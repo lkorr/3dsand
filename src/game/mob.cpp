@@ -3096,6 +3096,10 @@ void MobSystem::EvictDead() {
     Mob* oldest = nullptr;
     for (Mob& m : mobs_) {
       if (m.alive_ || m.rigReleased_) continue;
+      // A GHOST'S CORPSE is bounded by its OWNER's cap, and decays when the
+      // owner's MobGone(kGoneEvicted) says so; decaying it here would make
+      // local debris out of a rig the peer still keeps.
+      if (m.IsGhost()) continue;
       n++;
       bodies += m.LimbBodyCount();
       // A corpse about to get up is not the one to decay: the rising reads
@@ -3116,6 +3120,10 @@ void MobSystem::EvictDead() {
 void MobSystem::UpdateDeadSleep(World& world) {
   for (Mob& m : mobs_) {
     if (m.alive_ || m.rigReleased_ || m.deadAsleep_) continue;
+    // A ghost's corpse has no passes to put to sleep (it runs the ghost
+    // branch) and its limbs are kinematic, placed by the stream: the owner's
+    // corpse is the one that sleeps, and the stream's keyframe says so.
+    if (m.IsGhost()) continue;
     if (!m.DeadQuietNow()) {
       m.deadQuiet_ = 0;
       continue;
@@ -3154,6 +3162,9 @@ uint64_t MobSystem::GrabbableDeadLimb(uint64_t body) const {
   if (!body) return 0;
   for (const Mob& m : mobs_) {
     if (m.alive_ || m.rigReleased_) continue;
+    // A ghost's corpse is kinematic and placed by its owner's stream: a drag
+    // here would fight the pose every tick and move nothing the owner sees.
+    if (m.IsGhost()) continue;
     for (size_t i = 0; i < m.limbs_.size(); i++) {
       if (m.limbs_[i].body != body) continue;
       if (m.limbs_[i].holdSeconds > 0) return 0;   // leaving: not the corpse's
@@ -7081,7 +7092,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                mob.origin_.x > wlo.x + (float)kWorldN + kPad ||
                mob.origin_.y > wlo.y + (float)kWorldN + kPad ||
                mob.origin_.z > wlo.z + (float)kWorldN + kPad;
-    if (out && !mob.alive_) {
+    // ...a GHOST's corpse excepted: its rig is not this machine's to hand to
+    // debris (that would be local bodies for a corpse the peer still keeps).
+    // It takes the ghost's exit below — released, not parked — and the
+    // owner's own window rule decides what becomes of the real one.
+    if (out && !mob.alive_ && !mob.IsGhost()) {
       // A CORPSE THAT LEAVES THE WINDOW decays to debris, which is what every
       // corpse did before it was a Mob: DebrisSystem's own window rule takes
       // it from there. Not parked — the dead are not in the record format yet
@@ -7123,7 +7138,12 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // tick (rule 2): nothing it could change, and nothing around it changed.
     // The terrain anchor is still re-registered on a stride, or the patch it
     // is lying on would be evicted and a woken corpse would fall through it.
-    if (!mob.alive_) {
+    //
+    // NOT A GHOST'S CORPSE (P2c): that one is posed from its owner's stream
+    // like any ghost (the branch below), and every line here authors or
+    // simulates something — the bleed-out's ops, the terrain anchor, the
+    // limp walk anchor — that the owner is doing for it.
+    if (!mob.alive_ && !mob.IsGhost()) {
       // NOTHING LEFT OF IT: every limb burnt, rotted or cut away. What is left
       // of a man who burned to nothing is nothing — and that includes his
       // pack, exactly as the old corpse registry forgot an empty heap.
@@ -18641,6 +18661,15 @@ void MobSystem::PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
 
 void Mob::Die() {
   if (!alive_) return;
+  // A GHOST'S DEATH IS ITS OWNER'S (P2c). A blow struck here lands on this
+  // machine's copy and nothing forwards it — M9's rule for any remote
+  // creature — so the copy's hp can reach zero while the owner's creature is
+  // still standing. Dying here would be a corpse on one machine and a fighter
+  // on the other; the owner's pose (alive = 0) is what kills a ghost
+  // (EnterGhostDeath). This used to hand the ghost's rig to local debris (the
+  // P1 stopgap): anonymous bodies this machine then OWNED, for a creature the
+  // peer was still stepping.
+  if (IsGhost()) return;
   alive_ = false;
   // The ORDER a corpse fell in, for the dead cap (MobSystem::EvictDead): the
   // oldest decays to debris first.
@@ -18700,23 +18729,48 @@ void Mob::Die() {
   }
   // ---- WHO KEEPS THE RIG ---------------------------------------------------
   //
-  // A creature this machine steps keeps it: death is a state of the Mob. Two
-  // bodies still become anonymous debris the instant they die, exactly as
-  // every corpse used to (ReleaseRigToDebris is that loop, unchanged):
-  //   * a GHOST — its owner is the one keeping its corpse, and the dead state
-  //     is not on the wire yet (PLAN_corpse_is_a_mob.md P2c);
+  // A creature this machine steps keeps it: death is a state of the Mob. (A
+  // ghost never reaches here — see the top.) One body still becomes
+  // anonymous debris the instant it dies, exactly as every corpse used to
+  // (ReleaseRigToDebris is that loop, unchanged):
   //   * the PLAYER AVATAR — it is not in mobs_, so nothing would run a dead
   //     rig's passes on it (P2b moves it there). Unless the bite is standing
   //     it back up: then the rising needs the rig, and it is kept until the
   //     rising reads it (or the respawn settles it, SettleDeadAvatar).
   // A bare fixture Mob with no system keeps today's handover too.
-  const bool keep =
-      sys_ != nullptr && !IsGhost() && (!AvatarLayer() || rising);
+  const bool keep = sys_ != nullptr && (!AvatarLayer() || rising);
   if (!keep) {
     ReleaseRigToDebris();
     return;
   }
   EnterDeadRagdoll();
+}
+
+void Mob::EnterGhostDeath() {
+  if (!alive_) return;
+  alive_ = false;
+  if (sys_) deathSeq_ = ++sys_->deathSeq_;
+  // Die()'s agency reset: nothing the ghost's copy was holding for a living
+  // body (a stroke a local blow interrupted, a flinch) survives into death.
+  getUpFrom_.clear();
+  stroke_.Reset();
+  weapon_ = WeaponPose{};
+  swinging_ = false;
+  hitReact_.live = false;
+  aimLookValid_ = false;
+  // The death cry is presentation, and this machine's player is standing
+  // there too. After `alive_` went false, as in Die(), so PushVoice refuses
+  // every voice after it.
+  {
+    Vec3 at = origin_;
+    const int rl = def_ ? def_->rootLimb : -1;
+    if (rl >= 0 && rl < (int)limbs_.size() && limbs_[rl].body)
+      at = limbs_[rl].xf.pos;
+    if (sys_) sys_->PushVoice(*this, MobSystem::VoiceKind::Death, at, 1.0f);
+  }
+  deadAsleep_ = false;
+  deadQuiet_ = 0;
+  MarkInstancesDirty();
 }
 
 void Mob::EnterDeadRagdoll() {
@@ -19022,8 +19076,15 @@ uint64_t Mob::DeadWakeKey(World& world) const {
 // ---- looting a dead Mob ------------------------------------------------------
 
 bool Mob::Lootable() const {
+  // NOT A GHOST'S CORPSE (P2c). Its kit is its owner's, and there is no
+  // request/grant for a corpse's pieces the way there is for a ground item
+  // (net::ItemTake): taking here would put the piece in this player's bag
+  // while the owner's corpse still wore it. Loot over the network was never
+  // supported for corpses — a pre-P1 corpse on the peer was ghost debris the
+  // Corpses registry never knew — and this keeps that limit rather than
+  // opening a duplication path.
   return !alive_ && !rigReleased_ && sys_ != nullptr && !sys_->IsAvatar(this) &&
-         !AvatarLayer();
+         !AvatarLayer() && !IsGhost();
 }
 
 void Mob::LootPieces(std::vector<LootPiece>& out) const {
@@ -20908,9 +20969,11 @@ void MobSystem::RefreshOwnership() {
   if (!ownershipFn_) return;
   for (Mob& m : mobs_) {
     if (m.def_ == nullptr) continue;
-    // A CORPSE KEEPS THE OWNER IT DIED WITH. The dead state is not on the wire
-    // yet (PLAN_corpse_is_a_mob.md P2c), so a dead Mob flipping to a ghost
-    // would be a corpse nobody steps and nobody can see.
+    // A CORPSE KEEPS THE OWNER IT DIED WITH. It is streamed (P2c) but not
+    // handed over: the handoff record cannot say "dead" until MOBS v6 (P2a),
+    // so a flip here would make the far side's ghost corpse local with nobody
+    // having sent it the record — or this machine's corpse a ghost nobody
+    // poses. net::EntitySync::ScanHandoffs skips the dead for the same reason.
     if (!m.alive_) continue;
     // A CREATURE I HAVE NEVER HELD IS NOT MINE TO CLAIM (mob.h's note on
     // `announceOnly_`). The announce carries no record, so promoting it here
@@ -21106,6 +21169,15 @@ bool MobSystem::ApplyPose(const ::net::MobPose& p) {
   if (!m->haveGhostPose_) m->origin_ = p.origin;
   m->ghostPose_ = p;
   m->haveGhostPose_ = true;
+  // ---- THE OWNER SAYS IT DIED (P2c) ----------------------------------------
+  //
+  // The dead state, entered the moment the pose that carries it is latched:
+  // a corpse is still a Mob on both machines, so from here the ghost is dead
+  // for every reader that asks (melee's dead-flesh branch, the crosshair,
+  // Lootable's refusal, AI targeting) and is still placed from the stream.
+  // One way only: a pose saying alive = 1 does not raise it — a rising is a
+  // new def and arrives by handoff/announce.
+  if (p.alive == 0 && m->alive_) m->EnterGhostDeath();
   return true;
 }
 
@@ -21390,9 +21462,10 @@ bool MobSystem::ApplyGone(const ::net::MobGone& g) {
     // owner may end it, and a peer sending this about my mob is a disagreement
     // to count, not an instruction to obey.
     if (!mobs_[i].IsGhost()) return false;
-    // ReleaseRig, not Die: a ghost's death threw its corpse debris on the
-    // OWNER's machine, and those bodies arrive as M9.4-C's ghost bodies. A
-    // second corpse from this side would be one skeleton too many.
+    // ReleaseRig, not ReleaseRigToDebris, living or dead: whatever the owner
+    // turned this creature into (a corpse that decayed to debris —
+    // kGoneEvicted) is the OWNER's bodies, and they arrive as M9.4-C's ghost
+    // bodies. A second heap from this side would be one skeleton too many.
     mobs_[i].ReleaseRig();
     mobs_[i] = std::move(mobs_.back());
     mobs_.pop_back();
@@ -21400,6 +21473,118 @@ bool MobSystem::ApplyGone(const ::net::MobGone& g) {
     return true;
   }
   return false;
+}
+
+// ---- THE DEAD ON THE WIRE (PLAN_corpse_is_a_mob.md P2c) ---------------------
+
+uint64_t MobSystem::StateKey(uint64_t mobId) const {
+  const Mob* m = nullptr;
+  for (const Mob& c : mobs_)
+    if (c.id_ == mobId) { m = &c; break; }
+  if (m == nullptr) return 0;
+  // FNV-1a over exactly the facts mob.h lists, and nothing float: a key that
+  // moved with a limb's transform would send the whole record every tick a
+  // corpse rolled.
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](uint64_t v) {
+    for (int b = 0; b < 8; b++) {
+      h ^= (v >> (b * 8)) & 0xFFu;
+      h *= 1099511628211ull;
+    }
+  };
+  auto mixStr = [&mix](const std::string& str) {
+    mix(str.size());
+    for (char ch : str) mix((uint8_t)ch);
+  };
+  mix(m->limbs_.size());
+  for (const MobLimb& L : m->limbs_) {
+    mix(L.body ? 1u : 0u);
+    mix(L.voxels.size());
+    mix(L.skinVoxels.size());
+  }
+  mix(m->worn_.size());
+  for (const Mob::WornPiece& p : m->worn_) {
+    mix((uint64_t)(int64_t)p.equipSlot);
+    mixStr(p.item);
+  }
+  mixStr(m->heldItem_);
+  mix(m->carried_.size());
+  for (const CarriedItem& c : m->carried_) {
+    mixStr(c.item);
+    mix((uint64_t)(int64_t)c.count);
+    mix(c.dye);
+  }
+  return h == 0 ? 1 : h;   // 0 is "unknown id"
+}
+
+bool MobSystem::BuildState(uint64_t mobId, ::net::MobState& out) const {
+  const Mob* m = nullptr;
+  for (const Mob& c : mobs_)
+    if (c.id_ == mobId) { m = &c; break; }
+  if (m == nullptr || m->rigReleased_) return false;
+  out = ::net::MobState{};
+  if (!BuildAnnounce(mobId, out.announce)) return false;
+  out.recordVersion = kSaveVersion;
+  ByteWriter w{out.record};
+  m->SaveOne(w);
+  return true;
+}
+
+bool MobSystem::ApplyState(const ::net::MobState& st) {
+  Mob* m = FindMobById(st.announce.id);
+  // Only a ghost: a corpse I own is described by ME, and a state arriving for
+  // it is the same ownership disagreement ApplyPose refuses.
+  if (m == nullptr || !m->IsGhost() || m->rigReleased_) return false;
+  if (st.recordVersion != kSaveVersion) {
+    std::printf("mob: state record version %u, this build speaks %u\n",
+                st.recordVersion, kSaveVersion);
+    return false;
+  }
+  ByteReader r{st.record.data(), st.record.size()};
+  MobRecord rec;
+  if (!ReadMobRecord(r, rec, st.recordVersion)) return false;
+  // A record for another creature under this id (it turned while we held its
+  // ghost): not an overlay. The owner's announce/handoff for the new def is
+  // what replaces it.
+  if (m->defIndex_ < 0 || m->defIndex_ >= (int)defs_.size() ||
+      defs_[m->defIndex_].name != rec.defName)
+    return false;
+
+  // ---- THE GEAR FIRST, because the record's limb array is laid out over it -
+  //
+  // The owner's rig slots are base limbs + its pieces in the order they were
+  // appended; a looted piece left and every later slot moved down one
+  // (Mob::UnwearItem). The announce lists what is still on, in rig-slot
+  // order, so stripping the ghost bare and re-dressing from it reproduces
+  // the owner's numbering — the numbering the pose stream and the record are
+  // indexed by. Only when the list differs: an unchanged list would rebuild
+  // every shell for nothing.
+  ::net::MobAnnounce now{};
+  bool same = BuildAnnounce(st.announce.id, now) &&
+              now.gear.size() == st.announce.gear.size();
+  for (size_t k = 0; k < st.announce.gear.size() && same; k++)
+    same = now.gear[k].item == st.announce.gear[k].item &&
+           now.gear[k].equipSlot == st.announce.gear[k].equipSlot &&
+           now.gear[k].held == st.announce.gear[k].held &&
+           now.gear[k].dye == st.announce.gear[k].dye;
+  if (!same) {
+    std::vector<int> slots;
+    for (const Mob::WornPiece& p : m->worn_) slots.push_back(p.equipSlot);
+    for (int es : slots) m->UnwearItem(es);
+    if (!m->heldItem_.empty()) m->EquipItem(nullptr);
+    ApplyWireGear(*m, st.announce.gear);
+    m = FindMobById(st.announce.id);   // dressing may re-enter this system
+    if (m == nullptr) return false;
+  }
+  // ---- ...then the damage, through the handoff's own overlay --------------
+  //
+  // Carve state onto the limbs that differ, severs by DetachLimb(adopt =
+  // false) — the severed part is the OWNER's debris and arrives as a ghost
+  // body — the pack (so this machine's crosshair names what the corpse
+  // carries), and each limb put where the owner had it.
+  OverlayMobRecord(*m, rec, /*placeLimbs=*/true);
+  instancesDirty_ = true;
+  return true;
 }
 
 // ============================================================================

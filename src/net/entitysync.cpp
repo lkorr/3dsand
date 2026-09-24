@@ -25,6 +25,7 @@ namespace net {
 void EntityBatch::Clear() {
   mobHandoffs.clear();
   mobAnnounces.clear();
+  mobStates.clear();
   mobPoses.clear();
   mobGones.clear();
   bodyHandoffs.clear();
@@ -50,6 +51,8 @@ void EntityBatch::Encode(std::vector<uint8_t>& out) const {
   for (const MobHandoff& r : mobHandoffs) ::net::Encode(w, r);
   w.U32((uint32_t)mobAnnounces.size());
   for (const MobAnnounce& r : mobAnnounces) ::net::Encode(w, r);
+  w.U32((uint32_t)mobStates.size());
+  for (const MobState& r : mobStates) ::net::Encode(w, r);
   w.U32((uint32_t)mobPoses.size());
   for (const MobPose& r : mobPoses) ::net::Encode(w, r);
   w.U32((uint32_t)mobGones.size());
@@ -100,6 +103,7 @@ bool EntityBatch::Decode(const uint8_t* p, size_t n) {
   auto bodyRec = [](auto& rr, auto& rec) { return ::net::Decode(rr, rec); };
   if (!ReadVec(r, mobHandoffs, mobRec)) return false;
   if (!ReadVec(r, mobAnnounces, mobRec)) return false;
+  if (!ReadVec(r, mobStates, mobRec)) return false;
   if (!ReadVec(r, mobPoses, mobRec)) return false;
   if (!ReadVec(r, mobGones, mobRec)) return false;
   if (!ReadVec(r, bodyHandoffs, bodyRec)) return false;
@@ -132,6 +136,8 @@ void EntitySync::Connect(uint32_t me, uint32_t peer) {
   ownershipBound_ = false;
   announcedMobs_.clear();
   announcedBodies_.clear();
+  mobPoseSent_.clear();
+  mobStateSent_.clear();
   ghostMobSeen_.clear();
   ghostBodySeen_.clear();
   pendingMobHandoffs_.clear();
@@ -307,9 +313,11 @@ void EntitySync::ScanHandoffs(MobSystem& mobs, DebrisSystem& debris,
     const Mob* m = mobs.MobAt(i);
     if (m == nullptr || m->Def() == nullptr) continue;
     if (m->IsGhost()) continue;   // not mine to give away
-    // A CORPSE IS NOT HANDED OVER (yet): the dead state is not on the wire
-    // (PLAN_corpse_is_a_mob.md P2c), so a dead Mob stays with the machine it
-    // died on.
+    // A CORPSE IS NOT HANDED OVER (yet). It IS on the wire (P2c: posed with
+    // alive = 0, its shape in MobState), but the handoff's record is
+    // Mob::SaveOne, which until MOBS v6 (P2a) cannot say "dead" — the far side
+    // would stand a living creature up out of it. So a dead Mob stays with the
+    // machine it died on, and MobSystem::RefreshOwnership agrees.
     if (!m->Alive()) continue;
     // The FEET, the same point MobSystem::RefreshOwnership asks about — a
     // different anchor here would compute a different owner than the system
@@ -331,6 +339,7 @@ void EntitySync::ScanHandoffs(MobSystem& mobs, DebrisSystem& debris,
     // The handoff CARRIES an announce, so the peer no longer needs one from
     // us and we are no longer the thing that announces it.
     announcedMobs_.erase(id);
+    mobPoseSent_.erase(id);
     c_.handoffsOut++;
   }
 
@@ -410,10 +419,10 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
   for (uint32_t i = 0; i < mobs.MobCount(); i++) {
     const Mob* m = mobs.MobAt(i);
     if (m == nullptr || m->Def() == nullptr || m->IsGhost()) continue;
-    // THE DEAD ARE NOT STREAMED YET (P2c): a creature that died leaves the
-    // visible set exactly as it did when a death removed it from mobs_, so the
-    // peer gets its MobGone below.
-    if (!m->Alive()) continue;
+    // A RELEASED RIG IS A HUSK: its limbs are DebrisSystem's now and travel
+    // as bodies, so it leaves the visible set and gets its MobGone below. A
+    // corpse that still has its rig is streamed like the living (P2c).
+    if (m->RigReleased()) continue;
     const Vec3 origin = m->Origin();
     const Vec3 feet{origin.x + m->Def()->worldSize.x * 0.5f, origin.y,
                     origin.z + m->Def()->worldSize.z * 0.5f};
@@ -433,28 +442,62 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
         continue;
       }
     }
-    // RULE 2: and the pose, every tick.
+    // THE CORPSE'S SHAPE (P2c), before its pose: a MobState re-dresses the
+    // ghost, and the pose is indexed by the rig slots that re-dress lays out.
+    // Keyed, not timed: a corpse nobody touches sends one state (at death, or
+    // at first sight) and never another.
+    if (!m->Alive()) {
+      const uint64_t key = mobs.StateKey(id);
+      auto sent = mobStateSent_.find(id);
+      const bool changed = sent == mobStateSent_.end() || sent->second.key != key;
+      const bool due = sent == mobStateSent_.end() ||
+                       label - sent->second.label >= kDeadStateMinTicks;
+      if (changed && due && out.mobStates.size() < kMaxDeadStatesPerBatch) {
+        MobState st;
+        if (mobs.BuildState(id, st)) {
+          out.mobStates.push_back(std::move(st));
+          mobStateSent_[id] = DeadSent{key, label};
+          c_.statesOut++;
+        }
+      }
+    }
+    // RULE 2: and the pose, every tick — except an ASLEEP corpse, which gets
+    // one keyframe per kDeadPoseKeyframeTicks (the header says why any).
+    auto last = mobPoseSent_.find(id);
+    if (m->DeadAsleep() && last != mobPoseSent_.end() &&
+        label - last->second < kDeadPoseKeyframeTicks) {
+      c_.posesAsleep++;
+      continue;
+    }
     MobPose p;
     if (mobs.BuildPose(id, label, p)) {
       out.mobPoses.push_back(std::move(p));
+      mobPoseSent_[id] = label;
       c_.posesOut++;
     }
   }
   // RULE 3: everything the peer was told about that is no longer mine and
-  // inside its window. Death and despawn are the same message; the reason is
-  // diagnostic. `FindMobById` distinguishes them: still here = it walked out
-  // of range, gone = it died or was culled.
+  // inside its window. A DEATH IS NOT HERE ANY MORE (P2c): a corpse stays in
+  // the visible set and its pose says alive = 0. What is here is a creature
+  // that left the window, was parked or handed away, and a corpse whose rig
+  // decayed to debris (released, or swept as a husk) — the peer drops its
+  // ghost Mob, and the limbs come across as ghost bodies through the debris
+  // half below, exactly as a severed part always has. The reason is
+  // diagnostic only.
   for (auto it = announcedMobs_.begin(); it != announcedMobs_.end();) {
     if (visibleMobs.count(*it)) {
       ++it;
       continue;
     }
-    // Still here and ALIVE = it walked out of range; here but dead, or gone,
-    // = it died (a corpse is a Mob now, so presence alone no longer says).
     const Mob* fm = mobs.FindMobById(*it);
-    MobGone g{*it, fm != nullptr && fm->Alive() ? kGoneDespawn : kGoneDeath};
+    const bool wasCorpse = mobStateSent_.count(*it) != 0;
+    const bool decayed = (fm != nullptr && fm->RigReleased()) ||
+                         (fm == nullptr && wasCorpse);
+    MobGone g{*it, decayed ? kGoneEvicted : kGoneDespawn};
     out.mobGones.push_back(g);
     c_.gonesOut++;
+    mobPoseSent_.erase(*it);
+    mobStateSent_.erase(*it);
     it = announcedMobs_.erase(it);
   }
 
@@ -575,6 +618,14 @@ void EntitySync::ApplyForTick(uint32_t tick, MobSystem& mobs,
       // pile of voxels and `ground.Find()` returns null.
       if (items != nullptr && !a.item.empty())
         items->Add(h, a.item, a.itemDye, a.itemDamage);
+    }
+
+    // ---- states (P2c): a corpse's shape, before the pose that indexes it --
+    for (const MobState& st : b.mobStates) {
+      if (mobs.ApplyState(st)) {
+        c_.statesIn++;
+        ghostMobSeen_[st.announce.id] = tick;
+      }
     }
 
     // ---- poses ----------------------------------------------------------

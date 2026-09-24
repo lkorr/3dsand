@@ -28,6 +28,9 @@
 #include "game/camera.h"
 #include "game/player.h"
 #include "gpu/resources.h"
+#include "net/entitysync.h"
+#include "phys/debris.h"
+#include "phys/physics.h"
 #include "sim/microbody.h"
 #include "sim/reactcpu.h"
 #include "test/selftest.h"
@@ -11004,6 +11007,391 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- net-corpse ------------------------------------------------------------
+//
+// A CORPSE REPLICATES AS THE DEAD MOB IT IS (docs/PLAN_corpse_is_a_mob.md P2c).
+//
+// Two machines in one process, joined by bytes: machine A is the suite's own
+// MobSystem + DebrisSystem + Physics (it steps the world), machine B is a
+// second MobSystem + DebrisSystem on its OWN Physics (a ghost limb and the
+// real one in one Jolt world would collide with each other, and B's kinematic
+// copy would shove A's ragdoll). A's `::net::EntitySync::Build` output is
+// Encode'd, Decode'd and applied by B's `EntitySync::ApplyForTick`, every tick,
+// so the envelope codec, the interest rules, the apply order and both systems'
+// record paths are all on the path. Claims:
+//
+//   A. DEATH IS A STATE, NOT A GONE. A creature killed on A is, on B, a dead
+//      ghost Mob (not alive, still a ghost, rig not released) with NO ghost
+//      debris for it, NO MobGone sent, not lootable on B (lootable on A), and
+//      its limbs track the pose A sent within netCorpseTrackVox.
+//   B. ASLEEP COSTS ~NOTHING. Once A's corpse sleeps, over netCorpseSleepWindow
+//      ticks (longer than the 90-tick ghost expiry) A sends at most one pose
+//      per kDeadPoseKeyframeTicks for it, and B's ghost is still there, dead.
+//   C. A CUT REFLECTS. A carve on A's corpse, a severed limb and a looted
+//      piece: after a MobState lands, every rig slot on B has a body iff it
+//      does on A and holds the same number of voxels, B's gear list equals
+//      A's, and the severed limb exists on B as ghost debris.
+//   D. EVICTION IS A GONE. A's dead cap decays the corpse (the oldest of
+//      kMaxDeadMobs + 1): A sends MobGone(kGoneEvicted), B drops the ghost Mob,
+//      and every limb body A's debris adopted is on B as a ghost body.
+//   Plus: B authored nothing (ops, cells, spawns) at any point.
+//
+// Leaves the suite as it found it: id counter, tuning, mobs and debris reset.
+Status GateNetCorpse(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  const Tuning tuneWas = CurrentTuning();
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  c.mobs.SetItems(&c.items);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  constexpr uint32_t kPeer = 1;
+
+  // ---- machine B ----------------------------------------------------------
+  Physics farPhys;
+  farPhys.Init();
+  DebrisSystem farDebris;
+  farDebris.Init(&farPhys, &c.world, c.mats, c.reactions);
+  farDebris.SetMicroSet(c.debris.MicroSet());
+  farDebris.SetLocalPlayerId(kPeer);
+  MobSystem far;
+  far.Init(&farPhys, &c.world, &farDebris, c.mats, c.reactions);
+  far.SetMicroSet(c.mobs.MicroSet());
+  far.SetDefFactory(c.mobs.DefFactory());
+  far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
+  far.SetBehaviors(ai::Library(c.mobs.Behaviors()));
+  far.SetAttackStyles(StyleLibrary(c.mobs.AttackStyles()));
+  far.SetItems(&c.items);
+  far.SetLocalPlayerId(kPeer);
+
+  const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+  ::net::EntitySync entA, entB;
+  entA.Connect(0, kPeer);
+  entB.Connect(kPeer, 0);
+  {
+    ::net::PeerView mine{0, pchunk, c.world.WindowOrigin(), true};
+    ::net::PeerView peer{kPeer, pchunk, c.world.WindowOrigin(), true};
+    entA.SetPeers(mine, &peer);
+    entB.SetPeers(peer, &mine);
+  }
+
+  auto cleanup = [&]() {
+    SetCurrentTuning(tuneWas);
+    far.Reset();
+    farDebris.Reset();
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+    c.debris.Reset();
+    c.mobs.Reset();
+  };
+
+  // ---- one tick of both machines, with the wire between them --------------
+  uint32_t tick = 9000;
+  uint64_t farAuthored = 0;
+  size_t wireBytesMax = 0, stateBytesMax = 0;
+  uint64_t subject = 0;
+  ::net::EntityBatch sent;   // A's batch this tick, as decoded on B
+  int deathGones = 0, evictGones = 0;
+  auto step = [&]() {
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    std::vector<BrushOp> ops;
+    c.mobs.PreTick(tick + 1, c.world, ops, cellOps, spawns);
+    c.debris.QueueSupportEvents(c.world.Snap());
+    c.debris.PreTick(tick + 1, c.world, cellOps, spawns);
+    ++tick;
+    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+               false, pchunk, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    c.mobs.PostStep();
+    // A -> bytes -> B, labelled with the tick B is about to run.
+    ::net::EntityBatch out;
+    entA.Build(c.mobs, c.debris, tick, out);
+    std::vector<uint8_t> bytes;
+    out.Encode(bytes);
+    wireBytesMax = std::max(wireBytesMax, bytes.size());
+    for (const ::net::MobState& st : out.mobStates)
+      stateBytesMax = std::max(stateBytesMax, st.record.size());
+    sent.Clear();
+    sent.Decode(bytes.data(), bytes.size());
+    for (const ::net::MobGone& g : sent.mobGones)
+      if (g.id == subject) {
+        if (g.reason == ::net::kGoneDeath) deathGones++;
+        if (g.reason == ::net::kGoneEvicted) evictGones++;
+      }
+    entB.NoteRemote(::net::EntityBatch(sent));
+    entB.ApplyForTick(tick, far, farDebris, nullptr);
+    entB.ExpireGhosts(tick, far, farDebris);
+    std::vector<ParticleSpawn> bSp;
+    std::vector<CellOp> bCells;
+    std::vector<BrushOp> bOps;
+    far.PreTick(tick, c.world, bOps, bCells, bSp);
+    farDebris.PreTick(tick, c.world, bCells, bSp);
+    farPhys.Step(kTickDt);
+    farDebris.PostStep();
+    far.PostStep();
+    farAuthored += bOps.size() + bCells.size() + bSp.size();
+  };
+  // Every limb of `subject` A posed this tick, found by index on B.
+  double trackErr = 0;
+  int trackSamples = 0;
+  auto track = [&]() {
+    const ::net::MobPose* p = nullptr;
+    for (const ::net::MobPose& q : sent.mobPoses)
+      if (q.id == subject) p = &q;
+    ::net::MobPose now{};
+    if (p == nullptr || !far.BuildPose(subject, tick, now)) return;
+    for (const ::net::WireLimbPose& b : p->limbs)
+      for (const ::net::WireLimbPose& a : now.limbs)
+        if (a.index == b.index) {
+          trackErr = std::max(trackErr, (double)(a.pos - b.pos).len());
+          trackSamples++;
+        }
+  };
+
+  std::string why;
+  subject = AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "dummy", why);
+  if (subject == 0) {
+    detail = why;
+    cleanup();
+    return Status::Fail;
+  }
+  // Dressed as well as armed, so a looted piece has a slot to renumber.
+  const ItemDef* wear = nullptr;
+  for (const ItemDef& it : c.items.items) {
+    if (!ItemKindIsWorn(it.kind)) continue;
+    int home = -1;
+    for (int s = 0; s < kEquipSlotCount; s++)
+      if (EquipSlotAccepts(s, it.kind)) { home = s; break; }
+    if (home >= 0 && c.mobs.WearItem(subject, &it, home)) {
+      wear = &it;
+      break;
+    }
+  }
+  for (int i = 0; i < 8; i++) step();
+  const Mob* ghost0 = far.FindMobById(subject);
+  const bool announcedAlive = ghost0 != nullptr && ghost0->IsGhost() &&
+                              ghost0->Alive();
+
+  // ======== A: the death ==================================================
+  // Killed WITHOUT A WOUND (corpse-sleep's recipe: the root severed routes to
+  // Die, no stump, nothing to bleed out), so the corpse can fall asleep for
+  // claim B; the drying clock is corpse-sleep's arm for the same reason.
+  const int root = c.mobs.Defs()[defIndex].rootLimb;
+  {
+    Tuning fast = tuneWas;
+    fast.coat.decayScale = (float)BaselineNumber("corpseSleepDecayScale", 300.0);
+    SetCurrentTuning(fast);
+  }
+  c.mobs.Sever(subject, root);
+  const bool diedOnA = !c.mobs.IsAlive(subject);
+  step();
+  step();
+  const Mob* g = far.FindMobById(subject);
+  const bool deadOnB = g != nullptr && !g->Alive() && g->IsGhost() &&
+                       !g->RigReleased();
+  const uint32_t ghostBodiesAtDeath = farDebris.GhostCount();
+  const Mob* a = c.mobs.FindMobById(subject);
+  const bool lootA = a != nullptr && a->Lootable();
+  const bool lootB = g != nullptr && g->Lootable();
+  // ...and it keeps being posed as it falls.
+  const int maxSleep = (int)BaselineNumber("netCorpseSleepMaxTicks", 1200);
+  int asleepAt = -1;
+  for (int i = 0; i < maxSleep; i++) {
+    step();
+    track();
+    const Mob* m = c.mobs.FindMobById(subject);
+    if (m != nullptr && m->DeadAsleep()) {
+      asleepAt = i;
+      break;
+    }
+  }
+  SetCurrentTuning(tuneWas);
+  const char* awakeWhy = nullptr;
+  if (asleepAt < 0)
+    if (const Mob* m = c.mobs.FindMobById(subject)) awakeWhy = m->DeadAwakeReason();
+
+  // ======== B: asleep, it costs ~nothing ==================================
+  const int window = (int)BaselineNumber("netCorpseSleepWindow", 150);
+  uint64_t posesForSubject = 0;
+  const uint64_t asleep0 = entA.Stats().posesAsleep;
+  bool stayedAsleep = asleepAt >= 0;
+  for (int i = 0; i < window && asleepAt >= 0; i++) {
+    step();
+    for (const ::net::MobPose& q : sent.mobPoses)
+      if (q.id == subject) posesForSubject++;
+    const Mob* m = c.mobs.FindMobById(subject);
+    stayedAsleep = stayedAsleep && m != nullptr && m->DeadAsleep();
+  }
+  const uint64_t posesSkipped = entA.Stats().posesAsleep - asleep0;
+  const uint64_t poseCap =
+      (uint64_t)window / ::net::kDeadPoseKeyframeTicks + 1u;
+  g = far.FindMobById(subject);
+  const bool survivedExpiry = g != nullptr && !g->Alive() && g->IsGhost();
+  const bool cheap = asleepAt >= 0 && stayedAsleep &&
+                     posesForSubject <= poseCap && posesSkipped > 0 &&
+                     window > (int)::net::kGhostExpiryTicks && survivedExpiry;
+
+  // ======== C: a cut, a sever and a looted piece reflect ==================
+  uint32_t carved = 0;
+  int severed = -1;
+  bool looted = false;
+  {
+    std::vector<ParticleSpawn> spawns;
+    const uint32_t v0 = c.mobs.LimbArtVoxelCount(subject, root);
+    for (int k = 0; k < 3; k++)
+      if (const uint64_t lb = c.mobs.LimbBody(subject, root))
+        c.mobs.CarveLimbRadial(
+            lb, c.mobs.LimbVoxelPos(subject, root, 977u * (uint32_t)(k + 1)),
+            1.5f, /*ragged=*/true, /*eject=*/false, c.world, spawns);
+    const uint32_t v1 = c.mobs.LimbArtVoxelCount(subject, root);
+    carved = v0 > v1 ? v0 - v1 : 0u;
+    // The LAST base limb with a body that is not the root: a hand or a foot,
+    // whichever the def lists last — a leaf, so the sever takes one piece.
+    const MobDef& d = c.mobs.Defs()[defIndex];
+    for (int li = (int)d.limbs.size() - 1; li >= 0; li--)
+      if (li != root && c.mobs.LimbBody(subject, li)) {
+        severed = li;
+        break;
+      }
+    if (severed >= 0) c.mobs.Sever(subject, severed);
+    if (Mob* m = c.mobs.FindMobById(subject); m != nullptr && wear != nullptr)
+      looted = m->TakeLootPiece(0, nullptr);
+  }
+  const int settle = (int)::net::kDeadStateMinTicks + 4;
+  for (int i = 0; i < settle; i++) {
+    step();
+    track();
+  }
+  int slotsCompared = 0, slotMismatch = -1;
+  std::string slotWhy;
+  {
+    const Mob* ma = c.mobs.FindMobById(subject);
+    const Mob* mb = far.FindMobById(subject);
+    if (ma != nullptr && mb != nullptr) {
+      const int n = std::max(ma->LimbCount(), mb->LimbCount());
+      for (int li = 0; li < n; li++) {
+        const uint64_t ha = c.mobs.LimbBody(subject, li);
+        const uint64_t hb = far.LimbBody(subject, li);
+        const uint32_t va = ha ? c.mobs.LimbArtVoxelCount(subject, li) : 0u;
+        const uint32_t vb = hb ? far.LimbArtVoxelCount(subject, li) : 0u;
+        slotsCompared++;
+        if ((ha != 0) != (hb != 0) || va != vb) {
+          if (slotMismatch < 0) {
+            slotMismatch = li;
+            slotWhy = Format("slot %d: A body %d/%u vox, B body %d/%u vox", li,
+                             ha ? 1 : 0, va, hb ? 1 : 0, vb);
+          }
+        }
+      }
+      if (ma->LimbCount() != mb->LimbCount() && slotWhy.empty())
+        slotWhy = Format("rig %d vs %d slots", ma->LimbCount(), mb->LimbCount());
+    } else {
+      slotWhy = mb == nullptr ? "ghost gone" : "corpse gone on A";
+    }
+  }
+  bool gearSame = false;
+  int gearA = -1, gearB = -1;
+  {
+    ::net::MobAnnounce ga{}, gb{};
+    if (c.mobs.BuildAnnounce(subject, ga) && far.BuildAnnounce(subject, gb)) {
+      gearA = (int)ga.gear.size();
+      gearB = (int)gb.gear.size();
+      gearSame = gearA == gearB;
+      for (int k = 0; k < gearA && gearSame; k++)
+        gearSame = ga.gear[(size_t)k].item == gb.gear[(size_t)k].item &&
+                   ga.gear[(size_t)k].held == gb.gear[(size_t)k].held;
+    }
+  }
+  const uint32_t ghostBodiesAfterCut = farDebris.GhostCount();
+  const bool cutReflects = carved > 0 && severed >= 0 && slotMismatch < 0 &&
+                           slotWhy.empty() && gearSame &&
+                           (!looted || gearA >= 0) && ghostBodiesAfterCut > 0;
+
+  // ======== D: the dead cap evicts, and the peer gets debris ==============
+  std::vector<uint64_t> rigBodies;
+  for (int li = 0; li < 256; li++) {
+    const Mob* m = c.mobs.FindMobById(subject);
+    if (m == nullptr || li >= m->LimbCount()) break;
+    if (const uint64_t h = c.mobs.LimbBody(subject, li)) rigBodies.push_back(h);
+  }
+  int newDead = 0;
+  for (uint32_t k = 0; k < MobSystem::kMaxDeadMobs; k++) {
+    const uint64_t id = c.mobs.Spawn(
+        defIndex, {spot.x + 10 + (int)(k % 4) * 10, spot.y + 1,
+                   spot.z + 10 + (int)(k / 4) * 10});
+    if (!id) break;
+    const uint64_t torso = root >= 0 ? c.mobs.LimbBody(id, root) : 0;
+    if (torso) c.mobs.Damage(torso, 1.0e6f, c.mobs.LimbAnchorPos(id, root), 0.0f);
+    if (!c.mobs.IsAlive(id)) newDead++;
+  }
+  for (int i = 0; i < 3; i++) step();
+  const Mob* ea = c.mobs.FindMobById(subject);
+  const bool evictedOnA = ea == nullptr || ea->RigReleased();
+  const bool ghostDropped = far.FindMobById(subject) == nullptr;
+  uint32_t bodiesOnB = 0;
+  for (uint64_t h : rigBodies) {
+    const uint64_t gid = c.debris.GlobalIdOf(h);
+    const uint64_t fh = gid ? farDebris.HandleOfGlobalId(gid) : 0;
+    if (fh != 0 && farDebris.IsGhost(fh)) bodiesOnB++;
+  }
+  const bool evictReflects = evictedOnA && evictGones == 1 && ghostDropped &&
+                             !rigBodies.empty() &&
+                             bodiesOnB == (uint32_t)rigBodies.size();
+
+  const double trackTol = BaselineNumber("netCorpseTrackVox", 0.05);
+  const ::net::EntitySync::Counters sa = entA.Stats(), sb = entB.Stats();
+  RecordObserved("netCorpseTrackErrVox", trackErr);
+  RecordObserved("netCorpseSleepPoses", (double)posesForSubject);
+  RecordObserved("netCorpseWireBytesMax", (double)wireBytesMax);
+  RecordObserved("netCorpseStateBytesMax", (double)stateBytesMax);
+  const bool deathOk = announcedAlive && diedOnA && deadOnB &&
+                       ghostBodiesAtDeath == 0 && deathGones == 0 && lootA &&
+                       !lootB && trackSamples > 0 && trackErr <= trackTol;
+  const bool ok = deathOk && cheap && cutReflects && evictReflects &&
+                  farAuthored == 0;
+  detail = Format(
+      "A death: announced alive %d, died on A %d, dead ghost on B %d, ghost "
+      "bodies %u (need 0), death gones %d (need 0), lootable A %d / B %d, "
+      "track %.4f <= %.4f vox over %d limb samples | B asleep after %d ticks "
+      "(cap %d)%s%s, then %d ticks: %llu poses for it (cap %llu), %llu skipped, "
+      "stayed asleep %d, ghost survived the %u-tick expiry %d | C carved %u "
+      "vox, severed slot %d, looted %d; %d slots compared%s%s, gear %d/%d "
+      "same %d, ghost bodies on B %u | D %d more dead, evicted on A %d, "
+      "evict gones %d, ghost dropped %d, %u/%zu rig bodies on B as ghost "
+      "debris | B authored %llu | wire: states %llu out/%llu in, poses %llu "
+      "out, max batch %zu B, max state record %zu B",
+      announcedAlive ? 1 : 0, diedOnA ? 1 : 0, deadOnB ? 1 : 0,
+      ghostBodiesAtDeath, deathGones, lootA ? 1 : 0, lootB ? 1 : 0, trackErr,
+      trackTol, trackSamples, asleepAt, maxSleep, awakeWhy ? " awake: " : "",
+      awakeWhy ? awakeWhy : "", window,
+      (unsigned long long)posesForSubject, (unsigned long long)poseCap,
+      (unsigned long long)posesSkipped, stayedAsleep ? 1 : 0,
+      ::net::kGhostExpiryTicks, survivedExpiry ? 1 : 0, carved, severed,
+      looted ? 1 : 0, slotsCompared, slotWhy.empty() ? "" : " FIRST DIFF ",
+      slotWhy.c_str(), gearA, gearB, gearSame ? 1 : 0, ghostBodiesAfterCut,
+      newDead, evictedOnA ? 1 : 0, evictGones, ghostDropped ? 1 : 0,
+      bodiesOnB, rigBodies.size(), (unsigned long long)farAuthored,
+      (unsigned long long)sa.statesOut, (unsigned long long)sb.statesIn,
+      (unsigned long long)sa.posesOut, wireBytesMax, stateBytesMax);
+  cleanup();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
@@ -11056,6 +11444,9 @@ const std::vector<Gate>& MobGates() {
       // every claim is an op count, an AI-step count, a distance or a byte
       // comparison.
       {"mob-handoff", "mob", {}, false, GateMobHandoff, /*needsRender=*/false},
+      // A corpse replicates as the dead Mob it is (PLAN_corpse_is_a_mob.md
+      // P2c): two MobSystems on two Physics worlds joined by EntityBatch bytes.
+      {"net-corpse", "mob", {}, false, GateNetCorpse, /*needsRender=*/false},
       // MOBS v4: an untouched body saves as its def name plus hp and pose;
       // only a limb that differs from the def's art stores a lattice. Bytes,
       // byte-identical round trip, and the v3 section still loading. No

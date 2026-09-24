@@ -1,7 +1,7 @@
 // mobsync.h — what one creature looks like ON THE WIRE (PLAN_multiplayer_m9
 // M9.4-B).
 //
-// FOUR RECORDS AND NOTHING ELSE. This header knows nothing about sockets,
+// FIVE RECORDS AND NOTHING ELSE. This header knows nothing about sockets,
 // nothing about net::Link, and nothing about the tick: it is the DATA half of
 // mob ownership, so that the encode/decode rules live in one file that both
 // sides of a connection compile and neither side can drift from. The sending
@@ -14,7 +14,11 @@
 //                 stream from the owner; the only thing a ghost is posed from.
 //   MobHandoff   "it is yours now, here is everything you need to step it" —
 //                 the per-mob save record + the brain + the announce.
-//   MobGone      "stop drawing it" — death, despawn, or it left my window.
+//   MobGone      "stop drawing it" — despawn, it left my window, or its
+//                 corpse decayed to debris. NOT a death: a dead creature is
+//                 still a Mob and is still posed (MobPose.alive = 0).
+//   MobState     "this is what the corpse is now" — gear + the per-mob
+//                 record, on change only (P2c; see the struct).
 //
 // WHY THE HANDOFF CARRIES THE SAVE RECORD AND NOT A STRUCT OF ITS OWN:
 // `Mob::SaveOne` already answers "what is this creature's damage, carve state
@@ -135,15 +139,38 @@ struct MobHandoff {
   std::vector<uint8_t> record;   // Mob::SaveOne's bytes, exactly
 };
 
+// ---- "this is what the corpse IS now" (PLAN_corpse_is_a_mob.md P2c) -------
+//
+// A DEAD Mob stays a Mob on both machines, so a death no longer ends the
+// stream: the ghost goes on being posed (MobPose.alive = 0 is what puts it in
+// the dead state), and what a pose cannot say — a cut, a sever, a looted
+// breastplate — travels in THIS record. It is the handoff's payload without
+// the ownership change: the announce (gear by name, in rig-slot order, so the
+// far side's re-dress appends the same slots) and `Mob::SaveOne`'s bytes (the
+// carve and sever state, the pack). Sent by the owner only when the corpse's
+// shape key changes (MobSystem::StateKey), throttled, so a corpse nobody is
+// touching costs nothing here. Applied only to a GHOST (MobSystem::ApplyState).
+struct MobState {
+  MobAnnounce announce;          // id + CURRENT gear
+  uint32_t recordVersion = 0;    // MobSystem::kSaveVersion of the sender
+  std::vector<uint8_t> record;   // Mob::SaveOne's bytes, exactly
+};
+
 enum GoneReason : uint32_t {
-  kGoneDeath = 0,     // it died where its owner could see it
+  // RETIRED as a send (P2c): a death is a state of the Mob and is carried by
+  // MobPose.alive. Kept so an old number decodes to a name.
+  kGoneDeath = 0,
   kGoneDespawn = 1,   // it left the owner's window
   kGoneUnowned = 2,   // nobody's window contains it any more
+  // A DEAD Mob that decayed to debris (the dead cap, a corpse that left the
+  // window, or burned to nothing): its limbs arrive separately as ghost debris
+  // (BodyAnnounce.dead), exactly the way severed parts always have.
+  kGoneEvicted = 3,
 };
 
 struct MobGone {
   uint64_t id = 0;
-  uint32_t reason = kGoneDeath;
+  uint32_t reason = kGoneDespawn;
 };
 
 // ---- encode / decode --------------------------------------------------------
@@ -158,5 +185,7 @@ void Encode(ByteWriter& w, const MobHandoff& h);
 bool Decode(ByteReader& r, MobHandoff& h);
 void Encode(ByteWriter& w, const MobGone& g);
 bool Decode(ByteReader& r, MobGone& g);
+void Encode(ByteWriter& w, const MobState& s);
+bool Decode(ByteReader& r, MobState& s);
 
 }  // namespace net
