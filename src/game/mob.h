@@ -745,6 +745,13 @@ struct BodyBurnState {
   // limb's flesh_burning voxels never rolled their decay again. That is a
   // character left permanently coated in flame that has nothing left to burn.
   bool alight = false;
+  // Consecutive rain visits (MobSystem::RainOneLimb) that found only surface
+  // already soaked to the rain's cap and wrote nothing. Past a couple, the
+  // limb is visited only one cadence in several, so a saturated limb in a
+  // storm stops rebuilding the index the burn pass keeps dropping. A fact
+  // about the COAT, not an index into the lattice, so it survives
+  // DropBurnIndex.
+  uint8_t rainSated = 0;
   bool Burning() const { return !front.empty() || alight; }
   // ON FIRE, which is NARROWER than `front`. The front is every voxel whose
   // material carries a self decay/emit rule, and fire is only one of the things
@@ -2179,6 +2186,15 @@ class Mob {
   // Does any shell cover this body limb at all? The cheap gate in front of the
   // probe, so an undressed creature never even transforms a point.
   bool LimbHasShells(int bodyLimb) const;
+  // A limb's pose as physics holds it, as a COPY: the portrait pour brush's
+  // pick (MobSystem::PickBody / PourOnBody) runs outside the tick and must
+  // not write the live `xf` the sim passes read. `limb.xf` when there is no
+  // physics.
+  BodyTransform PickPose(const MobLimb& limb) const {
+    BodyTransform xf = limb.xf;
+    if (phys_ && limb.body) phys_->GetTransform(limb.body, xf);
+    return xf;
+  }
   // Rig slots that are NOT part of the authored rig: worn shells and a held
   // item, always at the tail. `LimbCount() - AppendedBase()` of them.
   int AppendedBase() const { return baseLimbs_; }
@@ -3224,8 +3240,10 @@ class Mob {
   // same walk the burn pass makes) and takes the stain of any staining
   // liquid, dry stain or drip it is touching on its exposed voxels -- or has
   // it rinsed off by a washing liquid. Sleeps at the cost of the walk when
-  // nothing is near. `budget` is lattice cells this call may visit.
-  void StainTick(uint32_t tick, World& world, uint32_t& budget);
+  // nothing is near. `budget` is lattice cells this call may visit;
+  // `rainBudget` is rain's own pot (MobSystem::kRainLatticePerTick).
+  void StainTick(uint32_t tick, World& world, uint32_t& budget,
+                 uint32_t& rainBudget);
   // Replay one queued burst against this creature's limbs: each droplet that
   // would land on a limb marks the voxel where it lands.
   void ApplySplatter(const SplatterEvent& e);
@@ -5172,15 +5190,19 @@ class MobSystem {
   // is under open sky, its world-UP-facing surface voxels get slowly wetter
   // (and rinse a foreign coat a level first, WashBodyStain's rule), capped by
   // how hard it rains. The existing wet lifecycle (WetOneLimb wicks + drips,
-  // DryOneLimb dries) takes it from there. Bounded by `budget`.
+  // DryOneLimb dries) takes it from there. Bounded by rain's OWN per-tick
+  // budget (`rainBudget`, kRainLatticePerTick), never the shared stain one: a
+  // storm's samples used to come out of kStainLatticePerTick, and about seven
+  // creatures in the rain starved the contact and drying passes (and every
+  // corpse) of the lattice they share.
   bool RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
-                   uint32_t& budget, World* world);
+                   uint32_t& rainBudget, World* world);
   // Where RainOneLimb's calls went (the mob-rain gate prints it): a bare
   // "0 wet voxels" names no cause, this names the early-out that ate them.
   struct RainStats {
     uint32_t calls = 0, dry = 0, offCadence = 0, noView = 0, roofed = 0,
              noWater = 0, noIndex = 0, sampled = 0, notTop = 0, capped = 0,
-             wrote = 0;
+             wrote = 0, sated = 0, starved = 0;
   };
   RainStats rainStats_;
   // What a WASHING coat (water) does while it is on a body, over a view: it
@@ -5202,7 +5224,8 @@ class MobSystem {
   // use, so a corpse in a river is washed at the rate a man in it is. Owner
   // report: "water doesn't clean the stains off corpses". Splatter onto the
   // dead is NOT here (Mob::ApplySplatter walks limbs, not bodies).
-  void StainCorpses(uint32_t tick, World& world, uint32_t& budget);
+  void StainCorpses(uint32_t tick, World& world, uint32_t& budget,
+                    uint32_t& rainBudget);
   // One burst replayed against one lattice (Mob::ApplySplatter's per-limb
   // body): true when a voxel's coat changed. `salt` keys the draws — the limb
   // index on the living, a hash of the body id on the dead.
@@ -5326,6 +5349,11 @@ class MobSystem {
     // the one distinction a bare miss count cannot make and the one that
     // decides whether the fix is a constant or a redesign.
     uint32_t nbrMissInReach = 0;
+    // A SPLATTER landing (SplatterView) that met a worn shell on its way in
+    // and was caught by it, and one that reached skin on a limb that HAS
+    // shells. The armour catches a thrown splash the way it stops a burn.
+    uint32_t splatBlocked = 0;
+    uint32_t splatPassed = 0;
   };
   const WornStats& Worn() const { return wornStats_; }
   void ResetWornStats() { wornStats_ = WornStats{}; }
@@ -5914,6 +5942,12 @@ class MobSystem {
   // pool is swept whole every tick or two.
   static constexpr uint32_t kStainLatticePerLimb = 6144;
   static constexpr uint32_t kStainLatticePerTick = 32768;
+  // RAIN's samples, all creatures and corpses together, per tick -- its own
+  // pot, so a storm can slow rain on a crowd but never the contact, drying or
+  // wicking passes (MobSystem::RainOneLimb). A storm visit is ~1,200 samples
+  // and a limb visits every 5 ticks, so this is ~4 humans at the full storm
+  // rate; past that the tick-rotated start shares it out.
+  static constexpr uint32_t kRainLatticePerTick = 16384;
   // Per corpse body: the contact pass's index (derived, rebuilt when the
   // lattice's voxel count moves — every carve, burn flush and shatter does),
   // and the coat ledger drying reads, recounted only while something changed.

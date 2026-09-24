@@ -14382,15 +14382,17 @@ void MobSystem::StainLimbs(uint32_t tick, World& world) {
   if (matGpu_.empty()) return;
   // Contact, under the shared lattice budget, start creature rotated by tick.
   uint32_t budget = kStainLatticePerTick;
+  // Rain draws on its own pot (RainOneLimb), so a storm never starves this.
+  uint32_t rainBudget = kRainLatticePerTick;
   if (!mobs_.empty()) {
     const size_t nm = mobs_.size();
     const size_t start = (size_t)(tick % (uint32_t)nm);
     for (size_t k = 0; k < nm && budget; k++)
-      mobs_[(start + k) % nm].StainTick(tick, world, budget);
+      mobs_[(start + k) % nm].StainTick(tick, world, budget, rainBudget);
   }
   // ...and the dead, out of what the living left. After them, so a crowd in a
   // river is never washed slower for the corpses floating beside it.
-  StainCorpses(tick, world, budget);
+  StainCorpses(tick, world, budget, rainBudget);
   // This tick's bursts, against every creature (the bleeder included: its
   // own gout lands on its own other limbs; only the bleeding limb is skipped).
   for (SplatterEvent& e : splatters_) {
@@ -14472,6 +14474,13 @@ void MobSystem::SplatterCorpses(const SplatterEvent& e) {
     CorpseCoat& cc = corpseCoat_[f.id];
     int model = -1;
     BurnLimbView v = CorpseView(f, cc, model);
+    // The cuirass still strapped to a dead torso catches a splash exactly as
+    // it did in life (SplatterView's worn-shell test).
+    CorpseWornProbe probe{this, &f.shells, e.tick};
+    if (!f.shells.empty()) {
+      v.occlude = &CorpseWornProbe::Call;
+      v.occludeCtx = &probe;
+    }
     if (SplatterView(e, v, CorpseKey(f.id))) cc.dirty = true;
     if (model >= 0) *f.microModel = (uint32_t)model;
   });
@@ -14572,7 +14581,8 @@ void MobSystem::BurnCorpses(uint32_t tick, World& world,
     it = tick - it->second.seen > 60u ? corpseShellIdx_.erase(it) : std::next(it);
 }
 
-void MobSystem::StainCorpses(uint32_t tick, World& world, uint32_t& budget) {
+void MobSystem::StainCorpses(uint32_t tick, World& world, uint32_t& budget,
+                             uint32_t& rainBudget) {
   if (!debris_ || matGpu_.empty()) return;
   // The stamp that marks an entry live this tick; 0 is "never", so skip it.
   const uint32_t stamp = tick + 1u;
@@ -14592,7 +14602,7 @@ void MobSystem::StainCorpses(uint32_t tick, World& world, uint32_t& budget) {
       TallyCoat(v, cc.led, &matCorrodes_);
       cc.dirty = false;
     }
-    if (budget && RainOneLimb(v, tick, key, budget, &world)) changed = true;
+    if (RainOneLimb(v, tick, key, rainBudget, &world)) changed = true;
     if (budget && DryOneLimb(v, cc.led, tick, key, budget, &world)) changed = true;
     if (changed) cc.dirty = true;
     if (model >= 0) *f.microModel = (uint32_t)model;
@@ -14604,7 +14614,8 @@ void MobSystem::StainCorpses(uint32_t tick, World& world, uint32_t& budget) {
 }
 
 
-void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
+void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget,
+                    uint32_t& rainBudget) {
   if (!sys_ || sys_->matGpu_.empty()) return;
   // Same rule as BurnTick, and before the budget for the same reason: the
   // coat on a ghost's skin is its owner's business. A ghost's coat is
@@ -14645,8 +14656,9 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget) {
     // takes it off" means. Which materials are on the limb comes off the
     // LEDGER, so a clean limb reads two zeroes and pays nothing.
     // ...rain lands on it from above (RainOneLimb), before it dries...
-    if (budget == 0) continue;
-    if (sys_->RainOneLimb(v, tick, key, budget, &world))
+    // (Its own budget, not `budget`: a storm must not starve the passes
+    // around it.)
+    if (sys_->RainOneLimb(v, tick, key, rainBudget, &world))
       coatDirty_ = twinDirty_ = true;
     if (budget == 0) continue;
     if (sys_->DryOneLimb(v, limbs_[li].coat, tick, key, budget, &world))
@@ -14819,20 +14831,36 @@ static constexpr uint32_t kRainEveryTicks = 5;
 static constexpr uint64_t kRainSampleK = 1479;
 static constexpr uint32_t kRainWetCap = 12;
 static constexpr uint32_t kRainRunoffPerMille = 350;
+// SATED LIMBS BACK OFF (2026-09-23 audit). A limb whose sampled surface is
+// all soaked to the cap writes nothing, but a visit still needed the index,
+// and the burn pass drops an idle index after kBurnIndexGrace -- so a
+// saturated corpse (nothing else keeps its index warm) rebuilt it every
+// visit for as long as it rained. After kRainSatedVisits fruitless visits in
+// a row a limb is visited one cadence in kRainSatedRetry (8 x 5 ticks = 1.3 s,
+// shorter than the ~4 s a level of water takes to dry), keyed on the tick so
+// it is the same limb-visits in every replay.
+static constexpr uint32_t kRainSatedVisits = 2;
+static constexpr uint32_t kRainSatedRetry = 8;
 
 bool MobSystem::RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
                             uint32_t& budget, World* world) {
   RainStats& rs = rainStats_;
   rs.calls++;
   const uint32_t rain = weatherRain_ & kRainAmountMask;
-  if (rain == 0 || budget == 0) { rs.dry++; return false; }
+  if (rain == 0) { rs.dry++; return false; }
   if ((tick + key) % kRainEveryTicks != 0) { rs.offCadence++; return false; }
+  if (budget == 0) { rs.starved++; return false; }
   const size_t n = v.Size();
   if (n == 0 || !v.burn || !v.xf) { rs.noView++; return false; }
+  BodyBurnState& st = *v.burn;
+  if (st.rainSated >= kRainSatedVisits &&
+      ((tick + key) / kRainEveryTicks) % kRainSatedRetry != 0) {
+    rs.sated++;
+    return false;
+  }
   if (world && !OpenToSky(*world, v.xf->pos)) { rs.roofed++; return false; }
   const uint32_t water = MaterialIdNamed("water");
   if (water == 0) { rs.noWater++; return false; }
-  BodyBurnState& st = *v.burn;
   if (st.idx.empty()) BuildBurnIndex(v);
   if (st.idx.empty()) { rs.noIndex++; return false; }
   const IVec3 bd = st.dims, bm = st.min;
@@ -14866,6 +14894,7 @@ bool MobSystem::RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
   static const IVec3 kSideFace[6] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
                                      {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
   bool changed = false, owned = false;
+  uint32_t cappedHere = 0;
   for (uint32_t j = 0; j < samples; j++) {
     const size_t vi = (from + j) % n;
     if (v.Mat(vi) == 0) continue;  // tombstone
@@ -14889,10 +14918,10 @@ bool MobSystem::RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
     }
     const uint16_t cur = v.Stain(vi);
     const uint32_t wetNow = BodyStainMat(cur) == water ? BodyStainAmt(cur) : 0u;
-    if (wetNow >= cap) { rs.capped++; continue; }
+    if (wetNow >= cap) { rs.capped++; cappedHere++; continue; }
     const uint16_t next =
         WashBodyStain(cur, water, std::min(cap, wetNow + perHit), perHit);
-    if (next == cur) continue;
+    if (next == cur) { cappedHere++; continue; }
     rs.wrote++;
     v.SetStain(vi, next);
     changed = true;
@@ -14900,7 +14929,14 @@ bool MobSystem::RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
     if (owned)
       MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y, p.z, next);
   }
-  if (changed) st.quiet = 0;
+  // Sated only on EVIDENCE: surface was reached and all of it was already at
+  // the cap. A visit whose samples all fell inside the limb says nothing.
+  if (changed) {
+    st.quiet = 0;
+    st.rainSated = 0;
+  } else if (cappedHere > 0 && st.rainSated < 255) {
+    st.rainSated++;
+  }
   return changed;
 }
 
@@ -14988,6 +15024,10 @@ bool MobSystem::WetOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
   for (uint32_t s = 0; s < samples; s++) {
     const uint32_t h = Hash3(key ^ 0x3E7D1u, tick, s);
     const size_t vi = h % (uint32_t)n;
+    // Burnt/eaten away but not yet compacted (FlushBurn batches that): no
+    // matter left to wick from or drip off. RainOneLimb and TallyCoat skip
+    // these the same way.
+    if (v.Mat(vi) == 0) continue;
     const uint16_t cur = v.Stain(vi);
     const uint32_t amt = BodyStainAmt(cur);
     if (amt < 2 || BodyStainMat(cur) != wet) continue;
@@ -14998,7 +15038,7 @@ bool MobSystem::WetOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
     if (foreign) {
       const IVec3 f = kFace[(h >> 20) % 6u];
       const uint32_t e = idxAt({l.x + f.x, l.y + f.y, l.z + f.z});
-      if (e) {
+      if (e && v.Mat(e - 1) != 0) {
         const uint16_t nc = v.Stain(e - 1);
         if (BodyStainAmt(nc) != 0 && BodyStainMat(nc) != wet) {
           const uint16_t next = WashBodyStain(nc, wet, amt / 2u, kWetWickRinse);
@@ -15761,6 +15801,34 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
                            pp.z, next);
       }
     };
+    // ARMOUR CATCHES A SPLASH (2026-09-23 audit). The droplet is flown against
+    // this limb's lattice alone, so without this a splash thrown at a plated
+    // torso landed on the skin UNDER the plate -- and an acid one (a thrown
+    // flask breaking, container.cpp) then ate the torso the plate covered,
+    // which StainOneLimb's contact pass had long refused to allow. A landing
+    // voxel asks the worn-shell probe along the way the droplet CAME IN (back
+    // up its flight, kWornNbrReach x 4 -- the gap between a rounded limb and a
+    // garment cut to its box is several cells on a diagonal, the burn pass's
+    // own reason for that reach); a shell there took the droplet instead.
+    // Every material, not only the corrosive ones: this is a flight, and a
+    // droplet that hit steel is on the steel, not soaked through it. (The
+    // shell is a rig slot of its own, so Mob::ApplySplatter flies the same
+    // burst at ITS lattice and the coat lands there; iron then pits by its own
+    // pass.) Null probe on anything wearing nothing: one pointer test per
+    // landing.
+    Vec3 backW{0, 0, 0};  // unit, world: back along the landing droplet's path
+    const float invScale = 1.0f / scale;
+    auto shielded = [&](int lx, int ly, int lz) -> bool {
+      if (!v.occlude) return false;
+      const Vec3 wp = v.xf->pos +
+                      Rotate(q, Vec3{((float)(lx + bm.x) + 0.5f) * invScale,
+                                     ((float)(ly + bm.y) + 0.5f) * invScale,
+                                     ((float)(lz + bm.z) + 0.5f) * invScale});
+      // Never further back than where the droplet was thrown from: a stump
+      // bleeding INSIDE its own collar is not caught by the collar.
+      const float reach = std::min(kWornNbrReach * 4.0f, (wp - e.origin).len());
+      return reach > 0.0f && v.WornAlong(wp, backW, reach) != 0u;
+    };
     // THE SPLAT. The voxel hit takes the full amount; exposed voxels round it
     // take less with distance and are dropped with rising chance toward the
     // rim, so a landing is a spot with a ragged edge and not a stamped disc.
@@ -15784,6 +15852,9 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
             int amt = (int)std::lround((float)e.amount * (1.0f - 0.5f * t * t) * jitter);
             if (centreVox) amt = std::max(amt, 1);
             if (amt <= 0) continue;
+            // The rim of a spot that landed beside a plate's edge must not
+            // creep under it (the centre was asked by the caller).
+            if (!centreVox && shielded(lx, ly, lz)) continue;
             mark((size_t)ent - 1, (uint32_t)amt);
           }
     };
@@ -15864,8 +15935,17 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
             const int lx = ifloor(p.x) - bm.x, ly = ifloor(p.y) - bm.y,
                       lz = ifloor(p.z) - bm.z;
             if (!idxAt(lx, ly, lz)) continue;
-            splat(lx, ly, lz, h);
             landed = true;
+            if (v.occlude) {
+              const float vl = vel.len();
+              backW = vl > 1e-6f ? vel * (-1.0f / vl) : Vec3{0, 1, 0};
+              if (shielded(lx, ly, lz)) {
+                wornStats_.splatBlocked++;
+                continue;  // on the shell: `landed` ends this droplet
+              }
+              wornStats_.splatPassed++;
+            }
+            splat(lx, ly, lz, h);
           }
         }
         pos = nxt;
@@ -15884,6 +15964,13 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
     if (!limb.body) continue;
     if (e.sourceMob == id_ && e.sourceLimb == (int)li) continue;
     BurnLimbView v = ViewOf(limb);
+    // Worn shells over this limb catch the splash (SplatterView); the probe
+    // BurnTick and StainTick set up, and only on a limb that has any.
+    WornProbe probe{this, (int)li};
+    if (LimbHasShells((int)li)) {
+      v.occlude = &WornProbe::Call;
+      v.occludeCtx = &probe;
+    }
     if (sys_->SplatterView(e, v, (uint32_t)li)) coatDirty_ = twinDirty_ = true;
   }
 }
@@ -18674,13 +18761,19 @@ MobSystem::BodyRayHit MobSystem::PickBody(uint64_t mobId, Vec3 ro, Vec3 rd,
   for (size_t li = 0; li < mob->limbs_.size(); li++) {
     MobLimb& l = mob->limbs_[li];
     if (!l.body) continue;
-    if (mob->phys_) mob->phys_->GetTransform(l.body, l.xf);
+    // The pose the body is DRAWN at, read into a LOCAL. This is called every
+    // frame from the portrait (main.cpp), outside the tick: writing Jolt's
+    // transform back into `l.xf` (as it once did) re-posed a live limb
+    // mid-tick, which the burn/stain/carve passes are written never to see
+    // (the note in BurnOneLimb, gotcha-live-limb-carve-pose). A pick is a
+    // question; it must not change the answer to anyone else's.
+    const BodyTransform xf = mob->PickPose(l);
     BurnLimbView v = mob->ViewOf(l);
     const float s = (float)std::max(1u, v.scale);
-    const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+    const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
     // The ray in LATTICE units: origin scaled, direction scaled by the same
     // factor, so the slab parameter stays in world voxels along a unit ray.
-    const Vec3 o = RotateInv(q, ro - l.xf.pos) * s;
+    const Vec3 o = RotateInv(q, ro - xf.pos) * s;
     const Vec3 d = RotateInv(q, rd) * s;
     const float inv[3] = {std::fabs(d.x) > 1e-9f ? 1.0f / d.x : 1e30f,
                           std::fabs(d.y) > 1e-9f ? 1.0f / d.y : 1e30f,
@@ -18759,10 +18852,12 @@ uint32_t MobSystem::PourOnBody(uint64_t mobId, const BodyRayHit& hit, Vec3 rd,
     BurnLimbView& v = views[li] = mob->ViewOf(l);
     const float s = (float)std::max(1u, v.scale);
     const float invS = 1.0f / s;
-    const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+    // The same pose PickBody aimed with (a local; the limb is not re-posed).
+    const BodyTransform xf = mob->PickPose(l);
+    const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
     // Everything in LATTICE units, so no cell is rotated: the ray origin and
     // the brush basis go into the limb's frame once.
-    const Vec3 oL = RotateInv(q, ro - l.xf.pos) * s;
+    const Vec3 oL = RotateInv(q, ro - xf.pos) * s;
     const Vec3 dL = RotateInv(q, rd);   // unit
     const Vec3 uL = RotateInv(q, u), wL = RotateInv(q, w);
     const size_t n = v.Size();

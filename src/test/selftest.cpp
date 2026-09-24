@@ -779,6 +779,10 @@ const char* const kOrder[] = {
     // and lays one of them down, so it is the most disturbing member of the
     // group rather than the most easily disturbed.
     "levitate",
+    // ...and a splash at a plated torso (MobSystem::SplatterView's worn-shell
+    // test), appended by the same rule: it spawns two creatures and
+    // regenerates worldgen on the way out.
+    "splatter-armor",
     // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
     // As late as it can go, by the rule the `floaters` block above spells out.
     // It regenerates worldgen three times (once per pacing arm and once on the
