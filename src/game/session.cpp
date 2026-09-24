@@ -2614,6 +2614,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           bool found = false;
           for (uint32_t i = 0; i < bc.mobs->MobCount(); i++) {
             const uint64_t mid = bc.mobs->MobIdAt(i);
+            // A status rides a CREATURE; a corpse is a dead Mob now but was
+            // never a target here (it was debris), and still is not.
+            if (!bc.mobs->IsAlive(mid)) continue;
             Vec3 lo, hi;
             if (!bc.mobs->MobBodyBox(mid, lo, hi)) continue;
             const float d = boxDist(from, lo, hi);

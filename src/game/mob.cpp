@@ -3124,6 +3124,16 @@ void MobSystem::UpdateDeadSleep(World& world) {
     if (m.deadQuiet_ >= kDeadSleepTicks) {
       m.deadAsleep_ = true;
       m.deadWakeKey_ = m.DeadWakeKey(world);
+      // THE GARMENTS GO TO SLEEP WITH IT. A worn shell is kinematic and was
+      // last driven with its host's (settled, but not exactly zero) velocity;
+      // left alone it would drift on that for Jolt's own sleep timer. The
+      // next awake PostStep's DriveWornShells puts both back.
+      if (phys_ != nullptr)
+        for (const MobLimb& l : m.limbs_)
+          if (l.body && l.wornHost >= 0 && l.holdSeconds <= 0) {
+            phys_->SetBodyVelocities(l.body, Vec3{}, Vec3{});
+            phys_->DeactivateBody(l.body);
+          }
     }
   }
 }
@@ -10491,6 +10501,7 @@ void Mob::DropBurnIndex(BodyBurnState& st) {
   st.dims = IVec3{0, 0, 0};
   st.quiet = 0;
   st.sleepKey = 0;
+  st.idle = false;
   // `st.alight` deliberately SURVIVES. Everything above is an index INTO a
   // lattice that just changed shape; the flag is a fact ABOUT the lattice, and
   // it is the only thing that will make BurnOneLimb rebuild this index once the
@@ -12539,7 +12550,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           mix(cc->version);
         }
     if (known) sleepKey = h ? h : 1u;
-    if (sleepKey && sleepKey == st.sleepKey) return changed;  // asleep
+    if (sleepKey && sleepKey == st.sleepKey) {  // asleep
+      st.idle = true;
+      return changed;
+    }
   }
   st.sleepKey = 0;
   scanHot.clear();
@@ -12617,9 +12631,24 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // held index still counts its quiet ticks, and sleeping would freeze it.
     // `sleepKey` is nonzero only when the index was ALREADY empty on entry.
     if (st.idx.empty()) st.sleepKey = sleepKey;
+    st.idle = true;
     return changed;
   }
+  // AN EMPTY FRONT UNDER A LATCHED `alight`, WITH NOTHING ELSE GOING ON, ASKS
+  // FOR THE SWEEP. Only BuildBurnIndex may clear the flag, and it runs only
+  // when the index is missing -- so a limb whose last self-active voxel went
+  // (a human torso's anatomy blood decays to air over ~900 ticks) held its
+  // index, an empty front and alight=1 forever: never quiet, never dropping
+  // the index, never taking the idle exit above, and a corpse built from it
+  // could never sleep. Only when no world heat is near and no corrosive coat
+  // is working: those are real activity, and dropping the index under them
+  // every tick throws away the corrosion list mid-bite. One sweep settles it
+  // (it re-seeds the front from anything alight that was never a candidate).
+  if (scanHot.empty() && st.front.empty() && st.alight && !v.corrodeCoat &&
+      !st.idx.empty())
+    Mob::DropBurnIndex(st);
   st.quiet = 0;
+  st.idle = false;
   if (st.idx.empty()) BuildBurnIndex(v);
   if (st.idx.empty()) return changed;  // refused: absurd bounding box
 
@@ -15513,6 +15542,13 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget,
   // SECOND opinion about the same skin, which is worse.
   if (IsGhost()) return;
   const uint32_t mobKey = (uint32_t)id_ * 0x9E3779B9u ^ 0x57A1Eu;
+  stainWriters_ = 0;
+  stainWriterLimb_ = -1;
+  auto wrote = [&](uint8_t bit, int li) {
+    coatDirty_ = twinDirty_ = true;
+    stainWriters_ |= bit;
+    stainWriterLimb_ = (int16_t)li;
+  };
   const int nl = (int)limbs_.size();
   const int start = nl > 0 ? (int)(tick % (uint32_t)nl) : 0;
   // The worn-shell probe, as BurnTick sets it up: the contact pass asks it
@@ -15528,7 +15564,7 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget,
       v.occludeCtx = &probe;
     }
     const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
-    if (sys_->StainOneLimb(v, tick, key, world, budget)) coatDirty_ = twinDirty_ = true;
+    if (sys_->StainOneLimb(v, tick, key, world, budget)) wrote(1, li);
 
     // ---- AND WHAT IS ALREADY ON IT DRIES ------------------------------------
     // AFTER the contact pass and NOT gated on it: StainOneLimb returns early
@@ -15545,15 +15581,14 @@ void Mob::StainTick(uint32_t tick, World& world, uint32_t& budget,
     // ...rain lands on it from above (RainOneLimb), before it dries...
     // (Its own budget, not `budget`: a storm must not starve the passes
     // around it.)
-    if (sys_->RainOneLimb(v, tick, key, rainBudget, &world))
-      coatDirty_ = twinDirty_ = true;
+    if (sys_->RainOneLimb(v, tick, key, rainBudget, &world)) wrote(2, li);
     if (budget == 0) continue;
     if (sys_->DryOneLimb(v, limbs_[li].coat, tick, key, budget, &world))
-      coatDirty_ = twinDirty_ = true;
+      wrote(4, li);
     // ...and while it is still wet it wicks and drips (WetOneLimb).
     if (budget == 0) continue;
     if (sys_->WetOneLimb(v, limbs_[li].coat, tick, key, budget, &pendingSpawns_))
-      coatDirty_ = twinDirty_ = true;
+      wrote(8, li);
   }
   // The ledger, at its own bounded cadence — the same place and the same
   // reason RecountBurn sits at the tail of BurnTick.
@@ -18819,43 +18854,95 @@ bool Mob::RigActive() const {
   return false;
 }
 
-bool Mob::DeadQuietNow() const {
-  if (alive_ || rigReleased_ || sys_ == nullptr) return false;
-  if (twinDirty_ || coatDirty_ || burnFracDirty_) return false;
-  if (!pendingSpawns_.empty()) return false;
-  if (RigActive()) return false;
+const char* Mob::DeadAwakeReason() const {
+  if (alive_ || rigReleased_ || sys_ == nullptr) return "not a corpse";
+  if (twinDirty_ || coatDirty_) {
+    static thread_local char why[96];
+    std::snprintf(why, sizeof why,
+                  "%s dirty (stain writers 0x%x on limb %d)",
+                  twinDirty_ ? "twin" : "coat", (unsigned)stainWriters_,
+                  (int)stainWriterLimb_);
+    return why;
+  }
+  if (coatDirty_) return "coat dirty";
+  if (burnFracDirty_) return "burn fraction dirty";
+  if (!pendingSpawns_.empty()) return "pending spawns";
+  if (RigActive()) return "root active in Jolt";
   const auto& gt = CurrentTuning().gore;
   const bool rotRuns = gt.infectSpreadRate > 0.0f || gt.infectRotRate > 0.0f;
   const bool burnTables = sys_->BurnTablesReady();
   for (const MobLimb& l : limbs_) {
-    if (l.holdBody) return false;            // a sever hold in flight
+    if (l.holdBody) return "sever hold";           // a sever hold in flight
     if (!l.body) continue;
-    if (l.bleedBudget >= 1.0f || l.gushTicks > 0) return false;
-    if (l.hitFlash > 0.0f) return false;
-    if (l.burn.Burning() || l.burn.removed) return false;
-    // The burn pass's own idle verdict: it walked the world round this limb,
-    // found nothing, and is holding no index. 0 = it has not said so yet.
-    if (burnTables && l.burn.sleepKey == 0) return false;
-    if (rotRuns && l.infectMat != 0) return false;
-    if (l.bluntPulp) return false;
+    if (l.bleedBudget >= 1.0f || l.gushTicks > 0) return "bleeding";
+    if (l.hitFlash > 0.0f) return "hit flash";
+    // NOT `burn.removed`: tombstones below FlushBurn's batch threshold are a
+    // settled state (the living carry them indefinitely too, until the next
+    // carve compacts them, Mob::CarveLimb), not something still happening.
+    if (l.burn.Burning()) {
+      // Named in full: "burning" alone cost a run (the front also holds every
+      // drying / rotting / crumbling voxel, BodyBurnState::hotVox's note).
+      static thread_local char why[160];
+      uint32_t frontMat = 0;
+      if (!l.burn.front.empty() && !l.burn.idx.empty()) {
+        const uint32_t c = l.burn.front[0];
+        const uint32_t e = c < l.burn.idx.size() ? (l.burn.idx[c] & ~kBurnQueued) : 0;
+        if (e) {
+          if (l.HasFineSkin() && e - 1 < l.skinVoxels.size())
+            frontMat = l.skinVoxels[e - 1].material & 0xFFFu;
+          else if (!l.HasFineSkin() && e - 1 < l.voxels.size())
+            frontMat = l.voxels[e - 1].payload & 0xFFFu;
+        }
+      }
+      std::snprintf(why, sizeof why,
+                    "burn state: limb %d%s front %zu (first mat %u) alight %d "
+                    "hot %u removed %u idx %zu quiet %u",
+                    (int)(&l - limbs_.data()), l.wornHost >= 0 ? " (worn)" : "",
+                    l.burn.front.size(), frontMat, l.burn.alight ? 1 : 0,
+                    l.burn.hotVox, l.burn.removed, l.burn.idx.size(),
+                    l.burn.quiet);
+      return why;
+    }
+    // The burn pass's own idle verdict on its last visit: it walked the world
+    // round this limb and found nothing (BodyBurnState::idle). NOT `sleepKey`,
+    // which also needs the index dropped — and the stain passes rebuild it
+    // for their surface lists on any body lying on something that stains.
+    if (burnTables && !l.burn.idle) {
+      static thread_local char why[128];
+      std::snprintf(why, sizeof why,
+                    "burn pass not idle: limb %d%s idx %zu quiet %u corrosive %u",
+                    (int)(&l - limbs_.data()), l.wornHost >= 0 ? " (worn)" : "",
+                    l.burn.idx.size(), l.burn.quiet, (unsigned)l.coat.corrosive);
+      return why;
+    }
+    if (rotRuns && l.infectMat != 0) return "infected";
+    if (l.bluntPulp) return "pulping";
     // ---- the coat: nothing on it that is still changing -------------------
-    if (l.coat.corrosive) return false;
+    if (l.coat.corrosive) return "corrosive coat";
     for (const CoatEntry& en : l.coat.top) {
       if (en.mat == 0 || en.sumAmt == 0) continue;
       const uint32_t m = en.mat;
       // A WASHER (water) wicks and drips while it is on a body.
       if (m < sys_->matGpu_.size() &&
           (sys_->matGpu_[m].stainPack & kStainPackWashesBit))
-        return false;
+        return "washer coat";
       // A coat that DRIES is changing until it reaches its floor everywhere.
       const float secs = m < sys_->coatDecay_.size() ? sys_->coatDecay_[m] : 0.0f;
       if (secs <= 0.0f) continue;
       const uint32_t floor =
           m < sys_->coatDecayFloor_.size() ? sys_->coatDecayFloor_[m] : 0u;
-      if (en.sumAmt > en.voxels * floor) return false;
+      if (en.sumAmt > en.voxels * floor) {
+        static thread_local char why[128];
+        std::snprintf(why, sizeof why,
+                      "coat drying: limb %d mat %u sumAmt %u over %u voxels, "
+                      "floor %u, %.0f s",
+                      (int)(&l - limbs_.data()), m, (unsigned)en.sumAmt,
+                      (unsigned)en.voxels, floor, (double)secs);
+        return why;
+      }
     }
   }
-  return true;
+  return nullptr;
 }
 
 uint64_t Mob::DeadWakeKey(World& world) const {

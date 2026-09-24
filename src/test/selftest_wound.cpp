@@ -1526,6 +1526,19 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
   // only the corpse's own tick (Mob::BluntPulpTick, in the dead burn pot)
   // runs from here. The limb is addressed by its rig slot, which neither a
   // collider rebuild nor anything settling around it can renumber.
+  //
+  // THE RATE IS AN ARM, NOT THE CLAIM -- impact-blunt's (tests/baseline.json
+  // _impactPulp_about). The debris version of this gate saw voxels leave in 45
+  // ticks only because its fixture CARVED during the blows (BluntBody on
+  // `earned`); a dead Mob takes the living ladder, where nothing leaves in the
+  // swing and the shipped 1.5 vox/min is a minute of sim per crater. So the
+  // window runs at the same cranked impactPulpRot the living gates use.
+  const Tuning savedTune = CurrentTuning();
+  {
+    Tuning tt = savedTune;
+    tt.gore.pulpRotRate = (float)BaselineNumber("impactPulpRot", 30.0);
+    SetCurrentTuning(tt);
+  }
   uint32_t tick = 61000;
   for (int i = 0; i < 45; i++) {
     std::vector<BrushOp> ops;
@@ -1538,6 +1551,7 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
     c.debris.PostStep();
     tick++;
   }
+  SetCurrentTuning(savedTune);
   const uint32_t vox2 = mobs.LimbArtVoxelCount(id, t.limb);
 
   RecordObserved("corpseBluntCoat", (double)(coat1 - coat0));
@@ -3889,8 +3903,16 @@ struct DeadFixture {
     torso = c.mobs.LimbBody(id, root);
     return torso ? root : -1;
   }
+  // Voxels the torso still HAS, tombstones excluded: a corpse is a dead Mob,
+  // whose burn/acid/rot removals sit in the lattice as material 0 until
+  // FlushBurn's batch threshold fills (selftest_impact.cpp LiveVoxels' note),
+  // so the raw lattice size reads "nothing eaten" for a bite too small to
+  // flush. DebrisSystem compacted at once, which is why this never mattered.
   uint32_t TorsoVoxels() {
-    return TorsoIndex() >= 0 ? c.mobs.LimbArtVoxelCount(id, root) : 0u;
+    if (TorsoIndex() < 0) return 0u;
+    const uint32_t art = c.mobs.LimbArtVoxelCount(id, root);
+    const uint32_t dead = c.mobs.LimbMaterialCount(id, root, 0u);
+    return art > dead ? art - dead : 0u;
   }
   uint32_t TorsoCoat(uint32_t mat) {
     return TorsoIndex() >= 0 ? c.mobs.LimbCoatMatCount(id, root, mat, 1) : 0u;
@@ -6349,6 +6371,10 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
   PrepareWorld(c);
   DeadFixture f(c);
+  // Blood as a lattice MATERIAL on the root (it decays, so it holds the burn
+  // front open): spawned / just after the kill / 20 ticks on. Attribution.
+  uint32_t bloodMat = 0, bloodSpawned = 0, bloodSevered = 0, bloodSettled = 0;
+  uint32_t coatSpawned = 0, coatSevered = 0, coatSettled = 0;
   // A garment, so the asleep claim covers DriveWornShells' activations too.
   const ItemDef* wear = nullptr;
   for (const ItemDef& it : c.items.items)
@@ -6381,19 +6407,41 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
     for (int i = 0; i < 8; i++) f.Step();
     f.root = mob->Def()->rootLimb;
     f.torso = c.mobs.LimbBody(f.id, f.root);
+    bloodMat = mob->Def()->bleedMat;
+    bloodSpawned = c.mobs.LimbMaterialCount(f.id, f.root, bloodMat);
+    coatSpawned = c.mobs.LimbCoatMatCount(f.id, f.root, bloodMat, 1);
     c.mobs.Sever(f.id, f.root);
+    coatSevered = c.mobs.LimbCoatMatCount(f.id, f.root, bloodMat, 1);
     if (c.mobs.IsAlive(f.id)) {
       detail = "severing the root did not kill";
       c.mobs.Reset();
       return Status::Fail;
     }
+    bloodSevered = c.mobs.LimbMaterialCount(f.id, f.root, bloodMat);
     for (int i = 0; i < 20; i++) f.Step();
+    bloodSettled = c.mobs.LimbMaterialCount(f.id, f.root, bloodMat);
+    coatSettled = c.mobs.LimbCoatMatCount(f.id, f.root, bloodMat, 1);
   }
   const int maxTicks = (int)BaselineNumber("corpseSleepMaxTicks", 900);
   const int window = (int)BaselineNumber("corpseSleepWindow", 60);
   auto dead = [&]() { return c.mobs.FindMobById(f.id); };
   // ---- A. it falls asleep ---------------------------------------------------
+  // THE DRYING CLOCK IS AN ARM (corpse-wash's decayScale, the impact gates'
+  // pulp rate). Even a corpse killed without a wound carries its anatomy's
+  // `blood` voxels, which decay out of the torso over a few hundred ticks and
+  // leave a blood coat behind them; at the authored 20 s per level that coat
+  // keeps the body correctly AWAKE for ~15,000 ticks (Mob::DeadAwakeReason
+  // names it). Scaled so it dries inside the window, the claim is the one
+  // that matters: once there is nothing left to do, the corpse sleeps.
+  const Tuning sleepTune = CurrentTuning();
+  {
+    Tuning fast = sleepTune;
+    fast.coat.decayScale =
+        (float)BaselineNumber("corpseSleepDecayScale", 300.0);
+    SetCurrentTuning(fast);
+  }
   int asleepAt = -1;
+  std::string history;  // the awake reason at a few ticks, for attribution
   for (int i = 0; i < maxTicks; i++) {
     f.Step();
     const Mob* m = dead();
@@ -6401,24 +6449,40 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
       asleepAt = i;
       break;
     }
+    if (m != nullptr && (i == 0 || i == 10 || i == 100 || i == 400 || i == 700)) {
+      const char* w = m->DeadAwakeReason();
+      history += Format(" t%d:'%s'", i, w ? w : "quiet");
+    }
   }
   // Attribution when it did not (rule 6): which criterion is still awake.
   std::string awakeWhy;
   if (asleepAt < 0) {
     const Mob* m = dead();
-    uint32_t active = 0, bleeding = 0, burning = 0, unslept = 0;
+    uint32_t active = 0, bleeding = 0, burning = 0;
+    std::string activeSlots;
     for (int li = 0; m && li < m->LimbCount(); li++) {
       const uint64_t h = c.mobs.LimbBody(f.id, li);
       if (!h) continue;
-      if (c.phys.IsActive(h)) active++;
+      if (c.phys.IsActive(h)) {
+        active++;
+        activeSlots += Format(" %d", li);
+      }
       if (c.mobs.LimbWoundOpen(f.id, li)) bleeding++;
       if (c.mobs.LimbBurningCount(f.id, li)) burning++;
     }
-    (void)unslept;
-    awakeWhy = Format(" [still awake: %u limbs active in Jolt, %u bleeding, "
-                      "%u burning]",
-                      active, bleeding, burning);
+    const char* why = m ? m->DeadAwakeReason() : "gone";
+    awakeWhy = Format(" [still awake: '%s'; %u limbs active in Jolt (slots%s, "
+                      "root %d), %u bleeding, %u burning; earlier%s]",
+                      why ? why : "(quiet now)", active, activeSlots.c_str(),
+                      f.root, bleeding, burning, history.c_str());
+    awakeWhy += Format(" [root blood voxels: spawned %u, killed %u, +20 %u, "
+                       "now %u; blood-coated voxels %u, %u, %u, now %u]",
+                       bloodSpawned, bloodSevered, bloodSettled,
+                       c.mobs.LimbMaterialCount(f.id, f.root, bloodMat),
+                       coatSpawned, coatSevered, coatSettled,
+                       c.mobs.LimbCoatMatCount(f.id, f.root, bloodMat, 1));
   }
+  SetCurrentTuning(sleepTune);
   // ---- B. asleep, it costs nothing ------------------------------------------
   const uint64_t anchors0 = c.mobs.DeadAnchorsTotal();
   const uint64_t posts0 = c.mobs.DeadPostStepsTotal();

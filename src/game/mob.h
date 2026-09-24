@@ -777,6 +777,13 @@ struct BodyBurnState {
   // box of cell reads and a fetch request per piece per tick). 0 = awake.
   // Cleared with the index, and by any state the gate reads going non-idle.
   uint64_t sleepKey = 0;
+  // THE LAST VISIT FOUND NOTHING TO DO: BurnOneLimb took one of its idle exits
+  // (the sleepKey match, or "nothing hot near, empty front, not alight").
+  // Unlike sleepKey this holds while an index is held, which matters because
+  // the stain passes build the index for their own surface lists (a body lying
+  // on grass keeps one), and that is not fire. A dead Mob's sleep test reads
+  // it (Mob::DeadAwakeReason). Cleared with the index and by any busy visit.
+  bool idle = false;
 };
 
 // One limb or part, described in the terms the burn pass needs.
@@ -2018,6 +2025,9 @@ class Mob {
   // damage entry point, Jolt activity or a change in the chunks around it
   // wakes it (MobSystem::PreTick).
   bool DeadAsleep() const { return deadAsleep_; }
+  // Which sleep criterion is holding this corpse awake right now, by name
+  // (nullptr = none: it is quiet). The corpse-sleep gate's attribution.
+  const char* DeadAwakeReason() const;
   // Wake a sleeping corpse. Cheap and idempotent; every entry point that can
   // change a dead body calls it.
   void WakeDead() {
@@ -3034,7 +3044,7 @@ class Mob {
   // not stand up either), no arrest and therefore no fall damage.
   void TickDeadLimp(float dt);
   // Every sleep criterion (MobSystem's note on kDeadSleepTicks) as of now.
-  bool DeadQuietNow() const;
+  bool DeadQuietNow() const { return DeadAwakeReason() == nullptr; }
   // Digest of what could wake a sleeping corpse from outside without touching
   // it: the residency window and the version of every cached chunk the body's
   // box overlaps. Equal = nothing around it changed.
@@ -3546,6 +3556,10 @@ class Mob {
   bool rigReleased_ = false;   // the rig went to DebrisSystem: a husk
   bool deadAsleep_ = false;    // see DeadAsleep()
   uint16_t deadQuiet_ = 0;     // consecutive ticks DeadQuietNow() held
+  // Which of StainTick's passes wrote on its last run, and on which limb
+  // (bits: 1 contact, 2 rain, 4 dry, 8 wet). Attribution for DeadAwakeReason.
+  uint8_t stainWriters_ = 0;
+  int16_t stainWriterLimb_ = -1;
   uint64_t deadWakeKey_ = 0;   // DeadWakeKey() when it fell asleep
   uint64_t deathSeq_ = 0;      // see DeathSeq()
   bool swinging_ = false;
@@ -4774,7 +4788,10 @@ class MobSystem {
   // under DebrisSystem's own cull and settle-back, so the old corpse lifetime
   // is the tail of the new one and nothing is unbounded.
   static constexpr uint32_t kMaxDeadMobs = 12;
-  static constexpr uint32_t kMaxDeadBodies = 360;
+  // Bodies, not creatures: the render registry walks debris, the avatar, then
+  // mobs_ (living and dead together) into kMaxBodySlots (512); 240 leaves
+  // the living crowd and the debris the larger share.
+  static constexpr uint32_t kMaxDeadBodies = 240;
   // A dead Mob is asleep after this many consecutive quiet ticks
   // (Mob::DeadQuietNow); an asleep one re-registers its terrain anchor every
   // kDeadAnchorStride ticks so the patch under it is not evicted
