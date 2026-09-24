@@ -182,6 +182,13 @@ class PlayerAvatar : public Mob {
                                                   : 0u;
   }
   uint32_t PartMaterialCount(int part, uint32_t mat) const;
+  // PartMaterialCount for MANY materials in ONE walk of the part's voxels:
+  // `binMask[mat & 0xFFF]` names the bins (bit k -> `bins[k]`) a voxel of
+  // that material counts into; bins are ADDED to, not cleared. The HUD asks
+  // ~10 materials per limb per frame, and ten walks of a fine skin is the
+  // cost this exists to remove (docs/PLAN_perf_audit_2026-09-23.md P6.1).
+  void PartMaterialTally(int part, const uint16_t* binMask,
+                         uint32_t* bins) const;
   // Cells in a part's dense burn index; 0 = the index does not exist, i.e.
   // nothing reactive has come near it. Diagnostic.
   uint32_t PartBurnIndexCells(int part) const {

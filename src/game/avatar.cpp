@@ -5,6 +5,7 @@
 #include "phys/lattice.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstring>
 #include <cstdio>
@@ -2682,6 +2683,27 @@ uint32_t PlayerAvatar::PartMaterialCount(int part, uint32_t mat) const {
       if ((v.payload & 0xFFFu) == (mat & 0xFFFu)) n++;
   }
   return n;
+}
+
+void PlayerAvatar::PartMaterialTally(int part, const uint16_t* binMask,
+                                     uint32_t* bins) const {
+  if (part < 0 || part >= (int)limbs_.size()) return;
+  const MobLimb& p = limbs_[part];
+  // The SAME lattice choice PartMaterialCount makes, so a tally and the
+  // per-material count can never disagree about which voxels are the limb.
+  auto add = [&](uint32_t mat) {
+    uint16_t m = binMask[mat & 0xFFFu];
+    while (m) {
+      const int k = std::countr_zero((unsigned)m);
+      bins[k]++;
+      m &= (uint16_t)(m - 1);
+    }
+  };
+  if (p.HasFineSkin()) {
+    for (const PrefabVoxel& v : p.skinVoxels) add(v.material);
+  } else {
+    for (const DebrisVoxel& v : p.voxels) add(v.payload);
+  }
 }
 
 uint32_t PlayerAvatar::IgnitePart(int partIndex, uint32_t count,

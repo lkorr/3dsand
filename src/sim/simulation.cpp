@@ -91,6 +91,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   materialBuf_ = CreateBuffer(device, sizeof(MaterialGpu) * 4096,
                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                               "materials");
+  artPaletteLive_ = false;  // a new buffer holds no palette write
   reactionBuf_ = CreateBuffer(device, sizeof(ReactionGpu) * kMaxReactions,
                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                               "reactions");
@@ -113,6 +114,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   mbModelBuf_ = CreateBuffer(device, sizeof(MicroBodyModelGpu) * kMaxMicroBodyModels,
                              rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                              "microBodyModels");
+  mbModelLive_ = false;  // a new buffer holds no table write
   mbPoolBuf_ = CreateBuffer(device, (uint64_t)kMicroBodyPoolWordsWorld * 4,
                             rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                             "microBodyPool");
@@ -931,17 +933,22 @@ void Simulation::ApplyArtPalette(std::vector<MaterialGpu>& table) const {
 
 void Simulation::SetArtPalette(const rhi::Queue& queue,
                                const std::vector<uint32_t>& rgb) {
-  artPalette_ = rgb;
-  if (artPalette_.size() > kArtPaletteSlotsGpu)
-    artPalette_.resize(kArtPaletteSlotsGpu);
+  // UNCHANGED AND ALREADY ON THE GPU: nothing to send. This is called on every
+  // dirty micro-body frame, and the palette changes only when prefabs load.
+  const size_t n = std::min<size_t>(rgb.size(), kArtPaletteSlotsGpu);
+  if (artPaletteLive_ && n == artPalette_.size() &&
+      std::equal(artPalette_.begin(), artPalette_.end(), rgb.begin()))
+    return;
+  artPalette_.assign(rgb.begin(), rgb.begin() + n);
   if (artPalette_.empty()) return;
   // Patch just the reserved run rather than re-uploading all 4096 entries: the
   // rest of the table is unchanged and may be mid-frame on the GPU.
-  std::vector<MaterialGpu> run(kArtPaletteSlotsGpu, MaterialGpu{});
+  artRunScratch_.assign(kArtPaletteSlotsGpu, MaterialGpu{});
   for (size_t i = 0; i < artPalette_.size(); i++)
-    run[i].color0 = ArtRgbToGpu(artPalette_[i]);
+    artRunScratch_[i].color0 = ArtRgbToGpu(artPalette_[i]);
   queue.WriteBuffer(materialBuf_, (uint64_t)kArtPaletteBaseGpu * sizeof(MaterialGpu),
-                    run.data(), run.size() * sizeof(MaterialGpu));
+                    artRunScratch_.data(), artRunScratch_.size() * sizeof(MaterialGpu));
+  artPaletteLive_ = true;
 }
 
 void Simulation::BuildSimBindGroups(const rhi::Device& device) {
@@ -1162,6 +1169,9 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   ApplyArtPalette(table);
 
   queue.WriteBuffer(materialBuf_, 0, table.data(), table.size() * sizeof(MaterialGpu));
+  // The run now holds THIS table's entries, not SetArtPalette's last write,
+  // so the next SetArtPalette must send even an unchanged palette.
+  artPaletteLive_ = false;
 
   std::vector<ReactionGpu> rtable(kMaxReactions, ReactionGpu{});
   for (size_t i = 0; i < reactions.size() && i < kMaxReactions; i++)
@@ -1188,12 +1198,23 @@ void Simulation::UploadMicroBodies(const rhi::Queue& queue, MicroBodySet& set) {
   // Fixed-size GPU buffers: pad the table so a shrinking reload cannot leave a
   // stale model behind a still-live index, and never write past the ceiling.
   // The whole table is 16 bytes x kMaxMicroBodyModels — small enough that
-  // tracking which records moved would cost more than the write.
-  std::vector<MicroBodyModelGpu> table = set.models;
-  if (table.size() > kMaxMicroBodyModels) table.resize(kMaxMicroBodyModels);
+  // tracking which records moved would cost more than the write. But a dirty
+  // frame is usually a POOL change (a burning limb's pokes), not a table one,
+  // so the padded table is built in member scratch and compared with the last
+  // one sent: an unchanged table is not written again.
+  std::vector<MicroBodyModelGpu>& table = mbModelScratch_;
+  table.assign(set.models.begin(),
+               set.models.begin() + std::min<size_t>(set.models.size(),
+                                                     kMaxMicroBodyModels));
   table.resize(kMaxMicroBodyModels, MicroBodyModelGpu{kMicroBodyNoModel, 0, 1, 0});
-  queue.WriteBuffer(mbModelBuf_, 0, table.data(),
-                    table.size() * sizeof(MicroBodyModelGpu));
+  if (!mbModelLive_ || mbModelLast_.size() != table.size() ||
+      std::memcmp(mbModelLast_.data(), table.data(),
+                  table.size() * sizeof(MicroBodyModelGpu)) != 0) {
+    queue.WriteBuffer(mbModelBuf_, 0, table.data(),
+                      table.size() * sizeof(MicroBodyModelGpu));
+    mbModelLast_ = table;
+    mbModelLive_ = true;
+  }
 
   // The POOL is 4 MiB and is sent by RANGE (MicroBodySet::MarkPool). Writing
   // all of it on any dirty was correct and free while only a carve dirtied it;
@@ -1220,7 +1241,8 @@ void Simulation::UploadMicroBodies(const rhi::Queue& queue, MicroBodySet& set) {
 
   // The skin's art colours ride the same upload the bricks do: they are
   // published together or a painted brick indexes colours that are not there
-  // yet. Cheap and idempotent when nothing painted (SetArtPalette early-outs).
+  // yet. Free when the palette has not changed since it was last sent
+  // (SetArtPalette compares before it writes).
   SetArtPalette(queue, set.artColors);
 }
 

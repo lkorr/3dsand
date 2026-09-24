@@ -94,5 +94,6 @@ class BodyRegistry {
   // allocates nothing on the frames where it finds nothing, which is all of
   // them until something is wrong.
   mutable std::vector<uint32_t> scratch_;
+  mutable std::vector<uint32_t> ids_;
   mutable std::vector<MicroHolder> holders_;
 };

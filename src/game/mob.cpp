@@ -3459,8 +3459,14 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
 
 bool Mob::CellSupportsWeight(World& world, IVec3 cell) const {
   if (!world.CellInWindow(cell)) return false;          // outside = open
-  const CachedChunk* cc =
-      world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+  return CellSupportsWeightIn(
+      world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4}), cell);
+}
+
+// The classification half, for a caller that already holds the cell's chunk
+// (AiProbeCtx memoises it across a line-of-sight walk). `cc` must be what
+// World::Cached returns for the cell's chunk; the window test is the caller's.
+bool Mob::CellSupportsWeightIn(const CachedChunk* cc, IVec3 cell) const {
   if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;  // unknown = open
   const uint32_t lx = (uint32_t)(cell.x & 15), ly = (uint32_t)(cell.y & 15),
                  lz = (uint32_t)(cell.z & 15);
@@ -4100,6 +4106,15 @@ struct AiProbeCtx {
   // the blocked adapter. That adapter now defers to Mob::CellSupportsWeight,
   // which reads the mob's own ClassOf() — so this is gone rather than left
   // around to be picked up by the next adapter that needs the same answer.
+  //
+  // LAST-CHUNK MEMO for the blocked adapter, the same trick GroundHeightAt's
+  // column walk uses: a line-of-sight walk samples up to 96 consecutive cells
+  // and nearly all of them share a chunk, so one World::Cached hash lookup per
+  // chunk instead of per cell. Valid for this context's lifetime (one
+  // DecideIntent), inside which nothing installs or drops a cached chunk.
+  mutable IVec3 memoChunk{};
+  mutable const CachedChunk* memoCc = nullptr;
+  mutable bool memoValid = false;
 };
 
 // Is this cell something a body cannot stand in? ONE implementation, shared
@@ -4108,7 +4123,16 @@ struct AiProbeCtx {
 // locomotion it is steering (ai_nav.h rule 2, applied to the other half of the
 // probe pair).
 bool AiCellBlocked(const AiProbeCtx& c, int x, int y, int z) {
-  return c.mob->CellSupportsWeight(*c.world, IVec3{x, y, z});
+  const IVec3 cell{x, y, z};
+  if (!c.world->CellInWindow(cell)) return false;  // outside = open
+  const IVec3 ch{x >> 4, y >> 4, z >> 4};
+  if (!c.memoValid || ch.x != c.memoChunk.x || ch.y != c.memoChunk.y ||
+      ch.z != c.memoChunk.z) {
+    c.memoChunk = ch;
+    c.memoCc = c.world->Cached(ch);
+    c.memoValid = true;
+  }
+  return c.mob->CellSupportsWeightIn(c.memoCc, cell);
 }
 
 bool AiProbeGround(void* ctx, int x, int z, int yFrom, int& outY) {
@@ -18088,6 +18112,17 @@ uint32_t Mob::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
 
 void MobSystem::AppendMicroHolders(std::vector<MicroHolder>& out) const {
   for (const Mob& mob : mobs_) mob.AppendMicroHolders(out);
+}
+
+void MobSystem::AppendMicroModelIds(std::vector<uint32_t>& out) const {
+  for (const Mob& mob : mobs_) mob.AppendMicroModelIds(out);
+}
+
+// The audit's cheap phase: the same holders AppendMicroHolders names, in the
+// same order, as bare model indices — no snprintf, no std::string.
+void Mob::AppendMicroModelIds(std::vector<uint32_t>& out) const {
+  for (const MobLimb& limb : limbs_)
+    if (limb.microModel >= 0) out.push_back((uint32_t)limb.microModel);
 }
 
 void Mob::AppendMicroHolders(std::vector<MicroHolder>& out) const {

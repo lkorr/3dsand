@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "audio/cues.h"
@@ -101,10 +102,14 @@ Vec3 LaserMuzzle(const Player& player, const Camera& cam) {
 // Upper vs lower within a limb is read from the name ("armU"/"armL"), which is
 // the convention the rigs already use; when a rig has only one segment per limb
 // it lands in the upper slot and the figure simply draws a shorter limb.
+//
+// Views, not std::strings: this runs per limb per frame (FillBodyUI) and per
+// limb per cast, and two heap copies of a name to compare its last letters
+// were the whole of its cost.
 int BodySlotFor(const char* name, const char* tag) {
-  const std::string n = name, t = tag;
-  const bool left = n.size() >= 2 && n.compare(n.size() - 2, 2, ".L") == 0;
-  const bool right = n.size() >= 2 && n.compare(n.size() - 2, 2, ".R") == 0;
+  const std::string_view n = name, t = tag;
+  const bool left = n.ends_with(".L");
+  const bool right = n.ends_with(".R");
   // The segment letter is the character just before the side suffix:
   // "armU.L" -> 'U' (upper), "armL.L" -> 'L' (lower). Anything without a side
   // suffix, or with any other letter there, is treated as the upper segment.
@@ -114,7 +119,7 @@ int BodySlotFor(const char* name, const char* tag) {
   if (t == "head") return UIState::kSlotHead;
   if (t == "spine") {
     // The rig's root is the hips; every other spine part is the torso.
-    return n.find("hip") != std::string::npos ? UIState::kSlotHips
+    return n.find("hip") != std::string_view::npos ? UIState::kSlotHips
                                               : UIState::kSlotTorso;
   }
   if (t == "hand") return left ? UIState::kSlotHandL : UIState::kSlotHandR;
@@ -192,6 +197,10 @@ int BodySlotFor(const char* name, const char* tag) {
 // live range crossed a phase boundary. Fields of a per-call struct rather than
 // statics, on purpose: a static here is the exact defect N5 removed and
 // DESIGN.md §10 forbids.
+//
+// A FIELD ADDED HERE MUST BE RESET IN TickScratch::Reset below: the struct is
+// held across ticks, and it cannot simply be reassigned from a fresh one
+// because PerfSpan (in `spanGame`) is neither copyable nor movable.
 struct WorldScratch {
   uint32_t farCount = 0;        // phase B -> phase N (SubmitTick)
   bool particlesActive = false; // phase L -> phase N
@@ -215,7 +224,7 @@ struct WorldScratch {
 };
 
 // PER-SESSION TICK SCRATCH, same rule: a local whose live range crossed a
-// phase boundary, and which is ONE PLAYER'S.
+// phase boundary, and which is ONE PLAYER'S. Same reset rule as WorldScratch.
 struct LaserCut {
   uint64_t body = 0;
   Vec3 at{};
@@ -225,6 +234,33 @@ struct LaserCut {
 struct PlayerScratch {
   LaserCut laserCut;                   // phase C -> phase K
   std::vector<ExplosionOp> spellExps;  // phase I -> phase K
+};
+
+// Both of the above, HELD in TickAuthorityCtx::tickScratch across ticks.
+// They were built fresh at the top of every TickAuthority, which made the
+// "held here so the per-tick rebuild does not allocate" notes on `actors` and
+// `sessionAvatars` untrue: a fresh struct is a fresh vector. Held now, and
+// reset to exactly the state a fresh one had — every value field back to its
+// default, every vector emptied but keeping its capacity — so no phase can
+// see anything the previous tick left behind.
+struct TickScratch {
+  WorldScratch ws;
+  std::vector<PlayerScratch> players;
+
+  void Reset(size_t sessions) {
+    ws.farCount = 0;
+    ws.particlesActive = false;
+    ws.pc = IVec3{};
+    ws.t0 = ws.tSubmit0 = ws.tSubmit1 = ws.tPhys1 = 0;
+    ws.spanGame.reset();
+    ws.actors.clear();
+    ws.sessionAvatars.clear();
+    players.resize(sessions);
+    for (PlayerScratch& p : players) {
+      p.laserCut = LaserCut{};
+      p.spellExps.clear();
+    }
+  }
 };
 
 #define SV_ENGINE_REFS                                     \
@@ -2463,7 +2499,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           const Player* player;
           uint64_t playerId;
           const PlayerAvatar* avatar;
-        } bodyCtx{&phys, &mobs, &player, 0x9134A5EEu, &avatar};
+        } bodyCtx{&phys, &mobs, &player, kPlayerCasterId, &avatar};
         SpellBodyProbe bodyProbe;
         bodyProbe.ctx = &bodyCtx;
         // WHAT A FLIGHT RUNS INTO: the first MOVING-layer body on the tick's
@@ -2604,7 +2640,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             const SpellFxVec dirFx{0, kSpellFxOne, 0};
             const SpellProbe probe = WorldSpellProbe(world);
             CastResult res = spells.Cast(caster.compiled, caster.mana, playerHealth,
-                                         0x9134A5EEu, originFx, dirFx, tick, emit, &probe,
+                                         kPlayerCasterId, originFx, dirFx, tick, emit, &probe,
                                          &selfAt, &bodyProbe);
             caster.lastOutcome = res.outcome;
             if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
@@ -2689,7 +2725,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           const SpellProbe probe = WorldSpellProbe(world);
           CastResult res =
               spells.Cast(caster.compiled, caster.mana, playerHealth,
-                          0x9134A5EEu /*casterId*/, originFx, dirFx, tick, emit,
+                          kPlayerCasterId /*casterId*/, originFx, dirFx, tick, emit,
                           &probe, nullptr, &bodyProbe);
           caster.lastOutcome = res.outcome;
           if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
@@ -2700,7 +2736,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           const Vec3 eye = player.EyePos();
           const Vec3 fwd = cam.Forward();
           const Vec3 muzzle = eye + fwd * 1.5f;
-          spells.HoldBeam(0x9134A5EEu,
+          spells.HoldBeam(kPlayerCasterId,
                           {SpellFxFromFloat(muzzle.x), SpellFxFromFloat(muzzle.y),
                            SpellFxFromFloat(muzzle.z)},
                           {SpellFxFromFloat(fwd.x), SpellFxFromFloat(fwd.y),
@@ -2708,7 +2744,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                           ti.Held(TB_ALT));
         }
         if (ti.Pressed(TB_DROP)) {
-          spells.DropNewestStatus(0x9134A5EEu);
+          spells.DropNewestStatus(kPlayerCasterId);
         }
         spells.Tick(tick, world, classOf, emit, &bodyProbe);
         // Impact flashes: born from this tick's resolves, aged per tick.
@@ -2734,7 +2770,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         {
           int32_t bill = 0;
           for (const SpellBill& sb : emit.bills)
-            if (sb.casterId == 0x9134A5EEu) bill += sb.amount;
+            if (sb.casterId == kPlayerCasterId) bill += sb.amount;
           if (bill > 0) {
             const int32_t fromMana = std::min(bill, caster.mana.mana);
             caster.mana.mana -= fromMana;
@@ -2744,11 +2780,11 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               if (hp > bill) {
                 playerHealth.Spend(bill);
               } else {
-                spells.DropAll(0x9134A5EEu);   // dry: it all goes out
+                spells.DropAll(kPlayerCasterId);   // dry: it all goes out
               }
             }
           }
-          caster.mana.reserved = spells.ReservationFor(0x9134A5EEu);
+          caster.mana.reserved = spells.ReservationFor(kPlayerCasterId);
         }
         // A sustained gravity mod on a body: the caster's own, or anyone
         // else's. The second half was missing until 2026-09-22 — the VM has
@@ -2758,14 +2794,14 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // which of its two velocity states the body is in (limp or walking);
         // this only has to hand the number over.
         for (const SpellBodyImpulse& bi : emit.bodyImpulses) {
-          if (bi.target == 0x9134A5EEu) player.vel.y += bi.vps.y;
+          if (bi.target == kPlayerCasterId) player.vel.y += bi.vps.y;
           else mobs.LiftMob(bi.target, bi.vps);
         }
         // GRAFTS: the world half already left as ops; the body half fills the
         // caster's missing anatomy cells with that matter, root-first. The VM
         // cannot reach a body (thesis 4); the owner does it.
         for (const SpellRestore& rs : emit.restores) {
-          if (rs.casterId == 0x9134A5EEu) {
+          if (rs.casterId == kPlayerCasterId) {
             if (avatar.Spawned()) avatar.RestoreBody(rs.material, rs.count);
           } else {
             mobs.RestoreMob(rs.casterId, rs.material, rs.count);
@@ -2862,7 +2898,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // diagnose from silence.
         for (WindPrim w : emit.winds) {
           w.spawnTick = tick;
-          w.ownerId = 0x9134A5EEu;   // the same casterId the projectile carries
+          w.ownerId = kPlayerCasterId;   // the same casterId the projectile carries
           if (!WindPrims().Spawn(w)) ui.windPrimsDropped++;
         }
 
@@ -3701,8 +3737,10 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // the order is (session 0's ops in phase order), then session 1's.
   out.Clear();
 
-  WorldScratch ws;
-  std::vector<PlayerScratch> scratch(players.size());
+  if (!w.tickScratch) w.tickScratch = std::make_shared<TickScratch>();
+  w.tickScratch->Reset(players.size());
+  WorldScratch& ws = w.tickScratch->ws;
+  std::vector<PlayerScratch>& scratch = w.tickScratch->players;
   // A session with no window of its own gets its presentation sink now, once,
   // and keeps it: see SV_SEAM_REFS_PLAYER. The primary never allocates one.
   for (SessionTick& p : players)
