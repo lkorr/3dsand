@@ -1423,7 +1423,11 @@ everything.
 > still wins. Same mechanism-not-a-list property; two new consequences are
 > documented in §4.1's phase-4a note (the intra-flush WAW barrier, and the
 > MapWrite staging-ring exception — the one buffer that must NOT be zeroed).
-> `ZeroInitAll` survives only for `--vk-info`'s explicit exercise.
+> `ZeroInitAll` survived only for `--vk-info`'s explicit exercise and was
+> deleted with that mode (2026-09-24). Also since then: the queued fill is
+> SKIPPED when a later queued write covers the whole buffer before the flush
+> (it could zero nothing that survives), and the intra-flush WAW test is an
+> epoch stamp on the buffer rather than a scan (`Backend::FlushUploads`).
 > Precondition kept by construction: buffers are always created BEFORE the
 > encoder that first uses them (true at every call site; a buffer created while
 > an encoder is open would get its fill one command buffer too late).

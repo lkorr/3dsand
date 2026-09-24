@@ -52,7 +52,6 @@
 #include "gpu/context.h"
 #include "gpu/resources.h"
 #include "gpu/rhi_vk.h"  // rhi::vkr::SetCaptureStats (--shader-stats)
-#include "gpu/vk_info.h"
 #include "gpu/vk_shader_stats.h"
 #include "gpu/vk_smoke.h"
 #include "lab/lab.h"
@@ -4387,7 +4386,6 @@ int main(int argc, char** argv) {
   // --present fifo|mailbox|immediate pins the swapchain present mode for the
   // run; -1 = follow render.presentMode in tuning.json (F5-live).
   int presentOverride = -1;
-  bool vkInfo = false;   // --vk-info: Vulkan backend smoke test (headless)
   bool vkSmoke = false;  // --vk-smoke: cross-backend world-hash comparison (headless)
   // --vk-smoke-loud: phase 3c's determinism acceptance evidence — the same
   // comparison over an ACTIVE world (ops, explosions, particles, readback ring,
@@ -4576,7 +4574,6 @@ int main(int argc, char** argv) {
           "  --residency paged|dense  Voxel buffer residency mode (default: paged)\n\n"
           "Vulkan / debug:\n"
           "  --backend vulkan      Explicitly name the Vulkan backend\n"
-          "  --vk-info             Vulkan device + shader compile check (headless)\n"
           "  --vk-smoke            Quiet 50-tick pinned hash comparison\n"
           "  --vk-smoke-loud       Active 120-tick hash comparison (19 probes)\n"
           "  --vk-validation       Enable VK_LAYER_KHRONOS_validation + sync\n"
@@ -4855,12 +4852,6 @@ int main(int argc, char** argv) {
       if (i + 1 >= argc) { std::fprintf(stderr, "--adapter requires a value\n"); return 1; }
       lowPowerAdapter = std::string(argv[++i]) == "low";
     }
-    // `--vk-info` is the Vulkan port's phase-3a exit proof (src/gpu/vk_info.cpp):
-    // create a VkDevice, print the capability record phase 7 needs, compile
-    // every WGSL shader to SPIR-V through Tint, build every compute pipeline,
-    // zero-init and submit one fenced command buffer. Headless, and it runs no
-    // sim work — the only commands submitted are the zero-init fills.
-    else if (a == "--vk-info") vkInfo = true;
     // `--vk-smoke` runs a quiet 50-tick world and compares its hashes against
     // the PINNED sequence (src/gpu/vk_smoke.cpp). It used to compare Dawn
     // against Vulkan; with Dawn gone the pinned values ARE the reference, so
@@ -5067,11 +5058,6 @@ int main(int argc, char** argv) {
     }
     return WriteHeightmap(heightmapArgs, heightmapOut);
   }
-
-  // --vk-info answers before any GpuContext exists: it builds its own device
-  // to print the capability record, so it must not race the engine's for the
-  // adapter.
-  if (vkInfo) return sandvox::RunVkInfo(lowPowerAdapter);
 
   // --suite acceptance: one process, all measurements. The expensive part of a
   // run is Vulkan device creation + SPIR-V compilation + worldgen. This

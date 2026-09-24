@@ -12,29 +12,17 @@ bool PassTimer::Init(GpuContext& ctx, uint32_t capacity) {
   capacity_ = capacity * 2;
   querySet_ = ctx.device.CreateTimestampQuerySet(capacity_, "passTimer");
   if (!querySet_) return false;
-  resolve_ = CreateBuffer(ctx.device, (uint64_t)capacity_ * 8,
+  resolve_ = CreateBuffer(ctx.device, (uint64_t)capacity_ * rhi::kTimestampBytes,
                           rhi::BufferUsage::QueryResolve | rhi::BufferUsage::CopySrc,
                           "passTimerResolve");
   for (int i = 0; i < kRing; i++) {
     ring_[i].staging =
-        CreateBuffer(ctx.device, (uint64_t)capacity_ * 8,
+        CreateBuffer(ctx.device, (uint64_t)capacity_ * rhi::kTimestampBytes,
                      rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
                      "passTimerStaging");
     if (!ring_[i].staging) return false;
   }
   return true;
-}
-
-rhi::ComputePass PassTimer::BeginPass(const rhi::CommandEncoder& enc,
-                                      const char* name) {
-  if (!querySet_ || used_ + 2 > capacity_) return enc.BeginComputePass();
-  rhi::PassTimestampWrites tw{};
-  tw.querySet = querySet_;
-  tw.beginIndex = used_;
-  tw.endIndex = used_ + 1;
-  used_ += 2;
-  pending_.push_back(name);
-  return enc.BeginComputePass(name, tw);
 }
 
 bool PassTimer::AllocPassPair(const char* name, uint32_t& beginIdx, uint32_t& endIdx) {

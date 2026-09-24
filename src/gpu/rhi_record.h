@@ -24,105 +24,42 @@ class PassTimer;
 namespace rhi {
 
 // The per-call counts and flags the row conditions and dispatch selectors
-// resolve against. Mirrors the RecordCtx both walkers already use — the values
-// are properties of the TABLE, not of a backend.
-struct TableCtx {
-  uint32_t opsCount = 0;
-  uint32_t cellCount = 0;
-  uint32_t expCount = 0;
-  uint32_t spawnCount = 0;
-  uint32_t genCount = 0;
-  uint32_t farCount = 0;
-  uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
-  uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
-  // Chunk slots this tick's wind primitives want dirty-marked
-  // (docs/RESEARCH_wind.md §4.3). Zero on every tick of a world with no fan in
-  // it, which is what skips the windWake row entirely.
-  uint32_t windWakeCount = 0;
-  // Water-body chunk-list entries this tick (docs/PLAN_water_master.md M2).
-  // Zero whenever sim.waterBodyMode is 0 — the off switch is "no row is
-  // recorded", which is what keeps it an exact identity.
-  uint32_t waterChunkCount = 0;
-  // Reserved drain spawn-op BLOCKS this tick (M3, component 6). Zero at
-  // sim.waterBodyMode 0 and whenever no body is proposed, so the discharge
-  // row is not recorded and the shipped world cannot see it.
-  uint32_t waterDrainBodies = 0;
-  // M5: which body's container curve re-derives this tick, or
-  // kWaterBodyCap for "none". A pure function of the tick (plan
-  // section 3.4) and the whole condition on both sweep rows.
-  uint32_t waterSweepSlot = 0xFFFFFFFFu;
-  // W2: sim.waveMode, ANDed with "a body is listed this tick"
-  // (docs/PLAN_water_relevel.md §4.2). 0 = the surface-momentum row is not
-  // recorded at all, which is what makes waveMode 0 an exact identity.
-  uint32_t waveMode = 0;
-  // Openness refresh budget this tick (docs/PLAN_gi.md §2). 0 = the grid
-  // is off and neither openness row is recorded.
-  uint32_t opennessChunks = 0;
-  // Glow-field refresh budget this tick (src/sim/world.h kGlowBytes). 0 = the
-  // field is off and NONE of the three glow rows is recorded.
-  uint32_t glowChunks = 0;
-  bool hashEnable = false;
-  bool particlesActive = false;
-  // False under --residency paged (PLAN_page_table.md §3.5c).
-  bool denseWorldgen = true;
-  // False ONLY when the CPU can prove the dirty set is empty, dropping compact
-  // + the args copy + all 54 CA iterations (ROADMAP_scale.md §3.4).
-  bool caActive = true;
-  bool vizActive = false;
-  // Gas particles exist OR the CA has work this tick (docs/PLAN_gas_particles
-  // .md). False on every tick of a settled world with no plume, and then not
-  // one gas row is recorded.
-  bool gasActive = false;
-  // Far fire-plume emitters the CPU handed the GPU this tick (world.h
-  // kGasFarEmitMax). 0 = no frozen fire is in range, and then the splat row is
-  // not recorded at all; it also decides, together with gasActive, whether the
-  // density box is cleared (C_GASOUT).
-  uint32_t gasFarEmitCount = 0;
-  // ...and the LONG-RANGE emitters (world.h kGasFarOuterN). 0 = no fire is in
-  // the 51.2 m..409.6 m band, and then neither the wide splat nor the wide
-  // box's clear is recorded.
-  uint32_t gasFarWideCount = 0;
-  // Any loaded material authors a `repose` AND the CA has work this tick
-  // (world.h kReposeSnap*). False for a materials.json with no repose line, and
-  // then the snapshot prepass is not recorded at all.
-  bool reposeActive = false;
-  // ---- the clouds (cloud.wgsl, DESIGN.md 9.w) — per-FRAME, ShadowCache table
-  // bit 0 kCloudRecOn: the weather has something in the sky and weather.clouds
-  //   is on, so the weather/shadow/env/march/resolve rows record.
-  // bit 1 kCloudRecBake: the noise volume has not been baked since the last
-  //   pipeline build; the bake row records once.
-  // bit 2 kCloudRecShadowCache: the voxel shadow cache is on (its three rows
-  //   used to be C_ALWAYS inside EncodeShadowResolve's early-out; they now
-  //   share the table with the clouds, which run without it).
-  uint32_t cloudFlags = 0;
-  // Workgroups (8x8) over the low-res cloud target, from the frame's size.
-  uint32_t cloudGx = 0, cloudGy = 0;
-};
+// resolve against are pass::RecordCtx (sim/pass_table.h) — the SAME struct
+// Simulation fills and the recorder reads, passed through by reference. This
+// header used to declare a copy of it (rhi::TableCtx) that the bridge copied
+// field by field into a third; see pass::RecordCtx for what that cost.
 
-// The live resources a table row resolves against, as SEAM handles. The
-// symbolic ids (DirtyIn/DirtyOut, ParticlesRead/ParticlesWrite) must already be
-// resolved for the current page — Simulation::PassBuffer does that, in the same
-// place in the flow (record time) it always has.
+// The live resources a table row resolves against, as NON-OWNING pointers to
+// the seam objects behind Simulation's handles. The symbolic ids
+// (DirtyIn/DirtyOut, ParticlesRead/ParticlesWrite) must already be resolved
+// for the current page — Simulation::PassBuffer does that, in the same place
+// in the flow (record time) it always has.
+//
+// RAW POINTERS, NOT HANDLES, and that is the point: this struct is rebuilt on
+// every RecordTable call (up to fluidSubsteps + 4 per tick), and as ~180
+// refcounted handles every build was ~180 atomic increments plus as many
+// decrements, per call, for data the bridge only ever reads. The pointees are
+// owned by Simulation for the whole call; nothing here outlives it.
 struct TableBindings {
-  Buffer buffers[(int)pass::Buf::kCount];
-  ComputePipeline pipelines[(int)pass::Pipe::kPipeCount];  // by (int)pass::Pipe
-  PipelineLayout simLayout;       // GRP_SIM (simPL_)
-  PipelineLayout slimPartLayout;  // GRP_SLIM_PART (simPL2_)
-  PipelineLayout slimFarLayout;   // GRP_SLIM_FAR (farPL_)
-  PipelineLayout slimFluidLayout; // GRP_SLIM_FLUID (fluidPL_)
-  PipelineLayout slimFluidSeamLayout; // GRP_SLIM_FLUIDSEAM (fluidSeamPL_)
-  PipelineLayout slimGasLayout;   // GRP_SLIM_GAS (gasPL_)
-  PipelineLayout shadowLayout;    // GRP_SHADOW (shadowPL_) — ONE set, unlike
-                                  // every Slim* pair above: the resolve pass
-                                  // shares no buffer with the sim groups.
-  BindGroup simSet;               // simBG_[page]
-  BindGroup slimSet;              // simSlimBG_[page]
-  BindGroup particleSet;          // particleBG_[page]
-  BindGroup farSet;               // farBG_
-  BindGroup fluidSet;             // fluidBG_
-  BindGroup fluidSeamSet;         // fluidSeamBG_[page]
-  BindGroup gasSet;               // gasBG_[page]
-  BindGroup shadowSet;            // shadowBG_
+  BufferImpl* buffers[(int)pass::Buf::kCount] = {};
+  ComputePipelineImpl* pipelines[(int)pass::Pipe::kPipeCount] = {};  // by (int)pass::Pipe
+  PipelineLayoutImpl* simLayout = nullptr;           // GRP_SIM (simPL_)
+  PipelineLayoutImpl* slimPartLayout = nullptr;      // GRP_SLIM_PART (simPL2_)
+  PipelineLayoutImpl* slimFarLayout = nullptr;       // GRP_SLIM_FAR (farPL_)
+  PipelineLayoutImpl* slimFluidLayout = nullptr;     // GRP_SLIM_FLUID (fluidPL_)
+  PipelineLayoutImpl* slimFluidSeamLayout = nullptr; // GRP_SLIM_FLUIDSEAM (fluidSeamPL_)
+  PipelineLayoutImpl* slimGasLayout = nullptr;       // GRP_SLIM_GAS (gasPL_)
+  // GRP_SHADOW (shadowPL_) — ONE set, unlike every Slim* pair above: the
+  // resolve pass shares no buffer with the sim groups.
+  PipelineLayoutImpl* shadowLayout = nullptr;
+  BindGroupImpl* simSet = nullptr;        // simBG_[page]
+  BindGroupImpl* slimSet = nullptr;       // simSlimBG_[page]
+  BindGroupImpl* particleSet = nullptr;   // particleBG_[page]
+  BindGroupImpl* farSet = nullptr;        // farBG_
+  BindGroupImpl* fluidSet = nullptr;      // fluidBG_
+  BindGroupImpl* fluidSeamSet = nullptr;  // fluidSeamBG_[page]
+  BindGroupImpl* gasSet = nullptr;        // gasBG_[page]
+  BindGroupImpl* shadowSet = nullptr;     // shadowBG_
 };
 
 // Record one table through the encoder's generated-barrier recorder. This is
@@ -131,7 +68,8 @@ struct TableBindings {
 // the recorder writes a GPU timestamp pair around each run of rows sharing a
 // `group` label, which is the granularity the phase-0 per-pass baseline was
 // measured at, so the numbers stay comparable to it.
-void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const TableCtx& cx,
-                       const TableBindings& tb, PassTimer* timer);
+void RecordTableVulkan(const CommandEncoder& enc, pass::Table which,
+                       const pass::RecordCtx& cx, const TableBindings& tb,
+                       PassTimer* timer);
 
 }  // namespace rhi

@@ -378,8 +378,9 @@ enum class Dyn : uint8_t { None, Zero, Ca };
 // here even though there is currently a single reader.
 //
 // 256 is the value passUBO was built with (54 slices x 256 B) and is a legal
-// dynamic offset on this device: minUniformBufferOffsetAlignment is 64
-// (--vk-info), and the requirement is that the offset be a multiple of it.
+// dynamic offset on every desktop device: Vulkan caps
+// minUniformBufferOffsetAlignment at 256, and the requirement is that the
+// offset be a multiple of it (it is 64 on the development RTX 3060 Ti).
 inline constexpr uint32_t kPassStride = 256;
 
 // Conditions, all known on the CPU before recording begins. A row whose
@@ -487,7 +488,7 @@ enum class Cond : uint8_t {
   // touched, and the pinned hash cannot move. The same shape as Cond::Gas and
   // Cond::WaterBody -- "off" means NO ROW, not a cheap row.
   ReposeActive,
-  // ---- the per-frame table's three switches (TableCtx::cloudFlags) ----
+  // ---- the per-frame table's three switches (RecordCtx::cloudFlags) ----
   // Clouds: the sky has cloud in it and weather.clouds is on. Off = not one
   // cloud row recorded, and the composite reads nothing (RWF_CLOUDS clear).
   Clouds,
@@ -556,7 +557,7 @@ enum class DispatchSel : uint32_t {
   // ---- shadow cache ----
   // Indirect: world.shadowArgs @ 0. The count is a GPU-side quantity (the
   // fragment shader appended it last frame), so the dispatch size cannot come
-  // from a TableCtx field the way farCount does — nothing on the CPU knows it,
+  // from a RecordCtx field the way farCount does — nothing on the CPU knows it,
   // and asking would mean a readback in the frame path.
   IndShadowArgs,
   // ---- gas particles ----
@@ -628,5 +629,104 @@ struct Row {
 // The expanded table, in record order. Rows for one Table are contiguous.
 extern const Row* const kRows;
 extern const int kRowCount;
+
+// ---------------------------------------------------------- record context --
+// Everything a row's Cond and DispatchSel resolve against, gathered by
+// Simulation's Encode* functions and read by the recorder (vk::Recorder::
+// CondHolds / Extent). ONE struct, used on both sides of the rhi seam.
+//
+// It used to be THREE — Simulation's file-local RecordCtx, rhi::TableCtx, and
+// vk::RecordCtx — hand-copied field by field twice per RecordTable call, and
+// three fields went missing across those copies at different times
+// (denseWorldgen and caActive, then vizActive; see the git history of
+// rhi_vk.cpp's RecordTableVulkan). A field that did not cross was silently its
+// DEFAULT on the recorder side. With one plain struct there is no copy to
+// forget. The defaults below are the recorder's safe side: CaActive defaults
+// TRUE (the CA records unless proven idle), every count 0 (the row is skipped).
+//
+// Plain data, no Vulkan types, so src/sim and src/gpu both include it.
+struct RecordCtx {
+  uint32_t opsCount = 0;
+  uint32_t cellCount = 0;
+  uint32_t expCount = 0;
+  uint32_t spawnCount = 0;
+  uint32_t genCount = 0;
+  uint32_t farCount = 0;
+  uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
+  uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick
+  // Chunk slots this tick's wind primitives want dirty-marked
+  // (docs/RESEARCH_wind.md §4.3). Zero on every tick of a world with no fan in
+  // it, which is what skips the windWake row entirely (Cond::WindWake).
+  uint32_t windWakeCount = 0;
+  // Water-body chunk-list entries this tick (docs/PLAN_water_master.md M2).
+  // Zero whenever sim.waterBodyMode is 0 — the off switch is "no row is
+  // recorded" (Cond::WaterBody), which is what keeps it an exact identity.
+  uint32_t waterChunkCount = 0;
+  // Reserved drain spawn-op BLOCKS this tick (M3, component 6). Zero at
+  // sim.waterBodyMode 0 and whenever no body is proposed, so the discharge
+  // row is not recorded and the shipped world cannot see it.
+  uint32_t waterDrainBodies = 0;
+  // M5: which body's container curve re-derives this tick, or any value >=
+  // kWaterBodyCap (world.h) for "none" — which is every tick of a basin nobody
+  // has dug into, and what leaves both sweep rows unrecorded (Cond::WaterSweep
+  // tests `< kWaterBodyCap`). The default is "none" in the widest form so this
+  // header need not include world.h.
+  uint32_t waterSweepSlot = 0xFFFFFFFFu;
+  // W2: sim.waveMode ANDed with "a body is listed this tick"
+  // (docs/PLAN_water_relevel.md §4.2). 0 leaves the surface-momentum row
+  // unrecorded (Cond::WaterWave), which is the exact-identity arm.
+  uint32_t waveMode = 0;
+  // Chunks the openness refresh walks this tick (render.opennessChunksPerFrame,
+  // clamped, and gated on render.opennessStrength). 0 = Cond::Openness false
+  // and NOTHING recorded, which is what makes the `noopenness` --render-budget
+  // arm measure the pass as well as the reads.
+  uint32_t opennessChunks = 0;
+  // Chunks the glow refresh walks this tick (render.glowChunksPerFrame,
+  // clamped, and zeroed when render.glowStrength is 0). Suppresses all three
+  // glow rows (Cond::Glow), which is what makes the off switch exact.
+  uint32_t glowChunks = 0;
+  bool hashEnable = false;
+  bool particlesActive = false;
+  // False under --residency paged: worldgen's whole-world dispatch is replaced
+  // by batched worldgenList submits (PLAN_page_table.md §3.5c).
+  bool denseWorldgen = true;
+  // False ONLY when the CPU can prove the dirty set is empty (ROADMAP_scale.md
+  // §3.4). Drops compact + the args staging copy + all 54 CA iterations, which
+  // is the whole of a settled tick's CA cost. Defaults TRUE so a caller that
+  // never sets it records the CA exactly as before — the safe direction.
+  bool caActive = true;
+  // True only while the per-voxel activity overlay is on. Gates the ActVoxViz
+  // write so the debug buffer costs nothing when the dev toggle is off.
+  bool vizActive = false;
+  // Gas particles (docs/PLAN_gas_particles.md). True when parcels are already
+  // in flight OR the CA has work this tick — a voxel can only reach the window
+  // edge from a chunk the CA is running, and a parcel already out there has to
+  // be stepped whether or not any chunk is awake. See the latch in EncodeTick.
+  bool gasActive = false;
+  // Far fire-plume emitters the CPU handed the GPU this tick (world.h
+  // kGasFarEmitMax). 0 = no frozen fire is in range, and then the splat row is
+  // not recorded at all; it also decides, together with gasActive, whether the
+  // density box is cleared (Cond::GasOuter).
+  uint32_t gasFarEmitCount = 0;
+  // ...and the LONG-RANGE emitters (world.h kGasFarOuterN). 0 = no fire is in
+  // the 51.2 m..409.6 m band, and then neither the wide splat nor the wide
+  // box's clear is recorded.
+  uint32_t gasFarWideCount = 0;
+  // Any loaded material authors a `repose` AND the CA has work this tick
+  // (world.h kReposeSnap*). False for a materials.json with no repose line,
+  // and then the snapshot prepass is not recorded at all. See the latch in
+  // EncodeTick.
+  bool reposeActive = false;
+  // ---- the clouds (cloud.wgsl, DESIGN.md 9.w) — per-FRAME, ShadowCache table
+  // bit 0 kCloudRecOn: the weather has something in the sky and weather.clouds
+  //   is on, so the weather/shadow/env/march/resolve rows record (Cond::Clouds).
+  // bit 1 kCloudRecBake: the noise volume has not been baked since the last
+  //   pipeline build; the bake row records once (Cond::CloudBake).
+  // bit 2 kCloudRecShadowCache: the voxel shadow cache is on
+  //   (Cond::ShadowCacheOn).
+  uint32_t cloudFlags = 0;
+  // Workgroups (8x8) over the low-res cloud target, from the frame's size.
+  uint32_t cloudGx = 0, cloudGy = 0;
+};
 
 }  // namespace pass

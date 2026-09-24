@@ -21,8 +21,11 @@
 // order and semantics mirror webgpu_cpp.h — that is what made the migration a
 // mechanical rename with a provably unchanged world hash, and renaming them
 // now would be exactly the kind of churn that hides a behaviour change inside
-// a refactor. Where a name is genuinely wrong for Vulkan the comment says so
-// (e.g. ClearBuffer is vkCmdFillBuffer).
+// a refactor. Where a name is genuinely wrong for Vulkan the comment says so.
+// Calls that only the Dawn backend could ever serve (a generic ComputePass,
+// ClearBuffer) were deleted on 2026-09-24 rather than left behind as
+// abort-if-reached stubs: sim compute records through the pass-table bridge
+// (rhi_record.h), never through wgpu-shaped compute passes.
 //
 // Handles are value types with reference semantics (like wgpu::), each holding
 // a backend handle in a small impl struct. Encoding-path cost is irrelevant at
@@ -30,7 +33,7 @@
 // CPU), so clarity beats avoiding an indirection.
 //
 // The ~10 concepts (docs/vulkan_pass_map.md §7):
-//   Buffer, CommandEncoder, ComputePassEncoder, RenderPassEncoder,
+//   Buffer, CommandEncoder, RenderPassEncoder,
 //   Texture/TextureView, ShaderModule, BindGroupLayout/PipelineLayout/BindGroup,
 //   ComputePipeline/RenderPipeline, Queue, Device.
 // Plus two things the port needs that WebGPU spells awkwardly:
@@ -148,8 +151,10 @@ enum class BlendFactor : uint32_t { Zero, One, SrcAlpha, OneMinusSrcAlpha, Src,
                                     OneMinusSrc, Dst, OneMinusDst };
 enum class BlendOperation : uint32_t { Add, Subtract, ReverseSubtract, Min, Max };
 
-// Whole-buffer sentinel for ClearBuffer/size arguments (wgpu::kWholeSize).
-inline constexpr uint64_t kWholeSize = ~0ull;
+// Bytes one resolved timestamp query occupies: CommandEncoder::ResolveQuerySet
+// always resolves 64-bit results, so a resolve/readback buffer holds this many
+// bytes per query and the copy stride is this value.
+inline constexpr uint64_t kTimestampBytes = sizeof(uint64_t);
 
 // ------------------------------------------------------------- handles ----
 // Each wraps a backend object. Copyable (shared), default-constructed handles
@@ -167,7 +172,6 @@ struct ComputePipelineImpl;
 struct RenderPipelineImpl;
 struct CommandEncoderImpl;
 struct CommandBufferImpl;
-struct ComputePassImpl;
 struct RenderPassImpl;
 struct QuerySetImpl;
 
@@ -292,11 +296,12 @@ struct RenderPassDesc {
   DepthAttachment depth;
 };
 
-// Timestamp writes attached to a compute pass (measurement only — PassTimer).
-struct PassTimestampWrites {
-  QuerySet querySet;
-  uint32_t beginIndex = 0;
-  uint32_t endIndex = 0;
+// One region of a batched buffer-to-buffer copy (CommandEncoder::
+// CopyTrackedRegions). Field-for-field VkBufferCopy, kept backend-free.
+struct CopyRegion {
+  uint64_t srcOffset = 0;
+  uint64_t dstOffset = 0;
+  uint64_t size = 0;
 };
 
 // Texture <-> buffer copy descriptors, used by the screenshot path only.
@@ -318,25 +323,6 @@ struct Extent3D {
 };
 
 // ------------------------------------------------------------ encoders ----
-
-class ComputePass {
- public:
-  ComputePass() = default;
-  explicit ComputePass(std::shared_ptr<ComputePassImpl> p) : p_(std::move(p)) {}
-  explicit operator bool() const { return p_ != nullptr; }
-
-  void SetPipeline(const ComputePipeline& p) const;
-  void SetBindGroup(uint32_t index, const BindGroup& bg) const;
-  // dynamicOffsets applies to the layout entries flagged hasDynamicOffset.
-  void SetBindGroup(uint32_t index, const BindGroup& bg, uint32_t dynamicOffsetCount,
-                    const uint32_t* dynamicOffsets) const;
-  void DispatchWorkgroups(uint32_t x, uint32_t y = 1, uint32_t z = 1) const;
-  void DispatchWorkgroupsIndirect(const Buffer& args, uint64_t offset) const;
-  void End() const;
-
- private:
-  std::shared_ptr<ComputePassImpl> p_;
-};
 
 class RenderPass {
  public:
@@ -371,7 +357,6 @@ class CommandEncoder {
   explicit operator bool() const { return p_ != nullptr; }
   CommandEncoderImpl* Get() const { return p_.get(); }
 
-  void ClearBuffer(const Buffer& b, uint64_t offset = 0, uint64_t size = kWholeSize) const;
   void CopyBufferToBuffer(const Buffer& src, uint64_t srcOffset, const Buffer& dst,
                           uint64_t dstOffset, uint64_t size) const;
 
@@ -391,6 +376,13 @@ class CommandEncoder {
   // between them is visible at the call site.
   void CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t srcOffset,
                    const Buffer& dst, uint64_t dstOffset, uint64_t size) const;
+  // The batched form: `count` regions from one tracked source into one
+  // destination, recorded as ONE tracker touch and ONE copy command. Same
+  // contract as CopyTracked (the destination is a readback slot or staging
+  // buffer read only by the host, regions disjoint). For the loop call sites
+  // that issue a CopyTracked per chunk into one staging buffer.
+  void CopyTrackedRegions(pass::Buf srcId, const Buffer& src, const Buffer& dst,
+                          const CopyRegion* regions, size_t count) const;
   // THE ONE RENDER-DOMAIN WRITE THE TRACKER IS TOLD ABOUT. barrier_graph §2.6
   // assumes draws are read-only over every buffer, and the recorder's
   // BeginRendering flush is built on it. RENDER_STATS' counters
@@ -445,9 +437,6 @@ class CommandEncoder {
   // Writes no memory and orders nothing: it cannot change what the frame draws.
   void WriteTimestamp(const QuerySet& qs, uint32_t index, bool bottom) const;
 
-  ComputePass BeginComputePass(const char* label = nullptr) const;
-  // Overload carrying GPU timestamp writes (measurement harness only).
-  ComputePass BeginComputePass(const char* label, const PassTimestampWrites& ts) const;
   RenderPass BeginRenderPass(const RenderPassDesc& d) const;
 
   CommandBuffer Finish() const;

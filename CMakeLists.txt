@@ -447,7 +447,6 @@ add_library(sandvox_core OBJECT
   src/gpu/rhi_vulkan.cpp
   src/gpu/rhi_vk.cpp
   src/gpu/vk_record.cpp
-  src/gpu/vk_info.cpp
   src/gpu/vk_shader_stats.cpp
   src/gpu/vk_smoke.cpp
   src/measure/measure.cpp

@@ -1,9 +1,8 @@
 // rhi.cpp — the public seam classes, forwarding to the abstract impl layer.
 //
-// Every method here is one virtual hop into rhi_impl.h; which backend answers
-// is decided by which subclass the Device was created from (rhi_dawn.cpp /
-// rhi_vk.cpp). Nothing in this file makes a decision, so a reader auditing the
-// seam only has to read the two backends.
+// Every method here is one virtual hop into rhi_impl.h, answered by the one
+// backend (rhi_vk.cpp). Nothing in this file makes a decision, so a reader
+// auditing the seam only has to read the backend.
 
 #include "gpu/rhi_impl.h"
 
@@ -19,30 +18,6 @@ TextureView Texture::CreateView() const {
   if (!*this) return {};
   return Get()->CreateView();
 }
-
-// --------------------------------------------------------- ComputePass ----
-
-void ComputePass::SetPipeline(const ComputePipeline& pipe) const { p_->SetPipeline(pipe); }
-
-void ComputePass::SetBindGroup(uint32_t index, const BindGroup& bg) const {
-  p_->SetBindGroup(index, bg, 0, nullptr);
-}
-
-void ComputePass::SetBindGroup(uint32_t index, const BindGroup& bg,
-                               uint32_t dynamicOffsetCount,
-                               const uint32_t* dynamicOffsets) const {
-  p_->SetBindGroup(index, bg, dynamicOffsetCount, dynamicOffsets);
-}
-
-void ComputePass::DispatchWorkgroups(uint32_t x, uint32_t y, uint32_t z) const {
-  p_->Dispatch(x, y, z);
-}
-
-void ComputePass::DispatchWorkgroupsIndirect(const Buffer& args, uint64_t offset) const {
-  p_->DispatchIndirect(args, offset);
-}
-
-void ComputePass::End() const { p_->End(); }
 
 // ---------------------------------------------------------- RenderPass ----
 
@@ -69,10 +44,6 @@ void RenderPass::End() const { p_->End(); }
 
 // ------------------------------------------------------ CommandEncoder ----
 
-void CommandEncoder::ClearBuffer(const Buffer& b, uint64_t offset, uint64_t size) const {
-  p_->ClearBuffer(b, offset, size);
-}
-
 void CommandEncoder::CopyBufferToBuffer(const Buffer& src, uint64_t srcOffset,
                                         const Buffer& dst, uint64_t dstOffset,
                                         uint64_t size) const {
@@ -83,6 +54,11 @@ void CommandEncoder::CopyTracked(pass::Buf srcId, const Buffer& src, uint64_t sr
                                  const Buffer& dst, uint64_t dstOffset,
                                  uint64_t size) const {
   p_->CopyTracked(srcId, src, srcOffset, dst, dstOffset, size);
+}
+void CommandEncoder::CopyTrackedRegions(pass::Buf srcId, const Buffer& src,
+                                        const Buffer& dst, const CopyRegion* regions,
+                                        size_t count) const {
+  p_->CopyTrackedRegions(srcId, src, dst, regions, count);
 }
 void CommandEncoder::CopyRenderWritten(const Buffer& src, uint64_t srcOffset,
                                        const Buffer& dst, uint64_t dstOffset,
@@ -119,15 +95,6 @@ void CommandEncoder::ResolveQuerySet(const QuerySet& qs, uint32_t firstQuery,
 void CommandEncoder::WriteTimestamp(const QuerySet& qs, uint32_t index,
                                     bool bottom) const {
   p_->WriteTimestamp(qs, index, bottom);
-}
-
-ComputePass CommandEncoder::BeginComputePass(const char* label) const {
-  return p_->BeginComputePass(label, nullptr);
-}
-
-ComputePass CommandEncoder::BeginComputePass(const char* label,
-                                             const PassTimestampWrites& ts) const {
-  return p_->BeginComputePass(label, &ts);
 }
 
 RenderPass CommandEncoder::BeginRenderPass(const RenderPassDesc& d) const {

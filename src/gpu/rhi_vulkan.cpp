@@ -8,7 +8,7 @@
 #include <filesystem>
 #include <functional>
 #include <iterator>  // std::make_move_iterator — AbandonCommands re-queue
-#include <thread>    // SPIR-V cache temp name (write-then-rename)
+#include <thread>    // SPIR-V cache temp name; PruneShaderCache's background sweep
 
 // The pipeline cache's temp-file name carries the PID: SANDVOX_PIPELINE_CACHE
 // lets several processes share one cache file, and two of them renaming the
@@ -183,6 +183,42 @@ VkShaderStageFlags ToVkStages(rhi::ShaderStage s) {
   return f;
 }
 
+// The shader_cache/ LRU sweep (kShaderCacheMaxAgeDays). Runs once per process
+// on a detached thread started by the first GetShaderModule, so the
+// directory walk — tens of thousands of entries on a machine that has been
+// editing shaders for a month — never sits on a frame or a pipeline build.
+//
+// Only `*.spv` files older than the cutoff are touched. Racing another process
+// is harmless in every direction: an entry deleted here just before someone
+// reads it is a cache miss for them (Tint recompiles and rewrites it), an
+// entry that process just wrote or touched is newer than the cutoff, and a
+// delete that fails because the file is open is skipped.
+void PruneShaderCache(std::filesystem::path dir) {
+  namespace fs = std::filesystem;
+  const auto cutoff = fs::file_time_type::clock::now() -
+                      std::chrono::hours(24 * kShaderCacheMaxAgeDays);
+  uint64_t removed = 0, bytes = 0;
+  std::error_code ec;
+  for (fs::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+    const fs::directory_entry& e = *it;
+    std::error_code fec;
+    if (!e.is_regular_file(fec) || e.path().extension() != ".spv") continue;
+    const auto t = e.last_write_time(fec);
+    if (fec || t >= cutoff) continue;
+    const uintmax_t sz = e.file_size(fec);
+    if (fs::remove(e.path(), fec)) {
+      removed++;
+      bytes += fec ? 0 : (uint64_t)sz;
+    }
+  }
+  if (removed)
+    std::fprintf(stderr,
+                 "shader_cache: pruned %llu entries (%.1f MiB) unused for %d+ "
+                 "days (%s)\n",
+                 (unsigned long long)removed, (double)bytes / (1024.0 * 1024.0),
+                 kShaderCacheMaxAgeDays, dir.string().c_str());
+}
+
 }  // namespace
 
 VKAPI_ATTR VkBool32 VKAPI_CALL DebugCallback(
@@ -349,16 +385,17 @@ bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
   // a stale cross-worktree sccache object with the OLD pass::Buf layout, NOT
   // this pool -- but the budget was one binding-per-set from the same
   // symptom, so it is sized generously now (descriptors are bytes) and the
-  // failure path aborts with a count. Phase 3c can still size this from the
-  // pass table, but it must keep the abort.
+  // failure path aborts with a count. The sizes are the named kDescPool*
+  // constants in rhi_vulkan.h; deriving them from the pass table would be
+  // tighter, but whatever sizes it must keep the abort.
   VkDescriptorPoolSize sizes[] = {
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4096},
-      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, 512},
-      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, 256},
-      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, 256},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kDescPoolStorageBuffers},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, kDescPoolUniformBuffers},
+      {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC, kDescPoolUniformDynamic},
+      {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC, kDescPoolStorageDynamic},
   };
   VkDescriptorPoolCreateInfo dpi{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-  dpi.maxSets = 512;
+  dpi.maxSets = kDescPoolMaxSets;
   dpi.poolSizeCount = (uint32_t)std::size(sizes);
   dpi.pPoolSizes = sizes;
   r = dfn_.CreateDescriptorPool(device_, &dpi, nullptr, &descPool_);
@@ -385,11 +422,33 @@ bool Backend::Init(bool lowPower, bool validation, bool syncValidation,
       pipelineCachePath_ = "sandvox_pipeline_cache.bin";
     std::vector<uint8_t> blob;
     if (FILE* f = std::fopen(pipelineCachePath_.c_str(), "rb")) {
+      // _ftelli64, not ftell: the blob has been measured at 394 MB and a long
+      // is 32 bits on this platform, so the cap below must not be judged on a
+      // value that wraps at 2 GiB.
+#ifdef _WIN32
+      _fseeki64(f, 0, SEEK_END);
+      const long long sz = _ftelli64(f);
+#else
       std::fseek(f, 0, SEEK_END);
-      long sz = std::ftell(f);
-      if (sz > 0) {
+      const long long sz = std::ftell(f);
+#endif
+      if (sz > (long long)kPipelineCacheMaxBytes) {
+        // START FRESH (kPipelineCacheMaxBytes says why). The empty cache
+        // misses on every create, which marks it dirty, so this launch's
+        // live set is what gets written back.
+        std::fprintf(stderr,
+                     "pipeline cache %s is %.0f MiB, over the %llu MiB cap: "
+                     "starting fresh (one cold compile, then it holds only "
+                     "what is used)\n",
+                     pipelineCachePath_.c_str(), (double)sz / (1024.0 * 1024.0),
+                     (unsigned long long)(kPipelineCacheMaxBytes >> 20));
+      } else if (sz > 0) {
         blob.resize((size_t)sz);
+#ifdef _WIN32
+        _fseeki64(f, 0, SEEK_SET);
+#else
         std::fseek(f, 0, SEEK_SET);
+#endif
         size_t got = std::fread(blob.data(), 1, blob.size(), f);
         if (got != blob.size()) blob.clear();
       }
@@ -725,8 +784,8 @@ Buffer* Backend::CreateBuffer(uint64_t size, rhi::BufferUsage usage, const char*
 
   VkBufferCreateInfo bci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
   bci.size = size;
-  // UNCONDITIONAL TRANSFER_DST: it is what ZeroInitAll's vkCmdFillBuffer needs,
-  // and it is free on device-local memory. This is the price of the zero-init
+  // UNCONDITIONAL TRANSFER_DST: it is what the queued zero fill's
+  // vkCmdFillBuffer needs, and it is free on device-local memory. This is the price of the zero-init
   // POLICY, and paying it everywhere is what makes the policy a mechanism
   // rather than a list somebody has to maintain correctly (barrier_graph §4.8).
   bci.usage = ToVkUsage(usage) | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
@@ -849,26 +908,6 @@ void Backend::DestroyBufferDeferred(Buffer* b) {
   }
 }
 
-bool Backend::ZeroInitAll(std::string& err) {
-  VkCommandBuffer cmd = BeginCommands("zeroInitAll");
-  if (!cmd) {
-    err = "ZeroInitAll: could not begin a command buffer";
-    return false;
-  }
-  // Iterate the REGISTRY, never a hand-written list. The barrier document's own
-  // draft enumerated "the buffers that need zeroing", missed two of them, and
-  // one of the misses (pArgsStage) would have fed garbage into an indirect draw
-  // count on the first tick — a device hang. Anything created through
-  // CreateBuffer is covered here whether or not anyone remembered it.
-  for (const auto& b : buffers_) {
-    if (!b->buf || b->size == 0) continue;
-    dfn_.CmdFillBuffer(cmd, b->buf, 0, VK_WHOLE_SIZE, 0);
-  }
-  VkFence fence = SubmitCommands(cmd, err);
-  if (fence == VK_NULL_HANDLE) return false;
-  return WaitIdle(err);
-}
-
 void Backend::ReclaimStaging() {
   // The floor is the LOW end of the oldest submit whose fence has not
   // signalled; everything below it has been read by the device already. Bytes
@@ -929,6 +968,13 @@ uint64_t Backend::StagingAlloc(uint64_t size) {
 
 void Backend::QueueWrite(Buffer* dst, uint64_t offset, const void* data, size_t size) {
   if (!dst || size == 0) return;
+  // A write covering the WHOLE buffer makes a still-queued creation zero fill
+  // dead: the fill drains first (issue order) and this write then overwrites
+  // every byte of it. Flag it and FlushUploads skips the fill. Harmless if the
+  // fill already drained — nothing consults the flag once it has. Big buffers
+  // uploaded wholesale right after creation (the material table, the reaction
+  // table, a page-table reset) stop paying a fill that nothing can observe.
+  if (offset == 0 && size >= dst->size) dst->zeroFillSuperseded = true;
   Pending p;
   p.dst = dst;
   p.dstOffset = offset;
@@ -976,8 +1022,9 @@ void Backend::QueueWrite(Buffer* dst, uint64_t offset, const void* data, size_t 
     // --shot far-fill loop is safe: each iteration records its own payload into
     // its own command buffer, so rapid overwrites of one small buffer cannot
     // alias.
-    p.inlineData.resize(size);
-    std::memcpy(p.inlineData.data(), data, size);
+    p.inlineOffset = inlineArena_.size();
+    inlineArena_.insert(inlineArena_.end(), (const uint8_t*)data,
+                        (const uint8_t*)data + size);
   }
   // ISSUE ORDER, preserved exactly. Never sorted, never coalesced: last write to
   // a range before a submit must win, and coalescing is what would break that.
@@ -1023,15 +1070,18 @@ void Backend::FlushUploads(VkCommandBuffer cmd) {
   // zeroed the material table — a frozen world, not a crash. The barrier is
   // derived from buffer identity (same rule the §3.3 tracker applies), emitted
   // only when a destination repeats; an ordinary flush emits none.
-  std::vector<Buffer*> touched;
-  auto touchedBefore = [&](Buffer* d) {
-    for (Buffer* t : touched) {
-      if (t == d) return true;
-    }
-    return false;
-  };
+  //
+  // "Seen since the last barrier" is an EPOCH stamp on the buffer rather than a
+  // scan of every destination so far: the scan was quadratic in the flush
+  // size, and a revisited window-shift plane flushes over a thousand writes.
+  ++flushEpoch_;
   for (const Pending& p : pending_) {
-    if (touchedBefore(p.dst)) {
+    // A creation fill a later whole-buffer write superseded (QueueWrite):
+    // recording it would zero bytes the next command in this very flush
+    // overwrites. Skipped BEFORE the WAW test, so it does not count as a
+    // touch and cannot force a barrier of its own.
+    if (p.zeroFill && p.dst->zeroFillSuperseded) continue;
+    if (p.dst->flushTouch == flushEpoch_) {
       VkMemoryBarrier2 mb{VK_STRUCTURE_TYPE_MEMORY_BARRIER_2};
       mb.srcStageMask = VK_PIPELINE_STAGE_2_ALL_TRANSFER_BIT;
       mb.srcAccessMask = VK_ACCESS_2_TRANSFER_WRITE_BIT;
@@ -1041,12 +1091,13 @@ void Backend::FlushUploads(VkCommandBuffer cmd) {
       di.memoryBarrierCount = 1;
       di.pMemoryBarriers = &mb;
       dfn_.CmdPipelineBarrier2(cmd, &di);
-      touched.clear();
+      ++flushEpoch_;  // everything touched so far is now ordered
     }
     if (p.zeroFill) {
       dfn_.CmdFillBuffer(cmd, p.dst->buf, 0, VK_WHOLE_SIZE, 0);
     } else if (p.classA) {
-      dfn_.CmdUpdateBuffer(cmd, p.dst->buf, p.dstOffset, p.size, p.inlineData.data());
+      dfn_.CmdUpdateBuffer(cmd, p.dst->buf, p.dstOffset, p.size,
+                           inlineArena_.data() + p.inlineOffset);
     } else {
       VkBufferCopy region{};
       region.srcOffset = p.stagingOffset;
@@ -1054,13 +1105,17 @@ void Backend::FlushUploads(VkCommandBuffer cmd) {
       region.size = p.size;
       dfn_.CmdCopyBuffer(cmd, stagingRing_->buf, p.dst->buf, 1, &region);
     }
-    touched.push_back(p.dst);
+    p.dst->flushTouch = flushEpoch_;
   }
   // HELD, not dropped. These copies are recorded into `cmd` and will only ever
   // execute if `cmd` is submitted; until then the writes are still owed. See
-  // AbandonCommands for the case that made this necessary.
+  // AbandonCommands for the case that made this necessary. Their Class A
+  // payloads go with them (heldArena_), and the swap hands the previous held
+  // arena's capacity back to the pending side.
   heldFlush_ = std::move(pending_);
   pending_.clear();
+  heldArena_.swap(inlineArena_);
+  inlineArena_.clear();
   heldFlushCmd_ = cmd;
   // CHARGE THE RING TO THIS COMMAND BUFFER. Everything allocated up to now has
   // had its vkCmdCopyBuffer recorded into `cmd`, so the submit of `cmd` is what
@@ -1095,16 +1150,28 @@ VkFence Backend::AcquireFence(std::string& err) {
 
 VkCommandBuffer Backend::BeginCommands(const char* /*label*/) {
   PollFences();  // recycle anything already finished
-  VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-  ai.commandPool = cmdPool_;
-  ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-  ai.commandBufferCount = 1;
+  // Reuse a retired command buffer when there is one (PollFences and
+  // AbandonCommands feed freeCmds_). The pool has RESET_COMMAND_BUFFER, which
+  // makes vkBeginCommandBuffer an implicit reset, so reuse costs nothing and
+  // saves a free + allocate pair per submit.
   VkCommandBuffer cmd = VK_NULL_HANDLE;
-  if (dfn_.AllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) return VK_NULL_HANDLE;
+  if (!freeCmds_.empty()) {
+    cmd = freeCmds_.back();
+    freeCmds_.pop_back();
+  } else {
+    VkCommandBufferAllocateInfo ai{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    ai.commandPool = cmdPool_;
+    ai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    ai.commandBufferCount = 1;
+    if (dfn_.AllocateCommandBuffers(device_, &ai, &cmd) != VK_SUCCESS) return VK_NULL_HANDLE;
+  }
 
   VkCommandBufferBeginInfo bi{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-  if (dfn_.BeginCommandBuffer(cmd, &bi) != VK_SUCCESS) return VK_NULL_HANDLE;
+  if (dfn_.BeginCommandBuffer(cmd, &bi) != VK_SUCCESS) {
+    freeCmds_.push_back(cmd);
+    return VK_NULL_HANDLE;
+  }
 
   // Uploads flush at the HEAD of whichever command buffer is recorded next,
   // from whichever code path records it. That is what reproduces WebGPU's
@@ -1148,16 +1215,27 @@ VkFence Backend::SubmitEnded(VkCommandBuffer cmd, std::string& err) {
 // FRONT of the queue (issue order is the contract — a later write to the same
 // range must still win) and drop the ring mark that would otherwise pin the
 // staging floor behind a fence that is never coming.
-void Backend::AbandonCommands(VkCommandBuffer cmd) {
+void Backend::AbandonCommands(VkCommandBuffer cmd, bool ended) {
   if (cmd == VK_NULL_HANDLE) return;
   if (heldFlushCmd_ == cmd) {
     if (!heldFlush_.empty()) {
       flushesRecovered_ += (uint64_t)heldFlush_.size();
+      // The re-queued writes carry offsets into heldArena_, the ones queued
+      // since into inlineArena_. Concatenate held-then-pending (the same order
+      // as the lists) and rebase the pending side's offsets past the held
+      // bytes, so every Class A payload still points at its own data.
+      const uint64_t heldBytes = heldArena_.size();
+      for (Pending& p : pending_)
+        if (p.classA && !p.zeroFill) p.inlineOffset += heldBytes;
+      heldArena_.insert(heldArena_.end(), inlineArena_.begin(), inlineArena_.end());
+      inlineArena_.swap(heldArena_);
+      heldArena_.clear();
       heldFlush_.insert(heldFlush_.end(), std::make_move_iterator(pending_.begin()),
                         std::make_move_iterator(pending_.end()));
       pending_.swap(heldFlush_);
     }
     heldFlush_.clear();
+    heldArena_.clear();
     heldFlushCmd_ = VK_NULL_HANDLE;
     for (size_t i = 0; i < flushMarks_.size(); i++) {
       if (flushMarks_[i].cmd != cmd) continue;
@@ -1165,16 +1243,21 @@ void Backend::AbandonCommands(VkCommandBuffer cmd) {
       break;
     }
   }
-  // The buffer was begun by BeginCommands and never ended; end it so the driver
-  // is not freeing a recording buffer, then release it.
-  dfn_.EndCommandBuffer(cmd);
-  dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &cmd);
+  // The buffer was begun by BeginCommands and possibly never ended (an
+  // encoder dropped mid-recording); end it so it is not left recording, then
+  // hand it straight back for reuse — it was never submitted, so nothing on
+  // the GPU can reference it, and the next vkBeginCommandBuffer resets it.
+  // A buffer the seam already ended (Finish without Submit) cannot be ended
+  // twice, so this asks the caller rather than guessing.
+  if (!ended) dfn_.EndCommandBuffer(cmd);
+  freeCmds_.push_back(cmd);
 }
 
 void Backend::NoteSubmit(VkFence fence, VkCommandBuffer cmd) {
   // Submitted: the held copies will execute, so the debt is settled.
   if (heldFlushCmd_ == cmd) {
     heldFlush_.clear();
+    heldArena_.clear();
     heldFlushCmd_ = VK_NULL_HANDLE;
   }
   uint64_t high = stagingSubmitted_;
@@ -1196,7 +1279,9 @@ void Backend::PollFences() {
   for (size_t i = 0; i < inFlight_.size();) {
     if (dfn_.GetFenceStatus(device_, inFlight_[i].fence) == VK_SUCCESS) {
       VkFence f = inFlight_[i].fence;
-      dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &inFlight_[i].cmd);
+      // Retired: the GPU is done with it, so it goes back for reuse
+      // (BeginCommands) rather than to the pool.
+      freeCmds_.push_back(inFlight_[i].cmd);
       // A RETAINED fence must not go back to the pool: a borrower (a readback
       // slot, an eviction batch) still holds the handle and still needs
       // vkGetFenceStatus on it to mean THIS submit. Park it until the last
@@ -1236,6 +1321,80 @@ void Backend::PollFences() {
       }
     }
   }
+  // The pipeline-side graveyard (DestroyPipelineDeferred and friends): same
+  // rule, its own lock because build-pool threads append to it.
+  {
+    std::lock_guard<std::mutex> lock(handleGraveMutex_);
+    if (!handleGraveyard_.empty()) {
+      uint64_t minInFlight = UINT64_MAX;
+      for (const auto& f : inFlight_) minInFlight = f.serial < minInFlight ? f.serial : minInFlight;
+      for (size_t i = 0; i < handleGraveyard_.size();) {
+        if (handleGraveyard_[i].serial < minInFlight) {
+          DestroyDoomedHandle(handleGraveyard_[i]);
+          handleGraveyard_[i] = handleGraveyard_.back();
+          handleGraveyard_.pop_back();
+        } else {
+          i++;
+        }
+      }
+    }
+  }
+}
+
+void Backend::DestroyDoomedHandle(const DoomedHandle& d) {
+  switch (d.kind) {
+    case DoomedHandle::Pipeline:
+      dfn_.DestroyPipeline(device_, (VkPipeline)d.handle, nullptr);
+      break;
+    case DoomedHandle::PipelineLayout:
+      dfn_.DestroyPipelineLayout(device_, (VkPipelineLayout)d.handle, nullptr);
+      break;
+    case DoomedHandle::SetLayout:
+      dfn_.DestroyDescriptorSetLayout(device_, (VkDescriptorSetLayout)d.handle, nullptr);
+      break;
+  }
+}
+
+// The serial recorded is the LATEST submit at the call, exactly as
+// DestroyBufferDeferred records it: every submit up to it may have recorded a
+// use, and the handle dies once all of them have retired. Each call looks the
+// handle up in its registry first and ignores one it does not find, which is
+// what makes a seam handle outliving Shutdown (whose registries are empty) a
+// no-op rather than a double destroy.
+void Backend::DestroyPipelineDeferred(VkPipeline p) {
+  if (p == VK_NULL_HANDLE) return;
+  {
+    std::lock_guard<std::mutex> lock(pipelineMutex_);
+    size_t i = 0;
+    while (i < pipelines_.size() && pipelines_[i].pipe != p) i++;
+    if (i == pipelines_.size()) return;
+    pipelines_.erase(pipelines_.begin() + (long)i);
+  }
+  std::lock_guard<std::mutex> lock(handleGraveMutex_);
+  handleGraveyard_.push_back({DoomedHandle::Pipeline, (uint64_t)p, submitSerial_.load()});
+}
+
+// pipeLayouts_ / setLayouts_ are appended by CreatePipelineLayout /
+// CreateSetLayout (main thread only, at Init) and erased here (any thread);
+// handleGraveMutex_ covers both sides.
+void Backend::DestroyPipelineLayoutDeferred(VkPipelineLayout l) {
+  if (l == VK_NULL_HANDLE) return;
+  std::lock_guard<std::mutex> lock(handleGraveMutex_);
+  size_t i = 0;
+  while (i < pipeLayouts_.size() && pipeLayouts_[i] != l) i++;
+  if (i == pipeLayouts_.size()) return;
+  pipeLayouts_.erase(pipeLayouts_.begin() + (long)i);
+  handleGraveyard_.push_back({DoomedHandle::PipelineLayout, (uint64_t)l, submitSerial_.load()});
+}
+
+void Backend::DestroySetLayoutDeferred(VkDescriptorSetLayout l) {
+  if (l == VK_NULL_HANDLE) return;
+  std::lock_guard<std::mutex> lock(handleGraveMutex_);
+  size_t i = 0;
+  while (i < setLayouts_.size() && setLayouts_[i] != l) i++;
+  if (i == setLayouts_.size()) return;
+  setLayouts_.erase(setLayouts_.begin() + (long)i);
+  handleGraveyard_.push_back({DoomedHandle::SetLayout, (uint64_t)l, submitSerial_.load()});
 }
 
 void Backend::RetainFence(VkFence f) {
@@ -1304,7 +1463,8 @@ bool Backend::WaitIdle(std::string& err) {
 VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::string& label,
                                         const std::string& entryPoint,
                                         uint32_t bodyLineOffset,
-                                        std::string& diagnostics) {
+                                        std::string& diagnostics,
+                                        std::string* cacheKey) {
   // THREAD-SAFE, AND CONCURRENT ACROSS KEYS. Threaded pipeline creation
   // (Simulation::BuildPipelines) reaches this from several threads at once.
   // The lock covers the CACHE ONLY, never the compile: the expensive middle —
@@ -1314,8 +1474,9 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   // (docs/PLAN_shader_compile.md package B measured ~181 s of it).
   //
   // Two threads asking for the SAME key do not both compile: the second waits
-  // on `shaderCv_` for the first to publish. That never happens in the current
-  // build (each entry point is asked for once), and it is what stops the
+  // on `shaderCv_` for the first to publish, then takes its own reference. The
+  // compute build asks for each key once, but the render pipelines share
+  // their vs/fs modules across variants, so this is the path that keeps the
   // no-duplicate-work property from being an accident of the call pattern.
   //
   // Everything else on this path is already per-key private: the shader_cache
@@ -1339,11 +1500,15 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
     srcHash ^= (size_t)optTag * 0x9e3779b97f4a7c15ull;
   std::string key = label + "\x1f" + entryPoint + "\x1f" +
                     std::to_string(srcHash);
+  if (cacheKey) *cacheKey = key;
   {
     std::unique_lock<std::mutex> lock(shaderMutex_);
     for (;;) {
       auto it = moduleCache_.find(key);
-      if (it != moduleCache_.end()) return it->second;
+      if (it != moduleCache_.end()) {
+        it->second.refs++;  // the caller's reference (ReleaseShaderModule)
+        return it->second.module;
+      }
       if (!moduleInFlight_.count(key)) break;  // ours to compile
       shaderCv_.wait(lock);
     }
@@ -1358,9 +1523,14 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   // SPIR-V disk cache: skip Tint entirely on subsequent launches when the
   // assembled WGSL hasn't changed. The key is a hash of (source, entry point);
   // any edit to a shader, common.wgsl, or tuning.json changes the assembled
-  // source and produces a new hash, so stale cache entries are harmless (just
-  // unreferenced files). F5 hot-reload bypasses this via the in-memory cache
-  // above, which is populated on the first compile or disk-cache hit.
+  // source and produces a new hash, so stale cache entries are harmless to
+  // correctness — but they are never read again, and they used to accumulate
+  // forever (2.5 GB / 35,405 files measured 2026-09-23). So every hit TOUCHES
+  // its file, and the first load of a process starts a background sweep that
+  // deletes entries untouched for kShaderCacheMaxAgeDays (PruneShaderCache
+  // below). The in-memory cache above short-circuits all of this while any
+  // seam handle still holds the module (it is refcounted since 2026-09-24, so
+  // an F5 whose sources are unchanged re-reads the .spv from here).
   //
   // SANDVOX_SHADER_CACHE overrides the directory, for the same reason
   // SANDVOX_PIPELINE_CACHE overrides the driver blob's path: the default is
@@ -1375,6 +1545,9 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
     fs::path d(env && *env ? env : "shader_cache");
     std::error_code ec;
     fs::create_directories(d, ec);
+    // Once per process, off the calling thread: the directory can hold tens of
+    // thousands of files and this is the pipeline-build path.
+    std::thread(PruneShaderCache, d).detach();
     return d;
   }();
   // Combine source hash and entry-point hash into a filename.
@@ -1395,10 +1568,16 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
         std::fclose(f);
         // The magic word too: a blob that does not start with it is not SPIR-V
         // and is recompiled rather than handed to the driver.
-        if (got == fsize && spirv[0] == 0x07230203u)
+        if (got == fsize && spirv[0] == 0x07230203u) {
           fromDisk = true;
-        else
+          // The LRU stamp PruneShaderCache ages entries by. One metadata
+          // write per module per launch; failure only means the entry ages
+          // from its last successful touch.
+          std::error_code tec;
+          fs::last_write_time(cachePath, fs::file_time_type::clock::now(), tec);
+        } else {
           spirv.clear();
+        }
       }
     }
   }
@@ -1455,10 +1634,27 @@ VkShaderModule Backend::GetShaderModule(const std::string& wgsl, const std::stri
   {
     std::lock_guard<std::mutex> lock(shaderMutex_);
     moduleInFlight_.erase(key);
-    if (out != VK_NULL_HANDLE) moduleCache_[key] = out;
+    if (out != VK_NULL_HANDLE) moduleCache_[key] = CachedModule{out, 1};
   }
   shaderCv_.notify_all();
   return out;
+}
+
+void Backend::ReleaseShaderModule(const std::string& cacheKey) {
+  std::lock_guard<std::mutex> lock(shaderMutex_);
+  auto it = moduleCache_.find(cacheKey);
+  if (it == moduleCache_.end()) return;  // after Shutdown, or never cached
+  if (it->second.refs > 1) {
+    it->second.refs--;
+    return;
+  }
+  // Last holder. Destroying NOW is legal: a VkShaderModule is only read during
+  // pipeline creation, and every create that used this one held a reference
+  // until it returned. Under the lock, so a concurrent GetShaderModule for the
+  // same key either found it first (and bumped refs above 1) or will miss and
+  // recompile — from shader_cache/ on disk, not from Tint.
+  if (device_) dfn_.DestroyShaderModule(device_, it->second.module, nullptr);
+  moduleCache_.erase(it);
 }
 
 VkDescriptorSetLayout Backend::CreateSetLayout(const rhi::BindGroupLayoutEntry* entries,
@@ -1478,6 +1674,7 @@ VkDescriptorSetLayout Backend::CreateSetLayout(const rhi::BindGroupLayoutEntry* 
   VkDescriptorSetLayout l = VK_NULL_HANDLE;
   if (dfn_.CreateDescriptorSetLayout(device_, &ci, nullptr, &l) != VK_SUCCESS)
     return VK_NULL_HANDLE;
+  std::lock_guard<std::mutex> lock(handleGraveMutex_);  // see DestroySetLayoutDeferred
   setLayouts_.push_back(l);
   return l;
 }
@@ -1490,8 +1687,25 @@ VkPipelineLayout Backend::CreatePipelineLayout(const VkDescriptorSetLayout* sets
   VkPipelineLayout l = VK_NULL_HANDLE;
   if (dfn_.CreatePipelineLayout(device_, &ci, nullptr, &l) != VK_SUCCESS)
     return VK_NULL_HANDLE;
+  std::lock_guard<std::mutex> lock(handleGraveMutex_);  // see DestroyPipelineLayoutDeferred
   pipeLayouts_.push_back(l);
   return l;
+}
+
+// ---------------------------------------------------------------------------
+// Pipeline-cache hit/miss, from VkPipelineCreationFeedback (core in 1.3).
+//
+// SavePipelineCache writes only when this has marked the cache dirty, which is
+// the whole of "a warm launch does not rewrite a 400 MB file three to five
+// times". A feedback the driver did not fill in (VALID clear) is treated as a
+// MISS: saving an unchanged cache costs a write, while believing a real miss
+// was a hit costs the next launch a cold compile.
+// ---------------------------------------------------------------------------
+void Backend::NoteCreationFeedback(const VkPipelineCreationFeedback& fb) {
+  const bool valid = (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT) != 0;
+  const bool hit =
+      (fb.flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) != 0;
+  if (!valid || !hit) pipelineCacheDirty_.store(true);
 }
 
 VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModule module,
@@ -1509,6 +1723,16 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
   ci.stage = stage;
   ci.layout = layout;
   if (captureStats_) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  // Did this create hit the on-disk cache? (NoteCreationFeedback.) One stage
+  // feedback per shader stage: the count must be 0 or stageCount, and 0 is
+  // only legal on drivers new enough to accept it.
+  VkPipelineCreationFeedback fb{}, stageFb{};
+  VkPipelineCreationFeedbackCreateInfo fbi{
+      VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+  fbi.pPipelineCreationFeedback = &fb;
+  fbi.pipelineStageCreationFeedbackCount = 1;
+  fbi.pPipelineStageCreationFeedbacks = &stageFb;
+  ci.pNext = &fbi;
 
   VkPipeline p = VK_NULL_HANDLE;
   // A cache HIT hands back an object the driver did not compile this run, and
@@ -1517,6 +1741,8 @@ VkPipeline Backend::CreateComputePipeline(VkPipelineLayout layout, VkShaderModul
                                   captureStats_ ? VK_NULL_HANDLE : pipelineCache_, 1,
                                   &ci, nullptr, &p) != VK_SUCCESS)
     return VK_NULL_HANDLE;
+  // The stats mode bypassed the cache, so there is nothing to learn about it.
+  if (!captureStats_ && pipelineCache_) NoteCreationFeedback(fb);
   // The one piece of shared state on this path (see the header note on why the
   // Vulkan call itself needs no lock).
   {
@@ -1709,6 +1935,14 @@ VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModu
   ci.layout = layout;
   ci.renderPass = VK_NULL_HANDLE;  // dynamic rendering
   if (captureStats_) ci.flags |= VK_PIPELINE_CREATE_CAPTURE_STATISTICS_BIT_KHR;
+  // Cache hit/miss, as in the compute path; chained after the rendering info.
+  VkPipelineCreationFeedback fb{}, stageFb[2]{};
+  VkPipelineCreationFeedbackCreateInfo fbi{
+      VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO};
+  fbi.pPipelineCreationFeedback = &fb;
+  fbi.pipelineStageCreationFeedbackCount = ci.stageCount;
+  fbi.pPipelineStageCreationFeedbacks = stageFb;
+  ri.pNext = &fbi;
 
   VkPipeline p = VK_NULL_HANDLE;
   // See the compute path: the on-disk cache is bypassed under captureStats_
@@ -1717,6 +1951,7 @@ VkPipeline Backend::CreateGraphicsPipeline(VkPipelineLayout layout, VkShaderModu
                                    captureStats_ ? VK_NULL_HANDLE : pipelineCache_, 1,
                                    &ci, nullptr, &p) != VK_SUCCESS)
     return VK_NULL_HANDLE;
+  if (!captureStats_ && pipelineCache_) NoteCreationFeedback(fb);
   // Locked for the same reason the compute path is: EnsureRenderPipelines is
   // still serial and still on the main thread, but a deferred `far` compile
   // may be appending to this vector at the same moment.
@@ -2074,7 +2309,10 @@ VkFence Backend::SubmitEndedPresenting(VkCommandBuffer cmd, std::string& err) {
   VkFence fence = AcquireFence(err);
   if (fence == VK_NULL_HANDLE) return VK_NULL_HANDLE;
 
-  VkPipelineStageFlags waitStage = VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
+  // Both ways the image is first touched: a colour attachment or a blit
+  // destination (rhi_vulkan.h kSwapchainAcquireWaitStages; the recorder's
+  // first transition of the image names the same stages as its source).
+  VkPipelineStageFlags waitStage = kSwapchainAcquireWaitStages;
   VkSubmitInfo si{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   si.waitSemaphoreCount = 1;
   si.pWaitSemaphores = &pendingAcquireSlot_->sem;
@@ -2225,20 +2463,35 @@ bool Backend::PopValidationScope(std::string& messages) {
 // build paid the full compile again. Saving right after the expensive create
 // makes the SECOND launch fast whatever happens to the first.
 //
-// Cheap to call repeatedly: vkGetPipelineCacheData is a memcpy of the blob and
-// the file is a few MiB. Callers (Simulation::EnsureRenderPipelines through
-// rhi::vkr::SavePipelineCache) only call it when they actually built something.
+// THE FILE IS NOT "A FEW MiB" (what this comment used to say): measured 394 MB
+// on 2026-09-23, and written in full by up to five call sites per launch
+// (worldgen batch, compute batch, far thread, render pipelines, Shutdown)
+// whether or not anything had changed. So a save now happens only when some
+// create since the last save MISSED the cache (pipelineCacheDirty_, set from
+// VkPipelineCreationFeedback in both create paths). A warm launch sets it
+// never and writes nothing; a cold one writes after each batch that compiled.
+// The callers stay where they are — "save right after the expensive create"
+// is still the right place — and simply cost nothing when clean.
 void Backend::SavePipelineCache() {
   if (!device_ || !pipelineCache_ || !dfn_.GetPipelineCacheData ||
       pipelineCachePath_.empty())
     return;
+  // Claim the dirty flag BEFORE reading the blob: a create that misses while
+  // this save is running sets it again and the next save picks it up, where
+  // clearing it afterwards could swallow that create.
+  if (!pipelineCacheDirty_.exchange(false)) return;
+  auto keepDirty = [this] { pipelineCacheDirty_.store(true); };
   size_t sz = 0;
   if (dfn_.GetPipelineCacheData(device_, pipelineCache_, &sz, nullptr) != VK_SUCCESS ||
-      sz == 0)
+      sz == 0) {
+    keepDirty();
     return;
+  }
   std::vector<uint8_t> blob(sz);
-  if (dfn_.GetPipelineCacheData(device_, pipelineCache_, &sz, blob.data()) != VK_SUCCESS)
+  if (dfn_.GetPipelineCacheData(device_, pipelineCache_, &sz, blob.data()) != VK_SUCCESS) {
+    keepDirty();
     return;
+  }
   // Write-then-rename, so a process killed mid-write (the whole reason this
   // function exists) cannot leave a truncated cache for the next launch to
   // hand the driver.
@@ -2256,17 +2509,29 @@ void Backend::SavePipelineCache() {
                 saveSeq.fetch_add(1));
   const std::string tmp = pipelineCachePath_ + suffix;
   FILE* f = std::fopen(tmp.c_str(), "wb");
-  if (!f) return;
+  if (!f) {
+    keepDirty();
+    return;
+  }
   const size_t wrote = std::fwrite(blob.data(), 1, sz, f);
   std::fclose(f);
-  if (wrote != sz) { std::remove(tmp.c_str()); return; }
-  // std::rename onto an existing file is implementation-defined on Windows and
-  // fails, so the target is removed first. That leaves a window in which a
-  // concurrent reader finds no cache at all, which costs it a cold compile but
-  // cannot give it a wrong one — the failure mode the temp file rules out.
-  std::remove(pipelineCachePath_.c_str());
-  if (std::rename(tmp.c_str(), pipelineCachePath_.c_str()) != 0)
+  if (wrote != sz) {
     std::remove(tmp.c_str());
+    keepDirty();
+    return;
+  }
+  // std::filesystem::rename REPLACES an existing target atomically (MSVC:
+  // MoveFileExW with MOVEFILE_REPLACE_EXISTING), so there is no moment at which
+  // the cache file does not exist. The old std::remove + std::rename pair (C
+  // rename refuses an existing target on Windows) left exactly such a window,
+  // in which a concurrent launch sharing SANDVOX_PIPELINE_CACHE found no cache
+  // and paid a cold compile.
+  std::error_code ec;
+  std::filesystem::rename(tmp, pipelineCachePath_, ec);
+  if (ec) {
+    std::remove(tmp.c_str());
+    keepDirty();
+  }
 }
 
 void Backend::Shutdown() {
@@ -2289,16 +2554,30 @@ void Backend::Shutdown() {
   WaitIdle(err);
   const double waitMs = msSince(tShut0);
 
-  for (const PipelineRec& p : pipelines_) dfn_.DestroyPipeline(device_, p.pipe, nullptr);
-  pipelines_.clear();
-  for (VkPipelineLayout l : pipeLayouts_) dfn_.DestroyPipelineLayout(device_, l, nullptr);
-  pipeLayouts_.clear();
-  for (VkDescriptorSetLayout l : setLayouts_)
-    dfn_.DestroyDescriptorSetLayout(device_, l, nullptr);
-  setLayouts_.clear();
-  for (auto& kv : moduleCache_) dfn_.DestroyShaderModule(device_, kv.second, nullptr);
-  moduleCache_.clear();
+  {
+    std::lock_guard<std::mutex> lock(pipelineMutex_);
+    for (const PipelineRec& p : pipelines_) dfn_.DestroyPipeline(device_, p.pipe, nullptr);
+    pipelines_.clear();
+  }
+  {
+    // WaitIdle above drained the queue, so every deferred handle is idle.
+    std::lock_guard<std::mutex> lock(handleGraveMutex_);
+    for (const DoomedHandle& d : handleGraveyard_) DestroyDoomedHandle(d);
+    handleGraveyard_.clear();
+    for (VkPipelineLayout l : pipeLayouts_) dfn_.DestroyPipelineLayout(device_, l, nullptr);
+    pipeLayouts_.clear();
+    for (VkDescriptorSetLayout l : setLayouts_)
+      dfn_.DestroyDescriptorSetLayout(device_, l, nullptr);
+    setLayouts_.clear();
+  }
+  {
+    std::lock_guard<std::mutex> lock(shaderMutex_);
+    for (auto& kv : moduleCache_)
+      dfn_.DestroyShaderModule(device_, kv.second.module, nullptr);
+    moduleCache_.clear();
+  }
 
+  const bool cacheDirty = pipelineCacheDirty_.load();
   const auto tSave0 = std::chrono::steady_clock::now();
   SavePipelineCache();
   const double saveMs = msSince(tSave0);
@@ -2306,16 +2585,27 @@ void Backend::Shutdown() {
     dfn_.DestroyPipelineCache(device_, pipelineCache_, nullptr);
     pipelineCache_ = VK_NULL_HANDLE;
   }
-  std::fprintf(stderr,
-               "[shutdown] vulkan backend: wait-idle %.0f ms, pipeline cache "
-               "saved in %.0f ms (%s)\n",
-               waitMs, saveMs, pipelineCachePath_.c_str());
+  if (cacheDirty)
+    std::fprintf(stderr,
+                 "[shutdown] vulkan backend: wait-idle %.0f ms, pipeline cache "
+                 "saved in %.0f ms (%s)\n",
+                 waitMs, saveMs, pipelineCachePath_.c_str());
+  else
+    std::fprintf(stderr,
+                 "[shutdown] vulkan backend: wait-idle %.0f ms, pipeline cache "
+                 "unchanged, not rewritten (%s)\n",
+                 waitMs, pipelineCachePath_.c_str());
 
   for (auto& f : inFlight_) {
     dfn_.FreeCommandBuffers(device_, cmdPool_, 1, &f.cmd);
     dfn_.DestroyFence(device_, f.fence, nullptr);
   }
   inFlight_.clear();
+  // Pool destruction below frees these too; explicit so the list is not left
+  // holding handles into a dead pool.
+  if (!freeCmds_.empty())
+    dfn_.FreeCommandBuffers(device_, cmdPool_, (uint32_t)freeCmds_.size(), freeCmds_.data());
+  freeCmds_.clear();
   for (VkFence f : freeFences_) dfn_.DestroyFence(device_, f, nullptr);
   freeFences_.clear();
   // Fences whose submit retired while a borrower still held them. WaitIdle
