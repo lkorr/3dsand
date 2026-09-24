@@ -768,6 +768,15 @@ struct BodyBurnState {
   // flicker the alarm off and on for the whole fire.
   uint32_t hotVox = 0;
   bool OnFire() const { return hotVox > 0; }
+  // ---- ASLEEP: THE LAST WORLD WALK FOUND NOTHING, AND NOTHING HAS MOVED ----
+  // A digest of everything the cheap gate's world walk reads (pose, box, the
+  // cached chunks' versions, the window) as of the last walk that took the
+  // idle exit with no index held. Equal next tick = the walk would read the
+  // same cells and exit the same way, so it is skipped (rule 2: a corpse
+  // lying still in a settled world costs a handful of chunk lookups, not a
+  // box of cell reads and a fetch request per piece per tick). 0 = awake.
+  // Cleared with the index, and by any state the gate reads going non-idle.
+  uint64_t sleepKey = 0;
 };
 
 // One limb or part, described in the terms the burn pass needs.
@@ -888,6 +897,14 @@ struct BurnLimbView {
                                  float dist);
   OccludeFn occlude = nullptr;
   void* occludeCtx = nullptr;
+  // Joint-twin cells on this lattice (Mob::twinCells_): sorted list of
+  // TwinRestKey << 1 | side (0 parent's copy, 1 child's), the lattice->rest
+  // offset, and the CREATURE's roll key. BurnOneLimb lets exactly one copy of
+  // such a cell roll per tick, chosen by a draw both limbs agree on. Null
+  // everywhere but a live limb.
+  const std::vector<uint64_t>* twinCells = nullptr;
+  IVec3 twinOrigin{};
+  uint32_t twinKey = 0;
   // dist 0 is a point test at `from`.
   uint32_t WornAlong(const Vec3& from, const Vec3& dir, float dist) const {
     return occlude ? occlude(occludeCtx, from, dir, dist) : 0u;
@@ -1044,6 +1061,12 @@ struct JointTwinCell {
   uint32_t hintA = 0, hintB = 0;
   JointTwinSide a, b;
 };
+// A rest-lattice cell as one sortable key (21 bits per axis, offset).
+inline uint64_t TwinRestKey(int x, int y, int z) {
+  return ((uint64_t)(uint32_t)(x + (1 << 20)) << 42) |
+         ((uint64_t)(uint32_t)(y + (1 << 20)) << 21) |
+         (uint64_t)(uint32_t)(z + (1 << 20));
+}
 struct JointTwinPair {
   int a = -1, b = -1;        // parent limb, child limb
   uint32_t scale = 1;        // the lattice both are on
@@ -1095,11 +1118,16 @@ struct ShellMarchIndex {
   IVec3 min{}, dims{};
   std::vector<uint16_t> mat;     // 0 = no voxel here
   size_t builtFor = (size_t)-1;  // voxel count the index was built from
+  // ...and the lattice's coordinate generation (DebrisSystem::Body::geomGen):
+  // a rebase moves every coordinate without moving the count. 0 on a live
+  // limb's shell, which is never rebased in place.
+  uint32_t builtGen = 0xFFFFFFFFu;
 };
 uint32_t MarchShell(ShellMarchIndex& ix, const std::vector<PrefabVoxel>* skin,
                     const std::vector<DebrisVoxel>* coll,
                     const BodyTransform& xf, uint32_t scale, const Vec3& from,
-                    const Vec3& dir, float dist, int maxSteps, Vec3* outAt);
+                    const Vec3& dir, float dist, int maxSteps, Vec3* outAt,
+                    uint32_t geomGen = 0);
 
 // ---- A SPLASH OF BLOOD LOOKING FOR SOMETHING TO LAND ON ---------------------
 //
@@ -3419,6 +3447,23 @@ class Mob {
   // Which limbs had a body when twins_ was built; any change (a sever, a
   // detach, a respawn) rebuilds from the lattices as they now stand.
   std::vector<uint8_t> twinAttached_;
+  // ---- ONE CELL, ONE DRAW; ONE CELL, ONE COUNT ------------------------------
+  // `twinCells_`: per limb, sorted TwinRestKey << 1 | side (0 = it holds the
+  // parent's copy, 1 = the child's) of every twin cell on it. The stochastic
+  // pass (BurnOneLimb: fire, decay, douse, the inbound and coat acid) lets
+  // ONE copy of such a cell roll per tick, the side picked by a draw on the
+  // creature, the rest cell and the tick, so both limbs agree which. Both
+  // copies rolling, with the sync copying whichever changed first, ran every
+  // overlap cell at ~2x its authored rate. (A FIXED side -- the parent -- was
+  // tried: right rate, but acid on a thigh then only ever migrated into the
+  // pelvis, since each copy carries a coat inward on its own lattice.)
+  // `twinShadow_`: the subset this limb holds the CHILD copy of. RecountBurn
+  // counts each shared cell once (the parent's) in both its numerator and the
+  // surface it divides by, so the burn cap is not driven at double weight.
+  // Both rebuilt with twins_; an entry whose cell is gone is never met.
+  std::vector<std::vector<uint64_t>> twinCells_;
+  std::vector<std::vector<uint64_t>> twinShadow_;
+  void TwinShadowInto(int li, BurnLimbView& v) const;
   bool twinsBuilt_ = false;
   bool twinDirty_ = false;
   void BuildJointTwins();
@@ -3496,7 +3541,12 @@ class Mob {
   uint32_t ShedCoat(int footLimb, Vec3 footPosVox, uint32_t tick, World& world);
   // Burnable voxels of a limb with at least one open face, on its
   // authoritative lattice. One hash pass; taken once per limb (surfaceAtSpawn).
-  uint32_t SurfaceCount(const MobLimb& limb) const;
+  // `skip` (sorted TwinRestKey list, with the limb's TwinOrigin) names cells
+  // that still occlude but are not counted: a joint twin's CHILD copies,
+  // whose surface is the parent's to count (Mob::twinShadow_).
+  uint32_t SurfaceCount(const MobLimb& limb,
+                        const std::vector<uint64_t>* skip = nullptr,
+                        IVec3 skipOrigin = {}) const;
   // Clamp every live authored limb's hp to its authored max x burnCap_, and
   // die if the cap is gone or a vital limb has nothing left under it.
   void ApplyBurnCap();
@@ -5460,6 +5510,11 @@ class MobSystem {
   // art slot) alone; marks the creature dirty like any writer.
   bool LimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t& mat,
                   uint16_t& stain);
+  // Attribution for a coat that will not go (gate acid-coat): the first few
+  // voxels of `limb` wearing `coatMat`, each as material / amount / whether it
+  // is a tombstone / whether the burn index still holds it / whether it is a
+  // joint-twin cell, plus the limb's pending removals and ledger.
+  std::string LimbCoatResidue(uint64_t mobId, int limb, uint32_t coatMat);
   bool SetLimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t mat,
                      uint16_t stain);
 
@@ -5976,6 +6031,7 @@ class MobSystem {
   struct CorpseCoat {
     BodyBurnState burn;
     size_t n = 0;
+    uint32_t gen = 0;   // DebrisSystem::Body::geomGen the index was built at
     LimbCoat led;
     bool dirty = true;
     uint32_t seen = 0;

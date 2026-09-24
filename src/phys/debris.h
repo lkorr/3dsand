@@ -245,6 +245,7 @@ class DebrisSystem {
     const std::vector<DebrisVoxel>* coll = nullptr;
     const BodyTransform* xf = nullptr;
     uint32_t scale = 1;
+    uint32_t geomGen = 0;  // Body::geomGen: the march index's second key
   };
   struct FleshLattice {
     uint64_t id = 0;         // global id: survives a collider rebuild's new handle
@@ -262,6 +263,9 @@ class DebrisSystem {
     // only fire is its own embers is not turned away by the cheap gate.
     bool selfActive = false;
     uint32_t bleedMat = 0;   // Body::bleedMat: the blood a bared bone may wear
+    // Body::geomGen. With the voxel count, the key every index derived from
+    // lattice COORDINATES is cached on (MobSystem::CorpseView).
+    uint32_t geomGen = 0;
     std::vector<FleshShell> shells;  // filled by BurnFleshBodies only
   };
   // A corpse piece MobSystem burns, rather than BurnBodies. Followers are not:
@@ -1497,11 +1501,22 @@ class DebrisSystem {
     // CACHED ON THE VOXEL COUNT, which is what every geometry edit in this
     // file changes: adoption, carve, shatter, split and settle all add or
     // remove voxels. Burning rewrites PAYLOADS in place and moves nothing, so
-    // it correctly does not invalidate this. Recomputed lazily by
+    // it correctly does not invalidate this. A REBASE moves every coordinate
+    // and keeps the count, so it bumps `geomGen`, the second key. Recomputed lazily by
     // RefreshLocalBounds, so no creation site has to remember to call it.
     int8_t lmin[3] = {0, 0, 0};
     int8_t lmax[3] = {0, 0, 0};
     uint32_t boundsCount = 0xFFFFFFFFu;  // != voxels.size() => recompute
+    uint32_t boundsGen = 0xFFFFFFFFu;    // != geomGen => recompute
+    // ---- THE LATTICE'S COORDINATES MOVED WITHOUT ITS COUNT MOVING ----------
+    // Bumped wherever every voxel coordinate is shifted in place: ReskinMicro
+    // taking MicroBodyEdit's new min corner, and DamageBody's RebaseVoxels.
+    // The voxel count cannot witness that (nothing was added or removed), so
+    // every cache over lattice POSITIONS keys on (count, geomGen): the local
+    // bounds above, MobSystem's corpse burn index (CorpseView) and the armour
+    // march index (MarchShell). Before this those three read neighbours and
+    // boxes at the pre-shift coordinates until something changed the count.
+    uint32_t geomGen = 0;
     // ...AND WHICH PARTS OF THAT BOX HOLD ANYTHING. The AABB of a rotated
     // 81-voxel trunk with a crown at one end is mostly empty, and the sweep
     // sat at kTerrainNeedCeiling (505 of 512 chunks a tick) for as long as

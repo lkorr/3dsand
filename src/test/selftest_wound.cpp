@@ -51,6 +51,7 @@
 #include <chrono>
 #include <cstdio>
 #include <functional>
+#include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -5550,6 +5551,114 @@ Status GateJointTwins(Ctx& c, std::string& detail) {
   }
   const uint32_t linksAfter = mobs.JointTwinCount(id);
 
+  auto tickOnce = [&](uint32_t tick) {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(tick, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  };
+  const MobDef& def = mobs.Defs()[t.defIndex];
+
+  // ---- REBUILD KEEPS THE DIVERGENCE (a sever in the same tick) -------------
+  // A change to a twin cell and a sever ELSEWHERE on the creature, both before
+  // one sync. The sever changes which limbs have a body, so the sync rebuilds
+  // its links -- and a rebuild that only re-baselines leaves the child's copy
+  // pristine for good. The sever is the real Mob::Sever; the sync, its
+  // rebuild and its propagation are the real BurnTick path.
+  std::string rebuildRes = "not run";
+  bool rebuildOk = false;
+  {
+    const uint32_t n4 = mobs.JointTwinCount(id);
+    const Probe p4 = n4 > 2 ? probeAt(n4 / 4) : Probe{};
+    // A LEAF that is in neither limb of the probed pair: severable, not
+    // vital, nobody's parent. Its sever reshapes nothing the probe touches.
+    int leaf = -1;
+    for (int li = (int)def.limbs.size() - 1; li >= 0 && p4.a >= 0; li--) {
+      if (li == p4.a || li == p4.b || li == def.rootLimb) continue;
+      if (!def.limbs[li].severable || def.limbs[li].vital) continue;
+      bool parent = false;
+      for (const auto& o : def.limbs) parent |= o.parent == def.limbs[li].name;
+      if (parent) continue;
+      leaf = li;
+      break;
+    }
+    uint32_t ma = 0, mb = 0;
+    uint16_t sa = 0, sb = 0;
+    if (leaf >= 0 && mobs.LimbCellAt(id, p4.a, p4.rest, ma, sa) &&
+        mobs.LimbCellAt(id, p4.b, p4.rest, mb, sb) && ma != rotMat) {
+      mobs.SetLimbCellAt(id, p4.a, p4.rest, rotMat, sa);
+      mobs.Sever(id, leaf);
+      tickOnce(2001u);
+      uint32_t seen = 0;
+      uint16_t s4 = 0;
+      rebuildOk = mobs.LimbCellAt(id, p4.b, p4.rest, seen, s4) && seen == rotMat;
+      rebuildRes = Format("rebuild (sever %s + %s/%s cell) %s, child reads %u",
+                          def.limbs[leaf].name.c_str(),
+                          def.limbs[p4.a].name.c_str(),
+                          def.limbs[p4.b].name.c_str(),
+                          rebuildOk ? "KEEPS the change" : "LOST the change",
+                          seen);
+    } else {
+      rebuildRes = "rebuild: no leaf limb / probe cell to use";
+    }
+  }
+
+  // ---- A TWIN'S HOLE IS CARVED, NOT STRIPPED --------------------------------
+  // Tombstone the PARENT's copies of one pair, one more than the CHILD's
+  // FlushBurn batching threshold (max(kBurnRebuildFloor 12, n >> 6), mirrored
+  // here); the sync removes the child's copies and flushes them. The child is
+  // not burning and holds no burn index -- the case that used to take the
+  // StripBurnTombstones fallback: a bare compaction, no hp charge, no collider
+  // re-derive, no joint rule. Now it is a CarveLimb read off the tombstones,
+  // so the child's hp moves (or the carve severs it -- also only a carve can).
+  std::string carveRes = "not run";
+  bool carveOk = false;
+  {
+    const uint32_t n3 = mobs.JointTwinCount(id);
+    std::map<std::pair<int, int>, std::vector<IVec3>> byPair;
+    for (uint32_t k = 0; k < n3; k++) {
+      Probe p = probeAt(k);
+      byPair[{p.a, p.b}].push_back(p.rest);
+    }
+    int a3 = -1, b3 = -1;
+    uint32_t need = 0;
+    for (auto& pr : byPair) {
+      const uint32_t nb = mobs.LimbArtVoxelCount(id, pr.first.second);
+      const uint32_t thr = std::max(12u, nb >> 6);
+      if (pr.second.size() >= thr + 1 && (b3 < 0 || thr < need)) {
+        a3 = pr.first.first;
+        b3 = pr.first.second;
+        need = thr + 1;
+      }
+    }
+    if (b3 >= 0) {
+      const std::vector<IVec3>& all = byPair[{a3, b3}];
+      const std::vector<IVec3> rests(all.begin(), all.begin() + need);
+      const float hpB0 = mobs.LimbHp(id, b3);
+      for (const IVec3& r : rests) mobs.SetLimbCellAt(id, a3, r, 0, 0);
+      tickOnce(2002u);
+      uint32_t left = 0;
+      for (const IVec3& r : rests) {
+        uint32_t m = 0;
+        uint16_t st2 = 0;
+        if (mobs.LimbCellAt(id, b3, r, m, st2)) left++;
+      }
+      const bool attached = mobs.LimbBody(id, b3) != 0;
+      const float hpB1 = mobs.LimbHp(id, b3);
+      carveOk = left == 0 && (!attached || hpB1 < hpB0);
+      carveRes = Format("twin hole on %s (%u cells, its threshold): %u child "
+                        "copies left, hp %.4f -> %.4f%s (%s)",
+                        def.limbs[b3].name.c_str(), need, left, (double)hpB0,
+                        (double)hpB1, attached ? "" : ", severed",
+                        carveOk ? "CARVED" : "NOT carved");
+    } else {
+      carveRes = "twin hole: no pair has as many links as its child's "
+                 "flush threshold";
+    }
+  }
+
   SetCurrentTuning(saved);
   mobs.Reset();
   c.debris.Reset();
@@ -5563,9 +5672,10 @@ Status GateJointTwins(Ctx& c, std::string& detail) {
                 coatOk ? "SHARED" : "NOT shared", coatSeen, coat,
                 goneOk ? "SHARED" : "NOT shared", moved, linksAfter, n - 1);
   detail = t.defName + ": " + std::to_string(n) + " twin cells (" + pairs +
-           ")" + buf;
+           ")" + buf + "; " + rebuildRes + "; " + carveRes;
   (void)m0;
-  return matOk && coatOk && goneOk && moved == 0 && linksAfter == n - 1
+  return matOk && coatOk && goneOk && moved == 0 && linksAfter == n - 1 &&
+                 rebuildOk && carveOk
              ? Status::Pass
              : Status::Fail;
 }
@@ -5688,6 +5798,33 @@ Status GateAcidCoat(Ctx& c, std::string& detail) {
     }
   }
   const bool gone = mobs.LimbBody(id, t.limb) == 0;
+  // ATTRIBUTION for a coat that will not go: which of the acid cells left are
+  // joint twins (Mob::SyncJointTwins), and what the OTHER copy wears there.
+  std::string residue;
+  if (!gone && mobs.LimbCoatMatCount(id, t.limb, mAcid, 1) > 0) {
+    const uint32_t nt = mobs.JointTwinCount(id);
+    uint32_t onTwin = 0;
+    for (uint32_t k = 0; k < nt; k++) {
+      int a = -1, b = -1;
+      IVec3 r{};
+      if (!mobs.JointTwinAt(id, k, a, b, r)) break;
+      if (a != t.limb && b != t.limb) continue;
+      const int other = a == t.limb ? b : a;
+      uint32_t mm = 0, mo = 0;
+      uint16_t sm = 0, so = 0;
+      const bool hm = mobs.LimbCellAt(id, t.limb, r, mm, sm);
+      const bool ho = mobs.LimbCellAt(id, other, r, mo, so);
+      if (!hm || (sm & 0xFFFu) != (mAcid & 0xFFFu) || (sm >> 12) == 0) continue;
+      if (onTwin++ < 3)
+        residue += Format(" [%s side, (%d,%d,%d) mat %u coat 0x%04x | %s %s mat %u coat 0x%04x]",
+                          a == t.limb ? "parent" : "child", r.x, r.y, r.z, mm,
+                          sm, def.limbs[other].name.c_str(),
+                          ho ? "has" : "LACKS", mo, so);
+    }
+    residue = Format(" | residue: %u acid cells, %u on twin links",
+                     mobs.LimbCoatMatCount(id, t.limb, mAcid, 1), onTwin) +
+              residue + mobs.LimbCoatResidue(id, t.limb, mAcid);
+  }
   const uint32_t nSpent = gone ? 0u : mobs.LimbSkinVoxelCount(id, t.limb);
   for (int i = 0; i < 30 && !gone; i++) poseTick();
   const uint32_t nAfter = gone ? 0u : mobs.LimbSkinVoxelCount(id, t.limb);
@@ -5738,7 +5875,7 @@ Status GateAcidCoat(Ctx& c, std::string& detail) {
                 nSpent, nAfter, bare0, bare1, bareBlood0, bareBlood1,
                 100.0f * baredFrac, 100.0f * bareOdds,
                 bareRan ? "" : " (did not run)");
-  detail = std::string(buf) + " | trace " + trace;
+  detail = std::string(buf) + residue + " | trace " + trace;
   const bool ok = wired && acidOn > 0 && acidCoat > 0 && corrosive > 0 &&
                   eats && ctlKept && spent && boneBloodied;
   return ok ? Status::Pass : Status::Fail;

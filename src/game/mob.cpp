@@ -8236,8 +8236,15 @@ uint8_t Mob::BurnStageOfMaterialName(const std::string& n) {
   return 0;
 }
 
-uint32_t Mob::SurfaceCount(const MobLimb& limb) const {
+namespace {
+IVec3 TwinOrigin(const MobLimb& l, uint32_t scale);  // joint twins, below
+}  // namespace
+
+uint32_t Mob::SurfaceCount(const MobLimb& limb,
+                           const std::vector<uint64_t>* skip,
+                           IVec3 skipOrigin) const {
   if (!sys_) return 0;
+  if (skip && skip->empty()) skip = nullptr;
   // Occupancy by 64-bit key: skin coords are int16 and a mina limb runs past
   // 127 micro voxels, so CarveLimb's 8-bit-per-axis key would alias here.
   auto key = [](int x, int y, int z) {
@@ -8265,6 +8272,11 @@ uint32_t Mob::SurfaceCount(const MobLimb& limb) const {
     const int x = fine ? limb.skinVoxels[i].x : limb.voxels[i].x;
     const int y = fine ? limb.skinVoxels[i].y : limb.voxels[i].y;
     const int z = fine ? limb.skinVoxels[i].z : limb.voxels[i].z;
+    if (skip && std::binary_search(skip->begin(), skip->end(),
+                                   TwinRestKey(x + skipOrigin.x,
+                                               y + skipOrigin.y,
+                                               z + skipOrigin.z)))
+      continue;  // the parent's copy of this cell is the one counted
     for (const auto& dd : d)
       if (!occ.count(key(x + dd[0], y + dd[1], z + dd[2]))) {
         surface++;
@@ -8310,8 +8322,13 @@ void Mob::RecountBurn(uint32_t tick, bool force) {
     // first recount happens on the first burn tick, when the lattice is
     // still whole enough to count. A limb whose count was never taken (it
     // was severed before anything burned) contributes nothing either way.
-    if (l.body && l.surfaceAtSpawn == 0)
-      l.surfaceAtSpawn = std::max(1u, SurfaceCount(l));
+    if (l.body && l.surfaceAtSpawn == 0) {
+      const std::vector<uint64_t>* skip =
+          i < (int)twinShadow_.size() ? &twinShadow_[i] : nullptr;
+      const uint32_t sc = l.HasFineSkin() ? SkinScaleOf(l) : PhysScaleOf(l);
+      l.surfaceAtSpawn = std::max(
+          1u, SurfaceCount(l, skip, skip ? TwinOrigin(l, sc) : IVec3{}));
+    }
     surface += l.surfaceAtSpawn;
     if (!l.body) continue;  // severed: its matter is gone, its burntAway stays
     if (l.HasFineSkin()) {
@@ -8320,6 +8337,21 @@ void Mob::RecountBurn(uint32_t tick, bool force) {
     } else {
       for (const DebrisVoxel& v : l.voxels)
         burnt2 += sys_->BurnStageOf(v.payload & 0xFFFu);
+    }
+  }
+  // ONE CELL, COUNTED ONCE. A joint twin cell is two lattice voxels (the
+  // parent's copy and the child's) and the sync keeps them the same material,
+  // so the sweep above counted every burnt overlap cell twice -- a charred
+  // joint pushed the creature toward the death knot at double weight. The
+  // child copies come back off, read from the links (just reconciled: the
+  // sync runs immediately before this in BurnTick), and the surface above
+  // skipped them for the same reason.
+  for (const JointTwinPair& tp : twins_) {
+    if (tp.b < 0 || tp.b >= n || tp.a < 0 || tp.a >= n) continue;
+    if (!limbs_[tp.a].body || !limbs_[tp.b].body) continue;
+    for (const JointTwinCell& c : tp.cells) {
+      const uint64_t st = sys_->BurnStageOf(c.b.mat & 0xFFFu);
+      burnt2 -= std::min(burnt2, st);
     }
   }
   burnFrac_ = surface ? std::clamp((float)burnt2 / (float)(2ull * surface),
@@ -9918,6 +9950,7 @@ void Mob::DropBurnIndex(BodyBurnState& st) {
   st.corrodeStale = true;
   st.dims = IVec3{0, 0, 0};
   st.quiet = 0;
+  st.sleepKey = 0;
   // `st.alight` deliberately SURVIVES. Everything above is an index INTO a
   // lattice that just changed shape; the flag is a fact ABOUT the lattice, and
   // it is the only thing that will make BurnOneLimb rebuild this index once the
@@ -11602,17 +11635,42 @@ bool Mob::FlushBurn(int limbIndex, World& world,
   // predicate rejects, and the index is what remembers which those are.
   const IVec3 bmin = limb.burn.min, bdim = limb.burn.dims;
   const std::vector<uint32_t>* idx = &limb.burn.idx;
-  auto keepAt = [bmin, bdim, idx](int x, int y, int z) -> bool {
+  // ---- NO INDEX: THE TOMBSTONES THEMSELVES ARE THE REMOVED SET -------------
+  //
+  // This used to fall back to StripBurnTombstones -- a bare compaction -- and
+  // that silently skipped everything the carve below does: no hp loss, no
+  // collider re-derive, no brick re-pack, no sever, and no
+  // DropDisconnectedChildren. It was reachable whenever a removal landed on a
+  // limb holding no burn index, and the joint-twin sync is exactly that
+  // writer: a hole burnt in the torso's copy of a hip cell tombstones the
+  // hip's copy, and the hip (not burning, so no index) kept a solid collider
+  // and full hp over a hole it could see. So the set is read off the
+  // lattice's material-0 tombstones instead, keyed by position; same carve.
+  std::unordered_set<uint64_t> tomb;
+  auto tombKey = [](int x, int y, int z) {
+    return (uint64_t)(uint32_t)(x + 32768) |
+           ((uint64_t)(uint32_t)(y + 32768) << 16) |
+           ((uint64_t)(uint32_t)(z + 32768) << 32);
+  };
+  if (idx->empty()) {
+    if (fine) {
+      for (const PrefabVoxel& v : limb.skinVoxels)
+        if ((v.material & 0xFFFu) == 0) tomb.insert(tombKey(v.x, v.y, v.z));
+    } else {
+      for (const DebrisVoxel& v : limb.voxels)
+        if ((v.payload & 0xFFFu) == 0) tomb.insert(tombKey(v.x, v.y, v.z));
+    }
+    if (tomb.empty()) return true;  // counted, but nothing is actually gone
+  }
+  const std::unordered_set<uint64_t>* tombs = &tomb;
+  auto keepAt = [bmin, bdim, idx, tombs, tombKey](int x, int y, int z) -> bool {
+    if (idx->empty()) return !tombs->count(tombKey(x, y, z));
     const int lx = x - bmin.x, ly = y - bmin.y, lz = z - bmin.z;
     if (lx < 0 || ly < 0 || lz < 0 || lx >= bdim.x || ly >= bdim.y ||
         lz >= bdim.z)
       return true;
     return (*idx)[((size_t)lz * bdim.y + ly) * bdim.x + lx] != 0;
   };
-  if (idx->empty()) {  // index already gone: fall back to a plain compaction
-    StripBurnTombstones(limb);
-    return true;
-  }
 
   inBurnFlush_ = true;
   const bool alive = CarveLimb(
@@ -11867,6 +11925,60 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     lo = {ifloor(mn.x) - 1, ifloor(mn.y) - 1, ifloor(mn.z) - 1};
     hi = {ifloor(mx.x) + 1, ifloor(mx.y) + 1, ifloor(mx.z) + 1};
   }
+  // ---- ASLEEP? (BodyBurnState::sleepKey) ----------------------------------
+  // Only when every OTHER input to the idle exit below already says idle --
+  // nothing alight, no acid on it, no index held, no sibling's heat -- so the
+  // walk is the only thing left that could wake the limb, and the walk is a
+  // pure function of what this key digests. A chunk that is not cached yet
+  // (the walk would ask for it) keeps the limb awake; so does any chunk being
+  // re-fetched, since that moves its version. The result is the walk's own,
+  // so this changes the cost and never the outcome.
+  uint64_t sleepKey = 0;
+  bool foreignHeat = false;
+  if (v.crossHeat && v.crossPct > 0)
+    for (const CrossHeatCell& e : *v.crossHeat)
+      if (e.limbs & ~selfBit) { foreignHeat = true; break; }
+  if (st.front.empty() && !st.alight && !v.corrodeCoat && st.idx.empty() &&
+      !foreignHeat) {
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](uint64_t x) {
+      h ^= x;
+      h *= 1099511628211ull;
+    };
+    auto mixF = [&mix](float f) {
+      uint32_t u;
+      std::memcpy(&u, &f, 4);
+      mix(u);
+    };
+    mixF(v.xf->pos.x); mixF(v.xf->pos.y); mixF(v.xf->pos.z);
+    for (int k = 0; k < 4; k++) mixF(v.xf->quat[k]);
+    mix((uint64_t)(uint32_t)lo.x << 32 | (uint32_t)lo.y);
+    mix((uint64_t)(uint32_t)lo.z << 32 | (uint32_t)hi.x);
+    mix((uint64_t)(uint32_t)hi.y << 32 | (uint32_t)hi.z);
+    const IVec3 wo = world.WindowOrigin();
+    mix((uint64_t)(uint32_t)wo.x << 32 | (uint32_t)wo.y);
+    mix((uint64_t)(uint32_t)wo.z);
+    mix((uint64_t)(uintptr_t)matHot_.data() ^ matHot_.size());
+    const IVec3 c0 = ChunkOfCell(lo.x, lo.y, lo.z),
+                c1 = ChunkOfCell(hi.x, hi.y, hi.z);
+    bool known = true;
+    for (int cz = c0.z; cz <= c1.z && known; cz++)
+      for (int cy = c0.y; cy <= c1.y && known; cy++)
+        for (int cx = c0.x; cx <= c1.x && known; cx++) {
+          const IVec3 wc{cx, cy, cz};
+          if (!world.ChunkInWindow(wc)) continue;  // reads as air, no fetch
+          const CachedChunk* cc = world.Cached(wc);
+          if (!cc || cc->voxels.size() != kChunkVol) {
+            known = false;
+            break;
+          }
+          mix((uint64_t)(uintptr_t)cc);
+          mix(cc->version);
+        }
+    if (known) sleepKey = h ? h : 1u;
+    if (sleepKey && sleepKey == st.sleepKey) return changed;  // asleep
+  }
+  st.sleepKey = 0;
   scanHot.clear();
   {
     uint32_t seen = 0;
@@ -11938,6 +12050,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // other tick, then released.
     if (!st.idx.empty() && ++st.quiet > kBurnIndexGrace)
       Mob::DropBurnIndex(st);
+    // Fall asleep only with no index held (the grace above has run out): a
+    // held index still counts its quiet ticks, and sleeping would freeze it.
+    // `sleepKey` is nonzero only when the index was ALREADY empty on entry.
+    if (st.idx.empty()) st.sleepKey = sleepKey;
     return changed;
   }
   st.quiet = 0;
@@ -12201,6 +12317,12 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         emitCell({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, pm, state);
       }
       v.Set(i, 0, 0);      // tombstone; FlushBurn compacts it away
+      // ...and it wears nothing. A tombstone waits for its batch's flush --
+      // indefinitely, on a limb that stops losing voxels short of FlushBurn's
+      // threshold -- and it used to keep the coat it had, so an acid-eaten
+      // voxel read as acid still on the limb to every stain count that walks
+      // the raw lattice (gate acid-coat). The ledger already skips tombstones.
+      v.SetStain(i, 0);
       st.idx[cell] = 0;  // gone NOW, so neighbours see through it
       st.removed++;
       if (v.bareBloodMat) bared.push_back(cell);
@@ -12217,6 +12339,25 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     changed = true;
   };
 
+  // The roll key of a lattice cell: the limb's own, or -- for a joint twin
+  // cell -- the creature's, off its rest coordinate, so the other copy of the
+  // same cell draws the same numbers (see ONE CELL, ONE DRAW below).
+  // Returns the side this lattice holds the cell on (0 = parent's copy,
+  // 1 = child's), or -1 when the cell is not a twin.
+  auto twinKeyOf = [&](IVec3 p, uint32_t& lk, uint32_t& ck, IVec3& kp) -> int {
+    if (!v.twinCells) return -1;
+    const IVec3 r{p.x + v.twinOrigin.x, p.y + v.twinOrigin.y,
+                  p.z + v.twinOrigin.z};
+    const uint64_t rk = TwinRestKey(r.x, r.y, r.z);
+    const auto it =
+        std::lower_bound(v.twinCells->begin(), v.twinCells->end(), rk << 1);
+    if (it == v.twinCells->end() || (*it >> 1) != rk) return -1;
+    lk = v.twinKey;
+    ck = (uint32_t)((rk * 0x9E3779B97F4A7C15ull) >> 32);
+    kp = r;
+    return (int)(*it & 1u);
+  };
+
   // ---- run the table over each candidate --------------------------------
   for (uint32_t cell : cand) {
     if (frontBudget == 0) break;
@@ -12227,6 +12368,32 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const uint32_t m = v.Mat(i);
     if (m == 0 || m >= matGpu_.size()) continue;
     const IVec3 vp = v.At(i);
+    // ---- ONE CELL, ONE ROLL (Mob::twinCells_) ----------------------------
+    // A joint twin cell is two lattice voxels on two limbs, and each limb's
+    // pass rolled it: two independent chances a tick at one cell, with the
+    // sync copying whichever changed first, so every overlap cell burnt,
+    // decayed and dissolved at about twice its authored rate.
+    //
+    // Now ONE copy rolls it per tick, and which one is itself a draw keyed on
+    // the creature, the rest cell and the tick -- the same answer on both
+    // limbs, so exactly one of them evaluates the cell and the sync carries
+    // the outcome to the other. Not a fixed side, and that is measured: with
+    // the PARENT always rolling, acid on a thigh was only ever carried inward
+    // into the pelvis (each copy carries a coat inward on its OWN lattice) and
+    // gate acid-coat's control leg, across the pelvis, started losing voxels.
+    // Alternating keeps the old 50/50 split of where the joint's matter goes.
+    // Both copies drawing the SAME number was also tried, and duplicated the
+    // carried acid into both lattices on every bite. The skipped copy is
+    // still a neighbour to everything around it, stays on the front if its
+    // material is alight, and does not spend the front budget.
+    uint32_t lk = limbKey, ck = cell;
+    IVec3 kp = vp;
+    const int twinSide = twinKeyOf(vp, lk, ck, kp);
+    if (twinSide >= 0 &&
+        (int)(Hash3(lk ^ ck, tick, 0x7512Eu) & 1u) != twinSide) {
+      frontBudget++;  // handed back: nothing was evaluated
+      continue;
+    }
 
     // The six face neighbours, gathered ONCE: the limb's own lattice first,
     // and the world cell one LATTICE step away when the lattice has nothing
@@ -12496,7 +12663,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           // Its own rule-index space (+96), apart from the self (+0) and
           // inbound (+64) passes, so the douse roll correlates with neither.
           const uint32_t rr =
-              Hash3(limbKey ^ (cell * 3266489917u), tick, 96u + ri);
+              Hash3(lk ^ (ck * 3266489917u), tick, 96u + ri);
           if (rr % kReactChanceDen >= r.chance) continue;
           applyTo(cell, r.prodSelf, rr);
           doused = true;
@@ -12518,7 +12685,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             std::max(0.05f, CurrentTuning().coat.fireDrySeconds);
         const uint32_t pm = (uint32_t)std::min(
             1000.0f, 1000.0f * (float)kStainAmtMax / (secs * 30.0f));
-        const uint32_t rr = Hash3(limbKey ^ (cell * 2654435761u), tick, 0xB011u);
+        const uint32_t rr = Hash3(lk ^ (ck * 2654435761u), tick, 0xB011u);
         if (rr % 1000u < pm) boil(i, 1u);
       }
     }
@@ -12553,7 +12720,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           // Its own rule-index space (+160), apart from self (+0), inbound
           // (+64), douse (+96) and coat bite (+128).
           const uint32_t rr =
-              Hash3(limbKey ^ (cell * 2891336453u), tick, 160u + rj);
+              Hash3(lk ^ (ck * 2891336453u), tick, 160u + rj);
           if (rr % kReactChanceDen >=
               RainScaledChance(r.cond, r.chance, weatherRain_, true))
             continue;
@@ -12705,7 +12872,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // Weather last, on the fully-scaled chance: rain douses a burning limb
       // and damps its catching exactly as it does a grid cell (reactcpu.h).
       chance = RainScaledChance(r.cond, chance, weatherRain_, true);
-      const uint32_t rr = Hash3(limbKey ^ (cell * 2246822519u), tick, ri);
+      const uint32_t rr = Hash3(lk ^ (ck * 2246822519u), tick, ri);
       if (rr % kReactChanceDen >= chance) continue;
       const uint32_t kind = r.packed & 3u;
       if (kind == kReactDecay) {
@@ -12780,7 +12947,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // that is both burning and dissolving does not roll one stream
         // twice and correlate the two.
         const uint32_t rr =
-            Hash3(limbKey ^ (cell * 668265263u), tick, 64u + rj);
+            Hash3(lk ^ (ck * 668265263u), tick, 64u + rj);
         if (rr % kReactChanceDen >=
             RainScaledChance(r.cond, r.chance, weatherRain_, true))
           continue;
@@ -12834,8 +13001,8 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // coarse pitch (one layer thicker than coat.depth) a coat takes the
       // layer at those odds rather than always or never.
       if (haveMilli < costMilli &&
-          Hash3(limbKey ^ ((uint32_t)vp.x * 73856093u) ^
-                    ((uint32_t)vp.y * 19349663u) ^ ((uint32_t)vp.z * 83492791u),
+          Hash3(lk ^ ((uint32_t)kp.x * 73856093u) ^
+                    ((uint32_t)kp.y * 19349663u) ^ ((uint32_t)kp.z * 83492791u),
                 0xAC1Du, 0u) % costMilli >= haveMilli)
         continue;
       for (uint32_t rj = 0; rj < cg.reactCount; rj++) {
@@ -12846,7 +13013,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // Its own rule-index space (+128), apart from self (+0), inbound
         // (+64) and douse (+96).
         const uint32_t rr =
-            Hash3(limbKey ^ (cell * 374761393u), tick, 128u + rj);
+            Hash3(lk ^ (ck * 374761393u), tick, 128u + rj);
         if (rr % kReactChanceDen >=
             RainScaledChance(r.cond, r.chance, weatherRain_, true))
           continue;
@@ -12926,9 +13093,12 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         const float odds = bmat < matBareBlood_.size() ? matBareBlood_[bmat] : 0.0f;
         if (!(odds > 0.0f)) continue;
         const IVec3 bp = v.At(bi);
+        uint32_t blk = limbKey, bck = 0;
+        IVec3 bkp = bp;
+        twinKeyOf(bp, blk, bck, bkp);  // one draw per twin cell
         const uint32_t h =
-            Hash3(limbKey ^ ((uint32_t)bp.x * 73856093u) ^
-                      ((uint32_t)bp.y * 19349663u) ^ ((uint32_t)bp.z * 83492791u),
+            Hash3(blk ^ ((uint32_t)bkp.x * 73856093u) ^
+                      ((uint32_t)bkp.y * 19349663u) ^ ((uint32_t)bkp.z * 83492791u),
                   0xB10D5u, 0u);
         if ((float)(h & 0xFFFFu) >= odds * 65536.0f) continue;
         const uint16_t cur = v.Stain(bi);
@@ -13066,6 +13236,7 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
     if (!limbs_[li].body) continue;
     BurnLimbView v = ViewOf(limbs_[li]);
     v.corrodeCoat = limbs_[li].coat.corrosive > 0;
+    TwinShadowInto(li, v);  // joint-twin cells: one copy rolls per tick
     if (!crossHeat_.empty()) {
       v.crossHeat = &crossHeat_;
       v.selfLimb = li;
@@ -13853,8 +14024,18 @@ struct TwinLook {
 
 }  // namespace
 
+void Mob::TwinShadowInto(int li, BurnLimbView& v) const {
+  if (li < 0 || li >= (int)twinCells_.size() || twinCells_[li].empty())
+    return;
+  v.twinCells = &twinCells_[li];
+  v.twinOrigin = TwinOrigin(limbs_[li], std::max(1u, v.scale));
+  v.twinKey = (uint32_t)id_ * 0x9E3779B9u ^ 0x7A1175u;
+}
+
 void Mob::BuildJointTwins() {
   twins_.clear();
+  twinShadow_.assign(limbs_.size(), {});
+  twinCells_.assign(limbs_.size(), {});
   twinsBuilt_ = true;
   twinAttached_.assign(limbs_.size(), 0);
   for (size_t i = 0; i < limbs_.size(); i++)
@@ -13937,7 +14118,23 @@ void Mob::BuildJointTwins() {
       tp.lo = {std::min(tp.lo.x, r.x), std::min(tp.lo.y, r.y), std::min(tp.lo.z, r.z)};
       tp.hi = {std::max(tp.hi.x, r.x), std::max(tp.hi.y, r.y), std::max(tp.hi.z, r.z)};
     }
-    if (!tp.cells.empty()) twins_.push_back(std::move(tp));
+    if (!tp.cells.empty()) {
+      for (const JointTwinCell& c : tp.cells) {
+        const uint64_t k = TwinRestKey(c.rest.x, c.rest.y, c.rest.z);
+        twinShadow_[(size_t)b].push_back(k);
+        twinCells_[(size_t)a].push_back(k << 1);        // the parent's copy
+        twinCells_[(size_t)b].push_back((k << 1) | 1u); // the child's copy
+      }
+      twins_.push_back(std::move(tp));
+    }
+  }
+  for (std::vector<uint64_t>& sh : twinShadow_) std::sort(sh.begin(), sh.end());
+  // A cell in two pairs on one limb keeps its first (lowest) side entry.
+  for (std::vector<uint64_t>& sh : twinCells_) {
+    std::sort(sh.begin(), sh.end());
+    sh.erase(std::unique(sh.begin(), sh.end(),
+                         [](uint64_t x, uint64_t y) { return (x >> 1) == (y >> 1); }),
+             sh.end());
   }
 }
 
@@ -13948,10 +14145,24 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
   // other half has left the body is no longer a twin: the severed hip keeps
   // its copy of the torso's rim and the torso keeps its own. Rebuilding
   // baselines against the lattices as they now stand; it propagates nothing.
-  bool rebuild = !twinsBuilt_ || twinAttached_.size() != limbs_.size();
+  //
+  // ...SO EVERY PAIR THAT IS STILL WHOLE IS RECONCILED FIRST. The rebuild
+  // re-baselines, and a re-baseline taken over a divergence makes the
+  // divergence the new normal: fire charring the torso's copy of a hip cell
+  // in the same tick it burnt a hand off left the hip's copy pristine for
+  // good, because the hand's sever forced a rebuild before the char was ever
+  // copied. The same happened whenever BurnTick returned early (a FlushBurn
+  // or InfectTick sever) with a change pending -- the sync did not run that
+  // tick, and the next tick's opened with a rebuild. Pairs whose limbs both
+  // still have a body are synced against their OLD baseline below, then the
+  // links are rebuilt. Only a change in the NUMBER of limbs (a respawn) skips
+  // it: pair indices are not meaningful across that.
+  const bool sameShape =
+      twinsBuilt_ && twinAttached_.size() == limbs_.size();
+  bool rebuild = !sameShape;
   for (size_t i = 0; !rebuild && i < limbs_.size(); i++)
     rebuild = (limbs_[i].body ? 1 : 0) != twinAttached_[i];
-  if (rebuild) {
+  if (!sameShape || (rebuild && twins_.empty())) {
     BuildJointTwins();
     return true;
   }
@@ -14020,6 +14231,7 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
   auto remove = [&](int li, const BurnLimbView& v, size_t i) {
     const IVec3 p = v.At(i);
     v.Set(i, 0, 0);
+    v.SetStain(i, 0);  // a tombstone wears nothing (BurnOneLimb's applyTo)
     BodyBurnState& st = limbs_[li].burn;
     if (!st.idx.empty()) {
       const int x = p.x - st.min.x, y = p.y - st.min.y, z = p.z - st.min.z;
@@ -14034,6 +14246,9 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
   };
 
   for (JointTwinPair& tp : twins_) {
+    if (tp.a < 0 || tp.b < 0 || tp.a >= (int)limbs_.size() ||
+        tp.b >= (int)limbs_.size())
+      continue;
     if (!limbs_[tp.a].body || !limbs_[tp.b].body) continue;
     BurnLimbView va = ViewOf(limbs_[tp.a]), vb = ViewOf(limbs_[tp.b]);
     const IVec3 dims{tp.hi.x - tp.lo.x + 1, tp.hi.y - tp.lo.y + 1,
@@ -14084,8 +14299,21 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
   // What this pass wrote is already reconciled; only a later writer (or the
   // flush below, which compacts and so moves every hint) needs another pass.
   twinDirty_ = false;
+  // The divergence is reconciled; NOW the links may be re-baselined against
+  // the new set of limbs (tombstones read as absent, so a removal just
+  // copied across is simply not linked again).
+  if (rebuild) BuildJointTwins();
   if (!removed) return true;
   // LAST, for InfectStep's reason: a flush may sever or kill.
+  //
+  // Batched, like every other removal: a receiver under FlushBurn's threshold
+  // keeps its copied holes as tombstones until its next flush (its own, or
+  // the forced one any later carve opens with) -- and that flush is now a
+  // real carve even when the receiver holds no burn index (FlushBurn).
+  // FORCING it here was tried and measured: every twin hole then carved the
+  // receiver at once, and the first carve of a hips drops its collider's
+  // stray components, which took two voxels off the OTHER thigh's copies
+  // through their own links (gate acid-coat's control leg).
   for (int li = 0; li < (int)limbs_.size(); li++) {
     if (!limbs_[li].body || limbs_[li].burn.removed == 0) continue;
     if (!FlushBurn(li, world, spawns, /*force=*/false)) return false;
@@ -14146,6 +14374,49 @@ bool MobSystem::LimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t& mat,
   mat = v.Mat((size_t)i);
   stain = v.Stain((size_t)i);
   return true;
+}
+
+std::string MobSystem::LimbCoatResidue(uint64_t mobId, int limb,
+                                       uint32_t coatMat) {
+  Mob* m = FindMobById(mobId);
+  if (!m || limb < 0 || limb >= (int)m->limbs_.size()) return "";
+  MobLimb& l = m->limbs_[limb];
+  BurnLimbView v = m->ViewOf(l);
+  const BodyBurnState& st = l.burn;
+  std::string out;
+  char buf[200];
+  uint32_t shown = 0;
+  for (size_t i = 0; i < v.Size() && shown < 3; i++) {
+    const uint16_t sc = v.Stain(i);
+    if (!BodyStainAmt(sc) || BodyStainMat(sc) != (coatMat & 0xFFFu)) continue;
+    const IVec3 p = v.At(i);
+    bool inIdx = false;
+    if (!st.idx.empty()) {
+      const int x = p.x - st.min.x, y = p.y - st.min.y, z = p.z - st.min.z;
+      if (x >= 0 && y >= 0 && z >= 0 && x < st.dims.x && y < st.dims.y &&
+          z < st.dims.z)
+        inIdx = (st.idx[((size_t)z * st.dims.y + y) * st.dims.x + x] &
+                 ~kBurnQueued) == (uint32_t)i + 1u;
+    }
+    bool twin = false;
+    if (limb < (int)m->twinCells_.size() && !m->twinCells_[limb].empty()) {
+      const IVec3 o = TwinOrigin(l, std::max(1u, v.scale));
+      const uint64_t rk = TwinRestKey(p.x + o.x, p.y + o.y, p.z + o.z);
+      const auto& tc = m->twinCells_[limb];
+      const auto it = std::lower_bound(tc.begin(), tc.end(), rk << 1);
+      twin = it != tc.end() && (*it >> 1) == rk;
+    }
+    std::snprintf(buf, sizeof buf, " [mat %u amt %u%s%s%s]", v.Mat(i),
+                  BodyStainAmt(sc), v.Mat(i) == 0 ? " TOMBSTONE" : "",
+                  st.idx.empty() ? " no-index" : (inIdx ? " indexed" : " NOT-indexed"),
+                  twin ? " twin-listed" : "");
+    out += buf;
+    shown++;
+  }
+  std::snprintf(buf, sizeof buf,
+                " (limb removed %u, alight %d, ledger corrosive %u voxels %u)",
+                st.removed, st.alight ? 1 : 0, l.coat.corrosive, l.coat.voxels);
+  return out + buf;
 }
 
 bool MobSystem::SetLimbCellAt(uint64_t mobId, int limb, IVec3 rest,
@@ -14443,16 +14714,22 @@ BurnLimbView MobSystem::CorpseView(DebrisSystem::FleshLattice& f,
   // A DERIVED INDEX OVER A LATTICE THAT MOVES UNDER IT. The living drop theirs
   // on every carve (DropBurnIndex); a corpse is carved, burnt and shattered by
   // DebrisSystem, which knows nothing of this one, so it is keyed on the voxel
-  // count instead. Every edit that moves voxels changes it; one that only
-  // rewrites payloads (burning, a coat) keeps positions, which is all the
-  // index records.
+  // count AND the body's coordinate generation. Every edit that adds or
+  // removes voxels changes the count; a REBASE (ReskinMicro taking the brick's
+  // new min corner, on BurnTail's batched refresh or a carve) moves every
+  // coordinate and keeps the count, and bumps Body::geomGen instead. Keyed on
+  // the count alone, the index, front and surface went on addressing the
+  // pre-shift coordinates and the burn pass read the wrong neighbours. One
+  // that only rewrites payloads (burning, a coat) keeps positions, which is
+  // all the index records.
   const size_t n = v.Size();
-  if (n != cc.n) {
+  if (n != cc.n || f.geomGen != cc.gen) {
     // The index, front and surface point INTO a lattice that just changed
     // shape; `alight` is a fact about the lattice and survives, exactly as a
     // living limb's does across a carve (Mob::DropBurnIndex).
     Mob::DropBurnIndex(cc.burn);
     cc.n = n;
+    cc.gen = f.geomGen;
     cc.dirty = true;
   }
   // First meeting, or a lattice rewritten in place (RewriteBodyMaterial): the
@@ -14494,7 +14771,8 @@ uint32_t MobSystem::CorpseWornAlong(
     CorpseShell& cs = corpseShellIdx_[sh.id];
     cs.seen = tick;
     const uint32_t m = MarchShell(cs.ix, sh.skin, sh.coll, *sh.xf, sh.scale,
-                                  from, dir, dist, kWornMarchMax, nullptr);
+                                  from, dir, dist, kWornMarchMax, nullptr,
+                                  sh.geomGen);
     if (m) return m;
   }
   return 0u;
@@ -21161,7 +21439,8 @@ int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
 uint32_t MarchShell(ShellMarchIndex& ix, const std::vector<PrefabVoxel>* skin,
                     const std::vector<DebrisVoxel>* coll,
                     const BodyTransform& xf, uint32_t scaleU, const Vec3& from,
-                    const Vec3& dir, float dist, int maxSteps, Vec3* outAt) {
+                    const Vec3& dir, float dist, int maxSteps, Vec3* outAt,
+                    uint32_t geomGen) {
   const bool fine = skin != nullptr;
   const size_t n = fine ? skin->size() : (coll ? coll->size() : 0);
   if (n == 0) return 0u;
@@ -21172,8 +21451,10 @@ uint32_t MarchShell(ShellMarchIndex& ix, const std::vector<PrefabVoxel>* skin,
   // (Re)build the dense index whenever the lattice changed size. Carving and
   // burning both COMPACT the lattice, so the count is a sufficient witness —
   // and it is the same witness the save/restore path uses to decide a limb
-  // was carved.
-  if (ix.builtFor != n) {
+  // was carved. A REBASE is the one edit that moves every coordinate and keeps
+  // the count (DebrisSystem::ReskinMicro), so the caller's coordinate
+  // generation is the second key.
+  if (ix.builtFor != n || ix.builtGen != geomGen) {
     IVec3 mn{1 << 30, 1 << 30, 1 << 30}, mx{-(1 << 30), -(1 << 30), -(1 << 30)};
     for (size_t i = 0; i < n; i++) {
       const IVec3 q = at(i);
@@ -21185,6 +21466,7 @@ uint32_t MarchShell(ShellMarchIndex& ix, const std::vector<PrefabVoxel>* skin,
     const IVec3 dims{mx.x - mn.x + 1, mx.y - mn.y + 1, mx.z - mn.z + 1};
     const uint64_t cells = (uint64_t)dims.x * dims.y * dims.z;
     ix.builtFor = n;
+    ix.builtGen = geomGen;
     // Same refusal BuildBurnIndex makes, and for the same reason: a long
     // diagonal sliver would allocate a lot to index very little. A refused
     // shell simply does not occlude, which fails toward "the fire reaches the

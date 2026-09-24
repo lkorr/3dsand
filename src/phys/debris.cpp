@@ -2796,6 +2796,7 @@ DebrisSystem::FleshLattice DebrisSystem::FleshOf(Body& b) {
   f.microModel = &b.micro.model;
   f.selfActive = b.activeCount > 0;
   f.bleedMat = b.bleedMat;
+  f.geomGen = b.geomGen;
   return f;
 }
 
@@ -2817,10 +2818,21 @@ void DebrisSystem::BurnFleshBodies(
   lats.reserve(which.size());
   for (size_t i : which) lats.push_back(FleshOf(bodies_[i]));
   // Its armour: every follower strapped to it. A handful per corpse at most.
-  for (size_t k = 0; k < which.size(); k++) {
-    const uint64_t host = bodies_[which[k]].handle;
-    for (const Body& sh : bodies_) {
-      if (sh.wornHost != host) continue;
+  //
+  // ONE PASS OVER THE BODY LIST, not one per piece. This used to walk every
+  // body for every dead-flesh body, every tick: O(corpse pieces x bodies),
+  // paid by a battlefield of corpses lying still. Followers are grouped by
+  // host once (in body-list order, so each piece's shell order is exactly
+  // what the per-piece scan produced), and a field with no armour on it pays
+  // one pass and an empty map.
+  std::unordered_map<uint64_t, std::vector<size_t>> strapped;
+  for (size_t i = 0; i < bodies_.size(); i++)
+    if (bodies_[i].wornHost != 0) strapped[bodies_[i].wornHost].push_back(i);
+  for (size_t k = 0; k < which.size() && !strapped.empty(); k++) {
+    const auto it = strapped.find(bodies_[which[k]].handle);
+    if (it == strapped.end()) continue;
+    for (size_t si : it->second) {
+      const Body& sh = bodies_[si];
       const bool fine = sh.HasFineSkin();
       FleshShell fs;
       fs.id = ((uint64_t)sh.ownerAtCreate << 48) | (uint64_t)sh.serial;
@@ -2828,6 +2840,7 @@ void DebrisSystem::BurnFleshBodies(
       fs.coll = fine ? nullptr : &sh.voxels;
       fs.xf = &sh.xf;
       fs.scale = std::max(1u, fine ? sh.micro.skinScale : sh.physScale);
+      fs.geomGen = sh.geomGen;
       lats[k].shells.push_back(fs);
     }
   }
@@ -4837,6 +4850,9 @@ bool DebrisSystem::ReskinMicro(Body& b) {
   // Doing it here, from what MicroBodyEdit actually chose, is what keeps the
   // two frames agreeing without either side having to assume the other's.
   if (shift.x || shift.y || shift.z) {
+    // Every coordinate moves and the count does not: the caches keyed on the
+    // count alone would go on reading the old frame (Body::geomGen).
+    b.geomGen++;
     const float inv = 1.0f / (float)std::max(1u, b.micro.skinScale);
     b.xf.pos += QuatRot(b.xf.quat, Vec3{(float)shift.x * inv,
                                         (float)shift.y * inv,
@@ -5141,10 +5157,12 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   // corner MicroBodyEdit really chose, so art, collider and voxels stay in one
   // frame. Exactly one of these two runs for any body.
   const Vec3 posBeforeRebase = b.xf.pos;
-  if (b.micro.Valid())
-    ReskinMicro(b);
-  else
+  if (b.micro.Valid()) {
+    ReskinMicro(b);  // bumps geomGen itself when it shifts
+  } else {
     RebaseVoxels(b.voxels, b.xf);
+    if ((b.xf.pos - posBeforeRebase).len() > 1e-6f) b.geomGen++;
+  }
   // ...AND ONLY WHEN THERE IS A NEW COLLIDER TO BUILD. A kerf that reached the
   // skin and not the derived collider leaves the physics shape bit-identical,
   // and RebuildCollider is not free: it is a fresh Jolt compound plus a
@@ -6112,8 +6130,10 @@ bool DebrisSystem::BodyLatticeOf(uint64_t handle, std::vector<PrefabVoxel>& out,
 }
 
 void DebrisSystem::RefreshLocalBounds(Body& b) {
-  if (b.boundsCount == (uint32_t)b.voxels.size()) return;
+  if (b.boundsCount == (uint32_t)b.voxels.size() && b.boundsGen == b.geomGen)
+    return;
   b.boundsCount = (uint32_t)b.voxels.size();
+  b.boundsGen = b.geomGen;
   if (b.voxels.empty()) {
     b.lmin[0] = b.lmin[1] = b.lmin[2] = 0;
     b.lmax[0] = b.lmax[1] = b.lmax[2] = 0;
