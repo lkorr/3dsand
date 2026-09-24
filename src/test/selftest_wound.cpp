@@ -4385,6 +4385,14 @@ Status GateRainOil(Ctx& c, std::string& detail) {
     if (mobs.LimbBody(id, li)) marked += mobs.SoakLimb(id, li, mOil, pour, simTick);
   const CoatEntry wetAfterPour = entry(mWater);
   const CoatEntry oilPoured = entry(mOil);
+  // OILED FEET SLIP (2026-09-23): the slip reads the SOLE fraction, and a
+  // freshly oiled sole has to clear player.slipCoatFull -- the whole-foot
+  // fraction it used to read divided the coat by the foot's interior and
+  // never reached onset, so oily feet did nothing. Both are printed.
+  const float soleSlip = mobs.CoatTagFraction(id, "slippery", "foot", true);
+  const float footSlip = mobs.CoatTagFraction(id, "slippery", "foot", false);
+  const float slipFull = CurrentTuning().player.slipCoatFull;
+  const bool slips = soleSlip >= slipFull;
 
   run(30);
   const CoatEntry oilEarly = entry(mOil), wetEarly = entry(mWater);
@@ -4406,19 +4414,21 @@ Status GateRainOil(Ctx& c, std::string& detail) {
   const bool landed = wetBefore.voxels > 0 && oilPoured.voxels > 0 &&
                       wetLeft <= wetLeftMax;
   const bool washed = oilPoured.sumAmt > 0 && oilFrac <= oilLeftMax;
-  const bool ok = landed && bothNamed && washed;
-  char buf[640];
+  const bool ok = landed && bothNamed && washed && slips;
+  char buf[800];
   std::snprintf(
       buf, sizeof(buf),
       "%s: %s — storm soak %d ticks: %u wet voxels; oil pour (amount %u) "
       "marked %u, oil on %u voxels, wet voxels left %u (%.2f, want <= %.2f)%s; "
       "30 ticks on: oil %u + water %u summed (both named: %s); after %d storm "
-      "ticks oil %u of %u summed (%.2f, want <= %.2f)%s",
+      "ticks oil %u of %u summed (%.2f, want <= %.2f)%s; slippery soles %.3f "
+      "(want >= slipCoatFull %.2f; whole foot %.3f)%s",
       ok ? "PASS" : "FAIL", t.defName.c_str(), soakTicks, wetBefore.voxels,
       pour, marked, oilPoured.voxels, wetAfterPour.voxels, wetLeft, wetLeftMax,
       landed ? "" : " [OIL REFUSED BY WATER]", oilEarly.sumAmt, wetEarly.sumAmt,
       bothNamed ? "yes" : "NO", washTicks, oilLeft.sumAmt, oilPoured.sumAmt,
-      oilFrac, oilLeftMax, washed ? "" : " [RAIN DID NOT RINSE]");
+      oilFrac, oilLeftMax, washed ? "" : " [RAIN DID NOT RINSE]", soleSlip,
+      slipFull, footSlip, slips ? "" : " [OILED FEET DO NOT SLIP]");
   detail = buf;
   std::printf("rain-oil: %s\n", buf);
   return ok ? Status::Pass : Status::Fail;

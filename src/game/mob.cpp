@@ -15042,7 +15042,7 @@ static void RankCoat(CoatEntry (&top)[kCoatTop], const CoatEntry& en) {
 }
 
 void MobSystem::TallyCoat(const BurnLimbView& v, LimbCoat& out,
-                          const std::vector<uint8_t>* corrodes) {
+                          const std::vector<uint8_t>* corrodes, bool sole) {
   // Occupied voxels (tombstones excluded — a carved-away voxel is not clean,
   // it is absent, and counting it would make a dismembered limb read as
   // washed), how many carry anything, and the kCoatTop heaviest substances.
@@ -15050,9 +15050,32 @@ void MobSystem::TallyCoat(const BurnLimbView& v, LimbCoat& out,
   CoatEntry tally[8]{};
   size_t nt = 0;
   const size_t n = v.Size();
+  // THE SOLE (sole=true, feet): the LOWEST occupied voxel of every (x,z)
+  // column of the lattice -- the underside, what meets the floor. The limb
+  // lattice is the bind pose, standing, so local -Y is down. Not a band of
+  // rows: contact and SoakLimb both coat the SURFACE only, and a band thicker
+  // than one lattice row would dilute the sole with interior no coat reaches.
+  std::unordered_map<uint64_t, int> soleY;
+  auto colKey = [](IVec3 p) {
+    return ((uint64_t)(uint32_t)p.x << 32) | (uint64_t)(uint32_t)p.z;
+  };
+  if (sole) {
+    for (size_t i = 0; i < n; i++) {
+      if (v.Mat(i) == 0) continue;
+      const IVec3 p = v.At(i);
+      auto [it, fresh] = soleY.try_emplace(colKey(p), p.y);
+      if (!fresh) it->second = std::min(it->second, p.y);
+    }
+  }
   for (size_t i = 0; i < n; i++) {
     if (v.Mat(i) == 0) continue;  // tombstone
     out.voxels++;
+    bool inSole = false;
+    if (sole) {
+      const IVec3 p = v.At(i);
+      inSole = soleY[colKey(p)] == p.y;
+    }
+    if (inSole) out.soleVoxels++;
     const uint16_t s = v.Stain(i);
     const uint32_t amt = BodyStainAmt(s);
     if (amt == 0) continue;
@@ -15069,6 +15092,7 @@ void MobSystem::TallyCoat(const BurnLimbView& v, LimbCoat& out,
     }
     tally[at].sumAmt += amt;
     tally[at].voxels++;
+    if (inSole) tally[at].soleAmt += amt;
   }
   for (size_t t = 0; t < nt; t++) RankCoat(out.top, tally[t]);
 }
@@ -15102,7 +15126,8 @@ void Mob::RecountCoat(uint32_t tick, bool force) {
     LimbCoat out;
     if (l.body) {
       BurnLimbView v = ViewOf(l);
-      MobSystem::TallyCoat(v, out, &sys_->matCorrodes_);
+      const bool foot = li < (int)limbDefs_.size() && limbDefs_[li].tag == "foot";
+      MobSystem::TallyCoat(v, out, &sys_->matCorrodes_, foot);
     }
     l.coat = out;
     // THE BODY IS THE BASE RIG. A robe soaked through is not the wearer being
@@ -18499,7 +18524,7 @@ LimbCoat MobSystem::BodyCoat(uint64_t mobId) const {
 }
 
 float MobSystem::CoatTagFraction(uint64_t mobId, const char* tag,
-                                 const char* limbTag) const {
+                                 const char* limbTag, bool sole) const {
   const Mob* mob = FindMob(mobId);
   if (!mob || !tag || !*tag) return 0.0f;
   auto carries = [&](uint32_t mat) {
@@ -18520,9 +18545,9 @@ float MobSystem::CoatTagFraction(uint64_t mobId, const char* tag,
       continue;
     }
     const LimbCoat& c = mob->limbs_[li].coat;
-    den += c.voxels;
+    den += sole ? c.soleVoxels : c.voxels;
     for (const CoatEntry& en : c.top)
-      if (en.mat != 0 && carries(en.mat)) num += en.sumAmt;
+      if (en.mat != 0 && carries(en.mat)) num += sole ? en.soleAmt : en.sumAmt;
   }
   if (den == 0) return 0.0f;
   return (float)num / (float)(kBodyStainAmtMax * den);

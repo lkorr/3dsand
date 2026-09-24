@@ -527,6 +527,7 @@ Player::Box Player::BoxFor(bool crouched) const {
 }
 
 void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
+  slideVel = Vec3{0, 0, 0};  // re-derived below, and only on slippery ground
   const Vec3& flatFwd = in.flatFwd;
   const Vec3& right = in.right;
   const Vec3& lookFwd = in.lookFwd;
@@ -966,6 +967,24 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     float blend = 1.0f - std::exp(-rate * dt);
     vel.x += (wish.x - vel.x) * blend;
     vel.z += (wish.z - vel.z) * blend;
+    // THE SLIDE (see slideVel in player.h): on slippery footing, the part of
+    // the horizontal velocity the legs are not driving. What the input asks
+    // for is walked -- velocity along the wish direction, up to the wish speed
+    // -- and everything else (the coast after letting go, the drift across a
+    // turn, the overshoot past a slower wish) is carried. Weighted by how
+    // slippery the footing is, so a sheen that barely costs grip barely slides.
+    if (onGround && groundGrip < 1.0f && T().slipGrip < 1.0f) {
+      const float w =
+          std::clamp((1.0f - groundGrip) / (1.0f - T().slipGrip), 0.0f, 1.0f);
+      const Vec3 h{vel.x, 0, vel.z};
+      Vec3 walk{0, 0, 0};
+      const float wl = wish.len();
+      if (wl > 1e-3f) {
+        const Vec3 d = wish * (1.0f / wl);
+        walk = d * std::clamp(h.x * d.x + h.z * d.z, 0.0f, wl);
+      }
+      slideVel = (h - walk) * w;
+    }
 
     // ---- jump: buffered press + coyote window, both consumed on use ----
     // Frame-local: "did we launch on THIS frame", read by the ground snap

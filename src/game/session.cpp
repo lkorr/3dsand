@@ -436,13 +436,16 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         player.jumpScale = couple ? loco.jumpScale : 1.0f;
         player.canJump = couple ? loco.canJump : true;
         // Slippery feet: a coat whose material lists "slippery" in its
-        // coat.effects (oil) on the limbs tagged "foot" ramps ground grip
-        // from 1 down to player.slipGrip. Read off the coat ledger, so it
-        // follows the coat as it is shed onto the floor and washed off.
+        // coat.effects (oil) on the SOLES of the limbs tagged "foot" ramps
+        // ground grip from 1 down to player.slipGrip. Read off the coat
+        // ledger, so it follows the coat as it is shed onto the floor and
+        // washed off. Sole, not whole foot: the whole-limb fraction divided a
+        // stepped-in coat by the foot's interior and never reached onset.
         player.groundGrip = 1.0f;
         if (couple) {
           const auto& pt = CurrentTuning().player;
-          const float f = mobs.CoatTagFraction(avatar.Id(), "slippery", "foot");
+          const float f = mobs.CoatTagFraction(avatar.Id(), "slippery", "foot",
+                                               /*sole=*/true);
           const float span = std::max(1e-4f, pt.slipCoatFull - pt.slipCoatStart);
           const float t = std::clamp((f - pt.slipCoatStart) / span, 0.0f, 1.0f);
           player.groundGrip = 1.0f + (pt.slipGrip - 1.0f) * t;
@@ -1889,7 +1892,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // selftest can drive it directly.
         avatarHeading = ResolveAvatarHeading(
             camMode, camHeading, avatarHeading,
-            Vec3{player.vel.x, 0, player.vel.z}, kTickDt);
+            Vec3{player.vel.x - player.slideVel.x, 0,
+                 player.vel.z - player.slideVel.z},
+            kTickDt);
 
         // FLY MODE HAS NO BODY. Two things go wrong otherwise, and the second
         // one is what makes flying feel possessed:

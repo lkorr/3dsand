@@ -369,6 +369,13 @@ class Player {
   // slippery (oily feet -- session.cpp derives it from the feet's coat). Only
   // the ON-GROUND rate: air and water control do not care what is on a sole.
   float groundGrip = 1.0f;
+  // OUTPUT: the horizontal velocity (vox/s) the feet are NOT walking -- the
+  // coast on slippery footing (groundGrip < 1): nothing held, or held in a
+  // direction the body is not yet moving. Zero on normal ground and in the
+  // air. The avatar's gait animates `vel - slideVel` and carries the planted
+  // feet along by slideVel, so a slide is a glide, not a walk. Render/anim
+  // only: nothing in the sim reads it.
+  Vec3 slideVel{0, 0, 0};
   bool canJump = true;
 
   // Largest single-frame velocity LOSS to a collision sweep since the avatar

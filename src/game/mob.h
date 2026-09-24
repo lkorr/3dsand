@@ -1048,6 +1048,7 @@ struct CoatEntry {
   uint32_t mat = 0;      // the substance (a material id, not a palette slot)
   uint32_t sumAmt = 0;   // total amount of it over the limb, 0..15 per voxel
   uint32_t voxels = 0;   // voxels carrying it
+  uint32_t soleAmt = 0;  // of sumAmt, what sits in the SOLE band (LimbCoat::soleVoxels)
 };
 
 inline constexpr int kCoatTop = 4;
@@ -1056,6 +1057,11 @@ struct LimbCoat {
   uint32_t voxels = 0;   // occupied lattice voxels — the denominator
   uint32_t stained = 0;  // of those, how many carry any coat at all
   uint32_t sumAmt = 0;   // total amount over EVERY material, `top` or not
+  // The lowest occupied voxel of each (x,z) column -- the sole, for a limb
+  // tallied with sole=true (feet). 0 otherwise. What makes a foot slip is
+  // what touches the floor, not a coat fraction diluted by the foot's buried
+  // interior.
+  uint32_t soleVoxels = 0;
   CoatEntry top[kCoatTop]{};  // the heaviest, by sumAmt, descending
   // Voxels whose coat is CORROSIVE (MobSystem::matCorrodes_) -- counted over
   // EVERY material, not just `top`, so a thin film of acid under a lot of
@@ -5067,8 +5073,14 @@ class MobSystem {
   // Reads the kCoatTop heaviest materials per limb, which is what the ledger
   // keeps. A tag carried only by a limb's fifth substance reads 0 — correct
   // enough for "is this hand bloody", and the alternative is a per-limb map.
-  float CoatTagFraction(uint64_t mobId, const char* tag,
-                        const char* limbTag) const;
+  //
+  // `sole` = measure over the SOLE band only (LimbCoat::soleVoxels, tallied
+  // for limbs tagged "foot"): the oil you stepped in is on the bottom of the
+  // foot, and a whole-limb fraction divides it by an interior no surface coat
+  // ever reaches -- a foot freshly out of an oil pool read ~0.1 and never
+  // slipped.
+  float CoatTagFraction(uint64_t mobId, const char* tag, const char* limbTag,
+                        bool sole = false) const;
   // Mob::DepositCoat by id, so a caller holding only the system can track a
   // coat onto the ground (the footfall wiring is P2's).
   bool DepositCoatOn(uint64_t mobId, uint32_t mat, IVec3 groundCell,
@@ -5195,7 +5207,8 @@ class MobSystem {
                   std::vector<ParticleSpawn>* drips);
   // One lattice's coat ledger (Mob::RecountCoat's per-limb count).
   static void TallyCoat(const BurnLimbView& v, LimbCoat& out,
-                        const std::vector<uint8_t>* corrodes = nullptr);
+                        const std::vector<uint8_t>* corrodes = nullptr,
+                        bool sole = false);
   // ---- THE DEAD TAKE A COAT TOO (2026-09-22) --------------------------------
   // Contact (blood stains, water rinses) and drying over every dead-flesh
   // debris body, through StainOneLimb / DryOneLimb — the passes the living

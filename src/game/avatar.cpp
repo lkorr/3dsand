@@ -2091,7 +2091,24 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
          std::fabs(origin_.y - supportY_) <
              kGaitCoyoteLegLengths * gaitLegLength);
 
-    UpdateAnimation(dt, world, gaitGrounded, player.vel, tick);
+    // A SLIDE IS NOT A WALK. On slippery footing the part of the velocity the
+    // legs are not driving (Player::slideVel) is taken out of what the gait
+    // and the walk/run clips see, and the planted feet ride along with it --
+    // otherwise the body coasts away from feet the gait thinks are planted,
+    // and it walks them after it, which reads as walking on ice rather than
+    // sliding on it. A swinging foot's endpoints ride too, so a step already
+    // in the air when the slide starts lands where it was aimed, relative to
+    // the body.
+    if (gaitGrounded && (player.slideVel.x != 0.0f || player.slideVel.z != 0.0f)) {
+      const Vec3 d{player.slideVel.x * dt, 0, player.slideVel.z * dt};
+      for (FootState& f : anim_.feet) {
+        f.planted = f.planted + d;
+        f.swingFrom = f.swingFrom + d;
+        f.swingTo = f.swingTo + d;
+      }
+    }
+    UpdateAnimation(dt, world, gaitGrounded, player.vel - player.slideVel,
+                    tick);
 
     // ---- air state clips ----
     // Grounded transitions drive jump/land; sustained air drives fall. Kept

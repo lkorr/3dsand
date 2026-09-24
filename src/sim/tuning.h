@@ -120,12 +120,14 @@ struct Tuning {
     // ---- slippery feet (a coat whose material lists "slippery" in its
     // materials.json coat.effects -- oil) ----
     // Grip on the ground is groundAccel scaled from 1 down to slipGrip as the
-    // FEET's amount-weighted coat fraction (MobSystem::CoatTagFraction over
-    // limbs tagged "foot") climbs from slipCoatStart to slipCoatFull. The
-    // start sits above oil's decayFloor sheen (2/15 on the surface voxels
-    // only, ~0.07 of a foot), so a greasy sheen that never dries does not
-    // keep you skating until you wash it off.
-    float slipCoatStart = 0.08f, slipCoatFull = 0.30f, slipGrip = 0.08f;
+    // SOLES' amount-weighted coat fraction (MobSystem::CoatTagFraction over
+    // limbs tagged "foot", sole band only) climbs from slipCoatStart to
+    // slipCoatFull. A fresh oil coat is amount 6 = 0.40; the start sits above
+    // oil's decayFloor sheen (2/15 = 0.133), so a greasy sheen that never
+    // dries does not keep you skating until you wash it off. It was a
+    // whole-foot fraction until 2026-09-23 and a foot fresh out of a pool read
+    // ~0.1 of it, so oily feet did nothing.
+    float slipCoatStart = 0.15f, slipCoatFull = 0.32f, slipGrip = 0.035f;
     float liquidDrag = 8.3f;
     float liquidGravityScale = 0.25f;
     float liquidSpeedScale = 0.55f;
