@@ -3556,9 +3556,24 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
     }
     return mobs.LimbBody(id, root) ? mobs.LimbStainCount(id, root, 1) : 0;
   };
+  // What the river is judged on is the BLOOD left, not any coat: water now
+  // leaves what it rinsed WET (bodystain.h WashBodyStain), so "stained" would
+  // count the wash itself. Read off the forced ledger, as the corpse half of
+  // this gate reads BodyCoatCount(mBlood).
+  auto bloodVoxels = [&]() -> uint32_t {
+    if (!mobs.LimbBody(id, root)) return 0u;
+    mobs.RecountCoatOn(id, simTick);
+    const LimbCoat* lc = mobs.LimbCoatOf(id, root);
+    uint32_t n = 0;
+    if (lc)
+      for (const CoatEntry& en : lc->top)
+        if (en.mat == mBlood) n += en.voxels;
+    return n;
+  };
   if (root >= 0 && mBlood && mWater && mobs.LimbBody(id, root)) {
     pooled = soakPhase(mBlood, 8u, 30);
-    washed = soakPhase(mWater, 8u, 60);
+    soakPhase(mWater, 8u, 60);
+    washed = bloodVoxels();
   }
   const bool poolOk = pooled > rootSplashed;
   const double washFrac = BaselineNumber("bodyStainWashMaxFraction", 0.5);
@@ -4059,6 +4074,128 @@ Status GateCorpseSplatter(Ctx& c, std::string& detail) {
 }
 
 // ---------------------------------------------------------------------------
+// corpse-acid: acid on the DEAD does what it does on the living
+// ---------------------------------------------------------------------------
+// Owner report 2026-09-23 ("acid stains aren't working on corpses"). The dead
+// run a parallel path (SplatterCorpses -> StainCorpses -> BurnCorpses) and
+// every body feature has to reach both. A flask-pour-shaped burst of acid at a
+// dead torso must COAT it and then EAT it, and the coat must be spent.
+Status GateCorpseAcid(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  const uint32_t mAcid = MatIdOf(c, "acid");
+  if (!mAcid) {
+    detail = "acid missing from materials.json";
+    return Status::Fail;
+  }
+  PrepareWorld(c);
+  // THE LIVING CONTROL: the identical burst at a standing creature's torso,
+  // so "the dead take less" is a differential and not a guess.
+  uint32_t livePeak = 0, liveN0 = 0, liveN90 = 0;
+  {
+    DeadFixture g(c);
+    const Target t = ChooseTarget(c.mobs, FixtureSite(c.world, 420));
+    const uint64_t lid = t.valid() ? SpawnTarget(c, t, 420, g.pchunk) : 0;
+    if (lid) {
+      c.mobs.SetMobBehavior(lid, "dummy");
+      g.tick = 61500;
+      for (int i = 0; i < 8; i++) g.Step();
+      const MobDef& def = c.mobs.Defs()[t.defIndex];
+      const int nl2 = (int)def.limbs.size();
+      auto census = [&](uint32_t& vox, uint32_t& coat) {
+        vox = coat = 0;
+        for (int li = 0; li < nl2; li++) {
+          vox += c.mobs.LimbSkinVoxelCount(lid, li);
+          coat += c.mobs.LimbCoatMatCount(lid, li, mAcid, 1);
+        }
+      };
+      uint32_t coat = 0;
+      census(liveN0, coat);
+      SplatterEvent le;
+      le.origin = c.mobs.LimbVoxelPos(lid, def.rootLimb, 0) +
+                  Vec3{0.0f, MetresToCells(1.0f), 0.0f};
+      le.axis = Vec3{0.0f, -1.0f, 0.0f};
+      le.cone = 0.35f;
+      le.reach = MetresToCells(2.0f);
+      le.speed = MetresToCells(3.0f);
+      le.life = 70;
+      le.count = 48;
+      le.mat = mAcid;
+      le.amount = 6;
+      le.tick = g.tick;
+      le.seed = 0xAC1Du;
+      c.mobs.QueueSplatter(le);
+      for (int i = 0; i < 90 && c.mobs.IsAlive(lid); i++) {
+        g.Step();
+        uint32_t v = 0;
+        census(v, coat);
+        livePeak = std::max(livePeak, coat);
+        liveN90 = v;
+      }
+    }
+    c.mobs.Reset();
+    c.debris.Reset();
+  }
+  DeadFixture f(c);
+  if (!f.Make(420, 62000)) {
+    detail = f.why;
+    return Status::Fail;
+  }
+  int ti = f.TorsoIndex();
+  const uint32_t serial = c.debris.BodySerial((uint32_t)ti);
+  const uint32_t n0 = c.debris.BodyVoxelCount((uint32_t)ti);
+  const Vec3 at = c.debris.BodyPosition((uint32_t)ti);
+  SplatterEvent ev;
+  ev.origin = at + Vec3{0.0f, MetresToCells(1.0f), 0.0f};
+  ev.axis = Vec3{0.0f, -1.0f, 0.0f};
+  ev.cone = 0.35f;
+  ev.reach = MetresToCells(2.0f);
+  ev.speed = MetresToCells(3.0f);
+  ev.life = 70;
+  ev.count = 48;
+  ev.mat = mAcid;
+  ev.amount = 6;
+  ev.tick = f.tick;
+  ev.seed = 0xAC1Du;
+  c.mobs.QueueSplatter(ev);
+  uint32_t coatPeak = 0;
+  std::string trace;
+  auto torso = [&]() { return c.debris.FindBodySerial(serial); };
+  for (int i = 0; i < 90; i++) {
+    f.Step();
+    const int k = torso();
+    const uint32_t coat = k >= 0 ? c.debris.BodyCoatCount((uint32_t)k, mAcid) : 0u;
+    coatPeak = std::max(coatPeak, coat);
+    if (i % 10 == 0)
+      trace += Format("%u/%u ", k >= 0 ? c.debris.BodyVoxelCount((uint32_t)k) : 0u,
+                      coat);
+  }
+  int k = torso();
+  const uint32_t n90 = k >= 0 ? c.debris.BodyVoxelCount((uint32_t)k) : 0u;
+  uint32_t left = k >= 0 ? c.debris.BodyCoatCount((uint32_t)k, mAcid) : 0u;
+  const uint32_t coatAt90 = left;
+  for (int i = 0; i < 900 && left; i++) {
+    f.Step();
+    k = torso();
+    left = k >= 0 ? c.debris.BodyCoatCount((uint32_t)k, mAcid) : 0u;
+  }
+  c.mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  // Eats SOME, and is GONE within 90 ticks (3 s): an acid stain dries off on
+  // its own in a few seconds, bone included (owner, 2026-09-23).
+  const uint32_t at90 = coatAt90;
+  const bool ok = coatPeak > 0 && n90 < n0 && at90 == 0 && left == 0;
+  detail = Format("acid burst on a dead torso: coat peak %u, voxels %u -> %u in "
+                  "90 ticks, acid on it at 90 ticks %u (want 0), after 900 more %u "
+                  "| trace %s| LIVING "
+                  "same burst: coat peak %u, voxels %u -> %u",
+                  coatPeak, n0, n90, at90, left, trace.c_str(), livePeak, liveN0,
+                  liveN90);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
 // body-coat: what is ON a body is a SUBSTANCE, and it behaves like one
 // ---------------------------------------------------------------------------
 //
@@ -4087,6 +4224,206 @@ Status GateCorpseSplatter(Ctx& c, std::string& detail) {
 //     floor gains blood it did not have and the limb's ledger falls. Both
 //     halves, because a print that only adds is a duplicator (rule 2) and one
 //     that only subtracts is a leak.
+// ---- mob-rain: rain wets a creature standing in it (MobSystem::RainOneLimb) --
+//
+// Three arms, each a FRESH pinned dummy for 60 ticks under one rain word: a dry
+// sky (the control — nothing may come out coated), a drizzle's word and a
+// storm's. Fresh per arm so a drizzle's coat cannot pre-soak the storm arm and
+// flatten the ratio. The claims: the word reaches the stain pass, the column
+// probe reads open sky, top voxels take water — and the RATE climbs steeply
+// with the rain (storm >= rainMobStormOverDrizzle x drizzle; the curve is a
+// fourth power, ~20x). Counted over every limb. Pure CPU stain pass, like
+// body-coat's poseTick; the mobs are Reset on the way out.
+Status GateMobRain(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
+  if (!t.valid()) {
+    detail = "no loaded mob def to stand in the rain";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  constexpr int kTicks = 60;
+  uint32_t simTick = 52000;
+  bool spawned = true;
+  MobSystem::RainStats stormStats{};
+  auto arm = [&](uint32_t rainWord) -> uint32_t {
+    IVec3 pchunk{};
+    const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+    if (!id) { spawned = false; return 0; }
+    mobs.SetMobBehavior(id, "dummy");
+    mobs.SetWeatherRain(rainWord);
+    mobs.rainStats_ = {};
+    for (int k = 0; k < kTicks; k++) {
+      ++simTick;
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+    stormStats = mobs.rainStats_;
+    // LimbStainCount (any coat), NOT LimbStainedMatCount: the latter counts
+    // voxels whose OWN material is `mat` ("the bone is bloodied"), which for
+    // water is none. The dry arm is the control for any coat the creature
+    // arrived with; the only coat this fixture can add is the rain's.
+    // DEPTH, not coverage: sum over levels of "voxels at >= level" is the
+    // summed coat amount. A storm covers every top voxel in well under the
+    // arm, so a count of coated voxels saturates and hides the rate.
+    uint32_t coated = 0;
+    for (int li = 0; li < (int)def.limbs.size(); li++)
+      if (mobs.LimbBody(id, li))
+        for (uint32_t lv = 1; lv <= kBodyStainAmtMax; lv++)
+          coated += mobs.LimbStainCount(id, li, lv);
+    mobs.SetWeatherRain(0u);
+    mobs.Reset();
+    return coated;
+  };
+  // weather::SimRainWord's layout: rain | damp << 8 | wetness << 16.
+  const uint32_t dry = arm(0u);
+  const uint32_t drizzle = arm(115u | (153u << 8) | (184u << 16));
+  const uint32_t storm = arm(242u | (153u << 8) | (255u << 16));
+  const MobSystem::RainStats rs = stormStats;
+  const double ratio = BaselineNumber("rainMobStormOverDrizzle", 3.0);
+  const bool ok = spawned && dry == 0 && drizzle > 0 &&
+                  (double)storm >= ratio * (double)drizzle;
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: %s summed coat depth after %d ticks — dry %u (want 0), drizzle "
+                "%u (want > 0), storm %u (want >= %.1fx drizzle) [storm arm: "
+                "calls %u, off-cadence %u, roofed %u, no view %u, sampled %u, "
+                "not top %u, capped %u, wrote %u]%s",
+                ok ? "PASS" : "FAIL", t.defName.c_str(), kTicks, dry, drizzle,
+                storm, ratio, rs.calls, rs.offCadence, rs.roofed, rs.noView,
+                rs.sampled, rs.notTop, rs.capped, rs.wrote,
+                spawned ? "" : " (SPAWN REFUSED)");
+  detail = buf;
+  std::printf("mob-rain: %s\n", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- rain-oil: oil goes on OVER rain, and rain takes it back off ---------
+//
+// Owner report 2026-09-23: oiled in a storm, the HUD said only "water", and
+// the rain never cleaned the oil. Two defects, one fixture:
+//   * OIL LANDS ON A WET BODY. A storm-soaked dummy (wet ~12 on every top
+//     voxel) is poured with oil (SoakLimb, oil's pour amount, surface only).
+//     Under Raise's "a different coat repaints only when strictly heavier"
+//     the wet voxels refused it; MobSystem::CoatBeneath now lets a washer's
+//     coat give way. Claim: the water ledger's voxel count falls to at most
+//     rainOilWetLeftMax of what it was (oil and rain both live on the
+//     surface, so oil should displace nearly all of it), and the body ledger
+//     names BOTH substances once rain has had a few ticks back on it.
+//   * RAIN RINSES IT, SIDES INCLUDED. The storm keeps going; the oil's summed
+//     amount must fall to at most rainOilLeftMax of what was poured. Tops
+//     alone left a standing figure's sides oiled indefinitely, which is what
+//     RainOneLimb's runoff roll is for.
+// Pure CPU stain pass, like mob-rain; mobs Reset on the way out.
+Status GateRainOil(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
+  if (!t.valid()) {
+    detail = "no loaded mob def to stand in the rain";
+    return Status::Fail;
+  }
+  uint32_t mOil = 0, mWater = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "oil") mOil = (uint32_t)i;
+    if (c.mats[i].name == "water") mWater = (uint32_t)i;
+  }
+  if (!mOil || !mWater) {
+    detail = "materials oil / water not loaded";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  uint32_t simTick = 53000;
+  auto run = [&](int ticks) {
+    for (int k = 0; k < ticks; k++) {
+      ++simTick;
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+  };
+  auto entry = [&](uint32_t mat) -> CoatEntry {
+    mobs.RecountCoatOn(id, simTick);
+    const LimbCoat body = mobs.BodyCoat(id);
+    for (const CoatEntry& en : body.top)
+      if (en.mat == mat) return en;
+    return CoatEntry{};
+  };
+  // weather::SimRainWord's layout: rain | damp << 8 | wetness << 16.
+  const uint32_t storm = 242u | (153u << 8) | (255u << 16);
+  const int soakTicks = (int)BaselineNumber("rainOilSoakTicks", 90.0);
+  const int washTicks = (int)BaselineNumber("rainOilWashTicks", 900.0);
+  mobs.SetWeatherRain(storm);
+  run(soakTicks);
+  const CoatEntry wetBefore = entry(mWater);
+
+  // The substance's own authored per-contact amount (materials.json stain).
+  const uint32_t packed =
+      (c.mats[mOil].gpu.stainPack >> kStainPackAmtShift) & kStainPackAmtMask;
+  const uint32_t pour = packed ? packed : 6u;
+  uint32_t marked = 0;
+  for (int li = 0; li < (int)def.limbs.size(); li++)
+    if (mobs.LimbBody(id, li)) marked += mobs.SoakLimb(id, li, mOil, pour, simTick);
+  const CoatEntry wetAfterPour = entry(mWater);
+  const CoatEntry oilPoured = entry(mOil);
+
+  run(30);
+  const CoatEntry oilEarly = entry(mOil), wetEarly = entry(mWater);
+  const bool bothNamed = oilEarly.sumAmt > 0 && wetEarly.sumAmt > 0;
+
+  run(washTicks - 30);
+  const CoatEntry oilLeft = entry(mOil);
+  mobs.SetWeatherRain(0u);
+  mobs.Reset();
+
+  const double wetLeftMax = BaselineNumber("rainOilWetLeftMax", 0.25);
+  const double oilLeftMax = BaselineNumber("rainOilLeftMax", 0.35);
+  const double wetLeft = wetBefore.voxels
+                             ? (double)wetAfterPour.voxels / wetBefore.voxels
+                             : 1.0;
+  const double oilFrac = oilPoured.sumAmt
+                             ? (double)oilLeft.sumAmt / oilPoured.sumAmt
+                             : 1.0;
+  const bool landed = wetBefore.voxels > 0 && oilPoured.voxels > 0 &&
+                      wetLeft <= wetLeftMax;
+  const bool washed = oilPoured.sumAmt > 0 && oilFrac <= oilLeftMax;
+  const bool ok = landed && bothNamed && washed;
+  char buf[640];
+  std::snprintf(
+      buf, sizeof(buf),
+      "%s: %s — storm soak %d ticks: %u wet voxels; oil pour (amount %u) "
+      "marked %u, oil on %u voxels, wet voxels left %u (%.2f, want <= %.2f)%s; "
+      "30 ticks on: oil %u + water %u summed (both named: %s); after %d storm "
+      "ticks oil %u of %u summed (%.2f, want <= %.2f)%s",
+      ok ? "PASS" : "FAIL", t.defName.c_str(), soakTicks, wetBefore.voxels,
+      pour, marked, oilPoured.voxels, wetAfterPour.voxels, wetLeft, wetLeftMax,
+      landed ? "" : " [OIL REFUSED BY WATER]", oilEarly.sumAmt, wetEarly.sumAmt,
+      bothNamed ? "yes" : "NO", washTicks, oilLeft.sumAmt, oilPoured.sumAmt,
+      oilFrac, oilLeftMax, washed ? "" : " [RAIN DID NOT RINSE]");
+  detail = buf;
+  std::printf("rain-oil: %s\n", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 Status GateBodyCoat(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -4456,14 +4793,117 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   RecordObserved("bodyCoatFootSumBefore", (double)footSumBefore);
   RecordObserved("bodyCoatFootSumAfter", (double)footSumAfter);
 
+  // ---- A WET BODY DOES NOT CATCH (BurnOneLimb section 0) ------------------
+  // Every limb but one soaked in water (doused enough times that any blood is
+  // rinsed and the skin left wet), then the creature stood in a column of
+  // world fire, with coat.fireDrySeconds parked long so the water is still on
+  // at the end (boiling off is its own rule; this is the claim that WET does
+  // not catch). The ROOT must come out with no seared (burn-stage)
+  // voxel; the one dry limb is the control, and must sear, or "the wet limb
+  // did not burn" says nothing about the water.
+  uint32_t mWater = 0, mFire = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "water") mWater = (uint32_t)i;
+    if (c.mats[i].name == "fire") mFire = (uint32_t)i;
+  }
+  int dryLimb = -1;
+  for (int li = 0; li < (int)def.limbs.size(); li++)
+    if (li != root && mobs.LimbBody(id, li) &&
+        def.limbs[li].parent == def.limbs[root].name) {
+      dryLimb = li;
+      break;
+    }
+  auto searedOn = [&](int li) {
+    // The stages skin and flesh walk through under heat, by name.
+    uint32_t n = 0;
+    for (const char* nm : {"flesh_cooked", "flesh_burning", "flesh_charred"})
+      for (size_t m = 1; m < c.mats.size(); m++)
+        if (c.mats[m].name == nm)
+          n += mobs.LimbMaterialCount(id, li, (uint32_t)m);
+    return n;
+  };
+  uint32_t wetSeared = 0, drySeared = 0, fireOpsPushed = 0, fireSeen = 0,
+           dryBurningPeak = 0, probeMat = 0xFFFFFFFFu, probeVer = 0;
+  IVec3 probeAt{};
+  constexpr int kFireTicks = 90;
+  if (mWater && mFire && dryLimb >= 0 && mobs.LimbBody(id, root)) {
+    const Tuning keepTune = CurrentTuning();
+    Tuning slowBoil = keepTune;
+    slowBoil.coat.fireDrySeconds = 600.0f;
+    SetCurrentTuning(slowBoil);
+    for (int li = 0; li < (int)def.limbs.size(); li++)
+      if (li != dryLimb && mobs.LimbBody(id, li))
+        for (int k = 0; k < 8; k++)
+          mobs.DouseLimb(id, li, mWater, 15, ++simTick);
+    for (int k = 0; k < kFireTicks; k++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
+      const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
+      const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
+      for (int dy = -8; dy <= 8; dy++)
+        for (int dz = -3; dz <= 3; dz++)
+          for (int dx = -3; dx <= 3; dx++) {
+            const IVec3 cc{b.x + dx, b.y + dy, b.z + dz};
+            if (!c.world.CellInWindow(cc)) continue;
+            if (cellOps.size() >= kMaxCellOpsPerTick) break;
+            cellOps.push_back({World::SlotCellIndex(cc),
+                               PackVoxNew(mFire, 7u) | kCellOpIfAir});
+            fireOpsPushed++;
+          }
+      // ATTRIBUTION: does the CPU mirror the burn pass reads see the fire?
+      {
+        const IVec3 probe{b.x + 2, b.y, b.z};
+        const CachedChunk* cch =
+            c.world.Cached({probe.x >> 4, probe.y >> 4, probe.z >> 4});
+        probeAt = probe;
+        if (cch && cch->voxels.size() == kChunkVol) {
+          probeMat = cch->voxels[((uint32_t)(probe.z & 15) * kChunk +
+                                  (uint32_t)(probe.y & 15)) * kChunk +
+                                 (uint32_t)(probe.x & 15)] & 0xFFFu;
+          probeVer = cch->version;
+          if (probeMat == mFire) fireSeen++;
+        } else {
+          probeMat = 0xFFFFFFFFu;
+        }
+      }
+      if (mobs.LimbBody(id, dryLimb))
+        dryBurningPeak =
+            std::max(dryBurningPeak, mobs.LimbBurningCount(id, dryLimb));
+      // The debris island scan is what RE-FETCHES a dirty chunk the mirror
+      // already holds; without it the burn pass reads the room as it was
+      // before the fire (a cached chunk is never refreshed on its own).
+      c.debris.QueueSupportEvents(c.world.Snap());
+      c.debris.PreTick(simTick + 1, c.world, cellOps, spawns);
+      ++simTick;
+      SubmitTick(c.ctx, c.world, c.sim, simTick, kDefaultSeed, ops, {},
+                 cellOps, false, IVec3{b.x >> 4, b.y >> 4, b.z >> 4}, true,
+                 false, spawns);
+      c.ctx.WaitIdle();
+      c.ctx.ProcessEvents();
+      c.phys.Step(kTickDt);
+      c.debris.PostStep();
+      mobs.PostStep();
+    }
+    SetCurrentTuning(keepTune);
+    wetSeared = mobs.LimbBody(id, root) ? searedOn(root) : 0u;
+    drySeared = mobs.LimbBody(id, dryLimb) ? searedOn(dryLimb) : 0u;
+  }
+  const bool wetOk =
+      mWater && mFire && dryLimb >= 0 && wetSeared == 0 && drySeared > 0;
+  RecordObserved("bodyCoatWetSeared", (double)wetSeared);
+  RecordObserved("bodyCoatDrySeared", (double)drySeared);
+
   mobs.Reset();
   c.debris.Reset();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
 
-  const bool ok = ledgerOk && holdOk && decayOk && depositOk && printOk;
+  const bool ok = ledgerOk && holdOk && decayOk && depositOk && printOk && wetOk;
   detail = Format(
-      "%s/%s%s: ledger top = mat %u (want %u, blood %u) over %u voxels, "
+      "%s/%s%s: in fire, wet root seared %u (want 0) vs dry control %s seared %u (want >0) [fire ops %u, mirror saw fire %u/%d ticks (last: mat %d ver %u at (%d,%d,%d), tick %u), control burning peak %u]; "
+      "ledger top = mat %u (want %u, blood %u) over %u voxels, "
       "frac %.4f, body sum %u >= limb sum %u, unknown tag %.2f; "
       "stained above the authored decayFloor %u: %u -> %u over %u ticks at "
       "the authored 20 s/level%s "
@@ -4473,6 +4913,9 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
       "%u droplet(s) down after %u plant(s), %u floor cell(s) at y%d newly "
       "bloodied (amount %u), sole ledger %u -> %u",
       t.defName.c_str(), t.limbName.c_str(), pinned ? "" : " (NOT pinned)",
+      wetSeared, dryLimb >= 0 ? def.limbs[dryLimb].name.c_str() : "-",
+      drySeared, fireOpsPushed, fireSeen, kFireTicks, (int)probeMat, probeVer,
+      probeAt.x, probeAt.y, probeAt.z, simTick, dryBurningPeak,
       limbLedger.top[0].mat, coatMat, mBlood, limbLedger.voxels,
       (double)limbLedger.Frac(), bodyLedger.sumAmt, limbLedger.sumAmt,
       (double)noSuchTag, coatFloor, cutStain, heldStain, kHoldTicks,
@@ -5117,6 +5560,525 @@ Status GateJointTwins(Ctx& c, std::string& detail) {
              : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// acid-coat: a CORROSIVE coat eats the body it is on, and then it is spent
+// ---------------------------------------------------------------------------
+//
+// Owner report 2026-09-23: pouring acid on a character neither showed nor
+// dissolved anything. Acid had no stain block, so every coat write (pour,
+// splash, contact) refused it, and a coat could not act on the voxel under it
+// anyway. Now a coat whose material's rules rewrite body matter is evaluated
+// against that voxel as a grid cell of it would be (mob.cpp BurnOneLimb,
+// section 3). Claims, on one pinned creature, no world submit:
+//   * THE MATERIAL IS WIRED: acid has a stain slot for bodies, NO GPU stain
+//     type (bodyOnly: it never marks the ground) and a glow for the renderer.
+//   * A COAT OF IT EATS: the acid-soaked limb loses voxels (or comes off) over
+//     90 ticks, and the ledger reported it as corrosive.
+//   * A COAT THAT IS NOT CORROSIVE DOES NOT: the control limb, soaked in blood
+//     at the same amount, loses nothing.
+//   * ACID TAKES A BLOODIED VOXEL: acid poured over blood replaces it
+//     (CoatBeneath) rather than waiting to be heavier.
+//   * IT IS SPENT: the acid coat is gone within 1,200 ticks, and the limb
+//     then stops losing voxels (bounded by what was poured -- rule 2).
+//   * THE BONE IT BARES IS BLOODY (2026-09-23): acid cannot eat bone, and the
+//     bone it uncovers wears the creature's blood at bone's `bareBlood` odds,
+//     so of the bone a clean pour newly exposes, bareBlood's share (+-20
+//     points) wears blood.
+Status GateAcidCoat(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb";
+    return Status::Fail;
+  }
+  uint32_t mAcid = 0, mBlood = 0, mBone = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "acid") mAcid = (uint32_t)i;
+    if (c.mats[i].name == "blood") mBlood = (uint32_t)i;
+    if (c.mats[i].name == "bone") mBone = (uint32_t)i;
+  }
+  if (!mAcid || !mBlood || !mBone) {
+    detail = "acid, blood or bone material missing";
+    return Status::Fail;
+  }
+  const MaterialDef& acid = c.mats[mAcid];
+  const bool wired = acid.stainSlot != 0 &&
+                     (acid.gpu.stainPack & kStainPackTypeMask) == 0 &&
+                     acid.coatGlow > 0 && mobs.StainTypeOf(mAcid) != 0;
+
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  // The control: the non-vital, non-root limb with the most voxels that is
+  // not the target -- acid does not cross a joint, so it cannot reach it.
+  int ctl = -1;
+  uint32_t ctlN = 0;
+  for (size_t li = 0; li < def.limbs.size(); li++) {
+    if ((int)li == t.limb || (int)li == def.rootLimb || def.limbs[li].vital)
+      continue;
+    if (!mobs.LimbBody(id, (int)li)) continue;
+    const uint32_t n = mobs.LimbSkinVoxelCount(id, (int)li);
+    if (n > ctlN) { ctlN = n; ctl = (int)li; }
+  }
+
+  uint32_t simTick = 35000;
+  auto poseTick = [&]() {
+    ++simTick;
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  };
+  for (int i = 0; i < 10; i++) poseTick();
+
+  // Blood first on BOTH limbs, then acid on the target only: the acid has to
+  // displace the blood to land at all (claim 4).
+  constexpr uint32_t kAmt = 6;
+  const uint32_t n0 = mobs.LimbSkinVoxelCount(id, t.limb);
+  const uint32_t c0 = ctl >= 0 ? mobs.LimbSkinVoxelCount(id, ctl) : 0u;
+  mobs.SoakLimb(id, t.limb, mBlood, 15, simTick);
+  if (ctl >= 0) mobs.SoakLimb(id, ctl, mBlood, kAmt, simTick);
+  const uint32_t acidOn = mobs.SoakLimb(id, t.limb, mAcid, kAmt, simTick);
+  const uint32_t acidCoat = mobs.LimbCoatMatCount(id, t.limb, mAcid, 1);
+  const LimbCoat* led = mobs.LimbCoatOf(id, t.limb);
+  const uint32_t corrosive = led ? led->corrosive : 0u;
+
+  std::string trace;
+  for (int i = 0; i < 90 && mobs.LimbBody(id, t.limb); i++) {
+    poseTick();
+    // voxels/acid-coated, every 6 ticks: the shape of the bite over time.
+    if (i % 6 == 0)
+      trace += std::to_string(mobs.LimbSkinVoxelCount(id, t.limb)) + "/" +
+               std::to_string(mobs.LimbCoatMatCount(id, t.limb, mAcid, 1)) + " ";
+  }
+  const bool severed = mobs.LimbBody(id, t.limb) == 0;
+  const uint32_t n90 = severed ? 0u : mobs.LimbSkinVoxelCount(id, t.limb);
+  const uint32_t c90 = ctl >= 0 ? mobs.LimbSkinVoxelCount(id, ctl) : 0u;
+  const bool eats = severed || n90 + 32 < n0;
+  const bool ctlKept = ctl < 0 || c90 == c0;
+
+  // Spent: run until no acid is left on the limb (or it is gone), then 30
+  // more ticks must take nothing.
+  uint32_t spentAt = 0;
+  for (int i = 0; i < 1200 && mobs.LimbBody(id, t.limb); i++) {
+    poseTick();
+    if (mobs.LimbCoatMatCount(id, t.limb, mAcid, 1) == 0) {
+      spentAt = (uint32_t)i + 1;
+      break;
+    }
+  }
+  const bool gone = mobs.LimbBody(id, t.limb) == 0;
+  const uint32_t nSpent = gone ? 0u : mobs.LimbSkinVoxelCount(id, t.limb);
+  for (int i = 0; i < 30 && !gone; i++) poseTick();
+  const uint32_t nAfter = gone ? 0u : mobs.LimbSkinVoxelCount(id, t.limb);
+  // ...and it is gone in a few seconds, not half a minute (spentAt counts
+  // from tick 90 of the bite, so 60 here is 5 s after the pour).
+  const bool spent = gone || (spentAt != 0 && spentAt <= 60 && nAfter == nSpent);
+
+  // ---- THE BONE IT BARES IS BLOODY (2026-09-23) -----------------------------
+  // A second creature and a CLEAN pour -- no blood first, because on a limb
+  // this thin the surface soak already reaches bone and the acid then
+  // replaces that coat, so the first creature cannot tell "blood the removal
+  // laid" from "blood the soak laid". Exposed bone is counted before and after
+  // (the joint faces at the lattice's ends are exposed from the start), and of
+  // what the acid newly bared about bone's `bareBlood` share must be bloody.
+  uint32_t bare0 = 0, bareBlood0 = 0, bare1 = 0, bareBlood1 = 0;
+  bool bareRan = false;
+  const float bareOdds = c.mats[mBone].bareBlood;
+  if (const uint64_t id2 = SpawnTarget(c, t, kInset, pchunk)) {
+    mobs.SetMobBehavior(id2, "dummy");
+    for (int i = 0; i < 10; i++) poseTick();
+    bare0 = mobs.LimbExposedMatCount(id2, t.limb, mBone, mBlood, &bareBlood0);
+    mobs.SoakLimb(id2, t.limb, mAcid, kAmt, simTick);
+    for (int i = 0; i < 400 && mobs.LimbBody(id2, t.limb); i++) {
+      poseTick();
+      if (mobs.LimbCoatMatCount(id2, t.limb, mAcid, 1) == 0) break;
+    }
+    if (mobs.LimbBody(id2, t.limb)) {
+      bare1 = mobs.LimbExposedMatCount(id2, t.limb, mBone, mBlood, &bareBlood1);
+      bareRan = true;
+    }
+  }
+  const uint32_t baredN = bare1 > bare0 ? bare1 - bare0 : 0u;
+  const uint32_t baredBlood = bareBlood1 > bareBlood0 ? bareBlood1 - bareBlood0 : 0u;
+  const float baredFrac = baredN ? (float)baredBlood / (float)baredN : 0.0f;
+  const bool boneBloodied = bareRan && baredN >= 10 &&
+                            std::fabs(baredFrac - bareOdds) <= 0.2f;
+
+  char buf[640];
+  std::snprintf(buf, sizeof buf,
+                "%s.%s: wired %d | acid over blood %u marked, %u coated, "
+                "ledger corrosive %u | voxels %u -> %u in 90 ticks%s | control "
+                "%s %u -> %u | acid spent after %u more ticks, then %u -> %u | "
+                "clean pour: exposed bone %u -> %u, bloody %u -> %u (%.0f%% of "
+                "the newly bared, bareBlood %.0f%%)%s",
+                t.defName.c_str(), t.limbName.c_str(), wired ? 1 : 0, acidOn,
+                acidCoat, corrosive, n0, n90, severed ? " (severed)" : "",
+                ctl >= 0 ? def.limbs[ctl].name.c_str() : "-", c0, c90, spentAt,
+                nSpent, nAfter, bare0, bare1, bareBlood0, bareBlood1,
+                100.0f * baredFrac, 100.0f * bareOdds,
+                bareRan ? "" : " (did not run)");
+  detail = std::string(buf) + " | trace " + trace;
+  const bool ok = wired && acidOn > 0 && acidCoat > 0 && corrosive > 0 &&
+                  eats && ctlKept && spent && boneBloodied;
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// lava-oil-coat: a HOT coat burns what it is on, a FUEL coat flashes
+// ---------------------------------------------------------------------------
+//
+// Owner report 2026-09-23: lava poured on yourself left no mark and did
+// nothing; oil did not stain at all. On the human's forearms, pose ticks only:
+//   * LAVA: the coat lands and is drawn (a stain slot, no GPU ground type,
+//     glow), sets the forearm ALIGHT (burning voxels) and DISINTEGRATES it
+//     (voxels gone) within 90 ticks, and cools off by itself.
+//   * OIL: the coat lands and is INERT on its own (30 ticks: nothing burns,
+//     the coat stays). Then lava on BOTH hands: the fire crosses each wrist,
+//     and the oiled forearm must burn far more than the clean one.
+Status GateLavaOilCoat(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  int di = -1;
+  for (size_t d = 0; d < mobs.Defs().size(); d++)
+    if (mobs.Defs()[d].name == "human") di = (int)d;
+  uint32_t mLava = 0, mOil = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "lava") mLava = (uint32_t)i;
+    if (c.mats[i].name == "oil") mOil = (uint32_t)i;
+  }
+  if (di < 0 || !mLava || !mOil) {
+    detail = "human def, lava or oil missing";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[di];
+  auto limbNamed = [&](const char* n) {
+    for (size_t i = 0; i < def.limbs.size(); i++)
+      if (def.limbs[i].name == n) return (int)i;
+    return -1;
+  };
+  const int foreL = limbNamed("armL.L"), foreR = limbNamed("armL.R"),
+            handL = limbNamed("hand.L"), handR = limbNamed("hand.R");
+  if (foreL < 0 || foreR < 0 || handL < 0 || handR < 0) {
+    detail = "human has no armL.L/armL.R/hand.L/hand.R";
+    return Status::Fail;
+  }
+  const MaterialDef& lava = c.mats[mLava];
+  const MaterialDef& oil = c.mats[mOil];
+  const bool wired = lava.stainSlot != 0 &&
+                     (lava.gpu.stainPack & kStainPackTypeMask) == 0 &&
+                     lava.coatGlow > 0 && mobs.StainTypeOf(mLava) != 0 &&
+                     oil.stainSlot != 0 &&
+                     (oil.gpu.stainPack & kStainPackTypeMask) != 0 &&
+                     mobs.StainTypeOf(mOil) != 0;
+  Target t;
+  t.defIndex = di;
+  t.limb = foreL;
+
+  uint32_t simTick = 37000;
+  auto poseTick = [&]() {
+    ++simTick;
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  };
+
+  // ---- LAVA -----------------------------------------------------------------
+  IVec3 pchunk{};
+  uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  for (int i = 0; i < 10; i++) poseTick();
+  const uint32_t n0 = mobs.LimbSkinVoxelCount(id, foreL);
+  const uint32_t lavaOn = mobs.SoakLimb(id, foreL, mLava, 10, simTick);
+  const uint32_t lavaCoat = mobs.LimbCoatMatCount(id, foreL, mLava, 1);
+  uint32_t burnPeak = 0;
+  std::string trace;
+  for (int i = 0; i < 90 && mobs.LimbBody(id, foreL); i++) {
+    poseTick();
+    burnPeak = std::max(burnPeak, mobs.LimbBurningCount(id, foreL));
+    if (i % 10 == 0)
+      trace += std::to_string(mobs.LimbSkinVoxelCount(id, foreL)) + "/" +
+               std::to_string(mobs.LimbBurningCount(id, foreL)) + "/" +
+               std::to_string(mobs.LimbCoatMatCount(id, foreL, mLava, 1)) + " ";
+  }
+  const bool severed = mobs.LimbBody(id, foreL) == 0;
+  const uint32_t n90 = severed ? 0u : mobs.LimbSkinVoxelCount(id, foreL);
+  const bool eats = severed || n90 + 32 < n0;
+  uint32_t cooledAt = 0;
+  for (int i = 0; i < 900 && mobs.LimbBody(id, foreL); i++) {
+    poseTick();
+    if (mobs.LimbCoatMatCount(id, foreL, mLava, 1) == 0) {
+      cooledAt = (uint32_t)i + 1;
+      break;
+    }
+  }
+  const bool cooled = mobs.LimbBody(id, foreL) == 0 || cooledAt != 0;
+
+  // ---- OIL ------------------------------------------------------------------
+  id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "second spawn refused";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  for (int i = 0; i < 10; i++) poseTick();
+  const uint32_t oilOn = mobs.SoakLimb(id, foreR, mOil, 12, simTick);
+  const uint32_t oil0 = mobs.LimbCoatMatCount(id, foreR, mOil, 1);
+  for (int i = 0; i < 30; i++) poseTick();
+  const uint32_t oil30 = mobs.LimbCoatMatCount(id, foreR, mOil, 1);
+  const uint32_t idleBurn = mobs.LimbBurningCount(id, foreR);
+  const bool inert = idleBurn == 0 && oil30 * 10 >= oil0 * 9;
+  mobs.SoakLimb(id, handL, mLava, 15, simTick);
+  mobs.SoakLimb(id, handR, mLava, 15, simTick);
+  uint64_t burnOiled = 0, burnClean = 0;  // burning voxel-ticks
+  for (int i = 0; i < 150; i++) {
+    poseTick();
+    burnOiled += mobs.LimbBurningCount(id, foreR);
+    burnClean += mobs.LimbBurningCount(id, foreL);
+  }
+  const uint32_t oilLeft = mobs.LimbCoatMatCount(id, foreR, mOil, 1);
+  const bool flashes = burnOiled > 0 && burnOiled >= 2 * burnClean + 50 &&
+                       oilLeft < oil30;
+
+  char buf[640];
+  std::snprintf(buf, sizeof buf,
+                "wired %d | LAVA %u marked, %u coated, forearm %u -> %u in 90 "
+                "ticks%s, burning peak %u, cooled after %u more | OIL %u marked, "
+                "%u coated, %u after 30 idle ticks, %u burning idle | lava on both "
+                "hands, 150 ticks: oiled forearm %llu burning voxel-ticks vs clean "
+                "%llu, oil %u -> %u",
+                wired ? 1 : 0, lavaOn, lavaCoat, n0, n90, severed ? " (severed)" : "",
+                burnPeak, cooledAt, oilOn, oil0, oil30, idleBurn,
+                (unsigned long long)burnOiled, (unsigned long long)burnClean, oil30,
+                oilLeft);
+  detail = std::string(buf) + " | lava trace vox/burning/coated " + trace;
+  const bool ok = wired && lavaOn > 0 && lavaCoat > 0 && burnPeak > 0 && eats &&
+                  cooled && oilOn > 0 && inert && flashes;
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// severed-hand: a part that comes off keeps what is attached to it
+// ---------------------------------------------------------------------------
+//
+// Owner report 2026-09-23: acid from a flask melted the player's forearm off
+// and the hand stayed where it was, floating at a wrist that had gone. Two
+// faults, one claim each, on the human's left arm, pose ticks only:
+//   * SPLIT: a ball carved through the middle of the forearm parts it; the
+//     elbow end stays the limb and the wrist end leaves. The hand must leave
+//     WITH the wrist end — off the rig and jointed to a body that is not.
+//     (Before: nothing asked what was seated in the piece that left.)
+//   * WHOLE: severing the upper arm keeps the chain jointed — forearm to upper
+//     arm, hand to forearm — and 40 ticks later the hand is still within
+//     reach of the forearm. (Before: DetachLimb destroyed every child joint,
+//     so a cut-off arm landed as three unrelated bodies.)
+// The acid run is the owner's own stroke (the pour brush on the side of the
+// forearm). Only "a hand it took off is on a piece" is asserted there: WHETHER
+// the acid parts the forearm depends on coat depth tuning, and both routes it
+// can take (split, collapse) are pinned by the two claims above.
+Status GateSeveredHand(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  int di = -1;
+  for (size_t d = 0; d < mobs.Defs().size(); d++)
+    if (mobs.Defs()[d].name == "human") di = (int)d;
+  if (di < 0) {
+    detail = "no human def";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[di];
+  auto limbNamed = [&](const char* n) {
+    for (size_t i = 0; i < def.limbs.size(); i++)
+      if (def.limbs[i].name == n) return (int)i;
+    return -1;
+  };
+  const int upper = limbNamed("armU.L"), fore = limbNamed("armL.L"),
+            hand = limbNamed("hand.L");
+  if (upper < 0 || fore < 0 || hand < 0) {
+    detail = "human has no armU.L/armL.L/hand.L";
+    return Status::Fail;
+  }
+  Target t;
+  t.defIndex = di;
+  t.limb = fore;
+
+  uint32_t simTick = 36000;
+  auto poseTick = [&]() {
+    ++simTick;
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  };
+  // Is `body` jointed to something, and is that something off the rig?
+  auto rigHas = [&](uint64_t id, uint64_t h) {
+    for (size_t i = 0; i < def.limbs.size(); i++)
+      if (h && mobs.LimbBody(id, (int)i) == h) return true;
+    return false;
+  };
+  auto jointedTo = [&](uint64_t body, uint64_t other) {
+    std::vector<Physics::BodyJoint> js;
+    c.phys.JointsOn(body, js);
+    for (const auto& j : js)
+      if (other == 0 ? j.other != 0 : j.other == other) return j.other;
+    return (uint64_t)0;
+  };
+  auto dist = [&](uint64_t a, uint64_t b) {
+    BodyTransform xa{}, xb{};
+    if (!c.phys.GetTransform(a, xa) || !c.phys.GetTransform(b, xb)) return 1e9f;
+    return (xa.pos - xb.pos).len();
+  };
+
+  // ---- SPLIT ----------------------------------------------------------------
+  IVec3 pchunk{};
+  uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  for (int i = 0; i < 10; i++) poseTick();
+  const uint64_t handBody = mobs.LimbBody(id, hand);
+  const LimbAxis ax = MeasureLimb(mobs, id, fore);
+  const uint32_t fore0 = mobs.LimbVoxelCount(id, fore);
+  bool splitOk = false, foreStayed = false, handOff = false, onRig = false;
+  uint64_t splitPartner = 0;
+  float splitGap = -1.0f;
+  if (handBody && ax.valid) {
+    // A SLAB, not a ball: small carves across the cross-section at mid-length,
+    // so the forearm parts in two without losing enough to collapse (a ball
+    // big enough to cut through a forearm eats most of it). The limb's handle
+    // changes on every rebuild, so it is re-read per carve; stops the moment
+    // the hand leaves or the forearm does.
+    const Vec3 mid = ax.anchor + ax.along * (0.5f * ax.reach);
+    for (int u = -4; u <= 4 && mobs.LimbBody(id, hand) && mobs.LimbBody(id, fore); u++)
+      for (int v = -4; v <= 4 && mobs.LimbBody(id, hand) && mobs.LimbBody(id, fore); v++) {
+        std::vector<ParticleSpawn> cs;
+        mobs.CarveLimbRadial(mobs.LimbBody(id, fore),
+                             mid + ax.edge * (0.25f * (float)u) +
+                                 ax.travel * (0.25f * (float)v),
+                             0.3f, /*ragged=*/false, /*eject=*/false, c.world, cs);
+      }
+    for (int i = 0; i < 3; i++) poseTick();
+    foreStayed = mobs.LimbBody(id, fore) != 0;
+    handOff = mobs.LimbBody(id, hand) == 0;
+    splitPartner = jointedTo(handBody, 0);
+    onRig = rigHas(id, splitPartner);
+    // The forearm must have STAYED, or this was a whole-limb sever (the WHOLE
+    // claim's case) and the split rule was never asked.
+    splitOk = foreStayed && handOff && splitPartner != 0 && !onRig;
+    for (int i = 0; i < 40; i++) poseTick();
+    if (splitPartner) splitGap = dist(handBody, splitPartner);
+  }
+  const uint32_t fore1 = foreStayed ? mobs.LimbVoxelCount(id, fore) : 0u;
+
+  // ---- WHOLE ----------------------------------------------------------------
+  id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "respawn refused";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  for (int i = 0; i < 10; i++) poseTick();
+  const uint64_t bU = mobs.LimbBody(id, upper), bL = mobs.LimbBody(id, fore),
+                 bH = mobs.LimbBody(id, hand);
+  mobs.Sever(id, upper);
+  const bool chainOff = mobs.LimbBody(id, upper) == 0 &&
+                        mobs.LimbBody(id, fore) == 0 && mobs.LimbBody(id, hand) == 0;
+  const bool foreToUpper = jointedTo(bL, bU) != 0;
+  const bool handToFore = jointedTo(bH, bL) != 0;
+  for (int i = 0; i < 40; i++) poseTick();
+  const float wholeGap = dist(bH, bL);
+  const bool stillJointed = jointedTo(bH, bL) != 0;
+  // "Within reach": the forearm's length plus a voxel. A hand that fell as its
+  // own body is free to roll anywhere; one on its joint cannot.
+  const bool wholeOk = chainOff && foreToUpper && handToFore && stillJointed &&
+                       wholeGap < ax.reach + 1.5f;
+
+  // ---- ACID (reported) --------------------------------------------------------
+  uint32_t mAcid = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "acid") mAcid = (uint32_t)i;
+  std::string acid = "no acid material";
+  bool acidOk = true;  // a hand the acid took off must be on a piece
+  if (mAcid) {
+    id = SpawnTarget(c, t, kInset, pchunk);
+    if (id) {
+      mobs.SetMobBehavior(id, "dummy");
+      for (int i = 0; i < 10; i++) poseTick();
+      const uint64_t aH = mobs.LimbBody(id, hand);
+      // The owner's stroke: the portrait pour brush, held over the side of the
+      // forearm at mid-length (a disc on the skin, not a whole-limb soak --
+      // a soak thins the limb evenly and never parts it).
+      const LimbAxis aax = MeasureLimb(mobs, id, fore);
+      const Vec3 aMid = aax.anchor + aax.along * (0.5f * aax.reach);
+      const MobSystem::BodyRayHit hit =
+          mobs.PickBody(id, aMid + aax.travel * 20.0f, aax.travel * -1.0f, 40.0f);
+      int foreGone = -1, handGone = -1;
+      const uint32_t aF0 = mobs.LimbVoxelCount(id, fore);
+      for (int i = 0; i < 600; i++) {
+        if (i < 20 && hit.hit)
+          mobs.PourOnBody(id, hit, aax.travel * -1.0f, 0.6f, mAcid, 3, simTick);
+        poseTick();
+        if (foreGone < 0 && !mobs.LimbBody(id, fore)) foreGone = i;
+        if (handGone < 0 && !mobs.LimbBody(id, hand)) handGone = i;
+      }
+      const uint64_t partner = jointedTo(aH, 0);
+      const uint32_t aF1 = mobs.LimbVoxelCount(id, fore);
+      if (handGone >= 0) acidOk = partner != 0 && !rigHas(id, partner);
+      char ab[200];
+      std::snprintf(ab, sizeof ab,
+                    "pour on %s, forearm %u -> %u, off at t%d, hand off at t%d, "
+                    "hand jointed %s",
+                    !hit.hit ? "NOTHING"
+                             : (hit.limb == fore ? "the forearm" : "another limb"),
+                    aF0, aF1, foreGone, handGone,
+                    partner == 0 ? "to nothing"
+                                 : (rigHas(id, partner) ? "to the RIG" : "to a piece"));
+      acid = ab;
+    }
+  }
+
+  char buf[640];
+  std::snprintf(buf, sizeof buf,
+                "split: forearm %u -> %u collider voxels (%s), hand %s, jointed "
+                "to %s, gap after 40 ticks %.2f | whole: chain off %d, "
+                "forearm-upper %d, hand-forearm %d, after 40 ticks jointed %d "
+                "gap %.2f (reach %.2f) | acid: %s",
+                fore0, fore1, foreStayed ? "stayed" : "came off",
+                handOff ? "off" : "STILL ON THE RIG",
+                splitPartner == 0 ? "nothing"
+                                  : (onRig ? "the rig" : "a piece"),
+                splitGap, chainOff ? 1 : 0, foreToUpper ? 1 : 0,
+                handToFore ? 1 : 0, stillJointed ? 1 : 0, wholeGap, ax.reach,
+                acid.c_str());
+  detail = buf;
+  return splitOk && wholeOk && acidOk ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -5139,11 +6101,17 @@ const std::vector<Gate>& WoundGates() {
       {"corpse-worn", "mob", {}, false, GateCorpseWorn, false},
       {"corpse-splatter", "mob", {}, false, GateCorpseSplatter, false},
       {"body-coat", "mob", {}, false, GateBodyCoat, false},
+      {"mob-rain", "mob", {}, false, GateMobRain, false},
+      {"rain-oil", "mob", {}, false, GateRainOil, false},
       {"blast-stain", "mob", {}, false, GateBlastStain, false},
       {"wound-heal", "mob", {}, false, GateWoundHeal, false},
       {"corpse-burn", "mob", {}, false, GateCorpseBurn, false},
       {"laser-head", "mob", {}, false, GateLaserHead, false},
       {"joint-twins", "mob", {}, false, GateJointTwins, false},
+      {"acid-coat", "mob", {}, false, GateAcidCoat, false},
+      {"corpse-acid", "mob", {}, false, GateCorpseAcid, false},
+      {"lava-oil-coat", "mob", {}, false, GateLavaOilCoat, false},
+      {"severed-hand", "mob", {}, false, GateSeveredHand, false},
   };
   return g;
 }

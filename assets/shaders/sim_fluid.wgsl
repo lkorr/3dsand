@@ -1108,7 +1108,13 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   // the particle — the back-projection at the end of this kernel is what stops
   // it moving into a closed cell — so this is always the world changing, never
   // the particle misbehaving.
-  let why = fluidSolidReason(cell);
+  // A GHOST (FP_GHOST, the scoop stream) is a picture on its way to a flask
+  // mouth: it flies up out of the pond and past the bank's edge, so neither
+  // the submerged freeze nor the hard-solid delete applies to it (it held no
+  // mass to lose), and it skips the back-projection below for the same reason.
+  let ghost = fpGhost(p.attr);
+  var why = fluidSolidReason(cell);
+  if (ghost) { why = FSOLID_OPEN; }
   if (why == FSOLID_SUBM) {
     // GO CALM, EXACTLY AS THE BACK-PROJECTION DOES. The pool grew over this
     // particle: it is inside its own substance, which is a floor for momentum
@@ -1276,6 +1282,20 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   p.vx = clamp(mq(v.x, damp), -FLUID_VMAX, FLUID_VMAX);
   p.vy = clamp(mq(v.y, damp), -FLUID_VMAX, FLUID_VMAX);
   p.vz = clamp(mq(v.z, damp), -FLUID_VMAX, FLUID_VMAX);
+  if (ghost) {
+    // THE SCOOP STREAM (FP_GHOST): steer onto the vessel's mouth. The homing
+    // velocity covers what is left of the way in the ticks it has left; the
+    // grid's own velocity keeps a quarter share, so the stream sags and
+    // swirls with the water around it rather than flying on rails. Integer,
+    // per particle, keyed on nothing but its own state.
+    let left = max(i32(u32(p._r3) - T.tick), 1);
+    let hx = clamp((p._r0 - p.px) / left, -FLUID_VMAX, FLUID_VMAX);
+    let hy = clamp((p._r1 - p.py) / left, -FLUID_VMAX, FLUID_VMAX);
+    let hz = clamp((p._r2 - p.pz) / left, -FLUID_VMAX, FLUID_VMAX);
+    p.vx = (p.vx + 3 * hx) / 4;
+    p.vy = (p.vy + 3 * hy) / 4;
+    p.vz = (p.vz + 3 * hz) / 4;
+  }
   p.c00 = clamp(c0.x, -FLUID_CMAX, FLUID_CMAX);
   p.c01 = clamp(c0.y, -FLUID_CMAX, FLUID_CMAX);
   p.c02 = clamp(c0.z, -FLUID_CMAX, FLUID_CMAX);
@@ -1312,7 +1332,7 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   p.px += p.vx / FLUID_SUBSTEPS;
   p.py += p.vy / FLUID_SUBSTEPS;
   p.pz += p.vz / FLUID_SUBSTEPS;
-  if (fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
+  if (!ghost && fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
     p.px = oldPx; p.py = oldPy; p.pz = oldPz;
     p.px += p.vx / FLUID_SUBSTEPS;
     if (fluidSolid(vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u))) {
@@ -1357,6 +1377,7 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
   // and foam land-and-stain as the ACTUAL substance.
   var splashMat = fpMat(p.attr);
   if (splashMat == 0u) { splashMat = T.fluidSplashMat[min(p.species, 3u)]; }
+  if (fpGhost(p.attr)) { splashMat = 0u; }   // a picture sheds no droplets
   if (splashMat != 0u && FLUID_SPLASH_CHANCE > 0 &&
       p.density < FLUID_SPLASH_MAX_RHO) {
     // Speed² in Q16.16 (cells/tick)²: (v >> 8)² sums stay well inside i32

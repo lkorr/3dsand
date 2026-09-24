@@ -2623,7 +2623,13 @@ struct TickParams {
   // to `genAct` and leaves dirtyIn/dirtyOut CLEARED for the slots it wrote,
   // instead of waking them itself. Set only by Stream::ShiftAxis.
   uint32_t genDeferWake = 0;
-  uint32_t pad_wp1 = 0;
+  // THE WEATHER, the SIM's copy (weather::SimRainWord; was the pad_wp1 pad
+  // word, so the struct layout is unchanged). Bits 0..7 rain reaching the
+  // ground, 8..15 the ignition damp strength, 16..23 ground wetness — see
+  // materials.h kRain*. Read by reactions authored "rain" (douse) and
+  // "rainDamped" (ignition), in the CA, the gas edge and the body burners.
+  // 0 = a dry sky and every such rule takes its dry path.
+  uint32_t weatherRain = 0;
   int32_t windPrimLo[3] = {1, 1, 1};   // union AABB of every live primitive,
   int32_t pad_wp2 = 0;                 // inclusive world cells (lo > hi = none)
   int32_t windPrimHi[3] = {0, 0, 0};
@@ -2903,6 +2909,11 @@ constexpr uint32_t kPFlagMicro = 4u;
 // nothing else (sim_particle.wgsl PFLAG_CALM, which must agree -- it is
 // declared in that shader, its only reader). Set by game/container.h.
 constexpr uint32_t kPFlagCalm = 16384u;
+// A DRIP off a wet body (MobSystem::WetOneLimb): a micro droplet that lands
+// and vanishes WITHOUT staining what it hit -- the world's wet stain never
+// dries, so a dripping creature must not paint a trail. Declared in
+// sim_particle.wgsl as PFLAG_DRIP, its only reader, which must agree.
+constexpr uint32_t kPFlagDrip = 32768u;
 constexpr uint32_t kPMicroScaleShift = 3, kPMicroScaleMask = 3u;
 constexpr uint32_t kPMicroLifeShift = 5, kPMicroLifeMask = 0xFFu;
 
@@ -3217,10 +3228,13 @@ constexpr uint64_t kCloudNoiseWords =
     (uint64_t)kCloudShapeN * kCloudShapeN * kCloudShapeN +
     (uint64_t)kCloudDetailN * kCloudDetailN * kCloudDetailN;
 // cloudMaps = [shadow: N^2 f32][env: E^2 x 2 words (pack2x16float rgb, T)]
-//             [probe: 4 words — the weather map AT THE CAMERA: coverage, type,
-//              rain, jitter as f32, written by the weather pass so the
-//              raymarcher's rain overlay knows whether it is raining HERE]
-constexpr uint32_t kCloudProbeWords = 4;
+//             [probe: 8 words — 0..3 the weather map AT THE CAMERA: coverage,
+//              type, rain, jitter as f32, written by the weather pass so the
+//              raymarcher's rain overlay knows whether it is raining HERE;
+//              4..6 the wind averaged over a 20 m disc round the camera,
+//              m/s f32, written by the env pass — what the rain streaks lean
+//              along; 7 spare]
+constexpr uint32_t kCloudProbeWords = 8;
 constexpr uint64_t kCloudMapsWords =
     (uint64_t)kCloudShadowN * kCloudShadowN +
     (uint64_t)kCloudEnvN * kCloudEnvN * 2 + kCloudProbeWords;

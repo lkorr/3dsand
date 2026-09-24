@@ -524,7 +524,11 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
     cp.weatherOrigin[1] = (float)(std::floor(((double)camZM - h) / t) * t);
   }
   cp.shadowTexelM = 40.0f;
-  cp.shadowPlaneM = w.baseM - 0.12f * w.thicknessM;
+  // Just under the lowest local base: the jitter cap mirrors common.wgsl's
+  // cloudBaseJitterM (10% of thickness, at most CLOUD_BASE_JITTER_MAX_M
+  // 150 m). 0.12 x thickness put a storm's plane 200 m below sea level.
+  cp.shadowPlaneM =
+      w.baseM - std::min(0.1f * w.thicknessM, 150.0f) - 0.02f * w.thicknessM;
   {
     // Centre the shadow map where the CAMERA's light ray crosses the plane,
     // so the ground around the player is always inside it. The key light is
@@ -1015,6 +1019,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.windSpeedQ = wq.speed;
     tp.windGustQ = wq.gust;
     tp.windMode = (uint32_t)wtun.sim.windMode;
+    // The weather, the sim's copy: rain + damp + wetness in one word, from
+    // the same seed and tick the renderer's sky is resolved on (weather.h
+    // SimRainWord). What "rain" / "rainDamped" reactions read.
+    tp.weatherRain = weather::SimRainWord(wtun, seed, tick);
     // The gas edge (docs/PLAN_gas_particles.md). Read here, from the same
     // tuning snapshot windMode comes from, so the value the kernel branches on
     // and the value Simulation gates Cond::Gas on are one read.

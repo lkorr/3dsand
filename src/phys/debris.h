@@ -261,6 +261,7 @@ class DebrisSystem {
     // burn state the first time MobSystem meets the body, so a corpse whose
     // only fire is its own embers is not turned away by the cheap gate.
     bool selfActive = false;
+    uint32_t bleedMat = 0;   // Body::bleedMat: the blood a bared bone may wear
     std::vector<FleshShell> shells;  // filled by BurnFleshBodies only
   };
   // A corpse piece MobSystem burns, rather than BurnBodies. Followers are not:
@@ -726,6 +727,8 @@ class DebrisSystem {
   // same on a body as it does in the grid (sim/reactcpu.h). Set it wherever the
   // tick's dayPhase is already computed; leaving it unset means night.
   void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
+  // TickParams::weatherRain for this tick (materials.h kRainAmountMask et al).
+  void SetWeatherRain(uint32_t w) { weatherRain_ = w; }
 
   // Once per tick AFTER Physics::Step: refresh transforms, cull fallen /
   // excess bodies.
@@ -1806,6 +1809,7 @@ class DebrisSystem {
   // it; every headless harness leaves it there, and no authored body rule is
   // phase-gated today, so that default changes nothing it can reach.
   uint32_t dayPhase_ = 0;
+  uint32_t weatherRain_ = 0;
   uint32_t nextSerial_ = 1;
   // ---- ownership (M9.4-C) -------------------------------------------------
   // All defaulted so that a process that never calls the setters behaves

@@ -45,6 +45,9 @@
 #include "sim/world.h"
 
 struct SplatterEvent;
+class Physics;
+class DebrisSystem;
+class WorldItems;
 
 // The raw voxel word at a world cell, false when the cell is not known (outside
 // the snapshot mirror). The live game binds this to World::Snap().mirror; the
@@ -151,12 +154,138 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                   uint32_t seed, std::vector<ParticleSpawn>& spawns,
                   SplatterEvent* splat);
 
+// THE SAME POUR AS MLS-MPM FLUID (owner, 2026-09-23: "when using the flask to
+// take or pour water, they're cubic microvoxels; i want ... the poured water
+// going out to be mpm fluid"). What the seam can hold -- a non-viscous liquid,
+// ContainerPoursAsFluid, the CPU twin of sim_fluid_seam's seamLiquid -- leaves
+// the flask as FluidSpawnOps instead of grid particles: one particle per EIGHTH
+// (the seam's own unit, fpPack fullness 1), so the stream is exactly what the
+// flask held, the last partial cell included, and it settles back into
+// fullness voxels where it comes to rest. The arc is solved in the solver's
+// gravity (sim.fluidGravity, substep-exact) and under its CFL cap; pressure and
+// cohesion bend it a little from there. `room` is the particle budget left
+// this tick (kFluidCap and the spawn stream, charged BEFORE emission, rule 2).
+// Species is (mat - 1) & 3, the rule exciteEmit uses, so a poured stream and
+// the pond it lands in are the same colour. Returns eighths poured; `splat` as
+// ContainerPour.
+bool ContainerPoursAsFluid(const MaterialDef& m);
+int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
+                       const Vec3* target, uint32_t tick, uint32_t seed,
+                       uint32_t room, std::vector<FluidSpawnOp>& out,
+                       SplatterEvent* splat);
+
+// THE SCOOP STREAM: what a scooped cell looks like on its way into the flask.
+// GHOST MPM particles (FluidSpawnOp::species kFluidOpGhost, FP_GHOST in
+// common.wgsl): rendered by the fluid surface like any water, homed onto
+// `mouth` by g2p and dead after `life` ticks, and never matter -- they do not
+// settle, react, stain, splash, or enter the seam's mass books. The eighths
+// were already paid for by the scoop ledger; this is only their picture.
+// Eight per cell from the cell's sub-lattice, `room` as above. Returns the
+// particles emitted.
+constexpr uint32_t kFluidOpGhost = 1u << 8;      // FluidSpawnOp::species bit
+constexpr uint32_t kFluidOpLifeShift = 16;       // ghost life, ticks, bits 16..23
+uint32_t ContainerScoopStream(IVec3 cell, uint32_t mat, Vec3 mouth, int life,
+                              uint32_t seed, uint32_t tick, uint32_t room,
+                              std::vector<FluidSpawnOp>& out);
+
+// ---- THROWING AND BREAKING (owner, 2026-09-23: "holding down a button with
+// it equipped charges up a throw ... if the flask hits something with a high
+// velocity or is hit by something with a high velocity it should break and
+// spawn all of its contents immediately into the world") -------------------
+//
+// A THROWN VESSEL IS A DROPPED ITEM WITH SPEED. DropItemToWorld already turns
+// a stack into a debris body that remembers its fill (WorldItem::fill), so the
+// throw is that call with a launch velocity and the flight is Jolt's. The
+// session counts the ticks Q is held (PlayerSession::throwTicks) and lets go
+// on the release; the charge is on the TICK clock, so a wind-up is the same
+// length at any frame rate and on a peer.
+//
+// BREAKING is decided per body, per tick, by two independent witnesses, and
+// either is enough:
+//   * a NEW CONTACT (Physics::ContactImpacts) whose closing speed along the
+//     normal reaches `breakSpeed` -- the relative speed, so a flask thrown at
+//     a wall and a rock thrown at a flask on the ground are the same test;
+//   * a VELOCITY JUMP of `breakSpeed` in one tick -- what the contact list
+//     cannot see (it is capped per step and drops anything touching the
+//     player) and what a blast does to it.
+// Gravity alone adds a third of a metre a second per tick, far under any
+// sensible threshold, so a flask in free fall never breaks in the air.
+bool ContainerThrowable(const ItemDef& def);
+// The wind-up so far, 0..1, after `heldTicks` ticks of the button.
+float ContainerThrowCharge(const ItemDef& def, int heldTicks);
+// Launch speed, world voxels/s: throwMinSpeed on a tap, throwSpeed at full.
+float ContainerThrowSpeed(const ItemDef& def, int heldTicks);
+bool ContainerShouldBreak(const ItemDef& def, float contactSpeed, Vec3 dv);
+
+// WHAT A BROKEN VESSEL LETS OUT. The body is gone the tick it breaks; its
+// contents are a SPILL that empties into the world from where it was, all of
+// it at once when the per-tick spawn budgets allow (1024 eighths of water is a
+// quarter of kMaxFluidSpawnsPerTick) and over the next few ticks when they do
+// not -- the budget is charged BEFORE emission (rule 2) and nothing is lost to
+// it. The same two roads the pour takes: a liquid the MPM seam can hold as
+// fluid particles, one per eighth, exact; anything else as grid particles, a
+// whole cell each (the pour's one rounding, under a cell per flask).
+struct ContainerSpill {
+  Vec3 at{};       // where the vessel was, world voxels (its centre of mass)
+  Vec3 vel{};      // its velocity before the blow, voxels/s
+  Vec3 away{};     // unit, off the surface it struck; zero when unknown
+  uint16_t mat = 0;
+  int units = 0;   // eighths still to come out
+  uint32_t seed = 0;
+  bool splatted = false;  // the SplatterEvent goes out once, with the burst
+};
+// One tick of a spill. Returns the eighths emitted; `splat`, on the first
+// tick anything leaves, is filled with the burst's SplatterEvent (the caller
+// queues it), so whoever it breaks over is wet with it.
+int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
+                       uint32_t tick, uint32_t fluidRoom,
+                       std::vector<FluidSpawnOp>& fluid,
+                       std::vector<ParticleSpawn>& parts, SplatterEvent* splat);
+
+// THE BREAK PASS, once per tick (session.cpp phase H, and the vessel-break
+// gate): every vessel in `ground` against both witnesses -- the NEW contacts
+// of the last Physics::Step and its velocity jump since the last call
+// (`lastVel`, which this maintains). A broken one's body is destroyed (its
+// registry entry goes with it through OnBodyGone) and its contents appended
+// to `spills` at its centre of mass. Ghost bodies are the peer's to break.
+// Returns the number broken.
+int ContainerBreakPass(WorldItems& ground, const ItemLibrary& items,
+                       Physics& phys, DebrisSystem& debris,
+                       std::vector<std::pair<uint64_t, Vec3>>& lastVel,
+                       std::vector<ContainerSpill>& spills);
+
 // Spend up to `cells` whole cells of contents (the triage "apply to this
 // limb"). Returns the eighths actually spent; empties the fill at zero.
 int ContainerSpend(ItemStack& st, int cells);
 
+// THE PORTRAIT POUR BRUSH'S DRAIN (MobSystem::PourOnBody): what a second of
+// pouring on your own body costs, in cells, for a brush disc of `radius`
+// world voxels. Scales with the disc's AREA -- a brush twice as wide covers
+// four times the skin and empties the flask four times as fast -- anchored so
+// the default brush (kPourBrushRefRadius) spends `container.applyCells` a
+// second. One function because the tick spends by it and the panel shows it.
+constexpr float kPourBrushRefRadius = 0.5f;
+float PourBrushCellsPerSec(const ItemDef& def, float radius);
+
 // Is `target` close enough to AIM at, rather than tip toward?
 bool ContainerInReach(const ItemDef& def, Vec3 mouth, Vec3 target);
+
+// THE POUR POINT (owner, 2026-09-23: "about 1 metre in the direction the
+// character is looking, so they can choose to pour in the air in front of them
+// or directly on the ground" -- and then "exactly where the mouse cursor is
+// looking"). A point ON THE CROSSHAIR RAY: from `from` (the render eye -- the
+// boom in third person, the head in first) along `fwd`, `container.aimDist`
+// past where the ray draws level with `head` (the character's eye), so in
+// third person it is a metre in front of the CHARACTER, not of the camera.
+// Short of that where the ray first meets a solid or liquid cell (`kindAt`,
+// the CPU mirror) or a body other than the `ignore` ones (your own limbs, the
+// flask in your fist). The frame computes it once (FrameIntent::pourAim) and
+// both the marker sphere and the tick's pour use it -- the sphere is where
+// the stream goes.
+Vec3 ContainerPourPoint(const ItemDef& def, Vec3 from, Vec3 head, Vec3 fwd,
+                        const std::function<CellKind(IVec3)>& kindAt,
+                        const Physics& phys,
+                        const std::vector<uint64_t>& ignore);
 
 // Hotbar stacks of vessels: a stack of N empty flasks cannot all hold the one
 // scoop. Before filling, the rest of the stack moves out to a free hotbar slot,

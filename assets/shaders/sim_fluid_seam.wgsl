@@ -407,7 +407,10 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   // rest of the cumulative block below): eighths that actually entered the pool
   // as LIVE particles, one per live op by construction (fpPack(op.mat, 1u, ...)
   // below). A discharge ledger's `drained` is supposed to equal this.
-  if (op.mat != 0u) { atomicAdd(&fluidArgs[FA_SPAWNLIVE], 1u); }
+  // A GHOST (the flask's scoop stream, FP_GHOST) is not matter and is kept
+  // out of the books entirely: in and out, it never happened.
+  let ghost = (op.species & 0x100u) != 0u;
+  if (op.mat != 0u && !ghost) { atomicAdd(&fluidArgs[FA_SPAWNLIVE], 1u); }
   var p : FluidParticle;
   p.px = op.px; p.py = op.py; p.pz = op.pz;
   // The CFL cap is derived from the substep knob (common.wgsl), so a spawn op
@@ -427,6 +430,17 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   p._r0 = 0; p._r1 = 0; p._r2 = 0; p._r3 = 0;
   p._r4 = 0; p._r5 = 0; p._r6 = 0; p._r7 = 0;
   p._r8 = 0; p._r9 = 0; p._r10 = 0; p._r11 = 0;
+  if (ghost && op.mat != 0u) {
+    // The op's velocity CARRIES THE TARGET (ContainerScoopStream): the point
+    // it would reach in `life` ticks, read before the CFL clamp above could
+    // shorten it. Life is species bits 16..23.
+    let life = max((op.species >> 16u) & 0xFFu, 1u);
+    p.attr |= FP_GHOST;
+    p._r0 = op.px + op.vx * i32(life);
+    p._r1 = op.py + op.vy * i32(life);
+    p._r2 = op.pz + op.vz * i32(life);
+    p._r3 = i32(T.tick + life);
+  }
   fluidParticles[slot] = p;
 }
 
@@ -1215,6 +1229,17 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
   var p = fluidParticles[gid.x];
   if (!fpAlive(p.attr)) { return; }
+  // A GHOST retires here at its death tick, and nothing else can take it: the
+  // CA never saw an occupancy intent for it (particleTick), so no reaction
+  // flagged its cell. No mass counter -- it never held any.
+  if (fpGhost(p.attr)) {
+    if (i32(T.tick - u32(p._r3)) >= 0) {
+      p.attr = 0u;
+      fluidParticles[gid.x] = p;
+      atomicAdd(&fluidArgs[FA_DEAD], 1u);
+    }
+    return;
+  }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   let csl = chunkSlotOf(worldChunkOf(cell), T.origin);
   if (csl == SLOT_NONE) { return; }
@@ -1265,7 +1290,9 @@ fn cellClear(@builtin(workgroup_id) wg : vec3<u32>,
 fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP)) { return; }
   let p = fluidParticles[gid.x];
-  if (!fpAlive(p.attr)) { return; }
+  // A GHOST gives the CA nothing to react with and nothing to stain by, and
+  // does not hold its chunk out of the calm judgement.
+  if (!fpAlive(p.attr) || fpGhost(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
   if (slot == SLOT_NONE) { return; }
@@ -1588,7 +1615,8 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
 fn settleBin(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP)) { return; }
   let p = fluidParticles[gid.x];
-  if (!fpAlive(p.attr)) { return; }
+  // Ghosts never settle: settleKill spares them by the same test.
+  if (!fpAlive(p.attr) || fpGhost(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
   if (slot == SLOT_NONE) { return; }
@@ -2188,7 +2216,8 @@ fn mirrorFold(@builtin(workgroup_id) wg : vec3<u32>,
 fn settleKill(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP)) { return; }
   var p = fluidParticles[gid.x];
-  if (!fpAlive(p.attr)) { return; }
+  // Ghosts were never binned (settleBin), so they are not killed here either.
+  if (!fpAlive(p.attr) || fpGhost(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
   if (slot == SLOT_NONE) { return; }

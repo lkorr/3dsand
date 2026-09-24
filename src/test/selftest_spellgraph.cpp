@@ -40,6 +40,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "game/caster.h"
 #include "game/spell.h"
 #include "game/spellgraph.h"
 #include "test/selftest.h"
@@ -528,22 +529,30 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
       check(over == 3, Format("%d of 3 lane beads are drawn over the socket they edit "
                               "in [%s]", over, Join(words).c_str()));
     }
-    // ...and `shotgun` inside a lane is THAT LANE'S bead (2026-09-22). It used
-    // to be record-wide wherever it was spoken, so it drew on the trunk however
-    // it was said; a count now splits the scope it was spoken in, so the bead
-    // is over the branch it splits and the drawing and the cast agree again.
+    // ...and `shotgun` inside a lane is THAT BRANCH'S JUNCTION (2026-09-22). It
+    // used to be record-wide wherever it was spoken, so it drew on the trunk
+    // however it was said; a count now splits the scope it was spoken in. And
+    // since the sub-fan is drawn, that count is not a bead at all any more — it
+    // IS the branch's junction, wearing its word, exactly as the record-wide one
+    // is the box's.
     {
       const CastList cl = LowerSpell(lib, ParseWords(lib, Split("fire lane shotgun end projectile")));
       const SpellGraph sg = BuildGraph(lib, cl);
-      int wide = 0, perLane = 0;
+      int wide = 0, perLane = 0, beads = 0;
       for (const SpellGraphNode& n : sg.nodes) {
-        if (n.kind != GraphKind::ModTag || n.label != "shotgun") continue;
+        if (n.label != "shotgun") continue;
+        if (n.kind == GraphKind::ModTag) {
+          beads++;
+          continue;
+        }
+        if (n.kind != GraphKind::Split) continue;
         if (n.instance < 0) wide++;
         else perLane++;
       }
-      check(perLane >= 1 && wide == 0,
-            Format("`shotgun` spoken inside a lane draws on that lane (%d wide, %d per-lane)",
-                   wide, perLane));
+      check(perLane == 1 && wide == 0 && beads == 0,
+            Format("`shotgun` inside a lane is that branch's junction, not a bead "
+                   "and not on the trunk (%d wide, %d per-lane, %d beads)",
+                   wide, perLane, beads));
     }
   }
 
@@ -654,6 +663,15 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
     for (const SpellGraphNode& n : g.nodes) {
       if (n.kind != GraphKind::Join && n.kind != GraphKind::Root) continue;
       if (n.primary >= 0) continue;
+      // ...WHEN THE ROW IS DRAWN AT ALL (2026-09-22). A box with one instance
+      // and no lane has nothing a socket row could say — one pip over one bolt
+      // — so it draws none, and the payload runs straight into the cell. The
+      // law is then: no row, or a full one. A row that is drawn and SHORT is
+      // still a word that vanished.
+      if (n.sockets.empty()) {
+        if (n.instances > 1 || n.laneCount > 0) sockets++;
+        continue;
+      }
       if ((int)n.sockets.size() != n.instances) {
         sockets++;
         continue;
@@ -716,13 +734,22 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
       const std::vector<int>& cs = kv.second;
       // The `hand` is the pedestal the branches have not diverged from yet, so
       // it is ONE cell however wide its fan; a spoken delivery gets one per
-      // branch.
+      // BOLT — a branch that splits again caps several columns, so the count is
+      // `laneSplits` summed, not `instances` (2026-09-22). The fallback is the
+      // collapsed drawing, where a wide sub-fan is a tally on one cell: the
+      // law is "one per bolt, or one per branch", and nothing in between.
       const bool hand = g.nodes[(size_t)cs[0]].kind == GraphKind::Root;
-      const int want = hand ? 1 : g.nodes[(size_t)cs[0]].instances;
+      const int branches = g.nodes[(size_t)cs[0]].instances;
+      const BoxPrice* bp = l.PriceOf(kv.first);
+      int bolts = 0;
+      if (bp)
+        for (int32_t b : bp->laneSplits) bolts += std::max<int32_t>(1, b);
+      if (bolts < branches) bolts = branches;
       int owners = 0;
       const int lyr = g.nodes[(size_t)cs[0]].layer;
       std::vector<int> seen;
-      bool ok = (int)cs.size() == want;
+      bool ok = hand ? (int)cs.size() == 1
+                     : ((int)cs.size() == bolts || (int)cs.size() == branches);
       for (int ci : cs) {
         const SpellGraphNode& c = g.nodes[(size_t)ci];
         if (c.primary < 0) owners++;
@@ -736,15 +763,22 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
       }
       if (owners != 1) ok = false;
       if (cs.size() > 1) {
-        // ...and the cells name branches 0..N-1, once each.
-        std::sort(seen.begin(), seen.end());
-        for (size_t i = 0; i < seen.size(); i++)
-          if (seen[i] != (int)i) ok = false;
+        // ...and every BRANCH is capped: the cells name 0..N-1, each at least
+        // once, in non-decreasing order (a branch's bolts are adjacent, which
+        // is what keeps a column a column).
+        std::vector<int> once = seen;
+        std::sort(once.begin(), once.end());
+        once.erase(std::unique(once.begin(), once.end()), once.end());
+        if ((int)once.size() != branches) ok = false;
+        for (size_t i = 0; i < once.size(); i++)
+          if (once[i] != (int)i) ok = false;
+        for (size_t i = 1; i < seen.size(); i++)
+          if (seen[i] < seen[i - 1]) ok = false;
       }
       if (!ok && cellBad++ < 6 && shownLayout++ < 12)
         std::printf("spell-graph: \"%s\": tree node %d drew %d cells (%d owners), "
-                    "want %d\n", what.c_str(), kv.first, (int)cs.size(), owners,
-                    want);
+                    "want %d branches or %d bolts\n", what.c_str(), kv.first,
+                    (int)cs.size(), owners, hand ? 1 : branches, hand ? 1 : bolts);
     }
     // (4) THE DRAWING IS BOUNDED. A split branch ends in a cell, so columns are
     // 64 wide now; nesting multiplies them and the page has to stay findable.
@@ -1068,6 +1102,303 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
     }
   }
 
+  // ---- 7b. FURNITURE ONLY WHERE IT SAYS SOMETHING (2026-09-22) ---------------
+  //
+  // From the owner, looking at a page holding the single word `projectile` and
+  // finding five bands on it: "what does the horizontal line actually represent
+  // here, and why are there two sockets". Nothing, and they were one socket
+  // each on two different boxes. A socket row over ONE instance is a pip saying
+  // "one" and a bus under ONE item is a rule sharing it with nobody.
+  {
+    struct Furn { const char* words; int buses; int sockets; const char* why; };
+    const Furn kFurn[] = {
+        // One word. Two cells, no furniture at all: the hand, and the bolt.
+        {"projectile", 0, 0, "one bare delivery"},
+        // The smallest real spell: hand, fire, PROJECTILE. Still nothing.
+        {"fire projectile", 0, 0, "one item on one bolt"},
+        // Two shared items DO collect on something: one bus, on the box that
+        // holds them. The hand, holding only the box, still gets none.
+        {"sand gust projectile", 1, 0, "two items collect"},
+        // A fan: three bolts, so the row says which is which and the bus says
+        // what all three carry.
+        {"sand shotgun projectile", 1, 3, "three bolts share one item"},
+        // A lane distinguishes its instance from the shared pile even at one
+        // instance, so the row is drawn and the bus is not.
+        {"fire lane sand end projectile", 0, 1, "one lane, one instance"},
+    };
+    for (const Furn& f : kFurn) {
+      const SpellGraph g =
+          BuildGraph(lib, LowerSpell(lib, ParseWords(lib, Split(f.words))));
+      int buses = 0, socks = 0;
+      for (const SpellGraphNode& n : g.nodes) {
+        if (n.kind == GraphKind::Bus) buses++;
+        if (n.kind == GraphKind::Socket) socks++;
+      }
+      check(buses == f.buses && socks == f.sockets,
+            Format("[%s] draws %d bus / %d sockets, want %d / %d (%s)", f.words,
+                   buses, socks, f.buses, f.sockets, f.why));
+    }
+    // ...and the words are untouched by any of it: furniture is synthesized, so
+    // suppressing it cannot change what the page says.
+    const SpellTree t = ParseWords(lib, Split("fire projectile"));
+    check(Join(Linearize(lib, t)) == "fire projectile",
+          "the sentence is the same either way: [" + Join(Linearize(lib, t)) + "]");
+  }
+
+  // ---- 7c. THE FAN CASCADES (2026-09-22) ------------------------------------
+  //
+  // From the owner, on `shotgun lane twin end`: "heres a shotgun into a twin,
+  // the twin doesnt split into 2 more. it should just fractal cascade into more
+  // and more." It did not: a branch's own split was drawn as a TALLY on the
+  // delivery cell that capped it, and the `hand` has no cell per branch, so on
+  // the reported sentence the second split was drawn as nothing at all.
+  //
+  // A split is a split at every depth. A branch that fires more than one bolt
+  // gets its own junction and its own socket row inside its column, and its
+  // delivery is drawn once per BOLT.
+  {
+    // (a) The reported sentence, on the hand. Two junctions, 3 + 2 sockets, and
+    // the second junction wears the word that opened it.
+    {
+      const SpellGraph g = BuildGraph(
+          lib, LowerSpell(lib, ParseWords(lib, Split("shotgun lane twin end"))));
+      int junctions = 0, branchPips = 0, boltPips = 0, twinJunction = 0;
+      for (const SpellGraphNode& n : g.nodes) {
+        if (n.kind == GraphKind::Split) {
+          junctions++;
+          if (n.label == "twin" && n.instances == 2) twinJunction++;
+        }
+        if (n.kind != GraphKind::Socket) continue;
+        // A branch pip is in the hand's socket list; a bolt pip is not.
+        bool branch = false;
+        for (const SpellGraphNode& b : g.nodes)
+          for (int si : b.sockets)
+            if (si == (int)(&n - g.nodes.data())) branch = true;
+        (branch ? branchPips : boltPips)++;
+      }
+      check(junctions == 2 && twinJunction == 1,
+            Format("`shotgun lane twin end` draws TWO junctions and the second "
+                   "wears `twin` (%d junctions, %d of them the twin)",
+                   junctions, twinJunction));
+      check(branchPips == 3 && boltPips == 2,
+            Format("...fanning 3 branches and then 2 bolts out of one of them "
+                   "(%d branch pips, %d bolt pips)", branchPips, boltPips));
+    }
+    // (b) A SPOKEN delivery is drawn once per BOLT. Three branches, one of them
+    // split in two, is FOUR bolts and four cells - and the price agrees, which
+    // is the point: the drawing counts what flies.
+    {
+      const char* w = "sand shotgun lane twin end projectile";
+      const SpellTree t = ParseWords(lib, Split(w));
+      const CastList cl = LowerSpell(lib, t);
+      const SpellGraph g = BuildGraph(lib, cl);
+      int cells = 0;
+      for (const SpellGraphNode& n : g.nodes)
+        if (n.kind == GraphKind::Join && n.label == "projectile") cells++;
+      const BoxPrice* bp =
+          t.clauses.empty() ? nullptr : cl.PriceOf(t.clauses[0].root);
+      int32_t bolts = 0;
+      // The hand's one item is the projectile box; its price is the one with
+      // more than one instance.
+      for (const BoxPrice& p : cl.boxPrice)
+        if (p.instances > 1) bolts = std::max(bolts, p.bolts);
+      check(cells == 4 && bolts == 4,
+            Format("[%s] draws one cell per BOLT: %d cells for %d bolts", w,
+                   cells, (int)bolts));
+      (void)bp;
+    }
+    // (c) IT NESTS. A fan inside a fan by nesting BOXES is the other way depth
+    // arrives, and it goes through the same recursion.
+    {
+      const SpellGraph g = BuildGraph(
+          lib, LowerSpell(lib, ParseWords(
+                                   lib, Split("fire shotgun projectile twin projectile"))));
+      int junctions = 0, inner = 0, outer = 0;
+      for (const SpellGraphNode& n : g.nodes) {
+        if (n.kind == GraphKind::Split) junctions++;
+        if (n.kind != GraphKind::Join) continue;
+        if (n.instances == 3) inner++;
+        if (n.instances == 2) outer++;
+      }
+      check(junctions == 2 && inner == 3 && outer == 2,
+            Format("a fan feeding a fan draws both (%d junctions, %d inner "
+                   "cells, %d outer)", junctions, inner, outer));
+    }
+    // (d) AND NOTHING WITHOUT A SUB-SPLIT GREW A JUNCTION. The ordinary fan is
+    // exactly what it was: one junction, one socket row, one cell per branch.
+    {
+      const SpellGraph g = BuildGraph(
+          lib, LowerSpell(lib, ParseWords(lib, Split("sand shotgun projectile"))));
+      int junctions = 0, socks = 0, cells = 0;
+      for (const SpellGraphNode& n : g.nodes) {
+        if (n.kind == GraphKind::Split) junctions++;
+        if (n.kind == GraphKind::Socket) socks++;
+        if (n.kind == GraphKind::Join) cells++;
+      }
+      check(junctions == 1 && socks == 3 && cells == 3,
+            Format("a plain fan is untouched (%d junctions, %d sockets, %d "
+                   "cells)", junctions, socks, cells));
+    }
+  }
+
+  // ---- 8. A SPLIT WORD ALWAYS FANS WHAT IT LANDS ON (2026-09-22) -------------
+  //
+  // From the owner: "if I just drag a single shotgun or twin glyph into an empty
+  // spellbook it gets sandwiched with a lane and end insertion which removes the
+  // 3 branching nodes it's supposed to make."
+  //
+  // A socket drop asks for lane `instance + 1`, and a socket with no lane of its
+  // own opens one — right for a payload, wrong for the word that MAKES sockets.
+  // A blank page draws one bare socket over the hand, so the only gesture there
+  // was `lane shotgun end`: one empty instance carrying a split, and no fan.
+  {
+    auto dropOnSocket = [&](const SpellTree& t, int box, const char* word) {
+      // What the canvas asks for when you aim at the LAST socket of a box, read
+      // the way `spellgraph_ui.cpp` reads it off the mirror.
+      const int32_t lanes = (int32_t)t.nodes[(size_t)box].laneAt.size() / 2;
+      const CastList cl = LowerSpell(lib, t);
+      const BoxPrice* p = cl.PriceOf(box);
+      const int32_t instances = std::max<int32_t>(p ? p->instances : 1, lanes);
+      return AttachMod(lib, t, box, instances, lib.Find(word));
+    };
+    for (const char* word : {"shotgun", "twin"}) {
+      const SpellTree blank = EmptyTree();
+      const int hand = blank.clauses.empty() ? -1 : blank.clauses[0].root;
+      const EditResult r = dropOnSocket(blank, hand, word);
+      check(r.ok, Format("`%s` can be dropped on a blank page: ", word) + r.why);
+      if (!r.ok) continue;
+      check(CountWord(r.words, "lane") == 0 && CountWord(r.words, "end") == 0,
+            Format("`%s` on a blank page says no lane and no end: [", word) +
+                Join(r.words) + "]");
+      // ...and the drawing it makes has one cell per branch, which is the thing
+      // the player dragged it in for.
+      const SpellTree after = ParseWords(lib, r.words);
+      const SpellGraph g = BuildGraph(lib, LowerSpell(lib, after));
+      const int want = lib.glyphs[(size_t)lib.Find(word)].amount;
+      int socketsDrawn = 0, split = 0;
+      for (const SpellGraphNode& n : g.nodes) {
+        if (n.kind == GraphKind::Socket) socketsDrawn++;
+        if (n.kind == GraphKind::Split) split++;
+      }
+      check(socketsDrawn == want && split == 1,
+            Format("`%s` fans the hand into %d branches out of one junction "
+                   "(%d sockets, %d junctions)", word, want, socketsDrawn, split));
+    }
+    // A TWIN OF A TWIN. The clamp above is right exactly ONCE per box: aim a
+    // second count at a socket of a box that already fans and you are asking
+    // for a fan INSIDE a fan, contained in that branch — not to fan the trunk
+    // twice, which is one split per scope and would do nothing. From the owner:
+    // "it also wont let me split a twin into a twin, which should totally be
+    // allowed and contained."
+    {
+      SpellTree t = EmptyTree();
+      EditResult first =
+          AttachMod(lib, t, t.clauses[0].root, 1, lib.Find("twin"));
+      check(first.ok, "the first twin fans the hand: " + first.why);
+      if (first.ok) {
+        t = ParseWords(lib, first.words);
+        // ...aimed at the FIRST socket, which is the aim branch and has no lane
+        // of its own yet. (The far socket works too and opens the lanes before
+        // it, which is `EVERY SOCKET IS A TARGET` and not this law.)
+        const EditResult second =
+            AttachMod(lib, t, t.clauses[0].root, 1, lib.Find("twin"));
+        check(second.ok, "a twin can be split into a twin: " + second.why);
+        if (second.ok) {
+          check(CountWord(second.words, "twin") == 2 &&
+                    CountWord(second.words, "lane") == 1 &&
+                    CountWord(second.words, "end") == 1,
+                "...and it is CONTAINED in that branch: [" +
+                    Join(second.words) + "]");
+          // The branch really fires more than the others: `laneSplits` is what
+          // the drawing's per-branch tally reads.
+          const SpellTree st = ParseWords(lib, second.words);
+          const CastList cl = LowerSpell(lib, st);
+          const BoxPrice* p =
+              st.clauses.empty() ? nullptr : cl.PriceOf(st.clauses[0].root);
+          int split = 0;
+          if (p)
+            for (int32_t b : p->laneSplits)
+              if (b > 1) split++;
+          check(split == 1, Format("one of the two branches fires more than one "
+                                   "bolt (%d do)", split));
+        }
+        // Aiming it at the TRUNK, where the split already is, is still the one
+        // refusal: that word would be charged and do nothing.
+        const EditResult trunk =
+            AttachMod(lib, t, t.clauses[0].root, 0, lib.Find("twin"));
+        check(!trunk.ok && !trunk.why.empty(),
+              "a second twin on the trunk is still refused, with a reason: '" +
+                  trunk.why + "'");
+      }
+    }
+    // A LANE THE PLAYER ACTUALLY OPENED still takes one: that is a real
+    // sub-split and the page has a bead for it.
+    {
+      const EditResult lane1 =
+          InsertItem(lib, EmptyTree(), 0, 1, lib.Find("fire"));
+      check(lane1.ok, "a lane can be opened with a word in it: " + lane1.why);
+      if (lane1.ok) {
+        const SpellTree t = ParseWords(lib, lane1.words);
+        const EditResult r =
+            AttachMod(lib, t, t.clauses[0].root, 1, lib.Find("shotgun"));
+        check(r.ok && CountWord(r.words, "lane") == 1,
+              "a count aimed at a lane the player opened stays in it: [" +
+                  Join(r.words) + "] " + r.why);
+      }
+    }
+  }
+
+  // ---- 9. AN EMPTY SLOT IS A HOLE IN THE ROW BELOW (2026-09-22) --------------
+  //
+  // Also from the owner: a `_ trail` drew its empty left slot as a ring hung off
+  // the LEFT EDGE of the cell. An operand belongs UNDER its operator, so the
+  // missing one is a cell-sized blank standing in that row with its own stroke
+  // into the word it is waiting for.
+  {
+    const SpellTree t = ParseWords(lib, Split("trail projectile"));
+    const SpellGraph g = BuildGraph(lib, LowerSpell(lib, t));
+    int hole = -1, op = -1;
+    for (size_t i = 0; i < g.nodes.size(); i++) {
+      if (g.nodes[i].kind == GraphKind::Hole) hole = (int)i;
+      else if (g.nodes[i].kind == GraphKind::Operator) op = (int)i;
+    }
+    check(hole >= 0 && op >= 0,
+          Format("`trail projectile` draws its empty slot as a hole (hole %d, "
+                 "operator %d)", hole, op));
+    if (hole >= 0 && op >= 0) {
+      const SpellGraphNode& h = g.nodes[(size_t)hole];
+      const SpellGraphNode& o = g.nodes[(size_t)op];
+      // y grows DOWNWARD: UNDERNEATH is a larger y.
+      check(h.y > o.y, Format("the hole sits under the cell it belongs to "
+                              "(hole y %d, operator y %d)", h.y, o.y));
+      check(h.w == kGraphCell && h.h == kGraphCell,
+            Format("the hole is a whole cell, not a pip (%dx%d)", h.w, h.h));
+      // It is the OPERATOR's slot, not a word: a drop on it is FillSlot on that
+      // operator's left side.
+      check(h.treeNode == o.treeNode && h.instance == 0,
+            Format("the hole names its operator's left slot (node %d vs %d, "
+                   "side %d)", h.treeNode, o.treeNode, (int)h.instance));
+      int slotIn = 0;
+      for (const SpellGraphEdge& e : g.edges)
+        if (e.from == hole && e.to == op && e.kind == GraphEdge::Slot) slotIn++;
+      check(slotIn == 1, Format("one stroke runs from the hole into its "
+                                "operator (%d)", slotIn));
+      // ...and filling it makes the hole a word: the same drawing, no blanks.
+      const EditResult f =
+          FillSlot(lib, t, o.treeNode, SlotSide::Left, lib.Find("fire"));
+      check(f.ok, "the hole takes a word: " + f.why);
+      if (f.ok) {
+        const SpellGraph g2 =
+            BuildGraph(lib, LowerSpell(lib, ParseWords(lib, f.words)));
+        int holes = 0;
+        for (const SpellGraphNode& n : g2.nodes)
+          if (n.kind == GraphKind::Hole) holes++;
+        check(holes == 0, Format("...and then there is no hole left (%d): [",
+                                 holes) + Join(f.words) + "]");
+      }
+    }
+  }
+
   detail = Format("%d sentences (%d oracle), %d op cases, %d graphs, %d checks",
                   (int)corpus.size(), oracleEntries, opCases, graphs, checks);
   std::printf(
@@ -1080,6 +1411,278 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---- spell-magnitude (docs/PLAN_spell_magnitude.md §2.6) ----------------------
+//
+// CPU-only, beside `spell-graph`: a word's MAGNITUDE — the number the wheel
+// sets on a cell — reaches the lowered cast in the units the plan promises,
+// prices convexly, survives the page's serialization (`float@0.5`) through
+// every path a page takes (ParseWords / Linearize / ExpandWords / the graph
+// op), and changes nothing for a word spoken without one.
+
+// The first effect of `verb` anywhere under `v`, launches and inners included.
+const EffectInst* FindVerb(const std::vector<EffectInst>& v, SpellVerb verb) {
+  for (const EffectInst& e : v) {
+    if (e.verb == verb) return &e;
+    if (const EffectInst* x = FindVerb(e.inner, verb)) return x;
+    for (const DeliveryRec& d : e.launch)
+      for (const SpellLane& ln : d.lanes)
+        if (const EffectInst* x = FindVerb(ln.extra, verb)) return x;
+  }
+  return nullptr;
+}
+
+Status GateSpellMagnitude(Ctx& c, std::string& detail) {
+  GlyphLibrary lib;
+  std::string gerr;
+  if (!LoadGlyphs(AssetDir() + "/spells/glyphs.json", c.mats, lib, gerr)) {
+    std::printf("spell-magnitude: FAIL (glyph load: %s)\n", gerr.c_str());
+    detail = "glyph load failed";
+    return Status::Fail;
+  }
+  bool ok = true;
+  int checks = 0, shown = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (cond) return;
+    ok = false;
+    if (shown++ < 20) std::printf("spell-magnitude: FAILED %s\n", what.c_str());
+  };
+  auto compile = [&](const std::vector<std::string>& w) {
+    return LowerSpell(lib, ParseWords(lib, w));
+  };
+  // The projectile record a `... projectile` sentence flies with.
+  auto flight = [&](const CastList& l) -> const DeliveryRec* {
+    if (l.casts.empty()) return nullptr;
+    const EffectInst* e = FindVerb(l.casts[0].payload, SpellVerb::Launch);
+    return e && !e->launch.empty() ? &e->launch[0] : nullptr;
+  };
+  const GlyphDef* proj = lib.At(lib.Find("projectile"));
+  if (!proj) {
+    std::printf("spell-magnitude: FAIL (no projectile glyph)\n");
+    return Status::Fail;
+  }
+
+  // 1. COMPATIBILITY: `word@1` IS `word`, over every pair of the alphabet -
+  // same tree key, same price, same readout, same words back.
+  int compat = 0;
+  for (const char* a : kAlphabet)
+    for (const char* b : kAlphabet) {
+      const std::vector<std::string> plain = {a, b, "projectile"};
+      const std::vector<std::string> one = {std::string(a) + "@1", std::string(b) + "@1.000",
+                                            "projectile"};
+      const SpellTree tp = ParseWords(lib, plain), t1 = ParseWords(lib, one);
+      const CastList lp = LowerSpell(lib, tp), l1 = LowerSpell(lib, t1);
+      const bool same = GraphTreeKey(lib, tp) == GraphTreeKey(lib, t1) &&
+                        lp.manaCost == l1.manaCost &&
+                        DescribeSpell(lib, lp).text == DescribeSpell(lib, l1).text &&
+                        Linearize(lib, tp) == Linearize(lib, t1);
+      if (!same) check(false, Format("`%s %s projectile` differs at @1", a, b));
+      compat++;
+    }
+
+  // 2. WHAT IT SCALES, in the units the plan's table promises.
+  {
+    const DeliveryRec* h = flight(compile({"float@0.5", "projectile"}));
+    const DeliveryRec* f = flight(compile({"float", "projectile"}));
+    const DeliveryRec* d = flight(compile({"float@2", "projectile"}));
+    check(h && f && d, "float projectiles lower to a flight");
+    if (h && f && d) {
+      check(f->gravityMille == proj->gravityMille - 1000,
+            Format("float: gravity %d, want %d", f->gravityMille, proj->gravityMille - 1000));
+      check(h->gravityMille == proj->gravityMille - 500,
+            Format("float@0.5: gravity %d, want %d", h->gravityMille, proj->gravityMille - 500));
+      check(d->gravityMille == proj->gravityMille - 2000,
+            Format("float@2: gravity %d, want %d", d->gravityMille, proj->gravityMille - 2000));
+    }
+    const DeliveryRec* s15 = flight(compile({"swift@1.5", "projectile"}));
+    check(s15 && s15->speedFx == proj->speedFx * 3,
+          Format("swift@1.5: speed %d, want %d", s15 ? s15->speedFx : -1, proj->speedFx * 3));
+    const DeliveryRec* sl = flight(compile({"slow@2", "projectile"}));
+    check(sl && sl->speedFx == proj->speedFx / 4,
+          Format("slow@2: speed %d, want %d", sl ? sl->speedFx : -1, proj->speedFx / 4));
+    const DeliveryRec* s0 = flight(compile({"swift@0.25", "projectile"}));
+    check(s0 && s0->speedFx >= proj->speedFx, "swift never slows: its magnitude floor is x1");
+    const DeliveryRec* b3 = flight(compile({"bounce@3", "projectile"}));
+    check(b3 && b3->bounces == 3, "bounce@3 bounces three times");
+    const DeliveryRec* bh = flight(compile({"bounce@0.5", "projectile"}));
+    check(bh && bh->bounces == 1, "bounce is whole units: @0.5 snaps to 1");
+
+    // Tariff follows the world effect: a bigger blast costs more.
+    const int32_t e05 = compile({"explosive@0.5", "projectile"}).tariff;
+    const int32_t e1 = compile({"explosive", "projectile"}).tariff;
+    const int32_t e2 = compile({"explosive@2", "projectile"}).tariff;
+    const int32_t ex2 = compile({"explosive", "explosive", "projectile"}).tariff;
+    check(e05 < e1 && e1 < e2, Format("explosive tariff %d < %d < %d", e05, e1, e2));
+    check(e2 == ex2, Format("explosive@2 prices as explosive x2 (%d vs %d)", e2, ex2));
+    const CastList sp = compile({"fire@2", "projectile"});
+    const EffectInst* spray =
+        sp.casts.empty() ? nullptr : FindVerb(sp.casts[0].payload, SpellVerb::Spray);
+    check(spray && spray->mag == 2000 &&
+              EffectVolume(lib, *spray) == lib.budgets.sprayVoxels * 2,
+          "fire@2 sprays twice the voxels");
+
+    // A sustained mod carries its magnitude to the body.
+    const CastList au = compile({"float@0.5", "aura", "self"});
+    const EffectInst* su =
+        au.casts.empty() ? nullptr : FindVerb(au.casts[0].payload, SpellVerb::Sustain);
+    check(su && su->modField == ModField::Gravity && su->modMag == 500,
+          "float@0.5 aura carries magnitude 0.5 to the status");
+  }
+
+  // 3. THE WORD PRICE IS CONVEX AND MONOTONE for every graded glyph, and at 1
+  // it is the authored word cost exactly.
+  int graded = 0;
+  for (const GlyphDef& g : lib.glyphs) {
+    check(MagnitudeWordCost(g.word, kMagOne) == g.word, g.id + ": word cost at 1 moved");
+    if (!g.graded) continue;
+    graded++;
+    int32_t prev = -1, prevDelta = -1;
+    // A SIGNED component prices by |magnitude|: walk its non-negative half.
+    for (int32_t m = std::max(g.magMin, 0); m <= g.magMax; m += g.magStep) {
+      const int32_t w = MagnitudeWordCost(g.word, m);
+      if (prev >= 0) {
+        check(w >= prev, Format("%s: word cost falls at %d", g.id.c_str(), m));
+        // Convex up to the ceil rounding: each step costs at least what the
+        // previous one did, less one.
+        if (prevDelta >= 0)
+          check(w - prev >= prevDelta - 1,
+                Format("%s: word cost not convex at %d", g.id.c_str(), m));
+        prevDelta = w - prev;
+      }
+      prev = w;
+    }
+  }
+  for (const char* id : {"shotgun", "twin", "projectile", "lane"}) {
+    const GlyphDef* g = lib.At(lib.Find(id));
+    check(g && !g->graded, std::string(id) + " must be ungraded");
+  }
+
+  // 3b. M2 - ONE SIGNED COMPONENT PER QUANTITY. `lift` at its default is
+  // `float`, below zero it is `heavy`; `speed` at its default is `swift` and
+  // below 1 it slows; `wind` at its default pushes and at -1 is `implode`. The
+  // replaced words still load (old pages) and are hidden from the column.
+  {
+    const DeliveryRec* fl = flight(compile({"float", "projectile"}));
+    const DeliveryRec* li = flight(compile({"lift", "projectile"}));
+    const DeliveryRec* hv = flight(compile({"heavy", "projectile"}));
+    const DeliveryRec* ln = flight(compile({"lift@-1", "projectile"}));
+    const DeliveryRec* lh = flight(compile({"lift@0.5", "projectile"}));
+    check(fl && li && fl->gravityMille == li->gravityMille, "lift at its default is float");
+    check(hv && ln && hv->gravityMille == ln->gravityMille, "lift@-1 is heavy");
+    check(lh && lh->gravityMille == proj->gravityMille - 500, "lift@0.5 takes half a g");
+    const DeliveryRec* sw = flight(compile({"swift", "projectile"}));
+    const DeliveryRec* sd = flight(compile({"speed", "projectile"}));
+    const DeliveryRec* sh = flight(compile({"speed@0.5", "projectile"}));
+    check(sw && sd && sw->speedFx == sd->speedFx, "speed at its default is swift");
+    check(sh && sh->speedFx == proj->speedFx / 2, "speed@0.5 halves the speed");
+    auto windOf = [&](const std::vector<std::string>& w) -> int32_t {
+      const CastList l = compile(w);
+      if (l.casts.empty()) return 0;
+      SpellEmission out;
+      ApplySpellEffect(lib, l.casts[0].payload, {0, 0, 0}, {kSpellFxOne, 0, 0}, 1000, out);
+      return out.winds.empty() ? 0 : out.winds[0].strengthQ;
+    };
+    const int32_t wp = windOf({"wind"}), wn = windOf({"wind@-1"}), wi = windOf({"implode"});
+    check(wp > 0 && wn < 0 && wn == -wp, Format("wind pushes, wind@-1 pulls (%d, %d)", wp, wn));
+    check(wn == wi, Format("wind@-1 is implode (%d vs %d)", wn, wi));
+    check(compile({"wind@-1"}).tariff == compile({"wind"}).tariff,
+          "a pull costs what the push does");
+    for (const char* id : {"float", "heavy", "swift", "slow", "implode"}) {
+      const GlyphDef* g = lib.At(lib.Find(id));
+      check(g && g->hidden, std::string(id) + " is hidden from the word column");
+    }
+    for (const char* id : {"lift", "speed", "wind"}) {
+      const GlyphDef* g = lib.At(lib.Find(id));
+      check(g && !g->hidden && g->graded, std::string(id) + " is offered and graded");
+    }
+    check(Linearize(lib, ParseWords(lib, {"lift", "projectile"})) ==
+              std::vector<std::string>({"lift", "projectile"}),
+          "a signed component at its default writes no suffix");
+    check(CountWord(Linearize(lib, ParseWords(lib, {"lift@-1.5", "projectile"})), "lift@-1.5") == 1,
+          "a negative magnitude round-trips");
+  }
+
+  // 4. SERIALIZATION. Round trip, merge rule, ungraded suffix, clamp, snap.
+  {
+    const std::vector<std::string> w = {"float@0.5", "explosive@2", "projectile"};
+    const SpellTree t = ParseWords(lib, w);
+    const std::vector<std::string> back = Linearize(lib, t);
+    check(CountWord(back, "float@0.5") == 1 && CountWord(back, "explosive@2") == 1,
+          "linearize keeps magnitudes: [" + Join(back) + "]");
+    check(GraphTreeKey(lib, ParseWords(lib, back)) == GraphTreeKey(lib, t),
+          "a magnitude round-trips through words");
+    const SpellTree merged = ParseWords(lib, {"float@0.5", "float@0.5", "projectile"});
+    const SpellTree apart = ParseWords(lib, {"float@0.5", "float", "projectile"});
+    const std::vector<std::string> lm = Linearize(lib, merged), la = Linearize(lib, apart);
+    check(CountWord(lm, "float@0.5") == 2, "equal magnitudes merge: [" + Join(lm) + "]");
+    check(CountWord(la, "float@0.5") == 1 && CountWord(la, "float") == 1,
+          "unequal magnitudes stay two items: [" + Join(la) + "]");
+    const DeliveryRec* ap = flight(LowerSpell(lib, apart));
+    check(ap && ap->gravityMille == proj->gravityMille - 1500, "float@0.5 + float = -1.5 g");
+    check(Linearize(lib, ParseWords(lib, {"shotgun@3", "projectile@2"})) ==
+              std::vector<std::string>({"shotgun", "projectile"}),
+          "an ungraded word's suffix is dropped");
+    check(CountWord(Linearize(lib, ParseWords(lib, {"explosive@99", "projectile"})),
+                    "explosive@4") == 1,
+          "a magnitude past the range clamps to its max");
+    check(CountWord(Linearize(lib, ParseWords(lib, {"explosive@0.3", "projectile"})),
+                    "explosive@0.25") == 1,
+          "a magnitude off the lattice snaps to the step");
+    check(CountWord(Linearize(lib, ParseWords(lib, {"explosive@banana", "projectile"})),
+                    "explosive") == 1,
+          "a malformed magnitude reads as 1");
+    // A grimoire page carries magnitudes through its expansion.
+    Grimoire gr;
+    GrimoirePage pg;
+    pg.name = "mag-test";
+    pg.words = {"fire@2", "projectile"};
+    gr.pages.push_back(pg);
+    const GrimoireExpansion ex = ExpandWords(lib, gr, {"mag-test"}, kSpellStackMax);
+    check(ex.spoken.size() == 2 && ex.mags.size() == 2 && ex.mags[0] == 2000 &&
+              ex.mags[1] == kMagOne,
+          "ExpandWords carries a page's magnitudes");
+  }
+
+  // 5. THE PAGE OP: the wheel's SetMagnitude is total and self-proving.
+  {
+    const SpellTree t = ParseWords(lib, {"explosive", "projectile"});
+    int word = -1, box = -1;
+    for (size_t i = 0; i < t.nodes.size(); i++) {
+      if (t.nodes[i].box && t.nodes[i].glyph >= 0) box = (int)i;
+      const GlyphDef* gd = lib.At(t.nodes[i].glyph);
+      if (!t.nodes[i].box && !t.nodes[i].group && gd && gd->id == "explosive") word = (int)i;
+    }
+    const EditResult up = SetMagnitude(lib, t, word, 2000);
+    check(up.ok && CountWord(up.words, "explosive@2") == 1,
+          "SetMagnitude writes explosive@2: " + (up.ok ? Join(up.words) : up.why));
+    const EditResult onBox = SetMagnitude(lib, t, box, 2000);
+    check(!onBox.ok && !onBox.why.empty(), "SetMagnitude on a box refuses with a reason");
+    const SpellTree top = ParseWords(lib, {"explosive@4", "projectile"});
+    int w4 = -1;
+    for (size_t i = 0; i < top.nodes.size(); i++)
+      if (!top.nodes[i].box && top.nodes[i].mag == 4000) w4 = (int)i;
+    const EditResult past = SetMagnitude(lib, top, w4, 4250);
+    check(!past.ok && past.why.find("higher") != std::string::npos,
+          "SetMagnitude past the max refuses naming the limit: " + past.why);
+    // And the graph cell shows it.
+    if (up.ok) {
+      const SpellGraph g = BuildGraph(lib, LowerSpell(lib, ParseWords(lib, up.words)));
+      bool seen = false;
+      for (const SpellGraphNode& n : g.nodes)
+        if (n.kind == GraphKind::Word && n.mag == 2000 && n.graded &&
+            n.magLabel.find("power") != std::string::npos)
+          seen = true;
+      check(seen, "the graph's explosive cell carries magnitude 2 and reads as power");
+    }
+  }
+
+  detail = Format("%d compat pairs, %d graded glyphs, %d checks", compat, graded, checks);
+  std::printf("spell-magnitude: %s (%d @1 pairs identical, %d graded glyphs priced, %d checks)\n",
+              ok ? "PASS" : "FAIL", compat, graded, checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SpellGraphGates() {
@@ -1087,6 +1690,8 @@ const std::vector<Gate>& SpellGraphGates() {
       // No deps: CPU-only over glyphs.json, the generated oracle and its own
       // fixtures. Nothing it does is visible to any later gate.
       {"spell-graph", "spell", {}, false, GateSpellGraph},
+      // CPU-only as well: magnitudes, over glyphs.json and its own fixtures.
+      {"spell-magnitude", "spell", {}, false, GateSpellMagnitude},
   };
   return g;
 }

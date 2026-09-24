@@ -541,6 +541,13 @@ bool LoadItems(const std::string& dir, size_t materialCount,
       d.container.applyCells = std::clamp(c.value("applyCells", 4), 1, 128);
       d.container.pourRange = MetresToCells(c.value("pourRangeM", 2.0f));
       d.container.pourSpeed = MetresToCells(c.value("pourSpeedMps", 1.5f));
+      d.container.aimDist = MetresToCells(std::max(0.1f, c.value("aimM", 1.0f)));
+      d.container.throwSpeed = MetresToCells(std::max(0.0f, c.value("throwSpeedMps", 0.0f)));
+      d.container.throwMinSpeed = std::min(
+          d.container.throwSpeed,
+          MetresToCells(std::max(0.0f, c.value("throwMinSpeedMps", 0.0f))));
+      d.container.throwChargeSec = std::max(0.05f, c.value("throwChargeSec", 1.0f));
+      d.container.breakSpeed = MetresToCells(std::max(0.0f, c.value("breakSpeedMps", 0.0f)));
       if (d.container.holds == 0 || d.container.capacity == 0) {
         errors += "items: \"" + d.name +
                   "\" is a container with no `holds` or no `capacity` -- skipped\n";

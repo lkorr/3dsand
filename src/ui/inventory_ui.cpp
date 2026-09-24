@@ -399,6 +399,26 @@ using ui::GlyphInfoBox;
 // frame: the real rig, with its real damage, its real pose and whatever is in
 // its hand. Nothing here knows any of that — which is the point, and is why a
 // severed arm shows up in the panel with no UI code for severed arms.
+// WHICH LIMB IS UNDER A SCREEN POINT: the smallest projected box containing
+// it, so a hand wins over the arm it overlaps. The one answer every portrait
+// click and every pick highlight uses, so what lights up is what a click hits.
+int LimbAtPoint(const UIState& s, ImVec2 at, ImVec2 size, ImVec2 m) {
+  const float mx = (m.x - at.x) / size.x;
+  const float my = (m.y - at.y) / size.y;
+  int best = -1;
+  float bestArea = 1e9f;
+  for (int i = 0; i < UIState::kSlotCount; i++) {
+    const UIState::BodyPartUI& b = s.body[i];
+    if (!b.present || b.severed || !b.projValid) continue;
+    if (mx < b.projMin[0] || mx > b.projMax[0]) continue;
+    if (my < b.projMin[1] || my > b.projMax[1]) continue;
+    const float area = (b.projMax[0] - b.projMin[0]) *
+                       (b.projMax[1] - b.projMin[1]);
+    if (area < bestArea) { bestArea = area; best = i; }
+  }
+  return best;
+}
+
 void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 br(at.x + size.x, at.y + size.y);
@@ -408,7 +428,8 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   ImGui::SetCursorScreenPos(at);
   ImGui::InvisibleButton("##portrait", size,
                          ImGuiButtonFlags_MouseButtonLeft |
-                         ImGuiButtonFlags_MouseButtonRight);
+                         ImGuiButtonFlags_MouseButtonRight |
+                         ImGuiButtonFlags_MouseButtonMiddle);
   const bool hovered = ImGui::IsItemHovered();
   // DEAD IS NOT STILL. The portrait keeps rendering after a death and keeps
   // orbiting with it — what is frozen is the body's POSE, not the picture
@@ -416,10 +437,18 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   // as it does on a living body. The one exception is the head look at the
   // bottom: there is no rig left to turn a head.
   const bool dead = s.deathScreen;
-  const bool dragL = ImGui::IsItemActive() &&
-                     ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f);
-  const bool dragR = ImGui::IsItemActive() &&
-                     ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f);
+  // POUR MODE: a filled vessel in hand (and no sentence spoken, which would
+  // own the click) turns the left button into the brush. The camera moves to
+  // the other two buttons, the way a modelling tool keeps its paint button
+  // free: right-drag orbits, middle-drag pans.
+  const bool pourMode = s.bodyValid && !dead && !s.applyText.empty() &&
+                        s.spellText.empty();
+  const bool active = ImGui::IsItemActive();
+  const bool dragL = active && ImGui::IsMouseDragging(ImGuiMouseButton_Left, 0.0f);
+  const bool dragR = active && ImGui::IsMouseDragging(ImGuiMouseButton_Right, 0.0f);
+  const bool dragM = active && ImGui::IsMouseDragging(ImGuiMouseButton_Middle, 0.0f);
+  const bool orbit = pourMode ? dragR : dragL;
+  const bool pan = pourMode ? dragM : (dragR || dragM);
 
   if (s.portraitTex) {
     dl->AddImage((ImTextureID)s.portraitTex, at, br);
@@ -433,21 +462,33 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   ui::InnerShadow(dl, at, br, 16.0f, 0.55f);
   ui::Grain(dl, at, br, 0.035f);
 
-  // ORBIT (left drag).
-  if (dragL) {
+  // ORBIT (left drag; right drag while pouring).
+  if (orbit) {
     const ImVec2 d = ImGui::GetIO().MouseDelta;
     s.portraitYaw -= d.x * 0.012f;
     s.portraitPitch = std::clamp(s.portraitPitch - d.y * 0.008f, -0.9f, 0.9f);
   }
-  // PAN (right drag): instant — writes both current and target.
-  if (dragR) {
+  // PAN (right or middle drag; middle only while pouring): instant — writes
+  // both current and target.
+  if (pan) {
     const ImVec2 d = ImGui::GetIO().MouseDelta;
     const float dx = -d.x * 0.006f, dy = d.y * 0.006f;
     s.portraitPanX += dx;  s.portraitPanXTarget += dx;
     s.portraitPanY += dy;  s.portraitPanYTarget += dy;
   }
   // ZOOM (scroll wheel): instant — writes both current and target.
-  if (hovered) {
+  // While pouring the wheel (and [ ]) is the brush size, and ctrl+wheel is
+  // the zoom: size is what a pour changes most, and it is also how much the
+  // flask gives up (PourBrushCellsPerSec).
+  if (hovered && pourMode) {
+    float grow = 0.0f;
+    if (!ImGui::GetIO().KeyCtrl) grow = ImGui::GetIO().MouseWheel;
+    if (ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) grow -= 1.0f;
+    if (ImGui::IsKeyPressed(ImGuiKey_RightBracket)) grow += 1.0f;
+    if (grow != 0.0f)
+      s.pourRadius = std::clamp(s.pourRadius * std::pow(1.25f, grow), 0.1f, 4.0f);
+  }
+  if (hovered && (!pourMode || ImGui::GetIO().KeyCtrl)) {
     const float wheel = ImGui::GetIO().MouseWheel;
     if (wheel != 0.0f) {
       const float factor = std::pow(1.15f, wheel);
@@ -458,22 +499,9 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   // DOUBLE-CLICK A LIMB to zoom in on it. Detected here rather than from a
   // separate button layer because the portrait's own InvisibleButton covers
   // the whole area and eats the click — a second button on top never sees it.
-  if (hovered && s.bodyValid &&
+  if (hovered && s.bodyValid && !pourMode &&
       ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-    const ImVec2 m = ImGui::GetMousePos();
-    const float mx = (m.x - at.x) / size.x;
-    const float my = (m.y - at.y) / size.y;
-    int best = -1;
-    float bestArea = 1e9f;
-    for (int i = 0; i < UIState::kSlotCount; i++) {
-      const UIState::BodyPartUI& b = s.body[i];
-      if (!b.present || b.severed || !b.projValid) continue;
-      if (mx < b.projMin[0] || mx > b.projMax[0]) continue;
-      if (my < b.projMin[1] || my > b.projMax[1]) continue;
-      const float area = (b.projMax[0] - b.projMin[0]) *
-                         (b.projMax[1] - b.projMin[1]);
-      if (area < bestArea) { bestArea = area; best = i; }
-    }
+    const int best = LimbAtPoint(s, at, size, ImGui::GetMousePos());
     if (best >= 0) {
       s.portraitFocusSlot = best;
       s.portraitPivotSlot = best;
@@ -489,27 +517,37 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
       ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
       ImGui::GetIO().MouseDragMaxDistanceSqr[0] < 9.0f &&
       ImGui::GetIO().MouseClickedCount[0] < 2) {
-    const ImVec2 m = ImGui::GetMousePos();
-    const float mx = (m.x - at.x) / size.x;
-    const float my = (m.y - at.y) / size.y;
-    int best = -1;
-    float bestArea = 1e9f;
-    for (int i = 0; i < UIState::kSlotCount; i++) {
-      const UIState::BodyPartUI& b = s.body[i];
-      if (!b.present || b.severed || !b.projValid) continue;
-      if (mx < b.projMin[0] || mx > b.projMax[0]) continue;
-      if (my < b.projMin[1] || my > b.projMax[1]) continue;
-      const float area = (b.projMax[0] - b.projMin[0]) *
-                         (b.projMax[1] - b.projMin[1]);
-      if (area < bestArea) { bestArea = area; best = i; }
-    }
+    const int best = LimbAtPoint(s, at, size, ImGui::GetMousePos());
     s.inspectSelected = best;
+    // The same click CASTS when there is a sentence to cast (InspectCastPicks).
+    // Latched here and not by a button of its own: that would sit on top of
+    // this one, and ImGui gives an overlapped click to whichever item was
+    // submitted first, so it never saw it. A flask pours through the brush
+    // below instead, not through a click on a part.
+    if (best >= 0 && !s.spellText.empty()) {
+      s.castAtPart.pending = true;
+      s.castAtPart.slot = best;
+    }
+  }
+
+  // THE POUR BRUSH. Only WHERE, normalized; main.cpp owns the camera, casts
+  // the ray and mirrors the hit back for the ring drawn here. Held, not
+  // clicked: every tick the button is down pours a little more.
+  s.pourBrush.hover = hovered && pourMode;
+  s.pourBrush.active = s.pourBrush.hover && active &&
+                       ImGui::IsMouseDown(ImGuiMouseButton_Left);
+  if (s.pourBrush.hover) {
+    const ImVec2 m = ImGui::GetMousePos();
+    s.pourBrush.uv[0] = (m.x - at.x) / size.x;
+    s.pourBrush.uv[1] = (m.y - at.y) / size.y;
   }
 
   // HEAD LOOK: only while not dragging at all, and never on a corpse — the
   // head is not going to follow the cursor, and main.cpp would be feeding a
   // look target to a rig that no longer exists.
-  s.portraitLookValid = hovered && !dragL && !dragR && !dead;
+  // Nor while pouring: a head that turned to follow the brush would move the
+  // skin out from under it.
+  s.portraitLookValid = hovered && !dragL && !dragR && !dragM && !dead && !pourMode;
   if (s.portraitLookValid) {
     const ImVec2 m = ImGui::GetMousePos();
     s.portraitLook[0] = std::clamp((m.x - at.x) / size.x * 2.0f - 1.0f, -1.0f,
@@ -521,6 +559,39 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
   if (hovered) ui::Glow(dl, at, br, ui::ColGold(), 6.0f, 0.22f);
   ui::Draw9(dl, "panel_inner", at, br);
 
+  // The brush ring, where the ray met the skin, sized to the disc it will
+  // coat. Pixel dots rather than an anti-aliased circle: the UI is pixel art.
+  if (s.pourBrush.hover && s.pourCursorValid) {
+    const ImVec2 c(at.x + s.pourCursorUV[0] * size.x,
+                   at.y + s.pourCursorUV[1] * size.y);
+    const float rpx = std::max(2.0f, s.pourCursorR * size.x);
+    const ImU32 col = Fade(s.applyColor ? s.applyColor : ui::ColGold(),
+                           s.pourBrush.active ? 1.0f : 0.75f);
+    const int dots = std::clamp((int)(rpx * 0.9f), 8, 64);
+    for (int k = 0; k < dots; k++) {
+      const float a = 6.2831853f * (float)k / (float)dots;
+      const float x = std::floor(c.x + std::cos(a) * rpx);
+      const float y = std::floor(c.y + std::sin(a) * rpx);
+      dl->AddRectFilled(ImVec2(x - 1, y - 1), ImVec2(x + 1, y + 1), col);
+    }
+    dl->AddRectFilled(ImVec2(std::floor(c.x) - 1, std::floor(c.y) - 1),
+                      ImVec2(std::floor(c.x) + 1, std::floor(c.y) + 1), col);
+  }
+  // THE BRUSH'S SIZE AND WHAT IT COSTS, always up while pouring is possible:
+  // a bigger disc empties the flask faster, and that should be read before
+  // the button goes down, not discovered from the fill text afterwards.
+  if (pourMode && hovered) {
+    char line[64];
+    std::snprintf(line, sizeof line, "brush %.2f  .  %.1f cells/s",
+                  s.pourRadius, s.pourDrainPerSec);
+    ImGui::PushFont(ui::FontSmall());
+    ui::ShadowText(dl, ImVec2(at.x + 8, at.y + 8),
+                   Fade(s.applyColor ? ui::Mix(s.applyColor, IM_COL32_WHITE, 0.4f)
+                                     : ui::ColParchDim(), 0.9f),
+                   line);
+    ImGui::PopFont();
+  }
+
   // RESET button — shown when the target differs from the default (not the
   // current, so it stays visible while the animation is still closing).
   const bool dirty = s.portraitZoomTarget != 1.0f ||
@@ -530,13 +601,14 @@ void Portrait(UIState& s, ImVec2 at, ImVec2 size) {
     if (ui::Button("##portraitreset", ImVec2(br.x - 54, br.y - 28), "reset",
                    false, 48))
       s.portraitReset = true;
-  } else if (hovered && !dragL && !dragR) {
+  } else if (hovered && !dragL && !dragR && !dragM) {
     // On a corpse the hint says WHAT is being turned, because a body that
     // orbits normally while everything else about it is frozen invites the
     // reading that it is still live.
     const char* hint =
-        dead ? "as you fell  .  drag to turn  .  scroll to zoom"
-             : "drag to turn  .  scroll to zoom  .  right-drag to pan";
+        dead       ? "as you fell  .  drag to turn  .  scroll to zoom"
+        : pourMode ? "hold to pour  .  scroll size  .  right-drag turn"
+                   : "drag to turn  .  scroll to zoom  .  right-drag to pan";
     ImGui::PushFont(ui::FontSmall());
     const ImVec2 ts = ImGui::CalcTextSize(hint);
     ui::ShadowText(dl, ImVec2(br.x - ts.x - 8, br.y - ts.y - 8),
@@ -632,83 +704,42 @@ void InspectOverlay(const UIState& s, ImVec2 at, ImVec2 size) {
   }
 }
 
-// CAST ON A PART. With a sentence on the stack, every present limb of the
-// inspector becomes a target: click it and the spell resolves there with
-// `self` (docs/PLAN_magic_grammar.md §7). The panel never touches the VM — it
-// latches the slot, and main.cpp turns the slot into a position and casts.
-void InspectCastPicks(UIState& s, ImVec2 at, ImVec2 size) {
-  if (!s.bodyValid || s.spellText.empty()) return;
-  ImDrawList* dl = ImGui::GetWindowDrawList();
+// The hover frame both pick layers draw: the limb under the cursor, clamped to
+// the picture, outlined in pixels, with a one-line tip. DRAW ONLY — the click
+// is latched by Portrait's own button (see the note there), resolved with the
+// same LimbAtPoint, so the framed limb is the one a click hits.
+void PickHover(const UIState& s, ImVec2 at, ImVec2 size, ImU32 base,
+                      const char* verb, const std::string& what) {
+  const ImVec2 m = ImGui::GetMousePos();
+  if (!ImGui::IsWindowHovered() ||
+      !ImGui::IsMouseHoveringRect(at, ImVec2(at.x + size.x, at.y + size.y)))
+    return;
+  const int i = LimbAtPoint(s, at, size, m);
+  if (i < 0) return;
+  const UIState::BodyPartUI& b = s.body[i];
+  ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
+  ImVec2 p1(at.x + b.projMax[0] * size.x, at.y + b.projMax[1] * size.y);
+  if (!ClipToPortrait(at, size, p0, p1)) return;
   const float flash = 0.5f + 0.5f * (float)std::sin(ImGui::GetTime() * 3.0);
-  for (int i = 0; i < UIState::kSlotCount; i++) {
-    const UIState::BodyPartUI& b = s.body[i];
-    if (!b.present || b.severed || !b.projValid) continue;
-    ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
-    ImVec2 p1(at.x + b.projMax[0] * size.x, at.y + b.projMax[1] * size.y);
-    // CLAMPED, not merely clipped: this one has a hit box on it, and a target
-    // you cannot see is a target you cannot have meant to click.
-    if (!ClipToPortrait(at, size, p0, p1)) continue;
-    if (p1.x - p0.x < 2.0f || p1.y - p0.y < 2.0f) continue;
-    ImGui::SetCursorScreenPos(p0);
-    ImGui::PushID(1000 + i);
-    ImGui::InvisibleButton("##castpart", ImVec2(p1.x - p0.x, p1.y - p0.y));
-    const bool hot = ImGui::IsItemHovered();
-    if (hot) {
-      // A pixel outline, not an anti-aliased stroke: the frame reads as "this
-      // is where it lands".
-      const ImU32 col = Fade(IM_COL32(150, 200, 255, 255), 0.5f + 0.5f * flash);
-      dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p1.x, p0.y + 2), col);
-      dl->AddRectFilled(ImVec2(p0.x, p1.y - 2), ImVec2(p1.x, p1.y), col);
-      dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p0.x + 2, p1.y), col);
-      dl->AddRectFilled(ImVec2(p1.x - 2, p0.y), ImVec2(p1.x, p1.y), col);
-      BeginTip();
-      ImGui::Text("cast %s here", s.spellText.c_str());
-      EndTip();
-    }
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-      s.castAtPart.pending = true;
-      s.castAtPart.slot = i;
-    }
-    ImGui::PopID();
-  }
+  const ImU32 col = Fade(base, 0.5f + 0.5f * flash);
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p1.x, p0.y + 2), col);
+  dl->AddRectFilled(ImVec2(p0.x, p1.y - 2), ImVec2(p1.x, p1.y), col);
+  dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p0.x + 2, p1.y), col);
+  dl->AddRectFilled(ImVec2(p1.x - 2, p0.y), ImVec2(p1.x, p1.y), col);
+  BeginTip();
+  ImGui::Text("%s %s here", verb, what.c_str());
+  EndTip();
 }
 
-// POUR ON A PART. The vessel twin of InspectCastPicks: with a filled flask
-// selected in the hotbar (and no sentence spoken, which keeps the click
-// unambiguous), every present limb is a target and a click latches the slot.
-// main.cpp hands it to the tick, which spends the flask and runs
-// MobSystem::DouseLimb (game/container.h).
-void InspectApplyPicks(UIState& s, ImVec2 at, ImVec2 size) {
-  if (!s.bodyValid || s.applyText.empty() || !s.spellText.empty()) return;
-  ImDrawList* dl = ImGui::GetWindowDrawList();
-  const float flash = 0.5f + 0.5f * (float)std::sin(ImGui::GetTime() * 3.0);
-  const ImU32 base = s.applyColor ? s.applyColor : IM_COL32(150, 200, 255, 255);
-  for (int i = 0; i < UIState::kSlotCount; i++) {
-    const UIState::BodyPartUI& b = s.body[i];
-    if (!b.present || b.severed || !b.projValid) continue;
-    ImVec2 p0(at.x + b.projMin[0] * size.x, at.y + b.projMin[1] * size.y);
-    ImVec2 p1(at.x + b.projMax[0] * size.x, at.y + b.projMax[1] * size.y);
-    if (!ClipToPortrait(at, size, p0, p1)) continue;
-    if (p1.x - p0.x < 2.0f || p1.y - p0.y < 2.0f) continue;
-    ImGui::SetCursorScreenPos(p0);
-    ImGui::PushID(2000 + i);
-    ImGui::InvisibleButton("##applypart", ImVec2(p1.x - p0.x, p1.y - p0.y));
-    if (ImGui::IsItemHovered()) {
-      const ImU32 col = Fade(base, 0.5f + 0.5f * flash);
-      dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p1.x, p0.y + 2), col);
-      dl->AddRectFilled(ImVec2(p0.x, p1.y - 2), ImVec2(p1.x, p1.y), col);
-      dl->AddRectFilled(ImVec2(p0.x, p0.y), ImVec2(p0.x + 2, p1.y), col);
-      dl->AddRectFilled(ImVec2(p1.x - 2, p0.y), ImVec2(p1.x, p1.y), col);
-      BeginTip();
-      ImGui::Text("pour %s here", s.applyText.c_str());
-      EndTip();
-    }
-    if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-      s.applyAtPart.pending = true;
-      s.applyAtPart.slot = i;
-    }
-    ImGui::PopID();
-  }
+// CAST ON A PART. With a sentence on the stack, every present limb of the
+// inspector becomes a target: click it and the spell resolves there with
+// `self` (docs/PLAN_magic_grammar.md §7). The panel never touches the VM — a
+// click latches the slot (in Portrait), and main.cpp turns the slot into a
+// position and casts.
+void InspectCastPicks(UIState& s, ImVec2 at, ImVec2 size) {
+  if (!s.bodyValid || s.spellText.empty()) return;
+  PickHover(s, at, size, IM_COL32(150, 200, 255, 255), "cast", s.spellText);
 }
 
 // WHICH WORN PIECE COVERS WHICH LIMB. The one place health and gear meet: a
@@ -952,7 +983,7 @@ float GlyphTableHeight(const UIState& s, int perRow) {
   for (int c = 0; c < 5; c++) {
     int n = 0;
     for (const UIState::GlyphUI& g : s.glyphsOwned)
-      if (g.type == kSortOrder[c]) n++;
+      if (g.type == kSortOrder[c] && !g.hidden) n++;
     if (n == 0) continue;
     h += ((n + perRow - 1) / perRow) * kCell + 8;
   }
@@ -975,7 +1006,7 @@ void GlyphTable(UIState& s, ImVec2 at, ImVec2 size, int perRow) {
       const int sort = kSortOrder[c];
       int n = 0;
       for (const UIState::GlyphUI& g : s.glyphsOwned)
-        if (g.type == sort) n++;
+        if (g.type == sort && !g.hidden) n++;
       if (n == 0) continue;
       const int rows = (n + perRow - 1) / perRow;
       const float bandH = rows * kCell - (kCell - kSlot);
@@ -991,7 +1022,7 @@ void GlyphTable(UIState& s, ImVec2 at, ImVec2 size, int perRow) {
       int k = 0;
       for (int i = 0; i < (int)s.glyphsOwned.size(); i++) {
         const UIState::GlyphUI& g = s.glyphsOwned[i];
-        if (g.type != sort) continue;
+        if (g.type != sort || g.hidden) continue;
         const ImVec2 p(base.x + kGutter + (k % perRow) * kCell, y + (k / perRow) * kCell);
         k++;
         GlyphCell(s, i, g, cd, p, sort);
@@ -1632,7 +1663,7 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
           else if (pg) ImGui::Text("[%s]  a page", w.c_str());
           else ImGui::Text("%s  (a word that no longer exists)", w.c_str());
           ImGui::PopStyleColor();
-          if (g) ImGui::TextDisabled("%s  .  %s", kSortLabel[g->type], g->desc.c_str());
+          if (g) ImGui::TextDisabled("%s  .  %s", ui::SortLabel(g->type), g->desc.c_str());
           else if (pg) ImGui::TextDisabled("%s", pg->readout.c_str());
           if (!readOnly)
             ImGui::TextDisabled("drag to reorder (a neighbour swaps)  .  ctrl+drag to copy  .  "
@@ -2118,13 +2149,23 @@ void VitalsColumn(UIState& s, ImVec2 at, ImVec2 size) {
     if (s.healthCap > 0 && s.healthCap < s.healthMax)
       chip(ui::ColChar(), false, "BURNT CAP %d", s.healthCap);
     if (s.stainFrac >= s.stainHudMin && s.stainColor != 0) {
-      char up[sizeof s.stainLabel];
-      size_t k = 0;
-      for (; k + 1 < sizeof up && s.stainLabel[k]; k++)
-        up[k] = (char)std::toupper((unsigned char)s.stainLabel[k]);
-      up[k] = '\0';
-      chip(ui::Mix(s.stainColor, IM_COL32_WHITE, 0.35f), false, "%s %.0f%%",
-           k ? up : "COATED", s.stainFrac * 100.0f);
+      // One chip per substance (UIState::coats), not one for the heaviest.
+      int named = 0;
+      for (int ci = 0; ci < s.coatCount; ci++) {
+        const UIState::CoatName& c = s.coats[ci];
+        if (c.color == 0 || c.frac < 0.005f) continue;
+        char up[sizeof c.label];
+        size_t k = 0;
+        for (; k + 1 < sizeof up && c.label[k]; k++)
+          up[k] = (char)std::toupper((unsigned char)c.label[k]);
+        up[k] = '\0';
+        chip(ui::Mix(c.color, IM_COL32_WHITE, 0.35f), false, "%s %.0f%%",
+             k ? up : "COATED", c.frac * 100.0f);
+        named++;
+      }
+      if (named == 0)
+        chip(ui::Mix(s.stainColor, IM_COL32_WHITE, 0.35f), false,
+             "COATED %.0f%%", s.stainFrac * 100.0f);
     }
     if (!s.locoState.empty())
       chip(ui::ColParchDim(), false, "%s", s.locoState.c_str());
@@ -2911,7 +2952,6 @@ void DrawInventoryScreen(UIState& s) {
     if (s.inspectMode) {
       InspectOverlay(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
       InspectCastPicks(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
-      InspectApplyPicks(s, ImVec2(portX, portY), ImVec2(kPortraitW, kPortraitH));
     }
     // A hovered armour slot shades the limbs it is standing in front of. This
     // is the other half of the COVER section in the health column and the same
@@ -2949,22 +2989,96 @@ void DrawInventoryScreen(UIState& s) {
     }
     y = portY + kPortraitH + 16;
 
-    // Sheath + quick slots: what is on your person but not in your hand.
+    // FLASKS: every vessel you carry, pack first, then hotbar - the same
+    // stacks, not copies, so a drag from here is a drag from where it lives.
+    // CLICK ONE TO USE IT on yourself: the portrait turns into the pour brush
+    // for that flask (Portrait's pourMode), whether or not it is in your hand.
+    // "put away" hands the portrait back to the camera. The Sheath and Quick
+    // equipment slots this row used to show still exist; nothing fills them.
     y = ui::Subheading(dl, ImVec2(wp.x + kPad, y), leftBase - kPad * 2,
-                       "ON YOUR PERSON");
+                       "FLASKS");
     y += 2;
-    for (int k = 0; k < 5; k++) {
-      const int idx = 8 + k;  // Sheath, Quick0..3
-      const UIState::EquipSlotUI& d =
-          idx < (int)s.equipDefs.size() ? s.equipDefs[idx]
-                                        : UIState::EquipSlotUI{};
-      char id[32];
-      std::snprintf(id, sizeof id, "eq%d", idx);
-      ItemSlot(s, id,
-               ImVec2(wp.x + kPad + k * (kSlot + kSlotGap), y),
-               SlotOr(s.equipSlots, idx), KitRef{KitSpace::Equip, idx},
-               d.icon.c_str(), d.acceptsAnything, d.why.c_str(), false,
-               &d.accepts);
+    {
+      std::vector<KitRef> flasks;
+      for (int i = 0; i < (int)s.bagSlots.size(); i++)
+        if (s.bagSlots[i].kind == "container")
+          flasks.push_back(KitRef{KitSpace::Bag, i});
+      for (int i = 0; i < (int)s.hotbarSlots.size(); i++)
+        if (s.hotbarSlots[i].kind == "container")
+          flasks.push_back(KitRef{KitSpace::Hotbar, i});
+      const bool inUse = s.activeVessel.Valid();
+      const char* offLabel = "put away";
+      const char* hint = "click one to use it";
+      ImGui::PushFont(ui::FontSmall());
+      const float offW = ImGui::CalcTextSize(offLabel).x + 24;
+      // The right end of the row is kept for the button (or the hint in its
+      // place), so choosing a flask never reflows the flasks.
+      const float reserve = std::max(offW, ImGui::CalcTextSize(hint).x) + kSlotGap;
+      ImGui::PopFont();
+      const float rowW = leftBase - kPad * 2;
+      const int fit =
+          std::max(1, (int)((rowW - reserve + kSlotGap) / (kSlot + kSlotGap)));
+      const int shown = std::min((int)flasks.size(), fit);
+      for (int k = 0; k < shown; k++) {
+        const KitRef r = flasks[k];
+        const UIState::KitSlotUI& it =
+            r.space == KitSpace::Bag ? s.bagSlots[r.index] : s.hotbarSlots[r.index];
+        char id[32];
+        std::snprintf(id, sizeof id, "flask%d_%d", (int)r.space, r.index);
+        const ImVec2 at(wp.x + kPad + k * (kSlot + kSlotGap), y);
+        const bool on = r == s.activeVessel;
+        ItemSlot(s, id, at, it, r, "", false, "", on);
+        // A click, not a press: the slot is also a drag source, and a drag
+        // that ends back on it must not toggle the choice.
+        if (!ImGui::GetDragDropPayload() &&
+            ImGui::IsMouseHoveringRect(at, ImVec2(at.x + kSlot, at.y + kSlot)) &&
+            ImGui::IsWindowHovered() &&
+            ImGui::IsMouseReleased(ImGuiMouseButton_Left) &&
+            ImGui::GetIO().MouseDragMaxDistanceSqr[0] < 9.0f)
+          s.activeVessel = on ? KitRef{} : r;
+        // The fill, as the HUD hotbar draws it: the one number that matters
+        // while pouring, readable without a tooltip.
+        if (it.fill >= 0.0f) {
+          const ImVec2 g0(at.x + 5, at.y + kSlot - 7);
+          const ImVec2 g1(at.x + kSlot - 5, at.y + kSlot - 4);
+          dl->AddRectFilled(g0, g1, Fade(ui::ColInk(), 0.8f));
+          if (it.fill > 0.0f)
+            dl->AddRectFilled(g0, ImVec2(std::floor(g0.x + (g1.x - g0.x) * it.fill), g1.y),
+                              on && s.applyColor ? s.applyColor : ui::ColGoldDim());
+        }
+      }
+      if (flasks.empty()) {
+        ImGui::PushFont(ui::FontSmall());
+        ui::ShadowText(dl, ImVec2(wp.x + kPad, y + kSlot * 0.5f - 7),
+                       Fade(ui::ColParchDim(), 0.8f), "no flasks carried");
+        ImGui::PopFont();
+      } else if (shown < (int)flasks.size()) {
+        char more[16];
+        std::snprintf(more, sizeof more, "+%d", (int)flasks.size() - shown);
+        ImGui::PushFont(ui::FontSmall());
+        ui::ShadowText(dl, ImVec2(wp.x + kPad + shown * (kSlot + kSlotGap) - kSlotGap + 2, y),
+                       ui::ColParchDim(), more);
+        ImGui::PopFont();
+      }
+      if (inUse) {
+        ImGui::PushFont(ui::FontSmall());
+        const float bh = ImGui::GetTextLineHeight() + 8;
+        if (ui::Button("##flaskoff",
+                       ImVec2(wp.x + kPad + rowW - offW,
+                              y + std::floor((kSlot - bh) * 0.5f)),
+                       offLabel, true, offW))
+          s.activeVessel = KitRef{};
+        if (ImGui::IsItemHovered())
+          Tip("Stop using this flask. The portrait goes back to turning, "
+              "panning and zooming.");
+        ImGui::PopFont();
+      } else if (!flasks.empty()) {
+        ImGui::PushFont(ui::FontSmall());
+        const ImVec2 ts = ImGui::CalcTextSize(hint);
+        ui::ShadowText(dl, ImVec2(wp.x + kPad + rowW - ts.x, y + (kSlot - ts.y) * 0.5f),
+                       Fade(ui::ColParchDim(), 0.8f), hint);
+        ImGui::PopFont();
+      }
     }
     y += kSlot + 18;
 
@@ -3467,4 +3581,93 @@ void DrawInventoryScreen(UIState& s) {
                       Fade(fresh ? ui::ColEmber() : ui::ColGoldDim(), 0.5f));
     ui::ShadowText(bg, tp, Fade(fresh ? ui::ColEmber() : ui::ColParchDim(), a), text);
   }
+}
+
+// ---- the HUD hotbar (ui/inventory_ui.h) -------------------------------------
+//
+// The pack's slot, minus everything interactive: the same recess, rim, icon,
+// dye chip and count badge, so a sword on the HUD is the sword in the pack.
+// The number each slot answers to sits in its top-left corner, and the
+// selected slot's name floats above the strip for a moment after it changes
+// -- the way you learn what you just switched to without looking down.
+void DrawHudHotbar(const UIState& s, ImDrawList* dl) {
+  const int n = (int)s.hotbarSlots.size();
+  if (n == 0) return;
+  const ImVec2 disp = ImGui::GetIO().DisplaySize;
+  constexpr float kGap = 4.0f, kBottom = 14.0f;
+  const float w = n * kSlot + (n - 1) * kGap;
+  const float x0 = std::floor((disp.x - w) * 0.5f);
+  const float y0 = std::floor(disp.y - kBottom - kSlot);
+  // The hand is only the hotbar with the melee tool up and magic off (the
+  // number row belongs to the brush or the glyphs otherwise), so the strip
+  // says so by dimming its selection rather than lying about what is held.
+  const bool live = s.tool == UIState::kToolMelee && !s.magicMode;
+  const int sel = s.itemSelected;
+
+  dl->AddRectFilled(ImVec2(x0 - 6, y0 - 6), ImVec2(x0 + w + 6, y0 + kSlot + 6),
+                    IM_COL32(0, 0, 0, 90));
+  ImGui::PushFont(ui::FontSmall());
+  for (int i = 0; i < n; i++) {
+    const UIState::KitSlotUI& item = s.hotbarSlots[i];
+    const ImVec2 at(x0 + i * (kSlot + kGap), y0);
+    const bool filled = !item.name.empty();
+    const bool isSel = live && i == sel;
+    const ui::SlotLook look = isSel    ? ui::SlotLook::Hover
+                              : filled ? ui::SlotLook::Filled
+                                       : ui::SlotLook::Empty;
+    ui::SlotSurface(dl, at, kSlot, look, isSel);
+    SlotRim(dl, at, look);
+    const ImVec2 mid(at.x + kSlot * 0.5f, at.y + kSlot * 0.5f);
+    if (filled) {
+      ui::DrawSpriteCentered(dl, ItemIcon(item.kind), ImVec2(mid.x + 1, mid.y + 1),
+                             Fade(ui::ColInk(), 0.7f));
+      ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid,
+                             item.dyeSwatch ? item.dyeSwatch : IM_COL32_WHITE);
+      if (item.dyeSwatch) {
+        dl->AddRectFilled(ImVec2(at.x + kSlot - 9, at.y + 3),
+                          ImVec2(at.x + kSlot - 3, at.y + 9), item.dyeSwatch);
+      }
+      if (item.count > 1) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "%d", item.count);
+        ui::CountBadge(dl, ImVec2(at.x + kSlot - 2, at.y + kSlot - 2), buf);
+      }
+      if (item.fill >= 0.0f) {
+        // The vessel's gauge: a 4 px bar along the slot's floor, whole pixels.
+        const float gx0 = at.x + 6, gx1 = at.x + kSlot - 6, gy = at.y + kSlot - 8;
+        dl->AddRectFilled(ImVec2(gx0, gy), ImVec2(gx1, gy + 4), IM_COL32(10, 10, 14, 220));
+        const float fx = std::floor(gx0 + (gx1 - gx0) * item.fill);
+        if (fx > gx0)
+          dl->AddRectFilled(ImVec2(gx0, gy), ImVec2(fx, gy + 4), IM_COL32(90, 160, 235, 255));
+      }
+    }
+    // The key: 1..9 then 0, the number row as it lies under the fingers.
+    char key[4];
+    std::snprintf(key, sizeof key, "%d", (i + 1) % 10);
+    ui::ShadowText(dl, ImVec2(at.x + 4, at.y + 2),
+                   isSel ? ui::ColGoldHi() : Fade(ui::ColParch(), 0.7f), key);
+  }
+  if (live && sel >= 0 && sel < n) {
+    // A gold frame round the hand, 2 px, outside the rim so it never covers
+    // the icon.
+    const ImVec2 at(x0 + sel * (kSlot + kGap), y0);
+    dl->AddRect(ImVec2(at.x - 3, at.y - 3), ImVec2(at.x + kSlot + 3, at.y + kSlot + 3),
+                ui::ColGoldHi(), 0.0f, 0, 2.0f);
+    // The name, fading 2 s after the selection last changed.
+    static int lastSel = -1;
+    static double changedAt = 0.0;
+    const double now = ImGui::GetTime();
+    if (sel != lastSel) {
+      lastSel = sel;
+      changedAt = now;
+    }
+    const float a = std::clamp(2.5f - (float)(now - changedAt), 0.0f, 1.0f);
+    const std::string& name = s.hotbarSlots[sel].name;
+    if (a > 0.0f && !name.empty()) {
+      const ImVec2 ts = ImGui::CalcTextSize(name.c_str());
+      ui::ShadowText(dl, ImVec2(std::floor((disp.x - ts.x) * 0.5f), y0 - 10 - ts.y),
+                     Fade(ui::ColParch(), a), name.c_str());
+    }
+  }
+  ImGui::PopFont();
 }

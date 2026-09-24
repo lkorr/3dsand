@@ -1109,9 +1109,17 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   // materials sharing a stain name share a slot and the last one wins, which
   // is correct — they are by definition the same stain.
   for (const auto& d : mats) {
-    uint32_t type = d.gpu.stainPack & kStainPackTypeMask;
+    // stainSlot, not the pack's type bits: a `bodyOnly` stain has a palette
+    // slot (bodies draw it) but no GPU type (the ground never gets it).
+    uint32_t type = d.stainSlot;
     if (type == 0) continue;
     table[kStainPaletteBase + type].stainColor = d.gpu.stainColor;
+    // ...and the body coat's glow + pulse in the palette entry's spare word
+    // (materials.h kCoatGlow*). Only microbody.wgsl reads it.
+    table[kStainPaletteBase + type]._r2 =
+        (d.coatGlow & kCoatGlowMask) |
+        (((uint32_t)std::lround(d.coatPulseHz * 100.0f) & kCoatPulseMask)
+         << kCoatPulseShift);
   }
 
   // Tint palette, same trick one range lower again (world.h): a MATF_TINTED
@@ -3411,6 +3419,17 @@ void Simulation::EnsureRenderPipelines(rhi::TextureFormat format) {
     d.fragmentEntry = "fsCurArrow";
     d.depth = dsWind;
     pool.Add([this, d] { debugCurrentDraw_ = device_.CreateRenderPipeline(d); });
+
+    // The vessel's pour-point sphere (DrawPourMarker). The wireframes' module
+    // and blend, the arrows' depth rule: a marker in the world is hidden by
+    // the world in front of it, and writes nothing so it never occludes.
+    d.label = "pourMarkerDraw";
+    d.vertexModule = debugLineModule_;
+    d.vertexEntry = "vsSphere";
+    d.fragmentModule = debugLineModule_;
+    d.fragmentEntry = "fsSphere";
+    d.depth = dsWind;
+    pool.Add([this, d] { pourMarkerDraw_ = device_.CreateRenderPipeline(d); });
   }
   {
     // Micro bodies: own layout (renderBGL_ + microBodyBGL_), own module, and
@@ -3684,6 +3703,15 @@ void Simulation::DrawDebugBoxes(const rhi::RenderPass& pass,
   pass.SetBindGroup(1, renderPartBG_[page_]);
   // 12 edges x 6 vertices (two triangles per edge quad).
   pass.Draw(72, count);
+}
+
+void Simulation::DrawPourMarker(const rhi::RenderPass& pass, uint32_t at) {
+  if (at == UINT32_MAX) return;   // no vessel up: not even a bind
+  pass.SetPipeline(pourMarkerDraw_);
+  pass.SetBindGroup(0, BodyRenderBG());
+  pass.SetBindGroup(1, renderPartBG_[page_]);
+  // One camera-facing quad; the fragment shader cuts the disc out of it.
+  pass.Draw(6, 1, 0, at);
 }
 
 void Simulation::DrawWindField(const rhi::RenderPass& pass, uint32_t arrows) {

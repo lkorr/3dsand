@@ -33,6 +33,7 @@
 #include "game/brush.h"
 #include "game/mob.h"
 #include "game/spell.h"
+#include "game/spellgraph.h"
 #include "phys/debris.h"
 #include "sim/worldmap.h"
 #include "test/selftest.h"
@@ -1891,6 +1892,212 @@ Status GateSpellsOracle(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---- spell-timing (docs/PLAN_spell_magnitude.md §4, M3) -----------------------
+//
+// WHEN an item fires in its carrier: `explosive!bounce`, `fire!every10`,
+// `explosive!expire`, `explosive!launch`, `explosive+20`. CPU half: the
+// suffixes survive every page path, mods and marks refuse a timing, the price
+// is the item's tariff times how often it CAN fire, a delay costs nothing but
+// lengthens the rule-2 tick bound, and the page op refuses a trigger on a
+// carrier that does not fly. Runtime half: real flights through the harness
+// window (the same open-air fixture as `spells` check 8) fire each event the
+// number of times the words say.
+Status GateSpellTiming(Ctx& c, std::string& detail) {
+  World& world = c.world;
+  GlyphLibrary lib;
+  std::string gerr;
+  if (!LoadGlyphs(AssetDir() + "/spells/glyphs.json", c.mats, lib, gerr)) {
+    std::printf("spell-timing: FAIL (glyph load: %s)\n", gerr.c_str());
+    detail = "glyph load failed";
+    return Status::Fail;
+  }
+  std::vector<uint32_t> classOf;
+  for (const auto& m : c.mats) classOf.push_back(m.gpu.klass);
+  bool ok = true;
+  int checks = 0, shown = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (cond) return;
+    ok = false;
+    if (shown++ < 20) std::printf("spell-timing: FAILED %s\n", what.c_str());
+  };
+  auto words = [](std::initializer_list<const char*> w) {
+    return std::vector<std::string>(w.begin(), w.end());
+  };
+  auto join = [](const std::vector<std::string>& w) {
+    std::string s;
+    for (const std::string& x : w) s += (s.empty() ? "" : " ") + x;
+    return s;
+  };
+  auto compile = [&](const std::vector<std::string>& w) {
+    return LowerSpell(lib, ParseWords(lib, w));
+  };
+  auto CountWord = [](const std::vector<std::string>& w, const std::string& id) {
+    int n = 0;
+    for (const std::string& x : w) n += x == id;
+    return n;
+  };
+
+  // ---- CPU: serialization ------------------------------------------------------
+  for (const auto& w : {words({"explosive!bounce", "bounce", "projectile"}),
+                        words({"fire@2!every10+20", "projectile"}),
+                        words({"explosive!expire", "projectile!launch", "projectile"}),
+                        words({"fire+40", "self"})}) {
+    const std::vector<std::string> back = Linearize(lib, ParseWords(lib, w));
+    std::vector<std::string> a = w, b = back;
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    check(a == b, "round trip [" + join(w) + "] -> [" + join(back) + "]");
+  }
+  check(Linearize(lib, ParseWords(lib, words({"lift!bounce", "projectile"}))) ==
+            words({"lift", "projectile"}),
+        "a mod's timing suffix is dropped (a mod edits its carrier)");
+  check(Linearize(lib, ParseWords(lib, words({"fire!every1", "projectile"})))[0] ==
+            "fire!every" + std::to_string(lib.budgets.minEveryTicks),
+        "an `every` period below the floor clamps to budgets.minEveryTicks");
+  {
+    const std::vector<std::string> two =
+        Linearize(lib, ParseWords(lib, words({"explosive!bounce", "explosive", "projectile"})));
+    int ex = 0, exb = 0;
+    for (const std::string& x : two) {
+      ex += x == "explosive";
+      exb += x == "explosive!bounce";
+    }
+    check(ex == 1 && exb == 1, "a timed and an untimed explosive stay two items: [" + join(two) + "]");
+  }
+
+  // ---- CPU: price = tariff x fires ---------------------------------------------
+  {
+    const int32_t hit = compile(words({"explosive", "bounce@3", "projectile"})).tariff;
+    const int32_t bnc = compile(words({"explosive!bounce", "bounce@3", "projectile"})).tariff;
+    check(hit > 0 && bnc == 3 * hit,
+          Format("a blast at each of 3 bounces prices 3 blasts (%d vs 3 x %d)", bnc, hit));
+    const int32_t fire = compile(words({"fire", "projectile"})).tariff;
+    const int32_t every = compile(words({"fire!every10", "projectile"})).tariff;
+    const GlyphDef* proj = lib.At(lib.Find("projectile"));
+    const int32_t fires = proj ? proj->lifetimeTicks / 10 : 0;
+    check(every == fire * fires,
+          Format("fire every 10 ticks prices %d fires (%d vs %d x %d)", fires, every, fire, fires));
+    check(compile(words({"explosive!bounce", "bomb"})).tariff == 0,
+          "a bomb has no bounce: a bounce item on it fires never and costs no tariff");
+    const CastList d0 = compile(words({"fire", "projectile"}));
+    const CastList d20 = compile(words({"fire+20", "projectile"}));
+    check(d20.tariff == d0.tariff, "a delay is free");
+    check(!d0.casts.empty() && !d20.casts.empty() && d20.casts[0].ticks == d0.casts[0].ticks + 20,
+          Format("a delay lengthens the tick bound by itself (%d -> %d)",
+                 d0.casts.empty() ? -1 : d0.casts[0].ticks,
+                 d20.casts.empty() ? -1 : d20.casts[0].ticks));
+    // echo's magnitude scales its repeats.
+    const int32_t e1 = compile(words({"explosive", "echo", "orb"})).tariff;
+    const int32_t e2 = compile(words({"explosive", "echo@2", "orb"})).tariff;
+    check(e2 == 2 * e1, Format("echo@2 repeats twice as often (%d vs 2 x %d)", e2, e1));
+  }
+
+  // ---- CPU: the page op ---------------------------------------------------------
+  {
+    const SpellTree t = ParseWords(lib, words({"explosive", "projectile"}));
+    int ex = -1;
+    for (size_t i = 0; i < t.nodes.size(); i++) {
+      const GlyphDef* gd = lib.At(t.nodes[i].glyph);
+      if (!t.nodes[i].box && gd && gd->id == "explosive") ex = (int)i;
+    }
+    SpellTiming tb;
+    tb.trigger = SpellTrigger::Bounce;
+    const EditResult r = SetTiming(lib, t, ex, tb);
+    check(r.ok && CountWord(r.words, "explosive!bounce") == 1,
+          "SetTiming writes explosive!bounce: " + (r.ok ? join(r.words) : r.why));
+    const SpellTree h = ParseWords(lib, words({"fire", "self"}));
+    int fi = -1;
+    for (size_t i = 0; i < h.nodes.size(); i++) {
+      const GlyphDef* gd = lib.At(h.nodes[i].glyph);
+      if (!h.nodes[i].box && gd && gd->id == "fire") fi = (int)i;
+    }
+    const EditResult no = SetTiming(lib, h, fi, tb);
+    check(!no.ok && no.why.find("does not fly") != std::string::npos,
+          "a bounce on a carrier that does not fly is refused: " + no.why);
+    SpellTiming td;
+    td.delay = 20;
+    const EditResult yes = SetTiming(lib, h, fi, td);
+    check(yes.ok && CountWord(yes.words, "fire+20") == 1,
+          "a delay is allowed anywhere: " + (yes.ok ? join(yes.words) : yes.why));
+  }
+
+  // ---- runtime: real flights --------------------------------------------------------
+  // Horizontal through open air from the window's -x edge, weightless (`lift`
+  // at its default is exactly 1 g of lift), so nothing lands on the ground.
+  const IVec3 worg = world.WindowOrigin();
+  const SpellFxVec origin{SpellFxFromFloat((float)(worg.x * (int)kChunk + 8)),
+                          SpellFxFromFloat((float)(worg.y * (int)kChunk + (int)kWorldN / 2)),
+                          SpellFxFromFloat((float)(worg.z * (int)kChunk + (int)kWorldN / 2))};
+  struct Run {
+    int atCast = 0;                // explosions on the cast tick
+    int blasts = 0;                // explosions while ticking
+    int firstBlast = -1;           // tick of the first one
+    int sprayTicks = 0;            // ticks that emitted spray particles
+  };
+  auto fly = [&](const std::vector<std::string>& w) {
+    Run r;
+    SpellSystem sys;
+    sys.SetLibrary(&lib);
+    const CastList sp = compile(w);
+    CasterState cs;
+    cs.mana = 1 << 28;
+    cs.manaMax = 1 << 28;
+    FakeHealth hp(1 << 28);
+    SpellEmission e0;
+    sys.Cast(sp, cs, hp.cb, 41, origin, {kSpellFxOne, 0, 0}, 1, e0);
+    r.atCast = (int)e0.explosions.size();
+    for (int t = 0; t < 3 * (int)lib.budgets.maxLifetimeTicks + lib.budgets.maxDelayTicks; t++) {
+      SpellEmission e;
+      sys.Tick((uint32_t)(7000 + t), world, classOf, e, nullptr);
+      if (!e.explosions.empty() && r.firstBlast < 0) r.firstBlast = t;
+      r.blasts += (int)e.explosions.size();
+      if (!e.spawns.empty()) r.sprayTicks++;
+      if (sys.LiveCount() == 0 && sys.BombCount() == 0 && sys.Echoes().empty() && t > 2) break;
+    }
+    return r;
+  };
+  // (a) EXPIRE: a slow weightless bolt runs out of life in the air. Untimed it
+  // fizzles; timed `!expire`, it goes off exactly once.
+  const Run fizz = fly(words({"explosive", "lift", "speed@0.25", "projectile"}));
+  const Run expire = fly(words({"explosive!expire", "lift", "speed@0.25", "projectile"}));
+  check(fizz.blasts == 0, Format("an untimed bolt that hits nothing fizzles (%d blasts)", fizz.blasts));
+  check(expire.blasts == 1, Format("`!expire` goes off once when life runs out (%d)", expire.blasts));
+  // (b) EVERY: the same bolt sprays every 10 ticks of its flight.
+  const Run pulse = fly(words({"fire!every10", "lift", "speed@0.25", "projectile"}));
+  const GlyphDef* proj = lib.At(lib.Find("projectile"));
+  const int life = proj ? proj->lifetimeTicks : 0;
+  check(pulse.sprayTicks >= life / 10 - 1 && pulse.sprayTicks <= life / 10,
+        Format("`!every10` sprays every 10 ticks of a %d-tick life (%d pulses)", life,
+               pulse.sprayTicks));
+  // (c) LAUNCH: at the muzzle, on the cast tick, and nothing at the end.
+  const Run launch = fly(words({"explosive!launch", "lift", "speed@0.25", "projectile"}));
+  check(launch.atCast == 1 && launch.blasts == 0,
+        Format("`!launch` goes off at the muzzle (%d at cast, %d later)", launch.atCast,
+               launch.blasts));
+  // (d) DELAY: the same impact, 20 ticks later.
+  const Run now = fly(words({"explosive", "lift", "projectile"}));
+  const Run later = fly(words({"explosive+20", "lift", "projectile"}));
+  check(now.blasts == 1 && later.blasts == 1 && later.firstBlast - now.firstBlast == 20,
+        Format("`+20` lands the blast 20 ticks after the impact (t%d -> t%d)", now.firstBlast,
+               later.firstBlast));
+  // (e) BOUNCE: a fast bolt that bounces twice off the window's walls explodes
+  // at each bounce and not at the end.
+  const Run bnc = fly(words({"explosive!bounce", "bounce@2", "lift", "speed@4", "projectile"}));
+  const Run bnc0 = fly(words({"explosive", "bounce@2", "lift", "speed@4", "projectile"}));
+  check(bnc0.blasts == 1, Format("control: an untimed bouncing bolt explodes once, at the end (%d)",
+                                 bnc0.blasts));
+  check(bnc.blasts == 2, Format("`!bounce` explodes at each of 2 bounces (%d)", bnc.blasts));
+
+  detail = Format("%d checks", checks);
+  std::printf("spell-timing: %s (expire %d, every %d pulses/%d-tick life, launch %d at cast, "
+              "delay t%d->t%d, bounce %d vs control %d; %d checks)\n",
+              ok ? "PASS" : "FAIL", expire.blasts, pulse.sprayTicks, life, launch.atCast,
+              now.firstBlast, later.firstBlast, bnc.blasts, bnc0.blasts, checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SpellGates() {
@@ -1902,6 +2109,9 @@ const std::vector<Gate>& SpellGates() {
       // SKIPPED in every scope for a day -- which is how "explosive
       // projectile does nothing" shipped with the gate nominally green.
       {"spells", "spell", {}, false, GateSpells},
+      // M3 triggers: CPU checks plus real flights through the same open-air
+      // window fixture `spells` check 8 uses; it leaves nothing behind.
+      {"spell-timing", "spell", {}, false, GateSpellTiming},
       // No deps: CPU-only over the glyph library and the oracle file.
       {"spells-oracle", "spell", {}, false, GateSpellsOracle},
   };

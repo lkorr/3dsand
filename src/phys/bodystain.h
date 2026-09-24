@@ -55,6 +55,19 @@ struct StainLattice {
 // subtractive rule). Returns the coat word.
 uint16_t RaiseBodyStain(uint16_t cur, uint32_t mat, uint32_t amt);
 
+// ---- ...AND A WASHING LIQUID ON A BODY ------------------------------------
+//
+// Water (materials.json `washes`) meeting a coat. Raise would leave blood
+// where it is -- a splash of water is rarely heavier than the blood it lands
+// on -- so a washer takes a different road: a FOREIGN coat is stepped down by
+// `rinse`, and only a voxel that comes out clean (or was already clean, or
+// already wet) takes the washer's own coat at `wetAmt`, keeping the larger of
+// that and what is there. So washing and wetting are one rule: the water gets
+// the blood off first and leaves the skin wet behind it. `wetAmt` 0 rinses
+// without wetting. Returns the coat word.
+uint16_t WashBodyStain(uint16_t cur, uint32_t washMat, uint32_t wetAmt,
+                       uint32_t rinse);
+
 // ---- ...AND THE OTHER WAY A COAT GETS DEEPER --------------------------------
 //
 // ADD `add` to what is already there, capped at `cap`. `RaiseBodyStain` above

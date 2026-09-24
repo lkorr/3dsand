@@ -527,6 +527,14 @@ struct Reaction {
 const RCOND_SKY   : u32 = 1u;  // cell must have open sky above it
 const RCOND_DAY   : u32 = 2u;  // only while the sun is up
 const RCOND_NIGHT : u32 = 4u;  // only while the sun is down
+// Weather conditions (materials.h kCondRain / kCondRainDamp), against
+// T.weatherRain. RAIN: a douse — only on a rain-exposed cell while it rains,
+// chance x (rain/255)^2. RAINDAMP: an ignition — chance cut by
+// max(rain, wet) x damp on a rain-exposed cell. RAIN holds no chunk awake
+// (it is a gate, like SKY/DAY/NIGHT); RAINDAMP is only a rescale and does.
+const RCOND_RAIN     : u32 = 8u;
+const RCOND_RAINDAMP : u32 = 16u;
+const RCOND_GATES    : u32 = 15u;  // SKY | DAY | NIGHT | RAIN
 
 // Neighbour-count scaling — must match kScale* in src/sim/materials.h.
 // Chance scales with how many of the 6 face neighbours match the rule's
@@ -636,7 +644,11 @@ struct TickParams {
   // in-kernel wake this replaced, byte for byte. It was the padWp0 pad word,
   // so the struct layout is unchanged.
   genDeferWake : u32,
-  padWp1 : u32,
+  // THE WEATHER, the SIM's copy (weather::SimRainWord; must match world.h —
+  // it was the padWp1 pad word, so the layout is unchanged). Bits 0..7 rain
+  // reaching the ground, 8..15 ignition damp strength, 16..23 ground wetness.
+  // Read by RCOND_RAIN / RCOND_RAINDAMP rules (sim_step rainChance).
+  weatherRain : u32,
   windPrimLo : vec3<i32>,   // union AABB, inclusive world cells; the whole-loop
   padWp2 : i32,             // early-out. lo > hi means "no primitives".
   windPrimHi : vec3<i32>,
@@ -1496,9 +1508,22 @@ const CLOUD_SHADOW_N : u32 = 256u;
 const CLOUD_ENV_N    : u32 = 64u;
 // Word offset of the env map inside cloudMaps: it follows the shadow map.
 const CLOUD_ENV_BASE : u32 = CLOUD_SHADOW_N * CLOUD_SHADOW_N;
-// ...and the 4-word camera probe follows the env map (world.h kCloudProbeWords):
-// the weather map at the camera's column as f32 (coverage, type, rain, jitter).
+// ...and the 8-word camera probe follows the env map (world.h kCloudProbeWords):
+// 0..3 the weather map at the camera column as f32 (coverage, type, rain,
+// jitter); 4..6 the 20 m averaged wind for the rain streaks, m/s (cloud.wgsl).
 const CLOUD_PROBE_BASE : u32 = CLOUD_ENV_BASE + CLOUD_ENV_N * CLOUD_ENV_N * 2u;
+// How far the deck's local base may sit below (or above) the authored baseM:
+// 10% of the thickness, CAPPED IN METRES. Uncapped, a 7.5 km cumulonimbus
+// deck (the storm preset, base 700 m) dipped 750 m — below sea level — so
+// cloud density reached the ground and the renderer decided the eye was
+// inside the deck and veiled every terrain pixel with it. Real bases vary by
+// a couple of hundred metres whatever the tower above them does. Shared by
+// cloud.wgsl (deckBase, deckSpan) and raymarch.wgsl (the over-terrain
+// composite); src/test/support.cpp mirrors the cap for the shadow plane.
+const CLOUD_BASE_JITTER_MAX_M : f32 = 150.0;
+fn cloudBaseJitterM(thicknessM : f32) -> f32 {
+  return min(0.1 * thicknessM, CLOUD_BASE_JITTER_MAX_M);
+}
 
 // Must match CloudParams in world.h, field for field.
 struct CloudParams {
@@ -3455,6 +3480,18 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 // FLUID_CAP.
 const FP_EXCITED : u32 = 1u << 22u;
 fn fpExcited(attr : u32) -> bool { return (attr & FP_EXCITED) != 0u; }
+// GHOST (bit 23): a picture of water, not water -- the flask's scoop stream
+// (ContainerScoopStream, 2026-09-23). spawnAppend sets it from the op's
+// species bit 8, with the homing target in _r0.._r2 and the death tick in _r3.
+// It is splatted into the grid like any particle, so the fluid surface draws
+// it, and g2p steers it onto its target. It is NEVER matter: spawnAppend does
+// not book it, particleTick gives the CA no occupancy or stain intent for it
+// (so no reaction can consume it), splash sheds no droplets from it, settle
+// neither bins nor kills it, and consumeApply retires it at its death tick
+// without a mass counter. The eighths it depicts were already taken by the
+// scoop's conditional clear and paid through the scoop ledger.
+const FP_GHOST : u32 = 1u << 23u;
+fn fpGhost(attr : u32) -> bool { return (attr & FP_GHOST) != 0u; }
 
 // ---- fluidArgsStage word map (40 u32 — world.h kFluidArgsWords) ------------
 // THIS COMMENT IS THE OCCUPANCY LEDGER FOR THE WHOLE MAP, including the words

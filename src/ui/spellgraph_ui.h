@@ -67,7 +67,10 @@ void PageHover(ImDrawList* dl, ImVec2 a, ImVec2 b);
 // JSON entry through the mirror, so the box is never wrong about the glyph and
 // a modder's glyph gets one for free. Shared: the arsenal table, the word row
 // and the canvas all open the same one.
-void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName);
+// `magnitude`, when given, is the cell's magnitude line (the canvas passes it
+// for a graded word; the word column does not).
+void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName,
+                  const char* magnitude = nullptr);
 
 // What the canvas wants said on the composer's status line this frame, and
 // whether it is a refusal (drawn in blood rather than gold). `note` points into

@@ -367,7 +367,7 @@ fn weatherAt(xz : vec2f) -> vec4f {
 // Base of the deck at this weather sample (the jitter channel lifts and drops
 // it so the underside is not a ruled line) and the height fraction in it.
 fn deckBase(wm : vec4f) -> f32 {
-  return C.baseM + (wm.w - 0.5) * 0.2 * C.thicknessM;
+  return C.baseM + (wm.w - 0.5) * 2.0 * cloudBaseJitterM(C.thicknessM);
 }
 // Vertical profile per cloud TYPE, 0..1 over the deck. Stratus is a thin low
 // sheet, cumulus a rounded mid-height body, cumulonimbus the full depth with a
@@ -642,7 +642,7 @@ fn rainLayer(rd : vec3f, Lt : CloudLight, mu : f32, tMax : f32, jit : f32) -> Ma
 // reports the distance to the ground, so the rain march stops there.
 fn deckSpan(rd : vec3f, groundT : ptr<function, f32>) -> vec2f {
   let hc = C.camM.y;
-  let lo = C.baseM - 0.1 * C.thicknessM;
+  let lo = C.baseM - cloudBaseJitterM(C.thicknessM);
   let hi = C.baseM + 1.1 * C.thicknessM;
   // The ground sphere: sea level. Terrain here is metres, the deck kilometres,
   // so sea level is a faithful stand-in for "the ray went into the land".
@@ -964,4 +964,33 @@ fn env(@builtin(global_invocation_id) gid : vec3<u32>) {
   let i = CLOUD_ENV_BASE + (gid.y * CLOUD_ENV_N + gid.x) * 2u;
   cloudMaps[i] = pack2x16float(m.c.xy);
   cloudMaps[i + 1u] = pack2x16float(vec2f(m.c.z, m.t));
+  if (all(gid.xy == vec2<u32>(0u))) { writeRainWindProbe(); }
+}
+
+// THE WIND THE RAIN LEANS ALONG: windAt averaged over a 20 m disc round the
+// camera, written once a frame into probe words 4..6 (m/s) for raymarch.wgsl's
+// rainOverlay. The point sample it replaced swung the whole sheet of streaks
+// with every gust front — the gust bands have a ~5 m wavelength, so one point
+// is the flutter of one blade of grass, not the weather. Seventeen samples,
+// the centre plus rings of eight at 10 and 20 m, equally weighted: each stands
+// for about the same area of the disc (25pi, 25pi and ~22pi m^2), so this is
+// an area average rather than one biased toward the eye. The mean wind, its
+// altitude ramp at the eye's height and any wind primitive (fan, spell gust,
+// tornado) the disc overlaps all survive the average; the flutter does not.
+// One thread of one pass: 17 field evaluations a frame, not per pixel.
+const RAIN_WIND_RADIUS_M : f32 = 20.0;
+fn writeRainWindProbe() {
+  let c = R.camPos;
+  let rv = RAIN_WIND_RADIUS_M / VOXEL_METERS;
+  var acc = windAt(c, R.time, &R);
+  for (var k = 0u; k < 8u; k++) {
+    let a = f32(k) * 0.78539816;
+    let d = vec3f(cos(a), 0.0, sin(a));
+    acc += windAt(c + d * (rv * 0.5), R.time, &R);
+    acc += windAt(c + d * rv, R.time, &R);
+  }
+  let w = acc * (VOXEL_METERS / 17.0);
+  cloudMaps[CLOUD_PROBE_BASE + 4u] = bitcast<u32>(w.x);
+  cloudMaps[CLOUD_PROBE_BASE + 5u] = bitcast<u32>(w.y);
+  cloudMaps[CLOUD_PROBE_BASE + 6u] = bitcast<u32>(w.z);
 }

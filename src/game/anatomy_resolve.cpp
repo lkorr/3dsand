@@ -46,6 +46,76 @@ std::vector<Layer> LayersFor(const nlohmann::json& recipe,
   return out;
 }
 
+// anatomy.js `carveFor`: a limb's skeleton rules — eye sockets in the skull,
+// ribs in the chest. The last matching rule wins; a kept layer is never carved.
+struct Carve {
+  std::string material, where;
+  bool hasBox[3] = {false, false, false};
+  double box[3][2] = {{0, 0}, {0, 0}, {0, 0}};
+  int depthMin = 0, depthMax = 254;
+  int stripeAxis = -1, stripePeriod = 0, stripeWidth = 0;
+};
+
+std::vector<Carve> CarveFor(const nlohmann::json& recipe,
+                            const std::string& limb) {
+  std::vector<Carve> out;
+  if (!recipe.contains("limbs") || !recipe["limbs"].is_object() ||
+      limb.empty() || !recipe["limbs"].contains(limb))
+    return out;
+  const nlohmann::json& L = recipe["limbs"][limb];
+  if (!L.is_object() || !L.contains("carve") || !L["carve"].is_array())
+    return out;
+  static const char* kAxes[3] = {"x", "y", "z"};
+  for (const nlohmann::json& c : L["carve"]) {
+    if (!c.is_object()) continue;
+    Carve e;
+    e.material = c.value("material", std::string());
+    if (e.material.empty()) continue;
+    e.where = c.value("where", std::string());
+    if (c.contains("box") && c["box"].is_object())
+      for (int a = 0; a < 3; a++) {
+        const auto it = c["box"].find(kAxes[a]);
+        if (it == c["box"].end() || !it->is_array() || it->size() != 2) continue;
+        e.hasBox[a] = true;
+        e.box[a][0] = (*it)[0].get<double>();
+        e.box[a][1] = (*it)[1].get<double>();
+      }
+    if (c.contains("depth") && c["depth"].is_array()) {
+      const nlohmann::json& d = c["depth"];
+      if (d.size() > 0 && d[0].is_number()) e.depthMin = d[0].get<int>();
+      if (d.size() > 1 && d[1].is_number()) e.depthMax = d[1].get<int>();
+    }
+    if (c.contains("stripe") && c["stripe"].is_object()) {
+      const nlohmann::json& s = c["stripe"];
+      const std::string ax = s.value("axis", std::string());
+      for (int a = 0; a < 3; a++)
+        if (ax == kAxes[a]) e.stripeAxis = a;
+      e.stripePeriod = s.value("period", 0);
+      e.stripeWidth = s.value("width", 0);
+      if (e.stripePeriod <= 0) e.stripeAxis = -1;
+    }
+    out.push_back(std::move(e));
+  }
+  return out;
+}
+
+// anatomy.js `carveMatches`. The box test is (l + 0.5) / n in [lo, hi), the
+// same double arithmetic JS does, so both sides pick the same cells.
+bool CarveMatches(const Carve& c, int whereId, int layerId, const int l[3],
+                  const IVec3& size, int depth) {
+  if (!c.where.empty() && whereId != layerId) return false;
+  if (depth < c.depthMin || depth > c.depthMax) return false;
+  const int n[3] = {size.x, size.y, size.z};
+  for (int a = 0; a < 3; a++) {
+    if (!c.hasBox[a]) continue;
+    const double f = (l[a] + 0.5) / n[a];
+    if (f < c.box[a][0] || f >= c.box[a][1]) return false;
+  }
+  if (c.stripeAxis >= 0 && l[c.stripeAxis] % c.stripePeriod >= c.stripeWidth)
+    return false;
+  return true;
+}
+
 // anatomy.js `layerIndexAt`: layers are consumed outermost first, each `depth`
 // voxels thick, and the last one (or any with no depth) takes the rest.
 int LayerIndexAt(const std::vector<Layer>& layers, int depth) {
@@ -259,6 +329,12 @@ Report Resolve(Prefab& prefab, const nlohmann::json& recipe,
       speck[li] = matIdOf(layers[li].speckle);
     }
     const int surfaceId = ids[0];
+    const std::vector<Carve> carve = CarveFor(recipe, m.name);
+    std::vector<int> carveId(carve.size()), carveWhere(carve.size());
+    for (size_t k = 0; k < carve.size(); k++) {
+      carveId[k] = matIdOf(carve[k].material);
+      carveWhere[k] = matIdOf(carve[k].where);
+    }
     // What this recipe puts UNDER the surface. A `keep` voxel made of one of
     // these is not the painted character — it is a face this recipe once baked
     // as interior, back before own-face depth existed — so it gets the kept
@@ -269,6 +345,8 @@ Report Resolve(Prefab& prefab, const nlohmann::json& recipe,
       if (ids[li]) interior.insert(ids[li]);
       if (speck[li]) interior.insert(speck[li]);
     }
+    for (int id : carveId)
+      if (id) interior.insert(id);
     for (PrefabVoxel& v : m.voxels) {
       const int px = v.x + m.offset.x, py = v.y + m.offset.y,
                 pz = v.z + m.offset.z;
@@ -290,7 +368,14 @@ Report Resolve(Prefab& prefab, const nlohmann::json& recipe,
                      L.speckleFraction * 10000.0) {
         mat = speck[(size_t)li];
       }
-      if (!mat) continue;                                  // unresolved: leave
+      if (!L.keep) {
+        const int l[3] = {v.x, v.y, v.z};
+        for (size_t k = 0; k < carve.size(); k++)
+          if (carveId[k] && CarveMatches(carve[k], carveWhere[k],
+                                         ids[(size_t)li], l, m.size, (int)d))
+            mat = carveId[k];
+      }
+      if (!mat) continue;                                 // unresolved: leave
       if ((int)v.material == mat && v.color == 0) continue;  // idempotent
       v.material = (uint16_t)mat;
       v.color = 0;

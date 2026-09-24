@@ -914,6 +914,48 @@ fn seesSky(c : vec3<i32>) -> bool {
   return !isRayBlocker(materials[nmat]);
 }
 
+// Does rain reach this cell? Rain falls at an angle and splashes, so a burning
+// trunk is wet down its SIDES, not only on top: the cell is exposed if it sees
+// the sky, or if a horizontal face opens onto a cell that does (an air-ish
+// side neighbour whose own cell above is not a ray blocker). Every read is at
+// Chebyshev distance 1 — the side neighbour and the diagonal above it — which
+// is the reach seesSky's note proves is scheduling-free: an actor in this pass
+// is >= 3 away and writes reach 1, so it cannot touch a cell within 1 of me.
+// Costs nothing while dry: both callers test T.weatherRain first.
+fn rainOpen(n : vec3<i32>) -> bool {
+  if (!inBounds(n)) { return true; }
+  let nm = voxMat(voxWordAt(n));
+  return nm == MAT_AIR || !isRayBlocker(materials[nm]);
+}
+fn rainExposed(c : vec3<i32>) -> bool {
+  if (seesSky(c)) { return true; }
+  for (var i = 0u; i < 4u; i++) {
+    let d = select(vec3<i32>(0, 0, select(-1, 1, i == 3u)),
+                   vec3<i32>(select(-1, 1, i == 1u), 0, 0), i < 2u);
+    let n = c + d;
+    if (rainOpen(n) && rainOpen(n + vec3<i32>(0, 1, 0))) { return true; }
+  }
+  return false;
+}
+
+// A rule's chance under this tick's weather — rain douses (RCOND_RAIN) and
+// damps ignition (RCOND_RAINDAMP). MIRRORED BIT FOR BIT by RainScaledChance
+// in src/sim/materials.h, which the body burners roll against: change one,
+// change both. Integer and divide-last; chance <= REACT_CHANCE_DEN (2e6), so
+// chance * 255 fits a u32. A RAIN rule has already passed lightMatches (rain
+// > 0, exposed); a RAINDAMP rule only pays the exposure probe while wet.
+fn rainChance(rule : Reaction, c : vec3<i32>, chance : u32) -> u32 {
+  let cond = rule.cond;
+  if ((cond & (RCOND_RAIN | RCOND_RAINDAMP)) == 0u) { return chance; }
+  let rain = T.weatherRain & 0xFFu;
+  if ((cond & RCOND_RAIN) != 0u) { return (chance * rain / 255u) * rain / 255u; }
+  let wet = max(rain, (T.weatherRain >> 16u) & 0xFFu);
+  if (wet == 0u || !rainExposed(c)) { return chance; }
+  let damp = (T.weatherRain >> 8u) & 0xFFu;
+  let keep = 255u - (wet * damp + 127u) / 255u;
+  return chance * keep / 255u;
+}
+
 // Does the cell's light environment satisfy this rule's condition?
 // Encoded in Reaction.cond (see materials.h ReactionGpu.cond):
 //   bit0 RCOND_SKY   — requires open sky above
@@ -924,6 +966,9 @@ fn seesSky(c : vec3<i32>) -> bool {
 fn lightMatches(rule : Reaction, c : vec3<i32>) -> bool {
   let cond = rule.cond & 0xFFu;
   if (cond == 0u) { return true; }  // unconditional: the common case, free
+  // A douse only while it rains, and only where the rain lands.
+  if ((cond & RCOND_RAIN) != 0u &&
+      ((T.weatherRain & 0xFFu) == 0u || !rainExposed(c))) { return false; }
   let day = daylightStrength(T.dayPhase);
   if ((cond & RCOND_DAY) != 0u && day == 0u) { return false; }
   if ((cond & RCOND_NIGHT) != 0u && day != 0u) { return false; }
@@ -1089,13 +1134,17 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     // off, which is a handful of ticks per in-game day. Between those
     // boundaries a chunk with only light-gated work sleeps, and the rules
     // still fire on the ticks it is awake for other reasons.
-    let lightGated = (rule.cond & 0xFFu) != 0u;
+    // RCOND_GATES, not the whole byte: RAINDAMP only rescales an ordinary
+    // ignition rule, and counting it as a gate would let a fire front fall
+    // asleep mid-spread. RAIN is a gate — a douse on something that does not
+    // resolve by itself must not pin its chunk awake for a whole storm.
+    let lightGated = (rule.cond & RCOND_GATES) != 0u;
 
     if (kind == RK_DECAY) {
       // Neighbour-count scaling (frontier rules — see scaledChance). Returns
       // rule.chance untouched for the ordinary unscaled case; 0 means the cell
       // has no qualifying neighbours and the rule is inert here this tick.
-      let chance = scaledChance(rule, c);
+      let chance = rainChance(rule, c, scaledChance(rule, c));
       if (chance == 0u) { continue; }
       keepAwake = keepAwake || !lightGated;
       if ((rr % REACT_CHANCE_DEN) < chance) {
@@ -1116,7 +1165,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         let ni = voxWordIndex((n));
         if (voxMat(voxWordAt((n))) != MAT_AIR) { continue; }
         keepAwake = keepAwake || !lightGated;
-        if ((rr % REACT_CHANCE_DEN) < rule.chance) {
+        if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
           markVoxActive(ni);
           markDirtyR(n, DIRTY_R_REACTW);
@@ -1154,7 +1203,9 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         }
         if (!nbrMatches(rule, nmat, materials[nmat])) { continue; }
         keepAwake = keepAwake || !lightGated;
-        if ((rr % REACT_CHANCE_DEN) < rule.chance) {
+        // Weather scale here, after the neighbour matched, so a dry-sky tick
+        // and a wood cell with nothing hot beside it never pay the probe.
+        if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
           if (rule.prodNbr != PROD_KEEP) {
             if (synthFluid) { flagFluidConsume(n); }
             // For a synthesized neighbour ni is the air cell: a product

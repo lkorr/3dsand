@@ -28,6 +28,7 @@
 #include "game/persist.h"
 #include "game/camera.h"
 #include "game/caster.h"
+#include "game/container.h"
 #include "game/equipment.h"
 #include "game/worlditems.h"
 #include "game/corpses.h"
@@ -186,6 +187,10 @@ bool g_shotInventory = false;
 // TWO pictures, because the screen has two halves and one of them cannot be
 // seen from the other: the equipment view and the injury inspector share a
 // frame and a portrait but show completely different things.
+// The HUD before the screen opens: the hotbar strip along the bottom with a
+// water-filled flask selected, so the pour-point sphere is in the picture too.
+constexpr uint64_t kShotInvHudSetup = 110;
+constexpr uint64_t kShotInvHudFrame = 140;     // -> screenshot_hud.bmp
 constexpr uint64_t kShotInvOpenFrame = 150;    // let the avatar spawn and settle
 constexpr uint64_t kShotInvDamageFrame = 170;
 constexpr uint64_t kShotInvGearFrame = 220;    // -> screenshot_inventory.bmp
@@ -248,7 +253,9 @@ struct ShotSpellScene {
 // THE SCENES. Every one of them is a question about the picture:
 //   plain     - two words: does a minimal tree sit centred and whole?
 //   duststorm - the shipped example: a bus, three sockets, a mod, a fan
-//   operator  - `transmute` with a hole in it: the slash, the hollow pip
+//   operator  - `transmute` with a hole in it: the slash, the blank in the row
+//   halfword  - `_ trail` alone: the word that is nothing until something is
+//               spoken before it, and the clasp that says the pair is one thing
 //   nested    - a delivery inside a delivery: the deep tree
 //   lanes     - lane/end scoping: sockets with payloads of their own
 //   fan       - shotgun twice: nine instances, the widest row the page draws
@@ -258,9 +265,20 @@ struct ShotSpellScene {
 //   deepfan   - a shotgun on a box three boxes down, and a shotgun on the HAND:
 //               the two places a fan can open that are not the top of the tree
 const ShotSpellScene kShotSpellScenes[] = {
+    // ONE WORD. The page that showed a pip, a rule and another pip for a spell
+    // that has no payload, no fan and nothing shared (2026-09-22): two cells is
+    // the whole truth about it.
+    {"bare", "projectile"},
     {"plain", "fire projectile"},
     {"duststorm", "sand gust gust shotgun projectile"},
     {"operator", "water transmute swift bolt"},
+    // BOTH HALVES OF THE SAME QUESTION: `trail` with nothing before it (one
+    // blank, centred under the cell it is waiting for) and `transmute` with
+    // nothing at all (two blanks side by side, which is the widest a clasp
+    // gets). Until 2026-09-22 both drew as a finished cell with a 21 px ring
+    // hung off its edge.
+    {"halfword", "trail projectile"},
+    {"halfwords", "transmute projectile"},
     {"nested", "fire explosive bomb orb long projectile"},
     {"lanes", "stone lane acid wide end lane fire end shotgun lob"},
     {"fan", "sand shotgun shotgun gust projectile"},
@@ -278,8 +296,24 @@ const ShotSpellScene kShotSpellScenes[] = {
     // splits again. The grammar does it (`--gate spells`, L13); what this scene
     // watches is whether the PAGE says so.
     {"subfan", "sand shotgun lane gust shotgun end projectile"},
+    // THE CASCADE, reported 2026-09-22: "heres a shotgun into a twin, the twin
+    // doesnt split into 2 more. it should just fractal cascade into more and
+    // more." The first is that sentence exactly - on the HAND, which has no
+    // cell per branch, so the sub-fan was drawn as a tally on nothing at all.
+    // The second is the same shape one level down, and the third is a fan
+    // inside a fan inside a fan by nesting boxes, which is where the depth
+    // actually comes from.
+    {"cascade", "shotgun lane twin end"},
+    {"cascade2", "sand shotgun lane twin end projectile"},
+    {"cascade3", "fire shotgun projectile twin projectile"},
     {"deepfan", "fire shotgun projectile projectile projectile"},
     {"handfan", "explosive projectile projectile shotgun"},
+    // MAGNITUDES (PLAN_spell_magnitude §2.5): a numeral at the foot of every
+    // cell whose magnitude is not 1, on a word, an operator and a mod bead.
+    {"magnitude", "fire@2 explosive@0.5 float@0.5 bounce@3 projectile"},
+    // TIMING and SIGNED COMPONENTS (M2/M3): a tag on each item that does not
+    // fire on hit, and a signed numeral on a lift pressing down.
+    {"timing", "explosive!bounce fire!every10+20 bounce@2 lift@-0.5 speed@3 projectile"},
     {"empty", ""},
     // The same page, dragged: every mark on the sheet - the ruling, the
     // pricked margins, the foxing, the great figure - must have moved with it.
@@ -1094,6 +1128,8 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   ui.stainMat = 0;
   ui.stainColor = 0;
   ui.stainLabel[0] = '\0';
+  for (auto& c : ui.coats) c = {};
+  ui.coatCount = 0;
   ui.stainHudMin = CurrentTuning().coat.hudMinFrac;
   const MobDef* def = avatar.Def();
   ui.bodyValid = def != nullptr;
@@ -1191,6 +1227,17 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   ui.stainMat = whole.top[0].mat;
   ui.stainColor = CoatColorOf(mats, ui.stainMat);
   CopyCoatLabel(mats, ui.stainMat, ui.stainLabel, sizeof ui.stainLabel);
+  static_assert(UIState::kCoatNames == kCoatTop,
+                "UIState::coats mirrors LimbCoat::top");
+  for (const CoatEntry& en : whole.top) {
+    if (en.mat == 0 || en.sumAmt == 0 || whole.voxels == 0) continue;
+    UIState::CoatName& c = ui.coats[ui.coatCount++];
+    c.mat = en.mat;
+    c.frac = std::clamp((float)en.sumAmt / (float)(kBodyStainAmtMax * whole.voxels),
+                        0.0f, 1.0f);
+    c.color = CoatColorOf(mats, en.mat);
+    CopyCoatLabel(mats, en.mat, c.label, sizeof c.label);
+  }
 }
 
 // ---- the character panel's live avatar portrait -----------------------------
@@ -6072,6 +6119,44 @@ int main(int argc, char** argv) {
       if (ui.aiWeaponNames[i] == want) ui.aiWeaponPick = i;
   };
   rebuildAiWeapons();
+  // ---- THE F1 "GIVE ME A FILLED VESSEL" PICKERS (UIState::giveVesselNames) --
+  // Every container item, and per vessel every material whose CLASS it holds,
+  // sorted by name. By name and re-found by name on each rebuild, for the
+  // weapon picker's reason; rebuilt on R because both the item library and
+  // the material table can change under it.
+  auto rebuildGiveVessels = [&ui, &items, &mats]() {
+    const std::string wasV =
+        (ui.giveVesselPick >= 0 && ui.giveVesselPick < (int)ui.giveVesselNames.size())
+            ? ui.giveVesselNames[ui.giveVesselPick] : std::string();
+    std::string wasM;
+    if (ui.giveVesselPick >= 0 && ui.giveVesselPick < (int)ui.giveVesselMats.size()) {
+      const auto& l = ui.giveVesselMats[ui.giveVesselPick];
+      if (ui.giveMatPick >= 0 && ui.giveMatPick < (int)l.size()) wasM = l[ui.giveMatPick];
+    }
+    ui.giveVesselNames.clear();
+    ui.giveVesselMats.clear();
+    for (const ItemDef& it : items.items) {
+      if (!it.IsContainer()) continue;
+      std::vector<std::string> ms;
+      for (size_t m = 1; m < mats.size(); m++) {
+        const uint32_t k = mats[m].gpu.klass;
+        if (k <= 31 && ((it.container.holds >> k) & 1u)) ms.push_back(mats[m].name);
+      }
+      std::sort(ms.begin(), ms.end());
+      ui.giveVesselNames.push_back(it.name);
+      ui.giveVesselMats.push_back(std::move(ms));
+    }
+    ui.giveVesselPick = 0;
+    ui.giveMatPick = 0;
+    for (int i = 0; i < (int)ui.giveVesselNames.size(); i++)
+      if (ui.giveVesselNames[i] == wasV) ui.giveVesselPick = i;
+    if (ui.giveVesselPick < (int)ui.giveVesselMats.size()) {
+      const auto& l = ui.giveVesselMats[ui.giveVesselPick];
+      for (int i = 0; i < (int)l.size(); i++)
+        if (l[i] == (wasM.empty() ? std::string("water") : wasM)) ui.giveMatPick = i;
+    }
+  };
+  rebuildGiveVessels();
   // ---- THE WARDROBE PICKERS (game/dye.h, the overlay's Wardrobe window) ----
   //
   // Every DYEABLE piece, split by the slot it goes in. Same contract as the
@@ -6255,7 +6340,7 @@ int main(int argc, char** argv) {
   float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI, eQ;
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
   // (E has no KeyEdge: it is a hold-aware binding now — see the tap/hold
   // block by `takeE` — and an edge tracker would only be half of it.)
   KeyEdge eGlyph[kGlyphSlots];
@@ -6424,37 +6509,26 @@ int main(int argc, char** argv) {
   // nothing until you took it off. The dye is part of the comparison for the
   // same reason the name is the rest of it. 0 = undyed (game/dye.h).
   uint32_t (&wearDye)[kEquipSlotCount] = session.wearDye;
-  // ---- THE SHEATH IS THE WEAPON SLOT -------------------------------------
+  // The last frame's RENDER eye, for the pour point (ContainerPourPoint): the
+  // crosshair ray starts there -- ahead of the head in first person
+  // (avatar.firstPersonForward), on the boom in third -- and the tick's pour
+  // is settled before this frame's eye exists.
+  Vec3 pourFrom{};
+  bool pourFromValid = false;
+  // ---- THE HOTBAR IS THE HAND ---------------------------------------------
   //
-  // A blade is either DRAWN (a real rig part in the fist, swinging) or STOWED
-  // (an entry in the Sheath equip slot and nothing else). Q toggles. The
-  // hotbar stays exactly what it was — WHAT IS IN YOUR HAND for consumables
-  // and tools, still selected by the number row — it simply stops being where
-  // a weapon comes from, because "the sword you are carrying" and "the potion
-  // you have selected" were never the same question.
-  //
-  // `toolBeforeDraw` is what the tool selector goes back to on stow. Drawing
-  // forces the melee tool (otherwise you draw a sword and the left mouse
-  // button still paints stone), and silently keeping it afterwards would
-  // strand the player in a mode they never chose.
-  SheathState& sheath = session.sheath;
-  sheath.toolBefore = UIState::kToolBrush;
-  const int kSheathSlot = (int)EquipSlotId::Sheath;
-  // What the Sheath slot holds, as a kind. Written as a lambda because both
-  // the key press and the per-frame reconcile ask, and re-deriving it at each
-  // site is how the two stop agreeing.
-  auto sheathKind = [&] {
-    const ItemStack& sh = kit.equip.At(kSheathSlot);
-    const ItemDef* d = items.At(sh.Empty() ? -1 : sh.def);
-    return d ? d->kind : ItemKind::None;
-  };
+  // A weapon is drawn the way a flask is: put it in a hotbar slot and select
+  // that slot (number row / wheel) with the melee tool up. There is no draw
+  // key any more -- the owner's call (2026-09-23), replacing Q-draws-from-the-
+  // sheath. The Sheath and Quick equipment slots are still there as places a
+  // blade rides on your person; they just are not where the hand reaches.
   {
     // ---- THE STARTING KIT, AND IT IS STILL A STUB ------------------------
     //
     // One of everything the library defines, put somewhere it can actually be
-    // USED rather than all of it in the hotbar: a weapon goes to the sheath
-    // (which is where the draw key looks), armour goes to the pack (so it can
-    // be dragged onto the figure), and anything else keeps the hotbar. Before
+    // USED rather than all of it in the hotbar: armour goes to the pack (so it
+    // can be dragged onto the figure), and anything else -- weapons included,
+    // since the hotbar is the hand -- keeps the hotbar. Before
     // this, an armour item started in the hotbar and there was no way to get
     // it onto the body without first knowing to drag it out.
     //
@@ -6465,11 +6539,11 @@ int main(int argc, char** argv) {
       const ItemDef& it = items.items[i];
       int home = -1;
       for (int s = 0; s < kEquipSlotCount && home < 0; s++)
-        if (!EquipSlotIsWorn(s) && EquipSlotAccepts(s, it.kind) &&
-            kit.equip.At(s).Empty())
+        if (it.kind != ItemKind::Melee && !EquipSlotIsWorn(s) &&
+            EquipSlotAccepts(s, it.kind) && kit.equip.At(s).Empty())
           home = s;
       if (home >= 0)
-        kit.equip.slots[home] = {i, 1};       // the sword, into the sheath
+        kit.equip.slots[home] = {i, 1};
       else if (ItemKindIsWorn(it.kind))
         kit.bag.Add(i, 1);                     // armour, into the pack
       else
@@ -8521,6 +8595,9 @@ int main(int argc, char** argv) {
   // THE GHOST LIST REACHES THE TICK ONLY WHEN THERE IS A NETWORK. Null
   // otherwise, which is what keeps phases B / H / I / O making exactly the
   // calls they made before package B landed.
+  // The ground-item registry: the tick throws vessels into it and breaks the
+  // ones that land hard (session.h section H2).
+  tickCtx.ground = &ground;
   if (netRoleBoot != NetRole::None) tickCtx.remotes = &remotes;
   // ...and so does the op exchange. Null in every harness and in every
   // single-player frame; even here it does nothing until Connected().
@@ -8767,6 +8844,23 @@ int main(int argc, char** argv) {
       if (frameCounter == 1) {
         ui.fly = false;
         player.fly = false;
+      }
+      if (frameCounter == kShotInvHudSetup) {
+        ui.visible = false;
+        ui.tool = UIState::kToolMelee;
+        ui.magicMode = false;
+        uint16_t water = 0;
+        for (size_t m = 0; m < mats.size(); m++)
+          if (mats[m].name == "water") water = (uint16_t)m;
+        for (int i = 0; i < kItemSlots; i++) {
+          const ItemDef* d = items.At(hotbar.slots[i].Empty() ? -1 : hotbar.slots[i].def);
+          if (d && d->IsContainer() && water) {
+            hotbar.slots[i].fillMat = water;
+            hotbar.slots[i].fillAmt = (uint16_t)(d->container.capacity * 2 / 3);
+            hotbar.Select(i);
+            break;
+          }
+        }
       }
       if (frameCounter == kShotInvOpenFrame) {
         // DRESS THE FIGURE BEFORE PHOTOGRAPHING IT. The portrait is the only
@@ -9364,17 +9458,6 @@ int main(int argc, char** argv) {
     }
     if (captured && ui.devControls && eX.Pressed(key(GLFW_KEY_X)))
       ui.pendingDetonate = true;
-    // DRAW / STOW. Q rather than the X the plan proposed: X already
-    // detonates, and a key that does two things is a key that does the wrong
-    // one under pressure.
-    if (captured && eQ.Pressed(key(GLFW_KEY_Q)) &&
-        !sheath.Toggle(sheathKind(), UIState::kToolMelee, ui.tool)) {
-      // Reaching for a sword that is not there says so, rather than silently
-      // arming an empty hand — the same rule the equipment panel's refusals
-      // follow.
-      ui.kitMessage = "your sheath is empty";
-      ui.kitMessageAge = 0.0f;
-    }
     // ---- E: PICK IT UP ------------------------------------------------------
     //
     // A short camera ray filtered through the ground registry, which is what
@@ -10125,6 +10208,7 @@ int main(int argc, char** argv) {
           // items.json appears in the combo on this R without disturbing what
           // is already selected.
           rebuildAiWeapons();
+          rebuildGiveVessels();
           // ...and the wardrobe's three, for the same reason and by the same
           // rule: a pattern added to items.json appears on this R without
           // moving what is already picked.
@@ -10466,6 +10550,10 @@ int main(int argc, char** argv) {
     // between two ticks reads as released on the second one.
     feeder.Hold(TB_ATTACK, mouseL);
     feeder.Hold(TB_ALT, mouseR);
+    // Q winds up a throw of the held vessel; letting go throws it
+    // (game/container.h). Only a throwable vessel in hand reads it.
+    feeder.Hold(TB_THROW, captured && gameKeys &&
+                              glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS);
     feeder.Hold(TB_LASER,
                 captured && (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
                              (ui.tool == UIState::kToolLaser && mouseL)));
@@ -10511,17 +10599,15 @@ int main(int argc, char** argv) {
     // MELEE: hold LMB with the melee tool to arm the weapon, then flick.
     // Magic mode wins the mouse, so guarding and casting can never both be
     // live on the same button.
-    // WHAT IS IN THE HAND comes from the SHEATH, not the hotbar (see the
-    // draw/stow block above). A weapon that left the sheath while it was drawn
-    // — dragged into the pack from the character screen, say — is no longer
-    // drawn, and this is where that is noticed: the state lives on one side of
-    // the question, so there is nothing to keep in step.
+    // WHAT IS IN THE HAND is the selected hotbar slot (see "THE HOTBAR IS THE
+    // HAND" above). A weapon dragged out of it, or a slot change, is noticed
+    // here for free: there is no drawn flag to keep in step.
     // ---- GEAR THAT LEFT THE BODY BY FORCE (Mob::LostGear) --------------------
     //
     // The rig reports; the KIT is this frame's to fix, and it has to be fixed
-    // BEFORE the sheath and the wear loop below read it in the same tick, or
-    // the re-equip seams would faithfully pull a second sword out of the
-    // sheath while the first lies at your feet, and put the cuirass back on
+    // BEFORE the hand and the wear loop below read it in the same tick, or
+    // the re-equip seams would faithfully put a second sword in your hand
+    // from the hotbar while the first lies at your feet, and put the cuirass back on
     // a body the plate has just fallen off. The piece on the ground is
     // registered under its name (SetOnItemShed), so picking it back up is the
     // ordinary `E` and wearing it again restores exactly the holes it had:
@@ -10529,7 +10615,7 @@ int main(int argc, char** argv) {
     // piece dragged into the pack takes.
     for (const Mob::LostGear& lg : avatar.LostGearEvents()) {
       if (lg.held) {
-        ItemStack& sh = kit.equip.slots[kSheathSlot];
+        ItemStack& sh = hotbar.slots[std::clamp(hotbar.selected, 0, kItemSlots - 1)];
         if (KitItemName(sh, items) == lg.item) sh = ItemStack{};
         ui.kitMessage = "your " + lg.item + " was knocked from your hand";
       } else {
@@ -10545,11 +10631,12 @@ int main(int argc, char** argv) {
       ui.kitMessageAge = 0.0f;
     }
     avatar.ClearLostGear();
-    sheath.Reconcile(sheathKind(), UIState::kToolMelee, ui.tool);
-    const ItemStack& sheathed = kit.equip.At(kSheathSlot);
-    const ItemDef* heldItem =
-        sheath.drawn ? items.At(sheathed.Empty() ? -1 : sheathed.def)
-                     : nullptr;
+    const ItemDef* heldItem = [&]() -> const ItemDef* {
+      if (ui.tool != UIState::kToolMelee || ui.magicMode) return nullptr;
+      const ItemStack& hs = hotbar.Selected();
+      const ItemDef* d = items.At(hs.Empty() ? -1 : hs.def);
+      return d && d->kind == ItemKind::Melee ? d : nullptr;
+    }();
     const bool meleeArmed = ui.tool == UIState::kToolMelee && !ui.magicMode &&
                             heldItem && heldItem->kind == ItemKind::Melee;
     // ---- ...AND WITH NOTHING IN YOUR HANDS (plan §6) -----------------------
@@ -10576,6 +10663,28 @@ int main(int argc, char** argv) {
       const ItemDef* d = hs.Empty() ? nullptr : items.At(hs.def);
       return d && d->IsContainer() ? hotbar.selected : -1;
     }();
+    // WHERE A FILLED VESSEL POURS (game/container.h ContainerPourPoint): on
+    // the crosshair ray from the RENDER eye. The tick pours at this one, cast
+    // from LAST frame's eye (this frame's is set after the ticks); the marker
+    // re-casts the same function from this frame's eye so the sphere sits on
+    // the crosshair exactly. The two differ by one frame of motion.
+    bool pourAimValid = false;
+    Vec3 pourAim{};
+    if (vesselSlot >= 0) {
+      const ItemStack& vs = hotbar.slots[vesselSlot];
+      const ItemDef* vdef = vs.Empty() ? nullptr : items.At(vs.def);
+      if (vdef && vdef->IsContainer() && vs.Filled()) {
+        static std::vector<uint64_t> own;
+        own.clear();
+        avatar.AppendLiveLimbBodies(own);
+        const Vec3 head = player.EyePos();
+        const Vec3 from = pourFromValid ? pourFrom : head;
+        pourAim = ContainerPourPoint(
+            *vdef, from, head, cam.Forward(),
+            [&](IVec3 c) { return world.KindAt(c, classOf); }, phys, own);
+        pourAimValid = true;
+      }
+    }
     const bool meleeUnarmed = [&] {
       if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
       if (vesselSlot >= 0) return false;
@@ -10847,7 +10956,7 @@ int main(int argc, char** argv) {
 
       TickAuthority(tickCtx, session,
                     FrameIntent{brushActive, meleeArmed, meleeReady, heldItem,
-                                vesselSlot},
+                                vesselSlot, pourAimValid, pourAim},
                     ti, tick, opBatch);
 
       // ---- S5b: NPCs OUTLIVE THE WINDOW (game/persist.h MobParking) --------
@@ -11004,6 +11113,8 @@ int main(int argc, char** argv) {
         Vec3 focus = eye;
         tpRig.Update(dt, camMode, cam, focus, loco, world, kindAt);
         if (camMode != CameraMode::First) eye = tpRig.EyePos();
+        pourFrom = eye;
+        pourFromValid = true;
 
         // Hide the body in first person so the player is not inside their own
         // hat, but keep the arms and the staff — seeing your own hands is most
@@ -11677,8 +11788,7 @@ int main(int argc, char** argv) {
           const std::string& name = caster.inventory.PageAt(i);
           ui.glyphSlots.push_back(name);
           const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, {name}, kSpellStackMax);
-          SpellStack st;
-          st.spoken = ex.spoken;
+          SpellStack st = StackOf(ex);
           ui.glyphSlotReadouts.push_back(DescribeSpell(glyphs, CompileSpell(glyphs, st)).text);
           continue;
         }
@@ -11707,16 +11817,20 @@ int main(int argc, char** argv) {
           ui.itemNames.push_back(d ? d->name : "");
       }
       ui.itemSelected = hotbar.selected;
-      // The health panel's pour-on-a-part targets (inventory_ui.cpp
-      // InspectApplyPicks): live only while the selected slot is a FILLED
-      // vessel, tinted with the substance's own colour.
+      // The portrait pour brush (inventory_ui.cpp Portrait): live only while
+      // the flask chosen on the FLASKS row is FILLED, tinted with the
+      // substance's own colour. A choice whose slot no longer holds a vessel
+      // is dropped here, so the row never lights a slot the flask left.
       {
-        const ItemStack& hs = hotbar.Selected();
-        const ItemDef* hd = hs.Empty() ? nullptr : items.At(hs.def);
+        const ItemStack* hp = kit.Resolve(ui.activeVessel, hotbar);
+        const ItemDef* hd = !hp || hp->Empty() ? nullptr : items.At(hp->def);
+        if (!hd || !hd->IsContainer()) ui.activeVessel = KitRef{};
         ui.applyText.clear();
         ui.applyColor = 0;
-        if (hd && hd->IsContainer() && hs.Filled() && hs.fillMat < mats.size()) {
+        if (hd && hd->IsContainer() && hp->Filled() && hp->fillMat < mats.size()) {
+          const ItemStack& hs = *hp;
           ui.applyText = ContainerFillText(*hd, hs, mats);
+          ui.pourDrainPerSec = PourBrushCellsPerSec(*hd, ui.pourRadius);
           const uint32_t c = mats[hs.fillMat].gpu.color0;
           ui.applyColor = 0xFF000000u | (c & 0x00FFFFFFu);
         }
@@ -12104,9 +12218,42 @@ int main(int argc, char** argv) {
         ui.castAtPart.pending = false;
         castAtPartQueued = ui.castAtPart.slot;
       }
-      if (ui.applyAtPart.pending) {
-        ui.applyAtPart.pending = false;
-        session.applyAtPartQueued = ui.applyAtPart.slot;
+      // THE POUR BRUSH: the cursor on the portrait becomes a world ray through
+      // the SAME camera that rendered it -- the inverse of ProjectToPortrait,
+      // i.e. raymarch.wgsl's primary ray -- so the cell the ring sits on is
+      // the cell that was drawn under the cursor. The pick runs every frame
+      // the cursor is over the body, for the ring; the tick re-picks with the
+      // pose it pours on (MobSystem::PourOnBody).
+      {
+        PlayerSession::PourStroke& ps = session.pourStroke;
+        ps.active = false;
+        ui.pourCursorValid = false;
+        if (ui.inventoryOpen && ui.pourBrush.hover && portraitCam.valid &&
+            avatar.Spawned()) {
+          const PortraitCam& pc = portraitCam;
+          const float ndcX = ui.pourBrush.uv[0] * 2.0f - 1.0f;
+          const float ndcY = 1.0f - ui.pourBrush.uv[1] * 2.0f;
+          const Vec3 rd = (pc.cam.Forward() +
+                           pc.cam.Right() * (ndcX * pc.tanHalf * pc.aspect) +
+                           pc.cam.Up() * (ndcY * pc.tanHalf))
+                              .normalized();
+          const MobSystem::BodyRayHit hit =
+              mobs.PickBody(avatar.Id(), pc.eye, rd, 4096.0f);
+          float uv[2], edge[2];
+          if (hit.hit && ProjectToPortrait(pc, hit.pos, uv) &&
+              ProjectToPortrait(pc, hit.pos + pc.cam.Right() * ui.pourRadius, edge)) {
+            ui.pourCursorValid = true;
+            ui.pourCursorUV[0] = uv[0];
+            ui.pourCursorUV[1] = uv[1];
+            ui.pourCursorR = std::fabs(edge[0] - uv[0]);
+          }
+          ps.active = ui.pourBrush.active;
+          ps.vessel = ui.activeVessel;
+          ps.ro = pc.eye;
+          ps.rd = rd;
+          ps.radius = ui.pourRadius;
+        }
+        ui.pourBrush.hover = ui.pourBrush.active = false;
       }
       if (ui.bindGlyph.pending) {
         ui.bindGlyph.pending = false;
@@ -12256,8 +12403,7 @@ int main(int argc, char** argv) {
         };
         const GrimoireExpansion gex = ExpandWords(glyphs, caster.grimoire,
                                                   ui.grimoireEditWords, kSpellStackMax);
-        SpellStack gst;
-        gst.spoken = gex.spoken;
+        SpellStack gst = StackOf(gex);
         SpellTree gtree = ParseSpell(glyphs, gst);
         if (gtree.Empty()) gtree = EmptyTree();
         EditResult r;
@@ -12266,13 +12412,18 @@ int main(int argc, char** argv) {
         // refusing the gesture outright would make the page list useless up
         // here. The first refusal stops the run and keeps what landed.
         std::vector<int> insert;
+        // A PAGE dropped on the tree lands as the SUBTREE its words parse to,
+        // magnitudes and timing included (`InsertWords`), not one word at a
+        // time - which lost both, and turned `fire projectile` into `fire`
+        // beside an empty bolt.
+        std::vector<std::string> pageWords;
         if ((op.op == UIState::GraphEditIntent::Insert ||
              op.op == UIState::GraphEditIntent::AttachMod) &&
-            glyphs.Find(op.glyphId) < 0 && !op.glyphId.empty()) {
+            glyphs.FindWord(op.glyphId) < 0 && !op.glyphId.empty()) {
           const GrimoireExpansion pe =
               ExpandWords(glyphs, caster.grimoire, {op.glyphId}, kSpellStackMax);
-          insert = pe.spoken;
-          if (insert.empty()) say("[" + op.glyphId + "] says nothing");
+          pageWords = ExpansionWords(glyphs, pe);
+          if (pageWords.empty()) say("[" + op.glyphId + "] says nothing");
         } else if (!op.glyphId.empty()) {
           insert.push_back(glyphs.Find(op.glyphId));
         }
@@ -12280,6 +12431,10 @@ int main(int argc, char** argv) {
         switch (op.op) {
           case UIState::GraphEditIntent::Insert:
           case UIState::GraphEditIntent::AttachMod: {
+            if (!pageWords.empty()) {
+              r = InsertWords(glyphs, gtree, op.treeNode, op.lane, pageWords);
+              break;
+            }
             SpellTree cur = gtree;
             for (size_t k = 0; k < insert.size(); k++) {
               r = op.op == UIState::GraphEditIntent::AttachMod
@@ -12318,6 +12473,17 @@ int main(int argc, char** argv) {
           case UIState::GraphEditIntent::CloseLane:
             r = CloseLane(glyphs, gtree, op.treeNode, op.lane);
             break;
+          case UIState::GraphEditIntent::SetMagnitude:
+            r = SetMagnitude(glyphs, gtree, op.treeNode, op.mag);
+            break;
+          case UIState::GraphEditIntent::SetTiming: {
+            SpellTiming tm;
+            tm.trigger = (SpellTrigger)std::clamp(op.trigger, 0, kSpellTriggerCount - 1);
+            tm.every = op.every;
+            tm.delay = op.delay;
+            r = SetTiming(glyphs, gtree, op.treeNode, tm);
+            break;
+          }
         }
         if (r.ok) {
           if ((int)r.words.size() > glyphs.budgets.maxMacroWords) {
@@ -12395,10 +12561,15 @@ int main(int argc, char** argv) {
           } else if (d->IsContainer()) {
             // What is in it, and the two buttons -- the vessel has no other
             // stat, and nothing else on screen says how to use one.
+            u.fill = d->container.capacity > 0
+                         ? std::clamp((float)st.fillAmt / (float)d->container.capacity,
+                                      0.0f, 1.0f)
+                         : 0.0f;
             u.tip = ContainerFillText(*d, st, mats) +
                     "\nhands up (melee tool), selected in the hotbar:"
                     "\nRMB scoops, LMB pours where you look"
-                    "\nhealth panel: click a limb to pour it there";
+                    "\ncharacter screen: click it under FLASKS, then"
+                    "\nhold LMB on the portrait to pour it on yourself";
           }
           return u;
         };
@@ -12447,6 +12618,7 @@ int main(int argc, char** argv) {
           u.type = (int)g.sort;
           u.mana = g.word;
           u.owned = caster.inventory.Owns(gi);
+          u.hidden = g.hidden;
           u.axis = g.axis;
           u.example = g.example;
           // Valence, in the sort names the grammar uses (plan §9).
@@ -12472,6 +12644,7 @@ int main(int argc, char** argv) {
             // COUNT IS RECORD-WIDE wherever it is spoken (spell.cpp's LowerBox),
             // so the canvas must not promise a socket drop edits one instance.
             u.recordWide = false;   // nothing is record-wide wherever spoken now
+            u.splits = g.field == ModField::Count;
           } else if (g.sort == GlyphSort::Delivery) {
             u.valence = std::string(g.mech == DeliveryMech::Flight ? "flight" :
                                     g.mech == DeliveryMech::Continuous ? "continuous" : "instant") +
@@ -12524,8 +12697,7 @@ int main(int argc, char** argv) {
         auto describeWords = [&](const std::vector<std::string>& words, std::string& readout,
                                  int32_t& price, bool& unknown, int& dropped) {
           const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, words, kSpellStackMax);
-          SpellStack st;
-          st.spoken = ex.spoken;
+          SpellStack st = StackOf(ex);
           const CastList l = CompileSpell(glyphs, st);
           const SpellReadout r = DescribeSpell(glyphs, l);
           readout = r.text;
@@ -12586,13 +12758,12 @@ int main(int argc, char** argv) {
           // the expansion back — the tree has no node for "a page". Said on the
           // status line rather than silently (v1; PLAN §5 notes it).
           for (const std::string& w : ui.grimoireEditWords)
-            if (glyphs.Find(w) < 0 && !w.empty()) {
+            if (glyphs.FindWord(w) < 0 && !w.empty()) {
               ui.spellGraph.expandedNote =
                   "page " + w + " is drawn expanded; an edit writes out its words";
               break;
             }
-          SpellStack gst;
-          gst.spoken = ex.spoken;
+          SpellStack gst = StackOf(ex);
           SpellTree tree = ParseSpell(glyphs, gst);
           // A BLANK PAGE STILL HAS A HAND. `ParseSpell` of silence has no
           // clause at all (silence is not a spell), and a canvas with no root
@@ -12639,11 +12810,23 @@ int main(int argc, char** argv) {
             u.subtotal = n.subtotal;
             u.primary = n.primary;
             u.split = n.split;
+            u.owner = n.owner;
             u.bolts = n.bolts;
             u.instance = n.instance;
             u.pipW = n.pipW;
             u.edit = n.edit;
             u.wasted = n.wasted;
+            u.mag = n.mag;
+            u.graded = n.graded;
+            u.magMin = n.magMin;
+            u.magMax = n.magMax;
+            u.magStep = n.magStep;
+            u.magDefault = n.magDefault;
+            u.magLabel = n.magLabel;
+            u.trigger = (int)n.timing.trigger;
+            u.every = n.timing.every;
+            u.delay = n.timing.delay;
+            u.timingPhrase = n.timing.IsDefault() ? std::string() : TimingPhrase(n.timing);
             u.spanFirst = n.spanFirst;
             u.spanLast = n.spanLast;
             // BY NAME, not by index (DESIGN §8b): the panel holds this across
@@ -13041,6 +13224,70 @@ int main(int argc, char** argv) {
         }
       }
 
+      // SCOOP MOTES (game/session.h ScoopMote): every cell a flask or pouch
+      // took flies into its mouth -- a hop up off the ground, a swirl about
+      // the line to the vessel, then an accelerating pull that shrinks it to
+      // nothing at the mouth. The mouth is re-read every frame, so the stream
+      // bends after the hand. Render-only; the matter was already paid for by
+      // the scoop ledger.
+      if (!session.scoopMotes.empty()) {
+        Vec3 mouth = player.RenderEyePos(tickAlpha) + cam.Forward() * MetresToCells(0.35f) -
+                     Vec3{0, MetresToCells(0.15f), 0};
+        {
+          Vec3 hp;
+          Quat hq;
+          const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
+          if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq))
+            mouth = hp + Vec3{0, MetresToCells(0.08f), 0};
+        }
+        auto shade = [](uint32_t c, float k) -> uint32_t {
+          auto ch = [&](int sh) {
+            const float v = (float)((c >> sh) & 0xFFu) * k;
+            return (uint32_t)std::clamp(v, 0.0f, 255.0f) << sh;
+          };
+          return 0xFF000000u | ch(0) | ch(8) | ch(16);
+        };
+        auto at = [&](const ScoopMote& m, float t, float phase) {
+          const Vec3 d = mouth - m.from;
+          const float len = std::max(d.len(), 1e-3f);
+          const Vec3 axis = d * (1.0f / len);
+          const Vec3 ref = std::fabs(axis.y) < 0.9f ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
+          const Vec3 u = ref.cross(axis).normalized();
+          const Vec3 v = axis.cross(u);
+          const float pull = t * t;                         // slow lift, fast suck
+          const float arc = std::sin(3.14159265f * t);      // 0 at both ends
+          const float ang = phase + t * 9.0f;               // ~1.5 turns
+          const float r = std::min(1.2f, 0.12f * len) * arc;
+          return m.from + d * pull + Vec3{0, 1.1f, 0} * arc * (1.0f - pull) +
+                 (u * std::cos(ang) + v * std::sin(ang)) * r;
+        };
+        for (const ScoopMote& m : session.scoopMotes) {
+          if (m.delay > 0) continue;   // the cell is still in the grid
+          if (sprv.size() + 2 >= kMaxSprites) break;
+          const float t = std::clamp(((float)m.age + tickAlpha) / (float)m.life, 0.0f, 1.0f);
+          const float phase = (float)(m.seed & 0xFFFFu) * (6.2831853f / 65536.0f);
+          const float size = 0.40f + 0.06f * (float)((m.seed >> 16) & 3u) / 3.0f;
+          const float bright = 0.9f + 0.2f * (float)((m.seed >> 20) & 7u) / 7.0f;
+          const Vec3 p = at(m, t, phase);
+          Sprite s{};
+          s.pos[0] = p.x; s.pos[1] = p.y; s.pos[2] = p.z;
+          s.halfSize = size * (1.0f - 0.8f * t * t);
+          s.color = shade(m.color, bright);
+          s.emission = 0.0f;
+          sprv.push_back(s);
+          // A crumb trailing behind, so the stream reads as matter pouring
+          // up rather than cubes teleporting.
+          if (t > 0.15f) {
+            const Vec3 q = at(m, t - 0.15f, phase + 1.7f);
+            Sprite c = s;
+            c.pos[0] = q.x; c.pos[1] = q.y; c.pos[2] = q.z;
+            c.halfSize = s.halfSize * 0.4f;
+            c.color = shade(m.color, bright * 0.85f);
+            sprv.push_back(c);
+          }
+        }
+      }
+
       // prefab tool preview: marker box at the anchor cell, sized to the
       // rotated footprint (cheap stand-in for a full ghost render)
       if (ui.tool == UIState::kToolPrefab && !prefabs.empty() &&
@@ -13209,12 +13456,41 @@ int main(int argc, char** argv) {
           }
         }
       }
-      uint32_t debugBoxCount = 0;
-      if (!dbg.empty()) {
-        debugBoxCount = (uint32_t)dbg.size();
+      const uint32_t debugBoxCount = (uint32_t)dbg.size();
+      // ---- THE POUR POINT (game/container.h ContainerPourPoint) -----------
+      // A filled vessel in the hands shows where its stream goes: a small,
+      // mostly transparent sphere on the crosshair a metre in front of the
+      // character, or on whatever is in the way -- `pourAim`, the same point
+      // the tick pours at. It rides
+      // the debugBoxes upload as ONE record after the overlay's boxes (so the
+      // overlay's count excludes it) and has its own DEPTH-TESTED pipeline
+      // (Simulation::DrawPourMarker): the ground in front of it hides it.
+      uint32_t pourMarkerAt = UINT32_MAX;
+      // `pourAimValid` was decided BEFORE the ticks, and a tick can empty the
+      // slot since (a throw, a pour to the last drop), so re-read it here.
+      const ItemStack* vsM =
+          pourAimValid ? &hotbar.slots[vesselSlot] : nullptr;
+      const ItemDef* vdefM =
+          vsM && !vsM->Empty() ? items.At(vsM->def) : nullptr;
+      if (vdefM && vdefM->IsContainer() && vsM->Filled() &&
+          dbg.size() < kMaxDebugBoxes) {
+        static std::vector<uint64_t> ownM;
+        ownM.clear();
+        avatar.AppendLiveLimbBodies(ownM);
+        const Vec3 at = ContainerPourPoint(
+            *vdefM, eye, player.EyePos(), cam.Forward(),
+            [&](IVec3 c) { return world.KindAt(c, classOf); }, phys, ownM);
+        DebugBox b{};
+        b.pos[0] = at.x; b.pos[1] = at.y; b.pos[2] = at.z;
+        b.half[0] = b.half[1] = b.half[2] = MetresToCells(0.02f);  // radius
+        b.quat[3] = 1.0f;
+        b.color = 0x60FFF0E0u;  // pale, mostly clear (0xAABBGGRR)
+        pourMarkerAt = (uint32_t)dbg.size();
+        dbg.push_back(b);
+      }
+      if (!dbg.empty())
         ctx.queue.WriteBuffer(world.debugBoxes, 0, dbg.data(),
                               dbg.size() * sizeof(DebugBox));
-      }
 
       // rigid bodies: debris takes slots [0, D), mob limbs stack after —
       // instances rebuild when either side changes (slot bases shift),
@@ -13494,6 +13770,7 @@ int main(int argc, char** argv) {
       {
         const LiveSpan sp = spanBegin("rm_debug");
         sim.DrawDebugBoxes(rp, debugBoxCount);
+        sim.DrawPourMarker(rp, pourMarkerAt);
         // Field arrows LAST of the world draws so they composite over
         // everything they annotate. Nothing is uploaded for them — the count
         // is the only CPU work, and at zero the draw is skipped outright
@@ -13581,6 +13858,7 @@ int main(int argc, char** argv) {
         std::snprintf(sSpellShotPath, sizeof sSpellShotPath,
                       "shot_spell_%s.bmp", kShotSpellScenes[spellShot].name);
       if ((g_shotInventory && (frameCounter == kShotInvGearFrame ||
+                               frameCounter == kShotInvHudFrame ||
                                frameCounter == kShotInvCaptureFrame ||
                                frameCounter == kShotInvGrimoireFrame ||
                                frameCounter == kShotInvGraphFrame ||
@@ -13593,6 +13871,7 @@ int main(int argc, char** argv) {
             :
             g_shotJumpPath                       ? g_shotJumpPath
             : frameCounter == kShotInvGearFrame  ? "screenshot_inventory.bmp"
+            : frameCounter == kShotInvHudFrame   ? "screenshot_hud.bmp"
             : frameCounter == kShotInvCaptureFrame
                 ? "screenshot_inventory_health.bmp"
             : frameCounter == kShotInvGrimoireFrame
@@ -13616,6 +13895,7 @@ int main(int argc, char** argv) {
         sim.DrawWorld(srp);
         sim.DrawBodies(srp, bodyInstCount);
         sim.DrawMicroBodies(srp, microCount);
+        sim.DrawPourMarker(srp, pourMarkerAt);
         overlay.RenderRecorded(srp);
         srp.End();
         ctx.queue.Submit(senc.Finish());

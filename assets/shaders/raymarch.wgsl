@@ -4807,6 +4807,9 @@ fn cloudHistTexel(p : vec2<u32>) -> CloudPx {
 // the view grazes the cylinder, i.e. looking up or down. A layer is skipped
 // where the scene is nearer than it; a drop is dropped where the openness
 // grid says its cell cannot see the sky.
+// Share of the (20 m averaged) wind the streaks lean with; see rainOverlay.
+const RAIN_WIND_SHARE : f32 = 0.4;
+const SNOW_WIND_SHARE : f32 = 0.8;
 fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
   let here = bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 2u]);
   let amount = clamp(here * 1.4, 0.0, 1.0) * TUNE_CLOUD_RAIN_STREAKS;
@@ -4822,8 +4825,28 @@ fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
   // instead of shimmering between present and absent.
   let pxAng = R.tanHalfFov * 2.0 / max(R.viewPx, 1.0);
   var color = colorIn;
-  let wind = vec2f(R.windDir.x, R.windDir.y) * R.windSpeed * VOXEL_METERS;
+  // THE WIND ROUND THE EYE: windAt (the field the grass sways in, wind
+  // primitives included) averaged over a 20 m disc by cloud.wgsl's env pass
+  // (writeRainWindProbe), so the sheet leans with the local weather and a
+  // nearby fan or tornado without flickering with every 5 m gust front. One
+  // value for the whole overlay: the sheared lattice below needs ONE wind per
+  // frame to keep each column a straight line on screen.
+  let wField = vec3f(bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 4u]),
+                     bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 5u]),
+                     bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 6u]));   // m/s
   let fallV = mix(8.5, 1.1, snow);
+  // RAIN FALLS DOWN. Physically a drop does take the full horizontal wind,
+  // but at the default 6 m/s against an 8.5 m/s fall that is a 35-degree
+  // lean, and with gusts and the storm's wind the sheet read as blowing
+  // sideways. So the streaks take a SHARE of the wind (RAIN_WIND_SHARE, more
+  // for snow, which really does drift) and the lean is capped — ~35 degrees
+  // off vertical for rain, ~56 for snow. The cap also keeps a fan's mouth or
+  // a tornado's rim from laying the streaks flat, where they would run along
+  // the lattice's shear axis and the column lookup degenerates.
+  let wLean = wField.xz * mix(RAIN_WIND_SHARE, SNOW_WIND_SHARE, snow);
+  let wLen = length(wLean);
+  let wMax = fallV * mix(0.7, 1.5, snow);   // tan(lean cap)
+  let wind = wLean * select(1.0, wMax / max(wLen, 1e-4), wLen > wMax);
   // Fall direction: down, carried along by the wind. A rain drop is a short
   // SEGMENT along it (motion blur over a frame's exposure); a flake a point.
   let fallDir = normalize(vec3f(wind.x, -fallV, wind.y));
@@ -10941,7 +10964,7 @@ fn fs(in : VSOut) -> FSOut {
   // is always nearer than any cloud and this is skipped (the common case, and
   // the one that must not pay a fetch per terrain pixel).
   if ((R.weatherFlags & RWF_CLOUDS) != 0u && tDepth >= 0.0 &&
-      CL.camM.y > CL.baseM - 0.1 * CL.thicknessM) {
+      CL.camM.y > CL.baseM - cloudBaseJitterM(CL.thicknessM)) {
     let cs = cloudScreenAt(in.pos.xy);
     color = color * cs.t + cs.c;
   }

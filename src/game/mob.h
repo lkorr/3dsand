@@ -710,6 +710,14 @@ struct BodyBurnState {
   // its surface and not its volume. Built by the first contact after an index
   // (re)build, dropped with the index.
   std::vector<uint32_t> surface;
+  // Cells whose voxel wears a CORROSIVE coat (acid) -- the coat's own candidate
+  // list, the way `front` is fire's. Rebuilt by a lattice sweep whenever it is
+  // stale (index rebuilt) and every kCorrodeSweepTicks while the ledger says
+  // such a coat is on the limb, and pushed to between sweeps as the coat eats
+  // inward. Dropped with the index (MobSystem::BurnOneLimb, coat inbound).
+  std::vector<uint32_t> corrode;
+  uint32_t corrodeNext = 0;   // tick of the next scheduled sweep
+  bool corrodeStale = true;   // the index moved under `corrode`: sweep now
   // Voxels burnt away since the last collider rebuild. That rebuild is the most
   // expensive single operation in the feature, so it is batched hard.
   uint32_t removed = 0;
@@ -724,6 +732,10 @@ struct BodyBurnState {
   // Consecutive ticks with an empty front, so a body walking in and out of a
   // campfire does not rebuild its index every other tick.
   uint32_t quiet = 0;
+  // The burn pass boiled or spent a WET coat this tick (BurnOneLimb section
+  // 0). The coat ledger belongs to the caller; this is how it hears. Cleared
+  // by whoever reads it.
+  bool coatTouched = false;
   // "This limb still carries burning matter", and the ONE piece of burn state
   // that SURVIVES DropBurnIndex. `front` cannot: its entries are cells of the
   // index box that was just thrown away. Every carve drops the index (the
@@ -819,6 +831,14 @@ struct BurnLimbView {
   const std::vector<CrossHeatCell>* crossHeat = nullptr;
   int selfLimb = -1;
   uint32_t crossPct = 0;
+  // The coat ledger says this lattice wears a CORROSIVE coat (LimbCoat::
+  // corrosive), so BurnOneLimb must run even with nothing in the world around
+  // it: the acid is ON the limb. Set by the caller from its ledger.
+  bool corrodeCoat = false;
+  // The blood a voxel BARED by a removal here may be left wearing (materials
+  // .json `bareBlood`: bone). The creature's smear material on a live limb, a
+  // corpse piece's bleedMat; 0 = nothing bleeds here (debris, a bloodless def).
+  uint32_t bareBloodMat = 0;
 
   // ---- IS SOMETHING WORN IN THE WAY? --------------------------------------
   //
@@ -997,11 +1017,14 @@ struct BurnLimbView {
 // (Mob::RecountCoat, tune.coat.recountTicks) and only when something actually
 // changed a coat byte since the last walk. A clean body pays nothing (rule 2).
 //
-// The two HEAVIEST materials are kept and the rest is folded into the totals.
-// Two rather than all of them because the ledger rides on every limb of every
-// creature and a map per limb is not worth the allocation: a body is realistically
-// bloody, or wet, or bloody and wet. Anything reading a specific substance off
-// this reads it off `top`; anything reading "how coated is this" reads Frac().
+// The kCoatTop HEAVIEST materials are kept and the rest is folded into the
+// totals. A fixed handful rather than all of them because the ledger rides on
+// every limb of every creature and a map per limb is not worth the allocation.
+// It was TWO until 2026-09-23 ("a body is realistically bloody, or wet, or
+// both"), which stopped being true the day oil, acid and lava became coats: an
+// oiled player in the rain is oiled AND wet AND maybe bloody, and the HUD could
+// only ever name one of them. Anything reading a specific substance off this
+// reads it off `top`; anything reading "how coated is this" reads Frac().
 // ---- JOINT TWINS (Mob::SyncJointTwins; the long note is at Mob::twins_) ----
 // One side of a coincident cell, as of the last sync.
 struct JointTwinSide {
@@ -1027,11 +1050,17 @@ struct CoatEntry {
   uint32_t voxels = 0;   // voxels carrying it
 };
 
+inline constexpr int kCoatTop = 4;
+
 struct LimbCoat {
   uint32_t voxels = 0;   // occupied lattice voxels — the denominator
   uint32_t stained = 0;  // of those, how many carry any coat at all
   uint32_t sumAmt = 0;   // total amount over EVERY material, `top` or not
-  CoatEntry top[2]{};    // the two heaviest, by sumAmt, descending
+  CoatEntry top[kCoatTop]{};  // the heaviest, by sumAmt, descending
+  // Voxels whose coat is CORROSIVE (MobSystem::matCorrodes_) -- counted over
+  // EVERY material, not just `top`, so a thin film of acid under a lot of
+  // blood still wakes the burn pass. 0 when counted without the table.
+  uint32_t corrosive = 0;
   // 0 = clean, 1 = every voxel saturated with something.
   float Frac() const {
     return voxels ? (float)sumAmt / (float)(kBodyStainAmtMax * voxels) : 0.0f;
@@ -3203,14 +3232,26 @@ class Mob {
   // Does hp reaching zero take this limb OFF, or merely kill the creature?
   // See the note at the call sites: geometry dismembers, damage kills.
   bool HpZeroSevers(int limbIndex) const;
-  void EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
-                          std::vector<DebrisVoxel> part, World& world,
-                          std::vector<ParticleSpawn>& spawns);
+  // The debris handle of the fragment, or 0 when it went to particles instead
+  // (no brick, Jolt refused). CarveLimb joints a child limb to it when the
+  // child's socket left with the fragment.
+  uint64_t EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
+                              std::vector<DebrisVoxel> part, World& world,
+                              std::vector<ParticleSpawn>& spawns);
   void LimbVoxelsToParticles(const MobLimb& limb, uint32_t physScale,
                              const std::vector<DebrisVoxel>& voxels, World& world,
                              std::vector<ParticleSpawn>& spawns) const;
   void ReleaseLimbMicro(MobLimb& limb);
-  void DetachLimb(int limbIndex, bool adopt);
+  // `keepJoint`: the limb leaves WITH its parent (DetachLimb's own child
+  // recursion), so the joint between them is handed to the debris pair rather
+  // than destroyed -- a severed forearm keeps its hand, as a corpse keeps its
+  // limbs. Only ever true for an adopted anatomy child.
+  void DetachLimb(int limbIndex, bool adopt, bool keepJoint = false);
+  // One collision group for a severed piece and everything jointed or strapped
+  // to it, so a forearm and the hand still jointed to it do not fight their own
+  // joint once the pieces are free (the corpse keeps the mob's group for the
+  // same reason). Called wherever a hold is released.
+  void GroupSeveredPiece(uint64_t handle);
   // Tear down every body/joint/brick this rig still owns (despawn, reset).
   void ReleaseRig();
 
@@ -3906,6 +3947,8 @@ class MobSystem {
   // same on a limb as it does in the grid. Unset means night; see the same
   // setter on DebrisSystem.
   void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
+  // TickParams::weatherRain for this tick (materials.h kRainAmountMask et al).
+  void SetWeatherRain(uint32_t w) { weatherRain_ = w; }
   void SetDefs(std::vector<MobDef> defs);           // hot reload
   const std::vector<MobDef>& Defs() const { return defs_; }
   // The loader's leftovers, so this system can build one more creature after
@@ -4973,6 +5016,12 @@ class MobSystem {
   // that question any more, because the rot converts bone and a coated voxel
   // leaves the census the moment it does.
   uint32_t LimbInfectBoneCoated(uint64_t mobId, int limbIndex) const;
+  // Voxels of `mat` on this limb with at least one EMPTY face neighbour in its
+  // own lattice (open to the air, or to the joint face at the lattice's end),
+  // and in `*coated` how many of those wear a `coatMat` coat. What "the bone
+  // the acid bared is bloody" is measured as (materials.json bareBlood).
+  uint32_t LimbExposedMatCount(uint64_t mobId, int limbIndex, uint32_t mat,
+                               uint32_t coatMat, uint32_t* coated) const;
   // ...and the OTHER field on the same voxel: how many cells are WEARING a coat
   // of `coatMat` (0xFFFFFFFF = any) at `minAmt` or deeper. The one above filters
   // on what the voxel IS MADE OF; this filters on what is ON it, which is what
@@ -5015,9 +5064,9 @@ class MobSystem {
   // ("foot", "hand", ...); nullptr means the whole body. 0 for an unknown
   // creature, an unknown tag, or a clean one.
   //
-  // Reads the two heaviest materials per limb, which is what the ledger keeps.
-  // A tag carried only by a body's THIRD substance reads 0 — correct enough
-  // for "is this hand bloody", and the alternative is a per-limb map.
+  // Reads the kCoatTop heaviest materials per limb, which is what the ledger
+  // keeps. A tag carried only by a limb's fifth substance reads 0 — correct
+  // enough for "is this hand bloody", and the alternative is a per-limb map.
   float CoatTagFraction(uint64_t mobId, const char* tag,
                         const char* limbTag) const;
   // Mob::DepositCoat by id, so a caller holding only the system can track a
@@ -5050,6 +5099,44 @@ class MobSystem {
   static constexpr uint32_t kRemedyStanch = 1u, kRemedyDisinfect = 2u;
   uint32_t DouseLimb(uint64_t mobId, int limb, uint32_t mat, uint32_t amount,
                      uint32_t tick, uint32_t* marked = nullptr);
+  // ---- THE POUR BRUSH (the health panel's portrait, game/container.h) -------
+  //
+  // DouseLimb coats a WHOLE limb, which is a click on a part. The brush is a
+  // place on the skin: a world ray (the portrait camera through the cursor)
+  // against the body's own authoritative lattice -- the skin cells when the
+  // limb has a finer skin, the collider otherwise, the same rule BurnLimbView
+  // applies -- so the cell it names is a cell that is drawn.
+  //
+  // PickBody: the nearest occupied cell the ray enters, over every live limb.
+  // Refreshes each limb's pose from physics first, so the answer is where the
+  // body IS this frame, which is what the portrait rendered.
+  struct BodyRayHit {
+    bool hit = false;
+    int limb = -1;
+    float t = 0.0f;   // world voxels along the (unit) ray
+    Vec3 pos{};       // world point where the ray entered the cell
+  };
+  BodyRayHit PickBody(uint64_t mobId, Vec3 ro, Vec3 rd, float maxT);
+  // Coat the SURFACE under a round brush of `radius` world voxels around the
+  // ray through `hit`: every cell whose centre is within `radius` of the ray
+  // line AND is the nearest cell along the ray in its column (binned at the
+  // finest lattice pitch on the plane across the ray), so the stain lands on
+  // the face you can see and not through the arm onto the far side, or onto
+  // the torso behind it. ACCUMULATES (AddBodyStain, +`amount` a tick up to
+  // the cap) so holding the brush over a spot deepens it; a washer takes
+  // WashBodyStain's road instead, as a poured limb does. Pokes the micro brick
+  // so the coat is drawn where it went. Then every limb that took any of it
+  // runs the material's `coat.effects` (DouseLimb's list). Returns the
+  // kRemedy* bits; `marked` = cells that changed, `drawn` = of those, how
+  // many reached the micro brick the renderer draws (0 on a cube-path limb,
+  // whose coat is gameplay state only).
+  uint32_t PourOnBody(uint64_t mobId, const BodyRayHit& hit, Vec3 rd,
+                      float radius, uint32_t mat, uint32_t amount,
+                      uint32_t tick, uint32_t* marked = nullptr,
+                      uint32_t* drawn = nullptr);
+  // The material's authored `coat.effects` run once on one limb: the half of
+  // DouseLimb that is not the coat, shared with PourOnBody.
+  uint32_t CoatEffectsOn(Mob& mob, int limb, uint32_t mat);
   // Force the ledger's cadence (Mob::RecountCoat) for one creature, so a
   // caller that has just changed a coat can read the answer this instant
   // instead of waiting out tune.coat.recountTicks.
@@ -5068,11 +5155,47 @@ class MobSystem {
                     World& world, uint32_t& budget);
   // The drying half of Mob::StainTick over a view: every substance in `led`
   // with an authored coat.decay loses a level on half its voxels once per
-  // period. Shared by the living and the dead (StainCorpses).
+  // period. Shared by the living and the dead (StainCorpses). In the SUN
+  // (daylight, and nothing but air/gas over the limb, InSunlight) the period
+  // is divided by coat.sunDryScale; `world` null skips the probe (shade).
   bool DryOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
-                  uint32_t key, uint32_t& budget);
+                  uint32_t key, uint32_t& budget, World* world);
+  // Is this world point in sunshine: daylight up (dayPhase_) and a clear
+  // column to kSunProbeCells above it in the CPU mirror. A column not yet
+  // mirrored reads as OPEN and is requested -- most of the world is outdoors,
+  // and the next probe answers properly.
+  bool InSunlight(World& world, const Vec3& p) const;
+  // InSunlight without the daylight half: nothing but air/gas in the column
+  // above `p` (same probe, same "unmirrored = open" rule). What rain asks.
+  bool OpenToSky(World& world, const Vec3& p) const;
+  // RAIN ON A BODY: while TickParams::weatherRain says it rains and the limb
+  // is under open sky, its world-UP-facing surface voxels get slowly wetter
+  // (and rinse a foreign coat a level first, WashBodyStain's rule), capped by
+  // how hard it rains. The existing wet lifecycle (WetOneLimb wicks + drips,
+  // DryOneLimb dries) takes it from there. Bounded by `budget`.
+  bool RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
+                   uint32_t& budget, World* world);
+  // Where RainOneLimb's calls went (the mob-rain gate prints it): a bare
+  // "0 wet voxels" names no cause, this names the early-out that ate them.
+  struct RainStats {
+    uint32_t calls = 0, dry = 0, offCadence = 0, noView = 0, roofed = 0,
+             noWater = 0, noIndex = 0, sampled = 0, notTop = 0, capped = 0,
+             wrote = 0;
+  };
+  RainStats rainStats_;
+  // What a WASHING coat (water) does while it is on a body, over a view: it
+  // WICKS -- a wet voxel rinses the foreign coat on a lattice neighbour and
+  // leaves it wet at half its own depth -- and it DRIPS off the undersides as
+  // micro droplets (world.h kPFlagDrip: they land and vanish, the ground is
+  // never marked), each drop taking a level off the voxel it left. `drips`
+  // null = wick only. Bounded by `budget`, a per-tick drip cap and the
+  // ledger: a limb with no washer on it returns at once.
+  bool WetOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
+                  uint32_t key, uint32_t& budget,
+                  std::vector<ParticleSpawn>* drips);
   // One lattice's coat ledger (Mob::RecountCoat's per-limb count).
-  static void TallyCoat(const BurnLimbView& v, LimbCoat& out);
+  static void TallyCoat(const BurnLimbView& v, LimbCoat& out,
+                        const std::vector<uint8_t>* corrodes = nullptr);
   // ---- THE DEAD TAKE A COAT TOO (2026-09-22) --------------------------------
   // Contact (blood stains, water rinses) and drying over every dead-flesh
   // debris body, through StainOneLimb / DryOneLimb — the passes the living
@@ -5516,15 +5639,57 @@ class MobSystem {
   std::vector<uint32_t> coatDecayFloor_;
   std::vector<uint32_t> coatShed_;
   std::vector<std::vector<std::string>> coatEffects_;
+  // A coat of this material EATS the body under it: it has a stain slot (it
+  // can be worn) AND matAttacksBody_ (its rules rewrite body matter). Acid.
+  // ...OR it is HOT (lava): a coat that burns what it sits on. Both kinds act
+  // with nothing else around, so both are seeded, dried, kept to the surface
+  // and stopped by a worn shell the same way.
+  std::vector<uint8_t> matCorrodes_;
+  std::vector<uint32_t> corrosiveMats_;  // the ids matCorrodes_ marks
+  // A HOT coat (wearable and tag:hot). BurnOneLimb reads it as what is OUTSIDE
+  // every exposed face of the voxel wearing it, so the voxel's own heat rules
+  // (sear, ignite) see it exactly as they would a wall of lava against them.
+  std::vector<uint8_t> matCoatHot_;
+  // A FUEL coat (wearable, and one of its own pair rules turns it into
+  // something hot: oil + tag:hot -> fire). Inert until heat touches it; then
+  // the coat flashes, lights the voxel under it (flashForm_) and the flame
+  // walks the rest of the coat through the lattice.
+  std::vector<uint8_t> matCoatFuel_;
+  // mat -> what it becomes when a fuel coat on it flashes: its ignited form,
+  // else the ignited form of what heat first turns it into (skin -> cooked ->
+  // burning), else that first product; 0 = nothing (bone, steel: the oil just
+  // burns off it).
+  std::vector<uint32_t> flashForm_;
+  std::vector<float> coatDepth_;      // MaterialDef::coatDepth
+  std::vector<float> matBareBlood_;   // MaterialDef::bareBlood
+  std::vector<int32_t> coatContact_;  // MaterialDef::coatContact (-1 = stain chance)
+  // The coat a new coat of `mat` should be laid OVER: `cur`, except that a
+  // CORROSIVE coat arriving on a voxel wearing one that is not treats it as
+  // clean. Acid does not sit on top of blood waiting to be heavier than it --
+  // without this a bloodied arm could not be coated in acid at all, because a
+  // different coat is only ever replaced by a strictly larger amount.
+  //
+  // A WASHER'S coat (water) likewise gives way to anything that is not itself
+  // a washer. Wet is not a substance sitting on the skin competing for it --
+  // it is the skin being damp -- and under Raise's "strictly heavier" rule a
+  // rain-soaked body (wet 12) could not be oiled at all (oil pours at 6): the
+  // owner oiled their character in a storm and the HUD said only "water"
+  // (2026-09-23).
+  // The reverse direction is WashBodyStain's, unchanged: water arriving on oil
+  // rinses it rather than being refused.
+  uint16_t CoatBeneath(uint16_t cur, uint32_t mat) const;
   // Deposits every creature together may track onto the ground this tick
   // (tune.coat.shedPerTick), charged BEFORE the droplet is queued and reset at
   // the top of PreTick. A budget and not a rate, for the reason every other
   // gore budget is one: the number of feet in a crowd is not bounded by
   // anything this layer controls.
   uint32_t coatShedSpent_ = 0;
+  // Drips off wet bodies this tick, all creatures together (WetOneLimb).
+  uint32_t coatDripSpent_ = 0;
   // mat -> what it becomes when it catches (see IgnitedForm).
   std::vector<uint32_t> ignitedForm_;
   uint32_t dayPhase_ = 0;
+  uint32_t weatherRain_ = 0;
   // EVERY LIVE BODY POINTS INTO THIS VECTOR (Mob::def_, and the avatar's too,
   // which this system cannot reach). So it is never allowed to reallocate
   // after a load: SetDefs reserves room for kDerivedDefs compositions up
@@ -5737,6 +5902,9 @@ class MobSystem {
   // Ticks a cold limb keeps its dense index before releasing it, so a limb
   // walking through a campfire does not rebuild the index every other tick.
   static constexpr uint32_t kBurnIndexGrace = 30;
+  // How often a limb wearing a corrosive coat re-sweeps its lattice for it
+  // (BodyBurnState::corrode) -- how late a fresh pour of acid can start eating.
+  static constexpr uint32_t kCorrodeSweepTicks = 6;
   // ---- the stain pass (StainLimbs / StainOneLimb) ---------------------------
   // World cells one limb's walk may read per tick (its AABB, dilated by one)
   // before it decides nothing is against it.

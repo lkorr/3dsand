@@ -4647,6 +4647,21 @@ touch a creature with a sword, lose a limb, anywhere, every time.
   ordinary `Sever()`, so this changes WHEN a limb comes off and nothing about
   what coming off means. Neither applies to a burn (which has its own tested
   account of charring through) or to a blast (which has no "other side").
+- **What is seated in a piece that leaves goes with it (2026-09-23).** Every
+  cause but blunt and a body's birth rot: when `CarveLimb`'s split parts a limb,
+  each child's socket is assigned to the nearest component big enough to be a
+  body. If that is not the kept (anchor) component, the child is `Sever()`ed and
+  jointed to the carved-off fragment at its live anchor, hold skipped, so the
+  pair falls as one object. Owner report: acid poured on a forearm ate through
+  its middle and the hand stayed on the rig, floating at a wrist that had gone —
+  fire and acid are exempt from the neck rules (`JointRuleApplies`), and those
+  measure flesh, not connectivity. The same report's other half: `DetachLimb`'s
+  child recursion destroyed every child joint, so a cut-off arm landed as three
+  unrelated bodies. An anatomy child leaving WITH its parent now keeps that
+  joint (`keepJoint`) and hands it to the debris pair as `Die()` hands over a
+  corpse's; the held item and worn shells still lose theirs.
+  `Mob::GroupSeveredPiece` gives the jointed/strapped set one collision table
+  when the holds release. Gate `severed-hand`.
 - **Heft is derived from the art.** `ItemDef::heftVolume` is the item's own
   voxel count in world voxels; the factor the wound model consumes is that
   against `gore.woundHeftRef` (the stock arming sword, 5.3). A greatsword cuts
@@ -5396,6 +5411,107 @@ two ticks a level, a value an author can set -- it falls to 62 in 47 ticks; a
 direct deposit on a stone cell of the room reads blood's slot at amount 5 and
 the cell is still stone.
 
+**Water on a body washes, wets, wicks and drips (2026-09-23;
+`WashBodyStain`, `MobSystem::WetOneLimb`, `kPFlagDrip`).** BODIES ONLY — the
+world's wet stain is unchanged and still never dries (a pond bed that dried
+would keep its chunks awake; see "Absorption and washing"). A washer
+(`stain.washes`) meeting a coat by any door — contact, splatter, the health
+panel's pour — goes through one rule: a foreign coat is stepped down by the
+rinse (`gore.stainWashPerContact`, 5; a pour rinses twice its own depth), and
+a voxel that comes out clean is left WET at the washer's amount. Before this
+contact rinsed but never wetted, and a pour or splash of water used Raise and
+so left blood exactly where it was. While wet, every third tick a limb samples
+96 voxels: a wet voxel beside a foreign coat rinses it by 2 and leaves it wet
+at half its own depth (15 -> 7 -> 3 -> 1, then it stops — monotone), and a wet
+underside (world-down lattice neighbour empty) drips a micro droplet, losing a
+level for it (<= 2 per limb, 48 per tick across all creatures). A drip carries
+`kPFlagDrip` and vanishes on landing WITHOUT staining the ground, because
+water's world stain never dries and a dripping creature would otherwise leave
+a permanent trail. Water's `coat.decay` is 2: `DryOneLimb` drops half the
+voxels a level per period, so a soaked limb is dry in ~60 s. Gates: `vessel`
+(water poured over blood leaves the limb wet with no blood), `body-stain` /
+`corpse-wash` (the river judged on BLOOD left, 1496 -> 0, not on "any coat").
+Drips are not gated. Corpses wash and get wet but neither wick nor drip
+(StainCorpses does not call `WetOneLimb` yet).
+
+**Wet vs fire, sun, and the look (2026-09-23).** A voxel whose coat is a
+washer does not catch: `BurnOneLimb` section 0 skips every rule whose product
+is hot or a burn stage for it (so it neither ignites nor sears), and
+`IgniteOneLimb` skips it. Heat against it BOILS the coat instead, one level per
+roll at a rate that takes a soaked voxel to dry in `coat.fireDrySeconds` (2 s)
+-- fire dries you out, then takes you. A BURNING voxel that is wet or has a
+wet lattice neighbour runs its own authored `tag:extinguisher` douse rule with
+the water as the neighbour (no new table), and the water pays
+`kCoatDouseCost` (4) levels. In sunshine -- daylight up and no non-gas cell in
+the 48 above the limb in the CPU mirror (`MobSystem::InSunlight`; unmirrored
+reads as open) -- a washer coat dries `coat.sunDryScale` (2x) faster; blood is
+not sped up. How strongly a coat SHOWS on a body is `coat.opacity` in
+materials.json (default 1; water 0.4), packed into the stain colour's alpha
+byte and applied only by `microbody.wgsl` `bodyStainTint` -- the soak amount
+still runs 0..15 for the wash/wick/dry rules. `body-coat` gates the fire half:
+every limb but one soaked, the creature stood in a fire column 90 ticks with
+`fireDrySeconds` parked long: soaked root 0 seared vs dry torso 595. Fixture
+note: `World::Cached` is only refreshed on request, and what re-requests a
+dirty chunk each tick is the debris island scan -- a fire fixture that skips
+`debris.QueueSupportEvents`/`PreTick` burns against a pre-fire mirror.
+
+**A coat that EATS: acid on a body (2026-09-23).** Owner report: acid poured
+on a character neither showed nor dissolved anything. Two gaps: acid had no
+`stain` block, so every coat write (pour, splash, contact) refused it; and a
+coat could not act on the voxel under it -- only a GRID cell of acid could,
+through `BurnOneLimb`'s inbound pass. Now:
+- **`"bodyOnly": true` on a LIQUID's stain** gives it a palette slot for
+  bodies and NO type bits in the GPU `stainPack`, so no kernel ever marks the
+  ground with it (`sim_step` doStaining, the particle landing and the fluid
+  seam all gate on those bits). `MaterialDef::stainSlot` is the slot; read it,
+  not the pack, wherever the question is "how is this drawn". The world hash is
+  unmoved by construction.
+- **A corrosive coat** is any wearable coat whose material `matAttacksBody_`
+  (its pair rules rewrite body matter) -- `MobSystem::matCorrodes_`, acid
+  named nowhere. `BurnOneLimb` section 3 evaluates the coat material's own
+  rules against the voxel it sits on (the inbound pass with the coat as the
+  neighbour, rule index +128), so flesh/skin/cloth/leather go at 125 (halved from 250 the same day: too fast),
+  dissolvables at 45, iron pits at 10, bone and steel shrug it off. The ledger
+  counts `LimbCoat::corrosive` over every material, which wakes the pass with
+  nothing in the world near the limb; `BodyBurnState::corrode` is the coat's
+  candidate list (swept every `kCorrodeSweepTicks` and after every index drop,
+  pushed to as the coat carries).
+- **Bounded by what was poured (rule 2).** An eaten voxel's coat carries into
+  the lattice voxels behind it, paying one layer's price: `15 / (coat.depth x
+  scale)` levels, in WORLD units so a fine-skinned creature is not eaten
+  deeper. A film thinner than a layer's price takes it iff it clears a
+  threshold fixed per voxel (position-keyed, not tick- or amount-keyed): a
+  per-tick roll let a thin film bite eventually and doubled the depth. Acid
+  `depth` 0.4: a full coat reaches the bone of a human limb, a splash (6) takes
+  skin and some flesh. `coat.decay` 0.15 s/level: a splash is gone in ~2 s, a full coat in ~5, bone included. `DryOneLimb` dries every CORROSIVE coat when the ledger counted one, not only the ledger's ranked few -- blood outweighed a thin acid film on bone and it never dried.
+- **It displaces, it does not wait**: `MobSystem::CoatBeneath` treats a
+  non-corrosive coat as clean when a corrosive one arrives, so a bloodied arm
+  can be coated in acid at all (Raise only repaints with a strictly larger
+  amount). A corrosive `SoakLimb` (the health panel's pour) coats the SURFACE
+  only -- every other coat soaks the whole lattice, and acid inside a limb ate
+  a thigh in three seconds. The same door opens for WATER going the other
+  way (2026-09-23): a washer's coat gives way to any non-washer, so a
+  rain-soaked body (wet 12) can be oiled (oil pours at 6); water arriving on
+  oil still rinses it (`WashBodyStain`). Rain rinses tops and, at a runoff
+  roll, sides (`RainOneLimb`); gate `rain-oil`. The ledger ranks the
+  `kCoatTop` (4) heaviest substances per limb and body, and the HUD names each
+  one with its share.
+- **Contact**: `coat.contact` (per mille) replaces the ground stain chance for
+  body contact (acid's ground chance is 0). Acid is at 15, low on purpose: the
+  pool already eats you through the grid inbound pass, and at 120 the two
+  stacked and an ankle-deep bath took every submerged limb to the bone in 20
+  ticks. A corrosive contact asks the worn-shell probe first (`StainTick` now
+  sets it up as `BurnTick` does), so acid does not coat skin under a plate.
+- **The look**: `coat.opacity` 0.5, and `coat.glow` / `coat.pulse` (Hz) are
+  mirrored into the stain palette entry's spare `_r2` word (materials.h
+  `kCoatGlow*`); `microbody.wgsl` `bodyCoatGlow` adds emission and
+  `bodyStainTint` breathes the cover 70-100% on the same wave.
+Gate `acid-coat` (pose ticks only): acid over blood coats 720 surface voxels,
+the limb goes 1344 -> ~400 (skin + flesh, bone left, limb stays on), the blood
+control limb loses 0, the acid is spent and the limb then holds. NOT covered:
+corpse contact does not ask a worn probe (corpses have no occlusion on the stain
+pass); the cube-path renderer (`debris.wgsl`) draws no coat at all.
+
 ### A creature is a variant of another creature (2026-09-15, inheritance + becoming one at runtime 2026-09-20; `src/game/sidecar.*` + `assets/editor/sidecar.js`, sidecar `extends`/`model`/`effects`/`palette`/`turn`, `assets/mobs/effects/`, `BuildMobDef` + `MobDefFactory`, `MobSystem::DefWithEffects`/`TurnMob`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gates `sidecar-resolve` + `undead` + `zombify`)
 
 A zombie is a human who walks slower, is paler, does not heal, and arrives
@@ -5771,6 +5887,16 @@ section above gives had no organs to point at. The human now has an interior:
 skin one voxel deep, `flesh` under it, `muscle` under that (speckled with
 `blood`), and `bone` at the core; the head is a two-voxel bone skull around a
 flesh brain.
+
+**Depth makes a shell; `carve` makes a skeleton (2026-09-22).** A depth
+schedule alone gives an egg-shaped skull and a solid bone brick in the chest.
+A limb's `carve` rules (`limbs.<name>.carve`: material / where / box as
+fractions of the limb box, +z front / depth range / stripe) rewrite what the
+schedule put there, last match wins, never on a kept layer: the human's skull
+gets two orbits and a nasal hole filled with flesh, its chest is hollowed to
+flesh with a muscle wall and bone put back as ribs, a sternum and a spine.
+`anatomy.js carveFor/carveMatches` and `anatomy_resolve.cpp CarveFor/
+CarveMatches` are the same rule; `--gate anatomy-parity` keeps them one.
 
 **This is authoring, not engine.** Every runtime consumer was already per
 voxel: `voxload` keeps enclosed cells, the micro brick is dense and its march
@@ -6430,6 +6556,65 @@ misfire state, and the imprecision penalty lives entirely in the mana/health
 crossover. The HUD's brackets are derived from the tree, so a box draws as
 `[ … DELIVERY]` and what you see is what nested.
 
+**Every word has a MAGNITUDE, and it is a property, not a word**
+(2026-09-23; `docs/PLAN_spell_magnitude.md` M1; gate `spell-magnitude`). The
+player only ever edits the 2D page, so the word list is the SERIALIZATION and
+not the design constraint: a new quantity is a per-node property written as a
+suffix (`float@0.5`), never a new word with a place in word order. A
+magnitude is per-mille of the glyph's authored quantity and rides beside
+multiplicity — `SpellStack::mags` → `SpellNode::mag` → `EffectInst::mag`, and
+every consumer scales by `n × mag / 1000` (`EffectInst::Scale()`), which is the
+old integer-`n` formula EXACTLY at 1000, so a page without a suffix lowers
+bit-for-bit as before and no pinned price moved. An add mod adds amount × mag
+(`float@0.5` = −0.5 g), a mul mod multiplies by amount × mag (`swift@1.5` = ×3,
+never below ×1), a div mod divides by it; matter, effects and the opted-in
+operators (`transmute`, `mend`, `trail`, `null`) scale their axis. The TARIFF
+follows the world effect for free (`explosive@2` prices as `explosive
+explosive`); the WORD price is convex, word × mag² (`MagnitudeWordCost`), so the
+middle of the range is the efficient buy. Ranges are content (`"magnitude":
+{min,max,step}` or `false` in glyphs.json; defaults by sort — count mods,
+deliveries and marks do not scale, bounce/pierce/seek step whole units),
+clamped once at parse. Only equal magnitudes merge (`NodeKey` carries `~mag`
+when it is not 1000). The page sets it with the wheel over a cell
+(`SetMagnitude`, total and self-proving like every op); the scripts/oracle
+corpus has no suffixes and is untouched.
+
+**One signed component per quantity** (2026-09-23, M2). A glyph may declare a
+`default` magnitude and — for the two quantities where "negative" means
+something, gravity added and a wind's speed — a range that crosses zero. `lift`
+(default 1 = one g of lift; `lift@-1` presses down), `speed` (a multiplier,
+default x2, down to x0.25) and `wind` (a burst: positive blows out, `wind@-1`
+is a vacuum) replace `float`/`heavy`, `swift`/`slow` and `implode`, which stay
+loadable (`"hidden": true`: old pages work, the word column does not offer
+them). A serialized word omits its suffix exactly when it is at its glyph's
+default, so an unedited `lift` is written `lift`.
+
+**WHEN an item fires is a property of the item, not a word** (2026-09-23, M3;
+gate `spell-timing`). Any payload item — a word, an operator group, a nested
+box — carries a `SpellTiming`: trigger `hit` (default; what every item always
+did) | `bounce` | `expire` | `launch` | `every N`, plus a `delay` in ticks.
+Serialized on the item's head word (`explosive!bounce`, `projectile!every10`,
+`fire+20`; a box's on its delivery word), carried `SpellStack::timing` →
+`SpellNode::timing` → `EffectInst::timing`, part of `NodeKey`, and refused on a
+mod (it edits its carrier, it does not fire). The flight loop fires each event's
+items through the one `resolve` path — impact and fuse the hit items (plus the
+expire items when an orb's expiry IS its resolve), each bounce the bounce items
+along the rebound, a bolt that dies in the air its expire items, every tick of
+flight `age % every == 0` items, `AdoptLaunches` the launch items at the muzzle
+before the carrier is born; bombs honour hit and every. A DELAY is a one-shot
+`SpellEcho` scheduled by `ApplySpellEffect`, so it is bounded, op-budgeted and
+ticked by code that already was, and a flattened (fatal) payload ignores it.
+PRICE: an item costs its tariff × `FiresIn(carrier, item)` — bounces, life /
+period, 0 for an event the carrier cannot have (a bomb does not bounce) — and a
+delay is free but lengthens the rule-2 tick bound. Only a FLIGHT carrier has
+events; on the hand, `self` and a beam every item fires at the resolve and
+`SetTiming` refuses anything but a delay there. `echo` gained a magnitude that
+scales its repeat count. On the page a plain click on a cell opens the "when
+does it fire?" menu, and a timed cell wears a tag where its stroke leaves.
+Known gap: a delayed or `every` child box is born from the echo queue at
+generation 0 rather than its parent's + 1 — still bounded (tree depth, the
+item's own fire count), but the generation cap does not see it.
+
 **The reference interpreter is the oracle.** `scripts/magic_grammar.py`
 implements the same three rules over the same glyph table and generates
 `docs/MAGIC_PERMUTATIONS.md` (the worked sets, every word, every brief
@@ -6891,6 +7076,88 @@ made (there is no `lane`/`end` pair to take out; what closes it is the mod),
 each with its own sentence. Everything still goes through the same `Finish`, so
 a pruned tree proves itself by re-parsing exactly like any other edit.
 
+**A SPLIT WORD ALWAYS FANS WHAT IT LANDS ON (2026-09-22).** A socket drop asks
+for lane `instance + 1`, and a socket with no lane of its own OPENS one — right
+for a payload, and exactly wrong for the word that MAKES sockets. A blank page
+draws one bare socket over the hand, so the only thing a dragged `shotgun` or
+`twin` could do there was `lane shotgun end`: one empty instance carrying a
+split, and the three branches the player dragged it in for were never drawn. So
+`AttachMod` clamps a `count` aimed past the last REAL lane back to the scope
+those sockets belong to (lane 0) — `AttachMod` is the truth and the canvas makes
+the same test only so the sentence under the cursor and the ghost describe the
+drop that is actually going to happen. **And it is right exactly ONCE per box.**
+A second count aimed at a socket of a box that ALREADY fans is not asking to fan
+the trunk twice (that is one split per scope, and the word would be charged and
+do nothing) — it is asking for a twin OF a twin, contained in that branch. So
+the clamp stands down once the shared scope holds a count and the lane opens
+after all: `twin`, then `twin` on one of its two sockets, is `twin lane twin end`
+— two bolts, one of which is two. That nesting is something the grammar could
+always say and the canvas could not reach. The refusal survives only where it
+means something: aiming a second count at a scope that already holds one.
+
+**THE FAN CASCADES (2026-09-22).** From the owner, on `shotgun lane twin end`:
+"the twin doesnt split into 2 more. it should just fractal cascade into more and
+more." It did not. A branch's own split was drawn as a TALLY on the delivery cell
+capping that branch, and the `hand` has no cell per branch — so on the reported
+sentence the second split, which is real in the words, real in the price and real
+in the number of bolts that fly (`RecBolts` charges every budget on the sum), was
+drawn as nothing at all. A split is a split at every depth: a branch firing more
+than one bolt now gets its **own junction and its own socket row inside its
+column**, by exactly the three laws the box's own fan follows — the junction on
+the column's axis, its sockets one band forward of it, the `Fan` edge pointing
+back at it — and the delivery is drawn **once per BOLT** rather than once per
+branch. `laneSplits[k]` is the per-branch count and the VM always had it; only
+the drawing collapsed it. A count spoken inside a lane therefore fuses into that
+branch's junction the same way a record-wide one fuses into the box's, instead of
+being a bead over the pip it splits. Depth past two levels comes from nesting
+BOXES, which recurses through `Place` already (`fire shotgun projectile twin
+projectile` is a fan feeding a fan). The column budget is now `sum(laneSplits)`
+rather than `instances`; a box past it keeps the older collapsed drawing, and no
+legal 32-word sentence reaches that — it is a guard, not a path. Consequences
+worth naming: cells per box became "one per bolt, or one per branch when
+collapsed, and every branch capped at least once" in the gate's law 3, and
+`boxOf` in the canvas became a back-pointer (`SpellGraphNode::owner`, set on every
+socket, bus and junction at every depth) because the old search over each join's
+`sockets` list could not see a sub-fan's pip and refused every drop on one with
+"that mark has no box".
+
+**FURNITURE IS ONLY DRAWN WHERE IT SAYS SOMETHING (2026-09-22).** A box's socket
+row means "how many of this" and its bus means "what all of them share". Drawn
+unconditionally they were a row of ONE pip and a rule spanning ONE item with
+nobody to share it with — and they cost two of the bands the canvas has to fit a
+whole spell into. The page holding the single word `projectile` came out FIVE
+bands tall (hand, pip, rule, pip, bolt) and three of them were news to nobody;
+worse, the two pips were one socket each on two DIFFERENT boxes, which is the
+one thing the picture could not say. So a **socket row** is drawn where the
+branches can differ — `instances > 1`, or a lane distinguishing one from the
+shared pile — and a **bus** where it actually shares: more than one bolt to
+carry it, or more than one item collecting on it. Otherwise the payload runs
+straight into the delivery cell, which is the whole truth about it. `projectile`
+is two cells now and `fire projectile` is three; `sand gust gust shotgun
+projectile` is unchanged, because there every mark on it is earned. Nothing
+about the spell moves — both are synthesized chrome and the words are identical
+— and the gate's socket law became "no row, or a full one" (a row that is drawn
+and SHORT is still a word that vanished). Measured over the op fuzz: 42,768
+graph nodes to 32,446, a quarter of the drawing gone and none of it meaning.
+
+**AN EMPTY SLOT IS A HOLE IN THE OPERAND ROW (2026-09-22).** `_ trail`, `_ mend`
+and `_ null` are half-words: each does nothing until something is spoken before
+it, and each is FUSED to whatever fills it. The page said so with a ~21 chrome-px
+hollow ring hung off the LEFT EDGE of the cell — eleven screen pixels at the fit
+rung, the smallest mark in the drawing, carrying its single most important fact,
+in the one place the layout otherwise uses for nothing. An operand is the row
+BELOW its operator (word order, bottom to top), so the MISSING operand is now a
+`GraphKind::Hole`: a cell-sized blank standing in that row, on the operand band,
+with its own `Slot` stroke up into the word it is waiting for. It is not a node
+of its own — it carries the OPERATOR's `treeNode` and `instance` is the side, so
+a drop on it is the same `FillSlot` the pip used to latch, on a 64 px target
+instead of 21. Drawn as the mark the grammar itself writes: a tablet ruled in
+DOTS with the underscore across it, in minium. And the operator's cell and the
+row it binds are enclosed in one faint CLASP — the reader's box round a phrase
+that has to be read together — because an operand used to be a cell with a
+stroke, exactly like an item feeding a bus, and the two mean different things. A
+FILLED slot keeps its pip: that stud is what says which side bound it.
+
 **THE ROUND-TRIP LAW, and the two trees that break it.**
 `Parse(Linearize(Parse(s)))` is `Parse(s)` node for node and lowers to an
 identical cast, for every sentence in the oracle corpus and every generated
@@ -6924,8 +7191,8 @@ the composed words through `ExpandWords → ParseSpell → LowerSpell → BuildG
 (so the drawing and the readout under it are of the same spell, by
 construction); `overlay.h` stays imgui-free AND spell-free, so the mirror is
 ints and strings and every glyph crosses by NAME. Node chrome is the panel's
-own: the glyph cell for a word, pips for an operator with a hollow `_` ring
-where a required slot is empty, a bar with its delivery's noun in caps for a
+own: the glyph cell for a word, pips for an operator's filled slots and a ruled
+BLANK in the row below for an empty one, a bar with its delivery's noun in caps for a
 join, its `instances` sockets over it, a bus stroke across them, mod tags off
 its left end and `tariff + carry ×N = subtotal` under it, and the hand bar with
 the cast's three price parts and a mana `ValueBar`. Nodes are joined by
@@ -6936,7 +7203,7 @@ scale of the layout's chrome pixels and scrolls when a tree still does not fit,
 framing the deepest join; the LAYER PITCH on screen is the canvas's own choice
 (tight enough to clear a cell) because spacing is a drawing decision while node
 SIZE is the layout's. **The canvas applies no op.** Every gesture — a word onto
-a bus or a socket, a word into a hollow pip, a delivery onto a branch, a mod
+a bus or a socket, a word into an operator's blank, a delivery onto a branch, a mod
 onto a bar, right-click to unbox or remove, a branch dragged to another socket
 or out of the panel — pushes the composer's existing undo and latches a
 `UIState::GraphEditIntent` naming one of `spellgraph.h`'s total ops; main.cpp
@@ -7079,7 +7346,8 @@ open: shut, nothing reads it, and it is a parse and a lowering per frame.
 
 **`--shot-spellpage` is the gallery** (`main.cpp`): the composer, ten word
 lists chosen to put a different piece of the drawing under the lens (a minimal
-tree, the shipped example, an operator with a hole in it, nesting, lanes, a
+tree, the shipped example, an operator with a hole in it, a bare `_ trail` and a
+bare `_ transmute _`, nesting, lanes, a
 nine-socket fan, eighteen words that cannot fit, an empty page) and two shot at
 a DRIVEN view - panned and at 1x - because the ground moving with the drawing is
 a claim only a picture of it moved can make. One BMP per scene,
@@ -11348,18 +11616,54 @@ residual 0.7 still reads as texture at some resolution.
 The plan of record is `docs/PLAN_clouds_weather.md` (corpus research + packages);
 this section is what landed and the invariants it holds.
 
-**Weather is data, and it is render-only.** A weather TYPE is
+**Weather is data, and it is render-only except for one integer.** A weather TYPE is
 `assets/weather/<name>.json` — coverage, cloud type (0 stratus .. 1
 cumulonimbus), density, deck base and thickness in metres, darkness, cirrus,
 raininess, precipitation type (0 rain .. 1 snow), mist, lightning rate. Eleven
 ship (clear, cirrus, fair, scattered, towering, overcast, fog, drizzle, rain,
 storm, snow); nothing in C++ knows their names. `weather::Resolve`
 (`src/sim/weather.cpp`) turns (tuning, presets, seed, sim clock) into one blended
-`State` per frame. **Nothing in it reaches TickParams, the CA or the world hash** —
-`--gate determinism` is unmoved by the whole system, and that is the gate on the
-claim. The day rain is allowed to touch the world (plan §2.5 tier 2: wet stain,
-`RCOND_RAIN`), the scalar the sim reads must be derived as an INTEGER in
-`weather.h` the way `WindWeatherQ` is; do not hand the sim one of these floats.
+`State` per frame. **None of those floats reaches TickParams, the CA or the world
+hash.** What does is ONE word, `weather::SimRainWord` → `TickParams.weatherRain`
+(the old `padWp1`): rain reaching the ground (bits 0..7), `weather.rainIgniteDamp`
+(8..15) and ground wetness (16..23), quantised once per tick from the pinned or
+scheduled preset — the un-eased TARGET, never the frame-time ease, so frame
+pacing cannot reach the hash. Two reaction flags read it (`materials.h`
+`kCondRain` / `kCondRainDamp`, `RCOND_RAIN` / `RCOND_RAINDAMP`):
+
+- `"rain": true` — a douse. Fires only on a RAIN-EXPOSED cell while it rains, at
+  chance × (rain/255)²: a drizzle barely touches a fire, a storm puts it out.
+  A gate like SKY/DAY/NIGHT, so it holds no chunk awake.
+- `"rainDamped": true` — an ignition. On an exposed cell its chance is cut by
+  max(rain, wetness) × damp, so rain slows a spread at once and wet ground stays
+  slow to catch for ~`weather.drySeconds` after. Only a rescale: it still holds
+  its chunk awake, or a fire front would fall asleep mid-spread.
+
+Rain-exposed (`sim_step.wgsl rainExposed`) = sees the sky, or a horizontal face
+opens onto a cell that does — every read at Chebyshev distance 1, the reach
+`seesSky`'s note proves scheduling-free. So a trunk wets down its sides, and a
+room's interior stays dry only where a ceiling is directly over it (the
+one-cell-up limit `seesSky` already has). The same arithmetic runs in
+`sim_gas.wgsl` (a parcel outside the window is exposed by construction) and on
+bodies and limbs (`RainScaledChance`, `reactcpu.h`; a body counts as exposed).
+Every burning material carries a rain douse beside its extinguisher douse, and
+every combustion ignition is rain-damped (`reactions.json`'s RAIN note); snow
+does neither yet. `weather.rainTouchesWorld` off = the word is 0. Gated by
+`--gate rain-fire` (one leaf sheet, three pinned skies).
+
+The same word WETS CREATURES (`MobSystem::RainOneLimb`, in the living's and
+the corpses' stain pass): a limb under open sky (`OpenToSky`, InSunlight's
+column probe without the daylight half) has its world-up-facing voxels take one
+level of water, sampled every 5 ticks at 1479 x (rain/255)^4 voxels a visit — a
+fourth power so a storm soaks ~20x faster than a drizzle — rinsing a foreign
+coat a level first, capped at 12 x rain/255; the existing wet lifecycle (wick,
+drip, dry) does the rest. Gated by `--gate mob-rain`.
+
+**The deck's base jitter is capped in metres** (`cloudBaseJitterM`,
+common.wgsl): 10% of the thickness, at most 150 m. It was 10% uncapped, and the
+storm preset (7.5 km deep, base 700 m) dipped below sea level — cloud density on
+the ground and the "eye is inside the deck" composite veiling every terrain
+pixel in grey.
 
 **The automatic cycle is a ladder, not a state machine.** Presets are sorted by
 their authored `moisture`; each owns a run of the ladder proportional to its
@@ -11394,7 +11698,7 @@ in the memories index), so the march lives in `cloud.wgsl` on the per-frame
 | row | what | size |
 |---|---|---|
 | `cloud_noise` | tileable Perlin-Worley SHAPE (R) + Worley fBm (GBA), 128³; Worley DETAIL, 32³. Once per pipeline build (`Cond::CloudBake`) | 8.1 MiB |
-| `cloud_weather` | per-frame 512² WEATHER MAP around the camera at 125 m: local coverage, type, rain, base jitter — plus a 4-word camera probe | 1 MiB |
+| `cloud_weather` | per-frame 512² WEATHER MAP around the camera at 125 m: local coverage, type, rain, base jitter — plus the camera probe (8 words; 4..6 = the 20 m averaged wind, written by `cloud_env`) | 1 MiB |
 | `cloud_shadow` | per-frame 256² CLOUD SHADOW map at 40 m, indexed at the deck-base plane along the key light | 256 KiB |
 | `cloud_env` | per-frame 64² octahedral ENV map: (in-scatter, T) per direction | 32 KiB |
 | `cloud_march` | the deck, cirrus and rain curtains, one ray per LOW-RES pixel (target ÷ `render.cloudResDiv`) | 4 words/px |
@@ -11449,9 +11753,14 @@ point, only where sunlit rain actually is). Near the eye, `rainOverlay` finds
 drops through four cylinders but tests each ray against the drop itself — a 3-D
 segment for rain, a point for snow — with pixel-footprint antialiasing, gated
 per drop on the openness grid (it stops at a roof and keeps falling outside) and
-on the camera probe (it rains HERE, not on average). Wet ground darkens and
+on the camera probe (it rains HERE, not on average). The streaks lean along the
+wind AVERAGED over a 20 m disc round the camera (17 `windAt` samples, one thread
+of the env pass, probe words 4..6) — a point sample swung the sheet with every
+~5 m gust front — at 40% of that wind (80% for snow) and capped at ~35° off
+vertical (~56° snow): the full wind read as sideways rain. Wet ground darkens and
 glints by `wetness`, a leaky integral of past rain evaluated as a pure sum,
-scaled by openness. Rain does not yet place water or stain the world.
+scaled by openness. Rain does not yet place water or stain the world; it does
+douse fire and damp ignition (above).
 
 **Cost (RTX 3060 Ti, 1080p, `cloudResDiv` 3):** ~1.2 ms of GPU per frame under a
 scattered sky in the game loop (march 0.84, weather 0.14, env/resolve/shadow
@@ -13328,20 +13637,22 @@ wide short one". A resampled shell packs its own copy-on-write brick and frees
 it on unwear; at ratio 1 (the stock set on the stock human) nothing is
 resampled and the def's brick is shared, exactly as a body limb shares its.
 
-### The sheath is the weapon slot
+### The hotbar is the hand
 
-A blade is either DRAWN (a real rig part in the fist) or STOWED (an entry in
-the Sheath slot and nothing else). `Q` toggles; drawing forces the melee tool
-and stowing puts the previous one back; a weapon that leaves the sheath while
-drawn stops being drawn (`SheathState`, `game/equipment.h` — three cases, all
-easy to get subtly wrong, so they live in one testable struct rather than in
-the frame loop). The hotbar keeps the number row and stops being where a weapon
-comes from.
+What is in your hand is the SELECTED HOTBAR SLOT, with the melee tool up and
+magic off: a sword there is drawn (a real rig part in the fist), a flask there
+is held for pouring, an empty slot is your fists. The number row and the wheel
+pick the slot; there is no draw key (Q drew from the sheath until 2026-09-23,
+when the owner asked for weapons to be held like flasks). A weapon dragged out
+of the selected slot is simply no longer in the hand -- there is no drawn flag
+to keep in step with the kit. The ten slots are always on the HUD, bottom
+centre (`DrawHudHotbar`, `ui/inventory_ui.cpp`).
 
-Sheathing is still **visually** data only: the slot holds a weapon, it does not
-draw it on the avatar's back. That visual is a `sheath_back` socket in the rig
-plus a matching grip context on the item — `ItemGrip`'s context map
-(`game/item.h`) already anticipates exactly that, so it is content, not code.
+The Sheath and Quick equipment slots remain as places a blade rides on your
+person, and nothing draws from them. Showing a stowed blade on the avatar's
+back is a `sheath_back` socket in the rig plus a matching grip context on the
+item -- `ItemGrip`'s context map (`game/item.h`) already anticipates exactly
+that, so it is content, not code.
 
 ### Ground items are debris that remember their name
 
@@ -13872,22 +14183,110 @@ MutationQueue:
   liquid particle FULL, so the last partial cell of a flask comes out as a
   whole one (under one cell per emptying). Ambient wind drags the stream like
   any particle (sim.windMode).
+- **WATER GOES BOTH WAYS AS MLS-MPM FLUID** (2026-09-23, owner: "they're
+  cubic microvoxels; i want the animated water going in, and the poured water
+  going out to be mpm fluid"). What the seam can hold (`ContainerPoursAsFluid`
+  = sim_fluid_seam's `seamLiquid`: a liquid with moveEvery <= 1) takes the
+  solver instead of the grid-particle path above; lava, blood and every powder
+  keep the grid particles and the motes.
+  - *Out*: `ContainerPourFluid` emits one FluidSpawnOp per EIGHTH (the seam's
+    own unit), so the pour is exact -- no last-drop rounding -- and settles back
+    into fullness voxels. The arc is solved in the solver's gravity
+    (`sim.fluidGravity`, substep-exact) and, when the asked-for flight time
+    would launch over the CFL cap, at the nearest flight time that fits.
+  - *In*: `ContainerScoopStream` spawns eight GHOST particles per scooped cell
+    (`FluidSpawnOp::species` bit 8, life in bits 16..23; `FP_GHOST` = attr bit
+    23 in common.wgsl). The fluid surface draws them like any water and g2p
+    homes them onto the vessel's mouth (target in `_r0.._r2`, death tick in
+    `_r3`), but they are NOT MATTER: never booked in, no occupancy or stain
+    intent (so no reaction can consume them), no splash, no submerged freeze or
+    hard-solid delete, never settled, retired by consumeApply at their death
+    tick with no mass counter. The scoop's accounting is unchanged -- the
+    ledger still pays what the clears took. Gate `vessel-mpm` runs the
+    vessel-grid round trip this way and holds both audits EXACT.
+  - *The price*: the ghosts wake the solver, and with `sim.fluidExciteMode` 1
+    the holes a scoop digs excite the water around them into particles, which a
+    scoop (a list of voxel clears) cannot take until they settle. Measured on
+    vessel-mpm's 18-cell pool: 64 eighths credited in 40 ticks against
+    vessel-grid's 113, the other 80 sloshing as MPM. A deep pond, dug at its
+    surface, excites far less; a sink that takes excited water at the mouth is
+    the fix if it matters.
 - **The pour is also a SplatterEvent**, the same record a severed artery's spray
   leaves, so any body in the stream -- creature, corpse, or your own feet -- is
   coated where it is hit. That IS "pour blood on somebody and they are stained".
 
-**The health panel's pour** (`InspectApplyPicks`): with a filled vessel selected
-and no spell spoken, each limb of the portrait is a target. A click spends
-`container.applyCells` and runs `MobSystem::DouseLimb`: the limb is coated
-(SoakLimb), then the material's `coat.effects` run ONCE on that limb -- the
-first reader that list has had. Vocabulary: `stanch` (the cauterise rule's
+**The portrait pour brush** (2026-09-23; `Portrait` in inventory_ui.cpp, the
+`pourStroke` in session.cpp): with a filled vessel chosen and no spell
+spoken, the character screen's portrait is a BRUSH. The vessel is CHOSEN, not
+held: the screen's FLASKS row (where "on your person" -- sheath + quick slots
+-- used to be) lists every vessel in the pack and hotbar; clicking one sets
+`UIState::activeVessel` (a `KitRef`), "put away" clears it, and
+`PourStroke::vessel` tells the tick which stack pays. main.cpp drops the choice
+when its slot stops holding a vessel. Left button held pours
+where the cursor is; right-drag orbits, middle-drag pans, the wheel or `[ ]`
+sizes the disc (`UIState::pourRadius`, world voxels) and ctrl+wheel zooms; the
+portrait's corner reads the size and what it drains. The panel reports only a
+portrait-normalized point; main.cpp turns it into a world ray through the same
+`PortraitCam` that rendered the image (the inverse of `ProjectToPortrait`), and
+the tick meets it with `MobSystem::PickBody` -- a slab test against every
+occupied cell of the body's AUTHORITATIVE lattice (skin when finer, collider
+otherwise), so the cell hit is a cell that is drawn. `PourOnBody` then coats
+the visible SURFACE under the disc: cells within the radius of the ray line,
+binned into columns at the finest lattice pitch across the ray, keeping only
+the nearest cell (+half a cell) per column -- the face you are looking at, not
+the far side of the arm or the torso behind it. It accumulates
+(`AddBodyStain`, +3 a tick to 15; washers take `WashBodyStain`), pokes the
+micro brick so the coat is drawn where it went, and runs the material's
+`coat.effects` ONCE per touched limb (`CoatEffectsOn`, shared with
+`DouseLimb`). Spend is a rate that follows the brush
+(`PourBrushCellsPerSec`, container.h): the disc's AREA, anchored so the
+default 0.5-voxel brush spends `container.applyCells` a second -- twice the
+radius, four times the drain -- paid in eighths off a milli-eighth accumulator
+and only on ticks the ray meets skin.
+Worn shells are not hit: the ray passes through armour to the body. The old
+click-a-limb pour (`InspectApplyPicks`) is gone; `DouseLimb` stays as the
+whole-limb door for gates and tools. Vocabulary: `stanch` (the cauterise rule's
 three fields -- bleedBudget, stumpOpen, gushTicks) and `disinfect` (a bite's
 infectMat/infectStain). No material authors either yet; medicine is content.
 
+**Thrown, and broken** (2026-09-23; owner: "holding down a button with it
+equipped charges up a throw ... if the flask hits something with a high
+velocity or is hit by something with a high velocity it should break and spawn
+all of its contents immediately into the world"). Q (`TB_THROW`,
+kTickInputVersion 2) held with a throwable vessel in hand winds the throw up
+on the TICK clock (`PlayerSession::throwTicks`); releasing it throws at
+`ContainerThrowSpeed`, eased from `throwMinSpeedMps` to `throwSpeedMps` over
+`throwChargeSec` (items.json; flask 4 -> 16 m/s over 0.9 s, the pouch is not
+thrown). Switching the hand mid-draw cancels it; while drawing, the buttons do
+not pour or scoop. The HUD meter under the crosshair (`UIState::throwCharge`)
+is ten pixel pips that light gold and, at full, turn ember and SHAKE by whole
+pixels. A THROWN VESSEL IS A DROPPED ITEM WITH SPEED: `DropItemToWorld` with
+the launch velocity and an end-over-end spin, so the flight is Jolt's and the
+fill rides `WorldItem::fill` as a drop's does. `ContainerBreakPass` (phase H,
+before submit; the `TickAuthorityCtx::ground` registry) breaks any vessel with
+`breakSpeedMps` > 0 (flask 6.5) on either of two witnesses: a NEW contact from
+the last step whose closing speed reaches it -- relative speed, so the flask
+hitting a wall and a rock hitting a resting flask are one test -- or a velocity
+jump of that size in one tick, which covers what the contact list cannot see
+(capped per step, blind to the player) and a blast. Free fall adds g/30 a tick
+and never qualifies. The body is destroyed and its contents become a
+`ContainerSpill` at its centre of mass, drained by `ContainerSpillStep` through
+the same two roads as the pour (MPM fluid per eighth for seam liquids, grid
+particles per cell otherwise) in a ball of the contents' own volume, nudged off
+the surface struck, bursting outward at 2.5 m/s plus a third of the vessel's
+velocity -- all on the tick it broke unless the spawn budgets are short, in
+which case the rest waits a tick rather than being lost -- and one radial
+SplatterEvent, so whoever it breaks over is wet with it. No glass is left
+behind (there is no glass material) and there is no break sound yet.
+
 Gates: `vessel` (pure: content, what goes in, the claim, the arc, stacks,
-PLYR v6, DouseLimb) and `vessel-grid` (the real grid: scoop exactly paid by
+PLYR v6, DouseLimb, the throw ramp, the break test, the spill's conservation)
+and `vessel-grid` (the real grid: scoop exactly paid by
 the ledger, pour conserved counting grid + MPM -- a splash excites landed water
-into MPM particles for a while, which a grid-only count reads as a loss).
+into MPM particles for a while, which a grid-only count reads as a loss), and
+`vessel-break` (real Jolt on a stone table: a flask set down from two voxels
+survives the whole fixture, one thrown down at full draw breaks and spills all
+1024 eighths, one lying still breaks when a flying stone hits it).
 
 ## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
 

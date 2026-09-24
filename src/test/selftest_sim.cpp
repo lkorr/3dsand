@@ -24,6 +24,7 @@
 #include "sim/rng.h"       // rng::Pcg — the CPU twin of the digest fold
 #include "sim/rng_simd.h"  // rng::Pcg8 / JitterStateInRow8 (the simd gate)
 #include "sim/scan.h"      // scan::FirstIndexWhereMasked   (the simd gate)
+#include "sim/weather.h"  // SetOverride / SimRainWord (rain-fire gate)
 #include "sim/stream.h"  // RleEncodeChunk / RleEncodeSentinelChunk (fusion gate)
 
 using namespace sandvox;
@@ -3371,6 +3372,110 @@ Status GateFireDown(Ctx& c, std::string& detail) {
   return (lit && armA && armB && armBDeep) ? Status::Pass : Status::Fail;
 }
 
+// ---- rain-fire: the weather reaches the world through ONE integer ---------
+//
+// weather::SimRainWord puts rain (and the ground wetness it leaves) on the tick
+// stream; reactions authored "rain" douse a burning cell the rain can reach and
+// reactions authored "rainDamped" slow an exposed ignition. This gate lights
+// the SAME fire under three pinned skies and asserts the ordering the feature
+// promises: a storm puts it out, a drizzle slows it, a clear sky does neither.
+//
+// The fuel is a ONE-VOXEL-THICK sheet of leaves floating in clear air, and the
+// thinness is the point: every leaf has air above it, so every leaf is
+// rain-exposed (sim_step.wgsl rainExposed). A solid slab would measure its own
+// interior — which the rain correctly cannot reach — rather than the rain.
+// The match is a 3x3 pad of ember on the sheet's centre.
+//
+// Also asserted: the word itself — no rain and no wetness under a clear pin, rain > 0 under a storm,
+// and a drizzle's wetness above its rain (the leaky integral is what keeps
+// ground slow to catch after a shower). The pin is restored on the way out,
+// and the world regenerated (rule 7).
+Status GateRainFire(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mLeaf = matId("leaves"), mEmber = matId("ember");
+  if (!mLeaf || !mEmber) {
+    detail = "leaves or ember missing from materials.json";
+    return Status::Fail;
+  }
+  const std::string prevPin = weather::Override();
+  const Tuning& tun = CurrentTuning();
+
+  const int W = 25, R = W / 2, cx = 200, cz = 200;
+  const uint32_t kTicks = (uint32_t)BaselineNumber("rainFireTicks", 400.0);
+
+  struct Arm { const char* sky; uint32_t word; uint32_t burnt; };
+  Arm arms[3] = {{"clear", 0, 0}, {"drizzle", 0, 0}, {"storm", 0, 0}};
+  for (Arm& a : arms) {
+    weather::SetOverride(a.sky);
+    a.word = weather::SimRainWord(tun, kDefaultSeed, 1);
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const int y = FixtureYOver(cx - R - 1, cz - R - 1, cx + R + 1, cz + R + 1,
+                               kDefaultSeed, 24);
+    std::vector<CellOp> scene;
+    for (int z = -R; z <= R; z++)
+      for (int x = -R; x <= R; x++) {
+        scene.push_back({World::SlotCellIndex({cx + x, y, cz + z}), mLeaf});
+        if (std::abs(x) <= 1 && std::abs(z) <= 1)
+          scene.push_back({World::SlotCellIndex({cx + x, y + 1, cz + z}), mEmber});
+      }
+    uint32_t t = 1;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false,
+               {12, 12, 12}, false, false);
+    for (uint32_t i = 2; i <= kTicks; i++)
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                 {12, 12, 12}, false, false);
+    ctx.WaitIdle();
+    std::vector<uint32_t> vox(kNumSlots * (size_t)kChunkVol);
+    ReadVoxelsSync(ctx, world, 0, kNumSlots, vox.data(), "rainFireRead");
+    for (int z = -R; z <= R; z++)
+      for (int x = -R; x <= R; x++)
+        if ((vox[World::SlotCellIndex({cx + x, y, cz + z})] & 0xFFFu) != mLeaf)
+          a.burnt++;
+  }
+  weather::SetOverride(prevPin);
+  weather::Snap();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const uint32_t cells = (uint32_t)(W * W);
+  auto pct = [&](uint32_t n) { return 100.0 * (double)n / (double)cells; };
+  auto rain = [](uint32_t w) { return w & 0xFFu; };
+  auto wet = [](uint32_t w) { return (w >> 16) & 0xFFu; };
+  const Arm &clr = arms[0], &drz = arms[1], &stm = arms[2];
+  const double clearMin = BaselineNumber("rainFireClearPctMin", 60.0);
+  const double stormMaxFrac = BaselineNumber("rainFireStormMaxFrac", 0.5);
+  const bool wordOk = rain(clr.word) == 0 && wet(clr.word) == 0 &&
+                      rain(stm.word) > rain(drz.word) &&
+                      rain(drz.word) > 0 && wet(drz.word) >= rain(drz.word);
+  const bool lit = pct(clr.burnt) >= clearMin;
+  const bool slowed = drz.burnt < clr.burnt;
+  const bool doused = (double)stm.burnt <= stormMaxFrac * (double)clr.burnt;
+  const bool ok = wordOk && lit && slowed && doused;
+
+  char buf[512];
+  std::snprintf(buf, sizeof(buf),
+                "%s: burnt after %u ticks — clear %.0f%% | drizzle %.0f%% | "
+                "storm %.0f%% [clear >= %.0f%%, drizzle < clear, storm <= "
+                "%.2fx clear] | word rain/wet: clear %u/%u drizzle %u/%u storm "
+                "%u/%u%s",
+                ok ? "PASS" : "FAIL", kTicks, pct(clr.burnt), pct(drz.burnt),
+                pct(stm.burnt), clearMin, stormMaxFrac, rain(clr.word),
+                wet(clr.word), rain(drz.word), wet(drz.word), rain(stm.word),
+                wet(stm.word), wordOk ? "" : " (WORD WRONG)");
+  detail = buf;
+  std::printf("rain-fire: %s\n", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- weak-flame: the floating flame ignites at a fraction of the coals' rate --
 //
 // Every ignition rule in reactions.json is `neighbor: tag:hot`, and `fire` --
@@ -4867,6 +4972,7 @@ const std::vector<Gate>& SimGates() {
       {"prefab", "sim", {}, false, GatePrefab},
       {"page-roundtrip", "sim", {}, false, GatePageRoundtrip},
       {"fire-down", "sim", {}, false, GateFireDown},
+      {"rain-fire", "sim", {}, false, GateRainFire},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
       {"support-flag", "sim", {}, false, GateSupportFlag},
       {"snapshot-latency", "sim", {}, false, GateSnapshotLatency},

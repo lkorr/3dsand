@@ -32,9 +32,13 @@ void Expand(const GlyphLibrary& lib, const Grimoire& g, const std::vector<std::s
       out.truncated = true;
       return;
     }
-    const int gi = lib.Find(w);
+    int32_t mag = kMagOne;
+    SpellTiming tm;
+    const int gi = ParseWord(lib, w, mag, tm);
     if (gi >= 0) {
       out.spoken.push_back(gi);
+      out.mags.push_back(mag);
+      out.timing.push_back(tm);
       out.readout.push_back(w);
       continue;
     }
@@ -85,7 +89,7 @@ bool Reaches(const GlyphLibrary& lib, const Grimoire& g, const std::vector<std::
              const std::string& target, int depth, std::string& path) {
   if (depth > lib.budgets.maxMacroDepth + 1) return false;
   for (const std::string& w : words) {
-    if (lib.Find(w) >= 0) continue;
+    if (lib.FindWord(w) >= 0) continue;
     if (w == target) {
       path = w;
       return true;
@@ -137,4 +141,23 @@ std::string GrimoireAutoName(const GlyphLibrary& lib, const std::vector<int>& sp
   // Names stay ASCII-safe and short enough to read on a key.
   if (s.size() > 48) s.resize(48);
   return s;
+}
+
+std::vector<std::string> ExpansionWords(const GlyphLibrary& lib, const GrimoireExpansion& ex) {
+  std::vector<std::string> out;
+  for (size_t k = 0; k < ex.spoken.size(); k++) {
+    const GlyphDef* g = lib.At(ex.spoken[k]);
+    if (!g) continue;
+    out.push_back(SerializeWord(*g, k < ex.mags.size() ? ex.mags[k] : g->magDefault,
+                                k < ex.timing.size() ? ex.timing[k] : SpellTiming{}));
+  }
+  return out;
+}
+
+SpellStack StackOf(const GrimoireExpansion& ex) {
+  SpellStack st;
+  for (size_t k = 0; k < ex.spoken.size(); k++)
+    st.Push(ex.spoken[k], k < ex.mags.size() ? ex.mags[k] : kMagUnset,
+            k < ex.timing.size() ? ex.timing[k] : SpellTiming{});
+  return st;
 }

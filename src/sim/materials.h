@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -452,6 +453,14 @@ constexpr uint32_t kStainPackConsumeShift = 17, kStainPackConsumeMask = 0x3FF;
 constexpr uint32_t kStainPackAbsorbShift = 27, kStainPackAbsorbMask = 0xF;
 constexpr uint32_t kStainPackWashesBit = 1u << 31;
 constexpr uint32_t kStainChanceMax = 1000;
+// The COAT GLOW word: the `_r2` of a STAIN PALETTE entry only
+// (table[kStainPaletteBase + type], never a real material's), written by
+// Simulation::UploadTables from MaterialDef::coatGlow / coatPulseHz and read by
+// microbody.wgsl `bodyCoatGlow`, which unpacks the same shifts literally.
+//   bits 0..7  : glow 0..255
+//   bits 8..19 : pulse rate in centi-Hz (0 = steady)
+constexpr uint32_t kCoatGlowMask = 0xFF;
+constexpr uint32_t kCoatPulseShift = 8, kCoatPulseMask = 0xFFF;
 
 // ---- absorption (MaterialGpu.stainPack bits 27..30) ------------------------
 // How much staining liquid a GROUND material soaks up before the liquid starts
@@ -507,6 +516,43 @@ constexpr uint32_t kNbrAny = 0xFFFF;
 // RCOND_* consts in common.wgsl. Authored in reactions.json as
 // "needsSky": true, "when": "day"|"night", "minLight": 0..255.
 constexpr uint32_t kCondSky = 1, kCondDay = 2, kCondNight = 4;
+// Weather conditions (same byte), read against TickParams::weatherRain — see
+// the note there for the word's layout. Authored as "rain": true and
+// "rainDamped": true; a rule may carry one or the other, not both.
+//   kCondRain      — fires only on a RAIN-EXPOSED cell while it rains, at its
+//                    chance x (rain/255)^2: drizzle barely douses, a storm does.
+//   kCondRainDamp  — always eligible; on a rain-exposed cell its chance is cut
+//                    by max(rain, wet) x the damp strength. Ignition rules.
+constexpr uint32_t kCondRain = 8, kCondRainDamp = 16;
+// The light-gate subset of the byte: a rule carrying any of these does not
+// hold its chunk awake (sim_step.wgsl doReactions). RainDamp is deliberately
+// NOT in it — it only rescales an ordinary rule, and pulling an ignition rule
+// out of keepAwake would let a fire front fall asleep mid-spread.
+constexpr uint32_t kCondGateMask = kCondSky | kCondDay | kCondNight | kCondRain;
+
+// TickParams::weatherRain word layout.
+constexpr uint32_t kRainAmountMask = 0xFFu;   // bits 0..7: rain reaching the ground now
+constexpr uint32_t kRainDampShift = 8;        // bits 8..15: ignition damp strength at 255
+constexpr uint32_t kRainWetShift = 16;        // bits 16..23: ground wetness (lingers)
+
+// A reaction chance under this tick's weather. `exposed` is the caller's
+// answer to "does rain reach this cell" (the grid asks rainExposed(); a body
+// answers true, the seesSky precedent in reactcpu.h). Integer, divide-last,
+// and bit-identical to rainChance() in sim_step.wgsl. A kCondRain rule is
+// assumed to have passed its gate already (rain > 0 and exposed).
+inline uint32_t RainScaledChance(uint32_t cond, uint32_t chance,
+                                 uint32_t rainWord, bool exposed) {
+  const uint32_t rain = rainWord & kRainAmountMask;
+  if ((cond & kCondRain) != 0) return (chance * rain / 255u) * rain / 255u;
+  if ((cond & kCondRainDamp) != 0 && exposed) {
+    const uint32_t wet = std::max(rain, (rainWord >> kRainWetShift) & 0xFFu);
+    if (wet == 0) return chance;
+    const uint32_t damp = (rainWord >> kRainDampShift) & 0xFFu;
+    const uint32_t keep = 255u - (wet * damp + 127u) / 255u;
+    return chance * keep / 255u;
+  }
+  return chance;
+}
 
 // Neighbour-count scaling (ReactionGpu.cond bits 16..31) — see the RSCALE_*
 // consts in common.wgsl. Authored as "scaleByNeighbors": {...}.
@@ -586,6 +632,13 @@ struct MaterialDef {
   // {"type": ...}). Shared across materials: two liquids naming the same stain
   // get the same palette slot. Empty = this material does not stain.
   std::string stain;
+  // Its stain PALETTE slot (1..7, 0 = none). Equal to the type bits of
+  // gpu.stainPack EXCEPT for a `"bodyOnly": true` stain, which gets a slot
+  // (a body coat is drawn through it) and NO type bits: the sim and particle
+  // kernels read the type to decide whether to mark the ground, and a
+  // body-only stain must never reach the ground. Read this, not the pack,
+  // wherever the question is "how is this drawn".
+  uint32_t stainSlot = 0;
   // How much staining liquid this material soaks up before the liquid pools on
   // top (materials.json "absorb": {"capacity": ...}), in the same 0..15 units
   // as a voxel's stain amount. 0 = never absorbs. Mirrors the top nibble of
@@ -620,6 +673,33 @@ struct MaterialDef {
   // coat can mean is content, so a new one is a JSON edit plus a consumer, not
   // an enum plus a JSON edit plus a consumer.
   std::vector<std::string> coatEffects;
+  // ---- A COAT THAT GLOWS, AND ONE THAT EATS (2026-09-23) --------------------
+  //
+  // `glow` 0..255 and `pulse` Hz: the coat is EMISSIVE on a body and breathes
+  // at that rate (0 = steady). Unlike the fields above these DO reach a shader,
+  // and only one: Simulation::UploadTables mirrors them into the stain palette
+  // entry's spare `_r2` word (kCoatGlow* below), which microbody.wgsl reads
+  // beside the stainColor it already reads there. Render-only, never hashed.
+  uint32_t coatGlow = 0;
+  float coatPulseHz = 0.0f;
+  // Per-mille chance per tick an exposed body voxel IN CONTACT with this
+  // liquid takes its coat, used INSTEAD of the ground stain's `chance` when
+  // authored (>= 0). A liquid can therefore coat a body without staining the
+  // ground at all -- acid, whose ground `chance` is 0 on purpose (it eats
+  // rock, it does not paint it). -1 = use the stain chance, as before.
+  int coatContact = -1;
+  // CORROSION. A coat whose material's own reaction rules rewrite a body
+  // voxel (acid: `acid + tag:organic -> neighborBecomes air`) is evaluated
+  // against the voxel it sits on, exactly as the grid cell would be
+  // (MobSystem::BurnOneLimb, the coat inbound pass). When it eats the voxel it
+  // carries into the voxels behind it a little weaker, so it is bounded by
+  // what was poured, never self-sustaining (CLAUDE.md rule 2). `depth` is how
+  // far a FULL coat (amount 15) eats, in WORLD voxels, before it is spent --
+  // in world units and not lattice layers because a limb's lattice pitch is
+  // per creature (skinScale), and the same splash must not go twice as deep
+  // into a finely-skinned arm. A coat of A reaches A/15 of it. > 0, default 1.
+  // Meaningless on a coat that attacks nothing.
+  float coatDepth = 1.0f;
   // GRID colours for a MATF_TINTED material (materials.json "tints"), packed
   // 0x00RRGGBB, at most kMatTintsMax. Entry i is what a voxel of this material
   // with state nibble i renders as; entry 0 is the natural colour by
@@ -708,6 +788,13 @@ struct MaterialDef {
   // so it is not tissue, so before this the rot ate a limb down to a clean
   // skeleton and stopped.
   float rotRate = -1.0f;
+  // BARED TO THE AIR, BLOODIED (2026-09-23). The chance a voxel of this
+  // material is left wearing the creature's blood when a body pass (acid,
+  // fire, rot) takes the voxel beside it and so uncovers it -- the skeleton
+  // under a dissolved arm reads as the inside of a body, not a clean model.
+  // Rolled ONCE per voxel, keyed on its lattice position, so a voxel bared
+  // twice gets the same answer both times. 0 = never. CPU-only (body coats).
+  float bareBlood = 0.0f;
   // Sound sets for this surface, keyed by SLOT ("footstep", "impact",
   // "break", ...). Each value names a set relative to the slot's namespace, so
   // "footstep": "leaf" resolves to the set "footsteps/leaf" — one FOLDER under

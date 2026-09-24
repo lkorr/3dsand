@@ -81,8 +81,8 @@ of effects, which is the direction the user asked for):
 | Grammar | Graph |
 |---|---|
 | pile (rule 1, a set) | the lanes above a box; siblings, unordered |
-| box (rule 2) | a join node: a bar with the delivery's name, its sockets above it |
-| operator group | a serial node with slot pips; `_` = a hollow pip (drop target) |
+| box (rule 2) | a join node: a bar with the delivery's name, its sockets above it — the socket row and the bus are drawn only where they say something (>1 instance / >1 shared item) |
+| operator group | a serial node with its operands in the row below; `_` = a ruled BLANK standing in that row (drop target) |
 | pending Mod (rule 3) | a tag hanging off the join it stuck to, showing its edit (`speed x2`) |
 | `count` > 1 (shotgun) | N sockets on the join, fanned; `xN` beside the tag |
 | nested box | a join node above another join node (a bolt that fires a bolt) |
@@ -253,11 +253,16 @@ holds here as it does on the character screen):
 
 - **Word** (Matter, Effect): the existing glyph cell (`GlyphContents`), sort
   colour on the rim, `×N` badge for multiplicity, hover opens the §9 info box.
-- **Operator**: a cell with one pip on the left for a unary word, pips both
-  sides for `transmute`. A filled pip has a stroke running into it; an EMPTY
-  REQUIRED pip is a hollow ring with `_` — the visual answer to "which words
-  need a prefix" — and it is a drop target. An incomplete operator's whole
-  node is dimmed and its cost shown struck through (charged, does nothing).
+- **Operator**: a cell whose operands are the row BELOW it, one pip on the
+  cell's edge per FILLED slot to say which side bound it. An EMPTY required
+  slot is a `Hole` — a cell-sized blank ruled in dots with `_` across it,
+  standing in the operand row where the missing word goes, with its own stroke
+  into the cell it is waiting for, and it is the drop target (2026-09-22; it
+  used to be a ~21 px hollow ring hung off the cell's left EDGE, the smallest
+  mark on the page carrying its biggest fact). The cell and the row it binds
+  are enclosed in one faint CLASP: the pair is one word. An incomplete
+  operator's whole node is dimmed and its cost shown struck through (charged,
+  does nothing).
 - **Join** (a box): a wide bar with the delivery's noun, `×N` weight, and
   its sockets in a row above the bar when `instances > 1`. Shared lanes run
   into a **bus** (a horizontal stroke above the sockets) that feeds every
@@ -307,11 +312,13 @@ graph itself).
 |---|---|---|
 | a noun / page | a join's bus, or the empty space above a root | `InsertItem(box, lane 0, glyph)` |
 | a noun / page | a socket | `InsertItem(box, lane i, glyph)` (opens the lane if empty) |
-| a noun | an operator's hollow pip | `FillSlot(group, side, glyph)` |
+| a noun | an operator's blank (or its cell) | `FillSlot(group, side, glyph)` |
 | a delivery | a subtree | `WrapInBox(node, delivery)`: that item alone is boxed; its siblings stay in the outer pile |
 | a delivery | a join's bus | `WrapInBox(box, delivery)`: nests the whole box (a bolt that fires this) |
 | a delivery | empty space | `InsertItem(root, 0, delivery)` as an empty box (the kinetic hit) |
 | a mod | a join | `AttachMod(box, lane 0, glyph)` |
+| a `count` mod | a socket of a box that does NOT fan yet | `AttachMod(box, lane 0, glyph)`: a split is never answered by opening a lane — it is the word that MAKES the sockets |
+| a `count` mod | a socket of a box that ALREADY fans | `AttachMod(box, lane i, glyph)`: a twin OF a twin, contained in that branch |
 | a mod | a socket | `AttachMod(box, lane i, glyph)` |
 | a graph node | outside the canvas | `Remove(node)` (the subtree) |
 | a graph node | another socket / bus | `Move(node, box, lane)` |

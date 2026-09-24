@@ -467,7 +467,20 @@ struct ItemDef {
     int pourPerTick = 2;   // cells thrown per tick while the button is held
     float pourRange = MetresToCells(2.0f);  // farthest AIMED target, voxels
     float pourSpeed = MetresToCells(1.5f);  // launch speed, world voxels/s
-    int applyCells = 4;    // cells spent per click on a limb (triage)
+    float aimDist = MetresToCells(1.0f);    // the pour point, along the look
+                                            // (ContainerPourPoint)
+    int applyCells = 4;    // cells/s of the portrait pour brush at its default
+                           // size; scales with area (PourBrushCellsPerSec)
+    // THROWING (game/container.h ContainerThrowSpeed). Q held charges, release
+    // throws: the launch speed ramps from throwMinSpeed to throwSpeed over
+    // throwChargeSec. throwSpeed 0 = this vessel is not thrown.
+    float throwSpeed = 0.0f;     // world voxels/s at full charge
+    float throwMinSpeed = 0.0f;  // world voxels/s on a tap
+    float throwChargeSec = 1.0f;
+    // BREAKING (ContainerShouldBreak): a body of this vessel that meets
+    // anything at this closing speed, or whose velocity jumps by it in one
+    // tick, shatters and spills everything it held. 0 = never breaks.
+    float breakSpeed = 0.0f;     // world voxels/s
   } container;
   bool IsContainer() const {
     return kind == ItemKind::Container && container.capacity > 0;

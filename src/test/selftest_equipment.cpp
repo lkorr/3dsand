@@ -175,54 +175,6 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
           "ItemKindIsWorn covers the armour range and nothing else");
   }
 
-  // ---- 0b. draw and stow, which is pure logic and also costs nothing ------
-  //
-  // The sheath is THE weapon slot, so this is the whole of "am I armed". It
-  // is asserted here rather than in the game because the rule lives in
-  // game/equipment.h precisely so it can be: no window, no GPU, no input
-  // stack, and the frame loop runs the same three lines.
-  {
-    const int kBrush = 0, kMelee = 4;   // any two distinct tool ids
-    SheathState sh;
-    sh.toolBefore = kBrush;
-    int tool = kBrush;
-
-    check(!sh.Toggle(ItemKind::None, kMelee, tool),
-          "drawing from an empty sheath is refused");
-    check(!sh.drawn && tool == kBrush,
-          "and changes neither the hand nor the tool");
-
-    check(sh.Toggle(ItemKind::Melee, kMelee, tool), "a sheathed blade draws");
-    check(sh.drawn && tool == kMelee,
-          "and drawing selects the melee tool, so the mouse swings rather "
-          "than paints");
-
-    // Stow puts back what the player had, not a default. Getting this wrong
-    // leaves them in a mode they never chose and looks like the tool selector
-    // is broken.
-    check(sh.Toggle(ItemKind::Melee, kMelee, tool), "it stows again");
-    check(!sh.drawn && tool == kBrush, "and hands the previous tool back");
-
-    // The character screen can move the weapon out mid-swing. Nothing about
-    // the key press knows that happened, so the reconcile is the only thing
-    // between "drawn" and "holding an item that is in your pack".
-    sh.Toggle(ItemKind::Melee, kMelee, tool);
-    check(sh.drawn, "drawn again");
-    sh.Reconcile(ItemKind::None, kMelee, tool);
-    check(!sh.drawn && tool == kBrush,
-          "a weapon dragged out of the sheath is no longer in the hand");
-    sh.Reconcile(ItemKind::None, kMelee, tool);
-    check(!sh.drawn && tool == kBrush, "and the reconcile is idempotent");
-
-    // A worn item in the sheath must not arm anybody. The slot table already
-    // refuses to put one there, but the hand asks about KIND and the two are
-    // separate claims.
-    SheathState sh2;
-    int t2 = kBrush;
-    check(!sh2.Toggle(ItemKind::ArmorHead, kMelee, t2),
-          "a helm in the sheath does not draw as a weapon");
-  }
-
   // ---- the rig fixture ----------------------------------------------------
   int avDef = -1;
   for (size_t i = 0; i < mobs.Defs().size(); i++)

@@ -446,6 +446,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "coyoteTime", p.coyoteTime, out, at);
     ReadF(*g, "jumpBufferTime", p.jumpBufferTime, out, at);
     ReadF(*g, "groundAccel", p.groundAccel, out, at);
+    ReadF(*g, "slipCoatStart", p.slipCoatStart, out, at);
+    ReadF(*g, "slipCoatFull", p.slipCoatFull, out, at);
+    ReadF(*g, "slipGrip", p.slipGrip, out, at);
     ReadF(*g, "airAccel", p.airAccel, out, at);
     ReadF(*g, "liquidAccel", p.liquidAccel, out, at);
     ReadF(*g, "liquidDrag", p.liquidDrag, out, at);
@@ -1100,6 +1103,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "coat";
     ReadI(*g, "recountTicks", e.recountTicks, out, at);
     ReadF(*g, "decayScale", e.decayScale, out, at);
+    ReadF(*g, "sunDryScale", e.sunDryScale, out, at);
+    ReadF(*g, "fireDrySeconds", e.fireDrySeconds, out, at);
     ReadI(*g, "shedCells", e.shedCells, out, at);
     ReadI(*g, "shedPerTick", e.shedPerTick, out, at);
     ReadI(*g, "shedAmount", e.shedAmount, out, at);
@@ -1122,6 +1127,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // into a two-tick period, which is the `body-coat` gate's fast arm and the
     // fastest anything here is meant to be dialled.
     e.decayScale = std::min(e.decayScale, 300.0f);
+    e.sunDryScale = std::clamp(e.sunDryScale, 1.0f, 20.0f);
+    e.fireDrySeconds = std::clamp(e.fireDrySeconds, 0.05f, 120.0f);
     e.shedCells = std::clamp(e.shedCells, 0, 32);
     e.shedPerTick = std::clamp(e.shedPerTick, 0, 1024);
     e.shedAmount = std::clamp(e.shedAmount, 0, 15);
@@ -2112,6 +2119,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "coverageBias", w.coverageBias, out, at);
     ReadF(*g, "precipScale", w.precipScale, out, at);
     ReadF(*g, "drySeconds", w.drySeconds, out, at);
+    ReadB(*g, "rainTouchesWorld", w.rainTouchesWorld, out, at);
+    ReadF(*g, "rainIgniteDamp", w.rainIgniteDamp, out, at);
+    w.rainIgniteDamp = std::clamp(w.rainIgniteDamp, 0.0f, 1.0f);
     w.epochMinutes = std::clamp(w.epochMinutes, 0.5f, 600.0f);
     w.cycleSpeed = std::clamp(w.cycleSpeed, 0.0f, 1000.0f);
     w.transitionSeconds = std::clamp(w.transitionSeconds, 0.0f, 600.0f);

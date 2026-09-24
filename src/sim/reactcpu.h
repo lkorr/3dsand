@@ -60,10 +60,19 @@ inline bool ReactNbrMatches(const ReactionGpu& r, uint32_t nmat,
 // alternative silently makes every sky-gated rule inert on bodies forever —
 // which is the same class of bug (authored rule does nothing) that this file
 // exists to prevent.
+//
+// `rainWord` is this tick's TickParams::weatherRain. A kCondRain rule (a douse)
+// is refused while it is dry; a body is treated as rain-exposed for the same
+// reason it is treated as seeing the sky. Callers then roll against
+// RainScaledChance(r.cond, chance, rainWord, true) — the gate and the scale are
+// both needed, exactly as lightMatches + rainChance are in the shader.
 inline bool ReactLightMatches(const ReactionGpu& r, uint32_t dayPhase,
-                              bool seesSky) {
+                              bool seesSky, uint32_t rainWord) {
   const uint32_t cond = r.cond & 0xFFu;
   if (cond == 0) return true;  // unconditional: the common case, free
+  if ((cond & kCondRain) != 0 &&
+      ((rainWord & kRainAmountMask) == 0 || !seesSky))
+    return false;
   const uint32_t day = DaylightStrengthCpu(dayPhase);
   if ((cond & kCondDay) != 0 && day == 0) return false;
   if ((cond & kCondNight) != 0 && day != 0) return false;

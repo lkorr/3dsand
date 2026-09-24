@@ -303,6 +303,12 @@ class Simulation {
   // depth testing off, so a collider is visible through whatever contains it.
   // `count` of 0 draws nothing at all — the overlay is free when it is off.
   void DrawDebugBoxes(const rhi::RenderPass& pass, uint32_t count);
+  // The vessel's pour point (game/container.h ContainerPourPoint): ONE soft,
+  // mostly transparent sphere read from debugBoxes[`at`] (centre = pos,
+  // radius = half.x, colour + alpha = color). Depth TESTED, unlike the
+  // wireframes -- it marks a place in the world, so the ground in front of it
+  // hides it. `at` of UINT32_MAX draws nothing.
+  void DrawPourMarker(const rhi::RenderPass& pass, uint32_t at);
   // Wind slope-field overlay (docs/RESEARCH_wind.md §4.8, F4): one arrow per
   // lattice point around the camera, oriented and coloured by `windAt` — the
   // same field function the foliage sway samples. `arrows` is
@@ -764,7 +770,7 @@ class Simulation {
       fluidSettleBin_, fluidSettleCheck_, fluidSettleCommit_, fluidSettleKill_,
       fluidConsumeApply_, fluidStainApply_, fluidMirrorFold_, fluidCellClear_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_, bodyDepth_,
-      microBodyDraw_, debugBoxDraw_, debugWindDraw_, debugCurrentDraw_,
+      microBodyDraw_, debugBoxDraw_, pourMarkerDraw_, debugWindDraw_, debugCurrentDraw_,
       fluidDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
       debugLineModule_, debugWindModule_, debugCurModule_;

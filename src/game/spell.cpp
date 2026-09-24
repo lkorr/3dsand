@@ -1,6 +1,7 @@
 #include "game/spell.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -52,6 +53,65 @@ int32_t ScaleRadiusCbrt(int32_t r, int32_t n) {
   if (n <= 1) return r;
   if (n > 8) n = 8;
   return (int32_t)(((int64_t)r * kCbrtMille[n] + 500) / 1000);
+}
+
+// The same growth for a FRACTIONAL scale (PLAN_spell_magnitude §2): `sMille`
+// is n × magnitude, per-mille. A whole multiple of 1000 goes through the table
+// above, so every word without a magnitude keeps its exact old radius (law
+// L-M0); anything else is round(cbrt(s)) per-mille by integer search — no
+// float in an authoritative number (thesis 3).
+int32_t ScaleRadiusCbrtMille(int32_t r, int32_t sMille) {
+  if (sMille % 1000 == 0) return ScaleRadiusCbrt(r, sMille / 1000);
+  if (sMille > 8000) sMille = 8000;
+  if (sMille < 1) sMille = 1;
+  // c (per-mille) with c³ closest to sMille × 10⁶.
+  const int64_t want = (int64_t)sMille * 1000000;
+  int64_t lo = 0, hi = 2001;
+  while (hi - lo > 1) {
+    const int64_t mid = (lo + hi) / 2;
+    if (mid * mid * mid <= want) lo = mid;
+    else hi = mid;
+  }
+  const int64_t c = (want - lo * lo * lo) <= (hi * hi * hi - want) ? lo : hi;
+  return (int32_t)(((int64_t)r * c + 500) / 1000);
+}
+
+// v × sMille / 1000, rounded toward zero, saturating — and at least `floor1`
+// when v > 0 (a quarter of three sprayed voxels is still one voxel, not none).
+int32_t ScaleMille(int32_t v, int32_t sMille, int32_t floor1 = 0);
+
+// `echo`'s repeat count at its magnitude: the authored repeats at 1, scaled
+// (and at least one) otherwise. Multiplicity is NOT in it - `echo echo` was
+// never twice the repeats, and must not start being so.
+int32_t EchoRepeats(const GlyphDef* g, const EffectInst& e) {
+  if (!g) return 1;
+  if (e.mag == kMagOne) return g->repeats;
+  return std::max<int32_t>(1, (int32_t)((int64_t)g->repeats * e.mag / 1000));
+}
+
+// HOW MANY TIMES an item fires in a carrier (M3): once on hit, launch or
+// expiry; once per bounce; once per `every` period of the carrier's life. A
+// carrier that cannot produce the event fires it NEVER (a bomb has no bounce,
+// a hand has no life), and an item that never fires costs only its word.
+// Anything but a flight fires every item once, at its resolve.
+int32_t FiresIn(const DeliveryRec& d, const EffectInst& e) {
+  if (d.mech != DeliveryMech::Flight) return 1;
+  switch (e.timing.trigger) {
+    case SpellTrigger::Hit:
+    case SpellTrigger::Launch: return 1;
+    case SpellTrigger::Bounce: return d.body ? 0 : d.bounces;
+    case SpellTrigger::Expire: return d.body ? 0 : 1;
+    case SpellTrigger::Every:
+      return e.timing.every > 0 ? std::max<int32_t>(1, d.lifetimeTicks / e.timing.every) : 1;
+  }
+  return 1;
+}
+
+int32_t ScaleMille(int32_t v, int32_t sMille, int32_t floor1) {
+  int64_t x = (int64_t)v * sMille / 1000;
+  if (x > 0x3FFFFFFF) x = 0x3FFFFFFF;
+  if (v > 0 && x < floor1) x = floor1;
+  return (int32_t)x;
 }
 
 int32_t Cube(int32_t r) {
@@ -211,6 +271,249 @@ std::string Times(int32_t n, BracketStyle style) {
 
 }  // namespace
 
+// ---- magnitude (PLAN_spell_magnitude §2) ----------------------------------------
+
+namespace {
+// Floor division, for a lattice that crosses zero (a signed magnitude).
+int64_t FloorDiv(int64_t a, int64_t b) { return a >= 0 ? a / b : -((-a + b - 1) / b); }
+}  // namespace
+
+int32_t ClampMagnitude(const GlyphDef& g, int32_t mag) {
+  if (!g.graded) return kMagOne;
+  if (mag == kMagUnset) return g.magDefault;
+  const int64_t step = g.magStep < 1 ? 1 : g.magStep;
+  // Snap to the nearest multiple of the step, then into range - rounding UP
+  // when the range's floor is off the lattice (a mul mod's x1 floor may be).
+  int64_t m = FloorDiv((int64_t)mag + step / 2, step) * step;
+  if (m < g.magMin) m = -FloorDiv(-(int64_t)g.magMin, step) * step;
+  if (m > g.magMax) m = FloorDiv(g.magMax, step) * step;
+  if (m < g.magMin) m = g.magMin;
+  return (int32_t)m;
+}
+
+void SplitMagnitude(const std::string& word, std::string& id, int32_t& mag) {
+  mag = kMagUnset;
+  const size_t cut = word.find_first_of("@!+");
+  id = word.substr(0, cut);
+  const size_t at = word.find('@');
+  if (at == std::string::npos) return;
+  // Decimal, parsed by hand: a locale-dependent strtod would read "0,5" on a
+  // machine that says comma, and pages are shared. A leading '-' is a signed
+  // component's other direction (`lift@-1` presses down).
+  size_t k = at + 1;
+  bool neg = false;
+  if (k < word.size() && word[k] == '-') {
+    neg = true;
+    k++;
+  }
+  int64_t whole = 0, frac = 0, scale = 1;
+  bool dot = false, any = false;
+  for (; k < word.size(); k++) {
+    const char ch = word[k];
+    if (ch == '!' || ch == '+') break;   // a timing suffix follows
+    if (ch == '.' && !dot) {
+      dot = true;
+      continue;
+    }
+    if (ch < '0' || ch > '9') return;   // malformed: the word's default
+    any = true;
+    if (!dot) whole = std::min<int64_t>(whole * 10 + (ch - '0'), 100000);
+    else if (scale < 1000) {
+      frac = frac * 10 + (ch - '0');
+      scale *= 10;
+    }
+  }
+  if (!any) return;
+  const int64_t v = std::min<int64_t>(whole * 1000 + frac * 1000 / scale, 0x3FFFFFFF);
+  mag = (int32_t)(neg ? -v : v);
+}
+
+std::string MagnitudeDecimal(int32_t mag) {
+  const bool neg = mag < 0;
+  const int64_t a = neg ? -(int64_t)mag : (int64_t)mag;
+  std::string s = (neg ? "-" : "") + std::to_string(a / 1000);
+  const int32_t frac = (int32_t)(a % 1000);
+  if (frac) {
+    char buf[8];
+    std::snprintf(buf, sizeof buf, "%03d", (int)frac);
+    std::string f = buf;
+    while (!f.empty() && f.back() == '0') f.pop_back();
+    s += "." + f;
+  }
+  return s;
+}
+
+const char* SpellTriggerName(SpellTrigger t) {
+  switch (t) {
+    case SpellTrigger::Hit: return "hit";
+    case SpellTrigger::Bounce: return "bounce";
+    case SpellTrigger::Expire: return "expire";
+    case SpellTrigger::Launch: return "launch";
+    case SpellTrigger::Every: return "every";
+  }
+  return "hit";
+}
+
+std::string TimingSuffix(const SpellTiming& t) {
+  std::string s;
+  if (t.trigger != SpellTrigger::Hit) {
+    s += "!";
+    s += SpellTriggerName(t.trigger);
+    if (t.trigger == SpellTrigger::Every) s += std::to_string(t.every);
+  }
+  if (t.delay > 0) s += "+" + std::to_string(t.delay);
+  return s;
+}
+
+std::string TimingPhrase(const SpellTiming& t) {
+  std::string s;
+  switch (t.trigger) {
+    case SpellTrigger::Hit: s = "on hit"; break;
+    case SpellTrigger::Bounce: s = "at each bounce"; break;
+    case SpellTrigger::Expire: s = "when its life runs out"; break;
+    case SpellTrigger::Launch: s = "at launch"; break;
+    case SpellTrigger::Every: s = "every " + std::to_string(t.every) + " ticks of flight"; break;
+  }
+  if (t.delay > 0) s += ", " + std::to_string(t.delay) + " ticks later";
+  return s;
+}
+
+namespace {
+// Which words may carry a timing at all: the things that HAPPEN in a payload.
+// A mod edits a record and a mark is structure; `trail` is a mod too (it is
+// already "every marked voxel") - so for those the suffix is dropped.
+bool TimeableGlyph(const GlyphDef& g) {
+  if (g.sort == GlyphSort::Mod || g.sort == GlyphSort::Separator) return false;
+  if (g.sort == GlyphSort::Operator && g.result == GlyphSort::Mod) return false;
+  return true;
+}
+SpellTiming SanitizeTiming(const GlyphLibrary& lib, const GlyphDef& g, SpellTiming t) {
+  if (!TimeableGlyph(g)) return SpellTiming{};
+  t.delay = std::clamp(t.delay, 0, lib.budgets.maxDelayTicks);
+  if (t.trigger == SpellTrigger::Every)
+    t.every = std::clamp(t.every <= 0 ? 10 : t.every, lib.budgets.minEveryTicks,
+                         lib.budgets.maxLifetimeTicks);
+  else
+    t.every = 0;
+  return t;
+}
+int32_t ReadDigits(const std::string& w, size_t k, int32_t fallback) {
+  int64_t v = 0;
+  bool any = false;
+  for (; k < w.size() && w[k] >= '0' && w[k] <= '9'; k++) {
+    v = std::min<int64_t>(v * 10 + (w[k] - '0'), 100000);
+    any = true;
+  }
+  return any ? (int32_t)v : fallback;
+}
+}  // namespace
+
+int ParseWord(const GlyphLibrary& lib, const std::string& word, int32_t& mag,
+              SpellTiming& timing) {
+  std::string id;
+  int32_t raw = kMagUnset;
+  SplitMagnitude(word, id, raw);
+  timing = SpellTiming{};
+  mag = kMagOne;
+  const int gi = lib.Find(id);
+  if (gi < 0) return -1;
+  const GlyphDef& g = lib.glyphs[(size_t)gi];
+  mag = ClampMagnitude(g, raw);
+  const size_t bang = word.find('!');
+  if (bang != std::string::npos) {
+    size_t k = bang + 1;
+    std::string name;
+    while (k < word.size() && word[k] >= 'a' && word[k] <= 'z') name += word[k++];
+    for (int t = 0; t < kSpellTriggerCount; t++)
+      if (name == SpellTriggerName((SpellTrigger)t)) timing.trigger = (SpellTrigger)t;
+    if (timing.trigger == SpellTrigger::Every) timing.every = ReadDigits(word, k, 10);
+  }
+  const size_t plus = word.find('+');
+  if (plus != std::string::npos) timing.delay = ReadDigits(word, plus + 1, 0);
+  timing = SanitizeTiming(lib, g, timing);
+  return gi;
+}
+
+std::string SerializeWord(const GlyphDef& g, int32_t mag, const SpellTiming& timing) {
+  std::string s = g.id;
+  if (g.graded && mag != g.magDefault) s += "@" + MagnitudeDecimal(mag);
+  return s + TimingSuffix(timing);
+}
+
+std::string WordWithMagnitude(const GlyphDef& g, int32_t mag) {
+  return SerializeWord(g, mag, SpellTiming{});
+}
+
+int32_t MagnitudeWordCost(int32_t word, int32_t mag) {
+  if (word <= 0) return word;
+  if (mag == kMagOne) return word;
+  // word × mag² / 10⁶, rounded up. CONVEX, so a middle magnitude is the
+  // efficient one and "always max it" is a real price rather than the default
+  // (Morrowind's spellmaking collapsed to max magnitude on a linear price).
+  const int64_t m = mag < 0 ? -(int64_t)mag : mag;
+  const int64_t c = ((int64_t)word * m * m + 999999) / 1000000;
+  return (int32_t)std::min<int64_t>(std::max<int64_t>(c, 1), 0x3FFFFFFF);
+}
+
+std::string MagnitudeLabel(const GlyphLibrary& lib, int glyph, int32_t n, int32_t mag) {
+  const GlyphDef* g = lib.At(glyph);
+  if (!g) return std::string();
+  if (n < 1) n = 1;
+  const int64_t s = (int64_t)n * mag;   // effective scale, per-mille
+  auto fix = [](int64_t mille, int decimals) {
+    // A per-mille number as a decimal with `decimals` places, sign kept.
+    const bool neg = mille < 0;
+    int64_t a = neg ? -mille : mille;
+    int64_t div = decimals == 2 ? 10 : (decimals == 1 ? 100 : 1000);
+    int64_t q = (a + div / 2) / div;
+    std::string out = std::to_string(q / (1000 / div));
+    if (decimals > 0) {
+      std::string f = std::to_string(q % (1000 / div));
+      while ((int)f.size() < decimals) f = "0" + f;
+      out += "." + f;
+    }
+    return (neg ? "-" : "") + out;
+  };
+  switch (g->sort) {
+    case GlyphSort::Matter: {
+      const int64_t v = std::max<int64_t>(1, (int64_t)lib.budgets.sprayVoxels * s / 1000);
+      return std::to_string(v) + " voxels";
+    }
+    case GlyphSort::Effect:
+      switch (g->verb) {
+        case SpellVerb::Explode: return "power " + std::to_string((int64_t)g->power * s / 1000);
+        case SpellVerb::Wind:
+          return "wind " + fix((int64_t)std::lround(g->wind.speedMs * 1000.0f) * s / 1000, 0) +
+                 " m/s";
+        default: return "x" + fix(s, 2);
+      }
+    case GlyphSort::Mod: {
+      if (g->field == ModField::Count) return std::string();
+      if (g->op == ModOp::Add) {
+        const int64_t total = (int64_t)g->amount * s / 1000;
+        switch (g->field) {
+          case ModField::Gravity: return "gravity " + std::string(total > 0 ? "+" : "") + fix(total, 2) + " g";
+          case ModField::Bounces: return std::to_string(total) + " bounces";
+          case ModField::Pierce: return "pierce " + std::to_string(total);
+          case ModField::Seek: return "homing " + std::to_string(total);
+          case ModField::Fuse: return "fuse " + fix(total * 1000 / 30, 1) + " s";
+          default: return "+" + std::to_string(total);
+        }
+      }
+      // A mul/div mod's factor is amount × magnitude, applied n times.
+      int64_t f = 1000;
+      for (int32_t k = 0; k < n; k++) f = f * ((int64_t)g->amount * mag) / 1000;
+      const char* what = g->field == ModField::Speed      ? "speed "
+                         : g->field == ModField::Lifetime ? "life "
+                         : g->field == ModField::Radius   ? "radius "
+                                                          : "";
+      return std::string(what) + (g->op == ModOp::Div ? "/" : "x") + fix(f, 2);
+    }
+    case GlyphSort::Operator: return "x" + fix(s, 2);
+    default: return std::string();
+  }
+}
+
 const char* ModFieldName(ModField f) {
   switch (f) {
     case ModField::Count: return "count";
@@ -296,6 +599,8 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
     rd("maxTrailVoxels", b.maxTrailVoxels);
     rd("maxLifetimeTicks", b.maxLifetimeTicks);
     rd("maxMultiplicity", b.maxMultiplicity);
+    rd("maxDelayTicks", b.maxDelayTicks);
+    rd("minEveryTicks", b.minEveryTicks);
     rd("maxInstances", b.maxInstances);
     rd("sprayVoxels", b.sprayVoxels);
     rd("maxSprayVoxels", b.maxSprayVoxels);
@@ -326,6 +631,8 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   b.maxTrailVoxels = ClampI(b.maxTrailVoxels, 1, 4096);
   b.maxLifetimeTicks = ClampI(b.maxLifetimeTicks, 1, 1800);
   b.maxMultiplicity = ClampI(b.maxMultiplicity, 1, 8);
+  b.maxDelayTicks = ClampI(b.maxDelayTicks, 0, 1800);
+  b.minEveryTicks = ClampI(b.minEveryTicks, 1, 60);
   b.maxInstances = ClampI(b.maxInstances, 1, 81);
   b.sprayVoxels = ClampI(b.sprayVoxels, 1, 64);
   // kMaxParticleSpawnsPerTick is 4096 and it is SHARED with gore and debris
@@ -577,6 +884,78 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
         break;
       }
     }
+
+    // MAGNITUDE (PLAN_spell_magnitude §2.2): which words the page may scale,
+    // and over what range. The DEFAULT follows the sort, so an authored word
+    // needs no block: nouns and field mods scale ¼..4 in quarters; a whole-unit
+    // field (a bounce, a pierce, a homing step) scales in whole units; a count
+    // mod (the fan), a delivery and a mark do not scale at all; an operator
+    // scales only when its glyph says so. A mul/div mod never goes below ×1, so
+    // `swift` cannot be turned into `slow` by the handle.
+    switch (d.sort) {
+      case GlyphSort::Matter:
+      case GlyphSort::Effect:
+        d.graded = true;
+        d.magMin = 250, d.magMax = 4000, d.magStep = 250;
+        break;
+      case GlyphSort::Mod:
+        if (d.field == ModField::Count) break;
+        d.graded = true;
+        if (d.field == ModField::Bounces || d.field == ModField::Pierce ||
+            d.field == ModField::Seek) {
+          d.magMin = 1000, d.magMax = 8000, d.magStep = 1000;
+        } else {
+          d.magMin = 250, d.magMax = 4000, d.magStep = 250;
+        }
+        break;
+      default:
+        break;
+    }
+    bool explicitMag = false;
+    // A SIGNED component may go below zero: gravity added (`lift@-1` presses
+    // down) and a wind's speed (`wind@-1` pulls in). Nothing else has a
+    // meaning for "negative this much".
+    const bool signedOk =
+        (d.sort == GlyphSort::Mod && d.op == ModOp::Add && d.field == ModField::Gravity) ||
+        (d.sort == GlyphSort::Effect && d.verb == SpellVerb::Wind);
+    d.hidden = g.value("hidden", false);
+    if (g.contains("magnitude")) {
+      explicitMag = true;
+      const json& m = g["magnitude"];
+      const bool scalable = d.sort != GlyphSort::Delivery && d.sort != GlyphSort::Separator &&
+                            !(d.sort == GlyphSort::Mod && d.field == ModField::Count);
+      if (m.is_boolean()) {
+        d.graded = m.get<bool>() && scalable;
+        if (d.graded && d.magStep == 1000 && d.magMin == 1000 && d.magMax == 1000)
+          d.magMin = 250, d.magMax = 4000, d.magStep = 250;
+      } else if (m.is_object() && scalable) {
+        d.graded = true;
+        auto mille = [&](const char* k, int32_t def) {
+          return m.contains(k) && m[k].is_number()
+                     ? (int32_t)std::lround(m[k].get<double>() * 1000.0)
+                     : def;
+        };
+        d.magMin = mille("min", 250);
+        d.magMax = mille("max", 4000);
+        d.magStep = mille("step", 250);
+        d.magDefault = mille("default", 1000);
+      } else if (!m.is_boolean()) {
+        errors += where + "\"magnitude\" must be false or {min, max, step}"
+                  " (and a delivery, a mark or a count mod does not scale)\n";
+        return false;
+      }
+    }
+    // The x1 floor on a mul/div mod is a DEFAULT, for the words that existed
+    // before magnitudes (`swift` must not become `slow`). A glyph that states
+    // its range - `speed`, whose whole point is going both ways - keeps it.
+    if (d.graded && !explicitMag && (d.sort == GlyphSort::Mod) &&
+        (d.op == ModOp::Mul || d.op == ModOp::Div) && d.amount > 0)
+      d.magMin = std::max(d.magMin, (1000 + d.amount - 1) / d.amount);
+    d.magStep = ClampI(d.magStep, 1, 8000);
+    d.magMin = ClampI(d.magMin, signedOk ? -8000 : d.magStep, 8000);
+    d.magMax = ClampI(d.magMax, d.magMin, 8000);
+    if (!d.graded) d.magMin = d.magMax = d.magStep = kMagOne;
+    d.magDefault = d.graded ? ClampMagnitude(d, d.magDefault) : kMagOne;
     out.glyphs.push_back(std::move(d));
   }
 
@@ -741,8 +1120,14 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
     if (!gd) continue;
     const bool mergeable =
         gd->sort != GlyphSort::Delivery && gd->sort != GlyphSort::Separator;
+    // A word's magnitude is clamped to what its glyph allows HERE, once, so
+    // every consumer downstream may trust it. Only EQUAL magnitudes merge: a
+    // run is "the same word again", and `float@0.5 float` is not.
+    const int32_t mag = ClampMagnitude(*gd, stack.MagAt(i));
+    const SpellTiming tm = SanitizeTiming(lib, *gd, stack.TimingAt(i));
     if (mergeable && !items.empty() && !t.nodes[items.back()].group &&
-        t.nodes[items.back()].glyph == gi) {
+        t.nodes[items.back()].glyph == gi && t.nodes[items.back()].mag == mag &&
+        t.nodes[items.back()].timing == tm) {
       SpellNode& prev = t.nodes[items.back()];
       prev.n = std::min(prev.n + 1, cap);
       prev.last = (int)i;
@@ -751,6 +1136,8 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
     SpellNode n;
     n.glyph = gi;
     n.n = 1;
+    n.mag = mag;
+    n.timing = tm;
     n.first = n.last = (int)i;
     t.nodes.push_back(n);
     items.push_back((int)t.nodes.size() - 1);
@@ -798,6 +1185,8 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
         SpellNode grp;
         grp.glyph = t.nodes[ni].glyph;
         grp.n = t.nodes[ni].n;
+        grp.mag = t.nodes[ni].mag;
+        grp.timing = t.nodes[ni].timing;
         grp.group = true;
         grp.first = t.nodes[ni].first;
         grp.last = t.nodes[ni].last;
@@ -840,6 +1229,8 @@ SpellTree ParseSpell(const GlyphLibrary& lib, const SpellStack& stack) {
         // outside any lane it takes the shared items and every closed lane,
         // which is the multi-socket box.
         const int b = CloseBox(lib, t, *sc, t.nodes[ni].glyph, t.nodes[ni].first, spokenEnd);
+        // The box's TIMING is what its delivery word said (`projectile!bounce`).
+        t.nodes[b].timing = t.nodes[ni].timing;
         sc->pile.clear();
         sc->lanes.clear();
         sc->laneAt.clear();
@@ -889,12 +1280,16 @@ std::string NodeKey(const GlyphLibrary& lib, const SpellTree& t, int node) {
       if (i) s += ",";
       s += NodeKey(lib, t, n.items[i]) + "#" + std::to_string(t.nodes[n.items[i]].n);
     }
-    return s + "|" + lib.Delivery(n.glyph).id + "]" + lane;
+    return s + "|" + lib.Delivery(n.glyph).id + TimingSuffix(n.timing) + "]" + lane;
   }
   const GlyphDef* g = lib.At(n.glyph);
   if (!g) return "?";
-  if (!n.group) return g->id + lane;
-  return "(" + (n.left >= 0 ? NodeKey(lib, t, n.left) : std::string()) + "|" + g->id +
+  // A magnitude is part of the identity (only equal ones merge), spelled only
+  // when it is not 1, so every key a sentence without one had is unchanged.
+  const std::string mag = (n.mag != kMagOne ? "~" + std::to_string(n.mag) : std::string()) +
+                          TimingSuffix(n.timing);
+  if (!n.group) return g->id + mag + lane;
+  return "(" + (n.left >= 0 ? NodeKey(lib, t, n.left) : std::string()) + "|" + g->id + mag +
          "|" + (n.right >= 0 ? NodeKey(lib, t, n.right) : std::string()) + ")" + lane;
 }
 
@@ -932,7 +1327,7 @@ std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
     // `[ ... DELIVERY]`: the brackets ARE the nesting, so the HUD shows the
     // fold the way the sentence built it, with ` / ` where a lane opened.
     std::string s = ShowItems(lib, t, n.items, style, (int32_t)n.laneAt.size() / 2);
-    const std::string id = lib.Delivery(n.glyph).id;
+    const std::string id = lib.Delivery(n.glyph).id + TimingSuffix(n.timing);
     if (!s.empty()) s += " ";
     if (style == BracketStyle::Oracle) {
       s += "**" + id + Times(n.n, style) + "**";
@@ -945,7 +1340,9 @@ std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
   }
   const GlyphDef* g = lib.At(n.glyph);
   if (!g) return "?";
-  if (!n.group) return g->id + Times(n.n, style);
+  const std::string at = (n.mag != kMagOne ? "@" + MagnitudeDecimal(n.mag) : std::string()) +
+                         TimingSuffix(n.timing);
+  if (!n.group) return g->id + at + Times(n.n, style);
   const std::string l =
       n.left >= 0 ? ShowNode(lib, t, n.left, style) : (g->hasLeft ? "_" : "");
   const std::string r =
@@ -954,9 +1351,9 @@ std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
   // its left".
   std::string sym;
   if (g->hasLeft && g->hasRight)
-    sym = style == BracketStyle::Oracle ? "\xE2\x8B\x88" : "><";
+    sym = std::string(style == BracketStyle::Oracle ? "\xE2\x8B\x88" : "><") + at;
   else
-    sym = (style == BracketStyle::Oracle ? "\xE2\x97\x82" : "<") + g->id;
+    sym = (style == BracketStyle::Oracle ? "\xE2\x97\x82" : "<") + g->id + at;
   std::string inner;
   const std::string* parts[3] = {&l, &sym, &r};
   for (const std::string* p : parts) {
@@ -993,7 +1390,7 @@ int32_t WordCostOf(const GlyphLibrary& lib, const SpellTree& t, int node) {
   if (node < 0) return 0;
   const SpellNode& n = t.nodes[node];
   const GlyphDef* g = lib.At(n.glyph);
-  int32_t c = g ? SatMul(g->word, n.n) : 0;
+  int32_t c = g ? SatMul(MagnitudeWordCost(g->word, n.mag), n.n) : 0;
   if (n.group) c = SatAdd(c, SatAdd(WordCostOf(lib, t, n.left), WordCostOf(lib, t, n.right)));
   // A box owns every word inside it: word costs SUM over the whole tree,
   // whatever the tariff does.
@@ -1045,13 +1442,29 @@ bool ModMeansAnything(ModField f, DeliveryMech mech, bool isHand) {
   return false;
 }
 
-// A Mod applied N times: compose, not add.
-void ApplyMod(DeliveryRec& r, const GlyphDef& g, int32_t n, const SpellBudgets& b) {
+// A Mod applied N times: compose, not add. At magnitude `mag` the authored
+// amount is scaled first (PLAN_spell_magnitude §2.2): an add mod adds
+// amount × mag, a mul mod multiplies by amount × mag, a div mod divides by it.
+// At 1000 each is the integer formula it replaced, bit for bit.
+void ApplyMod(DeliveryRec& r, const GlyphDef& g, int32_t n, const SpellBudgets& b,
+              int32_t mag = kMagOne) {
   auto edit = [&](int32_t v) -> int32_t {
+    if (mag == kMagOne) {
+      switch (g.op) {
+        case ModOp::Mul: return SatMul(v, g.amount);
+        case ModOp::Div: return v / (g.amount < 1 ? 1 : g.amount);
+        case ModOp::Add: return SatAdd(v, g.amount);
+      }
+      return v;
+    }
+    const int64_t f = (int64_t)g.amount * mag;   // the factor, per-mille
     switch (g.op) {
-      case ModOp::Mul: return SatMul(v, g.amount);
-      case ModOp::Div: return v / (g.amount < 1 ? 1 : g.amount);
-      case ModOp::Add: return SatAdd(v, g.amount);
+      case ModOp::Mul: {
+        const int64_t x = (int64_t)v * f / 1000;
+        return (int32_t)std::max<int64_t>(-0x3FFFFFFF, std::min<int64_t>(x, 0x3FFFFFFF));
+      }
+      case ModOp::Div: return (int32_t)((int64_t)v * 1000 / (f < 1000 ? 1000 : f));
+      case ModOp::Add: return SatAdd(v, (int32_t)(f / 1000));
     }
     return v;
   };
@@ -1095,6 +1508,7 @@ EffectInst LaunchEffectOf(const GlyphLibrary& lib, const SpellTree& t, int node,
   e.verb = SpellVerb::Launch;
   e.glyph = t.nodes[node].glyph;
   e.n = t.nodes[node].n;
+  e.timing = t.nodes[node].timing;
   e.node = node;
   e.inner = c.payload;
   e.launch.push_back(c.delivery);
@@ -1114,6 +1528,8 @@ EffectInst LowerMatter(const GlyphLibrary& lib, const SpellTree& t, int node,
   e.n = n.n;
   e.matA = g.material;
   e.anyA = g.wildcard;
+  e.mag = n.mag;
+  e.timing = n.timing;
   e.radius = 0;
   e.node = node;
   return e;
@@ -1130,6 +1546,8 @@ EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
     e.verb = g.verb;
     e.glyph = n.glyph;
     e.n = n.n;
+    e.mag = n.mag;
+    e.timing = n.timing;
     e.node = node;
     e.radius = g.radius;
     if (g.verb == SpellVerb::Place) {
@@ -1144,6 +1562,7 @@ EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
       e.modOp = g.op;
       e.modAmount = g.amount;
       e.modN = n.n;
+      e.modMag = n.mag;
     }
     return e;
   }
@@ -1153,6 +1572,8 @@ EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
   e.verb = g.verb;
   e.glyph = n.glyph;
   e.n = n.n;
+  e.mag = n.mag;
+  e.timing = n.timing;
   e.node = node;
   e.complete = n.complete;
   e.radius = g.radius;
@@ -1171,7 +1592,7 @@ EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
       matterOf(n.left, e.matA, e.anyA, e.glyphA);
       matterOf(n.right, e.matB, e.anyB, e.glyphB);
       // Repeating `transmute` widens the conversion: ×N VOLUME.
-      e.radius = ClampI(ScaleRadiusCbrt(g.radius, n.n), 0, 8);
+      e.radius = ClampI(ScaleRadiusCbrtMille(g.radius, SatMul(n.n, n.mag)), 0, 8);
       break;
     case SpellVerb::Mend:
       matterOf(n.left, e.matA, e.anyA, e.glyphA);
@@ -1190,6 +1611,7 @@ EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
         w.glyph = t.nodes[child].glyph;
         w.node = child;
         w.n = t.nodes[child].n;
+        w.mag = t.nodes[child].mag;
         e.inner.push_back(w);
         break;
       }
@@ -1201,6 +1623,7 @@ EffectInst LowerEffect(const GlyphLibrary& lib, const SpellTree& t, int node,
           e.modOp = cg.op;
           e.modAmount = cg.amount;
           e.modN = c.n;
+          e.modMag = c.mag;
         } else {
           // A trail under aura: the body lays it along its own path.
           e.inner.push_back(LowerEffect(lib, t, child, true, prices));
@@ -1234,7 +1657,7 @@ int32_t EffectTicks(const GlyphLibrary& lib, const EffectInst& e) {
   switch (e.verb) {
     case SpellVerb::Wind: ticks = g && g->wind.has ? g->wind.ttlTicks : 1; break;
     case SpellVerb::Sustain: ticks = g ? g->ticks : 1; break;
-    case SpellVerb::Repeat: ticks = g ? SatMul(g->repeats, g->everyTicks) : 1; break;
+    case SpellVerb::Repeat: ticks = g ? SatMul(EchoRepeats(g, e), g->everyTicks) : 1; break;
     case SpellVerb::Filter: ticks = 1; break;
     case SpellVerb::Launch:
       // A carrier's own clock, THEN whatever its payload keeps running: the
@@ -1252,7 +1675,9 @@ int32_t EffectTicks(const GlyphLibrary& lib, const EffectInst& e) {
     default: break;
   }
   for (const EffectInst& i : e.inner) inner = std::max(inner, EffectTicks(lib, i));
-  return e.verb == SpellVerb::Launch ? SatAdd(ticks, inner) : std::max(ticks, inner);
+  // A DELAY is time the item keeps the spell alive for (rule 2's tick bound).
+  return SatAdd(e.verb == SpellVerb::Launch ? SatAdd(ticks, inner) : std::max(ticks, inner),
+                e.timing.delay);
 }
 
 }  // namespace
@@ -1289,16 +1714,17 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
   switch (e.verb) {
     case SpellVerb::Spray:
       if (e.matA == 0 && !e.anyA) return 0;
-      return std::min(SatMul(b.sprayVoxels, e.n), b.maxSprayVoxels);
-    case SpellVerb::Place: return SatMul(Cube(e.radius), e.n);
+      return std::min(ScaleMille(b.sprayVoxels, e.Scale(), 1), b.maxSprayVoxels);
+    case SpellVerb::Place: return ScaleMille(Cube(e.radius), e.Scale(), 1);
     case SpellVerb::Convert: return Cube(e.radius);
-    case SpellVerb::Explode: return Cube(ClampI(ScaleRadiusCbrt(e.radius, e.n), 0, kMaxExplosionRadius));
+    case SpellVerb::Explode:
+      return Cube(ClampI(ScaleRadiusCbrtMille(e.radius, e.Scale()), 0, kMaxExplosionRadius));
     case SpellVerb::Wind: {
       if (!g || !g->wind.has) return 0;
       const int32_t r = g->wind.radius;
       return SatMul(SatMul(r, r), g->wind.reach);
     }
-    case SpellVerb::Mend: return g ? SatMul(g->perTick, e.n) : e.n;
+    case SpellVerb::Mend: return g ? ScaleMille(g->perTick, e.Scale(), 1) : e.n;
     case SpellVerb::Filter: return Cube(e.radius);
     case SpellVerb::Trail: {
       int32_t v = 0;
@@ -1313,7 +1739,7 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
     case SpellVerb::Repeat: {
       int32_t v = 0;
       for (const EffectInst& i : e.inner) v = SatAdd(v, EffectVolume(lib, i));
-      return SatMul(v, g ? g->repeats : 1);
+      return SatMul(v, EchoRepeats(g, e));
     }
     case SpellVerb::Launch: {
       // A box's footprint is what it carries, plus what it lays on the way,
@@ -1323,11 +1749,13 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e) {
       // rule 2 needs.
       if (e.launch.empty()) return 0;
       int32_t shared = 0;
-      for (const EffectInst& i : e.inner) shared = SatAdd(shared, EffectVolume(lib, i));
+      for (const EffectInst& i : e.inner)
+        shared = SatAdd(shared, SatMul(EffectVolume(lib, i), FiresIn(e.launch[0], i)));
       int32_t v = SatAdd(shared, e.launch[0].trailBudget);
       for (const SpellLane& ln : e.launch[0].lanes) {
         int32_t lv = shared;
-        for (const EffectInst& i : ln.extra) lv = SatAdd(lv, EffectVolume(lib, i));
+        for (const EffectInst& i : ln.extra)
+          lv = SatAdd(lv, SatMul(EffectVolume(lib, i), FiresIn(ln.rec, i)));
         v = std::max(v, SatAdd(lv, ln.rec.trailBudget));
       }
       return SatMul(v, RecBolts(lib, e.launch[0]));
@@ -1370,14 +1798,16 @@ int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCa
     case SpellVerb::Explode: {
       // power x r^3 x rate.explode / 1000: the only superlinear curve per word,
       // because the WORLD effect is.
-      const int32_t r = ClampI(ScaleRadiusCbrt(e.radius, e.n), 1, kMaxExplosionRadius);
-      const int64_t power = (int64_t)(g ? g->power : 220) * e.n;
+      const int32_t r = ClampI(ScaleRadiusCbrtMille(e.radius, e.Scale()), 1, kMaxExplosionRadius);
+      const int64_t power = std::max<int64_t>(1, (int64_t)(g ? g->power : 220) * e.Scale() / 1000);
       const int64_t v = power * r * r * r * b.rateExplode / 1000;
       return v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)std::max<int64_t>(v, 1);
     }
     case SpellVerb::Wind: {
       if (!g || !g->wind.has) return 0;
-      const int64_t v = (int64_t)vol * g->wind.ttlTicks * e.n * b.rateWind / 1000;
+      // |scale|: a signed wind (`wind@-1` pulls) costs what the push would.
+      const int64_t sc = e.Scale() < 0 ? -(int64_t)e.Scale() : (int64_t)e.Scale();
+      const int64_t v = (int64_t)vol * g->wind.ttlTicks * sc * b.rateWind / 1000000;
       return v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)std::max<int64_t>(v, 1);
     }
     case SpellVerb::Mend: {
@@ -1404,7 +1834,7 @@ int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCa
     case SpellVerb::Repeat: {
       int32_t t = 0;
       for (const EffectInst& i : e.inner) t = SatAdd(t, EffectTariffIn(lib, i, withCarry));
-      return SatMul(t, g ? g->repeats : 1);
+      return SatMul(t, EchoRepeats(g, e));
     }
     case SpellVerb::Launch: {
       // THE PRICE IS RECURSIVE, and carry composes MULTIPLICATIVELY down the
@@ -1414,7 +1844,11 @@ int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCa
       if (e.launch.empty()) return 0;
       const DeliveryRec& d = e.launch[0];
       int32_t shared = 0;
-      for (const EffectInst& i : e.inner) shared = SatAdd(shared, EffectTariffIn(lib, i, withCarry));
+      // M3: an item priced x how many times it fires in THIS carrier - a
+      // blast at every bounce of a three-bounce bolt is three blasts. x1 for
+      // every item on hit, which is every item that existed before triggers.
+      for (const EffectInst& i : e.inner)
+        shared = SatAdd(shared, SatMul(EffectTariffIn(lib, i, withCarry), FiresIn(d, i)));
       // RULE 4: SUM over instances, not the shared tariff times the fan. The
       // two are the same number when there are no lanes, which is why every
       // pinned price of a laneless sentence is unmoved.
@@ -1424,7 +1858,7 @@ int32_t EffectTariffIn(const GlyphLibrary& lib, const EffectInst& e, bool withCa
       for (int32_t i = 0; i < L; i++) {
         int32_t li = shared;
         for (const EffectInst& x : d.lanes[i].extra)
-          li = SatAdd(li, EffectTariffIn(lib, x, withCarry));
+          li = SatAdd(li, SatMul(EffectTariffIn(lib, x, withCarry), FiresIn(d.lanes[i].rec, x)));
         // ...TIMES THAT BRANCH'S OWN SPLIT: a branch that fires three of itself
         // is paid for three times. 1 when nothing inside the lane fans, which
         // is every sentence that existed before per-branch splitting.
@@ -1586,7 +2020,7 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
     const GlyphDef& g = lib.glyphs[n.glyph];
     if (!n.group) {
       if (ModMeansAnything(g.field, rec.mech, isHand))
-        ApplyMod(rec, g, n.n, b);
+        ApplyMod(rec, g, n.n, b, n.mag);
       else
         cast.wastedMods.push_back(n.glyph);
       return;
@@ -1602,7 +2036,7 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
     EffectInst tr = LowerEffect(lib, tree, ni, true, prices);
     for (EffectInst& i : tr.inner) rec.trail.push_back(i);
     rec.trailBudget =
-        std::min(SatAdd(rec.trailBudget, SatMul(g.voxelBudget, n.n)), b.maxTrailVoxels);
+        std::min(SatAdd(rec.trailBudget, ScaleMille(g.voxelBudget, SatMul(n.n, n.mag), 1)), b.maxTrailVoxels);
     rec.trailEvery = g.everyTicks;
   };
   auto isMod = [&](int ni) { return NodeSort(lib, tree, ni) == GlyphSort::Mod; };
@@ -1910,11 +2344,25 @@ std::string LaneSentence(const GlyphLibrary& lib, const DeliveryRec& d, int32_t 
 
 // A short third-person verb phrase for one payload item: what it DOES where it
 // lands. Derived from the verb, never from the glyph id.
+std::string EffectPhraseBase(const GlyphLibrary& lib, const EffectInst& e);
+// What an item does, and WHEN when that is not "on hit" (M3).
 std::string EffectPhrase(const GlyphLibrary& lib, const EffectInst& e) {
+  std::string s = EffectPhraseBase(lib, e);
+  if (!e.timing.IsDefault()) s += " (" + TimingPhrase(e.timing) + ")";
+  return s;
+}
+
+std::string EffectPhraseBase(const GlyphLibrary& lib, const EffectInst& e) {
   const GlyphDef* g = lib.At(e.glyph);
   const std::string id = g ? g->id : "?";
   if (!e.complete) return "wastes `" + id + "` (a word it needed was missing)";
-  const std::string times = e.n > 1 ? " x" + std::to_string(e.n) : std::string();
+  std::string times = e.n > 1 ? " x" + std::to_string(e.n) : std::string();
+  // A MAGNITUDE reads as the number it produces ("power 330"), not as a
+  // multiplier on a multiplier. Absent at 1, so every old line is unchanged.
+  if (e.mag != kMagOne) {
+    const std::string lbl = MagnitudeLabel(lib, e.glyph, e.n, e.mag);
+    if (!lbl.empty()) times = " (" + lbl + ")";
+  }
   switch (e.verb) {
     case SpellVerb::Launch: return "fires " + LaunchSentence(lib, e, "that");
     case SpellVerb::Spray:
@@ -1931,7 +2379,7 @@ std::string EffectPhrase(const GlyphLibrary& lib, const EffectInst& e) {
       if (!e.anyB && e.matB == 0) return "unmakes " + a + times;
       return "turns " + a + " into " + bb + times;
     }
-    case SpellVerb::Explode: return e.n > 1 ? "explodes x" + std::to_string(e.n) : "explodes";
+    case SpellVerb::Explode: return "explodes" + times;
     case SpellVerb::Wind: return "blows a wind jet along the aim" + times;
     case SpellVerb::Mend:
       return "draws " + MatName(lib, e.glyphA, e.matA, e.anyA) +
@@ -2020,7 +2468,10 @@ std::string LaunchSentence(const GlyphLibrary& lib, const EffectInst& e,
     case DeliveryMech::Flight:
       if (d.body) trig = "when its fuse runs down";
       else if (d.resolveOnExpiry) trig = "when it hits or its life runs out";
-      else if (!post.empty()) trig = "it bounces once, then when it hits again";
+      else if (!post.empty())
+        trig = d.bounces > 1 ? "it bounces " + std::to_string(d.bounces) +
+                                   " times, then when it hits again"
+                             : "it bounces once, then when it hits again";
       else trig = "when " + it + " hits";
       if (d.fuseTicks > g.fuseTicks) {
         trig += " it waits " + std::to_string(d.fuseTicks) + " ticks, then";
@@ -2345,6 +2796,24 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
   for (size_t ei = 0; ei < payload.size(); ei++) {
     const EffectInst& e = payload[ei];
     if (!e.complete) continue;   // R3: charged, does nothing
+    // A DELAYED item (M3) is not applied now: it is scheduled, as a one-shot
+    // echo, `delay` ticks out - the same queue `echo` uses, so it is bounded,
+    // ticked and op-budgeted by the code that already is. A FLATTENED payload
+    // (a fatal cast, a misfire) does everything at once: nothing is deferred
+    // out of the caster's chest.
+    if (e.timing.delay > 0 && !flatten) {
+      SpellEcho ec;
+      EffectInst now = e;
+      now.timing.delay = 0;
+      ec.inner.push_back(std::move(now));
+      ec.at = atFx;
+      ec.dir = dirFx;
+      ec.left = 1;
+      ec.period = e.timing.delay;
+      ec.instability = instabilityMille;
+      out.echoes.push_back(std::move(ec));
+      continue;
+    }
     const GlyphDef* g = lib.At(e.glyph);
     switch (e.verb) {
       case SpellVerb::Spray: {
@@ -2357,7 +2826,7 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
           mat = matHere(known);
         }
         if (mat == 0) break;
-        int64_t n = (int64_t)b.sprayVoxels * e.n;
+        int64_t n = ScaleMille(b.sprayVoxels, e.Scale(), 1);
         n = n * strengthMille / 1000;
         if (n > b.maxSprayVoxels) n = b.maxSprayVoxels;
         int64_t len2 = (int64_t)dirFx.x * dirFx.x + (int64_t)dirFx.y * dirFx.y +
@@ -2405,7 +2874,7 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
           mat = matHere(known);
           if (mat != 0) {
             const int32_t val = lib.Arcane(mat);
-            const int32_t vox = SatMul(Cube(e.radius), e.n);
+            const int32_t vox = ScaleMille(Cube(e.radius), e.Scale(), 1);
             out.billOnResolve = SatAdd(
                 out.billOnResolve,
                 SatMul(vox, SatAdd(SatMul(val, b.ratePlace),
@@ -2413,7 +2882,7 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
           }
         }
         if (mat == 0) break;
-        const int32_t r = ClampI(ScaleRadiusCbrt(e.radius, e.n), 0, 8);
+        const int32_t r = ClampI(ScaleRadiusCbrtMille(e.radius, e.Scale()), 0, 8);
         out.ops.push_back({cx, cy, cz, e.radius > 0 ? ClampI(scaled(r), 1, 8) : 0, mat,
                            0u /*paint into air*/, 0, 0});
         break;
@@ -2471,9 +2940,10 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         // that into reach. The op's radius bound grows as the cube root so the
         // bound does not clip what the power would have reached.
         const int32_t r0 = g ? g->radius : e.radius;
-        const int32_t r = ClampI(scaled(ScaleRadiusCbrt(std::max(r0, e.radius), e.n)), 1,
+        const int32_t r = ClampI(scaled(ScaleRadiusCbrtMille(std::max(r0, e.radius), e.Scale())), 1,
                                  kMaxExplosionRadius);
-        const int32_t power = (int32_t)((int64_t)(g ? g->power : 220) * e.n * strengthMille / 1000);
+        const int32_t power =
+            (int32_t)((int64_t)(g ? g->power : 220) * e.Scale() / 1000 * strengthMille / 1000);
         out.explosions.push_back({cx, cy, cz, r, std::max(power, 1), 0, 0, 0});
         break;
       }
@@ -2485,7 +2955,8 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         Vec3 dir{SpellFxToFloat(dirFx.x), SpellFxToFloat(dirFx.y), SpellFxToFloat(dirFx.z)};
         // Repetition buys SPEED rather than size: widening the footprint would
         // multiply the chunk-wake cost eightfold for one extra word.
-        const float speed = g->wind.speedMs * (float)e.n * ((float)strengthMille / 1000.0f);
+        const float speed =
+            g->wind.speedMs * ((float)e.Scale() / 1000.0f) * ((float)strengthMille / 1000.0f);
         WindPrim p{};
         p.x = cx;
         p.y = cy;
@@ -2533,12 +3004,12 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         // rest is scheduled as an echo the system ticks.
         ApplySpellEffect(lib, e.inner, atFx, dirFx, strengthMille, out, probe,
                          instabilityMille, salt ^ 0x5EC0u, flatten);
-        if (g && g->repeats > 1) {
+        if (g && EchoRepeats(g, e) > 1) {
           SpellEcho ec;
           ec.inner = e.inner;
           ec.at = atFx;
           ec.dir = dirFx;
-          ec.left = g->repeats - 1;
+          ec.left = EchoRepeats(g, e) - 1;
           ec.period = std::max(1, g->everyTicks);
           ec.instability = instabilityMille;
           out.echoes.push_back(std::move(ec));
@@ -2570,7 +3041,7 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         SpellFilter f;
         f.glyph = e.inner[0].glyph;
         f.at = atFx;
-        f.radius = ClampI(ScaleRadiusCbrt(e.radius, e.n), 1, 64);
+        f.radius = ClampI(ScaleRadiusCbrtMille(e.radius, e.Scale()), 1, 64);
         f.ticksLeft = ClampI(g ? g->ticks : 1, 1, b.maxStatusTicks);
         out.filters.push_back(f);
         break;
@@ -2583,7 +3054,7 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
         // The probe is the CPU mirror, so this reaches only what is mirrored
         // — reach around the caster, which is what a hand channel is.
         if (!probe || !probe->matAt) break;
-        const int32_t want = SatMul(g ? g->perTick : 1, e.n);
+        const int32_t want = ScaleMille(g ? g->perTick : 1, e.Scale(), 1);
         const int32_t r = ClampI(e.radius, 0, 8);
         uint32_t src = e.anyA ? 0u : e.matA;
         if (!e.anyA && src == 0) break;   // mends from nothing: charged
@@ -2622,6 +3093,25 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
 // ---- the system ------------------------------------------------------------
 
 namespace {
+
+// THE ITEMS OF A PAYLOAD THAT FIRE ON THIS EVENT (M3). `age` is the carrier's
+// tick of flight, for `every` items. Every item that existed before triggers
+// is `hit`, so the hit list of such a payload is the payload itself.
+std::vector<EffectInst> ItemsOn(const std::vector<EffectInst>& payload, SpellTrigger t,
+                                int32_t age = 0) {
+  std::vector<EffectInst> out;
+  for (const EffectInst& e : payload) {
+    if (e.timing.trigger != t) continue;
+    if (t == SpellTrigger::Every && (e.timing.every <= 0 || age % e.timing.every != 0)) continue;
+    out.push_back(e);
+  }
+  return out;
+}
+bool HasTrigger(const std::vector<EffectInst>& payload, SpellTrigger t) {
+  for (const EffectInst& e : payload)
+    if (e.timing.trigger == t) return true;
+  return false;
+}
 
 SpellFxVec Unit(SpellFxVec v, int64_t scale) {
   const int64_t rr = IntSqrt((int64_t)v.x * v.x + (int64_t)v.y * v.y + (int64_t)v.z * v.z);
@@ -2834,6 +3324,20 @@ void SpellSystem::AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies
         const bool onAim = column && j == 0;
         const SpellFxVec d =
             onAim ? rq.dir : SpellFan(rq.dir, b2, bolts, tick ^ rq.salt, rq.casterId);
+        // AT LAUNCH (M3): a flight's launch items go off at the muzzle, the
+        // moment it is born, and any child they fire leaves along its aim.
+        if (ic.delivery.mech == DeliveryMech::Flight &&
+            HasTrigger(ic.payload, SpellTrigger::Launch)) {
+          const size_t lb = out.launches.size();
+          ApplySpellEffect(*lib_, ItemsOn(ic.payload, SpellTrigger::Launch), rq.at, d, 1000, out,
+                           probe, rq.instability, rq.salt ^ 0x1A0u ^ (uint32_t)b2);
+          for (size_t kk = lb; kk < out.launches.size(); kk++) {
+            out.launches[kk].at = rq.at;
+            out.launches[kk].dir = d;
+            out.launches[kk].generation = gen + 1;
+            out.launches[kk].casterId = rq.casterId;
+          }
+        }
         switch (ic.delivery.mech) {
           case DeliveryMech::Flight:
             if (ic.delivery.body)
@@ -2927,7 +3431,7 @@ void SpellSystem::Adopt(SpellEmission& out, const SpellBodyProbe* bodies, uint32
     // The body at the point, or the place.
     if (bodies && bodies->bodyIdAt) {
       const Vec3 from{SpellFxToFloat(st.at.x), SpellFxToFloat(st.at.y), SpellFxToFloat(st.at.z)};
-      const float r = (float)std::max(1, ScaleRadiusCbrt(st.effect.radius, st.effect.n)) + 2.0f;
+      const float r = (float)std::max(1, ScaleRadiusCbrtMille(st.effect.radius, st.effect.Scale())) + 2.0f;
       uint64_t id;
       Vec3 c;
       if (bodies->bodyIdAt(bodies->ctx, from, r, id, c)) {
@@ -3251,27 +3755,32 @@ void SpellSystem::Tick(uint32_t tick, World& world,
   // (thesis 2), then the carriers its payload asked for. `from` is the last
   // free position, which is where a child launches from — a child born inside
   // the wall its parent hit would impact on its first sub-step and chain.
-  auto resolve = [&](const SpellCast& cast, SpellFxVec at, SpellFxVec from, SpellFxVec dir,
-                     int32_t instability, int32_t gen, uint64_t casterId, uint32_t salt,
-                     bool surface) {
+  // `items` is WHICH PART of the payload this event fires (M3: the hit items on
+  // an impact, the bounce items at a bounce, ...); `childDir`, when given, is
+  // the direction a child leaves in (a bounce's rebound, the flight's own
+  // velocity) instead of the reflection off a surface.
+  auto resolve = [&](const SpellCast& cast, const std::vector<EffectInst>& items, SpellFxVec at,
+                     SpellFxVec from, SpellFxVec dir, int32_t instability, int32_t gen,
+                     uint64_t casterId, uint32_t salt, bool surface,
+                     const SpellFxVec* childDir = nullptr) {
     {
       SpellImpactFx fx;
       fx.at = at;
       fx.tint = CastTintMaterial(cast);
       fx.radius = std::max(1, cast.delivery.impactRadius);
-      for (const EffectInst& e : cast.payload) fx.radius = std::max(fx.radius, e.radius);
+      for (const EffectInst& e : items) fx.radius = std::max(fx.radius, e.radius);
       fx.deliveryGlyph = cast.delivery.glyph;
       out.impacts.push_back(fx);
     }
     if (opsUsed < kSpellOpsPerTick) {
       const size_t before = out.ops.size();
       const size_t lbefore = out.launches.size();
-      ApplySpellEffect(*lib_, cast.payload, at, dir, 1000, out, &probe, instability, salt);
+      ApplySpellEffect(*lib_, items, at, dir, 1000, out, &probe, instability, salt);
       opsUsed += (int)(out.ops.size() - before);
       // NESTING (rule 2): a child leaves from the last free position, one
       // generation down. The generation counter is the subcriticality
       // guarantee — nothing past budgets.maxGeneration launches.
-      const SpellFxVec ld = launchDir(at, from, dir, surface);
+      const SpellFxVec ld = childDir ? *childDir : launchDir(at, from, dir, surface);
       for (size_t k = lbefore; k < out.launches.size(); k++) {
         out.launches[k].at = from;
         out.launches[k].dir = ld;
@@ -3312,11 +3821,12 @@ void SpellSystem::Tick(uint32_t tick, World& world,
     SpellFxVec impactAt = p.pos;
 
     bool impactSurface = false;
+    bool expiredNow = false;
     if (p.resting) {
       // A fused bolt sits where it landed until the fuse runs out.
       if (--p.fuseLeft <= 0) {
-        resolve(p.cast, p.pos, p.pos, {0, kSpellFxOne, 0}, p.instability, p.gen, p.casterId,
-                (uint32_t)tick, false);
+        resolve(p.cast, ItemsOn(p.cast.payload, SpellTrigger::Hit), p.pos, p.pos,
+                {0, kSpellFxOne, 0}, p.instability, p.gen, p.casterId, (uint32_t)tick, false);
         p.alive = false;
       }
     } else if (--p.ticksLeft <= 0) {
@@ -3326,8 +3836,18 @@ void SpellSystem::Tick(uint32_t tick, World& world,
         impact = true;
         impactAt = p.pos;
       }
+      expiredNow = true;
       p.alive = false;
     } else {
+      // EVERY N TICKS OF FLIGHT (M3): a pulse from where the carrier is, along
+      // the way it is going.
+      p.age++;
+      if (HasTrigger(p.cast.payload, SpellTrigger::Every)) {
+        const std::vector<EffectInst> ev = ItemsOn(p.cast.payload, SpellTrigger::Every, p.age);
+        if (!ev.empty())
+          resolve(p.cast, ev, p.pos, p.pos, p.vel, p.instability, p.gen, p.casterId,
+                  (uint32_t)tick ^ 0xE7E7u, false, &p.vel);
+      }
       // Gravity and homing, per the record.
       if (p.cast.delivery.gravityMille != 0)
         p.vel.y -= (int32_t)((int64_t)kGravityFxPerTick2 * p.cast.delivery.gravityMille / 1000);
@@ -3379,6 +3899,11 @@ void SpellSystem::Tick(uint32_t tick, World& world,
             p.vel.x = p.vel.x * 4 / 5;
             p.vel.y = p.vel.y * 4 / 5;
             p.vel.z = p.vel.z * 4 / 5;
+            // AT EACH BOUNCE (M3): from the last free position, a child
+            // leaving along the rebound.
+            if (HasTrigger(p.cast.payload, SpellTrigger::Bounce))
+              resolve(p.cast, ItemsOn(p.cast.payload, SpellTrigger::Bounce), p.pos, p.pos, p.vel,
+                      p.instability, p.gen, p.casterId, (uint32_t)tick ^ 0xB0B0u, false, &p.vel);
             continue;
           }
           if (p.cast.delivery.fuseTicks > 0) {
@@ -3423,9 +3948,18 @@ void SpellSystem::Tick(uint32_t tick, World& world,
     }
 
     if (impact) {
-      resolve(p.cast, impactAt, p.pos, p.vel, p.instability, p.gen, p.casterId, (uint32_t)tick,
-              impactSurface);
+      // The hit items - and, when life running out IS the resolve (an orb),
+      // the expiry items with them.
+      std::vector<EffectInst> hit = ItemsOn(p.cast.payload, SpellTrigger::Hit);
+      if (expiredNow)
+        for (const EffectInst& x : ItemsOn(p.cast.payload, SpellTrigger::Expire)) hit.push_back(x);
+      resolve(p.cast, hit, impactAt, p.pos, p.vel, p.instability, p.gen, p.casterId,
+              (uint32_t)tick, impactSurface);
       p.alive = false;
+    } else if (expiredNow && HasTrigger(p.cast.payload, SpellTrigger::Expire)) {
+      // A bolt that hit nothing still has an ending, and that is an event.
+      resolve(p.cast, ItemsOn(p.cast.payload, SpellTrigger::Expire), p.pos, p.pos, p.vel,
+              p.instability, p.gen, p.casterId, (uint32_t)tick ^ 0xE0E0u, false, &p.vel);
     }
 
     if (!p.alive) {
@@ -3480,6 +4014,15 @@ void SpellSystem::Tick(uint32_t tick, World& world,
            bm.markedValid, bm.lastPos, {0, kSpellFxOne, 0});
       stamp(bm.casterId);
     }
+    // EVERY N TICKS of a bomb's life (M3), from where the body is.
+    bm.age++;
+    if (HasTrigger(bm.cast.payload, SpellTrigger::Every)) {
+      const std::vector<EffectInst> ev = ItemsOn(bm.cast.payload, SpellTrigger::Every, bm.age);
+      const SpellFxVec up{0, kSpellFxOne, 0};
+      if (!ev.empty())
+        resolve(bm.cast, ev, bm.lastPos, bm.lastPos, up, bm.instability, bm.gen, bm.casterId,
+                (uint32_t)tick ^ bm.token ^ 0xE7E7u, false, &up);
+    }
     const bool fused = --bm.fuseLeft <= 0;
     const bool expired = --bm.ticksLeft <= 0;
     if (absorbed(bm.cast.delivery.glyph, bm.lastPos)) {
@@ -3491,8 +4034,9 @@ void SpellSystem::Tick(uint32_t tick, World& world,
       continue;
     }
     if (fused || gone || expired) {
-      resolve(bm.cast, bm.lastPos, bm.lastPos, {0, kSpellFxOne, 0}, bm.instability, bm.gen,
-              bm.casterId, (uint32_t)tick ^ bm.token, false);
+      resolve(bm.cast, ItemsOn(bm.cast.payload, SpellTrigger::Hit), bm.lastPos, bm.lastPos,
+              {0, kSpellFxOne, 0}, bm.instability, bm.gen, bm.casterId,
+              (uint32_t)tick ^ bm.token, false);
       if (bm.body != 0 && !gone) out.bodyDone.push_back(bm.body);
       bombs_[i] = bombs_.back();
       bombs_.pop_back();
@@ -3523,7 +4067,10 @@ void SpellSystem::Tick(uint32_t tick, World& world,
         if (st.effect.modField == ModField::Gravity && st.target != 0) {
           int32_t g = 0;
           for (int32_t k = 0; k < st.effect.modN; k++)
-            g = ClampI(st.effect.modOp == ModOp::Add ? g + st.effect.modAmount : g, -8000, 8000);
+            g = ClampI(st.effect.modOp == ModOp::Add
+                           ? g + (int32_t)((int64_t)st.effect.modAmount * st.effect.modMag / 1000)
+                           : g,
+                       -8000, 8000);
           // Per tick: what the record's edit would do to the flight, as a
           // velocity change on the body (voxels/s per tick).
           out.bodyImpulses.push_back({st.target, Vec3{0, -(float)g * 0.012f, 0}});

@@ -117,6 +117,15 @@ struct Tuning {
     // speed the game actually runs — so the feel is unchanged where it was
     // tuned, and now stays put at 30 or 144 fps instead of drifting.
     float groundAccel = 43.1f, airAccel = 6.2f, liquidAccel = 16.3f;
+    // ---- slippery feet (a coat whose material lists "slippery" in its
+    // materials.json coat.effects -- oil) ----
+    // Grip on the ground is groundAccel scaled from 1 down to slipGrip as the
+    // FEET's amount-weighted coat fraction (MobSystem::CoatTagFraction over
+    // limbs tagged "foot") climbs from slipCoatStart to slipCoatFull. The
+    // start sits above oil's decayFloor sheen (2/15 on the surface voxels
+    // only, ~0.07 of a foot), so a greasy sheen that never dries does not
+    // keep you skating until you wash it off.
+    float slipCoatStart = 0.08f, slipCoatFull = 0.30f, slipGrip = 0.08f;
     float liquidDrag = 8.3f;
     float liquidGravityScale = 0.25f;
     float liquidSpeedScale = 0.55f;
@@ -1663,6 +1672,14 @@ struct Tuning {
     // everything twice as fast and small values make blood permanent. A dial
     // on the whole look rather than a per-material edit.
     float decayScale = 1.0f;
+    // How much faster a WET coat (a washer, i.e. water) dries while the body is
+    // in sunshine: daylight up and open sky over the limb (MobSystem::
+    // InSunlight). Divides the drying period like decayScale; 1 = no effect.
+    float sunDryScale = 2.0f;
+    // Seconds of heat against a wet voxel to boil it from soaked (15) to dry.
+    // A wet voxel cannot catch fire (BurnOneLimb section 0), so this is how
+    // long water on the skin holds a flame off.
+    float fireDrySeconds = 2.0f;
     // Ground cells one footfall may track a coat onto. A footprint is a patch,
     // not a point, and this is how big the patch may get.
     int shedCells = 3;
@@ -2992,6 +3009,15 @@ struct Tuning {
     float precipScale = 1.0f;
     // Time constant, in sim seconds, over which rained-on ground dries.
     float drySeconds = 240.0f;
+    // ---- where the sky touches the WORLD (weather::SimRainWord) ----
+    // The one sim-affecting half of the weather: rain on the tick stream, read
+    // by reactions authored "rain" (douses) and "rainDamped" (ignitions).
+    // Off = the word is 0 and every such rule behaves as if the sky were dry.
+    bool rainTouchesWorld = true;
+    // How much of an exposed ignition's chance full rain / soaked ground
+    // removes (0 = none, 1 = all of it). Scaled by max(rain, wetness), so a
+    // drizzle already slows a fire and a field stays slow to catch after it.
+    float rainIgniteDamp = 0.6f;
   } weather;
 
   // ---- combustion: how long anything in the world stays alight ----

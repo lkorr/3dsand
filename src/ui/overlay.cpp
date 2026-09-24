@@ -270,16 +270,36 @@ void Overlay::DrawHUD(const UIState& s) {
   // — so a clean player's HUD is exactly the HUD that was here before.
   float yStack = yHealth - gap;
   if (s.bodyValid && s.stainFrac >= s.stainHudMin && s.stainColor != 0) {
+    // EVERY substance, each in its own colour with its own share: "stained
+    // 40% · oil 22% · water 18%". Naming only the heaviest is how an
+    // oiled player in the rain read as "water" and nothing else (2026-09-23).
+    // A substance too thin to round to 1% is not worth a word.
     char buf[80];
-    snprintf(buf, sizeof buf, "stained %.0f%% \xc2\xb7 %s",
-             s.stainFrac * 100.0f,
-             s.stainLabel[0] ? s.stainLabel : "something");
+    snprintf(buf, sizeof buf, "stained %.0f%%", s.stainFrac * 100.0f);
     const ImVec2 ts = ImGui::CalcTextSize(buf);
     const ImVec2 tp(x, std::floor(yStack - ts.y - 2.0f));
     // Lightened toward white: an authored stain colour is picked to read as
     // DRIED matter on a lit surface, and the same value set as 13 px of text
     // over the figure's dark scrim is barely a shape.
     ui::ShadowText(d, tp, ui::Mix(s.stainColor, IM_COL32_WHITE, 0.45f), buf);
+    float cx = tp.x + ts.x;
+    int named = 0;
+    for (int k = 0; k < s.coatCount; k++) {
+      const UIState::CoatName& c = s.coats[k];
+      if (c.color == 0 || c.frac < 0.005f) continue;
+      snprintf(buf, sizeof buf, " \xc2\xb7 %s %.0f%%",
+               c.label[0] ? c.label : "something", c.frac * 100.0f);
+      ui::ShadowText(d, ImVec2(cx, tp.y),
+                     ui::Mix(c.color, IM_COL32_WHITE, 0.45f), buf);
+      cx += ImGui::CalcTextSize(buf).x;
+      named++;
+    }
+    if (named == 0) {
+      snprintf(buf, sizeof buf, " \xc2\xb7 %s",
+               s.stainLabel[0] ? s.stainLabel : "something");
+      ui::ShadowText(d, ImVec2(cx, tp.y),
+                     ui::Mix(s.stainColor, IM_COL32_WHITE, 0.45f), buf);
+    }
     yStack = tp.y - 2.0f;
   }
 
@@ -315,6 +335,49 @@ void Overlay::DrawHUD(const UIState& s) {
     return ts.y + 8;
   };
   float py = std::floor(disp.y * 0.5f) + 28.0f;
+  // ---- the throw's wind-up: a row of pixel pips under the crosshair --------
+  //
+  // Ten 6x8 cells on the 2 px grid, lit left to right in gold as Q is held,
+  // turning ember at full. FULL is the one state the eye has to catch without
+  // counting pips, so at full the whole meter SHAKES -- a whole-pixel jitter
+  // on a fast wall-clock step, never a sub-pixel slide -- and the rim glows.
+  if (s.throwCharge >= 0.0f) {
+    constexpr int kPips = 10;
+    const float pw = 6.0f, ph = 8.0f, pg = 2.0f;
+    const float mw = kPips * pw + (kPips - 1) * pg;
+    const bool full = s.throwCharge >= 1.0f;
+    float jx = 0.0f, jy = 0.0f;
+    if (full) {
+      const int step = (int)(ImGui::GetTime() * 40.0);
+      const uint32_t h = (uint32_t)step * 2654435761u;
+      jx = (float)((int)(h >> 29) % 3 - 1) * 2.0f;
+      jy = (float)((int)(h >> 27) % 3 - 1) * 2.0f;
+    }
+    const float mx = std::floor((disp.x - mw) * 0.5f) + jx;
+    const float my = py + jy;
+    const ImU32 rim = full ? ui::ColEmber() : ui::ColBronze();
+    if (full)
+      d->AddRectFilled(ImVec2(mx - 6, my - 6), ImVec2(mx + mw + 6, my + ph + 6),
+                       ui::Fade(ui::ColEmber(), 0.25f));
+    d->AddRectFilled(ImVec2(mx - 4, my - 4), ImVec2(mx + mw + 4, my + ph + 4),
+                     IM_COL32(0, 0, 0, 170));
+    d->AddRect(ImVec2(mx - 4, my - 4), ImVec2(mx + mw + 4, my + ph + 4), rim,
+               0.0f, 0, 2.0f);
+    const int lit = (int)std::floor(s.throwCharge * kPips + 1e-4f);
+    for (int i = 0; i < kPips; i++) {
+      const float x0 = mx + i * (pw + pg);
+      const ImVec2 a(x0, my), b(x0 + pw, my + ph);
+      if (i < lit) {
+        const ImU32 c = full ? ui::ColEmber() : ui::ColGold();
+        d->AddRectFilled(a, b, c);
+        d->AddRectFilled(a, ImVec2(b.x, a.y + 2), full ? ui::ColGoldPale()
+                                                       : ui::ColGoldHi());
+      } else {
+        d->AddRectFilled(a, b, ui::ColDeep());
+      }
+    }
+    py += ph + 14.0f;
+  }
   if (!s.lookPrompt.empty())
     py += tab(s.lookPrompt.c_str(), py, ui::ColGoldDim(), ui::ColParch(), 0.95f);
   if (!s.kitMessage.empty() && s.kitMessageAge < 2.5f) {
@@ -322,6 +385,9 @@ void Overlay::DrawHUD(const UIState& s) {
     tab(s.kitMessage.c_str(), py, ui::ColEmber(), ui::ColEmber(), a);
   }
   ImGui::PopFont();
+  // The hotbar along the bottom centre (ui/inventory_ui.h): what is in your
+  // hand and what the number row reaches.
+  DrawHudHotbar(s, d);
 }
 
 // ---- the body-condition stick figure ----------------------------------------
@@ -992,6 +1058,16 @@ void Overlay::Draw(UIState& s) {
     changed |= EditableSliderFloat("raininess x##wx", &wt.precipScale, 0.0f, 4.0f, "%.2fx");
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("Multiplies every preset's raininess: wetter / drier.");
+    changed |= ImGui::Checkbox("rain touches world##wx", &wt.rainTouchesWorld);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Rain douses exposed fire and damps ignition (moves the world hash).");
+    changed |= EditableSliderFloat("rain ignition damp##wx", &wt.rainIgniteDamp, 0.0f, 1.0f, "%.2f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Share of an exposed ignition chance that full rain / soaked ground removes.");
+    {
+      const uint32_t rw = weather::LastSimRainWord();
+      ImGui::Text("sim: rain %u  wet %u /255", rw & 0xFFu, (rw >> 16) & 0xFFu);
+    }
     changed |= EditableSliderFloat("ease (s)##wx", &wt.transitionSeconds, 0.0f, 60.0f, "%.0f s");
     if (ImGui::IsItemHovered())
       ImGui::SetTooltip("How long a pinned change takes to blend in.");
@@ -1145,6 +1221,62 @@ void Overlay::Draw(UIState& s) {
   if (ImGui::Button("Fluid")) s.fluidWindowOpen = !s.fluidWindowOpen;
   ImGui::SameLine();
   if (ImGui::Button("Wardrobe")) s.wardrobeWindowOpen = !s.wardrobeWindowOpen;
+
+  // ---- a filled vessel, into your own inventory ------------------
+  // In the MAIN F1 panel (it first shipped inside the NPC AI window, where
+  // nobody looked). Pickers mirrored by main.cpp (UIState::giveVesselNames); the
+  // material list is only what THIS vessel can hold, so a pouch never
+  // offers water and a flask never offers sand.
+  if (!s.giveVesselNames.empty() &&
+      ImGui::CollapsingHeader("Give me a filled vessel",
+                              ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (s.giveVesselPick < 0 ||
+        s.giveVesselPick >= (int)s.giveVesselNames.size())
+      s.giveVesselPick = 0;
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::BeginCombo("vessel##give",
+                          s.giveVesselNames[s.giveVesselPick].c_str())) {
+      for (int i = 0; i < (int)s.giveVesselNames.size(); i++) {
+        ImGui::PushID(i);
+        if (ImGui::Selectable(s.giveVesselNames[i].c_str(),
+                              i == s.giveVesselPick)) {
+          if (i != s.giveVesselPick) s.giveMatPick = 0;
+          s.giveVesselPick = i;
+        }
+        ImGui::PopID();
+      }
+      ImGui::EndCombo();
+    }
+    const std::vector<std::string>* matNames =
+        s.giveVesselPick < (int)s.giveVesselMats.size()
+            ? &s.giveVesselMats[s.giveVesselPick]
+            : nullptr;
+    if (matNames && !matNames->empty()) {
+      if (s.giveMatPick < 0 || s.giveMatPick >= (int)matNames->size())
+        s.giveMatPick = 0;
+      ImGui::SetNextItemWidth(160);
+      if (ImGui::BeginCombo("filled with##give",
+                            (*matNames)[s.giveMatPick].c_str(),
+                            ImGuiComboFlags_HeightLarge)) {
+        for (int i = 0; i < (int)matNames->size(); i++) {
+          ImGui::PushID(i);
+          if (ImGui::Selectable((*matNames)[i].c_str(),
+                                i == s.giveMatPick))
+            s.giveMatPick = i;
+          ImGui::PopID();
+        }
+        ImGui::EndCombo();
+      }
+      if (ImGui::Button("give (full)##give")) s.giveVessel = true;
+      if (!s.giveVesselStatus.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", s.giveVesselStatus.c_str());
+      }
+    } else {
+      ImGui::TextDisabled("this vessel holds no loaded material");
+    }
+    ImGui::Separator();
+  }
 
   if (s.tool == UIState::kToolMelee) {
     ImGui::TextDisabled("hold LMB to guard, then FLICK the mouse to cut");

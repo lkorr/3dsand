@@ -22,6 +22,9 @@
     "coyoteTime": 0.12,
     "jumpBufferTime": 0.12,
     "groundAccel": 43.1,
+    "slipCoatStart": 0.08,
+    "slipCoatFull": 0.3,
+    "slipGrip": 0.08,
     "airAccel": 6.2,
     "liquidAccel": 16.3,
     "liquidDrag": 8.3,
@@ -122,7 +125,7 @@
     "airPoseLandHeight": 1.1,
     "airPoseLean": 16,
     "firstPersonArms": true,
-    "firstPersonForward": 0.255,
+    "firstPersonForward": 0.15,
     "footTrim": 0,
     "severImpulse": 6,
     "respawnDelay": 3,
@@ -276,7 +279,7 @@
     "stainBoneMin": 5,
     "stainContactScale": 1,
     "stainFloorTransfer": 0.35,
-    "stainWashPerContact": 3,
+    "stainWashPerContact": 5,
     "splatterReach": 48,
     "splatterAmount": 6,
     "splatterPerLimb": 64,
@@ -347,6 +350,8 @@
   "coat": {
     "recountTicks": 8,
     "decayScale": 1,
+    "sunDryScale": 2,
+    "fireDrySeconds": 0.667,
     "shedCells": 3,
     "shedPerTick": 64,
     "shedAmount": 2,
@@ -1103,7 +1108,9 @@
     "transitionSeconds": 12,
     "coverageBias": 0,
     "precipScale": 1,
-    "drySeconds": 240
+    "drySeconds": 240,
+    "rainTouchesWorld": true,
+    "rainIgniteDamp": 0.6
   },
   "combustion": {
     "burnDurationPct": 200,

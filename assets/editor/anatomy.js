@@ -56,6 +56,20 @@
  *    shorts, not flesh under the shorts); every deeper voxel follows the
  *    schedule by depth unchanged, so the bone core is where it would be on a
  *    bare limb.
+ *  - `carve` (per limb, `limbs.<name>.carve`) is what turns a bone CORE into a
+ *    SKELETON: depth alone makes an ellipsoid shell, which has no eye sockets
+ *    and no ribs. Each rule is
+ *        { "material": "flesh", "where": "bone",
+ *          "box":   { "x": [lo, hi], "y": [lo, hi], "z": [lo, hi] },
+ *          "depth": [min, max],
+ *          "stripe": { "axis": "y", "period": 4, "width": 2 } }
+ *    and every field but `material` is optional. A cell matches when the
+ *    schedule put `where` there, its centre lies in the box (FRACTIONS of the
+ *    limb's own box, lo inclusive, hi exclusive, so one rule fits every
+ *    generated body; +z is the FRONT, +y is up), its depth is in range, and
+ *    (limb-local index along `axis`) % period < width. Rules run in order and
+ *    the LAST match wins, so a rule list reads as "hollow it, then put the
+ *    ribs back". Kept layers are never carved: the surface is the character.
  */
 
 export const ANATOMY_VERSION = 1;
@@ -101,6 +115,46 @@ export const DEFAULT_ANATOMY = {
         { material: 'flesh', depth: 1 },
         { material: 'bone', depth: 2 },
         { material: 'brain' },
+      ],
+      // A SKULL, NOT AN EGG. With the skin and scalp gone the shell has to read
+      // as a face: two orbits behind the painted eyes and a nasal hole between
+      // and below them, filled with soft tissue that goes before the bone does.
+      //
+      // THE ORBITS ARE MUSCLE, NOT FLESH. Flesh is also the scalp, so with the
+      // skin gone a flesh-filled orbit was the same pink as the whole face, and
+      // after the scalp went it was a pale pink dot in pale bone a third of a
+      // world voxel across: a player who melted a face with acid saw no eye
+      // sockets at all (2026-09-23). Dark red against bone reads as a hole.
+      //
+      // Boxes are fractions of the head box. Painted eyes sit at x 4-5 / 14-15
+      // on the CURVE of the face, where the bone is three layers back; the
+      // z >= 0.6 floor is what reaches it. The generated heads paint their eyes
+      // a fixed count down from the TOP (y 16-17 of 32 on the human, 14-15 of
+      // 30 on newcomer), so no two-row fraction from the bottom fits both: the
+      // y box is three rows tall on purpose (an orbit is bigger than the eye).
+      carve: [
+        { material: 'muscle', where: 'bone',
+          box: { x: [0.2, 0.4], y: [0.47, 0.57], z: [0.6, 1] } },
+        { material: 'muscle', where: 'bone',
+          box: { x: [0.6, 0.8], y: [0.47, 0.57], z: [0.6, 1] } },
+        { material: 'flesh', where: 'bone',
+          box: { x: [0.45, 0.55], y: [0.4, 0.47], z: [0.7, 1] } },
+      ],
+    },
+    // A RIBCAGE, NOT A BONE BRICK. Depth alone fills the chest with solid bone
+    // from depth 3 inward. Instead: the organs (flesh) inside, a muscle wall at
+    // depth 3, then bone put back as ribs (2 rows on, 2 off, over the chest), a
+    // sternum down the front of the cage and a spine down the whole back.
+    torso: {
+      carve: [
+        { material: 'flesh', where: 'bone' },
+        { material: 'muscle', where: 'bone', depth: [3, 3] },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { y: [0.42, 0.94] }, stripe: { axis: 'y', period: 4, width: 2 } },
+        { material: 'bone', where: 'bone', depth: [3, 3],
+          box: { x: [0.45, 0.55], y: [0.42, 0.94], z: [0.5, 1] } },
+        { material: 'bone', where: 'bone',
+          box: { x: [0.4, 0.6], z: [0, 0.5] } },
       ],
     },
   },
@@ -235,6 +289,51 @@ export function layersFor(recipe, limbName) {
 }
 
 /**
+ * A limb's `carve` rules (see the module comment), normalised: each
+ * {material, where|null, box: {x,y,z: [lo,hi]|null}, depth: [min,max],
+ * stripe: {axis:0|1|2, period, width}|null}. Empty when the limb has none.
+ */
+export function carveFor(recipe, limbName) {
+  const src = (recipe.limbs && limbName && recipe.limbs[limbName] &&
+               recipe.limbs[limbName].carve) || [];
+  const range = r => Array.isArray(r) && r.length === 2 ? [+r[0], +r[1]] : null;
+  const out = [];
+  for (const c of src) {
+    if (!c || !c.material) continue;
+    const b = c.box || {};
+    const dep = Array.isArray(c.depth) ? c.depth : [];
+    const s = c.stripe;
+    const axis = s ? ['x', 'y', 'z'].indexOf(s.axis) : -1;
+    out.push({
+      material: c.material,
+      where: c.where || null,
+      box: { x: range(b.x), y: range(b.y), z: range(b.z) },
+      depth: [dep[0] == null ? 0 : dep[0] | 0, dep[1] == null ? 254 : dep[1] | 0],
+      stripe: axis >= 0 && (s.period | 0) > 0
+        ? { axis, period: s.period | 0, width: s.width | 0 } : null,
+    });
+  }
+  return out;
+}
+
+/** Does carve rule `c` take this model-local cell? `layerId` is the material
+ *  the depth schedule put there, `whereId` the rule's resolved `where`. */
+export function carveMatches(c, whereId, layerId, lx, ly, lz, dim, depth) {
+  if (c.where && whereId !== layerId) return false;
+  if (depth < c.depth[0] || depth > c.depth[1]) return false;
+  const l = [lx, ly, lz], n = [dim.x, dim.y, dim.z];
+  for (let a = 0; a < 3; a++) {
+    const r = c.box[['x', 'y', 'z'][a]];
+    if (!r) continue;
+    const f = (l[a] + 0.5) / n[a];
+    if (f < r[0] || f >= r[1]) return false;
+  }
+  if (c.stripe && (l[c.stripe.axis] % c.stripe.period) >= c.stripe.width)
+    return false;
+  return true;
+}
+
+/**
  * Which layer index a depth falls in. Layers are consumed outermost first,
  * each `depth` voxels thick; the last layer (or any with depth null) takes
  * the rest. Returns -1 when the schedule runs out before the core, which
@@ -323,6 +422,9 @@ export function planAnatomy(prefab, recipe, matId) {
     const ids = layers.map(l => resolve(l.material));
     const speck = layers.map(l => l.speckle ? resolve(l.speckle.material) : 0);
     const surfaceId = ids[0];
+    const carve = carveFor(recipe, m.name);
+    const carveId = carve.map(c => resolve(c.material));
+    const carveWhere = carve.map(c => c.where ? resolve(c.where) : 0);
     // What this recipe puts under the surface. A `keep` voxel made of one of
     // these is a face that was once baked as interior, not the painted
     // character, and it gets the kept layer's material back (see the module
@@ -333,6 +435,7 @@ export function planAnatomy(prefab, recipe, matId) {
       if (ids[li]) interior.add(ids[li]);
       if (speck[li]) interior.add(speck[li]);
     });
+    for (const id of carveId) if (id) interior.add(id);
     const d = m.dim, data = m.grid.data, color = m.grid.color, o = m.offset;
     const cells = [], mats = [];
     const hist = {};
@@ -357,6 +460,13 @@ export function planAnatomy(prefab, recipe, matId) {
                      (cellHash(px, py, pz, li + 1) % 10000) < L.speckle.fraction * 10000) {
             mat = speck[li]; label = L.speckle.material;
           }
+          // The skeleton: last matching carve rule wins (never on a kept layer).
+          if (!L.keep)
+            for (let k = 0; k < carve.length; k++)
+              if (carveId[k] && carveMatches(carve[k], carveWhere[k], ids[li],
+                                             x, y, z, d, depth)) {
+                mat = carveId[k]; label = carve[k].material;
+              }
           if (!mat) continue;                      // unresolved name: leave it
           const art = color ? color[i] : 0;
           if (cur === mat && art === 0) continue;  // already there: idempotent

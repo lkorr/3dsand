@@ -365,6 +365,10 @@ class Player {
   // They multiply the tuned speeds, so "intact" is exactly the old behaviour.
   float speedScale = 1.0f;
   float jumpScale = 1.0f;
+  // Ground-control multiplier on groundAccel: 1 = normal footing, lower =
+  // slippery (oily feet -- session.cpp derives it from the feet's coat). Only
+  // the ON-GROUND rate: air and water control do not care what is on a sole.
+  float groundGrip = 1.0f;
   bool canJump = true;
 
   // Largest single-frame velocity LOSS to a collision sweep since the avatar

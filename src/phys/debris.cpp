@@ -2795,6 +2795,7 @@ DebrisSystem::FleshLattice DebrisSystem::FleshOf(Body& b) {
   f.hi = IVec3{b.lmax[0] + 1, b.lmax[1] + 1, b.lmax[2] + 1};
   f.microModel = &b.micro.model;
   f.selfActive = b.activeCount > 0;
+  f.bleedMat = b.bleedMat;
   return f;
 }
 
@@ -3304,12 +3305,15 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
         //
         // seesSky = true: a rigidbody has no column to raycast, and refusing
         // instead would make a sky-gated rule permanently inert on bodies.
-        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true)) continue;
+        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
         uint32_t chance = r.chance;
         if (ReactScaleArmed(r)) {
           chance = ReactScaledChance(r, countMatches(v, r));
           if (chance == 0) continue;  // below minCount: no frontier, no rule
         }
+        // Weather (rain douses, wet damps ignition), as rainChance does in
+        // the grid; a body counts as rain-exposed (reactcpu.h).
+        chance = RainScaledChance(r.cond, chance, weatherRain_, true);
         uint32_t rr = Hash3(b.serial * 0x9E3779B9u + vi, tick, ri);
         // one roll per rule, GPU-style — chance is in 1/kReactChanceDen units,
         // so this must use the same denominator sim_step.wgsl rolls against
@@ -3436,13 +3440,15 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
             if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep)
               continue;
             if (!ReactNbrMatches(r, m, matGpu_)) continue;
-            if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true)) continue;
+            if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
             // A distinct rule-index space (+64) from the self pass, the same
             // separation BurnOneLimb draws: a voxel that is both burning and
             // dissolving must not roll one stream twice and correlate them.
             const uint32_t rr =
                 Hash3(b.serial * 668265263u + vi, tick, 64u + rj);
-            if (rr % kReactChanceDen >= r.chance) continue;
+            if (rr % kReactChanceDen >=
+                RainScaledChance(r.cond, r.chance, weatherRain_, true))
+              continue;
             applyProduct(vi, r.prodNbr, rr);
             fired = true;
             changed = true;

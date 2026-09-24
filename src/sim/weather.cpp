@@ -174,7 +174,28 @@ float GroundPrecip(const Preset& p) {
                     0.0f, 1.0f);
 }
 
+// Wetness: a leaky integral of past rain, evaluated as a sum. `now` is the
+// preset standing over the ground this instant (the eased one for the
+// renderer, the un-eased target for the sim); the history is the SCHEDULE, or
+// the pin itself when one is set. See Resolve for why.
+float WetnessAt(const Tuning& tn, const std::vector<Preset>& ps, uint32_t seed,
+                double ts, const Preset* ov, const Preset& now) {
+  const float dry = std::max(5.0f, tn.weather.drySeconds);
+  float acc = GroundPrecip(now), wsum = 1.0f;
+  for (int k = 1; k <= 8; k++) {
+    const double back = (double)k * dry / 4.0;
+    const float wk = std::exp(-(float)k / 4.0f);
+    Preset p = ov ? *ov : Scheduled(tn, ps, seed, ts - back, nullptr, nullptr, nullptr);
+    acc += GroundPrecip(p) * wk;
+    wsum += wk;
+  }
+  // Snow does not wet the ground the way rain does (it sits on it); the
+  // composite whitens instead, which is a later package.
+  return std::clamp(acc / wsum * 1.6f, 0.0f, 1.0f) * (1.0f - now.precipType);
+}
+
 std::string gOverride;
+uint32_t gLastSimWord = 0;
 State gLast;
 Preset gEased;
 bool gEasedValid = false;
@@ -336,20 +357,7 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, float camXM,
   // SCHEDULED weather, not the eased override, except for "now", so pinning
   // rain in the dev panel wets the ground within one sample step rather than
   // waiting for history that never happened.
-  {
-    const float dry = std::max(5.0f, tn.weather.drySeconds);
-    float acc = GroundPrecip(s.mix), wsum = 1.0f;
-    for (int k = 1; k <= 8; k++) {
-      const double back = (double)k * dry / 4.0;
-      const float wk = std::exp(-(float)k / 4.0f);
-      Preset p = ov ? *ov : Scheduled(tn, ps, seed, ts - back, nullptr, nullptr, nullptr);
-      acc += GroundPrecip(p) * wk;
-      wsum += wk;
-    }
-    // Snow does not wet the ground the way rain does (it sits on it); the
-    // composite whitens instead, which is a later package.
-    s.wetness = std::clamp(acc / wsum * 1.6f, 0.0f, 1.0f) * (1.0f - s.mix.precipType);
-  }
+  s.wetness = WetnessAt(tn, ps, seed, ts, ov, s.mix);
 
   // ---- lightning: a pure function of time ----------------------------------
   // The clock is cut into 0.5 s slots; a slot flashes with the probability the
@@ -397,6 +405,30 @@ State Resolve(const Tuning& tn, uint32_t seed, double ts, float dt, float camXM,
 }
 
 const State& Last() { return gLast; }
+
+uint32_t SimRainWord(const Tuning& tn, uint32_t seed, uint32_t tick) {
+  if (!tn.weather.clouds || !tn.weather.rainTouchesWorld) return 0u;
+  const std::vector<Preset>& ps = Presets().Presets();
+  const double ts = (double)tick / 30.0;
+  // The TARGET, never the frame-time ease: the ease is wall-clock and would
+  // make the world hash depend on frame pacing. So a dev-panel pin rains on
+  // the world at once while the sky takes transitionSeconds to catch up.
+  const Preset* ov = gOverride.empty() ? nullptr : Presets().Find(gOverride);
+  Preset now = ov ? *ov : Scheduled(tn, ps, seed, ts, nullptr, nullptr, nullptr);
+  now.precip = std::clamp(now.precip * tn.weather.precipScale, 0.0f, 1.0f);
+  // Rain only: snow neither douses nor soaks (it is a later package, as the
+  // composite's whitening is).
+  const float rain = GroundPrecip(now) * (1.0f - now.precipType);
+  const float wet = WetnessAt(tn, ps, seed, ts, ov, now);
+  auto q8 = [](float v) {
+    return (uint32_t)std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f);
+  };
+  gLastSimWord = (q8(rain) & 0xFFu) | (q8(tn.weather.rainIgniteDamp) << 8) |
+                 (q8(wet) << 16);
+  return gLastSimWord;
+}
+
+uint32_t LastSimRainWord() { return gLastSimWord; }
 
 void Snap() { gEasedValid = false; }
 

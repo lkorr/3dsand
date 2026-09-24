@@ -2,6 +2,8 @@
 
 #include "ui/overlay.h"
 
+struct ImDrawList;
+
 // THE CHARACTER SCREEN (I): the panel the armour, weapon, pickup and spell-
 // acquisition systems will land into.
 //
@@ -24,3 +26,9 @@
 // the contract ui/overlay.h has always stated, extended to a screen big enough
 // that breaking it would be tempting.
 void DrawInventoryScreen(UIState& s);
+
+// THE HUD HOTBAR: the ten hotbar slots along the bottom centre of the screen,
+// Minecraft-style, drawn from UIState::hotbarSlots with the pack's own slot
+// chrome. The selected slot is the hand (a flask, a sword -- main.cpp's "THE
+// HOTBAR IS THE HAND"). Display only: nothing here takes input.
+void DrawHudHotbar(const UIState& s, ImDrawList* dl);

@@ -95,6 +95,8 @@ const PipelineSpec kRenderShaders[] = {
     {"microbody.wgsl", "fs", "microbody.fs"},
     {"debug_lines.wgsl", "vsBox", "debug_lines.vsBox"},
     {"debug_lines.wgsl", "fsBox", "debug_lines.fsBox"},
+    {"debug_lines.wgsl", "vsSphere", "debug_lines.vsSphere"},
+    {"debug_lines.wgsl", "fsSphere", "debug_lines.fsSphere"},
 };
 
 const char* YesNo(bool b) { return b ? "YES" : "no"; }

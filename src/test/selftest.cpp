@@ -127,6 +127,9 @@ const char* const kOrder[] = {
     // same contract -- that parser agrees with the reference script, this that
     // every tree the parser builds can be SAID again as words.
     "spell-graph",
+    // ...and `spell-magnitude` beside it (PLAN_spell_magnitude 2.6): the
+    // same CPU-only footing, over the same glyph table.
+    "spell-magnitude",
     // And with them, for the same reason: `swing` is MeleeState alone — no
     // world, no GPU, no assets, its own fixtures — so it costs milliseconds
     // and disturbs nothing. It asserts the swing's INPUT MAPPING, which is the
@@ -413,7 +416,7 @@ const char* const kOrder[] = {
     // regenerates at the origin on the way out -- so it inherits nothing and
     // `streaming`, which regenerates on the way in anyway, is its neighbour.
     "gen-settle",
-    "streaming",     "spells",
+    "streaming",     "spells",        "spell-timing",
     "page-roundtrip", "daylight-boundary",
     // Support-loss flagging from the MUTATION path. Cheap and
     // self-contained (its own worldgen, an all-stone fixture the CA
@@ -482,6 +485,10 @@ const char* const kOrder[] = {
     // 900 ticks, and it regenerates the world on the way out so the gates
     // after it still find pristine terrain (rule 7).
     "fire-down",
+    // Rain against fire (weather::SimRainWord): lights a leaf sheet at absolute
+    // coordinates under three pinned skies, restores the pin and regenerates
+    // on the way out — fire-down's reasons, fire-down's slot.
+    "rain-fire",
     // ---- THE WINDOW EDGE AS A SINK (docs/PLAN_gas_particles.md §4) --------
     // Straight after `fire-down`, and for exactly the reasons the three gates
     // above it give. Both of these light no fire, but they do the same KIND of
@@ -654,13 +661,15 @@ const char* const kOrder[] = {
     // was: heat crossing its joints, its armour shielding it, and a burst of
     // blood landing on it (owner report 2026-09-22). Each ticks the world and
     // regenerates it on the way out.
-    "corpse-crossheat", "corpse-worn", "corpse-splatter", "vessel-grid",
+    "corpse-crossheat", "corpse-worn", "corpse-splatter", "vessel-grid", "vessel-mpm", "vessel-break",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto
     // the ground through the ordinary particle path. Same room fixture as
     // body-stain, same world regeneration on the way out.
     "body-coat",
+    "mob-rain",
+    "rain-oil",
     // ...and a blast bloodies the HOLE IT MADE and nothing else: a limb the
     // crater took no voxel from stays clean, and the limb it did hit gets a
     // chip's worth of blood rather than a repainted surface (owner report
@@ -707,6 +716,18 @@ const char* const kOrder[] = {
     // two lattices: rot, a coat or a hole in either copy is in both (owner
     // report 2026-09-23). Pristine ground, CPU only.
     "joint-twins",
+    // ...and a CORROSIVE coat (acid) eats the limb it is on, a blood coat does
+    // not, acid displaces blood, and the coat is spent. Pose ticks only.
+    "acid-coat",
+    // ...and on the DEAD: a burst of acid coats a corpse torso, eats it, and
+    // is spent. Ticks the world; regenerated on the way out.
+    "corpse-acid",
+    // ...and a HOT coat (lava) sets the limb alight and eats it, a FUEL coat
+    // (oil) is inert until heat reaches it and then flashes. Pose ticks only.
+    "lava-oil-coat",
+    // ...and a part that comes off keeps its hand: a split forearm drops the
+    // hand with the wrist end, a severed arm stays jointed. Pose ticks only.
+    "severed-hand",
     // ---- NOTHING IS LEFT HANGING (2026-09-03) -----------------------------
     // LAST of everything that touches the shared World except `voxregion`, and
     // that position was EARNED rather than chosen. It first sat at the end of

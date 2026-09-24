@@ -47,17 +47,43 @@
 //      edit and span and is drawn at CELL size. Fusing rather than growing the
 //      bead is what keeps law (2) - a junction stands on the box's axis - true
 //      for free: a junction is placed there by construction and a bead row of
-//      two is not. Only the record-wide WINNER fuses; a fan opened by lanes
-//      alone stays the blot, a count inside a lane stays a bead over the
-//      socket it splits, and a losing count word stays a slashed bead.
+//      two is not. Every WINNER fuses, at every depth: a fan opened by lanes
+//      alone has no word to wear and stays the blot, a count inside a lane is
+//      that BRANCH's junction (see the cascade below), and a losing count word
+//      - `twin` beside a `shotgun` - stays a slashed bead, which is the whole
+//      point of drawing it.
 //
-//      ...AND A SPOKEN DELIVERY IS DRAWN ONCE PER BRANCH. Everything above the
+//      ...AND THE FAN CASCADES (2026-09-22, third pass). `shotgun lane twin
+//      end` drew three sockets with a `twin` bead over the middle one and
+//      nothing above it: the second split was in the words, in the price and in
+//      the number of bolts that fly, and the page said nothing about it (the
+//      tally it used to wear lives on a delivery cell, and the `hand` has none).
+//      A branch that fires more than one bolt now gets its OWN junction and its
+//      OWN socket row inside its column, by the same three rules - junction on
+//      the column's axis, sockets one band forward, `Fan` pointing back - and
+//      its delivery is drawn once per BOLT. Depth beyond that comes from
+//      nesting BOXES, which recurses through `Place` already. `laneSplits[k]`
+//      is the per-branch count and the VM has always had it.
+//
+//      ...AND A SPOKEN DELIVERY IS DRAWN ONCE PER BRANCH - once per BOLT where
+//      a branch split again (2026-09-22). Everything above the
 //      socket row belongs to one branch each, so each branch rises through its
 //      own payload to its own copy of the delivery cell. They are one word and
 //      one record: the instance-0 copy is the PRIMARY and owns `sockets`,
 //      `bus`, `split`, the price and the box's whole span; the rest carry
 //      `primary`. The `hand` needs no copies - it is the pedestal the branches
 //      have not diverged from yet - so its one cell stays at the bottom.
+//
+//      AN EMPTY SLOT IS A HOLE IN THE OPERAND ROW (2026-09-22). `_ trail` and
+//      `_ mend` are the words that do nothing until something is spoken before
+//      them, and the page used to say so with a 21-px hollow ring hung off the
+//      LEFT EDGE of the cell - the smallest mark in the drawing, in the one
+//      place the layout otherwise uses for nothing, carrying the one fact the
+//      player most needs. An operand is the row BELOW its operator, so a
+//      MISSING operand is a missing cell in that row: a `Hole` node, cell-sized,
+//      on the operand band, with its own Slot edge up into the word it belongs
+//      to. The operator and its row then read as one fused figure with a gap in
+//      it rather than as a finished cell with chrome bolted to its side.
 //
 //      A BOX HANDS OFF TO ITS PARENT FROM THE BOTTOM OF ITS SPAN, not from its
 //      bar. `baseLayer` is that layer. The bar of a spoken box is at the TOP of
@@ -134,8 +160,12 @@ constexpr int kGraphSplitH = 16;
 // layout px - readable at the 0.25x overview rung. What has to be bounded is
 // NESTING: a split inside a split inside a split multiplies columns, and a
 // 32-word sentence buys enough of them to make a drawing nobody can find the
-// spell in. A sub-fan that would push a box past this is drawn COLLAPSED - one
-// cell wearing its tally, no pips - and says so.
+// spell in. THE FAN CASCADES (2026-09-22): a branch that splits again gets its
+// own junction and its own socket row inside its column, and one cell per BOLT
+// - so the columns to bound are `sum(laneSplits)`, not `instances`. A box whose
+// sub-fans would push it past this keeps the older drawing, one cell wearing
+// its tally; no legal 32-word sentence reaches that, and it is a guard, not a
+// path.
 constexpr int kGraphMaxColumns = 27;
 
 // ---- the graph ----------------------------------------------------------------
@@ -149,6 +179,10 @@ enum class GraphKind : uint8_t {
   Socket,     // synthesized: one instance of a join (treeNode == -1)
   Bus,        // synthesized: what the shared items feed (treeNode == -1)
   Split,      // synthesized: the junction a fan diverges out of (treeNode == -1)
+  Hole,       // synthesized: an operator's EMPTY slot, standing in the operand
+              // row as a cell-sized blank. `treeNode` is the OPERATOR whose slot
+              // it is (not -1: a drop on it fills that slot) and `instance` is
+              // the side, 0 left / 1 right.
 };
 
 enum class GraphEdge : uint8_t {
@@ -207,10 +241,15 @@ struct SpellGraphNode {
   // struct held before the field existed.
   int primary = -1;           // -1 = this cell owns the record
   int split = -1;             // graph index of this box's Split junction, or -1
-  // HOW MANY BOLTS THIS BRANCH FIRES. A branch with a count mod of its own
-  // splits again, and until the page draws that sub-fan as its own row of
-  // cells the branch is drawn COLLAPSED: one cell wearing a tally. 1 on an
-  // unsplit branch, which is every cell in a sentence with no count in a lane.
+  // ---- Socket, Bus, Split ---------------------------------------------------
+  // THE BOX THIS SYNTHESIZED MARK BELONGS TO, as a graph index of its PRIMARY
+  // cell. A back-pointer rather than a search, because a sub-fan's pip is in no
+  // box's `sockets` list and the search could not find it (2026-09-22).
+  int owner = -1;
+  // HOW MANY BOLTS THIS BRANCH FIRES, when the sub-fan could NOT be drawn as
+  // its own row of cells (past the column budget): the branch is collapsed to
+  // one cell wearing a tally. 1 everywhere else - including every branch of a
+  // drawn sub-fan, where each bolt has a cell of its own and the fan says it.
   int32_t bolts = 1;
 
   // ---- Socket, and a lane's ModTag ------------------------------------------
@@ -230,6 +269,17 @@ struct SpellGraphNode {
   // that already fans, 2026-09-22). The second needs the node, because the
   // whole point is that one `shotgun` works and its twin does not.
   bool wasted = false;
+
+  // ---- Word, Operator, ModTag: MAGNITUDE (PLAN_spell_magnitude §2.5) ------
+  // The word's magnitude, per-mille; whether the wheel may set it and over
+  // what lattice; and what it reads as in units ("gravity -0.50 g").
+  int32_t mag = kMagOne;
+  bool graded = false;
+  int32_t magMin = kMagOne, magMax = kMagOne, magStep = kMagOne;
+  int32_t magDefault = kMagOne;
+  std::string magLabel;
+  // Word / Operator / Join: WHEN it fires in its carrier (M3).
+  SpellTiming timing;
 
   // The spoken span this node covers, for the HUD word highlight.
   int spanFirst = -1, spanLast = -1;
@@ -271,8 +321,11 @@ std::vector<int> WordsToGlyphs(const GlyphLibrary& lib,
                                const std::vector<std::string>& words);
 std::vector<std::string> GlyphsToWords(const GlyphLibrary& lib,
                                        const std::vector<int>& glyphs);
+// Serialized words (`float@0.5`) -> a spoken stack with its magnitudes;
+// unknown names dropped, magnitudes clamped to each glyph's range.
+SpellStack WordsToStack(const GlyphLibrary& lib, const std::vector<std::string>& words);
 // Parse a word list. `Linearize(ParseWords(lib, w))` is the canonical
-// respelling of `w`.
+// respelling of `w`, magnitudes included.
 SpellTree ParseWords(const GlyphLibrary& lib, const std::vector<std::string>& words);
 // A blank page: one clause whose root is the empty hand box. `ParseSpell` of
 // silence has no clause at all (silence is not a spell), so the editor needs
@@ -338,6 +391,25 @@ EditResult Remove(const GlyphLibrary& lib, const SpellTree& tree, int node);
 // what closes them is the mod.
 EditResult CloseLane(const GlyphLibrary& lib, const SpellTree& tree, int boxNode,
                      int32_t lane);
+// Put a whole WORD LIST (a grimoire page, serialized) into a box's lane as the
+// subtree it parses to: `fire projectile` arrives as a bolt that sprays fire,
+// not as `fire` beside an empty bolt, and every word keeps its magnitude and
+// timing. A page's own root lanes become new lanes of the box when it lands on
+// the shared pile (lane 0), and fold into the lane otherwise.
+EditResult InsertWords(const GlyphLibrary& lib, const SpellTree& tree, int boxNode,
+                       int32_t lane, const std::vector<std::string>& words);
+// SET A WORD'S MAGNITUDE (PLAN_spell_magnitude §2.5): the wheel over a cell.
+// `mag` is per-mille and is clamped and snapped to the glyph's range; refused
+// on a box, on an ungraded word, and when the clamp leaves it where it was
+// (the end of the range), with the reason naming the limit.
+EditResult SetMagnitude(const GlyphLibrary& lib, const SpellTree& tree, int node,
+                        int32_t mag);
+// SET AN ITEM'S TIMING (M3): when a payload item - a word, an operator group,
+// or a nested box - fires in the carrier that holds it. Refused on anything
+// that is not an item of a box, on a mod (it edits its carrier), and for any
+// trigger but `hit` when the carrier does not fly (a delay is fine anywhere).
+EditResult SetTiming(const GlyphLibrary& lib, const SpellTree& tree, int node,
+                     SpellTiming timing);
 // Move (or, with `copy`, duplicate) a subtree into another box's lane. A move
 // that empties the lane it came from unwinds it exactly as `Remove` does.
 EditResult Move(const GlyphLibrary& lib, const SpellTree& tree, int node,

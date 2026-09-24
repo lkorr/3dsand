@@ -23,6 +23,7 @@
 //   * THE HEALTH PANEL'S POUR: MobSystem::DouseLimb coats exactly the limb it
 //     is given with the substance poured.
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <map>
@@ -35,6 +36,7 @@
 #include "game/equipment.h"
 #include "game/mob.h"
 #include "game/persist.h"
+#include "game/worlditems.h"
 #include "game/spell.h"
 #include "test/selftest.h"
 #include "test/support.h"
@@ -354,6 +356,71 @@ Status GateVessel(Ctx& c, std::string& detail) {
     check(rest == 4, "and none of them is lost");
   }
 
+  // ---- throwing and breaking -----------------------------------------------
+  {
+    check(ContainerThrowable(*flask) && flask->container.breakSpeed > 0.0f,
+          "the flask is thrown and breaks (items.json throwSpeedMps / breakSpeedMps)");
+    const int full = (int)std::ceil(flask->container.throwChargeSec * 30.0f) + 1;
+    check(ContainerThrowCharge(*flask, 1) == 0.0f &&
+              ContainerThrowCharge(*flask, full) == 1.0f &&
+              ContainerThrowCharge(*flask, full * 4) == 1.0f,
+          "the wind-up runs 0..1 over throwChargeSec and holds at full");
+    const float tap = ContainerThrowSpeed(*flask, 1),
+                mid = ContainerThrowSpeed(*flask, full / 2),
+                top = ContainerThrowSpeed(*flask, full);
+    check(tap < mid && mid < top &&
+              std::fabs(top - flask->container.throwSpeed) < 1e-3f,
+          "a longer draw throws harder, up to throwSpeed");
+    const float b = flask->container.breakSpeed;
+    check(!ContainerShouldBreak(*flask, b * 0.9f, Vec3{0, -b * 0.5f, 0}) &&
+              ContainerShouldBreak(*flask, b, Vec3{}) &&
+              ContainerShouldBreak(*flask, 0.0f, Vec3{b, 0, 0}),
+          "it breaks on a hard contact OR a hard velocity jump, not below");
+    // A tick of free fall is a velocity jump of g/30: never a break.
+    check(!ContainerShouldBreak(*flask, 0.0f,
+                                Vec3{0, -MetresToCells(9.81f) / 30.0f, 0}),
+          "free fall does not break it");
+
+    // The spill: every eighth of water comes out as MPM fluid, at once.
+    ContainerSpill sp;
+    sp.at = Vec3{10, 20, 30};
+    sp.vel = Vec3{MetresToCells(10.0f), 0, 0};
+    sp.away = Vec3{-1, 0, 0};
+    sp.mat = (uint16_t)mWater;
+    sp.units = 1024;
+    sp.seed = 7;
+    std::vector<FluidSpawnOp> fl;
+    std::vector<ParticleSpawn> pa;
+    SplatterEvent ev;
+    int got = ContainerSpillStep(sp, c.mats, 100, kMaxFluidSpawnsPerTick, fl, pa, &ev);
+    check(got == 1024 && sp.units == 0 && (int)fl.size() == 1024 && pa.empty(),
+          "a broken flask of water lets out all 1024 eighths as fluid in one tick");
+    check(sp.splatted && ev.mat == mWater && ev.count == 128,
+          "and splatters whoever it broke over");
+    // Under a short budget the rest waits, it is not lost.
+    sp = ContainerSpill{};
+    sp.at = Vec3{10, 20, 30};
+    sp.mat = (uint16_t)mWater;
+    sp.units = 1024;
+    fl.clear();
+    got = ContainerSpillStep(sp, c.mats, 100, 300, fl, pa, &ev);
+    const int got2 = ContainerSpillStep(sp, c.mats, 101, 4096, fl, pa, &ev);
+    check(got == 300 && got2 == 724 && sp.units == 0,
+          "a spill the budget cannot hold drains next tick, conserved");
+    // Sand (not fluid) leaves as grid particles, a whole cell each.
+    sp = ContainerSpill{};
+    sp.at = Vec3{10, 20, 30};
+    sp.mat = (uint16_t)mSand;
+    sp.units = 20;
+    fl.clear();
+    got = ContainerSpillStep(sp, c.mats, 100, 4096, fl, pa, &ev);
+    bool pOk = pa.size() == 3;
+    for (const ParticleSpawn& p : pa)
+      pOk = pOk && (p.payload & 0xFFFu) == mSand && !(p.flags & kPFlagMicro);
+    check(got == 20 && sp.units == 0 && fl.empty() && pOk,
+          "a broken pouch of sand is grid particles, rounded up to whole cells");
+  }
+
   // ---- persistence ---------------------------------------------------------
   {
     GlyphLibrary glyphs;
@@ -412,8 +479,85 @@ Status GateVessel(Ctx& c, std::string& detail) {
           if (const LimbCoat* o = c.mobs.LimbCoatOf(id, i))
             others = others || o->stained > 0;
       check(!others, "and no other limb");
+      // WATER WASHES, THEN WETS (bodystain.h WashBodyStain). A pour of 8
+      // rinses 16 levels off the blood -- all of it -- and leaves the limb
+      // wet, not bloody: Raise would have left 8-deep blood where it was.
+      c.mobs.DouseLimb(id, limb, mWater, 8, 1001, &marked);
+      lc = c.mobs.LimbCoatOf(id, limb);
+      bool bloodLeft = false;
+      if (lc)
+        for (const CoatEntry& en : lc->top)
+          bloodLeft = bloodLeft || (en.mat == mBlood && en.sumAmt > 0);
+      check(lc && lc->top[0].mat == mWater && !bloodLeft,
+            "pouring water over the blood washes it off and leaves the limb wet");
     } else {
       check(false, "the human has a live limb to pour on");
+    }
+    c.mobs.Reset();
+    c.debris.Reset();
+  }
+
+  // ---- the portrait pour BRUSH (MobSystem::PickBody / PourOnBody) ----------
+  // A ray at the body from in front, as the portrait camera casts one: it has
+  // to meet the skin, and the coat has to land as a PATCH on the face it met
+  // -- a disc of cells, not a core through the limb -- and reach the brick
+  // the renderer draws.
+  {
+    IdCounterScope idScope(c.mobs);
+    const int def = c.mobs.FindDef("human");
+    const uint64_t id = def >= 0 ? c.mobs.Spawn(def, {base.x, base.y + 40, base.z}) : 0;
+    const Mob* m = id ? c.mobs.FindMobById(id) : nullptr;
+    check(m != nullptr, "a human spawns for the brush");
+    if (m) {
+      const Vec3 at = m->RootWorldPos();
+      Vec3 face = m->Facing();
+      face.y = 0.0f;
+      face = face.len() > 0.1f ? face.normalized() : Vec3{0, 0, 1};
+      const Vec3 ro = at + face * 60.0f;
+      const Vec3 rd = face * -1.0f;
+      const auto pickT0 = std::chrono::steady_clock::now();
+      const MobSystem::BodyRayHit hit = c.mobs.PickBody(id, ro, rd, 200.0f);
+      const double pickMs = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - pickT0).count();
+      check(hit.hit && hit.limb >= 0 && hit.t > 40.0f && hit.t < 60.0f,
+            "a ray from in front meets the skin");
+      if (hit.hit) {
+        const float r = 1.5f;
+        uint32_t marked = 0, drawn = 0;
+        c.mobs.PourOnBody(id, hit, rd, r, mBlood, 3, 1000, &marked, &drawn);
+        uint32_t stainedAll = 0, scale = 1;
+        for (int i = 0; i < m->LimbCount(); i++)
+          if (const LimbCoat* o = c.mobs.LimbCoatOf(id, i)) stainedAll += o->stained;
+        if (m->Def()) scale = std::max(1u, m->Def()->skinScale);
+        // The disc's cells at the finest pitch; the surface under it is at
+        // most a couple of cells deep, a core through a limb is dozens.
+        const float disc = 3.14159f * (r * scale) * (r * scale);
+        std::printf("  vessel brush: limb %d at t=%.1f, %u cells coated (disc %.0f), "
+                    "%u drawn, micro set %s, pick %.3f ms\n", hit.limb, hit.t,
+                    marked, disc, drawn, c.mobs.MicroSet() ? "yes" : "no", pickMs);
+        check(marked > 0 && stainedAll == marked, "the brush coats cells");
+        check((float)marked <= disc * 3.0f,
+              Format("only the surface under the disc (%u cells, disc %.0f)",
+                     marked, disc).c_str());
+        check(drawn == marked || !c.mobs.MicroSet(),
+              Format("every coated cell reaches the drawn brick (%u of %u)",
+                     drawn, marked).c_str());
+        // The drain follows the brush: applyCells a second at the default
+        // size, four times that at twice the radius.
+        const float d1 = PourBrushCellsPerSec(*flask, kPourBrushRefRadius);
+        const float d2 = PourBrushCellsPerSec(*flask, kPourBrushRefRadius * 2.0f);
+        check(std::fabs(d1 - (float)flask->container.applyCells) < 1e-3f &&
+                  std::fabs(d2 - 4.0f * d1) < 1e-3f,
+              "a brush twice as wide drains four times as fast");
+        // Held: the same spot deepens rather than spreading.
+        uint32_t again = 0;
+        c.mobs.PourOnBody(id, hit, rd, r, mBlood, 3, 1001, &again);
+        uint32_t stained2 = 0;
+        for (int i = 0; i < m->LimbCount(); i++)
+          if (const LimbCoat* o = c.mobs.LimbCoatOf(id, i)) stained2 += o->stained;
+        check(again > 0 && stained2 == stainedAll,
+              "holding the brush deepens the same patch");
+      }
     }
     c.mobs.Reset();
     c.debris.Reset();
@@ -443,7 +587,16 @@ Status GateVessel(Ctx& c, std::string& detail) {
 //   * WHAT IS POURED COMES BACK AS WATER. After emptying the flask and
 //     letting the stream land, the mirror holds the flask's worth again, less
 //     nothing and plus at most the 7/8 rounding of the last drop.
-Status GateVesselGrid(Ctx& c, std::string& detail) {
+//
+// vessel-mpm: the same round trip the way the game now does it for water --
+// the scoop's cells fly into the flask as GHOST MPM particles
+// (ContainerScoopStream) and the pour leaves as MPM fluid (ContainerPour-
+// Fluid). Two claims on top of vessel-grid's: the ghosts are a picture and
+// nothing else (they existed, they are gone, and the scoop audit is still
+// exact -- a ghost that settled or reacted would show up as water the flask
+// never paid for), and the fluid pour is EXACT, one particle per eighth, with
+// no last-drop rounding.
+Status VesselRoundTrip(Ctx& c, std::string& detail, bool mpm) {
   auto matId = [&](const char* n) -> uint32_t {
     for (size_t i = 0; i < c.mats.size(); i++)
       if (c.mats[i].name == n) return (uint32_t)i;
@@ -496,11 +649,15 @@ Status GateVesselGrid(Ctx& c, std::string& detail) {
                    o.z * (int)kChunk + (int)kWorldN / 2 + 8};
   const IVec3 chunk{base.x >> 4, base.y >> 4, base.z >> 4};
   uint32_t tick = 71000;
+  uint32_t fluidSpawned = 0;   // conservative live bound for the MPM dispatch
   auto step = [&](const std::vector<CellOp>& cells,
-                  const std::vector<ParticleSpawn>& spawns = {}) {
+                  const std::vector<ParticleSpawn>& spawns = {},
+                  const std::vector<FluidSpawnOp>& fluid = {}) {
     std::vector<BrushOp> ops;
+    fluidSpawned += (uint32_t)fluid.size();
     SubmitTick(c.ctx, c.world, c.sim, tick++, kDefaultSeed, ops, {}, cells, false,
-               chunk, true, true, spawns);
+               chunk, true, true, spawns, 0, fluid,
+               std::min(kFluidCap, c.world.Snap().fluidLive + fluidSpawned));
     c.ctx.WaitIdle();
     c.ctx.ProcessEvents();
   };
@@ -518,7 +675,7 @@ Status GateVesselGrid(Ctx& c, std::string& detail) {
                          (chunk.z + cz) * (int)kChunk};
           if (!c.world.CellInWindow(cc)) continue;
           ReadVoxelsSync(c.ctx, c.world, World::SlotCellIndex(cc) / kChunkVol, 1,
-                         buf.data(), "vessel-grid");
+                         buf.data(), mpm ? "vessel-mpm" : "vessel-grid");
           for (uint32_t w : buf)
             if ((w & 0xFFFu) == mWater) total += ContainerCellUnits(w, c.mats[mWater]);
         }
@@ -564,6 +721,8 @@ Status GateVesselGrid(Ctx& c, std::string& detail) {
   // cell the pick ray would strike looking down into the basin.
   ItemStack st{flaskI, 1};
   ContainerScoopMemo memo;
+  const Vec3 mouth{base.x + 0.5f, base.y + 10.5f, base.z + 0.5f};
+  uint32_t ghosts = 0, ghostPeak = 0;
   for (int i = 0; i < 40; i++) {
     IVec3 aim{0, 0, 0};
     bool found = false;
@@ -578,13 +737,21 @@ Status GateVesselGrid(Ctx& c, std::string& detail) {
           }
         }
     std::vector<CellOp> cells;
-    if (found)
+    std::vector<FluidSpawnOp> stream;
+    if (found) {
       ContainerScoop(*flask, st, aim,
                      [&](IVec3 p, uint32_t& w) { return ContainerSnapWord(c.world, p, w); },
                      c.world, c.mats, cells, nullptr, &memo, tick);
-    step(cells);
+      if (mpm)
+        for (const ContainerScoopMemo::Taken& t : memo.cells)
+          if (t.tick == tick)
+            ghosts += ContainerScoopStream(t.c, mWater, mouth, 8, 0x5Cu, tick,
+                                           4096, stream);
+    }
+    step(cells, {}, stream);
     const WorldSnapshot& sn = c.world.Snap();
     if (sn.valid) ContainerSettle(memo, sn.tick, sn.scoopEighths, flask, &st);
+    ghostPeak = std::max(ghostPeak, sn.fluidLive);
   }
   for (int i = 0; i < 12; i++) {
     step({});
@@ -592,17 +759,22 @@ Status GateVesselGrid(Ctx& c, std::string& detail) {
     if (sn.valid) ContainerSettle(memo, sn.tick, sn.scoopEighths, flask, &st);
   }
   const long w1 = mirrorWater();
+  const uint32_t liveAfterScoop = c.world.Snap().fluidLive;
   const long taken = w0 - w1;
 
   // THE POUR: from ten cells above the basin's middle, onto it.
   const int held = st.fillAmt;
-  const Vec3 mouth{base.x + 0.5f, base.y + 10.5f, base.z + 0.5f};
   const Vec3 target{base.x + 0.5f, base.y + 0.5f, base.z + 0.5f};
   for (int i = 0; i < 200 && st.Filled(); i++) {
     std::vector<ParticleSpawn> spawns;
-    ContainerPour(*flask, st, mouth, Vec3{0, -1, 0}, &target,
-                  CurrentTuning().sim.partGravity, tick, 0x77u, spawns, nullptr);
-    step({}, spawns);
+    std::vector<FluidSpawnOp> fluid;
+    if (mpm)
+      ContainerPourFluid(*flask, st, mouth, Vec3{0, -1, 0}, &target, tick, 0x77u,
+                         4096, fluid, nullptr);
+    else
+      ContainerPour(*flask, st, mouth, Vec3{0, -1, 0}, &target,
+                    CurrentTuning().sim.partGravity, tick, 0x77u, spawns, nullptr);
+    step({}, spawns, fluid);
   }
   // The landing, over time: a count that PEAKS and then falls is the liquid
   // CA thinning a film, one that never arrives is drops lost in flight.
@@ -622,19 +794,209 @@ Status GateVesselGrid(Ctx& c, std::string& detail) {
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
 
-  RecordObserved("vesselGridTaken", (double)taken);
-  RecordObserved("vesselGridHeld", (double)held);
-  RecordObserved("vesselGridBack", (double)back);
-  // EXACT: the flask is paid from the GPU's own ledger.
-  const bool scoopOk = held > 0 && taken == held && memo.claims.empty();
-  // Everything poured is on the tray, plus at most the last drop's rounding
-  // up to a whole cell (ContainerPour: under one cell per emptying).
+  const char* key = mpm ? "vesselMpm" : "vesselGrid";
+  RecordObserved((std::string(key) + "Taken").c_str(), (double)taken);
+  RecordObserved((std::string(key) + "Held").c_str(), (double)held);
+  RecordObserved((std::string(key) + "Back").c_str(), (double)back);
+  // EXACT: the flask is paid from the GPU's own ledger. With ghosts in the
+  // stream this is also the proof they are not matter: they sat in the live
+  // pool while they flew (ghostPeak), and one that settled or outlived its
+  // death tick would read here as water the flask never paid for.
+  const bool scoopOk = held > 0 && taken == held && memo.claims.empty() &&
+                       (!mpm || (ghosts > 0 && ghostPeak > 0));
+  // Everything poured is on the tray: EXACTLY for the fluid pour (one
+  // particle per eighth), plus at most the last drop's rounding up to a whole
+  // cell for the grid one (ContainerPour: under one cell per emptying).
   const bool pourOk = !st.Filled() && stillFlying == 0 && back >= held &&
-                      back < held + kContainerUnitsPerCell;
+                      (mpm ? back == held : back < held + kContainerUnitsPerCell);
   detail = Format("pool %ld/8 -> flask credited %d, grid lost %ld; poured back, "
                   "grid gained %ld (%u particles still live; by tick%s)",
                   w0, held, taken, back, stillFlying, timeline.c_str());
+  detail += Format("; mpm live after scoop %u", liveAfterScoop);
+  if (mpm) detail += Format("; %u ghost particles, live peak %u", ghosts, ghostPeak);
   return scoopOk && pourOk ? Status::Pass : Status::Fail;
+}
+
+Status GateVesselGrid(Ctx& c, std::string& detail) {
+  return VesselRoundTrip(c, detail, false);
+}
+Status GateVesselMpm(Ctx& c, std::string& detail) {
+  return VesselRoundTrip(c, detail, true);
+}
+
+// ---------------------------------------------------------------------------
+// vessel-break: a thrown flask breaks, a set-down one does not, a struck one
+// does -- through real Jolt contacts and the same ContainerBreakPass the tick
+// runs (session.cpp phase H).
+// ---------------------------------------------------------------------------
+//
+// Three flasks of water on a stone table (the audio-impact fixture's slab):
+//   A  set down from two voxels up: must NOT break, and must still hold its
+//      water when it has settled. This is the false-positive half, and the
+//      one that matters most -- a flask that breaks when you drop it is not
+//      a flask.
+//   B  thrown straight down at full draw: must break, and its spill must be
+//      the whole flask (1024 eighths of water).
+//   C  resting on the table, then struck by a stone block flying at it: must
+//      break -- "is hit by something with a high velocity".
+Status GateVesselBreak(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Physics& phys = c.phys;
+  DebrisSystem& debris = c.debris;
+  uint32_t mWater = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "water") mWater = (uint32_t)i;
+  const ItemDef* flask = c.items.At(c.items.Find("flask"));
+  if (!flask || !mWater) {
+    detail = "flask or water missing";
+    return Status::Fail;
+  }
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  debris.Reset();
+  WorldItems ground;
+  debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  struct Unhook {
+    DebrisSystem& d;
+    ~Unhook() { d.SetOnBodyGone(nullptr); }
+  } unhook{debris};
+
+  const int px = 100, pz = 100;
+  const int slabY = World::TerrainHeight(px, pz, kDefaultSeed) + 6;
+  uint32_t t = 3000;
+  uint64_t aBody = 0;
+  int aGone = -1;
+  const char* aHow = "";
+  Vec3 aWhere{};
+  std::vector<std::pair<uint64_t, Vec3>> lastVel;
+  std::vector<ContainerSpill> spills;
+  auto tick = [&](std::vector<CellOp> cellOps) {
+    std::vector<ParticleSpawn> spawns;
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+               {px / 16, slabY / 16, pz / 16}, true, false, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+    const size_t sp0 = spills.size();
+    const int n = ContainerBreakPass(ground, c.items, phys, debris, lastVel, spills);
+    // WHEN A WENT, AND HOW (rule 6): the break pass taking it leaves a spill
+    // at its position; anything else (a cull) leaves none.
+    if (aBody && aGone < 0 && !ground.Find(aBody)) {
+      aGone = (int)(t - 3000);
+      aHow = n > 0 && spills.size() > sp0 ? "broken" : "removed without a break";
+      if (spills.size() > sp0) aWhere = spills.back().at;
+    }
+    return n;
+  };
+  {
+    std::vector<CellOp> pad;
+    for (int z = -10; z <= 10; z++)
+      for (int x = -10; x <= 10; x++)
+        for (int y = slabY - 3; y <= slabY; y++)
+          pad.push_back(
+              {World::SlotCellIndex({px + x, y, pz + z}), (uint32_t)kMatStone});
+    tick(pad);
+  }
+  for (int i = 0; i < 24; i++) tick({});
+
+  const uint32_t fill = PackItemFill((uint16_t)mWater, 1024);
+  auto drop = [&](Vec3 at, Vec3 vel) {
+    return DropItemToWorld(*flask, at, vel, phys, debris, nullptr, ground,
+                           nullptr, 0, fill);
+  };
+  const float top = (float)slabY + 1.0f;
+  bool ok = true;
+  std::string why;
+  auto fail = [&](const std::string& w) {
+    ok = false;
+    if (why.empty()) why = w;
+  };
+
+  // ---- A: set down gently ----------------------------------------------------
+  // Well clear of the rock C is struck by, which flies along -z of C.
+  const uint64_t a = drop(Vec3{(float)px - 7, top + 2.0f, (float)pz + 7}, Vec3{});
+  aBody = a;
+  const int aT0 = (int)(t - 3000);
+  int brokeA = 0;
+  for (int i = 0; i < 60; i++) brokeA += tick({});
+  const WorldItem* wa = ground.Find(a);
+  if (!a) fail("A: the flask did not become a body");
+  else if (brokeA || !wa) fail("A: a flask SET DOWN from two voxels broke");
+  else if (ItemFillAmt(wa->fill) != 1024) fail("A: the set-down flask lost its water");
+
+  // ---- B: thrown down hard ---------------------------------------------------
+  spills.clear();
+  const float full = flask->container.throwSpeed;
+  const uint64_t b = drop(Vec3{(float)px + 5, top + 14.0f, (float)pz + 5},
+                          Vec3{0, -full, 0});
+  int brokeB = -1;
+  for (int i = 0; i < 40 && brokeB < 0; i++)
+    if (tick({}) > 0 && !ground.Find(b)) brokeB = i;
+  int spilledB = 0;
+  for (const ContainerSpill& sp : spills)
+    if (sp.mat == mWater) spilledB += sp.units;
+  if (!b) fail("B: the flask did not become a body");
+  else if (brokeB < 0) fail("B: a flask thrown down at full draw did not break");
+  else if (spilledB != 1024) fail("B: the broken flask did not spill all 1024 eighths");
+
+  // ---- C: struck where it lies -----------------------------------------------
+  spills.clear();
+  const Vec3 cAt{(float)px + 5, top + 1.0f, (float)pz - 5};
+  const uint64_t cf = drop(cAt, Vec3{});
+  int brokeC0 = 0;
+  for (int i = 0; i < 45; i++) brokeC0 += tick({});
+  BodyTransform cx{};
+  const bool cLive = ground.Find(cf) && phys.GetTransform(cf, cx);
+  if (!cf || !cLive || brokeC0) fail("C: the target flask did not settle intact");
+  int brokeC = -1;
+  if (cLive) {
+    std::vector<DebrisVoxel> vox;
+    for (int8_t z = 0; z < 3; z++)
+      for (int8_t y = 0; y < 3; y++)
+        for (int8_t x = 0; x < 3; x++)
+          vox.push_back(DebrisVoxel{x, y, z, 0, (uint16_t)kMatStone});
+    std::vector<float> density(c.mats.size(), 1000.0f);
+    for (size_t i = 0; i < c.mats.size(); i++)
+      density[i] = std::max(1.0f, (float)c.mats[i].gpu.density);
+    // Level with the flask, eight voxels off along x, flying at it.
+    const Vec3 rAt{cx.pos.x - 9.0f, cx.pos.y, cx.pos.z - 1.0f};
+    const uint64_t rock =
+        phys.CreateDebrisBody(vox, {(int)rAt.x, (int)rAt.y, (int)rAt.z}, density);
+    if (rock) {
+      BodyTransform rx{};
+      rx.pos = Vec3{(float)(int)rAt.x, (float)(int)rAt.y, (float)(int)rAt.z};
+      rx.quat[3] = 1;
+      debris.AdoptBody(rock, vox, rx);
+      phys.SetBodyVelocity(rock, Vec3{MetresToCells(15.0f), MetresToCells(1.0f), 0});
+      for (int i = 0; i < 30 && brokeC < 0; i++)
+        if (tick({}) > 0 && !ground.Find(cf)) brokeC = i;
+    }
+    if (!rock) fail("C: Jolt refused the rock");
+    else if (brokeC < 0) fail("C: a flask struck by a flying stone did not break");
+  }
+
+  // A must survive the WHOLE fixture, not only its own settle: B landing and
+  // C being struck nearby must not take it with them.
+  if (aGone >= 0)
+    fail(Format("A: the set-down flask went at +%d ticks after its drop (%s, "
+                "at %.1f,%.1f,%.1f)", aGone - aT0, aHow, aWhere.x, aWhere.y,
+                aWhere.z));
+  detail = Format("A intact throughout: %s; B broke at +%d (spill %d/1024); "
+                  "C struck, broke at +%d",
+                  aGone < 0 ? "yes" : "no", brokeB, spilledB, brokeC);
+  if (!ok) detail = why + " -- " + detail;
+  std::printf("vessel-break: %s\n", detail.c_str());
+  // Leave nothing behind but a regenerated world: the bodies and the slab.
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
 }
 
 }  // namespace
@@ -645,6 +1007,10 @@ const std::vector<Gate>& VesselGates() {
       {"vessel", "player", {}, false, GateVessel},
       // Builds in the sky and regenerates the world after itself.
       {"vessel-grid", "player", {}, false, GateVesselGrid},
+      // The same, the way the game pours water: MPM out, ghost stream in.
+      {"vessel-mpm", "player", {}, false, GateVesselMpm},
+      // Real Jolt on a stone table; resets debris and regenerates on entry.
+      {"vessel-break", "player", {}, false, GateVesselBreak},
   };
   return g;
 }

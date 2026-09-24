@@ -293,15 +293,60 @@ fn bodyValueNoise(p : vec3f, scale : f32) -> f32 {
   let x11 = mix(bodyVnHash(i + vec3<i32>(0,1,1)), bodyVnHash(i + vec3<i32>(1,1,1)), f.x);
   return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
 }
-fn bodyStainTint(albedo : vec3f, stain : u32, cell : vec3<i32>, scale : f32) -> vec3f {
+// ---- A COAT THAT GLOWS AND BREATHES (2026-09-23) ---------------------------
+// The stain palette entry's spare `_r2` word is the coat's glow + pulse
+// (materials.json coat.glow / coat.pulse; packed by Simulation::UploadTables,
+// layout materials.h kCoatGlow* -- bits 0..7 glow 0..255, bits 8..19 pulse in
+// centi-Hz). Zero for every coat but a glowing one, so blood, water, rot and
+// bruises take the `pulse == 0` branch and draw exactly as before.
+//
+// The wave is 0..1. A small per-cell phase from the same mottle the coverage
+// uses, so a drenched arm shimmers as one film rather than blinking as a slab.
+fn bodyCoatWave(glowWord : u32, mottle : f32, time : f32) -> f32 {
+  let hz = f32((glowWord >> 8u) & 0xFFFu) * 0.01;
+  if (hz <= 0.0) { return 1.0; }
+  return 0.5 + 0.5 * sin(time * hz * 6.2831853 + mottle * 1.6);
+}
+
+// How much of this voxel the coat covers, 0..1, before any pulse. Shared by the
+// tint and the glow so the two can never disagree about where the coat is.
+fn bodyStainCover(stain : u32, cell : vec3<i32>, scale : f32) -> vec2f {
   let amtI = stain & 0xFu;
-  if (amtI == 0u) { return albedo; }
+  if (amtI == 0u) { return vec2f(0.0); }
   let amt = f32(amtI) / f32(STAIN_AMT_MAX);
-  let stainCol = unpackColor(materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)].stainColor);
+  let packed = materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)].stainColor;
+  // The one place a body differs from the ground: the coat's authored
+  // `opacity` (materials.json coat block, packed in the colour's alpha byte by
+  // ParseCoat) scales the coverage, so water can soak a limb to full amount
+  // and still read as a faint dampening rather than a grey statue.
+  let opacity = f32(packed >> 24u) / 255.0;
   let mottle = bodyValueNoise(vec3f(cell), TUNE_STAIN_MOTTLE_SCALE * scale);
-  let cover = clamp((amt * (1.0 + TUNE_STAIN_MOTTLE) - mottle * TUNE_STAIN_MOTTLE) *
+  let cover = opacity *
+              clamp((amt * (1.0 + TUNE_STAIN_MOTTLE) - mottle * TUNE_STAIN_MOTTLE) *
                     TUNE_STAIN_COVERAGE, 0.0, 1.0);
-  if (cover <= 0.0) { return albedo; }
+  return vec2f(cover, mottle);
+}
+
+// Emission a glowing coat adds to this voxel (scalar, like material emission):
+// glow x coverage, breathing between 35% and 100% on the coat's pulse.
+fn bodyCoatGlow(stain : u32, cell : vec3<i32>, scale : f32, time : f32) -> f32 {
+  if ((stain & 0xFu) == 0u) { return 0.0; }
+  let glowWord = materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)]._r2;
+  let glow = f32(glowWord & 0xFFu) / 255.0;
+  if (glow <= 0.0) { return 0.0; }
+  let cm = bodyStainCover(stain, cell, scale);
+  return glow * cm.x * mix(0.35, 1.0, bodyCoatWave(glowWord, cm.y, time));
+}
+
+fn bodyStainTint(albedo : vec3f, stain : u32, cell : vec3<i32>, scale : f32,
+                 time : f32) -> vec3f {
+  let cm = bodyStainCover(stain, cell, scale);
+  if (cm.x <= 0.0) { return albedo; }
+  let pal = materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)];
+  let stainCol = unpackColor(pal.stainColor);
+  // A pulsing coat's COLOUR breathes too (70%..100% of its cover), so the film
+  // itself swells and thins rather than only its light.
+  let cover = cm.x * mix(0.7, 1.0, bodyCoatWave(pal._r2, cm.y, time));
   let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, cover);
   return mix(soaked, stainCol, cover * TUNE_STAIN_OPACITY);
 }
@@ -610,7 +655,8 @@ fn fs(in : VSOut) -> FSOut {
   // where the ground applies its own stain: a stain is a change to what the
   // surface is, and it has to take the scene's light like the skin under it.
   // One pool load, and only for models that carry a lattice at all.
-  albedo = bodyStainTint(albedo, poolStainAt(in.stainBase, dims, c), c, scale);
+  let coatWord = poolStainAt(in.stainBase, dims, c);
+  albedo = bodyStainTint(albedo, coatWord, c, scale, R.time);
 
   // `tCur` is already the parameter along the UNNORMALIZED camera-to-fragment
   // vector, and that is the whole point of never normalizing anything: `ro/rd`
@@ -629,7 +675,10 @@ fn fs(in : VSOut) -> FSOut {
   let bt = burnTint(mat, albedo, f32(mat.emission) / 255.0,
                     burnTintWeightH(fh, R.time));
   albedo = bt.albedo;
-  let emis = emberFlicker(bt.emis, fh, R.time);
+  // ...plus a glowing coat's own light (acid), which breathes on its pulse
+  // rather than flickering like an ember.
+  let emis = emberFlicker(bt.emis, fh, R.time) +
+             bodyCoatGlow(coatWord, c, scale, R.time);
   // The ambient's spatial term. One downward probe per FRAGMENT (at most six
   // mask words), which is where a body's shading has to happen. `.x` is the
   // ambient multiplier, `.y` the raw openness the shadow lift is capped by —

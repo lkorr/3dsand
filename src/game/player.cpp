@@ -961,7 +961,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // rate and converted with 1-exp(-rate*dt): lerping by a bare constant every
     // frame (what this used to do) made acceleration and water drag scale with
     // frame rate, so the same input felt different at 30 and 144 FPS.
-    float rate = onGround ? T().groundAccel
+    float rate = onGround ? T().groundAccel * groundGrip
                           : (inLiquid ? T().liquidAccel : T().airAccel);
     float blend = 1.0f - std::exp(-rate * dt);
     vel.x += (wish.x - vel.x) * blend;

@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cfloat>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -60,7 +61,9 @@ namespace {
 
 // Graph node kinds, mirrored from game/spellgraph.h's GraphKind. The mirror
 // carries the enum as an int because ui/overlay.h is spell-free.
-enum Kind { kWord = 0, kOperator, kJoin, kModTag, kRoot, kSocket, kBus, kSplit };
+enum Kind {
+  kWord = 0, kOperator, kJoin, kModTag, kRoot, kSocket, kBus, kSplit, kHole
+};
 // Edge kinds, from GraphEdge.
 enum EKind { kTrunk = 0, kEBus, kESocket, kFan, kSlot };
 // Glyph sorts, from GlyphSort.
@@ -341,6 +344,47 @@ void LeafTablet(ImDrawList* dl, ImVec2 a, ImVec2 b, const char* icon, float mul,
                        mul, dim ? Fade(ColIronSoft(), 0.55f) : ColIronGall());
 }
 
+// A rectangle in DOTS. Used for the one shape on the page that is a space
+// rather than a thing; a dashed rule is how a scribe rules a blank he means to
+// come back and fill.
+void DashRect(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float t, float dash) {
+  for (float x = a.x; x < b.x; x += dash * 2.0f) {
+    const float x1 = std::min(x + dash, b.x);
+    dl->AddRectFilled(ImVec2(x, a.y), ImVec2(x1, a.y + t), col);
+    dl->AddRectFilled(ImVec2(x, b.y - t), ImVec2(x1, b.y), col);
+  }
+  for (float y = a.y; y < b.y; y += dash * 2.0f) {
+    const float y1 = std::min(y + dash, b.y);
+    dl->AddRectFilled(ImVec2(a.x, y), ImVec2(a.x + t, y1), col);
+    dl->AddRectFilled(ImVec2(b.x - t, y), ImVec2(b.x, y1), col);
+  }
+}
+
+// AN OPERATOR'S EMPTY SLOT, STANDING IN THE OPERAND ROW (2026-09-22). It used
+// to be a 21 px hollow ring hung off the LEFT EDGE of the operator's cell -
+// eleven screen pixels at the fit rung, the smallest mark in the drawing,
+// carrying the single most important fact about a `_ trail`: that it is not
+// finished and takes the word spoken before it. An operand is the row BELOW its
+// operator, so the missing operand is drawn there, at a cell's size, and the
+// mark is the one the grammar itself writes: a tablet ruled in dots with the
+// underscore across it.
+void LeafBlank(ImDrawList* dl, ImVec2 a, ImVec2 b, float mul) {
+  const ImU32 ink = Fade(ColRubric(), 0.85f);
+  const float uy = std::floor((a.y + b.y) * 0.5f + (b.y - a.y) * 0.16f);
+  const float ut = std::max(2.0f, std::floor((b.y - a.y) * 0.06f));
+  if (mul < 0.5f) {
+    dl->AddRect(a, b, ink, 0.0f, 0, 2.0f);
+    dl->AddRectFilled(ImVec2(a.x + 4, uy), ImVec2(b.x - 4, uy + ut), ink);
+    return;
+  }
+  // The hollow is PALER than the vellum around it, not darker: a hole in the
+  // page is an absence of ink, and a grey plate would read as a word drawn in
+  // a colour nobody else uses.
+  dl->AddRectFilled(a, b, Fade(ColVellumHi(), 0.35f));
+  DashRect(dl, a, b, ink, 2.0f, std::max(4.0f, std::floor((b.x - a.x) * 0.09f)));
+  dl->AddRectFilled(ImVec2(a.x + 12, uy), ImVec2(b.x - 12, uy + ut), ink);
+}
+
 // The hover mark on a page is not a glow - light does not come out of ink.
 // It is what a reader does: a bracket round the passage, pricked in minium.
 void LeafHover(ImDrawList* dl, ImVec2 a, ImVec2 b) {
@@ -471,7 +515,7 @@ void GlyphRoundel(ImDrawList* dl, ImVec2 a, ImVec2 b, uint32_t color, int sort,
 
 void PageHover(ImDrawList* dl, ImVec2 a, ImVec2 b) { LeafHover(dl, a, b); }
 
-void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName) {
+void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName, const char* magnitude) {
   BeginTip();
   ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
   if (g.owned) {
@@ -482,6 +526,11 @@ void GlyphInfoBox(const UIState::GlyphUI& g, const char* sortName) {
     ImGui::TextUnformatted("? ? ?");
   }
   ImGui::PopStyleColor();
+  if (magnitude && *magnitude) {
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
+    ImGui::TextUnformatted(magnitude);
+    ImGui::PopStyleColor();
+  }
   ImGui::TextDisabled("%s . %s", sortName, g.valence.c_str());
   if (!g.owned) {
     ImGui::TextDisabled("a word you have not learned");
@@ -507,6 +556,175 @@ void PushGrimoireUndo(UIState& s) {
     s.grimoireUndo.erase(s.grimoireUndo.begin());
   // A new edit is a new future: whatever ctrl+Z had set aside is gone.
   s.grimoireRedo.clear();
+}
+
+// ---- magnitude (docs/PLAN_spell_magnitude.md §2.5) ----------------------------
+//
+// THE WHEEL OVER A GRADED CELL SETS ITS MAGNITUDE; over anything else it zooms.
+// The zoom is decided before the cells are laid out this frame, so it reads
+// whether the cursor was over a graded cell LAST frame - one frame of lag on
+// a hover boundary, which a wheel notch cannot feel.
+static bool gOverGradedCell = false;
+
+std::string MagDecimal(int mag) {
+  const bool neg = mag < 0;
+  if (neg) mag = -mag;
+  std::string s = (neg ? "-" : "") + std::to_string(mag / 1000);
+  int frac = mag % 1000;
+  if (frac) {
+    char buf[8];
+    std::snprintf(buf, sizeof buf, "%03d", frac);
+    std::string f = buf;
+    while (!f.empty() && f.back() == '0') f.pop_back();
+    s += "." + f;
+  }
+  return s;
+}
+
+// The tip's magnitude line: "x0.5 . gravity -0.50 g   (wheel 0.25..4)".
+std::string MagnitudeLine(const UIState::SpellGraphUI::Node& n) {
+  if (!n.graded) return std::string();
+  std::string s = (n.magMin < 0 ? std::string() : std::string("x")) + MagDecimal(n.mag);
+  if (!n.magLabel.empty()) s += " . " + n.magLabel;
+  s += "   (wheel: " + MagDecimal(n.magMin) + " to " + MagDecimal(n.magMax) + ")";
+  return s;
+}
+
+// ---- timing (docs/PLAN_spell_magnitude.md §4, M3) -------------------------------
+//
+// WHEN AN ITEM FIRES is a click away: a plain left click on a cell (not a drag)
+// opens a small menu of the five moments and a row of delays, and a choice is
+// one `SetTiming` edit. A cell that does not fire on hit wears a tag at its top
+// edge - where its stroke leaves for the carrier - naming the moment.
+static int gTimingTree = -1;          // the tree node the open menu edits
+static int gTimingCur[3] = {0, 0, 0};  // its trigger / every / delay when opened
+static bool gTimingOpen = false;       // a click asked for the menu this frame
+
+const char* TriggerTag(int trig) {
+  switch (trig) {
+    case 1: return "BOUNCE";
+    case 2: return "EXPIRE";
+    case 3: return "LAUNCH";
+    case 4: return "EVERY";
+    default: return "";
+  }
+}
+
+void TimingTag(ImDrawList* dl, ImVec2 a, ImVec2 b, const UIState::SpellGraphUI::Node& n,
+               float scale) {
+  if ((n.trigger == 0 && n.delay == 0) || scale < 0.5f) return;
+  std::string t = TriggerTag(n.trigger);
+  if (n.trigger == 4) t += " " + std::to_string(n.every);
+  if (n.delay > 0) t += (t.empty() ? "" : " ") + std::string("+") + std::to_string(n.delay) + "t";
+  const ImVec2 ts = FontSmall()->CalcTextSizeA(13.0f, FLT_MAX, 0.0f, t.c_str());
+  const float cx = std::floor((a.x + b.x) * 0.5f);
+  const ImVec2 p(std::floor(cx - ts.x * 0.5f), std::floor(a.y - ts.y + 2.0f));
+  dl->AddRectFilled(ImVec2(p.x - 3, p.y - 1), ImVec2(p.x + ts.x + 3, p.y + ts.y),
+                    Fade(ColVellumHi(), 0.95f));
+  dl->AddRect(ImVec2(p.x - 3, p.y - 1), ImVec2(p.x + ts.x + 3, p.y + ts.y),
+              Fade(ColAzurite(), 0.9f));
+  dl->AddText(FontSmall(), 13.0f, p, ColAzurite(), t.c_str());
+}
+
+// A CLICK, not a drag: the button came up over the cell having moved less than
+// the drag threshold since it went down.
+void TimingClick(const UIState::SpellGraphUI::Node& n, bool hov, bool readOnly, bool live) {
+  if (readOnly || live || !hov || n.treeNode < 0) return;
+  if (!ImGui::IsMouseReleased(ImGuiMouseButton_Left)) return;
+  const float th = ImGui::GetIO().MouseDragThreshold;
+  if (ImGui::GetIO().MouseDragMaxDistanceSqr[0] > th * th) return;
+  gTimingTree = n.treeNode;
+  gTimingCur[0] = n.trigger;
+  gTimingCur[1] = n.every;
+  gTimingCur[2] = n.delay;
+  // OPENED LATER, by TimingPopup: the cells sit under a per-node PushID and a
+  // popup id is relative to the id stack, so one opened here would never be
+  // found by the BeginPopup outside the loop.
+  gTimingOpen = true;
+}
+
+void TimingPopup(UIState& s) {
+  if (gTimingOpen) {
+    gTimingOpen = false;
+    ImGui::OpenPopup("##timing");
+  }
+  if (!ImGui::BeginPopup("##timing")) return;
+  auto apply = [&](int trig, int every, int delay) {
+    PushGrimoireUndo(s);
+    s.graphEdit = {};
+    s.graphEdit.pending = true;
+    s.graphEdit.op = UIState::GraphEditIntent::SetTiming;
+    s.graphEdit.treeNode = gTimingTree;
+    s.graphEdit.trigger = trig;
+    s.graphEdit.every = every;
+    s.graphEdit.delay = delay;
+    ImGui::CloseCurrentPopup();
+  };
+  ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
+  ImGui::TextUnformatted("WHEN DOES IT FIRE?");
+  ImGui::PopStyleColor();
+  static const char* kNames[5] = {"when it hits", "at each bounce", "when its life runs out",
+                                  "at launch", "every"};
+  for (int t = 0; t < 5; t++) {
+    if (t == 4) {
+      ImGui::TextUnformatted("every");
+      for (int period : {5, 10, 20, 40}) {
+        ImGui::SameLine();
+        char lbl[24];
+        std::snprintf(lbl, sizeof lbl, "%d%s##ev%d", period, period == 40 ? " ticks" : "",
+                      period);
+        const bool on = gTimingCur[0] == 4 && gTimingCur[1] == period;
+        if (ImGui::Selectable(lbl, on, 0, ImVec2(on ? 0 : 0, 0))) apply(4, period, gTimingCur[2]);
+      }
+      continue;
+    }
+    if (ImGui::Selectable(kNames[t], gTimingCur[0] == t)) apply(t, 0, gTimingCur[2]);
+  }
+  ImGui::Separator();
+  ImGui::TextUnformatted("then wait");
+  for (int d : {0, 5, 10, 20, 40, 80}) {
+    ImGui::SameLine();
+    char lbl[24];
+    std::snprintf(lbl, sizeof lbl, d == 0 ? "no##d%d" : "%d##d%d", d, d);
+    if (d == 0) std::snprintf(lbl, sizeof lbl, "none##d0");
+    if (ImGui::Selectable(lbl, gTimingCur[2] == d, 0, ImVec2(0, 0)))
+      apply(gTimingCur[0], gTimingCur[1], d);
+  }
+  ImGui::TextDisabled("ticks (30 a second). Only a flying carrier");
+  ImGui::TextDisabled("bounces, expires or launches; a delay works anywhere.");
+  ImGui::EndPopup();
+}
+
+// Called for a hovered cell: consume the wheel as a magnitude step (ctrl = four
+// steps) and latch the edit. Past the end of the range the op REFUSES and the
+// status line names the limit, which is the feedback a silent clamp would eat.
+void WheelMagnitude(UIState& s, const UIState::SpellGraphUI::Node& n, bool readOnly) {
+  if (readOnly || !n.graded || n.treeNode < 0) return;
+  gOverGradedCell = true;
+  const float wheel = ImGui::GetIO().MouseWheel;
+  if (wheel == 0.0f || ImGui::GetDragDropPayload()) return;
+  const int steps = (wheel > 0.0f ? 1 : -1) * (ImGui::GetIO().KeyCtrl ? 4 : 1);
+  PushGrimoireUndo(s);
+  s.graphEdit = {};
+  s.graphEdit.pending = true;
+  s.graphEdit.op = UIState::GraphEditIntent::SetMagnitude;
+  s.graphEdit.treeNode = n.treeNode;
+  s.graphEdit.mag = n.mag + steps * std::max(1, n.magStep);
+}
+
+// The magnitude written on the cell: a small numeral at its foot, only when it
+// is not the word's default, so a page of plain words looks exactly as it did.
+// A SIGNED component (M2: `lift`, `wind`) writes its sign rather than an `x`,
+// because -1 of a lift is a direction, not a multiplier.
+void MagnitudeNumeral(ImDrawList* dl, ImVec2 a, ImVec2 b, const UIState::SpellGraphUI::Node& n,
+                      float scale) {
+  if (!n.graded || n.mag == n.magDefault || scale < 0.5f) return;
+  const std::string t =
+      n.magMin < 0 ? (n.mag > 0 ? "+" : "") + MagDecimal(n.mag) : "x" + MagDecimal(n.mag);
+  const ImVec2 ts = FontSmall()->CalcTextSizeA(13.0f, FLT_MAX, 0.0f, t.c_str());
+  const ImVec2 p(std::floor(b.x - ts.x - 2.0f), std::floor(b.y - ts.y + 1.0f));
+  dl->AddRectFilled(ImVec2(p.x - 2, p.y), ImVec2(b.x, b.y + 1), Fade(ColVellumHi(), 0.9f));
+  dl->AddText(FontSmall(), 13.0f, p, ColRubric(), t.c_str());
 }
 
 // ---- the canvas ---------------------------------------------------------------
@@ -780,7 +998,10 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // exactly where it is, which is the whole reason a zoom is usable at all.
   {
     const float wheel = ImGui::GetIO().MouseWheel;
-    if (wheel != 0.0f && ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
+    const bool overGraded = gOverGradedCell;
+    gOverGradedCell = false;   // the cells below set it again if still hovered
+    if (wheel != 0.0f && !overGraded &&
+        ImGui::IsWindowHovered(ImGuiHoveredFlags_ChildWindows) &&
         !ImGui::GetDragDropPayload()) {
       const int want = std::clamp(rungOf(scale) + (wheel > 0.0f ? 1 : -1), 0,
                                   kLadderN - 1);
@@ -901,18 +1122,15 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
   // of their own, so every gesture on one has to find the join that lists it.
   // By search rather than by a stored back-pointer, because the mirror is a flat
   // list and the search is over a handful of nodes.
+  // A BACK-POINTER, NOT A SEARCH (2026-09-22). It used to scan every join's
+  // socket list, which cannot see a SUB-fan's pip — a branch that splits again
+  // has sockets of its own and they are in nobody's list — so every drop on one
+  // refused with "that mark has no box". `owner` is set by the layout, where
+  // the answer is known, on every socket, bus and junction at every depth.
   auto boxOf = [&](int nodeIdx) {
-    for (size_t bi = 0; bi < g.nodes.size(); bi++) {
-      const UIState::SpellGraphUI::Node& bn = g.nodes[bi];
-      if (bn.kind != kJoin && bn.kind != kRoot) continue;
-      // ...and never a COPY: a split delivery is drawn once per branch and only
-      // the primary cell owns the bus, the junction and the socket list.
-      if (bn.primary >= 0) continue;
-      if (bn.bus == nodeIdx || bn.split == nodeIdx) return (int)bi;
-      for (int sk : bn.sockets)
-        if (sk == nodeIdx) return (int)bi;
-    }
-    return -1;
+    if (nodeIdx < 0 || nodeIdx >= (int)g.nodes.size()) return -1;
+    const int o = g.nodes[(size_t)nodeIdx].owner;
+    return (o >= 0 && o < (int)g.nodes.size()) ? o : -1;
   };
   // A cell that is a copy answers for the cell that owns the record.
   auto primaryOf = [&](int nodeIdx) {
@@ -1106,17 +1324,45 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           say = copyMod ? "ctrl: a copy of that branch lands here"
                         : "move that branch here";
         } else if (sort == kMod) {
+          const UIState::GlyphUI* mg = FindGlyph(s, name ? name : "");
+          // A SPLIT MAY NOT BE ANSWERED BY OPENING A LANE (2026-09-22).
+          //
+          // A socket drop asks for lane `instance + 1`, and a socket with no
+          // lane of its own OPENS one. That is right for a payload and wrong for
+          // a `shotgun` or a `twin`, because a count is the word that MAKES
+          // sockets: dropping one on a bare socket wrapped it in `lane ... end`,
+          // which moved the split down into a branch that did not exist until
+          // the drop invented it. On a blank page the whole gesture came out as
+          // `lane shotgun end` - one bare instance carrying a count - and the
+          // three branches the player dragged the word in for were never drawn.
+          //
+          // So a count lands in the scope the socket BELONGS TO unless that
+          // socket is a lane the player actually opened, and a split word
+          // always fans what you dropped it on.
+          //
+          // ...ONCE. A box that ALREADY fans has had that drop; a second count
+          // aimed at one of its sockets means "split THAT branch" - a twin of a
+          // twin, contained - so the clamp stands down and the lane opens after
+          // all. `bn.split` is the junction and it wears the count word that
+          // opened it, which is exactly "the trunk already holds a split".
+          //
+          // `AttachMod` IS THE TRUTH and enforces both for every caller; the
+          // same test is made here so the sentence under the cursor and the
+          // ghost describe the drop that is actually going to happen.
+          const bool trunkSplits =
+              bn.split >= 0 && bn.split < (int)g.nodes.size() &&
+              g.nodes[(size_t)bn.split].treeNode >= 0;
+          if (mg && mg->splits && lane > bn.laneCount && !trunkSplits) lane = 0;
           e.op = UIState::GraphEditIntent::AttachMod;
           e.treeNode = bn.treeNode;
           e.lane = lane;
           e.glyphId = name;
-          // `count` is record-wide wherever it is spoken, so promising "that
-          // instance alone" for a `shotgun` dropped on a socket would be a lie
-          // the drawing then contradicts by putting the bead on the trunk.
-          const UIState::GlyphUI* mg = FindGlyph(s, name ? name : "");
-          const bool wide = mg && mg->recordWide;
-          say = (lane > 0 && !wide) ? "this mod edits that instance alone"
-                                    : "this mod edits the whole record";
+          if (mg && mg->splits)
+            say = lane > 0 ? "this splits that branch again - a fan inside a fan"
+                           : "this splits the whole box into its branches";
+          else
+            say = lane > 0 ? "this mod edits that instance alone"
+                           : "this mod edits the whole record";
         } else {
           e.op = UIState::GraphEditIntent::Insert;
           e.treeNode = bn.treeNode;
@@ -1142,6 +1388,27 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
     }
     ImGui::EndDragDropTarget();
   };
+
+  // ---- THE CLASP: an operator and its row are ONE word -----------------------
+  //
+  // `_ trail`, `_ mend`, `_ null` do nothing on their own: each is half a word,
+  // FUSED to whatever stands in its slot, and the pair is one thing the sentence
+  // says once. Nothing on the page said so - an operand was a cell with a
+  // stroke, exactly like an item feeding a bus, and the two mean completely
+  // different things. So the operator's cell and the row it binds are drawn
+  // inside one faint enclosure: the reader's box round a phrase that has to be
+  // read together. Drawn UNDER the strokes and the cells, in the palest ink the
+  // page has, because it is a grouping and not a mark.
+  for (const UIState::SpellGraphUI::Node& n : g.nodes) {
+    if (n.kind != kOperator || !(n.hasLeft || n.hasRight)) continue;
+    const float pad = std::max(3.0f, std::floor(6.0f * scale));
+    const ImVec2 ca(X(n.subX) - pad, Y(n, 0) - pad);
+    const ImVec2 cb(X(n.subX + n.subW) + pad, BandBot(n.baseLayer) + pad);
+    if (cb.x <= ca.x || cb.y <= ca.y) continue;
+    dl->AddRectFilled(ca, cb, Fade(ColIronSoft(), 0.07f), 8.0f);
+    dl->AddRect(ca, cb, Fade(ColIronSoft(), n.complete ? 0.28f : 0.42f), 8.0f, 0,
+                2.0f);
+  }
 
   // ---- the strokes, under every node ----------------------------------------
   //
@@ -1523,6 +1790,8 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
                                                std::max(8.0f, b.y - a.y)));
         const bool hov = ImGui::IsItemHovered();
         if (hov) LeafHover(dl, a, b);
+        if (!root) TimingTag(dl, a, b, n, scale);
+        if (!root) TimingClick(n, hov, readOnly, live != nullptr);
         if (hov && !live) {
           std::string caps = n.label;
           for (char& c : caps) c = (char)toupper((unsigned char)c);
@@ -1566,7 +1835,9 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           }
           ImGui::TextDisabled("drop a word to share it, a mod to edit the record,");
           ImGui::TextDisabled("a delivery to nest this whole box inside it");
-          if (!root) ImGui::TextDisabled("right-click drops this delivery (unbox)");
+          if (!root && !n.timingPhrase.empty())
+            ImGui::TextDisabled("fires %s", n.timingPhrase.c_str());
+          if (!root) ImGui::TextDisabled("click: when it fires . right-click: unbox");
           EndTip();
         }
         if (!readOnly && !root && hov && !live &&
@@ -1625,13 +1896,16 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
                                                std::max(8.0f, b.y - a.y)));
         const bool hov = ImGui::IsItemHovered();
         if (hov) LeafHover(dl, a, b);
+        MagnitudeNumeral(dl, a, b, n, scale);
         if (hov && !live) {
+          WheelMagnitude(s, n, readOnly);
           BeginTip();
           ImGui::PushStyleColor(ImGuiCol_Text,
                                 ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
           ImGui::TextUnformatted(n.label.c_str());
           ImGui::PopStyleColor();
           if (!n.edit.empty()) ImGui::TextDisabled("%s", n.edit.c_str());
+          if (n.graded) ImGui::TextDisabled("%s", MagnitudeLine(n).c_str());
           // WHICH RECORD, always — it is the one thing a bead's position shows
           // and its picture does not, and `shotgun` spoken inside a lane is
           // record-wide anyway, so the answer is not guessable from the words.
@@ -1659,6 +1933,36 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           s.graphEdit.op = UIState::GraphEditIntent::Remove;
           s.graphEdit.treeNode = n.treeNode;
         }
+        break;
+      }
+      case kHole: {
+        // THE BLANK an operator is waiting on. It is not a node of its own: it
+        // carries the OPERATOR's tree node and `instance` is the side, so a drop
+        // on it is `FillSlot(thatOperator, thatSide)` - the same op the hollow
+        // pip used to latch, on a target 64 chrome pixels wide instead of 21.
+        LeafBlank(dl, a, b, scale);
+        ImGui::SetCursorScreenPos(a);
+        ImGui::InvisibleButton("##hole", ImVec2(std::max(8.0f, b.x - a.x),
+                                                std::max(8.0f, b.y - a.y)));
+        const bool hov = ImGui::IsItemHovered();
+        if (hov) LeafHover(dl, a, b);
+        if (hov && !live) {
+          BeginTip();
+          ImGui::PushStyleColor(ImGuiCol_Text,
+                                ImGui::ColorConvertU32ToFloat4(ColGoldHi()));
+          ImGui::Text("_ %s", n.glyphId.c_str());
+          ImGui::PopStyleColor();
+          ImGui::TextDisabled(n.instance == 0
+                                  ? "`%s` takes the word SPOKEN BEFORE it, and "
+                                    "this is where that word stands."
+                                  : "`%s` takes a second word after it, and this "
+                                    "is where that word stands.",
+                              n.glyphId.c_str());
+          ImGui::TextDisabled("Empty, the pair is charged and does nothing.");
+          ImGui::TextDisabled("Drop a word here to fuse it.");
+          EndTip();
+        }
+        offer(n.instance == 0 ? Tgt::PipL : Tgt::PipR, (int)i, a, b);
         break;
       }
       case kOperator:
@@ -1694,10 +1998,16 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
         // the cursor has to be unmistakable: the reader's bracket round the
         // whole figure, in minium.
         if (hov) LeafHover(dl, a, b);
+        MagnitudeNumeral(dl, a, b, n, scale);
+        TimingTag(dl, a, b, n, scale);
         if (hov && !live) {
-          if (gu) GlyphInfoBox(*gu, SortLabel(n.sort));
+          std::string ml = MagnitudeLine(n);
+          if (!n.timingPhrase.empty()) ml += (ml.empty() ? "" : "\n") + std::string("fires ") + n.timingPhrase;
+          if (gu) GlyphInfoBox(*gu, SortLabel(n.sort), ml.c_str());
           else Tip("a word that no longer exists");
+          WheelMagnitude(s, n, readOnly);
         }
+        TimingClick(n, hov, readOnly, live != nullptr);
         // THE CELL ITSELF TAKES A DROP (2026-09-21). It used to take none: a
         // word cell was a drag SOURCE and nothing else, and an operator's only
         // targets were its two hollow pips, so a glyph aimed anywhere at a
@@ -1738,15 +2048,18 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
           s.graphEdit.op = UIState::GraphEditIntent::Remove;
           s.graphEdit.treeNode = n.treeNode;
         }
-        // The operator's PIPS: one per declared slot, hollow with a `_` when
-        // empty. A hollow pip is the visual answer to "which words need a
-        // prefix", and it is the drop target that fills it.
+        // The operator's PIPS, one per FILLED slot: the stud the operand's
+        // stroke lands on, which is what says which side bound it. An EMPTY
+        // slot has no pip here any more - it is a `Hole` cell standing in the
+        // operand row (see LeafBlank), because a hollow ring hung off the
+        // cell's edge was the smallest mark on the page carrying the biggest
+        // fact on it.
         if (op) {
           const float ph = std::floor(cw * 0.34f);
           for (int side = 0; side < 2; side++) {
             const bool hasIt = side == 0 ? n.hasLeft : n.hasRight;
-            if (!hasIt) continue;
             const bool filled = side == 0 ? n.leftFilled : n.rightFilled;
+            if (!hasIt || !filled) continue;
             const float cx = side == 0 ? a.x : b.x;
             const ImVec2 pa(std::floor(cx - ph * 0.5f),
                             std::floor((a.y + b.y) * 0.5f - ph * 0.5f));
@@ -1754,38 +2067,8 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
             const ImVec2 sc2(std::floor((pa.x + pb.x) * 0.5f),
                              std::floor((pa.y + pb.y) * 0.5f));
             const float sr = std::max(3.0f, std::floor(ph * 0.5f));
-            if (filled) {
-              PixelDisc(dl, sc2, sr, ColIronGall());
-              PixelRing(dl, sc2, sr + 2.0f, Fade(ColVellumHi(), 0.8f), 2.0f);
-            } else {
-              // AN EMPTY SLOT IS AN EMPTY RING with the rule still drawn
-              // across it: the mark a scribe leaves where a word is to be
-              // filled in later, which is precisely what this is.
-              PixelDisc(dl, sc2, sr, Fade(ColVellumHi(), 0.9f));
-              PixelRing(dl, sc2, sr, ColRubric(), 2.0f);
-              dl->AddRectFilled(ImVec2(sc2.x - sr + 3, sc2.y - 1),
-                                ImVec2(sc2.x + sr - 1, sc2.y + 1), ColRubric());
-              // THE TARGET IS BIGGER THAN THE PIP. The pip is ~21 chrome pixels
-              // and ELEVEN on screen at half scale; `transmute`'s two hollow
-              // slots were the hardest thing on the page to hit, and missing
-              // one dropped the word on nothing. Padded by nearly half its own
-              // width on each side — still short of the 64 px between the two
-              // pip centres, so left and right can never both claim a pixel.
-              const float hp = std::floor(ph * 0.45f);
-              const ImVec2 ta(pa.x - hp, pa.y - hp), tb(pb.x + hp, pb.y + hp);
-              ImGui::PushID(side);
-              ImGui::SetCursorScreenPos(ta);
-              ImGui::InvisibleButton("##pip", ImVec2(tb.x - ta.x, tb.y - ta.y));
-              if (ImGui::IsItemHovered() && !live)
-                Tip(side == 0 ? "This operator's left slot is empty: it takes "
-                                "the word before it. Drop one here."
-                              : "This operator's right slot is empty. Drop a "
-                                "word here.");
-              // The RING is drawn on the pip, not on the padded target: the
-              // marker should point at the hole, not at the catchment.
-              offer(side == 0 ? Tgt::PipL : Tgt::PipR, (int)i, pa, pb);
-              ImGui::PopID();
-            }
+            PixelDisc(dl, sc2, sr, ColIronGall());
+            PixelRing(dl, sc2, sr + 2.0f, Fade(ColVellumHi(), 0.8f), 2.0f);
           }
         }
         break;
@@ -1793,6 +2076,8 @@ GraphCanvasResult SpellGraphCanvas(UIState& s, ImVec2 at, ImVec2 size, bool read
     }
     ImGui::PopID();
   }
+
+  if (!readOnly) TimingPopup(s);
 
   // ---- AHEAD OF THE SPELL: the empty slot a new delivery goes in -------------
   //

@@ -15,12 +15,12 @@
 //     holds no state that a frame boundary could move, so a replay renders the
 //     sky the player saw and `--shot` is reproducible.
 //
-//   * It is RENDER-ONLY today, and floats are allowed for exactly that reason.
-//     Nothing here reaches TickParams, the CA or the world hash. The day rain
-//     is allowed to TOUCH the world (wet stain, RCOND_RAIN — plan §2.5), the
-//     scalar the sim reads must be derived as an integer here the way
-//     `WindWeatherQ` is, and the float view below becomes a division of it.
-//     Do not hand the sim one of these floats.
+//   * It is RENDER-ONLY except for ONE integer: SimRainWord, below, which
+//     rides TickParams and is how rain douses fires and damps ignition (the
+//     "rain" / "rainDamped" reaction flags). Floats are allowed everywhere
+//     else for exactly that reason. Do not hand the sim one of these floats —
+//     anything else the weather should do to the world goes through that word
+//     (or a sibling of it), quantised on the tick stream.
 //
 // THE AUTOMATIC CYCLE. The three-field model from the corpus (plan §1c):
 // weather is not a state machine, it is a position on a MOISTURE ladder.
@@ -112,11 +112,13 @@ class Library {
 Library& Presets();
 
 // ---- the runtime override (dev panel / tuner "Weather" row) ----------------
-// A render-only knob the game can set without editing tuning.json: pin a
-// named preset, or "" to hand the sky back to tuning (weather.autoCycle /
-// weather.preset). The change is EASED over weather.transitionSeconds of
-// frame time, so flipping presets in the dev panel reads as the weather
-// turning, not a cut. Render-only, so wall-clock easing is allowed here.
+// A knob the game can set without editing tuning.json: pin a named preset, or
+// "" to hand the sky back to tuning (weather.autoCycle / weather.preset). The
+// SKY eases over weather.transitionSeconds of frame time, so flipping presets
+// in the dev panel reads as the weather turning, not a cut. The SIM does not
+// ease: SimRainWord reads the pin directly, because a wall-clock ease on the
+// tick stream would make the world hash depend on frame pacing. The pin is an
+// input, recorded on the tick stream like any other.
 void SetOverride(const std::string& name);
 const std::string& Override();
 
@@ -126,6 +128,22 @@ const std::string& Override();
 // envelope; pass 0 on a headless path and both snap.
 State Resolve(const Tuning& t, uint32_t seed, double timeSeconds,
               float frameDtSeconds, float camXM, float camZM);
+
+// THE SIM'S VIEW OF THE WEATHER: TickParams::weatherRain for `tick`, the one
+// integer by which the sky touches the world (reaction flags "rain" and
+// "rainDamped" — materials.h kCondRain / kCondRainDamp; layout kRain*).
+//   bits 0..7   rain reaching the ground now, 0..255
+//   bits 8..15  weather.rainIgniteDamp, 0..255
+//   bits 16..23 ground wetness (the leaky integral), 0..255
+// A pure function of (tuning, presets, seed, tick, the pinned preset): it
+// reads the un-eased TARGET, never the frame-time ease, so frame pacing cannot
+// reach the world hash. The floats stop here — quantised once, on the tick
+// input stream, which is what replays and the determinism gates capture.
+// 0 when weather.clouds or weather.rainTouchesWorld is off.
+uint32_t SimRainWord(const Tuning& t, uint32_t seed, uint32_t tick);
+// The word the last SimRainWord call returned — a readout for the dev panel,
+// never an input to anything.
+uint32_t LastSimRainWord();
 
 // The last State Resolve returned, for the dev panel's readout and the gate.
 const State& Last();

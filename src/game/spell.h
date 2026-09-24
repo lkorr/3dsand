@@ -1,4 +1,5 @@
 #pragma once
+#include <climits>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -315,7 +316,91 @@ struct GlyphDef {
   ModField field = ModField::None;
   ModOp op = ModOp::Mul;
   int32_t amount = 1;
+
+  // ---- magnitude (docs/PLAN_spell_magnitude.md §2) ----
+  // Whether the page may set this word's MAGNITUDE, and the range and step it
+  // may take, all in per-mille of the authored quantity (1000 = the word as
+  // written). From the glyph's "magnitude" block, or the sort's default.
+  bool graded = false;
+  int32_t magMin = 1000, magMax = 1000, magStep = 1000;
+  // The magnitude a word has when nothing says otherwise: 1000 for every word
+  // that existed before magnitudes, the component's natural value for a
+  // SIGNED one (`lift` is 1 g of lift, `speed` is x2). A serialized word
+  // omits its suffix exactly when it is at this value.
+  int32_t magDefault = 1000;
+  // Loadable (old pages keep working) but not offered in the page's word
+  // column: the words PLAN_spell_magnitude M2 replaced with one signed
+  // component (`float`/`heavy` -> `lift`, `swift`/`slow` -> `speed`,
+  // `implode` -> `wind`).
+  bool hidden = false;
 };
+
+// ---- magnitude (docs/PLAN_spell_magnitude.md §2) -------------------------------
+// A word's magnitude is per-mille of its authored quantity: 1000 is the word as
+// written, 500 half of it, 2000 double. It rides beside multiplicity, so an
+// item's effective scale is `n × mag / 1000` — and at 1000 every formula that
+// reads it is the integer-`n` formula it replaced, exactly (law L-M0).
+constexpr int32_t kMagOne = 1000;
+// "Nothing was said": the word takes its glyph's `magDefault` at parse.
+constexpr int32_t kMagUnset = INT32_MIN;
+struct GlyphLibrary;
+
+// ---- timing (docs/PLAN_spell_magnitude.md §4, M3) ------------------------------
+// WHEN a payload item fires, relative to the carrier it rides in. A property
+// of the item (a word, an operator group or a nested box), not a word of its
+// own: `explosive!bounce` explodes at every bounce, `projectile!every10` is a
+// child bolt fired every 10 ticks of the parent's flight, `fire+20` sprays 20
+// ticks after it would have. Only a FLIGHT carrier has bounces, a life and a
+// launch; on any other carrier every item fires when the carrier resolves, and
+// the delay still applies.
+enum class SpellTrigger : uint8_t {
+  Hit = 0,   // when the carrier resolves (impact, fuse, an orb's expiry): today
+  Bounce,    // at every bounce, from the bounce point along the rebound
+  Expire,    // when the carrier's life runs out, whether or not it resolves
+  Launch,    // at the muzzle, the moment the carrier is born
+  Every,     // every `every` ticks of flight
+};
+constexpr int kSpellTriggerCount = 5;
+const char* SpellTriggerName(SpellTrigger t);   // "hit" | "bounce" | ...
+struct SpellTiming {
+  SpellTrigger trigger = SpellTrigger::Hit;
+  int32_t every = 0;    // Every: the period, ticks (>= 1)
+  int32_t delay = 0;    // ticks after the trigger before it happens (0..maxDelayTicks)
+  bool IsDefault() const { return trigger == SpellTrigger::Hit && delay == 0; }
+  bool operator==(const SpellTiming& o) const {
+    return trigger == o.trigger && every == o.every && delay == o.delay;
+  }
+  bool operator!=(const SpellTiming& o) const { return !(*this == o); }
+};
+// The suffix a timing serializes to: "" | "!bounce" | "!every10" | "+20" | "!expire+5".
+std::string TimingSuffix(const SpellTiming& t);
+// The words a player reads: "on hit" | "at each bounce" | "every 10 ticks, 20 ticks later".
+std::string TimingPhrase(const SpellTiming& t);
+// Clamp to the glyph's range and snap to its step (an ungraded glyph is 1000).
+int32_t ClampMagnitude(const GlyphDef& g, int32_t mag);
+// `float@0.5` -> ("float", 500). No suffix -> kMagUnset. A malformed number
+// -> kMagUnset. Not clamped here: that needs the glyph. Stops at a timing
+// suffix (`!`, `+`).
+void SplitMagnitude(const std::string& word, std::string& id, int32_t& mag);
+// A SERIALIZED WORD, whole: `id[@mag][!trigger[N]][+delay]`. Resolves the id
+// against the library (-1 when it names no glyph), the magnitude to the
+// glyph's default when absent and clamped otherwise, and the timing (clamped
+// to the budgets). The one parser every page path goes through.
+int ParseWord(const GlyphLibrary& lib, const std::string& word, int32_t& mag,
+              SpellTiming& timing);
+// ...and its inverse: suffixes only where they differ from the default.
+std::string SerializeWord(const GlyphDef& g, int32_t mag, const SpellTiming& timing);
+// For callers with no timing: `SerializeWord(g, mag, {})`.
+std::string WordWithMagnitude(const GlyphDef& g, int32_t mag);
+// A magnitude as the decimal the page shows and writes: 500 -> "0.5", 2250 -> "2.25".
+std::string MagnitudeDecimal(int32_t mag);
+// What this word does at this magnitude, in the units a player reads:
+// "gravity -0.50 g", "speed x1.5", "power 330", "3 voxels". `n` is the
+// multiplicity. Empty for a glyph with nothing to say.
+std::string MagnitudeLabel(const GlyphLibrary& lib, int glyph, int32_t n, int32_t mag);
+// THE WORD PRICE AT A MAGNITUDE, and it is CONVEX: word × (mag/1000)², rounded
+// up, at least 1 for a word that costs anything. Exactly `word` at 1000.
+int32_t MagnitudeWordCost(int32_t word, int32_t mag);
 
 // A conjoined glyph / grimoire starter page: a saved list of glyph names that
 // speaks as if you had spoken them in order (plan §12b). Indices here are
@@ -335,6 +420,9 @@ struct SpellBudgets {
   int32_t maxLifetimeTicks = 300;
   // R1's cap: past it an extra utterance is free and does nothing.
   int32_t maxMultiplicity = 6;
+  // ---- timing (M3) ------------------------------------------------------------
+  int32_t maxDelayTicks = 300;   // a delay is clamped to this
+  int32_t minEveryTicks = 2;     // the shortest `every` period
   // shotgun's cap: instances per cast (3^N grows fast).
   int32_t maxInstances = 27;
   // ---- spray, the coercion of free Matter ---------------------------------
@@ -377,6 +465,12 @@ struct GlyphLibrary {
       if (glyphs[i].id == id) return (int)i;
     return -1;
   }
+  // A SERIALIZED word, which may carry a magnitude (`float@0.5`): the glyph it
+  // names, or -1. The magnitude itself is `SplitMagnitude`'s business.
+  int FindWord(const std::string& word) const {
+    const size_t at = word.find_first_of("@!+");
+    return Find(at == std::string::npos ? word : word.substr(0, at));
+  }
   const GlyphDef* At(int i) const {
     return (i >= 0 && i < (int)glyphs.size()) ? &glyphs[i] : nullptr;
   }
@@ -399,9 +493,32 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
 // the cast key applies "cast" to what is on top.
 struct SpellStack {
   std::vector<int> spoken;   // glyph indices, in spoken order
+  // Per-word MAGNITUDE (per-mille) and TIMING, parallel to `spoken`. Either
+  // may be SHORTER than `spoken` - a missing magnitude is kMagUnset (the
+  // glyph's default), a missing timing is the default - so every site that
+  // only ever pushes plain words keeps working untouched.
+  std::vector<int32_t> mags;
+  std::vector<SpellTiming> timing;
 
-  void Clear() { spoken.clear(); }
+  void Clear() {
+    spoken.clear();
+    mags.clear();
+    timing.clear();
+  }
   bool Empty() const { return spoken.empty(); }
+  int32_t MagAt(size_t i) const { return i < mags.size() ? mags[i] : kMagUnset; }
+  SpellTiming TimingAt(size_t i) const { return i < timing.size() ? timing[i] : SpellTiming{}; }
+  void Push(int glyph, int32_t mag = kMagUnset, SpellTiming tm = {}) {
+    // A side vector is materialized the first time a word needs it, padded
+    // with defaults for the words before, and kept in step from then on.
+    const bool wantMag = mag != kMagUnset || !mags.empty();
+    const bool wantTiming = !tm.IsDefault() || !timing.empty();
+    if (wantMag) mags.resize(spoken.size(), kMagUnset);
+    if (wantTiming) timing.resize(spoken.size());
+    spoken.push_back(glyph);
+    if (wantMag) mags.push_back(mag);
+    if (wantTiming) timing.push_back(tm);
+  }
 };
 // Bound so a stuck key cannot grow the stack without limit (rule 2 applies to
 // UI state too — an unbounded stack is an unbounded mana cost). 32 since rule
@@ -419,6 +536,13 @@ constexpr int kSpellStackMax = 32;
 struct SpellNode {
   int glyph = -1;        // library index; on a box, the delivery (-1 = hand)
   int32_t n = 1;         // multiplicity (runs merge), capped
+  // MAGNITUDE, per-mille (PLAN_spell_magnitude §2). Part of NodeKey when it is
+  // not 1000, so only equal magnitudes merge; always 1000 on a box.
+  int32_t mag = kMagOne;
+  // TIMING (M3): when this item fires in the carrier that holds it. On a box
+  // it is the box's own (spoken on its delivery word), on a group the
+  // operator word's. Part of NodeKey when not the default.
+  SpellTiming timing;
   bool group = false;    // an operator application
   bool box = false;      // a delivery box: `glyph` is the delivery, `items`
                          // the pile it closed (nouns AND pending mods)
@@ -498,6 +622,11 @@ struct EffectInst {
   SpellVerb verb = SpellVerb::None;
   int glyph = -1;            // the glyph that authored it (parameters)
   int32_t n = 1;             // multiplicity: the verb's declared scale axis ×n
+  // Magnitude, per-mille: the axis is scaled by n × mag / 1000 (`Scale()`).
+  int32_t mag = kMagOne;
+  // When it fires in its carrier (M3). Only a FLIGHT carrier's resolve filters
+  // by it; the delay is honoured everywhere, by ApplySpellEffect.
+  SpellTiming timing;
   bool complete = true;      // false: incomplete operator, charged, does nothing
   // Materials. spray/place/mend use matA; convert is matA -> matB.
   uint32_t matA = 0, matB = 0;
@@ -517,7 +646,15 @@ struct EffectInst {
   ModOp modOp = ModOp::Mul;
   int32_t modAmount = 0;
   int32_t modN = 1;
+  int32_t modMag = kMagOne;  // the sustained mod's magnitude
   int node = -1;             // tree node, for the readout
+
+  // THE EFFECTIVE SCALE, per-mille: multiplicity × magnitude. 1000·n exactly
+  // when no magnitude was set.
+  int32_t Scale() const {
+    const int64_t v = (int64_t)n * mag;
+    return v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)v;
+  }
 };
 
 struct SpellLane;
@@ -706,6 +843,7 @@ struct SpellProjectile {
   bool resting = false;
   bool alive = true;
   int32_t gen = 0;
+  int32_t age = 0;           // ticks of flight, for `every` items (M3)
   // The cast's instability, carried to the impact: an unstable convert lands
   // a melt-mode share wherever it resolves, not only at the hand.
   int32_t instability = 0;
@@ -746,6 +884,7 @@ struct SpellBomb {
   int32_t instability = 0;
   int32_t gen = 0;
   uint64_t casterId = 0;
+  int32_t age = 0;           // ticks alive, for `every` items (M3)
 };
 
 // What the VM may ask the owner about bodies, one tick latent, without knowing

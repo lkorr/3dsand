@@ -2430,7 +2430,15 @@ Status GateZombieDraw(Ctx& c, std::string& detail) {
     // correct measurement of nothing and hides WHICH of the two went: the prey
     // dying of its own bites is the feature working, the biter vanishing is a
     // broken fixture. Both are counted and said out loud.
-    if (m == nullptr) { goneBiter++; continue; }
+    if (m == nullptr) {
+      // SAY WHY, once: a husk sweep, a turn (TurnMob re-spawns under a new id)
+      // and a death are three different bugs and a count names none of them.
+      if (goneBiter++ == 0)
+        std::printf("zombie-draw: biter left at tick %d: death cause \"%s\", "
+                    "%u mobs remain\n",
+                    i, c.mobs.DeathCause(biter), c.mobs.MobCount());
+      continue;
+    }
     if (p == nullptr) { gonePrey++; continue; }
     alive++;
     const Vec3 d = m->Origin() - p->Origin();

@@ -5,10 +5,20 @@
       "note": "-------- fire: short-lived rising flame; doused by water --------"
     },
     {
+      "note": "-------- RAIN (weather::SimRainWord, TickParams.weatherRain) --------\nEvery burning material carries a \"rain\" douse beside its extinguisher douse: it fires only on a rain-exposed cell (it sees the sky, or a side face opens onto a cell that does) while it rains, at chance x (rain/255)^2 -- so a drizzle barely touches a fire and a storm puts it out. The product is the extinguisher's product. The other half is \"rainDamped\" on every COMBUSTION ignition (tag:hot rules on fuel; not water boiling, ice melting or flesh searing): on an exposed cell its chance is cut by max(rain, ground wetness) x weather.rainIgniteDamp, so rain slows a fire's spread at once and wet ground stays slow to catch for about weather.drySeconds after. Bodies and limbs count as exposed (sim/reactcpu.h)."
+    },
+    {
       "self": "fire",
       "neighbor": "tag:extinguisher",
       "chance": 400,
       "selfBecomes": "smoke"
+    },
+    {
+      "self": "fire",
+      "decay": true,
+      "rain": true,
+      "chance": 120,
+      "becomes": "smoke"
     },
     {
       "self": "fire",
@@ -53,6 +63,7 @@
       "self": "wood",
       "neighbor": "tag:hot",
       "chance": 12,
+      "rainDamped": true,
       "selfBecomes": "ember",
       "neighborChance": {
         "fire": 0.0625
@@ -62,6 +73,7 @@
       "self": "birch_wood",
       "neighbor": "tag:hot",
       "chance": 15,
+      "rainDamped": true,
       "selfBecomes": "ember",
       "neighborChance": {
         "fire": 0.0625
@@ -74,6 +86,7 @@
       "self": "leaves",
       "neighbor": "tag:hot",
       "chance": 133,
+      "rainDamped": true,
       "selfBecomes": "leaf_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -83,6 +96,7 @@
       "self": "pine_needles",
       "neighbor": "tag:hot",
       "chance": 133,
+      "rainDamped": true,
       "selfBecomes": "pine_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -92,6 +106,7 @@
       "self": "autumn_leaves",
       "neighbor": "tag:hot",
       "chance": 133,
+      "rainDamped": true,
       "selfBecomes": "autumn_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -104,6 +119,7 @@
       "self": "leaves_dark",
       "neighbor": "tag:hot",
       "chance": 133,
+      "rainDamped": true,
       "selfBecomes": "leaf_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -113,6 +129,7 @@
       "self": "leaves_lit",
       "neighbor": "tag:hot",
       "chance": 133,
+      "rainDamped": true,
       "selfBecomes": "leaf_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -122,6 +139,7 @@
       "self": "pine_dark",
       "neighbor": "tag:hot",
       "chance": 133,
+      "rainDamped": true,
       "selfBecomes": "pine_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -131,6 +149,7 @@
       "self": "pine_lit",
       "neighbor": "tag:hot",
       "chance": 133,
+      "rainDamped": true,
       "selfBecomes": "pine_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -140,6 +159,7 @@
       "self": "autumn_dark",
       "neighbor": "tag:hot",
       "chance": 133,
+      "rainDamped": true,
       "selfBecomes": "autumn_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -149,6 +169,7 @@
       "self": "autumn_lit",
       "neighbor": "tag:hot",
       "chance": 133,
+      "rainDamped": true,
       "selfBecomes": "autumn_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -158,6 +179,7 @@
       "self": "bark_dark",
       "neighbor": "tag:hot",
       "chance": 12,
+      "rainDamped": true,
       "selfBecomes": "ember",
       "neighborChance": {
         "fire": 0.0625
@@ -167,6 +189,7 @@
       "self": "bark_light",
       "neighbor": "tag:hot",
       "chance": 12,
+      "rainDamped": true,
       "selfBecomes": "ember",
       "neighborChance": {
         "fire": 0.0625
@@ -180,6 +203,13 @@
       "neighbor": "tag:extinguisher",
       "chance": 400,
       "selfBecomes": "air"
+    },
+    {
+      "self": "leaf_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 60,
+      "becomes": "air"
     },
     {
       "note": "THE THREE EMIT RULES ARE ONE RULE WITH A PREFERENCE, and the shape is load-bearing. An emit rule only fires into an AIR neighbour: sim_step.wgsl's RK_EMIT arm scans the allowed directions and falls through to the next rule when none of them is air. So `up` is tried first and gets the whole chance whenever the flame has somewhere to go, which keeps a burning crown looking like a burning crown; and when the cell above is more canopy -- i.e. exactly in the interior, where the old model delivered no heat downward at all -- the up rule is skipped entirely and the down and side rules get their full roll. The flame licks down only where it cannot go up, which is both the right picture and the cheap one.\n\nDown at half of up rather than at parity because this is still fire: the asymmetry is real physics, it just should not have been TOTAL. The old model was 90:0."
@@ -227,6 +257,13 @@
     },
     {
       "self": "pine_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 60,
+      "becomes": "air"
+    },
+    {
+      "self": "pine_burning",
       "emit": "fire",
       "dir": "up",
       "chance": 70
@@ -265,6 +302,13 @@
     },
     {
       "self": "autumn_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 60,
+      "becomes": "air"
+    },
+    {
+      "self": "autumn_burning",
       "emit": "fire",
       "dir": "up",
       "chance": 70
@@ -299,6 +343,7 @@
       "self": "grass",
       "neighbor": "tag:hot",
       "chance": 220,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -308,6 +353,7 @@
       "self": "petal",
       "neighbor": "tag:hot",
       "chance": 300,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -317,6 +363,7 @@
       "self": "oil",
       "neighbor": "tag:hot",
       "chance": 350,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -326,6 +373,7 @@
       "self": "dust",
       "neighbor": "tag:hot",
       "chance": 1000,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -335,6 +383,7 @@
       "self": "plant",
       "neighbor": "tag:hot",
       "chance": 250,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -344,6 +393,7 @@
       "self": "seed",
       "neighbor": "tag:hot",
       "chance": 400,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -353,6 +403,7 @@
       "self": "sprout",
       "neighbor": "tag:hot",
       "chance": 300,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -362,6 +413,7 @@
       "self": "stem",
       "neighbor": "tag:hot",
       "chance": 300,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -371,6 +423,7 @@
       "self": "flower",
       "neighbor": "tag:hot",
       "chance": 300,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -380,6 +433,7 @@
       "self": "vine",
       "neighbor": "tag:hot",
       "chance": 300,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -389,6 +443,7 @@
       "self": "fungus",
       "neighbor": "tag:hot",
       "chance": 350,
+      "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
         "fire": 0.0625
@@ -402,6 +457,13 @@
       "neighbor": "tag:extinguisher",
       "chance": 250,
       "selfBecomes": "wood"
+    },
+    {
+      "self": "ember",
+      "decay": true,
+      "rain": true,
+      "chance": 30,
+      "becomes": "wood"
     },
     {
       "note": "EVERY EMIT RULE IN THIS FILE USED TO BE dir:up, AND THAT WAS THE BUG. Combined with `fire` being a gas that rises with probability 1 in calm air (gasIntent, sim_step.wgsl), it meant the world had no downward heat path of any kind: the only thing that ever warmed a voxel from above was a stationary tag:hot SOLID touching it directly. Owner report, two symptoms, one cause -- a lit tree cooks the top of its crown and ignores the bottom layer of leaves, and a character whose torso burns through never lights his own legs.\n\nSo every up-emit below now has a down sibling at half its chance. The half is not timidity, it is the physics being restored to an asymmetry instead of an absolute: fire really does prefer to go up, it just does not refuse to go down.\n\nWHY THE ORDER IS SAFE. RK_EMIT only fires into an AIR neighbour and falls through to the next rule when no allowed direction is air, so `up` first costs the down rule nothing in the case that matters -- a flame with fuel or ground above it skips the up rule entirely and the down rule rolls at full chance. In the open the up rule wins most ticks and the flame still reads as rising. One caveat worth recording because the two evaluators differ here: MobSystem::BurnOneLimb's emit arm does NOT test the target for air before consuming the rule (it relies on kCellOpIfAir downstream), so on a BODY the down rule gets the residual ~93% of its chance rather than the full amount. That is still hundreds of fire voxels a tick under a burning torso, which is what reaches the legs -- the limb lattices cannot see each other at all, so the world grid is the only channel between them."
@@ -470,6 +532,15 @@
       "neighborBecomes": "molten_glass"
     },
     {
+      "note": "Lava BURNS AWAY organic matter it touches (2026-09-23): flesh, cloth, leaves, grass go up as flame outright rather than only being ignited through their own tag:hot rules. This is what makes a lava coat on a body DISINTEGRATE it (mob.cpp BurnOneLimb section 3 runs the coat's own rules against the voxel under it) and what makes wading in a pool eat the feet (section 2). Bounded like every contact rule: it consumes what it touches and grows nothing."
+    },
+    {
+      "self": "lava",
+      "neighbor": "tag:organic",
+      "chance": 60,
+      "neighborBecomes": "fire"
+    },
+    {
       "note": "-------- molten glass: cools to glass, quenched instantly by water --------"
     },
     {
@@ -500,10 +571,10 @@
       "neighborBecomes": "sand"
     },
     {
-      "note": "ACID EATS MEAT FAR FASTER THAN IT EATS ROCK, and this is the rule that says so. Ordered BEFORE the generic tag:dissolvable rule below, per the file's specific-before-generic convention, so mineral erosion keeps its old slow chain and only organics get the fast one.\n\nWHY IT MATTERS OUT OF PROPORTION TO ITS SIZE: this rule reaches a BODY. mob.cpp's inbound pass evaluates acid's own rules FROM the grid cell ONTO each body voxel it touches (the same direction the GPU evaluates them), so skin, flesh, bone, cloth and leather -- all tag:organic -- are eaten by this line and by nothing that had to be written for them. At the old shared 45 per-mille a limb at skinScale 8 lost about 4.5% of ONE sub-voxel layer per tick, roughly two seconds per layer and the better part of a minute for an arm, which is what 'acid does not do nearly enough damage' actually was. At 250 a layer goes in about ten ticks.\n\nSteel is unaffected because `steel` carries no tag:organic and no tag:dissolvable -- armour still protects, and still for the reason equipment.h states: not a resist number, an absence of the tag.",
+      "note": "ACID EATS MEAT FAR FASTER THAN IT EATS ROCK, and this is the rule that says so. Ordered BEFORE the generic tag:dissolvable rule below, per the file's specific-before-generic convention, so mineral erosion keeps its old slow chain and only organics get the fast one.\n\nWHY IT MATTERS OUT OF PROPORTION TO ITS SIZE: this rule reaches a BODY. mob.cpp's inbound pass evaluates acid's own rules FROM the grid cell ONTO each body voxel it touches (the same direction the GPU evaluates them), so skin, flesh, bone, cloth and leather -- all tag:organic -- are eaten by this line and by nothing that had to be written for them. At the old shared 45 per-mille a limb at skinScale 8 lost about 4.5% of ONE sub-voxel layer per tick, roughly two seconds per layer and the better part of a minute for an arm, which is what 'acid does not do nearly enough damage' actually was. At 250 a layer went in about ten ticks; halved to 125 (owner, 2026-09-23: disintegrates flesh twice too fast), about twenty -- still five times rock's 25.\n\nSteel is unaffected because `steel` carries no tag:organic and no tag:dissolvable -- armour still protects, and still for the reason equipment.h states: not a resist number, an absence of the tag.",
       "self": "acid",
       "neighbor": "tag:organic",
-      "chance": 250,
+      "chance": 125,
       "neighborBecomes": "air"
     },
     {
@@ -908,6 +979,7 @@
       "self": "cloth",
       "neighbor": "tag:hot",
       "chance": 200,
+      "rainDamped": true,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -917,6 +989,7 @@
       "self": "robe_trim",
       "neighbor": "tag:hot",
       "chance": 200,
+      "rainDamped": true,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -926,6 +999,7 @@
       "self": "robe_shadow",
       "neighbor": "tag:hot",
       "chance": 200,
+      "rainDamped": true,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -938,6 +1012,7 @@
       "self": "leather",
       "neighbor": "tag:hot",
       "chance": 25,
+      "rainDamped": true,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -947,6 +1022,7 @@
       "self": "grip_leather",
       "neighbor": "tag:hot",
       "chance": 25,
+      "rainDamped": true,
       "selfBecomes": "cloth_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -960,6 +1036,13 @@
       "neighbor": "tag:extinguisher",
       "chance": 450,
       "selfBecomes": "cloth_charred"
+    },
+    {
+      "self": "cloth_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 40,
+      "becomes": "cloth_charred"
     },
     {
       "self": "cloth_burning",
@@ -1016,6 +1099,7 @@
       "self": "hair_white",
       "neighbor": "tag:hot",
       "chance": 600,
+      "rainDamped": true,
       "selfBecomes": "hair_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -1026,6 +1110,13 @@
       "neighbor": "tag:extinguisher",
       "chance": 600,
       "selfBecomes": "air"
+    },
+    {
+      "self": "hair_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 60,
+      "becomes": "air"
     },
     {
       "self": "hair_burning",
@@ -1053,6 +1144,7 @@
       "self": "linen",
       "neighbor": "tag:hot",
       "chance": 200,
+      "rainDamped": true,
       "selfBecomes": "linen_burning",
       "neighborChance": {
         "fire": 0.0625
@@ -1063,6 +1155,13 @@
       "neighbor": "tag:extinguisher",
       "chance": 450,
       "selfBecomes": "linen_charred"
+    },
+    {
+      "self": "linen_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 40,
+      "becomes": "linen_charred"
     },
     {
       "self": "linen_burning",
@@ -1092,16 +1191,19 @@
     {
       "self": "skin",
       "neighbor": "tag:hot",
-      "chance": 90,
+      "chance": 63,
       "selfBecomes": "flesh_cooked"
     },
     {
       "note": "ON A BODY THE COUNT IS TAKEN AT WORLD PITCH, and without that this minCount means something entirely different from what the paragraph above says.\n\nIn the grid, fire and flesh are cells of the same size, so \"three of my six faces are hot\" really is \"I am half-surrounded by fire\". A mob or the player is a lattice EIGHT TIMES FINER (skinScale 8), and five of a skin sub-voxel's six faces are its own flesh however large the fire outside is -- so the count is 1 on a flat surface, 2 on a convex edge, and reaches 3 only on a convex CORNER. Measured over a 90-tick immersion of the bare `human` rig: world-facing faces 0:711k 1:465k 2:190k 3:26k, 92% of every ignition roll refused, 11 of 22,775 flesh voxels lost. On screen that is a character who sears brown all over and turns black ONLY along the outlines of its limbs.\n\nSo MobSystem::BurnOneLimb reads the four world cells TANGENTIAL to each exposed face and lets that face count for as much as the fire against it is WIDE (1..5), taken as a max against the ordinary lattice count. One cell of flame is still 1 and still gutters out -- the claim the paragraph above makes is intact, and is now true of bodies as well as of the grid -- while a wall of flame is 5 and takes hold. That is a change to WHERE THE SIX NEIGHBOURS COME FROM, which sim/reactcpu.h names as the one part of the two evaluators that legitimately differs; every authored number here, including this minCount, is untouched and shared. 9.8% -> 23.7% of flesh past the sear at 90 ticks, 45% cinder at 400. Guarded by mobBurnFleshCharPctMin in tests/baseline.json, which exists because the gate counted flesh_cooked -- a SEAR at one hot face, not combustion -- as \"charred\", so a body that only seared scored the same as one that burned."
     },
     {
+      "note": "FLESH 30% LESS FLAMMABLE (owner, 2026-09-23): BOTH doors into the chain take the same 0.7 -- the sear 90 -> 63 on skin, flesh and muscle, and this ignition 390 -> 273 -- because either one alone moves only half of 'how fast a body catches'. The sear paces a body under a real fire (the ignition saturates at a full front either way), the ignition is what a partial front (3..4 hot faces) rolls against. Cloth still catches at ~3x flesh's sear. The 90 / 390 figures in the two notes above are the history; these are the numbers."
+    },
+    {
       "self": "flesh_cooked",
       "decay": true,
-      "chance": 390,
+      "chance": 273,
       "becomes": "flesh_burning",
       "scaleByNeighbors": {
         "neighbor": "tag:hot",
@@ -1117,6 +1219,13 @@
       "neighbor": "tag:extinguisher",
       "chance": 500,
       "selfBecomes": "flesh_charred"
+    },
+    {
+      "self": "flesh_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 25,
+      "becomes": "flesh_charred"
     },
     {
       "self": "flesh_burning",
@@ -1174,12 +1283,88 @@
       }
     },
     {
+      "note": "-------- UNDERCLOTH: the base human's shorts, which BURN AS FLESH and still read as shorts --------\nThe human's underwear used to be `linen`, which is also the peasant wardrobe's cloth, so it caught at cloth's rate (200 vs skin's sear) and burned as a garment. Owner, 2026-09-23: it should be flesh in every respect but its look. So it is its own chain that copies flesh's NUMBERS rule for rule -- sear 63, ignition 273 at minCount 3 / scaleMax 4, 500 douse, 70/35 emit, 50 per-mille burn to char, 20 cinder, 8 relight at minCount 4 -- through stages that keep linen's colours, so a torched character still shows scorched shorts rather than reading naked at the first sear (the reason linen got its own id in the first place). Two deliberate differences, both visual: the 0.53 per-mille ash branch is folded into the char branch (a garment that falls away as ash is the naked read again), and the cinder terminus is linen_charred (no rules, so it is exactly as inert as flesh_cinder).\n\nThe .vox still paints the shorts as `linen` -- a new id is past the 127-entry palette ceiling -- and the human sidecar's `anatomy.garmentsBecome` rewrites them to `undercloth` at load (MobSystem, after anatomy::Resolve). Keep these numbers in step with the flesh chain above: they are a copy, not a reference."
+    },
+    {
+      "self": "undercloth",
+      "neighbor": "tag:hot",
+      "chance": 63,
+      "selfBecomes": "undercloth_seared"
+    },
+    {
+      "self": "undercloth_seared",
+      "decay": true,
+      "chance": 273,
+      "becomes": "undercloth_burning",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "minCount": 3,
+        "scaleMax": 4
+      }
+    },
+    {
+      "self": "undercloth_burning",
+      "neighbor": "tag:extinguisher",
+      "chance": 500,
+      "selfBecomes": "undercloth_charred"
+    },
+    {
+      "self": "undercloth_burning",
+      "decay": true,
+      "rain": true,
+      "chance": 40,
+      "becomes": "undercloth_charred"
+    },
+    {
+      "self": "undercloth_burning",
+      "emit": "fire",
+      "dir": "up",
+      "chance": 70
+    },
+    {
+      "self": "undercloth_burning",
+      "emit": "fire",
+      "dir": "down",
+      "chance": 35
+    },
+    {
+      "self": "undercloth_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 50,
+      "becomes": "undercloth_charred"
+    },
+    {
+      "self": "undercloth_charred",
+      "decay": true,
+      "chance": 20,
+      "becomes": "linen_charred",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "minCount": 3,
+        "scaleMax": 3
+      }
+    },
+    {
+      "self": "undercloth_charred",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 8,
+      "becomes": "undercloth_burning",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "minCount": 4,
+        "scaleMax": 2
+      }
+    },
+    {
       "note": "A dropped wooden staff is a debris body with a micro brick and BurnBodies runs this table over it, so 'fire lights the item you dropped' costs exactly this one rule."
     },
     {
       "self": "staff_wood",
       "neighbor": "tag:hot",
       "chance": 11,
+      "rainDamped": true,
       "selfBecomes": "ember",
       "neighborChance": {
         "fire": 0.0625
@@ -1191,13 +1376,13 @@
     {
       "self": "flesh",
       "neighbor": "tag:hot",
-      "chance": 90,
+      "chance": 63,
       "selfBecomes": "flesh_cooked"
     },
     {
       "self": "muscle",
       "neighbor": "tag:hot",
-      "chance": 90,
+      "chance": 63,
       "selfBecomes": "flesh_cooked"
     },
     {
@@ -1220,6 +1405,13 @@
     {
       "self": "rotflesh",
       "neighbor": "muscle",
+      "chance": 1,
+      "infectSpread": true,
+      "neighborBecomes": "rotflesh"
+    },
+    {
+      "self": "rotflesh",
+      "neighbor": "undercloth",
       "chance": 1,
       "infectSpread": true,
       "neighborBecomes": "rotflesh"

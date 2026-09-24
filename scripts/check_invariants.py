@@ -2078,13 +2078,14 @@ def check_scoop_ledger():
                             f"sim_mutate.wgsl {wgsl} = {b.group(1)}")
     # ...and the poured-particle bit, same shape: world.h <-> sim_particle.wgsl.
     sp = read("assets/shaders/sim_particle.wgsl")
-    a = re.search(r"constexpr\s+uint32_t\s+kPFlagCalm\s*=\s*(\d+)u", wh)
-    b = re.search(r"const\s+PFLAG_CALM\s*:\s*u32\s*=\s*(\d+)u", sp or "")
-    if not a or not b:
-        problems.append("calm flag: kPFlagCalm / PFLAG_CALM not found")
-    elif a.group(1) != b.group(1):
-        problems.append(f"calm flag: world.h kPFlagCalm = {a.group(1)} but "
-                        f"sim_particle.wgsl PFLAG_CALM = {b.group(1)}")
+    for cpp, wgsl in (("kPFlagCalm", "PFLAG_CALM"), ("kPFlagDrip", "PFLAG_DRIP")):
+        a = re.search(r"constexpr\s+uint32_t\s+" + cpp + r"\s*=\s*(\d+)u", wh)
+        b = re.search(r"const\s+" + wgsl + r"\s*:\s*u32\s*=\s*(\d+)u", sp or "")
+        if not a or not b:
+            problems.append(f"particle flag: {cpp} / {wgsl} not found")
+        elif a.group(1) != b.group(1):
+            problems.append(f"particle flag: world.h {cpp} = {a.group(1)} but "
+                            f"sim_particle.wgsl {wgsl} = {b.group(1)}")
     w = re.search(r"constexpr\s+uint32_t\s+kPageFaultWords\s*=\s*(\d+)", wh)
     e = re.search(r"constexpr\s+uint32_t\s+kPageFaultScoopRefused\s*=\s*(\d+)", wh)
     if w and e and int(e.group(1)) >= int(w.group(1)):

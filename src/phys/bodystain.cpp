@@ -14,6 +14,18 @@ uint16_t RaiseBodyStain(uint16_t cur, uint32_t mat, uint32_t amt) {
   return amt > curAmt ? PackBodyStain(mat, amt) : cur;
 }
 
+uint16_t WashBodyStain(uint16_t cur, uint32_t washMat, uint32_t wetAmt,
+                       uint32_t rinse) {
+  if (washMat == 0) return cur;
+  const uint32_t curAmt = BodyStainAmt(cur), curMat = BodyStainMat(cur);
+  if (curAmt != 0 && curMat != washMat) {
+    if (curAmt > rinse) return PackBodyStain(curMat, curAmt - rinse);
+    return PackBodyStain(washMat, wetAmt);  // amount 0 packs as clean
+  }
+  if (wetAmt == 0) return cur;
+  return PackBodyStain(washMat, std::max(curAmt, wetAmt));
+}
+
 uint16_t AddBodyStain(uint16_t cur, uint32_t mat, uint32_t add, uint32_t cap) {
   if (add == 0 || mat == 0) return cur;
   cap = std::min<uint32_t>(cap, kBodyStainAmtMax);
