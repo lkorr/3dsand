@@ -473,7 +473,9 @@ void Recorder::RecordTable(pass::Table which, const RecordCtx& cx) {
       TimerClose();  // a Fill/Copy row ends the open Dawn pass; mirror it
       ApplyUses(r.uses, r.useCount, /*global=*/false);
       Buffer* b = bind_.buffers[(int)r.uses[0].buf];
-      if (b && b->buf) f.CmdFillBuffer(cmd_, b->buf, 0, VK_WHOLE_SIZE, 0);
+      // x = offset, y = size (0 = to the end): pass_table.h's Row.
+      if (b && b->buf)
+        f.CmdFillBuffer(cmd_, b->buf, r.x, r.y ? (VkDeviceSize)r.y : VK_WHOLE_SIZE, 0);
       stats_.fills++;
       continue;
     }

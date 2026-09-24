@@ -2638,6 +2638,11 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   cx.gasActive = gasOn && (cx.caActive || gasSpawnsThisTick_ > 0 ||
                            gasLive_ > 0 || gasIdleTicks_ < kGasIdleTicks);
   gasSpawnsThisTick_ = 0;
+  // pass_table.def's fill_gasSpawn clears the HEADER only, by a literal byte
+  // count (pass_table.cpp does not see world.h). Keep the two in step.
+  static_assert(kGasSpHdrBytes == 64,
+                "fill_gasSpawn's size (pass_table.def, 0,64,0) is the gasSpawn "
+                "header: update the row with the header");
 
   // ---- C_GASFAR: the frozen fires, which are NOT a parcel population -------
   //
@@ -2714,6 +2719,18 @@ void Simulation::EncodeTick(const rhi::CommandEncoder& enc, uint32_t opsCount,
   // does, the emitted dirt keeps caActive true until the readback catches
   // up, so this predicate can never strand live particles unsimulated).
   // Every input here is tick-deterministic — never frame timing (rule 1).
+  //
+  // THE NO-WATER TICK. Because excite can create particles the CPU cannot see
+  // yet, the tables are recorded on every CA-awake tick whether or not any
+  // water exists, so what they cost with FA_LIVE == 0 is a standing cost of
+  // the CA itself. It is kept near the dispatch floor on the GPU side: no
+  // scratch or map Fills (each region is cleared by its last reader), every
+  // per-particle / per-block row dispatches off a GPU-written count that is
+  // zero, and the fixed-shape rows (alloc, exciteScan, settleJudge,
+  // settleScan, mirrorFold) skip their slot walks when nothing is or was live.
+  // What remains is exciteDetect over this tick's dirty chunks (real work:
+  // it is the excite trigger) plus ~55 dispatches — 36 of them the substep
+  // table's four rows x 9 — that are empty, one workgroup, or an early-out.
   const bool exciteOn = CurrentTuning().sim.fluidExciteMode != 0;
   const bool seamActive =
       fluidCount > 0 || fluidSpawnCount > 0 || (exciteOn && cx.caActive);

@@ -15,7 +15,7 @@
 //
 // THE TICK (recorded from EncodeTick around the solver substeps):
 //   PT_FLUID_SEAM (before the substeps):
-//     fill scratch -> compactCount/Scan/Scatter (ping-pong, removes corpses)
+//     compactCount/Scan/Scatter (ping-pong, removes corpses)
 //     -> spawnAppend (CPU ops) -> exciteDetect (dirty chunks: mark candidate
 //     cells in voxel bits 19..23) -> exciteScan (slot-order budget + offsets)
 //     -> exciteEmit (particles born, voxels cleared, marks consumed)
@@ -90,14 +90,18 @@ const PT_KERNEL : u32 = PT_K_FLUIDSEAM;
 @group(1) @binding(6) var<storage, read_write> dirtyList : array<u32>;
 // Excite scratch: [0..15] header, then per-slot candidate-particle counts,
 // per-slot emission bases (EX_REFUSED = budget refusal), then the candidate
-// slot list in slot order. Fill-cleared at the top of every seam tick.
+// slot list in slot order. NOT fill-cleared: the counts are zeroed by
+// exciteScan as it consumes them, and every other word is written before it
+// is read (see exciteScan).
 @group(1) @binding(7) var<storage, read_write> exciteScratch : array<atomic<u32>>;
 // Per-slot consecutive-calm-tick counters. PERSISTENT (not fill-cleared);
 // zeroed by worldgen/reset and whenever a slot has no particles.
 @group(1) @binding(8) var<storage, read_write> fluidCalm : array<atomic<u32>>;
 // Settle scratch: per-slot speed maxima, per-slot marks, the settle list
 // header, then kFluidSettleMax blocks of per-cell (eighths, mat|stain) bins.
-// Fill-cleared at the top of every seam tick.
+// NOT fill-cleared: each region is zeroed by its last reader — speeds by
+// settleJudge, marks by the next settleScan, bins by settleCommit — so the
+// buffer is all-zero outside its own producer -> consumer windows.
 @group(1) @binding(9) var<storage, read_write> settleScratch : array<atomic<u32>>;
 // Compaction spans: [0..SPANS) survivor count per 256-particle span,
 // [SPANS..2*SPANS) exclusive bases. Rewritten every tick before use.
@@ -105,8 +109,9 @@ const PT_KERNEL : u32 = PT_K_FLUIDSEAM;
 // Per active-block cell (2 words, world.h layout): [0] the intent word the
 // seam writes for the CA — the cell's fluid material + carried stain — and
 // [1] the flags the CA writes back (bit0: a reaction consumed this cell's
-// excited fluid). Fill-cleared at the head of the settle phase, so the CA
-// always reads LAST tick's intents (one tick latent, deterministic).
+// excited fluid). Cleared (cellClear, over the active blocks) at the head of
+// the settle phase, so the CA always reads LAST tick's intents (one tick
+// latent, deterministic).
 @group(1) @binding(11) var<storage, read_write> fluidCellScratch : array<atomic<u32>>;
 // blockIdx -> chunk slot, from the last substep's alloc. read_write to match
 // the solver's shared entry; this shader only reads.
@@ -139,7 +144,23 @@ const SETTLE_MAX : u32 = 16u;                      // kFluidSettleMax
 // bits each. Feasibility refusal stays whole-block (see settleCheck), but
 // instability is a property of ONE column and is refused at that granularity.
 const SP_COLBAD : u32 = SP_BINS + SETTLE_MAX * CHUNK_VOL * 2u;  // + listIdx*8
-const SP_SCRATCH_WORDS : u32 = SP_COLBAD + SETTLE_MAX * 8u;
+// Two SLEEP FLAGS, written by settleScan (thread 0) every settle tick:
+//   SP_LIVEFLAG = "FA_LIVE was non-zero at the last settle", i.e. fluidCalm
+//                 may hold non-zero counters and fluidMirror non-zero bytes;
+//   SP_LIVEPREV = the same flag one settle earlier.
+// settleJudge runs BEFORE settleScan and so reads LIVEFLAG as "last tick";
+// mirrorFold runs AFTER it and reads LIVEPREV for the same question. Both are
+// zero in a freshly created (zero-initialised) buffer, which is the state a
+// never-used fluidCalm (worldgen/reset Fill it) and fluidMirror are in.
+const SP_LIVEFLAG : u32 = SP_COLBAD + SETTLE_MAX * 8u;
+const SP_LIVEPREV : u32 = SP_LIVEFLAG + 1u;
+const SP_SCRATCH_WORDS : u32 = SP_LIVEPREV + 1u;   // world.cpp sizes by this
+// settleBin / settleKill's indirect args, staged by pass_table's
+// copy_settleArgs row. They live in the EXCITE scratch header (a free triple,
+// fixed byte offset 32 — the copy row names it) because that buffer is
+// already a transfer source and this one is not. {groups, 1, 1} with groups =
+// the per-particle count when a block was picked, 0 when none was.
+const EX_SETTLE_ARGS : u32 = 8u;   // [8..10]
 const MARK_SETTLING : u32 = 0x80000000u;
 const MARK_REFUSED : u32 = 0x40000000u;
 // This block was picked by settleScan's FORCED phase, not its calm one: its
@@ -210,6 +231,9 @@ const SEAM_CA_SPREAD_MIN : u32 = 2u * clamp(TUNE_LIQUID_MIN_FILM, 1u, 4u);
 // and a genuinely falling particle keeps all but one substep of its speed.
 // The bias was also why settleEps had to be re-scaled with gravity at all;
 // with it gone the threshold means the same thing at any g.
+// DERIVED, not restated: the expression is sim_fluid.wgsl's FLUID_GRAVITY /
+// FLUID_SUBSTEPS term by term — the exact value gridUpdate subtracts per
+// substep — so it cannot drift from the bias it removes.
 const SEAM_GRAV_SUB : i32 =
     i32(round(TUNE_FLUID_GRAVITY * 65536.0 / 900.0)) / FLUID_SUBSTEPS;
 fn seamRestVy(vy : i32) -> i32 { return min(abs(vy + SEAM_GRAV_SUB), abs(vy)); }
@@ -220,8 +244,17 @@ const SEAM_HYDRO : i32 = clamp(
     i32(round(TUNE_FLUID_GRAVITY * TUNE_FLUID_REST_DENSITY /
               max(TUNE_FLUID_STIFFNESS, 1.0) * 65536.0)),
     0, 8192);
-// The deepest J the 4-bit depth field can express — matches FLUID_JMIN's band.
+// The floor on the seeded J (0.70 in Q16), however deep the 4-bit depth field
+// says the cell sat. It does NOT match sim_fluid.wgsl's FLUID_JMIN (0.60, the
+// solver's clamp): it sits deliberately inside that band, so a freshly
+// excited particle never starts ON the clamp rail and g2p's relax-toward-1
+// has room to work in both directions.
 const SEAM_JFLOOR : i32 = 45875;   // 0.70 in Q16
+// sim_fluid.wgsl's FLUID_MASS_MIN (Q10, ~0.016 particle masses): below it a
+// node carries no meaningful velocity. Restated here because the two modules
+// are compiled separately and the constant is not in common.wgsl (a
+// common.wgsl edit re-keys every shader). Keep the two equal.
+const SEAM_MASS_MIN : i32 = 16;
 
 // Same node addressing as the solver (kept in step by hand — the two modules
 // read the same buffers).
@@ -691,20 +724,71 @@ fn seamDrainShellHit(c : vec3<i32>, mat : u32) -> bool {
 // aligned word does not tear on any device this engine targets (the same
 // word-atomicity the particle system's landing writes already lean on). The
 // OUTCOME is therefore a pure function of pre-seam state — rule 1 holds.
+//
+// WORKGROUP-LEVEL WORK, done once instead of per cell (all of it is a pure
+// function of pre-seam state, so hoisting it cannot change an outcome):
+//   * The three per-cell counters (FA_EXSEEN, FA_EXCANDID and this chunk's
+//     EX_COUNTS slot) were global atomics on ONE address each, hit by every
+//     liquid cell of a lake chunk — thousands of serialized read-modify-writes
+//     per workgroup. Each thread now sums its own 16 cells, the workgroup folds
+//     those in workgroup memory, and thread 0 publishes one add per word.
+//     Integer addition is associative: the words are unchanged (rule 1).
+//   * The wake trigger's six face-neighbour probes each did worldChunkOf +
+//     chunkSlotOf + a block-map load, per liquid cell. A face neighbour of a
+//     cell in this chunk lies in this chunk or in ONE of its six face chunks,
+//     so the seven block-map entries are read once into workgroup memory
+//     (exdNb) and a whole workgroup with no block anywhere in reach skips the
+//     probe outright — the common case: settled water with no solver nearby.
+var<workgroup> exdSeen : atomic<u32>;
+var<workgroup> exdCand : atomic<u32>;
+var<workgroup> exdParts : atomic<u32>;
+// [0] this chunk's block; [1 + f] the block of face f's chunk, f in the wake
+// loop's order +x, -x, +y, -y, +z, -z.
+var<workgroup> exdNb : array<u32, 7>;
+
+// The chunk of face direction f (0..5 = +x, -x, +y, -y, +z, -z), or the
+// chunk itself for f = 6. Only used to fill exdNb.
+fn exdFaceChunk(wc : vec3<i32>, f : u32) -> vec3<i32> {
+  var d = vec3<i32>(0, 0, 0);
+  if (f == 0u) { d.x = 1; } else if (f == 1u) { d.x = -1; }
+  else if (f == 2u) { d.y = 1; } else if (f == 3u) { d.y = -1; }
+  else if (f == 4u) { d.z = 1; } else if (f == 5u) { d.z = -1; }
+  return wc + d;
+}
+
 @compute @workgroup_size(256)
 fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
                 @builtin(local_invocation_index) li : u32) {
   let ci = dirtyList[wg.x];
   let wc = slotWorldChunk(ci, T.origin);
   let base = wc * i32(CHUNK);
+  if (li == 0u) {
+    atomicStore(&exdSeen, 0u);
+    atomicStore(&exdCand, 0u);
+    atomicStore(&exdParts, 0u);
+  }
+  if (li < 7u) {
+    // li 0..5 = face chunks, li 6 = own chunk (stored at exdNb[0]).
+    let sl = chunkSlotOf(exdFaceChunk(wc, li), T.origin);
+    var bm = 0u;
+    if (sl != SLOT_NONE) { bm = atomicLoad(&fluidBlockMapR[sl]); }
+    exdNb[select(li + 1u, 0u, li == 6u)] = bm;
+  }
+  workgroupBarrier();
+  let anyNb = (exdNb[0] | exdNb[1] | exdNb[2] | exdNb[3] | exdNb[4] |
+               exdNb[5] | exdNb[6]) != 0u;
+  var seen = 0u;
+  var cand = 0u;
+  var parts = 0u;
   // Sentinel chunk: nothing to excite in a chunk with no page -- a uniform
   // interior has no exposed face by construction. Decided ONCE for the
   // workgroup (every cell of the chunk shares this entry) instead of by a
-  // page-table lookup per cell.
+  // page-table lookup per cell. Not an early `return`: the fold below has a
+  // barrier, and a storage read is non-uniform to the compiler.
   let pe = pageTable[ci];
-  if ((pe & PT_SENTINEL_BIT) != 0u) { return; }
+  let paged = (pe & PT_SENTINEL_BIT) == 0u;
   let pageBase = pe * CHUNK_VOL;
-  for (var s = 0u; s < 16u; s++) {
+  for (var s = 0u; s < 16u && paged; s++) {
     // LANE-CONSECUTIVE cells, so a warp's loads coalesce. It was li * 16 + s,
     // a 64-byte stride between lanes; measured on a forest fire (thousands of
     // awake smoke chunks, not one liquid cell among them) the pass cost
@@ -718,7 +802,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     let w = voxels[idx];
     let mat = voxMat(w);
     if (!seamLiquid(mat)) { continue; }
-    atomicAdd(&fluidArgs[FA_EXSEEN], 1u);   // reach probe, see common.wgsl
+    seen += 1u;   // FA_EXSEEN, the reach probe (common.wgsl); folded below
 
     // ---- SUBMERGED WATER IS FULL WATER, AND IT IS ALSO UNEXCITABLE --------
     //
@@ -842,20 +926,25 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     // threshold — the disturbance in the active region has reached this
     // settled cell. Fires only where MPM already exists, so a world that
     // never spawned fluid never runs this branch's body.
-    if (!excite) {
+    if (!excite && anyNb) {
       for (var f = 0u; f < 6u; f++) {
         var d = vec3<i32>(0, 0, 0);
         if (f == 0u) { d.x = 1; } else if (f == 1u) { d.x = -1; }
         else if (f == 2u) { d.y = 1; } else if (f == 3u) { d.y = -1; }
         else if (f == 4u) { d.z = 1; } else { d.z = -1; }
         let n = c + d;
-        let nwc = worldChunkOf(n);
-        let nsl = chunkSlotOf(nwc, T.origin);
-        if (nsl == SLOT_NONE) { continue; }
-        let bm = atomicLoad(&fluidBlockMapR[nsl]);
+        // The neighbour leaves this chunk only through the face it points at.
+        var crosses = false;
+        if (f == 0u) { crosses = lo.x == CHUNK_MASK; }
+        else if (f == 1u) { crosses = lo.x == 0; }
+        else if (f == 2u) { crosses = lo.y == CHUNK_MASK; }
+        else if (f == 3u) { crosses = lo.y == 0; }
+        else if (f == 4u) { crosses = lo.z == CHUNK_MASK; }
+        else { crosses = lo.z == 0; }
+        let bm = exdNb[select(0u, f + 1u, crosses)];
         if (bm == 0u) { continue; }
         let nb = seamNodeBase(bm, n);
-        if (fluidGridR[nb] < 16) { continue; }  // FLUID_MASS_MIN
+        if (fluidGridR[nb] < SEAM_MASS_MIN) { continue; }
         // Same free-surface gravity strip as the calm measure. Without it the
         // node just above any settled pool reads a full substep of gravity —
         // 100 vox/s at the owner's defaults, four times wakeSpeed — so the
@@ -871,7 +960,7 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       }
     }
     if (!excite) { continue; }
-    atomicAdd(&fluidArgs[FA_EXCANDID], 1u);
+    cand += 1u;   // FA_EXCANDID; folded below
 
     // Depth to the free surface: contiguous same-liquid cells above, capped
     // at the 4-bit field. Computed HERE, against pre-write state — emit runs
@@ -900,7 +989,19 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
     }
     voxels[idx] = (w & ~EXCITE_SCRATCH_BITS) | EXCITE_PEND_BIT |
                   (depth << EXCITE_DEPTH_SHIFT);
-    atomicAdd(&exciteScratch[EX_COUNTS + ci], voxState(w) + 1u);
+    parts += voxState(w) + 1u;   // this chunk's EX_COUNTS slot; folded below
+  }
+  if (seen != 0u) { atomicAdd(&exdSeen, seen); }
+  if (cand != 0u) { atomicAdd(&exdCand, cand); }
+  if (parts != 0u) { atomicAdd(&exdParts, parts); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let ns = atomicLoad(&exdSeen);
+    let nc = atomicLoad(&exdCand);
+    let np = atomicLoad(&exdParts);
+    if (ns != 0u) { atomicAdd(&fluidArgs[FA_EXSEEN], ns); }
+    if (nc != 0u) { atomicAdd(&fluidArgs[FA_EXCANDID], nc); }
+    if (np != 0u) { atomicAdd(&exciteScratch[EX_COUNTS + ci], np); }
   }
 }
 
@@ -917,14 +1018,33 @@ var<workgroup> exBaseAt : array<u32, 256>;  // particle base at span start
 var<workgroup> exCrossSerial : u32;         // span containing the cutoff
 var<workgroup> exBudget : u32;
 
+//
+// SLEEP. exciteDetect counts every candidate cell into FA_EXCANDID, and a slot
+// count is non-zero only if some cell of that slot was a candidate — so with
+// FA_EXCANDID at zero every EX_COUNTS word is zero and the 32K-slot walk could
+// only find nothing. Skipped then (the WORK, not the pass: a `return` before
+// the barriers is a uniformity error). The header, the live count and the
+// dispatch args below are still written, exactly as a walk over zeros would.
+//
+// THE COUNTS CLEAN UP AFTER THEMSELVES. This pass is their last reader (emit
+// reads only EX_BASES / EX_LIST), so the per-span loop at the end zeroes each
+// non-zero count it consumes. That keeps the invariant "every EX_COUNTS word is
+// zero outside detect -> scan" and is what retired seam_fill_excite, a 393 KB
+// whole-buffer Fill that ran every seam tick whether a single cell was
+// disturbed or not. The rest of the buffer needs no clear: the header words are
+// written here or by compactScan before anything reads them, and EX_BASES /
+// EX_LIST entries are written for exactly the slots emit is later sent to.
 @compute @workgroup_size(256)
 fn exciteScan(@builtin(local_invocation_index) li : u32) {
   let span = NUM_SLOTS / 256u;
+  let anyCand = atomicLoad(&fluidArgs[FA_EXCANDID]) != 0u;
   var slots = 0u;
   var parts = 0u;
-  for (var s = li * span; s < (li + 1u) * span; s++) {
-    let c = atomicLoad(&exciteScratch[EX_COUNTS + s]);
-    if (c != 0u) { slots += 1u; parts += c; }
+  if (anyCand) {
+    for (var s = li * span; s < (li + 1u) * span; s++) {
+      let c = atomicLoad(&exciteScratch[EX_COUNTS + s]);
+      if (c != 0u) { slots += 1u; parts += c; }
+    }
   }
   exPart[li] = slots;
   exPartP[li] = parts;
@@ -1047,9 +1167,15 @@ fn exciteScan(@builtin(local_invocation_index) li : u32) {
   var listIdx = exListBase[li];
   var base = exBaseAt[li];
   let wholly = exAccept[li] == 1u;
-  for (var s = li * span; s < (li + 1u) * span; s++) {
+  // Spans with no candidate slot (every span, when nothing was disturbed)
+  // have nothing to list and nothing to clear.
+  let spanSlots = select(0u, exPart[li], anyCand);
+  for (var s = li * span; s < (li + 1u) * span && spanSlots != 0u; s++) {
     let c = atomicLoad(&exciteScratch[EX_COUNTS + s]);
     if (c == 0u) { continue; }
+    // Last read of this count this tick (thread 0's serial walk of the
+    // crossing span happened before the barrier above): clear it for the next.
+    atomicStore(&exciteScratch[EX_COUNTS + s], 0u);
     atomicStore(&exciteScratch[EX_LIST + listIdx], s);
     listIdx += 1u;
     if (li == exCrossSerial) { continue; }  // bases already assigned serially
@@ -1074,9 +1200,29 @@ fn seamMulQ16(a : i32, b : i32) -> i32 {
 // index order, build a workgroup-exclusive prefix of per-cell particle
 // counts, then either convert (particles born, voxel cleared, dirty marked)
 // or — refused slot — restore the word's scratch bits and leave the water.
+//
+// THE SLOT ORDER IS THE CONTRACT, the layout is not. A candidate cell's
+// particles land at emitBaseW + (particles of every earlier cell in CHUNK
+// INDEX order), so thread li must own cells li*16 .. li*16+15 for the prefix
+// — a strided layout, which is exactly what made detect's loads cost 1.1 ms on
+// a forest fire before it went lane-consecutive. So the READ of all 4,096 words
+// is lane-consecutive (s * 256 + li, coalesced) and publishes each cell's
+// pending fullness as a nibble in workgroup memory; the prefix and the emission
+// then walk the strided cell order out of that map, and touch global memory
+// only for the few cells that are actually pending. Same cells, same order,
+// same slots as before — the particle pool comes out identical (rule 1).
+//
+// The page is resolved once per workgroup (the chunk's one page-table entry)
+// instead of by voxWordIndex twice per cell. detect only marks cells of a
+// PAGED chunk, and the table does not change inside a tick, so a sentinel
+// chunk simply has no pending cell here.
 var<workgroup> emitPart : array<u32, 256>;
 var<workgroup> emitBaseW : u32;
 var<workgroup> emitRefused : u32;
+// Pending fullness (0 = not pending, else 1..8) per cell, 8 nibbles a word,
+// indexed by chunk-linear cell index.
+var<workgroup> emitNib : array<atomic<u32>, 512>;
+var<workgroup> emitEighths : atomic<u32>;
 
 @compute @workgroup_size(256)
 fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
@@ -1090,19 +1236,34 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
     if (b != EX_REFUSED) {
       atomicStore(&fluidArgs[FA_LASTSLOT], ci);
     }
+    atomicStore(&emitEighths, 0u);
   }
+  atomicStore(&emitNib[li], 0u);
+  atomicStore(&emitNib[li + 256u], 0u);
   let wc = slotWorldChunk(ci, T.origin);
   let base = wc * i32(CHUNK);
-  // Per-thread candidate-particle count over its 16 cells, for the prefix.
+  let pe = pageTable[ci];
+  let paged = (pe & PT_SENTINEL_BIT) == 0u;
+  let pageBase = pe * CHUNK_VOL;
+  workgroupBarrier();
+
+  // ---- phase 1: coalesced read, publish pending fullness per cell ---------
+  for (var s = 0u; s < 16u && paged; s++) {
+    let cell = s * 256u + li;
+    let w = voxels[pageBase + cell];
+    if ((w & EXCITE_PEND_BIT) != 0u) {
+      atomicOr(&emitNib[cell >> 3u], (voxState(w) + 1u) << ((cell & 7u) * 4u));
+    }
+  }
+  workgroupBarrier();
+
+  // ---- phase 2: per-thread count over ITS 16 cells (li*16 ..), the prefix -
+  // Cells li*16 .. li*16+15 are exactly nibble words 2li and 2li+1.
+  let n0 = atomicLoad(&emitNib[li * 2u]);
+  let n1 = atomicLoad(&emitNib[li * 2u + 1u]);
   var mine = 0u;
-  for (var s = 0u; s < 16u; s++) {
-    let localIdx = li * 16u + s;
-    let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
-                       i32(localIdx >> 8u));
-    let idx = voxWordIndex(base + lo);
-    if (idx == PT_NO_WORD) { continue; }
-    let w = voxels[idx];
-    if ((w & EXCITE_PEND_BIT) != 0u) { mine += voxState(w) + 1u; }
+  for (var k = 0u; k < 8u; k++) {
+    mine += ((n0 >> (k * 4u)) & 0xFu) + ((n1 >> (k * 4u)) & 0xFu);
   }
   emitPart[li] = mine;
   workgroupBarrier();
@@ -1115,17 +1276,20 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
     }
   }
   workgroupBarrier();
+
+  // ---- phase 3: emission, in cell-index order within the thread -----------
   let refused = emitRefused == 1u;
   var off = emitPart[li];
+  var emitted = 0u;
   for (var s = 0u; s < 16u; s++) {
     let localIdx = li * 16u + s;
+    let nib = (select(n0, n1, s >= 8u) >> ((s & 7u) * 4u)) & 0xFu;
+    if (nib == 0u) { continue; }
     let lo = vec3<i32>(i32(localIdx & 15u), i32((localIdx >> 4u) & 15u),
                        i32(localIdx >> 8u));
     let c = base + lo;
-    let idx = voxWordIndex(c);
-    if (idx == PT_NO_WORD) { continue; }
+    let idx = pageBase + localIdx;
     let w = voxels[idx];
-    if ((w & EXCITE_PEND_BIT) == 0u) { continue; }
     if (refused) {
       // Budget refusal: the water stays settled. The scratch bits MUST go —
       // they are per-tick state and the CA would carry them on the next move.
@@ -1188,9 +1352,19 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
     // CA re-evaluates everything that was resting on this water.
     voxels[idx] = 0u;
     markDirtyNext(c);
-    atomicAdd(&fluidArgs[FA_EXCITED], fullness);
-    atomicAdd(&fluidArgs[FA_EMITTED], fullness);
-    atomicAdd(&fluidArgs[FA_EXCITEDCUM], fullness);   // mass books, cumulative
+    emitted += fullness;
+  }
+  // FA_EXCITED / FA_EMITTED / FA_EXCITEDCUM all take the same eighths: fold
+  // them per workgroup and publish once (associative sums — rule 1).
+  if (emitted != 0u) { atomicAdd(&emitEighths, emitted); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let e = atomicLoad(&emitEighths);
+    if (e != 0u) {
+      atomicAdd(&fluidArgs[FA_EXCITED], e);
+      atomicAdd(&fluidArgs[FA_EMITTED], e);
+      atomicAdd(&fluidArgs[FA_EXCITEDCUM], e);   // mass books, cumulative
+    }
   }
 }
 
@@ -1212,15 +1386,14 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= min(atomicLoad(&exciteScratch[EX_COMPACT_LIVE]), FLUID_CAP)) {
     return;
   }
-  var p = fluidParticles[gid.x];
+  let p = fluidParticles[gid.x];
   if (!fpAlive(p.attr)) { return; }
   // A GHOST retires here at its death tick, and nothing else can take it: the
   // CA never saw an occupancy intent for it (particleTick), so no reaction
   // flagged its cell. No mass counter -- it never held any.
   if (fpGhost(p.attr)) {
     if (i32(T.tick - u32(p._r3)) >= 0) {
-      p.attr = 0u;
-      fluidParticles[gid.x] = p;
+      fluidParticles[gid.x].attr = 0u;   // the one word a dead slot is read by
       atomicAdd(&fluidArgs[FA_DEAD], 1u);
     }
     return;
@@ -1235,8 +1408,9 @@ fn consumeApply(@builtin(global_invocation_id) gid : vec3<u32>) {
   if ((atomicLoad(&fluidCellScratch[ci * 2u + 1u]) & 1u) == 0u) { return; }
   atomicAdd(&fluidArgs[FA_CONSUMED], fpFullness(p.attr));
   atomicAdd(&fluidArgs[FA_DEAD], 1u);
-  p.attr = 0u;
-  fluidParticles[gid.x] = p;
+  // The attr word alone: fpAlive is the first test of every later reader, so
+  // storing the other 124 bytes of a dead particle back was pure bandwidth.
+  fluidParticles[gid.x].attr = 0u;
 }
 
 // cellClear: zero the per-cell intent/flags scratch for the ACTIVE BLOCKS only.
@@ -1284,7 +1458,13 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
   // seamRestVy: strip the free-surface gravity bias (see the const block).
   let sx = p.vx >> 8u; let sy = seamRestVy(p.vy) >> 8u; let sz = p.vz >> 8u;
   let s2 = u32(sx * sx + sy * sy + sz * sz);
-  atomicMax(&settleScratch[SP_SPEED + slot], s2 + 1u);
+  // Load before the read-modify-write: a chunk's particles all fold into ONE
+  // word, and in a calm pool almost every one of them is below the maximum
+  // already there. Max is idempotent, so skipping the no-op RMW leaves the
+  // word exactly what the unconditional atomicMax made it (rule 1).
+  if (atomicLoad(&settleScratch[SP_SPEED + slot]) < s2 + 1u) {
+    atomicMax(&settleScratch[SP_SPEED + slot], s2 + 1u);
+  }
 
   // The stain this particle applies: what it CARRIES (excited out of a
   // stained voxel) wins over its material's authored stain — blood-stained
@@ -1334,18 +1514,48 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
 
 // stainApply: one thread per active-block cell (the node-pass indirect args
 // from the last substep). A SOLID cell with a stain intent rolls the seam's
-// stain chance and takes the stain, following the CA's merge rules: same
-// type climbs toward the substrate's ceiling, a foreign type starts over.
+// stain chance and takes the stain, following the CA's stain order: same
+// type climbs toward the substrate's ceiling, a foreign stain is only ever
+// washed DOWN (by a washing liquid), never painted over.
 // One thread owns one cell — no write races, and the roll keys on
 // hash3(seed, tick, cellSlot): state, never scheduling (rule 1).
 const SEAM_STAIN_CHANCE : u32 =
     u32(round(clamp(TUNE_FLUID_STAIN_RATE, 0.0, 30.0) * 65536.0 / 30.0));
 
+// A workgroup is one z-slice of ONE block, so all 256 threads share the
+// block's Y-mask word — the per-cell atomicOr (every liquid cell of a pool)
+// and the FA_STAINED add are folded in workgroup memory and published once.
+// OR and integer add commute: the words are unchanged (rule 1).
+var<workgroup> saYMask : atomic<u32>;
+var<workgroup> saStained : atomic<u32>;
+
 @compute @workgroup_size(256)
 fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
               @builtin(local_invocation_index) li : u32) {
-  let block = wg.x >> 4u;
-  let localIdx = (wg.x & 15u) * 256u + li;
+  if (li == 0u) {
+    atomicStore(&saYMask, 0u);
+    atomicStore(&saStained, 0u);
+  }
+  workgroupBarrier();
+  let r = stainApplyCell(wg.x, li);
+  if (r.x != 0u) { atomicOr(&saYMask, r.x); }
+  if (r.y != 0u) { atomicAdd(&saStained, r.y); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let ym = atomicLoad(&saYMask);
+    if (ym != 0u) {
+      atomicOr(&fluidBlockMapR[fbmYMaskIndex(fluidBlockList[wg.x >> 4u])], ym);
+    }
+    let ns = atomicLoad(&saStained);
+    if (ns != 0u) { atomicAdd(&fluidArgs[FA_STAINED], ns); }
+  }
+}
+
+// One cell of stainApply: returns (Y-mask bits this cell lights, 1 if it took
+// a stain) for the fold above. The voxel write and the dirty mark are its own.
+fn stainApplyCell(wgx : u32, li : u32) -> vec2<u32> {
+  let block = wgx >> 4u;
+  let localIdx = (wgx & 15u) * 256u + li;
   let intent = atomicLoad(&fluidCellScratch[(block * CHUNK_VOL + localIdx) * 2u]);
   let sType = intent & 0x7u;
   let sAmt = (intent >> 3u) & 0xFu;
@@ -1355,7 +1565,7 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
                      i32(localIdx >> 8u));
   let c = wc * i32(CHUNK) + lo;
   let idx = voxWordIndex(c);
-  if (idx == PT_NO_WORD) { return; }
+  if (idx == PT_NO_WORD) { return vec2<u32>(0u, 0u); }
   let w = voxels[idx];
   let nmat = voxMat(w);
   // ---- Y-occupancy mask, settled-liquid half (common.wgsl) ----------------
@@ -1365,28 +1575,49 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
   // march would skip the y levels a half-converted pool still holds as voxels —
   // a seam straight through the middle of it. This pass is the one that already
   // walks every active-block cell with the voxel word in hand.
+  var ybits = 0u;
   if (nmat != MAT_AIR && materials[nmat].klass == CLASS_LIQUID) {
-    atomicOr(&fluidBlockMapR[fbmYMaskIndex(slot)], fbmYBits(lo.y));
+    ybits = fbmYBits(lo.y);
   }
-  if (sType == 0u || sAmt == 0u) { return; }
-  if (nmat == MAT_AIR) { return; }
+  if (sType == 0u || sAmt == 0u) { return vec2<u32>(ybits, 0u); }
+  if (nmat == MAT_AIR) { return vec2<u32>(ybits, 0u); }
   let nk = materials[nmat].klass;
-  if (nk != CLASS_SOLID && nk != CLASS_POWDER) { return; }
+  if (nk != CLASS_SOLID && nk != CLASS_POWDER) { return vec2<u32>(ybits, 0u); }
   let h = hash3(T.seed ^ 0x5741u, T.tick, cellIndexW(c));
-  if ((h & 0xFFFFu) >= SEAM_STAIN_CHANCE) { return; }
-  // The CA's merge rules (doStaining): the substrate's absorb capacity caps
-  // how deep a stain it takes; same type climbs one level per contact on
-  // absorbent ground and jumps to the ceiling on plain stone; foreign types
-  // restart.
-  let ceiling = min(sAmt, max(matAbsorbCapacity(materials[nmat]), 1u));
+  if ((h & 0xFFFFu) >= SEAM_STAIN_CHANCE) { return vec2<u32>(ybits, 0u); }
+  // THE CA's STAIN ORDER (sim_step.wgsl doStaining), which this path used to
+  // break by painting over whatever was there:
+  //   * a FOREIGN stain (non-zero amount, another type) is never overwritten.
+  //     A washer (`stain: {washes: true}` on the particle's material — water)
+  //     steps it DOWN one level per contact, clearing the type with the last
+  //     level; a non-washer (blood, oil, ichor) leaves it alone.
+  //   * a clean cell, or one already carrying THIS stain type, takes the
+  //     stain: the substrate's absorb capacity caps how deep; the same type
+  //     climbs one level per contact and a clean cell starts at the ceiling.
+  // Every branch is a monotone step toward a fixed point (amount up to the
+  // ceiling, a foreign amount down to 0), so a wall under a standing flow
+  // still goes quiet (rule 2).
   let cur = voxStainAmt(w);
   let curType = voxStainType(w);
+  if (cur != 0u && curType != sType) {
+    if (!matWashes(materials[intent >> 16u])) {   // not ours to touch
+      return vec2<u32>(ybits, 0u);
+    }
+    let washed = cur - 1u;
+    voxels[idx] = (w & ~STAIN_BITS) |
+                  packStain(select(curType, 0u, washed == 0u), washed);
+    markDirtyNext(c);
+    return vec2<u32>(ybits, 1u);   // FA_STAINED, folded by the entry point
+  }
+  let ceiling = min(sAmt, max(matAbsorbCapacity(materials[nmat]), 1u));
   var amt = ceiling;
-  if (curType == sType && cur >= ceiling) { return; }  // saturated: sleep
+  if (curType == sType && cur >= ceiling) {   // saturated: sleep
+    return vec2<u32>(ybits, 0u);
+  }
   if (curType == sType) { amt = min(cur + 1u, ceiling); }
   voxels[idx] = (w & ~STAIN_BITS) | packStain(sType, amt);
-  atomicAdd(&fluidArgs[FA_STAINED], 1u);
   markDirtyNext(c);
+  return vec2<u32>(ybits, 1u);   // FA_STAINED, folded by the entry point
 }
 
 // settleJudge: one thread per chunk slot. Speed 0 means "no particles here" —
@@ -1408,11 +1639,26 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
 // scenes, and the sealed fluid-excite chamber never converting at all).
 // Re-excitation is measured, not assumed — FA_EXCITED against FA_SETTLED, the
 // `re-excited` column of --fluid-bench's seam-flow line.
+//
+// SLEEP. With FA_LIVE at zero, particleTick wrote no speed, so every slot
+// would be judged "no particles" and have both counters zeroed. If the last
+// settle ALSO saw zero live (SP_LIVEFLAG clear), this judge already zeroed
+// every counter then — nothing else raises one without live particles — so
+// this whole pass would store zero over zero, 32K times. It is skipped. The
+// first tick after the last particle dies still runs it (the flag is still
+// set), which is the one that actually clears the counters.
+//
+// THE SPEED MAXIMA ARE CLEARED HERE, by their only reader, after reading.
+// That keeps "every SP_SPEED word is zero outside particleTick -> judge" and
+// retired the SP_SPEED share of seam_fill_settle's 787 KB whole-buffer Fill.
 @compute @workgroup_size(256)
 fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
   let slot = gid.x;
   if (slot >= NUM_SLOTS) { return; }
+  if (atomicLoad(&fluidArgs[FA_LIVE]) == 0u &&
+      atomicLoad(&settleScratch[SP_LIVEFLAG]) == 0u) { return; }
   let sp = atomicLoad(&settleScratch[SP_SPEED + slot]);
+  if (sp != 0u) { atomicStore(&settleScratch[SP_SPEED + slot], 0u); }
   // ONE THREAD OWNS ONE SLOT, so the load/modify/store below needs no atomic
   // read-modify-write and is order-independent by construction (rule 1). The
   // atomics are here only because the buffer is atomic-typed for the passes
@@ -1440,7 +1686,10 @@ fn settleJudge(@builtin(global_invocation_id) gid : vec3<u32>) {
       calm = 0u;
     }
   }
-  atomicStore(&fluidCalm[slot], (age << 16u) | calm);
+  // Store only a change: an empty slot at 0/0 stays 0/0, and most slots of a
+  // world with a pond in one corner are exactly that.
+  let nw = (age << 16u) | calm;
+  if (nw != cur) { atomicStore(&fluidCalm[slot], nw); }
 }
 
 // settleScan: pick up to SETTLE_MAX calm blocks, in slot order, with a greedy
@@ -1479,9 +1728,9 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
   // TRUE SLEEP (plan §7 item 2). This scan and the solver's `alloc` are the
   // only fluid passes whose cost does NOT come from an indirect arg — both are
   // single-workgroup walks of all NUM_SLOTS slots, so a world that poured once
-  // and settled kept paying them forever (the CPU-side fluidCount is monotone
-  // by design, so the TABLE keeps being recorded — that is the determinism
-  // contract, and the sanctioned way to make it free is exactly this).
+  // and settled kept paying them forever (the table is recorded whenever the
+  // seam is live — every CA-awake tick while disturbance-excite is on — and the
+  // sanctioned way to make that free is exactly this).
   // With no particles alive, no slot can have a calm counter to find: settleJudge
   // resets a slot the moment its speed reads zero.
   // (The early-out cannot `return` before the workgroupBarrier below — a
@@ -1506,9 +1755,24 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
   ssForce[li] = nf;
   workgroupBarrier();
   if (li != 0u) { return; }
+  // ---- retire LAST tick's picks (replaces seam_fill_settle's SP_MARK share)
+  // The only non-zero SP_MARK words are the ones the previous scan picked
+  // (MARK_SETTLING, plus MARK_REFUSED OR'd by settleCheck), and that list is
+  // still in SP_LIST[0 .. SP_COUNT) — nothing writes it between. Zeroing them
+  // restores "every mark is zero before the picks", which is what the Fill
+  // used to guarantee, at <= SETTLE_MAX stores instead of 128 KB.
+  let prevCount = min(atomicLoad(&settleScratch[SP_COUNT]), SETTLE_MAX);
+  for (var q = 0u; q < prevCount; q++) {
+    atomicStore(&settleScratch[SP_MARK + atomicLoad(&settleScratch[SP_LIST + q])],
+                0u);
+  }
+  // The sleep flags (see SP_LIVEFLAG).
+  atomicStore(&settleScratch[SP_LIVEPREV], atomicLoad(&settleScratch[SP_LIVEFLAG]));
+  atomicStore(&settleScratch[SP_LIVEFLAG], select(1u, 0u, asleep));
   if (asleep) {
     atomicStore(&settleScratch[SP_COUNT], 0u);
     atomicStore(&fluidArgs[FA_SETBLOCKS], 0u);
+    seamSettleArgs(0u);
     return;
   }
   var picked = array<vec3<i32>, 16>();
@@ -1532,11 +1796,10 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
       picked[count] = sc;
       atomicStore(&settleScratch[SP_LIST + count], s);
       atomicStore(&settleScratch[SP_MARK + s], MARK_SETTLING | count);
-      // Belt-and-braces: `seam_fill_settle` already zeroes the whole scratch
-      // at the head of the seam, but settleCheck only ever ORs into this mask
-      // and a stale bit here silently strands a column's water as particles.
-      // Cheap (8 stores per pick, one thread) and it makes the OR-only
-      // contract locally sound rather than dependent on a distant pass row.
+      // LOAD-BEARING since the whole-scratch Fill was retired: settleCheck
+      // only ever ORs into this mask, a stale bit here silently strands a
+      // column's water as particles, and this store is now the ONLY thing
+      // that clears it. 8 stores per pick, one thread.
       for (var q = 0u; q < 8u; q++) {
         atomicStore(&settleScratch[SP_COLBAD + count * 8u + q], 0u);
       }
@@ -1591,31 +1854,62 @@ fn settleScan(@builtin(local_invocation_index) li : u32) {
   }
   atomicStore(&settleScratch[SP_COUNT], count);
   atomicStore(&fluidArgs[FA_SETBLOCKS], count);
+  seamSettleArgs(count);
+}
+
+// settleBin and settleKill act only on particles inside a PICKED block, so
+// with no pick they are a full pass over the pool that does nothing. Their
+// dispatch is sized here instead: the per-particle count when anything was
+// picked, zero workgroups when nothing was (copy_settleArgs stages it).
+fn seamSettleArgs(count : u32) {
+  let groups = select(0u, atomicLoad(&fluidArgs[4u]), count != 0u);
+  atomicStore(&exciteScratch[EX_SETTLE_ARGS + 0u], groups);
+  atomicStore(&exciteScratch[EX_SETTLE_ARGS + 1u], 1u);
+  atomicStore(&exciteScratch[EX_SETTLE_ARGS + 2u], 1u);
 }
 
 // settleBin: per particle. Particles inside a settling slot bin their eighths
 // (atomicAdd) and their identity (atomicMax of mat<<16 | stainAmt<<3 |
 // stainType — deterministic dominant-mat pick for mixed cells).
+// FA_BINNED (the mass audit) takes every binned particle's eighths on ONE
+// word, so it is folded per workgroup and published once; the per-CELL bins
+// stay direct atomics (their addresses differ). Associative sum — rule 1.
+var<workgroup> sbBinned : atomic<u32>;
+
 @compute @workgroup_size(64)
-fn settleBin(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (gid.x >= min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP)) { return; }
-  let p = fluidParticles[gid.x];
+fn settleBin(@builtin(global_invocation_id) gid : vec3<u32>,
+             @builtin(local_invocation_index) li : u32) {
+  if (li == 0u) { atomicStore(&sbBinned, 0u); }
+  workgroupBarrier();
+  let e = settleBinOne(gid.x);
+  if (e != 0u) { atomicAdd(&sbBinned, e); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let n = atomicLoad(&sbBinned);
+    if (n != 0u) { atomicAdd(&fluidArgs[FA_BINNED], n); }
+  }
+}
+
+// One particle of settleBin; returns the eighths it binned (0 if none).
+fn settleBinOne(gi : u32) -> u32 {
+  if (gi >= min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP)) { return 0u; }
+  let p = fluidParticles[gi];
   // Ghosts never settle: settleKill spares them by the same test.
-  if (!fpAlive(p.attr) || fpGhost(p.attr)) { return; }
+  if (!fpAlive(p.attr) || fpGhost(p.attr)) { return 0u; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   let slot = chunkSlotOf(worldChunkOf(cell), T.origin);
-  if (slot == SLOT_NONE) { return; }
+  if (slot == SLOT_NONE) { return 0u; }
   let mark = atomicLoad(&settleScratch[SP_MARK + slot]);
-  if ((mark & MARK_SETTLING) == 0u) { return; }
+  if ((mark & MARK_SETTLING) == 0u) { return 0u; }
   let listIdx = mark & MARK_LIST_MASK;
   let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
   let cellIdx = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
   let b = SP_BINS + (listIdx * CHUNK_VOL + cellIdx) * 2u;
   atomicAdd(&settleScratch[b], fpFullness(p.attr));
-  atomicAdd(&fluidArgs[FA_BINNED], fpFullness(p.attr));  // mass audit
   atomicMax(&settleScratch[b + 1u],
             (fpMat(p.attr) << 16u) | (fpStainAmt(p.attr) << 3u) |
             fpStainType(p.attr));
+  return fpFullness(p.attr);   // FA_BINNED, the mass audit; folded above
 }
 
 // Did the stability test refuse THIS column of this settling block? Shared by
@@ -2141,11 +2435,28 @@ fn settleCheck(@builtin(workgroup_id) wg : vec3<u32>,
 }
 
 // settleCommit: the identical walk, writing. Refused blocks skip.
+//
+// THE BINS ARE CLEARED HERE, after their last reader. settleColumn reads only
+// its OWN column's 16 bins (the blocked-cell pop-up included), check and
+// commit are separate rows with a barrier between, and this thread is the
+// column's commit — so once it is done (or refused) nobody reads them again
+// this tick. Zeroing them keeps "every bin is zero outside bin -> commit",
+// which is what retired the bins' share (512 KB) of seam_fill_settle.
 @compute @workgroup_size(256)
 fn settleCommit(@builtin(workgroup_id) wg : vec3<u32>,
                 @builtin(local_invocation_index) li : u32) {
   if (wg.x >= atomicLoad(&settleScratch[SP_COUNT])) { return; }
-  let ci = atomicLoad(&settleScratch[SP_LIST + wg.x]);
+  settleCommitColumn(wg.x, li);
+  for (var y = 0u; y < 16u; y++) {
+    let b = SP_BINS + (wg.x * CHUNK_VOL + (y * CHUNK + (li & 15u)) +
+                       (li >> 4u) * CHUNK * CHUNK) * 2u;
+    atomicStore(&settleScratch[b], 0u);
+    atomicStore(&settleScratch[b + 1u], 0u);
+  }
+}
+
+fn settleCommitColumn(wgx : u32, li : u32) {
+  let ci = atomicLoad(&settleScratch[SP_LIST + wgx]);
   let mark = atomicLoad(&settleScratch[SP_MARK + ci]);
   if ((mark & MARK_REFUSED) != 0u) { return; }
   // MUST match what settleCheck passed, or the commit walks a different column
@@ -2159,8 +2470,8 @@ fn settleCommit(@builtin(workgroup_id) wg : vec3<u32>,
   // bins are simply never drained and their voxels never written, which is
   // why the ledger stays exact without any special case: settleKill spares
   // the same particles by the same bit.
-  if (!seamColumnRefused(wg.x, li)) {
-    settleColumn(wg.x, base, cx, cz, true, false, li, forced);
+  if (!seamColumnRefused(wgx, li)) {
+    settleColumn(wgx, base, cx, cz, true, false, li, forced);
   }
   if (li == 0u) { atomicStore(&fluidCalm[ci], 0u); }
 }
@@ -2170,9 +2481,16 @@ fn settleCommit(@builtin(workgroup_id) wg : vec3<u32>,
 // swimming query sees particles the way it sees fullness voxels (plan §6.5
 // — `inLiquid` is a fraction, and node mass gives one naturally). One
 // workgroup per mirror chunk; 4 cells pack into each written word.
+//
+// SLEEP: with FA_LIVE at zero, alloc has retired every block, so every bm
+// below is 0 and every word written is 0 — whatever the mirror base. If the
+// previous fold ALSO ran with zero live (SP_LIVEPREV clear, see SP_LIVEFLAG),
+// it already wrote those zeros, so this one is skipped.
 @compute @workgroup_size(256)
 fn mirrorFold(@builtin(workgroup_id) wg : vec3<u32>,
               @builtin(local_invocation_index) li : u32) {
+  if (atomicLoad(&fluidArgs[FA_LIVE]) == 0u &&
+      atomicLoad(&settleScratch[SP_LIVEPREV]) == 0u) { return; }
   let m = wg.x;
   let wc = T.mirrorBase + vec3<i32>(i32(m % 3u), i32((m / 3u) % 3u),
                                     i32(m / 9u));
@@ -2200,7 +2518,7 @@ fn mirrorFold(@builtin(workgroup_id) wg : vec3<u32>,
 @compute @workgroup_size(64)
 fn settleKill(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP)) { return; }
-  var p = fluidParticles[gid.x];
+  let p = fluidParticles[gid.x];
   // Ghosts were never binned (settleBin), so they are not killed here either.
   if (!fpAlive(p.attr) || fpGhost(p.attr)) { return; }
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
@@ -2217,7 +2535,7 @@ fn settleKill(@builtin(global_invocation_id) gid : vec3<u32>) {
   // This is the death a conservation identity must NOT add back — unlike
   // FA_KILLHARD, the mass is standing in a voxel the sweep can see.
   atomicAdd(&fluidArgs[FA_SETTLEKILL], fpFullness(p.attr));
-  p.attr = 0u;
-  fluidParticles[gid.x] = p;
+  // The attr word alone — see consumeApply.
+  fluidParticles[gid.x].attr = 0u;
   atomicAdd(&fluidArgs[FA_DEAD], 1u);
 }

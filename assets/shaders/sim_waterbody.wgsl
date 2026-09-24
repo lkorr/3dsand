@@ -1322,19 +1322,64 @@ fn wbReduce(@builtin(workgroup_id) wg : vec3<u32>,
 // scalar loads, so a body's full footprint can be listed once and the dispatch
 // still only does work where the water actually is.
 // ============================================================================
+//
+// THE FOUR LEDGER COUNTERS ARE FOLDED PER WORKGROUP. One workgroup is one
+// listed chunk of ONE body, so its 256 columns all add into the same four
+// words (WBS_SEEN / ATLEVEL / SHAVED / CAPPED) — on a flat lake every column
+// sees a surface cell, so that was ~1,000 same-address atomics per chunk per
+// tick. Each column's contribution is summed in workgroup memory and thread 0
+// publishes one add per word. Integer adds commute: the ledger reads exactly
+// what it read before (rule 1).
+var<workgroup> wsSeen : atomic<i32>;
+var<workgroup> wsAtLevel : atomic<i32>;
+var<workgroup> wsShaved : atomic<i32>;
+var<workgroup> wsCapped : atomic<i32>;
+
 @compute @workgroup_size(16, 1, 16)
 fn wbShave(@builtin(workgroup_id) wg : vec3<u32>,
-           @builtin(local_invocation_id) li : vec3<u32>) {
+           @builtin(local_invocation_id) li : vec3<u32>,
+           @builtin(local_invocation_index) lx : u32) {
+  // Both uniform (a uniform-buffer word and the workgroup id), so returning
+  // here is a whole-workgroup exit and the barriers below stay legal.
   if (wg.x >= T.waterChunkCount) { return; }
-  let e = wbChunkEntry(wg.x);
+  let b = wbChunkEntry(wg.x) >> 16u;
+  if (b >= T.waterBodyCount) { return; }
+  if (lx == 0u) {
+    atomicStore(&wsSeen, 0);
+    atomicStore(&wsAtLevel, 0);
+    atomicStore(&wsShaved, 0);
+    atomicStore(&wsCapped, 0);
+  }
+  workgroupBarrier();
+  let r = wbShaveColumn(wg.x, li);
+  if (r.x != 0) { atomicAdd(&wsSeen, r.x); }
+  if (r.y != 0) { atomicAdd(&wsAtLevel, r.y); }
+  if (r.z != 0) { atomicAdd(&wsShaved, r.z); }
+  if (r.w != 0) { atomicAdd(&wsCapped, r.w); }
+  workgroupBarrier();
+  if (lx == 0u) {
+    let n0 = atomicLoad(&wsSeen);
+    let n1 = atomicLoad(&wsAtLevel);
+    let n2 = atomicLoad(&wsShaved);
+    let n3 = atomicLoad(&wsCapped);
+    if (n0 != 0) { atomicAdd(&waterBodyState[wbBase(b) + WBS_SEEN], n0); }
+    if (n1 != 0) { atomicAdd(&waterBodyState[wbBase(b) + WBS_ATLEVEL], n1); }
+    if (n2 != 0) { atomicAdd(&waterBodyState[wbBase(b) + WBS_SHAVED], n2); }
+    if (n3 != 0) { atomicAdd(&waterBodyState[wbBase(b) + WBS_CAPPED], n3); }
+  }
+}
+
+// One column of wbShave. Returns its (SEEN, ATLEVEL, SHAVED, CAPPED)
+// contribution for the fold above; the voxel write and dirty mark are its own.
+fn wbShaveColumn(wgx : u32, li : vec3<u32>) -> vec4<i32> {
+  let e = wbChunkEntry(wgx);
   let b = e >> 16u;
   let slot = e & 0xFFFFu;
-  if (b >= T.waterBodyCount) { return; }
   let st = wbGet(b, WBS_STATE);
-  if (st != WB_ADOPTED && st != WB_RELEASING) { return; }
+  if (st != WB_ADOPTED && st != WB_RELEASING) { return vec4<i32>(0); }
   let steps = wbGet(b, WBS_STEPS);
   let frac = wbGet(b, WBS_FRAC);
-  if (steps == 0 && frac == 0) { return; }   // nothing owed: idle cost is zero
+  if (steps == 0 && frac == 0) { return vec4<i32>(0); }   // nothing owed: idle cost is zero
   let level = wbGet(b, WBS_LEVEL);
   let area = max(wbGet(b, WBS_AREA), 1);
 
@@ -1345,7 +1390,7 @@ fn wbShave(@builtin(workgroup_id) wg : vec3<u32>,
   let cyHi = cyLo + i32(CHUNK) - 1;
   let y1 = min(level, cyHi);
   let y0 = max(level - 1, cyLo);
-  if (y1 < y0) { return; }   // this chunk is not in the band
+  if (y1 < y0) { return vec4<i32>(0); }   // this chunk is not in the band
 
   let x = wc.x * i32(CHUNK) + i32(li.x);
   let z = wc.z * i32(CHUNK) + i32(li.z);
@@ -1355,9 +1400,10 @@ fn wbShave(@builtin(workgroup_id) wg : vec3<u32>,
   // stop descending, and before M5 it did not.
   if (!wbOwns(wbMapOwner(b, seed.w), wbComp(seed.w), x, z, g,
               i32(wbIsqrt(u32(max(g.z, 0)))))) {
-    return;
+    return vec4<i32>(0);
   }
 
+  var r = vec4<i32>(0);   // (SEEN, ATLEVEL, SHAVED, CAPPED)
   for (var y = y1; y >= y0; y--) {
     if (y <= seed.x) { break; }              // at or below the basin floor
     let c = vec3<i32>(x, y, z);
@@ -1372,8 +1418,8 @@ fn wbShave(@builtin(workgroup_id) wg : vec3<u32>,
     // nothing left to give. `seen` becomes next tick's `area` and `atLevel` is
     // what tells the ledger the top layer has emptied, so both have to describe
     // the surface rather than the successful writes.
-    atomicAdd(&waterBodyState[wbBase(b) + WBS_SEEN], 1);
-    if (y == level) { atomicAdd(&waterBodyState[wbBase(b) + WBS_ATLEVEL], 1); }
+    r.x += 1;
+    if (y == level) { r.y += 1; }
 
     var want = steps;
     if (frac > 0 &&
@@ -1390,7 +1436,7 @@ fn wbShave(@builtin(workgroup_id) wg : vec3<u32>,
       var nw = 0u;
       if (left > 0) { nw = (w & 0xFFFF0FFFu) | (u32(left - 1) << 12u); }
       voxStore(voxWordIndex(c), nw);
-      atomicAdd(&waterBodyState[wbBase(b) + WBS_SHAVED], take);
+      r.z += take;
       wbMarkDirty(c);
     }
     // ATTRIBUTION, not statistics. A drain that stalls is either "the ledger is
@@ -1398,10 +1444,11 @@ fn wbShave(@builtin(workgroup_id) wg : vec3<u32>,
     // different fixes. Recording the shortfall here is the difference between
     // one run and CLAUDE.md rule 6's fourteen.
     if (want > take) {
-      atomicAdd(&waterBodyState[wbBase(b) + WBS_CAPPED], want - take);
+      r.w += want - take;
     }
     break;   // one surface cell per column per tick — see the header
   }
+  return r;
 }
 
 // ============================================================================
@@ -1479,23 +1526,69 @@ fn wbColumnSurface(x : i32, z : i32, mat : i32, yTop : i32, yBot : i32,
 // Order-free atomics only, and all three of them are adds: a count, a sum and
 // one histogram bucket. No CAS, no ordering, no scheduling dependence.
 // ============================================================================
+//
+// THE MEASURE IS FOLDED PER WORKGROUP. One workgroup is one listed chunk of
+// ONE body, so all 256 columns add into the same RVCOUNT and RVSUM words, and
+// a level lake puts nearly all of them in ONE histogram bucket. The count and
+// sum are summed in workgroup memory and published by thread 0; the histogram
+// is built in a workgroup copy and each non-empty bucket published once.
+// Adds commute: the ledger sees the same three answers (rule 1).
+var<workgroup> wfCount : atomic<i32>;
+var<workgroup> wfSum : atomic<i32>;
+var<workgroup> wfHist : array<atomic<i32>, WATER_RELEVEL_BUCKETS>;
+
 @compute @workgroup_size(16, 1, 16)
 fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
-             @builtin(local_invocation_id) li : vec3<u32>) {
+             @builtin(local_invocation_id) li : vec3<u32>,
+             @builtin(local_invocation_index) lx : u32) {
+  // All three uniform (uniform-buffer words and the workgroup id), so these
+  // are whole-workgroup exits and the barriers below stay legal.
   if (wg.x >= T.waterChunkCount) { return; }
-  let e = wbChunkEntry(wg.x);
-  let b = e >> 16u;
-  let slot = e & 0xFFFFu;
+  let b = wbChunkEntry(wg.x) >> 16u;
   if (b >= T.waterBodyCount) { return; }
   // THE ARM AND THE RATE IN ONE WORD. The CPU zeroes `waterRelevelMax` on any
   // tick this body's footprint is not declared to the page table, so at rest —
   // and at `sim.waterRelevelMax` 0 — this pass costs one uniform load.
   if (T.waterRelevelMax <= 0) { return; }
+  if (lx == 0u) {
+    atomicStore(&wfCount, 0);
+    atomicStore(&wfSum, 0);
+  }
+  for (var i = lx; i < WATER_RELEVEL_BUCKETS; i += 256u) {
+    atomicStore(&wfHist[i], 0);
+  }
+  workgroupBarrier();
+  let r = wbSurfaceColumn(wg.x, li);   // (counted 0/1, s, bucket)
+  if (r.x != 0) {
+    atomicAdd(&wfCount, 1);
+    atomicAdd(&wfSum, r.y);
+    atomicAdd(&wfHist[u32(r.z)], 1);
+  }
+  workgroupBarrier();
+  if (lx == 0u) {
+    let n = atomicLoad(&wfCount);
+    if (n != 0) {
+      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCOUNT], n);
+      atomicAdd(&waterBodyState[wbBase(b) + WBS_RVSUM], atomicLoad(&wfSum));
+    }
+  }
+  for (var i = lx; i < WATER_RELEVEL_BUCKETS; i += 256u) {
+    let h = atomicLoad(&wfHist[i]);
+    if (h != 0) { atomicAdd(&waterBodyState[wbHistBase(b) + i], h); }
+  }
+}
+
+// One column of wbSurface. Returns (1 if the column was measured, its s, its
+// histogram bucket) for the fold above; the flux-store write is its own.
+fn wbSurfaceColumn(wgx : u32, li : vec3<u32>) -> vec3<i32> {
+  let e = wbChunkEntry(wgx);
+  let b = e >> 16u;
+  let slot = e & 0xFFFFu;
   let st = wbGet(b, WBS_STATE);
-  if (st != WB_ADOPTED) { return; }
+  if (st != WB_ADOPTED) { return vec3<i32>(0); }
   let level = wbGet(b, WBS_LEVEL);
   let wc = wbSlotWorldChunk(slot);
-  if (!wbColumnLayer(wc.y, level)) { return; }
+  if (!wbColumnLayer(wc.y, level)) { return vec3<i32>(0); }
 
   let g = wbGeom(b);
   let seed = wbSeed(b);
@@ -1503,7 +1596,7 @@ fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
   let z = wc.z * i32(CHUNK) + i32(li.z);
   if (!wbOwns(wbMapOwner(b, seed.w), wbComp(seed.w), x, z, g,
               i32(wbIsqrt(u32(max(g.z, 0)))))) {
-    return;
+    return vec3<i32>(0);
   }
 
   var sy = 0;
@@ -1511,7 +1604,7 @@ fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
   var sw = 0u;
   let s = wbColumnSurface(x, z, g.w, level + 1, wbBandFloor(level, seed.x),
                           &sy, &sfull, &sw);
-  if (s == WB_RV_NOTAKE) { return; }
+  if (s == WB_RV_NOTAKE) { return vec3<i32>(0); }
   // A chunk the solver has a block in is not a chunk with a free surface: its
   // cells are mid-transfer and reading their fullness as a lake height would
   // freeze a transient into the mean (plan §3.8's MPM row).
@@ -1523,21 +1616,21 @@ fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
   // R: a crater's excite put blocks in the level layer and the relevel moved
   // ONE eighth in ninety ticks.
   let sc = worldChunkOf(vec3<i32>(x, sy, z));
-  if (!chunkInWindow(sc, T.origin)) { return; }
-  if (fluidBlockMapS[chunkSlotIndex(sc)] != 0u) { return; }
+  if (!chunkInWindow(sc, T.origin)) { return vec3<i32>(0); }
+  if (fluidBlockMapS[chunkSlotIndex(sc)] != 0u) { return vec3<i32>(0); }
 
-  atomicAdd(&waterBodyState[wbBase(b) + WBS_RVCOUNT], 1);
+  // RVCOUNT +1 — folded by the entry point.
   // Sigma s over 20k columns at s ~ 2,500 is 50 M — safe in i32 with three
   // orders to spare, which is the whole reason the measure is a SUM and a
   // COUNT rather than a running average nobody can audit.
-  atomicAdd(&waterBodyState[wbBase(b) + WBS_RVSUM], s);
+  // RVSUM += s — folded by the entry point.
   // The bucket, against the origin the LEDGER published (WBS_RVBASE). Anything
   // outside the band clamps into an end bucket and is treated as "deep" or
   // "high" — bounded, and a column 32 voxels below the level is a hole the MPM
   // owns anyway.
   let bi = u32(clamp(s - wbGet(b, WBS_RVBASE), 0,
                      i32(WATER_RELEVEL_BUCKETS) - 1));
-  atomicAdd(&waterBodyState[wbHistBase(b) + bi], 1);
+  // ...and this bucket +1, folded by the entry point.
 
   // ---- W2: THE SAME WALK, ONE MORE STORE (plan §4.3) --------------------
   //
@@ -1567,6 +1660,7 @@ fn wbSurface(@builtin(workgroup_id) wg : vec3<u32>,
   }
   waterFlux[fb + WV_S] = s;
   waterFlux[fb + WV_STAMP] = wvStampWrite(x, z);
+  return vec3<i32>(1, s, i32(bi));
 }
 
 // ============================================================================

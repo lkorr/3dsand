@@ -314,10 +314,12 @@ void World::Init(const rhi::Device& device) {
                                     "fluidExciteScratch");
   fluidCalm = CreateBuffer(device, (uint64_t)kNumSlots * 4,
                            U::Storage | U::CopyDst, "fluidCalm");
+  // ... + 2: SP_LIVEFLAG / SP_LIVEPREV, the settle half's sleep flags
+  // (sim_fluid_seam.wgsl SP_SCRATCH_WORDS is the layout's truth).
   fluidSettleScratch = CreateBuffer(
       device,
       (uint64_t)(2 * kNumSlots + 16 + 2 + kFluidSettleMax * kChunkVol * 2 +
-                 kFluidSettleMax * 8) * 4,
+                 kFluidSettleMax * 8 + 2) * 4,
       U::Storage | U::CopyDst, "fluidSettleScratch");
   // THREE arrays of one word per 256-particle compaction span, not two:
   // [0..SPANS) survivors, [SPANS..2*SPANS) their exclusive bases, and
