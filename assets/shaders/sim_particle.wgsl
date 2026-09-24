@@ -182,24 +182,9 @@ fn liquidBelow(c : vec3<i32>) -> bool {
 // Next-tick dirty mark incl. boundary neighbors (particles run post-CA, so
 // their writes are next tick's business).
 fn markDirtyNext(c : vec3<i32>) {
-  let lo = c & vec3<i32>(CHUNK_MASK);
-  let ch = worldChunkOf(c);
-  var xs = array<i32, 2>(0, 0);
-  var ys = array<i32, 2>(0, 0);
-  var zs = array<i32, 2>(0, 0);
-  if (lo.x == 0) { xs[1] = -1; } else if (lo.x == CHUNK_MASK) { xs[1] = 1; }
-  if (lo.y == 0) { ys[1] = -1; } else if (lo.y == CHUNK_MASK) { ys[1] = 1; }
-  if (lo.z == 0) { zs[1] = -1; } else if (lo.z == CHUNK_MASK) { zs[1] = 1; }
-  for (var i = 0; i < 2; i++) {
-    for (var j = 0; j < 2; j++) {
-      for (var k = 0; k < 2; k++) {
-        let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        let ns = chunkSlotOf(n, T.origin);
-        if (ns != SLOT_NONE) {
-          atomicOr(&dirtyOut[ns], DIRTY_R_PARTICLE);
-        }
-      }
-    }
+  for (var k = 0u; k < 8u; k++) {
+    let ns = dirtyFanSlot(c, T.origin, k);  // common.wgsl: own + bordered chunks
+    if (ns != SLOT_NONE) { atomicOr(&dirtyOut[ns], DIRTY_R_PARTICLE); }
   }
 }
 

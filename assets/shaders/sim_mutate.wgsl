@@ -69,25 +69,13 @@ const PT_KERNEL : u32 = PT_K_MUTATE;
 
 fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
+// c's own chunk plus every chunk it borders (common.wgsl's dirtyFanSlot).
 fn markBoth(c : vec3<i32>) {
-  let lo = c & vec3<i32>(CHUNK_MASK);
-  let ch = worldChunkOf(c);
-  var xs = array<i32, 2>(0, 0);
-  var ys = array<i32, 2>(0, 0);
-  var zs = array<i32, 2>(0, 0);
-  if (lo.x == 0) { xs[1] = -1; } else if (lo.x == CHUNK_MASK) { xs[1] = 1; }
-  if (lo.y == 0) { ys[1] = -1; } else if (lo.y == CHUNK_MASK) { ys[1] = 1; }
-  if (lo.z == 0) { zs[1] = -1; } else if (lo.z == CHUNK_MASK) { zs[1] = 1; }
-  for (var i = 0; i < 2; i++) {
-    for (var j = 0; j < 2; j++) {
-      for (var k = 0; k < 2; k++) {
-        let n = ch + vec3<i32>(xs[i], ys[j], zs[k]);
-        let ci = chunkSlotOf(n, T.origin);
-        if (ci != SLOT_NONE) {
-          atomicOr(&dirtyIn[ci], DIRTY_R_MUTATE);   // simulate this tick
-          atomicOr(&dirtyOut[ci], DIRTY_R_MUTATE);  // and re-check next tick
-        }
-      }
+  for (var k = 0u; k < 8u; k++) {
+    let ci = dirtyFanSlot(c, T.origin, k);
+    if (ci != SLOT_NONE) {
+      atomicOr(&dirtyIn[ci], DIRTY_R_MUTATE);   // simulate this tick
+      atomicOr(&dirtyOut[ci], DIRTY_R_MUTATE);  // and re-check next tick
     }
   }
 }
@@ -125,11 +113,13 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // TWO BASES (§4.1): slotIdx keys the palette-variant RNG, idx addresses
   // memory. See the note in sim_step:main.
   let slotIdx = cellIndexW(c);
-  let idx = voxWordIndex(c);
   // Read the OCCUPANT ONCE, ahead of every branch that wants it: the paint
   // mode's air test, the melt mode's source material, and the support-loss
-  // flag at the bottom, which needs what was here BEFORE the store.
-  let prevMat = voxMat(voxWordAt(c));
+  // flag at the bottom, which needs what was here BEFORE the store. Index and
+  // word come from one page-table resolution.
+  let iw = voxIndexAndWord(c);
+  let idx = iw.x;
+  let prevMat = voxMat(iw.y);
   // OVERLAP DEDUPE (see the header): the lowest op index that covers this cell
   // and would write it owns it. One read of the occupant feeds every decision
   // in this thread, so the answer is a function of the op list and that read.
@@ -188,7 +178,9 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   // the one the shader uses to index the table, which is the point.
   let ci = op.cellIdx / CHUNK_VOL;
   let lo = op.cellIdx % CHUNK_VOL;
-  let wordIdx = voxWordInChunk(ci, lo);
+  // Index and occupant from ONE table resolution (they used to be two).
+  let iw = voxIndexAndWordInChunk(ci, lo);
+  let wordIdx = iw.x;
   // prefab paint mode: fill air only (flag is spare-bit metadata, never stored)
   //
   // Reading a sentinel HERE is legal and correct: a paint-into-air op against
@@ -199,7 +191,7 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   // needs it on EVERY path: an exact-cell op is how island removal and the
   // rubble handoff take matter out of the grid, and those are precisely the
   // writes that can leave something above them unsupported.
-  let prevMat = voxMat(voxWordInChunkAt(ci, lo));
+  let prevMat = voxMat(iw.y);
   if ((word & CELLOP_IF_AIR) != 0u) {
     if (prevMat != MAT_AIR) { return; }
     word &= ~CELLOP_IF_AIR;
