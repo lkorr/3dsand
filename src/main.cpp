@@ -11228,9 +11228,15 @@ int main(int argc, char** argv) {
           const int heldPart = avatar.HeldSlot();
           if (camMode == CameraMode::First) {
             // Show the whole body except the head (its inside would fill the
-            // view). Worn shells over the head are hidden too.
+            // view). Worn shells over the head are hidden too -- and so is
+            // anything else hung off it, which since long hair became a BASE
+            // limb (a generated character's `hair`, parent "head") includes
+            // base slots: starting the sweep at AppendedBase() drew the hair
+            // across the camera. Parents precede children in both ranges
+            // (the base rig is ParentsFirst, an appended slot's host is an
+            // earlier slot), so one forward pass reaches every descendant.
             if (p.head >= 0 && p.head < (int)hide.size()) hide[p.head] = 1;
-            for (int i = avatar.AppendedBase(); i < (int)hide.size(); i++) {
+            for (int i = 0; i < (int)hide.size(); i++) {
               const int par = avatar.PartParent(i);
               if (par >= 0 && par < (int)hide.size() && hide[par] == 1)
                 hide[i] = 1;

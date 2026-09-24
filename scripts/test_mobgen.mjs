@@ -363,7 +363,7 @@ section('D. genome normalisation');
      `got ${round.body.shoulderWidth}`);
   const wild = mg.normalizeGenome({
     body: { heightM: 99, limbWidth: -5, footDepth: 'x' },
-    hair: { style: 'mohawk' }, colors: { skin: 'not a colour' },
+    hair: { style: 'mullet' }, colors: { skin: 'not a colour' },
     face: { eyeCols: 12 },
   });
   ok(wild.body.heightM === mg.HEIGHT_BAND[1],
@@ -660,14 +660,21 @@ section('F. every rolled body is STRUCTURALLY SOUND');
     // art slot. Checked on the written file, not on the builders' return, so a
     // palette bug in the write path cannot pass.
     const { prefab } = readVox(b.vox);
-    const mats = new Set(), cols = new Set();
+    // The hair mass (mobgen.js hairMass) is the one exception, and it is
+    // ONE material of its own: hair_white, never flesh.
+    const mats = new Set(), hairMats = new Set(), cols = new Set();
+    const isHair = n => /^(hair|mane)(\.\d+)?$/.test(n);
     for (const m of prefab.models) {
-      for (const v of m.grid.data) if (v) mats.add(v);
+      for (const v of m.grid.data) if (v) (isHair(m.name) ? hairMats : mats).add(v);
       if (m.grid.color) for (const v of m.grid.color) if (v) cols.add(v);
     }
     ok(mats.size === 1 && [...mats][0] <= 127,
        `${label} is one material, id <= 127`,
        `materials ${[...mats].join(',')}`);
+    const hairId = materials.findIndex(m => m.id === mg.HAIR_MAT_ID) + 1;
+    ok(hairMats.size === 0 || (hairMats.size === 1 && hairMats.has(hairId)),
+       `${label}'s hair is all ${mg.HAIR_MAT_ID}`,
+       `materials ${[...hairMats].join(',')}`);
     ok([...cols].every(c => c >= 128 && c <= 255),
        `${label} paints only art slots`,
        `colours ${[...cols].filter(c => c < 128).join(',')}`);
@@ -760,11 +767,15 @@ section('H. visual distinctness is actually reachable');
   // check is that the LEVERS MOVE VOXELS — a hairstyle that renders identically
   // is a slider that lies.
   const opts = { materials, player: tuning.player, avatar: avatarConstants() };
+  // The head AND the hair mass (hairMass): a style may differ only in hair
+  // that stands off the scalp, which the head brick never sees.
   const headOf = g => {
     const b = mg.generateMob(g, 0, opts);
-    const p = b.parts.find(x => x.name === 'head');
-    return { shape: p.cells.map(([x, y, z]) => `${x},${y},${z}`).sort().join(';'),
-             paint: p.cells.map(c => c.join(',')).sort().join(';') };
+    const ps = b.parts.filter(x => x.name === 'head' || x.hair);
+    const cells = ps.flatMap(p => p.cells.map(([x, y, z, c]) =>
+      [p.mn[0] + x, p.mn[1] + y, p.mn[2] + z, c]));
+    return { shape: cells.map(([x, y, z]) => `${x},${y},${z}`).sort().join(';'),
+             paint: cells.map(c => c.join(',')).sort().join(';') };
   };
   const base = headOf(mg.defaultGenome());
   const seenShapes = new Set();
