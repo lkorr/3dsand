@@ -2005,12 +2005,23 @@ class Mob {
   // runs the MATTER passes on it (burn, rot, stain, carve, bleed-out) and none
   // of the AGENCY passes (AI, gait, pose, voices, hp -> death).
   //
-  // Two bodies still go straight to DebrisSystem, through ReleaseRigToDebris,
-  // which is the old adoption loop verbatim: a GHOST (the peer owns its
-  // corpse) and the PLAYER AVATAR (not in mobs_; its corpse is anonymous
-  // debris exactly as before, unless the bite is going to stand it back up —
-  // then the rig is kept until the rising reads it, MobSystem::ServiceRisings).
+  // One body still goes straight to DebrisSystem, through ReleaseRigToDebris,
+  // which is the old adoption loop verbatim: the PLAYER AVATAR (not in mobs_;
+  // its corpse is anonymous debris exactly as before, unless the bite is going
+  // to stand it back up — then the rig is kept until the rising reads it,
+  // MobSystem::ServiceRisings).
+  //
+  // A GHOST DOES NOT DIE HERE (P2c). Its life is its owner's to end: a blow
+  // struck on this machine lands on the local copy (M9's rule for a remote
+  // creature — nothing is forwarded), and if it takes the copy's hp to zero
+  // the copy waits for the owner's pose to say alive = 0, which is what
+  // EnterGhostDeath is for.
   void Die();
+  // THE OWNER SAYS IT IS DEAD (MobPose.alive = 0, MobSystem::ApplyPose). The
+  // agency state Die() clears, cleared; `alive_` false; the death cry. And
+  // nothing else: no rising (the owner books it), no ragdoll flip (the limbs
+  // stay kinematic and go on being placed from the pose stream), no debris.
+  void EnterGhostDeath();
   // THE OLD CORPSE, ON DEMAND: hand every limb to DebrisSystem::AdoptBody as
   // dead flesh, re-tie the garments as debris straps, and forget the rig. Used
   // for the dead-cap eviction (oldest corpse decays to debris), a corpse that
@@ -4901,6 +4912,23 @@ class MobSystem {
   // own is NOT removed by this (the owner of a creature is the only one who
   // may kill it) and the call reports false.
   bool ApplyGone(const ::net::MobGone& g);
+  // ---- THE DEAD ON THE WIRE (PLAN_corpse_is_a_mob.md P2c) ------------------
+  //
+  // What a pose cannot carry: a corpse's gear and its carve/sever state. The
+  // owner sends a MobState when StateKey changes (net::EntitySync::Build);
+  // the ghost re-dresses if the gear list differs (strip, then ApplyWireGear
+  // in rig-slot order, so the slots line up with the pose stream) and
+  // overlays the record exactly as a handoff does — minus the ownership.
+  //
+  // StateKey is a digest of what that record would say that CAN change on a
+  // corpse: per limb whether it has a body and its two lattice sizes (a cut
+  // removes voxels, a sever removes the body), the worn pieces, the held item
+  // and the pack. A coat does not move it — a ghost's coat is stale, the
+  // known M9 limit — and neither does a pose. 0 for an unknown id.
+  uint64_t StateKey(uint64_t mobId) const;
+  bool BuildState(uint64_t mobId, ::net::MobState& out) const;
+  // False for an unknown id, a mob I own, or a record this build cannot read.
+  bool ApplyState(const ::net::MobState& s);
   // DRESS A CREATURE FROM AN ANNOUNCE'S GEAR LIST, by name, through the
   // ordinary WearItem/EquipItem. Factored out because `ApplyHandoff` and
   // `ApplyAnnounce` must dress identically — the announce lists gear in

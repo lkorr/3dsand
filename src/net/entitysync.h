@@ -23,10 +23,13 @@
 //   2. POSE EVERY TICK WHILE INSIDE. The smallest record, and the only one
 //      that repeats. Bodies get the sleeping-body discount for free:
 //      `DebrisSystem::OwnedBodiesNear` already declines to list a settled
-//      body (debris.h's note on `inactiveTicks`).
-//   3. GONE WHEN IT LEAVES, DIES, OR IS RELEASED. Three causes, one record,
-//      distinguished by `reason` for the diagnostics and by nothing else:
-//      the receiver's job is identical in all three.
+//      body (debris.h's note on `inactiveTicks`); an asleep corpse Mob is
+//      posed on a keyframe (kDeadPoseKeyframeTicks). A DEAD Mob is still
+//      posed (alive = 0) and additionally sends a MobState when its shape
+//      changes (P2c).
+//   3. GONE WHEN IT LEAVES, IS RELEASED, OR ITS CORPSE DECAYS TO DEBRIS. One
+//      record, distinguished by `reason` for the diagnostics and by nothing
+//      else: the receiver's job is identical. A death is NOT a gone any more.
 //   4. HANDOFF WHEN AUTHORITY FLIPS, and it is sent by the SIDE LOSING IT.
 //      See the long note on `ScanHandoffs` — the receiving side does not
 //      wait for it.
@@ -67,7 +70,35 @@ namespace net {
 // Bumped whenever the envelope's field order changes. The RECORDS inside
 // carry their own versions (kMobSyncVersion, kDebrisWireVersion); this one is
 // about the envelope alone.
-inline constexpr uint32_t kEntityBatchVersion = 1;
+//   2 (P2c, PLAN_corpse_is_a_mob.md): `mobStates` between the announces and
+//     the poses.
+inline constexpr uint32_t kEntityBatchVersion = 2;
+
+// ---- THE DEAD ON THE WIRE (PLAN_corpse_is_a_mob.md P2c) --------------------
+//
+// An ASLEEP corpse (Mob::DeadAsleep) is posed once per this many ticks instead
+// of every tick: nothing about it moves, so the only reason to send it at all
+// is the ghost-expiry backstop (kGhostExpiryTicks), which would otherwise drop
+// a corpse that merely lay still. 30 = one pose a second, a third of the
+// expiry, so one lost keyframe cannot expire it. This is the same discount
+// debris gets from `OwnedBodiesNear` (which sends a settled body nothing),
+// plus the keyframe the expiry clock needs.
+inline constexpr uint32_t kDeadPoseKeyframeTicks = 30;
+// A corpse being hacked at changes shape every blow. Its MobState (the whole
+// per-mob record: a few KB for a pristine rig, ~250 KB for a carved,
+// armoured one — `mob-handoff` records the size) goes out at most once per
+// this many ticks; a change inside the window goes out at the end of it,
+// because the key is compared against the last one SENT. 10 = a third of a
+// second of lag on the peer's view of a cut, and at most three records a
+// second per corpse under a sustained hacking.
+inline constexpr uint32_t kDeadStateMinTicks = 10;
+// ...and at most this many MobStates ride one batch. A skirmish's worth of
+// deaths in one tick is a dozen records at once (measured by `net-corpse`: 12
+// fresh corpses put a ~0.5 MB batch on the wire); capped, the rest go out on
+// the following ticks, because an unsent key still differs from the last one
+// sent. The pose already says "dead" meanwhile, so what waits is only the
+// wound detail.
+inline constexpr uint32_t kMaxDeadStatesPerBatch = 2;
 
 // How far past the peer's window edge an entity is still interesting. ONE
 // chunk, matching the plan's "the peer's window + 1 chunk": an entity exactly
@@ -97,18 +128,21 @@ inline constexpr uint32_t kGhostExpiryTicks = 90;
 // thing it can stand on.
 //
 // THE FIELD ORDER IS THE APPLY ORDER and it is load-bearing:
-//   handoffs -> announces -> poses -> gones -> takes -> grants.
+//   handoffs -> announces -> states -> poses -> gones -> takes -> grants.
 // A handoff carries its own announce, so it must run before an announce that
 // would re-create the thing it just adopted; an announce must run before the
 // pose that moves it; a gone must run after the pose (a body that died this
 // tick should be seen at its last position, not left at its previous one);
 // and an item grant must run after the gone that may have removed its body.
+// A state (P2c) re-dresses a corpse, which renumbers its rig slots, so it runs
+// before the pose that is indexed by them.
 struct EntityBatch {
   uint32_t tick = 0;      // the label
   uint32_t playerId = 0;  // the sender
 
   std::vector<MobHandoff> mobHandoffs;
   std::vector<MobAnnounce> mobAnnounces;
+  std::vector<MobState> mobStates;
   std::vector<MobPose> mobPoses;
   std::vector<MobGone> mobGones;
 
@@ -121,14 +155,16 @@ struct EntityBatch {
   std::vector<ItemGrant> itemGrants;
 
   bool Empty() const {
-    return mobHandoffs.empty() && mobAnnounces.empty() && mobPoses.empty() &&
+    return mobHandoffs.empty() && mobAnnounces.empty() &&
+           mobStates.empty() && mobPoses.empty() &&
            mobGones.empty() && bodyHandoffs.empty() && bodyAnnounces.empty() &&
            bodyPoses.empty() && bodyGones.empty() && itemTakes.empty() &&
            itemGrants.empty();
   }
   void Clear();
   size_t RecordCount() const {
-    return mobHandoffs.size() + mobAnnounces.size() + mobPoses.size() +
+    return mobHandoffs.size() + mobAnnounces.size() + mobStates.size() +
+           mobPoses.size() +
            mobGones.size() + bodyHandoffs.size() + bodyAnnounces.size() +
            bodyPoses.size() + bodyGones.size() + itemTakes.size() +
            itemGrants.size();
@@ -242,6 +278,9 @@ class EntitySync {
     // the pose loop in ApplyForTick.
     uint64_t posesMine = 0;     // for an entity this machine now owns
     uint64_t posesStale = 0;    // older than the pose already latched
+    // P2c: the dead on the wire. `posesAsleep` = poses NOT sent because the
+    // corpse was asleep between keyframes (the bandwidth the discount saved).
+    uint64_t statesOut = 0, statesIn = 0, posesAsleep = 0;
     uint32_t ghostsNow = 0;     // ghost mobs + ghost bodies at the last apply
     uint32_t ghostsMax = 0;
     uint64_t expired = 0;       // ghosts dropped by the 3 s rule
@@ -273,6 +312,15 @@ class EntitySync {
   // existing (Gone/death), or it changed hands (the handoff carries its own
   // announce, so the new owner re-announces from its side).
   std::unordered_set<uint64_t> announcedMobs_, announcedBodies_;
+  // P2c, per announced mob: the label of the last pose sent (the asleep
+  // keyframe clock), and for a DEAD one the last MobState key sent and when.
+  // An id in `mobStateSent_` is one the peer knows as a corpse.
+  struct DeadSent {
+    uint64_t key = 0;
+    uint32_t label = 0;
+  };
+  std::unordered_map<uint64_t, uint32_t> mobPoseSent_;
+  std::unordered_map<uint64_t, DeadSent> mobStateSent_;
 
   // Ghost id -> the tick we last saw a pose/announce for it. Rule 3's clock.
   std::unordered_map<uint64_t, uint32_t> ghostMobSeen_, ghostBodySeen_;

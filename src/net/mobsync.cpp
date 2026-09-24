@@ -173,4 +173,20 @@ bool Decode(ByteReader& r, MobGone& g) {
   return r.ok;
 }
 
+void Encode(ByteWriter& w, const MobState& s) {
+  w.U32(kMobSyncVersion);
+  // The announce nested whole, as the handoff nests it (same reason).
+  Encode(w, s.announce);
+  w.U32(s.recordVersion);
+  w.PodVec(s.record);
+}
+
+bool Decode(ByteReader& r, MobState& s) {
+  if (!ReadVersion(r)) return false;
+  if (!Decode(r, s.announce)) return false;
+  r.U32(s.recordVersion);
+  r.PodVec(s.record);
+  return r.ok;
+}
+
 }  // namespace net
