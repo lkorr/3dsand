@@ -68,4 +68,17 @@ bool GasRenderActive();
 void SetGasFarRenderActive(bool active);
 bool GasFarRenderActive();
 
+// ---- the clouds (cloud.wgsl, src/sim/weather.h) ----------------------------
+// What this frame's WriteRenderParams decided about the clouds, for the one
+// reader that records their passes (Simulation::EncodeShadowResolve). Same
+// shape and same reason as RenderSpec: a value the uniform ALREADY carries,
+// published so the recorder and the shader cannot disagree about whether the
+// cloud buffers were written this frame (RenderParams.weatherFlags RWF_CLOUDS
+// is set from exactly this `on`).
+struct CloudFrame {
+  bool on = false;       // the cloud rows record, and the composite reads
+  unsigned lowW = 1, lowH = 1;
+};
+const CloudFrame& LastCloudFrame();
+
 }  // namespace sandvox

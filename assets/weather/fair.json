@@ -1,0 +1,18 @@
+{
+  "label": "Fair",
+  "about": "Fair-weather cumulus: small, flat-based, well separated, bright tops. The default sky.",
+  "moisture": 0.2,
+  "weight": 2.0,
+  "coverage": 0.34,
+  "cloudType": 0.45,
+  "density": 0.9,
+  "baseM": 1300,
+  "thicknessM": 1400,
+  "darkness": 0.0,
+  "cirrus": 0.25,
+  "cirrusAltM": 8000,
+  "precip": 0.0,
+  "precipType": 0.0,
+  "mist": 0.0,
+  "lightning": 0.0
+}

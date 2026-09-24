@@ -135,6 +135,9 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     // to run (pass_table.def's fill_gasOuter note).
     case pass::Cond::GasOuter:   return cx.gasActive || cx.gasFarEmitCount > 0;
     case pass::Cond::ReposeActive: return cx.reposeActive;
+    case pass::Cond::Clouds:        return (cx.cloudFlags & 1u) != 0u;
+    case pass::Cond::CloudBake:     return (cx.cloudFlags & 2u) != 0u;
+    case pass::Cond::ShadowCacheOn: return (cx.cloudFlags & 4u) != 0u;
   }
   return false;
 }
@@ -173,6 +176,8 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
       return cx.gasFarEmitCount;
     case pass::DispatchSel::GasFarWideSel:
       return cx.gasFarWideCount;
+    case pass::DispatchSel::CloudGx: return cx.cloudGx;
+    case pass::DispatchSel::CloudGy: return cx.cloudGy;
     default:                          return v;
   }
 }

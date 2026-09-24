@@ -138,6 +138,7 @@ void World::Init(const rhi::Device& device) {
   opsBuf = CreateBuffer(device, kMaxOpsPerTick * sizeof(BrushOp),
                         U::Storage | U::CopyDst, "brushOps");
   renderUBO = CreateBuffer(device, sizeof(RenderParams), U::Uniform | U::CopyDst, "renderUBO");
+  cloudUBO = CreateBuffer(device, sizeof(CloudParams), U::Uniform | U::CopyDst, "cloudUBO");
   dirtyViz = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopyDst, "dirtyViz");
   actVoxViz = CreateBuffer(device, kActVoxVizBytes, U::Storage | U::CopyDst, "actVoxViz");
   // Shadow cache (world.h kShadowCacheBuckets). CopyDst so a zero-fill can

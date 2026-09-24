@@ -862,6 +862,11 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   // left the overlay permanently off with nothing to see. Three structs, one
   // value; all three or none.
   cxv.vizActive = cx.vizActive;
+  // The clouds' three switches and their dispatch extent. Same rule as the
+  // note above: three structs, one value; all three or none.
+  cxv.cloudFlags = cx.cloudFlags;
+  cxv.cloudGx = cx.cloudGx;
+  cxv.cloudGy = cx.cloudGy;
   e->rec->RecordTable(which, cxv);
 }
 

@@ -6,8 +6,10 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <thread>
+#include <vector>
 
 #include "gpu/resources.h"
 #include "sim/farplumes.h"  // FarPlumes::SetMaterials (what a frozen fire is)
@@ -552,6 +554,15 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // never hashed, never saved, no sim binding. Storage (not ReadOnly)
         // because the raymarch writes it; the body shaders declare it `read`.
         entry(24, T::Storage, S::Fragment),                       // waterVeil
+        // THE CLOUDS (cloud.wgsl, common.wgsl's CloudParams block). The
+        // accumulated low-res cloud image the sky composite upsamples (25);
+        // the shadow + env maps (26), which the BODY paths read too — debris
+        // shades per vertex, hence Vertex; and the cloud uniform (27). All
+        // render-private derived data written by the ShadowCache table's
+        // cloud rows earlier in the same command buffer.
+        entry(25, T::ReadOnlyStorage, S::Fragment),               // cloudHist
+        entry(26, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // cloudMaps
+        entry(27, T::Uniform, S::Fragment | S::Vertex),           // CloudParams
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -689,6 +700,33 @@ bool Simulation::Init(const rhi::Device& device, World& world,
                                                  std::size(rpentries), "renderPartBG");
   }
   {
+    // THE CLOUDS' fixed-size buffers (world.h kCloud*). The screen-sized pair
+    // starts at one pixel and is grown by EnsureClouds; every one of them is
+    // initialised to "clear sky" so a read before the first cloud pass sees
+    // transmittance 1, not the zeros that would black the sky out.
+    using U = rhi::BufferUsage;
+    cloudNoiseBuf_ = CreateBuffer(device, kCloudNoiseWords * 4, U::Storage, "cloudNoise");
+    cloudWeatherBuf_ = CreateBuffer(device, (uint64_t)kCloudWeatherN * kCloudWeatherN * 4,
+                                    U::Storage | U::CopyDst, "cloudWeather");
+    cloudMapsBuf_ = CreateBuffer(device, kCloudMapsWords * 4, U::Storage | U::CopyDst,
+                                 "cloudMaps");
+    cloudPixels_ = 0;
+    cloudBaked_ = false;
+    {
+      std::vector<uint32_t> init((size_t)kCloudMapsWords, 0u);
+      const float one = 1.0f;
+      uint32_t oneBits;
+      std::memcpy(&oneBits, &one, 4);
+      const size_t shadowWords = (size_t)kCloudShadowN * kCloudShadowN;
+      for (size_t i = 0; i < shadowWords; i++) init[i] = oneBits;
+      // pack2x16float(vec2(b = 0, T = 1)): half 1.0 is 0x3C00 in the high lane.
+      const size_t envEnd = shadowWords + (size_t)kCloudEnvN * kCloudEnvN * 2;
+      for (size_t i = shadowWords + 1; i < envEnd; i += 2) init[i] = 0x3C000000u;
+      device.GetQueue().WriteBuffer(cloudMapsBuf_, 0, init.data(), init.size() * 4);
+    }
+    EnsureClouds(1, 1);
+  }
+  {
     // One record's worth is below VEIL_WORDS, so the shaders' bounds test
     // reads NO veil from either buffer until EnsureVeil sizes the live one.
     using U = rhi::BufferUsage;
@@ -736,26 +774,23 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // written here and bound nowhere else — the fragment shader reads the
         // published 8-bit value out of shadowCache and never this.
         entry(11, T::Storage),         // shadowHist
+        entry(12, T::Uniform),         // CloudParams
+        entry(13, T::Storage),         // cloudNoise
+        entry(14, T::Storage),         // cloudWeather
+        entry(15, T::Storage),         // cloudMaps
+        entry(16, T::Storage),         // cloudRaw
+        entry(17, T::Storage),         // cloudHist
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
-    rhi::BindGroupEntry bges[] = {
-        b(0, world_->voxels),
-        b(1, world_->occupancy),
-        b(2, materialBuf_),
-        b(3, world_->renderUBO),
-        b(4, world_->pageTable),
-        b(5, world_->shadowCache),
-        b(6, world_->shadowReq),
-        b(7, world_->shadowArgsStage),
-        b(8, world_->irradiance),
-        b(9, world_->opennessGen),
-        b(10, world_->openness),
-        b(11, world_->shadowHist),
-    };
-    shadowBG_ = device.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
+    // THE CLOUDS share this layout (cloud.wgsl): same per-frame table, same
+    // compute stage, and binding 3 (RenderParams) is the one input they have
+    // in common with the resolve. 12 is their uniform, 13..17 their buffers.
+    // The bind group itself is built by BuildShadowBindGroup, because
+    // EnsureClouds replaces two of those buffers whenever the target grows.
     rhi::BindGroupLayout shadowGroups[] = {shadowBGL_};
     shadowPL_ = device.CreatePipelineLayout(shadowGroups, 1);
+    BuildShadowBindGroup();
   }
   // ---- the TAA resolve's layout (taa.wgsl) --------------------------------
   // Its OWN layout, sharing nothing with renderBGL_: this pass reads none of
@@ -1407,6 +1442,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // because BuildPipelines is the single place F5 recompiles, and the cache's
   // enable flag has to be recomputed in lockstep with raymarch.wgsl's const.
   rhi::ShaderModule mShadow;
+  // The clouds (cloud.wgsl): six render-path entry points on shadowPL_, loaded
+  // here for mShadow's reason — F5 recompiles everything through this function.
+  rhi::ShaderModule mCloud;
   rhi::ShaderModule mExplode, mParticle, mFluid, mFluidSeam, mWaterBody, mGas;
   rhi::ShaderModule mRay, mDebris, mMicroBody, mDebugLines, mDebugWind, mDebugCur;
   // The TAA resolve (taa.wgsl). Its own tiny module on purpose: the render
@@ -1430,6 +1468,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mOpenness, "sim_openness.wgsl");
     mod(&mGlow, "sim_glow.wgsl");
     mod(&mShadow, "shadow_resolve.wgsl");
+    mod(&mCloud, "cloud.wgsl");
     mod(&mExplode, "sim_explode.wgsl");
     mod(&mParticle, "sim_particle.wgsl");
     mod(&mGas, "sim_gas.wgsl");
@@ -1492,6 +1531,14 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // enable path is ONE test in one place rather than a load-time fork.
   pool.Add([&] { shadowPrepare_ = MakeComputePipeline(device, shadowPL_, mShadow, "prepare", "shadowPrepare"); });
   pool.Add([&] { shadowResolve_ = MakeComputePipeline(device, shadowPL_, mShadow, "resolve", "shadowResolve"); });
+  if (mCloud) {
+    pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
+    pool.Add([&] { cloudWeather_ = MakeComputePipeline(device, shadowPL_, mCloud, "weather", "cloudWeather"); });
+    pool.Add([&] { cloudShadow_ = MakeComputePipeline(device, shadowPL_, mCloud, "shadow", "cloudShadow"); });
+    pool.Add([&] { cloudEnv_ = MakeComputePipeline(device, shadowPL_, mCloud, "env", "cloudEnv"); });
+    pool.Add([&] { cloudMarch_ = MakeComputePipeline(device, shadowPL_, mCloud, "march", "cloudMarch"); });
+    pool.Add([&] { cloudResolve_ = MakeComputePipeline(device, shadowPL_, mCloud, "resolve", "cloudResolve"); });
+  }
   pool.Add([&] { mutate_ = MakeComputePipeline(device, simPL_, mMutate, "main", "mutate"); });
   pool.Add([&] { mutateCells_ = MakeComputePipeline(device, simPL_, mMutate, "cells", "mutateCells"); });
   // The wind primitive footprint wake — same module, third entry point. It
@@ -1584,6 +1631,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // the point: the pass and the shader must agree, and F5 recompiles both
   // through this function, so a tuning flip cannot leave one side switched.
   // AFTER the join, because it reads two pipelines the pool produced.
+  // A fresh cloud pipeline may be a fresh noise function: rebake on the next
+  // frame rather than trust a volume the old shader wrote.
+  cloudBaked_ = false;
   shadowCacheOn_ = FragmentStoresAvailable() &&
                    CurrentTuning().render.shadowCache != 0 &&
                    (bool)shadowPrepare_ && (bool)shadowResolve_;
@@ -1868,6 +1918,9 @@ struct RecordCtx {
   uint32_t gasFarWideCount = 0;
   // Angle of repose (world.h kReposeSnap*). See the latch in EncodeTick.
   bool reposeActive = false;
+  // The per-frame table's switches (rhi_record.h TableCtx::cloudFlags).
+  uint32_t cloudFlags = 0;
+  uint32_t cloudGx = 0, cloudGy = 0;
 };
 
 // NOTE: the condition and dispatch-extent resolvers that used to live here
@@ -1970,6 +2023,12 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::GasFarEmit:          return world_->gasFarEmit;
     case B::GasFarOuter:         return world_->gasFarOuter;
     case B::ReposeSnap:          return world_->reposeSnap;
+    case B::CloudUBO:            return world_->cloudUBO;
+    case B::CloudNoise:          return cloudNoiseBuf_;
+    case B::CloudWeather:        return cloudWeatherBuf_;
+    case B::CloudMaps:           return cloudMapsBuf_;
+    case B::CloudRaw:            return cloudRawBuf_;
+    case B::CloudHist:           return cloudHistBuf_;
     default:                return world_->voxels;
   }
 }
@@ -2012,6 +2071,12 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::GlowSrc:         return glowSrc_;
     case P::GlowField:       return glowField_;
     case P::GlowRefresh:     return glowRefresh_;
+    case P::CloudNoise:     return cloudNoise_;
+    case P::CloudWeather:   return cloudWeather_;
+    case P::CloudShadow:    return cloudShadow_;
+    case P::CloudEnv:       return cloudEnv_;
+    case P::CloudMarch:     return cloudMarch_;
+    case P::CloudResolve:   return cloudResolve_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -2099,6 +2164,9 @@ void Simulation::RecordTable(const rhi::CommandEncoder& enc, pass::Table which,
   tc.gasFarEmitCount = cx.gasFarEmitCount;
   tc.gasFarWideCount = cx.gasFarWideCount;
   tc.reposeActive = cx.reposeActive;
+  tc.cloudFlags = cx.cloudFlags;
+  tc.cloudGx = cx.cloudGx;
+  tc.cloudGy = cx.cloudGy;
 
   rhi::TableBindings tb{};
   for (int i = 0; i < (int)pass::Buf::kCount; i++)
@@ -2175,8 +2243,25 @@ void Simulation::EncodeFarFill(const rhi::CommandEncoder& enc, uint32_t count) {
 }
 
 void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
-  if (!shadowCacheOn_) return;
+  // The per-FRAME table carries two systems now: the voxel shadow cache and
+  // the clouds. Each has its own row condition, so this records whichever of
+  // them is live and returns early only when neither is.
+  const sandvox::CloudFrame& cf = sandvox::LastCloudFrame();
+  const bool clouds = cf.on && cloudMarch_ && cloudResolve_ && cloudWeather_ &&
+                      cloudShadow_ && cloudEnv_ && cloudNoise_;
+  if (!shadowCacheOn_ && !clouds) return;
   RecordCtx cx{};
+  cx.cloudFlags = (shadowCacheOn_ ? 4u : 0u);
+  if (clouds) {
+    EnsureClouds(cf.lowW, cf.lowH);
+    cx.cloudFlags |= 1u;
+    if (!cloudBaked_) {
+      cx.cloudFlags |= 2u;
+      cloudBaked_ = true;
+    }
+    cx.cloudGx = (cf.lowW + 7) / 8;
+    cx.cloudGy = (cf.lowH + 7) / 8;
+  }
   RecordTable(enc, pass::Table::ShadowCache, &cx);
 }
 
@@ -2686,6 +2771,9 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(22, world_->waterFlux),
         b(23, world_->gasFarOuter),
         b(24, veil),
+        b(25, cloudHistBuf_),
+        b(26, cloudMapsBuf_),
+        b(27, world_->cloudUBO),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
@@ -2703,6 +2791,66 @@ void Simulation::EnsureVeil(uint32_t width, uint32_t height) {
   veilBuf_ = CreateBuffer(device_, px * 6 * 4, rhi::BufferUsage::Storage,
                           "waterVeil");
   BuildRenderBindGroup(renderBG_, veilBuf_);
+}
+
+// The shadow cache's bind group, which the clouds share (cloud.wgsl binds 3
+// and 12..17 of it). Rebuilt by EnsureClouds when the screen-sized pair is
+// replaced; the voxel side never changes after Init.
+void Simulation::BuildShadowBindGroup() {
+  auto b = [](uint32_t binding, const rhi::Buffer& buf) {
+    rhi::BindGroupEntry e{};
+    e.binding = binding;
+    e.buffer = buf;
+    e.size = 0;
+    return e;
+  };
+  if (!shadowBGL_ || !cloudRawBuf_) return;
+  rhi::BindGroupEntry bges[] = {
+      b(0, world_->voxels),
+      b(1, world_->occupancy),
+      b(2, materialBuf_),
+      b(3, world_->renderUBO),
+      b(4, world_->pageTable),
+      b(5, world_->shadowCache),
+      b(6, world_->shadowReq),
+      b(7, world_->shadowArgsStage),
+      b(8, world_->irradiance),
+      b(9, world_->opennessGen),
+      b(10, world_->openness),
+      b(11, world_->shadowHist),
+      b(12, world_->cloudUBO),
+      b(13, cloudNoiseBuf_),
+      b(14, cloudWeatherBuf_),
+      b(15, cloudMapsBuf_),
+      b(16, cloudRawBuf_),
+      b(17, cloudHistBuf_),
+  };
+  shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
+}
+
+// Grow-only, like EnsureVeil: a --shot or portrait at a smaller size never
+// reallocates. The history is written "clear sky" (c = 0, T = 1) on creation so
+// the first composite after a resize draws no phantom cloud from garbage.
+void Simulation::EnsureClouds(uint32_t lowW, uint32_t lowH) {
+  const uint64_t px = std::max<uint64_t>((uint64_t)lowW * lowH, 1);
+  if (px <= cloudPixels_ && cloudRawBuf_ && cloudHistBuf_) return;
+  cloudPixels_ = px;
+  using U = rhi::BufferUsage;
+  cloudRawBuf_ = CreateBuffer(device_, px * kCloudRawWords * 4, U::Storage, "cloudRaw");
+  const uint64_t histWords = px * kCloudHistWords * 2;
+  cloudHistBuf_ = CreateBuffer(device_, histWords * 4, U::Storage | U::CopyDst, "cloudHist");
+  std::vector<uint32_t> init((size_t)histWords, 0u);
+  // (r,g) = 0, (b 0, T 1), (Td 1, -): clear sky.
+  for (size_t i = 0; i + 2 < init.size(); i += 3) {
+    init[i + 1] = 0x3C000000u;
+    init[i + 2] = 0x00003C00u;
+  }
+  device_.GetQueue().WriteBuffer(cloudHistBuf_, 0, init.data(), init.size() * 4);
+  BuildShadowBindGroup();
+  if (renderBGL_) {
+    if (veilBuf_) BuildRenderBindGroup(renderBG_, veilBuf_);
+    if (veilNone_) BuildRenderBindGroup(renderBGNoVeil_, veilNone_);
+  }
 }
 
 void Simulation::EnsureDepth(uint32_t width, uint32_t height) {

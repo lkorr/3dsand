@@ -18,6 +18,7 @@
 #include "gpu/rhi_vulkan.h"
 #include "sim/tuning.h"  // the Combat panel edits melee/combatfx/gore live
 #include "sim/world.h"   // kWindPrimCap for the primitive panel
+#include "sim/weather.h" // the weather row: preset pin + readout
 #include "ui/inventory_ui.h"
 #include "ui/theme.h"
 
@@ -917,6 +918,92 @@ void Overlay::Draw(UIState& s) {
   ImGui::SameLine();
   ImGui::RadioButton("current##fieldviz", &s.fieldViz, UIState::kFieldVizCurrent);
   fieldVizTip();
+
+  // ---- the sky's weather (src/sim/weather.h) -------------------------------
+  // Its own section of the F1 panel, open by default: the preset pin (a
+  // render-only override that eases the sky over weather.transitionSeconds
+  // without touching tuning.json — the running game writes that file, and a
+  // look switch must not clobber saved defaults), and live edits of the
+  // CPU-only weather knobs. Every one of them is render-only: the world hash
+  // never sees the weather, so nothing here needs a shader reload or moves a
+  // pinned number.
+  ImGui::Separator();
+  if (ImGui::CollapsingHeader("Weather", ImGuiTreeNodeFlags_DefaultOpen)) {
+    const std::vector<weather::Preset>& ps = weather::Presets().Presets();
+    const std::string cur = weather::Override();
+    const weather::State& w = weather::Last();
+    const char* shown = cur.empty() ? "(automatic / tuning)" : cur.c_str();
+    if (ImGui::BeginCombo("sky##wxcombo", shown)) {
+      if (ImGui::Selectable("(automatic / tuning)", cur.empty())) weather::SetOverride("");
+      for (const weather::Preset& p : ps) {
+        std::string lab = p.label + "##wx" + p.name;
+        if (ImGui::Selectable(lab.c_str(), cur == p.name)) weather::SetOverride(p.name);
+      }
+      ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "Pin the sky to one assets/weather preset; it eases in over\n"
+          "weather.transitionSeconds. (automatic / tuning) hands it back to\n"
+          "the automatic cycle, or to weather.preset when that is off.\n"
+          "Render-only: the world hash never sees it. R reloads the files.");
+    // One-click row: the presets as small buttons, so switching the sky
+    // while looking at it is a single click rather than a dropdown.
+    {
+      int n = 0;
+      for (const weather::Preset& p : ps) {
+        if (n++ % 4 != 0) ImGui::SameLine();
+        const bool on = cur == p.name;
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        std::string lab = p.label + "##wxb" + p.name;
+        if (ImGui::SmallButton(lab.c_str())) weather::SetOverride(on ? "" : p.name);
+        if (on) ImGui::PopStyleColor();
+      }
+    }
+    if (w.fromName == w.toName)
+      ImGui::Text("now: %s", w.fromName.c_str());
+    else
+      ImGui::Text("now: %s -> %s (%.0f%%)", w.fromName.c_str(), w.toName.c_str(),
+                  w.blend * 100.0f);
+    ImGui::Text("cover %.2f  rain %.2f  wet %.2f  overcast %.2f%s", w.mix.coverage,
+                w.mix.precip, w.wetness, w.overcast, w.flash > 0.05f ? "  *flash*" : "");
+
+    Tuning t = CurrentTuning();
+    Tuning::Weather& wt = t.weather;
+    bool changed = false;
+    changed |= ImGui::Checkbox("clouds##wx", &wt.clouds);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Master switch. Off records no cloud pass at all.");
+    ImGui::SameLine();
+    changed |= ImGui::Checkbox("automatic cycle##wx", &wt.autoCycle);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "On: the sky walks the preset ladder by moisture on its own\n"
+          "(clear -> fair -> scattered -> overcast -> rain -> storm and back).\n"
+          "Off: it holds weather.preset. A pin above overrides both.");
+    changed |= EditableSliderFloat("cycle speed##wx", &wt.cycleSpeed, 0.0f, 50.0f, "%.1fx");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "How fast the automatic weather runs. 0 freezes it; 20x shows a\n"
+          "whole afternoon of weather in a few minutes.");
+    changed |= EditableSliderFloat("coverage bias##wx", &wt.coverageBias, -1.0f, 1.0f, "%+.2f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Added to every preset's coverage: cloudier / clearer.");
+    changed |= EditableSliderFloat("raininess x##wx", &wt.precipScale, 0.0f, 4.0f, "%.2fx");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Multiplies every preset's raininess: wetter / drier.");
+    changed |= EditableSliderFloat("ease (s)##wx", &wt.transitionSeconds, 0.0f, 60.0f, "%.0f s");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("How long a pinned change takes to blend in.");
+    if (ImGui::SmallButton("reroll weather##wx")) {
+      wt.seedOffset = (wt.seedOffset + 1) % 1000;
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("A different automatic weather sequence (weather.seedOffset).");
+    if (changed) SetCurrentTuning(t);
+  }
+  ImGui::Separator();
 
   // ---- wind force multipliers, one per tier -------------------------------
   // Live: these ride TickParams, so a drag lands on the next tick with no

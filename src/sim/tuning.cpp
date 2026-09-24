@@ -2100,6 +2100,24 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "weather";
     ReadB(*g, "waterFreezes", w.waterFreezes, out, at);
     ReadB(*g, "iceMelts", w.iceMelts, out, at);
+    // The sky half (weather.h). Clamped here, not trusted: a negative epoch or
+    // a transition of 0 would divide by zero in weather::Resolve.
+    ReadB(*g, "clouds", w.clouds, out, at);
+    ReadB(*g, "autoCycle", w.autoCycle, out, at);
+    ReadStr(*g, "preset", w.preset, out, at);
+    ReadF(*g, "epochMinutes", w.epochMinutes, out, at);
+    ReadF(*g, "cycleSpeed", w.cycleSpeed, out, at);
+    ReadI(*g, "seedOffset", w.seedOffset, out, at);
+    ReadF(*g, "transitionSeconds", w.transitionSeconds, out, at);
+    ReadF(*g, "coverageBias", w.coverageBias, out, at);
+    ReadF(*g, "precipScale", w.precipScale, out, at);
+    ReadF(*g, "drySeconds", w.drySeconds, out, at);
+    w.epochMinutes = std::clamp(w.epochMinutes, 0.5f, 600.0f);
+    w.cycleSpeed = std::clamp(w.cycleSpeed, 0.0f, 1000.0f);
+    w.transitionSeconds = std::clamp(w.transitionSeconds, 0.0f, 600.0f);
+    w.coverageBias = std::clamp(w.coverageBias, -1.0f, 1.0f);
+    w.precipScale = std::clamp(w.precipScale, 0.0f, 4.0f);
+    w.drySeconds = std::clamp(w.drySeconds, 5.0f, 36000.0f);
   }
 
   // ---- combustion: read by the REACTION COMPILER, not by a kernel ----
@@ -2566,6 +2584,56 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "farPlumeStrength", r.farPlumeStrength, out, at);
     ReadF(*g, "farPlumeHeight", r.farPlumeHeight, out, at);
     ReadF(*g, "farPlumeRange", r.farPlumeRange, out, at);
+    // clouds (cloud.wgsl). Clamped to the tuner's ranges: a 0 scale divides
+    // by zero in the march and a 0 step count marches nothing forever.
+    ReadF(*g, "cloudShapeScaleM", r.cloudShapeScaleM, out, at);
+    ReadF(*g, "cloudDetailScaleM", r.cloudDetailScaleM, out, at);
+    ReadF(*g, "cloudWeatherScaleM", r.cloudWeatherScaleM, out, at);
+    ReadF(*g, "cloudExtinction", r.cloudExtinction, out, at);
+    ReadF(*g, "cloudErosion", r.cloudErosion, out, at);
+    ReadI(*g, "cloudSteps", r.cloudSteps, out, at);
+    ReadI(*g, "cloudLightSteps", r.cloudLightSteps, out, at);
+    ReadF(*g, "cloudMaxDistM", r.cloudMaxDistM, out, at);
+    ReadF(*g, "cloudHazeM", r.cloudHazeM, out, at);
+    ReadF(*g, "cloudPhaseG", r.cloudPhaseG, out, at);
+    ReadF(*g, "cloudMultiScatter", r.cloudMultiScatter, out, at);
+    ReadF(*g, "cloudPowder", r.cloudPowder, out, at);
+    ReadF(*g, "cloudAmbient", r.cloudAmbient, out, at);
+    ReadF(*g, "cloudSunGain", r.cloudSunGain, out, at);
+    ReadF(*g, "cloudShadowStrength", r.cloudShadowStrength, out, at);
+    ReadF(*g, "cloudRainDensity", r.cloudRainDensity, out, at);
+    ReadF(*g, "cloudRainStreaks", r.cloudRainStreaks, out, at);
+    ReadF(*g, "cloudTemporal", r.cloudTemporal, out, at);
+    ReadI(*g, "cloudResDiv", r.cloudResDiv, out, at);
+    ReadF(*g, "cloudWindScale", r.cloudWindScale, out, at);
+    ReadF(*g, "cloudWetDarken", r.cloudWetDarken, out, at);
+    ReadF(*g, "cloudRainbow", r.cloudRainbow, out, at);
+    ReadF(*g, "cloudCirrusScaleM", r.cloudCirrusScaleM, out, at);
+    ReadF(*g, "cloudFogMix", r.cloudFogMix, out, at);
+    r.cloudShapeScaleM = std::clamp(r.cloudShapeScaleM, 1000.0f, 40000.0f);
+    r.cloudDetailScaleM = std::clamp(r.cloudDetailScaleM, 50.0f, 5000.0f);
+    r.cloudWeatherScaleM = std::clamp(r.cloudWeatherScaleM, 2000.0f, 100000.0f);
+    r.cloudExtinction = std::clamp(r.cloudExtinction, 0.001f, 0.5f);
+    r.cloudErosion = std::clamp(r.cloudErosion, 0.0f, 1.0f);
+    r.cloudSteps = std::clamp(r.cloudSteps, 8, 256);
+    r.cloudLightSteps = std::clamp(r.cloudLightSteps, 1, 12);
+    r.cloudMaxDistM = std::clamp(r.cloudMaxDistM, 2000.0f, 200000.0f);
+    r.cloudHazeM = std::clamp(r.cloudHazeM, 1000.0f, 300000.0f);
+    r.cloudPhaseG = std::clamp(r.cloudPhaseG, 0.0f, 0.95f);
+    r.cloudMultiScatter = std::clamp(r.cloudMultiScatter, 0.0f, 0.9f);
+    r.cloudPowder = std::clamp(r.cloudPowder, 0.0f, 1.0f);
+    r.cloudAmbient = std::clamp(r.cloudAmbient, 0.0f, 10.0f);
+    r.cloudSunGain = std::clamp(r.cloudSunGain, 0.0f, 5.0f);
+    r.cloudShadowStrength = std::clamp(r.cloudShadowStrength, 0.0f, 1.0f);
+    r.cloudRainDensity = std::clamp(r.cloudRainDensity, 0.0f, 10.0f);
+    r.cloudRainStreaks = std::clamp(r.cloudRainStreaks, 0.0f, 4.0f);
+    r.cloudTemporal = std::clamp(r.cloudTemporal, 0.02f, 1.0f);
+    r.cloudResDiv = std::clamp(r.cloudResDiv, 1, 8);
+    r.cloudWindScale = std::clamp(r.cloudWindScale, 0.0f, 40.0f);
+    r.cloudWetDarken = std::clamp(r.cloudWetDarken, 0.0f, 0.9f);
+    r.cloudRainbow = std::clamp(r.cloudRainbow, 0.0f, 4.0f);
+    r.cloudCirrusScaleM = std::clamp(r.cloudCirrusScaleM, 500.0f, 50000.0f);
+    r.cloudFogMix = std::clamp(r.cloudFogMix, 0.0f, 1.0f);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "renderScale", r.renderScale, out, at);
     ReadI(*g, "taa", r.taa, out, at);

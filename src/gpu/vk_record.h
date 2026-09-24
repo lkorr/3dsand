@@ -134,6 +134,17 @@ struct RecordCtx {
   // (world.h kReposeSnap*). False for a materials.json with no repose line,
   // and then the snapshot prepass is not recorded at all.
   bool reposeActive = false;
+  // ---- the clouds (cloud.wgsl, DESIGN.md 9.w) — per-FRAME, ShadowCache table
+  // bit 0 kCloudRecOn: the weather has something in the sky and weather.clouds
+  //   is on, so the weather/shadow/env/march/resolve rows record.
+  // bit 1 kCloudRecBake: the noise volume has not been baked since the last
+  //   pipeline build; the bake row records once.
+  // bit 2 kCloudRecShadowCache: the voxel shadow cache is on (its three rows
+  //   used to be C_ALWAYS inside EncodeShadowResolve's early-out; they now
+  //   share the table with the clouds, which run without it).
+  uint32_t cloudFlags = 0;
+  // Workgroups (8x8) over the low-res cloud target, from the frame's size.
+  uint32_t cloudGx = 0, cloudGy = 0;
 };
 
 // The live GPU objects a table row resolves against. The recorder is handed one

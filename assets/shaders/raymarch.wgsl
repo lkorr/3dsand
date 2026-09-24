@@ -152,6 +152,16 @@
 @group(0) @binding(24) var<storage, read_write> waterVeil : array<u32>;
 const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
 
+// ---- THE CLOUDS (cloud.wgsl; common.wgsl's CloudParams block) --------------
+// The accumulated low-resolution cloud image (both ping-pong halves; CL.histCur
+// is this frame's), the shadow + env maps, and the cloud uniform. All three
+// are written by the ShadowCache table's cloud rows earlier in this command
+// buffer and read here only when R.weatherFlags has RWF_CLOUDS — with it clear
+// they are stale and must not be sampled, the gasOuter rule.
+@group(0) @binding(25) var<storage, read> cloudHist : array<u32>;
+@group(0) @binding(26) var<storage, read> cloudMaps : array<u32>;
+@group(0) @binding(27) var<uniform> CL : CloudParams;
+
 // What the liquid shades (shadeWater / shadeSubmerged / shadeMpmFluid) leave
 // for fs() to write into the veil. Private globals rather than a returned
 // struct for gRsTraceSteps' reason: those functions are inlined into fs() and
@@ -1195,6 +1205,26 @@ fn skyAirglow(rdIn : vec3f) -> vec3f {
 
 fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
   return skyColorNoBodiesU(normalize(rdIn), dayWeight());
+}
+
+// skyColor, split in two for the cloud composite: `full` is exactly what
+// skyColor returns, `smooth` is its airglow tier alone, `glow` (no stars, moons or sun
+// disc). One evaluation of each layer, like skyColor itself.
+struct SkyParts { full : vec3f, glow : vec3f };
+fn skyColorParts(rdIn : vec3f) -> SkyParts {
+  let rd = normalize(rdIn);
+  let dayW = dayWeight();
+  var moon = SkyLayer(vec3f(0.0), 0.0);
+  if (dayW < 0.999) { moon = moonLayer(rd); }
+  let g = skyAirglowV(rd, dayW);
+  var c = g.c;
+  if (dayW < 0.999) {
+    let hidden = 1.0 - (1.0 - g.veil) * (1.0 - clamp(moon.veil, 0.0, 1.0));
+    c += starField(rd) * (1.0 - dayW) * (1.0 - hidden);
+  }
+  c += moon.c * (1.0 - dayW);
+  if (R.sunUp > 0.001) { c += sunDisc(rd) * R.sunUp; }
+  return SkyParts(max(c, vec3f(0.0)), max(g.c, vec3f(0.0)));
 }
 
 fn skyColor(rdIn : vec3f) -> vec3f {
@@ -4725,6 +4755,148 @@ fn aerialFrac(tFine : f32) -> f32 {
   return 1.0 - exp(-dM * R.fogDensity);
 }
 
+// ---- THE CLOUDS, as the renderer sees them -----------------------------------
+// The fog target through the clouds: the airglow in `rd`, covered by whatever
+// the env map says the clouds in that direction are (common.wgsl cloudEnvAt).
+// This is what turns an overcast into a GREY horizon rather than a blue one
+// with a grey lid — the distant hills fog into the cloud they stand under.
+// TUNE_CLOUD_FOG_MIX 0 restores the cloudless fog target exactly.
+fn cloudySkyAirglow(rd : vec3f) -> vec3f {
+  let sky = skyAirglow(rd);
+  if ((R.weatherFlags & RWF_CLOUDS) == 0u || TUNE_CLOUD_FOG_MIX <= 0.0) { return sky; }
+  let e = cloudEnvAt(normalize(rd), &CL, &cloudMaps);
+  return mix(sky, sky * e.a + e.rgb, TUNE_CLOUD_FOG_MIX);
+}
+
+// The accumulated cloud image at a full-resolution pixel: (in-scatter, T).
+// Bilinear over the low-res grid, whose texel centres sit at (i + 0.5) * div.
+// A target whose size is not the one CloudParams was written for (a stale
+// uniform) reads as clear sky rather than as someone else's clouds.
+struct CloudPx { c : vec3f, t : f32, td : f32 };
+fn cloudScreenAt(fragXY : vec2f) -> CloudPx {
+  let div = f32(max(CL.resDiv, 1u));
+  let f = clamp(fragXY / div - 0.5, vec2f(0.0),
+                vec2f(f32(CL.lowW) - 1.001, f32(CL.lowH) - 1.001));
+  let i0 = vec2<u32>(floor(f));
+  let fr = f - floor(f);
+  let i1 = min(i0 + vec2<u32>(1u), vec2<u32>(CL.lowW - 1u, CL.lowH - 1u));
+  let a = cloudHistTexel(vec2<u32>(i0.x, i0.y));
+  let b = cloudHistTexel(vec2<u32>(i1.x, i0.y));
+  let c = cloudHistTexel(vec2<u32>(i0.x, i1.y));
+  let d = cloudHistTexel(vec2<u32>(i1.x, i1.y));
+  let v = mix(mix(a.c, b.c, fr.x), mix(c.c, d.c, fr.x), fr.y);
+  let t = mix(mix(a.t, b.t, fr.x), mix(c.t, d.t, fr.x), fr.y);
+  let td = mix(mix(a.td, b.td, fr.x), mix(c.td, d.td, fr.x), fr.y);
+  return CloudPx(max(v, vec3f(0.0)), clamp(t, 0.0, 1.0), clamp(td, 0.0, 1.0));
+}
+fn cloudHistTexel(p : vec2<u32>) -> CloudPx {
+  let i = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
+  if (i + 2u >= arrayLength(&cloudHist)) { return CloudPx(vec3f(0.0), 1.0, 1.0); }
+  let rg = unpack2x16float(cloudHist[i]);
+  let bt = unpack2x16float(cloudHist[i + 1u]);
+  let d = unpack2x16float(cloudHist[i + 2u]);
+  return CloudPx(vec3f(rg.x, rg.y, bt.x), bt.y, d.x);
+}
+
+// Rain and snow around the eye. Four cylinders at 1.2 / 2.6 / 5.5 / 11 m, a
+// lattice of drops on each (columns with hashed phase and speed), sheared
+// along the wind. The cylinder only FINDS the drop a ray passes: the drop
+// itself is a real 3-D segment (rain, the motion blur of one frame) or point
+// (snow), and the ray is tested against it by distance — painting streaks on
+// the cylinder's surface instead stretched them into arcs and ribbons wherever
+// the view grazes the cylinder, i.e. looking up or down. A layer is skipped
+// where the scene is nearer than it; a drop is dropped where the openness
+// grid says its cell cannot see the sky.
+fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
+  let here = bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 2u]);
+  let amount = clamp(here * 1.4, 0.0, 1.0) * TUNE_CLOUD_RAIN_STREAKS;
+  if (amount <= 0.002) { return colorIn; }
+  let sceneM = select(1e9, tDepthVox * VOXEL_METERS, tDepthVox >= 0.0);
+  let snow = clamp(CL.precipType, 0.0, 1.0);
+  let hl = length(rd.xz);
+  if (hl < 0.03) { return colorIn; }
+  let camM = R.camPos * VOXEL_METERS;
+  let lit = ambientAt(vec3f(0.0, 1.0, 0.0)) * 1.1 + keyLightColor() * 0.12;
+  // One pixel's angular size: every drop is drawn no thinner than ~0.7 px and
+  // dimmed by how much it had to be widened, so a far streak thins out
+  // instead of shimmering between present and absent.
+  let pxAng = R.tanHalfFov * 2.0 / max(R.viewPx, 1.0);
+  var color = colorIn;
+  let wind = vec2f(R.windDir.x, R.windDir.y) * R.windSpeed * VOXEL_METERS;
+  let fallV = mix(8.5, 1.1, snow);
+  // Fall direction: down, carried along by the wind. A rain drop is a short
+  // SEGMENT along it (motion blur over a frame's exposure); a flake a point.
+  let fallDir = normalize(vec3f(wind.x, -fallV, wind.y));
+  for (var k = 0u; k < 4u; k++) {
+    let radius = 1.2 * pow(2.12, f32(k));
+    let t = radius / hl;
+    if (t > sceneM || t > radius * 8.0) { continue; }
+    let p = camM + rd * t;
+    // The lattice lives in a frame SHEARED along the fall: each column of
+    // drops is a straight slanted line in 3-D, so it stays one on screen.
+    let hRel = p.y - camM.y;
+    let q = p.xz - camM.xz + wind * (hRel / fallV);
+    let ang = atan2(q.x, q.y);
+    let colW = mix(0.05, 0.06, snow) * (1.0 + f32(k) * 0.35);
+    let colF = ang * radius / colW;
+    let col = floor(colF);
+    let hsh = pcg(u32(i32(col) + 100000) ^ (k * 0x9E3779B9u));
+    let jx = f32(hsh & 1023u) / 1023.0;
+    let sp = 0.75 + 0.5 * f32((hsh >> 10u) & 255u) / 255.0;
+    let ph = f32((hsh >> 18u) & 1023u) / 1023.0;
+    let period = mix(1.6, 0.42, snow) * (1.0 + f32(k) * 0.25);
+    // Which drop of this column the ray passes nearest: the drop's centre
+    // height in the sheared frame, then back to the world.
+    let fallOff = R.time * fallV * sp;
+    let vNow = (hRel + fallOff) / period + ph;
+    var best = 0.0;
+    for (var dn = -1; dn <= 0; dn++) {
+      let n = floor(vNow) + f32(dn);
+      let hc = (n + 0.5 - ph) * period - fallOff;
+      var angC = (col + 0.25 + 0.5 * jx) * colW / radius;
+      // Snow wanders sideways as it falls.
+      angC += sin(R.time * (0.9 + sp) + ph * 6.28 + n) * 0.05 * snow / radius;
+      let qc = vec2f(sin(angC), cos(angC)) * radius;
+      let xz = qc - wind * (hc / fallV);
+      let c = camM + vec3f(xz.x, hc, xz.y);
+      // A drop within half a metre of the eye would cover the screen as a
+      // smear: real ones that close are out of focus and gone in a frame.
+      if (dot(c - camM, rd) < 0.5) { continue; }
+      // Distance from the ray to the drop (point or segment).
+      let halfLen = mix(0.17, 0.0, snow) * sp;
+      let a = c - fallDir * halfLen;
+      let b = c + fallDir * halfLen;
+      let ab = b - a;
+      // Closest points between the ray (cam + rd s) and the segment a + ab u.
+      let w0 = camM - a;
+      let bb = dot(ab, ab);
+      let rdab = dot(rd, ab);
+      let rdw = dot(rd, w0);
+      let abw = dot(ab, w0);
+      let den = bb - rdab * rdab;
+      var u = select(clamp((abw - rdab * rdw) / den, 0.0, 1.0), 0.5, den < 1e-8);
+      let pc = a + ab * u;
+      let s = max(dot(pc - camM, rd), 0.01);
+      let dist = length(camM + rd * s - pc);
+      let width = mix(0.0025, 0.011, snow);
+      let wPix = pxAng * s * 0.7;
+      let wEff = max(width, wPix);
+      let fade = width / wEff;
+      best = max(best, exp(-(dist * dist) / (wEff * wEff)) * fade);
+    }
+    var a = best * amount * mix(0.35, 0.9, snow) / (1.0 + f32(k) * 0.4);
+    if (a < 0.003) { continue; }
+    // Roofed? The openness at the drop's cell, looking up. Unknown = open.
+    let cell = vec3<i32>(floor(p / VOXEL_METERS));
+    if (inBounds(cell)) {
+      let o = opennessAt(cell, p / VOXEL_METERS, vec3f(0.0, 1.0, 0.0), &openness, &opennessGen);
+      if (o >= 0.0) { a *= clamp(o * 2.0 - 0.4, 0.0, 1.0); }
+    }
+    color = mix(color, lit * mix(1.0, 1.6, snow), clamp(a, 0.0, 1.0));
+  }
+  return color;
+}
+
 // Aerial perspective: distance fog that converges EXACTLY to the sky color in
 // that ray's direction. The old `skyColor * 0.9` target left every distant
 // surface hanging slightly darker than the sky it should dissolve into, which
@@ -4737,7 +4909,7 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   // nebulae into distant terrain — which renders stars *through* hillsides,
   // trees and the ground near the horizon, because those surfaces are exactly
   // the ones carrying the most fog.
-  return mix(color, skyAirglow(rd), f);
+  return mix(color, cloudySkyAirglow(rd), f);
 }
 
 // ============================================================================
@@ -6207,7 +6379,10 @@ fn reflectionSky(rd : vec3f) -> vec3f {
   // below, which is shaped for a rippled surface. Reflecting the real disc
   // here as well would double it AND scatter single-pixel fireflies wherever
   // a ripple normal happens to line up.
-  return skyColorNoBodies(normalize(d));
+  let sky = skyColorNoBodies(normalize(d));
+  if ((R.weatherFlags & RWF_CLOUDS) == 0u) { return sky; }
+  let e = cloudEnvAt(normalize(d), &CL, &cloudMaps);
+  return sky * e.a + e.rgb;
 }
 
 // ---- traced reflection ----
@@ -10016,6 +10191,12 @@ fn fs(in : VSOut) -> FSOut {
           lambert *= sh;
         }
       }
+      // Cloud shadow (common.wgsl cloudSunAt): the deck's shadow crossing the
+      // distant hills, from the same map the near field reads — so a cloud
+      // shadow is continuous across the window seam.
+      if (lambert > 0.0 && (R.weatherFlags & RWF_CLOUDS) != 0u) {
+        lambert *= cloudSunAt(R.camPos + rd * far.t, keyLightDir(), &CL, &cloudMaps);
+      }
       // ---- THE NEAR FIELD'S FOUR-TAP AO, on cascade cells ----
       // voxelAO's rule (two tangent neighbours + the corner the hit leans into,
       // ramped by the hit's position in the face) over farBlockerAt at the hit's
@@ -10060,7 +10241,20 @@ fn fs(in : VSOut) -> FSOut {
       if (h.liqT <= 0.0) { color = applyAerial(color, rd, far.t); }
       else { color = applyAerial(color, rd, far.t - h.liqT); }
     } else {
-      color = skyColor(rd);
+      // THE CLOUDS, over the sky they stand in front of, with the stars, the
+      // moons and the sun disc all behind them — the z-order the SkyLayer
+      // veils already encode for the aurora. One bilinear fetch of the
+      // accumulated low-res image (cloud.wgsl). The smooth sky takes the
+      // HAZED transmittance and the point sources the DIRECT one: aerial
+      // haze in front of a cloud is airlight, which may pale the cloud toward
+      // the sky but must not let the sun disc through it.
+      if ((R.weatherFlags & RWF_CLOUDS) != 0u) {
+        let sp = skyColorParts(rd);
+        let cs = cloudScreenAt(in.pos.xy);
+        color = sp.glow * cs.t + (sp.full - sp.glow) * cs.td + cs.c;
+      } else {
+        color = skyColor(rd);
+      }
     }
   } else {
     // A micro hit reports the SUB-VOXEL's material (h.micMat) while the cell's
@@ -10217,6 +10411,23 @@ fn fs(in : VSOut) -> FSOut {
       // 45% sun through the rock before this. `openRaw` is read above, once,
       // for the ambient term below.
       lambert *= shadowLiftCap(sh, openRaw);
+    }
+    // THE CLOUDS' SHADOW: one bilinear lookup in the per-frame cloud shadow
+    // map (cloud.wgsl `shadow`). Applied to the direct term only, like every
+    // other occluder here — the overcast's effect on the SKY light is the
+    // shared ambient's business (ambientAtP).
+    if (lambert > 0.0 && (R.weatherFlags & RWF_CLOUDS) != 0u) {
+      lambert *= cloudSunAt(hp, keyLightDir(), &CL, &cloudMaps);
+    }
+    // WET GROUND (weather.h wetness): rain darkens what it soaks — sky-facing
+    // surfaces that can SEE the sky, by openness, so the floor of a barn stays
+    // dry while the yard outside goes dark. Liquids are already wet. The
+    // sheen below picks it up through `wet`, so a soaked field glints.
+    if (R.wetness > 0.001 && m.klass != CLASS_LIQUID) {
+      let expo = select(1.0, clamp(openRaw * 1.6 - 0.35, 0.0, 1.0), openRaw >= 0.0);
+      let wv = R.wetness * expo * mix(0.3, 1.0, clamp(n.y, 0.0, 1.0));
+      albedo *= 1.0 - TUNE_CLOUD_WET_DARKEN * wv;
+      wet = max(wet, wv * 0.55);
     }
     let sun = keyLightColor() * lambert;
     // ---- the openness (sky-visibility) grid, phase 0 of indirect light ----
@@ -10721,6 +10932,29 @@ fn fs(in : VSOut) -> FSOut {
   // an emitter list the shader can index, so the cost scales with the number
   // of pools rather than with screen area.
 
+
+  // ---- THE DECK BETWEEN A HIGH CAMERA AND THE GROUND ----------------------
+  // From above (or inside) the deck the clouds stand in FRONT of the terrain,
+  // not behind it, and the march already stopped each downward ray at the
+  // ground — so the same low-res image composites over hit pixels too. Only
+  // when the eye is at or above the deck's lowest base: below it the terrain
+  // is always nearer than any cloud and this is skipped (the common case, and
+  // the one that must not pay a fetch per terrain pixel).
+  if ((R.weatherFlags & RWF_CLOUDS) != 0u && tDepth >= 0.0 &&
+      CL.camM.y > CL.baseM - 0.1 * CL.thicknessM) {
+    let cs = cloudScreenAt(in.pos.xy);
+    color = color * cs.t + cs.c;
+  }
+
+  // ---- RAIN / SNOW near the camera (weather.h; plan §2.5 tier 1) ----------
+  // Streaks on four cylinders around the eye, each hidden behind whatever the
+  // ray hit nearer than it and gated on the openness grid at the streak — so
+  // the rain stops at a roof and keeps falling two metres away outside, which
+  // is the per-sample gate the corpus says a player-centred cull gets wrong.
+  // Only when the camera probe says it is raining HERE.
+  if ((R.weatherFlags & (RWF_RAIN | RWF_CLOUDS)) == (RWF_RAIN | RWF_CLOUDS)) {
+    color = rainOverlay(color, rd, tDepth);
+  }
 
   // fire glow: additive, from the flicker-weighted emissive path. Intensity
   // drives a temperature ramp across the material palette — stray flame

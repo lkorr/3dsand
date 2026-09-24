@@ -67,6 +67,12 @@
 // of the world pass before this one draws.
 @group(0) @binding(24) var<storage, read> waterVeil : array<u32>;
 
+// THE CLOUDS (common.wgsl cloudSunAt): the shadow + env maps and the cloud
+// uniform, so a body standing in a cloud's shadow is in it too — the same
+// lookup the terrain around it makes.
+@group(0) @binding(26) var<storage, read> cloudMaps : array<u32>;
+@group(0) @binding(27) var<uniform> CL : CloudParams;
+
 struct BodyXform {
   pos : vec3f, _p : f32,         // world voxels
   quat : vec4f,                  // x,y,z,w
@@ -634,7 +640,10 @@ fn fs(in : VSOut) -> FSOut {
   // went dark, so a mob read as lit from a sun the terrain could not see.
   // Same ray, same softening law and same lift cap as the terrain beside it
   // (bodySunShadow -> shadowFromOpaqueHit, common.wgsl).
-  let sh = bodySunShadow(worldPos, n, R, &occupancy, &materials);
+  var sh = bodySunShadow(worldPos, n, R, &occupancy, &materials);
+  if ((R.weatherFlags & RWF_CLOUDS) != 0u) {
+    sh *= cloudSunAt(worldPos, keyLightDirP(R), &CL, &cloudMaps);
+  }
   // Unfogged: the air fog is applied at the end, by the water veil when the
   // fragment is under a liquid surface and by bodyAirFog when it is not.
   let lit = litColorSNoFog(albedo, n, worldPos, emis, R, open.x, open.y, sh);

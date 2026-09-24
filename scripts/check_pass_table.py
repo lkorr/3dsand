@@ -121,6 +121,12 @@ PIPE_TO_MEMBER = {
     "PIPE_GLOW_SRC": "glowSrc_",
     "PIPE_GLOW_FIELD": "glowField_",
     "PIPE_GLOW_REFRESH": "glowRefresh_",
+    "PIPE_CLOUD_NOISE": "cloudNoise_",
+    "PIPE_CLOUD_WEATHER": "cloudWeather_",
+    "PIPE_CLOUD_SHADOW": "cloudShadow_",
+    "PIPE_CLOUD_ENV": "cloudEnv_",
+    "PIPE_CLOUD_MARCH": "cloudMarch_",
+    "PIPE_CLOUD_RESOLVE": "cloudResolve_",
     "PIPE_SHADOW_PREPARE": "shadowPrepare_",
     "PIPE_SHADOW_RESOLVE": "shadowResolve_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
@@ -190,6 +196,14 @@ BUF_TO_WGSL = {
     "ShadowHist": {"shadowHist"},
     "ShadowArgsStage": {"shadowArgs"},
     "ShadowArgs": set(),
+    # The clouds (cloud.wgsl). CloudUBO is `C` there; the raymarcher and the
+    # body shaders call it `CL`, but they are not compute rows.
+    "CloudUBO": {"C"},
+    "CloudNoise": {"cloudNoise"},
+    "CloudWeather": {"cloudWeather"},
+    "CloudMaps": {"cloudMaps"},
+    "CloudRaw": {"cloudRaw"},
+    "CloudHist": {"cloudHist"},
     # ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
     # GasDispatchArgs is indirect-only and never bound, like ShadowArgs above.
     "GasParticlesRead": {"gasRead"},

@@ -23,6 +23,7 @@
 #include "sim/microvox.h"
 #include "sim/plants.h"
 #include "sim/trample.h"
+#include "sim/weather.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -4293,6 +4294,274 @@ Status GateTaa(Ctx& c, std::string& detail) {
   return alignOk ? Status::Pass : Status::Fail;
 }
 
+// ---- clouds (cloud.wgsl, src/sim/weather.h) --------------------------------
+// What a screenshot cannot establish about the clouds, in one launch:
+//
+//   A. THE WEATHER IS DATA AND IS CONTINUOUS. The preset library loads and is
+//      sorted by moisture; resolving the automatic cycle twice at one instant
+//      gives one answer (it is a pure function of the clock); and walking two
+//      hours of sim time a second at a time never moves coverage or raininess
+//      by more than a small step — i.e. the sky drifts, it never cuts.
+//   B. THE CLOUDS REACH THE PICTURE. Three arms of one sky view (clear,
+//      overcast, and overcast with weather.clouds OFF) and one ground view
+//      (clear vs overcast): an overcast sky is grey where a clear one is blue,
+//      the ground under a closed deck loses its direct light, and the master
+//      switch restores the cloudless sky exactly — the "off means no row"
+//      claim, measured on pixels rather than asserted.
+//
+// The frames are written to build/clouds_*.bmp for eyes, like the denoise and
+// taa gates, so a tuning.json edit plus one --gate clouds is the whole look
+// loop. Every threshold is RELATIVE to another arm of the same run.
+Status GateClouds(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+  const float aspect = (float)W / (float)H;
+  const Tuning base = CurrentTuning();
+  struct Restore {
+    const Tuning& t;
+    ~Restore() {
+      SetCurrentTuning(t);
+      weather::SetOverride("");
+      weather::Snap();
+    }
+  } restore{base};
+
+  // ---- A. the weather, CPU only ----------------------------------------
+  const std::vector<weather::Preset>& ps = weather::Presets().Presets();
+  if (ps.size() < 2) {
+    detail = "fewer than two weather presets loaded (assets/weather)";
+    return Status::Fail;
+  }
+  for (size_t i = 1; i < ps.size(); i++) {
+    if (ps[i].moisture < ps[i - 1].moisture) {
+      detail = "preset library not sorted by moisture";
+      return Status::Fail;
+    }
+  }
+  const weather::Preset* overcastP = weather::Presets().Find("overcast");
+  const weather::Preset* clearP = weather::Presets().Find("clear");
+  if (!overcastP || !clearP) {
+    detail = "assets/weather must ship `clear` and `overcast` (this gate's two arms)";
+    return Status::Fail;
+  }
+  float maxCov = 0.0f, maxRain = 0.0f;
+  size_t distinct = 0;
+  {
+    Tuning t = base;
+    t.weather.autoCycle = true;
+    t.weather.cycleSpeed = 1.0f;
+    t.weather.clouds = true;
+    SetCurrentTuning(t);
+    weather::SetOverride("");
+    std::string lastFrom;
+    weather::Snap();
+    weather::State prev = weather::Resolve(t, kDefaultSeed, 0.0, 0.0f, 0.0f, 0.0f);
+    for (int s = 1; s <= 7200; s++) {
+      weather::Snap();
+      const weather::State a = weather::Resolve(t, kDefaultSeed, (double)s, 0.0f, 0.0f, 0.0f);
+      weather::Snap();
+      const weather::State b = weather::Resolve(t, kDefaultSeed, (double)s, 0.0f, 0.0f, 0.0f);
+      if (a.mix.coverage != b.mix.coverage || a.mix.precip != b.mix.precip) {
+        detail = "weather::Resolve is not a pure function of the clock";
+        return Status::Fail;
+      }
+      maxCov = std::max(maxCov, std::fabs(a.mix.coverage - prev.mix.coverage));
+      maxRain = std::max(maxRain, std::fabs(a.mix.precip - prev.mix.precip));
+      if (a.fromName != lastFrom) { distinct++; lastFrom = a.fromName; }
+      prev = a;
+    }
+  }
+  // A preset->preset blend spans half of a ladder run, and a run is at least a
+  // share of one epoch — the largest honest one-second step is a few percent.
+  const float kStepMax = 0.08f;
+  if (maxCov > kStepMax || maxRain > kStepMax) {
+    char b[160];
+    std::snprintf(b, sizeof(b), "the automatic sky CUTS: max per-second step coverage %.3f "
+                  "rain %.3f (limit %.2f)", maxCov, maxRain, kStepMax);
+    detail = b;
+    return Status::Fail;
+  }
+
+  // ---- B. the picture ----------------------------------------------------
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  const int gx = 108, gz = 108;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  DrainFullRefill(ctx, world, sim, {gx >> 4, ground >> 4, gz >> 4});
+  // Late morning: a high sun, so the ground view is dominated by direct light
+  // and a closed deck has something to take away.
+  const uint32_t tick = (uint32_t)(TicksPerDayFromTuning(base) * 0.42);
+
+  uint32_t armTick = tick;
+  auto renderArm = [&](const char* preset, bool cloudsOn, const Vec3& eye, float yaw,
+                       float pitch, std::vector<uint8_t>& img, std::vector<float>& dep,
+                       double& ms) -> bool {
+    Tuning t = base;
+    t.weather.clouds = cloudsOn;
+    t.weather.autoCycle = false;
+    SetCurrentTuning(t);
+    weather::SetOverride(preset);
+    weather::Snap();
+    Camera cam;
+    cam.yaw = yaw;
+    cam.pitch = pitch;
+    using U = rhi::BufferUsage;
+    rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4, U::MapRead | U::CopyDst,
+                                    "cloudGateShot");
+    rhi::Buffer dshot = CreateBuffer(ctx.device, (uint64_t)W * H * 4, U::MapRead | U::CopyDst,
+                                     "cloudGateDepth");
+    auto copyOut = [&](const rhi::CommandEncoder& enc, const rhi::Texture& tex,
+                       const rhi::Buffer& into) {
+      rhi::TexelCopyTexture srcT{};
+      srcT.texture = tex;
+      rhi::TexelCopyBuffer dstB{};
+      dstB.buffer = into;
+      dstB.bytesPerRow = W * 4;
+      dstB.rowsPerImage = H;
+      enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+    };
+    // 16 frames: the cloud history's running mean and the shadow cache's
+    // 16-frame penumbra window both want to be full before the grab.
+    const uint32_t frames = 16;
+    ctx.WaitIdle();
+    const double t0 = NowSeconds();
+    for (uint32_t f = 0; f < frames; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam, aspect, true, 0.0f, kFarFogDensity,
+                        (float)H, armTick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      rp.End();
+      if (f + 1 == frames) {
+        copyOut(enc, c.offscreen, shot);
+        copyOut(enc, sim.DepthTexture(), dshot);
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    ctx.WaitIdle();
+    ms = (NowSeconds() - t0) * 1000.0 / (double)frames;
+    img.assign((size_t)W * H * 4, 0);
+    dep.assign((size_t)W * H, 0.0f);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, img.data(), img.size()) &&
+           rhi::ReadBufferBlocking(ctx.device, dshot, 0, dep.data(), dep.size() * 4);
+  };
+
+  // Mean colour and mean saturation of the SKY pixels (depth 0) or of the
+  // GROUND pixels (depth > 0).
+  struct Stat { double r = 0, g = 0, b = 0, sat = 0, lum = 0; size_t n = 0; };
+  auto stat = [&](const std::vector<uint8_t>& img, const std::vector<float>& dep,
+                  bool sky) {
+    Stat s;
+    for (size_t p = 0; p < (size_t)W * H; p++) {
+      if ((dep[p] <= 1e-7f) != sky) continue;
+      const double r = img[p * 4], g = img[p * 4 + 1], b = img[p * 4 + 2];
+      const double mx = std::max({r, g, b}), mn = std::min({r, g, b});
+      s.r += r; s.g += g; s.b += b;
+      s.sat += mx > 0.0 ? (mx - mn) / mx : 0.0;
+      s.lum += 0.299 * r + 0.587 * g + 0.114 * b;
+      s.n++;
+    }
+    if (s.n) { s.r /= s.n; s.g /= s.n; s.b /= s.n; s.sat /= s.n; s.lum /= s.n; }
+    return s;
+  };
+
+  const Vec3 skyEye{(float)gx, (float)(ground + 40), (float)gz};
+  const Vec3 gndEye{(float)gx, (float)(ground + 120), (float)gz};
+  std::vector<uint8_t> imClear, imOver, imOff, imGClear, imGOver;
+  std::vector<float> dClear, dOver, dOff, dGClear, dGOver;
+  double msClear = 0, msOver = 0, msOff = 0, msG0 = 0, msG1 = 0;
+  const float skyPitch = 0.55f, gndPitch = -0.5f;
+  if (!renderArm("clear", true, skyEye, 0.785f, skyPitch, imClear, dClear, msClear) ||
+      !renderArm("overcast", true, skyEye, 0.785f, skyPitch, imOver, dOver, msOver) ||
+      !renderArm("overcast", false, skyEye, 0.785f, skyPitch, imOff, dOff, msOff) ||
+      !renderArm("clear", true, gndEye, 0.785f, gndPitch, imGClear, dGClear, msG0) ||
+      !renderArm("overcast", true, gndEye, 0.785f, gndPitch, imGOver, dGOver, msG1)) {
+    detail = "readback failed";
+    return Status::Fail;
+  }
+  WriteBmpFile("build/clouds_clear.bmp", imClear, W, H);
+  WriteBmpFile("build/clouds_overcast.bmp", imOver, W, H);
+  WriteBmpFile("build/clouds_off.bmp", imOff, W, H);
+  WriteBmpFile("build/clouds_ground_clear.bmp", imGClear, W, H);
+  WriteBmpFile("build/clouds_ground_overcast.bmp", imGOver, W, H);
+  // ---- the LOOK GALLERY (SANDVOX_CLOUD_GALLERY=1): not an assertion ----
+  // Every preset from three cameras (up into the deck, along the horizon,
+  // down at the ground), plus the rain / storm presets at a low sun, written
+  // to build/clouds_gallery_<preset>_<view>.bmp. The whole look-iteration loop
+  // for a cloud.wgsl or tuning.json edit is one `--gate clouds` with this set:
+  // no rebuild, no --shot, one worldgen.
+  if (const char* g = std::getenv("SANDVOX_CLOUD_GALLERY"); g && g[0] == '1') {
+    struct View { const char* name; Vec3 eye; float yaw, pitch; };
+    const View views[] = {
+        {"up", skyEye, 0.785f, 0.55f},
+        {"horizon", Vec3{(float)gx, (float)(ground + 60), (float)gz}, 2.3f, 0.06f},
+        {"ground", gndEye, 0.785f, -0.35f},
+    };
+    const float dayTicks = (float)TicksPerDayFromTuning(base);
+    for (const weather::Preset& p : ps) {
+      for (const View& v : views) {
+        std::vector<uint8_t> im;
+        std::vector<float> dp;
+        double ms = 0;
+        armTick = tick;
+        if (!renderArm(p.name.c_str(), true, v.eye, v.yaw, v.pitch, im, dp, ms)) break;
+        WriteBmpFile("build/clouds_gallery_" + p.name + "_" + v.name + ".bmp", im, W, H);
+        std::printf("clouds gallery: %-10s %-8s %.2f ms/frame\n", p.name.c_str(), v.name, ms);
+      }
+    }
+    // Low sun: the undersides going orange (plan §3), toward and away from it.
+    // The afternoon tick whose sun stands ~1.5 degrees up: found, not guessed,
+    // because where sunset falls moves with latitude and the orbit.
+    uint32_t lowSun = (uint32_t)(dayTicks * 0.7f);
+    for (float f = 0.5f; f < 1.0f; f += 0.0025f) {
+      const uint32_t tk = (uint32_t)(dayTicks * f);
+      if (SkyForTick(base, tk).sunDir[1] < 0.025f) { lowSun = tk; break; }
+    }
+    for (const char* pn : {"fair", "towering", "storm"}) {
+      armTick = lowSun;
+      SkyState ss = SkyForTick(base, armTick);
+      const float sunYaw = std::atan2(ss.sunDir[2], ss.sunDir[0]);
+      std::vector<uint8_t> im;
+      std::vector<float> dp;
+      double ms = 0;
+      if (renderArm(pn, true, Vec3{(float)gx, (float)(ground + 60), (float)gz}, sunYaw, 0.12f,
+                    im, dp, ms))
+        WriteBmpFile(std::string("build/clouds_gallery_") + pn + "_sunset.bmp", im, W, H);
+      if (renderArm(pn, true, Vec3{(float)gx, (float)(ground + 60), (float)gz},
+                    sunYaw + 3.14159f, 0.12f, im, dp, ms))
+        WriteBmpFile(std::string("build/clouds_gallery_") + pn + "_antisun.bmp", im, W, H);
+    }
+    armTick = tick;
+  }
+
+  const Stat sc = stat(imClear, dClear, true), so = stat(imOver, dOver, true),
+             sf = stat(imOff, dOff, true);
+  const Stat gc = stat(imGClear, dGClear, false), go = stat(imGOver, dGOver, false);
+
+  // Master switch: the "off" arm draws the cloudless sky. Not bit-identical to
+  // the `clear` arm (clear still carries a faint cirrus, and the overcast
+  // preset's mist thickens the fog even with the deck off), so it is compared
+  // on the thing the deck changes: SATURATION.
+  const bool greyed = so.n > 1000 && so.sat < sc.sat * 0.6;
+  const bool offRestores = sf.n > 1000 && sf.sat > so.sat * 1.4;
+  const bool shaded = gc.n > 1000 && go.lum < gc.lum * 0.9;
+  char b[640];
+  std::snprintf(b, sizeof(b),
+                "sky sat clear %.3f / overcast %.3f / overcast+off %.3f (%zu px) | "
+                "ground lum clear %.1f / overcast %.1f | auto cycle: %zu presets "
+                "visited in 2 h, max 1 s step cov %.4f rain %.4f | ms/frame "
+                "clear %.2f overcast %.2f off %.2f (advisory)%s%s%s",
+                sc.sat, so.sat, sf.sat, so.n, gc.lum, go.lum, distinct, maxCov, maxRain,
+                msClear, msOver, msOff, greyed ? "" : " | OVERCAST SKY NOT GREY",
+                offRestores ? "" : " | clouds=false DID NOT RESTORE THE SKY",
+                shaded ? "" : " | OVERCAST DID NOT SHADE THE GROUND");
+  detail = b;
+  return (greyed && offRestores && shaded) ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& RenderGates() {
   static const std::vector<Gate> g = {
       {"far-fog", "render", {}, false, GateFarFog},
@@ -4336,6 +4605,10 @@ const std::vector<Gate>& RenderGates() {
       // compares them by distance band (near + sky untouched, mid-band
       // speckle down, mid-band mean kept). Own worldgen, no state left.
       {"denoise", "render", {}, false, GateDenoise, /*needsRender=*/true},
+      // The clouds: a CPU walk of the automatic weather (purity + no cuts)
+      // and five frames of one site under three skies. Own worldgen, and it
+      // restores the tuning and clears the weather pin before returning.
+      {"clouds", "render", {}, false, GateClouds, /*needsRender=*/true},
   };
   return g;
 }

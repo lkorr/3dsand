@@ -2985,7 +2985,12 @@ struct RenderParams {
   // — spend padding before adding more (world.h's note on the bound-size
   // validation above).
   uint32_t eclipseBody = 0;   // 0 none, 1 moon A in front of the sun, 2 moon B
-  uint32_t pad_dn0 = 0;
+  // ---- the sky's weather (src/sim/weather.h; spent from the old pad_dn0) ----
+  // bit 0 (RWF_CLOUDS): the cloud buffers were written this frame and may be
+  // read (cloud.wgsl). Clear when weather.clouds is off, and then no shader
+  // reads a cloud binding at all. bit 1 (RWF_RAIN): precipitation reaches the
+  // ground somewhere near the camera, so the streak overlay runs.
+  uint32_t weatherFlags = 0;
 
   float moon2Dir[3] = {0.0f, -1.0f, 0.0f};
   float moon2Phase = 0.5f;
@@ -3007,7 +3012,17 @@ struct RenderParams {
   float solarEclipse = 0.0f;
   // Fraction of moon B's disc hidden behind moon A. Render-only.
   float lunarEclipse = 0.0f;
-  float pad_dn1 = 0.0f, pad_dn2 = 0.0f;
+  // How much of the dome is under cloud, 0..1 (weather::State::overcast). The
+  // shared hemisphere ambient (ambientAtP, common.wgsl) greys and softens by
+  // it, so every shading path — terrain, far field, bodies — agrees that the
+  // sun went in. The DIRECT light is not scaled here: it is shadowed per
+  // position by the cloud shadow map, which is what makes the shadows of
+  // individual clouds cross the ground.
+  float overcast = 0.0f;
+  // How soaked exposed ground is, 0..1 (weather::State::wetness): darker
+  // albedo and a sheen on sky-facing surfaces. Render-only; the world's own
+  // wet STAIN is a different, sim-side thing (plan §2.5 tier 2).
+  float wetness = 0.0f;
 
   // The CELESTIAL POLE in the local horizon frame — the axis the starfield
   // wheels about. It is an OUTPUT of latitude (the pole sits at elevation =
@@ -3031,7 +3046,10 @@ struct RenderParams {
   // partway through the row solarEclipse opens. The two pads above are what
   // close that row, and the one below closes this one.
   float poleDir[3] = {0.0f, 1.0f, 0.0f};
-  float pad_dn3 = 0.0f;
+  // Lightning this frame, 0 = none, ~1 = a close stroke. Added to the shared
+  // ambient as a cold white flash (ambientAtP) and to the clouds' own
+  // emission at the stroke (cloud.wgsl). Spent from the old pad_dn3.
+  float lightning = 0.0f;
 
   // ---- MPM fluid render bounds (PLAN_fluid_overhaul.md §7 item 5) ---------
   // Inclusive world-VOXEL AABB of everything the fluid surface march can
@@ -3163,6 +3181,106 @@ struct RenderParams {
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");
+
+// RenderParams.weatherFlags bits. Mirrored as RWF_* in common.wgsl.
+constexpr uint32_t kRwfClouds = 1u;  // cloud buffers valid this frame
+constexpr uint32_t kRwfRain = 2u;    // precipitation near the camera
+
+// ---- THE CLOUDS (cloud.wgsl, src/sim/weather.h, DESIGN.md §9.w) ------------
+// Render-only derived data, in the sense DESIGN.md §9 gives the far cascades:
+// produced on the GPU every frame from the weather and the clock, read by the
+// raymarcher and the raster bodies, never read by the sim, never hashed, never
+// saved. Every size below is a SHIFT-free literal so check_invariants.py can
+// scrape it, and each is mirrored in cloud.wgsl / common.wgsl (CLOUD_* consts)
+// — the prelude deliberately does NOT carry them, because a prelude constant
+// re-keys the SPIR-V cache of every shader in the engine (CLAUDE.md).
+//
+// kCloudShapeN   edge of the tileable SHAPE noise volume: Perlin-Worley in R,
+//                Worley fBm at three frequencies in G/B/A, RGBA8 per texel.
+//                Baked once on the GPU (cloud.wgsl `noise`); 8 MiB.
+// kCloudDetailN  edge of the DETAIL (erosion) volume, Worley fBm x3; 128 KiB.
+// kCloudWeatherN the per-frame WEATHER MAP around the camera: local coverage,
+//                cloud type, rain, base jitter. 512^2 at weatherTexelM.
+// kCloudShadowN  the per-frame CLOUD SHADOW map: transmittance to the key
+//                light through the deck, indexed at the deck-base plane so
+//                one texel serves every receiver along its light ray.
+// kCloudEnvN     octahedral cloud ENVIRONMENT map: what the sky looks like
+//                through the clouds in every direction, for fog, reflections
+//                and anything else that integrates over a solid angle (the
+//                sky-tier rule — gotcha-sky-tiers-fog-target).
+constexpr uint32_t kCloudShapeN = 128;
+constexpr uint32_t kCloudDetailN = 32;
+constexpr uint32_t kCloudWeatherN = 512;
+constexpr uint32_t kCloudShadowN = 256;
+constexpr uint32_t kCloudEnvN = 64;
+constexpr uint64_t kCloudNoiseWords =
+    (uint64_t)kCloudShapeN * kCloudShapeN * kCloudShapeN +
+    (uint64_t)kCloudDetailN * kCloudDetailN * kCloudDetailN;
+// cloudMaps = [shadow: N^2 f32][env: E^2 x 2 words (pack2x16float rgb, T)]
+//             [probe: 4 words — the weather map AT THE CAMERA: coverage, type,
+//              rain, jitter as f32, written by the weather pass so the
+//              raymarcher's rain overlay knows whether it is raining HERE]
+constexpr uint32_t kCloudProbeWords = 4;
+constexpr uint64_t kCloudMapsWords =
+    (uint64_t)kCloudShadowN * kCloudShadowN +
+    (uint64_t)kCloudEnvN * kCloudEnvN * 2 + kCloudProbeWords;
+// Per low-res pixel: raw = 4 words (pack2x16float (r,g), (b,T), (Td,-) + depth
+// f32), history = 3 words (the first three), ping-ponged. T is the total
+// transmittance INCLUDING the aerial haze in front of the cloud; Td is the
+// DIRECT transmittance without it. The composite needs both: haze is
+// in-scattered airlight, so it may lighten a cloud toward the sky behind it
+// but must never let the sun disc or a star shine through a thick one.
+constexpr uint32_t kCloudRawWords = 4;
+constexpr uint32_t kCloudHistWords = 3;
+
+// CloudParams.flags bits. Mirrored as CLF_* in common.wgsl.
+constexpr uint32_t kClfOn = 1u;         // march and composite this frame
+constexpr uint32_t kClfHistValid = 2u;  // history may be reprojected
+constexpr uint32_t kClfBake = 4u;       // the noise volume needs (re)baking
+
+// The cloud pass's own uniform. Must match CloudParams in common.wgsl, field
+// for field (check_invariants.py `params`). Written ONCE per rendered frame by
+// WriteRenderParams, next to RenderParams, from the same resolved weather.
+//
+// Everything that GROWS without bound over a session — the wind advection of
+// three noise fields — is folded on the CPU in DOUBLE and handed over already
+// wrapped to 0..1 of its tile (the *Off fields). The shader never sees a
+// "seconds since boot" times a speed, which is the f32 cancellation that turns
+// drifting clouds into jittering ones after an hour.
+struct CloudParams {
+  float prevRight[3]; uint32_t flags;
+  float prevUp[3];    uint32_t frame;
+  float prevFwd[3];   float prevTanHalfFov;
+  // cur eye - prev eye in METRES, differenced in double (taa.wgsl's reason).
+  float eyeDeltaM[3]; float prevAspect;
+  uint32_t lowW = 0, lowH = 0, fullW = 0, fullH = 0;
+  // Word offsets of the two history halves: `histCur` is written this frame
+  // and is what the composite reads; `histPrev` is last frame's.
+  uint32_t histCur = 0, histPrev = 0, resDiv = 2, pad_c0 = 0;
+  // ---- the weather (weather::State::mix) ----
+  float coverage = 0.0f, cloudType = 0.5f, density = 1.0f, precip = 0.0f;
+  float baseM = 1400.0f, thicknessM = 1600.0f, darkness = 0.0f, cirrus = 0.0f;
+  float cirrusAltM = 8000.0f, precipType = 0.0f, overcast = 0.0f, wetness = 0.0f;
+  // Camera in absolute world METRES (voxel coords x kVoxelMeters).
+  float camM[3]; float mist = 0.0f;
+  // Wrapped advection offsets, in TILE units (0..1).
+  float shapeOff[3]; float weatherEvolve = 0.0f;
+  float detailOff[3]; float cirrusEvolve = 0.0f;
+  // The weather map's texel 0 corner, absolute metres, snapped to its texel
+  // grid so the map does not swim as the camera moves.
+  float weatherOrigin[2]; float weatherTexelM = 125.0f; float shadowTexelM = 40.0f;
+  // The shadow map's texel 0 corner at the deck-base plane, and that plane.
+  float shadowOrigin[2]; float shadowPlaneM = 1400.0f; float pad_c1 = 0.0f;
+  float weatherOff[2]; float windX = 0.0f, windZ = 1.0f;
+  // Lightning stroke: absolute metres (x, altitude, z) and brightness.
+  float flash[3]; float flashAmp = 0.0f;
+  // This frame's sub-pixel jitter of the LOW-RES grid, in low-res pixels, and
+  // the cirrus deck's own wrapped advection.
+  float jitter[2]; float cirrusOff[2];
+  float spare[4];
+};
+static_assert(sizeof(CloudParams) % 16 == 0,
+              "CloudParams must be a whole number of std140 rows");
 // Dilation applied to the fluid render AABB, world voxels. Two chunks: one for
 // the snapshot's readback latency (>= 5 ticks of travel at the CFL ceiling),
 // one for `fluidChunkActive`'s face-neighbour reach.
@@ -4181,6 +4299,7 @@ class World {
   rhi::Buffer passUBO;     // 27 slices * 256 B (3x3x3 color phases)
   rhi::Buffer opsBuf;      // kMaxOpsPerTick BrushOp
   rhi::Buffer renderUBO;   // RenderParams
+  rhi::Buffer cloudUBO;    // CloudParams (render-only; WriteRenderParams)
   rhi::Buffer dirtyViz;    // kNumChunks u32, CPU-uploaded snapshot for debug overlay
   rhi::Buffer actVoxViz;   // per-voxel activity bits (packed u32), debug overlay
   // ---- shadow cache (the kShadowCacheBuckets block above) ----

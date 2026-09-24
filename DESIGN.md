@@ -11343,6 +11343,128 @@ And nothing temporal: `render.taa`'s accumulator would integrate the same
 staircase over the jitter sequence and is the right next lever if the
 residual 0.7 still reads as texture at some resolution.
 
+### 9.w Clouds and weather (added 2026-09-23; `assets/shaders/cloud.wgsl`, `src/sim/weather.*`, `assets/weather/`)
+
+The plan of record is `docs/PLAN_clouds_weather.md` (corpus research + packages);
+this section is what landed and the invariants it holds.
+
+**Weather is data, and it is render-only.** A weather TYPE is
+`assets/weather/<name>.json` — coverage, cloud type (0 stratus .. 1
+cumulonimbus), density, deck base and thickness in metres, darkness, cirrus,
+raininess, precipitation type (0 rain .. 1 snow), mist, lightning rate. Eleven
+ship (clear, cirrus, fair, scattered, towering, overcast, fog, drizzle, rain,
+storm, snow); nothing in C++ knows their names. `weather::Resolve`
+(`src/sim/weather.cpp`) turns (tuning, presets, seed, sim clock) into one blended
+`State` per frame. **Nothing in it reaches TickParams, the CA or the world hash** —
+`--gate determinism` is unmoved by the whole system, and that is the gate on the
+claim. The day rain is allowed to touch the world (plan §2.5 tier 2: wet stain,
+`RCOND_RAIN`), the scalar the sim reads must be derived as an INTEGER in
+`weather.h` the way `WindWeatherQ` is; do not hand the sim one of these floats.
+
+**The automatic cycle is a ladder, not a state machine.** Presets are sorted by
+their authored `moisture`; each owns a run of the ladder proportional to its
+`weight` (0 = manual only — snow, until there are seasons); a smooth two-octave
+1-D value noise over weather epochs (`weather.epochMinutes`) walks the ladder,
+and the last half of each run blends into its neighbour. So the sky drifts
+clear → fair → scattered → towering → overcast → fog → drizzle → rain → storm and
+back through NEIGHBOURS — it cannot cut from a storm to a cloudless noon.
+`--gate clouds` walks two hours of sim time a second at a time and fails on any
+one-second step above 0.08 in coverage or raininess, and on any non-purity
+(two resolves at one instant must agree). A PIN (`weather::SetOverride`: the F1
+panel's Weather section, `SANDVOX_WEATHER=<preset>` for headless runs) eases in
+over `weather.transitionSeconds` of wall time — the one wall-clock term, allowed
+because nothing downstream is part of the world.
+
+**The cloud drift is a closed-form integral of the wind.** Clouds move with the
+same `WindWeather` epochs the grass leans in (× `render.cloudWindScale`, winds
+aloft are faster). An integral is state, and a frame-rate-dependent accumulator
+is a sky that differs between a replay and its run, so `CloudDrift`
+(`src/test/support.cpp`) evaluates it exactly: the per-epoch velocity is a
+smoothstep blend of two targets, whose integral is (V0+V1)/2 per whole epoch and
+V0·u + (V1−V0)(u³ − u⁴/2) for a partial one, summed from a cached prefix. Every
+unbounded offset (shape, detail, weather-field and cirrus advection) is folded in
+DOUBLE on the CPU and handed over wrapped to its tile, so clouds do not start to
+jitter after an hour of f32 cancellation.
+
+**The render form is a compute pass, not the raymarcher.** `raymarch.wgsl`'s
+fragment shader has no register headroom (its per-ray-state cliff is measured
+in the memories index), so the march lives in `cloud.wgsl` on the per-frame
+`PT_SHADOWCACHE` table, recorded by `EncodeShadowResolve` on every drawing path:
+
+| row | what | size |
+|---|---|---|
+| `cloud_noise` | tileable Perlin-Worley SHAPE (R) + Worley fBm (GBA), 128³; Worley DETAIL, 32³. Once per pipeline build (`Cond::CloudBake`) | 8.1 MiB |
+| `cloud_weather` | per-frame 512² WEATHER MAP around the camera at 125 m: local coverage, type, rain, base jitter — plus a 4-word camera probe | 1 MiB |
+| `cloud_shadow` | per-frame 256² CLOUD SHADOW map at 40 m, indexed at the deck-base plane along the key light | 256 KiB |
+| `cloud_env` | per-frame 64² octahedral ENV map: (in-scatter, T) per direction | 32 KiB |
+| `cloud_march` | the deck, cirrus and rain curtains, one ray per LOW-RES pixel (target ÷ `render.cloudResDiv`) | 4 words/px |
+| `cloud_resolve` | temporal accumulation: reproject through last frame's camera, neighbourhood clamp, running mean for the first frames after a reset | 3 words/px × 2 |
+
+All six are gated by `Cond::Clouds`: `weather.clouds` off, or a sky with no
+cloud, cirrus or rain, records no row, and `RenderParams.weatherFlags`'
+`RWF_CLOUDS` (set from the same `CloudFrame`) tells every reader not to look.
+
+**The look is the Nubis recipe, bent to this engine.** Coverage LOWERS THE
+DENSITY THRESHOLD (the corpus's three-field model: `remap(shape, 1−cov, 1)·cov`),
+so a fair sky is small separate cumulus and an overcast is the same noise with
+the floor dropped, not a scaled-up blob. A height profile per type (stratus sheet
+/ rounded cumulus / full-depth cumulonimbus with an anvil) shapes it; towers lean
+downwind with height; detail erodes the edges (wispy under, billowy over). Light
+is Beer toward the key light along a growing cone with one long sample, at
+`LIGHT_ABSORB` 0.3 of the view extinction (the standard lever: a kilometre-deep
+cumulus is white because light diffuses through it), three Wrenninge
+multiple-scattering octaves, a two-lobe HG phase (the silver lining), powder
+darkening away from the sun, a skylight-occlusion sample above (lumpy
+undersides), and Hillaire's energy-conserving step. The sun lights the deck until
+it is ~4° BELOW the horizon, through the long reddening air mass — cloud
+undersides go gold and orange over a darkening land.
+
+**Two transmittances, because haze is airlight.** Aerial perspective on a cloud
+pales it toward the sky behind it — but must not let the sun disc or a star
+through a thick one. So the march keeps T (hazed) and Td (direct), and the sky
+composite is `airglow·T + (sky − airglow)·Td + C` (`skyColorParts`). Under a
+closed deck the airlight is the deck's own light, not a blue dome: the overcast
+share of the haze goes to `hazeGrey()`, and the **horizon fill** — the deck a
+ray cannot reach because it meets the horizon ~100 km out — converges to exactly
+the same colour, below the horizon too, so the marched deck, the fill and the
+fogged ground (which reads the same function through the env map) meet without
+a seam.
+
+**How the rest of the renderer sees the clouds** (the sky-tier rule, one lookup
+each, never a march):
+
+- sky pixels: the full-resolution upsample of the history (`cloudScreenAt`);
+- terrain, far field, micro bodies and debris cubes: the direct light ×
+  `cloudSunAt` (common.wgsl) — one bilinear fetch of the shadow map, fading to
+  the deck's mean transmittance at the map edge;
+- fog and water reflections: the env map (`cloudySkyAirglow`, `reflectionSky`),
+  weighted by `render.cloudFogMix`;
+- the shared hemisphere ambient (`ambientAtP`): greys and flattens by
+  `RenderParams.overcast`, and takes a cold flash from `RenderParams.lightning`;
+- a camera at or above the deck base: the same image composited OVER hit pixels.
+
+**Precipitation, tier 1 only.** Rain curtains hang under raining cells in the
+march (with the primary and secondary RAINBOW at 42°/51° from the anti-solar
+point, only where sunlit rain actually is). Near the eye, `rainOverlay` finds
+drops through four cylinders but tests each ray against the drop itself — a 3-D
+segment for rain, a point for snow — with pixel-footprint antialiasing, gated
+per drop on the openness grid (it stops at a roof and keeps falling outside) and
+on the camera probe (it rains HERE, not on average). Wet ground darkens and
+glints by `wetness`, a leaky integral of past rain evaluated as a pure sum,
+scaled by openness. Rain does not yet place water or stain the world.
+
+**Cost (RTX 3060 Ti, 1080p, `cloudResDiv` 3):** ~1.2 ms of GPU per frame under a
+scattered sky in the game loop (march 0.84, weather 0.14, env/resolve/shadow
+~0.23), ~2 ms at worst looking straight up into big cumulus, 0 with clouds off.
+`raymarch` fs is unchanged at 168 registers; its local-memory spill went
+16 → 96 B/thread (the rain overlay and split sky), a follow-up to recover.
+Measure under a full overcast looking up — sky pixels were free before this.
+
+**Look loop.** `SANDVOX_CLOUD_GALLERY=1 ... --selftest --gate clouds` renders
+every preset from three cameras plus low-sun arms into
+`build/clouds_gallery_*.bmp` — a `cloud.wgsl` or `tuning.json` edit needs no
+rebuild and no `--shot`.
+
 ## 9b. Wind (added 2026-08-25)
 
 Plan of record: **`docs/RESEARCH_wind.md`** — the decision record, the industry

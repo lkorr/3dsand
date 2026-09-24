@@ -35,6 +35,12 @@
 // half of the world pass before these draws.
 @group(0) @binding(24) var<storage, read> waterVeil : array<u32>;
 
+// THE CLOUDS (common.wgsl cloudSunAt): the shadow + env maps and the cloud
+// uniform, so a body standing in a cloud's shadow is in it too — the same
+// lookup the terrain around it makes.
+@group(0) @binding(26) var<storage, read> cloudMaps : array<u32>;
+@group(0) @binding(27) var<uniform> CL : CloudParams;
+
 // Eye distance of a fragment, in voxels, from its reversed-Z depth — for the
 // per-vertex paths, which carry no world position to the fragment stage.
 // depth = KNEAR / viewZ, and a pixel's ray has |rd| / viewZ = the length of
@@ -366,6 +372,9 @@ fn fsBody(in : BodyVSOut) -> @location(0) vec4f {
   if (BODY_SHADOW_RAY &&
       (!BODY_SUN_SKIP || dot(in.wn, keyLightDirP(R)) > -TUNE_DIFFUSE_WRAP)) {
     sh = bodySunShadow(in.world, in.wn, R, &occupancy, &materials);
+  }
+  if ((R.weatherFlags & RWF_CLOUDS) != 0u) {
+    sh *= cloudSunAt(in.world, keyLightDirP(R), &CL, &cloudMaps);
   }
   let lit = litColorSNoFog(in.albedo, in.wn, in.world, in.misc.x, R,
                            in.misc.y, in.misc.z, sh);

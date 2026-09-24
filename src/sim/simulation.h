@@ -600,6 +600,13 @@ class Simulation {
   // The water veil (common.wgsl THE WATER VEIL): grow the per-pixel record
   // buffer to cover a width x height target and rebuild renderBG_ around it.
   void EnsureVeil(uint32_t width, uint32_t height);
+  // THE CLOUDS (cloud.wgsl): grow the low-res raw + history buffers to cover
+  // a lowW x lowH target and rebuild the two bind groups that name them.
+  // Grow-only, like the veil. Fresh buffers are written with "clear sky"
+  // (T = 1), so a composite that runs before the first march draws the sky it
+  // would have drawn with no clouds, never a black one.
+  void EnsureClouds(uint32_t lowW, uint32_t lowH);
+  void BuildShadowBindGroup();
   void BuildRenderBindGroup(rhi::BindGroup& out, const rhi::Buffer& veil);
   // The group-0 bind group a raster body draw uses: the live veil once this
   // pass's DrawWorld has written it, otherwise one bound to a zeroed record so
@@ -731,6 +738,16 @@ class Simulation {
   // resolves (all shadows stale) or the resolve pass runs against a shader that
   // never asks (wasted dispatch, and a request list that never drains).
   bool shadowCacheOn_ = false;
+  // The clouds (cloud.wgsl; world.h kCloud*). Six pipelines on shadowPL_ and
+  // the render-private buffers they write. cloudNoise_ is baked once per
+  // pipeline build (cloudBaked_ false = the next EncodeShadowResolve records
+  // the bake row); the rest are per frame.
+  rhi::ComputePipeline cloudNoise_, cloudWeather_, cloudShadow_, cloudEnv_,
+      cloudMarch_, cloudResolve_;
+  rhi::Buffer cloudNoiseBuf_, cloudWeatherBuf_, cloudMapsBuf_, cloudRawBuf_,
+      cloudHistBuf_;
+  uint64_t cloudPixels_ = 0;
+  bool cloudBaked_ = false;
   // Water bodies (sim_waterbody.wgsl): quiescence probe, drain ledger,
   // adoption reduce, surface shave — docs/PLAN_water_master.md components 3-5.
   rhi::ComputePipeline waterQuiet_, waterLedger_, waterReduce_, waterShave_;

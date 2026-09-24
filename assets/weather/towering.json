@@ -1,0 +1,18 @@
+{
+  "label": "Towering cumulus",
+  "about": "Cumulus congestus: tall cauliflower towers building through the afternoon. The sky before a storm.",
+  "moisture": 0.48,
+  "weight": 0.9,
+  "coverage": 0.56,
+  "cloudType": 0.8,
+  "density": 1.1,
+  "baseM": 1100,
+  "thicknessM": 3800,
+  "darkness": 0.15,
+  "cirrus": 0.15,
+  "cirrusAltM": 9000,
+  "precip": 0.08,
+  "precipType": 0.0,
+  "mist": 0.15,
+  "lightning": 0.0
+}

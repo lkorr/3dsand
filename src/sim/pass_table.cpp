@@ -59,6 +59,12 @@ namespace {
 #define PIPE_GLOW_SRC         Pipe::GlowSrc
 #define PIPE_GLOW_FIELD       Pipe::GlowField
 #define PIPE_GLOW_REFRESH     Pipe::GlowRefresh
+#define PIPE_CLOUD_NOISE     Pipe::CloudNoise
+#define PIPE_CLOUD_WEATHER   Pipe::CloudWeather
+#define PIPE_CLOUD_SHADOW    Pipe::CloudShadow
+#define PIPE_CLOUD_ENV       Pipe::CloudEnv
+#define PIPE_CLOUD_MARCH     Pipe::CloudMarch
+#define PIPE_CLOUD_RESOLVE   Pipe::CloudResolve
 #define PIPE_SHADOW_PREPARE  Pipe::ShadowPrepare
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
@@ -149,6 +155,9 @@ namespace {
 #define C_GASOUT    Cond::GasOuter
 #define C_GASWIDE   Cond::GasFarWide
 #define C_REPOSE    Cond::ReposeActive
+#define C_CLOUDS    Cond::Clouds
+#define C_CLOUDBAKE Cond::CloudBake
+#define C_SHADOWON  Cond::ShadowCacheOn
 
 #define D_WINDWAKE  (uint32_t)DispatchSel::WindWakeSel
 #define D_OPS       (uint32_t)DispatchSel::Ops
@@ -175,6 +184,8 @@ namespace {
 #define IND_GASARGS       (uint32_t)DispatchSel::IndGasDispatchArgs
 #define D_GASFAREMIT      (uint32_t)DispatchSel::GasFarEmitSel
 #define D_GASFARWIDE      (uint32_t)DispatchSel::GasFarWideSel
+#define D_CLOUDGX         (uint32_t)DispatchSel::CloudGx
+#define D_CLOUDGY         (uint32_t)DispatchSel::CloudGy
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

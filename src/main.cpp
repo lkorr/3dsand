@@ -84,6 +84,7 @@
 #include "sim/voxload.h"
 #include "sim/waterbody.h"
 #include "sim/wind.h"
+#include "sim/weather.h"
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
 #include "sim/world.h"
@@ -9937,6 +9938,10 @@ int main(int argc, char** argv) {
     }
     if (ui.reloadMaterials) {
       ui.reloadMaterials = false;
+      // The weather presets reload with the other R-reloaded content: they are
+      // authored data next to materials, and a tuner edit of a sky should show
+      // on the same keypress.
+      weather::Presets().Reload();
       std::vector<MaterialDef> newMats;
       std::vector<ReactionGpu> newReactions;
       if (LoadAssets(assetDir + "/materials/materials.json",

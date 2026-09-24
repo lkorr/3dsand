@@ -1345,7 +1345,9 @@ struct RenderParams {
   // 9-day synodic period against moon A's 8 — coprime, so the phase pair takes
   // 72 days to repeat.
   eclipseBody : u32,   // 0 none, 1 moon A in front of the sun, 2 moon B
-  _pdn0      : u32,
+  // RWF_* bits: clouds valid this frame / precipitation near the camera
+  // (src/sim/weather.h; world.h weatherFlags).
+  weatherFlags : u32,
   moon2Dir   : vec3f,  // unit vector toward moon B
   moon2Phase : f32,    // 0 = new, 0.5 = full
   // Apparent angular radii in RADIANS, modulated by orbital distance (perigee
@@ -1363,14 +1365,16 @@ struct RenderParams {
   solarEclipse : f32,
   // Fraction of moon B's disc hidden behind moon A.
   lunarEclipse : f32,
-  _pdn1      : f32,
-  _pdn2      : f32,
+  // How much of the dome is under cloud (0..1) — greys the shared ambient in
+  // ambientAtP — and how soaked exposed ground is (0..1). world.h says more.
+  overcast   : f32,
+  wetness    : f32,
   // The celestial pole in the horizon frame — the axis the starfield wheels
   // about. Derived from latitude on the CPU (see RenderParams in world.h);
   // there is no knob because the stars and the sun must agree on the axis.
   // On its own row: a vec3 aligns to 16 bytes and cannot start mid-row.
   poleDir    : vec3f,
-  _pdn3      : f32,
+  lightning  : f32,    // this frame's flash, 0 = none (ambientAtP, cloud.wgsl)
   // ---- MPM fluid render bounds (PLAN_fluid_overhaul.md §7 item 5) ----
   // Inclusive world-voxel AABB of everything the fluid surface march can hit.
   // Rays that miss it skip the march entirely; rays that hit march only the
@@ -1465,6 +1469,148 @@ struct RenderParams {
   _psc0 : u32,
   _psc1 : u32,
 };
+
+// ---- THE CLOUDS: the shared half (cloud.wgsl, src/sim/weather.h) ----------
+// What more than one shader must agree on about the clouds, and nothing else.
+// The march, the noise bake and the maps live in cloud.wgsl; what is HERE is
+// the uniform layout and the two lookups every shading path makes — "how much
+// key light gets through the clouds to this point" and "what does the sky look
+// like through the clouds in this direction". The raymarcher, the micro
+// bodies and the debris cubes all call these, which is what stops a mob
+// standing in full sun inside a cloud shadow that has darkened the ground
+// around its feet.
+//
+// Everything else cloud-related is declared in cloud.wgsl on purpose: an edit
+// to THIS file re-keys the SPIR-V cache of every shader (CLAUDE.md, the 536 s
+// measurement), so this block is kept small and frozen, with spare lanes.
+
+// RenderParams.weatherFlags (world.h kRwf*).
+const RWF_CLOUDS : u32 = 1u;
+const RWF_RAIN   : u32 = 2u;
+// CloudParams.flags (world.h kClf*).
+const CLF_ON         : u32 = 1u;
+const CLF_HIST_VALID : u32 = 2u;
+const CLF_BAKE       : u32 = 4u;
+// Map edges (world.h kCloudShadowN / kCloudEnvN; check_invariants.py pairs).
+const CLOUD_SHADOW_N : u32 = 256u;
+const CLOUD_ENV_N    : u32 = 64u;
+// Word offset of the env map inside cloudMaps: it follows the shadow map.
+const CLOUD_ENV_BASE : u32 = CLOUD_SHADOW_N * CLOUD_SHADOW_N;
+// ...and the 4-word camera probe follows the env map (world.h kCloudProbeWords):
+// the weather map at the camera's column as f32 (coverage, type, rain, jitter).
+const CLOUD_PROBE_BASE : u32 = CLOUD_ENV_BASE + CLOUD_ENV_N * CLOUD_ENV_N * 2u;
+
+// Must match CloudParams in world.h, field for field.
+struct CloudParams {
+  prevRight : vec3f, flags : u32,
+  prevUp    : vec3f, frame : u32,
+  prevFwd   : vec3f, prevTanHalfFov : f32,
+  eyeDeltaM : vec3f, prevAspect : f32,
+  lowW : u32, lowH : u32, fullW : u32, fullH : u32,
+  histCur : u32, histPrev : u32, resDiv : u32, _pc0 : u32,
+  coverage : f32, cloudType : f32, density : f32, precip : f32,
+  baseM : f32, thicknessM : f32, darkness : f32, cirrus : f32,
+  cirrusAltM : f32, precipType : f32, overcast : f32, wetness : f32,
+  camM : vec3f, mist : f32,
+  shapeOff : vec3f, weatherEvolve : f32,
+  detailOff : vec3f, cirrusEvolve : f32,
+  weatherOrigin : vec2f, weatherTexelM : f32, shadowTexelM : f32,
+  shadowOrigin : vec2f, shadowPlaneM : f32, _pc1 : f32,
+  weatherOff : vec2f, windX : f32, windZ : f32,
+  flash : vec3f, flashAmp : f32,
+  jitter : vec2f, cirrusOff : vec2f,
+  spare : vec4f,
+};
+
+// ---- octahedral direction <-> unit square (the env map's parameterisation)
+// Y-up: the upper hemisphere is the inner diamond, where the sky detail is,
+// so the lower hemisphere (below the horizon, T ~ 1) takes the folded corners
+// and their seams.
+fn cloudOctEncode(nIn : vec3f) -> vec2f {
+  let n = nIn / (abs(nIn.x) + abs(nIn.y) + abs(nIn.z));
+  var p = n.xz;
+  if (n.y < 0.0) {
+    let sx = select(-1.0, 1.0, p.x >= 0.0);
+    let sz = select(-1.0, 1.0, p.y >= 0.0);
+    p = (1.0 - abs(p.yx)) * vec2f(sx, sz);
+  }
+  return p * 0.5 + 0.5;
+}
+fn cloudOctDecode(uv : vec2f) -> vec3f {
+  let f = uv * 2.0 - 1.0;
+  var n = vec3f(f.x, 1.0 - abs(f.x) - abs(f.y), f.y);
+  let t = max(-n.y, 0.0);
+  n.x += select(t, -t, n.x >= 0.0);
+  n.z += select(t, -t, n.z >= 0.0);
+  return normalize(n);
+}
+
+// ---- key light through the clouds ------------------------------------------
+// The fraction of the key light that survives the cloud deck on its way to
+// world point `pM` (absolute METRES), from the per-frame shadow map. One
+// bilinear lookup: the map is indexed where the light ray crosses the deck's
+// BASE plane, so every receiver along one light ray reads the same texel —
+// the corpus's "check at the end of the shadow ray whether it hit a cloud"
+// (plan §1d), precomputed for the whole view once per frame.
+//
+// Outside the map (a receiver kilometres away, or a light ray too grazing to
+// reach the deck inside it) the answer is the deck's MEAN transmittance, which
+// is what a shadow that far away averages to on screen anyway.
+fn cloudSunAtM(pM : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
+               maps : ptr<storage, array<u32>, read>) -> f32 {
+  if (((*C).flags & CLF_ON) == 0u) { return 1.0; }
+  let mean = 1.0 - clamp((*C).overcast, 0.0, 1.0) * 0.85;
+  if (lightDir.y < 0.03) { return mean; }
+  let t = ((*C).shadowPlaneM - pM.y) / lightDir.y;
+  let q = pM.xz + lightDir.xz * max(t, 0.0);
+  let f = (q - (*C).shadowOrigin) / (*C).shadowTexelM - 0.5;
+  let n = f32(CLOUD_SHADOW_N);
+  if (f.x < 0.0 || f.y < 0.0 || f.x >= n - 1.0 || f.y >= n - 1.0) { return mean; }
+  let i0 = vec2<u32>(floor(f));
+  let fr = f - floor(f);
+  let b = i0.y * CLOUD_SHADOW_N + i0.x;
+  let s00 = bitcast<f32>((*maps)[b]);
+  let s10 = bitcast<f32>((*maps)[b + 1u]);
+  let s01 = bitcast<f32>((*maps)[b + CLOUD_SHADOW_N]);
+  let s11 = bitcast<f32>((*maps)[b + CLOUD_SHADOW_N + 1u]);
+  // Fade to the mean over the last eighth of the map so its edge is never a
+  // visible line across the ground.
+  let edge = min(min(f.x, f.y), min(n - 1.0 - f.x, n - 1.0 - f.y)) / (n * 0.125);
+  let v = mix(mix(s00, s10, fr.x), mix(s01, s11, fr.x), fr.y);
+  return mix(mean, v, clamp(edge, 0.0, 1.0));
+}
+
+// The same, for a point in fine-voxel world coordinates (what every shading
+// path has in hand).
+fn cloudSunAt(pVox : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
+              maps : ptr<storage, array<u32>, read>) -> f32 {
+  return cloudSunAtM(pVox * VOXEL_METERS, lightDir, C, maps);
+}
+
+// ---- the sky through the clouds, by direction -----------------------------
+// (in-scattered cloud light, transmittance) for direction `rd`, from the
+// low-resolution octahedral env map. For anything that integrates over a
+// solid angle — aerial perspective, reflections — never for a primary sky
+// pixel, which reads the full-resolution screen buffer instead (the same
+// tiering the sky itself follows: gotcha-sky-tiers-fog-target).
+fn cloudEnvAt(rd : vec3f, C : ptr<uniform, CloudParams>,
+              maps : ptr<storage, array<u32>, read>) -> vec4f {
+  if (((*C).flags & CLF_ON) == 0u) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+  let n = f32(CLOUD_ENV_N);
+  let f = clamp(cloudOctEncode(rd) * n - 0.5, vec2f(0.0), vec2f(n - 1.001));
+  let i0 = vec2<u32>(floor(f));
+  let fr = f - floor(f);
+  var acc = vec4f(0.0);
+  for (var k = 0u; k < 4u; k++) {
+    let o = vec2<u32>(k & 1u, k >> 1u);
+    let idx = CLOUD_ENV_BASE + ((i0.y + o.y) * CLOUD_ENV_N + (i0.x + o.x)) * 2u;
+    let rg = unpack2x16float((*maps)[idx]);
+    let bt = unpack2x16float((*maps)[idx + 1u]);
+    let w = select(1.0 - fr.x, fr.x, o.x == 1u) * select(1.0 - fr.y, fr.y, o.y == 1u);
+    acc += vec4f(rg.x, rg.y, bt.x, bt.y) * w;
+  }
+  return acc;
+}
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
 // Shared by the raymarcher (frag_depth) and every raster pipeline so raster
@@ -1662,7 +1808,25 @@ fn ambientAtP(n : vec3f, R : RenderParams) -> vec3f {
   let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY) * inv;
   let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY) * inv;
   let moonAmt = 0.30 * step(0.001, a + b) + 1.40 * (a + b) * 0.5;
-  return mix(nightAmb * (0.45 + moonAmt), base, eclipseDayWeightP(R));
+  var amb = mix(nightAmb * (0.45 + moonAmt), base, eclipseDayWeightP(R));
+  // THE OVERCAST (src/sim/weather.h). Under a closed deck the sky stops being
+  // a blue dome over a sunlit ground and becomes one grey diffuser: the
+  // blue-above / warm-below split collapses toward the dome's luminance, and
+  // the warm half loses the sunlit ground that was bouncing into it. Shared
+  // here so the terrain, the far field and every raster body grey together.
+  // The DIRECT light is not touched — the cloud shadow map dims it per
+  // position, which is what lets a single cloud's shadow cross a field.
+  if (R.overcast > 0.0) {
+    let lum = dot(amb, vec3f(0.2126, 0.7152, 0.0722));
+    let grey = vec3f(lum) * vec3f(0.96, 0.99, 1.04) *
+               mix(1.0, 0.72, clamp(-n.y, 0.0, 1.0));
+    amb = mix(amb, grey, clamp(R.overcast, 0.0, 1.0) * 0.8);
+  }
+  // Lightning: a cold white flash from the sky side, weighted by how much the
+  // face looks up so a flash lights a field and not the underside of a ledge.
+  amb += vec3f(0.78, 0.84, 1.0) * R.lightning *
+         (0.35 + 0.65 * clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+  return amb;
 }
 
 // Reinhard-with-white-point applied to LUMINANCE then reapplied to the colour

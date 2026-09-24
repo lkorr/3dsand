@@ -299,6 +299,9 @@ const char* const kOrder[] = {
     // `denoise` is the same shape as `taa` (own worldgen, draws one view two
     // ways, leaves nothing behind) and sits beside it for the same reason.
     "denoise",
+    // `clouds` is the same shape again (own worldgen, draws, leaves nothing
+    // behind — it restores the tuning and the weather pin on the way out).
+    "clouds",
     // With the other render gates: `body-shade` runs its own worldgen and is
     // the one gate that draws a RIGIDBODY. It writes the body instance buffer
     // directly (like `fire-depth`) rather than going through the DebrisSystem,

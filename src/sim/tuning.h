@@ -2960,6 +2960,38 @@ struct Tuning {
     // permanent — note that leaving this off while waterFreezes is on means
     // ice only ever accumulates, which is stable but one-way.
     bool iceMelts = true;
+
+    // ---- the SKY's weather (src/sim/weather.h, cloud.wgsl) ----------------
+    // Everything below is RENDER-ONLY: it picks which assets/weather/*.json
+    // preset the sky is showing and how that drifts. None of it reaches the
+    // CA or the world hash (weather.h's header says what must change first
+    // if rain is ever to touch the world).
+    //
+    // Master switch. Off skips every cloud pass (nothing is recorded) and the
+    // sky is the bare atmosphere it was before clouds existed.
+    bool clouds = true;
+    // On: the sky walks the moisture ladder of the presets on its own.
+    // Off: it holds `preset`. The dev panel's weather row overrides both
+    // without touching this file (weather::SetOverride).
+    bool autoCycle = true;
+    std::string preset = "fair";
+    // Length of one weather epoch in SIM minutes: the moisture signal gets one
+    // new knot per epoch, so this is roughly how long a given sky lasts.
+    float epochMinutes = 7.0f;
+    // Multiplier on how fast the cycle runs (1 = epochMinutes as authored).
+    // 0 freezes the automatic sky on whatever it is showing.
+    float cycleSpeed = 1.0f;
+    // Rerolls the whole weather sequence without touching the world seed.
+    int seedOffset = 0;
+    // How long a PINNED change (dev panel, preset edit) takes to ease in, in
+    // wall seconds. The automatic cycle is continuous and needs no ease.
+    float transitionSeconds = 12.0f;
+    // Added to every preset's coverage (-1..1), and a multiplier on every
+    // preset's raininess — the two global "make it cloudier / wetter" knobs.
+    float coverageBias = 0.0f;
+    float precipScale = 1.0f;
+    // Time constant, in sim seconds, over which rained-on ground dries.
+    float drySeconds = 240.0f;
   } weather;
 
   // ---- combustion: how long anything in the world stays alight ----
@@ -3973,6 +4005,57 @@ struct Tuning {
     // tuning.json on 2026-09-19; this struct default was left behind, and a
     // struct default matters whenever the key is missing from the JSON.
     float farPlumeRange = 3276.8f;
+
+    // ---- clouds (cloud.wgsl; DESIGN.md 9.w). The LOOK of the sky's clouds;
+    // which weather is showing lives in `weather` (src/sim/weather.h). ----
+    // Tile period of the Perlin-Worley shape volume, metres. Sets the size of individual cloud bodies: a quarter of this is roughly one cumulus tower.
+    float cloudShapeScaleM = 9000.0f;
+    // Tile period of the Worley erosion volume. Smaller = finer cauliflower and wisps on the cloud edges.
+    float cloudDetailScaleM = 700.0f;
+    // Feature size of the coverage/type/rain fields. Large = broad fronts and wide clear gaps; small = a sky of scattered patches.
+    float cloudWeatherScaleM = 16000.0f;
+    // Optical density of cloud at density 1, per metre. Higher = more opaque, darker undersides, harder silhouettes.
+    float cloudExtinction = 0.045f;
+    // How deep the detail noise eats into the base shape. 0 = smooth blobs, 1 = ragged wisps.
+    float cloudErosion = 0.45f;
+    // View-ray samples through the deck per low-res pixel. The main cost knob.
+    int cloudSteps = 64;
+    // Samples toward the sun per view sample (plus one long sample). Fewer = flatter clouds, cheaper.
+    int cloudLightSteps = 5;
+    // How far along a ray the deck is marched. Past it the deck is left to the haze.
+    float cloudMaxDistM = 45000.0f;
+    // e-folding distance of the aerial perspective on clouds: how quickly distant cloud dissolves into the horizon sky.
+    float cloudHazeM = 32000.0f;
+    // Henyey-Greenstein anisotropy of the forward lobe. Higher = brighter silver lining when looking toward the sun.
+    float cloudPhaseG = 0.72f;
+    // Octave falloff of the multiple-scattering approximation. Higher = brighter, softer cloud interiors.
+    float cloudMultiScatter = 0.5f;
+    // Darkening of thin cloud edges seen away from the sun (the 'powdered sugar' look).
+    float cloudPowder = 0.7f;
+    // Skylight on clouds, as a multiple of the terrain's hemisphere ambient.
+    float cloudAmbient = 2.2f;
+    // Multiplier on direct sun/moon light scattered by clouds.
+    float cloudSunGain = 1.0f;
+    // How much cloud shadows darken the direct light on the ground. 0 = clouds cast nothing.
+    float cloudShadowStrength = 0.9f;
+    // Opacity of the distant rain shafts under raining cells.
+    float cloudRainDensity = 1.0f;
+    // Brightness of the falling streaks (or flakes) around the camera.
+    float cloudRainStreaks = 1.0f;
+    // Weight of the new frame in the low-res accumulation. Lower = smoother but more lag when clouds move fast.
+    float cloudTemporal = 0.12f;
+    // The cloud buffer is the render target divided by this on each axis. 2 = quarter the pixels.
+    int cloudResDiv = 3;
+    // Cloud drift as a multiple of the surface wind (winds aloft are faster than at the ground).
+    float cloudWindScale = 4.0f;
+    // How much rain-soaked, sky-exposed ground darkens at full wetness.
+    float cloudWetDarken = 0.42f;
+    // Strength of the rainbow in sunlit rain (42 degrees from the anti-solar point).
+    float cloudRainbow = 1.0f;
+    // Feature size of the high ice-cloud streaks.
+    float cloudCirrusScaleM = 7000.0f;
+    // How much the clouds in a direction colour the distance fog and reflections in it (the env map).
+    float cloudFogMix = 1.0f;
     float lodHandoffDist = 24.0f;
     // ---- frame pacing and internal resolution (CPU-only: no .def row, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------
