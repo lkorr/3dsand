@@ -2311,7 +2311,35 @@ def check_react_gate():
                             f"but {c} = {mc.group(1)} in materials.h")
 
 
+def check_coat_flame():
+    """sim_step.wgsl MATF_FLAME <-> materials.h kMatFlagFlame, plus the bit is
+    one no other MATF_* in common.wgsl claims. The coat rules (DESIGN.md §6 "A
+    coat is a co-located virtual neighbour") release a product only if it
+    carries this flag; a drifted bit would release smoke or steam from a film
+    (matter from nothing) or no flame at all (oiled ground not flammable)."""
+    step, hpp = read("assets/shaders/sim_step.wgsl"), read("src/sim/materials.h")
+    common = read("assets/shaders/common.wgsl")
+    if not step or not hpp:
+        return
+    checked.append("coat flame flag")
+    mw = re.search(r"const\s+MATF_FLAME\s*:\s*u32\s*=\s*(\d+)u", step)
+    mc = re.search(r"kMatFlagFlame\s*=\s*(\d+)", hpp)
+    if not mw or not mc:
+        problems.append("coat flame flag: cannot read MATF_FLAME (sim_step.wgsl) "
+                        "or kMatFlagFlame (materials.h)")
+        return
+    if int(mw.group(1)) != int(mc.group(1)):
+        problems.append(f"coat flame flag: MATF_FLAME = {mw.group(1)} in "
+                        f"sim_step.wgsl but kMatFlagFlame = {mc.group(1)} in "
+                        "materials.h")
+    for m in re.finditer(r"const\s+(MATF_\w+)\s*:\s*u32\s*=\s*(\d+)u", common):
+        if int(m.group(2)) == int(mc.group(1)):
+            problems.append(f"coat flame flag: bit {mc.group(1)} is also "
+                            f"common.wgsl's {m.group(1)}")
+
+
 ALL = {
+    "coatflame": check_coat_flame,
     "reactgate": check_react_gate,
     "scoop": check_scoop_ledger,
     "envpred": check_env_predictions,
@@ -2386,7 +2414,8 @@ RELEVANT = {
     "assets/shaders/raymarch.wgsl": ["gas"],
     "tests/env_predictions.json": ["envpred"],
     "scripts/test_environment.mjs": ["envpred"],
-    "src/sim/materials.h": ["reactgate"],
+    "src/sim/materials.h": ["reactgate", "coatflame"],
+    "assets/shaders/sim_step.wgsl": ["coatflame"],
     "src/sim/reactcpu.h": ["reactgate"],
 }
 

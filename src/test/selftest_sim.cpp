@@ -11,6 +11,7 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "game/prefab.h"
@@ -5383,6 +5384,246 @@ Status GateChunkResync(Ctx& c, std::string& detail) {
 
 }  // namespace
 
+// ---- stain-react: a coat on the ground is matter that reacts ---------------
+//
+// DESIGN.md §6 "A coat is a co-located virtual neighbour" (rule-unification
+// W2-J1; sim_step.wgsl coatReact). Five strips of ground on one stone slab in
+// open air, each beside a row of heat (lava or ember) or of stone, all at once:
+//
+//   oil    lava  | dirt wearing oil (6)     -- dirt is not flammable; its oil is
+//   clean  lava  | clean dirt               -- the control: heat does nothing
+//   dry    ember | grass
+//   wet    ember | grass wearing water (12)
+//   inert  stone | dirt wearing oil (6)     -- a coat with no partner is inert
+//
+// Claims, each against its arm's control:
+//   IGNITES    flame over the oiled dirt, sampled every tick, exceeds the clean
+//              dirt's (lava makes no flame of its own)
+//   BURNS OUT  the oiled dirt's oil is all spent, and the dirt is still dirt
+//   WET        wet grass burnt by tick stainReactWetTicks is at most
+//              stainReactWetMaxFrac of dry grass burnt, and dry burnt at least
+//              stainReactDryMinPct -- wet resists, it is not merely slower luck
+//   CLEAN      the clean dirt is unchanged: dirt, unstained
+//   INERT      the partnerless oil is untouched, level for level
+//   SLEEPS     heat replaced by stone, 1000 ticks later every chunk the fixture
+//              occupies is asleep with the inert oil still on it (rule 2: a coat
+//              without a partner marks nothing)
+// Weather pinned clear (rain would damp the ignition rules); world regenerated
+// on the way out (rule 7).
+Status GateStainReact(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mDirt = matId("dirt"), mGrass = matId("grass"),
+                 mEmber = matId("ember"), mStone = matId("stone"),
+                 mOil = matId("oil"), mWater = matId("water"),
+                 mFire = matId("fire"), mLava = matId("lava");
+  if (!mDirt || !mGrass || !mEmber || !mStone || !mOil || !mWater || !mFire ||
+      !mLava) {
+    detail = "dirt/grass/ember/stone/oil/water/fire/lava missing from materials.json";
+    return Status::Fail;
+  }
+  const uint32_t oilType = c.mats[mOil].gpu.stainPack & kStainPackTypeMask;
+  const uint32_t wetType = c.mats[mWater].gpu.stainPack & kStainPackTypeMask;
+  if (!oilType || !wetType) {
+    detail = "oil or water has no ground stain type";
+    return Status::Fail;
+  }
+  const std::string prevPin = weather::Override();
+  weather::SetOverride("clear");
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  enum { kOil, kClean, kDry, kWet, kInert, kArms };
+  const int L = 12, x0 = 150, z0 = 300, kPitch = 6;
+  const int zSpan = kPitch * kArms;
+  const int y = FixtureYOver(x0 - 4, z0 - 4, x0 + L + 4, z0 + zSpan + 4,
+                             kDefaultSeed, 24);
+  auto heatZ = [&](int a) { return z0 + a * kPitch; };
+  auto fuelZ = [&](int a) { return z0 + a * kPitch + 1; };
+
+  // One word per cell, decided once (two ops on one cell: the lower index
+  // wins, so the box is assembled here rather than pushed in layers).
+  std::map<std::tuple<int, int, int>, uint32_t> cells;
+  for (int x = x0 - 4; x <= x0 + L + 3; x++)
+    for (int z = z0 - 4; z <= z0 + zSpan + 3; z++) {
+      cells[{x, y - 1, z}] = mStone;                      // the slab
+      for (int yy = y; yy <= y + 6; yy++) cells[{x, yy, z}] = 0;  // clear air
+    }
+  for (int a = 0; a < kArms; a++) {
+    // Heat that does not go out for the dirt arms: a walled channel of lava
+    // (no rule of lava's touches dirt). Embers decay, and a first version with
+    // embers left 14 levels of oil beside the three that had gone out, which
+    // measured the heat, not the coat. The GRASS arms keep embers: lava's own
+    // `lava + tag:organic -> fire` rewrites grass whatever it wears (only the
+    // wearer sees its coat), which is not the claim.
+    uint32_t heat = mEmber;
+    if (a == kOil || a == kClean) heat = mLava | (7u << 12);  // born full
+    if (a == kInert) heat = mStone;
+    uint32_t fuel = mDirt;
+    if (a == kOil || a == kInert) fuel = mDirt | PackStain(oilType, 6);
+    if (a == kDry) fuel = mGrass;
+    if (a == kWet) fuel = mGrass | PackStain(wetType, 12);
+    for (int x = x0; x < x0 + L; x++) {
+      cells[{x, y, heatZ(a)}] = heat;
+      cells[{x, y, fuelZ(a)}] = fuel;
+      cells[{x, y, fuelZ(a) + 1}] = mStone;  // guard: dirt cannot slide off
+    }
+    for (int dz = -1; dz < 3; dz++) {        // end caps, same reason
+      cells[{x0 - 1, y, heatZ(a) + dz}] = mStone;
+      cells[{x0 + L, y, heatZ(a) + dz}] = mStone;
+    }
+    for (int x = x0; x < x0 + L; x++)        // the lava channel's back wall
+      cells[{x, y, heatZ(a) - 1}] = mStone;
+  }
+  std::vector<CellOp> scene;
+  for (const auto& [p, wd] : cells)
+    scene.push_back({World::SlotCellIndex({std::get<0>(p), std::get<1>(p),
+                                           std::get<2>(p)}),
+                     wd});
+
+  // Readback of just the fixture's chunks.
+  std::map<uint32_t, std::vector<uint32_t>> chunkBuf;
+  for (const auto& [p, wd] : cells)
+    chunkBuf[World::SlotCellIndex({std::get<0>(p), std::get<1>(p),
+                                   std::get<2>(p)}) / kChunkVol];
+  auto readFixture = [&](const char* label) {
+    ctx.WaitIdle();
+    for (auto& [slot, buf] : chunkBuf) {
+      buf.resize(kChunkVol);
+      ReadVoxelsSync(ctx, world, slot, 1, buf.data(), label);
+    }
+  };
+  auto at = [&](int x, int yy, int z) -> uint32_t {
+    const uint32_t ci = World::SlotCellIndex({x, yy, z});
+    auto it = chunkBuf.find(ci / kChunkVol);
+    return it == chunkBuf.end() ? 0u : it->second[ci % kChunkVol];
+  };
+  struct ArmStat {
+    uint32_t fuelMat = 0, stainType = 0, levels = 0, flame = 0, heat = 0;
+  };
+  auto armStat = [&](int a) {
+    ArmStat s;
+    for (int x = x0; x < x0 + L; x++) {
+      const uint32_t hm = at(x, y, heatZ(a)) & 0xFFFu;
+      if (hm == mEmber || hm == mLava) s.heat++;
+      const uint32_t w = at(x, y, fuelZ(a));
+      const uint32_t want = (a == kDry || a == kWet) ? mGrass : mDirt;
+      if ((w & 0xFFFu) == want) s.fuelMat++;
+      if (VoxStainAmt(w)) s.stainType |= 1u << VoxStainType(w);
+      s.levels += VoxStainAmt(w);
+      for (int yy = y + 1; yy <= y + 2; yy++)
+        if ((at(x, yy, fuelZ(a)) & 0xFFFu) == mFire) s.flame++;
+    }
+    return s;
+  };
+
+  uint32_t t = 1;
+  const IVec3 pc{(x0 + L / 2) >> 4, y >> 4, (z0 + zSpan / 2) >> 4};
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false, pc, false,
+             false);
+  const uint32_t kWetTicks = (uint32_t)BaselineNumber("stainReactWetTicks", 40.0);
+  const uint32_t kBurnTicks = (uint32_t)BaselineNumber("stainReactBurnTicks", 200.0);
+  uint32_t flameOil = 0, flameClean = 0;
+  ArmStat wetAt[kArms];
+  // The oil arm's burn, as a trace: t:levels/embers left. Attribution for a
+  // BURNS OUT failure (a coat that stops reacting vs heat that went out).
+  std::string oilTrace;
+  for (uint32_t i = 2; i <= kBurnTicks; i++) {
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, pc, false,
+               false);
+    // Flame over the fuel rows, every tick while the oil can burn.
+    if (i <= 40) {
+      readFixture("stainReactFlame");
+      flameOil += armStat(kOil).flame;
+      flameClean += armStat(kClean).flame;
+    }
+    if (i == 5 || i == 10 || i == 20 || i == 40 || i == 100 || i == kBurnTicks) {
+      if (i > 40) readFixture("stainReactTrace");
+      const ArmStat o = armStat(kOil);
+      oilTrace += " t" + std::to_string(i) + ":" + std::to_string(o.levels) +
+                  "/" + std::to_string(o.heat);
+    }
+    if (i == kWetTicks) {
+      readFixture("stainReactWet");
+      for (int a = 0; a < kArms; a++) wetAt[a] = armStat(a);
+    }
+  }
+  readFixture("stainReactBurn");
+  ArmStat burnt[kArms];
+  for (int a = 0; a < kArms; a++) burnt[a] = armStat(a);
+
+  // Quench: the heat rows become stone, then let everything that was burning
+  // go out, and ask whether the fixture's chunks sleep with coats on them.
+  std::vector<CellOp> quench;
+  for (int a = 0; a < kArms; a++)
+    for (int x = x0; x < x0 + L; x++)
+      quench.push_back({World::SlotCellIndex({x, y, heatZ(a)}), mStone});
+  SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, quench, false, pc,
+             false, false);
+  const uint32_t kRestTicks = (uint32_t)BaselineNumber("stainReactRestTicks", 1000.0);
+  for (uint32_t i = 0; i < kRestTicks; i++)
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false, pc, false,
+               false);
+  ctx.WaitIdle();
+  readFixture("stainReactRest");
+  const ArmStat inertEnd = armStat(kInert);
+  std::vector<uint32_t> dirty(kNumSlots, 0);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, dirty.data(),
+                        kNumSlots * 4, "stainReactDirty");
+  uint32_t awake = 0;
+  for (const auto& [slot, buf] : chunkBuf)
+    if (dirty[slot] != 0) awake++;
+
+  weather::SetOverride(prevPin);
+  weather::Snap();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const uint32_t Lu = (uint32_t)L;
+  const double wetMaxFrac = BaselineNumber("stainReactWetMaxFrac", 0.5);
+  const double dryMinPct = BaselineNumber("stainReactDryMinPct", 75.0);
+  const uint32_t dryBurnt = Lu - wetAt[kDry].fuelMat;
+  const uint32_t wetBurnt = Lu - wetAt[kWet].fuelMat;
+  const bool ignites = flameOil > flameClean;
+  const bool burnsOut = burnt[kOil].levels == 0 && burnt[kOil].fuelMat == Lu;
+  const bool wetOk = 100.0 * dryBurnt >= dryMinPct * Lu &&
+                     (double)wetBurnt <= wetMaxFrac * (double)dryBurnt &&
+                     wetAt[kWet].levels < 12u * Lu;
+  const bool cleanOk = burnt[kClean].fuelMat == Lu && burnt[kClean].levels == 0;
+  const bool inertOk = burnt[kInert].levels == 6u * Lu &&
+                       inertEnd.levels == 6u * Lu &&
+                       inertEnd.stainType == (1u << oilType);
+  const bool sleeps = awake == 0;
+  const bool ok = ignites && burnsOut && wetOk && cleanOk && inertOk && sleeps;
+
+  char buf[1024];
+  std::snprintf(
+      buf, sizeof(buf),
+      "%s: IGNITES %s (flame-ticks over oiled dirt %u vs clean %u, first 40 "
+      "ticks) | BURNS OUT %s (oil levels %u -> %u by t%u, dirt %u/%u; "
+      "levels/heat%s) | WET %s "
+      "(t%u: dry burnt %u/%u, wet burnt %u/%u, wet levels %u/%u) | CLEAN %s "
+      "(dirt %u/%u, levels %u) | INERT %s (oil levels %u, %u after rest) | "
+      "SLEEPS %s (%u of %zu fixture chunks awake %u ticks after quench)",
+      ok ? "PASS" : "FAIL", ignites ? "ok" : "FAIL", flameOil, flameClean,
+      burnsOut ? "ok" : "FAIL", 6u * Lu, burnt[kOil].levels, kBurnTicks,
+      burnt[kOil].fuelMat, Lu, oilTrace.c_str(), wetOk ? "ok" : "FAIL",
+      kWetTicks, dryBurnt, Lu,
+      wetBurnt, Lu, wetAt[kWet].levels, 12u * Lu, cleanOk ? "ok" : "FAIL",
+      burnt[kClean].fuelMat, Lu, burnt[kClean].levels, inertOk ? "ok" : "FAIL",
+      burnt[kInert].levels, inertEnd.levels, sleeps ? "ok" : "FAIL", awake,
+      chunkBuf.size(), kRestTicks);
+  detail = buf;
+  std::printf("stain-react: %s\n", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& SimGates() {
   static const std::vector<Gate> g = {
       {"simd", "sim", {}, false, GateSimd},
@@ -5408,6 +5649,7 @@ const std::vector<Gate>& SimGates() {
       {"page-roundtrip", "sim", {}, false, GatePageRoundtrip},
       {"fire-down", "sim", {}, false, GateFireDown},
       {"rain-fire", "sim", {}, false, GateRainFire},
+      {"stain-react", "sim", {}, false, GateStainReact},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
       {"support-flag", "sim", {}, false, GateSupportFlag},
       {"snapshot-latency", "sim", {}, false, GateSnapshotLatency},

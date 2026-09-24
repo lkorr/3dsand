@@ -93,6 +93,16 @@ constexpr uint32_t kMatTintsMax = 16;
 // was, because the voxel word has no spare bits to remember it in (world.h);
 // the material id IS the memory.
 constexpr uint32_t kMatFlagBurnTint = 32;
+// A FLAME: a gas tagged `hot` (fire). Derived at load from the class and the
+// tag, never authored. Read by exactly one consumer, sim_step.wgsl's coat
+// rules (MATF_FLAME there, mirrored by check_invariants `coatflame`): the one
+// product a coat -- a stain, which has no volume -- may put into the world
+// when it reacts. Anything else a coat's reaction would make is not created,
+// because a coat level is at most an eighth of a liquid cell and releasing a
+// whole voxel per level would make matter from nothing (a pond beside lava,
+// through wet ground, would breed water via steam). DESIGN.md §6 "A coat is a
+// co-located virtual neighbour".
+constexpr uint32_t kMatFlagFlame = 64;
 // Where this material's tint run starts inside the shared tint palette, packed
 // into the free high half of `flags` (bits 16..23) rather than added as a
 // field, for the reason the wind nibbles give below: every reader tests `flags`

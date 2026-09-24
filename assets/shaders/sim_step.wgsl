@@ -1040,7 +1040,7 @@ fn excitedReact(c : vec3<i32>, idx : u32, slotIdx : u32) {
   let m = materials[fm];
   if (m.reactCount == 0u) { return; }
   let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
-  _ = doReactions(c, idx, slotIdx, 0u, fm, m, rnd, true);
+  _ = doReactions(c, idx, slotIdx, 0u, fm, m, rnd, true, 0u, false);
 }
 
 // A rule fired against synthesized excited fluid and takes the neighbour:
@@ -1114,12 +1114,20 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
 // All integer: the multiplier is quarters, biased by 1.0x, and the whole
 // expression is done in u32 with the divide last so it rounds identically on
 // every vendor. A float here would be a determinism bug.
-fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
+//
+// THE COAT (see "A COAT IS A CO-LOCATED VIRTUAL NEIGHBOUR" below): `coat` is
+// the material of the cell's own coat, 0 for none. It counts as ONE more
+// neighbour, for a DIRECT ramp only and only when it matches, and the count is
+// capped at 6: a coat is not a seventh face, and an INVERTED ramp counts what
+// the cell is exposed to, which a film on it does not add to. `covered` hides
+// the six faces (a quenching coat is reacting; see coatReact), leaving the coat.
+fn scaledChance(rule : Reaction, c : vec3<i32>, coat : u32, covered : bool) -> u32 {
   if ((rule.cond & RSCALE_ON) == 0u) { return rule.chance; }
   let invert = (rule.cond & RSCALE_INVERT) != 0u;
 
   var count = 0u;
-  for (var i = 0u; i < 6u; i++) {
+  if (!invert && coat != 0u && nbrMatches(rule, coat, materials[coat])) { count = 1u; }
+  for (var i = 0u; i < 6u && !covered; i++) {
     let n = c + faceDir(i);
     // Out-of-window space is solid and inert, and reads as "not the counted
     // material" — which is right for ice: the residency edge acts like a bank
@@ -1146,6 +1154,7 @@ fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
     }
     if (hit != invert) { count++; }
   }
+  count = min(count, 6u);
   // Hard gate: below the minimum count there is no frontier, so no reaction.
   // minCount defaults to 1 (any matching neighbour will do), which is the
   // freezing case. Evaporation raises it so that a water voxel with a couple
@@ -1167,6 +1176,237 @@ fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
   return min(scaled, REACT_CHANCE_DEN);
 }
 
+// ============ A COAT IS A CO-LOCATED VIRTUAL NEIGHBOUR (DESIGN.md §6) ========
+// rule-unification W2-J1, 2026-09-24. Before this the grid ignored its own
+// stains in reactions -- `doStaining` wrote them and nothing read them -- so
+// wet grass burnt exactly like dry and oiled dirt was not flammable, while a
+// BODY wearing the same substances (mob.cpp BurnOneLimb: wet douses and blocks
+// the burn, oil flashes, acid eats) reacted to them. This is the grid half of
+// the one rule DESIGN.md writes down for both; W2-J2 makes the body match it.
+//
+// THE RULE, in the order the kernel runs it (the spec lives in DESIGN.md §6,
+// "A coat is a co-located virtual neighbour"; this is its implementation):
+//
+//   0. WHICH STAINS ARE COATS. A cell's stain is a coat -- a substance, not a
+//      look -- iff its substrate ABSORBS (`absorb.capacity` > 0). Absorbent
+//      ground only ever takes a level that the liquid PAID for (stainStep sets
+//      STAIN_SPEND; doStaining debits an eighth, the MPM seam spends mass),
+//      while a capacity-0 surface takes a free one-level mark (stone under a
+//      pond). A free mark that could react would be matter from nothing: the
+//      pond re-marks stone for free each time a reaction spends it, so wet
+//      stone between a pond and lava would never dry and never sleep. The coat
+//      MATERIAL is the stain type's, read out of the stain palette's spare
+//      `_r3` (Simulation::UploadTables). A `bodyOnly` stain has no ground type
+//      bits and so is never here.
+//   1. THE COAT'S RULES FIRST (coatReact). The coat material's PAIR rules, in
+//      file order, with the coat as `self` standing where the cell stands: its
+//      partners are the cell's six faces (rule direction mask, RNG-rotated,
+//      excited fluid synthesized as in doReactions) and then the cell's OWN
+//      material. Decay and emit rules of the coat material do NOT run: a
+//      coat's lifetime on the ground is its stain's (monotone, see doStaining),
+//      and water's evaporation or blood's drying run by the coat would make
+//      every stained chunk a clock.
+//   2. A RULE FIRED THROUGH THE COAT SPENDS ONE LEVEL of it (amount - 1; at 0
+//      the cell is clean) instead of rewriting the coat's side. The coat side's
+//      PRODUCT is released only if it is a FLAME (a hot gas, MATF_FLAME), into
+//      an open face -- air first, else a gas cell -- of the cell; a flame that
+//      has no open face makes the rule not a match at all. Any other product is
+//      simply not created: a level is at most an eighth of a liquid cell. The
+//      PARTNER's side is ordinary: a face partner takes `neighborBecomes`; the
+//      cell itself taking `neighborBecomes` is rewritten and born clean (the
+//      coat goes with the voxel).
+//   3. A QUENCHING COAT COVERS THE CELL. If any coat rule MATCHED this tick
+//      (partner found, whether or not it rolled) and its coat-side product is
+//      not a flame, the cell is COVERED: its own rules below see its coat and
+//      nothing else -- no face partners, no emit, faces uncounted in ramps.
+//      Wet grass beside an ember is covered while the water boils off, so it
+//      does not catch until it is dry; an oil coat's rule makes a flame, so it
+//      covers nothing, and the grass under it rolls its own ignition as well
+//      (rule 5) while the flashes throw flame at its neighbours. A wet ember
+//      is covered too, so it
+//      stops emitting flame, and its own douse (`tag:extinguisher`) still runs
+//      against the coat.
+//   4. THE CELL'S OWN RULES SEE THE COAT (doReactions): after the six faces, a
+//      PAIR rule may take the coat as its partner (one roll per rule per tick,
+//      as for a face); a direct neighbour-count ramp counts it once (capped at
+//      6). Fired through the coat, rule 2 applies to the coat side.
+//   5. TWO REACTANTS, ONE RULE EACH. The coat and the cell each fire at most
+//      one rule per tick, the coat's first; the cell's rules then see the coat
+//      as it is after (thinner, or gone). So an oiled grass cell rolls its own
+//      ignition at the dry rate AND flashes its oil -- one rule per cell for
+//      both would make oil DELAY grass catching, the opposite of fuel.
+//
+// A coat is seen ONLY by the cell wearing it. A neighbour cell's rules see the
+// cell's material, never its coat -- so `lava + tag:organic -> fire` still
+// burns wet grass, exactly as a body's inbound pass (BurnOneLimb section 2)
+// burns a wet limb.
+//
+// DETERMINISM (rule 1). Every write is the cell itself or a face neighbour
+// (the partner, and the flame's open face, never the same cell when the
+// partner is rewritten), inside the colour lattice's reach-1 guarantee; every
+// read is at distance <= 1. The coat's rolls are their own stream
+// (COAT_ROLL_SALT), keyed on the SLOT index like every other roll.
+//
+// SLEEP AND TERMINATION (rule 2). The stain rule's old argument was "stain only
+// increases". It no longer does, so the argument is now MASS: every level a
+// coat reaction spends was paid for with liquid (rule 0), a firing spends
+// exactly one, and nothing a coat releases is liquid or solid -- only a flame,
+// which the ordinary fire chain already bounds. A cycle of re-wet and boil
+// therefore drains the liquid doing the wetting and ends. A matched coat rule
+// holds its chunk awake exactly as doReactions' rules do (and a light-gated
+// one does not); a coat with no partner costs one palette load and a bucket
+// walk in an AWAKE chunk and never marks anything, so a rained-on meadow
+// sleeps. A flame with no open face is not a match, so it cannot pin a buried
+// oiled cell beside lava awake.
+// coatReact's verdict bits (.x of its return; .y is the cell's word after).
+const COAT_COVERED : u32 = 1u;  // a quenching coat rule matched: rule 3
+const COAT_SPENT   : u32 = 2u;  // a coat rule fired: a level spent, same material
+const COAT_GONE    : u32 = 4u;  // a coat rule rewrote the cell itself
+const COAT_ROLL_SALT : u32 = 0xC0A7F11Au;
+// materials.h kMatFlagFlame, mirrored (check_invariants `coatflame`). Declared
+// here, not in common.wgsl: this kernel is its only reader.
+const MATF_FLAME : u32 = 64u;
+
+// The material of the cell's COAT, or 0 if its stain is not one (rule 0).
+fn coatMatOf(w : u32, sub : Material) -> u32 {
+  if (!voxStained(w) || !matAbsorbs(sub)) { return 0u; }
+  return materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu;
+}
+
+fn isFlame(prod : u32) -> bool {
+  return prod != PROD_KEEP && prod != MAT_AIR &&
+         (materials[prod].flags & MATF_FLAME) != 0u;
+}
+
+// Where a released flame goes (rule 2): the first face, in the rule's
+// direction mask and RNG rotation, that is air, else the first that is a gas.
+// `avoid` is a face that must not be used (the partner being rewritten), 6u
+// for none. 6u = no open face.
+fn coatReleaseFace(c : vec3<i32>, dmask : u32, rot : u32, avoid : u32) -> u32 {
+  var gasFace = 6u;
+  for (var i = 0u; i < 6u; i++) {
+    let di = (i + rot) % 6u;
+    if ((faceDirBit(di) & dmask) == 0u || di == avoid) { continue; }
+    let n = c + faceDir(di);
+    if (!inBounds(n)) { continue; }
+    let nm = voxMat(voxWordAt(n));
+    if (nm == MAT_AIR) { return di; }
+    if (gasFace == 6u && materials[nm].klass == CLASS_GAS) { gasFace = di; }
+  }
+  return gasFace;
+}
+
+fn coatRelease(c : vec3<i32>, face : u32, prod : u32, rr : u32, stamp : u32) {
+  let n = c + faceDir(face);
+  let ni = voxWordIndex(n);
+  voxStore(ni, packVox(prod, productState(prod, rr >> 4u), stamp));
+  markVoxActive(ni);
+  markDirtyR(n, DIRTY_R_REACTW);
+}
+
+// Spend one level of the cell's coat (rule 2). The rest of the word is kept.
+// The caller (main) ends the cell's substep after a spend, so the movement code
+// cannot move it with the stale word and put the level back -- which is why
+// the word is NOT stamped: a spend is not a move, and a live stamp left on a
+// cell that then sits still ALIASES the current one every STAMP_CYCLE ticks
+// (common.wgsl), skipping the cell before it can mark keepAwake. Measured in
+// `stain-react`: the last oiled cells beside a lava channel stamped by their
+// own flashes let the chunk fall asleep on such a tick with 2 of 72 levels
+// unburnt, heat still there, forever. STAMP_NEVER never aliases.
+fn coatSpend(c : vec3<i32>, idx : u32, w : u32, stamp : u32) -> u32 {
+  _ = stamp;
+  let amt = voxStainAmt(w);
+  var nw = packVox(voxMat(w), voxState(w), STAMP_NEVER);
+  if (amt > 1u) { nw = nw | packStain(voxStainType(w), amt - 1u); }
+  voxStore(idx, nw);
+  markVoxActive(idx);
+  markDirtyR(c, DIRTY_R_REACTW);
+  return nw;
+}
+
+// Rules 1-3: the coat material `cm`'s pair rules, run with the coat as self.
+fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
+             m : Material, cm : u32, rnd : u32) -> vec2<u32> {
+  let cmat = materials[cm];
+  let stamp = stampFor(T.tick, P.substep);
+  var keepAwake = false;
+  var covered = false;
+  for (var ri = 0u; ri < cmat.reactCount; ri++) {
+    let rule = reactions[cmat.reactOffset + ri];
+    if ((rule.packed & 3u) != RK_PAIR) { continue; }
+    if (!lightMatches(rule, c)) { continue; }
+    let rr = hash3(rnd ^ COAT_ROLL_SALT, ri, slotIdx);  // SLOT index
+    let rot = rr >> 12u;
+    let dmask = (rule.packed >> 2u) & 7u;
+    // Partner: the six faces, then the cell's own material (k == 6u).
+    var pk = 7u;
+    var pmat = 0u;
+    var pni = 0u;
+    var psyn = false;
+    for (var k = 0u; k < 7u; k++) {
+      var di = 6u;
+      var nm = mat;
+      var nidx = idx;
+      var syn = false;
+      if (k < 6u) {
+        di = (k + rot) % 6u;
+        if ((faceDirBit(di) & dmask) == 0u) { continue; }
+        let n = c + faceDir(di);
+        if (!inBounds(n)) { continue; }
+        let niw = voxIndexAndWord(n);
+        nidx = niw.x;
+        nm = voxMat(niw.y);
+        if (nm == MAT_AIR) {
+          nm = fluidOccMat(n);
+          if (nm == 0u) { continue; }
+          syn = true;
+        }
+      }
+      if (!nbrMatches(rule, nm, materials[nm])) { continue; }
+      // The no-op skip doReactions makes (a rule that would turn its partner
+      // into what it is and keep self changes nothing and is not a match).
+      if (!syn && rule.prodSelf == PROD_KEEP && rule.prodNbr == nm) { continue; }
+      pk = di;
+      pmat = nm;
+      pni = nidx;
+      psyn = syn;
+      break;
+    }
+    if (pk == 7u) { continue; }
+    let flame = isFlame(rule.prodSelf);
+    var rf = 6u;
+    if (flame) {
+      let avoid = select(6u, pk, rule.prodNbr != PROD_KEEP);
+      rf = coatReleaseFace(c, dmask, rot, avoid);
+      if (rf == 6u) { continue; }  // a flame with nowhere to go: not a match
+    }
+    keepAwake = keepAwake || (rule.cond & RCOND_GATES) == 0u;
+    covered = covered || !flame;
+    if ((rr % REACT_CHANCE_DEN) >= rainChance(rule, c, rule.chance)) { continue; }
+    // ---- FIRED ----
+    if (rf < 6u) { coatRelease(c, rf, rule.prodSelf, rr, stamp); }
+    if (rule.prodNbr != PROD_KEEP) {
+      if (pk == 6u) {
+        // The coat's rule rewrites the cell under it: the coat goes with it.
+        reactWriteSelf(c, idx, false, m.klass, rule.prodNbr, rnd, stamp);
+        return vec2<u32>(COAT_GONE, 0u);
+      }
+      let n = c + faceDir(pk);
+      if (psyn) { flagFluidConsume(n); }
+      if (rule.prodNbr == 0u) { voxStore(pni, 0u); }
+      else { voxStore(pni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp)); }
+      markVoxActive(pni);
+      markDirtyR(n, DIRTY_R_REACTW);
+      if (!psyn) { flagSupportLoss(n, materials[pmat].klass, rule.prodNbr); }
+    }
+    let nw = coatSpend(c, idx, w, stamp);
+    if (keepAwake) { markDirtyR(c, DIRTY_R_REACT); }
+    return vec2<u32>(select(0u, COAT_COVERED, covered) | COAT_SPENT, nw);
+  }
+  if (keepAwake) { markDirtyR(c, DIRTY_R_REACT); }
+  return vec2<u32>(select(0u, COAT_COVERED, covered), w);
+}
+
 // Runs the cell's reaction bucket. At most one rule fires per tick. Returns
 // true if SELF changed material (caller then skips movement this substep).
 // Matching-but-unfired rules mark the chunk dirty so reactive neighborhoods
@@ -1183,8 +1423,16 @@ fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
 // `synthSelf`: self is not a voxel but EXCITED FLUID of material `mat` in the
 // air cell `c` (excitedReact). Every rule runs unchanged; only committing a
 // self product differs, and reactWriteSelf owns that difference.
+//
+// `coat` / `covered`: the cell's own coat material (0 = none) and whether a
+// quenching coat is reacting this tick (coatReact) -- rules 3 and 4 of "A COAT
+// IS A CO-LOCATED VIRTUAL NEIGHBOUR" above. The coat is a PAIR partner after
+// the six faces; covered hides the faces from pairs, emits and ramps. A rule
+// fired through the coat also returns true: the word changed (a level spent)
+// even where the material did not, and the caller must not move the stale one.
 fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
-               m : Material, rnd : u32, synthSelf : bool) -> bool {
+               m : Material, rnd : u32, synthSelf : bool, coat : u32,
+               covered : bool) -> bool {
   var keepAwake = false;
   let stamp = stampFor(T.tick, P.substep);
 
@@ -1230,7 +1478,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       // Neighbour-count scaling (frontier rules — see scaledChance). Returns
       // rule.chance untouched for the ordinary unscaled case; 0 means the cell
       // has no qualifying neighbours and the rule is inert here this tick.
-      let chance = rainChance(rule, c, scaledChance(rule, c));
+      let chance = rainChance(rule, c, scaledChance(rule, c, coat, covered));
       if (chance == 0u) { continue; }
       keepAwake = keepAwake || !lightGated;
       if ((rr % REACT_CHANCE_DEN) < chance) {
@@ -1238,8 +1486,9 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         return true;
       }
     } else if (kind == RK_EMIT) {
-      // first air cell among allowed dirs (RNG-rotated scan)
-      for (var i = 0u; i < 6u; i++) {
+      // first air cell among allowed dirs (RNG-rotated scan). A covered cell
+      // has no open face: the coat is between it and the air.
+      for (var i = 0u; i < 6u && !covered; i++) {
         let di = (i + rot) % 6u;
         if ((faceDirBit(di) & dmask) == 0u) { continue; }
         let n = c + faceDir(di);
@@ -1261,7 +1510,8 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         break;  // one roll per rule per tick
       }
     } else {  // RK_PAIR
-      for (var i = 0u; i < 6u; i++) {
+      var faceMatched = false;
+      for (var i = 0u; i < 6u && !covered; i++) {
         let di = (i + rot) % 6u;
         if ((faceDirBit(di) & dmask) == 0u) { continue; }
         let n = c + faceDir(di);
@@ -1295,6 +1545,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
           continue;
         }
         keepAwake = keepAwake || !lightGated;
+        faceMatched = true;
         // Weather scale here, after the neighbour matched, so a dry-sky tick
         // and a wood cell with nothing hot beside it never pay the probe.
         if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
@@ -1319,6 +1570,31 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
           return false;  // neighbor transformed; self may still move
         }
         break;  // one roll per rule per tick
+      }
+      // ---- THE COAT AS PARTNER (rule 4), after the faces ----------------
+      // Only if no face matched: one roll per rule per tick, whichever
+      // partner it is. No direction mask -- the coat is not in a direction.
+      // The no-op skip applies as for a face. Fired, the coat side follows
+      // rule 2: one level spent, a flame product released into an open face
+      // (none open = not a match), any other product not created. A self
+      // product rewrites the cell, and the coat goes with it.
+      if (!faceMatched && coat != 0u && nbrMatches(rule, coat, materials[coat]) &&
+          !(rule.prodSelf == PROD_KEEP && rule.prodNbr == coat)) {
+        let flame = isFlame(rule.prodNbr);
+        var rf = 6u;
+        if (flame) { rf = coatReleaseFace(c, dmask, rot, 6u); }
+        if (!flame || rf < 6u) {
+          keepAwake = keepAwake || !lightGated;
+          if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
+            if (rf < 6u) { coatRelease(c, rf, rule.prodNbr, rr, stamp); }
+            if (rule.prodSelf != PROD_KEEP) {
+              reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
+            } else {
+              _ = coatSpend(c, idx, w, stamp);
+            }
+            return true;
+          }
+        }
       }
     }
   }
@@ -2547,12 +2823,42 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // and having one function stand for "this cell cannot act" is what keeps the
   // two from drifting. If a future rule lets a plain solid do something, this
   // return is where it breaks first, loudly, in the world hash.
-  if (!matCanAct(m)) { return; }
+  //
+  // ...EXCEPT a cell wearing a COAT (a stain on absorbent ground, coatMatOf):
+  // the coat's own rules act from here even when the substrate has none (an
+  // absorbent solid with an empty bucket). One stain-bits test for every cell
+  // that reaches here; the palette load only for a stained absorbent one.
+  let coat = coatMatOf(w, m);
+  if (!matCanAct(m) && coat == 0u) { return; }
   let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
 
   // Reactions roll once per tick (substep 0 of the two gravity substeps).
-  if (P.substep == 0u && m.reactCount > 0u) {
-    if (doReactions(c, idx, slotIdx, w, mat, m, rnd, false)) { return; }
+  // The COAT first (rules 1-3 of "A COAT IS A CO-LOCATED VIRTUAL NEIGHBOUR"),
+  // then the cell's own bucket: TWO reactants, one rule each per tick. A coat
+  // rule that rewrote the cell ends the cell's substep as any self rewrite
+  // does. One that spent a level has written (and stamped) the word, so the
+  // cell's own rules run against the word as it now is -- the coat thinner, or
+  // gone -- and the cell does not move this substep (its stamp is this
+  // substep's: moving it would carry a stale word). One that matched and
+  // quenches covers the cell for its own rules.
+  if (P.substep == 0u) {
+    var covered = false;
+    var spent = false;
+    var wNow = w;
+    var coatNow = coat;
+    if (coat != 0u) {
+      let cr = coatReact(c, idx, slotIdx, w, mat, m, coat, rnd);
+      if ((cr.x & COAT_GONE) != 0u) { return; }
+      covered = (cr.x & COAT_COVERED) != 0u;
+      spent = (cr.x & COAT_SPENT) != 0u;
+      wNow = cr.y;
+      if (!voxStained(wNow)) { coatNow = 0u; }
+    }
+    if (m.reactCount > 0u &&
+        doReactions(c, idx, slotIdx, wNow, mat, m, rnd, false, coatNow, covered)) {
+      return;
+    }
+    if (spent) { return; }
   }
 
   // Staining, same once-per-tick budget as reactions. Gated on the material

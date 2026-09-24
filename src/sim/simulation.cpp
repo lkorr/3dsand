@@ -1126,11 +1126,22 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   // most eight RGBA values. Every staining material writes its own slot; two
   // materials sharing a stain name share a slot and the last one wins, which
   // is correct — they are by definition the same stain.
-  for (const auto& d : mats) {
+  for (size_t mi = 0; mi < mats.size() && mi < kStainPaletteBase; mi++) {
+    const MaterialDef& d = mats[mi];
     // stainSlot, not the pack's type bits: a `bodyOnly` stain has a palette
     // slot (bodies draw it) but no GPU type (the ground never gets it).
     uint32_t type = d.stainSlot;
     if (type == 0) continue;
+    // WHAT THE STAIN IS MADE OF, in the entry's spare `_r3`: the material id
+    // behind a GROUND stain type, which is how sim_step.wgsl's coat rules find
+    // the coat's reaction bucket (DESIGN.md §6 "A coat is a co-located virtual
+    // neighbour"). The FIRST material to claim the slot, the same answer
+    // MobSystem's matOfStainType_ gives a body. Ground types only: a `bodyOnly`
+    // slot (no type bits in stainPack) is never on a grid cell, so it keeps 0
+    // ("no coat material") and could not be read as one if it were.
+    const uint32_t groundType = d.gpu.stainPack & kStainPackTypeMask;
+    if (groundType != 0 && table[kStainPaletteBase + groundType]._r3 == 0)
+      table[kStainPaletteBase + groundType]._r3 = (uint32_t)mi;
     table[kStainPaletteBase + type].stainColor = d.gpu.stainColor;
     // ...and the body coat's glow + pulse in the palette entry's spare word
     // (materials.h kCoatGlow*). Only microbody.wgsl reads it.

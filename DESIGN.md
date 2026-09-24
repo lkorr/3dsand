@@ -3065,6 +3065,9 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     puddle on saturated ground sleeps. This is also why saturation is TERMINAL
     and there is no drying-out rule: a cell that could both wet and dry would
     never reach a fixed point, and those chunks would never sleep again.
+    (Since 2026-09-24 a stain on absorbent ground can be SPENT by a reaction --
+    see "A coat is a co-located virtual neighbour" below. There is still no
+    drying rule, and the monotone argument is replaced there by a mass one.)
   - Absorption writes SELF, which the stain rule otherwise never does. Reach is
     still ≤1 cell so the lattice argument holds, and the write sets the substep
     stamp so the movement code cannot also move the cell and double-spend the
@@ -3075,6 +3078,104 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     now re-dirties only if `canFlowAnywhere` says the cell has somewhere to go.
     It went unnoticed because the sleep selftest only ever settled water and
     powders, both `moveEvery == 1`.
+
+- **A coat is a co-located virtual neighbour (2026-09-24; rule-unification
+  W2-J1; `sim_step.wgsl` `coatReact` + `doReactions`, gate `stain-react`).**
+  Before this the grid ignored its own stains in reactions -- wet grass burnt
+  like dry, oiled dirt was not flammable -- while a body wearing the same
+  substances reacted to them through four hand-written sections of
+  `MobSystem::BurnOneLimb` (hot coat, wet douse/boil, fuel flash, corrosive
+  bite). This is the ONE rule for both populations. The grid implements it
+  now; W2-J2 makes the body evaluator match it. It is expressed entirely in
+  `reactions.json` plus the `stain` / `absorb` blocks: no material is named.
+
+  **THE RULE.** A cell (a grid voxel, or a body voxel) of material V wearing a
+  coat of material C at amount a >= 1:
+
+  0. *What is a coat.* On a body, every stain is a coat (the stain byte names
+     a material, and a body coat is laid by contact, pour or splatter -- it is
+     the substance). On the ground, a stain is a coat iff the substrate
+     ABSORBS (`absorb.capacity` > 0), because only absorbent ground takes a
+     level the liquid PAID for (`stainStep`'s spend: an eighth of fullness, or
+     MPM mass); a capacity-0 surface takes a free one-level mark, and a free
+     mark that could react would make matter from nothing. C is the stain
+     type's material (the first material registered with that slot);
+     `bodyOnly` stains have no ground type and are never grid coats.
+  1. *The coat's rules.* C's PAIR rules, in file order, run with C as `self`
+     standing where the cell stands. Its partners are the cell's six face
+     neighbours (rule direction mask honoured) and then V itself. C's decay
+     and emit rules do NOT run through a coat: how long a coat lasts is its
+     stain's business (ground: monotone, no decay; body: `coat.decay`).
+  2. *Firing through the coat spends one level* (a -> a-1; at 0 the cell is
+     clean) instead of rewriting the coat's side of the rule. The coat side's
+     PRODUCT is put into the world only if it is a FLAME (a gas tagged `hot`,
+     `kMatFlagFlame`), into an open face of the cell (air first, else a gas
+     cell); a flame with no open face makes the rule not match at all. Any
+     other coat-side product is not created (a level is at most an eighth of a
+     liquid cell). The partner's side is ordinary: a face partner takes
+     `neighborBecomes`; if the partner is V itself, V is rewritten and the new
+     voxel is born clean (the coat goes with the voxel it was on).
+  3. *A quenching coat covers the cell.* If a coat rule MATCHED this tick
+     (partner found, rolled or not) and its coat-side product is not a flame,
+     the cell is COVERED for this tick: V's own rules see its coat and nothing
+     else (no face partner, no emit, faces not counted in ramps). A coat whose
+     matched rule makes a flame covers nothing.
+  4. *The cell's rules see the coat.* V's PAIR rules take the coat as a
+     partner after the six faces (one roll per rule per tick, whichever
+     partner it is; no direction mask). A direct neighbour-count ramp counts
+     the coat as one more matching neighbour, capped at 6; an inverted ramp
+     does not count it. Fired with the coat as partner, rule 2 applies to the
+     coat side (`neighborBecomes` of a flame is released, of anything else
+     not created; one level spent unless V itself was rewritten).
+  5. *Two reactants.* The coat and the cell each fire at most one rule per
+     tick, the coat's first; V's rules then see the coat as it is after.
+  6. *Only the wearer sees its coat.* A neighbour's rules see V, never V's
+     coat: `lava + tag:organic -> fire` still burns wet grass, as a body's
+     inbound pass burns a wet limb.
+
+  **What falls out, with no material named:** wet ground (water `washes`,
+  `water + tag:hot -> steam`) beside heat boils its coat level by level at
+  water's 180 per mille and, being covered meanwhile, does not catch until it
+  is dry -- the grid's version of the body's "wet does not burn". A wet
+  burning voxel is covered, stops emitting, and its own
+  `X + tag:extinguisher` douse runs against the coat. Oiled absorbent ground
+  (`oil + tag:hot -> fire`) beside heat flashes: each flash spends a level and
+  puts a flame in the open face above; oiled dirt, which cannot burn, burns
+  for as many flashes as it holds levels; oiled grass rolls its own ignition
+  at the dry rate as well. Blood and ichor own no pair rule, so a bloody cell
+  reacts exactly as a clean one.
+
+  **Rule 2 (termination), which the old argument no longer covers.** "Stain
+  only ever increases" is false now, so the argument is MASS: every level a
+  coat reaction spends was paid for in liquid (rule 0), each firing spends
+  exactly one, and a coat releases nothing but a flame, which the ordinary
+  fire chain bounds. So a re-wet / boil cycle (a pond wetting grass that
+  lava boils) drains the pond and ends. A matched coat rule holds its chunk
+  awake as any matched rule does, a light-gated one does not, and a coat with
+  no partner marks nothing: a rained-on meadow sleeps (`stain-react`'s SLEEPS
+  claim). A spend rewrites the cell's word with `STAMP_NEVER`, not the live
+  stamp: a live stamp on a cell that then sits still aliases the current one
+  every `STAMP_CYCLE` (7) ticks, the cell is skipped before it can mark
+  keepAwake, and the first version let a chunk fall asleep mid-burn with 2 of
+  72 oil levels left beside live lava. (The same alias can in principle skip
+  ANY lone matched-but-unfired cell that once moved; not seen elsewhere, not
+  changed here.) Cost: a stained cell on absorbent ground in an AWAKE chunk pays a
+  palette load and a walk of C's pair rules; an absorbent solid with no rules
+  of its own is no longer skipped as inert when it wears a coat.
+
+  **Where the body is today, against this rule (W2-J2's list):**
+  `BurnOneLimb` section 0 boils a wet coat at `coat.fireDrySeconds` rather than
+  at water's authored `water + tag:hot` chance, pays 4 levels per douse
+  (`kCoatDouseCost`) rather than 1, and blocks only rules whose product is hot
+  or a burn stage rather than covering the voxel; section 0b spends the WHOLE
+  fuel coat per flash and sets the voxel to `flashForm_` rather than one level
+  and letting the voxel's own rules answer the flame; the hot coat reads as
+  every open face widened to world pitch rather than one co-located partner
+  (a pitch correction the body may keep: a body voxel is a fraction of a world
+  voxel); section 3 charges a depth-derived layer price and carries the coat
+  into the voxels behind rather than one level with the coat going with the
+  voxel. Each is a deliberate body tuning or a divergence to retire; the
+  rule above is the reference either way.
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
@@ -5557,6 +5658,9 @@ clean air; per-voxel roll on `Hash3(limbKey ^ cell, tick, salt)` so it thins
 unevenly, start rotated by tick under the same lattice budget, brick poked per
 change. Ground stains do NOT decay: the world rule is monotone so a stained
 chunk can sleep, and a drying rule would keep every stained chunk awake.
+(They can be SPENT by a reaction since 2026-09-24 -- a coat on absorbent
+ground is a reactant, §6 "A coat is a co-located virtual neighbour", which is
+also the reference rule for how a body coat reacts.)
 
 **Shedding.** NPCs never had a footfall; `Footfall` moved from `PlayerAvatar`
 down to `Mob` and the NPC plant emits it (the avatar's per-frame audio drain is
@@ -5588,7 +5692,9 @@ the cell is still stone.
 **Water on a body washes, wets, wicks and drips (2026-09-23;
 `WashBodyStain`, `MobSystem::WetOneLimb`, `kPFlagDrip`).** BODIES ONLY — the
 world's wet stain is unchanged and still never dries (a pond bed that dried
-would keep its chunks awake; see "Absorption and washing"). A washer
+would keep its chunks awake; see "Absorption and washing"); since 2026-09-24
+it does BOIL off absorbent ground beside heat, level by level, through the
+coat rule (§6). A washer
 (`stain.washes`) meeting a coat by any door — contact, splatter, the health
 panel's pour — goes through one rule: a foreign coat is stepped down by the
 rinse (`gore.stainWashPerContact`, 5; a pour rinses twice its own depth), and

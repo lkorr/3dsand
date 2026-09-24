@@ -524,6 +524,11 @@ const char* const kOrder[] = {
     // coordinates under three pinned skies, restores the pin and regenerates
     // on the way out — fire-down's reasons, fire-down's slot.
     "rain-fire",
+    // Grid coats in reactions (DESIGN.md §6, "A coat is a co-located virtual
+    // neighbour"): lights oiled and wet ground at absolute coordinates, pins
+    // the weather clear and restores it, regenerates on the way out --
+    // rain-fire's reasons, rain-fire's slot.
+    "stain-react",
     // ---- THE WINDOW EDGE AS A SINK (docs/PLAN_gas_particles.md §4) --------
     // Straight after `fire-down`, and for exactly the reasons the three gates
     // above it give. Both of these light no fire, but they do the same KIND of

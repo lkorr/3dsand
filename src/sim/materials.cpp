@@ -685,6 +685,9 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       if (bit == 0 && tagReg.full)
         errors += path + ": material \"" + d.name + "\": more than 32 distinct tags\n";
       d.gpu.tagMask |= bit;
+      // A hot GAS is a flame (materials.h kMatFlagFlame): the one thing a
+      // reacting coat may release into the world.
+      if (t == "hot" && d.gpu.klass == CLASS_GAS) d.gpu.flags |= kMatFlagFlame;
     }
     mats.push_back(d);
   }
