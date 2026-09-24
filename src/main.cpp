@@ -5963,7 +5963,6 @@ int main(int argc, char** argv) {
     ui.fSettleEps        = fs.fluidSettleEps;
     ui.fWakeSpeed        = fs.fluidWakeSpeed;
     ui.fSettleTicks      = fs.fluidSettleTicks;
-    ui.fStainRate        = fs.fluidStainRate;
     const auto& fr = CurrentTuning().render;
     ui.fSurface      = fr.fluidSurface;
     ui.fIso          = fr.fluidIso;
@@ -10005,7 +10004,6 @@ int main(int argc, char** argv) {
           ui.fSettleEps        = fs.fluidSettleEps;
           ui.fWakeSpeed        = fs.fluidWakeSpeed;
           ui.fSettleTicks      = fs.fluidSettleTicks;
-          ui.fStainRate        = fs.fluidStainRate;
           const auto& fr = tune.render;
           ui.fSurface      = fr.fluidSurface;
           ui.fIso          = fr.fluidIso;
@@ -13207,7 +13205,6 @@ int main(int argc, char** argv) {
         t.sim.fluidSettleEps        = ui.fSettleEps;
         t.sim.fluidWakeSpeed        = ui.fWakeSpeed;
         t.sim.fluidSettleTicks      = ui.fSettleTicks;
-        t.sim.fluidStainRate        = ui.fStainRate;
         t.render.fluidSurface      = ui.fSurface;
         t.render.fluidIso          = ui.fIso;
         t.render.fluidSmooth       = ui.fSmooth;

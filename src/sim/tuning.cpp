@@ -1401,7 +1401,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadI(*g, "fluidStuckTicks", s.fluidStuckTicks, out, at);
     ReadI(*g, "fluidForceBlocks", s.fluidForceBlocks, out, at);
     ReadI(*g, "fluidForceReach", s.fluidForceReach, out, at);
-    ReadF(*g, "fluidStainRate", s.fluidStainRate, out, at);
     ReadI(*g, "waterBodyMode", s.waterBodyMode, out, at);
     ReadI(*g, "waterBodyMinVolume", s.waterBodyMinVolume, out, at);
     ReadI(*g, "waterBodyExitVolume", s.waterBodyExitVolume, out, at);
@@ -1653,7 +1652,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("sim.fluidSettleTicks out of 8..600; clamped");
       s.fluidSettleTicks = s.fluidSettleTicks < 8 ? 8 : 600;
     }
-    clampWarnF(s.fluidStainRate, 0.0f, 30.0f, "fluidStainRate");
     // The force-settle backstop. 0 is a legal value for stuckTicks — it is the
     // off switch — so the floor is 0, not the 8 fluidSettleTicks needs. The
     // ceiling on reach is what bounds the forced walk's write set, and the

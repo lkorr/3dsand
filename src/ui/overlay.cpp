@@ -1446,7 +1446,6 @@ void Overlay::Draw(UIState& s) {
             fslider("settle below",     &s.fSettleEps,   0.05f, 20.0f);
             fslider("wake above",       &s.fWakeSpeed,   0.1f, 50.0f);
             islider("settle ticks",     &s.fSettleTicks, 8, 600);
-            fslider("stain rate",       &s.fStainRate,   0.0f, 30.0f);
           }
           ImGui::EndTabItem();
         }

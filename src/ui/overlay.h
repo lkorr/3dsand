@@ -233,7 +233,6 @@ struct UIState {
   float fSettleEps = 0.9f;
   float fWakeSpeed = 3.6f;
   int   fSettleTicks = 45;
-  float fStainRate = 8.0f;
   // ---- look tab (render) ----
   float fSurface = 1.0f;
   float fIso = 0.30f;

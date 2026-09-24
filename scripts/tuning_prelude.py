@@ -418,7 +418,6 @@ SPEC = [
     ("sim", "fluidSettleEps", "TUNE_FLUID_SETTLE_EPS", "f", 6.0),
     ("sim", "fluidWakeSpeed", "TUNE_FLUID_WAKE_SPEED", "f", 24.0),
     ("sim", "fluidSettleTicks", "TUNE_FLUID_SETTLE_TICKS", "i", 24),
-    ("sim", "fluidStainRate", "TUNE_FLUID_STAIN_RATE", "f", 8.0),
     ("sim", "fluidStuckTicks", "TUNE_FLUID_STUCK_TICKS", "i", 96),
     ("sim", "fluidForceBlocks", "TUNE_FLUID_FORCE_BLOCKS", "i", 4),
     ("sim", "fluidForceReach", "TUNE_FLUID_FORCE_REACH", "i", 64),

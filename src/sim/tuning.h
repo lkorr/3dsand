@@ -2459,9 +2459,6 @@ struct Tuning {
                                   // page-materialization readback latency, so
                                   // the settle converter never writes voxels
                                   // into a chunk the mirror has not seen
-    float fluidStainRate = 8.0f;  // chances/s that an excited-fluid contact
-                                  // stains an adjacent solid cell — the MPM
-                                  // counterpart of CA liquid staining
     int fluidStuckTicks = 96;     // ticks a chunk slot may hold particles
                                   // before its blocks are force-settled
                                   // regardless of calm. 0 disables the

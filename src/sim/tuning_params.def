@@ -691,7 +691,6 @@ TP_I(sim, fluidSubmergedSolid, TUNE_FLUID_SUBMERGED_SOLID, 1)
 TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f)
 TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
 TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
-TP_F(sim, fluidStainRate, TUNE_FLUID_STAIN_RATE, 8.0f)
 
 // ---- THE FORCE-SETTLE BACKSTOP (rule 2's termination guarantee) ------------
 // settleColumn walks its own 16 cells plus SETTLE_SPILL more, so a SUBMERGED

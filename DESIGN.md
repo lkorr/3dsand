@@ -2412,7 +2412,7 @@ buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
   calls (W1-B1: the two copies had drifted twice and disagreed on the
   chance, consumption, absorption and a clean absorbent cell's first
   level). The roll is the stainer material's authored per-mille chance
-  (`sim.fluidStainRate` is no longer read), `consume` applies, and wetting
+  (the old global `sim.fluidStainRate` knob is deleted), `consume` applies, and wetting
   ABSORBENT ground is paid for: each particle bids (`(index+1) << 1`,
   atomicMax into the ground cell's flags word — highest index wins, a pure
   function of compaction order) on the one neighbour a contact would

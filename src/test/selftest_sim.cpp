@@ -1667,7 +1667,6 @@ Status GateFluidExcite(Ctx& c, std::string& detail) {
   t.sim.fluidSettleEps = 6.0f;
   t.sim.fluidWakeSpeed = 24.0f;
   t.sim.fluidSettleTicks = 24;
-  t.sim.fluidStainRate = 8.0f;
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   // fluidDamping is a WGSL const (folded into the kernels at compile time —
@@ -2623,7 +2622,6 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   t.sim.fluidSprayDensity = 0.42f;
   t.sim.fluidFoamScaleIdx = 3;
   t.sim.fluidSettleTicks = 24;
-  t.sim.fluidStainRate = 8.0f;
   Tuning saved = CurrentTuning();
   SetCurrentTuning(t);
   sim.ReloadShaders(ctx.device);
