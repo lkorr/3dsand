@@ -4553,7 +4553,14 @@ class MobSystem {
   // it, which is what loads have always done. An UNPARK (save plan S5b)
   // passes true: the creature comes back exactly as it left, so its SaveOne
   // is the parked record byte for byte.
-  Mob* LoadOne(ByteReader& r, uint32_t version, bool placeLimbs = false);
+  //
+  // `spawnRefused` (optional) tells the two kinds of null apart: true when the
+  // record parsed and its def resolved but Spawn refused (the kMaxMobs cap, or
+  // BuildRig short of a physics body / micro brick) -- TRANSIENT, a caller
+  // holding the record should keep it and retry. False with a null return is
+  // permanent (retired def, corrupt or short record).
+  Mob* LoadOne(ByteReader& r, uint32_t version, bool placeLimbs = false,
+               bool* spawnRefused = nullptr);
 
   // ==== OWNERSHIP: who steps which creature (M9.4-B) ========================
   //

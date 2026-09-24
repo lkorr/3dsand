@@ -9,6 +9,14 @@
 #include "math3d.h"
 #include "sim/world.h"
 
+// Move `from` over `to` in ONE step: `to` names the old file or the new one at
+// every instant, never nothing. Every save file (regions, buckets, manifest,
+// world/player sections, meta) is written to `<path>.tmp` and landed with this.
+// The old `remove(to); rename(from, to)` pair left a window in which a crash
+// deleted the file outright. Windows: MoveFileExW(REPLACE_EXISTING |
+// WRITE_THROUGH); elsewhere rename(2), which replaces atomically.
+bool ReplaceFileAtomic(const std::string& from, const std::string& to);
+
 // Evicted-chunk store (DESIGN.md §3 streaming). Chunks are grouped into
 // 16^3-chunk REGIONS. Unbound (the default) it is pure RAM — the v1 behavior.
 // Bound to a directory it becomes a region-file store: regions lazy-load on
@@ -261,8 +269,13 @@ class ChunkStore {
     std::vector<EntityRecord> dormant;
     uint64_t diskHash = 0;
     bool loaded = false;
+    // The file exists but did not parse (DormantEntities). It is set aside
+    // as `<path>.corrupt` before anything is written over or deleted in its
+    // place, so a bucket this build cannot read is never silently destroyed.
+    bool unreadable = false;
   };
   EntityRegion& TouchEntityRegion(IVec3 rc);
+  bool SetAsideUnreadable(EntityRegion& e, const std::string& path);
   std::unordered_map<uint64_t, EntityRegion> entityRegions_;  // packed region key
   size_t chunkCount_ = 0;
   uint64_t useCounter_ = 0;

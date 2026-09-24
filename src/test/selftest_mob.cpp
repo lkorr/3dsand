@@ -10057,7 +10057,132 @@ Status GateMobPark(Ctx& c, std::string& detail) {
   const bool okE = standing == 3;
   RecordObserved("mobParkWorstDropVox", (double)worstDrop);
 
-  const bool ok = okA && okB && okC && okD && okE;
+  // ======== F: a record that cannot go live YET is kept, a bad one is not ===
+  //
+  // F1 (load past the cap): the three records back in their buckets, a full
+  // live crowd, and the load path's ApplyRegionEntities. Every record must be
+  // RETRIED and stay parked -- the load used to take them out of the bucket
+  // and drop them, deleting every NPC past the sixteenth on the next save.
+  // Then with room: all three applied, the buckets empty.
+  // F2 (LoadOne's two nulls): the same record at the cap is `spawnRefused`
+  // (Unpark keeps it); a retired def name is a permanent null.
+  // F3 (a lying limb count): nLimbs = 0xFFFFFFFF is refused cleanly, not a
+  // multi-GiB assign().
+  // F4 (unreadable bucket): a garbage r_*.sve is set aside as .corrupt, byte
+  // for byte, before a record landing in its region writes the bucket.
+  c.mobs.Reset();
+  auto fillCrowd = [&]() {
+    for (int k = 0; k < 16; k++)
+      c.mobs.Spawn(dummyDef, {base.x - 60 + (k % 4) * 8,
+                              World::TerrainHeight(base.x - 60, base.z - 60, kDefaultSeed) + 1,
+                              base.z - 60 + (k / 4) * 8});
+  };
+  auto repark = [&]() {
+    for (const Parked& p : parked) {
+      EntityRecord r;
+      r.section = kMobs;
+      r.version = MobSystem::kSaveVersion;
+      r.pos = p.origin;
+      r.bytes = p.bytes;
+      c.stream.Store().DormantEntities(ChunkStore::RegionOfVoxel(p.origin))
+          .push_back(std::move(r));
+    }
+  };
+  repark();
+  fillCrowd();
+  const uint32_t crowdF = c.mobs.MobCount();
+  EntityFileReport fr1;
+  ApplyRegionEntities(c.stream.Store(), c.world.WindowOrigin(), eio, &fr1);
+  std::string whyF;
+  const int foundF1 = bucketsHold(whyF);
+  c.mobs.Reset();
+  EntityFileReport fr2;
+  ApplyRegionEntities(c.stream.Store(), c.world.WindowOrigin(), eio, &fr2);
+  std::string ignoreF;
+  const int foundF1b = bucketsHold(ignoreF);
+  const uint32_t liveF1b = c.mobs.MobCount();
+  const bool okF1 = crowdF == 16 && fr1.recordsRetried == 3 &&
+                    fr1.recordsApplied == 0 && fr1.recordsDropped == 0 &&
+                    foundF1 == 3 && fr2.recordsApplied == 3 &&
+                    fr2.recordsRetried == 0 && foundF1b == 0 && liveF1b == 3;
+
+  c.mobs.Reset();
+  fillCrowd();
+  bool capRefused = false, capNull = false;
+  {
+    ByteReader rd{parked[0].bytes.data(), parked[0].bytes.size()};
+    capNull = c.mobs.LoadOne(rd, MobSystem::kSaveVersion, true, &capRefused) == nullptr;
+  }
+  c.mobs.Reset();
+  // The def name is the record's first field: u32 length, then the bytes.
+  uint32_t nameLen = 0;
+  std::memcpy(&nameLen, parked[0].bytes.data(), 4);
+  bool retiredRefused = true, retiredNull = false;
+  {
+    std::vector<uint8_t> b = parked[0].bytes;
+    for (uint32_t k = 0; k < nameLen; k++) b[4 + k] = 'q';
+    ByteReader rd{b.data(), b.size()};
+    retiredNull = c.mobs.LoadOne(rd, MobSystem::kSaveVersion, true, &retiredRefused) == nullptr;
+  }
+  const bool okF2 = capNull && capRefused && retiredNull && !retiredRefused &&
+                    c.mobs.MobCount() == 0;
+
+  // defName (4 + len), origin (12), heading (4), bodyY (4), then nLimbs.
+  bool lieRefused = true, lieNull = false;
+  {
+    std::vector<uint8_t> b = parked[0].bytes;
+    const size_t at = 4 + (size_t)nameLen + 20;
+    if (at + 4 <= b.size()) {
+      const uint32_t lie = 0xFFFFFFFFu;
+      std::memcpy(b.data() + at, &lie, 4);
+      ByteReader rd{b.data(), b.size()};
+      lieNull = c.mobs.LoadOne(rd, MobSystem::kSaveVersion, true, &lieRefused) == nullptr;
+    }
+  }
+  const bool okF3 = lieNull && !lieRefused && c.mobs.MobCount() == 0;
+
+  bool okF4 = false;
+  std::string whyF4;
+  {
+    // A region nothing else in the gate touches.
+    const IVec3 rc = ChunkStore::RegionOfChunk({home.x - 4 * n, home.y, home.z - 4 * n});
+    const std::string path = c.stream.Store().EntityRegionPath(rc);
+    const std::string junk = "not a bucket, and not ours to destroy";
+    {
+      std::ofstream f(path, std::ios::binary);
+      f << junk;
+    }
+    const bool unread = c.stream.Store().DormantEntities(rc).empty();
+    EntityRecord r;
+    r.section = kMobs;
+    r.version = MobSystem::kSaveVersion;
+    r.pos = Vec3{(float)(rc.x * 256), (float)(rc.y * 256), (float)(rc.z * 256)};
+    r.bytes = parked[0].bytes;
+    const std::vector<const EntityRecord*> live{&r};
+    bool wrote = false;
+    const bool wroteOk = c.stream.Store().WriteEntityRegion(rc, live, &wrote);
+    std::string kept;
+    {
+      std::ifstream f(path + ".corrupt", std::ios::binary);
+      kept.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    uint32_t magic = 0;
+    {
+      std::ifstream f(path, std::ios::binary);
+      f.read((char*)&magic, 4);
+    }
+    okF4 = unread && wroteOk && wrote && kept == junk && magic == 0x31585653u;
+    if (!okF4)
+      whyF4 = Format(" (unread %d wrote %d/%d corrupt '%s' magic %08x)", unread ? 1 : 0,
+                     wroteOk ? 1 : 0, wrote ? 1 : 0, kept.c_str(), magic);
+    std::error_code ec;
+    fs::remove(path, ec);
+    fs::remove(path + ".corrupt", ec);
+  }
+  const bool okF = okF1 && okF2 && okF3 && okF4;
+  c.mobs.Reset();
+
+  const bool ok = okA && okB && okC && okD && okE && okF;
   detail = Format(
       "A %s: %zu captured, live %u after park, parked %llu, %d/3 records in "
       "their buckets byte-identical, carved stores lattice %d%s%s | B %s: %d/16 "
@@ -10077,6 +10202,16 @@ Status GateMobPark(Ctx& c, std::string& detail) {
       (unsigned long long)ds.groundWaits, (unsigned long long)ds.budgetWaits, same,
       onGround, whyD.empty() ? "" : ", first: ", whyD.c_str(), brainsBack,
       targetsAtPark, okE ? "ok" : "FAIL", standing, worstDrop, maxDrop);
+  detail += Format(
+      " | F %s: load at cap (crowd %u) retried %u applied %u dropped %u kept "
+      "%d/3%s%s, with room applied %u live %u left %d; LoadOne at cap null %d "
+      "refused %d, retired def null %d refused %d; nLimbs lie null %d refused "
+      "%d; unreadable bucket %s%s",
+      okF ? "ok" : "FAIL", crowdF, fr1.recordsRetried, fr1.recordsApplied,
+      fr1.recordsDropped, foundF1, whyF.empty() ? "" : ", first: ", whyF.c_str(),
+      fr2.recordsApplied, liveF1b, foundF1b, capNull ? 1 : 0, capRefused ? 1 : 0,
+      retiredNull ? 1 : 0, retiredRefused ? 1 : 0, lieNull ? 1 : 0,
+      lieRefused ? 1 : 0, okF4 ? "preserved" : "LOST", whyF4.c_str());
 
   restore();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);

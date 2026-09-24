@@ -224,6 +224,7 @@ class MobParking {
     uint64_t groundWaits = 0;  // a record left parked: its ground not known yet
     uint64_t capWaits = 0;     // ...the live crowd was full
     uint64_t budgetWaits = 0;  // ...this call's budget was spent
+    uint64_t spawnWaits = 0;   // ...Spawn refused it (rig/pool): kept, retried
     uint32_t lastCall = 0;     // creatures made live by the last call
     uint32_t maxCall = 0;      // the most any one call made live
   };

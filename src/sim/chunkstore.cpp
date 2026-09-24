@@ -9,7 +9,31 @@
 
 #include "sim/stream.h"  // kPersistMask, RleEncodeChunk
 
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
+
 namespace fs = std::filesystem;
+
+bool ReplaceFileAtomic(const std::string& from, const std::string& to) {
+#ifdef _WIN32
+  // Through fs::path for the UTF-8 -> UTF-16 conversion the rest of the store
+  // gets from std::filesystem.
+  const fs::path f(from), t(to);
+  return MoveFileExW(f.c_str(), t.c_str(),
+                     MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+  std::error_code ec;
+  fs::rename(from, to, ec);  // rename(2): replaces `to` atomically
+  return !ec;
+#endif
+}
 
 namespace {
 // 'SVR2' — bumped from 'SVR1' when the persisted voxel word widened from
@@ -304,11 +328,7 @@ bool ChunkStore::WriteRegion(IVec3 rc, Region& r, uint64_t* bytesOut) {
     bytes += 16 + rec.size();
   }
   std::fclose(fp);
-  if (ok) {
-    fs::remove(path, ec);
-    fs::rename(tmp, path, ec);
-    ok = !ec;
-  }
+  if (ok) ok = ReplaceFileAtomic(tmp, path);
   if (!ok) {
     std::fprintf(stderr, "chunkstore: failed writing %s\n", path.c_str());
     fs::remove(tmp, ec);
@@ -436,11 +456,7 @@ bool ChunkStore::WriteManifest() {
          std::fwrite(&tick, 4, 1, fp) == 1;
   }
   std::fclose(fp);
-  if (ok) {
-    fs::remove(ManifestPath(), ec);
-    fs::rename(tmp, ManifestPath(), ec);
-    ok = !ec;
-  }
+  if (ok) ok = ReplaceFileAtomic(tmp, ManifestPath());
   if (!ok) {
     std::fprintf(stderr, "chunkstore: failed writing %s\n",
                  ManifestPath().c_str());
@@ -583,9 +599,10 @@ std::vector<ChunkStore::EntityRecord>& ChunkStore::DormantEntities(IVec3 rc) {
     // they were the whole bucket.
     std::fprintf(stderr,
                  "chunkstore: %s is not a readable entity bucket (magic %08x); "
-                 "its records are ignored and the file is left alone unless "
-                 "something live lands in that region\n",
+                 "its records are ignored, and if anything live lands in that "
+                 "region the file is renamed to .corrupt, never overwritten\n",
                  EntityRegionPath(rc).c_str(), magic);
+    e.unreadable = true;
     return e.dormant;
   }
   e.dormant = std::move(recs);
@@ -594,6 +611,35 @@ std::vector<ChunkStore::EntityRecord>& ChunkStore::DormantEntities(IVec3 rc) {
 
 void ChunkStore::EntityRegionsKnown(std::vector<IVec3>& out) const {
   for (const auto& [key, e] : entityRegions_) out.push_back(e.rc);
+}
+
+// An unreadable bucket (EntityRegion::unreadable) is renamed to the first
+// free `<path>.corrupt[N]` before a write or a delete would take its place.
+// False only if the rename itself failed -- then the caller must not write
+// either, or the file it could not move would be destroyed after all.
+bool ChunkStore::SetAsideUnreadable(EntityRegion& e, const std::string& path) {
+  if (!e.unreadable) return true;
+  std::error_code ec;
+  if (!fs::exists(path, ec)) {  // gone since the read: nothing to protect
+    e.unreadable = false;
+    return true;
+  }
+  std::string dst = path + ".corrupt";
+  for (int i = 1; fs::exists(dst, ec) && i < 1000; i++)
+    dst = path + ".corrupt" + std::to_string(i);
+  fs::rename(path, dst, ec);
+  if (ec) {
+    std::fprintf(stderr,
+                 "chunkstore: cannot set aside unreadable %s (%s); not "
+                 "writing over it\n",
+                 path.c_str(), ec.message().c_str());
+    return false;
+  }
+  std::fprintf(stderr,
+               "chunkstore: unreadable entity bucket %s preserved as %s\n",
+               path.c_str(), dst.c_str());
+  e.unreadable = false;
+  return true;
 }
 
 bool ChunkStore::WriteEntityRegion(IVec3 rc,
@@ -613,6 +659,14 @@ bool ChunkStore::WriteEntityRegion(IVec3 rc,
   const std::string path = EntityRegionPath(rc);
   std::error_code ec;
   if (all.empty()) {
+    if (e.unreadable) {
+      // Nothing live and nothing readable here: set the file aside rather
+      // than delete it, and leave no bucket behind.
+      if (!SetAsideUnreadable(e, path)) return false;
+      e.diskHash = 0;
+      if (wrote) *wrote = true;
+      return true;
+    }
     if (e.diskHash != 0) {
       fs::remove(path, ec);
       e.diskHash = 0;
@@ -642,11 +696,8 @@ bool ChunkStore::WriteEntityRegion(IVec3 rc,
   FILE* fp = std::fopen(tmp.c_str(), "wb");
   bool ok = fp && std::fwrite(buf.data(), 1, buf.size(), fp) == buf.size();
   if (fp) std::fclose(fp);
-  if (ok) {
-    fs::remove(path, ec);
-    fs::rename(tmp, path, ec);
-    ok = !ec;
-  }
+  if (ok && !SetAsideUnreadable(e, path)) ok = false;
+  if (ok) ok = ReplaceFileAtomic(tmp, path);
   if (!ok) {
     std::fprintf(stderr, "chunkstore: failed writing %s\n", path.c_str());
     fs::remove(tmp, ec);

@@ -590,11 +590,17 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
         out.push_back(std::move(r));
       }
     };
+    // Straight to LoadOne (LoadState's loop body) rather than through a
+    // count-1 LoadState: LoadState reports only whether the BYTES parsed, and
+    // this has to know whether the creature went live. A full crowd is not
+    // worth parsing for -- the record stays parked, Unpark's capWaits rule.
     mobsSec.loadRecord = [&mobs](const uint8_t* d, size_t n, uint32_t v) {
-      std::vector<uint8_t> one;
-      PutU32(one, 1u);
-      one.insert(one.end(), d, d + n);
-      return mobs.LoadState(one.data(), one.size(), v);
+      if (!mobs.HasRoomToSpawn()) return RecordLoad::Retry;
+      ByteReader rd{d, n};
+      bool refused = false;
+      if (mobs.LoadOne(rd, v, /*placeLimbs=*/false, &refused) != nullptr)
+        return RecordLoad::Applied;
+      return refused ? RecordLoad::Retry : RecordLoad::Dropped;
     };
     io.sections.push_back(std::move(mobsSec));
   }
@@ -666,7 +672,8 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
       std::vector<uint8_t> one;
       PutU32(one, 1u);
       one.insert(one.end(), d, d + n);
-      return LoadWorldItems(g, one.data(), one.size(), v);
+      return LoadWorldItems(g, one.data(), one.size(), v) ? RecordLoad::Applied
+                                                          : RecordLoad::Dropped;
     };
     io.sections.push_back(std::move(itms));
   }
@@ -913,15 +920,29 @@ uint32_t MobParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
           }
           // Take it OUT of the bucket first, then apply (ApplyRegionEntities'
           // order): the creature is live now, and the next save writes it back
-          // from MobSystem. A record LoadOne refuses (def retired, short read)
-          // is logged there and dropped -- the load path's rule.
+          // from MobSystem. A record LoadOne refuses for GOOD (def retired,
+          // short read) is logged there and dropped -- the load path's rule.
+          // A refused SPAWN (BuildRig short of a physics body or micro brick;
+          // the cap was checked above) is transient: the record goes back
+          // where it was and this call stops spawning, so a pool that stays
+          // full costs one failed rig build per call, not one per record.
           EntityRecord r = std::move(dormant[i]);
           dormant.erase(dormant.begin() + (ptrdiff_t)i);
           ByteReader rd{r.bytes.data(), r.bytes.size()};
+          bool refused = false;
           // placeLimbs: it comes back in the pose it left in (mob.h LoadOne).
-          if (mobs.LoadOne(rd, r.version, /*placeLimbs=*/true) != nullptr) {
+          if (mobs.LoadOne(rd, r.version, /*placeLimbs=*/true, &refused) !=
+              nullptr) {
             made++;
             stats_.unparked++;
+          } else if (refused) {
+            stats_.spawnWaits++;
+            pending_ = true;
+            // Back at the index it came from, so the walk resumes after it.
+            dormant.insert(dormant.begin() + (ptrdiff_t)i, std::move(r));
+            // Spend the rest of this call's budget: nothing more spawns now.
+            budget = made;
+            i++;
           } else {
             stats_.failed++;
             std::fprintf(stderr,

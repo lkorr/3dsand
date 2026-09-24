@@ -87,11 +87,7 @@ bool WriteFileAtomic(const std::string& path, const std::vector<uint8_t>& buf) {
   bool ok = std::fwrite(buf.data(), 1, buf.size(), fp) == buf.size();
   std::fclose(fp);
   std::error_code ec;
-  if (ok) {
-    std::filesystem::remove(path, ec);
-    std::filesystem::rename(tmp, path, ec);
-    ok = !ec;
-  }
+  if (ok) ok = ReplaceFileAtomic(tmp, path);
   if (!ok) std::filesystem::remove(tmp, ec);
   return ok;
 }
@@ -433,23 +429,44 @@ void ApplyRegionEntities(ChunkStore& store, IVec3 wo, const EntityIO& io,
           }
         }
         dormant = std::move(keep);
-        if (rep) rep->recordsDormant += (uint32_t)dormant.size();
-        if (take.empty()) continue;
+        if (take.empty()) {
+          if (rep) rep->recordsDormant += (uint32_t)dormant.size();
+          continue;
+        }
         if (rep) rep->regionsApplied++;
-        for (const EntityRecord& r : take) {
+        // A record that fails for GOOD (content gone, truncated) is logged and
+        // NOT re-parked: the same rule the whole-payload loaders follow for a
+        // name that no longer resolves. A record that could not be made live
+        // YET (`Retry`: the creature cap, a pool momentarily full) goes back
+        // into the bucket -- MobParking::Unpark's rule. Parked records beyond
+        // the cap are a normal state, and a load that dropped them would
+        // delete every NPC past the sixteenth from the world file on the next
+        // save.
+        std::vector<EntityRecord> retry;
+        for (EntityRecord& r : take) {
           const EntitySection* match = nullptr;
           for (const EntitySection& s : io.sections)
             if (s.id == r.section && IsRegionSection(s)) match = &s;
-          // A record that fails (content gone, truncated) is logged and NOT
-          // re-parked: the same rule the whole-payload loaders follow for a
-          // name that no longer resolves.
-          if (!match->loadRecord(r.bytes.data(), r.bytes.size(), r.version))
+          const RecordLoad got =
+              match->loadRecord(r.bytes.data(), r.bytes.size(), r.version);
+          if (got == RecordLoad::Applied) {
+            if (rep) rep->recordsApplied++;
+          } else if (got == RecordLoad::Retry) {
+            if (rep) rep->recordsRetried++;
+            retry.push_back(std::move(r));
+          } else {
+            if (rep) rep->recordsDropped++;
             std::fprintf(stderr,
                          "load: a '%s' record (v%u) in region (%d,%d,%d) failed "
                          "to apply and is dropped\n",
                          FourCCStr(r.section).c_str(), r.version, rx, ry, rz);
-          if (rep) rep->recordsApplied++;
+          }
         }
+        // Re-fetch the bucket rather than trust the reference taken above: a
+        // loader that spawned may have touched the store.
+        std::vector<EntityRecord>& back = store.DormantEntities({rx, ry, rz});
+        for (EntityRecord& r : retry) back.push_back(std::move(r));
+        if (rep) rep->recordsDormant += (uint32_t)back.size();
       }
 }
 
@@ -566,9 +583,9 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
     store.RemoveAllEntityFiles();
   }
 
-  // meta last: its presence marks a completed save
-  FILE* fp = std::fopen(MetaPath(path).c_str(), "wb");
-  if (!fp) return false;
+  // meta last: its presence marks a completed save. Through the tmp+rename
+  // writer like every other save file: written in place, a crash mid-write
+  // left a torn meta.svm that refuses the whole world on the next load.
   {
     std::vector<uint8_t> meta;
     ByteWriter w{meta};
@@ -611,9 +628,10 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
     w.U32(WorldgenFingerprint::kParts);
     for (uint32_t i = 0; i < WorldgenFingerprint::kParts; i++)
       w.U32(rep.fingerprint.parts[i]);
-    bool ok = std::fwrite(meta.data(), 1, meta.size(), fp) == meta.size();
-    std::fclose(fp);
-    if (!ok) return false;
+    if (!WriteFileAtomic(MetaPath(path), meta)) {
+      std::fprintf(stderr, "save: failed to write %s\n", MetaPath(path).c_str());
+      return false;
+    }
   }
   // The TAGGED-chunk count is printed beside the byte total because the two
   // answer different questions and M9.5-B's smoke reads the second: "how much

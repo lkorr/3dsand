@@ -19256,6 +19256,19 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
   r.F32(out.heading);
   r.F32(out.bodyY);
   r.U32(nLimbs);
+  // THE COUNT IS FROM THE FILE, so it is bounded before it sizes anything:
+  // every limb, either version, is at least its first two u32-sized fields
+  // (v4 kind+hp, v3 alive+hp), so a count the remaining bytes cannot hold is
+  // a corrupt record -- refused here, not a multi-GiB assign() that dies in
+  // bad_alloc and takes the whole load with it. kMaxRecordLimbs is the second
+  // wall: no rig is within an order of magnitude of it.
+  constexpr uint32_t kMaxRecordLimbs = 1024;
+  constexpr size_t kMinLimbBytes = 8;
+  if (!r.ok || nLimbs > kMaxRecordLimbs ||
+      (size_t)nLimbs > (r.n - r.off) / kMinLimbBytes) {
+    r.ok = false;
+    return false;
+  }
   // resize() after the count is read and before the fields are: the reader is
   // bounds-checked and sticky, so a truncated record simply leaves the tail
   // default-constructed and `ok` false.
@@ -19506,7 +19519,9 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
 // saved carve state, then the severs. Null on a def that no longer exists, a
 // refused spawn, or a short read — all three of which it reports exactly as
 // the loop always did.
-Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs) {
+Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs,
+                        bool* spawnRefused) {
+  if (spawnRefused) *spawnRefused = false;
   if (version < kSaveVersionMin || version > kSaveVersion) {
     std::printf("mob: unknown mob record version %u\n", version);
     return nullptr;
@@ -19549,6 +19564,10 @@ Mob* MobSystem::LoadOne(ByteReader& r, uint32_t version, bool placeLimbs) {
                                        ifloor(rec.origin.y),
                                        ifloor(rec.origin.z)});
   if (id == 0) {
+    // TRANSIENT, unlike the two refusals above: the record is sound and the
+    // def resolves, the crowd was full or BuildRig could not get a physics
+    // body / micro brick this tick. A caller holding the record keeps it.
+    if (spawnRefused) *spawnRefused = true;
     std::printf("mob: could not respawn saved '%s' (limit or physics)\n",
                 rec.defName.c_str());
     return nullptr;
