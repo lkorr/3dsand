@@ -1579,8 +1579,15 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
   // (`instance`), because a sub-bolt has no lane of its own and a drop on it
   // means that branch. Where the sub-fans were too wide to draw, the branch
   // keeps ONE cell wearing the tally, which is what this did everywhere before.
+  //
+  // ONE BRANCH THAT SPLITS IS STILL A SPLIT (2026-09-23). `lane twin end
+  // projectile` is one lane, so one instance, and the early `stageBar` below
+  // used to take it: the lane's own junction and its two sub-sockets were
+  // drawn and then capped by NOTHING — one cell on the box axis, no stroke from
+  // either bolt into it. A single branch with bolts goes through the per-bolt
+  // loop like any other.
   auto stageDeliveries = [&]() {
-    if (instances <= 1) {
+    if (instances <= 1 && boltIdx[0].empty()) {
       stageBar();
       return;
     }
@@ -1655,8 +1662,14 @@ int Builder::Place(int node, int32_t lane, int layer, int x, int& outIdx,
   // reader (the canvas's reach rule, `boxOf`, the gate) tests for.
   if (drawSockets) {
     g.nodes[(size_t)barIdx].sockets = socketIdx;
-    for (int32_t inst = 0; inst < instances; inst++)
-      Edge(socketIdx[(size_t)inst], anchorIdx, GraphEdge::Fan);
+    // ...except where the anchor is a spoken box's own CELL over a single
+    // branch that split again: that pip's road to its cells is its sub-fan,
+    // and a second stroke from it straight up into bolt 0's cell would draw
+    // that bolt twice.
+    const bool viaSubFan = flip && splitIdx < 0 && instances == 1 && !boltIdx[0].empty();
+    if (!viaSubFan)
+      for (int32_t inst = 0; inst < instances; inst++)
+        Edge(socketIdx[(size_t)inst], anchorIdx, GraphEdge::Fan);
   }
   g.nodes[(size_t)barIdx].split = splitIdx;
   // The `hand` is the pedestal everything stands on, so its junction hands off

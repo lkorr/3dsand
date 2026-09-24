@@ -105,9 +105,11 @@ divisor ≥ 1 for div).
 The tariff already prices the world effect (bigger blast, more voxels), so it
 follows `mag` for free. The WORD cost is the only price on a mod with no tariff
 (`swift`, `seek`, `float`), and it is **convex**:
-`word × mag² / 1000²`, rounded up, minimum 1. Morrowind's sliders collapsed to
+`word × mag² / default²`, rounded up, minimum 1. Morrowind's sliders collapsed to
 "max magnitude" because price was linear; quadratic makes the middle values the
-efficient ones. At `mag = 1000` it is `word`, unchanged.
+efficient ones. At the word's default magnitude it is `word`, unchanged
+(2026-09-23: it was centred on 1000, which charged a fresh `speed`, default 2,
+four times its alias `swift`).
 
 ### 2.4 Serialization
 

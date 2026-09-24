@@ -107,6 +107,20 @@ bool Reaches(const GlyphLibrary& lib, const Grimoire& g, const std::vector<std::
 
 }  // namespace
 
+bool GrimoireNameUsable(const GlyphLibrary& lib, const std::string& name, std::string& why) {
+  if (name.find_first_of("@!+") != std::string::npos) {
+    why = "a page name cannot contain @ ! or +";
+    return false;
+  }
+  // The SAME lookup Expand and Reaches make (FindWord), so a name the save
+  // accepts is a name expansion reaches as a page.
+  if (lib.FindWord(name) >= 0) {
+    why = "that name belongs to the library";
+    return false;
+  }
+  return true;
+}
+
 bool GrimoireWouldCycle(const GlyphLibrary& lib, const Grimoire& g, const std::string& name,
                         const std::vector<std::string>& words, std::string& why) {
   std::string path;

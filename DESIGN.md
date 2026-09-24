@@ -6570,8 +6570,9 @@ bit-for-bit as before and no pinned price moved. An add mod adds amount × mag
 never below ×1), a div mod divides by it; matter, effects and the opted-in
 operators (`transmute`, `mend`, `trail`, `null`) scale their axis. The TARIFF
 follows the world effect for free (`explosive@2` prices as `explosive
-explosive`); the WORD price is convex, word × mag² (`MagnitudeWordCost`), so the
-middle of the range is the efficient buy. Ranges are content (`"magnitude":
+explosive`); the WORD price is convex, word × (mag/default)² (`MagnitudeWordCost`,
+centred on each word's own default so `speed` left at 2 costs what `swift`
+does), so the middle of the range is the efficient buy. Ranges are content (`"magnitude":
 {min,max,step}` or `false` in glyphs.json; defaults by sort — count mods,
 deliveries and marks do not scale, bounce/pierce/seek step whole units),
 clamped once at parse. Only equal magnitudes merge (`NodeKey` carries `~mag`

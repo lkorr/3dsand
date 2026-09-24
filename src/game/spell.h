@@ -398,9 +398,11 @@ std::string MagnitudeDecimal(int32_t mag);
 // "gravity -0.50 g", "speed x1.5", "power 330", "3 voxels". `n` is the
 // multiplicity. Empty for a glyph with nothing to say.
 std::string MagnitudeLabel(const GlyphLibrary& lib, int glyph, int32_t n, int32_t mag);
-// THE WORD PRICE AT A MAGNITUDE, and it is CONVEX: word × (mag/1000)², rounded
-// up, at least 1 for a word that costs anything. Exactly `word` at 1000.
-int32_t MagnitudeWordCost(int32_t word, int32_t mag);
+// THE WORD PRICE AT A MAGNITUDE, and it is CONVEX: word × (mag/magDefault)²,
+// rounded up, at least 1 for a word that costs anything. Exactly `word` at the
+// glyph's DEFAULT magnitude, so a word placed and left alone costs what its
+// authored price (and its fixed-magnitude alias, `speed` = `swift`) says.
+int32_t MagnitudeWordCost(int32_t word, int32_t mag, int32_t magDefault = kMagOne);
 
 // A conjoined glyph / grimoire starter page: a saved list of glyph names that
 // speaks as if you had spoken them in order (plan §12b). Indices here are
@@ -962,6 +964,16 @@ struct SpellEcho {
   int32_t left = 0, period = 1, phase = 0;
   uint64_t casterId = 0;
   int32_t instability = 0;
+  // THE LAUNCH CONTEXT a carrier inside `inner` is born with when the echo
+  // fires — the exact at/dir/generation the IMMEDIATE path stamps on a launch
+  // the same resolve asked for (a hit's last free position and reflection, the
+  // hand's muzzle and aim, ...). Filled by whoever emitted the payload, like
+  // SpellLaunchReq's; `launchGen` < 0 means "not stamped yet". Without it a
+  // delayed bolt was born with casterId 0 (it homed on and hit its own caster)
+  // at generation 0 (past maxGeneration) inside the wall its parent struck.
+  SpellFxVec launchAt{};
+  SpellFxVec launchDir{0, kSpellFxOne, 0};
+  int32_t launchGen = -1;
 };
 
 // A FILTER (plan §7 wards): `W null`. Refuses incoming ops of W's kind within

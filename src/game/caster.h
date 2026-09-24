@@ -155,6 +155,12 @@ const GrimoirePage* FindPage(const GlyphLibrary& lib, const Grimoire& g,
 GrimoireExpansion ExpandWords(const GlyphLibrary& lib, const Grimoire& g,
                               const std::vector<std::string>& words, int maxWords);
 
+// Can a page be saved under `name` and still be REACHED by expansion? False
+// with `why` filled when the name contains the word syntax (`@` `!` `+`:
+// expansion cuts a word there and looks for a glyph first, so `fire@x` speaks
+// `fire`) or when the name, read as a word, IS a glyph.
+bool GrimoireNameUsable(const GlyphLibrary& lib, const std::string& name, std::string& why);
+
 // Would saving `name` = `words` make a page that contains itself, through any
 // chain of pages? True with `why` filled: the save is refused (§12b).
 bool GrimoireWouldCycle(const GlyphLibrary& lib, const Grimoire& g,

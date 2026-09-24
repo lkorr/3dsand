@@ -162,6 +162,18 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
     check(ex.tooDeep && ex.spoken.empty(), "expanding a cycle stops rather than recursing");
   }
 
+  // ---- 3b. a name expansion cannot reach is refused at save --------------------
+  // `kit_fire@x` would be read as the glyph kit_fire (expansion cuts at the
+  // word syntax before it looks for a page), so the page is unreachable.
+  {
+    std::string why;
+    check(GrimoireNameUsable(lib, "my-page", why), "a plain name is usable");
+    for (const char* bad : {"kit_fire@x", "kit_fire!x", "kit_fire+x", "mine@2", "a!b", "c+d"})
+      check(!GrimoireNameUsable(lib, bad, why) && !why.empty(),
+            "a name with @ ! or + is refused");
+    check(!GrimoireNameUsable(lib, "kit_fire", why), "a glyph's own name is refused");
+  }
+
   // ---- 4. the overflow cap ------------------------------------------------------
   {
     Grimoire big;

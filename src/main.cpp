@@ -12415,7 +12415,9 @@ int main(int argc, char** argv) {
           std::string why;
           if (name.empty()) {
             say("a page needs a name");
-          } else if (starter || glyphs.Find(name) >= 0) {
+          } else if (!GrimoireNameUsable(glyphs, name, why)) {
+            say(why);
+          } else if (starter) {
             say("that name belongs to the library");
           } else if (GrimoireWouldCycle(glyphs, caster.grimoire, name, words, why)) {
             say("refused: " + why);

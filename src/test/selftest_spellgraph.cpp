@@ -32,6 +32,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cstdio>
+#include <deque>
 #include <fstream>
 #include <map>
 #include <set>
@@ -1207,6 +1208,31 @@ Status GateSpellGraph(Ctx& c, std::string& detail) {
                    cells, (int)bolts));
       (void)bp;
     }
+    // (b2) ONE BRANCH THAT SPLITS. `lane twin end projectile` is one lane and
+    // one instance, and it drew the lane's junction and two bolt pips capped by
+    // nothing: one cell on the axis and no stroke into it. Two bolts are two
+    // cells, each with a Trunk from its own bolt pip.
+    {
+      const char* w = "fire lane twin end projectile";
+      const SpellGraph g = BuildGraph(lib, LowerSpell(lib, ParseWords(lib, Split(w))));
+      std::vector<int> cellIdx;
+      for (size_t i = 0; i < g.nodes.size(); i++)
+        if (g.nodes[i].kind == GraphKind::Join && g.nodes[i].label == "projectile")
+          cellIdx.push_back((int)i);
+      int fed = 0;
+      for (int ci : cellIdx)
+        for (const SpellGraphEdge& e : g.edges)
+          if (e.to == ci && e.kind == GraphEdge::Trunk && e.from >= 0 &&
+              e.from < (int)g.nodes.size() &&
+              g.nodes[(size_t)e.from].kind == GraphKind::Socket) {
+            fed++;
+            break;
+          }
+      check(cellIdx.size() == 2 && fed == 2,
+            Format("[%s] caps each of its 2 bolts with a cell fed from its pip (%d cells, "
+                   "%d fed)",
+                   w, (int)cellIdx.size(), fed));
+    }
     // (c) IT NESTS. A fan inside a fan by nesting BOXES is the other way depth
     // arrives, and it goes through the same recursion.
     {
@@ -1452,7 +1478,15 @@ Status GateSpellMagnitude(Ctx& c, std::string& detail) {
     return LowerSpell(lib, ParseWords(lib, w));
   };
   // The projectile record a `... projectile` sentence flies with.
-  auto flight = [&](const CastList& l) -> const DeliveryRec* {
+  std::deque<CastList> keptLists;
+  // The CastList is KEPT: every caller passes a temporary (`flight(compile(..))`)
+  // and the pointer returned used to point into it after it died - reads of
+  // freed memory that passed or failed with the heap layout (2026-09-23: an
+  // unrelated edit to spell.cpp flipped `lift@-1 is heavy` red). A deque, so a
+  // later push never moves an earlier list.
+  auto flight = [&](CastList lv) -> const DeliveryRec* {
+    keptLists.push_back(std::move(lv));
+    const CastList& l = keptLists.back();
     if (l.casts.empty()) return nullptr;
     const EffectInst* e = FindVerb(l.casts[0].payload, SpellVerb::Launch);
     return e && !e->launch.empty() ? &e->launch[0] : nullptr;
@@ -1531,16 +1565,18 @@ Status GateSpellMagnitude(Ctx& c, std::string& detail) {
   }
 
   // 3. THE WORD PRICE IS CONVEX AND MONOTONE for every graded glyph, and at 1
-  // it is the authored word cost exactly.
+  // its DEFAULT it is the authored word cost exactly (a word placed and left
+  // alone costs what it says, whatever its default magnitude is).
   int graded = 0;
   for (const GlyphDef& g : lib.glyphs) {
-    check(MagnitudeWordCost(g.word, kMagOne) == g.word, g.id + ": word cost at 1 moved");
+    check(MagnitudeWordCost(g.word, g.magDefault, g.magDefault) == g.word,
+          g.id + ": word cost at its default magnitude moved");
     if (!g.graded) continue;
     graded++;
     int32_t prev = -1, prevDelta = -1;
     // A SIGNED component prices by |magnitude|: walk its non-negative half.
     for (int32_t m = std::max(g.magMin, 0); m <= g.magMax; m += g.magStep) {
-      const int32_t w = MagnitudeWordCost(g.word, m);
+      const int32_t w = MagnitudeWordCost(g.word, m, g.magDefault);
       if (prev >= 0) {
         check(w >= prev, Format("%s: word cost falls at %d", g.id.c_str(), m));
         // Convex up to the ceil rounding: each step costs at least what the
@@ -1575,6 +1611,15 @@ Status GateSpellMagnitude(Ctx& c, std::string& detail) {
     const DeliveryRec* sd = flight(compile({"speed", "projectile"}));
     const DeliveryRec* sh = flight(compile({"speed@0.5", "projectile"}));
     check(sw && sd && sw->speedFx == sd->speedFx, "speed at its default is swift");
+    // ...and it COSTS what swift does: the convex word price is centred on
+    // each word's own default (speed's is 2), not on 1.
+    {
+      const CastList cw = compile({"swift", "projectile"});
+      const CastList cd = compile({"speed", "projectile"});
+      check(cw.wordCost == cd.wordCost,
+            Format("speed at its default costs what swift does (word cost %d vs %d)",
+                   cd.wordCost, cw.wordCost));
+    }
     check(sh && sh->speedFx == proj->speedFx / 2, "speed@0.5 halves the speed");
     auto windOf = [&](const std::vector<std::string>& w) -> int32_t {
       const CastList l = compile(w);
