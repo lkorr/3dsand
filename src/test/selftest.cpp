@@ -492,6 +492,10 @@ const char* const kOrder[] = {
     // ownership function installed at all -- machine B is a second MobSystem
     // on its own Physics, destroyed before the gate returns.
     "net-corpse",
+    // The same exit contract as `net-corpse` (mobs, debris and id counter
+    // reset) plus: the ghost avatar list and BOTH ownership closures it
+    // installs through ScanHandoffs are cleared before it returns.
+    "net-player-corpse",
     // MOBS v4 (PLAN_save_system S5a). Beside `mob-handoff` because it shares
     // that gate's exit contract: it resets mobs and debris and puts the id
     // counter back. It ticks nothing and needs no terrain.

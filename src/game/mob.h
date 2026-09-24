@@ -4360,15 +4360,30 @@ class MobSystem {
   // `localCount`: how many leading entries are THIS process's sessions; the
   // rest are peers' ghosts (RemotePlayersSyncAvatars appends them after the
   // sessions). Default: all local. Read only by BlastMobsRadial.
+  //
+  // THE LOCAL ENTRIES ARE STAMPED AS THIS MACHINE'S (`owner_ =
+  // localPlayerId_`, here and again in SetLocalPlayerId). An avatar is not in
+  // mobs_, so RefreshOwnership never names its owner, and `owner_` stayed 0:
+  // on a CLIENT (local id 1) its own player was IsGhost(), so Die() refused
+  // and the player could not die, burn or stain. A ghost's owner is its
+  // peer's id, set by RemotePlayersSyncAvatars (SetAvatarOwner) -- which is
+  // what stops a local blow killing a peer's body here and AdoptDeadAvatar
+  // taking it as THIS machine's corpse (gate net-player-corpse).
   void SetAvatars(std::span<Mob* const> avatars,
                   size_t localCount = (size_t)-1) {
     avatars_.assign(avatars.begin(), avatars.end());
     localAvatars_ = localCount < avatars_.size() ? localCount : avatars_.size();
+    StampLocalAvatars();
   }
   void SetAvatar(Mob* avatar) {
     avatars_.clear();
     if (avatar) avatars_.push_back(avatar);
     localAvatars_ = avatars_.size();
+    StampLocalAvatars();
+  }
+  // A peer's ghost avatar belongs to that peer (RemotePlayersSyncAvatars).
+  static void SetAvatarOwner(Mob& avatar, uint32_t owner) {
+    avatar.owner_ = owner;
   }
   // The LOCAL player's avatar, or null. Still singular on purpose: the render
   // path and the character screen draw one body, and that body is this one.
@@ -4886,7 +4901,10 @@ class MobSystem {
   // `RefreshOwnership` is a no-op, and PreTick runs today's three branches for
   // every creature — which is why this package does not move the world hash.
   static constexpr uint32_t kLocalOwner = 0;
-  void SetLocalPlayerId(uint32_t id) { localPlayerId_ = id; }
+  void SetLocalPlayerId(uint32_t id) {
+    localPlayerId_ = id;
+    StampLocalAvatars();   // SetAvatars' note: the local avatars are mine
+  }
   uint32_t LocalPlayerId() const { return localPlayerId_; }
   // (mobId, feet position in world voxels) -> the playerId that should own it.
   // Evaluated once per creature at the top of PreTick, so a mob's ownership
@@ -6252,6 +6270,10 @@ class MobSystem {
   // lookups can find them. NOT owned and NOT in `mobs_` — see SetAvatars.
   std::vector<Mob*> avatars_;
   size_t localAvatars_ = 0;  // leading entries of avatars_ that are not ghosts
+  void StampLocalAvatars() {
+    for (size_t i = 0; i < localAvatars_ && i < avatars_.size(); i++)
+      if (avatars_[i] != nullptr) avatars_[i]->owner_ = localPlayerId_;
+  }
   std::vector<ParticleSpawn> ghostSpawns_;  // CarveMobsRadial's discard
   uint64_t nextId_ = 1;
   // ---- ownership state (M9.4-B) -------------------------------------------

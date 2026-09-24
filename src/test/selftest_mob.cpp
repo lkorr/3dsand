@@ -27,6 +27,7 @@
 #include "game/sidecar.h"
 #include "game/camera.h"
 #include "game/player.h"
+#include "game/remoteplayer.h"
 #include "gpu/resources.h"
 #include "net/entitysync.h"
 #include "phys/debris.h"
@@ -12138,6 +12139,440 @@ Status GateNetCorpse(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- net-player-corpse -----------------------------------------------------
+//
+// A REMOTE PLAYER'S DEATH, ON THE MACHINE WATCHING IT (PLAN_corpse_is_a_mob.md
+// follow-up). Machine A is the suite's MobSystem + DebrisSystem + Physics and
+// holds a `RemotePlayers` ghost of player B, driven by the SAME seams the
+// game runs (RemotePlayersPreTick / SyncAvatars / PostStep). Machine B is a
+// second MobSystem on its own Physics whose registered PlayerAvatar is B's
+// local player at localPlayerId 1 -- the CLIENT's id, the half no
+// single-machine gate exercises. The entity stream runs both ways through
+// Encode/Decode, and B's PlayerState reaches A one tick later, as over the
+// wire. Claims:
+//
+//   A. ONE CORPSE. B's player dies on B and becomes B's PlayerCorpse() dead
+//      Mob (AdoptDeadAvatar). On A no tick shows two rigs at the death spot,
+//      and at the end exactly one stands there: the announced dead Mob ghost
+//      (dead, a ghost, not lootable, posed from B within
+//      netPlayerCorpseTrackVox, no ghost debris for it) -- A's ghost avatar of
+//      B holds no rig.
+//   B. THE RESPAWN. B revives elsewhere: on A the corpse is still there (one
+//      copy, its handles still its own), and A's ghost avatar of B is whole
+//      with bodies of its own -- none a handle the corpse holds, FindOwner
+//      naming the avatar for every one.
+//   D. A LOCAL BLOW DOES NOT KILL A GHOST. Die on A's copy of B leaves it
+//      standing (the owner's pose decides), and A adopts nothing as its own
+//      player corpse.
+//   C. THE AUTOMATIC HANDOFF (EntitySync::ScanHandoffs). An NPC corpse A
+//      owns, with A's player moved eight chunks off and B's standing by it,
+//      flips to B through the ordinary ownership scan: local and dead on B
+//      with every rig slot the size it was, a dead ghost on A, one copy on
+//      each machine; B's player corpse undisturbed.
+//
+// Leaves the suite as it found it: id counter, mobs, debris, avatars and the
+// ownership closures reset.
+Status GateNetPlayerCorpse(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  c.mobs.SetItems(&c.items);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0) {
+    detail = "no mob def publishes a held_right socket";
+    return Status::Fail;
+  }
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot =
+      AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  constexpr uint32_t kPeer = 1;
+  const IVec3 pchunk{spot.x >> 4, spot.y >> 4, spot.z >> 4};
+
+  // ---- machine B ----------------------------------------------------------
+  Physics farPhys;
+  farPhys.Init();
+  DebrisSystem farDebris;
+  farDebris.Init(&farPhys, &c.world, c.mats, c.reactions);
+  farDebris.SetMicroSet(c.debris.MicroSet());
+  farDebris.SetLocalPlayerId(kPeer);
+  MobSystem far;
+  far.Init(&farPhys, &c.world, &farDebris, c.mats, c.reactions);
+  far.SetMicroSet(c.mobs.MicroSet());
+  far.SetDefFactory(c.mobs.DefFactory());
+  far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
+  far.SetBehaviors(ai::Library(c.mobs.Behaviors()));
+  far.SetAttackStyles(StyleLibrary(c.mobs.AttackStyles()));
+  far.SetItems(&c.items);
+  far.SetIdBand(kPeer);
+  far.SetLocalPlayerId(kPeer);
+
+  ::net::EntitySync entA, entB;
+  entA.Connect(0, kPeer);
+  entB.Connect(kPeer, 0);
+  auto seatPeers = [&](IVec3 chunkA, IVec3 chunkB) {
+    ::net::PeerView va{0, chunkA, c.world.WindowOrigin(), true};
+    ::net::PeerView vb{kPeer, chunkB, c.world.WindowOrigin(), true};
+    entA.SetPeers(va, &vb);
+    entB.SetPeers(vb, &va);
+  };
+  seatPeers(pchunk, pchunk);
+
+  // B's player: a registered avatar on B, as session.cpp registers it.
+  PlayerAvatar avB;
+  avB.Init(&farPhys, &c.world, &farDebris, c.mats, &far);
+  avB.SetDefs(&far.Defs(), kAvatarDefName);
+  // A's picture of B.
+  RemotePlayers remotes;
+  RemotePlayer& rb = remotes.Upsert(kPeer);
+
+  auto cleanup = [&]() {
+    remotes.Clear(c.phys);
+    c.mobs.SetAvatars({});
+    far.SetAvatar(nullptr);
+    avB.Despawn();
+    far.SetOwnershipFn(nullptr);
+    farDebris.ClearOwnershipFn();
+    farDebris.SetChunkOwnedFn(nullptr);
+    c.mobs.SetOwnershipFn(nullptr);
+    c.debris.ClearOwnershipFn();
+    c.debris.SetChunkOwnedFn(nullptr);
+    far.Reset();
+    farDebris.Reset();
+    c.mobs.ClearPlayerActor();
+    c.mobs.ClearAttackRequests();
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.ClearRisings();
+  };
+  if (!avB.HasDef()) {
+    cleanup();
+    detail = std::string("no mob def named \"") + kAvatarDefName + "\"";
+    return Status::Fail;
+  }
+  Player plB;
+  plB.fly = false;
+  plB.grounded = true;
+  auto standAt = [&](int x, int z) {
+    plB.pos = Vec3{(float)x + 0.5f,
+                   (float)(World::TerrainHeight(x, z, kDefaultSeed) + 2) +
+                       Player::kHalfY,
+                   (float)z + 0.5f};
+  };
+  standAt(spot.x, spot.z);
+  if (!avB.Spawn(plB, 0.0f)) {
+    cleanup();
+    detail = "B's avatar Spawn refused";
+    return Status::Fail;
+  }
+  far.SetAvatar(&avB);
+  const int nBase = (int)avB.Def()->limbs.size();
+
+  // ---- one tick of both machines, with the wire between them --------------
+  uint32_t tick = 9000;
+  bool scan = false;              // arm C: the ownership scan runs
+  ::net::EntityBatch fromB;       // B's batch, applied by A next tick
+  bool haveFromB = false;
+  PlayerState stB{};              // B's controller outcome, likewise
+  bool haveStB = false;
+  ::net::EntityBatch sentB;       // the B batch A applied this tick
+  auto step = [&]() {
+    const uint32_t t = tick + 1;
+    // ======== A ========
+    sentB.Clear();
+    if (haveFromB) {
+      sentB = fromB;
+      entA.NoteRemote(::net::EntityBatch(fromB));
+      haveFromB = false;
+    }
+    entA.ApplyForTick(t, c.mobs, c.debris, nullptr);
+    if (scan) entA.ScanHandoffs(c.mobs, c.debris, t);
+    entA.ExpireGhosts(t, c.mobs, c.debris);
+    if (haveStB) rb.Apply(stB);
+    if (remotes.dirty) RemotePlayersSyncAvatars(remotes, c.mobs, {});
+    {
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      std::vector<BrushOp> ops;
+      c.mobs.PreTick(t, c.world, ops, cellOps, spawns);
+      RemotePlayersPreTick(remotes, t, kTickDt, c.world, c.phys, c.mobs,
+                           c.debris, c.mats, kAvatarDefName);
+      if (remotes.dirty) RemotePlayersSyncAvatars(remotes, c.mobs, {});
+      c.debris.QueueSupportEvents(c.world.Snap());
+      c.debris.PreTick(t, c.world, cellOps, spawns);
+      tick = t;
+      SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
+                 false, pchunk, true, false, spawns);
+      c.ctx.WaitIdle();
+      c.ctx.ProcessEvents();
+    }
+    c.phys.Step(kTickDt);
+    c.debris.PostStep();
+    c.mobs.PostStep();
+    RemotePlayersPostStep(remotes);
+    ::net::EntityBatch sentA;
+    {
+      ::net::EntityBatch out;
+      entA.Build(c.mobs, c.debris, tick, out);
+      std::vector<uint8_t> bytes;
+      out.Encode(bytes);
+      sentA.Decode(bytes.data(), bytes.size());
+    }
+    // ======== B ========
+    entB.NoteRemote(::net::EntityBatch(sentA));
+    entB.ApplyForTick(tick, far, farDebris, nullptr);
+    if (scan) entB.ScanHandoffs(far, farDebris, tick);
+    entB.ExpireGhosts(tick, far, farDebris);
+    {
+      std::vector<ParticleSpawn> bSp;
+      std::vector<CellOp> bCells;
+      std::vector<BrushOp> bOps;
+      far.PreTick(tick, c.world, bOps, bCells, bSp);
+      if (avB.Spawned() && avB.IsAlive())
+        avB.PreTick(tick, plB, 0.0f, kTickDt, c.world, bOps, bCells, bSp);
+      farDebris.PreTick(tick, c.world, bCells, bSp);
+    }
+    farPhys.Step(kTickDt);
+    farDebris.PostStep();
+    far.PostStep();
+    if (avB.Spawned() && avB.IsAlive()) avB.PostStep();
+    {
+      ::net::EntityBatch out;
+      entB.Build(far, farDebris, tick, out);
+      std::vector<uint8_t> bytes;
+      out.Encode(bytes);
+      fromB.Clear();
+      fromB.Decode(bytes.data(), bytes.size());
+      haveFromB = true;
+    }
+    // B's controller outcome for this tick (MakePlayerState's fields that
+    // RemotePlayersPreTick reads; alive is the avatar's answer, as there).
+    stB = PlayerState{};
+    stB.tick = tick;
+    stB.playerId = kPeer;
+    stB.pos = plB.pos;
+    stB.Set(PlayerState::kGrounded, true);
+    stB.Set(PlayerState::kAlive, !avB.Spawned() || avB.IsAlive());
+    haveStB = true;
+  };
+
+  // Feet of a rig: the point RefreshOwnership asks about.
+  auto feetOf = [](const Mob& m) {
+    const Vec3 o = m.Origin();
+    return Vec3{o.x + m.Def()->worldSize.x * 0.5f, o.y,
+                o.z + m.Def()->worldSize.z * 0.5f};
+  };
+  // Every rig on A holding at least one body with its feet within `r` of
+  // `at`: the Mobs in mobs_ (living, dead, ghost) AND A's ghost avatar of B.
+  auto rigsOnA = [&](Vec3 at, float r, int* ghostAvatar) {
+    int n = 0;
+    for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+      const Mob* m = c.mobs.MobAt(i);
+      if (m == nullptr || m->Def() == nullptr || m->RigReleased()) continue;
+      bool bodies = false;
+      for (int li = 0; li < m->LimbCount() && !bodies; li++)
+        bodies = c.mobs.LimbBody(m->Id(), li) != 0;
+      if (bodies && (feetOf(*m) - at).len() <= r) n++;
+    }
+    int ga = 0;
+    if (rb.spawned && rb.avatar.Def() != nullptr) {
+      bool bodies = false;
+      for (int i = 0; i < rb.avatar.PartCount() && !bodies; i++)
+        bodies = rb.avatar.PartBody(i) != 0;
+      if (bodies && (feetOf(rb.avatar) - at).len() <= r) ga = 1;
+    }
+    if (ghostAvatar) *ghostAvatar = ga;
+    return n + ga;
+  };
+  const float spotR = (float)BaselineNumber("netPlayerCorpseSpotRadius", 24.0);
+
+  // ---- the NPC arm C hands over, killed up front on A ---------------------
+  std::string why;
+  const uint64_t npc =
+      AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z - 40}, "dummy", why);
+  if (npc == 0) {
+    cleanup();
+    detail = why;
+    return Status::Fail;
+  }
+  const int npcRoot = c.mobs.Defs()[defIndex].rootLimb;
+  for (int i = 0; i < 8; i++) step();
+  const bool ghostSpawned = rb.spawned && rb.avatar.IsAlive();
+  c.mobs.Sever(npc, npcRoot);
+  const bool npcDied = !c.mobs.IsAlive(npc);
+
+  // ======== A: B dies =====================================================
+  for (int i = 0; i < 4; i++) step();
+  const Vec3 deathAt = feetOf(avB);
+  const uint64_t adopted0 = far.AdoptedAvatarsTotal();
+  avB.Die();
+  const bool diedOnB = !avB.IsAlive();
+  const int watch = (int)BaselineNumber("netPlayerCorpseWatchTicks", 12);
+  std::string seq;
+  int maxCopies = 0, zeroTicks = 0, twoTicks = 0, ghostAvatarTicks = 0;
+  double trackErr = 0;
+  int trackSamples = 0;
+  uint64_t cid = 0;
+  for (int i = 0; i < watch; i++) {
+    step();
+    if (cid == 0)
+      for (uint32_t k = 0; k < far.MobCount(); k++)
+        if (const Mob* m = far.MobAt(k); m && m->PlayerCorpse()) cid = m->Id();
+    int ga = 0;
+    const int n = rigsOnA(deathAt, spotR, &ga);
+    ghostAvatarTicks += ga;
+    seq += Format("%s%d%s", i ? " " : "", n, ga ? "g" : "");
+    maxCopies = std::max(maxCopies, n);
+    if (n == 0) zeroTicks++;
+    if (n >= 2) twoTicks++;
+    // Posed from B: every limb of the corpse in the B batch A applied.
+    ::net::MobPose now{};
+    if (cid != 0 && c.mobs.BuildPose(cid, tick, now))
+      for (const ::net::MobPose& q : sentB.mobPoses)
+        if (q.id == cid)
+          for (const ::net::WireLimbPose& b : q.limbs)
+            for (const ::net::WireLimbPose& a : now.limbs)
+              if (a.index == b.index) {
+                trackErr = std::max(trackErr, (double)(a.pos - b.pos).len());
+                trackSamples++;
+              }
+  }
+  const bool adoptedOnB =
+      far.AdoptedAvatarsTotal() - adopted0 == 1 && cid != 0;
+  const Mob* ca = cid ? c.mobs.FindMobById(cid) : nullptr;
+  const bool corpseOnA = ca != nullptr && ca->IsGhost() && !ca->Alive() &&
+                         !ca->RigReleased() && !ca->Lootable();
+  const int playerCorpseFlagA = ca ? (ca->PlayerCorpse() ? 1 : 0) : -1;
+  const int copiesEnd = rigsOnA(deathAt, spotR, nullptr);
+  const uint32_t ghostDebrisA = c.debris.GhostCount();
+  const double trackTol = BaselineNumber("netPlayerCorpseTrackVox", 0.05);
+  const bool armA = ghostSpawned && npcDied && diedOnB && adoptedOnB &&
+                    corpseOnA && copiesEnd == 1 && twoTicks == 0 &&
+                    ghostDebrisA == 0 && trackSamples > 0 &&
+                    trackErr <= trackTol;
+
+  // ======== B: B respawns elsewhere =======================================
+  std::vector<uint64_t> corpseHandlesA;
+  if (const Mob* m = cid ? c.mobs.FindMobById(cid) : nullptr)
+    for (int li = 0; li < m->LimbCount(); li++)
+      if (const uint64_t h = c.mobs.LimbBody(cid, li))
+        corpseHandlesA.push_back(h);
+  standAt(spot.x + 48, spot.z);
+  avB.Revive(plB, 0.0f);
+  const bool revivedB = avB.IsAlive();
+  for (int i = 0; i < 6; i++) step();
+  const Mob* cb = cid ? c.mobs.FindMobById(cid) : nullptr;
+  const bool corpseStays = cb != nullptr && cb->IsGhost() && !cb->Alive() &&
+                           !cb->RigReleased();
+  const int copiesAfter = rigsOnA(deathAt, spotR, nullptr);
+  int wholeGhost = 0, aliasedGhost = 0, foreignOwner = 0;
+  if (rb.spawned)
+    for (int i = 0; i < nBase && i < rb.avatar.PartCount(); i++) {
+      const uint64_t h = rb.avatar.PartBody(i);
+      if (!h) continue;
+      wholeGhost++;
+      if (std::find(corpseHandlesA.begin(), corpseHandlesA.end(), h) !=
+          corpseHandlesA.end())
+        aliasedGhost++;
+      if (c.mobs.FindOwner(h) != static_cast<Mob*>(&rb.avatar))
+        foreignOwner++;
+    }
+  // ...and the corpse's own handles are still the corpse's.
+  int corpseLost = 0;
+  for (uint64_t h : corpseHandlesA)
+    if (c.mobs.FindOwner(h) != c.mobs.FindMobById(cid)) corpseLost++;
+  const bool armB = revivedB && corpseStays && copiesAfter == 1 &&
+                    rb.spawned && rb.avatar.IsAlive() && wholeGhost == nBase &&
+                    aliasedGhost == 0 && foreignOwner == 0 &&
+                    !corpseHandlesA.empty() && corpseLost == 0;
+
+  // ======== D: a lethal blow on A's copy of B =============================
+  const uint64_t adoptedA0 = c.mobs.AdoptedAvatarsTotal();
+  rb.avatar.Die();
+  const bool ghostDiedLocally = !rb.avatar.IsAlive();
+  for (int i = 0; i < 4; i++) step();
+  int playerCorpsesOnA = 0;
+  for (uint32_t k = 0; k < c.mobs.MobCount(); k++)
+    if (const Mob* m = c.mobs.MobAt(k);
+        m && m->PlayerCorpse() && !m->IsGhost())
+      playerCorpsesOnA++;
+  const bool standing = rb.spawned && rb.avatar.IsAlive() && avB.IsAlive();
+  const bool armD = !ghostDiedLocally && standing && playerCorpsesOnA == 0 &&
+                    c.mobs.AdoptedAvatarsTotal() == adoptedA0;
+
+  // ======== C: the ownership scan hands the NPC corpse to B ===============
+  std::vector<uint32_t> npcVox;
+  if (const Mob* m = c.mobs.FindMobById(npc))
+    for (int li = 0; li < m->LimbCount(); li++)
+      npcVox.push_back(c.mobs.LimbBody(npc, li)
+                           ? c.mobs.LimbArtVoxelCount(npc, li) : 0u);
+  const uint64_t hOut0 = entA.Stats().handoffsOut;
+  const uint64_t hIn0 = entB.Stats().handoffsIn;
+  // A's player walks eight chunks off; B's stands by the corpse.
+  seatPeers(IVec3{pchunk.x + 8, pchunk.y, pchunk.z}, pchunk);
+  scan = true;
+  for (int i = 0; i < 8; i++) step();
+  auto countId = [](MobSystem& s, uint64_t id) {
+    int n = 0;
+    for (uint32_t k = 0; k < s.MobCount(); k++)
+      if (const Mob* m = s.MobAt(k); m && m->Id() == id) n++;
+    return n;
+  };
+  const Mob* nb = far.FindMobById(npc);
+  const Mob* na = c.mobs.FindMobById(npc);
+  int npcSlotDiff = 0;
+  if (nb != nullptr)
+    for (int li = 0; li < (int)npcVox.size(); li++) {
+      const uint32_t v =
+          far.LimbBody(npc, li) ? far.LimbArtVoxelCount(npc, li) : 0u;
+      if (li >= nb->LimbCount() || v != npcVox[(size_t)li]) npcSlotDiff++;
+    }
+  const uint64_t hOut = entA.Stats().handoffsOut - hOut0;
+  const uint64_t hIn = entB.Stats().handoffsIn - hIn0;
+  const bool npcOnB = nb != nullptr && !nb->IsGhost() && !nb->Alive() &&
+                      !nb->RigReleased();
+  const bool npcGhostA = na != nullptr && na->IsGhost() && !na->Alive();
+  const int npcCopiesB = countId(far, npc), npcCopiesA = countId(c.mobs, npc);
+  // B's player corpse is not disturbed by the scan: still B's, one copy.
+  const Mob* pcB = cid ? far.FindMobById(cid) : nullptr;
+  const bool pcStill = pcB != nullptr && !pcB->IsGhost() && !pcB->Alive() &&
+                       rigsOnA(deathAt, spotR, nullptr) == 1;
+  const bool armC = hOut > 0 && hIn > 0 && npcOnB && npcGhostA &&
+                    !npcVox.empty() && npcSlotDiff == 0 && npcCopiesB == 1 &&
+                    npcCopiesA == 1 && pcStill;
+
+  RecordObserved("netPlayerCorpseTrackErrVox", trackErr);
+  RecordObserved("netPlayerCorpseZeroTicks", (double)zeroTicks);
+  const bool ok = armA && armB && armD && armC;
+  detail = Format(
+      "A ghost spawned %d, npc died %d, B died %d, adopted on B %d (corpse "
+      "%llx), rigs at the spot on A per tick [%s] (g = A's ghost avatar of B "
+      "holds one; max %d, %d ticks with 2+, %d with 0, ghost-avatar rig %d "
+      "ticks), end %d, dead ghost on A %d (player-corpse flag %d), ghost "
+      "debris %u, track %.4f <= %.4f over %d | B revived %d, corpse stays "
+      "%d, rigs at spot %d, ghost avatar whole %d/%d, aliased %d, foreign "
+      "owner %d, corpse handles %zu lost %d | D local Die took %d, standing "
+      "%d, player corpses owned by A %d | C handoffs out %llu in %llu, npc "
+      "local+dead on B %d, ghost+dead on A %d, slot diffs %d/%zu, copies B %d "
+      "A %d, player corpse undisturbed %d",
+      ghostSpawned ? 1 : 0, npcDied ? 1 : 0, diedOnB ? 1 : 0,
+      adoptedOnB ? 1 : 0, (unsigned long long)cid, seq.c_str(), maxCopies,
+      twoTicks, zeroTicks, ghostAvatarTicks, copiesEnd, corpseOnA ? 1 : 0,
+      playerCorpseFlagA, ghostDebrisA, trackErr, trackTol, trackSamples,
+      revivedB ? 1 : 0, corpseStays ? 1 : 0, copiesAfter, wholeGhost, nBase,
+      aliasedGhost, foreignOwner, corpseHandlesA.size(), corpseLost,
+      ghostDiedLocally ? 1 : 0, standing ? 1 : 0, playerCorpsesOnA,
+      (unsigned long long)hOut, (unsigned long long)hIn, npcOnB ? 1 : 0,
+      npcGhostA ? 1 : 0, npcSlotDiff, npcVox.size(), npcCopiesB, npcCopiesA,
+      pcStill ? 1 : 0);
+  cleanup();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
@@ -12193,6 +12628,10 @@ const std::vector<Gate>& MobGates() {
       // A corpse replicates as the dead Mob it is (PLAN_corpse_is_a_mob.md
       // P2c): two MobSystems on two Physics worlds joined by EntityBatch bytes.
       {"net-corpse", "mob", {}, false, GateNetCorpse, /*needsRender=*/false},
+      // A REMOTE player's death and respawn as the other machine sees them,
+      // and an NPC corpse changing hands through ScanHandoffs.
+      {"net-player-corpse", "mob", {}, false, GateNetPlayerCorpse,
+       /*needsRender=*/false},
       // MOBS v4: an untouched body saves as its def name plus hp and pose;
       // only a limb that differs from the def's art stores a lattice. Bytes,
       // byte-identical round trip, and the v3 section still loading. No

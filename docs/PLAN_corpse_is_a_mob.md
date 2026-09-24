@@ -12,13 +12,24 @@ report prints `asleep`/`states`), renamed the severed-part passes
 `fleshCoat_`, `fleshShellIdx_`) and deleted the old corpse-gate probes.
 
 Follow-ups, not done:
-- A REMOTE player's death: `AdoptDeadAvatar` skips ghost avatars, so the
-  owner's corpse arrives as an announced dead Mob while this machine's ghost
-  avatar still holds a dead rig for the same body -- unverified; needs a
-  two-machine death in the `net-corpse` style.
-- `net-corpse` arm H hands the corpse over by direct `TakeHandoff`/
-  `ApplyHandoff`; the `EntitySync::ScanHandoffs` authority flip for a dead
-  Mob is not exercised by a gate.
+- ~~A REMOTE player's death (two copies of the corpse?)~~ FIXED 2026-09-24,
+  gate `net-player-corpse`. The duplicate did not happen on the normal path
+  (the ghost avatar despawns on the wire's alive=0 the same tick the corpse
+  is announced: per-tick rigs at the spot `1g 1 1 1 ...`), but the gate found
+  the real bug underneath: an avatar is not in `mobs_`, so nothing set its
+  `owner_`, which stayed 0. On a CLIENT (local id 1) its own player was
+  `IsGhost()` -- `Die()` refused, so the player could not die (nor burn or
+  stain); on the HOST a peer's ghost avatar was local, so a local blow killed
+  it and `AdoptDeadAvatar` took it as the host's own player corpse, leaving
+  the ghost stuck dead. Fix: `MobSystem::SetAvatars`/`SetAvatar`/
+  `SetLocalPlayerId` stamp the local avatars with the local id, and
+  `RemotePlayersSyncAvatars` stamps each ghost with its peer's id; the ghost
+  despawns on the wire's alive=0 regardless of its local alive flag.
+- ~~The `ScanHandoffs` flip for a dead Mob is not gated~~ -- `net-player-corpse`
+  arm C (an NPC corpse flips A->B through the ordinary scan).
+- A player corpse announced to a peer arrives without `PlayerCorpse()` (the
+  announce does not carry the flag; a handoff's MOBS v6 record does). Harmless
+  while it is a ghost (a ghost is never lootable).
 - `kGoneDeath` stays in the wire enum as a retired value (decodes to a name).
 - `ServiceRising`'s `RiseLimb`/`RiseGear` are local structs over the moved
   rig; they could read straight off the dead Mob via `TurnMob`.

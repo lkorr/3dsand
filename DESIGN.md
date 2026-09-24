@@ -8072,7 +8072,13 @@ debris for the network). All of that is gone.
   ghost debris. Corpses hand off like the living: the record says dead, and
   `ApplyHandoff` enters `EnterLoadedDead`; the sender withdraws its rising
   booking (the record carries it) and makes the limbs kinematic for the
-  ghost. Gate `net-corpse` (arm H is the handoff).
+  ghost. Gate `net-corpse` (arm H is the handoff). A REMOTE player's death:
+  every avatar carries an owner (local sessions are stamped with the local id
+  by `SetAvatars`/`SetLocalPlayerId`, a peer's ghost avatar with the peer's
+  by `RemotePlayersSyncAvatars`), so the ghost avatar cannot die locally and
+  is never adopted here; it releases its rig on the wire's alive = 0 and the
+  owner's `AdoptDeadAvatar` corpse arrives as the one dead Mob ghost. Gate
+  `net-player-corpse` (also the `ScanHandoffs` flip of a dead NPC).
 - **What stays in DebrisSystem:** severed limbs and carved gobbets of living
   and dead creatures -- a part that has left the rig has no rig to belong to.
   Their passes are MobSystem's `BurnDeadFlesh` / `StainDeadFlesh` /

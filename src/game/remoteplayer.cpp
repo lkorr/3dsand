@@ -185,8 +185,14 @@ void RemotePlayersSyncAvatars(RemotePlayers& remotes, MobSystem& mobs,
   // `avatars_[i]`, so these two lists agreeing is not a nicety: disagreeing
   // means an NPC that targets ghost 0 resolves to session 0's body and hits
   // the local player instead.
-  for (std::unique_ptr<RemotePlayer>& r : remotes.list)
+  // ...and each is its PEER'S body (IsGhost() here): a local blow cannot kill
+  // it (Mob::Die refuses a ghost; the wire's alive flag decides), so this
+  // machine never adopts a peer's rig as its own player corpse
+  // (MobSystem::AdoptDeadAvatar) -- the peer's corpse arrives as its dead Mob.
+  for (std::unique_ptr<RemotePlayer>& r : remotes.list) {
+    MobSystem::SetAvatarOwner(r->avatar, r->playerId);
     all.push_back(static_cast<Mob*>(&r->avatar));
+  }
   // The sessions' count rides along so the blast can tell a local body it
   // may launch from a ghost it may not (MobSystem::BlastMobsRadial).
   mobs.SetAvatars(std::span<Mob* const>(all.data(), all.size()),
@@ -239,7 +245,11 @@ void RemotePlayersPreTick(RemotePlayers& remotes, uint32_t tick, float dt,
     // and it is the right presentation — but the authoritative alive/dead
     // edge is the one that arrives in the state.
     const bool wantAlive = r.last.Has(PlayerState::kAlive);
-    if (r.spawned && !wantAlive && r.avatar.IsAlive()) {
+    // No `IsAlive()` term: the ghost's rig is released whenever the owner
+    // says dead, whatever this machine's copy thinks -- the owner's corpse
+    // arrives as a dead Mob of its own and a second rig here would be a
+    // duplicate body.
+    if (r.spawned && !wantAlive) {
       r.avatar.Despawn();
       r.spawned = false;
       remotes.dirty = true;
