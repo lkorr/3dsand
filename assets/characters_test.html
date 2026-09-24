@@ -169,6 +169,25 @@ var toasts = [], dirt = [];
     say(!!side && inked(side) > 300, 'the profile view has voxels on it',
         side ? inked(side) + ' inked pixels' : 'no canvas');
 
+    // ...and it paints the WHOLE body. The painter recentres the figure, so
+    // sliding every part sideways must not change the picture. It did: a run
+    // sentinel of `runX = -1` dropped every run starting at a negative scene
+    // x, which is the right half of a figure centred on its spine, and every
+    // thumbnail came out bisected down the middle while clearing "has ink".
+    var tOpts = { materials: materials, player: tuning.player, name: 'human' };
+    var tBody = mg.generateMob(mg.defaultGenome(), 0, tOpts);
+    var tShift = { genome: tBody.genome, parts: tBody.parts.map(function(p){
+      return { name: p.name, mn: [p.mn[0] + 200, p.mn[1] + 200, p.mn[2]],
+               size: p.size, cells: p.cells };
+    }) };
+    var cC = document.createElement('canvas'); cC.width = 300; cC.height = 460;
+    var cS = document.createElement('canvas'); cS.width = 300; cS.height = 460;
+    breed.drawBody(cC, tBody);
+    breed.drawBody(cS, tShift);
+    say(Math.abs(inked(cC) - inked(cS)) < inked(cS) * 0.02,
+        'the centred figure paints as much as the same figure moved off-centre',
+        inked(cC) + ' vs ' + inked(cS) + ' inked pixels');
+
     mark('4b. THE SHOULDER ROUND IS VISIBLE');
     // ---- 4b. THE SHOULDER ROUND IS VISIBLE -------------------------------
     // The one thing the Node gate structurally cannot see. mobgen removes 160
