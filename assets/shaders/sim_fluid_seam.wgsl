@@ -1529,8 +1529,9 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
 
 // stainApply: one thread per active-block cell (the node-pass indirect args
 // from the last substep). A SOLID cell with a stain intent rolls the seam's
-// stain chance and takes the stain, following the CA's merge rules: same
-// type climbs toward the substrate's ceiling, a foreign type starts over.
+// stain chance and takes the stain, following the CA's stain order: same
+// type climbs toward the substrate's ceiling, a foreign stain is only ever
+// washed DOWN (by a washing liquid), never painted over.
 // One thread owns one cell — no write races, and the roll keys on
 // hash3(seed, tick, cellSlot): state, never scheduling (rule 1).
 const SEAM_STAIN_CHANCE : u32 =
@@ -1599,13 +1600,31 @@ fn stainApplyCell(wgx : u32, li : u32) -> vec2<u32> {
   if (nk != CLASS_SOLID && nk != CLASS_POWDER) { return vec2<u32>(ybits, 0u); }
   let h = hash3(T.seed ^ 0x5741u, T.tick, cellIndexW(c));
   if ((h & 0xFFFFu) >= SEAM_STAIN_CHANCE) { return vec2<u32>(ybits, 0u); }
-  // The CA's merge rules (doStaining): the substrate's absorb capacity caps
-  // how deep a stain it takes; same type climbs one level per contact on
-  // absorbent ground and jumps to the ceiling on plain stone; foreign types
-  // restart.
-  let ceiling = min(sAmt, max(matAbsorbCapacity(materials[nmat]), 1u));
+  // THE CA's STAIN ORDER (sim_step.wgsl doStaining), which this path used to
+  // break by painting over whatever was there:
+  //   * a FOREIGN stain (non-zero amount, another type) is never overwritten.
+  //     A washer (`stain: {washes: true}` on the particle's material — water)
+  //     steps it DOWN one level per contact, clearing the type with the last
+  //     level; a non-washer (blood, oil, ichor) leaves it alone.
+  //   * a clean cell, or one already carrying THIS stain type, takes the
+  //     stain: the substrate's absorb capacity caps how deep; the same type
+  //     climbs one level per contact and a clean cell starts at the ceiling.
+  // Every branch is a monotone step toward a fixed point (amount up to the
+  // ceiling, a foreign amount down to 0), so a wall under a standing flow
+  // still goes quiet (rule 2).
   let cur = voxStainAmt(w);
   let curType = voxStainType(w);
+  if (cur != 0u && curType != sType) {
+    if (!matWashes(materials[intent >> 16u])) {   // not ours to touch
+      return vec2<u32>(ybits, 0u);
+    }
+    let washed = cur - 1u;
+    voxels[idx] = (w & ~STAIN_BITS) |
+                  packStain(select(curType, 0u, washed == 0u), washed);
+    markDirtyNext(c);
+    return vec2<u32>(ybits, 1u);   // FA_STAINED, folded by the entry point
+  }
+  let ceiling = min(sAmt, max(matAbsorbCapacity(materials[nmat]), 1u));
   var amt = ceiling;
   if (curType == sType && cur >= ceiling) {   // saturated: sleep
     return vec2<u32>(ybits, 0u);
