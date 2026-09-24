@@ -1631,61 +1631,38 @@ struct CarriedItem {
 
 // ---- WHAT A CORPSE STILL HAS ON IT --------------------------------------------
 //
-// Die() hands every limb to DebrisSystem and the husk is swept out of mobs_ on
-// the next PreTick, so one tick after a creature falls there is no Mob left to
-// ask "what was it wearing". The shells are still THERE — a robe on a corpse is
-// a debris body jointed to the torso it fell with — but debris carries no
-// identity (game/worlditems.h's argument), so without this a corpse is a heap
-// you can carve and burn but not loot.
+// A DEAD CREATURE IS STILL A MOB (docs/PLAN_corpse_is_a_mob.md). Its rig stays
+// in MobSystem::mobs_ with every shell, the held item and the pack exactly where
+// they were, so the loot panel reads the list LIVE off the dead Mob
+// (Mob::LootPieces) instead of off a report taken at the moment of death. There
+// is no registry to fall out of step with the bodies: a robe that burns off the
+// corpse is simply not in the next list.
 //
-// This is the one-time report Die() makes the instant before the handover,
-// while the rig still knows which appended slot was the robe: the bodies the
-// corpse became (any of them under the crosshair means "this corpse"), and one
-// entry per piece of gear with the body that IS the piece — the identity shell
-// for a worn piece (the same panel ItemGroundVoxels drops, IdentityShellOf),
-// the borrowed slot for a held item — plus the piece's other shells, which are
-// rags that leave with it, and its damage captured one call before the shells
-// forget it (CaptureWorn). Delivered through MobSystem::SetOnCorpse to whoever
-// keeps the registry (game/corpses.h); the Mob keeps nothing.
+// ONE LIST, ONE INDEX SPACE, IN THE ORDER A LOOTER EXPECTS: every worn piece
+// whose identity shell is still on the body, then the held item, then the pack
+// (Mob::carried_). The loot panel addresses entries by index
+// (KitRef{KitSpace::Loot, i}, ui/inventory_ui.cpp), so the order is the
+// contract; it is the order the old CorpseReport used, which is what the panel
+// and "take all" were written against.
 //
-// NOT fired for the avatar: the player's kit lives in PlayerKit and the wear
-// loop re-dresses the respawned rig from it, so their own corpse holding a
-// second copy would be a duplication machine.
-struct CorpseReport {
-  uint64_t mobId = 0;
-  std::string def;                  // MobDef::name, for the prompt
-  std::vector<uint64_t> bodies;     // every limb body, shells included
-  struct Piece {
-    std::string item;               // by NAME (item.h's index hazard)
-    int equipSlot = -1;             // -1 for the held item
-    bool held = false;
-    // THE BODY THAT IS THE PIECE — or 0, WHICH MEANS IT WAS IN THE PACK.
-    //
-    // A worn or held piece is a real object lying in the heap: you loot it by
-    // taking its body OUT of the world. A carried stack (MobDef::loot) never
-    // had a body — it was a line in the creature's pack — so it is looted by
-    // deleting the entry and nothing else.
-    //
-    // One list rather than two because the LOOT PANEL ADDRESSES ENTRIES BY
-    // INDEX (KitRef{KitSpace::Loot, i}, ui/inventory_ui.cpp): a second vector
-    // would mean every consumer — the mirror, the take, the take-all loop, the
-    // drag-out — splitting one index space across two containers, which is
-    // four places to get an off-by-one wrong for no gain. The branch is
-    // `if (piece.body)`, and it appears exactly where a body is touched.
-    uint64_t body = 0;
-    int identityCover = -1;         // that body's ItemCover index (worn only)
-    std::vector<uint64_t> rags;     // the piece's other shells
-    WornDamage damage;              // as it was at death
-    // How many. Always 1 for worn and held gear — a rig slot is one garment —
-    // and the rolled count for a carried stack.
-    int count = 1;
-    // The COLOUR it was (game/dye.h), read off the identity shell. Travels for
-    // the same reason `damage` does: what you loot off a body has to be the
-    // thing that was on it. Without this a red tunic on a corpse loots into
-    // your pack undyed, which reads as the item having been swapped.
-    uint32_t dye = 0;
-  };
-  std::vector<Piece> gear;
+// NOT FOR THE AVATAR: the player's kit lives in PlayerKit and the wear loop
+// re-dresses the respawned rig from it, so their own corpse holding a second
+// copy would be a duplication machine (Mob::Lootable).
+struct LootPiece {
+  enum class Kind : uint8_t { Worn, Held, Carried };
+  Kind kind = Kind::Worn;
+  std::string item;               // by NAME (item.h's index hazard)
+  int equipSlot = -1;             // worn only
+  // How many. Always 1 for worn and held gear -- a rig slot is one garment --
+  // and the stack count for a carried entry.
+  int count = 1;
+  // The COLOUR it is (game/dye.h), off the identity shell for a worn piece.
+  uint32_t dye = 0;
+  // A worn piece's damage as it stands NOW (Mob::CaptureWorn): the shells are
+  // still on the body and still burning, so this is read live every call.
+  WornDamage damage;
+  // Which ItemCover entry the identity shell is (worn only), -1 otherwise.
+  int identityCover = -1;
 };
 
 class Mob {
@@ -1780,9 +1757,9 @@ class Mob {
 
   // ---- LIVE RAGDOLL: limp, then back on its feet (sim/tuning.h Ragdoll) -----
   //
-  // A creature that is knocked down is not a corpse. Die() flips every limb
-  // dynamic and HANDS IT TO DebrisSystem — there is no way back from that.
-  // This is the same flip with the limbs kept: every body stays owned by the
+  // A creature that is knocked down is not a corpse — but a corpse IS this
+  // state, made permanent (Mob::Die: Limp with the get-up never allowed).
+  // This is the flip with the limbs kept: every body stays owned by the
   // mob, its joints stay, its collision group stays, and the animation
   // pipeline simply stops re-posing it (SubmitPose skips a limp limb the way
   // it skips a sever hold), so PostStep's read-back is what places it. When
@@ -2012,15 +1989,49 @@ class Mob {
 
   // Detach a limb now. Root/vital kills instead.
   void Sever(int limbIndex);
-  void Die();
-  // LAST LOOK AT A LIVING RIG. Called from Die() after the cause is recorded
-  // and before a single limb is handed to DebrisSystem — the only instant at
-  // which "what state was this body in when it died" is still answerable, and
-  // it lasts one statement: the loop below zeroes `anim_.partAlive`, moves the
-  // skin voxels out and drops every body handle, after which every per-limb
-  // readout in the engine reports a severed, empty, zero-hp limb.
+  // ---- DEATH IS A STATE, NOT A CHANGE OF OWNER (PLAN_corpse_is_a_mob.md) ----
   //
-  // Default does nothing (an NPC corpse is read through CorpseReport instead).
+  // `alive_` goes false and the rig STAYS: every body, joint, worn shell, twin
+  // table, burn index, coat, wound, `worn_`, `heldItem_` and `carried_` is
+  // exactly where it was. The limbs are flipped dynamic the way StartRagdoll
+  // does it, permanently (RagdollPhase::Limp with no get-up), and MobSystem
+  // runs the MATTER passes on it (burn, rot, stain, carve, bleed-out) and none
+  // of the AGENCY passes (AI, gait, pose, voices, hp -> death).
+  //
+  // Two bodies still go straight to DebrisSystem, through ReleaseRigToDebris,
+  // which is the old adoption loop verbatim: a GHOST (the peer owns its
+  // corpse) and the PLAYER AVATAR (not in mobs_; its corpse is anonymous
+  // debris exactly as before, unless the bite is going to stand it back up —
+  // then the rig is kept until the rising reads it, MobSystem::ServiceRisings).
+  void Die();
+  // THE OLD CORPSE, ON DEMAND: hand every limb to DebrisSystem::AdoptBody as
+  // dead flesh, re-tie the garments as debris straps, and forget the rig. Used
+  // for the dead-cap eviction (oldest corpse decays to debris), a corpse that
+  // leaves the residency window, a ghost's death and the avatar's corpse. After
+  // it the Mob is a husk MobSystem sweeps once no sever hold is in flight.
+  void ReleaseRigToDebris();
+  bool RigReleased() const { return rigReleased_; }
+  // ---- A SETTLED CORPSE COSTS NOTHING (rule 2) -----------------------------
+  // True while a dead Mob is asleep: every limb inactive in Jolt, nothing
+  // burning, bleeding, rotting, drying or dirty for kDeadSleepTicks. An asleep
+  // corpse skips its terrain anchor, PostStep and the burn/stain scans; any
+  // damage entry point, Jolt activity or a change in the chunks around it
+  // wakes it (MobSystem::PreTick).
+  bool DeadAsleep() const { return deadAsleep_; }
+  // Wake a sleeping corpse. Cheap and idempotent; every entry point that can
+  // change a dead body calls it.
+  void WakeDead() {
+    deadAsleep_ = false;
+    deadQuiet_ = 0;
+  }
+  // Death order, 1-based and system-wide (0 = alive / never died). The dead
+  // cap evicts the LOWEST first.
+  uint64_t DeathSeq() const { return deathSeq_; }
+  // LAST LOOK AT A LIVING RIG. Called from Die() after the cause is recorded,
+  // before the rig goes limp and (for the bodies that still go to debris)
+  // before a single limb is handed over.
+  //
+  // Default does nothing (an NPC corpse is read live off its own rig).
   // PlayerAvatar overrides it to photograph the HUD mirror for the death
   // screen (game/avatar.h).
   virtual void OnDying() {}
@@ -2092,6 +2103,27 @@ class Mob {
   // into the corpse report, a rising carries them to the creature that gets
   // up, and the save writes them. Nothing here is drawn or simulated.
   const std::vector<CarriedItem>& Carried() const { return carried_; }
+  // ---- LOOTING A DEAD MOB (LootPiece) ---------------------------------------
+  // May this body be looted at all: dead, rig still its own, not a player's.
+  bool Lootable() const;
+  // The loot list, read live: worn pieces whose identity shell is still on
+  // the body, then the held item, then the pack. Empty when !Lootable().
+  void LootPieces(std::vector<LootPiece>& out) const;
+  // Take entry `index` OFF the body: a worn piece is unworn (its shells leave
+  // the world with it, damage captured first), the held item is unequipped, a
+  // carried stack loses `count` (all of it by default). `out` receives what
+  // was taken. False for a bad index or a body that is not lootable.
+  bool TakeLootPiece(int index, LootPiece* out, int count = -1);
+  // Leave entry `index` on the floor: the identity shell (or the held item)
+  // is cut loose as debris and registered as a ground item through
+  // SetOnItemShed, its rags falling with it. A carried stack has no body to
+  // cut loose and is refused (the caller drops it through the bag's path).
+  bool ShedLootPiece(int index, std::string* outItem = nullptr);
+  // The body that IS entry `index`: a worn piece's identity shell, the held
+  // item's slot; 0 for a pack stack (it never had one) or a bad index.
+  uint64_t LootPieceBody(int index) const;
+  // Is any of this body within `maxDist` world voxels of `from`?
+  bool AnyLimbWithin(Vec3 from, float maxDist) const;
   // Merges into an existing stack of the same item AND DYE, exactly as the
   // bag and the hotbar do (item.h ItemStack::dye: a stack is one colour).
   // Refused past kMaxCarried, like every other bounded per-mob list here.
@@ -2962,9 +2994,6 @@ class Mob {
   // severed arm inside the player's capsule launched the player exactly as
   // the avatar's own used to, and the fix belongs to the body, not to who it
   // came off.)
-  // NPC husks drop their limb list at death (PreTick reaps them); the avatar
-  // keeps it so the HUD's per-part readout survives the death screen.
-  virtual bool DropLimbListOnDeath() const { return true; }
   // Whose instance list went stale: MobSystem's shared one, or the avatar's.
   virtual void MarkInstancesDirty();
   // Per-limb render suppression (first-person hides the body, keeps the arms).
@@ -2994,6 +3023,25 @@ class Mob {
   // One tick of the limp phase: settle test, then BeginGetUp. Called by the
   // NPC loop and the avatar driver in place of their locomotion stages.
   void TickRagdollLimp(World& world, float dt);
+  // ---- THE DEAD RAGDOLL (Mob::Die) ------------------------------------------
+  // StartRagdoll's flip, permanent and unconditional: every attached limb that
+  // is not a follower or in a sever hold goes dynamic and off the player's
+  // contact layer until it has fallen clear. No-op on a released rig.
+  void EnterDeadRagdoll();
+  // One tick of a dead rig's own upkeep (MobSystem::PreTick's dead branch):
+  // the walk anchor follows the pelvis, the terrain anchor is registered, and
+  // nothing else — no settle test, no get-up (a body with no pelvis left does
+  // not stand up either), no arrest and therefore no fall damage.
+  void TickDeadLimp(float dt);
+  // Every sleep criterion (MobSystem's note on kDeadSleepTicks) as of now.
+  bool DeadQuietNow() const;
+  // Digest of what could wake a sleeping corpse from outside without touching
+  // it: the residency window and the version of every cached chunk the body's
+  // box overlaps. Equal = nothing around it changed.
+  uint64_t DeadWakeKey(World& world) const;
+  // Is the rig moving in Jolt? The root limb stands for the island: a jointed
+  // ragdoll sleeps and wakes as one.
+  bool RigActive() const;
   // One limp tick of the arrest measurement TakeRagdollImpact drains. See the
   // long note at its definition.
   void TickRagdollArrest(float dt);
@@ -3494,6 +3542,12 @@ class Mob {
   int defIndex_ = -1;          // into MobSystem's def list (events, persistence)
   const MobDef* def_ = nullptr;
   bool alive_ = true;
+  // ---- the dead state (Mob::Die, ReleaseRigToDebris, the sleep) ------------
+  bool rigReleased_ = false;   // the rig went to DebrisSystem: a husk
+  bool deadAsleep_ = false;    // see DeadAsleep()
+  uint16_t deadQuiet_ = 0;     // consecutive ticks DeadQuietNow() held
+  uint64_t deadWakeKey_ = 0;   // DeadWakeKey() when it fell asleep
+  uint64_t deathSeq_ = 0;      // see DeathSeq()
   bool swinging_ = false;
   GoreProfile gore_;           // this creature's own bleed character
   // ---- blood loss and the burn cap (see the public block above) -----------
@@ -4085,27 +4139,26 @@ class MobSystem {
 
   // ---- THE CORPSES THAT ARE GOING TO GET UP --------------------------------
   //
-  // A body that died with the rot in it (MobDef::Turn) books a rising here on
-  // its way out, and PreTick services it when the clock comes round: the
-  // remains are taken out of the world and the creature stands up as a variant
-  // of ITSELF. The queue exists because a corpse is not a mob — its limbs
-  // belong to DebrisSystem the moment it dies — and because nothing may spawn
-  // a mob from inside Mob::Die, which is running on a Mob that lives in the
-  // vector the spawn would push to.
+  // A body that died with the rot in it (MobDef::Turn) books a rising here
+  // from Mob::Die, and PreTick services it when the clock comes round: the
+  // dead Mob's rig is read straight off it (lattices, pose, gear, pack), a
+  // variant of ITSELF is spawned with that rig copied across (TurnMob's
+  // shape), and the dead rig is released. The queue exists because nothing
+  // may spawn a mob from inside Mob::Die, which is running on a Mob that lives
+  // in the vector the spawn would push to.
   //
-  // THE AVATAR BOOKS ONE TOO. The player's body goes to DebrisSystem through
-  // exactly the same path, so "you die of the bite and your own corpse gets up
-  // as a zombie of you" needs no player-specific code at all — you respawn,
-  // and the thing wearing your face is an NPC.
+  // THE AVATAR BOOKS ONE TOO. Its Die() keeps the rig when a rising is booked
+  // (it is not in mobs_, so the booking names it by id and the service finds
+  // it through AvatarById); "you die of the bite and your own corpse gets up
+  // as a zombie of you" still needs no player-specific rule — you respawn,
+  // and the thing wearing your face is an NPC. A respawn before the clock
+  // comes round services the rising at once (SettleDeadAvatar).
   //
-  // NOT SAVED, deliberately. A rising names debris handles, and the corpse it
-  // names travels in the 'DBRS' section as the debris it already is — so a
-  // save taken in the six seconds between the death and the rising loads back
-  // as a world with a corpse in it and nothing pending. That is the reading
-  // this queue is worth: the alternative is a save format for a body's
-  // intentions, and the whole point of the design above is that a creature's
-  // recipe lives in its NAME and not in a format.
+  // NOT SAVED yet: dead Mobs are not saved either (MOBS v6 is P2a), so a save
+  // taken between the death and the rising loads back with nothing pending.
   size_t PendingRisings() const { return rises_.size(); }
+  // Is a rising booked for this mob id?
+  bool RisingPending(uint64_t mobId) const;
   void ClearRisings() { rises_.clear(); }  // test fixtures (Reset does it too)
   // Tear down every mob. `rewindIds` also restarts the id counter, which is a
   // TEST-ONLY seam: mob ids seed gore variance and the blast crater's noise, so
@@ -4395,23 +4448,18 @@ class MobSystem {
       std::function<void(uint64_t, const std::string&, uint32_t)> cb) {
     onItemShed_ = std::move(cb);
   }
-  // A CREATURE FELL WITH THINGS ON IT. Called once from Mob::Die with the
-  // report above, after the limbs have become debris, so the handles in it
-  // are already bodies the receiver can destroy or look up. See CorpseReport.
-  void SetOnCorpse(std::function<void(const CorpseReport&)> cb) {
-    onCorpse_ = std::move(cb);
-  }
-  // ---- WHAT THE PLAYER IS CARRYING, ASKED AT THE MOMENT THEY DIE ----------
+  // ---- WHAT THE PLAYER IS CARRYING, ASKED AT THE MOMENT THEY RISE ---------
   //
   // The avatar's pack is not on the avatar. Bag, hotbar and equipment live in
   // PlayerKit on PlayerSession (game/session.h's rule: per-player state is not
   // a process global), and MobSystem cannot reach a session — deliberately,
-  // since there may be two of them. So the seam is the same shape as
-  // SetOnCorpse, pointing the other way: Die() ASKS, the session ANSWERS.
+  // since there may be two of them. So the seam is a callback: the rising
+  // ASKS, the session ANSWERS.
   //
-  // Called only when the avatar's corpse is actually going to get up, and only
-  // on the machine that owns it. `out` receives the stacks to hand the risen
-  // body.
+  // Called only when the avatar's corpse is actually getting up (the rising
+  // reads it at service time, off the dead rig — MobSystem::ServiceRisings),
+  // and only on the machine that owns it. `out` receives the stacks to hand
+  // the risen body.
   //
   // THE CALLBACK DECIDES WHETHER THE PLAYER KEEPS THEM. With
   // `avatar.keepKitOnTurn` (the default, and the dev-mode reading) it copies
@@ -4436,12 +4484,35 @@ class MobSystem {
   }
   void ClearAttackRequests() { attacks_.clear(); }
 
-  // Spawn def at a world cell (mob min corner; caller picks ground). 0 = fail.
+  // Spawn def at a world cell (mob min corner; caller picks ground). 0 = fail,
+  // including when kMaxMobs LIVING creatures already stand (the dead do not
+  // hold a spawn slot; they have their own cap, kMaxDeadMobs).
   uint64_t Spawn(int defIndex, IVec3 atVoxel);
-  // The live creature record, or null. The Mob API (damage, carve, ignite,
-  // equip...) is the per-creature surface; the id-keyed wrappers below remain
-  // for callers that only hold a body handle or an id.
+  // The creature record, or null — ALIVE OR DEAD. A corpse is a Mob now, so
+  // a caller that means "a live creature" asks `->Alive()`; "gone" (null)
+  // means released to debris, despawned or never existed. The Mob API
+  // (damage, carve, ignite, equip...) is the per-creature surface; the
+  // id-keyed wrappers below remain for callers that only hold a body handle
+  // or an id.
   Mob* FindMobById(uint64_t id);
+  // Take one creature out of the world with no corpse — its rig is released
+  // (bodies destroyed, not handed to debris). A test/harness seam: the game
+  // kills things, it does not delete them. False for an unknown id.
+  bool RemoveMob(uint64_t id);
+  // ---- THE AVATAR'S CORPSE AT RESPAWN (P1 fallback; P2b moves it into mobs_)
+  // A dead avatar that kept its rig (a rising is booked) is settled here
+  // before the respawn rebuilds it: the rising is serviced NOW if one is
+  // booked, otherwise the rig is released to debris exactly as a death used
+  // to. No-op for a living avatar or one whose rig already went.
+  void SettleDeadAvatar(Mob& avatar);
+  // ---- DEAD LIMBS AS THINGS YOU CAN HOLD AND SHOVE ------------------------
+  // The body a hand would take hold of if it grabbed `body`: `body` itself
+  // for a dead Mob's attached limb, its HOST limb for a worn shell (a
+  // follower has no dynamics of its own), 0 when `body` is not a dead Mob's.
+  uint64_t GrabbableDeadLimb(uint64_t body) const;
+  // A dead Mob's worn shell -> the limb it is strapped to; 0 otherwise. What a
+  // blow on a corpse's plate moves (melee.cpp StrikeReact).
+  uint64_t DeadFollowerHost(uint64_t body) const;
   // A creature by TARGET id, which includes the players: an avatar is a Mob
   // outside `mobs_` and its actor id is in the ai::kPlayerActorBase band. Use
   // this wherever the id came from the AI; `FindMobById` where it did not.
@@ -4556,8 +4627,9 @@ class MobSystem {
   // shifted, mob.h Limb notes). Load re-runs Spawn() so every derived quantity
   // — anim state, joints, rest sole, flipbooks — comes from the def exactly as
   // a fresh mob's does, then overlays the saved damage. DEAD mobs are not
-  // saved: their limbs were adopted into DebrisSystem at death and travel in
-  // the 'DBRS' section as the debris they already are.
+  // saved YET (MOBS v6 is package P2a of PLAN_corpse_is_a_mob.md): a corpse
+  // is a Mob now and no longer travels in 'DBRS', so until then a save loses
+  // the corpses that were lying about.
   //
   // 2 (2026-09-13): the coat word. PrefabVoxel::stain and DebrisVoxel::stain
   // went from a byte holding a palette slot to 16 bits holding a MATERIAL, and
@@ -4694,7 +4766,34 @@ class MobSystem {
   // bucket, not a slot in `mobs_`, so it never holds a cap slot -- and an
   // unpark is a spawn, so it is refused (and the record stays parked) while
   // the live crowd is full. This is that test, asked from outside.
-  bool HasRoomToSpawn() const { return mobs_.size() < kMaxMobs; }
+  bool HasRoomToSpawn() const { return LiveMobCount() < kMaxMobs; }
+  // ---- THE TWO CAPS (PLAN_corpse_is_a_mob.md "Bounds") ---------------------
+  // `kMaxMobs` counts the LIVING; the dead have their own count and a body
+  // budget over their limbs. Past either, the oldest corpse (lowest DeathSeq)
+  // decays to debris through Mob::ReleaseRigToDebris and from there falls
+  // under DebrisSystem's own cull and settle-back, so the old corpse lifetime
+  // is the tail of the new one and nothing is unbounded.
+  static constexpr uint32_t kMaxDeadMobs = 12;
+  static constexpr uint32_t kMaxDeadBodies = 360;
+  // A dead Mob is asleep after this many consecutive quiet ticks
+  // (Mob::DeadQuietNow); an asleep one re-registers its terrain anchor every
+  // kDeadAnchorStride ticks so the patch under it is not evicted
+  // (debris.cpp kTerrainEvictTicks) and it does not wake over a hole.
+  static constexpr uint16_t kDeadSleepTicks = 60;
+  static constexpr uint32_t kDeadAnchorStride = 128;
+  uint32_t LiveMobCount() const;
+  uint32_t DeadMobCount() const;       // unreleased corpses
+  uint32_t DeadAsleepCount() const;
+  // Corpses the caps have released to debris over the life of this system.
+  uint64_t DeadEvictedTotal() const { return deadEvicted_; }
+  // The living cap, for a gate that has to fill it.
+  static constexpr uint32_t MaxLiveMobs() { return kMaxMobs; }
+  // ---- what the dead cost, counted (the corpse-sleep gate reads these) ----
+  // Terrain anchors a corpse registered, and dead-rig PostSteps (read-back +
+  // untunnel + DriveWornShells) run, over the life of this system. An asleep
+  // corpse adds to neither except the anchor's kDeadAnchorStride refresh.
+  uint64_t DeadAnchorsTotal() const { return deadAnchors_; }
+  uint64_t DeadPostStepsTotal() const { return deadPostSteps_; }
   uint32_t MobOwner(uint64_t mobId) const;
   // Set one creature's owner directly. The handoff path and the gate use it;
   // the ownership function overrules it on the next PreTick, which is correct
@@ -4915,6 +5014,8 @@ class MobSystem {
   void AppendDebugBoxes(std::vector<DebugBox>& out, size_t limit,
                         uint32_t color) const;
   uint32_t LimbBodyCount() const;
+  // EVERY record, the dead included (and a released husk for the one tick
+  // until its sever holds end). Spawn-cap questions ask LiveMobCount().
   uint32_t MobCount() const { return (uint32_t)mobs_.size(); }
   // The i'th mob record, or null past the end. Read-only: the frame loop uses
   // it to lay trample stamps under every creature (sim/trample.h), which
@@ -5361,10 +5462,38 @@ class MobSystem {
   // question. -1 for an unknown id or limb, so a gate cannot read "no such
   // creature" as "dry".
   float LimbBleedBudget(uint64_t mobId, int limbIndex) const;
+  // ---- A LIMB'S WOUND, THE WAY A GATE ASKS A DEBRIS BODY'S -----------------
+  // (PLAN_corpse_is_a_mob.md: a corpse's limbs are a dead Mob's now, and the
+  // corpse gates ask them what they used to ask DebrisSystem.) Open = the
+  // limb still owes blood (bleedBudget >= 1, or a gout in progress); the
+  // world point is `woundLocal` through the limb's live pose.
+  bool LimbWoundOpen(uint64_t mobId, int limbIndex) const;
+  Vec3 LimbWoundWorld(uint64_t mobId, int limbIndex) const;
+  uint32_t WoundedLimbCount(uint64_t mobId) const;
+  // Mob::BluntPulpTick has this limb flagged (MobLimb::bluntPulp).
+  bool LimbPulping(uint64_t mobId, int limbIndex) const;
+  // The limb's live transform origin (its lattice corner), world voxels.
+  Vec3 LimbPosition(uint64_t mobId, int limbIndex) const;
+  // The nearest surviving voxel of the limb to `p`, and how many of its
+  // authoritative-lattice voxels lie within `radius` world voxels of `p`
+  // (DebrisSystem::NearestVoxelWorld / VoxelsNearWorld, for a limb).
+  Vec3 LimbNearestVoxelWorld(uint64_t mobId, int limbIndex, Vec3 p) const;
+  uint32_t LimbVoxelsNearWorld(uint64_t mobId, int limbIndex, Vec3 p,
+                               float radius) const;
+  // The brick a limb draws from (-1 = cube path / none).
+  int32_t LimbMicroModel(uint64_t mobId, int limbIndex) const;
+  // DebrisSystem::RewriteBodyMaterial for a limb: up to `maxCount` voxels of
+  // `fromMat` on its authoritative lattice become `toMat`, the brick is poked,
+  // the collider re-derived, and the burn pass told the lattice is alight. A
+  // fixture's way of setting a corpse's torso on fire without a world fire
+  // that would light everything else too (gate corpse-crossheat).
+  uint32_t RewriteLimbMaterial(uint64_t mobId, int limbIndex, uint32_t fromMat,
+                               uint32_t toMat, uint32_t maxCount);
   float BloodLost(uint64_t mobId) const;
   // MobLimb::surfaceAtSpawn (0 until the first burn recount takes it).
   uint32_t LimbSurfaceAtSpawn(uint64_t mobId, int limbIndex) const;
-  // Mob::DeathCause by id; "" for a live or unknown creature.
+  // Mob::DeathCause by id (the dead Mob answers for itself now; the avatar
+  // through AvatarById); "" for a live or unknown creature.
   const char* DeathCause(uint64_t mobId) const;
   float BurnFraction(uint64_t mobId) const;
   float BurnHealthCap(uint64_t mobId) const;
@@ -5705,10 +5834,6 @@ class MobSystem {
   // rebuilt with the rest on reload.
   std::vector<uint8_t> burnStage_;
   std::vector<uint8_t> burnable_;
-  // The most recent death's id and cause, so DeathCause(id) can answer for a
-  // husk that PreTick has already swept out of mobs_ (Mob::Die writes it).
-  uint64_t lastDeathId_ = 0;
-  const char* lastDeathCause_ = "";
   std::vector<ReactionGpu> reactions_;
   std::vector<uint8_t> matSelfActive_;  // has decay/emit rules — i.e. is ALIGHT
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
@@ -5809,96 +5934,39 @@ class MobSystem {
   // is therefore an append that moves nothing — which is also what lets one
   // turn mid-tick while the creature turning is standing in the middle of it.
   static constexpr size_t kDerivedDefs = 64;
-  // One booked rising. Everything a body has to say on its way out for the
-  // creature that gets up to be recognisably the same one, and nothing that
-  // needs the rig to still exist.
+  // One booked rising. The dead Mob it names still holds everything the
+  // risen creature needs — lattices, pose, gear, pack — so the booking is
+  // only WHO, WHAT INTO, WHEN and WHOSE.
   struct PendingRise {
-    std::string def;                   // whose body it was
+    uint64_t mobId = 0;                // the dead Mob (or dead avatar) to raise
     std::vector<std::string> fx;       // what it rises as
-    Vec3 at{};
-    float heading = 0.0f, bodyY = 0.0f;
-    std::vector<std::string> lost;     // limbs it had already lost
-    std::vector<uint64_t> bodies;      // the remains, to take out of the world
-    // Limb name → debris handle, so ServiceRisings can read the debris's
-    // current transform right before destroying it and hand the zombie a
-    // ragdoll pose to rise from.
-    struct RiseBodyMap { std::string name; uint64_t body; };
-    std::vector<RiseBodyMap> bodyMap;
     uint32_t atTick = 0;
     // WHOSE CORPSE IT WAS (M9.4-B). A rising SPAWNS a creature, which is an
     // authoring act: two machines servicing the same booking would stand two
-    // zombies up in one grave. Captured at the booking rather than tested at
+    // zombies up in one grave. Captured at the BOOKING rather than tested at
     // the service so that a body handed over between dying and rising rises
     // for the machine that owned it when it died — the one whose op stream
     // carried the wounds that killed it.
     uint32_t owner = 0;
-    // ---- WHAT HAPPENED TO IT, AS GEOMETRY ---------------------------------
-    //
-    // One entry per limb whose lattice is no longer the def's — the arm a
-    // sword opened, the shoulder a zombie tore at. Exactly the fields
-    // MobSystem::SaveState writes per limb, for exactly the same reason: the
-    // lattice is the truth and the collider, the brick and the rig offsets are
-    // derived from it, so restoring it is the whole restore (LoadState's carve
-    // pass, and ServiceRisings replays that pass verbatim).
-    //
-    // BY NAME, not by index, like `lost`: an effect may APPEND a limb even
-    // though it may not rename or remove one (sidecar.h), so index parity is a
-    // rule about this rig and not about every rig a later effect could
-    // describe.
-    struct RiseLimb {
-      std::string name;
-      float hp = 0;
-      Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
-      IVec3 size{};
-      std::vector<DebrisVoxel> voxels;
-      std::vector<PrefabVoxel> skinVoxels;
-    };
-    std::vector<RiseLimb> limbs;
-    // ---- AND WHAT IT WAS WEARING ------------------------------------------
-    //
-    // The remains are DESTROYED by the rising (a corpse that got up is not
-    // still lying there), and its gear is part of the remains — so without
-    // this, turning is a way to delete a suit of armour. Re-equipped through
-    // the ordinary Mob::WearItem / Mob::EquipItem on the far side, by NAME
-    // (item.h's index hazard) with the damage the piece had at death, so a
-    // zombie rises in the same battered, dyed kit the villager fell in.
-    struct RiseGear {
-      std::string item;
-      int equipSlot = -1;      // -1 for the held item
-      bool held = false;
-      uint32_t dye = 0;
-      WornDamage damage;
-    };
-    std::vector<RiseGear> gear;
-    // ---- AND WHAT IT HAD IN ITS PACK --------------------------------------
-    //
-    // The same argument as `gear`, one step simpler because there is no body
-    // and no damage to capture: the remains are destroyed by the rising, so a
-    // rising that dropped the pack would be a way to delete a purse by letting
-    // its owner turn. Straight onto the creature that gets up, which is then
-    // lootable for it in the ordinary way — a zombie carrying your dagger is a
-    // zombie you can take your dagger back off.
-    //
-    // FOR THE AVATAR this is where the player's bag and hotbar arrive
-    // (MobSystem::SetAvatarKitFn): Mob cannot reach PlayerSession, and the
-    // kit's owner answers the question at the moment of death.
-    std::vector<CarriedItem> carried;
   };
   // Bounded like every other emergent queue here (CLAUDE.md rule 2): a crowd
   // dying at once books a crowd of risings, and the cost of one is a spawn.
   static constexpr size_t kMaxRisings = 32;
-  // ...and a rising is no longer a fixed-size booking now that it carries
-  // lattices: a human's skin lattice is ~27k voxels of 8 bytes, per limb. Only
-  // limbs that were actually damaged are captured (MobLimb::carved, the latch
-  // that fires the first time a limb loses a voxel to a carve OR a burn), and
-  // the whole capture is dropped past this ceiling — the body still gets up,
-  // it simply gets up with the freshly-rotted lattice it used to get up with.
-  // 256k voxels is ten times a whole human's skin, so a body reaches it only
-  // by being cut to pieces, which is the case where the geometry has stopped
-  // meaning anything anyway.
-  static constexpr size_t kRiseVoxelBudget = 256 * 1024;
   void BookRising(PendingRise r);
   void ServiceRisings(uint32_t tick);
+  // Service rises_[i] now: read the dead rig, release it, spawn the turned
+  // def with the rig copied across. False when it must wait (no room for a
+  // living creature yet); the booking is consumed otherwise.
+  bool ServiceRising(size_t i);
+  // ---- the dead, per tick (PLAN_corpse_is_a_mob.md) ------------------------
+  // Release the oldest corpses to debris until both caps hold.
+  void EvictDead();
+  // Sleep bookkeeping for every awake corpse, after the tick's passes.
+  void UpdateDeadSleep(World& world);
+  uint64_t deathSeq_ = 0;       // Mob::deathSeq_'s source
+  uint64_t deadEvicted_ = 0;    // DeadEvictedTotal
+  uint64_t deadAnchors_ = 0;    // DeadAnchorsTotal
+  uint64_t deadPostSteps_ = 0;  // DeadPostStepsTotal
   std::vector<PendingRise> rises_;
   uint32_t tick_ = 0;                  // this tick, for booking a rising
   std::vector<MobDef> defs_;
@@ -5922,7 +5990,6 @@ class MobSystem {
   StyleLibrary styles_;
   const ItemLibrary* items_ = nullptr;
   std::function<void(uint64_t, const std::string&, uint32_t)> onItemShed_;
-  std::function<void(const CorpseReport&)> onCorpse_;
   std::function<void(std::vector<CarriedItem>&)> avatarKitFn_;
   std::vector<BlockEvent> blocks_;
   // The players' bodies, registered by the frame layer so the handle-keyed

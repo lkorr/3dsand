@@ -2044,11 +2044,11 @@ Status GateItemGround(Ctx& c, std::string& detail) {
 
 // ---- loot: a corpse keeps what it fell with, and you can take it -----------
 //
-// The whole chain from Mob::Die's CorpseReport to a robe in the pack, with no
-// window: dress a rig, kill it, find the corpse by any of its bodies, take the
-// piece into the pack and into an equip slot, have the wrong slot refuse it,
-// leave one on the floor as a ground item, and watch the release hook forget
-// a corpse whose bodies are all gone. Fixtures rather than shipped items, so
+// The whole chain from a dead Mob to a robe in the pack, with no window: dress
+// a rig, kill it, find the corpse by any of its bodies, take the piece into
+// the pack and into an equip slot, have the wrong slot refuse it, leave one on
+// the floor as a ground item, and see a corpse whose rig went to debris stop
+// being one (docs/PLAN_corpse_is_a_mob.md: the corpse IS the dead Mob). Fixtures rather than shipped items, so
 // the library is a two-entry local one and the gate reads any humanoid rig.
 Status GateLoot(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
@@ -2098,26 +2098,37 @@ Status GateLoot(Ctx& c, std::string& detail) {
   const int chestSlot = (int)EquipSlotId::Chest;
   const int bootSlot = (int)EquipSlotId::Boots;
 
-  // Wired exactly as the game wires it: both registries hang off the one
-  // release hook, and the corpse hook is the MobSystem's.
+  // Wired exactly as the game wires it: the ground registry hangs off the
+  // release hook, and a piece left on the floor reaches it through the mob
+  // system's item-shed hook. The corpse itself needs no registry: it is the
+  // dead Mob (docs/PLAN_corpse_is_a_mob.md).
   const uint64_t idsBefore = mobs.NextIdCounter();
   debris.Reset();
   mobs.Reset();
   WorldItems ground;
-  Corpses corpses;
-  debris.SetOnBodyGone([&ground, &corpses](uint64_t h) {
-    ground.OnBodyGone(h);
-    corpses.OnBodyGone(h);
-  });
-  mobs.SetOnCorpse([&corpses](const CorpseReport& r) { corpses.Add(r); });
+  debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
+  mobs.SetOnItemShed([&ground](uint64_t h, const std::string& name,
+                               uint32_t dye) { ground.Add(h, name, dye); });
   auto teardown = [&]() {
     debris.SetOnBodyGone(nullptr);
-    mobs.SetOnCorpse(nullptr);
+    mobs.SetOnItemShed(nullptr);
     debris.Reset();
     mobs.Reset();
     mobs.SetNextIdCounter(idsBefore);
     ground.Clear();
-    corpses.Clear();
+  };
+  auto lootable = [&]() {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+      const Mob* m = mobs.MobAt(i);
+      if (m && m->Lootable()) n++;
+    }
+    return n;
+  };
+  auto pieces = [&](uint64_t id) {
+    std::vector<LootPiece> out;
+    if (const Mob* m = mobs.FindMobById(id)) m->LootPieces(out);
+    return out;
   };
 
   const IVec3 wOrg = c.world.WindowOrigin();
@@ -2135,31 +2146,41 @@ Status GateLoot(Ctx& c, std::string& detail) {
       return Status::Fail;
     }
     const uint32_t bodiesBefore = mob->LimbBodyCount();
-    check(corpses.Count() == 0, "a living creature is not a corpse");
+    std::vector<uint64_t> bodies;
+    for (int li = 0; li < mob->LimbCount(); li++)
+      if (const uint64_t b = mobs.LimbBody(id, li)) bodies.push_back(b);
+    check(lootable() == 0 && !mob->Lootable(), "a living creature is not a corpse");
     mob->Die();
-    check(corpses.Count() == 1, "dying reports exactly one corpse");
-    const CorpseReport* cr = corpses.Find(id);
-    check(cr != nullptr, "found by the mob's id");
+    check(lootable() == 1, "dying makes exactly one corpse");
+    Mob* cr = mobs.FindMobById(id);
+    check(cr != nullptr && !cr->Alive() && cr->Lootable(),
+          "found by the mob's id, dead and lootable");
     if (cr) {
-      check(cr->def == def.name, "named for what it was");
-      check(cr->bodies.size() == bodiesBefore,
-            "every limb body, shells included, is in the hover set");
-      check(cr->gear.size() == 1, "one piece of gear on it");
-      const CorpseReport::Piece* pc = cr->gear.empty() ? nullptr : &cr->gear[0];
+      check(cr->Def() && cr->Def()->name == def.name, "named for what it was");
+      uint32_t owned = 0;
+      for (uint64_t b : bodies) owned += mobs.FindOwner(b) == cr ? 1u : 0u;
+      check(cr->LimbBodyCount() == bodiesBefore && owned == bodiesBefore,
+            "every limb body, shells included, is still the corpse's");
+      const std::vector<LootPiece> list = pieces(id);
+      check(list.size() == 1, "one piece of gear on it");
+      const LootPiece* pc = list.empty() ? nullptr : &list[0];
+      const uint64_t robeBody = cr->LootPieceBody(0);
       check(pc && pc->item == "fixture_robe", "which is the robe, BY NAME");
-      check(pc && pc->body != 0 && !pc->held, "with the body that IS the robe");
-      check(pc && pc->rags.size() == robeParts.size() - 1,
-            "and the other shells as its rags");
+      check(pc && pc->kind == LootPiece::Kind::Worn && robeBody != 0,
+            "with the body that IS the robe");
+      check(cr->WornPieceCount() == 1 &&
+                cr->WornSlotsAt(0).size() == robeParts.size(),
+            "and the other shells still on the body with it");
       check(pc && pc->identityCover >= 0,
             "and knows which cover entry the identity shell is");
       check(pc && pc->equipSlot == chestSlot, "in the slot it was worn in");
       check(pc && pc->damage.shells.size() >= 1,
-            "with its damage captured before the rig forgot it");
-      check(corpses.FindByBody(cr->bodies[0]) == cr,
-            "any body of the heap answers as the corpse");
-      check(pc && corpses.FindByBody(pc->body) == cr,
+            "with its damage read off the shells");
+      check(!bodies.empty() && mobs.FindOwner(bodies[0]) == cr,
+            "any body of the corpse answers as the corpse");
+      check(robeBody != 0 && mobs.FindOwner(robeBody) == cr,
             "the robe's own body included");
-      check(corpses.FindByBody(cr->bodies[0] + 977777) == nullptr,
+      check(!bodies.empty() && mobs.FindOwner(bodies[0] + 977777) == nullptr,
             "and a body that is nobody's is not a corpse");
     }
 
@@ -2169,14 +2190,13 @@ Status GateLoot(Ctx& c, std::string& detail) {
     for (ItemStack& st : kit.bag.slots) st = ItemStack{99, 1};
     for (ItemStack& st : hotbar.slots) st = ItemStack{99, 1};
     {
-      CorpseReport* cw = corpses.Find(id);
+      Mob* cw = mobs.FindMobById(id);
       std::string name;
       const LootResult r = cw ? TakeCorpseLoot(*cw, 0, KitRef{}, kit, hotbar,
-                                               lib, debris, &name)
+                                               lib, &name)
                               : LootResult::NoSuchPiece;
       check(r == LootResult::NoRoom, "a full pack and hotbar refuse the take");
-      cw = corpses.Find(id);
-      check(cw && cw->gear.size() == 1, "and the robe is still on the corpse");
+      check(pieces(id).size() == 1, "and the robe is still on the corpse");
       check(*LootResultText(LootResult::NoRoom, KitRef{}) != 0,
             "with a sentence to show");
     }
@@ -2185,12 +2205,12 @@ Status GateLoot(Ctx& c, std::string& detail) {
 
     // ---- 3. the take ------------------------------------------------------
     {
-      CorpseReport* cw = corpses.Find(id);
-      const uint64_t robeBody = cw ? cw->gear[0].body : 0;
-      const size_t heapBefore = cw ? cw->bodies.size() : 0;
+      Mob* cw = mobs.FindMobById(id);
+      const uint64_t robeBody = cw ? cw->LootPieceBody(0) : 0;
+      const uint32_t heapBefore = cw ? cw->LimbBodyCount() : 0;
       std::string name;
       const LootResult r = cw ? TakeCorpseLoot(*cw, 0, KitRef{}, kit, hotbar,
-                                               lib, debris, &name)
+                                               lib, &name)
                               : LootResult::NoSuchPiece;
       check(r == LootResult::Ok, "the robe comes off the corpse");
       check(name == "fixture_robe", "and the take names it");
@@ -2198,28 +2218,34 @@ Status GateLoot(Ctx& c, std::string& detail) {
       for (const ItemStack& st : kit.bag.slots)
         if (!st.Empty() && st.def == robeIdx) inBag += st.count;
       check(inBag == 1, "one robe in the pack");
-      std::vector<PrefabVoxel> lat;
-      uint32_t sc = 1;
-      check(!debris.BodyLatticeOf(robeBody, lat, sc),
+      check(robeBody != 0 && mobs.FindOwner(robeBody) == nullptr &&
+                !debris.HasBody(robeBody),
             "the robe's body has left the world");
-      cw = corpses.Find(id);
-      check(cw && cw->gear.empty(), "nothing left on the corpse");
-      check(cw && cw->bodies.size() == heapBefore - robeParts.size(),
-            "and the robe's shells left the hover set through the release hook");
+      cw = mobs.FindMobById(id);
+      check(pieces(id).empty(), "nothing left on the corpse");
+      check(cw && cw->LimbBodyCount() == heapBefore - robeParts.size(),
+            "and every one of the robe's shells left the body with it");
       check(kit.Damage("fixture_robe") == nullptr,
             "an untouched robe files no damage");
       const LootResult again =
-          cw ? TakeCorpseLoot(*cw, 0, KitRef{}, kit, hotbar, lib, debris)
+          cw ? TakeCorpseLoot(*cw, 0, KitRef{}, kit, hotbar, lib)
              : LootResult::NoSuchPiece;
       check(again == LootResult::NoSuchPiece, "taking from an empty list is refused");
     }
-    // The heap itself: destroy every body and the corpse is forgotten.
+    // The body itself: once its rig is no longer its own (the dead cap or the
+    // window releases it to DebrisSystem), it is not a corpse to loot any more
+    // and none of the heap's bodies answers as one.
     {
-      CorpseReport* cw = corpses.Find(id);
-      std::vector<uint64_t> heap = cw ? cw->bodies : std::vector<uint64_t>{};
-      for (uint64_t b : heap) debris.DestroyBody(b);
-      check(corpses.Find(id) == nullptr,
-            "a corpse with no bodies left is forgotten");
+      Mob* cw = mobs.FindMobById(id);
+      std::vector<uint64_t> heap;
+      for (int li = 0; cw && li < cw->LimbCount(); li++)
+        if (const uint64_t b = mobs.LimbBody(id, li)) heap.push_back(b);
+      if (cw) cw->ReleaseRigToDebris();
+      bool anyOwned = false;
+      for (uint64_t b : heap) anyOwned |= mobs.FindOwner(b) != nullptr;
+      check(cw && !cw->Lootable() && !heap.empty() && !anyOwned,
+            "a corpse whose rig went to debris is not lootable, and its bodies "
+            "answer as nobody's");
     }
   }
 
@@ -2235,33 +2261,33 @@ Status GateLoot(Ctx& c, std::string& detail) {
       return Status::Fail;
     }
     mob->Die();
-    CorpseReport* cw = corpses.Find(id);
-    check(cw && cw->gear.size() == 2, "two pieces on the second corpse");
+    check(pieces(id).size() == 2, "two pieces on the second corpse");
     PlayerKit kit;
     Inventory hotbar;
     auto indexOf = [&](const char* item) {
-      cw = corpses.Find(id);
-      if (!cw) return -1;
-      for (size_t i = 0; i < cw->gear.size(); i++)
-        if (cw->gear[i].item == item) return (int)i;
+      const std::vector<LootPiece> list = pieces(id);
+      for (size_t i = 0; i < list.size(); i++)
+        if (list[i].item == item) return (int)i;
       return -1;
     };
     // The robe, dragged straight onto the chest slot.
     {
+      Mob* cw = mobs.FindMobById(id);
       const int ri = indexOf("fixture_robe");
       const LootResult r =
           cw && ri >= 0 ? TakeCorpseLoot(*cw, ri, KitRef{KitSpace::Equip, chestSlot},
-                                         kit, hotbar, lib, debris)
+                                         kit, hotbar, lib)
                         : LootResult::NoSuchPiece;
       check(r == LootResult::Ok, "a robe drags straight onto the chest slot");
       check(kit.equip.At(chestSlot).def == robeIdx, "and is there");
     }
     // The boots onto the chest slot: refused, still on the corpse.
     {
+      Mob* cw = mobs.FindMobById(id);
       const int bi = indexOf("fixture_boots");
       const LootResult r =
           cw && bi >= 0 ? TakeCorpseLoot(*cw, bi, KitRef{KitSpace::Equip, chestSlot},
-                                         kit, hotbar, lib, debris)
+                                         kit, hotbar, lib)
                         : LootResult::NoSuchPiece;
       check(r == LootResult::WrongKind, "boots onto the chest slot are refused");
       check(indexOf("fixture_boots") >= 0, "and stay on the corpse");
@@ -2272,29 +2298,30 @@ Status GateLoot(Ctx& c, std::string& detail) {
       const LootResult in =
           cw && indexOf("fixture_boots") >= 0
               ? TakeCorpseLoot(*cw, indexOf("fixture_boots"),
-                               KitRef{KitSpace::Loot, 0}, kit, hotbar, lib, debris)
+                               KitRef{KitSpace::Loot, 0}, kit, hotbar, lib)
               : LootResult::NoSuchPiece;
       check(in == LootResult::WrongKind, "and a loot slot is never a destination");
     }
     // The boots, dragged out: left on the floor as a ground item.
     {
+      Mob* cw = mobs.FindMobById(id);
       const int bi = indexOf("fixture_boots");
-      const uint64_t bootBody = cw && bi >= 0 ? cw->gear[(size_t)bi].body : 0;
+      const uint64_t bootBody = cw && bi >= 0 ? cw->LootPieceBody(bi) : 0;
       std::string name;
-      check(cw && bi >= 0 && ShedCorpseLoot(*cw, bi, debris, ground, &name),
+      check(cw && bi >= 0 && ShedCorpseLoot(*cw, bi, &name),
             "the boots come off onto the floor");
       check(name == "fixture_boots", "named");
       const WorldItem* w = ground.Find(bootBody);
       check(w && w->item == "fixture_boots",
             "and the body is now a ground item E can pick up");
-      cw = corpses.Find(id);
-      check(cw && cw->gear.empty(), "the corpse has nothing left on it");
-      check(corpses.FindByBody(bootBody) == cw,
-            "but the boots still lie in the heap until they are taken");
+      check(pieces(id).empty(), "the corpse has nothing left on it");
+      check(bootBody != 0 && debris.HasBody(bootBody) &&
+                mobs.FindOwner(bootBody) == nullptr,
+            "but the boots still lie there, off the body, until they are taken");
       check(debris.DestroyBody(bootBody), "picking them up (the body goes)");
       check(ground.Count() == 0, "forgets the ground item");
-      check(corpses.FindByBody(bootBody) == nullptr,
-            "and takes the body out of the heap, through the one hook");
+      check(!debris.HasBody(bootBody) && mobs.FindOwner(bootBody) == nullptr,
+            "and the body is gone from the world, through the one hook");
     }
   }
 

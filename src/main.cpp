@@ -5519,15 +5519,11 @@ int main(int argc, char** argv) {
   // Ordering makes that unrepresentable; a teardown call would only make it
   // unlikely.
   WorldItems ground;
-  // ...and the corpses you can loot (game/corpses.h): the same registry shape
-  // over the same bodies, declared before `debris` for the same reason.
-  Corpses corpses;
+  // (The corpses you can loot are dead MOBS now and need no registry of
+  // their own: game/corpses.h reads their gear live off the rig.)
   DebrisSystem debris;
   debris.Init(&phys, &world, mats, reactions);
-  debris.SetOnBodyGone([&ground, &corpses](uint64_t h) {
-    ground.OnBodyGone(h);
-    corpses.OnBodyGone(h);
-  });
+  debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
   MobSystem mobs;
   mobs.Init(&phys, &world, &debris, mats, reactions);
   // S5b parking (game/persist.h). Lives beside `mobs` rather than in the
@@ -5609,11 +5605,6 @@ int main(int argc, char** argv) {
       [&ground](uint64_t h, const std::string& name, uint32_t dye) {
         ground.Add(h, name, dye);
       });
-  // A CREATURE THAT FELL WITH THINGS ON IT. Die() reports the bodies it became
-  // and the gear still on them the instant before the rig forgets; from here
-  // on the heap is a corpse the crosshair can name and the character screen
-  // can open (Mob::CorpseReport, game/corpses.h).
-  mobs.SetOnCorpse([&corpses](const CorpseReport& r) { corpses.Add(r); });
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
   stream.OnMaterialsReloaded(mats);
@@ -9036,8 +9027,8 @@ int main(int argc, char** argv) {
       }
       // Fifth picture: a corpse with its gear on, opened. A human is spawned
       // a few paces ahead, dressed in every worn piece the library has and
-      // handed a sword, and killed — the same CorpseReport path a fight
-      // produces — and the panel is opened on it as E would.
+      // handed a sword, and killed — the same dead Mob a fight produces — and
+      // the panel is opened on it as E would.
       if (frameCounter == kShotInvGraphFrame + 1) {
         ui.grimoireMode = false;
         // Shut it again: the pictures after this one are about the corpse and
@@ -9072,16 +9063,19 @@ int main(int argc, char** argv) {
               mobs.EquipItem(id, sword);
             if (Mob* m = mobs.FindMobById(id)) m->Die();
           }
-          const CorpseReport* c = corpses.Find(id);
+          Mob* c = id ? mobs.FindMobById(id) : nullptr;
+          if (c && !c->Lootable()) c = nullptr;
+          std::vector<LootPiece> pieces;
           if (c) {
+            c->LootPieces(pieces);
             lootCorpse = id;
             ui.lootOpen = true;
-            ui.lootTitle = c->def;
+            ui.lootTitle = c->Def() ? c->Def()->name : std::string();
           }
           std::printf("--shot-inventory: corpse of a human in %d worn pieces, "
                       "%zu lootable%s\n",
-                      dressed, c ? c->gear.size() : (size_t)0,
-                      c ? "" : " (NO CORPSE REPORTED)");
+                      dressed, pieces.size(),
+                      c ? "" : " (NO LOOTABLE CORPSE)");
         } else {
           std::fprintf(stderr, "--shot-inventory: no \"human\" mob def\n");
         }
@@ -9098,8 +9092,13 @@ int main(int argc, char** argv) {
         // player — which is exactly where this camera is. It photographed as a
         // second, hazy body laid over the first. Clearing debris first also
         // takes the hand severed at frame 170, so the only thing left for the
-        // player's own limbs to be is the corpse this picture is about.
+        // player's own limbs to be is the corpse this picture is about. The
+        // loot corpse is a dead MOB now, not debris, so it goes separately.
         debris.Reset();
+        for (uint32_t i = mobs.MobCount(); i-- > 0;) {
+          const uint64_t mid = mobs.MobIdAt(i);
+          if (mid && !mobs.IsAlive(mid)) mobs.RemoveMob(mid);
+        }
         avatar.SeverByName("head");
         std::printf("--shot-inventory: took the player's head off "
                     "(health %d/%d, alive=%d)\n",
@@ -9553,19 +9552,25 @@ int main(int argc, char** argv) {
           phys.CastRayBody(from, fwd, castLen, frac, lookIgnore);
       if (hit && (from + fwd * (frac * castLen) - hand).len() <= kPickupReach)
         lookBody = hit;
-      // The ground registry FIRST: a shed robe still lying in the heap it
-      // came off reads as the robe, not as the corpse (ShedCorpseLoot).
+      // The ground registry FIRST: a shed robe still lying beside the body
+      // it came off reads as the robe, not as the corpse (ShedCorpseLoot).
+      // Then a DEAD MOB under the crosshair — any of its limbs, shells or the
+      // sword in its hand answers as the corpse (MobSystem::FindOwner).
       if (const WorldItem* w = lookBody ? ground.Find(lookBody) : nullptr) {
         ui.lookPrompt = "E  pick up " + w->item;
-      } else if (const CorpseReport* c = corpses.FindByBody(lookBody)) {
-        ui.lookPrompt = c->gear.empty() ? c->def + "  -  nothing left on it"
-                                        : "E  loot " + c->def;
+      } else if (const Mob* c = lookBody ? mobs.FindOwner(lookBody) : nullptr;
+                 c != nullptr && c->Lootable()) {
+        std::vector<LootPiece> pieces;
+        c->LootPieces(pieces);
+        const std::string name = c->Def() ? c->Def()->name : std::string();
+        ui.lookPrompt = pieces.empty() ? name + "  -  nothing left on it"
+                                       : "E  loot " + name;
       }
       // ...and the second half of the same prompt: anything the grab would
       // accept says so, whether or not it is also an item. The prompt is how
       // the player finds out the key does two things at all.
       if (CurrentTuning().player.grabHoldTime > 0.0f) {
-        if (const uint64_t g = GrabHold::Grabbable(debris, lookBody)) {
+        if (const uint64_t g = GrabHold::Grabbable(debris, &mobs, lookBody)) {
           const float kg = phys.BodyMass(g);
           const float cap = CurrentTuning().player.grabMaxMass;
           char buf[96];
@@ -9628,14 +9633,17 @@ int main(int argc, char** argv) {
     auto takeE = [&]() {
       const uint64_t hit = lookBody;
       const WorldItem* w = hit ? ground.Find(hit) : nullptr;
-      const CorpseReport* corpse = w ? nullptr : corpses.FindByBody(hit);
-      if (corpse && !corpse->gear.empty()) {
+      const Mob* corpse = (w || !hit) ? nullptr : mobs.FindOwner(hit);
+      if (corpse && !corpse->Lootable()) corpse = nullptr;
+      std::vector<LootPiece> corpsePieces;
+      if (corpse) corpse->LootPieces(corpsePieces);
+      if (corpse && !corpsePieces.empty()) {
         // OPEN THE CORPSE: the character screen with its loot panel up. The
         // cursor dance is the I key's, and `lootOpenedScreen` remembers that
         // it was E who opened the screen so closing the loot closes it again.
-        lootCorpse = corpse->mobId;
+        lootCorpse = corpse->Id();
         ui.lootOpen = true;
-        ui.lootTitle = corpse->def;
+        ui.lootTitle = corpse->Def() ? corpse->Def()->name : std::string();
         if (!ui.inventoryOpen) {
           lootOpenedScreen = true;
           ui.inventoryOpen = true;
@@ -9711,7 +9719,7 @@ int main(int argc, char** argv) {
         if (grab.Active()) {
           grab.Release(phys);
           eGrabbed = true;
-        } else if (const uint64_t g = GrabHold::Grabbable(debris, lookBody)) {
+        } else if (const uint64_t g = GrabHold::Grabbable(debris, &mobs, lookBody)) {
           if (grab.Begin(phys, g, tp, player.EyePos())) {
             eGrabbed = true;
           } else if (grab.RefusedTooHeavy()) {
@@ -11681,7 +11689,9 @@ int main(int argc, char** argv) {
       ui.bodyCount = debris.BodyCount();
       ui.activeBodyCount = debris.ActiveBodyCount();
       ui.prefabPending = (uint32_t)placer.PendingCount();
-      ui.mobCount = mobs.MobCount();
+      // The LIVING: a corpse is a Mob now (PLAN_corpse_is_a_mob.md) and the
+      // overlay's "mobs" is the crowd, which is what the spawn cap counts.
+      ui.mobCount = mobs.LiveMobCount();
 
       // What the wardrobe's picked colour is CALLED (game/dye.h). Mirrored
       // rather than computed in the overlay so the UI keeps its "reads
@@ -11709,6 +11719,7 @@ int main(int argc, char** argv) {
       for (uint32_t i = 0; ui.aiWindowOpen && i < mobs.MobCount(); i++) {
         const uint64_t mid = mobs.MobIdAt(i);
         if (mid == 0) continue;
+        if (!mobs.IsAlive(mid)) continue;   // the dead have no AI to show
         const ai::Brain* br = mobs.MobBrain(mid);
         const ai::Profile* pf =
             br != nullptr ? mobs.Behaviors().At(br->profile) : nullptr;
@@ -12144,8 +12155,8 @@ int main(int argc, char** argv) {
       //
       // Consumed here, beside the kit latches, because a loot slot is one more
       // address the same drag can name (KitSpace::Loot). The corpse is
-      // re-found BY ID on every use — a registry pointer does not survive
-      // TakeCorpseLoot destroying the piece's body (game/corpses.h).
+      // re-found BY ID on every use — it is a Mob in a vector, and a pointer
+      // does not survive anything that spawns or removes one.
       {
         auto say = [&](const std::string& m) {
           ui.kitMessage = m;
@@ -12179,17 +12190,22 @@ int main(int argc, char** argv) {
         }
         if (ui.lootClose) closeLoot();
         // Walked away, or the heap is gone / picked clean: close by itself.
+        // The dead Mob the panel is open on, or null once it is not one any
+        // more (released to debris by the dead cap, risen, removed).
+        auto lootMob = [&]() -> Mob* {
+          Mob* m = lootCorpse ? mobs.FindMobById(lootCorpse) : nullptr;
+          return m != nullptr && m->Lootable() ? m : nullptr;
+        };
         if (ui.lootOpen) {
-          const CorpseReport* c = corpses.Find(lootCorpse);
-          if (!c || !CorpseWithin(*c, phys, player.pos, kLootRange))
-            closeLoot();
+          const Mob* c = lootMob();
+          if (!c || !c->AnyLimbWithin(player.pos, kLootRange)) closeLoot();
         }
         auto takeOne = [&](int index, KitRef dest) -> bool {
-          CorpseReport* c = corpses.Find(lootCorpse);
+          Mob* c = lootMob();
           if (!c) return false;
           std::string name;
-          const LootResult r = TakeCorpseLoot(*c, index, dest, kit, hotbar,
-                                              items, debris, &name);
+          const LootResult r =
+              TakeCorpseLoot(*c, index, dest, kit, hotbar, items, &name);
           if (r == LootResult::Ok) {
             say("took " + name);
             return true;
@@ -12220,8 +12236,10 @@ int main(int argc, char** argv) {
               // outcome under which nothing is lost.
               int took = 0;
               for (;;) {
-                const CorpseReport* c = corpses.Find(lootCorpse);
-                if (!c || c->gear.empty()) break;
+                const Mob* c = lootMob();
+                std::vector<LootPiece> left;
+                if (c) c->LootPieces(left);
+                if (left.empty()) break;
                 if (!takeOne(0, KitRef{})) break;
                 took++;
               }
@@ -12235,23 +12253,25 @@ int main(int argc, char** argv) {
           ui.dropItem.pending = false;
           // Dragged OUT of the loot panel: the piece comes off the corpse and
           // stays on the floor as a thing you can pick up (ShedCorpseLoot).
-          CorpseReport* c = ui.lootOpen ? corpses.Find(lootCorpse) : nullptr;
+          Mob* c = ui.lootOpen ? lootMob() : nullptr;
           std::string name;
           const int gi = ui.dropItem.from.index;
-          const bool carried =
-              c && gi >= 0 && gi < (int)c->gear.size() && c->gear[gi].body == 0;
+          std::vector<LootPiece> pieces;
+          if (c) c->LootPieces(pieces);
+          const bool carried = c && gi >= 0 && gi < (int)pieces.size() &&
+                               pieces[(size_t)gi].kind == LootPiece::Kind::Carried;
           if (carried) {
             // A CARRIED STACK HAS NO BODY TO SHED, so this one is a DROP, not
-            // a hand-over: ShedCorpseLoot registers a body that is already
-            // lying in the heap, and a pack item never was one. Same spawn the
-            // bag's own drop uses, from the corpse rather than from the eye —
-            // it should land on the body it came off, not in front of you.
-            CorpseReport::Piece& pc = c->gear[gi];
+            // a hand-over: ShedCorpseLoot cuts loose a body that is already
+            // lying on the corpse, and a pack item never was one. Same spawn
+            // the bag's own drop uses, from the corpse rather than from the eye
+            // — it should land on the body it came off, not in front of you.
+            const LootPiece& pc = pieces[(size_t)gi];
             const ItemDef* idef = items.At(items.Find(pc.item));
             Vec3 at = player.EyePos() + cam.Forward() * 2.0f;
-            if (!c->bodies.empty()) {
-              Vec3 com{};
-              if (phys.BodyCenterOfMass(c->bodies[0], com)) at = com + Vec3{0, 2, 0};
+            {
+              const Vec3 rp = c->RootWorldPos();
+              at = rp + Vec3{0, 2, 0};
             }
             if (idef && DropItemToWorld(*idef, at, Vec3{}, phys, debris, &mbSet,
                                         ground, nullptr, pc.dye)) {
@@ -12259,12 +12279,12 @@ int main(int argc, char** argv) {
               // ONE of the stack, the rule the bag's drop states one block
               // down: dropping a count you did not mean to is the mis-click
               // swap-never-overwrite exists to prevent.
-              if (--pc.count <= 0) c->gear.erase(c->gear.begin() + gi);
+              c->TakeLootPiece(gi, nullptr, 1);
               say("left the " + name + " on the ground");
             } else {
               say("there is nowhere to put that");
             }
-          } else if (c && ShedCorpseLoot(*c, gi, debris, ground, &name)) {
+          } else if (c && ShedCorpseLoot(*c, gi, &name)) {
             say("left the " + name + " on the ground");
           }
         }
@@ -12757,12 +12777,15 @@ int main(int argc, char** argv) {
         // piece nobody is wearing.
         ui.lootSlots.clear();
         if (ui.lootOpen) {
-          if (const CorpseReport* c = corpses.Find(lootCorpse)) {
-            ui.lootTitle = c->def;
-            for (const CorpseReport::Piece& pc : c->gear) {
+          const Mob* c = lootCorpse ? mobs.FindMobById(lootCorpse) : nullptr;
+          if (c && c->Lootable()) {
+            ui.lootTitle = c->Def() ? c->Def()->name : std::string();
+            std::vector<LootPiece> pieces;
+            c->LootPieces(pieces);
+            for (const LootPiece& pc : pieces) {
               const int di = items.Find(pc.item);
               // The COUNT comes off the piece now that a corpse can hold a
-              // carried stack as well as a worn garment (CorpseReport::Piece).
+              // carried stack as well as a worn garment (LootPiece::count).
               // Worn and held pieces are always 1 — a rig slot is one garment —
               // so this reads exactly as the hard-coded 1 did for them, and a
               // pack item gets its badge (ui::CountBadge, inventory_ui.cpp).
@@ -13587,6 +13610,7 @@ int main(int argc, char** argv) {
         };
         for (uint32_t i = 0; i < mobs.MobCount(); i++) {
           const uint64_t mid = mobs.MobIdAt(i);
+          if (!mobs.IsAlive(mid)) continue;   // a corpse's last plan is not one
           const ai::Brain* br = mobs.MobBrain(mid);
           if (br == nullptr || br->profile < 0) continue;
           const ai::Profile* pf = mobs.Behaviors().At(br->profile);

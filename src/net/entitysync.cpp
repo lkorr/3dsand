@@ -307,6 +307,10 @@ void EntitySync::ScanHandoffs(MobSystem& mobs, DebrisSystem& debris,
     const Mob* m = mobs.MobAt(i);
     if (m == nullptr || m->Def() == nullptr) continue;
     if (m->IsGhost()) continue;   // not mine to give away
+    // A CORPSE IS NOT HANDED OVER (yet): the dead state is not on the wire
+    // (PLAN_corpse_is_a_mob.md P2c), so a dead Mob stays with the machine it
+    // died on.
+    if (!m->Alive()) continue;
     // The FEET, the same point MobSystem::RefreshOwnership asks about — a
     // different anchor here would compute a different owner than the system
     // is about to, and the handoff would name the wrong machine.
@@ -406,6 +410,10 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
   for (uint32_t i = 0; i < mobs.MobCount(); i++) {
     const Mob* m = mobs.MobAt(i);
     if (m == nullptr || m->Def() == nullptr || m->IsGhost()) continue;
+    // THE DEAD ARE NOT STREAMED YET (P2c): a creature that died leaves the
+    // visible set exactly as it did when a death removed it from mobs_, so the
+    // peer gets its MobGone below.
+    if (!m->Alive()) continue;
     const Vec3 origin = m->Origin();
     const Vec3 feet{origin.x + m->Def()->worldSize.x * 0.5f, origin.y,
                     origin.z + m->Def()->worldSize.z * 0.5f};
@@ -441,7 +449,10 @@ void EntitySync::Build(MobSystem& mobs, DebrisSystem& debris, uint32_t label,
       ++it;
       continue;
     }
-    MobGone g{*it, mobs.FindMobById(*it) != nullptr ? kGoneDespawn : kGoneDeath};
+    // Still here and ALIVE = it walked out of range; here but dead, or gone,
+    // = it died (a corpse is a Mob now, so presence alone no longer says).
+    const Mob* fm = mobs.FindMobById(*it);
+    MobGone g{*it, fm != nullptr && fm->Alive() ? kGoneDespawn : kGoneDeath};
     out.mobGones.push_back(g);
     c_.gonesOut++;
     it = announcedMobs_.erase(it);

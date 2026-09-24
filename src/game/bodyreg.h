@@ -10,8 +10,10 @@
 
 // BodyRegistry — owns the ONE definition of the body GPU slot-space.
 //
-// Debris bodies take slots [0, D), mob limbs stack after, and the player
-// avatar's parts stack after those. Three parallel arrays are indexed by that
+// Debris bodies take slots [0, D), the player avatar's parts stack after, and
+// mob limbs (the dead included) stack after those — the avatar ahead of the
+// mobs so a crowd of corpses can never be what starves the player's own body
+// at kMaxBodySlots (bodyreg.cpp). Three parallel arrays are indexed by that
 // slot: the transforms (bodyXforms), the cube instances (bodyInstances) and
 // the compacted micro-body draw list. All three MUST agree on the walk order
 // and the base offsets, and that agreement used to be spelled out by hand at

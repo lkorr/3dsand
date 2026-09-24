@@ -1131,19 +1131,18 @@ Status GateOneHit(Ctx& c, std::string& detail) {
 // "when killing an NPC duelist with a sword, every single one of his limbs
 // pops off all together." one-hit could not see it because it stops at the
 // blow. The sweep does not: MeleeSweepDamage keeps probing for the rest of
-// the stroke, the creature's limbs are DEBRIS from the tick it died (Die()
-// hands every body to DebrisSystem with its joints on), and a probe that
-// finds one of them goes MeltBodyAt -> DamageBody -> RebuildCollider, which
-// built a new Jolt body and REMOVED the old one — and Physics::RemoveBody
-// destroys every joint on the body it removes. One nick to the torso took the
-// neck, both shoulders and both hips off in the same call.
+// the stroke, and a probe that finds a corpse limb carves it — and a carve
+// REBUILDS the limb's collider, and Physics::RemoveBody destroys every joint
+// on the body it removes. One nick to the torso took the neck, both shoulders
+// and both hips off in the same call (the corpse was debris then; it is a dead
+// Mob now, docs/PLAN_corpse_is_a_mob.md, and the carve is Mob::CarveLimb's).
 //
-// The property: the joints Die() leaves on the corpse survive the corpse
-// being carved. Kill the fixture the way the sword does (root limb to zero,
-// which Sever() routes to Die()), melt its torso where the swing crosses it
-// for three ticks, let it settle. The torso body must have been REBUILT (or
-// the gate proves nothing), the joint count must not have moved by one, and
-// every body the creature was made of must still have a joint on it.
+// The property: the joints a corpse keeps survive the corpse being carved.
+// Kill the fixture the way the sword does (root limb to zero, which is a
+// death, not an amputation), melt its torso where the swing crosses it for
+// three ticks, let it settle. The torso body must have been REBUILT (or the
+// gate proves nothing), the joint count must not have moved by one, and every
+// body the creature was made of must still have a joint on it.
 Status GateCorpseIntact(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -1172,7 +1171,7 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
     if (mobs.LimbBody(id, li)) attached++;
   const uint32_t jointsAlive = c.phys.JointCount();
   // Where the swing crosses the torso: mid-limb, measured off the live body
-  // before it dies, because a corpse has no limbs to measure.
+  // before it dies, while it still stands in its rest shape.
   const LimbAxis ax = MeasureLimb(mobs, id, root);
   const Vec3 mid = ax.anchor + ax.along * (ax.reach * 0.5f);
 
@@ -1190,22 +1189,16 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
   }
   const std::string cause = mobs.DeathCause(id);
   const uint32_t jointsDead = c.phys.JointCount();
-
-  auto indexOf = [&](uint64_t h) -> int {
-    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
-      if (c.debris.BodyHandle(i) == h) return (int)i;
-    return -1;
-  };
-  uint64_t cur = torso;
-  int idx = indexOf(cur);
-  if (idx < 0) {
-    detail = Format("%s: the torso was not adopted as debris on death",
+  // THE CORPSE IS THE DEAD MOB: its torso is still limb `root`, the same
+  // body it was a tick ago.
+  if (mobs.LimbBody(id, root) != torso) {
+    detail = Format("%s: the torso did not stay the corpse's own limb on death",
                     t.defName.c_str());
     mobs.Reset();
     c.debris.Reset();
     return Status::Fail;
   }
-  const uint32_t vox0 = c.debris.BodyVoxelCount((uint32_t)idx);
+  const uint32_t vox0 = mobs.LimbArtVoxelCount(id, root);
 
   uint32_t tick = 52000;
   auto step = [&]() {
@@ -1218,38 +1211,50 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
     c.debris.PostStep();
   };
   // The rest of the stroke: three ticks of the edge crossing the torso at the
-  // sword's own kerf width (halfWidth + carveBonus is about a voxel), exactly
-  // what MeleeSweepDamage does with a debris hit.
+  // sword's own kerf width (halfWidth + carveBonus is about a voxel) — the
+  // laser's sphere carve, which is what the melt on dead flesh always was.
   const float radius = 1.0f;
   std::vector<ParticleSpawn> spawns;
   int melts = 0;
-  for (int i = 0; i < 3 && idx >= 0; i++) {
-    if (c.debris.MeltBodyAt(cur, mid, radius, c.world, spawns)) melts++;
+  uint64_t cur = torso;
+  for (int i = 0; i < 3 && cur; i++) {
+    if (mobs.CarveLimbRadial(cur, mid, radius, /*ragged=*/false,
+                             /*eject=*/false, c.world, spawns))
+      melts++;
     spawns.clear();
-    cur = c.debris.BodyHandle((uint32_t)idx);  // a rebuild changes the handle
+    cur = mobs.LimbBody(id, root);  // a rebuild changes the handle
     step();
-    idx = indexOf(cur);
+    cur = mobs.LimbBody(id, root);
   }
   const uint32_t jointsCarved = c.phys.JointCount();
-  const uint32_t vox1 = idx >= 0 ? c.debris.BodyVoxelCount((uint32_t)idx) : 0;
-  const bool rebuilt = cur != torso && idx >= 0;
+  const uint32_t vox1 = cur ? mobs.LimbArtVoxelCount(id, root) : 0;
+  const bool rebuilt = cur != torso && cur != 0;
 
   // Then it settles for two seconds.
   for (int i = 0; i < 60; i++) step();
   const uint32_t jointsSettled = c.phys.JointCount();
   int jointed = 0, bodies = 0;
+  for (int li = 0; li < nLimbs; li++) {
+    const uint64_t h = mobs.LimbBody(id, li);
+    if (!h) continue;
+    bodies++;
+    if (c.phys.JointCount(h) > 0) jointed++;
+  }
+  // ...and anything that came off it as loose debris is a body of it too,
+  // with no joint: a limb that parted would show up here.
   for (uint32_t i = 0; i < c.debris.BodyCount(); i++) {
     bodies++;
     if (c.phys.JointCount(c.debris.BodyHandle(i)) > 0) jointed++;
   }
   // How far the corpse spread: the largest distance from the torso to any
-  // other body of it. Recorded, not asserted — a settling ragdoll spreads
+  // other limb of it. Recorded, not asserted — a settling ragdoll spreads
   // legitimately, and the joint account above is the claim.
   float spread = 0.0f;
-  if (idx >= 0) {
-    const Vec3 tp = c.debris.BodyPosition((uint32_t)idx);
-    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
-      spread = std::max(spread, (c.debris.BodyPosition(i) - tp).len());
+  if (mobs.LimbBody(id, root)) {
+    const Vec3 tp = mobs.LimbPosition(id, root);
+    for (int li = 0; li < nLimbs; li++)
+      if (mobs.LimbBody(id, li))
+        spread = std::max(spread, (mobs.LimbPosition(id, li) - tp).len());
   }
   RecordObserved("corpseSpreadVox", (double)spread);
 
@@ -1257,13 +1262,13 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
                           jointsCarved == jointsAlive &&
                           jointsSettled == jointsAlive;
   const bool ok = melts > 0 && rebuilt && vox1 < vox0 && jointsKept &&
-                  jointed == attached;
+                  jointed == attached && bodies == attached;
   mobs.Reset();
   c.debris.Reset();
   detail = Format(
       "%s: died of '%s' with %d/%d limbs on, %u joints; torso melted %d ticks "
       "(%u -> %u voxels, rebuilt=%d): joints %u after the kill, %u after the "
-      "carve, %u after settling; %d of %d debris bodies still jointed, spread "
+      "carve, %u after settling; %d of %d corpse bodies still jointed, spread "
       "%.1f vox",
       t.defName.c_str(), cause.c_str(), attached, nLimbs, jointsAlive, melts,
       vox0, vox1, rebuilt ? 1 : 0, jointsDead, jointsCarved, jointsSettled,
@@ -1279,28 +1284,24 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
 // interaction remain."
 //
 // THE PROPERTY, AND THE REASON IT COULD GO MISSING WITHOUT A GATE NOTICING.
-// `DebrisSystem::DamageBody` carves TWO lattices: the SKIN (the art, and what
-// the player sees) and the COLLIDER derived from it by a majority downsample.
-// It used to decide "nothing in range" from the collider predicate alone and
-// return before the skin was touched — and a blade's kerf is a sliver about a
-// tenth of a world voxel across, while one collider cell of a human corpse is
-// eight skin cells that only flip when half of them go. So every sword blow on
-// a corpse took nothing, bled nothing and left no gore, while the corpse still
-// shoved around exactly as before: damage gone, physics intact, which is the
-// report word for word. `Mob::CarveLimb` has refused to make that decision on
-// the collider since the fine skin existed; this is the same carve on the same
-// art one function later, and nothing exercised it — every corpse gate until
-// now went through `MeltBodyAt` (the laser's sphere), which is coarse enough
-// to move the collider on its own.
+// A carve on a fine-skinned body works on TWO lattices: the SKIN (the art, and
+// what the player sees) and the COLLIDER derived from it by a majority
+// downsample. A blade's kerf is a sliver about a tenth of a world voxel across,
+// and one collider cell of a human is eight skin cells that only flip when half
+// of them go — so a carve that decided "nothing in range" on the collider took
+// nothing, bled nothing and left no gore, while the corpse still shoved around
+// exactly as before. `Mob::CarveLimb` has refused to make that decision on the
+// collider since the fine skin existed, and a corpse is a dead Mob now, so the
+// corpse's cut IS that carve (docs/PLAN_corpse_is_a_mob.md).
 //
 // So the claim is the smallest one that the failure breaks: ONE sword-shaped
 // kerf against a corpse removes voxels from the authoritative lattice, and the
 // next two keep removing them (the entry snap must find the new surface, or
 // the wound saturates and a corpse becomes uncuttable after one blow). The
 // mace arm is the control: a blunt carve is a radius of voxels rather than a
-// slot, it moves the collider by itself, and it was WORKING throughout — so a
-// run where the blade takes nothing and the mace takes plenty is exactly the
-// signature of the bug, and the two numbers are printed side by side.
+// slot, it moves the collider by itself — so a run where the blade takes
+// nothing and the mace takes plenty is exactly the signature of the bug, and
+// the two numbers are printed side by side.
 //
 // CPU ONLY: no tick is submitted, so this leaves the world as it found it.
 Status GateCorpseCut(Ctx& c, std::string& detail) {
@@ -1324,7 +1325,7 @@ Status GateCorpseCut(Ctx& c, std::string& detail) {
   // The blade goes through the LIMB the fixture chose, not the torso: the
   // torso is the root and its cut has to survive being the thing every joint
   // hangs off (that is corpse-intact's claim). Measured on the live rig,
-  // because a corpse has no limbs left to measure.
+  // standing, where the limb's axis is the authored one.
   const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
   const uint64_t limbBody = mobs.LimbBody(id, t.limb);
   if (!torso || !limbBody || !ax.valid) {
@@ -1337,7 +1338,7 @@ Status GateCorpseCut(Ctx& c, std::string& detail) {
   const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
 
   // Killed the way the sword kills: the root limb at zero hp is a death, and
-  // Die() hands every limb to DebrisSystem with its joints on.
+  // the corpse keeps every limb and joint (Mob::Die).
   {
     MobSystem::BladeCutScope blade(mobs, 1.0f);
     mobs.Damage(torso, 1.0e6f, at, 45.0f);
@@ -1348,32 +1349,28 @@ Status GateCorpseCut(Ctx& c, std::string& detail) {
     c.debris.Reset();
     return Status::Fail;
   }
-
-  auto indexOf = [&](uint64_t h) -> int {
-    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
-      if (c.debris.BodyHandle(i) == h) return (int)i;
-    return -1;
-  };
-  int idx = indexOf(limbBody);
-  if (idx < 0) {
-    detail = Format("%s: the limb was not adopted as debris on death",
+  if (mobs.LimbBody(id, t.limb) != limbBody) {
+    detail = Format("%s: the limb did not stay the corpse's own on death",
                     t.defName.c_str());
     mobs.Reset();
     c.debris.Reset();
     return Status::Fail;
   }
 
-  // THE SAME SIX LINES MELEE BUILDS THE KERF FROM (game/melee.cpp's debris
-  // branch, which builds it from the same tuning rows the live path does), so
-  // a gore retune moves this gate and the game together.
+  // THE SAME SIX LINES MELEE BUILDS THE KERF FROM (game/melee.cpp
+  // BuildStrikeParts), so a gore retune moves this gate and the game together.
   const auto& g = CurrentTuning().gore;
   const float kPower = 1.0f, kHeft = 1.0f, kRadius = 0.9f;
   std::vector<ParticleSpawn> spawns;
-  uint64_t cur = c.debris.BodyHandle((uint32_t)idx);
-  const uint32_t vox0 = c.debris.BodyVoxelCount((uint32_t)idx);
+  const uint32_t vox0 = mobs.LimbArtVoxelCount(id, t.limb);
   uint32_t voxAfter[3] = {vox0, vox0, vox0};
   int cuts = 0;
-  for (int i = 0; i < 3 && idx >= 0; i++) {
+  for (int i = 0; i < 3; i++) {
+    // THE LIMB INDEX IS THE IDENTITY, NOT THE HANDLE. A carve that moved the
+    // collider rebuilds it, and a rebuild REPLACES the Jolt handle; the rig
+    // slot is untouched.
+    const uint64_t cur = mobs.LimbBody(id, t.limb);
+    if (!cur) break;   // parted: nothing of it left on the corpse to cut
     KerfCut cut;
     cut.at = at;
     cut.edgeAxis = ax.edge;
@@ -1383,51 +1380,31 @@ Status GateCorpseCut(Ctx& c, std::string& detail) {
     cut.length = g.cutLength * (0.4f + 0.6f * kPower) * kHeft;
     cut.power = kPower;
     cut.seed = 0x50D5u + (uint32_t)i * 40503u;
-    if (c.debris.CutBody(cur, cut, c.world, spawns)) cuts++;
+    if (mobs.CutLimb(cur, cut, c.world, spawns)) cuts++;
     spawns.clear();
-    // THE INDEX IS THE IDENTITY, NOT THE HANDLE. A carve that moved the
-    // collider rebuilds it, and a rebuild REPLACES the Jolt handle — so the
-    // handle recorded before the cut names nothing afterwards, while the slot
-    // in DebrisSystem's own list is untouched (fragments are appended past the
-    // end). This is corpse-intact's rule for the same reason.
-    const uint32_t now = c.debris.BodyVoxelCount((uint32_t)idx);
-    const uint32_t prev = i == 0 ? vox0 : voxAfter[i - 1];
-    if (now > prev) break;   // the body was destroyed and something took its slot
-    voxAfter[i] = now;
-    cur = c.debris.BodyHandle((uint32_t)idx);
+    voxAfter[i] = mobs.LimbArtVoxelCount(id, t.limb);
   }
   const uint32_t bladeTook = vox0 > voxAfter[2] ? vox0 - voxAfter[2] : 0u;
   const bool firstCut = voxAfter[0] < vox0;
   const bool deepens = voxAfter[2] < voxAfter[0];
   // The wound the cut armed: a corpse that is cut must BLEED from where it was
-  // cut (DamageBody::ArmWound), which is the second half of the same report
-  // ("no blood comes out").
-  const bool bleeds = idx >= 0 && c.debris.BodyWoundOpen((uint32_t)idx);
+  // cut, which is the second half of the same report ("no blood comes out").
+  const bool bleeds = mobs.LimbWoundOpen(id, t.limb);
 
-  // ---- THE CONTROL ARM: a mace, on a second body of the same corpse --------
+  // ---- THE CONTROL ARM: a mace-sized crater, on the torso of the same corpse
   // A blunt carve is a radius, not a slot, so it moves the collider on its own
   // and was never affected. If the blade takes nothing and this takes plenty,
   // the lattice the blade carves is the thing that is broken.
   uint32_t maceTook = 0;
-  int tidx = indexOf(torso);
-  if (tidx >= 0) {
-    const uint32_t before = c.debris.BodyVoxelCount((uint32_t)tidx);
-    const Vec3 tAt = c.debris.BodyPosition((uint32_t)tidx);
-    c.debris.BluntBody(c.debris.BodyHandle((uint32_t)tidx), tAt,
-                       std::max(g.bluntCarveRadius, 0.5f), 0xB1U, c.world,
-                       spawns);
+  if (const uint64_t tb = mobs.LimbBody(id, root)) {
+    const uint32_t before = mobs.LimbArtVoxelCount(id, root);
+    // On a surviving voxel, so the crater is guaranteed to land on matter.
+    const Vec3 tAt = mobs.LimbVoxelPos(id, root, 0);
+    mobs.CarveLimbRadial(tb, tAt, std::max(g.bluntCarveRadius, 0.5f),
+                         /*ragged=*/true, /*eject=*/true, c.world, spawns);
     spawns.clear();
-    // The torso's handle may have been replaced too; find it by position.
-    int best = -1;
-    float bestD = 1e9f;
-    for (uint32_t k = 0; k < c.debris.BodyCount(); k++) {
-      const float d = (c.debris.BodyPosition(k) - tAt).len();
-      if (d < bestD) { bestD = d; best = (int)k; }
-    }
-    if (best >= 0) {
-      const uint32_t after = c.debris.BodyVoxelCount((uint32_t)best);
-      maceTook = before > after ? before - after : 0u;
-    }
+    const uint32_t after = mobs.LimbArtVoxelCount(id, root);
+    maceTook = before > after ? before - after : 0u;
   }
 
   RecordObserved("corpseCutVoxels", (double)bladeTook);
@@ -1454,17 +1431,14 @@ Status GateCorpseCut(Ctx& c, std::string& detail) {
 // THE LADDER, NOT THE CRATER. A blunt blow on a living creature climbs three
 // rungs (Mob::BluntHit): the flesh MARKS, a saturated mark BREAKS and goes
 // bloody, and tissue that is bloody at depth is PULPED and crumbles over the
-// next few seconds. A corpse got none of that - it went straight to an instant
-// sphere, which is the exact shape the living path was given a bruise to stop
-// using. Dead tissue still marks and still crumbles; what it lacks is hp and a
-// voice.
+// next few seconds (Mob::BluntPulpTick). A corpse is a dead Mob now and takes
+// exactly that path; what it lacks is hp to lose and a voice.
 //
 // The claim, in the order the rungs fire: sustained mace blows on one spot of
 // a corpse (1) lay a bruise coat that was not there before, (2) arm the
-// dissolution, and (3) go on taking voxels AFTER the blows stop, through
-// DebrisSystem::PulpTick, without being touched again. A first blow on clean
-// flesh must take nothing: the carve is EARNED by pulp, exactly as it is on
-// the living.
+// dissolution, and (3) go on taking voxels AFTER the blows stop, without being
+// touched again. A first blow on clean flesh must take nothing: the carve is
+// EARNED by pulp, exactly as it is on the living.
 Status GateCorpseBlunt(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -1508,63 +1482,50 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
     c.debris.Reset();
     return Status::Fail;
   }
-  auto indexOf = [&](uint64_t h) -> int {
-    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
-      if (c.debris.BodyHandle(i) == h) return (int)i;
-    return -1;
-  };
-  int idx = indexOf(limbBody);
-  if (idx < 0) {
-    detail = Format("%s: the limb was not adopted as debris on death",
+  if (mobs.LimbBody(id, t.limb) != limbBody) {
+    detail = Format("%s: the limb did not stay the corpse's own on death",
                     t.defName.c_str());
     mobs.Reset();
     c.debris.Reset();
     return Status::Fail;
   }
 
-  // A MACE, resolved exactly as melee resolves it on loose matter: the bruise
-  // first, the carve only as far as the pulp earns it.
-  const uint32_t vox0 = c.debris.BodyVoxelCount((uint32_t)idx);
-  const uint32_t coat0 = c.debris.BodyCoatCount((uint32_t)idx, bruiseMat);
+  // A MACE, resolved exactly as melee resolves it on a creature (the corpse is
+  // one): the bruise first, the dissolution only as far as the pulp earns it.
+  const uint32_t vox0 = mobs.LimbArtVoxelCount(id, t.limb);
+  const uint32_t coat0 = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
   std::vector<ParticleSpawn> spawns;
   const float kHp = 16.0f;
   uint32_t voxAfterFirst = vox0;
   uint32_t coatAfterFirst = coat0;
   const int kBlows = 24;
-  for (int i = 0; i < kBlows && idx >= 0; i++) {
-    const uint64_t h = c.debris.BodyHandle((uint32_t)idx);
-    const float ripe =
-        c.debris.BruiseBody(h, at, gt.bruiseRadius, 0xB1u + (uint32_t)i * 977u,
-                            1.0f, kHp, false);
-    const float ripeFrom = std::clamp(gt.pulpCarveFrom, 0.0f, 1.0f);
-    const float earned =
-        ripeFrom >= 1.0f
-            ? 0.0f
-            : std::clamp((ripe - ripeFrom) / (1.0f - ripeFrom), 0.0f, 1.0f);
-    if (earned > 0.0f && gt.bluntCarveRadius > 0.0f)
-      c.debris.BluntBody(h, at, gt.bluntCarveRadius * 0.6f * earned,
-                         0xB2u + (uint32_t)i * 977u, c.world, spawns);
+  for (int i = 0; i < kBlows; i++) {
+    const uint64_t h = mobs.LimbBody(id, t.limb);
+    if (!h) break;
+    ::BluntHit hit;
+    hit.at = at;
+    hit.hp = kHp;
+    hit.power = 1.0f;
+    hit.carve = 0.6f;
+    hit.armorBreak = 0.0f;
+    hit.impactSpeed = 0.0f;
+    hit.seed = 0xB1u + (uint32_t)i * 977u;
+    hit.unarmed = false;
+    mobs.BluntHit(h, hit, c.world, spawns);
     spawns.clear();
     if (i == 0) {
-      voxAfterFirst = c.debris.BodyVoxelCount((uint32_t)idx);
-      coatAfterFirst = c.debris.BodyCoatCount((uint32_t)idx, bruiseMat);
+      voxAfterFirst = mobs.LimbArtVoxelCount(id, t.limb);
+      coatAfterFirst = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
     }
   }
-  const uint32_t vox1 = c.debris.BodyVoxelCount((uint32_t)idx);
-  const uint32_t coat1 = c.debris.BodyCoatCount((uint32_t)idx, bruiseMat);
-  const bool pulping = c.debris.BodyPulping((uint32_t)idx);
+  const uint32_t vox1 = mobs.LimbArtVoxelCount(id, t.limb);
+  const uint32_t coat1 = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
+  const bool pulping = mobs.LimbPulping(id, t.limb);
 
   // ...AND IT KEEPS GOING WITH NOBODY TOUCHING IT. The blows have stopped;
-  // only DebrisSystem::PulpTick runs from here.
-  // WHICH BODY IT IS, by the one identity that survives: neither the index nor
-  // the handle does. The handle is replaced by the carve PulpTick
-  // expresses itself as, and the INDEX is shuffled by the corpse's other
-  // pieces settling back into the grid (DebrisSystem::SettleBodies swap-pops
-  // them), which is what made the first two versions of this gate report a
-  // limb that had dissolved to nothing when it had lost 98 voxels.
-  const uint32_t serial = c.debris.BodySerial((uint32_t)idx);
-  // Short of debris.settleAfterTicks, so the piece under test is still a body
-  // at the end of the window rather than a patch of world voxels.
+  // only the corpse's own tick (Mob::BluntPulpTick, in the dead burn pot)
+  // runs from here. The limb is addressed by its rig slot, which neither a
+  // collider rebuild nor anything settling around it can renumber.
   uint32_t tick = 61000;
   for (int i = 0; i < 45; i++) {
     std::vector<BrushOp> ops;
@@ -1577,15 +1538,7 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
     c.debris.PostStep();
     tick++;
   }
-  // BY INDEX, NOT BY HANDLE. PulpTick expresses itself as a carve, a carve
-  // rebuilds the collider, and a rebuild REPLACES the Jolt handle — so the
-  // handle recorded before the ticks names nothing afterwards and a
-  // handle-keyed lookup reads "0 voxels left" for a body that is simply
-  // wearing a new number. That artifact made the first version of this gate
-  // report a limb dissolving to nothing when it had lost 98 voxels.
-  const int idx2 = c.debris.FindBodySerial(serial);
-  const uint32_t vox2 =
-      idx2 >= 0 ? c.debris.BodyVoxelCount((uint32_t)idx2) : 0;
+  const uint32_t vox2 = mobs.LimbArtVoxelCount(id, t.limb);
 
   RecordObserved("corpseBluntCoat", (double)(coat1 - coat0));
   RecordObserved("corpseBluntDissolved", (double)(vox1 > vox2 ? vox1 - vox2 : 0));
@@ -1612,26 +1565,23 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
 // Owner, 2026-09-20: "need audio cues for gore with corpses just like with
 // living bodies, mutilation etc."
 //
-// TWO THINGS A CORPSE COULD NOT DO. It could not be TAKEN APART: severing on
-// the debris side is connectivity inside ONE body, and a corpse is a dozen
-// bodies held together by the joints Mob::Die deliberately leaves on, which
-// nothing ever cut — so a blade could part a neck completely and the head
-// stayed attached. And it could not be HEARD: main.cpp picks the cue for a
-// blow by differencing the sever and voice queues, dead flesh fills neither,
-// so hacking a body apart made the noise a crate makes.
+// TWO THINGS A CORPSE COULD NOT DO. It could not be TAKEN APART — a blade could
+// part a neck completely and the head stayed attached. And it could not be
+// HEARD: main.cpp picks the cue for a blow by differencing the sever and voice
+// queues, and dead flesh filled neither, so hacking a body apart made the noise
+// a crate makes.
 //
-// Both are the same fix from the same direction — dead flesh reports what
-// happens to it the way living flesh does — so they are one gate. The claim:
-// sustained blade cuts at a corpse's NECK part the joint within a sane number
-// of blows, both ends bleed, and the blow that did it pushes a GoreEvent that
-// names the creature, says a piece came off, and says an edge did it.
+// A corpse is a dead Mob now (docs/PLAN_corpse_is_a_mob.md), so both are the
+// living's own machinery: CarveLimb's joint rule takes the head off where the
+// neck has been cut through, and Sever reports it on the sever queue with its
+// cause. The claim: sustained blade cuts at a corpse's NECK part the joint
+// within a sane number of blows, both ends bleed, and the blow that did it
+// pushes a sever event that names the creature and says an edge did it.
 //
 // THE BOUND MATTERS AS MUCH AS THE EVENT. Unbounded, this passes on a model
-// that needs four hundred blows, which is the same as not working — that is
-// what it looked like before the corpse carve got the SPALL the living carve
-// has always had (phys/lattice.h SpallGrow). `corpseDismemberMaxCuts` is the
-// ceiling and `corpse-intact` is the other side of the bet: a cut in the
-// MIDDLE of a limb must not part anything.
+// that needs four hundred blows, which is the same as not working.
+// `corpseDismemberMaxCuts` is the ceiling and `corpse-intact` is the other
+// side of the bet: a cut in the MIDDLE of a limb must not part anything.
 Status GateCorpseDismember(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -1675,7 +1625,7 @@ Status GateCorpseDismember(Ctx& c, std::string& detail) {
     c.debris.Reset();
     return Status::Fail;
   }
-  // Killed the way the sword kills. Handles do not change across adoption.
+  // Killed the way the sword kills. The rig stays the corpse's (Mob::Die).
   {
     MobSystem::BladeCutScope blade(mobs, 1.0f);
     mobs.Damage(torso, 1.0e6f, mobs.LimbAnchorPos(id, head), 45.0f);
@@ -1686,25 +1636,19 @@ Status GateCorpseDismember(Ctx& c, std::string& detail) {
     c.debris.Reset();
     return Status::Fail;
   }
+  mobs.ClearSeverEvents();
   c.debris.ClearGoreEvents();
-
-  auto indexOf = [&](uint64_t h) -> int {
-    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
-      if (c.debris.BodyHandle(i) == h) return (int)i;
-    return -1;
-  };
-  int hidx = indexOf(headBody0);
-  if (hidx < 0) {
-    detail = Format("%s: the head was not adopted as debris on death",
+  if (mobs.LimbBody(id, head) != headBody0) {
+    detail = Format("%s: the head did not stay the corpse's own on death",
                     t.defName.c_str());
     mobs.Reset();
     c.debris.Reset();
     return Status::Fail;
   }
-  // WHERE THE NECK JOINT IS, asked of physics rather than of the rig: the rig
-  // is gone, and the joint knows its own anchor (Physics::JointsOn).
+  // WHERE THE NECK JOINT IS, asked of physics: the joint knows its own anchor
+  // (Physics::JointsOn), and the corpse has fallen over since it was posed.
   std::vector<Physics::BodyJoint> js;
-  c.phys.JointsOn(c.debris.BodyHandle((uint32_t)hidx), js);
+  c.phys.JointsOn(headBody0, js);
   uint64_t neckJoint = 0;
   Vec3 anchorW{};
   for (const Physics::BodyJoint& j : js)
@@ -1712,10 +1656,9 @@ Status GateCorpseDismember(Ctx& c, std::string& detail) {
       neckJoint = j.joint;
       // THROUGH THE BODY'S OWN ROTATION. The anchor is body-local and a corpse
       // has just fallen over; adding it to the position alone puts the blow
-      // somewhere off in the air, which is how this gate first measured 60
-      // cuts that removed 17 voxels between them.
+      // somewhere off in the air.
       BodyTransform hx{};
-      c.phys.GetTransform(c.debris.BodyHandle((uint32_t)hidx), hx);
+      c.phys.GetTransform(headBody0, hx);
       const Quat hq{hx.quat[0], hx.quat[1], hx.quat[2], hx.quat[3]};
       anchorW = hx.pos + QuatRotate(hq, j.anchorLocalVox);
       break;
@@ -1734,33 +1677,33 @@ Status GateCorpseDismember(Ctx& c, std::string& detail) {
   const int kCap = (int)BaselineNumber("corpseDismemberMaxCuts", 60);
   const float kPower = 1.0f, kHeft = 1.5f, kRadius = 0.9f;
   std::vector<ParticleSpawn> spawns;
-  const uint32_t vox0 = c.debris.BodyVoxelCount((uint32_t)hidx);
-  // THE NUMBER THAT ACTUALLY DECIDES (DebrisSystem::PartJointsAt): how much
-  // flesh is within the hold radius of the anchor. Reported at both ends, so a
-  // gate that fails says WHY instead of saying the head stayed on.
+  const uint32_t vox0 = mobs.LimbArtVoxelCount(id, head);
+  // THE NUMBER THAT ACTUALLY DECIDES: how much flesh is within the hold radius
+  // of the joint. Reported at both ends, so a gate that fails says WHY instead
+  // of saying the head stayed on.
   const float hold = CurrentTuning().gore.corpseJointHold;
-  const uint32_t held0 = c.debris.VoxelsNearWorld(
-      c.debris.BodyHandle((uint32_t)hidx), anchorW, hold);
+  const uint32_t held0 = mobs.LimbVoxelsNearWorld(id, head, anchorW, hold);
   int cuts = 0;
   bool parted = false;
-  for (int i = 0; i < kCap && !parted && hidx >= 0; i++) {
+  uint64_t lastHead = headBody0;   // the handle the head had at the last cut
+  for (int i = 0; i < kCap && !parted; i++) {
+    const uint64_t hNow = mobs.LimbBody(id, head);
+    if (!hNow) break;
+    lastHead = hNow;
     // ---- A CHOP LANDS ON MATTER, NOT ON A COORDINATE --------------------
     //
     // The blade meets the body at its SURFACE nearest the joint and travels
-    // INTO the joint from there. Aiming at the anchor itself put 56 of 60
-    // blows in the air (the anchor sits at the boundary between two bodies,
-    // which is exactly where neither one's lattice is), and the kerf's entry
-    // snap only reaches about a voxel. Re-derived every blow, so a second
-    // chop lands in the groove the first one opened — which is what makes
-    // this a repeated chop at one place rather than a stipple.
-    const uint64_t hNow0 = c.debris.BodyHandle((uint32_t)hidx);
-    const Vec3 surf = c.debris.NearestVoxelWorld(hNow0, anchorW);
+    // INTO the joint from there. Aiming at the anchor itself puts the blow in
+    // the air (the anchor sits at the boundary between two bodies, which is
+    // exactly where neither one's lattice is), and the kerf's entry snap only
+    // reaches about a voxel. Re-derived every blow, so a second chop lands in
+    // the groove the first one opened.
+    const Vec3 surf = mobs.LimbNearestVoxelWorld(id, head, anchorW);
     Vec3 into = anchorW - surf;
     if (into.len() < 1e-3f) into = Vec3{0, -1, 0};
     into = into.normalized();
     KerfCut cut;
     cut.at = surf;
-    // The edge across the travel: any perpendicular will do for a chop.
     Vec3 edge = into.cross(Vec3{0, 1, 0});
     if (edge.len() < 0.15f) edge = into.cross(Vec3{1, 0, 0});
     cut.edgeAxis = edge.normalized();
@@ -1770,26 +1713,59 @@ Status GateCorpseDismember(Ctx& c, std::string& detail) {
     cut.length = g.cutLength * (0.4f + 0.6f * kPower) * kHeft;
     cut.power = kPower;
     cut.seed = 0xBEEFu + (uint32_t)i * 40503u;
-    c.debris.CutBody(c.debris.BodyHandle((uint32_t)hidx), cut, c.world, spawns);
+    {
+      // What melee opens around every blade blow: it is what marks a sever
+      // `byBlade`, the cause the dismember cue switches on.
+      MobSystem::BladeCutScope blade(mobs, kPower);
+      mobs.CutLimb(hNow, cut, c.world, spawns);
+    }
     spawns.clear();
     cuts++;
-    // The joint is gone when nothing on the head answers to it any more.
-    const uint64_t hNow = c.debris.BodyHandle((uint32_t)hidx);
-    c.phys.JointsOn(hNow, js);
-    parted = true;
-    for (const Physics::BodyJoint& j : js)
-      if (j.joint == neckJoint) parted = false;
-    if (c.debris.BodyVoxelCount((uint32_t)hidx) == 0) break;
+    // The head is off when it is no longer one of the corpse's limbs. (The
+    // joint's own id is no test: a carve that rebuilds the head's collider
+    // re-makes its joint under a new id while the head is still on.)
+    parted = mobs.LimbBody(id, head) == 0;
   }
-  const uint32_t vox1 = hidx >= 0 ? c.debris.BodyVoxelCount((uint32_t)hidx) : 0;
+  // Where the head went: a severed piece is loose dead flesh (DebrisSystem).
+  auto indexOf = [&](uint64_t h) -> int {
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
+      if (c.debris.BodyHandle(i) == h) return (int)i;
+    return -1;
+  };
+  uint64_t headNow = mobs.LimbBody(id, head);
+  int hidx = -1;
+  // The severed head keeps the handle it had at the cut (DetachLimb hands the
+  // same body to DebrisSystem); the nearest dead flesh to the joint is the
+  // fallback for a piece a carve rebuilt on its way out.
+  if (!headNow) hidx = indexOf(lastHead);
+  if (!headNow && hidx < 0) {
+    float best = 1e30f;
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++) {
+      const uint64_t h = c.debris.BodyHandle(i);
+      if (!c.debris.BodyIsDeadFlesh(h)) continue;
+      const float d = (c.debris.BodyPosition(i) - anchorW).len();
+      if (d < best) { best = d; hidx = (int)i; }
+    }
+  }
+  if (!headNow && hidx >= 0) headNow = c.debris.BodyHandle((uint32_t)hidx);
+  const uint32_t vox1 = hidx >= 0 ? c.debris.BodyVoxelCount((uint32_t)hidx)
+                                  : mobs.LimbArtVoxelCount(id, head);
   const uint32_t held1 =
-      hidx >= 0 ? c.debris.VoxelsNearWorld(
-                      c.debris.BodyHandle((uint32_t)hidx), anchorW, hold)
-                : 0;
+      hidx >= 0 ? c.debris.VoxelsNearWorld(headNow, anchorW, hold)
+                : mobs.LimbVoxelsNearWorld(id, head, anchorW, hold);
   const uint32_t jointsAfter = c.phys.JointCount();
 
   // ---- WHAT THE ROOM HEARD -------------------------------------------------
+  // The sever queue (MobSystem::SeverEvents) for the corpse, and the debris
+  // gore queue for anything its pieces reported on their own.
   int goreEvents = 0, severEvents = 0, bladeEvents = 0, named = 0;
+  for (const MobSystem::SeverEvent& se : mobs.SeverEvents()) {
+    if (se.mobId != id) continue;
+    goreEvents++;
+    severEvents++;
+    if (se.byBlade) bladeEvents++;
+    if (se.defIndex >= 0 && se.defIndex < (int)mobs.Defs().size()) named++;
+  }
   for (const DebrisSystem::GoreEvent& ge : c.debris.GoreEvents()) {
     goreEvents++;
     if (ge.severed) severEvents++;
@@ -1797,8 +1773,7 @@ Status GateCorpseDismember(Ctx& c, std::string& detail) {
     if (ge.defIndex >= 0 && ge.defIndex < (int)mobs.Defs().size()) named++;
   }
   const bool headBleeds = hidx >= 0 && c.debris.BodyWoundOpen((uint32_t)hidx);
-  const int nidx = indexOf(neckBody0);
-  const bool neckBleeds = nidx >= 0 && c.debris.BodyWoundOpen((uint32_t)nidx);
+  const bool neckBleeds = mobs.LimbWoundOpen(id, neck);
 
   RecordObserved("corpseDismemberCuts", (double)cuts);
   const bool ok = parted && cuts <= kCap && jointsAfter < jointsAtDeath &&
@@ -1889,6 +1864,7 @@ Status GateHitDrive(Ctx& c, std::string& detail) {
     // blow — and a gate that asserts a false thing teaches it.
     float hpDrop = 0.0f;
     bool owned = false;    // the mob still holds this body
+    bool deadRig = false;  // ...and that mob is a corpse (not a creature)
     bool voiced = false;   // the creature had something to say about it
   };
   Arm arms[3] = {{"standing"}, {"limp"}, {"dead"}};
@@ -1941,8 +1917,9 @@ Status GateHitDrive(Ctx& c, std::string& detail) {
         MobSystem::BladeCutScope blade(mobs, 1.0f);
         if (torso) mobs.Damage(torso, 1.0e6f, mid, 45.0f);
       }
-      // Die() hands every limb to DebrisSystem WITHOUT changing its handle,
-      // so the one measured above is still the body that was just adopted.
+      // Die() keeps the rig (docs/PLAN_corpse_is_a_mob.md) and flips it
+      // dynamic without changing a handle, so the one measured above is still
+      // the corpse's limb.
       for (int i = 0; i < 2; i++) step(3200u + (uint32_t)i);
     }
     if (!body) {
@@ -1998,6 +1975,7 @@ Status GateHitDrive(Ctx& c, std::string& detail) {
     arms[a].dv = (v1 - v0).len();
     arms[a].dw = (w1 - w0).len();
     arms[a].owned = mobs.LimbBody(id, t.limb) == body;
+    arms[a].deadRig = arms[a].owned && !mobs.IsAlive(id);
     const float hp1 = arms[a].owned ? mobs.LimbHp(id, t.limb) : 0.0f;
     arms[a].hpDrop = arms[a].owned ? std::max(0.0f, hp0 - hp1) : 0.0f;
     arms[a].voiced = mobs.VoiceEvents().size() > voi0;
@@ -2023,13 +2001,14 @@ Status GateHitDrive(Ctx& c, std::string& detail) {
   // The REACTION is shared because it is a fact about drive; the BLOW is not,
   // because physiology is a fact about being alive. A limp creature is still
   // a creature: the mob still owns the body, the blow still costs hp, and it
-  // still has something to say. A corpse's limb belongs to DebrisSystem, has
-  // no hp to lose and says nothing. Asserting both halves is what keeps the
-  // unification honest — it would otherwise be one short step from "the dead
-  // and the merely knocked-down are the same thing", which they are not.
+  // still has something to say. A corpse's limb is a DEAD Mob's (it keeps its
+  // rig, docs/PLAN_corpse_is_a_mob.md): it has no hp to lose and says nothing.
+  // Asserting both halves is what keeps the unification honest — it would
+  // otherwise be one short step from "the dead and the merely knocked-down are
+  // the same thing", which they are not.
   const bool livingHurt = arms[0].hpDrop > 0.0f && arms[1].hpDrop > 0.0f &&
                           arms[0].owned && arms[1].owned;
-  const bool deadIsNot = !arms[2].owned && arms[2].hpDrop <= 0.0f &&
+  const bool deadIsNot = arms[2].deadRig && arms[2].hpDrop <= 0.0f &&
                          !arms[2].voiced;
   RecordObserved("hitDriveLimpDeltaVox", (double)arms[1].dv);
   RecordObserved("hitDriveDeadDeltaVox", (double)arms[2].dv);
@@ -2040,7 +2019,7 @@ Status GateHitDrive(Ctx& c, std::string& detail) {
       "REACTION (shared, by drive): standing dynamic=%d dv=%.2f dw=%.2f | limp "
       "dynamic=%d dv=%.2f dw=%.2f | dead dynamic=%d dv=%.2f dw=%.2f. "
       "PHYSIOLOGY (not shared): standing owned=%d hp-%.1f voice=%d | limp "
-      "owned=%d hp-%.1f voice=%d | dead owned=%d hp-%.1f voice=%d "
+      "owned=%d hp-%.1f voice=%d | dead owned-by-corpse=%d hp-%.1f voice=%d "
       "(floor %.2f vox/s, impulse %.0f kg*m/s)",
       t.defName.c_str(), t.limbName.c_str(), (double)mace.blunt,
       arms[0].dynamic ? 1 : 0, (double)arms[0].dv, (double)arms[0].dw,
@@ -2048,7 +2027,7 @@ Status GateHitDrive(Ctx& c, std::string& detail) {
       arms[2].dynamic ? 1 : 0, (double)arms[2].dv, (double)arms[2].dw,
       arms[0].owned ? 1 : 0, (double)arms[0].hpDrop, arms[0].voiced ? 1 : 0,
       arms[1].owned ? 1 : 0, (double)arms[1].hpDrop, arms[1].voiced ? 1 : 0,
-      arms[2].owned ? 1 : 0, (double)arms[2].hpDrop, arms[2].voiced ? 1 : 0,
+      arms[2].deadRig ? 1 : 0, (double)arms[2].hpDrop, arms[2].voiced ? 1 : 0,
       (double)kMin, (double)fx.hitReactImpulse);
   return ok ? Status::Pass : Status::Fail;
 }
@@ -2342,16 +2321,38 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   double worstStepMs = 0.0;
   int worstStepTick = -1;
   const int kTicks = 180;
+  // THE CORPSE'S PIECES, EVERY TICK: the dead Mob's own limbs (a corpse keeps
+  // its rig, docs/PLAN_corpse_is_a_mob.md) by rig slot, and the loose pieces
+  // that came off it before it died (the severed limb and its shells) as the
+  // debris bodies they are. `follower` is a slot or body whose pose is its
+  // host's (a worn shell on the corpse, a strapped shell on a loose piece).
+  struct PieceNow {
+    uint64_t h;
+    Vec3 p;
+    bool follower;
+  };
+  auto piecesNow = [&]() {
+    std::vector<PieceNow> out;
+    const Mob* dead = mobs.FindMobById(id);
+    for (int li = 0; dead && li < dead->LimbCount(); li++)
+      if (const uint64_t h = mobs.LimbBody(id, li))
+        out.push_back({h, mobs.LimbPosition(id, li), dead->WornHostOf(li) >= 0});
+    for (uint32_t b = 0; b < c.debris.BodyCount(); b++) {
+      const uint64_t h = c.debris.BodyHandle(b);
+      if (!mine.count(h)) continue;   // not this corpse: see above
+      out.push_back({h, c.debris.BodyPosition(b), c.debris.WornHostOf(h) != 0});
+    }
+    return out;
+  };
   for (int i = 0; i < kTicks; i++) {
     double ms = 0.0;
     step(&ms);
     if (ms > worstStepMs) { worstStepMs = ms; worstStepTick = i; }
     Vec3 anchor{};
     bool haveAnchor = false;
-    for (uint32_t b = 0; b < c.debris.BodyCount(); b++) {
-      const uint64_t h = c.debris.BodyHandle(b);
-      if (!mine.count(h)) continue;   // not this corpse: see above
-      const Vec3 p = c.debris.BodyPosition(b);
+    for (const PieceNow& pn : piecesNow()) {
+      const uint64_t h = pn.h;
+      const Vec3 p = pn.p;
       // A FOLLOWER IS NOT A SECOND BODY, SO IT IS NOT A SECOND SAMPLE. Its
       // velocity is not a measurement of anything: DriveStraps WRITES its
       // host's rigid-body velocity into it every tick, so a shell on a limb
@@ -2362,7 +2363,7 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
       // still counts toward `spread`, because "did the armour stay on the
       // corpse" is a real question about a real body.
       Vec3 lin{}, ang{};
-      if (!c.debris.WornHostOf(h) && c.phys.GetBodyVelocities(h, lin, ang)) {
+      if (!pn.follower && c.phys.GetBodyVelocities(h, lin, ang)) {
         const float sp = lin.len(), sq = ang.len();
         if (sp > maxSpeed) {
           maxSpeed = sp;
@@ -2401,9 +2402,7 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   if (proxy) c.phys.RemoveBody(proxy);
 
   const Physics::RunawayProbe net = c.phys.Runaway();
-  uint32_t ours = 0;
-  for (uint32_t b = 0; b < c.debris.BodyCount(); b++)
-    if (mine.count(c.debris.BodyHandle(b))) ours++;
+  const uint32_t ours = (uint32_t)piecesNow().size();
 
   // ---- THE MOTOR ITSELF, NOT ITS SYMPTOM ----------------------------------
   //
@@ -2421,7 +2420,20 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   // (SANDVOX_NO_RIGWELD=1) restores the jointed shape deliberately, and is
   // recognised by there being no straps at all rather than by a second env
   // read: with the arm on, `strapped` is 0 and the joint claim is not made.
+  // A shell still on the corpse is a FOLLOWER of its limb (MobLimb::wornHost,
+  // driven by DriveWornShells exactly as in life); one that left on the
+  // severed limb is strapped to that piece (DebrisSystem::StrapBody). Both are
+  // "strapped", and neither may carry a joint.
   uint32_t shellsLeft = 0, shellJoints = 0, shellsStrapped = 0;
+  if (const Mob* dead = mobs.FindMobById(id)) {
+    for (int sIdx = bareLimbs; sIdx < dead->LimbCount(); sIdx++) {
+      const uint64_t h = mobs.LimbBody(id, sIdx);
+      if (!h || dead->LimbDefAt(sIdx).tag != "worn") continue;
+      shellsLeft++;
+      shellJoints += c.phys.JointCount(h);
+      if (dead->WornHostOf(sIdx) >= 0) shellsStrapped++;
+    }
+  }
   for (uint32_t b = 0; b < c.debris.BodyCount(); b++) {
     const uint64_t h = c.debris.BodyHandle(b);
     if (!shellBodies.count(h)) continue;
@@ -2468,11 +2480,10 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
     // longer existed). These two are owned by nothing, so they last exactly as
     // long as this block.
     Vec3 at{400.0f, 200.0f, 400.0f};
-    for (uint32_t b = 0; b < c.debris.BodyCount(); b++)
-      if (mine.count(c.debris.BodyHandle(b))) {
-        at = c.debris.BodyPosition(b);
-        break;
-      }
+    {
+      const std::vector<PieceNow> ps = piecesNow();
+      if (!ps.empty()) at = ps.front().p;
+    }
     const Vec3 hi{at.x, at.y + 24.0f, at.z};
     const uint64_t a = c.phys.CreateSphereBody(hi, 2.0f, 2000.0f, Vec3{});
     const uint64_t b =
@@ -2547,7 +2558,7 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   detail = Format(
       "%s: %d base limbs + %d shells from %d worn pieces, %u joints dressed; "
       "%s cut off in %d strokes (severed=%d), died=%d with %u joints, %u of "
-      "its %u debris bodies left (%u were in the world before it); "
+      "its %u bodies left (%u debris bodies were in the world before it); "
       "%u shells still bodies, %u strapped to their limb, %u joints on them "
       "(%s); over %d "
       "corpse ticks the fastest piece hit %.1f vox/s on "
@@ -2590,8 +2601,10 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
 //   C. those wounds pay out from where each piece is (blood attributed to the
 //      nearer of the two wounds), and then close: a corpse does not pump.
 //   D. a cut on the corpse afterwards opens a wound again.
-// CPU only: no tick is submitted. The debris system's own PreTick drains the
-// wounds, exactly as main.cpp calls it.
+// The head is loose dead flesh (DebrisSystem) once it is off; the corpse it
+// came off is a dead Mob that keeps its rig (docs/PLAN_corpse_is_a_mob.md),
+// so the neck's wound is the neck LIMB's, drained by the corpse's own
+// BleedTick with the living's pump switched off.
 Status GateCorpseBleed(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -2691,14 +2704,21 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
       if (c.debris.BodyHandle(i) == h) return (int)i;
     return -1;
   };
-  const int hi0 = indexOf(headBody), ni0 = indexOf(neckBody);
-  const bool headOff = hi0 >= 0 && c.phys.JointCount(headBody) == 0;
-  const bool bothWounded = hi0 >= 0 && ni0 >= 0 &&
+  // The neck stays ON the corpse, as its own limb: present = still attached.
+  auto neckOn = [&]() { return mobs.LimbBody(id, neck) != 0; };
+  const int hi0 = indexOf(headBody);
+  const bool ni0 = neckOn();
+  const bool headOff = hi0 >= 0 && c.phys.JointCount(headBody) == 0 &&
+                       mobs.LimbBody(id, head) == 0;
+  const bool bothWounded = hi0 >= 0 && ni0 &&
                            c.debris.BodyWoundOpen((uint32_t)hi0) &&
-                           c.debris.BodyWoundOpen((uint32_t)ni0);
+                           mobs.LimbWoundOpen(id, neck);
   const float headBudget0 = hi0 >= 0 ? c.debris.BodyWoundBudget((uint32_t)hi0) : 0.0f;
-  const float neckBudget0 = ni0 >= 0 ? c.debris.BodyWoundBudget((uint32_t)ni0) : 0.0f;
-  const uint32_t wounded0 = c.debris.WoundedBodyCount();
+  const float neckBudget0 = ni0 ? mobs.LimbBleedBudget(id, neck) : 0.0f;
+  auto woundedNow = [&]() {
+    return c.debris.WoundedBodyCount() + mobs.WoundedLimbCount(id);
+  };
+  const uint32_t wounded0 = woundedNow();
 
   // ---- C. each piece bleeds from where it is, then the wounds close -------
   uint32_t tick = 61000;
@@ -2715,28 +2735,30 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> sp;
     std::vector<CellOp> cellOps;
-    mobs.PreTick(tick + 1, c.world, ops, cellOps, sp);  // sweeps the husk
-    const size_t fromMobs = sp.size();
-    const int hi = indexOf(headBody), ni = indexOf(neckBody);
+    // The corpse's own tick drains the NECK (Mob::BleedTick on a dead Mob);
+    // the debris tick drains the severed head. Both streams are counted.
+    mobs.PreTick(tick + 1, c.world, ops, cellOps, sp);
+    const int hi = indexOf(headBody);
+    const bool ni = neckOn();
     const Vec3 hw = hi >= 0 ? c.debris.BodyWoundWorld((uint32_t)hi) : Vec3{};
-    const Vec3 nw = ni >= 0 ? c.debris.BodyWoundWorld((uint32_t)ni) : Vec3{};
-    if (ni >= 0) {
-      neckLast = c.debris.BodyPosition((uint32_t)ni);
+    const Vec3 nw = ni ? mobs.LimbWoundWorld(id, neck) : Vec3{};
+    if (ni) {
+      neckLast = mobs.LimbPosition(id, neck);
       if (i == 0) neckFirst = neckLast;
-      neckBudgetAtGone = c.debris.BodyWoundBudget((uint32_t)ni);
+      neckBudgetAtGone = mobs.LimbBleedBudget(id, neck);
     } else if (neckGoneTick < 0) {
       neckGoneTick = i;
     }
     if (hi < 0 && headGoneTick < 0) headGoneTick = i;
     c.debris.QueueSupportEvents(c.world.Snap());
     c.debris.PreTick(tick + 1, c.world, cellOps, sp);
-    for (size_t k = fromMobs; k < sp.size(); k++) {
+    for (size_t k = 0; k < sp.size(); k++) {
       const ParticleSpawn& p = sp[k];
       if ((p.payload & 0xFFFu) != (bleedMat & 0xFFFu)) continue;
       const Vec3 at{(float)p.px / 256.0f, (float)p.py / 256.0f,
                     (float)p.pz / 256.0f};
       const float dh = hi >= 0 ? (at - hw).len() : 1e9f;
-      const float dn = ni >= 0 ? (at - nw).len() : 1e9f;
+      const float dn = ni ? (at - nw).len() : 1e9f;
       if (dh < dn) bloodHead += 1.0; else bloodNeck += 1.0;
     }
     // A REAL TICK, because the corpse needs ground: debris terrain meshes are
@@ -2751,27 +2773,27 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
     c.phys.Step(kTickDt);
     c.debris.PostStep();
     mobs.PostStep();
-    if (closedTick < 0 && c.debris.WoundedBodyCount() == 0) {
+    if (closedTick < 0 && woundedNow() == 0) {
       closedTick = i;
       // ---- D. a cut on the corpse opens a wound again ----------------------
-      // The moment every wound has paid out (a settled body has folded into
-      // the grid and cannot be cut), at the neck's own wound point (a point
-      // ON the body), the sword's kerf. MeltBodyAt rebuilds the collider,
-      // which replaces the handle; the INDEX survives unless the body was
-      // destroyed, so the wound is read back by index.
-      const int ni1 = indexOf(neckBody);
-      if (ni1 < 0) {
+      // The moment every wound has paid out, at the neck's own wound point (a
+      // point ON the limb), the laser's sphere carve — the melt dead flesh has
+      // always taken. A carve rebuilds the collider, which replaces the
+      // handle; the rig slot is the identity, so the wound is read back by
+      // limb index.
+      if (!neckOn()) {
         cutSkipped = true;
       } else {
-        const Vec3 at = c.debris.BodyWoundWorld((uint32_t)ni1);
-        melted = c.debris.MeltBodyAt(neckBody, at, 1.5f, c.world, spawns);
+        neckBody = mobs.LimbBody(id, neck);
+        const Vec3 at = mobs.LimbWoundWorld(id, neck);
+        melted = mobs.CarveLimbRadial(neckBody, at, 1.5f, /*ragged=*/false,
+                                      /*eject=*/false, c.world, spawns);
         spawns.clear();
-        reopened = melted && c.debris.BodyWoundOpen((uint32_t)ni1) &&
-                   c.debris.BodyWoundBudget((uint32_t)ni1) > 0.0f;
-        neckBody = c.debris.BodyHandle((uint32_t)ni1);  // the rebuild replaced it
+        reopened = melted && mobs.LimbWoundOpen(id, neck) &&
+                   mobs.LimbBleedBudget(id, neck) > 0.0f;
+        neckBody = mobs.LimbBody(id, neck);  // the rebuild replaced it
       }
-    } else if (closedTick >= 0 && closedAgainTick < 0 &&
-               c.debris.WoundedBodyCount() == 0) {
+    } else if (closedTick >= 0 && closedAgainTick < 0 && woundedNow() == 0) {
       closedAgainTick = i;
     }
   }
@@ -2793,16 +2815,16 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
       "%s: soak on %s (armed=%d): %u exposed (rate %.3f) vs %u buried "
       "(rate %.3f), %u "
       "non-tissue stained; died of '%s', head off=%d, head wound=%d (%.0f vox) "
-      "neck wound=%d (%.0f vox), %u wounded bodies; over %d ticks the head "
+      "neck wound=%d (%.0f vox), %u wounded bodies/limbs; over %d ticks the head "
       "shed %.0f blood spawns and the neck %.0f, wounds closed at t+%d; corpse "
       "cut %s, closed again at t+%d; neck body gone at t+%d (budget %.0f left, "
       "moved %.1f vox, last y %.1f), head body gone at t+%d, %u bodies at end",
       t.defName.c_str(), t.limbName.c_str(), wantSoak ? 1 : 0, stainedExposed,
       rateExposed, stainedBuried, rateBuried, nonTissueStained, cause.c_str(),
       headOff ? 1 : 0, hi0 >= 0 ? 1 : 0,
-      headBudget0, ni0 >= 0 ? 1 : 0, neckBudget0, wounded0, window, bloodHead,
+      headBudget0, ni0 ? 1 : 0, neckBudget0, wounded0, window, bloodHead,
       bloodNeck, closedTick,
-      cutSkipped ? "skipped (the torso had settled into the grid)"
+      cutSkipped ? "skipped (the neck had left the corpse)"
                  : (reopened ? "reopened the wound" : "did NOT reopen the wound"),
       closedAgainTick, neckGoneTick, neckBudgetAtGone,
       (neckLast - neckFirst).len(), neckLast.y, headGoneTick, bodiesAtEnd);
@@ -2954,37 +2976,84 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
     }
   }
   const std::string cause = mobs.DeathCause(id);
-  // The husk is swept on the next PreTick; the bodies are already debris.
-  auto sumOf = [&](uint32_t bi, const uint32_t* mats, size_t n) {
+  // THE CORPSE IS THE DEAD MOB (docs/PLAN_corpse_is_a_mob.md): its limbs are
+  // still its own and burn in the living limb pass, and anything the fire took
+  // off it while it lived (a limb burnt through) is loose dead flesh in
+  // DebrisSystem. A PIECE is either: a rig slot of the corpse (stable identity:
+  // the slot index), or a debris body (tracked by handle, as before).
+  const Mob* deadMob = mobs.FindMobById(id);
+  const int nSlots = deadMob ? deadMob->LimbCount() : 0;
+  auto sumMats = [&](bool limb, int li, uint32_t bi, const uint32_t* mats,
+                     size_t n) {
     uint32_t s = 0;
-    for (size_t k = 0; k < n; k++)
-      if (mats[k]) s += c.debris.BodyMaterialCount(bi, mats[k]);
+    for (size_t k = 0; k < n; k++) {
+      if (!mats[k]) continue;
+      s += limb ? mobs.LimbMaterialCount(id, li, mats[k])
+                : c.debris.BodyMaterialCount(bi, mats[k]);
+    }
     return s;
   };
-  auto alightOf = [&](uint32_t bi) { return sumOf(bi, alight, 3); };
-  auto spentOf = [&](uint32_t bi) { return sumOf(bi, spent, 4); };
-  // Pieces are tracked by HANDLE. A burn rebuild replaces the handle
+  auto limbAlight = [&](int li) { return sumMats(true, li, 0, alight, 3); };
+  auto limbSpent = [&](int li) { return sumMats(true, li, 0, spent, 4); };
+  auto alightOf = [&](uint32_t bi) { return sumMats(false, 0, bi, alight, 3); };
+  auto spentOf = [&](uint32_t bi) { return sumMats(false, 0, bi, spent, 4); };
+  auto limbOn = [&](int li) { return mobs.LimbBody(id, li) != 0; };
+  // Every body of the corpse, counted the same way on both sides.
+  auto bodyCount = [&]() {
+    uint32_t n = c.debris.BodyCount();
+    for (int li = 0; li < nSlots; li++) n += limbOn(li) ? 1u : 0u;
+    return n;
+  };
+  auto lowestY = [&]() {
+    float lo = 1e9f;
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
+      lo = std::min(lo, c.debris.BodyPosition(bi).y);
+    for (int li = 0; li < nSlots; li++)
+      if (limbOn(li)) lo = std::min(lo, mobs.LimbPosition(id, li).y);
+    return lo;
+  };
+  // Loose pieces are tracked by HANDLE. A burn rebuild replaces the handle
   // (ReplaceBody) and a piece burnt below body-worthiness is swap-removed, so
   // neither an index nor a handle is stable across the window; a piece whose
-  // handle is no longer present is matched by voxel count among the unclaimed
-  // bodies, and one that matches nothing has finished burning (gone).
+  // handle is no longer present is matched by position among the unclaimed
+  // bodies, and one that matches nothing has finished burning (gone). A rig
+  // slot needs none of that: its index IS its identity.
   struct Piece {
-    uint64_t handle;
-    uint32_t alight0, spent0, voxels0;
-    Vec3 pos;
+    bool limb = false;
+    int li = -1;
+    uint64_t handle = 0;
+    uint32_t alight0 = 0, spent0 = 0, voxels0 = 0;
+    Vec3 pos{};
     uint32_t alight1 = 0, spent1 = 0;
     bool matched = false, gone = false;
   };
   std::vector<Piece> pieces;
   uint32_t alight0 = 0, spent0 = 0;
-  for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
-    Piece p{c.debris.BodyHandle(bi), alightOf(bi), spentOf(bi),
-            c.debris.BodyVoxelCount(bi), c.debris.BodyPosition(bi)};
+  for (int li = 0; li < nSlots; li++) {
+    if (!limbOn(li)) continue;
+    Piece p;
+    p.limb = true;
+    p.li = li;
+    p.alight0 = limbAlight(li);
+    p.spent0 = limbSpent(li);
+    p.voxels0 = mobs.LimbArtVoxelCount(id, li);
+    p.pos = mobs.LimbPosition(id, li);
     alight0 += p.alight0;
     spent0 += p.spent0;
     pieces.push_back(p);
   }
-  const uint32_t bodies0 = c.debris.BodyCount();
+  for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
+    Piece p;
+    p.handle = c.debris.BodyHandle(bi);
+    p.alight0 = alightOf(bi);
+    p.spent0 = spentOf(bi);
+    p.voxels0 = c.debris.BodyVoxelCount(bi);
+    p.pos = c.debris.BodyPosition(bi);
+    alight0 += p.alight0;
+    spent0 += p.spent0;
+    pieces.push_back(p);
+  }
+  const uint32_t bodies0 = bodyCount();
 
   // ---- B + C. the corpse, alone with its own fire ---------------------------
   // WHERE THE BODIES WENT is recorded per tick (rule 6): "0 bodies at the
@@ -3011,9 +3080,15 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
   {
     const IVec3 b{ifloor(pyre.x), ifloor(pyre.y), ifloor(pyre.z)};
     Vec3 mean{};
-    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
+    uint32_t nMean = 0;
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++, nMean++)
       mean += c.debris.BodyPosition(bi);
-    if (c.debris.BodyCount()) mean = mean * (1.0f / (float)c.debris.BodyCount());
+    for (int li = 0; li < nSlots; li++)
+      if (limbOn(li)) {
+        mean += mobs.LimbPosition(id, li);
+        nMean++;
+      }
+    if (nMean) mean = mean * (1.0f / (float)nMean);
     const IVec3 org = c.world.WindowOrigin();
     fall += Format(" pyre (%.0f,%.0f,%.0f) bodies mean (%.0f,%.0f,%.0f) window "
                    "origin chunk (%d,%d,%d) pchunk (%d,%d,%d) pyre chunk in "
@@ -3039,22 +3114,17 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
   }
   for (int i = 0; i < window; i++) {
     if (i < 12 || i == 30 || i == 60) {
-      float lo = 1e9f;
-      for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
-        lo = std::min(lo, c.debris.BodyPosition(bi).y);
       uint32_t built = 0, unfetched = 0, empty = 0;
       c.debris.TerrainCensus(built, unfetched, empty);
-      fall += Format(" t+%d:y%.1f/%ub%uu%ue", i, lo, built, unfetched, empty);
+      fall += Format(" t+%d:y%.1f/%ub%uu%ue", i, lowestY(), built, unfetched,
+                     empty);
     }
     tickOnce(false);
-    if (c.debris.BodyCount() > 0) {
+    if (bodyCount() > 0) {
       lastBodyTick = i;
-      float lo = 1e9f;
-      for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
-        lo = std::min(lo, c.debris.BodyPosition(bi).y);
-      lastY = lo;
+      lastY = lowestY();
     }
-    if (i == window / 2) bodiesMid = c.debris.BodyCount();
+    if (i == window / 2) bodiesMid = bodyCount();
   }
   const uint32_t settled = c.debris.SettledBack() - settled0;
 
@@ -3065,15 +3135,27 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
     p.alight1 = alightOf(bi);
     p.spent1 = spentOf(bi);
   };
-  for (Piece& p : pieces)
+  for (Piece& p : pieces) {
+    if (!p.limb) continue;
+    // A limb that burnt through and left mid-window is matched as a loose
+    // piece below, by where it lay.
+    if (!limbOn(p.li)) continue;
+    p.matched = true;
+    p.alight1 = limbAlight(p.li);
+    p.spent1 = limbSpent(p.li);
+  }
+  for (Piece& p : pieces) {
+    if (p.matched || p.limb) continue;
     for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
       if (!claimed[bi] && c.debris.BodyHandle(bi) == p.handle) {
         claim(p, bi);
         break;
       }
-  // Handle gone: the piece was rebuilt (new handle) or burnt away. Match the
-  // nearest unclaimed body to where the piece lay; a still corpse does not
-  // travel, so anything farther than a body length is not it.
+  }
+  // Handle gone (or a limb that left the rig): the piece was rebuilt (new
+  // handle), cut loose, or burnt away. Match the nearest unclaimed body to
+  // where the piece lay; a still corpse does not travel, so anything farther
+  // than a body length is not it.
   for (Piece& p : pieces) {
     if (p.matched) continue;
     int best = -1;
@@ -3094,16 +3176,19 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
     alight1 += alightOf(bi);
     spent1 += spentOf(bi);
   }
+  for (int li = 0; li < nSlots; li++)
+    if (limbOn(li)) {
+      alight1 += limbAlight(li);
+      spent1 += limbSpent(li);
+    }
   // Every piece that died with a real ember count must have MOVED: fewer
   // alight or more spent. Not "retired half of it" -- a corpse with fire on
   // it burns THROUGH, cooked flesh under the char catching from the embers
   // beside it, so the alight count on a piece can hold or climb for hundreds
-  // of ticks while the char under it grows; measured 6,155 -> 1,872 alight
-  // and 3,090 -> 7,880 spent over the window, with 6,066 fire ops emitted.
-  // What must never happen is a piece whose numbers do not change at all,
-  // which is the starved body the report describes. 8 is the floor: a piece
-  // with three embers on it can lose them all to the dice or keep them all,
-  // and neither says anything.
+  // of ticks while the char under it grows. What must never happen is a piece
+  // whose numbers do not change at all, which is the starved body the report
+  // describes. 8 is the floor: a piece with three embers on it can lose them
+  // all to the dice or keep them all, and neither says anything.
   std::string stalled;
   uint32_t stalledCount = 0, litPieces = 0;
   for (const Piece& p : pieces) {
@@ -3113,8 +3198,9 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
     if (p.alight1 * 2 > p.alight0 && p.spent1 <= p.spent0) {
       stalledCount++;
       if (stalled.size() < 200)
-        stalled += Format(" [%u vox: %u->%u alight, %u->%u spent]", p.voxels0,
-                          p.alight0, p.alight1, p.spent0, p.spent1);
+        stalled += Format(" [%s %u vox: %u->%u alight, %u->%u spent]",
+                          p.limb ? "limb" : "piece", p.voxels0, p.alight0,
+                          p.alight1, p.spent0, p.spent1);
     }
   }
   // ...and the corpse as a whole is retiring fire, not growing it: fewer
@@ -3135,17 +3221,13 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
   // in place and a release zeroes the record's dims and puts it back on the
   // free list. Two holders therefore means one of them is about to go INVISIBLE
   // (the other's release zeroed its dims) and the record is about to be handed
-  // to a third body that is still very much alive, which is how a shattering
-  // corpse used to take a living creature's torso with it. This is the shape
-  // the count check below cannot see: two bodies sharing a record whose payload
-  // happens to match one of their lattices disagree zero times.
+  // to a third body that is still very much alive.
   uint32_t bricks = 0, disagree = 0, sharedBricks = 0;
   std::string disagreeDetail;
   std::unordered_map<uint32_t, uint32_t> holdersOf;
   if (const MicroBodySet* set = c.debris.MicroSet()) {
-    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++) {
-      const uint32_t model = c.debris.BodyMicroModel(bi);
-      if (model == kMicroBodyNoModel || model >= set->models.size()) continue;
+    auto checkBrick = [&](uint32_t model, uint32_t latAlight, uint32_t latSpent) {
+      if (model == kMicroBodyNoModel || model >= set->models.size()) return;
       if (++holdersOf[model] == 2) sharedBricks++;
       const MicroBodyModelGpu& m = set->models[model];
       const uint32_t dx = m.dims & 1023u, dy = (m.dims >> 10) & 1023u,
@@ -3163,7 +3245,6 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
           if (s && mat == s) brickSpent++;
       }
       bricks++;
-      const uint32_t latAlight = alightOf(bi), latSpent = spentOf(bi);
       if (brickAlight != latAlight || brickSpent != latSpent) {
         disagree++;
         if (disagreeDetail.size() < 200)
@@ -3171,6 +3252,14 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
               Format(" [brick %u/%u vs lattice %u/%u alight/spent]",
                      brickAlight, brickSpent, latAlight, latSpent);
       }
+    };
+    for (uint32_t bi = 0; bi < c.debris.BodyCount(); bi++)
+      checkBrick(c.debris.BodyMicroModel(bi), alightOf(bi), spentOf(bi));
+    for (int li = 0; li < nSlots; li++) {
+      if (!limbOn(li)) continue;
+      const int32_t mm = mobs.LimbMicroModel(id, li);
+      if (mm < 0) continue;
+      checkBrick((uint32_t)mm, limbAlight(li), limbSpent(li));
     }
   }
   const bool drawn = disagree == 0 && sharedBricks == 0;
@@ -3184,7 +3273,7 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
 
   const bool died = deathTick >= 0;
   const bool ok = died && alight0 > 0 && advanced && emitted && drawn;
-  const uint32_t bodies1 = c.debris.BodyCount();
+  const uint32_t bodies1 = bodyCount();
   mobs.Reset();
   c.debris.Reset();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
@@ -3618,11 +3707,11 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
 // ---------------------------------------------------------------------------
 //
 // Owner report, 2026-09-22: "water doesn't clean the stains off corpses".
-// Nothing ran the contact pass on a corpse at all — Mob::StainTick walks a
-// creature's limbs, and from the tick it dies those limbs are DebrisSystem
-// bodies, so a corpse's coat froze at the moment of death. Now
-// MobSystem::StainCorpses runs the living's own StainOneLimb / DryOneLimb over
-// every dead-flesh body.
+// Nothing ran the contact pass on a corpse at all — Mob::StainTick walked a
+// creature's limbs, and from the tick it died those limbs were DebrisSystem
+// bodies, so a corpse's coat froze at the moment of death. A corpse is a dead
+// Mob now (docs/PLAN_corpse_is_a_mob.md) and gets the full StainTick — the
+// living's own contact, rain, drying and wet passes — from its own budget pot.
 //
 // Two claims, body-stain's phase 3 restated on the dead: the torso held in a
 // blood pool is BLOODIED (it can take a coat at all), and the same torso then
@@ -3657,34 +3746,28 @@ Status GateCorpseWash(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   // Killed the way corpse-intact kills: the root at zero is a death with every
-  // joint kept, so the torso becomes one dead-flesh body and stays one.
+  // joint kept, so the torso stays the corpse's own root limb.
+  const int root = def.rootLimb;
   {
-    const LimbAxis ax = MeasureLimb(mobs, id, def.rootLimb);
+    const LimbAxis ax = MeasureLimb(mobs, id, root);
     mobs.Damage(torso, 1.0e6f, ax.anchor, 0.0f);
   }
-  // By handle, and when a collider rebuild has replaced the handle, the
-  // largest body -- the torso is 3-4x any other piece of a human.
-  uint64_t torsoNow = torso;
-  auto indexOf = [&](uint64_t h) -> int {
-    (void)h;
-    int best = -1;
-    uint32_t bestN = 0;
-    for (uint32_t i = 0; i < c.debris.BodyCount(); i++) {
-      if (c.debris.BodyHandle(i) == torsoNow) return (int)i;
-      const uint32_t n = c.debris.BodyVoxelCount(i);
-      if (n > bestN) { bestN = n; best = (int)i; }
-    }
-    if (best >= 0) torsoNow = c.debris.BodyHandle((uint32_t)best);
-    return best;
+  // The torso by RIG SLOT: its identity survives every collider rebuild.
+  auto torsoOn = [&]() { return mobs.LimbBody(id, root) != 0; };
+  auto torsoCentre = [&]() {
+    Vec3 at{};
+    const Mob* m = mobs.FindMobById(id);
+    if (!m || !m->LimbCentreWorld(root, at)) at = mobs.LimbVoxelPos(id, root, 0);
+    return at;
   };
-  if (mobs.IsAlive(id) || indexOf(torso) < 0 || !c.debris.BodyIsDeadFlesh(torso)) {
-    detail = Format("%s: the torso did not become dead flesh on death",
+  if (mobs.IsAlive(id) || mobs.LimbBody(id, root) != torso) {
+    detail = Format("%s: the torso did not stay the corpse's own on death",
                     t.defName.c_str());
     mobs.Reset();
     c.debris.Reset();
     return Status::Fail;
   }
-  const uint32_t coat0 = c.debris.BodyCoatCount((uint32_t)indexOf(torso), mBlood);
+  const uint32_t coat0 = mobs.LimbCoatMatCount(id, root, mBlood, 1);
 
   // One real tick with liquid written round the torso (body-stain's
   // liquidTick, with the mirror centred on the corpse rather than a limb).
@@ -3695,10 +3778,9 @@ Status GateCorpseWash(Ctx& c, std::string& detail) {
       std::vector<ParticleSpawn> spawns;
       std::vector<CellOp> cellOps;
       mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
-      const int idx = indexOf(torso);
       IVec3 centre = pchunk;
-      if (idx >= 0) {
-        const Vec3 at = c.debris.BodyPosition((uint32_t)idx);
+      if (torsoOn()) {
+        const Vec3 at = torsoCentre();
         const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
         centre = IVec3{b.x >> 4, b.y >> 4, b.z >> 4};
         for (int dy = -3; dy <= 3; dy++)
@@ -3722,12 +3804,11 @@ Status GateCorpseWash(Ctx& c, std::string& detail) {
       c.debris.PostStep();
       mobs.PostStep();
     }
-    const int idx = indexOf(torso);
-    return idx >= 0 ? c.debris.BodyCoatCount((uint32_t)idx, mBlood) : 0u;
+    return torsoOn() ? mobs.LimbCoatMatCount(id, root, mBlood, 1) : 0u;
   };
   const uint32_t pooled = soak(mBlood, 30);
   const uint32_t washed = soak(mWater, 60);
-  const bool present = indexOf(torso) >= 0;
+  const bool present = torsoOn();
 
   RecordObserved("corpseWashPooled", (double)pooled);
   RecordObserved("corpseWashWashed", (double)washed);
@@ -3744,7 +3825,7 @@ Status GateCorpseWash(Ctx& c, std::string& detail) {
       "%s torso (dead): blood coat %u -> %u in the pool (need more), -> %u "
       "after water (cap %.0f%% of the pool)%s",
       t.defName.c_str(), coat0, pooled, washed, washFrac * 100.0,
-      present ? "" : "; the torso body was lost mid-test (handle changed?)");
+      present ? "" : "; the torso left the corpse mid-test");
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -3753,8 +3834,9 @@ Status GateCorpseWash(Ctx& c, std::string& detail) {
 // had and the dead did not (owner report 2026-09-22)
 // ---------------------------------------------------------------------------
 //
-// From the tick a creature dies its limbs are DebrisSystem bodies, and three
-// mechanisms that lived only in the creature's own passes stopped:
+// From the tick a creature died its limbs WERE DebrisSystem bodies, and three
+// mechanisms that lived only in the creature's own passes stopped (a corpse is
+// a dead Mob now, docs/PLAN_corpse_is_a_mob.md, and runs those passes itself):
 //   * HEAT ACROSS A JOINT (Mob::BuildCrossLimbHeat) -- a burning torso on the
 //     ground did not light the thighs jointed to it.
 //   * ARMOUR -- a corpse in plate burnt and dissolved as if naked, because the
@@ -3798,20 +3880,28 @@ struct DeadFixture {
     c.debris.PostStep();
     c.mobs.PostStep();
   }
-  // The torso body now: tracked by handle, and when a burn rebuild replaced
-  // the handle, the largest body is the torso (it is 3-4x any other piece).
+  // THE TORSO IS THE CORPSE'S ROOT LIMB, addressed by rig slot: a burn or a
+  // carve rebuilds its collider under a new handle, and the slot is the one
+  // identity that survives it. -1 once it has left the corpse.
+  int root = -1;
   int TorsoIndex() {
-    int best = -1;
-    uint32_t bestN = 0;
-    for (uint32_t i = 0; i < c.debris.BodyCount(); i++) {
-      if (c.debris.BodyHandle(i) == torso) return (int)i;
-      // Dead flesh only: a strapped cuirass can outweigh the torso it covers.
-      if (!c.debris.BodyIsDeadFlesh(c.debris.BodyHandle(i))) continue;
-      const uint32_t n = c.debris.BodyVoxelCount(i);
-      if (n > bestN) { bestN = n; best = (int)i; }
-    }
-    if (best >= 0) torso = c.debris.BodyHandle((uint32_t)best);
-    return best;
+    if (root < 0) return -1;
+    torso = c.mobs.LimbBody(id, root);
+    return torso ? root : -1;
+  }
+  uint32_t TorsoVoxels() {
+    return TorsoIndex() >= 0 ? c.mobs.LimbArtVoxelCount(id, root) : 0u;
+  }
+  uint32_t TorsoCoat(uint32_t mat) {
+    return TorsoIndex() >= 0 ? c.mobs.LimbCoatMatCount(id, root, mat, 1) : 0u;
+  }
+  // The middle of the torso's box through its live pose (a limb's transform
+  // origin is its lattice CORNER, which is no place to aim a splash).
+  Vec3 TorsoCentre() {
+    Vec3 at{};
+    const Mob* m = c.mobs.FindMobById(id);
+    if (!m || !m->LimbCentreWorld(root, at)) at = c.mobs.LimbVoxelPos(id, root, 0);
+    return at;
   }
   bool Make(int inset, uint32_t tick0, const char* wear = nullptr) {
     MobSystem& mobs = c.mobs;
@@ -3838,11 +3928,12 @@ struct DeadFixture {
       }
     }
     for (int i = 0; i < 8; i++) Step();
+    root = def.rootLimb;
     torso = mobs.LimbBody(id, def.rootLimb);
     const LimbAxis ax = MeasureLimb(mobs, id, def.rootLimb);
     mobs.Damage(torso, 1.0e6f, ax.anchor, 0.0f);
-    if (mobs.IsAlive(id) || !c.debris.BodyIsDeadFlesh(torso)) {
-      why = "the root at zero hp did not leave a dead-flesh torso";
+    if (mobs.IsAlive(id) || mobs.LimbBody(id, root) != torso) {
+      why = "the root at zero hp did not leave the torso on the corpse";
       return false;
     }
     for (int i = 0; i < 20; i++) Step();
@@ -3891,16 +3982,26 @@ Status GateCorpseCrossheat(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
   // What the OTHER pieces have been touched by: every voxel of theirs now in
-  // the burn chain. Excluding the torso (the source) is the whole point.
+  // the burn chain. Excluding the torso (the source) is the whole point. The
+  // corpse's own limbs (anatomy only: a garment is not flesh), and any loose
+  // dead flesh that has come off it.
   auto othersTouched = [&](uint32_t* pieces) {
-    const int ti = f.TorsoIndex();
     uint32_t n = 0, lit = 0;
-    for (uint32_t i = 0; i < c.debris.BodyCount(); i++) {
-      if ((int)i == ti || !c.debris.BodyIsDeadFlesh(c.debris.BodyHandle(i)))
-        continue;
+    const Mob* m = c.mobs.FindMobById(f.id);
+    const int base = m ? m->AppendedBase() : 0;
+    for (int li = 0; li < base; li++) {
+      if (li == f.root || !c.mobs.LimbBody(f.id, li)) continue;
       uint32_t here = 0;
-      for (uint32_t m : touchedMats)
-        if (m) here += c.debris.BodyMaterialCount(i, m);
+      for (uint32_t mat : touchedMats)
+        if (mat) here += c.mobs.LimbMaterialCount(f.id, li, mat);
+      n += here;
+      if (here) lit++;
+    }
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++) {
+      if (!c.debris.BodyIsDeadFlesh(c.debris.BodyHandle(i))) continue;
+      uint32_t here = 0;
+      for (uint32_t mat : touchedMats)
+        if (mat) here += c.debris.BodyMaterialCount(i, mat);
       n += here;
       if (here) lit++;
     }
@@ -3915,10 +4016,9 @@ Status GateCorpseCrossheat(Ctx& c, std::string& detail) {
     if (i % kRelight == 0) {
       const int ti = f.TorsoIndex();
       if (ti >= 0) {
-        const uint64_t h = c.debris.BodyHandle((uint32_t)ti);
-        uint32_t lit = c.debris.RewriteBodyMaterial(h, mSkin, mBurning, 200);
+        uint32_t lit = c.mobs.RewriteLimbMaterial(f.id, ti, mSkin, mBurning, 200);
         if (lit < 200 && mFlesh)
-          lit += c.debris.RewriteBodyMaterial(h, mFlesh, mBurning, 200 - lit);
+          lit += c.mobs.RewriteLimbMaterial(f.id, ti, mFlesh, mBurning, 200 - lit);
         relit += lit;
       }
     }
@@ -3929,7 +4029,9 @@ Status GateCorpseCrossheat(Ctx& c, std::string& detail) {
     peakPieces = std::max(peakPieces, pieces);
   }
   const MobSystem::BurnStats st = c.mobs.Burn();
-  const uint32_t bodies = c.debris.BodyCount();
+  const uint32_t bodies =
+      c.debris.BodyCount() +
+      (c.mobs.FindMobById(f.id) ? c.mobs.FindMobById(f.id)->LimbBodyCount() : 0u);
   c.mobs.Reset();
   c.debris.Reset();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
@@ -3937,8 +4039,8 @@ Status GateCorpseCrossheat(Ctx& c, std::string& detail) {
   RecordObserved("corpseCrossheatTouched", (double)peak);
   const double minTouched = BaselineNumber("corpseCrossheatMinTouched", 100.0);
   // The spread, and proof the living pass is what burned the dead: it built a
-  // cross-heat snapshot for the corpse (crossCells), which nothing but
-  // MobSystem::BurnCorpses does for a debris body.
+  // cross-heat snapshot for the corpse (crossCells) — Mob::BurnTick's own
+  // BuildCrossLimbHeat, run on the dead Mob.
   const bool ok = relit > 0 && (double)peak >= minTouched && st.crossCells > 0;
   detail = Format(
       "torso re-lit %u voxels, no world fire: other pieces touched by fire %u "
@@ -3975,14 +4077,12 @@ Status GateCorpseWorn(Ctx& c, std::string& detail) {
     PrepareWorld(c);
     DeadFixture f(c);
     if (!f.Make(500, 59000, a == 0 ? "iron_cuirass" : nullptr)) { why = f.why; break; }
-    int ti = f.TorsoIndex();
-    arms[a].v0 = ti >= 0 ? c.debris.BodyVoxelCount((uint32_t)ti) : 0;
+    arms[a].v0 = f.TorsoVoxels();
     c.mobs.ResetWornStats();
     for (int i = 0; i < kTicks; i++) {
       f.Step([&](std::vector<CellOp>& cellOps) {
-        const int k = f.TorsoIndex();
-        if (k < 0) return;
-        const Vec3 at = c.debris.BodyPosition((uint32_t)k);
+        if (f.TorsoIndex() < 0) return;
+        const Vec3 at = f.TorsoCentre();
         const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
         for (int dy = -3; dy <= 3; dy++)
           for (int dz = -3; dz <= 3; dz++)
@@ -3995,8 +4095,7 @@ Status GateCorpseWorn(Ctx& c, std::string& detail) {
             }
       });
     }
-    ti = f.TorsoIndex();
-    arms[a].v1 = ti >= 0 ? c.debris.BodyVoxelCount((uint32_t)ti) : 0;
+    arms[a].v1 = f.TorsoVoxels();
     arms[a].threats = c.mobs.Worn().nbrThreats;
     arms[a].shielded = c.mobs.Worn().nbrSubstituted;
     arms[a].seeds = c.mobs.Worn().seedsBlocked;
@@ -4044,9 +4143,8 @@ Status GateCorpseSplatter(Ctx& c, std::string& detail) {
     detail = f.why;
     return Status::Fail;
   }
-  int ti = f.TorsoIndex();
-  const uint32_t before = c.debris.BodyCoatCount((uint32_t)ti, mBlood);
-  const Vec3 at = c.debris.BodyPosition((uint32_t)ti);
+  const uint32_t before = f.TorsoCoat(mBlood);
+  const Vec3 at = f.TorsoCentre();
   SplatterEvent ev;
   ev.origin = at + Vec3{MetresToCells(1.0f), 0.3f, 0.0f};
   ev.axis = Vec3{-1.0f, 0.0f, 0.0f};
@@ -4061,8 +4159,7 @@ Status GateCorpseSplatter(Ctx& c, std::string& detail) {
   ev.seed = 0xC0A5Eu;
   c.mobs.QueueSplatter(ev);
   for (int i = 0; i < 4; i++) f.Step();
-  ti = f.TorsoIndex();
-  const uint32_t after = ti >= 0 ? c.debris.BodyCoatCount((uint32_t)ti, mBlood) : 0u;
+  const uint32_t after = f.TorsoCoat(mBlood);
   c.mobs.Reset();
   c.debris.Reset();
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
@@ -4078,8 +4175,9 @@ Status GateCorpseSplatter(Ctx& c, std::string& detail) {
 // corpse-acid: acid on the DEAD does what it does on the living
 // ---------------------------------------------------------------------------
 // Owner report 2026-09-23 ("acid stains aren't working on corpses"). The dead
-// run a parallel path (SplatterCorpses -> StainCorpses -> BurnCorpses) and
-// every body feature has to reach both. A flask-pour-shaped burst of acid at a
+// ran a parallel path (SplatterCorpses -> StainCorpses -> BurnCorpses); a
+// corpse is a dead Mob now and runs the living's own, so this pins that it
+// still does. A flask-pour-shaped burst of acid at a
 // dead torso must COAT it and then EAT it, and the coat must be spent.
 Status GateCorpseAcid(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
@@ -4141,10 +4239,8 @@ Status GateCorpseAcid(Ctx& c, std::string& detail) {
     detail = f.why;
     return Status::Fail;
   }
-  int ti = f.TorsoIndex();
-  const uint32_t serial = c.debris.BodySerial((uint32_t)ti);
-  const uint32_t n0 = c.debris.BodyVoxelCount((uint32_t)ti);
-  const Vec3 at = c.debris.BodyPosition((uint32_t)ti);
+  const uint32_t n0 = f.TorsoVoxels();
+  const Vec3 at = f.TorsoCentre();
   SplatterEvent ev;
   ev.origin = at + Vec3{0.0f, MetresToCells(1.0f), 0.0f};
   ev.axis = Vec3{0.0f, -1.0f, 0.0f};
@@ -4160,24 +4256,18 @@ Status GateCorpseAcid(Ctx& c, std::string& detail) {
   c.mobs.QueueSplatter(ev);
   uint32_t coatPeak = 0;
   std::string trace;
-  auto torso = [&]() { return c.debris.FindBodySerial(serial); };
   for (int i = 0; i < 90; i++) {
     f.Step();
-    const int k = torso();
-    const uint32_t coat = k >= 0 ? c.debris.BodyCoatCount((uint32_t)k, mAcid) : 0u;
+    const uint32_t coat = f.TorsoCoat(mAcid);
     coatPeak = std::max(coatPeak, coat);
-    if (i % 10 == 0)
-      trace += Format("%u/%u ", k >= 0 ? c.debris.BodyVoxelCount((uint32_t)k) : 0u,
-                      coat);
+    if (i % 10 == 0) trace += Format("%u/%u ", f.TorsoVoxels(), coat);
   }
-  int k = torso();
-  const uint32_t n90 = k >= 0 ? c.debris.BodyVoxelCount((uint32_t)k) : 0u;
-  uint32_t left = k >= 0 ? c.debris.BodyCoatCount((uint32_t)k, mAcid) : 0u;
+  const uint32_t n90 = f.TorsoVoxels();
+  uint32_t left = f.TorsoCoat(mAcid);
   const uint32_t coatAt90 = left;
   for (int i = 0; i < 900 && left; i++) {
     f.Step();
-    k = torso();
-    left = k >= 0 ? c.debris.BodyCoatCount((uint32_t)k, mAcid) : 0u;
+    left = f.TorsoCoat(mAcid);
   }
   c.mobs.Reset();
   c.debris.Reset();
@@ -5274,14 +5364,18 @@ Status GateWoundHeal(Ctx& c, std::string& detail) {
 //     severable limb at zero went through Sever() — which DETACHES it before
 //     it calls Die(). hp now kills in place (Mob::Damage, Mob::CarveLimb);
 //     only geometry takes a head off.
-//   * THE CORPSE. From the kill on, the head is debris, and the beam switched
-//     to laserMeltRadius (a 2-voxel ball per tick, sized for rock). Dead flesh
-//     now takes laserCarveRadius like the living (session.cpp phase C).
+//   * THE CORPSE. From the kill on, the head WAS debris, and the beam switched
+//     to laserMeltRadius (a 2-voxel ball per tick, sized for rock). A corpse
+//     is a dead Mob now (docs/PLAN_corpse_is_a_mob.md): its head is still its
+//     own limb and the beam goes on carving it through the creature path,
+//     exactly as it did while it lived; loose dead flesh still melts at the
+//     carve radius (session.cpp phase C).
 //
 // The beam is the one session.cpp fires, step for step: CastRayBody, then
-// Damage + CarveLimbRadial on a live limb, MeltBodyAt at the carve radius on
-// dead flesh. Asserted: it killed (or the gate proved nothing), nothing was
-// severed, and every body of the corpse is still jointed. Whether the bore
+// Damage + CarveLimbRadial on a creature's limb (alive or dead), MeltBodyAt at
+// the carve radius on loose dead flesh. Asserted: it killed (or the gate
+// proved nothing), nothing was severed, and every body of the corpse is still
+// jointed. Whether the bore
 // came out the far side is recorded, not asserted — the ray reads the
 // collider, which is coarser than the skin being bored.
 Status GateLaserHead(Ctx& c, std::string& detail) {
@@ -5371,7 +5465,15 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
     if (deathTick >= 0 && i >= deathTick + 30) break;
   }
   const size_t severs = mobs.SeverEvents().size();
+  // Every body of the corpse: its own limbs, and anything loose that came off
+  // it (which has no joint and would fail the claim, as it should).
   int bodies = 0, jointed = 0;
+  if (const Mob* dead = mobs.FindMobById(id))
+    for (int li = 0; li < dead->LimbCount(); li++)
+      if (const uint64_t h = mobs.LimbBody(id, li)) {
+        bodies++;
+        if (c.phys.JointCount(h) > 0) jointed++;
+      }
   for (uint32_t i = 0; i < c.debris.BodyCount(); i++) {
     bodies++;
     if (c.phys.JointCount(c.debris.BodyHandle(i)) > 0) jointed++;
@@ -6226,6 +6328,294 @@ Status GateSeveredHand(Ctx& c, std::string& detail) {
   return splitOk && wholeOk && acidOk ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// corpse-sleep: a settled corpse costs nothing, and a blow wakes it
+// ---------------------------------------------------------------------------
+//
+// A corpse is a dead Mob now (docs/PLAN_corpse_is_a_mob.md) and keeps its rig,
+// so rule 2 has a new population to be stated for: a body lying still in a
+// settled world must not cost a terrain anchor, a read-back, an untunnel and
+// a DriveWornShells activation of every garment on it every tick, forever.
+//
+// The claims, on a DRESSED corpse (so there are garments to activate):
+//   A. it falls ASLEEP (Mob::DeadAsleep) within corpseSleepMaxTicks of lying
+//      down in a quiet world;
+//   B. asleep, over corpseSleepWindow ticks it runs NO dead PostStep and
+//      registers terrain anchors only on its keep-alive stride
+//      (MobSystem::kDeadAnchorStride), and no body of it is active in Jolt;
+//   C. a CUT wakes it at once — a sleeping corpse is still flesh — and the
+//      cut takes voxels.
+Status GateCorpseSleep(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  PrepareWorld(c);
+  DeadFixture f(c);
+  // A garment, so the asleep claim covers DriveWornShells' activations too.
+  const ItemDef* wear = nullptr;
+  for (const ItemDef& it : c.items.items)
+    if (ItemKindIsWorn(it.kind)) {
+      wear = &it;
+      break;
+    }
+  // DeadFixture's body, killed WITHOUT A WOUND: the root severed is a death
+  // (Sever routes the root to Die) with no stump armed and no hp blow's bleed
+  // budget, so nothing drips a pool for the corpse to lie in. A corpse
+  // bleeding out or drying off in its own blood is correctly AWAKE for as long
+  // as that takes (Mob::DeadQuietNow); this claim is about the one that has
+  // nothing left to do.
+  {
+    const Target t = ChooseTarget(c.mobs, FixtureSite(c.world, 470));
+    f.id = t.valid() ? SpawnTarget(c, t, 470, f.pchunk) : 0;
+    Mob* mob = f.id ? c.mobs.FindMobById(f.id) : nullptr;
+    if (!mob || !mob->Def() || mob->Def()->rootLimb < 0) {
+      detail = "spawn refused";
+      return Status::Fail;
+    }
+    c.mobs.SetMobBehavior(f.id, "dummy");
+    f.tick = 63000;
+    if (wear != nullptr) {
+      int home = -1;
+      for (int sl = 0; sl < kEquipSlotCount; sl++)
+        if (EquipSlotAccepts(sl, wear->kind)) { home = sl; break; }
+      if (home >= 0) mob->WearItem(wear, home);
+    }
+    for (int i = 0; i < 8; i++) f.Step();
+    f.root = mob->Def()->rootLimb;
+    f.torso = c.mobs.LimbBody(f.id, f.root);
+    c.mobs.Sever(f.id, f.root);
+    if (c.mobs.IsAlive(f.id)) {
+      detail = "severing the root did not kill";
+      c.mobs.Reset();
+      return Status::Fail;
+    }
+    for (int i = 0; i < 20; i++) f.Step();
+  }
+  const int maxTicks = (int)BaselineNumber("corpseSleepMaxTicks", 900);
+  const int window = (int)BaselineNumber("corpseSleepWindow", 60);
+  auto dead = [&]() { return c.mobs.FindMobById(f.id); };
+  // ---- A. it falls asleep ---------------------------------------------------
+  int asleepAt = -1;
+  for (int i = 0; i < maxTicks; i++) {
+    f.Step();
+    const Mob* m = dead();
+    if (m != nullptr && m->DeadAsleep()) {
+      asleepAt = i;
+      break;
+    }
+  }
+  // Attribution when it did not (rule 6): which criterion is still awake.
+  std::string awakeWhy;
+  if (asleepAt < 0) {
+    const Mob* m = dead();
+    uint32_t active = 0, bleeding = 0, burning = 0, unslept = 0;
+    for (int li = 0; m && li < m->LimbCount(); li++) {
+      const uint64_t h = c.mobs.LimbBody(f.id, li);
+      if (!h) continue;
+      if (c.phys.IsActive(h)) active++;
+      if (c.mobs.LimbWoundOpen(f.id, li)) bleeding++;
+      if (c.mobs.LimbBurningCount(f.id, li)) burning++;
+    }
+    (void)unslept;
+    awakeWhy = Format(" [still awake: %u limbs active in Jolt, %u bleeding, "
+                      "%u burning]",
+                      active, bleeding, burning);
+  }
+  // ---- B. asleep, it costs nothing ------------------------------------------
+  const uint64_t anchors0 = c.mobs.DeadAnchorsTotal();
+  const uint64_t posts0 = c.mobs.DeadPostStepsTotal();
+  uint32_t activeTicks = 0;
+  bool stayedAsleep = asleepAt >= 0;
+  for (int i = 0; i < window && asleepAt >= 0; i++) {
+    f.Step();
+    const Mob* m = dead();
+    if (m == nullptr || !m->DeadAsleep()) {
+      stayedAsleep = false;
+      break;
+    }
+    for (int li = 0; li < m->LimbCount(); li++)
+      if (const uint64_t h = c.mobs.LimbBody(f.id, li); h && c.phys.IsActive(h)) {
+        activeTicks++;
+        break;
+      }
+  }
+  const uint64_t anchors = c.mobs.DeadAnchorsTotal() - anchors0;
+  const uint64_t posts = c.mobs.DeadPostStepsTotal() - posts0;
+  const uint64_t anchorCap =
+      (uint64_t)window / MobSystem::kDeadAnchorStride + 1u;
+  const bool quiet = stayedAsleep && posts == 0 && anchors <= anchorCap &&
+                     activeTicks == 0;
+  // ---- C. a cut wakes it ----------------------------------------------------
+  bool woke = false;
+  uint32_t took = 0;
+  if (asleepAt >= 0) {
+    const int li = f.root;
+    const uint64_t h = c.mobs.LimbBody(f.id, li);
+    const uint32_t v0 = c.mobs.LimbArtVoxelCount(f.id, li);
+    const Vec3 at = c.mobs.LimbVoxelPos(f.id, li, 0);
+    const auto& g = CurrentTuning().gore;
+    KerfCut cut;
+    cut.at = at;
+    cut.edgeAxis = Vec3{1, 0, 0};
+    cut.cutDir = Vec3{0, -1, 0};
+    cut.halfWidth = std::max(0.9f * g.cutWidth, 0.08f);
+    cut.depth = g.cutDepth + g.cutDepthPower;
+    cut.length = g.cutLength;
+    cut.power = 1.0f;
+    cut.seed = 0x51EEu;
+    std::vector<ParticleSpawn> spawns;
+    if (h) {
+      MobSystem::BladeCutScope blade(c.mobs, 1.0f);
+      c.mobs.Damage(h, 10.0f, at, 20.0f);
+      c.mobs.CutLimb(h, cut, c.world, spawns);
+    }
+    const Mob* m = dead();
+    woke = m != nullptr && !m->DeadAsleep();
+    const uint32_t v1 = c.mobs.LimbArtVoxelCount(f.id, li);
+    took = v0 > v1 ? v0 - v1 : 0u;
+  }
+  c.mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  RecordObserved("corpseSleepTicks", (double)asleepAt);
+  RecordObserved("corpseSleepAnchors", (double)anchors);
+  const bool ok = asleepAt >= 0 && quiet && woke && took > 0;
+  detail = Format(
+      "dressed in %s: asleep after %d ticks (cap %d)%s; asleep for %d ticks: "
+      "%llu dead PostSteps (need 0), %llu anchors (cap %llu), %u ticks with a "
+      "limb active in Jolt, stayed asleep=%d; a cut took %u voxels and woke "
+      "it=%d",
+      wear ? wear->name.c_str() : "nothing", asleepAt, maxTicks, awakeWhy.c_str(), window,
+      (unsigned long long)posts, (unsigned long long)anchors,
+      (unsigned long long)anchorCap, activeTicks, stayedAsleep ? 1 : 0, took,
+      woke ? 1 : 0);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// corpse-cap: the dead are bounded, and the oldest decays to debris
+// ---------------------------------------------------------------------------
+//
+// Rule 2 for the new population (docs/PLAN_corpse_is_a_mob.md "Bounds"). The
+// living cap (kMaxMobs) counts the LIVING only; the dead have their own cap
+// (kMaxDeadMobs) and a body budget over their limbs (kMaxDeadBodies). Past
+// either, the OLDEST corpse decays to debris through Mob::ReleaseRigToDebris,
+// where DebrisSystem's own cull finishes it.
+//
+// Claims: kill kMaxDeadMobs + corpseCapExtra creatures in order, run one tick,
+// and
+//   A. the dead are within both caps;
+//   B. the ones that went are the OLDEST (the first killed), their limbs are
+//      loose dead flesh in DebrisSystem now, and the newest is still a corpse;
+//   C. the living cap is untouched by the dead: kMaxMobs creatures still
+//      spawn beside the corpses, and the next one is refused.
+Status GateCorpseCap(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 380));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  mobs.Reset();
+  c.debris.Reset();
+  const int extra = (int)BaselineNumber("corpseCapExtra", 3);
+  const int kills = (int)MobSystem::kMaxDeadMobs + extra;
+  const uint64_t evicted0 = mobs.DeadEvictedTotal();
+  std::vector<uint64_t> order;               // in death order
+  std::vector<std::vector<uint64_t>> handles;  // each one's limbs at death
+  const int root = mobs.Defs()[t.defIndex].rootLimb;
+  for (int k = 0; k < kills; k++) {
+    const IVec3 site = FixtureSite(c.world, 200 + (k % 8) * 16);
+    const uint64_t id =
+        mobs.Spawn(t.defIndex, {site.x, site.y, site.z + (k / 8) * 16});
+    if (!id) break;
+    std::vector<uint64_t> hs;
+    for (int li = 0; li < (int)mobs.Defs()[t.defIndex].limbs.size(); li++)
+      if (const uint64_t h = mobs.LimbBody(id, li)) hs.push_back(h);
+    const uint64_t torso = root >= 0 ? mobs.LimbBody(id, root) : 0;
+    if (torso) mobs.Damage(torso, 1.0e6f, mobs.LimbAnchorPos(id, root), 0.0f);
+    if (mobs.IsAlive(id)) break;
+    order.push_back(id);
+    handles.push_back(std::move(hs));
+  }
+  const bool fixtureOk = (int)order.size() == kills;
+  // One tick: the cap is enforced at the top of PreTick (MobSystem::EvictDead).
+  {
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> sp;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(64000u, c.world, ops, cellOps, sp);
+    c.debris.PreTick(64000u, c.world, cellOps, sp);
+  }
+  uint32_t deadBodies = 0;
+  for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+    const Mob* m = mobs.MobAt(i);
+    if (m && !m->Alive() && !m->RigReleased()) deadBodies += m->LimbBodyCount();
+  }
+  const uint32_t deadNow = mobs.DeadMobCount();
+  const bool withinCaps = deadNow <= MobSystem::kMaxDeadMobs &&
+                          deadBodies <= MobSystem::kMaxDeadBodies;
+  // B: which ones went. A corpse still standing is a dead Mob with its rig.
+  auto stillCorpse = [&](uint64_t id) {
+    const Mob* m = mobs.FindMobById(id);
+    return m != nullptr && !m->Alive() && !m->RigReleased();
+  };
+  int goneOldest = 0, firstKept = -1;
+  for (int k = 0; k < (int)order.size(); k++) {
+    if (!stillCorpse(order[(size_t)k])) {
+      if (firstKept < 0) goneOldest++;
+    } else if (firstKept < 0) {
+      firstKept = k;
+    }
+  }
+  // Every corpse after the first one kept must still be one: eviction takes
+  // the oldest first, never one out of the middle.
+  bool orderly = firstKept >= 0;
+  for (int k = std::max(firstKept, 0); k < (int)order.size(); k++)
+    orderly = orderly && stillCorpse(order[(size_t)k]);
+  // ...and what went is DEBRIS now, not deleted: its limb bodies are loose dead
+  // flesh the debris cull will finish.
+  uint32_t decayedBodies = 0, decayedExpected = 0;
+  for (int k = 0; k < goneOldest; k++)
+    for (uint64_t h : handles[(size_t)k]) {
+      decayedExpected++;
+      if (c.debris.HasBody(h) && c.debris.BodyIsDeadFlesh(h)) decayedBodies++;
+    }
+  const bool decayed = goneOldest >= extra && decayedExpected > 0 &&
+                       decayedBodies == decayedExpected;
+  const bool newestKept = !order.empty() && stillCorpse(order.back());
+  const uint64_t evicted = mobs.DeadEvictedTotal() - evicted0;
+  // C: the living cap, beside the dead.
+  int live = 0;
+  bool refusedAtCap = false;
+  for (uint32_t k = 0; k <= MobSystem::MaxLiveMobs(); k++) {
+    const IVec3 site = FixtureSite(c.world, 120 + (int)(k % 8) * 16);
+    const uint64_t id = mobs.Spawn(
+        t.defIndex, {site.x, site.y, site.z + 300 + (int)(k / 8) * 16});
+    if (id) live++;
+    else if (k == MobSystem::MaxLiveMobs()) refusedAtCap = true;
+  }
+  const bool livingCap =
+      live == (int)MobSystem::MaxLiveMobs() && refusedAtCap &&
+      mobs.LiveMobCount() == MobSystem::MaxLiveMobs() && mobs.DeadMobCount() > 0;
+  RecordObserved("corpseCapEvicted", (double)evicted);
+  mobs.Reset();
+  c.debris.Reset();
+  const bool ok = fixtureOk && withinCaps && orderly && decayed && newestKept &&
+                  livingCap;
+  detail = Format(
+      "%s: %zu of %d killed; after one tick %u corpses (cap %u), %u corpse "
+      "bodies (cap %u), %llu evicted; the first %d gone (need >= %d) with "
+      "%u/%u of their limbs loose dead flesh, oldest-first=%d, newest kept=%d; "
+      "%d living spawned beside the dead (cap %u), next refused=%d",
+      t.defName.c_str(), order.size(), kills, deadNow, MobSystem::kMaxDeadMobs,
+      deadBodies, MobSystem::kMaxDeadBodies, (unsigned long long)evicted,
+      goneOldest, extra, decayedBodies, decayedExpected, orderly ? 1 : 0,
+      newestKept ? 1 : 0, live, MobSystem::MaxLiveMobs(), refusedAtCap ? 1 : 0);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -6259,6 +6649,8 @@ const std::vector<Gate>& WoundGates() {
       {"corpse-acid", "mob", {}, false, GateCorpseAcid, false},
       {"lava-oil-coat", "mob", {}, false, GateLavaOilCoat, false},
       {"severed-hand", "mob", {}, false, GateSeveredHand, false},
+      {"corpse-sleep", "mob", {}, false, GateCorpseSleep, false},
+      {"corpse-cap", "mob", {}, false, GateCorpseCap, false},
   };
   return g;
 }

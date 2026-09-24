@@ -728,6 +728,12 @@ const char* const kOrder[] = {
     // ...and a part that comes off keeps its hand: a split forearm drops the
     // hand with the wrist end, a severed arm stays jointed. Pose ticks only.
     "severed-hand",
+    // ...and a corpse is a dead Mob that costs nothing once it has settled
+    // (asleep: no anchor, no read-back, no garment activation) and wakes on a
+    // cut; and the dead are bounded by their own cap, the oldest decaying to
+    // debris (docs/PLAN_corpse_is_a_mob.md). The first ticks the world and
+    // regenerates it on the way out; the second is one PreTick, CPU only.
+    "corpse-sleep", "corpse-cap",
     // ---- NOTHING IS LEFT HANGING (2026-09-03) -----------------------------
     // LAST of everything that touches the shared World except `voxregion`, and
     // that position was EARNED rather than chosen. It first sat at the end of

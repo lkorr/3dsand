@@ -2430,7 +2430,9 @@ Status GateZombieDraw(Ctx& c, std::string& detail) {
     // correct measurement of nothing and hides WHICH of the two went: the prey
     // dying of its own bites is the feature working, the biter vanishing is a
     // broken fixture. Both are counted and said out loud.
-    if (m == nullptr) {
+    // GONE = not a living creature any more. A corpse is a dead Mob now
+    // (docs/PLAN_corpse_is_a_mob.md), so presence alone no longer says it.
+    if (m == nullptr || !m->Alive()) {
       // SAY WHY, once: a husk sweep, a turn (TurnMob re-spawns under a new id)
       // and a death are three different bugs and a count names none of them.
       if (goneBiter++ == 0)
@@ -2439,7 +2441,7 @@ Status GateZombieDraw(Ctx& c, std::string& detail) {
                     i, c.mobs.DeathCause(biter), c.mobs.MobCount());
       continue;
     }
-    if (p == nullptr) { gonePrey++; continue; }
+    if (p == nullptr || !p->Alive()) { gonePrey++; continue; }
     alive++;
     const Vec3 d = m->Origin() - p->Origin();
     const float dist = Vec3{d.x, 0, d.z}.len();
@@ -2637,11 +2639,18 @@ Status GateLimbAlias(Ctx& c, std::string& detail) {
     const uint32_t f = reg.AuditMicroModels();
     if (f > 0 && faults == 0) firstFaultTick = (uint32_t)i;
     faults += f;
-    peakBodies = std::max(peakBodies, c.debris.BodyCount());
+    // Dead matter: loose debris, and the corpses — which keep their rigs as
+    // dead Mobs now (docs/PLAN_corpse_is_a_mob.md) and hold brick records
+    // exactly as the debris they used to become did.
+    uint32_t deadBodies = c.debris.BodyCount();
+    for (uint64_t id : fighters)
+      if (const Mob* m = c.mobs.FindMobById(id); m != nullptr && !m->Alive())
+        deadBodies += m->LimbBodyCount();
+    peakBodies = std::max(peakBodies, deadBodies);
     peakSlots = std::max(peakSlots, reg.TotalSlots());
   }
   for (uint64_t id : fighters)
-    if (c.mobs.FindMobById(id) == nullptr) deaths++;
+    if (!c.mobs.IsAlive(id)) deaths++;
 
   // A CORPSE IS THE PRECONDITION, not the subject. The fault needs a death to
   // put a record back on the free list and a survivor to take it, so a run
@@ -2649,7 +2658,7 @@ Status GateLimbAlias(Ctx& c, std::string& detail) {
   check(deaths > 0,
         Format("the brawl killed somebody (%u of %zu fighters gone in %d ticks)",
                deaths, fighters.size(), ticks));
-  check(peakBodies > 0, "the fight produced debris bodies");
+  check(peakBodies > 0, "the fight produced dead bodies (corpses or debris)");
   check(faults == 0,
         Format("no brick record has two holders and no instance claims "
                "another body's slot (%u faults, first at tick %u — the named "
@@ -2695,7 +2704,7 @@ Status GateLimbAlias(Ctx& c, std::string& detail) {
   RecordObserved("limbAliasPeakBodies", (double)peakBodies);
   RecordObserved("limbAliasPeakSlots", (double)peakSlots);
   std::printf(
-      "limb-alias: %d ticks, %u of %zu fighters dead, peak %u debris bodies / "
+      "limb-alias: %d ticks, %u of %zu fighters dead, peak %u dead bodies / "
       "%u body slots (ceiling %u), %u faults\n",
       ticks, deaths, fighters.size(), peakBodies, peakSlots, kMaxBodySlots,
       faults);

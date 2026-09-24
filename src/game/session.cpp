@@ -2664,6 +2664,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           float best = 96.0f * 96.0f;   // seek range, voxels squared
           bool found = false;
           for (uint32_t i = 0; i < m.MobCount(); i++) {
+            // A seeking spell hunts the LIVING: a corpse is a Mob now
+            // (PLAN_corpse_is_a_mob.md), and homing on one is a wasted cast.
+            if (!m.IsAlive(m.MobIdAt(i))) continue;
             const Vec3 p = m.MobOrigin(m.MobIdAt(i));
             const Vec3 d = p - from;
             const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
@@ -3524,7 +3527,7 @@ static void PhaseM(TickAuthorityCtx& w, WorldScratch& ws,
       // stays under the crosshair. Nothing here can reach the hashed grid: it
       // sets rigid-body velocities, and bodies only re-enter the world through
       // the op stream.
-      grab.Tick(phys, debris, CurrentTuning().player, player.EyePos(),
+      grab.Tick(phys, debris, &mobs, CurrentTuning().player, player.EyePos(),
                 cam.Forward(), kTickDt);
       // WARDS, AT THE SPLICE (DESIGN.md §8): a live filter refuses ops of its
       // word's kind within its radius, whoever produced them — the brush, a

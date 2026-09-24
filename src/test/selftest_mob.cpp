@@ -467,7 +467,13 @@ bool mobOk = false;
     // (see the note above).
     for (int i = 0; i < 5000; i++) mobTick({});
     uint32_t awake = debris.ActiveBodyCount();
-    bool settled = awake == 0 && mobs.MobCount() == 0;
+    // THE CORPSE IS A MOB NOW (docs/PLAN_corpse_is_a_mob.md): "the scene is at
+    // rest" is every loose body asleep, nobody alive, and every corpse ASLEEP
+    // (Mob::DeadAsleep: inactive in Jolt, nothing burning, bleeding or
+    // drying) — the same full-rest claim, stated about where the bodies are.
+    const uint32_t deadAwake = mobs.DeadMobCount() - mobs.DeadAsleepCount();
+    awake += deadAwake;
+    bool settled = awake == 0 && mobs.LiveMobCount() == 0;
 
     mobOk = standing && severed && died && settled && dummyForward;
     std::printf(
@@ -3909,13 +3915,13 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // flesh, and still falling — a longer tail from a longer burn, not the
     // relight loop refusing to converge, which is what the bare count had
     // looked like and would have been diagnosed as.
+    // The creature whether it lives or not: a corpse is a dead Mob and keeps
+    // its limbs (docs/PLAN_corpse_is_a_mob.md), so its census is the corpse's.
     auto alightCloth = [&]() {
-      return (mobs.IsAlive(id) ? census(id, mClothBurn) : 0u) +
-             debris.TotalBodyMaterial(mClothBurn);
+      return census(id, mClothBurn) + debris.TotalBodyMaterial(mClothBurn);
     };
     auto alightFlesh = [&]() {
-      return (mobs.IsAlive(id) ? census(id, mBurning) : 0u) +
-             debris.TotalBodyMaterial(mBurning);
+      return census(id, mBurning) + debris.TotalBodyMaterial(mBurning);
     };
     auto alightInWorld = [&]() { return alightCloth() + alightFlesh(); };
 
@@ -3986,7 +3992,7 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     }
     const uint32_t stillAlight = alightInWorld();
     const uint32_t charred =
-        (mobs.IsAlive(id) ? census(id, mClothChar) + census(id, mCharred) : 0u) +
+        census(id, mClothChar) + census(id, mCharred) +
         debris.TotalBodyMaterial(mClothChar) + debris.TotalBodyMaterial(mCharred);
 
     const bool wasLit = lit > 0 && peakAlight > 0;
@@ -4247,6 +4253,10 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
   }
 
   // ---- G. a SEVERED burning limb keeps burning, and so does a corpse -------
+  // (A corpse is a dead Mob now, docs/PLAN_corpse_is_a_mob.md: its limbs burn
+  // in the living limb pass from their own budget pot. What is counted is the
+  // corpse's whole authoritative lattice — its own limbs plus any loose piece
+  // that came off it — because a micro limb emits no cube instances to count.)
   // DebrisSystem::BurnBodies refused micro bodies outright until this package,
   // for two reasons that had both expired: the copy-on-write brick pool shipped
   // (so a per-body edit is visible) and the pass now divides body-local
@@ -4268,22 +4278,33 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     uint32_t adopted = 0, before = 0, after = 0, bodies = 0;
     if (id) {
       for (int i = 0; i < 12; i++) burnTick(id, 0, 0);
-      // Light the whole creature, then kill it: the corpse hands every limb to
-      // DebrisSystem, fire and all.
+      // Light the whole creature, then kill it: the corpse keeps every limb,
+      // fire and all.
       for (int li = 0; li < nLimbs; li++) mobs.IgniteLimb(id, li, 40);
       for (int i = 0; i < 30; i++) burnTick(id, mFire, 18);
-      // Severing the ROOT limb is death (Sever routes root/vital to Die), which
-      // is the path that hands every limb to DebrisSystem.
+      // Severing the ROOT limb is death (Sever routes root/vital to Die).
       mobs.Sever(id, rootLimb);
+      const bool dead = !mobs.IsAlive(id);
+      auto corpseVoxels = [&]() {
+        uint32_t n = debris.TotalBodyVoxels();
+        for (int li = 0; li < nLimbs; li++)
+          if (mobs.LimbBody(id, li)) n += mobs.LimbArtVoxelCount(id, li);
+        return n;
+      };
+      auto corpseBodies = [&]() {
+        uint32_t n = debris.BodyCount();
+        for (int li = 0; li < nLimbs; li++) n += mobs.LimbBody(id, li) ? 1u : 0u;
+        return n;
+      };
       for (int i = 0; i < 3; i++) burnTick(0, 0, 0);
-      adopted = debris.BodyCount();
-      before = debris.TotalBodyVoxels();
+      adopted = dead ? corpseBodies() : 0u;
+      before = corpseVoxels();
       for (int i = 0; i < 120; i++) burnTick(0, 0, 0);
-      after = debris.TotalBodyVoxels();
-      bodies = debris.BodyCount();
+      after = corpseVoxels();
+      bodies = corpseBodies();
     }
     const bool gOk = adopted > 0 && before > 0 && after < before;
-    std::printf("  corpse burns: %s (%u bodies adopted, %u -> %u voxels, %u "
+    std::printf("  corpse burns: %s (%u corpse bodies, %u -> %u voxels, %u "
                 "bodies left)\n",
                 gOk ? "PASS" : "FAIL", adopted, before, after, bodies);
                 std::fflush(stdout);
@@ -5913,63 +5934,64 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
 
   // ---- C+D: IT FALLS WITH IT, AND YOU CAN TAKE IT --------------------------
   //
-  // The corpse report is the only way a pack ever reaches a player, and a pack
-  // entry rides the SAME list as the worn gear with no body on it
-  // (CorpseReport::Piece::body == 0). So the two halves are one arm: the entry
-  // has to arrive, and TakeCorpseLoot has to move the WHOLE stack into the bag
-  // without destroying a body it does not have.
+  // The dead Mob's loot list is the only way a pack ever reaches a player, and
+  // a pack entry rides the SAME list as the worn gear with no body behind it
+  // (LootPiece::Kind::Carried). So the two halves are one arm: the entry has
+  // to be there on the corpse, and TakeCorpseLoot has to move the WHOLE stack
+  // into the bag without taking a body out of the world it does not have.
   bool looted = false;
   std::string lootWhy = "no spawn";
   int gotN = 0, entriesBefore = 0, bodiesAfter = 0;
   {
     c.debris.Reset();
     c.mobs.Reset();
-    Corpses reg;
-    c.mobs.SetOnCorpse([&reg](const CorpseReport& r) { reg.Add(r); });
     const uint64_t id =
         c.mobs.Spawn(hi, {spot.x + 2 * step, spot.y + 1, spot.z});
     Mob* m = c.mobs.FindMobById(id);
     const int want = countOf(m, kSure);
     if (m != nullptr && want > 0) {
+      const uint32_t bodiesBefore = m->LimbBodyCount();
       m->Die();
-      CorpseReport* cr = reg.Find(id);
-      if (cr != nullptr) {
-        entriesBefore = (int)cr->gear.size();
+      Mob* cr = c.mobs.FindMobById(id);
+      if (cr != nullptr && cr->Lootable()) {
+        std::vector<LootPiece> list;
+        cr->LootPieces(list);
+        entriesBefore = (int)list.size();
         // The pack entry, found the way anything finds one: by what it is.
         int at = -1;
-        for (size_t i = 0; i < cr->gear.size(); i++)
-          if (cr->gear[i].body == 0 && cr->gear[i].item == kSure) at = (int)i;
+        for (size_t i = 0; i < list.size(); i++)
+          if (list[i].kind == LootPiece::Kind::Carried && list[i].item == kSure)
+            at = (int)i;
         PlayerKit kit;
         Inventory hotbar;
         std::string took;
         const LootResult lr =
             at >= 0 ? TakeCorpseLoot(*cr, at, KitRef{}, kit, hotbar, c.items,
-                                     c.debris, &took)
+                                     &took)
                     : LootResult::NoSuchPiece;
         for (const ItemStack& s : kit.bag.slots)
           if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
         for (const ItemStack& s : hotbar.slots)
           if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
-        // THE CORPSE IS STILL THERE. A pack item has no body, so taking it
-        // must not have taken a limb out of the world with it — the failure
-        // this pins is `DestroyBody(0)` reaching the physics layer and eating
-        // whatever handle 0 happens to mean.
-        const CorpseReport* after = reg.Find(id);
-        bodiesAfter = after != nullptr ? (int)after->bodies.size() : 0;
+        // THE CORPSE IS STILL THERE, WHOLE. A pack item has no body, so taking
+        // it must not have taken a limb out of the world with it.
+        Mob* after = c.mobs.FindMobById(id);
+        bodiesAfter = after != nullptr ? (int)after->LimbBodyCount() : 0;
+        std::vector<LootPiece> left;
+        if (after != nullptr) after->LootPieces(left);
         looted = at >= 0 && lr == LootResult::Ok && took == kSure &&
-                 gotN == want && bodiesAfter > 0 && after != nullptr &&
-                 (int)after->gear.size() == entriesBefore - 1;
+                 gotN == want && bodiesAfter > 0 &&
+                 bodiesAfter == (int)bodiesBefore && after != nullptr &&
+                 (int)left.size() == entriesBefore - 1;
         if (!looted)
           lootWhy = Format("at=%d res=%d took=%s got=%d/%d entries=%d->%d "
-                           "bodies=%d",
+                           "bodies=%d/%u",
                            at, (int)lr, took.c_str(), gotN, want, entriesBefore,
-                           after != nullptr ? (int)after->gear.size() : -1,
-                           bodiesAfter);
+                           (int)left.size(), bodiesAfter, bodiesBefore);
       } else {
-        lootWhy = "no corpse report";
+        lootWhy = "no lootable corpse";
       }
     }
-    c.mobs.SetOnCorpse(nullptr);
   }
 
   // ---- E: AND IT CARRIES THE PACK BACK UP ---------------------------------

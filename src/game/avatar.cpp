@@ -2750,6 +2750,11 @@ void PlayerAvatar::BurnParts(uint32_t tick, World& world,
 }
 
 void PlayerAvatar::Revive(const Player& player, float heading) {
+  // THE CORPSE FIRST (PLAN_corpse_is_a_mob.md, the P1 fallback). A death that
+  // booked a rising kept the rig for it; settling it here either stands the
+  // zombie up now or leaves the body where you fell as anonymous debris —
+  // exactly what every death did before. Despawn would otherwise DESTROY it.
+  if (spawned_ && !alive_ && sys_) sys_->SettleDeadAvatar(*this);
   Despawn();
   Spawn(player, heading);
 }

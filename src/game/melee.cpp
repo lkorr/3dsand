@@ -776,11 +776,18 @@ void StrikeReact(uint64_t body, const Vec3& dirWorld, const Vec3& atWorld,
   // RIG-POSED: the spring, exactly as before. HitReact self-refuses for a limp
   // or dead owner, and returns false for a body no creature owns.
   if (!phys.IsBodyDynamic(body)) {
-    if (mobs.HitReact(body, dirWorld, hp, power)) return;
-    // Not a mob's, and not dynamic: a strapped garment, or a kinematic prop.
-    const uint64_t host = debris.WornHostOf(body);
-    if (host == 0) return;
-    body = host;
+    // A DEAD MOB'S GARMENT is a kinematic follower of the limb it covers, as
+    // a corpse's strapped plate always was: the blow moves the body inside it.
+    if (const uint64_t host = mobs.DeadFollowerHost(body)) {
+      body = host;
+    } else if (mobs.HitReact(body, dirWorld, hp, power)) {
+      return;
+    } else {
+      // Not a mob's, and not dynamic: a strapped garment, or a kinematic prop.
+      const uint64_t host = debris.WornHostOf(body);
+      if (host == 0) return;
+      body = host;
+    }
   }
   // SOLVER-OWNED: the same ramp the spring is scaled by, so one reference blow
   // moves both halves of the reaction and a tuning change cannot drift them
@@ -1068,6 +1075,13 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       if (owner != nullptr && li >= 0)
         kind = li < owner->AppendedBase() ? StruckKind::Flesh
                                           : StruckKind::Shell;
+      // A DEAD MOB IS STRUCK AS THE CREATURE IT WAS (PLAN_corpse_is_a_mob.md):
+      // the creature branch below resolves it — Damage, CutLimb, BluntHit,
+      // BiteHit all work on a corpse, with no hp -> death and no voice — and
+      // this says it was FLESH for the cue, because a corpse fills neither the
+      // voice queue nor (unless something comes off) the sever queue.
+      if (owner != nullptr && !owner->Alive() && kind == StruckKind::Flesh)
+        out.hitDeadFlesh = true;
 
       // ---- ARMOUR DEFENDS FROM CUTS (2026-09-19) ---------------------------
       //

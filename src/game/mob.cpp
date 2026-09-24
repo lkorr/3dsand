@@ -1910,6 +1910,9 @@ void MobSystem::Init(Physics* phys, World* world, DebrisSystem* debris,
 
 void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
                                     const std::vector<ReactionGpu>& reactions) {
+  // A reload can change what a corpse is made of reacting to: every sleeping
+  // one looks again (Mob::DeadAsleep's wake list).
+  for (Mob& m : mobs_) m.WakeDead();
   densityOf_.clear();
   classOf_.clear();
   matGpu_.clear();
@@ -2266,8 +2269,8 @@ void MobSystem::BookRising(PendingRise r) {
     // fit stay corpses, which is the same answer every other bounded queue in
     // this file gives and the only one that keeps a bad tick from costing the
     // rest of the session.
-    std::printf("mob: %zu risings already booked; '%s' stays dead\n",
-                rises_.size(), r.def.c_str());
+    std::printf("mob: %zu risings already booked; mob %llu stays dead\n",
+                rises_.size(), (unsigned long long)r.mobId);
     return;
   }
   rises_.push_back(std::move(r));
@@ -2317,259 +2320,390 @@ static std::vector<int16_t> RisenArtRemap(const Prefab& was, const Prefab& now) 
   return map;
 }
 
-// THE CORPSE STANDS UP. Called once per tick from PreTick, after the husk
-// sweep, so a body that died this tick is already debris by the time its own
-// rising is due.
+// THE CORPSE STANDS UP. Called once per tick from PreTick, after every pass
+// that could still change the body, so the rig it reads is the one lying
+// there this tick.
 void MobSystem::ServiceRisings(uint32_t tick) {
   for (size_t i = 0; i < rises_.size();) {
-    PendingRise& r = rises_[i];
     // Unsigned wrap is not a hazard here: a rising is booked from the same
     // clock it is compared against, ticks apart.
-    if (tick < r.atTick) { i++; continue; }
-    // ---- A RISING IS AN AUTHORING ACT (M9.4-B) ----------------------------
-    //
-    // It SPAWNS a creature and destroys the remains. Both machines servicing
-    // one booking would stand two zombies up in one grave and each destroy
-    // the bodies the other was about to. So the machine that owned the corpse
-    // when it died is the one that raises it; every other machine DROPS the
-    // booking (it will meet the new creature as an announce). Test the
-    // captured owner, not the corpse — the corpse is gone by now.
-    if (r.owner != localPlayerId_) {
-      rises_[i] = std::move(rises_.back());
-      rises_.pop_back();
+    if (tick < rises_[i].atTick) { i++; continue; }
+    if (!ServiceRising(i)) { i++; continue; }  // waiting for room
+    // ServiceRising consumed rises_[i] (swap-with-back), so the entry now at
+    // `i` has not been looked at yet.
+  }
+}
+
+bool MobSystem::RisingPending(uint64_t mobId) const {
+  for (const PendingRise& r : rises_)
+    if (r.mobId == mobId) return true;
+  return false;
+}
+
+bool MobSystem::ServiceRising(size_t ri) {
+  if (ri >= rises_.size()) return true;
+  auto consume = [&]() {
+    rises_[ri] = std::move(rises_.back());
+    rises_.pop_back();
+  };
+  const PendingRise r = rises_[ri];
+  // ---- A RISING IS AN AUTHORING ACT (M9.4-B) ------------------------------
+  //
+  // It SPAWNS a creature and releases the remains. Both machines servicing one
+  // booking would stand two zombies up in one grave. So the machine that owned
+  // the corpse when it died is the one that raises it; every other machine
+  // DROPS the booking (it will meet the new creature as an announce).
+  if (r.owner != localPlayerId_) {
+    consume();
+    return true;
+  }
+  // ---- WHOSE BODY: A DEAD MOB, OR A DEAD AVATAR ---------------------------
+  //
+  // The remains are READ, not remembered. A booking whose corpse is no longer
+  // a rig of its own — released to debris by the dead cap or the window, or
+  // taken out of the world — has nothing to stand up, and stays down.
+  Mob* src = nullptr;
+  size_t srcIndex = (size_t)-1;
+  for (size_t k = 0; k < mobs_.size(); k++)
+    if (mobs_[k].id_ == r.mobId) {
+      src = &mobs_[k];
+      srcIndex = k;
+      break;
+    }
+  bool avatar = false;
+  if (src == nullptr) {
+    src = AvatarById(r.mobId);
+    avatar = src != nullptr;
+  }
+  if (src == nullptr || src->alive_ || src->rigReleased_ ||
+      src->def_ == nullptr || src->LimbBodyCount() == 0) {
+    consume();
+    return true;
+  }
+  const int at = DefWithEffects(src->def_->name, r.fx, nullptr);
+  if (at < 0) {
+    consume();
+    return true;
+  }
+  // THE LIVING CAP IS ASKED BEFORE ANYTHING IS TOUCHED. A rising that could
+  // not spawn used to have destroyed the remains already; now the corpse
+  // simply lies there a tick longer and the booking is retried.
+  if (!HasRoomToSpawn()) return false;
+
+  // ---- READ THE BODY, WHILE IT IS STILL THE CORPSE'S ----------------------
+  //
+  // Everything the risen creature inherits, straight off the dead rig. The
+  // lattices are MOVED, not copied: the dead rig is released a few lines down
+  // and nothing reads them again, so the capture costs nothing and needs no
+  // budget. By NAME throughout — an effect may APPEND a limb even though it
+  // may not rename or remove one (sidecar.h), so index parity is a rule about
+  // this rig and not about every rig a later effect could describe.
+  const std::string wasDef = src->def_->name;
+  const Vec3 atPos = src->origin_;
+  const float heading = src->heading_;
+  const float bodyY = src->bodyY_;
+  std::vector<std::string> lost;
+  struct RagPose { std::string name; BodyTransform xf; };
+  std::vector<RagPose> ragPose;
+  struct RiseLimb {
+    std::string name;
+    float hp = 0;
+    Vec3 restOffset{}, anchorRoot{}, anchorLimb{};
+    IVec3 size{};
+    std::vector<DebrisVoxel> voxels;
+    std::vector<PrefabVoxel> skinVoxels;
+  };
+  std::vector<RiseLimb> limbs;
+  const size_t nBase = std::min(src->limbs_.size(), src->def_->limbs.size());
+  for (size_t k = 0; k < nBase; k++) {
+    MobLimb& L = src->limbs_[k];
+    const std::string& name = src->def_->limbs[k].name;
+    if (L.body == 0) {
+      lost.push_back(name);
       continue;
     }
-    const int at = DefWithEffects(r.def, r.fx, nullptr);
-    if (at >= 0) {
-      // ---- WHERE EACH LIMB SETTLED, READ WHILE THE DEBRIS STILL EXISTS -----
-      //
-      // The zombie rises from where the corpse lies, not from where it died.
-      // Read each debris body's current transform from Jolt BEFORE destroying
-      // it — after DestroyBody the handle is dead. Matched to the zombie's
-      // limbs by name (PendingRise::bodyMap) on the far side of the spawn.
-      struct RagPose { std::string name; BodyTransform xf; };
-      std::vector<RagPose> ragPose;
-      if (phys_ && !r.bodyMap.empty()) {
-        ragPose.reserve(r.bodyMap.size());
-        for (const auto& bm : r.bodyMap) {
-          BodyTransform xf;
-          if (phys_->GetTransform(bm.body, xf))
-            ragPose.push_back({bm.name, xf});
-        }
+    // WHERE EACH LIMB LIES, so the zombie rises from where the corpse is and
+    // not from where it died.
+    BodyTransform xf = L.xf;
+    if (phys_) phys_->GetTransform(L.body, xf);
+    ragPose.push_back({name, xf});
+    // Only limbs the body actually LOST SOMETHING from travel — `carved` is
+    // the latch a carve or a burn sets the first time it takes a voxel, so an
+    // untouched arm is rebuilt from the def for free on the far side.
+    if (!L.carved) continue;
+    // Tombstones the burn left between flushes do not rise with it.
+    src->StripBurnTombstones(L);
+    RiseLimb rl;
+    rl.name = name;
+    rl.hp = L.hp;
+    rl.restOffset = L.restOffset;
+    rl.anchorRoot = L.anchorRoot;
+    rl.anchorLimb = L.anchorLimb;
+    rl.size = L.size;
+    rl.voxels = std::move(L.voxels);
+    rl.skinVoxels = std::move(L.skinVoxels);
+    limbs.push_back(std::move(rl));
+  }
+  // ---- AND ITS KIT ---------------------------------------------------------
+  // The same walk the loot panel reads (Mob::LootPieces' worn/held half): the
+  // identity shell carries the dye, CaptureWorn carries the damage, and a
+  // piece whose identity panel is gone stays gone.
+  struct RiseGear {
+    std::string item;
+    int equipSlot = -1;
+    bool held = false;
+    uint32_t dye = 0;
+    WornDamage damage;
+  };
+  std::vector<RiseGear> gear;
+  for (size_t pi = 0; pi < src->worn_.size(); pi++) {
+    const Mob::WornPiece& p = src->worn_[pi];
+    const int idSlot = src->IdentityShellOf((int)pi);
+    if (idSlot < 0 || idSlot >= (int)src->limbs_.size() ||
+        !src->limbs_[idSlot].body)
+      continue;
+    RiseGear g;
+    g.item = p.item;
+    g.equipSlot = p.equipSlot;
+    g.dye = src->limbs_[idSlot].dye;
+    src->CaptureWorn(p.equipSlot, g.damage);
+    gear.push_back(std::move(g));
+  }
+  if (src->heldSlot_ >= 0 && src->heldSlot_ < (int)src->limbs_.size() &&
+      src->limbs_[src->heldSlot_].body && !src->heldItem_.empty()) {
+    RiseGear g;
+    g.item = src->heldItem_;
+    g.held = true;
+    gear.push_back(std::move(g));
+  }
+  // ---- AND ITS PACK --------------------------------------------------------
+  // Without this, turning would be a way to delete a purse.
+  std::vector<CarriedItem> carried = src->carried_;
+  // ---- ...AND, FOR THE AVATAR, THE PLAYER'S OWN KIT ------------------------
+  //
+  // The player's bag and hotbar are not on the player's body — they are in
+  // PlayerKit on the session, which this class cannot reach and must not
+  // (game/session.h: per-player state is not a process global). So the owner
+  // of the kit answers the question, at the one moment the answer is wanted.
+  // The callback also decides whether the player KEEPS what it hands back
+  // (`avatar.keepKitOnTurn`); see MobSystem::SetAvatarKitFn.
+  if (avatar && avatarKitFn_) {
+    std::vector<CarriedItem> kit;
+    avatarKitFn_(kit);
+    for (CarriedItem& c : kit)
+      if (!c.item.empty() && c.count > 0) carried.push_back(std::move(c));
+  }
+
+  // ---- THE REMAINS COME OUT OF THE WORLD FIRST -----------------------------
+  //
+  // A corpse that got up is not still lying there, and spawning a rig inside
+  // its own flesh hands Jolt a dozen deep overlaps at once (the same
+  // penetration that used to fire ragdolls out of the player's capsule).
+  // ReleaseRig is the no-corpse teardown: the bodies go, nothing is handed to
+  // DebrisSystem. `src` is dead after this for an NPC (swap-with-back).
+  src->ReleaseRig();
+  if (avatar) {
+    // The avatar keeps its (empty) limb list for the death screen, exactly as
+    // a released rig does (ReleaseRigToDebris zeroes the same readout).
+    std::fill(src->anim_.partAlive.begin(), src->anim_.partAlive.end(), 0);
+    src->rigReleased_ = true;
+    src->MarkInstancesDirty();
+  } else {
+    mobs_[srcIndex] = std::move(mobs_.back());
+    mobs_.pop_back();
+  }
+  src = nullptr;
+  consume();
+
+  // ---- WHAT HAPPENED TO IT IS NOT RE-ROLLED -------------------------------
+  //
+  // `loading_` is the flag that keeps spawn-time rot (MobRotDef) off a body
+  // whose damage is about to be restored, and it means exactly the same thing
+  // here as it does in LoadState. Only when there IS a capture: a body that
+  // died without a mark on it still rots as it turns, which is the reading
+  // `rot` was authored for and the behaviour every arm of `undead` stands on.
+  const bool restoring = !limbs.empty();
+  const bool wasLoading = loading_;
+  if (restoring) loading_ = true;
+  const uint64_t id =
+      Spawn(at, {ifloor(atPos.x), ifloor(atPos.y), ifloor(atPos.z)});
+  loading_ = wasLoading;
+  instancesDirty_ = true;
+  if (id == 0) return true;   // physics refused a body: it stays down
+  Mob& now = mobs_.back();
+  now.origin_ = atPos;
+  now.heading_ = now.desiredHeading_ = heading;
+  now.bodyY_ = bodyY;
+  now.anim_.lastPos = atPos;
+  // ---- IT GETS UP AS DAMAGED AS IT WENT DOWN -------------------------------
+  //
+  // The carve pass of MobSystem::LoadState, replayed: the captured lattice and
+  // the rig offsets the carve shifted replace the authored ones, the micro
+  // brick is re-derived from the new lattice, and the Jolt body is rebuilt to
+  // the carved shape. BEFORE the severs below, exactly as in LoadState:
+  // DetachLimb recurses into children, so doing it first would operate on
+  // limbs this loop still needs.
+  size_t restored = 0, repainted = 0;
+  // Remap tables for the gradual skin tint: a voxel painted with human merged
+  // index H (or zombie merged index Z) is redirected to a DEDICATED shared
+  // palette entry whose RGB starts at the human colour and lerps to the zombie
+  // colour over 60 seconds.
+  uint8_t humanToTint[256] = {};
+  uint8_t zombieToTint[256] = {};
+  if (restoring) {
+    const int wasAt = FindDef(wasDef);
+    const std::vector<int16_t> recolour =
+        wasAt >= 0 ? RisenArtRemap(defs_[wasAt].prefab, defs_[at].prefab)
+                   : std::vector<int16_t>();
+    // ---- ALLOCATE DEDICATED PALETTE ENTRIES --------------------------------
+    //
+    // One per art colour that changed between the living body and the undead
+    // one. Initialised to the LIVING colour, so the creature rises looking
+    // like it did when it died; PreTick lerps the RGB toward the zombie colour
+    // over kTurnTintSeconds.
+    if (!recolour.empty() && microSet_) {
+      for (size_t s = 1; s < recolour.size(); s++) {
+        if (recolour[s] < 0 || recolour[s] == (int16_t)s) continue;
+        uint8_t hIdx = (uint8_t)s, zIdx = (uint8_t)recolour[s];
+        if (hIdx == 0 || zIdx == 0) continue;
+        if ((size_t)(hIdx - 1) >= microSet_->artColors.size() ||
+            (size_t)(zIdx - 1) >= microSet_->artColors.size()) continue;
+        uint32_t hRgb = microSet_->artColors[hIdx - 1];
+        uint32_t zRgb = microSet_->artColors[zIdx - 1];
+        if (hRgb == zRgb) continue;
+        size_t slot = microSet_->artColors.size();
+        if (slot >= kArtPaletteSlotsGpu) break;
+        microSet_->artColors.push_back(hRgb);
+        uint8_t m = (uint8_t)(slot + 1);
+        humanToTint[hIdx] = m;
+        zombieToTint[zIdx] = m;
+        now.turnTintSlots_.push_back({slot, hRgb, zRgb});
+        repainted++;
       }
-      // THE REMAINS COME OUT OF THE WORLD FIRST. A corpse that got up is not
-      // still lying there, and spawning a rig inside its own flesh hands Jolt
-      // a dozen deep overlaps at once (the same penetration that used to fire
-      // ragdolls out of the player's capsule, Mob::Die).
-      if (debris_ != nullptr)
-        for (uint64_t b : r.bodies) debris_->DestroyBody(b);
-      // ---- WHAT HAPPENED TO IT IS NOT RE-ROLLED -----------------------------
-      //
-      // `loading_` is the flag that keeps spawn-time rot (MobRotDef) off a body
-      // whose damage is about to be restored, and it means exactly the same
-      // thing here as it does in LoadState: this body's holes are already
-      // known, so drawing a fresh set on top of them would bury the wound that
-      // killed it under noise that never happened.
-      //
-      // Only when there IS a capture. A body that died without a mark on it
-      // (an infected creature that starved, a fixture killed outright) still
-      // rots as it turns, which is the reading `rot` was authored for and the
-      // behaviour every arm of `undead` stands on.
-      const bool restoring = !r.limbs.empty();
-      const bool wasLoading = loading_;
-      if (restoring) loading_ = true;
-      const uint64_t id = Spawn(at, {ifloor(r.at.x), ifloor(r.at.y),
-                                     ifloor(r.at.z)});
-      loading_ = wasLoading;
-      if (id != 0) {
-        Mob& now = mobs_.back();
-        now.origin_ = r.at;
-        now.heading_ = now.desiredHeading_ = r.heading;
-        now.bodyY_ = r.bodyY;
-        now.anim_.lastPos = r.at;
-        // ---- IT GETS UP AS DAMAGED AS IT WENT DOWN -------------------------
-        //
-        // The carve pass of MobSystem::LoadState, replayed: the captured
-        // lattice and the rig offsets the carve shifted replace the authored
-        // ones, the micro brick is re-derived from the new lattice, and the
-        // Jolt body is rebuilt to the carved shape. Same three steps, same
-        // order, same reason — the lattice is the truth and everything else is
-        // derived from it.
-        //
-        // BEFORE the severs below, exactly as in LoadState: DetachLimb recurses
-        // into children, so doing it first would operate on limbs this loop
-        // still needs.
-        size_t restored = 0, repainted = 0;
-        // Remap tables for the gradual skin tint: a voxel painted with
-        // human merged index H (or zombie merged index Z) is redirected to
-        // a DEDICATED shared palette entry whose RGB starts at the human
-        // colour and lerps to the zombie colour over 60 seconds.
-        uint8_t humanToTint[256] = {};
-        uint8_t zombieToTint[256] = {};
-        if (restoring) {
-          const int wasDef = FindDef(r.def);
-          const std::vector<int16_t> recolour =
-              wasDef >= 0 ? RisenArtRemap(defs_[wasDef].prefab,
-                                          defs_[at].prefab)
-                          : std::vector<int16_t>();
-          // ---- ALLOCATE DEDICATED PALETTE ENTRIES ----------------------------
-          //
-          // One per art colour that changed between the living body and the
-          // undead one. Initialised to the LIVING colour, so the creature
-          // rises looking like it did when it died; PreTick lerps the RGB
-          // toward the zombie colour over kTurnTintSeconds.
-          if (!recolour.empty() && microSet_) {
-            for (size_t s = 1; s < recolour.size(); s++) {
-              if (recolour[s] < 0 || recolour[s] == (int16_t)s) continue;
-              uint8_t hIdx = (uint8_t)s, zIdx = (uint8_t)recolour[s];
-              if (hIdx == 0 || zIdx == 0) continue;
-              if ((size_t)(hIdx - 1) >= microSet_->artColors.size() ||
-                  (size_t)(zIdx - 1) >= microSet_->artColors.size()) continue;
-              uint32_t hRgb = microSet_->artColors[hIdx - 1];
-              uint32_t zRgb = microSet_->artColors[zIdx - 1];
-              if (hRgb == zRgb) continue;
-              size_t slot = microSet_->artColors.size();
-              if (slot >= kArtPaletteSlotsGpu) break;
-              microSet_->artColors.push_back(hRgb);
-              uint8_t m = (uint8_t)(slot + 1);
-              humanToTint[hIdx] = m;
-              zombieToTint[zIdx] = m;
-              now.turnTintSlots_.push_back({slot, hRgb, zRgb});
-              repainted++;
-            }
-            now.turnTintT_ = 0.0f;
+      now.turnTintT_ = 0.0f;
+    }
+    for (RiseLimb& rl : limbs) {
+      int slot = -1;
+      for (size_t k = 0; k < now.limbs_.size() && k < defs_[at].limbs.size(); k++)
+        if (defs_[at].limbs[k].name == rl.name) { slot = (int)k; break; }
+      if (slot < 0 || !now.limbs_[slot].body) continue;
+      if (rl.voxels.empty()) continue;   // nothing left to stand up
+      // Captured limbs carry human merged indices — remap to the dedicated
+      // tint entries so they start at the living colour.
+      for (DebrisVoxel& v : rl.voxels)
+        if (v.color && humanToTint[v.color]) v.color = humanToTint[v.color];
+      for (PrefabVoxel& v : rl.skinVoxels)
+        if (v.color && humanToTint[v.color]) v.color = humanToTint[v.color];
+      MobLimb& L = now.limbs_[slot];
+      L.hp = rl.hp;
+      L.voxels = std::move(rl.voxels);
+      L.skinVoxels = std::move(rl.skinVoxels);
+      L.size = rl.size;
+      L.restOffset = rl.restOffset;
+      L.anchorRoot = rl.anchorRoot;
+      L.anchorLimb = rl.anchorLimb;
+      if (L.microModel >= 0)
+        now.ReskinLimbMicro(L, now.SkinScaleOf(L), now.PhysScaleOf(L));
+      now.RebuildLimbBody(slot);
+      restored++;
+    }
+    // ---- NON-CAPTURED LIMBS START HUMAN-COLOURED TOO ----------------------
+    //
+    // Without this, pristine limbs spawn at the zombie palette (grey) while
+    // carved limbs start at the human palette (warm), which reads as a pop
+    // rather than a transition. Their voxels carry ZOMBIE merged indices —
+    // remap through zombieToTint.
+    if (!now.turnTintSlots_.empty()) {
+      for (size_t k = 0; k < now.limbs_.size() && k < defs_[at].limbs.size();
+           k++) {
+        MobLimb& L = now.limbs_[k];
+        if (!L.body || L.carved) continue;
+        bool changed = false;
+        for (PrefabVoxel& v : L.skinVoxels)
+          if (v.color && zombieToTint[v.color]) {
+            v.color = zombieToTint[v.color]; changed = true;
           }
-          for (PendingRise::RiseLimb& rl : r.limbs) {
-            int slot = -1;
-            for (size_t k = 0;
-                 k < now.limbs_.size() && k < defs_[at].limbs.size(); k++)
-              if (defs_[at].limbs[k].name == rl.name) { slot = (int)k; break; }
-            if (slot < 0 || !now.limbs_[slot].body) continue;
-            if (rl.voxels.empty()) continue;   // nothing left to stand up
-            // Captured limbs carry human merged indices — remap to the
-            // dedicated tint entries so they start at the living colour.
-            for (DebrisVoxel& v : rl.voxels)
-              if (v.color && humanToTint[v.color])
-                v.color = humanToTint[v.color];
-            for (PrefabVoxel& v : rl.skinVoxels)
-              if (v.color && humanToTint[v.color])
-                v.color = humanToTint[v.color];
-            MobLimb& L = now.limbs_[slot];
-            L.hp = rl.hp;
-            L.voxels = std::move(rl.voxels);
-            L.skinVoxels = std::move(rl.skinVoxels);
-            L.size = rl.size;
-            L.restOffset = rl.restOffset;
-            L.anchorRoot = rl.anchorRoot;
-            L.anchorLimb = rl.anchorLimb;
-            if (L.microModel >= 0)
-              now.ReskinLimbMicro(L, now.SkinScaleOf(L), now.PhysScaleOf(L));
-            now.RebuildLimbBody(slot);
-            restored++;
+        for (DebrisVoxel& v : L.voxels)
+          if (v.color && zombieToTint[v.color]) {
+            v.color = (uint8_t)zombieToTint[v.color]; changed = true;
           }
-          // ---- NON-CAPTURED LIMBS START HUMAN-COLOURED TOO ------------------
-          //
-          // Without this, pristine limbs spawn at the zombie palette (grey)
-          // while carved limbs start at the human palette (warm), which reads
-          // as a pop rather than a transition. Their voxels carry ZOMBIE
-          // merged indices — remap through zombieToTint.
-          if (!now.turnTintSlots_.empty()) {
-            for (size_t k = 0;
-                 k < now.limbs_.size() && k < defs_[at].limbs.size(); k++) {
-              MobLimb& L = now.limbs_[k];
-              if (!L.body || L.carved) continue;
-              bool changed = false;
-              for (PrefabVoxel& v : L.skinVoxels)
-                if (v.color && zombieToTint[v.color]) {
-                  v.color = zombieToTint[v.color]; changed = true;
-                }
-              for (DebrisVoxel& v : L.voxels)
-                if (v.color && zombieToTint[v.color]) {
-                  v.color = (uint8_t)zombieToTint[v.color]; changed = true;
-                }
-              if (changed && L.microModel >= 0)
-                now.ReskinLimbMicro(L, now.SkinScaleOf(L), now.PhysScaleOf(L));
-            }
-          }
-        }
-        // What it was already missing stays missing — by NAME, as in TurnMob,
-        // and adopt=false because those pieces are lying where they fell.
-        for (size_t k = 0; k < now.limbs_.size() && k < defs_[at].limbs.size();
-             k++)
-          if (std::find(r.lost.begin(), r.lost.end(), defs_[at].limbs[k].name) !=
-              r.lost.end())
-            if (now.limbs_[k].body) now.DetachLimb((int)k, false);
-        // ---- AND IN THE KIT IT FELL IN -------------------------------------
-        //
-        // The remains — its armour among them — were destroyed above, so a
-        // rising that did not re-dress would be a way to delete a suit of
-        // plate. Re-equipped by NAME through the ordinary wear/hold path
-        // (item.h's index hazard: an ItemLibrary index is file order and dies
-        // on an R reload), with the damage the piece carried at death and the
-        // colour it was dyed, so what gets up is wearing the same battered
-        // tunic the villager was buried in rather than a new one.
-        //
-        // Shells appended AFTER the limb restore above on purpose: WearItem
-        // appends rig slots past the base limbs, and the restore addresses
-        // base limbs by def index. Doing it the other way round would be
-        // correct too, but only by accident.
-        size_t dressed = 0;
-        for (const PendingRise::RiseGear& g : r.gear) {
-          const ItemDef* item =
-              items_ != nullptr ? items_->At(items_->Find(g.item)) : nullptr;
-          if (item == nullptr) continue;   // retired item: it rises without it
-          const bool ok =
-              g.held ? now.EquipItem(item)
-                     : now.WearItem(item, g.equipSlot,
-                                    g.damage.Empty() ? nullptr : &g.damage,
-                                    g.dye);
-          if (ok) dressed++;
-        }
-        // ---- AND WITH THE PACK IT FELL WITH --------------------------------
-        //
-        // Through AddCarried rather than a straight assignment, so the merge
-        // and the cap are the ones every other pack obeys: a player who died
-        // holding three part-stacks of the same arrow rises with one, and a
-        // rising can never be the thing that puts a body over kMaxCarried.
-        size_t packed = 0;
-        for (const CarriedItem& c : r.carried)
-          if (now.AddCarried(c.item, c.count, c.dye)) packed++;
-        // ---- IT RISES FROM WHERE IT FELL, NOT FROM STANDING ----------------
-        //
-        // Teleport each of the zombie's limbs to the debris body's last
-        // settled position and start the get-up blend. Without this the
-        // corpse vanishes and the zombie pops in upright: a discontinuity
-        // on a creature the player is watching. BeginGetUp reads the limbs
-        // back from Jolt, derives heading from the chest, probes the ground
-        // and enters RagdollPhase::GetUp — the same path a blast knockdown
-        // follows.
-        if (!ragPose.empty() && phys_ && world_) {
-          for (const auto& rp : ragPose) {
-            for (size_t k = 0;
-                 k < now.limbs_.size() && k < defs_[at].limbs.size(); k++) {
-              if (defs_[at].limbs[k].name != rp.name) continue;
-              MobLimb& L = now.limbs_[k];
-              if (!L.body) continue;
-              float q[4] = {rp.xf.quat[0], rp.xf.quat[1],
-                            rp.xf.quat[2], rp.xf.quat[3]};
-              phys_->SetBodyTransform(L.body, rp.xf.pos, q);
-              break;
-            }
-          }
-          now.BeginGetUp(*world_);
-        }
-        std::printf("mob: '%s' got up as '%s' (%zu/%zu limbs as they were over "
-                    "%zu repainted art slots, %zu/%zu pieces of kit, "
-                    "%zu/%zu stacks in the pack)\n",
-                    r.def.c_str(), defs_[at].name.c_str(), restored,
-                    r.limbs.size(), repainted, dressed, r.gear.size(), packed,
-                    r.carried.size());
+        if (changed && L.microModel >= 0)
+          now.ReskinLimbMicro(L, now.SkinScaleOf(L), now.PhysScaleOf(L));
       }
     }
-    rises_[i] = std::move(rises_.back());
-    rises_.pop_back();
   }
-  instancesDirty_ = true;
+  // What it was already missing stays missing — by NAME, as in TurnMob, and
+  // adopt=false because those pieces are lying where they fell.
+  for (size_t k = 0; k < now.limbs_.size() && k < defs_[at].limbs.size(); k++)
+    if (std::find(lost.begin(), lost.end(), defs_[at].limbs[k].name) !=
+        lost.end())
+      if (now.limbs_[k].body) now.DetachLimb((int)k, false);
+  // ---- AND IN THE KIT IT FELL IN -------------------------------------------
+  //
+  // Re-equipped by NAME through the ordinary wear/hold path (item.h's index
+  // hazard), with the damage the piece carried and the colour it was dyed, so
+  // what gets up is wearing the same battered tunic the villager fell in.
+  // Shells appended AFTER the limb restore above on purpose: WearItem appends
+  // rig slots past the base limbs, and the restore addresses base limbs by def
+  // index.
+  size_t dressed = 0;
+  for (const RiseGear& g : gear) {
+    const ItemDef* item =
+        items_ != nullptr ? items_->At(items_->Find(g.item)) : nullptr;
+    if (item == nullptr) continue;   // retired item: it rises without it
+    const bool ok =
+        g.held ? now.EquipItem(item)
+               : now.WearItem(item, g.equipSlot,
+                              g.damage.Empty() ? nullptr : &g.damage, g.dye);
+    if (ok) dressed++;
+  }
+  // ---- AND WITH THE PACK IT FELL WITH --------------------------------------
+  // Through AddCarried, so the merge and the cap are the ones every other pack
+  // obeys.
+  size_t packed = 0;
+  for (const CarriedItem& c : carried)
+    if (now.AddCarried(c.item, c.count, c.dye)) packed++;
+  // ---- IT RISES FROM WHERE IT FELL, NOT FROM STANDING ----------------------
+  //
+  // Teleport each of the zombie's limbs to where the corpse's limb lay and
+  // start the get-up blend. BeginGetUp reads the limbs back from Jolt, derives
+  // heading from the chest, probes the ground and enters RagdollPhase::GetUp —
+  // the same path a blast knockdown follows.
+  if (!ragPose.empty() && phys_ && world_) {
+    for (const RagPose& rp : ragPose) {
+      for (size_t k = 0; k < now.limbs_.size() && k < defs_[at].limbs.size();
+           k++) {
+        if (defs_[at].limbs[k].name != rp.name) continue;
+        MobLimb& L = now.limbs_[k];
+        if (!L.body) continue;
+        float q[4] = {rp.xf.quat[0], rp.xf.quat[1], rp.xf.quat[2],
+                      rp.xf.quat[3]};
+        phys_->SetBodyTransform(L.body, rp.xf.pos, q);
+        break;
+      }
+    }
+    now.BeginGetUp(*world_);
+  }
+  std::printf("mob: '%s' got up as '%s' (%zu/%zu limbs as they were over "
+              "%zu repainted art slots, %zu/%zu pieces of kit, "
+              "%zu/%zu stacks in the pack)\n",
+              wasDef.c_str(), defs_[at].name.c_str(), restored, limbs.size(),
+              repainted, dressed, gear.size(), packed, carried.size());
+  return true;
+}
+
+void MobSystem::SettleDeadAvatar(Mob& av) {
+  if (av.alive_ || av.rigReleased_) return;
+  // The rising first, if one is booked: the respawn is about to rebuild this
+  // rig, and the corpse getting up is the one thing that must read it.
+  for (size_t i = 0; i < rises_.size(); i++)
+    if (rises_[i].mobId == av.id_) {
+      // Forced: a respawn does not wait for the clock. If the living cap is
+      // full the corpse cannot stand up here, and falls to debris instead.
+      if (ServiceRising(i) && av.rigReleased_) return;
+      break;
+    }
+  av.ReleaseRigToDebris();
 }
 
 // ---- A CREATURE GETS UP AS SOMETHING ELSE ----------------------------------
@@ -2782,6 +2916,9 @@ void Mob::MarkInstancesDirty() {
   // Every lattice writer lands here (or on a coat flag, which sets this too),
   // so this is what wakes the joint-twin sync (Mob::SyncJointTwins).
   twinDirty_ = true;
+  // ...and a SLEEPING CORPSE: anything that rewrote its lattice is a reason
+  // for its passes to look at it again (Mob::DeadAsleep).
+  if (!alive_) WakeDead();
 }
 
 // Draws this mob's own bleed character. Entity-scoped variances resolve here,
@@ -2929,6 +3066,111 @@ Mob* MobSystem::FindMobById(uint64_t id) {
   return nullptr;
 }
 
+// ---- THE DEAD, COUNTED AND BOUNDED (PLAN_corpse_is_a_mob.md) -----------------
+
+uint32_t MobSystem::LiveMobCount() const {
+  uint32_t n = 0;
+  for (const Mob& m : mobs_)
+    if (m.alive_) n++;
+  return n;
+}
+
+uint32_t MobSystem::DeadMobCount() const {
+  uint32_t n = 0;
+  for (const Mob& m : mobs_)
+    if (!m.alive_ && !m.rigReleased_) n++;
+  return n;
+}
+
+uint32_t MobSystem::DeadAsleepCount() const {
+  uint32_t n = 0;
+  for (const Mob& m : mobs_)
+    if (!m.alive_ && !m.rigReleased_ && m.deadAsleep_) n++;
+  return n;
+}
+
+void MobSystem::EvictDead() {
+  // Bounded by construction: every pass releases one corpse or returns.
+  for (;;) {
+    uint32_t n = 0, bodies = 0;
+    Mob* oldest = nullptr;
+    for (Mob& m : mobs_) {
+      if (m.alive_ || m.rigReleased_) continue;
+      n++;
+      bodies += m.LimbBodyCount();
+      // A corpse about to get up is not the one to decay: the rising reads
+      // its rig, and the booking itself is bounded (kMaxRisings).
+      if (RisingPending(m.id_)) continue;
+      if (oldest == nullptr || m.deathSeq_ < oldest->deathSeq_) oldest = &m;
+    }
+    if (n <= kMaxDeadMobs && bodies <= kMaxDeadBodies) return;
+    if (oldest == nullptr) return;
+    // The OLD corpse lifetime is the tail of the new one: the rig goes to
+    // DebrisSystem exactly as every corpse used to at the instant of death,
+    // and debris's own 200-body FIFO cull and settle-back finish it.
+    oldest->ReleaseRigToDebris();
+    deadEvicted_++;
+  }
+}
+
+void MobSystem::UpdateDeadSleep(World& world) {
+  for (Mob& m : mobs_) {
+    if (m.alive_ || m.rigReleased_ || m.deadAsleep_) continue;
+    if (!m.DeadQuietNow()) {
+      m.deadQuiet_ = 0;
+      continue;
+    }
+    if (m.deadQuiet_ < 0xFFFFu) m.deadQuiet_++;
+    if (m.deadQuiet_ >= kDeadSleepTicks) {
+      m.deadAsleep_ = true;
+      m.deadWakeKey_ = m.DeadWakeKey(world);
+    }
+  }
+}
+
+bool MobSystem::RemoveMob(uint64_t id) {
+  for (size_t i = 0; i < mobs_.size(); i++) {
+    if (mobs_[i].id_ != id) continue;
+    mobs_[i].ReleaseRig();
+    mobs_[i] = std::move(mobs_.back());
+    mobs_.pop_back();
+    instancesDirty_ = true;
+    return true;
+  }
+  return false;
+}
+
+uint64_t MobSystem::GrabbableDeadLimb(uint64_t body) const {
+  if (!body) return 0;
+  for (const Mob& m : mobs_) {
+    if (m.alive_ || m.rigReleased_) continue;
+    for (size_t i = 0; i < m.limbs_.size(); i++) {
+      if (m.limbs_[i].body != body) continue;
+      if (m.limbs_[i].holdSeconds > 0) return 0;   // leaving: not the corpse's
+      // A GARMENT IS HELD BY WHAT IT IS ON: a follower has no dynamics of its
+      // own (grab.h's note on a strapped shell, for the same reason).
+      const int host = m.limbs_[i].wornHost;
+      if (host >= 0 && host < (int)m.limbs_.size()) return m.limbs_[host].body;
+      return body;
+    }
+  }
+  return 0;
+}
+
+uint64_t MobSystem::DeadFollowerHost(uint64_t body) const {
+  if (!body) return 0;
+  for (const Mob& m : mobs_) {
+    if (m.alive_ || m.rigReleased_) continue;
+    for (size_t i = 0; i < m.limbs_.size(); i++) {
+      if (m.limbs_[i].body != body) continue;
+      const int host = m.limbs_[i].wornHost;
+      return host >= 0 && host < (int)m.limbs_.size() ? m.limbs_[host].body
+                                                       : 0ull;
+    }
+  }
+  return 0;
+}
+
 // ---- WHO A BLOW IS AIMED AT, AND THE PLAYER IS A WHO ------------------------
 //
 // `FindMobById` answers over `mobs_`, and the avatar is a Mob that is NOT in it
@@ -2989,7 +3231,8 @@ bool MobSystem::UnwearItem(uint64_t mobId, int equipSlot) {
 
 uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   if (defIndex < 0 || defIndex >= (int)defs_.size()) return 0;
-  if (mobs_.size() >= kMaxMobs) return 0;
+  // THE LIVING cap: a corpse does not hold a spawn slot (kMaxDeadMobs is its).
+  if (!HasRoomToSpawn()) return 0;
   const MobDef& def = defs_[defIndex];
 
   Mob mob;
@@ -3109,6 +3352,12 @@ static void BuildAuthoredLattice(const MobDef& def, size_t i,
 bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   if (!phys_ || !sys_) return false;
   origin_ = origin;
+  // A new rig is nobody's corpse (the avatar respawns into the same object).
+  rigReleased_ = false;
+  deadAsleep_ = false;
+  deadQuiet_ = 0;
+  deadWakeKey_ = 0;
+  deathSeq_ = 0;
   bodyUp_ = Vec3{0, 1, 0};
   footInit_ = false;
   speedNow_ = 0;
@@ -6713,6 +6962,12 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // drive. No-op (one null check) until the network layer installs a
   // function, which is why this package does not move the world hash.
   RefreshOwnership();
+  // THE CORPSES WHOSE CLOCK CAME ROUND STAND UP — FIRST, before any pass has
+  // touched the dead this tick, so what gets up is the body exactly as it lay
+  // at the end of the last one (the rot in it does not get one more tick's say
+  // on the risen lattice). Outside every loop over mobs_: this spawns, and a
+  // spawn pushes to the vector those loops walk by index.
+  ServiceRisings(tick);
   // Per-voxel burning and dissolution, once per TICK — never per frame. The
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
@@ -6773,6 +7028,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     actors_.push_back(std::move(a));
   }
 
+  // THE DEAD CAP, before anybody steps: a corpse released here is a husk
+  // the loop below sweeps in this same pass once its holds are over.
+  EvictDead();
+
   for (size_t mi = 0; mi < mobs_.size();) {
     Mob& mob = mobs_[mi];
     const MobDef& def = defs_[mob.defIndex_];
@@ -6789,14 +7048,16 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // would be the only thing bounding a walking crowd's queues.
     mob.ClearFootfalls();
 
-    // corpses hand their bodies to DebrisSystem in Die(); drop the husk once
-    // no limb is still holding a pose
-    if (!mob.alive_) {
+    // A HUSK: a rig that went to DebrisSystem (the dead cap, the window, a
+    // ghost's death — Mob::ReleaseRigToDebris). Dropped once no limb is still
+    // holding a severed piece's pose.
+    if (mob.rigReleased_) {
       bool holding = false;
       for (const MobLimb& l : mob.limbs_) holding |= l.holdBody != 0;
       if (!holding) {
         mobs_[mi] = std::move(mobs_.back());
         mobs_.pop_back();
+        instancesDirty_ = true;
         continue;
       }
       mi++;
@@ -6810,6 +7071,15 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
                mob.origin_.x > wlo.x + (float)kWorldN + kPad ||
                mob.origin_.y > wlo.y + (float)kWorldN + kPad ||
                mob.origin_.z > wlo.z + (float)kWorldN + kPad;
+    if (out && !mob.alive_) {
+      // A CORPSE THAT LEAVES THE WINDOW decays to debris, which is what every
+      // corpse did before it was a Mob: DebrisSystem's own window rule takes
+      // it from there. Not parked — the dead are not in the record format yet
+      // (MOBS v6, PLAN_corpse_is_a_mob.md P2a). Swept as a husk next pass.
+      mob.ReleaseRigToDebris();
+      mi++;
+      continue;
+    }
     if (out) {
       // PARKED, NOT FORGOTTEN (save plan S5b; mob.h SetParkFn). The record is
       // written BEFORE the rig is released -- SaveOne reads the live limbs --
@@ -6827,6 +7097,56 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       mobs_[mi] = std::move(mobs_.back());
       mobs_.pop_back();
       instancesDirty_ = true;
+      continue;
+    }
+
+    // ---- THE DEAD: A PERMANENT LIMP RAGDOLL (PLAN_corpse_is_a_mob.md) ------
+    //
+    // The matter passes run on it elsewhere in the tick (burn, rot and the
+    // joint twins in BurnLimbs, stain/rain/dry/wet in StainLimbs, splatter,
+    // every damage entry point); here it only keeps its walk anchor under the
+    // pelvis, keeps the ground under it collidable and pays out its wounds.
+    // No AI, no steering, no gait or pose, no stroke, no get-up and no fall
+    // damage — the agency passes are simply never reached.
+    //
+    // ASLEEP it costs one Jolt activity test and one chunk-version digest a
+    // tick (rule 2): nothing it could change, and nothing around it changed.
+    // The terrain anchor is still re-registered on a stride, or the patch it
+    // is lying on would be evicted and a woken corpse would fall through it.
+    if (!mob.alive_) {
+      // NOTHING LEFT OF IT: every limb burnt, rotted or cut away. What is left
+      // of a man who burned to nothing is nothing — and that includes his
+      // pack, exactly as the old corpse registry forgot an empty heap.
+      if (mob.LimbBodyCount() == 0) {
+        bool holding = false;
+        for (const MobLimb& l : mob.limbs_) holding |= l.holdBody != 0;
+        if (!holding) {
+          mob.ReleaseRig();   // bricks and burn indices; there are no bodies
+          mobs_[mi] = std::move(mobs_.back());
+          mobs_.pop_back();
+          instancesDirty_ = true;
+          continue;
+        }
+      }
+      if (mob.deadAsleep_) {
+        if (mob.RigActive() || mob.DeadWakeKey(world) != mob.deadWakeKey_) {
+          mob.WakeDead();
+        } else {
+          if ((tick + (uint32_t)mob.id_) % kDeadAnchorStride == 0) {
+            mob.RegisterTerrainAnchor();
+            deadAnchors_++;
+          }
+          mi++;
+          continue;
+        }
+      }
+      mob.RegisterTerrainAnchor();
+      deadAnchors_++;
+      mob.TickDeadLimp(dt);
+      // Wounds pay out and close; nothing refills them (the open stump's pump
+      // is `alive_`-gated in BleedTick), and DrainBlood cannot kill twice.
+      mob.BleedTick(tick, world, ops, spawns, bleedOps);
+      mi++;
       continue;
     }
 
@@ -6939,10 +7259,9 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // bursts (splatter). After every wound has bled, so a gout reaches the
   // creature beside it on the tick it happens.
   StainLimbs(tick, world);
-  // ...and the corpses whose clock came round stand up. LAST, and outside the
-  // loop above: this spawns, and a spawn pushes to the vector that loop is
-  // walking by index.
-  ServiceRisings(tick);
+  // Which corpses have gone quiet, now that every pass of the tick has had
+  // its say (the burn pass's idle verdict, the coat's recount, the bleed).
+  UpdateDeadSleep(world);
   // ---- GRADUAL SKIN TINT (the 60-second corpse-to-zombie palette fade) ----
   //
   // Each dedicated palette entry lerps from the living colour to the undead
@@ -8219,7 +8538,12 @@ float Mob::TotalHp() const {
 }
 
 bool Mob::DrainBlood(float voxels) {
-  if (!alive_ || !def_ || voxels <= 0.0f) return alive_;
+  // A CORPSE BLEEDS OUT FOR NOTHING: its wounds still pay out (BleedTick),
+  // but blood is health only while there is somebody to lose it, and nothing
+  // may die twice. `true` because the limb list is intact — the contract every
+  // caller reads is "may I keep touching `limb`", not "is it alive".
+  if (!alive_) return true;
+  if (!def_ || voxels <= 0.0f) return true;
   bloodLost_ += voxels;
   const float cost = voxels * CurrentTuning().gore.bleedHpPerVoxel;
   if (cost <= 0.0f) return true;
@@ -8327,7 +8651,10 @@ uint32_t Mob::SurfaceCount(const MobLimb& limb,
 }
 
 void Mob::RecountBurn(uint32_t tick, bool force) {
-  if (!burnFracDirty_ || !alive_ || !def_ || !sys_) return;
+  // A corpse's burnt fraction is still MEASURED (the gates and the HUD read
+  // it); only the cap's consequence — ApplyBurnCap's hp clamp and death — is
+  // the living's.
+  if (!burnFracDirty_ || rigReleased_ || !def_ || !sys_) return;
   if (!force && tick - burnRecountTick_ < kBurnRecountTicks &&
       burnRecountTick_ != 0)
     return;
@@ -8444,10 +8771,160 @@ float MobSystem::LimbBleedBudget(uint64_t mobId, int limbIndex) const {
   if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return -1.0f;
   return m->limbs_[limbIndex].bleedBudget;
 }
+bool MobSystem::LimbWoundOpen(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return false;
+  const MobLimb& l = m->limbs_[limbIndex];
+  return l.body != 0 && (l.bleedBudget >= 1.0f || l.gushTicks > 0);
+}
+Vec3 MobSystem::LimbWoundWorld(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return {};
+  const MobLimb& l = m->limbs_[limbIndex];
+  const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+  return l.xf.pos + Rotate(q, l.woundLocal);
+}
+uint32_t MobSystem::WoundedLimbCount(uint64_t mobId) const {
+  const Mob* m = FindMob(mobId);
+  if (!m) return 0;
+  uint32_t n = 0;
+  for (size_t i = 0; i < m->limbs_.size(); i++)
+    if (LimbWoundOpen(mobId, (int)i)) n++;
+  return n;
+}
+bool MobSystem::LimbPulping(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindMob(mobId);
+  return m && limbIndex >= 0 && limbIndex < (int)m->limbs_.size() &&
+         m->limbs_[limbIndex].bluntPulp;
+}
+Vec3 MobSystem::LimbPosition(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return {};
+  return m->limbs_[limbIndex].xf.pos;
+}
+Vec3 MobSystem::LimbNearestVoxelWorld(uint64_t mobId, int limbIndex,
+                                      Vec3 p) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return p;
+  const MobLimb& l = m->limbs_[limbIndex];
+  if (!l.body) return p;
+  const bool fine = l.HasFineSkin();
+  const float inv =
+      1.0f / (float)std::max(1u, fine ? m->SkinScaleOf(l) : m->PhysScaleOf(l));
+  const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+  Vec3 best = p;
+  float bestD = 1e30f;
+  auto test = [&](int x, int y, int z) {
+    const Vec3 w = l.xf.pos + Rotate(q, Vec3{((float)x + 0.5f) * inv,
+                                             ((float)y + 0.5f) * inv,
+                                             ((float)z + 0.5f) * inv});
+    const float d = (w - p).len();
+    if (d < bestD) { bestD = d; best = w; }
+  };
+  if (fine) {
+    for (const PrefabVoxel& v : l.skinVoxels)
+      if (v.material & 0xFFFu) test(v.x, v.y, v.z);
+  } else {
+    for (const DebrisVoxel& v : l.voxels)
+      if (v.payload & 0xFFFu) test(v.x, v.y, v.z);
+  }
+  return best;
+}
+uint32_t MobSystem::LimbVoxelsNearWorld(uint64_t mobId, int limbIndex, Vec3 p,
+                                        float radius) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return 0;
+  const MobLimb& l = m->limbs_[limbIndex];
+  if (!l.body) return 0;
+  const bool fine = l.HasFineSkin();
+  const float inv =
+      1.0f / (float)std::max(1u, fine ? m->SkinScaleOf(l) : m->PhysScaleOf(l));
+  const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+  uint32_t n = 0;
+  auto test = [&](int x, int y, int z) {
+    const Vec3 w = l.xf.pos + Rotate(q, Vec3{((float)x + 0.5f) * inv,
+                                             ((float)y + 0.5f) * inv,
+                                             ((float)z + 0.5f) * inv});
+    if ((w - p).len() <= radius) n++;
+  };
+  if (fine) {
+    for (const PrefabVoxel& v : l.skinVoxels)
+      if (v.material & 0xFFFu) test(v.x, v.y, v.z);
+  } else {
+    for (const DebrisVoxel& v : l.voxels)
+      if (v.payload & 0xFFFu) test(v.x, v.y, v.z);
+  }
+  return n;
+}
+uint32_t MobSystem::RewriteLimbMaterial(uint64_t mobId, int limbIndex,
+                                        uint32_t fromMat, uint32_t toMat,
+                                        uint32_t maxCount) {
+  Mob* m = FindMobById(mobId);
+  if (!m) m = AvatarById(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return 0;
+  MobLimb& l = m->limbs_[limbIndex];
+  if (!l.body) return 0;
+  const bool fine = l.HasFineSkin();
+  const size_t n = fine ? l.skinVoxels.size() : l.voxels.size();
+  uint32_t done = 0;
+  bool owned = false;
+  for (size_t i = 0; i < n && done < maxCount; i++) {
+    IVec3 p;
+    if (fine) {
+      PrefabVoxel& v = l.skinVoxels[i];
+      if ((uint32_t)(v.material & 0xFFFu) != fromMat) continue;
+      v.material = (uint16_t)((v.material & ~0xFFFu) | (toMat & 0xFFFu));
+      v.color = 0;
+      p = {v.x, v.y, v.z};
+    } else {
+      DebrisVoxel& v = l.voxels[i];
+      if ((uint32_t)(v.payload & 0xFFFu) != fromMat) continue;
+      v.payload = (uint16_t)((v.payload & ~0xFFFu) | (toMat & 0xFFFu));
+      v.color = 0;
+      p = {v.x, v.y, v.z};
+    }
+    done++;
+    if (!owned && l.microModel >= 0 && microSet_) {
+      const int own = MicroBodyOwn(*microSet_, (uint32_t)l.microModel);
+      if (own >= 0) {
+        l.microModel = own;
+        l.carved = true;
+        l.flipbookModel = -1;
+        owned = true;
+      }
+    }
+    if (owned)
+      MicroBodyPoke(*microSet_, (uint32_t)l.microModel, p.x, p.y, p.z,
+                    (uint8_t)toMat, 0);
+  }
+  if (done) {
+    if (fine) {
+      bool overflow = false;
+      l.voxels = DownsampleSkin(
+          l.skinVoxels,
+          std::max(1u, m->SkinScaleOf(l) / std::max(1u, m->PhysScaleOf(l))),
+          &overflow);
+    }
+    // The lattice now carries burning matter the index has never seen: the
+    // flag BurnOneLimb's cheap gate reads, exactly as a debris rewrite sets
+    // it through CorpseView.
+    Mob::DropBurnIndex(l.burn);
+    l.burn.alight = true;
+    m->burnFracDirty_ = true;
+    m->MarkInstancesDirty();
+  }
+  return done;
+}
+
+int32_t MobSystem::LimbMicroModel(uint64_t mobId, int limbIndex) const {
+  const Mob* m = FindMob(mobId);
+  if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return -1;
+  return m->limbs_[limbIndex].microModel;
+}
 const char* MobSystem::DeathCause(uint64_t mobId) const {
-  for (const Mob& m : mobs_)
-    if (m.id_ == mobId) return m.DeathCause();
-  return mobId && mobId == lastDeathId_ ? lastDeathCause_ : "";
+  // The corpse answers for itself: it is still here to ask.
+  const Mob* m = FindMob(mobId);
+  return m ? m->DeathCause() : "";
 }
 uint32_t MobSystem::LimbSurfaceAtSpawn(uint64_t mobId, int limbIndex) const {
   for (const Mob& m : mobs_)
@@ -8565,7 +9042,19 @@ void Mob::DriveWornShells() {
 }
 
 void MobSystem::PostStep() {
-  for (Mob& mob : mobs_) mob.PostStep();
+  for (Mob& mob : mobs_) {
+    if (mob.rigReleased_) continue;   // a husk owns no bodies
+    // AN ASLEEP CORPSE IS NOT READ BACK, clamped or re-dressed: nothing moved,
+    // and DriveWornShells would Activate its garments every tick for nothing.
+    // Unless Jolt says something did move it (a body landed on it, an
+    // explosion's impulse): then it is awake from this step on.
+    if (mob.deadAsleep_) {
+      if (!mob.RigActive()) continue;
+      mob.WakeDead();
+    }
+    if (!mob.alive_) deadPostSteps_++;
+    mob.PostStep();
+  }
 }
 
 // THE AVATAR IS SEARCHED LAST, EVERYWHERE. See MobSystem::SetAvatar for why it
@@ -8733,6 +9222,8 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // severable — you can cut the sword out of a hand) like any limb.
     const MobLimbDef& ld = limbDefs_[i];
     Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
+    // A blow on a sleeping corpse wakes it (Mob::DeadAsleep).
+    WakeDead();
     // ---- THE THREE INSTANT SEVERS, AND WHAT BECAME OF THEM ------------------
     //
     // 1. JOINT PROXIMITY (a hit within 1.75 voxels of the anchor severed
@@ -8761,7 +9252,10 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     const bool impactSevers = !inBluntCarve_ && !IsWornSlot((int)i) &&
                               ld.severImpactSpeed > 0 && impactBar > 0 &&
                               impactSpeed >= impactBar;
-    limb.hp -= amount;
+    // hp is LIFE: a corpse has none to lose, and a rising reads the hp its
+    // limbs died with (MobSystem::ServiceRising), not what was hacked off the
+    // body afterwards. The wound, the flash and the bleed still happen.
+    if (alive_) limb.hp -= amount;
     limb.woundLocal = RotateInv(q, hitWorldVoxel - limb.xf.pos);
     // ---- THE HIT FLASH ------------------------------------------------------
     // Set HERE rather than at the melee sweep, so it fires for every cause —
@@ -8796,7 +9290,10 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
             : 1.0f;
     limb.bleedBudget = AddBleedBudget(
         limb.bleedBudget, amount * def_->bleedPerDamage * bleedScale);
-    if (impactSevers || (limb.hp <= 0 && HpZeroSevers((int)i))) {
+    // hp reaching zero is a statement about DEATH, and a corpse has had its
+    // one: on the dead only the impact exception (a sword knocked out of a
+    // dead hand) still takes anything off.
+    if (impactSevers || (alive_ && limb.hp <= 0 && HpZeroSevers((int)i))) {
       // A MACE KILLS BUT DOES NOT DISMEMBER — on living tissue. Rotten undead
       // tissue falls apart either way, which is the whole visual difference
       // between beating a man and beating a zombie. Sever() on a vital limb
@@ -9161,12 +9658,15 @@ bool Mob::JointAttached(int limbIndex) const {
 }
 
 bool Mob::DropDisconnectedChildren(int parentIndex) {
-  if (!def_ || !alive_) return alive_;
+  // A CORPSE'S ARM FALLS OFF TOO when its shoulder is cut or rotted away:
+  // this is geometry, not a death transition. The return is "the rig is still
+  // this Mob's to touch", which a death no longer changes (Mob::Die keeps it).
+  if (!def_ || rigReleased_) return !rigReleased_;
   const int nl = std::min((int)limbs_.size(), (int)limbDefs_.size());
   if (parentIndex < 0 || parentIndex >= nl) return true;
   const std::string self = limbDefs_[parentIndex].name;  // by VALUE: Sever may
   if (self.empty()) return true;                         // reshape limbDefs_
-  for (int k = 0; k < nl && alive_; k++) {
+  for (int k = 0; k < nl && !rigReleased_; k++) {
     if (k == parentIndex || k >= (int)limbs_.size()) continue;
     if (k >= (int)limbDefs_.size() || limbDefs_[k].parent != self) continue;
     // A GARMENT IS NOT ANATOMY and a held sword is not a joint — the two
@@ -9178,7 +9678,7 @@ bool Mob::DropDisconnectedChildren(int parentIndex) {
     if (JointAttached(k)) continue;
     Sever(k);
   }
-  return alive_;
+  return !rigReleased_;
 }
 
 uint32_t Mob::DefaultSmearMat() const {
@@ -10049,7 +10549,9 @@ BurnLimbView Mob::ViewOf(MobLimb& limb) {
 }
 
 bool Mob::WoundsHeal() const {
-  return def_ && def_->woundHeals && CurrentTuning().gore.woundHeals;
+  // The DEAD do not heal: a soak on a corpse settles as the dead flesh it is
+  // (the reading a severed piece has always had, BurnLimbView's note).
+  return alive_ && def_ && def_->woundHeals && CurrentTuning().gore.woundHeals;
 }
 
 bool Mob::ReviveWoundVoxel(void* ctx, IVec3 p, uint32_t& word,
@@ -10637,7 +11139,8 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // carve's rebase shift is the frame the new lattice was computed in, and
   // re-reading Jolt would throw the shift away. DriveWornShells re-derives it
   // from the new anchorLimb in this same tick's PostStep either way.
-  if (!(alive_ && (ragdoll_ == RagdollPhase::Limp || limb.wornHost >= 0)))
+  // (A corpse is Limp for good, so it takes the limp branch too.)
+  if (!(ragdoll_ == RagdollPhase::Limp || limb.wornHost >= 0))
     phys_->GetTransform(limb.body, limb.xf);
   // What the old body was doing, for a LIMP limb: a rebuilt body starts at
   // rest, and a limb flying at 10 m/s that a burn or acid bite rebuilt at
@@ -10678,7 +11181,9 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // ...but a FOLLOWER is kinematic in every phase a live creature has: it is
   // not solved for, so a limp rig's garment does not go dynamic with the limb
   // it is on (MobLimb::wornHost).
-  bool kinematic = alive_ && (ragdoll_ != RagdollPhase::Limp || limb.wornHost >= 0);
+  // ...and a CORPSE's limbs are dynamic for good (Mob::Die), its garments
+  // followers exactly as in life.
+  bool kinematic = ragdoll_ != RagdollPhase::Limp || limb.wornHost >= 0;
   phys_->RemoveBody(limb.body);
   limb.body = nh;
   phys_->SetBodyKinematic(limb.body, kinematic);
@@ -10695,7 +11200,9 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // there is: acid, fire, laser and blast all end in a carve, and every carve
   // rebuilds the collider. Your own body must not push you — including after it
   // has been rebuilt.
-  if (AvatarLayer()) phys_->SetBodyAvatarLayer(limb.body, true);
+  // Not a dead avatar's: those limbs were handed to ReleaseToWorldWhenClear at
+  // death, and CarryLayer above already carried that state across.
+  if (AvatarLayer() && alive_) phys_->SetBodyAvatarLayer(limb.body, true);
   // ...and the PROP EXEMPTION, for exactly the same reason and reachable from
   // exactly the same places. A weapon is carved and burned like any other
   // slot, and a rebuilt blade that started back on the plain MOVING layer
@@ -11100,7 +11607,10 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   const float lostWeight =
       prevWeight > nowWeight ? prevWeight - nowWeight : 0.0f;
   limb.weightCharged = nowWeight;
-  limb.hp -= (lostWeight / w0) * limbDefs_[limbIndex].hp * kCarveDamagePerVolume;
+  // Charged to the LIVING only (Mob::Damage's note): a corpse carved keeps
+  // the hp it died with.
+  if (alive_)
+    limb.hp -= (lostWeight / w0) * limbDefs_[limbIndex].hp * kCarveDamagePerVolume;
   // ---- ...AND THE BRAIN IS NOT A FRACTION OF ANYTHING ----------------------
   //
   // The one absolute charge in this function. Every brain voxel destroyed --
@@ -11121,7 +11631,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // brain charge must not fire for them — a zombie whose spawn roll ate five
   // brain voxels would die before its first tick. Only NEW damage (rot
   // advancing, a blade, a blast) charges the flat penalty.
-  if (lostBrain && !inSpawnRot_)
+  if (lostBrain && !inSpawnRot_ && alive_)
     limb.hp -= (float)lostBrain * CurrentTuning().gore.brainHpPerVoxel;
   // ---- WHAT MAY BLEED, AND WHAT MAY NOT ------------------------------------
   //
@@ -11253,7 +11763,10 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // voxel of geometry had been consulted. A vital or root limb at zero still
   // routes to Sever(), which still routes to Die() — the creature dies of
   // damage, it simply does not come apart of it.
-  if (collapsed || (limb.hp <= 0 && HpZeroSevers(limbIndex))) {
+  // THE DEAD DO NOT DIE AGAIN: the hp clause is a statement about DEATH and
+  // is the living's. `collapsed` is geometry and applies to a corpse as it
+  // does to anybody (a limb carved to dust comes off).
+  if (collapsed || (alive_ && limb.hp <= 0 && HpZeroSevers(limbIndex))) {
     // A vital limb killed by ROT or FIRE (inBurnFlush_) dies WITHOUT detaching.
     // Sever() for a severable vital limb pops the head off and then Dies,
     // which is correct for a blade decapitation but wrong for brain damage: the
@@ -11270,10 +11783,17 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
                                  : "vital limb destroyed";
       Die();
-      return false;
+      // THE CORPSE KEEPS ITS HEAD AND ITS CARVE. The rig is still here (Die
+      // no longer hands it away), so the lattice this carve just changed must
+      // still be re-skinned and re-collided below — returning here would leave
+      // a dead Mob drawing the pre-carve brick over a post-carve collider.
+      if (rigReleased_) return false;
+    } else {
+      Sever(limbIndex);
+      // A root or unseverable limb is not taken off by Sever(): it routes to
+      // Die() and the limb stays on the corpse. Finish its carve too.
+      if (rigReleased_ || !limbs_[limbIndex].body) return false;
     }
-    Sever(limbIndex);
-    return false;
   }
 
   // ---- did the carve separate the limb into pieces? --------------------------
@@ -11498,7 +12018,9 @@ bool Mob::CarveLimb(int limbIndex, World& world,
             limbs_[k].holdSeconds = 0.0f;
           GroupSeveredPiece(childBody);
         }
-        if (!alive_) return false;  // a vital child (a head in a split torso)
+        // A vital child (a head in a split torso) killed the creature: its
+        // rig is still here unless it went to debris, so the carve goes on.
+        if (rigReleased_) return false;
       }
       // Losing the disconnected mass can itself take the limb under the floor.
       // Same lattice pairing as the first collapse test above -- and the same
@@ -11510,7 +12032,8 @@ bool Mob::CarveLimb(int limbIndex, World& world,
             (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
                 kLimbCollapseFraction * (float)at0))) {
         Sever(limbIndex);
-        return false;
+        // Root/unseverable: Die() only, the limb stays (see above).
+        if (rigReleased_ || !limbs_[limbIndex].body) return false;
       }
 
       // ---- CUT THROUGH: the edge came out the other side --------------------
@@ -11536,7 +12059,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       if (inBladeCut_ && !shellStaysOn &&
           (float)partedOff >= gt.woundSeverFraction * (float)n) {
         Sever(limbIndex);
-        return false;
+        if (rigReleased_ || !limbs_[limbIndex].body) return false;
       }
     }
   }
@@ -13214,23 +13737,50 @@ void MobSystem::BurnLimbs(uint32_t tick, World& world,
                           std::vector<CellOp>& cellOps,
                           std::vector<ParticleSpawn>& spawns) {
   if (!BurnTablesReady() || mobs_.empty()) return;
-  uint32_t frontBudget = kBurnFrontPerTick;
-  uint32_t opsBudget = kBurnOpsPerTick;
   // Rotate the start creature by tick, for the reason Mob::BurnTick rotates
   // its start limb: a shared budget spent in a fixed order starves the tail.
   const size_t nm = mobs_.size();
   const size_t start = (size_t)(tick % (uint32_t)nm);
-  for (size_t k = 0; k < nm && frontBudget; k++)
-    mobs_[(start + k) % nm].BurnTick(tick, world, cellOps, spawns, frontBudget,
-                                     opsBudget);
+  // Who is dead is decided ONCE, before anybody burns: a creature the living
+  // pass kills this tick must not be burnt a second time from the dead pot.
+  std::vector<uint8_t> dead(nm, 0);
+  for (size_t i = 0; i < nm; i++) dead[i] = !mobs_[i].alive_ ? 1 : 0;
+  // ---- THE LIVING ----
+  {
+    uint32_t frontBudget = kBurnFrontPerTick;
+    uint32_t opsBudget = kBurnOpsPerTick;
+    for (size_t k = 0; k < nm && frontBudget; k++) {
+      const size_t i = (start + k) % nm;
+      if (dead[i]) continue;
+      mobs_[i].BurnTick(tick, world, cellOps, spawns, frontBudget, opsBudget);
+    }
+  }
+  // ---- THE DEAD, FROM THEIR OWN POT ----
+  // The living's numbers, as BurnCorpses has always given the severed dead: a
+  // battlefield of corpses must not starve the creatures still standing in
+  // the fire, and the living must not starve the dead. An asleep corpse is
+  // not visited at all — its burn pass had already said "nothing near me"
+  // for every limb before it could fall asleep.
+  {
+    uint32_t frontBudget = kBurnFrontPerTick;
+    uint32_t opsBudget = kBurnOpsPerTick;
+    for (size_t k = 0; k < nm && frontBudget; k++) {
+      const size_t i = (start + k) % nm;
+      Mob& m = mobs_[i];
+      if (!dead[i] || m.rigReleased_ || m.deadAsleep_) continue;
+      m.BurnTick(tick, world, cellOps, spawns, frontBudget, opsBudget);
+    }
+  }
 }
 
 void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                    std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
                    uint32_t& opsBudget) {
-  // A corpse's limbs belong to DebrisSystem the moment Die() adopts them;
-  // limb.body is cleared there, so this is belt and braces.
-  if (!sys_ || !sys_->BurnTablesReady() || !alive_) return;
+  // THE DEAD BURN AS THEY LAY (PLAN_corpse_is_a_mob.md): a corpse's rig is
+  // still its own, so fire, rot, the joint twins and the burn fraction all
+  // run on it. Only a RELEASED rig (its limbs are DebrisSystem's) is refused,
+  // and limb.body is zero there anyway.
+  if (!sys_ || !sys_->BurnTablesReady() || rigReleased_) return;
   // A GHOST DOES NOT BURN HERE. Its owner is running this same pass on the
   // same creature and authoring the fire ops; running it on both machines
   // would consume the limb's lattice twice and charge two sets of cell ops
@@ -13431,7 +13981,9 @@ bool InfectTake(std::vector<uint32_t>& pool, uint32_t key, uint32_t& out) {
 
 bool Mob::InfectTick(uint32_t tick, World& world,
                      std::vector<ParticleSpawn>& spawns) {
-  if (!alive_ || !def_ || !sys_) return true;
+  // THE ROT GOES ON IN A CORPSE: the disease eats what it is in whether or
+  // not its host is still walking. Only a released rig is refused.
+  if (rigReleased_ || !def_ || !sys_) return true;
   const auto& gt = CurrentTuning().gore;
   if (gt.infectSpreadRate <= 0.0f && gt.infectRotRate <= 0.0f) return true;
   // World voxels per MINUTE is the unit the question is asked in ("how long
@@ -14501,7 +15053,9 @@ bool MobSystem::SetLimbCellAt(uint64_t mobId, int limb, IVec3 rest,
 
 bool Mob::BluntPulpTick(uint32_t tick, World& world,
                         std::vector<ParticleSpawn>& spawns) {
-  if (!alive_ || !def_ || !sys_) return true;
+  // Pulp crumbles on a corpse too (it always did on a severed piece,
+  // DebrisSystem::PulpTick). Only a released rig is refused.
+  if (rigReleased_ || !def_ || !sys_) return true;
   const auto& gt = CurrentTuning().gore;
   if (gt.pulpRotRate <= 0.0f) return true;
   const float perTick = 1.0f / (60.0f * 30.0f);
@@ -14695,15 +15249,30 @@ void MobSystem::StainLimbs(uint32_t tick, World& world) {
   uint32_t budget = kStainLatticePerTick;
   // Rain draws on its own pot (RainOneLimb), so a storm never starves this.
   uint32_t rainBudget = kRainLatticePerTick;
+  // THE DEAD HAVE THEIR OWN POTS, the same size (PLAN_corpse_is_a_mob.md): a
+  // battlefield of corpses in a river must not wash the living slower, and a
+  // crowd must not stop the dead drying. The dead Mobs go first out of it and
+  // the severed pieces (StainCorpses) take what they leave.
+  uint32_t deadBudget = kStainLatticePerTick;
+  uint32_t deadRain = kRainLatticePerTick;
   if (!mobs_.empty()) {
     const size_t nm = mobs_.size();
     const size_t start = (size_t)(tick % (uint32_t)nm);
-    for (size_t k = 0; k < nm && budget; k++)
-      mobs_[(start + k) % nm].StainTick(tick, world, budget, rainBudget);
+    for (size_t k = 0; k < nm && budget; k++) {
+      Mob& m = mobs_[(start + k) % nm];
+      if (!m.alive_) continue;
+      m.StainTick(tick, world, budget, rainBudget);
+    }
+    // The full StainTick — contact, rain, drying and the WET pass with its
+    // drips — on every awake corpse whose rig is still its own.
+    for (size_t k = 0; k < nm && deadBudget; k++) {
+      Mob& m = mobs_[(start + k) % nm];
+      if (m.alive_ || m.rigReleased_ || m.deadAsleep_) continue;
+      m.StainTick(tick, world, deadBudget, deadRain);
+    }
   }
-  // ...and the dead, out of what the living left. After them, so a crowd in a
-  // river is never washed slower for the corpses floating beside it.
-  StainCorpses(tick, world, budget, rainBudget);
+  // ...and the severed dead (debris flesh), out of what the dead Mobs left.
+  StainCorpses(tick, world, deadBudget, deadRain);
   // This tick's bursts, against every creature (the bleeder included: its
   // own gout lands on its own other limbs; only the bleeding limb is skipped).
   for (SplatterEvent& e : splatters_) {
@@ -16314,7 +16883,10 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
       v.occlude = &WornProbe::Call;
       v.occludeCtx = &probe;
     }
-    if (sys_->SplatterView(e, v, (uint32_t)li)) coatDirty_ = twinDirty_ = true;
+    if (sys_->SplatterView(e, v, (uint32_t)li)) {
+      coatDirty_ = twinDirty_ = true;
+      WakeDead();   // blood landing on a sleeping corpse wakes it
+    }
   }
 }
 
@@ -17554,7 +18126,9 @@ void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
 
 void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
                          World& world, std::vector<ParticleSpawn>& spawns) {
-  if (!phys_ || !alive_ || radiusVoxels <= 0.0f) return;
+  // A blast craters a corpse exactly as it craters the living (it always
+  // cratered the dead as debris). Only a released rig has nothing to carve.
+  if (!phys_ || rigReleased_ || radiusVoxels <= 0.0f) return;
   // Collect handles FIRST: carving rebuilds colliders and can sever limbs or
   // kill the creature, both of which reshape the limb list and its handles
   // mid-walk. Iterating the live structure while it mutates under us is how
@@ -17995,6 +18569,11 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
 // play it is the audio layer's.
 void MobSystem::PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
                           float intensity) {
+  // THE DEAD SAY NOTHING after the death cry (which Die() pushes after
+  // `alive_` has already gone false). A corpse being carved is still flesh —
+  // MeleeSweepDamage says so through EdgeSweepResult::hitDeadFlesh — but a
+  // hurt cry out of it would be the creature complaining after it died.
+  if (!mob.alive_ && kind != VoiceKind::Death) return;
   if (kind == VoiceKind::Hurt)
     for (const VoiceEvent& v : voices_)
       if (v.mobId == mob.id_ && v.kind == VoiceKind::Hurt) return;
@@ -18005,26 +18584,27 @@ void MobSystem::PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
 void Mob::Die() {
   if (!alive_) return;
   alive_ = false;
-  // A live ragdoll that dies is just a corpse now: the limbs below go to
-  // DebrisSystem exactly as from standing (SetBodyKinematic(false) on an
-  // already-dynamic body is a no-op).
-  ragdoll_ = RagdollPhase::None;
+  // The ORDER a corpse fell in, for the dead cap (MobSystem::EvictDead): the
+  // oldest decays to debris first.
+  if (sys_) deathSeq_ = ++sys_->deathSeq_;
+  // Nothing the living driver was doing carries on: the stroke, the swing
+  // pose it was commanding and the flinch it was playing all belong to a
+  // body that is about to be Jolt's.
   getUpFrom_.clear();
-  // The cause outlives the husk: an NPC corpse is swept out of mobs_ on the
-  // next PreTick, and a gate that asks "why did it die" one tick later would
-  // otherwise find nobody to ask (MobSystem::DeathCause falls back to this).
-  if (sys_) {
-    sys_->lastDeathId_ = id_;
-    sys_->lastDeathCause_ = deathCause_;
-  }
-  // The rig is still whole HERE and nowhere after here (see Mob::OnDying).
+  stroke_.Reset();
+  weapon_ = WeaponPose{};
+  swinging_ = false;
+  hitReact_.live = false;
+  aimLookValid_ = false;
+  // The rig is still whole and still posed HERE (see Mob::OnDying).
   OnDying();
-  // The death cry, BEFORE the limb list is dismantled below — the root limb's
-  // live transform is where the creature actually is, and `mob.origin_` is only
-  // the spawn corner (the trap called out in Sever()). Reported even if the
-  // mob binds no death take: the audio layer is what decides silence, and a
-  // test asserting "the engine noticed this creature died" needs the event to
-  // exist whether or not anyone recorded a sound for it.
+  // The death cry. The root limb's live transform is where the creature
+  // actually is, and `mob.origin_` is only the spawn corner (the trap called
+  // out in Sever()). Reported even if the mob binds no death take: the audio
+  // layer is what decides silence, and a test asserting "the engine noticed
+  // this creature died" needs the event to exist whether or not anyone
+  // recorded a sound for it. The LAST thing a dead body says: every voice
+  // after this is refused (MobSystem::PushVoice).
   {
     Vec3 at = origin_;
     const int rl = def_ ? def_->rootLimb : -1;
@@ -18032,69 +18612,116 @@ void Mob::Die() {
       at = limbs_[rl].xf.pos;
     if (sys_) sys_->PushVoice(*this, MobSystem::VoiceKind::Death, at, 1.0f);
   }
-  // WHAT IS ON THE BODY, read out while the rig still knows (CorpseReport).
-  // Built BEFORE the loop below zeroes every limb.body, delivered AFTER it so
-  // the receiver holds handles that are already debris. Not for the avatar
-  // (see the struct's note) and not when nobody is listening.
-  CorpseReport corpse;
-  const bool reportCorpse = sys_ && sys_->onCorpse_ && !sys_->IsAvatar(this);
-  if (reportCorpse) {
-    corpse.mobId = id_;
-    corpse.def = def_ ? def_->name : std::string();
-    for (const MobLimb& limb : limbs_)
-      if (limb.body) corpse.bodies.push_back(limb.body);
-    for (size_t pi = 0; pi < worn_.size(); pi++) {
-      const WornPiece& p = worn_[pi];
-      const int idSlot = IdentityShellOf((int)pi);
-      if (idSlot < 0 || idSlot >= (int)limbs_.size() || !limbs_[idSlot].body)
-        continue;   // the panel that IS the piece is gone: rags only
-      CorpseReport::Piece piece;
-      piece.item = p.item;
-      piece.equipSlot = p.equipSlot;
-      piece.body = limbs_[idSlot].body;
-      // The colour, off the identity shell — every shell of one garment
-      // carries the same word (Mob::WearItem hands it to all of them), so any
-      // of them would answer; the identity shell is the one already in hand.
-      piece.dye = limbs_[idSlot].dye;
-      for (size_t k = 0; k < p.slots.size() && k < p.cover.size(); k++)
-        if (p.slots[k] == idSlot) piece.identityCover = p.cover[k];
-      for (int s : p.slots)
-        if (s != idSlot && s >= 0 && s < (int)limbs_.size() && limbs_[s].body)
-          piece.rags.push_back(limbs_[s].body);
-      CaptureWorn(p.equipSlot, piece.damage);
-      corpse.gear.push_back(std::move(piece));
-    }
-    if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
-        limbs_[heldSlot_].body && !heldItem_.empty()) {
-      CorpseReport::Piece piece;
-      piece.item = heldItem_;
-      piece.held = true;
-      piece.body = limbs_[heldSlot_].body;
-      corpse.gear.push_back(std::move(piece));
-    }
-    // ---- AND WHAT WAS IN ITS PACK (Mob::carried_) --------------------------
-    //
-    // Onto the same list, with no body (CorpseReport::Piece::body: 0 means it
-    // was carried, not worn). Last, so the worn and held entries keep the slot
-    // indices the loot panel has always given them and a pack item is simply
-    // further down the grid — the order somebody looting a body expects, and
-    // the order "take all" empties in.
-    for (const CarriedItem& c : carried_) {
-      CorpseReport::Piece piece;
-      piece.item = c.item;
-      piece.count = c.count;
-      piece.dye = c.dye;
-      corpse.gear.push_back(std::move(piece));
-    }
+  // ---- IS THIS ONE GOING TO GET UP AGAIN (MobDef::Turn) --------------------
+  //
+  // Booked HERE, where the cause is still readable, and serviced ticks later
+  // by MobSystem::PreTick — nothing may spawn a mob from inside Die(), which is
+  // running on a Mob that lives in the vector a spawn pushes to. The booking
+  // is only who/what/when/whose: the rig it will read is THIS one, still in
+  // mobs_ (MobSystem::ServiceRising).
+  //
+  // The test is the rot the bite left in the flesh (MobLimb::infectMat), not a
+  // death-cause enum: what turns you is having the disease in you when you
+  // die, so a creature that crawls away from the fight and bleeds out in a
+  // ditch still gets up, and one killed cleanly by a sword does not.
+  bool rising = false;
+  if (sys_ != nullptr && def_ != nullptr && !def_->turn.into.empty()) {
+    int rotten = 0;
+    for (const MobLimb& l : limbs_)
+      if (l.infectMat != 0) rotten++;
+    rising = rotten >= def_->turn.infectedLimbs;
   }
+  if (rising) {
+    MobSystem::PendingRise rise;
+    rise.mobId = id_;
+    // Whose corpse this was, captured at the BOOKING (mob.h PendingRise).
+    rise.owner = owner_;
+    rise.fx.push_back(def_->turn.into);
+    rise.atTick = sys_->tick_ + (uint32_t)std::lround(def_->turn.afterSec * 30.0);
+    sys_->BookRising(std::move(rise));
+  }
+  // ---- WHO KEEPS THE RIG ---------------------------------------------------
+  //
+  // A creature this machine steps keeps it: death is a state of the Mob. Two
+  // bodies still become anonymous debris the instant they die, exactly as
+  // every corpse used to (ReleaseRigToDebris is that loop, unchanged):
+  //   * a GHOST — its owner is the one keeping its corpse, and the dead state
+  //     is not on the wire yet (PLAN_corpse_is_a_mob.md P2c);
+  //   * the PLAYER AVATAR — it is not in mobs_, so nothing would run a dead
+  //     rig's passes on it (P2b moves it there). Unless the bite is standing
+  //     it back up: then the rising needs the rig, and it is kept until the
+  //     rising reads it (or the respawn settles it, SettleDeadAvatar).
+  // A bare fixture Mob with no system keeps today's handover too.
+  const bool keep =
+      sys_ != nullptr && !IsGhost() && (!AvatarLayer() || rising);
+  if (!keep) {
+    ReleaseRigToDebris();
+    return;
+  }
+  EnterDeadRagdoll();
+}
+
+void Mob::EnterDeadRagdoll() {
+  if (rigReleased_) return;
+  ragdoll_ = RagdollPhase::Limp;
+  ragdollT_ = 0.0f;
+  ragdollMinT_ = 0.0f;
+  ragdollStillT_ = 0.0f;
+  ragdollVelValid_ = false;
+  ragdollImpact_ = Vec3{};
+  ragdollArrestRun_ = Vec3{};
+  ragdollArrestTicks_ = 0;
+  ragdollArrestQuiet_ = 0;
+  getUpFrom_.clear();
+  airborne_ = false;
+  launched_ = false;
+  fallVel_ = 0.0f;
+  airTime_ = 0.0f;
+  airVel_ = Vec3{};
+  deadAsleep_ = false;
+  deadQuiet_ = 0;
+  if (!phys_) return;
+  // StartRagdoll's flip, with the same three exclusions and none of its
+  // refusals (it will not flip a dead creature, and this IS the dead one).
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    MobLimb& limb = limbs_[i];
+    if (!limb.body) continue;
+    // A severed piece in its hold is on its way to DebrisSystem already;
+    // TickSeveredHolds releases it.
+    if (limb.holdSeconds > 0) continue;
+    // A GARMENT STAYS A FOLLOWER. Its pose is derived from the limb it covers
+    // (DriveWornShells, every awake PostStep), which is what keeps a corpse
+    // dressed — the job DebrisSystem::StrapBody used to do for the dead.
+    if (limb.wornHost >= 0) continue;
+    phys_->GetTransform(limb.body, limb.xf);
+    phys_->SetBodyKinematic(limb.body, false);
+    phys_->ActivateBody(limb.body);
+    // A weapon nobody is carrying is an object again (StartRagdoll's note).
+    if ((int)i == heldSlot_) phys_->SetBodyPropLayer(limb.body, false);
+    // A CORPSE FALLS WHERE IT STOOD, which for an NPC killed at sword's reach
+    // is often half inside the player's capsule proxy, and for the avatar
+    // entirely inside it: off the player's contact layer until it has fallen
+    // clear, then an ordinary body (the "I died and my body went FLYING" fix,
+    // made for every body that leaves the living, the avatar's included).
+    phys_->ReleaseToWorldWhenClear(limb.body);
+  }
+  MarkInstancesDirty();
+}
+
+void Mob::ReleaseRigToDebris() {
+  if (rigReleased_) return;
+  rigReleased_ = true;
+  ragdoll_ = RagdollPhase::None;
+  getUpFrom_.clear();
+  deadAsleep_ = false;
   // ---- A GARMENT IS A FOLLOWER ON A CORPSE TOO ------------------------------
   //
   // Death hands the strap over; it does not trade it for a constraint.
   //
   // The shells and their hosts are about to leave this system for
   // DebrisSystem, and nothing here can derive a pose for them afterwards
-  // (DriveWornShells needs a live Mob) — but a corpse must still be wearing its
-  // armour. Until 2026-09-13 that was bought with the Fixed joint
+  // (DriveWornShells needs a Mob) — but debris wearing armour must still be
+  // wearing it. Until 2026-09-13 that was bought with the Fixed joint
   // AppendWornShell deliberately does without: a stiff constraint between a
   // plate of iron and the flesh INSIDE it, across a deep overlap, at a mass
   // ratio a sequential-impulse solver gains energy on. That is the armoured-
@@ -18105,187 +18732,47 @@ void Mob::Die() {
   //
   // So the pairs are recorded here, while the rig still knows which shell is on
   // which limb, and re-tied on the far side of the adoption loop as
-  // DebrisSystem straps (DebrisSystem::StrapBody). A dressed corpse then has
-  // the SAME bodies in the solver as a naked one, the same constraint graph,
-  // and the same mass — the armour contributes nothing but its pose, which is
+  // DebrisSystem straps (DebrisSystem::StrapBody). A dressed heap then has the
+  // SAME bodies in the solver as a naked one, the same constraint graph, and
+  // the same mass — the armour contributes nothing but its pose, which is
   // exactly the property `corpse-armor` asserts.
-  //
-  // The A/B arm keeps the old shape whole: with SANDVOX_NO_RIGWELD=1 a shell
-  // was jointed from the moment it was worn, so it is jointed here too.
-  struct DyingStrap {
+  struct Strap {
     uint64_t shell = 0, host = 0;
   };
-  std::vector<DyingStrap> dyingStraps;
+  std::vector<Strap> straps;
   for (size_t i = 0; i < limbs_.size(); i++) {
     MobLimb& shell = limbs_[i];
     const int hi = shell.wornHost;
-    shell.wornHost = -1;   // this system derives nothing after Die()
+    shell.wornHost = -1;   // this system derives nothing after the handover
     if (hi < 0 || !shell.body || shell.joint != 0) continue;
     if (hi >= (int)limbs_.size() || !limbs_[(size_t)hi].body) continue;
-    dyingStraps.push_back(DyingStrap{shell.body, limbs_[(size_t)hi].body});
-  }
-  // ---- IS THIS ONE GOING TO GET UP AGAIN (MobDef::Turn) --------------------
-  //
-  // Booked HERE, in the one place the rig is still whole and the cause is
-  // still readable, and serviced ticks later by MobSystem::PreTick — nothing
-  // may spawn a mob from inside Die(), which is running on a Mob that lives in
-  // the vector a spawn pushes to.
-  //
-  // The test is the rot the bite left in the flesh (MobLimb::infectMat), not a
-  // death-cause enum: what turns you is having the disease in you when you
-  // die, so a creature that crawls away from the fight and bleeds out in a
-  // ditch still gets up, and one killed cleanly by a sword does not.
-  MobSystem::PendingRise rise;
-  bool rising = false;
-  if (sys_ != nullptr && def_ != nullptr && !def_->turn.into.empty()) {
-    int rotten = 0;
-    for (const MobLimb& l : limbs_)
-      if (l.infectMat != 0) rotten++;
-    rising = rotten >= def_->turn.infectedLimbs;
-  }
-  if (rising) {
-    rise.def = def_->name;
-    // Whose corpse this was, captured at the BOOKING (mob.h PendingRise).
-    rise.owner = owner_;
-    rise.fx.push_back(def_->turn.into);
-    rise.at = origin_;
-    rise.heading = heading_;
-    rise.bodyY = bodyY_;
-    rise.atTick = sys_->tick_ + (uint32_t)std::lround(def_->turn.afterSec * 30.0);
-    // What it had already lost, read before the loop below zeroes the rest.
-    for (size_t i = 0; i < limbs_.size() && i < def_->limbs.size(); i++)
-      if (limbs_[i].body == 0) rise.lost.push_back(def_->limbs[i].name);
-    // ---- AND WHAT IT STILL HAS, AS GEOMETRY --------------------------------
-    //
-    // THIS IS THE ONE MOMENT IT CAN BE READ. The loop below MOVES every
-    // limb's skinVoxels into DebrisSystem::AdoptBody, so a capture one
-    // statement later would copy empty vectors and the zombie would rise
-    // whole; and the rising is serviced ticks after the husk has been swept
-    // out of mobs_, so there is nobody left to ask.
-    //
-    // Only limbs the body actually LOST SOMETHING from travel — `carved` is
-    // the latch that fires the first time a carve or a burn takes a voxel, so
-    // an untouched arm is rebuilt from the def for free on the far side and
-    // costs the booking nothing. That is also the bound (kRiseVoxelBudget):
-    // an intact villager books a rising the size it always was.
-    size_t vox = 0;
-    for (size_t i = 0; i < limbs_.size() && i < def_->limbs.size(); i++) {
-      const MobLimb& L = limbs_[i];
-      if (!L.body || !L.carved) continue;
-      vox += L.voxels.size() + L.skinVoxels.size();
-      if (vox > MobSystem::kRiseVoxelBudget) {
-        std::printf(
-            "mob: '%s' is cut past %zu voxels; it gets up freshly rotted\n",
-            def_->name.c_str(), MobSystem::kRiseVoxelBudget);
-        rise.limbs.clear();
-        break;
-      }
-      MobSystem::PendingRise::RiseLimb rl;
-      rl.name = def_->limbs[i].name;
-      rl.hp = L.hp;
-      rl.restOffset = L.restOffset;
-      rl.anchorRoot = L.anchorRoot;
-      rl.anchorLimb = L.anchorLimb;
-      rl.size = L.size;
-      rl.voxels = L.voxels;            // COPIED: the originals go to debris
-      rl.skinVoxels = L.skinVoxels;
-      rise.limbs.push_back(std::move(rl));
-    }
-    // ---- AND ITS KIT -------------------------------------------------------
-    //
-    // Read the same way CorpseReport reads it a few lines up, and deliberately
-    // NOT read off that report: the report is only built when somebody is
-    // listening (SetOnCorpse) and never for the avatar, while a rising happens
-    // either way. The two walks agree on what a piece IS — the identity shell
-    // carries the dye, CaptureWorn carries the damage — they disagree only on
-    // what they hand back (bodies to loot vs. names to re-equip).
-    for (size_t pi = 0; pi < worn_.size(); pi++) {
-      const WornPiece& p = worn_[pi];
-      const int idSlot = IdentityShellOf((int)pi);
-      if (idSlot < 0 || idSlot >= (int)limbs_.size() || !limbs_[idSlot].body)
-        continue;   // the panel that IS the piece is gone: it stays gone
-      MobSystem::PendingRise::RiseGear g;
-      g.item = p.item;
-      g.equipSlot = p.equipSlot;
-      g.dye = limbs_[idSlot].dye;
-      CaptureWorn(p.equipSlot, g.damage);
-      rise.gear.push_back(std::move(g));
-    }
-    if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
-        limbs_[heldSlot_].body && !heldItem_.empty()) {
-      MobSystem::PendingRise::RiseGear g;
-      g.item = heldItem_;
-      g.held = true;
-      rise.gear.push_back(std::move(g));
-    }
-    // ---- AND ITS PACK ------------------------------------------------------
-    //
-    // Same argument as the kit one block up, one step simpler: no body, no
-    // damage, no dye read off a shell — the stacks travel as they are. Without
-    // this, turning would be a way to delete a purse, since the remains the
-    // pack would otherwise be looted off are destroyed by the rising.
-    rise.carried = carried_;
-    // ---- ...AND, FOR THE AVATAR, THE PLAYER'S OWN KIT ---------------------
-    //
-    // The player's bag and hotbar are not on the player's body — they are in
-    // PlayerKit on the session, which this class cannot reach and must not
-    // (game/session.h: per-player state is not a process global, and there may
-    // be two sessions). So the owner of the kit answers the question, at the
-    // one moment the answer is wanted.
-    //
-    // The callback also decides whether the player KEEPS what it hands back:
-    // `player.keepKitOnTurn` copies (your gear and a zombie wearing a second
-    // copy of it, which is the dev-mode reading) or MOVES (your gear walks
-    // away on your own corpse). See MobSystem::SetAvatarKitFn.
-    if (sys_ != nullptr && sys_->IsAvatar(this) && sys_->avatarKitFn_) {
-      std::vector<CarriedItem> kit;
-      sys_->avatarKitFn_(kit);
-      for (CarriedItem& c : kit)
-        if (!c.item.empty() && c.count > 0) rise.carried.push_back(std::move(c));
-    }
+    straps.push_back(Strap{shell.body, limbs_[(size_t)hi].body});
   }
   // whole-body ragdoll: every limb goes dynamic and becomes debris; joints
-  // stay so the corpse hangs together until pieces get culled or settle
+  // stay so the heap hangs together until pieces get culled or settle
   for (size_t i = 0; i < limbs_.size(); i++) {
     MobLimb& limb = limbs_[i];
     if (!limb.body) continue;
-    // The remains, so the rising can take them out of the world rather than
-    // stand a second body up inside them.
-    if (rising) {
-      rise.bodies.push_back(limb.body);
-      if (i < def_->limbs.size())
-        rise.bodyMap.push_back({def_->limbs[i].name, limb.body});
-    }
     // Same reason as DetachLimb: the lattice is handed to DebrisSystem here,
     // and an unflushed burn tombstone must not travel with it.
     StripBurnTombstones(limb);
     DropBurnIndex(limb.burn);
     phys_->SetBodyKinematic(limb.body, false);
     // ...wounds included: a stump that was bleeding goes on bleeding from the
-    // corpse, from where it is (BodyWound), until it has paid out.
+    // heap, from where it is (BodyWound), until it has paid out.
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
                        std::move(limb.skinVoxels), def_->bleedMat,
                        WoundOf(limb), /*dead=*/true, defIndex_, id_);
-    // A CORPSE FALLS WHERE IT STOOD, which for the avatar is entirely inside
-    // the player's capsule proxy, and for an NPC killed at sword's reach is
-    // often half inside it. Handing those limbs to the plain MOVING layer in
-    // the same frame hands Jolt a dozen deep, unresolvable penetrations
-    // against the proxy and the solver does the only thing it can — it fires
-    // the whole ragdoll out of the capsule in whatever direction the overlap
-    // resolved. That is the "I died and my body went FLYING" bug; it should
-    // keel over. (The avatar's limbs used to keep their exemption for good,
-    // which made your own remains walk-through after a respawn.)
-    //
     // Off the player's contact layer until it has fallen clear, then debris
-    // like any other: the same rule a severed piece follows.
+    // like any other: the same rule a severed piece follows (Mob::Die's note).
     phys_->ReleaseToWorldWhenClear(limb.body);
     limb.skinVoxels.clear();
     limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
-    // ...and the index with it. The avatar does NOT drop its limb list on
-    // death (DropLimbListOnDeath), so without this every one of the player's
-    // slots spends the whole death screen — and everything after it — holding
-    // a record its corpse owns. See the long note in DetachLimb.
+    // ...and the index with it. The avatar keeps its limb list past death,
+    // so without this every one of the player's slots spends the whole death
+    // screen — and everything after it — holding a record its corpse owns.
+    // See the long note in DetachLimb.
     limb.microModel = -1;
     limb.body = 0;
     if (limb.joint) limb.joint = 0;  // ownership follows the bodies now
@@ -18301,25 +18788,266 @@ void Mob::Die() {
   // that never reached the adoption — leaves the garment as loose debris.
   // Jointing it instead would be reaching for the motor as a fallback.
   if (debris_)
-    for (const DyingStrap& ds : dyingStraps)
-      debris_->StrapBody(ds.shell, ds.host);
-  // ...and the rising goes on the books now that the remains are debris and
-  // the handles in it name things somebody else owns.
-  if (rising) sys_->BookRising(std::move(rise));
+    for (const Strap& st : straps) debris_->StrapBody(st.shell, st.host);
   MarkInstancesDirty();
-  if (reportCorpse) sys_->onCorpse_(corpse);
-  // Death goes straight to ragdoll (no hold): the whole body flips at once,
-  // so there is no "still-attached" pose left to sell. The husk is removed on
-  // the next PreTick sweep once nothing is holding; drop the limb list but
-  // keep any in-flight hold entries alive.
-  // ...except for the avatar, which keeps its limb list so the HUD's
-  // per-part readout survives the death screen (DropLimbListOnDeath).
-  if (DropLimbListOnDeath()) {
-    std::vector<MobLimb> holding;
-    for (MobLimb& l : limbs_)
-      if (l.holdBody) holding.push_back(std::move(l));
-    limbs_ = std::move(holding);
+}
+
+// ---- the dead rig's upkeep ---------------------------------------------------
+
+void Mob::TickDeadLimp(float dt) {
+  ragdollT_ += dt;
+  // Keep the walk anchor under the body: the window release, the rising's
+  // spawn point and every "where is this creature" reader look at origin_.
+  // TickRagdollLimp's line, WITHOUT the rest of it: no settle test and no
+  // BeginGetUp from any branch (a corpse with no pelvis left does not stand
+  // what remains up either), and no arrest, so a corpse is never billed fall
+  // damage.
+  const int rl = def_ ? def_->rootLimb : -1;
+  if (rl >= 0 && rl < (int)limbs_.size() && limbs_[rl].body)
+    origin_ = limbs_[rl].xf.pos - limbs_[rl].restOffset;
+}
+
+bool Mob::RigActive() const {
+  if (!phys_) return false;
+  const int rl = def_ ? def_->rootLimb : -1;
+  if (rl >= 0 && rl < (int)limbs_.size() && limbs_[rl].body)
+    return phys_->IsActive(limbs_[rl].body);
+  // No pelvis: the first dynamic limb stands for what is left.
+  for (const MobLimb& l : limbs_)
+    if (l.body && l.wornHost < 0 && l.holdSeconds <= 0)
+      return phys_->IsActive(l.body);
+  return false;
+}
+
+bool Mob::DeadQuietNow() const {
+  if (alive_ || rigReleased_ || sys_ == nullptr) return false;
+  if (twinDirty_ || coatDirty_ || burnFracDirty_) return false;
+  if (!pendingSpawns_.empty()) return false;
+  if (RigActive()) return false;
+  const auto& gt = CurrentTuning().gore;
+  const bool rotRuns = gt.infectSpreadRate > 0.0f || gt.infectRotRate > 0.0f;
+  const bool burnTables = sys_->BurnTablesReady();
+  for (const MobLimb& l : limbs_) {
+    if (l.holdBody) return false;            // a sever hold in flight
+    if (!l.body) continue;
+    if (l.bleedBudget >= 1.0f || l.gushTicks > 0) return false;
+    if (l.hitFlash > 0.0f) return false;
+    if (l.burn.Burning() || l.burn.removed) return false;
+    // The burn pass's own idle verdict: it walked the world round this limb,
+    // found nothing, and is holding no index. 0 = it has not said so yet.
+    if (burnTables && l.burn.sleepKey == 0) return false;
+    if (rotRuns && l.infectMat != 0) return false;
+    if (l.bluntPulp) return false;
+    // ---- the coat: nothing on it that is still changing -------------------
+    if (l.coat.corrosive) return false;
+    for (const CoatEntry& en : l.coat.top) {
+      if (en.mat == 0 || en.sumAmt == 0) continue;
+      const uint32_t m = en.mat;
+      // A WASHER (water) wicks and drips while it is on a body.
+      if (m < sys_->matGpu_.size() &&
+          (sys_->matGpu_[m].stainPack & kStainPackWashesBit))
+        return false;
+      // A coat that DRIES is changing until it reaches its floor everywhere.
+      const float secs = m < sys_->coatDecay_.size() ? sys_->coatDecay_[m] : 0.0f;
+      if (secs <= 0.0f) continue;
+      const uint32_t floor =
+          m < sys_->coatDecayFloor_.size() ? sys_->coatDecayFloor_[m] : 0u;
+      if (en.sumAmt > en.voxels * floor) return false;
+    }
   }
+  return true;
+}
+
+uint64_t Mob::DeadWakeKey(World& world) const {
+  uint64_t h = 1469598103934665603ull;
+  auto mix = [&h](uint64_t x) {
+    h ^= x;
+    h *= 1099511628211ull;
+  };
+  const IVec3 wo = world.WindowOrigin();
+  mix((uint64_t)(uint32_t)wo.x << 32 | (uint32_t)wo.y);
+  mix((uint64_t)(uint32_t)wo.z);
+  // The box the body could be touching: its limbs' corners, one voxel of
+  // margin plus the largest limb's extent (a limb's xf.pos is its lattice
+  // CORNER, so the far side of it is up to a limb-size away).
+  Vec3 lo{1e30f, 1e30f, 1e30f}, hi{-1e30f, -1e30f, -1e30f};
+  float reach = 1.0f;
+  for (const MobLimb& l : limbs_) {
+    if (!l.body) continue;
+    const Vec3 p = l.xf.pos;
+    lo.x = std::min(lo.x, p.x); lo.y = std::min(lo.y, p.y);
+    lo.z = std::min(lo.z, p.z);
+    hi.x = std::max(hi.x, p.x); hi.y = std::max(hi.y, p.y);
+    hi.z = std::max(hi.z, p.z);
+    const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(l));
+    reach = std::max(
+        reach, (float)std::max({l.size.x, l.size.y, l.size.z}) * inv);
+  }
+  if (lo.x > hi.x) return h;
+  const IVec3 c0{ifloor(lo.x - reach - 1.0f) >> 4,
+                 ifloor(lo.y - reach - 1.0f) >> 4,
+                 ifloor(lo.z - reach - 1.0f) >> 4};
+  const IVec3 c1{ifloor(hi.x + reach + 1.0f) >> 4,
+                 ifloor(hi.y + reach + 1.0f) >> 4,
+                 ifloor(hi.z + reach + 1.0f) >> 4};
+  for (int cz = c0.z; cz <= c1.z; cz++)
+    for (int cy = c0.y; cy <= c1.y; cy++)
+      for (int cx = c0.x; cx <= c1.x; cx++) {
+        const IVec3 wc{cx, cy, cz};
+        if (!world.ChunkInWindow(wc)) {
+          mix(0x0FFu);
+          continue;
+        }
+        const CachedChunk* cc = world.Cached(wc);
+        if (!cc) {
+          mix(0xCACEu);
+          continue;
+        }
+        mix((uint64_t)(uintptr_t)cc);
+        mix(cc->version);
+      }
+  return h;
+}
+
+// ---- looting a dead Mob ------------------------------------------------------
+
+bool Mob::Lootable() const {
+  return !alive_ && !rigReleased_ && sys_ != nullptr && !sys_->IsAvatar(this) &&
+         !AvatarLayer();
+}
+
+void Mob::LootPieces(std::vector<LootPiece>& out) const {
+  out.clear();
+  if (!Lootable()) return;
+  for (size_t pi = 0; pi < worn_.size(); pi++) {
+    const WornPiece& p = worn_[pi];
+    const int idSlot = IdentityShellOf((int)pi);
+    if (idSlot < 0 || idSlot >= (int)limbs_.size() || !limbs_[idSlot].body)
+      continue;   // the panel that IS the piece is gone: rags only
+    LootPiece piece;
+    piece.kind = LootPiece::Kind::Worn;
+    piece.item = p.item;
+    piece.equipSlot = p.equipSlot;
+    // The colour, off the identity shell — every shell of one garment carries
+    // the same word (Mob::WearItem hands it to all of them).
+    piece.dye = limbs_[idSlot].dye;
+    for (size_t k = 0; k < p.slots.size() && k < p.cover.size(); k++)
+      if (p.slots[k] == idSlot) piece.identityCover = p.cover[k];
+    CaptureWorn(p.equipSlot, piece.damage);
+    out.push_back(std::move(piece));
+  }
+  if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
+      limbs_[heldSlot_].body && !heldItem_.empty()) {
+    LootPiece piece;
+    piece.kind = LootPiece::Kind::Held;
+    piece.item = heldItem_;
+    out.push_back(std::move(piece));
+  }
+  // The pack last, so the worn and held entries keep the indices the loot
+  // panel has always given them and a pack item is simply further down.
+  for (const CarriedItem& c : carried_) {
+    LootPiece piece;
+    piece.kind = LootPiece::Kind::Carried;
+    piece.item = c.item;
+    piece.count = c.count;
+    piece.dye = c.dye;
+    out.push_back(std::move(piece));
+  }
+}
+
+bool Mob::TakeLootPiece(int index, LootPiece* out, int count) {
+  if (!Lootable() || index < 0) return false;
+  std::vector<LootPiece> list;
+  LootPieces(list);
+  if (index >= (int)list.size()) return false;
+  const LootPiece piece = list[(size_t)index];
+  WakeDead();
+  switch (piece.kind) {
+    case LootPiece::Kind::Worn:
+      // The damage was captured by LootPieces a line ago off the shells as
+      // they are NOW (a robe that went on burning after its wearer died comes
+      // off burnt); UnwearItem then takes every shell of it out of the world.
+      if (!UnwearItem(piece.equipSlot)) return false;
+      break;
+    case LootPiece::Kind::Held:
+      EquipItem(nullptr);   // unequip: the borrowed slot leaves with the item
+      break;
+    case LootPiece::Kind::Carried: {
+      // The carried entries are the tail of the list, in carried_ order.
+      const int ci = index - (int)(list.size() - carried_.size());
+      const int took = TakeCarried(ci, count);
+      if (took <= 0) return false;
+      if (out) {
+        *out = piece;
+        out->count = took;
+      }
+      return true;
+    }
+  }
+  if (out) *out = piece;
+  return true;
+}
+
+bool Mob::ShedLootPiece(int index, std::string* outItem) {
+  if (!Lootable() || index < 0) return false;
+  std::vector<LootPiece> list;
+  LootPieces(list);
+  if (index >= (int)list.size()) return false;
+  const LootPiece& piece = list[(size_t)index];
+  int slot = -1;
+  if (piece.kind == LootPiece::Kind::Worn) {
+    for (size_t pi = 0; pi < worn_.size(); pi++)
+      if (worn_[pi].equipSlot == piece.equipSlot)
+        slot = IdentityShellOf((int)pi);
+  } else if (piece.kind == LootPiece::Kind::Held) {
+    slot = heldSlot_;
+  }
+  // A CARRIED STACK HAS NO BODY TO CUT LOOSE (the caller drops it through the
+  // bag's own drop path instead of this silently deleting it).
+  if (slot < 0 || slot >= (int)limbs_.size() || !limbs_[slot].body)
+    return false;
+  WakeDead();
+  if (outItem) *outItem = piece.item;
+  // OFF THE CORPSE MEANS OFF IT: the ordinary gear-leaves-the-body path. The
+  // identity shell (or the sword) becomes debris and is registered as the
+  // item through SetOnItemShed, so `E` sees it as the thing it is; the
+  // piece's other shells fall beside it as rags (ShedGearBeforeDetach).
+  DetachLimb(slot, /*adopt=*/true);
+  // No kinematic hold: the corpse is not animating, there is no pose to hold
+  // it in, and the piece should simply fall off the body it was dragged off.
+  if (slot < (int)limbs_.size() && limbs_[slot].holdBody)
+    limbs_[slot].holdSeconds = 0.0f;
+  return true;
+}
+
+uint64_t Mob::LootPieceBody(int index) const {
+  if (!Lootable() || index < 0) return 0;
+  std::vector<LootPiece> list;
+  LootPieces(list);
+  if (index >= (int)list.size()) return 0;
+  const LootPiece& piece = list[(size_t)index];
+  if (piece.kind == LootPiece::Kind::Held)
+    return heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size()
+               ? limbs_[heldSlot_].body
+               : 0ull;
+  if (piece.kind != LootPiece::Kind::Worn) return 0;
+  for (size_t pi = 0; pi < worn_.size(); pi++) {
+    if (worn_[pi].equipSlot != piece.equipSlot) continue;
+    const int s = IdentityShellOf((int)pi);
+    return s >= 0 && s < (int)limbs_.size() ? limbs_[s].body : 0ull;
+  }
+  return 0;
+}
+
+bool Mob::AnyLimbWithin(Vec3 from, float maxDist) const {
+  for (const MobLimb& l : limbs_) {
+    if (!l.body) continue;
+    Vec3 at = l.xf.pos;
+    if (phys_) phys_->BodyCenterOfMass(l.body, at);
+    const Vec3 d{at.x - from.x, at.y - from.y, at.z - from.z};
+    if (d.x * d.x + d.y * d.y + d.z * d.z <= maxDist * maxDist) return true;
+  }
+  return false;
 }
 
 uint32_t MobSystem::AppendInstances(std::vector<BodyVoxInst>& out,
@@ -19010,6 +19738,7 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
   if (limb < 0 || limb >= (int)mob->limbs_.size()) return 0;
   MobLimb& l = mob->limbs_[limb];
   if (!l.body) return 0;
+  mob->WakeDead();
   BurnLimbView v = mob->ViewOf(l);
   const size_t n = v.Size();
   uint32_t marked = 0;
@@ -19169,6 +19898,7 @@ uint32_t MobSystem::PourOnBody(uint64_t mobId, const BodyRayHit& hit, Vec3 rd,
     if (m.id_ == mobId) mob = &m;
   if (!mob) mob = AvatarById(mobId);
   if (!mob || !mob->def_) return 0;
+  mob->WakeDead();
   rd = rd.normalized();
   if (rd.len() < 0.5f) return 0;
   // The brush is a disc across the ray, centred on the hit: every cell is
@@ -20068,6 +20798,10 @@ void MobSystem::RefreshOwnership() {
   if (!ownershipFn_) return;
   for (Mob& m : mobs_) {
     if (m.def_ == nullptr) continue;
+    // A CORPSE KEEPS THE OWNER IT DIED WITH. The dead state is not on the wire
+    // yet (PLAN_corpse_is_a_mob.md P2c), so a dead Mob flipping to a ghost
+    // would be a corpse nobody steps and nobody can see.
+    if (!m.alive_) continue;
     // A CREATURE I HAVE NEVER HELD IS NOT MINE TO CLAIM (mob.h's note on
     // `announceOnly_`). The announce carries no record, so promoting it here
     // would step a pristine copy of a creature the peer is also stepping --
@@ -21734,6 +22468,7 @@ void Mob::Launch(Vec3 vel) {
 
 void Mob::AddLift(Vec3 vps) {
   if (vps.x == 0.0f && vps.y == 0.0f && vps.z == 0.0f) return;
+  WakeDead();   // a corpse lifted by `float aura` is a corpse in motion
   // ---- LIMP: the rig belongs to Jolt --------------------------------------
   // One impulse per live limb, sized mass x dv so every limb gains the SAME
   // speed (a uniform rig velocity, which is why SetLimbVelocities exists), and

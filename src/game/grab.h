@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdint>
 
+#include "game/mob.h"
 #include "math3d.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
@@ -62,8 +63,18 @@ class GrabHold {
   // follower with no dynamics of its own (StrapBody), so dragging it would
   // move nothing at all: the host is what has to be dragged, and the plate
   // comes with it.
-  static uint64_t Grabbable(const DebrisSystem& debris, uint64_t body) {
+  //
+  // ...AND A CORPSE IS A DEAD MOB NOW (docs/PLAN_corpse_is_a_mob.md). Its limbs
+  // are MobSystem's, but they are dynamic for good and nothing re-poses them,
+  // which is the whole of why a living limb is refused: there is no owner
+  // animation to argue with. So a dead Mob's limb is grabbable too, through
+  // the same shell-to-host redirect (MobSystem::GrabbableDeadLimb); dragging
+  // one limb drags the rest of the body on its joints.
+  static uint64_t Grabbable(const DebrisSystem& debris, const MobSystem* mobs,
+                            uint64_t body) {
     if (!body) return 0;
+    if (mobs != nullptr)
+      if (const uint64_t limb = mobs->GrabbableDeadLimb(body)) return limb;
     if (const uint64_t host = debris.WornHostOf(body)) body = host;
     return debris.HasBody(body) ? body : 0;
   }
@@ -116,10 +127,14 @@ class GrabHold {
 
   // ONE PHYSICS TICK of the servo. Call immediately before Physics::Step, with
   // the same dt that Step is about to be given.
-  void Tick(Physics& phys, const DebrisSystem& debris, const Tuning::Player& tp,
-            Vec3 handVoxel, Vec3 fwd, float dt) {
+  void Tick(Physics& phys, const DebrisSystem& debris, const MobSystem* mobs,
+            const Tuning::Player& tp, Vec3 handVoxel, Vec3 fwd, float dt) {
     if (!body_ || dt <= 0.0f) return;
-    if (!debris.HasBody(body_)) {
+    // Still a body something holds: debris, or a dead Mob's limb (a carve
+    // rebuilds a limb's collider under a NEW handle, and then this one is
+    // simply gone, exactly like a debris body re-made by a shatter).
+    if (!debris.HasBody(body_) &&
+        !(mobs != nullptr && mobs->GrabbableDeadLimb(body_) == body_)) {
       Forget();
       return;
     }

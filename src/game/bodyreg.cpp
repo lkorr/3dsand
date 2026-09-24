@@ -6,8 +6,14 @@
 #include <unordered_map>
 #include <unordered_set>
 
-// The walk order — debris, then mob limbs, then avatar parts — appears exactly
-// three times in this file and nowhere else in the codebase. Each system's
+// The walk order — debris, then the avatar's parts, then mob limbs — appears
+// exactly three times in this file and nowhere else in the codebase.
+//
+// THE AVATAR BEFORE THE MOBS (2026-09-24, PLAN_corpse_is_a_mob.md). Every walk
+// gives up at kMaxBodySlots, so whoever is walked LAST is who a crowded frame
+// starves. Corpses are Mobs now and stay rigs for as long as the dead cap lets
+// them, so the mob walk is the one that grows; the player's own body must not
+// be the one to vanish when it does. Each system's
 // Append* takes the base its slots start at; the bases are derived here from
 // the same counts every time, so the three arrays cannot disagree.
 //
@@ -24,29 +30,31 @@
 
 void BodyRegistry::BuildXforms(std::vector<BodyXformGpu>& out) const {
   debris_.BuildXforms(out);  // clears + fills [0, SlotCount)
-  mobs_.AppendXforms(out);
   if (avatar_) avatar_->AppendXforms(out);
+  mobs_.AppendXforms(out);
 }
 
 void BodyRegistry::BuildInstances(std::vector<BodyVoxInst>& out) {
   debris_.BuildInstances(out);  // clears + fills, slots [0, SlotCount)
-  const uint32_t mobBase = debris_.SlotCount();
-  const uint32_t avatarBase = mobs_.AppendInstances(out, mobBase);
-  if (avatar_) avatar_->AppendInstances(out, avatarBase);
+  const uint32_t avatarBase = debris_.SlotCount();
+  const uint32_t mobBase =
+      avatar_ ? avatar_->AppendInstances(out, avatarBase) : avatarBase;
+  mobs_.AppendInstances(out, mobBase);
 }
 
 void BodyRegistry::BuildMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
   out.clear();
   debris_.AppendMicroInsts(out);
   const uint32_t debrisEnd = (uint32_t)out.size();
-  const uint32_t mobBase = debris_.SlotCount();
-  // The avatar's base is where the MOB WALK ACTUALLY STOPPED, not
-  // `mobBase + LimbBodyCount()`: the walk gives up at kMaxBodySlots and the
-  // count does not, so on a crowded frame the two differ and the avatar's
-  // parts would be laid over somebody else's transforms.
-  const uint32_t avatarBase = mobs_.AppendMicroInsts(out, mobBase);
-  const uint32_t mobEnd = (uint32_t)out.size();
-  if (avatar_) avatar_->AppendMicroInsts(out, avatarBase);
+  const uint32_t avatarBase = debris_.SlotCount();
+  // The mobs' base is where the AVATAR WALK ACTUALLY STOPPED, not
+  // `avatarBase + LimbBodyCount()`: the walk gives up at kMaxBodySlots and the
+  // count does not, so on a crowded frame the two differ and the mob limbs
+  // would be laid over somebody else's transforms.
+  const uint32_t mobBase =
+      avatar_ ? avatar_->AppendMicroInsts(out, avatarBase) : avatarBase;
+  const uint32_t avatarEnd = (uint32_t)out.size();
+  mobs_.AppendMicroInsts(out, mobBase);
 
   // ---- ALIASING DIAGNOSTIC --------------------------------------------------
   // Two micro instances sharing the same OWNED model draw from one brick:
@@ -60,8 +68,8 @@ void BodyRegistry::BuildMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
     seen.reserve(out.size());
     auto region = [&](uint32_t idx) -> const char* {
       if (idx < debrisEnd) return "debris";
-      if (idx < mobEnd)    return "mob";
-      return "avatar";
+      if (idx < avatarEnd) return "avatar";
+      return "mob";
     };
     for (uint32_t i = 0; i < (uint32_t)out.size(); i++) {
       const uint32_t m = out[i].model;
