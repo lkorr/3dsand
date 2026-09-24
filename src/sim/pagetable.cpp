@@ -2100,13 +2100,14 @@ void PageTable::DrainFills(const rhi::CommandEncoder& enc) {
   // not one per page. The LIFO free list hands out pages in ascending runs
   // (ResetAllEmpty/ResetIdentity push high-to-low), so a materialized ring is
   // mostly contiguous and mostly one word (EMPTY's 0): a thousand 16 KiB
-  // fills become a handful of large ones. Order is irrelevant — the pages are
-  // distinct and nothing reads them until the tick's first row, which the
-  // tracker orders after every fill regardless of how they are grouped.
-  std::sort(pendingFills_.begin(), pendingFills_.end(),
-            [](const PendingFill& a, const PendingFill& b) {
-              return a.page < b.page;
-            });
+  // fills become a handful of large ones. Nothing reads these pages until the
+  // tick's first row, which the tracker orders after every fill however they
+  // are grouped. STABLE, so that if one page were ever queued twice its fills
+  // would still land in queue order (they are never merged: page+1 fails).
+  std::stable_sort(pendingFills_.begin(), pendingFills_.end(),
+                   [](const PendingFill& a, const PendingFill& b) {
+                     return a.page < b.page;
+                   });
   size_t i = 0;
   while (i < pendingFills_.size()) {
     size_t j = i + 1;

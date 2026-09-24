@@ -89,6 +89,8 @@ std::string ChunkStore::RegionPath(IVec3 rc) const {
 }
 
 ChunkStore::Region& ChunkStore::Touch(IVec3 rc) {
+  // A region someone is about to write into is no longer "known absent".
+  absentRegions_.erase(World::PackChunkKey(rc));
   Region& r = regions_[World::PackChunkKey(rc)];
   r.rc = rc;
   r.lastUse = ++useCounter_;
@@ -357,8 +359,25 @@ void ChunkStore::Put(IVec3 wc, std::vector<uint32_t> rle, uint32_t tick) {
 }
 
 const std::vector<uint32_t>* ChunkStore::Get(IVec3 wc) {
-  IVec3 rc = RegionOf(wc);
-  Region& r = Touch(rc);
+  const IVec3 rc = RegionOf(wc);
+  const uint64_t rkey = World::PackChunkKey(rc);
+  auto rit = regions_.find(rkey);
+  if (rit == regions_.end()) {
+    // A MISS DOES NOT CREATE A REGION (see absentRegions_). Unbound, there is
+    // no disk to ask; bound, the disk is asked ONCE per region per binding,
+    // and only a region that actually holds chunks enters RAM.
+    if (dir_.empty() || absentRegions_.count(rkey)) return nullptr;
+    Region probe;
+    probe.rc = rc;
+    EnsureLoaded(rc, probe);   // counts what it loads into chunkCount_
+    if (probe.chunks.empty()) {
+      absentRegions_.insert(rkey);
+      return nullptr;
+    }
+    rit = regions_.emplace(rkey, std::move(probe)).first;
+  }
+  Region& r = rit->second;
+  r.lastUse = ++useCounter_;
   EnsureLoaded(rc, r);
   auto it = r.chunks.find(World::PackChunkKey(wc));
   if (it == r.chunks.end()) return nullptr;
@@ -492,6 +511,7 @@ bool ChunkStore::BindSave(const std::string& dir) {
   for (const auto& de : fs::directory_iterator(dir + "/players", ec))
     if (de.path().extension() == ".svp") fs::remove(de.path(), ec);
   dir_ = dir;
+  absentRegions_.clear();
   for (auto& [key, r] : regions_) {
     r.dirty = true;
     r.loaded = true;  // nothing on disk to merge anymore
@@ -675,6 +695,7 @@ bool ChunkStore::BindLoad(const std::string& dir) {
   if (!fs::is_directory(dir, ec)) return false;
   regions_.clear();  // the disk's copy wins wholesale
   entityRegions_.clear();
+  absentRegions_.clear();
   chunkCount_ = 0;
   dir_ = dir;
   LoadManifest();  // ...and so does its manifest; absent file = all tags 0

@@ -277,9 +277,12 @@ void WindPrimSystem::BuildWake(const World& world,
           // fan's footprint from "a cube of sky" into "the surface it is aimed
           // at", and it is why the budget below is rarely reached.
           //
-          // The snapshot is one tick latent, which is the safe direction: a
-          // chunk that just gained matter is already dirty from the op that
-          // put it there.
+          // The snapshot is World::Snap(), the FIXED-latency view (tick
+          // T - kSnapshotLatency exactly, published by SubmitTick whatever
+          // the GPU's timing — N1), so this filter is a pure function of
+          // (inputs, tick) and the wake list is reproducible across runs and
+          // machines. Latent is the safe direction: a chunk that just gained
+          // matter is already dirty from the op that put it there.
           if (haveOcc && occupancy[slot] == 0) continue;
           const uint64_t bit = 1ull << (slot & 63u);
           if (seen[slot >> 6] & bit) continue;

@@ -1144,9 +1144,12 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
       pendingShifts_.push_back(std::move(ps));
       // BACKSTOP, not a throughput knob (IssueDemoteCopies' shape). Entries
       // retire on a TICK deadline, so a caller that drives Update without
-      // advancing `tick` would queue them forever. Three is the steady-state
-      // ceiling (one per tick, retired at T+kWakeLatency); eight is slack.
-      while (pendingShifts_.size() > 8) {
+      // advancing `tick` would queue them forever. The steady state is at
+      // most one entry per tick for the kWakeLatency ticks each one lives;
+      // twice that is slack. It is a kWakeLatency quantity, not a readback-
+      // ring one: entries retire on the WAKE deadline, not on a fence.
+      constexpr size_t kMaxPendingShifts = 2 * (size_t)kWakeLatency;
+      while (pendingShifts_.size() > kMaxPendingShifts) {
         PendingShift& front = pendingShifts_.front();
         front.map.Wait();
         CompleteShift(front, lastTick_);
@@ -1567,9 +1570,34 @@ void Stream::HarvestDemotes(uint32_t tick) {
   // more 4 MiB GPU copy and converges as soon as the GPU keeps up. Dropping
   // them instead would leak resident pages until the slot scrolls out, which
   // is bounded but is also how the pre-JITTER pool exhausted.
+  //
+  // ---- AND WHY AGE ALONE RETRIED FOREVER --------------------------------
+  //
+  // A batch is only harvested once its map is Ready, i.e. once the GPU has
+  // executed it, and the pipeline lets the GPU run up to kSnapshotLatency /
+  // kPagedSnapshotMaxGap ticks behind the CPU. A copy issued at Update(T) is
+  // therefore only GUARANTEED ready around T + 5 — past the 3-tick bound. On a
+  // GPU-bound stretch (several ticks per frame, the GPU at the lag ceiling)
+  // every batch came back "stale", was re-copied at the current tick, came
+  // back stale again, and nothing ever classified: 4 MiB of copies per batch
+  // per tick, no demotions.
+  //
+  // So age is no longer the only way in. THE WRITE-REACH CLOCK
+  // (PageTable::ReachTick) answers the question the age bound approximates:
+  // every writer that could reach a slot stamps it — Materialize for the CA,
+  // op, particle and fluid rings, EnsurePageForOverwrite for the CPU seam —
+  // so `ReachTick(s) < copyTick` PROVES nothing has written the slot since
+  // the copy was issued (the copy is submitted before tick copyTick's work,
+  // and a write at copyTick stamps copyTick itself). Such a slot's bytes are
+  // current however late they are harvested. The age bound stays as the
+  // other door, and a slot that passes neither is re-copied at most
+  // kDemoteMaxRetries times — after that it keeps its page (bounded: the
+  // slot scrolls out eventually, and an all-air one is freed by the
+  // hysteresis in ConsumeOccupancy) rather than paying a copy per tick.
   constexpr uint32_t kDemoteFreshTicks = 3;
+  constexpr uint32_t kDemoteMaxRetries = 4;
   const bool dbg = PtDbg();
-  uint32_t demoted = 0, retried = 0, harvested = 0;
+  uint32_t demoted = 0, retried = 0, harvested = 0, dropped = 0;
   double cpyMs = 0.0, clsMs = 0.0;
   while (!demotes_.empty() && demotes_.front().map.Ready()) {
     PendingDemote d = std::move(demotes_.front());
@@ -1600,9 +1628,14 @@ void Stream::HarvestDemotes(uint32_t tick) {
         if (World::PackChunkKey(world_->SlotToWorldChunk(s)) != d.keys[i])
           continue;
         if (world_->PageOffsetOfSlot(s) == World::kNoPage) continue;  // demoted already
-        if (!fresh) {
-          retry.push_back(s);
-          retryKeys.push_back(d.keys[i]);
+        const bool untouched = world_->pages->ReachTick(s) < d.copyTick;
+        if (!fresh && !untouched) {
+          if (d.generation < kDemoteMaxRetries) {
+            retry.push_back(s);
+            retryKeys.push_back(d.keys[i]);
+          } else {
+            dropped++;
+          }
           continue;
         }
         if (world_->pages->CpuDirty().Has(s)) continue;  // written since the copy
@@ -1616,7 +1649,7 @@ void Stream::HarvestDemotes(uint32_t tick) {
       }
       if (!retry.empty()) {
         retried += (uint32_t)retry.size();
-        IssueDemoteCopies(retry, retryKeys, tick);
+        IssueDemoteCopies(retry, retryKeys, tick, d.generation + 1);
       }
     } else {
       d.map.Unmap();
@@ -1624,10 +1657,11 @@ void Stream::HarvestDemotes(uint32_t tick) {
     stagingPool_.push_back(d.staging);
   }
   if (demoted) world_->pages->FlushTableWrites(ctx_->queue);
-  if (dbg && (harvested || retried))
+  if (dbg && (harvested || retried || dropped))
     std::printf("[pt-time] demote harvest: batches=%u demoted=%u retried=%u "
-                "queued=%zu (memcpy %.2f ms, classify %.2f ms)\n",
-                harvested, demoted, retried, demotes_.size(), cpyMs, clsMs);
+                "dropped=%u queued=%zu (memcpy %.2f ms, classify %.2f ms)\n",
+                harvested, demoted, retried, dropped, demotes_.size(), cpyMs,
+                clsMs);
 }
 
 void Stream::FoldSnapshot() {

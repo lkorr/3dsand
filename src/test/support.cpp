@@ -1966,6 +1966,11 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
   // candidate instead of one rebuild per candidate.
   static const uint32_t kPagedSnapshotMaxGap = [] {
     constexpr uint32_t kDefault = 4;
+    // World::kSnapshotLatency's ceiling, checked where it is declared rather
+    // than in two comments: the published snapshot is K ticks old, and the
+    // page table's drain may not accept a delivered one older than that.
+    static_assert(World::kSnapshotLatency <= kDefault,
+                  "kSnapshotLatency must stay <= kPagedSnapshotMaxGap");
     if (const char* e = std::getenv("SANDVOX_SNAP_MAXGAP")) {
       const long n = std::strtol(e, nullptr, 10);
       if (n >= 1 && n <= 13) {
