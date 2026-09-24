@@ -2026,13 +2026,29 @@ class Mob {
   // wakes it (MobSystem::PreTick).
   bool DeadAsleep() const { return deadAsleep_; }
   // Which sleep criterion is holding this corpse awake right now, by name
-  // (nullptr = none: it is quiet). The corpse-sleep gate's attribution.
+  // (nullptr = none: it is quiet and falling asleep). The corpse-sleep gate's
+  // attribution. ASLEEP it names that instead -- "asleep, drying: next level
+  // at tick T" while a passive coat is still drying on its own cadence
+  // (Mob::DeadDryVisit), "asleep, dry" once nothing is due.
   const char* DeadAwakeReason() const;
+  // The tick of this sleeping corpse's next drying visit (0 = none due: it is
+  // dry, or awake). See Mob::NextDryTick.
+  uint32_t DeadDryDueTick() const { return dryDue_; }
+  // What the last drying visit that WOKE this corpse found written besides
+  // drying (StainTick's writer bits: 1 contact, 2 rain, 8 wet), and on which
+  // limb; 0 = no visit has woken it. Attribution for the corpse-sleep gate.
+  uint8_t DeadDryWokeBy() const { return dryWokeBy_; }
+  int DeadDryWokeLimb() const { return dryWokeLimb_; }
+  // How it was last woken from outside a damage entry point: 1 Jolt active
+  // (PreTick), 2 the chunks round it changed, 3 Jolt active after the step
+  // (PostStep), 4 a drying visit wrote something else; 0 = never.
+  uint8_t DeadWokeHow() const { return deadWokeHow_; }
   // Wake a sleeping corpse. Cheap and idempotent; every entry point that can
   // change a dead body calls it.
   void WakeDead() {
     deadAsleep_ = false;
     deadQuiet_ = 0;
+    dryDue_ = 0;
   }
   // Death order, 1-based and system-wide (0 = alive / never died). The dead
   // cap evicts the LOWEST first.
@@ -3044,7 +3060,26 @@ class Mob {
   // not stand up either), no arrest and therefore no fall damage.
   void TickDeadLimp(float dt);
   // Every sleep criterion (MobSystem's note on kDeadSleepTicks) as of now.
-  bool DeadQuietNow() const { return DeadAwakeReason() == nullptr; }
+  // The criteria themselves, asleep or not (DeadAwakeReason adds the asleep
+  // report on top).
+  // `passiveDrySleeps` false = P1's rule, under which a drying coat held the
+  // corpse awake (the corpse-sleep gate's before/after number).
+  const char* DeadAwakeCriterion(bool passiveDrySleeps = true) const;
+  bool DeadQuietNow() const { return DeadAwakeCriterion() == nullptr; }
+  // THE NEXT TICK A PASSIVE COAT ON THIS BODY LOSES A LEVEL, strictly after
+  // `after` (0 = none: every passive coat is at its floor). A level is lost
+  // only on a tick that is a multiple of the material's period
+  // (MobSystem::CoatDryTicks, DryOneLimb's own `tick % period` test), so the
+  // answer is the smallest such multiple over the passive coats the ledger
+  // still ranks above their floor.
+  uint32_t NextDryTick(uint32_t after) const;
+  // One drying visit to a SLEEPING corpse, on its due tick: the whole
+  // StainTick, exactly as an awake corpse runs it that tick, then the twin
+  // sync and ledger it would have had within the next few ticks. Anything but
+  // drying written (contact, rain, wet) wakes it; else it stays asleep and
+  // the next due tick is taken off the fresh ledger.
+  void DeadDryVisit(uint32_t tick, World& world, uint32_t& budget,
+                    uint32_t& rainBudget);
   // Digest of what could wake a sleeping corpse from outside without touching
   // it: the residency window and the version of every cached chunk the body's
   // box overlaps. Equal = nothing around it changed.
@@ -3556,6 +3591,14 @@ class Mob {
   bool rigReleased_ = false;   // the rig went to DebrisSystem: a husk
   bool deadAsleep_ = false;    // see DeadAsleep()
   uint16_t deadQuiet_ = 0;     // consecutive ticks DeadQuietNow() held
+  // Asleep with a passive coat still drying: the tick of the next visit
+  // (NextDryTick), and the coat.decayScale it was computed under -- an F5
+  // that moves the scale moves every period, so the due tick is re-derived.
+  uint32_t dryDue_ = 0;
+  float dryScale_ = 0.0f;
+  uint8_t dryWokeBy_ = 0;      // see DeadDryWokeBy()
+  uint8_t deadWokeHow_ = 0;    // see DeadWokeHow()
+  int16_t dryWokeLimb_ = -1;
   // Which of StainTick's passes wrote on its last run, and on which limb
   // (bits: 1 contact, 2 rain, 4 dry, 8 wet). Attribution for DeadAwakeReason.
   uint8_t stainWriters_ = 0;
@@ -4798,6 +4841,21 @@ class MobSystem {
   // kDeadAnchorStride ticks so the patch under it is not evicted
   // (debris.cpp kTerrainEvictTicks) and it does not wake over a hole.
   static constexpr uint16_t kDeadSleepTicks = 60;
+  // A COAT THAT ONLY DRIES DOES NOT KEEP A CORPSE AWAKE (P2d). Blood at 20 s a
+  // level held every blooded corpse awake -- full PostStep, anchor, burn and
+  // stain scans -- for ~15,000 ticks. A passive coat (CoatDriesAsleep) is left
+  // out of the sleep criteria and dried on its own cadence instead: a
+  // sleeping corpse is visited only on the tick its next level is due
+  // (Mob::DeadDryVisit).
+  // Does a coat of `mat` only DRY while on a body -- time-driven level loss
+  // and nothing else? Data, not ids: it dries (coat.decay > 0), it is not a
+  // WASHER (water wicks and drips, WetOneLimb) and it is not CORROSIVE or HOT
+  // (matCorrodes_: acid eats, lava burns, BurnOneLimb). A flammable coat (oil)
+  // is passive: it acts only when fire reaches it, and fire near a sleeping
+  // corpse changes the chunks round it, which wakes it (DeadWakeKey).
+  bool CoatDriesAsleep(uint32_t mat) const;
+  // Ticks per level of `mat` in the shade: DryOneLimb's period. 0 = never dries.
+  uint32_t CoatDryTicks(uint32_t mat) const;
   static constexpr uint32_t kDeadAnchorStride = 128;
   uint32_t LiveMobCount() const;
   uint32_t DeadMobCount() const;       // unreleased corpses
@@ -5238,6 +5296,19 @@ class MobSystem {
   // thoroughly bruised limb — see the note at the definition.
   uint32_t LimbCoatMatCount(uint64_t mobId, int limbIndex, uint32_t coatMat,
                             uint32_t minAmt) const;
+  // EVERY coat word on the creature, every limb, in one number (FNV over
+  // limb, voxel, stain), and in `*sumAmt` the summed coat amount. Two runs
+  // whose bodies carry the same coat voxel for voxel agree (the corpse-sleep
+  // gate reads the sum off it).
+  uint64_t CoatDigest(uint64_t mobId, uint64_t* sumAmt = nullptr) const;
+  // THE AWAKE STAIN PASS, RUN ON DEMAND (the corpse-sleep gate's shadow): one
+  // Mob::StainTick on this creature at `tick` from fresh pots, returning what
+  // it wrote (its writer bits: 1 contact, 2 rain, 4 dry, 8 wet; 0 = nothing).
+  // On a tick a sleeping corpse skipped, 0 is the proof that sleeping through
+  // it changed nothing an awake corpse would have.
+  uint8_t ShadowStainTick(uint64_t mobId, uint32_t tick, World& world);
+  // Mob::DeadAwakeCriterion by id, either rule. nullptr = quiet / not found.
+  const char* DeadAwakeCriterionOf(uint64_t mobId, bool passiveDrySleeps) const;
   // The highest WORLD y (voxels) of any voxel of this limb carrying a stain
   // of at least `minAmt`, through the limb's live pose; -1e30 when none. What
   // "a shallow pool stains the ankles and not the thigh" is measured as.
@@ -5980,7 +6051,7 @@ class MobSystem {
   // Release the oldest corpses to debris until both caps hold.
   void EvictDead();
   // Sleep bookkeeping for every awake corpse, after the tick's passes.
-  void UpdateDeadSleep(World& world);
+  void UpdateDeadSleep(World& world, uint32_t tick);
   uint64_t deathSeq_ = 0;       // Mob::deathSeq_'s source
   uint64_t deadEvicted_ = 0;    // DeadEvictedTotal
   uint64_t deadAnchors_ = 0;    // DeadAnchorsTotal

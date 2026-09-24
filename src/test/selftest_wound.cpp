@@ -65,6 +65,7 @@
 #include "game/anim.h"   // QuatRotate: a joint anchor is body-local
 #include "sim/microbody.h"
 #include "sim/tuning.h"
+#include "sim/weather.h"  // corpse-sleep: the rain word, for attribution
 #include "test/selftest.h"
 #include "sim/scale.h"
 #include "test/support.h"
@@ -6351,7 +6352,7 @@ Status GateSeveredHand(Ctx& c, std::string& detail) {
 }
 
 // ---------------------------------------------------------------------------
-// corpse-sleep: a settled corpse costs nothing, and a blow wakes it
+// corpse-sleep: a settled corpse costs nothing, dries anyway, and a blow wakes it
 // ---------------------------------------------------------------------------
 //
 // A corpse is a dead Mob now (docs/PLAN_corpse_is_a_mob.md) and keeps its rig,
@@ -6359,22 +6360,36 @@ Status GateSeveredHand(Ctx& c, std::string& detail) {
 // settled world must not cost a terrain anchor, a read-back, an untunnel and
 // a DriveWornShells activation of every garment on it every tick, forever.
 //
-// The claims, on a DRESSED corpse (so there are garments to activate):
+// AT THE AUTHORED DRYING RATES (P2d). Even a corpse killed without a wound
+// carries its anatomy's `blood` voxels, which decay out of the torso over a
+// few hundred ticks and leave a blood COAT that dries at 20 s a level --
+// ~15,000 ticks of "still drying", which held P1's corpse awake throughout. A
+// passive coat no longer keeps a corpse awake (MobSystem::CoatDriesAsleep):
+// it sleeps, and is visited only on the tick its next level is due
+// (Mob::DeadDryVisit).
+//
+// The claims, on a DRESSED corpse (so there are garments to activate) SOAKED
+// in blood after the kill (every limb, so the coat does not depend on the
+// site), lying on a site with no liquid near it:
 //   A. it falls ASLEEP (Mob::DeadAsleep) within corpseSleepMaxTicks of lying
-//      down in a quiet world;
+//      down, with a blood coat still drying on it (a due tick) that P1's rule
+//      would have held it awake for;
 //   B. asleep, over corpseSleepWindow ticks it runs NO dead PostStep and
 //      registers terrain anchors only on its keep-alive stride
 //      (MobSystem::kDeadAnchorStride), and no body of it is active in Jolt;
+//   D. it STAYS asleep to corpseSleepDryTicks while its coat dries: at least
+//      one drying visit, the summed coat falls, and on EVERY tick it slept
+//      through, the awake stain pass run as a shadow
+//      (MobSystem::ShadowStainTick) writes nothing -- so the skipped ticks are
+//      exactly the ones an awake corpse spends writing nothing, and the coat
+//      is voxel for voxel what continuous drying leaves (the visit tick IS
+//      the awake call);
 //   C. a CUT wakes it at once — a sleeping corpse is still flesh — and the
 //      cut takes voxels.
 Status GateCorpseSleep(Ctx& c, std::string& detail) {
   IdCounterScope idScope(c.mobs);
   PrepareWorld(c);
   DeadFixture f(c);
-  // Blood as a lattice MATERIAL on the root (it decays, so it holds the burn
-  // front open): spawned / just after the kill / 20 ticks on. Attribution.
-  uint32_t bloodMat = 0, bloodSpawned = 0, bloodSevered = 0, bloodSettled = 0;
-  uint32_t coatSpawned = 0, coatSevered = 0, coatSettled = 0;
   // A garment, so the asleep claim covers DriveWornShells' activations too.
   const ItemDef* wear = nullptr;
   for (const ItemDef& it : c.items.items)
@@ -6382,15 +6397,75 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
       wear = &it;
       break;
     }
+  const int maxTicks = (int)BaselineNumber("corpseSleepMaxTicks", 300);
+  const int window = (int)BaselineNumber("corpseSleepWindow", 60);
+  const int dryTicks = std::max(
+      maxTicks + window + 1, (int)BaselineNumber("corpseSleepDryTicks", 1500));
+  // Liquid cells the CPU mirror (what the contact pass reads) shows in the box
+  // `reach` round `ctr` across, -4..+8 in y; `known` = every chunk of it was
+  // cached. `low`/`ver`: the lowest such cell and its chunk's version.
+  auto liquidAround = [&](IVec3 ctr, int reach, bool* known, IVec3* low,
+                          uint32_t* ver) {
+    uint32_t n = 0;
+    if (known) *known = true;
+    if (low) *low = IVec3{0, 1 << 30, 0};
+    for (int y = ctr.y - 4; y <= ctr.y + 8; y++)
+      for (int z = ctr.z - reach; z <= ctr.z + reach; z++)
+        for (int x = ctr.x - reach; x <= ctr.x + reach; x++) {
+          const CachedChunk* cc = c.world.Cached(IVec3{x >> 4, y >> 4, z >> 4});
+          if (!cc || cc->voxels.size() != kChunkVol) {
+            if (known) *known = false;
+            continue;
+          }
+          const uint32_t m = cc->voxels[((uint32_t)(z & 15) * kChunk +
+                                         (uint32_t)(y & 15)) * kChunk +
+                                        (uint32_t)(x & 15)] & 0xFFFu;
+          if (m == 0 || m >= c.mats.size() || c.mats[m].gpu.klass != CLASS_LIQUID)
+            continue;
+          n++;
+          if (low && y < low->y) {
+            *low = IVec3{x, y, z};
+            if (ver) *ver = cc->version;
+          }
+        }
+    return n;
+  };
+  constexpr int kDryReach = 12;
+  int inset = 470;
+  uint32_t siteLiquid = 0;
+  uint32_t soaked = 0;  // voxels given a blood coat after the kill
   // DeadFixture's body, killed WITHOUT A WOUND: the root severed is a death
   // (Sever routes the root to Die) with no stump armed and no hp blow's bleed
-  // budget, so nothing drips a pool for the corpse to lie in. A corpse
-  // bleeding out or drying off in its own blood is correctly AWAKE for as long
-  // as that takes (Mob::DeadQuietNow); this claim is about the one that has
-  // nothing left to do.
+  // budget, so nothing drips a pool for the corpse to lie in. A corpse lying
+  // in its own blood is re-stained by the contact pass, which is not passive,
+  // and is correctly awake while that goes on.
   {
-    const Target t = ChooseTarget(c.mobs, FixtureSite(c.world, 470));
-    f.id = t.valid() ? SpawnTarget(c, t, 470, f.pchunk) : 0;
+    // A DRY SITE, CHOSEN OFF THE CPU MIRROR. Inset 470 is the shore of a
+    // worldgen pond (556 liquid cells within 12 voxels): where the ragdoll
+    // comes to rest is chaotic, and in a --verify list it rolled into the
+    // water -- wet and in contact, correctly never asleep, and not this
+    // claim. So the first candidate with no liquid within kDryReach of it
+    // is used. The mirror follows the tick's player chunk (SubmitTick's
+    // `pchunk`), so each candidate is primed with a few empty ticks first;
+    // that also puts the mirror under the creature SpawnTarget poses, whose
+    // own settling steps submit no tick.
+    const int insets[] = {470, 350, 390, 430, 510};
+    f.tick = 62980;
+    for (int cand : insets) {
+      const IVec3 site = FixtureSite(c.world, cand);
+      f.pchunk = IVec3{site.x >> 4, site.y >> 4, site.z >> 4};
+      bool known = false;
+      uint32_t n = 0;
+      for (int i = 0; i < 6 && !known; i++) {
+        f.Step();
+        n = liquidAround(site, kDryReach, &known, nullptr, nullptr);
+      }
+      inset = cand;
+      siteLiquid = n;
+      if (known && n == 0) break;
+    }
+    const Target t = ChooseTarget(c.mobs, FixtureSite(c.world, inset));
+    f.id = t.valid() ? SpawnTarget(c, t, inset, f.pchunk) : 0;
     Mob* mob = f.id ? c.mobs.FindMobById(f.id) : nullptr;
     if (!mob || !mob->Def() || mob->Def()->rootLimb < 0) {
       detail = "spawn refused";
@@ -6406,111 +6481,141 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
     }
     for (int i = 0; i < 8; i++) f.Step();
     f.root = mob->Def()->rootLimb;
-    f.torso = c.mobs.LimbBody(f.id, f.root);
-    bloodMat = mob->Def()->bleedMat;
-    bloodSpawned = c.mobs.LimbMaterialCount(f.id, f.root, bloodMat);
-    coatSpawned = c.mobs.LimbCoatMatCount(f.id, f.root, bloodMat, 1);
     c.mobs.Sever(f.id, f.root);
-    coatSevered = c.mobs.LimbCoatMatCount(f.id, f.root, bloodMat, 1);
     if (c.mobs.IsAlive(f.id)) {
       detail = "severing the root did not kill";
       c.mobs.Reset();
       return Status::Fail;
     }
-    bloodSevered = c.mobs.LimbMaterialCount(f.id, f.root, bloodMat);
+    // A BLOODED CORPSE, on purpose: every limb soaked in its own blood at
+    // kSoak. The anatomy blood that decays out of the torso leaves a coat on
+    // some sites and none on others (it did at 470, not at 490 or 510), and
+    // the claim is about the coat, so the coat is put there.
+    constexpr uint32_t kSoak = 6;
+    if (const Mob* m = c.mobs.FindMobById(f.id); m != nullptr && m->Def())
+      for (int li = 0; li < m->LimbCount(); li++)
+        soaked += c.mobs.SoakLimb(f.id, li, m->Def()->bleedMat, kSoak, f.tick);
     for (int i = 0; i < 20; i++) f.Step();
-    bloodSettled = c.mobs.LimbMaterialCount(f.id, f.root, bloodMat);
-    coatSettled = c.mobs.LimbCoatMatCount(f.id, f.root, bloodMat, 1);
   }
-  const int maxTicks = (int)BaselineNumber("corpseSleepMaxTicks", 900);
-  const int window = (int)BaselineNumber("corpseSleepWindow", 60);
   auto dead = [&]() { return c.mobs.FindMobById(f.id); };
-  // ---- A. it falls asleep ---------------------------------------------------
-  // THE DRYING CLOCK IS AN ARM (corpse-wash's decayScale, the impact gates'
-  // pulp rate). Even a corpse killed without a wound carries its anatomy's
-  // `blood` voxels, which decay out of the torso over a few hundred ticks and
-  // leave a blood coat behind them; at the authored 20 s per level that coat
-  // keeps the body correctly AWAKE for ~15,000 ticks (Mob::DeadAwakeReason
-  // names it). Scaled so it dries inside the window, the claim is the one
-  // that matters: once there is nothing left to do, the corpse sleeps.
-  const Tuning sleepTune = CurrentTuning();
-  {
-    Tuning fast = sleepTune;
-    fast.coat.decayScale =
-        (float)BaselineNumber("corpseSleepDecayScale", 300.0);
-    SetCurrentTuning(fast);
-  }
-  int asleepAt = -1;
-  std::string history;  // the awake reason at a few ticks, for attribution
-  for (int i = 0; i < maxTicks; i++) {
-    f.Step();
-    const Mob* m = dead();
-    if (m != nullptr && m->DeadAsleep()) {
-      asleepAt = i;
-      break;
-    }
-    if (m != nullptr && (i == 0 || i == 10 || i == 100 || i == 400 || i == 700)) {
-      const char* w = m->DeadAwakeReason();
-      history += Format(" t%d:'%s'", i, w ? w : "quiet");
-    }
-  }
-  // Attribution when it did not (rule 6): which criterion is still awake.
-  std::string awakeWhy;
-  if (asleepAt < 0) {
-    const Mob* m = dead();
-    uint32_t active = 0, bleeding = 0, burning = 0;
-    std::string activeSlots;
-    for (int li = 0; m && li < m->LimbCount(); li++) {
-      const uint64_t h = c.mobs.LimbBody(f.id, li);
-      if (!h) continue;
-      if (c.phys.IsActive(h)) {
-        active++;
-        activeSlots += Format(" %d", li);
-      }
-      if (c.mobs.LimbWoundOpen(f.id, li)) bleeding++;
-      if (c.mobs.LimbBurningCount(f.id, li)) burning++;
-    }
-    const char* why = m ? m->DeadAwakeReason() : "gone";
-    awakeWhy = Format(" [still awake: '%s'; %u limbs active in Jolt (slots%s, "
-                      "root %d), %u bleeding, %u burning; earlier%s]",
-                      why ? why : "(quiet now)", active, activeSlots.c_str(),
-                      f.root, bleeding, burning, history.c_str());
-    awakeWhy += Format(" [root blood voxels: spawned %u, killed %u, +20 %u, "
-                       "now %u; blood-coated voxels %u, %u, %u, now %u]",
-                       bloodSpawned, bloodSevered, bloodSettled,
-                       c.mobs.LimbMaterialCount(f.id, f.root, bloodMat),
-                       coatSpawned, coatSevered, coatSettled,
-                       c.mobs.LimbCoatMatCount(f.id, f.root, bloodMat, 1));
-  }
-  SetCurrentTuning(sleepTune);
-  // ---- B. asleep, it costs nothing ------------------------------------------
-  const uint64_t anchors0 = c.mobs.DeadAnchorsTotal();
-  const uint64_t posts0 = c.mobs.DeadPostStepsTotal();
+
+  int asleepAt = -1;            // step it was first seen asleep
+  uint32_t dueAtSleep = 0;      // its drying due tick then (0 = nothing)
+  std::string stateAtSleep;     // DeadAwakeReason then
+  std::string p1AtSleep;        // what P1's rule said then
+  uint32_t awakeTicks = 0, wakes = 0, visits = 0;
+  uint32_t shadowTicks = 0, shadowWrites = 0;
+  std::string shadowFirst;      // the first shadow tick that wrote, named
+  uint64_t anchors0 = 0, posts0 = 0, anchors = 0, posts = 0;
   uint32_t activeTicks = 0;
-  bool stayedAsleep = asleepAt >= 0;
-  for (int i = 0; i < window && asleepAt >= 0; i++) {
+  bool windowAsleep = false;
+  uint64_t sumAtSleep = 0, sumEnd = 0;
+  std::string history;          // the trace (rule 6)
+  bool was = false;
+  for (int i = 0; i < dryTicks; i++) {
+    const Mob* before = dead();
+    const uint32_t dueBefore =
+        before != nullptr && before->DeadAsleep() ? before->DeadDryDueTick() : 0u;
     f.Step();
     const Mob* m = dead();
-    if (m == nullptr || !m->DeadAsleep()) {
-      stayedAsleep = false;
-      break;
-    }
-    for (int li = 0; li < m->LimbCount(); li++)
-      if (const uint64_t h = c.mobs.LimbBody(f.id, li); h && c.phys.IsActive(h)) {
-        activeTicks++;
-        break;
+    const bool asleep = m != nullptr && m->DeadAsleep();
+    if (!asleep) awakeTicks++;
+    if (was && !asleep) wakes++;
+    if (asleep && asleepAt < 0) {
+      asleepAt = i;
+      dueAtSleep = m->DeadDryDueTick();
+      const char* s = m->DeadAwakeReason();
+      stateAtSleep = s ? s : "(null)";
+      const char* p1 = c.mobs.DeadAwakeCriterionOf(f.id, false);
+      p1AtSleep = p1 ? p1 : "quiet";
+      c.mobs.CoatDigest(f.id, &sumAtSleep);
+      anchors0 = c.mobs.DeadAnchorsTotal();
+      posts0 = c.mobs.DeadPostStepsTotal();
+      windowAsleep = true;
+    } else if (asleep && was) {
+      if (f.tick == dueBefore) {
+        visits++;
+      } else {
+        // THE SHADOW: what the awake pass would have written on this tick
+        // the corpse slept through. Not on a visit tick -- that one ran the
+        // awake pass already, and a second run would dry it twice.
+        shadowTicks++;
+        const uint8_t w = c.mobs.ShadowStainTick(f.id, f.tick, c.world);
+        if (w != 0) {
+          if (shadowWrites == 0)
+            shadowFirst = Format(" (first at tick %u: writers 0x%x)", f.tick,
+                                 (unsigned)w);
+          shadowWrites++;
+        }
       }
+    }
+    // B: the window right after it fell asleep.
+    if (asleepAt >= 0 && i > asleepAt && i <= asleepAt + window) {
+      if (!asleep) windowAsleep = false;
+      for (int li = 0; m && li < m->LimbCount(); li++)
+        if (const uint64_t h = c.mobs.LimbBody(f.id, li); h && c.phys.IsActive(h)) {
+          activeTicks++;
+          break;
+        }
+      if (i == asleepAt + window) {
+        anchors = c.mobs.DeadAnchorsTotal() - anchors0;
+        posts = c.mobs.DeadPostStepsTotal() - posts0;
+      }
+    }
+    // The trace: coat sum and state every 150 steps and at every wake.
+    if (m != nullptr && (i % 150 == 0 || (was && !asleep))) {
+      const char* w = m->DeadAwakeReason();
+      uint64_t sum = 0;
+      c.mobs.CoatDigest(f.id, &sum);
+      history += Format(" t%d:%llu%s'%s'", i, (unsigned long long)sum,
+                        was && !asleep
+                            ? Format("(woke how %u, visit writers 0x%x limb %d)",
+                                     (unsigned)m->DeadWokeHow(),
+                                     (unsigned)m->DeadDryWokeBy(),
+                                     m->DeadDryWokeLimb())
+                                  .c_str()
+                            : "",
+                        w ? w : "quiet");
+      // WHERE it is and what it wears: a corpse that fell into water is
+      // wet and in contact, and awake for that, which is not this claim.
+      if (i == 0 || i == 150) {
+        Vec3 at{};
+        m->LimbCentreWorld(f.root, at);
+        const IVec3 site = FixtureSite(c.world, 470);
+        // ...and where water could have come from: the world's rain this
+        // tick (weather::SimRainWord's rain byte) and live MPM fluid.
+        history += Format("(root at %.1f,%.1f,%.1f, site y %d, top coat mat %u, "
+                          "world rain %u, mpm fluid live %u)",
+                          at.x, at.y, at.z, site.y,
+                          c.mobs.BodyCoat(f.id).top[0].mat,
+                          weather::LastSimRainWord() & 0xFFu,
+                          (unsigned)c.world.Snap().fluidLive);
+        // ...and the liquid the CPU mirror shows round it (what the contact
+        // pass reads): count, the lowest cell, its chunk's version.
+        IVec3 low{};
+        uint32_t ver = 0;
+        const uint32_t wet = liquidAround(
+            IVec3{(int)std::floor(at.x), (int)std::floor(at.y),
+                  (int)std::floor(at.z)},
+            kDryReach, nullptr, &low, &ver);
+        history += Format("(mirror liquid cells %u, lowest at %d,%d,%d ver %u, "
+                          "tick %u)",
+                          wet, low.x, low.y, low.z, ver, f.tick);
+      }
+    }
+    was = asleep;
   }
-  const uint64_t anchors = c.mobs.DeadAnchorsTotal() - anchors0;
-  const uint64_t posts = c.mobs.DeadPostStepsTotal() - posts0;
-  const uint64_t anchorCap =
-      (uint64_t)window / MobSystem::kDeadAnchorStride + 1u;
-  const bool quiet = stayedAsleep && posts == 0 && anchors <= anchorCap &&
-                     activeTicks == 0;
+  std::string endState;
+  {
+    const Mob* m = dead();
+    const char* s = m ? m->DeadAwakeReason() : "gone";
+    endState = s ? s : "quiet";
+  }
+  c.mobs.CoatDigest(f.id, &sumEnd);
   // ---- C. a cut wakes it ----------------------------------------------------
   bool woke = false;
   uint32_t took = 0;
-  if (asleepAt >= 0) {
+  if (const Mob* m = dead(); m != nullptr && m->DeadAsleep()) {
     const int li = f.root;
     const uint64_t h = c.mobs.LimbBody(f.id, li);
     const uint32_t v0 = c.mobs.LimbArtVoxelCount(f.id, li);
@@ -6531,8 +6636,8 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
       c.mobs.Damage(h, 10.0f, at, 20.0f);
       c.mobs.CutLimb(h, cut, c.world, spawns);
     }
-    const Mob* m = dead();
-    woke = m != nullptr && !m->DeadAsleep();
+    const Mob* after = dead();
+    woke = after != nullptr && !after->DeadAsleep();
     const uint32_t v1 = c.mobs.LimbArtVoxelCount(f.id, li);
     took = v0 > v1 ? v0 - v1 : 0u;
   }
@@ -6542,16 +6647,35 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
   c.ctx.WaitIdle();
   RecordObserved("corpseSleepTicks", (double)asleepAt);
   RecordObserved("corpseSleepAnchors", (double)anchors);
-  const bool ok = asleepAt >= 0 && quiet && woke && took > 0;
+  RecordObserved("corpseSleepAwakeTicks", (double)awakeTicks);
+  RecordObserved("corpseSleepDryVisits", (double)visits);
+  RecordObserved("corpseSleepShadowWrites", (double)shadowWrites);
+  const uint64_t anchorCap = (uint64_t)window / MobSystem::kDeadAnchorStride + 1u;
+  const bool asleepOk = asleepAt >= 0 && asleepAt <= maxTicks;
+  // The case this package is about: a coat still drying, which P1's rule
+  // (drying = awake) would not have let it sleep with.
+  const bool drying = dueAtSleep != 0 && p1AtSleep != "quiet";
+  const bool quiet =
+      windowAsleep && posts == 0 && anchors <= anchorCap && activeTicks == 0;
+  const bool dried = wakes == 0 && visits >= 1 && sumEnd < sumAtSleep &&
+                     shadowTicks > 0 && shadowWrites == 0;
+  const bool ok = asleepOk && drying && quiet && dried && woke && took > 0;
   detail = Format(
-      "dressed in %s: asleep after %d ticks (cap %d)%s; asleep for %d ticks: "
-      "%llu dead PostSteps (need 0), %llu anchors (cap %llu), %u ticks with a "
-      "limb active in Jolt, stayed asleep=%d; a cut took %u voxels and woke "
-      "it=%d",
-      wear ? wear->name.c_str() : "nothing", asleepAt, maxTicks, awakeWhy.c_str(), window,
+      "site inset %d (%u liquid cells within %d), dressed in %s, %u voxels "
+      "soaked in blood, authored drying: asleep after %d ticks (cap %d) as '%s' "
+      "[P1's rule then: '%s']; asleep for %d ticks: %llu dead PostSteps (need "
+      "0), %llu anchors (cap %llu), %u ticks with a limb active in Jolt, stayed "
+      "asleep=%d | over %d ticks: awake %u, %u wake(s) (need 0), %u drying "
+      "visit(s) (need >= 1), coat sum %llu at sleep -> %llu; shadow awake pass "
+      "on %u slept-through ticks wrote on %u (need 0)%s; end '%s' | a cut took "
+      "%u voxels and woke it=%d | trace%s",
+      inset, siteLiquid, kDryReach, wear ? wear->name.c_str() : "nothing",
+      soaked, asleepAt, maxTicks, stateAtSleep.c_str(), p1AtSleep.c_str(), window,
       (unsigned long long)posts, (unsigned long long)anchors,
-      (unsigned long long)anchorCap, activeTicks, stayedAsleep ? 1 : 0, took,
-      woke ? 1 : 0);
+      (unsigned long long)anchorCap, activeTicks, windowAsleep ? 1 : 0,
+      dryTicks, awakeTicks, wakes, visits, (unsigned long long)sumAtSleep,
+      (unsigned long long)sumEnd, shadowTicks, shadowWrites, shadowFirst.c_str(),
+      endState.c_str(), took, woke ? 1 : 0, history.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
