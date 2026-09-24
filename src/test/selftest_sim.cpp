@@ -2640,6 +2640,242 @@ Status GateFluidReact(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- fluid-self-react ------------------------------------------------------
+// EXCITED FLUID RUNS ITS OWN RULES (rule-unification W1-B1). fluid-react proves
+// the NEIGHBOUR side: a voxel's rule consumes the excited water beside it. This
+// gate proves the SELF side, which did not exist before -- an air cell holding
+// MPM particles runs the particles' material bucket (sim_step excitedReact),
+// woken by the seam's particleTick when one of its ungated rules has a partner.
+// Three sealed glass boxes (glass: acid's rules skip it, nothing hot, not
+// absorbent), each poured with 1024 particles and run with settle held off so
+// every eighth stays EXCITED for the whole window -- the fixture then asserts
+// that nothing settled, so no voxel liquid can have done the work:
+//   A  acid on a floor half stone, half an inert organic: acid's own PAIR
+//      rules (neighborBecomes gravel / air) must eat both. Stone has no rule
+//      of its own and the organic is picked inert, so only acid can.
+//   B  water on a lava floor: water's own rule `water + tag:hot -> steam`
+//      must make steam. Lava's rule makes STONE (neighbour kept), so any steam
+//      is the water's, and FA_CONSUMED -- the bins its self product took --
+//      must be non-zero.
+//   C  water on an inert ABSORBENT floor: the donor spend (stainStep's
+//      STAIN_SPEND paid by particleTick's bid). Exact: the wet-stain levels on
+//      the floor equal the eighths consumed, and spawned == live + consumed.
+// Dim dawn pinned (evaporation and freezing off), twice-run world hash.
+Status GateFluidSelfReact(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  auto idOf = [&](const char* n) -> uint32_t {
+    for (size_t i = 1; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0u;
+  };
+  const uint32_t waterId = idOf("water"), acidId = idOf("acid"),
+                 lavaId = idOf("lava"), glassId = idOf("glass"),
+                 steamId = idOf("steam");
+  if (!waterId || !acidId || !lavaId || !glassId || !steamId) {
+    detail = "missing one of water / acid / lava / glass / steam";
+    return Status::Fail;
+  }
+  // The organic and the absorbent floors are picked BY PROPERTY, first in
+  // table order, and INERT (no rule of their own) so the only thing that can
+  // change them is the fluid (memory: gotcha-gate-hardcodes-asset-cast).
+  uint32_t organicId = 0, absorbId = 0;
+  for (uint32_t i = 1; i < (uint32_t)c.mats.size(); i++) {
+    const MaterialDef& m = c.mats[i];
+    if (m.gpu.klass != CLASS_SOLID || m.gpu.reactCount != 0) continue;
+    bool organic = false;
+    for (const std::string& t : m.tags) if (t == "organic") organic = true;
+    if (!organicId && organic) organicId = i;
+    if (!absorbId && !organic && ((m.gpu.stainPack >> 27) & 0xFu) != 0)
+      absorbId = i;
+  }
+  if (!organicId || !absorbId) {
+    detail = Format("no inert solid %s in the table",
+                    !organicId ? "organic" : "absorbent non-organic");
+    return Status::Fail;
+  }
+  const uint32_t wetType = c.mats[waterId].gpu.stainPack & 0x7u;
+
+  Tuning t = CurrentTuning();
+  t.dayNight.freeze = 1;
+  t.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  t.sim.fluidExciteMode = 0;     // nothing voxel becomes a particle...
+  t.sim.fluidSettleTicks = 600;  // ...and no particle becomes a voxel
+  t.sim.fluidDamping = 0.9f;     // the sealed-box pins fluid-react uses
+  t.sim.fluidStiffness = 2400.0f;
+  Tuning saved = CurrentTuning();
+  SetCurrentTuning(t);
+  sim.ReloadShaders(ctx.device);
+
+  const int px = 96, pz = 96, RB = 7;
+  const int floorY = 109, roofY = 126, padY = floorY + 1;
+  const int kTicks = (int)BaselineNumber("fluidSelfReactTicks", 60);
+
+  struct Arm {
+    uint32_t floorStart[2] = {0, 0};  // A: stone / organic; B: lava; C: absorbent
+    uint32_t floorEnd[2] = {0, 0};
+    uint32_t steam = 0, stainLevels = 0, stainedCells = 0, fluidVox = 0;
+    uint32_t consumed = 0, settled = 0, dead = 0, live = 0, liveEighths = 0;
+    uint32_t spawned = 0, hash = 0;
+  };
+  // arm: 0 = acid on stone|organic, 1 = water on lava, 2 = water on absorbent
+  auto runArm = [&](int arm, uint32_t tick0) -> Arm {
+    Arm r;
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    auto floorMat = [&](int x) -> uint32_t {
+      if (arm == 0) return x < 0 ? kMatStone : organicId;
+      return arm == 1 ? lavaId : absorbId;
+    };
+    std::vector<CellOp> box;
+    for (int y = floorY - 1; y <= roofY + 1; y++)
+      for (int z = -RB; z <= RB; z++)
+        for (int x = -RB; x <= RB; x++) {
+          const bool shell = x <= -RB + 1 || x >= RB - 1 || z <= -RB + 1 ||
+                             z >= RB - 1 || y <= floorY || y >= roofY;
+          uint32_t w = 0u;
+          if (shell) w = glassId;
+          else if (y == padY) w = floorMat(x);
+          if (w == lavaId) w |= 7u << 12;  // a FULL liquid cell
+          box.push_back({World::SlotCellIndex({px + x, y, pz + z}), w});
+        }
+    const uint32_t fluidMat = arm == 0 ? acidId : waterId;
+    std::vector<FluidSpawnOp> pour;
+    for (int cz = -4; cz < 4; cz++)
+      for (int cy = 0; cy < 2; cy++)
+        for (int cx = -4; cx < 4; cx++)
+          for (int s = 0; s < 8; s++) {
+            FluidSpawnOp op{};
+            op.px = ((px + cx) << 16) + ((s & 1) ? 49152 : 16384);
+            op.py = ((padY + 3 + cy) << 16) + ((s & 2) ? 49152 : 16384);
+            op.pz = ((pz + cz) << 16) + ((s & 4) ? 49152 : 16384);
+            op.mat = fluidMat;
+            pour.push_back(op);
+          }
+    r.spawned = (uint32_t)pour.size();  // one eighth per spawned particle
+
+    auto census = [&](uint32_t out[2]) {
+      std::vector<uint32_t> cb((size_t)kChunkVol);
+      out[0] = out[1] = 0;
+      r.steam = r.stainLevels = r.stainedCells = r.fluidVox = 0;
+      for (int cy = (floorY - 1) / 16; cy <= (roofY + 1) / 16; cy++)
+        for (int cz = (pz - RB) / 16; cz <= (pz + RB) / 16; cz++)
+          for (int cx = (px - RB) / 16; cx <= (px + RB) / 16; cx++) {
+            ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                           cb.data(), "selfReact");
+            for (uint32_t i = 0; i < kChunkVol; i++) {
+              const int lx = (int)(i % 16) + cx * 16 - px,
+                        ly = (int)((i / 16) % 16) + cy * 16,
+                        lz = (int)(i / 256) + cz * 16 - pz;
+              if (lx <= -RB + 1 || lx >= RB - 1 || lz <= -RB + 1 ||
+                  lz >= RB - 1 || ly <= floorY || ly >= roofY)
+                continue;  // shell or outside: not the fixture's interior
+              const uint32_t w = cb[i], m = w & 0xFFFu;
+              if (m == steamId) r.steam++;
+              if (m == fluidMat) r.fluidVox++;
+              if (ly == padY) {
+                if (m == floorMat(lx)) out[lx < 0 || arm != 0 ? 0 : 1]++;
+                if (arm == 2 && m == absorbId && ((w >> 28) & 0x7u) == wetType) {
+                  r.stainLevels += (w >> 24) & 0xFu;
+                  if ((w >> 24) & 0xFu) r.stainedCells++;
+                }
+              }
+            }
+          }
+    };
+
+    uint32_t ft = tick0, liveEst = 0, fluidN = 0;
+    for (int i = 0; i < kTicks; i++) {
+      std::vector<FluidSpawnOp> fs;
+      if (i == 2) fs = pour;
+      SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {},
+                 i == 0 ? box : std::vector<CellOp>{}, false, {6, 7, 6},
+                 false, false, {}, 0, fs, std::max(liveEst, fluidN));
+      fluidN += (uint32_t)fs.size();
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      if (i == 1) census(r.floorStart);
+      uint32_t fa[32] = {};
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
+                            128, "selfReactArgs");
+      liveEst = std::min(fa[7], kFluidCap);
+      if (i >= 2) {
+        r.consumed += fa[16];  // FA_CONSUMED: self products + absorb spends
+        r.settled += fa[10];   // FA_SETTLED: must stay 0 (fixture validity)
+        r.dead += fa[8];
+      }
+    }
+    census(r.floorEnd);
+    r.hash = HashWorldNow(ctx, world, sim, kDefaultSeed);
+    r.live = liveEst;
+    if (r.live > 0) {
+      std::vector<uint32_t> pbuf((size_t)r.live * kFluidParticleWords);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue,
+                            world.fluidParticles[sim.Page()], 0, pbuf.data(),
+                            pbuf.size() * 4, "selfReactP");
+      for (uint32_t k = 0; k < r.live; k++)
+        r.liveEighths += (pbuf[k * kFluidParticleWords + 18] >> 12) & 0x7u;
+    }
+    return r;
+  };
+
+  Arm arms[2][3];
+  for (int run = 0; run < 2; run++)
+    for (int a = 0; a < 3; a++)
+      arms[run][a] = runArm(a, 80000u + 1000u * (uint32_t)a);
+  SetCurrentTuning(saved);
+  sim.ReloadShaders(ctx.device);
+
+  bool det = true;
+  for (int a = 0; a < 3; a++)
+    det = det && arms[0][a].hash == arms[1][a].hash &&
+          arms[0][a].consumed == arms[1][a].consumed;
+  const Arm& A = arms[1][0];
+  const Arm& B = arms[1][1];
+  const Arm& C = arms[1][2];
+  const uint32_t minEat = (uint32_t)BaselineNumber("fluidSelfReactMinEaten", 2);
+  const uint32_t minSteam = (uint32_t)BaselineNumber("fluidSelfReactMinSteam", 3);
+  const uint32_t stoneEaten = A.floorStart[0] - std::min(A.floorStart[0], A.floorEnd[0]);
+  const uint32_t orgEaten = A.floorStart[1] - std::min(A.floorStart[1], A.floorEnd[1]);
+  // Fixture validity: every eighth stayed excited (nothing settled, no voxel
+  // of the poured liquid anywhere in the box), so the CA's VOXEL rules for
+  // the fluid never had anything to run on.
+  const bool excitedOnly = A.settled == 0 && B.settled == 0 && C.settled == 0 &&
+                           A.fluidVox == 0 && C.fluidVox == 0;
+  const bool acidAte = stoneEaten >= minEat && orgEaten >= minEat;
+  const bool steamed = B.steam >= minSteam && B.consumed > 0;
+  const bool absorbed = C.consumed > 0 && C.stainLevels == C.consumed &&
+                        C.spawned == C.liveEighths + C.consumed;
+  RecordObserved("fluidSelfReactStoneEaten", (double)stoneEaten);
+  RecordObserved("fluidSelfReactOrganicEaten", (double)orgEaten);
+  RecordObserved("fluidSelfReactSteam", (double)B.steam);
+  RecordObserved("fluidSelfReactAbsorbed", (double)C.consumed);
+  const bool ok = det && excitedOnly && acidAte && steamed && absorbed;
+  std::printf(
+      "fluid self-react: %s (A acid: stone %u->%u, %s %u->%u, %u eighths "
+      "consumed | B water on lava: %u steam cells, %u eighths consumed | C "
+      "water on %s: %u eighths drunk, %u wet levels on %u cells, spawned %u = "
+      "live %u + drunk %u | settled A/B/C %u/%u/%u, poured-liquid voxels "
+      "A/C %u/%u | world hash %s)\n",
+      ok ? "PASS" : "FAIL", A.floorStart[0], A.floorEnd[0],
+      c.mats[organicId].name.c_str(), A.floorStart[1], A.floorEnd[1],
+      A.consumed, B.steam, B.consumed, c.mats[absorbId].name.c_str(),
+      C.consumed, C.stainLevels, C.stainedCells, C.spawned, C.liveEighths,
+      C.consumed, A.settled, B.settled, C.settled, A.fluidVox, C.fluidVox,
+      det ? "matches" : "DIVERGED");
+  detail = Format(
+      "acid ate stone %u / %s %u (min %u); water on lava made %u steam "
+      "(min %u), consumed %u; absorb %u drunk vs %u wet levels, spawned %u vs "
+      "live %u + drunk; excited-only %s; det %s",
+      stoneEaten, c.mats[organicId].name.c_str(), orgEaten, minEat, B.steam,
+      minSteam, B.consumed, C.consumed, C.stainLevels, C.spawned,
+      C.liveEighths, excitedOnly ? "yes" : "NO (fixture settled)",
+      det ? "ok" : "DIVERGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- prefab ------------------------------------------------------------
 Status GatePrefab(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
@@ -4969,6 +5205,7 @@ const std::vector<Gate>& SimGates() {
       {"debris-float", "sim", {}, false, GateDebrisFloat},
       {"fluid-stain", "sim", {}, false, GateFluidStain},
       {"fluid-react", "sim", {}, false, GateFluidReact},
+      {"fluid-self-react", "sim", {}, false, GateFluidSelfReact},
       {"prefab", "sim", {}, false, GatePrefab},
       {"page-roundtrip", "sim", {}, false, GatePageRoundtrip},
       {"fire-down", "sim", {}, false, GateFireDown},

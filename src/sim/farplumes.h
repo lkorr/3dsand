@@ -11,7 +11,7 @@
 //
 // THE GAP THIS CLOSES (world.h's kGasFarEmitMax block states it too, because
 // the constant is where a reader meets the feature first). A chunk evicted
-// mid-burn is FROZEN. Its `ember` / `lava` / burning-foliage voxels were
+// mid-burn is FROZEN. Its `ember` / burning-foliage voxels were
 // downsampled into the far cascade by the last `fardown`, so the fire is still
 // visibly orange at 60 m and stays that way for the rest of the session. Its
 // SMOKE is not: a smoke parcel is only ever born at the window face by the
@@ -61,8 +61,12 @@ class FarPlumes {
   // remember to refresh it. Static because there is exactly one material table
   // per process and every FarPlumes instance would otherwise hold a copy of
   // the same 128 bytes.
-  static void SetMaterials(const std::vector<MaterialDef>& mats);
-  static bool HotEmissive(uint32_t mat);
+  // What counts is DERIVED FROM THE REACTION TABLE (materials.h
+  // SmokeSourceTable): a material whose own rules decay to or emit fire or
+  // smoke — the same fact that makes it smoke in the near field.
+  static void SetMaterials(const std::vector<MaterialDef>& mats,
+                           const std::vector<ReactionGpu>& reactions);
+  static bool SmokeSource(uint32_t mat);
 
   // ---- the eviction harvest -------------------------------------------------
   // `words` is kChunkVol voxel words in chunk-linear order — the same layout

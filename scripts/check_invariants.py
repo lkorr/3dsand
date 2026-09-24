@@ -2102,7 +2102,66 @@ def check_scoop_ledger():
                         "of the page-fault record (kPageFaultWords)")
 
 
+# ------------------------------------------- the reaction-condition gate
+# assets/shaders/common.wgsl  <->  src/sim/materials.h (MIRROR-BEGIN reactgate)
+#
+# One authored reaction table has two evaluators: the GPU runs it over the grid
+# (sim_step lightMatches/rainChance) and over gas parcels (sim_gas), the CPU
+# over rigid bodies and mob limbs (reactcpu.h ReactLightMatches, and every body
+# burner's RainScaledChance). Until rule-unification W1-B1 the condition
+# arithmetic was retyped in all three; now each side has ONE definition
+# (common.wgsl's reactPhaseOpen / reactWeatherChance / reactGate, materials.h's
+# token-for-token copy), and this compares them. A drift is never a crash: it
+# is a body that burns in the rain while the voxel beside it is doused.
+_REACTGATE_NAMES = {
+    "RCOND_SKY": "kCondSky", "RCOND_DAY": "kCondDay",
+    "RCOND_NIGHT": "kCondNight", "RCOND_RAIN": "kCondRain",
+    "RCOND_RAINDAMP": "kCondRainDamp",
+    "RAIN_AMOUNT_MASK": "kRainAmountMask", "RAIN_DAMP_SHIFT": "kRainDampShift",
+    "RAIN_WET_SHIFT": "kRainWetShift",
+}
+
+
+def check_react_gate():
+    wgsl, hpp = read("assets/shaders/common.wgsl"), read("src/sim/materials.h")
+    if not wgsl or not hpp:
+        return
+    checked.append("reaction gate")
+    a, b = _mirror_blocks(wgsl, "reactgate"), _mirror_blocks(hpp, "reactgate")
+    if len(a) != 1 or len(b) != 1:
+        problems.append(
+            "reaction gate: expected exactly one `MIRROR-BEGIN reactgate` block "
+            f"in common.wgsl (found {len(a)}) and in materials.h (found "
+            f"{len(b)}) -- the GPU/CPU condition mirror is unenforced")
+        return
+    ta = [_REACTGATE_NAMES.get(t, t) for t in _normalise(a[0], True, {})]
+    tb = _normalise(b[0], False, {})
+    if ta != tb:
+        i = 0
+        while i < min(len(ta), len(tb)) and ta[i] == tb[i]:
+            i += 1
+        lo = max(0, i - 6)
+        problems.append(
+            "reaction gate: common.wgsl and materials.h `reactgate` diverge at "
+            f"token {i} (of {len(ta)}/{len(tb)}) -- the CA and the body burners "
+            "no longer evaluate a rule's condition the same way.\n"
+            f"      wgsl: ...{' '.join(ta[lo:i + 8])}\n"
+            f"      cpp : ...{' '.join(tb[lo:i + 8])}")
+    # The constants the two streams read, by value.
+    for w, c in _REACTGATE_NAMES.items():
+        mw = re.search(r"const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u?\s*;", wgsl)
+        mc = re.search(r"\b" + c + r"\s*=\s*(0x[0-9A-Fa-f]+|\d+)u?\b", hpp)
+        if not mw or not mc:
+            problems.append(f"reaction gate: cannot read {w} (common.wgsl) or "
+                            f"{c} (materials.h)")
+            continue
+        if int(mw.group(1), 0) != int(mc.group(1), 0):
+            problems.append(f"reaction gate: {w} = {mw.group(1)} in common.wgsl "
+                            f"but {c} = {mc.group(1)} in materials.h")
+
+
 ALL = {
+    "reactgate": check_react_gate,
     "scoop": check_scoop_ledger,
     "envpred": check_env_predictions,
     "autofly": check_autofly_surface,
@@ -2174,6 +2233,8 @@ RELEVANT = {
     "assets/shaders/raymarch.wgsl": ["gas"],
     "tests/env_predictions.json": ["envpred"],
     "scripts/test_environment.mjs": ["envpred"],
+    "src/sim/materials.h": ["reactgate"],
+    "src/sim/reactcpu.h": ["reactgate"],
 }
 
 if __name__ == "__main__":
@@ -2187,7 +2248,7 @@ if __name__ == "__main__":
                 if norm.endswith(key):
                     run += checks
             if norm.endswith(".wgsl"):
-                run += ["tuning", "world", "params", "windprim",
+                run += ["reactgate", "tuning", "world", "params", "windprim",
                         "curprim", "waterledger", "burntint", "plants",
                         "farface"]
         run = list(dict.fromkeys(run))

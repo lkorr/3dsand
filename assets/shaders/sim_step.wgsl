@@ -876,16 +876,9 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   markDirtyR(dst, DIRTY_R_MOVE);
 }
 
-// The six face directions with their RDIR_* bits: -y, +y, then laterals.
-// faceDir moved to common.wgsl beside flagSupportLoss, its only cross-shader
-// caller. faceDirBit stays: RDIR_* are sim_step's own.
-fn faceDirBit(i : u32) -> u32 {
-  switch (i % 6u) {
-    case 0u: { return RDIR_DOWN; }
-    case 1u: { return RDIR_UP; }
-    default: { return RDIR_SIDE; }
-  }
-}
+// faceDir and faceDirBit (the six face directions with their RDIR_* bits)
+// live in common.wgsl: the seam's particleTick walks a particle's reaction
+// bucket with the same direction mask doReactions honours (W1-B1).
 
 // State nibble for a freshly created voxel: liquids are born full (their
 // nibble is fullness, not a palette variant).
@@ -959,21 +952,15 @@ fn rainExposed(c : vec3<i32>) -> bool {
 }
 
 // A rule's chance under this tick's weather — rain douses (RCOND_RAIN) and
-// damps ignition (RCOND_RAINDAMP). MIRRORED BIT FOR BIT by RainScaledChance
-// in src/sim/materials.h, which the body burners roll against: change one,
-// change both. Integer and divide-last; chance <= REACT_CHANCE_DEN (2e6), so
-// chance * 255 fits a u32. A RAIN rule has already passed lightMatches (rain
-// > 0, exposed); a RAINDAMP rule only pays the exposure probe while wet.
+// damps ignition (RCOND_RAINDAMP). The arithmetic is common.wgsl's
+// reactWeatherChance, the one definition the gas parcels and (by mirror,
+// materials.h) the body burners also use; what is this kernel's own is only
+// the exposure probe, paid only when that arithmetic would read it (a
+// RAINDAMP rule while anything is wet). A RAIN rule has already passed
+// lightMatches (rain > 0, exposed).
 fn rainChance(rule : Reaction, c : vec3<i32>, chance : u32) -> u32 {
-  let cond = rule.cond;
-  if ((cond & (RCOND_RAIN | RCOND_RAINDAMP)) == 0u) { return chance; }
-  let rain = T.weatherRain & 0xFFu;
-  if ((cond & RCOND_RAIN) != 0u) { return (chance * rain / 255u) * rain / 255u; }
-  let wet = max(rain, (T.weatherRain >> 16u) & 0xFFu);
-  if (wet == 0u || !rainExposed(c)) { return chance; }
-  let damp = (T.weatherRain >> 8u) & 0xFFu;
-  let keep = 255u - (wet * damp + 127u) / 255u;
-  return chance * keep / 255u;
+  let exposed = reactWantsExposure(rule.cond, T.weatherRain) && rainExposed(c);
+  return reactWeatherChance(rule.cond, chance, T.weatherRain, exposed);
 }
 
 // Does the cell's light environment satisfy this rule's condition?
@@ -981,21 +968,18 @@ fn rainChance(rule : Reaction, c : vec3<i32>, chance : u32) -> u32 {
 //   bit0 RCOND_SKY   — requires open sky above
 //   bit1 RCOND_DAY   — requires daytime
 //   bit2 RCOND_NIGHT — requires night
+//   bit3 RCOND_RAIN  — a douse: only while it rains, only where it lands
 // `minLight` (bits 8..15) is a daylight-strength floor, so "only near noon"
 // rules are expressible without a second condition bit.
+// The tick-only half is common.wgsl's reactPhaseOpen; the two probes are this
+// kernel's, and run last because they are the only expensive tests.
 fn lightMatches(rule : Reaction, c : vec3<i32>) -> bool {
   let cond = rule.cond & 0xFFu;
   if (cond == 0u) { return true; }  // unconditional: the common case, free
-  // A douse only while it rains, and only where the rain lands.
-  if ((cond & RCOND_RAIN) != 0u &&
-      ((T.weatherRain & 0xFFu) == 0u || !rainExposed(c))) { return false; }
-  let day = daylightStrength(T.dayPhase);
-  if ((cond & RCOND_DAY) != 0u && day == 0u) { return false; }
-  if ((cond & RCOND_NIGHT) != 0u && day != 0u) { return false; }
-  let minLight = (rule.cond >> 8u) & 0xFFu;
-  if (day < minLight) { return false; }
-  // Sky probe last: it is the only expensive test, so the cheap phase checks
-  // above reject most cells before it ever runs.
+  if (!reactPhaseOpen(rule.cond, daylightStrength(T.dayPhase), T.weatherRain)) {
+    return false;
+  }
+  if ((cond & RCOND_RAIN) != 0u && !rainExposed(c)) { return false; }
   if ((cond & RCOND_SKY) != 0u && !seesSky(c)) { return false; }
   return true;
 }
@@ -1016,6 +1000,49 @@ fn fluidOccMat(n : vec3<i32>) -> u32 {
   return atomicLoad(&fluidCellScratch[ci * 2u]) >> 16u;
 }
 
+// ---- EXCITED FLUID RUNS ITS OWN RULES (rule-unification W1-B1) ------------
+// Before this, MPM particles were only ever the NEIGHBOUR side of a reaction
+// (fluidOccMat, in the PAIR scan below): stone next to excited water could
+// react with it, but the water's own rules never ran, because the CA only acts
+// on voxels and an excited cell is air in the grid. So splashing acid (every
+// acid rule has acid as `self`, and seamLiquid admits acid) corroded nothing,
+// and excited water beside `tag:hot` never became steam.
+//
+// THE DESIGN: the air cell is the actor. The same fluidOccMat synthesis that
+// makes an excited cell a neighbour makes it a SELF: an air cell whose intent
+// names a fluid material runs that material's bucket through the unchanged
+// doReactions, with `synthSelf` set so that a self product is written into
+// the air cell and the cell's particle bin is consumed (reactWriteSelf).
+// Chosen over the alternatives because it adds NO new pass, NO new buffer and
+// NO new consumption path:
+//   * per-particle evaluation in the seam would need a voxel write from a
+//     particle thread — two particles beside one stone race, which is exactly
+//     the mark/apply problem the colour lattice already solves here;
+//   * a separate mark/apply pair would duplicate doReactions' rule walk,
+//     which is the drift this program exists to remove.
+//
+// DETERMINISM (rule 1). The actor is the cell `c`, acting in its own colour
+// pass: every write is `c` itself or a face neighbour, reach <= 1, inside the
+// lattice guarantee. The intent it reads was written by last tick's
+// particleTick (atomicMax — order-free) and is stable for this whole dispatch;
+// the consume flag is an atomicOr, idempotent. RNG keys on the SLOT index as
+// every other rule does.
+//
+// SLEEP (rule 2). A synthesized self holds its chunk awake by the ordinary
+// keepAwake rule while a rule matches; every such rule either consumes the
+// finite bin (self product) or transforms a finite neighbour, and the
+// particles themselves settle. What WAKES a chunk the CA had let sleep is
+// particleTick (sim_fluid_seam.wgsl), which marks DIRTY_R_REACT on a
+// particle's chunk only when one of its UNGATED rules has a partner beside it.
+fn excitedReact(c : vec3<i32>, idx : u32, slotIdx : u32) {
+  let fm = fluidOccMat(c);
+  if (fm == 0u) { return; }
+  let m = materials[fm];
+  if (m.reactCount == 0u) { return; }
+  let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
+  _ = doReactions(c, idx, slotIdx, 0u, fm, m, rnd, true);
+}
+
 // A rule fired against synthesized excited fluid and takes the neighbour:
 // flag the cell so the seam's consumeApply kills its particle bin this tick.
 // atomicOr — order-free, idempotent.
@@ -1030,12 +1057,32 @@ fn flagFluidConsume(n : vec3<i32>) {
   atomicOr(&fluidCellScratch[ci * 2u + 1u], 1u);
 }
 
-fn nbrMatches(rule : Reaction, nmat : u32, nm : Material) -> bool {
-  if (rule.nbrClass != 0u && ((1u << nm.klass) & rule.nbrClass) == 0u) { return false; }
-  if (rule.nbrMat != NBR_ANY) { return nmat == rule.nbrMat; }
-  if (rule.nbrTags != 0u) { return (nm.tagMask & rule.nbrTags) != 0u; }
-  return true;  // wildcard "any"
+// A rule rewrote SELF. The one place the three rule kinds commit that, so the
+// synthesized-self case below cannot be forgotten in one of them.
+//
+// SYNTHESIZED SELF (excited fluid running its own rules — see excitedReact).
+// Self is then an AIR cell holding MPM particles: the product is written into
+// that air cell exactly as a PAIR writes into a synthesized neighbour, and the
+// cell's particle bin is flagged for consumeApply, which kills it in the seam
+// front half later this same tick. "Becomes air" writes nothing — the cell is
+// already air; the flag is the whole of it. Consumption granularity is the
+// voxel-eighth bin, the same contract the neighbour side has always had.
+fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
+                  prod : u32, rnd : u32, stamp : u32) {
+  markDirtyR(c, DIRTY_R_REACTW);
+  if (synthSelf) {
+    flagFluidConsume(c);
+    if (prod == 0u) { return; }
+  }
+  if (prod == 0u) { voxStore(idx, 0u); }
+  else { voxStore(idx, packVox(prod, productState(prod, rnd), stamp)); }
+  markVoxActive(idx);
+  flagSupportLoss(c, klass, prod);  // ember->ash drops the wood above
 }
+
+// nbrMatches lives in common.wgsl (W1-B1): the seam's particleTick asks the
+// same question of a particle's neighbours, and two copies of a neighbour
+// predicate are two answers to "does this rule apply here".
 
 // Scales a rule's chance by how many of the 6 face neighbours match its
 // neighbour predicate. Returns the effective chance in units of
@@ -1081,8 +1128,20 @@ fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
     if (inBounds(n)) {
       let nmat = voxMat(voxWordAt(n));
       // MAT_AIR has no Material entry worth matching on tags/class, so an
-      // air neighbour only counts via an exact nbrMat == 0 predicate.
-      if (nmat == MAT_AIR) { hit = rule.nbrMat == MAT_AIR; }
+      // air neighbour only counts via an exact nbrMat == 0 predicate —
+      // UNLESS it holds excited fluid, which counts as the fluid's material
+      // (the same synthesis doReactions' PAIR scan makes). Without it an
+      // excited water cell running its OWN evaporation rule (the synthSelf
+      // path) would count its excited neighbours as air and read every cell
+      // of a splash as a lone droplet; and a voxel pond beside a splash read
+      // the splash as open air too (DESIGN.md §5's old "frontier scaling
+      // sees excited fluid as air" limit). One zero-load in a fluid-free
+      // chunk.
+      if (nmat == MAT_AIR) {
+        let fm = fluidOccMat(n);
+        if (fm != 0u) { hit = nbrMatches(rule, fm, materials[fm]); }
+        else { hit = rule.nbrMat == MAT_AIR; }
+      }
       else { hit = nbrMatches(rule, nmat, materials[nmat]); }
     }
     if (hit != invert) { count++; }
@@ -1120,8 +1179,12 @@ fn scaledChance(rule : Reaction, c : vec3<i32>) -> u32 {
 // dense one with no other symptom — silently, because under the identity map
 // (dense) the two are equal. Found as a deterministic, reproducible lava/stone
 // swap at slot 9450 t43 in --vk-smoke-loud --residency paged.
+//
+// `synthSelf`: self is not a voxel but EXCITED FLUID of material `mat` in the
+// air cell `c` (excitedReact). Every rule runs unchanged; only committing a
+// self product differs, and reactWriteSelf owns that difference.
 fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
-               m : Material, rnd : u32) -> bool {
+               m : Material, rnd : u32, synthSelf : bool) -> bool {
   var keepAwake = false;
   let stamp = stampFor(T.tick, P.substep);
 
@@ -1171,11 +1234,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       if (chance == 0u) { continue; }
       keepAwake = keepAwake || !lightGated;
       if ((rr % REACT_CHANCE_DEN) < chance) {
-        if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
-        else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
-        markVoxActive(idx);
-        markDirtyR(c, DIRTY_R_REACTW);
-        flagSupportLoss(c, m.klass, rule.prodSelf);  // ember->ash drops the wood above
+        reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
         return true;
       }
     } else if (kind == RK_EMIT) {
@@ -1194,10 +1253,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
           markDirtyR(n, DIRTY_R_REACTW);
           markDirtyR(c, DIRTY_R_REACTW);
           if (rule.prodSelf != PROD_KEEP) {
-            if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
-            else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
-            markVoxActive(idx);
-            flagSupportLoss(c, m.klass, rule.prodSelf);
+            reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
             return true;
           }
           return false;  // emitted; self unchanged, may still move
@@ -1256,11 +1312,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             }
           }
           if (rule.prodSelf != PROD_KEEP) {
-            if (rule.prodSelf == 0u) { voxStore(idx, 0u); }
-            else { voxStore(idx, packVox(rule.prodSelf, productState(rule.prodSelf, rnd), stamp)); }
-            markVoxActive(idx);
-            markDirtyR(c, DIRTY_R_REACTW);
-            flagSupportLoss(c, m.klass, rule.prodSelf);
+            reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
             return true;
           }
           markDirtyR(c, DIRTY_R_REACTW);
@@ -1363,7 +1415,7 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
   // Rotate the scan so the stained neighbour is not biased toward -Y. One roll
   // decides WHETHER we stain this tick; the rotation decides WHICH neighbour.
   let rot = rnd >> 7u;
-  let fires = (rnd % 1000u) < matStainChance(m);
+  let fires = stainFires(m, rnd);
 
   // This cell's own word, for the absorption debit below. Passed in from main
   // rather than re-read: doReactions returns true (and main returns) whenever
@@ -1390,113 +1442,47 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
     let nw = niw.y;
     let nmat = voxMat(nw);
     if (nmat == MAT_AIR) { continue; }
-    // Don't stain other liquids or gases: a stain is something that soaks into
-    // a SURFACE. Blood mixing into water is a different (and unimplemented)
-    // thing, and staining a gas would mark smoke that then drifts away with it.
-    let nk = materials[nmat].klass;
-    if (nk != CLASS_SOLID && nk != CLASS_POWDER) { continue; }
 
-    let cur = voxStainAmt(nw);
-    let curType = voxStainType(nw);
-    // How deep this particular ground will take this stain. The liquid's own
-    // amount is still the ceiling, so `absorb` can only ever hold LESS than the
-    // liquid would otherwise apply — a material opts into being soakable, it
-    // cannot opt into being stained harder than the liquid stains.
-    //
-    // NON-ABSORBENT ground (capacity 0: all stone) takes a SURFACE MARK of
-    // exactly 1, not the liquid's full amount: `max(capacity, 1u)` is what
-    // keeps it from being 0 (unstainable). This has been the running behaviour
-    // since absorption landed (0787d38), and sim_fluid_seam's stainApply uses
-    // the same ceiling, so the two stainers agree; a comment below used to
-    // claim stone got the full amount, which the code never did.
-    let capacity = matAbsorbCapacity(materials[nmat]);
-    let ceiling = min(addAmt, max(capacity, 1u));
-
-    // Is there work left on this neighbour? A STRICT ORDER, and it is the
-    // termination argument (2026-09-23): a foreign stain is work ONLY for a
-    // washer, which steps it down; a non-washer stains only CLEAN ground or
-    // its OWN type below the ceiling, and never paints over somebody else's.
-    //
-    // It used to overwrite, and that was two stains on one cell that never
-    // settled: blood painted over wet ground, water rinsed the blood one level
-    // and re-wet it, blood painted it again — and blood vs ichor simply
-    // repainted each other forever. Every one of those events also rolled
-    // `consume`, so the surface eroded and the chunk never slept. Now every
-    // step is monotone: a washer only lowers a foreign amount, a stainer only
-    // raises its own, and nobody raises a foreign one, so each cell reaches a
-    // fixed point. The price is accepted: blood no longer recolours ground
-    // that is already wet (or rotted, or bloodied by ichor's opposite).
-    let foreign = cur != 0u && curType != stainType;
-    let canWash = washes && foreign;
-    let canStain = !foreign && cur < ceiling;
-    if (!canWash && !canStain) { continue; }
+    // THE DECISION IS common.wgsl's stainStep — the same function the MPM
+    // seam's stainApply calls, so the two stainers cannot drift again. What
+    // it decides (see its header): which surfaces take a stain (solids and
+    // powders, never liquids or gases), the strict order that terminates
+    // (a foreign stain is only ever WASHED down, by a washer; our own climbs
+    // to min(amount, max(capacity, 1))), the depth step (one level per
+    // contact on absorbent ground, the whole ceiling at once on stone), and
+    // whether the contact must be PAID for. What stays here is this kernel's
+    // own half: the roll, the write, the spend in fullness eighths, and the
+    // consumption of the marked voxel.
+    let d = stainStep(stainType, addAmt, washes, nw, materials[nmat]);
+    if ((d.y & STAIN_WORK) == 0u) { continue; }
     progress = true;
     if (!fires) { break; }  // work remains, but not this tick
 
-    // ---- washing: step the foreign stain DOWN rather than repainting it ----
-    if (canWash) {
-      // Rinse ONE level per contact, not `addAmt` levels. Water authors a large
-      // amount (it wets ground to whatever depth the ground allows), and reusing
-      // that here would erase any stain in a single touch — blood would blink
-      // out the instant water reached it instead of visibly fading under the
-      // flow. One level per successful contact makes washing a process you can
-      // watch, and it still terminates: the amount only ever decreases.
-      //
-      // When it hits 0 the TYPE goes with it, so the cell reads as genuinely
-      // unstained rather than as "blood, amount 0" (voxStained() checks both
-      // halves, and a stale type would let the next blood contact resume from
-      // the old slot).
-      let washed = cur - 1u;
-      var washedType = curType;
-      if (washed == 0u) { washedType = 0u; }
-      voxStore(ni, (nw & ~STAIN_BITS) | packStain(washedType, washed));
-      markVoxActive(ni);
-      markDirtyR(n, DIRTY_R_STAINW);
-      markDirtyR(c, DIRTY_R_STAINW);
-      break;
-    }
-
-    // ---- ordinary staining, now clamped by the substrate's capacity ----
-    // On ABSORBENT ground the stain climbs ONE level per contact, in lockstep
-    // with the eighth of liquid spent below, so the ground visibly darkens as
-    // it drinks and the depth reached is paid for in real mass. Jumping
-    // straight to the ceiling would soak grass to full for one eighth of water,
-    // which is both free mass and an instant, un-watchable transition.
-    //
-    // On NON-absorbent ground (capacity 0, all stone) nothing is spent, so
-    // there is no rate to keep in step with: the stainer applies the whole
-    // ceiling at once — which on stone is the 1-level surface mark above.
-    var amt = ceiling;
-    if (capacity > 0u) {
-      amt = min(cur + 1u, ceiling);
-      // Only a stale type at amount 0 reaches here now (foreign stains are
-      // refused above): start clean at 1.
-      if (curType != stainType) { amt = 1u; }
-    } else if (curType == stainType) {
-      amt = min(cur + addAmt, ceiling);
-    }
-    voxStore(ni, (nw & ~STAIN_BITS) | packStain(stainType, amt));
+    voxStore(ni, d.x);
     markVoxActive(ni);
     markDirtyR(n, DIRTY_R_STAINW);
+    markDirtyR(c, DIRTY_R_STAINW);
+    // ---- washing: a rinse spends nothing and eats nothing ----
+    // One level per contact (stainStep), not `addAmt` levels: water authors a
+    // large amount, and reusing it here would erase blood in a single touch
+    // instead of visibly fading it under the flow.
+    if ((d.y & STAIN_WASH) != 0u) { break; }
 
     // ---- absorption: the liquid SPENDS itself soaking in ----
-    // Only when the ground actually declared a capacity, and only for a liquid
-    // that has mass to give. One eighth per contact, and the cell dies when it
-    // gives its last — mass-conserving in the same units stepLiquid speaks.
+    // Only when the ground actually declared a capacity and the contact
+    // deepened the stain (STAIN_SPEND), and only for a liquid that has mass to
+    // give. One eighth per contact, and the cell dies when it gives its last —
+    // mass-conserving in the same units stepLiquid speaks. On absorbent ground
+    // the stain climbs one level per contact in lockstep with this eighth, so
+    // the ground visibly darkens as it drinks and the depth reached is paid
+    // for in real mass.
     //
     // This writes SELF, which the stain rule otherwise never does. It is safe
     // for the same reason the neighbour write is: reach is still <= 1 cell, so
     // the colour lattice still guarantees no other thread touches either cell
     // this pass. The stamp is set so the movement code below cannot ALSO move
     // this cell in the same substep and double-spend the eighth.
-    //
-    // `amt > cur` is the load-bearing test, not a redundant one: it charges the
-    // liquid ONLY for a contact that actually deepened the stain. Saturated
-    // ground never gets here (canStain is false, so the loop skipped it), but
-    // stating the invariant locally is what stops a future edit to the ceiling
-    // logic from silently turning this into a puddle that drains into ground
-    // it is no longer wetting — water disappearing for free.
-    if (capacity > 0u && selfIsLiquid && amt > cur) {
+    if ((d.y & STAIN_SPEND) != 0u && selfIsLiquid) {
       let sf = voxState(selfWord) + 1u;  // fullness 1..8
       if (sf <= 1u) {
         voxStore(idx, 0u);               // last eighth soaked in — gone
@@ -1510,14 +1496,12 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
     // DIFFERENT slice of the hash than the stain roll, so the two are
     // independent — reusing the same bits would correlate "stained" with
     // "consumed" and every stain would either always or never eat.
-    let croll = hash3(rnd, 0x51A17u, niSlot) % 1000u;
-    if (croll < matStainConsume(m)) {
+    if (stainConsumes(m, hash3(rnd, 0x51A17u, niSlot))) {
       voxStore(ni, 0u);
       markVoxActive(ni);
       // The voxel that vanished may have been holding a solid up.
-      flagSupportLoss(n, nk, MAT_AIR);
+      flagSupportLoss(n, materials[nmat].klass, MAT_AIR);
     }
-    markDirtyR(c, DIRTY_R_STAINW);
     break;  // one neighbour per tick — bounds the rule's rate (rule 2)
   }
   return progress;
@@ -2496,7 +2480,16 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   let idx = here.x;
   let w = here.y;
   let mat = voxMat(w);
-  if (mat == MAT_AIR) { return; }
+  if (mat == MAT_AIR) {
+    // An air cell may hold EXCITED FLUID, which runs its own rules here
+    // (excitedReact). Reactions roll on substep 0 only, as for voxels, and
+    // the block-map load is workgroup-uniform (every thread is in chunk ci),
+    // so a fluid-free chunk pays one broadcast load per air cell.
+    if (P.substep == 0u && fluidBlockMapS[ci] != 0u) {
+      excitedReact(c, idx, slotIdx);
+    }
+    return;
+  }
   gSelfCell = c;
   gSelfIdx = idx;
   if (voxStamp(w) == stampFor(T.tick, P.substep)) { return; }  // already acted this substep
@@ -2559,7 +2552,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 
   // Reactions roll once per tick (substep 0 of the two gravity substeps).
   if (P.substep == 0u && m.reactCount > 0u) {
-    if (doReactions(c, idx, slotIdx, w, mat, m, rnd)) { return; }
+    if (doReactions(c, idx, slotIdx, w, mat, m, rnd, false)) { return; }
   }
 
   // Staining, same once-per-tick budget as reactions. Gated on the material

@@ -1601,7 +1601,7 @@ through it, or a broken fixture passes too.
 
 ### Far fire plumes: the smoke of fires the window has left behind (2026-09-15; `sim_gas.wgsl` `gasFarPlume`, `src/sim/farplumes.h`)
 
-**The gap.** A chunk evicted mid-burn is FROZEN. Its `ember` / `lava` /
+**The gap.** A chunk evicted mid-burn is FROZEN. Its `ember` /
 burning-foliage voxels were downsampled into the far cascade by the last
 `fardown`, so the fire stays visibly orange at cascade distance for the rest of
 the session — that is the cascade working. Its SMOKE is not, and that is the
@@ -1620,11 +1620,18 @@ synthesizes their plumes. Both halves are deliberately small:
   FOOTPRINT: a cell is 8 voxels and a chunk is 16, so a burning chunk
   contributes at most FOUR emitters however much of it is alight, each carrying
   the column's hot-voxel count and its topmost hot voxel. What counts as fire is
-  data (`hot` tag + emission > 0 + not a gas), latched from the material table
-  by `Simulation::UploadTables`; no material id appears anywhere in the feature.
-  `fire` itself is CLASS_GAS and `farCellIsSolid` never writes a gas into the
-  cascade, so what is actually visible out there is the ember under the flame,
-  which is exactly the set the rule selects.
+  READ OFF THE REACTION TABLE (`SmokeSourceTable`, `materials.h`; since
+  rule-unification W1-B1, 2026-09-24): a material whose own bucket DECAYS to
+  or EMITS `fire` or `smoke` — exactly the materials that put smoke into the
+  sky in the near field, through the CA. Near and far therefore agree by
+  construction. It was `hot` tag + emission > 0 + not a gas until then, a
+  second definition of the same fact that disagreed with the first: lava and
+  molten glass are hot and glow but have no smoke rule, so a lava lake plumed
+  at distance and never up close. Latched from the compiled table by
+  `Simulation::UploadTables`; no material id appears anywhere in the feature.
+  `fire` itself is now in the set (its own decay-to-smoke rule): the index is
+  harvested from the evicted chunk's WORDS, not from the cascade, and a chunk
+  evicted mid-blaze does hold smoking flames.
 * `Build()` drops every emitter that is back INSIDE the residency window and
   every one outside the density box, then keeps the 256 nearest the window
   centre. The in-window drop is what stops a plume being drawn twice: a resident
@@ -1674,8 +1681,9 @@ race is `FAR_PLUME_CEIL + (kGasFarEmitMax * PUFFS - 1) * ADD_MAX`, and a
 **Knobs:** `render.farPlumeStrength` (0 = exact off: no emitters, no row, no
 write) and `render.farPlumeHeight` (metres, clamped to the box).
 
-**Gate:** `gas-farplume`. One chunk of the first hot+emissive+non-gas material in
-the table, harvested off the GPU and handed to the index at a coordinate half a
+**Gate:** `gas-farplume`. It first asserts the index agrees with the reaction
+table for EVERY material id (near and far agree), then paints one chunk of the
+first non-gas smoke source in the table, harvested off the GPU and handed to the index at a coordinate half a
 window away — the same words eviction would have handed it, without forcing a
 window shift that would move the origin out from under every gate after it
 (`far-persist` feeds `FarEdits` the same way and for the same reason). Four
@@ -2337,11 +2345,42 @@ buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
   standing + live + consumed == placed). Transitions that PRODUCE matter
   write ordinary voxels into the (air) cell; every phase change crosses the
   seam through the voxel form (plan §6.6).
+- EXCITED FLUID RUNS ITS OWN RULES (rule-unification W1-B1, 2026-09-24).
+  The same synthesis makes an excited cell a SELF: an air cell whose intent
+  names a fluid material runs that material's bucket through the unchanged
+  `doReactions` (`sim_step` `excitedReact`, substep 0, gated on the chunk's
+  block-map word so a fluid-free chunk pays one broadcast load). A self
+  product is written into the air cell and the cell's bin is flagged for
+  `consumeApply` (`reactWriteSelf`) — the neighbour side's contract, from
+  the other side. So splashing acid corrodes stone and eats organics, and
+  excited water beside `tag:hot` becomes steam. Chosen over per-particle
+  evaluation (two particles beside one stone would race on its voxel — the
+  mark/apply problem the colour lattice already solves) and over a separate
+  mark/apply pass (a second rule walk is the drift this program removes).
+  The WAKE is `particleTick`'s `seamReactWake`: a particle marks its chunk
+  `DIRTY_R_REACT` only when one of its UNGATED rules has a partner beside
+  it (an ungated decay/emit, or a PAIR whose predicate a face-neighbour
+  voxel meets in its authored direction) — the doReactions keepAwake
+  condition from the particle side, so a splash over plain rock wakes
+  nothing. Frontier neighbour-count scaling (`scaledChance`) now counts an
+  excited neighbour as its fluid, not as air, on both sides. Gate:
+  `fluid-self-react`.
 - CONTACT STAINING: `particleTick` scatters each particle's stain (carried
   attr stain beats the material's authored one) onto solid/powder face
-  neighbours as intents; `stainApply` rolls `sim.fluidStainRate` per cell
-  and merges with the CA's rules. Settled water then WASHES foreign stains
-  exactly as CA water does — the fluid-stain gate observes both halves.
+  neighbours as intents; `stainApply` applies them through
+  `common.wgsl`'s `stainStep`, the ONE stain decision `doStaining` also
+  calls (W1-B1: the two copies had drifted twice and disagreed on the
+  chance, consumption, absorption and a clean absorbent cell's first
+  level). The roll is the stainer material's authored per-mille chance
+  (`sim.fluidStainRate` is no longer read), `consume` applies, and wetting
+  ABSORBENT ground is paid for: each particle bids (`(index+1) << 1`,
+  atomicMax into the ground cell's flags word — highest index wins, a pure
+  function of compaction order) on the one neighbour a contact would
+  deepen and charge, and `stainApply` takes one eighth off the winning
+  donor per level — the CA's fullness spend, in particle currency, counted
+  into FA_CONSUMED. No donor, no soak. Settled water then WASHES foreign
+  stains exactly as CA water does — the fluid-stain gate observes both
+  halves.
 - SWIMMING: `mirrorFold` packs excited-fluid eighths for the 27 CPU-mirror
   chunks (one byte per cell, `TickParams.mirrorBase` = the readback's own
   clamp) into the snapshot; `World::FluidEighthsAt` folds it into the
@@ -2361,7 +2400,8 @@ buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):
 KNOWN LIMITS (Phase 2): excite converts non-viscous liquids only
 (moveEvery <= 1 — lava/blood stay CA until per-material fluid dynamics,
 plan Phase 7); splash droplets from STAINED water carry the material, not
-the carried stain; frontier neighbour-count scaling sees excited fluid as
+the carried stain; (fixed by W1-B1, 2026-09-24:) frontier neighbour-count
+scaling saw excited fluid as
 air; a sealed, undamped pool at stock stiffness can churn indefinitely
 (sim.fluidDamping defaults to 0 — the settle gates document the tuning that
 calms adversarial geometry, and Phase 7 owns the defaults).
@@ -2911,8 +2951,10 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     exactly the N×M explosion tags exist to avoid. Capacity 0 (every material
     predating this, all stone) means the liquid never soaks in and pools at once;
     such ground still takes a 1-level surface mark (the ceiling is
-    `min(amount, max(capacity, 1))`, in both `doStaining` and the MPM seam's
-    `stainApply`).
+    `min(amount, max(capacity, 1))`). Every rule in this bullet list is ONE
+    function, `common.wgsl`'s `stainStep`, which both `doStaining` and the MPM
+    seam's `stainApply` call (rule-unification W1-B1); the kernels keep only
+    the roll, the write and the spend in their own currency.
   - **Absorbing SPENDS the liquid**: one eighth of the source cell's fullness
     per successful contact, in the same units `stepLiquid` speaks, and the cell
     dies when it gives its last. Without that debit the puddle would stain the
@@ -11720,6 +11762,17 @@ Every burning material carries a rain douse beside its extinguisher douse, and
 every combustion ignition is rain-damped (`reactions.json`'s RAIN note); snow
 does neither yet. `weather.rainTouchesWorld` off = the word is 0. Gated by
 `--gate rain-fire` (one leaf sheet, three pinned skies).
+
+ONE DEFINITION (rule-unification W1-B1, 2026-09-24): the condition arithmetic
+— the day/night/minLight phase gate, the douse's rain requirement, and the
+rain rescale — is `common.wgsl`'s `reactPhaseOpen` / `reactWeatherChance` /
+`reactGate`, called by `sim_step` (`lightMatches`, `rainChance`) and by
+`sim_gas` (`gasDecayProduct`, exposure true by construction). What each caller
+keeps is only its EXPOSURE answers. The CPU side (`materials.h`, which
+`reactcpu.h` and every body burner's `RainScaledChance` go through) is a
+token-for-token copy in a `MIRROR-BEGIN reactgate` block, and
+`check_invariants.py reactgate` compares the two streams and the `RCOND_*` /
+`RAIN_*` constants they read.
 
 **The word is sampled ONCE per tick.** The pin is a human input, so the
 authority latches the word at the head of the tick (`weather::LatchTickRain`,
