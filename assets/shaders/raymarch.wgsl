@@ -7084,13 +7084,8 @@ struct LiquidOptics {
   fresnel   : f32,
 };
 
-// The liquid's own colour: its authored palette average. What the volume
-// tends toward with depth, and the albedo an MPM particle of it is drawn in
-// (debris.wgsl vsFluid restates this one line; common.wgsl is its shared home
-// once that file is free to edit).
-fn liquidAlbedo(m : Material) -> vec3f {
-  return (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
-}
+// The liquid's own colour is common.wgsl's liquidAlbedo (shared with
+// debris.wgsl's MPM particle cubes).
 
 fn liquidOptics(m : Material) -> LiquidOptics {
   var p : LiquidOptics;

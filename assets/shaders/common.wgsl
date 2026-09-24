@@ -735,12 +735,10 @@ struct TickParams {
   // old CPU append base is gone with it.
   fluidExciteEnable : u32,
   fluidSpawnCount   : u32,
-  // Material id each MPM species splashes micro droplets as (0 = species was
-  // never poured, so it emits none). CPU-owned, recorded from the pour's brush
-  // material — blood MPM sprays blood droplets that stain, water sprays water.
-  // Part of the tick input stream like every field above, so replays and the
-  // determinism gates capture it for free.
-  fluidSplashMat  : vec4<u32>,
+  // PADDING (was the per-species splash material table, retired by W1-B2: a
+  // particle splashes as its own material). Kept so mirrorBase stays at the
+  // same offset; world.h TickParams::_padSplash is its twin. Nothing reads it.
+  _padSplash      : vec4<u32>,
   // WORLD chunk coord of the 3x3x3 CPU-mirror corner (the same clamp the
   // readback uses). The seam's mirrorFold packs excited-fluid occupancy for
   // these 27 chunks — the swimming query's view of the particles.
@@ -1827,6 +1825,14 @@ fn axisUnit(a : u32) -> vec3f {
 
 fn unpackColor(c : u32) -> vec3f {
   return vec3f(f32(c & 0xFFu), f32((c >> 8u) & 0xFFu), f32((c >> 16u) & 0xFFu)) / 255.0;
+}
+
+// A liquid's own colour: its authored palette average. What a liquid volume
+// tends toward with depth (raymarch.wgsl liquidOptics), the albedo the MPM
+// surface blends per node composition, and the colour an MPM particle cube is
+// drawn in (debris.wgsl vsFluid). The ONE definition; render-only.
+fn liquidAlbedo(m : Material) -> vec3f {
+  return (unpackColor(m.color0) + unpackColor(m.color1)) * 0.5;
 }
 
 // The COSMETIC 3-variant decode, keyed on an arbitrary number rather than on a
@@ -3511,9 +3517,11 @@ const FLUID_VMAX      : i32 = i32(round(0.45 * f32(FLUID_SUBSTEPS) * 65536.0));
 const FLUID_MARK_PAD  : i32 = min(i32(ceil(0.45 * f32(FLUID_SUBSTEPS))), 7);
 const FLUID_ONE       : i32 = 65536;    // 1.0 in Q16.16
 // Words per fluid grid node: [0] mass Q10, [1..3] momentum->velocity Q16.16,
-// [4..6] species 1..3 mass Q10, [7] foam field (persistent). Shared by the
-// solver (sim_fluid.wgsl) and the surface renderer (raymarch.wgsl reads mass,
-// velocity and species words of the LAST substep's grid); world.cpp sizes
+// [4..6] material composition (hi id, 4096 - lo id, volume-weighted id sum;
+// sim_fluid.wgsl's GRID LAYOUT block owns the encoding), [7] foam field
+// (persistent). Shared by the solver (sim_fluid.wgsl) and the surface renderer
+// (raymarch.wgsl reads mass, velocity and composition words of the LAST
+// substep's grid); world.cpp sizes
 // fluidGrid by this.
 const FLUID_GW        : u32 = 8u;
 
@@ -3562,9 +3570,9 @@ struct FluidParticle {
                                   // excite converter seeds it from hydrostatic
                                   // depth so a reawakened column starts
                                   // pre-compressed instead of jello-popping.
-  species : u32,                  // 0..3, grid species-mass slot (render color
-                                  // + attraction). Derived from attr's mat at
-                                  // excite time; the pour picks it directly.
+  _padSpecies : u32,              // PADDING (was `species`, retired by
+                                  // W1-B2: a particle's one identity is its
+                                  // material in `attr`). Nothing reads it.
   density : i32,                  // Q16.16 masses/cell sampled by p2g2 last
                                   // substep (render shading + attraction)
   // ---- seam identity (word 18): what this particle IS in voxel terms ------
@@ -3615,7 +3623,7 @@ const FP_EXCITED : u32 = 1u << 22u;
 fn fpExcited(attr : u32) -> bool { return (attr & FP_EXCITED) != 0u; }
 // GHOST (bit 23): a picture of water, not water -- the flask's scoop stream
 // (ContainerScoopStream, 2026-09-23). spawnAppend sets it from the op's
-// species bit 8, with the homing target in _r0.._r2 and the death tick in _r3.
+// flags bit 8, with the homing target in _r0.._r2 and the death tick in _r3.
 // It is splatted into the grid like any particle, so the fluid surface draws
 // it, and g2p steers it onto its target. It is NEVER matter: spawnAppend does
 // not book it, particleTick gives the CA no occupancy or stain intent for it
@@ -3733,11 +3741,12 @@ const FA_ARGS_COMPACT : u32 = 19u;
 const FA_ARGS_CONSUME : u32 = 22u;
 
 // Must match FluidSpawnOp in world.h (32 bytes). mat carries the pour's brush
-// material into the particle's attr word (stainless, fullness 1).
+// material into the particle's attr word (stainless, fullness 1). flags: bit 8
+// GHOST (kFluidOpGhost), bits 16..23 ghost life in ticks; bits 0..7 unused.
 struct FluidSpawnOp {
   px : i32, py : i32, pz : i32,   // Q16.16 world cells
   vx : i32, vy : i32, vz : i32,   // Q16.16 cells/tick
-  species : u32, mat : u32,
+  flags : u32, mat : u32,
 };
 
 // ---- excite scratch bits (voxel word bits 19..23, per the allocation table

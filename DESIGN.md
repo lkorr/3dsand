@@ -2367,10 +2367,12 @@ picking the render colour (`render.fluidColor0..3`), the attraction slot and
 were both species 0, so splashed acid drew water-blue and the solver treated
 the two as one liquid. Now colour is `materials[mat]`'s palette average,
 "same liquid" is "same material id", and weight is `materials[mat].density`
-(see the grid composition words below). The WGSL field `FluidParticle.species`
-and `TickParams.fluidSplashMat` survive only as unused layout in
-`common.wgsl` until that file is next edited; `FluidSpawnOp`'s same word is
-the spawn FLAGS (`flags` in C++: bit 8 ghost, bits 16..23 ghost life).
+(see the grid composition words below; the colour is `common.wgsl`'s
+`liquidAlbedo`, shared by the raymarched surface and `debris.wgsl`'s particle
+cubes). The old `FluidParticle.species` and `TickParams.fluidSplashMat` words
+are named padding (`_padSpecies`, `_padSplash`, twin in `world.h`), so every
+offset is unchanged; `FluidSpawnOp`'s same word is `flags` on both sides
+(bit 8 ghost, bits 16..23 ghost life).
 
 ENVIRONMENT PARITY (Phase 2's §6 slice) runs through ONE per-cell bridge
 buffer, `fluidCellScratch` (intent word from the seam, flags from the CA):

@@ -417,7 +417,7 @@ fn fsBody(in : BodyVSOut) -> @location(0) vec4f {
 //     pressure visibly travels through a pool;
 //   * TUNE_FLUID_FOAM whitens with speed — spray and churn wash toward white;
 //   * the albedo is the particle's MATERIAL colour (attr word; W1-B2), the
-//     same palette average raymarch.wgsl's liquidAlbedo draws the surface in.
+//     same palette average (common.wgsl liquidAlbedo) the surface is drawn in.
 @group(1) @binding(5) var<storage, read> fluid : array<FluidParticle>;
 
 @vertex
@@ -448,10 +448,8 @@ fn vsFluid(@builtin(vertex_index) vi : u32,
   }
   let world = center + off;
   // The particle's one identity is its material: draw it in that material's
-  // palette average. Kept in step with raymarch.wgsl's liquidAlbedo by hand
-  // (one line; the shared home would be common.wgsl).
-  let pm = materials[fpMat(p.attr)];
-  var albedo = (unpackColor(pm.color0) + unpackColor(pm.color1)) * 0.5;
+  // palette average, the same liquidAlbedo the raymarched surface uses.
+  var albedo = liquidAlbedo(materials[fpMat(p.attr)]);
   // p.density is Q16.16 masses/cell; TUNE_FLUID_REST_DENSITY is the tuner's
   // human-unit particles/voxel (see sim_fluid.wgsl's conversion block).
   let rest = max(TUNE_FLUID_REST_DENSITY, 1.0) * 65536.0;

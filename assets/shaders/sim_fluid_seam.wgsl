@@ -436,9 +436,8 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   // below). A discharge ledger's `drained` is supposed to equal this.
   // A GHOST (the flask's scoop stream, FP_GHOST) is not matter and is kept
   // out of the books entirely: in and out, it never happened.
-  // op.species is the spawn FLAGS word (world.h FluidSpawnOp::flags; the WGSL
-  // name is common.wgsl's, kept this wave): bit 8 ghost, bits 16..23 life.
-  let ghost = (op.species & 0x100u) != 0u;
+  // op.flags: bit 8 ghost, bits 16..23 life (world.h FluidSpawnOp::flags).
+  let ghost = (op.flags & 0x100u) != 0u;
   if (op.mat != 0u && !ghost) { atomicAdd(&fluidArgs[FA_SPAWNLIVE], 1u); }
   var p : FluidParticle;
   p.px = op.px; p.py = op.py; p.pz = op.pz;
@@ -462,7 +461,7 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
     // The op's velocity CARRIES THE TARGET (ContainerScoopStream): the point
     // it would reach in `life` ticks, read before the CFL clamp above could
     // shorten it. Life is flags bits 16..23.
-    let life = max((op.species >> 16u) & 0xFFu, 1u);
+    let life = max((op.flags >> 16u) & 0xFFu, 1u);
     p.attr |= FP_GHOST;
     p._r0 = op.px + op.vx * i32(life);
     p._r1 = op.py + op.vy * i32(life);

@@ -58,7 +58,7 @@
 //       is made of — the EOS, the isosurface and every threshold read this)
 //   [1..3] MASS-weighted momentum -> velocity (Q16.16). A particle's mass is
 //       materials[mat].density / FLUID_REF_DENSITY (water = exactly 1.0)
-//   [4..6] COMPOSITION (W1-B2; common.wgsl's comment still says "species"):
+//   [4..6] COMPOSITION (W1-B2):
 //       [4] highest material id at the node (atomicMax)
 //       [5] 4096 - lowest material id (atomicMax; 0 = no material yet)
 //       [6] sum of volume * material id (Q10 * id, WRAPPING i32 — see nodeHiVol)
