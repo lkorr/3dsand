@@ -139,6 +139,16 @@ the world layer (`ReleaseToWorldWhenClear`, already done at death). It is not
 lootable. Until the move lands, `Revive` falls back to `ReleaseRigToDebris()`,
 which is exactly today's behaviour.
 
+**Landed (P2b):** the move is `MobSystem::AdoptDeadAvatar`, run at the top of
+the PreTick after the death (not at `Revive`: the corpse then burns, bleeds and
+sleeps during the death screen too; `Revive` only covers an unregistered
+avatar). The corpse is `PlayerCorpse()`, id from its own band (bit 61 |
+player << 40 | seq) so `nextId_` and every later NPC is untouched, and a booked
+rising follows it to that id and rises on the NPC clock (the kit through
+`avatarKitFn_`); `SettleDeadAvatar` and the debris fallback are gone. The avatar
+keeps a husk (same part list, no bodies). The death portrait matches its frozen
+pose over every body slot (`BodyRegistry::BuildHandles`). Gate `player-corpse`.
+
 ### Persistence
 
 MOBS v6 adds `alive` (and `riseAtTick_`). A dead Mob's record restores its lying

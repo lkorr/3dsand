@@ -2011,17 +2011,14 @@ class Mob {
   // runs the MATTER passes on it (burn, rot, stain, carve, bleed-out) and none
   // of the AGENCY passes (AI, gait, pose, voices, hp -> death).
   //
-  // One body still goes straight to DebrisSystem, through ReleaseRigToDebris,
-  // which is the old adoption loop verbatim: the PLAYER AVATAR (not in mobs_;
-  // its corpse is anonymous debris exactly as before, unless the bite is going
-  // to stand it back up — then the rig is kept until the rising reads it,
-  // MobSystem::ServiceRisings).
-  //
   // A GHOST DOES NOT DIE HERE (P2c). Its life is its owner's to end: a blow
   // struck on this machine lands on the local copy (M9's rule for a remote
-  // creature — nothing is forwarded), and if it takes the copy's hp to zero
+  // creature -- nothing is forwarded), and if it takes the copy's hp to zero
   // the copy waits for the owner's pose to say alive = 0, which is what
-  // EnterGhostDeath is for.
+  // EnterGhostDeath is for. The PLAYER AVATAR keeps its rig like anybody
+  // else; it is not in mobs_, so MobSystem moves the dead rig there as a dead
+  // Mob of its own (MobSystem::AdoptDeadAvatar) at the top of the next
+  // PreTick, or at Revive.
   void Die();
   // THE OWNER SAYS IT IS DEAD (MobPose.alive = 0, MobSystem::ApplyPose). The
   // agency state Die() clears, cleared; `alive_` false; the death cry. And
@@ -2070,6 +2067,12 @@ class Mob {
   // Death order, 1-based and system-wide (0 = alive / never died). The dead
   // cap evicts the LOWEST first.
   uint64_t DeathSeq() const { return deathSeq_; }
+  // THE PLAYER'S OWN CORPSE (MobSystem::AdoptDeadAvatar): a dead Mob in
+  // mobs_ whose rig was a player's avatar. It burns, bleeds, stains, is carved
+  // and sleeps like any corpse; it is NOT lootable (the kit lives in PlayerKit
+  // and re-dresses the respawned rig, so looting it would duplicate), and a
+  // rising from it hands the player's kit over through avatarKitFn_.
+  bool PlayerCorpse() const { return playerCorpse_; }
   // LAST LOOK AT A LIVING RIG. Called from Die() after the cause is recorded,
   // before the rig goes limp and (for the bodies that still go to debris)
   // before a single limb is handed over.
@@ -2744,6 +2747,10 @@ class Mob {
   // lands in is the slot the instance records. Each returns the next slot.
   uint32_t AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase);
   void AppendXforms(std::vector<BodyXformGpu>& out) const;
+  // The physics handle behind each slot AppendXforms emits, in the same walk
+  // (BodyRegistry::BuildHandles): what the death-screen portrait matches its
+  // frozen pose against, whichever system the body lies in by then.
+  void AppendBodyHandles(std::vector<uint64_t>& out) const;
   uint32_t AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
                             uint32_t slotBase) const;
 
@@ -3622,6 +3629,7 @@ class Mob {
   int16_t stainWriterLimb_ = -1;
   uint64_t deadWakeKey_ = 0;   // DeadWakeKey() when it fell asleep
   uint64_t deathSeq_ = 0;      // see DeathSeq()
+  bool playerCorpse_ = false;  // see PlayerCorpse()
   bool swinging_ = false;
   GoreProfile gore_;           // this creature's own bleed character
   // ---- blood loss and the burn cap (see the public block above) -----------
@@ -4221,12 +4229,14 @@ class MobSystem {
   // may spawn a mob from inside Mob::Die, which is running on a Mob that lives
   // in the vector the spawn would push to.
   //
-  // THE AVATAR BOOKS ONE TOO. Its Die() keeps the rig when a rising is booked
-  // (it is not in mobs_, so the booking names it by id and the service finds
-  // it through AvatarById); "you die of the bite and your own corpse gets up
-  // as a zombie of you" still needs no player-specific rule — you respawn,
-  // and the thing wearing your face is an NPC. A respawn before the clock
-  // comes round services the rising at once (SettleDeadAvatar).
+  // THE AVATAR BOOKS ONE TOO. Its dead rig becomes a dead Mob in mobs_
+  // (AdoptDeadAvatar), and the booking follows it to the corpse's new id, so
+  // "you die of the bite and your own corpse gets up as a zombie of you"
+  // needs no player-specific rule — the corpse rises on the same clock as an
+  // NPC's, whether or not you have respawned, and the thing wearing your face
+  // is an NPC. The one player-specific line is the kit (avatarKitFn_), asked
+  // of a PlayerCorpse(). The AvatarById fallback in the service only covers a
+  // rising whose clock comes round before the adoption has run.
   //
   // NOT SAVED yet: dead Mobs are not saved either (MOBS v6 is P2a), so a save
   // taken between the death and the rising loads back with nothing pending.
@@ -4573,12 +4583,22 @@ class MobSystem {
   // (bodies destroyed, not handed to debris). A test/harness seam: the game
   // kills things, it does not delete them. False for an unknown id.
   bool RemoveMob(uint64_t id);
-  // ---- THE AVATAR'S CORPSE AT RESPAWN (P1 fallback; P2b moves it into mobs_)
-  // A dead avatar that kept its rig (a rising is booked) is settled here
-  // before the respawn rebuilds it: the rising is serviced NOW if one is
-  // booked, otherwise the rig is released to debris exactly as a death used
-  // to. No-op for a living avatar or one whose rig already went.
-  void SettleDeadAvatar(Mob& avatar);
+  // ---- THE PLAYER'S CORPSE BECOMES A DEAD MOB (PLAN_corpse_is_a_mob.md P2b)
+  // A dead avatar still holding its rig has that rig MOVED into mobs_ as a
+  // dead Mob (a slice-move of the Mob base: bodies, joints, shells, bricks,
+  // burn indices, coats and wounds change owner without being rebuilt), under
+  // a FRESH id from its own band (kPlayerCorpseIdBase, so nextId_ and every
+  // NPC spawned after is untouched) and a second death never aliases the
+  // first corpse; a rising
+  // booked for the avatar follows it to the new id. The avatar is left a husk
+  // with the same part list and no bodies, which is what the death screen and
+  // the respawn read. The corpse counts against the dead cap at once.
+  //
+  // Called from the top of PreTick for every registered avatar (never from
+  // inside Die, which runs on the object being moved), and from Revive for an
+  // avatar that was never registered. Returns the corpse's id, 0 when there
+  // was nothing to move (alive, already a husk, a ghost, no bodies).
+  uint64_t AdoptDeadAvatar(Mob& avatar);
   // ---- DEAD LIMBS AS THINGS YOU CAN HOLD AND SHOVE ------------------------
   // The body a hand would take hold of if it grabbed `body`: `body` itself
   // for a dead Mob's attached limb, its HOST limb for a worn shell (a
@@ -4901,6 +4921,8 @@ class MobSystem {
   uint32_t DeadAsleepCount() const;
   // Corpses the caps have released to debris over the life of this system.
   uint64_t DeadEvictedTotal() const { return deadEvicted_; }
+  // Player corpses AdoptDeadAvatar has moved into mobs_ (player-corpse gate).
+  uint64_t AdoptedAvatarsTotal() const { return adoptedAvatars_; }
   // The living cap, for a gate that has to fill it.
   static constexpr uint32_t MaxLiveMobs() { return kMaxMobs; }
   // ---- what the dead cost, counted (the corpse-sleep gate reads these) ----
@@ -5130,6 +5152,10 @@ class MobSystem {
   // system's parts over somebody else's transforms (game/bodyreg.cpp).
   uint32_t AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase);
   void AppendXforms(std::vector<BodyXformGpu>& out) const;
+  // The physics handle behind each slot AppendXforms emits, in the same walk
+  // (BodyRegistry::BuildHandles): what the death-screen portrait matches its
+  // frozen pose against, whichever system the body lies in by then.
+  void AppendBodyHandles(std::vector<uint64_t>& out) const;
   // Append this system's micro limbs to the COMPACTED draw list, using the same
   // slot walk as AppendXforms/AppendInstances so the recorded slot is the one
   // the limb's transform lands in — sim/microbody.h.
@@ -6119,6 +6145,11 @@ class MobSystem {
   void UpdateDeadSleep(World& world, uint32_t tick);
   uint64_t deathSeq_ = 0;       // Mob::deathSeq_'s source
   uint64_t deadEvicted_ = 0;    // DeadEvictedTotal
+  uint64_t adoptedAvatars_ = 0; // AdoptedAvatarsTotal
+  // Player-corpse id band (AdoptDeadAvatar): bit 61, below the player-actor
+  // band (ai::kPlayerActorBase, bit 62) and above every mob band (playerId<<40).
+  static constexpr uint64_t kPlayerCorpseIdBase = 1ull << 61;
+  uint64_t playerCorpseSeq_ = 0;
   uint64_t deadAnchors_ = 0;    // DeadAnchorsTotal
   uint64_t deadPostSteps_ = 0;  // DeadPostStepsTotal
   std::vector<PendingRise> rises_;

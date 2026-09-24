@@ -2493,7 +2493,9 @@ bool MobSystem::ServiceRising(size_t ri) {
   // of the kit answers the question, at the one moment the answer is wanted.
   // The callback also decides whether the player KEEPS what it hands back
   // (`avatar.keepKitOnTurn`); see MobSystem::SetAvatarKitFn.
-  if (avatar && avatarKitFn_) {
+  // A PlayerCorpse() is the same body after AdoptDeadAvatar moved it into
+  // mobs_: still the player's kit, and still only the callback can read it.
+  if ((avatar || src->playerCorpse_) && avatarKitFn_) {
     std::vector<CarriedItem> kit;
     avatarKitFn_(kit);
     for (CarriedItem& c : kit)
@@ -2698,18 +2700,119 @@ bool MobSystem::ServiceRising(size_t ri) {
   return true;
 }
 
-void MobSystem::SettleDeadAvatar(Mob& av) {
-  if (av.alive_ || av.rigReleased_) return;
-  // The rising first, if one is booked: the respawn is about to rebuild this
-  // rig, and the corpse getting up is the one thing that must read it.
-  for (size_t i = 0; i < rises_.size(); i++)
-    if (rises_[i].mobId == av.id_) {
-      // Forced: a respawn does not wait for the clock. If the living cap is
-      // full the corpse cannot stand up here, and falls to debris instead.
-      if (ServiceRising(i) && av.rigReleased_) return;
-      break;
-    }
-  av.ReleaseRigToDebris();
+// ---- THE PLAYER'S CORPSE BECOMES A DEAD MOB ---------------------------------
+//
+// A SLICE-MOVE OF THE Mob BASE, and the audit that makes it one:
+//   * every physics handle the rig owns lives in `limbs_` (body, joint,
+//     holdBody) or `rigHandles_` — both vectors, both moved, so the avatar
+//     keeps none and its respawn cannot free or alias one. PlayerAvatar's own
+//     members hold no handle (indices and presentation floats only);
+//   * brick ownership is `MobLimb::microModel` and burn indices are
+//     `MobLimb::burn` — they move with the limbs, and the audit
+//     (BodyRegistry::AuditMicroModels) finds the holder in the mob walk now;
+//   * nothing in the base holds `this` (mobs_ is a vector and swap-with-back
+//     moves Mobs every tick), and `sys_`/`phys_`/`world_`/`debris_` are
+//     shared services, copied;
+//   * the vtable is Mob's: AvatarLayer() is false, OnDying and the avatar's
+//     own instance flag no longer apply;
+//   * the avatar LAYER: EnterDeadRagdoll put every dynamic limb through
+//     ReleaseToWorldWhenClear at death, but a worn shell (a follower) and a
+//     limb still on the avatar layer for any other reason did not go — they
+//     go here, so nothing of the corpse is left where the player's capsule
+//     cannot feel it once it has fallen clear;
+//   * render-only state the avatar drives per frame — the first-person hide
+//     mask and the render offset — is the LIVING player's, and a corpse that
+//     inherited it would lie there with no torso;
+//   * the id is FRESH, from the player-corpse band (below): the avatar keeps
+//     its own for the respawn, and two deaths must not leave two Mobs with
+//     one id.
+uint64_t MobSystem::AdoptDeadAvatar(Mob& av) {
+  if (av.alive_ || av.rigReleased_ || av.def_ == nullptr ||
+      av.LimbBodyCount() == 0 || av.IsGhost())
+    return 0;
+  // A Mob that already lives in mobs_ registered AS the avatar (a fixture
+  // borrowing an NPC for the player's seat, selftest_combat) is a corpse
+  // already; moving it into its own vector would be a use-after-move.
+  for (const Mob& m : mobs_)
+    if (&m == &av) return 0;
+  // The corpse's def must be one of THIS system's (the dead passes index
+  // defs_[defIndex_]); an avatar built from some other list decays to debris.
+  const int di = FindDef(av.def_->name);
+  if (di < 0) {
+    av.ReleaseRigToDebris();
+    return 0;
+  }
+  const uint64_t avatarId = av.id_;
+  const size_t nLimbs = av.limbs_.size();
+
+  // THE CORPSE'S ID IS FROM ITS OWN BAND, NOT nextId_. A player's death must
+  // not renumber every creature spawned after it: an id seeds gore variance,
+  // crater noise and every per-limb RNG key (test/support.h IdCounterScope),
+  // so drawing from nextId_ re-rolled the NPCs of every later gate — measured,
+  // corpse-sleep's fixture came out of the ground differently and lay in the
+  // stream beside it. Bit 61 (below ai::kPlayerActorBase's 62), the authoring
+  // player in bits 40.., a per-system sequence below; probed for uniqueness
+  // because a load may already hold one (P2a restores ids verbatim).
+  uint64_t cidNew = 0;
+  do {
+    cidNew = kPlayerCorpseIdBase | ((uint64_t)localPlayerId_ << 40) |
+             (++playerCorpseSeq_ & ((1ull << 40) - 1));
+  } while (FindMobById(cidNew) != nullptr);
+  Mob corpse(std::move(av));   // the slice: Mob's move constructor only
+  corpse.id_ = cidNew;
+  corpse.defIndex_ = di;
+  corpse.def_ = &defs_[di];
+  corpse.playerCorpse_ = true;
+  corpse.hidden_.assign(corpse.limbs_.size(), 0);
+  corpse.renderOffset_ = Vec3{0, 0, 0};
+  corpse.WakeDead();
+  if (phys_)
+    for (const MobLimb& l : corpse.limbs_)
+      if (l.body && phys_->BodyObjectLayer(l.body) == 3 /*AVATAR*/)
+        phys_->ReleaseToWorldWhenClear(l.body);
+  // The booking follows the body.
+  for (PendingRise& r : rises_)
+    if (r.mobId == avatarId) r.mobId = corpse.id_;
+
+  // ---- THE HUSK THE AVATAR KEEPS -------------------------------------------
+  // What ReleaseRigToDebris used to leave: the same part list with no bodies,
+  // partAlive zeroed, and the names, rig and kit bookkeeping the death screen
+  // and the equip loops still read (session.cpp compares WornItem/HeldItem
+  // against the kit every tick, dead or alive — an emptied worn_ would read as
+  // "take it off", an emptied heldItem_ as "equip the sword" on a dead husk).
+  // Revive rebuilds all of it (Despawn + Spawn -> BuildRig).
+  av.id_ = avatarId;
+  av.alive_ = false;
+  av.rigReleased_ = true;
+  av.deadAsleep_ = false;
+  // Not limp: a husk is nothing the player's capsule rides (session.cpp's
+  // Ragdolled() branch would freeze the controller on it).
+  av.ragdoll_ = Mob::RagdollPhase::None;
+  av.limbs_.assign(nLimbs, MobLimb{});
+  for (size_t i = 0; i < nLimbs && i < corpse.limbs_.size(); i++) {
+    av.limbs_[i].hp = corpse.limbs_[i].hp;
+    av.limbs_[i].voxelsAtSpawn = corpse.limbs_[i].voxelsAtSpawn;
+    av.limbs_[i].brainAtSpawn = corpse.limbs_[i].brainAtSpawn;
+  }
+  av.anim_ = corpse.anim_;
+  std::fill(av.anim_.partAlive.begin(), av.anim_.partAlive.end(), 0);
+  av.skel_ = corpse.skel_;
+  av.limbDefs_ = corpse.limbDefs_;
+  av.hidden_ = std::vector<uint8_t>(nLimbs, 0);
+  av.worn_ = corpse.worn_;
+  av.heldItem_ = corpse.heldItem_;
+  av.heldPart_ = corpse.heldPart_;
+  av.getUpFrom_.clear();
+  av.MarkInstancesDirty();
+
+  const uint64_t corpseId = corpse.id_;
+  mobs_.push_back(std::move(corpse));
+  instancesDirty_ = true;
+  adoptedAvatars_++;
+  // It is a corpse like any other from here, and the cap says so now rather
+  // than at the next PreTick (the oldest dead decays to debris).
+  EvictDead();
+  return corpseId;
 }
 
 // ---- A CREATURE GETS UP AS SOMETHING ELSE ----------------------------------
@@ -6995,6 +7098,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // drive. No-op (one null check) until the network layer installs a
   // function, which is why this package does not move the world hash.
   RefreshOwnership();
+  // A PLAYER WHO DIED LAST TICK LEAVES A CORPSE IN mobs_ (AdoptDeadAvatar).
+  // Before the risings, so a bite booked on the avatar rises from the moved
+  // corpse under its new id; outside every loop over mobs_, since it pushes.
+  for (Mob* av : avatars_)
+    if (av != nullptr) AdoptDeadAvatar(*av);
   // THE CORPSES WHOSE CLOCK CAME ROUND STAND UP — FIRST, before any pass has
   // touched the dead this tick, so what gets up is the body exactly as it lay
   // at the end of the last one (the rot in it does not get one more tick's say
@@ -18799,15 +18907,15 @@ void Mob::Die() {
   // ---- WHO KEEPS THE RIG ---------------------------------------------------
   //
   // A creature this machine steps keeps it: death is a state of the Mob. (A
-  // ghost never reaches here — see the top.) One body still becomes
-  // anonymous debris the instant it dies, exactly as every corpse used to
-  // (ReleaseRigToDebris is that loop, unchanged):
-  //   * the PLAYER AVATAR — it is not in mobs_, so nothing would run a dead
-  //     rig's passes on it (P2b moves it there). Unless the bite is standing
-  //     it back up: then the rising needs the rig, and it is kept until the
-  //     rising reads it (or the respawn settles it, SettleDeadAvatar).
-  // A bare fixture Mob with no system keeps today's handover too.
-  const bool keep = sys_ != nullptr && (!AvatarLayer() || rising);
+  // ghost never reaches here -- see the top.) A bare fixture Mob with no
+  // system keeps the old handover (ReleaseRigToDebris, that loop unchanged).
+  //
+  // THE PLAYER AVATAR KEEPS ITS RIG like anybody else (P2b). It is not in
+  // mobs_, so the rig is moved there as a dead Mob of its own at the top of
+  // the next MobSystem::PreTick (AdoptDeadAvatar) -- not here: this runs on
+  // the avatar from inside its own damage paths, and moving the object a
+  // member function is running on is how you get a use-after-move.
+  const bool keep = sys_ != nullptr && !IsGhost();
   if (!keep) {
     ReleaseRigToDebris();
     return;
@@ -19221,11 +19329,11 @@ bool Mob::Lootable() const {
   // request/grant for a corpse's pieces the way there is for a ground item
   // (net::ItemTake): taking here would put the piece in this player's bag
   // while the owner's corpse still wore it. Loot over the network was never
-  // supported for corpses — a pre-P1 corpse on the peer was ghost debris the
-  // Corpses registry never knew — and this keeps that limit rather than
-  // opening a duplication path.
-  return !alive_ && !rigReleased_ && sys_ != nullptr && !sys_->IsAvatar(this) &&
-         !AvatarLayer() && !IsGhost();
+  // supported for corpses, and this keeps that limit rather than opening a
+  // duplication path. A PlayerCorpse() is refused for the reason the avatar
+  // is: its kit lives in PlayerKit and re-dresses the respawned rig.
+  return !alive_ && !rigReleased_ && !playerCorpse_ && sys_ != nullptr &&
+         !sys_->IsAvatar(this) && !AvatarLayer() && !IsGhost();
 }
 
 void Mob::LootPieces(std::vector<LootPiece>& out) const {
@@ -19410,6 +19518,19 @@ void Mob::AppendXforms(std::vector<BodyXformGpu>& out) const {
     // is what keeps it presentation: the debug-box walk, every collider and
     // every strike keep reading limb.xf itself.
     rigrender::AppendXform(out, limb.xf, renderOffset_);
+  }
+}
+
+void MobSystem::AppendBodyHandles(std::vector<uint64_t>& out) const {
+  for (const Mob& mob : mobs_) mob.AppendBodyHandles(out);
+}
+
+void Mob::AppendBodyHandles(std::vector<uint64_t>& out) const {
+  // AppendXforms' walk exactly: same skip, same ceiling.
+  for (const MobLimb& limb : limbs_) {
+    if (!limb.body) continue;
+    if (out.size() >= kMaxBodySlots) return;
+    out.push_back(limb.body);
   }
 }
 

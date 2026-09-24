@@ -2447,8 +2447,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                          spawns);
         // DEAD AVATAR: HOLD, AND WAIT TO BE ASKED. Nothing rebuilds the body
         // on a timer any more, and NOTHING OPENS A MENU OVER THE DEATH either:
-        // the corpse lies where it fell (its parts are DebrisSystem's and
-        // settle like any other debris) and the screen comes up when — and
+        // the corpse lies where it fell (a dead Mob in mobs_ since the tick
+        // after the death, MobSystem::AdoptDeadAvatar, and it burns, bleeds and
+        // settles like any other corpse) and the screen comes up when — and
         // only when — you press I for it. A panel that snaps open the instant
         // you die takes the view away at the one moment you want to look at it,
         // and the readout it holds is not going anywhere: every value on it is

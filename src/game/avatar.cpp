@@ -2750,11 +2750,12 @@ void PlayerAvatar::BurnParts(uint32_t tick, World& world,
 }
 
 void PlayerAvatar::Revive(const Player& player, float heading) {
-  // THE CORPSE FIRST (PLAN_corpse_is_a_mob.md, the P1 fallback). A death that
-  // booked a rising kept the rig for it; settling it here either stands the
-  // zombie up now or leaves the body where you fell as anonymous debris —
-  // exactly what every death did before. Despawn would otherwise DESTROY it.
-  if (spawned_ && !alive_ && sys_) sys_->SettleDeadAvatar(*this);
+  // THE CORPSE FIRST (PLAN_corpse_is_a_mob.md P2b). A registered avatar's
+  // dead rig was moved into mobs_ as a dead Mob at the top of the tick after
+  // it died (MobSystem::AdoptDeadAvatar), and this avatar is a husk; one
+  // that was never registered (a harness), or a respawn in the same tick as
+  // the death, is moved here. Despawn would otherwise DESTROY the body.
+  if (spawned_ && !alive_ && sys_) sys_->AdoptDeadAvatar(*this);
   Despawn();
   Spawn(player, heading);
 }
