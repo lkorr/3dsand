@@ -1946,7 +1946,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   burnStage_.assign(mats.size(), 0u);
   burnable_.assign(mats.size(), 0u);
   for (size_t i = 0; i < mats.size(); i++) {
-    burnStage_[i] = Mob::BurnStageOfMaterialName(mats[i].name);
+    burnStage_[i] = mats[i].burnStage;  // authored (materials.h burnStage)
     bool flammable = burnStage_[i] != 0;
     for (const auto& t : mats[i].tags)
       if (t == "flammable") flammable = true;
@@ -1991,7 +1991,16 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
       const ReactionGpu& r = reactions_[m.gpu.reactOffset + ri];
       const uint32_t kind = r.packed & 3u;
-      if (kind == kReactDecay || kind == kReactEmit) selfActive = 1;
+      // UNGATED self rules only (W1-F, 2026-09-24): a decay/emit behind a
+      // neighbour-count ramp cannot fire until something hot is next to the
+      // voxel, and then that neighbour's own front (or the world / sibling
+      // face seeding) queues it anyway. flesh_charred, flesh_cooked and
+      // cloth_charred own only such rules, and counting them kept every
+      // charred LIVE limb on the front, `alight`, and awake forever -- the
+      // split debris.cpp already makes (matSelfScaled_), measured by the
+      // mob-burn gate's "charred limbs sleep" line.
+      if ((kind == kReactDecay || kind == kReactEmit) && !ReactScaleArmed(r))
+        selfActive = 1;
       if (kind == kReactPair) {
         hasPair = 1;
         if (r.prodNbr != kProdKeep) rewritesNbr = 1;
@@ -7448,6 +7457,10 @@ void Mob::AppendLiveLimbBodies(std::vector<uint64_t>& out) const {
 
 void MobSystem::AppendLiveLimbBodies(std::vector<uint64_t>& out) const {
   for (const Mob& m : mobs_) m.AppendLiveLimbBodies(out);
+  // Then every avatar, ghosts included (mob.h). An unspawned avatar has no
+  // limbs (PlayerAvatar::Despawn clears them), which is its Spawned() test.
+  for (const Mob* av : avatars_)
+    if (av && !av->limbs_.empty()) av->AppendLiveLimbBodies(out);
 }
 
 void Mob::SetLimbVelocities(Vec3 velVoxPerSec) {
@@ -7890,6 +7903,13 @@ int MobSystem::BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
   for (Mob& mob : mobs_)
     if (mob.alive_ && mob.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
       n++;
+  // The LOCAL avatars after the NPCs (mob.h: never a ghost's).
+  for (size_t i = 0; i < localAvatars_ && i < avatars_.size(); i++) {
+    Mob* av = avatars_[i];
+    if (av && av->alive_ && !av->limbs_.empty() &&
+        av->BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
+      n++;
+  }
   return n;
 }
 
@@ -8259,22 +8279,6 @@ float Mob::BurnHealthCapFor(float f) {
   const float t = (f - g.burnCapMidFraction) /
                   std::max(1e-4f, g.burnDeathFraction - g.burnCapMidFraction);
   return g.burnCapMidHealth * (1.0f - t);
-}
-
-uint8_t Mob::BurnStageOfMaterialName(const std::string& n) {
-  // Named, never by id (CLAUDE.md conventions), and mirrored nowhere: main.cpp
-  // resolves the HUD's readout through this same function. A name not in the
-  // content contributes nothing, so a rig that burns into materials this list
-  // has never heard of reads as "not burnt" rather than as a wrong count.
-  if (n == "flesh_cooked" || n == "flesh_burning" || n == "cloth_burning" ||
-      n == "linen_burning" || n == "undercloth_seared" ||
-      n == "undercloth_burning")
-    return 1;
-  if (n == "flesh_charred" || n == "flesh_cinder" || n == "ash" ||
-      n == "cloth_charred" || n == "linen_charred" ||
-      n == "undercloth_charred")
-    return 2;
-  return 0;
 }
 
 namespace {
@@ -13194,6 +13198,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // rebuilt; until then a non-empty front is the only positive evidence there
   // is, and it may only ADD to the flag, never clear it.
   if (!st.front.empty()) st.alight = true;
+  // ...AND THE LATCH NEEDS A WAY DOWN (W1-F, 2026-09-24). Only the sweep may
+  // clear `alight`, and the sweep only runs when the index is REBUILT -- which
+  // the gate above does only for an EMPTY index. A fire that went out without
+  // a further carve (doused, or the last flush under its threshold) left the
+  // index held, the front empty and the latch set for good: measured on the
+  // mob-burn gate's doused arm, 4 limbs with front 0, alight 1, never asleep,
+  // 1500 ticks after the last flame. So an empty front under a set latch hands
+  // the question to the sweep: drop the index (the latch survives a drop) and
+  // the next tick's rebuild either finds matter still alight -- the far-side
+  // case above, now caught -- or clears the latch, and the idle exit and the
+  // sleep follow. Once per fire's end, not per tick.
+  else if (st.alight)
+    Mob::DropBurnIndex(st);
   // `hotVox` CAN fall here, where `alight` may not, and the difference is not
   // an inconsistency. `cand` is a superset of the old front — every front cell
   // is queued unconditionally above, and the loop that just ran walked ALL of
@@ -17551,6 +17568,11 @@ void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                 std::vector<ParticleSpawn>& spawns) {
   for (Mob& mob : mobs_)
     mob.CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
+  // Then every avatar, ghosts included (mob.h). The empty-limb test is
+  // PlayerAvatar::CarveRadial's Spawned() guard.
+  for (Mob* av : avatars_)
+    if (av && !av->limbs_.empty())
+      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
 }
 
 void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
@@ -18776,6 +18798,43 @@ uint32_t MobSystem::LimbBurningCount(uint64_t mobId, int limbIndex) const {
       // drying blood and crumbling char are on it (see BodyBurnState::hotVox).
       return mob.limbs_[limbIndex].burn.hotVox;
   return 0;
+}
+
+MobSystem::LimbBurnProbe MobSystem::LimbBurnStateOf(uint64_t mobId,
+                                                    int limbIndex) const {
+  LimbBurnProbe p;
+  for (const Mob& mob : mobs_)
+    if (mob.id_ == mobId && limbIndex >= 0 &&
+        limbIndex < (int)mob.limbs_.size()) {
+      const MobLimb& l = mob.limbs_[limbIndex];
+      const BodyBurnState& st = l.burn;
+      p.front = (uint32_t)st.front.size();
+      p.alight = st.alight;
+      p.asleep = st.sleepKey != 0;
+      p.indexed = !st.idx.empty();
+      p.quiet = st.quiet;
+      // WHICH material holds the front (attribution, not a count).
+      std::vector<uint32_t> hist(matGpu_.size(), 0u);
+      const bool fine = l.HasFineSkin();
+      for (uint32_t c : st.front) {
+        if (c >= st.idx.size()) continue;
+        const uint32_t vi = st.idx[c] & ~kBurnQueued;
+        if (vi == 0) continue;
+        const uint32_t m =
+            fine ? (vi - 1 < l.skinVoxels.size()
+                        ? (uint32_t)(l.skinVoxels[vi - 1].material & 0xFFFu)
+                        : 0u)
+                 : (vi - 1 < l.voxels.size()
+                        ? (uint32_t)(l.voxels[vi - 1].payload & 0xFFFu)
+                        : 0u);
+        if (BurnStageOf(m)) p.frontBurnt++;
+        if (m < hist.size() && ++hist[m] > p.frontMatCount) {
+          p.frontMatCount = hist[m];
+          p.frontMat = m;
+        }
+      }
+    }
+  return p;
 }
 
 uint32_t MobSystem::LimbMaterialCount(uint64_t mobId, int limbIndex,

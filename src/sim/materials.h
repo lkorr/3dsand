@@ -848,6 +848,14 @@ struct MaterialDef {
   // Rolled ONCE per voxel, keyed on its lattice position, so a voxel bared
   // twice gets the same answer both times. 0 = never. CPU-only (body coats).
   float bareBlood = 0.0f;
+  // HOW BURNT A VOXEL OF THIS READS (materials.json "burnStage", W1-F
+  // 2026-09-24): 0 = intact, 1 = half (cooked / seared / alight), 2 = whole
+  // (charred / cinder / ash). A body's burnt fraction, its burn health cap,
+  // `burntAway`, the wet guard, `burnable` and the HUD's cooked/charred limb
+  // readout all read THIS field -- it replaced a twelve-name list in mob.cpp
+  // (Mob::BurnStageOfMaterialName), so a new burn stage is a JSON key, not a
+  // code edit. CPU-only: nothing here reaches a shader or the world hash.
+  uint8_t burnStage = 0;
   // Sound sets for this surface, keyed by SLOT ("footstep", "impact",
   // "break", ...). Each value names a set relative to the slot's namespace, so
   // "footstep": "leaf" resolves to the set "footsteps/leaf" — one FOLDER under

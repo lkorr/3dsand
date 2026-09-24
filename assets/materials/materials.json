@@ -214,6 +214,7 @@
     },
     {
       "id": "ash",
+      "burnStage": 2,
       "footstep": "path",
       "class": "powder",
       "repose": 40,
@@ -2499,6 +2500,7 @@
     {
       "//": "BODY REACTIVITY (docs/PLAN_body_reactivity.md). Burn state is encoded as MATERIAL IDENTITY -- skin -> flesh_cooked -> flesh_burning -> flesh_charred -> ash -- rather than as a side table or a spare bit. The micro-body voxel is 16 bits and fully spent (8 material + 8 art colour), and there is nothing to widen; encoding the state as a material instead needs zero engine change, renders correctly for free because each stage authors its own colour and emission, and keeps the behaviour in JSON where DESIGN.md §6 wants it. SEARED, not burning: a creature can be cooked without being destroyed, which is the readability win wounds already argue for.",
       "id": "flesh_cooked",
+      "burnStage": 1,
       "class": "solid",
       "density": 1000,
       "hardness": 7,
@@ -2533,6 +2535,7 @@
     {
       "//": "Flesh actively on fire. tag:hot is the whole point: this voxel is now a heat SOURCE, so it ignites the flesh next to it, lights the grass the mob is standing in, and boils water -- through the ordinary reaction table, with no mob-specific fire code anywhere.",
       "id": "flesh_burning",
+      "burnStage": 1,
       "class": "solid",
       "density": 900,
       "hardness": 4,
@@ -2553,6 +2556,7 @@
     {
       "//": "Burnt-through flesh: spent fuel, and STRUCTURALLY WEAK. hardness 3 against skin's 8 means a charred limb shatters under a blow a healthy one shrugs off -- emergent, out of the material table, with no damage multiplier to author. Deliberately NOT tagged flammable: it re-ignites only through its own high-minCount rule, so a burnt corpse does not smoulder forever.",
       "id": "flesh_charred",
+      "burnStage": 2,
       "class": "solid",
       "density": 620,
       "hardness": 3,
@@ -2581,6 +2585,7 @@
     {
       "//": "Cloth alight. Shared by every fabric (cloth/trim/shadow) and by leather, so the burn character is authored ONCE and a new fabric inherits it by naming this as its product.",
       "id": "cloth_burning",
+      "burnStage": 1,
       "class": "solid",
       "density": 300,
       "hardness": 2,
@@ -2601,6 +2606,7 @@
     {
       "//": "What is left of a garment that burned: holes, and scorched rag around them. Low hardness for the same reason flesh_charred has it.",
       "id": "cloth_charred",
+      "burnStage": 2,
       "class": "solid",
       "density": 260,
       "hardness": 2,
@@ -2834,6 +2840,7 @@
     {
       "//": "Undercloth alight. A near-copy of cloth_burning and NOT the same material, which is the entire mechanic: cloth_burning is CONSUMED (it has a becomes-air branch, so a robe burns into holes), and this one is not. See its rules in reactions.json.",
       "id": "linen_burning",
+      "burnStage": 1,
       "class": "solid",
       "density": 300,
       "hardness": 2,
@@ -2854,6 +2861,7 @@
     {
       "//": "Scorched linen: the TERMINUS of the whole chain, and the only material in this file that authors no rules at all. That is the point rather than an omission -- it can never burn away, so a torched character keeps a blackened garment instead of losing it, and it can never re-ignite, so the chunk it sits in sleeps (rule 2). NEUTRAL-COOL where the flesh chars beside it are warm brown-black, which is the whole readability job: value alone would not separate scorched linen (#262326) from charred flesh (#3a2f2a) at a glance, but hue does, and it is the same neutral family cloth_charred already uses because both are burnt fabric. A touch darker than cloth_charred: this garment burns to completion rather than into rags.",
       "id": "linen_charred",
+      "burnStage": 2,
       "class": "solid",
       "density": 280,
       "hardness": 2,
@@ -2871,6 +2879,7 @@
     {
       "//": "DEEP CHAR: one stage past flesh_charred. Charred is what a body looks like the moment the flame passes over it -- dark, but still brown and still recognisably meat. Sustained fire takes it further, and this is where it ends: cinder, near-black, crisp. Authored as a separate id rather than as another palette jitter of flesh_charred because it is not a shade, it is a STATE -- it has different rules (none), so a corpse driven this far can neither re-ignite nor be driven further, which is what makes a torched body a settled, permanently black thing rather than one that smoulders on the edge of relighting. hardness 2 continues the ramp (skin 8 -> cooked 7 -> charred 3 -> cinder 2): a cindered limb comes apart at a touch.",
       "id": "flesh_cinder",
+      "burnStage": 2,
       "class": "solid",
       "density": 520,
       "hardness": 2,
@@ -3357,6 +3366,7 @@
     {
       "//": "Undercloth seared: flesh_cooked's twin (same density, hardness, rubble, tags) in scorched-linen colours, so a singed pair of shorts still reads as shorts.",
       "id": "undercloth_seared",
+      "burnStage": 1,
       "class": "solid",
       "far": "flesh_cooked",
       "density": 1000,
@@ -3377,6 +3387,7 @@
     {
       "//": "Undercloth alight: flesh_burning's twin (hot, emission 170, same body numbers) in linen_burning's flame colours.",
       "id": "undercloth_burning",
+      "burnStage": 1,
       "class": "solid",
       "far": "flesh_burning",
       "density": 900,
@@ -3398,6 +3409,7 @@
     {
       "//": "Undercloth charred: flesh_charred's twin (structurally weak, not tagged flammable, relights only under a four-face front) in linen_charred's neutral-cool black, so it still separates from the warm char of the flesh beside it. Sustained fire takes it on to linen_charred, the inert terminus, as flesh_charred goes to flesh_cinder.",
       "id": "undercloth_charred",
+      "burnStage": 2,
       "class": "solid",
       "far": "linen_charred",
       "density": 620,

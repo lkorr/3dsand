@@ -355,6 +355,10 @@ const char* const kOrder[] = {
     // debris and mobs into every arm and regenerates pristine worldgen at
     // kDefaultSeed on the way out.
     "remote-ghost",
+    // W1-F: one player's grenade carves and launches the other (and carves,
+    // but never launches, a peer's ghost). CPU + Jolt, resets debris and mobs
+    // on both sides; beside the other two-body gates.
+    "blast-players",
     "debris",
     // `audio-spatial` touches no World at all (it is the mixer and a Camera),
     // so its slot is free; it sits with the other audio gates.

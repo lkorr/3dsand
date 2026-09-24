@@ -650,6 +650,9 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     if (d.rotRate > 1.0f) d.rotRate = 1.0f;
     d.bareBlood = std::clamp(m.value("bareBlood", 0.0f), 0.0f, 1.0f);
     if (!(d.bareBlood == d.bareBlood)) d.bareBlood = 0.0f;   // NaN
+    // 0 intact / 1 half / 2 whole (materials.h burnStage). Clamped, like the
+    // weights above: a silly number should misbehave visibly, not refuse.
+    d.burnStage = (uint8_t)std::clamp(m.value("burnStage", 0), 0, 2);
     // The tariff base. Derived from density when not authored: a voxel of
     // something heavy is worth more to conjure than a voxel of smoke, which is
     // the right default for the long tail and wrong for exactly the materials
