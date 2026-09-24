@@ -76,14 +76,24 @@ for severed parts. They are renamed to say so (`BurnDeadFlesh`, `StainDeadFlesh`
 - **Sleep.** A dead Mob is asleep when all of these hold for ≥ 60 ticks:
   - every limb body is inactive in Jolt, with no `holdBody` in flight;
   - burn has no front, no `alight` and a non-zero `sleepKey`;
-  - the coat has nothing decaying or wet and nothing is dirty;
+  - the coat has nothing active on it (a washer, a corrosive or hot coat) and
+    nothing is dirty. A PASSIVE coat -- one that only dries (`coat.decay` > 0,
+    not a washer, not corrosive/hot: blood, ichor, oil) -- does not hold it
+    awake (P2d, `MobSystem::CoatDriesAsleep`);
   - every `bleedBudget`/`gushTicks` is 0;
   - `twinDirty_` is false, no pending spawns, and the hit flash has decayed.
 
   An asleep dead Mob skips:
   - `RegisterTerrainAnchor`;
   - `PostStep`'s untunnel, read-back and `DriveWornShells` (no per-tick `Activate`);
-  - the burn and stain scans.
+  - the burn and stain scans -- except that a passive coat still drying gets
+    one visit on each tick its next level is due (`Mob::NextDryTick`, the
+    material's `DryOneLimb` period). The visit is the awake `StainTick` on
+    that tick, from the same pot, then the twin sync and a forced ledger
+    recount; the skipped ticks are exactly the ones on which an awake corpse
+    writes nothing, so the coat ends voxel-for-voxel the same (the
+    `corpse-sleep` gate compares against an awake arm). A visit that writes
+    anything but drying (contact, rain, wet) wakes it.
 
   It wakes on any of these:
   - a limb is active in Jolt;

@@ -3123,7 +3123,7 @@ void MobSystem::EvictDead() {
   }
 }
 
-void MobSystem::UpdateDeadSleep(World& world) {
+void MobSystem::UpdateDeadSleep(World& world, uint32_t tick) {
   for (Mob& m : mobs_) {
     if (m.alive_ || m.rigReleased_ || m.deadAsleep_) continue;
     // A ghost's corpse has no passes to put to sleep (it runs the ghost
@@ -3138,6 +3138,10 @@ void MobSystem::UpdateDeadSleep(World& world) {
     if (m.deadQuiet_ >= kDeadSleepTicks) {
       m.deadAsleep_ = true;
       m.deadWakeKey_ = m.DeadWakeKey(world);
+      // A passive coat still drying goes on drying, on its own cadence
+      // (StainLimbs visits it on this tick; Mob::DeadDryVisit).
+      m.dryScale_ = CurrentTuning().coat.decayScale;
+      m.dryDue_ = m.NextDryTick(tick);
       // THE GARMENTS GO TO SLEEP WITH IT. A worn shell is kinematic and was
       // last driven with its host's (settled, but not exactly zero) velocity;
       // left alone it would drift on that for Jolt's own sleep timer. The
@@ -7188,6 +7192,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       if (mob.deadAsleep_) {
         if (mob.RigActive() || mob.DeadWakeKey(world) != mob.deadWakeKey_) {
           mob.WakeDead();
+          mob.deadWokeHow_ = mob.RigActive() ? 1 : 2;
         } else {
           if ((tick + (uint32_t)mob.id_) % kDeadAnchorStride == 0) {
             mob.RegisterTerrainAnchor();
@@ -7318,7 +7323,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   StainLimbs(tick, world);
   // Which corpses have gone quiet, now that every pass of the tick has had
   // its say (the burn pass's idle verdict, the coat's recount, the bleed).
-  UpdateDeadSleep(world);
+  UpdateDeadSleep(world, tick);
   // ---- GRADUAL SKIN TINT (the 60-second corpse-to-zombie palette fade) ----
   //
   // Each dedicated palette entry lerps from the living colour to the undead
@@ -9128,6 +9133,7 @@ void MobSystem::PostStep() {
     if (mob.deadAsleep_) {
       if (!mob.RigActive()) continue;
       mob.WakeDead();
+      mob.deadWokeHow_ = 3;
     }
     if (!mob.alive_) deadPostSteps_++;
     mob.PostStep();
@@ -15360,10 +15366,29 @@ void MobSystem::StainLimbs(uint32_t tick, World& world) {
       m.StainTick(tick, world, budget, rainBudget);
     }
     // The full StainTick — contact, rain, drying and the WET pass with its
-    // drips — on every awake corpse whose rig is still its own.
+    // drips — on every awake corpse whose rig is still its own. An ASLEEP one
+    // is visited only on the tick its next coat level is due (P2d, the note
+    // on MobSystem::CoatDriesAsleep), from the same pot at the same place in
+    // the rotation, so it spends and dries as it would have awake.
     for (size_t k = 0; k < nm && deadBudget; k++) {
       Mob& m = mobs_[(start + k) % nm];
-      if (m.alive_ || m.rigReleased_ || m.deadAsleep_) continue;
+      if (m.alive_ || m.rigReleased_) continue;
+      if (m.deadAsleep_) {
+        if (m.dryDue_ == 0) continue;
+        // F5 moved coat.decayScale: every period moved with it.
+        if (m.dryScale_ != CurrentTuning().coat.decayScale) {
+          m.dryScale_ = CurrentTuning().coat.decayScale;
+          m.dryDue_ = m.NextDryTick(tick - 1u);
+          if (m.dryDue_ == 0) continue;
+        }
+        if (tick < m.dryDue_) continue;
+        // A missed due tick (the pot ran dry before this corpse's turn, as it
+        // would have skipped it awake too) is not caught up: DryOneLimb acts
+        // only ON a period tick, so the next one is simply taken.
+        if (tick == m.dryDue_) m.DeadDryVisit(tick, world, deadBudget, deadRain);
+        else m.dryDue_ = m.NextDryTick(tick - 1u);
+        continue;
+      }
       m.StainTick(tick, world, deadBudget, deadRain);
     }
   }
@@ -15696,6 +15721,22 @@ bool MobSystem::OpenToSky(World& world, const Vec3& p) const {
   return true;
 }
 
+uint32_t MobSystem::CoatDryTicks(uint32_t mat) const {
+  const float secs = mat < coatDecay_.size() ? coatDecay_[mat] : 0.0f;
+  if (secs <= 0.0f) return 0;
+  const auto& ct = CurrentTuning().coat;
+  const long tk = std::lround((double)secs * 30.0 / (double)ct.decayScale);
+  return (uint32_t)std::max<long>(1, tk);
+}
+
+bool MobSystem::CoatDriesAsleep(uint32_t mat) const {
+  if (mat == 0 || CoatDryTicks(mat) == 0) return false;
+  if (mat < matGpu_.size() && (matGpu_[mat].stainPack & kStainPackWashesBit))
+    return false;  // a washer wicks and drips (WetOneLimb), and dries in sun
+  if (mat < matCorrodes_.size() && matCorrodes_[mat]) return false;  // eats
+  return true;
+}
+
 bool MobSystem::DryOneLimb(BurnLimbView& v, const LimbCoat& led,
                            uint32_t tick, uint32_t key, uint32_t& budget,
                            World* world) {
@@ -15729,8 +15770,9 @@ bool MobSystem::DryOneLimb(BurnLimbView& v, const LimbCoat& led,
     if (secs <= 0.0f) continue;
     const uint32_t floor =
         en.mat < coatDecayFloor_.size() ? coatDecayFloor_[en.mat] : 0u;
-    const long tk = std::lround((double)secs * 30.0 / (double)ct.decayScale);
-    const uint32_t shadeTicks = (uint32_t)std::max<long>(1, tk);
+    // The ONE period formula: a sleeping corpse's due tick (Mob::NextDryTick)
+    // is computed from the same function, so it lands on this test's ticks.
+    const uint32_t shadeTicks = CoatDryTicks(en.mat);
     // IN THE SUN a WET coat (a washer: water) dries coat.sunDryScale times
     // faster -- evaporation, which blood soaked into skin does not do on the
     // same terms. Two periods, and the probe only on a tick one lands on.
@@ -15739,7 +15781,7 @@ bool MobSystem::DryOneLimb(BurnLimbView& v, const LimbCoat& led,
     const long tkSun =
         washer ? std::lround((double)secs * 30.0 /
                              ((double)ct.decayScale * (double)ct.sunDryScale))
-               : tk;
+               : (long)shadeTicks;
     const uint32_t sunTicks = (uint32_t)std::max<long>(1, tkSun);
     if (tick % shadeTicks != 0 && tick % sunTicks != 0) continue;
     if (sun < 0 && sunTicks != shadeTicks)
@@ -18959,6 +19001,75 @@ bool Mob::RigActive() const {
 }
 
 const char* Mob::DeadAwakeReason() const {
+  if (deadAsleep_ && !alive_ && !rigReleased_) {
+    if (dryDue_ == 0) return "asleep, dry";
+    static thread_local char why[64];
+    std::snprintf(why, sizeof why, "asleep, drying: next level at tick %u",
+                  (unsigned)dryDue_);
+    return why;
+  }
+  return DeadAwakeCriterion();
+}
+
+uint32_t Mob::NextDryTick(uint32_t after) const {
+  if (sys_ == nullptr) return 0;
+  uint64_t best = 0;
+  for (const MobLimb& l : limbs_) {
+    if (!l.body) continue;
+    for (const CoatEntry& en : l.coat.top) {
+      if (en.mat == 0 || en.sumAmt == 0 || !sys_->CoatDriesAsleep(en.mat))
+        continue;
+      const uint32_t floor = en.mat < sys_->coatDecayFloor_.size()
+                                 ? sys_->coatDecayFloor_[en.mat]
+                                 : 0u;
+      if (en.sumAmt <= en.voxels * floor) continue;  // at its floor: done
+      const uint64_t p = sys_->CoatDryTicks(en.mat);
+      const uint64_t t = ((uint64_t)after / p + 1u) * p;
+      if (best == 0 || t < best) best = t;
+    }
+  }
+  // Past the 32-bit tick: the counter wraps there and so does every period
+  // test, which is not a case the game reaches (4.5 years at 30 Hz).
+  return best > 0xFFFFFFFFull ? 0u : (uint32_t)best;
+}
+
+void Mob::DeadDryVisit(uint32_t tick, World& world, uint32_t& budget,
+                       uint32_t& rainBudget) {
+  // EXACTLY THE AWAKE CALL. An awake corpse runs StainTick every tick, and on
+  // a tick that is not a multiple of any of its coats' periods DryOneLimb
+  // does nothing; on a passive-only body in a quiet world the contact, rain
+  // and wet passes do nothing either (else it would not have fallen asleep).
+  // So the ticks skipped asleep are exactly the ones that write nothing, and
+  // this is the one that would -- same tick, same keys, same pot.
+  StainTick(tick, world, budget, rainBudget);
+  // Anything BUT drying wrote: it is lying in something, or it is raining on
+  // it. That is not passive; it is awake from here and the awake passes
+  // (which ran the same writes this tick) take it on.
+  if (stainWriters_ & ~4u) {
+    dryWokeBy_ = stainWriters_;
+    dryWokeLimb_ = stainWriterLimb_;
+    WakeDead();
+    deadWokeHow_ = 4;
+    return;
+  }
+  // What the next awake ticks would have done with what it wrote: the joint
+  // twins (BurnTick's tail, the next tick), the burn fraction the sync marks,
+  // and the ledger (RecountCoat's recountTicks cadence) -- forced now, since
+  // nothing else will run them before the next visit, and the next due tick
+  // is read off the ledger. A stain-only sync removes nothing, so it cannot
+  // sever and its spawns list stays empty.
+  if (!SyncJointTwins(world, pendingSpawns_)) return;
+  RecountBurn(tick, true);
+  RecountCoat(tick, true);
+  // STILL ASLEEP. The sync reports what it copied through MarkInstancesDirty,
+  // which wakes any corpse (its note: a lattice writer is a reason to look
+  // again) -- but the writer here is this visit, drying and nothing else, and
+  // the render instances it marked are all it needs.
+  deadAsleep_ = true;
+  dryDue_ = NextDryTick(tick);
+}
+
+const char* Mob::DeadAwakeCriterion(bool passiveDrySleeps) const {
   if (alive_ || rigReleased_ || sys_ == nullptr) return "not a corpse";
   if (twinDirty_ || coatDirty_) {
     static thread_local char why[96];
@@ -19026,6 +19137,9 @@ const char* Mob::DeadAwakeReason() const {
     for (const CoatEntry& en : l.coat.top) {
       if (en.mat == 0 || en.sumAmt == 0) continue;
       const uint32_t m = en.mat;
+      // A PASSIVE coat (blood, ichor, oil) only dries, and dries asleep on
+      // its own cadence (MobSystem::CoatDriesAsleep, Mob::DeadDryVisit).
+      if (passiveDrySleeps && sys_->CoatDriesAsleep(m)) continue;
       // A WASHER (water) wicks and drips while it is on a body.
       if (m < sys_->matGpu_.size() &&
           (sys_->matGpu_[m].stainPack & kStainPackWashesBit))
@@ -19834,6 +19948,55 @@ uint32_t MobSystem::LimbCoatMatCount(uint64_t mobId, int limbIndex,
       if (hit(v.stain)) n++;
   }
   return n;
+}
+
+uint64_t MobSystem::CoatDigest(uint64_t mobId, uint64_t* sumAmt) const {
+  const Mob* mob = nullptr;
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) { mob = &m; break; }
+  if (!mob) mob = AvatarById(mobId);
+  uint64_t h = 1469598103934665603ull, sum = 0;
+  auto mix = [&h](uint64_t x) {
+    h ^= x;
+    h *= 1099511628211ull;
+  };
+  if (mob)
+    for (size_t li = 0; li < mob->limbs_.size(); li++) {
+      const MobLimb& l = mob->limbs_[li];
+      if (!l.body) continue;
+      mix(0xB0D7u + li);
+      auto one = [&](size_t vi, uint16_t stain) {
+        if (stain == 0) return;
+        mix((uint64_t)vi << 16 | stain);
+        sum += BodyStainAmt(stain);
+      };
+      if (l.HasFineSkin())
+        for (size_t vi = 0; vi < l.skinVoxels.size(); vi++)
+          one(vi, l.skinVoxels[vi].stain);
+      else
+        for (size_t vi = 0; vi < l.voxels.size(); vi++)
+          one(vi, l.voxels[vi].stain);
+    }
+  if (sumAmt) *sumAmt = sum;
+  return h;
+}
+
+uint8_t MobSystem::ShadowStainTick(uint64_t mobId, uint32_t tick,
+                                   World& world) {
+  for (Mob& m : mobs_)
+    if (m.id_ == mobId) {
+      uint32_t budget = kStainLatticePerTick, rain = kRainLatticePerTick;
+      m.StainTick(tick, world, budget, rain);
+      return m.stainWriters_;
+    }
+  return 0;
+}
+
+const char* MobSystem::DeadAwakeCriterionOf(uint64_t mobId,
+                                            bool passiveDrySleeps) const {
+  for (const Mob& m : mobs_)
+    if (m.id_ == mobId) return m.DeadAwakeCriterion(passiveDrySleeps);
+  return nullptr;
 }
 
 uint32_t MobSystem::StainTypeOf(uint32_t mat) const {
