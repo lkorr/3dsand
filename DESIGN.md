@@ -5020,9 +5020,24 @@ reads as a permanently short bar rather than one that quietly rescaled. The
 recount is dirtied by the burn pass and by every carve and taken at most every
 `kBurnRecountTicks` (8) — a creature that is not changing costs nothing, one
 that is burning pays one pass over its body per cadence, never one per burn
-step (rule 2). The material list is `Mob::BurnStageOfMaterialName`, and
-main.cpp's per-limb HUD readout resolves through it, so the two cannot disagree
-about ash. Derived, not saved: a loaded avatar keeps its low hp but starts at
+step (rule 2). How burnt a material reads is AUTHORED: `"burnStage"` in
+materials.json (0 intact / 1 half / 2 whole), compiled into
+`MaterialDef::burnStage` (W1-F, 2026-09-24; it replaced a twelve-name list,
+`Mob::BurnStageOfMaterialName`). The burn cap, `burntAway`, the wet guard,
+`burnable` and main.cpp's per-limb HUD readout all read that one field, so they
+cannot disagree about ash, and a new burn stage is a JSON key.
+
+A charred LIVE limb sleeps (W1-F). The burn front holds only materials with an
+UNGATED decay/emit rule; charred and cooked flesh own only rules behind a
+neighbour-count ramp, which the front's neighbour queue and the world/sibling
+face seeding already reach whenever there is heat to satisfy them. Counting
+them as self-active kept every charred limb `alight` and off the burn
+`sleepKey` forever — the split debris had already made (`matSelfScaled_`).
+That split exposed the second half: `alight` is cleared only by the index
+SWEEP, and the sweep ran only on an index rebuild, so a fire that went out
+without a further carve latched the limb awake with an empty front. An empty
+front under a set latch now drops the index, and the next tick's sweep decides.
+Gate `mob-burn`, line "charred limbs sleep". Derived, not saved: a loaded avatar keeps its low hp but starts at
 cap 1 until it burns again.
 
 **Heat crosses a joint, and until it did a burning torso never lit the legs.**
@@ -14975,6 +14990,21 @@ ghost's coat is stale until handoff; `WaterBodies()` is still keyed on the
 window origin (rule 1 below); the HUD has no net line (the `--frames` exit
 report is the readout). Every one of these is listed with its trigger in
 `docs/PLAN_multiplayer_m9.md`.
+
+**Player-on-player damage is author-side only (W1-F, 2026-09-24).** No hit
+crosses the wire. A sword or a grenade resolves on the ATTACKER's machine
+against every body that machine holds: NPCs, its own player, and the peer's
+ghost avatar, which is carved as presentation and never launched (the wire
+owns a ghost's position and its alive bit; `remoteplayer.cpp`). The peer's
+real body, on the peer's machine, is untouched. Since W1-F the explosion
+body pass (`ExplosionHitsBodies`) reaches every registered avatar through
+`MobSystem::CarveMobsRadial` / `BlastMobsRadial` / `AppendLiveLimbBodies`, so
+in-process players hit each other (gate `blast-players`). The owner-side half
+differs by kind: explosions already travel in the merged op batch, so the
+owner can apply a PEER's blast to its own avatar at the landing tick in phase
+N (the crater scan's M9.4-D precedent) with no protocol change — it needs the
+merge to report which explosion indices are remote, as it already does for
+brush ops. Melee has no op to ride, so it needs a hit message.
 
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×

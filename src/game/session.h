@@ -128,6 +128,16 @@ struct Grenade {
 // Integrate one 30 Hz tick against the voxel mirror. Returns true on detonate.
 bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt);
 
+// ONE EXPLOSION AGAINST EVERY BODY: rigidbodies crater, creatures AND players
+// are carved, debris takes the impulse, the living are launched. Phase K's
+// per-explosion body block, lifted out so the `blast-players` gate runs the
+// code the game runs. Every player is reached through MobSystem's registered
+// avatars (W1-F): a grenade carves and launches the OTHER player too, and a
+// peer's ghost is carved but never launched (game/mob.h).
+void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
+                         DebrisSystem& debris, MobSystem& mobs,
+                         std::vector<ParticleSpawn>& spawns);
+
 // Where a spell resolved, for the renderer: a short-lived burst of sprites
 // (SpellEmission::impacts). Render-only, counted down per TICK so the flash
 // lasts the same world-time at any frame rate.

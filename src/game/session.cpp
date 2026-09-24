@@ -3376,51 +3376,69 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
           // IS this vector, `OpLandingTick` is `tick`, phase N is after phase
           // J (the only other producer of destruction events in a tick), so
           // the same boxes are queued at the same tick in the same order.
-          // Blow voxels OFF the bodies in range before shoving what survives:
-          // an explosion next to a rigidbody now craters it, and splits it into
-          // separate bodies when the crater severs it. Runs first so the
-          // impulse below acts on the post-damage bodies (including the new
-          // fragments, which is what makes a blown-apart object scatter).
-          const Vec3 ec{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
-          const float edr =
-              (float)e.radius * CurrentTuning().physics.explosionBodyDamageScale;
-          debris.DamageBodiesRadial(ec, edr, world, spawns);
-          // Living flesh craters too: a blast next to a mob tears voxels off
-          // its limbs, and takes a limb clean off when it removes enough of it.
-          // Same call shape as the debris line above — that parallel is the
-          // point (game/mob.h).
-          mobs.CarveMobsRadial(ec, edr, world, spawns);
-          avatar.CarveRadial(ec, edr, world, spawns);
-          // The per-body impulse is for DEBRIS. A living creature's limbs are
-          // skipped whether kinematic (standing) or dynamic (already limp
-          // from an earlier blast): impulse / limb mass on a 0.3 kg hand is
-          // 170 m/s and the joints drag the rest of the rig after it —
-          // "bodies zoom across the map". The rig takes ONE launch below.
-          std::vector<uint64_t> rigBodies;
-          mobs.AppendLiveLimbBodies(rigBodies);
-          if (avatar.Spawned()) avatar.AppendLiveLimbBodies(rigBodies);
-          std::sort(rigBodies.begin(), rigBodies.end());
-          phys.ApplyRadialImpulse(
-              Vec3{(float)e.x, (float)e.y, (float)e.z},
-              (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
-              (float)e.power * CurrentTuning().physics.explosionImpulseScale,
-              &rigBodies);
-          // ...and the LIVING are knocked flying. A standing creature's limbs
-          // are kinematic, so the impulse above never touched them; this is
-          // the blast's other half (Mob::BlastRadial): go limp, take a launch
-          // velocity of impulse / body mass toward away-from-the-blast,
-          // capped at ragdoll.maxLaunchSpeed, and get back up once landed.
-          {
-            const auto& rg = CurrentTuning().ragdoll;
-            const float reach = (float)e.radius * rg.blastRadiusScale;
-            const float impulse = (float)e.power * rg.blastImpulseScale;
-            mobs.BlastMobsRadial(ec, reach, impulse);
-            if (avatar.Spawned()) avatar.BlastRadial(ec, reach, impulse);
-          }
+          //
+          // ---- THE BODIES STAY HERE, ON THE AUTHOR'S MACHINE (W1-F) -------
+          // Every body this process holds: NPCs, every local player, and a
+          // peer's ghost (carved as presentation, never launched) — the same
+          // rule a melee hit on a ghost follows. KNOWN GAP over the wire: the
+          // peer's REAL body, on the peer's machine, is not hit by my grenade,
+          // exactly as it is not hit by my sword (no hit crosses the wire).
+          // Explosions, unlike sword hits, ARE in the merged batch, so the
+          // owner-side half needs no protocol change — see DESIGN.md §10.
+          ExplosionHitsBodies(e, world, phys, debris, mobs, spawns);
           stream.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                  {e.x + e.radius, e.y + e.radius, e.z + e.radius});
         }
       }
+  }
+}
+
+// ---- ONE EXPLOSION AGAINST EVERY BODY (session.h) -------------------------
+void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
+                         DebrisSystem& debris, MobSystem& mobs,
+                         std::vector<ParticleSpawn>& spawns) {
+  // Blow voxels OFF the bodies in range before shoving what survives:
+  // an explosion next to a rigidbody now craters it, and splits it into
+  // separate bodies when the crater severs it. Runs first so the
+  // impulse below acts on the post-damage bodies (including the new
+  // fragments, which is what makes a blown-apart object scatter).
+  const Vec3 ec{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
+  const float edr =
+      (float)e.radius * CurrentTuning().physics.explosionBodyDamageScale;
+  debris.DamageBodiesRadial(ec, edr, world, spawns);
+  // Living flesh craters too: a blast next to a mob tears voxels off
+  // its limbs, and takes a limb clean off when it removes enough of it.
+  // Same call shape as the debris line above — that parallel is the
+  // point (game/mob.h). EVERY PLAYER is in it (W1-F): MobSystem walks
+  // its registered avatars after the NPCs, so another player standing
+  // in this session's blast is carved. It used to be this session's
+  // own `avatar.CarveRadial` beside it, which reached nobody else.
+  mobs.CarveMobsRadial(ec, edr, world, spawns);
+  // The per-body impulse is for DEBRIS. A living creature's limbs are
+  // skipped whether kinematic (standing) or dynamic (already limp
+  // from an earlier blast): impulse / limb mass on a 0.3 kg hand is
+  // 170 m/s and the joints drag the rest of the rig after it —
+  // "bodies zoom across the map". The rig takes ONE launch below.
+  std::vector<uint64_t> rigBodies;
+  mobs.AppendLiveLimbBodies(rigBodies);  // NPCs + every avatar
+  std::sort(rigBodies.begin(), rigBodies.end());
+  phys.ApplyRadialImpulse(
+      Vec3{(float)e.x, (float)e.y, (float)e.z},
+      (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
+      (float)e.power * CurrentTuning().physics.explosionImpulseScale,
+      &rigBodies);
+  // ...and the LIVING are knocked flying. A standing creature's limbs
+  // are kinematic, so the impulse above never touched them; this is
+  // the blast's other half (Mob::BlastRadial): go limp, take a launch
+  // velocity of impulse / body mass toward away-from-the-blast,
+  // capped at ragdoll.maxLaunchSpeed, and get back up once landed.
+  {
+    const auto& rg = CurrentTuning().ragdoll;
+    const float reach = (float)e.radius * rg.blastRadiusScale;
+    const float impulse = (float)e.power * rg.blastImpulseScale;
+    // NPCs + every LOCAL avatar; a peer's ghost is carved above but
+    // never launched — its position is the wire's (game/mob.h).
+    mobs.BlastMobsRadial(ec, reach, impulse);
   }
 }
 

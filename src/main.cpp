@@ -1046,14 +1046,12 @@ TissueMats ResolveTissueMats(const MobSystem& mobs,
 
 BurnMats ResolveBurnMats(const std::vector<MaterialDef>& mats) {
   BurnMats bm;
-  // Named, never hardcoded by id (CLAUDE.md conventions), and the NAME LIST
-  // lives in one place: Mob::BurnStageOfMaterialName is what the burn cap
-  // (sim/tuning.h Gore §G) counts with, so the HUD's per-limb readout and the
-  // creature's own health cap cannot disagree about what "burnt" is. A name
-  // not in this content simply contributes nothing — the readout degrades to
-  // "not charred" rather than reporting a wrong material's count.
+  // Never hardcoded by id (CLAUDE.md conventions): the stage is AUTHORED on
+  // the material (materials.json "burnStage"), and it is the same field the
+  // burn cap (sim/tuning.h Gore §G) counts with, so the HUD's per-limb readout
+  // and the creature's own health cap cannot disagree about what "burnt" is.
   for (size_t i = 0; i < mats.size(); i++) {
-    const uint8_t stage = Mob::BurnStageOfMaterialName(mats[i].name);
+    const uint8_t stage = mats[i].burnStage;
     if (stage == 1) bm.cooked.push_back((uint32_t)i);
     if (stage == 2) bm.charred.push_back((uint32_t)i);
   }

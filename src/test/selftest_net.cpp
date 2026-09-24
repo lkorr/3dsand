@@ -36,12 +36,16 @@
 // testing a second implementation and would keep passing while the shipped one
 // was broken — the "fixture that measures itself" failure.
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
+#include <span>
 #include <string>
 #include <vector>
 
+#include "game/avatar.h"
+#include "game/session.h"
 #include "net/authority.h"
 #include "net/link.h"
 #include "net/opsync.h"
@@ -1773,6 +1777,132 @@ Status GateStoreSync(Ctx& c, std::string& detail) {
   return pinOk ? Status::Pass : Status::Fail;
 }
 
+// ---- blast-players ----------------------------------------------------------
+//
+// ONE PLAYER'S GRENADE HITS THE OTHER PLAYER (W1-F, 2026-09-24).
+//
+// Phase K used to carve and launch THE SESSION'S OWN avatar beside the NPC
+// calls, so with two players the thrower's blast reached the thrower and
+// nobody else: B could stand on A's grenade untouched. The body pass is now
+// `ExplosionHitsBodies` (session.h) and every player is reached through
+// MobSystem's registered avatars. The gate calls that function -- the code
+// phase K runs -- rather than restating it. CPU + Jolt only: no tick, no
+// worldgen, nothing pinned.
+//
+//   (a) TWO LOCAL PLAYERS. A's blast at B's chest: B loses voxels AND goes
+//       limp; A, 80 voxels off, loses nothing and stays up (the reach is the
+//       blast's, not "every avatar"). B's limbs are in the impulse skip list.
+//   (b) B IS A PEER'S GHOST (`SetAvatars(.., localCount = 1)`): the same
+//       blast carves it (the melee rule: presentation) and does NOT launch it
+//       -- a ghost's position is the wire's.
+namespace blastp {
+
+struct BlastArm {
+  uint32_t lostA = 0, lostB = 0;
+  bool limpA = false, limpB = false;
+  bool bSkipped = false;  // B's limb bodies were in AppendLiveLimbBodies
+  size_t spawns = 0;
+  std::string why;
+};
+
+uint32_t AvatarVoxels(const PlayerAvatar& av) {
+  uint32_t n = 0;
+  for (int i = 0; i < av.PartCount(); i++) n += av.PartVoxelCount(i);
+  return n;
+}
+
+void RunBlastArm(Ctx& c, bool bIsGhost, BlastArm& r) {
+  c.debris.Reset();
+  c.mobs.Reset(true);
+  const IVec3 wo = c.world.WindowOrigin();
+  const int cx = (wo.x + (int)kNChunk / 2) * (int)kChunk;
+  const int cz = (wo.z + (int)kNChunk / 2) * (int)kChunk;
+  const int gy = World::TerrainHeight(cx, cz, c.world.WorldSeed());
+  // Well above the ground: nothing but the blast may touch either body.
+  const float y = (float)(gy + 40) + Player::kHalfY;
+  Player pa, pb;
+  pa.fly = pb.fly = true;
+  pa.pos = Vec3{(float)cx + 80.5f, y, (float)cz + 0.5f};
+  pb.pos = Vec3{(float)cx + 0.5f, y, (float)cz + 0.5f};
+  pa.SnapRender();
+  pb.SnapRender();
+  PlayerAvatar a(0x5A11EDU), b(0x5A11EDU + 1);
+  a.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  b.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+  a.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  b.SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  if (!a.HasDef() || !a.Spawn(pa, 0.0f) || !b.Spawn(pb, 0.0f)) {
+    r.why = std::string("could not spawn two \"") + kAvatarDefName + "\" avatars";
+    a.Despawn();
+    b.Despawn();
+    return;
+  }
+  Mob* avs[2] = {&a, &b};
+  c.mobs.SetAvatars(std::span<Mob* const>(avs, 2), bIsGhost ? 1 : 2);
+
+  std::vector<uint64_t> skip;
+  c.mobs.AppendLiveLimbBodies(skip);
+  const uint64_t bBody = b.PartBody(0);
+  r.bSkipped = bBody != 0 &&
+               std::find(skip.begin(), skip.end(), bBody) != skip.end();
+
+  const uint32_t a0 = AvatarVoxels(a), b0 = AvatarVoxels(b);
+  const auto& g = CurrentTuning().grenade;
+  // 12 voxels to B's side at chest height: close enough that the crater
+  // bites B's near flank, far enough that it does not kill (a grenade AT the
+  // chest takes the whole body, and a dead body is not launched), and well
+  // inside the launch reach (radius x ragdoll.blastRadiusScale).
+  const ExplosionOp e{ifloor(pb.pos.x) - 12, ifloor(pb.pos.y),
+                      ifloor(pb.pos.z), g.blastRadius, g.blastPower, 0, 0, 0};
+  std::vector<ParticleSpawn> spawns;
+  ExplosionHitsBodies(e, c.world, c.phys, c.debris, c.mobs, spawns);
+  const uint32_t a1 = AvatarVoxels(a), b1 = AvatarVoxels(b);
+  r.lostA = a0 > a1 ? a0 - a1 : 0;
+  r.lostB = b0 > b1 ? b0 - b1 : 0;
+  r.limpA = a.Ragdoll() == Mob::RagdollPhase::Limp;
+  r.limpB = b.Ragdoll() == Mob::RagdollPhase::Limp;
+  r.spawns = spawns.size();
+
+  // Leave nothing behind: limb bodies, severed limbs adopted by debris, and
+  // the avatar list are all shared with the next gate.
+  c.mobs.SetAvatars({});
+  a.Despawn();
+  b.Despawn();
+  c.debris.Reset();
+  c.mobs.Reset(true);
+}
+
+}  // namespace blastp
+
+Status GateBlastPlayers(Ctx& c, std::string& detail) {
+  blastp::BlastArm local, ghost;
+  blastp::RunBlastArm(c, false, local);
+  if (local.why.empty()) blastp::RunBlastArm(c, true, ghost);
+  const std::string why = !local.why.empty() ? local.why : ghost.why;
+  if (!why.empty()) {
+    detail = why;
+    std::printf("blast-players: FAIL (%s)\n", why.c_str());
+    return Status::Fail;
+  }
+  const bool localOk = local.lostB > 0 && local.limpB && local.lostA == 0 &&
+                       !local.limpA && local.bSkipped;
+  const bool ghostOk = ghost.lostB > 0 && !ghost.limpB && ghost.bSkipped;
+  char buf[400];
+  std::snprintf(buf, sizeof buf,
+                "local B: -%u vox, %s, in skip list %d | A (80 vox off): -%u "
+                "vox, %s | ghost B: -%u vox, %s (want carved, NOT launched) | "
+                "spawns %zu / %zu",
+                local.lostB, local.limpB ? "launched" : "NOT LAUNCHED",
+                local.bSkipped ? 1 : 0, local.lostA,
+                local.limpA ? "LAUNCHED" : "standing", ghost.lostB,
+                ghost.limpB ? "LAUNCHED" : "not launched", local.spawns,
+                ghost.spawns);
+  detail = buf;
+  const bool ok = localOk && ghostOk;
+  std::printf("blast-players: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& NetGates() {
@@ -1791,6 +1921,9 @@ const std::vector<Gate>& NetGates() {
       // It regenerates at the origin on the way out, so the gate after it
       // starts where it always did.
       {"store-sync", "net", {}, false, GateStoreSync},
+      // W1-F. CPU + Jolt only: two avatars and one ExplosionHitsBodies call.
+      // Resets debris and mobs on the way in and out.
+      {"blast-players", "net", {}, false, GateBlastPlayers},
   };
   return g;
 }

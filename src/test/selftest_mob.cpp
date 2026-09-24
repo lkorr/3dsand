@@ -3845,6 +3845,207 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     debris.Reset();
   }
 
+  // ---- K. A CHARRED LIMB SLEEPS (W1-F, 2026-09-24) -------------------------
+  //
+  // flesh_charred / flesh_cooked / cloth_charred own ONLY neighbour-gated self
+  // rules (relight under a hot front, crumble under one). Counted as
+  // self-active they sat on the burn front forever, so a live limb carrying
+  // char read `alight`, rebuilt its burn index every tick and never reached
+  // the sleepKey -- the light-gated-rules-never-sleep trap on the living side
+  // (debris.cpp had already split them out as matSelfScaled_). The "you
+  // walked out of the fire" case: light a patch of an arm's skin, put the
+  // fire out, and ask the burn pass's own bookkeeping. Every limb carrying
+  // char must be off the front with its latch cleared, and must sleep
+  // whenever an unburnt limb of the same creature does. Its own fixture
+  // because F's creature is still burning somewhere at the end of F (a slow
+  // tail F allows), and heat from a neighbour keeps a limb awake for a reason
+  // that is not its char. Measured before the fix: 6 limbs carrying 185
+  // burnt voxels, all 6 alight on a 193-voxel front, 0 asleep.
+  {
+    debris.Reset();
+    mobs.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const IVec3 site = fixture(290);
+    const int h = World::TerrainHeight(site.x, site.z, kDefaultSeed);
+    pchunk = IVec3{site.x >> 4, h >> 4, site.z >> 4};
+    const uint64_t id = mobs.Spawn(wizDef, {site.x, h + 1, site.z});
+    if (!id) {
+      detail = "spawn refused";
+      return Status::Fail;
+    }
+    // Pinned: this fixture ticks the creature for over a thousand ticks, and
+    // a human under its default profile walks -- off the window, in the
+    // limit (gotcha-burning-npc-runs-off-the-window). `dummy` is the authored
+    // profile whose whole content is `mobile: false`.
+    mobs.SetMobBehavior(id, "dummy");
+    for (int i = 0; i < 12; i++) burnTick(id, 0, 0);  // settle onto the ground
+    int armLimb = -1;
+    for (int li = 0; li < nLimbs; li++)
+      if (mobs.Defs()[wizDef].limbs[li].name == "armU.L") armLimb = li;
+    // Lit, allowed to char, then PUT OUT with water. Left alone a fire does
+    // not gutter on a human: measured, 60 and even 12 lit skin voxels spread
+    // over the whole body and it died "burnt past the death knot" -- and a
+    // dead creature's limbs are debris, not the population this claim is
+    // about. The douse is the extinguisher rule (flesh_burning + water).
+    const uint32_t lit =
+        armLimb >= 0 ? mobs.IgniteLimb(id, armLimb, 60u, mSkin) : 0u;
+    for (int i = 0; i < 30 && mobs.IsAlive(id); i++) burnTick(id, 0, 0);
+    // Until the fire is out, bounded: the claim is about the state AFTER it.
+    // Water for the first stretch only, so the world around the body can
+    // drain and settle before the sleep is asked for.
+    int outAt = -1;
+    for (int i = 0; i < 4000 && mobs.IsAlive(id); i++) {
+      burnTick(id, i < 90 ? mWater : 0u, 18);
+      if (mobs.IsAlive(id) && burning(id) == 0 && census(id, mBurning) == 0 &&
+          census(id, mClothBurn) == 0 && census(id, mUnderBurn) == 0) {
+        outAt = i;
+        break;
+      }
+    }
+    // "Carries char" = any voxel of an authored burn stage (materials.json
+    // burnStage), the same field the burn cap counts with.
+    struct KCensus {
+      uint32_t charLimbs = 0, charVox = 0, awake = 0, asleep = 0, front = 0;
+      uint32_t charOnFront = 0;  // THE claim: front voxels that are char
+      // The CONTROL: the same creature's limbs that never burnt, in the same
+      // world at the same tick. Whatever keeps them from sleeping is not char.
+      uint32_t cleanLimbs = 0, cleanAsleep = 0;
+    };
+    auto kCensus = [&](bool print) {
+      KCensus k;
+      if (!mobs.IsAlive(id)) return k;
+      for (int li = 0; li < nLimbs; li++) {
+        uint32_t ch = 0;
+        for (size_t m = 1; m < mats.size(); m++)
+          if (mats[m].burnStage)
+            ch += mobs.LimbMaterialCount(id, li, (uint32_t)m);
+        if (ch == 0) {
+          k.cleanLimbs++;
+          if (mobs.LimbBurnStateOf(id, li).asleep) k.cleanAsleep++;
+          continue;
+        }
+        k.charVox += ch;
+        k.charLimbs++;
+        const MobSystem::LimbBurnProbe pr = mobs.LimbBurnStateOf(id, li);
+        k.front += pr.front;
+        k.charOnFront += pr.frontBurnt;
+        if (pr.asleep) k.asleep++;
+        // Off the front but not asleep: say which half of the idle test is
+        // missing. An index still held with `quiet` stuck low is something
+        // reactive near the limb (the walk found it); no index and no sleep
+        // is the walk's own precondition (an uncached chunk, a sibling's heat).
+        if (print && !pr.asleep && !pr.alight && !pr.front) {
+          // ...and WHAT the walk is seeing: the hot / non-inert cells in a
+          // small box round the limb, from the same cache the walk reads.
+          const Vec3 at = mobs.LimbVoxelPos(id, li, 0);
+          std::string near;
+          uint32_t nHot = 0;
+          for (int dy = -3; dy <= 3; dy++)
+            for (int dz = -3; dz <= 3; dz++)
+              for (int dx = -3; dx <= 3; dx++) {
+                const IVec3 cell{ifloor(at.x) + dx, ifloor(at.y) + dy,
+                                 ifloor(at.z) + dz};
+                const CachedChunk* cc =
+                    world.Cached({cell.x >> 4, cell.y >> 4, cell.z >> 4});
+                if (cc == nullptr || cc->voxels.size() != kChunkVol) continue;
+                const uint32_t m =
+                    cc->voxels[(((uint32_t)cell.z & 15u) * kChunk +
+                                ((uint32_t)cell.y & 15u)) * kChunk +
+                               ((uint32_t)cell.x & 15u)] & 0xFFFu;
+                if (m == 0 || m >= mats.size()) continue;
+                bool hot = false;
+                for (const std::string& t : mats[m].tags)
+                  if (t == "hot") hot = true;
+                if (!hot && mats[m].gpu.reactCount == 0) continue;
+                if (hot) nHot++;
+                if (near.find(mats[m].name) == std::string::npos &&
+                    near.size() < 120)
+                  near += (near.empty() ? "" : ",") + mats[m].name;
+              }
+          std::printf("    not asleep limb %d: index %s, quiet %u; within 3 "
+                      "cells: %u hot, reactive [%s]\n", li,
+                      pr.indexed ? "held" : "released", pr.quiet, nHot,
+                      near.c_str());
+        }
+        if (!pr.alight && !pr.front) continue;
+        k.awake++;
+        // Attribution at the point of failure (CLAUDE.md rule 6): WHICH
+        // material is holding this limb's front.
+        if (print)
+          std::printf("    awake limb %d: front %u (%u char; mostly %u x %s), "
+                      "alight %d\n",
+                      li, pr.front, pr.frontBurnt, pr.frontMatCount,
+                      pr.frontMat < mats.size() ? mats[pr.frontMat].name.c_str()
+                                                : "?",
+                      pr.alight ? 1 : 0);
+      }
+      return k;
+    };
+    // Other self-active matter on a burnt limb is legitimately on the front
+    // and finite: measured, the only thing left there was body `blood` (decay
+    // to air, 8 per mille a tick). So the limbs are given until every charred
+    // limb has left the front -- bounded -- and the assertion is on char.
+    const KCensus k0 = kCensus(false);
+    // The per-tick test reads only the burn pass's own bookkeeping (cheap);
+    // the material census above walks every voxel and is taken twice.
+    std::vector<int> charred;
+    for (int li = 0; li < nLimbs; li++) {
+      uint32_t ch = 0;
+      for (size_t m = 1; m < mats.size() && ch == 0; m++)
+        if (mats[m].burnStage) ch += mobs.LimbMaterialCount(id, li, (uint32_t)m);
+      if (ch) charred.push_back(li);
+    }
+    auto anyAwake = [&]() {
+      for (int li : charred) {
+        const MobSystem::LimbBurnProbe pr = mobs.LimbBurnStateOf(id, li);
+        if (pr.alight || pr.front) return true;
+      }
+      return false;
+    };
+    int settled = -1;
+    for (int i = 0; i < 1500 && mobs.IsAlive(id); i++) {
+      burnTick(id, 0, 0);
+      // Past the index's release grace (kBurnIndexGrace) before asking.
+      if (i >= 40 && !anyAwake()) {
+        settled = i;
+        break;
+      }
+    }
+    // Off the front, the idle exit still holds the index for kBurnIndexGrace
+    // (30) quiet ticks before releasing it, and the sleep engages on the walk
+    // AFTER the release.
+    for (int i = 0; i < 40 && mobs.IsAlive(id); i++) burnTick(id, 0, 0);
+    const KCensus k = kCensus(true);
+    // Char never holds a front, before OR after the finite tail drains, and
+    // every charred limb then leaves the front with its latch cleared -- the
+    // two things that kept it from the idle exit. Whether the sleepKey then
+    // engages is the idle walk's own business (cached chunks, no foreign
+    // heat), so it is asserted AGAINST THE CONTROL rather than absolutely: a
+    // charred limb must sleep whenever an unburnt limb of the same creature
+    // does. Measured 2026-09-24: in this harness NO limb sleeps, burnt or not
+    // (0 of 10 unburnt), with the index held and `quiet` resetting -- a
+    // harness property, recorded here rather than papered over.
+    const bool kOk = lit > 0 && outAt >= 0 && k.charLimbs > 0 &&
+                     k0.charOnFront == 0 && k.charOnFront == 0 &&
+                     k.awake == 0 && (k.cleanAsleep == 0 || k.asleep > 0);
+    std::printf(
+        "  charred limbs sleep: %s (%u lit, out at t+%d; %u limbs carry %u "
+        "burnt voxels; char on the front %u -> %u; right after: %u limbs "
+        "alight/fronted, front %u; off the front at t+%d: %u awake, %u asleep; "
+        "control: %u of %u unburnt limbs asleep)\n",
+        kOk ? "PASS" : "FAIL", lit, outAt, k.charLimbs, k.charVox,
+        k0.charOnFront, k.charOnFront, k0.awake, k0.front, settled, k.awake,
+        k.asleep, k.cleanAsleep, k.cleanLimbs);
+    if (!mobs.IsAlive(id))
+      std::printf("    creature died: %s (the claim is about a LIVE limb)\n",
+                  mobs.DeathCause(id));
+    std::fflush(stdout);
+    ok = ok && kOk;
+    mobs.Reset();
+    debris.Reset();
+  }
+
   // ---- H. FIRE EATS BEFORE IT TAKES, AND WHAT IT LEAVES IS CHAR -----------
   // Subtest F asserts the burn FRONT reaches zero, and that is a different
   // claim: the front is a list of cells in the burn INDEX, and every carve

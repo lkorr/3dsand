@@ -187,7 +187,10 @@ void RemotePlayersSyncAvatars(RemotePlayers& remotes, MobSystem& mobs,
   // the local player instead.
   for (std::unique_ptr<RemotePlayer>& r : remotes.list)
     all.push_back(static_cast<Mob*>(&r->avatar));
-  mobs.SetAvatars(std::span<Mob* const>(all.data(), all.size()));
+  // The sessions' count rides along so the blast can tell a local body it
+  // may launch from a ghost it may not (MobSystem::BlastMobsRadial).
+  mobs.SetAvatars(std::span<Mob* const>(all.data(), all.size()),
+                  sessionAvatars.size());
   remotes.dirty = false;
 }
 
