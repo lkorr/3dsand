@@ -1176,7 +1176,13 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
 // mass-weighted by materials[].density and the grid divides by mass, so the
 // same pressure field pushes the light liquid up through the heavy one.
 //
-// Fixture: fluid-det's stone basin (taller) filled wall to wall with two
+// Fixture: fluid-det's basin (taller, and GLASS: since W1-B1 excited acid
+// runs its own rules, and acid eats stone (-> gravel -> sand) and anything
+// tag:dissolvable, so a stone basin spent the acid on its walls and both arms
+// lost live particles alike — measured on the wave-1 tree, A 1.04 vs B 1.09.
+// Glass carries only `meltable`; no acid or water rule names it, and acid and
+// water have no rule against each other, so every particle's fate here is
+// the solver's) filled wall to wall with two
 // liquids, `L` cells of each (fluidIdentityLayerCells), spawned one cell-row
 // per tick, bottom first. The interface is NOT flat: under a central 7x7
 // patch it sits `D` cells lower (fluidIdentityDipCells), so the top liquid
@@ -1270,10 +1276,10 @@ Status GateFluidIdentity(Ctx& c, std::string& detail) {
     };
     for (int z = -R - 1; z <= R + 1; z++)
       for (int x = -R - 1; x <= R + 1; x++) {
-        put(px + x, py - 1, pz + z, kMatStone);
+        put(px + x, py - 1, pz + z, kMatGlass);
         bool rim = (x < -R || x > R || z < -R || z > R);
         for (int y = 0; y < H; y++)
-          put(px + x, py + y, pz + z, rim ? kMatStone : kMatAir);
+          put(px + x, py + y, pz + z, rim ? kMatGlass : kMatAir);
       }
     uint32_t fluidN = 0;
     uint32_t ft = 40000;
