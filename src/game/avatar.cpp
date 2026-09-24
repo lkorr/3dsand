@@ -2720,7 +2720,10 @@ void PlayerAvatar::BurnParts(uint32_t tick, World& world,
   // burst this tick queued (Mob::StainTick / MobSystem::SplatterOnto). Its
   // own budget, for the reason the burn budget above is its own.
   uint32_t stainBudget = 8192;
-  StainTick(tick, world, stainBudget);
+  // Rain's own pot, as the crowd's is (MobSystem::kRainLatticePerTick): the
+  // player in a storm must not dry-starve its own contact/drying passes.
+  uint32_t rainBudget = 8192;
+  StainTick(tick, world, stainBudget, rainBudget);
   if (sys_) sys_->SplatterOnto(*this);
 }
 

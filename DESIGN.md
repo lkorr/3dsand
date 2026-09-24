@@ -11657,7 +11657,14 @@ column probe without the daylight half) has its world-up-facing voxels take one
 level of water, sampled every 5 ticks at 1479 x (rain/255)^4 voxels a visit — a
 fourth power so a storm soaks ~20x faster than a drizzle — rinsing a foreign
 coat a level first, capped at 12 x rain/255; the existing wet lifecycle (wick,
-drip, dry) does the rest. Gated by `--gate mob-rain`.
+drip, dry) does the rest. Its samples come out of a pot of their OWN
+(`kRainLatticePerTick`, 16,384 a tick over every creature and corpse; the
+player's own 8,192), never the shared stain budget: at ~1,200 a storm visit,
+seven creatures in the rain used to starve the contact and drying passes and
+every corpse. A limb whose sampled surface is all at the cap backs off
+(`BodyBurnState::rainSated`: after two fruitless visits it is visited one
+cadence in eight) so a saturated corpse stops rebuilding its index every visit.
+Gated by `--gate mob-rain`.
 
 **The deck's base jitter is capped in metres** (`cloudBaseJitterM`,
 common.wgsl): 10% of the thickness, at most 150 m. It was 10% uncapped, and the
@@ -14243,7 +14250,13 @@ micro brick so the coat is drawn where it went, and runs the material's
 default 0.5-voxel brush spends `container.applyCells` a second -- twice the
 radius, four times the drain -- paid in eighths off a milli-eighth accumulator
 and only on ticks the ray meets skin.
-Worn shells are not hit: the ray passes through armour to the body. The old
+Worn shells ARE hit, on purpose: they are rig slots like any limb, so the ray
+meets the armour first and the pour coats the plate, not the skin under it --
+the same rule the splatter replay follows (a splash thrown at a plated limb is
+caught by the plate; `SplatterView` asks the worn-shell probe back along each
+landing droplet's path). Both read the pose into a LOCAL (`Mob::PickPose`):
+the pick runs every frame from the portrait, outside the tick, and must not
+write a live limb's `xf`. The old
 click-a-limb pour (`InspectApplyPicks`) is gone; `DouseLimb` stays as the
 whole-limb door for gates and tools. Vocabulary: `stanch` (the cauterise rule's
 three fields -- bleedBudget, stumpOpen, gushTicks) and `disinfect` (a bite's

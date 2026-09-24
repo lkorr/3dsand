@@ -375,7 +375,10 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     // be gone, rather than tunnelling upward through solid rock.
     if (isMicro(p)) {
       p.flags |= PFLAG_PENDING;
-      atomicMax(&claim[claimSlot(cellIndexW(startCell))], microStainPriority(p));
+      // A DRIP never claims (see the landing site below for why).
+      if ((p.flags & PFLAG_DRIP) == 0u) {
+        atomicMax(&claim[claimSlot(cellIndexW(startCell))], microStainPriority(p));
+      }
       append(p);
       return;
     }
@@ -562,7 +565,15 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
       if (isMicro(p)) {
         p.px = sx; p.py = sy; p.pz = sz;
         p.flags |= PFLAG_PENDING;
-        atomicMax(&claim[claimSlot(cellIndexW(cell))], microStainPriority(p));
+        // A DRIP lands without a mark (resolve returns before it reads the
+        // claim), so it must not TAKE the claim either: its priority could
+        // out-max a real droplet's on the same cell, and that droplet then
+        // lost to a drop that writes nothing -- a stain that should have been
+        // there was silently dropped. Not claiming at all is the deterministic
+        // "drips always lose": the claim is decided among real droplets only.
+        if ((p.flags & PFLAG_DRIP) == 0u) {
+          atomicMax(&claim[claimSlot(cellIndexW(cell))], microStainPriority(p));
+        }
         append(p);
         return;
       }

@@ -2304,6 +2304,151 @@ Status GateLoot(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ============================================================================
+// splatter-armor -- a SPLASH thrown at a plated limb is caught by the plate.
+//
+// Audit 2026-09-23: MobSystem::SplatterView flew each droplet against one
+// limb's lattice at a time and never asked whether a worn shell was in the
+// way, so an acid flask breaking against a man in plate (container.cpp) coated
+// the skin UNDER the plate and the coat then ate the torso -- the exact thing
+// StainOneLimb's contact pass had refused since armor-react. Pose ticks only,
+// no world submit. The same acid burst, the same geometry, thrown at the torso
+// of two creatures of the stock rig from half a metre in front:
+//   * BARE: the torso takes the coat (the control -- a burst that reached
+//     nothing would also leave a plated torso clean).
+//   * PLATED (an enclosing steel shell over the torso, armor-react's fixture):
+//     the skin under the plate takes NOTHING, and the worn-shell probe says it
+//     was the plate that caught the droplets (WornStats::splatBlocked), not a
+//     burst that missed.
+// ============================================================================
+Status GateSplatterArmor(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  uint32_t mAcid = 0, mSteel = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "acid") mAcid = (uint32_t)i;
+    if (c.mats[i].name == "steel") mSteel = (uint32_t)i;
+  }
+  if (!mAcid || !mSteel) {
+    detail = "acid or steel missing from materials.json";
+    return Status::Fail;
+  }
+  int avDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) avDef = (int)i;
+  if (avDef < 0) {
+    detail = Format("no '%s' def to dress", kAvatarDefName);
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[avDef];
+  // armor-react's subject and for its reason: the torso is the one part
+  // several grid cells across, so "outside the plate" is a place.
+  int torso = -1;
+  for (size_t i = 0; i < def.limbs.size(); i++)
+    if (def.limbs[i].tag == "spine" && (int)i != def.rootLimb) {
+      torso = (int)i;
+      break;
+    }
+  if (torso < 0) {
+    detail = Format("'%s' has no non-root spine part to cover", kAvatarDefName);
+    return Status::Skip;
+  }
+  MicroBodySet fixtureMicro;
+  const ItemDef plate =
+      MakeEnclosingFixture("fixture_splash_plate", ItemKind::ArmorShoulders,
+                           def, def.limbs[torso].name, mSteel, 2, fixtureMicro);
+  if (plate.cover.empty()) {
+    detail = "could not build an enclosing shell over " + def.limbs[torso].name;
+    return Status::Fail;
+  }
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  struct Arm {
+    bool ran = false;
+    uint32_t coat = 0, plateCoat = 0, blocked = 0, passed = 0;
+  };
+  uint32_t tick = 47000;
+  auto poseTick = [&]() {
+    ++tick;
+    std::vector<BrushOp> ops;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cellOps;
+    mobs.PreTick(tick, c.world, ops, cellOps, spawns);
+    c.phys.Step(kTickDt);
+    mobs.PostStep();
+  };
+  auto run = [&](bool plated) {
+    Arm a;
+    mobs.Reset();
+    c.debris.Reset();
+    const IVec3 org = c.world.WindowOrigin();
+    const int x = org.x * (int)kChunk + 300, z = org.z * (int)kChunk + 300;
+    const uint64_t id =
+        mobs.Spawn(avDef, IVec3{x, World::TerrainHeight(x, z, kDefaultSeed) + 1, z});
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    if (!m) return a;
+    mobs.SetMobBehavior(id, "dummy");
+    int shell = -1;
+    if (plated) {
+      if (!m->WearItem(&plate, (int)EquipSlotId::Shoulders)) return a;
+      for (int p = 0; p < m->WornPieceCount(); p++)
+        if (!m->WornSlotsAt(p).empty()) shell = m->WornSlotsAt(p)[0];
+    }
+    for (int i = 0; i < 10; i++) poseTick();
+    // The torso's middle, off its live voxels.
+    const uint32_t n = mobs.LimbVoxelCount(id, torso);
+    if (n == 0) return a;
+    Vec3 mid{0, 0, 0};
+    uint32_t k = 0;
+    for (uint32_t j = 0; j < n; j += std::max(1u, n / 64u), k++)
+      mid += mobs.LimbVoxelPos(id, torso, j);
+    mid = mid * (1.0f / (float)std::max(1u, k));
+    // Thrown at it level from half a metre along +z (front or back, but never
+    // a side, where the arms hang in the way).
+    mobs.ResetWornStats();
+    SplatterEvent ev;
+    ev.origin = mid + Vec3{0.0f, 0.2f, MetresToCells(0.5f)};
+    ev.axis = Vec3{0.0f, 0.0f, -1.0f};
+    ev.cone = 0.2f;
+    ev.reach = MetresToCells(1.5f);
+    ev.speed = MetresToCells(6.0f);
+    ev.life = 40;
+    ev.count = 48;
+    ev.mat = mAcid;
+    ev.amount = 6;
+    ev.tick = tick + 1;
+    ev.seed = 0x5A1A5u;
+    mobs.QueueSplatter(ev);
+    poseTick();
+    a.coat = mobs.LimbCoatMatCount(id, torso, mAcid, 1);
+    a.plateCoat = shell >= 0 ? mobs.LimbCoatMatCount(id, shell, mAcid, 1) : 0u;
+    a.blocked = mobs.Worn().splatBlocked;
+    a.passed = mobs.Worn().splatPassed;
+    a.ran = true;
+    return a;
+  };
+  const Arm bare = run(false);
+  const Arm plated = run(true);
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  RecordObserved("splatterArmorBareCoat", (double)bare.coat);
+  RecordObserved("splatterArmorPlatedCoat", (double)plated.coat);
+  const bool ok = bare.ran && plated.ran && bare.coat > 0 && plated.coat == 0 &&
+                  plated.blocked > 0;
+  detail = Format(
+      "acid burst (48 droplets, 0.5 m) at the torso: bare skin coated %u | "
+      "plated skin coated %u (need 0), plate itself coated %u, landings the "
+      "shell caught %u / reached skin %u%s",
+      bare.coat, plated.coat, plated.plateCoat, plated.blocked, plated.passed,
+      bare.ran && plated.ran ? "" : " (an arm did not run)");
+  std::printf("splatter-armor: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& EquipmentGates() {
@@ -2316,6 +2461,9 @@ const std::vector<Gate>& EquipmentGates() {
       // regenerates the world on the way out — the same discipline (and the
       // same slot in the order) as `mob-burn`.
       {"armor-react", "equipment", {"prefab"}, false, GateArmorReact},
+      // A splash at a plated torso lands on the plate. Pose ticks only; it
+      // regenerates the world on the way out like its neighbour.
+      {"splatter-armor", "equipment", {"prefab"}, false, GateSplatterArmor},
       // Ground items. Makes real bodies at real coordinates and clears them
       // on the way out, so it sits beside the other two rather than near
       // anything that measures a settled world.
