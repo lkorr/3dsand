@@ -172,7 +172,8 @@ class WindPrimSystem {
   // kWindPrimEntrain: a gust that cannot move settled matter has no reason to
   // wake anything, and saying so here is what keeps a decorative spell free.
   //
-  // `occupancy` is the one-tick-latent snapshot's per-slot non-air count, used
+  // `occupancy` is World::Snap()'s (fixed kSnapshotLatency, so deterministic)
+  // per-slot non-air count, used
   // as a filter: a chunk of pure air has nothing to entrain, and skipping it
   // is what turns a fan's footprint from "a cube of sky" into "the surface it
   // is pointed at". Pass an empty span before the first snapshot arrives — the

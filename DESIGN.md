@@ -495,8 +495,22 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   occupancy + `genAct` readback is queued with **no `Wait()`** and a
   `PendingShift` records what is owed. At tick T+K `Stream::Update` polls the
   ticket, runs the same CPU logic as before (act set → `RefilledSlot`, pure sky
-  → `PT_EMPTY`, full → demote copies) and only then writes the act set into
-  both dirty pages. Between T and T+K the plane is resident and drawn but
+  → `PT_EMPTY`, full → the kernel's page-table class, or demote copies when the
+  chunk may have been written since generation) and only then writes the act
+  set into both dirty pages.
+
+  **The `genAct` word is a verdict, not a bit (P4, 2026-09-24).** Bit 0 is
+  still the act set; bits 1..15 are `PageTable::Classify`'s answer for the
+  words `genChunk` just wrote (valid, class EMPTY/UNIFORM/JITTER/needs-page,
+  material — `world.h` `kGenVerdict*`), reduced in-kernel with a second sweep
+  over FULL chunks only. The batched whole-window worldgen (`SubmitWorldgen`)
+  classifies from it too: an 8 KiB readback per 2,048-slot batch instead of a
+  32 MiB `ReadVoxelsSync` (512 MiB per paged regen). A shift's FULL chunk
+  demotes on the verdict when `cpuDirty`, the snapshot dirty flags and the
+  write-reach clock (`ReachTick < genTick`) all prove nothing wrote it since
+  generation; otherwise it takes the word copy as before.
+  `SANDVOX_GEN_VERDICT_CHECK=1` classifies every worldgen batch both ways and
+  counts disagreements. Between T and T+K the plane is resident and drawn but
   nothing dispatches it; a neighbour that writes into it lands on a real page
   (every gen slot has one) and marks it dirty through the ordinary path.
 

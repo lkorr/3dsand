@@ -18,6 +18,24 @@ inline double PtNowMs() {
   return duration<double, std::milli>(steady_clock::now().time_since_epoch())
       .count();
 }
+// The two diagnostic switches this file tested with a getenv() per call --
+// 22 call sites, several of them per tick or per slot. Read ONCE, the way
+// stream.cpp's PtDbg() already does: a switch that changes mid-process is not
+// something any harness relies on, and getenv walks the whole environment
+// block on every call.
+inline bool PtDebug() {
+  static const bool on = getenv("SANDVOX_PT_DEBUG") != nullptr;
+  return on;
+}
+inline bool PtFreeLog() {
+  static const bool on = getenv("SANDVOX_PT_FREELOG") != nullptr;
+  return on;
+}
+// RunCensus's cadence when no diagnostic asks for every tick. The census is
+// two more kNumSlots walks and is only READ by --telemetry's counters, the
+// SANDVOX_PT_DEBUG dump and the --frames exit summary; a peak is still
+// latched on the tick it happens (see ConsumeOccupancy).
+constexpr uint32_t kCensusEveryTicks = 8;
 }  // namespace
 
 // Global scope, matching world.h and sim/world.h's World — this type is a
@@ -86,18 +104,12 @@ void PageTable::Init(const rhi::Device& device, World& world) {
   ResetIdentity(device.GetQueue());
 }
 
-void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
-  auto& t = world_->pageTableCpuMutable();
-  t.assign(kNumSlots, kPtEmpty);
-  freePages_.clear();
-  freePages_.reserve(poolPages_);
-  // Pushed high-to-low so the LIFO pop order starts at page 0, which keeps a
-  // freshly generated world's pages roughly in slot order — nicer to read in a
-  // debugger and marginally friendlier to the cache. Not load-bearing: page
-  // assignment is not part of the world (§3.7, review m4).
-  for (uint32_t i = poolPages_; i-- > 0;) freePages_.push_back(i);
-  pagesInUse_ = 0;
-  queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumSlots * 4);
+// Everything the two bulk resets (ResetAllEmpty / ResetIdentity) clear in
+// common: the fault counter, the pending uploads and fills, every mirror
+// contributor, the retire queue, the streaks and the write-reach clock. ONE
+// copy, because the two used to be verbatim duplicates of this block and a
+// field added to one and not the other is a reset that leaves state behind.
+void PageTable::ClearTransientState(const rhi::Queue& queue) {
   // ZERO THE FAULT COUNTER. It is a permanently-bound atomic that nothing else
   // ever resets, and CreateBuffer does not zero — so without this it starts at
   // whatever the driver left behind (measured 134,217,728 == 2^27 on a 3060
@@ -132,6 +144,22 @@ void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
   // snapshot that POSTDATES it may be trusted to describe them.
   reachTick_.assign(kNumSlots, tick_);
   totals_ = PageCensus{};
+  consumedOccValid_ = false;   // the next snapshot is a new world's
+}
+
+void PageTable::ResetAllEmpty(const rhi::Queue& queue) {
+  auto& t = world_->pageTableCpuMutable();
+  t.assign(kNumSlots, kPtEmpty);
+  freePages_.clear();
+  freePages_.reserve(poolPages_);
+  // Pushed high-to-low so the LIFO pop order starts at page 0, which keeps a
+  // freshly generated world's pages roughly in slot order — nicer to read in a
+  // debugger and marginally friendlier to the cache. Not load-bearing: page
+  // assignment is not part of the world (§3.7, review m4).
+  for (uint32_t i = poolPages_; i-- > 0;) freePages_.push_back(i);
+  pagesInUse_ = 0;
+  queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumSlots * 4);
+  ClearTransientState(queue);
 }
 
 void PageTable::ResetIdentity(const rhi::Queue& queue) {
@@ -174,40 +202,7 @@ void PageTable::ResetIdentity(const rhi::Queue& queue) {
   // kPoolPages sizing attempt. The high-water is real demand only if its sole
   // writer is Alloc().
   queue.WriteBuffer(world_->pageTable, 0, t.data(), (uint64_t)kNumSlots * 4);
-  // ZERO THE FAULT COUNTER. It is a permanently-bound atomic that nothing else
-  // ever resets, and CreateBuffer does not zero — so without this it starts at
-  // whatever the driver left behind (measured 134,217,728 == 2^27 on a 3060
-  // Ti). Every gate asserts this counter is zero, so an unzeroed counter made
-  // that assertion unreadable; combined with the reporting bug below it made
-  // "pageFaults == 0" vacuous for the whole phase.
-  const uint32_t faultZero[kPageFaultWords] = {};
-  queue.WriteBuffer(world_->pageFaults, 0, faultZero, sizeof(faultZero));
-  tableDirty_.clear();
-  std::fill(tableDirtyMark_.begin(), tableDirtyMark_.end(), (uint8_t)0);
-  cpuDirty_.Clear();
-  particleChunks_.Clear();
-  fluidChunks_.Clear();
-  opTargets_.Clear();
-  refilled_.Clear();
-  shell_.Clear();
-  shellSeed_.Clear();
-  shellPending_ = false;
-  shellActive_ = false;
-  shellLinger_ = false;
-  lastSpawnTick_ = -1;
-  settleAnchor_ = -1;
-  cRing_.clear();
-  pendingFills_.clear();
-  pendingJitterFills_.clear();
-  retire_.clear();
-  zeroStreak_.assign(kNumSlots, 0);
-  // The bulk resets are the two paths that hand out pages WITHOUT going
-  // through Materialize or EnsurePageForOverwrite, so they stamp the write-
-  // reach clock themselves (P4-H). `tick_` is right and "never" would be
-  // wrong: worldgen writes every one of these slots at this tick, and only a
-  // snapshot that POSTDATES it may be trusted to describe them.
-  reachTick_.assign(kNumSlots, tick_);
-  totals_ = PageCensus{};
+  ClearTransientState(queue);
 }
 
 uint32_t PageTable::Alloc() {
@@ -415,7 +410,7 @@ void PageTable::SetSentinel(uint32_t slot, uint32_t entry) {
   // Stream's store-hit classification, the shift's sky demote and the demote
   // harvest all arrive here. Keyed on the world chunk so it pairs with the
   // fault record, which is keyed the same way.
-  if ((t[slot] & kPtSentinelBit) == 0u && getenv("SANDVOX_PT_FREELOG")) {
+  if ((t[slot] & kPtSentinelBit) == 0u && PtFreeLog()) {
     const IVec3 wc = world_->SlotToWorldChunk(slot);
     std::printf("[pt-demote] tick %u slot %u chunk (%d,%d,%d) -> 0x%08x\n",
                 tick_, slot, wc.x * (int)kChunk, wc.y * (int)kChunk,
@@ -613,10 +608,38 @@ uint32_t PageTable::Classify(uint32_t slot, const uint32_t* words) const {
 #endif
 }
 
+uint32_t PageTable::ClassifyGenVerdict(uint32_t verdict,
+                                       uint32_t genSeed) const {
+  // Not published (a list past genAct's size, an old kernel, a failed map):
+  // no claim, and "needs a page" is the claim that can never lose a voxel.
+  if ((verdict & kGenVerdictValid) == 0u) return kNeedsPage;
+  const uint32_t cls =
+      (verdict >> kGenVerdictClassShift) & kGenVerdictClassMask;
+  const uint32_t mat = (verdict >> kGenVerdictMatShift) & kPtMatMask;
+  switch (cls) {
+    case kGenVerdictEmpty:
+      return kPtEmpty;
+    case kGenVerdictUniform:
+      // The kernel already applied Classify's SynthWord(entry) == w0 test.
+      return kPtSentinelBit | mat;
+    case kGenVerdictJitter:
+      // Classify's two CPU-side refusals, applied here so the answer stays
+      // Classify's: JITTER off (SANDVOX_NO_JITTER) and a mirror seed that is
+      // not the one the chunk was generated with — Classify compares against
+      // seed_, the kernel against the generating seed, and when they differ
+      // Classify refuses every jittered chunk (see SetWorldSeed).
+      if (!jitterEnabled_ || genSeed != seed_ || mat == kMatAir)
+        return kNeedsPage;
+      return kPtSentinelBit | kPtJitterBit | mat;
+    default:
+      return kNeedsPage;
+  }
+}
+
 // ---- the §3.2 recurrence --------------------------------------------------
 
 void PageTable::BeginTick(uint32_t tick) {
-  if (getenv("SANDVOX_PT_DEBUG") && (allocsMat_ | allocsOvr_))
+  if (PtDebug() && (allocsMat_ | allocsOvr_))
     std::printf("[pt] tick %u..%u allocs: mat=%u ovr=%u refills=%u inUse=%u origin=%d,%d,%d\n",
                 tick_, tick, allocsMat_, allocsOvr_, refills_, pagesInUse_,
                 world_->WindowOrigin().x, world_->WindowOrigin().y,
@@ -760,15 +783,19 @@ void PageTable::TightenFromSnapshot(const std::vector<uint8_t>& dirtyFlags,
   // dirtyFlags(S) == dirtyIn(S+1) EXACTLY, so rolling it forward the
   // (M-S-1) ticks since gives a SECOND superset of dirtyIn(M). Both operands
   // of the intersection are supersets, so the result is a superset and is at
-  // least as tight as either — that is the whole correctness argument, and it
-  // is why this is an intersection and NEVER an assignment (§3.2, review C1).
+  // least as tight as either — that is the whole correctness argument
+  // (§3.2, review C1). NOTE the growth step at the bottom: the intersection is
+  // followed by a union with the same set, and (A n S) u S == S, so the net
+  // effect today IS an assignment of the rolled-forward snapshot set. The
+  // guards above (ring coverage, roll depth) are what make that assignment a
+  // superset of dirtyIn(M); see the note where it happens.
   const uint32_t rolls = gap - 1;
   // The C(j) union for j in [S+1, M-1] is MANDATORY: a CPU op issued at tick
   // S+1 marks chunks the snapshot never saw, and intersecting them away loses
   // them. If the ring cannot cover the span, SKIP the tightening entirely and
   // let step (1) carry — never tighten with an incomplete superset.
   if (rolls > kCRing) {
-    if (getenv("SANDVOX_PT_DEBUG"))
+    if (PtDebug())
       std::printf("[pt] tick %u SKIP tighten: snapshot %u is %u rolls old\n",
                   encodeTick, snapTick, rolls);
     return;
@@ -776,16 +803,20 @@ void PageTable::TightenFromSnapshot(const std::vector<uint8_t>& dirtyFlags,
   uint32_t oldest = encodeTick;
   for (const CEntry& e : cRing_) oldest = std::min(oldest, e.tick);
   if (rolls > 0 && oldest > snapTick + 1) {
-    if (getenv("SANDVOX_PT_DEBUG"))
+    if (PtDebug())
       std::printf("[pt] tick %u SKIP tighten: C ring starts at %u, need %u\n",
                   encodeTick, oldest, snapTick + 1);
     return;
   }
 
-  SlotSet snap;
+  // Members, not locals: two 4 KiB bitsets plus their member vectors were
+  // allocated and freed every tick. Clear() is O(members), so a settled
+  // world pays nothing for reusing them.
+  SlotSet& snap = tightenSnap_;
+  SlotSet& rolled = tightenRolled_;
+  snap.Clear();
   for (uint32_t i = 0; i < kNumSlots; i++)
     if (dirtyFlags[i]) snap.Add(i);
-  SlotSet rolled;
   for (uint32_t r = 0; r < rolls; r++) {
     rolled.Clear();
     DilateN26(snap, rolled);
@@ -825,13 +856,19 @@ void PageTable::TightenFromSnapshot(const std::vector<uint8_t>& dirtyFlags,
   // fixed point is (GPU-active) u N26(GPU-active) — the same shape the particle
   // flight shell already settles at, and zero when the world is asleep, which
   // is the state rule 2 keeps it in.
-  cpuDirty_.IntersectWith(snap);
-  cpuDirty_.UnionWith(snap);
-  if (getenv("SANDVOX_PT_DEBUG"))
-    std::printf("[pt] tick %u tighten from snap %u (%u rolls): %zu -> %zu "
-                "(snap set %zu)\n",
-                encodeTick, snapTick, rolls, before, cpuDirty_.Size(),
-                snap.Size());
+  //
+  // (cpuDirty n snap) u snap == snap, so this is written as what it is: the
+  // mirror BECOMES the rolled-forward snapshot set. The intersection that used
+  // to precede the union was dead work (a full membership walk per tick) and
+  // made the code read as a narrowing it no longer is. Contributors that must
+  // survive regardless — (c) the wake, (d) refills, (e) the flight shell — are
+  // unioned AFTER this call (Materialize / ApplyParticleShell), unchanged.
+  // A swap, so the outgoing mirror's storage is what tightenSnap_ reuses
+  // (and Clear()s) next tick.
+  std::swap(cpuDirty_, snap);
+  if (PtDebug())
+    std::printf("[pt] tick %u tighten from snap %u (%u rolls): %zu -> %zu\n",
+                encodeTick, snapTick, rolls, before, cpuDirty_.Size());
 }
 
 void PageTable::WakeAll() {
@@ -842,7 +879,7 @@ void PageTable::WakeAll() {
   // ordering reasoning at all, and C(j) would have to carry a 32,768-entry
   // all-ones set (§3.1a).
   cpuDirty_.SetAll();
-  if (getenv("SANDVOX_PT_DEBUG"))
+  if (PtDebug())
     std::printf("[pt] tick %u WAKE-ALL: inUse=%u highWater=%u\n", tick_,
                 pagesInUse_, pagesHighWater_);
 }
@@ -1012,13 +1049,13 @@ void PageTable::ApplyParticleShell(const WorldSnapshot& snap,
   shell_.Clear();
   DilateN26(scratch_, shell_);
   shellPending_ = true;
-  if (getenv("SANDVOX_PT_DEBUG"))
+  if (PtDebug())
     std::printf("[pt] tick %u flight shell: occMatter=%zu shell=%zu\n",
                 tick_, scratch_.Size(), shell_.Size());
 }
 
 void PageTable::Materialize(const rhi::Queue& queue) {
-  const bool matDbg = getenv("SANDVOX_PT_DEBUG") != nullptr;
+  const bool matDbg = PtDebug();
   const double matT0 = matDbg ? PtNowMs() : 0.0;
   // Step (1) of the normative definitions: propagate. Done here rather than in
   // BeginTick because opTargets_/particleChunks_ (= C(N)) are only complete
@@ -1187,7 +1224,7 @@ void PageTable::Materialize(const rhi::Queue& queue) {
   for (uint32_t s : materialized_.Members()) reachTick_[s] = tick_;
   for (uint32_t s : cpuDirty_.Members()) reachTick_[s] = tick_;
 
-  if (getenv("SANDVOX_PT_DEBUG")) {
+  if (PtDebug()) {
     std::printf("[pt] tick %u cpuDirty=%zu hasMatter=%zu mat=%zu ops=%zu part=%zu fluid=%zu inUse=%u aM=%u aO=%u\n",
                 tick_, cpuDirty_.Size(), hasMatterCount, materialized_.Size(),
                 opTargets_.Size(), particleChunks_.Size(), fluidChunks_.Size(),
@@ -1259,7 +1296,7 @@ bool PageTable::ReleasePage(uint32_t slot, uint32_t tick) {
   // cannot be lined up against it after a shift, which is the whole reason
   // the reporter defect was expensive. Same key, both ends, so one grep pairs
   // them.
-  if (getenv("SANDVOX_PT_FREELOG")) {
+  if (PtFreeLog()) {
     const IVec3 wc = world_->SlotToWorldChunk(slot);
     std::printf("[pt-free] tick %u FREED slot %u chunk (%d,%d,%d)\n",
                 tick, slot, wc.x * (int)kChunk, wc.y * (int)kChunk,
@@ -1276,7 +1313,7 @@ bool PageTable::ReleasePage(uint32_t slot, uint32_t tick) {
 
 void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
                                  const std::vector<uint8_t>& occStain,
-                                 uint32_t tick) {
+                                 uint32_t occTick, uint32_t tick) {
   if (!paged_) return;
   if (zeroStreak_.size() != kNumSlots) zeroStreak_.assign(kNumSlots, 0);
   if (reachTick_.size() != kNumSlots) reachTick_.assign(kNumSlots, 0u);
@@ -1302,7 +1339,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
     const char* rc = getenv("SANDVOX_PT_RETIRECAP");
     if (rc) retireCap_ = std::min((uint32_t)std::max(0, atoi(rc)),
                                   (uint32_t)kPageRetireCeiling);
-    if (getenv("SANDVOX_PT_DEBUG"))
+    if (PtDebug())
       std::printf("[pt] free path: mode %d, direct budget %u/tick, probe %zu/tick"
                   ", verify %d\n", freeMode_, freeDirectMax_,
                   kMaxFreeProbesPerTick, (int)verifyFree_);
@@ -1339,7 +1376,20 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   const uint32_t scanStart =
       (uint32_t)((uint64_t)tick * (uint64_t)kMaxFreeProbesPerTick % kNumSlots);
   uint32_t eligible = 0;
-  for (uint32_t i = 0; i < kNumSlots; i++) {
+  // ---- ONE WALK PER SNAPSHOT, NOT PER TICK (L2) ---------------------------
+  //
+  // The walk below advances zeroStreak_ — "consecutive empty SNAPSHOTS" — and
+  // collects candidates from the occupancy it was handed. When no new
+  // snapshot has been delivered since the last call (a frame running several
+  // ticks ahead of the GPU), `occupancy` is the SAME array again: re-walking
+  // it re-counts one observation as several and buys nothing else, because
+  // every decision it could make was made last call on identical data. So
+  // it is skipped; the harvest / release / submit halves below still run, and
+  // a skipped tick simply has no new candidates.
+  const bool freshOcc = !consumedOccValid_ || occTick != consumedOccTick_;
+  consumedOccTick_ = occTick;
+  consumedOccValid_ = true;
+  for (uint32_t i = 0; freshOcc && i < kNumSlots; i++) {
     const uint32_t s = i + scanStart >= kNumSlots ? i + scanStart - kNumSlots
                                                    : i + scanStart;
     if (occupancy[s] != 0) { zeroStreak_[s] = 0; continue; }
@@ -1486,7 +1536,7 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   // to a different world chunk. The slot-to-worldchunk key recorded at submit
   // time is compared at harvest time; a mismatch skips the slot (conservative:
   // keeps the page, exactly like a vanished-page skip).
-  const bool ptDbg = getenv("SANDVOX_PT_DEBUG") != nullptr;
+  const bool ptDbg = PtDebug();
   const double probeT0 = ptDbg ? PtNowMs() : 0.0;
   uint32_t probesRun = 0, probesHarvested = 0;
 
@@ -1680,7 +1730,15 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
   totals_.tFreedPeak = std::max(totals_.tFreedPeak, (uint64_t)pending_.fFreed);
 
   // ---- ATTRIBUTION, after this tick's frees so it describes the result -----
-  RunCensus(occupancy, occStain);
+  //
+  // Not every tick: the census is two more kNumSlots walks whose readers are
+  // --telemetry's counters and the exit/debug prints. It runs every
+  // kCensusEveryTicks, every tick under SANDVOX_PT_DEBUG (the periodic dump
+  // wants its own cadence), and on any tick that set a new residency high
+  // water, so CensusAtHighWater() still latches the peak's own census.
+  if (PtDebug() || !census_.valid || (tick % kCensusEveryTicks) == 0u ||
+      pagesHighWater_ > censusHighMark_)
+    RunCensus(occupancy, occStain);
 }
 
 // Bill every resident page to exactly one reason, and bucket it by height band.
@@ -1690,8 +1748,9 @@ void PageTable::ConsumeOccupancy(const std::vector<uint32_t>& occupancy,
 // COST: two more walks of kNumSlots (one to find each slot column's top of
 // matter, one to bill), on top of the walk ConsumeOccupancy was already doing.
 // Measured shape, not cost: ~98k branch-light iterations per tick, no
-// allocation after the first call, no readback and no GPU work. It runs
-// unconditionally rather than behind SANDVOX_PT_DEBUG because the whole point
+// allocation after the first call, no readback and no GPU work. It runs on a
+// fixed cadence (ConsumeOccupancy: every kCensusEveryTicks, plus every new
+// high water) rather than behind SANDVOX_PT_DEBUG because the whole point
 // is to answer this question from a LIVE session over --telemetry, where no
 // environment variable was set and no harness flag was passed.
 void PageTable::RunCensus(const std::vector<uint32_t>& occupancy,
@@ -1826,7 +1885,7 @@ void PageTable::RunCensus(const std::vector<uint32_t>& occupancy,
     const char* e = getenv("SANDVOX_PT_CENSUS_EVERY");
     return e ? (uint32_t)std::max(1, atoi(e)) : 120u;
   }();
-  if (getenv("SANDVOX_PT_DEBUG") && every && (tick_ % every) == 0u) {
+  if (PtDebug() && every && (tick_ % every) == 0u) {
     char label[64];
     std::snprintf(label, sizeof label, "tick %u", tick_);
     PrintPageCensus(c, label);
@@ -1966,6 +2025,25 @@ void PageTable::FlushTableWrites(const rhi::Queue& queue) {
   // Sorted so contiguous runs coalesce into one write, which the
   // materialization set makes common (a dilated ring is mostly contiguous).
   std::sort(tableDirty_.begin(), tableDirty_.end());
+  // A SPARSE flush becomes ONE covering write. An X-axis shift plane strides
+  // by kNChunk, so its 1,024 slots coalesce into 1,024 separate 4-byte
+  // uploads; past kTableRunsCovering runs it is cheaper to upload the whole
+  // span [first, last] from the CPU table in one write. Rewriting the entries
+  // in between is exact, not merely harmless: the GPU table is written ONLY
+  // from this CPU mirror (no pass writes PageTable), so every one of them
+  // already holds the value being re-sent.
+  constexpr size_t kTableRunsCovering = 64;
+  size_t runs = 1;
+  for (size_t k = 1; k < tableDirty_.size() && runs <= kTableRunsCovering; k++)
+    if (tableDirty_[k] != tableDirty_[k - 1] + 1) runs++;
+  if (runs > kTableRunsCovering) {
+    const uint32_t lo = tableDirty_.front(), hi = tableDirty_.back();
+    queue.WriteBuffer(world_->pageTable, (uint64_t)lo * 4, t.data() + lo,
+                      ((uint64_t)hi - lo + 1) * 4);
+    for (uint32_t s : tableDirty_) tableDirtyMark_[s] = 0;
+    tableDirty_.clear();
+    return;
+  }
   size_t i = 0;
   while (i < tableDirty_.size()) {
     size_t j = i + 1;
@@ -1996,7 +2074,7 @@ uint32_t PageTable::UploadJitterFills(const rhi::Queue& queue) {
   // worth the branch: the counter alone cannot.
   const auto& tj = world_->pageTableCpu();
   for (const PendingJitterFill& f : pendingJitterFills_) {
-    if ((tj[f.slot] & kPtSentinelBit) != 0u && getenv("SANDVOX_PT_FREELOG")) {
+    if ((tj[f.slot] & kPtSentinelBit) != 0u && PtFreeLog()) {
       const IVec3 wc = world_->SlotToWorldChunk(f.slot);
       std::printf("[pt-bad] tick %u jitterfill slot %u chunk (%d,%d,%d): table "
                   "says sentinel 0x%08x, fill entry 0x%08x\n",
@@ -2018,7 +2096,26 @@ uint32_t PageTable::UploadJitterFills(const rhi::Queue& queue) {
 
 void PageTable::DrainFills(const rhi::CommandEncoder& enc) {
   if (pendingFills_.empty()) return;
-  for (const PendingFill& f : pendingFills_) {
+  // ONE vkCmdFillBuffer PER RUN of consecutive pages with the same pattern,
+  // not one per page. The LIFO free list hands out pages in ascending runs
+  // (ResetAllEmpty/ResetIdentity push high-to-low), so a materialized ring is
+  // mostly contiguous and mostly one word (EMPTY's 0): a thousand 16 KiB
+  // fills become a handful of large ones. Nothing reads these pages until the
+  // tick's first row, which the tracker orders after every fill however they
+  // are grouped. STABLE, so that if one page were ever queued twice its fills
+  // would still land in queue order (they are never merged: page+1 fails).
+  std::stable_sort(pendingFills_.begin(), pendingFills_.end(),
+                   [](const PendingFill& a, const PendingFill& b) {
+                     return a.page < b.page;
+                   });
+  size_t i = 0;
+  while (i < pendingFills_.size()) {
+    size_t j = i + 1;
+    while (j < pendingFills_.size() &&
+           pendingFills_[j].page == pendingFills_[j - 1].page + 1 &&
+           pendingFills_[j].word == pendingFills_[i].word)
+      j++;
+    const PendingFill& f = pendingFills_[i];
     // FillTracked (pass::Buf::Voxels + offset) is the phase-4a entry point
     // built for exactly this: an off-table GPU command whose destination
     // offset is chosen at runtime, so it cannot be a table row (a pass::Row
@@ -2028,8 +2125,9 @@ void PageTable::DrainFills(const rhi::CommandEncoder& enc) {
     // barrier automatically (§5.4 (2)).
     enc.FillTracked(pass::Buf::Voxels, world_->voxels,
                     (uint64_t)f.page * kChunkVol * 4,
-                    (uint64_t)kChunkVol * 4, f.word);
-    fillsIssued_++;
+                    (uint64_t)(j - i) * kChunkVol * 4, f.word);
+    fillsIssued_ += (uint64_t)(j - i);  // still counts PAGES filled
+    i = j;
   }
   pendingFills_.clear();
 }
