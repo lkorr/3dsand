@@ -15151,20 +15151,32 @@ window origin (rule 1 below); the HUD has no net line (the `--frames` exit
 report is the readout). Every one of these is listed with its trigger in
 `docs/PLAN_multiplayer_m9.md`.
 
-**Player-on-player damage is author-side only (W1-F, 2026-09-24).** No hit
-crosses the wire. A sword or a grenade resolves on the ATTACKER's machine
+**Player-on-player damage (W1-F, 2026-09-24; owner-side blasts at wave-1
+integration).** A sword or a grenade resolves on the ATTACKER's machine
 against every body that machine holds: NPCs, its own player, and the peer's
 ghost avatar, which is carved as presentation and never launched (the wire
-owns a ghost's position and its alive bit; `remoteplayer.cpp`). The peer's
-real body, on the peer's machine, is untouched. Since W1-F the explosion
+owns a ghost's position and its alive bit; `remoteplayer.cpp`). The explosion
 body pass (`ExplosionHitsBodies`) reaches every registered avatar through
 `MobSystem::CarveMobsRadial` / `BlastMobsRadial` / `AppendLiveLimbBodies`, so
-in-process players hit each other (gate `blast-players`). The owner-side half
-differs by kind: explosions already travel in the merged op batch, so the
-owner can apply a PEER's blast to its own avatar at the landing tick in phase
-N (the crater scan's M9.4-D precedent) with no protocol change — it needs the
-merge to report which explosion indices are remote, as it already does for
-brush ops. Melee has no op to ride, so it needs a hit message.
+in-process players hit each other (gate `blast-players`). **A grenade also
+reaches the peer's REAL body**, with no protocol change: explosions travel in
+the merged op batch, `OpDelayQueue::Merge` reports the merged indices of the
+REMOTE ones (`remoteExpIdx`, as it does for brush ops), and phase N applies
+exactly those to this machine's own avatars at the landing tick
+(`RemoteExplosionsHitOwnAvatars` -> `ExplosionHitsBodies(..,
+BlastBodies::OwnAvatars)`: carve plus launch, no NPC, no debris, no ghost).
+Nothing is applied twice: the author's own blast is LOCAL in its merge (phase
+K hit its bodies when authored), and on the owner's machine the author is a
+ghost, which `OwnAvatars` skips. The gore follows the ghost rule: a ghost's
+carve spawns are discarded on the author's machine (`CarveMobsRadial`'s
+`ghostSpawns_`), and the owner's carve spawns are carried into its NEXT local
+batch (`TickAuthorityCtx::remoteBlastGore`, drained in phase L) because phase
+N runs after the outgoing batch was stored — pushed into the merged batch
+they would reach one GPU only. A remote crater's box is also marked modified
+in phase N, as a remote brush op's is. Still open: a peer's blast does not
+touch this machine's NPCs or debris (the author's machine applies it to its
+own), and melee has no op to ride, so an owner-side sword hit still needs a
+hit message.
 
 **M9 proper (`docs/PLAN_multiplayer_m9.md`, plan of record 2026-09-20).** The
 audit under-stated one number: the residency window is `kWorldN` ×

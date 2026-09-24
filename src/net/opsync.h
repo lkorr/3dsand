@@ -227,10 +227,16 @@ class OpDelayQueue {
   // local ones were marked at their own tick and the remote ones touch chunks
   // this machine never marked.
   //
+  // `remoteExpIdx` (optional) is the same for EXPLOSIONS: the merged indices
+  // of the peer's blasts. Phase N applies exactly those to this machine's own
+  // avatars (session.h RemoteExplosionsHitOwnAvatars) — the owner-side half of
+  // a grenade that the author's machine cannot apply (DESIGN.md s10).
+  //
   // Erases every label at or before this one: labels are consumed in tick
   // order and nothing ever asks for a past one twice.
   OpBatch Merge(uint32_t label, const World& world, MergeStats& st,
-                std::vector<uint32_t>* remoteBrushIdx = nullptr);
+                std::vector<uint32_t>* remoteBrushIdx = nullptr,
+                std::vector<uint32_t>* remoteExpIdx = nullptr);
 
   size_t LabelsHeld() const { return labels_.size(); }
 

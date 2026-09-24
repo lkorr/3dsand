@@ -7904,6 +7904,13 @@ int MobSystem::BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
     if (mob.alive_ && mob.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
       n++;
   // The LOCAL avatars after the NPCs (mob.h: never a ghost's).
+  return n + BlastLocalAvatarsRadial(centerWorldVoxel, radiusVoxels,
+                                     impulseKgMs);
+}
+
+int MobSystem::BlastLocalAvatarsRadial(Vec3 centerWorldVoxel,
+                                       float radiusVoxels, float impulseKgMs) {
+  int n = 0;
   for (size_t i = 0; i < localAvatars_ && i < avatars_.size(); i++) {
     Mob* av = avatars_[i];
     if (av && av->alive_ && !av->limbs_.empty() &&
@@ -17570,9 +17577,24 @@ void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
     mob.CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
   // Then every avatar, ghosts included (mob.h). The empty-limb test is
   // PlayerAvatar::CarveRadial's Spawned() guard.
-  for (Mob* av : avatars_)
+  CarveLocalAvatarsRadial(centerWorldVoxel, radiusVoxels, world, spawns);
+  // A ghost's gore goes to the discard (mob.h): its owner authors it.
+  ghostSpawns_.clear();
+  for (size_t i = localAvatars_; i < avatars_.size(); i++) {
+    Mob* av = avatars_[i];
+    if (av && !av->limbs_.empty())
+      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, ghostSpawns_);
+  }
+}
+
+void MobSystem::CarveLocalAvatarsRadial(Vec3 centerWorldVoxel,
+                                        float radiusVoxels, World& world,
+                                        std::vector<ParticleSpawn>& spawns) {
+  for (size_t i = 0; i < localAvatars_ && i < avatars_.size(); i++) {
+    Mob* av = avatars_[i];
     if (av && !av->limbs_.empty())
       av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
+  }
 }
 
 void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,

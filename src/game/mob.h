@@ -4536,9 +4536,20 @@ class MobSystem {
   // which meant a session's grenade reached ITS OWN avatar and nobody else's.
   // A peer's ghost avatar is carved too — the melee rule (remoteplayer.cpp:
   // local damage to a ghost carves its rig as presentation; the owner decides
-  // its life).
+  // its life). A GHOST'S GORE IS THROWN AWAY (ghostSpawns_, cleared per call),
+  // like every other op a ghost authors: the owner applies the same blast to
+  // its real body at the landing tick (RemoteExplosionsHitOwnAvatars) and its
+  // gore reaches both worlds from there. Emitting it here too would put the
+  // blood in the shared batch twice.
   void CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                        std::vector<ParticleSpawn>& spawns);
+  // Only THIS process's avatars (the leading `localCount` of SetAvatars): the
+  // owner-side half of a PEER's blast. No NPC, no ghost.
+  void CarveLocalAvatarsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
+                               World& world,
+                               std::vector<ParticleSpawn>& spawns);
+  int BlastLocalAvatarsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
+                              float impulseKgMs);
   // The blast's OTHER half: knock every creature in reach off its feet
   // (Mob::BlastRadial). Runs after the carve, on what survived it. Returns
   // how many were knocked down. Covers the LOCAL avatars as well, never a
@@ -5957,6 +5968,7 @@ class MobSystem {
   // lookups can find them. NOT owned and NOT in `mobs_` — see SetAvatars.
   std::vector<Mob*> avatars_;
   size_t localAvatars_ = 0;  // leading entries of avatars_ that are not ghosts
+  std::vector<ParticleSpawn> ghostSpawns_;  // CarveMobsRadial's discard
   uint64_t nextId_ = 1;
   // ---- ownership state (M9.4-B) -------------------------------------------
   // All three are PROCESS state, not world state: none is hashed, none is
