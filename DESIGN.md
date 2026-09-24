@@ -5998,8 +5998,8 @@ running over the baked model.
 
 ### Characters are generated and bred (2026-09-19, thinned to a diff 2026-09-20; `assets/editor/mobgen.js`, `assets/editor/sidecar.js`, `assets/editor/breed.js`, `scripts/gen_mobs.mjs`, gate `node scripts/test_mobgen.mjs`)
 
-A character used to be a Python script. `scripts/gen_human.py` is 1,588 lines
-that run by hand and write one file, and a second character meant a second copy
+A character used to be a Python script. `scripts/gen_human.py` was 1,588 lines
+(deleted 2026-09-24, see below) that ran by hand and wrote one file, and a second character meant a second copy
 of the whole thing — there were three (`gen_mina`, `gen_wizard`, `gen_asha`),
 all subtly diverged, all since deleted. Nothing else could call any of them: the
 tuner could not preview a body it was about to make, and the only way to see a
@@ -6037,20 +6037,24 @@ segment weights are normalised against `MICRO_H` plus the archetype's joint
 overlaps and the residual is handed out one micro at a time, so "longer legs"
 can never also mean "taller".
 
-**The port is pinned to its SOURCE, not to the shipped human.**
-`generateMob(defaultGenome())` with the shoulder round off reproduces
-`gen_human.py`'s output cell for cell, slot for slot and anchor for anchor,
-against a digest in `tests/mobgen_human_ref.json`. It does *not* reproduce
-`assets/mobs/human.vox` — and neither does `gen_human.py`, any more. Measured:
-thirteen of the fifteen limbs are identical to the cell, and the torso and the
-two upper arms differ by 130 cells, every one of them a REMOVAL, all in the
-shoulder, because **the shipped human's shoulders were rounded by hand in the
-model editor**. That sculpting is the entire geometric divergence and is now a
-generator rule (see below). Beyond geometry the shipped human also has an
-anatomized interior, clothing dye in art slots the script never knew about, and
-seven hand-extended sidecar blocks. Pinning to it would pin to a body the
-generator cannot make, so the reference is the generator, and regenerating the
-human is explicitly not part of this (it would move the world hash for nothing). Keeping
+**The port is pinned to the shipped human, not to its source** (since 2026-09-24,
+rule-unification W1-E). It used to be the other way round: `generateMob(defaultGenome())`
+with the shoulder round off reproduced `gen_human.py`'s output cell for cell
+against a digest in `tests/mobgen_human_ref.json`, on the argument that the
+shipped human (anatomized interior, clothing dye, hand-rounded shoulders, seven
+hand-extended sidecar blocks) was a body the generator could not make. That pin
+proved the TRANSLATION and nothing about whether what was translated was
+current, and it was not: the Python was the rig of the day it was written, four
+`human.json` commits never reached it, and every bred character inherited the
+stale side of all four while the pin stayed green (the two agreed on the wrong
+answer). The Python, its reference digest and `test_mobgen.mjs` §A are deleted;
+§L holds the default genome's rig contract to `assets/mobs/human.json`, §M every
+bred character on disk to what its genome generates today, and §K the shoulder
+round to the shipped `human.vox`. What the Python knew that is still true — the
+limb art table and shape builders the stock wardrobe's `fitBox`es are measured
+off — lives on as a library, `scripts/human_art.py`, that writes nothing.
+Regenerating the human is still not a thing: `human.json`/`human.vox` are
+authored truth. When the pin existed, keeping
 the equality exact needed two things worth writing down: `pyRound` reproduces
 Python's half-to-even rounding of the exact binary value (`Math.round` is
 half-up, and the difference shows up in the ear row and in an arm cycle that
@@ -6189,8 +6193,22 @@ expressed against the art's own boxes and a bake that moved a voxel would drift
 the whole rig with nothing to say so. `scripts/anatomize_mob.mjs` remains the way
 to re-bake a mob already on disk, including hand-authored ones.
 
-**Verified** by `node scripts/test_mobgen.mjs` (the cell-for-cell pin, genome
-normalisation, mutate/cross reproducibility and bounds, and ~100 rolled bodies
+**The generator gates run themselves** (2026-09-24). `test_mobgen.mjs`,
+`test_anatomy.mjs` and `test_environment.mjs` were run by nothing automatic, so
+each was green on the day it was written and silent afterwards.
+`scripts/generator_parity.mjs` is now the one place that knows which test reads
+what (a test's import closure, parsed from the sources, plus the data
+directories it opens) and has two callers: `scripts/post_edit_check.sh` runs
+the affected tests after every Edit/Write of an `assets/editor/*.js`,
+`assets/mobs/`, `assets/biomes/` or `assets/trees/` file, and the
+`generator-parity` selftest gate runs all three through an input-hash cache
+(`build/generator_parity.json`: one node start in the steady state, ~20 s after
+an edit). The gate SKIPS without `node` on PATH; tests known red at baseline
+are listed by name in `tests/baseline.json`'s `generatorParityKnownRed`, so one
+red test does not disarm the gate for the others.
+
+**Verified** by `node scripts/test_mobgen.mjs` (the rig contract against
+`human.json`, genome normalisation, mutate/cross reproducibility and bounds, and ~100 rolled bodies
 each asserted sound: anchors inside their own limbs, the eye row on the face,
 one material ≤ 127, art slots only, and every limb ONE CONNECTED PIECE) and by
 `bash scripts/check_characters.sh` (the real module in real headless Chrome: the
@@ -9336,7 +9354,8 @@ Rigs are data. Every new sidecar field (`gait`, `tag`, `chains`, `clips`,
 `flipbooks`, `spring`, `severImpactSpeed`) is optional; `dummy.json` still
 works untouched, its `swingAmp`/`swingPhase` now running as a procedural layer
 *inside* the same pipeline rather than as a parallel code path.
-`assets/mobs/critter.*` (`scripts/gen_critter_mob.py`) is the worked example:
+`assets/mobs/critter.*` (editor-owned; `scripts/gen_critter_mob.py` was deleted
+2026-09-24 when it had stopped reproducing the file) is the worked example:
 a quadruped with two-segment legs (real two-bone IK), diagonal-pair gait
 groups, a spring tail and a masked flinch clip.
 

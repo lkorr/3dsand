@@ -6,6 +6,8 @@
 #   *.wgsl                  -> scripts/check_shaders.sh   (tint --validate)
 #   any "agree in two places" file -> scripts/check_invariants.py
 #   *.wgsl / pass_table.* / simulation.cpp -> scripts/check_pass_table.py
+#   assets/{editor/*.js,mobs,biomes,trees} -> scripts/generator_parity.mjs
+#                          (test_mobgen / test_anatomy / test_environment.mjs)
 #
 # Lives in a script rather than inline in settings.json because the inline
 # version was already an unreadable one-liner with three nested seds, and the
@@ -52,5 +54,25 @@ fi
 if [ -f scripts/check_pass_table.py ]; then
   python scripts/check_pass_table.py "$f" || rc=1
 fi
+
+# The generator data gates (test_mobgen / test_anatomy / test_environment.mjs),
+# which nothing ran before 2026-09-24. generator_parity.mjs owns the routing:
+# it runs only the tests whose import closure or data directories contain the
+# edited file and exits 0 without running anything otherwise, so a UI module or
+# an unrelated asset costs one node start. Needs node; silently skipped without
+# it (the `generator-parity` selftest gate SKIPS the same way).
+# The payload's path is JSON-escaped (doubled backslashes on Windows), so fold
+# every run of backslashes into one forward slash before matching.
+fs=$(printf '%s' "$f" | sed 's#\\\\*#/#g')
+case "$fs" in
+  */assets/editor/*.js|*/assets/mobs/*|*/assets/biomes/*|*/assets/trees/*|\
+  assets/editor/*.js|assets/mobs/*|assets/biomes/*|assets/trees/*|\
+  *scripts/test_mobgen.mjs|*scripts/test_anatomy.mjs|*scripts/test_environment.mjs|\
+  *scripts/generator_parity.mjs)
+    if [ -f scripts/generator_parity.mjs ] && command -v node >/dev/null 2>&1; then
+      node scripts/generator_parity.mjs --changed "$fs" >&2 || rc=1
+    fi
+    ;;
+esac
 
 exit $rc
