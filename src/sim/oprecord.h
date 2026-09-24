@@ -387,6 +387,12 @@ void SetReplay(const Log* log);
 const Log* Replay();
 // While replaying, swap `gas` for the recorded tick's list. No-op otherwise.
 void ReplaceGasIfReplaying(uint32_t tick, std::vector<GasSpawnOp>& gas);
+// While replaying, the recorded tick's TickParams::weatherRain (true + `word`);
+// false otherwise. The rain word carries the dev-panel weather PIN, a human
+// input no other recorded field reproduces, so a replay takes it from the
+// record rather than rebuilding it from whatever the replaying process has
+// pinned (weather::TakeTickRain).
+bool RecordedWeatherRain(uint32_t tick, uint32_t& word);
 
 // While replaying, re-apply this tick's recorded chunk replaces through
 // `stream`. A no-op (one pointer test) otherwise, so the drive loops call it

@@ -11651,6 +11651,25 @@ every combustion ignition is rain-damped (`reactions.json`'s RAIN note); snow
 does neither yet. `weather.rainTouchesWorld` off = the word is 0. Gated by
 `--gate rain-fire` (one leaf sheet, three pinned skies).
 
+**The word is sampled ONCE per tick.** The pin is a human input, so the
+authority latches the word at the head of the tick (`weather::LatchTickRain`,
+`session.cpp`), feeds that value to the CPU body-rain readers, and `SubmitTick`
+takes the same latch for `TickParams` (`weather::TakeTickRain`); paths that
+never latch compute it fresh. Under ops-replay the recorded word is used
+(`opstream::RecordedWeatherRain`), because the pin that shaped it is on no
+other recorded field. `SANDVOX_WEATHER` is read at preset load, so tick 0
+already sees it. The wetness sum's decay weights are literals, not `std::exp`,
+since they reach the hash.
+
+**A second view does not disturb the first.** `WriteRenderParams(...,
+auxView=true)` (the inventory portrait) keeps its own cloud temporal state,
+PEEKS at the weather (`weather::Resolve(..., commit=false)`: no ease, no
+`Last()`), and does not republish `LastCloudFrame`. Sharing one state reset the
+game's cloud history every frame the inventory was open and eased its sky toward
+the portrait's fixed light tick. `--gate clouds` part C asserts it. The cloud
+grid is laid out on the TARGET size (`targetW/targetH`), not `viewPx`, which
+under TAA + `render.taaSharpLod` is the native height.
+
 The same word WETS CREATURES (`MobSystem::RainOneLimb`, in the living's and
 the corpses' stain pass): a limb under open sky (`OpenToSky`, InSunlight's
 column probe without the daylight half) has its world-up-facing voxels take one

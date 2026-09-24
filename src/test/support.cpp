@@ -375,11 +375,27 @@ struct CloudPrev {
   uint32_t age = 0;
   double wall = -1.0;
 };
+// One per VIEW: the game's (and every harness's) main view, and the
+// auxiliary one a portrait draws inside the main view's frame. Sharing one
+// was the bug: the portrait's different target size failed the main view's
+// size test every frame (no accumulation ever), and its parity flip made the
+// main view resolve into the half it had just read.
 CloudPrev gCloudPrev;
+CloudPrev gCloudPrevAux;
+unsigned gVeilPitch = 0;
 
 }  // namespace
 
 const CloudFrame& LastCloudFrame() { return gCloudFrame; }
+unsigned LastVeilPitch() { return gVeilPitch; }
+CloudHistoryProbe MainCloudHistory() {
+  CloudHistoryProbe p;
+  p.valid = gCloudPrev.valid;
+  p.age = gCloudPrev.age;
+  p.lowW = gCloudPrev.lowW;
+  p.lowH = gCloudPrev.lowH;
+  return p;
+}
 
 // Fills the weather fields of `rp` and uploads CloudParams. Called from
 // WriteRenderParams, which is the single author of every frame uniform, so
@@ -388,26 +404,36 @@ const CloudFrame& LastCloudFrame() { return gCloudFrame; }
 static void WriteCloudParams(const rhi::Queue& queue, const World& world,
                              RenderParams& rp, const Vec3& eyeV, float aspect,
                              float viewPx, uint32_t tick, float frameFrac,
-                             const SkyState& sky) {
+                             const SkyState& sky, uint32_t targetW,
+                             uint32_t targetH, bool auxView) {
   const float eyeA[3] = {eyeV.x, eyeV.y, eyeV.z};
   struct { float x, y, z; } eye{eyeV.x, eyeV.y, eyeV.z};
   const Tuning& tun = CurrentTuning();
   const Tuning::Render& rr = tun.render;
   const double tSec = ((double)tick + (double)frameFrac) / 30.0;
+  CloudPrev& prev = auxView ? gCloudPrevAux : gCloudPrev;
   const double wall = NowSeconds();
   float dt = 0.0f;
-  if (gCloudPrev.wall >= 0.0) dt = (float)std::clamp(wall - gCloudPrev.wall, 0.0, 0.25);
-  gCloudPrev.wall = wall;
+  if (prev.wall >= 0.0) dt = (float)std::clamp(wall - prev.wall, 0.0, 0.25);
+  prev.wall = wall;
 
   const float camXM = eye.x * kVoxelMeters, camZM = eye.z * kVoxelMeters;
-  const weather::State st = weather::Resolve(tun, rp.seed, tSec, dt, camXM, camZM);
+  // An aux view PEEKS at the weather (commit = false): the main view's eased
+  // sky, with neither the ease nor Last() touched.
+  const weather::State st =
+      weather::Resolve(tun, rp.seed, tSec, dt, camXM, camZM, !auxView);
   const weather::Preset& w = st.mix;
   const bool on = st.enabled &&
                   (w.coverage > 0.001f || w.cirrus > 0.001f || w.precip > 0.001f);
 
   CloudParams cp{};
-  const uint32_t fullH = (uint32_t)std::max(1.0f, std::round(viewPx));
-  const uint32_t fullW = (uint32_t)std::max(1.0f, std::round(viewPx * aspect));
+  // The TARGET's size, which is what the raymarch's fragXY counts in. viewPx
+  // is not always it: under TAA + render.taaSharpLod viewPx is the native
+  // height (an LOD bias) while the target is renderW x renderH.
+  const uint32_t fullH = targetH ? targetH
+                                 : (uint32_t)std::max(1.0f, std::round(viewPx));
+  const uint32_t fullW =
+      targetW ? targetW : (uint32_t)std::max(1.0f, std::round(viewPx * aspect));
   const uint32_t div = (uint32_t)std::clamp(rr.cloudResDiv, 1, 8);
   const uint32_t lowW = (fullW + div - 1) / div, lowH = (fullH + div - 1) / div;
   cp.fullW = fullW;
@@ -420,28 +446,28 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   // Valid only if last frame also marched, into a target of the same size.
   // Anything else — the first frame, a resize, a portrait drawn between two
   // game frames at a different size — starts the history over.
-  const bool histValid = on && gCloudPrev.valid && gCloudPrev.lowW == lowW &&
-                         gCloudPrev.lowH == lowH;
-  gCloudPrev.parity ^= 1u;
+  const bool histValid = on && prev.valid && prev.lowW == lowW &&
+                         prev.lowH == lowH;
+  prev.parity ^= 1u;
   const uint32_t half = lowW * lowH * kCloudHistWords;
-  cp.histCur = gCloudPrev.parity * half;
-  cp.histPrev = (gCloudPrev.parity ^ 1u) * half;
+  cp.histCur = prev.parity * half;
+  cp.histPrev = (prev.parity ^ 1u) * half;
   cp.flags = (on ? kClfOn : 0u) | (histValid ? kClfHistValid : 0u);
   // Frames the history has accumulated since it was last reset. The resolve
   // blends at max(render.cloudTemporal, 1 / (age + 1)): an exact running MEAN
   // for the first frames after a reset, so a four-frame --shot is the average
   // of four jittered marches rather than one march with three ghosts on it.
-  gCloudPrev.age = histValid ? gCloudPrev.age + 1 : 0;
-  cp.spare[0] = (float)gCloudPrev.age;
-  cp.frame = ++gCloudPrev.frame;
+  prev.age = histValid ? prev.age + 1 : 0;
+  cp.spare[0] = (float)prev.age;
+  cp.frame = ++prev.frame;
   for (int i = 0; i < 3; i++) {
-    cp.prevRight[i] = gCloudPrev.right[i];
-    cp.prevUp[i] = gCloudPrev.up[i];
-    cp.prevFwd[i] = gCloudPrev.fwd[i];
-    cp.eyeDeltaM[i] = (float)(((double)eyeA[i] - gCloudPrev.eye[i]) * (double)kVoxelMeters);
+    cp.prevRight[i] = prev.right[i];
+    cp.prevUp[i] = prev.up[i];
+    cp.prevFwd[i] = prev.fwd[i];
+    cp.eyeDeltaM[i] = (float)(((double)eyeA[i] - prev.eye[i]) * (double)kVoxelMeters);
   }
-  cp.prevTanHalfFov = gCloudPrev.tanHalfFov;
-  cp.prevAspect = gCloudPrev.aspect;
+  cp.prevTanHalfFov = prev.tanHalfFov;
+  cp.prevAspect = prev.aspect;
   // R2 low-discrepancy jitter of the LOW-RES grid: over a handful of frames
   // the accumulated history has sampled every sub-texel position, which is
   // the quarter-resolution march paying for a half-resolution image.
@@ -452,16 +478,16 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
     cp.jitter[1] = (float)(std::fmod(0.5 + a2 * cp.frame, 1.0) - 0.5);
   }
   for (int i = 0; i < 3; i++) {
-    gCloudPrev.right[i] = rp.camRight[i];
-    gCloudPrev.up[i] = rp.camUp[i];
-    gCloudPrev.fwd[i] = rp.camFwd[i];
-    gCloudPrev.eye[i] = (double)eyeA[i];
+    prev.right[i] = rp.camRight[i];
+    prev.up[i] = rp.camUp[i];
+    prev.fwd[i] = rp.camFwd[i];
+    prev.eye[i] = (double)eyeA[i];
   }
-  gCloudPrev.tanHalfFov = rp.tanHalfFov;
-  gCloudPrev.aspect = rp.aspect;
-  gCloudPrev.lowW = lowW;
-  gCloudPrev.lowH = lowH;
-  gCloudPrev.valid = on;
+  prev.tanHalfFov = rp.tanHalfFov;
+  prev.aspect = rp.aspect;
+  prev.lowW = lowW;
+  prev.lowH = lowH;
+  prev.valid = on;
 
   // ---- the weather ----
   cp.coverage = w.coverage;
@@ -566,9 +592,14 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   // cascades end — mist only brings it closer.
   if (on) rp.fogDensity *= 1.0f + w.mist;
 
-  gCloudFrame.on = on;
-  gCloudFrame.lowW = lowW;
-  gCloudFrame.lowH = lowH;
+  // An aux view records no cloud passes of its own (the portrait draws bodies
+  // only), and the main view writing its params next frame must find the
+  // recorder's answer still its own.
+  if (!auxView) {
+    gCloudFrame.on = on;
+    gCloudFrame.lowW = lowW;
+    gCloudFrame.lowH = lowH;
+  }
 }
 
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
@@ -576,7 +607,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        bool shadows, float time,
                        float fogDensity, float viewPx, uint32_t tick,
                        uint32_t fluidCount, float frameFrac,
-                       uint32_t extraFlags) {
+                       uint32_t extraFlags, uint32_t targetW,
+                       uint32_t targetH, bool auxView) {
   RenderParams rp{};
   rp.fluidCount = fluidCount;  // 0 skips the MPM fluid surface march entirely
   Vec3 f = cam.Forward(), r = cam.Right(), u = cam.Up();
@@ -767,7 +799,11 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
   // The clouds and the weather (cloud.wgsl): CloudParams, and the four
   // RenderParams fields they own. Last, because it scales rp.fogDensity.
-  WriteCloudParams(queue, world, rp, eye, aspect, viewPx, tick, frameFrac, sky);
+  WriteCloudParams(queue, world, rp, eye, aspect, viewPx, tick, frameFrac, sky,
+                   targetW, targetH, auxView);
+  // veilBase's pitch, computed the way the shader computes it (f32 product,
+  // rounded); EnsureVeil adds a column of slack for the rounding-mode tie.
+  gVeilPitch = (unsigned)std::max(1.0f, std::round(rp.viewPx * rp.aspect));
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
 }
 
@@ -1022,7 +1058,11 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // The weather, the sim's copy: rain + damp + wetness in one word, from
     // the same seed and tick the renderer's sky is resolved on (weather.h
     // SimRainWord). What "rain" / "rainDamped" reactions read.
-    tp.weatherRain = weather::SimRainWord(wtun, seed, tick);
+    // ONE value per tick, shared with the CPU rain readers the session fed
+    // from the same latch (weather::LatchTickRain); a replay takes the
+    // recorded word, because the pin inside it is a human input.
+    tp.weatherRain = weather::TakeTickRain(wtun, seed, tick);
+    opstream::RecordedWeatherRain(tick, tp.weatherRain);
     // The gas edge (docs/PLAN_gas_particles.md). Read here, from the same
     // tuning snapshot windMode comes from, so the value the kernel branches on
     // and the value Simulation gates Cond::Gas on are one read.

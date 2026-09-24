@@ -82,6 +82,20 @@ void SetShortRangeNear(bool on);
 
 // fluidCount: live MLS-MPM particle count — nonzero enables the fluid surface
 // march in raymarch.wgsl; zero costs the renderer nothing.
+//
+// targetW / targetH: the render target's real size, when it is NOT
+// viewPx * aspect x viewPx — i.e. the game under TAA with render.taaSharpLod,
+// which tells the shader the native height for LOD while drawing renderW x
+// renderH. The cloud pass lays its low-res grid out on these (cloudScreenAt
+// maps the target's fragXY onto it). 0 = derive from viewPx and aspect.
+//
+// auxView: a SECOND view drawn inside the main view's frame (the inventory
+// portrait). It gets a coherent sky but must not disturb the main view's
+// frame-to-frame state: it neither advances nor reads the main cloud temporal
+// history (own CloudPrev), nor eases the weather (weather::Resolve peek), nor
+// republishes LastCloudFrame. Without it the portrait reset the main view's
+// cloud history every frame and dragged its weather toward the portrait's
+// fixed light tick.
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
@@ -89,7 +103,18 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        float viewPx = 1080.0f, uint32_t tick = 0,
                        uint32_t fluidCount = 0,
                        float frameFrac = 0.0f,
-                       uint32_t extraFlags = 0);
+                       uint32_t extraFlags = 0,
+                       uint32_t targetW = 0, uint32_t targetH = 0,
+                       bool auxView = false);
+
+// The main view's cloud temporal state, for the clouds gate: whether the next
+// main-view frame would find its history valid, and how many frames it has
+// accumulated. Read-only.
+struct CloudHistoryProbe {
+  bool valid = false;
+  unsigned age = 0, lowW = 0, lowH = 0;
+};
+CloudHistoryProbe MainCloudHistory();
 
 // WriteRenderParams also publishes the raymarch's per-frame specialization
 // record — sim/renderspec.h, included above, says what it is and why it is

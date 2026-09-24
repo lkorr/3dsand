@@ -81,4 +81,14 @@ struct CloudFrame {
 };
 const CloudFrame& LastCloudFrame();
 
+// ---- the water veil's row pitch (common.wgsl veilBase) ----------------------
+// veilBase indexes the per-pixel veil as y * round(viewPx * aspect) + x. Under
+// TAA with render.taaSharpLod that pitch is the NATIVE width while the target
+// is renderW x renderH, so a buffer sized width x height lost its bottom rows
+// to the bounds check. The pitch the last WriteRenderParams implies is
+// published here and EnsureVeil sizes for pitch x height -- sparse in that one
+// mode, never short. (The shader is not changed: every other path has
+// pitch == target width, and a common.wgsl edit is a whole-cache recompile.)
+unsigned LastVeilPitch();
+
 }  // namespace sandvox
