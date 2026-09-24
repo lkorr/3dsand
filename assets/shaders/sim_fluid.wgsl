@@ -12,10 +12,13 @@
 // clamped J. p2g2 also applies dynamic viscosity (via the APIC C matrix) and
 // the per-species attraction terms (attract same / attract different).
 //
-// DETERMINISM. The fluid never writes a voxel and no CA kernel reads a fluid
-// buffer, so the WORLD hash cannot move (verified by the pinned determinism
-// gate staying at its baseline). The fluid's own state is bit-deterministic by
-// the same discipline the CA uses, and the fluid_det gate verifies it twice-run:
+// DETERMINISM. THIS FILE never writes a voxel — the substeps only read the
+// voxel field for their boundary conditions. But the fluid as a SYSTEM is
+// inside the hashed world: the excite/settle seam (sim_fluid_seam.wgsl)
+// converts voxels to particles and back, and the CA reads fluid buffers
+// (sim_step.wgsl's fluidBlockMapS + the per-cell intent scratch), so particle
+// state reaches the world hash one tick later. It is bit-deterministic by the
+// same discipline the CA uses, and the fluid_det gate verifies it twice-run:
 //   * integer-only math end to end — no f32 anywhere in this file;
 //   * every grid scatter accumulates via i32 atomicAdd: integer addition is
 //     associative, so the sum cannot depend on workgroup scheduling (this is
@@ -28,10 +31,13 @@
 //   * per-particle work is keyed on particle state only, never on dispatch or
 //     buffer order.
 //
-// THE SUBSTEP (recorded kFluidSubsteps times per tick from EncodeTick):
-//   fill blockMap=0 -> mark -> alloc(scan) -> copy args -> clear ->
-//   p2g1 (mass+momentum+species mass) -> p2g2 (density -> stress scatter) ->
-//   grid update (gravity + terrain BCs) -> G2P/advect
+// THE TICK (recorded from EncodeTick):
+//   ONCE per tick (PT_FLUIDMAP): mark -> alloc(scan; also retires LAST tick's
+//     map entries) -> copy args. The map is not rebuilt per substep: `mark`
+//     pads each particle's support by a whole tick of CFL-capped travel.
+//   sim.fluidSubsteps times (PT_FLUID): clear -> p2g1 (mass+momentum+species
+//     mass) -> p2g2 (density -> stress scatter) -> grid update (gravity +
+//     terrain BCs) -> G2P/advect
 // Terrain collision is a boundary condition on grid nodes read straight from
 // the voxel buffer through voxWordAt — dig under a pool and it drains with no
 // coupling code (plan §6.1). Out-of-window space is solid and inert, exactly
@@ -270,9 +276,10 @@ const FLUID_SETTLED_Q8 : i32 =
 // control arm for `--sweep sim.fluidSubmergedSolid=0,1`.
 const FLUID_SUBMERGED_SOLID : i32 = clamp(TUNE_FLUID_SUBMERGED_SOLID, 0, 1);
 // Gravity, EOS (stiffness / rest density / power / cohesion), the species
-// attraction pair, viscosity and damping all come from tuning (sim.* —
-// integer, F5-reloadable, the "fluid" rows of tuning_params.def). LoadTuning
-// clamps every one of them into the ranges the overflow audit above assumes.
+// attraction pair, viscosity and damping all come from tuning (the sim.fluid*
+// rows of tuning_params.def — HUMAN-UNIT FLOATS, F5-reloadable, converted to
+// integers by the const block at the top of this file). LoadTuning clamps
+// every one of them into the ranges the overflow audit above assumes.
 
 // Q16.16 multiply, exact to ~2^-4 fixed-point units, valid for |a|,|b| < 2^21.
 // The staging (>>6, >>6, >>4) keeps the product inside i32. Computed on
@@ -286,11 +293,6 @@ fn mq(a : i32, b : i32) -> i32 {
   return select(m, -m, (a ^ b) < 0);
 }
 
-// The paper's clamping function (Eq. 1), in Q16.16 throughout:
-//   Phi(I, tmin, tmax) = (min(I,tmax) - min(I,tmin)) / (tmax - tmin)
-// Result is Q16 in [0, 65536]. LoadTuning guarantees tmax > tmin, so the
-// divisor is never zero; the shift keeps the numerator inside i32 for the
-// widest threshold pair the tuner allows.
 // Signed wrapper over common.wgsl's exact integer isqrt. The foam potentials
 // need a magnitude from a squared sum, and rule 1 forbids f32 in the CA: a
 // hardware sqrt is free to differ in the last ulp between vendors, which is
@@ -300,6 +302,11 @@ fn isqrtI(x : i32) -> i32 {
   return i32(isqrt(u32(x)));
 }
 
+// The paper's clamping function (Eq. 1), in Q16.16 throughout:
+//   Phi(I, tmin, tmax) = (min(I,tmax) - min(I,tmin)) / (tmax - tmin)
+// Result is Q16 in [0, 65536]. LoadTuning guarantees tmax > tmin, so the
+// divisor is never zero; the shift keeps the numerator inside i32 for the
+// widest threshold pair the tuner allows.
 fn phiQ(v : i32, tmin : i32, tmax : i32) -> i32 {
   let num = min(v, tmax) - min(v, tmin);
   let den = max(tmax - tmin, 1);
@@ -338,6 +345,63 @@ fn nodeBlock(nc : vec3<i32>) -> u32 {
   let slot = chunkSlotOf(wc, T.origin);
   if (slot == SLOT_NONE) { return 0u; }
   return atomicLoad(&fluidBlockMap[slot]);
+}
+
+// ---- the particle's support blocks, resolved ONCE per particle ------------
+// A particle's 3-node support spans at most TWO chunks per axis ([base,
+// base+2], and a chunk is 16 nodes wide), so its 27 taps touch at most 8
+// distinct block-map entries. nodeBlock() per tap redid worldChunkOf +
+// chunkSlotOf + an atomic load 27 times (54 in p2g2) for those <= 8 answers.
+// This resolves each distinct chunk once; `supBlock` then picks the entry for
+// a tap. The answer is nodeBlock(nc) EXACTLY — nodeBlock depends only on the
+// chunk holding nc, and the map is not written during any substep pass that
+// reads it — so this is a pure cost change (rule 1).
+//
+// Eight named fields rather than an array: the tap index is a runtime value,
+// and a dynamically indexed function-scope array is the classic way to push
+// a hot kernel into local-memory spills.
+struct SupBlocks {
+  b000 : u32, b100 : u32, b010 : u32, b110 : u32,
+  b001 : u32, b101 : u32, b011 : u32, b111 : u32,
+  // First node offset (0..2) on each axis that lies in the NEXT chunk, or 3
+  // when the whole support is inside one chunk.
+  sx : i32, sy : i32, sz : i32,
+};
+
+fn supSplit(base : i32) -> i32 {
+  // base+2 crosses into the next chunk iff base's local coord is 14 or 15.
+  let lo = base & CHUNK_MASK;
+  return select(3, i32(CHUNK) - lo, lo >= i32(CHUNK) - 2);
+}
+
+fn supBlocks(ax : Axis, ay : Axis, az : Axis) -> SupBlocks {
+  var s : SupBlocks;
+  s.sx = supSplit(ax.base);
+  s.sy = supSplit(ay.base);
+  s.sz = supSplit(az.base);
+  let x1 = ax.base + 2; let y1 = ay.base + 2; let z1 = az.base + 2;
+  let hx = s.sx < 3; let hy = s.sy < 3; let hz = s.sz < 3;
+  s.b000 = nodeBlock(vec3<i32>(ax.base, ay.base, az.base));
+  s.b100 = 0u; s.b010 = 0u; s.b110 = 0u;
+  s.b001 = 0u; s.b101 = 0u; s.b011 = 0u; s.b111 = 0u;
+  if (hx) { s.b100 = nodeBlock(vec3<i32>(x1, ay.base, az.base)); }
+  if (hy) { s.b010 = nodeBlock(vec3<i32>(ax.base, y1, az.base)); }
+  if (hx && hy) { s.b110 = nodeBlock(vec3<i32>(x1, y1, az.base)); }
+  if (hz) {
+    s.b001 = nodeBlock(vec3<i32>(ax.base, ay.base, z1));
+    if (hx) { s.b101 = nodeBlock(vec3<i32>(x1, ay.base, z1)); }
+    if (hy) { s.b011 = nodeBlock(vec3<i32>(ax.base, y1, z1)); }
+    if (hx && hy) { s.b111 = nodeBlock(vec3<i32>(x1, y1, z1)); }
+  }
+  return s;
+}
+
+// The block of tap (i, j, k) of the support — nodeBlock(base + (i, j, k)).
+fn supBlock(s : SupBlocks, i : i32, j : i32, k : i32) -> u32 {
+  let ux = i >= s.sx; let uy = j >= s.sy; let uz = k >= s.sz;
+  let lo = select(select(s.b000, s.b100, ux), select(s.b010, s.b110, ux), uy);
+  let hi = select(select(s.b001, s.b101, ux), select(s.b011, s.b111, ux), uy);
+  return select(lo, hi, uz);
 }
 
 // First WORD of node nc's accumulator row (block bm), i.e. index * FLUID_GW.
@@ -457,8 +521,10 @@ fn fluidHardSolid(c : vec3<i32>) -> bool {
 fn liveTotal() -> u32 { return min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP); }
 
 // ---- mark: flag every chunk the particle's node support can touch THIS TICK -
-// atomicOr of a constant is order-independent; the map is cleared by a Fill
-// row at the top of PT_FLUIDMAP, which runs ONCE per tick.
+// atomicOr of a constant is order-independent. There is NO whole-map clear any
+// more: `alloc` retires last tick's entries itself (see there), so a mark has
+// to be distinguishable from a stale block index — hence MAP_MARK, a bit no
+// block index (<= FLUID_BLOCKS) can carry.
 //
 // THE PAD. The map used to be rebuilt before every substep, so marking the
 // instantaneous 3-cell node support was exact. Building it once per tick
@@ -470,7 +536,15 @@ fn liveTotal() -> u32 { return min(atomicLoad(&fluidArgs[FA_LIVE]), FLUID_CAP); 
 // FLUID_MARK_PAD (common.wgsl, derived from the substep knob) is exactly that
 // rounded up: 3 cells at the historical 6 substeps, 5 at the 9-substep
 // default. The padded span is [base-pad, base+2+pad] and the pad is capped so
-// that stays <= CHUNK, which is what keeps the 8-corner loop below exhaustive.
+// that stays <= CHUNK, which is what keeps the corner loop below exhaustive.
+//
+// COST. Most particles' padded span sits inside one chunk on most axes, and a
+// crowd of particles shares the same few chunks, so the 8 corners collapse to
+// 1-2 distinct slots that are already marked. Corners that repeat an axis's
+// chunk are skipped, and a slot already carrying MAP_MARK is not OR'd again —
+// a load instead of 8 same-address read-modify-writes per particle. The final
+// map is the same set of marked slots either way.
+const MAP_MARK : u32 = 0x80000000u;
 
 @compute @workgroup_size(64)
 fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
@@ -482,16 +556,21 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
   let lo = vec3<i32>(ax.base, ay.base, az.base) - vec3<i32>(FLUID_MARK_PAD);
   let hi = vec3<i32>(ax.base, ay.base, az.base) +
            vec3<i32>(2 + FLUID_MARK_PAD);
-  for (var k = 0; k < 2; k++) {
-    for (var j = 0; j < 2; j++) {
-      for (var i = 0; i < 2; i++) {
-        let corner = vec3<i32>(select(lo.x, hi.x, i == 1),
-                               select(lo.y, hi.y, j == 1),
-                               select(lo.z, hi.z, k == 1));
-        let wc = worldChunkOf(corner);
+  let clo = worldChunkOf(lo);
+  let chi = worldChunkOf(hi);
+  let nx = select(1, 2, chi.x != clo.x);
+  let ny = select(1, 2, chi.y != clo.y);
+  let nz = select(1, 2, chi.z != clo.z);
+  for (var k = 0; k < nz; k++) {
+    for (var j = 0; j < ny; j++) {
+      for (var i = 0; i < nx; i++) {
+        let wc = vec3<i32>(select(clo.x, chi.x, i == 1),
+                           select(clo.y, chi.y, j == 1),
+                           select(clo.z, chi.z, k == 1));
         let cs = chunkSlotOf(wc, T.origin);
-        if (cs != SLOT_NONE) {
-          atomicOr(&fluidBlockMap[cs], 1u);
+        if (cs != SLOT_NONE &&
+            (atomicLoad(&fluidBlockMap[cs]) & MAP_MARK) == 0u) {
+          atomicOr(&fluidBlockMap[cs], MAP_MARK);
         }
       }
     }
@@ -505,20 +584,47 @@ fn mark(@builtin(global_invocation_id) gid : vec3<u32>) {
 // span in slot order. Chunks past the kFluidBlocks budget lose their mark and
 // their particles freeze for the substep — bounded, deterministic degradation
 // rather than an overrun (rule 2).
+//
+// IT ALSO RETIRES LAST TICK'S MAP, which is what replaced a 256 KiB
+// whole-buffer Fill that ran every seam tick, water or no water. The invariant
+// that makes that sound: after alloc, the ONLY non-zero words of either half of
+// the map belong to slots in fluidBlockList[0 .. fluidArgs[3]) — alloc zeroes
+// every over-budget index, gridUpdate and stainApply light the Y-mask only of
+// listed slots, and worldgen/reset Fill the whole map and fluidArgs together.
+// So phase A below walks LAST tick's list (still in the buffers: nothing writes
+// them between last tick's alloc and this one) and
+//   * zeroes that slot's Y-mask word (gridUpdate/stainApply rebuild it), and
+//   * masks its index word down to MAP_MARK — dropping the stale block index
+//     while keeping a mark `mark` may already have OR'd in this tick.
+// After phase A a slot's index word is non-zero iff it was marked THIS tick,
+// exactly the state the old Fill + mark produced, and the rest of the kernel
+// is unchanged — so the map comes out identical word for word (rule 1).
 var<workgroup> allocPartial : array<u32, 256>;
 var<workgroup> allocTotal : u32;
 
 @compute @workgroup_size(256)
 fn alloc(@builtin(local_invocation_index) li : u32) {
+  // ---- phase A: retire last tick's entries (see above) ---------------------
+  let prevBlocks = min(atomicLoad(&fluidArgs[3]), FLUID_BLOCKS);
+  for (var i = li; i < prevBlocks; i += 256u) {
+    let s = fluidBlockList[i];
+    atomicStore(&fluidBlockMap[fbmYMaskIndex(s)], 0u);
+    atomicAnd(&fluidBlockMap[s], MAP_MARK);
+  }
+  // Phase B reads index words that OTHER threads of phase A just masked, and
+  // thread 0 overwrites fluidArgs[3] below — both need phase A finished.
+  storageBarrier();
+  workgroupBarrier();
+
   // TRUE SLEEP (plan §7 item 2). Every other row of this table dispatches off
   // an indirect arg and so costs nothing with no particles; this one is a fixed
   // single-workgroup walk of all NUM_SLOTS slots (the seam's settleScan is the
-  // other). Whether the table is RECORDED stays a pure function of the
-  // CPU-owned monotone count — never a readback, that is the determinism trap
-  // in plan §7 — so a world that poured once and settled goes on recording
-  // these passes forever, and making them free is the only sanctioned fix.
-  // With no live particles `mark` wrote nothing, so the map is all zero and the
-  // scan below could only ever produce zero.
+  // other). The table is recorded whenever the seam is live — which includes
+  // every CA-awake tick while disturbance-excite is on, water or not — so
+  // making these passes free when nothing is alive is what rule 2 needs here.
+  // With no live particles `mark` wrote nothing, and phase A has just retired
+  // everything the last tick left, so the map is all zero and the scan below
+  // could only ever produce zero.
   // (The early-out must not `return` before the workgroupBarriers below — a
   // storage read is non-uniform to the compiler, and a barrier in non-uniform
   // control flow is a WGSL validation error. Skipping the WORK is enough.)
@@ -673,6 +779,7 @@ fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!cellResident(cell, T.origin)) { return; }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
+  let sb = supBlocks(ax, ay, az);   // <= 8 block lookups, not 27
 
   // ---- loop-invariant work, lifted out of the 27 taps ----------------------
   // Every term below was recomputed inside the innermost body, 27 times, for
@@ -706,7 +813,7 @@ fn p2g1(@builtin(global_invocation_id) gid : vec3<u32>) {
     for (var j = 0; j < 3; j++) {
       for (var i = 0; i < 3; i++) {
         let nc = vec3<i32>(ax.base + i, ay.base + j, az.base + k);
-        let bm = nodeBlock(nc);
+        let bm = supBlock(sb, i, j, k);
         if (bm == 0u) { continue; }
         let w = mq(wxy[j * 3 + i], az.w[k]);   // Q16.16 <= 0.42
         // dpos = node - particle, Q16.16 in [-1.5, 1.5] per axis.
@@ -748,10 +855,11 @@ fn densityRatio(m : i32, rest : i32) -> i32 {
 @compute @workgroup_size(64)
 fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= liveTotal()) { return; }
-  var p = fluidParticles[gid.x];
+  let p = fluidParticles[gid.x];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
   if (!cellResident(cell, T.origin)) { return; }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
+  let sb = supBlocks(ax, ay, az);   // <= 8 block lookups, not 27
 
   // The (i,j) weight product, hoisted out of BOTH 27-tap loops below — see the
   // note in p2g1. mq truncates and is not associative, so this precomputes the
@@ -769,7 +877,7 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
     for (var j = 0; j < 3; j++) {
       for (var i = 0; i < 3; i++) {
         let nc = vec3<i32>(ax.base + i, ay.base + j, az.base + k);
-        let bm = nodeBlock(nc);
+        let bm = supBlock(sb, i, j, k);
         if (bm == 0u) { continue; }
         let w = mq(wxy[j * 3 + i], az.w[k]);
         let ni = nodeWordBase(bm, nc);
@@ -789,8 +897,9 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
       }
     }
   }
-  p.density = rho;
-  fluidParticles[gid.x] = p;
+  // The density word ALONE: it is this pass's only particle write, and storing
+  // the whole 128-byte particle back to change 4 bytes of it was pure bandwidth.
+  fluidParticles[gid.x].density = rho;
 
   // EOS: pressure = stiffness * ((rho/rest)^power - 1), floored at -cohesion
   // so a free surface pulls itself together instead of tearing apart.
@@ -856,7 +965,7 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
     for (var j = 0; j < 3; j++) {
       for (var i = 0; i < 3; i++) {
         let nc = vec3<i32>(ax.base + i, ay.base + j, az.base + k);
-        let bm = nodeBlock(nc);
+        let bm = supBlock(sb, i, j, k);
         if (bm == 0u) { continue; }
         let w = mq(wxy[j * 3 + i], az.w[k]);
         let dx = dxs[i];
@@ -886,11 +995,45 @@ fn p2g2(@builtin(global_invocation_id) gid : vec3<u32>) {
 // v = P * 1024 / M exactly, via q/r decomposition (WGSL has no i64; the
 // two-stage division is exact to 1 Q16.16 unit and everything stays in i32
 // because |P/M| <= VEFF_MAX/1024 and |r| < M).
+//
+// THE TWO SAME-ADDRESS ATOMICS ARE REDUCED PER WORKGROUP. Every node with mass
+// used to atomicOr its y bits into its chunk's ONE Y-mask word, and every
+// clamped node to atomicAdd the ONE FA_CLAMPED word — up to 256 serialized
+// read-modify-writes per workgroup on a single address. A workgroup is one
+// z-slice of ONE block (wg.x >> 4), so all 256 nodes share that mask word: the
+// OR and the SUM are folded in workgroup memory and published once. OR and
+// integer add are associative and commutative, so the words end up bit-for-bit
+// what the per-node atomics produced (rule 1).
+var<workgroup> guYMask : atomic<u32>;
+var<workgroup> guClamped : atomic<u32>;
+
 @compute @workgroup_size(256)
 fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
               @builtin(local_invocation_index) li : u32) {
-  let block = wg.x >> 4u;
-  let localIdx = (wg.x & 15u) * 256u + li;
+  if (li == 0u) {
+    atomicStore(&guYMask, 0u);
+    atomicStore(&guClamped, 0u);
+  }
+  workgroupBarrier();
+  let r = gridUpdateNode(wg.x, li);
+  if (r.x != 0u) { atomicOr(&guYMask, r.x); }
+  if (r.y != 0u) { atomicAdd(&guClamped, r.y); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let ym = atomicLoad(&guYMask);
+    if (ym != 0u) {
+      atomicOr(&fluidBlockMap[fbmYMaskIndex(fluidBlockList[wg.x >> 4u])], ym);
+    }
+    let nc = atomicLoad(&guClamped);
+    if (nc != 0u) { atomicAdd(&fluidArgs[FA_CLAMPED], nc); }
+  }
+}
+
+// One node of gridUpdate. Returns (this node's Y-mask bits, 1 if the VMAX
+// clamp engaged) for the workgroup fold above; every other effect is its own.
+fn gridUpdateNode(wgx : u32, li : u32) -> vec2<u32> {
+  let block = wgx >> 4u;
+  let localIdx = (wgx & 15u) * 256u + li;
   let ni = (block * CHUNK_VOL + localIdx) * FLUID_GW;
 
   // ---- foam field decay (word 7) ----
@@ -914,14 +1057,13 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&fluidGrid[ni + 1u], 0);
     atomicStore(&fluidGrid[ni + 2u], 0);
     atomicStore(&fluidGrid[ni + 3u], 0);
-    return;
+    return vec2<u32>(0u, 0u);
   }
   // This node carries mass: light its y level in the chunk's Y-occupancy mask
-  // (common.wgsl). Render-only derived data; atomicOr of a constant is
-  // order-independent, and the mask is cleared by the same fill that clears the
-  // index half of the map, once per tick.
-  atomicOr(&fluidBlockMap[fbmYMaskIndex(fluidBlockList[block])],
-           fbmYBits(i32((localIdx >> 4u) & 15u)));
+  // (common.wgsl). Render-only derived data, folded per workgroup by the entry
+  // point above; the word is retired once per tick by `alloc`'s phase A.
+  let ybits = fbmYBits(i32((localIdx >> 4u) & 15u));
+  var clamped = 0u;
   var v : vec3<i32>;
   for (var a = 0u; a < 3u; a++) {
     let mom = atomicLoad(&fluidGrid[ni + 1u + a]);
@@ -1063,7 +1205,7 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
   // VMAX except by rounding. Diagnostic only — nothing keys on it, and an
   // atomic counter sum is order-independent (rule 1).
   if (abs(v.x) > FLUID_VMAX || abs(v.y) > FLUID_VMAX || abs(v.z) > FLUID_VMAX) {
-    atomicAdd(&fluidArgs[FA_CLAMPED], 1u);
+    clamped = 1u;   // summed per workgroup by the entry point
   }
   v.x = clamp(v.x, -FLUID_VMAX, FLUID_VMAX);
   v.y = clamp(v.y, -FLUID_VMAX, FLUID_VMAX);
@@ -1071,6 +1213,7 @@ fn gridUpdate(@builtin(workgroup_id) wg : vec3<u32>,
   atomicStore(&fluidGrid[ni + 1u], v.x);
   atomicStore(&fluidGrid[ni + 2u], v.y);
   atomicStore(&fluidGrid[ni + 3u], v.z);
+  return vec2<u32>(ybits, clamped);
 }
 
 // ---- this kernel's two words of the FA_* map (world.h kFluidArgsWords) ------
@@ -1096,12 +1239,33 @@ const FA_CALMSUBM : u32 = 37u;  // eighths CALMED by g2p inside submerged
 // A particle with no reachable nodes (out of window, over-budget chunk) sums
 // zero weight and freezes in place — deterministic, and it thaws by itself
 // when coverage returns.
+// FA_CALMSUBM is folded per workgroup: in a pool that has grown over its own
+// particles EVERY thread of a workgroup can take the submerged branch, and 64
+// same-address atomicAdds per workgroup per substep was the whole cost of the
+// counter. The sum is associative, so the word is unchanged (rule 1).
+var<workgroup> g2pCalm : atomic<u32>;
+
 @compute @workgroup_size(64)
-fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
-  if (gid.x >= liveTotal()) { return; }
-  var p = fluidParticles[gid.x];
+fn g2p(@builtin(global_invocation_id) gid : vec3<u32>,
+       @builtin(local_invocation_index) li : u32) {
+  if (li == 0u) { atomicStore(&g2pCalm, 0u); }
+  workgroupBarrier();
+  let calm = g2pParticle(gid.x);
+  if (calm != 0u) { atomicAdd(&g2pCalm, calm); }
+  workgroupBarrier();
+  if (li == 0u) {
+    let c = atomicLoad(&g2pCalm);
+    if (c != 0u) { atomicAdd(&fluidArgs[FA_CALMSUBM], c); }
+  }
+}
+
+// One particle of g2p. Returns the eighths it contributes to FA_CALMSUBM
+// (the submerged-freeze event count) for the workgroup fold above.
+fn g2pParticle(gi : u32) -> u32 {
+  if (gi >= liveTotal()) { return 0u; }
+  var p = fluidParticles[gi];
   let cell = vec3<i32>(p.px >> 16u, p.py >> 16u, p.pz >> 16u);
-  if (!cellResident(cell, T.origin)) { return; }
+  if (!cellResident(cell, T.origin)) { return 0u; }
   // ---- the particle woke up inside something ------------------------------
   // Two reasons, two outcomes, and conflating them was a real mass leak (see
   // the long block at fluidSolidReason). The cell can only have closed UNDER
@@ -1129,15 +1293,14 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
     // that stays under for twenty ticks is counted twenty times. It is a
     // pressure gauge for "how much of the pool is holding particles it cannot
     // settle", not a term in any conservation identity.
-    if (fpAlive(p.attr)) {
-      atomicAdd(&fluidArgs[FA_CALMSUBM], fpFullness(p.attr));
-    }
+    var calm = 0u;
+    if (fpAlive(p.attr)) { calm = fpFullness(p.attr); }
     p.vx = 0; p.vy = 0; p.vz = 0;
     p.c00 = 0; p.c01 = 0; p.c02 = 0;
     p.c10 = 0; p.c11 = 0; p.c12 = 0;
     p.c20 = 0; p.c21 = 0; p.c22 = 0;
-    fluidParticles[gid.x] = p;
-    return;
+    fluidParticles[gi] = p;
+    return calm;
   }
   // Explicitly `== FSOLID_HARD`, not `!= FSOLID_OPEN`: if someone adds a third
   // reason and forgets this site, the particle should keep simulating, not be
@@ -1165,12 +1328,15 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
     if (fpAlive(p.attr)) {
       atomicAdd(&fluidArgs[FA_KILLHARD], fpFullness(p.attr));
     }
-    p.attr = 0u;
-    fluidParticles[gid.x] = p;
+    // The attr word alone: nothing else of a dead particle is ever read
+    // (fpAlive is the first test of every consumer), so writing the other 31
+    // words back was 124 bytes of store bandwidth per kill for nothing.
+    fluidParticles[gi].attr = 0u;
     atomicAdd(&fluidArgs[FA_DEAD], 1u);
-    return;
+    return 0u;
   }
   let ax = axisOf(p.px); let ay = axisOf(p.py); let az = axisOf(p.pz);
+  let sb = supBlocks(ax, ay, az);   // <= 8 block lookups, not 27
 
   var v = vec3<i32>(0, 0, 0);
   var c0 = vec3<i32>(0, 0, 0);   // row 0 of C (x-velocity gradients)
@@ -1207,7 +1373,7 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
     for (var j = 0; j < 3; j++) {
       for (var i = 0; i < 3; i++) {
         let nc = vec3<i32>(ax.base + i, ay.base + j, az.base + k);
-        let bm = nodeBlock(nc);
+        let bm = supBlock(sb, i, j, k);
         if (bm == 0u) { continue; }
         let w = mq(wxy[j * 3 + i], az.w[k]);
         let ni = nodeWordBase(bm, nc);
@@ -1347,7 +1513,7 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
       p.pz = oldPz; p.vz = 0;
     }
   }
-  fluidParticles[gid.x] = p;
+  fluidParticles[gi] = p;
 
   // ---- splash: fast free-surface particles shed micro droplets --------------
   // A fluid particle that is moving hard AND sits at low density (spray, a
@@ -1386,7 +1552,7 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
     let s2 = sx * sx + sy * sy + sz * sz;
     let th = FLUID_SPLASH_SPEED >> 8u;
     if (s2 > th * th) {
-      let h = pcg(gid.x ^ pcg(u32(p.px) ^ pcg(u32(p.py) ^
+      let h = pcg(gi ^ pcg(u32(p.px) ^ pcg(u32(p.py) ^
               pcg(u32(p.pz) ^ pcg(T.tick ^ T.seed)))));
       if ((h & 0xFFFFu) < u32(FLUID_SPLASH_CHANCE)) {
         var d : Particle;
@@ -1537,7 +1703,7 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
         // scheduling-keyed. A distinct
         // salt from the splash hash keeps foam and spray from firing on
         // exactly the same particles every time.
-        let fh = pcg(0x9E3779B9u ^ gid.x ^ pcg(u32(p.px) ^ pcg(u32(p.py) ^
+        let fh = pcg(0x9E3779B9u ^ gi ^ pcg(u32(p.px) ^ pcg(u32(p.py) ^
                  pcg(u32(p.pz) ^ pcg(T.tick ^ T.seed)))));
         if ((fh & 0xFFFFu) < u32(nd)) {
           // --- classification (paper §3.2): by local fluid density, which is
@@ -1602,4 +1768,5 @@ fn g2p(@builtin(global_invocation_id) gid : vec3<u32>) {
       }
     }
   }
+  return 0u;
 }

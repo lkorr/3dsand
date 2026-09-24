@@ -614,7 +614,8 @@ struct Row {
   // Compute: workgroup extents (x may be a DispatchSel selector).
   // Indirect: x is the args-buffer selector.
   // Copy:     x = srcOffset, y = dstOffset, z = size.
-  // Fill:     unused (whole buffer).
+  // Fill:     x = offset, y = size in bytes; y == 0 means to the end of the
+  //           buffer (every row but fill_gasSpawn's header clear is 0,0).
   uint32_t x, y, z;
   Groups groups;
   Dyn dyn;

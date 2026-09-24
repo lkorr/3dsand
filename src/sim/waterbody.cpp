@@ -1,6 +1,7 @@
 #include "sim/waterbody.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
@@ -361,11 +362,23 @@ void WaterBodySystem::NoteMutations(const World& world, uint32_t tick, int mode,
         o.material != kMatLava)
       continue;
     const int r = std::clamp(o.radius, 0, 32);
-    int64_t cellsIn = 0;
-    for (int dz = -r; dz <= r; dz++)
-      for (int dy = -r; dy <= r; dy++)
-        for (int dx = -r; dx <= r; dx++)
-          if (dx * dx + dy * dy + dz * dz <= r * r) cellsIn++;
+    // Lattice points of the radius-r ball — sim_mutate's own `d2 <= r*r`.
+    // Counted ONCE per radius, by exactly the triple loop this used to run
+    // for every liquid brush op of every tick (O(r^3): 275k iterations at the
+    // clamp), and looked up after that. Same loop, same answer.
+    static const std::array<int64_t, 33> kBallCells = [] {
+      std::array<int64_t, 33> t{};
+      for (int rr = 0; rr <= 32; rr++) {
+        int64_t n = 0;
+        for (int dz = -rr; dz <= rr; dz++)
+          for (int dy = -rr; dy <= rr; dy++)
+            for (int dx = -rr; dx <= rr; dx++)
+              if (dx * dx + dy * dy + dz * dz <= rr * rr) n++;
+        t[rr] = n;
+      }
+      return t;
+    }();
+    const int64_t cellsIn = kBallCells[r];
     // A liquid brush paints FULL cells, so eight eighths each. It is an upper
     // bound in `mode == 0` (paint into air) whenever the ball overlaps solid
     // ground, which is the same benign over-count the cell-op loop takes.
