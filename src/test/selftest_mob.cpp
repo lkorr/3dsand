@@ -10251,6 +10251,487 @@ Status GateMobPark(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- corpse-save -----------------------------------------------------------
+//
+// THE DEAD ARE SAVED (PLAN_corpse_is_a_mob.md P2a, MOBS v6).
+//
+// Two corpses on real terrain: A is armoured (every `iron_*` piece that goes
+// on), armed, carrying a stack, killed, then BURNED, CARVED and PARTIALLY
+// LOOTED (its held weapon taken); B was bitten with the rot before it died,
+// so a rising is booked on it. Then, in one run:
+//   S. SAVE AND LOAD. SaveState -> Reset -> LoadState: both come back DEAD
+//      (not alive, rig kept, lootable), every limb's live voxel count equal,
+//      the loot list equal (kind, item, count, dye, slot, condition), every
+//      limb on its saved lying pose within `corpseSavePoseTolVox`, the death
+//      cause and the death ORDER kept, the rising still booked, and each
+//      record re-saves byte-identical. Then 30 stepped ticks: still dead, and
+//      no root has moved more than `corpseSaveMaxSettleVox` -- a corpse that
+//      had been stood up in Spawn's rest pose would fall that far.
+//   P. PARK AND UNPARK. The window moves away: both park (no corpse left, no
+//      rising left booked on a corpse that is bytes now) and the records sit
+//      in their buckets. The window returns with the LIVING crowd full (the
+//      living cap): both corpses still come back, with no cap wait and the
+//      living count untouched, and the same S-claims hold against the corpse
+//      as it was the tick before it parked.
+//   R. IT STILL RISES. The crowd cleared, two PreTicks far enough on: the
+//      booking the record carried stands B up as the turned def.
+// LEAVES NOTHING: resets mobs, debris and risings, removes the park function,
+// puts the id counter back, clears the store and regenerates the world.
+Status GateCorpseSave(Ctx& c, std::string& detail) {
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  MobParking parking;
+  auto restore = [&]() {
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.ClearRisings();
+    c.mobs.SetParkFn(nullptr);
+    c.mobs.ClearPlayerActors();
+    c.mobs.SetNextIdCounter(idCounterWas);
+    c.stream.Store().Clear();
+  };
+  const int hi = c.mobs.FindDef("human"), zi = c.mobs.FindDef("zombie");
+  int dummyDef = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == "dummy") dummyDef = (int)i;
+  if (hi < 0 || zi < 0 || dummyDef < 0) {
+    detail = "need the human, zombie and dummy defs";
+    return Status::Fail;
+  }
+  const uint16_t rotMat = c.mobs.Defs()[zi].bite.infectMat;
+  if (rotMat == 0) {
+    detail = "zombie def has no bite.infectMat";
+    return Status::Fail;
+  }
+  c.stream.Store().Clear();
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  c.mobs.SetNextIdCounter(1);
+  c.mobs.SetItems(&c.items);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const IVec3 home = c.world.WindowOrigin();
+  const int n = (int)kNChunk;
+  const IVec3 away{home.x + n + 8, home.y, home.z + n + 8};
+  auto teleport = [&](IVec3 origin) {
+    c.world.InvalidateSnapshot();
+    c.stream.ReloadWindow(origin);
+    rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+    c.sim.EncodeLoadReset(enc);
+    rhi::CommandBuffer cmd = enc.Finish();
+    c.ctx.queue.Submit(1, &cmd);
+    c.ctx.WaitIdle();
+  };
+  uint32_t t = 9000;
+  IVec3 pc{home.x + n / 2, home.y + n / 2, home.z + n / 2};
+  auto tick = [&](bool stepMobs) {
+    std::vector<BrushOp> ops;
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    if (stepMobs) {
+      c.mobs.PreTick(t + 1, c.world, ops, cellOps, spawns);
+      c.debris.QueueSupportEvents(c.world.Snap());
+      c.debris.PreTick(t + 1, c.world, cellOps, spawns);
+    }
+    ++t;
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, ops, {}, cellOps, false,
+               pc, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    if (stepMobs) {
+      c.phys.Step(kTickDt);
+      c.debris.PostStep();
+      c.mobs.PostStep();
+    }
+  };
+
+  // ---- the fixture ----
+  const IVec3 base{(home.x + n / 2) * (int)kChunk, 0, (home.z + n / 2) * (int)kChunk};
+  pc = {base.x >> 4, World::TerrainHeight(base.x, base.z, kDefaultSeed) >> 4,
+        base.z >> 4};
+  uint64_t idA = 0, idB = 0;
+  {
+    const int ax = base.x, az = base.z, bx = base.x + 16, bz = base.z + 6;
+    idA = c.mobs.Spawn(hi, {ax, World::TerrainHeight(ax, az, kDefaultSeed) + 1, az});
+    idB = c.mobs.Spawn(hi, {bx, World::TerrainHeight(bx, bz, kDefaultSeed) + 1, bz});
+  }
+  if (idA == 0 || idB == 0) {
+    detail = "spawn refused";
+    restore();
+    return Status::Fail;
+  }
+  c.mobs.SetMobBehavior(idA, "dummy");
+  c.mobs.SetMobBehavior(idB, "dummy");
+  // A: every iron piece that goes on (one per slot), one held weapon, a stack.
+  int worn = 0;
+  {
+    bool used[kEquipSlotCount] = {};
+    for (const ItemDef& it : c.items.items) {
+      if (!ItemKindIsWorn(it.kind) || it.name.rfind("iron_", 0) != 0) continue;
+      for (int sl = 0; sl < kEquipSlotCount; sl++)
+        if (!used[sl] && EquipSlotAccepts(sl, it.kind)) {
+          if (c.mobs.WearItem(idA, &it, sl, /*dye=*/0)) {
+            used[sl] = true;
+            worn++;
+          }
+          break;
+        }
+    }
+  }
+  std::string heldName;
+  for (const ItemDef& it : c.items.items)
+    if (!ItemKindIsWorn(it.kind) && c.mobs.EquipItem(idA, &it)) {
+      heldName = it.name;
+      break;
+    }
+  if (Mob* a = c.mobs.FindMobById(idA))
+    if (!c.items.items.empty()) a->AddCarried(c.items.items[0].name, 3, 0x40u);
+  for (int i = 0; i < 8; i++) tick(true);
+  // B: bitten with the rot, so its death books a rising.
+  const MobDef& hd = c.mobs.Defs()[hi];
+  {
+    std::vector<ParticleSpawn> spawns;
+    int limb = hd.rootLimb;
+    for (size_t i = 0; i < hd.limbs.size(); i++)
+      if (hd.limbs[i].name.rfind("armR", 0) == 0) limb = (int)i;
+    ::BiteHit bt;
+    bt.at = c.mobs.LimbVoxelPos(idB, limb, 2251u);
+    bt.hp = 3.0f;
+    bt.power = 0.8f;
+    bt.infectMat = rotMat;
+    bt.infectStain = c.mobs.Defs()[zi].bite.infectStain;
+    bt.seed = 0x10071u;
+    if (const uint64_t lb = c.mobs.LimbBody(idB, limb))
+      c.mobs.BiteHit(lb, bt, c.world, spawns);
+  }
+  // Killed at the root, A first: A's death is the OLDER one.
+  for (uint64_t id : {idA, idB})
+    if (const uint64_t rb = c.mobs.LimbBody(id, hd.rootLimb))
+      c.mobs.Damage(rb, 1.0e6f, c.mobs.LimbVoxelPos(id, hd.rootLimb, 0), 0.0f);
+  const bool bothDead = !c.mobs.IsAlive(idA) && !c.mobs.IsAlive(idB) &&
+                        c.mobs.FindMobById(idA) != nullptr &&
+                        c.mobs.FindMobById(idB) != nullptr;
+  for (int i = 0; i < 20; i++) tick(true);
+  // Damage the corpse: burn the torso, carve a leg, loot the weapon.
+  const uint32_t lit = c.mobs.IgniteLimb(idA, hd.rootLimb, 64, 0);
+  for (int i = 0; i < 6; i++) tick(true);
+  int legLimb = -1;
+  for (size_t i = 0; i < hd.limbs.size() && legLimb < 0; i++)
+    if (hd.limbs[i].name.rfind("leg", 0) == 0 || hd.limbs[i].name.rfind("thigh", 0) == 0)
+      legLimb = (int)i;
+  if (legLimb < 0) legLimb = hd.rootLimb;
+  const uint32_t legBefore = c.mobs.LimbArtVoxelCount(idA, legLimb);
+  {
+    std::vector<ParticleSpawn> spawns;
+    if (const uint64_t lb = c.mobs.LimbBody(idA, legLimb))
+      c.mobs.CarveLimbRadial(lb, c.mobs.LimbVoxelPos(idA, legLimb, 977u), 1.5f,
+                             /*ragged=*/true, /*eject=*/false, c.world, spawns);
+  }
+  const bool carved = c.mobs.LimbArtVoxelCount(idA, legLimb) < legBefore;
+  bool lootedHeld = false;
+  if (Mob* a = c.mobs.FindMobById(idA)) {
+    std::vector<LootPiece> list;
+    a->LootPieces(list);
+    for (size_t i = 0; i < list.size(); i++)
+      if (list[i].kind == LootPiece::Kind::Held) {
+        PlayerKit kit;
+        Inventory hotbar;
+        lootedHeld = TakeCorpseLoot(*a, (int)i, KitRef{}, kit, hotbar, c.items) ==
+                     LootResult::Ok;
+        break;
+      }
+  }
+  for (int i = 0; i < 4; i++) tick(true);
+
+  // ---- what a corpse IS, for comparison ----
+  struct Snap {
+    bool found = false, alive = true, released = true, lootable = false;
+    bool rising = false;
+    std::string cause;
+    uint64_t seq = 0;
+    std::vector<uint32_t> live;       // per rig slot, tombstones out
+    std::vector<uint8_t> hasBody;
+    std::vector<BodyTransform> xf;
+    std::vector<LootPiece> loot;
+    std::vector<std::string> names;   // rig slot names, for attribution
+    Vec3 root{};
+    Vec3 origin{};
+  };
+  auto snap = [&](uint64_t id) {
+    Snap s;
+    const Mob* m = c.mobs.FindMobById(id);
+    if (m == nullptr) return s;
+    s.found = true;
+    s.alive = m->Alive();
+    s.released = m->RigReleased();
+    s.lootable = m->Lootable();
+    s.rising = c.mobs.RisingPending(id);
+    s.cause = m->DeathCause();
+    s.seq = m->DeathSeq();
+    s.origin = m->Origin();
+    m->LootPieces(s.loot);
+    // Every slot that still HAS a body, by name. A slot with none is matter
+    // that already left as debris (a severed leg, the greaves that went with
+    // it); it carries nothing a record could restore, and v6 does not write
+    // an appended one.
+    for (int i = 0; i < m->LimbCount(); i++) {
+      const uint64_t b = c.mobs.LimbBody(id, i);
+      if (b == 0) continue;
+      const uint32_t art = c.mobs.LimbArtVoxelCount(id, i);
+      const uint32_t tomb = c.mobs.LimbMaterialCount(id, i, 0u);
+      s.live.push_back(art > tomb ? art - tomb : 0u);
+      s.hasBody.push_back(b != 0 ? 1 : 0);
+      BodyTransform x{};
+      if (b != 0) c.phys.GetTransform(b, x);
+      s.xf.push_back(x);
+      s.names.push_back(m->LimbDefAt(i).name);
+      if (i == hd.rootLimb) s.root = x.pos;
+    }
+    return s;
+  };
+  const double poseTol = BaselineNumber("corpseSavePoseTolVox", 0.05);
+  const double settleMax = BaselineNumber("corpseSaveMaxSettleVox", 3);
+  // "" = the same corpse; otherwise the first thing that differs.
+  // `voxels` false: the live counts are the RECORD's claim instead (P, where
+  // a burning corpse burns once more between the snapshot and the park).
+  auto same = [&](const Snap& a, const Snap& b, double& worstPose,
+                  bool voxels = true) {
+    worstPose = 0.0;
+    if (!b.found) return std::string("not found");
+    if (b.alive) return std::string("came back ALIVE");
+    if (b.released) return std::string("came back released to debris");
+    if (!b.lootable) return std::string("not lootable");
+    if (a.cause != b.cause)
+      return Format("cause '%s' vs '%s'", a.cause.c_str(), b.cause.c_str());
+    if (a.rising != b.rising)
+      return Format("rising %d vs %d", a.rising ? 1 : 0, b.rising ? 1 : 0);
+    if (a.live.size() != b.live.size()) {
+      // WHICH slots: the first name that differs, and every name the loaded
+      // rig lacks (a piece that would not go back on names itself here).
+      std::string missing;
+      for (const std::string& nm : a.names)
+        if (std::find(b.names.begin(), b.names.end(), nm) == b.names.end())
+          missing += (missing.empty() ? "" : ",") + nm;
+      size_t k = 0;
+      while (k < a.names.size() && k < b.names.size() && a.names[k] == b.names[k]) k++;
+      return Format("bodied slots %zu vs %zu (first differ at %zu: '%s' vs '%s'; missing %s)",
+                    a.live.size(), b.live.size(), k,
+                    k < a.names.size() ? a.names[k].c_str() : "-",
+                    k < b.names.size() ? b.names[k].c_str() : "-",
+                    missing.empty() ? "none" : missing.c_str());
+    }
+    for (size_t i = 0; i < a.live.size(); i++) {
+      if (a.names[i] != b.names[i])
+        return Format("slot %zu is '%s' vs '%s'", i, a.names[i].c_str(),
+                      b.names[i].c_str());
+      if (a.hasBody[i] != b.hasBody[i])
+        return Format("slot %zu body %d vs %d", i, (int)a.hasBody[i], (int)b.hasBody[i]);
+      if (voxels && a.live[i] != b.live[i])
+        return Format("slot %zu live voxels %u vs %u", i, a.live[i], b.live[i]);
+      if (!a.hasBody[i]) continue;
+      const Vec3 d{a.xf[i].pos.x - b.xf[i].pos.x, a.xf[i].pos.y - b.xf[i].pos.y,
+                   a.xf[i].pos.z - b.xf[i].pos.z};
+      worstPose = std::max(worstPose, (double)std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z));
+      float dot = 0;
+      for (int k = 0; k < 4; k++) dot += a.xf[i].quat[k] * b.xf[i].quat[k];
+      if (std::fabs(dot) < 0.999f) return Format("slot %zu rotation (dot %.4f)", i, dot);
+    }
+    if (worstPose > poseTol) return Format("pose off by %.3f vox", worstPose);
+    if (a.loot.size() != b.loot.size())
+      return Format("loot %zu vs %zu entries", a.loot.size(), b.loot.size());
+    for (size_t i = 0; i < a.loot.size(); i++) {
+      const LootPiece &p = a.loot[i], &q = b.loot[i];
+      if (p.kind != q.kind || p.item != q.item || p.count != q.count ||
+          p.dye != q.dye || p.equipSlot != q.equipSlot)
+        return Format("loot %zu '%s'x%d vs '%s'x%d", i, p.item.c_str(), p.count,
+                      q.item.c_str(), q.count);
+      if (std::fabs(p.damage.Condition() - q.damage.Condition()) > 1e-4f)
+        return Format("loot %zu '%s' condition %.4f vs %.4f", i, p.item.c_str(),
+                      p.damage.Condition(), q.damage.Condition());
+    }
+    return std::string();
+  };
+  auto recordOf = [&](uint64_t id) {
+    std::vector<uint8_t> r;
+    if (const Mob* m = c.mobs.FindMobById(id)) {
+      ByteWriter w{r};
+      m->SaveOne(w);
+    }
+    return r;
+  };
+  const Snap a0 = snap(idA), b0 = snap(idB);
+  const std::vector<uint8_t> recA0 = recordOf(idA), recB0 = recordOf(idB);
+  const bool fixtureOk = bothDead && a0.lootable && b0.lootable && b0.rising &&
+                         !a0.rising && worn >= 1 && !heldName.empty() && lit > 0 &&
+                         carved && lootedHeld && a0.seq < b0.seq;
+
+  // ======== S: save and load ===============================================
+  std::vector<uint8_t> blob;
+  c.mobs.SaveState(blob);
+  c.debris.Reset();
+  c.mobs.Reset();
+  const bool readS = c.mobs.LoadState(blob.data(), blob.size(), MobSystem::kSaveVersion);
+  const uint32_t backS = c.mobs.MobCount();
+  const uint64_t idA1 = backS == 2 ? c.mobs.MobIdAt(0) : 0;
+  const uint64_t idB1 = backS == 2 ? c.mobs.MobIdAt(1) : 0;
+  const Snap a1 = snap(idA1), b1 = snap(idB1);
+  double poseA1 = 0, poseB1 = 0;
+  const std::string whyA1 = same(a0, a1, poseA1), whyB1 = same(b0, b1, poseB1);
+  const std::string reA = MobRecordDiff(recA0, recordOf(idA1));
+  const std::string reB = MobRecordDiff(recB0, recordOf(idB1));
+  const bool orderKept = a1.seq < b1.seq;
+  const uint32_t liveS = c.mobs.LiveMobCount();
+  // ...and it lies still: 30 stepped ticks, no root moves far.
+  for (int i = 0; i < 30; i++) tick(true);
+  const Snap a1s = snap(idA1), b1s = snap(idB1);
+  auto drift = [](const Snap& x, const Snap& y) {
+    const Vec3 d{x.root.x - y.root.x, x.root.y - y.root.y, x.root.z - y.root.z};
+    return (double)std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z);
+  };
+  const double settleS = std::max(drift(a1, a1s), drift(b1, b1s));
+  const bool stillDeadS = a1s.found && b1s.found && !a1s.alive && !b1s.alive &&
+                          !a1s.released && !b1s.released;
+  RecordObserved("corpseSaveSettleVox", settleS);
+  RecordObserved("corpseSavePoseVox", std::max(poseA1, poseB1));
+  const bool okS = readS && backS == 2 && liveS == 0 && whyA1.empty() &&
+                   whyB1.empty() && reA.empty() && reB.empty() && orderKept &&
+                   stillDeadS && settleS <= settleMax;
+
+  // ======== P: park and unpark past a full living crowd =====================
+  const Snap a2 = snap(idA1), b2 = snap(idB1);
+  parking.Bind(c.mobs, c.stream.Store(), true);
+  teleport(away);
+  pc = {away.x + n / 2, home.y + n / 2, away.z + n / 2};
+  tick(true);
+  const uint32_t leftAfterPark = c.mobs.MobCount();
+  const uint64_t parkedN = parking.GetStats().parked;
+  const bool risingWithdrawn = !c.mobs.RisingPending(idB1);
+  // The records as parked: an unparked corpse must re-save as exactly one of
+  // them (voxels, pose, gear, dead state, the rising's ticks left).
+  std::vector<std::vector<uint8_t>> parkedRecs;
+  {
+    const uint32_t kMobs = 'M' | ('O' << 8) | ('B' << 16) | ((uint32_t)'S' << 24);
+    std::vector<IVec3> regions;
+    for (const Snap* sp : {&a2, &b2}) {
+      const IVec3 rc = ChunkStore::RegionOfVoxel(sp->origin);
+      bool dup = false;
+      for (const IVec3& r : regions) dup |= r.x == rc.x && r.y == rc.y && r.z == rc.z;
+      if (!dup) regions.push_back(rc);
+    }
+    for (const IVec3& rc : regions)
+      for (const EntityRecord& r : c.stream.Store().DormantEntities(rc))
+        if (r.section == kMobs) parkedRecs.push_back(r.bytes);
+  }
+  teleport(home);
+  parking.ResetWaits();
+  parking.ResetStats();
+  pc = {base.x >> 4, World::TerrainHeight(base.x, base.z, kDefaultSeed) >> 4,
+        base.z >> 4};
+  std::vector<uint64_t> crowd;
+  for (int k = 0; k < 16; k++) {
+    const int x = base.x - 60 + (k % 4) * 8, z = base.z - 60 + (k / 4) * 8;
+    const uint64_t d =
+        c.mobs.Spawn(dummyDef, {x, World::TerrainHeight(x, z, kDefaultSeed) + 1, z});
+    if (d) crowd.push_back(d);
+  }
+  const bool crowdFull = !c.mobs.HasRoomToSpawn();
+  std::vector<uint64_t> back;
+  for (int i = 0; i < 240 && back.size() < 2; i++) {
+    tick(false);
+    parking.Unpark(c.mobs, c.stream.Store(), c.world, t, 4);
+    for (uint32_t mi = 0; mi < c.mobs.MobCount(); mi++) {
+      const Mob* m = c.mobs.MobAt(mi);
+      if (m == nullptr || m->Alive()) continue;
+      if (std::find(back.begin(), back.end(), m->Id()) == back.end())
+        back.push_back(m->Id());
+    }
+  }
+  const MobParking::Stats ps = parking.GetStats();
+  const uint32_t liveP = c.mobs.LiveMobCount();
+  // Which is which: by death order (A died first).
+  uint64_t idA2 = 0, idB2 = 0;
+  if (back.size() == 2) {
+    const Mob* m0 = c.mobs.FindMobById(back[0]);
+    const Mob* m1 = c.mobs.FindMobById(back[1]);
+    const bool firstIsA = m0 && m1 && m0->DeathSeq() < m1->DeathSeq();
+    idA2 = firstIsA ? back[0] : back[1];
+    idB2 = firstIsA ? back[1] : back[0];
+  }
+  const Snap a3 = snap(idA2), b3 = snap(idB2);
+  double poseA3 = 0, poseB3 = 0;
+  const std::string whyA3 = same(a2, a3, poseA3, false),
+                    whyB3 = same(b2, b3, poseB3, false);
+  int recSame = 0;
+  std::string recWhy;
+  for (uint64_t id : {idA2, idB2}) {
+    const std::vector<uint8_t> now = recordOf(id);
+    std::string first;
+    bool hit = false;
+    for (const std::vector<uint8_t>& pr : parkedRecs) {
+      const std::string d = MobRecordDiff(pr, now);
+      if (d.empty()) hit = true;
+      else if (first.empty()) first = d;
+    }
+    if (hit) recSame++;
+    else if (recWhy.empty()) recWhy = first.empty() ? "no parked record" : first;
+  }
+  RecordObserved("corpseSaveUnparkPoseVox", std::max(poseA3, poseB3));
+  const bool okP = parkedN == 2 && leftAfterPark == 0 && risingWithdrawn &&
+                   crowdFull && back.size() == 2 && ps.capWaits == 0 &&
+                   ps.unparked == 2 && ps.failed == 0 && liveP == crowd.size() &&
+                   whyA3.empty() && whyB3.empty() && parkedRecs.size() == 2 &&
+                   recSame == 2;
+
+  // ======== R: the carried booking still raises B ===========================
+  for (uint64_t d : crowd) c.mobs.RemoveMob(d);
+  uint64_t risen = 0;
+  {
+    std::vector<BrushOp> ops;
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    // The first PreTick books the deferred rising against its clock; the
+    // second is past any `afterSec` a def could reasonably author.
+    c.mobs.PreTick(t + 1, c.world, ops, cellOps, spawns);
+    c.mobs.PreTick(t + 1 + 30 * 60, c.world, ops, cellOps, spawns);
+    for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+      const Mob* om = c.mobs.MobAt(i);
+      if (om != nullptr && om->Alive() && om->Def() != nullptr && om->Def()->undead)
+        risen = om->Id();
+    }
+  }
+  const Mob* aAfter = c.mobs.FindMobById(idA2);
+  const bool aStillThere = aAfter != nullptr && !aAfter->Alive();
+  const bool okR = risen != 0 && aStillThere;
+
+  detail = Format(
+      "fixture %s: dead %d, worn %d, held '%s' looted %d, burnt %u, carved %d, "
+      "rising booked on B %d, cause A '%s', order %llu<%llu | S %s: read %d, "
+      "%u back (%u alive), A %s, B %s, re-save A %s B %s, order kept %d, "
+      "pose %.3f/%.3f (tol %.2f), 30-tick drift %.2f (max %.1f) still dead %d | "
+      "P %s: parked %llu, left %u, rising withdrawn %d; living crowd %zu full %d, "
+      "%zu corpses back, cap waits %llu, unparked %llu, failed %llu, live %u; "
+      "A %s, B %s, %d/%zu re-save as their parked record%s%s | R %s: risen "
+      "%llu, A still dead %d",
+      fixtureOk ? "ok" : "FAIL", bothDead ? 1 : 0, worn, heldName.c_str(),
+      lootedHeld ? 1 : 0, lit, carved ? 1 : 0, b0.rising ? 1 : 0, a0.cause.c_str(),
+      (unsigned long long)a0.seq, (unsigned long long)b0.seq, okS ? "ok" : "FAIL",
+      readS ? 1 : 0, backS, liveS, whyA1.empty() ? "same" : whyA1.c_str(),
+      whyB1.empty() ? "same" : whyB1.c_str(), reA.empty() ? "identical" : reA.c_str(),
+      reB.empty() ? "identical" : reB.c_str(), orderKept ? 1 : 0, poseA1, poseB1,
+      poseTol, settleS, settleMax, stillDeadS ? 1 : 0, okP ? "ok" : "FAIL",
+      (unsigned long long)parkedN, leftAfterPark, risingWithdrawn ? 1 : 0,
+      crowd.size(), crowdFull ? 1 : 0, back.size(),
+      (unsigned long long)ps.capWaits, (unsigned long long)ps.unparked,
+      (unsigned long long)ps.failed, liveP, whyA3.empty() ? "same" : whyA3.c_str(),
+      whyB3.empty() ? "same" : whyB3.c_str(), recSame, parkedRecs.size(),
+      recWhy.empty() ? "" : ", first: ", recWhy.c_str(), okR ? "ok" : "FAIL",
+      (unsigned long long)risen, aStillThere ? 1 : 0);
+  restore();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return fixtureOk && okS && okP && okR ? Status::Pass : Status::Fail;
+}
+
 // ---- mob-handoff -----------------------------------------------------------
 //
 // ONE CREATURE, ONE SIMULATOR (docs/PLAN_multiplayer_m9.md M9.4-B).
@@ -11457,6 +11938,11 @@ const std::vector<Gate>& MobGates() {
       // comes back, byte-identical and on known ground, when the window
       // returns -- bounded per tick, through a save and load. No render.
       {"mob-park", "mob", {}, false, GateMobPark, /*needsRender=*/false},
+      // MOBS v6: an armoured, burnt, carved, half-looted corpse and a bitten
+      // one round-trip through a save and through park/unpark past a full
+      // living crowd -- still dead, same voxels, same loot, same lying pose,
+      // and the booked rising still rises. No render.
+      {"corpse-save", "mob", {}, false, GateCorpseSave, /*needsRender=*/false},
       // NPC AI. No render either: every claim is a distance, an angle or a
       // count, which is what makes them iterable with `--gate` alone.
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},

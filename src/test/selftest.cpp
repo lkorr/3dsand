@@ -480,6 +480,10 @@ const char* const kOrder[] = {
     // world dir, and so REGENERATES worldgen at the home window on the way
     // out, removes its park function and clears the store.
     "mob-park",
+    // MOBS v6 (PLAN_corpse_is_a_mob P2a). After `mob-park` for the same exit
+    // contract: mobs, debris and risings reset, id counter restored, park
+    // function removed, store cleared, worldgen regenerated at home.
+    "corpse-save",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find

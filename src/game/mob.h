@@ -1727,10 +1727,11 @@ class Mob {
   // loop, lifted out so the handoff and the save file cannot drift apart
   // (`save-entities` gates the format; `mob-handoff` gates the round trip).
   //
-  // What it does NOT carry, on purpose: the id and the worn/held gear. The id
-  // because a save re-spawns into a fresh counter; the gear because it is rig
-  // slots somebody re-dresses by name. The handoff carries both beside the
-  // record (net/mobsync.h). Since v5 (save plan S5b) it DOES carry the
+  // What it does NOT carry, on purpose: the id, because a save re-spawns into
+  // a fresh counter (the handoff carries it beside the record, net/mobsync.h).
+  // Until v6 it did not carry the worn/held gear either -- "rig slots somebody
+  // re-dresses by name", except that nobody did on a load; v6 carries the
+  // gear list and whether the creature is dead (kSaveVersion). Since v5 (save plan S5b) it DOES carry the
   // brain's memory -- profile by name and the target -- because a creature
   // parked out of the window must come back still hunting what it hunted.
   //
@@ -1740,6 +1741,11 @@ class Mob {
   // manufactures an old-format record to prove it still loads.
   void SaveOne(ByteWriter& w) const;
   void SaveOne(ByteWriter& w, uint32_t version) const;
+  // Worn pieces and the held item as the record (v6) and the announce list
+  // them: identity-shell dye, CaptureWorn damage, IN RIG-SLOT ORDER so that
+  // replaying the list (MobSystem::ApplyWireGear) appends the same slots in
+  // the same places. The same walk as MobSystem::BuildAnnounce's gear half.
+  void CaptureGear(std::vector<::net::WireGear>& out) const;
   // ---- IS THIS LIMB EXACTLY WHAT ITS DEF AUTHORED? (MOBS v4) ----------------
   //
   // True when body limb `i` is attached and its collider lattice, skin
@@ -4695,7 +4701,17 @@ class MobSystem {
   // positional), so after a quit it may name nobody -- the brain then drops
   // the target the way it drops any target it cannot resolve. v4 and v3 still
   // LOAD (a fresh brain on the def's profile, which is all they ever had).
-  static constexpr uint32_t kSaveVersion = 5;
+  //
+  // 6 (2026-09-24, PLAN_corpse_is_a_mob.md P2a): THE DEAD ARE SAVED. A tail
+  // after the brain: a flags word (bit 0 = dead), then the gear list (worn
+  // pieces and the held item, rig-slot order, Mob::CaptureGear -- written for
+  // the living too, who until now came back from a save naked), then, for a
+  // dead record only, the death cause by name, its DeathSeq, and the pending
+  // rising if one is booked (fx by name, ticks left). A dead record loads
+  // straight into the dead state on the pose its limbs were lying in (always
+  // placed, whatever `placeLimbs` says); it never stands up in Spawn's rest
+  // pose to fall over. v3..v5 still LOAD, alive and undressed as before.
+  static constexpr uint32_t kSaveVersion = 6;
   static constexpr uint32_t kSaveVersionMin = 3;
   // Record limb kinds (v4).
   static constexpr uint32_t kLimbSevered = 0;
@@ -4793,6 +4809,18 @@ class MobSystem {
   // unpark is a spawn, so it is refused (and the record stays parked) while
   // the live crowd is full. This is that test, asked from outside.
   bool HasRoomToSpawn() const { return LiveMobCount() < kMaxMobs; }
+  // ...and asked of a RECORD (MOBS v6): a dead record never waits on the
+  // living cap -- it is subject to the dead cap instead, which is enforced by
+  // decay (EvictDead: the oldest corpse goes to debris), never by refusal.
+  // A record that does not parse answers "room" so the loader drops it.
+  static bool RecordIsDead(const uint8_t* data, size_t len, uint32_t version);
+  // Whether `m` is written as a record by a save (SaveState, persist.cpp's
+  // region records): the living and the unreleased dead with a body left. A
+  // husk (ReleaseRigToDebris) is DBRS's already.
+  bool SavesAsRecord(const Mob& m) const;
+  bool HasRoomForRecord(const uint8_t* data, size_t len, uint32_t version) const {
+    return HasRoomToSpawn() || RecordIsDead(data, len, version);
+  }
   // ---- THE TWO CAPS (PLAN_corpse_is_a_mob.md "Bounds") ---------------------
   // `kMaxMobs` counts the LIVING; the dead have their own count and a body
   // budget over their limbs. Past either, the oldest corpse (lowest DeathSeq)
@@ -5858,6 +5886,9 @@ class MobSystem {
   // a saved creature already carries the holes it was born with, in its saved
   // lattice, and biting it again on every load would eat it.
   bool loading_ = false;
+  // True only around LoadOne's Spawn of a DEAD record: the living cap does
+  // not apply to a corpse (kMaxDeadMobs does, by decay).
+  bool spawnDead_ = false;
   std::vector<float> densityOf_;
   std::vector<uint32_t> classOf_;
   // ---- burn tables, rebuilt on materials hot-reload --------------------------
@@ -5994,6 +6025,12 @@ class MobSystem {
     // for the machine that owned it when it died — the one whose op stream
     // carried the wounds that killed it.
     uint32_t owner = 0;
+    // A booking restored from a save or an unpark (MOBS v6) knows how many
+    // ticks it had LEFT, not the clock it was booked against: the loader runs
+    // before the tick that owns `tick_` does. ServiceRisings resolves it to
+    // `atTick = tick + ticksLeft` on the first tick that sees it.
+    bool deferred = false;
+    uint32_t ticksLeft = 0;
   };
   // Bounded like every other emergent queue here (CLAUDE.md rule 2): a crowd
   // dying at once books a crowd of risings, and the cost of one is a spawn.
@@ -6053,6 +6090,11 @@ class MobSystem {
   // flicker the body for nothing.
   struct MobRecord;
   static bool ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version);
+  // LoadOne's dead branch (MOBS v6): Die's end state without Die's effects.
+  void EnterLoadedDead(Mob& m, const MobRecord& rec);
+  // v6: the record's slots re-ordered onto the dressed rig's (base by index,
+  // appended by name). OverlayMobRecord's first step for a v6 record.
+  void AlignRecordToRig(const Mob& m, MobRecord& rec);
   // PristineOf's cache: one entry per def index, built on demand.
   mutable std::vector<std::shared_ptr<const std::vector<PristineLimb>>>
       pristine_;
