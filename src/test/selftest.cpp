@@ -32,6 +32,9 @@ const std::vector<Gate>& TerrainGates();
 const std::vector<Gate>& TreeGates();
 const std::vector<Gate>& BiomeGates();
 const std::vector<Gate>& EnvTruthGates();
+// The Node generator data gates (test_mobgen / test_anatomy / test_environment.mjs),
+// shelled out to through scripts/generator_parity.mjs. No World, no GPU.
+const std::vector<Gate>& GeneratorGates();
 const std::vector<Gate>& ScaleGates();
 const std::vector<Gate>& SimGates();
 const std::vector<Gate>& CaGates();
@@ -199,6 +202,12 @@ const char* const kOrder[] = {
     // asserts they agree with each other and with the atlas that was just
     // checked. No world, no GPU, nothing left behind.
     "biomes",
+    // With them: `generator-parity` runs the Node generator data gates
+    // (scripts/generator_parity.mjs). A child process over files on disk -- no
+    // World, no GPU, nothing left behind -- and cached on its inputs, so it
+    // costs one node start unless a generator or its data changed. SKIPS
+    // without node on PATH.
+    "generator-parity",
     "terrain",
     // Right after terrain, on the same pristine world: the painted map's
     // biome reaches the kernel (CPU twin at cell centres, GPU skin in-window).
@@ -812,7 +821,7 @@ const char* const kOrder[] = {
 const std::vector<Gate>& Registry() {
   static std::vector<Gate> all = [] {
     std::vector<Gate> pool;
-    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &ScaleGates(),
+    for (const auto* g : {&TerrainGates(), &TreeGates(), &BiomeGates(), &EnvTruthGates(), &GeneratorGates(), &ScaleGates(),
                           &SimGates(), &CaGates(), &GasGates(), &WindGates(), &WaterGates(),
                           &RenderGates(),
                           &PlayerGates(),

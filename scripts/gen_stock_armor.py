@@ -20,7 +20,8 @@ reason it is done this way:
     torso, so "degraded armour shows the body underneath" needs no code: burn a
     hole in the cloth and the skin is simply visible through it.
   * It cannot go stale. The limb boxes and the shape builders are IMPORTED from
-    gen_human.py, never restated here, so re-proportioning the human
+    human_art.py (the retired gen_human.py's limb table), never restated
+    here, so re-proportioning the human
     re-proportions the coat. CLAUDE.md's rule against a second source of truth,
     applied to art.
   * `offset` and `fitBox` in the sidecar are MEASURED off that same import
@@ -49,8 +50,8 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 # THE BODY THIS IS CUT FOR. Imported rather than restated — see the note above.
-# gen_human's main() is guarded, so this costs nothing but the module.
-import gen_human as H
+# human_art.py is a library (the retired gen_human.py minus its writer).
+import human_art as H
 
 # ---- materials --------------------------------------------------------------
 # PALETTE CONVENTION (as everywhere): .vox palette index i+1 == materials.json[i].

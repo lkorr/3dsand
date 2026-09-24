@@ -160,7 +160,7 @@ def resolve_ids():
     return missing
 
 
-# ---- .vox writing (same hand-rolled chunks as scripts/gen_test_mob.py) -------
+# ---- .vox writing (same hand-rolled chunks as scripts/human_art.py) ---------
 def chunk(cid, content, children=b""):
     return cid + struct.pack("<ii", len(content), len(children)) + content + children
 

@@ -640,8 +640,7 @@ Status GateCombatCues(Ctx& c, std::string& detail) {
       ok = false;
       std::printf(
           "combat-cues: FAILED '%s' resolves to nothing. The set is a FOLDER "
-          "under assets/sounds — run `python scripts/gen_combat_sounds.py` for "
-          "the placeholders, or add real takes through scripts/import_sounds.py\n",
+          "under assets/sounds — add takes through scripts/import_sounds.py\n",
           s.name);
     } else {
       resolved++;

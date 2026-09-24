@@ -381,8 +381,12 @@ console.log('\n-- predictions export (tests/env_predictions.json) --');
   }
   const path = join(ROOT, 'tests', 'env_predictions.json');
   const text = JSON.stringify(out, null, 2) + '\n';
-  const before = existsSync(path) ? readFileSync(path, 'utf8') : '';
-  writeFileSync(path, text);
+  // Compared with line endings normalised, and NOT rewritten when equal: a
+  // Windows checkout holds this file CRLF, the text below is LF, and rewriting
+  // it unconditionally dirtied the tree on every run -- which matters now that
+  // post_edit_check.sh and the `generator-parity` gate run this unasked.
+  const before = existsSync(path) ? readFileSync(path, 'utf8').replace(/\r\n/g, '\n') : '';
+  if (before !== text) writeFileSync(path, text);
   ok(true, 'wrote tests/env_predictions.json (' + Object.keys(out.biomes).length + ' biomes, biomesHash ' + out.biomesHash +
      (before === text ? ', unchanged)' : before ? ', CHANGED -- commit it)' : ', new -- commit it)'));
 }

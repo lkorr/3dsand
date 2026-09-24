@@ -252,7 +252,9 @@ def main():
             "mesh, so the hitbox cannot drift from the art."),
         "name": "sword",
         "model": "sword",
-        "scale": SCALE,
+        # The modern key for the legacy `"scale": SCALE` the committed file was
+        # migrated off: mob.cpp reads a legacy scale as scale * 10 vox/m.
+        "artVoxelsPerMetre": SCALE * 10,
         "hp": 30,
         "severable": True,
         "severImpactSpeed": 7.0,
