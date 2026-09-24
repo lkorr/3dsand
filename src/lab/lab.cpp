@@ -252,7 +252,6 @@ void EmitCell(int x, int y, int z, int32_t vx, int32_t vy, int32_t vz,
     op.vx = vx;
     op.vy = vy;
     op.vz = vz;
-    op.species = 0;
     op.mat = mat;
     out.push_back(op);
   }
@@ -814,8 +813,6 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
     std::fprintf(stderr, "--fluid-bench: no 'water' material\n");
     return 1;
   }
-  const uint32_t splashMats[4] = {waterId, 0, 0, 0};
-
   SetHarnessSnapshotDrain(true);  // headless tick loop: see test/support.h
 
   PassTimer timer;
@@ -1040,8 +1037,7 @@ int RunFluidBench(GpuContext& ctx, World& world, Simulation& sim,
       std::vector<FluidSpawnOp> fs;
       LabScenePour(scene, st, liveEst, waterId, fs);
       SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, cops, false,
-                 pc, false, liveEst + fs.size() > 0, {}, 0, fs, liveEst,
-                 splashMats);
+                 pc, false, liveEst + fs.size() > 0, {}, 0, fs, liveEst);
       poured += fs.size();
       ctx.WaitIdle();
       ctx.ProcessEvents();

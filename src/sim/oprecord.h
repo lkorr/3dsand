@@ -248,8 +248,6 @@ struct TickInputs {
   int32_t playerChunk[3] = {0, 0, 0};
   uint32_t farCount = 0;
   uint32_t fluidLive = 0;
-  uint32_t hasSplashMat = 0;
-  uint32_t fluidSplashMat[4] = {0, 0, 0, 0};
 };
 
 // One tick, as it reached the GPU.
@@ -316,7 +314,10 @@ struct Header {
 //    with a default-empty vector — but a frame body is a flat byte run with no
 //    per-field tags, so a reader that expected the field would run off the end
 //    of every old frame. The bump turns that into one clear refusal.
-constexpr uint32_t kRecordVersion = 3;
+// 4: TickInputs lost hasSplashMat + fluidSplashMat[4] (W1-B2: a fluid
+//    particle splashes as its own material, so the per-species splash table
+//    is gone). TickInputs is written as one POD, so the frame shrank.
+constexpr uint32_t kRecordVersion = 4;
 
 // ---- recording ----
 // Start appending frames to `path`. `mats` is the loaded material table: its

@@ -2239,10 +2239,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "skyHorizonOffset", r.skyHorizonOffset, out, at);
     ReadV3(*g, "skyHorizon", r.skyHorizon, out, at);
     ReadV3(*g, "skyZenith", r.skyZenith, out, at);
-    ReadV3(*g, "fluidColor", r.fluidColor, out, at);
-    ReadV3(*g, "fluidColor1", r.fluidColor1, out, at);
-    ReadV3(*g, "fluidColor2", r.fluidColor2, out, at);
-    ReadV3(*g, "fluidColor3", r.fluidColor3, out, at);
     ReadF(*g, "fluidParticleSize", r.fluidParticleSize, out, at);
     ReadF(*g, "fluidStretch", r.fluidStretch, out, at);
     ReadF(*g, "fluidDensityShade", r.fluidDensityShade, out, at);

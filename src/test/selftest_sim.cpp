@@ -1167,6 +1167,202 @@ Status GateFluidDet(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- fluid-identity ------------------------------------------------------
+// W1-B2: an MPM particle's ONE identity is its material. The part of that a
+// gate can see without a camera is DENSITY: the solver used to weigh every
+// particle the same (and group them by a four-slot `species` that made acid
+// and water one liquid), so a heavier liquid poured over a lighter one just
+// sat there until the settle converter handed it to the CA. Now momentum is
+// mass-weighted by materials[].density and the grid divides by mass, so the
+// same pressure field pushes the light liquid up through the heavy one.
+//
+// Fixture: fluid-det's stone basin (taller) filled wall to wall with two
+// liquids, `L` cells of each (fluidIdentityLayerCells), spawned one cell-row
+// per tick, bottom first. The interface is NOT flat: under a central 7x7
+// patch it sits `D` cells lower (fluidIdentityDipCells), so the top liquid
+// starts with a finger pushed into the bottom one. That seed matters: at grid
+// resolution a mixed node carries one velocity, so two liquids only move
+// relative to each other between nodes of different composition — thin flat
+// layers are all interface and cannot overturn, which the first version of
+// this gate measured (acid 4x water's density, 2+2 cell layers: no overturn
+// in 25 ticks).
+//   A: ACID (1200 kg/m^3) over WATER (1000) — unstable, the finger sinks;
+//   B: WATER over ACID — stable, the same finger (now of water) is pushed
+//      back up. Same volumes, same ticks, same jitter.
+// The measure is by MATERIAL, never by spawn order (the seam re-excites
+// settled water with a fresh birth tick): sep = mean height of live acid
+// particles minus that of live water particles, in cells. Compression and
+// numerical mixing shrink |sep| in BOTH arms alike (measured: A +1.25 ->
+// +1.05, B -1.30 -> -1.11 over 25 ticks); density shrinks A's faster, because
+// in A the heavy liquid is going down and in B it is already there. The
+// verdict is that difference, at the last checkpoint where both arms are
+// still mostly particles (after the settle converter the CA's own density
+// swaps would pass this for the wrong reason): A's loss of separation must
+// exceed B's by fluidIdentityMarginCells. The OLD solver weighed both liquids
+// the same, so A and B were mirror images and the difference was ~0.
+// Arm A runs twice: the non-water mass path (massScale, nodeMass, the
+// composition words) is new code and gets its own twice-run particle + world
+// hash — fluid-det only ever pours water.
+Status GateFluidIdentity(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0, acidId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "water") waterId = (uint32_t)i;
+    if (c.mats[i].name == "acid") acidId = (uint32_t)i;
+  }
+  if (waterId == 0 || acidId == 0) {
+    detail = "needs 'water' and 'acid' materials";
+    return Status::Fail;
+  }
+
+  const int L = std::clamp((int)BaselineNumber("fluidIdentityLayerCells", 4.0), 1, 6);
+  const int D = std::clamp((int)BaselineNumber("fluidIdentityDipCells", 2.0), 0, L - 1);
+  const double margin = BaselineNumber("fluidIdentityMarginCells", 0.25);
+  const int px = 96, py = 120, pz = 96, R = 8, H = 2 * L + 6;
+  const int kSpawnTicks = 2 * L;             // one cell-row per tick
+  static const int kChecks[] = {15, 20, 25, 30, 35, 40, 45};
+  constexpr int kNumChecks = (int)(sizeof(kChecks) / sizeof(kChecks[0]));
+  const int kLastTick = kChecks[kNumChecks - 1];
+
+  // Interface height of column (cx, cz): L, or L - D under the central 7x7.
+  auto iface = [&](int cx, int cz) {
+    return (std::abs(cx) <= 3 && std::abs(cz) <= 3) ? L - D : L;
+  };
+  // Row `row` of the pool: the bottom liquid below the interface, the top one
+  // above it, 8 particles per cell on the half-cell lattice with hash jitter.
+  auto spawnRow = [&](int row, uint32_t bottomMat, uint32_t topMat) {
+    std::vector<FluidSpawnOp> fs;
+    for (int cz = -R; cz <= R; cz++)
+      for (int cx = -R; cx <= R; cx++)
+        for (int s = 0; s < 8; s++) {
+          uint32_t h = ((uint32_t)fs.size() * 6271u + 777u + (uint32_t)row * 131u) *
+                           747796405u + 2891336453u;
+          FluidSpawnOp op{};
+          op.px = ((px + cx) << 16) + ((s & 1) ? 49152 : 16384) +
+                  (int32_t)(h % 8192u) - 4096;
+          op.py = ((py + row) << 16) + ((s & 2) ? 49152 : 16384) +
+                  (int32_t)((h >> 13) % 8192u) - 4096;
+          op.pz = ((pz + cz) << 16) + ((s & 4) ? 49152 : 16384) +
+                  (int32_t)((h >> 19) % 8192u) - 4096;
+          op.mat = row < iface(cx, cz) ? bottomMat : topMat;
+          fs.push_back(op);
+        }
+    return fs;
+  };
+
+  struct Arm {
+    double sep[kNumChecks] = {};     // acid mean y - water mean y, cells
+    uint32_t acidN[kNumChecks] = {}, waterN[kNumChecks] = {};
+    uint32_t acidSpawned = 0, waterSpawned = 0;
+    uint64_t hash = 0;
+    uint32_t worldHash = 0;
+  };
+  auto runArm = [&](uint32_t bottomMat, uint32_t topMat) -> Arm {
+    Arm a;
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    std::vector<CellOp> basin;
+    auto put = [&](int x, int y, int z, uint32_t m) {
+      basin.push_back({World::SlotCellIndex({x, y, z}), (uint32_t)(m & 0xFFFu)});
+    };
+    for (int z = -R - 1; z <= R + 1; z++)
+      for (int x = -R - 1; x <= R + 1; x++) {
+        put(px + x, py - 1, pz + z, kMatStone);
+        bool rim = (x < -R || x > R || z < -R || z > R);
+        for (int y = 0; y < H; y++)
+          put(px + x, py + y, pz + z, rim ? kMatStone : kMatAir);
+      }
+    uint32_t fluidN = 0;
+    uint32_t ft = 40000;
+    std::vector<uint32_t> buf;
+    int check = 0;
+    for (int i = 0; i <= kLastTick; i++) {
+      std::vector<FluidSpawnOp> fs;
+      if (i >= 1 && i <= kSpawnTicks) {
+        fs = spawnRow(i - 1, bottomMat, topMat);
+        for (const FluidSpawnOp& op : fs)
+          (op.mat == acidId ? a.acidSpawned : a.waterSpawned)++;
+      }
+      SubmitTick(ctx, world, sim, ++ft, kDefaultSeed, {}, {},
+                 i == 0 ? basin : std::vector<CellOp>{}, false, {6, 7, 6},
+                 /*wantReadback=*/false, /*particlesActive=*/false, {}, 0, fs,
+                 fluidN);
+      fluidN += (uint32_t)fs.size();
+      ctx.WaitIdle();
+      ctx.ProcessEvents();
+      if (check >= kNumChecks || i != kChecks[check]) continue;
+      uint32_t fa[16] = {};
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, world.fluidArgsStage, 0, fa,
+                            64, "fluidIdArgs");
+      const uint32_t live = std::min(fa[7], kFluidCap);
+      buf.assign((size_t)live * kFluidParticleWords, 0u);
+      if (live > 0)
+        rhi::ReadbackBlocking(ctx.device, ctx.queue,
+                              world.fluidParticles[sim.Page()], 0, buf.data(),
+                              buf.size() * 4, "fluidId");
+      double ay = 0, wy = 0;
+      for (uint32_t k = 0; k < live; k++) {
+        const uint32_t* p = &buf[(size_t)k * kFluidParticleWords];
+        const uint32_t m = p[18] & 0xFFFu;
+        const double y = (double)(int32_t)p[1] / 65536.0;
+        if (m == acidId) { ay += y; a.acidN[check]++; }
+        else if (m == waterId) { wy += y; a.waterN[check]++; }
+      }
+      if (a.acidN[check] && a.waterN[check])
+        a.sep[check] = ay / a.acidN[check] - wy / a.waterN[check];
+      check++;
+    }
+    uint64_t h = 1469598103934665603ull;   // the LAST checkpoint's live pool
+    for (uint32_t w : buf) { h ^= w; h *= 1099511628211ull; }
+    a.hash = h ^ ((uint64_t)(buf.size() / kFluidParticleWords) << 32);
+    a.worldHash = HashWorldNow(ctx, world, sim, kDefaultSeed);
+    return a;
+  };
+
+  const Arm over1 = runArm(waterId, acidId);   // acid poured onto water
+  const Arm over2 = runArm(waterId, acidId);
+  const Arm under = runArm(acidId, waterId);   // water poured onto acid
+
+  // Mostly particles: at least half of each liquid, in BOTH arms.
+  auto mostlyLive = [&](const Arm& a, int k) {
+    return a.acidN[k] * 2 >= a.acidSpawned && a.waterN[k] * 2 >= a.waterSpawned;
+  };
+  std::string traj;
+  int verdictAt = -1;   // the last checkpoint both arms are mostly particles
+  for (int k = 0; k < kNumChecks; k++) {
+    traj += Format(" t%d %+.2f/%+.2f (%u+%u)", kChecks[k], over1.sep[k],
+                   under.sep[k], over1.acidN[k], over1.waterN[k]);
+    if (mostlyLive(over1, k) && mostlyLive(under, k)) verdictAt = k;
+  }
+  // How much separation each arm has LOST since the first checkpoint. The
+  // symmetric processes take the same from both; density takes more from A.
+  double lossA = 0, lossB = 0;
+  if (verdictAt > 0) {
+    lossA = std::abs(over1.sep[0]) - std::abs(over1.sep[verdictAt]);
+    lossB = std::abs(under.sep[0]) - std::abs(under.sep[verdictAt]);
+  }
+  const bool det = over1.hash == over2.hash && over1.worldHash == over2.worldHash;
+  const bool orderOk = over1.sep[0] > 0.0 && under.sep[0] < 0.0;  // measure sane
+  const bool sank = verdictAt > 0 && lossA > lossB + margin;
+  const bool ok = det && orderOk && sank;
+  std::printf(
+      "fluid identity: %s (L %d, dip %d; sep acid-over-water / water-over-acid,"
+      " cells [A live acid+water]:%s; by t%d A lost %.2f cells of separation, "
+      "B %.2f, needs A > B + %.2f; acid particle hash %016llx %s, world %s)\n",
+      ok ? "PASS" : "FAIL", L, D, traj.c_str(),
+      verdictAt >= 0 ? kChecks[verdictAt] : -1, lossA, lossB, margin,
+      (unsigned long long)over1.hash,
+      over1.hash == over2.hash ? "matches" : "DIVERGED",
+      over1.worldHash == over2.worldHash ? "matches" : "DIVERGED");
+  detail = Format("loss A %.2f vs B %.2f (t%d), order %s, det %s", lossA, lossB,
+                  verdictAt >= 0 ? kChecks[verdictAt] : -1,
+                  orderOk ? "ok" : "WRONG", det ? "ok" : "DIVERGED");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- fluid-settle --------------------------------------------------------
 // The settle converter in isolation (plan §7, Phase 2): pour MPM water into a
 // stone basin, stop, and require the WHOLE pool to convert back to fullness
@@ -1825,7 +2021,6 @@ Status GateFluidOnWater(Ctx& c, std::string& detail) {
             op.vx = 0;
             op.vy = -65536;   // 1 cell/tick down = 30 vox/s
             op.vz = 0;
-            op.species = 0;
             op.mat = waterId;
             pour.push_back(op);
           }
@@ -4138,7 +4333,6 @@ Status GateOpsReplay(Ctx& c, std::string& detail) {
                {f.in.playerChunk[0], f.in.playerChunk[1], f.in.playerChunk[2]},
                f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
                f.in.farCount, f.fluid, f.in.fluidLive,
-               f.in.hasSplashMat ? f.in.fluidSplashMat : nullptr,
                f.in.vizActive != 0);
     if (f.in.tick % kProbeEvery == 0 || f.in.tick == (uint32_t)kTicks)
       hashB.push_back(ReadHashSync(c.ctx, c.world));
@@ -4899,7 +5093,6 @@ Status GateChunkResync(Ctx& c, std::string& detail) {
                     f.in.playerChunk[2]},
                    f.in.wantReadback != 0, f.in.particlesActive != 0, f.spawns,
                    f.in.farCount, f.fluid, f.in.fluidLive,
-                   f.in.hasSplashMat ? f.in.fluidSplashMat : nullptr,
                    f.in.vizActive != 0);
       }
       replayFrames = (uint32_t)log.frames.size();
@@ -4963,6 +5156,7 @@ const std::vector<Gate>& SimGates() {
       {"blood-stain", "sim", {}, false, GateBloodStain},
       {"flung-liquid", "sim", {}, false, GateFlungLiquid},
       {"fluid-det", "sim", {}, false, GateFluidDet},
+      {"fluid-identity", "sim", {}, false, GateFluidIdentity},
       {"fluid-settle", "sim", {}, false, GateFluidSettle},
       {"fluid-excite", "sim", {}, false, GateFluidExcite},
       {"fluid-onwater", "sim", {}, false, GateFluidOnWater},

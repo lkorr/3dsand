@@ -832,10 +832,16 @@ constexpr uint32_t kFluidSettleMax = 16;
 struct FluidSpawnOp {
   int32_t px, py, pz;   // position, fixed 16.16 world cells
   int32_t vx, vy, vz;   // velocity, fixed 16.16 cells/tick
-  uint32_t species = 0; // 0..3: grid species-mass slot (colour + attraction)
+  // Spawn FLAGS (the word common.wgsl still calls `species`, a name kept
+  // only because W1-B2 could not edit common.wgsl; nothing reads bits 0..7).
+  // Bit 8 = GHOST (kFluidOpGhost, game/container.h), bits 16..23 = ghost
+  // life in ticks. A particle has ONE identity, its material (`mat` below):
+  // colour, splash, attraction and density all come from materials[mat].
+  uint32_t flags = 0;
   uint32_t mat = 0;     // material id for the particle's attr word — settle
                         // writes this back as the voxel, splash droplets and
-                        // staining key on it
+                        // staining key on it, the renderer colours it and the
+                        // solver weighs it by materials[mat].density
 };
 
 // Rigid-body render slots shared by debris + mob limbs (BodyVoxInst packs the
@@ -2576,10 +2582,12 @@ struct TickParams {
   // above kFluidCap.
   uint32_t fluidExciteEnable = 0;
   uint32_t fluidSpawnCount = 0;
-  // Material id each MPM species splashes micro droplets as (0 = species never
-  // poured -> no droplets). Recorded from the pour's brush material by the main
-  // loop; vec4<u32> on the WGSL side, so keep this 16-byte aligned.
-  uint32_t fluidSplashMat[4] = {0, 0, 0, 0};
+  // RETIRED (W1-B2, 2026-09-24): was the per-species splash material table.
+  // A particle splashes as its own material (attr word), so nothing writes
+  // or reads this; it stays only because common.wgsl's TickParams still
+  // declares the vec4<u32> and the two layouts must match. Delete both with
+  // the next common.wgsl edit. Keep 16-byte aligned until then.
+  uint32_t _retiredFluidSplashMat[4] = {0, 0, 0, 0};
   // WORLD chunk coord of the 3x3x3 CPU-mirror corner (World::MirrorBaseFor of
   // the player chunk — the SAME clamp EncodeReadbacks uses, or the fold and
   // the voxel mirror would describe different cubes). The seam's mirrorFold

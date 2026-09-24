@@ -585,26 +585,6 @@
       0.47,
       0.85
     ],
-    "fluidColor": [
-      0.2,
-      0.42,
-      0.85
-    ],
-    "fluidColor1": [
-      0.92,
-      0.34,
-      0.1
-    ],
-    "fluidColor2": [
-      0.22,
-      0.78,
-      0.28
-    ],
-    "fluidColor3": [
-      0.88,
-      0.72,
-      0.25
-    ],
     "fluidParticleSize": 0.58,
     "fluidStretch": 0.4,
     "fluidDensityShade": 0.45,
@@ -846,7 +826,7 @@
     "subScatterDense": 0.42,
     "subScatterClear": 0.16,
     "subClearLow": 0.62,
-    "subClearHigh": 0.82,
+    "subClearHigh": 0.78,
     "lavaCrackFreq": 2.4,
     "lavaCrackKneeLow": 0.5,
     "lavaCrackKneeHigh": 0.9,

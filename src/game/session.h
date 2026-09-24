@@ -621,9 +621,9 @@ struct TickAuthorityCtx {
   std::vector<std::pair<uint32_t, uint32_t>> fluidPendingSpawns;
   uint32_t fluidCueMat = 0;
   uint32_t lastFluidTick = 0;
-  // Material id each MPM species splashes micro droplets as
-  // (TickParams.fluidSplashMat).
-  uint32_t fluidSpeciesMat[4] = {0, 0, 0, 0};
+  // The liquid the mpm tool's keys 1-4 pour (UIState::fluidPour indexes it;
+  // 0 = fall back to fluidCueMat, water). Resolved by name at startup.
+  uint32_t fluidPourMat[4] = {0, 0, 0, 0};
   // BROKEN VESSELS (game/container.h ContainerSpill): what is still coming
   // out of a flask that shattered, drained under the spawn budgets. Nearly
   // always empty; one entry for a tick when a flask breaks.

@@ -1160,9 +1160,10 @@ PASS(fluidClear, "fluid(substep)", PT_FLUID, PIPE_FLUID_CLEAR, K_INDIRECT, IND_F
 // read-only in practice: `fluidParticles` is read_write for the module (spawn
 // and g2p write it); p2g1 only reads particle state to scatter it. Likewise
 // `fluidBlockMap` is written by mark/alloc; p2g only atomicLoads the mapping.
+// R(Materials): a particle's mass is materials[mat].density (W1-B2).
 PASS(fluidP2g1, "fluid(substep)", PT_FLUID, PIPE_FLUID_P2G, K_INDIRECT, IND_FLUIDPARGS,0,0, GRP_SLIM_FLUID, DYN_NONE, C_ALWAYS, 1,
-     USES(U(TickUBO) R(FluidParticlesWrite) R(FluidBlockMap) A(FluidGrid)
-          R(FluidArgsStage) I(FluidPDispatchArgs)))
+     USES(U(TickUBO) R(Materials) R(FluidParticlesWrite) R(FluidBlockMap)
+          A(FluidGrid) R(FluidArgsStage) I(FluidPDispatchArgs)))
 // p2g2 is the density-EOS half of the grantkot two-pass P2G: it needs p2g1's
 // COMPLETE mass field (the A->A WAW barrier between these rows orders it),
 // gathers density per particle, and scatters stress as momentum. Within the

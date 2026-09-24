@@ -427,6 +427,8 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   // below). A discharge ledger's `drained` is supposed to equal this.
   // A GHOST (the flask's scoop stream, FP_GHOST) is not matter and is kept
   // out of the books entirely: in and out, it never happened.
+  // op.species is the spawn FLAGS word (world.h FluidSpawnOp::flags; the WGSL
+  // name is common.wgsl's, kept this wave): bit 8 ghost, bits 16..23 life.
   let ghost = (op.species & 0x100u) != 0u;
   if (op.mat != 0u && !ghost) { atomicAdd(&fluidArgs[FA_SPAWNLIVE], 1u); }
   var p : FluidParticle;
@@ -441,7 +443,6 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   p.c10 = 0; p.c11 = 0; p.c12 = 0;
   p.c20 = 0; p.c21 = 0; p.c22 = 0;
   p.j = FLUID_ONE;
-  p.species = op.species & 3u;
   p.density = 0;
   p.attr = fpPack(op.mat, 1u, 0u, 0u);
   p.birthTick = T.tick;
@@ -451,7 +452,7 @@ fn spawnAppend(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (ghost && op.mat != 0u) {
     // The op's velocity CARRIES THE TARGET (ContainerScoopStream): the point
     // it would reach in `life` ticks, read before the CFL clamp above could
-    // shorten it. Life is species bits 16..23.
+    // shorten it. Life is flags bits 16..23.
     let life = max((op.species >> 16u) & 0xFFu, 1u);
     p.attr |= FP_GHOST;
     p._r0 = op.px + op.vx * i32(life);
@@ -1334,7 +1335,6 @@ fn exciteEmit(@builtin(workgroup_id) wg : vec3<u32>,
       p.c10 = 0; p.c11 = 0; p.c12 = 0;
       p.c20 = 0; p.c21 = 0; p.c22 = 0;
       p.j = j0;
-      p.species = (mat - 1u) & 3u;
       p.density = 0;
       // FP_EXCITED: this particle came out of a voxel, so it counts against
       // sim.fluidExciteCeiling for as long as it lives. spawnAppend does not
