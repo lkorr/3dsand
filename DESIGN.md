@@ -10679,7 +10679,21 @@ authored difference between the copies (the torso's rim is skin where the hip's
 copy of that cell is muscle) survives until something happens there; when both
 copies change the same field in one tick the parent wins. An infectious
 material carries the infection with it; a self-active one marks the receiver
-alight. A sever or respawn rebuilds the links. Rejected: partitioning the
+alight. A sever or respawn rebuilds the links - AFTER every pair whose limbs
+both survive has been reconciled against its old baseline, or a same-tick
+change (fire charring a torso copy in the tick it burnt a hand off, or a sync
+skipped by BurnTick's early return) was re-baselined as the new normal. A
+removal copied across is flushed as a real CarveLimb on the receiver even when
+it holds no burn index (FlushBurn reads the tombstones; it used to strip them,
+charging no hp and re-deriving nothing), batched at FlushBurn's threshold like
+every removal - forcing it was measured to strip a hips' stray collider
+components on its first carve and take voxels off the other thigh. ONE ROLL
+PER CELL: `BurnOneLimb` lets exactly one copy of a twin cell roll per tick, the
+side picked by a draw on the creature, rest cell and tick (both copies rolling
+ran every overlap cell at ~2x its authored rate; a fixed parent side made acid
+on a thigh migrate only into the pelvis), and `RecountBurn` counts each shared
+cell once (the parent's) toward the burn cap. Twin sync stops at death: a
+corpse's pieces are independent bodies. Rejected: partitioning the
 overlap (reopens the gap it exists to hide), hiding one copy near rest (a guess
 that fails back into this bug), a single skinned lattice (the right end state,
 and a rewrite of every per-limb path). Cost is zero on a creature nothing is
