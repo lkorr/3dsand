@@ -288,6 +288,12 @@ export function layersFor(recipe, limbName) {
   return out;
 }
 
+/** True when every layer is `keep`: the recipe rewrites nothing in this
+ *  limb, so it is not body and planAnatomy leaves it out of the depth union. */
+export function keepOnly(layers) {
+  return layers.length > 0 && layers.every(l => l.keep);
+}
+
 /**
  * A limb's `carve` rules (see the module comment), normalised: each
  * {material, where|null, box: {x,y,z: [lo,hi]|null}, depth: [min,max],
@@ -376,7 +382,15 @@ export function cellHash(x, y, z, salt = 0) {
  * }}
  */
 export function planAnatomy(prefab, recipe, matId) {
-  const field = unionDepth(prefab);
+  // A KEEP-ONLY LIMB IS NOT BODY. Its override keeps every voxel as it is
+  // (hair: `limbs.hair.layers = [{material, keep}]`), so it has no interior
+  // to schedule -- and if it stayed in the union it would bury the surface it
+  // lies on. Measured on an afro, the hair made every scalp cell "interior"
+  // and moved the skull eight cells into the head, shrinking the brain the
+  // head's lethality is authored against. Left out, the skull sits where it
+  // would on a bald head. anatomy_resolve.cpp makes the same exclusion.
+  const field = unionDepth(prefab,
+    mi => !keepOnly(layersFor(recipe, prefab.models[mi].name)));
   const garmentIds = new Set((recipe.garments || []).map(n => matId[n]).filter(Boolean));
   const unresolved = new Set();
   const resolve = (name) => {

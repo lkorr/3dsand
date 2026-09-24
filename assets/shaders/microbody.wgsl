@@ -429,6 +429,38 @@ const BODY_Z_PRIORITY : f32 = 3.0e-5;
 // (The common.wgsl mirror called it `_pad` until 2026-09-24.)
 fn microBodyCutFaces(m : MicroBodyModel) -> u32 { return m.cutFaces; }
 
+// ---- SEE-THROUGH ART (wisps, 2026-09-24) ------------------------------------
+//
+// An art colour's alpha byte (color0 >> 24, written by ArtRgbToGpu from the
+// .vox RGBA chunk's own alpha) is how much of a voxel painted in it is THERE.
+// Long hair uses it: the strands thin toward their tips (mobgen.js
+// ART.HAIR_WISP*), so the last hand-span of a mane reads as wisps rather than
+// as a cut plank.
+//
+// SCREEN-DOOR, NOT BLENDING. This pass writes depth and is composited against
+// the world, the cube bodies and the sprites by the depth test alone, with no
+// sorting anywhere; a blended fragment would need all of that to change. So a
+// partly-covered voxel is either hit or passed THROUGH, per pixel, and the
+// march carries on to whatever is behind it (more hair, the neck, nothing).
+// The fraction of pixels that hit is the alpha.
+//
+// THE PATTERN is interleaved gradient noise on the pixel, offset by a hash of
+// the CELL. The pixel term makes coverage fine-grained within a voxel; the
+// cell term decorrelates neighbouring voxels so two tiers of wisp do not line
+// up into one screen-fixed grid, and so a wisp's holes move with the strand
+// when the head turns rather than crawling across it.
+//
+// Opaque art (alpha 255, every colour but the wisps) exits on the first
+// compare, and unpainted voxels never get here at all.
+fn artCovers(art : u32, c : vec3<i32>, px : vec2f, slot : u32) -> bool {
+  let a = materials[ART_PALETTE_BASE + (art - 1u)].color0 >> 24u;
+  if (a >= 255u) { return true; }
+  let ign = fract(52.9829189 * fract(dot(floor(px), vec2f(0.06711056, 0.00583715))));
+  let h = f32(pcg(u32(c.x * 73856093) ^ u32(c.y * 19349663) ^
+                  u32(c.z * 83492791) ^ (slot * 2654435761u)) & 0xFFFFu) / 65536.0;
+  return fract(ign + h) * 255.0 < f32(a);
+}
+
 // Sample the brick's occupancy field, deciding what a sample OUTSIDE the brick
 // means.
 //
@@ -554,9 +586,14 @@ fn fs(in : VSOut) -> FSOut {
         c.x >= dims.x || c.y >= dims.y || c.z >= dims.z) { break; }
     let v = poolVoxAt(in.base, dims, c);
     if ((v & 0xFFu) != 0u) {
-      hitMat = v & 0xFFu;
-      hitArt = (v >> 8u) & 0xFFu;
-      break;
+      let art = (v >> 8u) & 0xFFu;
+      // A see-through art voxel this pixel misses is empty to the march
+      // (artCovers, above): step on to whatever lies behind it.
+      if (art == 0u || artCovers(art, c, in.pos.xy, in.slot)) {
+        hitMat = v & 0xFFu;
+        hitArt = art;
+        break;
+      }
     }
     if (tMax.x < tMax.y && tMax.x < tMax.z) {
       c.x += stepv.x; tCur = tMax.x; tMax.x += tDelta.x; axis = 0;

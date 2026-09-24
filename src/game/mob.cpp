@@ -632,7 +632,9 @@ static void ApplyPaletteRecolour(const json& p, std::vector<uint32_t>& colors,
       g += ((float)((tint >> 8) & 0xFF) - g) * amount;
       b += ((float)(tint & 0xFF) - b) * amount;
     }
-    c = (chan(r) << 16) | (chan(g) << 8) | chan(b);
+    // The top byte is the slot's transparency (voxload.cpp), not colour:
+    // a recolour must not make a wisp of hair solid.
+    c = (c & 0xFF000000u) | (chan(r) << 16) | (chan(g) << 8) | chan(b);
   }
 }
 
@@ -1102,6 +1104,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
     ld.hp = l.value("hp", 20.0f);
     ld.severable = l.value("severable", true);
     ld.vital = l.value("vital", false);
+    ld.bloodless = l.value("bloodless", false);
     ld.swingAmp = l.value("swingAmp", 0.0f);
     ld.swingPhase = l.value("swingPhase", 0.0f);
     ld.tag = l.value("tag", "");
@@ -1273,6 +1276,73 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       log += jp + ": limb \"" + ld.name + "\" parent \"" + ld.parent +
              "\" not found\n";
       ok = false;
+    }
+  }
+  // ---- THE PREFAB ORIGIN IS THE BODY'S CORNER, NOT THE HAIR'S --------------
+  //
+  // voxload rebases a prefab to the min corner over ALL of its models, and
+  // everything that turns the rig into a creature on the ground -- every gait
+  // pivot in avatar.cpp and below (`worldSize * 0.5` from prefab-local 0),
+  // the spawn centring (`prefab.size / 2`), the worldSize box itself -- reads
+  // that corner as the BODY's. Long hair breaks the assumption: a generated
+  // character's `hair`/`mane` limb can hang further back than anything else on
+  // it, so its models would move the origin by the depth of the hair, and the
+  // creature would pivot and stand a hair's length off its own feet.
+  //
+  // So a def carrying such a limb is re-origined HERE on the body: every
+  // model's offset has the body's min corner subtracted (a model outside the
+  // body -- the hair -- goes negative, which every consumer tolerates: offsets
+  // are float-converted or int16-keyed downstream) and `prefab.size` becomes
+  // the body box. The sidecar's anchors are already written by the generator
+  // (assets/editor/mobgen.js) relative to the body's min corner, so after this
+  // they agree with the models again. `sceneMin` is left alone: it is the
+  // model's corner in the .vox's own coordinates, not in this frame.
+  //
+  // WHERE, and why not beside the worldSize measurement further down: after
+  // anatomy::Resolve and the upsample (both read offsets in the whole-file
+  // frame and are content with it), and BEFORE the skeleton build, whose
+  // AutoAnchor / root anchor / bone-axis reads are the first consumers of
+  // model offsets as rig geometry. Doing it at the worldSize block would have
+  // left the root anchor and every auto anchor in the hair-shifted frame.
+  //
+  // The "body" is the set the worldSize block measures (not a prop) minus
+  // hair. Gated on the def HAVING a hair limb, so every existing mob -- none
+  // has one -- is untouched by construction, not merely because its lo
+  // happens to come out zero.
+  {
+    auto isHair = [](const MobLimbDef& ld) {
+      return ld.tag == "hair" || ld.bloodless;
+    };
+    bool hasHair = false;
+    for (const MobLimbDef& ld : def.limbs) hasHair |= isHair(ld);
+    IVec3 lo{INT32_MAX, INT32_MAX, INT32_MAX};
+    IVec3 hi{INT32_MIN, INT32_MIN, INT32_MIN};
+    bool any = false;
+    if (hasHair) {
+      for (const MobLimbDef& ld : def.limbs) {
+        if (ld.tag == "prop" || isHair(ld)) continue;
+        const int mi = FindModel(def.prefab, ld.name);
+        if (mi < 0) continue;
+        const PrefabModel& m = def.prefab.models[mi];
+        lo.x = std::min(lo.x, m.offset.x);
+        lo.y = std::min(lo.y, m.offset.y);
+        lo.z = std::min(lo.z, m.offset.z);
+        hi.x = std::max(hi.x, m.offset.x + m.size.x);
+        hi.y = std::max(hi.y, m.offset.y + m.size.y);
+        hi.z = std::max(hi.z, m.offset.z + m.size.z);
+        any = true;
+      }
+    }
+    if (any) {
+      for (PrefabModel& m : def.prefab.models)
+        m.offset = {m.offset.x - lo.x, m.offset.y - lo.y, m.offset.z - lo.z};
+      // The BODY box, which is what the spawn centring reads; hair that
+      // overhangs it (on either side) still renders, it just is not counted.
+      def.prefab.size = {hi.x - lo.x, hi.y - lo.y, hi.z - lo.z};
+      if (lo.x != 0 || lo.y != 0 || lo.z != 0)
+        log += def.name + ": prefab re-origined on the body corner (" +
+               std::to_string(lo.x) + "," + std::to_string(lo.y) + "," +
+               std::to_string(lo.z) + "): hair reaches past the body\n";
     }
   }
   // Derive the COLLIDER resolution from the art (mob.h MobDef::physScale).
@@ -1784,7 +1854,10 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
     IVec3 hi{INT32_MIN, INT32_MIN, INT32_MIN};
     bool any = false;
     for (const MobLimbDef& ld : def.limbs) {
-      if (ld.tag == "prop") continue;
+      // Hair (tag "hair", or any bloodless limb) is measured out for the
+      // same reason: a mane down the back is not how big the creature is.
+      // The prefab was already re-origined on this same body set, above.
+      if (ld.tag == "prop" || ld.tag == "hair" || ld.bloodless) continue;
       int mi = FindModel(def.prefab, ld.name);
       if (mi < 0) continue;
       const PrefabModel& m = def.prefab.models[mi];
@@ -6973,7 +7046,9 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
           return (uint32_t)std::clamp((int)std::lround(va + (vb - va) * t),
                                       0, 255);
         };
-        uint32_t rgb = (lerp8(ts.fromRgb, ts.toRgb, t, 16) << 16) |
+        // Top byte = transparency (voxload.cpp); carried, never lerped.
+        uint32_t rgb = (ts.fromRgb & 0xFF000000u) |
+                       (lerp8(ts.fromRgb, ts.toRgb, t, 16) << 16) |
                        (lerp8(ts.fromRgb, ts.toRgb, t, 8) << 8) |
                        lerp8(ts.fromRgb, ts.toRgb, t, 0);
         if (microSet_->artColors[ts.sharedIndex] != rgb) {
@@ -7978,8 +8053,9 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // (game/impact.h): its budget is charged so the hp accounting stays one
     // path, but the drip must not draw blood out of iron. The flesh under it
     // is charged separately and bleeds for itself. Same refusal CarveLimb
-    // and StainWound make for a worn slot, made here for the drip.
-    if (IsWornSlot((int)li)) {
+    // and StainWound make for a worn slot, made here for the drip. Hair (a
+    // `bloodless` base limb) is refused for the same reason: see IsBloodless.
+    if (IsBloodless((int)li)) {
       limb.bleedBudget = 0.0f;
       continue;
     }
@@ -8217,7 +8293,7 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     MobLimb& stumpLimb = limbs_[dragStumpLimb_];
     const bool open = stumpLimb.stumpOpen || stumpLimb.bleedBudget >= 1.0f ||
                       stumpLimb.gushTicks > 0;
-    if (open && !IsWornSlot(dragStumpLimb_) && !WoundCharred(stumpLimb) &&
+    if (open && !IsBloodless(dragStumpLimb_) && !WoundCharred(stumpLimb) &&
         world.CellInWindow({ifloor(dragContact_.x), ifloor(dragContact_.y),
                             ifloor(dragContact_.z)})) {
       dragTrailDist_ = 0.0f;
@@ -8241,8 +8317,11 @@ float Mob::TotalHp() const {
   if (!alive_) return 0.0f;
   float sum = 0.0f;
   const int n = std::min(baseLimbs_, (int)limbs_.size());
+  // Hair (IsBloodless) is not health: a bald creature is not a wounded one,
+  // and counting a mane's hp would let a long-haired body bleed longer.
   for (int i = 0; i < n; i++)
-    if (limbs_[i].body && limbs_[i].hp > 0.0f) sum += limbs_[i].hp;
+    if (limbs_[i].body && limbs_[i].hp > 0.0f && !IsBloodless(i))
+      sum += limbs_[i].hp;
   return sum;
 }
 
@@ -8269,7 +8348,8 @@ bool Mob::DrainBlood(float voxels) {
   const int n = std::min(baseLimbs_, (int)limbs_.size());
   for (int i = 0; i < n; i++) {
     MobLimb& l = limbs_[i];
-    if (!l.body || l.hp <= 0.0f) continue;
+    // Same set TotalHp summed: bleeding does not thin the hair.
+    if (!l.body || l.hp <= 0.0f || IsBloodless(i)) continue;
     l.hp -= l.hp * frac;
   }
   return true;
@@ -8365,10 +8445,17 @@ void Mob::RecountBurn(uint32_t tick, bool force) {
   // authoritative lattice (the skin when there is one); see
   // PlayerAvatar::PartVoxelCount for why mixing the two lattices scales the
   // fraction by (skin/phys)^3.
+  //
+  // HAIR IS NOT SKIN. A bloodless base limb (IsBloodless: a generated
+  // character's `hair`/`mane`) is left off BOTH totals. It is flammable and
+  // burns first and fastest, so counted it would push a long-haired creature
+  // toward the death knot for losing its hair -- and its surface in the
+  // denominator would make the same burns on the body read milder.
   uint64_t burnt2 = 0, surface = 0;
   const int n = std::min(baseLimbs_, (int)limbs_.size());
   for (int i = 0; i < n; i++) {
     MobLimb& l = limbs_[i];
+    if (IsBloodless(i)) continue;
     burnt2 += 2ull * l.burn.burntAway;
     // The surface is taken ONCE, lazily, before this limb burns much: the
     // first recount happens on the first burn tick, when the lattice is
@@ -8401,6 +8488,9 @@ void Mob::RecountBurn(uint32_t tick, bool force) {
   for (const JointTwinPair& tp : twins_) {
     if (tp.b < 0 || tp.b >= n || tp.a < 0 || tp.a >= n) continue;
     if (!limbs_[tp.a].body || !limbs_[tp.b].body) continue;
+    // A pair with a bloodless side was never double-counted: that side was
+    // skipped by the sweep above, so there is nothing to take back off.
+    if (IsBloodless(tp.a) || IsBloodless(tp.b)) continue;
     for (const JointTwinCell& c : tp.cells) {
       const uint64_t st = sys_->BurnStageOf(c.b.mat & 0xFFFu);
       burnt2 -= std::min(burnt2, st);
@@ -8425,7 +8515,8 @@ void Mob::ApplyBurnCap() {
   bool vitalGone = false;
   for (int i = 0; i < n; i++) {
     MobLimb& l = limbs_[i];
-    if (!l.body) continue;
+    // Hair is outside the burn accounting (RecountBurn) and so outside its cap.
+    if (!l.body || IsBloodless(i)) continue;
     const float capHp = limbDefs_[i].hp * burnCap_;
     if (l.hp > capHp) l.hp = capHp;
     // A cap above zero leaves every authored limb some hp, so this only fires
@@ -8806,8 +8897,12 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
                              : CurrentTuning().gore.bluntBleedScale,
                          0.0f, 1.0f)
             : 1.0f;
-    limb.bleedBudget = AddBleedBudget(
-        limb.bleedBudget, amount * def_->bleedPerDamage * bleedScale);
+    // A BLOODLESS LIMB (hair) takes hp but opens no bleed budget: BleedTick
+    // would refuse to drip it anyway, and a budget left standing would read as
+    // an open wound to every "is this limb bleeding" query.
+    if (!IsBloodless((int)i))
+      limb.bleedBudget = AddBleedBudget(
+          limb.bleedBudget, amount * def_->bleedPerDamage * bleedScale);
     if (impactSevers || (limb.hp <= 0 && HpZeroSevers((int)i))) {
       // A MACE KILLS BUT DOES NOT DISMEMBER — on living tissue. Rotten undead
       // tissue falls apart either way, which is the whole visual difference
@@ -8852,7 +8947,9 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       // the creature being hurt: a clang is not a cry. Same distinction
       // Mob::StainWound already draws when it refuses to bleed a held item —
       // a slot at or past baseLimbs_ is wardrobe or weaponry, not anatomy.
-      if (sys_ && (int)i < baseLimbs_)
+      // Hair is a base limb and still not the creature: a cut through a
+      // ponytail is a haircut, not a cry (IsBloodless).
+      if (sys_ && (int)i < baseLimbs_ && !IsBloodless((int)i))
         sys_->PushVoice(*this, MobSystem::VoiceKind::Hurt, hitWorldVoxel,
                         ld.hp > 0 ? amount / ld.hp : 1.0f);
     }
@@ -9258,7 +9355,8 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
   // Same two exclusions StainWoundAs makes, and for the same reason: a worn
   // garment and a held sword are borrowed rig slots, and neither bruises.
-  if (IsWornSlot(limbIndex) || limbIndex >= baseLimbs_) return 0;
+  // Nor does hair (a bloodless base limb): there is no flesh under it.
+  if (IsBloodless(limbIndex) || limbIndex >= baseLimbs_) return 0;
   if (bruiseMat == 0 || radiusWorld <= 0.0f) return 0;
   const auto& gt = CurrentTuning().gore;
   const float effStep =
@@ -9387,8 +9485,9 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
   // rig slots (DESIGN.md §8c) and both reach every path a limb reaches, which
   // is how the gore code previously sprayed a wearer's blood out of their own
   // coat. The held item is not `worn`, so it needs its own exclusion: an
-  // appended slot that is not part of the authored rig is luggage.
-  if (IsWornSlot(limbIndex) || limbIndex >= baseLimbs_) return 0;
+  // appended slot that is not part of the authored rig is luggage. Hair is a
+  // base limb with `bloodless` set, and has no blood in it either.
+  if (IsBloodless(limbIndex) || limbIndex >= baseLimbs_) return 0;
   const uint32_t stain = rewriteMat;
   const bool fromCrater = crater && !crater->empty() && rimCells > 0.0f;
   if (!stain || (!fromCrater && radiusWorld <= 0.0f)) return 0;
@@ -10751,7 +10850,8 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   return true;
 }
 
-uint64_t Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
+uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
+                                 uint32_t physScale,
                                  std::vector<DebrisVoxel> part, World& world,
                                  std::vector<ParticleSpawn>& spawns) {
   // Rebase the chunk to its own min corner and move its pose to match, the same
@@ -10829,12 +10929,16 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
   // ...and WHICH CREATURE this came off, so a gobbet cut again later still
   // makes that species' wet noises (DebrisSystem::GoreEvent). `dead` because a
   // lump carved out of a living body is no longer part of a living body.
+  //
+  // A BLOODLESS SOURCE (hair) hands the debris no bleed material at all, so
+  // cutting the lock again later cannot draw blood out of it either.
+  const uint32_t fragBleed = IsBloodless(srcLimb) ? 0u : def_->bleedMat;
   debris_->AdoptBody(h, std::move(part), xf, micro, 0, {},
-                     def_->bleedMat, {}, /*dead=*/true, defIndex_, id_);
+                     fragBleed, {}, /*dead=*/true, defIndex_, id_);
   // A lump of live flesh oozes from the face it was cut on: the wound sits on
   // the gobbet's voxel nearest the limb it came off, budgeted like a corpse
   // carve of the same volume. No gout; a gobbet is not an amputation.
-  if (def_->bleedMat != 0)
+  if (fragBleed != 0)
     debris_->WoundBody(h, src.xf.pos,
                        partWorldVox * CurrentTuning().gore.corpseBleedPerVoxel,
                        0);
@@ -11147,7 +11251,8 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   //     the first frame. See Mob::inSpawnRot_.
   //   * A GARMENT HAS NO BLOOD IN IT. A shell is a borrowed rig slot, so
   //     `def.bleedMat` — the WEARER's blood — was being sprayed out of a
-  //     burning robe. See Mob::IsWornSlot.
+  //     burning robe. See Mob::IsWornSlot. Hair is the same case on a BASE
+  //     slot (`bloodless`), which is why this asks IsBloodless.
   //   * FIRE CAUTERISES. FlushBurn expresses a tick of burning as a carve and
   //     fires every max(12, n>>6) voxels removed, so a limb on fire carves
   //     itself dozens of times a second; each one topped the drip budget back
@@ -11157,7 +11262,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   //
   // The HP CHARGE above is deliberately outside both: fire still kills you, and
   // a burnt shell still loses its own durability. Only the blood is refused.
-  const bool bleeds = !inBurnFlush_ && !inSpawnRot_ && !IsWornSlot(limbIndex);
+  const bool bleeds = !inBurnFlush_ && !inSpawnRot_ && !IsBloodless(limbIndex);
   // ---- WHERE THE MATTER ACTUALLY LEFT ---------------------------------------
   // Centroid and spread of what was removed, in limb-local WORLD voxels — the
   // frame woundLocal is read in (PreTick rotates it by the limb's live quat).
@@ -11478,7 +11583,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
           // A carved-off fragment becomes its own debris body, packed from the
           // COLLIDER voxels it was split on — it has no skin lattice of its
           // own, so its brick is packed at physScale to match its coords.
-          fragOf[c] = EmitCarvedFragment(limb, PhysScaleOf(limb),
+          fragOf[c] = EmitCarvedFragment(limb, limbIndex, PhysScaleOf(limb),
                                          std::move(parts[c]), world, spawns);
           budget--;
         } else {
@@ -11615,8 +11720,8 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   //
   // A GARMENT DOES NOT CRY OUT. Same exclusion as the blood above: a hole
   // opening in a hood is the hood's damage, not the wearer's, and voicing it
-  // made a burning robe sound like a mauling.
-  if (lost > 0.0f && !IsWornSlot(limbIndex))
+  // made a burning robe sound like a mauling. Singed hair does not either.
+  if (lost > 0.0f && !IsBloodless(limbIndex))
     if (sys_)
     sys_->PushVoice(*this, MobSystem::VoiceKind::Hurt, limb.xf.pos,
                     lost * kCarveDamagePerVolume);
@@ -13468,8 +13573,9 @@ bool Mob::InfectTick(uint32_t tick, World& world,
     if (limb.infectMat == 0) continue;
     // A GARMENT AND A HELD SWORD ARE NOT ANATOMY. The same two exclusions
     // StainWoundAs makes and for the same reason: both are borrowed rig slots,
-    // and rotting a sword is not a disease.
-    if (li >= baseLimbs_ || IsWornSlot(li) || !limb.body) continue;
+    // and rotting a sword is not a disease. Hair (IsBloodless) is not
+    // living tissue either -- it does not rot, it burns.
+    if (li >= baseLimbs_ || IsBloodless(li) || !limb.body) continue;
     // ...AND IN THIS LIMB'S OWN UNITS. A rate in world voxels converted with
     // the limb's scale^3 makes a fine skin rot at the same PHYSICAL rate as a
     // coarse one; using the rate as a lattice count directly would have made a
@@ -13649,7 +13755,7 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
       const std::string& self = limbDefs_[li].name;
       const std::string& up = limbDefs_[li].parent;
       for (int k = 0; k < nl2; k++) {
-        if (k == li || k >= baseLimbs_ || IsWornSlot(k)) continue;
+        if (k == li || k >= baseLimbs_ || IsBloodless(k)) continue;
         if (!limbs_[k].body || limbs_[k].infectMat != 0) continue;
         Vec3 jointLocal{};
         bool adjacent = false;
@@ -13901,7 +14007,8 @@ uint32_t Mob::InfectAcrossJoint(int fromLimb, uint32_t tick, int toLimb,
   const uint32_t infect = (uint32_t)limbs_[fromLimb].infectMat & 0xFFFu;
   if (infect == 0) return 0;
   if (!limbs_[toLimb].body || limbs_[toLimb].infectMat != 0) return 0;
-  if (toLimb >= baseLimbs_ || IsWornSlot(toLimb)) return 0;
+  // Not into a garment, a held item, or hair (IsBloodless): none is tissue.
+  if (toLimb >= baseLimbs_ || IsBloodless(toLimb)) return 0;
 
   MobLimb& dst = limbs_[toLimb];
   const bool fine = dst.HasFineSkin();
@@ -14557,7 +14664,8 @@ bool Mob::BluntPulpTick(uint32_t tick, World& world,
   for (int li = 0; li < (int)limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
     if (!limb.bluntPulp) continue;
-    if (li >= baseLimbs_ || IsWornSlot(li) || !limb.body) continue;
+    // Hair (IsBloodless) has nothing in it to pulp.
+    if (li >= baseLimbs_ || IsBloodless(li) || !limb.body) continue;
     const uint32_t scale =
         limb.HasFineSkin() ? SkinScaleOf(limb) : PhysScaleOf(limb);
     const float lat = (float)scale * (float)scale * (float)scale;
@@ -15516,7 +15624,10 @@ void Mob::RecountCoat(uint32_t tick, bool force) {
     // THE BODY IS THE BASE RIG. A robe soaked through is not the wearer being
     // covered in it — the same exclusion StainWound applies, for the same
     // reason (a garment and a held sword are borrowed rig slots, not anatomy).
-    if (li >= baseLimbs_ || IsWornSlot(li)) continue;
+    // Hair (IsBloodless) is left out too: a long mane would otherwise dilute
+    // every "how much of the body is soaked" fraction with voxels that are
+    // not skin.
+    if (li >= baseLimbs_ || IsBloodless(li)) continue;
     bodyCoat_.voxels += out.voxels;
     bodyCoat_.stained += out.stained;
     bodyCoat_.sumAmt += out.sumAmt;
@@ -17234,8 +17345,9 @@ uint32_t Mob::RotAtSpawn(World& world) {
     if (!limb.body || limb.voxels.empty()) continue;
     // A garment is not anatomy — the same exclusion the wound soak and the coat
     // recount both make. Rotting the robe is a separate feature (and a nicer
-    // one done as authored art than as a carve).
-    if (IsWornSlot((int)i)) continue;
+    // one done as authored art than as a carve). Hair (IsBloodless) does not
+    // rot: a zombie's long hair arrives whole.
+    if (IsBloodless((int)i)) continue;
     const MobLimbDef& ld = limbDefs_[i];
     bool skipped = false;
     for (const std::string& s : rd.skip)
@@ -17713,8 +17825,13 @@ void Mob::Sever(int limbIndex) {
       // FIRE IS THE OTHER SUPPRESSION, and it applies to real limbs too: an arm
       // that burns THROUGH parts company already cauterised, and arming a gout
       // there is the second half of "being on fire causes spurts like crazy".
+      //
+      // HAIR IS THE THIRD (IsBloodless): a ponytail cut off leaves no stump,
+      // no gout and no blood. The wardrobe-only decision below (`adopt`)
+      // keeps asking IsWornSlot: hair burnt through at the root still drops
+      // as a body, as a cut lock does.
       const bool worn = IsWornSlot(limbIndex);
-      const bool gore = !worn && !inBurnFlush_;
+      const bool gore = !IsBloodless(limbIndex) && !inBurnFlush_;
       // ...AND A GARMENT CONSUMED BY FIRE LEAVES NO BODY AT ALL.
       //
       // DetachLimb(adopt=true) hands the slot to DebrisSystem, which makes it
@@ -17954,8 +18071,9 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     // would visibly coarsen at the moment it came off.
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
-                       std::move(limb.skinVoxels), def.bleedMat, WoundOf(limb),
-                       /*dead=*/true, defIndex_, id_);
+                       std::move(limb.skinVoxels),
+                       IsBloodless(limbIndex) ? 0u : def.bleedMat,
+                       WoundOf(limb), /*dead=*/true, defIndex_, id_);
     limb.skinVoxels.clear();
     limb.carved = false;
     // ...AND THE SLOT FORGETS THE INDEX, not just the ownership. `carved =
@@ -18310,7 +18428,8 @@ void Mob::Die() {
     // corpse, from where it is (BodyWound), until it has paid out.
     debris_->AdoptBody(limb.body, limb.voxels, limb.xf,
                        limb.MicroRef(SkinScaleOf(limb)), PhysScaleOf(limb),
-                       std::move(limb.skinVoxels), def_->bleedMat,
+                       std::move(limb.skinVoxels),
+                       IsBloodless((int)i) ? 0u : def_->bleedMat,
                        WoundOf(limb), /*dead=*/true, defIndex_, id_);
     // A CORPSE FALLS WHERE IT STOOD, which for the avatar is entirely inside
     // the player's capsule proxy, and for an NPC killed at sword's reach is
@@ -19039,7 +19158,8 @@ float MobSystem::CoatTagFraction(uint64_t mobId, const char* tag,
     if (limbTag) {
       if (li >= (int)mob->limbDefs_.size() || mob->limbDefs_[li].tag != limbTag)
         continue;
-    } else if (li >= mob->baseLimbs_ || mob->IsWornSlot(li)) {
+    } else if (li >= mob->baseLimbs_ || mob->IsBloodless(li)) {
+      // ...and hair is not anatomy either (RecountCoat's bodyCoat_ skips it).
       continue;
     }
     const LimbCoat& c = mob->limbs_[li].coat;

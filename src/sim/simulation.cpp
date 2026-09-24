@@ -925,9 +925,13 @@ namespace {
 // from bits 0..7 (RGBA8 little-endian), so the byte order flips on the way in.
 // Getting this wrong swaps red and blue, which reads as an art mistake rather
 // than a packing one — hence one definition, used by both writers below.
+//
+// The top byte is TRANSPARENCY on the CPU side (voxload.cpp: 0 = opaque, so
+// every colour that predates it is unchanged) and ALPHA on the GPU side, where
+// microbody.wgsl reads color0 >> 24 as a voxel's screen-door coverage.
 inline uint32_t ArtRgbToGpu(uint32_t rgb) {
   return ((rgb & 0xFFu) << 16) | (rgb & 0xFF00u) | ((rgb >> 16) & 0xFFu) |
-         0xFF000000u;
+         ((255u - (rgb >> 24)) << 24);
 }
 }  // namespace
 

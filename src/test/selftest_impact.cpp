@@ -161,6 +161,10 @@ Target ChooseTarget(MobSystem& mobs, IVec3 at) {
     for (size_t li = 0; li < def.limbs.size(); li++) {
       if ((int)li == def.rootLimb) continue;
       if (!def.limbs[li].severable || def.limbs[li].vital) continue;
+      // Not hair: a `bloodless` limb (Mob::IsBloodless) is severable,
+      // non-vital and can be big, and it never bleeds -- a fixture that
+      // expects blood must not land on a long-haired character's mane.
+      if (def.limbs[li].bloodless) continue;
       if (!mobs.LimbBody(id, (int)li)) continue;
       const uint32_t n = mobs.LimbVoxelsAtSpawn(id, (int)li);
       if (n <= best.atSpawn) continue;
@@ -1969,8 +1973,13 @@ Status GateBiteLimbs(Ctx& c, std::string& detail) {
   for (size_t d = 0; d < mobs.Defs().size(); d++) {
     const MobDef& def = mobs.Defs()[d];
     if (def.bleedMat == 0 || def.tissue.empty()) continue;
-    if (def.limbs.size() > most) {
-      most = def.limbs.size();
+    // Counted WITHOUT bloodless limbs: a long-haired character's `hair` and
+    // `mane` are extra limbs that no bite infects, and counting them would
+    // hand the gate a body whose "most limbs" is two locks of hair.
+    size_t n = 0;
+    for (const MobLimbDef& ld : def.limbs) n += ld.bloodless ? 0 : 1;
+    if (n > most) {
+      most = n;
       defIndex = (int)d;
     }
   }
@@ -2041,6 +2050,7 @@ Status GateBiteLimbs(Ctx& c, std::string& detail) {
     }
     for (int li = 0; li < m->AppendedBase(); li++) {
       if (!mobs.LimbBody(id, li)) continue;
+      if (m->LimbDefAt(li).bloodless) continue;  // hair: nothing to infect
       Row r;
       r.limb = li;
       r.name = m->LimbDefAt(li).name;

@@ -44,6 +44,12 @@ struct MobLimbDef {
   float hp = 20;
   bool severable = true;
   bool vital = false;          // severing/destroying this kills the mob
+  // Not flesh: hair, and anything else with no blood in it. Carving, burning
+  // or severing it draws no blood, charges no health, rots/pulps/infects
+  // nothing, and it is left out of every "how much body is left" total. Read
+  // through Mob::IsBloodless, which folds worn slots in (a garment is
+  // bloodless too, by tag rather than by field).
+  bool bloodless = false;
   Vec3 axis{1, 0, 0};          // hinge axis
   float minAngle = -1.2f, maxAngle = 1.2f;
   // ---- ball-joint (swing-twist) limits; see Physics::JointDesc ------------
@@ -3292,8 +3298,11 @@ class Mob {
   bool HpZeroSevers(int limbIndex) const;
   // The debris handle of the fragment, or 0 when it went to particles instead
   // (no brick, Jolt refused). CarveLimb joints a child limb to it when the
-  // child's socket left with the fragment.
-  uint64_t EmitCarvedFragment(const MobLimb& src, uint32_t physScale,
+  // child's socket left with the fragment. `srcLimb` is `src`'s slot, asked
+  // only whether it has blood in it (IsBloodless): a lock of hair cut off is
+  // not a gobbet and does not ooze.
+  uint64_t EmitCarvedFragment(const MobLimb& src, int srcLimb,
+                              uint32_t physScale,
                               std::vector<DebrisVoxel> part, World& world,
                               std::vector<ParticleSpawn>& spawns);
   void LimbVoxelsToParticles(const MobLimb& limb, uint32_t physScale,
@@ -3979,6 +3988,21 @@ class Mob {
   bool IsWornSlot(int limbIndex) const {
     return limbIndex >= baseLimbs_ && limbIndex < (int)limbDefs_.size() &&
            limbDefs_[limbIndex].tag == "worn";
+  }
+
+  // ---- DOES THIS RIG SLOT HAVE BLOOD IN IT? ---------------------------------
+  //
+  // IsWornSlot's wider sibling. Long hair is a BASE limb (a generated
+  // character's `hair`/`mane`, appended after the human's 15 by the sidecar
+  // merge) -- it animates, burns and severs like a limb, but it is not
+  // anatomy: cutting it off must not spurt, cost health or kill anybody.
+  // Every blood/health site asks this instead of IsWornSlot; the ones that
+  // are about WARDROBE specifically (Sever's `adopt`, the HUD's garment
+  // rows) keep asking IsWornSlot.
+  bool IsBloodless(int limbIndex) const {
+    return IsWornSlot(limbIndex) ||
+           (limbIndex >= 0 && limbIndex < (int)limbDefs_.size() &&
+            limbDefs_[limbIndex].bloodless);
   }
 
   // how long a severed piece holds its last animated pose before ragdolling

@@ -360,11 +360,23 @@ bool LoadVoxFromMemory(const uint8_t* data, size_t len, size_t materialCount,
 
       // Art palette RGB, straight out of the RGBA chunk. Without it the slots
       // are indices into nothing and the model renders black.
+      //
+      // ALPHA RIDES IN THE TOP BYTE AS TRANSPARENCY (255 - a), not as alpha,
+      // so every opaque colour -- which is every colour any file carried
+      // before wisps existed -- keeps exactly the value it always had: the
+      // merge dedupe, the tint map, the recolour filter and the zombie fade
+      // all see bit-identical numbers. Only a see-through slot (the tips of
+      // long hair, mobgen.js ART.HAIR_WISP*) is nonzero up there, and
+      // microbody.wgsl reads it as screen-door coverage. a == 0 is read as
+      // opaque: a fully invisible art voxel is not a thing anyone authors,
+      // and a zero byte is what a writer that ignored alpha would leave.
       if (!rgba.empty()) {
         out.artColors.assign(kArtPaletteSlots, 0u);
         for (int s = kArtPaletteBase; s <= kArtPaletteTop; s++) {
           const size_t o = (size_t)(s - 1) * 4;   // entry i is index i+1
+          const uint32_t a = rgba[o + 3] ? rgba[o + 3] : 255u;
           out.artColors[s - kArtPaletteBase] =
+              ((255u - a) << 24) |
               ((uint32_t)rgba[o] << 16) | ((uint32_t)rgba[o + 1] << 8) |
               (uint32_t)rgba[o + 2];
         }
