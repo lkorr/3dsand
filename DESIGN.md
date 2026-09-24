@@ -10726,7 +10726,10 @@ the binding summary.
 
 **The problem.** `ambientAt(n)` (raymarch.wgsl) and its raster twin
 `ambientAtP` (common.wgsl) are a hemisphere lerp on `n.y` between
-`TUNE_AMB_GROUND` and `TUNE_AMB_SKY`. Pure functions of the NORMAL: no term in
+`TUNE_AMB_GROUND` and `TUNE_AMB_SKY`. (Since 2026-09-24 both read ONE
+definition, `ambientHemi`, on ends resolved once per frame on the CPU —
+`ResolveFrameLight`, support.cpp, which also owns the key light's colour and
+direction; the hand-inlined terrain copy had missed the overcast and lightning.) Pure functions of the NORMAL: no term in
 either knows where the receiver is. So a cave floor was lit exactly as brightly
 as a meadow, a room exactly as brightly as the field outside its door, and
 `voxelAO`'s three in-plane taps cannot see a ceiling 3 m up. It was also the
@@ -11037,8 +11040,10 @@ the column's coefficients).
 exp(−absorb·d) over the path d in the liquid. The raymarch solves it for its bed
 and writes the COEFFICIENTS per pixel — K, A = Arest + K·scatter, S =
 K·scatter, absorb, the surface distance, the path cap and the caustic
-curvature: six words, `VEIL_WORDS` (common.wgsl THE WATER VEIL), at render
-binding 24. A body fragment at distance `dist` beyond the surface shades
+curvature: six words plus a frame stamp, `VEIL_WORDS` = 7 (common.wgsl THE
+WATER VEIL), at render binding 24. The stamp (w6 = `RenderParams.frameIdx`)
+is what makes a record live: a reader whose frame differs sees a dry pixel,
+so the raymarch no longer clears every pixel's record at the top of fs. A body fragment at distance `dist` beyond the surface shades
 `A + T·(K·lit·caustic − S)`; one nearer than the surface takes the ordinary
 air fog. The raymarch then writes the depth BEHIND a clear liquid (viscous
 ones — blood, oil — keep the interface and record no veil). Fog is not
@@ -11049,16 +11054,20 @@ wears the bed's web.
 
 **The pass split.** The veil is a fragment-stage STORAGE write read by later
 draws of the same pass, and no barrier is legal inside a rendering scope.
-`Simulation::DrawWorld` ends with `RenderPass::SplitAfterFragmentWrite`, which
-ends the scope, emits the fragment-write → vertex/fragment read+write barrier
+`RenderPass::SplitAfterFragmentWrite` ends the scope, emits the fragment-write
+→ vertex/fragment read+write barrier
 (`vk::Recorder::SplitRenderingAfterFragmentWrite`), and reopens on the same
-attachments with LOAD — in the one function every world pass calls, so none of
-the dozens of DrawWorld-then-DrawBodies call sites changed. A pass with no
+attachments with LOAD. `Simulation::DrawWorld` only ARMS it; the first draw
+whose fragment stage reads the veil (particles, sprites, fluid cubes, bodies,
+micro bodies — all through `Simulation::VeilReaderBG`) takes it, so a pass
+that draws nothing after the world pays no split, and none of the
+DrawWorld-then-DrawBodies call sites changed. A pass with no
 DrawWorld (the character portrait) binds `renderBGNoVeil_` (a one-word buffer
 the bounds test rejects), so it never reads a veil written for other pixels.
 
-**Cost.** One store per pixel (w0 = 0) for a dry pixel; six for a water pixel;
-six loads per body fragment. The buffer is 24 B/px (~50 MB at 1080p), grow-only.
+**Cost.** Nothing for a dry pixel; seven stores for a water pixel; one load
+(the stamp) per body fragment on a dry pixel, seven on a wet one. The buffer is
+28 B/px (~58 MB at 1080p), grow-only.
 Without fragment stores (`WATER_VEIL` = `SHADOW_CACHE_AVAILABLE`) the old
 contract holds exactly.
 
@@ -11722,7 +11731,7 @@ in the memories index), so the march lives in `cloud.wgsl` on the per-frame
 | row | what | size |
 |---|---|---|
 | `cloud_noise` | tileable Perlin-Worley SHAPE (R) + Worley fBm (GBA), 128³; Worley DETAIL, 32³. Once per pipeline build (`Cond::CloudBake`) | 8.1 MiB |
-| `cloud_weather` | per-frame 512² WEATHER MAP around the camera at 125 m: local coverage, type, rain, base jitter — plus the camera probe (8 words; 4..6 = the 20 m averaged wind, written by `cloud_env`) | 1 MiB |
+| `cloud_weather` | 512² WEATHER MAP around the camera at 125 m: local coverage, type, rain, base jitter — plus the camera probe (8 words; 4..6 = the 20 m averaged wind, written by `cloud_env`). Recorded every frame but REBUILT only on frames with `kClfWeather` (below) | 1 MiB |
 | `cloud_shadow` | per-frame 256² CLOUD SHADOW map at 40 m, indexed at the deck-base plane along the key light | 256 KiB |
 | `cloud_env` | per-frame 64² octahedral ENV map: (in-scatter, T) per direction | 32 KiB |
 | `cloud_march` | the deck, cirrus and rain curtains, one ray per LOW-RES pixel (target ÷ `render.cloudResDiv`) | 4 words/px |
@@ -11731,6 +11740,20 @@ in the memories index), so the march lives in `cloud.wgsl` on the per-frame
 All six are gated by `Cond::Clouds`: `weather.clouds` off, or a sky with no
 cloud, cirrus or rain, records no row, and `RenderParams.weatherFlags`'
 `RWF_CLOUDS` (set from the same `CloudFrame`) tells every reader not to look.
+
+**The weather map is reused, not rebuilt, between changes** (2026-09-24). Its
+inputs are translations of the noise domain (the drift `weatherOff`, the camera
+re-centring `weatherOrigin`) and slow shape terms (`weatherEvolve`, the
+preset's coverage / type / precip). A translated field is the same field read
+elsewhere, so `WriteCloudParams` keeps the map it last built and hands
+`weatherAt` the metres the drift has moved since (`CloudParams.spare.yz`) —
+exact while the map still covers 30 km each way (a 16-texel slack) — and asks
+for a rebuild (`kClfWeather`) only when a shape term moves by a step below
+visibility (evolve 4e-4 ≈ 7 m of front, preset terms 0.002) or the slack runs
+out. The rebuild is COMMITTED by the recorder (`CommitCloudWeather`, called by
+`EncodeShadowResolve` once the rows are recorded), so a caller that writes
+params and records no sky cannot leave the offset describing a map that was
+never built. It was ~31M hashes and ~16M sincos every frame.
 
 **The look is the Nubis recipe, bent to this engine.** Coverage LOWERS THE
 DENSITY THRESHOLD (the corpus's three-field model: `remap(shape, 1−cov, 1)·cov`),

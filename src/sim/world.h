@@ -3228,7 +3228,35 @@ struct RenderParams {
   // quality knob hot-reloads on F5 like every other render tuning value; the
   // CACHE ITSELF is const-gated, but its granularity is not.
   uint32_t shadowSubdiv = 4;
-  uint32_t pad_sc0 = 0, pad_sc1 = 0;
+  // ---- THE FRAME'S LIGHT (ResolveFrameLight, src/test/support.cpp) --------
+  // Everything below is a pure function of the fields above plus TUNE_*
+  // constants, evaluated ONCE per frame on the CPU. It used to be evaluated
+  // per pixel, in two hand-kept copies: keyLightColor/keyLightDir/ambientAt in
+  // raymarch.wgsl and keyLightColorP/keyLightDirP/ambientAtP in common.wgsl.
+  // The copies drifted — 8124088 taught the common.wgsl ambient about the
+  // overcast and lightning and the terrain's copy never heard, so a storm
+  // greyed every body and left the ground it stood on in blue daylight. With
+  // one author there is nothing to drift. common.wgsl's accessors read these.
+  //
+  // dayWeight: sunUp after the eclipse (the old dayWeight()/eclipseDayWeightP).
+  // moonLit: (moon A + moon B contribution) / moonLightIntensity — the scaled
+  //   sum ambient and the fog tints key their night level on.
+  float dayWeight = 1.0f;
+  float moonLit = 0.0f;
+  // Unit key-light direction (sun by day, the brighter moon by night) and the
+  // overcast blend the ambient applies (clamp(overcast) * 0.8; 0 = clear).
+  float keyDir[3] = {0.0f, 1.0f, 0.0f};
+  float ambOvercast = 0.0f;
+  // Key-light colour x intensity, eclipse and moon selection included.
+  float keyCol[3] = {0.0f, 0.0f, 0.0f};
+  float pad_kl0 = 0.0f;
+  // The hemisphere ambient BEFORE overcast and lightning, at n.y = -1 (ground)
+  // and n.y = +1 (sky). It is linear in n.y (every term of it is a mix on
+  // n.y * 0.5 + 0.5), so these two ends reproduce it exactly.
+  float ambGround[3] = {0.0f, 0.0f, 0.0f};
+  float pad_kl1 = 0.0f;
+  float ambSky[3] = {0.0f, 0.0f, 0.0f};
+  float pad_kl2 = 0.0f;
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");
@@ -3291,6 +3319,11 @@ constexpr uint32_t kCloudHistWords = 3;
 constexpr uint32_t kClfOn = 1u;         // march and composite this frame
 constexpr uint32_t kClfHistValid = 2u;  // history may be reprojected
 constexpr uint32_t kClfBake = 4u;       // the noise volume needs (re)baking
+// The weather map is regenerated THIS frame (cloud.wgsl CLF_WEATHER, declared
+// there, its only reader). Clear = the map from the last regen is reused, read
+// through CloudParams.spare.yz, the metres the drift has moved since then —
+// see WriteCloudParams (support.cpp) for when a regen is due.
+constexpr uint32_t kClfWeather = 8u;
 
 // The cloud pass's own uniform. Must match CloudParams in common.wgsl, field
 // for field (check_invariants.py `params`). Written ONCE per rendered frame by

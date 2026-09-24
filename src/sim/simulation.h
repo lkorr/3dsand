@@ -625,6 +625,12 @@ class Simulation {
   const rhi::BindGroup& BodyRenderBG() const {
     return veilLive_ ? renderBG_ : renderBGNoVeil_;
   }
+  // BodyRenderBG for a draw whose fragment stage READS the veil. The scope
+  // split that makes the raymarch's veil writes visible is taken here, by the
+  // first such draw after DrawWorld, instead of unconditionally in DrawWorld:
+  // a pass that draws no veil reader after the world (--shot, a sky-only
+  // frame) pays no split at all.
+  const rhi::BindGroup& VeilReaderBG(const rhi::RenderPass& pass);
   void EnsureRenderPipelines(rhi::TextureFormat format);
   // Derive raymarchLeanModule_ from an already-loaded raymarch module by
   // flipping the three `const SPEC_* : bool = true;` lines in the source
@@ -887,6 +893,8 @@ class Simulation {
   uint64_t veilPixels_ = 0;
   rhi::BindGroup renderBGNoVeil_;
   bool veilLive_ = false;
+  // DrawWorld wrote the veil and no split has been taken yet (VeilReaderBG).
+  bool veilSplitPending_ = false;
   int page_ = 0;
 
   // ---- settled-tick skip state (§3.4) -------------------------------------

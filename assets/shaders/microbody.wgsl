@@ -278,21 +278,8 @@ fn poolStainAt(stainBase : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
 // same render.stain* knobs. Only the noise domain differs: the mottle is
 // sampled in MICRO cells scaled back to world pitch, so a stain on a scale-8
 // limb breaks up at the same physical size as one on the ground beside it.
-fn bodyVnHash(c : vec3<i32>) -> f32 {
-  return f32(pcg(u32(c.x * 374761393 + c.y * 668265263 + c.z * 1274126177)) &
-             0xFFFFu) * (1.0 / 65535.0);
-}
-fn bodyValueNoise(p : vec3f, scale : f32) -> f32 {
-  let q = p / scale;
-  let i = vec3<i32>(floor(q));
-  var f = fract(q);
-  f = f * f * (3.0 - 2.0 * f);
-  let x00 = mix(bodyVnHash(i + vec3<i32>(0,0,0)), bodyVnHash(i + vec3<i32>(1,0,0)), f.x);
-  let x10 = mix(bodyVnHash(i + vec3<i32>(0,1,0)), bodyVnHash(i + vec3<i32>(1,1,0)), f.x);
-  let x01 = mix(bodyVnHash(i + vec3<i32>(0,0,1)), bodyVnHash(i + vec3<i32>(1,0,1)), f.x);
-  let x11 = mix(bodyVnHash(i + vec3<i32>(0,1,1)), bodyVnHash(i + vec3<i32>(1,1,1)), f.x);
-  return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
-}
+// The value noise itself is common.wgsl's valueNoise — the one the ground's
+// stain mottle reads, so the two cannot drift.
 // ---- A COAT THAT GLOWS AND BREATHES (2026-09-23) ---------------------------
 // The stain palette entry's spare `_r2` word is the coat's glow + pulse
 // (materials.json coat.glow / coat.pulse; packed by Simulation::UploadTables,
@@ -320,7 +307,7 @@ fn bodyStainCover(stain : u32, cell : vec3<i32>, scale : f32) -> vec2f {
   // ParseCoat) scales the coverage, so water can soak a limb to full amount
   // and still read as a faint dampening rather than a grey statue.
   let opacity = f32(packed >> 24u) / 255.0;
-  let mottle = bodyValueNoise(vec3f(cell), TUNE_STAIN_MOTTLE_SCALE * scale);
+  let mottle = valueNoise(vec3f(cell), TUNE_STAIN_MOTTLE_SCALE * scale);
   let cover = opacity *
               clamp((amt * (1.0 + TUNE_STAIN_MOTTLE) - mottle * TUNE_STAIN_MOTTLE) *
                     TUNE_STAIN_COVERAGE, 0.0, 1.0);
@@ -435,17 +422,12 @@ const BODY_Z_PRIORITY : f32 = 3.0e-5;
 
 // ---- WHAT LIES OUTSIDE THE BRICK (the cut-face mask, 2026-09-11) -----------
 //
-// The word common.wgsl's MicroBodyModel mirror still calls `_pad` is NOT
-// padding: src/sim/microbody.h names it `cutFaces` and the mob loader fills it
-// in (mob.cpp LimbCutFaces). Six bits, `axis * 2 + positive`, one per boundary
-// plane of the brick, set when ANOTHER limb of the same prefab is pressed
-// against that plane — i.e. when the plane is a JOINT rather than the end of
-// the model.
-//
-// The mirror's name is stale and the rename is owed. It is held back only
-// because editing common.wgsl misses the SPIR-V cache for every shader in the
-// engine (CLAUDE.md: measured at 536 s), and this is the only reader.
-fn microBodyCutFaces(m : MicroBodyModel) -> u32 { return m._pad; }
+// MicroBodyModel.cutFaces (src/sim/microbody.h, filled by mob.cpp
+// LimbCutFaces). Six bits, `axis * 2 + positive`, one per boundary plane of
+// the brick, set when ANOTHER limb of the same prefab is pressed against that
+// plane — i.e. when the plane is a JOINT rather than the end of the model.
+// (The common.wgsl mirror called it `_pad` until 2026-09-24.)
+fn microBodyCutFaces(m : MicroBodyModel) -> u32 { return m.cutFaces; }
 
 // Sample the brick's occupancy field, deciding what a sample OUTSIDE the brick
 // means.

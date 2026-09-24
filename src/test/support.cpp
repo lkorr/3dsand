@@ -377,9 +377,43 @@ struct CloudPrev {
 };
 CloudPrev gCloudPrev;
 
+// ---- WEATHER-MAP REUSE (cloud.wgsl `weather`) -----------------------------
+// The weather map is 512^2 texels of six 5-octave gradient-noise fBms — about
+// 31M hashes and 16M sincos — and it used to be rebuilt in full every frame
+// although nothing in it moves at frame rate. Everything it depends on is one
+// of three kinds:
+//   * TRANSLATIONS of the noise domain: the drift (weatherOff) and the camera
+//     re-centring (weatherOrigin). A translated field is the same field read
+//     at a shifted position, so the map is REUSED and the lookup (weatherAt)
+//     adds the metres the drift has moved since it was built (spare.yz). No
+//     approximation at all while the reused map still covers the view.
+//   * SLOW CHANGES of shape: weatherEvolve (1 unit per 25 min, on a lattice
+//     of cloudWeatherScaleM / 0.7 ~ 17 km) and the preset's coverage / type /
+//     precip (weather transitions over minutes). Rebuilt when they move past
+//     a step small enough that the step is below what the eye can see — the
+//     evolve step is ~7 m of front movement, under a 125 m texel.
+//   * a changed map scale or a first frame: rebuilt outright.
+// The camera probe (cloudMaps CLOUD_PROBE_BASE) is written by the regen, so
+// between regens it is the column the camera was over at the last one — at
+// most a few hundred metres off, for a rain-here flag.
+struct WeatherGen {
+  bool valid = false;
+  float off[2] = {0, 0};
+  float origin[2] = {0, 0};
+  float evolve = 0, coverage = 0, precip = 0, cloudType = 0, scaleM = 0;
+};
+WeatherGen gWeatherGen;      // the map on the GPU (committed by the recorder)
+WeatherGen gWeatherPending;  // what this frame's uniform asked to build
+bool gWeatherRegenAsked = false;
+
 }  // namespace
 
 const CloudFrame& LastCloudFrame() { return gCloudFrame; }
+void CommitCloudWeather() {
+  if (!gWeatherRegenAsked) return;
+  gWeatherGen = gWeatherPending;
+  gWeatherRegenAsked = false;
+}
 
 // Fills the weather fields of `rp` and uploads CloudParams. Called from
 // WriteRenderParams, which is the single author of every frame uniform, so
@@ -523,6 +557,53 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
     cp.weatherOrigin[0] = (float)(std::floor(((double)camXM - h) / t) * t);
     cp.weatherOrigin[1] = (float)(std::floor(((double)camZM - h) / t) * t);
   }
+  // ---- reuse the weather map, or rebuild it (WeatherGen above) ----
+  {
+    const WeatherGen& g = gWeatherGen;
+    const float S = (float)weatherS;
+    const float shiftX = (cp.weatherOff[0] - g.off[0]) * S;
+    const float shiftZ = (cp.weatherOff[1] - g.off[1]) * S;
+    // Slack: 16 texels (2 km) of combined drift + camera travel from the
+    // centre the map was built round. The map reaches 256 texels (32 km) each
+    // way, so the view keeps >= 30 km of it in every direction.
+    const float slackM = 16.0f * cp.weatherTexelM;
+    const float lagX = std::fabs(cp.weatherOrigin[0] - g.origin[0]);
+    const float lagZ = std::fabs(cp.weatherOrigin[1] - g.origin[1]);
+    const bool regen =
+        !g.valid || g.scaleM != S ||
+        std::fabs(shiftX) + lagX > slackM || std::fabs(shiftZ) + lagZ > slackM ||
+        std::fabs(cp.weatherEvolve - g.evolve) > 4e-4f ||
+        std::fabs(cp.coverage - g.coverage) > 2e-3f ||
+        std::fabs(cp.precip - g.precip) > 2e-3f ||
+        std::fabs(cp.cloudType - g.cloudType) > 2e-3f;
+    gWeatherRegenAsked = on && regen;
+    if (regen) {
+      WeatherGen& p = gWeatherPending;
+      p.valid = true;
+      p.off[0] = cp.weatherOff[0];
+      p.off[1] = cp.weatherOff[1];
+      p.origin[0] = cp.weatherOrigin[0];
+      p.origin[1] = cp.weatherOrigin[1];
+      p.evolve = cp.weatherEvolve;
+      p.coverage = cp.coverage;
+      p.precip = cp.precip;
+      p.cloudType = cp.cloudType;
+      p.scaleM = S;
+      cp.flags |= kClfWeather;
+      cp.spare[1] = 0.0f;
+      cp.spare[2] = 0.0f;
+    } else {
+      // The map on the GPU was built at g.origin with g.off: read it there,
+      // shifted by the drift since. The regen-only fields (off, origin) are
+      // left as the map's own so nothing can read a mixed pair.
+      cp.weatherOrigin[0] = g.origin[0];
+      cp.weatherOrigin[1] = g.origin[1];
+      cp.weatherOff[0] = g.off[0];
+      cp.weatherOff[1] = g.off[1];
+      cp.spare[1] = shiftX;
+      cp.spare[2] = shiftZ;
+    }
+  }
   cp.shadowTexelM = 40.0f;
   // Just under the lowest local base: the jitter cap mirrors common.wgsl's
   // cloudBaseJitterM (10% of thickness, at most CLOUD_BASE_JITTER_MAX_M
@@ -569,6 +650,73 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   gCloudFrame.on = on;
   gCloudFrame.lowW = lowW;
   gCloudFrame.lowH = lowH;
+}
+
+// ---- THE FRAME'S LIGHT: one author for the key light and the ambient ------
+// Fills RenderParams' dayWeight / moonLit / keyDir / keyCol / ambGround /
+// ambSky / ambOvercast from the sky state already in `rp` and the TUNE_*
+// values, exactly as the per-pixel WGSL did (common.wgsl keyLightColorP,
+// keyLightDirP, ambientAtP, moonContribP, sunTransmittance, airMass — the
+// shader now reads the results instead of re-deriving them). Everything here
+// is frame-constant, so it was 21 + 18 call sites of per-pixel smoothsteps,
+// pows and an acos computing the same numbers, in two copies that had
+// drifted apart (the terrain's missed the overcast and lightning).
+//
+// Render-only float math: nothing here reaches the sim or the world hash.
+// Called after WriteCloudParams, which is what writes overcast / lightning.
+static void ResolveFrameLight(RenderParams& rp, const Tuning::Render& r) {
+  auto clampf = [](float x, float lo, float hi) { return std::min(std::max(x, lo), hi); };
+  auto smooth = [&](float e0, float e1, float x) {
+    const float t = clampf((x - e0) / (e1 - e0), 0.0f, 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+  };
+  // moonContribP: up-ness x intensity x (illuminated fraction)^2 shaping.
+  auto moonContrib = [&](const float* dir, float phase, float intensity) {
+    return smooth(-0.10f, 0.18f, dir[1]) * intensity *
+           (0.15f + 1.70f * phase * phase);
+  };
+  // airMass (Kasten-Young) and sunTransmittance, common.wgsl.
+  const float c = clampf(rp.sunDir[1], -0.02f, 1.0f);
+  const float zdeg = std::acos(clampf(c, -1.0f, 1.0f)) * (180.0f / 3.14159265358979f);
+  const float mass = 1.0f / (c + 0.50572f * std::pow(std::max(96.07995f - zdeg, 1e-3f), -1.6364f));
+  static const float kRayleigh[3] = {0.1440f, 0.3125f, 0.7940f};
+  const float kSunTransmitK = 0.09f;
+
+  const float a = moonContrib(rp.moonDir, rp.moonPhase, r.moonLightIntensity);
+  const float b = moonContrib(rp.moon2Dir, rp.moon2Phase, r.moon2LightIntensity);
+  const float f = clampf(rp.solarEclipse, 0.0f, 1.0f);
+  const float dayW = rp.sunUp * (1.0f - std::pow(f, r.eclipseCurve) * r.eclipseDarkness);
+  const float inv = 1.0f / std::max(r.moonLightIntensity, 1e-4f);
+  const float moonLit = (a + b) * inv;
+  rp.dayWeight = dayW;
+  rp.moonLit = moonLit;
+
+  // Key colour: the brighter moon by night, the reddened sun by day.
+  for (int k = 0; k < 3; k++) {
+    const float sunCol = std::exp(-kRayleigh[k] * mass * kSunTransmitK * r.sunReddening) *
+                         r.sunColor[k] * r.sunIntensity;
+    const float keyMoon = a >= b ? r.moonLightColor[k] * a : r.moon2LightColor[k] * b;
+    rp.keyCol[k] = keyMoon + (sunCol - keyMoon) * dayW;
+  }
+  // Key direction: a hard switch at RAW sunUp = 0.5 (keyLightDirP's argument
+  // for not blending, and for not using the eclipse-dimmed weight).
+  {
+    const float* d = rp.sunUp >= 0.5f ? rp.sunDir : (a >= b ? rp.moonDir : rp.moon2Dir);
+    const float len = std::sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]);
+    const float il = len > 0.0f ? 1.0f / len : 0.0f;
+    for (int k = 0; k < 3; k++) rp.keyDir[k] = d[k] * il;
+    if (len <= 0.0f) rp.keyDir[1] = 1.0f;
+  }
+  // Hemisphere ambient at its two ends. Linear in n.y, so the shader's
+  // mix(ambGround, ambSky, n.y * 0.5 + 0.5) is the old expression exactly.
+  const float moonAmt = 0.30f * (moonLit >= 0.001f ? 1.0f : 0.0f) + 1.40f * moonLit * 0.5f;
+  for (int k = 0; k < 3; k++) {
+    const float nightG = r.nightAmbGround[k] * (0.45f + moonAmt);
+    const float nightS = r.nightAmbSky[k] * (0.45f + moonAmt);
+    rp.ambGround[k] = nightG + (r.ambGround[k] - nightG) * dayW;
+    rp.ambSky[k] = nightS + (r.ambSky[k] - nightS) * dayW;
+  }
+  rp.ambOvercast = clampf(rp.overcast, 0.0f, 1.0f) * 0.8f;
 }
 
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
@@ -768,6 +916,8 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   // The clouds and the weather (cloud.wgsl): CloudParams, and the four
   // RenderParams fields they own. Last, because it scales rp.fogDensity.
   WriteCloudParams(queue, world, rp, eye, aspect, viewPx, tick, frameFrac, sky);
+  // After the clouds: the ambient's overcast and lightning come from there.
+  ResolveFrameLight(rp, tun.render);
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
 }
 

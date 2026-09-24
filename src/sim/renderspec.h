@@ -80,5 +80,12 @@ struct CloudFrame {
   unsigned lowW = 1, lowH = 1;
 };
 const CloudFrame& LastCloudFrame();
+// The recorder calls this when it has recorded this frame's cloud rows. If the
+// uniform asked for a weather-map regen (kClfWeather), the map those rows
+// write becomes the one later frames reuse; if the rows were never recorded,
+// nothing was regenerated and the next frame decides again against the old
+// map. Committing at RECORD time rather than at uniform-write time is what
+// keeps the reuse offset honest for callers that write params and draw no sky.
+void CommitCloudWeather();
 
 }  // namespace sandvox
