@@ -96,9 +96,18 @@ Preset Lerp(const Preset& a, const Preset& b, float t);
 // and again on Reload() (the R hot-reload and F5 both call it). A missing or
 // empty directory is NOT fatal: the built-in table below is used and one
 // warning is printed, so a checkout without the folder still has a sky.
+// The four fields SimRainWord reads, as Q16 fixed point (65536 = 1.0),
+// quantised ONCE per load from the authored floats. The sim word is computed
+// from these in integers only — see SimRainWord.
+struct PresetQ {
+  int64_t weight = 0, coverage = 0, precip = 0, precipType = 0;
+};
+
 class Library {
  public:
   const std::vector<Preset>& Presets();   // sorted by moisture
+  // Parallel to Presets(): entry i is Presets()[i] quantised.
+  const std::vector<PresetQ>& PresetsQ();
   const Preset* Find(const std::string& name);
   void Reload();
   const std::vector<std::string>& Warnings() const { return warnings_; }
@@ -107,6 +116,7 @@ class Library {
   void EnsureLoaded();
   bool loaded_ = false;
   std::vector<Preset> presets_;
+  std::vector<PresetQ> presetsQ_;
   std::vector<std::string> warnings_;
 };
 Library& Presets();
@@ -127,7 +137,7 @@ const std::string& Override();
 // `frameDtSeconds` only drives the manual-override ease and the lightning
 // envelope; pass 0 on a headless path and both snap.
 State Resolve(const Tuning& t, uint32_t seed, double timeSeconds,
-              float frameDtSeconds, float camXM, float camZM);
+              float frameDtSeconds);
 
 // THE SIM'S VIEW OF THE WEATHER: TickParams::weatherRain for `tick`, the one
 // integer by which the sky touches the world (reaction flags "rain" and
@@ -137,8 +147,14 @@ State Resolve(const Tuning& t, uint32_t seed, double timeSeconds,
 //   bits 16..23 ground wetness (the leaky integral), 0..255
 // A pure function of (tuning, presets, seed, tick, the pinned preset): it
 // reads the un-eased TARGET, never the frame-time ease, so frame pacing cannot
-// reach the world hash. The floats stop here — quantised once, on the tick
-// input stream, which is what replays and the determinism gates capture.
+// reach the world hash. INTEGER MATH END TO END (2026-09-24): every float input
+// — the presets (PresetQ) and the weather.* tuning — is quantised to Q16 by one
+// exact conversion, and the schedule, ladder, blend and wetness sum run on
+// int64. It used to run the renderer's float path (std::exp, float smoothstep
+// and lerp, then lround), and a libm `exp` is exactly the kind of thing two
+// machines may disagree on in the last bit — which a quantiser then turns into
+// a different word and a multiplayer desync. The renderer keeps the float path;
+// the two agree up to fixed-point rounding, not bit-for-bit.
 // 0 when weather.clouds or weather.rainTouchesWorld is off.
 uint32_t SimRainWord(const Tuning& t, uint32_t seed, uint32_t tick);
 // The word the last SimRainWord call returned — a readout for the dev panel,

@@ -1848,8 +1848,12 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
       debris.SetDayPhase(DayPhaseNow(tick));
       // ...and the weather, from the one function that also puts it on
       // TickParams (weather::SimRainWord), for the same reason.
-      mobs.SetWeatherRain(weather::SimRainWord(CurrentTuning(), kDefaultSeed, tick));
-      debris.SetWeatherRain(weather::SimRainWord(CurrentTuning(), kDefaultSeed, tick));
+      // Once per tick, handed to both: it is the same pure function of the
+      // same inputs, and each call walks nine schedule samples.
+      const uint32_t rainWord =
+          weather::SimRainWord(CurrentTuning(), kDefaultSeed, tick);
+      mobs.SetWeatherRain(rainWord);
+      debris.SetWeatherRain(rainWord);
 
       // ---- BROKEN VESSELS (game/container.h ContainerShouldBreak) -----------
       //
