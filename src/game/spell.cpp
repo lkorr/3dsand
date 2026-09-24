@@ -444,14 +444,19 @@ std::string WordWithMagnitude(const GlyphDef& g, int32_t mag) {
   return SerializeWord(g, mag, SpellTiming{});
 }
 
-int32_t MagnitudeWordCost(int32_t word, int32_t mag) {
+int32_t MagnitudeWordCost(int32_t word, int32_t mag, int32_t magDefault) {
   if (word <= 0) return word;
-  if (mag == kMagOne) return word;
-  // word × mag² / 10⁶, rounded up. CONVEX, so a middle magnitude is the
+  if (mag == magDefault) return word;
+  // word × (mag / default)², rounded up. CONVEX, so a middle magnitude is the
   // efficient one and "always max it" is a real price rather than the default
   // (Morrowind's spellmaking collapsed to max magnitude on a linear price).
+  // CENTRED ON THE WORD'S OWN DEFAULT, not on 1: `speed` defaults to 2, and a
+  // price centred on 1 charged a freshly placed `speed` 4x its authored cost
+  // (16 against its alias `swift`'s 4) for saying nothing.
   const int64_t m = mag < 0 ? -(int64_t)mag : mag;
-  const int64_t c = ((int64_t)word * m * m + 999999) / 1000000;
+  int64_t d = magDefault < 0 ? -(int64_t)magDefault : magDefault;
+  if (d == 0) d = kMagOne;
+  const int64_t c = ((int64_t)word * m * m + d * d - 1) / (d * d);
   return (int32_t)std::min<int64_t>(std::max<int64_t>(c, 1), 0x3FFFFFFF);
 }
 
@@ -1390,7 +1395,7 @@ int32_t WordCostOf(const GlyphLibrary& lib, const SpellTree& t, int node) {
   if (node < 0) return 0;
   const SpellNode& n = t.nodes[node];
   const GlyphDef* g = lib.At(n.glyph);
-  int32_t c = g ? SatMul(MagnitudeWordCost(g->word, n.mag), n.n) : 0;
+  int32_t c = g ? SatMul(MagnitudeWordCost(g->word, n.mag, g->magDefault), n.n) : 0;
   if (n.group) c = SatAdd(c, SatAdd(WordCostOf(lib, t, n.left), WordCostOf(lib, t, n.right)));
   // A box owns every word inside it: word costs SUM over the whole tree,
   // whatever the tariff does.
@@ -2121,6 +2126,11 @@ SpellCast LowerBox(const GlyphLibrary& lib, const SpellTree& tree, int node,
         e.verb = SpellVerb::Launch;
         e.glyph = tree.nodes[ni].glyph;
         e.n = tree.nodes[ni].n;
+        // WHEN the box fires in its carrier (M3). `LaunchEffectOf` (a box
+        // under an operator) always carried it; a box standing in a bag lost
+        // it here, so `projectile+20` / `projectile!launch` as an item parsed,
+        // round-tripped, drew its tag on the page and then fired on hit, now.
+        e.timing = tree.nodes[ni].timing;
         e.node = ni;
         e.inner = child.payload;
         e.launch.push_back(child.delivery);
@@ -3157,6 +3167,22 @@ void SpellSystem::Launch(const SpellCast& cast, SpellFxVec originFx, SpellFxVec 
   live_.push_back(std::move(p));
 }
 
+// Give every echo a payload scheduled since `from` the launch context the
+// immediate path gives a launch: where a carrier it fires is born, along what,
+// at which generation, for whom (SpellEcho::launchGen). The first stamp wins,
+// the same way a launch keeps the at/dir of the resolve that asked for it.
+static void StampEchoLaunches(SpellEmission& out, size_t from, SpellFxVec at, SpellFxVec dir,
+                              int32_t gen, uint64_t casterId) {
+  for (size_t k = from; k < out.echoes.size(); k++) {
+    SpellEcho& ec = out.echoes[k];
+    if (ec.casterId == 0) ec.casterId = casterId;
+    if (ec.launchGen >= 0) continue;
+    ec.launchAt = at;
+    ec.launchDir = dir;
+    ec.launchGen = gen;
+  }
+}
+
 CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
                              const CasterHealth& health, uint64_t casterId,
                              SpellFxVec originFx, SpellFxVec dirFx,
@@ -3251,6 +3277,7 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
           at = {at.x + o.x, at.y + o.y, at.z + o.z};
         }
         const size_t before = out.launches.size();
+        const size_t ebefore = out.echoes.size();
         ApplySpellEffect(*lib_, ci2.payload, at, d, 1000, out, probe, r.instability,
                          (uint32_t)b);
         // A carrier the hand spoke starts AT THE CASTER, not at reach: the
@@ -3261,6 +3288,7 @@ CastResult SpellSystem::Cast(const CastList& list, CasterState& caster,
           out.launches[kk].generation = 0;
           out.launches[kk].casterId = casterId;
         }
+        StampEchoLaunches(out, ebefore, originFx, d, 0, casterId);
         // A gravity Mod on the hand acts on the caster's body: `float` hops,
         // `heavy` shoves down. Once, as an impulse; `aura` makes it a status.
         if (b == 0 && ci2.delivery.gravityMille != 0)
@@ -3329,6 +3357,7 @@ void SpellSystem::AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies
         if (ic.delivery.mech == DeliveryMech::Flight &&
             HasTrigger(ic.payload, SpellTrigger::Launch)) {
           const size_t lb = out.launches.size();
+          const size_t eb = out.echoes.size();
           ApplySpellEffect(*lib_, ItemsOn(ic.payload, SpellTrigger::Launch), rq.at, d, 1000, out,
                            probe, rq.instability, rq.salt ^ 0x1A0u ^ (uint32_t)b2);
           for (size_t kk = lb; kk < out.launches.size(); kk++) {
@@ -3337,6 +3366,7 @@ void SpellSystem::AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies
             out.launches[kk].generation = gen + 1;
             out.launches[kk].casterId = rq.casterId;
           }
+          StampEchoLaunches(out, eb, rq.at, d, gen + 1, rq.casterId);
         }
         switch (ic.delivery.mech) {
           case DeliveryMech::Flight:
@@ -3390,6 +3420,7 @@ void SpellSystem::AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies
               at = {at.x + o.x, at.y + o.y, at.z + o.z};
             }
             const size_t before = out.launches.size();
+            const size_t ebefore = out.echoes.size();
             ApplySpellEffect(*lib_, *payload, at, d, 1000, out, probe, rq.instability,
                              rq.salt ^ (uint32_t)b2);
             for (size_t kk = before; kk < out.launches.size(); kk++) {
@@ -3398,6 +3429,7 @@ void SpellSystem::AdoptLaunches(SpellEmission& out, const SpellBodyProbe* bodies
               out.launches[kk].generation = gen + 1;
               out.launches[kk].casterId = rq.casterId;
             }
+            StampEchoLaunches(out, ebefore, at, {0, kSpellFxOne, 0}, gen + 1, rq.casterId);
             if (b2 == 0 && ic.delivery.gravityMille != 0)
               out.casterImpulseVps.y += -(float)ic.delivery.gravityMille * 0.012f;
             break;
@@ -3775,6 +3807,7 @@ void SpellSystem::Tick(uint32_t tick, World& world,
     if (opsUsed < kSpellOpsPerTick) {
       const size_t before = out.ops.size();
       const size_t lbefore = out.launches.size();
+      const size_t ebefore = out.echoes.size();
       ApplySpellEffect(*lib_, items, at, dir, 1000, out, &probe, instability, salt);
       opsUsed += (int)(out.ops.size() - before);
       // NESTING (rule 2): a child leaves from the last free position, one
@@ -3787,6 +3820,9 @@ void SpellSystem::Tick(uint32_t tick, World& world,
         out.launches[k].generation = gen + 1;
         out.launches[k].casterId = casterId;
       }
+      // A DELAYED child (M3 `delay`, or an `echo` over a box) is the same
+      // child later: same free position, same direction, same generation.
+      StampEchoLaunches(out, ebefore, from, ld, gen + 1, casterId);
       stamp(casterId);
     } else {
       opsDropped_++;
@@ -4137,9 +4173,27 @@ void SpellSystem::Tick(uint32_t tick, World& world,
       ec.phase = 0;
       if (opsUsed < kSpellOpsPerTick) {
         const size_t before = out.ops.size();
+        const size_t lbefore = out.launches.size();
+        const size_t ebefore = out.echoes.size();
         ApplySpellEffect(*lib_, ec.inner, ec.at, ec.dir, 1000, out, &probe, ec.instability,
                          (uint32_t)tick ^ (uint32_t)i);
         opsUsed += (int)(out.ops.size() - before);
+        // The carriers it fires are born exactly as the immediate path would
+        // have born them (SpellEcho::launchAt): the caster's, one generation
+        // down, from the last free position. An echo nobody stamped (a
+        // trail's, a status's) keeps its old reading: from the echo's point.
+        const bool ctx = ec.launchGen >= 0;
+        for (size_t k = lbefore; k < out.launches.size(); k++) {
+          SpellLaunchReq& lq = out.launches[k];
+          if (ctx) {
+            lq.at = ec.launchAt;
+            lq.dir = ec.launchDir;
+            lq.generation = ec.launchGen;
+          }
+          if (lq.casterId == 0) lq.casterId = ec.casterId;
+        }
+        if (ctx)
+          StampEchoLaunches(out, ebefore, ec.launchAt, ec.launchDir, ec.launchGen, ec.casterId);
         stamp(ec.casterId);
       } else {
         opsDropped_++;

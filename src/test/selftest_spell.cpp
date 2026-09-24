@@ -2090,6 +2090,97 @@ Status GateSpellTiming(Ctx& c, std::string& detail) {
                                  bnc0.blasts));
   check(bnc.blasts == 2, Format("`!bounce` explodes at each of 2 bounces (%d)", bnc.blasts));
 
+  // (f) A DELAYED CARRIER IS THE SAME CHILD, LATER. `explosive lift projectile`
+  // nested in a bolt, once immediate and once `+20`: the child must be born
+  // with the caster's id (so it neither homes on nor hits its own caster),
+  // one generation down (maxGeneration holds), from the parent's last free
+  // position along the reflection - identical to the immediate child, only 20
+  // ticks later. Flown WITH a body probe, so every body query the flights make
+  // names the caster they were asked for; the probe answers "nothing there".
+  struct BodyLog {
+    std::vector<uint64_t> asked;   // casterIds bodyHit / nearestTarget were asked for
+  };
+  struct Born {
+    int tick = -1;
+    SpellFxVec pos{}, vel{};
+    int32_t gen = -1;
+    uint64_t casterId = ~0ull;
+  };
+  auto flyNested = [&](const std::vector<std::string>& w, BodyLog& log) {
+    Born child;
+    SpellSystem sys;
+    sys.SetLibrary(&lib);
+    const CastList sp = compile(w);
+    CasterState cs;
+    cs.mana = 1 << 28;
+    cs.manaMax = 1 << 28;
+    FakeHealth hp(1 << 28);
+    SpellBodyProbe bp;
+    bp.ctx = &log;
+    bp.bodyHit = [](void* ctx, Vec3, Vec3, uint64_t id, Vec3&) {
+      ((BodyLog*)ctx)->asked.push_back(id);
+      return false;
+    };
+    bp.nearestTarget = [](void* ctx, Vec3, uint64_t id, Vec3&) {
+      ((BodyLog*)ctx)->asked.push_back(id);
+      return false;
+    };
+    bp.bodyPos = [](void*, uint64_t, Vec3&) { return false; };
+    SpellEmission e0;
+    sys.Cast(sp, cs, hp.cb, 41, origin, {kSpellFxOne, 0, 0}, 1, e0, nullptr, nullptr, &bp);
+    for (int t = 0; t < 3 * (int)lib.budgets.maxLifetimeTicks + lib.budgets.maxDelayTicks; t++) {
+      SpellEmission e;
+      sys.Tick((uint32_t)(9000 + t), world, classOf, e, &bp);
+      for (const SpellProjectile& p : sys.Live())
+        if (p.gen >= 1 && child.tick < 0) {
+          child.tick = t;
+          child.pos = p.pos;
+          child.vel = p.vel;
+          child.gen = p.gen;
+          child.casterId = p.casterId;
+        }
+      if (sys.LiveCount() == 0 && sys.BombCount() == 0 && sys.Echoes().empty() && t > 2) break;
+    }
+    return child;
+  };
+  BodyLog logNow, logLater;
+  const Born kidNow =
+      flyNested(words({"explosive", "lift", "projectile", "lift", "projectile"}), logNow);
+  const Born kidLater =
+      flyNested(words({"explosive", "lift", "projectile+20", "lift", "projectile"}), logLater);
+  check(kidNow.tick >= 0 && kidNow.gen == 1 && kidNow.casterId == 41,
+        Format("control: an immediate nested bolt is born gen 1 for caster 41 (t%d gen %d "
+               "caster %llu)",
+               kidNow.tick, kidNow.gen, (unsigned long long)kidNow.casterId));
+  check(kidLater.tick >= 0 && kidLater.tick - kidNow.tick == 20,
+        Format("a `+20` nested bolt is born 20 ticks after the immediate one (t%d -> t%d)",
+               kidNow.tick, kidLater.tick));
+  check(kidLater.casterId == 41,
+        Format("a delayed nested bolt belongs to its caster (casterId %llu, want 41)",
+               (unsigned long long)kidLater.casterId));
+  check(kidLater.gen == kidNow.gen,
+        Format("a delayed nested bolt is one generation down like the immediate one (gen %d "
+               "vs %d)",
+               kidLater.gen, kidNow.gen));
+  check(kidLater.pos.x == kidNow.pos.x && kidLater.pos.y == kidNow.pos.y &&
+            kidLater.pos.z == kidNow.pos.z && kidLater.vel.x == kidNow.vel.x &&
+            kidLater.vel.y == kidNow.vel.y && kidLater.vel.z == kidNow.vel.z,
+        Format("a delayed nested bolt leaves from the parent's last free position along the "
+               "reflection, as the immediate one does (pos %d,%d,%d vel %d,%d,%d vs pos "
+               "%d,%d,%d vel %d,%d,%d)",
+               kidLater.pos.x, kidLater.pos.y, kidLater.pos.z, kidLater.vel.x, kidLater.vel.y,
+               kidLater.vel.z, kidNow.pos.x, kidNow.pos.y, kidNow.pos.z, kidNow.vel.x,
+               kidNow.vel.y, kidNow.vel.z));
+  {
+    int foreign = 0;
+    for (uint64_t id : logLater.asked) foreign += id != 41;
+    for (uint64_t id : logNow.asked) foreign += id != 41;
+    check(!logLater.asked.empty() && foreign == 0,
+          Format("every body query a flight makes names its caster (%d of %d asked for "
+                 "another id)",
+                 foreign, (int)(logLater.asked.size() + logNow.asked.size())));
+  }
+
   detail = Format("%d checks", checks);
   std::printf("spell-timing: %s (expire %d, every %d pulses/%d-tick life, launch %d at cast, "
               "delay t%d->t%d, bounce %d vs control %d; %d checks)\n",

@@ -599,6 +599,12 @@ std::string MagnitudeLine(const UIState::SpellGraphUI::Node& n) {
 static int gTimingTree = -1;          // the tree node the open menu edits
 static int gTimingCur[3] = {0, 0, 0};  // its trigger / every / delay when opened
 static bool gTimingOpen = false;       // a click asked for the menu this frame
+// THE PAGE THE INDEX MEANS SOMETHING IN. `gTimingTree` is a node index into
+// the tree of these words, and an index outlives nothing: an undo, a reload or
+// a page switch while the menu is open rebuilds the tree, and the same number
+// then names some other word. The menu closes the frame its words change.
+static std::vector<std::string> gTimingWords;
+static std::string gTimingPage;
 
 const char* TriggerTag(int trig) {
   switch (trig) {
@@ -646,9 +652,17 @@ void TimingClick(const UIState::SpellGraphUI::Node& n, bool hov, bool readOnly, 
 void TimingPopup(UIState& s) {
   if (gTimingOpen) {
     gTimingOpen = false;
+    gTimingWords = s.grimoireEditWords;
+    gTimingPage = s.grimoireSelected;
     ImGui::OpenPopup("##timing");
   }
   if (!ImGui::BeginPopup("##timing")) return;
+  if (s.grimoireEditWords != gTimingWords || s.grimoireSelected != gTimingPage) {
+    ImGui::CloseCurrentPopup();
+    ImGui::EndPopup();
+    gTimingTree = -1;
+    return;
+  }
   auto apply = [&](int trig, int every, int delay) {
     PushGrimoireUndo(s);
     s.graphEdit = {};
