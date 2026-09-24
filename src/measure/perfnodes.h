@@ -230,6 +230,17 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "lit pixel inside the raymarch. Its cost belongs next to raymarch, not "
      "inside it: this row going up while raymarch goes down by more is the "
      "trade working (world.h kShadowCacheBuckets)."},
+    // The clouds (cloud.wgsl): the noise bake (once), the weather / shadow /
+    // env maps and the low-res march + temporal resolve, all per FRAME on the
+    // ShadowCache table. Zero when weather.clouds is off or the sky is empty —
+    // no row is recorded. The march is the one that scales (with coverage,
+    // resolution and render.cloudSteps); the rest are fixed-size.
+    {"clouds", "Clouds", "renderPass", PerfSide::Gpu, PerfScope::Count,
+     "cloud_noise;cloud_weather;cloud_shadow;cloud_env;cloud_march;cloud_resolve",
+     "Volumetric cloud deck, cirrus and rain curtains, marched at 1/cloudResDiv "
+     "resolution and accumulated over frames, plus the maps the rest of the "
+     "renderer reads the clouds through. Measure it under a full overcast "
+     "looking up — sky pixels were free before clouds existed."},
     // Billed to `renderPass` and not to `simTick`, even though its two rows are
     // recorded on the TICK command buffer. The bill follows what the cost is
     // FOR: nothing in the sim reads this grid, and turning off

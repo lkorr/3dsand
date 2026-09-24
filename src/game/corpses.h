@@ -88,6 +88,11 @@ class Corpses {
         if (p.body == body) c.gear.erase(c.gear.begin() + g);
         else g++;
       }
+      // A corpse with nothing left of it is forgotten — AND SO IS ITS PACK.
+      // Carried stacks (CorpseReport::Piece with no body) have no handle of
+      // their own to keep the entry alive, so a body that burns away entirely
+      // takes its purse with it. That is the reading, not an oversight: what
+      // is left of a man who burned to nothing is nothing.
       if (c.bodies.empty()) corpses_.erase(corpses_.begin() + ci);
       else ci++;
     }
@@ -173,6 +178,14 @@ inline LootResult TakeCorpseLoot(CorpseReport& corpse, int index, KitRef dest,
   }
 
   // ---- find it a home, without touching anything yet ----------------------
+  //
+  // THE WHOLE STACK MOVES, AND THE PROBE DOES NOT CHANGE FOR IT. A carried
+  // entry (CorpseReport::Piece::count) can be a dozen of something, and the
+  // one-unit probe below is still the right question because NO STACK IN THIS
+  // GAME HAS A MAXIMUM: Bag::Add and Inventory::Add merge by `count += count`
+  // with no ceiling, so N units fit in exactly the places one unit fits. If a
+  // stack limit is ever added, this is the comment that has to stop being
+  // true — the probe would then need capacity for N, and a partial take.
   if (dest.space == KitSpace::None) {
     // Probe only: Bag::Add would place it, and a refusal must leave the
     // corpse untouched. First free bag slot or a stack of the same item.
@@ -207,22 +220,23 @@ inline LootResult TakeCorpseLoot(CorpseReport& corpse, int index, KitRef dest,
   // THE COLOUR COMES WITH IT (game/dye.h). It is carried on the piece rather
   // than re-derived, because there is nothing to re-derive it from: a dye is
   // not recoverable from the greyscale art it colours.
+  const int take = piece.count > 0 ? piece.count : 1;
   if (dest.space == KitSpace::None) {
-    int where = kit.bag.Add(di, 1, piece.dye);
-    if (where < 0) where = hotbar.Add(di, 1, piece.dye);
+    int where = kit.bag.Add(di, take, piece.dye);
+    if (where < 0) where = hotbar.Add(di, take, piece.dye);
     (void)where;   // proven above
   } else {
     ItemStack* d = kit.Resolve(dest, hotbar);
     if (d->Empty()) {
-      *d = ItemStack{di, 1, piece.dye};
+      *d = ItemStack{di, take, piece.dye};
     } else if (d->def == di && d->dye == piece.dye) {
-      d->count++;
+      d->count += take;
     } else {
       // SWAP-NEVER-OVERWRITE, with the pack standing in for the corpse as the
       // other end: what was in the slot goes to the first free bag slot.
       const int free = kit.bag.FirstFree();
       kit.bag.slots[free] = *d;
-      *d = ItemStack{di, 1, piece.dye};
+      *d = ItemStack{di, take, piece.dye};
     }
   }
 
@@ -251,8 +265,13 @@ inline LootResult TakeCorpseLoot(CorpseReport& corpse, int index, KitRef dest,
   // ---- and the corpse loses it -----------------------------------------------
   // Last, because the release hook may erase `corpse` out from under us on the
   // final body (see the header note).
+  //
+  // A CARRIED STACK HAS NO BODY AND THERE IS NOTHING TO DESTROY. Erasing the
+  // entry above WAS the whole removal — it was never an object in the world.
+  // Which also means a take of a pack item cannot invalidate `corpse`: no body
+  // leaves, so OnBodyGone does not fire.
   for (uint64_t r : piece.rags) debris.DestroyBody(r);
-  debris.DestroyBody(piece.body);
+  if (piece.body) debris.DestroyBody(piece.body);
   return LootResult::Ok;
 }
 
@@ -264,6 +283,13 @@ inline bool ShedCorpseLoot(CorpseReport& corpse, int index,
                            DebrisSystem& debris, WorldItems& ground,
                            std::string* outItem = nullptr) {
   if (index < 0 || index >= (int)corpse.gear.size()) return false;
+  // A CARRIED STACK CANNOT BE SHED, because this function creates nothing: its
+  // whole premise is that the body is already lying there and only needs its
+  // strap cut and its identity registered. A pack item never had a body, so
+  // shedding it would have to SPAWN one, which is the drop path main.cpp
+  // already owns for dragging something out of the bag. Refused here so the
+  // caller falls back to that rather than silently deleting the stack.
+  if (corpse.gear[index].body == 0) return false;
   CorpseReport::Piece piece = std::move(corpse.gear[index]);
   corpse.gear.erase(corpse.gear.begin() + index);
   if (outItem) *outItem = piece.item;

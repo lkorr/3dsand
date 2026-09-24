@@ -32,6 +32,7 @@
 #include "sim/tuning.h"
 #include "sim/voxload.h"
 #include "sim/waterbody.h"
+#include "sim/weather.h"
 #include "sim/wind.h"
 #include "sim/windprim.h"
 #include "sim/worldedit.h"
@@ -434,6 +435,21 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         player.speedScale = couple ? loco.speedScale : 1.0f;
         player.jumpScale = couple ? loco.jumpScale : 1.0f;
         player.canJump = couple ? loco.canJump : true;
+        // Slippery feet: a coat whose material lists "slippery" in its
+        // coat.effects (oil) on the SOLES of the limbs tagged "foot" ramps
+        // ground grip from 1 down to player.slipGrip. Read off the coat
+        // ledger, so it follows the coat as it is shed onto the floor and
+        // washed off. Sole, not whole foot: the whole-limb fraction divided a
+        // stepped-in coat by the foot's interior and never reached onset.
+        player.groundGrip = 1.0f;
+        if (couple) {
+          const auto& pt = CurrentTuning().player;
+          const float f = mobs.CoatTagFraction(avatar.Id(), "slippery", "foot",
+                                               /*sole=*/true);
+          const float span = std::max(1e-4f, pt.slipCoatFull - pt.slipCoatStart);
+          const float t = std::clamp((f - pt.slipCoatStart) / span, 0.0f, 1.0f);
+          player.groundGrip = 1.0f + (pt.slipGrip - 1.0f) * t;
+        }
         // ...and what you are DRAGGING multiplies the same scale (game/grab.h):
         // a light crate costs nothing, a corpse walks you at half pace, and the
         // heaviest thing the grab will accept is close to the tuned floor. It
@@ -465,6 +481,12 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         if (avatar.Spawned() && avatar.Ragdolled()) {
           player.vel = {};
           player.SnapRender();   // the rig owns the body: nothing to lerp
+          // Update() is what normally ages the step-smoothing offsets, and it
+          // is not running. Left frozen they would hold the camera (and now
+          // the art, Player::RenderBodyOffset) a step off the ground for the
+          // whole ragdoll — so age them here on the same clock.
+          player.DecayViewSmooth(kTickDt,
+                                 CurrentTuning().player.viewSmoothHalflife);
         } else {
           player.Update(kTickDt, ti, kindAt);
         }
@@ -515,12 +537,15 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         // direction that was flicked, aimed wherever the camera is THEN.
         if (ti.Pressed(TB_ATTACK) && meleeReady) {
           const StyleLibrary& styleLib = mobs.AttackStyles();
-          // WHICH COMPASS: the sword's, or the fists'. Two maps rather than one
-          // filtered set, because the two are different SHAPES (strokes.h
-          // StyleLibrary::playerUnarmed) — a punch compass has a jab and a
-          // cross where a sword's has an overhead and a thrust.
+          // WHICH COMPASS: three maps keyed on what is in the fist.
+          // A dagger's short blade needs its own sectors, and unarmed
+          // is a different vocabulary entirely (punches vs cuts).
           const PlayerStrikeMap& map =
-              meleeArmed ? styleLib.player : styleLib.playerUnarmed;
+              !meleeArmed              ? styleLib.playerUnarmed
+            : (heldItem && heldItem->weaponClass == "dagger"
+                         && styleLib.playerDagger.Usable())
+                                       ? styleLib.playerDagger
+            :                            styleLib.player;
           float fx = 0, fy = 0;
           int si = -1;
           if (strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy))
@@ -793,8 +818,19 @@ static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
             // fills further down, and the ray must be cast HERE where the
             // camera and physics state for this tick are current. Carrying the
             // hit forward is cheaper than reordering the tick.
-            float br = (float)CurrentTuning().tools.laserMeltRadius;
-            laserCut = {hitBody, hitPos + fwd * (br * 0.5f), br, false};
+            //
+            // A CORPSE IS STILL FLESH. The kill usually lands a few ticks into
+            // a held beam, and the melt radius (2 voxels, sized for rock) then
+            // bored a ball out of the dead head every tick — the clean hole
+            // the live carve had started turned into a crater. Dead flesh
+            // takes the same sub-voxel bore a living limb does.
+            if (debris.BodyIsDeadFlesh(hitBody)) {
+              laserCut = {hitBody, hitPos,
+                          (float)CurrentTuning().tools.laserCarveRadius, false};
+            } else {
+              float br = (float)CurrentTuning().tools.laserMeltRadius;
+              laserCut = {hitBody, hitPos + fwd * (br * 0.5f), br, false};
+            }
           }
         } else if (gridDist < 1e8f) {
           const int r = CurrentTuning().tools.laserMeltRadius;
@@ -1118,6 +1154,39 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
         const float val = 0.35f + (float)((h >> 20) % 100u) / 100.0f * 0.5f;
         DyeFromHsv(hue, sat, val, ui.wardrobeColor);
       }
+      // ---- F1 Spawn tab: a vessel filled to capacity, into your inventory ---
+      // Resolved BY NAME (UIState::giveVesselNames) and admitted by the same
+      // ContainerAccepts rule a scoop obeys, so the panel cannot make a flask
+      // of sand. Hotbar first, then the bag, as every other give does.
+      if (ui.giveVessel) {
+        ui.giveVessel = false;
+        const bool okV = ui.giveVesselPick >= 0 &&
+                         ui.giveVesselPick < (int)ui.giveVesselNames.size() &&
+                         ui.giveVesselPick < (int)ui.giveVesselMats.size();
+        const std::string vname = okV ? ui.giveVesselNames[ui.giveVesselPick] : "";
+        const std::vector<std::string>* ml =
+            okV ? &ui.giveVesselMats[ui.giveVesselPick] : nullptr;
+        const std::string mname =
+            ml && ui.giveMatPick >= 0 && ui.giveMatPick < (int)ml->size()
+                ? (*ml)[ui.giveMatPick] : "";
+        const int di = items.Find(vname);
+        const ItemDef* d = items.At(di);
+        uint32_t mat = 0;
+        for (size_t m = 1; m < mats.size() && !mat; m++)
+          if (mats[m].name == mname) mat = (uint32_t)m;
+        const char* why = nullptr;
+        if (!d || !mat) {
+          ui.giveVesselStatus = "pick a vessel and a material";
+        } else if (!ContainerAccepts(*d, ItemStack{di, 1}, mat, mats, &why)) {
+          ui.giveVesselStatus = why ? why : "refused";
+        } else {
+          const uint16_t amt = (uint16_t)std::min(d->container.capacity, 0xFFFF);
+          const bool ok = hotbar.Add(di, 1, 0, (uint16_t)mat, amt) >= 0 ||
+                          kit.bag.Add(di, 1, 0, (uint16_t)mat, amt) >= 0;
+          ui.giveVesselStatus = ok ? vname + " of " + mname + " — in your pack"
+                                   : "no room in the hotbar or the bag";
+        }
+      }
       if (ui.wardrobeSpawnSet || ui.wardrobeWearSet || ui.wardrobeDyeWorn) {
         const bool wear = ui.wardrobeWearSet;
         const bool redye = ui.wardrobeDyeWorn;
@@ -1400,6 +1469,284 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             }
       }
 
+      // ---- VESSELS (game/container.h): RMB scoops, LMB pours ----------------
+      //
+      // The hands are up with a flask or a pouch in them (FrameIntent::
+      // vesselSlot). Both halves go out through the MutationQueue: a scoop is
+      // conditional clears, a pour is grid particles plus the SplatterEvent
+      // that lets whoever is standing in the stream be wet by it.
+      // PAY WHAT THE GPU TOOK (ContainerSettle): every tick, held or not, so
+      // a scoop in flight when the flask is put away still lands in it. The
+      // claim goes to the held vessel, else the first vessel on the hotbar or
+      // in the pack that holds the same thing or nothing.
+      // Scoop motes (render-only, ScoopMote): wait out the op latency, fly,
+      // and are gone at the mouth.
+      for (ScoopMote& m : s.scoopMotes) {
+        if (m.delay > 0) m.delay--;
+        else m.age++;
+      }
+      s.scoopMotes.erase(std::remove_if(s.scoopMotes.begin(), s.scoopMotes.end(),
+                                        [](const ScoopMote& m) { return m.age > m.life; }),
+                         s.scoopMotes.end());
+      if (!s.scoopMemo.claims.empty() || s.scoopMemo.haveLedger) {
+        const WorldSnapshot& lsnap = world.Snap();
+        if (lsnap.valid) {
+          ItemStack* dst = nullptr;
+          const ItemDef* ddef = nullptr;
+          const uint16_t want = s.scoopMemo.PendingMat();
+          auto take = [&](ItemStack& cand) {
+            if (dst || cand.Empty()) return;
+            const ItemDef* d = items.At(cand.def);
+            if (d && d->IsContainer() &&
+                (!cand.Filled() || cand.fillMat == want)) {
+              dst = &cand;
+              ddef = d;
+            }
+          };
+          if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots)
+            take(hotbar.slots[st.intent.vesselSlot]);
+          for (ItemStack& cand : hotbar.slots) take(cand);
+          for (ItemStack& cand : kit.bag.slots) take(cand);
+          ContainerSettle(s.scoopMemo, lsnap.tick, lsnap.scoopEighths, ddef, dst);
+        }
+      }
+      // ---- THE THROW (game/container.h ContainerThrowSpeed): Q held winds it
+      // up, Q released lets go. Off whenever the hand stops holding a
+      // throwable vessel, so switching slots mid-draw cancels the draw.
+      {
+        const int tslot = st.intent.vesselSlot;
+        const ItemStack* ts =
+            tslot >= 0 && tslot < kItemSlots ? &hotbar.slots[tslot] : nullptr;
+        const ItemDef* tdef = ts && !ts->Empty() ? items.At(ts->def) : nullptr;
+        if (!tdef || !ContainerThrowable(*tdef) || tslot != s.throwSlot) {
+          if (s.throwTicks > 0 && avatar.Spawned())
+            avatar.StopClip("throw_windup");
+          s.throwTicks = 0;
+          s.throwLaunchIn = 0;  // the hand changed mid-swing: nothing leaves it
+          s.throwSlot = tdef && ContainerThrowable(*tdef) ? tslot : -1;
+        }
+        // The arm draws back while Q is held (a looping hold, eased in by the
+        // clip's blend) and whips through on the release; the vessel leaves
+        // the hand kThrowLaunchTicks later, at the front of the swing (the
+        // `throw` clip's release key, assets/anims/throw.json).
+        constexpr int kThrowLaunchTicks = 3;
+        bool launch = false;
+        if (s.throwLaunchIn > 0) {
+          launch = --s.throwLaunchIn == 0;
+        } else if (s.throwSlot >= 0 && ti.Held(TB_THROW)) {
+          if (s.throwTicks == 0 && avatar.Spawned())
+            avatar.PlayClip("throw_windup");
+          s.throwTicks = std::min(s.throwTicks + 1, 1 << 20);
+        } else if (s.throwSlot >= 0 && s.throwTicks > 0) {
+          s.throwLaunchSpeed = ContainerThrowSpeed(*tdef, s.throwTicks);
+          s.throwTicks = 0;
+          if (avatar.Spawned()) {
+            avatar.StopClip("throw_windup");
+            avatar.PlayClip("throw");
+            s.throwLaunchIn = kThrowLaunchTicks;
+          } else {
+            launch = true;  // no body to swing (fly mode): straight away
+          }
+        }
+        if (launch && s.throwSlot >= 0) {
+          ItemStack& vs = hotbar.slots[s.throwSlot];
+          const float speed = s.throwLaunchSpeed;
+          const Vec3 fwd = cam.Forward();
+          // A few degrees of lift, because a throw aimed AT the crosshair is
+          // released above it.
+          Vec3 dir = fwd + Vec3{0, 0.08f, 0};
+          dir = dir * (1.0f / std::max(1e-4f, dir.len()));
+          const Vec3 vel = dir * speed + player.vel;
+          // FROM THE HAND: the held rig part's pose, centred on the item's
+          // own voxels (`at` is the body's min corner). Without a body, from
+          // in front of the eye. Either way it starts inside the capsule and
+          // among the thrower's own limbs, which is why the release below is
+          // `thrown`: on the plain AVATAR layer it struck the thrower's head
+          // and arm on its first step and burst in their face.
+          Vec3 at = player.EyePos() + fwd * 2.0f - Vec3{0, 0.5f, 0};
+          {
+            Vec3 hp;
+            Quat hq;
+            const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
+            uint32_t gscale = 1;
+            const std::vector<PrefabVoxel>* gv = ItemGroundVoxels(*tdef, gscale);
+            if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq)) {
+              Vec3 c{};
+              if (gv && !gv->empty()) {
+                for (const PrefabVoxel& v : *gv)
+                  c = c + Vec3{v.x + 0.5f, v.y + 0.5f, v.z + 0.5f};
+                c = c * (1.0f / ((float)gv->size() * (float)std::max(1u, gscale)));
+              }
+              at = hp - c;
+            }
+          }
+          const uint64_t body =
+              w.ground ? DropItemToWorld(*tdef, at, vel, phys, debris, &mbSet,
+                                         *w.ground, nullptr, vs.dye,
+                                         PackItemFill(vs.fillMat, vs.fillAmt))
+                       : 0;
+          if (body) phys.ReleaseToWorldWhenClear(body, /*thrown=*/true);
+          if (body) {
+            // End over end about the throw's own right axis: a spun flask
+            // reads as thrown, a translating one as teleported.
+            Vec3 right = Vec3{dir.z, 0.0f, -dir.x};
+            const float rl = right.len();
+            right = rl > 1e-4f ? right * (1.0f / rl) : Vec3{1, 0, 0};
+            phys.SetBodyVelocities(body, vel, right * (-4.0f - speed * 0.02f));
+            if (--vs.count <= 0) vs = ItemStack{};
+          } else {
+            ui.kitMessage = "there is nowhere to throw that";
+            ui.kitMessageAge = 0.0f;
+          }
+        }
+        ui.throwCharge = s.throwTicks > 0 && tdef
+                             ? ContainerThrowCharge(*tdef, s.throwTicks)
+                             : -1.0f;
+      }
+      if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots &&
+          s.throwTicks == 0 && s.throwLaunchIn == 0) {
+        ItemStack& vs = hotbar.slots[st.intent.vesselSlot];
+        const ItemDef* vdef = vs.Empty() ? nullptr : items.At(vs.def);
+        const WorldSnapshot& vsnap = world.Snap();
+        const Vec3 eye = player.EyePos();
+        const Vec3 fwd = cam.Forward();
+        auto say = [&](const char* why) {
+          if (!why || !*why) return;
+          ui.kitMessage = why;
+          ui.kitMessageAge = 0.0f;
+        };
+        // THE MOUTH: the held rig part when there is one, so the water
+        // visibly leaves (and enters) the thing in your hand; else just in
+        // front of and below the eye (fly mode, no body).
+        auto vesselMouth = [&]() {
+          Vec3 mouth = eye + fwd * MetresToCells(0.35f) -
+                       Vec3{0, MetresToCells(0.15f), 0};
+          Vec3 hp;
+          Quat hq;
+          const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
+          if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq))
+            mouth = hp + Vec3{0, MetresToCells(0.08f), 0};
+          return mouth;
+        };
+        // Particles the MPM pool can still take this tick (rule 2: charged
+        // BEFORE emission, against the cap and the spawn stream both).
+        auto fluidRoom = [&]() -> uint32_t {
+          const size_t used = (size_t)fluidCount + fluidSpawns.size();
+          if (used >= kFluidCap || fluidSpawns.size() >= kMaxFluidSpawnsPerTick)
+            return 0u;
+          return (uint32_t)std::min<size_t>(kFluidCap - used,
+                                            kMaxFluidSpawnsPerTick - fluidSpawns.size());
+        };
+        if (vdef && vdef->IsContainer() && ti.Held(TB_ALT)) {
+          const char* why = nullptr;
+          if (!vsnap.valid || vsnap.pick[0] == 0) {
+            why = "there is nothing there to scoop";
+          } else {
+            const IVec3 hit{(int)vsnap.pick[2], (int)vsnap.pick[3],
+                            (int)vsnap.pick[4]};
+            const Vec3 hc{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f};
+            // Arm's reach plus the vessel's own pour range: you scoop where
+            // you could pour, and no further.
+            if ((hc - eye).len() > vdef->container.pourRange + MetresToCells(1.0f)) {
+              why = "too far away";
+            } else if (!ContainerIsolateOne(hotbar.slots, kItemSlots,
+                                            st.intent.vesselSlot, kit.bag.slots,
+                                            Bag::kSlots)) {
+              why = "no room to set the others down";
+            } else {
+              const uint32_t landing = OpLandingTick(w, tick);
+              ContainerScoop(*vdef, vs, hit,
+                             [&](IVec3 c, uint32_t& wd) {
+                               return ContainerSnapWord(world, c, wd);
+                             },
+                             world, mats, cellOps, &why, &s.scoopMemo,
+                             landing);
+              // Every cell just claimed flies into the vessel: the memo stamps
+              // each with the tick its clear lands, and this is the one scoop
+              // call per tick, so `landing` picks out exactly this call's.
+              // A liquid the solver can hold flies as GHOST MPM water
+              // (ContainerScoopStream), spawned in this tick's batch so it
+              // appears the tick the clear lands; anything else (a pouch's
+              // sand, a flask of lava) as the render-only motes.
+              const uint16_t mmat = s.scoopMemo.PendingMat();
+              const bool asFluid =
+                  mmat < mats.size() && ContainerPoursAsFluid(mats[mmat]);
+              const Vec3 smouth = vesselMouth();
+              int k = 0;
+              for (const ContainerScoopMemo::Taken& t : s.scoopMemo.cells) {
+                if (t.tick != landing) continue;  // claimed on an earlier tick
+                if (asFluid) {
+                  const float d = (Vec3{t.c.x + 0.5f, t.c.y + 0.5f, t.c.z + 0.5f} -
+                                   smouth).len();
+                  ContainerScoopStream(t.c, mmat, smouth,
+                                       6 + (int)(d / MetresToCells(0.5f)),
+                                       0x5C0F1Au ^ (uint32_t)k++, tick,
+                                       fluidRoom(), fluidSpawns);
+                  continue;
+                }
+                if (s.scoopMotes.size() >= 96) break;
+                uint32_t h = ((uint32_t)t.c.x * 73856093u) ^
+                             ((uint32_t)t.c.y * 19349663u) ^
+                             ((uint32_t)t.c.z * 83492791u) ^ (tick * 2654435761u);
+                h ^= h >> 15;
+                h *= 2246822519u;
+                h ^= h >> 13;
+                ScoopMote m;
+                m.from = Vec3{t.c.x + 0.5f, t.c.y + 0.5f, t.c.z + 0.5f};
+                m.color = mmat < mats.size() ? mats[mmat].gpu.color0 : 0xFFFFFFFFu;
+                m.seed = h;
+                // Staggered by a tick per cell so a held button reads as a
+                // stream rather than volleys of four.
+                m.delay = (int)(landing - tick) + (k++ & 1);
+                m.age = 0;
+                m.life = 7 + (int)(h % 4u);
+                s.scoopMotes.push_back(m);
+              }
+              if (!ti.Pressed(TB_ALT)) why = nullptr;
+            }
+          }
+          if (ti.Pressed(TB_ALT)) say(why);
+        }
+        if (vdef && vdef->IsContainer() && ti.Held(TB_ATTACK) && !ti.Held(TB_ALT)) {
+          if (!vs.Filled()) {
+            if (ti.Pressed(TB_ATTACK)) say("it is empty");
+          } else {
+            // OUT OF THE FLASK, from its mouth.
+            const Vec3 mouth = vesselMouth();
+            // AIMED, always, at the pour point (ContainerPourPoint): a metre
+            // along the look, or the first thing in the way -- the point
+            // main.cpp draws the marker sphere on. The stream is solved to pass
+            // through it, so looking ahead pours into the air in front of you
+            // and looking down pours onto the ground.
+            Vec3 target = st.intent.pourAim;
+            if (!st.intent.pourAimValid) {
+              std::vector<uint64_t> own;
+              avatar.AppendLiveLimbBodies(own);
+              target = ContainerPourPoint(*vdef, eye, eye, fwd, s.kindAt, phys, own);
+            }
+            if (world.CellInWindow({ifloor(mouth.x), ifloor(mouth.y),
+                                    ifloor(mouth.z)})) {
+              // Water leaves as MLS-MPM fluid (ContainerPourFluid) when the
+              // solver can hold it; lava, blood and the pouch's powders keep
+              // the grid particles.
+              SplatterEvent splat;
+              const uint32_t pseed = 0x0F1A5Cu ^ (uint32_t)st.intent.vesselSlot;
+              const int poured =
+                  vs.fillMat < mats.size() && ContainerPoursAsFluid(mats[vs.fillMat])
+                      ? ContainerPourFluid(*vdef, vs, mouth, fwd, &target, tick,
+                                           pseed, fluidRoom(), fluidSpawns, &splat)
+                      : ContainerPour(*vdef, vs, mouth, fwd, &target,
+                                      CurrentTuning().sim.partGravity, tick,
+                                      pseed, spawns, &splat);
+              if (poured > 0) {
+                splat.sourceMob = avatar.Spawned() ? avatar.Id() : 0;
+                mobs.QueueSplatter(splat);
+              }
+            }
+          }
+        }
+      }
+
       BrushOp op;
       if (brushActive && ti.Held(TB_ATTACK) &&
           brush.BuildOp(world.Snap(), player.EyePos(), cam.Forward(), false, op))
@@ -1463,6 +1810,43 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
       // sim/reactcpu.h for why the CPU has to agree with the GPU here.
       mobs.SetDayPhase(DayPhaseNow(tick));
       debris.SetDayPhase(DayPhaseNow(tick));
+      // ...and the weather, from the one function that also puts it on
+      // TickParams (weather::SimRainWord), for the same reason.
+      mobs.SetWeatherRain(weather::SimRainWord(CurrentTuning(), kDefaultSeed, tick));
+      debris.SetWeatherRain(weather::SimRainWord(CurrentTuning(), kDefaultSeed, tick));
+
+      // ---- BROKEN VESSELS (game/container.h ContainerShouldBreak) -----------
+      //
+      // Every vessel lying or flying in the world, against the two witnesses:
+      // last step's NEW contacts (Physics clears them at the head of Step, so
+      // here they are the step phase N ran last tick) and the body's velocity
+      // jump since last tick. A break destroys the body -- the registry entry
+      // goes with it through OnBodyGone -- and leaves a SPILL at its centre
+      // that drains below this tick, through the spawn streams, so the
+      // contents are in the world on the tick the glass went.
+      //
+      // Bounded by the ground registry (a few entries) and the contact list
+      // (capped per step); a ghost body is the peer's to break.
+      if (w.ground) {
+        ContainerBreakPass(*w.ground, items, phys, debris, w.vesselVel,
+                           w.vesselSpills);
+        for (ContainerSpill& sp : w.vesselSpills) {
+          const size_t used = (size_t)fluidCount + fluidSpawns.size();
+          const uint32_t room =
+              used >= kFluidCap || fluidSpawns.size() >= kMaxFluidSpawnsPerTick
+                  ? 0u
+                  : (uint32_t)std::min<size_t>(
+                        kFluidCap - used,
+                        kMaxFluidSpawnsPerTick - fluidSpawns.size());
+          SplatterEvent splat;
+          splat.count = 0;
+          const bool first = !sp.splatted;
+          ContainerSpillStep(sp, mats, tick, room, fluidSpawns, spawns, &splat);
+          if (first && sp.splatted) mobs.QueueSplatter(splat);
+        }
+        std::erase_if(w.vesselSpills,
+                      [](const ContainerSpill& sp) { return sp.units <= 0; });
+      }
 
       // WHO THE NPCs ARE FIGHTING, pushed once per TICK rather than per frame.
       // The tick loop runs 0..4 times per frame, and a target position sampled
@@ -1552,7 +1936,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // selftest can drive it directly.
         avatarHeading = ResolveAvatarHeading(
             camMode, camHeading, avatarHeading,
-            Vec3{player.vel.x, 0, player.vel.z}, kTickDt);
+            Vec3{player.vel.x - player.slideVel.x, 0,
+                 player.vel.z - player.slideVel.z},
+            kTickDt);
 
         // FLY MODE HAS NO BODY. Two things go wrong otherwise, and the second
         // one is what makes flying feel possessed:
@@ -1567,6 +1953,8 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         const bool wantAvatar = av.enabled && !player.fly;
         if (wantAvatar && avatar.HasDef() && !avatar.Spawned()) {
           avatar.Spawn(player, avatarHeading);
+          if (avatar.HasEyeLocal())
+            player.SetModelEyeHeight(avatar.EyeRestHeight());
           // A new rig wears nothing (Mob::BuildRig clears its shells), so the
           // armour sync below has to be offered every slot again.
           for (std::string& w : wearTried) w.clear();
@@ -1600,7 +1988,14 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // BEFORE melee.Update, not after: the arm read below needs the item
             // in the hand to know WHICH arm is the weapon arm, and the tick the
             // player selects the blade and clicks can be the same tick.
-            const ItemDef* want = meleeArmed ? heldItem : nullptr;
+            // A VESSEL in the hands is held the same way, through the same
+            // borrowed rig slot: the flask is a real part of the arm while
+            // you hold it (game/container.h).
+            const ItemDef* vesselDef = nullptr;
+            if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots &&
+                !hotbar.slots[st.intent.vesselSlot].Empty())
+              vesselDef = items.At(hotbar.slots[st.intent.vesselSlot].def);
+            const ItemDef* want = meleeArmed ? heldItem : vesselDef;
             const std::string wantName = want ? want->name : std::string();
             if (avatar.HeldItem() != wantName) avatar.EquipItem(want);
             // WHERE THE BLADE IS, so taking control of it is not a teleport:
@@ -1623,6 +2018,16 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                 melee.SetKeepOut(kc, kr);
               else
                 melee.ClearKeepOut();
+              // ...and the avatar's own CHEST, so no cut across the body drags
+              // the arm through it (melee.h SetBodyKeepOut). Same seam, same
+              // clamp site, same reason the head sphere is composed by the rig
+              // rather than guessed by the driver.
+              Vec3 ba, bb;
+              float bw = 0, bd = 0;
+              if (avatar.BodyKeepOut(ba, bb, bw, bd))
+                melee.SetBodyKeepOut(ba, bb, bw, bd);
+              else
+                melee.ClearBodyKeepOut();
             }
             // The NPC driver always did this and the player's never had —
             // without it the asymmetric azimuth window (azOut on the weapon
@@ -2083,26 +2488,50 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // The body a status attaches to: the nearest mob origin within the
         // radius, else the player. Ids are the mob's own and the player's
         // caster id — opaque to the VM either way.
+        //
+        // MEASURED TO THE BODY'S BOX, NOT TO A POINT ON IT (2026-09-22). This
+        // used to compare `from` against `MobOrigin`, which is the collider's
+        // min corner in x/z and the FEET in y — i.e. the ground between a
+        // creature's ankles. A `float aura projectile` attaches its status
+        // within the effect's radius plus 2 (three voxels for a mod), so a
+        // bolt that struck a human anywhere above the shins found NO body,
+        // the status fell back to being a PLACE, and a sustained mod on a
+        // place does nothing at all: the spell worked on you and silently
+        // failed on everything else. The player's branch had the whole figure
+        // allowed for in a `+9.0f` for exactly this reason; the mobs' did not.
         bodyProbe.bodyIdAt = [](void* c, Vec3 from, float radius, uint64_t& id, Vec3& out) {
           SpellBodyCtx& bc = *(SpellBodyCtx*)c;
-          float best = radius * radius;
+          // Distance from the point to a box, zero inside it.
+          auto boxDist = [](const Vec3& p, const Vec3& lo, const Vec3& hi) {
+            const float dx = std::max(std::max(lo.x - p.x, 0.0f), p.x - hi.x);
+            const float dy = std::max(std::max(lo.y - p.y, 0.0f), p.y - hi.y);
+            const float dz = std::max(std::max(lo.z - p.z, 0.0f), p.z - hi.z);
+            return std::sqrt(dx * dx + dy * dy + dz * dz);
+          };
+          float best = radius;
           bool found = false;
           for (uint32_t i = 0; i < bc.mobs->MobCount(); i++) {
             const uint64_t mid = bc.mobs->MobIdAt(i);
-            const Vec3 p = bc.mobs->MobOrigin(mid);
-            const Vec3 d = p - from;
-            const float d2 = d.x * d.x + d.y * d.y + d.z * d.z;
-            if (d2 <= best) {
-              best = d2;
+            Vec3 lo, hi;
+            if (!bc.mobs->MobBodyBox(mid, lo, hi)) continue;
+            const float d = boxDist(from, lo, hi);
+            if (d <= best) {
+              best = d;
               id = mid;
-              out = p;
+              // The body's CENTRE, not its corner: this is the point the
+              // status rides and the one a place-status would resolve at.
+              out = Vec3{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                         (lo.z + hi.z) * 0.5f};
               found = true;
             }
           }
+          // The player, as a figure box of her own (~1.7 m) around `pos`, and
+          // NEAREST WINS: a self-cast with an enemy standing on top of you
+          // still lands on you.
           const Vec3 dp = bc.player->pos - from;
-          // The figure box is ~1.7 m: a point anywhere on the body counts.
-          const float pr = radius + 9.0f;
-          if (!found && dp.x * dp.x + dp.y * dp.y + dp.z * dp.z <= pr * pr) {
+          const float dPlayer =
+              std::max(0.0f, std::sqrt(dp.x * dp.x + dp.y * dp.y + dp.z * dp.z) - 9.0f);
+          if (dPlayer <= radius && (!found || dPlayer < best)) {
             id = bc.playerId;
             out = bc.player->pos;
             found = true;
@@ -2179,6 +2608,60 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                                          &selfAt, &bodyProbe);
             caster.lastOutcome = res.outcome;
             if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
+          }
+        }
+        // THE POUR BRUSH (game/container.h): with a filled vessel chosen on
+        // the FLASKS row (any pack or hotbar slot -- `ps.vessel`), the health
+        // panel's portrait pours where the cursor is. main.cpp
+        // built the ray from the portrait camera; here it meets the body's own
+        // skin cells (MobSystem::PickBody) and the disc round the hit takes a
+        // little more coat every tick the button is held (PourOnBody), plus
+        // whatever the material's `coat.effects` do to the limbs it touched.
+        //
+        // THE SPEND IS A RATE THAT FOLLOWS THE BRUSH: PourBrushCellsPerSec
+        // (the disc's area, `applyCells` a second at the default size), paid in
+        // the flask's own eighths off a milli-eighth accumulator, and only on
+        // ticks the ray actually meets skin -- pouring at the air beside you
+        // costs nothing, because nothing leaves the flask.
+        {
+          PlayerSession::PourStroke& ps = s.pourStroke;
+          ItemStack* vp = kit.Resolve(ps.vessel, hotbar);
+          const ItemDef* vdef = !vp || vp->Empty() ? nullptr : items.At(vp->def);
+          if (!ps.active || !avatar.Spawned() || !vdef || !vdef->IsContainer() ||
+              !vp->Filled()) {
+            s.pourStrokeTicks = 0;
+            s.pourSpendMilli = 0;
+          } else {
+            const MobSystem::BodyRayHit hit =
+                mobs.PickBody(avatar.Id(), ps.ro, ps.rd, 4096.0f);
+            if (hit.hit) {
+              const uint32_t mat = vp->fillMat;
+              // milli-eighths per tick at 30 Hz
+              s.pourSpendMilli += (int64_t)std::llround(
+                  PourBrushCellsPerSec(*vdef, ps.radius) * kContainerUnitsPerCell *
+                  1000.0f / 30.0f);
+              const int units = (int)(s.pourSpendMilli / 1000);
+              s.pourSpendMilli -= (int64_t)units * 1000;
+              if (units > 0) {
+                vp->fillAmt = (uint16_t)(vp->fillAmt - std::min<int>(units, vp->fillAmt));
+                if (vp->fillAmt == 0) vp->fillMat = 0;
+              }
+              uint32_t marked = 0;
+              // +3 a tick: a spot held under the brush for five ticks is
+              // soaked through (15), a quick pass leaves a light coat.
+              const uint32_t did = mobs.PourOnBody(avatar.Id(), hit, ps.rd,
+                                                   ps.radius, mat, 3u, tick, &marked);
+              if (s.pourStrokeTicks == 0 || did) {
+                std::string msg = "you pour " +
+                                  (mat < mats.size() ? mats[mat].name : std::string("it")) +
+                                  " over your " + avatar.PartName(hit.limb);
+                if (did & MobSystem::kRemedyStanch) msg += "; the bleeding stops";
+                if (did & MobSystem::kRemedyDisinfect) msg += "; the rot stops spreading";
+                ui.kitMessage = msg;
+                ui.kitMessageAge = 0.0f;
+              }
+              s.pourStrokeTicks++;
+            }
           }
         }
         if (castNow && !caster.stack.Empty()) {
@@ -2267,9 +2750,17 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           }
           caster.mana.reserved = spells.ReservationFor(0x9134A5EEu);
         }
-        // A sustained gravity mod on the player's own body.
-        for (const SpellBodyImpulse& bi : emit.bodyImpulses)
+        // A sustained gravity mod on a body: the caster's own, or anyone
+        // else's. The second half was missing until 2026-09-22 — the VM has
+        // always emitted the impulse for whatever body the status attached to,
+        // and this loop dropped every one that was not the player's, so
+        // `float aura` lifted you and left an enemy standing. MobSystem knows
+        // which of its two velocity states the body is in (limp or walking);
+        // this only has to hand the number over.
+        for (const SpellBodyImpulse& bi : emit.bodyImpulses) {
           if (bi.target == 0x9134A5EEu) player.vel.y += bi.vps.y;
+          else mobs.LiftMob(bi.target, bi.vps);
+        }
         // GRAFTS: the world half already left as ops; the body half fills the
         // caster's missing anatomy cells with that matter, root-first. The VM
         // cannot reach a body (thesis 4); the owner does it.

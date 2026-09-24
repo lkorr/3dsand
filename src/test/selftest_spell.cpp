@@ -9,10 +9,11 @@
 //                   fails breaks a CLASS of spells, which is what the line
 //                   says; a change that moves one spell's numbers is a
 //                   rebaseline.
-//                   L1 totality, L2 pile commutativity, L3 multiplicity,
-//                   L4 `also` additivity, L5 delivery invariance, L6 locality,
-//                   L7 tariff monotonicity, L8 budgets, L9 nesting,
-//                   L10 mod placement, L11 flattening.
+//                   L1 totality, L2 segment commutativity, L3 multiplicity,
+//                   L4 root-lane additivity, L5 delivery invariance,
+//                   L6 locality, L7 tariff monotonicity, L8 budgets,
+//                   L9 nesting, L10 mod placement, L11 flattening,
+//                   L12 lanes (rule 4).
 //   spells-oracle — the C++ parser against scripts/magic_grammar.py, which is
 //                   the executable reference: every sentence in the brief and
 //                   every ordered pair over the 19-word alphabet, as canonical
@@ -32,6 +33,7 @@
 #include "game/brush.h"
 #include "game/mob.h"
 #include "game/spell.h"
+#include "game/spellgraph.h"
 #include "phys/debris.h"
 #include "sim/worldmap.h"
 #include "test/selftest.h"
@@ -47,7 +49,7 @@ namespace {
 const char* const kAlphabet[] = {
     "fire", "gold",  "air",        "anything", "explosive", "gust",       "transmute",
     "mend", "trail", "null",       "aura",     "echo",      "shotgun",    "float",
-    "also", "projectile", "bomb",  "self",     "beam",
+    "lane", "projectile", "bomb",  "self",     "beam",      "twin",       "end",
 };
 
 struct FakeHealth {
@@ -90,6 +92,15 @@ void SigRecord(const GlyphLibrary& lib, const DeliveryRec& d, std::string& s) {
                 d.trailBudget, d.trailEvery);
   s += buf;
   for (const EffectInst& e : d.trail) SigEffect(lib, e, s);
+  // RULE 4: the lanes are part of the record's identity. Without them two
+  // casts that fire the same fan carrying different things would compare
+  // equal and L2/L12 would be asserting nothing. A lane's own record is
+  // laneless by construction, so this recursion is one level deep.
+  for (const SpellLane& ln : d.lanes) {
+    s += "/";
+    SigRecord(lib, ln.rec, s);
+    for (const EffectInst& e : ln.extra) SigEffect(lib, e, s);
+  }
   s += ">";
 }
 std::string CastsSignature(const GlyphLibrary& lib, const CastList& l) {
@@ -129,7 +140,14 @@ std::string CanonNode(const GlyphLibrary& lib, const SpellTree& t, int node) {
   std::sort(items.begin(), items.end());
   std::string s = "[";
   for (const std::string& i : items) s += i + ",";
-  return s + "|" + lib.Delivery(n.glyph).id + "]";
+  // The LANE COUNT is part of the shape (rule 4): a box with an empty trailing
+  // lane fires one more instance than one without it. And so is the box's OWN
+  // lane — a box sitting in a socket is not the same item as the same box
+  // sitting in the shared pile, and without this L2 compared two sentences
+  // that lower differently and called the difference a failure.
+  return s + "|" + lib.Delivery(n.glyph).id + "|" +
+         std::to_string(n.laneAt.size() / 2) + "]" +
+         (n.lane > 0 ? "@" + std::to_string(n.lane) : std::string());
 }
 std::string Canon(const GlyphLibrary& lib, const SpellTree& t) {
   std::string s;
@@ -521,13 +539,22 @@ Status GateSpells(Ctx& c, std::string& detail) {
         // Every item of the parse carries n == min(N, cap) - EXCEPT a
         // delivery, which does not merge at all: each one boxes what is in
         // front of it, so N of them are N nested boxes under the hand (rule
-        // 2). And `also` is N+1 sentences, not one word said N times.
+        // 2). And `lane` does not merge either: N of them open N segments.
         if (gd.sort == GlyphSort::Delivery) {
           ok = ok && l.tree.clauses.size() == 1 &&
                BoxDepth(l.tree, l.tree.clauses[0].root) == (int)N + 1 &&
                l.casts[0].depth == (int)N;
         } else if (gd.sort == GlyphSort::Separator) {
-          ok = ok && (int)l.tree.clauses.size() == (int)N + 1;
+          // RULE 4: a mark does not merge either, and marks NEST rather than
+          // enumerate - N `lane` words in a row open N scopes inside each
+          // other, and the inner ones (never boxed) flatten into the outer
+          // when the sentence runs out, so the hand box has exactly ONE lane
+          // however many were spoken. N `end` words with nothing open are N
+          // charged no-ops and the hand has none.
+          const int32_t wantLanes = gd.scopeClose ? 0 : 1;
+          ok = ok && l.tree.clauses.size() == 1 &&
+               (int)l.tree.nodes[l.tree.clauses[0].root].laneAt.size() == 2 * wantLanes &&
+               l.casts[0].instances == std::max(1, wantLanes);
         } else {
           ok = ok && l.tree.clauses.size() == 1 && l.tree.clauses[0].bag.size() == 1 &&
                l.tree.nodes[l.tree.clauses[0].bag[0]].n == want;
@@ -554,15 +581,27 @@ Status GateSpells(Ctx& c, std::string& detail) {
           // Compose: the field is the previous value edited ONCE more (or held
           // at its clamp).
           const int32_t v = RecordField(l.casts[0].delivery, gd.field);
-          if (N > 1 && N <= cap) {
+          // ...EXCEPT A COUNT, WHICH DOES NOT COMPOSE (2026-09-22). One split
+          // per scope: the strongest count word wins and applies exactly once,
+          // so saying it again is a charged no-op and the field must not move
+          // at all. Asserted as an EQUALITY rather than left to the band below,
+          // which would have absorbed "never composes" silently - it did, on
+          // the day the rule changed, and L3 stayed green saying nothing.
+          if (gd.field == ModField::Count) {
+            if (N > 1 && N <= cap) ok = ok && v == prevField;
+          } else if (N > 1 && N <= cap) {
             int32_t once = prevField;
             switch (gd.op) {
               case ModOp::Mul: once = prevField * gd.amount; break;
               case ModOp::Div: once = prevField / gd.amount; break;
               case ModOp::Add: once = prevField + gd.amount; break;
             }
-            // Either the exact composition or the clamp held the value.
-            ok = ok && (v == once || v == prevField);
+            // Either the exact composition, or the field's own clamp cut it
+            // short — in which case the value lies between what it was and
+            // what the edit asked for. (`twin` five times asks for 32
+            // instances and gets the 27 the budget allows, which is neither
+            // the old value nor the new one.)
+            ok = ok && v >= std::min(prevField, once) && v <= std::max(prevField, once);
           }
           prevField = v;
         }
@@ -625,39 +664,209 @@ Status GateSpells(Ctx& c, std::string& detail) {
     }
   }
 
-  // L4 sentence independence - `A also B` costs cost(A) + cost(B) and its
-  // casts are the union. THE BOUNDARY IS `also` NOW, not a delivery: a
-  // delivery no longer ends anything, it boxes what came before it and the
-  // sentence carries on (rule 2), so the only additive seam left is the one
-  // word whose whole job is to be a seam.
+  // L4 ROOT-LANE INDEPENDENCE - `lane A end lane B end` costs cost(A) +
+  // cost(B) and fires two instances, the first carrying exactly what `A` alone
+  // lowers to and the second exactly what `B` does. THE SEAM IS A ROOT LANE
+  // NOW: `also` was dropped with rule 4, and two unrelated spells in one cast
+  // are two columns of the hand box (PLAN_spell_graph section 0b). A DELIVERY
+  // in an arm is fine and is the point - `end` closes the lane, so the arm's
+  // own box stays inside its column. The only exclusion left is another mark,
+  // which would re-scope the arm.
+  //
+  // A COUNT MOD USED TO BE EXCLUDED TOO, because rule 4 made it record-wide on
+  // purpose and it would therefore have fanned the other arm as well. A count
+  // now splits the scope it was spoken in (2026-09-22), so a count inside an
+  // arm is exactly the locality this law is about and the exclusion went away -
+  // which WIDENS this law's corpus rather than narrowing it.
   int l4 = 0, l4cases = 0;
   {
-    const int gAlso = lib.Find("also");
+    const int gLane = lib.Find("lane"), gEnd = lib.Find("end");
+    auto laneClean = [&](const std::vector<int>& q) {
+      for (int g : q) {
+        const GlyphDef& gd = lib.glyphs[g];
+        if (gd.sort == GlyphSort::Separator) return false;
+      }
+      return true;
+    };
     std::vector<std::vector<int>> shortSeqs;
     std::vector<CastList> lowered;
     for (const auto& s : seqs) {
-      if (s.size() > 2) continue;
+      if (s.size() > 2 || !laneClean(s)) continue;
       shortSeqs.push_back(s);
       lowered.push_back(CompileSpell(lib, stackOf(s)));
     }
-    for (size_t ai = 0; gAlso >= 0 && ai < shortSeqs.size(); ai++) {
+    for (size_t ai = 0; gLane >= 0 && gEnd >= 0 && ai < shortSeqs.size(); ai++) {
       const CastList& la = lowered[ai];
-      const std::string ca = Canon(lib, la.tree);
-      const std::string sa = CastsSignature(lib, la);
+      std::string pa;
+      for (const EffectInst& e : la.casts[0].payload) SigEffect(lib, e, pa);
       for (size_t bi = 0; bi < shortSeqs.size(); bi++) {
         const CastList& lb = lowered[bi];
-        std::vector<int> ab = shortSeqs[ai];
-        ab.push_back(gAlso);
+        std::vector<int> ab = {gLane};
+        ab.insert(ab.end(), shortSeqs[ai].begin(), shortSeqs[ai].end());
+        ab.push_back(gEnd);
+        ab.push_back(gLane);
         ab.insert(ab.end(), shortSeqs[bi].begin(), shortSeqs[bi].end());
+        ab.push_back(gEnd);
         const CastList lab = CompileSpell(lib, stackOf(ab));
-        if (Canon(lib, lab.tree) != ca + Canon(lib, lb.tree)) continue;
         l4cases++;
-        const bool ok = lab.manaCost == la.manaCost + lb.manaCost &&
+        std::string pb, g0, g1;
+        for (const EffectInst& e : lb.casts[0].payload) SigEffect(lib, e, pb);
+        const SpellCast i0 = InstanceCast(lab.casts[0], 0);
+        const SpellCast i1 = InstanceCast(lab.casts[0], 1);
+        for (const EffectInst& e : i0.payload) SigEffect(lib, e, g0);
+        for (const EffectInst& e : i1.payload) SigEffect(lib, e, g1);
+        const bool ok = lab.casts.size() == 1 && lab.casts[0].instances == 2 &&
+                        (int)lab.casts[0].delivery.lanes.size() == 2 &&
+                        lab.manaCost == la.manaCost + lb.manaCost &&
                         lab.priceUnknown == (la.priceUnknown || lb.priceUnknown) &&
-                        CastsSignature(lib, lab) == sa + CastsSignature(lib, lb);
-        if (!ok) fail("L4", spell(shortSeqs[ai]) + " also " + spell(shortSeqs[bi]));
+                        g0 == pa && g1 == pb;
+        if (!ok)
+          fail("L4", "lane " + spell(shortSeqs[ai]) + " end lane " + spell(shortSeqs[bi]) +
+                         " end");
         else l4++;
       }
+    }
+  }
+
+  // L12 LANES (rule 4), over the same generated alphabet. Four claims, and
+  // (d) is the one the whole scope rule exists for:
+  //
+  //  (a) a lane is a SCOPE, not a second pile: `E lane F end D` lowers to one
+  //      instance carrying exactly what `E F D` carries, at exactly the same
+  //      price - the compatibility claim that makes rule 4 free;
+  //  (b) a lane BELONGS TO ONE INSTANCE: in `E lane F end twin D` the first
+  //      instance is `E F D`'s payload and the second is `E D`'s, and the
+  //      tariff is their sum rather than either one doubled;
+  //  (c) a sentence with NO mark lowers with no lanes at all, which is why
+  //      every pinned price in this repo is unmoved;
+  //  (d) A LANE MAY HOLD A BOX OF ITS OWN. `lane E D end lane F end D` is an
+  //      outer carrier with two sockets: socket 0 carries exactly the box that
+  //      `E D` lowers to, socket 1 exactly what `F` lowers to. Under the old
+  //      "a delivery boxes the whole pile" reading the trailing D swallowed
+  //      the earlier lane and this sentence could not be said at all.
+  int l12 = 0, l12cases = 0;
+  {
+    const int gLane = lib.Find("lane"), gTwin = lib.Find("twin"), gEnd = lib.Find("end");
+    std::vector<int> nouns, flights;
+    for (int g : alpha) {
+      const GlyphDef& gd = lib.glyphs[g];
+      if (gd.sort == GlyphSort::Effect || gd.sort == GlyphSort::Matter) nouns.push_back(g);
+      if (gd.sort == GlyphSort::Delivery && gd.mech == DeliveryMech::Flight)
+        flights.push_back(g);
+    }
+    // A payload as a SET of effect signatures. Rule 1 says a pile is a set,
+    // and a lane's nouns are appended after the shared ones rather than
+    // re-sorted with them — so the claim "instance 0 carries what `E F D`
+    // carries" is about the multiset, not about the order it was built in.
+    auto sigSet = [&](const std::vector<EffectInst>& es) {
+      std::vector<std::string> v;
+      for (const EffectInst& e : es) {
+        std::string one;
+        SigEffect(lib, e, one);
+        v.push_back(one);
+      }
+      std::sort(v.begin(), v.end());
+      std::string s2;
+      for (const std::string& one : v) s2 += one;
+      return s2;
+    };
+    // The payload of the ONE box a `... D` sentence lowers to.
+    auto boxSig = [&](const CastList& l) {
+      std::string s2;
+      if (l.casts.size() != 1 || l.casts[0].payload.size() != 1) return s2;
+      const EffectInst& bx = l.casts[0].payload[0];
+      if (bx.verb != SpellVerb::Launch || bx.launch.empty()) return s2;
+      return sigSet(bx.inner);
+    };
+    // The same, for instance `i` of that box (rule 4).
+    auto instSig = [&](const CastList& l, int32_t i, int32_t& instances) {
+      std::string s2;
+      instances = 0;
+      if (l.casts.size() != 1 || l.casts[0].payload.size() != 1) return s2;
+      const EffectInst& bx = l.casts[0].payload[0];
+      if (bx.verb != SpellVerb::Launch || bx.launch.empty()) return s2;
+      SpellCast c;
+      c.delivery = bx.launch[0];
+      c.payload = bx.inner;
+      instances = RecInstances(lib, c.delivery);
+      const SpellCast ic = InstanceCast(c, i);
+      return sigSet(ic.payload);
+    };
+    for (int e : nouns) {
+      for (int f : nouns) {
+        if (f == e) continue;
+        for (int d : flights) {
+          const CastList both = CompileSpell(lib, stackOf({e, f, d}));
+          const CastList base = CompileSpell(lib, stackOf({e, d}));
+          const std::string wantBoth = boxSig(both), wantBase = boxSig(base);
+          if (wantBoth.empty() || wantBase.empty()) continue;
+          // (a) one lane, one instance: the same cast as saying them together.
+          const CastList one = CompileSpell(lib, stackOf({e, gLane, f, gEnd, d}));
+          int32_t n1 = 0;
+          const std::string got1 = instSig(one, 0, n1);
+          l12cases++;
+          if (n1 != 1 || got1 != wantBoth || one.manaCost != both.manaCost)
+            fail("L12a", spell({e, gLane, f, gEnd, d}) + " is not " + spell({e, f, d}));
+          else
+            l12++;
+          // (b) the lane belongs to instance 0; instance 1 is the shared copy.
+          if (gTwin < 0) continue;
+          const CastList two = CompileSpell(lib, stackOf({e, gLane, f, gEnd, gTwin, d}));
+          int32_t n2 = 0;
+          const std::string g0 = instSig(two, 0, n2);
+          int32_t n2b = 0;
+          const std::string g1 = instSig(two, 1, n2b);
+          l12cases++;
+          const int32_t wantTariff = both.tariff + base.tariff;
+          if (n2 != 2 || g0 != wantBoth || g1 != wantBase ||
+              two.casts[0].tariff != wantTariff)
+            fail("L12b", spell({e, gLane, f, gEnd, gTwin, d}) + ": instances " +
+                             std::to_string(n2) + ", tariff " +
+                             std::to_string(two.casts[0].tariff) + " want " +
+                             std::to_string(wantTariff));
+          else
+            l12++;
+          // (d) a socket holding a whole spell of its own: `lane E D end lane
+          // F end D`. Socket 0 is the box `E D` makes, socket 1 is `F`.
+          const CastList sock =
+              CompileSpell(lib, stackOf({gLane, e, d, gEnd, gLane, f, gEnd, d}));
+          const CastList justE = CompileSpell(lib, stackOf({e, d}));
+          const CastList justF = CompileSpell(lib, stackOf({f}));
+          int32_t n3 = 0, n3b = 0;
+          const std::string s0 = instSig(sock, 0, n3);
+          const std::string s1 = instSig(sock, 1, n3b);
+          l12cases++;
+          if (n3 != 2 || s0 != sigSet(justE.casts[0].payload) ||
+              s1 != sigSet(justF.casts[0].payload))
+            fail("L12d", spell({gLane, e, d, gEnd, gLane, f, gEnd, d}) +
+                             ": sockets do not hold [" + spell({e, d}) + "] and [" +
+                             spell({f}) + "] (instances " + std::to_string(n3) + ")");
+          else
+            l12++;
+        }
+      }
+    }
+    // (c) no `lane` word, no lanes anywhere in the lowering.
+    std::function<bool(const std::vector<EffectInst>&)> anyLane =
+        [&](const std::vector<EffectInst>& es) {
+          for (const EffectInst& x : es) {
+            for (const DeliveryRec& r : x.launch)
+              if (!r.lanes.empty()) return true;
+            if (anyLane(x.inner)) return true;
+          }
+          return false;
+        };
+    for (const auto& sq : seqs) {
+      bool spoke = false;
+      for (int g : sq) spoke = spoke || lib.glyphs[g].sort == GlyphSort::Separator;
+      if (spoke) continue;   // (c) is about sentences with no mark at all
+      const CastList l = CompileSpell(lib, stackOf(sq));
+      l12cases++;
+      bool clean = true;
+      for (const SpellCast& c : l.casts)
+        clean = clean && c.delivery.lanes.empty() && !anyLane(c.payload);
+      if (!clean) fail("L12c", spell(sq) + " grew a lane nobody spoke");
+      else l12++;
     }
   }
 
@@ -925,6 +1134,15 @@ Status GateSpells(Ctx& c, std::string& detail) {
              // asserted at runtime in check (8) - a sentence may SAY more than
              // the engine will do, and saying so is not an unbounded process.
              c.leaves >= 1 && c.leaves <= lib.budgets.maxInstances &&
+             // ...AND BOLTS, NOT BRANCHES, ARE WHAT IS BOUNDED (2026-09-22).
+             // A branch with a count of its own fires more than once, so
+             // `instances` stopped being the number that flies. `bolts` is at
+             // least the branch count (every branch fires at least once), never
+             // past the cap, and `leaves` - the product down the tree - is at
+             // least the bolts this box alone makes. That chain is what the
+             // tail-first split cutback in `LowerBox` exists to keep true.
+             c.bolts >= c.instances && c.bolts <= lib.budgets.maxInstances &&
+             c.leaves >= c.bolts &&
              c.depth >= 0 && c.depth <= kSpellStackMax;
       if (!ok) fail("L8", spell(s));
       else l8++;
@@ -1363,9 +1581,198 @@ Status GateSpells(Ctx& c, std::string& detail) {
                 lib.budgets.maxGeneration);
   }
 
+  // ---- (9) LANES AT RUNTIME (rule 4) ---------------------------------------
+  // The laws above are about the lowering; these two are about what leaves.
+  //   (a) `explosive lane fire twin projectile` fires TWO bolts and exactly
+  //       ONE of them carries the fire - the fan is not a copy machine any
+  //       more.
+  //   (b) `lane explosive projectile lane blood mend self` is two unrelated
+  //       spells in one cast: a bolt leaves, and the mend resolves on the
+  //       caster, from one utterance.
+  bool laneRunOk = false;
+  // L13's flags: a branch that splits, three of them, the two levels together,
+  // no-compose, and the bolts that actually left the hand.
+  bool splitRunOk = false, splitBranch = false, splitThree = false, splitBoth = false,
+       splitOnce = false;
+  int splitLive = 0, splitDistinct = 0;
+  int laneBolts = 0, laneWithFire = 0, laneWithSand = 0;
+  int laneLive = 0, laneRestores = 0, sockBolts = 0, sockChild = 0, sockFire = 0;
+  {
+    SpellSystem lsys;
+    lsys.SetLibrary(&lib);
+    CasterState cs;
+    cs.mana = 1 << 28;
+    cs.manaMax = 1 << 28;
+    FakeHealth hp(1 << 28);
+    const IVec3 worg = world.WindowOrigin();
+    const SpellFxVec origin{SpellFxFromFloat((float)(worg.x * (int)kChunk + 8)),
+                            SpellFxFromFloat((float)(worg.y * (int)kChunk + (int)kWorldN / 2)),
+                            SpellFxFromFloat((float)(worg.z * (int)kChunk + (int)kWorldN / 2))};
+    uint32_t mFire = 0, mSand = 0;
+    for (size_t m = 0; m < mats.size(); m++) {
+      if (mats[m].name == "fire") mFire = (uint32_t)m;
+      if (mats[m].name == "sand") mSand = (uint32_t)m;
+    }
+    auto sprays = [&](const std::vector<EffectInst>& es, uint32_t mat) {
+      for (const EffectInst& x : es)
+        if (x.verb == SpellVerb::Spray && x.matA == mat) return true;
+      return false;
+    };
+    auto launches = [&](const std::vector<EffectInst>& es) {
+      for (const EffectInst& x : es)
+        if (x.verb == SpellVerb::Launch) return true;
+      return false;
+    };
+
+    // (a) `explosive lane sand end lane fire end twin projectile`: two bolts,
+    // both exploding, one carrying sand and the other fire. The fan is not a
+    // copy machine any more.
+    SpellEmission e0;
+    lsys.Cast(CompileSpell(lib, speak({"explosive", "lane", "sand", "end", "lane", "fire",
+                                       "end", "twin", "projectile"})),
+              cs, hp.cb, 88, origin, {kSpellFxOne, 0, 0}, 1, e0);
+    laneBolts = lsys.LiveCount();
+    for (const SpellProjectile& pr : lsys.Live()) {
+      if (sprays(pr.cast.payload, mFire)) laneWithFire++;
+      if (sprays(pr.cast.payload, mSand)) laneWithSand++;
+    }
+    lsys.Clear();
+
+    // (b) `lane explosive projectile end lane blood mend self end`: two
+    // unrelated spells in one cast — a bolt leaves, and the graft resolves on
+    // the caster. The mend needs something to draw on, so the mirror is blood.
+    struct Patch {
+      uint32_t blood;
+    } patch{0};
+    for (size_t i = 0; i < mats.size(); i++)
+      if (mats[i].name == "blood") patch.blood = (uint32_t)i;
+    SpellProbe probe2;
+    probe2.ctx = &patch;
+    probe2.matAt = [](void* c, int32_t, int32_t, int32_t, bool& known) -> uint32_t {
+      known = true;
+      return ((Patch*)c)->blood;
+    };
+    SpellEmission e1;
+    lsys.Cast(CompileSpell(lib, speak({"lane", "explosive", "projectile", "end", "lane",
+                                       "blood", "mend", "self", "end"})),
+              cs, hp.cb, 89, origin, {kSpellFxOne, 0, 0}, 2, e1, &probe2);
+    laneLive = lsys.LiveCount();
+    laneRestores = (int)e1.restores.size();
+    lsys.Clear();
+
+    // (c) `lane explosive projectile end lane fire end projectile`: ONE outer
+    // carrier with two sockets — socket 0 fires a child bolt that explodes,
+    // socket 1 sprays fire. This is the sentence the scope rule exists for.
+    SpellEmission e2;
+    lsys.Cast(CompileSpell(lib, speak({"lane", "explosive", "projectile", "end", "lane",
+                                       "fire", "end", "projectile"})),
+              cs, hp.cb, 90, origin, {kSpellFxOne, 0, 0}, 3, e2);
+    sockBolts = lsys.LiveCount();
+    for (const SpellProjectile& pr : lsys.Live()) {
+      if (launches(pr.cast.payload)) sockChild++;
+      if (sprays(pr.cast.payload, mFire)) sockFire++;
+    }
+    lsys.Clear();
+
+    // (d) L13 — THE SPLIT IS PER-BRANCH (2026-09-22).
+    //
+    // `shotgun` used to be a record-wide `count` that COMPOSED: it trebled the
+    // whole box wherever it was spoken, and saying it twice was x9. It splits
+    // the SCOPE it was spoken in now, and one split per scope, so nine bolts is
+    // something you BUILD - a shotgun on each of three branches - and not
+    // something you get by saying one word twice.
+    //
+    // Every number below is derived from a second compile of a smaller
+    // sentence or from the arithmetic of the sentence itself, so retuning
+    // `shotgun`'s amount in glyphs.json cannot break this law.
+    //
+    // THE RECORD UNDER TEST IS THE BOX'S, NOT THE HAND'S. `CompileSpell` hands
+    // back the hand cast and a spoken delivery is a Launch inside its payload -
+    // reading `casts[0].delivery` measures the pedestal and reports a split of
+    // 1 for a sentence that splits perfectly well. It cost one run.
+    auto boxOf = [&](const CastList& l) -> const DeliveryRec* {
+      if (l.casts.empty()) return nullptr;
+      for (const EffectInst& e : l.casts[0].payload)
+        if (e.verb == SpellVerb::Launch && !e.launch.empty()) return &e.launch[0];
+      return nullptr;
+    };
+    {
+      const CastList one = CompileSpell(lib, speak({"lane", "shotgun", "end", "projectile"}));
+      const DeliveryRec* d1 = boxOf(one);
+      const int32_t split = d1 ? LaneSplit(lib, *d1, 0) : 0;
+      // (1) A count inside a lane splits THAT BRANCH and nothing else: one
+      // branch, and that branch fires `split` bolts.
+      splitBranch = d1 && RecInstances(lib, *d1) == 1 && split > 1 &&
+                    RecBolts(lib, *d1) == split;
+      // (2) ...and one on each of three branches is the product, by
+      // construction. This is the nine the player builds.
+      const CastList three = CompileSpell(
+          lib, speak({"lane", "shotgun", "end", "lane", "shotgun", "end", "lane", "shotgun",
+                      "end", "projectile"}));
+      const DeliveryRec* d3 = boxOf(three);
+      splitThree = d3 && RecInstances(lib, *d3) == 3 && RecBolts(lib, *d3) == 3 * split;
+      // (3) THE TWO LEVELS ARE INDEPENDENT: a shared `shotgun` fans the box
+      // into `split` branches, a lane's own `shotgun` splits ONE of them, and
+      // that branch does not inherit the box's fan on top of its own. So the
+      // total is (split - 1) plain branches plus one that is `split` wide.
+      const CastList both =
+          CompileSpell(lib, speak({"shotgun", "lane", "shotgun", "end", "projectile"}));
+      const DeliveryRec* db = boxOf(both);
+      splitBoth = db && RecInstances(lib, *db) == split &&
+                  RecBolts(lib, *db) == split + (split - 1);
+      // (4) NO-COMPOSE, and the loser is named. Two DIFFERENT count words in
+      // one scope, because two of the same word merge into one node with n=2
+      // and there is nothing to waste - the `n` is simply ignored.
+      const CastList once = CompileSpell(lib, speak({"shotgun", "projectile"}));
+      const CastList twice = CompileSpell(lib, speak({"shotgun", "twin", "projectile"}));
+      const DeliveryRec *d4a = boxOf(once), *d4b = boxOf(twice);
+      splitOnce = d4a && d4b && RecInstances(lib, *d4b) == RecInstances(lib, *d4a) &&
+                  !twice.casts.empty() && !twice.casts[0].wastedNodes.empty();
+      // ...and it FLIES. Three branches, each firing its own split, and EVERY
+      // BOLT HAS ITS OWN DIRECTION except the one each branch puts on the aim:
+      // a lane is a spell the player aimed, so its first bolt goes where they
+      // pointed and its copies fan around it. If the fan were keyed on the
+      // per-branch index instead of the global bolt ordinal, branch 2's second
+      // bolt would fly exactly where branch 1's second bolt did and this count
+      // would collapse from 3*split-2 to split.
+      SpellEmission e3;
+      lsys.Cast(three, cs, hp.cb, 91, origin, {kSpellFxOne, 0, 0}, 4, e3);
+      splitLive = lsys.LiveCount();
+      std::vector<std::string> dirs;
+      for (const SpellProjectile& pr : lsys.Live()) {
+        char buf[64];
+        // VELOCITY, which is the direction times the record's speed: every bolt
+        // of one box carries the same speed, so two equal velocities are two
+        // equal directions and that is the collision this catches.
+        std::snprintf(buf, sizeof buf, "%lld,%lld,%lld", (long long)pr.vel.x,
+                      (long long)pr.vel.y, (long long)pr.vel.z);
+        dirs.push_back(buf);
+      }
+      std::sort(dirs.begin(), dirs.end());
+      splitDistinct = (int)(std::unique(dirs.begin(), dirs.end()) - dirs.begin());
+      lsys.Clear();
+      splitRunOk = splitBranch && splitThree && splitBoth && splitOnce &&
+                   splitLive == 3 * split && splitDistinct == 3 * split - 2;
+      std::printf("spell split: %s (a lane's shotgun splits that branch x%d; three of them "
+                  "fire %d bolts in %d directions, want %d; shared+lane %d, no-compose %d)\n",
+                  splitRunOk ? "PASS" : "FAIL", split, splitLive, splitDistinct,
+                  3 * split - 2, splitBoth ? 1 : 0, splitOnce ? 1 : 0);
+    }
+
+    laneRunOk = laneBolts == 2 && laneWithFire == 1 && laneWithSand == 1 &&
+                laneLive == 1 && laneRestores == 1 && sockBolts == 2 &&
+                sockChild == 1 && sockFire == 1;
+    std::printf("spell lanes: %s (twin+lanes: %d bolts, %d with fire, %d with sand; root "
+                "lanes: %d bolt(s) + %d restore(s) from one cast; sockets: %d bolts, %d "
+                "carrying a child box, %d carrying fire)\n",
+                laneRunOk ? "PASS" : "FAIL", laneBolts, laneWithFire, laneWithSand, laneLive,
+                laneRestores, sockBolts, sockChild, sockFire);
+  }
+
   const bool lawsOk = alphaOk && lawFail == 0 && l1 > 0 && l2pairs > 0 && l3 > 0 &&
                       l6cases > 0 && l4cases > 0 && l7 > 0 && l5 > 0 && l8 > 0 &&
-                      l9cases > 0 && l10cases > 0 && l11 > 0;
+                      l9cases > 0 && l10cases > 0 && l11 > 0 && l12cases > 0 && laneRunOk &&
+                      splitRunOk;
   const bool spellOk = budgetOk && deliverOk && fatalOk && carveAsked && fatalEmitted &&
                        sprayOk && latchOk && lawsOk && bombOk && sustainOk && mendOk &&
                        nestOk;
@@ -1375,7 +1782,7 @@ Status GateSpells(Ctx& c, std::string& detail) {
       "overcast fatal=%d carve=%d payload=%d; spray %d/%d/%d voxels for "
       "%d/%d/%d mana; bomb=%d sustain=%d mend=%d nest=%d; laws over %zu sequences: "
       "L1 %d, L2 %d/%d, L3 %d, L4 %d/%d, L5 %d, L6 %d/%d, L7 %d, L8 %d, L9 %d/%d, "
-      "L10 %d/%d, L11 %d, %d failures)\n",
+      "L10 %d/%d, L11 %d, L12 %d/%d, %d failures)\n",
       spellOk ? "PASS" : "FAIL", (long long)trailVolume, authoredBudget, flownTicks,
       diedWithBudget ? 1 : 0, deliverOk ? 1 : 0, deliverY, deliverGround, deliverSx, deliverSz,
       deliverColumn ? 1 : 0, deliverMirrored ? 1 : 0, deliverTicks,
@@ -1383,7 +1790,7 @@ Status GateSpells(Ctx& c, std::string& detail) {
       sprayN[0], sprayN[1], sprayN[2], sprayCost[0], sprayCost[1], sprayCost[2],
       bombOk ? 1 : 0, sustainOk ? 1 : 0, mendOk ? 1 : 0, nestOk ? 1 : 0, seqs.size(), l1,
       l2, l2pairs, l3, l4, l4cases, l5, l6, l6cases, l7, l8, l9, l9cases, l10, l10cases,
-      l11, lawFail);
+      l11, l12, l12cases, lawFail);
   detail = Format("laws %zu seq, %d failures", seqs.size(), lawFail);
   return spellOk ? Status::Pass : Status::Fail;
 }
@@ -1485,6 +1892,212 @@ Status GateSpellsOracle(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---- spell-timing (docs/PLAN_spell_magnitude.md §4, M3) -----------------------
+//
+// WHEN an item fires in its carrier: `explosive!bounce`, `fire!every10`,
+// `explosive!expire`, `explosive!launch`, `explosive+20`. CPU half: the
+// suffixes survive every page path, mods and marks refuse a timing, the price
+// is the item's tariff times how often it CAN fire, a delay costs nothing but
+// lengthens the rule-2 tick bound, and the page op refuses a trigger on a
+// carrier that does not fly. Runtime half: real flights through the harness
+// window (the same open-air fixture as `spells` check 8) fire each event the
+// number of times the words say.
+Status GateSpellTiming(Ctx& c, std::string& detail) {
+  World& world = c.world;
+  GlyphLibrary lib;
+  std::string gerr;
+  if (!LoadGlyphs(AssetDir() + "/spells/glyphs.json", c.mats, lib, gerr)) {
+    std::printf("spell-timing: FAIL (glyph load: %s)\n", gerr.c_str());
+    detail = "glyph load failed";
+    return Status::Fail;
+  }
+  std::vector<uint32_t> classOf;
+  for (const auto& m : c.mats) classOf.push_back(m.gpu.klass);
+  bool ok = true;
+  int checks = 0, shown = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (cond) return;
+    ok = false;
+    if (shown++ < 20) std::printf("spell-timing: FAILED %s\n", what.c_str());
+  };
+  auto words = [](std::initializer_list<const char*> w) {
+    return std::vector<std::string>(w.begin(), w.end());
+  };
+  auto join = [](const std::vector<std::string>& w) {
+    std::string s;
+    for (const std::string& x : w) s += (s.empty() ? "" : " ") + x;
+    return s;
+  };
+  auto compile = [&](const std::vector<std::string>& w) {
+    return LowerSpell(lib, ParseWords(lib, w));
+  };
+  auto CountWord = [](const std::vector<std::string>& w, const std::string& id) {
+    int n = 0;
+    for (const std::string& x : w) n += x == id;
+    return n;
+  };
+
+  // ---- CPU: serialization ------------------------------------------------------
+  for (const auto& w : {words({"explosive!bounce", "bounce", "projectile"}),
+                        words({"fire@2!every10+20", "projectile"}),
+                        words({"explosive!expire", "projectile!launch", "projectile"}),
+                        words({"fire+40", "self"})}) {
+    const std::vector<std::string> back = Linearize(lib, ParseWords(lib, w));
+    std::vector<std::string> a = w, b = back;
+    std::sort(a.begin(), a.end());
+    std::sort(b.begin(), b.end());
+    check(a == b, "round trip [" + join(w) + "] -> [" + join(back) + "]");
+  }
+  check(Linearize(lib, ParseWords(lib, words({"lift!bounce", "projectile"}))) ==
+            words({"lift", "projectile"}),
+        "a mod's timing suffix is dropped (a mod edits its carrier)");
+  check(Linearize(lib, ParseWords(lib, words({"fire!every1", "projectile"})))[0] ==
+            "fire!every" + std::to_string(lib.budgets.minEveryTicks),
+        "an `every` period below the floor clamps to budgets.minEveryTicks");
+  {
+    const std::vector<std::string> two =
+        Linearize(lib, ParseWords(lib, words({"explosive!bounce", "explosive", "projectile"})));
+    int ex = 0, exb = 0;
+    for (const std::string& x : two) {
+      ex += x == "explosive";
+      exb += x == "explosive!bounce";
+    }
+    check(ex == 1 && exb == 1, "a timed and an untimed explosive stay two items: [" + join(two) + "]");
+  }
+
+  // ---- CPU: price = tariff x fires ---------------------------------------------
+  {
+    const int32_t hit = compile(words({"explosive", "bounce@3", "projectile"})).tariff;
+    const int32_t bnc = compile(words({"explosive!bounce", "bounce@3", "projectile"})).tariff;
+    check(hit > 0 && bnc == 3 * hit,
+          Format("a blast at each of 3 bounces prices 3 blasts (%d vs 3 x %d)", bnc, hit));
+    const int32_t fire = compile(words({"fire", "projectile"})).tariff;
+    const int32_t every = compile(words({"fire!every10", "projectile"})).tariff;
+    const GlyphDef* proj = lib.At(lib.Find("projectile"));
+    const int32_t fires = proj ? proj->lifetimeTicks / 10 : 0;
+    check(every == fire * fires,
+          Format("fire every 10 ticks prices %d fires (%d vs %d x %d)", fires, every, fire, fires));
+    check(compile(words({"explosive!bounce", "bomb"})).tariff == 0,
+          "a bomb has no bounce: a bounce item on it fires never and costs no tariff");
+    const CastList d0 = compile(words({"fire", "projectile"}));
+    const CastList d20 = compile(words({"fire+20", "projectile"}));
+    check(d20.tariff == d0.tariff, "a delay is free");
+    check(!d0.casts.empty() && !d20.casts.empty() && d20.casts[0].ticks == d0.casts[0].ticks + 20,
+          Format("a delay lengthens the tick bound by itself (%d -> %d)",
+                 d0.casts.empty() ? -1 : d0.casts[0].ticks,
+                 d20.casts.empty() ? -1 : d20.casts[0].ticks));
+    // echo's magnitude scales its repeats.
+    const int32_t e1 = compile(words({"explosive", "echo", "orb"})).tariff;
+    const int32_t e2 = compile(words({"explosive", "echo@2", "orb"})).tariff;
+    check(e2 == 2 * e1, Format("echo@2 repeats twice as often (%d vs 2 x %d)", e2, e1));
+  }
+
+  // ---- CPU: the page op ---------------------------------------------------------
+  {
+    const SpellTree t = ParseWords(lib, words({"explosive", "projectile"}));
+    int ex = -1;
+    for (size_t i = 0; i < t.nodes.size(); i++) {
+      const GlyphDef* gd = lib.At(t.nodes[i].glyph);
+      if (!t.nodes[i].box && gd && gd->id == "explosive") ex = (int)i;
+    }
+    SpellTiming tb;
+    tb.trigger = SpellTrigger::Bounce;
+    const EditResult r = SetTiming(lib, t, ex, tb);
+    check(r.ok && CountWord(r.words, "explosive!bounce") == 1,
+          "SetTiming writes explosive!bounce: " + (r.ok ? join(r.words) : r.why));
+    const SpellTree h = ParseWords(lib, words({"fire", "self"}));
+    int fi = -1;
+    for (size_t i = 0; i < h.nodes.size(); i++) {
+      const GlyphDef* gd = lib.At(h.nodes[i].glyph);
+      if (!h.nodes[i].box && gd && gd->id == "fire") fi = (int)i;
+    }
+    const EditResult no = SetTiming(lib, h, fi, tb);
+    check(!no.ok && no.why.find("does not fly") != std::string::npos,
+          "a bounce on a carrier that does not fly is refused: " + no.why);
+    SpellTiming td;
+    td.delay = 20;
+    const EditResult yes = SetTiming(lib, h, fi, td);
+    check(yes.ok && CountWord(yes.words, "fire+20") == 1,
+          "a delay is allowed anywhere: " + (yes.ok ? join(yes.words) : yes.why));
+  }
+
+  // ---- runtime: real flights --------------------------------------------------------
+  // Horizontal through open air from the window's -x edge, weightless (`lift`
+  // at its default is exactly 1 g of lift), so nothing lands on the ground.
+  const IVec3 worg = world.WindowOrigin();
+  const SpellFxVec origin{SpellFxFromFloat((float)(worg.x * (int)kChunk + 8)),
+                          SpellFxFromFloat((float)(worg.y * (int)kChunk + (int)kWorldN / 2)),
+                          SpellFxFromFloat((float)(worg.z * (int)kChunk + (int)kWorldN / 2))};
+  struct Run {
+    int atCast = 0;                // explosions on the cast tick
+    int blasts = 0;                // explosions while ticking
+    int firstBlast = -1;           // tick of the first one
+    int sprayTicks = 0;            // ticks that emitted spray particles
+  };
+  auto fly = [&](const std::vector<std::string>& w) {
+    Run r;
+    SpellSystem sys;
+    sys.SetLibrary(&lib);
+    const CastList sp = compile(w);
+    CasterState cs;
+    cs.mana = 1 << 28;
+    cs.manaMax = 1 << 28;
+    FakeHealth hp(1 << 28);
+    SpellEmission e0;
+    sys.Cast(sp, cs, hp.cb, 41, origin, {kSpellFxOne, 0, 0}, 1, e0);
+    r.atCast = (int)e0.explosions.size();
+    for (int t = 0; t < 3 * (int)lib.budgets.maxLifetimeTicks + lib.budgets.maxDelayTicks; t++) {
+      SpellEmission e;
+      sys.Tick((uint32_t)(7000 + t), world, classOf, e, nullptr);
+      if (!e.explosions.empty() && r.firstBlast < 0) r.firstBlast = t;
+      r.blasts += (int)e.explosions.size();
+      if (!e.spawns.empty()) r.sprayTicks++;
+      if (sys.LiveCount() == 0 && sys.BombCount() == 0 && sys.Echoes().empty() && t > 2) break;
+    }
+    return r;
+  };
+  // (a) EXPIRE: a slow weightless bolt runs out of life in the air. Untimed it
+  // fizzles; timed `!expire`, it goes off exactly once.
+  const Run fizz = fly(words({"explosive", "lift", "speed@0.25", "projectile"}));
+  const Run expire = fly(words({"explosive!expire", "lift", "speed@0.25", "projectile"}));
+  check(fizz.blasts == 0, Format("an untimed bolt that hits nothing fizzles (%d blasts)", fizz.blasts));
+  check(expire.blasts == 1, Format("`!expire` goes off once when life runs out (%d)", expire.blasts));
+  // (b) EVERY: the same bolt sprays every 10 ticks of its flight.
+  const Run pulse = fly(words({"fire!every10", "lift", "speed@0.25", "projectile"}));
+  const GlyphDef* proj = lib.At(lib.Find("projectile"));
+  const int life = proj ? proj->lifetimeTicks : 0;
+  check(pulse.sprayTicks >= life / 10 - 1 && pulse.sprayTicks <= life / 10,
+        Format("`!every10` sprays every 10 ticks of a %d-tick life (%d pulses)", life,
+               pulse.sprayTicks));
+  // (c) LAUNCH: at the muzzle, on the cast tick, and nothing at the end.
+  const Run launch = fly(words({"explosive!launch", "lift", "speed@0.25", "projectile"}));
+  check(launch.atCast == 1 && launch.blasts == 0,
+        Format("`!launch` goes off at the muzzle (%d at cast, %d later)", launch.atCast,
+               launch.blasts));
+  // (d) DELAY: the same impact, 20 ticks later.
+  const Run now = fly(words({"explosive", "lift", "projectile"}));
+  const Run later = fly(words({"explosive+20", "lift", "projectile"}));
+  check(now.blasts == 1 && later.blasts == 1 && later.firstBlast - now.firstBlast == 20,
+        Format("`+20` lands the blast 20 ticks after the impact (t%d -> t%d)", now.firstBlast,
+               later.firstBlast));
+  // (e) BOUNCE: a fast bolt that bounces twice off the window's walls explodes
+  // at each bounce and not at the end.
+  const Run bnc = fly(words({"explosive!bounce", "bounce@2", "lift", "speed@4", "projectile"}));
+  const Run bnc0 = fly(words({"explosive", "bounce@2", "lift", "speed@4", "projectile"}));
+  check(bnc0.blasts == 1, Format("control: an untimed bouncing bolt explodes once, at the end (%d)",
+                                 bnc0.blasts));
+  check(bnc.blasts == 2, Format("`!bounce` explodes at each of 2 bounces (%d)", bnc.blasts));
+
+  detail = Format("%d checks", checks);
+  std::printf("spell-timing: %s (expire %d, every %d pulses/%d-tick life, launch %d at cast, "
+              "delay t%d->t%d, bounce %d vs control %d; %d checks)\n",
+              ok ? "PASS" : "FAIL", expire.blasts, pulse.sprayTicks, life, launch.atCast,
+              now.firstBlast, later.firstBlast, bnc.blasts, bnc0.blasts, checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SpellGates() {
@@ -1496,6 +2109,9 @@ const std::vector<Gate>& SpellGates() {
       // SKIPPED in every scope for a day -- which is how "explosive
       // projectile does nothing" shipped with the gate nominally green.
       {"spells", "spell", {}, false, GateSpells},
+      // M3 triggers: CPU checks plus real flights through the same open-air
+      // window fixture `spells` check 8 uses; it leaves nothing behind.
+      {"spell-timing", "spell", {}, false, GateSpellTiming},
       // No deps: CPU-only over the glyph library and the oracle file.
       {"spells-oracle", "spell", {}, false, GateSpellsOracle},
   };

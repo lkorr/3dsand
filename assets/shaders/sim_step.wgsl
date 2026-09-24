@@ -625,12 +625,16 @@ fn reposeSnapOpen(c : vec3<i32>) -> bool {
 // and cross into a neighbour chunk that may be asleep, and a boundary artifact
 // every 16 cells is not acceptable.
 //
-// Ring members are re-filled by every dirty chunk that touches them. That is
-// redundant, never divergent -- the bits are a pure function of voxel state
-// that nothing in this pass writes -- and the stamp test below skips most of
-// it. The skip READS state this pass writes, so which workgroup does the work
-// depends on scheduling; WHAT IT WRITES does not, which is the only thing rule
-// 1 is about.
+// EACH RING SLOT HAS EXACTLY ONE OWNER, decided from this tick's dirty flags
+// (reposeRingOwned below). It used to be "every dirty chunk that touches a
+// slot fills it, and a stamp test skips the ones already done" -- but a stamp
+// is only published when a workgroup FINISHES, and with thousands of
+// workgroups in flight at once almost none of them saw one. Measured
+// 2026-09-22 on a forest fire (~5,000 dirty chunks, a solid block of smoke):
+// 5.1 ms/tick, i.e. nearly every slot filled by all of its up-to-ten
+// neighbours. Ownership is a pure function of dirtyIn, so which workgroup
+// does the work is no longer scheduling-dependent either; the bits written
+// were always a pure function of pre-CA voxel state.
 //
 // A SENTINEL CHUNK COSTS 128 STORES AND NO VOXEL READS. Its material is
 // uniform, so its occupancy bit is uniform, so the whole 4096-cell bitfield is
@@ -687,6 +691,29 @@ fn reposeRingSlot(cx : u32, cy : u32, cz : u32, k : u32) -> u32 {
   return (nz * NCHUNK + ny) * NCHUNK + nx;
 }
 
+// Does the dirty chunk at (cx,cy,cz) own ring member k? The member's slot s is
+// in the ring of every dirty centre s - offset(j); the owner is the one with
+// the SMALLEST j. Offset 0 is j = 0, so a dirty chunk always owns itself, and
+// every slot some dirty chunk's ring reaches has exactly one owner.
+fn reposeRingOwned(cx : u32, cy : u32, cz : u32, k : u32) -> bool {
+  let o = reposeRingOffset(k);
+  let sx = i32(cx) + o.x;
+  let sy = i32(cy) + o.y;
+  let sz = i32(cz) + o.z;
+  for (var j = 0u; j < k; j++) {
+    let oj = reposeRingOffset(j);
+    let nx = u32((sx - oj.x + 2 * i32(NCHUNK)) % i32(NCHUNK));
+    let ny = u32((sy - oj.y + 2 * i32(NCHUNK)) % i32(NCHUNK));
+    let nz = u32((sz - oj.z + 2 * i32(NCHUNK)) % i32(NCHUNK));
+    if (dirtyIn[(nz * NCHUNK + ny) * NCHUNK + nx] != 0u) { return false; }
+  }
+  return true;
+}
+
+var<workgroup> wgReposeOwned : array<u32, REPOSE_RING>;
+var<workgroup> wgReposeEntry : u32;
+var<workgroup> wgReposeFlag : array<u32, 4224>;   // CHUNK_VOL + CHUNK_VOL / 32
+
 @compute @workgroup_size(64)
 fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
               @builtin(local_invocation_index) li : u32) {
@@ -697,22 +724,26 @@ fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
   let cx = centre % NCHUNK;
   let wpc = CHUNK_VOL / 32u;   // 128 bitfield words per chunk
 
-  // PASS 1: the bits. Work items are FLATTENED over (ring member, word) so the
-  // per-item skip below sits in non-uniform control flow with no barrier in it
-  // -- WGSL forbids a workgroupBarrier() under a non-uniform branch, and this
-  // shape sidesteps the question instead of arguing about it.
-  for (var t = li; t < REPOSE_RING * wpc; t += 64u) {
-    let k = t / wpc;
-    let i = t % wpc;
+  // PASS 0: which ring members are OURS (one thread each, then shared).
+  if (li < REPOSE_RING) {
+    wgReposeOwned[li] = select(0u, 1u, reposeRingOwned(cx, cy, cz, li));
+  }
+  workgroupBarrier();
+
+  // PASS 1: the bits, one ring member at a time. The loop is UNIFORM (every
+  // branch that holds a barrier tests a workgroupUniformLoad), so a member is
+  // read COALESCED -- thread v loads voxel v into a padded flag array -- and
+  // then packed thread-per-word out of workgroup memory. The previous shape,
+  // thread-per-word straight from the page, strode 128 B between lanes on
+  // every load; measured on a forest fire it was 2.6 ms/tick of a pass whose
+  // whole input is one read of each chunk.
+  for (var k = 0u; k < REPOSE_RING; k++) {
+    // Another dirty chunk owns this member and fills it (reposeRingOwned).
+    if (workgroupUniformLoad(&wgReposeOwned[k]) == 0u) { continue; }
     let slot = reposeRingSlot(cx, cy, cz, k);
-    // A stamp already at this tick's value means SOME workgroup has already
-    // written every word of this chunk -- see pass 2 for why that is safe to
-    // rely on. Skipping is then free of consequence: the bits are a pure
-    // function of voxel state that nothing in this pass writes, so whoever did
-    // the work wrote exactly what this thread would have.
-    if (reposeSnap[REPOSE_SNAP_TICK_BASE + slot] == stamp) { continue; }
     let wordBase = slot * wpc;
-    let e = pageTable[slot];
+    if (li == 0u) { wgReposeEntry = pageTable[slot]; }
+    let e = workgroupUniformLoad(&wgReposeEntry);
     if ((e & PT_SENTINEL_BIT) != 0u) {
       // Uniform by definition: EMPTY, UNIFORM(mat) and JITTER(mat) all hold ONE
       // material, and JITTER varies only the palette nibble -- which this
@@ -722,34 +753,32 @@ fn reposesnap(@builtin(workgroup_id) wg : vec3<u32>,
       // and a per-cell synth pays two PCG rounds for an answer that cannot vary.
       var bits = 0u;
       if (reposeSnapOpenMat(e & PT_MAT_MASK)) { bits = 0xFFFFFFFFu; }
-      reposeSnap[wordBase + i] = bits;
-    } else {
-      let pageBase = e * CHUNK_VOL;
+      for (var i = li; i < wpc; i += 64u) { reposeSnap[wordBase + i] = bits; }
+      continue;
+    }
+    let pageBase = e * CHUNK_VOL;
+    for (var v = li; v < CHUNK_VOL; v += 64u) {
+      // +1 word of padding per 32 so the packing reads below (lane t at
+      // t*33 + b) fall in 32 different banks.
+      wgReposeFlag[v + (v >> 5u)] = select(0u, 1u, reposeSnapOpenWord(voxels[pageBase + v]));
+    }
+    workgroupBarrier();
+    for (var i = li; i < wpc; i += 64u) {
       var bits = 0u;
-      for (var b = 0u; b < 32u; b++) {
-        if (reposeSnapOpenWord(voxels[pageBase + i * 32u + b])) {
-          bits |= 1u << b;
-        }
-      }
+      for (var b = 0u; b < 32u; b++) { bits |= wgReposeFlag[i * 33u + b] << b; }
       reposeSnap[wordBase + i] = bits;
     }
+    // The next member overwrites the flags this one's packing is reading.
+    workgroupBarrier();
   }
 
-  // ONE BARRIER, at a uniform point, and it is what makes pass 1's skip sound:
-  // a stamp must mean "every word of this chunk is final", so no thread may
-  // publish a stamp while a sibling is still filling the same chunk.
-  //
-  // storageBarrier(), not workgroupBarrier(): the thing being ordered is a
-  // STORAGE write (the bit region) against a storage write another WORKGROUP
-  // may read (the stamp). workgroupBarrier only fences workgroup-address-space
-  // memory, so with it the sentence above would be true of this workgroup's
-  // execution and not of what anyone else can see -- which is exactly the
-  // distinction the skip leans on.
-  storageBarrier();
+  // NO BARRIER before publishing: nothing in this pass reads a stamp any
+  // more (ownership replaced the stamp skip), and the CA that does read them
+  // runs behind the pass-table barrier on W(ReposeSnap).
 
-  // PASS 2: publish. Cheap (10 stores per workgroup), and re-publishing a stamp
-  // another workgroup already set is a write of the same value.
+  // PASS 2: publish the members this workgroup owns and filled.
   for (var k = li; k < REPOSE_RING; k += 64u) {
+    if (wgReposeOwned[k] == 0u) { continue; }
     reposeSnap[REPOSE_SNAP_TICK_BASE + reposeRingSlot(cx, cy, cz, k)] = stamp;
   }
 }
@@ -885,6 +914,48 @@ fn seesSky(c : vec3<i32>) -> bool {
   return !isRayBlocker(materials[nmat]);
 }
 
+// Does rain reach this cell? Rain falls at an angle and splashes, so a burning
+// trunk is wet down its SIDES, not only on top: the cell is exposed if it sees
+// the sky, or if a horizontal face opens onto a cell that does (an air-ish
+// side neighbour whose own cell above is not a ray blocker). Every read is at
+// Chebyshev distance 1 — the side neighbour and the diagonal above it — which
+// is the reach seesSky's note proves is scheduling-free: an actor in this pass
+// is >= 3 away and writes reach 1, so it cannot touch a cell within 1 of me.
+// Costs nothing while dry: both callers test T.weatherRain first.
+fn rainOpen(n : vec3<i32>) -> bool {
+  if (!inBounds(n)) { return true; }
+  let nm = voxMat(voxWordAt(n));
+  return nm == MAT_AIR || !isRayBlocker(materials[nm]);
+}
+fn rainExposed(c : vec3<i32>) -> bool {
+  if (seesSky(c)) { return true; }
+  for (var i = 0u; i < 4u; i++) {
+    let d = select(vec3<i32>(0, 0, select(-1, 1, i == 3u)),
+                   vec3<i32>(select(-1, 1, i == 1u), 0, 0), i < 2u);
+    let n = c + d;
+    if (rainOpen(n) && rainOpen(n + vec3<i32>(0, 1, 0))) { return true; }
+  }
+  return false;
+}
+
+// A rule's chance under this tick's weather — rain douses (RCOND_RAIN) and
+// damps ignition (RCOND_RAINDAMP). MIRRORED BIT FOR BIT by RainScaledChance
+// in src/sim/materials.h, which the body burners roll against: change one,
+// change both. Integer and divide-last; chance <= REACT_CHANCE_DEN (2e6), so
+// chance * 255 fits a u32. A RAIN rule has already passed lightMatches (rain
+// > 0, exposed); a RAINDAMP rule only pays the exposure probe while wet.
+fn rainChance(rule : Reaction, c : vec3<i32>, chance : u32) -> u32 {
+  let cond = rule.cond;
+  if ((cond & (RCOND_RAIN | RCOND_RAINDAMP)) == 0u) { return chance; }
+  let rain = T.weatherRain & 0xFFu;
+  if ((cond & RCOND_RAIN) != 0u) { return (chance * rain / 255u) * rain / 255u; }
+  let wet = max(rain, (T.weatherRain >> 16u) & 0xFFu);
+  if (wet == 0u || !rainExposed(c)) { return chance; }
+  let damp = (T.weatherRain >> 8u) & 0xFFu;
+  let keep = 255u - (wet * damp + 127u) / 255u;
+  return chance * keep / 255u;
+}
+
 // Does the cell's light environment satisfy this rule's condition?
 // Encoded in Reaction.cond (see materials.h ReactionGpu.cond):
 //   bit0 RCOND_SKY   — requires open sky above
@@ -895,6 +966,9 @@ fn seesSky(c : vec3<i32>) -> bool {
 fn lightMatches(rule : Reaction, c : vec3<i32>) -> bool {
   let cond = rule.cond & 0xFFu;
   if (cond == 0u) { return true; }  // unconditional: the common case, free
+  // A douse only while it rains, and only where the rain lands.
+  if ((cond & RCOND_RAIN) != 0u &&
+      ((T.weatherRain & 0xFFu) == 0u || !rainExposed(c))) { return false; }
   let day = daylightStrength(T.dayPhase);
   if ((cond & RCOND_DAY) != 0u && day == 0u) { return false; }
   if ((cond & RCOND_NIGHT) != 0u && day != 0u) { return false; }
@@ -1060,13 +1134,17 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     // off, which is a handful of ticks per in-game day. Between those
     // boundaries a chunk with only light-gated work sleeps, and the rules
     // still fire on the ticks it is awake for other reasons.
-    let lightGated = (rule.cond & 0xFFu) != 0u;
+    // RCOND_GATES, not the whole byte: RAINDAMP only rescales an ordinary
+    // ignition rule, and counting it as a gate would let a fire front fall
+    // asleep mid-spread. RAIN is a gate — a douse on something that does not
+    // resolve by itself must not pin its chunk awake for a whole storm.
+    let lightGated = (rule.cond & RCOND_GATES) != 0u;
 
     if (kind == RK_DECAY) {
       // Neighbour-count scaling (frontier rules — see scaledChance). Returns
       // rule.chance untouched for the ordinary unscaled case; 0 means the cell
       // has no qualifying neighbours and the rule is inert here this tick.
-      let chance = scaledChance(rule, c);
+      let chance = rainChance(rule, c, scaledChance(rule, c));
       if (chance == 0u) { continue; }
       keepAwake = keepAwake || !lightGated;
       if ((rr % REACT_CHANCE_DEN) < chance) {
@@ -1087,7 +1165,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         let ni = voxWordIndex((n));
         if (voxMat(voxWordAt((n))) != MAT_AIR) { continue; }
         keepAwake = keepAwake || !lightGated;
-        if ((rr % REACT_CHANCE_DEN) < rule.chance) {
+        if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
           markVoxActive(ni);
           markDirtyR(n, DIRTY_R_REACTW);
@@ -1125,7 +1203,9 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         }
         if (!nbrMatches(rule, nmat, materials[nmat])) { continue; }
         keepAwake = keepAwake || !lightGated;
-        if ((rr % REACT_CHANCE_DEN) < rule.chance) {
+        // Weather scale here, after the neighbour matched, so a dry-sky tick
+        // and a wood cell with nothing hot beside it never pay the probe.
+        if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
           if (rule.prodNbr != PROD_KEEP) {
             if (synthFluid) { flagFluidConsume(n); }
             // For a synthesized neighbour ni is the air cell: a product

@@ -23,6 +23,8 @@
 #include "sim/treeatlas.h"
 #include "sim/worldmap.h"
 #include "sim/wind.h"
+#include "sim/weather.h"
+#include "sim/renderspec.h"
 #include "sim/worldedit.h"
 #include "sim/waterbody.h"
 #include "sim/windprim.h"
@@ -275,6 +277,300 @@ bool GasRenderActive() { return gGasRenderActive; }
 void SetGasFarRenderActive(bool active) { gGasFarRenderActive = active; }
 bool GasFarRenderActive() { return gGasFarRenderActive; }
 
+
+// ============================================================================
+// THE CLOUDS' half of the frame uniforms (cloud.wgsl, src/sim/weather.h)
+// ============================================================================
+namespace {
+CloudFrame gCloudFrame;
+
+// Cloud DRIFT in metres, a pure function of the sim clock.
+//
+// The drift is the integral of the wind over time, and an integral is exactly
+// the kind of state this engine refuses to keep (a frame-rate-dependent
+// accumulator is a sky that differs between a replay and the run it
+// replays). So it is evaluated in closed form: WindWeather's velocity is a
+// smoothstep blend between per-epoch targets, and the integral of
+// V0 + (V1 - V0) s(u) over a whole epoch is (V0 + V1) / 2 exactly, and over a
+// partial one V0 u + (V1 - V0)(u^3 - u^4 / 2). Summed over the epochs so far —
+// a prefix sum cached per epoch and invalidated when the wind knobs change —
+// it costs one WindWeather call per new epoch and is continuous at every
+// frame, which a numerical integral re-sampled each frame would not be.
+//
+// The blend uses the VECTOR lerp of the two targets (speed x direction), not
+// WindWeather's renormalised direction, so this is the drift of a wind that
+// agrees with the surface wind at every epoch boundary and differs from it
+// only in how it turns in between — invisible at cloud distance, and it is
+// what makes the closed form exact.
+void CloudDrift(const Tuning& tun, uint32_t seed, double tSec, double& dx, double& dz) {
+  const double epochS = (double)(1u << kWindEpochShift) / 30.0;
+  auto vel = [&](uint32_t epoch, double& vx, double& vz) {
+    const WindState w = WindWeather(tun, seed, epoch << kWindEpochShift);
+    const double mps = (double)w.speed * (double)kVoxelMeters;
+    vx = (double)w.dirX * mps;
+    vz = (double)w.dirZ * mps;
+  };
+  if (tSec < 0.0) tSec = 0.0;
+  if (!tun.wind.weatherAuto) {
+    double vx, vz;
+    vel(0, vx, vz);
+    dx = vx * tSec;
+    dz = vz * tSec;
+    return;
+  }
+  struct Key {
+    uint32_t seed; float speed, dir, gust; bool operator==(const Key& o) const {
+      return seed == o.seed && speed == o.speed && dir == o.dir && gust == o.gust;
+    }
+  };
+  static Key key{0xFFFFFFFFu, -1.0f, 0.0f, 0.0f};
+  static std::vector<double> px, pz;  // drift at the START of epoch i
+  const Key k{seed, tun.wind.windSpeed, tun.wind.windDirDeg, tun.wind.gustStrength};
+  if (!(k == key)) {
+    key = k;
+    px.assign(1, 0.0);
+    pz.assign(1, 0.0);
+  }
+  const double eF = tSec / epochS;
+  const uint32_t e = (uint32_t)std::min(eF, 4.0e9);
+  // Extend the prefix to epoch e. Bounded per frame so a jump to tick 10^9 (a
+  // --sweep of time) cannot stall one frame for minutes; past the bound the
+  // drift is extrapolated at the last epoch's velocity, which is continuous.
+  size_t budget = 20000;
+  while (px.size() <= e && budget-- > 0) {
+    const uint32_t i = (uint32_t)px.size() - 1;
+    double ax, az, bx, bz;
+    vel(i, ax, az);
+    vel(i + 1, bx, bz);
+    px.push_back(px.back() + (ax + bx) * 0.5 * epochS);
+    pz.push_back(pz.back() + (az + bz) * 0.5 * epochS);
+  }
+  const uint32_t have = (uint32_t)px.size() - 1;
+  const uint32_t ei = std::min(e, have);
+  double ax, az, bx, bz;
+  vel(ei, ax, az);
+  vel(ei + 1, bx, bz);
+  const double u = std::clamp(eF - (double)ei, 0.0, 1e6);
+  const double uc = std::min(u, 1.0);
+  const double shape = uc * uc * uc - uc * uc * uc * uc * 0.5;
+  dx = px[ei] + (ax * uc + (bx - ax) * shape) * epochS + (u - uc) * bx * epochS;
+  dz = pz[ei] + (az * uc + (bz - az) * shape) * epochS + (u - uc) * bz * epochS;
+}
+
+double Wrap(double v, double period) {
+  const double r = std::fmod(v, period);
+  return r < 0.0 ? r + period : r;
+}
+
+// Per-call state the temporal resolve needs: the previous frame's camera and
+// target, and the ping-pong parity. Render-only, so it may live here.
+struct CloudPrev {
+  bool valid = false;
+  double eye[3] = {0, 0, 0};
+  float right[3] = {1, 0, 0}, up[3] = {0, 1, 0}, fwd[3] = {0, 0, 1};
+  float tanHalfFov = 1.0f, aspect = 1.0f;
+  uint32_t lowW = 0, lowH = 0;
+  uint32_t parity = 0;
+  uint32_t frame = 0;
+  uint32_t age = 0;
+  double wall = -1.0;
+};
+CloudPrev gCloudPrev;
+
+}  // namespace
+
+const CloudFrame& LastCloudFrame() { return gCloudFrame; }
+
+// Fills the weather fields of `rp` and uploads CloudParams. Called from
+// WriteRenderParams, which is the single author of every frame uniform, so
+// every drawing path — the game, --shot, the lab, the perf harness, the
+// portrait — gets the same sky with nothing to remember.
+static void WriteCloudParams(const rhi::Queue& queue, const World& world,
+                             RenderParams& rp, const Vec3& eyeV, float aspect,
+                             float viewPx, uint32_t tick, float frameFrac,
+                             const SkyState& sky) {
+  const float eyeA[3] = {eyeV.x, eyeV.y, eyeV.z};
+  struct { float x, y, z; } eye{eyeV.x, eyeV.y, eyeV.z};
+  const Tuning& tun = CurrentTuning();
+  const Tuning::Render& rr = tun.render;
+  const double tSec = ((double)tick + (double)frameFrac) / 30.0;
+  const double wall = NowSeconds();
+  float dt = 0.0f;
+  if (gCloudPrev.wall >= 0.0) dt = (float)std::clamp(wall - gCloudPrev.wall, 0.0, 0.25);
+  gCloudPrev.wall = wall;
+
+  const float camXM = eye.x * kVoxelMeters, camZM = eye.z * kVoxelMeters;
+  const weather::State st = weather::Resolve(tun, rp.seed, tSec, dt, camXM, camZM);
+  const weather::Preset& w = st.mix;
+  const bool on = st.enabled &&
+                  (w.coverage > 0.001f || w.cirrus > 0.001f || w.precip > 0.001f);
+
+  CloudParams cp{};
+  const uint32_t fullH = (uint32_t)std::max(1.0f, std::round(viewPx));
+  const uint32_t fullW = (uint32_t)std::max(1.0f, std::round(viewPx * aspect));
+  const uint32_t div = (uint32_t)std::clamp(rr.cloudResDiv, 1, 8);
+  const uint32_t lowW = (fullW + div - 1) / div, lowH = (fullH + div - 1) / div;
+  cp.fullW = fullW;
+  cp.fullH = fullH;
+  cp.lowW = lowW;
+  cp.lowH = lowH;
+  cp.resDiv = div;
+
+  // ---- the temporal history ----
+  // Valid only if last frame also marched, into a target of the same size.
+  // Anything else — the first frame, a resize, a portrait drawn between two
+  // game frames at a different size — starts the history over.
+  const bool histValid = on && gCloudPrev.valid && gCloudPrev.lowW == lowW &&
+                         gCloudPrev.lowH == lowH;
+  gCloudPrev.parity ^= 1u;
+  const uint32_t half = lowW * lowH * kCloudHistWords;
+  cp.histCur = gCloudPrev.parity * half;
+  cp.histPrev = (gCloudPrev.parity ^ 1u) * half;
+  cp.flags = (on ? kClfOn : 0u) | (histValid ? kClfHistValid : 0u);
+  // Frames the history has accumulated since it was last reset. The resolve
+  // blends at max(render.cloudTemporal, 1 / (age + 1)): an exact running MEAN
+  // for the first frames after a reset, so a four-frame --shot is the average
+  // of four jittered marches rather than one march with three ghosts on it.
+  gCloudPrev.age = histValid ? gCloudPrev.age + 1 : 0;
+  cp.spare[0] = (float)gCloudPrev.age;
+  cp.frame = ++gCloudPrev.frame;
+  for (int i = 0; i < 3; i++) {
+    cp.prevRight[i] = gCloudPrev.right[i];
+    cp.prevUp[i] = gCloudPrev.up[i];
+    cp.prevFwd[i] = gCloudPrev.fwd[i];
+    cp.eyeDeltaM[i] = (float)(((double)eyeA[i] - gCloudPrev.eye[i]) * (double)kVoxelMeters);
+  }
+  cp.prevTanHalfFov = gCloudPrev.tanHalfFov;
+  cp.prevAspect = gCloudPrev.aspect;
+  // R2 low-discrepancy jitter of the LOW-RES grid: over a handful of frames
+  // the accumulated history has sampled every sub-texel position, which is
+  // the quarter-resolution march paying for a half-resolution image.
+  {
+    const double g = 1.32471795724474602596;
+    const double a1 = 1.0 / g, a2 = 1.0 / (g * g);
+    cp.jitter[0] = (float)(std::fmod(0.5 + a1 * cp.frame, 1.0) - 0.5);
+    cp.jitter[1] = (float)(std::fmod(0.5 + a2 * cp.frame, 1.0) - 0.5);
+  }
+  for (int i = 0; i < 3; i++) {
+    gCloudPrev.right[i] = rp.camRight[i];
+    gCloudPrev.up[i] = rp.camUp[i];
+    gCloudPrev.fwd[i] = rp.camFwd[i];
+    gCloudPrev.eye[i] = (double)eyeA[i];
+  }
+  gCloudPrev.tanHalfFov = rp.tanHalfFov;
+  gCloudPrev.aspect = rp.aspect;
+  gCloudPrev.lowW = lowW;
+  gCloudPrev.lowH = lowH;
+  gCloudPrev.valid = on;
+
+  // ---- the weather ----
+  cp.coverage = w.coverage;
+  cp.cloudType = w.cloudType;
+  cp.density = w.density;
+  cp.precip = w.precip;
+  cp.baseM = w.baseM;
+  cp.thicknessM = w.thicknessM;
+  cp.darkness = w.darkness;
+  cp.cirrus = w.cirrus;
+  cp.cirrusAltM = w.cirrusAltM;
+  cp.precipType = w.precipType;
+  cp.overcast = st.overcast;
+  cp.wetness = st.wetness;
+  cp.mist = w.mist;
+  cp.camM[0] = eye.x * kVoxelMeters;
+  cp.camM[1] = eye.y * kVoxelMeters;
+  cp.camM[2] = eye.z * kVoxelMeters;
+
+  // ---- the drift: every unbounded quantity folded here, in double ----
+  double dx = 0.0, dz = 0.0;
+  CloudDrift(tun, rp.seed, tSec, dx, dz);
+  const double ws = (double)rr.cloudWindScale;
+  dx *= ws;
+  dz *= ws;
+  {
+    const double wn = std::sqrt(dx * dx + dz * dz);
+    // Downwind unit for the towers' lean and the cirrus streaks: the surface
+    // wind's own heading this frame.
+    cp.windX = rp.windDir[0];
+    cp.windZ = rp.windDir[1];
+    (void)wn;
+  }
+  const double shapeS = rr.cloudShapeScaleM, detailS = rr.cloudDetailScaleM;
+  const double weatherS = rr.cloudWeatherScaleM, cirrusS = rr.cloudCirrusScaleM;
+  // Pattern(p - drift): the offset is MINUS the drift, per tile. A slow rise
+  // on the shape's y axis makes the towers boil rather than slide.
+  cp.shapeOff[0] = (float)Wrap(-dx / shapeS, 1.0);
+  cp.shapeOff[1] = (float)Wrap(-tSec * 0.9 / shapeS, 1.0);
+  cp.shapeOff[2] = (float)Wrap(-dz / shapeS, 1.0);
+  cp.detailOff[0] = (float)Wrap(-dx * 1.15 / detailS, 1.0);
+  cp.detailOff[1] = (float)Wrap(-tSec * 2.5 / detailS, 1.0);
+  cp.detailOff[2] = (float)Wrap(-dz * 1.15 / detailS, 1.0);
+  // The weather fields move a little slower than the clouds in them (the
+  // "offset the coverage and texture movement" trick, plan §1c), and morph in
+  // their own time.
+  cp.weatherOff[0] = (float)Wrap(-dx * 0.8 / weatherS, 4096.0);
+  cp.weatherOff[1] = (float)Wrap(-dz * 0.8 / weatherS, 4096.0);
+  cp.weatherEvolve = (float)Wrap(tSec / 1500.0, 4096.0);
+  cp.cirrusOff[0] = (float)Wrap(-dx * 1.8 / cirrusS, 1.0);
+  cp.cirrusOff[1] = (float)Wrap(-dz * 1.8 / cirrusS, 1.0);
+  cp.cirrusEvolve = (float)Wrap(tSec / 4000.0, 1.0);
+
+  // ---- the maps' footprints, snapped to their texel grids ----
+  cp.weatherTexelM = 125.0f;
+  {
+    const double t = cp.weatherTexelM;
+    const double h = (double)kCloudWeatherN * 0.5 * t;
+    cp.weatherOrigin[0] = (float)(std::floor(((double)camXM - h) / t) * t);
+    cp.weatherOrigin[1] = (float)(std::floor(((double)camZM - h) / t) * t);
+  }
+  cp.shadowTexelM = 40.0f;
+  // Just under the lowest local base: the jitter cap mirrors common.wgsl's
+  // cloudBaseJitterM (10% of thickness, at most CLOUD_BASE_JITTER_MAX_M
+  // 150 m). 0.12 x thickness put a storm's plane 200 m below sea level.
+  cp.shadowPlaneM =
+      w.baseM - std::min(0.1f * w.thicknessM, 150.0f) - 0.02f * w.thicknessM;
+  {
+    // Centre the shadow map where the CAMERA's light ray crosses the plane,
+    // so the ground around the player is always inside it. The key light is
+    // the sun by day and moon A by night — keyLightDirP's rule to within the
+    // two-moon tie-break, which only moves the map's centre, never a value.
+    const float* L = sky.sunUp >= 0.5f ? sky.sunDir : sky.moonDir;
+    const double ly = std::max((double)L[1], 0.05);
+    const double up = (double)cp.shadowPlaneM - (double)cp.camM[1];
+    const double qx = (double)camXM + (double)L[0] / ly * up;
+    const double qz = (double)camZM + (double)L[2] / ly * up;
+    const double t = cp.shadowTexelM;
+    const double h = (double)kCloudShadowN * 0.5 * t;
+    cp.shadowOrigin[0] = (float)(std::floor((qx - h) / t) * t);
+    cp.shadowOrigin[1] = (float)(std::floor((qz - h) / t) * t);
+  }
+
+  // ---- lightning ----
+  cp.flash[0] = camXM + st.flashX;
+  cp.flash[1] = w.baseM + w.thicknessM * 0.35f;
+  cp.flash[2] = camZM + st.flashZ;
+  cp.flashAmp = on ? st.flash : 0.0f;
+
+  queue.WriteBuffer(world.cloudUBO, 0, &cp, sizeof(cp));
+
+  // ---- the RenderParams half ----
+  rp.weatherFlags = (on ? kRwfClouds : 0u) |
+                    (on && w.precip > 0.01f && w.coverage > 0.2f ? kRwfRain : 0u);
+  rp.overcast = on ? st.overcast : 0.0f;
+  rp.wetness = on ? st.wetness : 0.0f;
+  // The flash reaches the ground only as the part of it not lost in the deck;
+  // a distant stroke is a glow on the clouds, a close one lights the field.
+  rp.lightning = on ? st.flash * 0.9f : 0.0f;
+  // Mist: rain and fog thicken the air. A multiplier on the far-field fog
+  // density the caller computed, so the horizon still dissolves where the
+  // cascades end — mist only brings it closer.
+  if (on) rp.fogDensity *= 1.0f + w.mist;
+
+  gCloudFrame.on = on;
+  gCloudFrame.lowW = lowW;
+  gCloudFrame.lowH = lowH;
+}
+
 void WriteRenderParams(const rhi::Queue& queue, const World& world,
                        const Vec3& eye, const Camera& cam, float aspect,
                        bool shadows, float time,
@@ -469,6 +765,9 @@ void WriteRenderParams(const rhi::Queue& queue, const World& world,
   }
   IVec3 o = world.WindowOrigin();
   rp.origin[0] = o.x; rp.origin[1] = o.y; rp.origin[2] = o.z;
+  // The clouds and the weather (cloud.wgsl): CloudParams, and the four
+  // RenderParams fields they own. Last, because it scales rp.fogDensity.
+  WriteCloudParams(queue, world, rp, eye, aspect, viewPx, tick, frameFrac, sky);
   queue.WriteBuffer(world.renderUBO, 0, &rp, sizeof(rp));
 }
 
@@ -720,6 +1019,10 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     tp.windSpeedQ = wq.speed;
     tp.windGustQ = wq.gust;
     tp.windMode = (uint32_t)wtun.sim.windMode;
+    // The weather, the sim's copy: rain + damp + wetness in one word, from
+    // the same seed and tick the renderer's sky is resolved on (weather.h
+    // SimRainWord). What "rain" / "rainDamped" reactions read.
+    tp.weatherRain = weather::SimRainWord(wtun, seed, tick);
     // The gas edge (docs/PLAN_gas_particles.md). Read here, from the same
     // tuning snapshot windMode comes from, so the value the kernel branches on
     // and the value Simulation gates Cond::Gas on are one read.

@@ -52,7 +52,11 @@ const std::vector<Gate>& WorldIoGates();
 const std::vector<Gate>& VoxRegionGates();
 const std::vector<Gate>& SpellGates();
 const std::vector<Gate>& PlayerKitGates();
+const std::vector<Gate>& VesselGates();
 const std::vector<Gate>& GrimoireGates();
+// The spell GRAPH (PLAN_spell_graph phase 2): layout, the linearizer, the tree
+// edit ops. CPU-only over glyphs.json and the generated oracle.
+const std::vector<Gate>& SpellGraphGates();
 const std::vector<Gate>& SwingGates();
 const std::vector<Gate>& EquipmentGates();
 const std::vector<Gate>& DyeGates();
@@ -107,6 +111,7 @@ const char* const kOrder[] = {
     // with the other cheap front-loaded checks rather than after them.
     "scale",
     "player-kit",
+    "vessel",
     // With it: `spells-oracle` is pure CPU over glyphs.json and the generated
     // grammar oracle -- no world, no GPU, nothing left behind -- and a parser
     // that disagrees with the reference script should be the first thing a
@@ -115,12 +120,34 @@ const char* const kOrder[] = {
     // And `grimoire`: CPU-only over its own fixtures, beside `player-kit`
     // for the same reasons (plan §12c).
     "grimoire",
+    // And beside it `spell-graph` (PLAN_spell_graph phase 2), for the third
+    // time and the same reason: CPU-only over glyphs.json, the generated
+    // oracle and its own fixtures, milliseconds, nothing left behind. It
+    // belongs next to `spells-oracle` because it asserts the other half of the
+    // same contract -- that parser agrees with the reference script, this that
+    // every tree the parser builds can be SAID again as words.
+    "spell-graph",
+    // ...and `spell-magnitude` beside it (PLAN_spell_magnitude 2.6): the
+    // same CPU-only footing, over the same glyph table.
+    "spell-magnitude",
     // And with them, for the same reason: `swing` is MeleeState alone — no
     // world, no GPU, no assets, its own fixtures — so it costs milliseconds
     // and disturbs nothing. It asserts the swing's INPUT MAPPING, which is the
     // one part of melee no other gate can see (`mob`'s melee subtests drive
     // SetWeaponPose directly and never touch the mouse).
     "swing",
+    // ...and its derivative, immediately after it. `swing-smooth` replays
+    // every authored HELD style through the same driver and asserts that
+    // nothing — hand, point, blade direction, blade roll, arm claim — steps
+    // in one tick. Same cost, same independence: it reads
+    // attack_styles.json and builds its own MeleeState, and touches no world.
+    "swing-smooth",
+    // ...and with them `cut-path`: a cut may be a LIST OF LEGS run inside the
+    // one Cut phase (strokes.h "A CUT IS A PATH"), and nothing in the shipped
+    // library uses one yet, so this is the only gate that would notice a path
+    // that parsed and then ran as a straight line. Its styles are built in
+    // memory and its loader probe is a temp file — milliseconds, no world.
+    "cut-path",
     // AND WITH THEM: `tick-input` is Player alone over a synthetic ground
     // lambda — no world, no GPU, no assets — and it asserts that the
     // controller's trajectory is a function of the COMMAND STREAM and not of
@@ -128,6 +155,12 @@ const char* const kOrder[] = {
     // the same reason `swing` is: a controller that has drifted back onto the
     // frame clock makes every later movement gate measure something else.
     "tick-input",
+    // ...and immediately after it `view-smooth`, which is the same Player,
+    // the same synthetic ground lambda and the same milliseconds, asserting
+    // the RENDER half of what tick-input asserts about the sim half: the
+    // drawn eye and the drawn body are one continuous motion across a step
+    // the controller takes in a single tick.
+    "view-smooth",
     // AND WITH THEM, for the fourth time and the same reason: `net-loopback`
     // is src/net alone — two in-memory Links, one loopback TCP pair, a Hello
     // table and a pure-value pacer. No world, no GPU, no assets, nothing left
@@ -269,6 +302,9 @@ const char* const kOrder[] = {
     // `denoise` is the same shape as `taa` (own worldgen, draws one view two
     // ways, leaves nothing behind) and sits beside it for the same reason.
     "denoise",
+    // `clouds` is the same shape again (own worldgen, draws, leaves nothing
+    // behind — it restores the tuning and the weather pin on the way out).
+    "clouds",
     // With the other render gates: `body-shade` runs its own worldgen and is
     // the one gate that draws a RIGIDBODY. It writes the body instance buffer
     // directly (like `fire-depth`) rather than going through the DebrisSystem,
@@ -276,6 +312,10 @@ const char* const kOrder[] = {
     // matters, because neither of those resets the debris system and both
     // assert over BodyCount().
     "body-shade",
+    // Beside it: the other gate that draws a rigidbody, standing in water. It
+    // leaves a filled basin 45 cells from body-shade's site, clear of that
+    // gate's roof; nothing after it reads that region before regenerating.
+    "underwater-body",
     "player-walk", "player-waterjump", "player-ledgegrab", "player-crouch",
     "player-fastfall",
     "player-plants",
@@ -338,6 +378,9 @@ const char* const kOrder[] = {
     // and patch they make. Neither reads the shared World, so the slot is free
     // — but it has to be AFTER the gates that assert over BodyCount().
     "body-fastfall",
+    // Same shape as `body-fastfall`: pure Jolt, its own bodies 900 voxels out,
+    // all removed before it returns.
+    "big-body-collider",
     // AFTER the debris gates and BEFORE anything that owns bodies of its own.
     //
     // It installs an ownership function on the SHARED DebrisSystem, which
@@ -350,6 +393,14 @@ const char* const kOrder[] = {
     // regenerates the world on the way in so it inherits nothing either.
     "debris-ghost",
     "save-load",   "save-entities", "region-store",
+    // SVR3 codec (PLAN_save_system.md S3). Runs its own worldgen + 150 ticks
+    // and leaves that world behind; chunk-exchange next regenerates on entry.
+    "region-codec",
+    // S4 entity split (PLAN_save_system.md). Regenerates on the way in,
+    // spawns and drops its own fixtures, and puts back the two process
+    // globals it touches (the mob id counter and the celestial clock) on the
+    // way out; the world it leaves behind is one chunk-exchange regenerates.
+    "save-split",
     // BETWEEN region-store and streaming, and the slot is chosen rather than
     // convenient. It regenerates the world several times (four arms, each
     // with its own worldgen and its own ReloadWindow) and it SHIFTS the
@@ -359,7 +410,13 @@ const char* const kOrder[] = {
     // leaves nothing at all. It also regenerates at the origin on the way
     // out, so `streaming` starts where it always did (M9.5-A).
     "chunk-exchange",
-    "streaming",     "spells",
+    // `gen-settle` (PLAN_save_system S2): how many chunks come out MODIFIED
+    // with no player input, attributed. It regenerates on the way in (and
+    // three more times inside), shifts the window 48 chunks in +X, and
+    // regenerates at the origin on the way out -- so it inherits nothing and
+    // `streaming`, which regenerates on the way in anyway, is its neighbour.
+    "gen-settle",
+    "streaming",     "spells",        "spell-timing",
     "page-roundtrip", "daylight-boundary",
     // Support-loss flagging from the MUTATION path. Cheap and
     // self-contained (its own worldgen, an all-stone fixture the CA
@@ -387,6 +444,13 @@ const char* const kOrder[] = {
     // creature at the end. Nothing before it moves (the append is an append),
     // which is the property that makes this safe to run in-suite at all.
     "zombify",
+    // The pack. Beside `zombify` because half its claim IS a rising, and on
+    // the same terms: it regenerates worldgen on the way in and resets mobs
+    // and debris on every exit. It EDITS `human`'s loot table and restores the
+    // pristine def list before it returns — the rule `crowd` states, and it
+    // matters more here because a def left carrying a fixture table would put
+    // two daggers on every villager every other NPC gate spawns.
+    "mob-loot",
     // Mob-vs-mob spacing. Next to `undead` and for the same reasons: it
     // regenerates worldgen on the way in, ticks no fire and pours no acid,
     // and resets mobs and debris on every exit. It also RESTORES the mob defs
@@ -401,6 +465,16 @@ const char* const kOrder[] = {
     // installs an ownership function and clears it again; a gate after it
     // that found one still installed would be measuring ghosts.
     "mob-handoff",
+    // MOBS v4 (PLAN_save_system S5a). Beside `mob-handoff` because it shares
+    // that gate's exit contract: it resets mobs and debris and puts the id
+    // counter back. It ticks nothing and needs no terrain.
+    "mob-save-delta",
+    // S5b (PLAN_save_system). After `mob-save-delta` for the same exit
+    // contract (mobs and debris reset, id counter restored) plus its own: it
+    // teleports the window (ReloadWindow) away and back, saves and loads a
+    // world dir, and so REGENERATES worldgen at the home window on the way
+    // out, removes its park function and clears the store.
+    "mob-park",
     // Armour reactivity, right after `mob-burn` and for the same reasons: it
     // lights real fires and pours real acid at absolute coordinates, and it
     // regenerates the world on the way out so the gates after it still find
@@ -411,6 +485,10 @@ const char* const kOrder[] = {
     // 900 ticks, and it regenerates the world on the way out so the gates
     // after it still find pristine terrain (rule 7).
     "fire-down",
+    // Rain against fire (weather::SimRainWord): lights a leaf sheet at absolute
+    // coordinates under three pinned skies, restores the pin and regenerates
+    // on the way out — fire-down's reasons, fire-down's slot.
+    "rain-fire",
     // ---- THE WINDOW EDGE AS A SINK (docs/PLAN_gas_particles.md §4) --------
     // Straight after `fire-down`, and for exactly the reasons the three gates
     // above it give. Both of these light no fire, but they do the same KIND of
@@ -525,7 +603,11 @@ const char* const kOrder[] = {
     // up, which is about as large a perturbation as this suite has, so they go
     // after even the wound gates. Each restores the id counter and regenerates
     // worldgen on the way out.
-    "npc-strike", "npc-block", "npc-styles", "duel",
+    "npc-strike", "npc-block", "npc-styles",
+    // The same replay, asking what the pose went THROUGH rather than where it
+    // went (game/selfclip.h). Directly after npc-styles because it builds the
+    // identical fixture and restores the world the same way.
+    "rig-clip", "duel",
     // ---- BLOOD IS HEALTH; BURNS CAP IT (Gore §F/§G, 2026-09-02) -----------
     // Appended after the combat gates by the same rule again. Each spawns one
     // creature inside the window and restores the id counter. bleed-out is
@@ -571,12 +653,23 @@ const char* const kOrder[] = {
     // on contact and water rinses it (owner report 2026-09-13). Ticks the
     // world for the last two and regenerates it on the way out.
     "body-stain",
+    // ...and the DEAD take the same coat: a corpse in blood is bloodied and in
+    // water is washed, by the living's own contact pass (owner report
+    // 2026-09-22). Ticks the world and regenerates it on the way out.
+    "corpse-wash",
+    // ...and the three things a corpse did not inherit from the creature it
+    // was: heat crossing its joints, its armour shielding it, and a burst of
+    // blood landing on it (owner report 2026-09-22). Each ticks the world and
+    // regenerates it on the way out.
+    "corpse-crossheat", "corpse-worn", "corpse-splatter", "vessel-grid", "vessel-mpm", "vessel-break",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto
     // the ground through the ordinary particle path. Same room fixture as
     // body-stain, same world regeneration on the way out.
     "body-coat",
+    "mob-rain",
+    "rain-oil",
     // ...and a blast bloodies the HOLE IT MADE and nothing else: a limb the
     // crater took no voxel from stays clean, and the limb it did hit gets a
     // chip's worth of blood rather than a repainted surface (owner report
@@ -615,6 +708,26 @@ const char* const kOrder[] = {
     // (owner report 2026-09-02: the corpse pulsed at its death colour for
     // good). Same world fire as burn-cap, regenerated on the way out.
     "corpse-burn",
+    // ...and a laser through a head kills it in place and bores a hole: hp
+    // does not decapitate, and dead flesh takes the flesh bore, not the rock
+    // melt (owner report 2026-09-22). Pristine ground, CPU only.
+    "laser-head",
+    // ...and the overlap where a limb meets its parent is ONE cell of flesh in
+    // two lattices: rot, a coat or a hole in either copy is in both (owner
+    // report 2026-09-23). Pristine ground, CPU only.
+    "joint-twins",
+    // ...and a CORROSIVE coat (acid) eats the limb it is on, a blood coat does
+    // not, acid displaces blood, and the coat is spent. Pose ticks only.
+    "acid-coat",
+    // ...and on the DEAD: a burst of acid coats a corpse torso, eats it, and
+    // is spent. Ticks the world; regenerated on the way out.
+    "corpse-acid",
+    // ...and a HOT coat (lava) sets the limb alight and eats it, a FUEL coat
+    // (oil) is inert until heat reaches it and then flashes. Pose ticks only.
+    "lava-oil-coat",
+    // ...and a part that comes off keeps its hand: a split forearm drops the
+    // hand with the wrist end, a severed arm stays jointed. Pose ticks only.
+    "severed-hand",
     // ---- NOTHING IS LEFT HANGING (2026-09-03) -----------------------------
     // LAST of everything that touches the shared World except `voxregion`, and
     // that position was EARNED rather than chosen. It first sat at the end of
@@ -662,6 +775,10 @@ const char* const kOrder[] = {
     // against the rig's own idle wobble — so it goes where nothing else can
     // leave a body standing in its fixture.
     "hit-react",
+    // ...and `levitate` after it, by that same rule: it spawns TWO creatures
+    // and lays one of them down, so it is the most disturbing member of the
+    // group rather than the most easily disturbed.
+    "levitate",
     // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
     // As late as it can go, by the rule the `floaters` block above spells out.
     // It regenerates worldgen three times (once per pacing arm and once on the
@@ -689,7 +806,8 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &GrimoireGates(), &SwingGates(),
+                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &GrimoireGates(), &SpellGraphGates(),
+                          &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(),
                           &NetGates()})
@@ -844,8 +962,19 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << (r.status == Status::Pass ? "pass"
           : r.status == Status::Fail ? "fail" : "skip")
       << "\", \"seconds\": " << (int)(r.seconds * 100) / 100.0
-      << ", \"detail\": \"" << detail << "\"}"
-      << (i + 1 < results.size() ? "," : "") << "\n";
+      << ", \"detail\": \"" << detail << "\"";
+    // What the gate MEASURED (RecordObserved), always -- not only under
+    // --rebaseline, which is the one run that writes them into baseline.json.
+    // A gate that reports numbers (terrain, gen-settle) is otherwise only
+    // readable back out of its prose detail line.
+    if (!r.observed.empty()) {
+      f << ", \"observed\": {";
+      for (size_t k = 0; k < r.observed.size(); k++)
+        f << (k ? ", " : "") << "\"" << r.observed[k].first << "\": \""
+          << r.observed[k].second << "\"";
+      f << "}";
+    }
+    f << "}" << (i + 1 < results.size() ? "," : "") << "\n";
   }
   f << "  },\n";
   // ---- THE OP STREAM'S REFUSALS, ALWAYS (docs/PLAN_multiplayer_now.md N3) --

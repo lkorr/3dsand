@@ -1,0 +1,18 @@
+{
+  "label": "Thunderstorm",
+  "about": "Cumulonimbus with anvils, slate-dark bases, heavy rain shafts and lightning. The wet end of the ladder.",
+  "moisture": 0.95,
+  "weight": 0.6,
+  "coverage": 0.82,
+  "cloudType": 0.95,
+  "density": 1.5,
+  "baseM": 700,
+  "thicknessM": 7500,
+  "darkness": 0.75,
+  "cirrus": 0.1,
+  "cirrusAltM": 10000,
+  "precip": 0.95,
+  "precipType": 0.0,
+  "mist": 1.8,
+  "lightning": 7.0
+}

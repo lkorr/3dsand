@@ -527,6 +527,7 @@ Player::Box Player::BoxFor(bool crouched) const {
 }
 
 void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
+  slideVel = Vec3{0, 0, 0};  // re-derived below, and only on slippery ground
   const Vec3& flatFwd = in.flatFwd;
   const Vec3& right = in.right;
   const Vec3& lookFwd = in.lookFwd;
@@ -569,7 +570,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     } else if (crouching && !Collides(pos, BoxFor(false), kindAt)) {
       crouching = false;
     }
-    viewYOffset -= EyeOffsetNow() - eyeBefore;
+    BankEyeShift(EyeOffsetNow() - eyeBefore);
   }
   const Box b = CurrentBox();
 
@@ -578,13 +579,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
   // distance every viewSmoothHalflife seconds at any FPS). Decayed BEFORE this
   // frame's snaps are accumulated so the frame a step lands on starts fully
   // compensated. See Player::ViewEyePos().
-  {
-    const float hl = T().viewSmoothHalflife;
-    if (hl > 1e-4f)
-      viewYOffset *= std::pow(0.5f, dt / hl);
-    else
-      viewYOffset = 0.0f;  // knob at 0 disables smoothing entirely
-  }
+  DecayViewSmooth(dt, T().viewSmoothHalflife);
 
   // ---- unstick: eject a body that is already inside solid ground ----
   //
@@ -606,7 +601,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     if (rise > 0.0f) {
       float step = std::min(rise, (T().unstickSpeed / kVoxelMeters) * dt);
       pos.y += step;
-      viewYOffset -= step;
+      BankVerticalSnap(step);
       if (vel.y < 0.0f) {
         // Being dug out of solid is a landing too: the body got here fast
         // enough to end up buried (a fall the sweep resolved into an overlap,
@@ -747,9 +742,8 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
       }
       // Bank the climb into the view offset like a step-up, so the camera glides
       // out of the water instead of snapping up it.
-      viewYOffset -= pos.y - yBefore;
-      viewYOffset = std::clamp(viewYOffset, -(float)kMaxStepUpVoxels,
-                               (float)kMaxStepUpVoxels);
+      BankVerticalSnap(pos.y - yBefore);
+      ClampViewSmooth((float)kMaxStepUpVoxels);
 
       // Done when we arrive, or when the timer runs out — the timeout is what
       // stops a mantle that got blocked mid-climb (collapsed bank, a body shoved
@@ -879,9 +873,8 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
       }
       // Bank the settle into the view offset like every other scripted
       // vertical move, so the eye eases down to the dead hang.
-      viewYOffset -= pos.y - yBefore;
-      viewYOffset = std::clamp(viewYOffset, -(float)kMaxStepUpVoxels,
-                               (float)kMaxStepUpVoxels);
+      BankVerticalSnap(pos.y - yBefore);
+      ClampViewSmooth((float)kMaxStepUpVoxels);
       impactDeltaV = {0, 0, 0};
       return;  // scripted: no gravity, no walk this frame
     }
@@ -897,7 +890,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     grounded = false;
     hanging = false;  // no timer guards the grip, so fly must open it
     coyoteTimer = 0.0f;
-    viewYOffset = 0.0f;  // fly motion is deliberate: never smooth it
+    ResetViewSmooth();  // fly motion is deliberate: never smooth it
     impactDeltaV = {0, 0, 0};
   } else {
     const float nonJumpSpeed = T().nonJumpSpeed / kVoxelMeters;
@@ -969,11 +962,29 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // rate and converted with 1-exp(-rate*dt): lerping by a bare constant every
     // frame (what this used to do) made acceleration and water drag scale with
     // frame rate, so the same input felt different at 30 and 144 FPS.
-    float rate = onGround ? T().groundAccel
+    float rate = onGround ? T().groundAccel * groundGrip
                           : (inLiquid ? T().liquidAccel : T().airAccel);
     float blend = 1.0f - std::exp(-rate * dt);
     vel.x += (wish.x - vel.x) * blend;
     vel.z += (wish.z - vel.z) * blend;
+    // THE SLIDE (see slideVel in player.h): on slippery footing, the part of
+    // the horizontal velocity the legs are not driving. What the input asks
+    // for is walked -- velocity along the wish direction, up to the wish speed
+    // -- and everything else (the coast after letting go, the drift across a
+    // turn, the overshoot past a slower wish) is carried. Weighted by how
+    // slippery the footing is, so a sheen that barely costs grip barely slides.
+    if (onGround && groundGrip < 1.0f && T().slipGrip < 1.0f) {
+      const float w =
+          std::clamp((1.0f - groundGrip) / (1.0f - T().slipGrip), 0.0f, 1.0f);
+      const Vec3 h{vel.x, 0, vel.z};
+      Vec3 walk{0, 0, 0};
+      const float wl = wish.len();
+      if (wl > 1e-3f) {
+        const Vec3 d = wish * (1.0f / wl);
+        walk = d * std::clamp(h.x * d.x + h.z * d.z, 0.0f, wl);
+      }
+      slideVel = (h - walk) * w;
+    }
 
     // ---- jump: buffered press + coyote window, both consumed on use ----
     // Frame-local: "did we launch on THIS frame", read by the ground snap
@@ -1100,8 +1111,11 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
         onGround ? StepSlide(pos, vel.x * dt, vel.z * dt, b, kindAt) : 0.0f;
     // The climb is an instantaneous vertical snap of the BODY; cancel it in
     // the view offset so the eye stays put this frame and glides up as the
-    // offset decays. Horizontal motion is untouched — stays 1:1.
-    viewYOffset -= climbed;
+    // offset decays, and move the render lerp's start with it so the tick
+    // interpolation does not re-add it (Player::BankVerticalSnap — this is the
+    // site that made walking up a hill judder). Horizontal motion is untouched
+    // — it IS travel along the segment, and stays 1:1.
+    BankVerticalSnap(climbed);
     if (!onGround) {
       // Airborne: plain slide, no stepping (both Quake and Source refuse to
       // step while off the ground).
@@ -1132,7 +1146,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
         // Downward twin of the step-up compensation: the snap teleports the
         // body onto the lower surface, so bank the drop (positive) into the
         // view offset and let the eye follow it down over the half-life.
-        viewYOffset += yBefore - pos.y;
+        BankVerticalSnap(pos.y - yBefore);
         if (vel.y < 0.0f) vel.y = 0.0f;
       }
     }
@@ -1207,7 +1221,7 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
     // as well as a step: whichever of the two is larger.
     const float maxOff = std::max((float)kMaxStepUpVoxels,
                                   BoxFor(false).yHi - BoxFor(true).yHi);
-    viewYOffset = std::clamp(viewYOffset, -maxOff, maxOff);
+    ClampViewSmooth(maxOff);
   }
 
   // No world-bounds clamp: the world is infinite (toroidal streaming follows

@@ -891,6 +891,17 @@ constexpr uint32_t kMaxCellOpsPerTick = 65536;
 // stored word are now the stain layer (below) and a CellOp carries real stain
 // bits through to the grid.
 constexpr uint32_t kCellOpIfAir = 0x80000000u;
+// THE CONDITIONAL CLEAR: "empty this cell, but only if it still holds material
+// M". kCellOpIfAir on a word whose material is AIR would be "write air where
+// there is air" -- a no-op nobody needs -- so that combination is reused, with
+// M in bits 12..23 (sim_mutate.wgsl `cells`). It exists for the vessels
+// (game/container.h): a scoop is decided off a snapshot one tick old, and
+// liquid moves, so an unconditional clear would delete whatever flowed into
+// the cell since -- sand, a plant, somebody's foot. Refused ops cost the
+// scooper nothing but accuracy; they never cost the world matter.
+inline uint32_t CellOpClearIfMat(uint32_t mat) {
+  return kCellOpIfAir | ((mat & 0xFFFu) << 12);
+}
 
 // ---- the voxel word ----
 // bits 0..11 material, 12..15 state, 16..18 tick-stamp, 19..23 excite scratch,
@@ -1044,7 +1055,13 @@ constexpr uint64_t kOpennessBytes =
 // a walk tick like any other). The third is per window COLUMN and stays
 // kNChunk^2: a ticket has no place in the window's (x, z) column grid, and the
 // refresh cursor that reads it only ever walks window slots.
-constexpr uint32_t kOpennessGenWords = 2 * kNumSlots + kNChunk * kNChunk;
+// A FOURTH plane after the columns, per slot: the ray-blocker signature of the
+// chunk at its last DIRTY walk (sim_openness.wgsl OPEN_SIG_BASE). A dirty chunk
+// whose blockers have not changed is skipped by the dirty pass -- it is then
+// exactly a chunk that was not dirty, which the touch plane already handles.
+// That is a burning forest's smoke: thousands of chunks awake for gas, which
+// is not a blocker (2026-09-22, 2.7 ms/frame of opennessDirty).
+constexpr uint32_t kOpennessGenWords = 3 * kNumSlots + kNChunk * kNChunk;
 constexpr uint64_t kOpennessGenBytes = (uint64_t)kOpennessGenWords * 4;   // 260 KiB
 
 // ---- the IRRADIANCE grid (docs/PLAN_gi.md §3, W3 P1) -----------------------
@@ -1513,6 +1530,14 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //   [18]     LAST fault: the page-table entry (racy store)
 //   [19]     reserved
 //   [20..32] per-kernel fault tally, indexed by PT_K_*
+//   [33..35] reserved (tally headroom: PT_K_COUNT may grow)
+//   [36]     THE SCOOP LEDGER (game/container.h): eighths of a cell that
+//            CONDITIONAL CLEARS (CellOpClearIfMat) actually removed, monotonic.
+//            Not a fault; it lives here because sim_mutate already binds this
+//            record atomically and the snapshot already copies it, so the
+//            one number a vessel needs back from the GPU costs no binding.
+//   [37]     conditional clears applied, monotonic
+//   [38]     conditional clears REFUSED (the cell no longer held the material)
 //
 // [16]/[18] are what separate a FREED page (PT_EMPTY) from a DEMOTED one
 // (UNIFORM / JITTER): the first is the hysteresis free path, the second is
@@ -1531,6 +1556,9 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 // complaint. Sized with headroom for the same reason kMaxUses is.
 constexpr uint32_t kPageFaultWords = 40;
 constexpr uint32_t kPageFaultBytes = kPageFaultWords * 4;
+constexpr uint32_t kPageFaultScoopEighths = 36;
+constexpr uint32_t kPageFaultScoopApplied = 37;
+constexpr uint32_t kPageFaultScoopRefused = 38;
 
 // ---- fluidArgsStage: the FA_* word map -------------------------------------
 // The seam's counter block (common.wgsl's FA_* names, plus the two refusal-site
@@ -2635,7 +2663,13 @@ struct TickParams {
   // to `genAct` and leaves dirtyIn/dirtyOut CLEARED for the slots it wrote,
   // instead of waking them itself. Set only by Stream::ShiftAxis.
   uint32_t genDeferWake = 0;
-  uint32_t pad_wp1 = 0;
+  // THE WEATHER, the SIM's copy (weather::SimRainWord; was the pad_wp1 pad
+  // word, so the struct layout is unchanged). Bits 0..7 rain reaching the
+  // ground, 8..15 the ignition damp strength, 16..23 ground wetness — see
+  // materials.h kRain*. Read by reactions authored "rain" (douse) and
+  // "rainDamped" (ignition), in the CA, the gas edge and the body burners.
+  // 0 = a dry sky and every such rule takes its dry path.
+  uint32_t weatherRain = 0;
   int32_t windPrimLo[3] = {1, 1, 1};   // union AABB of every live primitive,
   int32_t pad_wp2 = 0;                 // inclusive world cells (lo > hi = none)
   int32_t windPrimHi[3] = {0, 0, 0};
@@ -2911,6 +2945,15 @@ constexpr uint32_t kMaxParticleSpawnsPerTick = 4096;
 // note in common.wgsl for why both properties are forced rather than optional.
 constexpr uint32_t kPFlagAlive = 1u;
 constexpr uint32_t kPFlagMicro = 4u;
+// POURED, not thrown: the particle kernel skips the wind drag for it and
+// nothing else (sim_particle.wgsl PFLAG_CALM, which must agree -- it is
+// declared in that shader, its only reader). Set by game/container.h.
+constexpr uint32_t kPFlagCalm = 16384u;
+// A DRIP off a wet body (MobSystem::WetOneLimb): a micro droplet that lands
+// and vanishes WITHOUT staining what it hit -- the world's wet stain never
+// dries, so a dripping creature must not paint a trail. Declared in
+// sim_particle.wgsl as PFLAG_DRIP, its only reader, which must agree.
+constexpr uint32_t kPFlagDrip = 32768u;
 constexpr uint32_t kPMicroScaleShift = 3, kPMicroScaleMask = 3u;
 constexpr uint32_t kPMicroLifeShift = 5, kPMicroLifeMask = 0xFFu;
 
@@ -2993,7 +3036,12 @@ struct RenderParams {
   // — spend padding before adding more (world.h's note on the bound-size
   // validation above).
   uint32_t eclipseBody = 0;   // 0 none, 1 moon A in front of the sun, 2 moon B
-  uint32_t pad_dn0 = 0;
+  // ---- the sky's weather (src/sim/weather.h; spent from the old pad_dn0) ----
+  // bit 0 (RWF_CLOUDS): the cloud buffers were written this frame and may be
+  // read (cloud.wgsl). Clear when weather.clouds is off, and then no shader
+  // reads a cloud binding at all. bit 1 (RWF_RAIN): precipitation reaches the
+  // ground somewhere near the camera, so the streak overlay runs.
+  uint32_t weatherFlags = 0;
 
   float moon2Dir[3] = {0.0f, -1.0f, 0.0f};
   float moon2Phase = 0.5f;
@@ -3015,7 +3063,17 @@ struct RenderParams {
   float solarEclipse = 0.0f;
   // Fraction of moon B's disc hidden behind moon A. Render-only.
   float lunarEclipse = 0.0f;
-  float pad_dn1 = 0.0f, pad_dn2 = 0.0f;
+  // How much of the dome is under cloud, 0..1 (weather::State::overcast). The
+  // shared hemisphere ambient (ambientAtP, common.wgsl) greys and softens by
+  // it, so every shading path — terrain, far field, bodies — agrees that the
+  // sun went in. The DIRECT light is not scaled here: it is shadowed per
+  // position by the cloud shadow map, which is what makes the shadows of
+  // individual clouds cross the ground.
+  float overcast = 0.0f;
+  // How soaked exposed ground is, 0..1 (weather::State::wetness): darker
+  // albedo and a sheen on sky-facing surfaces. Render-only; the world's own
+  // wet STAIN is a different, sim-side thing (plan §2.5 tier 2).
+  float wetness = 0.0f;
 
   // The CELESTIAL POLE in the local horizon frame — the axis the starfield
   // wheels about. It is an OUTPUT of latitude (the pole sits at elevation =
@@ -3039,7 +3097,10 @@ struct RenderParams {
   // partway through the row solarEclipse opens. The two pads above are what
   // close that row, and the one below closes this one.
   float poleDir[3] = {0.0f, 1.0f, 0.0f};
-  float pad_dn3 = 0.0f;
+  // Lightning this frame, 0 = none, ~1 = a close stroke. Added to the shared
+  // ambient as a cold white flash (ambientAtP) and to the clouds' own
+  // emission at the stroke (cloud.wgsl). Spent from the old pad_dn3.
+  float lightning = 0.0f;
 
   // ---- MPM fluid render bounds (PLAN_fluid_overhaul.md §7 item 5) ---------
   // Inclusive world-VOXEL AABB of everything the fluid surface march can
@@ -3171,6 +3232,109 @@ struct RenderParams {
 };
 static_assert(sizeof(RenderParams) % 16 == 0,
               "RenderParams must be a whole number of std140 rows");
+
+// RenderParams.weatherFlags bits. Mirrored as RWF_* in common.wgsl.
+constexpr uint32_t kRwfClouds = 1u;  // cloud buffers valid this frame
+constexpr uint32_t kRwfRain = 2u;    // precipitation near the camera
+
+// ---- THE CLOUDS (cloud.wgsl, src/sim/weather.h, DESIGN.md §9.w) ------------
+// Render-only derived data, in the sense DESIGN.md §9 gives the far cascades:
+// produced on the GPU every frame from the weather and the clock, read by the
+// raymarcher and the raster bodies, never read by the sim, never hashed, never
+// saved. Every size below is a SHIFT-free literal so check_invariants.py can
+// scrape it, and each is mirrored in cloud.wgsl / common.wgsl (CLOUD_* consts)
+// — the prelude deliberately does NOT carry them, because a prelude constant
+// re-keys the SPIR-V cache of every shader in the engine (CLAUDE.md).
+//
+// kCloudShapeN   edge of the tileable SHAPE noise volume: Perlin-Worley in R,
+//                Worley fBm at three frequencies in G/B/A, RGBA8 per texel.
+//                Baked once on the GPU (cloud.wgsl `noise`); 8 MiB.
+// kCloudDetailN  edge of the DETAIL (erosion) volume, Worley fBm x3; 128 KiB.
+// kCloudWeatherN the per-frame WEATHER MAP around the camera: local coverage,
+//                cloud type, rain, base jitter. 512^2 at weatherTexelM.
+// kCloudShadowN  the per-frame CLOUD SHADOW map: transmittance to the key
+//                light through the deck, indexed at the deck-base plane so
+//                one texel serves every receiver along its light ray.
+// kCloudEnvN     octahedral cloud ENVIRONMENT map: what the sky looks like
+//                through the clouds in every direction, for fog, reflections
+//                and anything else that integrates over a solid angle (the
+//                sky-tier rule — gotcha-sky-tiers-fog-target).
+constexpr uint32_t kCloudShapeN = 128;
+constexpr uint32_t kCloudDetailN = 32;
+constexpr uint32_t kCloudWeatherN = 512;
+constexpr uint32_t kCloudShadowN = 256;
+constexpr uint32_t kCloudEnvN = 64;
+constexpr uint64_t kCloudNoiseWords =
+    (uint64_t)kCloudShapeN * kCloudShapeN * kCloudShapeN +
+    (uint64_t)kCloudDetailN * kCloudDetailN * kCloudDetailN;
+// cloudMaps = [shadow: N^2 f32][env: E^2 x 2 words (pack2x16float rgb, T)]
+//             [probe: 8 words — 0..3 the weather map AT THE CAMERA: coverage,
+//              type, rain, jitter as f32, written by the weather pass so the
+//              raymarcher's rain overlay knows whether it is raining HERE;
+//              4..6 the wind averaged over a 20 m disc round the camera,
+//              m/s f32, written by the env pass — what the rain streaks lean
+//              along; 7 spare]
+constexpr uint32_t kCloudProbeWords = 8;
+constexpr uint64_t kCloudMapsWords =
+    (uint64_t)kCloudShadowN * kCloudShadowN +
+    (uint64_t)kCloudEnvN * kCloudEnvN * 2 + kCloudProbeWords;
+// Per low-res pixel: raw = 4 words (pack2x16float (r,g), (b,T), (Td,-) + depth
+// f32), history = 3 words (the first three), ping-ponged. T is the total
+// transmittance INCLUDING the aerial haze in front of the cloud; Td is the
+// DIRECT transmittance without it. The composite needs both: haze is
+// in-scattered airlight, so it may lighten a cloud toward the sky behind it
+// but must never let the sun disc or a star shine through a thick one.
+constexpr uint32_t kCloudRawWords = 4;
+constexpr uint32_t kCloudHistWords = 3;
+
+// CloudParams.flags bits. Mirrored as CLF_* in common.wgsl.
+constexpr uint32_t kClfOn = 1u;         // march and composite this frame
+constexpr uint32_t kClfHistValid = 2u;  // history may be reprojected
+constexpr uint32_t kClfBake = 4u;       // the noise volume needs (re)baking
+
+// The cloud pass's own uniform. Must match CloudParams in common.wgsl, field
+// for field (check_invariants.py `params`). Written ONCE per rendered frame by
+// WriteRenderParams, next to RenderParams, from the same resolved weather.
+//
+// Everything that GROWS without bound over a session — the wind advection of
+// three noise fields — is folded on the CPU in DOUBLE and handed over already
+// wrapped to 0..1 of its tile (the *Off fields). The shader never sees a
+// "seconds since boot" times a speed, which is the f32 cancellation that turns
+// drifting clouds into jittering ones after an hour.
+struct CloudParams {
+  float prevRight[3]; uint32_t flags;
+  float prevUp[3];    uint32_t frame;
+  float prevFwd[3];   float prevTanHalfFov;
+  // cur eye - prev eye in METRES, differenced in double (taa.wgsl's reason).
+  float eyeDeltaM[3]; float prevAspect;
+  uint32_t lowW = 0, lowH = 0, fullW = 0, fullH = 0;
+  // Word offsets of the two history halves: `histCur` is written this frame
+  // and is what the composite reads; `histPrev` is last frame's.
+  uint32_t histCur = 0, histPrev = 0, resDiv = 2, pad_c0 = 0;
+  // ---- the weather (weather::State::mix) ----
+  float coverage = 0.0f, cloudType = 0.5f, density = 1.0f, precip = 0.0f;
+  float baseM = 1400.0f, thicknessM = 1600.0f, darkness = 0.0f, cirrus = 0.0f;
+  float cirrusAltM = 8000.0f, precipType = 0.0f, overcast = 0.0f, wetness = 0.0f;
+  // Camera in absolute world METRES (voxel coords x kVoxelMeters).
+  float camM[3]; float mist = 0.0f;
+  // Wrapped advection offsets, in TILE units (0..1).
+  float shapeOff[3]; float weatherEvolve = 0.0f;
+  float detailOff[3]; float cirrusEvolve = 0.0f;
+  // The weather map's texel 0 corner, absolute metres, snapped to its texel
+  // grid so the map does not swim as the camera moves.
+  float weatherOrigin[2]; float weatherTexelM = 125.0f; float shadowTexelM = 40.0f;
+  // The shadow map's texel 0 corner at the deck-base plane, and that plane.
+  float shadowOrigin[2]; float shadowPlaneM = 1400.0f; float pad_c1 = 0.0f;
+  float weatherOff[2]; float windX = 0.0f, windZ = 1.0f;
+  // Lightning stroke: absolute metres (x, altitude, z) and brightness.
+  float flash[3]; float flashAmp = 0.0f;
+  // This frame's sub-pixel jitter of the LOW-RES grid, in low-res pixels, and
+  // the cirrus deck's own wrapped advection.
+  float jitter[2]; float cirrusOff[2];
+  float spare[4];
+};
+static_assert(sizeof(CloudParams) % 16 == 0,
+              "CloudParams must be a whole number of std140 rows");
 // Dilation applied to the fluid render AABB, world voxels. Two chunks: one for
 // the snapshot's readback latency (>= 5 ticks of travel at the CFL ceiling),
 // one for `fluidChunkActive`'s face-neighbour reach.
@@ -3409,6 +3573,11 @@ struct WorldSnapshot {
   uint32_t gasDied = 0;          // decay / outer box / ceiling
   uint32_t gasAboveWindow = 0;   // live parcels above the window's top face
   uint32_t tick = 0;                  // sim tick this snapshot was captured at
+  // World::TicksEncoded() as of the tick that encoded this copy: one per tick,
+  // gap-free, and immune to the harness restarting its tick numbers. The save
+  // path proves "every tick since the window was filled had its dirty flags
+  // folded" by walking these (Stream::FoldSnapshot, PLAN_save_system.md S1).
+  uint32_t submitSeq = 0;
   std::vector<uint8_t> dirtyFlags;    // per-chunk next-tick dirty (kNumChunks)
   // Per-chunk support-loss flags (kNumChunks): the sim saw a supporting voxel
   // (solid/powder) vacate next to a solid there since the last readback.
@@ -3442,6 +3611,13 @@ struct WorldSnapshot {
   // which is what turns §2.4's structural claim into a measurement made on
   // every run rather than in a special configuration.
   uint32_t pageFaults = 0;
+  // The scoop ledger (pageFaults record [36..38], see kPageFaultScoop*): what
+  // the vessels' conditional clears really took, monotonic, as of `tick`.
+  // Zeroed with the rest of the record by a page-table reset or a worldgen,
+  // which a reader sees as the total going DOWN.
+  uint32_t scoopEighths = 0;
+  uint32_t scoopApplied = 0;
+  uint32_t scoopRefused = 0;
   // ---- MLS-MPM fluid (seam) ----
   // The GPU-owned live particle count and the fluidArgsStage event counters
   // (the FA_* map in common.wgsl) as of this snapshot's tick. fluidLive is
@@ -3928,6 +4104,22 @@ class World {
   const WorldSnapshot& LatestDelivered() const {
     return ready_.empty() ? snap_ : ready_.back();
   }
+
+  // ---- THE SAVE PATH'S VIEW OF THE PIPELINE (PLAN_save_system.md S1) ------
+  //
+  // A save stores only the chunks that differ from what genChunk would make,
+  // and "differs" is the union of every tick's dirty flags since the window
+  // was filled. Snap() is K ticks behind, so the save also needs the K
+  // snapshots that are delivered but not yet published, and a way to prove
+  // none is missing. Read-only, derived consumers only — the same rule as
+  // LatestDelivered: NOTHING THAT FEEDS THE SIM MAY READ THESE.
+  //
+  // TicksEncoded: one per EncodeReadbacks call, i.e. one per sim tick
+  // (the readback is unconditional since N1), counted BEFORE the ring can
+  // decline — so a tick with no snapshot is a visible hole in submitSeq.
+  uint32_t TicksEncoded() const { return ticksEncoded_; }
+  uint32_t SnapshotEpoch() const { return snapEpoch_; }
+  const std::deque<WorldSnapshot>& DeliveredUnpublished() const { return ready_; }
   const SnapshotPipeStats& SnapshotPipe() const { return snapPipe_; }
   SnapshotPipeStats TakeSnapshotPipe() {
     const SnapshotPipeStats s = snapPipe_;
@@ -4221,6 +4413,7 @@ class World {
   rhi::Buffer passUBO;     // 27 slices * 256 B (3x3x3 color phases)
   rhi::Buffer opsBuf;      // kMaxOpsPerTick BrushOp
   rhi::Buffer renderUBO;   // RenderParams
+  rhi::Buffer cloudUBO;    // CloudParams (render-only; WriteRenderParams)
   rhi::Buffer dirtyViz;    // kNumChunks u32, CPU-uploaded snapshot for debug overlay
   rhi::Buffer actVoxViz;   // per-voxel activity bits (packed u32), debug overlay
   // ---- shadow cache (the kShadowCacheBuckets block above) ----
@@ -4414,6 +4607,15 @@ class World {
   rhi::Buffer farList;  // kFarListCap entries: (level-1)<<kFarSlotShift | slot
   rhi::Buffer farUBO;   // FarParams
   rhi::Buffer farPatch; // per-fill edit patches (kFarPatch* above)
+  // One u32 per slot: a signature of the chunk's far-visible matter (every
+  // cell farCellIsSolid keeps, keyed by position and material, mixed with the
+  // world chunk coord and the level origins) as of its last `fardown`. A dirty
+  // chunk whose signature has not moved is skipped: nothing the cascade can
+  // show has changed. That is most of a burning forest, whose ~5,000 awake
+  // chunks are awake for SMOKE, which the cascade never holds (2026-09-22:
+  // 15.4 ms/frame of fardown). Derived, zero-initialised; FarField zeroes it
+  // on every reset / full refill so a re-filled level is downsampled afresh.
+  rhi::Buffer farSig;
 
   // The CPU's far-field edit index (src/sim/faredits.h), owned by Stream —
   // it is fed by the same eviction path that fills the ChunkStore, and that
@@ -4480,6 +4682,7 @@ class World {
     uint32_t particleLivePage = 0;
     uint32_t tick = 0;
     uint32_t epoch = 0;  // pipeline epoch at encode time (see snapEpoch_)
+    uint32_t seq = 0;    // ticksEncoded_ at encode time (WorldSnapshot::submitSeq)
     std::vector<IVec3> fetchIds;  // world chunks riding this slot
     // Sentinel slots are not copied at all (§2.1a); their table entry is
     // recorded here at encode time and their 4,096 words are synthesized on
@@ -4514,6 +4717,7 @@ class World {
   // which unsigned arithmetic would otherwise read as "four billion ticks in
   // the future".
   uint32_t snapEpoch_ = 0;
+  uint32_t ticksEncoded_ = 0;  // see TicksEncoded(); monotonic, never reset
   uint32_t lastEncodeTick_ = 0;
   bool haveEncodeTick_ = false;
   SnapshotPipeStats snapPipe_;

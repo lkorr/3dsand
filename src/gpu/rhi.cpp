@@ -61,6 +61,10 @@ void RenderPass::DrawIndirect(const Buffer& args, uint64_t offset) const {
   p_->DrawIndirect(args, offset);
 }
 
+void RenderPass::SplitAfterFragmentWrite(const Buffer& written) const {
+  p_->SplitAfterFragmentWrite(written);
+}
+
 void RenderPass::End() const { p_->End(); }
 
 // ------------------------------------------------------ CommandEncoder ----

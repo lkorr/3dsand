@@ -1,0 +1,18 @@
+{
+  "label": "Clear",
+  "about": "A cloudless sky with a faint veil of cirrus. The dry end of the ladder.",
+  "moisture": 0.0,
+  "weight": 1.2,
+  "coverage": 0.0,
+  "cloudType": 0.4,
+  "density": 1.0,
+  "baseM": 1500,
+  "thicknessM": 1400,
+  "darkness": 0.0,
+  "cirrus": 0.14,
+  "cirrusAltM": 9000,
+  "precip": 0.0,
+  "precipType": 0.0,
+  "mist": 0.0,
+  "lightning": 0.0
+}

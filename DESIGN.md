@@ -23,7 +23,7 @@ procedurally generated world, alchemy, spells, and online multiplayer.
 | Simulation location | **GPU compute shaders** (CA, particles, worldgen) | Proven viable at 100M+ voxel scale; CPU cannot touch this throughput |
 | What stays on CPU | Rigidbodies, gameplay, projectiles, networking, streaming | Needs branching logic, engine APIs, and authoritative game state |
 | Voxel format | **16 bits: 12-bit material ID + 4-bit state** | 4,096 materials; ~200 MB for a 512³-scale resident region |
-| Chunk size | **16³ voxels (4,096 voxels, 8 KB)** | Fine-grained dirty/sleep granularity; cheap streaming unit |
+| Chunk size | **16³ voxels (4,096 voxels, 16 KiB of 32-bit words)** | Fine-grained dirty/sleep granularity; cheap streaming unit |
 | Sim tick rate | **Fixed 30 Hz**, decoupled from render | Determinism of *timing*, halves sim cost vs 60, imperceptible for sand |
 | Race handling in CA | **3×3×3 cell-coloring — 27 passes/tick** (deterministic by construction); atomics-CAS as an opt-in optimization | Same-color cells are ≥3 apart on every axis while movement reach is ≤1, so destination writes are provably disjoint: race-free AND bit-deterministic across GPUs — keeps lockstep networking and replay debugging viable (see §4 for why chunk-level checkerboarding alone is insufficient) |
 | Materials | **Data-driven JSON → compiled to GPU lookup tables**, hot-reloadable | Moddability requirement; iteration speed |
@@ -255,7 +255,7 @@ one opaque colour. And **the palette is per-document, merged at load**: colours
 are deduplicated across mob defs, so 128 slots cover a whole cast.
 
 ### Chunks
-- **16³ voxels = 8 KB per chunk.**
+- **16³ voxels = 16 KiB per chunk** (4,096 32-bit words since the stain layer widened the word).
 - Resident region: a rolling N³-chunk cube centered on the player (initial target
   N = 32 → 512³ voxels ≈ 134M voxels ≈ 268 MB device memory; tune to hardware).
 - **Toroidal addressing**: the resident array never shifts in memory. Moving the
@@ -305,6 +305,29 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   directory per session; regen detaches without deleting files, so the last
   explicit save survives until the next save overwrites it. The old
   monolithic `.svx` (SVX2) format is retired.
+- **Region files are compressed (`SVR3`, 2026-09-22, PLAN_save_system.md S3).**
+  RAM is unchanged — the store still holds `(run, word)` RLE, and `Get`,
+  `ForEachStored`, the M9.5 exchange and `FarEdits` see exactly that; only the
+  disk encoding moved. Each chunk is one independently decodable record
+  (`wc`, `len | codec<<28`, payload) in a region file whose header carries the
+  SEED the records were encoded against. The payload is the smaller of the raw
+  RLE pairs (a one-run chunk stays 8 bytes; anything with bits outside
+  `kPersistMask` or a malformed run structure is kept verbatim) and zstd
+  (level 3) over four byte planes: material low byte, material high nibble,
+  state nibble XOR the palette variant worldgen would have given the cell
+  (`JitterStateFor` via its row form; air predicts 0; no material-table
+  lookups, so a save's meaning cannot depend on `materials.json`), stain byte.
+  Untouched jittered terrain reads as zero state. Measured on the determinism
+  script's world (150 ticks of sand, water, lava, fire, seeds, melt laser,
+  crater and pool blast; 968 chunks read back, 200 of them modified vs fresh
+  worldgen): modified chunks 2.31 MB SVR2 -> 99.6 KB SVR3 (23x; ~500 B per
+  modified chunk), the whole box 10.2 MB -> 157 KB (64x); encode ~37 us and
+  decode ~33 us per multi-run chunk. zstd 1 was within 1% of 3 on bytes;
+  9 bought 14% for 2.5x the encode time. `SVR2` still loads and is rewritten
+  as `SVR3` region by region as regions go dirty; `SVR1` is still refused.
+  Gate: `region-codec` (round-trip at 1/3/9, store read back under a wrong
+  `SetSeed`, hand-written SVR2 load + upgrade, and
+  `regionCodec.modifiedRatioMin` in `tests/baseline.json`).
 - **Save-format hardening + entity persistence (2026-08-22, worldio.h):**
   `meta.svm` is `'SVM4'` and now records the exact BIT PATTERN of
   `kVoxelMeters` and the full material NAME table alongside `kWorldN`/`kChunk`;
@@ -325,6 +348,132 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   invariant holds from tick one); anything saved mid-flight lands where it
   was, accepted. Entity state is CPU-float gameplay state outside the hashed
   domain (§7), so the grid hash round-trip is unchanged.
+- **Entity state is split by owner (2026-09-23, `docs/PLAN_save_system.md`
+  S4; supersedes the single `entities.sve` above).** Three files instead of
+  one: **`r_x_y_z.sve`** beside each region's `.svr` holds the world-anchored
+  entities that bucket one by one (`MOBS` one `Mob::SaveOne` per creature,
+  `ITMS` one entry per ground item), each in the region containing its
+  position at save time, as framed records (`'SVX1'`: section FourCC, section
+  version, position, bytes) so one record can be appended or taken without
+  reading any other; **`world.sve`** (the old SVE1 TLV container) holds the
+  world's non-local state — `DBRS` debris, `WTRB` discovered water bodies,
+  `MOBG` the mob id counter (restored as a max, so a loaded world never
+  re-issues an id), `TIME` the celestial clock — and is the home for quests,
+  flags and factions; **`players/<id>.svp`** holds `AVTR` + `PLYR` (single
+  player is `local`; a multiplayer peer saves its own via `SavePlayerFile`,
+  the host saves the world). The chunk store owns the buckets as OPAQUE
+  records (`ChunkStore::DormantEntities` / `WriteEntityRegion`): in RAM it
+  keeps only DORMANT records (read but not yet made live); a save writes each
+  bucket as dormant + live, skips a bucket whose bytes did not change, and
+  never opens a region that is neither known nor live — so a region's parked
+  records (S5b's dormant NPCs) survive every save that does not concern them.
+  A load resets every system, applies `world.sve`, the player file, then
+  every record the window's regions hold whose POSITION is inside the window
+  (`ApplyRegionEntities`, also the entry point for later touches). Cross-
+  bucket references: `MOBS` and `ITMS` records name nothing outside
+  themselves; `DBRS` names strap hosts by index into its own list and has no
+  per-body entry point, so it stays one group in `world.sve`. Time of day is
+  the celestial clock plus meta's sim tick; weather is a pure function of
+  (tuning, seed, sim tick) with no state of its own. The pre-S4
+  `entities.sve` still loads (whole, every section through its whole-payload
+  loader) and the next save distributes it and deletes it. Gate:
+  `save-split`; `save-entities` asserts its old claims on the new layout.
+- **A whole body saves as its name (MOBS v4, 2026-09-23,
+  `docs/PLAN_save_system.md` S5a).** The mob record is the terrain delta rule
+  applied to a body: a limb that is field-for-field its def's authored limb
+  (collider + skin lattice, box, rest offset, anchors) writes a KIND word, hp
+  and its transform and nothing else; only a limb that differs stores its
+  lattices; a severed limb stores none (its matter is `DBRS`'s). "Pristine" is
+  PROVEN by content — `Mob::LimbIsPristine` compares against
+  `MobSystem::PristineOf`, which is built by the same `BuildAuthoredLattice`
+  BuildRig uses — never by a dirty bit, because carve, burn, rot/infection,
+  coats, wound soaks, recolours and the rise/limb-swap overlays all edit limb
+  voxels in place and a bit is one forgotten writer from a save that silently
+  heals a wound. A stored lattice of the same SHAPE as the rig is restored by
+  brick pokes (the door the coat and burn took, no rebase), so SaveOne ->
+  LoadOne -> SaveOne is byte-identical and a blood coat now survives a load
+  (v3's count-compare overlay dropped it). Pristine limbs follow the def's
+  CURRENT art on load, which is the point: an untouched body is its name. v3
+  still loads under its own rule; the handoff packet carries the same record.
+  **Measured: an untouched human 345,969 B (v3) -> 577 B; a crowd of 11
+  untouched + 4 damaged 5.17 MB -> 160 KB (32x), the remainder being the four
+  damaged limbs' lattices.** Gate `mob-save-delta`.
+- **NPCs outlive the window (MOBS v5, 2026-09-23, `docs/PLAN_save_system.md`
+  S5b).** `MobSystem::PreTick` no longer destroys a creature that ends up more
+  than 16 voxels outside the window: with a park function installed it first
+  writes the creature's `Mob::SaveOne` record and appends it, as a `MOBS`
+  EntityRecord at its origin, to that region's bucket
+  (`ChunkStore::DormantEntities`) -- the record a save writes, so a parked
+  creature and a saved one are the same bytes and the next save puts it on
+  disk with no code of its own -- and then releases the rig as before. Only a
+  creature this machine OWNS parks (a ghost is the peer's). `game/persist.h
+  MobParking::Unpark`, called once per sim tick after `TickAuthority`, brings
+  back the `MOBS` records of the window's regions whose origin is at least one
+  chunk inside every face (hysteresis against the 16-voxel park pad), through
+  the load path (`MobSystem::LoadOne`), and a record WAITS -- stays parked,
+  never dropped -- on three things: the per-call budget
+  (`MobParking::kUnparkPerCall` = 2, so a shift into a crowd is a trickle of
+  rig builds, not a spike), the live cap (`MobSystem::HasRoomToSpawn`; parked
+  creatures never hold a cap slot), and the ground: the chunks under its
+  footprint, at the feet and one below, must be in the fetch cache
+  (`World::Cached`) at a version no older than the tick the parker first asked
+  for them, because the CPU never holds the window and a copy cached before
+  the chunk last left is stale. It comes back through `LoadOne(...,
+  placeLimbs=true)` -- in the pose it left in, so its `SaveOne` is the parked
+  record byte for byte (a save LOAD still stands the rig in Spawn's rest pose
+  at the floored origin, as it always has).
+  The walk is skipped when the window has not moved and nothing was left
+  waiting. MOBS v5 appends the brain's memory to each record (profile by name,
+  target id / has-target / target and last-seen positions / last-seen tick,
+  the five facts the handoff's `MobBrainWire` carries), so a creature that left
+  mid-hunt comes back hunting; v4 and v3 still load with a fresh brain.
+  **Multiplayer:** main enables parking in single player and on the host; a
+  client keeps the old despawn, because its store is not the one the host
+  saves. Known gap: a host-parked creature returns only when the HOST's window
+  reaches it. **Not done:** parked creatures do not tick (no off-screen
+  travel or schedules); ground items do not park; authored NPCs still have no
+  stable content id (`npc:<name>`) for quests to name. Gate `mob-park`.
+- **The save stores the delta, and meta names its generator (2026-09-22,
+  `docs/PLAN_save_system.md` S1).** A saved world is `genChunk(seed,
+  generator)` plus the store. `Stream::FlushResident` used to write all 32,768
+  resident slots, pristine ones included (JITTER and mixed surface chunks
+  RLE-expand to 22–32 KiB each); it now stores only the slots something wrote
+  since they entered the window — the rule eviction already used — and a
+  pristine chunk costs zero bytes and regenerates on load. **Measured, fresh
+  worldgen + 30 idle ticks: 279.06 MB (all 32,768 chunks) → 18.09 MB (1,485
+  chunks, every one of them gen-settle activity that S2 attributes).** Two
+  things make that exact rather than "exact except the last few ticks": the
+  save drains the in-flight snapshot readbacks and ORs the K=4
+  delivered-but-unpublished snapshots' dirty flags into a LOCAL mask (the
+  save-load gate's round trip needs it: 9 of its 1,688 stored chunks are
+  reachable only through that tail), and the delta is taken only when it is
+  PROVABLE — every tick encoded since the last wholesale refill has a snapshot
+  whose flags reached the mask (`WorldSnapshot::submitSeq`, one per tick,
+  gap-free, counted before the ring can decline) and the snapshot epoch did not
+  move behind the stream. Otherwise it is the old full flush with the reason
+  printed. The game satisfies this by construction (`Update` folds every
+  tick); a harness that ticks without `Update` calls `Stream::FoldSnapshot()`
+  per tick or gets the full flush (`save-entities` does, on purpose, and keeps
+  exercising that path). **No prune:** a stored chunk cannot be proven pristine
+  without generating it on the GPU and comparing, so chunks an older (full)
+  save wrote stay until a regen; a chunk that entered FROM the store and left
+  unmodified is simply not rewritten. `meta.svm` is **`SVM6`**: after SVM5's
+  tick/seed it appends a u64 **worldgen fingerprint** plus six per-input u32
+  parts — `worldgen.wgsl` exactly as `LoadShader` assembles it (preludes, the
+  tuning constants it references, `common.wgsl`) with comments stripped and
+  whitespace collapsed, the map dir, biomes+water, trees, the edit layer, the
+  material names. INPUTS, not a genChunk probe: a probe needs scratch slots in
+  a live window and a GPU round trip at every save and load; the input hash is
+  CPU file reads, 65–130 ms per save/load measured (the 8.6 MB of tree atlases
+  dominate). Blind spots: C++ table packing, and on-disk-but-unapplied edits.
+  SVM5/SVM4 still load with the fingerprint UNKNOWN. **On mismatch the load
+  proceeds, loudly**, naming the parts that differ, and sets
+  `WorldStamp::worldgenMismatch` (the `save-load` gate reports it into
+  `build/last_run.json`): dev iteration changes worldgen daily. **Open
+  question, deferred:** the SHIPPED policy when a patch changes the generator
+  under a save — frozen generator versions, new generation only in
+  never-visited chunks (needs a visited set), or bake-on-upgrade; spelled out
+  in `worldio.h`.
 - **Deferred shift wake (2026-09-03, R1 of `docs/RESEARCH_streaming_hitch.md`):**
   a window shift no longer FENCES. Until this landed, `Stream::FillSlots`
   submitted the plane's `worldgenList` and then blocked on a readback of
@@ -421,6 +570,105 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
 - Overworld draw distance beyond the window is handled by the render-only
   far-field cascades (§9) — the streaming horizon is no longer visible from
   the surface. Underground, darkness still hides it.
+- **Settle-after-generation: what gets saved that nobody touched (2026-09-22,
+  gate `gen-settle`, docs/PLAN_save_system.md S2).** The save is a delta from
+  the seed only while `Stream::modified_` means "a player did something here".
+  It is fed by the CA's per-chunk NEXT-TICK dirty flag, so it also catches
+  worldgen output that is not born at rest, and every such chunk is stored.
+  The gate measures that with no input at all and attributes every modified
+  chunk (current words vs a regenerated window, under `kPersistMask`): SETTLE
+  = fresh worldgen + 300 ticks standing still; TRAVEL = +X flight, 1 chunk /
+  8 ticks, 48 shifts, per STREAMED plane evicted. Measured at the default
+  map and seed (the strip is all desert):
+  - settle: **1,485 modified chunks = 28% of the 5,254 real pages**; 1,289 have
+    changed words, 196 do not.
+  - travel: **45.4 modified chunks per streamed plane = 12.6% of its real
+    pages**, 39.9 changed. The chunks from the first worldgen come out almost
+    exactly like the settle arm (1,486), which cross-checks the two arms.
+  - Ranked causes:
+    1. **Desert sand on slopes past its angle of repose** — every departed
+       grain in both arms (8,574 settle, 4,179 travel) is desert, and every
+       one is the SURFACE cell. The ground there has a true local slope
+       (central difference of `World::TerrainHeight`) of 1–2x repose for 80%
+       of them and in the taper band for 18%; only 1% are on flat ground.
+       `looseCoverDepth` (worldgen.wgsl) already tapers the loose cap to zero
+       at repose, but on the ANALYTIC `Col.slope`, which does not see the
+       detail/grain octaves — so on rough near-repose faces one loose voxel
+       survives and slides on tick 1. 1,157 settle / 638 streamed chunks.
+       ("jitter" cells are the same grains landing on sand of another
+       palette variant: same material, different state nibble.)
+    2. **Neighbour wake with no persisted change** — 196 settle / 89 streamed
+       chunks (13%) whose words equal genChunk's, flagged only because a
+       sliding neighbour woke them. Pure save waste.
+    3. **Pond-bed stain** — 130 settle chunks change only their stain byte
+       (23,805 cells): water soaking into the sand bed it was generated on.
+       None on the streamed strip (no water on it).
+  - Measured as NOT causes: the latent-snapshot inheritance (a refilled slot
+    picking up its previous occupant's dirty flag from a snapshot older than
+    the refill) raised 0 flags; "woke and changed nothing" with no changed
+    neighbour is 0; nothing below one chunk under the surface except 19
+    settle chunks.
+  - **Cause 1 FIXED (2026-09-23, PLAN S2b): the local step line.**
+    `genChunk` computes, for every column whose cover splits (sand cap, or a
+    powder skin with an authored `firmSkin`) in the chunk that holds its loose
+    band, `looseTop = min(h, min(axis-neighbour ground) + 1)` from four
+    `colHeightAt` calls, and `genCellIn` lays a loose cell only at
+    `y <= looseTop`; anything above goes to the firm cover (`sandstone`). This
+    is exact, not statistical: sim_step moves a 1:1 powder only straight down
+    or into the four AXIS down-diagonals, so a cell at or below that line has
+    ground in every cell it could move into. Corners and whatever stands above
+    a lower neighbour's ground are irrelevant by construction. `genColumn`
+    keeps `looseTop = h`, so the far cascades (where sandstone far-aliases
+    sand anyway) pay nothing. Measured over the gate's window on raw worldgen
+    (`--voxserve`, no CA, 512x384x512): sand cells with a legal first move
+    **9,351 -> 0** (22 snow grains remain, treeline snow in the desert, not
+    this rule); sand cells 765,161 -> 755,809 (**-1.2%** of the sand, all of it
+    the top one or two cells of a 2+ voxel step); columns whose surface is sand
+    240,977 -> 231,883 (-3.8%, those 9,094 surface as sandstone). The flat dune
+    field is untouched. gen-settle after:
+    - settle: **1,485 -> 160 modified chunks** (4,706 real pages): 132 changed
+      = 131 pond-bed stain + 1 snow grain; 28 neighbour-wake.
+    - travel: **45.4 -> 0.0 modified chunks per streamed plane** (0 changed).
+    - untouched save (`save-load` B): **454,510 B / 1,485 chunks -> 94,582 B /
+      160 chunks**. Caps: `genSettle.*` 168 / 139 / 0.5 / 0.5,
+      `saveUntouchedMaxBytes` 190,000.
+    - **`terrain` goes red on it, and that is the gate's list, not the
+      world**: pass C1's `BuildBodyMask` (selftest_terrain.cpp) names the
+      ground materials by hand and has no `sandstone`, so the 330 columns of
+      its 97x97 box whose surface is now sandstone read as "hollow". The box
+      had 0 sandstone-topped columns before and exactly 330 after (raw-worldgen
+      probe). Fix is adding `"sandstone"` to `kBody` — a C++ line, left to the
+      next C++ package because this one does not build.
+  - Still open, ranked:
+    2. **Neighbour wake (28 settle chunks, now 18% of what remains).**
+       `modified_` is fed by the CA's NEXT-TICK dirty flag, which means
+       "scheduled to act", not "a word changed": `markDirtyR` wakes all 26
+       neighbours of a mover, and the stream folds the dirty set into
+       `modified_` without asking whether any word in the chunk was written.
+       Fix (sim/stream change, not this package): a per-chunk WRITTEN bit set
+       by `voxStore` on an actual word change (or by the CA's move/stain
+       write sites — `tryMove`, `doStaining`, reactions, `sim_mutate`), carried
+       to the CPU in the same snapshot as the dirty flags, and `modified_` fed
+       from that bit instead of the dirty flag. It must include every writer
+       (mutations, explosions, fluid seam, particle deposit) or edits go
+       unsaved, which is the dangerous direction; the gate's recorded-vs-stored
+       model check is the instrument. Expected: settle 160 -> ~132, the
+       remaining chunks all with changed words.
+    3. **Pond-bed stain (131 settle chunks, 23,805 cells) — not done here,
+       and not cheap.** Baking the at-rest stain in worldgen means: every
+       solid/powder cell face-adjacent to a water cell gets `wet` at
+       `min(amount, max(capacity, 1))` (sand 6, stone 1). Three things make it
+       more than a WGSL line: side faces need the NEIGHBOUR columns' fluid top
+       (four more `genColumn`-grade evaluations near water); worldgen writes
+       no stain today and `occupancy`'s stain bit (`packOcc`, not
+       `packOccStain`) plus the page table's "a generated chunk is demotable
+       on sight" rely on that; and the CA's absorption SPENDS an eighth of
+       water per level soaked into sand, so a baked-wet bed with full water is
+       a different (arguably better — a lake bed is saturated) world than the
+       one the CA reaches, which should be decided rather than slipped in.
+  - Caveat: the travel strip is one biome (desert). The step line covers every
+    biome whose cover splits (desert, ocean); tundra's snow skin opted out of
+    the firm split and keeps its settle transient.
 
 ---
 
@@ -621,6 +869,18 @@ SSBO lists of chunk indices.
     the refusal path is unreachable for an acting cell — a cell only acts if its
     own chunk is on the dirty list, and every probe target is within that
     chunk's probe ring, which the prepass covers by construction.
+
+    **Each ring slot has exactly ONE filler (2026-09-22).** The prepass used to
+    let every dirty chunk fill its whole ten-chunk ring and skip a member whose
+    stamp was already this tick's. A stamp is only published when a workgroup
+    finishes, so with thousands of workgroups in flight almost none saw one: on
+    a forest fire (~5,000 awake smoke chunks) the prepass was 5.1 ms/tick, each
+    slot filled by up to ten neighbours. Now `reposeRingOwned` picks the owner
+    from this tick's `dirtyIn` flags — slot `s` belongs to the dirty centre
+    `s - offset(j)` with the smallest `j`, and offset 0 is the centre itself —
+    so the row reads `R(DirtyIn)`, the stamp skip is gone, and the fill is
+    staged through workgroup memory so a member's 4,096 words are read
+    coalesced. Same slots filled, same bits (world hash unmoved); 5.1 -> ~1.3 ms.
 
     **The ALLOCATION is dense; only the WRITING is sparse.** One bit per
     cell in the window is 16.125 MiB resident from `World::Init`, roughly +36%
@@ -2193,9 +2453,10 @@ buffer read. `RenderParams.fluidCount == 0`
 (or `render.fluidSurface = 0`, which restores the old debug cubes via
 `debris.wgsl:vsFluid`) skips every instruction of it. Tuner section "MPM
 Fluid Look": iso, smoothing, IOR, clarity (metres), reflection/specular
-gains, foam amount/speed, shimmer, per-species colours. Depth is written at
-the fluid interface, so raster spray in front composites over it and debris
-behind it is covered.
+gains, foam amount/speed, shimmer, per-species colours. Depth was written at
+the fluid interface, so raster spray in front composited over it and debris
+behind it was covered; since 2026-09-23 the interface writes NO depth and a
+body behind it is shaded through it instead (§9.zz THE WATER VEIL).
 
 THE RENDER SEAM: ONE LAKE, TWO REPRESENTATIONS (2026-08-25). The virtual-mass
 blend above lets the isosurface reach over SETTLED voxel water, which closes the
@@ -2816,7 +3077,7 @@ powder, and firming a tenth of the tundra broke its own authored claim ("99% of
 columns wear snow at `y == h`", the `env-truth` gate) for a settle transient
 tundra has always accepted.
 
-**Known gap, not fixed here.** This gate reads `Land.slope`, the *landform*
+**Known gap, FIXED 2026-09-23 by the local step line (§3 "Settle-after-generation", `looseRestTop`).** This gate reads `Land.slope`, the *landform*
 gradient, which by design excludes the detail and grain octaves (see the note
 above -- gating on the full gradient turns the wedge into a cliff). So the
 +-2-voxel steps fine noise puts on an otherwise gentle dune face are invisible
@@ -3928,10 +4189,45 @@ neighbors, so this needs an explicit connectivity pass:
   232 KB — in the same order, so the box set, collider and resting pose are
   unchanged (fuzzed against a port of the old walk, and the debris /
   settle-back / audio-impact / body-fastfall detail lines are byte-identical):
-  **10.4 ms → 0.5 ms** on the birth tick. Still open: the 1,024-box cap covers
-  only 5,474 of the oak's 28,478 voxels (19%) in flood order, so a canopy's
-  collider is whichever fifth the island scan reached first; raising the cap
-  moves resting positions and is its own gate-measured change.
+  **10.4 ms → 0.5 ms** on the birth tick. The 1,024-box cap that covered only
+  a fifth of the oak's voxels is gone (next item).
+- **A felled tree cost 100+ ms a Jolt step (2026-09-22).** Owner report: "cut
+  a tree down, or split a big body into several, and it runs at 3 fps for a
+  few seconds". Reproduced with `--fell-tree` on the BAKED birch
+  (`SANDVOX_FELL_SPECIES=birch SANDVOX_FELL_SPLIT=90`, and
+  `SANDVOX_FRAMES_NO_RELOAD=1` — the harness's mid-run F5 otherwise wipes the
+  bodies seconds after the cut): after two splits ONE `Update` took 100-138 ms
+  over four bodies, i.e. 300-500 ms frames at 4 ticks a frame. The step was
+  never contact-bound — the watchdog line now counts manifolds, and a 100 ms
+  step had 17 of them, 44 points — and turning enhanced internal-edge removal
+  off changed nothing; `SANDVOX_NO_ANTITUNNEL=ccd` took it to 1.6 ms. The
+  LinearCast was paying twice: Jolt casts when a step exceeds 0.75 × the
+  shape's inner radius, which for a compound is its SMALLEST sub-shape's — one
+  loose leaf, so a 7 m tree cast on every step of its fall — and the cast
+  sweeps every sub-shape, 1,024 of them on a crown. Two rules in
+  `CreateDebrisBodyXf` (`physics.cpp`, beside `kDiscreteMinExtentVox`):
+  1. **A body at least 24 voxels thick on every axis steps Discrete.** To cross
+     a terrain sheet in one step it would have to move half that, 12 voxels, in
+     one 30 Hz tick — 36 m/s, over the 32 m/s terminal velocity of a fall the
+     height of the whole window. Everything thinner keeps `LinearCast`
+     (`body-fastfall` is unchanged).
+  2. **A box budget of 256.** Under it the greedy merge is untouched (same
+     boxes, same order, same resting pose). Over it, boxes at least 8 voxels and
+     2 thick on every side are KEPT EXACT (the trunk — what rests on the
+     ground), and every other voxel is re-merged on a doubling lattice (2, 4,
+     8…) where a cell is solid if any voxel in it is, clipped to the body's
+     bounds, until the total fits. The collider now covers EVERY voxel (the
+     birch: 242 boxes, 46 kept, rest on a 4-voxel lattice) where it covered a
+     sixth; the price is a crown that collides as a slightly fuller blob.
+  Same run after: worst `Update` 0.5 ms, frame p99 23 ms. The carve path paid
+  too — eight sword kerfs on that log were 56-119 ms (one of them 27 ms) — so
+  `ShatterBody`'s connectivity flood reads a dense index grid instead of a hash
+  map (same seed order, same component numbering), `SpallGrow` only hashes the
+  cells within reach of the blow instead of the whole lattice every round,
+  `DamageBody` evaluates the carve predicate once per voxel instead of twice,
+  and `DominantMaterial` tallies into a flat array: 3.7 ms for the eight. Gate
+  `big-body-collider` pins the budget, the full coverage, the exact trunk box,
+  and Discrete-for-thick / LinearCast-for-thin, with no timing in it.
 - **The body draw was overdraw × a shadow ray (2026-09-12).** Under
   `--fell-tree`, `BuildInstances` ran twice for the whole fall (0.3 ms), and
   the draw cost 1.14 ms a frame while the oak was a body: every voxel was an
@@ -4023,12 +4319,16 @@ neighbors, so this needs an explicit connectivity pass:
   17.8 voxels of travel in one 30 Hz tick at `player.maxFall`. Debris and limp
   rigs were going through the floor, and the guarantee needs THREE things,
   because each one covers a case the others cannot:
-  1. **Jolt CCD.** Every dynamic world body is created `LinearCast`, not the
-     default `Discrete` (which advances by v·dt and only then asks what it
-     overlaps). Jolt pays for the shape cast only when a step exceeds 0.75 ×
-     the collider's inner radius, so a settled or walking body costs what it
-     always did. `Physics::CreateDebrisBody`'s note has the arithmetic; the
-     `body-fastfall` gate pins it against a real `PolygonizeChunk` patch.
+  1. **Jolt CCD.** Every dynamic world body thinner than 24 voxels on some
+     axis is created `LinearCast`, not the default `Discrete` (which advances
+     by v·dt and only then asks what it overlaps). Jolt pays for the shape cast
+     only when a step exceeds 0.75 × the collider's inner radius, so a settled
+     or walking body costs what it always did. `Physics::CreateDebrisBody`'s
+     note has the arithmetic; the `body-fastfall` gate pins it against a real
+     `PolygonizeChunk` patch. A body thicker than that on every axis is
+     `Discrete`, because it cannot cross a sheet in one step and the cast on a
+     compound fires off its smallest box (2026-09-22, "A felled tree cost 100+
+     ms a Jolt step").
   2. **Patches requested ALONG the velocity.** A cast can only hit a triangle
      that exists, and the anchor box reaches about one chunk past a
      human-sized body while a patch costs a chunk fetch plus a slot in
@@ -4102,9 +4402,10 @@ still technically being attached" describes.
 > is gone.
 
 **Why it costs minutes rather than merely looking silly.** Two multipliers that
-this document already records elsewhere. Every dynamic body is
-`EMotionQuality::LinearCast`, so once the linear velocity is large each step is
-a swept compound-shape cast against marching-cubes terrain, per body, per step.
+this document already records elsewhere. Every dynamic body thinner than 24
+voxels is `EMotionQuality::LinearCast`, so once the linear velocity is large
+each step is a swept compound-shape cast against marching-cubes terrain, per
+body, per step.
 And the contact solve sees `v + ω × r` at every contact point — the same term
 that turned a 5-second gate into an eight-minute hang when 1e30 rad/s was
 injected past the sweep.
@@ -4346,6 +4647,21 @@ touch a creature with a sword, lose a limb, anywhere, every time.
   ordinary `Sever()`, so this changes WHEN a limb comes off and nothing about
   what coming off means. Neither applies to a burn (which has its own tested
   account of charring through) or to a blast (which has no "other side").
+- **What is seated in a piece that leaves goes with it (2026-09-23).** Every
+  cause but blunt and a body's birth rot: when `CarveLimb`'s split parts a limb,
+  each child's socket is assigned to the nearest component big enough to be a
+  body. If that is not the kept (anchor) component, the child is `Sever()`ed and
+  jointed to the carved-off fragment at its live anchor, hold skipped, so the
+  pair falls as one object. Owner report: acid poured on a forearm ate through
+  its middle and the hand stayed on the rig, floating at a wrist that had gone —
+  fire and acid are exempt from the neck rules (`JointRuleApplies`), and those
+  measure flesh, not connectivity. The same report's other half: `DetachLimb`'s
+  child recursion destroyed every child joint, so a cut-off arm landed as three
+  unrelated bodies. An anatomy child leaving WITH its parent now keeps that
+  joint (`keepJoint`) and hands it to the debris pair as `Die()` hands over a
+  corpse's; the held item and worn shells still lose theirs.
+  `Mob::GroupSeveredPiece` gives the jointed/strapped set one collision table
+  when the holds release. Gate `severed-hand`.
 - **Heft is derived from the art.** `ItemDef::heftVolume` is the item's own
   voxel count in world voxels; the factor the wound model consumes is that
   against `gore.woundHeftRef` (the stock arming sword, 5.3). A greatsword cuts
@@ -5095,6 +5411,107 @@ two ticks a level, a value an author can set -- it falls to 62 in 47 ticks; a
 direct deposit on a stone cell of the room reads blood's slot at amount 5 and
 the cell is still stone.
 
+**Water on a body washes, wets, wicks and drips (2026-09-23;
+`WashBodyStain`, `MobSystem::WetOneLimb`, `kPFlagDrip`).** BODIES ONLY — the
+world's wet stain is unchanged and still never dries (a pond bed that dried
+would keep its chunks awake; see "Absorption and washing"). A washer
+(`stain.washes`) meeting a coat by any door — contact, splatter, the health
+panel's pour — goes through one rule: a foreign coat is stepped down by the
+rinse (`gore.stainWashPerContact`, 5; a pour rinses twice its own depth), and
+a voxel that comes out clean is left WET at the washer's amount. Before this
+contact rinsed but never wetted, and a pour or splash of water used Raise and
+so left blood exactly where it was. While wet, every third tick a limb samples
+96 voxels: a wet voxel beside a foreign coat rinses it by 2 and leaves it wet
+at half its own depth (15 -> 7 -> 3 -> 1, then it stops — monotone), and a wet
+underside (world-down lattice neighbour empty) drips a micro droplet, losing a
+level for it (<= 2 per limb, 48 per tick across all creatures). A drip carries
+`kPFlagDrip` and vanishes on landing WITHOUT staining the ground, because
+water's world stain never dries and a dripping creature would otherwise leave
+a permanent trail. Water's `coat.decay` is 2: `DryOneLimb` drops half the
+voxels a level per period, so a soaked limb is dry in ~60 s. Gates: `vessel`
+(water poured over blood leaves the limb wet with no blood), `body-stain` /
+`corpse-wash` (the river judged on BLOOD left, 1496 -> 0, not on "any coat").
+Drips are not gated. Corpses wash and get wet but neither wick nor drip
+(StainCorpses does not call `WetOneLimb` yet).
+
+**Wet vs fire, sun, and the look (2026-09-23).** A voxel whose coat is a
+washer does not catch: `BurnOneLimb` section 0 skips every rule whose product
+is hot or a burn stage for it (so it neither ignites nor sears), and
+`IgniteOneLimb` skips it. Heat against it BOILS the coat instead, one level per
+roll at a rate that takes a soaked voxel to dry in `coat.fireDrySeconds` (2 s)
+-- fire dries you out, then takes you. A BURNING voxel that is wet or has a
+wet lattice neighbour runs its own authored `tag:extinguisher` douse rule with
+the water as the neighbour (no new table), and the water pays
+`kCoatDouseCost` (4) levels. In sunshine -- daylight up and no non-gas cell in
+the 48 above the limb in the CPU mirror (`MobSystem::InSunlight`; unmirrored
+reads as open) -- a washer coat dries `coat.sunDryScale` (2x) faster; blood is
+not sped up. How strongly a coat SHOWS on a body is `coat.opacity` in
+materials.json (default 1; water 0.4), packed into the stain colour's alpha
+byte and applied only by `microbody.wgsl` `bodyStainTint` -- the soak amount
+still runs 0..15 for the wash/wick/dry rules. `body-coat` gates the fire half:
+every limb but one soaked, the creature stood in a fire column 90 ticks with
+`fireDrySeconds` parked long: soaked root 0 seared vs dry torso 595. Fixture
+note: `World::Cached` is only refreshed on request, and what re-requests a
+dirty chunk each tick is the debris island scan -- a fire fixture that skips
+`debris.QueueSupportEvents`/`PreTick` burns against a pre-fire mirror.
+
+**A coat that EATS: acid on a body (2026-09-23).** Owner report: acid poured
+on a character neither showed nor dissolved anything. Two gaps: acid had no
+`stain` block, so every coat write (pour, splash, contact) refused it; and a
+coat could not act on the voxel under it -- only a GRID cell of acid could,
+through `BurnOneLimb`'s inbound pass. Now:
+- **`"bodyOnly": true` on a LIQUID's stain** gives it a palette slot for
+  bodies and NO type bits in the GPU `stainPack`, so no kernel ever marks the
+  ground with it (`sim_step` doStaining, the particle landing and the fluid
+  seam all gate on those bits). `MaterialDef::stainSlot` is the slot; read it,
+  not the pack, wherever the question is "how is this drawn". The world hash is
+  unmoved by construction.
+- **A corrosive coat** is any wearable coat whose material `matAttacksBody_`
+  (its pair rules rewrite body matter) -- `MobSystem::matCorrodes_`, acid
+  named nowhere. `BurnOneLimb` section 3 evaluates the coat material's own
+  rules against the voxel it sits on (the inbound pass with the coat as the
+  neighbour, rule index +128), so flesh/skin/cloth/leather go at 125 (halved from 250 the same day: too fast),
+  dissolvables at 45, iron pits at 10, bone and steel shrug it off. The ledger
+  counts `LimbCoat::corrosive` over every material, which wakes the pass with
+  nothing in the world near the limb; `BodyBurnState::corrode` is the coat's
+  candidate list (swept every `kCorrodeSweepTicks` and after every index drop,
+  pushed to as the coat carries).
+- **Bounded by what was poured (rule 2).** An eaten voxel's coat carries into
+  the lattice voxels behind it, paying one layer's price: `15 / (coat.depth x
+  scale)` levels, in WORLD units so a fine-skinned creature is not eaten
+  deeper. A film thinner than a layer's price takes it iff it clears a
+  threshold fixed per voxel (position-keyed, not tick- or amount-keyed): a
+  per-tick roll let a thin film bite eventually and doubled the depth. Acid
+  `depth` 0.4: a full coat reaches the bone of a human limb, a splash (6) takes
+  skin and some flesh. `coat.decay` 0.15 s/level: a splash is gone in ~2 s, a full coat in ~5, bone included. `DryOneLimb` dries every CORROSIVE coat when the ledger counted one, not only the ledger's ranked few -- blood outweighed a thin acid film on bone and it never dried.
+- **It displaces, it does not wait**: `MobSystem::CoatBeneath` treats a
+  non-corrosive coat as clean when a corrosive one arrives, so a bloodied arm
+  can be coated in acid at all (Raise only repaints with a strictly larger
+  amount). A corrosive `SoakLimb` (the health panel's pour) coats the SURFACE
+  only -- every other coat soaks the whole lattice, and acid inside a limb ate
+  a thigh in three seconds. The same door opens for WATER going the other
+  way (2026-09-23): a washer's coat gives way to any non-washer, so a
+  rain-soaked body (wet 12) can be oiled (oil pours at 6); water arriving on
+  oil still rinses it (`WashBodyStain`). Rain rinses tops and, at a runoff
+  roll, sides (`RainOneLimb`); gate `rain-oil`. The ledger ranks the
+  `kCoatTop` (4) heaviest substances per limb and body, and the HUD names each
+  one with its share.
+- **Contact**: `coat.contact` (per mille) replaces the ground stain chance for
+  body contact (acid's ground chance is 0). Acid is at 15, low on purpose: the
+  pool already eats you through the grid inbound pass, and at 120 the two
+  stacked and an ankle-deep bath took every submerged limb to the bone in 20
+  ticks. A corrosive contact asks the worn-shell probe first (`StainTick` now
+  sets it up as `BurnTick` does), so acid does not coat skin under a plate.
+- **The look**: `coat.opacity` 0.5, and `coat.glow` / `coat.pulse` (Hz) are
+  mirrored into the stain palette entry's spare `_r2` word (materials.h
+  `kCoatGlow*`); `microbody.wgsl` `bodyCoatGlow` adds emission and
+  `bodyStainTint` breathes the cover 70-100% on the same wave.
+Gate `acid-coat` (pose ticks only): acid over blood coats 720 surface voxels,
+the limb goes 1344 -> ~400 (skin + flesh, bone left, limb stays on), the blood
+control limb loses 0, the acid is spent and the limb then holds. NOT covered:
+corpse contact does not ask a worn probe (corpses have no occlusion on the stain
+pass); the cube-path renderer (`debris.wgsl`) draws no coat at all.
+
 ### A creature is a variant of another creature (2026-09-15, inheritance + becoming one at runtime 2026-09-20; `src/game/sidecar.*` + `assets/editor/sidecar.js`, sidecar `extends`/`model`/`effects`/`palette`/`turn`, `assets/mobs/effects/`, `BuildMobDef` + `MobDefFactory`, `MobSystem::DefWithEffects`/`TurnMob`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gates `sidecar-resolve` + `undead` + `zombify`)
 
 A zombie is a human who walks slower, is paler, does not heal, and arrives
@@ -5471,6 +5888,16 @@ skin one voxel deep, `flesh` under it, `muscle` under that (speckled with
 `blood`), and `bone` at the core; the head is a two-voxel bone skull around a
 flesh brain.
 
+**Depth makes a shell; `carve` makes a skeleton (2026-09-22).** A depth
+schedule alone gives an egg-shaped skull and a solid bone brick in the chest.
+A limb's `carve` rules (`limbs.<name>.carve`: material / where / box as
+fractions of the limb box, +z front / depth range / stripe) rewrite what the
+schedule put there, last match wins, never on a kept layer: the human's skull
+gets two orbits and a nasal hole filled with flesh, its chest is hollowed to
+flesh with a muscle wall and bone put back as ribs, a sternum and a spine.
+`anatomy.js carveFor/carveMatches` and `anatomy_resolve.cpp CarveFor/
+CarveMatches` are the same rule; `--gate anatomy-parity` keeps them one.
+
 **This is authoring, not engine.** Every runtime consumer was already per
 voxel: `voxload` keeps enclosed cells, the micro brick is dense and its march
 stops at the first solid cell (an interior costs memory and nothing else until
@@ -5804,6 +6231,30 @@ a detached speckle becomes a floating scrap of flesh in the world.
   `pos`/`EyePos()`, or the world would stop being a function of the tick stream.
   Gate: `tick-input` runs 300 scripted ticks at 1 and at 4 ticks per frame and
   asserts a bit-identical trajectory and a bit-identical command stream.
+- **A step is ONE continuous motion, and three separate things had to agree
+  before it was** (2026-09-21, `view-smooth` gate). `StepSlide` climbs a ledge
+  in a single tick by design, so the render path hides it — and from N2 until
+  this change the two halves of that hiding fought each other and the art got
+  neither. (1) `Player::BankVerticalSnap` is now the ONLY way a vertical snap
+  is banked: it subtracts the jump from `viewYOffset` *and* adds it to
+  `prevPos.y`, because a snap is not travel along the tick's segment. Without
+  the second half the offset removed the whole step in one lump at the tick
+  boundary while `RenderPos` added it back linearly over the next 33 ms — a
+  full-step-height sawtooth at 30 Hz, which is "it teleports up a voxel at a
+  time" exactly as reported. (2) The offset is aged once per tick, so it was
+  itself a 30 Hz staircase releasing 20.6% of a voxel in one frame;
+  `Player::SmoothFade(alpha)` spreads that tick's decay factor across the
+  tick's frames. (3) The BODY gets both corrections too, through
+  `Player::RenderBodyOffset` → `Mob::SetRenderOffset` → `Mob::AppendXforms`,
+  which is the single place a render-only rigid translation is applied — the
+  colliders, the reach tests and every strike keep reading the posed
+  transforms. `bodyYOffset` is `viewYOffset` minus the crouch's eye-height
+  bank, since a crouch moves the eye inside a body that has not moved.
+  The gate walks a 1-in-4 staircase sampling five frames per tick and bounds
+  the largest single-FRAME change in drawn eye height, the largest downward
+  one, and the drift between the drawn eye and the drawn body (~0 by
+  construction). Measured: 1.0 → 0.26 → 0.056 voxels per frame across the
+  three fixes.
 - **The collision box is not the figure** (2026-09-02, `Player::Box`).
   `Player::pos` stays the centre of the NOMINAL 1.7 m figure box
   (`kHalfXZ`/`kHalfY`: the art contract, the Jolt proxy, the mob sense actor,
@@ -5882,7 +6333,7 @@ and the projectile dies when it is spent; lifetimes, live projectile counts,
 multiplicity, fan count and generation are capped in `glyphs.json` and clamped
 against engine ceilings at load.
 
-#### The grammar (three rules; `ParseSpell`, `LowerBox`, `LowerSpell`)
+#### The grammar (four rules; `ParseSpell`, `LowerBox`, `LowerSpell`)
 
 Hundreds of glyphs, uncountably many sequences, every one does the predictable
 literal thing, and nobody ever writes a rule for a specific combination. The
@@ -5899,27 +6350,32 @@ record fields), **Mod** (a field edit on the delivery record: `field`, `op`,
 `amount`), **Operator** (a verb with argument slots — `left`/`right` list the
 sorts each accepts, `result` the sort produced; every unary operator takes the
 one item BEFORE it, only `transmute` is infix), and
-**Separator** (`also`, which ends one sentence and starts the next). Nothing
+**Separator** (`lane` opens a lane scope of the pile and `end` closes it; which
+one a word is, is content — `"scope": "open" | "close"` — and the enum value
+kept its name after `also` was dropped for rule 4). Nothing
 in C++ knows which words exist. The C++ vocabulary is the sort names, the verb
 names (`spray`, `place`, `convert`, `explode`, `wind`, `mend`, `trail`,
 `sustain`, `filter`, `repeat`, `launch`) and the record field names — each verb
 maps to ONE op type or ONE engine seam, and `ApplySpellEffect` switches on the
 verb and nothing else.
 
-**Three rules, and they are the whole grammar** (rewritten 2026-09-10; the
-2026-09-04 six-rule version is superseded, and `docs/PLAN_magic_grammar.md` §2
-R4/R6 and §11.4 are marked as such):
+**Four rules, and they are the whole grammar** (rewritten 2026-09-10, rule 4
+added 2026-09-21 from `docs/PLAN_spell_graph.md` §2–3; the 2026-09-04 six-rule
+version is superseded, and `docs/PLAN_magic_grammar.md` §2 R4/R6 and §11.4 are
+marked as such):
 
 - **1. A NOUN GOES INTO THE PILE.** A Matter word, an Effect word, or an
   operator group whose result sort is Effect is pushed onto the PILE. Order
-  inside the pile does not matter: runs merge (`shotgun shotgun` is
-  `shotgun×2`, capped by `budgets.maxMultiplicity`), identical non-adjacent
+  inside the pile does not matter: runs merge (`swift swift` is `swift×2`,
+  capped by `budgets.maxMultiplicity`; a COUNT word merges too but its
+  multiplicity is ignored — see rule 4), identical non-adjacent
   items merge too, and the lowering rebuilds the pile in a CANONICAL order (by
   key) because mods compose through integer arithmetic that does not commute
   under clamping — 49 halved then doubled is 48. Matter and Effects ADD (×N of
   the verb's declared axis); Mods COMPOSE.
 - **2. A DELIVERY BOXES THE PILE, AND SPEAKING CONTINUES.** The Delivery word
-  takes the WHOLE pile and wraps it into ONE Effect value of verb `launch`:
+  takes the pile — all of it, or, under rule 4, the innermost OPEN scope of it
+  — and wraps it into ONE Effect value of verb `launch`:
   that delivery's `DeliveryRec`, the pile's Effects as its payload, the pile's
   pending Mods stuck to its record. The pile becomes exactly that one value —
   so a box is a noun again and can be boxed once more, taken by an operator, or
@@ -5933,19 +6389,99 @@ R4/R6 and §11.4 are marked as such):
   `explosive shotgun projectile` and `shotgun explosive projectile` are the
   same three fanned exploding bolts, while `explosive projectile shotgun` is
   one bolt fired from three fanned points and `explosive projectile shotgun
-  projectile` is three bolts that each fire one. With no delivery to close the
+  projectile` is three bolts that each fire one. A count word said TWICE in one
+  scope is not nine: one split per scope (rule 4), and the second is charged
+  and does nothing. With no delivery to close the
   pile a mod sticks to `hand`, the implicit outermost delivery, where `shotgun`
   is three fanned resolve points and `float` is the hop — and **every other mod
   on the hand is a charged no-op**, named in the describe line ("`swift` is
   wasted: it landed on your hand, which has no speed") rather than quietly
   editing a field nobody reads.
 
-The outermost box is ALWAYS `hand`, so the whole utterance lowers to ONE cast —
-unless **`also`** is spoken. `also` is a new sort (`separator`, word cost 0):
-it closes the current pile as a finished cast, hand-delivered if no delivery
-closed it, and starts a new one. **Law L4 (cost additivity, union of emissions)
-attaches to `also`**, not to a delivery, because a delivery no longer ends
-anything.
+- **4. `lane` OPENS A LANE SCOPE, `end` CLOSES IT, AND A LANE BELONGS TO ONE
+  INSTANCE.** `lane` pushes a scope onto the current pile and `end` pops the
+  innermost open one back into the scope around it (both sort `separator`, word
+  cost 0; an unclosed lane is closed when the sentence runs out, and an `end`
+  with nothing open is a charged no-op). **A delivery boxes the innermost OPEN
+  scope**: inside an open lane it takes only that lane's items — the box lands
+  *in* the lane, which stays open, so more may follow in it — and outside any
+  lane it takes the shared items plus every closed lane, which is the
+  multi-socket box. Lanes are ordered as spoken; the box fires
+  `instances = max(count, L)`, instance *i* < L carries shared ∪ lane[*i*+1],
+  and instance *i* ≥ L carries the shared items alone. So `explosive lane sand
+  end lane fire end twin projectile` is two exploding bolts, one spraying sand
+  and the other fire, from one utterance — the thing the first three rules
+  could not say, because a fan was a copy machine — and `lane explosive
+  projectile end lane fire end projectile` is one carrier whose first socket
+  fires a child bolt and whose second sprays fire, which is the sentence the
+  SCOPE (rather than a running segment counter) exists for: with "a delivery
+  boxes the whole pile", that trailing `projectile` would have swallowed the
+  first lane, and a socket could never hold a spell with its own delivery.
+  A mark WALLS binding (an operator binds within its own scope only, so in
+  `fire lane trail` the item under `trail` is the wall, not `fire`, and the
+  operator is incomplete) and WALLS merging (`fire lane fire end` is two items
+  in two scopes, not `fire×2`) — `NodeKey` carries the lane, which is what
+  makes both true at once. A mod inside a lane edits that instance's record.
+
+  **A COUNT MOD SPLITS THE SCOPE IT WAS SPOKEN IN** (2026-09-22). Spoken in the
+  shared segment it is the box's own fan; spoken inside a lane it is THAT
+  BRANCH's split, and the branch does not inherit the box's fan on top of its
+  own. It used to be RECORD-WIDE wherever it was spoken — count *was* the fan
+  and a lane was one instance of it — which made a fan a property of the box
+  and left no way to say "this branch splits and that one does not". And **at
+  most one count word per scope is effective**: the one whose application
+  yields the largest count (ties by lowest `NodeKey` — largest-result rather
+  than first-spoken, because the pile is a SET and law L2 would be false
+  otherwise), applied EXACTLY ONCE however many times it was said. Every other
+  count word in that segment is wasted: charged, listed in
+  `SpellCast::wastedNodes`, drawn slashed, and refused outright if you try to
+  drop one. Nine bolts is a split on each of three branches — something you
+  build and can see you built — not `shotgun shotgun`. The number that FLIES is
+  therefore `RecBolts` (the sum of the branches' splits), not `RecInstances`
+  (the branch count, which is still what the socket row draws), and every
+  price, budget and cap is charged on `RecBolts`.
+
+  `lane end` with nothing between is an empty lane: the instance exists
+  and carries the shared items. Marks NEST rather than enumerate — an inner
+  lane nobody boxed flattens into its parent when it closes, because there is
+  no record for it to be a column of.
+
+The outermost box is ALWAYS `hand`, so the whole utterance lowers to ONE cast.
+**`also` is gone** (2026-09-21): two unrelated spells in one cast are two
+columns of the hand box (`lane explosive projectile end lane blood mend self
+end` is a bolt at the aim AND a graft on your own body), and **law L4 (cost
+additivity, union of emissions) attaches to ROOT LANES**. There is no sentence
+separator left; `SpellTree::clauses` survives as a vector that holds one
+clause, so the UI and the gates keep their shape.
+
+**COPIES FAN, COLUMNS DO NOT.** `SpellFan` spreads only the instances whose
+payload is the shared-only copy; an instance that carries a lane fires ON THE
+AIM, with no fanned resolve offset, because it is not a copy of anything — it
+is a second spell the player asked for, and a projectile in the right-hand
+column should fly at the crosshair. With no lanes the fan behaves exactly as it
+always did.
+
+**One helper carries rule 4 into the runtime: `InstanceCast(cast, i)`.**
+`DeliveryRec` gains `std::vector<SpellLane> lanes`, where a `SpellLane` is
+`{DeliveryRec rec, std::vector<EffectInst> extra}` — the lane's record is the
+shared one with that lane's Mods applied on top and its trail merged in, and
+`extra` is the nouns only that instance carries (a lane's own `rec.lanes` is
+always empty, so the knot is one level deep, tied the way `EffectInst::launch`
+ties it). `SpellNode::laneAt` holds TWO spoken positions per lane — the `lane`
+word and the `end` word, -1 when the close was implicit — so the HUD span and
+the linearizer both have the marks, and a box's span covers its whole scope
+(law L6 reads it to decide what "far away" means). `InstanceCast` returns the cast instance *i*
+actually flies with, and returns the cast UNCHANGED when there are no lanes.
+Every fan loop calls it — `Cast()` for the hand's instances, `AdoptLaunches`
+for a nested box (which carries its lanes inside the `SpellLaunchReq`'s
+record), and from there `Launch()` / `RequestBody()`. `ApplySpellEffect` never
+sees a lane: it is handed one instance's payload, which is what thesis 2 wants.
+Pricing follows the same shape — the tariff is Σ over instances of
+tariff(shared ∪ lane_i), which is the old `tariff(shared) × instances` exactly
+when L = 0, and `EffectVolume` / the rule-2 tick bound take the widest and
+longest-lived lane. The stack bound went 16 → 32 (`kSpellStackMax`,
+`budgets.maxMacroWords`) because a socket costs TWO words and three sockets of
+two effects, a fan, a delivery and a mod do not fit in fewer.
 
 Unary operators (`trail`, `aura`, `echo`, `null`, `mend`) take the ONE item
 immediately before them, which may now be a launch box: `explosive projectile
@@ -6020,6 +6556,65 @@ misfire state, and the imprecision penalty lives entirely in the mana/health
 crossover. The HUD's brackets are derived from the tree, so a box draws as
 `[ … DELIVERY]` and what you see is what nested.
 
+**Every word has a MAGNITUDE, and it is a property, not a word**
+(2026-09-23; `docs/PLAN_spell_magnitude.md` M1; gate `spell-magnitude`). The
+player only ever edits the 2D page, so the word list is the SERIALIZATION and
+not the design constraint: a new quantity is a per-node property written as a
+suffix (`float@0.5`), never a new word with a place in word order. A
+magnitude is per-mille of the glyph's authored quantity and rides beside
+multiplicity — `SpellStack::mags` → `SpellNode::mag` → `EffectInst::mag`, and
+every consumer scales by `n × mag / 1000` (`EffectInst::Scale()`), which is the
+old integer-`n` formula EXACTLY at 1000, so a page without a suffix lowers
+bit-for-bit as before and no pinned price moved. An add mod adds amount × mag
+(`float@0.5` = −0.5 g), a mul mod multiplies by amount × mag (`swift@1.5` = ×3,
+never below ×1), a div mod divides by it; matter, effects and the opted-in
+operators (`transmute`, `mend`, `trail`, `null`) scale their axis. The TARIFF
+follows the world effect for free (`explosive@2` prices as `explosive
+explosive`); the WORD price is convex, word × mag² (`MagnitudeWordCost`), so the
+middle of the range is the efficient buy. Ranges are content (`"magnitude":
+{min,max,step}` or `false` in glyphs.json; defaults by sort — count mods,
+deliveries and marks do not scale, bounce/pierce/seek step whole units),
+clamped once at parse. Only equal magnitudes merge (`NodeKey` carries `~mag`
+when it is not 1000). The page sets it with the wheel over a cell
+(`SetMagnitude`, total and self-proving like every op); the scripts/oracle
+corpus has no suffixes and is untouched.
+
+**One signed component per quantity** (2026-09-23, M2). A glyph may declare a
+`default` magnitude and — for the two quantities where "negative" means
+something, gravity added and a wind's speed — a range that crosses zero. `lift`
+(default 1 = one g of lift; `lift@-1` presses down), `speed` (a multiplier,
+default x2, down to x0.25) and `wind` (a burst: positive blows out, `wind@-1`
+is a vacuum) replace `float`/`heavy`, `swift`/`slow` and `implode`, which stay
+loadable (`"hidden": true`: old pages work, the word column does not offer
+them). A serialized word omits its suffix exactly when it is at its glyph's
+default, so an unedited `lift` is written `lift`.
+
+**WHEN an item fires is a property of the item, not a word** (2026-09-23, M3;
+gate `spell-timing`). Any payload item — a word, an operator group, a nested
+box — carries a `SpellTiming`: trigger `hit` (default; what every item always
+did) | `bounce` | `expire` | `launch` | `every N`, plus a `delay` in ticks.
+Serialized on the item's head word (`explosive!bounce`, `projectile!every10`,
+`fire+20`; a box's on its delivery word), carried `SpellStack::timing` →
+`SpellNode::timing` → `EffectInst::timing`, part of `NodeKey`, and refused on a
+mod (it edits its carrier, it does not fire). The flight loop fires each event's
+items through the one `resolve` path — impact and fuse the hit items (plus the
+expire items when an orb's expiry IS its resolve), each bounce the bounce items
+along the rebound, a bolt that dies in the air its expire items, every tick of
+flight `age % every == 0` items, `AdoptLaunches` the launch items at the muzzle
+before the carrier is born; bombs honour hit and every. A DELAY is a one-shot
+`SpellEcho` scheduled by `ApplySpellEffect`, so it is bounded, op-budgeted and
+ticked by code that already was, and a flattened (fatal) payload ignores it.
+PRICE: an item costs its tariff × `FiresIn(carrier, item)` — bounces, life /
+period, 0 for an event the carrier cannot have (a bomb does not bounce) — and a
+delay is free but lengthens the rule-2 tick bound. Only a FLIGHT carrier has
+events; on the hand, `self` and a beam every item fires at the resolve and
+`SetTiming` refuses anything but a delay there. `echo` gained a magnitude that
+scales its repeat count. On the page a plain click on a cell opens the "when
+does it fire?" menu, and a timed cell wears a tag where its stroke leaves.
+Known gap: a delayed or `every` child box is born from the echo queue at
+generation 0 rather than its parent's + 1 — still bounded (tree depth, the
+item's own fire count), but the generation cap does not see it.
+
 **The reference interpreter is the oracle.** `scripts/magic_grammar.py`
 implements the same three rules over the same glyph table and generates
 `docs/MAGIC_PERMUTATIONS.md` (the worked sets, every word, every brief
@@ -6037,8 +6632,14 @@ alphabet, generated in the test: L1 totality (non-empty cast list, finite
 cost, non-empty description), L2 pile commutativity (permuting nouns and
 pending mods within one pile lowers to an IDENTICAL cast list, compared field
 by field), L3 multiplicity (`g g` ≡ `g×2` exactly until the cap — except a
-delivery, which nests N deep, and `also`, which is N+1 sentences), L4 `also`
-additivity (`cost(A also B) = cost(A) + cost(B)` and the casts are the union),
+delivery, which nests N deep, and a mark, which nests rather than enumerates —
+N `lane` words open one lane inside another, and N `end` words with nothing
+open are N charged no-ops), L4 ROOT-LANE additivity (`cost(lane A end lane B
+end) = cost(A) + cost(B)`, two instances, the first carrying exactly what `A`
+lowers to and the second what `B` does — a `count` mod in an arm used to be
+excluded, because rule 4 made it record-wide and it would have fanned the other
+arm too; a count is lane-local now, so the exclusion went away and the law's
+corpus grew from 93,636 cases to 144,400),
 L5 delivery invariance (the payload INSIDE the box of `E… D` is identical for
 every flight D; only the record differs), L6 locality (a unary operator's
 operand is exactly the item to its left, and inserting a word anywhere outside
@@ -6050,7 +6651,19 @@ runtime, since a sentence may legally SAY more than the engine will do),
 `E D1 D2` box is exactly one Launch whose payload is bit-for-bit the lowering
 of `E D1`), **L10 mod placement** (`E μ D` ≡ `μ E D`, and in `E D μ` the mod is
 on the hand record and never reaches inside the box), **L11 flattening** (a
-Fatal cast of any sequence emits no launches). A change that breaks a law
+Fatal cast of any sequence emits no launches), and **L12 lanes** — (a) `E lane
+F end D` lowers to ONE instance carrying exactly what `E F D` carries at
+exactly the same price, the compatibility claim that makes rule 4 free; (b) in
+`E lane F end twin D` instance 0 is `E F D`'s payload, instance 1 is `E D`'s,
+and the tariff is their sum; (c) a sentence with no mark grows no lane anywhere
+in its lowering, which is why every pinned price in the repo is unmoved; (d) **a
+lane may hold a box of its own** — in `lane E D end lane F end D` socket 0
+holds exactly the box `E D` lowers to and socket 1 holds `F`. Check (9) is rule
+4 at runtime: `explosive lane sand end lane fire end twin projectile` fires two
+bolts, one carrying the sand and the other the fire; `lane explosive projectile
+end lane blood mend self end` leaves a bolt AND a graft from one utterance; and
+`lane explosive projectile end lane fire end projectile` is one carrier with
+two sockets. A change that breaks a law
 breaks a *class* of spells, which is what the line says; a change that moves one
 spell's numbers is a rebaseline.
 
@@ -6078,9 +6691,26 @@ health; when neither pays, `DropAll`), or at the hard tick cap
 (`budgets.maxStatusTicks`); a caster may hold `maxStatusPerCaster` at once
 and the aura beyond it is charged and attaches nothing (rule 2). A sustained
 Mod acts on the body as if the body were the delivery: gravity is a per-tick
-impulse the owner applies (`bodyImpulses`; the player's controller today,
-mobs have no impulse seam yet), the rest have no meaning on a body and were
-charged for the word.
+impulse the owner applies (`bodyImpulses`), the rest have no meaning on a body
+and were charged for the word. **The impulse reaches ANY body since
+2026-09-22** — `Mob::AddLift` is the mobs' seam, and it is two seams behind one
+name, because "add a velocity" means two different things to a creature: a LIMP
+rig belongs to Jolt (an impulse at each live limb's centre of mass, mass × dv,
+so the rig gains one uniform speed and a lift does not spin it) and a LIVE one
+belongs to us (the ballistic state `UpdateFall` integrates, the same one
+`Launch` fills). A lift is not a fall: an UPWARD one holds the `launched_`
+latch so the body does not land on the ground it is leaving, and keeps
+`airTime_` at zero so it does not go limp for having been held up past
+`ragdoll.fallSeconds`. A downward one (`heavy aura`) does neither, so it still
+lands. **And the status has to FIND the body first:** `bodyIdAt` measures to
+the body's BOX (`MobSystem::MobBodyBox`), not to `MobOrigin` — which is the
+collider's min corner in x/z and the FEET in y, i.e. ~9 voxels under a human's
+chest, while a bare mod's attach radius is 3. Measured to the origin, a bolt
+that struck a body found no body, the status fell back to being a PLACE, and a
+sustained mod on a place does nothing at all: `float aura` worked on the caster
+and silently failed on everything else. Gate: `--gate levitate` (box height,
+chest-to-origin vs chest-to-box, and a lifted-vs-idle differential on a live
+body and a limp one).
 
 **`null` is the op-stream filter, at the MutationQueue splice.** `W null`
 yields a filter entry (one tick, unless an aura re-issues it every tick) that
@@ -6303,8 +6933,10 @@ in the HUD** rather than dropped silently.
 words, one hand, no menu. Sprint is on Shift outside magic mode and magic mode
 captures the number row, so nothing collides. A slot holds a glyph OR a
 grimoire page (`SlotKind`), both by NAME; the HUD strip draws two rows and
-lights the bank Shift is holding. The character screen's ARSENAL is a full
-column of its own (`ui/inventory_ui.cpp`): the twenty bound keys on top, then
+lights the bank Shift is holding. The character screen's ARSENAL is the lower
+half of the SPELLBOOK panel (`ui/inventory_ui.cpp`; since 2026-09-21 the
+grimoire and the arsenal are ONE window — see below): the twenty bound keys on
+the left, and beside them
 EVERY WORD as a table with one band of rows per sort — matter, effect,
 operator, delivery, mod — the sort's name in a gutter on the left, each glyph
 with its sort's colour and its valence mark (`<` takes the word before it,
@@ -6332,10 +6964,16 @@ the reason shown (`GrimoireWouldCycle`), and an expansion is capped by the
 unbounded expansion, ever). A word that no longer resolves drops with a log
 line and shows as `?`; the page is kept (the DESIGN §8b contract). Two ways to
 make one: `=` in magic mode CAPTURES the stack to a page auto-named from its
-readout (`fire2-trail-projectile`), and the character screen's GRIMOIRE panel
-COMPOSES — its own panel above the pack, in a third column beside the arsenal
-(when the window is too narrow for three columns it falls back to a toggle on
-the arsenal, over the pack). A page list on the left (the authored starters
+readout (`fire2-trail-projectile`), and the character screen's SPELLBOOK panel
+COMPOSES — the upper half of one window that the arsenal shares, as wide as the
+two columns those used to be (2026-09-21). There is no narrow/wide fork and no
+arsenal/grimoire toggle any more: the toggle existed because the two were
+separate panels and a short window could not hold both, which is exactly the
+problem merging them solves. The book's height is split by serving the PAGE
+first — the words get `min(what the table wants, 45% of the body, whatever the
+page does not need)`, quantised to whole rows of cells so a band is never
+sliced through the middle, and the header's `words` button folds the table away
+entirely and leaves the bindings. A page list on the left (the authored starters
 from `glyphs.json`'s `conjoined` block appear read-only; `heal` = `blood
 mend`, `firebolt` = `fire trail projectile`, `ward` = `transmute null aura
 self`), and for the selected page a name, a word row you drag glyphs and pages
@@ -6380,12 +7018,354 @@ page from the sentence. `--shot-inventory` writes a third frame,
 `screenshot_inventory_grimoire.bmp`, with a page selected and its word row
 populated.
 
+**THE SPELL AS A DRAWING, AND THE DRAWING AS A SENTENCE (2026-09-21;
+`game/spellgraph.h/.cpp`, gate `spell-graph`, docs/PLAN_spell_graph.md §4–§6
+phase 2).** The parse tree IS the skill tree the page will draw, so
+`spellgraph` is a VIEW over it and a set of TREE OPS that write back as words
+— imgui-free and VM-side, which is why a CPU-only gate can assert all of it in
+milliseconds. Three pieces. `BuildGraph(lib, castList)` lays the tree out as a
+rooted, layered drawing in integer chrome pixels: the hand bar is the root at
+the MAXIMUM y and the tree grows upward, leaves take slots left to right in
+canonical pile order, a parent is centred over its children, and a join draws
+its `instances` sockets in a row that a SPLIT junction fans upward into — the
+junction sits immediately below the socket row in both orders, so a fan always
+opens forward and never back out of the delivery cell (2026-09-22) — with the
+shared items feeding a BUS below it, each branch's subtree standing over its
+own socket, a copy of the delivery cell capping EVERY branch (one word, one
+record, one primary cell that owns it; the rest carry `primary`), the pending
+Mods as beads on the trunk with their composed edit and the wasted ones
+marked — EXCEPT the one that opened the fan: **a record-wide `count` mod IS the
+junction** and the `Split` node wears its tree node, glyph, edit and span at
+CELL size (2026-09-22), because "one of it becomes several here" and "the word
+that says so" are the same place and drawing them as a 32 px bead a band under
+a 16 px blot made the branch point of the spell the least legible mark on the
+page. A fan opened by LANES alone has no word to wear and stays the blot; a
+count spoken inside a lane splits that branch and stays a bead over its socket;
+a LOSING count word stays a slashed bead. Fusing rather than growing the bead
+is also what keeps "a junction is on the box's axis" true for free — a junction
+is placed there by construction, a bead row of two is not. And
+`CastList::boxPrice` is copied onto every bar so
+the multiplicative price is legible at every level. Instance 0 takes the CENTRE
+slot of the socket row, because rule 4 promises the first lane you open is the
+middle bolt. `Linearize(lib, tree)` says a tree back as words, post-order, with
+a canonical order within each segment of a pile. The edit ops (`InsertItem`,
+`AttachMod`, `FillSlot`, `WrapInBox`, `Unbox`, `Remove`, `Move`, `CloseLane`)
+are TOTAL:
+each works on a copy, re-merges the piles the way the parser would, checks the
+word cap and the instance cap, and then PROVES itself by re-parsing its own
+output and comparing the span-agnostic tree key — an op that cannot write
+itself back as words is REFUSED with a reason rather than returned, so the
+editor can never save words that mean something else.
+
+**A FAN COMES APART THE WAY IT WENT TOGETHER (2026-09-22).** A lane used to
+outlive its last item, always: the instance is real (it still carries the
+shared payload) and the lanes above it are NUMBERED FROM IT, so deleting one
+from the middle would move every bolt after it onto a different socket. The
+price was a fan that could not be taken down — build three lanes, delete the
+three payloads, and the box still spells `lane end lane end lane end`: three
+sockets of nothing and six words nobody asked for. Opening a lane is also a
+SIDE EFFECT (`OpenLaneIfNeeded` opens the ones before a far socket), so the
+leftovers accumulated from gestures never aimed at a lane at all. The rule is
+the asymmetry: a TRAILING empty lane holds nothing in place, so `Remove`,
+`Move` and `Unbox` drop the lane their subject vacated and cascade down through
+any bare lane under it; an INTERIOR empty lane stays, and gets a GESTURE
+instead — `CloseLane(lib, tree, box, lane)`, right-click on a socket — which
+takes the lane and everything in it out and slides the lanes above it down. It
+refuses lane 0 (the shared pile is not a lane) and an instance a `count` mod
+made (there is no `lane`/`end` pair to take out; what closes it is the mod),
+each with its own sentence. Everything still goes through the same `Finish`, so
+a pruned tree proves itself by re-parsing exactly like any other edit.
+
+**A SPLIT WORD ALWAYS FANS WHAT IT LANDS ON (2026-09-22).** A socket drop asks
+for lane `instance + 1`, and a socket with no lane of its own OPENS one — right
+for a payload, and exactly wrong for the word that MAKES sockets. A blank page
+draws one bare socket over the hand, so the only thing a dragged `shotgun` or
+`twin` could do there was `lane shotgun end`: one empty instance carrying a
+split, and the three branches the player dragged it in for were never drawn. So
+`AttachMod` clamps a `count` aimed past the last REAL lane back to the scope
+those sockets belong to (lane 0) — `AttachMod` is the truth and the canvas makes
+the same test only so the sentence under the cursor and the ghost describe the
+drop that is actually going to happen. **And it is right exactly ONCE per box.**
+A second count aimed at a socket of a box that ALREADY fans is not asking to fan
+the trunk twice (that is one split per scope, and the word would be charged and
+do nothing) — it is asking for a twin OF a twin, contained in that branch. So
+the clamp stands down once the shared scope holds a count and the lane opens
+after all: `twin`, then `twin` on one of its two sockets, is `twin lane twin end`
+— two bolts, one of which is two. That nesting is something the grammar could
+always say and the canvas could not reach. The refusal survives only where it
+means something: aiming a second count at a scope that already holds one.
+
+**THE FAN CASCADES (2026-09-22).** From the owner, on `shotgun lane twin end`:
+"the twin doesnt split into 2 more. it should just fractal cascade into more and
+more." It did not. A branch's own split was drawn as a TALLY on the delivery cell
+capping that branch, and the `hand` has no cell per branch — so on the reported
+sentence the second split, which is real in the words, real in the price and real
+in the number of bolts that fly (`RecBolts` charges every budget on the sum), was
+drawn as nothing at all. A split is a split at every depth: a branch firing more
+than one bolt now gets its **own junction and its own socket row inside its
+column**, by exactly the three laws the box's own fan follows — the junction on
+the column's axis, its sockets one band forward of it, the `Fan` edge pointing
+back at it — and the delivery is drawn **once per BOLT** rather than once per
+branch. `laneSplits[k]` is the per-branch count and the VM always had it; only
+the drawing collapsed it. A count spoken inside a lane therefore fuses into that
+branch's junction the same way a record-wide one fuses into the box's, instead of
+being a bead over the pip it splits. Depth past two levels comes from nesting
+BOXES, which recurses through `Place` already (`fire shotgun projectile twin
+projectile` is a fan feeding a fan). The column budget is now `sum(laneSplits)`
+rather than `instances`; a box past it keeps the older collapsed drawing, and no
+legal 32-word sentence reaches that — it is a guard, not a path. Consequences
+worth naming: cells per box became "one per bolt, or one per branch when
+collapsed, and every branch capped at least once" in the gate's law 3, and
+`boxOf` in the canvas became a back-pointer (`SpellGraphNode::owner`, set on every
+socket, bus and junction at every depth) because the old search over each join's
+`sockets` list could not see a sub-fan's pip and refused every drop on one with
+"that mark has no box".
+
+**FURNITURE IS ONLY DRAWN WHERE IT SAYS SOMETHING (2026-09-22).** A box's socket
+row means "how many of this" and its bus means "what all of them share". Drawn
+unconditionally they were a row of ONE pip and a rule spanning ONE item with
+nobody to share it with — and they cost two of the bands the canvas has to fit a
+whole spell into. The page holding the single word `projectile` came out FIVE
+bands tall (hand, pip, rule, pip, bolt) and three of them were news to nobody;
+worse, the two pips were one socket each on two DIFFERENT boxes, which is the
+one thing the picture could not say. So a **socket row** is drawn where the
+branches can differ — `instances > 1`, or a lane distinguishing one from the
+shared pile — and a **bus** where it actually shares: more than one bolt to
+carry it, or more than one item collecting on it. Otherwise the payload runs
+straight into the delivery cell, which is the whole truth about it. `projectile`
+is two cells now and `fire projectile` is three; `sand gust gust shotgun
+projectile` is unchanged, because there every mark on it is earned. Nothing
+about the spell moves — both are synthesized chrome and the words are identical
+— and the gate's socket law became "no row, or a full one" (a row that is drawn
+and SHORT is still a word that vanished). Measured over the op fuzz: 42,768
+graph nodes to 32,446, a quarter of the drawing gone and none of it meaning.
+
+**AN EMPTY SLOT IS A HOLE IN THE OPERAND ROW (2026-09-22).** `_ trail`, `_ mend`
+and `_ null` are half-words: each does nothing until something is spoken before
+it, and each is FUSED to whatever fills it. The page said so with a ~21 chrome-px
+hollow ring hung off the LEFT EDGE of the cell — eleven screen pixels at the fit
+rung, the smallest mark in the drawing, carrying its single most important fact,
+in the one place the layout otherwise uses for nothing. An operand is the row
+BELOW its operator (word order, bottom to top), so the MISSING operand is now a
+`GraphKind::Hole`: a cell-sized blank standing in that row, on the operand band,
+with its own `Slot` stroke up into the word it is waiting for. It is not a node
+of its own — it carries the OPERATOR's `treeNode` and `instance` is the side, so
+a drop on it is the same `FillSlot` the pip used to latch, on a 64 px target
+instead of 21. Drawn as the mark the grammar itself writes: a tablet ruled in
+DOTS with the underscore across it, in minium. And the operator's cell and the
+row it binds are enclosed in one faint CLASP — the reader's box round a phrase
+that has to be read together — because an operand used to be a cell with a
+stroke, exactly like an item feeding a bus, and the two mean different things. A
+FILLED slot keeps its pip: that stud is what says which side bound it.
+
+**THE ROUND-TRIP LAW, and the two trees that break it.**
+`Parse(Linearize(Parse(s)))` is `Parse(s)` node for node and lowers to an
+identical cast, for every sentence in the oracle corpus and every generated
+sequence of length ≤ 3 — that is what makes the drawing and the sentence one
+truth rather than two. Ordering a segment is therefore not a sort: a group with
+an EMPTY LEFT slot must come first (anything before it would fill the slot),
+the one item that speaks a delivery of its own must come next (that delivery
+boxes whatever is already in the pile), a group with an empty RIGHT slot must
+come last, and no item may start with the word the previous one ended with
+(they would merge into one item of multiplicity 2). And the grammar already
+has a WALL word for the last two of those, which the linearizer spends: an
+`end` with no lane open is a charged no-op of word cost 0, and a sentence uses
+one exactly this way — `transmute end fire` says "transmute's right slot stays
+empty and the fire is beside it", `null end null` says one `null` took another
+rather than `null` twice. The first two rules are about the PILE, which a no-op
+does not touch, so nothing saves those but a different order; and a wall is
+only spoken where no lane is open, because inside one an `end` would close it.
+Two trees the rules can
+hold that no word order rebuilds: TWO ITEMS CONTAINING A DELIVERY in one
+segment — the second box would swallow the first, and two independent
+deliveries are two LANES, which is what rule 4 is for — and two incomplete
+unary operators in one segment where either accepts the other's result sort
+(`(_ echo)` beside `(_ null)`), since whichever is spoken second binds the
+first. `Speakable()` names both, in those words, and every op refuses on it.
+
+**THE PAGE IS THE INTERFACE (2026-09-21; `ui/spellgraph_ui.h/.cpp`, phase 3).**
+The grimoire composer gains a CANVAS above its word row, and the row stays under
+it as the spoken form — what a bound key will actually say. The canvas draws
+`UIState::spellGraph`, a plain-struct mirror main.cpp fills each frame by running
+the composed words through `ExpandWords → ParseSpell → LowerSpell → BuildGraph`
+(so the drawing and the readout under it are of the same spell, by
+construction); `overlay.h` stays imgui-free AND spell-free, so the mirror is
+ints and strings and every glyph crosses by NAME. Node chrome is the panel's
+own: the glyph cell for a word, pips for an operator's filled slots and a ruled
+BLANK in the row below for an empty one, a bar with its delivery's noun in caps for a
+join, its `instances` sockets over it, a bus stroke across them, mod tags off
+its left end and `tariff + carry ×N = subtotal` under it, and the hand bar with
+the cast's three price parts and a mana `ValueBar`. Nodes are joined by
+`ui::InkStroke` — a cubic flattened to twelve segments and drawn with
+anti-aliasing OFF at a width quantised to whole 2 px steps, thin at the tip,
+full at the belly, thin into the join. The canvas picks an integer 1× or 0.5×
+scale of the layout's chrome pixels and scrolls when a tree still does not fit,
+framing the deepest join; the LAYER PITCH on screen is the canvas's own choice
+(tight enough to clear a cell) because spacing is a drawing decision while node
+SIZE is the layout's. **The canvas applies no op.** Every gesture — a word onto
+a bus or a socket, a word into an operator's blank, a delivery onto a branch, a mod
+onto a bar, right-click to unbox or remove, a branch dragged to another socket
+or out of the panel — pushes the composer's existing undo and latches a
+`UIState::GraphEditIntent` naming one of `spellgraph.h`'s total ops; main.cpp
+re-parses the composed words, applies it, and writes `Linearize`'s result back
+into `grimoireEditWords`, or puts the op's own refusal on the status line. Every
+target PEEKS at the payload, so a gold ring, a ghost and a reason are drawn
+before the release. **And the number row now CASTS**: in magic mode a number key
+SELECTS the spell bound to it (a page, or one glyph as a one-word spell), the
+stack becomes its expansion, right-click casts it, and the selection persists
+across casts. Speaking one word per key and `=` capturing the stack are gone —
+authoring happens on the page, which is a surface with room for it.
+`--shot-inventory` writes a fourth frame, `screenshot_inventory_graph.bmp`: a
+copy of the `duststorm` starter with `shotgun` on it and a lane holding `fire`
+added through the intent path.
+
+**The screen makes room for it.** The PACK is as tall as what is in it — the
+row holding the last filled slot plus one empty row to drop into, keyed on the
+highest filled INDEX rather than on a count (nothing compacts the bag, so a boot
+at slot 30 would otherwise vanish), and nothing in it at all is the in-hand
+strip alone — and its grid and that strip stand SIDE BY SIDE under the book,
+which is 86 px the composer wants far more than the pack does. Everything that
+frees goes to the page. The composer's own band went the same way: save / copy /
+delete moved up beside the NAME (they are pressed once, at the end, and they had
+a row of their own as far from the name they act on as the panel allows); the
+word row is a compact strip sized to the sentence rather than a grid of all 32
+cells, with the PRICE laid out from the composer's right edge on the same band;
+and the READOUT is prose alone, spanning the whole body under both columns — at
+the composer's width `DescribeSpell`'s verdict wrapped to six lines and ate the
+canvas, at the body's width it is one or two. It wraps and is never clipped.
+
+**THE CANVAS CARRIES NO WORDS** (2026-09-21). A node is the sort's engraving
+over the glyph's own colour and nothing else: one silhouette per sort (droplet /
+spark / arrow / bracketed bar / spiral, and a ring for the hand), the
+multiplicity as PIPS over the node rather than an "x3" badge, an incomplete
+operator dimmed and SLASHED rather than captioned with a struck-through number,
+and a wasted mod slashed the same way. The name, the price at that level, the
+instance and lane counts and a cut fan are all in the hover box that already
+existed. It used to spell every leaf under its cell, write the delivery's noun
+in tracked caps across every bar and hang `tariff 441 + carry 882 x3 = 1323`
+under it — three kinds of type at three sizes inside a band 300 px wide, all of
+which collided, clipped, and crossed the strokes. The drawing is the SHAPE of
+the spell; the numbers are on the price band under it where nothing can clip
+them, and the names belong to whatever is under the cursor. The drawing is also
+CENTRED in its band and pinned there whenever it fits, and each LAYER is as tall
+as the tallest node in it rather than a uniform pitch — a bus is 16 px and a
+uniform grid spent a 64 px band on it twice in every spell that shares anything
+(`duststorm-mine`: six layers, 252 px uniform and clipped, 198 px per-layer and
+whole).
+
+**THE BOOK OPENS AS A SPREAD OF VELLUM (2026-09-22; `ui/theme.*`,
+`ui/spellgraph_ui.cpp`).** The spell page is no longer chrome: it is a LEAF,
+and the drawing on it is an illuminated quadrivium diagram - iron-gall brown
+for the figure, a rubricator's vermilion for what governs it, and the earth
+pigments an illuminator had (verdigris / azurite / orpiment) for the five
+sorts, all of them new `Col*` entries beside the obsidian-and-gold family
+rather than replacing it. The binding stays dark; the page inside it does not.
+Three columns are on the same stock and read as one open book: the INDEX of
+pages (the verso, each name on a ruled red line with a marker at its place),
+the DIAGRAM (the recto), and under both the COLOPHON - what the page means,
+opened by a rubricated `ui::Versal`, the initial changing with the page. The
+spoken row and the price band between them are on the same sheet, and a word in
+the row is the same roundel the canvas draws, at the row's size
+(`ui::GlyphRoundel`).
+
+**THE GROUND IS DRAWN IN PAGE COORDINATES, which is the whole point.** The
+recess was painted in window coordinates with the tree sliding over it; a page
+is the opposite - what a drag moves is the SHEET. So `PaintLeaf` runs after the
+rung and the pan are resolved and draws everything in the drawing's own space:
+the ruling on the layout's 32 px module, the pricked margins, the foxing (one
+decision per 96 px page cell, hashed on the cell so a blemish belongs to the
+sheet), and the GREAT FIGURE - concentric rings, twelve ticked houses, two
+lesser circles in proportion - behind the tree. A pan moves all of it together,
+which is both the manuscript's look and the only landmark a pan has to move
+against.
+
+**THE VOCABULARY IS COMPASS AND RULE.** `PixelArc` / `PixelRing` / `PixelDisc`
+/ `PixelLozenge` / `DottedRule` in `ui/theme.*` draw stepped figures on the same
+2 px lattice as the rest of the chrome. A word is a ROUNDEL (wash of the glyph's
+own colour, the sort's pigment on the rim, the engraving in ink), an operator a
+TABLET with bracket serifs, a delivery a DOUBLE RING (the hand a triple one with
+twelve ticks), a mod a LOZENGE threaded on the trunk, a socket a pricked POINT
+(a donut, because a 2 px ring at r=4 quantises to a diamond), the bus a ruled
+line in minium closed by serifs. Hover is the reader's bracket, an accept is a
+pricked ring, a refusal is the corrector's hatching - a page has no backlight,
+so nothing here is said with a glow.
+
+**`ui::InkStroke` became a RIBBON.** It was a polyline of thick `AddLine`
+segments, which is why it looked broken: an unjoined 6 px segment opens a notch
+on the outside of every bend and doubles the ink on the inside, and quantising
+each segment's width to a 2 px step turned the taper into a staircase. It is a
+quad strip now - consecutive quads share their end vertices, so the edge is
+continuous however hard the curve turns - with a nib profile, a deterministic
+tremor along the normal seeded from the endpoints (a wobble reseeded per frame
+is a stroke that CRAWLS), a paler wider pass under it for the bleed into the
+fibre, and a blot where it leaves its parent. The tremor is a fraction of the
+stroke's LENGTH and a short stroke has none: the page is full of 10 px hops
+from a pip to its bus, and a fixed 2 px wobble made every one of them a
+squiggle.
+
+**IT FITS NOW, AND WHEN IT CANNOT IT SAYS SO.** Two-thirds of the drawing's
+height was furniture: a socket row (32) and a bus (16) were each given a band
+and a full gap, so `fire projectile` - the smallest spell there is - came to
+216 px in a band of 192 and was CUT at both ends, as was almost every page in
+the gallery. Bands are per-layer and squashed (a bus is a rule, a pip row is
+pips), furniture TOUCHES what it belongs to at the fit rungs and opens up from
+1x where you have zoomed in to read, and the fit may fall to the 0.25x overview
+rung rather than clip. That rung draws a DIFFERENT figure - a filled disc in
+the sort's pigment, no engraving, no tally, a solid bead - because at 16 px a
+wash, two rings and a 16 px sprite are four pictures in nine pixels. What still
+overflows fades into the binding's shadow with a pricked chevron pointing that
+way, instead of being sliced.
+
+**THE BOOK IS SHUT UNTIL YOU OPEN IT (2026-09-22; `UIState::spellbookOpen`).**
+The character screen is two things at once - a place you take stock (body,
+gear, pack) and a place you WRITE - and the second wants every pixel on the
+screen while the first wants none of them. So the spellbook lies CLOSED by
+default: a spine across the top of its column carrying the header, the ten
+BOUND keys (the only part of the book that matters while you are looking at
+something else - they are literally the number row the game is listening to)
+and an invitation. The whole cover is the button, not just the 96 px one on
+the header bar.
+
+Open, it takes the WHOLE column - full width (`bookRoom`, not the ideal width
+it is clamped to when shut) and top to bottom - and **the pack is not drawn at
+all**, which is what "the book covers the desk" means: a panel that is not
+drawn has no slots. Measured on a 1600x900 screen, the canvas goes from ~200 px
+to ~430, which is the difference between a five-word spell at the 0.5x fit and
+the same spell at 1x with its engravings legible. Shut, the pack takes the room
+back and shows every row it has, sized to its content rather than stretched to
+the bottom rule.
+
+Two things the shut book changed elsewhere, both structural: a CORPSE is
+measured against the column rather than against the book's rect (a loot panel
+clamped to a 190 px spine loses every row past the second), and the pack is
+placed under whatever the column above it actually came to (`colBottom`) rather
+than under `top + bookH`, because a corpse now STACKS on top of a shut book -
+the spine is short enough to survive beside one, so your bound keys stay on
+screen while you loot. The spell-graph mirror is built only while the book is
+open: shut, nothing reads it, and it is a parse and a lowering per frame.
+
+**`--shot-spellpage` is the gallery** (`main.cpp`): the composer, ten word
+lists chosen to put a different piece of the drawing under the lens (a minimal
+tree, the shipped example, an operator with a hole in it, a bare `_ trail` and a
+bare `_ transmute _`, nesting, lanes, a
+nine-socket fan, eighteen words that cannot fit, an empty page) and two shot at
+a DRIVEN view - panned and at 1x - because the ground moving with the drawing is
+a claim only a picture of it moved can make. One BMP per scene,
+`shot_spell_<scene>.bmp`, in one boot.
+
 Selftest gates `spells` (the trail's voxel budget respected exactly and the
 projectile dead with it; an overcast resolving Fatal, emitting its own payload
 and asking for the caster to be carved; `fire`×N throwing exactly N times the
 matter of `fire` at exactly N times the price; the cast latch; the laws; the
 bomb, the sustained things, the mend), `spells-oracle` (the parser against the
-reference script, every entry) and `grimoire`.
+reference script, every entry), `grimoire`, and `spell-graph` (the round trip
+and the lowering over the whole corpus plus every generated sequence of length
+≤ 3; linearizing is a fixed point; a few hundred generated (tree, op, target,
+glyph) cases each either applied or refused with a reason; the two unspeakable
+trees refused by name; the plan's §2 worked sentences BUILT from a blank page
+one gesture at a time; and the layout's own sanity — no two nodes of a layer
+overlap, every child sits inside its parent's span, a join has exactly
+`instances` sockets, each lane feeds exactly one, the root is at the bottom).
 
 ### Items, and mouse-directed melee (2026-08-20; `game/item.h`, `game/melee.*`)
 
@@ -6609,9 +7589,133 @@ Multiplying `edgeAlign` in a second time when the kerf is built would square it.
 gate that only wants the geometry needs no item) and `EdgeSweep::tick` seeds the
 wound's counter-based RNG.
 
+### A SWING IS ALSO A DERIVATIVE, AND A POSE IS ALSO A SOLID (2026-09-21)
+
+Owner report: *"many of them will look good for like 60% of the animation and
+then the sword will spin / clip through things / teleport around super crazy
+fast"*, and *"many of the animations cause the character's arm to clip through
+their own body"*. Two complaints, and **neither was a thing any gate could
+see** — every swing gate above asserts on where a stroke ENDS UP (the arc it
+swept, the channel it travelled in, the pose it started from), so a stroke that
+arrives in the right place by a route with a step in it passes all of them.
+
+Two instruments were built, and they are the durable part of this:
+
+- **`--gate swing-smooth`** (CPU-only, milliseconds, `test/selftest_swing.cpp`)
+  replays every authored HELD style through the shared runner and asserts on
+  the PER-TICK CHANGE: the hand's and the point's travel bounded on the SECOND
+  difference (a committed cut legitimately moves the point six voxels in a
+  thirtieth of a second — what distinguishes a swing from a teleport is whether
+  the speed ARRIVED), the blade's direction and roll on the first (they have no
+  equivalent of a cut's speed, so a large step there IS the defect), the arm
+  CLAIM on the first, and the flat's SIGN REVERSALS on a count. Roll is measured
+  against the PARALLEL-TRANSPORTED previous flat — the naive angle between
+  consecutive flats is dominated by the blade turning, and measured that way
+  every style reported ~2.3 rad of "roll" and the number said nothing.
+- **`game/selfclip.h` + `--gate rig-clip`** answer *is this pose inside
+  itself*, which nothing in the engine could. A mob's limbs are deliberately
+  excluded from colliding with each other and a live limb is KINEMATIC, so Jolt
+  is never consulted about a pose; `AnimClampPoseLimits` bounds one joint at a
+  time and says nothing about where the shape on the end of it ends up. The
+  detector counts SOLID COLLIDER VOXELS of one limb standing inside another —
+  art-level, not box-level, because every limb's box overlaps its parent's at
+  the joint by construction — **differenced against the BIND POSE**, so the
+  shoulder ball that is always in the chest is not a finding and a forearm
+  swung through the ribs is. Pairs that share a joint are reported against
+  their own looser number, because a shared pivot buries more of one in the
+  other on every rotation and the bind-pose baseline cannot subtract that.
+
+**What the instruments then found, in order of how load-bearing it is:**
+
+1. **THE ARM CLAIM STEPPED FROM 1.0 TO 0 IN ONE TICK at the end of a swing**,
+   and that is the "teleport". `MeleeState::recoverHold_` is latched at the
+   Slash -> Recover transition ("the button is still down, so the arm is kept")
+   and **had no path that ever cleared it**, so a stroke that committed a cut
+   and then released held `PoseWeight()` at a full 1.0 for the whole recover
+   and dropped it to zero on the single tick the phase ended — and the rig
+   blends the ENTIRE two-bone solve and the wrist by that number. Fixed in two
+   places, because the authored `recover` ticks and the driver's own
+   `melee.recoverTime` are independent numbers that nothing made agree: the
+   latch is cleared on release (and the fade clock restarted, so it is a full
+   `recoverTime` FROM the release), and `StepStrokeProgram` will not report
+   `Finished` — the tick its caller drops the pose claim outright — while
+   `PoseWeight()` is still high. Measured on `swing-smooth`: worst claim step
+   **1.000 -> 0.152**.
+2. **THE ARM GOES THROUGH THE CHEST, and the head sphere was the only keep-out
+   there was.** `melee.headClear` covered the one body part a BLADE could be
+   swept through and left the one an ARM actually goes through untouched: a
+   backhand's windup drives the commanded point to the far azimuth stop and the
+   hand is that point minus a WHOLE BLADE, so it lands inside the ribs with the
+   forearm trailing through them. `Mob::BodyKeepOut` reports the trunk as a
+   capsule with an **elliptical** cross-section (a chest is half as deep as it
+   is wide; one radius off the width reaches out to where a guard is held),
+   inflated by the swinging arm's own half-thickness — the clamp bounds a LINE
+   and the detector counts a SOLID, and that gap is the arm's radius. The clamp
+   bounds the whole **shoulder-to-hand chord**, not the hand: a chord with both
+   endpoints outside a capsule passes straight through the middle of it, which
+   is exactly a backhand's chamber, and pushing only the hand left the forearm
+   84-105 voxels deep. Near the spine the radial direction is meaningless, so a
+   crossing arm resolves to passing IN FRONT — anatomy, not a tie-break, and
+   picking the radial there made `horizontal_r` worse rather than better.
+   Measured, summed over the ten held styles' driven phases: **476 -> 361
+   voxels**, better on six, worse on one.
+3. **AND THE RIG UNDOES PART OF IT, which is why `rig-clip` lands RED.** The
+   gate prints `ikMiss 0.00` on every style — the two-bone solve lands the hand
+   exactly where the driver asked — beside `shoulderClamp` up to 1.74 rad and
+   `roundTrip` up to 3.83 voxels. `AnimClampPoseLimits` runs AFTER the driver's
+   keep-out and takes the shoulder's authored ball limit off the result, so the
+   arm that ends up in the ribs is the CLAMPED pose and not the commanded one,
+   and **no further work inside `melee.cpp` can move it**. The fix is at the
+   pose seam — re-apply the keep-out after the clamp (it is a pose
+   post-process, like the IK it sits beside), or teach the clamp to project
+   onto the keep-out surface rather than onto the cone alone. Recorded rather
+   than bolted on: both are changes to the pose pipeline with their own hash
+   consequences.
+
+**Two fixes were measured, found real, and NOT LANDED, with their costs.** Both
+are one JSON edit away and both are recorded here because "we tried it" is the
+expensive half of the knowledge:
+
+- **Bounding the lean plane's turn.** `perpL_` chases the tip's TRAVEL, and
+  travel reverses at the end of every cut — asking the plane to turn by pi,
+  which carries the HAND through `pi * bladeLen * sin(lean)` of arc about the
+  shoulder-to-point line. That is the whole arm whipping round a blade that has
+  nearly stopped, and `leanTurnRate` does not prevent it, it only makes it take
+  0.17 s. Two formulations were tried — hold the plane to the arc the tip is
+  actually covering (`leanChaseRatio`), and refuse to chase a near-antipodal
+  target at all (`melee.leanFlipHold`, which is what ships, defaulted to pi =
+  off). Both measure well on the blade (a radian per swing of unasked-for
+  rotation gone) and **both move the arm enough to fail `swing-plane` and
+  `player-styles`**: the joint bulges 0.674 rad in front of its own
+  shoulder-to-wrist line against an authored 0.50, and a thrust loses its posed
+  travel. Sweeping `leanChaseRatio` found exactly one value (4) that threaded
+  between the two gates, with 2 and 8 each failing a different one — a knob
+  tuned to thread a needle between two thresholds is a flake, not a fix.
+- **A smoothstep velocity profile on the cut.** `StepStrokeProgram` closes the
+  remaining gap in equal shares, which is a deadline controller with a FLAT
+  velocity profile: the blade goes from still to full speed on the tick the
+  windup ends and from full speed to nothing on the tick the cut does. In
+  between it is perfectly smooth, which is why every gate passed it. Shaping
+  the closure on `S(u) = 3u^2 - 2u^3` gives `S'(0) = S'(1) = 0` and would also
+  read the damage speed at the MIDDLE of the travel, where the cut is centred
+  on the aim. It costs `npc-block`: `melee.blockGap` is sized to the shipped
+  geometry by 1% (its own note says so), and any change to when the blade is
+  where stops two swinging edges closing inside it.
+
+What DID land beside the two above: the blade's flat is chosen with the sign
+that agrees with the roll it already has (a flat normal names a PLANE — the
+damage model takes `fabs` of it — and `tangent_` reversing made the commanded
+normal jump to its own negative, which `Lerp` then carries THROUGH ZERO into an
+arbitrary `AnyPerp`), and `melee.flatMinSin` / `melee.leanMinSpeed` stop the
+roll and the lean plane being decided by numerical dust when the travel is
+nearly parallel to the blade or has stopped — the old guards were `1e-3`, three
+hundredths of a degree and a thousandth of a voxel per second.
+
 `--gate swing` covers the mapping (CPU-only, milliseconds, its own fixtures);
+`--gate swing-smooth` covers its derivative over every authored style;
 `--gate swing-plane` drives the same driver through the real rig and asserts on
-the sword's own world trajectory; `arm-readback` inside `--gate mob` covers the
+the sword's own world trajectory; `--gate rig-clip` asks what the pose went
+THROUGH rather than where it went; `arm-readback` inside `--gate mob` covers the
 inverse against a target the test chose, since a dropped yaw or a flipped x is
 invisible on a rig standing at heading 0 and mirrors the answer.
 
@@ -7436,6 +8540,25 @@ that is what makes a telegraph mean something. The windup's own target is
 `aim − cut/2`, so the middle of the travel passes through the aim rather than
 the beginning; a stroke aimed at its own start point cuts the air behind the
 target every time.
+
+**A cut is a PATH, not only a chord** (2026-09-21; `cut-path` gate). One
+segment can express only a straight line through the target, so a hook that
+comes round a guard, a chop that drops and then drags, and a feint that checks
+and re-commits had no authoring surface at all — and adding another *style*
+cannot make one, because the thing missing is inside one stroke. So `cut` may
+be a **list of legs** (`kMaxCutLegs` = 6) run back to back inside the one Cut
+phase: each leg is an ordinary segment meaning what the single cut meant, a
+travel from wherever the previous leg ended, its deltas divided by its own
+ticks — so a short leg is a fast one and a leg that travels nowhere is a legal
+**hitch**. The phase does not split: `cutTicks` is the total, `phaseTick`
+counts across it, and everything outside `strokes.cpp` that asks "is this
+cutting" or "how many cut ticks are left" — the damage sweep, the bite holdout,
+every gate — needs to know nothing about legs. With a path, "half a cut"
+becomes **which leg meets them**, authored as `"aim": true` on that leg and
+defaulting to the midpoint of the whole travel (which for one leg is `cut/2`
+exactly, so every style written before this is unchanged — the determinism hash
+did not move). The tuner's Attacks lane adds and removes legs; the *shipped*
+library is still all single-leg.
 
 **Variation is deterministic.** Style pick, start bow and tempo are all
 `rng::Hash3(mobId ^ salt, tick, index)`, so ten swings differ and the fight
@@ -8581,6 +9704,21 @@ where you hear from either (§12b, "The ears are on the character").
   (`atomicAnd`+`atomicOr` per byte, `atomicMax` on the occupancy flag, which
   keeps it conservative: never falsely zero). Atomics are legal here precisely
   because cascades carry no determinism requirement.
+  **A dirty chunk whose far-visible matter did not change is skipped
+  (2026-09-22).** The dirty list says a chunk was WRITTEN, not that anything
+  the cascade holds changed — and gas never reaches the cascade, so a burning
+  forest's ~5,000 smoke-awake chunks were re-downsampled every tick for
+  identical bytes (15.4 ms/frame, the largest GPU row in the fire). `fardown`
+  now opens with one coalesced read of the chunk, sums a per-cell hash of every
+  cell `farCellIsSolid` keeps (position + material), mixes in the world chunk
+  coord and the eight level origins, and compares against `World::farSig[slot]`
+  (one u32 per slot, far group binding 6). Equal = return. `FarField` zeroes
+  `farSig` on every `ResetLevel` / `FullRefill`, because a refill re-derives the
+  level from procgen + patches and the next dirty tick must downsample afresh.
+  A 32-bit collision skips one downsample of render-only data. The per-sample
+  procgen (`genColumn`, the column top) is also hoisted to one call per COLUMN
+  (a thread per column, cells in an inner loop): 8x fewer at level 1.
+  Together: 15.4 -> ~1.8 ms/frame on the fire.
   **Edits SURVIVE a cascade refill (edit persistence, 2026-08-24;
   `src/sim/faredits.h`):** the downsample above is only half the story, because
   the sieve is the other producer of the same cells and it knows nothing but
@@ -9420,8 +10558,9 @@ point where the accumulated GAS crosses half opacity (`MEDIA_HALF_TAU`, ln 2;
 the honest single depth for a volume: a wisp never reaches it and nothing
 changes, geometry beyond it is more hidden than shown, and geometry in FRONT of
 it still wins the reversed-Z test and draws over the flame. Liquids are excluded
-— they have a real interface (`liqT`) and already report it. Ordering geometry
-*inside* a plume still needs order-independent transparency.
+— they have a real interface (`liqT`), and since 2026-09-23 a clear one reports
+the depth BEHIND it and hands raster geometry a per-pixel veil instead (§9.zz).
+Ordering geometry *inside* a plume still needs order-independent transparency.
 
 Gated by `--selftest --gate fire-depth`, which renders a stone block behind a
 fire slab and the same block in front of it and compares both against the flame
@@ -9521,6 +10660,32 @@ fixed number of depth steps at any distance: the largest bias is 1.9e-3 of view
 depth, four thousand times the rounding it must beat and under a hundredth of a
 voxel at arm's length.
 
+**A limb's overlap is ONE cell stored twice, and the two copies share its
+state** (2026-09-23, `Mob::SyncJointTwins`). The same overlap exists between a
+creature's own limbs: mobgen's stack overlaps (`ARCHETYPE.stack[].overlap`) put
+the bottom 2-3 cells of the torso inside the hips, the top of each thigh inside
+the hips, and so on, so a bent joint never opens a gap - 1,904 coincident cells
+on `newcomer`, 896 of them hips/torso. Every lattice writer (rot, fire, coats,
+carves) is per-limb, so the two copies used to live separate lives, and
+`BODY_Z_PRIORITY` then made the covering PERMANENT: a torso cell turned green
+by the rot sat under the hip's pristine copy forever (owner report). The fix
+keeps the overlap and links the copies: at the first sync each parent/child
+pair's rest-pose-coincident cells are linked by REST lattice coordinate (a
+compaction or a brick rebase moves indices and local coords, never that), and
+from then on a change to either copy is copied to the other, FIELD-WISE and only
+when it changed - material+art, coat, and removal (tombstoned and flushed
+through the rot's FlushBurn tail). Copying never runs parent-over-child, so the
+authored difference between the copies (the torso's rim is skin where the hip's
+copy of that cell is muscle) survives until something happens there; when both
+copies change the same field in one tick the parent wins. An infectious
+material carries the infection with it; a self-active one marks the receiver
+alight. A sever or respawn rebuilds the links. Rejected: partitioning the
+overlap (reopens the gap it exists to hide), hiding one copy near rest (a guess
+that fails back into this bug), a single skinned lattice (the right end state,
+and a rewrite of every per-limb path). Cost is zero on a creature nothing is
+happening to (`twinDirty_`, set by `MarkInstancesDirty` and every coat writer)
+and one pass over its twin cells otherwise. Gate: `joint-twins`.
+
 **Bounds and cost.** The per-fragment DDA is hard-capped at `3·maxDim + 4` steps
 (worst-case diagonal of the brick) with no data-dependent loop bound anywhere.
 The draw list is CPU-compacted, so the instance count IS the number of micro
@@ -9601,7 +10766,15 @@ geometry. Every dirty walk stamps the 17×17 columns around its chunk
 (`openTouchAround` — column STAMPS, not the chunk WALKS the paragraph above
 refuses), and so does the refresh when it meets a chunk that arrived in a slot
 with a stale stamp (its neighbours' faces were marched against whatever the
-slot held before). A refresh visit whose column was not touched since the
+slot held before).
+**A dirty chunk whose RAY BLOCKERS did not change skips the dirty walk**
+(2026-09-22). A fourth plane, `OPEN_SIG_BASE` (declared in
+`sim_openness.wgsl`, sized by `kOpennessGenWords`), holds each slot's
+blocker signature at its last dirty walk; the walk computes the current one in
+a single coalesced read and returns if it matches and the stamp is current.
+That makes the chunk exactly a chunk that was not dirty: its own faces are
+unchanged, and a blocker that changed elsewhere stamps the touch plane from its
+own walk. Gas is not a blocker, so smoke-awake chunks stop costing a walk. A refresh visit whose column was not touched since the
 slot's last full walk keeps its bytes and does only the irradiance
 maintenance — the coarse sun re-sample for a face that marched, the decay for
 one that could not — because that half must never stop (the
@@ -9817,6 +10990,70 @@ casts one ray per FRAGMENT with nowhere to accumulate, so a limb still takes a
 hard edge; the terrain under it does not. Per-fragment cone jitter would dither
 it at the cost of noise on a moving body, which is the artifact this pass exists
 to avoid — the honest fix is a body-side cache, and it is not written.
+
+### 9.zz THE WATER VEIL — raster bodies under a liquid surface (added 2026-09-23)
+
+**The defect.** Bodies, micro bodies (every mob) and particles are rasterized
+after the raymarch and composite by depth, and the raymarch wrote its depth at
+a liquid's SURFACE (it shades the interface, then keeps marching to light the
+bed). Every body fragment below the waterline failed the depth test: a wading
+mob was cut off at the surface as if the lake were concrete (owner report:
+"completely obfuscated").
+
+**Why a depth alone cannot fix it.** Moving the depth behind the water makes
+the body visible but draws it untouched — no absorption, no Fresnel, no foam —
+floating in front of a lake whose bed beside it is tinted cyan. The body needs
+the SAME optics the bed got, evaluated at its own distance, and those depend on
+per-pixel state only the raymarch has (the surface's Fresnel, reflection, foam,
+the column's coefficients).
+
+**The fix: record the equation, not the answer.** Every water shade in
+`raymarch.wgsl` (`shadeWater`, `shadeSubmerged`, `shadeMpmFluid`) has the form
+`final = Arest + K·(lit·caustic·T(d) + scatter·(1 − T(d)))`, with T(d) =
+exp(−absorb·d) over the path d in the liquid. The raymarch solves it for its bed
+and writes the COEFFICIENTS per pixel — K, A = Arest + K·scatter, S =
+K·scatter, absorb, the surface distance, the path cap and the caustic
+curvature: six words, `VEIL_WORDS` (common.wgsl THE WATER VEIL), at render
+binding 24. A body fragment at distance `dist` beyond the surface shades
+`A + T·(K·lit·caustic − S)`; one nearer than the surface takes the ordinary
+air fog. The raymarch then writes the depth BEHIND a clear liquid (viscous
+ones — blood, oil — keep the interface and record no veil). Fog is not
+double-counted: the body shades unfogged (`litColorSNoFog`) and K/A already
+carry the air fog to the surface. Caustics are split into curvature
+(`waterCausticCurv`) and a depth law (`veilCaustic`) so a mob on a lake bed
+wears the bed's web.
+
+**The pass split.** The veil is a fragment-stage STORAGE write read by later
+draws of the same pass, and no barrier is legal inside a rendering scope.
+`Simulation::DrawWorld` ends with `RenderPass::SplitAfterFragmentWrite`, which
+ends the scope, emits the fragment-write → vertex/fragment read+write barrier
+(`vk::Recorder::SplitRenderingAfterFragmentWrite`), and reopens on the same
+attachments with LOAD — in the one function every world pass calls, so none of
+the dozens of DrawWorld-then-DrawBodies call sites changed. A pass with no
+DrawWorld (the character portrait) binds `renderBGNoVeil_` (a one-word buffer
+the bounds test rejects), so it never reads a veil written for other pixels.
+
+**Cost.** One store per pixel (w0 = 0) for a dry pixel; six for a water pixel;
+six loads per body fragment. The buffer is 24 B/px (~50 MB at 1080p), grow-only.
+Without fragment stores (`WATER_VEIL` = `SHADOW_CACHE_AVAILABLE`) the old
+contract holds exactly.
+
+**What it does NOT do: refraction.** Nothing is bent. That matches the terrain —
+the CA water shade lights its bed along the UNBENT primary ray too (only the MPM
+path traces refraction, and fades it out over settled water, §MLS-MPM RENDER
+SEAM) — and it has to: bending the body alone would lift its image off an unbent
+bed, and a mob's feet would float. True refraction needs the primary ray bent at
+the surface in the raymarch (a second trace per water pixel) and the micro-body
+march bent the same way (it can: it already marches a ray inside its OBB); the
+cube-body path, which marches nothing, cannot follow.
+
+**The gate.** `--gate underwater-body`: a sand cube-path pillar standing out of
+six cells of water and one real mob limb micro brick wholly under it, in a
+sealed basin, each rendered dry and wet against an adjacent no-body reference.
+Veil on: cube 0.95–0.99 of its dry pixels visible, blue shift +16; micro 0.99,
++54. Veil forced off (`WATER_VEIL = false`, the old contract): cube 0.59 / −1.0,
+micro 0.00. Thresholds in `tests/baseline.json`. `determinismHash` cannot move —
+render-only data, no sim binding.
 
 ### 9.z Raster body shading parity (added 2026-09-04)
 
@@ -10373,6 +11610,169 @@ item) are unaffected either way — a body's pixels are nearer than the ramp.
 And nothing temporal: `render.taa`'s accumulator would integrate the same
 staircase over the jitter sequence and is the right next lever if the
 residual 0.7 still reads as texture at some resolution.
+
+### 9.w Clouds and weather (added 2026-09-23; `assets/shaders/cloud.wgsl`, `src/sim/weather.*`, `assets/weather/`)
+
+The plan of record is `docs/PLAN_clouds_weather.md` (corpus research + packages);
+this section is what landed and the invariants it holds.
+
+**Weather is data, and it is render-only except for one integer.** A weather TYPE is
+`assets/weather/<name>.json` — coverage, cloud type (0 stratus .. 1
+cumulonimbus), density, deck base and thickness in metres, darkness, cirrus,
+raininess, precipitation type (0 rain .. 1 snow), mist, lightning rate. Eleven
+ship (clear, cirrus, fair, scattered, towering, overcast, fog, drizzle, rain,
+storm, snow); nothing in C++ knows their names. `weather::Resolve`
+(`src/sim/weather.cpp`) turns (tuning, presets, seed, sim clock) into one blended
+`State` per frame. **None of those floats reaches TickParams, the CA or the world
+hash.** What does is ONE word, `weather::SimRainWord` → `TickParams.weatherRain`
+(the old `padWp1`): rain reaching the ground (bits 0..7), `weather.rainIgniteDamp`
+(8..15) and ground wetness (16..23), quantised once per tick from the pinned or
+scheduled preset — the un-eased TARGET, never the frame-time ease, so frame
+pacing cannot reach the hash. Two reaction flags read it (`materials.h`
+`kCondRain` / `kCondRainDamp`, `RCOND_RAIN` / `RCOND_RAINDAMP`):
+
+- `"rain": true` — a douse. Fires only on a RAIN-EXPOSED cell while it rains, at
+  chance × (rain/255)²: a drizzle barely touches a fire, a storm puts it out.
+  A gate like SKY/DAY/NIGHT, so it holds no chunk awake.
+- `"rainDamped": true` — an ignition. On an exposed cell its chance is cut by
+  max(rain, wetness) × damp, so rain slows a spread at once and wet ground stays
+  slow to catch for ~`weather.drySeconds` after. Only a rescale: it still holds
+  its chunk awake, or a fire front would fall asleep mid-spread.
+
+Rain-exposed (`sim_step.wgsl rainExposed`) = sees the sky, or a horizontal face
+opens onto a cell that does — every read at Chebyshev distance 1, the reach
+`seesSky`'s note proves scheduling-free. So a trunk wets down its sides, and a
+room's interior stays dry only where a ceiling is directly over it (the
+one-cell-up limit `seesSky` already has). The same arithmetic runs in
+`sim_gas.wgsl` (a parcel outside the window is exposed by construction) and on
+bodies and limbs (`RainScaledChance`, `reactcpu.h`; a body counts as exposed).
+Every burning material carries a rain douse beside its extinguisher douse, and
+every combustion ignition is rain-damped (`reactions.json`'s RAIN note); snow
+does neither yet. `weather.rainTouchesWorld` off = the word is 0. Gated by
+`--gate rain-fire` (one leaf sheet, three pinned skies).
+
+The same word WETS CREATURES (`MobSystem::RainOneLimb`, in the living's and
+the corpses' stain pass): a limb under open sky (`OpenToSky`, InSunlight's
+column probe without the daylight half) has its world-up-facing voxels take one
+level of water, sampled every 5 ticks at 1479 x (rain/255)^4 voxels a visit — a
+fourth power so a storm soaks ~20x faster than a drizzle — rinsing a foreign
+coat a level first, capped at 12 x rain/255; the existing wet lifecycle (wick,
+drip, dry) does the rest. Gated by `--gate mob-rain`.
+
+**The deck's base jitter is capped in metres** (`cloudBaseJitterM`,
+common.wgsl): 10% of the thickness, at most 150 m. It was 10% uncapped, and the
+storm preset (7.5 km deep, base 700 m) dipped below sea level — cloud density on
+the ground and the "eye is inside the deck" composite veiling every terrain
+pixel in grey.
+
+**The automatic cycle is a ladder, not a state machine.** Presets are sorted by
+their authored `moisture`; each owns a run of the ladder proportional to its
+`weight` (0 = manual only — snow, until there are seasons); a smooth two-octave
+1-D value noise over weather epochs (`weather.epochMinutes`) walks the ladder,
+and the last half of each run blends into its neighbour. So the sky drifts
+clear → fair → scattered → towering → overcast → fog → drizzle → rain → storm and
+back through NEIGHBOURS — it cannot cut from a storm to a cloudless noon.
+`--gate clouds` walks two hours of sim time a second at a time and fails on any
+one-second step above 0.08 in coverage or raininess, and on any non-purity
+(two resolves at one instant must agree). A PIN (`weather::SetOverride`: the F1
+panel's Weather section, `SANDVOX_WEATHER=<preset>` for headless runs) eases in
+over `weather.transitionSeconds` of wall time — the one wall-clock term, allowed
+because nothing downstream is part of the world.
+
+**The cloud drift is a closed-form integral of the wind.** Clouds move with the
+same `WindWeather` epochs the grass leans in (× `render.cloudWindScale`, winds
+aloft are faster). An integral is state, and a frame-rate-dependent accumulator
+is a sky that differs between a replay and its run, so `CloudDrift`
+(`src/test/support.cpp`) evaluates it exactly: the per-epoch velocity is a
+smoothstep blend of two targets, whose integral is (V0+V1)/2 per whole epoch and
+V0·u + (V1−V0)(u³ − u⁴/2) for a partial one, summed from a cached prefix. Every
+unbounded offset (shape, detail, weather-field and cirrus advection) is folded in
+DOUBLE on the CPU and handed over wrapped to its tile, so clouds do not start to
+jitter after an hour of f32 cancellation.
+
+**The render form is a compute pass, not the raymarcher.** `raymarch.wgsl`'s
+fragment shader has no register headroom (its per-ray-state cliff is measured
+in the memories index), so the march lives in `cloud.wgsl` on the per-frame
+`PT_SHADOWCACHE` table, recorded by `EncodeShadowResolve` on every drawing path:
+
+| row | what | size |
+|---|---|---|
+| `cloud_noise` | tileable Perlin-Worley SHAPE (R) + Worley fBm (GBA), 128³; Worley DETAIL, 32³. Once per pipeline build (`Cond::CloudBake`) | 8.1 MiB |
+| `cloud_weather` | per-frame 512² WEATHER MAP around the camera at 125 m: local coverage, type, rain, base jitter — plus the camera probe (8 words; 4..6 = the 20 m averaged wind, written by `cloud_env`) | 1 MiB |
+| `cloud_shadow` | per-frame 256² CLOUD SHADOW map at 40 m, indexed at the deck-base plane along the key light | 256 KiB |
+| `cloud_env` | per-frame 64² octahedral ENV map: (in-scatter, T) per direction | 32 KiB |
+| `cloud_march` | the deck, cirrus and rain curtains, one ray per LOW-RES pixel (target ÷ `render.cloudResDiv`) | 4 words/px |
+| `cloud_resolve` | temporal accumulation: reproject through last frame's camera, neighbourhood clamp, running mean for the first frames after a reset | 3 words/px × 2 |
+
+All six are gated by `Cond::Clouds`: `weather.clouds` off, or a sky with no
+cloud, cirrus or rain, records no row, and `RenderParams.weatherFlags`'
+`RWF_CLOUDS` (set from the same `CloudFrame`) tells every reader not to look.
+
+**The look is the Nubis recipe, bent to this engine.** Coverage LOWERS THE
+DENSITY THRESHOLD (the corpus's three-field model: `remap(shape, 1−cov, 1)·cov`),
+so a fair sky is small separate cumulus and an overcast is the same noise with
+the floor dropped, not a scaled-up blob. A height profile per type (stratus sheet
+/ rounded cumulus / full-depth cumulonimbus with an anvil) shapes it; towers lean
+downwind with height; detail erodes the edges (wispy under, billowy over). Light
+is Beer toward the key light along a growing cone with one long sample, at
+`LIGHT_ABSORB` 0.3 of the view extinction (the standard lever: a kilometre-deep
+cumulus is white because light diffuses through it), three Wrenninge
+multiple-scattering octaves, a two-lobe HG phase (the silver lining), powder
+darkening away from the sun, a skylight-occlusion sample above (lumpy
+undersides), and Hillaire's energy-conserving step. The sun lights the deck until
+it is ~4° BELOW the horizon, through the long reddening air mass — cloud
+undersides go gold and orange over a darkening land.
+
+**Two transmittances, because haze is airlight.** Aerial perspective on a cloud
+pales it toward the sky behind it — but must not let the sun disc or a star
+through a thick one. So the march keeps T (hazed) and Td (direct), and the sky
+composite is `airglow·T + (sky − airglow)·Td + C` (`skyColorParts`). Under a
+closed deck the airlight is the deck's own light, not a blue dome: the overcast
+share of the haze goes to `hazeGrey()`, and the **horizon fill** — the deck a
+ray cannot reach because it meets the horizon ~100 km out — converges to exactly
+the same colour, below the horizon too, so the marched deck, the fill and the
+fogged ground (which reads the same function through the env map) meet without
+a seam.
+
+**How the rest of the renderer sees the clouds** (the sky-tier rule, one lookup
+each, never a march):
+
+- sky pixels: the full-resolution upsample of the history (`cloudScreenAt`);
+- terrain, far field, micro bodies and debris cubes: the direct light ×
+  `cloudSunAt` (common.wgsl) — one bilinear fetch of the shadow map, fading to
+  the deck's mean transmittance at the map edge;
+- fog and water reflections: the env map (`cloudySkyAirglow`, `reflectionSky`),
+  weighted by `render.cloudFogMix`;
+- the shared hemisphere ambient (`ambientAtP`): greys and flattens by
+  `RenderParams.overcast`, and takes a cold flash from `RenderParams.lightning`;
+- a camera at or above the deck base: the same image composited OVER hit pixels.
+
+**Precipitation, tier 1 only.** Rain curtains hang under raining cells in the
+march (with the primary and secondary RAINBOW at 42°/51° from the anti-solar
+point, only where sunlit rain actually is). Near the eye, `rainOverlay` finds
+drops through four cylinders but tests each ray against the drop itself — a 3-D
+segment for rain, a point for snow — with pixel-footprint antialiasing, gated
+per drop on the openness grid (it stops at a roof and keeps falling outside) and
+on the camera probe (it rains HERE, not on average). The streaks lean along the
+wind AVERAGED over a 20 m disc round the camera (17 `windAt` samples, one thread
+of the env pass, probe words 4..6) — a point sample swung the sheet with every
+~5 m gust front — at 40% of that wind (80% for snow) and capped at ~35° off
+vertical (~56° snow): the full wind read as sideways rain. Wet ground darkens and
+glints by `wetness`, a leaky integral of past rain evaluated as a pure sum,
+scaled by openness. Rain does not yet place water or stain the world; it does
+douse fire and damp ignition (above).
+
+**Cost (RTX 3060 Ti, 1080p, `cloudResDiv` 3):** ~1.2 ms of GPU per frame under a
+scattered sky in the game loop (march 0.84, weather 0.14, env/resolve/shadow
+~0.23), ~2 ms at worst looking straight up into big cumulus, 0 with clouds off.
+`raymarch` fs is unchanged at 168 registers; its local-memory spill went
+16 → 96 B/thread (the rain overlay and split sky), a follow-up to recover.
+Measure under a full overcast looking up — sky pixels were free before this.
+
+**Look loop.** `SANDVOX_CLOUD_GALLERY=1 ... --selftest --gate clouds` renders
+every preset from three cameras plus low-sun arms into
+`build/clouds_gallery_*.bmp` — a `cloud.wgsl` or `tuning.json` edit needs no
+rebuild and no `--shot`.
 
 ## 9b. Wind (added 2026-08-25)
 
@@ -12237,20 +13637,22 @@ wide short one". A resampled shell packs its own copy-on-write brick and frees
 it on unwear; at ratio 1 (the stock set on the stock human) nothing is
 resampled and the def's brick is shared, exactly as a body limb shares its.
 
-### The sheath is the weapon slot
+### The hotbar is the hand
 
-A blade is either DRAWN (a real rig part in the fist) or STOWED (an entry in
-the Sheath slot and nothing else). `Q` toggles; drawing forces the melee tool
-and stowing puts the previous one back; a weapon that leaves the sheath while
-drawn stops being drawn (`SheathState`, `game/equipment.h` — three cases, all
-easy to get subtly wrong, so they live in one testable struct rather than in
-the frame loop). The hotbar keeps the number row and stops being where a weapon
-comes from.
+What is in your hand is the SELECTED HOTBAR SLOT, with the melee tool up and
+magic off: a sword there is drawn (a real rig part in the fist), a flask there
+is held for pouring, an empty slot is your fists. The number row and the wheel
+pick the slot; there is no draw key (Q drew from the sheath until 2026-09-23,
+when the owner asked for weapons to be held like flasks). A weapon dragged out
+of the selected slot is simply no longer in the hand -- there is no drawn flag
+to keep in step with the kit. The ten slots are always on the HUD, bottom
+centre (`DrawHudHotbar`, `ui/inventory_ui.cpp`).
 
-Sheathing is still **visually** data only: the slot holds a weapon, it does not
-draw it on the avatar's back. That visual is a `sheath_back` socket in the rig
-plus a matching grip context on the item — `ItemGrip`'s context map
-(`game/item.h`) already anticipates exactly that, so it is content, not code.
+The Sheath and Quick equipment slots remain as places a blade rides on your
+person, and nothing draws from them. Showing a stowed blade on the avatar's
+back is a `sheath_back` socket in the rig plus a matching grip context on the
+item -- `ItemGrip`'s context map (`game/item.h`) already anticipates exactly
+that, so it is content, not code.
 
 ### Ground items are debris that remember their name
 
@@ -12580,8 +13982,9 @@ within reach of the head. It is the one ray that reads the camera: a UI query
 against Jolt bodies, not a sim input, so the "picking rays use `player.EyePos`
 so the camera cannot change what the sim sees" contract does not apply to it.
 E over a corpse opens the
-character screen with a LOOT panel where the grimoire sits (wide) or the
-arsenal (narrow), one `KitSlotUI` per piece through the same mirror, and
+character screen with a LOOT panel in the SPELLBOOK's place (looting is a
+moment; the words are not going anywhere, and a fourth column would not fit on
+most screens), one `KitSlotUI` per piece through the same mirror, and
 `KitSpace::Loot` is one more address the same drag can name. `TakeCorpseLoot`
 executes it beside `PlayerKit::Move` rather than inside it — a corpse is not
 one of the player's containers and has no `ItemStack` to swap — with Move's
@@ -12737,6 +14140,153 @@ cell of every dyeable piece is a grey against the MERGED palette the renderer
 actually reads, that three patterns exist per slot, that the dye reaches every
 shell's GPU instance and nothing else's, that a stack is one colour, and that
 the word survives `PLYR` v5.
+
+### Vessels: a flask scoops, a pouch scoops, both pour (2026-09-22; `game/container.*`)
+
+ONE ITEM KIND, `container`, and what it takes up is DATA: items.json's
+`container.holds` names material CLASSES (`liquid`, `powder`), so the flask and
+the pouch are two rows and a bucket would be a third. Amounts are EIGHTHS of a
+cell, the grid's own liquid unit, so a half-drained puddle cell is taken for
+exactly what it held. The contents ride the stack (`ItemStack::fillMat/
+fillAmt`), are part of the merge key (a flask of blood must not fold into a
+stack of empties), and persist through `PLYR` v6, `ITMS` v3, a drop and an R
+reload.
+
+**Hands up, a vessel selected in the hotbar, nothing drawn** (`FrameIntent::
+vesselSlot`): RMB scoops, LMB pours, the flask is held in the rig slot a sword
+would borrow, and the unarmed compass is off. Both directions go through the
+MutationQueue:
+
+- **A scoop is a list of CONDITIONAL CLEARS** (`CellOpClearIfMat`: kCellOpIfAir
+  on an AIR word, expected material in bits 12..23 -- a combination that was
+  otherwise a no-op). The snapshot the CPU scoops from is kSnapshotLatency
+  ticks old and liquid moves, so the GPU refuses a clear whose cell no longer
+  holds that material; nothing that was not what you scooped is ever deleted.
+- **The vessel is paid what the GPU TOOK, not what the CPU asked for.** A flask
+  held over a levelling pool was measured credited 125 eighths for 113
+  removed: water ran into the holes during the snapshot's four ticks and every
+  cell was paid at its stale fullness. So `sim_mutate` adds what each applied
+  clear really removed to a monotonic SCOOP LEDGER (page-fault record words
+  36..38, `kPageFaultScoop*`), the snapshot carries it, and a scoop files a
+  CLAIM that `ContainerSettle` pays when that tick's snapshot arrives. Exact,
+  four ticks late. A world-wide ledger: two scoops landing on one tick share it.
+- **A pour leaves the flask in your hand as grid particles**, two ways. AIMED
+  when what the crosshair touches (the grid pick, or the first body the look
+  ray meets -- the pick cannot see a creature) is within `pourRangeM` (2 m):
+  the arc is solved in the kernel's own integration and lands on it. TIPPED
+  otherwise: out along the look at the gentle `pourSpeedMps` and down, a short
+  way in front. The first version solved every pour toward a point
+  `pourRange` along the look line -- in mid-air when you look at the horizon
+  -- and the owner saw it "fly off at a weird angle": a long lob, and long
+  enough in flight for the wind to carry it. They reinsert as matter where
+  they land. The one rounding: the kernel reinserts a
+  liquid particle FULL, so the last partial cell of a flask comes out as a
+  whole one (under one cell per emptying). Ambient wind drags the stream like
+  any particle (sim.windMode).
+- **WATER GOES BOTH WAYS AS MLS-MPM FLUID** (2026-09-23, owner: "they're
+  cubic microvoxels; i want the animated water going in, and the poured water
+  going out to be mpm fluid"). What the seam can hold (`ContainerPoursAsFluid`
+  = sim_fluid_seam's `seamLiquid`: a liquid with moveEvery <= 1) takes the
+  solver instead of the grid-particle path above; lava, blood and every powder
+  keep the grid particles and the motes.
+  - *Out*: `ContainerPourFluid` emits one FluidSpawnOp per EIGHTH (the seam's
+    own unit), so the pour is exact -- no last-drop rounding -- and settles back
+    into fullness voxels. The arc is solved in the solver's gravity
+    (`sim.fluidGravity`, substep-exact) and, when the asked-for flight time
+    would launch over the CFL cap, at the nearest flight time that fits.
+  - *In*: `ContainerScoopStream` spawns eight GHOST particles per scooped cell
+    (`FluidSpawnOp::species` bit 8, life in bits 16..23; `FP_GHOST` = attr bit
+    23 in common.wgsl). The fluid surface draws them like any water and g2p
+    homes them onto the vessel's mouth (target in `_r0.._r2`, death tick in
+    `_r3`), but they are NOT MATTER: never booked in, no occupancy or stain
+    intent (so no reaction can consume them), no splash, no submerged freeze or
+    hard-solid delete, never settled, retired by consumeApply at their death
+    tick with no mass counter. The scoop's accounting is unchanged -- the
+    ledger still pays what the clears took. Gate `vessel-mpm` runs the
+    vessel-grid round trip this way and holds both audits EXACT.
+  - *The price*: the ghosts wake the solver, and with `sim.fluidExciteMode` 1
+    the holes a scoop digs excite the water around them into particles, which a
+    scoop (a list of voxel clears) cannot take until they settle. Measured on
+    vessel-mpm's 18-cell pool: 64 eighths credited in 40 ticks against
+    vessel-grid's 113, the other 80 sloshing as MPM. A deep pond, dug at its
+    surface, excites far less; a sink that takes excited water at the mouth is
+    the fix if it matters.
+- **The pour is also a SplatterEvent**, the same record a severed artery's spray
+  leaves, so any body in the stream -- creature, corpse, or your own feet -- is
+  coated where it is hit. That IS "pour blood on somebody and they are stained".
+
+**The portrait pour brush** (2026-09-23; `Portrait` in inventory_ui.cpp, the
+`pourStroke` in session.cpp): with a filled vessel chosen and no spell
+spoken, the character screen's portrait is a BRUSH. The vessel is CHOSEN, not
+held: the screen's FLASKS row (where "on your person" -- sheath + quick slots
+-- used to be) lists every vessel in the pack and hotbar; clicking one sets
+`UIState::activeVessel` (a `KitRef`), "put away" clears it, and
+`PourStroke::vessel` tells the tick which stack pays. main.cpp drops the choice
+when its slot stops holding a vessel. Left button held pours
+where the cursor is; right-drag orbits, middle-drag pans, the wheel or `[ ]`
+sizes the disc (`UIState::pourRadius`, world voxels) and ctrl+wheel zooms; the
+portrait's corner reads the size and what it drains. The panel reports only a
+portrait-normalized point; main.cpp turns it into a world ray through the same
+`PortraitCam` that rendered the image (the inverse of `ProjectToPortrait`), and
+the tick meets it with `MobSystem::PickBody` -- a slab test against every
+occupied cell of the body's AUTHORITATIVE lattice (skin when finer, collider
+otherwise), so the cell hit is a cell that is drawn. `PourOnBody` then coats
+the visible SURFACE under the disc: cells within the radius of the ray line,
+binned into columns at the finest lattice pitch across the ray, keeping only
+the nearest cell (+half a cell) per column -- the face you are looking at, not
+the far side of the arm or the torso behind it. It accumulates
+(`AddBodyStain`, +3 a tick to 15; washers take `WashBodyStain`), pokes the
+micro brick so the coat is drawn where it went, and runs the material's
+`coat.effects` ONCE per touched limb (`CoatEffectsOn`, shared with
+`DouseLimb`). Spend is a rate that follows the brush
+(`PourBrushCellsPerSec`, container.h): the disc's AREA, anchored so the
+default 0.5-voxel brush spends `container.applyCells` a second -- twice the
+radius, four times the drain -- paid in eighths off a milli-eighth accumulator
+and only on ticks the ray meets skin.
+Worn shells are not hit: the ray passes through armour to the body. The old
+click-a-limb pour (`InspectApplyPicks`) is gone; `DouseLimb` stays as the
+whole-limb door for gates and tools. Vocabulary: `stanch` (the cauterise rule's
+three fields -- bleedBudget, stumpOpen, gushTicks) and `disinfect` (a bite's
+infectMat/infectStain). No material authors either yet; medicine is content.
+
+**Thrown, and broken** (2026-09-23; owner: "holding down a button with it
+equipped charges up a throw ... if the flask hits something with a high
+velocity or is hit by something with a high velocity it should break and spawn
+all of its contents immediately into the world"). Q (`TB_THROW`,
+kTickInputVersion 2) held with a throwable vessel in hand winds the throw up
+on the TICK clock (`PlayerSession::throwTicks`); releasing it throws at
+`ContainerThrowSpeed`, eased from `throwMinSpeedMps` to `throwSpeedMps` over
+`throwChargeSec` (items.json; flask 4 -> 16 m/s over 0.9 s, the pouch is not
+thrown). Switching the hand mid-draw cancels it; while drawing, the buttons do
+not pour or scoop. The HUD meter under the crosshair (`UIState::throwCharge`)
+is ten pixel pips that light gold and, at full, turn ember and SHAKE by whole
+pixels. A THROWN VESSEL IS A DROPPED ITEM WITH SPEED: `DropItemToWorld` with
+the launch velocity and an end-over-end spin, so the flight is Jolt's and the
+fill rides `WorldItem::fill` as a drop's does. `ContainerBreakPass` (phase H,
+before submit; the `TickAuthorityCtx::ground` registry) breaks any vessel with
+`breakSpeedMps` > 0 (flask 6.5) on either of two witnesses: a NEW contact from
+the last step whose closing speed reaches it -- relative speed, so the flask
+hitting a wall and a rock hitting a resting flask are one test -- or a velocity
+jump of that size in one tick, which covers what the contact list cannot see
+(capped per step, blind to the player) and a blast. Free fall adds g/30 a tick
+and never qualifies. The body is destroyed and its contents become a
+`ContainerSpill` at its centre of mass, drained by `ContainerSpillStep` through
+the same two roads as the pour (MPM fluid per eighth for seam liquids, grid
+particles per cell otherwise) in a ball of the contents' own volume, nudged off
+the surface struck, bursting outward at 2.5 m/s plus a third of the vessel's
+velocity -- all on the tick it broke unless the spawn budgets are short, in
+which case the rest waits a tick rather than being lost -- and one radial
+SplatterEvent, so whoever it breaks over is wet with it. No glass is left
+behind (there is no glass material) and there is no break sound yet.
+
+Gates: `vessel` (pure: content, what goes in, the claim, the arc, stacks,
+PLYR v6, DouseLimb, the throw ramp, the break test, the spill's conservation)
+and `vessel-grid` (the real grid: scoop exactly paid by
+the ledger, pour conserved counting grid + MPM -- a splash excites landed water
+into MPM particles for a while, which a grid-only count reads as a loss), and
+`vessel-break` (real Jolt on a stone table: a flask set down from two voxels
+survives the whole fixture, one thrown down at full draw breaks and spills all
+1024 eighths, one lying still breaks when a flying stone hits it).
 
 ## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
 
@@ -13292,7 +14842,8 @@ tag, the manifest crosses on join in slices before the first batch, and
 either side answers a `ChunkGet` from its own store (with two peers "the
 machine that has it resident" is always the requester's peer, so symmetry
 replaces a relay; a third player is a second link and a relay table).
-`meta.svm` is `SVM5` with tick and seed; `SVM4` still loads. Two defects
+`meta.svm` is `SVM5` with tick and seed (`SVM6` since 2026-09-22 appends the
+worldgen fingerprint, §3); `SVM4` still loads. Two defects
 this package found on the way in: M9.3-C's five sync messages had fallen
 through into M9.4-D's `EntityBatch` case, so the convergence protocol was
 dead on the wire (`hashBlocks recv = 0`, `late = 38`) — the only symptom of

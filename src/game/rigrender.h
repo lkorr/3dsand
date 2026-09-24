@@ -65,12 +65,18 @@ inline bool AppendVoxInsts(std::vector<BodyVoxInst>& out, uint32_t slot,
 }
 
 // One slot's worth of the transform pass.
+//
+// `offset` is a RENDER-ONLY rigid translation of the whole body (Mob's
+// renderOffset_ — tick interpolation and step smoothing for the player's art).
+// It moves the drawn position and nothing else: the collider, the reach tests
+// and every strike still use xf.pos. Zero for every caller that does not opt in.
 inline void AppendXform(std::vector<BodyXformGpu>& out,
-                        const BodyTransform& xf) {
+                        const BodyTransform& xf,
+                        const Vec3& offset = Vec3{0, 0, 0}) {
   BodyXformGpu x{};
-  x.pos[0] = xf.pos.x;
-  x.pos[1] = xf.pos.y;
-  x.pos[2] = xf.pos.z;
+  x.pos[0] = xf.pos.x + offset.x;
+  x.pos[1] = xf.pos.y + offset.y;
+  x.pos[2] = xf.pos.z + offset.z;
   std::memcpy(x.quat, xf.quat, sizeof(x.quat));
   out.push_back(x);
 }

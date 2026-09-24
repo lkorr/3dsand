@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <atomic>
 #include <mutex>
 #include <unordered_map>
 
@@ -87,7 +88,17 @@ constexpr JPH::ObjectLayer AVATAR = 3;
 // applies no impulses at all. All three keep working here, because a query
 // filter is what they go through and this layer is in DynamicLayerFilter.
 constexpr JPH::ObjectLayer PROP = 4;
-constexpr JPH::ObjectLayer NUM = 5;
+// A THROWN BODY STILL LEAVING THE THROWER. AVATAR is not enough for this: it
+// keeps a released piece off the player PROXY, but AVATAR collides with AVATAR,
+// so a flask launched from the hand slammed into the thrower's own head and arm
+// on its first step — a velocity jump the vessel break pass reads as a blow,
+// and the flask burst in your face. This layer touches only terrain and
+// ordinary bodies (STATIC, MOVING); TickPendingReleases moves it to MOVING the
+// moment it is clear of every player, after which it hits anyone, the thrower
+// included. Reported by the contact listener like MOVING — it is a real
+// projectile, and its impacts are what break it.
+constexpr JPH::ObjectLayer THROWN = 5;
+constexpr JPH::ObjectLayer NUM = 6;
 }  // namespace Layers
 
 namespace BP {
@@ -132,6 +143,11 @@ class ObjPairFilter final : public JPH::ObjectLayerPairFilter {
     // MobSystem::FindParry, and letting the solver see them as well would put
     // a second, disagreeing answer underneath the one combat actually reads.
     if (a == Layers::PROP || b == Layers::PROP) return false;
+    // A body on its way out of a thrower meets only the world (see THROWN).
+    if (a == Layers::THROWN || b == Layers::THROWN) {
+      const JPH::ObjectLayer o = a == Layers::THROWN ? b : a;
+      return o == Layers::STATIC || o == Layers::MOVING;
+    }
     // The avatar's own limbs never touch the player proxy they live inside.
     if ((a == Layers::PLAYER && b == Layers::AVATAR) ||
         (a == Layers::AVATAR && b == Layers::PLAYER))
@@ -153,7 +169,7 @@ class DynamicLayerFilter final : public JPH::ObjectLayerFilter {
  public:
   bool ShouldCollide(JPH::ObjectLayer layer) const override {
     return layer == Layers::MOVING || layer == Layers::AVATAR ||
-           layer == Layers::PROP;
+           layer == Layers::PROP || layer == Layers::THROWN;
   }
 };
 
@@ -220,9 +236,38 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
 
   ContactImpls() { impacts.reserve(kMaxPerStep); }
 
+  // ---- WHAT THE NARROW PHASE DID THIS STEP, for the watchdog line ---------
+  // A slow Update used to report only "N active bodies", which cannot tell a
+  // pair of 1024-box compounds grinding face to face from a fast body's swept
+  // cast. These say how many manifolds and contact points the step produced,
+  // body-vs-body and body-vs-static apart. Relaxed atomics: written from the
+  // job threads, read on the game thread after Update returns.
+  std::atomic<uint32_t> manifoldsDyn{0}, manifoldsStatic{0};
+  std::atomic<uint32_t> pointsDyn{0}, pointsStatic{0};
+  void CountManifold(const JPH::Body& b1, const JPH::Body& b2,
+                     const JPH::ContactManifold& m) {
+    const bool st = b1.IsStatic() || b2.IsStatic();
+    (st ? manifoldsStatic : manifoldsDyn).fetch_add(1, std::memory_order_relaxed);
+    (st ? pointsStatic : pointsDyn)
+        .fetch_add((uint32_t)m.mRelativeContactPointsOn1.size(),
+                   std::memory_order_relaxed);
+  }
+  void ResetCounts() {
+    manifoldsDyn = 0;
+    manifoldsStatic = 0;
+    pointsDyn = 0;
+    pointsStatic = 0;
+  }
+  void OnContactPersisted(const JPH::Body& b1, const JPH::Body& b2,
+                          const JPH::ContactManifold& m,
+                          JPH::ContactSettings&) override {
+    CountManifold(b1, b2, m);
+  }
+
   void OnContactAdded(const JPH::Body& b1, const JPH::Body& b2,
                       const JPH::ContactManifold& m,
                       JPH::ContactSettings&) override {
+    CountManifold(b1, b2, m);
     // YOUR OWN BODY MUST NOT FIRE DEBRIS IMPACTS. Layers::AVATAR exists
     // precisely to split the player's limbs out of contact handling, and the
     // player proxy is teleported onto the player every tick so its contacts
@@ -414,10 +459,10 @@ constexpr float kInsaneSpeed = 1.0e5f;
 // is wrong for this engine by a factor of fifteen.
 //
 // 500 m/s is 8.3 METRES of travel in one 60 Hz step, which is 83 voxels. Every
-// dynamic body here is EMotionQuality::LinearCast (the long note below
-// CreateDebrisBody), so a step that long is a shape cast of a compound of up
-// to 1024 boxes swept 83 voxels through marching-cubes terrain, and the sweep
-// happens for every such body every step. Nothing in this world legitimately
+// dynamic body thinner than kDiscreteMinExtentVox is EMotionQuality::LinearCast
+// (the long note below CreateDebrisBody), so a step that long is a shape cast
+// of a compound of up to kColliderBoxBudget boxes swept 83 voxels through
+// marching-cubes terrain, and the sweep happens for every such body every step. Nothing in this world legitimately
 // travels at 500 m/s: the fastest legal values are physics.explosionMaxSpeed
 // (30 m/s), ragdoll.maxLaunchSpeed (14 m/s) and terminal velocity for a fall
 // the height of the whole residency window (sqrt(2 g * 51 m) = 32 m/s). 80 m/s
@@ -455,6 +500,38 @@ constexpr float kRunawayDampScale = 0.2f;
 // "the framerate plummeted and the whole game froze". Report-only: wall clock
 // may not change what the simulation does, but it may say what it saw.
 constexpr double kStepWatchdogMs = 100.0;
+
+// ---- WHAT A BIG BODY'S COLLIDER MAY COST (2026-09-22) ------------------------
+//
+// The owner report: "cut a tree down, or split a big body into several, and it
+// runs at 3 fps for a few seconds". Measured with `--fell-tree` on the baked
+// birch, split twice: ONE Jolt Update 100-138 ms over four bodies, and 1.6 ms
+// with SANDVOX_NO_ANTITUNNEL=ccd in the same binary (turning off enhanced
+// internal-edge removal changed nothing). The contacts were never the cost --
+// 17 manifolds, 44 points on a 100 ms step. The LINEAR CAST was, twice over:
+//
+//  * Jolt casts when a step moves the body more than 0.75 x its shape's INNER
+//    RADIUS, and a compound's inner radius is its SMALLEST sub-shape's. One
+//    leaf left as a 1x1x1 box made a 7 m tree cast on every step it moved
+//    faster than about 1 m/s -- i.e. for the whole of its fall.
+//  * the cast sweeps every sub-shape, and a crown was 1024 of them.
+//
+// kDiscreteMinExtentVox answers the first: a body whose THINNEST extent is at
+// least this many world voxels cannot cross a terrain sheet in one step at any
+// speed a falling or thrown body reaches here -- it would have to move half its
+// thickness, 12 voxels, in one 30 Hz step, which is 36 m/s, and the fastest
+// legal body is a fall the height of the whole window at 32 m/s (the ceilings
+// note above). So it steps discretely and never casts. Its thin parts (a twig,
+// a branch) can still graze through a triangle for a step; the body does not,
+// because its thick parts are what the discrete contacts stop. Everything
+// thinner -- limbs, rubble, a plank, a trunk section -- keeps LinearCast
+// exactly as before. kColliderBoxBudget answers the second, and the collider
+// builder's note says how a body over it is re-merged.
+constexpr float kDiscreteMinExtentVox = 24.0f;
+constexpr int kColliderBoxBudget = 256;
+// A greedy box at least this big (and at least 2 voxels on every side) is
+// kept exactly when a body is over budget; everything smaller goes coarse.
+constexpr int kFatBoxMinVoxels = 8;
 
 // True when every component is finite and under `limit`. No multiplies, so
 // this is safe to call on the garbage it is looking for.
@@ -686,6 +763,8 @@ void Physics::SweepInsaneVelocities() {
 
 float Physics::MaxBodySpeedVox() { return kBodyMaxSpeedMS / kVoxelMeters; }
 float Physics::MaxBodySpinRad() { return kBodyMaxSpinRad; }
+int Physics::ColliderBoxBudget() { return kColliderBoxBudget; }
+float Physics::DiscreteMinExtentVox() { return kDiscreteMinExtentVox; }
 
 // ---- A CORPSE IN ARMOUR IS NOT ALLOWED TO BE A MOTOR ------------------------
 //
@@ -916,7 +995,10 @@ void Physics::Step(float dt) {
   // before Update hands the buffer to the job threads, so a caller reading
   // after Step sees exactly that step and nothing accumulates when nobody
   // drains (a headless run never reads this at all).
-  if (contacts_) contacts_->impacts.clear();
+  if (contacts_) {
+    contacts_->impacts.clear();
+    contacts_->ResetCounts();
+  }
   // WALL CLOCK, REPORT ONLY. The owner's report was "the whole game froze for
   // several minutes", and the one thing that was missing when it happened was
   // any line saying so. This may not change what the simulation does -- a
@@ -929,23 +1011,33 @@ void Physics::Step(float dt) {
                         std::chrono::steady_clock::now() - t0)
                         .count();
   if (ms > runaway_.worstStepMs) runaway_.worstStepMs = ms;
+  lastStep_.ms = ms;
+  if (contacts_) {
+    lastStep_.manifoldsDyn = contacts_->manifoldsDyn.load();
+    lastStep_.pointsDyn = contacts_->pointsDyn.load();
+    lastStep_.manifoldsStatic = contacts_->manifoldsStatic.load();
+    lastStep_.pointsStatic = contacts_->pointsStatic.load();
+  }
   if (ms >= kStepWatchdogMs && runawayReports_ < 8) {
     runawayReports_++;
     std::fprintf(stderr,
                  "[phys] one Update took %.0f ms over %u active bodies "
                  "(%u of them at their velocity ceiling; fastest %.0f vox/s, "
-                 "%.1f rad/s since the last probe reset). Every dynamic body "
-                 "is LinearCast, so a fast body pays a swept cast against "
-                 "terrain every step; see the runaway note in "
-                 "phys/physics.cpp.\n",
+                 "%.1f rad/s since the last probe reset); contacts %u "
+                 "body-body manifolds / %u points, %u body-static manifolds / "
+                 "%u points. Every dynamic body is LinearCast, so a fast body "
+                 "pays a swept cast against terrain every step; see the "
+                 "runaway note in phys/physics.cpp.\n",
                  ms, (unsigned)NumActiveBodies(), (unsigned)runaway_.hot,
-                 (double)runaway_.peakSpeedVox, (double)runaway_.peakSpinRad);
+                 (double)runaway_.peakSpeedVox, (double)runaway_.peakSpinRad,
+                 lastStep_.manifoldsDyn, lastStep_.pointsDyn,
+                 lastStep_.manifoldsStatic, lastStep_.pointsStatic);
   }
   // After the step, so a piece is judged against where it has fallen TO.
   TickPendingReleases();
 }
 
-// ---- WHY EVERY DYNAMIC WORLD BODY IS LinearCast (anti-tunnelling) -----------
+// ---- WHY (NEARLY) EVERY DYNAMIC WORLD BODY IS LinearCast (anti-tunnelling) --
 //
 // Jolt's default motion quality is Discrete: the body is advanced by v*dt and
 // only THEN asked what it overlaps. The thing it has to not miss is a
@@ -963,6 +1055,12 @@ void Physics::Step(float dt) {
 // half-extent of any sub-box -- so a settled or walking body costs exactly
 // what it did before, and the bodies that do pay are the handful that are
 // moving fast enough to be about to leave the world.
+//
+// EXCEPT A BIG ONE (2026-09-22). "The smallest half-extent of any sub-box" is
+// half a voxel on anything with one loose leaf, so a felled tree paid the cast
+// on every step of its fall, over every one of its boxes: 100+ ms a step. A
+// body at least kDiscreteMinExtentVox thick on every axis is Discrete; see
+// that constant for why it cannot tunnel.
 //
 // This is only half the guarantee: a cast can only hit a triangle that EXISTS,
 // and the patch under a fast-falling body is built by DebrisSystem::
@@ -1034,10 +1132,10 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   };
 
   JPH::StaticCompoundShapeSettings compound;
-  // The box cap below bounds the sub-shape list, so this reserve is exact for
-  // a capped body and an upper bound (n voxels = n boxes at worst) otherwise;
-  // it keeps Jolt's Array from regrowing under 1024 pushes.
-  compound.mSubShapes.reserve(std::min<size_t>(voxels.size(), 1024));
+  // The box budget below bounds the sub-shape list, so this reserve is exact
+  // for a budgeted body and an upper bound (n voxels = n boxes at worst)
+  // otherwise; it keeps Jolt's Array from regrowing.
+  compound.mSubShapes.reserve(std::min<size_t>(voxels.size(), kColliderBoxBudget));
   float totalMass = 0;
   // One supplied voxel is `voxelPitch` world voxels on a side, so its physical
   // volume is (pitch * kVoxelMeters)^3. A scale-2 limb has 8x the voxels at 1/8
@@ -1052,8 +1150,9 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
     totalMass += density * voxVol;
   }
 
-  int boxes = 0;
-  size_t covered = 0;  // voxels inside a box: below voxels.size() once the cap bites
+  // A box in lattice voxels: min corner and size.
+  struct Box { int x, y, z, sx, sy, sz; };
+  std::vector<Box> fine;
   for (const DebrisVoxel& v : voxels) {
     if (occ[idx(v.x, v.y, v.z)] == 2) continue;
     // extend +x
@@ -1077,20 +1176,125 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
     for (int k = 0; k < sz; k++)
       for (int j = 0; j < sy; j++)
         for (int i = 0; i < sx; i++) occ[idx(v.x + i, v.y + j, v.z + k)] = 2;
+    fine.push_back({v.x, v.y, v.z, sx, sy, sz});
+  }
 
-    JPH::Vec3 half(VoxToM(sx * 0.5f * voxelPitch), VoxToM(sy * 0.5f * voxelPitch),
-                   VoxToM(sz * 0.5f * voxelPitch));
-    JPH::Vec3 center(VoxToM((v.x + sx * 0.5f) * voxelPitch),
-                     VoxToM((v.y + sy * 0.5f) * voxelPitch),
-                     VoxToM((v.z + sz * 0.5f) * voxelPitch));
+  // ---- THE BOX BUDGET: a felled tree is not 1024 one-voxel boxes ----------
+  //
+  // The greedy merge is exact, and on a SOLID body (a slab, a trunk, a limb)
+  // it is also small. On a crown it is neither: leaves are a sparse dither, so
+  // nearly every leaf is its own 1x1x1 box. This used to stop at 1024 boxes,
+  // which on the tree-fell oak covered 4,907 of 28,401 voxels -- the collider
+  // was the trunk plus whichever sixth of the crown the flood order reached
+  // first -- and 1024 boxes is also what every narrow-phase query on the body
+  // then iterates. Measured 2026-09-22 (`--fell-tree` with the baked birch,
+  // split twice): three such bodies made ONE Jolt Update 100-138 ms, i.e. 3 fps
+  // at 4 ticks a frame, for as long as the logs moved.
+  //
+  // Over budget, the body keeps its FAT boxes exactly (the trunk: what rests
+  // on the ground, where a coarse box would read as floating) and the rest of
+  // its voxels -- the leaves and twigs -- are re-merged on a coarser lattice,
+  // doubling it until the total fits. A coarse cell is solid if ANY of its
+  // voxels is, clipped to the body's own bounds, so the collider covers every
+  // voxel of the body instead of a sixth of them, at the price of a crown that
+  // collides as a slightly fuller blob. Under budget nothing changes: same
+  // boxes in the same order, so every existing body keeps its collider.
+  std::vector<Box> emit;
+  int coarseCell = 1;
+  size_t keptFat = 0;
+  if ((int)fine.size() <= kColliderBoxBudget) {
+    emit = std::move(fine);
+  } else {
+    std::vector<uint32_t> order(fine.size());
+    for (uint32_t i = 0; i < (uint32_t)fine.size(); i++) order[i] = i;
+    auto vol = [&](const Box& b) { return b.sx * b.sy * b.sz; };
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) {
+      return vol(fine[a]) > vol(fine[b]);
+    });
+    for (uint32_t i : order) {
+      const Box& b = fine[i];
+      if (vol(b) < kFatBoxMinVoxels) break;
+      if (std::min(b.sx, std::min(b.sy, b.sz)) < 2) continue;
+      emit.push_back(b);
+      for (int k = 0; k < b.sz; k++)
+        for (int j = 0; j < b.sy; j++)
+          for (int ii = 0; ii < b.sx; ii++) occ[idx(b.x + ii, b.y + j, b.z + k)] = 3;
+      if ((int)emit.size() >= kColliderBoxBudget / 2) break;
+    }
+    keptFat = emit.size();
+    // Everything a kept box does not hold, on a lattice of `cell` voxels.
+    std::vector<uint8_t> cocc;
+    std::vector<Box> coarse;
+    for (int cell = 2;; cell *= 2) {
+      const int cx = (ex + cell - 1) / cell, cy = (ey + cell - 1) / cell,
+                cz = (ez + cell - 1) / cell;
+      cocc.assign((size_t)cx * cy * cz, 0);
+      auto cidx = [&](int x, int y, int z) {
+        return ((size_t)z * cy + (size_t)y) * cx + (size_t)x;
+      };
+      for (const DebrisVoxel& v : voxels)
+        if (occ[idx(v.x, v.y, v.z)] == 2)
+          cocc[cidx((v.x - minc[0]) / cell, (v.y - minc[1]) / cell,
+                    (v.z - minc[2]) / cell)] = 1;
+      auto chas = [&](int x, int y, int z) {
+        return x < cx && y < cy && z < cz && cocc[cidx(x, y, z)] == 1;
+      };
+      coarse.clear();
+      for (int z = 0; z < cz; z++)
+        for (int y = 0; y < cy; y++)
+          for (int x = 0; x < cx; x++) {
+            if (cocc[cidx(x, y, z)] != 1) continue;
+            int sx = 1;
+            while (chas(x + sx, y, z)) sx++;
+            int sy = 1;
+            for (;; sy++) {
+              bool ok = true;
+              for (int i = 0; i < sx && ok; i++) ok = chas(x + i, y + sy, z);
+              if (!ok) break;
+            }
+            int sz = 1;
+            for (;; sz++) {
+              bool ok = true;
+              for (int j = 0; j < sy && ok; j++)
+                for (int i = 0; i < sx && ok; i++) ok = chas(x + i, y + j, z + sz);
+              if (!ok) break;
+            }
+            for (int k = 0; k < sz; k++)
+              for (int j = 0; j < sy; j++)
+                for (int i = 0; i < sx; i++) cocc[cidx(x + i, y + j, z + k)] = 2;
+            // Back to lattice voxels, clipped to the body's own bounds so a
+            // coarse cell past the edge does not grow the body.
+            Box b;
+            b.x = minc[0] + x * cell;
+            b.y = minc[1] + y * cell;
+            b.z = minc[2] + z * cell;
+            b.sx = std::min(sx * cell, maxc[0] + 1 - b.x);
+            b.sy = std::min(sy * cell, maxc[1] + 1 - b.y);
+            b.sz = std::min(sz * cell, maxc[2] + 1 - b.z);
+            coarse.push_back(b);
+          }
+      coarseCell = cell;
+      if ((int)(keptFat + coarse.size()) <= kColliderBoxBudget ||
+          cell >= std::max(ex, std::max(ey, ez)))
+        break;
+    }
+    emit.insert(emit.end(), coarse.begin(), coarse.end());
+  }
+
+  const int boxes = (int)emit.size();
+  size_t covered = 0;  // voxels inside a box (with overlap, when coarse)
+  for (const Box& b : emit) {
+    JPH::Vec3 half(VoxToM(b.sx * 0.5f * voxelPitch), VoxToM(b.sy * 0.5f * voxelPitch),
+                   VoxToM(b.sz * 0.5f * voxelPitch));
+    JPH::Vec3 center(VoxToM((b.x + b.sx * 0.5f) * voxelPitch),
+                     VoxToM((b.y + b.sy * 0.5f) * voxelPitch),
+                     VoxToM((b.z + b.sz * 0.5f) * voxelPitch));
     // Tiny convex radius: debris voxels are 12.5 cm. Scale it with the pitch
     // too — a fixed 1 cm skin on a 3 cm micro voxel is a third of the box, and
     // Jolt would round the limb off into a lump.
     compound.AddShape(center, JPH::Quat::sIdentity(),
                       new JPH::BoxShape(half, 0.01f * voxelPitch));
-    boxes++;
-    covered += (size_t)sx * sy * sz;
-    if (boxes >= 1024) break;  // pathological shapes get a truncated collider
+    covered += (size_t)b.sx * b.sy * b.sz;
   }
 
   const Clock::time_point t1 = kProfile ? Clock::now() : Clock::time_point{};
@@ -1121,7 +1325,12 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
   // Ghost contacts with internal edges of the marching-cubes terrain are what
   // make debris snag and hop on flat-looking ground; this is Jolt's fix.
   bcs.mEnhancedInternalEdgeRemoval = true;
-  if (!AntiTunnelOff(AntiTunnel::Ccd))
+  // LinearCast only where tunnelling is possible (see the note above
+  // CreateDebrisBody, and kDiscreteMinExtentVox for why a big body is exempt).
+  const float thinnestVox =
+      (float)std::min(ex, std::min(ey, ez)) * voxelPitch;
+  const bool cast = thinnestVox < kDiscreteMinExtentVox;
+  if (cast && !AntiTunnelOff(AntiTunnel::Ccd))
     bcs.mMotionQuality = JPH::EMotionQuality::LinearCast;  // see note above
 
   JPH::BodyInterface& bi = system_->GetBodyInterface();
@@ -1132,11 +1341,12 @@ uint64_t Physics::CreateDebrisBodyXf(const std::vector<DebrisVoxel>& voxels,
       return std::chrono::duration<double, std::micro>(b - a).count();
     };
     std::printf(
-        "[phys-prof] body %zu vox extent %dx%dx%d -> %d boxes covering %zu: "
-        "merge %.0f us, compound.Create %.0f us, CreateAndAddBody %.0f us "
-        "(total %.0f us)\n",
-        voxels.size(), ex, ey, ez, boxes, covered, us(t0, t1), us(t1, t2),
-        us(t2, t3), us(t0, t3));
+        "[phys-prof] body %zu vox extent %dx%dx%d -> %d boxes (%zu fat kept, "
+        "rest on a %d-voxel lattice) covering %zu, %s: merge %.0f us, "
+        "compound.Create %.0f us, CreateAndAddBody %.0f us (total %.0f us)\n",
+        voxels.size(), ex, ey, ez, boxes, keptFat, coarseCell, covered,
+        cast ? "LinearCast" : "discrete", us(t0, t1), us(t1, t2), us(t2, t3),
+        us(t0, t3));
   }
   if (id.IsInvalid()) return 0;
   GuardBodyInertia(id.GetIndexAndSequenceNumber(), "debris");
@@ -1702,6 +1912,16 @@ void Physics::SetBodyKinematic(uint64_t handle, bool kinematic) {
                    JPH::EActivation::Activate);
 }
 
+bool Physics::UsesLinearCast(uint64_t handle) const {
+  if (!system_ || handle == 0) return false;
+  JPH::BodyLockRead lock(system_->GetBodyLockInterface(), ToBodyID(handle));
+  if (!lock.Succeeded()) return false;
+  const JPH::Body& body = lock.GetBody();
+  const JPH::MotionProperties* mp = body.GetMotionPropertiesUnchecked();
+  return body.IsDynamic() && mp != nullptr &&
+         mp->GetMotionQuality() == JPH::EMotionQuality::LinearCast;
+}
+
 bool Physics::IsBodyDynamic(uint64_t handle) const {
   if (!system_ || handle == 0) return false;
   const JPH::BodyInterface& bi = system_->GetBodyInterface();
@@ -1969,7 +2189,7 @@ bool Physics::WorldBounds(uint64_t handle, float outMin[3],
   return true;
 }
 
-void Physics::ReleaseToWorldWhenClear(uint64_t handle) {
+void Physics::ReleaseToWorldWhenClear(uint64_t handle, bool thrown) {
   if (!system_ || handle == 0) return;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   const JPH::BodyID id = ToBodyID(handle);
@@ -1984,7 +2204,7 @@ void Physics::ReleaseToWorldWhenClear(uint64_t handle) {
     bi.SetObjectLayer(id, Layers::MOVING);
     return;
   }
-  bi.SetObjectLayer(id, Layers::AVATAR);
+  bi.SetObjectLayer(id, thrown ? Layers::THROWN : Layers::AVATAR);
   for (uint64_t h : pendingRelease_)
     if (h == handle) return;
   if (pendingRelease_.size() >= kMaxPendingRelease) {

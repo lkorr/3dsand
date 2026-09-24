@@ -62,6 +62,16 @@
 // ONE buffer load per shaded point, no ray and no voxel read, which is the only
 // shape of emitter light this path can consume.
 @group(0) @binding(20) var<storage, read> glow : array<u32>;
+// The water veil (common.wgsl THE WATER VEIL): how the liquid over each pixel
+// transforms light coming up from below. Written by raymarch.wgsl in the half
+// of the world pass before this one draws.
+@group(0) @binding(24) var<storage, read> waterVeil : array<u32>;
+
+// THE CLOUDS (common.wgsl cloudSunAt): the shadow + env maps and the cloud
+// uniform, so a body standing in a cloud's shadow is in it too — the same
+// lookup the terrain around it makes.
+@group(0) @binding(26) var<storage, read> cloudMaps : array<u32>;
+@group(0) @binding(27) var<uniform> CL : CloudParams;
 
 struct BodyXform {
   pos : vec3f, _p : f32,         // world voxels
@@ -283,15 +293,60 @@ fn bodyValueNoise(p : vec3f, scale : f32) -> f32 {
   let x11 = mix(bodyVnHash(i + vec3<i32>(0,1,1)), bodyVnHash(i + vec3<i32>(1,1,1)), f.x);
   return mix(mix(x00, x10, f.y), mix(x01, x11, f.y), f.z);
 }
-fn bodyStainTint(albedo : vec3f, stain : u32, cell : vec3<i32>, scale : f32) -> vec3f {
+// ---- A COAT THAT GLOWS AND BREATHES (2026-09-23) ---------------------------
+// The stain palette entry's spare `_r2` word is the coat's glow + pulse
+// (materials.json coat.glow / coat.pulse; packed by Simulation::UploadTables,
+// layout materials.h kCoatGlow* -- bits 0..7 glow 0..255, bits 8..19 pulse in
+// centi-Hz). Zero for every coat but a glowing one, so blood, water, rot and
+// bruises take the `pulse == 0` branch and draw exactly as before.
+//
+// The wave is 0..1. A small per-cell phase from the same mottle the coverage
+// uses, so a drenched arm shimmers as one film rather than blinking as a slab.
+fn bodyCoatWave(glowWord : u32, mottle : f32, time : f32) -> f32 {
+  let hz = f32((glowWord >> 8u) & 0xFFFu) * 0.01;
+  if (hz <= 0.0) { return 1.0; }
+  return 0.5 + 0.5 * sin(time * hz * 6.2831853 + mottle * 1.6);
+}
+
+// How much of this voxel the coat covers, 0..1, before any pulse. Shared by the
+// tint and the glow so the two can never disagree about where the coat is.
+fn bodyStainCover(stain : u32, cell : vec3<i32>, scale : f32) -> vec2f {
   let amtI = stain & 0xFu;
-  if (amtI == 0u) { return albedo; }
+  if (amtI == 0u) { return vec2f(0.0); }
   let amt = f32(amtI) / f32(STAIN_AMT_MAX);
-  let stainCol = unpackColor(materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)].stainColor);
+  let packed = materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)].stainColor;
+  // The one place a body differs from the ground: the coat's authored
+  // `opacity` (materials.json coat block, packed in the colour's alpha byte by
+  // ParseCoat) scales the coverage, so water can soak a limb to full amount
+  // and still read as a faint dampening rather than a grey statue.
+  let opacity = f32(packed >> 24u) / 255.0;
   let mottle = bodyValueNoise(vec3f(cell), TUNE_STAIN_MOTTLE_SCALE * scale);
-  let cover = clamp((amt * (1.0 + TUNE_STAIN_MOTTLE) - mottle * TUNE_STAIN_MOTTLE) *
+  let cover = opacity *
+              clamp((amt * (1.0 + TUNE_STAIN_MOTTLE) - mottle * TUNE_STAIN_MOTTLE) *
                     TUNE_STAIN_COVERAGE, 0.0, 1.0);
-  if (cover <= 0.0) { return albedo; }
+  return vec2f(cover, mottle);
+}
+
+// Emission a glowing coat adds to this voxel (scalar, like material emission):
+// glow x coverage, breathing between 35% and 100% on the coat's pulse.
+fn bodyCoatGlow(stain : u32, cell : vec3<i32>, scale : f32, time : f32) -> f32 {
+  if ((stain & 0xFu) == 0u) { return 0.0; }
+  let glowWord = materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)]._r2;
+  let glow = f32(glowWord & 0xFFu) / 255.0;
+  if (glow <= 0.0) { return 0.0; }
+  let cm = bodyStainCover(stain, cell, scale);
+  return glow * cm.x * mix(0.35, 1.0, bodyCoatWave(glowWord, cm.y, time));
+}
+
+fn bodyStainTint(albedo : vec3f, stain : u32, cell : vec3<i32>, scale : f32,
+                 time : f32) -> vec3f {
+  let cm = bodyStainCover(stain, cell, scale);
+  if (cm.x <= 0.0) { return albedo; }
+  let pal = materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)];
+  let stainCol = unpackColor(pal.stainColor);
+  // A pulsing coat's COLOUR breathes too (70%..100% of its cover), so the film
+  // itself swells and thins rather than only its light.
+  let cover = cm.x * mix(0.7, 1.0, bodyCoatWave(pal._r2, cm.y, time));
   let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, cover);
   return mix(soaked, stainCol, cover * TUNE_STAIN_OPACITY);
 }
@@ -600,7 +655,8 @@ fn fs(in : VSOut) -> FSOut {
   // where the ground applies its own stain: a stain is a change to what the
   // surface is, and it has to take the scene's light like the skin under it.
   // One pool load, and only for models that carry a lattice at all.
-  albedo = bodyStainTint(albedo, poolStainAt(in.stainBase, dims, c), c, scale);
+  let coatWord = poolStainAt(in.stainBase, dims, c);
+  albedo = bodyStainTint(albedo, coatWord, c, scale, R.time);
 
   // `tCur` is already the parameter along the UNNORMALIZED camera-to-fragment
   // vector, and that is the whole point of never normalizing anything: `ro/rd`
@@ -619,7 +675,10 @@ fn fs(in : VSOut) -> FSOut {
   let bt = burnTint(mat, albedo, f32(mat.emission) / 255.0,
                     burnTintWeightH(fh, R.time));
   albedo = bt.albedo;
-  let emis = emberFlicker(bt.emis, fh, R.time);
+  // ...plus a glowing coat's own light (acid), which breathes on its pulse
+  // rather than flickering like an ember.
+  let emis = emberFlicker(bt.emis, fh, R.time) +
+             bodyCoatGlow(coatWord, c, scale, R.time);
   // The ambient's spatial term. One downward probe per FRAGMENT (at most six
   // mask words), which is where a body's shading has to happen. `.x` is the
   // ambient multiplier, `.y` the raw openness the shadow lift is capped by —
@@ -630,8 +689,13 @@ fn fs(in : VSOut) -> FSOut {
   // went dark, so a mob read as lit from a sun the terrain could not see.
   // Same ray, same softening law and same lift cap as the terrain beside it
   // (bodySunShadow -> shadowFromOpaqueHit, common.wgsl).
-  let sh = bodySunShadow(worldPos, n, R, &occupancy, &materials);
-  var col = litColorS(albedo, n, worldPos, emis, R, open.x, open.y, sh);
+  var sh = bodySunShadow(worldPos, n, R, &occupancy, &materials);
+  if ((R.weatherFlags & RWF_CLOUDS) != 0u) {
+    sh *= cloudSunAt(worldPos, keyLightDirP(R), &CL, &cloudMaps);
+  }
+  // Unfogged: the air fog is applied at the end, by the water veil when the
+  // fragment is under a liquid surface and by bodyAirFog when it is not.
+  let lit = litColorSNoFog(albedo, n, worldPos, emis, R, open.x, open.y, sh);
   // Emitter light from the glow field (common.wgsl THE GLOW FIELD). ONE buffer
   // load, no ray: this is the term that lights a mob standing in a lava pit or
   // beside a burning tree, which nothing did before. It cannot come from the
@@ -641,8 +705,8 @@ fn fs(in : VSOut) -> FSOut {
   // `open.x` as the occlusion, not 1.0: unlike a loose particle a limb is a
   // solid body with creases, and this is the same multiplier the ambient took
   // one line up.
-  col += glowLight(albedo, open.x, glowAtPos(worldPos, &glow),
-                   TUNE_GLOW_STRENGTH);
+  var add = glowLight(albedo, open.x, glowAtPos(worldPos, &glow),
+                     TUNE_GLOW_STRENGTH);
 
   // ---- THE HIT FLASH -------------------------------------------------------
   // ADDITIVE, and BEFORE the tonemap, because litColor's output is linear HDR
@@ -660,7 +724,23 @@ fn fs(in : VSOut) -> FSOut {
   // uniform across the instance (the value is flat-interpolated), so it costs
   // nothing on the ones that skip it.
   if (in.flash > 0.0) {
-    col += (vec3f(1.0, 0.86, 0.78) + albedo) * in.flash;
+    add += (vec3f(1.0, 0.86, 0.78) + albedo) * in.flash;
+  }
+
+  // ---- UNDER WATER ---------------------------------------------------------
+  // A limb below a liquid surface is seen through it: dimmed and tinted by the
+  // column between it and the surface, lit by the caustic web, and behind the
+  // surface's own Fresnel reflection and foam — the same equation the lake bed
+  // under it was shaded with (common.wgsl THE WATER VEIL). Above the surface
+  // it takes the ordinary air fog, with glow and flash on top unfogged as
+  // they always were.
+  let dist = length(worldPos - R.camPos);
+  let veil = waterVeilAt(&waterVeil, in.pos.xy, dist, &R);
+  var col : vec3f;
+  if (veil.on) {
+    col = waterVeilApply(veil, lit + add, dist);
+  } else {
+    col = bodyAirFog(lit, worldPos, R) + add;
   }
 
   // ---- reversed-Z depth, EXACTLY raymarch.wgsl's convention ----

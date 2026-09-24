@@ -484,6 +484,84 @@ struct MeleeTuning {
   // keep-out sphere itself arrives per tick via SetKeepOut, because only the
   // rig knows where its head is. 0 = clamp OFF, the one-JSON-edit A/B.
   float headClear = MetresToCells(0.06f);
+  // ---- ...AND OUT OF THE WIELDER'S OWN CHEST (2026-09-21) ------------------
+  //
+  // World voxels of clearance beyond the torso capsule's own radius the HAND
+  // is held out to. Same shape as `headClear` and the same off switch (0), and
+  // it exists because the head sphere covered the one body part an authored
+  // windup could sweep a BLADE through and left the one an ARM actually goes
+  // through untouched: a backhand's windup drives the commanded point to the
+  // far azimuth stop, the hand is that point minus a whole blade, and it lands
+  // inside the ribs with the forearm following it there. Reported as arms
+  // clipping through the body; game/selfclip.h is what made it a number.
+  //
+  // The capsule arrives per tick via SetBodyKeepOut, because only the rig
+  // knows where its own spine is (Mob::BodyKeepOut). THE HAND is what is
+  // pushed, not the tip: the tip is the ASK and the hand is the ARM, and
+  // pushing the ask would move where the cut lands — the blade is re-aimed at
+  // the commanded point from the pushed hand, which is exactly the treatment
+  // `handBackFrac` already gets and for the same reason.
+  //
+  // 0.10 m is a hand's width off the ribs: enough that a crossed guard reads
+  // as being in front of the chest rather than in it, small enough that a
+  // backhand windup still chambers across the body.
+  float bodyClear = MetresToCells(0.05f);
+  // ---- THE LEAN PLANE DOES NOT CHASE A REVERSAL (2026-09-21) -------------
+  //
+  // `leanTurnRate` above bounds how fast the blade's lean plane may rotate
+  // about the radius, and a flat rate is the wrong KIND of bound at the one
+  // place it matters. The plane chases the tip's own TRAVEL, so a reversal —
+  // the end of every cut, and every tick of a follow-through unwinding — asks
+  // it to turn by pi. Rotating `perpL_` by pi carries the HAND through an arc
+  // of pi * bladeLen * sin(lean) about the shoulder-to-point line: on a sword
+  // that is the whole arm whipping round a point that has nearly stopped, and
+  // it is the reported "the sword spins near the end of the swing". The rate
+  // limit does not prevent it, it only makes it take 0.17 s.
+  //
+  // RADIANS. A commanded turn larger than this is treated as a REVERSAL
+  // rather than as a turn, and the plane holds its lean instead of swapping
+  // which side the hilt leads on — which is what a real blade does. Anything
+  // smaller is honest tracking and is chased as before.
+  //
+  // ---- IT SHIPS AT pi, WHICH IS OFF, AND THAT IS THE FINDING --------------
+  //
+  // Nothing exceeds a half turn, so pi never fires. The mechanism is here,
+  // measured and reachable by one JSON edit, and it is NOT ON, because every
+  // value tight enough to matter costs more than it buys:
+  //
+  //   * At 1.75 (100 degrees) the blade's unasked-for rotation drops by about
+  //     a radian per swing — and `swing-plane` catches the elbow bulging
+  //     0.674 rad in front of its own shoulder-to-wrist line against an
+  //     authored 0.50, `player-styles` loses a thrust's posed travel, and
+  //     `npc-strike` goes with them.
+  //   * The bound tried FIRST — hold the plane to the arc the tip is actually
+  //     covering, so the arm can never outrun the point — fails the same two
+  //     gates for the same reason, and sweeping its ratio found exactly ONE
+  //     value (4) that threaded between them, with 2 and 8 each failing a
+  //     different one. A knob tuned to thread a needle between two thresholds
+  //     is a flake, not a fix.
+  //
+  // So the spin is diagnosed, instrumented (`--gate swing-smooth` reports the
+  // blade's direction arc per stroke) and left alone. Whoever takes it on
+  // next needs the ARM's constraint solved with the plane's, not against it.
+  float leanFlipHold = 3.14f;
+  // ...and the tangential speed below which there is no travel to chase at
+  // all, world voxels/sec. Under this the plane simply HOLDS — a decelerating
+  // or stalled tip reports a tangent that is mostly noise, and re-aiming the
+  // whole arm at noise is the other half of the same spin. Stated as a
+  // fraction of `steerSpeedLo` would couple two unrelated feels; 0.05 m/s is
+  // a blade that has stopped.
+  float leanMinSpeed = MetresPerSecToCells(0.05f);
+  // ---- HOW FAR OFF ITS OWN LINE THE TRAVEL HAS TO BE TO SET THE ROLL ------
+  //
+  // The blade's flat is `bladeDir x travel`, whose LENGTH is the sine of the
+  // angle between them — so a thrust, where the two are nearly parallel, gives
+  // a normal whose DIRECTION is almost pure noise. The guard used to be
+  // 1e-3, which is three hundredths of a degree: in practice the roll was
+  // being decided by numerical dust for the whole of every thrust and every
+  // stall. Below this sine the previous roll is held, which is what a real
+  // blade does. 0.20 is 11.5 degrees.
+  float flatMinSin = 0.20f;
 };
 
 // ---- WHERE THE NUMBERS COME FROM -------------------------------------------
@@ -897,6 +975,24 @@ class MeleeState {
     keepR_ = radius;
   }
   void ClearKeepOut() { keepR_ = 0; }
+  // THE WIELDER'S OWN TORSO, as a keep-out CAPSULE: the spine's two ends
+  // relative to the shoulder in the same world frame SetStroke's offsets are
+  // in, and the body's half-WIDTH in world voxels. Pushed per tick beside
+  // SetStroke by both drivers (Mob::BodyKeepOut); Clear when the rig cannot
+  // say, which turns the clamp off rather than clamping against a stale one.
+  void SetBodyKeepOut(const Vec3& aFromShoulder, const Vec3& bFromShoulder,
+                      float halfWide, float halfDeep) {
+    bodyA_ = aFromShoulder;
+    bodyB_ = bFromShoulder;
+    bodyWide_ = halfWide;
+    bodyDeep_ = halfDeep;
+  }
+  void ClearBodyKeepOut() { bodyWide_ = bodyDeep_ = 0; }
+  // WAS THE HAND PUSHED OUT OF THE BODY THIS TICK, and by how far (world
+  // voxels)? Reported rather than merely applied, because "the arm still goes
+  // through the chest" and "the clamp is off" are different failures and from
+  // outside they are the same picture. Zero when the clamp did not fire.
+  float BodyClampPush() const { return bodyPush_; }
   // +1 = the weapon is on the basis's RIGHT (a right-handed wielder), -1 = its
   // left. Only the asymmetric azimuth limits read it: "across the body" is a
   // different stop from "out to the weapon side".
@@ -968,6 +1064,26 @@ class MeleeState {
   // recover instead of being switched off. Coming IN needs no fade — control
   // starts at the arm's own current pose, so weight 1 changes nothing visible.
   float PoseWeight() const;
+  // ---- ONE STROKE'S OWN HAND-BACK CLOCK (2026-09-21) ---------------------
+  //
+  // `tuning.recoverTime` is ONE NUMBER SHARED BY EVERY ATTACK IN THE GAME, and
+  // for a held-button stroke that is right: it is the feel of releasing the
+  // mouse, and there is one of those. For an AUTHORED stroke it is not — a jab
+  // and an overhead chop have no business handing the arm back on the same
+  // clock, and until this existed they had no choice.
+  //
+  // Seconds; 0 restores the global value, which is what every caller that
+  // never touches it gets. Pushed by StepStrokeProgram from the style's
+  // `recover.fade` (strokes.cpp says why it is pushed every tick), and cleared
+  // by Reset() so a fresh stroke never inherits one. It deliberately does NOT
+  // live on `tuning`: that struct is copied wholesale from tuning.json on every
+  // F5 and per-swing state written into it would be silently reverted.
+  void SetRecoverTime(float seconds) {
+    recoverOverride_ = seconds > 1e-4f ? seconds : 0.0f;
+  }
+  float RecoverTime() const {
+    return recoverOverride_ > 1e-4f ? recoverOverride_ : tuning.recoverTime;
+  }
   // HOW COMMITTED THIS STROKE IS, 0..1, and therefore how much of the blade's
   // commanded orientation the wrist should actually apply (WeaponPose::
   // steerAmount). Smoothed inside RebuildFrame on the blade's own halflife, so
@@ -1113,8 +1229,17 @@ class MeleeState {
   // shoulder; 0 radius = no sphere = clamp off.
   Vec3 keepC_{};
   float keepR_ = 0;
+  // The torso keep-out capsule (SetBodyKeepOut). World-frame offsets from the
+  // shoulder; 0 radius = no capsule = clamp off.
+  Vec3 bodyA_{}, bodyB_{};
+  // Half-width (across) and half-depth (front-to-back), world voxels. Either
+  // at 0 = no capsule = clamp off.
+  float bodyWide_ = 0, bodyDeep_ = 0;
+  float bodyPush_ = 0;   // how far the hand was pushed out of it, last tick
   float handSign_ = 1.0f;
   // Was the button still down when this recover started? A recover between two
   // cuts keeps the arm; a recover after the release hands it back (PoseWeight).
   bool recoverHold_ = false;
+  // Seconds, 0 = use tuning.recoverTime. See SetRecoverTime.
+  float recoverOverride_ = 0.0f;
 };

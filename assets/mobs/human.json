@@ -1,12 +1,13 @@
 {
   "root": "hips",
   "artVoxelsPerMetre": 80,
+  "eyeLocal": [0, 16, 0],
   "bleed": {
     "material": "blood",
     "perDamage": 2.5
   },
   "anatomy": {
-    "//": "What is under the skin, by depth from the surface, baked into human.vox by `node scripts/anatomize_mob.mjs human` or the tuner's Apply recipe button (assets/editor/anatomy.js documents the format). Materials by NAME. `keep` leaves the painted surface alone; `garments` are surface voxels that are clothes, so the voxel under them is skin. Head override: a bone skull two deep around a `brain` core.",
+    "//": "What is under the skin, by depth from the surface, baked into the .vox by `node scripts/anatomize_mob.mjs <mob>` or the tuner's Apply recipe button (assets/editor/anatomy.js documents the format). Materials by NAME. `keep` leaves the painted surface alone; `garments` are surface voxels that are clothes, so the voxel under them is skin. Head override: a bone skull two deep around a `brain` core. `carve` (per limb) shapes the bone into a skeleton: eye sockets and a nasal hole in the skull, ribs, sternum and spine in the chest.",
     "layers": [
       {
         "material": "skin",
@@ -32,8 +33,11 @@
     "garments": [
       "linen"
     ],
+    "//garmentsBecome": "The shorts are painted as `linen` (a .vox can only paint ids 0..127) and are FLESH in every respect but look, so every garment voxel on this body becomes `undercloth` at load -- after the recipe, so `garments` above still finds them. materials.json `undercloth` / reactions.json UNDERCLOTH. Characters that extend human inherit it.",
+    "garmentsBecome": "undercloth",
     "limbs": {
       "//head": "A bone skull two deep around a BRAIN. The core layer is open-ended, so `brain` is by definition everything the shell encloses -- there is no geometric brain test anywhere in the engine, and this recipe is the only thing that decides what is one. Losing a voxel of it costs gore.brainHpPerVoxel flat on top of the ordinary volume damage (materials.json `brain`), which is why the skull in front of it matters: the rot chews bone at half rate (bone.rotRate), so breaching takes time and what is behind goes fast.",
+      "//torso": "A ribcage, not a bone brick: the depth schedule would fill the chest with solid bone, so `carve` hollows it to flesh (the organs), walls it in muscle at depth 3, and puts bone back as ribs, a sternum and a spine.",
       "head": {
         "layers": [
           {
@@ -52,6 +56,133 @@
           {
             "material": "brain"
           }
+        ],
+        "carve": [
+          {
+            "material": "muscle",
+            "where": "bone",
+            "box": {
+              "x": [
+                0.2,
+                0.4
+              ],
+              "y": [
+                0.47,
+                0.57
+              ],
+              "z": [
+                0.6,
+                1
+              ]
+            }
+          },
+          {
+            "material": "muscle",
+            "where": "bone",
+            "box": {
+              "x": [
+                0.6,
+                0.8
+              ],
+              "y": [
+                0.47,
+                0.57
+              ],
+              "z": [
+                0.6,
+                1
+              ]
+            }
+          },
+          {
+            "material": "flesh",
+            "where": "bone",
+            "box": {
+              "x": [
+                0.45,
+                0.55
+              ],
+              "y": [
+                0.4,
+                0.47
+              ],
+              "z": [
+                0.7,
+                1
+              ]
+            }
+          }
+        ]
+      },
+      "torso": {
+        "carve": [
+          {
+            "material": "flesh",
+            "where": "bone"
+          },
+          {
+            "material": "muscle",
+            "where": "bone",
+            "depth": [
+              3,
+              3
+            ]
+          },
+          {
+            "material": "bone",
+            "where": "bone",
+            "depth": [
+              3,
+              3
+            ],
+            "box": {
+              "y": [
+                0.42,
+                0.94
+              ]
+            },
+            "stripe": {
+              "axis": "y",
+              "period": 4,
+              "width": 2
+            }
+          },
+          {
+            "material": "bone",
+            "where": "bone",
+            "depth": [
+              3,
+              3
+            ],
+            "box": {
+              "x": [
+                0.45,
+                0.55
+              ],
+              "y": [
+                0.42,
+                0.94
+              ],
+              "z": [
+                0.5,
+                1
+              ]
+            }
+          },
+          {
+            "material": "bone",
+            "where": "bone",
+            "box": {
+              "x": [
+                0.4,
+                0.6
+              ],
+              "z": [
+                0,
+                0.5
+              ]
+            }
+          }
         ]
       }
     }
@@ -64,6 +195,18 @@
     "//infectedLimbs": "How much of the body has to carry the rot. One limb: a single bite that got through is enough, which is the rule the bite already implies (armour that stops the tear stops the infection outright, melee.h).",
     "infectedLimbs": 1
   },
+  "//loot": "WHAT A PERSON HAS ON THEM, as opposed to what they are WEARING. Worn and held gear is a rig slot and has to be applied from outside (WearItem/EquipItem); this is the pack, and it is pure data because a carried stack has no geometry, no physics and nothing to draw. Rolled ONCE at spawn from the mob id alone (Mob::RollLoot), so the same villager has the same purse on a replay, on the other machine, and after a reload -- and a load does not re-roll, because the saved list is the truth and rolling again would make sleeping next to a corpse a way to refill it. Each row is an item id from assets/items/items.json, an optional `count` (a number, or [min,max] for a draw), an optional `chance` 0..1, and an optional `dye` as \"#RRGGBB\". The two draws use separate keys so that lucky rows are not also big rows. INHERITED BY EVERY CHARACTER through `extends` -- an array REPLACES wholesale (RFC 7396) so a character states its own table in full, and `\"loot\": null` empties it. What dies with a pack drops it: Die() puts every stack on the corpse report where the loot panel can see it, and a body that TURNS carries its pack onto the zombie that gets up, because a rising that dropped the purse would be a way to delete one.",
+  "loot": [
+    {
+      "item": "dagger",
+      "chance": 0.18
+    },
+    {
+      "item": "hood",
+      "chance": 0.12,
+      "dye": "#6b5a3e"
+    }
+  ],
   "speed": 31.5,
   "gait": {
     "groups": [

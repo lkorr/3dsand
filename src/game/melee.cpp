@@ -519,6 +519,41 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     // baseline; rescale so the same number means the same distance.
     d.reach = it.value("reach", 9.0f) *
               ((float)kVoxelsPerMetre / (float)kLegacyAuthoringVoxelsPerMetre);
+    d.weaponClass = it.value("weaponClass", "");
+    // ---- VESSELS (game/container.h) ----------------------------------------
+    // `holds` by CLASS NAME, so what a vessel takes up is authored, not a
+    // material list: a flask holds every liquid there is or will be.
+    if (d.kind == ItemKind::Container) {
+      const json c = it.value("container", json::object());
+      for (const auto& h : c.value("holds", json::array())) {
+        const std::string hn = h.is_string() ? h.get<std::string>() : "";
+        if (hn == "liquid") d.container.holds |= 1u << CLASS_LIQUID;
+        else if (hn == "powder") d.container.holds |= 1u << CLASS_POWDER;
+        else
+          errors += "items: \"" + d.name + "\" container holds unknown class \"" +
+                    hn + "\" (liquid | powder)\n";
+      }
+      // Authored in CELLS, stored in eighths (kContainerUnitsPerCell).
+      d.container.capacity =
+          std::clamp(c.value("capacity", 0), 0, 4096) * kContainerUnitsPerCell;
+      d.container.scoopPerTick = std::clamp(c.value("scoopPerTick", 4), 1, 64);
+      d.container.pourPerTick = std::clamp(c.value("pourPerTick", 2), 1, 64);
+      d.container.applyCells = std::clamp(c.value("applyCells", 4), 1, 128);
+      d.container.pourRange = MetresToCells(c.value("pourRangeM", 2.0f));
+      d.container.pourSpeed = MetresToCells(c.value("pourSpeedMps", 1.5f));
+      d.container.aimDist = MetresToCells(std::max(0.1f, c.value("aimM", 1.0f)));
+      d.container.throwSpeed = MetresToCells(std::max(0.0f, c.value("throwSpeedMps", 0.0f)));
+      d.container.throwMinSpeed = std::min(
+          d.container.throwSpeed,
+          MetresToCells(std::max(0.0f, c.value("throwMinSpeedMps", 0.0f))));
+      d.container.throwChargeSec = std::max(0.05f, c.value("throwChargeSec", 1.0f));
+      d.container.breakSpeed = MetresToCells(std::max(0.0f, c.value("breakSpeedMps", 0.0f)));
+      if (d.container.holds == 0 || d.container.capacity == 0) {
+        errors += "items: \"" + d.name +
+                  "\" is a container with no `holds` or no `capacity` -- skipped\n";
+        continue;
+      }
+    }
     // A broken item is skipped, never fatal: one bad asset must not cost the
     // player their whole hotbar (DESIGN.md §6, the same rule mob defs follow).
     if (!LoadItemAsset(dir, materialCount, micro, d, errors)) continue;
@@ -1378,6 +1413,10 @@ void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
   dst.torsoShare = m.torsoShare;
   dst.torsoPitch = m.torsoPitch;
   dst.headClear = MetresToCells(m.headClearM);           // m -> voxels
+  dst.bodyClear = MetresToCells(m.bodyClearM);           // m -> voxels
+  dst.leanFlipHold = m.leanFlipHold;
+  dst.leanMinSpeed = MetresPerSecToCells(m.leanMinSpeed);  // m/s -> voxels/s
+  dst.flatMinSin = m.flatMinSin;
   // `controlMode`/`pickMinSpeed` are DELIBERATELY not copied: they are the
   // controller's switch, read off CurrentTuning() at the one site in main.cpp,
   // and a cached copy here could disagree with it across an F5 (tuning.h).
@@ -1447,8 +1486,11 @@ float MeleeState::PoseWeight() const {
       // mid-combination would drop the blade to the walk pose for a fifth of a
       // second. `recoverHold_` is what the phase was entered for.
       if (recoverHold_) return 1.0f;
-      float t =
-          tuning.recoverTime > 1e-4f ? phaseTime_ / tuning.recoverTime : 1.0f;
+      // RecoverTime(), not tuning.recoverTime: an authored stroke may own its
+      // own hand-back clock (melee.h SetRecoverTime, strokes.h
+      // StrokeRecover::fade). Unset, this IS tuning.recoverTime.
+      const float rt = RecoverTime();
+      float t = rt > 1e-4f ? phaseTime_ / rt : 1.0f;
       return std::clamp(1.0f - t, 0.0f, 1.0f);
     }
     default:
@@ -1540,6 +1582,11 @@ void MeleeState::Reset() {
   steerLive_ = std::clamp(tuning.steerFloor, 0.0f, 1.0f);
   framePrimed_ = false;
   recoverHold_ = false;
+  // A fresh stroke inherits no previous style's hand-back clock (melee.h
+  // SetRecoverTime). StepStrokeProgram pushes one every tick anyway, so this
+  // is belt and braces for the callers that Reset() and then do not run a
+  // program at all.
+  recoverOverride_ = 0.0f;
 }
 
 // ---- the derived half -------------------------------------------------------
@@ -1632,9 +1679,19 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   // thrust, and a thrust has no sweep plane to speak of. Held from the last
   // tick when there is nothing to read, so a blade brought to a stop keeps the
   // roll it was cutting with instead of snapping to an arbitrary one.
+  //
+  // ...AND ONLY WHEN THERE IS TRAVEL TO READ (2026-09-21). The guard used to
+  // be 1e-3 voxels/sec, which is not a speed: a blade coasting to a stop, or
+  // one whose follow-through is unwinding, reports a tangent made of numerical
+  // dust, and everything derived from it — the lean plane, the roll — then
+  // chases the dust. `leanMinSpeed` is a blade that has stopped; under it the
+  // last real direction is held, which is what a real one does.
+  float tanSpeed = 0;
   {
     const Vec3 t = tipVel_ - radial * radial.dot(tipVel_);
-    if (t.len() > 1e-3f) tangent_ = t.normalized();
+    tanSpeed = t.len();
+    if (tanSpeed > std::max(tuning.leanMinSpeed, 1e-3f))
+      tangent_ = t.normalized();
   }
 
   // ---- HOW FAR THE BLADE LEANS OFF THE RADIUS -----------------------------
@@ -1668,6 +1725,23 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
        extendLive_) *
       SmoothAlpha(tuning.extendSmoothing, dt);
 
+  // ---- THE LEAN ANGLE ITSELF, before the plane it is laid in --------------
+  //
+  // Solved HERE rather than beside the direction below (where it used to live)
+  // because the plane's own turn bound needs it: the hand sits
+  // `bladeLen * sin(lean)` off the shoulder-to-point line, and that distance
+  // is exactly the radius the hand orbits at when the plane rotates. A bound
+  // stated in radians per second cannot know how far that is on this blade at
+  // this extension, and it is the difference between a wrist and a whole arm.
+  float leanCos = 1.0f, leanSin = 0.0f;
+  if (bladeLen_ > 1e-4f && r > 1e-4f) {
+    leanCos = std::clamp(
+        (r * r + bladeLen_ * bladeLen_ - extendLive_ * extendLive_) /
+            (2.0f * bladeLen_ * r),
+        -1.0f, 1.0f);
+    leanSin = std::sqrt(std::max(0.0f, 1.0f - leanCos * leanCos));
+  }
+
   // WHICH WAY THE LEAN GOES: with the travel (so the hand leads the point), or
   // against it. Rotated toward the target ABOUT THE RADIUS at a bounded rate,
   // which is the only way to cross a reversal without passing through the
@@ -1686,6 +1760,40 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
     const float c = std::clamp(cur.dot(want), -1.0f, 1.0f);
     const float sgn = cur.cross(want).dot(radial) < 0.0f ? -1.0f : 1.0f;
     float turn = std::acos(c) * sgn;
+    // ---- THE PLANE DOES NOT CHASE A REVERSAL (2026-09-21) ----------------
+    //
+    // This is the fix for the reported spin, and WHICH bound to use took two
+    // tries, so both are recorded.
+    //
+    // The defect: `perpL_` chases the tip's own TRAVEL, and travel reverses —
+    // at the end of every cut, and on every tick of a follow-through
+    // unwinding. A reversal asks this plane to turn by pi, and rotating it by
+    // pi carries the HAND through an arc of `pi * bladeLen * leanSin` about
+    // the shoulder-to-point line. On a sword that is the whole arm whipping
+    // round a blade that has nearly stopped. `leanTurnRate` (18 rad/s) bounds
+    // it only in the sense that it takes 0.17 s instead of one tick, which is
+    // precisely fast enough to read as a spin.
+    //
+    // WHAT WAS TRIED FIRST, and why it is not here: bounding the turn by the
+    // arc the TIP is actually covering, so the arm could never outrun the
+    // point. It is a true statement and it measures well on the blade — a
+    // radian per swing of unasked-for rotation gone — but it also FREEZES the
+    // plane through every slow, honest part of a stroke, which leaves the hand
+    // holding a stale lean and pushes the elbow forward: `swing-plane` caught
+    // the joint bulging 0.674 rad in front of its own shoulder-to-wrist line
+    // against an authored 0.50, and `player-styles` lost a thrust's posed
+    // travel. Sweeping the ratio found exactly one value (4) that threaded
+    // between the two, with 2 and 8 each failing a different gate — a knob
+    // tuned to thread a needle between two thresholds is a flake, not a fix.
+    //
+    // A REVERSAL IS NOT A TURN, and that is the sharper statement. When the
+    // travel flips, a real blade does not swap which side its hilt leads on;
+    // it keeps the lean it had and the hand goes on leading. So a target more
+    // than `leanFlipHold` away is not chased at all — the plane HOLDS, and
+    // picks the new travel up again once it is within a quarter turn or so.
+    // Small, honest tracking is untouched, which is why this costs neither
+    // gate what the rate bound did.
+    if (std::fabs(turn) > std::max(tuning.leanFlipHold, 0.0f)) turn = 0.0f;
     const float maxTurn = std::max(tuning.leanTurnRate, 0.0f) * dt;
     turn = std::clamp(turn, -maxTurn, maxTurn);
     // Rodrigues about the radius; `cur` is already perpendicular to it, so the
@@ -1696,21 +1804,36 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
 
   Vec3 wantDir = radial;
   if (bladeLen_ > 1e-4f && r > 1e-4f) {
-    const float cosT = std::clamp((r * r + bladeLen_ * bladeLen_ -
-                                   extendLive_ * extendLive_) /
-                                      (2.0f * bladeLen_ * r),
-                                  -1.0f, 1.0f);
-    const float sinT = std::sqrt(std::max(0.0f, 1.0f - cosT * cosT));
     const float s = tuning.handLead >= 0.0f ? 1.0f : -1.0f;
-    wantDir = radial * cosT - perpL_ * (sinT * s);
+    wantDir = radial * leanCos - perpL_ * (leanSin * s);
   }
   if (wantDir.len() < 1e-5f) wantDir = radial;
   wantDir = wantDir.normalized();
   // THE FLAT FACES OUT OF THE STROKE PLANE, which is the same statement as
   // "the edge leads the travel": the cutting plane is spanned by the blade and
   // by where it is going, so its normal is their cross product.
+  //
+  // TWO THINGS ABOUT THAT CROSS PRODUCT ARE TRAPS, and both were live until
+  // 2026-09-21 (the reported "the sword spins"):
+  //
+  //   * ITS LENGTH IS A SINE. Blade and travel nearly parallel — a thrust, a
+  //     stall, the moment a cut reverses — and the DIRECTION is noise. The old
+  //     guard was 1e-3, three hundredths of a degree, so the roll was decided
+  //     by dust rather than held. `flatMinSin` is the real threshold.
+  //   * ITS SIGN IS ARBITRARY AND IT FLIPS ON EVERY REVERSAL. A flat normal
+  //     names a PLANE; which face it points out of means nothing — the damage
+  //     model takes `fabs` of it (MeleeEdgeAlign, "a blade cuts equally well
+  //     on either face"). But `tangent_` reverses at the end of every cut, so
+  //     the commanded normal jumped to its own negative, and Lerping a unit
+  //     vector toward its negative passes THROUGH ZERO: the re-orthogonalize
+  //     below then fell to `AnyPerp` and the blade rolled 180 degrees through
+  //     an arbitrary intermediate. Choosing the sign that agrees with the roll
+  //     the blade already has costs one dot product and the flip is gone.
   Vec3 wantFlat = wantDir.cross(tangent_);
-  if (wantFlat.len() < 1e-3f) wantFlat = bladeFlatL_;   // no travel: hold the roll
+  if (wantFlat.len() < std::clamp(tuning.flatMinSin, 0.0f, 0.95f))
+    wantFlat = bladeFlatL_;   // no usable travel: hold the roll
+  else if (wantFlat.dot(bladeFlatL_) < 0.0f)
+    wantFlat = wantFlat * -1.0f;
   if (wantFlat.len() < 1e-3f) wantFlat = AnyPerp(wantDir);
   wantFlat = wantFlat.normalized();
   const float a = SmoothAlpha(tuning.bladeSmoothing, dt);
@@ -1764,6 +1887,166 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
         bladeFlatL_ = bladeFlatL_ - bladeDirL_ * bladeDirL_.dot(bladeFlatL_);
         bladeFlatL_ = bladeFlatL_.len() > 1e-5f ? bladeFlatL_.normalized()
                                                 : AnyPerp(bladeDirL_);
+      }
+    }
+  }
+
+  // ---- ...AND THE HAND STAYS OUT OF THE WIELDER'S OWN CHEST ---------------
+  //
+  // The two clamps above bound the hand against the body's FRONT PLANE, which
+  // is a half-space and therefore says nothing about a hand driven ACROSS the
+  // body. A backhand's windup takes the commanded point to the far azimuth
+  // stop (azAcross, 80 degrees over the midline) and the hand is that point
+  // minus a WHOLE BLADE, so it arrives inside the ribs with the forearm
+  // trailing through them — which is the reported arm-through-the-body, and
+  // what `--gate rig-clip` counts in voxels.
+  //
+  // A CAPSULE, pushed radially, and only the HAND is moved: the tip is the
+  // ASK and moving it would move where the cut lands. The blade is re-aimed at
+  // the commanded point from the pushed hand, exactly as the handBackFrac
+  // clamp does, so a chambered backhand still angles the blade across the body
+  // while the arm itself stays outside it.
+  //
+  // RUNS BEFORE THE HEAD CLAMP because a face-slice is the one outcome nothing
+  // later may undo, and the head clamp is a rigid translate of both endpoints
+  // that cannot push the hand back in.
+  // ---- IT IS THE FOREARM THAT GOES THROUGH THE CHEST, NOT THE FIST -------
+  //
+  // The first version of this clamp pushed the HAND out of the capsule and
+  // stopped there, and `--gate rig-clip` said what that was worth: the forearm
+  // was still 84 to 105 voxels inside the torso on every horizontal cut.
+  // Obvious in hindsight — the arm is the CHORD from the shoulder to the hand,
+  // the shoulder end is pinned ON the body by anatomy, and a chord whose two
+  // endpoints are both outside a capsule can pass straight through the middle
+  // of it. A backhand's chamber is exactly that shape.
+  //
+  // So the deepest point of the WHOLE CHORD is what is measured, and the hand
+  // is pushed by enough to lift THAT point clear: a deficit at parameter `t`
+  // along the chord needs `deficit / t` at the hand, since the shoulder end
+  // cannot move. `kArmFrom` skips the shoulder ball itself, which is inside
+  // the chest in the bind pose and must stay allowed to be.
+  bodyPush_ = 0;
+  if (bodyWide_ > 0.0f && bodyDeep_ > 0.0f && tuning.bodyClear > 0.0f) {
+    const Vec3 aL{bodyA_.dot(right), bodyA_.dot(up), bodyA_.dot(fwd)};
+    const Vec3 bL{bodyB_.dot(right), bodyB_.dot(up), bodyB_.dot(fwd)};
+    const Vec3 ab = bL - aL;
+    const float ab2 = ab.dot(ab);
+    // ---- THE ELLIPSE IS SOLVED AS A CIRCLE IN SCALED SPACE ----------------
+    //
+    // A chest is about twice as wide as it is deep, and the clamp has to be
+    // that shape or it is useless in one axis and oppressive in the other: a
+    // round keep-out sized off the WIDTH reaches out in front of the sternum
+    // to exactly where a guard is held, and one sized off the DEPTH lets an
+    // arm lie flat across the ribs. Dividing the lateral offset by the two
+    // half-extents turns the ellipse into a unit circle, where "how far in"
+    // and "which way out" are one line each; the push is scaled back on the
+    // way out so it is a real displacement again.
+    const float rx = bodyWide_ + tuning.bodyClear;
+    const float rz = bodyDeep_ + tuning.bodyClear;
+    // A point's offset from the capsule AXIS, with the along-the-spine part
+    // removed, in units of the ellipse: |.| < 1 is inside.
+    auto scaled = [&](const Vec3& p) {
+      const float t =
+          ab2 > 1e-6f ? std::clamp((p - aL).dot(ab) / ab2, 0.0f, 1.0f) : 0.0f;
+      Vec3 away = p - (aL + ab * t);
+      if (ab2 > 1e-6f) away = away - ab * (away.dot(ab) / ab2);
+      return Vec3{away.x / rx, away.y, away.z / rz};
+    };
+    // ...and back: a displacement in ellipse units is a displacement in
+    // voxels again once each axis is multiplied by its own half-extent.
+    auto unscale = [&](const Vec3& e) { return Vec3{e.x * rx, e.y, e.z * rz}; };
+    // WHICH WAY IS OUT, when the point is essentially ON the axis. An arm
+    // crossing the body has its deepest sample near the spine, where the
+    // radial direction is numerically meaningless and picking it at random
+    // shoves the hand FURTHER across — measured, that made `horizontal_r`
+    // worse, not better (84 voxels of forearm inside the torso became 106).
+    //
+    // A crossing arm passes IN FRONT OF THE CHEST. That is anatomy rather
+    // than a tie-break: there is nowhere else for it to go, and it is what a
+    // person does. So near-degenerate resolves to forward, and the well-posed
+    // case still uses the real radial.
+    auto outward = [&](const Vec3& e) {
+      const float d = std::sqrt(e.x * e.x + e.z * e.z);
+      if (d > 0.35f) return Vec3{e.x / d, 0, e.z / d};
+      return Vec3{0, 0, 1};
+    };
+
+    // ---- 1. THE ARM IS A CHORD, AND ONLY ONE END OF IT CAN MOVE ----------
+    //
+    // The first version of this clamp pushed the HAND out of the capsule and
+    // stopped there, and `--gate rig-clip` said what that was worth: the
+    // forearm was still 84 to 105 voxels inside the torso on every horizontal
+    // cut. Obvious in hindsight — the arm is the chord from the shoulder to
+    // the hand, the shoulder end is pinned ON the body by anatomy, and a chord
+    // whose two endpoints are both outside a capsule passes straight through
+    // the middle of it. A backhand's chamber is exactly that shape.
+    //
+    // So the deepest point of the WHOLE CHORD is found and the hand is pushed
+    // by enough to lift THAT point clear: a deficit at parameter `t` needs
+    // `deficit / t` at the hand, since moving the hand by `v` moves the point
+    // by `t * v`. `kArmFrom` skips the shoulder ball, which is inside the
+    // chest in the bind pose and must stay allowed to be.
+    constexpr float kArmFrom = 0.35f;
+    constexpr int kArmSamples = 8;
+    {
+      float needPush = 0;
+      Vec3 pushDir{};
+      for (int k = 0; k <= kArmSamples; k++) {
+        const float t =
+            kArmFrom + (1.0f - kArmFrom) * ((float)k / (float)kArmSamples);
+        const Vec3 e = scaled(handL * t);
+        const float d = std::sqrt(e.x * e.x + e.z * e.z);
+        if (d >= 1.0f) continue;
+        const Vec3 dir = outward(e);
+        // In ellipse units the surface is at 1, so the deficit is (1 - d);
+        // unscaled along the chosen direction it is a real distance.
+        const float need = unscale(dir * (1.0f - d)).len() / t;
+        if (need <= needPush) continue;
+        needPush = need;
+        pushDir = unscale(dir).normalized();
+      }
+      if (needPush > 0.0f) {
+        bodyPush_ = needPush;
+        handL += pushDir * needPush;
+        const Vec3 bd = tipL - handL;
+        if (bd.len() > 1e-4f) {
+          bladeDirL_ = bd.normalized();
+          bladeFlatL_ = bladeFlatL_ - bladeDirL_ * bladeDirL_.dot(bladeFlatL_);
+          bladeFlatL_ = bladeFlatL_.len() > 1e-5f ? bladeFlatL_.normalized()
+                                                  : AnyPerp(bladeDirL_);
+        }
+      }
+    }
+
+    // ---- 2. ...AND THE BLADE IS A CHORD TOO -------------------------------
+    //
+    // Same argument one link further out: the hand is now outside the capsule
+    // and the point is wherever the stroke asked for, and the segment between
+    // them can still lie through the ribs — an overhead's recover and a
+    // diagonal's follow-through both did, at 48 and 47 voxels of sword inside
+    // the torso. A RIGID TRANSLATE of both endpoints, exactly as the head
+    // sphere below does and for the same reason: |tip - hand| is preserved, so
+    // the sword stays rigid in the fist and only the geometry of the ask moves.
+    if (bladeLen_ > 1e-4f) {
+      constexpr int kBladeSamples = 8;
+      float deficit = 0;
+      Vec3 dirOut{};
+      for (int k = 0; k <= kBladeSamples; k++) {
+        const float t = (float)k / (float)kBladeSamples;
+        const Vec3 e = scaled(handL + (tipL - handL) * t);
+        const float d = std::sqrt(e.x * e.x + e.z * e.z);
+        if (d >= 1.0f) continue;
+        const Vec3 dir = outward(e);
+        const float need = unscale(dir * (1.0f - d)).len();
+        if (need <= deficit) continue;
+        deficit = need;
+        dirOut = unscale(dir).normalized();
+      }
+      if (deficit > 0.0f) {
+        const Vec3 push = dirOut * deficit;
+        handL += push;
+        tipL += push;
+        bodyPush_ = std::max(bodyPush_, deficit);
       }
     }
   }
@@ -2168,7 +2451,30 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       break;
 
     case SwingPhase::Recover:
-      if (phaseTime_ >= tuning.recoverTime) {
+      // ---- THE BUTTON WENT UP MID-FOLLOW-THROUGH (2026-09-21) ------------
+      //
+      // `recoverHold_` is latched at the Slash -> Recover transition — "the
+      // button is still down, so the arm is kept rather than handed back" —
+      // and until now there was NO PATH THAT EVER CLEARED IT. Every stroke
+      // that committed a cut and then released therefore held PoseWeight at a
+      // full 1.0 for the whole recover and dropped it to 0 on the single tick
+      // this phase ended, because the exit goes to Idle and Idle's weight is
+      // zero. The rig blends the ENTIRE two-bone solve and the wrist by that
+      // number (Mob::ApplyWeaponArm's `weight`), so a one-tick 1 -> 0 step is
+      // the arm snapping from the end of the swing to the walk pose in one
+      // frame. That is the reported "looks good for 60% of the animation and
+      // then the sword teleports", and it fired on every authored style:
+      // slashTime is 0.17 s and every cut phase is longer than that, so the
+      // driver was always in Recover-while-held when the program released.
+      //
+      // Clearing the latch hands the fade back to PoseWeight's ramp, and
+      // restarting the clock is what makes it a FULL recoverTime from the
+      // release rather than whatever was left of one that began mid-cut.
+      if (recoverHold_ && !(armed && held)) {
+        recoverHold_ = false;
+        phaseTime_ = 0;
+      }
+      if (phaseTime_ >= RecoverTime()) {
         phase_ = (armed && held) ? SwingPhase::Guard : SwingPhase::Idle;
         phaseTime_ = 0;
         swingAz_ = swingEl_ = swingOut_ = 0;

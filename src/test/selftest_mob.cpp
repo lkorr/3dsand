@@ -17,8 +17,10 @@
 
 #include "game/avatar.h"
 #include "game/bodyreg.h"
+#include "game/corpses.h"
 #include "game/equipment.h"
 #include "game/item.h"
+#include "game/persist.h"
 #include "game/thirdperson.h"
 #include "game/brush.h"
 #include "game/anatomy_resolve.h"
@@ -5766,6 +5768,431 @@ Status GateZombify(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- mob-loot --------------------------------------------------------------
+//
+// THE PACK: what a creature is carrying that is not on its body (MobDef::loot,
+// Mob::carried_). Six claims, in the order the thing actually happens —
+// authored, rolled, dropped, looted, carried through a turning, saved.
+//
+// IT AUTHORS ITS OWN TABLE rather than reading human.json's. A gate that
+// asserted on the shipped loot table would be a gate that fails whenever
+// somebody changes the content, which is the opposite of what it is for: the
+// claim here is that the MECHANISM works, and the content is somebody else's
+// to tune. Same technique the `crowd` gate uses for spacing — SetDefs a copy,
+// restore the pristine list on the way out, because every gate after this one
+// shares the same MobSystem.
+//
+// The fixture is two rows with different shapes: one CERTAIN and stacked (so
+// "it rolled" is not the same statement as "it rolled once"), one COIN-FLIP
+// and dyed (so the chance gate and the dye both have to travel). No render, no
+// worldgen beyond the flat spot, no ticks that are not the rising's clock.
+Status GateMobLoot(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int hi0 = c.mobs.FindDef("human"), zi = c.mobs.FindDef("zombie");
+  if (hi0 < 0 || zi < 0) {
+    detail = "need the human and zombie defs";
+    return Status::Fail;
+  }
+  // The two items the fixture rolls. By NAME against the real library, because
+  // the whole point of a name is that it resolves late: a row naming an item
+  // nobody ships is skipped at spawn, and a gate that hard-coded an index
+  // would be asserting on file order.
+  const char* kSure = "dagger";     // always, two of them
+  const char* kFlip = "hood";       // half the time, dyed
+  const uint32_t kFlipDye = 0x0100Bu | (1u << 24);
+  if (c.items.Find(kSure) < 0 || c.items.Find(kFlip) < 0) {
+    detail = Format("the item library has no '%s'/'%s' to roll", kSure, kFlip);
+    return Status::Fail;
+  }
+  c.mobs.SetItems(&c.items);
+
+  // ---- the fixture table, and the pristine list to put back ----------------
+  const std::vector<MobDef> pristine = c.mobs.Defs();
+  {
+    std::vector<MobDef> edited = pristine;
+    MobDef::LootEntry sure;
+    sure.item = kSure;
+    sure.countMin = sure.countMax = 2;
+    MobDef::LootEntry flip;
+    flip.item = kFlip;
+    flip.chance = 0.5f;
+    flip.dye = kFlipDye;
+    edited[(size_t)hi0].loot = {sure, flip};
+    c.mobs.SetDefs(std::move(edited));
+  }
+  // Every index is re-taken after SetDefs: it MOVES the def vector, so an
+  // index read before it is an index into a dead allocation.
+  const int hi = c.mobs.FindDef("human");
+  const int zid = c.mobs.FindDef("zombie");
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const int step = 12;
+
+  auto countOf = [](const Mob* m, const char* item) {
+    int n = 0;
+    if (m != nullptr)
+      for (const CarriedItem& ci : m->Carried())
+        if (ci.item == item) n += ci.count;
+    return n;
+  };
+
+  // ---- A: IT ROLLS, AND THE ROLL IS A FUNCTION OF THE CREATURE ------------
+  //
+  // Not "the numbers look plausible" — the same body rolled twice produces the
+  // same pack, byte for byte. That is the property every other consumer leans
+  // on: a replay, the other machine and a reload-from-seed all have to agree
+  // about what is in a villager's pockets, and none of them can ask this one.
+  //
+  // Done by CLEARING and RE-ROLLING the same mob rather than by spawning two,
+  // because two mobs are two ids and two ids are supposed to differ.
+  bool rolled = false;
+  std::string rollWhy = "no spawn";
+  int sureN = 0;
+  {
+    const uint64_t id = c.mobs.Spawn(hi, {spot.x, spot.y + 1, spot.z});
+    Mob* m = c.mobs.FindMobById(id);
+    if (m != nullptr) {
+      const std::vector<CarriedItem> first = m->Carried();
+      m->ClearCarried();
+      m->RollLoot();
+      const std::vector<CarriedItem>& again = m->Carried();
+      bool same = first.size() == again.size();
+      for (size_t i = 0; same && i < first.size(); i++)
+        same = first[i].item == again[i].item &&
+               first[i].count == again[i].count && first[i].dye == again[i].dye;
+      sureN = countOf(m, kSure);
+      // The certain row is certain, and it is a STACK: a roll that produced
+      // one of everything would pass a weaker version of this arm.
+      rolled = same && sureN == 2;
+      if (!rolled)
+        rollWhy = Format("stable=%d sure=%d stacks=%zu/%zu", same ? 1 : 0,
+                         sureN, first.size(), again.size());
+    }
+  }
+
+  // ---- B: THE CHANCE IS A CHANCE ------------------------------------------
+  //
+  // A coin-flip row has to come up both ways across a crowd. Without this arm
+  // a `chance` that was read as "always" (or dropped on the floor) passes
+  // every other claim here — the pack would still travel, still save, still
+  // rise; it would simply be the wrong pack, on everybody.
+  //
+  // Deterministic despite being a distribution: the ids are consecutive from a
+  // Reset, so this is a fixed set of draws and not a sample.
+  bool varied = false;
+  std::string varyWhy;
+  int withFlip = 0, withoutFlip = 0;
+  uint32_t dyeSeen = 0;
+  {
+    for (int k = 0; k < 24; k++) {
+      const uint64_t id =
+          c.mobs.Spawn(hi, {spot.x + step + k, spot.y + 1, spot.z + step});
+      const Mob* m = c.mobs.FindMobById(id);
+      if (m == nullptr) continue;
+      bool has = false;
+      for (const CarriedItem& ci : m->Carried())
+        if (ci.item == kFlip) { has = true; dyeSeen = ci.dye; }
+      if (has) withFlip++; else withoutFlip++;
+    }
+    // ...and the DYE travelled with it. A colour authored in the table and
+    // dropped on the way to the pack is the defect that only shows up as a
+    // looted garment being the wrong colour, which nothing else here would
+    // catch (game/dye.h).
+    varied = withFlip > 0 && withoutFlip > 0 && dyeSeen == kFlipDye;
+    if (!varied)
+      varyWhy = Format("with=%d without=%d dye=%08x/%08x", withFlip,
+                       withoutFlip, dyeSeen, kFlipDye);
+  }
+
+  // ---- C+D: IT FALLS WITH IT, AND YOU CAN TAKE IT --------------------------
+  //
+  // The corpse report is the only way a pack ever reaches a player, and a pack
+  // entry rides the SAME list as the worn gear with no body on it
+  // (CorpseReport::Piece::body == 0). So the two halves are one arm: the entry
+  // has to arrive, and TakeCorpseLoot has to move the WHOLE stack into the bag
+  // without destroying a body it does not have.
+  bool looted = false;
+  std::string lootWhy = "no spawn";
+  int gotN = 0, entriesBefore = 0, bodiesAfter = 0;
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    Corpses reg;
+    c.mobs.SetOnCorpse([&reg](const CorpseReport& r) { reg.Add(r); });
+    const uint64_t id =
+        c.mobs.Spawn(hi, {spot.x + 2 * step, spot.y + 1, spot.z});
+    Mob* m = c.mobs.FindMobById(id);
+    const int want = countOf(m, kSure);
+    if (m != nullptr && want > 0) {
+      m->Die();
+      CorpseReport* cr = reg.Find(id);
+      if (cr != nullptr) {
+        entriesBefore = (int)cr->gear.size();
+        // The pack entry, found the way anything finds one: by what it is.
+        int at = -1;
+        for (size_t i = 0; i < cr->gear.size(); i++)
+          if (cr->gear[i].body == 0 && cr->gear[i].item == kSure) at = (int)i;
+        PlayerKit kit;
+        Inventory hotbar;
+        std::string took;
+        const LootResult lr =
+            at >= 0 ? TakeCorpseLoot(*cr, at, KitRef{}, kit, hotbar, c.items,
+                                     c.debris, &took)
+                    : LootResult::NoSuchPiece;
+        for (const ItemStack& s : kit.bag.slots)
+          if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
+        for (const ItemStack& s : hotbar.slots)
+          if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
+        // THE CORPSE IS STILL THERE. A pack item has no body, so taking it
+        // must not have taken a limb out of the world with it — the failure
+        // this pins is `DestroyBody(0)` reaching the physics layer and eating
+        // whatever handle 0 happens to mean.
+        const CorpseReport* after = reg.Find(id);
+        bodiesAfter = after != nullptr ? (int)after->bodies.size() : 0;
+        looted = at >= 0 && lr == LootResult::Ok && took == kSure &&
+                 gotN == want && bodiesAfter > 0 && after != nullptr &&
+                 (int)after->gear.size() == entriesBefore - 1;
+        if (!looted)
+          lootWhy = Format("at=%d res=%d took=%s got=%d/%d entries=%d->%d "
+                           "bodies=%d",
+                           at, (int)lr, took.c_str(), gotN, want, entriesBefore,
+                           after != nullptr ? (int)after->gear.size() : -1,
+                           bodiesAfter);
+      } else {
+        lootWhy = "no corpse report";
+      }
+    }
+    c.mobs.SetOnCorpse(nullptr);
+  }
+
+  // ---- E: AND IT CARRIES THE PACK BACK UP ---------------------------------
+  //
+  // The remains a pack would be looted off are DESTROYED by a rising, so
+  // without this, turning is a way to delete a purse. Same skipped clock as
+  // the `zombify` gate: PreTick with a later tick, not 180 real ones.
+  bool carried = false;
+  std::string carryWhy = "no spawn";
+  int roseN = 0;
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.ClearRisings();
+    const uint64_t id =
+        c.mobs.Spawn(hi, {spot.x + 3 * step, spot.y + 1, spot.z});
+    Mob* m = c.mobs.FindMobById(id);
+    const uint16_t rotMat =
+        zid >= 0 ? c.mobs.Defs()[zid].bite.infectMat : (uint16_t)0;
+    const int want = m != nullptr ? countOf(m, kSure) : 0;
+    if (m != nullptr && rotMat != 0 && want > 0) {
+      std::vector<BrushOp> ops;
+      std::vector<CellOp> cellOps;
+      std::vector<ParticleSpawn> spawns;
+      const uint32_t tick0 = 15000;
+      c.mobs.PreTick(tick0, c.world, ops, cellOps, spawns);
+      int limb = c.mobs.Defs()[hi].rootLimb;
+      for (size_t i = 0; i < c.mobs.Defs()[hi].limbs.size(); i++)
+        if (c.mobs.Defs()[hi].limbs[i].name.rfind("armR", 0) == 0) limb = (int)i;
+      ::BiteHit bt;
+      bt.at = c.mobs.LimbVoxelPos(id, limb, 2251u);
+      bt.hp = 3.0f;
+      bt.power = 0.8f;
+      bt.infectMat = rotMat;
+      bt.infectStain = c.mobs.Defs()[zid].bite.infectStain;
+      bt.seed = 0x10071u;
+      if (const uint64_t lb = c.mobs.LimbBody(id, limb))
+        c.mobs.BiteHit(lb, bt, c.world, spawns);
+      if (Mob* d = c.mobs.FindMobById(id)) d->Die();
+      c.mobs.PreTick(tick0 + 400, c.world, ops, cellOps, spawns);
+      uint64_t risen = 0;
+      for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+        const uint64_t oid = c.mobs.MobIdAt(i);
+        const Mob* om = c.mobs.FindMobById(oid);
+        if (om != nullptr && om->Def() != nullptr && om->Def()->undead)
+          risen = oid;
+      }
+      roseN = countOf(c.mobs.FindMobById(risen), kSure);
+      // THE CONTROL, and the reason this cannot pass by accident: the zombie
+      // def has NO loot table of its own, so a body that got up carrying two
+      // daggers got them from the corpse and from nowhere else. If the rising
+      // dropped the pack and the zombie simply rolled its own, this is 0.
+      const uint64_t ctl =
+          c.mobs.Spawn(zid, {spot.x + 4 * step, spot.y + 1, spot.z});
+      const int ctlN = countOf(c.mobs.FindMobById(ctl), kSure);
+      carried = risen != 0 && roseN == want && ctlN == 0;
+      if (!carried)
+        carryWhy = Format("risen=%llu carried=%d/%d control=%d",
+                          (unsigned long long)risen, roseN, want, ctlN);
+    } else {
+      carryWhy = m == nullptr ? "could not spawn a human"
+                              : (rotMat == 0 ? "no bite.infectMat"
+                                             : "the fixture rolled nothing");
+    }
+  }
+
+  // ---- F: AND IT SURVIVES A SAVE ------------------------------------------
+  //
+  // kSaveVersion 3 is this list. A record that wrote it and a reader that did
+  // not would not merely lose the pack — it would desynchronise the stream and
+  // every creature after this one would load as garbage, which is why the
+  // round-trip is asserted over TWO mobs and not one.
+  bool saved = false;
+  std::string saveWhy = "no spawn";
+  int backN = 0, backN2 = 0;
+  {
+    c.debris.Reset();
+    c.mobs.Reset();
+    const uint64_t a =
+        c.mobs.Spawn(hi, {spot.x + 5 * step, spot.y + 1, spot.z});
+    const uint64_t b =
+        c.mobs.Spawn(hi, {spot.x + 6 * step, spot.y + 1, spot.z});
+    const int wantA = countOf(c.mobs.FindMobById(a), kSure);
+    const int wantB = countOf(c.mobs.FindMobById(b), kSure);
+    if (a != 0 && b != 0) {
+      std::vector<uint8_t> blob;
+      c.mobs.SaveState(blob);
+      c.mobs.Reset();
+      const bool read =
+          c.mobs.LoadState(blob.data(), blob.size(), MobSystem::kSaveVersion);
+      std::vector<uint64_t> back;
+      for (uint32_t i = 0; i < c.mobs.MobCount(); i++)
+        back.push_back(c.mobs.MobIdAt(i));
+      if (back.size() == 2) {
+        backN = countOf(c.mobs.FindMobById(back[0]), kSure);
+        backN2 = countOf(c.mobs.FindMobById(back[1]), kSure);
+      }
+      saved = read && back.size() == 2 && backN == wantA && backN2 == wantB &&
+              wantA > 0;
+      if (!saved)
+        saveWhy = Format("read=%d mobs=%zu packs=%d/%d vs %d/%d", read ? 1 : 0,
+                         back.size(), backN, backN2, wantA, wantB);
+    }
+  }
+
+  // ---- G: THE PLAYER'S OWN KIT RIDES THEIR OWN CORPSE ---------------------
+  //
+  // The avatar turns like anybody else, and its pack is the one thing Die()
+  // cannot read: bag, hotbar and equipment live in PlayerKit on a session this
+  // system deliberately cannot see. So there is a callback, and THIS IS THE
+  // ONLY PLACE THE CALLBACK IS EXERCISED — main.cpp binds it to the real kit,
+  // which no gate has.
+  //
+  // Two arms, because "the zombie carried three daggers" means nothing without
+  // the control: with the callback UNSET the same death must produce a zombie
+  // carrying NOTHING. Otherwise a rising that had quietly learned to roll the
+  // human's table for itself would pass the first half.
+  //
+  // The avatar's own `carried_` stays empty throughout (PlayerAvatar::Spawn
+  // builds its rig without going through MobSystem::Spawn, so it never rolls a
+  // table), which is what makes the count attributable to the hook alone.
+  bool kitRode = false;
+  std::string kitWhy = "no avatar";
+  int kitN = 0, kitCtl = -1;
+  {
+    const std::string avName = kAvatarDefName;
+    const int avDef = c.mobs.FindDef(avName);
+    const uint16_t rotMat =
+        zid >= 0 ? c.mobs.Defs()[zid].bite.infectMat : (uint16_t)0;
+    if (avDef >= 0 && rotMat != 0) {
+      // `armed` false is the control pass; true binds the hook. One lambda so
+      // the two passes cannot drift into two different deaths.
+      auto runOne = [&](bool armed) -> int {
+        c.debris.Reset();
+        c.mobs.Reset();
+        c.mobs.ClearRisings();
+        PlayerAvatar avatar;
+        avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+        avatar.SetDefs(&c.mobs.Defs(), avName);
+        c.mobs.SetAvatar(&avatar);
+        c.mobs.SetAvatarKitFn(
+            armed ? std::function<void(std::vector<CarriedItem>&)>(
+                        [&](std::vector<CarriedItem>& out) {
+                          out.push_back(CarriedItem{kSure, 3, 0});
+                        })
+                  : nullptr);
+        Player pl;
+        pl.fly = false;
+        pl.grounded = true;
+        const int gy = World::TerrainHeight(spot.x + 7 * step, spot.z,
+                                            kDefaultSeed);
+        pl.pos = Vec3{(float)(spot.x + 7 * step) + 0.5f,
+                      (float)(gy + 2) + Player::kHalfY, (float)spot.z + 0.5f};
+        int got = -1;
+        if (avatar.Spawn(pl, 0.0f)) {
+          std::vector<BrushOp> ops;
+          std::vector<CellOp> cellOps;
+          std::vector<ParticleSpawn> spawns;
+          const uint32_t tick0 = 18000;
+          c.mobs.PreTick(tick0, c.world, ops, cellOps, spawns);
+          // The rot, into whichever limb still has a body — what turns you is
+          // having the disease in you when you die, and one limb is the whole
+          // threshold (human.json turn.infectedLimbs).
+          std::vector<uint64_t> bodies;
+          avatar.AppendLiveLimbBodies(bodies);
+          if (!bodies.empty()) {
+            ::BiteHit bt;
+            c.phys.BodyCenterOfMass(bodies[0], bt.at);
+            bt.hp = 3.0f;
+            bt.power = 0.8f;
+            bt.infectMat = rotMat;
+            bt.infectStain = c.mobs.Defs()[zid].bite.infectStain;
+            bt.seed = 0xAF17u;
+            c.mobs.BiteHit(bodies[0], bt, c.world, spawns);
+          }
+          avatar.Die();
+          c.mobs.PreTick(tick0 + 400, c.world, ops, cellOps, spawns);
+          got = 0;
+          for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+            const Mob* om = c.mobs.FindMobById(c.mobs.MobIdAt(i));
+            if (om != nullptr && om->Def() != nullptr && om->Def()->undead)
+              got = countOf(om, kSure);
+          }
+        }
+        c.mobs.SetAvatarKitFn(nullptr);
+        c.mobs.SetAvatar(nullptr);
+        return got;
+      };
+      kitN = runOne(true);
+      kitCtl = runOne(false);
+      kitRode = kitN == 3 && kitCtl == 0;
+      if (!kitRode)
+        kitWhy = Format("carried=%d (want 3) control=%d (want 0)", kitN, kitCtl);
+    } else {
+      kitWhy = avDef < 0 ? "no avatar def" : "no bite.infectMat";
+    }
+  }
+
+  // Put the def list back before anything else runs against it (kOrder's rule:
+  // gates share one MobSystem, so a def left edited retunes every NPC gate
+  // after this one), and drop the item library the harness never had.
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  c.mobs.SetDefs(std::vector<MobDef>(pristine));
+  c.mobs.SetItems(nullptr);
+
+  const bool ok = rolled && varied && looted && carried && saved && kitRode;
+  detail = Format(
+      "rolled %d%s (%d of '%s'); chance %d%s (%d with / %d without '%s'); "
+      "looted %d%s (%d taken, %d bodies left); rose with %d%s (%d carried); "
+      "saved %d%s (%d/%d back); player kit %d%s (%d vs control %d)",
+      rolled ? 1 : 0, rolled ? "" : (" [" + rollWhy + "]").c_str(), sureN, kSure,
+      varied ? 1 : 0, varied ? "" : (" [" + varyWhy + "]").c_str(), withFlip,
+      withoutFlip, kFlip, looted ? 1 : 0,
+      looted ? "" : (" [" + lootWhy + "]").c_str(), gotN, bodiesAfter,
+      carried ? 1 : 0, carried ? "" : (" [" + carryWhy + "]").c_str(), roseN,
+      saved ? 1 : 0, saved ? "" : (" [" + saveWhy + "]").c_str(), backN, backN2,
+      kitRode ? 1 : 0, kitRode ? "" : (" [" + kitWhy + "]").c_str(), kitN,
+      kitCtl);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- ai-dummy --------------------------------------------------------------
 Status GateAiDummy(Ctx& c, std::string& detail) {
   c.debris.Reset();
@@ -8974,6 +9401,689 @@ Status GateRagdollFallDamage(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ONE MOBS RECORD, FIELD BY FIELD ---------------------------------------
+//
+// WHAT DIFFERS, not just THAT it differs (CLAUDE.md rule 6). "The re-saved
+// record is not byte-identical" is a bare bool with a dozen causes — a limb
+// count, a transform, one carved lattice, the def name — and eliminating them
+// one rebuild at a time is the ladder that rule forbids. This walks the CURRENT
+// format (Mob::SaveOne's v4 writes, in order) on both sides and names the first
+// field that disagrees. Shared by `mob-handoff` (arm B) and `mob-save-delta`.
+std::string MobRecordDiff(const std::vector<uint8_t>& a,
+                          const std::vector<uint8_t>& b) {
+  if (a.size() == b.size() &&
+      (a.empty() || std::memcmp(a.data(), b.data(), a.size()) == 0))
+    return "";
+  ByteReader ra{a.data(), a.size()}, rb{b.data(), b.size()};
+  std::string na, nb;
+  Vec3 oa{}, ob{};
+  float ha = 0, hb = 0, ya = 0, yb = 0;
+  uint32_t la = 0, lb = 0;
+  ra.Str(na); ra.Pod(oa); ra.F32(ha); ra.F32(ya); ra.U32(la);
+  rb.Str(nb); rb.Pod(ob); rb.F32(hb); rb.F32(yb); rb.U32(lb);
+  if (na != nb) return Format("def '%s' vs '%s'", na.c_str(), nb.c_str());
+  if (oa.x != ob.x || oa.y != ob.y || oa.z != ob.z) return "origin";
+  if (ha != hb) return "heading";
+  if (ya != yb) return "bodyY";
+  if (la != lb) return Format("limb count %u vs %u", la, lb);
+  struct Limb {
+    uint32_t kind = 0;
+    float hp = 0;
+    BodyTransform xf{};
+    Vec3 v3[3]{};
+    IVec3 sz{};
+    std::vector<DebrisVoxel> v;
+    std::vector<PrefabVoxel> s;
+  };
+  auto read = [](ByteReader& r, Limb& L) {
+    r.U32(L.kind);
+    r.F32(L.hp);
+    r.Pod(L.xf);
+    if (L.kind != MobSystem::kLimbStored) return;
+    for (int k = 0; k < 3; k++) r.Pod(L.v3[k]);
+    r.Pod(L.sz);
+    r.PodVec(L.v);
+    r.PodVec(L.s);
+  };
+  for (uint32_t i = 0; i < la && ra.ok && rb.ok; i++) {
+    Limb A, B;
+    read(ra, A);
+    read(rb, B);
+    if (A.kind != B.kind)
+      return Format("limb %u kind %u vs %u (0 severed, 1 pristine, 2 stored)",
+                    i, A.kind, B.kind);
+    if (A.hp != B.hp) return Format("limb %u hp %.3f vs %.3f", i, A.hp, B.hp);
+    if (A.xf.pos.x != B.xf.pos.x || A.xf.pos.y != B.xf.pos.y ||
+        A.xf.pos.z != B.xf.pos.z) {
+      const Vec3 d{A.xf.pos.x - B.xf.pos.x, A.xf.pos.y - B.xf.pos.y,
+                   A.xf.pos.z - B.xf.pos.z};
+      return Format("limb %u xf.pos by %.4f", i,
+                    std::sqrt(d.x * d.x + d.y * d.y + d.z * d.z));
+    }
+    for (int k = 0; k < 4; k++)
+      if (A.xf.quat[k] != B.xf.quat[k]) return Format("limb %u xf.quat", i);
+    for (int k = 0; k < 3; k++)
+      if (A.v3[k].x != B.v3[k].x || A.v3[k].y != B.v3[k].y ||
+          A.v3[k].z != B.v3[k].z)
+        return Format("limb %u %s", i,
+                      k == 0 ? "restOffset" : k == 1 ? "anchorRoot" : "anchorLimb");
+    if (A.sz.x != B.sz.x || A.sz.y != B.sz.y || A.sz.z != B.sz.z)
+      return Format("limb %u size", i);
+    if (A.v.size() != B.v.size())
+      return Format("limb %u voxels %zu vs %zu", i, A.v.size(), B.v.size());
+    if (!A.v.empty() &&
+        std::memcmp(A.v.data(), B.v.data(), A.v.size() * sizeof(DebrisVoxel)) != 0)
+      return Format("limb %u voxel contents", i);
+    if (A.s.size() != B.s.size())
+      return Format("limb %u skin %zu vs %zu", i, A.s.size(), B.s.size());
+    if (!A.s.empty() &&
+        std::memcmp(A.s.data(), B.s.data(), A.s.size() * sizeof(PrefabVoxel)) != 0)
+      return Format("limb %u skin contents", i);
+  }
+  return Format("tail (%zu vs %zu bytes)", a.size(), b.size());
+}
+
+// ---- mob-save-delta --------------------------------------------------------
+//
+// A WHOLE BODY SAVES AS ITS NAME (docs/PLAN_save_system.md S5a, MOBS v4).
+//
+// A crowd of untouched humans plus one creature per KIND of damage — carved
+// (the shape changed), soaked in blood (same shape, every coat word changed),
+// set alight (same shape, materials changed in place by the burn front) and
+// one with a limb cut off — and nothing is ticked, so every difference between
+// two records is the save format's and not the simulation's. Five claims:
+//   A. PRISTINE IS DETECTED. Every base limb of every fresh human reads
+//      Mob::LimbIsPristine — which is what proves the reference PristineOf
+//      builds is BuildRig's output byte for byte (a mismatch would flag every
+//      fresh limb "stored" and fail here, not silently cost bytes). Every
+//      damaged limb reads NOT pristine: the in-place writers (coat, burn) do
+//      not move a count, so this is the half a count-based test would miss.
+//   B. IT IS SMALL. v4 bytes per pristine human under
+//      `mobSaveDeltaPristineMaxBytes`, and the crowd at least
+//      `mobSaveDeltaMinRatio` times smaller than the same crowd written as v3.
+//   C. IT ROUND-TRIPS. SaveOne -> LoadState -> SaveOne is byte-identical for
+//      EVERY record, pristine and damaged (MobRecordDiff names the field).
+//   D. v3 STILL LOADS. The same crowd written in the old format loads through
+//      LoadState(v3): every creature comes back, the carve and the sever are
+//      restored, and pristine and carved bodies re-save as the same v4 bytes.
+//      (The soaked body is exempt BY DESIGN: v3's overlay compares counts and
+//      always dropped a coat — the rule this version exists to retire.)
+// LEAVES NOTHING: resets mobs and debris and puts the id counter back.
+Status GateMobSaveDelta(Ctx& c, std::string& detail) {
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  auto restore = [&]() {
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.SetNextIdCounter(idCounterWas);
+  };
+  const int hi = c.mobs.FindDef("human");
+  uint32_t mBlood = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "blood") mBlood = (uint32_t)i;
+  if (hi < 0 || mBlood == 0) {
+    detail = hi < 0 ? "no 'human' def" : "no 'blood' material";
+    restore();
+    return Status::Fail;
+  }
+  const MobDef& hd = c.mobs.Defs()[hi];
+  // The limb a sever takes: the last severable, non-vital, non-root one (a
+  // hand or a foot on the human), so the sever takes nothing else with it.
+  int severLimb = -1;
+  for (int i = (int)hd.limbs.size() - 1; i >= 0 && severLimb < 0; i--)
+    if (hd.limbs[i].severable && !hd.limbs[i].vital && i != hd.rootLimb)
+      severLimb = i;
+  // 16 = MobSystem::kMaxMobs (private); a refused spawn fails loudly below.
+  const int nPristine =
+      std::clamp((int)BaselineNumber("mobSaveDeltaCrowd", 11), 1, 16 - 4);
+  const IVec3 o = c.world.WindowOrigin();
+  const IVec3 base{(o.x + (int)kNChunk / 2) * (int)kChunk,
+                   (o.y + (int)kNChunk / 2) * (int)kChunk,
+                   (o.z + (int)kNChunk / 2) * (int)kChunk};
+  std::vector<uint64_t> ids;
+  for (int k = 0; k < nPristine + 4; k++) {
+    const uint64_t id =
+        c.mobs.Spawn(hi, {base.x + (k % 4) * 12, base.y, base.z + (k / 4) * 12});
+    if (id == 0) {
+      detail = Format("spawn %d of %d refused", k, nPristine + 4);
+      restore();
+      return Status::Fail;
+    }
+    ids.push_back(id);
+  }
+  // ---- the damage, one kind per creature ----
+  const uint64_t idCarved = ids[nPristine], idSoaked = ids[nPristine + 1],
+                 idBurnt = ids[nPristine + 2], idSevered = ids[nPristine + 3];
+  const int carveLimb = hd.rootLimb >= 0 ? hd.rootLimb : 0;
+  {
+    std::vector<ParticleSpawn> spawns;
+    const uint32_t full = c.mobs.LimbArtVoxelCount(idCarved, carveLimb);
+    for (int k = 0; k < 3; k++) {
+      const uint64_t lb = c.mobs.LimbBody(idCarved, carveLimb);
+      if (!lb || c.mobs.LimbArtVoxelCount(idCarved, carveLimb) < full * 8 / 10)
+        break;
+      c.mobs.CarveLimbRadial(
+          lb, c.mobs.LimbVoxelPos(idCarved, carveLimb, 977u * (uint32_t)(k + 1)),
+          1.0f, /*ragged=*/true, /*eject=*/false, c.world, spawns);
+    }
+  }
+  const int soakLimb = carveLimb;
+  const uint32_t soaked = c.mobs.SoakLimb(idSoaked, soakLimb, mBlood, 6, 7000);
+  const uint32_t lit = c.mobs.IgniteLimb(idBurnt, carveLimb, 64, 0);
+  if (severLimb >= 0) c.mobs.Sever(idSevered, severLimb);
+
+  // ======== A: pristine is detected, damage is not ========================
+  int freshNotPristine = 0, freshLimbs = 0;
+  std::string freshWhy;
+  for (int k = 0; k < nPristine; k++) {
+    const Mob* m = c.mobs.FindMobById(ids[k]);
+    if (m == nullptr) continue;
+    for (size_t li = 0; li < hd.limbs.size(); li++) {
+      freshLimbs++;
+      if (!m->LimbIsPristine(li)) {
+        if (freshWhy.empty())
+          freshWhy = Format("mob %d limb %zu (%s)", k, li, hd.limbs[li].name.c_str());
+        freshNotPristine++;
+      }
+    }
+  }
+  auto pristineOf = [&](uint64_t id, int li) {
+    const Mob* m = c.mobs.FindMobById(id);
+    return m != nullptr && m->LimbIsPristine((size_t)li);
+  };
+  const Mob* sevM = c.mobs.FindMobById(idSevered);
+  const bool carvedSeen = !pristineOf(idCarved, carveLimb);
+  const bool soakedSeen = soaked > 0 && !pristineOf(idSoaked, soakLimb);
+  const bool burntSeen = lit > 0 && !pristineOf(idBurnt, carveLimb);
+  const bool severSeen = severLimb >= 0 && sevM != nullptr &&
+                         c.mobs.LimbBody(idSevered, severLimb) == 0;
+  // Only the damaged limb is stored: a wound on the torso does not cost the
+  // legs their lattices. (Not asked of the severed body: a sever opens a
+  // stump on the PARENT, which is damage to a second limb by design.)
+  int damagedOthersStored = 0;
+  for (uint64_t id : {idCarved, idSoaked, idBurnt}) {
+    const Mob* m = c.mobs.FindMobById(id);
+    if (m == nullptr) continue;
+    for (size_t li = 0; li < hd.limbs.size(); li++) {
+      if ((int)li == carveLimb) continue;
+      if (!m->LimbIsPristine(li)) damagedOthersStored++;
+    }
+  }
+
+  // ======== B: bytes, v4 against the same crowd written as v3 =============
+  std::vector<std::vector<uint8_t>> rec4(ids.size()), rec3(ids.size());
+  size_t crowd4 = 0, crowd3 = 0;
+  std::vector<uint8_t> blob3;
+  {
+    ByteWriter w3{blob3};
+    w3.U32((uint32_t)ids.size());
+    for (size_t k = 0; k < ids.size(); k++) {
+      const Mob* m = c.mobs.FindMobById(ids[k]);
+      if (m == nullptr) continue;
+      { ByteWriter w{rec4[k]}; m->SaveOne(w); }
+      { ByteWriter w{rec3[k]}; m->SaveOne(w, 3); }
+      m->SaveOne(w3, 3);
+      crowd4 += rec4[k].size();
+      crowd3 += rec3[k].size();
+    }
+  }
+  const size_t pristine4 = rec4[0].size(), pristine3 = rec3[0].size();
+  const double maxPristine = BaselineNumber("mobSaveDeltaPristineMaxBytes", 2048);
+  const double minRatio = BaselineNumber("mobSaveDeltaMinRatio", 4);
+  const double ratio = crowd4 ? (double)crowd3 / (double)crowd4 : 0.0;
+  RecordObserved("mobSaveDeltaPristineBytes", (double)pristine4);
+  RecordObserved("mobSaveDeltaPristineBytesV3", (double)pristine3);
+  RecordObserved("mobSaveDeltaCrowdBytes", (double)crowd4);
+  RecordObserved("mobSaveDeltaCrowdBytesV3", (double)crowd3);
+
+  // ======== C: v4 round trip, every record =================================
+  std::vector<uint8_t> blob4;
+  c.mobs.SaveState(blob4);
+  c.debris.Reset();
+  c.mobs.Reset();
+  const bool read4 = c.mobs.LoadState(blob4.data(), blob4.size(),
+                                      MobSystem::kSaveVersion);
+  int rtSame = 0;
+  std::string rtWhy;
+  const uint32_t back4 = c.mobs.MobCount();
+  for (uint32_t i = 0; i < back4 && i < ids.size(); i++) {
+    const Mob* m = c.mobs.FindMobById(c.mobs.MobIdAt(i));
+    std::vector<uint8_t> again;
+    if (m != nullptr) { ByteWriter w{again}; m->SaveOne(w); }
+    const std::string why = MobRecordDiff(rec4[i], again);
+    if (why.empty()) rtSame++;
+    else if (rtWhy.empty()) rtWhy = Format("record %u: %s", i, why.c_str());
+  }
+
+  // ======== D: the v3 section still loads ==================================
+  c.debris.Reset();
+  c.mobs.Reset();
+  const bool read3 = c.mobs.LoadState(blob3.data(), blob3.size(), 3);
+  const uint32_t back3 = c.mobs.MobCount();
+  int v3Same = 0, v3Want = 0;
+  std::string v3Why;
+  bool v3Sever = false;
+  for (uint32_t i = 0; i < back3 && i < ids.size(); i++) {
+    const uint64_t id = c.mobs.MobIdAt(i);
+    if (ids[i] == idSevered) {
+      v3Sever = severLimb >= 0 && c.mobs.LimbBody(id, severLimb) == 0;
+      continue;
+    }
+    if (ids[i] == idSoaked || ids[i] == idBurnt) continue;   // v3's own rule
+    v3Want++;
+    const Mob* m = c.mobs.FindMobById(id);
+    std::vector<uint8_t> again;
+    if (m != nullptr) { ByteWriter w{again}; m->SaveOne(w); }
+    const std::string why = MobRecordDiff(rec4[i], again);
+    if (why.empty()) v3Same++;
+    else if (v3Why.empty()) v3Why = Format("record %u: %s", i, why.c_str());
+  }
+  restore();
+
+  const bool okA = freshNotPristine == 0 && carvedSeen && soakedSeen &&
+                   burntSeen && severSeen && damagedOthersStored == 0;
+  const bool okB = (double)pristine4 <= maxPristine && ratio >= minRatio;
+  const bool okC = read4 && back4 == ids.size() && rtSame == (int)ids.size();
+  const bool okD = read3 && back3 == ids.size() && v3Sever && v3Same == v3Want;
+  detail = Format(
+      "A %s: fresh %d/%d limbs pristine%s%s, damage seen carve %d soak %d(%u) "
+      "burn %d(%u) sever %d, other limbs stored %d | B %s: pristine human %zu B "
+      "(v3 %zu, max %.0f), crowd of %zu %zu B vs v3 %zu B = %.1fx (min %.1f) | "
+      "C %s: read %d, %u/%zu back, %d/%zu byte-identical%s%s | D %s: read %d, "
+      "%u/%zu back, sever %d, %d/%d re-save identical%s%s",
+      okA ? "ok" : "FAIL", freshLimbs - freshNotPristine, freshLimbs,
+      freshWhy.empty() ? "" : ", first stored: ", freshWhy.c_str(),
+      carvedSeen ? 1 : 0, soakedSeen ? 1 : 0, soaked, burntSeen ? 1 : 0, lit,
+      severSeen ? 1 : 0, damagedOthersStored, okB ? "ok" : "FAIL", pristine4,
+      pristine3, maxPristine, ids.size(), crowd4, crowd3, ratio, minRatio,
+      okC ? "ok" : "FAIL", read4 ? 1 : 0, back4, ids.size(), rtSame, ids.size(),
+      rtWhy.empty() ? "" : ", first: ", rtWhy.c_str(), okD ? "ok" : "FAIL",
+      read3 ? 1 : 0, back3, ids.size(), v3Sever ? 1 : 0, v3Same, v3Want,
+      v3Why.empty() ? "" : ", first: ", v3Why.c_str());
+  return okA && okB && okC && okD ? Status::Pass : Status::Fail;
+}
+
+// ---- mob-park --------------------------------------------------------------
+//
+// NPCs OUTLIVE THE WINDOW (docs/PLAN_save_system.md S5b, persist.h MobParking).
+//
+// Three humans near the window centre, one of them carved (so MOBS v4/v5
+// stores a lattice for it), settled on real terrain. Then, all asserted in one
+// run:
+//   A. PARK. The window is moved far away (ReloadWindow) and ONE mobs.PreTick
+//      runs: zero live, three parked, and each region bucket holding a
+//      creature's origin has a 'MOBS' record at that origin whose bytes are
+//      EXACTLY the creature's SaveOne from just before -- the record a save
+//      would have written.
+//   B. THE CAP COUNTS ONLY THE LIVE. With three parked, a full crowd
+//      (MobSystem's cap, 16) still spawns.
+//   C. SAVE AND LOAD WHILE PARKED. The save writes an r_*.sve for every
+//      parked creature's region; a load at the far window applies none of
+//      them (zero live) and the buckets read back from disk hold the same
+//      three records, byte for byte.
+//   D. UNPARK, BOUNDED. The window returns home. While the live crowd is
+//      full, a call makes nobody live and the records stay (cap wait). Then,
+//      at a budget of ONE per call, the creatures come back over successive
+//      ticks -- never more than one per call -- each only after the fetch
+//      cache has answered for the ground under it, at its parked origin, with
+//      SaveOne bytes IDENTICAL to the parked record, over solid ground in the
+//      cache.
+//   E. THEY STAND. 40 ticks of the full mob step afterwards: all three alive
+//      and none has dropped more than `mobParkMaxDropVox` below where it
+//      came back.
+// LEAVES NOTHING: resets mobs and debris, removes the park function, puts the
+// id counter back, clears the store, deletes its save dir and regenerates the
+// world at its home window.
+Status GateMobPark(Ctx& c, std::string& detail) {
+  namespace fs = std::filesystem;
+  const char* kPath = "selftest_mobpark.svd";
+  const uint64_t idCounterWas = c.mobs.NextIdCounter();
+  MobParking parking;
+  auto restore = [&]() {
+    c.debris.Reset();
+    c.mobs.Reset();
+    c.mobs.SetParkFn(nullptr);
+    c.mobs.ClearPlayerActors();
+    c.mobs.SetNextIdCounter(idCounterWas);
+    c.stream.Store().Clear();
+    std::error_code ec;
+    fs::remove_all(kPath, ec);
+  };
+  const int hi = c.mobs.FindDef("human");
+  int dummyDef = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == "dummy") dummyDef = (int)i;
+  if (hi < 0 || dummyDef < 0) {
+    detail = hi < 0 ? "no 'human' def" : "no 'dummy' def";
+    return Status::Fail;
+  }
+  // CLEAR, not Unbind: Unbind keeps the RAM chunks, and after `save-split`'s
+  // full flush those are a whole window of real pages -- every ReloadWindow
+  // below would restore them instead of regenerating sentinels, driving the
+  // page pool to 94% for nothing this gate asserts on.
+  c.stream.Store().Clear();
+  {
+    std::error_code ec;
+    fs::remove_all(kPath, ec);
+  }
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.SetNextIdCounter(1);
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const IVec3 home = c.world.WindowOrigin();
+  const int n = (int)kNChunk;
+  const IVec3 away{home.x + n + 8, home.y, home.z + n + 8};
+
+  parking.Bind(c.mobs, c.stream.Store(), true);
+  // A TELEPORT, done the way LoadWorld moves the window: the held readback
+  // snapshot describes the old window and must not be consumed afterwards,
+  // and the sim's transient state is reset over the refilled grid.
+  auto teleport = [&](IVec3 origin) {
+    c.world.InvalidateSnapshot();
+    c.stream.ReloadWindow(origin);
+    rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+    c.sim.EncodeLoadReset(enc);
+    rhi::CommandBuffer cmd = enc.Finish();
+    c.ctx.queue.Submit(1, &cmd);
+    c.ctx.WaitIdle();
+  };
+  const uint32_t budget = 1;   // the gate's own, so the budget binds on 3
+
+  // ---- the tick: world + readbacks always, the mob step on request ----
+  uint32_t t = 7000;
+  IVec3 pc{home.x + n / 2, home.y + n / 2, home.z + n / 2};
+  auto tick = [&](bool stepMobs) {
+    std::vector<BrushOp> ops;
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    if (stepMobs) {
+      c.mobs.PreTick(t + 1, c.world, ops, cellOps, spawns);
+      c.debris.QueueSupportEvents(c.world.Snap());
+      c.debris.PreTick(t + 1, c.world, cellOps, spawns);
+    }
+    ++t;
+    SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, ops, {}, cellOps, false,
+               pc, true, false, spawns);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+    if (stepMobs) {
+      c.phys.Step(kTickDt);
+      c.debris.PostStep();
+      c.mobs.PostStep();
+    }
+  };
+
+  // ---- the fixture: three humans on the ground, one carved ----
+  const IVec3 base{(home.x + n / 2) * (int)kChunk, 0, (home.z + n / 2) * (int)kChunk};
+  std::vector<uint64_t> ids;
+  for (int k = 0; k < 3; k++) {
+    const int x = base.x + k * 14, z = base.z + (k % 2) * 10;
+    const int h = World::TerrainHeight(x, z, kDefaultSeed);
+    const uint64_t id = c.mobs.Spawn(hi, {x, h + 1, z});
+    if (id == 0) {
+      detail = Format("spawn %d refused", k);
+      restore();
+      return Status::Fail;
+    }
+    ids.push_back(id);
+  }
+  pc = {base.x >> 4, (World::TerrainHeight(base.x, base.z, kDefaultSeed)) >> 4,
+        base.z >> 4};
+  {
+    const MobDef& hd = c.mobs.Defs()[hi];
+    const int carveLimb = hd.rootLimb >= 0 ? hd.rootLimb : 0;
+    std::vector<ParticleSpawn> spawns;
+    const uint64_t lb = c.mobs.LimbBody(ids[2], carveLimb);
+    if (lb)
+      c.mobs.CarveLimbRadial(lb, c.mobs.LimbVoxelPos(ids[2], carveLimb, 977u), 1.0f,
+                             /*ragged=*/true, /*eject=*/false, c.world, spawns);
+  }
+  // A player standing a few metres off, so a creature whose profile hunts has
+  // a TARGET in its brain when it parks -- the v5 tail then carries more than
+  // defaults. (Whether any profile acquires is reported, not asserted: the
+  // byte-identical round trip is the claim, the target makes it non-vacuous.)
+  {
+    const int px = base.x + 30, pz = base.z + 30;
+    const MobSystem::PlayerActorDesc pa{
+        Vec3{(float)px, (float)World::TerrainHeight(px, pz, kDefaultSeed) + 10.0f,
+             (float)pz},
+        4.0f, 18.0f, true};
+    c.mobs.SetPlayerActors(std::span<const MobSystem::PlayerActorDesc>(&pa, 1));
+  }
+  for (int i = 0; i < 30; i++) tick(true);
+  const Mob* carvedM = c.mobs.FindMobById(ids[2]);
+  bool carvedStored = false;
+  if (carvedM != nullptr)
+    for (size_t li = 0; li < c.mobs.Defs()[hi].limbs.size(); li++)
+      carvedStored |= !carvedM->LimbIsPristine(li);
+
+  // ======== A: park ========================================================
+  struct Parked {
+    Vec3 origin{};
+    std::vector<uint8_t> bytes;
+    ai::Brain brain;
+  };
+  std::vector<Parked> parked;
+  for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
+    const Mob* m = c.mobs.MobAt(i);
+    if (m == nullptr || !m->Alive()) continue;
+    Parked p;
+    p.origin = m->Origin();
+    ByteWriter w{p.bytes};
+    m->SaveOne(w);
+    if (const ai::Brain* b = c.mobs.MobBrain(m->Id())) p.brain = *b;
+    parked.push_back(std::move(p));
+  }
+  int targetsAtPark = 0;
+  for (const Parked& p : parked) targetsAtPark += p.brain.hasTarget ? 1 : 0;
+  teleport(away);
+  pc = {away.x + n / 2, home.y + n / 2, away.z + n / 2};
+  tick(true);
+  const uint32_t liveAfterPark = c.mobs.MobCount();
+  const uint64_t parkedCount = parking.GetStats().parked;
+  const uint32_t kMobs = 'M' | ('O' << 8) | ('B' << 16) | ((uint32_t)'S' << 24);
+  // Every creature's record, found in the bucket of its origin's region.
+  auto bucketsHold = [&](std::string& why) {
+    int found = 0;
+    for (size_t k = 0; k < parked.size(); k++) {
+      const IVec3 rc = ChunkStore::RegionOfVoxel(parked[k].origin);
+      bool hit = false;
+      for (const EntityRecord& r : c.stream.Store().DormantEntities(rc)) {
+        if (r.section != kMobs || r.pos.x != parked[k].origin.x ||
+            r.pos.y != parked[k].origin.y || r.pos.z != parked[k].origin.z)
+          continue;
+        const std::string d = MobRecordDiff(parked[k].bytes, r.bytes);
+        if (d.empty() && r.version == MobSystem::kSaveVersion) hit = true;
+        else if (why.empty()) why = Format("creature %zu: %s", k, d.c_str());
+      }
+      if (hit) found++;
+      else if (why.empty()) why = Format("creature %zu: no record in its bucket", k);
+    }
+    return found;
+  };
+  std::string whyA;
+  const int foundA = bucketsHold(whyA);
+  const bool okA = parked.size() == 3 && liveAfterPark == 0 && parkedCount == 3 &&
+                   foundA == 3 && carvedStored;
+
+  // ======== B: the cap counts only the live ================================
+  int capSpawned = 0;
+  {
+    const int ax = (away.x + n / 2) * (int)kChunk, az = (away.z + n / 2) * (int)kChunk;
+    const int ah = World::TerrainHeight(ax, az, kDefaultSeed);
+    for (int k = 0; k < 16; k++)
+      if (c.mobs.Spawn(dummyDef, {ax + (k % 4) * 8, ah + 1, az + (k / 4) * 8}) != 0)
+        capSpawned++;
+    c.mobs.Reset();
+  }
+  const bool okB = capSpawned == 16;
+
+  // ======== C: save and load while parked ==================================
+  EntityIO eio = MakeEntityIO(c.debris, c.mobs, nullptr);
+  const bool saved = SaveWorld(c.ctx, c.world, c.stream, kPath, c.mats, &eio);
+  int bucketFiles = 0;
+  {
+    std::error_code ec;
+    std::vector<IVec3> want;
+    for (const Parked& p : parked) {
+      const IVec3 rc = ChunkStore::RegionOfVoxel(p.origin);
+      bool dup = false;
+      for (const IVec3& w : want) dup |= w.x == rc.x && w.y == rc.y && w.z == rc.z;
+      if (!dup) want.push_back(rc);
+    }
+    for (const IVec3& rc : want)
+      if (fs::exists(c.stream.Store().EntityRegionPath(rc), ec)) bucketFiles++;
+    bucketFiles = bucketFiles == (int)want.size() ? bucketFiles : -bucketFiles;
+  }
+  c.mobs.Reset();
+  EntityFileReport lr;
+  const bool loaded =
+      LoadWorld(c.ctx, c.world, c.sim, c.stream, kPath, c.mats, &eio, nullptr, &lr);
+  const uint32_t liveAfterLoad = c.mobs.MobCount();
+  std::string whyC;
+  const int foundC = bucketsHold(whyC);
+  const bool okC = saved && bucketFiles > 0 && loaded && liveAfterLoad == 0 &&
+                   foundC == 3 && lr.recordsApplied == 0;
+
+  // ======== D: unpark, bounded, onto known ground ==========================
+  teleport(home);
+  parking.ResetWaits();
+  parking.ResetStats();
+  pc = {base.x >> 4, (World::TerrainHeight(base.x, base.z, kDefaultSeed)) >> 4,
+        base.z >> 4};
+  // The cap wait first: a full live crowd makes nobody live and keeps every
+  // record where it was.
+  uint32_t capMade = 0;
+  uint64_t capWaits = 0;
+  int foundCap = 0;
+  {
+    for (int k = 0; k < 16; k++)
+      c.mobs.Spawn(dummyDef, {base.x - 60 + (k % 4) * 8,
+                              World::TerrainHeight(base.x - 60, base.z - 60, kDefaultSeed) + 1,
+                              base.z - 60 + (k / 4) * 8});
+    capMade = parking.Unpark(c.mobs, c.stream.Store(), c.world, t, budget);
+    capWaits = parking.GetStats().capWaits;
+    std::string ignore;
+    foundCap = bucketsHold(ignore);
+    c.mobs.Reset();
+    parking.ResetStats();
+  }
+  int calls = 0, callsBeforeFirst = -1, same = 0, onGround = 0;
+  std::string whyD;
+  std::vector<uint64_t> seen;
+  std::vector<float> seenY;
+  int brainsBack = 0;
+  for (int i = 0; i < 240 && seen.size() < parked.size(); i++) {
+    tick(false);
+    const uint32_t made = parking.Unpark(c.mobs, c.stream.Store(), c.world, t, budget);
+    calls++;
+    if (made > 0 && callsBeforeFirst < 0) callsBeforeFirst = calls - 1;
+    for (uint32_t mi = 0; mi < c.mobs.MobCount(); mi++) {
+      const Mob* m = c.mobs.MobAt(mi);
+      if (m == nullptr) continue;
+      if (std::find(seen.begin(), seen.end(), m->Id()) != seen.end()) continue;
+      seen.push_back(m->Id());
+      seenY.push_back(m->Origin().y);
+      std::vector<uint8_t> again;
+      {
+        ByteWriter w{again};
+        m->SaveOne(w);
+      }
+      int match = -1;
+      for (size_t k = 0; k < parked.size(); k++) {
+        const Vec3& o = parked[k].origin;
+        if (o.x == m->Origin().x && o.y == m->Origin().y && o.z == m->Origin().z)
+          match = (int)k;
+      }
+      if (match < 0) {
+        if (whyD.empty()) whyD = "an unparked creature at no parked origin";
+        continue;
+      }
+      // The brain's memory rode the record (v5): profile and target facts.
+      if (const ai::Brain* b = c.mobs.MobBrain(m->Id())) {
+        const ai::Brain& pb = parked[match].brain;
+        if (b->profile == pb.profile && b->targetId == pb.targetId &&
+            b->hasTarget == pb.hasTarget && b->lastSeenTick == pb.lastSeenTick)
+          brainsBack++;
+      }
+      const std::string d = MobRecordDiff(parked[match].bytes, again);
+      if (d.empty()) same++;
+      else if (whyD.empty()) whyD = Format("creature %d: %s", match, d.c_str());
+      // Solid within three cells under the feet, in the very cache the
+      // ground wait trusted (the centre column of the body box).
+      const MobDef& md = c.mobs.Defs()[hi];
+      const int cx = ifloor(m->Origin().x + md.worldSize.x * 0.5f);
+      const int cz = ifloor(m->Origin().z + md.worldSize.z * 0.5f);
+      const int fy = ifloor(m->Origin().y);
+      bool solid = false;
+      for (int y = fy + 1; y >= fy - 3 && !solid; y--) {
+        const CachedChunk* cc = c.world.Cached({cx >> 4, y >> 4, cz >> 4});
+        if (cc == nullptr || cc->voxels.size() != kChunkVol) continue;
+        const uint32_t mat =
+            cc->voxels[(((uint32_t)cz & 15u) * kChunk + ((uint32_t)y & 15u)) * kChunk +
+                       ((uint32_t)cx & 15u)] &
+            0xFFFu;
+        solid = mat != 0 && mat < c.mats.size() &&
+                (c.mats[mat].gpu.klass == CLASS_SOLID ||
+                 c.mats[mat].gpu.klass == CLASS_POWDER);
+      }
+      if (solid) onGround++;
+      else if (whyD.empty()) whyD = Format("creature %d: no solid under its feet", match);
+    }
+  }
+  const MobParking::Stats ds = parking.GetStats();
+  const bool okD = capMade == 0 && capWaits > 0 && foundCap == 3 &&
+                   seen.size() == parked.size() && same == 3 && onGround == 3 &&
+                   ds.maxCall <= budget && ds.unparked == 3 && ds.failed == 0 &&
+                   calls >= 3 && callsBeforeFirst >= 1 && brainsBack == 3;
+  // `callsBeforeFirst >= 1`: the first sight of a chunk only ASKS for it, so a
+  // creature can never come back on the call that first saw its ground.
+
+  // ======== E: they stand ==================================================
+  const double maxDrop = BaselineNumber("mobParkMaxDropVox", 10);
+  for (int i = 0; i < 40; i++) tick(true);
+  int standing = 0;
+  float worstDrop = 0.0f;
+  for (size_t k = 0; k < seen.size(); k++) {
+    const Mob* m = c.mobs.FindMobById(seen[k]);
+    if (m == nullptr || !m->Alive()) continue;
+    const float drop = seenY[k] - m->Origin().y;
+    worstDrop = std::max(worstDrop, drop);
+    if (drop <= (float)maxDrop) standing++;
+  }
+  const bool okE = standing == 3;
+  RecordObserved("mobParkWorstDropVox", (double)worstDrop);
+
+  const bool ok = okA && okB && okC && okD && okE;
+  detail = Format(
+      "A %s: %zu captured, live %u after park, parked %llu, %d/3 records in "
+      "their buckets byte-identical, carved stores lattice %d%s%s | B %s: %d/16 "
+      "spawned with 3 parked | C %s: saved %d, bucket files %d, loaded %d, live %u, "
+      "%d/3 records read back, applied %u%s%s | D %s: cap wait made %u waits %llu "
+      "kept %d/3; %zu back over %d calls (first after %d), max %u/call (budget %u), "
+      "ground waits %llu, budget waits %llu, %d/3 byte-identical, %d/3 on solid "
+      "ground%s%s, brains %d/3 (%d held a target at park) | E %s: %d/3 standing "
+      "after 40 ticks, worst drop %.2f (max %.0f)",
+      okA ? "ok" : "FAIL", parked.size(), liveAfterPark,
+      (unsigned long long)parkedCount, foundA, carvedStored ? 1 : 0,
+      whyA.empty() ? "" : ", first: ", whyA.c_str(), okB ? "ok" : "FAIL", capSpawned,
+      okC ? "ok" : "FAIL", saved ? 1 : 0, bucketFiles, loaded ? 1 : 0, liveAfterLoad,
+      foundC, lr.recordsApplied, whyC.empty() ? "" : ", first: ", whyC.c_str(),
+      okD ? "ok" : "FAIL", capMade, (unsigned long long)capWaits, foundCap,
+      seen.size(), calls, callsBeforeFirst, ds.maxCall, budget,
+      (unsigned long long)ds.groundWaits, (unsigned long long)ds.budgetWaits, same,
+      onGround, whyD.empty() ? "" : ", first: ", whyD.c_str(), brainsBack,
+      targetsAtPark, okE ? "ok" : "FAIL", standing, worstDrop, maxDrop);
+
+  restore();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- mob-handoff -----------------------------------------------------------
 //
 // ONE CREATURE, ONE SIMULATOR (docs/PLAN_multiplayer_m9.md M9.4-B).
@@ -9132,63 +10242,10 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
   // them one rebuild at a time is the ladder that rule forbids. This walks the
   // format (Mob::SaveOne's writes, in order) on both sides and names the first
   // field that disagrees.
+  // (MobRecordDiff, file scope: `mob-save-delta` walks the same format.)
   auto recordDiff = [](const std::vector<uint8_t>& a,
                        const std::vector<uint8_t>& b) -> std::string {
-    if (a.size() == b.size() && std::memcmp(a.data(), b.data(), a.size()) == 0)
-      return "";
-    ByteReader ra{a.data(), a.size()}, rb{b.data(), b.size()};
-    std::string na, nb;
-    Vec3 oa{}, ob{};
-    float ha = 0, hb = 0, ya = 0, yb = 0;
-    uint32_t la = 0, lb = 0;
-    ra.Str(na); ra.Pod(oa); ra.F32(ha); ra.F32(ya); ra.U32(la);
-    rb.Str(nb); rb.Pod(ob); rb.F32(hb); rb.F32(yb); rb.U32(lb);
-    if (na != nb) return Format("def '%s' vs '%s'", na.c_str(), nb.c_str());
-    if (oa.x != ob.x || oa.y != ob.y || oa.z != ob.z) return "origin";
-    if (ha != hb) return "heading";
-    if (ya != yb) return "bodyY";
-    if (la != lb) return Format("limb count %u vs %u", la, lb);
-    for (uint32_t i = 0; i < la && ra.ok && rb.ok; i++) {
-      uint32_t aliveA = 0, aliveB = 0;
-      float hpA = 0, hpB = 0;
-      Vec3 v3a[3]{}, v3b[3]{};
-      BodyTransform xfA{}, xfB{};
-      IVec3 szA{}, szB{};
-      std::vector<DebrisVoxel> vA, vB;
-      std::vector<PrefabVoxel> sA, sB;
-      ra.U32(aliveA); ra.F32(hpA);
-      for (int k = 0; k < 3; k++) ra.Pod(v3a[k]);
-      ra.Pod(xfA); ra.Pod(szA); ra.PodVec(vA); ra.PodVec(sA);
-      rb.U32(aliveB); rb.F32(hpB);
-      for (int k = 0; k < 3; k++) rb.Pod(v3b[k]);
-      rb.Pod(xfB); rb.Pod(szB); rb.PodVec(vB); rb.PodVec(sB);
-      if (aliveA != aliveB) return Format("limb %u attached %u vs %u", i, aliveA, aliveB);
-      if (hpA != hpB) return Format("limb %u hp %.3f vs %.3f", i, hpA, hpB);
-      for (int k = 0; k < 3; k++)
-        if (v3a[k].x != v3b[k].x || v3a[k].y != v3b[k].y || v3a[k].z != v3b[k].z)
-          return Format("limb %u anchor %d", i, k);
-      if (xfA.pos.x != xfB.pos.x || xfA.pos.y != xfB.pos.y ||
-          xfA.pos.z != xfB.pos.z)
-        return Format("limb %u xf.pos by %.4f", i,
-                      std::sqrt((xfA.pos.x - xfB.pos.x) * (xfA.pos.x - xfB.pos.x) +
-                                (xfA.pos.y - xfB.pos.y) * (xfA.pos.y - xfB.pos.y) +
-                                (xfA.pos.z - xfB.pos.z) * (xfA.pos.z - xfB.pos.z)));
-      for (int k = 0; k < 4; k++)
-        if (xfA.quat[k] != xfB.quat[k]) return Format("limb %u xf.quat", i);
-      if (szA.x != szB.x || szA.y != szB.y || szA.z != szB.z)
-        return Format("limb %u size", i);
-      if (vA.size() != vB.size())
-        return Format("limb %u voxels %zu vs %zu", i, vA.size(), vB.size());
-      if (!vA.empty() &&
-          std::memcmp(vA.data(), vB.data(), vA.size() * sizeof(DebrisVoxel)) != 0)
-        return Format("limb %u voxel contents", i);
-      if (sA.size() != sB.size())
-        return Format("limb %u skin %zu vs %zu", i, sA.size(), sB.size());
-      if (!sA.empty() &&
-          std::memcmp(sA.data(), sB.data(), sA.size() * sizeof(PrefabVoxel)) != 0)
-        return Format("limb %u skin contents", i);
-    }
-    return Format("tail (%zu vs %zu bytes)", a.size(), b.size());
+    return MobRecordDiff(a, b);
   };
 
   const double trackTol = BaselineNumber("mobGhostTrackVox", 0.05);
@@ -9819,6 +10876,12 @@ const std::vector<Gate>& MobGates() {
       // in it gets back up. Counts and def reads; the six-second wait is
       // skipped by calling PreTick with a later tick.
       {"zombify", "mob", {}, false, GateZombify, /*needsRender=*/false},
+      // THE PACK: a creature carries things that are not on its body, they
+      // fall with it, you can loot them, and a body that turns takes them with
+      // it. Authors its own two-row loot table over a copy of the def list and
+      // puts the pristine list back, so it asserts the mechanism and never the
+      // shipped content.
+      {"mob-loot", "mob", {}, false, GateMobLoot, /*needsRender=*/false},
       // Creatures give each other room instead of piling into one point.
       // Two arms in one gate, the second with spacing zeroed IN THE DEF, so
       // the fixture has to prove it crowds before "they did not overlap"
@@ -9829,6 +10892,16 @@ const std::vector<Gate>& MobGates() {
       // every claim is an op count, an AI-step count, a distance or a byte
       // comparison.
       {"mob-handoff", "mob", {}, false, GateMobHandoff, /*needsRender=*/false},
+      // MOBS v4: an untouched body saves as its def name plus hp and pose;
+      // only a limb that differs from the def's art stores a lattice. Bytes,
+      // byte-identical round trip, and the v3 section still loading. No
+      // ticks, no render.
+      {"mob-save-delta", "mob", {}, false, GateMobSaveDelta,
+       /*needsRender=*/false},
+      // S5b: a creature leaving the window is PARKED in its region bucket and
+      // comes back, byte-identical and on known ground, when the window
+      // returns -- bounded per tick, through a save and load. No render.
+      {"mob-park", "mob", {}, false, GateMobPark, /*needsRender=*/false},
       // NPC AI. No render either: every claim is a distance, an angle or a
       // count, which is what makes them iterable with `--gate` alone.
       {"ai-dummy", "mob", {}, false, GateAiDummy, /*needsRender=*/false},

@@ -3146,6 +3146,12 @@ struct Col {
   wp          : u32,         // the water preset this column's pond or shore wears; 0 = none (P-F)
   bedSolid    : bool,        // inside a disc: the bowl face here is steeper than a powder bed can hold
   plant       : PlantCol,    // the tile plant whose footprint covers this column
+  // The highest y a LOOSE cover cell may occupy and still be at rest on
+  // tick 1: min over the four axis neighbours' ground + 1 (see
+  // looseRestTop). genColumn sets it to `h` (no restriction); only
+  // genChunk, which owns the pristine words the save compares against,
+  // pays the four neighbour heights to tighten it.
+  looseTop    : i32,
 };
 
 // ---- tile plants: ferns and big toadstools ---------------------------------
@@ -3558,6 +3564,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
     lab.plant.mat = MAT_AIR;
     lab.plant.base = 0;
     lab.plant.top = -1;
+    lab.looseTop = LAB_SLAB_Y;
     return lab;
   }
   // THE GROUND, and everything derived from it, in one call. This is the same
@@ -3627,6 +3634,7 @@ fn genColumn(x : i32, z : i32, seed : u32) -> Col {
   col.wp = L.wp;
   col.bedSolid = L.bedSolid;
   col.plant = plantColumnAt(x, z, seed, biome);
+  col.looseTop = h;
   return col;
 }
 
@@ -3697,6 +3705,57 @@ fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
   let flat = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
   let span = max(CAP_REPOSE_Q8 - flat, 1);
   return clamp((depth * (CAP_REPOSE_Q8 - (*col).slope)) / span, 0, depth);
+}
+
+// ---- THE LOCAL STEP TEST: no loose grain above a free down-diagonal ------
+//
+// looseCoverDepth is a GRADIENT test, and on the landform gradient by design
+// (DESIGN.md "A loose cover is born at rest too": gated on the full gradient
+// the taper becomes a cliff). So it cannot see the +-2-voxel steps the detail
+// and grain octaves put on an otherwise gentle dune face, and on every such
+// step one loose voxel survived and slid on tick 1. Measured by gen-settle
+// (docs/PLAN_save_system.md S2): 1,157 of the 1,485 chunks an untouched world
+// saved were exactly that, and a raw-worldgen probe over the same window found
+// 9,351 sand cells with a free cell below or on an axis down-diagonal, all of
+// them desert sand.
+//
+// This is the instrument the note asked for, and it is exact rather than
+// statistical. sim_step moves a powder that authors no `repose` (sand is 1:1)
+// straight down or into one of the FOUR AXIS down-diagonals, nothing else. A
+// loose cell at y therefore rests iff every axis neighbour's cell at y-1 is
+// ground, i.e. iff  y <= min(axis neighbour ground) + 1.  Cells above that
+// line go to the firm cover (sandstone), exactly what the taper already hands
+// its steep ground; the loose depth below the line is untouched. Corners do
+// not matter (the CA never takes a corner diagonal for a powder), and neither
+// does what stands above a lower neighbour's ground (water, a plant, a cactus):
+// the line is drawn at the neighbour's GROUND, so a cell above it is firmed
+// whatever occupies the diagonal -- conservative, and it only ever fires on a
+// real 2+ voxel step.
+//
+// COST, and why it lives in genChunk and not genColumn. Four colHeightAt per
+// column (landColumn: ~25 hashes each), paid only by columns of a biome whose
+// cover is loose-with-a-firm-opt-in, only in the chunk(s) whose 16 cells reach
+// the top four of the column, and only where the taper left any loose depth.
+// genColumn stays as it was because it is also the far cascades' per-cell
+// entry, where sand vs sandstone is one far palette slot (sandstone far-aliases
+// sand) and four more ground evaluations per sample would be pure cost.
+fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32) -> i32 {
+  var m = colHeightAt(x + 1, z, seed);
+  m = min(m, colHeightAt(x - 1, z, seed));
+  m = min(m, colHeightAt(x, z + 1, seed));
+  m = min(m, colHeightAt(x, z - 1, seed));
+  return min((*col).h, m + 1);
+}
+
+// Does this column's cover get the loose/firm split at all? The same two opt-ins
+// genCellIn's cap and skin branches read: the sand cap flag, or a POWDER skin
+// in a biome that authored a firm skin (tundra's snow authored none and keeps
+// its settle transient, as before).
+fn coverSplits(biome : u32) -> bool {
+  if (wmFlag(biome, WM_BF_SAND_CAP)) { return true; }
+  let skin = wmBiome(biome, WM_B_SKIN);
+  return skin != MAT_AIR && materials[skin].klass == CLASS_POWDER &&
+         wmBiome(biome, WM_B_FIRM_COVER) != MAT_AIR;
 }
 
 // The material the ramp above hands the rest of the cap to: the biome's
@@ -3802,8 +3861,11 @@ fn genCellIn(col : ptr<function, Col>,
       // so a cut bank reads as sandstone rock instead of as sand that has not
       // fallen yet. In between the two split at the ramp, which is what a real
       // dune face looks like anyway.
+      // And never above the local step line (looseRestTop): a cell with a
+      // free down-diagonal is firm whatever the gradient said.
       let loose = looseCoverDepth(col, 4);
-      mat = select(coverFirmMat(biome), M_SAND, y > h - loose);
+      mat = select(coverFirmMat(biome), M_SAND,
+                   y > h - loose && y <= (*col).looseTop);
     } else if (shore.onShore && shore.past < wmWaterI(wp, WM_W_MUD_WIDTH) &&
                y > h - 2) {
       // WET MUD, in the inner ring only. This is the transition the whole
@@ -3845,7 +3907,10 @@ fn genCellIn(col : ptr<function, Col>,
       let loose = select(depth, looseCoverDepth(col, depth),
                          skin != MAT_AIR && materials[skin].klass == CLASS_POWDER &&
                          wmBiome(biome, WM_B_FIRM_COVER) != MAT_AIR);
-      mat = select(coverFirmMat(biome), skin, y > h - loose);
+      // looseTop is `h` for every column genChunk did not tighten, which
+      // includes every biome coverSplits() rejects (tundra's snow), so the
+      // step line cannot firm a skin whose author did not opt in.
+      mat = select(coverFirmMat(biome), skin, y > h - loose && y <= (*col).looseTop);
     } else if (y > h - sed) {
       // NOT ON A FIXTURE PAD. The pad keeps its authored loose SAND cap on
       // purpose ("avalanches into repose piles"), but the four voxels under it
@@ -4705,6 +4770,17 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     // of the COLUMN -- the cover stack's own guard with the y test replaced by
     // "does this chunk's 16-cell stack reach the band at all". -1 = not
     // computed; genCellIn scans on demand.
+    // THE LOCAL STEP LINE for a loose cover (looseRestTop, above genCellIn):
+    // only where the cover splits, only where this chunk reaches the loose
+    // band (the cap is 4 deep, a skin its authored skinDepth), and only where
+    // the taper left loose depth to restrict. Every other column keeps
+    // genColumn's `looseTop = h`.
+    let coverDepth = max(4, i32(wmBiome(col.biome, WM_B_SKIN_DEPTH)));
+    if (coverSplits(col.biome) && base.y <= col.h &&
+        base.y + i32(CHUNK) > col.h - coverDepth &&
+        looseCoverDepth(&col, coverDepth) > 0) {
+      col.looseTop = looseRestTop(&col, wx, wz, T.seed);
+    }
     var canopy = -1;
     if (wmFlag(col.biome, WM_BF_CANOPY_ROWS) && !col.inRim && col.pond < 0 &&
         !siteKeepOut(wx, wz) &&
@@ -4998,6 +5074,9 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
 // (payload offset, count) indexed by DISPATCH entry, then the payload:
 // (mat << 12) | cellIndexInLevelChunk. Read by the `farpatch` entry below.
 @group(1) @binding(5) var<storage, read> farPatch : array<u32>;
+// fardown's skip (world.h farSig): the far-visible matter signature each slot
+// had the last time it was downsampled.
+@group(1) @binding(6) var<storage, read_write> farSig : array<u32>;
 
 var<workgroup> wgFarCount : atomic<u32>;
 // Non-air cells contributed by the patch pass (`farpatch`). Kept apart from
@@ -5346,7 +5425,55 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
            @builtin(local_invocation_index) li : u32) {
   // world fine-voxel base of the dirty chunk this workgroup owns
   let slot = farDirty[wg.x];
-  let base = slotWorldChunk(slot, T.origin) * i32(CHUNK);
+  let wc = slotWorldChunk(slot, T.origin);
+  let base = wc * i32(CHUNK);
+
+  // ---- SKIP A CHUNK WHOSE FAR-VISIBLE MATTER HAS NOT CHANGED ----------------
+  // Everything below writes a pure function of (the cells farCellIsSolid
+  // keeps, procgen, the level origins). Procgen is fixed per coord, so if the
+  // kept cells and the origins match what this slot held at its last
+  // downsample, every byte would be rewritten with the value it already has.
+  // The dirty list cannot say that on its own: a chunk awake only for SMOKE
+  // (a burning forest's ~5,000 of them, 2026-09-22) changes nothing here,
+  // because gas never reaches the cascade.
+  //
+  // The signature is an order-free SUM of per-cell hashes, so the workgroup's
+  // accumulation order cannot change it. A 32-bit collision skips one
+  // downsample of render-only derived data; nothing else can observe it.
+  if (li == 0u) { atomicStore(&wgFarCount, 0u); }
+  workgroupBarrier();
+  // The page is read DIRECTLY (i is the chunk-linear in-page index): a
+  // per-cell voxWordAt re-resolves the page table for every cell, which made
+  // this read cost 8x the occupancy pass's read of the same chunks. A sentinel
+  // holds one material everywhere (JITTER varies only the palette nibble).
+  var acc = 0u;
+  let pe = pageTable[slot];
+  if ((pe & PT_SENTINEL_BIT) != 0u) {
+    let m = pe & PT_MAT_MASK;
+    if (farCellIsSolid(m)) {
+      for (var i = li; i < CHUNK_VOL; i += 64u) { acc += pcg((m << 12u) | i); }
+    }
+  } else {
+    let pageBase = pe * CHUNK_VOL;
+    for (var i = li; i < CHUNK_VOL; i += 64u) {
+      let m = voxels[pageBase + i] & 0xFFFu;
+      if (farCellIsSolid(m)) { acc += pcg((m << 12u) | i); }
+    }
+  }
+  atomicAdd(&wgFarCount, acc);
+  workgroupBarrier();
+  if (li == 0u) {
+    var sig = hash3(u32(wc.x), u32(wc.y), u32(wc.z)) ^ atomicLoad(&wgFarCount);
+    for (var k = 0u; k < FAR_LEVELS; k++) {
+      let o = F.origins[k].xyz;
+      sig = pcg(sig ^ hash3(u32(o.x), u32(o.y), u32(o.z)));
+    }
+    sig = max(sig, 1u);   // 0 is "never downsampled" (zeroed buffer)
+    let same = farSig[slot] == sig;
+    farSig[slot] = sig;
+    atomicStore(&wgFarCount, select(0u, 1u, same));
+  }
+  if (workgroupUniformLoad(&wgFarCount) != 0u) { return; }
   // Constant over the whole dispatch, like in `far` above (see Poi).
 
   for (var level = 1u; level <= FAR_LEVELS; level++) {
@@ -5361,63 +5488,75 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
     let n = vec3<i32>(farCenterCount(base.x, first.x, step),
                       farCenterCount(base.y, first.y, step),
                       farCenterCount(base.z, first.z, step));
-    let total = u32(n.x * n.y * n.z);
+    // ONE THREAD PER COLUMN, the cells of that column in an inner loop.
+    //
+    // Everything procgen here is a function of (x, z) alone — genColumn, the
+    // column top — and it is most of this kernel's cost. The flat
+    // `i -> (ix, iy, iz)` walk this replaced evaluated it once per SAMPLE, so
+    // level 1 (8x8x8 samples, 8x8 columns) paid eight genColumns per column.
+    // Measured 2026-09-22 on a forest fire (~5,000 smoke-awake chunks/tick):
+    // `farDown` was 15.4 ms/frame, the single largest GPU row. Same samples,
+    // same bytes written (each cell owns its byte; atomics commute), so the
+    // cascade is bit-identical; only the procgen count drops.
+    let cols = u32(n.x * n.z);
     let origin = F.origins[level - 1u].xyz;
-    for (var i = li; i < total; i += 64u) {
-      let ix = i32(i) % n.x;
-      let iy = (i32(i) / n.x) % n.y;
-      let iz = i32(i) / (n.x * n.y);
-      // fine-voxel sample point, and the level cell it belongs to
-      let fine = first + vec3<i32>(ix, iy, iz) * step;
-      let cc = fine >> vec3<u32>(shift);
-      if (!farInBox(cc, origin)) { continue; }   // outside this cascade level
+    for (var ci = li; ci < cols; ci += 64u) {
+      let ix = i32(ci) % n.x;
+      let iz = i32(ci) / n.x;
+      let fx = first.x + ix * step;
+      let fz = first.z + iz * step;
+      // Column-level box test: x/z of the level cell do not depend on y.
+      let ccx = fx >> shift;
+      let ccz = fz >> shift;
+      var pcol = genColumn(fx, fz, T.seed);
+      let topC = farColTopFrom(pcol.h, pcol.fluidTop, fx, fz, T.seed);
+      for (var iy = 0; iy < n.y; iy++) {
+        // fine-voxel sample point, and the level cell it belongs to
+        let fine = vec3<i32>(fx, first.y + iy * step, fz);
+        let cc = vec3<i32>(ccx, fine.y >> shift, ccz);
+        if (!farInBox(cc, origin)) { continue; }   // outside this cascade level
 
-      // THE BLOCKER FLAG IS PRISTINE ON BOTH SIDES, and that is the whole
-      // reason it is computed from the procgen COLUMN here rather than from
-      // the live grid this entry otherwise reads. `far` has no live grid to consult —
-      // it fills from procgen — so a flag derived from real voxels here would
-      // differ from the flag `far` writes for the same cell, and the seam
-      // between a refilled plane and a downsampled chunk would show it. Same
-      // function, same arguments, same answer: the argument `farSurfaceMat`
-      // already makes for the colour. The cost is that an EDIT never sets or
-      // clears the flag — only the material byte below records it, which is
-      // the behaviour every reader had before the flag existed.
-      //
-      // The column is now HOISTED out of the material branch and shared by the
-      // two, so a cell pays ONE genColumn instead of one for the flag and
-      // another for the skin. That makes an air cell dearer than it was (it
-      // used to pay none) and a solid cell exactly as dear as it was.
-      var pcol = genColumn(fine.x, fine.z, T.seed);
-      var byteV = farBlockerBitAt(
-          farColTopFrom(pcol.h, pcol.fluidTop, fine.x, fine.z, T.seed),
-          cc, shift, T.seed);
-      // live grid (the sample point is inside this chunk, hence resident)
-      let mat = voxWordAt(fine) & 0xFFFu;
-      if (farCellIsSolid(mat)) {
-        // Same skin rule as the sieve — the skin is looked up from PRISTINE
-        // procgen (genCell), so a pristine chunk downsamples bit-identically
-        // to the sieve's fill. An edited surface keeps its pristine skin color
-        // while the cell's center voxel survives; the moment the center voxel
-        // is dug away the cell empties for real. A slightly stale rim color is
-        // invisible at cascade distances; a seam between refilled planes and
-        // downsampled chunks is not.
-        // SAME CALL, SAME ARGUMENTS as the sieve — that identity is what keeps
-        // a downsampled chunk byte-identical to a refilled one at their shared
-        // boundary, and it is why farSurfaceMat takes the column rather than
-        // deriving a height of its own (surfHeightAt used to, and drifted).
-        byteV |= matFarPal(&materials, farSurfaceMat(&pcol, mat, fine, shift, T.seed));
-      }
-      let bi = farVoxByteIndex(level, cc);
-      let bsh = (bi & 3u) * 8u;
-      atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
-      atomicOr(&farVox[bi >> 2u], byteV << bsh);
-      if (byteV != 0u) {
-        // Count 1 (all a reader asks of the count is non-zero) under this
-        // cell's row: max() compares the row first, so a live edit that stacks
-        // something above the sieve's top row raises it, and nothing ever
-        // lowers it (common.wgsl, the farOcc word).
-        atomicMax(&farOcc[farOccIndex(level, cc)],
-                  farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
+        // THE BLOCKER FLAG IS PRISTINE ON BOTH SIDES, and that is the whole
+        // reason it is computed from the procgen COLUMN here rather than from
+        // the live grid this entry otherwise reads. `far` has no live grid to
+        // consult — it fills from procgen — so a flag derived from real voxels
+        // here would differ from the flag `far` writes for the same cell, and
+        // the seam between a refilled plane and a downsampled chunk would show
+        // it. Same function, same arguments, same answer: the argument
+        // `farSurfaceMat` already makes for the colour. The cost is that an
+        // EDIT never sets or clears the flag — only the material byte below
+        // records it, which is the behaviour every reader had before the flag
+        // existed.
+        var byteV = farBlockerBitAt(topC, cc, shift, T.seed);
+        // live grid (the sample point is inside this chunk, hence resident)
+        let mat = voxWordAt(fine) & 0xFFFu;
+        if (farCellIsSolid(mat)) {
+          // Same skin rule as the sieve — the skin is looked up from PRISTINE
+          // procgen (genCell), so a pristine chunk downsamples bit-identically
+          // to the sieve's fill. An edited surface keeps its pristine skin
+          // color while the cell's center voxel survives; the moment the
+          // center voxel is dug away the cell empties for real. A slightly
+          // stale rim color is invisible at cascade distances; a seam between
+          // refilled planes and downsampled chunks is not.
+          // SAME CALL, SAME ARGUMENTS as the sieve — that identity is what
+          // keeps a downsampled chunk byte-identical to a refilled one at their
+          // shared boundary, and it is why farSurfaceMat takes the column
+          // rather than deriving a height of its own (surfHeightAt used to,
+          // and drifted).
+          byteV |= matFarPal(&materials, farSurfaceMat(&pcol, mat, fine, shift, T.seed));
+        }
+        let bi = farVoxByteIndex(level, cc);
+        let bsh = (bi & 3u) * 8u;
+        atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
+        atomicOr(&farVox[bi >> 2u], byteV << bsh);
+        if (byteV != 0u) {
+          // Count 1 (all a reader asks of the count is non-zero) under this
+          // cell's row: max() compares the row first, so a live edit that
+          // stacks something above the sieve's top row raises it, and nothing
+          // ever lowers it (common.wgsl, the farOcc word).
+          atomicMax(&farOcc[farOccIndex(level, cc)],
+                    farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
+        }
       }
     }
   }

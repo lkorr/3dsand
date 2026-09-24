@@ -183,6 +183,9 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   // established, so the page table cannot disagree with worldgen about which
   // world it is classifying.
   if (world_->pages) world_->pages->SetWorldSeed(seed);
+  // ...and so does the region codec's state predictor (SVR3). Compression
+  // only: each region file records the seed it was encoded with.
+  store_.SetSeed(seed);
   world_->SetMirrorSeed(seed);
   // Publish the far-field edit index so FarField can reach it through World
   // (world.h's `farEdits`, forward-declared exactly like `pages`).
@@ -191,6 +194,9 @@ void Stream::Init(GpuContext* ctx, World* world, Simulation* sim, uint32_t seed)
   // emitter list from (world.h's `farPlumes`).
   world_->farPlumes = &farPlumes_;
   modified_.assign(kNumSlots, 0);
+  // The window is about to be generated from nothing: the delta save's
+  // coverage proof starts here (FlushResident in stream.h).
+  ResetSaveTracking();
   // Sized once beside modified_ so every later path can index it without a
   // bounds dance (M9.5-A). All-zero is "no slot is waiting on anybody",
   // which is the only state a single-player run ever reaches.
@@ -231,10 +237,7 @@ void Stream::Update(const InterestSet& interest, uint32_t tick) {
 
   // sticky modified set from the latest snapshot (slot-indexed, ~2 ticks
   // latent; see the accepted-race note in stream.h)
-  const WorldSnapshot& snap = world_->Snap();
-  if (snap.valid) {
-    for (uint32_t i = 0; i < kNumSlots; i++) modified_[i] |= snap.dirtyFlags[i];
-  }
+  FoldSnapshot();
   timing_.dirtyFoldMs += PtNowMs() - uT1;
 
   IVec3 o = world_->WindowOrigin();
@@ -378,7 +381,8 @@ void Stream::ShiftAxis(int axis, int dir) {
   timing_.shifts++;
 }
 
-void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
+void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter,
+                        const std::vector<uint8_t>* keep) {
   const WorldSnapshot& snap = world_->Snap();
   // Everything the completion needs is captured NOW: the slots are refilled
   // (and modified_ reset) before the readback lands.
@@ -387,6 +391,9 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
   std::vector<uint32_t> sentRle;
   uint32_t unmodReal = 0;
   for (uint32_t s : slots) {
+    // The delta save's mask (FlushResident): a slot it does not name is
+    // reproducible without the store, by exactly the argument below.
+    if (keep && (*keep)[s] == 0) continue;
     bool worth = true;
     if (filter && snap.valid)
       worth = snap.occupancy[s] > 0 || modified_[s] != 0;
@@ -419,9 +426,11 @@ void Stream::EvictSlots(const std::vector<uint32_t>& slots, bool filter) {
     // without the copy, and the non-air unmodified chunks it had to keep are
     // exactly the ones the argument above says are re-derivable too.
     //
-    // Gated on `filter` and a live snapshot, exactly as dropIfAir was: a
-    // FlushResident (the save path) passes filter=false and still stores
-    // every resident chunk, air included.
+    // Gated on `filter` and a live snapshot, exactly as dropIfAir was. The
+    // save path (FlushResident) passes filter=false and applies the SAME rule
+    // through `keep` above instead, with the unpublished snapshot tail folded
+    // in — a save cannot accept the ~kSnapshotLatency-tick race this test
+    // accepts for a trailing plane.
     if (filter && snap.valid && modified_[s] == 0) {
       unmodReal++;
       continue;
@@ -1621,11 +1630,134 @@ void Stream::HarvestDemotes(uint32_t tick) {
                 harvested, demoted, retried, demotes_.size(), cpyMs, clsMs);
 }
 
-void Stream::FlushResident() {
+void Stream::FoldSnapshot() {
+  const WorldSnapshot& snap = world_->Snap();
+  if (!snap.valid) return;
+  // The fold itself is unconditional and unchanged: eviction reads modified_,
+  // so what goes in here must stay a pure function of the published snapshot.
+  for (uint32_t i = 0; i < kNumSlots; i++) modified_[i] |= snap.dirtyFlags[i];
+  if (!trackOk_) return;
+  const uint32_t ep = world_->SnapshotEpoch();
+  if (!trackEpochKnown_) {
+    trackEpoch_ = ep;
+    trackEpochKnown_ = true;
+  } else if (ep != trackEpoch_) {
+    trackOk_ = false;
+    trackWhy_ = "the snapshot pipeline was reset behind the stream (a world "
+                "regenerated or a tick rewind without Stream::OnRegen/ReloadWindow)";
+    return;
+  }
+  // Already counted, or from before the last wholesale refill (a window
+  // re-pull that did not invalidate the pipeline): folded above, harmlessly
+  // over-inclusive, but it proves nothing about the new window.
+  if (snap.submitSeq <= trackSeq_) return;
+  if (snap.submitSeq != trackSeq_ + 1) {
+    trackOk_ = false;
+    char buf[160];
+    std::snprintf(buf, sizeof buf,
+                  "ticks %u..%u were encoded but their dirty flags never reached "
+                  "the modified set (FoldSnapshot not called for them)",
+                  trackSeq_ + 1, snap.submitSeq - 1);
+    trackWhy_ = buf;
+    return;
+  }
+  trackSeq_ = snap.submitSeq;
+}
+
+void Stream::ResetSaveTracking() {
+  trackOk_ = true;
+  trackWhy_.clear();
+  trackEpochKnown_ = false;
+  // Every tick encoded so far belongs to the window being replaced.
+  trackSeq_ = world_ ? world_->TicksEncoded() : 0u;
+}
+
+bool Stream::BuildSaveMask(std::vector<uint8_t>& mask, FlushReport& rep) {
+  if (!trackOk_) {
+    rep.why = trackWhy_.empty() ? "the modified set has not been tracked since "
+                                  "the window was filled"
+                                : trackWhy_;
+    return false;
+  }
+  const uint32_t ep = world_->SnapshotEpoch();
+  if (!trackEpochKnown_) {
+    // Nothing folded since the refill. Adopting here is only sound if no tick
+    // ran in between, which the seq test below checks.
+    trackEpoch_ = ep;
+    trackEpochKnown_ = true;
+  } else if (ep != trackEpoch_) {
+    rep.why = "the snapshot pipeline was reset since the last fold (a world "
+              "regenerated behind the stream)";
+    return false;
+  }
+  // THE TAIL. Every tick encoded so far has a readback in flight or parsed;
+  // wait for the in-flight ones (bounded by the ring: each wait retires one
+  // slot and nothing here arms another). This is the save path, off the frame
+  // loop, and it already blocks on DrainEvictions below — one more fence of
+  // the same kind is not a new class of stall.
+  for (int i = 0; i < World::kReadbackSlots + 1 &&
+                  world_->ReadbackPendingAtOrBefore(0xFFFFFFFFu);
+       i++)
+    if (!ctx_->WaitOldestPendingMap()) break;
+  ctx_->ProcessEvents();
+  if (world_->ReadbackPendingAtOrBefore(0xFFFFFFFFu)) {
+    rep.why = "a snapshot readback did not land";
+    return false;
+  }
+  mask = modified_;
+  uint32_t seq = trackSeq_;
+  for (const WorldSnapshot& sn : world_->DeliveredUnpublished()) {
+    if (!sn.valid || sn.submitSeq <= trackSeq_) continue;
+    if (sn.submitSeq != seq + 1) {
+      char buf[128];
+      std::snprintf(buf, sizeof buf,
+                    "snapshot tail has a hole: expected seq %u, found %u", seq + 1,
+                    sn.submitSeq);
+      rep.why = buf;
+      return false;
+    }
+    for (uint32_t i = 0; i < kNumSlots; i++) {
+      if (sn.dirtyFlags[i] && !mask[i]) {
+        mask[i] = 1;
+        rep.tailOnly++;
+      }
+    }
+    seq = sn.submitSeq;
+    rep.tailTicks++;
+  }
+  if (seq != world_->TicksEncoded()) {
+    char buf[160];
+    std::snprintf(buf, sizeof buf,
+                  "ticks %u..%u have no dirty flags in the mask (encoded %u, "
+                  "covered through %u)",
+                  seq + 1, world_->TicksEncoded(), world_->TicksEncoded(), seq);
+    rep.why = buf;
+    return false;
+  }
+  return true;
+}
+
+Stream::FlushReport Stream::FlushResident(bool forceFull) {
+  FlushReport rep;
   std::vector<uint32_t> slots(kNumChunks);
   for (uint32_t i = 0; i < kNumChunks; i++) slots[i] = i;
-  EvictSlots(slots, /*filter=*/false);
+  std::vector<uint8_t> mask;
+  if (forceFull) {
+    rep.why = "full flush forced by the caller";
+  } else {
+    rep.delta = BuildSaveMask(mask, rep);
+  }
+  if (rep.delta) {
+    for (uint32_t i = 0; i < kNumChunks; i++) rep.stored += mask[i] != 0;
+    rep.skipped = kNumChunks - rep.stored;
+    EvictSlots(slots, /*filter=*/false, &mask);
+  } else {
+    rep.tailOnly = 0;
+    rep.stored = kNumChunks;
+    EvictSlots(slots, /*filter=*/false);
+  }
   DrainEvictions();  // a save wants the store complete NOW
+  return rep;
 }
 
 void Stream::ReloadWindow(IVec3 origin) {
@@ -1635,6 +1767,9 @@ void Stream::ReloadWindow(IVec3 origin) {
   DiscardPendingShifts();  // and so do any un-enacted shift verdicts
   world_->SetWindowOrigin(origin);
   modified_.assign(kNumSlots, 0);
+  // Every slot is refilled below from the store or genChunk, so the delta
+  // save's coverage proof restarts with the window (FlushResident).
+  ResetSaveTracking();
   // Holds and miss-requeues belong to the window being replaced (M9.5-A). The
   // refill below re-asks the exchange for every slot under the NEW origin, so
   // any chunk still genuinely wanted is held again on the way through; not

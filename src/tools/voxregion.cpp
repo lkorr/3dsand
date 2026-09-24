@@ -121,7 +121,7 @@ std::string VoxPaletteJson(const std::vector<MaterialDef>& mats) {
   {
     uint32_t pal[kStainTypeMax + 1] = {0};
     for (const MaterialDef& d : mats) {
-      const uint32_t type = d.gpu.stainPack & kStainPackTypeMask;
+      const uint32_t type = d.stainSlot;
       if (type == 0 || type > kStainTypeMax) continue;
       pal[type] = d.gpu.stainColor;  // shared name => shared slot, last wins
     }

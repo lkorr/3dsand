@@ -1,6 +1,27 @@
 # PLAN — clouds and weather
 
-Status: RESEARCH + PLAN, nothing landed. 2026-09-11.
+Status: packages A, B, C, E and F LANDED 2026-09-23 (worktree
+`clouds-weather`), plus tier-1 rain/snow and lightning from D/G. DESIGN.md §9.w
+is what shipped and supersedes the sketches below where they differ. Still open:
+rain touching the SIM (§2.5 tier 2 wet stain + `RCOND_RAIN`, tier 3 water), a
+tuner PAGE for authoring presets (they are plain JSON; the Clouds and Sky
+weather tabs cover the knobs), thunder audio, cloud god-rays, biome-driven
+weather, and recovering the raymarch fs spill (16 -> 96 B/thread).
+
+Deviations from the plan, and why:
+- §2.1 did NOT extend WindWeather/TickParams: nothing in the sim reads weather
+  yet, so the resolver is its own render-only module (`src/sim/weather.*`) that
+  READS the wind (cloud drift, streak lean). The integer TickParams copy is the
+  first step of tier 2, not a prerequisite for clouds.
+- §2.3's "one texture fetch" is one bilinear upsample of a 3-word history, and
+  it keeps TWO transmittances (hazed and direct) — a single T let the sun disc
+  shine through a hazed thick cloud.
+- §2.4 is a per-frame cloud SHADOW MAP (compute), not taps along each shadow
+  ray: one bilinear lookup at every shading site, bodies included.
+- The weather presets are sorted onto a moisture LADDER walked by smooth noise
+  (DESIGN.md §9.w), which is what makes "no cuts" a gate claim.
+
+Original status: RESEARCH + PLAN, nothing landed. 2026-09-11.
 
 Sources: the VoxelGameDev scrape at `F:\discord scrape\txt` (channels *graphics*,
 *voxels*, *raytracing*, *lighting*, *procedural-generation*, *fluids*,

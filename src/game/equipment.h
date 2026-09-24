@@ -29,9 +29,9 @@
 //   * No stack limits. ItemStack::count is already a count and nothing in the
 //     game produces more than one of anything yet; a cap invented before the
 //     first stackable item exists would be a guess.
-//   * No visual sheathing. Sheath holds a melee item as DATA; the draw key
-//     takes it OUT of the sheath and into the hand through the ordinary
-//     Mob::EquipItem path. Drawing it on the BACK while stowed needs a
+//   * No visual sheathing. Sheath holds a melee item as DATA, and since
+//     2026-09-23 nothing draws from it: the hand is the selected hotbar slot,
+//     the way a flask is held. Drawing it on the BACK while stowed needs a
 //     `sheath_back` socket in the rig plus a matching grip context on the item
 //     (game/item.h's ItemGrip map already anticipates exactly this), which is
 //     content, not code.
@@ -334,15 +334,17 @@ struct Bag {
   }
   // Merges by def AND DYE, for the reason ItemStack::dye states: a stack is one
   // colour, so a red tunic must not fold into a stack of blue ones.
-  int Add(int defIndex, int count = 1, uint32_t dye = 0) {
+  int Add(int defIndex, int count = 1, uint32_t dye = 0, uint16_t fillMat = 0,
+          uint16_t fillAmt = 0) {
     if (defIndex < 0 || count <= 0) return -1;
     for (int i = 0; i < kSlots; i++)
-      if (!slots[i].Empty() && slots[i].def == defIndex && slots[i].dye == dye) {
+      if (!slots[i].Empty() &&
+          slots[i].SameKind(defIndex, dye, fillMat, fillAmt)) {
         slots[i].count += count;
         return i;
       }
     int f = FirstFree();
-    if (f >= 0) slots[f] = {defIndex, count, dye};
+    if (f >= 0) slots[f] = {defIndex, count, dye, fillMat, fillAmt};
     return f;
   }
 };
@@ -430,50 +432,6 @@ struct PlayerKit {
     *a = *b;
     *b = tmp;
     return MoveResult::Ok;
-  }
-};
-
-// ---- DRAWN OR STOWED --------------------------------------------------------
-//
-// The Sheath slot is where a weapon lives; this is whether it is currently IN
-// THE HAND. Two states and one key, which is the whole feature — but the rule
-// has three cases that are easy to get subtly wrong, so it lives here as a
-// plain struct rather than as a branch in the frame loop:
-//
-//   * Drawing forces the melee tool. Without it you pull a sword and the left
-//     mouse button still paints stone.
-//   * Stowing puts the PREVIOUS tool back. Forcing a mode and never
-//     un-forcing it strands the player somewhere they did not choose.
-//   * A weapon that LEAVES the sheath while drawn is no longer drawn. The
-//     character screen can move it into the pack mid-swing, and nothing about
-//     the key press knows that happened — so the reconcile runs every frame
-//     and there is exactly one place the two facts have to agree.
-//
-// No engine coupling of any kind (`tool` is an int the caller owns), which is
-// what lets --gate armor-wear assert on it with no window and no GPU.
-struct SheathState {
-  bool drawn = false;
-  int toolBefore = 0;
-
-  // The key press. False = nothing to draw; the caller shows a refusal.
-  bool Toggle(ItemKind sheathKind, int meleeTool, int& tool) {
-    if (drawn) {
-      drawn = false;
-      tool = toolBefore;
-      return true;
-    }
-    if (sheathKind != ItemKind::Melee) return false;
-    drawn = true;
-    toolBefore = tool;
-    tool = meleeTool;
-    return true;
-  }
-
-  // Every frame, before the hand is read.
-  void Reconcile(ItemKind sheathKind, int meleeTool, int& tool) {
-    if (!drawn || sheathKind == ItemKind::Melee) return;
-    drawn = false;
-    if (tool == meleeTool) tool = toolBefore;
   }
 };
 

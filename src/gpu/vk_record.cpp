@@ -135,6 +135,9 @@ bool Recorder::CondHolds(pass::Cond c, const RecordCtx& cx) {
     // to run (pass_table.def's fill_gasOuter note).
     case pass::Cond::GasOuter:   return cx.gasActive || cx.gasFarEmitCount > 0;
     case pass::Cond::ReposeActive: return cx.reposeActive;
+    case pass::Cond::Clouds:        return (cx.cloudFlags & 1u) != 0u;
+    case pass::Cond::CloudBake:     return (cx.cloudFlags & 2u) != 0u;
+    case pass::Cond::ShadowCacheOn: return (cx.cloudFlags & 4u) != 0u;
   }
   return false;
 }
@@ -173,6 +176,8 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
       return cx.gasFarEmitCount;
     case pass::DispatchSel::GasFarWideSel:
       return cx.gasFarWideCount;
+    case pass::DispatchSel::CloudGx: return cx.cloudGx;
+    case pass::DispatchSel::CloudGy: return cx.cloudGy;
     default:                          return v;
   }
 }
@@ -967,6 +972,7 @@ void Recorder::FlushPendingImages() {
 
 void Recorder::BeginRendering(const RenderAttachments& att) {
   if (!att.color || att.color->img == VK_NULL_HANDLE || renderOpen_) return;
+  lastAtt_ = att;
 
   // 1. Resolve every buffer hazard BEFORE the rendering scope opens — barriers
   //    are illegal inside it. Sledgehammer mode uses its full barrier instead,
@@ -1040,6 +1046,51 @@ void Recorder::EndRendering() {
   if (!renderOpen_) return;
   be_.Fns().CmdEndRendering(cmd_);
   renderOpen_ = false;
+}
+
+void Recorder::SplitRenderingAfterFragmentWrite(Buffer* written) {
+  if (!renderOpen_) return;
+  EndRendering();
+  if (written && written->buf) {
+    // Find-or-create the extras entry, as CopyRenderWritten does, and SET its
+    // state: the write happened inside the scope just closed, where no barrier
+    // could have been placed.
+    BufState* s = nullptr;
+    for (auto& e : extra_)
+      if (e.first == written) s = &e.second;
+    if (!s) {
+      extra_.push_back({written, BufState{}});
+      s = &extra_.back().second;
+    }
+    // Emitted here rather than left to BeginRendering's flush, because that
+    // flush's destination is the READ domain only (§2.6: draws are read-only)
+    // and this buffer is written again by the next world draw in the same
+    // recording — the WAW half needs the write access in the destination.
+    VkBufferMemoryBarrier2 b{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER_2};
+    b.srcStageMask = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    b.srcAccessMask = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    b.dstStageMask = kRenderReadStages;
+    b.dstAccessMask =
+        VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    b.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    b.buffer = written->buf;
+    b.offset = 0;
+    b.size = VK_WHOLE_SIZE;
+    pending_.push_back(b);
+    // From here the reopened scope reads it; a later BeginRendering's flush
+    // then orders those reads ahead of the next write (the WAR half).
+    s->lastWriteStage = VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT;
+    s->lastWriteAccess = VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT;
+    s->readStagesSince = kRenderReadStages;
+    s->readAccessSince = kRenderReadAccess;
+  }
+  // Same attachments, LOADED: everything drawn so far carries on. Every scope
+  // this recorder opens stores both attachments, so the load is defined.
+  RenderAttachments att = lastAtt_;
+  att.clearColor = false;
+  att.clearDepth = false;
+  BeginRendering(att);  // flushes pending_ ahead of the scope
 }
 
 void Recorder::Draw(uint32_t vertexCount, uint32_t instanceCount, uint32_t firstVertex,

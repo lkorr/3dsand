@@ -1,4 +1,5 @@
 #pragma once
+#include <climits>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -52,9 +53,10 @@
 // Six SORTS: Matter (a material by name), Effect (something that happens at a
 // point), Delivery (how an Effect reaches a point), Mod (a field edit on a
 // delivery record), Operator (a word with argument slots that produces one of
-// the others), Separator (`also`: ends one sentence and starts the next).
+// the others), Separator (`lane` opens a lane scope of the pile, `end` closes
+// it; a lane belongs to one instance of the box that closes the pile).
 //
-// THREE RULES, and everything else is a consequence of them:
+// FOUR RULES, and everything else is a consequence of them:
 //
 //   1. A NOUN GOES INTO THE PILE. A Matter word, an Effect word, or an
 //      operator group whose result sort is Effect is pushed onto the PILE.
@@ -62,10 +64,11 @@
 //      capped) and the lowering rebuilds the pile in a CANONICAL order.
 //
 //   2. A DELIVERY BOXES THE PILE, AND SPEAKING CONTINUES. The Delivery word
-//      takes the WHOLE pile and wraps it into ONE Effect value of verb
-//      `launch`: {that delivery's DeliveryRec, the pile's Effects as its
-//      payload, the pile's pending Mods stuck to its record}. The pile becomes
-//      exactly that one value. So deliveries NEST and word order matters:
+//      takes the pile — all of it, or, under rule 4, the innermost OPEN scope
+//      of it — and wraps it into ONE Effect value of verb `launch`: {that
+//      delivery's DeliveryRec, the pile's Effects as its payload, the pile's
+//      pending Mods stuck to its record}. That scope's pile becomes exactly
+//      that one value. So deliveries NEST and word order matters:
 //      `explosive projectile projectile` is a bolt that fires a bolt that
 //      explodes.
 //
@@ -77,9 +80,29 @@
 //      the hop; every other mod on the hand is a charged no-op and the
 //      describe line says so.
 //
-// The outermost box is always `hand`, so the whole sentence lowers to ONE cast
-// — unless `also` is spoken, which closes the current pile as a finished
-// cast and starts a new one (law L4 attaches to `also`, not to a delivery).
+//   4. `lane` OPENS A LANE SCOPE, `end` CLOSES IT, AND A LANE BELONGS TO ONE
+//      INSTANCE. `lane` pushes a scope onto the current pile and `end` pops
+//      the innermost open one back into the scope around it. **A delivery
+//      boxes the innermost OPEN scope**: inside an open lane it takes only
+//      that lane's items (the box lands IN the lane, which stays open, so more
+//      may follow in it), and outside any lane it takes the shared items plus
+//      every closed lane — the multi-socket box. An unclosed lane is closed
+//      when the sentence runs out. Lanes are ordered as spoken; the box fires
+//      `instances = max(count, L)`, instance i < L carries shared ∪ lane[i+1],
+//      and instance i >= L carries the shared items alone. A `lane` / `end`
+//      mark is a WALL: an operator binds only within its own scope, and runs
+//      merge only within a scope (`fire lane fire end` is two items in two
+//      scopes, not `fire×2`) — but a `count` Mod is record-wide wherever it
+//      was spoken, because count IS the fan and a lane is one instance of it,
+//      while any other mod inside a lane edits that instance's record.
+//      COPIES FAN, COLUMNS DO NOT: `SpellFan` spreads only the shared-only
+//      instances; an instance that carries a lane fires on the aim itself.
+//
+// The outermost box is always `hand`, so the whole sentence lowers to ONE cast.
+// Lanes on the hand are how two unrelated spells are said at once (`lane
+// explosive projectile end lane blood mend self end` is a bolt AND a graft),
+// and law L4 (cost additivity) attaches to those root lanes. There is no
+// sentence separator any more: `also` was dropped when rule 4 landed.
 //
 // Unary operators (`trail`, `aura`, `echo`, `null`, `mend`) take the ONE item
 // immediately before them, which may itself be a launch box (`explosive
@@ -122,7 +145,10 @@ enum class GlyphSort : uint8_t {
   Delivery,
   Mod,
   Operator,
-  Separator,   // `also`: closes the pile as a finished cast, starts a new one
+  // `lane` (rule 4): opens a segment of the pile that belongs to ONE instance
+  // of the box that closes it. The enum value kept its name; the word it
+  // names changed when `also` was dropped.
+  Separator,
 };
 constexpr int kGlyphSortCount = 6;
 const char* GlyphSortName(GlyphSort s);   // "matter" | "effect" | ...
@@ -281,11 +307,100 @@ struct GlyphDef {
   // so a modder's new carrier reads as itself; defaults to the glyph id.
   std::string noun;
 
+  // ---- separator (rule 4) ----
+  // false = `lane`, opens a lane scope; true = `end`, closes the innermost
+  // open one. Content, from the glyph's "scope" field.
+  bool scopeClose = false;
+
   // ---- mod ----
   ModField field = ModField::None;
   ModOp op = ModOp::Mul;
   int32_t amount = 1;
+
+  // ---- magnitude (docs/PLAN_spell_magnitude.md §2) ----
+  // Whether the page may set this word's MAGNITUDE, and the range and step it
+  // may take, all in per-mille of the authored quantity (1000 = the word as
+  // written). From the glyph's "magnitude" block, or the sort's default.
+  bool graded = false;
+  int32_t magMin = 1000, magMax = 1000, magStep = 1000;
+  // The magnitude a word has when nothing says otherwise: 1000 for every word
+  // that existed before magnitudes, the component's natural value for a
+  // SIGNED one (`lift` is 1 g of lift, `speed` is x2). A serialized word
+  // omits its suffix exactly when it is at this value.
+  int32_t magDefault = 1000;
+  // Loadable (old pages keep working) but not offered in the page's word
+  // column: the words PLAN_spell_magnitude M2 replaced with one signed
+  // component (`float`/`heavy` -> `lift`, `swift`/`slow` -> `speed`,
+  // `implode` -> `wind`).
+  bool hidden = false;
 };
+
+// ---- magnitude (docs/PLAN_spell_magnitude.md §2) -------------------------------
+// A word's magnitude is per-mille of its authored quantity: 1000 is the word as
+// written, 500 half of it, 2000 double. It rides beside multiplicity, so an
+// item's effective scale is `n × mag / 1000` — and at 1000 every formula that
+// reads it is the integer-`n` formula it replaced, exactly (law L-M0).
+constexpr int32_t kMagOne = 1000;
+// "Nothing was said": the word takes its glyph's `magDefault` at parse.
+constexpr int32_t kMagUnset = INT32_MIN;
+struct GlyphLibrary;
+
+// ---- timing (docs/PLAN_spell_magnitude.md §4, M3) ------------------------------
+// WHEN a payload item fires, relative to the carrier it rides in. A property
+// of the item (a word, an operator group or a nested box), not a word of its
+// own: `explosive!bounce` explodes at every bounce, `projectile!every10` is a
+// child bolt fired every 10 ticks of the parent's flight, `fire+20` sprays 20
+// ticks after it would have. Only a FLIGHT carrier has bounces, a life and a
+// launch; on any other carrier every item fires when the carrier resolves, and
+// the delay still applies.
+enum class SpellTrigger : uint8_t {
+  Hit = 0,   // when the carrier resolves (impact, fuse, an orb's expiry): today
+  Bounce,    // at every bounce, from the bounce point along the rebound
+  Expire,    // when the carrier's life runs out, whether or not it resolves
+  Launch,    // at the muzzle, the moment the carrier is born
+  Every,     // every `every` ticks of flight
+};
+constexpr int kSpellTriggerCount = 5;
+const char* SpellTriggerName(SpellTrigger t);   // "hit" | "bounce" | ...
+struct SpellTiming {
+  SpellTrigger trigger = SpellTrigger::Hit;
+  int32_t every = 0;    // Every: the period, ticks (>= 1)
+  int32_t delay = 0;    // ticks after the trigger before it happens (0..maxDelayTicks)
+  bool IsDefault() const { return trigger == SpellTrigger::Hit && delay == 0; }
+  bool operator==(const SpellTiming& o) const {
+    return trigger == o.trigger && every == o.every && delay == o.delay;
+  }
+  bool operator!=(const SpellTiming& o) const { return !(*this == o); }
+};
+// The suffix a timing serializes to: "" | "!bounce" | "!every10" | "+20" | "!expire+5".
+std::string TimingSuffix(const SpellTiming& t);
+// The words a player reads: "on hit" | "at each bounce" | "every 10 ticks, 20 ticks later".
+std::string TimingPhrase(const SpellTiming& t);
+// Clamp to the glyph's range and snap to its step (an ungraded glyph is 1000).
+int32_t ClampMagnitude(const GlyphDef& g, int32_t mag);
+// `float@0.5` -> ("float", 500). No suffix -> kMagUnset. A malformed number
+// -> kMagUnset. Not clamped here: that needs the glyph. Stops at a timing
+// suffix (`!`, `+`).
+void SplitMagnitude(const std::string& word, std::string& id, int32_t& mag);
+// A SERIALIZED WORD, whole: `id[@mag][!trigger[N]][+delay]`. Resolves the id
+// against the library (-1 when it names no glyph), the magnitude to the
+// glyph's default when absent and clamped otherwise, and the timing (clamped
+// to the budgets). The one parser every page path goes through.
+int ParseWord(const GlyphLibrary& lib, const std::string& word, int32_t& mag,
+              SpellTiming& timing);
+// ...and its inverse: suffixes only where they differ from the default.
+std::string SerializeWord(const GlyphDef& g, int32_t mag, const SpellTiming& timing);
+// For callers with no timing: `SerializeWord(g, mag, {})`.
+std::string WordWithMagnitude(const GlyphDef& g, int32_t mag);
+// A magnitude as the decimal the page shows and writes: 500 -> "0.5", 2250 -> "2.25".
+std::string MagnitudeDecimal(int32_t mag);
+// What this word does at this magnitude, in the units a player reads:
+// "gravity -0.50 g", "speed x1.5", "power 330", "3 voxels". `n` is the
+// multiplicity. Empty for a glyph with nothing to say.
+std::string MagnitudeLabel(const GlyphLibrary& lib, int glyph, int32_t n, int32_t mag);
+// THE WORD PRICE AT A MAGNITUDE, and it is CONVEX: word × (mag/1000)², rounded
+// up, at least 1 for a word that costs anything. Exactly `word` at 1000.
+int32_t MagnitudeWordCost(int32_t word, int32_t mag);
 
 // A conjoined glyph / grimoire starter page: a saved list of glyph names that
 // speaks as if you had spoken them in order (plan §12b). Indices here are
@@ -305,6 +420,9 @@ struct SpellBudgets {
   int32_t maxLifetimeTicks = 300;
   // R1's cap: past it an extra utterance is free and does nothing.
   int32_t maxMultiplicity = 6;
+  // ---- timing (M3) ------------------------------------------------------------
+  int32_t maxDelayTicks = 300;   // a delay is clamped to this
+  int32_t minEveryTicks = 2;     // the shortest `every` period
   // shotgun's cap: instances per cast (3^N grows fast).
   int32_t maxInstances = 27;
   // ---- spray, the coercion of free Matter ---------------------------------
@@ -324,7 +442,7 @@ struct SpellBudgets {
   int32_t maxStatusPerCaster = 4;
   // ---- the grimoire (plan §12b), P5 -----------------------------------------
   int32_t maxGrimoirePages = 32;
-  int32_t maxMacroWords = 16;
+  int32_t maxMacroWords = 32;
   int32_t maxMacroDepth = 4;
 };
 
@@ -346,6 +464,12 @@ struct GlyphLibrary {
     for (size_t i = 0; i < glyphs.size(); i++)
       if (glyphs[i].id == id) return (int)i;
     return -1;
+  }
+  // A SERIALIZED word, which may carry a magnitude (`float@0.5`): the glyph it
+  // names, or -1. The magnitude itself is `SplitMagnitude`'s business.
+  int FindWord(const std::string& word) const {
+    const size_t at = word.find_first_of("@!+");
+    return Find(at == std::string::npos ? word : word.substr(0, at));
   }
   const GlyphDef* At(int i) const {
     return (i >= 0 && i < (int)glyphs.size()) ? &glyphs[i] : nullptr;
@@ -369,13 +493,39 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
 // the cast key applies "cast" to what is on top.
 struct SpellStack {
   std::vector<int> spoken;   // glyph indices, in spoken order
+  // Per-word MAGNITUDE (per-mille) and TIMING, parallel to `spoken`. Either
+  // may be SHORTER than `spoken` - a missing magnitude is kMagUnset (the
+  // glyph's default), a missing timing is the default - so every site that
+  // only ever pushes plain words keeps working untouched.
+  std::vector<int32_t> mags;
+  std::vector<SpellTiming> timing;
 
-  void Clear() { spoken.clear(); }
+  void Clear() {
+    spoken.clear();
+    mags.clear();
+    timing.clear();
+  }
   bool Empty() const { return spoken.empty(); }
+  int32_t MagAt(size_t i) const { return i < mags.size() ? mags[i] : kMagUnset; }
+  SpellTiming TimingAt(size_t i) const { return i < timing.size() ? timing[i] : SpellTiming{}; }
+  void Push(int glyph, int32_t mag = kMagUnset, SpellTiming tm = {}) {
+    // A side vector is materialized the first time a word needs it, padded
+    // with defaults for the words before, and kept in step from then on.
+    const bool wantMag = mag != kMagUnset || !mags.empty();
+    const bool wantTiming = !tm.IsDefault() || !timing.empty();
+    if (wantMag) mags.resize(spoken.size(), kMagUnset);
+    if (wantTiming) timing.resize(spoken.size());
+    spoken.push_back(glyph);
+    if (wantMag) mags.push_back(mag);
+    if (wantTiming) timing.push_back(tm);
+  }
 };
 // Bound so a stuck key cannot grow the stack without limit (rule 2 applies to
-// UI state too — an unbounded stack is an unbounded mana cost).
-constexpr int kSpellStackMax = 16;
+// UI state too — an unbounded stack is an unbounded mana cost). 32 since rule
+// 4: a socket costs TWO words (`lane` … `end`), and three sockets holding two
+// effects each, a fan, a delivery and a mod is a sentence a player will want
+// to say.
+constexpr int kSpellStackMax = 32;
 
 // ---- the parse tree (the three rules) ----------------------------------------
 
@@ -386,12 +536,29 @@ constexpr int kSpellStackMax = 16;
 struct SpellNode {
   int glyph = -1;        // library index; on a box, the delivery (-1 = hand)
   int32_t n = 1;         // multiplicity (runs merge), capped
+  // MAGNITUDE, per-mille (PLAN_spell_magnitude §2). Part of NodeKey when it is
+  // not 1000, so only equal magnitudes merge; always 1000 on a box.
+  int32_t mag = kMagOne;
+  // TIMING (M3): when this item fires in the carrier that holds it. On a box
+  // it is the box's own (spoken on its delivery word), on a group the
+  // operator word's. Part of NodeKey when not the default.
+  SpellTiming timing;
   bool group = false;    // an operator application
   bool box = false;      // a delivery box: `glyph` is the delivery, `items`
                          // the pile it closed (nouns AND pending mods)
   int left = -1;         // operator child, -1 = empty slot (or no slot)
   int right = -1;
   std::vector<int> items;   // box: the closed pile, first-seen order, merged
+  // RULE 4: which segment of the pile this item was spoken in. 0 = the shared
+  // segment; 1..L = the segment opened by the Nth `lane` word, which belongs
+  // to instance N-1 of the box that closes the pile. Part of NodeKey, so two
+  // identical words in different lanes never merge.
+  int32_t lane = 0;
+  // Box only: TWO spoken positions per lane it closed, in lane order — the
+  // `lane` word, then the `end` word (-1 when the sentence ended and the lane
+  // was closed implicitly). So `laneAt.size() == 2 * L`, and the HUD highlight
+  // and the linearizer both have the marks they need.
+  std::vector<int> laneAt;
   bool complete = true;  // false: a required slot is empty
   // Spoken span [first, last] of this item and everything under it, for the
   // HUD highlight and the L6 law; `at` is the operator/delivery word's own
@@ -400,9 +567,12 @@ struct SpellNode {
   int at = -1;
 };
 
-// One sentence: everything up to an `also`, or up to the end. Its root is
-// ALWAYS the implicit `hand` box (rule 3), so `delivery`/`weight` below are
-// the hand's and the nesting lives inside `bag`.
+// THE sentence. Since `also` was dropped for rule 4, a spoken sequence is
+// exactly ONE clause (`clauses` holds 0 entries for silence, 1 otherwise) —
+// the vector survives so the UI and the gates keep their shape, and so that a
+// future second root is a change of one number rather than of every loop. Its
+// root is ALWAYS the implicit `hand` box (rule 3), so `delivery`/`weight`
+// below are the hand's and the nesting lives inside `bag`.
 struct SpellClause {
   int root = -1;         // the outermost box node
   int delivery = -1;     // == nodes[root].glyph; -1 = hand, and always is
@@ -432,10 +602,13 @@ enum class BracketStyle : uint8_t {
   Hud,          // ASCII for the pixel font: x2, |, ><, <, DELIVERY in caps
 };
 // An item with its brackets: `fire×2`, `(dirt ⋈ water)`, `(_ ◂trail)`, and a
-// box as `[ ... **projectile**]`.
+// box as `[ ... **projectile**]`. A lane prints as `/ ... /` in BOTH styles
+// (`[explosive / sand / / fire / **projectile**]`), one mark per word the
+// sentence actually contains — one spelling, because the oracle JSON and this
+// parser compare strings.
 std::string ShowNode(const GlyphLibrary& lib, const SpellTree& t, int node,
                      BracketStyle style = BracketStyle::Oracle);
-// The whole sentence: the hand box's items, clauses (`also`) joined by ‖.
+// The whole sentence: the hand box's items, each lane wrapped in ` / `.
 std::string BracketSpell(const GlyphLibrary& lib, const SpellTree& t,
                          BracketStyle style = BracketStyle::Oracle);
 
@@ -449,6 +622,11 @@ struct EffectInst {
   SpellVerb verb = SpellVerb::None;
   int glyph = -1;            // the glyph that authored it (parameters)
   int32_t n = 1;             // multiplicity: the verb's declared scale axis ×n
+  // Magnitude, per-mille: the axis is scaled by n × mag / 1000 (`Scale()`).
+  int32_t mag = kMagOne;
+  // When it fires in its carrier (M3). Only a FLIGHT carrier's resolve filters
+  // by it; the delay is honoured everywhere, by ApplySpellEffect.
+  SpellTiming timing;
   bool complete = true;      // false: incomplete operator, charged, does nothing
   // Materials. spray/place/mend use matA; convert is matA -> matB.
   uint32_t matA = 0, matB = 0;
@@ -468,8 +646,18 @@ struct EffectInst {
   ModOp modOp = ModOp::Mul;
   int32_t modAmount = 0;
   int32_t modN = 1;
+  int32_t modMag = kMagOne;  // the sustained mod's magnitude
   int node = -1;             // tree node, for the readout
+
+  // THE EFFECTIVE SCALE, per-mille: multiplicity × magnitude. 1000·n exactly
+  // when no magnitude was set.
+  int32_t Scale() const {
+    const int64_t v = (int64_t)n * mag;
+    return v > 0x3FFFFFFF ? 0x3FFFFFFF : (int32_t)v;
+  }
 };
+
+struct SpellLane;
 
 // The delivery record a live cast carries. Mods are field edits on it.
 struct DeliveryRec {
@@ -483,7 +671,16 @@ struct DeliveryRec {
   int32_t gravityMille = 0;  // per-mille of g (flight), or on the anchored body
   int32_t fuseTicks = 0;
   int32_t reach = 0;
-  int32_t count = 1;         // instances (shotgun)
+  // THE FAN, AND WHAT THE NUMBER MEANS DEPENDS ON WHERE THE RECORD IS
+  // (2026-09-22). On a TOP-LEVEL record `count` is the number of BRANCHES -
+  // the sockets the page draws, the columns the fan opens into. On a record
+  // inside `lanes[k]` it is that ONE branch's sub-bolt multiplier, which is
+  // how `shotgun` on a branch splits the branch instead of the box. A lane
+  // record's own `lanes` is empty by construction, so there is exactly one
+  // level of each reading and no ambiguity. `RecInstances` is the first,
+  // `LaneSplit` the second, and `RecBolts` - the SUM - is what every price,
+  // budget and cap must use.
+  int32_t count = 1;         // branches here, sub-bolts inside a lane
   int32_t bounces = 0, pierce = 0, seek = 0;
   int32_t radiusMille = 1000;   // wide: resolve radius multiplier
   bool body = false;         // rigid body flight (bomb)
@@ -493,6 +690,21 @@ struct DeliveryRec {
   std::vector<EffectInst> trail;
   int32_t trailBudget = 0;
   int32_t trailEvery = 1;    // mark every Nth voxel of travel
+  // RULE 4: one entry per `lane` segment of the pile this record's box closed,
+  // in SPOKEN order. Lane i belongs to instance i. A vector rather than a
+  // by-value member for the same reason `EffectInst::launch` is one: a lane
+  // holds a record, and a record holds effects that hold records.
+  // INVARIANT: a lane's own `rec.lanes` is always empty (one level only).
+  std::vector<SpellLane> lanes;
+};
+
+// One instance's private segment of the pile (rule 4): the shared record with
+// this lane's Mods applied on top and this lane's trail merged in, plus the
+// nouns only this instance carries. `InstanceCast` is the one place that puts
+// the two halves back together.
+struct SpellLane {
+  DeliveryRec rec;
+  std::vector<EffectInst> extra;
 };
 
 // One clause, lowered: what Cast() runs, what a projectile carries, what
@@ -500,7 +712,11 @@ struct DeliveryRec {
 struct SpellCast {
   DeliveryRec delivery;
   std::vector<EffectInst> payload;
-  int32_t instances = 1;     // == delivery.count, capped
+  int32_t instances = 1;     // BRANCHES: == delivery.count, capped
+  // BOLTS: the branches with each branch's own split counted, which is what
+  // actually flies and therefore what every price and budget is charged on.
+  // Equal to `instances` for every sentence with no count inside a lane.
+  int32_t bolts = 1;
   // Price, split the way the HUD shows it (plan §9).
   int32_t wordCost = 0;
   int32_t tariff = 0;        // payload tariff × instances (P1)
@@ -520,14 +736,42 @@ struct SpellCast {
   // Mod words that landed on a record with nothing to edit (rule 3: the hand
   // has no speed, no fuse, nothing to bounce). Charged; named in the readout.
   std::vector<int> wastedMods;
+  // ...and mod words wasted by their POSITION rather than by their field: a
+  // second count word in a scope that already fans. Tree node indices, not
+  // glyph ids, because the whole point is that one `shotgun` works and the
+  // other does not - slashing them by glyph would slash both.
+  std::vector<int> wastedNodes;
   int clause = -1;
 
   int32_t Cost() const { return wordCost + tariff + carryCost; }
 };
 
+// THE PRICE OF ONE BOX, kept beside the cast list so the graph page can draw
+// a subtotal under every join (PLAN_spell_graph §4). Derived data: filled by
+// `LowerBox` on the way out, never read by the VM.
+struct BoxPrice {
+  int node = -1;             // the SpellTree node of the box
+  int32_t wordCost = 0, tariff = 0, carryCost = 0;
+  int32_t instances = 1, leaves = 1;
+  int32_t bolts = 1;         // instances with each branch's own split counted
+  // How many bolts each BRANCH fires, in instance order - the per-branch half
+  // of `bolts`. Derived data for the page: a branch with a split of its own is
+  // drawn differently from one without, and the drawing may not re-derive it by
+  // reaching into the VM's records.
+  std::vector<int32_t> laneSplits;
+  bool instancesClamped = false;
+};
+
 struct CastList {
   SpellTree tree;
   std::vector<SpellCast> casts;
+  // One entry per box in `tree`, the hand root included, in lowering order.
+  std::vector<BoxPrice> boxPrice;
+  const BoxPrice* PriceOf(int node) const {
+    for (const BoxPrice& p : boxPrice)
+      if (p.node == node) return &p;
+    return nullptr;
+  }
   int32_t wordCost = 0, tariff = 0, carryCost = 0;
   int32_t manaCost = 0;      // the total the HUD shows and ResolveCast charges
   bool priceUnknown = false;
@@ -547,8 +791,24 @@ int32_t EffectVolume(const GlyphLibrary& lib, const EffectInst& e);
 // the material's arcane value and the budgets' rates. `anything` prices as 0
 // here and is billed when it resolves (SpellEmission::billOnResolve).
 int32_t EffectTariff(const GlyphLibrary& lib, const EffectInst& e);
-// Fills a cast's tariff and carry from its payload, trail and instances.
+// Fills a cast's tariff and carry from its payload, trail and instances. With
+// lanes (rule 4) the tariff is the SUM over instances of tariff(shared ∪
+// lane_i) rather than tariff(shared) × instances, which is the same number
+// when there are no lanes.
 void PriceCast(const GlyphLibrary& lib, SpellCast& cast);
+// HOW MANY INSTANCES a record fires: max(count, lanes), clamped. One place,
+// because the fan loops, the pricing and the volume bound must agree.
+int32_t RecInstances(const GlyphLibrary& lib, const DeliveryRec& d);
+// How many sub-bolts branch `k` of `d` fires (1 for a branch with no lane of
+// its own), and the total over every branch - the TRUE bolt count of the box.
+int32_t LaneSplit(const GlyphLibrary& lib, const DeliveryRec& d, int32_t k);
+int32_t RecBolts(const GlyphLibrary& lib, const DeliveryRec& d);
+// THE CAST INSTANCE i ACTUALLY FLIES WITH (rule 4): the shared cast for
+// i >= L, and for i < L the lane's record with the lane's nouns appended to
+// the shared payload. Called in every fan loop; returns `cast` unchanged when
+// the cast has no lanes, so a sentence without `lane` behaves bit-for-bit as
+// it did.
+SpellCast InstanceCast(const SpellCast& cast, int32_t i);
 // The first material a cast carries (a spray, a convert's product, a trail
 // mark), for drawing the bolt; 0 when it carries none.
 uint32_t CastTintMaterial(const SpellCast& cast);
@@ -583,6 +843,7 @@ struct SpellProjectile {
   bool resting = false;
   bool alive = true;
   int32_t gen = 0;
+  int32_t age = 0;           // ticks of flight, for `every` items (M3)
   // The cast's instability, carried to the impact: an unstable convert lands
   // a melt-mode share wherever it resolves, not only at the hand.
   int32_t instability = 0;
@@ -623,6 +884,7 @@ struct SpellBomb {
   int32_t instability = 0;
   int32_t gen = 0;
   uint64_t casterId = 0;
+  int32_t age = 0;           // ticks alive, for `every` items (M3)
 };
 
 // What the VM may ask the owner about bodies, one tick latent, without knowing
@@ -992,6 +1254,8 @@ class SpellSystem {
 SpellFxVec SpellWobble(SpellFxVec dirFx, int32_t instabilityMille,
                        uint32_t tick, uint64_t casterId);
 // A fanned copy of `dir` for instance `i` of `count` (shotgun). Instance 0 is
-// the aim itself.
+// the aim itself. COPIES FAN, COLUMNS DO NOT (rule 4): the callers only fan an
+// instance whose payload is the shared-only copy, so a projectile in its own
+// lane flies at the crosshair rather than a few degrees off it.
 SpellFxVec SpellFan(SpellFxVec dirFx, int32_t i, int32_t count, uint32_t tick,
                     uint64_t casterId);

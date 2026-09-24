@@ -102,7 +102,7 @@
         "extinguisher",
         "conductive"
       ],
-      "comment": "Water darkens what it soaks rather than tinting it, so the stain colour is a desaturated near-grey: a wet patch should read as the same ground, wetter. amount 15 is the CEILING water would apply on its own; how deep any given ground actually gets is that ground's absorb capacity, which is always the smaller of the two. washes lets running water rinse blood out instead of relabelling it as wet. The `coat` block is the body side of the same substance: wet DRIES, a level every 4 seconds, and a wet foot tracks nothing (shed 0) — a puddle is not a footprint.",
+      "comment": "Water darkens what it soaks rather than tinting it, so the stain colour is a desaturated near-grey: a wet patch should read as the same ground, wetter. amount 15 is the CEILING water would apply on its own; how deep any given ground actually gets is that ground's absorb capacity, which is always the smaller of the two. washes lets running water rinse blood out instead of relabelling it as wet. The `coat` block is the body side of the same substance: wet DRIES (decay 2: half the voxels lose a level every 2 s, so a soaked limb is dry in ~60 s), and a wet foot tracks nothing (shed 0) — a puddle is not a footprint. On a body, water also rinses foreign coats before it wets, wicks into the blood beside a wet patch, and drips off undersides (MobSystem::WetOneLimb).",
       "stain": {
         "type": "wet",
         "color": "#6d6f73",
@@ -112,8 +112,10 @@
         "washes": true
       },
       "coat": {
-        "decay": 4,
+        "decay": 2,
         "shed": 0,
+        "//opacity": "How strongly a wet coat SHOWS on a body (0..1; blood and the rest default to 1). The soak amount still runs the full 0..15 so washing, wicking and drying count the same; only the look is scaled. At 1 a soaked person read as a grey statue; 0.4 was still too visible (owner, 2026-09-23), halved to 0.2.",
+        "opacity": 0.2,
         "effects": []
       },
       "molten": "steam"
@@ -134,6 +136,22 @@
         "flammable",
         "dissolvable"
       ],
+      "//stain": "OIL STAINS LIKE BLOOD (2026-09-23): a spill soaks into absorbent ground and leaves a dark slick, and a pour, splash or wade leaves a coat on a body.",
+      "stain": {
+        "type": "oil",
+        "color": "#3b2a12",
+        "amount": 6,
+        "chance": 70,
+        "consume": 4
+      },
+      "//coat": "A FUEL COAT. Oil's own rule (oil + tag:hot -> fire, 350) is asked of every oiled body voxel with its six faces as the neighbours (mob.cpp BurnOneLimb section 0b), so a coat is inert until heat touches it and then FLASHES: the film is spent, a flame goes up off it, and the voxel under it catches straight past the sear (skin -> flesh_burning). The flame walks the rest of the coat voxel to voxel at oil's own odds, so an oiled arm goes up along the whole oiled patch in a few ticks instead of cooking slowly from one face. Laid on the SURFACE only (SoakLimb), so it cannot flash over from inside the limb. Oil does not dry: decay 30 s a level, floor 2 (a greasy sheen stays until washed). shed 250: oily feet track a little. opacity 0.8, a dark gloss rather than paint. Effects: slippery -- oily SOLES cost ground grip (player.slipGrip, ramped by the sole coat fraction; session.cpp).",
+      "coat": {
+        "decay": 30,
+        "decayFloor": 2,
+        "shed": 250,
+        "opacity": 0.8,
+        "effects": ["slippery"]
+      },
       "molten": "fire"
     },
     {
@@ -234,7 +252,23 @@
       ],
       "tags": [
         "hot"
-      ]
+      ],
+      "//stain": "LAVA ON A BODY (2026-09-23). bodyOnly, as acid: the slot exists so a body can wear it and draw it; the GPU pack gets no type bits, so lava never paints the ground it flows over.",
+      "stain": {
+        "type": "lava",
+        "color": "#ff6a1c",
+        "amount": 10,
+        "bodyOnly": true
+      },
+      "//coat": "A HOT COAT. Lava is tag:hot, and a hot coat is read as what is OUTSIDE every exposed face of the voxel wearing it (mob.cpp BurnOneLimb, 'a hot coat is what is outside me'), a full world voxel wide -- so skin sears and flesh catches under it through their own authored heat rules, and the fire then spreads through the body the ordinary way. It also BITES, as acid does, through lava's own rule `lava + tag:organic -> fire` (reactions.json): a voxel under the coat goes up as flame and the coat runs into the voxels behind it, `depth` 0.6 world voxels for a full coat. Bone is not organic, so the skeleton is what is left. decay 0.4 s/level: it cools off a body in a few seconds (a full coat in ~6-12 s). glow 230 + pulse 0.7: it reads as molten, not as orange paint. contact 60: wading in lava coats you, on top of the pool's own inbound bite.",
+      "coat": {
+        "decay": 0.4,
+        "opacity": 1,
+        "glow": 230,
+        "pulse": 0.7,
+        "contact": 60,
+        "depth": 0.6
+      }
     },
     {
       "id": "acid",
@@ -249,7 +283,23 @@
         "#68d82c",
         "#93ff4e"
       ],
-      "tags": []
+      "tags": [],
+      "//stain": "ACID ON A BODY (2026-09-23). bodyOnly: a LIQUID with a coat and no ground stain -- the stain slot exists so a body can wear it and draw it, and the GPU pack gets no type bits, so acid eats rock exactly as before and never paints it (materials.cpp ParseStain). Without this block a pour, a splash or a pool could not leave acid on a creature at all: every coat write refuses a material with no stain slot.",
+      "stain": {
+        "type": "acid",
+        "color": "#6dff2e",
+        "amount": 6,
+        "bodyOnly": true
+      },
+      "//coat": "A CORROSIVE COAT. Because acid's own rules (reactions.json: acid + tag:organic at 125, + tag:dissolvable at 45, + iron at 10) rewrite body matter, a coat of it is evaluated against the voxel it sits on every tick exactly as a grid cell of acid would be (mob.cpp BurnOneLimb section 3) -- flesh, skin, cloth and leather go fast, anything dissolvable slowly, iron pits, bone and steel shrug it off, and nothing here names acid. `depth` 0.4: a FULL coat (15) eats 0.4 of a world voxel (~4 cm, three human lattice layers: skin, flesh, muscle -- to the bone) and is then spent; a splash (6) takes the skin and some flesh. Each voxel eaten carries the coat into the voxels behind it a little weaker, costed per WORLD voxel so a finely-skinned creature is not eaten deeper than a coarse one. Measured: at 0.75 a single splash on a thigh (one world voxel across) ate to the bone and the leg collapsed off. decay 0.15 s/level (owner, 2026-09-23: acid stains must go away on their own in a few seconds, bone included): with DryOneLimb's half-the-voxels-per-period roll a splash (6) is gone in about 2 s and a full coat in about 5; what it has not eaten by then it never will. The fast clock also caps the depth in TIME, not only by amount. opacity 0.5 + glow + pulse: a translucent green film that breathes, so acid on skin reads at a glance as something happening rather than as paint. contact 15: standing in a pool coats you slowly (the ground chance is 0 because of bodyOnly) -- SLOWLY on purpose, because the pool is already eating you through the grid's own inbound pass and the coat is the film you see and what keeps eating once you step out. At 120 the two stacked and an ankle-deep bath ate every submerged limb to the bone in 20 ticks (armor-react's plated creature died of its hips).",
+      "coat": {
+        "decay": 0.15,
+        "opacity": 0.5,
+        "glow": 110,
+        "pulse": 1.4,
+        "contact": 15,
+        "depth": 0.4
+      }
     },
     {
       "id": "ice",
@@ -1190,12 +1240,12 @@
         "#6a5f48",
         "#3a352a"
       ],
-      "tags": [
-        "organic",
-        "dissolvable"
-      ],
+      "//tags": "NOT organic, NOT dissolvable (2026-09-22), and that is the whole of what makes a skeleton outlast its body in acid: acid eats `tag:organic` at 125 and `tag:dissolvable` at 45, and the rule file has no exclusion syntax, so the tags are the only lever. Cost: fungus (which spreads over tag:organic) no longer creeps onto bone.",
+      "tags": [],
       "//woundHp": "Three times skin. Bone is the deepest thing a wound reaches on most limbs, so a blade or blast that takes bone out has done materially more than one that skimmed the surface.",
       "woundHp": 3,
+      "//bareBlood": "Half of the bone a body pass (acid, fire, rot) uncovers is left wearing the creature's blood (fresh-cut amount, gore.stainCutAmount), rolled once per voxel by position, so a skeleton showing through a dissolved arm reads as the inside of a body. Cuts already smear their own bone (SoakCut).",
+      "bareBlood": 0.5,
       "//rotRate": "THE ROT CHEWS THROUGH BONE, AT HALF SPEED. Bone's `rubble` is dust rather than blood, so it is NOT in MobDef::tissue and before this it was simply invisible to Mob::InfectStep -- an infection ate a limb down to a clean skeleton and then stopped forever. This is the one field that makes it eligible, and 0.5 is literally 'half as likely as flesh to be taken in any given draw'. The wound SOAK still refuses bone (that gate is still `tissue`, on purpose, so a sword hole shows bone through the blood instead of turning it red); only the infection reads this.",
       "rotRate": 0.5
     },
@@ -3270,6 +3320,95 @@
       "tags": [
         "flammable",
         "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "UNDERCLOTH: the base human's shorts, and FLESH IN EVERYTHING BUT LOOK (owner, 2026-09-23). Skin's density, hardness and rubble (blood), so it weighs, cuts, bites, bleeds, wounds and rots exactly as the skin beside it would -- `rubble: blood` is what makes MobDef::tissue count it -- and its burn chain in reactions.json copies flesh's numbers rule for rule. Colours and tints are linen's, which is the one thing it keeps of cloth. NOT PAINTABLE: id past 127 is the .vox art palette, so human.vox paints the shorts as `linen` and the human sidecar's anatomy.garmentsBecome rewrites them to this at load. Linen itself (the peasant wardrobe) is untouched.",
+      "id": "undercloth",
+      "class": "solid",
+      "far": "linen",
+      "density": 1010,
+      "hardness": 8,
+      "rubble": "blood",
+      "colors": [
+        "#7a6a4e",
+        "#665843",
+        "#8d7c5c"
+      ],
+      "tints": [
+        "#7a6a4e",
+        "#d8cdb4",
+        "#a89a78",
+        "#5c5138",
+        "#8a6a5a",
+        "#6a7a6a",
+        "#6a6a80",
+        "#3a332a"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Undercloth seared: flesh_cooked's twin (same density, hardness, rubble, tags) in scorched-linen colours, so a singed pair of shorts still reads as shorts.",
+      "id": "undercloth_seared",
+      "class": "solid",
+      "far": "flesh_cooked",
+      "density": 1000,
+      "hardness": 7,
+      "rubble": "blood",
+      "colors": [
+        "#5e4a34",
+        "#4f3e2b",
+        "#6c563c"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Undercloth alight: flesh_burning's twin (hot, emission 170, same body numbers) in linen_burning's flame colours.",
+      "id": "undercloth_burning",
+      "class": "solid",
+      "far": "flesh_burning",
+      "density": 900,
+      "hardness": 4,
+      "rubble": "ash",
+      "emission": 170,
+      "colors": [
+        "#ff8a2a",
+        "#e05c15",
+        "#ffb347"
+      ],
+      "tags": [
+        "hot",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "Undercloth charred: flesh_charred's twin (structurally weak, not tagged flammable, relights only under a four-face front) in linen_charred's neutral-cool black, so it still separates from the warm char of the flesh beside it. Sustained fire takes it on to linen_charred, the inert terminus, as flesh_charred goes to flesh_cinder.",
+      "id": "undercloth_charred",
+      "class": "solid",
+      "far": "linen_charred",
+      "density": 620,
+      "hardness": 3,
+      "rubble": "ash",
+      "colors": [
+        "#262326",
+        "#1c1a1d",
+        "#322e33"
+      ],
+      "tags": [
         "dissolvable"
       ],
       "molten": "fire"

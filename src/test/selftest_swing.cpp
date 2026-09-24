@@ -55,6 +55,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -2354,9 +2356,13 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
     }
 
     // ---- the style's own claims (npc-styles' branch logic) -----------------
-    const float wantAz = std::fabs(sty.cut.az);
-    const float wantEl = std::fabs(sty.cut.el);
-    const float wantR = std::fabs(sty.cut.reach);
+    // Over the WHOLE path: a cut may be several legs (strokes.h "A CUT IS A
+    // PATH"), and which channel a stroke travels in is a fact about its total
+    // displacement rather than about its opening leg.
+    const StrokeSegment cutAll = sty.CutTravel();
+    const float wantAz = std::fabs(cutAll.az);
+    const float wantEl = std::fabs(cutAll.el);
+    const float wantR = std::fabs(cutAll.reach);
     const float dr = rMax > rMin ? rMax - rMin : 0.0f;
     const std::string n = "\"" + sty.name + "\"";
     check(cutTicks >= 2, "style " + n + " spent time cutting");
@@ -2370,7 +2376,7 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
     // arithmetic rather than by name.
     const float cutPx = (wantAz / melee.tuning.aimGainX +
                          wantEl / melee.tuning.aimGainY) /
-                        (float)std::max(sty.cut.ticks, 1) / kTickDt;
+                        (float)std::max(cutAll.ticks, 1) / kTickDt;
     if (cutPx > melee.tuning.commitSpeed * 1.5f)
       check(sawSlash, "style " + n +
                           " committed Slash (its authored cut speed demands "
@@ -2847,6 +2853,708 @@ Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// =============================================================================
+// swing-smooth — THE WEAPON MOVES SMOOTHLY AT EVERY POINT OF EVERY STYLE
+// =============================================================================
+//
+// THE REPORT THIS EXISTS FOR, in the owner's words: "many of them will look
+// good for like 60% of the animation and then the sword will spin / clip
+// through things / teleport around super crazy fast."
+//
+// Every gate in this file before it asserts on where a stroke ENDS UP — the
+// arc it swept, the channel it travelled in, the pose it started from. None of
+// them could see a stroke that arrives in the right place by a route with a
+// step in it, and all three of the faults behind that report were exactly
+// that: a one-tick discontinuity somewhere in the middle or at the very end.
+//
+// So this one asserts on the DERIVATIVE, per tick, over every authored style
+// replayed through the shared runner:
+//
+//   * the HAND's travel may not CHANGE much from one tick to the next
+//   * nor the TIP's
+//   * the blade's DIRECTION may not turn more than so far in one tick
+//   * the blade's ROLL may not either — this is the one that caught the flat's
+//     sign flip, which is invisible in position and is the whole "spin"
+//   * the arm CLAIM may not step — PoseWeight, which the rig blends the entire
+//     IK solve by, so a 1 -> 0 step is the arm teleporting to the walk cycle
+//
+// The ceilings are in tests/baseline.json so tuning them costs no rebuild, and
+// each failure prints the STYLE, the TICK, the PHASE and the measurement, so
+// a red line says where to look rather than that something is wrong.
+//
+// CPU-ONLY AND ASSET-LIGHT: it loads attack_styles.json (the styles ARE the
+// subject) and nothing else — no world, no rig, no GPU. Milliseconds.
+//
+// SMOOTHING STAYS AT ITS AUTHORED VALUES here, unlike every fixture above.
+// The other blocks turn it off because they assert on the mapping and the
+// easing is lag; this one asserts on CONTINUITY, and the easing is half of
+// what delivers it. Measuring the shipped feel means measuring the shipped
+// knobs.
+Status GateSwingSmooth(Ctx& c, std::string& detail) {
+  (void)c;
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("swing-smooth: FAILED %s\n", what.c_str());
+    }
+  };
+
+  StyleLibrary lib;
+  std::string log;
+  if (!LoadAttackStyles(AssetDir() + "/mobs/attack_styles.json", lib, log) ||
+      lib.empty()) {
+    detail = "attack_styles.json did not load";
+    std::printf("swing-smooth: SKIP (%s)\n%s", detail.c_str(), log.c_str());
+    return Status::Skip;
+  }
+
+  // The ceilings. Per TICK at 30 Hz, which is the rate both live feeders run
+  // the runner at (MobSystem::StepStroke's fixed 1/30, session.cpp's kTickDt).
+  //
+  // ---- WHY POSITION IS MEASURED AS AN ACCELERATION AND ANGLE IS NOT -------
+  //
+  // A committed cut legitimately moves the point six voxels in a thirtieth of
+  // a second — that is 180 vox/s, and `melee.fullSpeedMps` says full damage
+  // starts at 200. So a ceiling on a SINGLE tick's travel cannot separate "a
+  // fast sword" from "a teleport", and one tight enough to catch the second
+  // forbids the first. What distinguishes them is whether the speed ARRIVED:
+  // a real swing accelerates over several ticks, a discontinuity changes the
+  // travel-per-tick by the whole of it in one. So hand and point are bounded
+  // on the SECOND difference.
+  //
+  // The two ANGLES are not, and the asymmetry is real rather than an
+  // inconsistency. A blade's direction and roll have no equivalent of a
+  // committed cut's speed: the stroke only ever turns the blade as fast as the
+  // arm carries it, so a large first difference there IS the defect — it is
+  // the lean plane spinning about a stalled point, or the flat's sign
+  // flipping, both of which arrive at full size on one tick and leave on the
+  // next. Bounding their acceleration would let a 180-degree roll through as
+  // long as it took two ticks to do it.
+  const float maxHand =
+      (float)BaselineNumber("swingSmooth.maxHandAccelVox", 1.30);
+  const float maxTip =
+      (float)BaselineNumber("swingSmooth.maxTipAccelVox", 2.60);
+  const float maxDir = (float)BaselineNumber("swingSmooth.maxDirStepRad", 0.90);
+  const float maxRoll =
+      (float)BaselineNumber("swingSmooth.maxRollStepRad", 0.90);
+  const float maxWeight =
+      (float)BaselineNumber("swingSmooth.maxWeightStep", 0.20);
+  // ---- AND THE ROLL'S WHOLE JOURNEY, not just its worst step -------------
+  //
+  // A per-tick ceiling cannot see the defect this gate was written for. The
+  // blade's flat is `bladeDir x travel`, whose SIGN reverses when the travel
+  // does — every cut, at its end — and the rig then rolls the sword through
+  // 180 degrees to follow it. Smoothed on `bladeSmoothing`, that flip takes
+  // three or four ticks, so no single tick's step is remarkable and the total
+  // is a whole pi of roll the stroke never asked for. Summing the per-tick
+  // turn is what catches it: a cut that keeps its edge spends well under a
+  // radian of roll over the whole swing, and one that flips spends pi more.
+  const float maxRollArc =
+      (float)BaselineNumber("swingSmooth.maxRollArcRad", 1.60);
+
+  const float dt = 1.0f / 30.0f;
+  // A HELD BLADE'S GEOMETRY, not a bare arm: the lean machinery — which is
+  // where two of the three faults lived — only exists when `bladeLen_` is
+  // non-zero, and a fixture reporting its tip at its hand would exercise none
+  // of it. 5.5 voxels is the shipped sword (assets/items/sword.json's edge at
+  // 10 cm voxels), stated here rather than loaded because the claim is about
+  // the DRIVER and not about this week's art.
+  const Vec3 fixtureHand{-0.4f, -3.0f, -0.3f};   // x mirrored with the basis
+  const Vec3 fixtureTip = fixtureHand + Vec3{0, 5.5f, 0};
+
+  auto angleBetween = [](const Vec3& a, const Vec3& b) {
+    if (a.len() < 1e-5f || b.len() < 1e-5f) return 0.0f;
+    return std::acos(
+        std::clamp(a.normalized().dot(b.normalized()), -1.0f, 1.0f));
+  };
+  const char* kPhase[] = {"idle", "guard", "windup", "cut", "recover"};
+
+  int styles = 0;
+  float worstHand = 0, worstTip = 0, worstDir = 0, worstRoll = 0, worstW = 0;
+  float worstRollArc = 0;
+  int totalFlips = 0;
+  for (const AttackStyle& sty : lib.styles) {
+    // ONLY THE STYLES THE DRIVER CAN REPLAY WITHOUT A RIG. `StyleUsable` needs
+    // a Mob; here the question is narrower and is answered by the style: a
+    // natural weapon's stroke is driven through a part the fixture does not
+    // have, and a bite is an AIM effector whose whole motion happens in a
+    // channel this bladeless fixture cannot express. The held styles are the
+    // ones the owner's report is about and the ones with a blade to spin.
+    if (!(sty.weapon.empty() || sty.weapon == "held")) continue;
+    styles++;
+
+    MeleeState m;
+    ApplyMeleeTuning(m.tuning);
+    m.SetStroke(fixtureHand, fixtureTip, Vec3{0, 0, 1}, kRestReach);
+    m.SetHandSign(1.0f);
+
+    StrokeCursor cur;
+    // A FIXED SEED off the style's NAME, for the reason npc-styles pins its
+    // own: the tempo jitter scales the tick counts, so an unpinned seed makes
+    // "the same style" a different number of ticks from run to run.
+    BeginStrokeProgram(cur, sty, lib.Find(sty.name),
+                       (uint32_t)std::hash<std::string>{}(sty.name) | 1u);
+
+    Vec3 prevHand{}, prevTip{}, prevDir{}, prevFlat{};
+    float prevW = 0;
+    float lastHandStep = 0, lastTipStep = 0;
+    bool have = false, haveStep = false;
+    bool hitHand = false, hitTip = false, hitDir = false, hitRoll = false,
+         hitW = false;
+    float rollArc = 0, dirArc = 0;
+    int rollFlips = 0;
+    for (int i = 0; i < 200; i++) {
+      const StrokeCursor::Phase ph = cur.phase;
+      const StrokeStepResult r =
+          StepStrokeProgram(cur, &sty, m, 0.0f, 0.0f, 0.0f, dt, kRight, kUp,
+                            kFwd);
+      if (r == StrokeStepResult::Idle) break;
+      const WeaponPose p = m.Pose();
+      if (have) {
+        const float dHand = (p.hand - prevHand).len();
+        const float dTip = (m.TipOffset() - prevTip).len();
+        const float dDir = angleBetween(p.bladeDir, prevDir);
+        // ---- ROLL IS ROTATION ABOUT THE BLADE, NOT THE FLAT'S TRAVEL ----
+        //
+        // The naive angle between consecutive flats is dominated by the blade
+        // TURNING: the flat is perpendicular to the blade by construction, so
+        // a 2.5-radian sweep carries it 2.5 radians whether or not the sword
+        // rolled at all in the wielder's fist. Measured that way every style
+        // reported ~2.3 rad of "roll" and the number said nothing.
+        //
+        // PARALLEL-TRANSPORT the previous flat along the blade's own turn
+        // first — the minimal rotation taking the old direction to the new one
+        // — and what is left is the rotation about the blade axis, which is
+        // the only thing a wrist is doing and the only thing a sign flip
+        // shows up in.
+        const Vec3 carried =
+            QuatRotate(QuatFromTo(prevDir, p.bladeDir), prevFlat);
+        const float dRoll = angleBetween(p.bladeFlat, carried);
+        const float dW = std::fabs(p.weight - prevW);
+        // The SECOND difference: how much the travel-per-tick changed. Zero on
+        // a constant-speed sweep however fast, and the whole of the step on a
+        // discontinuity.
+        const float aHand = haveStep ? std::fabs(dHand - lastHandStep) : 0.0f;
+        const float aTip = haveStep ? std::fabs(dTip - lastTipStep) : 0.0f;
+        lastHandStep = dHand;
+        lastTipStep = dTip;
+        haveStep = true;
+        worstHand = std::max(worstHand, aHand);
+        worstTip = std::max(worstTip, aTip);
+        worstDir = std::max(worstDir, dDir);
+        worstRoll = std::max(worstRoll, dRoll);
+        worstW = std::max(worstW, dW);
+        rollArc += dRoll;
+        dirArc += dDir;
+        // ---- AND THE SHARP ONE: DID THE FLAT REVERSE? --------------------
+        //
+        // Roll ARC is a blunt instrument — a cut legitimately rolls the edge
+        // round to lead its travel, and on these styles that is two radians of
+        // honest wrist. What is never legitimate is the flat pointing out of
+        // the OTHER FACE of the blade from one tick to the next, because a
+        // flat normal names a plane and its sign carries no information at
+        // all (MeleeEdgeAlign takes fabs of it). A reversal is the commanded
+        // normal having jumped to its own negative, which the rig then spends
+        // several ticks rolling the sword through 180 degrees to follow.
+        //
+        // COUNTED AGAINST THE PARALLEL-TRANSPORTED flat, so the blade turning
+        // through a right angle is not mistaken for one.
+        if (carried.dot(p.bladeFlat) < 0.0f) rollFlips++;
+        // ---- AND WHAT ELSE WAS TRUE ON THAT TICK (CLAUDE.md rule 6) -------
+        //
+        // "The hand jumped by 2.3 voxels" has at least three causes and from
+        // outside they are one number: the POINT jumped and the hand followed
+        // it, the blade TURNED and swung the hand round the point (hand = tip
+        // minus a blade, so 0.5 rad on a 5.5-voxel blade is 2.75 voxels of
+        // hand with the point perfectly still), or the lean angle moved
+        // because the RADIUS did and the law of cosines is steep near the ends
+        // of the reach band. Printing the co-measurements is one line and
+        // saves an elimination run per hypothesis.
+        auto where = [&](const char* what, float got, float lim) {
+          return Format(
+              "%s: %s %.3f (limit %.3f) at tick %d, phase %s | point step "
+              "%.3f, dir turn %.3f rad, roll %.3f rad, radius %.2f, steer "
+              "%.2f",
+              sty.name.c_str(), what, got, lim, i,
+              kPhase[(int)ph <= 4 ? (int)ph : 0], dTip, dDir, dRoll,
+              m.StrokeRadius(), m.SteerAmount());
+        };
+        // ONE CHECK PER STYLE PER CHANNEL, not one per tick: a broken style
+        // breaks on many ticks and five hundred identical FAILED lines bury
+        // the one that says which style it was. `firstHand`/... latch that.
+        if (aHand > maxHand && !hitHand) {
+          hitHand = true;
+          check(false, where("the hand's travel jumped by", aHand, maxHand));
+        }
+        if (aTip > maxTip && !hitTip) {
+          hitTip = true;
+          check(false, where("the point's travel jumped by", aTip, maxTip));
+        }
+        if (dDir > maxDir && !hitDir) {
+          hitDir = true;
+          check(false, where("the blade direction turned", dDir, maxDir));
+        }
+        if (dRoll > maxRoll && !hitRoll) {
+          hitRoll = true;
+          check(false, where("the blade rolled", dRoll, maxRoll));
+        }
+        if (dW > maxWeight && !hitW) {
+          hitW = true;
+          check(false, where("the arm claim stepped", dW, maxWeight));
+        }
+      }
+      prevHand = p.hand;
+      prevTip = m.TipOffset();
+      prevDir = p.bladeDir;
+      prevFlat = p.bladeFlat;
+      prevW = p.weight;
+      have = true;
+      if (r == StrokeStepResult::Finished) {
+        // ---- AND THE LAST TICK IS NOT A CLIFF -----------------------------
+        //
+        // `Finished` is the one tick where the CALLER drops the pose claim
+        // outright (MobSystem::StepStroke pushes an empty WeaponPose), so
+        // whatever weight the driver still had at that instant is a step the
+        // rig takes in a single frame. Checked separately from the per-tick
+        // ceiling above because the step happens OUTSIDE the driver and no
+        // amount of smoothing inside it can cover one.
+        checks++;
+        if (p.weight > maxWeight) {
+          ok = false;
+          std::printf(
+              "swing-smooth: FAILED %s: the program finished while the arm "
+              "was still claimed at %.3f (limit %.3f) — the caller drops the "
+              "claim on this tick, so that is a one-frame snap to the walk "
+              "pose\n",
+              sty.name.c_str(), p.weight, maxWeight);
+        }
+        break;
+      }
+    }
+    check(have, sty.name + ": the program stepped at all");
+    // THE ROLL IS NOT A SECOND SWING. Stated against the DIRECTION's own arc
+    // as well as an absolute ceiling, because the two failures are different:
+    // an absolute bound catches a flip on a short stroke, and the ratio
+    // catches one on a long sweep whose direction legitimately travels two
+    // radians. A blade that keeps its edge rolls a fraction of what it swings.
+    worstRollArc = std::max(worstRollArc, rollArc);
+    totalFlips += rollFlips;
+    check(rollFlips == 0,
+          Format("%s: the blade's flat reversed %d time(s) — the commanded "
+                 "normal jumped to its own negative, which is a 180-degree "
+                 "roll of the sword that no part of the stroke asked for",
+                 sty.name.c_str(), rollFlips));
+    check(rollArc <= maxRollArc,
+          Format("%s: the blade rolled %.3f rad over the whole stroke (limit "
+                 "%.3f) while its direction turned %.3f — a roll that large "
+                 "beside a swing that size is the flat's sign having reversed, "
+                 "not the edge leading the cut",
+                 sty.name.c_str(), rollArc, maxRollArc, dirArc));
+  }
+  check(styles >= 5, "the library ships held styles to measure");
+
+  std::printf(
+      "swing-smooth: %d styles | worst: hand accel %.3f/%.2f vox, point accel "
+      "%.3f/%.2f vox, dir %.3f/%.2f rad/tick, roll %.3f/%.2f rad/tick, claim "
+      "step %.3f/%.2f\n",
+      styles, worstHand, maxHand, worstTip, maxTip, worstDir, maxDir,
+      worstRoll, maxRoll, worstW, maxWeight);
+  detail = Format("%d styles, %d checks", styles, checks);
+  std::printf("swing-smooth: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// =============================================================================
+// cut-path — A CUT IS A PATH, AND THE PATH IS DRIVEN (strokes.h, 2026-09-21)
+//
+// `cut` may be a LIST OF LEGS run back to back inside the one Cut phase, so a
+// stroke can hook, dogleg or hitch instead of being a chord through the
+// target. Nothing in the shipped library uses one yet — the feature is an
+// AUTHORING surface, and the styles that will use it are authored in the
+// tuner — which is exactly why it needs a gate of its own: a path that parsed
+// and then ran as a straight line would look, from every other gate in this
+// file, like a library nobody had got round to editing.
+//
+// FOUR CLAIMS, and each is the one whose failure would be silent:
+//
+//   1. THE OLD SPELLING IS THE OLD PROGRAM. A bare `"cut": {…}` and a
+//      one-element list must be the same stroke tick for tick, or every style
+//      in the library quietly changed.
+//   2. THE CORNER IS REALLY DRIVEN. Two legs summing to a straight cut's
+//      travel must END where it ends and go somewhere ELSE on the way —
+//      arriving in the right place is what a straight line already does.
+//   3. THE AIM MARKER MOVES THE TARGET ALONG THE PATH. `"aim": true` on leg 2
+//      has to make the blade meet the target later; a marker that parsed and
+//      did nothing reads identically from outside.
+//   4. THE LOADER REFUSES WHAT IT SAYS IT REFUSES — too many legs, an empty
+//      list, a path with no motion in it — because those are the messages an
+//      author actually meets.
+//
+// CPU-ONLY AND WORLD-FREE, like `swing` and `swing-smooth` beside it: its
+// styles are built in memory and its loader probe is a temp file, so it costs
+// milliseconds, disturbs nothing, and `--gate cut-path` alone is the whole
+// verification loop for a change to the path arithmetic.
+Status GateCutPath(Ctx& c, std::string& detail) {
+  (void)c;
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("cut-path: FAILED %s\n", what.c_str());
+    }
+  };
+
+  const float dt = 1.0f / 30.0f;
+  // swing-smooth's fixture, for its reasons: a HELD BLADE's geometry, because
+  // the reach band a leg's `reach` is a position in only exists when there is
+  // a blade to measure.
+  const Vec3 fixtureHand{-0.4f, -3.0f, -0.3f};
+  const Vec3 fixtureTip = fixtureHand + Vec3{0, 5.5f, 0};
+  const float kAimAz = 0.25f;
+
+  struct Sample {
+    StrokeCursor::Phase phase;
+    float az, el, r;
+  };
+  // One style, run to completion against a fresh driver, sampled every tick.
+  // The phase is read BEFORE the step for the reason test_melee.mjs states:
+  // StepStrokeProgram advances and transitions inside the one call.
+  auto run = [&](const AttackStyle& sty, std::vector<Sample>& out) {
+    MeleeState m;
+    ApplyMeleeTuning(m.tuning);
+    m.SetStroke(fixtureHand, fixtureTip, Vec3{0, 0, 1}, kRestReach);
+    m.SetHandSign(1.0f);
+    StrokeCursor cur;
+    BeginStrokeProgram(cur, sty, 0, 0xC17A11u);
+    out.clear();
+    for (int i = 0; i < 200; i++) {
+      const StrokeCursor::Phase ph = cur.phase;
+      const StrokeStepResult r =
+          StepStrokeProgram(cur, &sty, m, kAimAz, 0.0f, 0.0f, dt, kRight, kUp,
+                            kFwd);
+      out.push_back(Sample{ph, m.StrokeAz(), m.StrokeEl(), m.StrokeRadius()});
+      if (r != StrokeStepResult::Live) break;
+    }
+    return cur;
+  };
+  auto cutOnly = [](const std::vector<Sample>& all) {
+    std::vector<Sample> out;
+    for (const Sample& s : all)
+      if (s.phase == StrokeCursor::Phase::Cut) out.push_back(s);
+    return out;
+  };
+  // A style with nothing authored but its path: no jitter, so the trace is the
+  // program and not a draw.
+  auto styleWith = [](std::vector<StrokeSegment> legs, int aimLeg) {
+    AttackStyle s;
+    s.name = "probe";
+    s.windup = StrokeSegment{6, 0.20f, 0.10f, -0.05f};
+    s.cut = std::move(legs);
+    s.aimLeg = aimLeg;
+    s.recover.ticks = 4;
+    s.jitter = StrokeJitter{};
+    return s;
+  };
+
+  // ---- 2 and 3: the runner ------------------------------------------------
+  const AttackStyle straight =
+      styleWith({StrokeSegment{8, -2.0f, 0.0f, 0.10f}}, -1);
+  const AttackStyle dogleg =
+      styleWith({StrokeSegment{4, -1.0f, -0.40f, 0.05f},
+                 StrokeSegment{4, -1.0f, 0.40f, 0.05f}},
+                -1);
+  const AttackStyle marked =
+      styleWith({StrokeSegment{4, -1.0f, -0.40f, 0.05f},
+                 StrokeSegment{4, -1.0f, 0.40f, 0.05f}},
+                1);
+  std::vector<Sample> ts, td, tm;
+  const StrokeCursor cs = run(straight, ts);
+  const StrokeCursor cd = run(dogleg, td);
+  const StrokeCursor cm = run(marked, tm);
+  const std::vector<Sample> ds = cutOnly(ts), dd = cutOnly(td),
+                            dm = cutOnly(tm);
+
+  check(cd.cutLegs == 2 && cd.legTicks[0] == 4 && cd.legTicks[1] == 4 &&
+            cd.cutTicks == 8,
+        Format("the path resolves to two 4-tick legs in one 8-tick Cut phase "
+               "(got %d legs, %d+%d, total %d)",
+               cd.cutLegs, cd.legTicks[0], cd.legTicks[1], cd.cutTicks));
+  check(!ds.empty() && ds.size() == dd.size(),
+        Format("a two-leg path spends the same ticks cutting as the straight "
+               "cut it sums to (%d vs %d)",
+               (int)dd.size(), (int)ds.size()));
+
+  // ---- THE CORNER, MEASURED WHERE THE DRIVER IS NOT IN THE WAY -----------
+  //
+  // The obvious assertion — "the dogleg ends where the straight cut of the
+  // same travel ends" — IS FALSE, and it is worth saying why rather than
+  // quietly not testing it. A cut that commits the driver's own Slash gets
+  // its follow-through ARC FOLDED BACK INTO THE STROKE when the Slash ends
+  // (melee.cpp, "a cut ENDS WHERE IT WENT"), and how much arc that is depends
+  // on how the travel was delivered. Measured here: the straight 2.0-rad cut
+  // finishes at az -1.40 and the two-leg path that sums to it at -0.75, which
+  // is the authored end of the path exactly. Neither number is wrong; they
+  // differ because one committed a single long Slash and the other did not,
+  // and comparing them is comparing FOLLOW-THROUGH, not geometry.
+  //
+  // So the path's geometry is asserted on a SLOW pair, whose travel stays
+  // under `commitSpeed` in every channel: there the stored stroke is the
+  // program and nothing else, and "the corner is really driven" is a claim
+  // about the runner rather than about the driver's arc. The fast pair above
+  // still carries the structural claims (legs, ticks) and the aim marker
+  // below, which are the ones that need the shipped regime.
+  const AttackStyle slowLine =
+      styleWith({StrokeSegment{10, -0.50f, 0.0f, 0.0f}}, -1);
+  const AttackStyle slowBend =
+      styleWith({StrokeSegment{5, -0.25f, -0.30f, 0.0f},
+                 StrokeSegment{5, -0.25f, 0.30f, 0.0f}},
+                -1);
+  std::vector<Sample> tl, tb;
+  run(slowLine, tl);
+  run(slowBend, tb);
+  const std::vector<Sample> dl = cutOnly(tl), db = cutOnly(tb);
+  // The tolerances are data, so tuning them costs no rebuild.
+  const float endEps = (float)BaselineNumber("cutPath.endAgreeRad", 0.08);
+  const float bendMin = (float)BaselineNumber("cutPath.minCornerDipRad", 0.15);
+  float dipL = 1e9f, dipB = 1e9f;
+  int dipAt = -1;
+  for (const Sample& s : dl) dipL = std::min(dipL, s.el);
+  for (size_t i = 0; i < db.size(); i++)
+    if (db[i].el < dipB) {
+      dipB = db[i].el;
+      dipAt = (int)i;
+    }
+  if (!dl.empty() && !db.empty()) {
+    check(std::fabs(db.back().az - dl.back().az) <= endEps,
+          Format("the path ENDS where the straight cut of the same total "
+                 "travel ends (%.3f vs %.3f, tolerance %.3f)",
+                 db.back().az, dl.back().az, endEps));
+    check(std::fabs(db.back().el - dl.back().el) <= endEps,
+          Format("...in elevation too, having been below it on the way "
+                 "(%.3f vs %.3f)",
+                 db.back().el, dl.back().el));
+    check(dipB < dipL - bendMin,
+          Format("...and it goes somewhere ELSE on the way: elevation dipped "
+                 "to %.3f against the straight cut's %.3f (needs %.3f lower)",
+                 dipB, dipL, bendMin));
+    // ---- THE CORNER, AS A DEPARTURE FROM THE PATH'S OWN CHORD ------------
+    //
+    // Not as a reversal count: the arc rings as it unwinds, and the two-leg
+    // path was measured turning three times rather than once. Not as an
+    // absolute depth either — the rate this fixture delivers is close enough
+    // to `commitSpeed` that the driver amplifies the -0.30 corner to -1.15.
+    //
+    // What survives both is DEVIATION FROM ITS OWN CHORD: how far the point
+    // gets from the straight line between where this very stroke's cut began
+    // and where it ended. A chord is zero by construction whatever the driver
+    // adds on top, which is what makes the control arm meaningful — and the
+    // control is a DIAGONAL straight cut, one that really moves in elevation,
+    // rather than the flat one above, so "a straight cut deviates little"
+    // is measured on a straight cut with something to deviate from.
+    auto chordDev = [](const std::vector<Sample>& d, int& where) {
+      where = -1;
+      if (d.size() < 3) return 0.0f;
+      const float e0 = d.front().el, e1 = d.back().el;
+      const float span = (float)(d.size() - 1);
+      float worst = 0;
+      for (size_t i = 1; i + 1 < d.size(); i++) {
+        const float chord = e0 + (e1 - e0) * ((float)i / span);
+        const float dev = std::fabs(d[i].el - chord);
+        if (dev > worst) {
+          worst = dev;
+          where = (int)i;
+        }
+      }
+      return worst;
+    };
+    const AttackStyle slowDiag =
+        styleWith({StrokeSegment{10, -0.50f, -0.60f, 0.0f}}, -1);
+    std::vector<Sample> tg;
+    run(slowDiag, tg);
+    const std::vector<Sample> dg = cutOnly(tg);
+    int devAtDiag = -1, devAtBend = -1;
+    const float devDiag = chordDev(dg, devAtDiag);
+    const float devBend = chordDev(db, devAtBend);
+    check(devBend > devDiag + bendMin,
+          Format("the path leaves its own chord where a straight cut does not "
+                 "(%.3f rad against a diagonal chord's %.3f, needs %.3f more)",
+                 devBend, devDiag, bendMin));
+    // A leg is its own clock, so the departure must be AT the corner. At the
+    // end of the cut it would be a slow arc; at the start, a windup that
+    // missed its pose and spent the cut catching up.
+    const int boundary = 5;   // slowBend's first leg is 5 of its 10 ticks
+    check(devAtBend >= boundary - 2 && devAtBend <= boundary + 2,
+          Format("the corner lands at the leg boundary rather than at either "
+                 "end of the cut (furthest from the chord at tick %d of %d, "
+                 "boundary %d)",
+                 devAtBend, (int)db.size(), boundary));
+    std::printf(
+        "cut-path: chord departure — two-leg %.3f rad at tick %d, diagonal "
+        "one-leg control %.3f at %d\n",
+        devBend, devAtBend, devDiag, devAtDiag);
+    (void)dipAt;
+  }
+  // THE AIM MARKER. The cut sweeps az DOWNWARD (-2.0 over the path), so the
+  // crossing is the first tick at or under the aim.
+  auto crossAt = [&](const std::vector<Sample>& d) {
+    for (size_t i = 0; i < d.size(); i++)
+      if (d[i].az <= kAimAz) return (int)i;
+    return -1;
+  };
+  const int xd = crossAt(dd), xm = crossAt(dm);
+  check(xd >= 0 && xm > xd,
+        Format("marking leg 2 with \"aim\" makes the cut meet the target LATER "
+               "in the path (unmarked tick %d, marked %d)",
+               xd, xm));
+  check(!dm.empty() && dm.front().az > kAimAz && xm >= 0,
+        "...and the marked path still crosses the aim rather than starting "
+        "past it");
+  check(cm.cutTicks == cd.cutTicks,
+        "the aim marker moves where the target is, not how long the cut takes");
+
+  // ---- the path arithmetic, which three readers share ---------------------
+  const StrokeSegment tot = dogleg.CutTravel();
+  check(std::fabs(tot.az + 2.0f) < 1e-5f && std::fabs(tot.el) < 1e-5f &&
+            std::fabs(tot.reach - 0.10f) < 1e-5f && tot.ticks == 8,
+        "CutTravel sums the legs");
+  const StrokeSegment thr = dogleg.CutThrough(0);
+  check(std::fabs(thr.az + 1.0f) < 1e-5f && std::fabs(thr.el + 0.40f) < 1e-5f,
+        "CutThrough(0) is where the point stands when the first leg ends");
+  float offAz = 0, offEl = 0;
+  dogleg.CutAimOffset(offAz, offEl);
+  check(std::fabs(offAz + 1.0f) < 1e-5f && std::fabs(offEl) < 1e-5f,
+        "an unmarked path puts the aim at the midpoint of the whole travel");
+  marked.CutAimOffset(offAz, offEl);
+  check(std::fabs(offAz + 1.5f) < 1e-5f && std::fabs(offEl + 0.20f) < 1e-5f,
+        "...and a marked one puts it at the middle of the marked leg");
+
+  // ---- 1 and 4: THE LOADER, through a written file ------------------------
+  //
+  // Through a FILE and not through a hand-built struct, because the claim is
+  // about the two SPELLINGS and a struct has only one. It is the one thing in
+  // this gate that touches the disk; a temp path, so a read-only asset tree or
+  // a parallel run cannot collide with it.
+  {
+    const std::string probe =
+        (std::filesystem::temp_directory_path() / "sandvox_cutpath_probe.json")
+            .string();
+    std::ofstream f(probe);
+    if (!f) {
+      std::printf("cut-path: could not write %s — loader half skipped\n",
+                  probe.c_str());
+    } else {
+      f << R"({ "styles": [
+        { "name": "asObject",
+          "windup": { "ticks": 6, "az": 0.20, "el": 0.10, "reach": -0.05 },
+          "cut": { "ticks": 8, "az": -2.0, "el": 0.0, "reach": 0.10 },
+          "recover": { "ticks": 4 } },
+        { "name": "asList",
+          "windup": { "ticks": 6, "az": 0.20, "el": 0.10, "reach": -0.05 },
+          "cut": [ { "ticks": 8, "az": -2.0, "el": 0.0, "reach": 0.10 } ],
+          "recover": { "ticks": 4 } },
+        { "name": "marked",
+          "cut": [ { "ticks": 4, "az": -1.0 },
+                   { "ticks": 4, "az": -1.0, "aim": true } ] },
+        { "name": "twoAims",
+          "cut": [ { "ticks": 4, "az": -1.0, "aim": true },
+                   { "ticks": 4, "az": -1.0, "aim": true } ] },
+        { "name": "tooMany",
+          "cut": [ { "ticks": 2, "az": -0.2 }, { "ticks": 2, "az": -0.2 },
+                   { "ticks": 2, "az": -0.2 }, { "ticks": 2, "az": -0.2 },
+                   { "ticks": 2, "az": -0.2 }, { "ticks": 2, "az": -0.2 },
+                   { "ticks": 2, "az": -0.2 }, { "ticks": 2, "az": -0.2 } ] },
+        { "name": "emptyList", "cut": [] },
+        { "name": "goesNowhere",
+          "cut": [ { "ticks": 4 }, { "ticks": 4 } ] },
+        { "name": "hitch",
+          "cut": [ { "ticks": 4, "az": -1.0 }, { "ticks": 3 },
+                   { "ticks": 4, "az": -1.0 } ] }
+      ] })";
+      f.close();
+      StyleLibrary pl;
+      std::string plog;
+      check(LoadAttackStyles(probe, pl, plog), "the probe library loads");
+      const AttackStyle* a = pl.At(pl.Find("asObject"));
+      const AttackStyle* b = pl.At(pl.Find("asList"));
+      check(a != nullptr && b != nullptr && a->cut.size() == 1 &&
+                b->cut.size() == 1,
+            "both cut spellings parse to exactly one leg");
+      if (a != nullptr && b != nullptr) {
+        std::vector<Sample> ta, tb;
+        run(*a, ta);
+        run(*b, tb);
+        bool same = ta.size() == tb.size();
+        for (size_t i = 0; same && i < ta.size(); i++)
+          same = ta[i].az == tb[i].az && ta[i].el == tb[i].el &&
+                 ta[i].r == tb[i].r;
+        check(same,
+              "a one-leg LIST and a bare cut OBJECT are the same stroke, tick "
+              "for tick");
+      }
+      const AttackStyle* mk = pl.At(pl.Find("marked"));
+      check(mk != nullptr && mk->aimLeg == 1, "\"aim\" names the leg it is on");
+      const AttackStyle* two = pl.At(pl.Find("twoAims"));
+      check(two != nullptr && two->aimLeg == 0 &&
+                plog.find("keeps it") != std::string::npos,
+            "two legs claiming the aim: the first wins, LOUDLY");
+      const AttackStyle* tm2 = pl.At(pl.Find("tooMany"));
+      check(tm2 != nullptr && (int)tm2->cut.size() == kMaxCutLegs &&
+                plog.find("more than") != std::string::npos,
+            Format("more than %d legs is dropped LOUDLY", kMaxCutLegs));
+      const AttackStyle* em = pl.At(pl.Find("emptyList"));
+      check(em != nullptr && em->cut.size() == 1 &&
+                plog.find("empty cut list") != std::string::npos,
+            "an empty cut list falls back to one default leg, loudly");
+      check(pl.Find("goesNowhere") < 0 &&
+                plog.find("travels nowhere") != std::string::npos,
+            "a path with no motion anywhere in it is REFUSED, as a single "
+            "motionless cut always was");
+      const AttackStyle* h = pl.At(pl.Find("hitch"));
+      check(h != nullptr && h->cut.size() == 3,
+            "...but a motionless leg INSIDE a path is a legal hitch");
+      if (h != nullptr) {
+        std::vector<Sample> th;
+        run(*h, th);
+        const std::vector<Sample> dh = cutOnly(th);
+        // The hitch has to be visible as a hitch: the middle three ticks move
+        // the point far less than the legs either side of them. Measured on
+        // the commanded azimuth, which is what the leg drives.
+        float moveLegs = 0, moveHitch = 0;
+        for (size_t i = 1; i < dh.size(); i++) {
+          const float d = std::fabs(dh[i].az - dh[i - 1].az);
+          // Ticks 4, 5 and 6 are the hitch's own (the sample is the state
+          // AFTER that tick's step, and the hitch's first tick is 4).
+          if (i >= 4 && i <= 6) moveHitch += d;
+          else moveLegs += d;
+        }
+        check(dh.size() == 11 && moveHitch < moveLegs * 0.35f,
+              Format("a hitch really holds: %.3f rad over its 3 ticks against "
+                     "%.3f over the 8 that travel",
+                     moveHitch, moveLegs));
+      }
+    }
+  }
+
+  // The evidence, printed whether or not it failed: three numbers that say
+  // what the path did rather than that something is wrong (CLAUDE.md rule 6).
+  std::printf(
+      "cut-path: straight 2.0-rad cut ends az %.3f, the 2-leg path summing to "
+      "it ends %.3f (follow-through, not geometry) | slow pair: ends az %.3f "
+      "vs %.3f, el dipped %.3f vs %.3f at tick %d of %d | aim crossing "
+      "unmarked tick %d, marked %d\n",
+      ds.empty() ? 0.0f : ds.back().az, dd.empty() ? 0.0f : dd.back().az,
+      db.empty() ? 0.0f : db.back().az, dl.empty() ? 0.0f : dl.back().az, dipB,
+      dipL, dipAt, (int)db.size(), xd, xm);
+  detail = Format("%d checks", checks);
+  std::printf("cut-path: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SwingGates() {
@@ -2854,6 +3562,15 @@ const std::vector<Gate>& SwingGates() {
       // No deps and no world: it builds its own MeleeState fixtures, so it can
       // neither disturb pristine worldgen nor be disturbed by anything.
       {"swing", "player", {}, false, GateSwing},
+      // The derivative of the same driver, over every authored held style:
+      // nothing may step in one tick. Asset-light and world-free like `swing`,
+      // so it sits beside it in kOrder and is the whole verification loop for
+      // a continuity change.
+      {"swing-smooth", "player", {}, false, GateSwingSmooth},
+      // The cut PATH: multi-leg cuts, the aim marker, and the loader's two
+      // spellings. Same shape as the two above — its own in-memory styles, one
+      // temp file, no world — so it sits with them in kOrder.
+      {"cut-path", "player", {}, false, GateCutPath},
       // The opposite: the whole pipeline, on real terrain, against a real body.
       // Expensive, so it runs LATE in kOrder with the other world-touching
       // gates and regenerates worldgen on the way out (CLAUDE.md rule 7).

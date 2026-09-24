@@ -117,6 +117,17 @@ struct Tuning {
     // speed the game actually runs — so the feel is unchanged where it was
     // tuned, and now stays put at 30 or 144 fps instead of drifting.
     float groundAccel = 43.1f, airAccel = 6.2f, liquidAccel = 16.3f;
+    // ---- slippery feet (a coat whose material lists "slippery" in its
+    // materials.json coat.effects -- oil) ----
+    // Grip on the ground is groundAccel scaled from 1 down to slipGrip as the
+    // SOLES' amount-weighted coat fraction (MobSystem::CoatTagFraction over
+    // limbs tagged "foot", sole band only) climbs from slipCoatStart to
+    // slipCoatFull. A fresh oil coat is amount 6 = 0.40; the start sits above
+    // oil's decayFloor sheen (2/15 = 0.133), so a greasy sheen that never
+    // dries does not keep you skating until you wash it off. It was a
+    // whole-foot fraction until 2026-09-23 and a foot fresh out of a pool read
+    // ~0.1 of it, so oily feet did nothing.
+    float slipCoatStart = 0.15f, slipCoatFull = 0.32f, slipGrip = 0.035f;
     float liquidDrag = 8.3f;
     float liquidGravityScale = 0.25f;
     float liquidSpeedScale = 0.55f;
@@ -432,6 +443,10 @@ struct Tuning {
     // In first person the body is hidden, but the ARMS are kept so the player
     // can see their own hands and staff. Turning this off hides everything.
     bool firstPersonArms = true;
+    // How far forward (metres) the first-person eye sits from the body centre.
+    // Pushes the camera in front of the arms so looking down shows hands behind
+    // you rather than surrounding you.
+    float firstPersonForward = 0.255f;
     // Vertical offset applied to the whole avatar relative to the player AABB,
     // in meters. The rig's own feet should land on the box's bottom face; this
     // is the trim for art whose contact point is not exactly at its origin.
@@ -568,6 +583,24 @@ struct Tuning {
     float severImpulse = 6.0f;   // extra shove given to a part as it comes off
     // How long the corpse's parts stay before the avatar can respawn, seconds.
     float respawnDelay = 3.0f;
+    // ---- WHAT YOUR ZOMBIE TAKES WITH IT -----------------------------------
+    //
+    // The avatar turns like anybody else: die with the rot in you and your own
+    // corpse gets up as a zombie of you (MobDef::Turn, inherited from
+    // human.json by every character). It rises in the gear it fell in — and
+    // the question this answers is whether you STILL HAVE THAT GEAR.
+    //
+    // true  — it rises with a COPY and you respawn with your kit intact. Two
+    //         swords now exist where there was one. The default, because
+    //         losing your kit to a test bite costs more than a duplicate
+    //         does while the mechanic is being played with.
+    // false — the kit MOVES. Bag, hotbar and equipment are emptied at the
+    //         moment of death and everything is on the thing wearing your
+    //         face. No duplication, and the death penalty this becomes.
+    //
+    // CPU-only, read at the one seam (MobSystem::SetAvatarKitFn, bound in
+    // main.cpp). Nothing here reaches a shader or the CA.
+    bool keepKitOnTurn = true;
   } avatar;
 
   // ---- sound ----
@@ -785,7 +818,7 @@ struct Tuning {
   struct Ragdoll {
     // Continuous freefall before a creature goes limp mid-air. NPCs fall under
     // the same gravity as the player since this landed (they used to hang).
-    float fallSeconds = 3.0f;
+    float fallSeconds = 1.5f;
     // A blast within radius * blastRadiusScale of a body launches it. The
     // impulse at the centre is power * blastImpulseScale (kg*m/s), falling
     // off linearly to zero at that reach; launch speed is impulse / body mass,
@@ -1641,6 +1674,14 @@ struct Tuning {
     // everything twice as fast and small values make blood permanent. A dial
     // on the whole look rather than a per-material edit.
     float decayScale = 1.0f;
+    // How much faster a WET coat (a washer, i.e. water) dries while the body is
+    // in sunshine: daylight up and open sky over the limb (MobSystem::
+    // InSunlight). Divides the drying period like decayScale; 1 = no effect.
+    float sunDryScale = 2.0f;
+    // Seconds of heat against a wet voxel to boil it from soaked (15) to dry.
+    // A wet voxel cannot catch fire (BurnOneLimb section 0), so this is how
+    // long water on the skin holds a flame off.
+    float fireDrySeconds = 2.0f;
     // Ground cells one footfall may track a coat onto. A footprint is a patch,
     // not a point, and this is how big the patch may get.
     int shedCells = 3;
@@ -1842,6 +1883,27 @@ struct Tuning {
     // frontal-plane clamp). 0 = clamp OFF — the A/B, same convention as
     // elbowAxisCone's pi.
     float headClearM = 0.06f;
+    // ---- ...and the ARM stays out of the wielder's own chest (2026-09-21) --
+    // Metres of clearance beyond the torso capsule's own half-width the HAND
+    // is pushed out to. The head sphere covered the one body part a BLADE
+    // could be swept through and left the one an ARM goes through untouched.
+    // 0 = clamp OFF, the same A/B convention.
+    float bodyClearM = 0.05f;
+    // ---- and the lean plane does not chase a reversal (game/melee.h) ------
+    // Radians. A commanded turn of the blade's lean plane larger than this is
+    // a REVERSAL, not a turn: the travel flipped, and a real blade keeps its
+    // lean rather than swapping which side the hilt leads on. The plane holds
+    // instead. pi disables it, which is the A/B.
+    float leanFlipHold = 3.14f;
+    // Metres/sec of TANGENTIAL tip travel below which there is nothing to
+    // chase and the lean plane and the roll simply hold. Under it the tangent
+    // is numerical dust.
+    float leanMinSpeed = 0.05f;
+    // Sine of the angle between the blade and its travel below which the
+    // blade's ROLL is held rather than recomputed. The flat is their cross
+    // product, so its direction is noise as they approach parallel — every
+    // thrust and every stall. 0.20 is 11.5 degrees.
+    float flatMinSin = 0.20f;
   } melee;
 
   // ---- combat feel: hit-stop, hit flash, combat cues --------------------------
@@ -2917,6 +2979,47 @@ struct Tuning {
     // permanent — note that leaving this off while waterFreezes is on means
     // ice only ever accumulates, which is stable but one-way.
     bool iceMelts = true;
+
+    // ---- the SKY's weather (src/sim/weather.h, cloud.wgsl) ----------------
+    // Everything below is RENDER-ONLY: it picks which assets/weather/*.json
+    // preset the sky is showing and how that drifts. None of it reaches the
+    // CA or the world hash (weather.h's header says what must change first
+    // if rain is ever to touch the world).
+    //
+    // Master switch. Off skips every cloud pass (nothing is recorded) and the
+    // sky is the bare atmosphere it was before clouds existed.
+    bool clouds = true;
+    // On: the sky walks the moisture ladder of the presets on its own.
+    // Off: it holds `preset`. The dev panel's weather row overrides both
+    // without touching this file (weather::SetOverride).
+    bool autoCycle = true;
+    std::string preset = "fair";
+    // Length of one weather epoch in SIM minutes: the moisture signal gets one
+    // new knot per epoch, so this is roughly how long a given sky lasts.
+    float epochMinutes = 7.0f;
+    // Multiplier on how fast the cycle runs (1 = epochMinutes as authored).
+    // 0 freezes the automatic sky on whatever it is showing.
+    float cycleSpeed = 1.0f;
+    // Rerolls the whole weather sequence without touching the world seed.
+    int seedOffset = 0;
+    // How long a PINNED change (dev panel, preset edit) takes to ease in, in
+    // wall seconds. The automatic cycle is continuous and needs no ease.
+    float transitionSeconds = 12.0f;
+    // Added to every preset's coverage (-1..1), and a multiplier on every
+    // preset's raininess — the two global "make it cloudier / wetter" knobs.
+    float coverageBias = 0.0f;
+    float precipScale = 1.0f;
+    // Time constant, in sim seconds, over which rained-on ground dries.
+    float drySeconds = 240.0f;
+    // ---- where the sky touches the WORLD (weather::SimRainWord) ----
+    // The one sim-affecting half of the weather: rain on the tick stream, read
+    // by reactions authored "rain" (douses) and "rainDamped" (ignitions).
+    // Off = the word is 0 and every such rule behaves as if the sky were dry.
+    bool rainTouchesWorld = true;
+    // How much of an exposed ignition's chance full rain / soaked ground
+    // removes (0 = none, 1 = all of it). Scaled by max(rain, wetness), so a
+    // drizzle already slows a fire and a field stays slow to catch after it.
+    float rainIgniteDamp = 0.6f;
   } weather;
 
   // ---- combustion: how long anything in the world stays alight ----
@@ -3930,6 +4033,57 @@ struct Tuning {
     // tuning.json on 2026-09-19; this struct default was left behind, and a
     // struct default matters whenever the key is missing from the JSON.
     float farPlumeRange = 3276.8f;
+
+    // ---- clouds (cloud.wgsl; DESIGN.md 9.w). The LOOK of the sky's clouds;
+    // which weather is showing lives in `weather` (src/sim/weather.h). ----
+    // Tile period of the Perlin-Worley shape volume, metres. Sets the size of individual cloud bodies: a quarter of this is roughly one cumulus tower.
+    float cloudShapeScaleM = 9000.0f;
+    // Tile period of the Worley erosion volume. Smaller = finer cauliflower and wisps on the cloud edges.
+    float cloudDetailScaleM = 700.0f;
+    // Feature size of the coverage/type/rain fields. Large = broad fronts and wide clear gaps; small = a sky of scattered patches.
+    float cloudWeatherScaleM = 16000.0f;
+    // Optical density of cloud at density 1, per metre. Higher = more opaque, darker undersides, harder silhouettes.
+    float cloudExtinction = 0.045f;
+    // How deep the detail noise eats into the base shape. 0 = smooth blobs, 1 = ragged wisps.
+    float cloudErosion = 0.45f;
+    // View-ray samples through the deck per low-res pixel. The main cost knob.
+    int cloudSteps = 64;
+    // Samples toward the sun per view sample (plus one long sample). Fewer = flatter clouds, cheaper.
+    int cloudLightSteps = 5;
+    // How far along a ray the deck is marched. Past it the deck is left to the haze.
+    float cloudMaxDistM = 45000.0f;
+    // e-folding distance of the aerial perspective on clouds: how quickly distant cloud dissolves into the horizon sky.
+    float cloudHazeM = 32000.0f;
+    // Henyey-Greenstein anisotropy of the forward lobe. Higher = brighter silver lining when looking toward the sun.
+    float cloudPhaseG = 0.72f;
+    // Octave falloff of the multiple-scattering approximation. Higher = brighter, softer cloud interiors.
+    float cloudMultiScatter = 0.5f;
+    // Darkening of thin cloud edges seen away from the sun (the 'powdered sugar' look).
+    float cloudPowder = 0.7f;
+    // Skylight on clouds, as a multiple of the terrain's hemisphere ambient.
+    float cloudAmbient = 2.2f;
+    // Multiplier on direct sun/moon light scattered by clouds.
+    float cloudSunGain = 1.0f;
+    // How much cloud shadows darken the direct light on the ground. 0 = clouds cast nothing.
+    float cloudShadowStrength = 0.9f;
+    // Opacity of the distant rain shafts under raining cells.
+    float cloudRainDensity = 1.0f;
+    // Brightness of the falling streaks (or flakes) around the camera.
+    float cloudRainStreaks = 1.0f;
+    // Weight of the new frame in the low-res accumulation. Lower = smoother but more lag when clouds move fast.
+    float cloudTemporal = 0.12f;
+    // The cloud buffer is the render target divided by this on each axis. 2 = quarter the pixels.
+    int cloudResDiv = 3;
+    // Cloud drift as a multiple of the surface wind (winds aloft are faster than at the ground).
+    float cloudWindScale = 4.0f;
+    // How much rain-soaked, sky-exposed ground darkens at full wetness.
+    float cloudWetDarken = 0.42f;
+    // Strength of the rainbow in sunlit rain (42 degrees from the anti-solar point).
+    float cloudRainbow = 1.0f;
+    // Feature size of the high ice-cloud streaks.
+    float cloudCirrusScaleM = 7000.0f;
+    // How much the clouds in a direction colour the distance fog and reflections in it (the env map).
+    float cloudFogMix = 1.0f;
     float lodHandoffDist = 24.0f;
     // ---- frame pacing and internal resolution (CPU-only: no .def row, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------

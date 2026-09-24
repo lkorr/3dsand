@@ -125,12 +125,23 @@ struct Grimoire {
 // unbounded expansion, ever).
 struct GrimoireExpansion {
   std::vector<int> spoken;
+  // Per-word magnitude and timing, parallel to `spoken` (always the same
+  // length): what `word@x!bounce+20` in the page said, resolved - the glyph's
+  // default magnitude and on-hit timing where it said nothing.
+  std::vector<int32_t> mags;
+  std::vector<SpellTiming> timing;
   int dropped = 0;
   bool truncated = false;
   bool tooDeep = false;
   // The words in order with `?` for a dropped one, for the readout.
   std::vector<std::string> readout;
 };
+
+// An expansion as SERIALIZED words (`fire@2`, ...): what a page says with
+// every nested page flattened, each word carrying its own properties.
+std::vector<std::string> ExpansionWords(const GlyphLibrary& lib, const GrimoireExpansion& ex);
+// ...and as the spoken stack it is, properties and all.
+SpellStack StackOf(const GrimoireExpansion& ex);
 
 // A page name resolves against the player's pages first, then the library's
 // authored starters (read-only). Returns the page or null.
@@ -179,10 +190,33 @@ struct PlayerCaster {
     compiled = CompileSpell(lib, stack);
     readout = DescribeSpell(lib, compiled);
   }
-  // Speak the glyph or page bound to a slot. Pressing a number SPEAKS, it
-  // never casts. Bounded so a stuck key cannot grow the stack without limit
-  // (rule 2 applies to UI state too — an unbounded stack is an unbounded
-  // mana cost); a page speaks as much of its expansion as fits and says so.
+  // THE PAGE IS THE INTERFACE (docs/PLAN_spell_graph.md §0b). A number key
+  // SELECTS the spell bound to a slot: the stack becomes that page's whole
+  // expansion (or that one glyph), the HUD shows its readout and price, and
+  // right-click casts it. The selection PERSISTS across casts, so a bound
+  // spell fires repeatedly off one key; another key switches, Backspace
+  // clears. Building the sentence is the grimoire page's job now, not the
+  // number row's.
+  //
+  // `selected` is the slot the stack came from, for the HUD strip's highlight;
+  // -1 when the stack was built some other way.
+  int selected = -1;
+  bool SelectSlot(const GlyphLibrary& lib, int slot) {
+    stack.Clear();
+    selected = -1;
+    if (!SpeakSlot(lib, slot)) {
+      Recompile(lib);
+      return false;
+    }
+    selected = slot;
+    return true;
+  }
+  // Put the glyph or page bound to a slot ONTO the stack, on top of whatever is
+  // there. Bounded so a stuck key cannot grow the stack without limit (rule 2
+  // applies to UI state too — an unbounded stack is an unbounded mana cost); a
+  // page speaks as much of its expansion as fits and says so. The number row no
+  // longer calls this one word at a time (see `SelectSlot`); it is the
+  // primitive under it, and the `grimoire` gate's fixture.
   bool SpeakSlot(const GlyphLibrary& lib, int slot) {
     if (inventory.KindAt(slot) == SlotKind::Page) return SpeakPage(lib, inventory.PageAt(slot));
     const int gi = inventory.At(slot);
@@ -196,7 +230,8 @@ struct PlayerCaster {
     const int room = kSpellStackMax - (int)stack.spoken.size();
     if (room <= 0) return false;
     const GrimoireExpansion ex = ExpandWords(lib, grimoire, {name}, room);
-    for (int gi : ex.spoken) stack.spoken.push_back(gi);
+    for (size_t k = 0; k < ex.spoken.size(); k++)
+      stack.Push(ex.spoken[k], ex.mags[k], ex.timing[k]);
     if (ex.truncated) {
       note = "the stack is full: " + name + " was cut short";
       noteAge = 0.0f;
@@ -223,8 +258,10 @@ struct PlayerCaster {
     std::string base = p.name;
     for (int k = 2; grimoire.Find(p.name) >= 0 && k < 100; k++)
       p.name = base + "-" + std::to_string(k);
-    for (int gi : stack.spoken)
-      if (const GlyphDef* g = lib.At(gi)) p.words.push_back(g->id);
+    for (size_t k = 0; k < stack.spoken.size(); k++)
+      if (const GlyphDef* g = lib.At(stack.spoken[k]))
+        p.words.push_back(
+            SerializeWord(*g, ClampMagnitude(*g, stack.MagAt(k)), stack.TimingAt(k)));
     if ((int)p.words.size() > lib.budgets.maxMacroWords)
       p.words.resize(lib.budgets.maxMacroWords);
     grimoire.pages.push_back(p);
@@ -234,6 +271,7 @@ struct PlayerCaster {
   }
   void Clear(const GlyphLibrary& lib) {
     stack.Clear();
+    selected = -1;
     Recompile(lib);
   }
 };

@@ -49,6 +49,8 @@ PlayerState MakePlayerState(const PlayerSession& s, uint32_t tick,
   st.Set(PlayerState::kFly, p.fly);
   st.Set(PlayerState::kHanging, p.hanging);
   st.Set(PlayerState::kBlindFall, p.blindFall);
+  st.Set(PlayerState::kThrowDraw, s.throwTicks > 0);
+  st.Set(PlayerState::kThrowSwing, s.throwLaunchIn > 0);
   // ALIVE IS THE AVATAR'S ANSWER, not the HUD's. Phase H uses `ui.playerAlive`
   // for the primary because that mirror is what the window draws; over the
   // wire the window is irrelevant and the body is the truth. A session with no
@@ -245,7 +247,23 @@ void RemotePlayersPreTick(RemotePlayers& remotes, uint32_t tick, float dt,
         remotes.dirty = true;
       }
     }
-    if (!r.spawned) continue;
+    if (!r.spawned) {
+      r.throwDraw = r.throwSwing = false;
+      continue;
+    }
+
+    // ---- the throw: the same clips session.cpp plays on the owner's rig ---
+    // Presentation only -- the vessel itself is the owner's body in the
+    // owner's world. Played on the transitions of the two levels.
+    {
+      const bool draw = r.last.Has(PlayerState::kThrowDraw);
+      const bool swing = r.last.Has(PlayerState::kThrowSwing);
+      if (draw && !r.throwDraw) r.avatar.PlayClip("throw_windup");
+      if (!draw && r.throwDraw) r.avatar.StopClip("throw_windup");
+      if (swing && !r.throwSwing) r.avatar.PlayClip("throw");
+      r.throwDraw = draw;
+      r.throwSwing = swing;
+    }
 
     // ---- drive the rig ---------------------------------------------------
     // SetLook before PreTick, for the reason phase I states: PreTick is what

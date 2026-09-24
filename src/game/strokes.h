@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "game/anim.h"    // Ease / ApplyEase — a cut's pacing IS a clip's easing
 #include "game/melee.h"
 #include "math3d.h"
 
@@ -29,9 +30,21 @@
 //     "label":   "Horizontal cut, weapon side across",
 //     "windup":  { "ticks": 12, "az":  0.30, "el": 0.10, "reach": -0.05 },
 //     "cut":     { "ticks":  7, "az": -2.30, "el": 0.00, "reach":  0.10 },
-//     "recover": { "ticks": 10 },
+//     "recover": { "ticks": 10, "az": 0.25, "el": 0.10, "reach": -0.10,
+//                  "settle": 7, "fade": 5 },
 //     "jitter":  { "az": 0.20, "el": 0.08, "tempo": 0.25 }
 //   }
+//
+// ...and `cut` MAY BE A LIST OF LEGS instead of one segment, which is the only
+// way to author a stroke that is not a straight line (2026-09-21):
+//
+//     "cut": [
+//       { "ticks": 4, "az": -1.10, "el": -0.35, "reach":  0.20 },
+//       { "ticks": 5, "az": -1.20, "el":  0.35, "reach": -0.10, "aim": true }
+//     ]
+//
+// See "A CUT IS A PATH" below for what the legs mean and which one meets the
+// target. One segment and a one-leg list are the same program.
 //
 // WINDUP is a POSE, in the mob's own facing basis, expressed RELATIVE TO THE
 // AIM (see below): azimuth 0 straight ahead and positive to the mob's right,
@@ -46,8 +59,41 @@
 // implies, which is what commits the driver's own Slash and gives the sweep the
 // tip speed that scales the damage (melee.h note 2, "SPEED IS THE DAMAGE").
 //
-// RECOVER is a hold with no input: the driver's own follow-through unwinds and
-// the arm is handed back to the walk cycle over `PoseWeight`'s ramp.
+// RECOVER is a RETURN, and it is an absolute pose rather than an aim-relative
+// one: the arm is DRIVEN back to a stance over `settle` ticks (closed-loop and
+// under commitSpeed, the windup's own drive, so no cut can fire out of one) and
+// only then is the claim handed back over `fade`. A style that authors no pose
+// gets the historical behaviour — release on the first tick, freeze wherever
+// the cut ended, crossfade. See `StrokeRecover` below for why that was not good
+// enough.
+//
+// ---------------------------------------------------------------------------
+// A CUT IS A PATH (2026-09-21)
+//
+// One segment can only express a straight line through the target: the deltas
+// are divided by the ticks and delivered at a constant rate, so every cut in
+// the library was a chord. A hook that comes round the guard, a chop that
+// drops and then drags, a feint that checks and re-commits — none of them had
+// an authoring surface, and "add another style" cannot make one, because the
+// thing missing is INSIDE one stroke.
+//
+// So `cut` is a LIST OF LEGS, run back to back inside the one Cut phase. Each
+// leg is an ordinary `StrokeSegment` and means exactly what the single cut
+// meant: a TRAVEL from wherever the previous leg ended, its deltas divided by
+// its own `ticks`. The path is therefore CUMULATIVE — leg 2's `az` is measured
+// from the end of leg 1, not from the start of the cut — because that is what
+// makes an author able to lengthen leg 1 without re-typing everything after it.
+//
+// THE PHASE DOES NOT SPLIT. `Phase::Cut` covers the whole path, `cutTicks` is
+// its total and `phaseTick` counts across it, so everything outside this file
+// that asks "is this stroke cutting" or "how many cut ticks are left" — the
+// damage sweep, the bite holdout, the dev readout, every gate — is unchanged
+// and needs to know nothing about legs. A leg boundary is a change of velocity,
+// not a change of state; there is no frame of hand-back between them.
+//
+// A leg that travels nowhere is a HITCH, and is legal: it holds the point where
+// it is for its ticks, which is the hesitation in a feint. What is refused is a
+// whole path that travels nowhere — see the loader.
 //
 // ---------------------------------------------------------------------------
 // THE CUT IS CENTRED ON THE AIM, AND THE AIM IS TAKEN ONCE
@@ -60,6 +106,15 @@
 // the aim so that the MIDDLE of the travel passes through it, rather than the
 // beginning. A stroke aimed at its own start point cuts the air behind the
 // target every time.
+//
+// WITH A PATH, "half a cut" BECOMES "WHICH LEG MEETS THEM", and it is authored
+// rather than assumed: a leg may say `"aim": true`, and the target then sits at
+// the middle of THAT leg (`AttackStyle::CutAimOffset`). Unstated, the aim sits
+// at the midpoint of the whole travel, which for a one-leg cut is the old
+// `cut/2` exactly. It matters because the midpoint of a dogleg is often the
+// corner — the one point on the path where the blade is slowest and turning —
+// and a hook whose target sits there lands its hesitation on them instead of
+// its edge.
 //
 // ---------------------------------------------------------------------------
 // VARIATION IS DETERMINISTIC (CLAUDE.md rule 1)
@@ -86,6 +141,14 @@ struct StrokeSegment {
   float el = 0;
   float reach = 0;
 };
+
+// HOW MANY LEGS ONE CUT MAY HAVE. A ceiling because the live cursor carries
+// the jittered tick count of each leg in a fixed array (a stroke program is
+// per-creature presentation state stepped every tick; it does not allocate),
+// and because a path with more corners than this is a clip rather than a
+// stroke — the body animation lane is where that belongs. The loader drops the
+// extras LOUDLY rather than silently truncating the motion.
+constexpr int kMaxCutLegs = 6;
 
 struct StrokeJitter {
   float az = 0;      // radians of start-azimuth bow, +-
@@ -133,13 +196,194 @@ struct StyleTargetWeight {
   float weight = 0;
 };
 
+// ---- HOW THE ARM COMES BACK (AttackStyle::recover; 2026-09-21) ------------
+//
+// THE RECOVER USED TO BE FOUR LINES AND NONE OF THEM WAS A MOTION. The runner
+// set `held = false` and stepped the driver, and everything after that was out
+// of the style's hands: the STORED stroke froze wherever the cut ended (only
+// the follow-through arc decayed), `PoseWeight` ramped 1 -> 0 over the ONE
+// global `melee.recoverTime` shared by every attack in the game, and
+// Mob::ApplyWeaponArm handed that number to AnimSolveTwoBone as a BLEND
+// WEIGHT. So the path from the end of a cut back to the walk cycle was a
+// rotation-space crossfade with nothing in it that knows about anatomy — and a
+// cut that ends with the blade across the body blends THROUGH the torso to get
+// home. That is the "limbs move in impossible ways" report, and no amount of
+// tuning the windup or the cut could reach it, because the recover was not
+// being authored at all.
+//
+// So a recover is now a SEGMENT like the other two, and the arm is DRIVEN
+// through it:
+//
+//   "recover": { "ticks": 10, "az": 0.25, "el": 0.10, "reach": -0.10,
+//                "settle": 7, "fade": 5 }
+//
+// THE POSE IS ABSOLUTE, in the mob's own facing basis — the same vocabulary
+// `StrokeCursor::Phase::Guard` already uses, and deliberately NOT the windup's
+// aim-relative one. A recover is a return to STANCE, not a second aim: an
+// arm that recovered relative to the target would end every swing pointed back
+// at whatever it just hit, which reads as re-chambering rather than as
+// finishing. `reach` is an offset from the neutral band position, exactly as
+// `windup.reach` and `cut.reach` are, so it means the same thing on any rig.
+//
+// SETTLE is how many of the `ticks` are DRIVEN before the hand-back begins.
+// Those ticks steer closed-loop and under `commitSpeed` (the windup's own
+// drive, so no cut can fire out of a recover) with the button still down, so
+// `PoseWeight` stays at 1 and the arm really travels. Only afterwards is the
+// button released and the claim faded — from a pose that is already near the
+// one being blended to, which is what makes the crossfade short enough to be
+// invisible instead of long enough to go through the chest.
+//
+// FADE overrides `melee.recoverTime` FOR THIS STYLE, in ticks (0 = the global
+// value). A jab and an overhead chop have no business handing the arm back on
+// the same clock, and before this they had no choice: one number in tuning.json
+// owned every recover in the game.
+//
+// EVERY FIELD DEFAULTS TO THE OLD BEHAVIOUR. `posed` is false unless the style
+// authored an az/el/reach, and an unposed recover releases on tick 0 with the
+// global fade — which is, line for line, what the four lines used to do. A
+// style written before this loads and swings identically.
+struct StrokeRecover {
+  int ticks = 10;
+  // Did the author state a return pose at all? False = freeze where the cut
+  // ended and crossfade, the pre-2026-09-21 behaviour.
+  bool posed = false;
+  float az = 0;      // ABSOLUTE, mob's facing basis: + is the mob's right
+  float el = 0;      // ABSOLUTE, 0 is level
+  float reach = 0;   // offset from the neutral band position, like the others
+  // Ticks DRIVEN to that pose before the button is released. Clamped to
+  // `ticks` at load. Meaningless without a pose, and ignored without one.
+  int settle = 0;
+  // Ticks the hand-back fade takes, overriding melee.recoverTime; 0 = global.
+  int fade = 0;
+};
+
+// ---- HOW A CUT'S TRAVEL IS PACED (AttackStyle::ease; 2026-09-22) ----------
+//
+// The cut's per-tick delta is `gap / ticksLeftInThisLeg`, and that is a
+// CONSTANT RATE: the gap shrinks linearly and the point lands on the leg's end
+// exactly on its last tick (the derivation is in StepStrokeProgram). It is the
+// only pacing a cut has ever had, and on a long cut it is the wrong one to be
+// stuck with -- an author who wanted a blade that accelerates into the target,
+// or one that arrives early and settles, could only fake it by splitting the
+// path into legs with different tick counts.
+//
+// So the rate is a CURVE over the leg now. IT IS THE ENGINE'S EXISTING EASE
+// VOCABULARY (`anim.h` Ease / ParseEase / ApplyEase), not a second one: those
+// eight curves are already what a clip keyframe interpolates with, already
+// authored by name in assets/anims/*.json, and already ported to
+// editor/anim.js. A style saying `"ease": "quadOut"` therefore means exactly
+// what a keyframe saying it means, which is design guideline 4 ("author
+// content by name") and guideline 3 ("one authoritative source per fact")
+// applied to the one concept both systems needed. The first cut of this had
+// its own three-value `linear|exp|log` enum, and `exp`/`log` were literally
+// QuadOut and QuadIn respelled.
+//
+//   linear      f(p) = p            constant rate. THE DEFAULT, and
+//                                   algebraically the pre-2026-09-22 drive.
+//   quadOut     f(p) = 1-(1-p)^2    fast off the mark, decelerating in
+//   quadIn      f(p) = p^2          slow off the mark, accelerating in
+//   cubicIn/Out                     the same two, harder
+//   quadInOut / cubicInOut          slow at both ends, fast through the middle
+//   instant                         hold, then arrive on the last tick
+//
+// `f(p)` is the fraction of THE LEG'S TRAVEL that should be behind the point at
+// progress `p`. What the drive actually spends is the share of the REMAINING
+// gap the curve advances this tick (StrokeEaseStep) rather than an absolute
+// position, which is what keeps the property the Cut phase is built on: each
+// leg's target is an ABSOLUTE point on the path, so a leg that ran out of
+// ticks short of its corner does not displace the legs after it.
+//
+// THIS PACES THE CUT ONLY. The windup and the settle are a closed-loop chase
+// to a POSE under `commitSpeed` (`steerTo`), which is a different control law
+// with its own feel and no authored travel to distribute.
+
+// The share of the REMAINING gap to spend on the tick carrying progress
+// p0 -> p1.
+//
+// THE LAST TICK ALWAYS SPENDS EVERYTHING. Forced rather than derived, because
+// `Ease` contains curves that do not reach 1 -- `instant` is 0 for every t
+// including t=1 -- and a cut whose curve never completes would leave residue
+// for the next leg to absorb, or stop short of the path's end entirely. With
+// the force, all eight curves arrive exactly and `instant` is a legitimate
+// shape (hold, then snap home) rather than a way to freeze the blade.
+//
+// For `linear` over a leg of N ticks this is (1/N) / ((N-k)/N) = 1/(N-k),
+// which IS the old `gap / left` divisor. The Cut phase still spells that case
+// out longhand rather than calling this, so the default drive cannot move a
+// hash on float rounding; the identity is what makes that safe to do.
+inline float StrokeEaseStep(Ease e, float p0, float p1) {
+  if (p1 >= 1.0f) return 1.0f;
+  const float f0 = ApplyEase(e, p0), f1 = ApplyEase(e, p1);
+  const float room = 1.0f - f0;
+  if (room <= 1e-6f) return 1.0f;
+  const float s = (f1 - f0) / room;
+  return s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
+}
+
 struct AttackStyle {
   std::string name;    // the id a behaviour profile refers to
   std::string label;   // human text for the dev readout
+  // How the cut's travel is paced over each leg, in the engine's shared ease
+  // vocabulary (anim.h). Linear is the historical drive; see above.
+  Ease ease = Ease::Linear;
   StrokeSegment windup;
-  StrokeSegment cut;
-  int recoverTicks = 10;
+  // THE CUT PATH, one leg or several ("A CUT IS A PATH" above). NEVER EMPTY
+  // after `LoadAttackStyles` — a style whose whole path travels nowhere is
+  // refused rather than loaded as a cut with no legs, so every reader may say
+  // `cut[0]` and every writer that builds a style by hand owes it one leg.
+  std::vector<StrokeSegment> cut{StrokeSegment{7, -2.0f, 0.0f, 0.10f}};
+  // WHICH LEG THE TARGET IS IN THE MIDDLE OF (`"aim": true` on that leg);
+  // -1 = the midpoint of the whole travel, which is what a one-leg cut has
+  // always done.
+  int aimLeg = -1;
+  StrokeRecover recover;
   StrokeJitter jitter;
+
+  // ---- THE PATH, READ THREE WAYS ------------------------------------------
+  // Here rather than at the call sites because a gate, the dev readout and the
+  // runner all need the same arithmetic, and three copies of "sum the legs" is
+  // three chances for one of them to still think a cut is a chord.
+
+  // The whole travel, summed: what a single segment with these numbers would
+  // have been, `ticks` included. This is the displacement a style ASKS for and
+  // what "is this style azimuth-dominant" is a question about.
+  StrokeSegment CutTravel() const {
+    StrokeSegment t{0, 0, 0, 0};
+    for (const StrokeSegment& s : cut) {
+      t.ticks += s.ticks;
+      t.az += s.az;
+      t.el += s.el;
+      t.reach += s.reach;
+    }
+    return t;
+  }
+  // Cumulative travel from the start of the cut through leg `k` INCLUSIVE, so
+  // `CutThrough(k)` is where the point stands when leg k ends. `k < 0` is the
+  // start of the path, which is what makes the aim arithmetic below one line.
+  StrokeSegment CutThrough(int k) const {
+    StrokeSegment t{0, 0, 0, 0};
+    for (int i = 0; i <= k && i < (int)cut.size(); i++) {
+      t.ticks += cut[i].ticks;
+      t.az += cut[i].az;
+      t.el += cut[i].el;
+      t.reach += cut[i].reach;
+    }
+    return t;
+  }
+  // WHERE THE TARGET SITS ALONG THE PATH, measured from the cut's start. The
+  // windup lands at `aim - this`, and leg k therefore ends at
+  // `aim - this + CutThrough(k)`.
+  void CutAimOffset(float& az, float& el) const {
+    if (aimLeg >= 0 && aimLeg < (int)cut.size()) {
+      const StrokeSegment before = CutThrough(aimLeg - 1);
+      az = before.az + 0.5f * cut[aimLeg].az;
+      el = before.el + 0.5f * cut[aimLeg].el;
+      return;
+    }
+    const StrokeSegment all = CutTravel();
+    az = 0.5f * all.az;
+    el = 0.5f * all.el;
+  }
   // ---- WHAT SWINGS IT (plan §4/§5) ---------------------------------------
   // "held" (the default, and every style authored before this existed) or the
   // NAME of a natural weapon on the creature's own rig (mob.h
@@ -215,6 +459,7 @@ struct StyleLibrary {
   // asking one set of sectors to mean both would make every punch a
   // re-labelled sword cut.
   PlayerStrikeMap playerUnarmed;
+  PlayerStrikeMap playerDagger;
   int Find(const std::string& n) const {
     for (size_t i = 0; i < styles.size(); i++)
       if (styles[i].name == n) return (int)i;
@@ -267,8 +512,24 @@ struct StrokeCursor {
   int style = -1;
   int phaseTick = 0;         // ticks spent in the current phase
   int windupTicks = 0;       // after tempo jitter
-  int cutTicks = 0;
+  int cutTicks = 0;          // the WHOLE path, every leg (see "A CUT IS A PATH")
   int recoverTicks = 0;
+  // ---- THE PATH, AS THIS SWING WILL ACTUALLY RUN IT -----------------------
+  // The tempo jitter is applied PER LEG and resolved once at BeginStrokeProgram
+  // rather than re-derived per tick: rounding each leg independently every tick
+  // would let a boundary move under the drive, and a leg whose remaining ticks
+  // changed mid-leg is a velocity step — the exact discontinuity `swing-smooth`
+  // exists to catch. `cutTicks` is the sum of these, which is why nothing
+  // outside this file has to know they exist.
+  int cutLegs = 1;
+  int legTicks[kMaxCutLegs] = {0, 0, 0, 0, 0, 0};
+  // Which leg the cut is in right now, recorded for the dev readout and the
+  // gates. Derived from `phaseTick` by the runner; never an input.
+  int cutLeg = 0;
+  // How many of `recoverTicks` are DRIVEN to the style's return pose before
+  // the button is released (StrokeRecover::settle, resolved and clamped at
+  // BeginStrokeProgram). 0 = release immediately, the historical recover.
+  int settleTicks = 0;
   uint32_t seed = 0;         // wielder ^ salt ^ startTick; every draw keys off it
   // The aim, resolved ONCE at the end of the windup and never refreshed.
   float aimAz = 0, aimEl = 0;

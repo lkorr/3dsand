@@ -1,0 +1,18 @@
+{
+  "label": "Snow",
+  "about": "A low bright-grey deck and falling snow. Weight 0: the automatic cycle never picks it (there are no seasons yet); pin it from the dev panel or weather.preset.",
+  "moisture": 0.78,
+  "weight": 0.0,
+  "coverage": 0.9,
+  "cloudType": 0.2,
+  "density": 1.1,
+  "baseM": 800,
+  "thicknessM": 1500,
+  "darkness": 0.2,
+  "cirrus": 0.0,
+  "cirrusAltM": 8000,
+  "precip": 0.8,
+  "precipType": 1.0,
+  "mist": 1.2,
+  "lightning": 0.0
+}

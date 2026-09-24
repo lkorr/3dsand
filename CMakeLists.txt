@@ -386,6 +386,38 @@ if(NOT miniaudio_POPULATED)
 endif()
 
 # ---------------------------------------------------------------------------
+# zstd (region-file compression, SVR3 — src/sim/chunkstore.cpp,
+# docs/PLAN_save_system.md S3)
+#
+# Populate-only, like miniaudio: zstd's own build/cmake project declares the
+# programs, tests, a shared lib and install rules, and configuring it costs
+# more than compiling the library. The library is lib/{common,compress,
+# decompress}/*.c and nothing else, so it is built here as one static target.
+# ZSTD_DISABLE_ASM: the x64 Huffman decoder is a GNU-as .S file MSVC cannot
+# assemble; the C fallback is what an MSVC build of upstream uses too.
+# ZSTD_MULTITHREAD is left undefined — one chunk (16 KiB) per call has nothing
+# to parallelise. Pinned to a release tag.
+# ---------------------------------------------------------------------------
+FetchContent_Declare(
+  zstd
+  GIT_REPOSITORY https://github.com/facebook/zstd.git
+  GIT_TAG        v1.5.7
+  GIT_SHALLOW    TRUE
+)
+sv_reuse_shared_source(zstd)
+FetchContent_GetProperties(zstd)
+if(NOT zstd_POPULATED)
+  FetchContent_Populate(zstd)
+endif()
+file(GLOB SV_ZSTD_SOURCES CONFIGURE_DEPENDS
+  ${zstd_SOURCE_DIR}/lib/common/*.c
+  ${zstd_SOURCE_DIR}/lib/compress/*.c
+  ${zstd_SOURCE_DIR}/lib/decompress/*.c)
+add_library(zstd_lib STATIC ${SV_ZSTD_SOURCES})
+target_include_directories(zstd_lib PUBLIC ${zstd_SOURCE_DIR}/lib)
+target_compile_definitions(zstd_lib PRIVATE ZSTD_DISABLE_ASM XXH_NAMESPACE=ZSTD_)
+
+# ---------------------------------------------------------------------------
 # sandvox
 #
 # Two targets, one program. `sandvox_core` is an OBJECT library holding every
@@ -456,6 +488,7 @@ add_library(sandvox_core OBJECT
   # The authored biome + water-body preset files (assets/biomes, assets/water):
   # loaded and validated on the CPU; the table worldgen will read.
   src/sim/biomes.cpp
+  src/sim/weather.cpp
   src/sim/worldmap.cpp
   src/sim/microvox.cpp
   src/sim/microbody.cpp
@@ -486,9 +519,14 @@ add_library(sandvox_core OBJECT
   src/game/avatar.cpp
   src/game/thirdperson.cpp
   src/game/spell.cpp
+  src/game/spellgraph.cpp
   src/game/caster.cpp
   src/game/melee.cpp
+  src/game/container.cpp
   src/game/strokes.cpp
+  # Is this pose inside itself? (game/selfclip.h) — voxel-level limb
+  # interpenetration, differenced against the bind pose.
+  src/game/selfclip.cpp
   # THE AUTHORITY / PRESENTATION BOUNDARY (docs/PLAN_multiplayer_now.md N5).
   # PlayerSession is one player; TickAuthority is one tick of gameplay, moved
   # out of the middle of main()'s frame loop. See src/game/session.h.
@@ -526,7 +564,9 @@ add_library(sandvox_core OBJECT
   src/test/selftest_mob.cpp
   src/test/selftest_worldio.cpp
   src/test/selftest_spell.cpp
+  src/test/selftest_spellgraph.cpp
   src/test/selftest_playerkit.cpp
+  src/test/selftest_vessel.cpp
   src/test/selftest_swing.cpp
   src/test/selftest_combat.cpp
   src/test/selftest_equipment.cpp
@@ -569,6 +609,10 @@ add_library(sandvox_core OBJECT
   # inventory_ui.cpp is a pure drawing function over UIState.
   src/ui/theme.cpp
   src/ui/inventory_ui.cpp
+  # spellgraph_ui.cpp is the composer's CANVAS: it draws UIState::spellGraph
+  # (main.cpp's mirror of game/spellgraph.h) and turns a gesture into a
+  # GraphEditIntent. It applies no op itself.
+  src/ui/spellgraph_ui.cpp
   src/telemetry.cpp
   # The network layer (docs/PLAN_multiplayer_m9.md M9.2). Beside telemetry.cpp
   # because they are the only two TUs that open a socket, and ws2_32 is already
@@ -638,6 +682,9 @@ set(SANDVOX_LINK_LIBS
   # include directories (spirv-tools/optimizer.hpp) and pulls in SPIRV-Tools
   # core for the validator that guards the optimizer's output.
   SPIRV-Tools-opt
+  # SVR3 region files (src/sim/chunkstore.cpp). Declared above, next to
+  # miniaudio.
+  zstd_lib
 )
 target_link_libraries(sandvox_core PRIVATE ${SANDVOX_LINK_LIBS})
 # `sandvox_compile` = "compile everything sandvox links, link nothing". An

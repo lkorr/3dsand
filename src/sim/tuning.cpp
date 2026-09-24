@@ -446,6 +446,9 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "coyoteTime", p.coyoteTime, out, at);
     ReadF(*g, "jumpBufferTime", p.jumpBufferTime, out, at);
     ReadF(*g, "groundAccel", p.groundAccel, out, at);
+    ReadF(*g, "slipCoatStart", p.slipCoatStart, out, at);
+    ReadF(*g, "slipCoatFull", p.slipCoatFull, out, at);
+    ReadF(*g, "slipGrip", p.slipGrip, out, at);
     ReadF(*g, "airAccel", p.airAccel, out, at);
     ReadF(*g, "liquidAccel", p.liquidAccel, out, at);
     ReadF(*g, "liquidDrag", p.liquidDrag, out, at);
@@ -620,9 +623,11 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "airPoseLean", a.airPoseLean, out, at);
     a.airPoseLean = std::clamp(a.airPoseLean, 0.0f, 60.0f);
     ReadB(*g, "firstPersonArms", a.firstPersonArms, out, at);
+    ReadF(*g, "firstPersonForward", a.firstPersonForward, out, at);
     ReadF(*g, "footTrim", a.footTrim, out, at);
     ReadF(*g, "severImpulse", a.severImpulse, out, at);
     ReadF(*g, "respawnDelay", a.respawnDelay, out, at);
+    ReadB(*g, "keepKitOnTurn", a.keepKitOnTurn, out, at);
   }
 
   if (const json* g = Find(j, "audio")) {
@@ -1098,6 +1103,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "coat";
     ReadI(*g, "recountTicks", e.recountTicks, out, at);
     ReadF(*g, "decayScale", e.decayScale, out, at);
+    ReadF(*g, "sunDryScale", e.sunDryScale, out, at);
+    ReadF(*g, "fireDrySeconds", e.fireDrySeconds, out, at);
     ReadI(*g, "shedCells", e.shedCells, out, at);
     ReadI(*g, "shedPerTick", e.shedPerTick, out, at);
     ReadI(*g, "shedAmount", e.shedAmount, out, at);
@@ -1120,6 +1127,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // into a two-tick period, which is the `body-coat` gate's fast arm and the
     // fastest anything here is meant to be dialled.
     e.decayScale = std::min(e.decayScale, 300.0f);
+    e.sunDryScale = std::clamp(e.sunDryScale, 1.0f, 20.0f);
+    e.fireDrySeconds = std::clamp(e.fireDrySeconds, 0.05f, 120.0f);
     e.shedCells = std::clamp(e.shedCells, 0, 32);
     e.shedPerTick = std::clamp(e.shedPerTick, 0, 1024);
     e.shedAmount = std::clamp(e.shedAmount, 0, 15);
@@ -1186,6 +1195,10 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "torsoShare", e.torsoShare, out, at);
     ReadF(*g, "torsoPitch", e.torsoPitch, out, at);
     ReadF(*g, "headClearM", e.headClearM, out, at);
+    ReadF(*g, "bodyClearM", e.bodyClearM, out, at);
+    ReadF(*g, "leanFlipHold", e.leanFlipHold, out, at);
+    ReadF(*g, "leanMinSpeed", e.leanMinSpeed, out, at);
+    ReadF(*g, "flatMinSin", e.flatMinSin, out, at);
 
     // ---- BOUNDS, not taste ---------------------------------------------------
     // Every clamp here protects a STRUCTURAL property of the stroke rather than
@@ -1313,6 +1326,16 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.torsoShare = std::clamp(e.torsoShare, 0.0f, 1.0f);
     e.torsoPitch = std::clamp(e.torsoPitch, 0.0f, 1.0f);
     e.headClearM = std::clamp(e.headClearM, 0.0f, 0.5f);
+    // Past half a metre the capsule is wider than the arm can reach round and
+    // the stroke is pinned at the stop; 0 is the off switch and is legal.
+    e.bodyClearM = std::clamp(e.bodyClearM, 0.0f, 0.5f);
+    // 0 pins the lean plane outright; pi is "never treat a turn as a
+    // reversal", which is the old behaviour and the one-JSON-edit A/B.
+    e.leanFlipHold = std::clamp(e.leanFlipHold, 0.0f, 3.15f);
+    e.leanMinSpeed = std::clamp(e.leanMinSpeed, 0.0f, 5.0f);
+    // Past ~0.95 the roll would never be recomputed at all, which is a blade
+    // whose edge stops leading the cut.
+    e.flatMinSin = std::clamp(e.flatMinSin, 0.0f, 0.95f);
   }
 
   // ---- combat feel: hit-stop, hit flash, combat cues ------------------------
@@ -2084,6 +2107,27 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     const std::string at = "weather";
     ReadB(*g, "waterFreezes", w.waterFreezes, out, at);
     ReadB(*g, "iceMelts", w.iceMelts, out, at);
+    // The sky half (weather.h). Clamped here, not trusted: a negative epoch or
+    // a transition of 0 would divide by zero in weather::Resolve.
+    ReadB(*g, "clouds", w.clouds, out, at);
+    ReadB(*g, "autoCycle", w.autoCycle, out, at);
+    ReadStr(*g, "preset", w.preset, out, at);
+    ReadF(*g, "epochMinutes", w.epochMinutes, out, at);
+    ReadF(*g, "cycleSpeed", w.cycleSpeed, out, at);
+    ReadI(*g, "seedOffset", w.seedOffset, out, at);
+    ReadF(*g, "transitionSeconds", w.transitionSeconds, out, at);
+    ReadF(*g, "coverageBias", w.coverageBias, out, at);
+    ReadF(*g, "precipScale", w.precipScale, out, at);
+    ReadF(*g, "drySeconds", w.drySeconds, out, at);
+    ReadB(*g, "rainTouchesWorld", w.rainTouchesWorld, out, at);
+    ReadF(*g, "rainIgniteDamp", w.rainIgniteDamp, out, at);
+    w.rainIgniteDamp = std::clamp(w.rainIgniteDamp, 0.0f, 1.0f);
+    w.epochMinutes = std::clamp(w.epochMinutes, 0.5f, 600.0f);
+    w.cycleSpeed = std::clamp(w.cycleSpeed, 0.0f, 1000.0f);
+    w.transitionSeconds = std::clamp(w.transitionSeconds, 0.0f, 600.0f);
+    w.coverageBias = std::clamp(w.coverageBias, -1.0f, 1.0f);
+    w.precipScale = std::clamp(w.precipScale, 0.0f, 4.0f);
+    w.drySeconds = std::clamp(w.drySeconds, 5.0f, 36000.0f);
   }
 
   // ---- combustion: read by the REACTION COMPILER, not by a kernel ----
@@ -2550,6 +2594,56 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "farPlumeStrength", r.farPlumeStrength, out, at);
     ReadF(*g, "farPlumeHeight", r.farPlumeHeight, out, at);
     ReadF(*g, "farPlumeRange", r.farPlumeRange, out, at);
+    // clouds (cloud.wgsl). Clamped to the tuner's ranges: a 0 scale divides
+    // by zero in the march and a 0 step count marches nothing forever.
+    ReadF(*g, "cloudShapeScaleM", r.cloudShapeScaleM, out, at);
+    ReadF(*g, "cloudDetailScaleM", r.cloudDetailScaleM, out, at);
+    ReadF(*g, "cloudWeatherScaleM", r.cloudWeatherScaleM, out, at);
+    ReadF(*g, "cloudExtinction", r.cloudExtinction, out, at);
+    ReadF(*g, "cloudErosion", r.cloudErosion, out, at);
+    ReadI(*g, "cloudSteps", r.cloudSteps, out, at);
+    ReadI(*g, "cloudLightSteps", r.cloudLightSteps, out, at);
+    ReadF(*g, "cloudMaxDistM", r.cloudMaxDistM, out, at);
+    ReadF(*g, "cloudHazeM", r.cloudHazeM, out, at);
+    ReadF(*g, "cloudPhaseG", r.cloudPhaseG, out, at);
+    ReadF(*g, "cloudMultiScatter", r.cloudMultiScatter, out, at);
+    ReadF(*g, "cloudPowder", r.cloudPowder, out, at);
+    ReadF(*g, "cloudAmbient", r.cloudAmbient, out, at);
+    ReadF(*g, "cloudSunGain", r.cloudSunGain, out, at);
+    ReadF(*g, "cloudShadowStrength", r.cloudShadowStrength, out, at);
+    ReadF(*g, "cloudRainDensity", r.cloudRainDensity, out, at);
+    ReadF(*g, "cloudRainStreaks", r.cloudRainStreaks, out, at);
+    ReadF(*g, "cloudTemporal", r.cloudTemporal, out, at);
+    ReadI(*g, "cloudResDiv", r.cloudResDiv, out, at);
+    ReadF(*g, "cloudWindScale", r.cloudWindScale, out, at);
+    ReadF(*g, "cloudWetDarken", r.cloudWetDarken, out, at);
+    ReadF(*g, "cloudRainbow", r.cloudRainbow, out, at);
+    ReadF(*g, "cloudCirrusScaleM", r.cloudCirrusScaleM, out, at);
+    ReadF(*g, "cloudFogMix", r.cloudFogMix, out, at);
+    r.cloudShapeScaleM = std::clamp(r.cloudShapeScaleM, 1000.0f, 40000.0f);
+    r.cloudDetailScaleM = std::clamp(r.cloudDetailScaleM, 50.0f, 5000.0f);
+    r.cloudWeatherScaleM = std::clamp(r.cloudWeatherScaleM, 2000.0f, 100000.0f);
+    r.cloudExtinction = std::clamp(r.cloudExtinction, 0.001f, 0.5f);
+    r.cloudErosion = std::clamp(r.cloudErosion, 0.0f, 1.0f);
+    r.cloudSteps = std::clamp(r.cloudSteps, 8, 256);
+    r.cloudLightSteps = std::clamp(r.cloudLightSteps, 1, 12);
+    r.cloudMaxDistM = std::clamp(r.cloudMaxDistM, 2000.0f, 200000.0f);
+    r.cloudHazeM = std::clamp(r.cloudHazeM, 1000.0f, 300000.0f);
+    r.cloudPhaseG = std::clamp(r.cloudPhaseG, 0.0f, 0.95f);
+    r.cloudMultiScatter = std::clamp(r.cloudMultiScatter, 0.0f, 0.9f);
+    r.cloudPowder = std::clamp(r.cloudPowder, 0.0f, 1.0f);
+    r.cloudAmbient = std::clamp(r.cloudAmbient, 0.0f, 10.0f);
+    r.cloudSunGain = std::clamp(r.cloudSunGain, 0.0f, 5.0f);
+    r.cloudShadowStrength = std::clamp(r.cloudShadowStrength, 0.0f, 1.0f);
+    r.cloudRainDensity = std::clamp(r.cloudRainDensity, 0.0f, 10.0f);
+    r.cloudRainStreaks = std::clamp(r.cloudRainStreaks, 0.0f, 4.0f);
+    r.cloudTemporal = std::clamp(r.cloudTemporal, 0.02f, 1.0f);
+    r.cloudResDiv = std::clamp(r.cloudResDiv, 1, 8);
+    r.cloudWindScale = std::clamp(r.cloudWindScale, 0.0f, 40.0f);
+    r.cloudWetDarken = std::clamp(r.cloudWetDarken, 0.0f, 0.9f);
+    r.cloudRainbow = std::clamp(r.cloudRainbow, 0.0f, 4.0f);
+    r.cloudCirrusScaleM = std::clamp(r.cloudCirrusScaleM, 500.0f, 50000.0f);
+    r.cloudFogMix = std::clamp(r.cloudFogMix, 0.0f, 1.0f);
     ReadF(*g, "lodHandoffDist", r.lodHandoffDist, out, at);
     ReadF(*g, "renderScale", r.renderScale, out, at);
     ReadI(*g, "taa", r.taa, out, at);
@@ -3070,6 +3164,10 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("torsoShare", m.torsoShare);
     put("torsoPitch", m.torsoPitch);
     put("headClearM", m.headClearM);
+    put("bodyClearM", m.bodyClearM);
+    put("leanFlipHold", m.leanFlipHold);
+    put("leanMinSpeed", m.leanMinSpeed);
+    put("flatMinSin", m.flatMinSin);
     put("aimYaw", m.aimYaw);
     put("aimReleaseYaw", m.aimReleaseYaw);
   }

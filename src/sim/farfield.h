@@ -299,6 +299,10 @@ class FarField {
   bool frameGated_ = false;   // BeginFrame has been called at least once
   bool bulkThisFrame_ = false;
   bool uboDirty_ = true;
+  // A reset / full refill re-fills a level from procgen (+ FarEdits patches),
+  // so every slot's fardown signature (world.h farSig) is stale: zero them all
+  // on the next PrepareTick and every dirty chunk downsamples afresh.
+  bool sigClear_ = true;
   // Reused across ticks so a fill-heavy frame does not reallocate: the header
   // is 2 u32 per dispatched entry, the payload is the concatenated patch runs.
   std::vector<uint32_t> patchHeader_;

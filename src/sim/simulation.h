@@ -307,6 +307,12 @@ class Simulation {
   // depth testing off, so a collider is visible through whatever contains it.
   // `count` of 0 draws nothing at all — the overlay is free when it is off.
   void DrawDebugBoxes(const rhi::RenderPass& pass, uint32_t count);
+  // The vessel's pour point (game/container.h ContainerPourPoint): ONE soft,
+  // mostly transparent sphere read from debugBoxes[`at`] (centre = pos,
+  // radius = half.x, colour + alpha = color). Depth TESTED, unlike the
+  // wireframes -- it marks a place in the world, so the ground in front of it
+  // hides it. `at` of UINT32_MAX draws nothing.
+  void DrawPourMarker(const rhi::RenderPass& pass, uint32_t at);
   // Wind slope-field overlay (docs/RESEARCH_wind.md §4.8, F4): one arrow per
   // lattice point around the camera, oriented and coloured by `windAt` — the
   // same field function the foliage sway samples. `arrows` is
@@ -601,6 +607,24 @@ class Simulation {
   void EnsureDepth(uint32_t width, uint32_t height);
   void EnsureAuxDepth(uint32_t width, uint32_t height);
   void EnsureOverlayDepth(uint32_t width, uint32_t height);
+  // The water veil (common.wgsl THE WATER VEIL): grow the per-pixel record
+  // buffer to cover a width x height target and rebuild renderBG_ around it.
+  void EnsureVeil(uint32_t width, uint32_t height);
+  // THE CLOUDS (cloud.wgsl): grow the low-res raw + history buffers to cover
+  // a lowW x lowH target and rebuild the two bind groups that name them.
+  // Grow-only, like the veil. Fresh buffers are written with "clear sky"
+  // (T = 1), so a composite that runs before the first march draws the sky it
+  // would have drawn with no clouds, never a black one.
+  void EnsureClouds(uint32_t lowW, uint32_t lowH);
+  void BuildShadowBindGroup();
+  void BuildRenderBindGroup(rhi::BindGroup& out, const rhi::Buffer& veil);
+  // The group-0 bind group a raster body draw uses: the live veil once this
+  // pass's DrawWorld has written it, otherwise one bound to a zeroed record so
+  // a body-only pass (the character portrait) never reads a veil some other
+  // pass wrote for other pixels.
+  const rhi::BindGroup& BodyRenderBG() const {
+    return veilLive_ ? renderBG_ : renderBGNoVeil_;
+  }
   void EnsureRenderPipelines(rhi::TextureFormat format);
   // Derive raymarchLeanModule_ from an already-loaded raymarch module by
   // flipping the three `const SPEC_* : bool = true;` lines in the source
@@ -724,6 +748,16 @@ class Simulation {
   // resolves (all shadows stale) or the resolve pass runs against a shader that
   // never asks (wasted dispatch, and a request list that never drains).
   bool shadowCacheOn_ = false;
+  // The clouds (cloud.wgsl; world.h kCloud*). Six pipelines on shadowPL_ and
+  // the render-private buffers they write. cloudNoise_ is baked once per
+  // pipeline build (cloudBaked_ false = the next EncodeShadowResolve records
+  // the bake row); the rest are per frame.
+  rhi::ComputePipeline cloudNoise_, cloudWeather_, cloudShadow_, cloudEnv_,
+      cloudMarch_, cloudResolve_;
+  rhi::Buffer cloudNoiseBuf_, cloudWeatherBuf_, cloudMapsBuf_, cloudRawBuf_,
+      cloudHistBuf_;
+  uint64_t cloudPixels_ = 0;
+  bool cloudBaked_ = false;
   // Water bodies (sim_waterbody.wgsl): quiescence probe, drain ledger,
   // adoption reduce, surface shave — docs/PLAN_water_master.md components 3-5.
   rhi::ComputePipeline waterQuiet_, waterLedger_, waterReduce_, waterShave_;
@@ -740,7 +774,7 @@ class Simulation {
       fluidSettleBin_, fluidSettleCheck_, fluidSettleCommit_, fluidSettleKill_,
       fluidConsumeApply_, fluidStainApply_, fluidMirrorFold_, fluidCellClear_;
   rhi::RenderPipeline raymarch_, particleDraw_, spriteDraw_, bodyDraw_, bodyDepth_,
-      microBodyDraw_, debugBoxDraw_, debugWindDraw_, debugCurrentDraw_,
+      microBodyDraw_, debugBoxDraw_, pourMarkerDraw_, debugWindDraw_, debugCurrentDraw_,
       fluidDraw_;
   rhi::ShaderModule raymarchModule_, debrisModule_, microBodyModule_,
       debugLineModule_, debugWindModule_, debugCurModule_;
@@ -846,6 +880,13 @@ class Simulation {
   // source.
   rhi::BindGroup renderBG_, renderPartBG_[2], farBG_, microBodyBG_, fluidBG_[2],
       fluidSeamBG_[2], shadowBG_;
+  // Water veil: renderBG_ binds veilBuf_ at 24 (grown by EnsureVeil, never
+  // shrunk); renderBGNoVeil_ binds veilNone_, one zeroed record. veilLive_ is
+  // true between a pass's DrawWorld and the next Begin*RenderPass.
+  rhi::Buffer veilBuf_, veilNone_;
+  uint64_t veilPixels_ = 0;
+  rhi::BindGroup renderBGNoVeil_;
+  bool veilLive_ = false;
   int page_ = 0;
 
   // ---- settled-tick skip state (§3.4) -------------------------------------

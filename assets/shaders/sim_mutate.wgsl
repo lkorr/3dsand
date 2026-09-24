@@ -175,6 +175,13 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
 // MutationQueue discipline as the brush: the op stream is the only CPU->grid
 // path, so saves/replays/networking capture island events for free.
 // Dispatch: ceil(cellCount / 64) workgroups of 64.
+// The scoop ledger's words in the page-fault record (world.h
+// kPageFaultScoop*). Declared here, next to their only writer, not in
+// common.wgsl: a constant one shader reads belongs to that shader.
+const SCOOP_EIGHTHS_WORD : u32 = 36u;
+const SCOOP_APPLIED_WORD : u32 = 37u;
+const SCOOP_REFUSED_WORD : u32 = 38u;
+
 @compute @workgroup_size(64)
 fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   if (gid.x >= T.cellCount) { return; }
@@ -201,8 +208,30 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   // writes that can leave something above them unsupported.
   let prevMat = voxMat(voxWordInChunkAt(ci, lo));
   if ((word & CELLOP_IF_AIR) != 0u) {
-    if (prevMat != MAT_AIR) { return; }
-    word &= ~CELLOP_IF_AIR;
+    if ((word & 0xFFFu) == MAT_AIR) {
+      // CONDITIONAL CLEAR (world.h CellOpClearIfMat): the flag on an AIR word
+      // means "empty this cell only if it still holds the material in bits
+      // 12..23". A vessel's scoop is decided off last tick's snapshot and
+      // liquid moves, so whatever flowed in since is left alone.
+      if (prevMat != ((word >> 12u) & 0xFFFu)) {
+        atomicAdd(&pageFaults[SCOOP_REFUSED_WORD], 1u);
+        return;
+      }
+      // THE LEDGER: what this clear really took, in eighths -- a liquid's
+      // fullness as it is NOW, not as the (older) snapshot the CPU scooped
+      // from said it was. Summed with atomicAdd, which is order-independent,
+      // so the total is a pure function of the tick's ops. The vessel is
+      // credited from this number, never from its own guess.
+      let prevWord = voxWordInChunkAt(ci, lo);
+      var units = 8u;
+      if (materials[prevMat].klass == CLASS_LIQUID) { units = ((prevWord >> 12u) & 7u) + 1u; }
+      atomicAdd(&pageFaults[SCOOP_EIGHTHS_WORD], units);
+      atomicAdd(&pageFaults[SCOOP_APPLIED_WORD], 1u);
+      word = 0u;
+    } else {
+      if (prevMat != MAT_AIR) { return; }
+      word &= ~CELLOP_IF_AIR;
+    }
   }
   voxStore(wordIdx, word);
 

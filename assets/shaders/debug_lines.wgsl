@@ -124,3 +124,53 @@ fn fsBox(in : VSOut) -> @location(0) vec4f {
   // was asked for is the colour that is drawn.
   return vec4f(in.color, in.alpha);
 }
+
+// ---- THE POUR-POINT SPHERE (Simulation::DrawPourMarker) --------------------
+//
+// Where a held vessel's stream will go (game/container.h ContainerPourPoint).
+// Not debug, but it IS annotation, so it borrows this file's record and
+// straight-alpha blend: boxes[inst] is the sphere, pos = centre, half.x =
+// radius, color = colour + alpha. One camera-facing quad; the fragment shader
+// cuts a disc from it and shades that as a glassy ball -- faint through the
+// middle, a brighter rim -- so it reads as a sphere without being lit (a
+// marker that went dark at night would be no marker). Depth TESTED by its
+// pipeline, so terrain in front of it hides it.
+
+struct SphereOut {
+  @builtin(position) pos : vec4f,
+  @location(0) color : vec3f,
+  @location(1) alpha : f32,
+  @location(2) uv : vec2f,     // -1..1 across the quad
+};
+
+@vertex
+fn vsSphere(@builtin(vertex_index) vi : u32,
+            @builtin(instance_index) inst : u32) -> SphereOut {
+  let b = boxes[inst];
+  // Two triangles: (0,1,2) (2,1,3) over the corners (-1,-1) (1,-1) (-1,1) (1,1).
+  var corner = array<vec2f, 6>(vec2f(-1.0, -1.0), vec2f(1.0, -1.0), vec2f(-1.0, 1.0),
+                               vec2f(-1.0, 1.0), vec2f(1.0, -1.0), vec2f(1.0, 1.0));
+  let uv = corner[vi % 6u];
+  var out : SphereOut;
+  // Screen-aligned: the camera's own axes, so the disc is round on screen.
+  let world = b.pos + (R.camRight * uv.x + R.camUp * uv.y) * b.half.x;
+  out.pos = projectView(world - R.camPos, R);
+  out.color = unpackColor(b.color);
+  out.alpha = f32((b.color >> 24u) & 255u) / 255.0;
+  out.uv = uv;
+  return out;
+}
+
+@fragment
+fn fsSphere(in : SphereOut) -> @location(0) vec4f {
+  let r2 = dot(in.uv, in.uv);
+  if (r2 > 1.0) { discard; }
+  // Fresnel-ish: view-facing at the centre (1 - r2 = z^2 of the unit sphere),
+  // grazing at the rim.
+  let facing = sqrt(1.0 - r2);
+  let rim = pow(1.0 - facing, 2.0);
+  let a = in.alpha * (0.35 + 0.65 * rim);
+  // A small highlight up and to the left so it reads as round.
+  let spec = pow(max(0.0, dot(vec3f(in.uv, facing), normalize(vec3f(-0.4, 0.5, 0.77)))), 24.0);
+  return vec4f(min(in.color + vec3f(spec * 0.6), vec3f(1.0)), min(1.0, a + spec * 0.5));
+}

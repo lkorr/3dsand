@@ -1615,9 +1615,14 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
     // ITS OWN CLAIM, FROM ITS OWN AUTHORED NUMBERS. Nothing here names a style,
     // so the check is inherited by every style added later: whichever channel
     // the author asked to travel in must be the one the WEAPON travelled in.
-    const float wantAz = std::fabs(sty.cut.az);
-    const float wantEl = std::fabs(sty.cut.el);
-    const float wantR = std::fabs(sty.cut.reach);
+    //
+    // OVER THE WHOLE PATH, because a cut may be several legs (strokes.h "A CUT
+    // IS A PATH") and the channel a stroke travels in is a fact about its
+    // total displacement, not about whichever leg happens to be first.
+    const StrokeSegment cutAll = sty.CutTravel();
+    const float wantAz = std::fabs(cutAll.az);
+    const float wantEl = std::fabs(cutAll.el);
+    const float wantR = std::fabs(cutAll.reach);
     const std::string n = "\"" + sty.name + "\"";
     const bool natural = !(sty.weapon.empty() || sty.weapon == "held");
     // AN AIM EFFECTOR IS ONE THE RIG CANNOT SERVE WITH A CHAIN, and the rig is
@@ -1758,14 +1763,16 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
             "style " + n + " (diagonal) is genuinely diagonal");
     }
     std::printf(
-        "npc-styles %-14s [%-7s] authored (az %.2f el %.2f reach %.2f) -> "
+        "npc-styles %-14s [%-7s] authored (az %.2f el %.2f reach %.2f, %d "
+        "legs) -> "
         "swept commanded arc az %.2f el %.2f; posed arc az %.2f el %.2f "
         "(spans %.2f / %.2f) dr %.2f vox (commanded dr %.2f, r %.2f..%.2f) "
         "over %d cut ticks; effector knuckle path %.2f vox, forward turn "
         "%.2f rad, commanded az %.2f..%.2f, blade %.2f, head pitch commanded %.2f -> "
         "posed %.2f\n",
-        sty.name.c_str(), sty.weapon.c_str(), sty.cut.az, sty.cut.el,
-        sty.cut.reach, az, el, posedAz, posedEl, azSpan, elSpan, dr, cmdDr,
+        sty.name.c_str(), sty.weapon.c_str(), cutAll.az, cutAll.el,
+        cutAll.reach, (int)sty.cut.size(),
+        az, el, posedAz, posedEl, azSpan, elSpan, dr, cmdDr,
         cmdRMin, cmdRMax, cutTicks, edgePath, fwdTurn,
         cmdAzLo, cmdAzHi, blade,
         aimCmdPitchHi > aimCmdPitchLo ? aimCmdPitchHi - aimCmdPitchLo : 0.0f,
@@ -1775,6 +1782,263 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
   CloseStage(c);
   detail = Format("%d checks", checks);
   std::printf("npc-styles: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// =============================================================================
+// rig-clip — NO LIMB PASSES THROUGH ANOTHER LIMB OF THE SAME BODY
+// =============================================================================
+//
+// THE REPORT: "many of the animations cause the character's arm to clip
+// through their own body."
+//
+// NOTHING IN THE ENGINE COULD ANSWER THAT, and that is a structural fact
+// rather than an oversight. A mob's limbs are deliberately excluded from
+// colliding with each other (mob.h MobLimbDef's ball-joint note) and a live
+// limb is KINEMATIC, so Jolt is not consulted about a pose at all.
+// `AnimClampPoseLimits` bounds each joint's own range of motion, which is a
+// claim about ONE joint and says nothing about where the shape on the end of
+// it ends up. The only detector was a person looking at the screen.
+//
+// `game/selfclip.h` is the detector; this is the gate that spends it. It
+// replays every authored style this rig can swing, and after EVERY TICK counts
+// solid collider voxels of one limb standing inside another — differenced
+// against the BIND POSE, so the shoulder ball that is always inside the chest
+// is not a finding and a forearm swung through the ribs is.
+//
+// WHAT A FAILURE PRINTS is the pair, the style, the tick and the count, which
+// is the whole of what a fixer needs: "armL.R is 34 voxels inside torso, in
+// horizontal_l, at tick 9" names the style to re-author or the clamp to widen.
+// A bare "the arm clips" would be the number-with-four-causes CLAUDE.md rule 6
+// is about.
+//
+// THE THRESHOLD IS NOT ZERO and is in tests/baseline.json. Voxel art is not
+// convex and a rig is not a jointed doll: an elbow at full flexion genuinely
+// puts a corner of the forearm lattice a cell or two inside the upper arm, and
+// a gate that called that a defect would be red on the walk cycle. What the
+// number bounds is a LIMB INSIDE A LIMB, and a few cells at a joint is not
+// that.
+Status GateRigClip(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("rig-clip: FAILED %s\n", what.c_str());
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("rig-clip: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  std::string why;
+  const uint64_t id =
+      SpawnFighter(c, st.defIndex, {st.spot.x, st.spot.y + 1, st.spot.z},
+                   "training_dummy", true, why);
+  if (id == 0) {
+    detail = why.empty() ? "fixture spawn failed" : why;
+    std::printf("rig-clip: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  Ticker tick{c, 28000, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  for (int i = 0; i < 20; i++) tick();
+
+  const int limit = (int)BaselineNumber("rigClip.maxExcessVox", 12);
+  // A DIRECTLY JOINTED PAIR GETS ITS OWN, LOOSER NUMBER (selfclip.h
+  // ClipPair::jointed says why at length): the two shapes share a pivot, so
+  // every rotation about it buries more of one in the other, and the bind-pose
+  // baseline cannot subtract that because the bind pose has the joint at rest.
+  // It is still BOUNDED — a shoulder driven clean through the chest is a
+  // defect — just not by the number that bounds a forearm in the ribs.
+  const int jointLimit = (int)BaselineNumber("rigClip.maxJointExcessVox", 80);
+  auto nameOf = [&](const Mob* m, int slot) {
+    if (m == nullptr || slot < 0 || slot >= m->LimbCount())
+      return std::string("?");
+    return m->LimbDefAt(slot).name;
+  };
+
+  // ---- 0. THE BASELINE IS NOT A BLANKET PASS -----------------------------
+  //
+  // A detector that reports zero because it is looking at nothing passes every
+  // assertion below for free, which is the "fixture that cannot fail" trap.
+  // So: the rig standing still must be READABLE (the check ran, over a real
+  // number of limbs) before a single style is driven through it.
+  {
+    const Mob* m = c.mobs.FindMobById(id);
+    ClipReport rep;
+    check(m != nullptr && m->SelfClipCheck(rep), "the rig can be read at all");
+    check(rep.limbs >= 8, Format("the detector sees a whole body (%d limbs)",
+                                 rep.limbs));
+    check(rep.worstExcess <= limit,
+          Format("standing still is clean: worst %d voxels (%s in %s), limit "
+                 "%d",
+                 rep.worstExcess, nameOf(m, rep.worst.a).c_str(),
+                 nameOf(m, rep.worst.b).c_str(), limit));
+  }
+
+  auto aimFor = [&](const AttackStyle& s2) {
+    const Vec3 o2 = c.mobs.MobOrigin(id);
+    float ahead = 11.0f;
+    if (const Mob* m2 = c.mobs.FindMobById(id))
+      ahead = std::max(ahead, c.mobs.StyleReachOn(*m2, s2));
+    return Vec3{o2.x + st.def->worldSize.x * 0.5f,
+                o2.y + st.def->worldSize.y * 0.66f,
+                o2.z + st.def->worldSize.z * 0.5f + ahead};
+  };
+
+  const StyleLibrary& lib = c.mobs.AttackStyles();
+  int styles = 0;
+  int worstAll = 0;
+  std::string worstWhere;
+  for (const AttackStyle& sty : lib.styles) {
+    const Mob* fixture = c.mobs.FindMobById(id);
+    if (fixture == nullptr || !StyleUsable(*fixture, sty)) continue;
+    // ---- ...AND ONLY THE STYLES THE DRAW WOULD ACTUALLY PRODUCE ----------
+    //
+    // `ForceAttack` bypasses `PickAttackStyle`, and a FALLBACK style is one
+    // the draw drops as a group whenever any non-fallback style is usable
+    // (strokes.h AttackStyle::fallback: "a duelist with a sword never throws a
+    // punch"). Forcing one onto this ARMED fixture stages a situation the
+    // game cannot create — a human punching with a sword still in its fist —
+    // and the detector correctly reports the sword sweeping through the head,
+    // at 84 and 96 voxels. That is a true measurement of a false scenario, and
+    // it is also outside what the stroke driver can fix: the item's pose is
+    // derived from the hand by the rig, and for a Chain effector the driver is
+    // told the tip IS the hand (mob.cpp says why at length), so it has no
+    // blade to keep out of anything.
+    //
+    // IT IS SKIPPED LOUDLY rather than silently, because "a disarmed creature
+    // punching" IS reachable and this gate does not cover it: a fixture with
+    // an empty fist is the way to, and nobody should conclude from a green
+    // line here that it was checked.
+    const bool natural = !(sty.weapon.empty() || sty.weapon == "held");
+    if ((sty.fallback || natural) && fixture->HeldSlot() >= 0) {
+      std::printf(
+          "rig-clip %-16s skipped: a %s style on an ARMED fixture is a swing "
+          "nothing selects (and the held sword it sweeps is not the driver's "
+          "to move)\n",
+          sty.name.c_str(), natural ? "natural-weapon" : "fallback");
+      continue;
+    }
+    styles++;
+    // The same pinned seed npc-styles uses, for the same reason: the tempo
+    // jitter is what decides the tick counts, and an unpinned one makes the
+    // same style a different swing in a different scope.
+    const uint32_t styleSeed =
+        rng::Hash3(0x5C0BEu,
+                   (uint32_t)std::hash<std::string>{}(sty.name), 0x5747u) |
+        1u;
+    const Vec3 aim = aimFor(sty);
+    FaceAt(c.mobs, id, aim);
+    if (!c.mobs.ForceAttack(id, sty.name, aim, tick.tick, styleSeed)) continue;
+
+    int worst = 0, worstTick = -1;
+    float push = 0;
+    ClipPair worstPair;
+    // ---- SPLIT BY WHO OWNED THE ARM (CLAUDE.md rule 6) -------------------
+    //
+    // "105 voxels of forearm inside the torso" has two completely different
+    // causes and the bare number cannot tell them apart: the STROKE drove it
+    // there (windup/cut, where the driver's pose claim is 1 and the chest
+    // keep-out is what has to stop it), or the HAND-BACK did (recover, where
+    // the claim is fading and the pose is a blend between the stroke's and
+    // the walk cycle's, which nothing in the driver can reach). The tell that
+    // they are not one event: the keep-out reported pushing the hand 1.11
+    // voxels on the very swing the detector called 105 voxels deep, and two
+    // numbers that far apart are not describing the same pose.
+    int worstDriven = 0, worstDrivenTick = -1, worstDrivenJoint = 0;
+    float worstRoundTrip = 0, worstIkMiss = 0, worstShoulderClamp = 0;
+    ClipPair worstDrivenPair;
+    for (int i = 0; i < 90; i++) {
+      tick();
+      const Mob* m = c.mobs.FindMobById(id);
+      if (m == nullptr) break;
+      const NpcStroke* s = c.mobs.MobStroke(id);
+      ClipReport rep;
+      if (m->SelfClipCheck(rep) && rep.worstExcess > worst) {
+        worst = rep.worstExcess;
+        worstPair = rep.worst;
+        worstTick = i;
+      }
+      // HOW HARD THE KEEP-OUT WORKED, summed over the swing. "The arm is still
+      // in the chest" and "the clamp never fired" are different failures and
+      // the voxel count alone cannot tell them apart (CLAUDE.md rule 6).
+      if (s != nullptr) push = std::max(push, s->melee.BodyClampPush());
+      if (s != nullptr &&
+          (s->phase == NpcStroke::Phase::Windup ||
+           s->phase == NpcStroke::Phase::Cut)) {
+        if (rep.worstExcess > worstDriven) {
+          worstDriven = rep.worstExcess;
+          worstDrivenPair = rep.worst;
+          worstDrivenTick = i;
+        }
+        worstDrivenJoint = std::max(worstDrivenJoint, rep.worstJointExcess);
+        // ---- IS THE RIG EVEN DOING WHAT THE DRIVER ASKED? ---------------
+        //
+        // The chest keep-out clamps the hand the DRIVER commands, and the rig
+        // then has its own opinion: the two-bone solve may not reach, and
+        // `AnimClampPoseLimits` takes the shoulder's authored ball limit off
+        // the result afterwards. If the arm inside the chest is the CLAMPED
+        // pose rather than the commanded one, no amount of work in the driver
+        // can move it, and the fix belongs in the rig or in the authoring.
+        // Those are opposite repairs, so the numbers that separate them are
+        // recorded here rather than inferred later (CLAUDE.md rule 6).
+        const Mob::WeaponArmDiag& wd = m->WeaponArmDiagnostics();
+        if (wd.ran) {
+          worstRoundTrip = std::max(worstRoundTrip, wd.roundTrip);
+          worstIkMiss = std::max(worstIkMiss, wd.ikMiss);
+          worstShoulderClamp = std::max(worstShoulderClamp, wd.shoulderClamp);
+        }
+      }
+      if (s == nullptr || (!s->Active() && i > 4)) break;
+    }
+    const std::string where =
+        Format("%s: %s is %d voxels inside %s at tick %d", sty.name.c_str(),
+               nameOf(c.mobs.FindMobById(id), worstPair.a).c_str(), worst,
+               nameOf(c.mobs.FindMobById(id), worstPair.b).c_str(), worstTick);
+    if (worst > worstAll) {
+      worstAll = worst;
+      worstWhere = where;
+    }
+    // THE CLAIM IS STATED ON THE DRIVEN PHASES, which is where the driver's
+    // keep-out is the thing responsible. The whole-stroke number is printed
+    // beside it on every run, so a regression in the hand-back stays visible
+    // even though this line does not assert on it.
+    (void)where;
+    check(worstDrivenJoint <= jointLimit,
+          Format("%s: a JOINTED pair buried %d voxels while the stroke owned "
+                 "the arm (limit %d)",
+                 sty.name.c_str(), worstDrivenJoint, jointLimit));
+    check(worstDriven <= limit,
+          Format("%s: %s is %d voxels inside %s at tick %d, while the STROKE "
+                 "owned the arm (limit %d)",
+                 sty.name.c_str(),
+                 nameOf(c.mobs.FindMobById(id), worstDrivenPair.a).c_str(),
+                 worstDriven,
+                 nameOf(c.mobs.FindMobById(id), worstDrivenPair.b).c_str(),
+                 worstDrivenTick, limit));
+    std::printf(
+        "rig-clip %-16s driven %3d vox (%s in %s, tick %d) | jointed %3d | "
+        "whole stroke %3d | limit %d/%d | push %.2f | rig: roundTrip %.2f ikMiss %.2f shoulderClamp %.2f rad\n",
+        sty.name.c_str(), worstDriven,
+        nameOf(c.mobs.FindMobById(id), worstDrivenPair.a).c_str(),
+        nameOf(c.mobs.FindMobById(id), worstDrivenPair.b).c_str(),
+        worstDrivenTick, worstDrivenJoint, worst, limit, jointLimit, push,
+        worstRoundTrip, worstIkMiss, worstShoulderClamp);
+  }
+  check(styles >= 3, "the fixture can swing enough styles to be worth driving");
+  if (worstAll > 0)
+    std::printf("rig-clip: worst over all styles — %s\n", worstWhere.c_str());
+
+  CloseStage(c);
+  detail = Format("%d styles, worst %d vox", styles, worstAll);
+  std::printf("rig-clip: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -2166,7 +2430,15 @@ Status GateZombieDraw(Ctx& c, std::string& detail) {
     // correct measurement of nothing and hides WHICH of the two went: the prey
     // dying of its own bites is the feature working, the biter vanishing is a
     // broken fixture. Both are counted and said out loud.
-    if (m == nullptr) { goneBiter++; continue; }
+    if (m == nullptr) {
+      // SAY WHY, once: a husk sweep, a turn (TurnMob re-spawns under a new id)
+      // and a death are three different bugs and a count names none of them.
+      if (goneBiter++ == 0)
+        std::printf("zombie-draw: biter left at tick %d: death cause \"%s\", "
+                    "%u mobs remain\n",
+                    i, c.mobs.DeathCause(biter), c.mobs.MobCount());
+      continue;
+    }
     if (p == nullptr) { gonePrey++; continue; }
     alive++;
     const Vec3 d = m->Origin() - p->Origin();
@@ -3658,6 +3930,134 @@ Status GateHitReact(Ctx& c, std::string& detail) {
 
 }  // namespace
 
+// ---- levitate: a sustained gravity mod on a body that is NOT the caster ----
+//
+// (spell.h `SpellBodyImpulse` -> session.cpp's routing -> mob.h `Mob::AddLift`,
+// 2026-09-22, from the owner's report that `float aura` worked on himself, did
+// nothing to an enemy, and did nothing to a ragdoll.)
+//
+// Three claims, because those were three independent causes that look like the
+// same zero from outside (CLAUDE.md rule 6):
+//
+//   1. THE BODY CAN BE FOUND. A status attaches to whatever body lies within
+//      the effect's radius + 2 of the point the spell resolved at - three
+//      voxels for a bare mod. That search measured to `MobOrigin`, which is
+//      the collider's MIN CORNER in x/z and the FEET in y, so a bolt that
+//      struck a chest found no body at all, the status fell back to being a
+//      PLACE, and a sustained mod on a place does nothing. Both distances are
+//      printed; the box one is the claim.
+//   2. A LIVE BODY RISES when it is lifted, and does not when it is not. The
+//      control arm is the same creature over the same span with no lift, so
+//      the number is a differential and not a reading of the terrain.
+//   3. A LIMP BODY RISES TOO. That is a different velocity state entirely -
+//      the rig belongs to Jolt once it goes down - and it is the half the
+//      owner reported second.
+Status GateLevitate(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const char* what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("levitate: FAILED %s\n", what);
+    }
+  };
+
+  Stage st = OpenStage(c);
+  if (!st.ok) {
+    detail = st.why;
+    std::printf("levitate: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+
+  // WHAT `float` IS WORTH, derived rather than guessed: glyphs.json gives the
+  // word `gravity add -1000`, and spell.cpp turns a sustained gravity mod into
+  // `-amount * 0.012` voxels/sec of velocity per tick. One `float` is +12.
+  const float kFloatVps = (float)BaselineNumber("levitate.floatVps", 12.0);
+  const int kSpan = (int)BaselineNumber("levitate.spanTicks", 24);
+  const float minRise = (float)BaselineNumber("levitate.minRiseVox", 3.0);
+
+  std::string why;
+  auto spawn = [&](int dz) {
+    return SpawnFighter(c, st.defIndex,
+                        {st.spot.x, st.spot.y + 1, st.spot.z + dz},
+                        "training_dummy", false, why);
+  };
+  const uint64_t live = spawn(0);
+  const uint64_t limp = spawn(24);
+  if (live == 0 || limp == 0) {
+    detail = why.empty() ? "fixture spawn failed" : why;
+    std::printf("levitate: SKIP (%s)\n", detail.c_str());
+    CloseStage(c);
+    return Status::Skip;
+  }
+  Ticker tick{c, 33000, {st.spot.x >> 4, st.spot.y >> 4, st.spot.z >> 4}};
+  for (int i = 0; i < 48; i++) tick();
+
+  // ---- (1) the body's box, and the point a bolt would resolve at -----------
+  Vec3 lo{}, hi{};
+  const bool haveBox = c.mobs.MobBodyBox(live, lo, hi);
+  check(haveBox, "a spawned mob reports a body box at all");
+  const Vec3 chest{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
+                   (lo.z + hi.z) * 0.5f};
+  const Vec3 org = c.mobs.MobOrigin(live);
+  const float dOrigin = (chest - org).len();
+  const float dBox =
+      std::max({lo.x - chest.x, chest.x - hi.x, lo.y - chest.y, chest.y - hi.y,
+                lo.z - chest.z, chest.z - hi.z, 0.0f});
+  check(haveBox && hi.y - lo.y >= 4.0f,
+        "the box has the creature's HEIGHT in it (not a point at its feet)");
+  check(dBox <= 0.0f, "a strike at the middle of a body is ON that body");
+
+  // ---- (2) live: lifted vs not, same creature, same span -------------------
+  auto riseOf = [&](uint64_t who, bool lift) {
+    const float y0 = c.mobs.MobOrigin(who).y;
+    float peak = 0.0f;
+    for (int i = 0; i < kSpan; i++) {
+      if (lift) c.mobs.LiftMob(who, Vec3{0.0f, kFloatVps, 0.0f});
+      tick();
+      if (c.mobs.FindMobById(who) == nullptr) break;
+      peak = std::max(peak, c.mobs.MobOrigin(who).y - y0);
+    }
+    return peak;
+  };
+  const float idle = riseOf(live, false);
+  const float lifted = riseOf(live, true);
+  check(idle < 1.0f, "a creature nobody lifted stays on the ground");
+  check(lifted >= minRise, "`float aura` lifts a LIVE body off the ground");
+  const Mob* lm = c.mobs.FindMobById(live);
+  check(lm != nullptr && lm->Airborne(),
+        "...and it is airborne while it is held up, not standing in mid-air");
+
+  // ---- (3) limp: the same lift through Jolt --------------------------------
+  Mob* dead = c.mobs.FindMobById(limp);
+  if (dead != nullptr) dead->StartRagdoll(4.0f, "levitate gate");
+  for (int i = 0; i < 4; i++) tick();   // let the rig go dynamic
+  dead = c.mobs.FindMobById(limp);
+  const bool wentLimp = dead != nullptr && dead->Ragdolled();
+  const float limpIdle = riseOf(limp, false);
+  const float limpRise = riseOf(limp, true);
+  check(wentLimp, "the second fixture actually went limp");
+  check(limpIdle < 1.0f, "a corpse nobody lifted stays put");
+  check(limpRise >= minRise, "`float aura` lifts a LIMP body too");
+
+  std::printf(
+      "levitate: box %.1f tall | chest %.1f vox from the collider ORIGIN, "
+      "%.1f from the BOX | live rise %.2f (idle %.2f) | limp rise %.2f "
+      "(idle %.2f) | %d checks\n",
+      hi.y - lo.y, dOrigin, dBox, lifted, idle, limpRise, limpIdle, checks);
+
+  c.mobs.Reset();
+  c.debris.Reset();
+  CloseStage(c);
+  if (!ok) {
+    detail = "a sustained gravity mod did not move a body";
+    return Status::Fail;
+  }
+  return Status::Pass;
+}
+
 const std::vector<Gate>& CombatGates() {
   static const std::vector<Gate> g = {
       // No deps, no world, no GPU: both build their own inputs and neither
@@ -3669,6 +4069,11 @@ const std::vector<Gate>& CombatGates() {
       {"npc-strike", "mob", {}, false, GateNpcStrike},
       {"npc-block", "mob", {}, false, GateNpcBlock},
       {"npc-styles", "mob", {}, false, GateNpcStyles},
+      // ...and the same replay measured for a different defect: does the pose
+      // pass through itself (game/selfclip.h). Same fixture shape as
+      // npc-styles and placed beside it, because they ask the two halves of
+      // "is this swing any good" — where it went, and what it went through.
+      {"rig-clip", "mob", {}, false, GateRigClip},
       {"duel", "mob", {}, false, GateDuel},
       // ---- THE UNARMED HALF (docs/PLAN_impact_unarmed.md §8) --------------
       // Same shape as the four above and placed with them in kOrder: each
@@ -3688,6 +4093,10 @@ const std::vector<Gate>& CombatGates() {
       // MobSystem entry point. Same shape as the ones above — id scope in,
       // worldgen out — so `--gate hit-react` is the whole of iterating on it.
       {"hit-react", "mob", {}, false, GateHitReact},
+      // ---- a sustained gravity mod on somebody else's body ----------------
+      // Spawns two creatures and lays one of them down, so it goes with the
+      // group above and at the end of it.
+      {"levitate", "mob", {}, false, GateLevitate},
   };
   return g;
 }

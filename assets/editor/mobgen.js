@@ -1729,8 +1729,8 @@ function roundShoulders(cells, size, rule) {
       for (const x of [xs[0], xs[xs.length - 1]])
         if (cols.get(x) * 2 <= widest) drop.add(x + ',' + z);
     }
-    if (!drop.size) return cells;
-    return cells.filter(([x, y, z]) => !drop.has(x + ',' + z));
+    if (drop.size) cells = cells.filter(c => !drop.has(c[0] + ',' + c[2]));
+    return bevelCrest(cells);
   }
   // rule === 'cap': RE-DERIVE THE CAP'S CROSS-SECTION AT THE SHIPPED LATTICE.
   //
@@ -1772,7 +1772,31 @@ function roundShoulders(cells, size, rule) {
     for (const c of dropped) if (c[2] === z) out.push(c);
   }
   void key;
-  return out;
+  return bevelCrest(out);
+}
+
+/** THE FRONT AND BACK EDGE OF THE CREST, for torso and arm cap alike. Both
+ *  rules round the shoulder seen from the FRONT (x steps in as z climbs), but
+ *  each part's DEPTH runs full to its top row, so seen from the side the crest
+ *  is a square corner at chest and back. Taking the frontmost and backmost cell
+ *  off every column of the top row is one line of voxels along that edge, and
+ *  the shoulder reads round from all four sides. A column shorter than three
+ *  cells is left alone so the front silhouette never loses a column. */
+function bevelCrest(cells) {
+  let top = -1;
+  for (const c of cells) top = Math.max(top, c[2]);
+  const span = new Map();                    // x -> [yLo, yHi] on the top row
+  for (const [x, y, z] of cells) {
+    if (z !== top) continue;
+    const s = span.get(x);
+    if (!s) span.set(x, [y, y]);
+    else { s[0] = Math.min(s[0], y); s[1] = Math.max(s[1], y); }
+  }
+  return cells.filter(([x, y, z]) => {
+    if (z !== top) return true;
+    const [lo, hi] = span.get(x);
+    return hi - lo < 2 || (y !== lo && y !== hi);
+  });
 }
 
 /** Every voxel becomes a factor^3 block — the generator's twin of the
@@ -1845,7 +1869,9 @@ export function anatomyRecipe() {
           'format). Materials by NAME. `keep` leaves the painted surface ' +
           'alone; `garments` are surface voxels that are clothes, so the ' +
           'voxel under them is skin. Head override: a bone skull two deep ' +
-          'around a `brain` core.',
+          'around a `brain` core. `carve` (per limb) shapes the bone into a ' +
+          'skeleton: eye sockets and a nasal hole in the skull, ribs, ' +
+          'sternum and spine in the chest.',
     ...r,
     limbs: {
       '//head': 'A bone skull two deep around a BRAIN. The core layer is ' +
@@ -1857,6 +1883,10 @@ export function anatomyRecipe() {
                 '`brain`), which is why the skull in front of it matters: the ' +
                 'rot chews bone at half rate (bone.rotRate), so breaching ' +
                 'takes time and what is behind goes fast.',
+      '//torso': 'A ribcage, not a bone brick: the depth schedule would fill ' +
+                 'the chest with solid bone, so `carve` hollows it to flesh ' +
+                 '(the organs), walls it in muscle at depth 3, and puts bone ' +
+                 'back as ribs, a sternum and a spine.',
       ...r.limbs,
     },
   };

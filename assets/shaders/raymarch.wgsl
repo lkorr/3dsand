@@ -139,6 +139,45 @@
 // near box does not reach. Same layout, same u16 pair-per-word packing, same
 // render-only standing; eight times the cell and eight times the span.
 @group(0) @binding(23) var<storage, read> gasFarOuter : array<u32>;
+
+// ---- THE WATER VEIL (common.wgsl THE WATER VEIL) ---------------------------
+// One VEIL_WORDS record per pixel: how the liquid this pixel's primary ray
+// crossed transforms the light of whatever raster body sits under it. Written
+// here (w0 = 0 for every dry pixel), read by debris.wgsl / microbody.wgsl after
+// Simulation::DrawWorld splits the pass. The fifth render-private buffer a
+// fragment shader writes, with shadowCache's standing.
+//
+// WATER_VEIL off (no fragment stores on the device) restores the old contract
+// exactly: depth at the liquid interface, and nothing under it drawn.
+@group(0) @binding(24) var<storage, read_write> waterVeil : array<u32>;
+const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
+
+// ---- THE CLOUDS (cloud.wgsl; common.wgsl's CloudParams block) --------------
+// The accumulated low-resolution cloud image (both ping-pong halves; CL.histCur
+// is this frame's), the shadow + env maps, and the cloud uniform. All three
+// are written by the ShadowCache table's cloud rows earlier in this command
+// buffer and read here only when R.weatherFlags has RWF_CLOUDS — with it clear
+// they are stale and must not be sampled, the gasOuter rule.
+@group(0) @binding(25) var<storage, read> cloudHist : array<u32>;
+@group(0) @binding(26) var<storage, read> cloudMaps : array<u32>;
+@group(0) @binding(27) var<uniform> CL : CloudParams;
+
+// What the liquid shades (shadeWater / shadeSubmerged / shadeMpmFluid) leave
+// for fs() to write into the veil. Private globals rather than a returned
+// struct for gRsTraceSteps' reason: those functions are inlined into fs() and
+// their signatures are load-bearing for register pressure. Only meaningful
+// once one of them ran on this pixel.
+//   gVK       transmitting fraction of the surface, before the air fog
+//   gVScatter the column's in-scatter colour
+//   gVAbsorb  per-metre extinction
+//   gVDelta   T_bed * (caustic * bed - scatter): the part of the pixel a body
+//             under the surface replaces, before K
+//   gVCurv    caustic curvature (0 = no caustic web)
+var<private> gVK : vec3f;
+var<private> gVScatter : vec3f;
+var<private> gVAbsorb : vec3f;
+var<private> gVDelta : vec3f;
+var<private> gVCurv : f32;
 // Must match kWaterFluxWords / WV_* in src/sim/world.h and
 // assets/shaders/sim_waterbody.wgsl. Declared here rather than in common.wgsl
 // for the GAS_OUTER_N reason above and CLAUDE.md's: a constant two shaders must
@@ -1166,6 +1205,26 @@ fn skyAirglow(rdIn : vec3f) -> vec3f {
 
 fn skyColorNoBodies(rdIn : vec3f) -> vec3f {
   return skyColorNoBodiesU(normalize(rdIn), dayWeight());
+}
+
+// skyColor, split in two for the cloud composite: `full` is exactly what
+// skyColor returns, `smooth` is its airglow tier alone, `glow` (no stars, moons or sun
+// disc). One evaluation of each layer, like skyColor itself.
+struct SkyParts { full : vec3f, glow : vec3f };
+fn skyColorParts(rdIn : vec3f) -> SkyParts {
+  let rd = normalize(rdIn);
+  let dayW = dayWeight();
+  var moon = SkyLayer(vec3f(0.0), 0.0);
+  if (dayW < 0.999) { moon = moonLayer(rd); }
+  let g = skyAirglowV(rd, dayW);
+  var c = g.c;
+  if (dayW < 0.999) {
+    let hidden = 1.0 - (1.0 - g.veil) * (1.0 - clamp(moon.veil, 0.0, 1.0));
+    c += starField(rd) * (1.0 - dayW) * (1.0 - hidden);
+  }
+  c += moon.c * (1.0 - dayW);
+  if (R.sunUp > 0.001) { c += sunDisc(rd) * R.sunUp; }
+  return SkyParts(max(c, vec3f(0.0)), max(g.c, vec3f(0.0)));
 }
 
 fn skyColor(rdIn : vec3f) -> vec3f {
@@ -4696,6 +4755,171 @@ fn aerialFrac(tFine : f32) -> f32 {
   return 1.0 - exp(-dM * R.fogDensity);
 }
 
+// ---- THE CLOUDS, as the renderer sees them -----------------------------------
+// The fog target through the clouds: the airglow in `rd`, covered by whatever
+// the env map says the clouds in that direction are (common.wgsl cloudEnvAt).
+// This is what turns an overcast into a GREY horizon rather than a blue one
+// with a grey lid — the distant hills fog into the cloud they stand under.
+// TUNE_CLOUD_FOG_MIX 0 restores the cloudless fog target exactly.
+fn cloudySkyAirglow(rd : vec3f) -> vec3f {
+  let sky = skyAirglow(rd);
+  if ((R.weatherFlags & RWF_CLOUDS) == 0u || TUNE_CLOUD_FOG_MIX <= 0.0) { return sky; }
+  let e = cloudEnvAt(normalize(rd), &CL, &cloudMaps);
+  return mix(sky, sky * e.a + e.rgb, TUNE_CLOUD_FOG_MIX);
+}
+
+// The accumulated cloud image at a full-resolution pixel: (in-scatter, T).
+// Bilinear over the low-res grid, whose texel centres sit at (i + 0.5) * div.
+// A target whose size is not the one CloudParams was written for (a stale
+// uniform) reads as clear sky rather than as someone else's clouds.
+struct CloudPx { c : vec3f, t : f32, td : f32 };
+fn cloudScreenAt(fragXY : vec2f) -> CloudPx {
+  let div = f32(max(CL.resDiv, 1u));
+  let f = clamp(fragXY / div - 0.5, vec2f(0.0),
+                vec2f(f32(CL.lowW) - 1.001, f32(CL.lowH) - 1.001));
+  let i0 = vec2<u32>(floor(f));
+  let fr = f - floor(f);
+  let i1 = min(i0 + vec2<u32>(1u), vec2<u32>(CL.lowW - 1u, CL.lowH - 1u));
+  let a = cloudHistTexel(vec2<u32>(i0.x, i0.y));
+  let b = cloudHistTexel(vec2<u32>(i1.x, i0.y));
+  let c = cloudHistTexel(vec2<u32>(i0.x, i1.y));
+  let d = cloudHistTexel(vec2<u32>(i1.x, i1.y));
+  let v = mix(mix(a.c, b.c, fr.x), mix(c.c, d.c, fr.x), fr.y);
+  let t = mix(mix(a.t, b.t, fr.x), mix(c.t, d.t, fr.x), fr.y);
+  let td = mix(mix(a.td, b.td, fr.x), mix(c.td, d.td, fr.x), fr.y);
+  return CloudPx(max(v, vec3f(0.0)), clamp(t, 0.0, 1.0), clamp(td, 0.0, 1.0));
+}
+fn cloudHistTexel(p : vec2<u32>) -> CloudPx {
+  let i = CL.histCur + (p.y * CL.lowW + p.x) * 3u;
+  if (i + 2u >= arrayLength(&cloudHist)) { return CloudPx(vec3f(0.0), 1.0, 1.0); }
+  let rg = unpack2x16float(cloudHist[i]);
+  let bt = unpack2x16float(cloudHist[i + 1u]);
+  let d = unpack2x16float(cloudHist[i + 2u]);
+  return CloudPx(vec3f(rg.x, rg.y, bt.x), bt.y, d.x);
+}
+
+// Rain and snow around the eye. Four cylinders at 1.2 / 2.6 / 5.5 / 11 m, a
+// lattice of drops on each (columns with hashed phase and speed), sheared
+// along the wind. The cylinder only FINDS the drop a ray passes: the drop
+// itself is a real 3-D segment (rain, the motion blur of one frame) or point
+// (snow), and the ray is tested against it by distance — painting streaks on
+// the cylinder's surface instead stretched them into arcs and ribbons wherever
+// the view grazes the cylinder, i.e. looking up or down. A layer is skipped
+// where the scene is nearer than it; a drop is dropped where the openness
+// grid says its cell cannot see the sky.
+// Share of the (20 m averaged) wind the streaks lean with; see rainOverlay.
+const RAIN_WIND_SHARE : f32 = 0.4;
+const SNOW_WIND_SHARE : f32 = 0.8;
+fn rainOverlay(colorIn : vec3f, rd : vec3f, tDepthVox : f32) -> vec3f {
+  let here = bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 2u]);
+  let amount = clamp(here * 1.4, 0.0, 1.0) * TUNE_CLOUD_RAIN_STREAKS;
+  if (amount <= 0.002) { return colorIn; }
+  let sceneM = select(1e9, tDepthVox * VOXEL_METERS, tDepthVox >= 0.0);
+  let snow = clamp(CL.precipType, 0.0, 1.0);
+  let hl = length(rd.xz);
+  if (hl < 0.03) { return colorIn; }
+  let camM = R.camPos * VOXEL_METERS;
+  let lit = ambientAt(vec3f(0.0, 1.0, 0.0)) * 1.1 + keyLightColor() * 0.12;
+  // One pixel's angular size: every drop is drawn no thinner than ~0.7 px and
+  // dimmed by how much it had to be widened, so a far streak thins out
+  // instead of shimmering between present and absent.
+  let pxAng = R.tanHalfFov * 2.0 / max(R.viewPx, 1.0);
+  var color = colorIn;
+  // THE WIND ROUND THE EYE: windAt (the field the grass sways in, wind
+  // primitives included) averaged over a 20 m disc by cloud.wgsl's env pass
+  // (writeRainWindProbe), so the sheet leans with the local weather and a
+  // nearby fan or tornado without flickering with every 5 m gust front. One
+  // value for the whole overlay: the sheared lattice below needs ONE wind per
+  // frame to keep each column a straight line on screen.
+  let wField = vec3f(bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 4u]),
+                     bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 5u]),
+                     bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 6u]));   // m/s
+  let fallV = mix(8.5, 1.1, snow);
+  // RAIN FALLS DOWN. Physically a drop does take the full horizontal wind,
+  // but at the default 6 m/s against an 8.5 m/s fall that is a 35-degree
+  // lean, and with gusts and the storm's wind the sheet read as blowing
+  // sideways. So the streaks take a SHARE of the wind (RAIN_WIND_SHARE, more
+  // for snow, which really does drift) and the lean is capped — ~35 degrees
+  // off vertical for rain, ~56 for snow. The cap also keeps a fan's mouth or
+  // a tornado's rim from laying the streaks flat, where they would run along
+  // the lattice's shear axis and the column lookup degenerates.
+  let wLean = wField.xz * mix(RAIN_WIND_SHARE, SNOW_WIND_SHARE, snow);
+  let wLen = length(wLean);
+  let wMax = fallV * mix(0.7, 1.5, snow);   // tan(lean cap)
+  let wind = wLean * select(1.0, wMax / max(wLen, 1e-4), wLen > wMax);
+  // Fall direction: down, carried along by the wind. A rain drop is a short
+  // SEGMENT along it (motion blur over a frame's exposure); a flake a point.
+  let fallDir = normalize(vec3f(wind.x, -fallV, wind.y));
+  for (var k = 0u; k < 4u; k++) {
+    let radius = 1.2 * pow(2.12, f32(k));
+    let t = radius / hl;
+    if (t > sceneM || t > radius * 8.0) { continue; }
+    let p = camM + rd * t;
+    // The lattice lives in a frame SHEARED along the fall: each column of
+    // drops is a straight slanted line in 3-D, so it stays one on screen.
+    let hRel = p.y - camM.y;
+    let q = p.xz - camM.xz + wind * (hRel / fallV);
+    let ang = atan2(q.x, q.y);
+    let colW = mix(0.05, 0.06, snow) * (1.0 + f32(k) * 0.35);
+    let colF = ang * radius / colW;
+    let col = floor(colF);
+    let hsh = pcg(u32(i32(col) + 100000) ^ (k * 0x9E3779B9u));
+    let jx = f32(hsh & 1023u) / 1023.0;
+    let sp = 0.75 + 0.5 * f32((hsh >> 10u) & 255u) / 255.0;
+    let ph = f32((hsh >> 18u) & 1023u) / 1023.0;
+    let period = mix(1.6, 0.42, snow) * (1.0 + f32(k) * 0.25);
+    // Which drop of this column the ray passes nearest: the drop's centre
+    // height in the sheared frame, then back to the world.
+    let fallOff = R.time * fallV * sp;
+    let vNow = (hRel + fallOff) / period + ph;
+    var best = 0.0;
+    for (var dn = -1; dn <= 0; dn++) {
+      let n = floor(vNow) + f32(dn);
+      let hc = (n + 0.5 - ph) * period - fallOff;
+      var angC = (col + 0.25 + 0.5 * jx) * colW / radius;
+      // Snow wanders sideways as it falls.
+      angC += sin(R.time * (0.9 + sp) + ph * 6.28 + n) * 0.05 * snow / radius;
+      let qc = vec2f(sin(angC), cos(angC)) * radius;
+      let xz = qc - wind * (hc / fallV);
+      let c = camM + vec3f(xz.x, hc, xz.y);
+      // A drop within half a metre of the eye would cover the screen as a
+      // smear: real ones that close are out of focus and gone in a frame.
+      if (dot(c - camM, rd) < 0.5) { continue; }
+      // Distance from the ray to the drop (point or segment).
+      let halfLen = mix(0.17, 0.0, snow) * sp;
+      let a = c - fallDir * halfLen;
+      let b = c + fallDir * halfLen;
+      let ab = b - a;
+      // Closest points between the ray (cam + rd s) and the segment a + ab u.
+      let w0 = camM - a;
+      let bb = dot(ab, ab);
+      let rdab = dot(rd, ab);
+      let rdw = dot(rd, w0);
+      let abw = dot(ab, w0);
+      let den = bb - rdab * rdab;
+      var u = select(clamp((abw - rdab * rdw) / den, 0.0, 1.0), 0.5, den < 1e-8);
+      let pc = a + ab * u;
+      let s = max(dot(pc - camM, rd), 0.01);
+      let dist = length(camM + rd * s - pc);
+      let width = mix(0.0025, 0.011, snow);
+      let wPix = pxAng * s * 0.7;
+      let wEff = max(width, wPix);
+      let fade = width / wEff;
+      best = max(best, exp(-(dist * dist) / (wEff * wEff)) * fade);
+    }
+    var a = best * amount * mix(0.35, 0.9, snow) / (1.0 + f32(k) * 0.4);
+    if (a < 0.003) { continue; }
+    // Roofed? The openness at the drop's cell, looking up. Unknown = open.
+    let cell = vec3<i32>(floor(p / VOXEL_METERS));
+    if (inBounds(cell)) {
+      let o = opennessAt(cell, p / VOXEL_METERS, vec3f(0.0, 1.0, 0.0), &openness, &opennessGen);
+      if (o >= 0.0) { a *= clamp(o * 2.0 - 0.4, 0.0, 1.0); }
+    }
+    color = mix(color, lit * mix(1.0, 1.6, snow), clamp(a, 0.0, 1.0));
+  }
+  return color;
+}
+
 // Aerial perspective: distance fog that converges EXACTLY to the sky color in
 // that ray's direction. The old `skyColor * 0.9` target left every distant
 // surface hanging slightly darker than the sky it should dissolve into, which
@@ -4708,7 +4932,7 @@ fn applyAerial(color : vec3f, rd : vec3f, tFine : f32) -> vec3f {
   // nebulae into distant terrain — which renders stars *through* hillsides,
   // trees and the ground near the horizon, because those surfaces are exactly
   // the ones carrying the most fog.
-  return mix(color, skyAirglow(rd), f);
+  return mix(color, cloudySkyAirglow(rd), f);
 }
 
 // ============================================================================
@@ -6032,15 +6256,19 @@ fn waterRippleFootprint(hitP : vec3f) -> f32 {
 // across the bed with the sun's angle instead of being pinned under the waves
 // that cast it.
 //
-// Returns a MULTIPLIER for the bed colour, not an addition. Caustics are a
-// redistribution of the sunlight already landing on the bed, so they scale what
-// is there: bright sand goes brighter, dark stone stays dark. Adding a constant
-// instead lights up the water itself, which reads as glowing blobs floating in
-// the volume rather than light playing over a surface.
+// Two halves. This one returns the CURVATURE — how strongly the swell above
+// this pixel focuses (>= 0, a wave crest acting as a converging lens).
+// veilCaustic (common.wgsl) turns it into a MULTIPLIER for the lit colour at a
+// given depth, not an addition: caustics are a redistribution of the sunlight
+// already landing on the bed, so they scale what is there — bright sand goes
+// brighter, dark stone stays dark. Adding a constant instead lights up the
+// water itself, which reads as glowing blobs floating in the volume. The split
+// is what lets the water veil re-apply the web at a raster body's own depth.
 //
 // Shared by shadeWater and the MPM fluid's seam path so a lake whose surface is
 // half CA and half marched isosurface throws ONE caustic web across its bed.
-fn waterCaustics(hitP : vec3f, rd : vec3f, pathVox : f32, depthM : f32) -> f32 {
+fn waterCausticCurv(hitP : vec3f, rd : vec3f, pathVox : f32,
+                    depthM : f32) -> f32 {
   // where on the surface the sunlight entering this bed point came from
   let bedP = hitP + rd * pathVox;
   let kdc = keyLightDir();
@@ -6061,12 +6289,9 @@ fn waterCaustics(hitP : vec3f, rd : vec3f, pathVox : f32, depthM : f32) -> f32 {
   // divergence of the slope field = Laplacian of the height field. Negative
   // curvature (a wave crest acting as a converging lens) is the bright case.
   let curv = ((sx.x - s0.x) + (sz.y - s0.y)) / e;
-  // Focusing strength grows with depth (longer lever arm from surface to bed)
-  // then saturates — deep water's caustics wash out as the light scatters, and
-  // unbounded growth would blow the bed out to white.
-  let focus = clamp(depthM * 1.5, 0.0, 1.4);
-  let caustic = max(-curv, 0.0) * focus;
-  return 1.0 + min(caustic * TUNE_CAUSTIC_GAIN, TUNE_CAUSTIC_CAP);
+  // The focusing strength (growing with depth, then saturating) is
+  // veilCaustic's half.
+  return max(-curv, 0.0);
 }
 
 // ---- W3: the sim's own surface momentum, at this column --------------------
@@ -6177,7 +6402,10 @@ fn reflectionSky(rd : vec3f) -> vec3f {
   // below, which is shaped for a rippled surface. Reflecting the real disc
   // here as well would double it AND scatter single-pixel fireflies wherever
   // a ripple normal happens to line up.
-  return skyColorNoBodies(normalize(d));
+  let sky = skyColorNoBodies(normalize(d));
+  if ((R.weatherFlags & RWF_CLOUDS) == 0u) { return sky; }
+  let e = cloudEnvAt(normalize(d), &CL, &cloudMaps);
+  return sky * e.a + e.rgb;
 }
 
 // ---- traced reflection ----
@@ -6683,7 +6911,43 @@ fn mistAirAt(c : vec3<i32>) -> bool {
   return voxMat(voxWordAt(c)) == MAT_AIR;
 }
 
-// THREE voxel reads worst case, and only on a pixel that already resolved a CA
+// HOW MUCH FALLING LIQUID THIS CELL BELONGS TO: the count of its five
+// non-downward axis neighbours that are liquid too, 0..5.
+//
+// A plume is thrown by a FALL, and a fall has to be BIG. The cue below used to
+// ask one question — "is the cell above me liquid?" — and a two-voxel gout of
+// blood leaving a wound answers it exactly the way a river does, so every
+// droplet of blood in flight wore a waterfall's worth of vapour. That veil is
+// 65% white and blends at up to 0.92, so a dark red droplet came out a pale
+// grey-pink smudge: blood FLASHED WHITE the moment it left a body and went
+// back to blood the moment it landed. (Measured 2026-09-22 by returning black
+// from shadeViscous on a --shot-strike frame: the droplet's pixels still read
+// 175,164,162 — nearly all of what was on screen there was this overlay and
+// none of it was the liquid.)
+//
+// WHY THE MEASUREMENT IS SIDEWAYS AND NOT UPWARD. The obvious size test is
+// "how tall is the column above me", and it is the wrong one: a CA waterfall
+// in flight is vertically BROKEN — the cells separate as they accelerate, so
+// the column reads as stacked slabs with air between them, and a run-length
+// gate erases the mist from the very thing it exists for (tried first, and
+// --shot-waterfall came back a clear blue ribbon with no plume at all). What a
+// river has and a wound does not is WIDTH: the falling sheet is cells across
+// in x and z, while a gout is one or two cells alone in the air.
+//
+// Five reads on a pixel that already resolved a CA liquid surface, against the
+// three the cue paid before. Cheap beside the 48 the smooth liquid normal on
+// the same pixel already spends, and only ever reached on liquid.
+fn fallMassAt(cell : vec3<i32>) -> f32 {
+  var n = 0.0;
+  if (mistLiquidAt(cell + vec3<i32>(0, 1, 0))) { n += 1.0; }
+  if (mistLiquidAt(cell + vec3<i32>(1, 0, 0))) { n += 1.0; }
+  if (mistLiquidAt(cell + vec3<i32>(-1, 0, 0))) { n += 1.0; }
+  if (mistLiquidAt(cell + vec3<i32>(0, 0, 1))) { n += 1.0; }
+  if (mistLiquidAt(cell + vec3<i32>(0, 0, -1))) { n += 1.0; }
+  return n;
+}
+
+// SEVEN voxel reads worst case, and only on a pixel that already resolved a CA
 // liquid surface. The branches are exclusive because the second question is a
 // different question in each: a cell either has air under it or it does not.
 fn fallCueAt(cell : vec3<i32>) -> FallCue {
@@ -6691,18 +6955,22 @@ fn fallCueAt(cell : vec3<i32>) -> FallCue {
   cue.fall = 0.0;
   cue.impact = 0.0;
   if (mistAirAt(cell + vec3<i32>(0, -1, 0))) {
-    // In flight. Liquid directly above means a continuous column, which is the
-    // strong signal; a lone cell with air on both sides is one droplet and is
-    // worth proportionally less veil.
-    cue.fall = select(0.55, 1.0, mistLiquidAt(cell + vec3<i32>(0, 1, 0)));
+    // In flight, and how much of a fall this is comes off how much liquid is
+    // falling WITH it: nothing at all for a lone droplet or a pair, the full
+    // veil once it is part of a sheet.
+    cue.fall = smoothstep(1.5, 3.5, fallMassAt(cell));
     // And if something solid is within two cells under it, this cell IS the
-    // foot of the fall — the spray belongs here as much as at the pool.
-    cue.impact = select(1.0, 0.0, mistAirAt(cell + vec3<i32>(0, -2, 0)));
+    // foot of the fall — the spray belongs here as much as at the pool. Same
+    // gate: a droplet about to land is not a plunge basin.
+    cue.impact = select(cue.fall, 0.0, mistAirAt(cell + vec3<i32>(0, -2, 0)));
   } else {
     // At rest: a pool surface. It is a plunge site only if there is DETACHED
-    // liquid coming down onto it — an air gap, then water.
-    if (mistAirAt(cell + vec3<i32>(0, 1, 0))) {
-      cue.impact = select(0.0, 1.0, mistLiquidAt(cell + vec3<i32>(0, 2, 0)));
+    // liquid coming down onto it — an air gap, then water, and enough of it to
+    // be a fall by the same measure (taken up THERE, not here: a pool has five
+    // liquid neighbours of its own and would pass its own test every time).
+    let above = cell + vec3<i32>(0, 2, 0);
+    if (mistAirAt(cell + vec3<i32>(0, 1, 0)) && mistLiquidAt(above)) {
+      cue.impact = smoothstep(1.5, 3.5, fallMassAt(above));
     }
   }
   return cue;
@@ -6759,7 +7027,16 @@ fn waterfallMist(base : vec3f, hitP : vec3f, rd : vec3f, tHit : f32,
   // and aerated oil is brown foam; nothing here names a material.
   let lmc = (unpackColor(materials[mat].color0) +
              unpackColor(materials[mat].color1)) * 0.5;
-  let tint = mix(vec3f(1.0), lmc, 0.35);
+  // HOW WHITE AERATION GOES IS THE LIQUID'S OWN BUSINESS, and the axis is the
+  // authored opacity — the same one submergedProfile reads, so nothing here
+  // names a material. Foam is white because a cloud of bubbles scatters every
+  // wavelength before any of it is absorbed; that only holds for a liquid light
+  // gets THROUGH. Water (opacity 90) still goes to the 0.65 white this always
+  // used, while blood (200) and oil (235) keep their own colour and foam pink
+  // and brown, which is what they actually do.
+  let clarity = clamp((1.0 - f32(materials[mat].opacity) / 255.0) * 1.5,
+                      0.0, 1.0);
+  let tint = mix(lmc, vec3f(1.0), 0.65 * clarity);
   let col = (ambientAt(vec3f(0.0, 1.0, 0.0)) + keyLightColor() * lit)
             * (0.25 + 0.75 * lit) * tint * TUNE_MIST_BRIGHTNESS;
 
@@ -6976,6 +7253,12 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   let extinction = absorbK + vec3f(1.0 / prof.visM);
   let trans = exp(-extinction * distM);
   var color = behind * trans + ambientWater * (vec3f(1.0) - trans);
+  // The water veil (gV* globals): the eye is in the medium, so a raster body
+  // at any distance sits in the same column, under no surface and no caustic.
+  gVScatter = ambientWater;
+  gVAbsorb = extinction;
+  gVDelta = (behind - ambientWater) * trans;
+  gVCurv = 0.0;
 
   // ---- god rays and silt ----
   // BOTH GATED ON CLARITY, and both skipped outright in a dense liquid.
@@ -7040,7 +7323,9 @@ fn shadeSubmerged(ro : vec3f, rd : vec3f, mat : u32, pathVox : f32,
   // with aspect ratio. Stronger in a dense liquid, which is what makes being
   // in oil feel like being in oil.
   let off = 1.0 - clamp(dot(rd, R.camFwd), 0.0, 1.0);
-  color *= 1.0 - clamp(off * prof.vignette * 2.5, 0.0, prof.vignette);
+  let vig = 1.0 - clamp(off * prof.vignette * 2.5, 0.0, prof.vignette);
+  color *= vig;
+  gVK = vec3f(vig);
 
   return color;
 }
@@ -7235,14 +7520,21 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // shifts across the bed with the sun's angle instead of being pinned under
   // the waves that cast it.
   var lit = sceneBehind;
+  gVCurv = 0.0;
   if (!underwater && depthM > 0.02) {
-    lit *= waterCaustics(hitP, rd, pathVox, depthM);
+    gVCurv = waterCausticCurv(hitP, rd, pathVox, depthM);
+    lit *= veilCaustic(gVCurv, depthM);
   }
 
   // What comes back up: the bed (plus its caustics), filtered by the water
   // column, plus the column's own in-scattered light (which is what keeps
   // deep water blue rather than black).
   var refracted = lit * trans + scatter * (vec3f(1.0) - trans);
+  // The water veil's half of this equation (see the gV* globals): a raster
+  // body under the surface replaces the bed term at its own depth.
+  gVScatter = scatter;
+  gVAbsorb = absorbK;
+  gVDelta = (lit - scatter) * trans;
 
   // ---- reflection ----
   var reflection : vec3f;
@@ -7270,6 +7562,7 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   }
 
   var color = mix(refracted, reflection, fres);
+  gVK = vec3f(1.0 - fres);
 
   // ---- sun glint ----
   // Sharp Blinn-Phong lobe on the RIPPLED normal. This is what turns a
@@ -7339,7 +7632,9 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
       // damping it would dissolve the far shore's foam line)
       let s = rippleSlope(pm, R.time, 0.0);
       let mask = smoothstep(0.010, 0.055, length(s));
-      color = mix(color, vec3f(0.92, 0.95, 0.97), amount * mask * TUNE_FOAM_STRENGTH);
+      let foamA = amount * mask * TUNE_FOAM_STRENGTH;
+      color = mix(color, vec3f(0.92, 0.95, 0.97), foamA);
+      gVK *= 1.0 - foamA;
     }
   }
 
@@ -8237,6 +8532,27 @@ struct FSOut {
   @location(0) color : vec4f,
   @builtin(frag_depth) depth : f32,
 };
+
+// Publish this pixel's water veil (common.wgsl THE WATER VEIL) from the gV*
+// globals the liquid shade just left. `colorNow` is the pixel as shaded so far
+// — surface, reflection, foam and the air fog to the surface all included —
+// and `fogF` that air fog's fraction, which scales the transmitting part the
+// same way applyAerial scaled the bed's. The pitch is recomputed from the
+// uniform rather than carried from the top of fs(): a value live across
+// trace() costs registers in the one place this shader has none.
+fn writeWaterVeil(fragXY : vec2f, tSurf : f32, pathCap : f32, colorNow : vec3f,
+                  fogF : f32) {
+  let b = veilBase(fragXY, &R);
+  if (b == 0xFFFFFFFFu || b + VEIL_WORDS > arrayLength(&waterVeil)) { return; }
+  let k = gVK * (1.0 - fogF);
+  waterVeil[b] = bitcast<u32>(max(tSurf, 0.0) + 1.0);
+  waterVeil[b + 1u] = packRgb9e5(k);
+  waterVeil[b + 2u] = packRgb9e5(colorNow - k * gVDelta);
+  waterVeil[b + 3u] = packRgb9e5(k * gVScatter);
+  waterVeil[b + 4u] = packRgb9e5(gVAbsorb);
+  waterVeil[b + 5u] = pack2x16float(vec2f(clamp(pathCap, 0.0, 60000.0),
+                                          clamp(gVCurv, 0.0, 60000.0)));
+}
 
 // ============================================================================
 // MPM FLUID SURFACE — the Splash-style water look for the MLS-MPM liquid
@@ -9420,6 +9736,13 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
     body = mix(body, caScatter, caFrac);
   }
   let trans = exp(-absorb * thickM);
+  // The water veil (gV* globals): the same two coefficients a raster body in
+  // this column is dimmed by. Delta is refined below once `behind` is known.
+  gVScatter = body;
+  gVAbsorb = absorb;
+  gVK = vec3f(1.0);
+  gVCurv = 0.0;
+  gVDelta = (sceneBehind - body) * trans;
 
   if (fh.inside) {
     // Submerged: volumetric only — no interface, no Fresnel split. The
@@ -9534,9 +9857,12 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   // seam as the colour was, and free to fix because both surfaces now agree
   // about the wave field that casts it (waterCaustics / rippleSlope).
   if (caFrac > 0.001 && thickM > 0.02) {
-    behind *= mix(1.0, waterCaustics(hitP, rd, colVox, thickM), caFrac);
+    let cc = waterCausticCurv(hitP, rd, colVox, thickM);
+    behind *= mix(1.0, veilCaustic(cc, thickM), caFrac);
+    gVCurv = cc * caFrac;
   }
   var refracted = behind * trans + body * (1.0 - trans);
+  gVDelta = (behind - body) * trans;
 
   // ---- reflection ----
   var reflection : vec3f;
@@ -9550,6 +9876,7 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
   reflection *= TUNE_FLUID_REFLECT;
 
   var color = mix(refracted, reflection, clamp(fres, 0.0, 1.0));
+  gVK = vec3f(1.0 - clamp(fres, 0.0, 1.0));
 
   // ---- sun glint ----
   // Tight Blinn-Phong lobe; the wobble normal breaks it into the moving
@@ -9608,12 +9935,19 @@ fn shadeMpmFluid(ro : vec3f, rd : vec3f, fh : FluidHit, caMat : u32,
     let foamCol = vec3f(0.93, 0.96, 0.99) *
                   (ambientAt(n) + keyLightColor() * 0.55);
     color = mix(color, foamCol, clamp(foam, 0.0, 0.90));
+    gVK *= 1.0 - clamp(foam, 0.0, 0.90);
   }
   return color;
 }
 
 @fragment
 fn fs(in : VSOut) -> FSOut {
+  // Every pixel starts dry; a liquid shade below overwrites the record. Done
+  // FIRST so nothing about it is live across trace().
+  if (WATER_VEIL) {
+    let vb = veilBase(in.pos.xy, &R);
+    if (vb != 0xFFFFFFFFu && vb < arrayLength(&waterVeil)) { waterVeil[vb] = 0u; }
+  }
   if (RENDER_STATS) {
     // The 1-in-16 sample: every fourth pixel on both axes. Decided once here;
     // rsAdd() reads the flag on every count.
@@ -9760,14 +10094,28 @@ fn fs(in : VSOut) -> FSOut {
   // Liquid interface: nearest wins. `> 0.0` skips the underwater case (liqT
   // ~0 means the camera is already submerged, so there is no interface in
   // front of anything and depth belongs to whatever the ray actually found).
+  //
+  // UNLESS THE WATER VEIL CARRIES IT. A clear liquid's surface is not what
+  // covers a body under it — the water column is, and it is recorded per pixel
+  // (writeWaterVeil) for the raster passes to shade through. Its depth
+  // therefore stays with what the march found BEHIND it, so a wading mob's
+  // legs pass the depth test and are drawn dimmed and tinted instead of being
+  // cut off at the waterline. Viscous liquids (blood, oil) keep the interface:
+  // they are near-opaque and their shade records no veil.
   if (h.liqT > 0.05 && (tDepth < 0.0 || h.liqT < tDepth)) {
-    tDepth = h.liqT;
+    if (!WATER_VEIL ||
+        isViscousLiquid(materials[voxMat(voxWordAt(h.liqCell))])) {
+      tDepth = h.liqT;
+    }
   }
   // MPM fluid interface: same nearest-wins rule as the CA liquid above, and
   // the same "> 0.05" skip for a submerged camera. Raster geometry (droplet
   // spray, debris) behind the surface is covered by it; spray in front of it
   // draws over it — which is exactly what a splash should do.
-  if (SPEC_FLUID && mf.hit && mf.t > 0.05 && (tDepth < 0.0 || mf.t < tDepth)) {
+  // The MPM shade always records a veil (it only ever holds non-viscous
+  // liquid), so under WATER_VEIL its interface writes no depth either.
+  if (!WATER_VEIL && SPEC_FLUID && mf.hit && mf.t > 0.05 &&
+      (tDepth < 0.0 || mf.t < tDepth)) {
     tDepth = mf.t;
   }
   // Half-opaque gas: same nearest-wins rule as the two interfaces above, and
@@ -9866,6 +10214,12 @@ fn fs(in : VSOut) -> FSOut {
           lambert *= sh;
         }
       }
+      // Cloud shadow (common.wgsl cloudSunAt): the deck's shadow crossing the
+      // distant hills, from the same map the near field reads — so a cloud
+      // shadow is continuous across the window seam.
+      if (lambert > 0.0 && (R.weatherFlags & RWF_CLOUDS) != 0u) {
+        lambert *= cloudSunAt(R.camPos + rd * far.t, keyLightDir(), &CL, &cloudMaps);
+      }
       // ---- THE NEAR FIELD'S FOUR-TAP AO, on cascade cells ----
       // voxelAO's rule (two tangent neighbours + the corner the hit leans into,
       // ramped by the hit's position in the face) over farBlockerAt at the hit's
@@ -9910,7 +10264,20 @@ fn fs(in : VSOut) -> FSOut {
       if (h.liqT <= 0.0) { color = applyAerial(color, rd, far.t); }
       else { color = applyAerial(color, rd, far.t - h.liqT); }
     } else {
-      color = skyColor(rd);
+      // THE CLOUDS, over the sky they stand in front of, with the stars, the
+      // moons and the sun disc all behind them — the z-order the SkyLayer
+      // veils already encode for the aurora. One bilinear fetch of the
+      // accumulated low-res image (cloud.wgsl). The smooth sky takes the
+      // HAZED transmittance and the point sources the DIRECT one: aerial
+      // haze in front of a cloud is airlight, which may pale the cloud toward
+      // the sky but must not let the sun disc through it.
+      if ((R.weatherFlags & RWF_CLOUDS) != 0u) {
+        let sp = skyColorParts(rd);
+        let cs = cloudScreenAt(in.pos.xy);
+        color = sp.glow * cs.t + (sp.full - sp.glow) * cs.td + cs.c;
+      } else {
+        color = skyColor(rd);
+      }
     }
   } else {
     // A micro hit reports the SUB-VOXEL's material (h.micMat) while the cell's
@@ -10067,6 +10434,23 @@ fn fs(in : VSOut) -> FSOut {
       // 45% sun through the rock before this. `openRaw` is read above, once,
       // for the ambient term below.
       lambert *= shadowLiftCap(sh, openRaw);
+    }
+    // THE CLOUDS' SHADOW: one bilinear lookup in the per-frame cloud shadow
+    // map (cloud.wgsl `shadow`). Applied to the direct term only, like every
+    // other occluder here — the overcast's effect on the SKY light is the
+    // shared ambient's business (ambientAtP).
+    if (lambert > 0.0 && (R.weatherFlags & RWF_CLOUDS) != 0u) {
+      lambert *= cloudSunAt(hp, keyLightDir(), &CL, &cloudMaps);
+    }
+    // WET GROUND (weather.h wetness): rain darkens what it soaks — sky-facing
+    // surfaces that can SEE the sky, by openness, so the floor of a barn stays
+    // dry while the yard outside goes dark. Liquids are already wet. The
+    // sheen below picks it up through `wet`, so a soaked field glints.
+    if (R.wetness > 0.001 && m.klass != CLASS_LIQUID) {
+      let expo = select(1.0, clamp(openRaw * 1.6 - 0.35, 0.0, 1.0), openRaw >= 0.0);
+      let wv = R.wetness * expo * mix(0.3, 1.0, clamp(n.y, 0.0, 1.0));
+      albedo *= 1.0 - TUNE_CLOUD_WET_DARKEN * wv;
+      wet = max(wet, wv * 0.55);
     }
     let sun = keyLightColor() * lambert;
     // ---- the openness (sky-visibility) grid, phase 0 of indirect light ----
@@ -10431,12 +10815,16 @@ fn fs(in : VSOut) -> FSOut {
                      && materials[lm].moveEvery <= 1u
                      && (mf.inside || mf.t <= h.liqT + 1.0);
 
+      // The veil's surface distance, set by the two shades that record one
+      // (-1 = none): 0 for a submerged eye, the interface otherwise.
+      var veilT = -1.0;
       if (underwater && !mpmOwned) {
         let sawSky = !h.hit && !h.saturated && !far.hit;
         rsAdd(RS_PX_SUB, 1u);
         color = shadeSubmerged(R.camPos, rd, lm, h.liqPath, color, in.pos.xy,
                                sawSky);
         caShadedLiquid = true;
+        veilT = 0.0;
       } else if (isViscousLiquid(materials[lm])) {
         color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                              h.liqPath, max(h.mediaSurf, 0.125), color,
@@ -10450,6 +10838,7 @@ fn fs(in : VSOut) -> FSOut {
                            h.liqT, underwater);
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
+        veilT = h.liqT;
       }
       // mpmOwned && !viscous && !underwater: the MPM path below will shade it.
 
@@ -10462,6 +10851,12 @@ fn fs(in : VSOut) -> FSOut {
       // render.mistDensity at 0 so does this one.
       if (!underwater && caShadedLiquid) {
         color = waterfallMist(color, hitP, rd, h.liqT, h.liqCell, lm);
+      }
+      // After the mist, which hangs between the eye and the surface and so
+      // covers a body under it exactly as it covers the bed.
+      if (WATER_VEIL && veilT >= 0.0) {
+        writeWaterVeil(in.pos.xy, veilT, h.liqPath, color,
+                       select(0.0, aerialFrac(veilT), veilT > 0.0));
       }
     }
   }
@@ -10543,6 +10938,11 @@ fn fs(in : VSOut) -> FSOut {
       }
       color = shadeMpmFluid(R.camPos, rd, mf, caMat, caPath, color);
       if (!mf.inside) { color = applyAerial(color, rd, mf.t); }
+      if (WATER_VEIL) {
+        writeWaterVeil(in.pos.xy, select(mf.t, 0.0, mf.inside),
+                       max(mf.thick, caPath), color,
+                       select(aerialFrac(mf.t), 0.0, mf.inside));
+      }
     }
   }
 
@@ -10555,6 +10955,29 @@ fn fs(in : VSOut) -> FSOut {
   // an emitter list the shader can index, so the cost scales with the number
   // of pools rather than with screen area.
 
+
+  // ---- THE DECK BETWEEN A HIGH CAMERA AND THE GROUND ----------------------
+  // From above (or inside) the deck the clouds stand in FRONT of the terrain,
+  // not behind it, and the march already stopped each downward ray at the
+  // ground — so the same low-res image composites over hit pixels too. Only
+  // when the eye is at or above the deck's lowest base: below it the terrain
+  // is always nearer than any cloud and this is skipped (the common case, and
+  // the one that must not pay a fetch per terrain pixel).
+  if ((R.weatherFlags & RWF_CLOUDS) != 0u && tDepth >= 0.0 &&
+      CL.camM.y > CL.baseM - cloudBaseJitterM(CL.thicknessM)) {
+    let cs = cloudScreenAt(in.pos.xy);
+    color = color * cs.t + cs.c;
+  }
+
+  // ---- RAIN / SNOW near the camera (weather.h; plan §2.5 tier 1) ----------
+  // Streaks on four cylinders around the eye, each hidden behind whatever the
+  // ray hit nearer than it and gated on the openness grid at the streak — so
+  // the rain stops at a roof and keeps falling two metres away outside, which
+  // is the per-sample gate the corpus says a player-centred cull gets wrong.
+  // Only when the camera probe says it is raining HERE.
+  if ((R.weatherFlags & (RWF_RAIN | RWF_CLOUDS)) == (RWF_RAIN | RWF_CLOUDS)) {
+    color = rainOverlay(color, rd, tDepth);
+  }
 
   // fire glow: additive, from the flicker-weighted emissive path. Intensity
   // drives a temperature ramp across the material palette — stray flame

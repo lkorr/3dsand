@@ -1115,6 +1115,168 @@ Status GateTickInput(Ctx& c, std::string& detail) {
 }
 
 
+// ---- view-smooth -----------------------------------------------------------
+//
+// WALKING UP A HILL IS ONE CONTINUOUS MOTION, NOT THIRTY TELEPORTS A SECOND.
+//
+// The body climbs a ledge in ONE tick — `StepSlide` is an instantaneous
+// vertical snap, by design — so both render corrections have to hide it:
+//   * `viewYOffset`, which cancels the snap and decays over
+//     player.viewSmoothHalflife, and
+//   * the N2 tick interpolation, which rides prevPos -> pos across the 33 ms.
+// They are not independent, and that is what this gate exists to pin. From
+// 2026-09-10 (N2) to 2026-09-21 the two DOUBLE-COUNTED each other: the offset
+// subtracted the whole step in one lump at the tick boundary while the lerp
+// added it back linearly over the tick, so the eye dropped a full step height
+// on the first frame of every tick and climbed back over the next 33 ms. At a
+// 30 Hz tick and a voxel per step that is a 10 cm sawtooth at 30 Hz for the
+// whole climb — visually indistinguishable from no smoothing at all, which is
+// exactly how it was reported ("it snaps up one voxel at a time").
+// `Player::BankVerticalSnap` moves prevPos with the offset so the lerp only
+// ever covers the CONTINUOUS part of the tick's travel.
+//
+// THE MEASUREMENT IS PER FRAME, NOT PER TICK, because the artifact only exists
+// between ticks: sampled once per tick the broken version and the fixed one
+// return the same numbers. So the fixture runs the frame loop's real shape —
+// N frames per tick, `alpha` sweeping 0..1 — and looks at the biggest
+// single-frame change in the drawn eye height.
+//
+// THREE CLAIMS, each of which fails on its own:
+//   (A) no frame moves the eye more than `viewSmooth.maxFrameJumpVox`. The
+//       staircase's riser is one voxel, so a per-frame jump near 1.0 IS the
+//       sawtooth and a well-smoothed climb is an order of magnitude under it.
+//   (B) the eye never goes DOWN while the body is climbing. A dip is the
+//       signature of the double-count specifically (the lump lands before the
+//       lerp makes it back), and it is not caught by (A) alone.
+//   (C) the BODY and the EYE move as one. The art is posed once per tick
+//       around `pos` (Mob::SetRenderOffset / Player::RenderBodyOffset); if it
+//       does not get the same two corrections, third person shows a figure
+//       stair-stepping under a camera that glides. With no crouch in the
+//       script the gap between them is a constant, so its VARIATION is the
+//       error — measured in voxels, asserted at ~0.
+constexpr int kViewSmoothTicks = 240;
+constexpr int kViewSmoothFramesPerTick = 5;   // 150 fps against a 30 Hz tick
+constexpr int kViewSmoothSettleTicks = 20;   // land first, then measure
+
+Status GateViewSmooth(Ctx& c, std::string& detail) {
+  (void)c;
+  // A staircase: one voxel up every 4 voxels of +x, starting at x=150. Four
+  // voxels is about one tick of walking, so the run crosses a riser every few
+  // ticks and the climb is the steady state rather than a single event.
+  auto kindAt = [](IVec3 cell) {
+    int ground = 100;
+    if (cell.x >= 150) ground = 100 + (cell.x - 150) / 4 + 1;
+    return cell.y < ground ? CellKind::Solid : CellKind::Air;
+  };
+  Player p;
+  p.fly = false;
+  p.pos = Vec3{140.0f, 100.0f + Player::kHalfY + 2.0f, 140.0f};
+  p.SnapRender();
+
+  TickInput in;
+  in.forward = 1.0f;
+  in.flatFwd = Vec3{1, 0, 0};
+  in.right = Vec3{0, 0, -1};
+  in.lookFwd = in.flatFwd;
+
+  float prevEye = 0.0f, prevGap = 0.0f;
+  bool have = false;
+  float maxJump = 0.0f, worstDip = 0.0f, maxGapDrift = 0.0f;
+  // Attribution, not a bare count (CLAUDE.md rule 6): WHEN the worst frame
+  // happened and what the body was doing on it. A number with no cause
+  // attached costs a diagnosis run; these cost nothing.
+  int jumpAt[2] = {-1, -1}, dipAt[2] = {-1, -1};
+  float jumpWhy[5] = {0, 0, 0, 0, 0}, dipWhy[5] = {0, 0, 0, 0, 0};
+  float climbed = 0.0f;
+  float startY = p.pos.y;
+  for (int t = 0; t < kViewSmoothTicks; t++) {
+    p.Update(kTickDt, in, kindAt);
+    // The fixture spawns two voxels up so the body lands on its own feet
+    // rather than starting interpenetrating; those ticks are a FALL, which is
+    // fast continuous motion and would set the worst-frame numbers to
+    // something that has nothing to do with stepping. (Measured before this
+    // skip existed: the worst 'dip' was tick 4 at vel.y = -16.4 vox/s, i.e.
+    // gravity working correctly.) The claim is about a WALK, so the walk is
+    // what is sampled.
+    if (t < kViewSmoothSettleTicks) {
+      have = false;
+      startY = p.pos.y;   // the climb is measured from where the walk begins
+      continue;
+    }
+    for (int f = 0; f < kViewSmoothFramesPerTick; f++) {
+      const float alpha = (float)f / (float)kViewSmoothFramesPerTick;
+      const float eyeY = p.RenderEyePos(alpha).y;
+      // Where the ART is drawn, in the same units: the avatar is posed around
+      // `pos` and translated by RenderBodyOffset (game/mob.cpp AppendXforms).
+      const float bodyY = p.pos.y + p.RenderBodyOffset(alpha).y;
+      const float gap = eyeY - bodyY;
+      if (have) {
+        const float d = eyeY - prevEye;
+        if (std::abs(d) > maxJump) {
+          maxJump = std::abs(d);
+          jumpAt[0] = t; jumpAt[1] = f;
+          jumpWhy[0] = p.pos.y; jumpWhy[1] = p.prevPos.y;
+          jumpWhy[2] = p.viewYOffset; jumpWhy[3] = p.grounded ? 1.f : 0.f;
+          jumpWhy[4] = p.vel.y;
+        }
+        if (d < worstDip) {
+          worstDip = d;
+          dipAt[0] = t; dipAt[1] = f;
+          dipWhy[0] = p.pos.y; dipWhy[1] = p.prevPos.y;
+          dipWhy[2] = p.viewYOffset; dipWhy[3] = p.grounded ? 1.f : 0.f;
+          dipWhy[4] = p.vel.y;
+        }
+        maxGapDrift = std::max(maxGapDrift, std::abs(gap - prevGap));
+      }
+      prevEye = eyeY;
+      prevGap = gap;
+      have = true;
+    }
+  }
+  climbed = p.pos.y - startY;
+
+  // (0) THE BODY ACTUALLY CLIMBED. Every bound below is satisfied perfectly by
+  // a player that never left the flat, which is the "absolute zero is a rate
+  // claim" trap — so the climb is asserted first and the rest means nothing
+  // without it. The staircase rises well past 10 voxels over the run.
+  const bool climbedOk = climbed > 8.0f;
+
+  const double maxJumpAllow = BaselineNumber("viewSmooth.maxFrameJumpVox", 0.25);
+  const double maxDipAllow = BaselineNumber("viewSmooth.maxFrameDipVox", 0.03);
+  const double maxGapAllow = BaselineNumber("viewSmooth.maxGapDriftVox", 0.001);
+  RecordObserved("viewSmooth.maxFrameJumpVox", (double)maxJump);
+  RecordObserved("viewSmooth.maxFrameDipVox", (double)-worstDip);
+  RecordObserved("viewSmooth.maxGapDriftVox", (double)maxGapDrift);
+
+  const bool jumpOk = maxJump <= (float)maxJumpAllow;
+  const bool dipOk = -worstDip <= (float)maxDipAllow;
+  const bool gapOk = maxGapDrift <= (float)maxGapAllow;
+  const bool ok = climbedOk && jumpOk && dipOk && gapOk;
+
+  char buf[360];
+  std::snprintf(buf, sizeof(buf),
+                "%d ticks x %d frames up a 1-in-4 staircase: climbed %.2f vox "
+                "(want >8), max frame jump %.4f vox (allow %.4f)%s, worst frame "
+                "dip %.4f vox (allow %.4f)%s, eye-vs-body drift %.6f vox "
+                "(allow %.6f)%s",
+                kViewSmoothTicks, kViewSmoothFramesPerTick, climbed, maxJump,
+                maxJumpAllow, jumpOk ? "" : " FAIL", -worstDip, maxDipAllow,
+                dipOk ? "" : " FAIL", maxGapDrift, maxGapAllow,
+                gapOk ? "" : " FAIL");
+  if (!jumpOk || !dipOk)
+    std::printf("view smooth: worst jump at tick %d frame %d "
+                "(pos.y %.4f prev.y %.4f off %.4f ground %.0f vel.y %.3f); "
+                "worst dip at tick %d frame %d "
+                "(pos.y %.4f prev.y %.4f off %.4f ground %.0f vel.y %.3f)\n",
+                jumpAt[0], jumpAt[1], jumpWhy[0], jumpWhy[1], jumpWhy[2],
+                jumpWhy[3], jumpWhy[4], dipAt[0], dipAt[1], dipWhy[0],
+                dipWhy[1], dipWhy[2], dipWhy[3], dipWhy[4]);
+  detail = buf;
+  std::printf("view smooth: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+
 // ---- two-players -----------------------------------------------------------
 //
 // TWO INDEPENDENT BODIES IN ONE WORLD, AND ONLY ONE OF THEM HAS A MIRROR.
@@ -1653,6 +1815,14 @@ constexpr int kGhostReviveTick = 240;  // ...alive again from here
 // not a target and the creature correctly drops it, so sampling at tick 300
 // would be asserting the re-acquisition timer rather than the band.
 constexpr int kGhostTargetProbeTick = 190;
+// ONE THROW, as the owner's session reports it: drawing, then the release's
+// swing (3 ticks, PlayerSession::throwLaunchIn). Probed a few ticks into each
+// level, past the clip's blend-in start.
+constexpr int kGhostThrowDrawFrom = 20;
+constexpr int kGhostThrowSwingFrom = 32;
+constexpr int kGhostThrowSwingTo = 35;
+constexpr int kGhostThrowDrawProbe = 28;
+constexpr int kGhostThrowSwingProbe = 33;
 
 // What one arm measured.
 struct GhostArm {
@@ -1673,6 +1843,8 @@ struct GhostArm {
   bool mobBrain = false;
   bool combatantOk = false;
   float mobToGhost = 0, mobToLocal = 0;
+  float windupW = 0, throwW = 0;        // the ghost's clip weights at the probes
+  float windupAfterRelease = -1;        // wind-up weight at the swing probe
   std::vector<uint32_t> hashes;
   std::string why;
 };
@@ -1708,6 +1880,10 @@ PlayerState GhostScript(int tick, const IVec3& site, uint32_t seed) {
          tick >= kGhostCrouchFrom && tick < kGhostCrouchTo);
   // The other one-tick edge, same rule: one tick only.
   if (tick == kGhostLandTick) st.impactDeltaV = Vec3{0, -kGhostLandDeltaV, 0};
+  st.Set(PlayerState::kThrowDraw,
+         tick >= kGhostThrowDrawFrom && tick < kGhostThrowSwingFrom);
+  st.Set(PlayerState::kThrowSwing,
+         tick >= kGhostThrowSwingFrom && tick < kGhostThrowSwingTo);
   st.health = 100;
   return st;
 }
@@ -1896,6 +2072,13 @@ void RunGhostArm(Ctx& c, GhostArm& a) {
         }
       }
     }
+    if (i == kGhostThrowDrawProbe)
+      a.windupW = ghost.avatar.ClipWeight("throw_windup");
+    if (i == kGhostThrowSwingProbe) {
+      a.throwW = ghost.avatar.ClipWeight("throw");
+      // Stopping, not gone: a released wind-up blends out over the swing.
+      a.windupAfterRelease = ghost.avatar.ClipWeight("throw_windup");
+    }
     if (i == kGhostTargetProbeTick) {
       const ai::Brain* br = c.mobs.MobBrain(a.mobId);
       a.mobBrain = br != nullptr;
@@ -1981,16 +2164,21 @@ Status GateRemoteGhost(Ctx& c, std::string& detail) {
   RecordObserved("remoteGhost.firstDiscardTick", (double)a.firstDiscardTick);
   RecordObserved("remoteGhost.leakedOps", (double)a.leaked);
 
-  const bool ok =
-      spawnOk && posOk && lifeOk && targetOk && triedOk && noLeakOk && detOk;
-  char buf[760];
+  // (7) THE OTHER PLAYER SEES YOU THROW: the wire's throw levels drive the
+  // same clips on the ghost's rig that session.cpp plays on the owner's.
+  const bool throwOk = a.windupW > 0.0f && a.throwW > 0.0f;
+
+  const bool ok = spawnOk && posOk && lifeOk && targetOk && triedOk &&
+                  noLeakOk && detOk && throwOk;
+  char buf[900];
   std::snprintf(
       buf, sizeof buf,
       "%d ticks x2: spawned tick %d (want <= 2) | worst root-vs-state %.4f vox "
       "at tick %d over %d samples (tol %.2f) | dead %d..%d held %d, revived %d "
       "| authored %llu ops, ALL discarded (first at tick %d), leaked %llu | "
       "mob %llu targets %llx (want %llx) at tick %d, d(ghost)=%.1f "
-      "d(local)=%.1f, band resolves %d | hashes %zu %s",
+      "d(local)=%.1f, band resolves %d | throw clips on the ghost: wind-up "
+      "%.2f, throw %.2f (wind-up %.2f after release) | hashes %zu %s",
       kGhostTicks, a.spawnTick, a.worstPosErr, a.worstPosErrTick, a.posSamples,
       posTol,
       kGhostDieTick, kGhostReviveTick, a.deadWhileDead ? 1 : 0,
@@ -1998,7 +2186,8 @@ Status GateRemoteGhost(Ctx& c, std::string& detail) {
       a.firstDiscardTick, (unsigned long long)a.leaked,
       (unsigned long long)a.mobId, (unsigned long long)a.mobTarget,
       (unsigned long long)(ai::kPlayerActorBase + 1), kGhostTargetProbeTick,
-      a.mobToGhost, a.mobToLocal, a.combatantOk ? 1 : 0, a.hashes.size(),
+      a.mobToGhost, a.mobToLocal, a.combatantOk ? 1 : 0, a.windupW, a.throwW,
+      a.windupAfterRelease, a.hashes.size(),
       detOk ? "reproduced" : "DIVERGED between the two runs");
   detail = buf;
   std::printf("remote ghost: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
@@ -2016,6 +2205,7 @@ const std::vector<Gate>& PlayerGates() {
       {"player-plants", "player", {}, false, GatePlayerPlants},
       {"player-fastfall", "player", {}, false, GatePlayerFastFall},
       {"tick-input", "player", {}, false, GateTickInput},
+      {"view-smooth", "player", {}, false, GateViewSmooth},
       {"two-players", "player", {}, false, GateTwoPlayers},
       {"remote-ghost", "player", {}, false, GateRemoteGhost},
   };

@@ -300,6 +300,11 @@ class PlayerAvatar : public Mob {
   // World position of a part's joint anchor — where the camera boom pivots and
   // where a first-person eye sits.
   bool PartAnchorWorld(int part, Vec3& out) const;
+  // Eye height from the creature's bottom in world voxels, derived from the
+  // sidecar's eyeLocal + the head's rest-pose anchor. 0 when no eyeLocal was
+  // authored (caller falls back to a constant).
+  float EyeRestHeight() const { return def_ ? def_->eyeRestHeight : 0.0f; }
+  bool HasEyeLocal() const { return def_ && def_->hasEyeLocal; }
 
   // ---- render plumbing ----
   // Inherited from Mob (identical slot walk to MobSystem's), except that the
@@ -463,7 +468,10 @@ class PlayerAvatar : public Mob {
   // death screen; Despawn/Revive tears it down instead of the husk sweep.
   bool DropLimbListOnDeath() const override { return false; }
   // The avatar renders through its own slot range with its own dirty flag.
-  void MarkInstancesDirty() override { instancesDirty_ = true; }
+  void MarkInstancesDirty() override {
+    instancesDirty_ = true;
+    twinDirty_ = true;  // Mob::SyncJointTwins: a lattice may have changed
+  }
 
  private:
   // Damage state read from a save (LoadState), applied at the end of the next

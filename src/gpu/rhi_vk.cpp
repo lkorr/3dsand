@@ -205,6 +205,11 @@ struct VkrRenderPass final : RenderPassImpl {
   void DrawIndirect(const Buffer& args, uint64_t offset) override {
     rec->DrawIndirect(NB(args), offset);
   }
+  void SplitAfterFragmentWrite(const Buffer& written) override {
+    // The bound pipeline and descriptor sets are command-buffer state and
+    // survive the scope boundary, so curLayout stays valid.
+    rec->SplitRenderingAfterFragmentWrite(NB(written));
+  }
   void End() override { rec->EndRendering(); }
 };
 
@@ -857,6 +862,11 @@ void RecordTableVulkan(const CommandEncoder& enc, pass::Table which, const Table
   // left the overlay permanently off with nothing to see. Three structs, one
   // value; all three or none.
   cxv.vizActive = cx.vizActive;
+  // The clouds' three switches and their dispatch extent. Same rule as the
+  // note above: three structs, one value; all three or none.
+  cxv.cloudFlags = cx.cloudFlags;
+  cxv.cloudGx = cx.cloudGx;
+  cxv.cloudGy = cx.cloudGy;
   e->rec->RecordTable(which, cxv);
 }
 

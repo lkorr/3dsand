@@ -1,0 +1,18 @@
+{
+  "label": "High cirrus",
+  "about": "Mares' tails: no low cloud, a streaked ice veil high up. Shows the 22-degree halo around the sun.",
+  "moisture": 0.08,
+  "weight": 0.8,
+  "coverage": 0.04,
+  "cloudType": 0.3,
+  "density": 0.8,
+  "baseM": 1600,
+  "thicknessM": 1200,
+  "darkness": 0.0,
+  "cirrus": 0.8,
+  "cirrusAltM": 8500,
+  "precip": 0.0,
+  "precipType": 0.0,
+  "mist": 0.0,
+  "lightning": 0.0
+}

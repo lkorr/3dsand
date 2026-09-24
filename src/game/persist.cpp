@@ -1,5 +1,7 @@
 #include "game/persist.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -184,6 +186,26 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   putDyes(r.hotbar->slots, kItemSlots);
   putDyes(r.kit->bag.slots, Bag::kSlots);
   putDyes(r.kit->equip.slots, kEquipSlotCount);
+  if (version < 6) return;
+
+  // ---- v6: what the vessels hold (game/container.h) --------------------------
+  //
+  //   u32 hotbarCount  then per slot: u32 fill (PackItemFill: mat | eighths<<16)
+  //   u32 bagCount     then per slot: u32 fill
+  //   u32 equipCount   then per slot: u32 fill
+  //
+  // The dyes' parallel-array shape, for the dyes' reason. The material is an
+  // ID, not a name, because the grid this came out of is saved by id too: a
+  // content change that renumbers materials has already repainted the world,
+  // and a flask that kept its old name would be the one thing that disagreed.
+  auto putFills = [&](const ItemStack* v, int n) {
+    PutU32(out, (uint32_t)n);
+    for (int i = 0; i < n; i++)
+      PutU32(out, v[i].Empty() ? 0u : PackItemFill(v[i].fillMat, v[i].fillAmt));
+  };
+  putFills(r.hotbar->slots, kItemSlots);
+  putFills(r.kit->bag.slots, Bag::kSlots);
+  putFills(r.kit->equip.slots, kEquipSlotCount);
 }
 
 bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
@@ -330,6 +352,27 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
     getDyes(r.kit->bag.slots, Bag::kSlots);
     getDyes(r.kit->equip.slots, kEquipSlotCount);
   }
+  // ---- v6: vessel contents ---------------------------------------------------
+  // Only onto a slot that resolved to a VESSEL: contents on anything else are
+  // matter attached to nothing, and would make that stack refuse to merge.
+  if (version >= 6) {
+    auto getFills = [&](ItemStack* v, int n) {
+      const uint32_t count = rd.U32();
+      for (uint32_t i = 0; i < count && rd.ok; i++) {
+        const uint32_t f = rd.U32();
+        if (!rd.ok || (int)i >= n || v[i].Empty()) continue;
+        const ItemDef* d = r.items->At(v[i].def);
+        if (!d || !d->IsContainer()) continue;
+        v[i].fillMat = ItemFillMat(f);
+        v[i].fillAmt = (uint16_t)std::min<int>(ItemFillAmt(f),
+                                               d->container.capacity);
+        if (v[i].fillAmt == 0) v[i].fillMat = 0;
+      }
+    };
+    getFills(r.hotbar->slots, kItemSlots);
+    getFills(r.kit->bag.slots, Bag::kSlots);
+    getFills(r.kit->equip.slots, kEquipSlotCount);
+  }
   if (dropped > 0)
     std::fprintf(stderr,
                  "PLYR: %d saved entries name content that no longer exists; "
@@ -358,18 +401,23 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
 // that burned half away on the ground has to come back that way. An untouched
 // item costs four bytes, which is why the common case can afford the check.
 
-void SaveWorldItems(const WorldItemRefs& r, std::vector<uint8_t>& out) {
-  const std::vector<WorldItem>& all = r.reg->All();
-  PutU32(out, (uint32_t)all.size());
-  for (const WorldItem& w : all) {
+// ONE ENTRY of the payload below -- the whole section is `u32 count` + these,
+// and a region bucket (S4) stores each one as its own record. `posOut` is
+// where the item is, which is what buckets it.
+void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
+                      std::vector<uint8_t>& out, Vec3* posOut) {
+  {
     PutStr(out, w.item);
     // v2: THE DYE (game/dye.h). Written next to the name because it is the
     // other half of what the thing on the ground IS — a dropped red tunic and
     // a dropped blue one share a name and a lattice, and the word is not
     // recoverable from either.
     PutU32(out, w.dye);
+    // v3: what a dropped vessel holds (WorldItem::fill).
+    PutU32(out, w.fill);
     BodyTransform xf{};
     r.phys->GetTransform(w.body, xf);
+    if (posOut) *posOut = xf.pos;
     PutF32(out, xf.pos.x);
     PutF32(out, xf.pos.y);
     PutF32(out, xf.pos.z);
@@ -397,6 +445,12 @@ void SaveWorldItems(const WorldItemRefs& r, std::vector<uint8_t>& out) {
   }
 }
 
+void SaveWorldItems(const WorldItemRefs& r, std::vector<uint8_t>& out) {
+  const std::vector<WorldItem>& all = r.reg->All();
+  PutU32(out, (uint32_t)all.size());
+  for (const WorldItem& w : all) SaveOneWorldItem(r, w, out, nullptr);
+}
+
 bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
                     uint32_t version) {
   // A RANGE, not an equality. v2 inserts one word per entry and everything
@@ -413,6 +467,7 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
   for (uint32_t i = 0; i < n && rd.ok; i++) {
     const std::string name = rd.Str();
     const uint32_t dye = version >= 2 ? rd.U32() : 0u;
+    const uint32_t fill = version >= 3 ? rd.U32() : 0u;
     const uint32_t bx = rd.U32(), by = rd.U32(), bz = rd.U32();
     if (!rd.ok) break;
     Vec3 at{};
@@ -446,7 +501,7 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
       continue;
     }
     DropItemToWorld(*d, at, Vec3{}, *r.phys, *r.debris, r.micro, *r.reg,
-                    lat.empty() ? nullptr : &lat, dye);
+                    lat.empty() ? nullptr : &lat, dye, fill);
   }
   if (dropped > 0)
     std::fprintf(stderr,
@@ -476,13 +531,73 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
       [&debris](const uint8_t* d, size_t n, uint32_t v) {
         return debris.LoadState(d, n, v);
       }});
+  // ---- 'MOBG': the mob id counter, GLOBAL (S4) ------------------------------
+  //
+  // Registered BEFORE 'MOBS' so it sits ahead of it in world.sve and in the
+  // load order: every creature a region bucket spawns draws its id from the
+  // counter this restores. max(), never assignment -- the rule SetIdBand
+  // states: a counter already past the saved one (a long session, a client's
+  // id band) must not be pulled back into ids it has issued.
+  //
+  // Why it is global at all: ids are session-local today (a loaded mob gets a
+  // fresh one, mob.h SaveOne), but they key RNG (gore variance, carve noise)
+  // and S5b's dormant NPCs will outlive the window, so "never re-issue an id
+  // this world has used" has to hold across a quit, not only within one run.
+  // No reset: a load without the section leaves the counter where it is,
+  // which is the pre-S4 behaviour exactly.
   io.sections.push_back(EntitySection{
-      FourCC('M', 'O', 'B', 'S'), MobSystem::kSaveVersion,
-      [&mobs] { mobs.Reset(); },
-      [&mobs](std::vector<uint8_t>& out) { mobs.SaveState(out); },
+      FourCC('M', 'O', 'B', 'G'), kMobGlobalSaveVersion, [] {},
+      [&mobs](std::vector<uint8_t>& out) {
+        const uint64_t n = mobs.NextIdCounter();
+        PutU32(out, (uint32_t)(n & 0xFFFFFFFFull));
+        PutU32(out, (uint32_t)(n >> 32));
+      },
       [&mobs](const uint8_t* d, size_t n, uint32_t v) {
-        return mobs.LoadState(d, n, v);
+        if (v != kMobGlobalSaveVersion) return false;
+        Reader rd{d, n};
+        const uint64_t lo = rd.U32(), hi = rd.U32();
+        if (!rd.ok) return false;
+        const uint64_t saved = lo | (hi << 32);
+        mobs.SetNextIdCounter(std::max(mobs.NextIdCounter(), saved));
+        return true;
       }});
+  // ---- 'MOBS': one record per creature, bucketed by REGION (S4) -----------
+  //
+  // A record is exactly one Mob::SaveOne -- the bytes the whole section has
+  // always been a count-prefixed list of -- so the per-record loader wraps it
+  // as a count-1 payload and hands it to the same LoadState. Nothing in the
+  // record names another creature (it carries no id), so a crowd splits
+  // across buckets freely. Bucketed by ORIGIN, the position LoadOne respawns
+  // at. Opaque here: S5a owns what SaveOne writes.
+  {
+    EntitySection mobsSec{
+        FourCC('M', 'O', 'B', 'S'), MobSystem::kSaveVersion,
+        [&mobs] { mobs.Reset(); },
+        [&mobs](std::vector<uint8_t>& out) { mobs.SaveState(out); },
+        [&mobs](const uint8_t* d, size_t n, uint32_t v) {
+          return mobs.LoadState(d, n, v);
+        }};
+    mobsSec.scope = EntityScope::Region;
+    mobsSec.saveRecords = [&mobs](std::vector<EntityRecord>& out) {
+      for (uint32_t i = 0; i < mobs.MobCount(); i++) {
+        const Mob* m = mobs.MobAt(i);
+        // SaveState's own filter: dead mobs are debris already (mob.h).
+        if (!m || !m->Alive() || !m->Def()) continue;
+        EntityRecord r;
+        r.pos = m->Origin();
+        ByteWriter w{r.bytes};
+        m->SaveOne(w);
+        out.push_back(std::move(r));
+      }
+    };
+    mobsSec.loadRecord = [&mobs](const uint8_t* d, size_t n, uint32_t v) {
+      std::vector<uint8_t> one;
+      PutU32(one, 1u);
+      one.insert(one.end(), d, d + n);
+      return mobs.LoadState(one.data(), one.size(), v);
+    };
+    io.sections.push_back(std::move(mobsSec));
+  }
   if (avatar) {
     io.sections.push_back(EntitySection{
         FourCC('A', 'V', 'T', 'R'), PlayerAvatar::kSaveVersion,
@@ -496,6 +611,8 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
         [avatar](const uint8_t* d, size_t n, uint32_t v) {
           return avatar->LoadState(d, n, v);
         }});
+    // The body is the PLAYER's, not the world's: players/<id>.svp (S4).
+    io.sections.back().scope = EntityScope::Player;
   }
   if (player && player->Complete()) {
     const PlayerKitRefs r = *player;
@@ -520,10 +637,11 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
         [r](const uint8_t* d, size_t n, uint32_t v) {
           return LoadPlayerKit(r, d, n, v);
         }});
+    io.sections.back().scope = EntityScope::Player;  // players/<id>.svp (S4)
   }
   if (ground && ground->Complete()) {
     const WorldItemRefs g = *ground;
-    io.sections.push_back(EntitySection{
+    EntitySection itms{
         FourCC('I', 'T', 'M', 'S'), kWorldItemSaveVersion,
         // Reset clears the REGISTRY only. The bodies belong to DebrisSystem,
         // whose own reset runs from its own section — clearing them here would
@@ -533,8 +651,85 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
         [g](std::vector<uint8_t>& out) { SaveWorldItems(g, out); },
         [g](const uint8_t* d, size_t n, uint32_t v) {
           return LoadWorldItems(g, d, n, v);
-        }});
+        }};
+    // One record per item, bucketed by where it lies (S4). An entry names
+    // nothing but content and its own pose, so items split freely.
+    itms.scope = EntityScope::Region;
+    itms.saveRecords = [g](std::vector<EntityRecord>& out) {
+      for (const WorldItem& w : g.reg->All()) {
+        EntityRecord r;
+        SaveOneWorldItem(g, w, r.bytes, &r.pos);
+        out.push_back(std::move(r));
+      }
+    };
+    itms.loadRecord = [g](const uint8_t* d, size_t n, uint32_t v) {
+      std::vector<uint8_t> one;
+      PutU32(one, 1u);
+      one.insert(one.end(), d, d + n);
+      return LoadWorldItems(g, one.data(), one.size(), v);
+    };
+    io.sections.push_back(std::move(itms));
   }
+  // ---- 'TIME': the celestial clock, GLOBAL (S4) ------------------------------
+  //
+  // TIME OF DAY is ComputeSky(tuning, celestial tick), and the celestial tick
+  // is the sim tick unless the dev time-scale has ENGAGED the clock (world.h
+  // CelestialClock). The sim tick is already in meta.svm, so the only state a
+  // save was missing is the clock itself: engaged, its rational scale, its
+  // integer position and remainder, and the previous position the day/night
+  // wake handshake compares against. All integers, restored exactly.
+  //
+  // THE SCALE IS STORED BUT IS NOT AUTHORITY after a load: the frame loop
+  // re-asserts the UI slider every tick (session.cpp SetScale), so what a load
+  // really restores is WHERE the sun is, which is the thing the player saw.
+  //
+  // WEATHER HAS NO STATE OF ITS OWN to put here: WindWeatherQ (sim/wind.h) is
+  // a pure function of (tuning, seed, SIM tick), all three of which a save
+  // already pins (tuning is content, seed and tick are in meta). It round-trips
+  // exactly when the sim tick does -- which a fresh process loading the save
+  // does, and an in-session reload of an OLDER save does not, because main.cpp
+  // only moves its clock forward (see the resume note there). ResumeWorldClock
+  // below closes that gap for the sky; the wind would need its own clock.
+  //
+  // Reset to the default (disengaged) clock on every load: a pre-S4 save had
+  // no clock state, and "the celestial tick is the sim tick" is exactly what it
+  // was saved under.
+  io.sections.push_back(EntitySection{
+      FourCC('T', 'I', 'M', 'E'), kWorldTimeSaveVersion,
+      [] { Celestial() = CelestialClock{}; },
+      [](std::vector<uint8_t>& out) {
+        const CelestialClock& c = Celestial();
+        auto put64 = [&out](int64_t v) {
+          PutU32(out, (uint32_t)((uint64_t)v & 0xFFFFFFFFull));
+          PutU32(out, (uint32_t)((uint64_t)v >> 32));
+        };
+        PutU32(out, c.engaged ? 1u : 0u);
+        put64(c.scaleNum);
+        put64(c.scaleDen);
+        put64(c.ticks);
+        put64(c.rem);
+        put64(c.prevTicks);
+      },
+      [](const uint8_t* d, size_t n, uint32_t v) {
+        if (v != kWorldTimeSaveVersion) return false;
+        Reader rd{d, n};
+        auto get64 = [&rd]() {
+          const uint64_t lo = rd.U32(), hi = rd.U32();
+          return (int64_t)(lo | (hi << 32));
+        };
+        CelestialClock c;
+        c.engaged = rd.U32() != 0;
+        c.scaleNum = get64();
+        c.scaleDen = get64();
+        c.ticks = get64();
+        c.rem = get64();
+        c.prevTicks = get64();
+        // Refused whole, never half-applied; a zero denominator would divide
+        // by zero on the next Advance.
+        if (!rd.ok || c.scaleDen <= 0) return false;
+        Celestial() = c;
+        return true;
+      }});
   // ---- W-D: THE DISCOVERED-BODY REGISTRY (PLAN_water_relevel.md §8.3) ------
   //
   // Unconditional, and it takes no reference: WaterBodies() is a process global
@@ -564,4 +759,179 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
         return sandvox::WaterBodies().LoadState(d, n, v);
       }});
   return io;
+}
+
+bool ResumeWorldClock(uint32_t savedSimTick, uint32_t simTickNow) {
+  CelestialClock& c = Celestial();
+  if (c.engaged || savedSimTick == simTickNow) return false;
+  // Engage at the saved position, at 1x in the UI's own quantisation (1024),
+  // so the first SetScale(1.0) the frame loop makes is a no-op rather than a
+  // re-base.
+  c.engaged = true;
+  c.scaleNum = 1024;
+  c.scaleDen = 1024;
+  c.ticks = (int64_t)savedSimTick;
+  c.prevTicks = c.ticks;
+  c.rem = 0;
+  return true;
+}
+
+// ---- MobParking (persist.h, PLAN_save_system.md S5b) -------------------------
+
+void MobParking::Bind(MobSystem& mobs, ChunkStore& store, bool enabled) {
+  if (boundMobs_ == &mobs && boundStore_ == &store && enabled_ == enabled &&
+      mobs.HasParkFn() == enabled)
+    return;
+  boundMobs_ = &mobs;
+  boundStore_ = &store;
+  enabled_ = enabled;
+  if (!enabled) {
+    mobs.SetParkFn(nullptr);
+    return;
+  }
+  ChunkStore* st = &store;
+  Stats* stats = &stats_;
+  mobs.SetParkFn([st, stats](const Mob& m, std::vector<uint8_t>& record) {
+    // THE SAME RECORD A SAVE WRITES: section, version, origin, SaveOne bytes
+    // (persist.cpp's 'MOBS' saveRecords builds exactly this).
+    ChunkStore::EntityRecord r;
+    r.section = FourCC('M', 'O', 'B', 'S');
+    r.version = MobSystem::kSaveVersion;
+    r.pos = m.Origin();
+    r.bytes = std::move(record);
+    st->DormantEntities(ChunkStore::RegionOfVoxel(r.pos)).push_back(std::move(r));
+    stats->parked++;
+    return true;
+  });
+  // Something new may be parked right at a face the window is about to cross.
+  pending_ = true;
+}
+
+void MobParking::ResetWaits() {
+  waits_.clear();
+  haveOrigin_ = false;
+  pending_ = true;
+}
+
+bool MobParking::GroundKnown(World& world, IVec3 wc, uint32_t tick) {
+  const uint64_t key = World::PackChunkKey(wc);
+  auto it = waits_.find(key);
+  if (it == waits_.end()) {
+    // First sight: whatever the cache holds may predate this residency.
+    waits_[key] = Wait{wc, tick};
+    world.RequestChunkFetch(wc, World::FetchSource::Mob);
+    return false;
+  }
+  const CachedChunk* cc = world.Cached(wc);
+  if (cc != nullptr && cc->voxels.size() == kChunkVol && cc->version >= it->second.since)
+    return true;
+  world.RequestChunkFetch(wc, World::FetchSource::Mob);  // coalesced if queued
+  return false;
+}
+
+uint32_t MobParking::Unpark(MobSystem& mobs, ChunkStore& store, World& world,
+                            uint32_t tick, uint32_t budget) {
+  stats_.lastCall = 0;
+  if (!enabled_) return 0;
+  const IVec3 wo = world.WindowOrigin();
+  const bool moved = !haveOrigin_ || wo.x != lastOrigin_.x ||
+                     wo.y != lastOrigin_.y || wo.z != lastOrigin_.z;
+  if (!moved && !pending_) return 0;
+  const int n = (int)(kWorldN / kChunk);
+  if (moved) {
+    // A chunk that left the window forgets its wait: its cached copy is stale
+    // the moment it re-enters, and asking again is what proves freshness.
+    for (auto it = waits_.begin(); it != waits_.end();) {
+      const IVec3& c = it->second.wc;
+      const bool in = c.x >= wo.x && c.x < wo.x + n && c.y >= wo.y &&
+                      c.y < wo.y + n && c.z >= wo.z && c.z < wo.z + n;
+      it = in ? std::next(it) : waits_.erase(it);
+    }
+  }
+  haveOrigin_ = true;
+  lastOrigin_ = wo;
+  pending_ = false;
+
+  const int m = kUnparkMarginChunks;
+  auto chunkOf = [](float v) { return (int)std::floor((double)v / (double)kChunk); };
+  auto inside = [&](const Vec3& p) {
+    const int cx = chunkOf(p.x), cy = chunkOf(p.y), cz = chunkOf(p.z);
+    return cx >= wo.x + m && cx < wo.x + n - m && cy >= wo.y + m &&
+           cy < wo.y + n - m && cz >= wo.z + m && cz < wo.z + n - m;
+  };
+  const uint32_t kMobs = FourCC('M', 'O', 'B', 'S');
+  const IVec3 lo = ChunkStore::RegionOfChunk(wo);
+  const IVec3 hi = ChunkStore::RegionOfChunk({wo.x + n - 1, wo.y + n - 1, wo.z + n - 1});
+  uint32_t made = 0;
+  for (int rz = lo.z; rz <= hi.z; rz++)
+    for (int ry = lo.y; ry <= hi.y; ry++)
+      for (int rx = lo.x; rx <= hi.x; rx++) {
+        std::vector<EntityRecord>& dormant = store.DormantEntities({rx, ry, rz});
+        for (size_t i = 0; i < dormant.size();) {
+          if (dormant[i].section != kMobs || !inside(dormant[i].pos)) {
+            i++;
+            continue;
+          }
+          // Every wait below leaves the record where it is and asks for a
+          // later call; none of them drops it.
+          if (made >= budget) {
+            stats_.budgetWaits++;
+            pending_ = true;
+            i++;
+            continue;
+          }
+          if (!mobs.HasRoomToSpawn()) {
+            stats_.capWaits++;
+            pending_ = true;
+            i++;
+            continue;
+          }
+          // The record's position is the body's MIN CORNER (Mob::Origin), and
+          // the ground the body rests on runs under the whole footprint -- so
+          // the chunks under the corner AND half a chunk on in x and z (the
+          // centre column of anything up to a chunk wide), at the feet and
+          // one below. Every one is asked every time (no short-circuit), so
+          // the fetches go out together rather than one call apart.
+          const Vec3 p = dormant[i].pos;
+          const float half = 0.5f * (float)kChunk;
+          const int xs[2] = {chunkOf(p.x), chunkOf(p.x + half)};
+          const int zs[2] = {chunkOf(p.z), chunkOf(p.z + half)};
+          const int fy = chunkOf(p.y);
+          bool ground = true;
+          for (int a = 0; a < 2; a++)
+            for (int b = 0; b < 2; b++) {
+              if (a == 1 && xs[1] == xs[0]) continue;
+              if (b == 1 && zs[1] == zs[0]) continue;
+              for (int dy = 0; dy >= -1; dy--)
+                ground &= GroundKnown(world, {xs[a], fy + dy, zs[b]}, tick);
+            }
+          if (!ground) {
+            stats_.groundWaits++;
+            pending_ = true;
+            i++;
+            continue;
+          }
+          // Take it OUT of the bucket first, then apply (ApplyRegionEntities'
+          // order): the creature is live now, and the next save writes it back
+          // from MobSystem. A record LoadOne refuses (def retired, short read)
+          // is logged there and dropped -- the load path's rule.
+          EntityRecord r = std::move(dormant[i]);
+          dormant.erase(dormant.begin() + (ptrdiff_t)i);
+          ByteReader rd{r.bytes.data(), r.bytes.size()};
+          // placeLimbs: it comes back in the pose it left in (mob.h LoadOne).
+          if (mobs.LoadOne(rd, r.version, /*placeLimbs=*/true) != nullptr) {
+            made++;
+            stats_.unparked++;
+          } else {
+            stats_.failed++;
+            std::fprintf(stderr,
+                         "unpark: a parked creature record (v%u) in region "
+                         "(%d,%d,%d) failed to apply and is dropped\n",
+                         r.version, rx, ry, rz);
+          }
+        }
+      }
+  stats_.lastCall = made;
+  stats_.maxCall = std::max(stats_.maxCall, made);
+  return made;
 }

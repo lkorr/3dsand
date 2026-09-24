@@ -96,6 +96,7 @@ enum class Buf : uint8_t {
   FarList,
   FarUBO,
   FarPatch,   // cascade edit patches, read by farFill (world.h kFarPatch*)
+  FarSig,     // per-slot far-matter signature, fardown's skip (world.h farSig)
   // ---- the software page table (docs/PLAN_page_table.md §5.1) ----
   // PageTable is READ by every row whose entry point touches a voxel and
   // written by nothing on the tick path — it is dispatch-invariant
@@ -168,6 +169,18 @@ enum class Buf : uint8_t {
   // snapshot while the prepass is still writing it, which is the determinism
   // hole the snapshot was introduced to close.
   ReposeSnap,
+  // ---- the clouds (cloud.wgsl, world.h kCloud*) ----
+  // Render-only derived data on the per-FRAME ShadowCache table, there for
+  // the shadow cache's reason: the cloud compute rows WRITE these and the
+  // raymarcher and the raster bodies READ them in the fragment/vertex stages
+  // of the same command buffer — the compute->fragment hop nothing else in
+  // this engine synchronises. CloudUBO is the uniform (world.h CloudParams).
+  CloudUBO,
+  CloudNoise,
+  CloudWeather,
+  CloudMaps,
+  CloudRaw,
+  CloudHist,
   // ---- the voxel-keyed shadow cache (world.h kShadowCacheBuckets) ----
   // RENDER-side buffers, on the table for the same reason TreeAtlas is: a
   // hazard the table does not know about generates no barrier. The resolve
@@ -319,6 +332,10 @@ enum class Pipe : uint8_t {
   // `(int)Pipe::ShadowResolve + 1` and a Pipe added past it is silently never
   // copied into the recorder's table.
   GlowSrc, GlowField, GlowRefresh,
+  // The clouds (cloud.wgsl): the one-shot noise bake, then the per-frame
+  // weather map, shadow map, env map, march and temporal resolve. BEFORE
+  // ShadowPrepare for the pipeline-copy bound's reason stated above.
+  CloudNoise, CloudWeather, CloudShadow, CloudEnv, CloudMarch, CloudResolve,
   // Voxel-keyed shadow cache (shadow_resolve.wgsl). AFTER FarDown, which the
   // note at the fluid block says must stay last — so the copy loop's bound in
   // Simulation::RecordTable moves to ShadowResolve with these. Both are render
@@ -470,6 +487,17 @@ enum class Cond : uint8_t {
   // touched, and the pinned hash cannot move. The same shape as Cond::Gas and
   // Cond::WaterBody -- "off" means NO ROW, not a cheap row.
   ReposeActive,
+  // ---- the per-frame table's three switches (TableCtx::cloudFlags) ----
+  // Clouds: the sky has cloud in it and weather.clouds is on. Off = not one
+  // cloud row recorded, and the composite reads nothing (RWF_CLOUDS clear).
+  Clouds,
+  // CloudBake: the noise volume needs baking (first frame after a pipeline
+  // build). One row, once.
+  CloudBake,
+  // ShadowCacheOn: the voxel shadow cache's three rows. They were implicitly
+  // gated by EncodeShadowResolve returning early; now that the table also
+  // carries the clouds, the gate has to be a row condition.
+  ShadowCacheOn,
 };
 
 // Which command buffer a row belongs to — one per Encode* entry point.
@@ -546,6 +574,9 @@ enum class DispatchSel : uint32_t {
   GasFarEmitSel,
   // One workgroup per LONG-RANGE emitter, same argument as the line above.
   GasFarWideSel,
+  // ---- the clouds: one 8x8 workgroup per tile of the low-res target ----
+  CloudGx,
+  CloudGy,
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile

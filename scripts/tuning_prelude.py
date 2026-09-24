@@ -497,6 +497,32 @@ SPEC = [
     ("render", "oilEdgeBand", "TUNE_OIL_EDGE_BAND", "f", 0.07),
     ("render", "oilDropReflect", "TUNE_OIL_DROP_REFLECT", "f", 0.3),
     ("render", "subMurkGlow", "TUNE_SUB_MURK_GLOW", "f", 2.2),
+
+    # clouds + weather (cloud.wgsl, src/sim/weather.h, DESIGN.md 9.w)
+    ("render", "cloudShapeScaleM", "TUNE_CLOUD_SHAPE_SCALE_M", "f", 9000.0),
+    ("render", "cloudDetailScaleM", "TUNE_CLOUD_DETAIL_SCALE_M", "f", 700.0),
+    ("render", "cloudWeatherScaleM", "TUNE_CLOUD_WEATHER_SCALE_M", "f", 16000.0),
+    ("render", "cloudExtinction", "TUNE_CLOUD_EXTINCTION", "f", 0.045),
+    ("render", "cloudErosion", "TUNE_CLOUD_EROSION", "f", 0.45),
+    ("render", "cloudSteps", "TUNE_CLOUD_STEPS", "u", 64),
+    ("render", "cloudLightSteps", "TUNE_CLOUD_LIGHT_STEPS", "u", 5),
+    ("render", "cloudMaxDistM", "TUNE_CLOUD_MAX_DIST_M", "f", 45000.0),
+    ("render", "cloudHazeM", "TUNE_CLOUD_HAZE_M", "f", 32000.0),
+    ("render", "cloudPhaseG", "TUNE_CLOUD_PHASE_G", "f", 0.72),
+    ("render", "cloudMultiScatter", "TUNE_CLOUD_MULTI_SCATTER", "f", 0.5),
+    ("render", "cloudPowder", "TUNE_CLOUD_POWDER", "f", 0.7),
+    ("render", "cloudAmbient", "TUNE_CLOUD_AMBIENT", "f", 2.2),
+    ("render", "cloudSunGain", "TUNE_CLOUD_SUN_GAIN", "f", 1.0),
+    ("render", "cloudShadowStrength", "TUNE_CLOUD_SHADOW_STRENGTH", "f", 0.9),
+    ("render", "cloudRainDensity", "TUNE_CLOUD_RAIN_DENSITY", "f", 1.0),
+    ("render", "cloudRainStreaks", "TUNE_CLOUD_RAIN_STREAKS", "f", 1.0),
+    ("render", "cloudTemporal", "TUNE_CLOUD_TEMPORAL", "f", 0.12),
+    ("render", "cloudResDiv", "TUNE_CLOUD_RES_DIV", "u", 3),
+    ("render", "cloudWindScale", "TUNE_CLOUD_WIND_SCALE", "f", 4.0),
+    ("render", "cloudWetDarken", "TUNE_CLOUD_WET_DARKEN", "f", 0.42),
+    ("render", "cloudRainbow", "TUNE_CLOUD_RAINBOW", "f", 1.0),
+    ("render", "cloudCirrusScaleM", "TUNE_CLOUD_CIRRUS_SCALE_M", "f", 7000.0),
+    ("render", "cloudFogMix", "TUNE_CLOUD_FOG_MIX", "f", 1.0),
 ]
 
 

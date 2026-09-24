@@ -78,6 +78,23 @@ const PART_FLOAT_PATIENCE : u32 = TUNE_PART_FLOAT_PATIENCE;
 // particle never has lift, see above), so the two never read the same bits in
 // the same particle. Same trick as the micro fields themselves — spare room in
 // `flags`, no growth of the 32-byte Particle.
+// ---- CALM: poured, not thrown (game/container.h) --------------------------
+// A stream out of a flask is a rope of water, not spray, and the wind does not
+// carry it off. Measured before this: a flask poured from ten cells up put
+// every drop outside a 25x25 catch tray and some of them still aloft 80 ticks
+// later, and the owner saw the stream "fly off at a weird angle". The bit
+// skips the wind drag and nothing else -- gravity, landing, buoyancy and the
+// claim are exactly an ordinary particle's. Bit 14: 0..12 are ALIVE / PENDING
+// / MICRO + the micro fields and 13 is PFLAG_GAS (common.wgsl). Declared here,
+// beside its only reader; world.h kPFlagCalm must agree (check_invariants).
+const PFLAG_CALM : u32 = 16384u;
+// ---- DRIP: off a wet body, lands without a mark (MobSystem::WetOneLimb) ----
+// A micro droplet that dies on contact like any other and skips the stain it
+// would have deposited: water's world stain never dries, so a creature
+// dripping as it walks would otherwise leave a permanent wet trail. Bit 15,
+// the next free one after CALM. world.h kPFlagDrip must agree.
+const PFLAG_DRIP : u32 = 32768u;
+
 fn floatTicksOf(flags : u32) -> u32 {
   return (flags >> PMICRO_LIFE_SHIFT) & PMICRO_LIFE_MASK;
 }
@@ -292,7 +309,8 @@ fn spawn(@builtin(global_invocation_id) gid : vec3<u32>) {
   // construction; here it is a CPU value arriving, so it is enforced rather
   // than assumed, and a whole-voxel spawn starts its patience at zero whatever
   // the producer put in the word.
-  var keep = p.flags & (PFLAG_MICRO | (PMICRO_SCALE_MASK << PMICRO_SCALE_SHIFT));
+  var keep = p.flags & (PFLAG_MICRO | PFLAG_CALM | PFLAG_DRIP |
+                        (PMICRO_SCALE_MASK << PMICRO_SCALE_SHIFT));
   if ((p.flags & PFLAG_MICRO) != 0u) {
     keep |= p.flags & (PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT);
   }
@@ -457,7 +475,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // structural fact the buoyancy note at the top of this file is built on), and
   // the fraction would be invented rather than measured. A chip that is thrown
   // clear of the water is dry on the tick it clears it and the wind has it back.
-  if (T.windMode != WIND_MODE_OFF && !wet) {
+  if (T.windMode != WIND_MODE_OFF && !wet && (p.flags & PFLAG_CALM) == 0u) {
     let resp = i32(matWindResponse(materials[p.payload & 0xFFFu]));
     // Almost every material is 0 (stone chips do not blow around), so the
     // common case is one comparison and no field evaluation at all.
@@ -624,8 +642,10 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // particle's behaviour) would leave spray hovering against a wall until a
   // slot freed up.
   if (isMicro(p)) {
+    let drip = (p.flags & PFLAG_DRIP) != 0u;
     p.flags = 0u;  // dead either way
     pWrite[gid.x] = p;
+    if (drip) { return; }  // a drop off a wet body: gone, no mark
     if (atomicLoad(&claim[claimSlot(tgtSlot)]) != microStainPriority(p)) { return; }
 
     let w = voxWordAt(cell);
@@ -698,7 +718,8 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     // Lost the claim (or the cell got taken): rest, retry next tick. The float
     // ticks survive — patience is a budget for finding a berth, and having a
     // berth taken from you is precisely the thing it is counting.
-    p.flags = PFLAG_ALIVE | (p.flags & (PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT));
+    p.flags = PFLAG_ALIVE | (p.flags & ((PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT) |
+                                         PFLAG_CALM));
     p.vx = 0; p.vy = 0; p.vz = 0;
   }
   pWrite[gid.x] = p;

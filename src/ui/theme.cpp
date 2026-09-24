@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
@@ -510,6 +511,24 @@ ImVec2 DrawSprite(ImDrawList* dl, const char* key, ImVec2 at, ImU32 tint) {
   return sz;
 }
 
+// AT A RUNG OF ITS OWN (2026-09-22). Every engraving used to be drawn at
+// kChromeScale whatever the surface it went on, which is right for a 44 px
+// slot and wrong for the spell page: at the canvas's half rung a cell is 32 px
+// and the 16 px engraving inside it was still being drawn at 2x, so the sigil
+// was exactly as big as the roundel that was supposed to contain it. The scale
+// is quantised to a whole 1x/2x/3x, never a fraction, for the reason the whole
+// chrome is: a nearest-sampled sprite at 1.5x drops every other row.
+void DrawSpriteCenteredAt(ImDrawList* dl, const char* key, ImVec2 c, float mul,
+                          ImU32 tint) {
+  const ChromeSprite* sp = Chrome(key);
+  if (!sp) return;
+  const float k = std::max(1.0f, std::floor(kChromeScale * mul + 0.001f));
+  const ImVec2 sz(sp->size.x * k, sp->size.y * k);
+  const ImVec2 at((float)(int)(c.x - sz.x * 0.5f), (float)(int)(c.y - sz.y * 0.5f));
+  dl->AddImage(ChromeTex(), at, ImVec2(at.x + sz.x, at.y + sz.y), sp->uv0,
+               sp->uv1, tint);
+}
+
 void DrawSpriteCentered(ImDrawList* dl, const char* key, ImVec2 c, ImU32 tint) {
   const ChromeSprite* s = Chrome(key);
   if (!s) return;
@@ -767,6 +786,255 @@ void ValueBar(ImDrawList* dl, ImVec2 a, ImVec2 b, float frac, ImU32 fill,
   Grain(dl, ia, ib, 0.06f);
   InnerShadow(dl, a, b, 4.0f, 0.5f);
   Outline(dl, a, b, 1.0f, Fade(ColBronze(), 0.9f));
+}
+
+void BeginTip() {
+  ImGui::BeginTooltip();
+  ImGui::PushFont(FontSmall());
+  ImGui::PushTextWrapPos(320.0f);
+}
+void EndTip() {
+  ImGui::PopTextWrapPos();
+  ImGui::PopFont();
+  ImGui::EndTooltip();
+}
+void Tip(const char* text) {
+  BeginTip();
+  ImGui::TextUnformatted(text);
+  EndTip();
+}
+
+// THE CALLIGRAPHIC STROKE (PLAN_spell_graph §4). Twelve segments of a cubic,
+// each drawn as its own un-antialiased line at a width quantised to a whole
+// 2 px step. The quantisation is the whole trick: a smoothly tapering spline
+// beside nearest-sampled 2x sprites reads as two different programs, and a
+// stepped one reads as the same artist with a bigger brush.
+// ---- the sheet -------------------------------------------------------------
+
+void VellumSheet(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+  dl->AddRectFilled(a, b, ColVellum());
+  GradientV(dl, a, ImVec2(b.x, a.y + std::floor((b.y - a.y) * 0.45f)),
+            Fade(ColVellumHi(), 0.55f), Fade(ColVellumHi(), 0.0f));
+  GradientV(dl, ImVec2(a.x, b.y - std::floor((b.y - a.y) * 0.35f)), b,
+            Fade(ColVellumLo(), 0.0f), Fade(ColVellumLo(), 0.45f));
+  const float w = std::min(40.0f, std::floor((b.x - a.x) * 0.25f));
+  GradientH(dl, a, ImVec2(a.x + w, b.y), Fade(ColVellumLo(), 0.40f),
+            Fade(ColVellumLo(), 0.0f));
+  GradientH(dl, ImVec2(b.x - w, a.y), b, Fade(ColVellumLo(), 0.0f),
+            Fade(ColVellumLo(), 0.30f));
+}
+
+void VellumFrame(ImDrawList* dl, ImVec2 a, ImVec2 b) {
+  InnerShadow(dl, a, b, 10.0f, 0.38f);
+  Grain(dl, a, b, 0.045f);
+  dl->AddRect(a, b, Fade(ColIronGall(), 0.55f), 0.0f, 0, 2.0f);
+  dl->AddRectFilled(a, ImVec2(a.x + 2, b.y), Fade(ColGoldDim(), 0.75f));
+}
+
+float Versal(ImDrawList* dl, ImVec2 at, char letter, float size) {
+  const ImVec2 b(at.x + size, at.y + size);
+  dl->AddRectFilled(at, b, Fade(ColRubric(), 0.13f));
+  dl->AddRect(at, b, Fade(ColRubric(), 0.75f), 0.0f, 0, 2.0f);
+  // Corner serifs: the little L-brackets an illuminator finishes a box with.
+  const float t = std::floor(size * 0.28f);
+  for (int i = 0; i < 4; i++) {
+    const float x = (i & 1) ? b.x - t : at.x;
+    const float y = (i & 2) ? b.y - 2 : at.y;
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + t, y + 2), Fade(ColRubric(), 0.95f));
+    const float vy = (i & 2) ? b.y - t : at.y;
+    const float vx = (i & 1) ? b.x - 2 : at.x;
+    dl->AddRectFilled(ImVec2(vx, vy), ImVec2(vx + 2, vy + t), Fade(ColRubric(), 0.95f));
+  }
+  char txt[2] = {letter, 0};
+  ImFont* f = FontLarge();
+  const float fs = std::floor(size * 0.72f);
+  const ImVec2 ts = f->CalcTextSizeA(fs, FLT_MAX, 0.0f, txt);
+  const ImVec2 tp(std::floor(at.x + (size - ts.x) * 0.5f),
+                  std::floor(at.y + (size - ts.y) * 0.5f));
+  dl->AddText(f, fs, ImVec2(tp.x + 1, tp.y + 1), Fade(ColVellumHi(), 0.8f), txt);
+  dl->AddText(f, fs, tp, ColRubric(), txt);
+  return size;
+}
+
+// ---- compass and rule ------------------------------------------------------
+//
+// Every sample lands on the 2 px lattice (`Snap2`) and a repeated sample is
+// dropped, so an arc is a chain of 2 px blocks with no overdraw and a ring of
+// radius 200 costs the pixels it covers rather than the segments a caller
+// guessed at.
+static inline float Snap2(float v) { return std::floor(v * 0.5f) * 2.0f; }
+
+void PixelArc(ImDrawList* dl, ImVec2 c, float r, float a0, float a1, ImU32 col,
+              float thick) {
+  if (r < 1.0f) return;
+  const float t = std::max(2.0f, std::floor(thick * 0.5f) * 2.0f);
+  const int n = std::max(8, (int)std::ceil(std::fabs(a1 - a0) * r));
+  float px = 1e9f, py = 1e9f;
+  for (int i = 0; i <= n; i++) {
+    const float a = a0 + (a1 - a0) * (float)i / (float)n;
+    const float x = Snap2(c.x + std::cos(a) * r);
+    const float y = Snap2(c.y + std::sin(a) * r);
+    if (x == px && y == py) continue;
+    px = x;
+    py = y;
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + t, y + t), col);
+  }
+}
+
+// SCANNED, NOT SAMPLED. The first version of this drew the whole circle with
+// `PixelArc`, and at the radii the spell page actually uses - a socket pip is
+// r=6 - an angular sampler snapped to the 2 px lattice leaves GAPS: the four
+// places where the tangent is steepest get one block where they need two, so
+// every small ring on the page was a broken "C" instead of an "o". Scanning
+// rows and then columns closes it by construction at every radius: a row can
+// only miss where the circle is more vertical than horizontal, and the column
+// pass covers exactly those.
+void PixelRing(ImDrawList* dl, ImVec2 c, float r, ImU32 col, float thick) {
+  if (r < 1.0f) return;
+  const float t = std::max(2.0f, std::floor(thick * 0.5f) * 2.0f);
+  const float cx = Snap2(c.x), cy = Snap2(c.y);
+  const float ri = std::max(0.0f, r - t);
+  for (float y = -Snap2(r); y <= r; y += 2.0f) {
+    const float xo = Snap2(std::sqrt(std::max(0.0f, r * r - y * y)));
+    const float xi = (std::fabs(y) < ri)
+                         ? Snap2(std::sqrt(std::max(0.0f, ri * ri - y * y)))
+                         : 0.0f;
+    if (xo <= 0.0f) continue;
+    dl->AddRectFilled(ImVec2(cx - xo, cy + y), ImVec2(cx - xi + 2, cy + y + 2), col);
+    dl->AddRectFilled(ImVec2(cx + xi, cy + y), ImVec2(cx + xo + 2, cy + y + 2), col);
+  }
+  for (float x = -Snap2(r); x <= r; x += 2.0f) {
+    const float yo = Snap2(std::sqrt(std::max(0.0f, r * r - x * x)));
+    const float yi = (std::fabs(x) < ri)
+                         ? Snap2(std::sqrt(std::max(0.0f, ri * ri - x * x)))
+                         : 0.0f;
+    if (yo <= 0.0f) continue;
+    dl->AddRectFilled(ImVec2(cx + x, cy - yo), ImVec2(cx + x + 2, cy - yi + 2), col);
+    dl->AddRectFilled(ImVec2(cx + x, cy + yi), ImVec2(cx + x + 2, cy + yo + 2), col);
+  }
+}
+
+void PixelDisc(ImDrawList* dl, ImVec2 c, float r, ImU32 col) {
+  if (r < 1.0f) return;
+  const float cx = Snap2(c.x), cy = Snap2(c.y);
+  for (float y = -Snap2(r); y <= r; y += 2.0f) {
+    const float h = Snap2(std::sqrt(std::max(0.0f, r * r - y * y)));
+    if (h < 1.0f) continue;
+    dl->AddRectFilled(ImVec2(cx - h, cy + y), ImVec2(cx + h + 2, cy + y + 2), col);
+  }
+}
+
+void DottedRule(ImDrawList* dl, ImVec2 a, ImVec2 b, ImU32 col, float step,
+                float dot) {
+  const float dx = b.x - a.x, dy = b.y - a.y;
+  const float len = std::sqrt(dx * dx + dy * dy);
+  if (len < 1.0f) return;
+  const float d = std::max(2.0f, std::floor(dot * 0.5f) * 2.0f);
+  const int n = std::max(1, (int)(len / std::max(2.0f, step)));
+  for (int i = 0; i <= n; i++) {
+    const float t = (float)i / (float)n;
+    const float x = Snap2(a.x + dx * t), y = Snap2(a.y + dy * t);
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + d, y + d), col);
+  }
+}
+
+void PixelLozenge(ImDrawList* dl, ImVec2 c, float r, ImU32 col, bool filled,
+                  float thick) {
+  const float cx = Snap2(c.x), cy = Snap2(c.y);
+  const float rr = std::max(2.0f, Snap2(r));
+  if (filled) {
+    for (float y = -rr; y <= rr; y += 2.0f) {
+      const float h = Snap2(rr - std::fabs(y));
+      dl->AddRectFilled(ImVec2(cx - h, cy + y), ImVec2(cx + h + 2, cy + y + 2), col);
+    }
+    return;
+  }
+  const float t = std::max(2.0f, std::floor(thick * 0.5f) * 2.0f);
+  for (float y = -rr; y <= rr; y += 2.0f) {
+    const float h = Snap2(rr - std::fabs(y));
+    dl->AddRectFilled(ImVec2(cx - h, cy + y), ImVec2(cx - h + t, cy + y + 2), col);
+    dl->AddRectFilled(ImVec2(cx + h - t + 2, cy + y), ImVec2(cx + h + 2, cy + y + 2),
+                      col);
+  }
+}
+
+// ---- the quill stroke ------------------------------------------------------
+//
+// A RIBBON, not a polyline: see the header. The two things that make it read
+// as ink rather than as a spline are the continuous tapered edge (quads that
+// share vertices, so a bend opens no notch) and the tremor - a deterministic
+// wobble along the stroke's own normal, seeded from the endpoints so the same
+// edge is drawn identically every frame. Determinism matters here for a UI
+// reason rather than a sim one: a wobble reseeded per frame is a stroke that
+// crawls, which is the single most distracting thing a still diagram can do.
+void InkStroke(ImDrawList* dl, ImVec2 from, ImVec2 to, ImU32 col, float weight) {
+  const float dy = to.y - from.y;
+  const float bend = std::max(8.0f, std::fabs(dy) * 0.55f);
+  const ImVec2 c0(from.x, from.y + bend), c1(to.x, to.y - bend);
+  constexpr int kSeg = 22;
+  ImVec2 pts[kSeg + 1];
+  for (int i = 0; i <= kSeg; i++) {
+    const float t = (float)i / (float)kSeg, u = 1.0f - t;
+    const float a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+    pts[i] = ImVec2(a * from.x + b * c0.x + c * c1.x + d * to.x,
+                    a * from.y + b * c0.y + c * c1.y + d * to.y);
+  }
+  // The hand. One seed per edge, from the rounded endpoints, so a stroke keeps
+  // its own wobble as the view pans and only changes when the drawing does.
+  const uint32_t seed =
+      (uint32_t)((int)from.x * 73856093) ^ (uint32_t)((int)from.y * 19349663) ^
+      (uint32_t)((int)to.x * 83492791) ^ (uint32_t)((int)to.y * 2971215073u);
+  const float phase = (float)(seed & 1023u) * 0.006136f;  // 0..2pi
+  // TREMOR IS A FRACTION OF THE STROKE'S LENGTH, and a short stroke has none.
+  // A fixed 2 px wobble is a hand on a 60 px stroke and a seizure on an 8 px
+  // one: the spell page is full of 10 px hops from a pip to the bus under it,
+  // and every one of them came out as a visible squiggle - the single jankiest
+  // thing in the first pass of this drawing.
+  const float dx = to.x - from.x;
+  const float len = std::sqrt(dx * dx + dy * dy);
+  const float tremor =
+      std::min(std::min(1.6f, weight * 0.22f), std::max(0.0f, len - 16.0f) * 0.05f);
+
+  const float half = std::max(1.0f, weight * 0.5f);
+  auto ribbon = [&](float grow, ImU32 c) {
+    for (int i = 0; i < kSeg; i++) {
+      const ImVec2& p0 = pts[i];
+      const ImVec2& p1 = pts[i + 1];
+      float nx = p1.y - p0.y, ny = -(p1.x - p0.x);
+      const float nl = std::sqrt(nx * nx + ny * ny);
+      if (nl < 0.0001f) continue;
+      nx /= nl;
+      ny /= nl;
+      // The nib: full through the belly, thin at both terminals. `sqrt` of the
+      // sine so the taper happens near the ends and the middle stays even -
+      // a plain sine is a lens, which reads as a leaf rather than as a stroke.
+      const float t0 = (float)i / (float)kSeg, t1 = (float)(i + 1) / (float)kSeg;
+      auto prof = [&](float t) {
+        return 0.42f + 0.58f * std::sqrt(std::sin(t * 3.14159265f));
+      };
+      auto wob = [&](float t) {
+        return std::sin(t * 3.1f + phase) * tremor +
+               std::sin(t * 7.3f + phase * 2.3f) * tremor * 0.30f;
+      };
+      const float h0 = std::floor(half * prof(t0) + grow) + 0.5f;
+      const float h1 = std::floor(half * prof(t1) + grow) + 0.5f;
+      const float w0 = wob(t0), w1 = wob(t1);
+      const ImVec2 a0(std::floor(p0.x + nx * (h0 + w0)),
+                      std::floor(p0.y + ny * (h0 + w0)));
+      const ImVec2 b0(std::floor(p0.x - nx * (h0 - w0)),
+                      std::floor(p0.y - ny * (h0 - w0)));
+      const ImVec2 a1(std::floor(p1.x + nx * (h1 + w1)),
+                      std::floor(p1.y + ny * (h1 + w1)));
+      const ImVec2 b1(std::floor(p1.x - nx * (h1 - w1)),
+                      std::floor(p1.y - ny * (h1 - w1)));
+      dl->AddQuadFilled(a0, a1, b1, b0, c);
+    }
+  };
+  const bool wasAA = (dl->Flags & ImDrawListFlags_AntiAliasedFill) != 0;
+  if (wasAA) dl->Flags &= ~ImDrawListFlags_AntiAliasedFill;
+  ribbon(1.0f, Fade(col, 0.28f));   // the bleed into the fibre
+  ribbon(0.0f, col);                // the core
+  if (wasAA) dl->Flags |= ImDrawListFlags_AntiAliasedFill;
 }
 
 // Both badges are set in the 13 px pixel font — the same face as the rest of

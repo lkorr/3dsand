@@ -98,12 +98,25 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
     const GrimoireExpansion ex2 = ExpandWords(lib, g, {"hellfire", "kit_bolt"}, kSpellStackMax);
     check(Sig(lib, ex2.spoken) == Sig(lib, {gFire, gBoom, gFan, gFan, gBolt}),
           "a page is a fragment: a delivery after it closes the clause");
-    // And `hellfire hellfire` merges by R1: fan x4.
+    // And `hellfire hellfire` still MERGES by R1 - but a merged count no longer
+    // multiplies out (2026-09-22). `kit_fan` four times over is one split per
+    // scope: the strongest count word wins, applies once, and the other three
+    // are charged no-ops. It used to be 3^4 = 81 clamped to the instance cap,
+    // which is how saying one page twice bought you the whole budget.
     const GrimoireExpansion ex3 = ExpandWords(lib, g, {"hellfire", "hellfire"}, kSpellStackMax);
     const CastList l3 = CompileSpell(lib, SpellStack{ex3.spoken});
-    check(l3.casts.size() == 1 &&
-              l3.casts[0].delivery.count == std::min(81, lib.budgets.maxInstances),
-          "two expansions merge by R1 (fan x4 = 81 instances, capped by budgets.maxInstances)");
+    const CastList l3one = CompileSpell(lib, SpellStack{ExpandWords(lib, g, {"hellfire"},
+                                                                    kSpellStackMax).spoken});
+    check(l3.casts.size() == 1 && !l3one.casts.empty() &&
+              l3.casts[0].delivery.count == l3one.casts[0].delivery.count,
+          "two expansions merge by R1, and the merged fan does not compound");
+    // ...and it is the MERGE that is being tested, not a failure to merge: the
+    // expansion really does say the fan word four times, and R1 folds them into
+    // one node with n=4 whose count applies exactly once anyway.
+    int fanSaid = 0;
+    for (int w : ex3.spoken)
+      if (w == gFan) fanSaid++;
+    check(fanSaid == 4, "the expansion really does say the fan word four times");
     // The authored starter is a page too, read-only.
     GrimoirePage scratch;
     const GrimoirePage* st = FindPage(lib, g, "kit_starter", scratch);
@@ -152,7 +165,9 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
   // ---- 4. the overflow cap ------------------------------------------------------
   {
     Grimoire big;
-    std::vector<std::string> twenty(20, "kit_fire");
+    // Longer than kSpellStackMax, whatever it is this week (24 since rule 4's
+    // lanes needed the room): the claim is the OVERFLOW, not the number.
+    std::vector<std::string> twenty((size_t)kSpellStackMax + 6, "kit_fire");
     big.pages.push_back({"twenty", twenty});
     const GrimoireExpansion ex = ExpandWords(lib, big, {"twenty"}, kSpellStackMax);
     check(ex.truncated && (int)ex.spoken.size() == kSpellStackMax,

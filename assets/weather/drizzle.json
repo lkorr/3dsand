@@ -1,0 +1,18 @@
+{
+  "label": "Drizzle",
+  "about": "A low dark sheet and a fine steady drizzle. The ground darkens slowly.",
+  "moisture": 0.72,
+  "weight": 0.8,
+  "coverage": 0.95,
+  "cloudType": 0.12,
+  "density": 1.2,
+  "baseM": 700,
+  "thicknessM": 1100,
+  "darkness": 0.35,
+  "cirrus": 0.0,
+  "cirrusAltM": 8000,
+  "precip": 0.45,
+  "precipType": 0.0,
+  "mist": 0.9,
+  "lightning": 0.0
+}

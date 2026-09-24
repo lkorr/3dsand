@@ -227,7 +227,8 @@ async function ensureItemList() {
     // items.json is a LIST of defs; tolerate both the bare array and a wrapped
     // object so this does not break if the schema grows a header.
     const arr = Array.isArray(j) ? j : (j.items || []);
-    itemList = arr.map(it => ({ id: it.id || it.name, name: it.name || it.id }))
+    itemList = arr.map(it => ({ id: it.id || it.name, name: it.name || it.id,
+                                kind: it.kind || '' }))
                   .filter(it => it.id);
   } catch (e) {
     itemErr = 'needs the tuner server (python scripts/tuner_server.py) — ' +
@@ -3176,6 +3177,7 @@ function rebuildSkeleton() {
   // the first tick and stays populated.
   AN.animSampleAndBlend(skel, anim, 0);
   AN.animFlatten(skel, anim);
+  strokeBodyClipIdx = -1;
   weaponRebuild();
 }
 
@@ -3263,6 +3265,12 @@ function stepPreviewFixed(dt) {
   //   PREVIEWING the gait (K, no clip open, or auto-loco on): the LOCOMOTION
   //   FAMILY drives it exactly as avatar.cpp does — one clip of
   //   idle/walk/run, exclusive, stride-rate-locked. This is the arm swing.
+  // Preserve the stroke's body clip instance across the clip management
+  // block — it was started by beginStroke and must keep running until the
+  // stroke finishes. animSampleAndBlend advances its timeMs each frame.
+  const strokeClipInst = (strokeBodyClipIdx >= 0)
+      ? anim.clips.find(i => i.clip === strokeBodyClipIdx) : null;
+
   const authoring = !!activeClip && !(autoLoco && gaitOn);
   if (authoring) {
     const ci = skel.clips.findIndex(k => k.name === activeClip);
@@ -3301,6 +3309,9 @@ function stepPreviewFixed(dt) {
   } else {
     anim.clips = [];
   }
+
+  if (strokeClipInst && !anim.clips.some(i => i.clip === strokeBodyClipIdx))
+    anim.clips.push(strokeClipInst);
 
   if (gaitOn) {
     // Walk along +Z with heading 0 (APPROXIMATION: the engine's heading comes
@@ -3471,7 +3482,12 @@ function lungeOffsetModel() {
 // The preview runs whenever something wants a posed rig: the gait walk, clip
 // playback, simply having a clip open (so scrubbing and ring-dragging show
 // their result on a paused rig), or a live stroke.
-const previewActive = () => gaitOn || clipPlaying || !!activeClip || strokeLive();
+// ...or a held GOAL FRAME, which is a posed rig with nothing live on it: the
+// arm sits on one of the style's destinations and does not move, so none of
+// the other four predicates is true and without this the preview would not
+// run at all (and the goal would never be drawn).
+const previewActive = () =>
+  gaitOn || clipPlaying || !!activeClip || strokeLive() || !!ATK.goalFrame?.();
 
 /* ==========================================================================
    5b. THE WEAPON ARM — the real stroke driver, in the preview
@@ -3552,6 +3568,7 @@ let strokeCommit = null;      // {dAz, dEl, dR} at the windup -> cut edge
 // SOLO: hold the pose at the end of the chosen segment for a beat instead of
 // running on, and burst through the segments before it. See weaponTick.
 let strokeHoldTicks = 0;
+let strokeBodyClipIdx = -1;
 const kSoloHoldTicks = 24;    // 0.8 s of holding the segment's end pose
 // The rig parts the driver needs. -1 until weaponRebuild() finds them.
 let wpHandPart = -1, wpChain = -1, wpHeadPart = -1;
@@ -4145,13 +4162,33 @@ function weaponTick() {
   const lib = ATK.library();
   const sty = (lib && strokeStyle >= 0) ? lib.styles[strokeStyle] : null;
   if (!sty) dbgNoStyle++;
+  // ---- 3a. THE GOAL FRAME, held still (attacks.js's goal chips) ----------
+  //
+  // No program runs and no time passes: the arm is put EXACTLY on the
+  // authored destination and left there. Re-resolved every tick rather than
+  // once on the click, so nudging the aim sliders or an az/el box moves the
+  // held frame under the cursor — which is the whole authoring loop this is
+  // for. It reads the SELECTED style, not `strokeStyle`: nothing is live, so
+  // there is no live style to read.
+  const goalKey = ATK.goalFrame?.();
+  if (goalKey) {
+    const gsty = lib ? lib.styles[ATK.styleIndex()] : null;
+    const gaim = ATK.currentAim();
+    const g = gsty
+      ? MELEE.strokeGoalPose(gsty, melee, goalKey, gaim.az, gaim.el) : null;
+    if (g) melee.snapToPose(g.az, g.el, g.reach, right, up, fwd);
+    else melee.update(kStrokeDt, false, !!gsty, right, up, fwd);
+    return;
+  }
   if (!strokeLive()) { melee.update(kStrokeDt, false, !!sty, right, up, fwd); return; }
   // SOLO HOLD: the segment under study has ended; keep the pose it ended in
   // on screen (no step, so the driver's pose is unchanged) for a beat, then
   // run the program again from the start.
   if (strokeHoldTicks > 0) {
     if (--strokeHoldTicks === 0) {
-      if (ATK.looping()) { ATK.nextSwing(); beginStroke(strokeStyle); }
+      // ONLY `vary` ADVANCES THE DRAW. See the loop exit below.
+      if (ATK.looping()) { if (ATK.varying?.()) ATK.nextSwing();
+                           beginStroke(strokeStyle); }
       else stopStroke();
     }
     return;
@@ -4204,7 +4241,16 @@ function weaponTick() {
     }
   }
   if (r === MELEE.STEP.Finished) {
-    if (ATK.looping()) { ATK.nextSwing(); beginStroke(strokeStyle); }
+    // ---- THE LOOP REPLAYS THE SAME SWING unless `vary` is on (2026-09-21).
+    // It used to call nextSwing() here unconditionally, so every cycle drew a
+    // new seed: a different start bow (up to 0.24 rad on the shipped NPC
+    // styles) and different post-tempo tick counts (±0.28). Authoring against
+    // that is authoring against a moving target — the segment you are watching
+    // changes shape once a cycle and nothing on screen says why, which is the
+    // "solo gives different animations randomly" report. `reroll` and the
+    // `vary` chip both still step the sequence, deliberately.
+    if (ATK.looping()) { if (ATK.varying?.()) ATK.nextSwing();
+                         beginStroke(strokeStyle); }
     else stopStroke();
   }
 }
@@ -4256,6 +4302,19 @@ function beginStroke(styleIndex) {
   strokeStart = null;
   strokeCommit = null;
   strokeHoldTicks = 0;
+  // mob.cpp BeginStroke calls PlayClip for the body animation. Start the
+  // style's clip so the rest of the body (torso lean, off-hand, step) plays
+  // alongside the weapon arm.
+  strokeBodyClipIdx = -1;
+  if (sty.clip && skel) {
+    const ci = skel.clips.findIndex(c => c.name === sty.clip);
+    if (ci >= 0) {
+      strokeBodyClipIdx = ci;
+      anim.clips = anim.clips.filter(i => i.clip !== ci);
+      anim.clips.push({ clip: ci, timeMs: 0, ageMs: 0, rate: 1,
+                         weight: 1, stopping: false, fade: 1 });
+    }
+  }
   // SOLO cut / recover: BURST through the segments before the one under
   // study, so the preview opens on that segment's first tick. The burst runs
   // the same ticks the engine would — seed from the rig, step the program —
@@ -4281,6 +4340,11 @@ function stopStroke() {
   clearStrikeEffector();
   lungeArc = null;
   strokeHoldTicks = 0;
+  if (strokeBodyClipIdx >= 0) {
+    for (const inst of anim.clips)
+      if (inst.clip === strokeBodyClipIdx) inst.stopping = true;
+    strokeBodyClipIdx = -1;
+  }
   if (melee) melee.reset();
   strokeTrail.length = 0;
   strokeTipPrev = null;
@@ -4456,7 +4520,12 @@ let lastElbowOverride = null;
 function bindAttacks() {
   ATK.bind({
     el, toast,
-    begin: beginStroke,
+    begin: async (idx) => {
+      const lib = ATK.library();
+      const sty = lib?.styles?.[idx];
+      if (sty?.clip) await ensureClipOnSkeleton(sty.clip);
+      beginStroke(idx);
+    },
     stop: stopStroke,
     rerender: () => renderTimeline(),
     limbByName,
@@ -4474,8 +4543,25 @@ function bindAttacks() {
     }) : equipWeapon(id)),
     weaponEquipped,
     weaponName: () => heldItemId || '',
+    meleeItems: () => (itemList || []).filter(it => it.kind === 'melee'),
+    ensureItemList,
     onTuningChanged: () => { if (melee) melee.tuning = meleeTuning(); },
+    // READ-ONLY, for the panel's own hints — "0 = the global value, which is
+    // currently 0.22 s" is the difference between a field an author can set
+    // and one they have to go and look up.
+    meleeTuning,
     onStylesChanged: () => { /* a live swing keeps running on the edited data */ },
+    // ONE GOAL FRAME, RESOLVED against the arm currently previewing, for the
+    // panel's own readout. The pose itself is applied in weaponTick; this is
+    // the same call with the same arguments, so what the readout prints is by
+    // construction the pose on screen rather than a second derivation of it.
+    goalPose: (key) => {
+      const lib = ATK.library();
+      const s = lib ? lib.styles[ATK.styleIndex()] : null;
+      const a = ATK.currentAim();
+      return (s && melee) ? MELEE.strokeGoalPose(s, melee, key, a.az, a.el)
+                          : null;
+    },
     onTrailToggled: () => { strokeTrail.length = 0; ed.setStrokeTrail?.(null); },
     rebuild: () => { rebuildSkeleton(); ed.invalidate(); },
     state: () => ({
@@ -5090,6 +5176,23 @@ async function saveClipToLibrary(name) {
   } catch (e) {
     toast('library save failed: ' + (e.message || e), true);
   }
+}
+
+async function ensureClipOnSkeleton(name) {
+  if (!skel || !name) return false;
+  if (skel.clips.some(c => c.name === name)) return true;
+  try {
+    const r = await fetch('/api/model?path=' + encodeURIComponent('anims/' + name + '.json'),
+                          { cache: 'no-store' });
+    if (!r.ok) return false;
+    const doc = await r.json();
+    const clip = Object.assign({}, doc);
+    delete clip.name; delete clip.sidecarVoxelsPerMetre;
+    if (!clip.tracks || typeof clip.tracks !== 'object') clip.tracks = {};
+    clips()[name] = clip;
+    rebuildSkeleton();
+    return true;
+  } catch { return false; }
 }
 
 async function importClipFromLibrary(name) {
@@ -5897,8 +6000,10 @@ function installTestSeam() {
     },
     styleTicks: name => {
       const s = ATK.library()?.styles.find(x => x.name === name);
-      return s ? { windup: s.windup.ticks, cut: s.cut.ticks,
-                   recover: s.recoverTicks } : null;
+      // `cut` is the WHOLE path's ticks, every leg (strokes.h "A CUT IS A
+      // PATH") — the phase is one phase however many corners it has.
+      return s ? { windup: s.windup.ticks, cut: MELEE.cutTravel(s).ticks,
+                   recover: s.recover.ticks } : null;
     },
     // Drives the box the AUTHOR drives, so the undo entry the panel pushes is
     // the one under test. A seam that wrote the JSON directly would prove the

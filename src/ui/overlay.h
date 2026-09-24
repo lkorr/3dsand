@@ -179,6 +179,14 @@ struct UIState {
     kToolCount
   };
   int tool = kToolBrush;
+  // PLAY or DEV (F2, and the dev panel's checkbox). Off = the game as a
+  // player meets it: the hands are the only tool (kToolMelee -- fists, a
+  // drawn weapon, a flask), the number row and wheel pick the hotbar, and
+  // every build/debug binding (Tab tools, brush keys, M/B/K/U/L/H/T/O, fly,
+  // single-step, grenades) is inert. On = everything as it always was. The
+  // F-keys, pause, save/load and the menus work in both. main.cpp enforces
+  // it every frame and applies the transition (fly off, hands up) on a change.
+  bool devControls = true;
 
   // MLS-MPM fluid prototype (docs/PLAN_mpm_fluids.md): the experimental
   // particle liquid, placeable side by side with CA water for comparison.
@@ -366,6 +374,18 @@ struct UIState {
   // with, and a picker that cannot express it would need a second button.
   std::vector<std::string> aiWeaponNames;
   int aiWeaponPick = 0;
+  // ---- F1 Spawn tab: GIVE YOURSELF A FILLED VESSEL --------------------------
+  // Every container item (flask, pouch, ...) and, per vessel, every material
+  // its `container.holds` classes admit -- both BY NAME and rebuilt by main.cpp
+  // off the live item library and material table on load and every R, for the
+  // weapon picker's reason (indices renumber on insert). session.cpp consumes
+  // the one-shot `giveVessel`, filling the vessel to capacity through the same
+  // ContainerAccepts rule a scoop obeys, into the hotbar or else the bag.
+  std::vector<std::string> giveVesselNames;
+  std::vector<std::vector<std::string>> giveVesselMats;
+  int giveVesselPick = 0, giveMatPick = 0;
+  bool giveVessel = false;
+  std::string giveVesselStatus;
   // WHICH CREATURE the Spawn tab's three buttons put in the world. Same
   // contract as the weapon picker above and for the same reasons: rebuilt off
   // the LIVE mob defs at load and on every R, re-found by name afterwards
@@ -630,6 +650,13 @@ struct UIState {
     uint32_t voxelBone = 0;
     uint32_t voxelBrain = 0;
     uint32_t voxelBrainMax = 0;  // brain voxels at spawn (for "X missing")
+    // Tissue a bite has already turned (materials tagged `infectious`, i.e.
+    // rotflesh). It is counted in voxelTotal like any other tissue, so it does
+    // NOT move voxelFrac — rot is a limb being the wrong thing, not a limb
+    // being smaller, and only the rot that eventually deletes voxels hollows
+    // it out. A separate number because it is the only tissue count that goes
+    // UP when things get worse.
+    uint32_t voxelRot = 0;
     // WHERE THE LIMB IS ON THE PORTRAIT, so the inspector can outline it.
     // Normalized to the portrait frame: (0,0) top-left, (1,1) bottom-right,
     // as the screen-space bounds of the limb's projected oriented box.
@@ -659,6 +686,21 @@ struct UIState {
   uint32_t stainMat = 0;
   uint32_t stainColor = 0;
   char stainLabel[24] = {0};
+  // ...and EVERY substance the ledger ranked, heaviest first, each with its
+  // own share of the body (same amount-weighted scale as stainFrac, so they
+  // sum to at most stainFrac). The line above names the dominant one only,
+  // which is how an oiled player standing in the rain read as "water" and
+  // nothing else. Sized to game/mob.h kCoatTop (not included here; main.cpp
+  // static_asserts the two agree).
+  static constexpr int kCoatNames = 4;
+  struct CoatName {
+    float frac = 0.0f;
+    uint32_t mat = 0;
+    uint32_t color = 0;     // 0xAABBGGRR, as stainColor
+    char label[24] = {0};
+  };
+  CoatName coats[kCoatNames];
+  int coatCount = 0;
   // tune.coat.hudMinFrac, MIRRORED IN rather than read: ui/ includes no sim
   // header, and a threshold the overlay reached for itself would be a second
   // place the number lives. Below it the HUD line, the figure's chip and the
@@ -691,6 +733,9 @@ struct UIState {
   std::vector<int> glyphSlotKinds;             // SlotKind: 0 none, 1 glyph, 2 page
   std::vector<std::string> glyphSlotReadouts;  // a page's bracket readout
   bool glyphBankB = false;                     // Shift held: the strip highlights bank B
+  // Which bound key's spell is SELECTED (PLAN_spell_graph §0b: a number key
+  // selects, right-click casts, the selection persists). -1 = nothing held.
+  int glyphSelected = -1;
   std::string spellNote;                       // "saved as ...", "the stack is full"
   float spellNoteAge = 99.0f;
 
@@ -713,6 +758,13 @@ struct UIState {
   bool inventoryOpen = false;   // I toggles; main.cpp owns the cursor/capture
   bool inspectMode = false;     // left panel: CHARACTER (gear) vs HEALTH
   int inspectSelected = -1;     // BodySlot of the limb whose detail is open, -1 = none
+  // WHICH TRIAGE GROUPS ARE EXPANDED, one bit per body group (head, torso,
+  // left arm, right arm, left leg, right leg — the table lives in the panel,
+  // which is the only thing that knows what a "group" is). Kept here rather
+  // than as a static in the drawing code because it is per-PLAYER UI state
+  // like the selection above it, and because a static would survive a body
+  // it has nothing to do with.
+  uint32_t triageOpen = 0;
 
   // ---- the live avatar portrait (main.cpp's second render pass) ------------
   // `portraitTex` is an ImTextureID (a VkDescriptorSet behind the scenes) that
@@ -785,6 +837,10 @@ struct UIState {
     // apart, and `dyeName` is what the tooltip says out loud.
     uint32_t dyeSwatch = 0;
     std::string dyeName;
+    // A VESSEL's contents over its capacity, 0..1; -1 for anything that is not
+    // a vessel. The HUD hotbar draws it as a gauge under the icon, the one
+    // number you need while pouring.
+    float fill = -1.0f;
   };
   std::vector<KitSlotUI> bagSlots;      // Bag::kSlots, row-major
   std::vector<KitSlotUI> hotbarSlots;   // kItemSlots
@@ -814,6 +870,8 @@ struct UIState {
     std::string desc;
     int type = 0;         // GlyphSort: 0 matter, 1 effect, 2 delivery, 3 mod, 4 operator
     int mana = 0;         // the word cost
+    bool hidden = false;  // replaced by a signed component (M2): loadable,
+                          // not offered in the word column
     uint32_t color = 0;   // matter swatch (gpu color0), 0 = not matter
     // The §9 info box, every field read from the glyph's JSON entry so the
     // box is never wrong about the glyph and a modder's glyph gets one free.
@@ -824,6 +882,16 @@ struct UIState {
     std::string example;
     std::string delivers; // which deliveries carry it
     std::string emptyNote;// "left empty: _" for operators
+    // A Mod that edits the whole record WHEREVER it is spoken. `count` was the
+    // only one and is not any more (2026-09-22): a count splits the scope it
+    // was spoken in, so a mod dropped on a branch edits that branch. Kept as a
+    // field because the drop preview promises which it is, and the day a
+    // genuinely record-wide mod exists it has somewhere to say so.
+    bool recordWide = false;
+    // A Mod whose field is `count`: the word that MAKES the branches. The canvas
+    // needs to know, because a split is the one mod a socket drop may not answer
+    // by opening a lane - see the drop rule in spellgraph_ui.cpp.
+    bool splits = false;
   };
   std::vector<GlyphUI> glyphsOwned;   // EVERY glyph, `owned` says which
   // ---- the grimoire (plan §12b) --------------------------------------------
@@ -841,7 +909,20 @@ struct UIState {
   // The page being composed: UI-owned until Save. main.cpp fills the readout
   // and price for the row every frame through the same DescribeSpell the live
   // sentence uses, so the panel can never disagree with the game.
-  bool grimoireMode = false;                // the arsenal panel: glyphs vs grimoire
+  bool grimoireMode = false;                // vestigial: the old arsenal/grimoire toggle
+  // THE BOOK IS SHUT UNTIL YOU OPEN IT (2026-09-22). The character screen is
+  // two things at once: a place you take stock (body, gear, pack) and a place
+  // you WRITE (the spell page). The second wants every pixel on the screen and
+  // the first wants none of them, so the book lies closed on the desk - its
+  // spine, and the ten keys you actually cast with - and opening it takes the
+  // whole column, pack and all. Closed is the default because opening the
+  // character screen is usually about the body.
+  bool spellbookOpen = false;
+  // THE SPELLBOOK'S LOWER HALF. The grimoire and the arsenal are one panel
+  // (2026-09-21); this folds the EVERY WORD table away and leaves the bound
+  // keys, which is the trade a short screen wants — the table is a reference
+  // surface, the tree above it is the thing being built. Open by default.
+  bool spellWordsOpen = true;
   std::string grimoireSelected;             // page name, "" = none
   std::string grimoireEditName;
   std::vector<std::string> grimoireEditWords;
@@ -859,6 +940,116 @@ struct UIState {
   // off is the mistake this panel makes most.
   std::vector<std::vector<std::string>> grimoireUndo, grimoireRedo;
   std::string grimoireUndoPage;
+  // ---- THE SPELL GRAPH (docs/PLAN_spell_graph.md §4-§6) ---------------------
+  //
+  // A PLAIN-STRUCT MIRROR of game/spellgraph.h's `SpellGraph`, field for field,
+  // in ints and strings. This header is included by main.cpp and stays both
+  // imgui-free AND spell-free on purpose, so it may not name `SpellGraphNode`,
+  // `GlyphSort` or `BoxPrice`; main.cpp copies across every frame the composer
+  // is open. A glyph crosses BY NAME (DESIGN §8b) — indices die on R reload —
+  // but a TREE NODE index is fine, because it is re-derived from the same word
+  // list in the same frame the intent is consumed.
+  struct SpellGraphUI {
+    struct Node {
+      int kind = 0;            // GraphKind: 0 word 1 operator 2 join 3 modtag
+                               // 4 root 5 socket 6 bus 7 split
+      int treeNode = -1;       // index into the SpellTree; -1 = synthesized
+      std::string glyphId;     // the word's NAME; "" on a synthesized node
+      std::string label;       // what the cell says ("fire", "PROJECTILE")
+      int n = 1;               // multiplicity
+      int sort = 0;            // GlyphSort: 0 matter 1 effect 2 delivery
+                               // 3 mod 4 operator 5 separator
+      uint32_t color = 0;      // the matter swatch, as GlyphUI carries it
+      int lane = 0;
+      int x = 0, y = 0, w = 0, h = 0;
+      int layer = 0;
+      // The LOWEST layer this node's subtree occupies, which is the band its
+      // edge into its parent leaves from (SpellGraphNode::baseLayer). Equal to
+      // `layer` for everything a single band tall; lower on a spoken delivery,
+      // whose bar is the top of its own span.
+      int baseLayer = 0;
+      int subX = 0, subW = 0;
+      // Operator
+      bool hasLeft = false, hasRight = false;
+      bool leftFilled = false, rightFilled = false;
+      bool complete = true;
+      int wordCostOf = 0;      // the glyph's word cost, for the struck-through
+                               // price on an incomplete operator
+      // Join / Root
+      int instances = 1, laneCount = 0;
+      std::vector<int> sockets;
+      int bus = -1;
+      bool hasPrice = false;
+      int wordCost = 0, tariff = 0, carryCost = 0, priceInstances = 1, leaves = 1;
+      bool instancesClamped = false;
+      int subtotal = 0;
+      // ONE RECORD, SEVERAL CELLS: a split delivery is drawn once per branch and
+      // exactly one of those cells - the PRIMARY - owns `sockets`, `bus`,
+      // `split`, the price and the box's whole span. `primary` is the primary's
+      // index on a copy and -1 on the primary itself, so an unsplit box reads
+      // exactly as it did before the field existed. See SpellGraphNode.
+      int primary = -1;
+      int split = -1;          // this box's Split junction, -1 when unsplit
+      // On a Socket / Bus / Split: the box cell that owns it (SpellGraphNode::
+      // owner). A sub-fan's pip is in no `sockets` list, so this is the only
+      // answer to "which box is this mark on".
+      int owner = -1;
+      int bolts = 1;           // how many bolts THIS branch fires (a sub-split)
+      // Socket, or WHICH BRANCH a Join cell caps
+      int instance = -1;
+      int pipW = 32;
+      // ModTag
+      std::string edit;        // "speed x2"
+      bool wasted = false;
+      // Word / Operator / ModTag: MAGNITUDE (docs/PLAN_spell_magnitude.md
+      // §2.5). Per-mille; `graded` says the wheel over the cell may move it,
+      // on the lattice magMin..magMax by magStep; `magLabel` is what it reads
+      // as ("gravity -0.50 g").
+      int mag = 1000;
+      bool graded = false;
+      int magMin = 1000, magMax = 1000, magStep = 1000;
+      int magDefault = 1000;
+      std::string magLabel;
+      // WHEN it fires in its carrier (M3): SpellTrigger 0 hit 1 bounce 2 expire
+      // 3 launch 4 every; `every` the period; `delay` ticks later. The phrase
+      // is empty at the default (on hit, no delay).
+      int trigger = 0, every = 0, delay = 0;
+      std::string timingPhrase;
+      int spanFirst = -1, spanLast = -1;
+    };
+    struct Edge {
+      int from = -1, to = -1;
+      int kind = 0;            // GraphEdge: 0 trunk 1 bus 2 socket 3 fan 4 slot
+    };
+    std::vector<Node> nodes;
+    std::vector<Edge> edges;
+    int root = -1;
+    int width = 0, height = 0, layers = 0;
+    // The whole cast's total, the three parts the HUD shows, under the hand.
+    int wordCost = 0, tariff = 0, carryCost = 0, manaCost = 0;
+    bool priceUnknown = false;
+    // A page nested in the composed words was EXPANDED to draw the tree, so an
+    // edit rewrites it as its words. Said on the status line rather than
+    // silently.
+    std::string expandedNote;
+  };
+  SpellGraphUI spellGraph;
+  // THE CANVAS'S VIEW (2026-09-22): drag to pan, wheel to zoom. UI-owned and
+  // persistent across frames, because a view is a thing you SET and then work
+  // in — it must survive the composer resizing under it, a word being typed,
+  // and the page's shape changing.
+  //
+  // `spellGraphZoom` is 0 for AUTO: the fit-or-halve rule the canvas always
+  // had, re-decided every frame, with the drawing centred and the pan ignored.
+  // Any other value is an explicit scale off the ladder in spellgraph_ui.cpp,
+  // set by the wheel, and it is the only state that turns the pan on. A
+  // double-click on the canvas's background puts it back to 0.
+  //
+  // THE LADDER IS THE PIXEL-ART RULE. Only 0.5 and whole numbers are ever
+  // stored here: a 2x sprite at 0.5x is its authored size and at 2x/3x/4x is
+  // whole pixels, and anything between would put chrome on half a pixel.
+  float spellGraphZoom = 0.0f;
+  float spellGraphPanX = 0.0f, spellGraphPanY = 0.0f;
   // `glyphSlots` above is already the bound strip (slot -> glyph id) and IS
   // the arsenal's bottom row — the panel and the live hotkeys read one mirror,
   // which is what makes binding in the panel provably the same thing as the
@@ -937,6 +1128,28 @@ struct UIState {
     std::string name;
     std::vector<std::string> words;
   } grimoireOp;
+  // A GESTURE ON THE CANVAS (PLAN_spell_graph §5). The page never edits words:
+  // it names a TREE OP and main.cpp applies it to the tree of the current edit
+  // words, linearizes the result back and writes it into `grimoireEditWords`.
+  // Two views, one truth — and every op is total, so a refusal is a sentence on
+  // the status line (`kitMessage`) rather than a malformed page.
+  struct GraphEditIntent {
+    bool pending = false;
+    enum Op {
+      Insert = 0, FillSlot, Wrap, AttachMod, Remove, Unbox, Move, CloseLane,
+      SetMagnitude,  // the wheel over a graded cell: `treeNode` to `mag`
+      SetTiming      // the timing popup: `treeNode` fires on trigger/every/delay
+    } op = Insert;
+    int treeNode = -1;      // the box (Insert/AttachMod/CloseLane), the group
+                            // (FillSlot), or the subject (Wrap/Remove/Unbox/Move)
+    int boxTreeNode = -1;   // Move's destination box
+    int lane = 0;
+    int side = 0;           // SlotSide: 0 left, 1 right
+    std::string glyphId;    // a word's NAME, or a page's (Insert/Fill/Wrap/Mod)
+    bool copy = false;      // ctrl held: Move duplicates instead
+    int mag = 1000;         // SetMagnitude: the new magnitude, per-mille
+    int trigger = 0, every = 0, delay = 0;   // SetTiming (SpellTrigger order)
+  } graphEdit;
   // A body part clicked in the health inspector with a sentence on the
   // stack: cast it with `self` resolving AT that part (docs/
   // PLAN_magic_grammar.md §7 — `fire self` on a bleeding stump). The panel
@@ -945,6 +1158,39 @@ struct UIState {
     bool pending = false;
     int slot = -1;             // UIState::BodySlot
   } castAtPart;
+  // ...and with a filled VESSEL chosen on the FLASKS row instead (game/
+  // container.h; `activeVessel` below): the portrait becomes a BRUSH. Left button held over the
+  // body pours where the cursor is (MobSystem::PourOnBody); right-drag
+  // orbits, middle-drag pans, the wheel (or [ ]) sizes the brush and
+  // ctrl+wheel zooms. The panel
+  // reports only WHERE on the picture, normalized like projMin/projMax;
+  // main.cpp owns the portrait camera and turns it into a ray, and mirrors
+  // the answer back as the cursor ring. `applyText` is what the flask holds
+  // ("water 64/128"), empty when the chosen slot is no filled vessel -- and
+  // then the portrait is not a brush.
+  struct PourBrushIntent {
+    bool hover = false;    // the cursor is over the portrait: pick for the ring
+    bool active = false;   // ...and the left button is down: pour
+    float uv[2] = {0, 0};  // portrait-normalized, (0,0) top-left
+  } pourBrush;
+  float pourRadius = 0.5f;  // world voxels; brush disc on the skin
+  // What that size drains, cells a second (container.h PourBrushCellsPerSec),
+  // mirrored by main.cpp so the readout is the number the tick spends by.
+  float pourDrainPerSec = 0.0f;
+  bool pourCursorValid = false;       // main.cpp: the ray hits the body
+  float pourCursorUV[2] = {0, 0};     // where it hit, portrait-normalized
+  float pourCursorR = 0.0f;           // brush radius, fraction of portrait width
+  std::string applyText;
+  uint32_t applyColor = 0;   // the substance's own colour, for the hover frame
+  // WHICH FLASK IS IN USE on your own body: a pack or hotbar slot, picked by
+  // clicking it on the character screen's FLASKS row and put back with the
+  // row's button. The panel owns the choice; main.cpp clears it when the slot
+  // it names stops holding a vessel (moved, dropped, swapped for a sword).
+  KitRef activeVessel{};
+  // THE THROW'S WIND-UP, 0..1 while Q is held with a throwable vessel in
+  // hand, -1 otherwise (game/container.h ContainerThrowCharge). Written by the
+  // tick; the HUD draws the meter under the crosshair, shaking at full.
+  float throwCharge = -1.0f;
 
   // What the last refused action said, and how long ago. Flashed under the
   // panel rather than swallowed: a slot that silently declines is the failure

@@ -2050,7 +2050,51 @@ def check_material_ids():
                 f"literal)")
 
 
+# ------------------------------------------------------------- scoop ledger
+def check_scoop_ledger():
+    """world.h kPageFaultScoop* <-> sim_mutate.wgsl SCOOP_*_WORD.
+
+    The vessels' ledger (game/container.h) is three words of the page-fault
+    record: sim_mutate adds to them and World::ReadSnapshot copies them out.
+    The WGSL side declares its own indices (a constant one shader reads lives
+    in that shader), so nothing but this check keeps the two numbers equal --
+    and a mismatch is a flask paid from the wrong counter, silently.
+    """
+    wh = read("src/sim/world.h")
+    sm = read("assets/shaders/sim_mutate.wgsl")
+    if not wh or not sm:
+        return
+    checked.append("scoop ledger")
+    for cpp, wgsl in (("kPageFaultScoopEighths", "SCOOP_EIGHTHS_WORD"),
+                      ("kPageFaultScoopApplied", "SCOOP_APPLIED_WORD"),
+                      ("kPageFaultScoopRefused", "SCOOP_REFUSED_WORD")):
+        a = re.search(r"constexpr\s+uint32_t\s+" + cpp + r"\s*=\s*(\d+)", wh)
+        b = re.search(r"const\s+" + wgsl + r"\s*:\s*u32\s*=\s*(\d+)u", sm)
+        if not a or not b:
+            problems.append(f"scoop ledger: {cpp} / {wgsl} not found")
+            continue
+        if a.group(1) != b.group(1):
+            problems.append(f"scoop ledger: world.h {cpp} = {a.group(1)} but "
+                            f"sim_mutate.wgsl {wgsl} = {b.group(1)}")
+    # ...and the poured-particle bit, same shape: world.h <-> sim_particle.wgsl.
+    sp = read("assets/shaders/sim_particle.wgsl")
+    for cpp, wgsl in (("kPFlagCalm", "PFLAG_CALM"), ("kPFlagDrip", "PFLAG_DRIP")):
+        a = re.search(r"constexpr\s+uint32_t\s+" + cpp + r"\s*=\s*(\d+)u", wh)
+        b = re.search(r"const\s+" + wgsl + r"\s*:\s*u32\s*=\s*(\d+)u", sp or "")
+        if not a or not b:
+            problems.append(f"particle flag: {cpp} / {wgsl} not found")
+        elif a.group(1) != b.group(1):
+            problems.append(f"particle flag: world.h {cpp} = {a.group(1)} but "
+                            f"sim_particle.wgsl {wgsl} = {b.group(1)}")
+    w = re.search(r"constexpr\s+uint32_t\s+kPageFaultWords\s*=\s*(\d+)", wh)
+    e = re.search(r"constexpr\s+uint32_t\s+kPageFaultScoopRefused\s*=\s*(\d+)", wh)
+    if w and e and int(e.group(1)) >= int(w.group(1)):
+        problems.append("scoop ledger: kPageFaultScoopRefused is past the end "
+                        "of the page-fault record (kPageFaultWords)")
+
+
 ALL = {
+    "scoop": check_scoop_ledger,
     "envpred": check_env_predictions,
     "autofly": check_autofly_surface,
     "worldgen": check_worldgen_mirror,
@@ -2100,7 +2144,9 @@ RELEVANT = {
     "src/test/selftest.cpp": ["arch"],
     # ONE entry per file: a duplicate key in a dict literal silently replaces
     # the earlier one, and world.h / perfnodes.h each had two until 2026-09-19.
-    "src/sim/world.h": ["world", "params", "substeps", "windprim",
+    "assets/shaders/sim_mutate.wgsl": ["scoop"],
+    "assets/shaders/sim_particle.wgsl": ["scoop"],
+    "src/sim/world.h": ["scoop", "world", "params", "substeps", "windprim",
                         "curprim", "waterledger", "ringdepth", "matids"],
     "src/test/selftest_water.cpp": ["waterledger"],
     "src/sim/world.cpp": ["worldgen"],

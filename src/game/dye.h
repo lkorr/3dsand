@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <cstdlib>
 #include <string>
 
 // THE DYE: one colour, carried by an item, applied to a worn garment's art at
@@ -56,6 +57,27 @@ inline uint32_t DyePack(float r, float g, float b) {
     return (uint32_t)(c * 255.0f + 0.5f);
   };
   return kDyeFlag | q(r) | (q(g) << 8) | (q(b) << 16);
+}
+
+// A DYE THE WAY A HUMAN TYPES ONE: "#RRGGBB", or the same six digits bare. An
+// unparseable string is 0 — no dye — rather than a guess, so a typo in an asset
+// shows up as an undyed garment and not as a surprising colour.
+//
+// The byte order swaps here: authored red-first, packed red in the LOW byte
+// because that is how the GPU reads it. This used to live at its one call site
+// in main.cpp's --shot-mob parser with a comment saying so; a mob's loot table
+// (MobDef::LootEntry) is the second place a colour is typed, and two copies of
+// a channel swap is exactly the kind of pair that drifts.
+inline uint32_t DyeParseHex(const std::string& s) {
+  const size_t at = s.empty() ? std::string::npos
+                              : (s[0] == '#' ? 1u : 0u);
+  if (at == std::string::npos) return 0;
+  char* end = nullptr;
+  const unsigned long v = std::strtoul(s.c_str() + at, &end, 16);
+  if (end == nullptr || end == s.c_str() + at) return 0;
+  return DyePack((float)((v >> 16) & 0xFFu) / 255.0f,
+                 (float)((v >> 8) & 0xFFu) / 255.0f,
+                 (float)(v & 0xFFu) / 255.0f);
 }
 
 inline bool DyeSet(uint32_t dye) { return (dye & kDyeFlag) != 0; }

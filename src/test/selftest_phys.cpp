@@ -1646,6 +1646,118 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- big-body-collider -----------------------------------------------------
+//
+// A FELLED TREE MUST NOT COST 100 ms A STEP. The owner report was "cut a tree
+// down, or split a big body, and it runs at 3 fps for a few seconds"; the
+// measured cause (physics.cpp, kDiscreteMinExtentVox) was a crown collider of
+// 1024 one-voxel boxes that Jolt LinearCast on every step, because a compound's
+// inner radius is its smallest box's. This pins the three rules that fixed it,
+// structurally, so no timing has to be trusted:
+//
+//   A. a sparse crown stays within Physics::ColliderBoxBudget() boxes AND every
+//      one of its voxels is inside a box (the old 1024 cap covered a sixth);
+//   B. its solid trunk survives as ONE exact box (the fat part is kept, only
+//      the leaves go coarse), and a thick body steps discretely;
+//   C. a small, thin body is untouched: one box, still LinearCast -- the
+//      `body-fastfall` guarantee is for exactly these.
+//
+// Pure Jolt, no world, no terrain: the bodies are made, read and removed.
+Status GateBigBodyCollider(Ctx& c, std::string& detail) {
+  Physics& phys = c.phys;
+  std::vector<float> dens;
+  for (const auto& m : c.mats) dens.push_back((float)m.gpu.density);
+
+  // The crown: a radius-28 ball at 35% dither (the tree-fell fixture's rim
+  // density), on a 6x60x6 trunk listed FIRST so the greedy merge meets it as
+  // one run, the way an island's flood meets a trunk.
+  std::vector<DebrisVoxel> tree;
+  const int R = 28, T = 60;
+  for (int z = 0; z < 6; z++)
+    for (int y = 0; y < T; y++)
+      for (int x = 0; x < 6; x++)
+        tree.push_back({(int8_t)(R - 3 + x), (int8_t)y, (int8_t)(R - 3 + z), 0,
+                        kMatStone});
+  for (int z = 0; z <= 2 * R; z++)
+    for (int y = 0; y <= 2 * R; y++)
+      for (int x = 0; x <= 2 * R; x++) {
+        const int dx = x - R, dy = y - R, dz = z - R;
+        if (dx * dx + dy * dy + dz * dz > R * R) continue;
+        const bool inTrunk = x >= R - 3 && x < R + 3 && z >= R - 3 && z < R + 3 &&
+                             y + T - R < T;
+        if (inTrunk) continue;
+        uint32_t h = (uint32_t)(x * 73856093) ^ (uint32_t)(y * 19349663) ^
+                     (uint32_t)(z * 83492791);
+        h ^= h >> 13; h *= 0x5BD1E995u; h ^= h >> 15;
+        if (h % 100u >= 35u) continue;
+        tree.push_back({(int8_t)x, (int8_t)(y + T - R), (int8_t)z, 0, kMatStone});
+      }
+  BodyTransform xf{};
+  xf.pos = Vec3{900.0f, 700.0f, 900.0f};  // far from every other fixture
+  xf.quat[3] = 1;
+  const uint64_t big = phys.CreateDebrisBodyXf(tree, xf, dens, false);
+  std::vector<SubShapeBox> boxes;
+  const size_t nBoxes = big ? phys.GetSubShapeBoxes(big, boxes, 1u << 16) : 0;
+  size_t uncovered = 0;
+  // The trunk, exactly: a 6 x 60 x 6 box whose min corner is the trunk's.
+  bool trunkExact = false;
+  for (const SubShapeBox& b : boxes)
+    trunkExact = trunkExact ||
+                 (std::fabs(b.halfExtents.x - 3.0f) < 1e-3f &&
+                  std::fabs(b.halfExtents.y - 0.5f * T) < 1e-3f &&
+                  std::fabs(b.halfExtents.z - 3.0f) < 1e-3f &&
+                  std::fabs(b.center.x - (float)R) < 1e-3f &&
+                  std::fabs(b.center.y - 0.5f * T) < 1e-3f &&
+                  std::fabs(b.center.z - (float)R) < 1e-3f);
+  for (const DebrisVoxel& v : tree) {
+    const Vec3 p{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+    bool in = false;
+    for (const SubShapeBox& b : boxes) {
+      if (std::fabs(p.x - b.center.x) <= b.halfExtents.x + 1e-3f &&
+          std::fabs(p.y - b.center.y) <= b.halfExtents.y + 1e-3f &&
+          std::fabs(p.z - b.center.z) <= b.halfExtents.z + 1e-3f) {
+        in = true;
+        break;
+      }
+    }
+    if (!in) uncovered++;
+  }
+  const bool bigCast = phys.UsesLinearCast(big);
+  if (big) phys.RemoveBody(big);
+
+  // C: the small thin body.
+  std::vector<DebrisVoxel> plank;
+  for (int z = 0; z < 3; z++)
+    for (int x = 0; x < 12; x++)
+      plank.push_back({(int8_t)x, 0, (int8_t)z, 0, kMatStone});
+  xf.pos = Vec3{960.0f, 700.0f, 900.0f};
+  const uint64_t small = phys.CreateDebrisBodyXf(plank, xf, dens, false);
+  std::vector<SubShapeBox> sboxes;
+  const size_t nSmall = small ? phys.GetSubShapeBoxes(small, sboxes, 64) : 0;
+  const bool smallCast = phys.UsesLinearCast(small);
+  if (small) phys.RemoveBody(small);
+
+  const bool a = big != 0 && (int)nBoxes <= Physics::ColliderBoxBudget() &&
+                 uncovered == 0;
+  const bool b = trunkExact && !bigCast;
+  const bool cOk = small != 0 && nSmall == 1 && smallCast;
+  const bool ok = a && b && cOk;
+  char buf[512];
+  std::snprintf(buf, sizeof buf,
+      "A crown %zu vox -> %zu boxes (budget %d), %zu voxels outside every box | "
+      "B trunk %s, %s (discrete from %.0f vox thick) | "
+      "C plank -> %zu box, %s",
+      tree.size(), nBoxes, Physics::ColliderBoxBudget(), uncovered,
+      trunkExact ? "kept as one exact 6x60x6 box" : "NOT kept exact",
+      bigCast ? "LinearCast" : "discrete",
+      Physics::DiscreteMinExtentVox(), nSmall,
+      smallCast ? "LinearCast" : "discrete");
+  detail = buf;
+  std::printf("big-body-collider: %s (%s)\n", ok ? "PASS" : "FAIL",
+              detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& BodyGates() {
@@ -1655,6 +1767,7 @@ const std::vector<Gate>& BodyGates() {
       {"player-body", "phys", {}, false, GatePlayerBody},
       {"ragdoll-joints", "phys", {}, false, GateRagdollJoints},
       {"body-fastfall", "phys", {}, false, GateBodyFastFall},
+      {"big-body-collider", "phys", {}, false, GateBigBodyCollider},
       {"debris-ghost", "phys", {}, false, GateDebrisGhost},
   };
   return g;

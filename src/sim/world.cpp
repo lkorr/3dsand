@@ -139,6 +139,7 @@ void World::Init(const rhi::Device& device) {
   opsBuf = CreateBuffer(device, kMaxOpsPerTick * sizeof(BrushOp),
                         U::Storage | U::CopyDst, "brushOps");
   renderUBO = CreateBuffer(device, sizeof(RenderParams), U::Uniform | U::CopyDst, "renderUBO");
+  cloudUBO = CreateBuffer(device, sizeof(CloudParams), U::Uniform | U::CopyDst, "cloudUBO");
   dirtyViz = CreateBuffer(device, kDirtyBytes, U::Storage | U::CopyDst, "dirtyViz");
   actVoxViz = CreateBuffer(device, kActVoxVizBytes, U::Storage | U::CopyDst, "actVoxViz");
   // Shadow cache (world.h kShadowCacheBuckets). CopyDst so a zero-fill can
@@ -370,6 +371,8 @@ void World::Init(const rhi::Device& device) {
   // NOT lean on zero-initialized allocation the way farVox does.
   farPatch = CreateBuffer(device, (uint64_t)kFarPatchWords * 4,
                           U::Storage | U::CopyDst, "farPatch");
+  farSig = CreateBuffer(device, (uint64_t)kNumSlots * 4, U::Storage | U::CopyDst,
+                        "farSig");
 
   for (auto& s : slots_) {
     s.buf = CreateBuffer(device, kSlotBytes, U::MapRead | U::CopyDst, "readback");
@@ -498,6 +501,10 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   if (haveEncodeTick_ && tick < lastEncodeTick_) InvalidateSnapshot();
   lastEncodeTick_ = tick;
   haveEncodeTick_ = true;
+  // Counted BEFORE the decline below (see TicksEncoded): a tick that gets no
+  // copy must leave a hole in submitSeq, or the save path could not tell it
+  // happened.
+  const uint32_t seq = ++ticksEncoded_;
   int slot = -1;
   const int active = ActiveReadbackSlots();
   for (int i = 0; i < active; i++) {
@@ -516,6 +523,7 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   Slot& s = slots_[slot];
   s.particleLivePage = particleLivePage;
   s.tick = tick;
+  s.seq = seq;
   s.origin = origin_;
 
   // drain queued chunk fetches into this slot (bounded per tick); anything
@@ -710,6 +718,7 @@ void World::KickReadback() {
         // Set before the parse: the SANDVOX_DIRTY_REASONS diagnostic below
         // stamps its line with it.
         out.tick = sl.tick;
+        out.submitSeq = sl.seq;
         std::memcpy(out.mirror.data(), p, kMirrorBytes);
         // Sentinel chunks were never copied (§2.1a); synthesize their words
         // now, through the SAME rule the shader uses. SynthWord (world.h)
@@ -835,6 +844,9 @@ void World::KickReadback() {
         out.chunkHash = lastChunkHash_;
         out.chunkHashTick = (*out.chunkHash)[kChunkHashTickWord];
         std::memcpy(&out.pageFaults, p + kPageFaultOff, 4);
+        std::memcpy(&out.scoopEighths, p + kPageFaultOff + kPageFaultScoopEighths * 4, 4);
+        std::memcpy(&out.scoopApplied, p + kPageFaultOff + kPageFaultScoopApplied * 4, 4);
+        std::memcpy(&out.scoopRefused, p + kPageFaultOff + kPageFaultScoopRefused * 4, 4);
         std::memcpy(out.pick, b + kPickOff, 32);
         uint32_t pcounts[2];
         std::memcpy(pcounts, b + kPCountOff, 8);

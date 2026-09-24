@@ -181,9 +181,16 @@ static void ParseStain(const json& m, const std::string& path,
   // Preserve any absorb capacity already parsed for this material: the two
   // halves of stainPack are authored in separate JSON blocks and either may be
   // read first, so neither may clobber the other's bits.
+  // A BODY-ONLY stain keeps its slot on the CPU side and out of the GPU pack:
+  // every kernel that marks the ground (sim_step doStaining, sim_particle's
+  // landing, the fluid seam) gates on the pack's type bits, so zero there is
+  // "never stains the world" with no kernel knowing the flag exists. That is
+  // what lets a LIQUID (acid) coat a body without painting every rock it eats.
+  d.stainSlot = slot;
+  const uint32_t gpuSlot = bodyOnly ? 0u : slot;
   d.gpu.stainPack = (d.gpu.stainPack & ((kStainPackAbsorbMask << kStainPackAbsorbShift) |
                                         kStainPackWashesBit)) |
-                    ((uint32_t)slot << kStainPackTypeShift) |
+                    ((uint32_t)gpuSlot << kStainPackTypeShift) |
                     ((uint32_t)amount << kStainPackAmtShift) |
                     ((uint32_t)chance << kStainPackChanceShift) |
                     ((uint32_t)consume << kStainPackConsumeShift);
@@ -231,10 +238,54 @@ static void ParseCoat(const json& m, const std::string& path, MaterialDef& d,
               "\": coat decayFloor must be 0..15\n";
     decayFloor = 0;
   }
+  // "opacity" 0..1: how strongly this coat SHOWS on a body, at any amount.
+  // Water soaks skin to the same amount blood does (that amount is what the
+  // wash / wick / dry rules count), but a wet arm is still an arm; at full
+  // strength the near-grey wet colour turned people into statues. The value
+  // rides in the ALPHA byte of stainColor, which nothing else reads
+  // (unpackColor is RGB), and only microbody.wgsl bodyStainTint applies it:
+  // the ground's stain path is untouched.
+  float opacity = co.value("opacity", 1.0f);
+  if (opacity < 0.0f || opacity > 1.0f) {
+    errors += path + ": material \"" + d.name +
+              "\": coat opacity must be 0..1\n";
+    opacity = 1.0f;
+  }
+  d.gpu.stainColor = (d.gpu.stainColor & 0x00FFFFFFu) |
+                     ((uint32_t)(opacity * 255.0f + 0.5f) << 24);
   d.coatDecay = decay;
   d.coatDecayFloor = (uint32_t)decayFloor;
   d.coatShed = (uint32_t)shed;
   d.coatEffects = co.value("effects", std::vector<std::string>{});
+  // Glow + pulse (render-only; MaterialDef::coatGlow), contact rate and depth
+  // (MaterialDef::coatContact / coatDepth).
+  const int glow = co.value("glow", 0);
+  if (glow < 0 || glow > 255) {
+    errors += path + ": material \"" + d.name + "\": coat glow must be 0..255\n";
+  } else {
+    d.coatGlow = (uint32_t)glow;
+  }
+  const float pulse = co.value("pulse", 0.0f);
+  if (pulse < 0.0f || pulse * 100.0f > (float)kCoatPulseMask) {
+    errors += path + ": material \"" + d.name +
+              "\": coat pulse must be 0..40 Hz\n";
+  } else {
+    d.coatPulseHz = pulse;
+  }
+  const int contact = co.value("contact", -1);
+  if (contact < -1 || contact > (int)kStainChanceMax) {
+    errors += path + ": material \"" + d.name +
+              "\": coat contact must be 0..1000 per-mille (or -1)\n";
+  } else {
+    d.coatContact = contact;
+  }
+  const float depth = co.value("depth", 1.0f);
+  if (!(depth > 0.0f) || depth > 64.0f) {
+    errors += path + ": material \"" + d.name +
+              "\": coat depth must be > 0 and <= 64 world voxels\n";
+  } else {
+    d.coatDepth = depth;
+  }
 }
 
 // Parses "absorb": { capacity } into the top nibble of stainPack. Authored on
@@ -567,6 +618,8 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
     // Only clamp the TOP: the negative sentinel has to survive.
     d.rotRate = m.value("rotRate", -1.0f);
     if (d.rotRate > 1.0f) d.rotRate = 1.0f;
+    d.bareBlood = std::clamp(m.value("bareBlood", 0.0f), 0.0f, 1.0f);
+    if (!(d.bareBlood == d.bareBlood)) d.bareBlood = 0.0f;   // NaN
     // The tariff base. Derived from density when not authored: a voxel of
     // something heavy is worth more to conjure than a voxel of smoke, which is
     // the right default for the long tail and wrong for exactly the materials
@@ -1277,6 +1330,16 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     if ((g.cond & kCondDay) && (g.cond & kCondNight))
       errors += path + ": reaction self=\"" + self +
                 "\": when cannot be both day and night\n";
+    // ---- weather (TickParams::weatherRain; kCondRain / kCondRainDamp) ----
+    // "rain": the rule only happens to a rain-exposed cell while it rains (a
+    // douse). "rainDamped": the rule's odds fall with rain and wet ground on
+    // an exposed cell (an ignition). Both read the tick stream's integer, so
+    // the weather reaches the world hash the way the day phase does.
+    if (r.value("rain", false)) g.cond |= kCondRain;
+    if (r.value("rainDamped", false)) g.cond |= kCondRainDamp;
+    if ((g.cond & kCondRain) && (g.cond & kCondRainDamp))
+      errors += path + ": reaction self=\"" + self +
+                "\": rain and rainDamped are exclusive\n";
 
     uint32_t kind, dirMask = ParseDir(r, path, self, errors);
     if (r.value("decay", false)) {

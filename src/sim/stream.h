@@ -2,6 +2,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -246,9 +247,55 @@ class Stream {
   };
   const ExchangeStats& Exchange() const { return exchangeStats_; }
 
-  // Save every resident chunk (air included — no snapshot trust needed) into
-  // the store. Used by SaveWorld before serializing the store.
-  void FlushResident();
+  // ---- THE SAVE STORES THE DELTA (docs/PLAN_save_system.md S1) -----------
+  //
+  // Put the resident chunks a save needs into the store, and ONLY those: a
+  // chunk nothing has written since it entered the window is reproducible
+  // without the store — genChunk remakes it (a pure function of chunk and
+  // seed), or the store already holds the bytes it was decoded from (Get does
+  // not consume). That is the argument EvictSlots has always used for the
+  // leaving plane; the save path used to ignore it and write all 32,768
+  // slots, pristine ones included, where JITTER and mixed surface chunks
+  // RLE-EXPAND to 22-32 KiB each.
+  //
+  // "Written since it entered" is `modified_` PLUS the tail it cannot see
+  // yet. modified_ folds Snap(), which is kSnapshotLatency ticks old, so the
+  // save drains the in-flight readbacks and ORs in every delivered-but-
+  // unpublished snapshot's dirty flags too (a LOCAL mask: modified_ itself
+  // keeps its deterministic fold, because eviction decisions read it). With
+  // the tail folded the rule is exact for every writer that sets a dirty
+  // flag — CA, brush, cell ops, particles landing, gas re-entry — rather
+  // than "exact except the last ~4 ticks", which is the race eviction
+  // accepts for a trailing plane 6+ chunks away but a save next to the
+  // player cannot.
+  //
+  // THE DELTA IS TAKEN ONLY WHEN IT IS PROVABLE, and otherwise this is the
+  // old full flush with a printed reason. Provable means: since the last
+  // wholesale refill (Init / ReloadWindow / OnRegen) every tick the world
+  // encoded has a snapshot whose dirty flags reached the mask, with no hole
+  // in WorldSnapshot::submitSeq, and the world was not reset behind the
+  // stream's back (snapshot epoch). The game satisfies this by construction
+  // (Update folds every tick). A harness that drives SubmitTick without
+  // Update must call FoldSnapshot() once per tick, or its save falls back
+  // to the full flush — loudly, never silently lossy.
+  //
+  // `forceFull` is the old behaviour on demand (the save-load gate measures
+  // the before/after bytes with it).
+  struct FlushReport {
+    bool delta = false;       // false = the full flush ran
+    std::string why;          // why the delta was refused (empty when taken)
+    uint32_t stored = 0;      // resident chunks put into the store
+    uint32_t skipped = 0;     // resident chunks left to genChunk / the store
+    uint32_t tailOnly = 0;    // stored ONLY because of the unpublished tail
+    uint32_t tailTicks = 0;   // delivered-but-unpublished snapshots folded
+  };
+  FlushReport FlushResident(bool forceFull = false);
+
+  // The dirty-flag half of Update: OR Snap()'s dirty flags into modified_ and
+  // advance the save path's coverage proof. Update calls it every tick; a
+  // harness that ticks without Update calls it after each SubmitTick.
+  // Idempotent per published snapshot.
+  void FoldSnapshot();
 
   // Fill the whole window at `origin` from the store (misses -> procgen) and
   // reset residency bookkeeping. Used by LoadWorld and world regen.
@@ -270,6 +317,9 @@ class Stream {
     // world they belonged to is gone.
     awaitingRemote_.assign(kNumSlots, 0);
     genAfterMiss_.clear();
+    // The caller regenerates the whole window next, and the store is empty:
+    // every slot is procgen again, so the delta's coverage proof restarts.
+    ResetSaveTracking();
   }
 
   ChunkStore& Store() { return store_; }
@@ -280,6 +330,12 @@ class Stream {
   // Edits() above. Same standing: derived, disposable, never sim state.
   FarPlumes& Plumes() { return farPlumes_; }
   uint32_t ShiftCount() const { return shifts_; }
+  // The sticky per-slot modified set, READ-ONLY (kNumSlots entries, nonzero =
+  // "eviction will store this chunk rather than let procgen reproduce it").
+  // For the `gen-settle` gate, which attributes the chunks that come out
+  // modified with no player input (docs/PLAN_save_system.md S2). Nothing
+  // outside Stream may write it; every writer declares itself inside.
+  const std::vector<uint8_t>& ModifiedFlags() const { return modified_; }
   size_t PendingEvictions() const { return pending_.size(); }
 
   // ---- WHERE A WINDOW SHIFT'S TIME GOES ------------------------------------
@@ -377,8 +433,24 @@ class Stream {
   // Encode readback copies for the slots and queue them as pending evictions.
   // filter=true applies the occupancy/modified save-worthiness test
   // (streaming); filter=false saves everything including air (whole-window
-  // flush). Returns without blocking.
-  void EvictSlots(const std::vector<uint32_t>& slots, bool filter);
+  // flush). `keep`, when non-null, is a per-slot mask and a slot with a zero
+  // entry is skipped outright (FlushResident's delta). Returns without
+  // blocking.
+  void EvictSlots(const std::vector<uint32_t>& slots, bool filter,
+                  const std::vector<uint8_t>* keep = nullptr);
+  // ---- the delta save's coverage proof (see FlushResident) ---------------
+  // Restarted at every wholesale refill. trackSeq_ is the last submitSeq whose
+  // dirty flags are in modified_; the epoch is adopted lazily (a regen resets
+  // here and THEN invalidates the snapshot pipeline).
+  void ResetSaveTracking();
+  // Builds the save mask (modified_ | the unpublished tail). False, with
+  // `why` filled, when the mask cannot be proven complete.
+  bool BuildSaveMask(std::vector<uint8_t>& mask, FlushReport& rep);
+  bool trackOk_ = false;
+  bool trackEpochKnown_ = false;
+  uint32_t trackEpoch_ = 0;
+  uint32_t trackSeq_ = 0;
+  std::string trackWhy_;  // why trackOk_ went false, for the save's log line
   // The SHIFT-LOCAL eviction snapshot (the same-frame stall fix).
   //
   // EvictSlots inserts every slot of the leaving plane into pendingChunks_,

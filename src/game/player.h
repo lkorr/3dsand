@@ -1,5 +1,6 @@
 #pragma once
 #include <algorithm>
+#include <cmath>
 #include <functional>
 
 #include "math3d.h"
@@ -74,14 +75,22 @@ class Player {
     return b.yHi - b.yLo;
   }
 
-  // The first-person eye rides at the FIGURE's face row (kEyeOffset) or just
-  // under the top of the live collision box, whichever is lower. The box is
-  // what is guaranteed to be clear of terrain; the face row is not, and a
-  // camera inside a ceiling voxel is the one thing the head-clip must not
-  // buy. Crouching drops it with the box.
+  // Set the eye offset from the avatar's model data. Called once when the
+  // avatar spawns or changes def. eyeFromFeet is in world voxels from the
+  // creature's bottom; converted to an offset from pos (the AABB centre).
+  void SetModelEyeHeight(float eyeFromFeet) {
+    modelEyeOffset_ = eyeFromFeet - kHalfY;
+  }
+
+  // The first-person eye rides at the FIGURE's face row or just under the top
+  // of the live collision box, whichever is lower. The box is what is
+  // guaranteed to be clear of terrain; the face row is not, and a camera inside
+  // a ceiling voxel is the one thing the head-clip must not buy. Crouching
+  // drops it with the box.
   float EyeOffsetNow() const {
+    const float base = modelEyeOffset_ > 0 ? modelEyeOffset_ : kEyeOffset;
     const Box b = CurrentBox();
-    return std::min(kEyeOffset, b.yHi - kEyeBelowTopM / kVoxelMeters);
+    return std::min(base, b.yHi - kEyeBelowTopM / kVoxelMeters);
   }
   Vec3 EyePos() const { return pos + Vec3{0, EyeOffsetNow(), 0}; }
 
@@ -114,12 +123,112 @@ class Player {
   Vec3 RenderPos(float alpha) const {
     return prevPos + (pos - prevPos) * alpha;
   }
+  // How much of the step-smoothing offset is still standing `alpha` of the way
+  // through this tick.
+  //
+  // THE SMOOTHING WAS ITSELF A 30 Hz STAIRCASE until 2026-09-21, and it is
+  // worth being precise about why, because it is the same mistake as the one
+  // BankVerticalSnap fixes wearing different clothes. The offset is aged once
+  // per TICK, at the top of Update, so across the five frames of a tick it is
+  // a CONSTANT and then drops by the whole tick's worth at the boundary. With
+  // the default 0.1 s half-life that is 20.6% of the offset released in one
+  // frame — 0.21 voxels on a one-voxel step, measured — so a "smoothed" climb
+  // still arrived in thirty discrete lumps a second. Fading the offset by the
+  // same exponential WITHIN the tick makes the release continuous at any frame
+  // rate, and it costs no state: `viewDecayPerTick` is the exact factor the
+  // next Update will apply, so alpha=1 here lands on the value the next tick
+  // starts from. Render only, like everything else on this path.
+  float SmoothFade(float alpha) const {
+    return std::pow(viewDecayPerTick, alpha);
+  }
   Vec3 RenderEyePos(float alpha) const {
-    return RenderPos(alpha) + Vec3{0, EyeOffsetNow() + viewYOffset, 0};
+    return RenderPos(alpha) +
+           Vec3{0, EyeOffsetNow() + viewYOffset * SmoothFade(alpha), 0};
   }
   // Kill the interpolation for one frame: a teleport (world load, lab scene
   // placement, the autofly park pin) must not be smeared across a tick.
   void SnapRender() { prevPos = pos; }
+
+  // Where the BODY should be drawn this frame, relative to where the sim
+  // believes it is. The player's art (PlayerAvatar) is posed once per tick
+  // around `pos`, so without this it stair-steps at 30 Hz while the camera —
+  // which has ridden RenderEyePos since N2 — glides, and it takes a whole
+  // step-up in one frame while the eye eases up over the half-life. Both
+  // corrections are the camera's own, so body and eye move as one rigid thing.
+  //
+  // `bodyYOffset`, NOT `viewYOffset`: the two agree on every body snap and
+  // differ on the crouch, which changes where the EYE sits inside a body that
+  // has not moved at all. Feeding the crouch bank to the art would slide the
+  // whole figure down through the floor while the avatar's own stanceCrouch_
+  // was already bending its knees.
+  //
+  // RENDER ONLY: nothing derived from `alpha` or from these offsets may reach
+  // the sim, physics or a picking ray.
+  Vec3 RenderBodyOffset(float alpha) const {
+    return (RenderPos(alpha) - pos) +
+           Vec3{0, bodyYOffset * SmoothFade(alpha), 0};
+  }
+
+  // Bank a vertical SNAP of the body — a step-up climb, the walk-down ground
+  // snap, the unstick lift, a scripted mantle or ledge settle — out of the
+  // render path. `dy` is how far `pos.y` just jumped (signed, up positive).
+  //
+  // TWO corrections, and until 2026-09-21 only the first was applied:
+  //   * `viewYOffset -= dy` holds the eye where it was and lets it glide back
+  //     over viewSmoothHalflife, and
+  //   * `prevPos.y += dy` moves the render lerp's START to AFTER the snap,
+  //     because a snap is not travel along this tick's segment.
+  // Without the second, RenderPos re-adds the whole snap linearly across the
+  // tick while the offset subtracts it in one lump: the eye drops by the full
+  // step height at every tick boundary and ramps back up over the next 33 ms.
+  // Walking up a hill that is a 30 Hz sawtooth of one voxel — exactly the
+  // "it teleports up a voxel at a time" this whole system exists to remove.
+  void BankVerticalSnap(float dy) {
+    viewYOffset -= dy;
+    bodyYOffset -= dy;
+    prevPos.y += dy;
+  }
+
+  // The EYE moved inside a body that did not: a crouch changes EyeOffsetNow by
+  // the box-height change. Banked so the camera eases down and up instead of
+  // stepping — but deliberately NOT into bodyYOffset (see RenderBodyOffset).
+  void BankEyeShift(float dy) { viewYOffset -= dy; }
+
+  // Cap the smoothing at `maxOff` voxels: anything bigger than a step is not a
+  // step (a long fall the ground snap resolved, a spawn, a shove) and smearing
+  // it reads as lag, not smoothness. The excess has to come off BOTH halves of
+  // the body bank or the render lerp quietly re-smears what the clamp just
+  // refused, so what is taken out of bodyYOffset is taken out of prevPos too.
+  void ClampViewSmooth(float maxOff) {
+    viewYOffset = std::clamp(viewYOffset, -maxOff, maxOff);
+    const float clamped = std::clamp(bodyYOffset, -maxOff, maxOff);
+    prevPos.y += bodyYOffset - clamped;
+    bodyYOffset = clamped;
+  }
+
+  // Decay the render-only step-smoothing offsets toward zero, frame-rate
+  // independently: half the remaining distance every viewSmoothHalflife
+  // seconds at any tick rate. Called at the top of Update, and ALSO while the
+  // ragdoll owns the body (session.cpp) — Update does not run then, and an
+  // offset left frozen would hold the camera and the body off the ground for
+  // as long as the ragdoll lasts. A half-life of 0 disables smoothing.
+  void DecayViewSmooth(float dt, float halflife) {
+    if (halflife > 1e-4f) {
+      const float k = std::pow(0.5f, dt / halflife);
+      viewYOffset *= k;
+      bodyYOffset *= k;
+      // Published for SmoothFade: the frames of the tick about to run spread
+      // THIS factor out instead of waiting for the boundary to apply it.
+      viewDecayPerTick = k;
+    } else {
+      viewYOffset = bodyYOffset = 0.0f;
+      viewDecayPerTick = 0.0f;
+    }
+  }
+
+  // Drop the smoothing entirely: a teleport, a world load, fly mode. Pairs
+  // with SnapRender at every site that moves the body on purpose.
+  void ResetViewSmooth() { viewYOffset = bodyYOffset = 0.0f; }
 
   Vec3 pos{128, 100, 140};  // centre of the nominal figure box (see Box)
   // `pos` at the START of the tick Update() is running, for RenderPos above.
@@ -230,6 +339,20 @@ class Player {
   // spawns never smear the camera. Zeroed in fly mode and on teleports.
   // Render-only — see ViewEyePos().
   float viewYOffset = 0.0f;
+  // The same accumulator restricted to snaps of the BODY, i.e. everything
+  // viewYOffset carries except the crouch's eye-height change. This is what
+  // the player's art is drawn by (RenderBodyOffset), so that the figure and
+  // the camera ride a step together instead of the art taking the whole voxel
+  // in one frame while the eye eases up over the half-life.
+  float bodyYOffset = 0.0f;
+  // The decay factor the LAST DecayViewSmooth applied, i.e. the one the
+  // next tick will apply again. SmoothFade raises it to `alpha` so the
+  // offset eases out across the tick's frames instead of stepping down by
+  // a whole tick's worth at the boundary. Render-only; 1.0 means "nothing
+  // has been aged yet", which is the correct no-op.
+  float viewDecayPerTick = 1.0f;
+
+  float modelEyeOffset_ = 0;
 
   // ---- avatar damage coupling ----
   // Multipliers the PlayerAvatar's dismemberment state feeds in (see
@@ -242,6 +365,17 @@ class Player {
   // They multiply the tuned speeds, so "intact" is exactly the old behaviour.
   float speedScale = 1.0f;
   float jumpScale = 1.0f;
+  // Ground-control multiplier on groundAccel: 1 = normal footing, lower =
+  // slippery (oily feet -- session.cpp derives it from the feet's coat). Only
+  // the ON-GROUND rate: air and water control do not care what is on a sole.
+  float groundGrip = 1.0f;
+  // OUTPUT: the horizontal velocity (vox/s) the feet are NOT walking -- the
+  // coast on slippery footing (groundGrip < 1): nothing held, or held in a
+  // direction the body is not yet moving. Zero on normal ground and in the
+  // air. The avatar's gait animates `vel - slideVel` and carries the planted
+  // feet along by slideVel, so a slide is a glide, not a walk. Render/anim
+  // only: nothing in the sim reads it.
+  Vec3 slideVel{0, 0, 0};
   bool canJump = true;
 
   // Largest single-frame velocity LOSS to a collision sweep since the avatar

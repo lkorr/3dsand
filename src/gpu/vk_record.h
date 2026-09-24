@@ -134,6 +134,17 @@ struct RecordCtx {
   // (world.h kReposeSnap*). False for a materials.json with no repose line,
   // and then the snapshot prepass is not recorded at all.
   bool reposeActive = false;
+  // ---- the clouds (cloud.wgsl, DESIGN.md 9.w) — per-FRAME, ShadowCache table
+  // bit 0 kCloudRecOn: the weather has something in the sky and weather.clouds
+  //   is on, so the weather/shadow/env/march/resolve rows record.
+  // bit 1 kCloudRecBake: the noise volume has not been baked since the last
+  //   pipeline build; the bake row records once.
+  // bit 2 kCloudRecShadowCache: the voxel shadow cache is on (its three rows
+  //   used to be C_ALWAYS inside EncodeShadowResolve's early-out; they now
+  //   share the table with the clouds, which run without it).
+  uint32_t cloudFlags = 0;
+  // Workgroups (8x8) over the low-res cloud target, from the frame's size.
+  uint32_t cloudGx = 0, cloudGy = 0;
 };
 
 // The live GPU objects a table row resolves against. The recorder is handed one
@@ -356,6 +367,11 @@ class Recorder {
   // hand-placed image barrier either.
   void BeginRendering(const RenderAttachments& att);
   void EndRendering();
+  // rhi::RenderPass::SplitAfterFragmentWrite: end the open scope, declare
+  // `written` as written by the fragment stage of that scope, emit its
+  // fragment-write -> vertex/fragment read+write barrier, and reopen on the
+  // attachments of the last BeginRendering with LOAD. No-op with no scope open.
+  void SplitRenderingAfterFragmentWrite(Buffer* written);
   // Draws record inside the open rendering scope. No barrier can be (or needs
   // to be) emitted here; routing them through the recorder keeps the "every
   // command is reachable only through the recorder" property plus stats, and
@@ -435,6 +451,7 @@ class Recorder {
   std::vector<std::pair<Image*, BufState>> imgState_;
   std::vector<VkImageMemoryBarrier2> pendingImg_;
   bool renderOpen_ = false;
+  RenderAttachments lastAtt_{};  // for SplitRenderingAfterFragmentWrite
   std::vector<VkBufferMemoryBarrier2> pending_;
   // Host-visible buffers written during this recording, for the Finish()
   // barrier. Kept as a small vector rather than a set: it is never more than a

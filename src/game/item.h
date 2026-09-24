@@ -78,6 +78,11 @@ enum class ItemKind : uint8_t {
   ArmorHands,
   ArmorBelt,
   Trinket,
+  // ---- carried, and used from the hotbar with the hands up ----
+  // A vessel: scoops loose matter out of the grid and pours it back out
+  // (game/container.h). WHAT it holds is data (`container.holds`), so a flask
+  // and a pouch are two rows of one kind, not two systems.
+  Container,
 };
 
 // Is this kind WORN (a set of shells over the body) rather than merely carried?
@@ -100,13 +105,14 @@ inline const char* ItemKindName(ItemKind k) {
     case ItemKind::ArmorHands: return "armor_hands";
     case ItemKind::ArmorBelt: return "armor_belt";
     case ItemKind::Trinket: return "trinket";
+    case ItemKind::Container: return "container";
     case ItemKind::None: break;
   }
   return "none";
 }
 
 inline ItemKind ItemKindFromName(const std::string& s) {
-  for (int i = 1; i <= (int)ItemKind::Trinket; i++) {
+  for (int i = 1; i <= (int)ItemKind::Container; i++) {
     const ItemKind k = (ItemKind)i;
     if (s == ItemKindName(k)) return k;
   }
@@ -406,6 +412,11 @@ struct ItemDef {
   // since the blade geometry is supposed to be what decides the wound.
   float carveBonus = 0.0f;
 
+  // Which player strike compass this weapon selects: "dagger" uses
+  // playerDagger, anything else (or empty) uses player. Authored in
+  // items.json; absent defaults to the armed compass.
+  std::string weaponClass;
+
   // ---- HEFT: how much weapon is behind the edge ---------------------------
   //
   // DERIVED FROM THE ART, because the art is right there. `heftVolume` is the
@@ -441,7 +452,43 @@ struct ItemDef {
   // METRES-derived: 0.9 m from the shoulder. A bare 9 cells halved the
   // player's effective reach the moment kVoxelMeters did.
   float reach = MetresToCells(0.9f);
+
+  // ---- ItemKind::Container only (game/container.h) -------------------------
+  // items.json's `container` block. Amounts are in EIGHTHS OF A CELL, the
+  // grid's own liquid unit (the state nibble's fullness), so scooping a
+  // half-drained puddle cell takes exactly what was there. A powder cell is
+  // always a whole one: 8.
+  struct ContainerSpec {
+    // Bit per material CLASS (1u << CLASS_LIQUID, 1u << CLASS_POWDER): what
+    // the vessel can take up. Authored by name ("liquid", "powder").
+    uint32_t holds = 0;
+    int capacity = 0;      // eighths; 128 cells authored = 1024
+    int scoopPerTick = 4;  // cells lifted per tick while the button is held
+    int pourPerTick = 2;   // cells thrown per tick while the button is held
+    float pourRange = MetresToCells(2.0f);  // farthest AIMED target, voxels
+    float pourSpeed = MetresToCells(1.5f);  // launch speed, world voxels/s
+    float aimDist = MetresToCells(1.0f);    // the pour point, along the look
+                                            // (ContainerPourPoint)
+    int applyCells = 4;    // cells/s of the portrait pour brush at its default
+                           // size; scales with area (PourBrushCellsPerSec)
+    // THROWING (game/container.h ContainerThrowSpeed). Q held charges, release
+    // throws: the launch speed ramps from throwMinSpeed to throwSpeed over
+    // throwChargeSec. throwSpeed 0 = this vessel is not thrown.
+    float throwSpeed = 0.0f;     // world voxels/s at full charge
+    float throwMinSpeed = 0.0f;  // world voxels/s on a tap
+    float throwChargeSec = 1.0f;
+    // BREAKING (ContainerShouldBreak): a body of this vessel that meets
+    // anything at this closing speed, or whose velocity jumps by it in one
+    // tick, shatters and spills everything it held. 0 = never breaks.
+    float breakSpeed = 0.0f;     // world voxels/s
+  } container;
+  bool IsContainer() const {
+    return kind == ItemKind::Container && container.capacity > 0;
+  }
 };
+
+// Cells <-> the eighths a ContainerSpec counts in.
+constexpr int kContainerUnitsPerCell = 8;
 
 // The item library. Loaded once; indices into it are what a slot stores, the
 // same way a glyph slot stores an index into GlyphLibrary::glyphs.
@@ -480,7 +527,17 @@ struct ItemStack {
   // slot when it does not — the same rule every game with enchantments uses,
   // arrived at for the same reason.
   uint32_t dye = 0;
+  // WHAT IS IN IT, for a vessel (ItemKind::Container, game/container.h).
+  // Material id + eighths of a cell. Part of the merge key for the dye's
+  // reason: a flask of blood must not fold into a stack of empty ones and
+  // hand every one of them the blood. 0/0 on everything that is not a vessel.
+  uint16_t fillMat = 0;
+  uint16_t fillAmt = 0;
   bool Empty() const { return def < 0 || count <= 0; }
+  bool Filled() const { return fillMat != 0 && fillAmt != 0; }
+  bool SameKind(int d, uint32_t dy, uint16_t fm, uint16_t fa) const {
+    return def == d && dye == dy && fillMat == fm && fillAmt == fa;
+  }
 };
 
 struct Inventory {
@@ -508,16 +565,18 @@ struct Inventory {
   // The dye is part of the merge key for the reason ItemStack::dye states: a
   // stack is one colour, and folding a red tunic into a stack of blue ones
   // would repaint them.
-  int Add(int defIndex, int count = 1, uint32_t dye = 0) {
+  int Add(int defIndex, int count = 1, uint32_t dye = 0, uint16_t fillMat = 0,
+          uint16_t fillAmt = 0) {
     if (defIndex < 0 || count <= 0) return -1;
     for (int i = 0; i < kItemSlots; i++)
-      if (!slots[i].Empty() && slots[i].def == defIndex && slots[i].dye == dye) {
+      if (!slots[i].Empty() &&
+          slots[i].SameKind(defIndex, dye, fillMat, fillAmt)) {
         slots[i].count += count;
         return i;
       }
     for (int i = 0; i < kItemSlots; i++)
       if (slots[i].Empty()) {
-        slots[i] = {defIndex, count, dye};
+        slots[i] = {defIndex, count, dye, fillMat, fillAmt};
         return i;
       }
     return -1;

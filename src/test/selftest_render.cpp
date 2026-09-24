@@ -23,6 +23,7 @@
 #include "sim/microvox.h"
 #include "sim/plants.h"
 #include "sim/trample.h"
+#include "sim/weather.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -3069,6 +3070,272 @@ Status GateBodyShade(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// underwater-body: A BODY UNDER WATER IS SEEN THROUGH THE WATER.
+//
+// WHAT IS UNDER TEST. Bodies are rasterized after the raymarch and composite by
+// depth. The raymarch used to write its depth AT a liquid's surface, so every
+// body fragment below the waterline failed the depth test: a wading mob was cut
+// off at the surface as if the lake were concrete (owner report 2026-09-23:
+// "completely obfuscated"). Now the raymarch writes the depth BEHIND the water
+// and records a per-pixel water veil (common.wgsl THE WATER VEIL) that
+// debris.wgsl / microbody.wgsl shade the fragment through.
+//
+// THE FIXTURE. A sealed stone basin, a SAND pillar standing on its floor that
+// rises three voxels out of six of water, and a camera above the surface
+// looking down at it. Sand rather than stone so the pillar contrasts with the
+// basin it stands in: the mask below is "pixels that change when the body is
+// drawn", and a stone pillar on a stone floor under the same water changes
+// fewer of them for reasons that have nothing to do with the veil.
+//
+// FOUR ARMS, TWO WORLD STATES. The basin is photographed DRY (with and without
+// the body), then filled and photographed WET (with and without). Each body
+// mask is a same-state differential -- a pixel is body iff drawing the body
+// changed it -- so the two claims compare like with like:
+//   VISIBLE  the wet mask holds most of the dry mask's pixels. With the depth
+//            at the surface only the three dry voxels of the pillar survive.
+//   TINTED   the pillar's pixels shift toward blue when the water arrives:
+//            water absorbs red about nine times faster than blue per metre
+//            (TUNE_WATER_ABSORB), so a body drawn through it untinted -- the
+//            veil not applied -- keeps its dry colour.
+Status GateUnderwaterBody(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // Beside body-shade's site (inside the window wherever streaming has left
+  // it) but NOT on it: body-shade runs first in kOrder and leaves a 45x45 roof
+  // at (300, ground+21, 300) +-22, which shadowed this basin at suite scope
+  // and nowhere else (0.79 visible vs 0.99 at --gate scope).
+  const int gx = 300, gz = 345;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  const int kHalf = 10;             // 21x21 basin
+  const int floorY = ground + 8;    // two-thick floor at floorY, floorY + 1
+  const int waterTop = floorY + 7;  // six cells of water: floorY+2..floorY+7
+  const int wallTop = floorY + 9;
+  const IVec3 pchunk{gx / 16, floorY / 16, gz / 16};
+
+  auto put = [&](std::vector<CellOp>& ops, int x, int y, int z, uint32_t word) {
+    const IVec3 cc{x, y, z};
+    if (world.CellInWindow(cc)) ops.push_back({World::SlotCellIndex(cc), word});
+  };
+  std::vector<CellOp> basin, water;
+  // The cleared box is two cells wider than the basin and runs 20 above the
+  // rim, so nothing a previous gate or worldgen left there shades the water.
+  for (int dx = -kHalf - 2; dx <= kHalf + 2; dx++)
+    for (int dz = -kHalf - 2; dz <= kHalf + 2; dz++) {
+      const bool out = dx < -kHalf || dx > kHalf || dz < -kHalf || dz > kHalf;
+      const bool rim = !out && (dx == -kHalf || dx == kHalf || dz == -kHalf ||
+                                dz == kHalf);
+      for (int y = floorY; y <= wallTop + 20; y++) {
+        if (out && y <= floorY + 1) continue;   // keep the ground around it
+        // Air everywhere else in the box: clears whatever worldgen put there.
+        uint32_t w = PackVoxNew(kMatAir, 0u);
+        if (!out && (y <= floorY + 1 || (rim && y <= wallTop)))
+          w = PackVoxNew(kMatStone, 0u);
+        put(basin, gx + dx, y, gz + dz, w);
+        if (!out && !rim && y >= floorY + 2 && y <= waterTop)
+          put(water, gx + dx, y, gz + dz, PackVoxNew(kMatWater, 8u));
+      }
+    }
+  if (basin.empty() || water.empty()) {
+    detail = "fixture site is outside the residency window";
+    return Status::Fail;
+  }
+  uint32_t tick = 91000;
+  auto settle = [&](const std::vector<CellOp>& ops, int n) {
+    SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, ops, false,
+               pchunk, false, false);
+    for (int i = 0; i < n; i++)
+      SubmitTick(ctx, world, sim, ++tick, kDefaultSeed, {}, {}, {}, false,
+                 pchunk, false, false);
+    ctx.WaitIdle();
+  };
+  settle(basin, 6);
+
+  const Tuning base = CurrentTuning();
+  uint32_t noonTick = 0;
+  {
+    float bestUp = -2.0f;
+    for (uint32_t t = 0; t < 200000u; t += 64u) {
+      const float up = ComputeSky(base, (double)t).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = t; }
+    }
+  }
+
+  // ---- the body: a 5 x 9 x 5 sand pillar on the basin floor ----
+  const int kBX = 5, kBY = 9;
+  std::vector<BodyVoxInst> inst;
+  for (int x = 0; x < kBX; x++)
+    for (int y = 0; y < kBY; y++)
+      for (int z = 0; z < kBX; z++)
+        inst.push_back({(float)x, (float)y, (float)z, kMatSand});
+  std::vector<BodyXformGpu> xf;
+  {
+    BodyXformGpu m{};
+    m.pos[0] = (float)gx - (float)kBX * 0.5f;
+    m.pos[1] = (float)(floorY + 2);
+    m.pos[2] = (float)gz - (float)kBX * 0.5f;
+    m.quat[3] = 1.0f;
+    xf.push_back(m);
+  }
+  ctx.queue.WriteBuffer(world.bodyInstances, 0, inst.data(),
+                        inst.size() * sizeof(BodyVoxInst));
+  ctx.queue.WriteBuffer(world.bodyXforms, 0, xf.data(),
+                        xf.size() * sizeof(BodyXformGpu));
+
+  // Above the surface, down at the pillar across the water, so most of what
+  // the frame holds of it is under the surface.
+  const Vec3 eye{(float)gx - 9.0f, (float)(waterTop + 9), (float)gz - 9.0f};
+  const Vec3 at{(float)gx, (float)(floorY + 5), (float)gz};
+  Camera cam;
+  {
+    const float dx = at.x - eye.x, dy = at.y - eye.y, dz = at.z - eye.z;
+    cam.yaw = std::atan2(dz, dx);
+    cam.pitch = std::atan2(dy, std::sqrt(dx * dx + dz * dz));
+  }
+
+  // ---- the MICRO body: one real mob limb brick, the path every mob draws
+  // through (microbody.wgsl), with its own veil wiring. The first limb of the
+  // first def that has one, posed by the pillar's transform (slot 0) so its
+  // brick sits on the basin floor -- and, at a limb's size, entirely under
+  // six cells of water, so the old contract drew none of it.
+  std::vector<MicroBodyInstGpu> micro;
+  for (const MobDef& md : c.mobs.Defs()) {
+    for (const auto& l : md.limbs)
+      if (l.microModel >= 0) {
+        MicroBodyInstGpu mi{};
+        mi.slot = 0;
+        mi.model = (uint32_t)l.microModel;
+        micro.push_back(mi);
+        break;
+      }
+    if (!micro.empty()) break;
+  }
+
+  auto render = [&](uint32_t bodyInstances, bool withMicro,
+                    std::vector<uint8_t>& out) -> bool {
+    rhi::Buffer shot =
+        CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                     rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                     "underwaterBodyShot");
+    const uint32_t microCount =
+        withMicro ? sim.UploadMicroBodyInsts(ctx.queue, micro) : 0u;
+    // Four frames, grab the last: body-shade's warm-shadow-cache reason.
+    for (uint32_t f = 0; f < 4; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam, (float)W / H, true, 0.0f,
+                        kFarFogDensity, (float)H, noonTick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(
+          enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      sim.DrawBodies(rp, bodyInstances);
+      sim.DrawMicroBodies(rp, microCount);
+      rp.End();
+      if (f == 3) {
+        rhi::TexelCopyTexture srcT{};
+        srcT.texture = c.offscreen;
+        rhi::TexelCopyBuffer dstB{};
+        dstB.buffer = shot;
+        dstB.bytesPerRow = W * 4;
+        dstB.rowsPerImage = H;
+        enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    out.assign((size_t)W * H * 4, 0);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, out.data(), out.size());
+  };
+
+  const uint32_t n = (uint32_t)inst.size();
+  const bool haveMicro = !micro.empty();
+  // EVERY MASK GETS A REFERENCE RENDERED IMMEDIATELY BEFORE IT. The shadow
+  // resolve blends irradiance into the GI grid every frame, so terrain keeps
+  // drifting for a few frames after a fixture edit; a reference two arms back
+  // counted that drift as body (a limb measured at 3x its own footprint).
+  std::vector<uint8_t> dryNo, dryBody, dryNoM, dryMicro;
+  std::vector<uint8_t> wetNo, wetBody, wetNoM, wetMicro;
+  if (!render(0, false, dryNo) || !render(0, false, dryNo) ||
+      !render(n, false, dryBody) ||
+      (haveMicro && (!render(0, false, dryNoM) || !render(0, true, dryMicro)))) {
+    detail = "render/readback failed (dry)";
+    return Status::Fail;
+  }
+  settle(water, 20);
+  if (!render(0, false, wetNo) || !render(0, false, wetNo) ||
+      !render(n, false, wetBody) ||
+      (haveMicro && (!render(0, false, wetNoM) || !render(0, true, wetMicro)))) {
+    detail = "render/readback failed (wet)";
+    return Status::Fail;
+  }
+  if (haveMicro) WriteBmpFile("underwater_body_micro.bmp", wetMicro, W, H);
+  WriteBmpFile("underwater_body_dry.bmp", dryBody, W, H);
+  WriteBmpFile("underwater_body_wet.bmp", wetBody, W, H);
+
+  // A pixel is body iff drawing the body moved any channel by more than 10.
+  // Returns the count, and the mean (blue - red) over those pixels.
+  auto mask = [&](const std::vector<uint8_t>& no, const std::vector<uint8_t>& yes,
+                  double& meanBR) {
+    size_t cnt = 0;
+    double br = 0;
+    for (size_t p = 0; p < (size_t)W * H; p++) {
+      const size_t i = p * 4;
+      const int d = std::max({std::abs((int)yes[i] - (int)no[i]),
+                              std::abs((int)yes[i + 1] - (int)no[i + 1]),
+                              std::abs((int)yes[i + 2] - (int)no[i + 2])});
+      if (d <= 10) continue;
+      cnt++;
+      br += (double)yes[i + 2] - (double)yes[i];
+    }
+    meanBR = cnt ? br / (double)cnt : 0.0;
+    return cnt;
+  };
+  double dryBR = 0, wetBR = 0;
+  const size_t nDry = mask(dryNo, dryBody, dryBR);
+  const size_t nWet = mask(wetNo, wetBody, wetBR);
+  if (nDry < 500) {
+    detail = Format("only %zu body px in the DRY frame -- the pillar is not in "
+                    "shot (fixture, not the veil)", nDry);
+    return Status::Fail;
+  }
+  const double visible = (double)nWet / (double)nDry;
+  const double tint = wetBR - dryBR;
+  // Thresholds in baseline.json (CLAUDE.md: no thresholds in source).
+  const double minVisible = BaselineNumber("underwaterBody.minVisible", 0.80);
+  const double minTint = BaselineNumber("underwaterBody.minBlueShift", 6.0);
+  bool ok = visible >= minVisible && tint >= minTint;
+  detail = Format(
+      "CUBE pillar px dry %zu / wet %zu = %.2f visible (must be >= %.2f; depth "
+      "at the surface leaves only the 3 dry voxels); blue-red dry %.1f -> wet "
+      "%.1f, shift %+.1f (must be >= %.1f; an untinted body keeps its dry "
+      "colour). ",
+      nDry, nWet, visible, minVisible, dryBR, wetBR, tint, minTint);
+  // The micro limb is wholly submerged, so the same two claims are sharper:
+  // the old contract drew NONE of it.
+  if (haveMicro) {
+    double dryMBR = 0, wetMBR = 0;
+    const size_t nDryM = mask(dryNoM, dryMicro, dryMBR);
+    const size_t nWetM = mask(wetNoM, wetMicro, wetMBR);
+    const double visM = nDryM ? (double)nWetM / (double)nDryM : 0.0;
+    const bool okM = nDryM >= 100 && visM >= minVisible &&
+                     wetMBR - dryMBR >= minTint;
+    ok = ok && okM;
+    detail += Format("MICRO limb (model %u) px dry %zu / wet %zu = %.2f "
+                     "visible, blue-red shift %+.1f%s. ",
+                     micro[0].model, nDryM, nWetM, visM, wetMBR - dryMBR,
+                     nDryM < 100 ? " -- NOT IN SHOT (fixture)" : "");
+  } else {
+    detail += "MICRO: no def carries a micro limb at this voxel size, "
+              "skipped. ";
+  }
+  detail += "Frames: underwater_body_{dry,wet,micro}.bmp";
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 
@@ -4027,6 +4294,274 @@ Status GateTaa(Ctx& c, std::string& detail) {
   return alignOk ? Status::Pass : Status::Fail;
 }
 
+// ---- clouds (cloud.wgsl, src/sim/weather.h) --------------------------------
+// What a screenshot cannot establish about the clouds, in one launch:
+//
+//   A. THE WEATHER IS DATA AND IS CONTINUOUS. The preset library loads and is
+//      sorted by moisture; resolving the automatic cycle twice at one instant
+//      gives one answer (it is a pure function of the clock); and walking two
+//      hours of sim time a second at a time never moves coverage or raininess
+//      by more than a small step — i.e. the sky drifts, it never cuts.
+//   B. THE CLOUDS REACH THE PICTURE. Three arms of one sky view (clear,
+//      overcast, and overcast with weather.clouds OFF) and one ground view
+//      (clear vs overcast): an overcast sky is grey where a clear one is blue,
+//      the ground under a closed deck loses its direct light, and the master
+//      switch restores the cloudless sky exactly — the "off means no row"
+//      claim, measured on pixels rather than asserted.
+//
+// The frames are written to build/clouds_*.bmp for eyes, like the denoise and
+// taa gates, so a tuning.json edit plus one --gate clouds is the whole look
+// loop. Every threshold is RELATIVE to another arm of the same run.
+Status GateClouds(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t W = c.width, H = c.height;
+  const float aspect = (float)W / (float)H;
+  const Tuning base = CurrentTuning();
+  struct Restore {
+    const Tuning& t;
+    ~Restore() {
+      SetCurrentTuning(t);
+      weather::SetOverride("");
+      weather::Snap();
+    }
+  } restore{base};
+
+  // ---- A. the weather, CPU only ----------------------------------------
+  const std::vector<weather::Preset>& ps = weather::Presets().Presets();
+  if (ps.size() < 2) {
+    detail = "fewer than two weather presets loaded (assets/weather)";
+    return Status::Fail;
+  }
+  for (size_t i = 1; i < ps.size(); i++) {
+    if (ps[i].moisture < ps[i - 1].moisture) {
+      detail = "preset library not sorted by moisture";
+      return Status::Fail;
+    }
+  }
+  const weather::Preset* overcastP = weather::Presets().Find("overcast");
+  const weather::Preset* clearP = weather::Presets().Find("clear");
+  if (!overcastP || !clearP) {
+    detail = "assets/weather must ship `clear` and `overcast` (this gate's two arms)";
+    return Status::Fail;
+  }
+  float maxCov = 0.0f, maxRain = 0.0f;
+  size_t distinct = 0;
+  {
+    Tuning t = base;
+    t.weather.autoCycle = true;
+    t.weather.cycleSpeed = 1.0f;
+    t.weather.clouds = true;
+    SetCurrentTuning(t);
+    weather::SetOverride("");
+    std::string lastFrom;
+    weather::Snap();
+    weather::State prev = weather::Resolve(t, kDefaultSeed, 0.0, 0.0f, 0.0f, 0.0f);
+    for (int s = 1; s <= 7200; s++) {
+      weather::Snap();
+      const weather::State a = weather::Resolve(t, kDefaultSeed, (double)s, 0.0f, 0.0f, 0.0f);
+      weather::Snap();
+      const weather::State b = weather::Resolve(t, kDefaultSeed, (double)s, 0.0f, 0.0f, 0.0f);
+      if (a.mix.coverage != b.mix.coverage || a.mix.precip != b.mix.precip) {
+        detail = "weather::Resolve is not a pure function of the clock";
+        return Status::Fail;
+      }
+      maxCov = std::max(maxCov, std::fabs(a.mix.coverage - prev.mix.coverage));
+      maxRain = std::max(maxRain, std::fabs(a.mix.precip - prev.mix.precip));
+      if (a.fromName != lastFrom) { distinct++; lastFrom = a.fromName; }
+      prev = a;
+    }
+  }
+  // A preset->preset blend spans half of a ladder run, and a run is at least a
+  // share of one epoch — the largest honest one-second step is a few percent.
+  const float kStepMax = 0.08f;
+  if (maxCov > kStepMax || maxRain > kStepMax) {
+    char b[160];
+    std::snprintf(b, sizeof(b), "the automatic sky CUTS: max per-second step coverage %.3f "
+                  "rain %.3f (limit %.2f)", maxCov, maxRain, kStepMax);
+    detail = b;
+    return Status::Fail;
+  }
+
+  // ---- B. the picture ----------------------------------------------------
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  const int gx = 108, gz = 108;
+  const int ground = World::TerrainHeight(gx, gz, kDefaultSeed);
+  DrainFullRefill(ctx, world, sim, {gx >> 4, ground >> 4, gz >> 4});
+  // Late morning: a high sun, so the ground view is dominated by direct light
+  // and a closed deck has something to take away.
+  const uint32_t tick = (uint32_t)(TicksPerDayFromTuning(base) * 0.42);
+
+  uint32_t armTick = tick;
+  auto renderArm = [&](const char* preset, bool cloudsOn, const Vec3& eye, float yaw,
+                       float pitch, std::vector<uint8_t>& img, std::vector<float>& dep,
+                       double& ms) -> bool {
+    Tuning t = base;
+    t.weather.clouds = cloudsOn;
+    t.weather.autoCycle = false;
+    SetCurrentTuning(t);
+    weather::SetOverride(preset);
+    weather::Snap();
+    Camera cam;
+    cam.yaw = yaw;
+    cam.pitch = pitch;
+    using U = rhi::BufferUsage;
+    rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4, U::MapRead | U::CopyDst,
+                                    "cloudGateShot");
+    rhi::Buffer dshot = CreateBuffer(ctx.device, (uint64_t)W * H * 4, U::MapRead | U::CopyDst,
+                                     "cloudGateDepth");
+    auto copyOut = [&](const rhi::CommandEncoder& enc, const rhi::Texture& tex,
+                       const rhi::Buffer& into) {
+      rhi::TexelCopyTexture srcT{};
+      srcT.texture = tex;
+      rhi::TexelCopyBuffer dstB{};
+      dstB.buffer = into;
+      dstB.bytesPerRow = W * 4;
+      dstB.rowsPerImage = H;
+      enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+    };
+    // 16 frames: the cloud history's running mean and the shadow cache's
+    // 16-frame penumbra window both want to be full before the grab.
+    const uint32_t frames = 16;
+    ctx.WaitIdle();
+    const double t0 = NowSeconds();
+    for (uint32_t f = 0; f < frames; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam, aspect, true, 0.0f, kFarFogDensity,
+                        (float)H, armTick);
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeShadowResolve(enc);
+      rhi::RenderPass rp = sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(rp);
+      rp.End();
+      if (f + 1 == frames) {
+        copyOut(enc, c.offscreen, shot);
+        copyOut(enc, sim.DepthTexture(), dshot);
+      }
+      ctx.queue.Submit(enc.Finish());
+    }
+    ctx.WaitIdle();
+    ms = (NowSeconds() - t0) * 1000.0 / (double)frames;
+    img.assign((size_t)W * H * 4, 0);
+    dep.assign((size_t)W * H, 0.0f);
+    return rhi::ReadBufferBlocking(ctx.device, shot, 0, img.data(), img.size()) &&
+           rhi::ReadBufferBlocking(ctx.device, dshot, 0, dep.data(), dep.size() * 4);
+  };
+
+  // Mean colour and mean saturation of the SKY pixels (depth 0) or of the
+  // GROUND pixels (depth > 0).
+  struct Stat { double r = 0, g = 0, b = 0, sat = 0, lum = 0; size_t n = 0; };
+  auto stat = [&](const std::vector<uint8_t>& img, const std::vector<float>& dep,
+                  bool sky) {
+    Stat s;
+    for (size_t p = 0; p < (size_t)W * H; p++) {
+      if ((dep[p] <= 1e-7f) != sky) continue;
+      const double r = img[p * 4], g = img[p * 4 + 1], b = img[p * 4 + 2];
+      const double mx = std::max({r, g, b}), mn = std::min({r, g, b});
+      s.r += r; s.g += g; s.b += b;
+      s.sat += mx > 0.0 ? (mx - mn) / mx : 0.0;
+      s.lum += 0.299 * r + 0.587 * g + 0.114 * b;
+      s.n++;
+    }
+    if (s.n) { s.r /= s.n; s.g /= s.n; s.b /= s.n; s.sat /= s.n; s.lum /= s.n; }
+    return s;
+  };
+
+  const Vec3 skyEye{(float)gx, (float)(ground + 40), (float)gz};
+  const Vec3 gndEye{(float)gx, (float)(ground + 120), (float)gz};
+  std::vector<uint8_t> imClear, imOver, imOff, imGClear, imGOver;
+  std::vector<float> dClear, dOver, dOff, dGClear, dGOver;
+  double msClear = 0, msOver = 0, msOff = 0, msG0 = 0, msG1 = 0;
+  const float skyPitch = 0.55f, gndPitch = -0.5f;
+  if (!renderArm("clear", true, skyEye, 0.785f, skyPitch, imClear, dClear, msClear) ||
+      !renderArm("overcast", true, skyEye, 0.785f, skyPitch, imOver, dOver, msOver) ||
+      !renderArm("overcast", false, skyEye, 0.785f, skyPitch, imOff, dOff, msOff) ||
+      !renderArm("clear", true, gndEye, 0.785f, gndPitch, imGClear, dGClear, msG0) ||
+      !renderArm("overcast", true, gndEye, 0.785f, gndPitch, imGOver, dGOver, msG1)) {
+    detail = "readback failed";
+    return Status::Fail;
+  }
+  WriteBmpFile("build/clouds_clear.bmp", imClear, W, H);
+  WriteBmpFile("build/clouds_overcast.bmp", imOver, W, H);
+  WriteBmpFile("build/clouds_off.bmp", imOff, W, H);
+  WriteBmpFile("build/clouds_ground_clear.bmp", imGClear, W, H);
+  WriteBmpFile("build/clouds_ground_overcast.bmp", imGOver, W, H);
+  // ---- the LOOK GALLERY (SANDVOX_CLOUD_GALLERY=1): not an assertion ----
+  // Every preset from three cameras (up into the deck, along the horizon,
+  // down at the ground), plus the rain / storm presets at a low sun, written
+  // to build/clouds_gallery_<preset>_<view>.bmp. The whole look-iteration loop
+  // for a cloud.wgsl or tuning.json edit is one `--gate clouds` with this set:
+  // no rebuild, no --shot, one worldgen.
+  if (const char* g = std::getenv("SANDVOX_CLOUD_GALLERY"); g && g[0] == '1') {
+    struct View { const char* name; Vec3 eye; float yaw, pitch; };
+    const View views[] = {
+        {"up", skyEye, 0.785f, 0.55f},
+        {"horizon", Vec3{(float)gx, (float)(ground + 60), (float)gz}, 2.3f, 0.06f},
+        {"ground", gndEye, 0.785f, -0.35f},
+    };
+    const float dayTicks = (float)TicksPerDayFromTuning(base);
+    for (const weather::Preset& p : ps) {
+      for (const View& v : views) {
+        std::vector<uint8_t> im;
+        std::vector<float> dp;
+        double ms = 0;
+        armTick = tick;
+        if (!renderArm(p.name.c_str(), true, v.eye, v.yaw, v.pitch, im, dp, ms)) break;
+        WriteBmpFile("build/clouds_gallery_" + p.name + "_" + v.name + ".bmp", im, W, H);
+        std::printf("clouds gallery: %-10s %-8s %.2f ms/frame\n", p.name.c_str(), v.name, ms);
+      }
+    }
+    // Low sun: the undersides going orange (plan §3), toward and away from it.
+    // The afternoon tick whose sun stands ~1.5 degrees up: found, not guessed,
+    // because where sunset falls moves with latitude and the orbit.
+    uint32_t lowSun = (uint32_t)(dayTicks * 0.7f);
+    for (float f = 0.5f; f < 1.0f; f += 0.0025f) {
+      const uint32_t tk = (uint32_t)(dayTicks * f);
+      if (SkyForTick(base, tk).sunDir[1] < 0.025f) { lowSun = tk; break; }
+    }
+    for (const char* pn : {"fair", "towering", "storm"}) {
+      armTick = lowSun;
+      SkyState ss = SkyForTick(base, armTick);
+      const float sunYaw = std::atan2(ss.sunDir[2], ss.sunDir[0]);
+      std::vector<uint8_t> im;
+      std::vector<float> dp;
+      double ms = 0;
+      if (renderArm(pn, true, Vec3{(float)gx, (float)(ground + 60), (float)gz}, sunYaw, 0.12f,
+                    im, dp, ms))
+        WriteBmpFile(std::string("build/clouds_gallery_") + pn + "_sunset.bmp", im, W, H);
+      if (renderArm(pn, true, Vec3{(float)gx, (float)(ground + 60), (float)gz},
+                    sunYaw + 3.14159f, 0.12f, im, dp, ms))
+        WriteBmpFile(std::string("build/clouds_gallery_") + pn + "_antisun.bmp", im, W, H);
+    }
+    armTick = tick;
+  }
+
+  const Stat sc = stat(imClear, dClear, true), so = stat(imOver, dOver, true),
+             sf = stat(imOff, dOff, true);
+  const Stat gc = stat(imGClear, dGClear, false), go = stat(imGOver, dGOver, false);
+
+  // Master switch: the "off" arm draws the cloudless sky. Not bit-identical to
+  // the `clear` arm (clear still carries a faint cirrus, and the overcast
+  // preset's mist thickens the fog even with the deck off), so it is compared
+  // on the thing the deck changes: SATURATION.
+  const bool greyed = so.n > 1000 && so.sat < sc.sat * 0.6;
+  const bool offRestores = sf.n > 1000 && sf.sat > so.sat * 1.4;
+  const bool shaded = gc.n > 1000 && go.lum < gc.lum * 0.9;
+  char b[640];
+  std::snprintf(b, sizeof(b),
+                "sky sat clear %.3f / overcast %.3f / overcast+off %.3f (%zu px) | "
+                "ground lum clear %.1f / overcast %.1f | auto cycle: %zu presets "
+                "visited in 2 h, max 1 s step cov %.4f rain %.4f | ms/frame "
+                "clear %.2f overcast %.2f off %.2f (advisory)%s%s%s",
+                sc.sat, so.sat, sf.sat, so.n, gc.lum, go.lum, distinct, maxCov, maxRain,
+                msClear, msOver, msOff, greyed ? "" : " | OVERCAST SKY NOT GREY",
+                offRestores ? "" : " | clouds=false DID NOT RESTORE THE SKY",
+                shaded ? "" : " | OVERCAST DID NOT SHADE THE GROUND");
+  detail = b;
+  return (greyed && offRestores && shaded) ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& RenderGates() {
   static const std::vector<Gate> g = {
       {"far-fog", "render", {}, false, GateFarFog},
@@ -4055,6 +4590,10 @@ const std::vector<Gate>& RenderGates() {
       // The only gate in the suite that DRAWS A RIGIDBODY. Three arms of one
       // fixture frame, and it spawns a body through the real destruction path.
       {"body-shade", "render", {}, false, GateBodyShade, /*needsRender=*/true},
+      // Draws a body standing in water, dry and wet (common.wgsl THE WATER
+      // VEIL). Leaves a filled stone basin at (300, ground+8, 345).
+      {"underwater-body", "render", {}, false, GateUnderwaterBody,
+       /*needsRender=*/true},
       // Draws three frames of a painted stand and reads them back.
       {"plants", "render", {}, false, GatePlants, /*needsRender=*/true},
       // The TAA resolve: draws 4 + 2 + 4 + 16 frames of the same terrain view
@@ -4066,6 +4605,10 @@ const std::vector<Gate>& RenderGates() {
       // compares them by distance band (near + sky untouched, mid-band
       // speckle down, mid-band mean kept). Own worldgen, no state left.
       {"denoise", "render", {}, false, GateDenoise, /*needsRender=*/true},
+      // The clouds: a CPU walk of the automatic weather (purity + no cuts)
+      // and five frames of one site under three skies. Own worldgen, and it
+      // restores the tuning and clears the weather pin before returning.
+      {"clouds", "render", {}, false, GateClouds, /*needsRender=*/true},
   };
   return g;
 }

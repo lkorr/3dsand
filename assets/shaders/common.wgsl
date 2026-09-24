@@ -527,6 +527,14 @@ struct Reaction {
 const RCOND_SKY   : u32 = 1u;  // cell must have open sky above it
 const RCOND_DAY   : u32 = 2u;  // only while the sun is up
 const RCOND_NIGHT : u32 = 4u;  // only while the sun is down
+// Weather conditions (materials.h kCondRain / kCondRainDamp), against
+// T.weatherRain. RAIN: a douse — only on a rain-exposed cell while it rains,
+// chance x (rain/255)^2. RAINDAMP: an ignition — chance cut by
+// max(rain, wet) x damp on a rain-exposed cell. RAIN holds no chunk awake
+// (it is a gate, like SKY/DAY/NIGHT); RAINDAMP is only a rescale and does.
+const RCOND_RAIN     : u32 = 8u;
+const RCOND_RAINDAMP : u32 = 16u;
+const RCOND_GATES    : u32 = 15u;  // SKY | DAY | NIGHT | RAIN
 
 // Neighbour-count scaling — must match kScale* in src/sim/materials.h.
 // Chance scales with how many of the 6 face neighbours match the rule's
@@ -636,7 +644,11 @@ struct TickParams {
   // in-kernel wake this replaced, byte for byte. It was the padWp0 pad word,
   // so the struct layout is unchanged.
   genDeferWake : u32,
-  padWp1 : u32,
+  // THE WEATHER, the SIM's copy (weather::SimRainWord; must match world.h —
+  // it was the padWp1 pad word, so the layout is unchanged). Bits 0..7 rain
+  // reaching the ground, 8..15 ignition damp strength, 16..23 ground wetness.
+  // Read by RCOND_RAIN / RCOND_RAINDAMP rules (sim_step rainChance).
+  weatherRain : u32,
   windPrimLo : vec3<i32>,   // union AABB, inclusive world cells; the whole-loop
   padWp2 : i32,             // early-out. lo > hi means "no primitives".
   windPrimHi : vec3<i32>,
@@ -1345,7 +1357,9 @@ struct RenderParams {
   // 9-day synodic period against moon A's 8 — coprime, so the phase pair takes
   // 72 days to repeat.
   eclipseBody : u32,   // 0 none, 1 moon A in front of the sun, 2 moon B
-  _pdn0      : u32,
+  // RWF_* bits: clouds valid this frame / precipitation near the camera
+  // (src/sim/weather.h; world.h weatherFlags).
+  weatherFlags : u32,
   moon2Dir   : vec3f,  // unit vector toward moon B
   moon2Phase : f32,    // 0 = new, 0.5 = full
   // Apparent angular radii in RADIANS, modulated by orbital distance (perigee
@@ -1363,14 +1377,16 @@ struct RenderParams {
   solarEclipse : f32,
   // Fraction of moon B's disc hidden behind moon A.
   lunarEclipse : f32,
-  _pdn1      : f32,
-  _pdn2      : f32,
+  // How much of the dome is under cloud (0..1) — greys the shared ambient in
+  // ambientAtP — and how soaked exposed ground is (0..1). world.h says more.
+  overcast   : f32,
+  wetness    : f32,
   // The celestial pole in the horizon frame — the axis the starfield wheels
   // about. Derived from latitude on the CPU (see RenderParams in world.h);
   // there is no knob because the stars and the sun must agree on the axis.
   // On its own row: a vec3 aligns to 16 bytes and cannot start mid-row.
   poleDir    : vec3f,
-  _pdn3      : f32,
+  lightning  : f32,    // this frame's flash, 0 = none (ambientAtP, cloud.wgsl)
   // ---- MPM fluid render bounds (PLAN_fluid_overhaul.md §7 item 5) ----
   // Inclusive world-voxel AABB of everything the fluid surface march can hit.
   // Rays that miss it skip the march entirely; rays that hit march only the
@@ -1465,6 +1481,161 @@ struct RenderParams {
   _psc0 : u32,
   _psc1 : u32,
 };
+
+// ---- THE CLOUDS: the shared half (cloud.wgsl, src/sim/weather.h) ----------
+// What more than one shader must agree on about the clouds, and nothing else.
+// The march, the noise bake and the maps live in cloud.wgsl; what is HERE is
+// the uniform layout and the two lookups every shading path makes — "how much
+// key light gets through the clouds to this point" and "what does the sky look
+// like through the clouds in this direction". The raymarcher, the micro
+// bodies and the debris cubes all call these, which is what stops a mob
+// standing in full sun inside a cloud shadow that has darkened the ground
+// around its feet.
+//
+// Everything else cloud-related is declared in cloud.wgsl on purpose: an edit
+// to THIS file re-keys the SPIR-V cache of every shader (CLAUDE.md, the 536 s
+// measurement), so this block is kept small and frozen, with spare lanes.
+
+// RenderParams.weatherFlags (world.h kRwf*).
+const RWF_CLOUDS : u32 = 1u;
+const RWF_RAIN   : u32 = 2u;
+// CloudParams.flags (world.h kClf*).
+const CLF_ON         : u32 = 1u;
+const CLF_HIST_VALID : u32 = 2u;
+const CLF_BAKE       : u32 = 4u;
+// Map edges (world.h kCloudShadowN / kCloudEnvN; check_invariants.py pairs).
+const CLOUD_SHADOW_N : u32 = 256u;
+const CLOUD_ENV_N    : u32 = 64u;
+// Word offset of the env map inside cloudMaps: it follows the shadow map.
+const CLOUD_ENV_BASE : u32 = CLOUD_SHADOW_N * CLOUD_SHADOW_N;
+// ...and the 8-word camera probe follows the env map (world.h kCloudProbeWords):
+// 0..3 the weather map at the camera column as f32 (coverage, type, rain,
+// jitter); 4..6 the 20 m averaged wind for the rain streaks, m/s (cloud.wgsl).
+const CLOUD_PROBE_BASE : u32 = CLOUD_ENV_BASE + CLOUD_ENV_N * CLOUD_ENV_N * 2u;
+// How far the deck's local base may sit below (or above) the authored baseM:
+// 10% of the thickness, CAPPED IN METRES. Uncapped, a 7.5 km cumulonimbus
+// deck (the storm preset, base 700 m) dipped 750 m — below sea level — so
+// cloud density reached the ground and the renderer decided the eye was
+// inside the deck and veiled every terrain pixel with it. Real bases vary by
+// a couple of hundred metres whatever the tower above them does. Shared by
+// cloud.wgsl (deckBase, deckSpan) and raymarch.wgsl (the over-terrain
+// composite); src/test/support.cpp mirrors the cap for the shadow plane.
+const CLOUD_BASE_JITTER_MAX_M : f32 = 150.0;
+fn cloudBaseJitterM(thicknessM : f32) -> f32 {
+  return min(0.1 * thicknessM, CLOUD_BASE_JITTER_MAX_M);
+}
+
+// Must match CloudParams in world.h, field for field.
+struct CloudParams {
+  prevRight : vec3f, flags : u32,
+  prevUp    : vec3f, frame : u32,
+  prevFwd   : vec3f, prevTanHalfFov : f32,
+  eyeDeltaM : vec3f, prevAspect : f32,
+  lowW : u32, lowH : u32, fullW : u32, fullH : u32,
+  histCur : u32, histPrev : u32, resDiv : u32, _pc0 : u32,
+  coverage : f32, cloudType : f32, density : f32, precip : f32,
+  baseM : f32, thicknessM : f32, darkness : f32, cirrus : f32,
+  cirrusAltM : f32, precipType : f32, overcast : f32, wetness : f32,
+  camM : vec3f, mist : f32,
+  shapeOff : vec3f, weatherEvolve : f32,
+  detailOff : vec3f, cirrusEvolve : f32,
+  weatherOrigin : vec2f, weatherTexelM : f32, shadowTexelM : f32,
+  shadowOrigin : vec2f, shadowPlaneM : f32, _pc1 : f32,
+  weatherOff : vec2f, windX : f32, windZ : f32,
+  flash : vec3f, flashAmp : f32,
+  jitter : vec2f, cirrusOff : vec2f,
+  spare : vec4f,
+};
+
+// ---- octahedral direction <-> unit square (the env map's parameterisation)
+// Y-up: the upper hemisphere is the inner diamond, where the sky detail is,
+// so the lower hemisphere (below the horizon, T ~ 1) takes the folded corners
+// and their seams.
+fn cloudOctEncode(nIn : vec3f) -> vec2f {
+  let n = nIn / (abs(nIn.x) + abs(nIn.y) + abs(nIn.z));
+  var p = n.xz;
+  if (n.y < 0.0) {
+    let sx = select(-1.0, 1.0, p.x >= 0.0);
+    let sz = select(-1.0, 1.0, p.y >= 0.0);
+    p = (1.0 - abs(p.yx)) * vec2f(sx, sz);
+  }
+  return p * 0.5 + 0.5;
+}
+fn cloudOctDecode(uv : vec2f) -> vec3f {
+  let f = uv * 2.0 - 1.0;
+  var n = vec3f(f.x, 1.0 - abs(f.x) - abs(f.y), f.y);
+  let t = max(-n.y, 0.0);
+  n.x += select(t, -t, n.x >= 0.0);
+  n.z += select(t, -t, n.z >= 0.0);
+  return normalize(n);
+}
+
+// ---- key light through the clouds ------------------------------------------
+// The fraction of the key light that survives the cloud deck on its way to
+// world point `pM` (absolute METRES), from the per-frame shadow map. One
+// bilinear lookup: the map is indexed where the light ray crosses the deck's
+// BASE plane, so every receiver along one light ray reads the same texel —
+// the corpus's "check at the end of the shadow ray whether it hit a cloud"
+// (plan §1d), precomputed for the whole view once per frame.
+//
+// Outside the map (a receiver kilometres away, or a light ray too grazing to
+// reach the deck inside it) the answer is the deck's MEAN transmittance, which
+// is what a shadow that far away averages to on screen anyway.
+fn cloudSunAtM(pM : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
+               maps : ptr<storage, array<u32>, read>) -> f32 {
+  if (((*C).flags & CLF_ON) == 0u) { return 1.0; }
+  let mean = 1.0 - clamp((*C).overcast, 0.0, 1.0) * 0.85;
+  if (lightDir.y < 0.03) { return mean; }
+  let t = ((*C).shadowPlaneM - pM.y) / lightDir.y;
+  let q = pM.xz + lightDir.xz * max(t, 0.0);
+  let f = (q - (*C).shadowOrigin) / (*C).shadowTexelM - 0.5;
+  let n = f32(CLOUD_SHADOW_N);
+  if (f.x < 0.0 || f.y < 0.0 || f.x >= n - 1.0 || f.y >= n - 1.0) { return mean; }
+  let i0 = vec2<u32>(floor(f));
+  let fr = f - floor(f);
+  let b = i0.y * CLOUD_SHADOW_N + i0.x;
+  let s00 = bitcast<f32>((*maps)[b]);
+  let s10 = bitcast<f32>((*maps)[b + 1u]);
+  let s01 = bitcast<f32>((*maps)[b + CLOUD_SHADOW_N]);
+  let s11 = bitcast<f32>((*maps)[b + CLOUD_SHADOW_N + 1u]);
+  // Fade to the mean over the last eighth of the map so its edge is never a
+  // visible line across the ground.
+  let edge = min(min(f.x, f.y), min(n - 1.0 - f.x, n - 1.0 - f.y)) / (n * 0.125);
+  let v = mix(mix(s00, s10, fr.x), mix(s01, s11, fr.x), fr.y);
+  return mix(mean, v, clamp(edge, 0.0, 1.0));
+}
+
+// The same, for a point in fine-voxel world coordinates (what every shading
+// path has in hand).
+fn cloudSunAt(pVox : vec3f, lightDir : vec3f, C : ptr<uniform, CloudParams>,
+              maps : ptr<storage, array<u32>, read>) -> f32 {
+  return cloudSunAtM(pVox * VOXEL_METERS, lightDir, C, maps);
+}
+
+// ---- the sky through the clouds, by direction -----------------------------
+// (in-scattered cloud light, transmittance) for direction `rd`, from the
+// low-resolution octahedral env map. For anything that integrates over a
+// solid angle — aerial perspective, reflections — never for a primary sky
+// pixel, which reads the full-resolution screen buffer instead (the same
+// tiering the sky itself follows: gotcha-sky-tiers-fog-target).
+fn cloudEnvAt(rd : vec3f, C : ptr<uniform, CloudParams>,
+              maps : ptr<storage, array<u32>, read>) -> vec4f {
+  if (((*C).flags & CLF_ON) == 0u) { return vec4f(0.0, 0.0, 0.0, 1.0); }
+  let n = f32(CLOUD_ENV_N);
+  let f = clamp(cloudOctEncode(rd) * n - 0.5, vec2f(0.0), vec2f(n - 1.001));
+  let i0 = vec2<u32>(floor(f));
+  let fr = f - floor(f);
+  var acc = vec4f(0.0);
+  for (var k = 0u; k < 4u; k++) {
+    let o = vec2<u32>(k & 1u, k >> 1u);
+    let idx = CLOUD_ENV_BASE + ((i0.y + o.y) * CLOUD_ENV_N + (i0.x + o.x)) * 2u;
+    let rg = unpack2x16float((*maps)[idx]);
+    let bt = unpack2x16float((*maps)[idx + 1u]);
+    let w = select(1.0 - fr.x, fr.x, o.x == 1u) * select(1.0 - fr.y, fr.y, o.y == 1u);
+    acc += vec4f(rg.x, rg.y, bt.x, bt.y) * w;
+  }
+  return acc;
+}
 
 // Reversed-Z depth (clear 0, compare GreaterEqual): depth = KNEAR / viewZ.
 // Shared by the raymarcher (frag_depth) and every raster pipeline so raster
@@ -1662,7 +1833,25 @@ fn ambientAtP(n : vec3f, R : RenderParams) -> vec3f {
   let a = moonContribP(R.moonDir, R.moonPhase, TUNE_MOON_LIGHT_INTENSITY) * inv;
   let b = moonContribP(R.moon2Dir, R.moon2Phase, TUNE_MOON2_LIGHT_INTENSITY) * inv;
   let moonAmt = 0.30 * step(0.001, a + b) + 1.40 * (a + b) * 0.5;
-  return mix(nightAmb * (0.45 + moonAmt), base, eclipseDayWeightP(R));
+  var amb = mix(nightAmb * (0.45 + moonAmt), base, eclipseDayWeightP(R));
+  // THE OVERCAST (src/sim/weather.h). Under a closed deck the sky stops being
+  // a blue dome over a sunlit ground and becomes one grey diffuser: the
+  // blue-above / warm-below split collapses toward the dome's luminance, and
+  // the warm half loses the sunlit ground that was bouncing into it. Shared
+  // here so the terrain, the far field and every raster body grey together.
+  // The DIRECT light is not touched — the cloud shadow map dims it per
+  // position, which is what lets a single cloud's shadow cross a field.
+  if (R.overcast > 0.0) {
+    let lum = dot(amb, vec3f(0.2126, 0.7152, 0.0722));
+    let grey = vec3f(lum) * vec3f(0.96, 0.99, 1.04) *
+               mix(1.0, 0.72, clamp(-n.y, 0.0, 1.0));
+    amb = mix(amb, grey, clamp(R.overcast, 0.0, 1.0) * 0.8);
+  }
+  // Lightning: a cold white flash from the sky side, weighted by how much the
+  // face looks up so a flash lights a field and not the underside of a ledge.
+  amb += vec3f(0.78, 0.84, 1.0) * R.lightning *
+         (0.35 + 0.65 * clamp(n.y * 0.5 + 0.5, 0.0, 1.0));
+  return amb;
 }
 
 // Reinhard-with-white-point applied to LUMINANCE then reapplied to the colour
@@ -1848,6 +2037,18 @@ fn wrapDiffuse(ndl : f32, wrap : f32) -> f32 {
 fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
              R : RenderParams, openScale : f32, openRaw : f32,
              sh : f32) -> vec3f {
+  return bodyAirFog(litColorSNoFog(albedo, n, worldPos, emission, R, openScale,
+                                   openRaw, sh), worldPos, R);
+}
+
+// litColorS without the air fog. A body seen THROUGH a water surface takes its
+// fog from the water veil (waterVeilApply), which carries the raymarch's own
+// aerial term for the air between the eye and the surface — fogging the whole
+// eye-to-body distance here as well would count that air twice and fog the
+// water column as if it were air.
+fn litColorSNoFog(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
+                  R : RenderParams, openScale : f32, openRaw : f32,
+                  sh : f32) -> vec3f {
   // Per-face constant, keyed on the WORLD normal exactly as the terrain keys it
   // (raymarch.wgsl's `face`) — it only breaks the tie between the two
   // horizontal axes so parallel faces don't fuse. A cube lit without it sat a
@@ -1868,6 +2069,11 @@ fn litColorS(albedo : vec3f, n : vec3f, worldPos : vec3f, emission : f32,
           (ambientOpen(ambientAtP(n, R), openScale, openRaw) +
            keyLightColorP(R) * lambert);
   c += albedo * emission * 1.7;
+  return c;
+}
+
+// The raster bodies' air fog, the tail litColorS always had.
+fn bodyAirFog(c : vec3f, worldPos : vec3f, R : RenderParams) -> vec3f {
   let dist = length(worldPos - R.camPos);
   // R.fogDensity, not a hardcoded 0.0128. They agreed at the shipped default
   // and diverged everywhere else — main.cpp passes 0.0 for portrait renders,
@@ -3274,6 +3480,18 @@ fn fpPack(mat : u32, fullness : u32, stainType : u32, stainAmt : u32) -> u32 {
 // FLUID_CAP.
 const FP_EXCITED : u32 = 1u << 22u;
 fn fpExcited(attr : u32) -> bool { return (attr & FP_EXCITED) != 0u; }
+// GHOST (bit 23): a picture of water, not water -- the flask's scoop stream
+// (ContainerScoopStream, 2026-09-23). spawnAppend sets it from the op's
+// species bit 8, with the homing target in _r0.._r2 and the death tick in _r3.
+// It is splatted into the grid like any particle, so the fluid surface draws
+// it, and g2p steers it onto its target. It is NEVER matter: spawnAppend does
+// not book it, particleTick gives the CA no occupancy or stain intent for it
+// (so no reaction can consume it), splash sheds no droplets from it, settle
+// neither bins nor kills it, and consumeApply retires it at its death tick
+// without a mass counter. The eighths it depicts were already taken by the
+// scoop's conditional clear and paid through the scoop ledger.
+const FP_GHOST : u32 = 1u << 23u;
+fn fpGhost(attr : u32) -> bool { return (attr & FP_GHOST) != 0u; }
 
 // ---- fluidArgsStage word map (40 u32 — world.h kFluidArgsWords) ------------
 // THIS COMMENT IS THE OCCUPANCY LEDGER FOR THE WHOLE MAP, including the words
@@ -4115,6 +4333,119 @@ fn unpackRgb9e5(w : u32) -> vec3f {
   let scale = exp2(f32(i32(w >> 27u) - 15 - 9));
   return vec3f(f32(w & 511u), f32((w >> 9u) & 511u), f32((w >> 18u) & 511u)) *
          scale;
+}
+
+// ============================================================================
+// THE WATER VEIL — raster bodies seen through a liquid surface
+// ============================================================================
+// Bodies, micro bodies (every mob) and particles are RASTERIZED after the
+// raymarch and composite by depth. Water is not a surface the march stops at —
+// it shades the interface and keeps going to the bed — so when it wrote its
+// depth at the interface, everything under the surface failed the depth test
+// and a wading mob was cut off at the waterline as if the lake were concrete.
+//
+// Now the march writes the depth of what is BEHIND the water, and records for
+// each pixel how the water it crossed transforms whatever light comes up from
+// below. Every water shade in raymarch.wgsl already has the form
+//
+//     final = Arest + K * (lit * caustic * T(d) + scatter * (1 - T(d)))
+//
+// with T(d) = exp(-absorb * d) over the path d the light travels in the liquid,
+// K the part of the surface that transmits ((1 - Fresnel) x (1 - foam) x the
+// air fog to the surface) and Arest everything the surface adds on top
+// (reflection, glint, foam, fog in-scatter). The march solves it for its own
+// bed; a body in front of the bed needs the same equation at ITS distance, so
+// the record holds the equation, not an answer:
+//
+//   w0  tSurf + 1 as f32 bits (0 = no veil on this pixel; tSurf 0 = camera
+//       already submerged), in voxels along the normalized primary ray
+//   w1  K                       rgb9e5
+//   w2  A = Arest + K*scatter   rgb9e5 — the colour of infinitely deep water
+//   w3  S = K*scatter           rgb9e5
+//   w4  absorb, per metre       rgb9e5
+//   w5  pack2x16float(path cap in voxels, caustic curvature)
+//
+// and a body at distance `dist` shades A + T * (K * lit * caustic - S). A
+// body point nearer than the surface is simply not under it and takes the
+// ordinary air fog. The path cap is how far the primary ray actually ran in
+// liquid, so a body seen through a thin sheet (a waterfall curtain) is dimmed
+// by the sheet, not by the air behind it.
+//
+// Render-only derived data, rewritten every frame by the raymarch (one store of
+// w0 for a dry pixel), never hashed, never saved. Bound at renderBGL_ binding
+// 24; the raymarch writes it, the body passes read it after
+// RenderPass::SplitAfterFragmentWrite.
+const VEIL_WORDS : u32 = 6u;
+
+struct WaterVeil {
+  on      : bool,
+  tSurf   : f32,
+  k       : vec3f,
+  a       : vec3f,
+  s       : vec3f,
+  absorb  : vec3f,
+  pathCap : f32,
+  curv    : f32,
+};
+
+// Word offset of this pixel's record, or 0xFFFFFFFF when the pixel is outside
+// the addressed rectangle. Both sides compute the pitch from the SAME uniform,
+// so they agree on the mapping even where it is not the target's exact width.
+fn veilBase(fragXY : vec2f, R : ptr<uniform, RenderParams>) -> u32 {
+  let w = u32(round((*R).viewPx * (*R).aspect));
+  let x = u32(max(fragXY.x, 0.0));
+  let y = u32(max(fragXY.y, 0.0));
+  if (x >= w) { return 0xFFFFFFFFu; }
+  return (y * w + x) * VEIL_WORDS;
+}
+
+fn waterVeilDecode(w0 : u32, w1 : u32, w2 : u32, w3 : u32, w4 : u32,
+                   w5 : u32) -> WaterVeil {
+  var v : WaterVeil;
+  v.on = w0 != 0u;
+  v.tSurf = bitcast<f32>(w0) - 1.0;
+  v.k = unpackRgb9e5(w1);
+  v.a = unpackRgb9e5(w2);
+  v.s = unpackRgb9e5(w3);
+  v.absorb = unpackRgb9e5(w4);
+  let pc = unpack2x16float(w5);
+  v.pathCap = pc.x;
+  v.curv = pc.y;
+  return v;
+}
+
+// The caustic web's brightening at a water depth, from the curvature the march
+// measured on the surface above this pixel. The same law as waterCaustics in
+// raymarch.wgsl — focus grows with the lever arm to the lit point, then
+// saturates — so a mob standing on a lake bed wears the web the bed wears.
+fn veilCaustic(curv : f32, depthM : f32) -> f32 {
+  let focus = clamp(depthM * 1.5, 0.0, 1.4);
+  return 1.0 + min(curv * focus * TUNE_CAUSTIC_GAIN, TUNE_CAUSTIC_CAP);
+}
+
+// `lit` is the body's linear HDR radiance WITHOUT air fog (litColorSNoFog);
+// `dist` its distance from the eye in voxels. Returns linear HDR, pre-tonemap.
+fn waterVeilApply(v : WaterVeil, lit : vec3f, dist : f32) -> vec3f {
+  let d = clamp(dist - v.tSurf, 0.0, v.pathCap) * VOXEL_METERS;
+  let t = exp(-v.absorb * d);
+  return v.a + t * (v.k * lit * veilCaustic(v.curv, d) - v.s);
+}
+
+// The raster side's lookup: the veil over this fragment, with `on` false when
+// the pixel is dry OR the fragment is NEARER than the surface (a body standing
+// on the shore in front of a lake is not under it). `dist` in voxels.
+fn waterVeilAt(veil : ptr<storage, array<u32>, read>, fragXY : vec2f,
+               dist : f32, R : ptr<uniform, RenderParams>) -> WaterVeil {
+  var v : WaterVeil;
+  v.on = false;
+  let b = veilBase(fragXY, R);
+  if (b == 0xFFFFFFFFu || b + VEIL_WORDS > arrayLength(veil)) { return v; }
+  let w0 = (*veil)[b];
+  if (w0 == 0u) { return v; }
+  v = waterVeilDecode(w0, (*veil)[b + 1u], (*veil)[b + 2u], (*veil)[b + 3u],
+                      (*veil)[b + 4u], (*veil)[b + 5u]);
+  v.on = dist > v.tSurf;
+  return v;
 }
 
 // Blend one radiance sample into a block-face word. `stampOk` false means the

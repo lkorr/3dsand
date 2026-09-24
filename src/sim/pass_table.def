@@ -250,10 +250,9 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // Each workgroup fills its dirty chunk AND the nine neighbours a probe can
 // reach (reposeRingOffset in the shader owns that table): a resting grain's
 // probes reach 3 cells and cross into a neighbour chunk that may be asleep, and
-// a boundary artifact every 16 cells is not acceptable. Ring members are
-// re-filled by every dirty chunk that touches them; the bits written are a pure
-// function of pre-CA voxel state, so duplicated work is redundant, never
-// divergent.
+// a boundary artifact every 16 cells is not acceptable. Each ring slot is
+// filled by exactly ONE owner, chosen from this tick's dirty flags -- hence
+// R(DirtyIn) (reposeRingOwned in the shader).
 //
 // read-only in practice: `voxels` is read_write for the module because `main`
 // writes it; `reposesnap` only asks what material a cell holds. No A(DirtyOut),
@@ -261,7 +260,7 @@ PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, G
 // this row from adding a WAW edge to the 54 CA iterations behind it.
 PASS(reposeSnap, "reposeSnap", PT_TICK, PIPE_REPOSE_SNAP, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_ZERO, C_REPOSE, 1,
-     USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyList) I(DispatchArgs)
+     USES(U(TickUBO) R(Voxels) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs)
           R(PageTable) W(ReposeSnap)))
 
 // ---- phase 3: the CA loop -------------------------------------------------
@@ -646,7 +645,7 @@ PASS(pick_dirty, "occupancyDirty+pick", PT_TICK, PIPE_PICK, K_COMPUTE, 1,1,1, GR
 PASS(farDown, "farDown", PT_TICK, PIPE_FAR_DOWN, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SLIM_FAR, DYN_NONE, C_DIRTYTICK, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) U(FarUBO) R(DirtyList) I(DispatchArgs)
-          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap)))
+          A(FarVox) A(FarOcc) R(PageTable) R(TreeAtlas) R(WorldMap) RW(FarSig)))
 
 // ---- phase 5c: the openness (sky-visibility) grid -------------------------
 // docs/PLAN_gi.md §2. RENDER-ONLY DERIVED DATA written on the TICK table, which
@@ -975,9 +974,9 @@ PASS(farPatchFill, "farPatchFill", PT_FARFILL, PIPE_FAR_PATCH_FILL, K_COMPUTE,
 // A(ShadowReq) — atomics on one buffer still need a real barrier between the
 // dispatch that writes and the dispatch that reads (§3.8).
 PASS(shadow_prepare, "shadowPrepare", PT_SHADOWCACHE, PIPE_SHADOW_PREPARE, K_COMPUTE, 1,1,1,
-     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     GRP_SHADOW, DYN_NONE, C_SHADOWON, 1,
      USES(A(ShadowReq) W(ShadowArgsStage)))
-PASS(copy_shadowArgs, nullptr, PT_SHADOWCACHE, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+PASS(copy_shadowArgs, nullptr, PT_SHADOWCACHE, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_SHADOWON, 1,
      USES(TR(ShadowArgsStage) TW(ShadowArgs)))
 // The dispatch size is a GPU-side quantity, so this is the one indirect row
 // whose count no CPU field mirrors. R(Voxels)/R(Occupancy)/R(PageTable) are the
@@ -992,7 +991,7 @@ PASS(copy_shadowArgs, nullptr, PT_SHADOWCACHE, PIPE_NONE, K_COPY, 0,0,12, GRP_NO
 // result is an average either way); W rather than A because it is not
 // atomic and the barrier mapping is the same.
 PASS(shadow_resolve, "shadowResolve", PT_SHADOWCACHE, PIPE_SHADOW_RESOLVE, K_INDIRECT, IND_SHADOWARGS,1,1,
-     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     GRP_SHADOW, DYN_NONE, C_SHADOWON, 1,
 // W(ShadowHist) since the penumbra window (world.h kShadowHistBytes): the pass
 // reads its slot's word, folds this frame's sample into it and writes it back.
 // Both halves are this one row, so the only hazard it carries is the frame-to-
@@ -1004,6 +1003,44 @@ PASS(shadow_resolve, "shadowResolve", PT_SHADOWCACHE, PIPE_SHADOW_RESOLVE, K_IND
      USES(R(Voxels) R(Occupancy) R(Materials) U(RenderUBO) R(PageTable)
           A(ShadowCache) A(ShadowReq) I(ShadowArgs) W(Irradiance) R(OpennessGen)
           R(Openness) W(ShadowHist)))
+
+// ---- THE CLOUDS (assets/shaders/cloud.wgsl, DESIGN.md §9.w) ---------------
+// Same table, same reason: per-FRAME render-path compute whose writes the
+// raymarcher (and microbody/debris) read in the fragment/vertex stage of the
+// same command buffer. BeginRendering's FlushForRenderDomain turns the W()s
+// below into the compute->fragment barrier; a row that did not declare its
+// write would leave the composite reading a half-written map.
+//
+// C_CLOUDS gates all five per-frame rows together: weather.clouds off, or a
+// sky with no cloud, cirrus or rain in it, records NOTHING — the "off means
+// no row" rule every other optional system here follows. The bake is its own
+// condition because it runs once per pipeline build, not per frame.
+//
+// Order is dependency order: the weather map feeds the shadow map, the env
+// map and the march; the march feeds the resolve. Each is its own pass group
+// so --measure attributes the frame's cloud cost row by row.
+PASS(cloud_noise, "cloudNoise", PT_SHADOWCACHE, PIPE_CLOUD_NOISE, K_COMPUTE, 33280,1,1,
+     GRP_SHADOW, DYN_NONE, C_CLOUDBAKE, 1,
+     USES(W(CloudNoise)))
+PASS(cloud_weather, "cloudWeather", PT_SHADOWCACHE, PIPE_CLOUD_WEATHER, K_COMPUTE, 64,64,1,
+     GRP_SHADOW, DYN_NONE, C_CLOUDS, 1,
+     USES(U(CloudUBO) W(CloudWeather) W(CloudMaps)))
+// read-only in practice: `cloudNoise`/`cloudWeather` are read_write for the module because `noise`/`weather` write them; the shadow map only samples them.
+PASS(cloud_shadow, "cloudShadow", PT_SHADOWCACHE, PIPE_CLOUD_SHADOW, K_COMPUTE, 32,32,1,
+     GRP_SHADOW, DYN_NONE, C_CLOUDS, 1,
+     USES(U(RenderUBO) U(CloudUBO) R(CloudNoise) R(CloudWeather) W(CloudMaps)))
+// read-only in practice: `cloudNoise`/`cloudWeather` are read_write for the module because `noise`/`weather` write them; the env map only samples them.
+PASS(cloud_env, "cloudEnv", PT_SHADOWCACHE, PIPE_CLOUD_ENV, K_COMPUTE, 8,8,1,
+     GRP_SHADOW, DYN_NONE, C_CLOUDS, 1,
+     USES(U(RenderUBO) U(CloudUBO) R(CloudNoise) R(CloudWeather) W(CloudMaps)))
+// read-only in practice: `cloudNoise`/`cloudWeather` are read_write for the module because `noise`/`weather` write them; the march only samples them.
+PASS(cloud_march, "cloudMarch", PT_SHADOWCACHE, PIPE_CLOUD_MARCH, K_COMPUTE, D_CLOUDGX,D_CLOUDGY,1,
+     GRP_SHADOW, DYN_NONE, C_CLOUDS, 1,
+     USES(U(RenderUBO) U(CloudUBO) R(CloudNoise) R(CloudWeather) W(CloudRaw)))
+// read-only in practice: `cloudRaw` is read_write for the module because `march` writes it; the resolve only reads this frame's raw samples.
+PASS(cloud_resolve, "cloudResolve", PT_SHADOWCACHE, PIPE_CLOUD_RESOLVE, K_COMPUTE, D_CLOUDGX,D_CLOUDGY,1,
+     GRP_SHADOW, DYN_NONE, C_CLOUDS, 1,
+     USES(U(RenderUBO) U(CloudUBO) R(CloudRaw) RW(CloudHist)))
 
 // =========================================================== PT_FLUID ======
 // ONE MLS-MPM SUBSTEP (docs/PLAN_mpm_fluids.md; sim_fluid.wgsl). Recorded

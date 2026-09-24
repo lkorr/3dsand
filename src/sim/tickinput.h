@@ -60,11 +60,12 @@ enum TickButton : uint32_t {
   TB_SPAWN = 1u << 7,   // spawn the selected mob def
   TB_DROP = 1u << 8,    // drop the newest status effect
   TB_LASER = 1u << 9,   // the laser is firing (F, or LMB with the laser tool)
+  TB_THROW = 1u << 10,  // Q: winding up a throw of the held vessel; release throws
 };
 
 // Bumped whenever a field is added, removed or changes meaning. Carried in the
 // op record's frame header (sim/oprecord.h) and refused on mismatch.
-constexpr uint32_t kTickInputVersion = 1;
+constexpr uint32_t kTickInputVersion = 2;   // 2: TB_THROW
 
 struct TickInput {
   uint32_t version = kTickInputVersion;

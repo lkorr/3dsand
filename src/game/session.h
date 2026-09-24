@@ -3,7 +3,7 @@
 //
 // Before this file, ONE PLAYER WAS A SET OF LOCAL VARIABLES IN main(). The
 // camera, the controller, the brush, the avatar, the spell caster, the melee
-// state, the sheath, the kit, the grab, the grenades in flight and thirty
+// state, the kit, the grab, the grenades in flight and thirty
 // other things were declared side by side in main() and read by a 2,400-line
 // tick body that also lived in main(). Nothing was wrong with any of it as
 // code; what was wrong is that "a second player" had no shape. You could not
@@ -73,6 +73,7 @@
 #include "game/brush.h"
 #include "game/camera.h"
 #include "game/caster.h"
+#include "game/container.h"
 #include "game/corpses.h"
 #include "game/equipment.h"
 #include "game/grab.h"
@@ -100,6 +101,8 @@
 #include "sim/tickinput.h"
 #include "sim/world.h"
 #include "ui/overlay.h"
+
+class WorldItems;  // game/worlditems.h; TickAuthorityCtx holds it by pointer
 
 // THE OP EXCHANGE, BY NAME ONLY (M9.3-B). net/opsync.h includes this header
 // for OpBatch, so the dependency has to point one way: a pointer to an
@@ -133,6 +136,20 @@ struct SpellFlash {
   uint32_t color;
   float radius;
   int ttl, ttl0;
+};
+
+// A voxel a vessel scooped, flying into it (game/container.h). Render-only,
+// born from the cells ContainerScoop claimed and aged per TICK like
+// SpellFlash; main.cpp flies each one from its cell to the held vessel's mouth
+// (re-read every frame, so the stream follows the hand). `delay` holds it
+// until the clear LANDS, so the mote takes off as the cell vanishes.
+struct ScoopMote {
+  Vec3 from;       // cell centre, world voxels
+  uint32_t color;  // 0xAABBGGRR
+  uint32_t seed;   // swirl phase, size and flight-time jitter
+  int delay;       // ticks until it takes off
+  int age;         // ticks in flight
+  int life;        // ticks from take-off to the mouth
 };
 
 // A combat cue raised inside the tick loop cannot be played there: audio
@@ -368,7 +385,6 @@ struct PlayerSession {
   PrefabPlacer placer;
   Inventory hotbar;
   PlayerKit kit;
-  SheathState sheath;
   // What we last ASKED the body to wear, per equip slot, and in what dye. Not
   // a second copy of the equipment — it is the record that keeps a REFUSED
   // piece from being retried thirty times a second.
@@ -401,6 +417,38 @@ struct PlayerSession {
   // specific rig part, a UI transaction rather than a player command, and it
   // has no meaning on a remote peer.
   int castAtPartQueued = -1;
+  // ...and with a filled VESSEL chosen on the character screen's FLASKS row
+  // the portrait is a BRUSH instead (game/container.h, MobSystem::PourOnBody):
+  // while the button is held, the world ray main.cpp built from the portrait
+  // camera through the cursor, the disc radius, and WHICH stack pays for it
+  // (a pack or hotbar slot, not the hand -- the flask need not be held). HELD, not latched -- main.cpp rewrites it every frame and
+  // the tick pours every tick it is `active`. Same reasoning as the latch
+  // above for why it is not a TickInput field.
+  struct PourStroke {
+    bool active = false;
+    Vec3 ro{}, rd{};
+    float radius = 0.5f;
+    KitRef vessel{};
+  } pourStroke;
+  uint32_t pourStrokeTicks = 0;  // ticks this stroke has poured
+  // Eighths owed but not yet taken, in 1/1000ths: the drain is a rate that
+  // depends on the brush size (PourBrushCellsPerSec), so it is paid off an
+  // accumulator rather than a fixed per-tick clock.
+  int64_t pourSpendMilli = 0;
+  // What this player's scoop has taken that the snapshot cannot see yet.
+  ContainerScoopMemo scoopMemo;
+  std::vector<ScoopMote> scoopMotes;  // render-only, see ScoopMote
+  // THE THROW'S WIND-UP (game/container.h ContainerThrowSpeed): ticks Q has
+  // been held with a throwable vessel in hand, 0 when it is not. Counted on
+  // the tick, released on the tick; cancelled when the hand changes.
+  int throwTicks = 0;
+  int throwSlot = -1;
+  // THE RELEASE: Q let go starts the `throw` clip and the vessel leaves the
+  // hand `throwLaunchIn` ticks later, where the arm has swung it to — not
+  // from behind your head. >0 while the arm is coming through; the speed is
+  // fixed at the release so the delay cannot add charge.
+  int throwLaunchIn = 0;
+  float throwLaunchSpeed = 0.0f;
 
   // ---- melee ----
   MeleeState melee;
@@ -475,9 +523,9 @@ inline PlayerKitRefs PlayerKitOf(PlayerSession& s, const GlyphLibrary& glyphs,
 }
 
 // What the FRAME layer decided this frame that the tick has to act under.
-// These three are derived from the tool selector, magic mode and the sheath —
+// These three are derived from the tool selector, magic mode and the hotbar —
 // UI state, settled before the tick and passed in rather than re-derived,
-// because the sheath is Reconcile'd on the frame and re-deriving here is how
+// because the frame settles the hand before the tick and re-deriving here is how
 // two reads of one fact stop agreeing.
 struct FrameIntent {
   bool brushActive = false;
@@ -488,6 +536,18 @@ struct FrameIntent {
   bool meleeArmed = false;
   bool meleeReady = false;
   const ItemDef* heldItem = nullptr;
+  // THE HANDS HOLD A VESSEL: the melee tool is up, nothing is drawn, and the
+  // selected hotbar slot is an ItemKind::Container. The hotbar slot, or -1.
+  // LMB pours and RMB scoops (game/container.h); the unarmed compass is off,
+  // because a hand round a flask is not a fist.
+  int vesselSlot = -1;
+  // ...and WHERE IT POURS (game/container.h ContainerPourPoint): the point on
+  // the crosshair ray the frame drew the marker sphere on. The crosshair ray
+  // starts at the RENDER eye, which only the frame knows; handing the point
+  // over is what keeps the stream on the sphere. Invalid = the tick works it
+  // out from the head (headless harnesses have no camera).
+  bool pourAimValid = false;
+  Vec3 pourAim{};
 };
 
 // ---- the world a tick runs in ---------------------------------------------
@@ -556,6 +616,13 @@ struct TickAuthorityCtx {
   // Material id each MPM species splashes micro droplets as
   // (TickParams.fluidSplashMat).
   uint32_t fluidSpeciesMat[4] = {0, 0, 0, 0};
+  // BROKEN VESSELS (game/container.h ContainerSpill): what is still coming
+  // out of a flask that shattered, drained under the spawn budgets. Nearly
+  // always empty; one entry for a tick when a flask breaks.
+  std::vector<ContainerSpill> vesselSpills;
+  // Each vessel body's velocity last tick, for the break test's "velocity
+  // jump" witness. One entry per vessel lying or flying in the world.
+  std::vector<std::pair<uint64_t, Vec3>> vesselVel;
   uint32_t labTick = 0;
   bool duelDummySpawned = false;
   // Wall clock, for the render-only ripple timestamps. A VALUE the frame layer
@@ -633,6 +700,13 @@ struct TickAuthorityCtx {
   // answering) is the FRAME layer's, because it is socket work; this pointer
   // exists only so the install lands at the right point in the tick.
   net::ChunkSync* chunksync = nullptr;
+
+  // ---- H2. ITEMS ON THE GROUND (game/worlditems.h), owned by main().
+  //
+  // The tick THROWS vessels into it (DropItemToWorld with a launch speed) and
+  // breaks the ones that hit something hard (PhaseH's vessel pass). Null in
+  // every harness that does not bind it, and then nothing is thrown or broken.
+  WorldItems* ground = nullptr;
 
   // ---- I. THE TWO-PROCESS SMOKE'S DELIBERATE DIVERGENCE (M9.3-C).
   //

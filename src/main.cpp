@@ -28,6 +28,7 @@
 #include "game/persist.h"
 #include "game/camera.h"
 #include "game/caster.h"
+#include "game/container.h"
 #include "game/equipment.h"
 #include "game/worlditems.h"
 #include "game/corpses.h"
@@ -37,6 +38,7 @@
 #include "game/melee.h"
 #include "game/mob.h"
 #include "game/spell.h"
+#include "game/spellgraph.h"
 #include "game/strike_pick.h"
 #include "sim/rng.h"
 #include "game/player.h"
@@ -83,6 +85,7 @@
 #include "sim/voxload.h"
 #include "sim/waterbody.h"
 #include "sim/wind.h"
+#include "sim/weather.h"
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
 #include "sim/world.h"
@@ -184,11 +187,25 @@ bool g_shotInventory = false;
 // TWO pictures, because the screen has two halves and one of them cannot be
 // seen from the other: the equipment view and the injury inspector share a
 // frame and a portrait but show completely different things.
+// The HUD before the screen opens: the hotbar strip along the bottom with a
+// water-filled flask selected, so the pour-point sphere is in the picture too.
+constexpr uint64_t kShotInvHudSetup = 110;
+constexpr uint64_t kShotInvHudFrame = 140;     // -> screenshot_hud.bmp
 constexpr uint64_t kShotInvOpenFrame = 150;    // let the avatar spawn and settle
 constexpr uint64_t kShotInvDamageFrame = 170;
 constexpr uint64_t kShotInvGearFrame = 220;    // -> screenshot_inventory.bmp
 constexpr uint64_t kShotInvCaptureFrame = 240;  // -> ..._health.bmp
 constexpr uint64_t kShotInvGrimoireFrame = 260; // -> ..._grimoire.bmp
+// The SPELL PAGE (docs/PLAN_spell_graph.md §7): the same composer with the
+// canvas in it, on a COPY of the `duststorm` starter (starters are read-only,
+// and a page you cannot edit cannot show an edit), with one lane added through
+// the intent path — which puts a socket, the bus, a mod tag and the per-level
+// prices in one picture. Three frames apart from the grimoire shot because the
+// edit is applied through main.cpp's intent consumer and has to be seen by a
+// tick before it is drawn.
+constexpr uint64_t kShotInvGraphSetup = 262;
+constexpr uint64_t kShotInvGraphEdit = 266;
+constexpr uint64_t kShotInvGraphFrame = 274;    // -> ..._inventory_graph.bmp
 // Fourth: a dressed human killed in front of the player and its corpse opened
 // — the loot panel where the grimoire was (game/corpses.h).
 constexpr uint64_t kShotInvLootFrame = 280;     // -> ..._loot.bmp
@@ -207,6 +224,127 @@ constexpr uint64_t kShotInvDeathFrame = 310;
 constexpr uint64_t kShotInvDeathShot = 350;      // -> ..._death.bmp
 constexpr uint64_t kShotInvDeathTurnAt = 360;    // orbit ~80 degrees
 constexpr uint64_t kShotInvDeathTurnShot = 420;  // -> ..._death_turn.bmp; last
+
+// ---- --shot-spellpage: the SPELL PAGE's own look-iteration harness ---------
+//
+// `--shot-inventory` photographs the spell page once, on one five-word page.
+// One picture of one tree cannot say whether a stroke overlaps a cell, whether
+// a fan of nine sockets collides with its neighbour, or what a page too tall
+// for the band looks like when the fit gives up - and those are exactly the
+// questions a look pass asks. So this is the GALLERY: the same composer, the
+// same canvas, and one BMP per scene, each scene a word list chosen to put a
+// different piece of the drawing under the lens.
+//
+// Cheap on purpose: no damage, no dressing, no corpse, no death. It opens the
+// screen, writes the words straight into `grimoireEditWords` (the composer's
+// own field - the harness types, it does not reach into the tree), waits a few
+// frames for main.cpp's parse/lower/build to refill the mirror, and shoots.
+bool g_shotSpellPage = false;
+struct ShotSpellScene {
+  const char* name;
+  const char* words;  // space separated; "" is the empty page
+  // The view the scene is shot at. Zero zoom is the fit, which is what every
+  // ordinary scene wants; a scene that names a rung and a pan is photographing
+  // THE VIEW rather than the tree - the page's ground is drawn in page
+  // coordinates, and the only way to prove that is a picture of it moved.
+  float zoom = 0.0f;
+  float panX = 0.0f, panY = 0.0f;
+};
+// THE SCENES. Every one of them is a question about the picture:
+//   plain     - two words: does a minimal tree sit centred and whole?
+//   duststorm - the shipped example: a bus, three sockets, a mod, a fan
+//   operator  - `transmute` with a hole in it: the slash, the blank in the row
+//   halfword  - `_ trail` alone: the word that is nothing until something is
+//               spoken before it, and the clasp that says the pair is one thing
+//   nested    - a delivery inside a delivery: the deep tree
+//   lanes     - lane/end scoping: sockets with payloads of their own
+//   fan       - shotgun twice: nine instances, the widest row the page draws
+//   tall      - eighteen words of everything: the page that does not fit
+//   split     - the shape the whole thing is for: one shotgun, three branches,
+//               each rising to its own copy of the delivery
+//   deepfan   - a shotgun on a box three boxes down, and a shotgun on the HAND:
+//               the two places a fan can open that are not the top of the tree
+const ShotSpellScene kShotSpellScenes[] = {
+    // ONE WORD. The page that showed a pip, a rule and another pip for a spell
+    // that has no payload, no fan and nothing shared (2026-09-22): two cells is
+    // the whole truth about it.
+    {"bare", "projectile"},
+    {"plain", "fire projectile"},
+    {"duststorm", "sand gust gust shotgun projectile"},
+    {"operator", "water transmute swift bolt"},
+    // BOTH HALVES OF THE SAME QUESTION: `trail` with nothing before it (one
+    // blank, centred under the cell it is waiting for) and `transmute` with
+    // nothing at all (two blanks side by side, which is the widest a clasp
+    // gets). Until 2026-09-22 both drew as a finished cell with a 21 px ring
+    // hung off its edge.
+    {"halfword", "trail projectile"},
+    {"halfwords", "transmute projectile"},
+    {"nested", "fire explosive bomb orb long projectile"},
+    {"lanes", "stone lane acid wide end lane fire end shotgun lob"},
+    {"fan", "sand shotgun shotgun gust projectile"},
+    {"tall",
+     "water fire transmute twin seek heavy lane acid wide end lane stone "
+     "bounce end explosive long shotgun lob"},
+    // A FAN THAT IS NOT AT THE TOP. `shotgun` on the innermost box opens
+    // three sockets into layers the boxes above it have already spent, and
+    // `shotgun` spoken last edits the implicit `hand` - the one box drawn
+    // bar-downward, so its fan hangs at the FOOT of the page. Both drew wrong
+    // until 2026-09-22 (the bead's trunk stroke was patched onto whichever bar
+    // finished first, which on the hand is a delivery several layers up).
+    {"split", "sand gust shotgun projectile"},
+    // A SPLIT INSIDE A SPLIT: the box fans into three and one of those branches
+    // splits again. The grammar does it (`--gate spells`, L13); what this scene
+    // watches is whether the PAGE says so.
+    {"subfan", "sand shotgun lane gust shotgun end projectile"},
+    // THE CASCADE, reported 2026-09-22: "heres a shotgun into a twin, the twin
+    // doesnt split into 2 more. it should just fractal cascade into more and
+    // more." The first is that sentence exactly - on the HAND, which has no
+    // cell per branch, so the sub-fan was drawn as a tally on nothing at all.
+    // The second is the same shape one level down, and the third is a fan
+    // inside a fan inside a fan by nesting boxes, which is where the depth
+    // actually comes from.
+    {"cascade", "shotgun lane twin end"},
+    {"cascade2", "sand shotgun lane twin end projectile"},
+    {"cascade3", "fire shotgun projectile twin projectile"},
+    {"deepfan", "fire shotgun projectile projectile projectile"},
+    {"handfan", "explosive projectile projectile shotgun"},
+    // MAGNITUDES (PLAN_spell_magnitude §2.5): a numeral at the foot of every
+    // cell whose magnitude is not 1, on a word, an operator and a mod bead.
+    {"magnitude", "fire@2 explosive@0.5 float@0.5 bounce@3 projectile"},
+    // TIMING and SIGNED COMPONENTS (M2/M3): a tag on each item that does not
+    // fire on hit, and a signed numeral on a lift pressing down.
+    {"timing", "explosive!bounce fire!every10+20 bounce@2 lift@-0.5 speed@3 projectile"},
+    {"empty", ""},
+    // The same page, dragged: every mark on the sheet - the ruling, the
+    // pricked margins, the foxing, the great figure - must have moved with it.
+    {"panned", "sand gust gust shotgun projectile", 0.5f, 90.0f, 34.0f},
+    // ...and read close, where the engravings come back.
+    {"zoomed", "sand gust gust shotgun projectile", 1.0f, 0.0f, -40.0f},
+};
+constexpr int kShotSpellSceneCount =
+    (int)(sizeof(kShotSpellScenes) / sizeof(kShotSpellScenes[0]));
+// Open late enough that the world is up and the avatar has spawned (the screen
+// draws a portrait either way, and an empty one is a distraction in a picture
+// of a page). Then one scene every `kShotSpellStride` frames: the words go in
+// on the scene's first frame and the shutter falls eight frames later, which
+// is several ticks of the graph rebuild.
+constexpr uint64_t kShotSpellOpen = 120;
+constexpr uint64_t kShotSpellFirst = 140;
+constexpr uint64_t kShotSpellStride = 12;
+constexpr uint64_t kShotSpellShutter = 8;
+constexpr uint64_t kShotSpellLast =
+    kShotSpellFirst + (uint64_t)(kShotSpellSceneCount - 1) * kShotSpellStride +
+    kShotSpellShutter;
+// Which scene a frame belongs to, or -1: `setup` asks about the frame the
+// words land on, otherwise about the frame the picture is taken on.
+inline int ShotSpellSceneAt(uint64_t frame, bool setup) {
+  const uint64_t base = kShotSpellFirst + (setup ? 0 : kShotSpellShutter);
+  if (frame < base) return -1;
+  const uint64_t d = frame - base;
+  if (d % kShotSpellStride != 0) return -1;
+  const int idx = (int)(d / kShotSpellStride);
+  return idx < kShotSpellSceneCount ? idx : -1;
+}
 
 // ---- --shot-jump: the AIRBORNE POSE's look-iteration harness ---------------
 //
@@ -513,8 +651,30 @@ int g_fellTreeAt = 240;  // the plant tick; the cut is 120 ticks later
 // flood walked 54 voxels west and 40 down through another tree and correctly
 // refused). The harness pad (map.json site `harness`, x/z -128..640) has no
 // trees by construction; --fell-tree 240 200,200 plants there.
+//
+// The 2026-09-22 "3 fps after a tree falls or a big body splits" repro is
+//   SANDVOX_FRAMES_NO_RELOAD=1 SANDVOX_FELL_SPECIES=birch SANDVOX_FELL_SPLIT=90
+//     ./sandvox.exe --frames 2000 --fell-tree 240 200,200
+// (a BAKED tree, not the fixture; two splits; CutBody timed on the log). The
+// NO_RELOAD is not optional: the harness's mid-run F5 lands just after the
+// cut and wipes the bodies, which read as "the tree vanished".
 bool g_fellSiteSet = false;
 int g_fellSiteX = 0, g_fellSiteZ = 0;
+// --forest-fire [tick]: the "whole forest is burning around me" frame-rate
+// repro, in the live loop so debris, mobs, audio and the render all pay what
+// the game pays (--perf treeburn is ONE tree, headless, with no debris).
+// On `tick` (default 240) fire is seeded, IfAir, in a disc of columns out to
+// 100 voxels round the player at ground level and up through the canopy
+// band; the first 600 ticks after that are the fire taking hold and are NOT
+// measured (every harness series is cleared at ignition+600), the next 600
+// are, with the camera turning one full circle so the number is the fire all
+// round and not whichever side the spawn faced. Then the run ends itself and
+// the normal --frames report is the forest fire's.
+//   SANDVOX_FRAMES_NO_RELOAD is implied.
+//   bash scripts/run.sh ./build/Release/sandvox.exe --frames 100000 --forest-fire
+bool g_forestFire = false;
+int g_forestFireAt = 240;
+bool g_forestFireDone = false;
 // SANDVOX_PARK_AT="x,y,z": park at a NAMED PLACE instead of wherever the
 // procedural surface route happens to stop.
 //
@@ -857,15 +1017,30 @@ struct BurnMats {
 
 struct TissueMats {
   uint32_t skin = 0, flesh = 0, muscle = 0, bone = 0, brain = 0;
+  // ROT IS A LIST, not an id. The four tissues above are the ones a human rig
+  // is BUILT from, so each is one authored name; what a bite leaves behind is
+  // whatever the attacking effect named as its `infect` material
+  // (assets/mobs/effects/zombie.json: "rotflesh"), and a second undead with a
+  // second rot material would simply be a second entry here. The tag is the
+  // contract — `matInfectious_` in mob.cpp reads the same one to decide
+  // whether a graft latches an infection, so the readout and the mechanic
+  // cannot disagree about what counts as rot.
+  std::vector<uint32_t> rot;
 };
 
-TissueMats ResolveTissueMats(const MobSystem& mobs) {
+TissueMats ResolveTissueMats(const MobSystem& mobs,
+                             const std::vector<MaterialDef>& mats) {
   TissueMats t;
   t.skin   = mobs.MaterialIdNamed("skin");
   t.flesh  = mobs.MaterialIdNamed("flesh");
   t.muscle = mobs.MaterialIdNamed("muscle");
   t.bone   = mobs.MaterialIdNamed("bone");
   t.brain  = mobs.MaterialIdNamed("brain");
+  for (size_t i = 0; i < mats.size(); i++) {
+    for (const std::string& tag : mats[i].tags) {
+      if (tag == "infectious") { t.rot.push_back((uint32_t)i); break; }
+    }
+  }
   return t;
 };
 
@@ -953,6 +1128,8 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   ui.stainMat = 0;
   ui.stainColor = 0;
   ui.stainLabel[0] = '\0';
+  for (auto& c : ui.coats) c = {};
+  ui.coatCount = 0;
   ui.stainHudMin = CurrentTuning().coat.hudMinFrac;
   const MobDef* def = avatar.Def();
   ui.bodyValid = def != nullptr;
@@ -1008,6 +1185,13 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
     if (tissueMats.muscle) b.voxelMuscle = avatar.PartMaterialCount(i, tissueMats.muscle);
     if (tissueMats.bone)   b.voxelBone   = avatar.PartMaterialCount(i, tissueMats.bone);
     if (tissueMats.brain)  b.voxelBrain  = avatar.PartMaterialCount(i, tissueMats.brain);
+    // Rot is tissue the limb is made of NOW, exactly like the four above — a
+    // bitten arm's flesh bar shrinking with nothing taking its place was the
+    // whole defect: the voxels are still in voxelTotal, they had just stopped
+    // being anything the panel had a name for.
+    uint32_t rotted = 0;
+    for (uint32_t m : tissueMats.rot) rotted += avatar.PartMaterialCount(i, m);
+    b.voxelRot = rotted;
     b.voxelBrainMax = avatar.PartBrainAtSpawn(i);
 
     // What is ON the limb. The ledger is recounted by the creature itself at
@@ -1043,6 +1227,17 @@ void FillBodyUI(const PlayerAvatar& avatar, const BurnMats& burnMats,
   ui.stainMat = whole.top[0].mat;
   ui.stainColor = CoatColorOf(mats, ui.stainMat);
   CopyCoatLabel(mats, ui.stainMat, ui.stainLabel, sizeof ui.stainLabel);
+  static_assert(UIState::kCoatNames == kCoatTop,
+                "UIState::coats mirrors LimbCoat::top");
+  for (const CoatEntry& en : whole.top) {
+    if (en.mat == 0 || en.sumAmt == 0 || whole.voxels == 0) continue;
+    UIState::CoatName& c = ui.coats[ui.coatCount++];
+    c.mat = en.mat;
+    c.frac = std::clamp((float)en.sumAmt / (float)(kBodyStainAmtMax * whole.voxels),
+                        0.0f, 1.0f);
+    c.color = CoatColorOf(mats, en.mat);
+    CopyCoatLabel(mats, en.mat, c.label, sizeof c.label);
+  }
 }
 
 // ---- the character panel's live avatar portrait -----------------------------
@@ -2903,14 +3098,10 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       // this harness exists to answer without a live session.
       uint32_t wearDye = 0;
       if (size_t hash = itemName.find('#'); hash != std::string::npos) {
-        const unsigned long v =
-            std::strtoul(itemName.c_str() + hash + 1, nullptr, 16);
         // Authored the way a human writes a colour (#RRGGBB) and packed the
-        // way the GPU reads one (r in the low byte) — the swap is here rather
-        // than in dye.h because this is the only place a dye is ever typed.
-        wearDye = DyePack((float)((v >> 16) & 0xFFu) / 255.0f,
-                          (float)((v >> 8) & 0xFFu) / 255.0f,
-                          (float)(v & 0xFFu) / 255.0f);
+        // way the GPU reads one (r in the low byte). The swap lives in
+        // dye.h (DyeParseHex) now that a mob's loot table types colours too.
+        wearDye = DyeParseHex(itemName.substr(hash));
         itemName = itemName.substr(0, hash);
       }
       const int ii = items.Find(itemName);
@@ -4335,6 +4526,8 @@ int main(int argc, char** argv) {
           "                        --shot-strike zombie bite_lunge human+iron_cuirass\n"
           "  --shot-inventory      Character screen (I) with a damaged avatar,\n"
           "                        one frame to screenshot_inventory.bmp\n"
+          "  --shot-spellpage      The spell page, one BMP per word list:\n"
+          "                        shot_spell_<scene>.bmp (the look gallery)\n"
           "  --shot-jump           Airborne pose look iteration: third person,\n"
           "                        one BMP per phase of a jump (rise/apex/\n"
           "                        fall/land), triggered on the pose's own vy\n"
@@ -4353,11 +4546,11 @@ int main(int argc, char** argv) {
           "  --measure             Vulkan sizing harness (occupancy + GPU timings)\n"
           "  --perf                Performance suite -> build/perf.json (tuner Performance tab)\n"
           "  --perf-list           List the --perf scenarios and exit\n"
-          "  --scenario <id>       One --perf scenario (idle|treeburn|flythrough|explosion|water)\n"
+          "  --scenario <id>       One --perf scenario (idle|treeburn|forestfire|flythrough|explosion|water)\n"
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
           "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
-          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy; default all)\n"
+          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire; default all)\n"
           "  --shader-stats        Per-shader registers/spills from the driver\n"
           "                        -> build/shader_stats.json (headless)\n\n"
           "Residency:\n"
@@ -4469,6 +4662,12 @@ int main(int argc, char** argv) {
       g_shotInventory = true;
       g_harnessFrames = kShotInvDeathTurnShot;
     }
+    // `--shot-spellpage` is the SPELL PAGE's gallery: one BMP per word list,
+    // all of them on the same canvas. See the note at g_shotSpellPage.
+    else if (a == "--shot-spellpage") {
+      g_shotSpellPage = true;
+      g_harnessFrames = kShotSpellLast;
+    }
     // `--shot-jump` is the AIRBORNE POSE's look-iteration harness: walk the
     // avatar in third person, jump it, and write one picture per phase of the
     // arc. See the note at g_shotJump for why the captures are triggered by
@@ -4484,6 +4683,10 @@ int main(int argc, char** argv) {
     // stroke can be judged against a body rather than against the sky. Phase B's
     // AI/spawn panel supersedes it; keep the footprint here at one bool.
     else if (a == "--duel-dummy") g_duelDummy = true;
+    else if (a == "--forest-fire") {
+      g_forestFire = true;
+      if (i + 1 < argc && argv[i + 1][0] != '-') g_forestFireAt = std::atoi(argv[++i]);
+    }
     else if (a == "--fell-tree") {
       g_fellTree = true;
       if (i + 1 < argc && argv[i + 1][0] != '-') g_fellTreeAt = std::atoi(argv[++i]);
@@ -5916,6 +6119,44 @@ int main(int argc, char** argv) {
       if (ui.aiWeaponNames[i] == want) ui.aiWeaponPick = i;
   };
   rebuildAiWeapons();
+  // ---- THE F1 "GIVE ME A FILLED VESSEL" PICKERS (UIState::giveVesselNames) --
+  // Every container item, and per vessel every material whose CLASS it holds,
+  // sorted by name. By name and re-found by name on each rebuild, for the
+  // weapon picker's reason; rebuilt on R because both the item library and
+  // the material table can change under it.
+  auto rebuildGiveVessels = [&ui, &items, &mats]() {
+    const std::string wasV =
+        (ui.giveVesselPick >= 0 && ui.giveVesselPick < (int)ui.giveVesselNames.size())
+            ? ui.giveVesselNames[ui.giveVesselPick] : std::string();
+    std::string wasM;
+    if (ui.giveVesselPick >= 0 && ui.giveVesselPick < (int)ui.giveVesselMats.size()) {
+      const auto& l = ui.giveVesselMats[ui.giveVesselPick];
+      if (ui.giveMatPick >= 0 && ui.giveMatPick < (int)l.size()) wasM = l[ui.giveMatPick];
+    }
+    ui.giveVesselNames.clear();
+    ui.giveVesselMats.clear();
+    for (const ItemDef& it : items.items) {
+      if (!it.IsContainer()) continue;
+      std::vector<std::string> ms;
+      for (size_t m = 1; m < mats.size(); m++) {
+        const uint32_t k = mats[m].gpu.klass;
+        if (k <= 31 && ((it.container.holds >> k) & 1u)) ms.push_back(mats[m].name);
+      }
+      std::sort(ms.begin(), ms.end());
+      ui.giveVesselNames.push_back(it.name);
+      ui.giveVesselMats.push_back(std::move(ms));
+    }
+    ui.giveVesselPick = 0;
+    ui.giveMatPick = 0;
+    for (int i = 0; i < (int)ui.giveVesselNames.size(); i++)
+      if (ui.giveVesselNames[i] == wasV) ui.giveVesselPick = i;
+    if (ui.giveVesselPick < (int)ui.giveVesselMats.size()) {
+      const auto& l = ui.giveVesselMats[ui.giveVesselPick];
+      for (int i = 0; i < (int)l.size(); i++)
+        if (l[i] == (wasM.empty() ? std::string("water") : wasM)) ui.giveMatPick = i;
+    }
+  };
+  rebuildGiveVessels();
   // ---- THE WARDROBE PICKERS (game/dye.h, the overlay's Wardrobe window) ----
   //
   // Every DYEABLE piece, split by the slot it goes in. Same contract as the
@@ -6059,6 +6300,18 @@ int main(int argc, char** argv) {
     player.fly = true;
     ui.fly = true;
   }
+  // PLAY OR DEV at boot (UIState::devControls). A lab scene is a bench,
+  // SANDVOX_DEV=1 asks for one, and every SCRIPTED run (--frames, each --shot,
+  // which all set g_harnessFrames) keeps the dev bindings and fly state it was
+  // measured with. Otherwise the game starts as a game: walking, hands up.
+  // F2 flips it.
+  ui.devControls = labScene >= 0 || g_harnessFrames > 0 ||
+                   std::getenv("SANDVOX_DEV") != nullptr;
+  if (!ui.devControls) {
+    ui.fly = false;
+    player.fly = false;
+    ui.tool = UIState::kToolMelee;
+  }
   // The render camera interpolates prevPos -> pos across a tick (N2), and
   // every placement above is a TELEPORT: without this the first frames would
   // lerp the eye in from the constructor's default position.
@@ -6086,8 +6339,8 @@ int main(int argc, char** argv) {
   // switched (camera.meleeSensHalflife). See the note at the ApplyMouse call.
   float lookSensNow = 1.0f;
 
-  KeyEdge eP, eN, eV, eF1, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eEq, eU, eL, eI, eQ;
+  KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
+      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
   // (E has no KeyEdge: it is a hold-aware binding now — see the tap/hold
   // block by `takeE` — and an edge tracker would only be half of it.)
   KeyEdge eGlyph[kGlyphSlots];
@@ -6197,6 +6450,53 @@ int main(int argc, char** argv) {
   // the hotbar is WHAT IS IN YOUR HAND and predates all of this; the melee
   // path reads Inventory::Selected() and must keep doing exactly that.
   PlayerKit& kit = session.kit;
+  // ---- WHAT THE PLAYER IS CARRYING WHEN THEY DIE INFECTED -----------------
+  //
+  // The avatar is not excluded from turning (Mob::Die's rising test reads the
+  // def's `turn` block, and every character inherits one from human.json), so
+  // a player who dies with the rot in them stands up six seconds later as a
+  // zombie of themselves. It rises in the gear it fell in because `worn_` is
+  // on the body — but the BAG AND HOTBAR ARE NOT ON THE BODY, they are here,
+  // and MobSystem cannot see a session (game/session.h). This is the seam.
+  //
+  // COPY OR MOVE, and that is the whole of `avatar.keepKitOnTurn`:
+  //
+  //   true  (default) — the zombie rises with a COPY and you respawn with
+  //                     everything. Two swords exist where one did. That is a
+  //                     duplication machine and it is deliberately the default
+  //                     while the feature is being played with, because losing
+  //                     your kit to a test bite is worse than duplicating it.
+  //   false           — bag, hotbar and equipment are EMPTIED on the way out.
+  //                     Your kit walks away wearing your face; go and take it
+  //                     back off the thing. No duplication, and the death
+  //                     penalty this was always going to become.
+  //
+  // Equipment is cleared but NOT copied: the worn pieces are already on the
+  // rig and Die() captured them through the ordinary `worn_` walk, so copying
+  // them here would hand the zombie a second breastplate. Clearing it is what
+  // stops the wear loop re-dressing the respawned body from the slot.
+  mobs.SetAvatarKitFn([&kit, &hotbar, &items](std::vector<CarriedItem>& out) {
+    const bool keep = CurrentTuning().avatar.keepKitOnTurn;
+    auto take = [&](ItemStack& s) {
+      if (s.Empty()) return;
+      // BY NAME on the way out (item.h's index hazard): what this hands back
+      // travels through a rising, a save record and a handoff packet, and a
+      // library index survives none of those.
+      const ItemDef* d = items.At(s.def);
+      out.push_back(CarriedItem{d ? d->name : std::string(), s.count, s.dye});
+      if (!keep) s = ItemStack{};
+    };
+    for (ItemStack& s : kit.bag.slots) take(s);
+    for (ItemStack& s : hotbar.slots) take(s);
+    if (!keep)
+      for (int e = 0; e < kEquipSlotCount; e++) kit.equip.slots[e] = ItemStack{};
+    // A name the library no longer knows resolves to "" and would be dropped
+    // silently by the far side; drop it here instead, where the slot it came
+    // from can still be reported if that ever needs saying.
+    out.erase(std::remove_if(out.begin(), out.end(),
+                             [](const CarriedItem& c) { return c.item.empty(); }),
+              out.end());
+  });
   // What we last ASKED the body to wear, per equip slot. Not a second copy of
   // the equipment — it is the record that keeps a REFUSED piece (a helm on a
   // creature with no head) from being retried thirty times a second. Cleared
@@ -6209,37 +6509,26 @@ int main(int argc, char** argv) {
   // nothing until you took it off. The dye is part of the comparison for the
   // same reason the name is the rest of it. 0 = undyed (game/dye.h).
   uint32_t (&wearDye)[kEquipSlotCount] = session.wearDye;
-  // ---- THE SHEATH IS THE WEAPON SLOT -------------------------------------
+  // The last frame's RENDER eye, for the pour point (ContainerPourPoint): the
+  // crosshair ray starts there -- ahead of the head in first person
+  // (avatar.firstPersonForward), on the boom in third -- and the tick's pour
+  // is settled before this frame's eye exists.
+  Vec3 pourFrom{};
+  bool pourFromValid = false;
+  // ---- THE HOTBAR IS THE HAND ---------------------------------------------
   //
-  // A blade is either DRAWN (a real rig part in the fist, swinging) or STOWED
-  // (an entry in the Sheath equip slot and nothing else). Q toggles. The
-  // hotbar stays exactly what it was — WHAT IS IN YOUR HAND for consumables
-  // and tools, still selected by the number row — it simply stops being where
-  // a weapon comes from, because "the sword you are carrying" and "the potion
-  // you have selected" were never the same question.
-  //
-  // `toolBeforeDraw` is what the tool selector goes back to on stow. Drawing
-  // forces the melee tool (otherwise you draw a sword and the left mouse
-  // button still paints stone), and silently keeping it afterwards would
-  // strand the player in a mode they never chose.
-  SheathState& sheath = session.sheath;
-  sheath.toolBefore = UIState::kToolBrush;
-  const int kSheathSlot = (int)EquipSlotId::Sheath;
-  // What the Sheath slot holds, as a kind. Written as a lambda because both
-  // the key press and the per-frame reconcile ask, and re-deriving it at each
-  // site is how the two stop agreeing.
-  auto sheathKind = [&] {
-    const ItemStack& sh = kit.equip.At(kSheathSlot);
-    const ItemDef* d = items.At(sh.Empty() ? -1 : sh.def);
-    return d ? d->kind : ItemKind::None;
-  };
+  // A weapon is drawn the way a flask is: put it in a hotbar slot and select
+  // that slot (number row / wheel) with the melee tool up. There is no draw
+  // key any more -- the owner's call (2026-09-23), replacing Q-draws-from-the-
+  // sheath. The Sheath and Quick equipment slots are still there as places a
+  // blade rides on your person; they just are not where the hand reaches.
   {
     // ---- THE STARTING KIT, AND IT IS STILL A STUB ------------------------
     //
     // One of everything the library defines, put somewhere it can actually be
-    // USED rather than all of it in the hotbar: a weapon goes to the sheath
-    // (which is where the draw key looks), armour goes to the pack (so it can
-    // be dragged onto the figure), and anything else keeps the hotbar. Before
+    // USED rather than all of it in the hotbar: armour goes to the pack (so it
+    // can be dragged onto the figure), and anything else -- weapons included,
+    // since the hotbar is the hand -- keeps the hotbar. Before
     // this, an armour item started in the hotbar and there was no way to get
     // it onto the body without first knowing to drag it out.
     //
@@ -6250,11 +6539,11 @@ int main(int argc, char** argv) {
       const ItemDef& it = items.items[i];
       int home = -1;
       for (int s = 0; s < kEquipSlotCount && home < 0; s++)
-        if (!EquipSlotIsWorn(s) && EquipSlotAccepts(s, it.kind) &&
-            kit.equip.At(s).Empty())
+        if (it.kind != ItemKind::Melee && !EquipSlotIsWorn(s) &&
+            EquipSlotAccepts(s, it.kind) && kit.equip.At(s).Empty())
           home = s;
       if (home >= 0)
-        kit.equip.slots[home] = {i, 1};       // the sword, into the sheath
+        kit.equip.slots[home] = {i, 1};
       else if (ItemKindIsWorn(it.kind))
         kit.bag.Add(i, 1);                     // armour, into the pack
       else
@@ -6287,7 +6576,7 @@ int main(int argc, char** argv) {
   // Burn-material ids for the inspector's charred readout, resolved ONCE here
   // and again after every materials reload — never per frame (see ResolveBurnMats).
   BurnMats burnMats = ResolveBurnMats(mats);
-  TissueMats tissueMats = ResolveTissueMats(mobs);
+  TissueMats tissueMats = ResolveTissueMats(mobs, mats);
   // ---- THE DEATH SCREEN'S PHOTOGRAPH ---------------------------------------
   // Registered once, called from inside Die() while the rig is still whole
   // (PlayerAvatar::SetDyingObserver). It runs the SAME mirror the frame loop
@@ -6676,7 +6965,7 @@ int main(int argc, char** argv) {
     // 300-tick profile window. What differs is that this loop RENDERS. Here
     // rather than in the tick body because it reads g_frameMs, which is the
     // frame layer's own whole-frame ring.
-    tickCtx.fellTree = [&world, &mats, &debris, &player, &cam](
+    tickCtx.fellTree = [&world, &mats, &debris, &player, &cam, &phys, &treeAtlas](
                            uint32_t tick, std::vector<CellOp>& cellOps) {
       static int fellPhase = 0;  // 0 waiting, 1 planted, 2 cut, 3 reported
       static uint32_t fellPlantTick = 0, fellCutTick = 0;
@@ -6684,17 +6973,100 @@ int main(int argc, char** argv) {
       static size_t fellFrame0 = 0;
       static bool fellBodySeen = false;
       static bool fellTreeSeen = false;
+      static uint32_t fellTreeTick = 0;
       static selftest::TreeFixture fellTree;
       auto matByName = [&](const char* n) -> uint32_t {
         for (size_t i = 0; i < mats.size(); i++)
           if (mats[i].name == n) return (uint32_t)i;
         return 0u;
       };
+      // SANDVOX_FELL_SPLIT=<ticks>: that long after the tree becomes a body,
+      // split the largest body across its longest axis, twice, 45 ticks
+      // apart -- the "one big body becomes several" half of the report --
+      // and profile the 300 ticks after the first split like the fall.
+      static const int splitAfter = [] {
+        const char* e = std::getenv("SANDVOX_FELL_SPLIT");
+        return e ? std::max(1, std::atoi(e)) : 0;
+      }();
       if ((tick % 60u) == 0u)
         std::printf("--fell-tree: tick %u player (%.1f,%.1f,%.1f) yaw %.2f fly %d\n",
                     tick, player.pos.x, player.pos.y, player.pos.z, cam.yaw,
                     player.fly ? 1 : 0);
-      if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt) {
+      static bool fellCutWide = false;
+      static int fellCutR = 4;
+      if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt &&
+          std::getenv("SANDVOX_FELL_SPECIES") != nullptr) {
+        // SANDVOX_FELL_SPECIES=<name>[:variant]: the BAKED tree instead of the
+        // fixture -- the atlas's own voxels (TreeAtlasCellAt, the shader's
+        // column/run path), stamped where the fixture would stand, over as
+        // many ticks as the op cap needs. What a player actually cuts down.
+        static std::vector<CellOp> stamp;
+        static size_t stampAt = 0;
+        static bool stampBuilt = false;
+        if (!stampBuilt) {
+          stampBuilt = true;
+          std::string want = std::getenv("SANDVOX_FELL_SPECIES");
+          int variant = 0;
+          if (const size_t colon = want.find(':'); colon != std::string::npos) {
+            variant = std::atoi(want.c_str() + colon + 1);
+            want.resize(colon);
+          }
+          int sp = -1;
+          for (int i = 0; i < (int)treeAtlas.species.size(); i++)
+            if (treeAtlas.species[i].name == want) sp = i;
+          if (sp < 0) {
+            std::printf("--fell-tree: no species '%s' in the atlas\n", want.c_str());
+            fellPhase = 3;
+            return;
+          }
+          using namespace treeatlas;
+          const uint32_t* W = treeAtlas.words.data();
+          const uint32_t* sd = W + W[kHSpeciesDir] + sp * kSpeciesWords;
+          variant = std::min(variant, (int)sd[kSVariantCount] - 1);
+          const uint32_t* d = W + sd[kSVariantDir] + variant * kVariantWords;
+          const int nx = (int)d[kVNx], ny = (int)d[kVNy], nz = (int)d[kVNz];
+          const int ax = (int)d[kVAnchorX], az = (int)d[kVAnchorZ];
+          const Vec3 fwd = cam.Forward();
+          const int bx = ifloor(player.pos.x + fwd.x * 48.0f);
+          const int bz = ifloor(player.pos.z + fwd.z * 48.0f);
+          fellGroundY = World::TerrainHeight(bx, bz, kDefaultSeed);
+          size_t wood = 0, other = 0;
+          int trunkR = 0;
+          for (int lz = 0; lz < nz; lz++)
+            for (int ly = 0; ly < ny; ly++)
+              for (int lx = 0; lx < nx; lx++) {
+                const uint32_t m = TreeAtlasCellAt(treeAtlas, sp, variant, lx, ly, lz);
+                if (m == 0) continue;
+                const IVec3 cc{bx + lx - ax, fellGroundY + 1 + ly, bz + lz - az};
+                if (!world.CellInWindow(cc)) continue;
+                stamp.push_back({World::SlotCellIndex(cc),
+                                 PackVoxNew(m, (uint32_t)(lx * 7 + ly * 3 + lz) % 3u)});
+                const bool isWood = m < mats.size() &&
+                    (mats[m].name.find("wood") != std::string::npos ||
+                     mats[m].name.find("bark") != std::string::npos);
+                (isWood ? wood : other)++;
+                if (isWood && ly == 11)
+                  trunkR = std::max(trunkR, std::max(std::abs(lx - ax), std::abs(lz - az)));
+              }
+          fellTree.base = IVec3{bx, fellGroundY + 1, bz};
+          fellTree.lo = IVec3{bx - ax, fellGroundY + 1, bz - az};
+          fellTree.hi = IVec3{bx - ax + nx - 1, fellGroundY + ny, bz - az + nz - 1};
+          fellTree.woodCells = (uint32_t)wood;
+          fellTree.leafCells = (uint32_t)other;
+          fellCutWide = true;
+          fellCutR = std::min(40, trunkR + 3);
+          std::printf("--fell-tree: SPECIES %s variant %d: %dx%dx%d, %zu wood + %zu "
+                      "other, trunk half-width %d at +11, stamped at (%d,%d,%d)\n",
+                      want.c_str(), variant, nx, ny, nz, wood, other, trunkR, bx,
+                      fellGroundY + 1, bz);
+        }
+        while (stampAt < stamp.size() && cellOps.size() < kMaxCellOpsPerTick)
+          cellOps.push_back(stamp[stampAt++]);
+        if (stampAt < stamp.size()) return;
+        fellPlantTick = tick;
+        fellPhase = 1;
+        std::fflush(stdout);
+      } else if (fellPhase == 0 && tick >= (uint32_t)g_fellTreeAt) {
         const Vec3 fwd = cam.Forward();
         const int bx = ifloor(player.pos.x + fwd.x * 48.0f);
         const int bz = ifloor(player.pos.z + fwd.z * 48.0f);
@@ -6722,16 +7094,17 @@ int main(int argc, char** argv) {
       } else if (fellPhase == 1 && tick >= fellPlantTick + 120) {
         const int fx = fellTree.base.x, fz = fellTree.base.z;
         const int cutY = fellGroundY + 11;
+        const int cr = fellCutWide ? fellCutR : 4;
         for (int y = cutY; y < cutY + 3; y++)
-          for (int dz = -4; dz <= 4; dz++)
-            for (int dx = -4; dx <= 4; dx++) {
+          for (int dz = -cr; dz <= cr; dz++)
+            for (int dx = -cr; dx <= cr; dx++) {
               const IVec3 cc{fx + dx, y, fz + dz};
               if (!world.CellInWindow(cc)) continue;
               if (cellOps.size() < kMaxCellOpsPerTick)
                 cellOps.push_back({World::SlotCellIndex(cc), 0u});
             }
-        debris.AddDestructionEvent(tick, {fx - 5, fellGroundY + 10, fz - 5},
-                                   {fx + 5, fellGroundY + 15, fz + 5});
+        debris.AddDestructionEvent(tick, {fx - cr - 1, fellGroundY + 10, fz - cr - 1},
+                                   {fx + cr + 1, fellGroundY + 15, fz + cr + 1});
         debris.SetProfiling(true);
         debris.ResetProfile();
         debris.ResetFloaterProbe();
@@ -6797,6 +7170,204 @@ int main(int argc, char** argv) {
                     world.FetchReport().c_str());
         std::fflush(stdout);
         if (!std::getenv("SANDVOX_DEBRIS_PROFILE")) debris.SetProfiling(false);
+      }
+      // THE WORST PHYSICS STEP, per 60 ticks while anything is a body: a
+      // whole-frame max says a frame was slow, this says Jolt was the reason.
+      if (fellPhase >= 2 && (tick % 60u) == 0u) {
+        std::printf("--fell-tree: tick %u (+%u) bodies %u, worst Jolt Update "
+                    "since last line %.1f ms\n",
+                    tick, tick - fellCutTick, debris.BodyCount(),
+                    phys.Runaway().worstStepMs);
+        phys.ResetRunawayProbe();
+      }
+      if (fellTreeSeen && fellTreeTick == 0) fellTreeTick = tick;
+      static int splits = 0;
+      static uint32_t splitTick0 = 0, lastSplitTick = 0;
+      static size_t splitFrame0 = 0;
+      if (splitAfter > 0 && fellTreeTick != 0 && splits < 2 &&
+          tick >= fellTreeTick + (uint32_t)splitAfter &&
+          (splits == 0 || tick >= lastSplitTick + 45)) {
+        uint32_t bi = UINT32_MAX, big = 0;
+        for (uint32_t b = 0; b < debris.BodyCount(); b++)
+          if (debris.BodyVoxelCount(b) > big) {
+            big = debris.BodyVoxelCount(b);
+            bi = b;
+          }
+        Vec3 lmn{}, lmx{};
+        BodyTransform bxf{};
+        const uint64_t h = bi != UINT32_MAX ? debris.BodyHandle(bi) : 0;
+        if (h != 0 && phys.GetLocalBounds(h, lmn, lmx) && phys.GetTransform(h, bxf)) {
+          // Across the body's own longest LOCAL axis, through its middle.
+          const float ext[3] = {lmx.x - lmn.x, lmx.y - lmn.y, lmx.z - lmn.z};
+          int ax = 0;
+          for (int a = 1; a < 3; a++)
+            if (ext[a] > ext[ax]) ax = a;
+          auto rot = [&](Vec3 v) {
+            const Vec3 u{bxf.quat[0], bxf.quat[1], bxf.quat[2]};
+            const Vec3 t = u.cross(v) * 2.0f;
+            return v + t * bxf.quat[3] + u.cross(t);
+          };
+          const Vec3 c = bxf.pos + rot(Vec3{0.5f * (lmn.x + lmx.x),
+                                            0.5f * (lmn.y + lmx.y),
+                                            0.5f * (lmn.z + lmx.z)});
+          const Vec3 n = rot(Vec3{ax == 0 ? 1.0f : 0.0f, ax == 1 ? 1.0f : 0.0f,
+                                  ax == 2 ? 1.0f : 0.0f});
+          // THE BLADE'S COST ON THIS BODY FIRST: eight kerfs across the
+          // split plane, each timed, the way a sword stroke's probes land on a
+          // log (melee.cpp ResolveOnLooseMatter -> CutBody). Shallow slots,
+          // so they carve without parting it and the split below still has
+          // the whole body to work on.
+          if (splits == 0) {
+            std::vector<ParticleSpawn> sp;
+            double worst = 0, tot = 0;
+            for (int k = 0; k < 8; k++) {
+              KerfCut kc;
+              kc.at = c + Vec3{0.0f, 0.5f * (float)k, 0.0f};
+              kc.edgeAxis = Vec3{n.z, 0.0f, -n.x}.len() > 0.1f
+                                ? Vec3{n.z, 0.0f, -n.x}.normalized()
+                                : Vec3{1.0f, 0.0f, 0.0f};
+              kc.cutDir = n;
+              kc.depth = 1.5f;
+              kc.halfWidth = 0.3f;
+              kc.length = 3.0f;
+              kc.seed = (uint32_t)k;
+              const auto tk = std::chrono::steady_clock::now();
+              debris.CutBody(debris.BodyHandle(bi), kc, world, sp);
+              const double ms = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - tk).count();
+              worst = std::max(worst, ms);
+              tot += ms;
+            }
+            std::printf("--fell-tree: 8 CutBody kerfs on the %u-vox body: %.2f ms "
+                        "total, worst %.2f, bodies now %u\n", big, tot, worst,
+                        debris.BodyCount());
+          }
+          const auto t0 = std::chrono::steady_clock::now();
+          const bool ok = debris.SplitBody(debris.BodyHandle(bi), c, n);
+          const double ms = std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - t0).count();
+          std::printf("--fell-tree: SPLIT %d of body %u (%u vox) across axis %d "
+                      "at tick %u: %s in %.2f ms, bodies now %u\n",
+                      splits, bi, big, ax, tick, ok ? "ok" : "REFUSED", ms,
+                      debris.BodyCount());
+          if (splits == 0) {
+            splitTick0 = tick;
+            splitFrame0 = g_frameMs.size();
+          }
+          lastSplitTick = tick;
+          splits++;
+          std::fflush(stdout);
+        } else {
+          splits = 2;  // nothing left to split
+        }
+      }
+      if (splitTick0 != 0 && tick == splitTick0 + 300) {
+        std::vector<double> win(g_frameMs.begin() + (ptrdiff_t)splitFrame0,
+                                g_frameMs.end());
+        std::sort(win.begin(), win.end());
+        auto pct = [&](double p) {
+          return win.empty() ? 0.0 : win[(size_t)(p * (win.size() - 1))];
+        };
+        size_t over33 = 0;
+        for (double m : win) if (m > 33.0) over33++;
+        std::printf("--fell-tree: SPLIT window 300 ticks / %zu frames: whole-frame "
+                    "ms p50 %.1f p95 %.1f p99 %.1f max %.1f, >33ms %zu; bodies %u\n",
+                    win.size(), pct(0.5), pct(0.95), pct(0.99),
+                    win.empty() ? 0.0 : win.back(), over33, debris.BodyCount());
+        std::fflush(stdout);
+      }
+    };
+  }
+  if (g_forestFire && !g_fellTree) {
+    // ---- --forest-fire (see g_forestFire). Borrows the fell-tree slot: it is
+    // the frame layer's one cell-op hook, and the two harnesses are exclusive.
+    tickCtx.fellTree = [&world, &mats, &debris, &player, &sim](
+                           uint32_t tick, std::vector<CellOp>& cellOps) {
+      static std::vector<CellOp> seed;
+      static size_t seedAt = 0;
+      static bool built = false;
+      if (g_forestFireDone) return;
+      // NOT BEFORE THE HORIZON EXISTS. The far pipelines compile on background
+      // threads and any worldgen.wgsl edit makes that a minute or more; a
+      // fire measured before `fardown` exists is measured without it (it
+      // happened twice on 2026-09-22 and read as a 15 ms win). Ignition slides
+      // to 60 ticks after they are ready, and every later phase with it.
+      if (!built && (uint32_t)g_forestFireAt <= tick && !sim.FarPipelinesReady()) {
+        g_forestFireAt = (int)tick + 60;
+        return;
+      }
+      const uint32_t t0 = (uint32_t)g_forestFireAt;
+      if (tick < t0) return;
+      if (!built) {
+        built = true;
+        uint32_t fire = 0;
+        for (size_t i = 0; i < mats.size(); i++)
+          if (mats[i].name == "fire") { fire = (uint32_t)i; break; }
+        const int px = ifloor(player.pos.x), pz = ifloor(player.pos.z);
+        // A jittered 9-voxel grid of columns, 12..100 voxels out. Jitter is a
+        // fixed hash of the column so the seed set is the same every run.
+        for (int gz = -100; gz <= 100; gz += 9)
+          for (int gx = -100; gx <= 100; gx += 9) {
+            const uint32_t h = (uint32_t)(gx * 73856093) ^ (uint32_t)(gz * 19349663);
+            const int x = px + gx + (int)(h % 5u) - 2;
+            const int z = pz + gz + (int)((h >> 8) % 5u) - 2;
+            const int d2 = (x - px) * (x - px) + (z - pz) * (z - pz);
+            if (d2 < 12 * 12 || d2 > 100 * 100) continue;
+            const int g = World::TerrainHeight(x, z, kDefaultSeed);
+            for (int y : {g + 1, g + 2, g + 10, g + 18, g + 26, g + 34, g + 42}) {
+              const IVec3 c{x, y, z};
+              if (!world.CellInWindow(c)) continue;
+              seed.push_back({World::SlotCellIndex(c), fire | kCellOpIfAir});
+            }
+          }
+        // SANDVOX_FOREST_FIRE_CONTROL=1: the same run, camera and schedule
+        // with no fire -- the control arm every per-pass number is read against.
+        if (std::getenv("SANDVOX_FOREST_FIRE_CONTROL")) seed.clear();
+        std::printf("--forest-fire: tick %u, %zu fire seeds round (%d,%d)\n",
+                    tick, seed.size(), px, pz);
+        std::fflush(stdout);
+      }
+      while (seedAt < seed.size() && cellOps.size() < kMaxCellOpsPerTick)
+        cellOps.push_back(seed[seedAt++]);
+      if (tick % 60u == 0u) {
+        const WorldSnapshot& sn = world.Snap();
+        std::printf("--forest-fire: tick %u (+%u) active %u particles %u bodies %u\n",
+                    tick, tick - t0, sn.valid ? sn.activeChunks : 0u,
+                    sn.valid ? sn.particleCount : 0u, debris.BodyCount());
+        std::fflush(stdout);
+      }
+      // The fire has had 20 s. Every --frames series starts over here, so the
+      // exit report is the burning forest and nothing before it.
+      if (tick == t0 + 600u) {
+        g_frameMs.clear();
+        g_activeChunks.clear();
+        for (int i = 0; i < sandvox::kPerfScopeCount; i++) {
+          g_frameScopeSum[i] = 0;
+          g_frameScopeMax[i] = 0;
+          g_frameScopeSeries[i].clear();
+        }
+        for (int n = 0; n < sandvox::kPerfNodeCount; n++) g_frameGpuSeries[n].clear();
+        g_frameGpuPassSeries.clear();
+        g_frameGpuFrames = 0;
+        // The debris/terrain phase profile over the same window: the CPU
+        // table's terrainMesh / debris rows are the whole of it, and a row
+        // is a sum -- this says which phase of it.
+        debris.SetProfiling(true);
+        debris.ResetProfile();
+        std::printf("--forest-fire: MEASURING from tick %u\n", tick);
+        std::fflush(stdout);
+      }
+      // SANDVOX_FOREST_FIRE_PROBE=1: WHAT the awake chunks are (depth band and
+      // material mix vs an idle control), via the park probe's sampler. Off by
+      // default: it pulls ~380 chunks through the fetch ring mid-measurement.
+      static const bool probe = std::getenv("SANDVOX_FOREST_FIRE_PROBE") != nullptr;
+      if (probe && tick == t0 + 900u) ParkSampleRequest(world, "fire");
+      if (probe && tick == t0 + 940u) ParkSampleReport(world, mats, "fire");
+      if (tick >= t0 + 1200u) {
+        std::printf("--forest-fire: debris profile over the measured window: %s\n",
+                    debris.ProfileReport().c_str());
+        std::fflush(stdout);
+        g_forestFireDone = true;
       }
     };
   }
@@ -8024,6 +8595,9 @@ int main(int argc, char** argv) {
   // THE GHOST LIST REACHES THE TICK ONLY WHEN THERE IS A NETWORK. Null
   // otherwise, which is what keeps phases B / H / I / O making exactly the
   // calls they made before package B landed.
+  // The ground-item registry: the tick throws vessels into it and breaks the
+  // ones that land hard (session.h section H2).
+  tickCtx.ground = &ground;
   if (netRoleBoot != NetRole::None) tickCtx.remotes = &remotes;
   // ...and so does the op exchange. Null in every harness and in every
   // single-player frame; even here it does nothing until Connected().
@@ -8109,7 +8683,7 @@ int main(int argc, char** argv) {
       // tail of a default `--frames` run is the compiler, not the game.
       // SANDVOX_FRAMES_NO_RELOAD=1 is the measurement arm.
       static const bool noReload =
-          std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr;
+          std::getenv("SANDVOX_FRAMES_NO_RELOAD") != nullptr || g_forestFire;
       if (frameCounter == g_harnessFrames / 2 && !noReload) {
         std::printf("--frames harness: triggering shader reload (F5 path)\n");
         ui.reloadShaders = true;
@@ -8118,7 +8692,7 @@ int main(int argc, char** argv) {
     }
     // The park probe is tick-scheduled, so it decides its own end: --frames
     // only has to be generous enough to reach it.
-    if (g_parkDone) glfwSetWindowShouldClose(window, 1);
+    if (g_parkDone || g_forestFireDone) glfwSetWindowShouldClose(window, 1);
 
     // --shot-jump: decide whether THIS frame is one of the four pictures.
     //
@@ -8205,6 +8779,61 @@ int main(int argc, char** argv) {
       if (g_shotJumpPath) g_shotJumpVy = vy;
     }
 
+    // --shot-spellpage's scripted schedule: open the screen on the grimoire,
+    // then one word list per scene. The words are written into the COMPOSER's
+    // field, which is the same thing typing them does; everything else (parse,
+    // lower, build, the mirror the canvas draws) happens on the ordinary path.
+    if (g_shotSpellPage) {
+      if (frameCounter == 1) {
+        ui.fly = false;
+        player.fly = false;
+      }
+      if (frameCounter == kShotSpellOpen) {
+        ui.inventoryOpen = true;
+        ui.grimoireMode = true;
+        // THE BOOK IS SHUT BY DEFAULT (2026-09-22). This harness photographs
+        // the page, so it opens the book the way the player does.
+        ui.spellbookOpen = true;
+        ui.visible = false;  // the dev panel sits on top of the thing we shoot
+        captured = false;
+        captureBeforeUi = false;
+        glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_NORMAL);
+        // PARK THE POINTER. It lands wherever the window happened to put it,
+        // and one of the gallery's pictures came back with the page list's
+        // tooltip open across the canvas - a picture of a tooltip, not of a
+        // page. Bottom-centre is the one patch of this screen with nothing
+        // hoverable on it.
+        glfwSetCursorPos(window, 1200.0, 880.0);
+      }
+      const int sceneSetup = ShotSpellSceneAt(frameCounter, true);
+      if (sceneSetup >= 0) {
+        const ShotSpellScene& sc = kShotSpellScenes[sceneSetup];
+        GrimoirePage pg;
+        pg.name = std::string("shot-") + sc.name;
+        std::string w;
+        for (const char* c = sc.words;; c++) {
+          if (*c == ' ' || *c == 0) {
+            if (!w.empty()) pg.words.push_back(w);
+            w.clear();
+            if (*c == 0) break;
+          } else {
+            w.push_back(*c);
+          }
+        }
+        if (caster.grimoire.Find(pg.name) < 0) caster.grimoire.pages.push_back(pg);
+        ui.grimoireMode = true;
+        ui.grimoireSelected = pg.name;
+        ui.grimoireEditName = pg.name;
+        ui.grimoireEditWords = pg.words;
+        ui.grimoireEditDirty = false;
+        // A view driven by an earlier scene is not this scene's picture.
+        ui.spellGraphZoom = sc.zoom;
+        ui.spellGraphPanX = sc.panX;
+        ui.spellGraphPanY = sc.panY;
+        std::printf("--shot-spellpage: [%s] %d words\n", sc.name,
+                    (int)pg.words.size());
+      }
+    }
     // --shot-inventory's scripted schedule. Frame-counted rather than
     // wall-clocked so the same picture comes out on any machine.
     if (g_shotInventory) {
@@ -8215,6 +8844,23 @@ int main(int argc, char** argv) {
       if (frameCounter == 1) {
         ui.fly = false;
         player.fly = false;
+      }
+      if (frameCounter == kShotInvHudSetup) {
+        ui.visible = false;
+        ui.tool = UIState::kToolMelee;
+        ui.magicMode = false;
+        uint16_t water = 0;
+        for (size_t m = 0; m < mats.size(); m++)
+          if (mats[m].name == "water") water = (uint16_t)m;
+        for (int i = 0; i < kItemSlots; i++) {
+          const ItemDef* d = items.At(hotbar.slots[i].Empty() ? -1 : hotbar.slots[i].def);
+          if (d && d->IsContainer() && water) {
+            hotbar.slots[i].fillMat = water;
+            hotbar.slots[i].fillAmt = (uint16_t)(d->container.capacity * 2 / 3);
+            hotbar.Select(i);
+            break;
+          }
+        }
       }
       if (frameCounter == kShotInvOpenFrame) {
         // DRESS THE FIGURE BEFORE PHOTOGRAPHING IT. The portrait is the only
@@ -8282,6 +8928,7 @@ int main(int argc, char** argv) {
       if (frameCounter == kShotInvCaptureFrame + 1) {
         ui.inspectMode = false;
         ui.grimoireMode = true;
+        ui.spellbookOpen = true;
         if (!glyphs.conjoined.empty()) {
           const ConjoinedGlyph& cg = glyphs.conjoined[0];
           ui.grimoireSelected = cg.id;
@@ -8291,12 +8938,75 @@ int main(int argc, char** argv) {
             if (const GlyphDef* d = glyphs.At(gi)) ui.grimoireEditWords.push_back(d->id);
         }
       }
-      // Fourth picture: a corpse with its gear on, opened. A human is spawned
+      // Fourth picture: THE SPELL PAGE. A COPY of the `duststorm` starter —
+      // starters are read-only and a page you cannot edit cannot show an edit —
+      // with `shotgun` on it, so the tree has a bus (the shared sand and gusts),
+      // a mod tag (`count x3`), three sockets and a price under every bar.
+      if (frameCounter == kShotInvGraphSetup) {
+        ui.grimoireMode = true;
+        ui.lootOpen = false;
+        ui.spellbookOpen = true;   // the book is shut by default; open it
+        GrimoirePage p;
+        p.name = "duststorm-mine";
+        p.words = {"sand", "gust", "gust", "shotgun", "projectile"};
+        if (caster.grimoire.Find(p.name) < 0) caster.grimoire.pages.push_back(p);
+        ui.grimoireSelected = p.name;
+        ui.grimoireEditName = p.name;
+        ui.grimoireEditWords = p.words;
+        ui.grimoireEditDirty = false;
+        std::printf("--shot-inventory: composed [%s] for the spell page\n",
+                    p.name.c_str());
+      }
+      // ...and ONE edit, applied through the intent latch exactly as a drop
+      // would: a lane holding `fire` on the projectile. The box is found in the
+      // MIRROR the panel is about to draw, which is the same lookup the drop
+      // target does — the harness drives the player's path, it does not reach
+      // into the tree.
+      if (frameCounter == kShotInvGraphEdit) {
+        int box = -1;
+        for (const UIState::SpellGraphUI::Node& n : ui.spellGraph.nodes)
+          // `primary < 0`: a split delivery is drawn once per branch and only
+          // the primary cell owns the socket list this harness reads.
+          if (n.kind == 2 /* Join */ && n.treeNode >= 0 && n.primary < 0) {
+            box = (int)(&n - ui.spellGraph.nodes.data());
+            break;
+          }
+        if (box >= 0) {
+          // THE SOCKET THAT USED TO REFUSE. `shotgun` gives this box three
+          // sockets over zero lanes, and the lane a socket drop asks for is
+          // `instance + 1` — so the LAST instance is the drop that was
+          // impossible until lanes learned to open in a run (2026-09-21), and
+          // it is the picture worth reviewing. Read off the mirror's socket
+          // list exactly as the canvas's drop target does.
+          const UIState::SpellGraphUI::Node& bn = ui.spellGraph.nodes[box];
+          int32_t lane = bn.laneCount + 1;
+          if (!bn.sockets.empty()) {
+            const UIState::SpellGraphUI::Node& sk =
+                ui.spellGraph.nodes[(size_t)bn.sockets.back()];
+            lane = sk.lane > 0 ? sk.lane : sk.instance + 1;
+          }
+          ui.graphEdit = {};
+          ui.graphEdit.pending = true;
+          ui.graphEdit.op = UIState::GraphEditIntent::Insert;
+          ui.graphEdit.treeNode = bn.treeNode;
+          ui.graphEdit.lane = lane;
+          ui.graphEdit.glyphId = "fire";
+          std::printf("--shot-inventory: spell page edit -> lane %d of [%s] "
+                      "takes `fire`\n",
+                      (int)lane, bn.label.c_str());
+        } else {
+          std::fprintf(stderr, "--shot-inventory: no join in the spell graph\n");
+        }
+      }
+      // Fifth picture: a corpse with its gear on, opened. A human is spawned
       // a few paces ahead, dressed in every worn piece the library has and
       // handed a sword, and killed — the same CorpseReport path a fight
       // produces — and the panel is opened on it as E would.
-      if (frameCounter == kShotInvGrimoireFrame + 1) {
+      if (frameCounter == kShotInvGraphFrame + 1) {
         ui.grimoireMode = false;
+        // Shut it again: the pictures after this one are about the corpse and
+        // the body, and an open book covers the pack they are drawn beside.
+        ui.spellbookOpen = false;
         int humanDef = -1;
         for (size_t i = 0; i < mobs.Defs().size(); i++)
           if (mobs.Defs()[i].name == "human") humanDef = (int)i;
@@ -8653,9 +9363,12 @@ int main(int argc, char** argv) {
     // The DEV tier: still live with the character screen open, dead while an
     // ImGui field has focus.
     if (devKeys && eP.Pressed(key(GLFW_KEY_P))) ui.paused = !ui.paused;
-    if (devKeys && eN.Pressed(key(GLFW_KEY_N))) ui.stepOnce = true;
-    if (devKeys && eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
+    if (devKeys && ui.devControls && eN.Pressed(key(GLFW_KEY_N))) ui.stepOnce = true;
+    if (devKeys && ui.devControls && eV.Pressed(key(GLFW_KEY_V))) ui.fly = !ui.fly;
     if (devKeys && eF1.Pressed(key(GLFW_KEY_F1))) ui.visible = !ui.visible;
+    // F2: PLAY <-> DEV controls (UIState::devControls). The transition itself
+    // is applied below, where the checkbox path lands too.
+    if (devKeys && eF2.Pressed(key(GLFW_KEY_F2))) ui.devControls = !ui.devControls;
     if (devKeys && eF3.Pressed(key(GLFW_KEY_F3)))
       ui.showCollisionBoxes = !ui.showCollisionBoxes;
     // F4 CYCLES the vector-field arrows: off -> wind (RESEARCH_wind.md §4.8)
@@ -8688,9 +9401,9 @@ int main(int argc, char** argv) {
     if (devKeys && eF9.Pressed(key(GLFW_KEY_F9))) ui.saveWorld = true;
     if (devKeys && eF10.Pressed(key(GLFW_KEY_F10))) ui.loadWorld = true;
     if (devKeys && eR.Pressed(key(GLFW_KEY_R))) ui.reloadMaterials = true;
-    if (gameKeys && eLBracket.Pressed(key(GLFW_KEY_LEFT_BRACKET)))
+    if (gameKeys && ui.devControls && eLBracket.Pressed(key(GLFW_KEY_LEFT_BRACKET)))
       ui.brushRadius = std::max(1, ui.brushRadius - 1);
-    if (gameKeys && eRBracket.Pressed(key(GLFW_KEY_RIGHT_BRACKET)))
+    if (gameKeys && ui.devControls && eRBracket.Pressed(key(GLFW_KEY_RIGHT_BRACKET)))
       ui.brushRadius = std::min(7, ui.brushRadius + 1);
     // The number row is SHARED: it picks a brush material normally and SPEAKS
     // glyphs in magic mode (Z). Both wanted 1-8 and the brush binding predates
@@ -8698,29 +9411,34 @@ int main(int argc, char** argv) {
     // than silently stealing its keys.
     if (!ui.magicMode) {
       for (int i = 0; i < 8; i++)
-        if (gameKeys && key(GLFW_KEY_1 + i) && i + 1 < (int)mats.size()) {
+        if (gameKeys && ui.devControls && key(GLFW_KEY_1 + i) &&
+            i + 1 < (int)mats.size()) {
           if (ui.tool == UIState::kToolFluid)
             ui.fluidSpecies = i & 3;
           else
             ui.brushMaterial = i + 1;
         }
     } else {
-      // Pressing a number SPEAKS that glyph — it never casts. Edge-triggered:
-      // a held key must not stutter the same word onto the stack. TWO BANKS
-      // (plan §12a): `1`-`0` speak bank A, `Shift+1`-`0` bank B. Sprint is
-      // on Shift outside magic mode and magic mode captures the number row,
-      // so nothing collides.
+      // THE PAGE IS THE INTERFACE (PLAN_spell_graph §0b). Pressing a number
+      // SELECTS the spell bound to that key — a grimoire page, or a single
+      // glyph as a one-word spell — and right-click CASTS it. The selection
+      // persists across casts, so a bound spell fires as often as you click;
+      // another key switches, Backspace clears. Building the sentence happens
+      // on the page's tree, which is a surface with room for it; the number row
+      // used to be the only authoring tool there was, and it was a bad one.
+      //
+      // Edge-triggered still: a held key must not re-select every frame and
+      // wipe a half-drained mana readout. TWO BANKS (plan §12a): `1`-`0` is
+      // bank A, `Shift+1`-`0` bank B. Sprint is on Shift outside magic mode and
+      // magic mode captures the number row, so nothing collides.
       const bool bankB = key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT);
       for (int i = 0; i < kGlyphBank; i++) {
         // GLFW's number row is contiguous 1..9 then 0, and slot 10 is the 0
         // key, matching the strip the HUD prints.
         int k = (i == 9) ? GLFW_KEY_0 : (GLFW_KEY_1 + i);
         if (captured && eGlyph[i].Pressed(key(k)))
-          caster.SpeakSlot(glyphs, i + (bankB ? kGlyphBank : 0));
+          caster.SelectSlot(glyphs, i + (bankB ? kGlyphBank : 0));
       }
-      // `=` captures the sentence on the stack into the grimoire (§12b): the
-      // fast path for "that worked, make it one key".
-      if (captured && eEq.Pressed(key(GLFW_KEY_EQUAL))) caster.CaptureStack(glyphs);
     }
     if (captured && eZ.Pressed(key(GLFW_KEY_Z))) {
       ui.magicMode = !ui.magicMode;
@@ -8730,7 +9448,7 @@ int main(int argc, char** argv) {
     // universal "undo what I just typed" key and the left hand is on WASD.
     if (captured && eBack.Pressed(key(GLFW_KEY_BACKSPACE))) caster.Clear(glyphs);
 
-    if (captured && eG.Pressed(key(GLFW_KEY_G))) {
+    if (captured && ui.devControls && eG.Pressed(key(GLFW_KEY_G))) {
       Grenade g;
       g.pos = player.EyePos() + cam.Forward() * 2.0f;
       g.vel = cam.Forward() * (CurrentTuning().grenade.throwSpeed / kVoxelMeters) +
@@ -8738,18 +9456,8 @@ int main(int argc, char** argv) {
       g.fuse = CurrentTuning().grenade.fuse;
       grenades.push_back(g);
     }
-    if (captured && eX.Pressed(key(GLFW_KEY_X))) ui.pendingDetonate = true;
-    // DRAW / STOW. Q rather than the X the plan proposed: X already
-    // detonates, and a key that does two things is a key that does the wrong
-    // one under pressure.
-    if (captured && eQ.Pressed(key(GLFW_KEY_Q)) &&
-        !sheath.Toggle(sheathKind(), UIState::kToolMelee, ui.tool)) {
-      // Reaching for a sword that is not there says so, rather than silently
-      // arming an empty hand — the same rule the equipment panel's refusals
-      // follow.
-      ui.kitMessage = "your sheath is empty";
-      ui.kitMessageAge = 0.0f;
-    }
+    if (captured && ui.devControls && eX.Pressed(key(GLFW_KEY_X)))
+      ui.pendingDetonate = true;
     // ---- E: PICK IT UP ------------------------------------------------------
     //
     // A short camera ray filtered through the ground registry, which is what
@@ -8920,8 +9628,10 @@ int main(int argc, char** argv) {
         // registry carries the word because the art cannot: a dyed garment is
         // painted in neutral greys, so a pickup that forgot the dye would hand
         // back a grey tunic with nothing anywhere to say it had ever been red.
-        int where = di >= 0 ? kit.bag.Add(di, 1, w->dye) : -1;
-        if (where < 0 && di >= 0) where = hotbar.Add(di, 1, w->dye);
+        // ...holding what it held when it went down (WorldItem::fill).
+        const uint16_t fm = ItemFillMat(w->fill), fa = ItemFillAmt(w->fill);
+        int where = di >= 0 ? kit.bag.Add(di, 1, w->dye, fm, fa) : -1;
+        if (where < 0 && di >= 0) where = hotbar.Add(di, 1, w->dye, fm, fa);
         if (where >= 0) {
           ui.kitMessage = "picked up " + w->item;
           // Order matters: the registry entry is dropped by the release hook
@@ -8979,17 +9689,17 @@ int main(int argc, char** argv) {
       if (!eDown) eHeld = 0.0f;
       ePrevDown = eDown;
     }
-    if (captured && eTab.Pressed(key(GLFW_KEY_TAB))) {
+    if (captured && ui.devControls && eTab.Pressed(key(GLFW_KEY_TAB))) {
       ui.tool = (ui.tool + 1) % UIState::kToolCount;
       if (ui.tool == UIState::kToolFluid && fluidCueMat != 0)
         ui.brushMaterial = (int)fluidCueMat;
     }
-    if (captured && eM.Pressed(key(GLFW_KEY_M))) feeder.Press(TB_SPAWN);
-    if (captured && eB.Pressed(key(GLFW_KEY_B))) feeder.Press(TB_PLACE);
-    if (captured && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
+    if (captured && ui.devControls && eM.Pressed(key(GLFW_KEY_M))) feeder.Press(TB_SPAWN);
+    if (captured && ui.devControls && eB.Pressed(key(GLFW_KEY_B))) feeder.Press(TB_PLACE);
+    if (captured && ui.devControls && eK.Pressed(key(GLFW_KEY_K))) ui.spawnSphere = true;
     // U clears the experimental MLS-MPM fluid (sticky flag, consumed in the
     // tick loop like every other one-shot input — see the cast-key note).
-    if (captured && eU.Pressed(key(GLFW_KEY_U))) ui.clearFluid = true;
+    if (captured && ui.devControls && eU.Pressed(key(GLFW_KEY_U))) ui.clearFluid = true;
     // L (lab only) resets the scene: scene clock to zero + fluid cleared, so
     // the next tick re-submits the build CellOps and the pour replays from
     // its fixed schedule — an identical A/B run without regenerating the
@@ -9009,7 +9719,8 @@ int main(int argc, char** argv) {
     // dismemberment states that does not need a weapon pointed at yourself.
     // The order walks DOWN the state ladder (hand -> arm -> foot -> leg ->
     // head), so repeated presses march through limp, hop, crawl and squirm.
-    if (captured && eH.Pressed(key(GLFW_KEY_H)) && avatar.Spawned()) {
+    if (captured && ui.devControls && eH.Pressed(key(GLFW_KEY_H)) &&
+        avatar.Spawned()) {
       static const char* kSeverOrder[] = {
           "staff",  "hand.R", "hand.L", "armL.R", "armL.L",
           "foot.R", "foot.L", "legL.R", "legL.L", "armU.R",
@@ -9017,10 +9728,10 @@ int main(int argc, char** argv) {
       for (const char* nm : kSeverOrder)
         if (avatar.SeverByName(nm)) break;
     }
-    if (gameKeys && ui.tool == UIState::kToolPrefab &&
+    if (gameKeys && ui.devControls && ui.tool == UIState::kToolPrefab &&
         eT.Pressed(key(GLFW_KEY_T)))
       ui.prefabRot = (ui.prefabRot + 1) & 3;
-    if (gameKeys && ui.tool == UIState::kToolPrefab &&
+    if (gameKeys && ui.devControls && ui.tool == UIState::kToolPrefab &&
         eO.Pressed(key(GLFW_KEY_O)) && !prefabs.empty())
       ui.prefabSelected = (ui.prefabSelected + 1) % (int)prefabs.size();
 
@@ -9115,6 +9826,13 @@ int main(int argc, char** argv) {
       }
       // A fixed tick schedule, like the autofly phases: reproducible run to run.
       cam.yaw = 2.35f + (float)((tick / 240u) % 4u) * 1.5707963f;
+    }
+    // --forest-fire: one full turn over the measured 600 ticks, level-ish, so
+    // the frame is the fire on every side and not the side the spawn faced.
+    if (g_forestFire && tick >= (uint32_t)g_forestFireAt + 600u) {
+      const uint32_t t = tick - ((uint32_t)g_forestFireAt + 600u);
+      cam.yaw = 6.2831853f * (float)(t % 600u) / 600.0f;
+      cam.pitch = 0.08f;
     }
     if (g_autofly) {
       player.fly = true;
@@ -9303,6 +10021,10 @@ int main(int argc, char** argv) {
     }
     if (ui.reloadMaterials) {
       ui.reloadMaterials = false;
+      // The weather presets reload with the other R-reloaded content: they are
+      // authored data next to materials, and a tuner edit of a sky should show
+      // on the same keypress.
+      weather::Presets().Reload();
       std::vector<MaterialDef> newMats;
       std::vector<ReactionGpu> newReactions;
       if (LoadAssets(assetDir + "/materials/materials.json",
@@ -9436,22 +10158,32 @@ int main(int argc, char** argv) {
           // (game/dye.h): dropping it here would bleach every coloured garment
           // the player owns on every R, which reads as a rendering bug rather
           // than as the data loss it is.
+          // ...and WHAT A VESSEL HOLDS (game/container.h), for the dye's
+          // reason: an R that forgot it would empty every flask you carry.
           struct KitSnap {
             std::string name;
             int count = 0;
             uint32_t dye = 0;
+            uint16_t fillMat = 0, fillAmt = 0;
           };
           auto snapshot = [&](ItemStack* v, int n,
                               std::vector<KitSnap>& out) {
             out.clear();
             for (int i = 0; i < n; i++)
-              out.push_back({KitItemName(v[i], items), v[i].count, v[i].dye});
+              out.push_back({KitItemName(v[i], items), v[i].count, v[i].dye,
+                             v[i].fillMat, v[i].fillAmt});
           };
           auto restore = [&](ItemStack* v, int n,
                              const std::vector<KitSnap>& in) {
             for (int i = 0; i < n && i < (int)in.size(); i++) {
-              const ItemStack s = KitItemFromName(in[i].name, in[i].count,
-                                                  items, in[i].dye);
+              ItemStack s = KitItemFromName(in[i].name, in[i].count,
+                                            items, in[i].dye);
+              if (const ItemDef* d = s.Empty() ? nullptr : items.At(s.def);
+                  d && d->IsContainer() && in[i].fillAmt > 0) {
+                s.fillMat = in[i].fillMat;
+                s.fillAmt = (uint16_t)std::min<int>(in[i].fillAmt,
+                                                    d->container.capacity);
+              }
               if (!in[i].name.empty() && s.Empty())
                 std::fprintf(stderr,
                              "items reload: \"%s\" is gone; slot emptied\n",
@@ -9476,6 +10208,7 @@ int main(int argc, char** argv) {
           // items.json appears in the combo on this R without disturbing what
           // is already selected.
           rebuildAiWeapons();
+          rebuildGiveVessels();
           // ...and the wardrobe's three, for the same reason and by the same
           // rule: a pattern added to items.json appears on this R without
           // moving what is already picked.
@@ -9528,7 +10261,7 @@ int main(int argc, char** argv) {
         // removes or reorders flesh_charred/ash has to re-resolve here or the
         // inspector's charred readout counts the wrong material.
         burnMats = ResolveBurnMats(mats);
-        tissueMats = ResolveTissueMats(mobs);
+        tissueMats = ResolveTissueMats(mobs, mats);
         ui.materialNames.clear();
         ui.materialColors.clear();
         for (auto& m : mats) {
@@ -9576,7 +10309,7 @@ int main(int argc, char** argv) {
         cam.yaw = labYaw;
         cam.pitch = labPitch;
       }
-      player.viewYOffset = 0.0f;  // teleport: never smooth across it
+      player.ResetViewSmooth();   // teleport: never smooth across it
       player.SnapRender();        // ...and never interpolate across it either
       tick = 0;
       grenades.clear();
@@ -9596,7 +10329,8 @@ int main(int argc, char** argv) {
       ui.saveWorld = false;
       ctx.WaitIdle();
       // Grid + entities: everything outside the voxel grid rides the
-      // entities.sve sections registered in game/persist.cpp.
+      // sections registered in game/persist.cpp -- world.sve, this player's
+      // players/local.svp, and per-region r_*.sve buckets (S4).
       const PlayerKitRefs kitRefs = PlayerKitOf(session, glyphs, items);
       WorldItemRefs groundRefs{&ground, &phys, &debris, &mbSet, &items};
       EntityIO eio = MakeEntityIO(debris, mobs, &avatar, &kitRefs, &groundRefs);
@@ -9638,6 +10372,12 @@ int main(int argc, char** argv) {
                       loaded.tick, tick);
           tick = loaded.tick;
         }
+        // ...and the SKY follows the save even when the sim clock could not
+        // (an older save reloaded mid-session): game/persist.h ResumeWorldClock.
+        if (loaded.known && ResumeWorldClock(loaded.tick, tick))
+          std::printf("load: sky clock engaged at the save's tick %u (sim tick "
+                      "stays %u)\n",
+                      loaded.tick, tick);
         // Debris/mobs were reset and reloaded by their sections; the avatar
         // was despawned by its reset and respawns on the next tick, applying
         // the saved damage state (avatar.h persistence note). Only main's own
@@ -9810,6 +10550,10 @@ int main(int argc, char** argv) {
     // between two ticks reads as released on the second one.
     feeder.Hold(TB_ATTACK, mouseL);
     feeder.Hold(TB_ALT, mouseR);
+    // Q winds up a throw of the held vessel; letting go throws it
+    // (game/container.h). Only a throwable vessel in hand reads it.
+    feeder.Hold(TB_THROW, captured && gameKeys &&
+                              glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS);
     feeder.Hold(TB_LASER,
                 captured && (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
                              (ui.tool == UIState::kToolLaser && mouseL)));
@@ -9831,21 +10575,39 @@ int main(int argc, char** argv) {
       // or it fires the instant the world resumes.
       strikeQueued = -1;
     }
+    // ---- PLAY / DEV (UIState::devControls) ----------------------------------
+    // Applied here, after every key and the dev panel have had their say and
+    // before anything reads the tool, so the checkbox and F2 are one path.
+    // ON A CHANGE TO PLAY: land (fly off) and put the hands up. EVERY FRAME IN
+    // PLAY: the hands are the only tool -- the dev panel's radio buttons and a
+    // Q that stows back to `toolBefore` cannot leave the brush in them.
+    {
+      static bool devPrev = ui.devControls;
+      if (ui.devControls != devPrev) {
+        devPrev = ui.devControls;
+        if (!ui.devControls) {
+          ui.fly = false;
+          player.fly = false;
+        }
+        ui.kitMessage = ui.devControls ? "dev controls ON (F2)"
+                                       : "dev controls OFF -- play mode (F2)";
+        ui.kitMessageAge = 0.0f;
+      }
+      if (!ui.devControls) ui.tool = UIState::kToolMelee;
+    }
     bool brushActive = ui.tool == UIState::kToolBrush && !ui.magicMode;
     // MELEE: hold LMB with the melee tool to arm the weapon, then flick.
     // Magic mode wins the mouse, so guarding and casting can never both be
     // live on the same button.
-    // WHAT IS IN THE HAND comes from the SHEATH, not the hotbar (see the
-    // draw/stow block above). A weapon that left the sheath while it was drawn
-    // — dragged into the pack from the character screen, say — is no longer
-    // drawn, and this is where that is noticed: the state lives on one side of
-    // the question, so there is nothing to keep in step.
+    // WHAT IS IN THE HAND is the selected hotbar slot (see "THE HOTBAR IS THE
+    // HAND" above). A weapon dragged out of it, or a slot change, is noticed
+    // here for free: there is no drawn flag to keep in step.
     // ---- GEAR THAT LEFT THE BODY BY FORCE (Mob::LostGear) --------------------
     //
     // The rig reports; the KIT is this frame's to fix, and it has to be fixed
-    // BEFORE the sheath and the wear loop below read it in the same tick, or
-    // the re-equip seams would faithfully pull a second sword out of the
-    // sheath while the first lies at your feet, and put the cuirass back on
+    // BEFORE the hand and the wear loop below read it in the same tick, or
+    // the re-equip seams would faithfully put a second sword in your hand
+    // from the hotbar while the first lies at your feet, and put the cuirass back on
     // a body the plate has just fallen off. The piece on the ground is
     // registered under its name (SetOnItemShed), so picking it back up is the
     // ordinary `E` and wearing it again restores exactly the holes it had:
@@ -9853,7 +10615,7 @@ int main(int argc, char** argv) {
     // piece dragged into the pack takes.
     for (const Mob::LostGear& lg : avatar.LostGearEvents()) {
       if (lg.held) {
-        ItemStack& sh = kit.equip.slots[kSheathSlot];
+        ItemStack& sh = hotbar.slots[std::clamp(hotbar.selected, 0, kItemSlots - 1)];
         if (KitItemName(sh, items) == lg.item) sh = ItemStack{};
         ui.kitMessage = "your " + lg.item + " was knocked from your hand";
       } else {
@@ -9869,11 +10631,12 @@ int main(int argc, char** argv) {
       ui.kitMessageAge = 0.0f;
     }
     avatar.ClearLostGear();
-    sheath.Reconcile(sheathKind(), UIState::kToolMelee, ui.tool);
-    const ItemStack& sheathed = kit.equip.At(kSheathSlot);
-    const ItemDef* heldItem =
-        sheath.drawn ? items.At(sheathed.Empty() ? -1 : sheathed.def)
-                     : nullptr;
+    const ItemDef* heldItem = [&]() -> const ItemDef* {
+      if (ui.tool != UIState::kToolMelee || ui.magicMode) return nullptr;
+      const ItemStack& hs = hotbar.Selected();
+      const ItemDef* d = items.At(hs.Empty() ? -1 : hs.def);
+      return d && d->kind == ItemKind::Melee ? d : nullptr;
+    }();
     const bool meleeArmed = ui.tool == UIState::kToolMelee && !ui.magicMode &&
                             heldItem && heldItem->kind == ItemKind::Melee;
     // ---- ...AND WITH NOTHING IN YOUR HANDS (plan §6) -----------------------
@@ -9888,8 +10651,43 @@ int main(int argc, char** argv) {
     // NPC draw asks). Lose both hands and the compass stops resolving on its
     // own; author a creature with claws instead of fists and nothing here
     // changes.
+    // ---- ...OR A VESSEL (game/container.h) ---------------------------------
+    //
+    // The melee tool is the hands. With nothing drawn and a flask or pouch
+    // selected in the hotbar, the hands hold THAT: RMB scoops, LMB pours, and
+    // the unarmed compass below stays off -- a fist round a flask does not
+    // punch.
+    const int vesselSlot = [&] {
+      if (ui.tool != UIState::kToolMelee || ui.magicMode || heldItem) return -1;
+      const ItemStack& hs = hotbar.Selected();
+      const ItemDef* d = hs.Empty() ? nullptr : items.At(hs.def);
+      return d && d->IsContainer() ? hotbar.selected : -1;
+    }();
+    // WHERE A FILLED VESSEL POURS (game/container.h ContainerPourPoint): on
+    // the crosshair ray from the RENDER eye. The tick pours at this one, cast
+    // from LAST frame's eye (this frame's is set after the ticks); the marker
+    // re-casts the same function from this frame's eye so the sphere sits on
+    // the crosshair exactly. The two differ by one frame of motion.
+    bool pourAimValid = false;
+    Vec3 pourAim{};
+    if (vesselSlot >= 0) {
+      const ItemStack& vs = hotbar.slots[vesselSlot];
+      const ItemDef* vdef = vs.Empty() ? nullptr : items.At(vs.def);
+      if (vdef && vdef->IsContainer() && vs.Filled()) {
+        static std::vector<uint64_t> own;
+        own.clear();
+        avatar.AppendLiveLimbBodies(own);
+        const Vec3 head = player.EyePos();
+        const Vec3 from = pourFromValid ? pourFrom : head;
+        pourAim = ContainerPourPoint(
+            *vdef, from, head, cam.Forward(),
+            [&](IVec3 c) { return world.KindAt(c, classOf); }, phys, own);
+        pourAimValid = true;
+      }
+    }
     const bool meleeUnarmed = [&] {
       if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
+      if (vesselSlot >= 0) return false;
       if (heldItem != nullptr || !avatar.Spawned()) return false;
       const StyleLibrary& lib = mobs.AttackStyles();
       if (!lib.playerUnarmed.Usable()) return false;
@@ -10157,8 +10955,21 @@ int main(int argc, char** argv) {
       }
 
       TickAuthority(tickCtx, session,
-                    FrameIntent{brushActive, meleeArmed, meleeReady, heldItem},
+                    FrameIntent{brushActive, meleeArmed, meleeReady, heldItem,
+                                vesselSlot, pourAimValid, pourAim},
                     ti, tick, opBatch);
+
+      // ---- S5b: NPCs OUTLIVE THE WINDOW (game/persist.h MobParking) --------
+      // A creature leaving the window is parked in its region bucket by
+      // mobs.PreTick; here, after the tick, the ones the window has reached
+      // again come back, at most MobParking::kUnparkPerCall per tick and only
+      // onto ground the fetch cache has answered for. Parking is on for single
+      // player and the host (whose store is the world's), off for a client.
+      {
+        static MobParking mobParking;
+        mobParking.Bind(mobs, stream.Store(), netRoleBoot != NetRole::Client);
+        mobParking.Unpark(mobs, stream.Store(), world, tick);
+      }
 
       // ---- M9.3-B: THE SMOKE'S AUTHOR ------------------------------------
       //
@@ -10262,6 +11073,19 @@ int main(int argc, char** argv) {
       const float tickAlpha =
           std::min(1.0f, std::max(0.0f, (float)(accumulator / kTickDt)));
       Vec3 eye = player.RenderEyePos(tickAlpha);
+      if (camMode == CameraMode::First) {
+        const float fpFwd =
+            CurrentTuning().avatar.firstPersonForward / kVoxelMeters;
+        eye = eye + cam.FlatForward() * fpFwd;
+      }
+      // ...and the BODY gets the same two corrections, or the art and the
+      // camera disagree. The avatar is posed once per 30 Hz tick around
+      // `player.pos`, so before this the figure stair-stepped at the tick rate
+      // under a camera that glides, and a step-up put it a whole voxel higher
+      // in a single frame while the eye eased up over viewSmoothHalflife.
+      // Render-only, applied in ONE place (Mob::AppendXforms) — the colliders,
+      // the reach tests and every strike still read the posed transforms.
+      avatar.SetRenderOffset(player.RenderBodyOffset(tickAlpha));
       // First-person part-hiding mask, hoisted so the portrait pass below can
       // restore it after drawing the whole body. See the note at its fill.
       std::vector<uint8_t> hide;
@@ -10289,6 +11113,8 @@ int main(int argc, char** argv) {
         Vec3 focus = eye;
         tpRig.Update(dt, camMode, cam, focus, loco, world, kindAt);
         if (camMode != CameraMode::First) eye = tpRig.EyePos();
+        pourFrom = eye;
+        pourFromValid = true;
 
         // Hide the body in first person so the player is not inside their own
         // hat, but keep the arms and the staff — seeing your own hands is most
@@ -10309,29 +11135,13 @@ int main(int argc, char** argv) {
           hide.assign(avatar.PartCount(), 0);
           const int heldPart = avatar.HeldSlot();
           if (camMode == CameraMode::First) {
-            for (size_t i = 0; i < hide.size(); i++) hide[i] = 1;
-            if (CurrentTuning().avatar.firstPersonArms) {
-              // THE WHOLE ARM, not just its ends. The forearms have to be in
-              // here explicitly: the rig is armU -> armL -> hand, so keeping
-              // only the upper arm and the hand left a floating fist with a
-              // gap where the forearm should be — the arm you see in first
-              // person is mostly forearm, so it is the one part that cannot be
-              // omitted.
-              const int keep[9] = {p.armUL, p.armUR, p.armLL, p.armLR,
-                                   p.handL, p.handR, p.staff, heldPart, -1};
-              for (int k : keep)
-                if (k >= 0 && k < (int)hide.size()) hide[k] = 0;
-              // ...AND WHATEVER IS WORN OVER THEM. The keep list names BODY
-              // parts, so with a robe on, the arms you see in first person
-              // would be bare while the sleeves stayed behind with the hidden
-              // torso. A shell is kept exactly when the part it covers is —
-              // read off the rig's parent link rather than from a second list
-              // of sleeve names that would have to be maintained per item.
-              for (int i = avatar.AppendedBase(); i < (int)hide.size(); i++) {
-                const int par = avatar.PartParent(i);
-                if (par >= 0 && par < (int)hide.size() && hide[par] == 0)
-                  hide[i] = 0;
-              }
+            // Show the whole body except the head (its inside would fill the
+            // view). Worn shells over the head are hidden too.
+            if (p.head >= 0 && p.head < (int)hide.size()) hide[p.head] = 1;
+            for (int i = avatar.AppendedBase(); i < (int)hide.size(); i++) {
+              const int par = avatar.PartParent(i);
+              if (par >= 0 && par < (int)hide.size() && hide[par] == 1)
+                hide[i] = 1;
             }
           }
           // NOTHING TO HIDE FOR UNHELD ITEMS ANY MORE. The rig used to carry
@@ -10978,8 +11788,7 @@ int main(int argc, char** argv) {
           const std::string& name = caster.inventory.PageAt(i);
           ui.glyphSlots.push_back(name);
           const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, {name}, kSpellStackMax);
-          SpellStack st;
-          st.spoken = ex.spoken;
+          SpellStack st = StackOf(ex);
           ui.glyphSlotReadouts.push_back(DescribeSpell(glyphs, CompileSpell(glyphs, st)).text);
           continue;
         }
@@ -10988,6 +11797,7 @@ int main(int argc, char** argv) {
             gi >= 0 && gi < (int)glyphs.glyphs.size() ? glyphs.glyphs[gi].id : "");
         ui.glyphSlotReadouts.push_back("");
       }
+      ui.glyphSelected = caster.selected;
       ui.glyphBankB = captured && ui.magicMode &&
                       (key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT));
       caster.noteAge += dt;
@@ -10998,9 +11808,33 @@ int main(int argc, char** argv) {
       for (int i = 0; i < kItemSlots; i++) {
         const ItemDef* d = items.At(hotbar.slots[i].Empty() ? -1
                                                             : hotbar.slots[i].def);
-        ui.itemNames.push_back(d ? d->name : "");
+        // A vessel says what is in it, right on the strip: the only way to
+        // know how much is left while pouring.
+        if (d && d->IsContainer())
+          ui.itemNames.push_back(d->name + " (" +
+                                 ContainerFillText(*d, hotbar.slots[i], mats) + ")");
+        else
+          ui.itemNames.push_back(d ? d->name : "");
       }
       ui.itemSelected = hotbar.selected;
+      // The portrait pour brush (inventory_ui.cpp Portrait): live only while
+      // the flask chosen on the FLASKS row is FILLED, tinted with the
+      // substance's own colour. A choice whose slot no longer holds a vessel
+      // is dropped here, so the row never lights a slot the flask left.
+      {
+        const ItemStack* hp = kit.Resolve(ui.activeVessel, hotbar);
+        const ItemDef* hd = !hp || hp->Empty() ? nullptr : items.At(hp->def);
+        if (!hd || !hd->IsContainer()) ui.activeVessel = KitRef{};
+        ui.applyText.clear();
+        ui.applyColor = 0;
+        if (hd && hd->IsContainer() && hp->Filled() && hp->fillMat < mats.size()) {
+          const ItemStack& hs = *hp;
+          ui.applyText = ContainerFillText(*hd, hs, mats);
+          ui.pourDrainPerSec = PourBrushCellsPerSec(*hd, ui.pourRadius);
+          const uint32_t c = mats[hs.fillMat].gpu.color0;
+          ui.applyColor = 0xFF000000u | (c & 0x00FFFFFFu);
+        }
+      }
       switch (melee.Phase()) {
         case SwingPhase::Idle:    ui.swingPhase = meleeReady ? "ready" : ""; break;
         case SwingPhase::Guard:   ui.swingPhase = "guard"; break;
@@ -11252,9 +12086,36 @@ int main(int argc, char** argv) {
           // stays on the floor as a thing you can pick up (ShedCorpseLoot).
           CorpseReport* c = ui.lootOpen ? corpses.Find(lootCorpse) : nullptr;
           std::string name;
-          if (c && ShedCorpseLoot(*c, ui.dropItem.from.index, debris, ground,
-                                  &name))
+          const int gi = ui.dropItem.from.index;
+          const bool carried =
+              c && gi >= 0 && gi < (int)c->gear.size() && c->gear[gi].body == 0;
+          if (carried) {
+            // A CARRIED STACK HAS NO BODY TO SHED, so this one is a DROP, not
+            // a hand-over: ShedCorpseLoot registers a body that is already
+            // lying in the heap, and a pack item never was one. Same spawn the
+            // bag's own drop uses, from the corpse rather than from the eye —
+            // it should land on the body it came off, not in front of you.
+            CorpseReport::Piece& pc = c->gear[gi];
+            const ItemDef* idef = items.At(items.Find(pc.item));
+            Vec3 at = player.EyePos() + cam.Forward() * 2.0f;
+            if (!c->bodies.empty()) {
+              Vec3 com{};
+              if (phys.BodyCenterOfMass(c->bodies[0], com)) at = com + Vec3{0, 2, 0};
+            }
+            if (idef && DropItemToWorld(*idef, at, Vec3{}, phys, debris, &mbSet,
+                                        ground, nullptr, pc.dye)) {
+              name = pc.item;
+              // ONE of the stack, the rule the bag's drop states one block
+              // down: dropping a count you did not mean to is the mis-click
+              // swap-never-overwrite exists to prevent.
+              if (--pc.count <= 0) c->gear.erase(c->gear.begin() + gi);
+              say("left the " + name + " on the ground");
+            } else {
+              say("there is nowhere to put that");
+            }
+          } else if (c && ShedCorpseLoot(*c, gi, debris, ground, &name)) {
             say("left the " + name + " on the ground");
+          }
         }
       }
       if (ui.moveItem.pending) {
@@ -11340,7 +12201,8 @@ int main(int argc, char** argv) {
           const Vec3 at = player.EyePos() + cam.Forward() * 2.0f;
           const Vec3 vel = cam.Forward() * 4.0f + player.vel;
           if (DropItemToWorld(*def, at, vel, phys, debris, &mbSet, ground,
-                              nullptr, src->dye)) {
+                              nullptr, src->dye,
+                              PackItemFill(src->fillMat, src->fillAmt))) {
             // ONE of the stack. Dropping a count you did not mean to is the
             // mis-click this system's swap-never-overwrite rule exists to
             // prevent, and it applies here too.
@@ -11355,6 +12217,43 @@ int main(int argc, char** argv) {
       if (ui.castAtPart.pending) {
         ui.castAtPart.pending = false;
         castAtPartQueued = ui.castAtPart.slot;
+      }
+      // THE POUR BRUSH: the cursor on the portrait becomes a world ray through
+      // the SAME camera that rendered it -- the inverse of ProjectToPortrait,
+      // i.e. raymarch.wgsl's primary ray -- so the cell the ring sits on is
+      // the cell that was drawn under the cursor. The pick runs every frame
+      // the cursor is over the body, for the ring; the tick re-picks with the
+      // pose it pours on (MobSystem::PourOnBody).
+      {
+        PlayerSession::PourStroke& ps = session.pourStroke;
+        ps.active = false;
+        ui.pourCursorValid = false;
+        if (ui.inventoryOpen && ui.pourBrush.hover && portraitCam.valid &&
+            avatar.Spawned()) {
+          const PortraitCam& pc = portraitCam;
+          const float ndcX = ui.pourBrush.uv[0] * 2.0f - 1.0f;
+          const float ndcY = 1.0f - ui.pourBrush.uv[1] * 2.0f;
+          const Vec3 rd = (pc.cam.Forward() +
+                           pc.cam.Right() * (ndcX * pc.tanHalf * pc.aspect) +
+                           pc.cam.Up() * (ndcY * pc.tanHalf))
+                              .normalized();
+          const MobSystem::BodyRayHit hit =
+              mobs.PickBody(avatar.Id(), pc.eye, rd, 4096.0f);
+          float uv[2], edge[2];
+          if (hit.hit && ProjectToPortrait(pc, hit.pos, uv) &&
+              ProjectToPortrait(pc, hit.pos + pc.cam.Right() * ui.pourRadius, edge)) {
+            ui.pourCursorValid = true;
+            ui.pourCursorUV[0] = uv[0];
+            ui.pourCursorUV[1] = uv[1];
+            ui.pourCursorR = std::fabs(edge[0] - uv[0]);
+          }
+          ps.active = ui.pourBrush.active;
+          ps.vessel = ui.activeVessel;
+          ps.ro = pc.eye;
+          ps.rd = rd;
+          ps.radius = ui.pourRadius;
+        }
+        ui.pourBrush.hover = ui.pourBrush.active = false;
       }
       if (ui.bindGlyph.pending) {
         ui.bindGlyph.pending = false;
@@ -11485,6 +12384,122 @@ int main(int argc, char** argv) {
           }
         }
       }
+      // ---- A GESTURE ON THE CANVAS (docs/PLAN_spell_graph.md §5) -------------
+      //
+      // The page never edits words. It names a TREE OP; this applies it to the
+      // tree of the composed words, and on success writes the LINEARIZED result
+      // back into the row. Every op in game/spellgraph.h is total — it returns
+      // either the new word list or a reason — so a refusal is a sentence on the
+      // status line and never a malformed page.
+      //
+      // The tree is built from the EXPANSION, so a nested page is edited as its
+      // words. That is the v1 compromise §5 names, and the composer says so.
+      if (ui.graphEdit.pending) {
+        ui.graphEdit.pending = false;
+        const UIState::GraphEditIntent op = ui.graphEdit;
+        auto say = [&](const std::string& m) {
+          ui.kitMessage = m;
+          ui.kitMessageAge = 0.0f;
+        };
+        const GrimoireExpansion gex = ExpandWords(glyphs, caster.grimoire,
+                                                  ui.grimoireEditWords, kSpellStackMax);
+        SpellStack gst = StackOf(gex);
+        SpellTree gtree = ParseSpell(glyphs, gst);
+        if (gtree.Empty()) gtree = EmptyTree();
+        EditResult r;
+        // A PAGE DROPPED ON THE TREE IS ITS WORDS, one InsertItem each, the
+        // tree re-parsed between: the tree has no node kind for "a page", and
+        // refusing the gesture outright would make the page list useless up
+        // here. The first refusal stops the run and keeps what landed.
+        std::vector<int> insert;
+        // A PAGE dropped on the tree lands as the SUBTREE its words parse to,
+        // magnitudes and timing included (`InsertWords`), not one word at a
+        // time - which lost both, and turned `fire projectile` into `fire`
+        // beside an empty bolt.
+        std::vector<std::string> pageWords;
+        if ((op.op == UIState::GraphEditIntent::Insert ||
+             op.op == UIState::GraphEditIntent::AttachMod) &&
+            glyphs.FindWord(op.glyphId) < 0 && !op.glyphId.empty()) {
+          const GrimoireExpansion pe =
+              ExpandWords(glyphs, caster.grimoire, {op.glyphId}, kSpellStackMax);
+          pageWords = ExpansionWords(glyphs, pe);
+          if (pageWords.empty()) say("[" + op.glyphId + "] says nothing");
+        } else if (!op.glyphId.empty()) {
+          insert.push_back(glyphs.Find(op.glyphId));
+        }
+        const int gi = insert.empty() ? -1 : insert[0];
+        switch (op.op) {
+          case UIState::GraphEditIntent::Insert:
+          case UIState::GraphEditIntent::AttachMod: {
+            if (!pageWords.empty()) {
+              r = InsertWords(glyphs, gtree, op.treeNode, op.lane, pageWords);
+              break;
+            }
+            SpellTree cur = gtree;
+            for (size_t k = 0; k < insert.size(); k++) {
+              r = op.op == UIState::GraphEditIntent::AttachMod
+                      ? AttachMod(glyphs, cur, op.treeNode, op.lane, insert[k])
+                      : InsertItem(glyphs, cur, op.treeNode, op.lane, insert[k]);
+              if (!r.ok) {
+                if (k > 0) r.ok = true;   // some of it landed; keep that
+                break;
+              }
+              // RE-PARSE BETWEEN WORDS, because the node indices the next
+              // InsertItem needs are the new tree's, not the old one's. The box
+              // is found again by its position in the same place: the root.
+              if (k + 1 < insert.size()) {
+                cur = ParseWords(glyphs, r.words);
+                if (cur.Empty()) break;
+              }
+            }
+            break;
+          }
+          case UIState::GraphEditIntent::FillSlot:
+            r = FillSlot(glyphs, gtree, op.treeNode,
+                         op.side ? SlotSide::Right : SlotSide::Left, gi);
+            break;
+          case UIState::GraphEditIntent::Wrap:
+            r = WrapInBox(glyphs, gtree, op.treeNode, gi);
+            break;
+          case UIState::GraphEditIntent::Unbox:
+            r = Unbox(glyphs, gtree, op.treeNode);
+            break;
+          case UIState::GraphEditIntent::Remove:
+            r = Remove(glyphs, gtree, op.treeNode);
+            break;
+          case UIState::GraphEditIntent::Move:
+            r = Move(glyphs, gtree, op.treeNode, op.boxTreeNode, op.lane, op.copy);
+            break;
+          case UIState::GraphEditIntent::CloseLane:
+            r = CloseLane(glyphs, gtree, op.treeNode, op.lane);
+            break;
+          case UIState::GraphEditIntent::SetMagnitude:
+            r = SetMagnitude(glyphs, gtree, op.treeNode, op.mag);
+            break;
+          case UIState::GraphEditIntent::SetTiming: {
+            SpellTiming tm;
+            tm.trigger = (SpellTrigger)std::clamp(op.trigger, 0, kSpellTriggerCount - 1);
+            tm.every = op.every;
+            tm.delay = op.delay;
+            r = SetTiming(glyphs, gtree, op.treeNode, tm);
+            break;
+          }
+        }
+        if (r.ok) {
+          if ((int)r.words.size() > glyphs.budgets.maxMacroWords) {
+            say("that would not fit on the page");
+            if (!ui.grimoireUndo.empty()) ui.grimoireUndo.pop_back();
+          } else {
+            ui.grimoireEditWords = r.words;
+            ui.grimoireEditDirty = true;
+          }
+        } else {
+          say(r.why.empty() ? std::string("that cannot be said") : r.why);
+          // The panel pushed an undo before it latched; a refusal changed
+          // nothing, so the stack must not grow an identical entry.
+          if (!ui.grimoireUndo.empty()) ui.grimoireUndo.pop_back();
+        }
+      }
       ui.kitMessageAge += dt;
 
       // ---- the mirrors -------------------------------------------------------
@@ -11543,6 +12558,18 @@ int main(int argc, char** argv) {
                           d->strike.cut, d->reach,
                           d->hasEdge ? "\ncuts along its own edge" : "");
             u.tip = tip;
+          } else if (d->IsContainer()) {
+            // What is in it, and the two buttons -- the vessel has no other
+            // stat, and nothing else on screen says how to use one.
+            u.fill = d->container.capacity > 0
+                         ? std::clamp((float)st.fillAmt / (float)d->container.capacity,
+                                      0.0f, 1.0f)
+                         : 0.0f;
+            u.tip = ContainerFillText(*d, st, mats) +
+                    "\nhands up (melee tool), selected in the hotbar:"
+                    "\nRMB scoops, LMB pours where you look"
+                    "\ncharacter screen: click it under FLASKS, then"
+                    "\nhold LMB on the portrait to pour it on yourself";
           }
           return u;
         };
@@ -11565,8 +12592,13 @@ int main(int argc, char** argv) {
             ui.lootTitle = c->def;
             for (const CorpseReport::Piece& pc : c->gear) {
               const int di = items.Find(pc.item);
-              UIState::KitSlotUI u =
-                  mirror(ItemStack{di, di >= 0 ? 1 : 0, pc.dye});
+              // The COUNT comes off the piece now that a corpse can hold a
+              // carried stack as well as a worn garment (CorpseReport::Piece).
+              // Worn and held pieces are always 1 — a rig slot is one garment —
+              // so this reads exactly as the hard-coded 1 did for them, and a
+              // pack item gets its badge (ui::CountBadge, inventory_ui.cpp).
+              const int cnt = di >= 0 ? (pc.count > 0 ? pc.count : 1) : 0;
+              UIState::KitSlotUI u = mirror(ItemStack{di, cnt, pc.dye});
               if (u.name.empty()) u.name = pc.item;   // gone from the library
               if (u.wearable) {
                 u.condition = pc.damage.Condition();
@@ -11586,6 +12618,7 @@ int main(int argc, char** argv) {
           u.type = (int)g.sort;
           u.mana = g.word;
           u.owned = caster.inventory.Owns(gi);
+          u.hidden = g.hidden;
           u.axis = g.axis;
           u.example = g.example;
           // Valence, in the sort names the grammar uses (plan §9).
@@ -11608,6 +12641,10 @@ int main(int argc, char** argv) {
             const char* opn = g.op == ModOp::Mul ? "x" : g.op == ModOp::Div ? "/" : "+";
             u.valence = std::string("edits ") + ModFieldName(g.field) + " " + opn +
                         std::to_string(g.amount) + ", again per repeat";
+            // COUNT IS RECORD-WIDE wherever it is spoken (spell.cpp's LowerBox),
+            // so the canvas must not promise a socket drop edits one instance.
+            u.recordWide = false;   // nothing is record-wide wherever spoken now
+            u.splits = g.field == ModField::Count;
           } else if (g.sort == GlyphSort::Delivery) {
             u.valence = std::string(g.mech == DeliveryMech::Flight ? "flight" :
                                     g.mech == DeliveryMech::Continuous ? "continuous" : "instant") +
@@ -11660,10 +12697,15 @@ int main(int argc, char** argv) {
         auto describeWords = [&](const std::vector<std::string>& words, std::string& readout,
                                  int32_t& price, bool& unknown, int& dropped) {
           const GrimoireExpansion ex = ExpandWords(glyphs, caster.grimoire, words, kSpellStackMax);
-          SpellStack st;
-          st.spoken = ex.spoken;
+          SpellStack st = StackOf(ex);
           const CastList l = CompileSpell(glyphs, st);
-          readout = DescribeSpell(glyphs, l).text;
+          const SpellReadout r = DescribeSpell(glyphs, l);
+          readout = r.text;
+          // THE VERDICT ON ITS OWN LINE. It is the sentence that says what the
+          // page DOES ("a bolt that sprays sand and fire, three of them"),
+          // which the bracket string above deliberately does not; the composer
+          // wraps both rather than clipping either.
+          if (!r.verdict.empty()) readout += "\n" + r.verdict;
           if (ex.dropped > 0) readout += "   (? = a word that no longer exists)";
           if (ex.truncated) readout += "   (cut at the stack bound)";
           price = l.manaCost;
@@ -11690,6 +12732,116 @@ int main(int argc, char** argv) {
           int dropped = 0;
           describeWords(ui.grimoireEditWords, ui.grimoireEditReadout, ui.grimoireEditPrice,
                         ui.grimoireEditPriceUnknown, dropped);
+        }
+
+        // ---- THE SPELL GRAPH MIRROR (docs/PLAN_spell_graph.md §4) ----------
+        //
+        // The composer's words -> expansion -> parse -> lower -> BuildGraph,
+        // copied field by field into a plain-struct mirror. The same expansion
+        // the readout above is produced from, so the drawing and the sentence
+        // under it can never be of two different spells.
+        //
+        // Only while the character screen is open: it is a parse and a
+        // lowering per frame, and nothing looks at it otherwise. NOT gated on
+        // `grimoireMode` — that flag is the NARROW layout's arsenal/grimoire
+        // toggle; the wide three-column layout draws the grimoire always with
+        // the flag false, and gating on it left the canvas empty in the game
+        // while `--shot-inventory` (which sets the flag by hand) showed a tree.
+        // ...and only while the BOOK IS OPEN (2026-09-22). Shut, the panel is a
+        // spine with the bound keys on it and nothing reads the mirror at all,
+        // so a parse and a lowering every frame would be pure waste.
+        if (ui.inventoryOpen && ui.spellbookOpen) {
+          ui.spellGraph = UIState::SpellGraphUI{};
+          const GrimoireExpansion ex =
+              ExpandWords(glyphs, caster.grimoire, ui.grimoireEditWords, kSpellStackMax);
+          // A NESTED PAGE IS EXPANDED TO ITS WORDS to draw, and an edit writes
+          // the expansion back — the tree has no node for "a page". Said on the
+          // status line rather than silently (v1; PLAN §5 notes it).
+          for (const std::string& w : ui.grimoireEditWords)
+            if (glyphs.FindWord(w) < 0 && !w.empty()) {
+              ui.spellGraph.expandedNote =
+                  "page " + w + " is drawn expanded; an edit writes out its words";
+              break;
+            }
+          SpellStack gst = StackOf(ex);
+          SpellTree tree = ParseSpell(glyphs, gst);
+          // A BLANK PAGE STILL HAS A HAND. `ParseSpell` of silence has no
+          // clause at all (silence is not a spell), and a canvas with no root
+          // has nothing to drop the first word onto.
+          if (tree.Empty()) tree = EmptyTree();
+          const CastList gl = LowerSpell(glyphs, tree);
+          const SpellGraph sg = BuildGraph(glyphs, gl);
+          ui.spellGraph.root = sg.root;
+          ui.spellGraph.width = sg.width;
+          ui.spellGraph.height = sg.height;
+          ui.spellGraph.layers = sg.layers;
+          ui.spellGraph.wordCost = gl.wordCost;
+          ui.spellGraph.tariff = gl.tariff;
+          ui.spellGraph.carryCost = gl.carryCost;
+          ui.spellGraph.manaCost = gl.manaCost;
+          ui.spellGraph.priceUnknown = gl.priceUnknown;
+          ui.spellGraph.nodes.reserve(sg.nodes.size());
+          for (const SpellGraphNode& n : sg.nodes) {
+            UIState::SpellGraphUI::Node u;
+            u.kind = (int)n.kind;
+            u.treeNode = n.treeNode;
+            u.label = n.label;
+            u.n = n.n;
+            u.sort = (int)n.sort;
+            u.lane = n.lane;
+            u.x = n.x; u.y = n.y; u.w = n.w; u.h = n.h;
+            u.layer = n.layer;
+            u.baseLayer = n.baseLayer;
+            u.subX = n.subX; u.subW = n.subW;
+            u.hasLeft = n.hasLeft; u.hasRight = n.hasRight;
+            u.leftFilled = n.leftFilled; u.rightFilled = n.rightFilled;
+            u.complete = n.complete;
+            u.instances = n.instances;
+            u.laneCount = n.laneCount;
+            u.sockets = n.sockets;
+            u.bus = n.bus;
+            u.hasPrice = n.hasPrice;
+            u.wordCost = n.price.wordCost;
+            u.tariff = n.price.tariff;
+            u.carryCost = n.price.carryCost;
+            u.priceInstances = n.price.instances;
+            u.leaves = n.price.leaves;
+            u.instancesClamped = n.price.instancesClamped;
+            u.subtotal = n.subtotal;
+            u.primary = n.primary;
+            u.split = n.split;
+            u.owner = n.owner;
+            u.bolts = n.bolts;
+            u.instance = n.instance;
+            u.pipW = n.pipW;
+            u.edit = n.edit;
+            u.wasted = n.wasted;
+            u.mag = n.mag;
+            u.graded = n.graded;
+            u.magMin = n.magMin;
+            u.magMax = n.magMax;
+            u.magStep = n.magStep;
+            u.magDefault = n.magDefault;
+            u.magLabel = n.magLabel;
+            u.trigger = (int)n.timing.trigger;
+            u.every = n.timing.every;
+            u.delay = n.timing.delay;
+            u.timingPhrase = n.timing.IsDefault() ? std::string() : TimingPhrase(n.timing);
+            u.spanFirst = n.spanFirst;
+            u.spanLast = n.spanLast;
+            // BY NAME, not by index (DESIGN §8b): the panel holds this across
+            // a frame and an R reload renumbers every glyph.
+            if (const GlyphDef* gd = glyphs.At(n.glyph)) {
+              u.glyphId = gd->id;
+              u.wordCostOf = gd->word;
+              if (gd->sort == GlyphSort::Matter && !gd->wildcard && gd->material > 0 &&
+                  gd->material < mats.size())
+                u.color = mats[gd->material].gpu.color0;
+            }
+            ui.spellGraph.nodes.push_back(std::move(u));
+          }
+          for (const SpellGraphEdge& e : sg.edges)
+            ui.spellGraph.edges.push_back({e.from, e.to, (int)e.kind});
         }
       }
 
@@ -12072,6 +13224,70 @@ int main(int argc, char** argv) {
         }
       }
 
+      // SCOOP MOTES (game/session.h ScoopMote): every cell a flask or pouch
+      // took flies into its mouth -- a hop up off the ground, a swirl about
+      // the line to the vessel, then an accelerating pull that shrinks it to
+      // nothing at the mouth. The mouth is re-read every frame, so the stream
+      // bends after the hand. Render-only; the matter was already paid for by
+      // the scoop ledger.
+      if (!session.scoopMotes.empty()) {
+        Vec3 mouth = player.RenderEyePos(tickAlpha) + cam.Forward() * MetresToCells(0.35f) -
+                     Vec3{0, MetresToCells(0.15f), 0};
+        {
+          Vec3 hp;
+          Quat hq;
+          const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
+          if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq))
+            mouth = hp + Vec3{0, MetresToCells(0.08f), 0};
+        }
+        auto shade = [](uint32_t c, float k) -> uint32_t {
+          auto ch = [&](int sh) {
+            const float v = (float)((c >> sh) & 0xFFu) * k;
+            return (uint32_t)std::clamp(v, 0.0f, 255.0f) << sh;
+          };
+          return 0xFF000000u | ch(0) | ch(8) | ch(16);
+        };
+        auto at = [&](const ScoopMote& m, float t, float phase) {
+          const Vec3 d = mouth - m.from;
+          const float len = std::max(d.len(), 1e-3f);
+          const Vec3 axis = d * (1.0f / len);
+          const Vec3 ref = std::fabs(axis.y) < 0.9f ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
+          const Vec3 u = ref.cross(axis).normalized();
+          const Vec3 v = axis.cross(u);
+          const float pull = t * t;                         // slow lift, fast suck
+          const float arc = std::sin(3.14159265f * t);      // 0 at both ends
+          const float ang = phase + t * 9.0f;               // ~1.5 turns
+          const float r = std::min(1.2f, 0.12f * len) * arc;
+          return m.from + d * pull + Vec3{0, 1.1f, 0} * arc * (1.0f - pull) +
+                 (u * std::cos(ang) + v * std::sin(ang)) * r;
+        };
+        for (const ScoopMote& m : session.scoopMotes) {
+          if (m.delay > 0) continue;   // the cell is still in the grid
+          if (sprv.size() + 2 >= kMaxSprites) break;
+          const float t = std::clamp(((float)m.age + tickAlpha) / (float)m.life, 0.0f, 1.0f);
+          const float phase = (float)(m.seed & 0xFFFFu) * (6.2831853f / 65536.0f);
+          const float size = 0.40f + 0.06f * (float)((m.seed >> 16) & 3u) / 3.0f;
+          const float bright = 0.9f + 0.2f * (float)((m.seed >> 20) & 7u) / 7.0f;
+          const Vec3 p = at(m, t, phase);
+          Sprite s{};
+          s.pos[0] = p.x; s.pos[1] = p.y; s.pos[2] = p.z;
+          s.halfSize = size * (1.0f - 0.8f * t * t);
+          s.color = shade(m.color, bright);
+          s.emission = 0.0f;
+          sprv.push_back(s);
+          // A crumb trailing behind, so the stream reads as matter pouring
+          // up rather than cubes teleporting.
+          if (t > 0.15f) {
+            const Vec3 q = at(m, t - 0.15f, phase + 1.7f);
+            Sprite c = s;
+            c.pos[0] = q.x; c.pos[1] = q.y; c.pos[2] = q.z;
+            c.halfSize = s.halfSize * 0.4f;
+            c.color = shade(m.color, bright * 0.85f);
+            sprv.push_back(c);
+          }
+        }
+      }
+
       // prefab tool preview: marker box at the anchor cell, sized to the
       // rotated footprint (cheap stand-in for a full ghost render)
       if (ui.tool == UIState::kToolPrefab && !prefabs.empty() &&
@@ -12240,12 +13456,41 @@ int main(int argc, char** argv) {
           }
         }
       }
-      uint32_t debugBoxCount = 0;
-      if (!dbg.empty()) {
-        debugBoxCount = (uint32_t)dbg.size();
+      const uint32_t debugBoxCount = (uint32_t)dbg.size();
+      // ---- THE POUR POINT (game/container.h ContainerPourPoint) -----------
+      // A filled vessel in the hands shows where its stream goes: a small,
+      // mostly transparent sphere on the crosshair a metre in front of the
+      // character, or on whatever is in the way -- `pourAim`, the same point
+      // the tick pours at. It rides
+      // the debugBoxes upload as ONE record after the overlay's boxes (so the
+      // overlay's count excludes it) and has its own DEPTH-TESTED pipeline
+      // (Simulation::DrawPourMarker): the ground in front of it hides it.
+      uint32_t pourMarkerAt = UINT32_MAX;
+      // `pourAimValid` was decided BEFORE the ticks, and a tick can empty the
+      // slot since (a throw, a pour to the last drop), so re-read it here.
+      const ItemStack* vsM =
+          pourAimValid ? &hotbar.slots[vesselSlot] : nullptr;
+      const ItemDef* vdefM =
+          vsM && !vsM->Empty() ? items.At(vsM->def) : nullptr;
+      if (vdefM && vdefM->IsContainer() && vsM->Filled() &&
+          dbg.size() < kMaxDebugBoxes) {
+        static std::vector<uint64_t> ownM;
+        ownM.clear();
+        avatar.AppendLiveLimbBodies(ownM);
+        const Vec3 at = ContainerPourPoint(
+            *vdefM, eye, player.EyePos(), cam.Forward(),
+            [&](IVec3 c) { return world.KindAt(c, classOf); }, phys, ownM);
+        DebugBox b{};
+        b.pos[0] = at.x; b.pos[1] = at.y; b.pos[2] = at.z;
+        b.half[0] = b.half[1] = b.half[2] = MetresToCells(0.02f);  // radius
+        b.quat[3] = 1.0f;
+        b.color = 0x60FFF0E0u;  // pale, mostly clear (0xAABBGGRR)
+        pourMarkerAt = (uint32_t)dbg.size();
+        dbg.push_back(b);
+      }
+      if (!dbg.empty())
         ctx.queue.WriteBuffer(world.debugBoxes, 0, dbg.data(),
                               dbg.size() * sizeof(DebugBox));
-      }
 
       // rigid bodies: debris takes slots [0, D), mob limbs stack after —
       // instances rebuild when either side changes (slot bases shift),
@@ -12378,6 +13623,7 @@ int main(int argc, char** argv) {
         if (g_shotInventory && (frameCounter == kShotInvGearFrame ||
                                 frameCounter == kShotInvCaptureFrame ||
                                 frameCounter == kShotInvGrimoireFrame ||
+                                frameCounter == kShotInvGraphFrame ||
                                 frameCounter == kShotInvLootFrame ||
                                 frameCounter == kShotInvDeathShot ||
                                 frameCounter == kShotInvDeathTurnShot))
@@ -12524,6 +13770,7 @@ int main(int argc, char** argv) {
       {
         const LiveSpan sp = spanBegin("rm_debug");
         sim.DrawDebugBoxes(rp, debugBoxCount);
+        sim.DrawPourMarker(rp, pourMarkerAt);
         // Field arrows LAST of the world draws so they composite over
         // everything they annotate. Nothing is uploaded for them — the count
         // is the only CPU work, and at zero the draw is skipped outright
@@ -12601,20 +13848,36 @@ int main(int argc, char** argv) {
       // cache, so nothing thrashes) and read back. The blocking readback is
       // legal here for the same reason it is in --shot: this is the last frame
       // of a harness run, not the frame path of a game.
+      // --shot-spellpage names its file after the SCENE, not after the frame:
+      // a gallery whose pictures are called shot_spell_148.bmp is a gallery
+      // nobody can diff against the last pass.
+      static char sSpellShotPath[64];
+      const int spellShot =
+          g_shotSpellPage ? ShotSpellSceneAt(frameCounter, false) : -1;
+      if (spellShot >= 0)
+        std::snprintf(sSpellShotPath, sizeof sSpellShotPath,
+                      "shot_spell_%s.bmp", kShotSpellScenes[spellShot].name);
       if ((g_shotInventory && (frameCounter == kShotInvGearFrame ||
+                               frameCounter == kShotInvHudFrame ||
                                frameCounter == kShotInvCaptureFrame ||
                                frameCounter == kShotInvGrimoireFrame ||
+                               frameCounter == kShotInvGraphFrame ||
                                frameCounter == kShotInvLootFrame ||
                                frameCounter == kShotInvDeathShot ||
                                frameCounter == kShotInvDeathTurnShot)) ||
-          g_shotJumpPath) {
+          spellShot >= 0 || g_shotJumpPath) {
         const char* shotPath =
+            spellShot >= 0                       ? sSpellShotPath
+            :
             g_shotJumpPath                       ? g_shotJumpPath
             : frameCounter == kShotInvGearFrame  ? "screenshot_inventory.bmp"
+            : frameCounter == kShotInvHudFrame   ? "screenshot_hud.bmp"
             : frameCounter == kShotInvCaptureFrame
                 ? "screenshot_inventory_health.bmp"
             : frameCounter == kShotInvGrimoireFrame
                 ? "screenshot_inventory_grimoire.bmp"
+            : frameCounter == kShotInvGraphFrame
+                ? "screenshot_inventory_graph.bmp"
             : frameCounter == kShotInvLootFrame
                 ? "screenshot_inventory_loot.bmp"
             : frameCounter == kShotInvDeathShot
@@ -12632,6 +13895,7 @@ int main(int argc, char** argv) {
         sim.DrawWorld(srp);
         sim.DrawBodies(srp, bodyInstCount);
         sim.DrawMicroBodies(srp, microCount);
+        sim.DrawPourMarker(srp, pourMarkerAt);
         overlay.RenderRecorded(srp);
         srp.End();
         ctx.queue.Submit(senc.Finish());

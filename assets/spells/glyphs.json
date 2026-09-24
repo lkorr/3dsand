@@ -1,6 +1,6 @@
 {
   "comment": "Glyphs are CONTENT, like materials.json and reactions.json. A glyph is a word of the ancient language; docs/PLAN_magic_grammar.md is the grammar and scripts/magic_grammar.py the executable reference the C++ parser is checked against (`--gate spells-oracle`). Five sorts: matter (a material BY NAME, resolved to a 12-bit id at load; `air` is the void, `anything` the wildcard), effect (something that happens at a point: verb + params), delivery (how an effect reaches a point: mech instant | flight | continuous, plus the record fields), mod (a field edit on the delivery record: field/op/amount, applied again per repetition), operator (verb + valence: `left`/`right` list the sorts each slot accepts or `any`, `result` is the sort produced). Every unary operator takes the word BEFORE it; only an infix operator has both slots. Costs are integer: `word` is the small fixed cost of saying it; the real price is the tariff on what the cast does to the world (budgets.rates x the per-material `arcane` value in materials.json). Hot-reloads on R alongside materials.json. A delivery's `speed` is voxels per tick at 30 Hz and may be fractional (4.8 = 14.4 m/s); a flight collides with the CPU mirror, then the chunk cache it prefetches ahead of itself, then the ground contract, and with bodies by ray. A delivery's `look` block is RENDER-ONLY: shape bolt | ball | orb | spark, size (core half-size, voxels), tail (trailing sprites; the orb's ring count), tailStep (voxels between them), glow (emission), color (#RRGGBB, used when the cast carries no matter).",
-  "language": "R1 runs merge (fire fire = fire x2; matter and effects ADD, mods COMPOSE: shotgun x2 = 9). R2 operators bind their neighbours greedily on their declared side, left to right. R3 an operator with an empty required slot is INCOMPLETE: charged, does nothing, drawn with `_`; there are no defaults, `anything` and `air` are words. R4 a delivery closes the clause; a second delivery starts a new cast. R5 no delivery = hand, at reach in front of the caster. R6 order inside a bag does not matter. Every sequence lowers to a definite cast list; there is no misfire state.",
+  "language": "FOUR rules. R1 a noun goes into the PILE and order inside a scope of the pile does not matter: runs merge within a scope (fire fire = fire x2; matter and effects ADD, mods COMPOSE: shotgun x2 = 9) and the lowering rebuilds each scope in a canonical order. R2 a DELIVERY BOXES the innermost OPEN scope of the pile into one Effect value and speaking CONTINUES, so deliveries NEST and word order decides what is inside what; with no delivery the box is `hand`, at reach in front of the caster. R3 a MOD is pending and sticks to the box that closes the pile; on the hand only `shotgun`/`twin` (fanned resolve points) and `float`/`heavy` (the hop) mean anything and every other mod there is a charged no-op the readout names. R4 `lane` OPENS A LANE SCOPE and `end` CLOSES the innermost open one. A delivery inside an open lane boxes only that lane and the lane stays open; outside any lane it boxes the shared items plus every closed lane, which is the multi-socket box. Lanes are ordered as spoken, lane i belongs to instance i, the box fires max(count, lanes) instances, and an instance past the last lane carries the shared items alone. An unclosed lane is closed at the end of the sentence. Operators bind within the current scope only and a `lane`/`end` mark is a wall; a mod inside a lane edits that instance's record. A `count` mod SPLITS THE SCOPE it was spoken in - shared, it is the box's fan; inside a lane, it is that one branch's split - and at most ONE count word per scope is effective: the strongest wins, the rest are charged no-ops. Nine bolts is a split on each of three branches, not one word said twice. An operator with an empty required slot is INCOMPLETE: charged, does nothing, drawn with `_`; there are no defaults, `anything` and `air` are words. Every sequence lowers to a definite cast list; there is no misfire state.",
   "budgets": {
     "comment": "Rule 2 applied to magic: every sustained effect declares a FINITE budget up front. Hard engine ceilings; a glyph's own budget is clamped to them at load. rates.* and anythingSurchargeMille are the tariff (plan section 4): place = per voxel x arcane(M); convert = per voxel + max(0, arcane(B)-arcane(A)); graft = per voxel x arcane(M); explode = power x r^3 / 1000; wind = footprint x ticks / 1000. The wildcard bills value(actual) x surcharge on top, when it resolves.",
     "maxLiveProjectiles": 32,
@@ -24,8 +24,10 @@
     "maxStatusTicks": 900,
     "maxStatusPerCaster": 4,
     "maxGrimoirePages": 32,
-    "maxMacroWords": 16,
-    "maxMacroDepth": 4
+    "maxMacroWords": 32,
+    "maxMacroDepth": 4,
+    "maxDelayTicks": 300,
+    "minEveryTicks": 2
   },
   "hand": {
     "comment": "The implicit delivery (R5). Not a glyph: it cannot be spoken, it is what a clause without a delivery is delivered by.",
@@ -214,7 +216,8 @@
         "entrain": true
       },
       "axis": "speed",
-      "desc": "A vacuum burst: pulls loose matter and bodies toward the point."
+      "desc": "A vacuum burst: pulls loose matter and bodies toward the point. (Replaced on the page by `wind`, which says the same thing as a number; kept so old pages still work.)",
+      "hidden": true
     },
     {
       "id": "spark",
@@ -229,6 +232,11 @@
     },
     {
       "id": "transmute",
+      "magnitude": {
+        "min": 0.25,
+        "max": 4,
+        "step": 0.25
+      },
       "sort": "operator",
       "word": 4,
       "verb": "convert",
@@ -246,6 +254,11 @@
     },
     {
       "id": "mend",
+      "magnitude": {
+        "min": 0.25,
+        "max": 4,
+        "step": 0.25
+      },
       "sort": "operator",
       "word": 6,
       "verb": "mend",
@@ -269,6 +282,11 @@
     },
     {
       "id": "trail",
+      "magnitude": {
+        "min": 0.25,
+        "max": 4,
+        "step": 0.25
+      },
       "sort": "operator",
       "word": 8,
       "verb": "trail",
@@ -303,6 +321,11 @@
     },
     {
       "id": "null",
+      "magnitude": {
+        "min": 0.25,
+        "max": 4,
+        "step": 0.25
+      },
       "sort": "operator",
       "word": 5,
       "verb": "filter",
@@ -327,8 +350,13 @@
       "repeats": 4,
       "everyTicks": 10,
       "example": "explosive echo orb",
-      "axis": "repeats",
-      "desc": "E echo: E repeats at the point every few ticks for a bounded span."
+      "axis": "repeats (magnitude scales the count)",
+      "desc": "E echo: E repeats at the point every few ticks for a bounded span.",
+      "magnitude": {
+        "min": 0.25,
+        "max": 4,
+        "step": 0.25
+      }
     },
     {
       "id": "projectile",
@@ -480,9 +508,9 @@
       "field": "count",
       "op": "mul",
       "amount": 3,
-      "example": "explosive shotgun shotgun projectile",
-      "axis": "count x3 (3, 9, 27 ...), fanned",
-      "desc": "Three of it, fanned. Said again: nine. Everything behind it is paid that many times."
+      "example": "explosive shotgun projectile",
+      "axis": "splits its scope into 3, fanned",
+      "desc": "Splits into three, fanned. Said again in the same place it does nothing - to get nine, split each of the three branches. Everything behind it is paid for every bolt."
     },
     {
       "id": "float",
@@ -493,7 +521,8 @@
       "amount": -1000,
       "example": "float float aura self",
       "axis": "gravity -1g",
-      "desc": "Anti-gravity. Twice: gravity reversed. On a body-anchored delivery it lifts the body."
+      "desc": "Anti-gravity. Twice: gravity reversed. On a body-anchored delivery it lifts the body. (Replaced on the page by `lift`, which says the same thing as a number; kept so old pages still work.)",
+      "hidden": true
     },
     {
       "id": "heavy",
@@ -504,7 +533,8 @@
       "amount": 1000,
       "example": "heavy explosive lob",
       "axis": "gravity +1g",
-      "desc": "Falls harder, hits harder."
+      "desc": "Falls harder, hits harder. (Replaced on the page by `lift`, which says the same thing as a number; kept so old pages still work.)",
+      "hidden": true
     },
     {
       "id": "swift",
@@ -515,7 +545,8 @@
       "amount": 2,
       "example": "swift bolt",
       "axis": "speed x2",
-      "desc": "Faster."
+      "desc": "Faster. (Replaced on the page by `speed`, which says the same thing as a number; kept so old pages still work.)",
+      "hidden": true
     },
     {
       "id": "slow",
@@ -526,7 +557,8 @@
       "amount": 2,
       "example": "slow float explosive orb",
       "axis": "speed /2",
-      "desc": "Slower. A slow explosive bolt is a mine that drifts."
+      "desc": "Slower. A slow explosive bolt is a mine that drifts. (Replaced on the page by `speed`, which says the same thing as a number; kept so old pages still work.)",
+      "hidden": true
     },
     {
       "id": "long",
@@ -595,12 +627,90 @@
       "desc": "Waits after impact before resolving; on a bomb, a longer fuse."
     },
     {
-      "id": "also",
+      "id": "lane",
       "sort": "separator",
+      "scope": "open",
       "word": 0,
-      "example": "explosive projectile also fire",
-      "axis": "sentences",
-      "desc": "Ends this sentence and starts the next. Everything spoken before it is one finished cast, delivered by hand if no delivery closed it; everything after is a second. Costs add and both go off together. Without it a whole utterance is ONE cast, however many deliveries nest inside it."
+      "example": "explosive lane fire end twin projectile",
+      "axis": "lanes (one instance each)",
+      "desc": "Opens a LANE: a scope of the pile that belongs to ONE instance of the box that closes it. `end` closes it again. The first lane you open is what instance 0 carries on top of the shared items, the second what instance 1 carries, and so on; the box fires max(count, lanes) instances and an instance past the last lane carries the shared items alone. A delivery spoken INSIDE an open lane boxes only that lane, and the lane stays open — which is how a socket holds a bolt that fires a bolt. A lane is a wall: an operator cannot take a word from another scope, and identical words in different lanes do not merge. A mod inside a lane edits that instance's record - a `count` among them splits that one branch. With no delivery outside the lanes they are the hand's, which is how two unrelated spells are said at once: `lane explosive projectile end lane blood mend self end`."
+    },
+    {
+      "id": "end",
+      "sort": "separator",
+      "scope": "close",
+      "word": 0,
+      "example": "lane explosive projectile end lane fire end projectile",
+      "axis": "closes a lane",
+      "desc": "Closes the innermost open `lane`, back to the scope around it. A lane left open when the sentence runs out is closed for you; an `end` with nothing open is charged and does nothing."
+    },
+    {
+      "id": "twin",
+      "sort": "mod",
+      "word": 3,
+      "field": "count",
+      "op": "mul",
+      "amount": 2,
+      "example": "explosive lane fire end twin projectile",
+      "axis": "splits its scope into 2, fanned",
+      "desc": "Splits into two, fanned. The double of `shotgun`'s triple, and like it one split per scope - said twice in one place the second is charged and does nothing. Everything behind it is paid for every bolt."
+    },
+    {
+      "id": "lift",
+      "sort": "mod",
+      "word": 4,
+      "field": "gravity",
+      "op": "add",
+      "amount": -1000,
+      "magnitude": {
+        "min": -3,
+        "max": 3,
+        "step": 0.25,
+        "default": 1
+      },
+      "example": "lift aura self",
+      "axis": "lift in g: +1 weightless, +2 rises, -1 falls twice as hard",
+      "desc": "How much gravity to take away, in g. 1 is weightless, 0.5 a slow fall, 2 rises; below zero it presses down instead. On a body-anchored delivery it lifts the body."
+    },
+    {
+      "id": "speed",
+      "sort": "mod",
+      "word": 4,
+      "field": "speed",
+      "op": "mul",
+      "amount": 1,
+      "magnitude": {
+        "min": 0.25,
+        "max": 4,
+        "step": 0.25,
+        "default": 2
+      },
+      "example": "speed projectile",
+      "axis": "speed multiplier: x0.25 crawls, x4 flies",
+      "desc": "How fast it flies, as a multiple of its carrier's own speed. Below 1 it slows."
+    },
+    {
+      "id": "wind",
+      "sort": "effect",
+      "word": 5,
+      "verb": "wind",
+      "example": "wind projectile",
+      "wind": {
+        "kind": "burst",
+        "speed": 20,
+        "radius": 8,
+        "reach": 8,
+        "ticks": 30,
+        "entrain": true
+      },
+      "magnitude": {
+        "min": -3,
+        "max": 3,
+        "step": 0.25,
+        "default": 1
+      },
+      "axis": "strength: positive blows out from the point, negative pulls in",
+      "desc": "A burst of wind at the point. Positive pushes loose matter and bodies away; negative is a vacuum that pulls them in."
     }
   ],
   "conjoined": {

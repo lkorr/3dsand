@@ -1,0 +1,18 @@
+{
+  "label": "Scattered",
+  "about": "Half the sky in cumulus, bigger bodies, deeper shadows crossing the land.",
+  "moisture": 0.35,
+  "weight": 1.5,
+  "coverage": 0.52,
+  "cloudType": 0.55,
+  "density": 1.0,
+  "baseM": 1200,
+  "thicknessM": 1900,
+  "darkness": 0.05,
+  "cirrus": 0.2,
+  "cirrusAltM": 8000,
+  "precip": 0.0,
+  "precipType": 0.0,
+  "mist": 0.1,
+  "lightning": 0.0
+}

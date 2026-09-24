@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <unordered_map>
 
 #include "sim/rng.h"
 #include <nlohmann/json.hpp>
@@ -27,6 +28,65 @@ StrokeSegment ReadSegment(const json& j, StrokeSegment dflt) {
   return s;
 }
 
+// ---- THE CUT PATH (strokes.h "A CUT IS A PATH") ----------------------------
+//
+// `cut` is EITHER one segment or a list of legs, and the two spellings are read
+// by the one function so the single-segment form cannot drift into being a
+// special case with its own defaults. A one-leg list and a bare object produce
+// byte-identical programs; that is the whole compatibility story, and it is why
+// nothing in the shipped library had to be rewritten for this.
+//
+// A leg of the list defaults to a SHORT, STATIONARY segment rather than to the
+// single cut's `{7, -2.0, 0, 0.10}`: those defaults are a whole horizontal
+// slash, which is a sensible thing for an unstated cut to be and a nonsensical
+// thing for an unstated SECOND leg to be. An author who writes `{"az": -0.4}`
+// as a third leg means "and then a little further", not "and then a whole
+// second swing".
+void ReadCutPath(const json& cutJ, const std::string& path,
+                 const std::string& name, std::vector<StrokeSegment>& out,
+                 int& aimLeg, std::string& log) {
+  out.clear();
+  aimLeg = -1;
+  if (cutJ.is_array()) {
+    for (const auto& leg : cutJ) {
+      if (!leg.is_object()) {
+        log += path + ": style \"" + name +
+               "\" has a cut leg that is not an object — skipped\n";
+        continue;
+      }
+      if ((int)out.size() >= kMaxCutLegs) {
+        log += path + ": style \"" + name + "\" has more than " +
+               std::to_string(kMaxCutLegs) +
+               " cut legs — the rest are dropped (a path with that many "
+               "corners is a body clip, not a stroke)\n";
+        break;
+      }
+      // THE AIM IS ONE LEG'S. Two legs claiming it is an authoring slip with a
+      // silent outcome — the target would sit wherever the tie-break landed —
+      // so the first wins and the second is reported.
+      if (leg.value("aim", false)) {
+        if (aimLeg >= 0)
+          log += path + ": style \"" + name + "\" marks leg " +
+                 std::to_string(out.size() + 1) +
+                 " with \"aim\" as well — the first marked leg keeps it\n";
+        else
+          aimLeg = (int)out.size();
+      }
+      out.push_back(ReadSegment(leg, StrokeSegment{4, 0.0f, 0.0f, 0.0f}));
+    }
+    if (out.empty())
+      log += path + ": style \"" + name +
+             "\" has an empty cut list — falling back to one default cut\n";
+  }
+  // The single-segment spelling, and the fallback for a list with nothing
+  // usable in it. `cutJ` being null (no `cut` key at all) lands here too and
+  // gets the historical default, which is what `ReadSegment` has always done
+  // with an absent object.
+  if (out.empty())
+    out.push_back(ReadSegment(cutJ.is_object() ? cutJ : json::object(),
+                              StrokeSegment{7, -2.0f, 0.0f, 0.10f}));
+}
+
 }  // namespace
 
 bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
@@ -45,7 +105,9 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
   }
 
   StyleLibrary lib;
-  for (const auto& s : j.value("styles", json::array())) {
+  const auto stylesJson = j.value("styles", json::array());
+  std::unordered_map<std::string, json> rawByName;
+  for (const auto& s : stylesJson) {
     AttackStyle st;
     st.name = s.value("name", "");
     if (st.name.empty()) {
@@ -53,12 +115,79 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
       continue;
     }
     st.label = s.value("label", st.name);
+    // HOW THE CUT IS PACED (strokes.h, above AttackStyle). Absent is "linear",
+    // the drive every style shipped before this had, so an older file loads
+    // and swings identically.
+    //
+    // ParseEase is SILENT on a name it does not know (anim.cpp returns Linear,
+    // which is right for a keyframe: a clip must not fail to load over a
+    // typo). Here the typo is worth saying out loud, and the round-trip is how
+    // to tell "the author wrote linear" from "the author wrote quadOOut" —
+    // both parse to Linear, and only one of them is a mistake.
+    if (s.contains("ease")) {
+      const std::string en = s.value("ease", "linear");
+      st.ease = ParseEase(en);
+      if (st.ease == Ease::Linear && en != "linear")
+        log += path + ": style \"" + st.name + "\" has unknown ease \"" + en +
+               "\" — using linear (the names are anim.h's: linear, instant, "
+               "quadIn/Out/InOut, cubicIn/Out/InOut)\n";
+    }
     st.windup = ReadSegment(s.value("windup", json::object()),
                             StrokeSegment{12, 0.30f, 0.10f, -0.05f});
-    st.cut = ReadSegment(s.value("cut", json::object()),
-                         StrokeSegment{7, -2.0f, 0.0f, 0.10f});
-    if (s.contains("recover") && s["recover"].is_object())
-      st.recoverTicks = std::max(1, s["recover"].value("ticks", 10));
+    ReadCutPath(s.contains("cut") ? s["cut"] : json(), path, st.name, st.cut,
+                st.aimLeg, log);
+    // ---- THE RETURN (strokes.h StrokeRecover) ------------------------------
+    // Every field defaults to what a style written before this existed already
+    // did, and `posed` is derived rather than authored: stating an az, an el or
+    // a reach is what asks for a driven return, so there is no second switch to
+    // forget. A recover of `{ "ticks": 10 }` is the old four-line hand-back,
+    // byte for byte.
+    if (s.contains("recover") && s["recover"].is_object()) {
+      const auto& rv = s["recover"];
+      st.recover.ticks = std::max(1, rv.value("ticks", 10));
+      st.recover.posed =
+          rv.contains("az") || rv.contains("el") || rv.contains("reach");
+      st.recover.az = rv.value("az", 0.0f);
+      st.recover.el = rv.value("el", 0.0f);
+      st.recover.reach = rv.value("reach", 0.0f);
+      st.recover.settle = std::max(0, rv.value("settle", 0));
+      st.recover.fade = std::max(0, rv.value("fade", 0));
+      // A SETTLE WITH NOTHING TO SETTLE TO holds the arm at the end of the cut
+      // with the button still down and then drops it, which is the crossfade
+      // this whole block exists to remove, arrived at the long way round.
+      if (st.recover.settle > 0 && !st.recover.posed) {
+        log += path + ": style \"" + st.name +
+               "\" has `recover.settle` but no return pose (az/el/reach) — the "
+               "arm has nowhere to be driven, so the settle is ignored\n";
+        st.recover.settle = 0;
+      }
+      if (st.recover.settle > st.recover.ticks) {
+        log += path + ": style \"" + st.name + "\" settles for " +
+               std::to_string(st.recover.settle) + " of " +
+               std::to_string(st.recover.ticks) +
+               " recover ticks — clamped to the segment\n";
+        st.recover.settle = st.recover.ticks;
+      }
+      // ...AND THE FADE HAS TO FIT IN WHAT IS LEFT. The program ENDS at
+      // `ticks`, and the NPC drops its pose claim on that tick (mob.cpp pushes
+      // an empty WeaponPose). A fade still running when that happens is a
+      // PoseWeight stepping from whatever it had reached straight to 0 in one
+      // tick — which is exactly the snap melee.cpp:2430 was just fixed to
+      // remove, reintroduced from the content side. Extend the segment rather
+      // than shortening the fade: the author asked for that return, and the
+      // cost of honouring it is ticks, not a visible snap.
+      if (st.recover.fade > 0 &&
+          st.recover.settle + st.recover.fade > st.recover.ticks) {
+        const int want = st.recover.settle + st.recover.fade;
+        log += path + ": style \"" + st.name + "\" settles " +
+               std::to_string(st.recover.settle) + " + fades " +
+               std::to_string(st.recover.fade) + " = " + std::to_string(want) +
+               " ticks in a " + std::to_string(st.recover.ticks) +
+               "-tick recover — extended to " + std::to_string(want) +
+               " so the claim is not dropped mid-fade\n";
+        st.recover.ticks = want;
+      }
+    }
     if (s.contains("jitter") && s["jitter"].is_object()) {
       const auto& q = s["jitter"];
       st.jitter.az = q.value("az", 0.0f);
@@ -133,8 +262,16 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
     // nothing, and hand back a stroke that could never damage anything — and
     // the only symptom would be an NPC that swings and never hits, which is
     // exactly the sort of content bug that gets blamed on the damage path.
-    const float travel = std::fabs(st.cut.az) + std::fabs(st.cut.el) +
-                         std::fabs(st.cut.reach);
+    //
+    // MEASURED OVER THE WHOLE PATH, not per leg: a stationary leg is a legal
+    // hitch (strokes.h), and a path that ends where it started still passed
+    // through the target on the way — a hook out and back is a real stroke.
+    // What this refuses is a path with no motion anywhere in it, which is why
+    // the sum is of each leg's own |travel| rather than of the net
+    // displacement.
+    float travel = 0;
+    for (const StrokeSegment& leg : st.cut)
+      travel += std::fabs(leg.az) + std::fabs(leg.el) + std::fabs(leg.reach);
     if (travel < 1e-3f) {
       log += path + ": style \"" + st.name +
              "\" has a cut that travels nowhere — skipped\n";
@@ -142,20 +279,102 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
     }
     if (lib.Find(st.name) >= 0)
       log += path + ": duplicate style \"" + st.name + "\" — last wins\n";
+    rawByName[st.name] = s;
     lib.styles.push_back(std::move(st));
   }
   if (lib.styles.empty())
     log += path + ": no usable styles — NPCs will not swing\n";
 
+  // ---- PLAYER OVERRIDES (attack_styles.json `player` block per style) ------
+  // Each style may carry a `player` block stating only the fields that differ
+  // when the player swings it (shorter windup, zero jitter, sometimes different
+  // geometry). The loader creates a DERIVED copy with overrides merged and
+  // appends it to `styles`; the player compass resolves to the derived copy.
+  // Merge rule: per-field within windup/cut/jitter (unstated fields inherit).
+  // For `recover`: if the override is present but states no az/el/reach, the
+  // result has no posed return even if the base did.
+  std::unordered_map<std::string, int> playerDerived;
+  for (size_t base = 0, count = lib.styles.size(); base < count; base++) {
+    auto it = rawByName.find(lib.styles[base].name);
+    if (it == rawByName.end()) continue;
+    const auto& sj = it->second;
+    if (!sj.contains("player") || !sj["player"].is_object()) continue;
+    const auto& pj = sj["player"];
+    AttackStyle ps = lib.styles[base];
+    ps.name += ":player";
+    // The player's copy may pace the cut differently from the NPC's: a click
+    // has to feel owned and an authored NPC telegraph does not, which is the
+    // same reason the block already overrides windup ticks and zeroes jitter.
+    if (pj.contains("ease")) {
+      const std::string en = pj.value("ease", "linear");
+      const Ease pe = ParseEase(en);
+      if (pe == Ease::Linear && en != "linear")
+        log += path + ": style \"" + ps.name + "\" has unknown ease \"" + en +
+               "\" — inheriting the base's\n";
+      else
+        ps.ease = pe;
+    }
+    if (pj.contains("windup") && pj["windup"].is_object()) {
+      const auto& w = pj["windup"];
+      ps.windup.ticks = std::max(1, w.value("ticks", ps.windup.ticks));
+      ps.windup.az = w.value("az", ps.windup.az);
+      ps.windup.el = w.value("el", ps.windup.el);
+      ps.windup.reach = w.value("reach", ps.windup.reach);
+    }
+    // ---- THE CUT, WHICH MAY NOW BE A PATH ON EITHER SIDE ------------------
+    // A LIST REPLACES, AN OBJECT MERGES INTO THE FIRST LEG. Merging a list
+    // into a list per index would silently reinterpret leg 2 of the player's
+    // hook as leg 2 of a base with a different number of corners, which is a
+    // rule nobody could hold in their head; and an object override was only
+    // ever "the same stroke, tightened" — a shorter windup, a shorter travel —
+    // so it lands on the leg that opens the cut and leaves the rest of the
+    // path as the base authored it.
+    if (pj.contains("cut") && pj["cut"].is_array()) {
+      ReadCutPath(pj["cut"], path, ps.name, ps.cut, ps.aimLeg, log);
+    } else if (pj.contains("cut") && pj["cut"].is_object()) {
+      const auto& c = pj["cut"];
+      StrokeSegment& leg0 = ps.cut[0];
+      leg0.ticks = std::max(1, c.value("ticks", leg0.ticks));
+      leg0.az = c.value("az", leg0.az);
+      leg0.el = c.value("el", leg0.el);
+      leg0.reach = c.value("reach", leg0.reach);
+    }
+    if (pj.contains("recover") && pj["recover"].is_object()) {
+      const auto& rv = pj["recover"];
+      ps.recover.ticks = std::max(1, rv.value("ticks", ps.recover.ticks));
+      ps.recover.posed =
+          rv.contains("az") || rv.contains("el") || rv.contains("reach");
+      if (ps.recover.posed) {
+        ps.recover.az = rv.value("az", 0.0f);
+        ps.recover.el = rv.value("el", 0.0f);
+        ps.recover.reach = rv.value("reach", 0.0f);
+      } else {
+        ps.recover.az = ps.recover.el = ps.recover.reach = 0.0f;
+        ps.recover.settle = 0;
+      }
+      ps.recover.settle = std::max(0, rv.value("settle", ps.recover.settle));
+      ps.recover.fade = std::max(0, rv.value("fade", ps.recover.fade));
+      if (ps.recover.settle > 0 && !ps.recover.posed)
+        ps.recover.settle = 0;
+      if (ps.recover.settle > ps.recover.ticks)
+        ps.recover.settle = ps.recover.ticks;
+      if (ps.recover.fade > 0 &&
+          ps.recover.settle + ps.recover.fade > ps.recover.ticks)
+        ps.recover.ticks = ps.recover.settle + ps.recover.fade;
+    }
+    if (pj.contains("jitter") && pj["jitter"].is_object()) {
+      const auto& q = pj["jitter"];
+      ps.jitter.az = q.value("az", ps.jitter.az);
+      ps.jitter.el = q.value("el", ps.jitter.el);
+      ps.jitter.tempo = std::clamp(q.value("tempo", ps.jitter.tempo), 0.0f, 0.6f);
+    }
+    playerDerived[lib.styles[base].name] = (int)lib.styles.size();
+    lib.styles.push_back(std::move(ps));
+  }
+
   // ---- the player's flick compass (strokes.h PlayerStrikeMap) --------------
-  // Parsed AFTER the styles so sectors resolve to indices right here, and
-  // skipped as loudly as a bad style: a compass pointing at nothing is a
-  // player who clicks and does not swing, which must never be silent.
-  //
-  // TWO BLOCKS THROUGH ONE READER: `player` (a weapon in the fist) and
-  // `playerUnarmed` (fists). One function, because a second copy of "resolve a
-  // sector to an index and skip it loudly" is a second place for the skip to
-  // stop being loud.
+  // The compass references BASE style names; the resolver uses the derived
+  // player copy if one exists, otherwise the base directly.
   auto readMap = [&](const char* key, PlayerStrikeMap& map) {
     if (!j.contains(key) || !j[key].is_object()) return;
     const auto& p = j[key];
@@ -169,7 +388,8 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
         sec.y = d[1].get<float>();
       }
       const std::string name = s.value("style", "");
-      sec.style = lib.Find(name);
+      auto it = playerDerived.find(name);
+      sec.style = (it != playerDerived.end()) ? it->second : lib.Find(name);
       if (sec.style < 0 || (sec.x == 0.0f && sec.y == 0.0f)) {
         log += path + ": " + key + " sector -> \"" + name +
                "\" is unknown or directionless — skipped\n";
@@ -181,7 +401,8 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
     for (size_t i = 0; i < 2 && i < na.size(); i++) {
       if (!na[i].is_string()) continue;
       const std::string name = na[i].get<std::string>();
-      map.neutral[i] = lib.Find(name);
+      auto it = playerDerived.find(name);
+      map.neutral[i] = (it != playerDerived.end()) ? it->second : lib.Find(name);
       if (map.neutral[i] < 0)
         log += std::string(path) + ": " + key + " neutralAlternate \"" + name +
                "\" is unknown — skipped\n";
@@ -189,6 +410,7 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
   };
   readMap("player", lib.player);
   readMap("playerUnarmed", lib.playerUnarmed);
+  readMap("playerDagger", lib.playerDagger);
   out = std::move(lib);
   return true;
 }
@@ -261,8 +483,38 @@ void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
   const float tempo =
       1.0f + sty.jitter.tempo * rng::SignedUnit(rng::Hash3(seed, 1, 0));
   cur.windupTicks = std::max(2, (int)std::lround(sty.windup.ticks * tempo));
-  cur.cutTicks = std::max(2, (int)std::lround(sty.cut.ticks * tempo));
-  cur.recoverTicks = std::max(1, sty.recoverTicks);
+  // ---- THE PATH'S TICK TABLE (strokes.h StrokeCursor::legTicks) ------------
+  // PER LEG, ROUNDED ONCE. Scaling the total and splitting it would make the
+  // corner drift with the jitter; scaling each leg is what keeps "leg 1 is
+  // twice leg 2" true at every tempo, and rounding here rather than per tick
+  // is what keeps a leg boundary from moving under the drive.
+  //
+  // A leg floors at ONE tick — a leg the jitter rounded away would delete a
+  // corner from the path, and a stroke that loses its dogleg at tempo 0.9 and
+  // has it at 1.1 is the "different animations randomly" report all over
+  // again. The WHOLE cut still floors at two, exactly as it did when there was
+  // only ever one leg, so a one-leg path's tick count is unchanged.
+  cur.cutLegs = std::clamp((int)sty.cut.size(), 1, kMaxCutLegs);
+  int total = 0;
+  for (int k = 0; k < cur.cutLegs; k++) {
+    cur.legTicks[k] = std::max(1, (int)std::lround(sty.cut[k].ticks * tempo));
+    total += cur.legTicks[k];
+  }
+  if (total < 2) {
+    cur.legTicks[cur.cutLegs - 1] += 2 - total;
+    total = 2;
+  }
+  cur.cutTicks = total;
+  cur.cutLeg = 0;
+  // THE RECOVER IS NOT TEMPO-JITTERED, and that is deliberate rather than an
+  // omission. `tempo` exists so two duelists do not beat time together, and
+  // what carries that is the TELEGRAPH and the travel — the two segments an
+  // opponent reads. Scaling the return as well would make the settle and the
+  // fade drift out of the relationship the author set them in (settle + fade
+  // <= ticks, enforced at load), and buy nothing an onlooker can see.
+  cur.recoverTicks = std::max(1, sty.recover.ticks);
+  cur.settleTicks = std::clamp(sty.recover.posed ? sty.recover.settle : 0, 0,
+                               cur.recoverTicks);
   cur.phase = StrokeCursor::Phase::Windup;
   cur.phaseTick = 0;
 }
@@ -286,6 +538,22 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       sty ? sty->jitter.az * rng::SignedUnit(rng::Hash3(cur.seed, 2, 0)) : 0.0f;
   const float bowEl =
       sty ? sty->jitter.el * rng::SignedUnit(rng::Hash3(cur.seed, 3, 0)) : 0.0f;
+  // ---- THIS STYLE'S OWN HAND-BACK CLOCK (StrokeRecover::fade) --------------
+  //
+  // Pushed every tick rather than once at the release, and from HERE rather
+  // than from BeginStrokeProgram, because this is the only function that holds
+  // both the style and the MeleeState — the program fields live on a cursor
+  // that has never seen a driver. It is idempotent (a float assignment), it
+  // costs nothing, and pushing it unconditionally is what guarantees a style
+  // that authors no fade RESTORES the global one: a MeleeState is reused
+  // across strokes (the player's is reused for the whole session), so a
+  // previous style's override would otherwise outlive it.
+  //
+  // Zero means "the global melee.recoverTime", which is what every style
+  // authored before `fade` existed asks for.
+  m.SetRecoverTime(sty != nullptr && sty->recover.fade > 0
+                       ? sty->recover.fade * dt
+                       : 0.0f);
   StrokeSample smp;
   smp.held = true;
   // THE CLOSED-LOOP, UNDER-COMMIT DRIVE, shared by Guard and Windup because
@@ -318,12 +586,17 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
     }
     case StrokeCursor::Phase::Windup: {
       if (sty == nullptr) break;
-      // THE CUT IS CENTRED ON THE AIM, so the windup lands HALF A CUT SHORT of
-      // it: `aim - cut/2 + windup offset`. A stroke that started at the aim
-      // would cut the air behind the target every time — the blade only ever
-      // travels away from where it began.
-      cur.wantAz = liveAz - 0.5f * sty->cut.az + sty->windup.az + bowAz;
-      cur.wantEl = liveEl - 0.5f * sty->cut.el + sty->windup.el + bowEl;
+      // THE CUT IS CENTRED ON THE AIM, so the windup lands as far SHORT of it
+      // as the target sits ALONG THE PATH: `aim - CutAimOffset + windup`. For
+      // a one-leg cut that offset is `cut/2` and this is the line it always
+      // was; for a path it is the middle of the leg that carries the aim
+      // (strokes.h). A stroke that started at the aim would cut the air behind
+      // the target every time — the blade only ever travels away from where it
+      // began.
+      float aimOffAz = 0, aimOffEl = 0;
+      sty->CutAimOffset(aimOffAz, aimOffEl);
+      cur.wantAz = liveAz - aimOffAz + sty->windup.az + bowAz;
+      cur.wantEl = liveEl - aimOffEl + sty->windup.el + bowEl;
       // AGAINST A NEUTRAL EXTENSION, not against the live radius. Computing
       // this as `StrokeRadius() + offset` every windup tick is a RUNAWAY: each
       // tick re-targets a further offset from wherever the last one landed, so
@@ -350,21 +623,65 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
     }
     case StrokeCursor::Phase::Cut: {
       if (sty == nullptr) break;
-      // FROM WHERE THE BLADE ACTUALLY IS, THROUGH THE AIM, TO HALF A CUT PAST
-      // IT. Derived per tick from the live stroke state rather than baked at
+      // WHICH LEG OF THE PATH (strokes.h "A CUT IS A PATH"). `phaseTick`
+      // counts the WHOLE cut — every reader outside this file measures it
+      // against `cutTicks` — so the leg is found by walking the resolved tick
+      // table, six additions at worst. Deriving it instead of latching it is
+      // what makes the phase re-entrant: a caller that steps a cursor twice in
+      // one tick (a zero-tempo lunge does) lands on the same leg both times.
+      int leg = 0, legEnd = cur.legTicks[0];
+      while (leg + 1 < cur.cutLegs && cur.phaseTick >= legEnd) {
+        leg++;
+        legEnd += cur.legTicks[leg];
+      }
+      cur.cutLeg = leg;
+      // FROM WHERE THE BLADE ACTUALLY IS, THROUGH THE AIM, TO THE END OF THIS
+      // LEG. Derived per tick from the live stroke state rather than baked at
       // commit, so a windup that could not quite reach its pose (a clamped
       // shoulder, a short arm) still produces a cut through the target instead
-      // of one displaced by however much the arm fell short.
-      const float toAz = cur.aimAz + 0.5f * sty->cut.az;
-      const float toEl = cur.aimEl + 0.5f * sty->cut.el;
+      // of one displaced by however much the arm fell short — and so a leg
+      // that ran out of ticks short of its corner does not displace the legs
+      // after it either, because each one's target is an ABSOLUTE point on the
+      // path (`aim - offset + travel through this leg`) and not a delta from
+      // wherever the last one actually got to.
+      float aimOffAz = 0, aimOffEl = 0;
+      sty->CutAimOffset(aimOffAz, aimOffEl);
+      const StrokeSegment through = sty->CutThrough(leg);
+      const float toAz = cur.aimAz - aimOffAz + through.az;
+      const float toEl = cur.aimEl - aimOffEl + through.el;
       const float toR =
-          toTarget(StrokeReachIn(m, sty->windup.reach + sty->cut.reach));
-      const int left = std::max(1, cur.cutTicks - cur.phaseTick);
+          toTarget(StrokeReachIn(m, sty->windup.reach + through.reach));
+      // HOW MUCH OF THE REMAINING GAP THIS TICK SPENDS (strokes.h, above
+      // AttackStyle).
+      //
+      // The tick counts are per LEG, not per cut: that is what sets a leg's
+      // SPEED, so a short leg is a fast one, and it is the whole of how a path
+      // varies its tempo. WITHIN the leg, the split is the share the style's
+      // own ease curve advances over this tick.
+      //
+      // LINEAR KEEPS THE LITERAL OLD EXPRESSION rather than going through
+      // StrokeEaseStep, which returns exactly `1 / left` for it. The two agree
+      // algebraically and NOT to the last bit — one divides the gap once, the
+      // other multiplies it by a quotient of two divisions — and every style
+      // in the game is linear, so routing the default through the general form
+      // would move the world hash for nothing but float rounding.
       const MeleeTuning& t = m.tuning;
-      smp.dx = ((toAz - m.StrokeAz()) / (float)left) / t.aimGainX;
-      smp.dy = -((toEl - m.StrokeEl()) / (float)left) / t.aimGainY;
-      smp.dReach = ((toR - m.StrokeRadius()) / (float)left) /
-                   std::max(t.reachGain, 1e-4f);
+      const float rg = std::max(t.reachGain, 1e-4f);
+      if (sty->ease == Ease::Linear) {
+        const int left = std::max(1, legEnd - cur.phaseTick);
+        smp.dx = ((toAz - m.StrokeAz()) / (float)left) / t.aimGainX;
+        smp.dy = -((toEl - m.StrokeEl()) / (float)left) / t.aimGainY;
+        smp.dReach = ((toR - m.StrokeRadius()) / (float)left) / rg;
+      } else {
+        const int legLen = std::max(1, cur.legTicks[leg]);
+        const int intoLeg = std::max(0, cur.phaseTick - (legEnd - legLen));
+        const float share =
+            StrokeEaseStep(sty->ease, (float)intoLeg / (float)legLen,
+                           (float)(intoLeg + 1) / (float)legLen);
+        smp.dx = ((toAz - m.StrokeAz()) * share) / t.aimGainX;
+        smp.dy = -((toEl - m.StrokeEl()) * share) / t.aimGainY;
+        smp.dReach = ((toR - m.StrokeRadius()) * share) / rg;
+      }
       m.Step(smp, dt, true, right, up, fwd);
       if (++cur.phaseTick >= cur.cutTicks) {
         cur.phase = StrokeCursor::Phase::Recover;
@@ -373,11 +690,33 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       break;
     }
     case StrokeCursor::Phase::Recover: {
-      // Button RELEASED: the driver's own recover ramps PoseWeight down and
-      // hands the arm back to the walk cycle, which is the same hand-back the
-      // player gets and the reason nothing snaps here.
-      smp.held = false;
-      m.Step(smp, dt, true, right, up, fwd);
+      // ---- THE RETURN, IN TWO PARTS (strokes.h StrokeRecover) -------------
+      //
+      // SETTLE: the button is still DOWN and the arm is steered — closed-loop,
+      // under commitSpeed, the windup's own drive — from wherever the cut left
+      // it to the style's ABSOLUTE return stance. PoseWeight stays at 1 for
+      // every one of these ticks, so what the rig sees is an arm travelling a
+      // path an arm can travel, not a weight fading on a frozen pose.
+      //
+      // The pose is absolute for the reason the header states: a recover is a
+      // return to stance and not a second aim. `cur.wantAz`/`wantEl`/
+      // `wantReach` are written the same way the other two phases write them,
+      // so the tuner's readout and the gates report the return target in the
+      // same three fields they already read.
+      //
+      // Then RELEASE: exactly the old four lines. The driver clears
+      // `recoverHold_` and restarts its own clock at the release
+      // (melee.cpp:2430), so the fade is a full one measured from HERE rather
+      // than whatever was left of one that began back in the cut.
+      if (sty != nullptr && cur.phaseTick < cur.settleTicks) {
+        cur.wantAz = sty->recover.az;
+        cur.wantEl = sty->recover.el;
+        cur.wantReach = StrokeReachIn(m, sty->recover.reach);
+        steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
+      } else {
+        smp.held = false;
+        m.Step(smp, dt, true, right, up, fwd);
+      }
       if (++cur.phaseTick >= cur.recoverTicks) return StrokeStepResult::Finished;
       break;
     }

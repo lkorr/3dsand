@@ -18,6 +18,7 @@
 #include "gpu/rhi_vulkan.h"
 #include "sim/tuning.h"  // the Combat panel edits melee/combatfx/gore live
 #include "sim/world.h"   // kWindPrimCap for the primitive panel
+#include "sim/weather.h" // the weather row: preset pin + readout
 #include "ui/inventory_ui.h"
 #include "ui/theme.h"
 
@@ -269,16 +270,36 @@ void Overlay::DrawHUD(const UIState& s) {
   // — so a clean player's HUD is exactly the HUD that was here before.
   float yStack = yHealth - gap;
   if (s.bodyValid && s.stainFrac >= s.stainHudMin && s.stainColor != 0) {
+    // EVERY substance, each in its own colour with its own share: "stained
+    // 40% · oil 22% · water 18%". Naming only the heaviest is how an
+    // oiled player in the rain read as "water" and nothing else (2026-09-23).
+    // A substance too thin to round to 1% is not worth a word.
     char buf[80];
-    snprintf(buf, sizeof buf, "stained %.0f%% \xc2\xb7 %s",
-             s.stainFrac * 100.0f,
-             s.stainLabel[0] ? s.stainLabel : "something");
+    snprintf(buf, sizeof buf, "stained %.0f%%", s.stainFrac * 100.0f);
     const ImVec2 ts = ImGui::CalcTextSize(buf);
     const ImVec2 tp(x, std::floor(yStack - ts.y - 2.0f));
     // Lightened toward white: an authored stain colour is picked to read as
     // DRIED matter on a lit surface, and the same value set as 13 px of text
     // over the figure's dark scrim is barely a shape.
     ui::ShadowText(d, tp, ui::Mix(s.stainColor, IM_COL32_WHITE, 0.45f), buf);
+    float cx = tp.x + ts.x;
+    int named = 0;
+    for (int k = 0; k < s.coatCount; k++) {
+      const UIState::CoatName& c = s.coats[k];
+      if (c.color == 0 || c.frac < 0.005f) continue;
+      snprintf(buf, sizeof buf, " \xc2\xb7 %s %.0f%%",
+               c.label[0] ? c.label : "something", c.frac * 100.0f);
+      ui::ShadowText(d, ImVec2(cx, tp.y),
+                     ui::Mix(c.color, IM_COL32_WHITE, 0.45f), buf);
+      cx += ImGui::CalcTextSize(buf).x;
+      named++;
+    }
+    if (named == 0) {
+      snprintf(buf, sizeof buf, " \xc2\xb7 %s",
+               s.stainLabel[0] ? s.stainLabel : "something");
+      ui::ShadowText(d, ImVec2(cx, tp.y),
+                     ui::Mix(s.stainColor, IM_COL32_WHITE, 0.45f), buf);
+    }
     yStack = tp.y - 2.0f;
   }
 
@@ -314,6 +335,49 @@ void Overlay::DrawHUD(const UIState& s) {
     return ts.y + 8;
   };
   float py = std::floor(disp.y * 0.5f) + 28.0f;
+  // ---- the throw's wind-up: a row of pixel pips under the crosshair --------
+  //
+  // Ten 6x8 cells on the 2 px grid, lit left to right in gold as Q is held,
+  // turning ember at full. FULL is the one state the eye has to catch without
+  // counting pips, so at full the whole meter SHAKES -- a whole-pixel jitter
+  // on a fast wall-clock step, never a sub-pixel slide -- and the rim glows.
+  if (s.throwCharge >= 0.0f) {
+    constexpr int kPips = 10;
+    const float pw = 6.0f, ph = 8.0f, pg = 2.0f;
+    const float mw = kPips * pw + (kPips - 1) * pg;
+    const bool full = s.throwCharge >= 1.0f;
+    float jx = 0.0f, jy = 0.0f;
+    if (full) {
+      const int step = (int)(ImGui::GetTime() * 40.0);
+      const uint32_t h = (uint32_t)step * 2654435761u;
+      jx = (float)((int)(h >> 29) % 3 - 1) * 2.0f;
+      jy = (float)((int)(h >> 27) % 3 - 1) * 2.0f;
+    }
+    const float mx = std::floor((disp.x - mw) * 0.5f) + jx;
+    const float my = py + jy;
+    const ImU32 rim = full ? ui::ColEmber() : ui::ColBronze();
+    if (full)
+      d->AddRectFilled(ImVec2(mx - 6, my - 6), ImVec2(mx + mw + 6, my + ph + 6),
+                       ui::Fade(ui::ColEmber(), 0.25f));
+    d->AddRectFilled(ImVec2(mx - 4, my - 4), ImVec2(mx + mw + 4, my + ph + 4),
+                     IM_COL32(0, 0, 0, 170));
+    d->AddRect(ImVec2(mx - 4, my - 4), ImVec2(mx + mw + 4, my + ph + 4), rim,
+               0.0f, 0, 2.0f);
+    const int lit = (int)std::floor(s.throwCharge * kPips + 1e-4f);
+    for (int i = 0; i < kPips; i++) {
+      const float x0 = mx + i * (pw + pg);
+      const ImVec2 a(x0, my), b(x0 + pw, my + ph);
+      if (i < lit) {
+        const ImU32 c = full ? ui::ColEmber() : ui::ColGold();
+        d->AddRectFilled(a, b, c);
+        d->AddRectFilled(a, ImVec2(b.x, a.y + 2), full ? ui::ColGoldPale()
+                                                       : ui::ColGoldHi());
+      } else {
+        d->AddRectFilled(a, b, ui::ColDeep());
+      }
+    }
+    py += ph + 14.0f;
+  }
   if (!s.lookPrompt.empty())
     py += tab(s.lookPrompt.c_str(), py, ui::ColGoldDim(), ui::ColParch(), 0.95f);
   if (!s.kitMessage.empty() && s.kitMessageAge < 2.5f) {
@@ -321,6 +385,9 @@ void Overlay::DrawHUD(const UIState& s) {
     tab(s.kitMessage.c_str(), py, ui::ColEmber(), ui::ColEmber(), a);
   }
   ImGui::PopFont();
+  // The hotbar along the bottom centre (ui/inventory_ui.h): what is in your
+  // hand and what the number row reaches.
+  DrawHudHotbar(s, d);
 }
 
 // ---- the body-condition stick figure ----------------------------------------
@@ -550,7 +617,8 @@ void Overlay::Draw(UIState& s) {
   // It is drawn as one continuous bar with a hard break at that point, because
   // a pair of numbers does not communicate "this next glyph will cost you an
   // arm" the way a bar segment eating into red does.
-  ImGui::Text("magic %s   (M toggles)", s.magicMode ? "ON" : "off");
+  ImGui::Text("magic %s   (Z toggles; a number SELECTS a bound spell, RMB casts it)",
+              s.magicMode ? "ON" : "off");
   {
     const float w = ImGui::GetContentRegionAvail().x;
     const float h = 14.0f;
@@ -647,10 +715,15 @@ void Overlay::Draw(UIState& s) {
                        "unstable - %d from your body", s.spellCost - s.mana);
   }
   if (!s.spellText.empty()) {
-    ImGui::Text("speaking: %s", s.spellText.c_str());
+    // THE BRACKET TEXT STAYS. It is what the oracle compares and what the dev
+    // panel reads a tree off; the player-facing surface is the grimoire page's
+    // canvas. "held" rather than "speaking" because the stack is now the
+    // SELECTED spell, not a half-spoken one.
+    ImGui::Text("held: %s", s.spellText.c_str());
     ImGui::TextDisabled("%s", s.spellVerdict.c_str());
   } else {
-    ImGui::TextDisabled("speaking: (nothing)   RMB casts, C clears");
+    ImGui::TextDisabled("held: (nothing)   a number selects a bound spell, "
+                        "RMB casts it, Backspace clears");
   }
   if (!s.spellStatuses.empty()) {
     ImGui::Text("sustaining (%d reserved, Delete drops the newest):", s.manaReserved);
@@ -668,8 +741,11 @@ void Overlay::Draw(UIState& s) {
         if (s.glyphSlots[i].empty()) continue;
         any = true;
         const bool page = i < s.glyphSlotKinds.size() && s.glyphSlotKinds[i] == 2;
-        strip += std::to_string((i + 1) % 10) + ":" + (page ? "[" : "") + s.glyphSlots[i] +
-                 (page ? "]" : "") + "  ";
+        // The SELECTED key is starred: the stack is its spell, and right-click
+        // will fire that one until another key takes its place.
+        const bool sel = (int)i == s.glyphSelected;
+        strip += (sel ? "*" : "") + std::to_string((i + 1) % 10) + ":" +
+                 (page ? "[" : "") + s.glyphSlots[i] + (page ? "]" : "") + "  ";
       }
       if (!any) continue;
       if (s.glyphBankB == (bank == 1)) ImGui::Text("%s", strip.c_str());
@@ -909,6 +985,102 @@ void Overlay::Draw(UIState& s) {
   ImGui::RadioButton("current##fieldviz", &s.fieldViz, UIState::kFieldVizCurrent);
   fieldVizTip();
 
+  // ---- the sky's weather (src/sim/weather.h) -------------------------------
+  // Its own section of the F1 panel, open by default: the preset pin (a
+  // render-only override that eases the sky over weather.transitionSeconds
+  // without touching tuning.json — the running game writes that file, and a
+  // look switch must not clobber saved defaults), and live edits of the
+  // CPU-only weather knobs. Every one of them is render-only: the world hash
+  // never sees the weather, so nothing here needs a shader reload or moves a
+  // pinned number.
+  ImGui::Separator();
+  if (ImGui::CollapsingHeader("Weather", ImGuiTreeNodeFlags_DefaultOpen)) {
+    const std::vector<weather::Preset>& ps = weather::Presets().Presets();
+    const std::string cur = weather::Override();
+    const weather::State& w = weather::Last();
+    const char* shown = cur.empty() ? "(automatic / tuning)" : cur.c_str();
+    if (ImGui::BeginCombo("sky##wxcombo", shown)) {
+      if (ImGui::Selectable("(automatic / tuning)", cur.empty())) weather::SetOverride("");
+      for (const weather::Preset& p : ps) {
+        std::string lab = p.label + "##wx" + p.name;
+        if (ImGui::Selectable(lab.c_str(), cur == p.name)) weather::SetOverride(p.name);
+      }
+      ImGui::EndCombo();
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "Pin the sky to one assets/weather preset; it eases in over\n"
+          "weather.transitionSeconds. (automatic / tuning) hands it back to\n"
+          "the automatic cycle, or to weather.preset when that is off.\n"
+          "Render-only: the world hash never sees it. R reloads the files.");
+    // One-click row: the presets as small buttons, so switching the sky
+    // while looking at it is a single click rather than a dropdown.
+    {
+      int n = 0;
+      for (const weather::Preset& p : ps) {
+        if (n++ % 4 != 0) ImGui::SameLine();
+        const bool on = cur == p.name;
+        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
+        std::string lab = p.label + "##wxb" + p.name;
+        if (ImGui::SmallButton(lab.c_str())) weather::SetOverride(on ? "" : p.name);
+        if (on) ImGui::PopStyleColor();
+      }
+    }
+    if (w.fromName == w.toName)
+      ImGui::Text("now: %s", w.fromName.c_str());
+    else
+      ImGui::Text("now: %s -> %s (%.0f%%)", w.fromName.c_str(), w.toName.c_str(),
+                  w.blend * 100.0f);
+    ImGui::Text("cover %.2f  rain %.2f  wet %.2f  overcast %.2f%s", w.mix.coverage,
+                w.mix.precip, w.wetness, w.overcast, w.flash > 0.05f ? "  *flash*" : "");
+
+    Tuning t = CurrentTuning();
+    Tuning::Weather& wt = t.weather;
+    bool changed = false;
+    changed |= ImGui::Checkbox("clouds##wx", &wt.clouds);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Master switch. Off records no cloud pass at all.");
+    ImGui::SameLine();
+    changed |= ImGui::Checkbox("automatic cycle##wx", &wt.autoCycle);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "On: the sky walks the preset ladder by moisture on its own\n"
+          "(clear -> fair -> scattered -> overcast -> rain -> storm and back).\n"
+          "Off: it holds weather.preset. A pin above overrides both.");
+    changed |= EditableSliderFloat("cycle speed##wx", &wt.cycleSpeed, 0.0f, 50.0f, "%.1fx");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip(
+          "How fast the automatic weather runs. 0 freezes it; 20x shows a\n"
+          "whole afternoon of weather in a few minutes.");
+    changed |= EditableSliderFloat("coverage bias##wx", &wt.coverageBias, -1.0f, 1.0f, "%+.2f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Added to every preset's coverage: cloudier / clearer.");
+    changed |= EditableSliderFloat("raininess x##wx", &wt.precipScale, 0.0f, 4.0f, "%.2fx");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Multiplies every preset's raininess: wetter / drier.");
+    changed |= ImGui::Checkbox("rain touches world##wx", &wt.rainTouchesWorld);
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Rain douses exposed fire and damps ignition (moves the world hash).");
+    changed |= EditableSliderFloat("rain ignition damp##wx", &wt.rainIgniteDamp, 0.0f, 1.0f, "%.2f");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("Share of an exposed ignition chance that full rain / soaked ground removes.");
+    {
+      const uint32_t rw = weather::LastSimRainWord();
+      ImGui::Text("sim: rain %u  wet %u /255", rw & 0xFFu, (rw >> 16) & 0xFFu);
+    }
+    changed |= EditableSliderFloat("ease (s)##wx", &wt.transitionSeconds, 0.0f, 60.0f, "%.0f s");
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("How long a pinned change takes to blend in.");
+    if (ImGui::SmallButton("reroll weather##wx")) {
+      wt.seedOffset = (wt.seedOffset + 1) % 1000;
+      changed = true;
+    }
+    if (ImGui::IsItemHovered())
+      ImGui::SetTooltip("A different automatic weather sequence (weather.seedOffset).");
+    if (changed) SetCurrentTuning(t);
+  }
+  ImGui::Separator();
+
   // ---- wind force multipliers, one per tier -------------------------------
   // Live: these ride TickParams, so a drag lands on the next tick with no
   // shader reload. Split by TIER because that is how the engine is split
@@ -1024,6 +1196,10 @@ void Overlay::Draw(UIState& s) {
   }
 
   ImGui::Separator();
+  ImGui::Checkbox("dev controls (F2)", &s.devControls);
+  if (ImGui::IsItemHovered())
+    ImGui::SetTooltip("off = play mode: hands only, number row picks the hotbar,\n"
+                      "no brush / spawn / fly / tool keys");
   ImGui::Text("tool (Tab):");
   ImGui::SameLine();
   ImGui::RadioButton("brush", &s.tool, UIState::kToolBrush);
@@ -1045,6 +1221,62 @@ void Overlay::Draw(UIState& s) {
   if (ImGui::Button("Fluid")) s.fluidWindowOpen = !s.fluidWindowOpen;
   ImGui::SameLine();
   if (ImGui::Button("Wardrobe")) s.wardrobeWindowOpen = !s.wardrobeWindowOpen;
+
+  // ---- a filled vessel, into your own inventory ------------------
+  // In the MAIN F1 panel (it first shipped inside the NPC AI window, where
+  // nobody looked). Pickers mirrored by main.cpp (UIState::giveVesselNames); the
+  // material list is only what THIS vessel can hold, so a pouch never
+  // offers water and a flask never offers sand.
+  if (!s.giveVesselNames.empty() &&
+      ImGui::CollapsingHeader("Give me a filled vessel",
+                              ImGuiTreeNodeFlags_DefaultOpen)) {
+    if (s.giveVesselPick < 0 ||
+        s.giveVesselPick >= (int)s.giveVesselNames.size())
+      s.giveVesselPick = 0;
+    ImGui::SetNextItemWidth(160);
+    if (ImGui::BeginCombo("vessel##give",
+                          s.giveVesselNames[s.giveVesselPick].c_str())) {
+      for (int i = 0; i < (int)s.giveVesselNames.size(); i++) {
+        ImGui::PushID(i);
+        if (ImGui::Selectable(s.giveVesselNames[i].c_str(),
+                              i == s.giveVesselPick)) {
+          if (i != s.giveVesselPick) s.giveMatPick = 0;
+          s.giveVesselPick = i;
+        }
+        ImGui::PopID();
+      }
+      ImGui::EndCombo();
+    }
+    const std::vector<std::string>* matNames =
+        s.giveVesselPick < (int)s.giveVesselMats.size()
+            ? &s.giveVesselMats[s.giveVesselPick]
+            : nullptr;
+    if (matNames && !matNames->empty()) {
+      if (s.giveMatPick < 0 || s.giveMatPick >= (int)matNames->size())
+        s.giveMatPick = 0;
+      ImGui::SetNextItemWidth(160);
+      if (ImGui::BeginCombo("filled with##give",
+                            (*matNames)[s.giveMatPick].c_str(),
+                            ImGuiComboFlags_HeightLarge)) {
+        for (int i = 0; i < (int)matNames->size(); i++) {
+          ImGui::PushID(i);
+          if (ImGui::Selectable((*matNames)[i].c_str(),
+                                i == s.giveMatPick))
+            s.giveMatPick = i;
+          ImGui::PopID();
+        }
+        ImGui::EndCombo();
+      }
+      if (ImGui::Button("give (full)##give")) s.giveVessel = true;
+      if (!s.giveVesselStatus.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", s.giveVesselStatus.c_str());
+      }
+    } else {
+      ImGui::TextDisabled("this vessel holds no loaded material");
+    }
+    ImGui::Separator();
+  }
 
   if (s.tool == UIState::kToolMelee) {
     ImGui::TextDisabled("hold LMB to guard, then FLICK the mouse to cut");
