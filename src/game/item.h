@@ -528,15 +528,22 @@ struct ItemStack {
   // arrived at for the same reason.
   uint32_t dye = 0;
   // WHAT IS IN IT, for a vessel (ItemKind::Container, game/container.h).
-  // Material id + eighths of a cell. Part of the merge key for the dye's
-  // reason: a flask of blood must not fold into a stack of empty ones and
-  // hand every one of them the blood. 0/0 on everything that is not a vessel.
+  // Material id + eighths of a cell, and it is the fill of ONE vessel.
+  //
+  // A FILLED VESSEL NEVER STACKS, with anything, even an identical one. It
+  // used to be part of the merge key the way the dye is, so two flasks each
+  // holding 40 eighths of water merged into a count-2 stack with ONE fillAmt
+  // of 40: every path that charges or pays a fill (pour, the portrait brush,
+  // the scoop's settle) treats the stack as one flask, so pouring the pair
+  // destroyed a flask's worth and a scoop paid into a stack of three empties
+  // tripled it. A fill is per-object state, so the object stays alone; empty
+  // vessels still stack. 0/0 on everything that is not a vessel.
   uint16_t fillMat = 0;
   uint16_t fillAmt = 0;
   bool Empty() const { return def < 0 || count <= 0; }
   bool Filled() const { return fillMat != 0 && fillAmt != 0; }
   bool SameKind(int d, uint32_t dy, uint16_t fm, uint16_t fa) const {
-    return def == d && dye == dy && fillMat == fm && fillAmt == fa;
+    return def == d && dye == dy && fillAmt == 0 && fa == 0;
   }
 };
 

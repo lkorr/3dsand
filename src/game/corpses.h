@@ -190,11 +190,14 @@ inline LootResult TakeCorpseLoot(CorpseReport& corpse, int index, KitRef dest,
     // Probe only: Bag::Add would place it, and a refusal must leave the
     // corpse untouched. First free bag slot or a stack of the same item.
     bool room = kit.bag.FirstFree() >= 0;
+    // A stack it would MERGE into (ItemStack::SameKind: same def, same dye,
+    // and not a filled vessel) -- the rule Bag::Add and Inventory::Add apply.
+    const uint32_t pdye = corpse.gear[index].dye;
     for (const ItemStack& s : kit.bag.slots)
-      if (!s.Empty() && s.def == di) room = true;
+      if (!s.Empty() && s.SameKind(di, pdye, 0, 0)) room = true;
     if (!room)
       for (const ItemStack& s : hotbar.slots)
-        if (s.Empty() || s.def == di) room = true;
+        if (s.Empty() || s.SameKind(di, pdye, 0, 0)) room = true;
     if (!room) return LootResult::NoRoom;
   } else {
     if (dest.space == KitSpace::Loot) return LootResult::WrongKind;
@@ -206,8 +209,7 @@ inline LootResult TakeCorpseLoot(CorpseReport& corpse, int index, KitRef dest,
     // A slot holding the same def in a DIFFERENT colour is not a stack this
     // can grow (game/dye.h): it swaps, so it needs the bag free exactly as a
     // different item would.
-    if (!d->Empty() &&
-        (d->def != di || d->dye != corpse.gear[index].dye) &&
+    if (!d->Empty() && !d->SameKind(di, corpse.gear[index].dye, 0, 0) &&
         kit.bag.FirstFree() < 0)
       return LootResult::NoRoom;
   }
@@ -229,7 +231,7 @@ inline LootResult TakeCorpseLoot(CorpseReport& corpse, int index, KitRef dest,
     ItemStack* d = kit.Resolve(dest, hotbar);
     if (d->Empty()) {
       *d = ItemStack{di, take, piece.dye};
-    } else if (d->def == di && d->dye == piece.dye) {
+    } else if (d->SameKind(di, piece.dye, 0, 0)) {
       d->count += take;
     } else {
       // SWAP-NEVER-OVERWRITE, with the pack standing in for the corpse as the

@@ -94,6 +94,17 @@ const PFLAG_CALM : u32 = 16384u;
 // dripping as it walks would otherwise leave a permanent wet trail. Bit 15,
 // the next free one after CALM. world.h kPFlagDrip must agree.
 const PFLAG_DRIP : u32 = 32768u;
+// ---- MEASURED: a vessel's poured liquid carries its own fullness -----------
+// (game/container.h ContainerPour / ContainerSpillStep.) A whole-voxel liquid
+// particle normally lands FULL whatever its state nibble says (resolve, below:
+// a bleed spawn leaves the nibble at 0 and must not land at 1/8). A vessel is
+// CHARGED per particle -- min(8, what is left) eighths -- so landing its last
+// particle full minted up to 7/8 of a cell per pour, and a flask scooping one
+// eighth of lava, pouring it and re-scooping eight did so without limit. With
+// this bit the nibble IS the fullness code (0..7 = 1..8 eighths) and the cell
+// lands at exactly what was paid. Bit 16, the next free one after DRIP.
+// container.h kPFlagMeasured must agree (check_invariants).
+const PFLAG_MEASURED : u32 = 65536u;
 
 fn floatTicksOf(flags : u32) -> u32 {
   return (flags >> PMICRO_LIFE_SHIFT) & PMICRO_LIFE_MASK;
@@ -309,7 +320,7 @@ fn spawn(@builtin(global_invocation_id) gid : vec3<u32>) {
   // construction; here it is a CPU value arriving, so it is enforced rather
   // than assumed, and a whole-voxel spawn starts its patience at zero whatever
   // the producer put in the word.
-  var keep = p.flags & (PFLAG_MICRO | PFLAG_CALM | PFLAG_DRIP |
+  var keep = p.flags & (PFLAG_MICRO | PFLAG_CALM | PFLAG_DRIP | PFLAG_MEASURED |
                         (PMICRO_SCALE_MASK << PMICRO_SCALE_SHIFT));
   if ((p.flags & PFLAG_MICRO) != 0u) {
     keep |= p.flags & (PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT);
@@ -707,7 +718,12 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     // The result reads as separately shaded translucent cubes — the exact
     // "gelatin" failure shadeViscous is written to avoid. Fullness is what
     // makes flung blood shade like the blood a brush paints.
-    if (materials[mat].klass == CLASS_LIQUID) { state = LIQ_FULL_STATE; }
+    //
+    // ...unless it is MEASURED (a vessel's pour): then the nibble is the
+    // fullness it was charged for, and landing it full would mint the rest.
+    if (materials[mat].klass == CLASS_LIQUID) {
+      state = select(LIQ_FULL_STATE, state & 7u, (p.flags & PFLAG_MEASURED) != 0u);
+    }
     // STAMP_NEVER: a reinserted particle has not acted as a grid voxel yet, so
     // it is free to move on the tick it lands.
     voxStore(tgt, packVox(mat, state, STAMP_NEVER));
@@ -719,7 +735,7 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     // ticks survive — patience is a budget for finding a berth, and having a
     // berth taken from you is precisely the thing it is counting.
     p.flags = PFLAG_ALIVE | (p.flags & ((PMICRO_LIFE_MASK << PMICRO_LIFE_SHIFT) |
-                                         PFLAG_CALM));
+                                         PFLAG_CALM | PFLAG_MEASURED));
     p.vx = 0; p.vy = 0; p.vz = 0;
   }
   pWrite[gid.x] = p;

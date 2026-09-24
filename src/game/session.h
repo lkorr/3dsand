@@ -614,6 +614,10 @@ struct TickAuthorityCtx {
   // out of a flask that shattered, drained under the spawn budgets. Nearly
   // always empty; one entry for a tick when a flask breaks.
   std::vector<ContainerSpill> vesselSpills;
+  // THE SCOOP LEDGER, ONE PER WORLD (container.h ContainerScoopLedger): the
+  // GPU's scoop counter is world-wide, so every session's claims draw on one
+  // per-tick pot here instead of each reading the whole delta for itself.
+  ContainerScoopLedger scoopLedger;
   // Each vessel body's velocity last tick, for the break test's "velocity
   // jump" witness. One entry per vessel lying or flying in the world.
   std::vector<std::pair<uint64_t, Vec3>> vesselVel;
