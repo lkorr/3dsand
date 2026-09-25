@@ -4,6 +4,8 @@
   "patch": {
     "//undead": "Two consequences and no more (MobDef::undead): `bleed.woundHeals` defaults to false here, and the `rot` block below is honoured at spawn. Everything else that makes a zombie a zombie is an ordinary sidecar number, on purpose.",
     "undead": true,
+    "//bodyTissue": "ROTTEN TISSUE FALLS APART EITHER WAY. The body's row of the (cause, tissue) sever table (src/game/severpolicy.h, MobDef::bodyTissue): the one difference it makes is that a rotten VITAL limb beaten to zero hp by a blunt weapon comes off before the creature dies, where a living one dies with its head on -- the whole visual difference between beating a man and beating a zombie. Stated here rather than implied by `undead` (it used to be a hidden `undead` check in Mob::Damage), so `undead` keeps its two consequences and a rotten-but-alive thing is one key.",
+    "bodyTissue": "rotten",
     "//turn": "AND THE DEAD STAY DEAD THE SECOND TIME. An explicit null is the RFC 7396 delete, so this drops the `turn` block the body inherited from the human: a zombie that dies has nothing left to become, and without this every corpse in a fight between zombies would get back up forever -- an unbounded process, which is the thing rule 2 forbids. Deleting the key is also how any other creature opts out.",
     "turn": null,
     "//palette": "A FILTER over human.vox's art palette, not a colour table -- restating the colours would be a copy of the art by another route, which is the thing `extends` exists to avoid. Applied before the merged palette dedupes by RGB, so the human is untouched. Chroma down to a bit under half, a touch lighter, and a fifth of the way toward a sickly grey-green.",

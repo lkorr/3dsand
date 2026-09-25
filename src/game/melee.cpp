@@ -897,7 +897,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // items carry hp and severImpactSpeed (item.h), so a weapon wears down
       // under repeated parries and one that catches something far too fast is
       // knocked out of the hand — both by mechanisms that were already there.
-      // Deliberately NOT inside a BladeCutScope: a clang is not a
+      // Deliberately NOT DamageCause::Blade: a clang is not a
       // dismemberment and must not arm the wet cue.
       // EVERYTHING THE BLOW CAN DO, against the item that stopped it. A parry
       // is the one place the three parts of a strike are NOT distinguished:
@@ -1318,24 +1318,24 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // wound model to notice that it is nothing.
       if (s.strike.cut > 0.0f) {
         const float dmg = s.strike.cut * power;
-        // Everything severed inside this scope is a BLADE cut, and gets the wet
-        // dismember sound on top of the creature's own cry. Both calls below can
-        // sever several frames deep — Damage() at zero hp or over the impact
-        // threshold, CutLimb() when the lattice is cut through — so the cause is
-        // marked around them rather than passed down through a chain the laser
-        // and explosions also use.
+        // Everything severed by these two calls is a BLADE cut, and gets the
+        // wet dismember sound on top of the creature's own cry. Both can sever
+        // several frames deep — Damage() at zero hp or over the impact
+        // threshold, CutLimb() when the lattice is cut through — and the cause
+        // travels down with them as an argument (DamageCause::Blade, `power`
+        // as the audio's severity; phys/damagecause.h).
         //
-        // IT ENDS WITH THE KERF. The blunt and bite parts below are
-        // deliberately OUTSIDE it: a mace caving a skull in is not a
-        // dismemberment and must not arm the wet cue.
-        MobSystem::BladeCutScope blade(mobs, power);
+        // IT ENDS WITH THE KERF. The blunt and bite parts below carry their
+        // own causes: a mace caving a skull in is not a dismemberment and must
+        // not arm the wet cue.
+        const DamageCtx blade(DamageCause::Blade, power);
         // A KERF, NOT A BITE, and it is the only thing that decides
         // dismemberment: the slot follows the blade's own edge and the
         // direction the swing is going, and a limb comes off when the lattice
         // has been cut through (game/mob.h BladeCut). The slot itself is
         // `parts.cut`, which a corpse is cut by too.
-        if (mobs.Damage(hb, dmg, at, out.tipSpeed))
-          mobs.CutLimb(hb, parts.cut, world, spawns);
+        if (mobs.Damage(hb, dmg, at, out.tipSpeed, blade))
+          mobs.CutLimb(hb, parts.cut, world, spawns, power);
       }
 
       // ---- 2. THE BLUNT PART — trauma, a bruise, and never a sever --------

@@ -836,10 +836,10 @@ static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
           // beam like any other debris — which is the intent. What it must
           // never again do is take the beam off the head it was fired from.
           if (avatar.Damage(hitBody, CurrentTuning().tools.laserDamage,
-                            hitPos)) {
+                            hitPos, 0.0f, DamageCtx(DamageCause::Beam))) {
             // handled by the avatar
           } else if (mobs.Damage(hitBody, CurrentTuning().tools.laserDamage,
-                                 hitPos)) {
+                                 hitPos, 0.0f, DamageCtx(DamageCause::Beam))) {
             // A limb hit is now BOTH: the hp/sever logic above (joint
             // crossings, flinch, loco states) AND a real channel bored through
             // the flesh. Deferred like the melt below, for the same reason.
@@ -3115,7 +3115,8 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
         // populations — see game/mob.h.
         if (laserCut.limb)
           mobs.CarveLimbRadial(laserCut.body, laserCut.at, laserCut.radius,
-                               false /*ragged*/, false /*eject*/, world, spawns);
+                               false /*ragged*/, false /*eject*/, world, spawns,
+                               DamageCtx(DamageCause::Beam));
         else
           debris.MeltBodyAt(laserCut.body, laserCut.at, laserCut.radius, world,
                             spawns);

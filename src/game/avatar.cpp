@@ -2597,7 +2597,7 @@ void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
       if ((h & 1) == 0) continue;
       int i = severable[j];
       if (PartAlive(i)) {
-        Sever(i);
+        Sever(i, DamageCtx(DamageCause::Fall));
         if (limbs_[i].holdBody) limbs_[i].holdSeconds = 0.0f;
       }
     }

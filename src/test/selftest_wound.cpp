@@ -149,9 +149,9 @@ LimbAxis MeasureLimb(MobSystem& mobs, uint64_t id, int limb) {
 
 // One blade hit, expressed exactly as main.cpp's melee sweep expresses one.
 //
-// The BladeCutScope matters and is not decoration: it is what marks the sever
-// `byBlade`, which is the cause the dismember audio switches on, and a gate
-// that omitted it would be testing a cut nobody in the game ever makes.
+// CutLimb is always DamageCause::Blade (it used to need a BladeCutScope around
+// it to mark the sever `byBlade`, the cause the dismember audio switches on);
+// `power` rides along as the audio's severity, as melee passes it.
 bool CutOnce(MobSystem& mobs, World& world, uint64_t id, int limb,
              const LimbAxis& ax, float alongLimb, float power, float heft,
              uint32_t seed, std::vector<ParticleSpawn>& spawns) {
@@ -169,8 +169,7 @@ bool CutOnce(MobSystem& mobs, World& world, uint64_t id, int limb,
   cut.length = g.cutLength * (0.4f + 0.6f * power) * heft;
   cut.power = power;
   cut.seed = seed;
-  MobSystem::BladeCutScope blade(mobs, power);
-  return mobs.CutLimb(body, cut, world, spawns);
+  return mobs.CutLimb(body, cut, world, spawns, power);
 }
 
 // Pick the fixture: the biggest severable, non-vital limb in the library.
@@ -1070,13 +1069,12 @@ Status GateOneHit(Ctx& c, std::string& detail) {
   std::vector<ParticleSpawn> spawns;
   int landed = 0;
   {
-    MobSystem::BladeCutScope blade(mobs, 1.0f);
     for (int li : hits) {
       const uint64_t body = mobs.LimbBody(id, li);
       if (!body) continue;
       const LimbAxis ax = MeasureLimb(mobs, id, li);
       const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
-      if (!mobs.Damage(body, dmg, at, tipSpeed)) continue;
+      if (!mobs.Damage(body, dmg, at, tipSpeed, DamageCtx(DamageCause::Blade, 1.0f))) continue;
       landed++;
       if (!mobs.IsAlive(id)) break;
       CutOnce(mobs, c.world, id, li, ax, ax.reach * 0.5f, 1.0f, 1.0f,
@@ -1187,8 +1185,7 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
   // The killing blow. The root limb at zero hp is a death, not an amputation
   // (Mob::HpZeroSevers), and the corpse keeps every joint (Mob::Die).
   {
-    MobSystem::BladeCutScope blade(mobs, 1.0f);
-    mobs.Damage(torso, 1.0e6f, mid, 45.0f);
+    mobs.Damage(torso, 1.0e6f, mid, 45.0f, DamageCtx(DamageCause::Blade, 1.0f));
   }
   if (mobs.IsAlive(id)) {
     detail = Format("%s: root limb at zero hp did not kill", t.defName.c_str());
@@ -1349,8 +1346,7 @@ Status GateCorpseCut(Ctx& c, std::string& detail) {
   // Killed the way the sword kills: the root limb at zero hp is a death, and
   // the corpse keeps every limb and joint (Mob::Die).
   {
-    MobSystem::BladeCutScope blade(mobs, 1.0f);
-    mobs.Damage(torso, 1.0e6f, at, 45.0f);
+    mobs.Damage(torso, 1.0e6f, at, 45.0f, DamageCtx(DamageCause::Blade, 1.0f));
   }
   if (mobs.IsAlive(id)) {
     detail = Format("%s: root limb at zero hp did not kill", t.defName.c_str());
@@ -1482,8 +1478,7 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
   }
   const Vec3 at = ax.anchor + ax.along * (ax.reach * 0.5f);
   {
-    MobSystem::BladeCutScope blade(mobs, 1.0f);
-    mobs.Damage(torso, 1.0e6f, at, 45.0f);
+    mobs.Damage(torso, 1.0e6f, at, 45.0f, DamageCtx(DamageCause::Blade, 1.0f));
   }
   if (mobs.IsAlive(id)) {
     detail = Format("%s: root limb at zero hp did not kill", t.defName.c_str());
@@ -1650,8 +1645,7 @@ Status GateCorpseDismember(Ctx& c, std::string& detail) {
   }
   // Killed the way the sword kills. The rig stays the corpse's (Mob::Die).
   {
-    MobSystem::BladeCutScope blade(mobs, 1.0f);
-    mobs.Damage(torso, 1.0e6f, mobs.LimbAnchorPos(id, head), 45.0f);
+    mobs.Damage(torso, 1.0e6f, mobs.LimbAnchorPos(id, head), 45.0f, DamageCtx(DamageCause::Blade, 1.0f));
   }
   if (mobs.IsAlive(id)) {
     detail = Format("%s: root limb at zero hp did not kill", t.defName.c_str());
@@ -1737,10 +1731,9 @@ Status GateCorpseDismember(Ctx& c, std::string& detail) {
     cut.power = kPower;
     cut.seed = 0xBEEFu + (uint32_t)i * 40503u;
     {
-      // What melee opens around every blade blow: it is what marks a sever
+      // A CutLimb is DamageCause::Blade, which is what marks a sever
       // `byBlade`, the cause the dismember cue switches on.
-      MobSystem::BladeCutScope blade(mobs, kPower);
-      mobs.CutLimb(hNow, cut, c.world, spawns);
+      mobs.CutLimb(hNow, cut, c.world, spawns, kPower);
     }
     spawns.clear();
     cuts++;
@@ -1937,8 +1930,7 @@ Status GateHitDrive(Ctx& c, std::string& detail) {
       const int root = mobs.Defs()[t.defIndex].rootLimb;
       const uint64_t torso = root >= 0 ? mobs.LimbBody(id, root) : 0;
       {
-        MobSystem::BladeCutScope blade(mobs, 1.0f);
-        if (torso) mobs.Damage(torso, 1.0e6f, mid, 45.0f);
+        if (torso) mobs.Damage(torso, 1.0e6f, mid, 45.0f, DamageCtx(DamageCause::Blade, 1.0f));
       }
       // Die() keeps the rig (docs/PLAN_corpse_is_a_mob.md) and flips it
       // dynamic without changing a handle, so the one measured above is still
@@ -2302,8 +2294,7 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   // joint (Mob::Die).
   if (mobs.IsAlive(id)) {
     const LimbAxis ax = MeasureLimb(mobs, id, root);
-    MobSystem::BladeCutScope blade(mobs, 1.0f);
-    mobs.Damage(torso, 1.0e6f, ax.anchor + ax.along * (ax.reach * 0.5f), 45.0f);
+    mobs.Damage(torso, 1.0e6f, ax.anchor + ax.along * (ax.reach * 0.5f), 45.0f, DamageCtx(DamageCause::Blade, 1.0f));
   }
   const bool died = !mobs.IsAlive(id);
   const uint32_t jointsDead = c.phys.JointCount();
@@ -6650,9 +6641,8 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
     cut.seed = 0x51EEu;
     std::vector<ParticleSpawn> spawns;
     if (h) {
-      MobSystem::BladeCutScope blade(c.mobs, 1.0f);
-      c.mobs.Damage(h, 10.0f, at, 20.0f);
-      c.mobs.CutLimb(h, cut, c.world, spawns);
+      c.mobs.Damage(h, 10.0f, at, 20.0f, DamageCtx(DamageCause::Blade, 1.0f));
+      c.mobs.CutLimb(h, cut, c.world, spawns, 1.0f);
     }
     const Mob* after = dead();
     woke = after != nullptr && !after->DeadAsleep();
@@ -7105,9 +7095,8 @@ Status GatePlayerCorpse(Ctx& c, std::string& detail) {
     cut.seed = 0x9C0Bu;
     std::vector<ParticleSpawn> spawns;
     if (h) {
-      MobSystem::BladeCutScope blade(c.mobs, 1.0f);
-      c.mobs.Damage(h, 10.0f, at, 20.0f);
-      c.mobs.CutLimb(h, cut, c.world, spawns);
+      c.mobs.Damage(h, 10.0f, at, 20.0f, DamageCtx(DamageCause::Blade, 1.0f));
+      c.mobs.CutLimb(h, cut, c.world, spawns, 1.0f);
     }
     const Mob* m = c.mobs.FindMobById(cid);
     woke = m != nullptr && !m->DeadAsleep();

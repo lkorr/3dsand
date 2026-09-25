@@ -4941,6 +4941,51 @@ touch a creature with a sword, lose a limb, anywhere, every time.
 Gated by `wound-chip` / `wound-accumulate` / `wound-heft` / `wound-bleed`, with
 the hit-count BAND (not an exact count) in `tests/baseline.json`.
 
+### The damage cause is an argument (2026-09-24, W2-G; `phys/damagecause.h`, `game/severpolicy.h`, gate `damage-cause`)
+
+**What did this is a VALUE, passed down, never an ambient flag.** Every entry
+point that damages a creature states its cause and hands it explicitly through
+`Mob::Damage` → `CarveLimb` → `FlushBurn` → `Sever` (and
+`HpZeroSevers` / `JointRuleApplies` / `DropDisconnectedChildren`): `CutLimb`
+is `Blade`, `BluntHit` `Blunt` (`Unarmed` for a natural weapon), `BiteHit`
+`Bite`, `RotAtSpawn` `SpawnRot`, the burn / infection / joint-twin flushes
+`Burn`, the blast `Blast`, the laser `Beam`, a hard landing `Fall`, anything
+unstated `Other`. `DebrisSystem::DamageCause` is the same enum (an alias), so
+the living and the dead name a cause one way.
+
+It replaced six Mob flags (`inBurnFlush_`, `inSpawnRot_`, `inBladeCut_`,
+`inBluntCarve_`, `inUnarmedBlunt_`, `inBite_`) and MobSystem's audio
+`bladeCut_`, each set by a scope guard and read several calls deep in
+combinations. Every new cause had to re-patch every sever rule, because a flag
+nobody set read as "not me" to a rule it was not written for (b4daa6e, fd90f11,
+904dd30, 719df2d, 9d1701d). `bladeCut_` folded in exactly: it was set around
+precisely the `Damage` + `CutLimb` pair the Blade cause now marks.
+
+**`eaten` travels with the cause and is not one.** `DamageCtx::eaten` means
+the carve is `FlushBurn` expressing per-voxel removals in a batch — a burn tick,
+an infection step, the blunt pulp tick, or the pending tombstones a strike
+flushes before it reads the lattice. The pulp tick is `Blunt` + eaten; a sword
+that flushes a burning arm's tombstones is `Blade` + eaten. Eaten is what the
+old `inBurnFlush_` meant: consumed, not struck, so it cauterises and keeps
+fire's account of how a limb comes apart.
+
+**What each cause may do is ONE table** (`kCauseRows`, keyed `(cause, eaten)`,
+resolved against the limb's TISSUE by `SeverPolicyOf`). Columns: the
+extreme-impact sever, the bleed rate, whether a carve drips, brain charge, the
+collapse sever, children carried by a split, the cut-through rule, the joint
+rule, hp-0-severs-any-limb, the worn-shell exemption, gore, whether a severed
+garment drops, the death's name, a rotten vital limb detaching at hp 0, and
+the audio's blade cue. Tissue is a property of the slot: `Shell` (worn),
+`Bloodless` (hair), and for anatomy the body's `MobDef::bodyTissue` — `Flesh`,
+or `Rotten` where the zombie effect authors it. In code, not JSON, because
+every column is a structural rule a dozen gates describe in prose and nobody
+tunes; the content half (which bodies are rotten) is data.
+
+The `damage-cause` gate is the proof it changed nothing: it walks every
+`(cause, eaten, tissue)` and compares each column with the deleted flag
+expression, written out verbatim, and checks that the shipped `undead` defs
+are exactly the `rotten` ones.
+
 ### Damage kinds: cut, blunt, bite (2026-09-15; `game/impact.h`, `Mob::BluntHit` / `Mob::BiteHit`, `sim/tuning.h` §E6, `docs/PLAN_impact_unarmed.md`)
 
 Everything above is a KERF, and until this landed a kerf was all there was:
@@ -4974,7 +5019,8 @@ distinguished; then CLASSIFICATION, asked once (`StruckKind`: a slot below
 at `HeldSlot()` is a WEAPON, an unowned body is DEBRIS — three resolvers and two
 gates read it, and an enum is cheaper to keep agreeing than three copies of the
 same two `if`s); then the CUT if `cut > 0`, the whole wound model above
-unchanged, inside a `BladeCutScope` that now ENDS with the kerf, because a mace
+unchanged, carrying `DamageCause::Blade` on exactly the `Damage` + `CutLimb`
+pair (the cause ENDS with the kerf), because a mace
 caving a skull in is not a dismemberment and must not arm the wet dismember cue;
 then `Mob::BluntHit` if `blunt > 0`; then `Mob::BiteHit` if `bite > 0`, with the
 infection terms copied onto it ONLY when the classification said FLESH — armour
@@ -4993,8 +5039,10 @@ removes a voxel only if the weapon authored `bluntCarve` AND the spot it landed
 on has already been beaten open (see "A blunt blow climbs a ladder" below): a
 shallow radial DENT of `gore.bluntCarveRadius · bluntCarve · power · earned`,
 through the same `CarveLimbRadial` an explosion calls, soaked in the victim's
-own `woundMat` on the way out. The whole blow runs inside `Mob::BluntCarveScope`, and that scope
-is the entire implementation of the owner's one-line spec: the COLLAPSE sever is
+own `woundMat` on the way out. The whole blow carries `DamageCause::Blunt`
+(`Unarmed` for a natural weapon), and that cause's row of the sever table (see
+*The damage cause is an argument* below) is the entire implementation of the
+owner's one-line spec: the COLLAPSE sever is
 skipped, so a face may be caved in well past the point at which a blast would
 have shed the head, however many blows land. hp reaching zero on a vital limb
 still kills, because `HpZeroSevers` is about DEATH rather than about amputation.
@@ -5059,16 +5107,17 @@ exactly as the kerf is scaled but referenced at 120 rather than 8. That is
 "plate stops swords almost entirely; maces go through", as geometry.
 
 **A dent in a plate is still a dent** (2026-09-16). The shell branch returns
-before the flesh branch below it constructs `Mob::BluntCarveScope`, so for a
+before the flesh branch below it constructed its blunt scope, so for a
 while the armour carve ran UNSCOPED and the collapse sever was live against it:
 a worn slot is `severable` (a cut strap drops the pauldron), so once
 `CarveLimbRadial` had taken a cuirass below `kLimbCollapseFraction` — 25% of its
 spawn voxels — `CarveLimb` called `Sever()` and the piece fell off the body.
 Raising `gear.bluntDentRadius` 1.2 → 3.0 is what brought that inside a couple of
-blows, and from outside it reads as a mace dismembering people. The scope now
-opens at the top of the shell branch as well, so the rule
-`Mob::BluntCarveScope` states — A BLUNT HIT NEVER TAKES A LIMB OFF — holds for
-every slot rather than only for flesh. A mace beats plate IN and beats the
+blows, and from outside it reads as a mace dismembering people. The shell
+branch now passes the blunt cause to both its calls as well, so the rule the
+blunt rows state — A BLUNT HIT NEVER TAKES A LIMB OFF — holds for
+every slot rather than only for flesh. (Since W2-G the cause is an argument,
+so a call that forgets it gets `Other`, never a scope somebody left standing.) A mace beats plate IN and beats the
 wearer through it; shearing it off the straps is an edge's job.
 
 **A bite is a tear, and it severs only by collapse.** `Mob::BiteHit` on FLESH
@@ -5076,8 +5125,8 @@ charges hp, bleeds like a cut (refusing the drip would make a bite read as a
 bruise), and carves a correlated-noise BLOB of
 `gore.biteRadius · (0.4 + 0.6·power)` at feature size `gore.biteBlob` — the same
 predicate `Mob::RotAtSpawn` draws the undead's holes with, now one
-implementation shared through `Mob::CarveBlob`. `Mob::BiteScope` marks the carve
-as a tear so it cannot inherit a blade scope somebody left standing; the blade
+implementation shared through `Mob::CarveBlob`. The carve carries
+`DamageCause::Bite` (whose rows are `Other`'s); the blade
 rules stay off (a mouth has no direction to cut through in) and the collapse
 sever is deliberately left ON, because enough bites DO take a hand off and that
 is the single rule separating a bite from a punch. On a SHELL a bite is
@@ -5226,7 +5275,8 @@ body bleeds out at 4.5 hp/s from one stump. Topped up to a clump rather than to
 the wound cap so a stump that cannot drip this tick (out of ops) does not bank
 blood for later; cleared by `DetachLimb` so a stump that is itself cut off does
 not drip forever at its rest-pose anchor from a body it is no longer on. Fire
-still cauterises: a limb that burns through arms no stump (`inBurnFlush_`).
+still cauterises: a limb that burns through arms no stump (the carve is
+EATEN: `DamageCtx::eaten`, set by `FlushBurn`).
 
 **Burns cap the health a body can hold.** Burning already charged hp for the
 voxels it removed, but a body that is COOKED rather than consumed lost nothing
@@ -5975,6 +6025,9 @@ by another route, and a filter keeps tracking the original.
 
 **`undead` is a content word, not a subsystem.** It does exactly two things:
 it defaults `bleed.woundHeals` to false, and it makes `rot` apply at spawn.
+(A third was hidden in `Mob::Damage` until 2026-09-24 — a blunt blow took a
+vital limb off an undead body before it died. It is data now: the zombie
+effect authors `"bodyTissue": "rotten"`, one row of the sever table.)
 Nothing else in the engine branches on it, and that is deliberate — the slower
 walk, the paler skin and the shorter stride are ordinary sidecar numbers and
 stay ordinary sidecar numbers, so that "undead" never becomes the name of a
@@ -6074,8 +6127,9 @@ Four properties worth stating because each cost something to get right:
   a body no more chewed than before. What came off was the BLOOD, not the
   damage, so the damage is what compensates.
 
-  What stays refused is **bleeding**: `Mob::inSpawnRot_` joins the burn and the
-  garment on the line deciding whether a carve tops up a drip budget, and
+  What stays refused is **bleeding**: `DamageCause::SpawnRot` joins the burn
+  and the garment on the line deciding whether a carve tops up a drip budget
+  (`SeverPolicy::carveBleeds`), and
   `StainWound` has no drip in it. So the holes look wet and the creature is not
   haemorrhaging — which is exactly why the soak and the drip are separate
   functions. The hp charge stays outside both, for the reason the burn exclusion
@@ -6089,9 +6143,9 @@ Four properties worth stating because each cost something to get right:
   a tenth of its authored budget could still hollow out a shoulder socket and
   drop the arm — and `Sever` arms an arterial gout, charges `gore.severVoxels`
   through `DrainBlood`, and calls `Die()` outright if the limb was `vital`.
-  Zombies arrived dismembered, haemorrhaging and dead. `inSpawnRot_` is
-  therefore the third exclusion in `JointRuleApplies` too, beside blunt and
-  fire.
+  Zombies arrived dismembered, haemorrhaging and dead. `SpawnRot` is
+  therefore the third exclusion in `JointRuleApplies` too (`JointRule::Never`
+  on its rows), beside blunt and fire.
   `Mob::RebaseJointCounts` is the other half and is not optional: `neckAtSpawn`
   and `socketAtSpawn` are taken at the top of a limb's FIRST carve, which for a
   rotted body is the rot, so refusing the verdict alone would leave every joint
@@ -7880,7 +7934,7 @@ them.
 
 The two halves meet at exactly one number. `MeleeSweepDamage` forms
 `power = speedRamp * MeleeEdgeAlign(...)` once, and everything downstream reads
-that value: the damage, the `BladeCutScope`, and the kerf's `depth` and
+that value: the damage, the blade `DamageCtx`'s audio severity, and the kerf's `depth` and
 `length`. So a flat-on slap makes a shallower wound as well as a weaker one, for
 free, and the wound model never has to know that edge alignment exists.
 Multiplying `edgeAlign` in a second time when the kerf is built would square it.
@@ -14201,7 +14255,8 @@ of gear hitting the floor.
 expresses a tick of burning as a carve and fires every `max(12, n>>6)` voxels
 removed, so a limb alight carves itself dozens of times a second and each one
 topped the bleed budget back up — being on fire read as haemorrhaging. Both the
-drip and `Sever`'s arterial gout now refuse while `inBurnFlush_` is set. The hp
+drip and `Sever`'s arterial gout now refuse for an EATEN carve
+(`DamageCtx::eaten`; `carveBleeds`/`gore` false on those rows). The hp
 charge is deliberately outside the exclusion: fire still kills you, and a burnt
 shell still loses its own durability. Only the blood is refused.
 `mob-burn`'s `fire does not bleed` asserts zero droplets and zero open wounds
