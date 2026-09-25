@@ -289,6 +289,144 @@ Status GateAnatomyParity(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- damage-cause ------------------------------------------------------
+//
+// THE PROOF THAT THE (cause, tissue) TABLE IS THE OLD FLAG PREDICATES
+// (W2-G, game/severpolicy.h). Until 2026-09-24 Mob answered "what may this
+// damage do" by combining six ambient flags set by scope guards. This walks
+// every (cause, eaten, tissue) the new table can be asked about, re-derives
+// the flags that cause would have set, and compares each column with the
+// expression it replaced -- written out below VERBATIM from the deleted code,
+// so a table edit that changes behaviour fails here with the cell named.
+//
+//   A. THE WALK. 10 causes x {struck, eaten} x 4 tissues, 16 columns each.
+//      The flag mapping is the whole claim about what the old scopes meant:
+//        inBurnFlush_     = eaten (only FlushBurn set it)
+//        inSpawnRot_      = SpawnRot   (RotAtSpawn)
+//        inBladeCut_      = Blade      (CutLimb; MobSystem::bladeCut_ was set
+//                                       around exactly the Blade-cause calls)
+//        inBluntCarve_    = Blunt or Unarmed (BluntHit, BluntPulpTick)
+//        inUnarmedBlunt_  = Unarmed
+//        inBite_          = (never read) -- Bite, Beam, Blast, Fall and Burn
+//                           set nothing, so they must equal Other.
+//      IsWornSlot = Shell; IsBloodless = Shell or Bloodless; undead = Rotten.
+//   B. THE UNDEAD RULE MOVED TO DATA WITHOUT MOVING. The hidden `undead` check
+//      in Mob::Damage is now MobDef::bodyTissue == Rotten, authored by the
+//      zombie effect. On the shipped content the two sets of defs must be
+//      identical, and the one place A's "undead = Rotten tissue" mapping
+//      could differ from the old def-level check -- a VITAL slot that is
+//      bloodless (a worn slot is never vital: WearItem/EquipItem force it) --
+//      must not exist.
+//
+// No world, no GPU, no ticks: a table walk and a def scan.
+Status GateDamageCause(Ctx& c, std::string& detail) {
+  int cells = 0, bad = 0;
+  std::string firstBad;
+  auto check = [&](bool same, const char* col, DamageCause cz, bool eaten,
+                   Tissue t) {
+    cells++;
+    if (same) return;
+    bad++;
+    if (firstBad.empty())
+      firstBad = std::string(col) + " at (cause " +
+                 std::to_string((int)cz) + (eaten ? ", eaten, " : ", struck, ") +
+                 TissueName(t) + ")";
+  };
+  for (int ci = 0; ci < (int)DamageCause::Count; ci++)
+    for (int e = 0; e < 2; e++)
+      for (int ti = 0; ti < (int)Tissue::Count; ti++) {
+        const DamageCause cz = (DamageCause)ci;
+        const bool eaten = e != 0;
+        const Tissue t = (Tissue)ti;
+        DamageCtx ctx(cz);
+        if (eaten) ctx = ctx.Eaten();
+        const SeverPolicy p = SeverPolicyOf(ctx, t);
+        // The old flags this cause stood for.
+        const bool inBurnFlush = eaten;
+        const bool inSpawnRot = cz == DamageCause::SpawnRot;
+        const bool inBladeCut = cz == DamageCause::Blade;
+        const bool inBluntCarve =
+            cz == DamageCause::Blunt || cz == DamageCause::Unarmed;
+        const bool inUnarmedBlunt = cz == DamageCause::Unarmed;
+        const bool worn = t == Tissue::Shell;
+        const bool bloodless = worn || t == Tissue::Bloodless;
+        const bool undead = t == Tissue::Rotten;
+        // The old rate: `inBluntCarve_ ? (inUnarmedBlunt_ && unarmed >= 0 ?
+        // unarmed : blunt) : 1`, as the kind of scale it picks (the >= 0
+        // fallback is BleedRateScale's, and is not a property of the cause).
+        const BleedRate oldRate =
+            inBluntCarve ? (inUnarmedBlunt ? BleedRate::Unarmed : BleedRate::Blunt)
+                         : BleedRate::Full;
+        // Mob::Damage
+        check(p.impactSevers == (!inBluntCarve && !worn), "impactSevers", cz,
+              eaten, t);
+        check(p.hitBleed == (bloodless ? BleedRate::None : oldRate), "hitBleed",
+              cz, eaten, t);
+        check(p.vitalHpZeroDetaches == !(!inBluntCarve || !undead),
+              "vitalHpZeroDetaches", cz, eaten, t);
+        // Mob::HpZeroSevers
+        check(p.hpZeroSeversAny == (inBurnFlush && !inBluntCarve),
+              "hpZeroSeversAny", cz, eaten, t);
+        // Mob::JointRuleApplies
+        const JointRule oldJoint =
+            inBluntCarve  ? JointRule::Never
+            : inSpawnRot  ? JointRule::Never
+            : !inBurnFlush ? JointRule::Always
+                           : JointRule::IfInfected;
+        check(p.joint == oldJoint, "joint", cz, eaten, t);
+        // Mob::CarveLimb
+        check(p.chargesBrain == !inSpawnRot, "chargesBrain", cz, eaten, t);
+        const bool oldBleeds = !inBurnFlush && !inSpawnRot && !bloodless;
+        check(p.carveBleeds == oldBleeds, "carveBleeds", cz, eaten, t);
+        check(!oldBleeds || p.carveBleed == oldRate, "carveBleed", cz, eaten, t);
+        check(p.shellStaysOn == (worn && !inBurnFlush), "shellStaysOn", cz,
+              eaten, t);
+        check(p.collapseSevers == !inBluntCarve, "collapseSevers", cz, eaten, t);
+        check(p.carriesChildren == (!inBluntCarve && !inSpawnRot),
+              "carriesChildren", cz, eaten, t);
+        check(p.cutThrough == inBladeCut, "cutThrough", cz, eaten, t);
+        // Mob::Sever
+        check(p.deathBurnt == inBurnFlush, "deathBurnt", cz, eaten, t);
+        check(p.gore == (!bloodless && !inBurnFlush), "gore", cz, eaten, t);
+        check(p.adopt == !(worn && inBurnFlush), "adopt", cz, eaten, t);
+        check(p.byBlade == inBladeCut, "byBlade", cz, eaten, t);
+      }
+
+  // ---- B: undead == rotten on the shipped defs ------------------------------
+  int defs = 0, undeadN = 0, rottenN = 0, disagree = 0, vitalBloodless = 0;
+  std::string defBad;
+  for (const MobDef& d : c.mobs.Defs()) {
+    defs++;
+    const bool rotten = d.bodyTissue == Tissue::Rotten;
+    undeadN += d.undead ? 1 : 0;
+    rottenN += rotten ? 1 : 0;
+    if (d.undead != rotten) {
+      disagree++;
+      if (defBad.empty())
+        defBad = d.name + (d.undead ? " is undead but not rotten"
+                                    : " is rotten but not undead");
+    }
+    for (const MobLimbDef& ld : d.limbs)
+      if (ld.vital && ld.bloodless) {
+        vitalBloodless++;
+        if (defBad.empty()) defBad = d.name + "/" + ld.name + " is vital AND bloodless";
+      }
+  }
+
+  const bool ok = bad == 0 && cells > 0 && defs > 0 && undeadN > 0 &&
+                  disagree == 0 && vitalBloodless == 0;
+  detail = "A: " + std::to_string(cells) + " (cause, eaten, tissue, column) " +
+           "cells vs the old flag predicates, " + std::to_string(bad) +
+           " differ (want 0)" + (firstBad.empty() ? "" : " -- first: " + firstBad) +
+           "; B: " + std::to_string(defs) + " defs, " + std::to_string(undeadN) +
+           " undead / " + std::to_string(rottenN) + " rotten, " +
+           std::to_string(disagree) + " disagree, " +
+           std::to_string(vitalBloodless) + " vital+bloodless slot(s) (want 0, 0)" +
+           (defBad.empty() ? "" : " -- " + defBad);
+  std::printf("damage-cause: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- mob ---------------------------------------------------------------
 Status GateMob(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
@@ -12596,6 +12734,10 @@ const std::vector<Gate>& MobGates() {
        /*needsRender=*/false},
       // With it, and for the same reasons: files and arithmetic, no world.
       {"anatomy-parity", "mob", {}, false, GateAnatomyParity,
+       /*needsRender=*/false},
+      // The (cause, tissue) sever table vs the ambient-flag predicates it
+      // replaced (W2-G). A table walk and a def scan: no world, no GPU.
+      {"damage-cause", "mob", {}, false, GateDamageCause,
        /*needsRender=*/false},
       {"mob", "mob", {}, false, GateMob, /*needsRender=*/true},
       // Per-voxel body reactivity. No render: every claim is a count.

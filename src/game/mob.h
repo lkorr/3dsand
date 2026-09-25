@@ -14,6 +14,7 @@
 #include "game/impact.h"    // StrikeProfile / StrikeEffectorMode: what a blow IS
 #include "game/melee.h"     // WeaponPose: the stroke driver's command to the rig
 #include "game/selfclip.h"  // ClipReport: is this pose inside itself
+#include "game/severpolicy.h"  // DamageCtx + the (cause, tissue) sever table
 #include "game/strokes.h"   // NpcStroke: one authored swing, live
 #include "math3d.h"
 #include "phys/debris.h"
@@ -459,6 +460,21 @@ struct MobDef {
   // ordinary sidecar numbers so that "undead" does not quietly become the name
   // of a second creature pipeline. A ghoul that sprints is then one file.
   bool undead = false;
+  // ---- WHAT THIS BODY IS MADE OF (sidecar `bodyTissue`) ---------------------
+  //
+  // "flesh" (default) or "rotten": the BODY's row of the (cause, tissue) sever
+  // table (game/severpolicy.h). A garment slot is Shell and hair is Bloodless
+  // whatever this says; this is the anatomy.
+  //
+  // It carries the one consequence `undead` used to carry by a hidden flag
+  // check in Mob::Damage (W2-G, 2026-09-24): a rotten VITAL limb beaten to
+  // hp 0 comes off before the creature dies, where a living one dies with its
+  // head on -- "rotten undead tissue falls apart either way, which is the
+  // whole visual difference between beating a man and beating a zombie". It
+  // is authored by the zombie effect (assets/mobs/effects/zombie.json), NOT
+  // implied by `undead`, so the two-consequence contract above stays true.
+  // (Not `tissue`: that name is the per-material wound-soak census below.)
+  Tissue bodyTissue = Tissue::Flesh;
   // ---- WHAT THIS BODY GETS UP AS (sidecar `turn`) --------------------------
   //
   // The content half of "killed by a zombie, rises as one". A creature that
@@ -1563,7 +1579,7 @@ using BladeCut = KerfCut;
 //   * the bleed budget is topped up at gore.bluntBleedScale of a cut's rate.
 //     A punch does not open you.
 //   * only if `carve` > 0 does any voxel LEAVE, and then as a shallow radial
-//     DENT inside a BluntCarveScope, which is what refuses the collapse sever
+//     DENT carrying DamageCause::Blunt, whose row refuses the collapse sever
 //     and the blade rules. A blunt hit NEVER takes a limb off, however many
 //     land -- that was the owner's spec in one line.
 //   * against a WORN shell it breaks shell voxels in proportion to
@@ -1933,16 +1949,22 @@ class Mob {
   // missing arm is a consequence of geometry. `severImpactSpeed` survives as
   // an extreme-speed exception, scaled by gore.woundImpactSeverScale so an
   // ordinary swing cannot reach it.
+  //
+  // `ctx` is WHAT DID IT (phys/damagecause.h). It decides the impact sever,
+  // the bleed rate and what a vital limb at zero does, through the one
+  // (cause, tissue) table in game/severpolicy.h, and it is handed on to any
+  // Sever() this reaches. The default is DamageCause::Other.
   bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
-              float impactSpeed = 0.0f);
+              float impactSpeed = 0.0f, const DamageCtx& ctx = {});
   // ---- THE BLADE PATH ------------------------------------------------------
   // Cut a live limb along the swept edge: a narrow slot, not a spherical bite.
   // Removes voxels, ejects them as gore, soaks the exposed flesh in the
   // creature's wound material, and — when the lattice has genuinely parted —
   // routes the dismemberment through the ordinary Sever(). Returns true when
-  // the handle was one of this creature's live limbs.
+  // the handle was one of this creature's live limbs. Always DamageCause::Blade;
+  // `severity` is the audio's blade intensity (SeverEvent::severity).
   bool CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
-               std::vector<ParticleSpawn>& spawns);
+               std::vector<ParticleSpawn>& spawns, float severity = 1.0f);
   // ---- THE BLUNT PATH (game/impact.h, BluntHit above) ----------------------
   // Charge trauma to a live limb without opening it: hp, a bruise, at most a
   // shallow dent, and never a sever. On a WORN slot it breaks shell voxels and
@@ -1958,58 +1980,24 @@ class Mob {
   bool BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
                std::vector<ParticleSpawn>& spawns);
 
-  // ---- "THIS CARVE IS A DENT" ----------------------------------------------
+  // ---- WHAT DID IT: THE CAUSE IS AN ARGUMENT (W2-G, 2026-09-24) -------------
   //
-  // RAII around a CarveLimb reached from BluntHit. Two rules read it, and both
-  // are the same statement: A BLUNT HIT NEVER TAKES A LIMB OFF.
-  //
-  //   * the COLLAPSE sever (CarveLimb's "carved down past being a limb at
-  //     all") is skipped, so a face can be caved in past the point where a
-  //     blast would have shed it;
-  //   * the blade rules are unreachable anyway (`inBladeCut_` is false), and
-  //     that is deliberately NOT restated here -- one flag, one meaning.
-  //
-  // What it does NOT suppress is the crater STAIN: the dent is still soaked in
-  // the victim's own woundMat, because "deletes voxels and replaces them with
-  // gore" is exactly what the owner asked a gauntlet to do. The BRUISE is a
-  // separate, wider stain in gore.bruiseMat laid on before the dent.
-  //
-  // hp reaching zero on a vital limb still kills (a caved-in skull), because
-  // that path is HpZeroSevers and is about DEATH rather than about amputation.
-  struct BluntCarveScope {
-    bool& f;
-    bool prev;
-    bool& u;
-    bool uprev;
-    BluntCarveScope(Mob& m, bool unarmed = false)
-        : f(m.inBluntCarve_), prev(m.inBluntCarve_),
-          u(m.inUnarmedBlunt_), uprev(m.inUnarmedBlunt_) {
-      f = true;
-      u = unarmed;
-    }
-    ~BluntCarveScope() { f = prev; u = uprev; }
-  };
+  // BluntHit passes DamageCause::Blunt (Unarmed for a natural weapon), BiteHit
+  // Bite, CutLimb Blade, RotAtSpawn SpawnRot, the burn/infection/joint-twin
+  // flushes Burn, the blast Blast and the laser Beam -- explicitly, down
+  // through Damage / CarveLimb / FlushBurn / Sever. What each may do is the
+  // (cause, tissue) table in game/severpolicy.h; read its row comments for the
+  // rules the old BluntCarveScope / BiteScope notes stated (A BLUNT HIT NEVER
+  // TAKES A LIMB OFF; a bite keeps the collapse sever and loses the blade
+  // rules; a creature born bitten neither bleeds nor comes apart at spawn).
+  // A cause that is not passed is DamageCause::Other -- it cannot be
+  // inherited from a scope somebody else left standing, which is the bug
+  // class the flags had.
 
-  // ---- "THIS CARVE IS A TEAR" ----------------------------------------------
-  //
-  // RAII around a CarveLimb reached from BiteHit. The blade rules (cut-through
-  // and the neck) stay off, because a mouth is not an edge and neither rule has
-  // a direction to read -- but the COLLAPSE sever is deliberately LEFT ON:
-  // enough bites DO take a hand off, and that is the one line separating a bite
-  // from a punch.
-  //
-  // It exists as a flag at all rather than as nothing because the bite must not
-  // silently inherit a scope somebody else left standing, and because the
-  // infection rewrite below needs to know the carve it is soaking was a tear.
-  struct BiteScope {
-    bool& f;
-    bool prev;
-    explicit BiteScope(Mob& m) : f(m.inBite_), prev(m.inBite_) { f = true; }
-    ~BiteScope() { f = prev; }
-  };
-
-  // Detach a limb now. Root/vital kills instead.
-  void Sever(int limbIndex);
+  // Detach a limb now. Root/vital kills instead. `ctx` decides whether the
+  // stump spurts, whether a severed garment drops, what the death is called
+  // and whether the audio hears a blade.
+  void Sever(int limbIndex, const DamageCtx& ctx = {});
   // ---- DEATH IS A STATE, NOT A CHANGE OF OWNER (PLAN_corpse_is_a_mob.md) ----
   //
   // `alive_` goes false and the rig STAYS: every body, joint, worn shell, twin
@@ -2094,8 +2082,10 @@ class Mob {
   // Per-voxel carving: remove real voxels from a live limb (docs/DESIGN.md §7).
   bool CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                        float radiusVoxels, bool ragged, bool eject, World& world,
-                       std::vector<ParticleSpawn>& spawns);
-  // Every live limb of THIS creature within the blast — the explosion path.
+                       std::vector<ParticleSpawn>& spawns,
+                       const DamageCtx& ctx = {});
+  // Every live limb of THIS creature within the blast — the explosion path
+  // (DamageCause::Blast).
   void CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
                       std::vector<ParticleSpawn>& spawns);
 
@@ -3174,7 +3164,10 @@ class Mob {
     // carves dozens of times a second and wants none of this) pays nothing.
     std::vector<IVec3> cells;
   };
-  bool CarveLimb(int limbIndex, World& world,
+  // `ctx` is required: every structural rule in here reads it (the table in
+  // game/severpolicy.h), and a carve that did not say what made it is the
+  // ambient-flag bug this signature exists to make impossible.
+  bool CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
                  std::vector<ParticleSpawn>& spawns, bool eject,
                  const LimbCarveFactory& carveAt,
                  const CarveSpall* spall = nullptr,
@@ -3203,8 +3196,8 @@ class Mob {
   // other radius here. `report` receives the removed cells so a caller can
   // soak exactly the hole it made. Returns false when the limb did not survive
   // (CarveLimb's contract: nothing may touch `limbs_` after that).
-  bool CarveBlob(int limbIndex, Vec3 centreLocal, float radiusWorld, float blob,
-                 uint32_t seed, World& world,
+  bool CarveBlob(int limbIndex, const DamageCtx& ctx, Vec3 centreLocal,
+                 float radiusWorld, float blob, uint32_t seed, World& world,
                  std::vector<ParticleSpawn>& spawns, CarveReport* report);
   // The blob predicate itself, over a LIST of bites. A member (rather than the
   // free function it reads as) only because LimbCarveFactory is protected here;
@@ -3283,13 +3276,14 @@ class Mob {
   // Blunt never amputates; fire keeps its own account; spawn rot is the damage
   // the creature ARRIVED with and may not dismember it; everything else —
   // blade, blast, and live rot even though rot rides the burn flush — may.
-  bool JointRuleApplies(int limbIndex) const;
+  // (SeverPolicy::joint for `ctx`.)
+  bool JointRuleApplies(int limbIndex, const DamageCtx& ctx) const;
   // Is `limbIndex` still held on by flesh — on BOTH sides of its joint? False
   // when either side has fallen below gore.woundNeckFraction of what it had.
   bool JointAttached(int limbIndex) const;
   // Sever any child of `parentIndex` whose socket in it has been eaten away.
   // Returns whether the creature is still alive (severing a vital child kills).
-  bool DropDisconnectedChildren(int parentIndex);
+  bool DropDisconnectedChildren(int parentIndex, const DamageCtx& ctx);
   // Soak the flesh around a cut. Rewrites the MATERIAL of a hash-selected
   // fraction of the voxels within `radiusWorld` of `centreLocal` (limb-local
   // world voxels) to the creature's wound material, and pokes the micro brick
@@ -3417,7 +3411,7 @@ class Mob {
   void ApplySplatter(const SplatterEvent& e);
   // Does hp reaching zero take this limb OFF, or merely kill the creature?
   // See the note at the call sites: geometry dismembers, damage kills.
-  bool HpZeroSevers(int limbIndex) const;
+  bool HpZeroSevers(int limbIndex, const DamageCtx& ctx) const;
   // The debris handle of the fragment, or 0 when it went to particles instead
   // (no brick, Jolt refused). CarveLimb joints a child limb to it when the
   // child's socket left with the fragment. `srcLimb` is `src`'s slot, asked
@@ -3509,7 +3503,11 @@ class Mob {
   // limb's front is walked first when the scan budget cannot cover them all --
   // the same fairness BurnTick and BurnLimbs apply, for the same reason.
   void BuildCrossLimbHeat(uint32_t tick);
-  bool FlushBurn(int limbIndex, World& world,
+  // `ctx` is the cause whose per-voxel removals are being flushed: Burn for
+  // the burn / infection / joint-twin passes, Blunt for the pulp tick, and a
+  // strike's own cause when CarveLimb flushes pending tombstones before it
+  // reads the lattice. The carve runs with ctx.Eaten() -- see DamageCtx.
+  bool FlushBurn(int limbIndex, const DamageCtx& ctx, World& world,
                  std::vector<ParticleSpawn>& spawns, bool force);
   void StripBurnTombstones(MobLimb& limb);
 
@@ -4059,52 +4057,13 @@ class Mob {
   // Particles authored outside the tick (Sever is reached from damage handling
   // all over the frame); drained by the driver's PreTick.
   std::vector<ParticleSpawn> pendingSpawns_;
-  // Re-entrancy guard: FlushBurn expresses itself as a CarveLimb, and
-  // CarveLimb flushes before it reads the lattice.
-  bool inBurnFlush_ = false;
-  // ---- "THESE HOLES ARE OLD" -------------------------------------------------
-  // Set for the duration of RotAtSpawn's carves, and read by the same line that
-  // already refuses to bleed a burning limb or a garment: a creature born
-  // bitten is not bleeding from those bites. Without it a zombie would arrive
-  // haemorrhaging from every hole it has ever had and paint the ground red the
-  // moment it walked into view, which is the opposite of what "already
-  // wounded" should look like. The HP CHARGE is deliberately outside it, for
-  // the reason the burn exclusion gives: the damage is real, only the blood is
-  // refused.
-  bool inSpawnRot_ = false;
-  // ---- "THIS CARVE IS AN EDGE, NOT A BLAST OR A FIRE" ------------------------
-  //
-  // Set for the duration of Mob::CutLimb's carve, and read by exactly two
-  // rules in CarveLimb: the cut-through sever and the neck sever. Both are
-  // deliberately NOT applied to the other carve causes, and the reason is
-  // asymmetric risk rather than principle.
-  //
-  //   * BURNING already has a documented, tested account of what happens when
-  //     a limb comes apart (the anchor component keeps the identity, the rest
-  //     leaves as fragments, and `mob-burn` asserts a limb never leaves while
-  //     it is still mostly there). Routing a burn-through into Sever() would
-  //     re-open exactly the "a burning body dismembers instead of charring"
-  //     bug that block was written to close.
-  //   * A BLAST is a sphere and has no direction; "cut through" is not a thing
-  //     it does. Its existing behaviour — crater, fragments, collapse when too
-  //     little is left — is the right account of it.
-  //
-  // A blade is the one cause where the geometry says something the fraction
-  // cannot, so it is the one cause that gets to ask.
-  //
-  // Note this is a MOB-level flag, not MobSystem::bladeCut_ (which exists for
-  // the AUDIO cause and is set by the caller around a whole sweep). They mean
-  // different things and the avatar has no MobSystem at all, which is what
-  // Phase C's "an NPC cuts the player" path needs.
-  bool inBladeCut_ = false;
-  // ---- "THIS CARVE IS A DENT" / "THIS CARVE IS A TEAR" ---------------------
-  // Set by Mob::BluntCarveScope / Mob::BiteScope (see the notes there) for the
-  // duration of the carve each entry point makes. Both are MOB-level for the
-  // same reason `inBladeCut_` is: the avatar has no MobSystem at all, and an
-  // NPC punching the player has to reach the same rules.
-  bool inBluntCarve_ = false;
-  bool inUnarmedBlunt_ = false;
-  bool inBite_ = false;
+  // (The six ambient cause flags -- inBurnFlush_, inSpawnRot_, inBladeCut_,
+  // inBluntCarve_, inUnarmedBlunt_, inBite_ -- that lived here are gone: the
+  // cause is a DamageCtx argument now, and what each cause may do is
+  // game/severpolicy.h. Why a blade alone cuts through, why fire keeps its own
+  // account and why the holes a zombie is born with neither bleed nor
+  // dismember are the row comments there and the notes at each rule in
+  // CarveLimb.)
 
   // ---- IS THIS RIG SLOT A GARMENT? -------------------------------------------
   //
@@ -4144,6 +4103,17 @@ class Mob {
     return IsWornSlot(limbIndex) ||
            (limbIndex >= 0 && limbIndex < (int)limbDefs_.size() &&
             limbDefs_[limbIndex].bloodless);
+  }
+  // The TISSUE column of the sever table (game/severpolicy.h) for one slot:
+  // a garment is Shell, hair is Bloodless, anatomy is whatever the body's def
+  // says (MobDef::bodyTissue). Same order of questions IsBloodless asks.
+  Tissue TissueOf(int limbIndex) const {
+    if (IsWornSlot(limbIndex)) return Tissue::Shell;
+    if (IsBloodless(limbIndex)) return Tissue::Bloodless;
+    return def_ ? def_->bodyTissue : Tissue::Flesh;
+  }
+  SeverPolicy PolicyAt(int limbIndex, const DamageCtx& ctx) const {
+    return SeverPolicyOf(ctx, TissueOf(limbIndex));
   }
 
   // how long a severed piece holds its last animated pose before ragdolling
@@ -4701,9 +4671,9 @@ class MobSystem {
   // if the handle belonged to a live mob limb. Severs / kills at 0 hp, and a
   // hit whose impact speed (voxels/sec) exceeds the limb's severImpactSpeed
   // severs regardless of remaining hp. Starts NO clip — the visible answer to
-  // a blow is HitReact below, not a keyframed pose.
+  // a blow is HitReact below, not a keyframed pose. `ctx`: Mob::Damage.
   bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
-              float impactSpeed = 0.0f);
+              float impactSpeed = 0.0f, const DamageCtx& ctx = {});
 
   // THE DIRECTIONAL HALF OF A LANDED BLOW (Mob::HitReact). By body handle for
   // the reason Damage is: the melee sweep knows a Jolt body and a travel
@@ -4730,14 +4700,16 @@ class MobSystem {
   //
   // `eject` spawns the removed matter as ballistic particles (blast) rather
   // than vaporizing it (laser). Returns true when the handle was a live limb.
+  // `ctx` says what did it (the laser passes DamageCause::Beam).
   bool CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                        float radiusVoxels, bool ragged, bool eject, World& world,
-                       std::vector<ParticleSpawn>& spawns);
+                       std::vector<ParticleSpawn>& spawns,
+                       const DamageCtx& ctx = {});
   // THE BLADE ENTRY POINT — a kerf along the swept edge rather than a sphere,
   // plus the blood soak and the structural sever. See Mob::CutLimb and the
   // BladeCut struct above. Returns true when the handle was a live limb.
   bool CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
-               std::vector<ParticleSpawn>& spawns);
+               std::vector<ParticleSpawn>& spawns, float severity = 1.0f);
   // Every live limb of every mob within the blast — the explosion entry point.
   // THE PLAYERS TOO (W1-F, 2026-09-24): every registered avatar is carved
   // after the NPCs, so a second player standing in the first player's blast is
@@ -5125,11 +5097,11 @@ class MobSystem {
   // system knows nothing about audio, the same way it hands particle spawns
   // back instead of emitting them. main.cpp drains these after the tick.
   //
-  // Sever() is reached from a dozen call sites (explosion, laser, hp loss,
-  // carve collapse) and none of them know what CAUSED the cut, which is the
-  // one thing the audio needs: only a BLADE plays the dismember sound. So the
-  // cause is set by the caller around the call — see BladeCutScope — rather
-  // than threaded through every signature.
+  // Only a BLADE plays the dismember sound, so the event carries the cause:
+  // `byBlade` is SeverPolicy::byBlade of the DamageCtx that reached Sever()
+  // (game/severpolicy.h), and `severity` is that ctx's. The cause used to be
+  // a MobSystem-wide flag set around the melee sweep (BladeCutScope); it
+  // meant exactly "the ctx is Blade", so it is that now (W2-G).
   struct SeverEvent {
     Vec3 posVoxel;      // the cut point, world voxels
     uint64_t mobId = 0;
@@ -5168,27 +5140,6 @@ class MobSystem {
   };
   const std::vector<VoiceEvent>& VoiceEvents() const { return voices_; }
   void ClearVoiceEvents() { voices_.clear(); }
-
-  // RAII: marks every Sever() reached inside its lifetime as a blade cut.
-  // Scoped rather than a parameter because the melee sweep calls Damage() and
-  // CarveLimbRadial(), each of which may sever internally several frames deep;
-  // adding a `byBlade` argument to that whole chain would touch the laser and
-  // explosion paths too, for a fact only the audio cares about.
-  struct BladeCutScope {
-    MobSystem& sys;
-    float prevSeverity;
-    bool prevBlade;
-    BladeCutScope(MobSystem& s, float severity) : sys(s) {
-      prevBlade = sys.bladeCut_;
-      prevSeverity = sys.bladeSeverity_;
-      sys.bladeCut_ = true;
-      sys.bladeSeverity_ = severity;
-    }
-    ~BladeCutScope() {
-      sys.bladeCut_ = prevBlade;
-      sys.bladeSeverity_ = prevSeverity;
-    }
-  };
 
   // Wounds that are bleeding hard enough to be worth hearing. Rebuilt each
   // tick in PreTick; main.cpp turns each into a positioned loop.
@@ -6334,11 +6285,6 @@ class MobSystem {
   // because it is a property of the EVENT, not of the sound.
   void PushVoice(const Mob& mob, VoiceKind kind, Vec3 posVoxel,
                  float intensity);
-  // Set by BladeCutScope for the duration of the melee sweep, so Sever() can
-  // record what caused it without every caller having to say.
-  bool bladeCut_ = false;
-  float bladeSeverity_ = 1.0f;
-  friend struct BladeCutScope;
 
   static constexpr uint32_t kMaxMobs = 16;
   // (the drip op budget is now gore.bleedOpsPerTick in tuning.json)

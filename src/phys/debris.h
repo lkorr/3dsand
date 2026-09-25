@@ -13,6 +13,7 @@
 
 #include "math3d.h"
 #include "phys/bodystain.h"  // BodyStainMat/Amt: coats a blow leaves
+#include "phys/damagecause.h"  // DamageCause: shared with Mob
 #include "phys/kerf.h"   // KerfCut/KerfSlot: the shape a blade takes out
 #include "phys/lattice.h"
 #include "phys/physics.h"
@@ -327,7 +328,11 @@ class DebrisSystem {
   // tell a sword from a fire: only a blade makes the wet dismemberment sound
   // (an explosion that takes the same arm off did not saw through anything),
   // and only a blow makes any of them at all.
-  enum class DamageCause : uint8_t { Other = 0, Blade, Blunt, Bite, Beam, Blast };
+  //
+  // ONE ENUM FOR THE LIVING AND THE DEAD (phys/damagecause.h, W2-G): Mob
+  // passes the same value through Damage/CarveLimb/Sever. The alias keeps
+  // `DebrisSystem::DamageCause::Blade` spelling what it always did.
+  using DamageCause = ::DamageCause;
   // ---- ...AND THE MARK A BLOW LEAVES BEFORE IT TAKES ANYTHING -------------
   //
   // THE BRUISE LADDER ON DEAD TISSUE (phys/bodystain.h SoakBruise), which is

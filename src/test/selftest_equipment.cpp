@@ -487,8 +487,7 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
         cut.power = 1.0f;
         cut.seed = 0xC4A7u;
         std::vector<ParticleSpawn> spawns;
-        MobSystem::BladeCutScope blade(mobs, 1.0f);
-        mobs.CutLimb(body, cut, c.world, spawns);
+        mobs.CutLimb(body, cut, c.world, spawns, 1.0f);
         const uint32_t after = mobs.LimbSkinVoxelCount(id, slot);
         return before ? 1.0f - (float)after / (float)before : 0.0f;
       };
