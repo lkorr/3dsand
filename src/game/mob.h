@@ -2000,6 +2000,14 @@ class Mob {
   // Blood that has left this body in its life, in whole-voxel equivalents
   // (a micro droplet is 1/microScale^3 of one). Diagnostic and gate readout.
   float BloodLost() const { return bloodLost_; }
+  // hp charged while ALIVE, by the DamageCause that charged it: Mob::Damage
+  // (the amount) and Mob::CarveLimb (volume + brain), keyed by ctx.cause.
+  // Blood loss is BloodLost(), the burn cap is BurnHealthCap(); neither is a
+  // cause row. Diagnostic only (a gate that finds a body dead can say WHICH
+  // cause paid for it -- CLAUDE.md rule 6); never saved, never hashed.
+  float HpLostBy(DamageCause c) const {
+    return (int)c < (int)DamageCause::Count ? hpLostBy_[(int)c] : 0.0f;
+  }
   // Take `voxels` of blood out of the creature: charges
   // voxels * gore.bleedHpPerVoxel across the live authored limbs in proportion
   // to what each still has, and kills the creature through Die() when the
@@ -3870,6 +3878,7 @@ class Mob {
   GoreProfile gore_;           // this creature's own bleed character
   // ---- blood loss and the burn cap (see the public block above) -----------
   float bloodLost_ = 0.0f;
+  float hpLostBy_[(int)DamageCause::Count] = {};
   float burnFrac_ = 0.0f;
   float burnCap_ = 1.0f;
   // The lattice changed since burnFrac_ was taken. Set by the burn pass and by

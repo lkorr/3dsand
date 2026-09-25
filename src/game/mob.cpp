@@ -10236,7 +10236,10 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // hp is LIFE: a corpse has none to lose, and a rising reads the hp its
     // limbs died with (MobSystem::ServiceRising), not what was hacked off the
     // body afterwards. The wound, the flash and the bleed still happen.
-    if (alive_) limb.hp -= amount;
+    if (alive_) {
+      limb.hp -= amount;
+      hpLostBy_[(int)ctx.cause] += amount;
+    }
     limb.woundLocal = RotateInv(q, hitWorldVoxel - limb.xf.pos);
     // ---- THE HIT FLASH ------------------------------------------------------
     // Set HERE rather than at the melee sweep, so it fires for every cause —
@@ -12596,9 +12599,12 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   limb.weightCharged = nowWeight;
   // Charged to the LIVING only (Mob::Damage's note): a corpse carved keeps
   // the hp it died with.
-  if (alive_)
-    limb.hp -= (lostWeight / w0) * limbDefs_[limbIndex].hp *
-               CurrentTuning().gore.carveHpPerVolume;
+  if (alive_) {
+    const float charge = (lostWeight / w0) * limbDefs_[limbIndex].hp *
+                         CurrentTuning().gore.carveHpPerVolume;
+    limb.hp -= charge;
+    hpLostBy_[(int)ctx.cause] += charge;
+  }
   // ---- ...AND THE BRAIN IS NOT A FRACTION OF ANYTHING ----------------------
   //
   // The one absolute charge in this function. Every brain voxel destroyed --
@@ -12619,8 +12625,11 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // brain charge must not fire for them — a zombie whose spawn roll ate five
   // brain voxels would die before its first tick. Only NEW damage (rot
   // advancing, a blade, a blast) charges the flat penalty.
-  if (lostBrain && pol.chargesBrain && alive_)
+  if (lostBrain && pol.chargesBrain && alive_) {
     limb.hp -= (float)lostBrain * CurrentTuning().gore.brainHpPerVoxel;
+    hpLostBy_[(int)ctx.cause] +=
+        (float)lostBrain * CurrentTuning().gore.brainHpPerVoxel;
+  }
   // ---- WHAT MAY BLEED, AND WHAT MAY NOT ------------------------------------
   //
   // Two exclusions, both of them reported as bugs and both of them the same

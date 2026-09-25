@@ -4429,7 +4429,8 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // produce ONE drop of
     // blood. Zero is the right threshold and not a strict one: burning reached
     // the gore path through CarveLimb's drip and Sever's gout, both of which
-    // now refuse while `inBurnFlush_` is set, so any non-zero here means a
+    // now refuse for an EATEN carve (DamageCtx::eaten, the old `inBurnFlush_`;
+    // the carveBleeds / gore columns of game/severpolicy.h), so any non-zero here means a
     // third route nobody has found yet rather than a rate that needs tuning.
     //
     // Asserted on the SPAWN STREAM and on BleedSources, which are different
@@ -5479,14 +5480,15 @@ Status GateUndead(Ctx& c, std::string& detail) {
   // the one thing this claim exists to refuse. What CAN see it is a base limb
   // with no body the instant after Spawn -- and it matters now, because the
   // joint-attachment rule (Mob::JointRuleApplies / DropDisconnectedChildren,
-  // reached from CarveLimb) WAS not excluded under inSpawnRot_: a rot bite that
+  // reached from CarveLimb) WAS not excluded for spawn rot (then the
+  // `inSpawnRot_` flag, now DamageCause::SpawnRot's row): a rot bite that
   // eats a socket out of the torso severed the arm seated in it, and Sever()
   // charges gore.severVoxels through DrainBlood -- which is the only way `dry`
   // below can be false with no tick run. So the two reds always arrived
   // together, and the owner saw the whole chain: zombies that spawned missing
   // limbs, bleeding hard, dead before they took a step (vital limbs route
-  // Sever straight to Die). Fixed 2026-09-20 by the third inSpawnRot_
-  // exclusion, and by re-taking the joint baselines once the rot is done so
+  // Sever straight to Die). Fixed 2026-09-20 by the third spawn-rot
+  // exclusion (now the SpawnRot row's `joint` column), and by re-taking the joint baselines once the rot is done so
   // the refusal does not just move the sever to the first blow instead.
   // Both numbers stay printed side by side so a red here names its cause.
   int severedAtSpawn = 0;
@@ -5498,8 +5500,8 @@ Status GateUndead(Ctx& c, std::string& detail) {
                       ma->LimbCount() == mh->LimbCount() &&
                       mb->LimbCount() == mh->LimbCount() &&
                       severedAtSpawn == 0;
-  // THE HOLES ARE OLD. Without Mob::inSpawnRot_ every bite tops up a drip
-  // budget and the creature arrives haemorrhaging.
+  // THE HOLES ARE OLD. Without the SpawnRot row's carveBleeds = false
+  // (game/severpolicy.h) every bite tops up a drip budget and the creature arrives haemorrhaging.
   const float bloodLostA = c.mobs.BloodLost(zA);
   const bool dry = bloodLostA <= 0.0f;
   // Chunks, not speckle: spurs per voxel lost, against the same body's own
@@ -9221,7 +9223,19 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
     float deathPush = 0.0f;
     Physics::PushSource deathSrc{};
     Vec3 livingPos = pl.pos;
+    // WHY the player ends dead or alive, not just whether (CLAUDE.md rule 6):
+    // the last living tick's body state, and at the end Mob's hp ledger by
+    // cause. "alive 0" alone cannot tell the burn cap from blood loss from a
+    // vital limb carved to zero, nor the burn from a blast or a contact.
+    int deathTick = -1;
+    float lastHp = avatar.TotalHp(), lastBurn = 0.0f, lastCap = 1.0f,
+          lastBlood = 0.0f;
+    const float startHp = avatar.TotalHp();
     for (int i = 0; i < 400 && avatar.IsAlive(); i++) {
+      lastHp = avatar.TotalHp();
+      lastBurn = avatar.BurnFraction();
+      lastCap = avatar.BurnHealthCap();
+      lastBlood = avatar.BloodLost();
       avTick();
       Physics::PushSource src{};
       Vec3 push = phys.PlayerPushOut(proxy, pl.pos, &src);
@@ -9234,6 +9248,7 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
       else pl.pos += push;
       gobbets = std::max(gobbets, debris.BodyCount());
       if (!avatar.IsAlive()) {  // died during this tick: post-mortem, not ours
+        deathTick = i;
         deathPush = len;
         deathSrc = src;
         break;
@@ -9267,6 +9282,22 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
                 (unsigned long long)worst.body, worst.massKg, worst.depthVox,
                 worstLayer, worstTick, worstAlive, worstOwn, worstBodies,
                 worstPending);
+    {
+      static const char* const kCause[(int)DamageCause::Count] = {
+          "other", "blade", "blunt", "bite", "beam", "blast",
+          "unarmed", "burn", "spawnrot", "fall"};
+      std::string ledger;
+      for (int k = 0; k < (int)DamageCause::Count; k++) {
+        const float v = avatar.HpLostBy((DamageCause)k);
+        if (v > 0.0f) ledger += Format(" %s %.1f", kCause[k], v);
+      }
+      std::printf("    fate: %s at burn tick %d (cause \"%s\"); hp %.1f of %.1f "
+                  "on the last living tick, burnt %.3f (cap %.3f), blood lost "
+                  "%.1f; hp charged by cause:%s\n",
+                  avatar.IsAlive() ? "ALIVE" : "DEAD", deathTick,
+                  avatar.DeathCause(), lastHp, startHp, lastBurn, lastCap,
+                  lastBlood, ledger.empty() ? " none" : ledger.c_str());
+    }
     // OPEN FINDING, reported every run and asserted on by nothing (2026-09-11).
     // On the tick the avatar dies, Die() hands its limbs to DebrisSystem and
     // queues them through ReleaseToWorldWhenClear — and at some poses one of
