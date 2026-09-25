@@ -14904,6 +14904,19 @@ fall out of the ordinary authored table; and the moment the shell burns through
 the probe returns nothing there and the skin is exposed. No integrity
 threshold, nothing to tune.
 
+**Burnt cloth goes to nothing while it is still in the fire** (2026-09-25,
+gate `garment-burn`). Every fabric's burning state now CHARS
+(`cloth_burning`, and garment `linen_burning`, both land on `cloth_charred`),
+and `cloth_charred` with any hot neighbour -- the cloth still burning beside
+it, a flame, the wearer's own burning flesh read across the joint -- decays
+to air, faster the more hot faces it has. That is what "the moment the shell
+burns through" above depends on: a char voxel is not hot, so to the probe it
+is cloth, and a garment that only blackened (linen did, by design, until the
+base human's shorts became their own `undercloth` material) shielded the
+skin forever. Put out, or left behind by the front, the char stays as rag.
+The shorts keep their inert terminus (`linen_charred`); `mob-burn` asserts
+that chain never reaches air.
+
 **Asked along a SEGMENT, not at a point.** A limb is a rounded tube inside a
 garment cut to its box, so on any diagonal there are several empty cells
 between the flesh and the cloth: the obvious "is the cell one step outside me

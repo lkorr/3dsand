@@ -1069,17 +1069,13 @@
       "chance": 60
     },
     {
-      "self": "cloth_burning",
-      "decay": true,
-      "burnDuration": true,
-      "chance": 26.67,
-      "becomes": "air"
+      "note": "BURNT FIRST, THEN NOTHING (owner, 2026-09-25: 'when you set someone on fire the clothes just become burnt; it should turn to burnt -> nothing if the burnt clothes are still on fire, which should destroy clothing and further light skin on fire'). Burning cloth no longer vanishes straight to air: all of its 39 per-mille (less the ash sliver) now lands on cloth_charred, so the garment visibly BLACKENS as the front passes, and the char is what goes to nothing -- while it is still in the fire -- in the rule below. The total is unchanged, so a voxel stays alight exactly as long as before and the combustion slider reads the same."
     },
     {
       "self": "cloth_burning",
       "decay": true,
       "burnDuration": true,
-      "chance": 12,
+      "chance": 38.67,
       "becomes": "cloth_charred"
     },
     {
@@ -1090,18 +1086,18 @@
       "becomes": "ash"
     },
     {
-      "note": "Charred rag is spent fuel: three hot faces to relight, so a burnt-out garment does not smoulder its wearer to death after the fire is over."
+      "note": "CHARRED RAG STILL IN THE FIRE BURNS TO NOTHING. One hot face is enough -- the burning cloth beside it, the flame it licks up, the wearer's own burning flesh under it (the shell reads a burning limb as heat across the joint) -- and more faces burn it faster, up to four. With nothing hot left around it the char is inert, so a garment that was put out, or that the fire has moved on from, hangs as scorched rag instead of evaporating. It REPLACES the old three-face relight (charred -> burning): that was the only closed loop in the cloth chain and it mostly left a burnt garment in place; this ends the chain in air and grows nothing, so it is subcritical by construction (CLAUDE.md rule 2). burnDuration, because it retires fuel. The HOLE it leaves is the point for the wearer: a char voxel over the skin reads as cold cloth to the worn-occlusion probe forever, and air lets the fire through."
     },
     {
       "self": "cloth_charred",
       "decay": true,
       "burnDuration": true,
-      "chance": 10,
-      "becomes": "cloth_burning",
+      "chance": 30,
+      "becomes": "air",
       "scaleByNeighbors": {
         "neighbor": "tag:hot",
-        "minCount": 3,
-        "scaleMax": 3
+        "minCount": 1,
+        "scaleMax": 4
       }
     },
     {
@@ -1150,7 +1146,7 @@
       "becomes": "air"
     },
     {
-      "note": "-------- UNDERCLOTH: the base human's linen, which BLACKENS AND STAYS --------\nA near-copy of the cloth chain above with one branch deleted, and the deletion is the mechanic. cloth_burning is CONSUMED (26.67 of its 39 per-mille go to air), which is right for a robe -- a burnt robe should hang in rags. It is wrong for the one garment the character is wearing UNDER everything: burning it away undresses them, and 'the player caught fire and is now naked' is a worse read than any amount of scorching.\n\nSo linen_burning has exactly one decay branch and it lands on linen_charred, which authors no rules at all. Same 39 per-mille total, so it burns for the same LENGTH of time as a robe and responds to the burn-duration slider identically; only the destination moved. It still catches at cloth's rate, still emits fire upward while alight, so it still spreads a fire and still cooks the flesh underneath through the ordinary table -- what it cannot do is disappear."
+      "note": "-------- LINEN: the peasant wardrobe's cloth, which now BURNS AWAY like every garment (2026-09-25) --------\nEverything linen_burning makes is cloth_charred, so a smock blackens and then burns to nothing while it is still in the fire, exactly as a robe does (see the cloth chain above). The paragraph below is the history of why this chain once ended in the inert linen_charred instead: the base human's UNDERWEAR was linen then, and burning it away undressed the character. The shorts have been their own material since 2026-09-23 (`undercloth`, which chars to linen_charred and stays -- see its block below), so the reason no longer applies to linen and the owner asked for burnt clothes to go. linen_charred remains, as the undercloth's terminus only.\n\nHISTORY: A near-copy of the cloth chain above with one branch deleted, and the deletion is the mechanic. cloth_burning is CONSUMED (26.67 of its 39 per-mille go to air), which is right for a robe -- a burnt robe should hang in rags. It is wrong for the one garment the character is wearing UNDER everything: burning it away undresses them, and 'the player caught fire and is now naked' is a worse read than any amount of scorching.\n\nSo linen_burning has exactly one decay branch and it lands on linen_charred, which authors no rules at all. Same 39 per-mille total, so it burns for the same LENGTH of time as a robe and responds to the burn-duration slider identically; only the destination moved. It still catches at cloth's rate, still emits fire upward while alight, so it still spreads a fire and still cooks the flesh underneath through the ordinary table -- what it cannot do is disappear."
     },
     {
       "self": "linen",
@@ -1166,14 +1162,14 @@
       "self": "linen_burning",
       "neighbor": "tag:extinguisher",
       "chance": 450,
-      "selfBecomes": "linen_charred"
+      "selfBecomes": "cloth_charred"
     },
     {
       "self": "linen_burning",
       "decay": true,
       "rain": true,
       "chance": 40,
-      "becomes": "linen_charred"
+      "becomes": "cloth_charred"
     },
     {
       "self": "linen_burning",
@@ -1191,8 +1187,15 @@
       "self": "linen_burning",
       "decay": true,
       "burnDuration": true,
-      "chance": 39,
-      "becomes": "linen_charred"
+      "chance": 38.67,
+      "becomes": "cloth_charred"
+    },
+    {
+      "self": "linen_burning",
+      "decay": true,
+      "burnDuration": true,
+      "chance": 0.33,
+      "becomes": "ash"
     },
     {
       "note": "FLESH: sears on contact, ignites only under a WIDE front. skin -> flesh_cooked is a plain pair rule, so a single lick of flame cooks the surface and a creature can be seared without being destroyed. Ignition is the scaled decay below.\n\nIGNITION WAS RAISED 9.75x IN TWO PASSES (40 -> 130 -> 390) on owner report that a body was not flammable enough. THE SEAR WAS NOT, and the attempt to raise it is worth recording because it was wrong for a reason that is easy to repeat: skin -> flesh_cooked is a COLOUR CHANGE, not combustion, so raising it makes a body look cooked faster without making it any more likely to catch. It also broke the one comparison this whole section is built on -- at sear 220 vs cloth's 200 the flesh reacted to a single hot face MORE eagerly than the cloth over it, which inverts 'cloth catches at about 8x flesh's rate' -- and the mob-burn gate caught it as cloth and skin halving on the same tick. Flammability is the decay below; the sear stays at 90. THE MINCOUNT DID NOT MOVE and must not: 3 is the reason a lone ember on a shoulder gutters out, and it is provable rather than tuned (see the next note). At 390 with scaleMax 4 the scaled chance is 858 per-mille at the minCount-3 threshold and saturates at 1000 under a full six-face front, i.e. cooked flesh under a real fire ignites within a tick or two -- the SEAR (90) is now what paces a body catching alight, not the ignition. Raising the chance makes a real fire take hold quickly; lowering the count would make ANY spark take hold, which is a different and much worse game."

@@ -3656,18 +3656,29 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     }
 
     // ---- I.2 A BURNT CHARACTER IS NEVER A NAKED ONE ------------------------
-    // The base human's linen is a material, not a paint colour, precisely so
-    // that burning it cannot expose skin — every reaction that rewrites a body
-    // voxel clears its art colour, so a painted-on garment burns into whatever
-    // the underlying material chars to and reads as bare flesh.
+    // The base human's SHORTS are a material, not a paint colour, precisely so
+    // that burning them cannot expose skin — every reaction that rewrites a
+    // body voxel clears its art colour, so a painted-on garment burns into
+    // whatever the underlying material chars to and reads as bare flesh.
+    //
+    // THE SHORTS ARE `undercloth` (anatomy.garmentsBecome rewrites the .vox's
+    // linen to it at load, 2026-09-23), NOT linen. This check read `linen`
+    // until 2026-09-25, when the peasant wardrobe's linen was made to BURN
+    // AWAY like every other garment (owner: burnt clothes that are still on
+    // fire go to nothing) -- which is right for a smock and exactly what this
+    // claim forbids for the one garment under everything.
     //
     // Asserted as a REACHABILITY claim over the whole chain rather than as
-    // "linen_burning has no air branch", because the hole could be opened
-    // by any of the three materials, or by a fourth added between them later.
-    // Nothing in the closure may produce air (prodSelf 0), and the closure must
-    // terminate at linen_charred, which authors no rules at all.
+    // "undercloth_burning has no air branch", because the hole could be opened
+    // by any material in it, or by one added between them later. Nothing in
+    // the closure may produce air (prodSelf 0), and the closure must terminate
+    // at linen_charred, which authors no rules at all.
     {
-      std::vector<uint32_t> stack{mUnder}, seen{mUnder};
+      const uint32_t mShorts = matId("undercloth");
+      const uint32_t shortsChain[] = {mShorts, matId("undercloth_seared"),
+                                      matId("undercloth_burning"),
+                                      matId("undercloth_charred"), mUnderChar};
+      std::vector<uint32_t> stack{mShorts}, seen{mShorts};
       bool leaks = false, closed = true;
       while (!stack.empty() && closed) {
         const uint32_t id = stack.back();
@@ -3688,13 +3699,16 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
           stack.push_back(p);
         }
       }
-      // Every state the linen can reach must be one of its own three, or the
-      // chain has escaped into a material with different (consumable) rules.
+      // Every state the shorts can reach must be one of their own five, or
+      // the chain has escaped into a material with different (consumable)
+      // rules.
       for (uint32_t s : seen)
-        if (s != mUnder && s != mUnderBurn && s != mUnderChar) closed = false;
+        if (std::find(std::begin(shortsChain), std::end(shortsChain), s) ==
+            std::end(shortsChain))
+          closed = false;
       const bool terminal = mats[mUnderChar].gpu.reactCount == 0;
-      const bool i2 = !leaks && closed && terminal;
-      std::printf("  linen chars, never bares: %s (%zu states reachable, "
+      const bool i2 = mShorts != 0 && !leaks && closed && terminal;
+      std::printf("  shorts char, never bare: %s (%zu states reachable, "
                   "air branch %s, terminus %s)\n",
                   i2 ? "PASS" : "FAIL", seen.size(), leaks ? "PRESENT" : "none",
                   terminal ? "inert" : "still reactive");

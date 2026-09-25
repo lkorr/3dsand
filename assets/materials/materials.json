@@ -2844,7 +2844,7 @@
       "molten": "fire"
     },
     {
-      "//": "Undercloth alight. A near-copy of cloth_burning and NOT the same material, which is the entire mechanic: cloth_burning is CONSUMED (it has a becomes-air branch, so a robe burns into holes), and this one is not. See its rules in reactions.json.",
+      "//": "Linen alight. A near-copy of cloth_burning in linen's flame colours. Since 2026-09-25 it chars to cloth_charred exactly as cloth_burning does, so a burning smock blackens and then burns to nothing while still in the fire (reactions.json). It used to char to the inert linen_charred instead, because the base human's underwear was linen and burning it away undressed the character; the shorts are `undercloth` now.",
       "id": "linen_burning",
       "burnStage": 1,
       "class": "solid",
@@ -2865,7 +2865,7 @@
       "molten": "fire"
     },
     {
-      "//": "Scorched linen: the TERMINUS of the whole chain, and the only material in this file that authors no rules at all. That is the point rather than an omission -- it can never burn away, so a torched character keeps a blackened garment instead of losing it, and it can never re-ignite, so the chunk it sits in sleeps (rule 2). NEUTRAL-COOL where the flesh chars beside it are warm brown-black, which is the whole readability job: value alone would not separate scorched linen (#262326) from charred flesh (#3a2f2a) at a glance, but hue does, and it is the same neutral family cloth_charred already uses because both are burnt fabric. A touch darker than cloth_charred: this garment burns to completion rather than into rags.",
+      "//": "Scorched linen: the TERMINUS of the UNDERCLOTH chain (undercloth_charred -> here), and a material that authors no rules at all. That is the point rather than an omission -- it can never burn away, so a torched character keeps blackened shorts instead of losing them, and it can never re-ignite, so the chunk it sits in sleeps (rule 2). Garment linen no longer reaches it: since 2026-09-25 linen_burning chars to cloth_charred, which burns to nothing while still in the fire. NEUTRAL-COOL where the flesh chars beside it are warm brown-black, which is the whole readability job: value alone would not separate scorched linen (#262326) from charred flesh (#3a2f2a) at a glance, but hue does.",
       "id": "linen_charred",
       "burnStage": 2,
       "class": "solid",

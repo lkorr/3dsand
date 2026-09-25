@@ -4041,6 +4041,203 @@ Status GateCorpseCrossheat(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- garment-burn ----------------------------------------------------------
+// A GARMENT THAT CATCHES BURNS AWAY, AND THE SKIN UNDER IT CATCHES (owner,
+// 2026-09-25: "when you set someone on fire the clothes just become burnt; it
+// should turn to burnt -> nothing if the burnt clothes are still on fire,
+// which should destroy clothing and further light skin on fire").
+//
+// A living human in the stock linen smock, lit at a few dozen voxels of the
+// garment and nothing else -- NO world fire, because the case that was broken
+// is a person on fire, not a person standing in one (armor-react's standing
+// bath already relit charred cloth from three hot faces; linen never burned
+// away at all, its char was an inert terminus, and an inert char over the
+// skin reads as cold cloth to the occlusion probe forever). Three claims:
+//   A the garment is CONSUMED: at least garmentBurnMinGone of its voxels are
+//     gone (air), not merely blackened;
+//   B burnt goes on to NOTHING while it is still on fire: more of what burned
+//     became air than is left hanging as char;
+//   C the fire reaches the wearer: flesh under the garment is ALIGHT
+//     (flesh_burning) at some tick -- lit, not only seared.
+// Burn death is parked (gore.burnDeathFraction 1) for the same reason
+// mob-burn parks it: the claim is how far the fire gets, and a body that dies
+// of the first 70% stops being counted. Regenerates the world on the way out.
+//
+// MEASURED BOTH WAYS on this fixture, same spark: on the rules before
+// 2026-09-25 the fire crossed the whole smock (peak 5,980 alight) and left
+// 11,214 voxels of char and 0 gone -- A and B FAIL, the owner's report. After:
+// 86% gone, 833 char left. C held on the old rules too (flesh alight peak 311,
+// burning cloth against the skin already lights it); the change roughly
+// doubles it (599), because the holes let the fire at the skin -- C is kept as
+// the "the wearer burns" floor, not as the discriminating claim.
+Status GateGarmentBurn(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const uint32_t mLinen = MatIdOf(c, "linen"),
+                 mLinenBurn = MatIdOf(c, "linen_burning"),
+                 mFleshBurning = MatIdOf(c, "flesh_burning");
+  const uint32_t charMats[] = {MatIdOf(c, "cloth_charred"),
+                               MatIdOf(c, "linen_charred")};
+  if (!mLinen || !mLinenBurn || !mFleshBurning) {
+    detail = "linen / linen_burning / flesh_burning missing from materials.json";
+    return Status::Fail;
+  }
+  const ItemDef* smock = c.items.At(c.items.Find("smock"));
+  const int hd = mobs.FindDef("human");
+  if (smock == nullptr || hd < 0) {
+    detail = "no `smock` item or `human` def to dress";
+    return Status::Skip;
+  }
+  PrepareWorld(c);
+  mobs.Reset();
+  c.debris.Reset();
+  const Tuning saved = CurrentTuning();
+  {
+    Tuning tt = saved;
+    tt.gore.burnDeathFraction = 1.0f;
+    SetCurrentTuning(tt);
+  }
+  // A DRY FLOOR. Worldgen at this inset is a lake: measured, a human stood
+  // there for 8 ticks came out with a water coat on ~76% of every smock panel,
+  // and burning cloth is doused by water at 450 per-mille -- the spark was out
+  // in three ticks. So, like armor-react, the fixture stamps its own ground:
+  // two layers of stone flush above the highest column under it and air above,
+  // through the real tick, and stands the creature on that.
+  const IVec3 site = FixtureSite(c.world, 460);
+  int padTop = 0;
+  std::vector<CellOp> pad;
+  {
+    const uint32_t mStone = MatIdOf(c, "stone");
+    int hMax = 0;
+    for (int x = site.x - 10; x <= site.x + 10; x++)
+      for (int z = site.z - 10; z <= site.z + 10; z++)
+        hMax = std::max(hMax, World::TerrainHeight(x, z, kDefaultSeed));
+    padTop = hMax + 2;
+    for (int x = site.x - 10; x <= site.x + 10; x++)
+      for (int z = site.z - 10; z <= site.z + 10; z++)
+        for (int y = padTop - 1; y <= padTop + 28; y++) {
+          const IVec3 cc{x, y, z};
+          if (c.world.CellInWindow(cc))
+            pad.push_back({World::SlotCellIndex(cc),
+                           PackVoxNew(y <= padTop ? mStone : 0u, 0u)});
+        }
+  }
+  const IVec3 pchunk{site.x >> 4, padTop >> 4, site.z >> 4};
+  support::TickRig rig(c, 70000u, pchunk);
+  support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) { o.cells = pad; });
+  const uint64_t id = mobs.Spawn(hd, {site.x, padTop + 1, site.z});
+  Mob* mob = id ? mobs.FindMobById(id) : nullptr;
+  int home = -1;
+  for (int sl = 0; sl < kEquipSlotCount && home < 0; sl++)
+    if (EquipSlotAccepts(sl, smock->kind)) home = sl;
+  if (!mob || home < 0 || !mob->WearItem(smock, home)) {
+    SetCurrentTuning(saved);
+    detail = "could not spawn and dress the human in the smock";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  // Every rig slot the smock occupies (a garment is several cover panels).
+  std::vector<int> shell;
+  for (int p = 0; p < mob->WornPieceCount(); p++)
+    for (int sl : mob->WornSlotsAt(p)) shell.push_back(sl);
+  const int base = mob->AppendedBase();
+  support::RunTicks(rig, 8);
+
+  auto live = [&](int sl) {
+    const uint32_t art = mobs.LimbArtVoxelCount(id, sl);
+    const uint32_t dead = mobs.LimbMaterialCount(id, sl, 0u);
+    return mobs.LimbBody(id, sl) && art > dead ? art - dead : 0u;
+  };
+  auto shellVox = [&]() {
+    uint32_t n = 0;
+    for (int sl : shell) n += live(sl);
+    return n;
+  };
+  auto shellCount = [&](uint32_t m) {
+    uint32_t n = 0;
+    for (int sl : shell)
+      if (m && mobs.LimbBody(id, sl)) n += mobs.LimbMaterialCount(id, sl, m);
+    return n;
+  };
+  auto shellChar = [&]() {
+    uint32_t n = 0;
+    for (uint32_t m : charMats) n += shellCount(m);
+    return n;
+  };
+  auto bodyAlight = [&]() {
+    uint32_t n = 0;
+    for (int li = 0; li < base; li++)
+      if (mobs.LimbBody(id, li))
+        n += mobs.LimbMaterialCount(id, li, mFleshBurning);
+    return n;
+  };
+  // THE FIXTURE MUST BE DRY, and says so if it is not: a wet garment is a
+  // doused garment, and "it did not burn" would then be about the ground.
+  uint32_t wet = 0;
+  const uint32_t mWater = MatIdOf(c, "water");
+  for (int sl : shell) wet += mobs.LimbCoatMatCount(id, sl, mWater, 1);
+  const uint32_t vox0 = shellVox();
+  const uint32_t alight0 = bodyAlight();
+  // THE SPARK: 48 voxels of the biggest panel (the body of the smock), once.
+  int sparkSlot = -1;
+  for (int sl : shell)
+    if (sparkSlot < 0 || live(sl) > live(sparkSlot)) sparkSlot = sl;
+  const uint32_t lit =
+      sparkSlot >= 0 && wet * 100u <= vox0
+          ? mobs.RewriteLimbMaterial(id, sparkSlot, mLinen, mLinenBurn, 48)
+          : 0u;
+  const int kTicks = 300;
+  uint32_t voxEnd = vox0, charEnd = 0, peakAlight = 0, peakBurning = 0;
+  int firstAlight = -1, diedAt = -1;
+  std::string trace;
+  for (int i = 0; i < kTicks && lit > 0; i++) {
+    support::RunTicks(rig, 1);
+    if (!mobs.FindMobById(id)) break;
+    if (diedAt < 0 && !mobs.IsAlive(id)) diedAt = i;
+    voxEnd = shellVox();
+    charEnd = shellChar();
+    const uint32_t a = bodyAlight();
+    const uint32_t burning = shellCount(mLinenBurn) + shellCount(MatIdOf(c, "cloth_burning"));
+    peakBurning = std::max(peakBurning, burning);
+    if (a > alight0 && firstAlight < 0) firstAlight = i;
+    peakAlight = std::max(peakAlight, a);
+    // The garment's course every 50 ticks: alive / alight / char / flesh lit.
+    if (i % 50 == 0)
+      trace += Format(" t+%d %u/%u/%u/%u", i, voxEnd, burning, charEnd, a);
+  }
+  std::printf("  garment-burn trace (voxels / alight / charred / flesh alight):%s\n",
+              trace.c_str());
+  SetCurrentTuning(saved);
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const uint32_t gone = vox0 > voxEnd ? vox0 - voxEnd : 0u;
+  const double goneFrac = vox0 ? (double)gone / (double)vox0 : 0.0;
+  RecordObserved("garmentBurnGoneFrac", goneFrac);
+  RecordObserved("garmentBurnPeakAlight", (double)peakAlight);
+  const double minGone = BaselineNumber("garmentBurnMinGone", 0.5);
+  const bool a = lit > 0 && goneFrac >= minGone;
+  const bool b = gone > charEnd;
+  const bool cc = peakAlight > alight0;
+  if (wet * 100u > vox0) {
+    detail = Format("fixture is WET (%u smock voxels, over 1%%, carry a water coat before "
+                    "the spark): the ground under it holds water", wet);
+    return Status::Fail;
+  }
+  detail = Format(
+      "smock (%zu panels) %u voxels, %u lit (peak %u alight), no world fire, %d ticks: A "
+      "consumed %u (%.0f%%, need %.0f%%) %s | B left charred %u vs gone %u %s "
+      "| C flesh alight peak %u (first at t+%s) %s%s",
+      shell.size(), vox0, lit, peakBurning, kTicks, gone, goneFrac * 100.0, minGone * 100.0,
+      a ? "ok" : "FAIL", charEnd, gone, b ? "ok" : "FAIL", peakAlight,
+      firstAlight < 0 ? "never" : std::to_string(firstAlight).c_str(),
+      cc ? "ok" : "FAIL",
+      diedAt >= 0 ? Format(" | died at t+%d", diedAt).c_str() : "");
+  return a && b && cc ? Status::Pass : Status::Fail;
+}
+
 // ---- corpse-worn ----------------------------------------------------------
 // The same acid bath round two corpses' torsos, one wearing the iron cuirass
 // and one bare. Steel carries no tag:dissolvable, so on the living the acid
@@ -7281,6 +7478,8 @@ const std::vector<Gate>& WoundGates() {
       {"body-stain", "mob", {}, false, GateBodyStain, false},
       {"corpse-wash", "mob", {}, false, GateCorpseWash, false},
       {"corpse-crossheat", "mob", {}, false, GateCorpseCrossheat, false},
+      // A lit garment burns to nothing and lights the wearer (no world fire).
+      {"garment-burn", "mob", {}, false, GateGarmentBurn, false},
       {"corpse-worn", "mob", {}, false, GateCorpseWorn, false},
       {"corpse-splatter", "mob", {}, false, GateCorpseSplatter, false},
       {"body-coat", "mob", {}, false, GateBodyCoat, false},
