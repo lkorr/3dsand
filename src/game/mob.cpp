@@ -1910,7 +1910,18 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   // Packed once per DEF, shared by every instance: a limb's voxels never
   // change after load in v1, so there is no per-instance storage at all.
   // Done last so a def that failed validation never enters the pool.
+  //
+  // ALL OR NOTHING (2026-09-25). A limb that did not pack used to leave the
+  // def with `microModel = -1` on that limb and nothing else wrong, and a
+  // limb with no brick falls to the CUBE path, which draws each collider
+  // voxel as one WORLD voxel — so a pool that ran out mid-def produced a
+  // creature with some limbs many times their size, painted in raw anatomy
+  // materials (owner report: "deformed abominations ... limbs 20x their
+  // normal size, replaced by organs"). A def is one body; if the pool cannot
+  // hold all of it, it holds none of it, and the caller (MobSystem::PoolDef,
+  // DefWithEffects) decides what to spawn instead.
   if (ok && def.skinScale > 1) {
+    std::vector<uint32_t> packed;
     for (MobLimbDef& ld : def.limbs) {
       int mi = FindModel(def.prefab, ld.name);
       if (mi < 0) continue;
@@ -1920,10 +1931,17 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
       ld.microModel = MicroBodyPack(micro, m.voxels, m.size, def.skinScale,
                                     def.name + "/" + ld.name, log,
                                     MicroBodyCutFaces(def.prefab, mi));
-      if (ld.microModel < 0)
+      if (ld.microModel < 0) {
         log += def.name + ": limb \"" + ld.name +
-               "\" has no micro brick and will not render (the cube path "
-               "would draw it at the wrong scale)\n";
+               "\" has no micro brick; the whole def is refused (" +
+               std::to_string(MicroBodyFreeWords(micro)) +
+               " pool words free)\n";
+        for (uint32_t pm : packed) MicroBodyReleaseShared(micro, pm);
+        for (MobLimbDef& l2 : def.limbs) l2.microModel = -1;
+        ok = false;
+        break;
+      }
+      packed.push_back((uint32_t)ld.microModel);
     }
   }
   if (!ok) return false;
@@ -1941,6 +1959,12 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
   // pointing at the wrong bricks.
   micro.models.clear();
   micro.pool.clear();
+  // ...and every allocator record that indexes them: a retired record or a
+  // free range from the previous load names a position that no longer exists.
+  micro.owned.clear();
+  micro.blockWords.clear();
+  micro.freeModels.clear();
+  micro.freeRanges.clear();
   // Same reasoning for the art palette: slots are positions in this merged
   // list, so carrying one across a reload would repaint every def with the
   // previous load's colours.
@@ -2224,6 +2248,10 @@ void MobSystem::SetDefs(std::vector<MobDef> defs) {
   // Room for the compositions, once, so no later append can move a MobDef the
   // avatar or a live limb is pointing at. See kDerivedDefs.
   defs_.reserve(defs_.size() + kDerivedDefs);
+  // Everything from here on is RUNTIME (EvictUnusedDefs), including what the
+  // re-seating loop below composes for creatures that turned.
+  loadedDefs_ = defs_.size();
+  defIdle_.assign(defs_.size(), 0);
   for (size_t i = 0; i < mobs_.size(); i++) {
     Mob& m = mobs_[i];
     // FindOrComposeDef, not FindDef: a creature that TURNED is standing there
@@ -2252,6 +2280,8 @@ void MobSystem::SetDefs(std::vector<MobDef> defs) {
 }
 
 int MobSystem::FindDef(const std::string& name) const {
+  // An evicted runtime slot has an empty name; nothing may find it.
+  if (name.empty()) return -1;
   for (size_t i = 0; i < defs_.size(); i++)
     if (defs_[i].name == name) return (int)i;
   return -1;
@@ -2309,11 +2339,6 @@ int MobSystem::PoolDef(const std::string& name, std::string* log) {
         "handed over (SetDefFactory / SetMicroSet)\n");
     return -1;
   }
-  if (defs_.size() >= defs_.capacity()) {
-    say("mob: refusing to build '" + name + "': all " +
-        std::to_string(kDerivedDefs) + " runtime def slots are spent\n");
-    return -1;
-  }
   const std::string stem = name.substr(std::char_traits<char>::length(kPoolPrefix));
   // A stem is a file name inside pool/, never a path out of it.
   if (stem.empty() || stem.find_first_of("/\\.") != std::string::npos) {
@@ -2341,20 +2366,121 @@ int MobSystem::PoolDef(const std::string& name, std::string* log) {
     say(buildLog + "mob: '" + name + "' did not resolve\n");
     return -1;
   }
+  // A SLOT FIRST, evicting what nothing holds if every one is taken.
+  int slot = TakeDefSlot();
+  if (slot < 0 && EvictUnusedDefs() > 0) slot = TakeDefSlot();
+  if (slot < 0) {
+    say("mob: refusing to build '" + name + "': all " +
+        std::to_string(kDerivedDefs) +
+        " runtime def slots hold a creature something is still using\n");
+    return -1;
+  }
   MobDef def;
-  if (!BuildMobDef(*defFactory_, src, j, *microSet_, def, buildLog)) {
+  bool built = BuildMobDef(*defFactory_, src, j, *microSet_, def, buildLog);
+  // BuildMobDef refuses a body the micro pool cannot hold WHOLE; bodies
+  // nobody is using any more are what make room, so evict and try once more.
+  if (!built && EvictUnusedDefs(slot) > 0) {
+    def = MobDef{};
+    built = BuildMobDef(*defFactory_, src, j, *microSet_, def, buildLog);
+  }
+  if (!built) {
     say(buildLog + "mob: '" + name + "' did not build\n");
     return -1;
   }
   if (!buildLog.empty()) say(buildLog);
   // Registered as a SOURCE too, so DefWithEffects can compose from it: a
-  // random human who is bitten gets up as `pool/<stem>+zombie`.
-  defFactory_->sources.push_back(src);
-  say("mob: built pool body '" + name + "' (def " + std::to_string(defs_.size()) +
-      ", " + std::to_string(defs_.capacity() - defs_.size() - 1) +
-      " slots left)\n");
-  defs_.push_back(std::move(def));
+  // random human who is bitten gets up as `pool/<stem>+zombie`. Once: an
+  // evicted body that is rebuilt is still the same source.
+  bool known = false;
+  for (const MobSource& s : defFactory_->sources) known |= s.name == name;
+  if (!known) defFactory_->sources.push_back(src);
+  defs_[slot] = std::move(def);
+  say("mob: built pool body '" + name + "' (def " + std::to_string(slot) +
+      ", " + std::to_string(kDerivedDefs - RuntimeDefCount()) +
+      " runtime slots left, " + std::to_string(MicroBodyFreeWords(*microSet_)) +
+      " micro pool words free)\n");
+  return slot;
+}
+
+int MobSystem::TakeDefSlot() {
+  for (size_t i = loadedDefs_; i < defs_.size(); i++)
+    if (defs_[i].name.empty()) return (int)i;
+  // Inside the reserve only: a reallocation would move every MobDef a live
+  // body points at (see kDerivedDefs).
+  if (defs_.size() >= defs_.capacity()) return -1;
+  defs_.emplace_back();
+  defIdle_.resize(defs_.size(), 0);
   return (int)defs_.size() - 1;
+}
+
+uint32_t MobSystem::RuntimeDefCount() const {
+  uint32_t n = 0;
+  for (size_t i = loadedDefs_; i < defs_.size(); i++)
+    if (!defs_[i].name.empty()) n++;
+  return n;
+}
+
+uint32_t MobSystem::EvictUnusedDefs(int keep, uint32_t minIdleSweeps) {
+  if (defs_.size() <= loadedDefs_) return 0;
+  defIdle_.resize(defs_.size(), 0);
+  // THE CENSUS: which defs, and which brick records, something still holds.
+  // The same three populations BodyRegistry::AuditMicroModels walks.
+  std::vector<uint8_t> defHeld(defs_.size(), 0);
+  const size_t nModels = microSet_ ? microSet_->models.size() : 0;
+  std::vector<uint8_t> modelHeld(nModels, 0);
+  auto holdModel = [&](int64_t m) {
+    if (m >= 0 && (size_t)m < nModels) modelHeld[(size_t)m] = 1;
+  };
+  auto holdDef = [&](const MobDef* d) {
+    // By ADDRESS, not by defIndex_: an avatar's def need not index this list
+    // (Mob::defIndex_ is only meaningful for mobs_), and a pointer into defs_
+    // is exactly what an eviction would leave dangling.
+    if (d == nullptr || defs_.empty()) return;
+    if (d < defs_.data() || d >= defs_.data() + defs_.size()) return;
+    defHeld[(size_t)(d - defs_.data())] = 1;
+  };
+  auto holdMob = [&](const Mob& m) {
+    holdDef(m.def_);
+    for (const MobLimb& l : m.limbs_) holdModel(l.microModel);
+  };
+  for (const Mob& m : mobs_) holdMob(m);
+  for (const Mob* av : avatars_)
+    if (av != nullptr) holdMob(*av);
+  if (debris_ != nullptr) {
+    for (uint32_t i = 0; i < debris_->BodyCount(); i++) {
+      const uint32_t m = debris_->BodyMicroModel(i);
+      if (m != kMicroBodyNoModel) holdModel((int64_t)m);
+      const int di = debris_->BodyDefIndex(i);
+      if (di >= 0 && (size_t)di < defs_.size()) defHeld[(size_t)di] = 1;
+    }
+  }
+
+  uint32_t evicted = 0;
+  for (size_t i = loadedDefs_; i < defs_.size(); i++) {
+    MobDef& d = defs_[i];
+    if (d.name.empty()) continue;
+    bool held = defHeld[i] != 0 || (int)i == keep;
+    for (const MobLimbDef& ld : d.limbs)
+      if (ld.microModel >= 0 && (size_t)ld.microModel < nModels &&
+          modelHeld[(size_t)ld.microModel])
+        held = true;
+    if (held) {
+      defIdle_[i] = 0;
+      continue;
+    }
+    if (defIdle_[i] < 255) defIdle_[i]++;
+    if (defIdle_[i] < minIdleSweeps) continue;
+    if (microSet_ != nullptr)
+      for (const MobLimbDef& ld : d.limbs)
+        if (ld.microModel >= 0)
+          MicroBodyReleaseShared(*microSet_, (uint32_t)ld.microModel);
+    std::printf("mob: evicted unused def '%s' (slot %zu)\n", d.name.c_str(), i);
+    d = MobDef{};  // blank name = free slot (TakeDefSlot)
+    defIdle_[i] = 0;
+    if (i < pristine_.size()) pristine_[i].reset();
+    evicted++;
+  }
+  return evicted;
 }
 
 // ---- COMPOSING A CREATURE AT RUNTIME ---------------------------------------
@@ -2410,12 +2536,13 @@ int MobSystem::DefWithEffects(const std::string& base,
         "' + effects: no micro pool to pack the new body's bricks into\n");
     return -1;
   }
-  if (defs_.size() >= defs_.capacity()) {
+  int slot = TakeDefSlot();
+  if (slot < 0 && EvictUnusedDefs(baseAt) > 0) slot = TakeDefSlot();
+  if (slot < 0) {
     say("mob: refusing to compose from '" + base + "': all " +
         std::to_string(kDerivedDefs) +
-        " composed-def slots are spent. Every distinct (creature, effects) "
-        "pair costs one for the session; something is asking for new ones "
-        "without repeating.\n");
+        " runtime def slots hold a creature something is still using. Every "
+        "distinct (creature, effects) pair alive at once costs one.\n");
     return -1;
   }
   const MobDefFactory& fac = *defFactory_;
@@ -2440,18 +2567,26 @@ int MobSystem::DefWithEffects(const std::string& base,
     return -1;
   }
   MobDef def;
-  if (!BuildMobDef(fac, virt, j, *microSet_, def, buildLog)) {
+  bool built = BuildMobDef(fac, virt, j, *microSet_, def, buildLog);
+  // Same retry PoolDef makes: a refused pack is room, and room is what the
+  // unheld runtime defs are holding.
+  if (!built && EvictUnusedDefs(slot) > 0) {
+    def = MobDef{};
+    built = BuildMobDef(fac, virt, j, *microSet_, def, buildLog);
+  }
+  if (!built) {
     say(buildLog + "mob: '" + virt.name + "' did not build\n");
     return -1;
   }
   if (!buildLog.empty()) say(buildLog);
   say("mob: composed '" + def.name + "' (" + std::to_string(def.limbs.size()) +
-      " limbs, def " + std::to_string(defs_.size()) + ", " +
-      std::to_string(defs_.capacity() - defs_.size() - 1) + " slots left)\n");
-  defs_.push_back(std::move(def));
-  // The reserve in SetDefs is what makes this an append and not a move, so
-  // nothing needs re-seating here — but say so if it ever stops being true.
-  return (int)defs_.size() - 1;
+      " limbs, def " + std::to_string(slot) + ", " +
+      std::to_string(kDerivedDefs - RuntimeDefCount() - 1) +
+      " runtime slots left)\n");
+  // The reserve in SetDefs is what makes a new slot an append and not a move,
+  // and a reused slot is an assignment in place, so nothing needs re-seating.
+  defs_[slot] = std::move(def);
+  return slot;
 }
 
 void MobSystem::BookRising(PendingRise r) {
@@ -3697,6 +3832,8 @@ bool MobSystem::UnwearItem(uint64_t mobId, int equipSlot) {
 
 uint64_t MobSystem::Spawn(int defIndex, IVec3 atVoxel) {
   if (defIndex < 0 || defIndex >= (int)defs_.size()) return 0;
+  // An evicted runtime slot (EvictUnusedDefs): a stale index, not a creature.
+  if (defs_[defIndex].name.empty()) return 0;
   // THE LIVING cap: a corpse does not hold a spawn slot (kMaxDeadMobs is its).
   // `spawnDead_`: LoadOne is standing a saved CORPSE back up, which the living
   // cap does not govern (MOBS v6; the dead cap decays the oldest instead).
@@ -6796,6 +6933,9 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // on the risen lattice). Outside every loop over mobs_: this spawns, and a
   // spawn pushes to the vector those loops walk by index.
   ServiceRisings(tick);
+  // Runtime defs nothing has held for kDefIdleSweeps sweeps give their bricks
+  // back (EvictUnusedDefs). After the risings, which may have composed.
+  if (tick % kDefSweepTicks == 0) EvictUnusedDefs(-1, kDefIdleSweeps);
   // Per-voxel burning and dissolution, once per TICK — never per frame. The
   // pass writes fire into the hashed grid, so running it off the render clock
   // would make the world a function of frame rate.
@@ -20132,7 +20272,15 @@ uint32_t Mob::AppendInstances(std::vector<BodyVoxInst>& out, uint32_t slotBase) 
     // twice, at the wrong size (cube instances are one WORLD voxel each).
     // The slot is still consumed: slots are shared with the micro pass.
     // Hidden limbs (first-person body suppression) also consume theirs.
-    if (limb.microModel >= 0 || LimbHidden((int)i)) {
+    //
+    // AND SO DOES A FINE-COLLIDER LIMB THAT HAS LOST ITS BRICK. The cube path
+    // is only the right size when the collider lattice IS the world lattice
+    // (physScale 1); at physScale > 1 it draws every collider voxel a whole
+    // world voxel wide — a limb several times its size, in raw anatomy
+    // materials. Not drawing it is the honest failure: the body still
+    // collides, bleeds and dies, and BuildMobDef's all-or-nothing pack is
+    // what keeps this from being reachable in the first place.
+    if (limb.microModel >= 0 || LimbHidden((int)i) || PhysScaleOf(limb) > 1) {
       slot++;
       continue;
     }

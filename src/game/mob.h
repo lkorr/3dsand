@@ -4517,7 +4517,8 @@ class MobSystem {
   // first time something names it `pool/<stem>` -- PoolDef, reached through
   // FindOrComposeDef and DefWithEffects -- which is also how a save, a network
   // peer and a hot reload get the same body back: by name, like every def.
-  // Each one built spends one of the kDerivedDefs slots for the session.
+  // Each one built holds one of the kDerivedDefs slots, and its bricks, until
+  // nothing holds it any more (EvictUnusedDefs, below).
   static constexpr const char* kPoolPrefix = "pool/";
   static bool IsPoolName(const std::string& name) {
     return name.rfind(kPoolPrefix, 0) == 0 && name.find('+') == std::string::npos;
@@ -4529,6 +4530,41 @@ class MobSystem {
   // Every `pool/<stem>` on disk, sorted. Read fresh on each call: it is a
   // directory listing behind a button, not a per-tick path.
   std::vector<std::string> PoolNames() const;
+
+  // ---- RUNTIME DEFS ARE A CACHE, NOT A LEDGER (2026-09-25) ------------------
+  //
+  // Every def built after the load — a pool body (PoolDef) or a composition
+  // (DefWithEffects) — packs its own limb bricks into the shared micro pool.
+  // They used to stay for the session. The twenty pool bodies are ~1.3M words
+  // and ~600 records, against what was a 2M-word pool and a 1024-record table
+  // that the load and every live gore clone also draw on, so about a dozen random
+  // humans in, the next def's limbs did not pack — and a limb with no brick
+  // was drawn by the cube path several times its size (owner report
+  // 2026-09-25: "deformed abominations"). BuildMobDef now refuses a def it
+  // cannot pack whole; this is what keeps it from having to.
+  //
+  // A runtime def is EVICTED — its bricks and records returned, its slot
+  // blanked for reuse — once NOTHING holds it: no mob or corpse whose def it
+  // is, no avatar, no debris body carrying it as `defIndex`, and no limb
+  // anywhere (mob, avatar or debris) still drawing one of its bricks. The
+  // census is the same three populations BodyRegistry::AuditMicroModels
+  // walks. Nothing is lost by evicting: a def is a pure function of its NAME
+  // (FindOrComposeDef), so the next thing that asks for it rebuilds it.
+  //
+  // Two callers. PreTick sweeps every kDefSweepTicks and evicts a def only
+  // after kDefIdleSweeps consecutive unheld sweeps, so a def built one line
+  // before its creature is spawned is never taken out from under it. A build
+  // that finds no slot or no pool room evicts every unheld runtime def at
+  // once (minIdleSweeps 0) and tries again, sparing `keep`.
+  //
+  // Returns how many defs were evicted. Stock defs (the load) never are.
+  uint32_t EvictUnusedDefs(int keep = -1, uint32_t minIdleSweeps = 0);
+  // Runtime def slots currently holding a def (not evicted).
+  uint32_t RuntimeDefCount() const;
+  // How many defs the LOAD produced; everything past this index is runtime.
+  size_t LoadedDefCount() const { return loadedDefs_; }
+  static constexpr uint32_t kDefSweepTicks = 60;
+  static constexpr uint32_t kDefIdleSweeps = 2;
 
   // ---- BECOMING SOMETHING ELSE ---------------------------------------------
   //
@@ -4547,10 +4583,10 @@ class MobSystem {
   //      (sidecar::LoadWithEffects), build it through the same BuildMobDef
   //      every file goes through, and append it as `<base>+<fx>`.
   //
-  // A composed def costs one entry in the shared micro pool per limb and never
-  // goes away, so the number of them in a session is CAPPED (kDerivedDefs);
-  // past the cap the call fails and says so rather than growing the pool
-  // without bound. Deduplication by recipe is what keeps the cap generous: a
+  // A composed def costs one entry in the shared micro pool per limb for as
+  // long as anything holds it (EvictUnusedDefs), and the number alive at once
+  // is CAPPED (kDerivedDefs); past the cap, with nothing unheld to evict, the
+  // call fails and says so rather than growing the pool without bound. Deduplication by recipe is what keeps the cap generous: a
   // hundred villagers turning cost one def, not a hundred.
   int DefWithEffects(const std::string& base,
                      const std::vector<std::string>& fx, std::string* log);
@@ -5276,8 +5312,9 @@ class MobSystem {
   // ---- THE PRISTINE REFERENCE --------------------------------------------
   // One def limb exactly as BuildRig authors it (BuildAuthoredLattice + the
   // rig's anchor). Built lazily per def on the first save that asks, cached
-  // for the def's life, dropped by SetDefs (defs are immutable in between:
-  // the only other writer is FindOrComposeDef's reserved append). Derived
+  // for the def's life, dropped by SetDefs and by EvictUnusedDefs for the slot
+  // it blanks (defs are immutable in between: the only other writers are
+  // FindOrComposeDef's reserved append and that eviction). Derived
   // data — never saved.
   struct PristineLimb {
     std::vector<DebrisVoxel> voxels;
@@ -6604,7 +6641,15 @@ class MobSystem {
   // front, and DefWithEffects refuses once that room is gone. A composed def
   // is therefore an append that moves nothing — which is also what lets one
   // turn mid-tick while the creature turning is standing in the middle of it.
+  // An EVICTED runtime def is not erased (that would move its neighbours); its
+  // slot is blanked (empty name) and TakeDefSlot hands it to the next build.
   static constexpr size_t kDerivedDefs = 64;
+  // defs_.size() right after SetDefs: the stock/runtime boundary.
+  size_t loadedDefs_ = 0;
+  // Per def: consecutive PreTick sweeps it was found unheld (runtime only).
+  std::vector<uint8_t> defIdle_;
+  // A blanked runtime slot, else a fresh one inside the reserve; -1 if none.
+  int TakeDefSlot();
   // One booked rising. The dead Mob it names still holds everything the
   // risen creature needs — lattices, pose, gear, pack — so the booking is
   // only WHO, WHAT INTO, WHEN and WHOSE.

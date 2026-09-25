@@ -4536,9 +4536,11 @@ neighbors, so this needs an explicit connectivity pass:
   index exactly one body holds; `MicroBodyEdit` rewrites that block from the
   surviving voxels and re-derives the dims, so a body that lost half its mass
   draws a smaller OBB instead of marching through air. Freed blocks return to
-  an exact-size free list (no coalescing: a compaction would have to rewrite
-  every live `base` while the GPU may still be reading last frame's upload, and
-  a body re-carving its own block reuses it in place anyway). `blockWords`
+  a free-RANGE list (`freeRanges`: best-fit, split on allocation, merged with
+  free neighbours on free — since 2026-09-25; it was exact-size until runtime
+  defs started freeing whole bodies of odd-sized bricks, see "A random human").
+  Never COMPACTED: a compaction would have to rewrite every live `base` while
+  the GPU may still be reading last frame's upload. `blockWords`
   tracks the reserved size separately from the dims precisely because shrinking
   reuses the block — freeing by dims would leak the surplus. Every body
   teardown routes through `DebrisSystem::ReleaseBody` so a culled, settled,
@@ -6392,6 +6394,25 @@ and rolls weapon, outfit, dye and behaviour off the tick (`session.cpp`). The
 exact stock colours matter: every loaded body merges into one 255-entry art
 palette, and the whole pool adds 57 colours where jittered ones would add ~12
 per body.
+
+**Runtime defs are a cache, not a ledger** (2026-09-25, `MobSystem::
+EvictUnusedDefs`, gate `pool-evict`). A pool body or a composition packs its own
+limb bricks — the 20 pool bodies are ~1.3M words and ~600 records — and those
+used to stay for the session. About a dozen random humans in, the next def's
+limbs did not pack, and a limb with no brick fell to the cube path, which draws
+every collider voxel a whole world voxel wide: limbs several times their size
+in raw anatomy colours. Three rules now: `BuildMobDef` packs a def WHOLE or
+not at all (releasing what it packed); a fine-collider limb with no brick is
+never drawn by the cube path (mob or debris); and a runtime def that nothing
+holds — no mob or corpse whose `def_` it is, no avatar, no debris body carrying
+it as `defIndex`, no limb anywhere drawing one of its bricks — is evicted: its
+shared bricks go back through `MicroBodyReleaseShared`, its slot is blanked
+(empty name) and reused by the next build, which never reallocates `defs_`.
+`PreTick` sweeps every 60 ticks with a two-sweep grace; a build that finds no
+slot or no pool room evicts every unheld runtime def at once and retries.
+Nothing is lost: the name rebuilds the def. Ceilings were raised with it
+(`kMaxMicroBodyModels` 2048, `kMicroBodyPoolWordsWorld` 4 MiW) because 16 live
+creatures plus 12 corpses can hold every pool body at once.
 
 **And a body that dies with the rot in it gets up.** Sidecar `turn`
 (`{into, afterSec, infectedLimbs}`, on the human and inherited by every

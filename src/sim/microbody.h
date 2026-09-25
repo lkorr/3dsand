@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -151,18 +152,22 @@ static_assert(sizeof(MicroBodyInstGpu) == 16,
 // The pool plus the per-model records.
 //
 // Two populations share one pool. **Shared** models are packed at mob-def load
-// (or on first sphere spawn), indexed by every instance of that def, and never
-// freed. **Owned** models are copy-on-write clones created the first time a
-// particular BODY is damaged — from then on that body has its own payload and
-// edits are local to it (MicroBodyOwn / MicroBodyEdit below).
+// (or on first sphere spawn, or when a runtime def is built), indexed by every
+// instance of that def, and freed only by MicroBodyReleaseShared once nothing
+// holds them (MobSystem's runtime-def eviction). **Owned** models are
+// copy-on-write clones created the first time a particular BODY is damaged —
+// from then on that body has its own payload and edits are local to it
+// (MicroBodyOwn / MicroBodyEdit below).
 //
-// Freed owned blocks return to `freeList` keyed by word count and are reused
-// verbatim, which is what keeps "shoot the same sphere for ten minutes" from
-// walking the pool's high-water mark to the ceiling. Blocks are never
-// coalesced or compacted: a compaction would have to rewrite every live
-// model's `base` while the GPU may still be reading last frame's upload, and
-// exact-size reuse already handles the dominant case (a body re-editing its
-// own block in place, which does not reallocate at all).
+// FREED WORDS ARE RANGES, split on allocation and merged on free (2026-09-25).
+// Until then the free list was keyed by EXACT word count, which was enough for
+// the case it was written for (a body re-editing its own block) and useless for
+// the one that arrived with the random-human pool: every pool body is a new
+// def packing ~66k words of limbs at a size no other body shares, so freeing
+// one body's bricks made no room for the next and the high-water mark climbed
+// to the ceiling anyway. Still never COMPACTED: a compaction would have to
+// rewrite every live model's `base` while the GPU may still be reading last
+// frame's upload. Splitting and merging never moves a live block.
 struct MicroBodySet {
   std::vector<MicroBodyModelGpu> models;
   std::vector<uint32_t> pool;
@@ -174,8 +179,9 @@ struct MicroBodySet {
   // the block stays the size it was allocated at and must be freed at that
   // size or the surplus leaks out of the pool permanently.
   std::vector<uint32_t> blockWords;
-  // word count -> list of free block bases of exactly that size.
-  std::vector<std::pair<uint32_t, std::vector<uint32_t>>> freeList;
+  // Free word ranges below the high-water mark `pool.size()`: base -> words,
+  // never adjacent (PoolFree merges neighbours). Best-fit on allocation.
+  std::map<uint32_t, uint32_t> freeRanges;
   // Retired owned model records, reusable so a long fight does not exhaust
   // kMaxMicroBodyModels even though the pool words are recycled.
   std::vector<uint32_t> freeModels;
@@ -425,6 +431,20 @@ constexpr uint32_t kMicroBodyDimsMask = 0x3FFFFFFFu;
 // Safe (no-op) on shared models and on kMicroBodyNoModel, so body teardown can
 // call it blindly.
 void MicroBodyFree(MicroBodySet& set, uint32_t model);
+
+// Returns a SHARED model's words and record, which MicroBodyFree refuses to
+// touch. The caller is asserting that NOTHING holds `model` any more — no def,
+// no mob or avatar limb, no debris body — and the only caller entitled to say
+// so is the one that has just counted: MobSystem's runtime-def eviction and
+// BuildMobDef's all-or-nothing unwind of a def that never entered the list.
+// No-op on an owned model (that is MicroBodyFree's) and on a bad index.
+void MicroBodyReleaseShared(MicroBodySet& set, uint32_t model);
+
+// Words a new block could still take: never-used room above the high-water
+// mark plus every free range below it. `largest` receives the biggest single
+// block that would fit right now, which is the number that decides whether a
+// limb packs — a fragmented pool can have room in total and none in one piece.
+uint32_t MicroBodyFreeWords(const MicroBodySet& set, uint32_t* largest = nullptr);
 
 // ---- WHO HOLDS A BRICK RECORD (the aliasing audit) --------------------------
 //

@@ -6696,6 +6696,11 @@ void DebrisSystem::BuildInstances(std::vector<BodyVoxInst>& out) {
     // OWN their slot (the two passes share bodyXforms), they just contribute
     // no cube instances — emitting both would double-draw at the wrong size.
     if (bodies_[bi].micro.Valid()) continue;
+    // A body whose collider is FINER than the world lattice and has no brick
+    // (a limb adopted from a creature whose pack was refused) is not drawn:
+    // the cube path would put each collider voxel a whole world voxel wide.
+    // Mob::AppendInstances makes the same call for the limb before it falls.
+    if (bodies_[bi].physScale > 1) continue;
     Body& b = bodies_[bi];
     sourceVoxels += (uint32_t)b.voxels.size();
     if (BodyDrawAllVoxels()) {

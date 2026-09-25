@@ -12862,10 +12862,13 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
   }
 
   // ---- B + C ----------------------------------------------------------------
-  const size_t before = c.mobs.Defs().size();
+  // RuntimeDefCount, not Defs().size(): an evicted runtime slot is REUSED
+  // (MobSystem::EvictUnusedDefs), so the vector's length is not what a build
+  // costs any more.
+  const size_t before = c.mobs.RuntimeDefCount();
   const int fi = c.mobs.FindOrComposeDef(fem);
   const int mi = c.mobs.FindOrComposeDef(mal);
-  const size_t afterBuild = c.mobs.Defs().size();
+  const size_t afterBuild = c.mobs.RuntimeDefCount();
   bool built = fi >= 0 && mi >= 0 && afterBuild == before + 2;
   std::string builtWhy;
   for (const int di : {fi, mi}) {
@@ -12883,7 +12886,7 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
   }
   const bool cached = c.mobs.FindOrComposeDef(fem) == fi &&
                       c.mobs.PoolDef(mal, nullptr) == mi &&
-                      c.mobs.Defs().size() == afterBuild;
+                      c.mobs.RuntimeDefCount() == afterBuild;
 
   // ---- D ----------------------------------------------------------------------
   int relief = 0;
@@ -12900,11 +12903,11 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
                       c.mobs.Defs()[zi].name == fem + "+zombie";
 
   // ---- F ----------------------------------------------------------------------
-  const size_t beforeBad = c.mobs.Defs().size();
+  const size_t beforeBad = c.mobs.RuntimeDefCount();
   const bool refused = c.mobs.FindOrComposeDef("pool/no_such_body") < 0 &&
                        c.mobs.PoolDef("pool/../human", nullptr) < 0 &&
                        c.mobs.PoolDef("pool/", nullptr) < 0 &&
-                       c.mobs.Defs().size() == beforeBad;
+                       c.mobs.RuntimeDefCount() == beforeBad;
 
   // ---- G ----------------------------------------------------------------------
   const size_t art = c.mobs.MicroSet() ? c.mobs.MicroSet()->artColors.size() : 0;
@@ -12917,6 +12920,169 @@ Status GatePoolHuman(Ctx& c, std::string& detail) {
                   builtWhy.c_str(), cached ? "ok" : "FAIL",
                   spawned ? "ok" : "FAIL", fem.c_str(), zombie ? "ok" : "FAIL",
                   refused ? "ok" : "FAIL", art, (int)kArtPaletteSlotsGpu);
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- pool-evict: a random human gives its bricks back ------------------------
+//
+// Owner report 2026-09-25: after about a dozen "random human" spawns every
+// further one came out with limbs many times their size in raw anatomy
+// colours. Each pool body is a runtime def whose limb bricks were packed into
+// the shared micro pool and kept for the session; once the pool or the model
+// table ran out, a limb packed no brick and the cube path drew it at collider
+// scale. Three things changed, and this gate holds each:
+//   A EVERY pool body builds and packs WHOLE while all of them are held at
+//     once -- the living cap's worth alive, the rest killed so they lie as
+//     corpses, the oldest corpses decayed to debris (every holder population
+//     EvictUnusedDefs counts);
+//   B nothing held is evicted: an eviction with no grace in the middle of A
+//     takes nothing;
+//   C once nothing holds them the PreTick sweep takes them after its grace
+//     (kDefIdleSweeps sweeps, not one), and the pool's free words and live
+//     records return to exactly what they were before A;
+//   D a second full wave rebuilds every body by name into the REUSED slots
+//     (the def vector does not grow), packs whole again, and gives it all back
+//     again -- the leak test.
+// Counts and def reads, no ticks.
+Status GatePoolEvict(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  MicroBodySet* set = c.mobs.MicroSet();
+  const std::vector<std::string> names = c.mobs.PoolNames();
+  const int hi = c.mobs.FindDef("human");
+  if (set == nullptr || names.size() < 2 || hi < 0) {
+    detail = Format("no micro set / pool (%zu bodies) / human def",
+                    names.size());
+    return Status::Fail;
+  }
+  // Limbs of the stock human with no brick (a rig may have art-less limbs):
+  // what "packed whole" is measured against.
+  int humanBare = 0;
+  for (const MobLimbDef& ld : c.mobs.Defs()[hi].limbs)
+    if (ld.microModel < 0) humanBare++;
+
+  // Whatever earlier gates left unheld goes first, so the baseline is the load.
+  c.mobs.EvictUnusedDefs();
+  auto liveRecords = [&]() {
+    return set->models.size() - set->freeModels.size();
+  };
+  const uint32_t words0 = MicroBodyFreeWords(*set);
+  const size_t rec0 = liveRecords();
+  const uint32_t runtime0 = c.mobs.RuntimeDefCount();
+
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+
+  struct Wave {
+    int built = 0, spawned = 0, partial = 0, killed = 0;
+    uint32_t heldEvicted = 0;  // B: must stay 0
+    uint32_t debrisHolders = 0;
+    uint32_t minFree = 0xFFFFFFFFu;
+    std::string why;
+  };
+  auto wave = [&](Wave& w) {
+    std::vector<uint64_t> living;
+    for (size_t k = 0; k < names.size(); k++) {
+      const int di = c.mobs.FindOrComposeDef(names[k]);
+      if (di < 0) {
+        if (w.why.empty()) w.why = names[k] + " did not build";
+        continue;
+      }
+      w.built++;
+      int bare = 0;
+      for (const MobLimbDef& ld : c.mobs.Defs()[di].limbs)
+        if (ld.microModel < 0) bare++;
+      if (bare != humanBare) {
+        w.partial++;
+        if (w.why.empty())
+          w.why = Format("%s has %d brickless limbs (human %d)",
+                         names[k].c_str(), bare, humanBare);
+      }
+      // The living cap is 16: the oldest living one dies to make room and
+      // stays a holder as a corpse (and, past the dead cap, as debris).
+      while (!c.mobs.HasRoomToSpawn() && !living.empty()) {
+        if (Mob* m = c.mobs.FindMobById(living.front())) {
+          m->Die();
+          w.killed++;
+        }
+        living.erase(living.begin());
+      }
+      const int x = spot.x + (int)(k % 5) * 12 - 24;
+      const int z = spot.z + (int)(k / 5) * 12 - 24;
+      const uint64_t id = c.mobs.Spawn(
+          di, {x, World::TerrainHeight(x, z, kDefaultSeed) + 1, z});
+      if (id != 0) {
+        w.spawned++;
+        living.push_back(id);
+      } else if (w.why.empty()) {
+        w.why = names[k] + " did not spawn";
+      }
+      w.minFree = std::min(w.minFree, MicroBodyFreeWords(*set));
+      // B, asked of every step: everything built so far is held by somebody.
+      w.heldEvicted += c.mobs.EvictUnusedDefs();
+    }
+    for (uint32_t i = 0; i < c.debris.BodyCount(); i++)
+      if (c.debris.BodyDefIndex(i) >= (int)c.mobs.LoadedDefCount())
+        w.debrisHolders++;
+  };
+  // C: nothing holds them now; the sweep's grace, then the sweep.
+  struct Drain {
+    uint32_t firstSweep = 0, secondSweep = 0, runtimeLeft = 0;
+    uint32_t words = 0;
+    size_t records = 0;
+  };
+  auto drain = [&](Drain& d) {
+    c.mobs.Reset();
+    c.debris.Reset();
+    d.firstSweep = c.mobs.EvictUnusedDefs(-1, MobSystem::kDefIdleSweeps);
+    d.secondSweep = c.mobs.EvictUnusedDefs(-1, MobSystem::kDefIdleSweeps);
+    d.runtimeLeft = c.mobs.RuntimeDefCount();
+    d.words = MicroBodyFreeWords(*set);
+    d.records = liveRecords();
+  };
+
+  Wave w1, w2;
+  Drain d1, d2;
+  wave(w1);
+  const size_t defsAfterW1 = c.mobs.Defs().size();
+  drain(d1);
+  wave(w2);
+  const size_t defsAfterW2 = c.mobs.Defs().size();
+  drain(d2);
+
+  const int n = (int)names.size();
+  auto waveOk = [&](const Wave& w) {
+    return w.built == n && w.spawned == n && w.partial == 0 && w.heldEvicted == 0;
+  };
+  auto drainOk = [&](const Drain& d) {
+    return d.firstSweep == 0 && d.secondSweep >= (uint32_t)n &&
+           d.runtimeLeft == runtime0 && d.words == words0 && d.records == rec0;
+  };
+  const bool reused = defsAfterW2 == defsAfterW1;
+  const bool ok = waveOk(w1) && waveOk(w2) && drainOk(d1) && drainOk(d2) &&
+                  reused && w1.killed > 0;
+  auto waveStr = [&](const Wave& w) {
+    return Format("built %d/%d spawned %d partial %d killed %d debris-held %u "
+                  "held-evicted %u min free %u",
+                  w.built, n, w.spawned, w.partial, w.killed, w.debrisHolders,
+                  w.heldEvicted, w.minFree);
+  };
+  auto drainStr = [&](const Drain& d) {
+    return Format("sweeps %u then %u, runtime left %u/%u, free words %u/%u, "
+                  "records %zu/%zu",
+                  d.firstSweep, d.secondSweep, d.runtimeLeft, runtime0, d.words,
+                  words0, d.records, rec0);
+  };
+  detail = Format("A %s | C %s | D %s, defs %zu->%zu%s | C' %s%s%s",
+                  waveStr(w1).c_str(), drainStr(d1).c_str(),
+                  waveStr(w2).c_str(), defsAfterW1, defsAfterW2,
+                  reused ? "" : " (GREW)", drainStr(d2).c_str(),
+                  w1.why.empty() && w2.why.empty() ? "" : " | first fault: ",
+                  (w1.why.empty() ? w2.why : w1.why).c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -14071,6 +14237,10 @@ const std::vector<Gate>& MobGates() {
       // cached, spawned, composed with an effect; bad names refused. Counts
       // and def reads, no ticks.
       {"pool-human", "mob", {}, false, GatePoolHuman, /*needsRender=*/false},
+      // ...and gives its bricks back: every pool body held at once packs
+      // whole, and once nothing holds them the sweep returns every word and
+      // record, twice over. Counts and def reads, no ticks.
+      {"pool-evict", "mob", {}, false, GatePoolEvict, /*needsRender=*/false},
       // THE PACK: a creature carries things that are not on its body, they
       // fall with it, you can loot them, and a body that turns takes them with
       // it. Authors its own two-row loot table over a copy of the def list and

@@ -921,6 +921,11 @@ class DebrisSystem {
   uint32_t BodyMicroModel(uint32_t i) const {
     return i < bodies_.size() ? bodies_[i].micro.model : kMicroBodyNoModel;
   }
+  // The creature def this body was part of (Body::defIndex), -1 for matter
+  // that never lived. MobSystem::EvictUnusedDefs counts it as a holder.
+  int BodyDefIndex(uint32_t i) const {
+    return i < bodies_.size() ? bodies_[i].defIndex : -1;
+  }
   // ---- corpse ground, for a gate that has to say WHY a body fell ----------
   // Of the chunks ManageTerrain wanted on its last sweep: how many carry a
   // collision mesh, how many are still waiting on their chunk fetch, and how

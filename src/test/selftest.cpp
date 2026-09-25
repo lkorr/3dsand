@@ -878,6 +878,9 @@ const char* const kOrder[] = {
     // Builds pool bodies into the def list for the rest of the session, so
     // late: nothing after it counts defs.
     "pool-human",
+    // Right after it: spawns every pool body, kills and resets them, and
+    // evicts every unheld runtime def -- so nothing after it counts defs.
+    "pool-evict",
     "snapshot-latency",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every

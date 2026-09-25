@@ -2,9 +2,16 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <iterator>
 #include <unordered_set>
 
 namespace {
+
+size_t FreeRangeWords(const MicroBodySet& set) {
+  size_t n = 0;
+  for (const auto& [base, w] : set.freeRanges) n += w;
+  return n;
+}
 
 // Say out loud that a ceiling refused, without ever becoming a flood.
 //
@@ -25,12 +32,13 @@ void NoteRefusal(MicroBodySet& set, const char* what) {
   for (uint8_t o : set.owned) owned += o ? 1u : 0u;
   std::fprintf(stderr,
                "micro body: %s REFUSED (%u so far) — %zu/%u model records "
-               "(%u owned, %zu retired), %zu/%u pool words. Damaged bodies "
+               "(%u owned, %zu retired), %zu/%u pool words (%zu of them in "
+               "free ranges). Damaged bodies "
                "keep a stale skin: carves, char and blood stop showing until "
                "corpses are culled.\n",
                what, n, set.models.size(), kMaxMicroBodyModels, owned,
                set.freeModels.size(), set.pool.size(),
-               kMicroBodyPoolWordsWorld);
+               kMicroBodyPoolWordsWorld, FreeRangeWords(set));
 }
 
 // Word count for a brick of `cellCount` micro voxels (2 per word).
@@ -74,21 +82,28 @@ inline uint8_t StainByteOf(const MicroBodySet& set, uint16_t coat) {
   return (uint8_t)((slot << 4) | (amt & 0xFu));
 }
 
-// Take `words` from the free list if an exact-size block is waiting, else bump
-// the pool's high-water mark. Returns UINT32_MAX when the ceiling is hit.
+// Take `words` from the best-fitting free range (the smallest one that holds
+// it, so large holes stay large for the next body), else bump the pool's
+// high-water mark. Returns UINT32_MAX when the ceiling is hit.
 //
-// Exact-size only, deliberately: splitting a larger block leaves a remainder
-// that nothing can use without a real allocator, and the reuse case that
-// actually matters (a body re-editing at the same or smaller dims) is exact by
-// construction because MicroBodyEdit reuses the block in place when it fits.
+// A range larger than the request is SPLIT: the block takes its front and the
+// tail stays free. That remainder used to be the reason this allocator was
+// exact-size only ("nothing can use it without a real allocator"); PoolFree's
+// merge is what makes it usable — freed next to its neighbour, it rejoins it.
 uint32_t PoolAlloc(MicroBodySet& set, size_t words) {
   if (words == 0) return UINT32_MAX;
-  for (auto& [sz, blocks] : set.freeList) {
-    if (sz == words && !blocks.empty()) {
-      uint32_t base = blocks.back();
-      blocks.pop_back();
-      return base;
-    }
+  auto best = set.freeRanges.end();
+  for (auto it = set.freeRanges.begin(); it != set.freeRanges.end(); ++it) {
+    if (it->second < words) continue;
+    if (best == set.freeRanges.end() || it->second < best->second) best = it;
+    if (best->second == words) break;  // exact: nothing fits better
+  }
+  if (best != set.freeRanges.end()) {
+    const uint32_t base = best->first;
+    const uint32_t left = best->second - (uint32_t)words;
+    set.freeRanges.erase(best);
+    if (left) set.freeRanges.emplace(base + (uint32_t)words, left);
+    return base;
   }
   if (set.pool.size() + words > kMicroBodyPoolWordsWorld) return UINT32_MAX;
   uint32_t base = (uint32_t)set.pool.size();
@@ -96,15 +111,26 @@ uint32_t PoolAlloc(MicroBodySet& set, size_t words) {
   return base;
 }
 
+// Returns [base, base+words) and merges it with a free neighbour on either
+// side, so a body's thirty limb blocks freed one by one become one hole the
+// next body's torso fits in.
 void PoolFree(MicroBodySet& set, uint32_t base, size_t words) {
-  if (words == 0) return;
-  for (auto& [sz, blocks] : set.freeList) {
-    if (sz == words) {
-      blocks.push_back(base);
-      return;
+  if (words == 0 || base == kMicroBodyNoModel) return;
+  uint32_t lo = base, n = (uint32_t)words;
+  auto next = set.freeRanges.lower_bound(lo);
+  if (next != set.freeRanges.begin()) {
+    auto prev = std::prev(next);
+    if (prev->first + prev->second == lo) {
+      lo = prev->first;
+      n += prev->second;
+      set.freeRanges.erase(prev);
     }
   }
-  set.freeList.push_back({(uint32_t)words, {base}});
+  if (next != set.freeRanges.end() && lo + n == next->first) {
+    n += next->second;
+    set.freeRanges.erase(next);
+  }
+  set.freeRanges.emplace(lo, n);
 }
 
 // Flatten `voxels` into the pool block at `base`, 2 packed 16-bit micro voxels
@@ -636,4 +662,32 @@ void MicroBodyFree(MicroBodySet& set, uint32_t model) {
   set.owned[model] = 0;
   set.freeModels.push_back(model);
   set.dirty = true;
+}
+
+void MicroBodyReleaseShared(MicroBodySet& set, uint32_t model) {
+  if (model >= set.models.size()) return;
+  set.owned.resize(set.models.size(), 0);
+  set.blockWords.resize(set.models.size(), 0);
+  if (set.owned[model]) return;  // owned: MicroBodyFree's, and its holder's
+  MicroBodyModelGpu& m = set.models[model];
+  if ((m.dims & kMicroBodyDimsMask) == 0) return;  // already released
+  PoolFree(set, m.base, set.blockWords[model]);
+  set.blockWords[model] = 0;
+  m.base = kMicroBodyNoModel;
+  m.dims = 0;
+  set.freeModels.push_back(model);
+  set.dirty = true;
+}
+
+uint32_t MicroBodyFreeWords(const MicroBodySet& set, uint32_t* largest) {
+  const uint32_t top = kMicroBodyPoolWordsWorld > set.pool.size()
+                           ? kMicroBodyPoolWordsWorld - (uint32_t)set.pool.size()
+                           : 0u;
+  uint32_t total = top, big = top;
+  for (const auto& [base, n] : set.freeRanges) {
+    total += n;
+    big = std::max(big, n);
+  }
+  if (largest) *largest = big;
+  return total;
 }

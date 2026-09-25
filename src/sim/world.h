@@ -2038,7 +2038,14 @@ constexpr uint32_t kMicroPoolWordsWorld = 1u << 20;
 // — about 1.5x — so the ~350 clones a fight's worth of corpses and bloodied
 // creatures can hold live run to ~800k. At 1 MiW the pool would have become the
 // new "gore stopped working" the moment the table stopped being it.
-constexpr uint32_t kMicroBodyPoolWordsWorld = 2u << 20;
+// 4 MiW = 16 MiB since 2026-09-25, for the random-human pool: its 20 bodies
+// are 1.29M words of SHARED bricks, and up to kMaxMobs live creatures plus
+// kMaxDeadMobs corpses (28) can hold all of them at once on top of the load
+// (~0.5M) and the fight's clones (~0.8M, above). Unheld bodies are evicted
+// (MobSystem::EvictUnusedDefs), so this is sized to what can be ALIVE, not to
+// what a session has ever spawned. Changing it misses the SPIR-V cache once
+// (MICRO_BODY_POOL_WORDS is in the constant prelude).
+constexpr uint32_t kMicroBodyPoolWordsWorld = 4u << 20;
 // ---- THE MODEL TABLE IS SHARED RECORDS **PLUS** EVERY OWNED CLONE ----------
 //
 // Two populations, and sizing this to the first one is the bug it shipped with
@@ -2070,7 +2077,11 @@ constexpr uint32_t kMicroBodyPoolWordsWorld = 2u << 20;
 // refusal is no longer SILENT (MicroBodySet::refusals) — a cap whose only
 // symptom is "gore quietly stopped working" is a cap nobody can diagnose.
 static_assert(kMaxBodySlots <= 512, "micro-body model ceiling derived below");
-constexpr uint32_t kMaxMicroBodyModels = 1024;
+// 2048 since 2026-09-25: the random-human pool made SHARED records a runtime
+// population too -- every pool body built is ~30 more, held until nothing uses
+// it (MobSystem::EvictUnusedDefs) -- so the table now has to cover the load,
+// the pool bodies alive at once AND the owned clones their fights make. 32 KiB.
+constexpr uint32_t kMaxMicroBodyModels = 2048;
 // A micro body's model has no micro model when its slot maps here.
 constexpr uint32_t kMicroBodyNoModel = 0xFFFFFFFFu;
 
