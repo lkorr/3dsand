@@ -80,6 +80,7 @@ const TUNING_SCHEMA = [
       {k:'airAccel', n:'air control', d:'Steering authority while airborne. Low means jumps are committed.', min:0, max:60, step:0.1, u:'/s'},
       {k:'coyoteTime', n:'coyote time', d:'A jump stays legal for this long after walking off a ledge.', min:0, max:0.5, step:0.01, u:'s'},
       {k:'jumpBufferTime', n:'jump buffer', d:'A jump pressed this long before landing is remembered and fires on touchdown.', min:0, max:0.5, step:0.01, u:'s'},
+      {k:'jumpRepressTime', n:'jump re-press lockout', d:'After any jump press, further presses are ignored for this long. Stops mashing space from turning the buffer into a free hop on every landing.', min:0, max:1, step:0.01, u:'s'},
       {k:'stepUp', n:'step height', d:'Tallest ledge walked over without jumping. ~1/3 of body height is where most engines land.', min:0, max:2, step:0.01, u:'m'},
       {k:'smoothBump', n:'free bump height', d:'Bumps at or below this cost no speed at all — what makes noisy ground feel like smooth floor.', min:0, max:1, step:0.01, u:'m'},
       {k:'stepSpeedPenaltyPerM', n:'step speed penalty', d:'Speed shed per metre climbed above the free bump height.', min:0, max:10, step:0.05, u:'/m'},
