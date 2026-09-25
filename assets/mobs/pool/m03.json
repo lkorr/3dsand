@@ -1,0 +1,670 @@
+{
+  "//": "A CHARACTER, not a creature: pool_m03 inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs pool_m03 --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "human",
+  "model": "pool_m03",
+  "sidecarVoxelsPerMetre": 10,
+  "anatomy": {
+    "limbs": {
+      "hair": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    },
+    "garmentsBecome": null
+  },
+  "gait": {
+    "rideHeight": 1.174
+  },
+  "limbs": [
+    {
+      "name": "hips",
+      "hp": 130
+    },
+    {
+      "name": "torso",
+      "hp": 105,
+      "anchor": [
+        18,
+        80,
+        12
+      ]
+    },
+    {
+      "name": "head",
+      "hp": 162,
+      "anchor": [
+        18,
+        104,
+        12
+      ]
+    },
+    {
+      "name": "armU.L",
+      "hp": 39,
+      "anchor": [
+        32,
+        106,
+        12
+      ]
+    },
+    {
+      "name": "armL.L",
+      "hp": 43,
+      "anchor": [
+        32,
+        90,
+        12
+      ]
+    },
+    {
+      "name": "hand.L",
+      "hp": 22,
+      "anchor": [
+        32,
+        68,
+        12
+      ]
+    },
+    {
+      "name": "armU.R",
+      "hp": 39,
+      "anchor": [
+        4,
+        106,
+        12
+      ]
+    },
+    {
+      "name": "armL.R",
+      "hp": 43,
+      "anchor": [
+        4,
+        90,
+        12
+      ]
+    },
+    {
+      "name": "hand.R",
+      "hp": 22,
+      "anchor": [
+        4,
+        68,
+        12
+      ]
+    },
+    {
+      "name": "legU.L",
+      "hp": 71,
+      "anchor": [
+        22,
+        64,
+        12
+      ]
+    },
+    {
+      "name": "legL.L",
+      "hp": 58,
+      "anchor": [
+        22,
+        36,
+        12
+      ]
+    },
+    {
+      "name": "foot.L",
+      "anchor": [
+        22,
+        6,
+        16
+      ]
+    },
+    {
+      "name": "legU.R",
+      "hp": 71,
+      "anchor": [
+        14,
+        64,
+        12
+      ]
+    },
+    {
+      "name": "legL.R",
+      "hp": 58,
+      "anchor": [
+        14,
+        36,
+        12
+      ]
+    },
+    {
+      "name": "foot.R",
+      "anchor": [
+        14,
+        6,
+        16
+      ]
+    },
+    {
+      "name": "hair",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 40,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        15.5,
+        125,
+        20.5
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        4,
+        64,
+        12
+      ]
+    }
+  ],
+  "natural": [
+    {
+      "name": "fist.L",
+      "edge": {
+        "from": [
+          4,
+          7.6,
+          4
+        ],
+        "to": [
+          4,
+          0.4,
+          4
+        ]
+      }
+    },
+    {
+      "name": "fist.R",
+      "edge": {
+        "from": [
+          4,
+          7.6,
+          4
+        ],
+        "to": [
+          4,
+          0.4,
+          4
+        ]
+      }
+    },
+    {
+      "name": "jaws",
+      "edge": {
+        "from": [
+          10,
+          12.2,
+          9.6
+        ],
+        "to": [
+          10,
+          9,
+          40.8
+        ]
+      }
+    }
+  ],
+  "states": [
+    {
+      "name": "squirm",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl.shins",
+      "bodyYOffset": null
+    }
+  ],
+  "clips": {
+    "walk": {
+      "durationMs": 666,
+      "tracks": {
+        "armU.L": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 333,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 666,
+              "q": [
+                0.1149,
+                0,
+                0,
+                0.9934
+              ]
+            }
+          ]
+        },
+        "armU.R": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 333,
+              "q": [
+                0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 666,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ]
+            }
+          ]
+        },
+        "armL.L": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 333,
+              "q": [
+                -0.1977,
+                0,
+                0,
+                0.9803
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 666,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ]
+            }
+          ]
+        },
+        "armL.R": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                -0.1977,
+                0,
+                0,
+                0.9803
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 333,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 666,
+              "q": [
+                -0.1977,
+                0,
+                0,
+                0.9803
+              ]
+            }
+          ]
+        },
+        "torso": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                -0.0184,
+                0,
+                0.9998
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 333,
+              "q": [
+                0,
+                0.0184,
+                0,
+                0.9998
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 666,
+              "q": [
+                0,
+                -0.0184,
+                0,
+                0.9998
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "run": {
+      "durationMs": 338,
+      "tracks": {
+        "armU.L": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0.1564,
+                0,
+                0,
+                0.9877
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 169,
+              "q": [
+                -0.1564,
+                0,
+                0,
+                0.9877
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 338,
+              "q": [
+                0.1564,
+                0,
+                0,
+                0.9877
+              ]
+            }
+          ]
+        },
+        "armU.R": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                -0.1564,
+                0,
+                0,
+                0.9877
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 169,
+              "q": [
+                0.1564,
+                0,
+                0,
+                0.9877
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 338,
+              "q": [
+                -0.1564,
+                0,
+                0,
+                0.9877
+              ]
+            }
+          ]
+        },
+        "armL.L": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 169,
+              "q": [
+                -0.1977,
+                0,
+                0,
+                0.9803
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 338,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ]
+            }
+          ]
+        },
+        "armL.R": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                -0.1977,
+                0,
+                0,
+                0.9803
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 169,
+              "q": [
+                -0.1149,
+                0,
+                0,
+                0.9934
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 338,
+              "q": [
+                -0.1977,
+                0,
+                0,
+                0.9803
+              ]
+            }
+          ]
+        },
+        "torso": {
+          "rot": [
+            {
+              "t": 0,
+              "q": [
+                0,
+                -0.0251,
+                0,
+                0.9997
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 169,
+              "q": [
+                0,
+                0.0251,
+                0,
+                0.9997
+              ],
+              "ease": "quadInOut"
+            },
+            {
+              "t": 338,
+              "q": [
+                0,
+                -0.0251,
+                0,
+                0.9997
+              ]
+            }
+          ]
+        }
+      }
+    }
+  },
+  "genome": {
+    "archetype": "humanoid",
+    "name": "pool_m03",
+    "displayName": "Untitled",
+    "body": {
+      "sex": "male",
+      "bust": 0.668315069982782,
+      "heightM": 1.7002038133051245,
+      "hipWidth": 8,
+      "shoulderWidth": 12,
+      "bodyDepth": 6,
+      "headWidth": 10,
+      "headDepth": 12,
+      "limbWidth": 4,
+      "footDepth": 7,
+      "stack": {
+        "foot": 4.212452385574579,
+        "shin": 14.923974748933688,
+        "thigh": 17.17387489369139,
+        "hips": 12.81488279812038,
+        "torso": 15.111469738651067,
+        "head": 16.845157056115568
+      },
+      "armStack": {
+        "upper": 10.601360779255629,
+        "fore": 13.626925773918629,
+        "hand": 4.574897791957483
+      }
+    },
+    "shape": {
+      "waist": 0.94193167721387,
+      "chest": 1.0236398895503953,
+      "shoulder": 1.0197489180602133,
+      "chestDepth": 0.9575280990917235,
+      "seat": 0.8816743005299941,
+      "armGirth": 0.9978624309878796,
+      "legGirth": 0.8821409720694646
+    },
+    "head": {
+      "jaw": 0.8617076550843195,
+      "cheek": 1.1263776839710773,
+      "crown": 0.9766779492492788,
+      "skullBack": 0.9827403772156685
+    },
+    "face": {
+      "eyeDx": 2.217753541190177,
+      "eyeRow": 0,
+      "eyeCols": 2,
+      "mouthWidth": 1,
+      "mouthDrop": 3,
+      "brow": true,
+      "beard": 0
+    },
+    "hair": {
+      "style": "undercut",
+      "back": 9.5,
+      "front": 9,
+      "length": 0,
+      "knot": false,
+      "side": 0.5,
+      "band": 0.55,
+      "volume": 2,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0,
+      "braid": false,
+      "twin": false,
+      "wisp": 0.35,
+      "ragged": 0.3,
+      "bangs": 0,
+      "faceThin": 0,
+      "hairlineSoft": 0,
+      "sideThin": 0,
+      "topThin": 0,
+      "fluff": 0
+    },
+    "colors": {
+      "skin": "#a9714a",
+      "skinShade": "#7f5335",
+      "skinLight": "#c99468",
+      "hair": "#e3d6b4",
+      "hairShade": "#b3a684",
+      "eye": "#37506b",
+      "cloth": "#7a6a4e",
+      "clothShade": "#5c4f39",
+      "nail": "#b68b6c"
+    }
+  }
+}

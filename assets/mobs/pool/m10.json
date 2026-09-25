@@ -1,0 +1,340 @@
+{
+  "//": "A CHARACTER, not a creature: pool_m10 inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs pool_m10 --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "human",
+  "model": "pool_m10",
+  "sidecarVoxelsPerMetre": 10,
+  "anatomy": {
+    "limbs": {
+      "hair": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    },
+    "garmentsBecome": null
+  },
+  "gait": {
+    "rideHeight": 1.195
+  },
+  "limbs": [
+    {
+      "name": "hips",
+      "hp": 113
+    },
+    {
+      "name": "torso",
+      "hp": 142,
+      "anchor": [
+        22,
+        64,
+        10
+      ]
+    },
+    {
+      "name": "head",
+      "hp": 127,
+      "anchor": [
+        22,
+        98,
+        10
+      ]
+    },
+    {
+      "name": "armU.L",
+      "hp": 88,
+      "anchor": [
+        38,
+        100,
+        10
+      ]
+    },
+    {
+      "name": "armL.L",
+      "hp": 96,
+      "anchor": [
+        38,
+        84,
+        10
+      ]
+    },
+    {
+      "name": "hand.L",
+      "hp": 49,
+      "anchor": [
+        38,
+        62,
+        10
+      ]
+    },
+    {
+      "name": "armU.R",
+      "hp": 88,
+      "anchor": [
+        6,
+        100,
+        10
+      ]
+    },
+    {
+      "name": "armL.R",
+      "hp": 96,
+      "anchor": [
+        6,
+        84,
+        10
+      ]
+    },
+    {
+      "name": "hand.R",
+      "hp": 49,
+      "anchor": [
+        6,
+        62,
+        10
+      ]
+    },
+    {
+      "name": "legU.L",
+      "hp": 138,
+      "anchor": [
+        28,
+        58,
+        10
+      ]
+    },
+    {
+      "name": "legL.L",
+      "hp": 131,
+      "anchor": [
+        28,
+        34,
+        10
+      ]
+    },
+    {
+      "name": "foot.L",
+      "hp": 35,
+      "anchor": [
+        28,
+        6,
+        13
+      ]
+    },
+    {
+      "name": "legU.R",
+      "hp": 138,
+      "anchor": [
+        16,
+        58,
+        10
+      ]
+    },
+    {
+      "name": "legL.R",
+      "hp": 131,
+      "anchor": [
+        16,
+        34,
+        10
+      ]
+    },
+    {
+      "name": "foot.R",
+      "hp": 35,
+      "anchor": [
+        16,
+        6,
+        13
+      ]
+    },
+    {
+      "name": "hair",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 27,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        28.5,
+        117,
+        12.5
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        6,
+        58,
+        10
+      ]
+    }
+  ],
+  "natural": [
+    {
+      "name": "fist.L",
+      "edge": {
+        "from": [
+          6,
+          7.6,
+          6
+        ],
+        "to": [
+          6,
+          0.4,
+          6
+        ],
+        "halfWidth": 6
+      }
+    },
+    {
+      "name": "fist.R",
+      "edge": {
+        "from": [
+          6,
+          7.6,
+          6
+        ],
+        "to": [
+          6,
+          0.4,
+          6
+        ],
+        "halfWidth": 6
+      }
+    },
+    {
+      "name": "jaws",
+      "edge": {
+        "from": [
+          10,
+          11.4,
+          8
+        ],
+        "to": [
+          10,
+          8.4,
+          34
+        ]
+      }
+    }
+  ],
+  "states": [
+    {
+      "name": "squirm",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl.shins",
+      "bodyYOffset": null
+    }
+  ],
+  "clips": {
+    "walk": {
+      "durationMs": 638
+    },
+    "run": {
+      "durationMs": 324
+    }
+  },
+  "genome": {
+    "archetype": "humanoid",
+    "name": "pool_m10",
+    "displayName": "Untitled",
+    "body": {
+      "sex": "male",
+      "bust": 0,
+      "heightM": 1.6040883052255956,
+      "hipWidth": 12,
+      "shoulderWidth": 12,
+      "bodyDepth": 6,
+      "headWidth": 10,
+      "headDepth": 10,
+      "limbWidth": 6,
+      "footDepth": 6,
+      "stack": {
+        "foot": 3.576999011449516,
+        "shin": 14.776023640995845,
+        "thigh": 13.610405870480463,
+        "hips": 7.255242068320513,
+        "torso": 19.52891557244584,
+        "head": 15.600437317043543
+      },
+      "armStack": {
+        "upper": 10.870319476351142,
+        "fore": 14.773275185376406,
+        "hand": 5.263573392527178
+      }
+    },
+    "shape": {
+      "waist": 1.2538580405293032,
+      "chest": 1.0679913235944696,
+      "shoulder": 1.0413664433173835,
+      "chestDepth": 0.9795937042916194,
+      "seat": 1.109313927940093,
+      "armGirth": 1.0365821102750488,
+      "legGirth": 0.9114834279753268
+    },
+    "head": {
+      "jaw": 1.0296373032033443,
+      "cheek": 0.9837208218872547,
+      "crown": 1.2031021583243273,
+      "skullBack": 1.3038680065888912
+    },
+    "face": {
+      "eyeDx": 2.1639311579056084,
+      "eyeRow": 0,
+      "eyeCols": 1,
+      "mouthWidth": 2,
+      "mouthDrop": 3,
+      "brow": true,
+      "beard": 0
+    },
+    "hair": {
+      "style": "ponytail",
+      "back": 5,
+      "front": 10,
+      "length": 0,
+      "knot": false,
+      "side": 0,
+      "band": 1,
+      "volume": 0,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0.7,
+      "braid": false,
+      "twin": false,
+      "wisp": 0.35,
+      "ragged": 0.3,
+      "bangs": 0,
+      "faceThin": 0,
+      "hairlineSoft": 0,
+      "sideThin": 0,
+      "topThin": 0,
+      "fluff": 0
+    },
+    "colors": {
+      "skin": "#4e3020",
+      "skinShade": "#372014",
+      "skinLight": "#6b4531",
+      "hair": "#d8d3cb",
+      "hairShade": "#a8a39b",
+      "eye": "#525b60",
+      "cloth": "#44566f",
+      "clothShade": "#313f52",
+      "nail": "#553c30"
+    }
+  }
+}

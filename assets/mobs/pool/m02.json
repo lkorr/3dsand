@@ -1,0 +1,339 @@
+{
+  "//": "A CHARACTER, not a creature: pool_m02 inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs pool_m02 --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "human",
+  "model": "pool_m02",
+  "sidecarVoxelsPerMetre": 10,
+  "anatomy": {
+    "limbs": {
+      "hair": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    },
+    "garmentsBecome": null
+  },
+  "gait": {
+    "rideHeight": 1.202
+  },
+  "limbs": [
+    {
+      "name": "hips",
+      "hp": 130
+    },
+    {
+      "name": "torso",
+      "hp": 107,
+      "anchor": [
+        14,
+        66,
+        8
+      ]
+    },
+    {
+      "name": "head",
+      "hp": 146,
+      "anchor": [
+        14,
+        94,
+        8
+      ]
+    },
+    {
+      "name": "armU.L",
+      "hp": 44,
+      "anchor": [
+        24,
+        96,
+        8
+      ]
+    },
+    {
+      "name": "armL.L",
+      "hp": 35,
+      "anchor": [
+        24,
+        78,
+        8
+      ]
+    },
+    {
+      "name": "hand.L",
+      "hp": 22,
+      "anchor": [
+        24,
+        60,
+        8
+      ]
+    },
+    {
+      "name": "armU.R",
+      "hp": 44,
+      "anchor": [
+        4,
+        96,
+        8
+      ]
+    },
+    {
+      "name": "armL.R",
+      "hp": 35,
+      "anchor": [
+        4,
+        78,
+        8
+      ]
+    },
+    {
+      "name": "hand.R",
+      "hp": 22,
+      "anchor": [
+        4,
+        60,
+        8
+      ]
+    },
+    {
+      "name": "legU.L",
+      "hp": 71,
+      "anchor": [
+        18,
+        56,
+        8
+      ]
+    },
+    {
+      "name": "legL.L",
+      "hp": 46,
+      "anchor": [
+        18,
+        28,
+        8
+      ]
+    },
+    {
+      "name": "foot.L",
+      "hp": 31,
+      "anchor": [
+        18,
+        6,
+        11
+      ]
+    },
+    {
+      "name": "legU.R",
+      "hp": 71,
+      "anchor": [
+        10,
+        56,
+        8
+      ]
+    },
+    {
+      "name": "legL.R",
+      "hp": 46,
+      "anchor": [
+        10,
+        28,
+        8
+      ]
+    },
+    {
+      "name": "foot.R",
+      "hp": 31,
+      "anchor": [
+        10,
+        6,
+        11
+      ]
+    },
+    {
+      "name": "hair",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 40,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        16.5,
+        112,
+        1.5
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        4,
+        56,
+        8
+      ]
+    }
+  ],
+  "natural": [
+    {
+      "name": "fist.L",
+      "edge": {
+        "from": [
+          4,
+          7.6,
+          4
+        ],
+        "to": [
+          4,
+          0.4,
+          4
+        ]
+      }
+    },
+    {
+      "name": "fist.R",
+      "edge": {
+        "from": [
+          4,
+          7.6,
+          4
+        ],
+        "to": [
+          4,
+          0.4,
+          4
+        ]
+      }
+    },
+    {
+      "name": "jaws",
+      "edge": {
+        "from": [
+          12,
+          13.7,
+          6.4
+        ],
+        "to": [
+          12,
+          10.1,
+          27.2
+        ],
+        "halfWidth": 22.8
+      }
+    }
+  ],
+  "states": [
+    {
+      "name": "squirm",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl.shins",
+      "bodyYOffset": null
+    }
+  ],
+  "clips": {
+    "walk": {
+      "durationMs": 628
+    },
+    "run": {
+      "durationMs": 319
+    }
+  },
+  "genome": {
+    "archetype": "humanoid",
+    "name": "pool_m02",
+    "displayName": "Untitled",
+    "body": {
+      "sex": "male",
+      "bust": 0,
+      "heightM": 1.6253295191074721,
+      "hipWidth": 8,
+      "shoulderWidth": 8,
+      "bodyDepth": 8,
+      "headWidth": 12,
+      "headDepth": 8,
+      "limbWidth": 4,
+      "footDepth": 8,
+      "stack": {
+        "foot": 3.2959382561966777,
+        "shin": 11.788584241410717,
+        "thigh": 16.209199198987335,
+        "hips": 9.112807374447584,
+        "torso": 16.960747787263244,
+        "head": 18.503142894245684
+      },
+      "armStack": {
+        "upper": 10.712416687980294,
+        "fore": 11.008213015273213,
+        "hand": 4
+      }
+    },
+    "shape": {
+      "waist": 0.7489645900204778,
+      "chest": 0.9551853555603884,
+      "shoulder": 1.0375720671378077,
+      "chestDepth": 0.9162168480688706,
+      "seat": 0.9801321944105439,
+      "armGirth": 1.0169274123036303,
+      "legGirth": 1.0141626900294796
+    },
+    "head": {
+      "jaw": 0.764092047419399,
+      "cheek": 0.9784174317494034,
+      "crown": 1.029178717697505,
+      "skullBack": 0.5676378478761762
+    },
+    "face": {
+      "eyeDx": 2.702715375693515,
+      "eyeRow": 0,
+      "eyeCols": 1,
+      "mouthWidth": 3,
+      "mouthDrop": 3,
+      "brow": false,
+      "beard": 0.9713031590799801
+    },
+    "hair": {
+      "style": "afro",
+      "back": 5,
+      "front": 9.5,
+      "length": 0,
+      "knot": false,
+      "side": 0,
+      "band": 1,
+      "volume": 4,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0,
+      "braid": false,
+      "twin": false,
+      "wisp": 0,
+      "ragged": 0.3,
+      "bangs": 0,
+      "faceThin": 0,
+      "hairlineSoft": 0,
+      "sideThin": 0,
+      "topThin": 0,
+      "fluff": 0.3
+    },
+    "colors": {
+      "skin": "#a9714a",
+      "skinShade": "#7f5335",
+      "skinLight": "#c99468",
+      "hair": "#6b4a2e",
+      "hairShade": "#4a3220",
+      "eye": "#5a4222",
+      "cloth": "#6b4f33",
+      "clothShade": "#4d3824",
+      "nail": "#ac8366"
+    }
+  }
+}

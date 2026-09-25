@@ -493,7 +493,7 @@
       "id": "dust",
       "class": "powder",
       "repose": 30,
-      "density": 400,
+      "density": 1100,
       "hardness": 6,
       "colors": [
         "#cbb457",

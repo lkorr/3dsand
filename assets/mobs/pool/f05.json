@@ -1,0 +1,330 @@
+{
+  "//": "A CHARACTER, not a creature: pool_f05 inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs pool_f05 --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "human",
+  "model": "pool_f05",
+  "sidecarVoxelsPerMetre": 10,
+  "anatomy": {
+    "limbs": {
+      "hair": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    },
+    "garmentsBecome": null
+  },
+  "limbs": [
+    {
+      "name": "hips",
+      "hp": 173
+    },
+    {
+      "name": "torso",
+      "hp": 255,
+      "anchor": [
+        26,
+        68,
+        14
+      ]
+    },
+    {
+      "name": "head",
+      "hp": 113,
+      "anchor": [
+        26,
+        98,
+        14
+      ]
+    },
+    {
+      "name": "armU.L",
+      "hp": 175,
+      "anchor": [
+        44,
+        100,
+        14
+      ]
+    },
+    {
+      "name": "armL.L",
+      "hp": 128,
+      "anchor": [
+        44,
+        82,
+        14
+      ]
+    },
+    {
+      "name": "hand.L",
+      "hp": 108,
+      "anchor": [
+        44,
+        66,
+        14
+      ]
+    },
+    {
+      "name": "armU.R",
+      "hp": 175,
+      "anchor": [
+        8,
+        100,
+        14
+      ]
+    },
+    {
+      "name": "armL.R",
+      "hp": 128,
+      "anchor": [
+        8,
+        82,
+        14
+      ]
+    },
+    {
+      "name": "hand.R",
+      "hp": 108,
+      "anchor": [
+        8,
+        66,
+        14
+      ]
+    },
+    {
+      "name": "legU.L",
+      "hp": 283,
+      "anchor": [
+        34,
+        60,
+        14
+      ]
+    },
+    {
+      "name": "legL.L",
+      "hp": 183,
+      "anchor": [
+        34,
+        32,
+        14
+      ]
+    },
+    {
+      "name": "foot.L",
+      "hp": 103,
+      "anchor": [
+        34,
+        6,
+        17
+      ]
+    },
+    {
+      "name": "legU.R",
+      "hp": 283,
+      "anchor": [
+        18,
+        60,
+        14
+      ]
+    },
+    {
+      "name": "legL.R",
+      "hp": 183,
+      "anchor": [
+        18,
+        32,
+        14
+      ]
+    },
+    {
+      "name": "foot.R",
+      "hp": 103,
+      "anchor": [
+        18,
+        6,
+        17
+      ]
+    },
+    {
+      "name": "hair",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 25,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        32.5,
+        111,
+        13.5
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        8,
+        61,
+        14
+      ]
+    }
+  ],
+  "natural": [
+    {
+      "name": "fist.L",
+      "edge": {
+        "from": [
+          8,
+          9.5,
+          8
+        ],
+        "to": [
+          8,
+          0.5,
+          8
+        ],
+        "halfWidth": 8
+      }
+    },
+    {
+      "name": "fist.R",
+      "edge": {
+        "from": [
+          8,
+          9.5,
+          8
+        ],
+        "to": [
+          8,
+          0.5,
+          8
+        ],
+        "halfWidth": 8
+      }
+    },
+    {
+      "name": "jaws",
+      "edge": {
+        "from": [
+          8,
+          9.1,
+          11.2
+        ],
+        "to": [
+          8,
+          6.7,
+          47.6
+        ],
+        "halfWidth": 15.2
+      }
+    }
+  ],
+  "states": [
+    {
+      "name": "squirm",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl.shins",
+      "bodyYOffset": null
+    }
+  ],
+  "genome": {
+    "archetype": "humanoid",
+    "name": "pool_f05",
+    "displayName": "Untitled",
+    "body": {
+      "sex": "female",
+      "bust": 0.6939199403859675,
+      "heightM": 1.53,
+      "hipWidth": 8,
+      "shoulderWidth": 12,
+      "bodyDepth": 12,
+      "headWidth": 8,
+      "headDepth": 14,
+      "limbWidth": 8,
+      "footDepth": 8,
+      "stack": {
+        "foot": 5.578417018987238,
+        "shin": 12.330865764059126,
+        "thigh": 16.29882884421386,
+        "hips": 8.628094874322414,
+        "torso": 18.809794158674777,
+        "head": 13.629065641202033
+      },
+      "armStack": {
+        "upper": 10.024132745340466,
+        "fore": 9.479717937298119,
+        "hand": 5.154769029933959
+      }
+    },
+    "shape": {
+      "waist": 0.8037744612665847,
+      "chest": 1.0416494697937742,
+      "shoulder": 0.8,
+      "chestDepth": 0.7566300177294761,
+      "seat": 0.9979775995248928,
+      "armGirth": 0.9642423118115403,
+      "legGirth": 0.8
+    },
+    "head": {
+      "jaw": 1.1662828578148037,
+      "cheek": 1.0220191899407656,
+      "crown": 1.0377803364535794,
+      "skullBack": 0.7401123178657144
+    },
+    "face": {
+      "eyeDx": 2.2739489693194628,
+      "eyeRow": 0,
+      "eyeCols": 1,
+      "mouthWidth": 2,
+      "mouthDrop": 4,
+      "brow": false,
+      "beard": 0
+    },
+    "hair": {
+      "style": "ponytail",
+      "back": 5,
+      "front": 10,
+      "length": 0,
+      "knot": false,
+      "side": 0,
+      "band": 1,
+      "volume": 0,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0.7,
+      "braid": false,
+      "twin": false,
+      "wisp": 0.35,
+      "ragged": 0.3,
+      "bangs": 0,
+      "faceThin": 0,
+      "hairlineSoft": 0,
+      "sideThin": 0,
+      "topThin": 0,
+      "fluff": 0
+    },
+    "colors": {
+      "skin": "#e8b898",
+      "skinShade": "#c2906f",
+      "skinLight": "#f6d6bd",
+      "hair": "#e3d6b4",
+      "hairShade": "#b3a684",
+      "eye": "#3a5236",
+      "cloth": "#44566f",
+      "clothShade": "#313f52",
+      "nail": "#fbe3dc"
+    }
+  }
+}

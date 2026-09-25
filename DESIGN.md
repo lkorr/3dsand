@@ -6377,6 +6377,22 @@ by index, and composes a name nothing on disk answers to.
 writes the def NAME it always wrote; `FindOrComposeDef` splits `base+fx` and
 rebuilds it. No version bump, no `effects` field, no migration.
 
+**A random human is a POOL BODY, built on demand by the same rule** (2026-09-24,
+`MobSystem::PoolDef`/`PoolNames`, gate `pool-human`). The character generator
+is `assets/editor/mobgen.js` and the engine has no copy of it, so the variety is
+baked: `node scripts/bake_human_pool.mjs` writes generated humans (half each
+sex, exact stock colours) to `assets/mobs/pool/<stem>.{vox,json}`. `LoadMobDefs`
+does not recurse, so none of them costs anything at startup or appears as a
+creature; `pool/<stem>` becomes a def the first time `FindOrComposeDef` (or
+`DefWithEffects`, as a base) is asked for it, spending one `kDerivedDefs` slot,
+and is registered as a factory SOURCE so `pool/<stem>+zombie` composes too.
+Saves, network handoffs and hot reloads therefore get the same stranger back by
+name with no new mechanism. The F1 Spawn tab's "random human" draws a pool body
+and rolls weapon, outfit, dye and behaviour off the tick (`session.cpp`). The
+exact stock colours matter: every loaded body merges into one 255-entry art
+palette, and the whole pool adds 57 colours where jittered ones would add ~12
+per body.
+
 **And a body that dies with the rot in it gets up.** Sidecar `turn`
 (`{into, afterSec, infectedLimbs}`, on the human and inherited by every
 character) is read by `Mob::Die`, which books a rising — where it was, which

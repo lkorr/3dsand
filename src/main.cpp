@@ -6253,7 +6253,10 @@ int main(int argc, char** argv) {
                                 : std::string();
     ui.aiCreatureNames.clear();
     for (const MobDef& d : mobs.Defs())
-      if (d.FindSocket("held_right") >= 0 && d.effects.empty())
+      // ...and not a random-human pool body a spawn built this session
+      // (MobSystem::PoolDef): those are the "random human" button's.
+      if (d.FindSocket("held_right") >= 0 && d.effects.empty() &&
+          !MobSystem::IsPoolName(d.name))
         ui.aiCreatureNames.push_back(d.name);
     // First build defaults to the avatar's own species, which is the def the
     // old code preferred when it picked for you — so the panel's behaviour is

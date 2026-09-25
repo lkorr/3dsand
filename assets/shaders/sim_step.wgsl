@@ -3121,7 +3121,26 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   //     or by a fall, within at most two steps. Searching 3-out before 2-out
   //     would break exactly this: a grain between two drops at 3 and 2 could
   //     take the far one and then come back.
-  if (reposeCode == REPOSE_2_1 || reposeCode == REPOSE_3_1) {
+  //
+  //     NOT WHILE FLOATING. That argument assumes a "drop" is somewhere the
+  //     grain can fall INTO, but the snapshot bit is density-blind: it counts
+  //     every liquid as open (reposeSnapOpenMat). A grain lighter than the
+  //     liquid it rests on (ash, seed, snow on water) sees a drop in every
+  //     direction, slides, and sees one again -- forever, and its chunk never
+  //     sleeps (rule 2). Stage 1 just refused the cell below, so if that cell
+  //     is not solid/powder it is a liquid this grain cannot enter: it is
+  //     floating, and a floating grain has already reached its rest. Distance
+  //     1, so the live read is legal. A grain on a shore may still take ONE
+  //     slide onto the surface; once there it floats and stops. Below the
+  //     window is unreadable and reads as not floating (the old behaviour).
+  let below = c + vec3<i32>(0, -1, 0);
+  var floating = false;
+  if (inBounds(below)) {
+    let bm = voxMat(voxWordAt(below));
+    let bk = materials[bm].klass;
+    floating = bm != MAT_AIR && bk != CLASS_SOLID && bk != CLASS_POWDER;
+  }
+  if (!floating && (reposeCode == REPOSE_2_1 || reposeCode == REPOSE_3_1)) {
     // Same RNG-rotated direction order the diagonal loop just used, so a slide
     // does not get its own symmetry-breaking and downwind still leads.
     for (var i = 0u; i < 4u; i++) {

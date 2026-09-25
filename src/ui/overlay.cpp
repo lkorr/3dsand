@@ -1732,6 +1732,12 @@ void Overlay::Draw(UIState& s) {
           // want a duelist and wrong every other time -- a zombie on the
           // `duelist` profile has no bite in its style list and can only
           // punch.
+          // THE STRANGER: nothing picked above is used but the effect boxes.
+          if (ImGui::Button("random human##ai")) s.aiSpawnRandom = true;
+          ImGui::SameLine();
+          ImGui::TextDisabled("any sex, build, face, hair, colouring,");
+          ImGui::TextDisabled("  weapon, outfit and fighting style");
+          ImGui::Separator();
           if (ImGui::Button("as authored##ai")) s.aiSpawnOwn = true;
           ImGui::SameLine();
           ImGui::TextDisabled("its own JSON behaviour (zombie -> bites)");

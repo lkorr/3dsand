@@ -875,6 +875,9 @@ const char* const kOrder[] = {
     // shared World about as much as `determinism` does -- and from here there
     // is nothing left for it to disturb but `voxregion`, which resets the
     // window and the page table itself.
+    // Builds pool bodies into the def list for the rest of the session, so
+    // late: nothing after it counts defs.
+    "pool-human",
     "snapshot-latency",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every

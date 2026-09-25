@@ -2260,6 +2260,7 @@ int MobSystem::FindDef(const std::string& name) const {
 int MobSystem::FindOrComposeDef(const std::string& name) {
   const int at = FindDef(name);
   if (at >= 0) return at;
+  if (IsPoolName(name)) return PoolDef(name, nullptr);
   const size_t plus = name.find('+');
   if (plus == std::string::npos || plus == 0) return -1;
   std::vector<std::string> fx;
@@ -2275,6 +2276,87 @@ int MobSystem::FindOrComposeDef(const std::string& name) {
   return DefWithEffects(name.substr(0, plus), fx, nullptr);
 }
 
+// ---- THE RANDOM-HUMAN POOL (mob.h) -----------------------------------------
+
+std::vector<std::string> MobSystem::PoolNames() const {
+  std::vector<std::string> out;
+  if (defFactory_ == nullptr) return out;
+  std::error_code ec;
+  const std::filesystem::path dir = std::filesystem::path(defFactory_->dir) / "pool";
+  for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
+    if (!e.is_regular_file() || e.path().extension() != ".json") continue;
+    // A body is its pair: a sidecar with no art beside it is not spawnable.
+    std::filesystem::path vox = e.path();
+    vox.replace_extension(".vox");
+    if (!std::filesystem::exists(vox, ec)) continue;
+    out.push_back(std::string(kPoolPrefix) + e.path().stem().string());
+  }
+  if (ec) out.clear();
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+int MobSystem::PoolDef(const std::string& name, std::string* log) {
+  auto say = [&](const std::string& s) {
+    if (log != nullptr) *log += s;
+    else std::printf("%s", s.c_str());
+  };
+  const int have = FindDef(name);
+  if (have >= 0) return have;
+  if (!IsPoolName(name)) return -1;
+  if (defFactory_ == nullptr || microSet_ == nullptr) {
+    say("mob: cannot build '" + name + "': no loader factory / micro pool "
+        "handed over (SetDefFactory / SetMicroSet)\n");
+    return -1;
+  }
+  if (defs_.size() >= defs_.capacity()) {
+    say("mob: refusing to build '" + name + "': all " +
+        std::to_string(kDerivedDefs) + " runtime def slots are spent\n");
+    return -1;
+  }
+  const std::string stem = name.substr(std::char_traits<char>::length(kPoolPrefix));
+  // A stem is a file name inside pool/, never a path out of it.
+  if (stem.empty() || stem.find_first_of("/\\.") != std::string::npos) {
+    say("mob: '" + name + "' is not a pool name\n");
+    return -1;
+  }
+  const std::filesystem::path dir = std::filesystem::path(defFactory_->dir) / "pool";
+  MobSource src;
+  src.name = name;
+  src.voxPath = (dir / (stem + ".vox")).string();
+  src.jsonPath = (dir / (stem + ".json")).string();
+  std::error_code ec;
+  if (!std::filesystem::exists(src.voxPath, ec) ||
+      !std::filesystem::exists(src.jsonPath, ec)) {
+    say("mob: no pool body '" + stem + "' (assets/mobs/pool/" + stem +
+        ".{vox,json}; bake with `node scripts/bake_human_pool.mjs`)\n");
+    return -1;
+  }
+  // `extends` resolves against the MAIN mob directory: a pool body is a diff
+  // against assets/mobs/human.json, exactly as a saved character is.
+  std::string buildLog;
+  json j;
+  if (!sidecar::Load(defFactory_->dir, src.jsonPath, j, buildLog,
+                     &src.extendsName)) {
+    say(buildLog + "mob: '" + name + "' did not resolve\n");
+    return -1;
+  }
+  MobDef def;
+  if (!BuildMobDef(*defFactory_, src, j, *microSet_, def, buildLog)) {
+    say(buildLog + "mob: '" + name + "' did not build\n");
+    return -1;
+  }
+  if (!buildLog.empty()) say(buildLog);
+  // Registered as a SOURCE too, so DefWithEffects can compose from it: a
+  // random human who is bitten gets up as `pool/<stem>+zombie`.
+  defFactory_->sources.push_back(src);
+  say("mob: built pool body '" + name + "' (def " + std::to_string(defs_.size()) +
+      ", " + std::to_string(defs_.capacity() - defs_.size() - 1) +
+      " slots left)\n");
+  defs_.push_back(std::move(def));
+  return (int)defs_.size() - 1;
+}
+
 // ---- COMPOSING A CREATURE AT RUNTIME ---------------------------------------
 // The header carries the three-step preference and why it is in that order.
 int MobSystem::DefWithEffects(const std::string& base,
@@ -2284,7 +2366,9 @@ int MobSystem::DefWithEffects(const std::string& base,
     if (log != nullptr) *log += s;
     else std::printf("%s", s.c_str());
   };
-  const int baseAt = FindDef(base);
+  // A pool body not yet spawned this session is built first (mob.h PoolDef),
+  // so `pool/<stem>+zombie` resolves from a save with nothing live.
+  const int baseAt = IsPoolName(base) ? PoolDef(base, log) : FindDef(base);
   if (baseAt < 0) {
     say("mob: cannot compose from '" + base + "': no such creature\n");
     return -1;

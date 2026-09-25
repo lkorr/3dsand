@@ -92,7 +92,44 @@ const S = {
   // rebuilds the pane on any state change and the view must survive that.
   // Filled on first use: ORBIT_HOME is declared further down this module.
   view: null,
+  // Which side columns are folded to a strip. Kept across reloads: someone who
+  // folds the litter away to work the sliders wants it folded next time too.
+  collapsed: loadCollapsed(),
 };
+
+function loadCollapsed() {
+  try {
+    const j = JSON.parse(localStorage.getItem('breed.collapsed') || '{}');
+    return { pool: !!j.pool, litter: !!j.litter };
+  } catch { return { pool: false, litter: false }; }
+}
+function setCollapsed(which, v) {
+  S.collapsed[which] = v;
+  try { localStorage.setItem('breed.collapsed', JSON.stringify(S.collapsed)); }
+  catch { /* private mode: the fold just does not persist */ }
+  render();
+}
+
+/** The strip a collapsed column becomes: its name down the side, and the
+ *  whole strip is the button that brings it back. Still a `.bcol`, so the page
+ *  keeps its three columns. */
+function collapsedCol(which, title) {
+  return el('div', { class: 'bcol collapsed',
+                     title: 'show ' + title,
+                     onclick: () => setCollapsed(which, false) },
+    el('button', { title: 'show ' + title }, which === 'pool' ? '»' : '«'),
+    el('div', { class: 'vlab' }, title));
+}
+
+/** A column heading with its fold button. */
+function colHead(which, title, tip, ...extra) {
+  return el('div', { class: 'bhead' },
+    el('h3', { title: tip }, title), ...extra,
+    which ? el('button', { title: 'fold this column away to give the sliders ' +
+                                   'the room',
+                           onclick: () => setCollapsed(which, true) },
+               which === 'pool' ? '«' : '»') : null);
+}
 
 const el = (...a) => H.el(...a);
 /** The host's unsaved-work flag, so closing the tab on a character you spent
@@ -858,23 +895,22 @@ function css() {
    when a slider surprises you. */
 #view-characters .gnote{font-size:10px;opacity:.55;line-height:1.45;
   margin:0 0 6px;max-width:46em}
-#view-characters .gwrap{padding:2px 0}
-#view-characters .ghint{font-size:10px;opacity:0;line-height:1.4;
-  margin:0 0 0 20px;max-width:44em;height:0;overflow:hidden;
-  transition:opacity .08s}
-/* The hint costs no height until you are on the row. Forty sliders each with a
-   permanent second line is a pane nobody scrolls to the bottom of; forty
-   sliders that explain themselves under the pointer is the same pane that
-   teaches. The :focus-within rule is the keyboard half of the same thing --
-   tab to a slider and you get the sentence too.
+/* THE HINT IS A COLUMN, always there, to the right of its slider. It used to
+   open a second line under the row on hover, which shoved every row below it
+   down as the pointer crossed the list -- the pane moved under the mouse. A
+   fixed column costs no height and never moves; three lines clamp it, and the
+   whole sentence is the row's tooltip.
    NOTE this whole block is a TEMPLATE LITERAL: no backticks in here. */
-#view-characters .gwrap:hover .ghint,
-#view-characters .gwrap:focus-within .ghint{opacity:.72;height:auto;
-  margin-bottom:3px}
-#view-characters .grow{display:grid;grid-template-columns:14px 104px 1fr 54px;
-  gap:6px;align-items:center;font-size:11px;padding:1px 0}
+#view-characters .grow{display:grid;
+  grid-template-columns:14px 104px minmax(90px,1fr) 46px minmax(120px,1.15fr);
+  gap:6px;align-items:center;font-size:11px;padding:2px 0;
+  border-bottom:1px solid #1c1c1c}
+#view-characters .grow .ghint{font-size:10px;opacity:.55;line-height:1.35;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;
+  overflow:hidden}
+#view-characters .grow:hover{background:#1a1a18}
+#view-characters .grow:hover .ghint{opacity:.8}
 #view-characters .grow input[type=range]{width:100%}
-#view-characters .gwrap:hover .grow{background:#1a1a18}
 #view-characters .grow .gl{overflow:hidden;text-overflow:ellipsis;
   white-space:nowrap}
 #view-characters .grow .gu{opacity:.45}
@@ -888,6 +924,38 @@ function css() {
 #view-characters .prev canvas{background:#0d0d0f;image-rendering:pixelated;
   border:1px solid #2a2a2a}
 #view-characters .bad{color:#e08080}
+#view-characters .bhead{display:flex;align-items:center;gap:6px;margin:0 0 6px}
+#view-characters .bhead h3{margin:0;flex:1}
+#view-characters .bhead button{font-size:10px;padding:0 6px}
+/* A COLLAPSED COLUMN is a strip you click to get it back: its name runs down
+   it, so a collapsed pane is never a missing one. */
+#view-characters .bcol.collapsed{display:flex;flex-direction:column;
+  align-items:center;gap:8px;padding:6px 0;border:1px solid #2a2a2a;
+  background:#141414;cursor:pointer;min-height:220px}
+#view-characters .bcol.collapsed:hover{border-color:#5a5a4a}
+#view-characters .bcol.collapsed .vlab{writing-mode:vertical-rl;
+  font-size:11px;letter-spacing:.1em;text-transform:uppercase;opacity:.7}
+#view-characters .pcanv{display:flex;gap:8px;align-items:flex-start}
+/* WIDE: the litter is collapsed, so the tweak pane has the page. The preview
+   and its buttons stack on the left and the sliders run the full height on
+   the right, instead of a thin list under a picture. */
+#view-characters .tbody.wide{display:grid;
+  grid-template-columns:auto minmax(0,1fr);gap:14px;align-items:start}
+#view-characters .tbody.wide .prev{flex-direction:column;max-width:440px}
+#view-characters .tbody.wide .genes{max-height:calc(100vh - 150px)}
+#view-characters .hsctl,#view-characters .hcctl{display:inline-flex;gap:6px;
+  align-items:center;min-width:0}
+#view-characters .hsctl input[type=range]{width:110px}
+#view-characters .hcctl input[type=range]{width:110px}
+#view-characters .grow .hsctl input[type=range],
+#view-characters .grow .hcctl input[type=range]{width:auto;flex:1;min-width:40px}
+#view-characters .grow .hsctl,#view-characters .grow .hcctl{display:flex}
+#view-characters .sexctl{display:inline-flex}
+#view-characters .sexbtn{font-size:10px;padding:1px 10px;opacity:.55}
+#view-characters .sexbtn.on{opacity:1;border-color:#c9b46a;color:#fff3c8;
+  background:#2a2618}
+#view-characters .hcsw{display:inline-block;width:12px;height:12px;
+  border:1px solid #444;vertical-align:middle}
 #view-characters .note{font-size:10px;opacity:.6;line-height:1.4;margin:4px 0}
 #view-characters .brow{display:flex;gap:6px;align-items:center;
   flex-wrap:wrap;margin:4px 0}
@@ -958,8 +1026,13 @@ function renderPage() {
     'make it a parent and roll again. Use the middle column when you want to ',
     'move one thing by hand. Saving writes a finished character into ',
     el('code', {}, 'assets/mobs/'), ' that the game will spawn as it is.'));
-  root.append(el('div', { class: 'bwrap' },
-    poolPane(), tweakPane(), litterPane()));
+  const c = S.collapsed;
+  root.append(el('div', { class: 'bwrap', style: 'grid-template-columns:' +
+                            (c.pool ? '26px' : '210px') + ' ' +
+                            (c.litter ? '1fr 26px' : '1fr 1fr') },
+    c.pool ? collapsedCol('pool', 'saved characters') : poolPane(),
+    tweakPane(),
+    c.litter ? collapsedCol('litter', 'litter') : litterPane()));
   if (S.status)
     root.append(el('div', { class: 'note' }, S.status));
 }
@@ -1007,8 +1080,8 @@ function poolPane() {
     rows.push(row);
   }
   return el('div', { class: 'bcol' },
-    el('h3', { title: 'every character already saved in assets/mobs' },
-       'saved characters'),
+    colHead('pool', 'saved characters',
+            'every character already saved in assets/mobs'),
     el('div', { class: 'brow' },
       el('button', { onclick: async () => { await loadPool(); render(); } },
          'refresh'),
@@ -1094,7 +1167,10 @@ function orbitControls(canvas) {
 }
 
 function tweakPane() {
-  const big = canvasFor(150, 230, 2);
+  // WIDE when the litter is folded away: a preview big enough to judge a face
+  // by, beside the sliders instead of on top of them.
+  const wide = S.collapsed.litter;
+  const big = wide ? canvasFor(260, 400, 2) : canvasFor(150, 230, 2);
   big.title = 'drag to turn · wheel to zoom (towards the pointer) · ' +
               'right- or shift-drag to pan · double-click to reset';
   big.style.cursor = 'grab';
@@ -1103,11 +1179,12 @@ function tweakPane() {
   const b = buildOf(S.genome, S.name);
   drawOrbit(big, b, S.view);
   orbitControls(big);
-  const side = canvasFor(90, 230, 2);
+  const side = wide ? canvasFor(150, 400, 2) : canvasFor(90, 230, 2);
   side.title = 'side view — depth, the jaw, the skull set-back and the hair ' +
                'sweep, none of which read from the front at this resolution';
   thumbFor(side, S.genome, S.name, 'side');
 
+  rowSync.clear();
   const geneRows = [];
   let group = null;
   for (const spec of mg.GENE_SPECS) {
@@ -1117,6 +1194,8 @@ function tweakPane() {
       geneRows.push(el('div', { class: 'gh' }, (g && g.title) || group));
       if (g) geneRows.push(el('div', { class: 'gnote' }, g.note));
     }
+    // The stock-colour stepper sits directly above the swatch it drives.
+    if (spec.path === 'colors.hair') geneRows.push(hairStockRow());
     geneRows.push(geneRow(spec));
   }
 
@@ -1137,64 +1216,211 @@ function tweakPane() {
   }, el('option', { value: '' }, 'preset…'),
      mg.PRESET_ORDER.map(k => el('option', { value: k }, k)));
 
-  const hairSel = el('select', {
-    onchange: e => {
-      mg.applyHairStyle(S.genome, e.target.value);
+  const both = S.collapsed.pool && S.collapsed.litter;
+  return el('div', { class: 'bcol' },
+    colHead(null, 'this character',
+            'the one character the sliders hold, and the thing a save writes',
+            el('button', {
+              title: both ? 'bring back the saved characters and the litter'
+                          : 'fold both side columns away: the whole page for ' +
+                            'the preview and the sliders',
+              onclick: () => {
+                S.collapsed.pool = !both;
+                setCollapsed('litter', !both);
+              },
+            }, both ? 'unfocus' : 'focus')),
+    el('div', { class: 'tbody' + (wide ? ' wide' : '') },
+      el('div', { class: 'prev' },
+        el('div', { class: 'pcanv' }, big, side),
+        el('div', {},
+          el('div', { class: 'brow' },
+            el('input', { value: S.name, size: 12, placeholder: 'name',
+                          title: 'the filename this saves as: ' +
+                                 'assets/mobs/<name>.vox and .json. Lowercase ' +
+                                 'letters, digits and underscores.',
+                          oninput: e => { S.name = e.target.value; } }),
+            presetSel),
+          el('div', { class: 'brow' },
+            el('span', { title: 'switching moves the build sliders by the ' +
+                                'typical difference between the sexes; drag ' +
+                                'them afterwards as you like' }, 'sex'),
+            sexToggle()),
+          el('div', { class: 'brow' },
+            el('span', { title: 'a starting point for every hair setting ' +
+                                'further down; drag them afterwards and you ' +
+                                'are off the preset, which is fine' }, 'hair'),
+            hairStyleControl()),
+          el('div', { class: 'brow' },
+            el('span', { title: 'stock hair colours, darkest to lightest. ' +
+                                'The hair swatch further down still takes ' +
+                                'any colour.' }, 'hair colour'),
+            hairColorControl(),
+            el('button', {
+              title: 'picks a complexion, a hair colour and a cloth colour ' +
+                     'that go together, then varies them a little — the ' +
+                     'three skin tones stay related, which is the part that ' +
+                     'is easy to get wrong by hand',
+              onclick: () => {
+                mg.rollColors(S.genome, mg.makeRng((Math.random() * 1e9) | 0));
+                setDirty(true);
+                render();
+              },
+            }, 'roll colours')),
+          el('div', { class: 'bstats' }, statLines(b)),
+          el('div', { class: 'brow' },
+            el('button', { title: 'writes assets/mobs/<name>.vox and .json, ' +
+                                  'with the anatomy baked in — a finished ' +
+                                  'character the game will spawn as it is',
+                           onclick: saveCharacter },
+               'save character (.vox + .json)'),
+            el('button', {
+              title: 'pin every setting, so the next litter varies nothing. ' +
+                     'Then un-pin the few you want to explore.',
+              onclick: () => {
+                S.locks = new Set(mg.GENE_SPECS.map(s => s.path));
+                render();
+              },
+            }, 'pin all'),
+            el('button', { title: 'un-pin everything, so a litter varies the ' +
+                                  'whole character',
+                           onclick: () => { S.locks = new Set(); render(); } },
+               'un-pin all')),
+          variantRow())),
+      el('div', { class: 'genes' }, geneRows)));
+}
+
+// ---- sex: two buttons, one lit -------------------------------------------------
+//
+// Not gset: a switch has to MOVE the build (mg.applySex adds or takes away the
+// typical difference), and a bare write of the enum would leave a woman's name
+// on a man's shoulders.
+function sexToggle() {
+  const cur = S.genome.body.sex === 'female' ? 'female' : 'male';
+  const btn = sex => el('button', {
+    class: 'sexbtn' + (cur === sex ? ' on' : ''),
+    title: sex === cur ? 'this character is ' + sex
+                       : 'switch to ' + sex + ': moves height, shoulders, ' +
+                         'waist, hips, jaw and arms by the typical difference' +
+                         (sex === 'female' ? ', adds a bust and a bra'
+                                           : ', drops the bust and bra'),
+    onclick: () => {
+      if (sex === cur) return;
+      mg.applySex(S.genome, sex, S.locks);
       setDirty(true);
       render();
     },
-  }, mg.HAIR_STYLE_ORDER.map(k =>
-       el('option', { value: k, selected: S.genome.hair.style === k }, k)));
+  }, sex);
+  return el('span', { class: 'sexctl' }, btn('male'), btn('female'));
+}
 
-  return el('div', { class: 'bcol' },
-    el('h3', { title: 'the one character the sliders hold, and the thing a ' +
-                      'save writes' }, 'this character'),
-    el('div', { class: 'prev' }, big, side,
-      el('div', {},
-        el('div', { class: 'brow' },
-          el('input', { value: S.name, size: 12, placeholder: 'name',
-                        title: 'the filename this saves as: ' +
-                               'assets/mobs/<name>.vox and .json. Lowercase ' +
-                               'letters, digits and underscores.',
-                        oninput: e => { S.name = e.target.value; } }),
-          presetSel),
-        el('div', { class: 'brow' },
-          el('span', { title: 'a starting point for the four hair settings ' +
-                              'further down; drag them afterwards and you ' +
-                              'are off the preset, which is fine' }, 'hair'),
-          hairSel,
-          el('button', {
-            title: 'picks a complexion, a hair colour and a cloth colour that ' +
-                   'go together, then varies them a little — the three skin ' +
-                   'tones stay related, which is the part that is easy to get ' +
-                   'wrong by hand',
-            onclick: () => {
-              mg.rollColors(S.genome, mg.makeRng((Math.random() * 1e9) | 0));
-              setDirty(true);
-              render();
-            },
-          }, 'roll colours')),
-        el('div', { class: 'bstats' }, statLines(b)),
-        el('div', { class: 'brow' },
-          el('button', { title: 'writes assets/mobs/<name>.vox and .json, ' +
-                                'with the anatomy baked in — a finished ' +
-                                'character the game will spawn as it is',
-                         onclick: saveCharacter },
-             'save character (.vox + .json)'),
-          el('button', {
-            title: 'pin every setting, so the next litter varies nothing. ' +
-                   'Then un-pin the few you want to explore.',
-            onclick: () => {
-              S.locks = new Set(mg.GENE_SPECS.map(s => s.path));
-              render();
-            },
-          }, 'pin all'),
-          el('button', { title: 'un-pin everything, so a litter varies the ' +
-                                'whole character',
-                         onclick: () => { S.locks = new Set(); render(); } },
-             'un-pin all')),
-        variantRow())),
-    el('div', { class: 'genes' }, geneRows));
+// ---- hair style + stock colour: a slider beside the dropdown ----------------
+//
+// Both step through a LIST, so both drag without rebuilding the page: a
+// render() mid-drag would replace the very <input> under the pointer and end
+// the drag. They write the genome, repaint the preview, and push the new
+// values into every other control showing the same thing (the top row and the
+// gene list each carry one) through rowSync and the class selectors below.
+
+/** path -> a function that re-reads the genome into that gene row's input
+ *  and readout. Rebuilt by every tweakPane(). */
+const rowSync = new Map();
+
+function syncRows(pred) {
+  for (const [path, fn] of rowSync) if (pred(path)) fn();
+}
+
+function pickStyle(style) {
+  mg.applyHairStyle(S.genome, style);
+  setDirty(true);
+  const i = mg.HAIR_STYLE_ORDER.indexOf(style);
+  root.querySelectorAll('.hs-sel').forEach(e => { e.value = style; });
+  root.querySelectorAll('.hs-rng').forEach(e => { e.value = String(i); });
+  root.querySelectorAll('.hs-name').forEach(e => {
+    e.textContent = (i + 1) + '/' + mg.HAIR_STYLE_ORDER.length; });
+  syncRows(p => p.startsWith('hair.'));
+  renderPreviewOnly();
+}
+
+function hairStyleControl() {
+  const order = mg.HAIR_STYLE_ORDER;
+  const i = Math.max(0, order.indexOf(S.genome.hair.style));
+  return el('span', { class: 'hsctl' },
+    el('select', { class: 'hs-sel', title: 'pick a hairstyle by name',
+                   onchange: e => pickStyle(e.target.value) },
+       order.map(k => el('option', { value: k,
+                                     selected: S.genome.hair.style === k }, k))),
+    el('input', { type: 'range', class: 'hs-rng', min: 0, max: order.length - 1,
+                  step: 1, value: i,
+                  title: 'step through every hairstyle — drag, or click it ' +
+                         'and use the arrow keys',
+                  oninput: e => pickStyle(order[Number(e.target.value)]) }),
+    el('span', { class: 'hs-name gv' }, (i + 1) + '/' + order.length));
+}
+
+/** The stock entry whose colours the genome holds exactly, or -1 (custom). */
+function stockIndex() {
+  const c = S.genome.colors;
+  return mg.HAIR_STOCK.findIndex(([, v]) => v.hair === c.hair &&
+                                            v.hairShade === c.hairShade);
+}
+
+/** Where to park the stepper's thumb for a custom colour: the nearest stock
+ *  entry, so the next arrow press moves to a neighbour of what you have. */
+function nearestStock() {
+  const n = parseInt(S.genome.colors.hair.slice(1), 16);
+  let best = 0, bd = Infinity;
+  mg.HAIR_STOCK.forEach(([, v], i) => {
+    const m = parseInt(v.hair.slice(1), 16);
+    const d = [16, 8, 0].reduce((s, sh) =>
+      s + (((n >> sh) & 255) - ((m >> sh) & 255)) ** 2, 0);
+    if (d < bd) { bd = d; best = i; }
+  });
+  return best;
+}
+
+function syncHairColor() {
+  const i = stockIndex();
+  const name = i >= 0 ? mg.HAIR_STOCK[i][0] : 'custom';
+  root.querySelectorAll('.hc-rng').forEach(e => {
+    e.value = String(i >= 0 ? i : nearestStock()); });
+  root.querySelectorAll('.hc-name').forEach(e => { e.textContent = name; });
+  root.querySelectorAll('.hcsw').forEach(e => {
+    e.style.background = S.genome.colors.hair; });
+}
+
+function hairColorControl() {
+  const i = stockIndex();
+  return el('span', { class: 'hcctl' },
+    el('input', { type: 'range', class: 'hc-rng', min: 0,
+                  max: mg.HAIR_STOCK.length - 1, step: 1,
+                  value: i >= 0 ? i : nearestStock(),
+                  title: 'stock hair colours, darkest to lightest: ' +
+                         mg.HAIR_STOCK.map(([k]) => k).join(', '),
+                  oninput: e => {
+                    const [, v] = mg.HAIR_STOCK[Number(e.target.value)];
+                    // Base and shade together, as a stock pair: the shade is
+                    // hand-matched per colour, which a carry cannot improve on.
+                    gset('colors.hair', v.hair);
+                    gset('colors.hairShade', v.hairShade);
+                    syncHairColor();
+                    syncRows(p => p === 'colors.hair' ||
+                                  p === 'colors.hairShade');
+                    renderPreviewOnly();
+                  } }),
+    el('span', { class: 'hcsw', style: 'background:' + S.genome.colors.hair }),
+    el('span', { class: 'hc-name gv', style: 'text-align:left' },
+       i >= 0 ? mg.HAIR_STOCK[i][0] : 'custom'));
+}
+
+/** The stock-colour stepper as a gene-list row, above the hair swatch. Not a
+ *  gene: it writes two genes, and there is nothing of its own to pin. */
+function hairStockRow() {
+  const hint = 'Steps through ' + mg.HAIR_STOCK.length + ' stock hair ' +
+               'colours, darkest to lightest, setting the hair and its shade ' +
+               'together. The swatches below still take any colour.';
+  return el('div', { class: 'grow', title: hint },
+    el('span'), el('span', { class: 'gl' }, 'stock colour'),
+    hairColorControl(), el('span'), el('div', { class: 'ghint' }, hint));
 }
 
 /** The three lines under the preview: what this body IS, what the shoulder
@@ -1252,11 +1478,29 @@ function geneRow(spec) {
   let input, readout = null;
   if (spec.kind === 'color') {
     input = el('input', { type: 'color', value: v,
-      oninput: e => { gset(spec.path, e.target.value); renderPreviewOnly(); } });
+      oninput: e => {
+        gset(spec.path, e.target.value);
+        readout.textContent = e.target.value;
+        // A hand-picked hair colour is "custom" to the stock stepper.
+        if (spec.path.startsWith('colors.hair')) syncHairColor();
+        renderPreviewOnly();
+      } });
     readout = el('span', { class: 'gv' }, v);
+    rowSync.set(spec.path, () => {
+      const nv = mg.getPath(S.genome, spec.path);
+      input.value = nv; readout.textContent = nv;
+    });
   } else if (spec.kind === 'bool') {
     input = el('input', { type: 'checkbox', checked: !!v,
       onchange: e => { gset(spec.path, e.target.checked); render(); } });
+    rowSync.set(spec.path, () => {
+      input.checked = !!mg.getPath(S.genome, spec.path); });
+  } else if (spec.path === 'body.sex') {
+    input = sexToggle();
+  } else if (spec.path === 'hair.style') {
+    // The dropdown AND a slider that steps through every style, the same
+    // control as the one under the preview (the two stay in step).
+    input = hairStyleControl();
   } else if (spec.kind === 'enum') {
     input = el('select', {
       onchange: e => { gset(spec.path, e.target.value);
@@ -1286,11 +1530,15 @@ function geneRow(spec) {
       },
     });
     readout = el('span', { class: 'gv' }, fmt(v, spec));
+    rowSync.set(spec.path, () => {
+      const nv = mg.getPath(S.genome, spec.path);
+      input.value = Math.min(nv, hi); readout.textContent = fmt(nv, spec);
+    });
   }
-  // The HINT is the row's tooltip and also the line under it when the pane is
-  // wide enough for one (see .ghint in the CSS). Both, not either: the tooltip
-  // is what you get when you are hunting and the line is what you get when you
-  // are reading, and a dense stack of forty sliders needs both modes.
+  // The HINT is the row's tooltip and also a column to the right of the
+  // slider (see .ghint in the CSS). Both, not either: the column is what you
+  // read while dragging, the tooltip is the whole sentence when the column
+  // had to clamp it.
   const label = el('span', { class: 'gl' }, spec.label,
                    spec.unit ? el('span', { class: 'gu' }, ' ' + spec.unit)
                              : null,
@@ -1307,10 +1555,9 @@ function geneRow(spec) {
                                  (spec.tone ? ' tone' : ''),
                           title: hint ? hint + '\n\n(' + spec.path + ')'
                                       : spec.path },
-                 lock, label, input, readout || el('span'));
-  return hint
-    ? el('div', { class: 'gwrap' }, row, el('div', { class: 'ghint' }, hint))
-    : row;
+                 lock, label, input, readout || el('span'),
+                 el('div', { class: 'ghint' }, hint || ''));
+  return row;
 }
 
 /** A gene's value as it is worth reading. `uiMax` rows print the word rather
@@ -1422,8 +1669,8 @@ function litterPane() {
   const reroll = () => { rollLitter(); render(); };
 
   return el('div', { class: 'bcol' },
-    el('h3', { title: 'a fresh batch of candidates, drawn from the parents' },
-       'litter'),
+    colHead('litter', 'litter',
+            'a fresh batch of candidates, drawn from the parents'),
     el('div', { class: 'brow' }, srcSel,
       el('label', { style: 'font-size:10px', title: 'how many children to ' +
                     'show at once' }, 'how many ',

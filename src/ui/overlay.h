@@ -355,6 +355,12 @@ struct UIState {
   // `dA.behavior.empty() ? "duelist" : dA.behavior`, and this panel was the one
   // producer that did not.
   bool aiSpawnOwn = false;
+  // ---- A RANDOM HUMAN (2026-09-24) ------------------------------------------
+  // One-shot: a body drawn from assets/mobs/pool/ (MobSystem::PoolDef; baked by
+  // scripts/bake_human_pool.mjs), with its weapon, outfit, dye and behaviour
+  // rolled too. The ticked effect boxes still apply. session.cpp consumes it
+  // beside the four buttons above.
+  bool aiSpawnRandom = false;
   bool aiKillSpawned = false;     // one-shot: despawn everything this panel made
   bool aiRagdollSpawned = false;  // one-shot: knock everything this panel made flat
   // WHAT THE SPAWN BUTTONS PUT IN ITS HAND. Names rather than library indices,

@@ -4508,6 +4508,28 @@ class MobSystem {
   // only one producer can set.
   int FindOrComposeDef(const std::string& name);
 
+  // ---- THE RANDOM-HUMAN POOL -----------------------------------------------
+  //
+  // assets/mobs/pool/<stem>.{vox,json}: generated humans baked by
+  // scripts/bake_human_pool.mjs, because the generator is JavaScript and the
+  // engine has no copy of it. LoadMobDefs does not recurse, so none of them is
+  // loaded at startup or listed as a creature. A pool body becomes a def the
+  // first time something names it `pool/<stem>` -- PoolDef, reached through
+  // FindOrComposeDef and DefWithEffects -- which is also how a save, a network
+  // peer and a hot reload get the same body back: by name, like every def.
+  // Each one built spends one of the kDerivedDefs slots for the session.
+  static constexpr const char* kPoolPrefix = "pool/";
+  static bool IsPoolName(const std::string& name) {
+    return name.rfind(kPoolPrefix, 0) == 0 && name.find('+') == std::string::npos;
+  }
+  // Returns the def index for `pool/<stem>`, building it on first use; -1
+  // (with the reason in `log`, or printed) when there is no such file, no
+  // factory, or no slot left.
+  int PoolDef(const std::string& name, std::string* log = nullptr);
+  // Every `pool/<stem>` on disk, sorted. Read fresh on each call: it is a
+  // directory listing behind a button, not a per-tick path.
+  std::vector<std::string> PoolNames() const;
+
   // ---- BECOMING SOMETHING ELSE ---------------------------------------------
   //
   // `base`, with `fx` poured on it — the runtime form of what

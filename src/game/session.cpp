@@ -965,17 +965,36 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
       // the same creature.
       if (labScene >= 0) {
         ui.aiSpawnDummy = ui.aiSpawnStatic = ui.aiSpawnDuelist = false;
-        ui.aiSpawnOwn = false;
+        ui.aiSpawnOwn = ui.aiSpawnRandom = false;
         ui.aiKillSpawned = false;
       }
       if (ui.aiSpawnDummy || ui.aiSpawnStatic || ui.aiSpawnDuelist ||
-          ui.aiSpawnOwn) {
+          ui.aiSpawnOwn || ui.aiSpawnRandom) {
+        // A RANDOM HUMAN (UIState::aiSpawnRandom): every pick below that the
+        // panel would have made -- body, weapon, outfit, behaviour -- is rolled
+        // instead, off the tick and this panel's spawn count, the way the dye
+        // already was: a replay spawns the same stranger. The body is one of
+        // the baked pool (MobSystem::PoolDef); the ticked effects still apply.
+        const bool rnd = ui.aiSpawnRandom;
+        ui.aiSpawnRandom = false;
+        const uint32_t rseed = rng::Hash3(tick, 0x68756d61u,
+                                          (uint32_t)aiSpawnedMobs.size());
+        auto rpick = [&](uint32_t salt, uint32_t n) {
+          return n == 0 ? 0u : rng::Hash3(rseed, salt, 0x9e37u) % n;
+        };
         // EMPTY MEANS "THE CREATURE'S OWN", resolved once the def is known --
         // see UIState::aiSpawnOwn for what the override was costing.
-        const char* profile = ui.aiSpawnOwn         ? ""
-                              : ui.aiSpawnDummy     ? "dummy"
-                              : ui.aiSpawnStatic    ? "swordsman_static"
-                                                    : "duelist";
+        // The profiles a random human may get: the ones that fight a person
+        // in different ways. Not `dummy` / `training_dummy` (they do nothing)
+        // and not `zombie` (a living human that bites is not a trait).
+        static const char* const kRandomProfiles[] = {
+            "duelist", "duelist_blue", "crowder", "retreater"};
+        const char* profile =
+            rnd ? kRandomProfiles[rpick(4, 4)]
+            : ui.aiSpawnOwn    ? ""
+            : ui.aiSpawnDummy  ? "dummy"
+            : ui.aiSpawnStatic ? "swordsman_static"
+                               : "duelist";
         ui.aiSpawnDummy = ui.aiSpawnStatic = ui.aiSpawnDuelist = false;
         ui.aiSpawnOwn = false;
         // A humanoid that can actually HOLD the sword: picked by capability
@@ -992,7 +1011,21 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
                                          ? ui.aiCreaturePick
                                          : 0];
         int aiDef = -1;
-        for (size_t i = 0; i < mobs.Defs().size(); i++) {
+        if (rnd) {
+          const std::vector<std::string> pool = mobs.PoolNames();
+          if (pool.empty()) {
+            std::printf("AI panel: no random-human pool (assets/mobs/pool/ is "
+                        "empty; bake it with `node scripts/bake_human_pool.mjs`) "
+                        "-- spawning the picked creature instead\n");
+          } else {
+            std::string plog;
+            aiDef = mobs.PoolDef(pool[rpick(1, (uint32_t)pool.size())], &plog);
+            if (!plog.empty()) std::printf("%s", plog.c_str());
+          }
+        }
+        // (A random spawn that got a pool body skips the picker entirely; one
+        // that did not falls through to it.)
+        for (size_t i = 0; !(rnd && aiDef >= 0) && i < mobs.Defs().size(); i++) {
           if (mobs.Defs()[i].FindSocket("held_right") < 0) continue;
           // Fall back to the old rule — first eligible def, preferring the
           // avatar's own species — if the pick names a def that has gone away
@@ -1052,10 +1085,15 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
             // nothing in its fist, which is no longer a creature that cannot
             // fight: its `natural` weapons and its profile's fallback punches
             // are what it swings (docs/PLAN_impact_unarmed.md §3/§5).
-            const std::string& pick =
-                ui.aiWeaponNames[ui.aiWeaponPick < (int)ui.aiWeaponNames.size()
-                                     ? ui.aiWeaponPick
-                                     : 0];
+            const int weaponPick =
+                rnd ? (int)rpick(2, (uint32_t)ui.aiWeaponNames.size())
+                    : ui.aiWeaponPick;
+            const std::string pick =
+                ui.aiWeaponNames.empty()
+                    ? std::string()
+                    : ui.aiWeaponNames[weaponPick < (int)ui.aiWeaponNames.size()
+                                           ? weaponPick
+                                           : 0];
             const ItemDef* weapon = items.At(items.Find(pick));
             if (weapon != nullptr) mobs.EquipItem(nid, weapon);
             // WHAT IT WEARS (UIState::aiOutfit). Through MobSystem::WearItem,
@@ -1066,13 +1104,21 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
             // Slot by slot in EquipSlotId order, one piece per slot. The
             // random outfit and the dye are hashed off the tick and the mob id
             // rather than rand(), so a replay dresses the same crowd.
+            // A random human's outfit mode: mostly everyday clothes, some in
+            // plate, some mixed piece by piece (mode 4, below), a few in
+            // nothing but their underwear.
+            int outfit = ui.aiOutfit;
+            if (rnd) {
+              const uint32_t o = rpick(3, 100);
+              outfit = o < 10 ? 0 : o < 65 ? 1 : o < 80 ? 2 : 4;
+            }
             {
               int dressed = 0;
               for (int s = 0; s < (int)ui.aiWearNames.size(); s++) {
                 if (!EquipSlotIsWorn(s)) break;
                 const ItemDef* piece = nullptr;
                 const uint32_t roll = rng::Hash3(tick, (uint32_t)nid, (uint32_t)s);
-                if (ui.aiOutfit == 1) {
+                if (outfit == 1) {
                   // RANDOM CLOTHES: a dyeable piece of this slot's kind. The
                   // commoner set is chest / legs / boots, so a helmet slot has
                   // no candidates and stays bare, which is the point.
@@ -1081,7 +1127,7 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
                     if (it.dyeable && EquipSlotAccepts(s, it.kind))
                       cands.push_back(&it);
                   if (!cands.empty()) piece = cands[roll % cands.size()];
-                } else if (ui.aiOutfit == 2) {
+                } else if (outfit == 2) {
                   // FULL PLATE: the slot's `iron_*` piece. By name prefix
                   // rather than by material because the stock set is authored
                   // that way (scripts/gen_stock_armor.py) and nothing on an
@@ -1092,11 +1138,20 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
                       piece = &it;
                       break;
                     }
-                } else if (ui.aiOutfit == 3) {
+                } else if (outfit == 3) {
                   const int wp = s < (int)ui.aiWearPick.size() ? ui.aiWearPick[s]
                                                                 : 0;
                   if (wp > 0 && wp < (int)ui.aiWearNames[s].size())
                     piece = items.At(items.Find(ui.aiWearNames[s][wp]));
+                } else if (outfit == 4) {
+                  // MIXED: any piece this slot takes, or none -- entry 0 of
+                  // the slot list is "(none)", so a bare slot is one of the
+                  // outcomes rather than a special case.
+                  const std::vector<std::string>& names = ui.aiWearNames[s];
+                  const size_t wp =
+                      names.empty() ? 0 : (size_t)(roll % (uint32_t)names.size());
+                  if (wp > 0 && wp < names.size())
+                    piece = items.At(items.Find(names[wp]));
                 }
                 if (piece == nullptr) continue;
                 // A dyeable piece gets a colour, the same "full saturation at a
@@ -1116,7 +1171,7 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
                   std::printf("AI panel: \"%s\" would not go on %s\n",
                               piece->name.c_str(), d.name.c_str());
               }
-              if (ui.aiOutfit != 0)
+              if (outfit != 0)
                 std::printf("AI panel: %s spawned wearing %d piece(s)\n",
                             d.name.c_str(), dressed);
             }
@@ -1136,6 +1191,11 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
                   " behaviors.json — it will not fight\n",
                   d.name.c_str(), prof.c_str());
             }
+            if (rnd)
+              std::printf("AI panel: random human %s -- %s, outfit %d, "
+                          "behaviour %s\n",
+                          d.name.c_str(), pick.empty() ? "fists" : pick.c_str(),
+                          outfit, prof.c_str());
             aiSpawnedMobs.push_back(nid);
           }
         }

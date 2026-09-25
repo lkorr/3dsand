@@ -12816,6 +12816,110 @@ Status GateNetPlayerCorpse(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- pool-human: the F1 Spawn tab's "random human" --------------------------
+//
+// The bodies are baked by scripts/bake_human_pool.mjs into assets/mobs/pool/,
+// which LoadMobDefs does not scan; a pool body becomes a def only when
+// something names it (MobSystem::PoolDef). Every claim is a def read or a
+// count, and nothing ticks:
+//   A the pool is on disk, and holds both sexes (the bake alternates them);
+//   B a pool body builds BY NAME through FindOrComposeDef -- the path a save,
+//     a network peer and a hot reload take -- on the human's rig, armable;
+//   C a second ask is the same def, and costs no slot;
+//   D it spawns;
+//   E `pool/<stem>+zombie` composes by name from a pool body (a bitten
+//     stranger gets up as a zombie of itself, and saves as that name);
+//   F a name that is not a pool body, or tries to leave pool/, is refused
+//     without spending a slot;
+//   G the merged art palette did not overflow (exact stock colours are what
+//     the bake uses so it does not).
+Status GatePoolHuman(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  c.mobs.ClearRisings();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const std::vector<std::string> names = c.mobs.PoolNames();
+  std::string fem, mal;
+  for (const std::string& n : names) {
+    const std::string stem = n.substr(std::strlen(MobSystem::kPoolPrefix));
+    if (fem.empty() && !stem.empty() && stem[0] == 'f') fem = n;
+    if (mal.empty() && !stem.empty() && stem[0] == 'm') mal = n;
+  }
+  const bool onDisk = names.size() >= 2 && !fem.empty() && !mal.empty();
+  if (!onDisk) {
+    detail = Format("pool has %zu bodies (female %s, male %s); bake it with "
+                    "`node scripts/bake_human_pool.mjs`",
+                    names.size(), fem.empty() ? "none" : fem.c_str(),
+                    mal.empty() ? "none" : mal.c_str());
+    return Status::Fail;
+  }
+  const int hi = c.mobs.FindDef("human");
+  if (hi < 0) {
+    detail = "no human def";
+    return Status::Fail;
+  }
+
+  // ---- B + C ----------------------------------------------------------------
+  const size_t before = c.mobs.Defs().size();
+  const int fi = c.mobs.FindOrComposeDef(fem);
+  const int mi = c.mobs.FindOrComposeDef(mal);
+  const size_t afterBuild = c.mobs.Defs().size();
+  bool built = fi >= 0 && mi >= 0 && afterBuild == before + 2;
+  std::string builtWhy;
+  for (const int di : {fi, mi}) {
+    if (di < 0) continue;
+    const MobDef& d = c.mobs.Defs()[di];
+    const MobDef& h = c.mobs.Defs()[hi];
+    const bool ok = d.extendsName == "human" && d.limbs.size() >= h.limbs.size() &&
+                    d.FindSocket("held_right") >= 0 && d.skel.FindClip("walk") >= 0;
+    if (!ok)
+      builtWhy += Format(" %s: extends=%s limbs=%zu/%zu held=%d walk=%d;",
+                         d.name.c_str(), d.extendsName.c_str(), d.limbs.size(),
+                         h.limbs.size(), d.FindSocket("held_right"),
+                         d.skel.FindClip("walk"));
+    built = built && ok;
+  }
+  const bool cached = c.mobs.FindOrComposeDef(fem) == fi &&
+                      c.mobs.PoolDef(mal, nullptr) == mi &&
+                      c.mobs.Defs().size() == afterBuild;
+
+  // ---- D ----------------------------------------------------------------------
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+  const uint64_t id = fi >= 0 ? c.mobs.Spawn(fi, {spot.x, spot.y + 1, spot.z}) : 0;
+  const Mob* m = id ? c.mobs.FindMobById(id) : nullptr;
+  const bool spawned = m != nullptr && m->Def() != nullptr && m->Def()->name == fem;
+
+  // ---- E ----------------------------------------------------------------------
+  const int zi = c.mobs.FindOrComposeDef(fem + "+zombie");
+  const bool zombie = zi >= 0 && c.mobs.Defs()[zi].extendsName == fem &&
+                      c.mobs.Defs()[zi].undead &&
+                      c.mobs.Defs()[zi].name == fem + "+zombie";
+
+  // ---- F ----------------------------------------------------------------------
+  const size_t beforeBad = c.mobs.Defs().size();
+  const bool refused = c.mobs.FindOrComposeDef("pool/no_such_body") < 0 &&
+                       c.mobs.PoolDef("pool/../human", nullptr) < 0 &&
+                       c.mobs.PoolDef("pool/", nullptr) < 0 &&
+                       c.mobs.Defs().size() == beforeBad;
+
+  // ---- G ----------------------------------------------------------------------
+  const size_t art = c.mobs.MicroSet() ? c.mobs.MicroSet()->artColors.size() : 0;
+  const bool palette = art > 0 && art < (size_t)kArtPaletteSlotsGpu;
+
+  const bool ok = built && cached && spawned && zombie && refused && palette;
+  detail = Format("pool %zu bodies | built %s + %s %s%s | cached %s | spawned %s | "
+                  "%s+zombie %s | bad names refused %s | art palette %zu/%d",
+                  names.size(), fem.c_str(), mal.c_str(), built ? "ok" : "FAIL",
+                  builtWhy.c_str(), cached ? "ok" : "FAIL",
+                  spawned ? "ok" : "FAIL", fem.c_str(), zombie ? "ok" : "FAIL",
+                  refused ? "ok" : "FAIL", art, (int)kArtPaletteSlotsGpu);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- damage-sources -----------------------------------------------------
 //
 // ONE DAMAGE EVENT, ONE SHELL RESPONSE (W2-H, game/shellresponse.h). Every
@@ -13963,6 +14067,10 @@ const std::vector<Gate>& MobGates() {
       // in it gets back up. Counts and def reads; the six-second wait is
       // skipped by calling PreTick with a later tick.
       {"zombify", "mob", {}, false, GateZombify, /*needsRender=*/false},
+      // The F1 Spawn tab's "random human": a baked pool body built by name,
+      // cached, spawned, composed with an effect; bad names refused. Counts
+      // and def reads, no ticks.
+      {"pool-human", "mob", {}, false, GatePoolHuman, /*needsRender=*/false},
       // THE PACK: a creature carries things that are not on its body, they
       // fall with it, you can loot them, and a body that turns takes them with
       // it. Authors its own two-row loot table over a copy of the def list and

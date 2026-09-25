@@ -421,6 +421,13 @@ export function defaultGenome() {
     displayName: 'Untitled',
 
     body: {
+      /** 'male' | 'female'. Not a switch in the generator so much as a
+       *  PRESET OF OFFSETS over the build genes (applySex): the toggle moves
+       *  the sliders, the sliders build the body. Two things read it directly:
+       *  the bust and the bra (torsoVox), which exist only on a woman. */
+      sex: 'male',
+      /** Chest forward of the torso, 0..1. Female only. */
+      bust: 0,
       heightM: DEFAULT_HEIGHT_M,
       /** Box widths in AUTHORED micro. Forced EVEN by normalizeGenome: a box
        *  is centred at mn.x = -sx/2 and an odd width puts the ellipse centre
@@ -474,6 +481,7 @@ export function defaultGenome() {
       mouthWidth: 2,
       mouthDrop: 3,     // micro below the eye row
       brow: false,      // an eyebrow row, off by default
+      beard: 0,         // painted facial hair: stubble .. moustache .. full
     },
 
     /** HAIR IS A FUNCTION, not a texture: `back`/`front` are the z at or above
@@ -503,6 +511,18 @@ export function defaultGenome() {
       twin: false,      // two tails behind the ears instead of one
       wisp: 0.35,       // share of a hanging strand that thins to nothing
       ragged: 0.3,      // how uneven the ends are
+      // ---- bangs and REGIONAL THINNING (2026-09-24). `wisp` thins only the
+      // ends of what hangs, which is all at the back; these thin by WHERE a
+      // cell is. The mass fades through the wisp slots (see thinMass); the
+      // painted cap cannot go see-through (it is the skull's own surface, and
+      // under it is the inside of the head), so on the cap "thin" means scalp
+      // showing through: SKIN_LIGHT speckle. All 0 = the body it always was.
+      bangs: 0,         // fringe hanging over the forehead: 1 reaches the eyes
+      faceThin: 0,      // mass near the face (bangs included) fades
+      hairlineSoft: 0,  // the cap's edge breaks up into scalp
+      sideThin: 0,      // temples and the sides of the head and curtain
+      topThin: 0,       // the crown
+      fluff: 0,         // the outer surface of any mass breaks into wisps
     },
 
     colors: {
@@ -532,37 +552,45 @@ export function defaultGenome() {
 const HAIR_NONE = { back: 99, front: 99, length: 0, knot: false, side: 0,
                     band: 1, volume: 0, crest: 0, spikes: 0, buns: false,
                     drop: 0, tail: 0, braid: false, twin: false, wisp: 0.35,
-                    ragged: 0.3 };
+                    ragged: 0.3, bangs: 0, faceThin: 0, hairlineSoft: 0,
+                    sideThin: 0, topThin: 0, fluff: 0 };
 const hs = o => ({ ...HAIR_NONE, ...o });
 export const HAIR_STYLES = {
   // ---- short: paint on the skull, and at most a little mass
   bald:     hs({}),
   cropped:  hs({ back: 8.5, front: 8.5 }),
   swept:    hs({ back: 5.5, front: 10.0 }),
-  fringe:   hs({ back: 9.5, front: 5.0 }),
+  fringe:   hs({ back: 9.5, front: 5.0, bangs: 0.45, faceThin: 0.5,
+                 hairlineSoft: 0.25 }),
+  thinning: hs({ back: 6.0, front: 10.5, hairlineSoft: 0.7, topThin: 0.8,
+                 sideThin: 0.3 }),
   sidepart: hs({ back: 5.5, front: 8.0, side: 0.8, volume: 1 }),
   crew:     hs({ back: 7.0, front: 9.5, volume: 1 }),
   bowl:     hs({ back: 6.0, front: 6.0, volume: 2, ragged: 0 }),
   undercut: hs({ back: 9.5, front: 9.0, band: 0.55, volume: 2, side: 0.5 }),
   mohawk:   hs({ back: 5.0, front: 9.0, band: 0.22, crest: 5, ragged: 0.2 }),
   spiky:    hs({ back: 6.5, front: 9.0, volume: 1, spikes: 5 }),
-  afro:     hs({ back: 5.0, front: 9.5, volume: 4, wisp: 0 }),
+  afro:     hs({ back: 5.0, front: 9.5, volume: 4, wisp: 0, fluff: 0.3 }),
   topknot:  hs({ back: 10.5, front: 11.5, knot: true }),
   buns:     hs({ back: 5.5, front: 9.5, buns: true }),
   // ---- hanging: a `mane` part below the neck, thinning to wisps
   bob:      hs({ back: 4.5, front: 7.0, volume: 1, drop: 0.12, wisp: 0.25,
-                 ragged: 0.1 }),
-  long:     hs({ back: 4.5, front: 9.5, length: 6, drop: 0.6 }),
+                 ragged: 0.1, bangs: 0.85, faceThin: 0.45 }),
+  blunt:    hs({ back: 4.5, front: 7.5, volume: 1, drop: 0.3, wisp: 0.2,
+                 ragged: 0, bangs: 1.0, faceThin: 0.6, sideThin: 0.2 }),
+  long:     hs({ back: 4.5, front: 9.5, length: 6, drop: 0.6, faceThin: 0.25,
+                 sideThin: 0.2 }),
   mane:     hs({ back: 3.5, front: 8.5, length: 10, volume: 2, drop: 0.75,
-                 ragged: 0.6 }),
+                 ragged: 0.6, sideThin: 0.25 }),
   flowing:  hs({ back: 4.0, front: 8.0, side: -0.6, volume: 1, drop: 1.0,
-                 wisp: 0.45, ragged: 0.45 }),
+                 wisp: 0.45, ragged: 0.45, bangs: 0.6, faceThin: 0.55,
+                 sideThin: 0.3 }),
   ponytail: hs({ back: 5.0, front: 10.0, tail: 0.7 }),
   braid:    hs({ back: 5.0, front: 10.0, tail: 0.95, braid: true,
                  wisp: 0.15 }),
   pigtails: hs({ back: 5.0, front: 7.0, tail: 0.5, twin: true }),
   wild:     hs({ back: 3.5, front: 6.0, volume: 3, spikes: 3, drop: 0.45,
-                 ragged: 0.9, wisp: 0.5 }),
+                 ragged: 0.9, wisp: 0.5, fluff: 0.35, faceThin: 0.3 }),
 };
 export const HAIR_STYLE_ORDER = Object.keys(HAIR_STYLES);
 
@@ -641,6 +669,12 @@ const COLOR_LABELS = {
  * `uiMax` narrows the SLIDER without narrowing the gene (see hair.back).
  */
 export const GENE_SPECS = [
+  { path: 'body.sex', label: 'sex', group: 'body',
+    hint: 'Male or female. Switching moves the build sliders by the ' +
+          'typical difference (shorter, narrower shoulders, narrower waist, ' +
+          'fuller hips, softer jaw, slimmer arms) and adds a bust and a bra; ' +
+          'every slider still moves freely afterwards.',
+    kind: 'enum', choices: ['male', 'female'], sigma: 0 },
   { path: 'body.heightM', label: 'height', group: 'body', unit: 'm',
     hint: 'Sole to crown. Every proportion below divides this up, so this is ' +
           'the only slider that changes how tall the character is.',
@@ -653,6 +687,10 @@ export const GENE_SPECS = [
     hint: 'Width across the pelvis. Wider than the shoulders reads as ' +
           'pear-shaped, much narrower as a wedge.',
     min: 8, max: 16, step: 2, int: true, even: true, sigma: 1.2 },
+  { path: 'body.bust', label: 'bust', group: 'body',
+    hint: 'How far the chest stands forward of the ribs. Female bodies ' +
+          'only; always covered by the bra.',
+    min: 0, max: 1, step: 0.05, sigma: 0.12 },
   { path: 'body.bodyDepth', label: 'body thickness', group: 'body',
     hint: 'Front to back through the chest. Invisible head-on — watch the ' +
           'side view.',
@@ -765,6 +803,10 @@ export const GENE_SPECS = [
     hint: 'How far below the eyes the mouth sits. Bigger drops lengthen the ' +
           'face and shorten the chin under it.',
     min: 2, max: 5, step: 1, int: true, sigma: 0.6 },
+  { path: 'face.beard', label: 'beard', group: 'face',
+    hint: 'Facial hair in the hair shade: a little is a moustache and ' +
+          'goatee, the middle runs along the jaw, the top is a full beard.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
   { path: 'face.brow', label: 'eyebrows', group: 'face', kind: 'bool',
     hint: 'Paints a brow row above the eyes in the hair colour.',
     sigma: 0.25 },
@@ -832,6 +874,31 @@ export const GENE_SPECS = [
     min: 0, max: 0.8, step: 0.05, sigma: 0.1 },
   { path: 'hair.ragged', label: 'ragged ends', group: 'hair',
     hint: 'How uneven the strands are where they end. 0 is a clean cut.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.bangs', label: 'bangs', group: 'hair',
+    hint: 'A fringe of real hair hanging from the hairline down over the ' +
+          'forehead. 1 reaches the eyes; the parting tilts it to one side.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.faceThin', label: 'thin at face', group: 'hair',
+    hint: 'Hair near the face turns see-through, most at the ends of the ' +
+          'bangs where they meet the eyes. Needs bangs or hair standing ' +
+          'off the head to have anything to thin.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.hairlineSoft', label: 'soft hairline', group: 'hair',
+    hint: 'Breaks up the edge of the hair on the head into scalp, so the ' +
+          'hairline fades out instead of ending on a ruled line.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.sideThin', label: 'thin at sides', group: 'hair',
+    hint: 'Thins the temples and the sides of the head, and the outer ' +
+          'edges of hair hanging down.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.topThin', label: 'thin on top', group: 'hair',
+    hint: 'Thins the crown: scalp shows through on top and any hair ' +
+          'standing there goes see-through. High is a thinning older head.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.fluff', label: 'wispy surface', group: 'hair',
+    hint: 'Breaks the outer surface of any hair standing off the head or ' +
+          'hanging into loose see-through wisps, all over.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
 
   // BASE FIRST, THEN ITS TONES. COLOR_SLOTS is keyed for the palette writer
@@ -914,6 +981,71 @@ export function normalizeGenome(src) {
     setPath(g, spec.path, coerceGene(spec, getPath(g, spec.path),
                                      getPath(def, spec.path)));
   return g;
+}
+
+/**
+ * THE SEXES, as offsets female-minus-male over the build genes. A toggle
+ * ADDS or SUBTRACTS these rather than snapping to a stock body, so whatever
+ * you did to the sliders survives the switch: a tall, broad woman switched to
+ * male is a taller, broader man, not the default one. Roughly the average
+ * adult difference, scaled to what the lattice can show -- shoulders are the
+ * one that reads at a distance, so they move the most.
+ */
+export const SEX_FEMALE_DELTA = {
+  'body.heightM': -0.08,
+  'body.shoulderWidth': -2,
+  'body.bust': 0.55,
+  'shape.shoulder': -0.05,
+  'shape.chest': -0.04,
+  'shape.waist': -0.1,
+  'shape.seat': 0.1,
+  'shape.chestDepth': -0.08,
+  'shape.armGirth': -0.1,
+  'shape.legGirth': -0.03,
+  'head.jaw': -0.1,
+  'head.cheek': 0.03,
+};
+
+/** Switch a genome's sex, moving the build genes by SEX_FEMALE_DELTA. A no-op
+ *  when it already is. Going female also clears the beard; going male clears
+ *  nothing but the bust, which a male body never draws anyway. `locks`, when
+ *  given, holds pinned genes still. */
+export function applySex(genome, sex, locks) {
+  if (sex !== 'male' && sex !== 'female') return genome;
+  const was = genome.body.sex === 'female' ? 'female' : 'male';
+  genome.body.sex = sex;
+  if (was === sex) return genome;
+  const sign = sex === 'female' ? 1 : -1;
+  for (const [path, d] of Object.entries(SEX_FEMALE_DELTA)) {
+    if (isLocked(locks, path)) continue;
+    const spec = SPEC_BY_PATH.get(path);
+    let v = getPath(genome, path) + sign * d;
+    if (spec) v = clamp(v, spec.min, spec.max);
+    setPath(genome, path, v);
+  }
+  if (sex === 'female' && !isLocked(locks, 'face.beard')) genome.face.beard = 0;
+  return genome;
+}
+
+/** Which hairstyles a random roll favours for each sex: three times as likely
+ *  as the rest, never exclusive. A roll that could not give a man a braid or a
+ *  woman a crop would be a narrower generator, not a more realistic one. */
+export const SEX_STYLE_BIAS = {
+  male: ['cropped', 'swept', 'sidepart', 'crew', 'undercut', 'spiky',
+         'thinning', 'bowl', 'mohawk'],
+  female: ['long', 'flowing', 'bob', 'blunt', 'ponytail', 'braid', 'pigtails',
+           'buns', 'fringe', 'mane', 'topknot'],
+};
+
+function biasedStyle(sex, r) {
+  const fav = new Set(SEX_STYLE_BIAS[sex] || []);
+  const w = HAIR_STYLE_ORDER.map(k => (k === 'bald' ? 0.4 : fav.has(k) ? 3 : 1));
+  let t = r() * w.reduce((a, b) => a + b, 0);
+  for (let i = 0; i < w.length; i++) {
+    t -= w[i];
+    if (t < 0) return HAIR_STYLE_ORDER[i];
+  }
+  return HAIR_STYLE_ORDER[HAIR_STYLE_ORDER.length - 1];
 }
 
 /** Snap the hair numbers to a named style. The generator never reads `style`
@@ -1049,6 +1181,14 @@ export function mutate(genome, sigma, rng, locks) {
   // body does not — the one place the style/number duality can bite.
   if (!isLocked(locks, 'hair.style') && g.hair.style !== genome?.hair?.style)
     applyHairStyle(g, g.hair.style);
+  // ...and so does a sex flip (sigma 0 on the gene: mutation never flips it
+  // today, but a genome edited to flip must still move the body).
+  const sexWas = genome?.body?.sex === 'female' ? 'female' : 'male';
+  if (g.body.sex !== sexWas) {
+    const to = g.body.sex;
+    g.body.sex = sexWas;
+    applySex(g, to, locks);
+  }
   reshadeFamily(g, was, locks);
   return normalizeGenome(g);
 }
@@ -1166,6 +1306,20 @@ export function randomGenome(rng, locks) {
                                                          spec.max - d));
     }
   }
+  // THE SEX IS ROLLED ON THE MALE-CENTRED BUILD, then applied as offsets, so a
+  // woman is the same spread of builds shifted -- not a second distribution.
+  // Drawn from the rng AFTER the loop, so every gene above sees the sequence
+  // it always did.
+  if (!isLocked(locks, 'body.sex')) {
+    const sex = r() < 0.5 ? 'female' : 'male';
+    g.body.sex = 'male';
+    applySex(g, sex, locks);
+    if (!isLocked(locks, 'hair.style')) g.hair.style = biasedStyle(sex, r);
+    if (!isLocked(locks, 'face.beard'))
+      g.face.beard = sex === 'male' && r() < 0.45 ? 0.15 + r() * 0.85 : 0;
+    if (!isLocked(locks, 'body.bust') && sex === 'female')
+      g.body.bust = clamp(0.25 + r() * 0.6, 0, 1);
+  }
   applyHairStyle(g, g.hair.style);
   // Hair length and the knot belong to the style; re-roll length within it so
   // a `long` is not always exactly 6 micro.
@@ -1196,6 +1350,27 @@ export const HAIR_COLORS = {
   grey:   { hair: '#8e8a83', hairShade: '#66625c' },
   white:  { hair: '#d8d3cb', hairShade: '#a8a39b' },
 };
+/** The Characters page's STOCK hair colours, darkest to lightest, for the
+ *  step-through slider -- a menu, not a constraint: the swatch still takes any
+ *  colour. Separate from HAIR_COLORS on purpose: rollColors draws from that
+ *  table by key, so growing it would change every seeded litter's colouring. */
+export const HAIR_STOCK = [
+  ['jet',        { hair: '#121010', hairShade: '#080707' }],
+  ['black',      HAIR_COLORS.black],
+  ['dark brown', HAIR_COLORS.dark],
+  ['chestnut',   { hair: '#5e3a24', hairShade: '#402616' }],
+  ['brown',      HAIR_COLORS.brown],
+  ['ash brown',  { hair: '#6e6152', hairShade: '#4e4439' }],
+  ['auburn',     HAIR_COLORS.auburn],
+  ['copper',     { hair: '#a4502a', hairShade: '#76361a' }],
+  ['ginger',     { hair: '#c0672e', hairShade: '#8c4a1f' }],
+  ['strawberry', { hair: '#c98a5e', hairShade: '#9a633f' }],
+  ['sandy',      HAIR_COLORS.sandy],
+  ['blond',      HAIR_COLORS.blond],
+  ['platinum',   { hair: '#e3d6b4', hairShade: '#b3a684' }],
+  ['grey',       HAIR_COLORS.grey],
+  ['white',      HAIR_COLORS.white],
+];
 export const EYE_COLORS = {
   dark: '#241d18', brown: '#3b2a1c', hazel: '#5a4222',
   green: '#3a5236', blue: '#37506b', grey: '#525b60',
@@ -1209,11 +1384,19 @@ export const CLOTH_COLORS = {
   umber:  { cloth: '#6b4f33', clothShade: '#4d3824' },
 };
 
-/** A palette roll that picks SETS, then jitters inside them. */
-export function rollColors(genome, rng) {
+/** A palette roll that picks SETS, then jitters inside them.
+ *
+ *  `opts.jitter` 0 keeps the sets EXACT and draws hair from HAIR_STOCK, which
+ *  is what the engine's random-human pool is baked with (bake_human_pool.mjs):
+ *  the engine merges every loaded body's colours into ONE 255-entry art
+ *  palette, and exact stock colours are shared between bodies where jittered
+ *  ones would each spend a dozen fresh slots. */
+export function rollColors(genome, rng, opts = {}) {
   const r = typeof rng === 'function' ? rng : makeRng(rng | 0);
   const pick = obj => obj[r.pick(Object.keys(obj))];
-  const set = Object.assign({}, pick(COMPLEXIONS), pick(HAIR_COLORS),
+  const jitter = opts.jitter ?? 0.02;
+  const hair = jitter === 0 ? r.pick(HAIR_STOCK)[1] : pick(HAIR_COLORS);
+  const set = Object.assign({}, pick(COMPLEXIONS), hair,
                             pick(CLOTH_COLORS), { eye: pick(EYE_COLORS) });
   const was = { ...genome.colors };
   Object.assign(genome.colors, set);
@@ -1228,10 +1411,11 @@ export function rollColors(genome, rng) {
   // pull one apart is the jitter -- which is why it, too, moves the base and
   // carries the tones. At 0.02 the drift per roll is small; it is the LOOP
   // (roll, keep, roll again from the keeper) that makes small drift add up.
+  if (jitter === 0) return genome;
   const beforeJitter = { ...genome.colors };
   for (const k of Object.keys(COLOR_SLOTS))
     if (!COLOR_BASE_OF[k])
-      genome.colors[k] = jitterColor(genome.colors[k], 0.02, r);
+      genome.colors[k] = jitterColor(genome.colors[k], jitter, r);
   reshadeFamily(genome, beforeJitter);
   return genome;
 }
@@ -1477,18 +1661,67 @@ function torsoProfiles(g, size) {
   };
 }
 
+/**
+ * The torso. On a woman, a BUST and a BRA.
+ *
+ * THE BUST LIVES INSIDE THE TORSO'S OWN BOX. The front of the ribcage stops
+ * short of the box's front face (torso depth < 1 on a female build, see
+ * SEX_FEMALE_DELTA), and the bust fills the rows in between. Growing the box
+ * instead would move every joint centred on it -- the neck, the shoulders --
+ * and resample every cuirass fitted to it. Two lobes, each a bump on the
+ * FRONT radius only, peaked a third of the way down from the shoulders.
+ *
+ * THE BRA IS PAINT, exactly as the shorts are (hipsVox): CLOTH cells on a
+ * body that is skin all the way through. Cups over the bust, a band right
+ * round the ribs under it, and a strap up each side of the chest to the top
+ * of the shoulder, front and back. Pre-flip, high y is the FRONT.
+ */
 function torsoVox(g, size) {
   const [sx, sy, sz] = size;
   const cx = sx * 0.5, cy = sy * 0.5;
   const { rx: prx, ry: pry } = torsoProfiles(g, size);
+  const female = g.body.sex === 'female';
+  const bust = female ? g.body.bust : 0;
+  // Band of the bust in u (0 = waist, 1 = shoulder top), and where the bra's
+  // under-band sits.
+  const uPeak = 0.66, uHalf = 0.13;
+  const bandLo = uPeak - uHalf - 0.03, bandHi = uPeak + uHalf;
+  const bumpAt = (x, u, rx) => {
+    if (bust <= 0) return 0;
+    const bu = 1 - Math.abs(u - uPeak) / uHalf;
+    if (bu <= 0) return 0;
+    const off = rx * 0.45, w = Math.max(rx * 0.32, 1.1);
+    const dx = Math.min(Math.abs(x + 0.5 - (cx - off)),
+                        Math.abs(x + 0.5 - (cx + off)));
+    const bx = 1 - (dx / w) * (dx / w);
+    if (bx <= 0) return 0;
+    return bust * 2.2 * Math.sqrt(bx) * Math.sqrt(bu);
+  };
   const out = [];
   for (let z = 0; z < sz; z++) {
     const u = z / Math.max(sz - 1, 1);
     const rx = profile(u, prx), ry = profile(u, pry);
+    const strapX = rx * 0.45;
     for (let y = 0; y < sy; y++)
-      for (let x = 0; x < sx; x++)
-        if (ellipseMask(x, y, cx, cy, rx, ry))
-          out.push([x, y, z, shadeBack(y, cy, ART.SKIN_BASE, ART.SKIN_SHADE)]);
+      for (let x = 0; x < sx; x++) {
+        const front = y + 0.5 > cy;
+        const bump = front ? bumpAt(x, u, rx) : 0;
+        // The front radius grows by the bump but never past the box.
+        const ryHere = Math.min(ry + bump, sy - cy - 0.02);
+        if (!ellipseMask(x, y, cx, cy, rx, front ? ryHere : ry)) continue;
+        let col = shadeBack(y, cy, ART.SKIN_BASE, ART.SKIN_SHADE);
+        if (female) {
+          const cup = bump > 0.25;
+          const band = u >= bandLo && u < bandLo + 0.09;
+          // Straps: one column pair each side, from the cups to the top.
+          const strap = u > bandHi - 0.02 &&
+            Math.abs(Math.abs(x + 0.5 - cx) - strapX) < 0.75;
+          if (cup || band || strap)
+            col = front || !cup ? shadeBack(y, cy, ART.CLOTH, ART.CLOTH_SHADE)
+                                : col;
+        }
+        out.push([x, y, z, col]);
+      }
   }
   return flipY(size, out);
 }
@@ -1571,15 +1804,48 @@ function headVox(g, size, ctx) {
   // same width at the brow as at the crown instead of pinching to one cell on
   // top. At side 0 / band 1 both are exact no-ops, which is what keeps every
   // existing character's head bit-identical.
-  const bandHalf = g.hair.band * Math.max(...prx.map(k => k[1]));
-  const isHair = (x, y, z) => {
-    if (z < skullLo) return false;
+  const skullR = Math.max(...prx.map(k => k[1]));
+  const bandHalf = g.hair.band * skullR;
+  const lineAt = (x, y) => {
     const dx = x + 0.5 - cx;
-    if (Math.abs(dx) > bandHalf) return false;
     let line = hairLine(y);
     if (g.hair.side)
       line += g.hair.side * (dx / Math.max(bandHalf, 1)) * 3.0 * hz * hairT(y);
-    return z >= line;
+    return line;
+  };
+  const isHair = (x, y, z) => {
+    if (z < skullLo) return false;
+    if (Math.abs(x + 0.5 - cx) > bandHalf) return false;
+    return z >= lineAt(x, y);
+  };
+  // SCALP SHOWING THROUGH: the cap's version of thin hair. The cap is the
+  // skull's own surface -- a see-through voxel there would open onto the
+  // inside of the head -- so a thin patch is painted as scalp instead, in
+  // SKIN_LIGHT, which hairMass still reads as scalp to root on. A hashed
+  // speckle whose density falls off with distance from the thin region, so
+  // it reads as a gradient and not a stencil. Every weight is 0 by default.
+  const hg = g.hair;
+  const thinCap = hg.hairlineSoft > 0 || hg.topThin > 0 || hg.sideThin > 0;
+  const scalpShows = (x, y, z) => {
+    const ax = Math.abs(x + 0.5 - cx) / Math.max(skullR, 1);
+    let p = 0;
+    if (hg.hairlineSoft > 0) {
+      // Ragged on the edge itself (up to half the edge row goes), fading out
+      // over three and a half rows above it.
+      const dz = z + 0.5 - lineAt(x, y);
+      p = Math.max(p, hg.hairlineSoft * 0.85 * clamp(1 - dz / (3.5 * hz), 0, 1));
+      if (Math.abs(x + 0.5 - cx) > bandHalf - 1.5)
+        p = Math.max(p, hg.hairlineSoft * 0.5);
+    }
+    if (hg.topThin > 0) {
+      const u = clamp((z + 0.5 - sz * 0.62) / (sz * 0.38), 0, 1);
+      p = Math.max(p, hg.topThin * 0.75 * u * (1 - 0.5 * clamp(ax, 0, 1)));
+    }
+    if (hg.sideThin > 0) {
+      const w = clamp((ax - 0.55) / 0.4, 0, 1) * (z < sz * 0.8 ? 1 : 0.4);
+      p = Math.max(p, hg.sideThin * 0.6 * w);
+    }
+    return p > 0 && hashN(x, y, z, 71) / 4294967296 < p;
   };
 
   const out = [];
@@ -1596,7 +1862,8 @@ function headVox(g, size, ctx) {
         const back = y + 0.5 < hcy - 1.5;
         let col;
         if (isHair(x, y, z))
-          col = back ? ART.HAIR_SHADE : ART.HAIR;
+          col = thinCap && scalpShows(x, y, z) ? ART.SKIN_LIGHT
+              : back ? ART.HAIR_SHADE : ART.HAIR;
         else col = back ? ART.SKIN_SHADE : ART.SKIN_BASE;
         out.push([x, y, z, col]);
       }
@@ -1671,6 +1938,31 @@ function headVox(g, size, ctx) {
     if (hiX + 1 < sx) out.push([hiX + 1, earY, z, ART.SKIN_SHADE]);
   }
 
+  // THE BEARD: paint on the lower face in the hair shade, laid down before the
+  // mouth is repainted over it (so a moustache never swallows the mouth).
+  // The amount is its REACH, not its density: a moustache and goatee, then
+  // the jaw, then the cheeks up to the ears. Solid, with a broken outer edge.
+  // A density ramp (stubble) was tried first and read as random blotches --
+  // one painted cell is a 2x2 block once shipped, which is not a stubble grain.
+  // Front half only, and never above the cheekbone row.
+  if (g.face.beard > 0) {
+    const bd = g.face.beard;
+    const topZ = eyeZ - 2;
+    const reach = 1.5 + bd * (sx * 0.5);     // half-width it spreads to
+    for (let i = 0; i < out.length; i++) {
+      const [x, y, z, c] = out[i];
+      if (z > topZ || z < skullLo) continue;
+      if (c === ART.EYE) continue;
+      if (y + 0.5 < hcy - 0.5) continue;        // the back of the head
+      const dx = Math.abs(x + 0.5 - cx);
+      // The cheek above the jaw stays bare until the beard is full.
+      const jawRow = z <= skullLo + 1 + Math.round(bd * 3);
+      if (dx > reach || (dx > 2.2 && !jawRow && bd < 0.75)) continue;
+      const edge = dx > reach - 1 || (!jawRow && dx > 1.2);
+      if (!edge || hashN(x, y, z, 97) / 4294967296 < 0.55)
+        out[i] = [x, y, z, ART.HAIR_SHADE];
+    }
+  }
   // Eyes and mouth are repaints of the FRONTMOST existing cell in their
   // column, so they can never float in front of the face or sink into it.
   const paintFront = (cols, z, col) => {
@@ -1834,7 +2126,7 @@ const HAIR_MAX_EXTENT = 110;
 
 export function hairWants(h) {
   return h.volume > 0 || h.crest > 0 || h.spikes > 0 || !!h.buns ||
-         h.drop > 0 || h.tail > 0;
+         h.drop > 0 || h.tail > 0 || h.bangs > 0;
 }
 
 function hairMass(g, parts) {
@@ -1861,7 +2153,11 @@ function hairMass(g, parts) {
       c0 = [Math.min(c0[0], X), Math.min(c0[1], Y), Math.min(c0[2], Z)];
       c1 = [Math.max(c1[0], X), Math.max(c1[1], Y), Math.max(c1[2], Z)];
     }
-    if (c === ART.HAIR || c === ART.HAIR_SHADE) scalp.push([X, Y, Z]);
+    // SKIN_LIGHT on the skull is scalp showing through thin hair (headVox's
+    // scalpShows): still scalp, so the mass roots there and is not pushed off
+    // it the way it is pushed off the face.
+    if (c === ART.HAIR || c === ART.HAIR_SHADE || c === ART.SKIN_LIGHT)
+      scalp.push([X, Y, Z]);
     else skin.add(K(X, Y, Z));
   }
   if (!scalp.length) return [];                 // bald: nothing to root on
@@ -2190,6 +2486,163 @@ function hairMass(g, parts) {
     for (const v of mass.values())
       if (v[3] === ART.HAIR && v[2] < C[2] && mass.has(K(v[0], v[1] + 1, v[2])))
         v[3] = ART.HAIR_SHADE;
+  }
+
+  // ---- bangs: a fringe hanging over the forehead ----------------------------
+  // One strand per column across the front hairline, lying ONE CELL PROUD of
+  // the face all the way down (it follows the brow as it bulges), so it is
+  // hair on the forehead rather than a visor standing off it. `bangs` 1 ends
+  // on the eye row. The parting (`side`) lengthens it on the side the cap's
+  // line drops toward, so a side part sweeps over one eye. The last
+  // `faceThin` share of each strand steps down through the wisp tiers, which
+  // is what lets bangs reach the eyes without hiding them.
+  const bangsCells = new Set();
+  // The face's front surface and the hairline seen from the front, shared by
+  // the bangs and by the face term of the thinning below.
+  const frontOf = new Map();                    // (X, Z) -> the face's front Y
+  const lineZ = new Map();                      // column -> front hairline Z
+  let eyeLo = 1e9;
+  const eyeFront = new Map();                   // (X, Z) of an eye -> its Y
+  if (h.bangs > 0 || h.faceThin > 0) {
+    for (const [x, y, z, c] of head.cells) {
+      const X = head.mn[0] + x, Y = head.mn[1] + y, Z = head.mn[2] + z;
+      const k = X * 4096 + Z;
+      if (!frontOf.has(k) || Y < frontOf.get(k)) frontOf.set(k, Y);
+      if (c === ART.EYE) {
+        if (Z < eyeLo) eyeLo = Z;
+        if (!eyeFront.has(k) || Y < eyeFront.get(k)) eyeFront.set(k, Y);
+      }
+    }
+    if (eyeLo === 1e9) eyeLo = Math.round(C[2] - skullH * 0.2);
+    // The hairline AS SEEN FROM THE FRONT: per column, walk down the face's
+    // front surface from the crown while it is still scalp. NOT the lowest
+    // scalp cell in the front third of the head -- on a style swept low at
+    // the nape that one sits beside the ear, below the eyes, and every column
+    // then had "no forehead" and grew nothing.
+    const scalpK = new Set(scalp.map(([X, Y, Z]) => K(X, Y, Z)));
+    for (let X = Math.floor(c0[0]); X <= c1[0]; X++) {
+      let z0 = null;
+      for (let Z = c1[2]; Z > eyeLo; Z--) {
+        const fy = frontOf.get(X * 4096 + Z);
+        if (fy === undefined) continue;          // above the crown here
+        if (!scalpK.has(K(X, fy, Z))) break;     // reached skin: the line
+        z0 = Z;
+      }
+      if (z0 !== null) lineZ.set(X, z0);
+    }
+  }
+  if (h.bangs > 0) {
+    for (const [X, z0] of lineZ) {
+      const ex = (X + 0.5 - C[0]) / Math.max(halfW, 1);
+      if (Math.abs(ex) > 0.9 || z0 <= eyeLo) continue;
+      const full = z0 - eyeLo + 1;
+      const len = h.bangs * full * (1 - h.side * ex * 0.45) *
+                  (1 - 0.15 * ex * ex) * (1 - h.ragged * 0.3 * rnd(X, z0, 83));
+      const n = Math.max(1, Math.min(full, Math.round(len)));
+      const wl = Math.round(h.faceThin * n);
+      const streak = rnd(X, 87) < 0.2;
+      // FORWARD ONLY. Hair hangs off the brow; it does not tuck back into the
+      // eye socket. Following the face in there stacked three and four wisp
+      // cells deep in front of each eye (the strand stepping in, the welder
+      // filling the step), and stacked wisps are opaque again -- the eyes
+      // vanished behind bangs meant to show them.
+      let y = Infinity;
+      for (let i = 0; i < n; i++) {
+        const z = z0 - i;
+        const fy = frontOf.get(X * 4096 + z);
+        if (fy === undefined) break;
+        y = Math.min(y, fy - 1);
+        const fromEnd = n - 1 - i;
+        let tier = 0;
+        if (wl >= 1 && fromEnd < wl) {
+          const f = fromEnd / wl;
+          tier = f < 1 / 3 ? 3 : f < 2 / 3 ? 2 : 1;
+        }
+        const k = K(X, y, z);
+        if (add(X, y, z, tier ? WISP[tier]
+                              : streak ? ART.HAIR_SHADE : ART.HAIR))
+          bangsCells.add(k);
+      }
+    }
+  }
+
+  // ---- regional thinning ------------------------------------------------------
+  // `wisp` thins the ENDS of what hangs; these thin by WHERE a cell is. Each
+  // region gives a score 0..1, the largest wins, and the score picks a wisp
+  // tier with a hashed dither (score 0.5 is a mix of tiers 1 and 2, not a
+  // band), so a region fades in rather than switching on. A cell is only ever
+  // made THINNER than it already is, and only hair slots are touched -- a
+  // tail's tie stays cloth. The bangs carry their own ramp (above), so the
+  // face term skips them.
+  // THE EYE WINDOW. With face thinning on, whatever lies in front of an eye
+  // keeps only its OUTERMOST cell and that cell is thinned hard; the layers
+  // between it and the eye go. A shell with any volume wraps two or three
+  // cells deep round the outer corner of the eye (it did before any of this:
+  // sidepart and bowl hide an eye), and three wisps in a row cover as much
+  // as one opaque cell -- thinning each layer could never open the eye. The
+  // removed cells are the hidden ones; the silhouette is unchanged.
+  const eyeWin = new Set();
+  if (h.faceThin > 0 && eyeFront.size) {
+    const cols = new Map();
+    for (const [k, ey] of eyeFront) {
+      const X = Math.floor(k / 4096), Z = k - X * 4096;
+      for (let dz = -1; dz <= 1; dz++)
+        for (let dx = -1; dx <= 1; dx++) {
+          const kk = (X + dx) * 4096 + (Z + dz);
+          if (!cols.has(kk) || ey > cols.get(kk)) cols.set(kk, ey);
+        }
+    }
+    for (const [kk, ey] of cols) {
+      const X = Math.floor(kk / 4096), Z = kk - X * 4096;
+      let outer = null;
+      for (let Y = ey - 1; Y > ey - 12; Y--)
+        if (mass.has(K(X, Y, Z))) {
+          if (outer !== null) mass.delete(K(X, outer, Z));
+          outer = Y;
+        }
+      if (outer !== null) eyeWin.add(K(X, outer, Z));
+    }
+  }
+
+  if (h.faceThin > 0 || h.sideThin > 0 || h.topThin > 0 || h.fluff > 0) {
+    const TIER_OF = { [ART.HAIR_WISP1]: 1, [ART.HAIR_WISP2]: 2,
+                      [ART.HAIR_WISP3]: 3 };
+    const open = (X, Y, Z) => !body.has(K(X, Y, Z)) && !mass.has(K(X, Y, Z));
+    for (const [k, v] of mass) {
+      const [X, Y, Z, slot] = v;
+      const cur = TIER_OF[slot] || 0;
+      if (!cur && slot !== ART.HAIR && slot !== ART.HAIR_SHADE) continue;
+      let s = 0;
+      if (h.faceThin > 0 && !bangsCells.has(k)) {
+        // Forward of the ears and below the crown: the hair that frames the
+        // face, not the top of the head.
+        // Where the column has a front hairline, only at or below it: the
+        // hair on top running INTO a fringe is dense, and thinning it left an
+        // opaque band at the fringe's root with see-through hair above it.
+        const fwd = (C[1] - (Y + 0.5)) / Math.max(halfD, 1);
+        const line = lineZ.get(X);
+        const low = line !== undefined
+          ? clamp((line + 1.5 - Z) / 3, 0, 1)
+          : clamp((C[2] + skullH * 0.35 - Z) / (skullH * 0.3), 0, 1);
+        s = Math.max(s, h.faceThin * clamp((fwd - 0.1) / 0.7, 0, 1) * low);
+      }
+      if (h.sideThin > 0) {
+        const ax = Math.abs(X + 0.5 - C[0]) / Math.max(halfW, 1);
+        s = Math.max(s, h.sideThin * clamp((ax - 0.6) / 0.5, 0, 1));
+      }
+      if (h.topThin > 0) {
+        const u = clamp((Z + 0.5 - (C[2] + skullH * 0.1)) / (skullH * 0.4), 0, 1);
+        s = Math.max(s, h.topThin * u);
+      }
+      if (eyeWin.has(k)) s = Math.max(s, 0.34 + h.faceThin * 0.66);
+      if (h.fluff > 0 &&
+          (open(X + 1, Y, Z) || open(X - 1, Y, Z) || open(X, Y + 1, Z) ||
+           open(X, Y - 1, Z) || open(X, Y, Z + 1) || open(X, Y, Z - 1)))
+        s = Math.max(s, h.fluff);
+      if (s <= 0) continue;
+      const t = Math.min(3, Math.floor(s * 3 + rnd(X, Y, Z, 89)));
+      if (t > cur) v[3] = WISP[t];
+    }
   }
 
   // ---- split by what it rides, then into connected pieces -------------------
