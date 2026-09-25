@@ -194,10 +194,11 @@ inline uint64_t DropItemToWorld(const ItemDef& def, Vec3 at, Vec3 vel,
   if (!body) return 0;
   phys.SetBodyVelocity(body, vel);
   // Thrown from the eye — which is INSIDE the player's capsule proxy (3
-  // voxels of half-width against a 2-voxel throw). Off the player's contact
-  // layer until it has flown clear, or the proxy shoves the player away from
-  // their own drop.
-  phys.ReleaseToWorldWhenClear(body);
+  // voxels of half-width against a 2-voxel throw). A loose role clears the
+  // player before it is ordinary debris, or the proxy shoves the player away
+  // from their own drop. (A THROW re-sets it Thrown, with its thrower,
+  // straight after: session.cpp.)
+  phys.SetBodyRole(body, Physics::BodyRole::Debris);
   // The micro brick travels with it so a dropped item keeps its detail — the
   // same argument a severed limb makes, and the reason a dropped sword does
   // not visibly coarsen the moment it leaves your hand.

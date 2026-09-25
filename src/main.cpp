@@ -6350,6 +6350,9 @@ int main(int argc, char** argv) {
   // player; terrain collision stays in the AABB controller
   uint64_t& playerBody = session.playerBody;
   playerBody = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+  // The avatar's body is exempt from THIS capsule and nobody else's
+  // (Physics::BodyRole, OWNED). Once, here: every respawn reads it.
+  session.avatar.SetCollisionOwner(playerBody);
 
   bool& captured = session.captured;
   // What `captured` was before the character screen took the cursor, so
@@ -9748,7 +9751,7 @@ int main(int argc, char** argv) {
           grab.Release(phys);
           eGrabbed = true;
         } else if (const uint64_t g = GrabHold::Grabbable(debris, &mobs, lookBody)) {
-          if (grab.Begin(phys, g, tp, player.EyePos())) {
+          if (grab.Begin(phys, g, tp, player.EyePos(), playerBody)) {
             eGrabbed = true;
           } else if (grab.RefusedTooHeavy()) {
             ui.kitMessage = "too heavy to lift";

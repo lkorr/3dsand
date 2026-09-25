@@ -355,6 +355,9 @@ const char* const kOrder[] = {
     // debris and mobs into every arm and regenerates pristine worldgen at
     // kDefaultSeed on the way out.
     "remote-ghost",
+    // W2-N: roles -> layers, owner-scoped with two capsules and two avatars.
+    // CPU + Jolt only, touches no World state, removes every body it made.
+    "layer-roles",
     // W1-F: one player's grenade carves and launches the other (and carves,
     // but never launches, a peer's ghost). CPU + Jolt, resets debris and mobs
     // on both sides; beside the other two-body gates.

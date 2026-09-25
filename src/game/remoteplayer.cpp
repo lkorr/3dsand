@@ -236,6 +236,10 @@ void RemotePlayersPreTick(RemotePlayers& remotes, uint32_t tick, float dt,
       // Jolt body every death is how handles leak.
       if (r.proxyBody == 0)
         r.proxyBody = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+      // The ghost's body is exempt from ITS OWN capsule only: the local
+      // player walking into a peer is shoved by the peer's limbs, as by any
+      // creature's, and a peer's limbs never shove the peer's own proxy.
+      r.avatar.SetCollisionOwner(r.proxyBody);
       remotes.dirty = true;  // a new Mob* has to reach MobSystem's avatar list
     }
 

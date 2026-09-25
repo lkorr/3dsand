@@ -1632,8 +1632,10 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           // own voxels (`at` is the body's min corner). Without a body, from
           // in front of the eye. Either way it starts inside the capsule and
           // among the thrower's own limbs, which is why the release below is
-          // `thrown`: on the plain AVATAR layer it struck the thrower's head
-          // and arm on its first step and burst in their face.
+          // Thrown: on the plain exempt layer it struck the thrower's head
+          // and arm on its first step and burst in their face. Owned by THIS
+          // player's capsule, so it clears its thrower and still hits anyone
+          // else it is thrown at (Physics::BodyRole, THROWN(P)).
           Vec3 at = player.EyePos() + fwd * 2.0f - Vec3{0, 0.5f, 0};
           {
             Vec3 hp;
@@ -1656,7 +1658,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                                          *w.ground, nullptr, vs.dye,
                                          PackItemFill(vs.fillMat, vs.fillAmt))
                        : 0;
-          if (body) phys.ReleaseToWorldWhenClear(body, /*thrown=*/true);
+          if (body) phys.SetBodyRole(body, Physics::BodyRole::Thrown, playerBody);
           if (body) {
             // End over end about the throw's own right axis: a spun flask
             // reads as thrown, a translating one as teleported.
@@ -2924,7 +2926,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           const uint64_t h = phys.CreateSphereBody(rq.pos, r, density);
           if (!h) continue;
           phys.SetBodyVelocity(h, rq.vel);
-          phys.ReleaseToWorldWhenClear(h);
+          phys.SetBodyRole(h, Physics::BodyRole::Debris);  // clears the caster first
           debris.AdoptBody(h, std::move(ball), xf);
           spells.AdoptBody(rq.token, h);
         }

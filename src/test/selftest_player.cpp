@@ -2194,6 +2194,258 @@ Status GateRemoteGhost(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- layer-roles (W2-N) ------------------------------------------------------
+//
+// A body's collision layer is DERIVED from its role (Physics::BodyRole), and a
+// player's own body is exempt from THAT player's capsule only. Four claims,
+// each a separate arm so a failure names which:
+//   A. the table: every role x owner kind resolves to the documented layer,
+//      settled and clearing (the pure ResolveLayer, walked in full);
+//   B. owner scoping with two avatars and two capsules: A's limbs do not meet
+//      A's capsule and do not shove A (PlayerPushOut), and DO meet B's capsule
+//      and DO shove B; an avatar never told its proxy is exempt from both
+//      (the pre-W2-N AVATAR layer, the control);
+//   C. a throw owned by A clears A (its capsule and its limbs) but meets B,
+//      and settles to loose Debris on MOVING once clear of both;
+//   D. the transitions: an avatar going limp keeps its owned layer, an NPC
+//      going limp clears first then settles on MOVING, and an attached role
+//      given to a body still clearing applies at once when no player could
+//      feel it (PROP) and waits otherwise — the get-up sword that a stale
+//      release used to knock back onto MOVING.
+// CPU + Jolt only: no tick, no World mutation. Leaves nothing behind.
+Status GateLayerRoles(Ctx& c, std::string& detail) {
+  using R = Physics::BodyRole;
+  Physics& phys = c.phys;
+  std::vector<std::string> fails;
+  auto check = [&](bool ok, const std::string& what) {
+    if (!ok) fails.push_back(what);
+  };
+  char buf[256];
+
+  // ---- A. the table ----------------------------------------------------------
+  // Layer ids (physics.h BodyObjectLayer): 1 MOVING, 3 EXEMPT, 4 PROP,
+  // 5 THROWN, 16+s OWNED by s, 24+s THROWN by s. Slot 2 stands in for "some
+  // owner" so an off-by-one between the families shows up.
+  struct Row {
+    R role;
+    int none, owned, any;           // settled: owner none / slot 2 / any
+    int cNone, cOwned, cAny;        // clearing
+  };
+  const Row rows[] = {
+      {R::Debris, 1, 1, 1, 3, 3, 3},
+      {R::RigLive, 1, 18, 3, 3, 3, 3},
+      {R::RigLimp, 1, 1, 1, 3, 3, 3},
+      {R::RigDead, 1, 1, 1, 3, 3, 3},
+      {R::WornShell, 1, 18, 3, 3, 3, 3},
+      {R::HeldProp, 4, 4, 4, 4, 4, 4},
+      {R::Carried, 1, 18, 3, 3, 3, 3},
+      {R::SeveredHold, 3, 3, 3, 3, 3, 3},
+      {R::Thrown, 1, 1, 1, 5, 26, 5},
+  };
+  int tableBad = 0;
+  for (const Row& r : rows) {
+    const int got[6] = {
+        Physics::ResolveLayer(r.role, -2, false),
+        Physics::ResolveLayer(r.role, 2, false),
+        Physics::ResolveLayer(r.role, -1, false),
+        Physics::ResolveLayer(r.role, -2, true),
+        Physics::ResolveLayer(r.role, 2, true),
+        Physics::ResolveLayer(r.role, -1, true)};
+    const int want[6] = {r.none, r.owned, r.any, r.cNone, r.cOwned, r.cAny};
+    for (int k = 0; k < 6; k++)
+      if (got[k] != want[k]) {
+        tableBad++;
+        std::snprintf(buf, sizeof buf, "table %s[%d] = %d, want %d",
+                      Physics::RoleName(r.role), k, got[k], want[k]);
+        check(false, buf);
+      }
+  }
+
+  // ---- fixture: two capsules, two avatars -----------------------------------
+  const IVec3 wo = c.world.WindowOrigin();
+  const int cx = wo.x + (int)kWorldN / 2, cz = wo.z + (int)kWorldN / 2;
+  const float gy = (float)World::TerrainHeight(cx, cz, kDefaultSeed) + 1.0f;
+  const uint64_t pb0 = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+  const uint64_t pb1 = phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+  const int s0 = phys.PlayerSlotOf(pb0), s1 = phys.PlayerSlotOf(pb1);
+  check(s0 >= 0 && s1 >= 0 && s0 != s1, "two capsules, two distinct slots");
+  Player pA, pB, pC;
+  pA.fly = pB.fly = pC.fly = true;
+  pA.pos = Vec3{(float)cx + 0.5f, gy + Player::kHalfY, (float)cz + 0.5f};
+  pB.pos = pA.pos + Vec3{40.0f, 0.0f, 0.0f};
+  pC.pos = pA.pos + Vec3{-40.0f, 0.0f, 0.0f};
+  pA.SnapRender();
+  pB.SnapRender();
+  pC.SnapRender();
+  auto pin = [&](uint64_t pb, Vec3 at) {
+    phys.MovePlayerBody(pb, at, kTickDt);
+    phys.SetBodyVelocity(pb, Vec3{});
+  };
+  pin(pb0, pA.pos);
+  pin(pb1, pB.pos);
+
+  PlayerAvatar avA(0x5A11EDU + 20), avB(0x5A11EDU + 21), avC(0x5A11EDU + 22);
+  for (PlayerAvatar* av : {&avA, &avB, &avC}) {
+    av->Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+    av->SetDefs(&c.mobs.Defs(), kAvatarDefName);
+  }
+  if (!avA.HasDef()) {
+    phys.RemoveBody(pb0);
+    phys.RemoveBody(pb1);
+    detail = std::string("no mob def named \"") + kAvatarDefName + "\"";
+    std::printf("layer-roles: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  // A is told its capsule BEFORE it spawns (the main.cpp order), B AFTER
+  // (the re-application path: SetCollisionOwner re-derives every live slot),
+  // C never (the control).
+  avA.SetCollisionOwner(pb0);
+  avA.Spawn(pA, 0.0f);
+  avB.Spawn(pB, 0.0f);
+  avB.SetCollisionOwner(pb1);
+  avC.Spawn(pC, 0.0f);
+  std::vector<uint64_t> limbsA, limbsB, limbsC;
+  avA.AppendBodyHandles(limbsA);
+  avB.AppendBodyHandles(limbsB);
+  avC.AppendBodyHandles(limbsC);
+  check(!limbsA.empty() && !limbsB.empty() && !limbsC.empty(),
+        "three avatars spawned with limb bodies");
+
+  // ---- B. owner scoping -----------------------------------------------------
+  int aWrongLayer = 0, aMeetsOwn = 0, aMissesOther = 0;
+  for (uint64_t h : limbsA) {
+    if (phys.BodyObjectLayer(h) != 16 + s0) aWrongLayer++;
+    if (phys.LayersCollide(h, pb0)) aMeetsOwn++;
+    if (!phys.LayersCollide(h, pb1)) aMissesOther++;
+  }
+  int bWrongLayer = 0;
+  for (uint64_t h : limbsB)
+    if (phys.BodyObjectLayer(h) != 16 + s1) bWrongLayer++;
+  int cMeetsAny = 0, cWrongLayer = 0;
+  for (uint64_t h : limbsC) {
+    if (phys.BodyObjectLayer(h) != 3) cWrongLayer++;
+    if (phys.LayersCollide(h, pb0) || phys.LayersCollide(h, pb1)) cMeetsAny++;
+  }
+  std::snprintf(buf, sizeof buf,
+                "A's %zu limbs: %d off OWNED(%d), %d meet A's capsule, %d miss "
+                "B's", limbsA.size(), aWrongLayer, s0, aMeetsOwn, aMissesOther);
+  check(aWrongLayer == 0 && aMeetsOwn == 0 && aMissesOther == 0, buf);
+  std::snprintf(buf, sizeof buf, "B (owner told after spawn): %d limbs off OWNED(%d)",
+                bWrongLayer, s1);
+  check(bWrongLayer == 0, buf);
+  std::snprintf(buf, sizeof buf,
+                "C (no owner): %d limbs off EXEMPT, %d meet a capsule",
+                cWrongLayer, cMeetsAny);
+  check(cWrongLayer == 0 && cMeetsAny == 0, buf);
+  // The push itself — the claim a player feels. A standing in A's own body
+  // is not shoved by it; B standing in the same place is, by one of A's.
+  Physics::PushSource worstB{};
+  const float pushOwn = phys.PlayerPushOut(pb0, pA.pos).len();
+  const float pushOther = phys.PlayerPushOut(pb1, pA.pos, &worstB).len();
+  const bool byA =
+      std::find(limbsA.begin(), limbsA.end(), worstB.body) != limbsA.end();
+  std::snprintf(buf, sizeof buf,
+                "push inside A's body: A %.3f vox (want 0), B %.3f vox by %s "
+                "(want > 0, by one of A's limbs)",
+                pushOwn, pushOther, byA ? "A's limb" : "something else");
+  check(pushOwn < 1e-3f && pushOther > 1e-3f && byA, buf);
+
+  // ---- C. a throw owned by A --------------------------------------------------
+  std::vector<DebrisVoxel> cube;
+  for (int8_t z = 0; z < 2; z++)
+    for (int8_t y = 0; y < 2; y++)
+      for (int8_t x = 0; x < 2; x++)
+        cube.push_back(DebrisVoxel{x, y, z, 0, (uint16_t)kMatStone});
+  auto block = [&](Vec3 at) {
+    BodyTransform xf{};
+    xf.pos = at;
+    xf.quat[3] = 1;
+    const uint64_t h = phys.CreateDebrisBodyXf(cube, xf, c.debris.DensityOf(), true);
+    if (h) {
+      phys.SetBodyKinematic(h, true);  // stays where it is put
+    }
+    return h;
+  };
+  const uint64_t flask = block(pA.pos);
+  phys.SetBodyRole(flask, R::Thrown, pb0);
+  const bool thrownClearing = phys.BodyClearing(flask);
+  const int thrownLayer = phys.BodyObjectLayer(flask);
+  const bool fMeetsA = phys.LayersCollide(flask, pb0) ||
+                       (!limbsA.empty() && phys.LayersCollide(flask, limbsA[0]));
+  const bool fMeetsB = phys.LayersCollide(flask, pb1) &&
+                       (!limbsB.empty() && phys.LayersCollide(flask, limbsB[0]));
+  std::snprintf(buf, sizeof buf,
+                "throw by A: layer %d (want %d), clearing %d, meets A %d, "
+                "meets B's capsule+limb %d",
+                thrownLayer, 24 + s0, thrownClearing ? 1 : 0, fMeetsA ? 1 : 0,
+                fMeetsB ? 1 : 0);
+  check(thrownLayer == 24 + s0 && thrownClearing && !fMeetsA && fMeetsB, buf);
+
+  // ---- D. transitions ---------------------------------------------------------
+  // A pending body given an ATTACHED role nobody can feel (HeldProp) stops
+  // clearing at once; given one a player could feel (an unowned RigLive, i.e.
+  // MOVING) it keeps clearing and settles on THAT role's layer when clear.
+  const uint64_t sword = block(pA.pos);
+  phys.SetBodyRole(sword, R::RigLimp);
+  const bool swordWasClearing = phys.BodyClearing(sword);
+  phys.SetBodyRole(sword, R::HeldProp);
+  const uint64_t limb = block(pA.pos);
+  phys.SetBodyRole(limb, R::RigLimp);
+  phys.SetBodyRole(limb, R::RigLive);
+  const bool limbStillClearing =
+      phys.BodyClearing(limb) && phys.BodyObjectLayer(limb) == 3;
+  // A goes limp: an avatar's limbs stay its own. An NPC-like loose limp role is
+  // the `limb` above; the NPC path proper is exercised by `ragdoll`.
+  avA.StartRagdoll(1.0f, "layer-roles");
+  int limpOff = 0;
+  std::vector<uint64_t> limbsA2;
+  avA.AppendBodyHandles(limbsA2);
+  for (uint64_t h : limbsA2)
+    if (phys.BodyObjectLayer(h) != 16 + s0 || phys.BodyClearing(h)) limpOff++;
+  // Everyone walks away; one Step runs the clearing sweep.
+  const Vec3 far{pA.pos.x, pA.pos.y + 200.0f, pA.pos.z};
+  pin(pb0, far);
+  pin(pb1, far + Vec3{20.0f, 0.0f, 0.0f});
+  phys.Step(kTickDt);
+  const bool flaskSettled = !phys.BodyClearing(flask) &&
+                            phys.BodyObjectLayer(flask) == 1 &&
+                            phys.BodyRoleOf(flask) == R::Debris;
+  const bool swordProp = !phys.BodyClearing(sword) &&
+                         phys.BodyObjectLayer(sword) == 4;
+  const bool limbSettled = !phys.BodyClearing(limb) &&
+                           phys.BodyObjectLayer(limb) == 1 &&
+                           phys.BodyRoleOf(limb) == R::RigLive;
+  std::snprintf(buf, sizeof buf,
+                "clear of both: throw settled %d (Debris on MOVING), "
+                "pending->HeldProp %d (was clearing %d), pending->RigLive held "
+                "%d then settled %d, avatar limp keeps OWNED: %d off",
+                flaskSettled ? 1 : 0, swordProp ? 1 : 0,
+                swordWasClearing ? 1 : 0, limbStillClearing ? 1 : 0,
+                limbSettled ? 1 : 0, limpOff);
+  check(flaskSettled && swordProp && swordWasClearing && limbStillClearing &&
+            limbSettled && limpOff == 0,
+        buf);
+
+  // ---- leave nothing behind --------------------------------------------------
+  for (uint64_t h : {flask, sword, limb})
+    if (h) phys.RemoveBody(h);
+  avA.Despawn();
+  avB.Despawn();
+  avC.Despawn();
+  phys.RemoveBody(pb0);
+  phys.RemoveBody(pb1);
+
+  const bool ok = fails.empty();
+  detail.clear();
+  for (const std::string& f : fails) detail += (detail.empty() ? "" : " | ") + f;
+  if (ok)
+    detail = "table 9 roles x 6 walked; A/B owner-scoped both ways (push own "
+             "0, other > 0); throw clears thrower only; clearing transitions ok";
+  std::printf("layer-roles: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  (void)tableBad;
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& PlayerGates() {
@@ -2208,6 +2460,7 @@ const std::vector<Gate>& PlayerGates() {
       {"view-smooth", "player", {}, false, GateViewSmooth},
       {"two-players", "player", {}, false, GateTwoPlayers},
       {"remote-ghost", "player", {}, false, GateRemoteGhost},
+      {"layer-roles", "player", {}, false, GateLayerRoles},
   };
   return g;
 }

@@ -226,8 +226,8 @@ class Physics {
   void ReplaceBody(uint64_t oldHandle, uint64_t newHandle);
   // The layer half of ReplaceBody on its own, for a rebuild that re-makes its
   // joints itself (Mob::RebuildLimbBody) and for a SPLIT, where the parent
-  // stays. `to` takes `from`'s object layer, and if `from` was waiting in
-  // ReleaseToWorldWhenClear's list, `to` is added to it (never in place of
+  // stays. `to` takes `from`'s ROLE, owner and object layer (SetBodyRole), and
+  // if `from` was still CLEARING, `to` is added to the list (never in place of
   // `from`: a dead parent is forgotten by the next Step, a live one keeps its
   // own entry). Without this a body rebuilt or split INSIDE the player came
   // back on the plain MOVING layer and shoved them — a burning gobbet that
@@ -307,26 +307,113 @@ class Physics {
   // a hood and the head inside it.
   bool SetBodyTransform(uint64_t handle, Vec3 posVoxel, const float quat[4]);
 
-  // Move a body onto (or off) the PLAYER-AVATAR collision layer. Bodies there
-  // behave exactly like normal dynamic bodies except that they never generate
-  // contacts with the player proxy, and they are invisible to PlayerPushOut.
+  // ---- A BODY'S COLLISION LAYER IS DERIVED FROM ITS ROLE (W2-N) -----------
   //
-  // WHY THIS EXISTS. The player's avatar is drawn around the player's own
+  // Callers say WHAT a body is; this class alone decides which Jolt object
+  // layer that means (ResolveLayer) and which pairs of layers meet (the pair
+  // filter in physics.cpp). Until 2026-09-24 the layer was set imperatively
+  // at ~24 sites (SetBodyAvatarLayer, SetBodyPropLayer,
+  // ReleaseToWorldWhenClear) and every missed site was its own bug: a rebuilt
+  // blade back on MOVING, a thrown flask bursting on the thrower's head, a
+  // get-up sword knocked back to MOVING later by a release still pending.
+  //
+  // THE ROLES, and the layer each resolves to (`owner` = a player proxy
+  // handle, kNoOwner, or kAnyPlayer):
+  //
+  //   role          owner none   owner = proxy P       owner any / unknown
+  //   ------------  -----------  --------------------  -------------------
+  //   RigLive       MOVING       OWNED(P)              EXEMPT
+  //   WornShell     MOVING       OWNED(P)              EXEMPT
+  //   Carried       MOVING       OWNED(P)              EXEMPT
+  //   HeldProp      PROP         PROP                  PROP
+  //   SeveredHold   EXEMPT       EXEMPT                EXEMPT
+  //   Debris        MOVING, entered through CLEARING
+  //   RigLimp       MOVING, entered through CLEARING
+  //   RigDead       MOVING, entered through CLEARING
+  //   Thrown        THROWN(P) / THROWN while clearing, then Debris on MOVING
+  //
+  // OWNED(P) is the OWNER-SCOPED exemption: exactly MOVING, except that it
+  // never meets player P's capsule and P's PlayerPushOut never sees it. Every
+  // OTHER player's capsule does meet it: your own body cannot shove you, and
+  // somebody else's can. (The old AVATAR layer exempted a body from EVERY
+  // player's capsule, which is wrong the moment there are two.) EXEMPT is that
+  // old layer, kept for what really is exempt from everyone: a piece inside
+  // somebody, and an avatar whose proxy it has not been told
+  // (Mob::SetCollisionOwner). PROP meets nothing and is seen by every query.
+  // THROWN meets terrain and ordinary bodies only; THROWN(P) also meets bodies
+  // and capsules that are not P's.
+  //
+  // WHY OWNED EXISTS. The player's avatar is drawn around the player's own
   // capsule, so its limbs are permanently interpenetrated with the proxy. On
   // the normal layer that produced a large depenetration push every tick whose
   // direction swung with the gait animation — the player's own body steering
   // them backwards and sideways. Rays and other queries still see these
   // bodies, so laser/damage hits on the avatar are unaffected.
   //
-  // Call with `false` when a limb is severed: the detached piece stops being
-  // "you" and should be able to bump into you like any other debris.
-  void SetBodyAvatarLayer(uint64_t handle, bool isAvatar);
-
-  // A HELD WEAPON IS CARRIED, NOT SIMULATED.
+  // CLEARING is the one transition rule, in one place (was
+  // ReleaseToWorldWhenClear). Everything that leaves a creature — a severed
+  // limb, a cut strap's pauldron, a sword knocked from a hand, a carved-off
+  // gobbet, a corpse's limbs, an item dropped from the pack — is created
+  // exactly where the creature is, which for the player means INSIDE the
+  // capsule proxy. On MOVING that is a deep penetration the solver cannot
+  // resolve, and PlayerPushOut turns it into a shove of up to a body-width per
+  // tick for as long as the overlap lasts: "my arm came off and I was launched
+  // across the field". So a LOOSE role (Debris, RigLimp, RigDead, Thrown)
+  // always enters by waiting on EXEMPT — THROWN for a throw, because EXEMPT
+  // meets EXEMPT and a flask thrown from the hand hit your own head and burst
+  // — and every Step each waiting body whose world AABB is clear of EVERY live
+  // proxy (M9.1 P2) settles on its own layer: ordinary debris that can be
+  // stood on, kicked and picked up. The check is an AABB test (one lock per
+  // body), bounded by kMaxPendingRelease; past that the oldest settles
+  // unconditionally rather than the list growing. With no live proxy there is
+  // nobody to protect and it settles at once. Re-setting a loose role re-arms
+  // the wait. An ATTACHED role (the other five) applies at once — except that
+  // a body still clearing, given an attached role some player could feel,
+  // keeps clearing and settles on that role's layer when clear.
   //
-  // Move a body onto (or off) the PROP layer, which generates contacts with
-  // NOTHING — no terrain, no debris, no creature, no player proxy — while
-  // staying fully visible to ray casts and every other query.
+  // The role and owner live in the Jolt body's user data, so ReplaceBody and
+  // CarryLayer take them to a rebuilt collider with no caller involvement. A
+  // body this class creates starts as Debris on MOVING, not clearing.
+  enum class BodyRole : uint8_t {
+    Debris = 0,
+    RigLive,
+    RigLimp,
+    RigDead,
+    WornShell,
+    HeldProp,
+    Carried,
+    SeveredHold,
+    Thrown,
+    Count,
+  };
+  static constexpr uint64_t kNoOwner = 0;
+  static constexpr uint64_t kAnyPlayer = (1ull << 56) - 1;
+  static bool IsLooseRole(BodyRole r) {
+    return r == BodyRole::Debris || r == BodyRole::RigLimp ||
+           r == BodyRole::RigDead || r == BodyRole::Thrown;
+  }
+  static const char* RoleName(BodyRole r);
+  void SetBodyRole(uint64_t handle, BodyRole role, uint64_t owner = kNoOwner);
+  BodyRole BodyRoleOf(uint64_t handle) const;
+  uint64_t BodyOwnerOf(uint64_t handle) const;
+  // True while the body waits to be clear of every player (see CLEARING).
+  bool BodyClearing(uint64_t handle) const;
+  // THE ONE MAPPING, pure. `ownerSlot`: -2 no owner, -1 any/unknown, else the
+  // owning proxy's slot (PlayerSlotOf). Returns a Jolt object layer number.
+  static int ResolveLayer(BodyRole role, int ownerSlot, bool clearing);
+  // The owner-scoping slot a player proxy was given (0..kMaxPlayerProxies-1),
+  // or -1 for a dead handle or a proxy past the slot count (which then
+  // behaves like the old single PLAYER layer: every OWNED body meets it).
+  int PlayerSlotOf(uint64_t proxy) const;
+  // Would the SIMULATION let these two bodies' layers meet? The pair filter
+  // asked directly (a rig's group exclusions not included). For gates.
+  bool LayersCollide(uint64_t a, uint64_t b) const;
+
+  // ---- HeldProp: A HELD WEAPON IS CARRIED, NOT SIMULATED ----
+  //
+  // The PROP layer generates contacts with NOTHING — no terrain, no debris,
+  // no creature, no player proxy — while staying fully visible to ray casts
+  // and every other query.
   //
   // WHY THIS EXISTS. A sword in a fist is a kinematic body posed by its
   // wielder's hand every tick and pinned to it by a Fixed joint. Contacts can
@@ -354,41 +441,9 @@ class Physics {
   //
   // A prop that stops being held — dropped, thrown, knocked loose, severed
   // with the arm, or dynamic under a ragdoll — must come off this layer, or
-  // it will fall through the floor. Every one of those paths already ends in
-  // ReleaseToWorldWhenClear or AdoptBody, which set the layer outright.
-  void SetBodyPropLayer(uint64_t handle, bool isProp);
-
-  // A BODY BORN INSIDE SOMEBODY MUST NOT SHOVE THEM OUT OF IT.
-  //
-  // Everything that leaves a creature — a severed limb, a cut strap's
-  // pauldron, a sword knocked from a hand, a carved-off gobbet, a corpse's
-  // limbs, an item dropped from the pack — is created exactly where the
-  // creature is, which for the player means INSIDE the capsule proxy. On the
-  // normal layer that is a deep penetration the solver cannot resolve, and
-  // PlayerPushOut turns it into a shove of up to a body-width per tick for as
-  // long as the overlap lasts: a kinematic piece (the severed-hold beat) does
-  // not move, so the PLAYER does, at ~36 m/s, until it is clear. That was "my
-  // arm came off and I was launched across the field".
-  //
-  // This puts the body on the no-player-contact layer (Layers::AVATAR, the
-  // same one the player's own attached limbs live on) and remembers it. Every
-  // Step, each remembered body whose world AABB no longer overlaps the proxy
-  // is moved back to MOVING and forgotten — clear of EVERY live proxy, not
-  // just one (M9.1 P2) — so it never pushes the creature
-  // it came off, and the moment it has fallen clear it is ordinary debris
-  // that can be stood on, kicked and picked up. The check is an AABB test
-  // (one lock per body), bounded by kMaxPendingRelease; past that the oldest
-  // is released unconditionally rather than the list growing.
-  //
-  // With no live player proxy in the world (a headless NPC-only run) the body
-  // goes straight to MOVING: there is nobody to protect.
-  //
-  // `thrown`: a projectile leaving the thrower's hand. It must not meet the
-  // thrower's own LIMBS either (AVATAR collides with AVATAR — a flask thrown
-  // from the hand hit your own head and burst), so it waits on Layers::THROWN,
-  // which touches only terrain and ordinary bodies. Calling again on a body
-  // already pending just re-sets its layer.
-  void ReleaseToWorldWhenClear(uint64_t handle, bool thrown = false);
+  // it will fall through the floor. Every one of those paths sets the role it
+  // becomes (RigLive / RigLimp / RigDead / SeveredHold / Debris), and a role
+  // is a whole layer: there is no "clear the prop flag" left to forget.
   static constexpr size_t kMaxPendingRelease = 256;
   // How many player proxies TickPendingReleases will test a piece against. A
   // bound, not a player cap: it sizes the stack array of AABBs gathered once
@@ -458,9 +513,12 @@ class Physics {
     float massKg = 0;
     float depthVox = 0;
   };
-  // Which object layer a body is on: 0 STATIC, 1 MOVING, 2 PLAYER, 3 AVATAR,
-  // 4 PROP, -1 dead. The layer is the whole of whether a body can shove the player,
-  // so a push that should have been impossible is answered by this.
+  // Which object layer a body is on: 0 STATIC, 1 MOVING, 2 PLAYER (a proxy
+  // with no slot), 3 EXEMPT (from every player; was AVATAR), 4 PROP,
+  // 5 THROWN, 8+s PLAYER slot s, 16+s OWNED by player s, 24+s THROWN by
+  // player s, -1 dead. The layer is the whole of whether a body can shove the
+  // player, so a push that should have been impossible is answered by this
+  // (and BodyRoleOf says WHY it is on it).
   int BodyObjectLayer(uint64_t handle) const;
   Vec3 PlayerPushOut(uint64_t handle, Vec3 centerVoxel,
                      PushSource* outWorst = nullptr) const;
@@ -474,8 +532,8 @@ class Physics {
   //
   // The list is filtered inside the listener before it is stored, because the
   // filter is what bounds it (CLAUDE.md rule 2): contacts below the speed gate,
-  // and anything touching the PLAYER proxy or a PLAYER-AVATAR limb, never
-  // become entries. Bodies on Layers::AVATAR are excluded by name — your own
+  // and anything touching a PLAYER proxy, an OWNED body or an EXEMPT one,
+  // never become entries. Those layers are excluded by name — your own
   // body parts are permanently interpenetrated with your capsule and would
   // otherwise machine-gun the mixer with your own footsteps.
   //
@@ -592,9 +650,10 @@ class Physics {
   std::unique_ptr<JointImpls> joints_;
   uint64_t nextJointId_ = 1;
   uint32_t nextCollisionGroup_ = 1;
-  // EVERY live player proxy (CreatePlayerBody), so ReleaseToWorldWhenClear can
-  // ask "is this body still inside A player" without the caller threading the
-  // handle through every mob. Empty in a world with no player.
+  // EVERY live player proxy (CreatePlayerBody), so CLEARING can ask "is this
+  // body still inside A player" without the caller threading the handle
+  // through every mob. Empty in a world with no player. Each proxy also holds
+  // an owner-scoping SLOT, encoded in its object layer (PlayerSlotOf).
   //
   // A LIST, NOT A SLOT (M9.1 P2). It was one handle, and the newest proxy won:
   // a second session's capsule would have silently stolen the protection from
@@ -610,6 +669,12 @@ class Physics {
   // World-space AABB of a live body, metres. False for a dead handle.
   bool WorldBounds(uint64_t handle, float outMin[3], float outMax[3]) const;
   void TickPendingReleases();
+  // SetBodyRole's halves: the owner's slot (-2 none, -1 any/unknown), whether
+  // any live proxy exists, and the layer a clearing body settles on.
+  int OwnerSlot(uint64_t owner) const;
+  bool AnyLivePlayer() const;
+  void SettleBody(uint64_t handle);
+  void AddPending(uint64_t handle);
   // ---- the FP-overflow net (see the long note in physics.cpp) ----
   // Called on every DYNAMIC body the moment it is added: floors a principal
   // moment of inertia that a decomposition left at (or below) zero, which is

@@ -31,11 +31,12 @@
 //     other debris about and cannot be pushed through terrain, because Jolt
 //     still solves the step it was given a velocity for.
 //
-// The body is moved onto the no-player-contact layer while held. It is riding
-// inside arm's reach with the player walking into it; on the normal layer that
-// is a permanent deep overlap, and PlayerPushOut turns a permanent deep
-// overlap into the player being shoved across the field (phys/physics.h
-// ReleaseToWorldWhenClear, which is also how it gets back).
+// The body is CARRIED while held (Physics::BodyRole::Carried, owned by the
+// grabbing player): exempt from that player's capsule and nobody else's. It is
+// riding inside arm's reach with the player walking into it; on the normal
+// layer that is a permanent deep overlap, and PlayerPushOut turns a permanent
+// deep overlap into the player being shoved across the field. Letting go makes
+// it loose Debris, which clears the player before it is ordinary again.
 //
 // NOT SIM STATE. Bodies are CPU float gameplay outside the hashed grid, and
 // this only ever writes velocities; nothing here can reach the world hash
@@ -81,8 +82,10 @@ class GrabHold {
 
   // Take `body` (already resolved through Grabbable). False when it is dead or
   // over player.grabMaxMass, in which case RefusedTooHeavy() says which.
+  // `owner`: the grabbing player's capsule proxy (Physics::kAnyPlayer when
+  // unknown: exempt from every capsule, the pre-W2-N behaviour).
   bool Begin(Physics& phys, uint64_t body, const Tuning::Player& tp,
-             Vec3 handVoxel) {
+             Vec3 handVoxel, uint64_t owner = Physics::kAnyPlayer) {
     refusedHeavy_ = false;
     if (!body) return false;
     Vec3 com;
@@ -102,7 +105,8 @@ class GrabHold {
     // table has to stay on the table.
     const float reach = tp.grabDistance / kVoxelMeters;
     dist_ = std::clamp((com - handVoxel).len(), 0.35f * reach, reach);
-    phys.SetBodyAvatarLayer(body_, true);
+    prevRole_ = phys.BodyRoleOf(body_);
+    phys.SetBodyRole(body_, Physics::BodyRole::Carried, owner);
     phys.ActivateBody(body_);
     return true;
   }
@@ -111,7 +115,12 @@ class GrabHold {
   // makes a walked-along crate carry on into the wall you shoved it at.
   void Release(Physics& phys) {
     if (!body_) return;
-    phys.ReleaseToWorldWhenClear(body_);
+    // Back to what it was before it was picked up. A dead Mob's limb
+    // (GrabbableDeadLimb) is a corpse's again; anything else DebrisSystem owns
+    // is loose debris. Both are loose roles, so both clear the player first.
+    phys.SetBodyRole(body_, prevRole_ == Physics::BodyRole::RigDead
+                                ? Physics::BodyRole::RigDead
+                                : Physics::BodyRole::Debris);
     phys.ActivateBody(body_);
     body_ = 0;
     massKg_ = 0.0f;
@@ -201,6 +210,9 @@ class GrabHold {
 
   uint64_t body_ = 0;
   float massKg_ = 0.0f;
+  // What the body was before it was Carried, so Release can say what it is
+  // again (a corpse limb stays a corpse's).
+  Physics::BodyRole prevRole_ = Physics::BodyRole::Debris;
   float dist_ = 0.0f;   // carry distance from the hand, voxels
   bool refusedHeavy_ = false;
 };

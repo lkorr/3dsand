@@ -8349,7 +8349,8 @@ exception: a carve mid-ragdoll rebuilds a DYNAMIC limb). Three things reach it
 and nothing else: a blast (`Mob::BlastRadial`), freefall past
 `ragdoll.fallSeconds` (NPC: `MobSystem::UpdateFall`; avatar: its own air
 clock), and the dev panel ("ragdoll me"; "ragdoll all spawned" in the NPC AI
-window). An NPC's limbs go through `ReleaseToWorldWhenClear` on the flip, for
+window). An NPC's limbs become the loose `RigLimp` role on the flip (they
+clear the player first; was `ReleaseToWorldWhenClear`), for
 the reason `Die()` documents — a body that goes dynamic inside the player's
 capsule otherwise fires out of it.
 
@@ -8586,7 +8587,68 @@ the world (`ragdoll player on fire`). What it found, in order of damage:
   5% of `playerMassKg` cannot push the player at all (the 80 kg proxy pushes
   it instead). Standing on a log or being shoved by a corpse is unchanged.
 
-### A held weapon is CARRIED, not simulated (2026-09-15; `Layers::PROP`, `Physics::SetBodyPropLayer`)
+### A body's collision layer is DERIVED FROM ITS ROLE (2026-09-24, W2-N; `Physics::BodyRole`)
+
+The sections below each added a layer and a call to set it: `AVATAR` for your
+own body, `PROP` for a held weapon, `ReleaseToWorldWhenClear` for everything
+that leaves a creature, `THROWN` for a flask. By 2026-09-24 that was ~24
+imperative sites (`SetBodyAvatarLayer` x6, `SetBodyPropLayer` x4,
+`ReleaseToWorldWhenClear` x9 plus the throw), and **every missed site was a
+separate bug** (d960a54 the rebuilt blade, 4689b1 the thrown flask, and a
+get-up sword a still-pending release later dropped back onto `MOVING`).
+`AVATAR` also exempted a body from EVERY player's capsule, which is wrong the
+moment there are two.
+
+Now a caller says what a body IS — `Physics::SetBodyRole(handle, role, owner)`
+— and `Physics::ResolveLayer(role, ownerSlot, clearing)` is the one place that
+turns it into a Jolt object layer. The role and owner live in the body's Jolt
+user data, so `ReplaceBody`/`CarryLayer` take them to a rebuilt collider with
+no caller involvement.
+
+| Role | owner none | owner = player P | owner any / unknown |
+|---|---|---|---|
+| `RigLive` (a live creature's limb) | `MOVING` | `OWNED(P)` | `EXEMPT` |
+| `WornShell` | `MOVING` | `OWNED(P)` | `EXEMPT` |
+| `Carried` (the grab) | `MOVING` | `OWNED(P)` | `EXEMPT` |
+| `HeldProp` | `PROP` | `PROP` | `PROP` |
+| `SeveredHold` (the 0.25 s beat) | `EXEMPT` | `EXEMPT` | `EXEMPT` |
+| `Debris`, `RigLimp` (an NPC's ragdoll), `RigDead` | `MOVING`, entered through CLEARING | | |
+| `Thrown` | `THROWN(P)` / `THROWN` while clearing, then `Debris` on `MOVING` | | |
+
+- **`OWNED(P)` is the owner-scoped exemption** (layer 16+slot): `MOVING`,
+  except that it never meets player P's capsule and P's `PlayerPushOut` never
+  sees it. Every OTHER capsule meets it and is pushed by it (with the
+  creature-phase rule for a kinematic limb, as for any NPC). Each player proxy
+  gets a slot at `CreatePlayerBody` (layer 8+slot; 8 slots = the release
+  sweep's `kMaxPlayerProxies`); a proxy past that is the unslotted `PLAYER` and
+  owns nothing. A player's avatar is told its proxy once by whoever made it —
+  `main.cpp` for the local session, `RemotePlayersPreTick` for a ghost —
+  through `Mob::SetCollisionOwner`; one never told keeps `EXEMPT` (the old
+  `AVATAR`, id 3), which is what every fixture that spawns an avatar without
+  wiring a proxy still gets.
+- **CLEARING is the one transition rule** (it was `ReleaseToWorldWhenClear`).
+  A LOOSE role always enters by waiting on `EXEMPT` (`THROWN` for a throw)
+  until its AABB is clear of every live proxy, then settles on its own layer;
+  with no proxy it settles at once. An ATTACHED role applies at once — except
+  that a body still clearing, given an attached role some player could feel
+  (`MOVING`/`OWNED`), keeps clearing and settles on THAT role's layer. The
+  settle is `ResolveLayer`, no longer a blanket `MOVING`.
+- **`THROWN(P)`** (24+slot) meets terrain, ordinary bodies, and bodies and
+  capsules that are not P's: a flask clears its thrower and still hits the man
+  it was thrown at. An unowned throw is the old `THROWN`.
+- **Mob side**: `Mob::LimbRole(i)` derives a slot's role from the creature's
+  state (alive / limp / dead, held slot, worn shell, hold);
+  `BuildRig`/`EquipItem`/`AppendWornShell` set their slot's role,
+  `StartRagdoll`/`BeginGetUp` re-derive every flipped slot, `Die` makes them
+  `RigDead`, and the three ends of a severed hold share `Mob::EndSeveredHold`.
+  The four "re-exclude the whole rig" group rebuilds are `Mob::RegroupRig`.
+
+Gate `layer-roles`: walks the whole table; two capsules and two avatars (A's
+limbs meet neither A's capsule nor A's push-out and DO meet B's and push B,
+plus an avatar never told its proxy as the control); a throw owned by A; and
+the clearing transitions, including the get-up case.
+
+### A held weapon is CARRIED, not simulated (2026-09-15; `Layers::PROP`, now the `HeldProp` role)
 
 Reported as "holding a sword moves other mobs, walking into an inactive sword
 moves me, fights feel clunky". Both halves are one mechanism, and it is not a
@@ -8628,9 +8690,13 @@ costs the swing nothing and is the part to check before touching it again:
 - `Mob::WeaponEdge` needs the body's TRANSFORM, which is why this moves a body
   between layers rather than removing it.
 
-**The flag is not set once.** A prop that stops being carried must come off the
-layer or it falls through the world, and a prop that resumes being carried must
-go back on:
+**The flag is not set once** — which is what the role derivation above
+replaced (2026-09-24): each row is now a ROLE the path sets or re-derives
+(`HeldProp` / `RigLive` / `RigLimp` / `RigDead` / `SeveredHold` / `Debris`),
+and `RebuildLimbBody`'s re-application is carried by the collider rebuild
+itself. The table is kept as the history of why each path matters. A prop that
+stops being carried must come off the layer or it falls through the world, and
+a prop that resumes being carried must go back on:
 | Path | What it does |
 |---|---|
 | `EquipItem` | sets it |
@@ -9924,7 +9990,11 @@ layers rather than a single-layer filter. `Physics::SetBodyAvatarLayer` moves a
 body on or off it; both layers map to the same broadphase layer, so this is
 never a broadphase rebuild. A severed limb is switched *back* to `MOVING` when
 its hold expires (and the whole corpse on death), because a detached arm has
-stopped being "you" and should bump you like any other debris.
+stopped being "you" and should bump you like any other debris. (Since W2-N the
+avatar's limbs are the `RigLive` role owned by the player's proxy — `OWNED`,
+exempt from THAT capsule only; `AVATAR` survives as `EXEMPT`, exempt from
+every capsule, for an avatar never told its proxy. See "A body's collision
+layer is DERIVED FROM ITS ROLE".)
 
 Selftest-gated: the avatar test walks a proxy alongside a spawned avatar for 30
 ticks and asserts the peak `PlayerPushOut` magnitude is zero. Sampled over many
@@ -14524,7 +14594,8 @@ for fifteen ticks. That was "I dismembered him and flew across the field", and
 the avatar's own pieces had already been exempted once (`Layers::AVATAR`).
 
 The rule now belongs to the body, not to who it came off.
-`Physics::ReleaseToWorldWhenClear` puts a body on the no-player-contact layer
+`Physics::ReleaseToWorldWhenClear` (since W2-N: any LOOSE `Physics::BodyRole`,
+CLEARING) puts a body on the no-player-contact layer
 and remembers it; every step, each remembered body whose world AABB has left
 the proxy goes back to `MOVING` and is forgotten. So a piece never shoves the
 creature it came off, and the moment it has fallen clear it is ordinary debris
@@ -15490,6 +15561,16 @@ window origin (rule 1 below); the HUD has no net line (the `--frames` exit
 report is the readout). Every one of these is listed with its trigger in
 `docs/PLAN_multiplayer_m9.md`.
 
+**Two bodies can shove each other (W2-N, 2026-09-24).** A player's limbs,
+worn shells and grabbed load are `OWNED` by that player's capsule: exempt from
+it and from nobody else's (see "A body's collision layer is DERIVED FROM ITS
+ROLE"). Before, the `AVATAR` layer exempted them from EVERY capsule, so the
+local player walked straight through a peer's ghost. Now the local
+`PlayerPushOut` sees the ghost's kinematic limbs exactly as it sees an NPC's
+(creature-phase slack, rate-capped), and a flask thrown by one player clears
+its thrower but hits the other. The ghost's own proxy is still teleported to
+the wire position every tick, so nothing local can move a peer.
+
 **Player-on-player damage (W1-F, 2026-09-24; owner-side blasts at wave-1
 integration).** A sword or a grenade resolves on the ATTACKER's machine
 against every body that machine holds: NPCs, its own player, and the peer's
@@ -16069,7 +16150,8 @@ of the contact plane through the same chunk cache the body burn uses, and falls
 back to the other body's dominant material (cached per body, refreshed by
 `RecountBurn`) for a body-vs-body hit.
 
-**Your own body cannot fire one.** `Layers::AVATAR` and `Layers::PLAYER` are
+**Your own body cannot fire one.** `EXEMPT` (the old `AVATAR`), every
+`OWNED` layer and every `PLAYER` layer are
 rejected by name in the listener, and a LIVE mob limb is filtered for free by
 ownership: limb bodies belong to `MobSystem`, so the handle never resolves in
 `bodies_`. A SEVERED limb has been `AdoptBody`'d by then and does start

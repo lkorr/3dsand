@@ -58,16 +58,21 @@ constexpr JPH::ObjectLayer STATIC = 0;
 constexpr JPH::ObjectLayer MOVING = 1;
 // player proxy: collides with MOVING only — terrain collision is the voxel
 // AABB controller's job, and resolving against both would double-collide
+// (A proxy is given PLAYER_BASE + its slot when one is free, CreatePlayerBody;
+// this unslotted PLAYER is the overflow and behaves as the old single layer.)
 constexpr JPH::ObjectLayer PLAYER = 2;
-// PLAYER AVATAR LIMBS. Identical to MOVING in every respect EXCEPT that it
-// does not collide with PLAYER. The avatar is drawn AROUND the player's own
+// EXEMPT FROM EVERY PLAYER (the old AVATAR layer; Physics::BodyRole says who
+// lands here now: a piece still CLEARING, a severed hold, an avatar that has
+// not been told its proxy). Identical to MOVING in every respect EXCEPT that
+// it does not collide with any PLAYER. The avatar is drawn AROUND the player's own
 // capsule by construction (avatar.cpp derives origin_ from player.pos), so on
 // MOVING every limb is permanently interpenetrated with the proxy. That fed
 // the solver a contact it could never resolve and fed PlayerPushOut a large
 // depenetration vector whose direction swung with the gait — which is exactly
 // "walking forward moves me backwards/diagonally, sporadically". Your own body
-// must never be able to push you.
-constexpr JPH::ObjectLayer AVATAR = 3;
+// must never be able to push you — and, with two players, SOMEBODY ELSE's body
+// must still be able to, which is what OWNED_BASE below is for.
+constexpr JPH::ObjectLayer EXEMPT = 3;
 // A HELD PROP: geometry that is CARRIED, not simulated. Collides with NOTHING
 // — not terrain, not debris, not another creature, not the player proxy — and
 // is fully visible to every QUERY (ray casts, shape casts, overlap tests).
@@ -98,7 +103,38 @@ constexpr JPH::ObjectLayer PROP = 4;
 // included. Reported by the contact listener like MOVING — it is a real
 // projectile, and its impacts are what break it.
 constexpr JPH::ObjectLayer THROWN = 5;
-constexpr JPH::ObjectLayer NUM = 6;
+// OWNER-SCOPED LAYERS (W2-N), one per player slot. PLAYER_BASE+s is player s's
+// capsule. OWNED_BASE+s is MOVING except that it never meets PLAYER_BASE+s:
+// player s's own limbs, worn shells and grabbed load — exempt from THEIR
+// capsule and nobody else's. THROWN_BASE+s is THROWN except that it also
+// meets what is not player s's (another player's limbs and capsule): a flask
+// clears its thrower and still hits the man it was thrown at.
+constexpr int kSlots = 8;  // == Physics::kMaxPlayerProxies
+constexpr JPH::ObjectLayer PLAYER_BASE = 8;
+constexpr JPH::ObjectLayer OWNED_BASE = 16;
+constexpr JPH::ObjectLayer THROWN_BASE = 24;
+constexpr JPH::ObjectLayer NUM = 32;
+
+// The slot a layer is scoped to, or -1. One reader per family so the pair
+// filter, the query filters and the contact listener cannot disagree.
+int PlayerSlot(JPH::ObjectLayer l) {
+  return l >= PLAYER_BASE && l < PLAYER_BASE + kSlots ? (int)(l - PLAYER_BASE) : -1;
+}
+int OwnedSlot(JPH::ObjectLayer l) {
+  return l >= OWNED_BASE && l < OWNED_BASE + kSlots ? (int)(l - OWNED_BASE) : -1;
+}
+int ThrownSlot(JPH::ObjectLayer l) {
+  return l >= THROWN_BASE && l < THROWN_BASE + kSlots ? (int)(l - THROWN_BASE) : -1;
+}
+bool IsPlayer(JPH::ObjectLayer l) { return l == PLAYER || PlayerSlot(l) >= 0; }
+bool IsOwned(JPH::ObjectLayer l) { return OwnedSlot(l) >= 0; }
+bool IsThrown(JPH::ObjectLayer l) { return l == THROWN || ThrownSlot(l) >= 0; }
+// Is a body on `b` exempt from the capsule on player layer `p`?
+bool ExemptFromPlayer(JPH::ObjectLayer b, JPH::ObjectLayer p) {
+  if (b == STATIC || b == EXEMPT || b == PROP || b == THROWN) return true;
+  const int s = OwnedSlot(b) >= 0 ? OwnedSlot(b) : ThrownSlot(b);
+  return s >= 0 && PlayerSlot(p) == s;  // an unslotted PLAYER owns nothing
+}
 }  // namespace Layers
 
 namespace BP {
@@ -124,7 +160,7 @@ class ObjVsBPFilter final : public JPH::ObjectVsBroadPhaseLayerFilter {
  public:
   bool ShouldCollide(JPH::ObjectLayer layer, JPH::BroadPhaseLayer bp) const override {
     if (layer == Layers::STATIC) return bp == BP::MOVING;  // static vs moving only
-    if (layer == Layers::PLAYER) return bp == BP::MOVING;  // proxy: bodies only
+    if (Layers::IsPlayer(layer)) return bp == BP::MOVING;  // proxy: bodies only
     // A held prop is rejected by the pair filter against every layer there is,
     // so stopping it here costs the broadphase nothing and saves it pairing a
     // fast-swinging body against the whole world every step. This filter is
@@ -143,18 +179,27 @@ class ObjPairFilter final : public JPH::ObjectLayerPairFilter {
     // MobSystem::FindParry, and letting the solver see them as well would put
     // a second, disagreeing answer underneath the one combat actually reads.
     if (a == Layers::PROP || b == Layers::PROP) return false;
-    // A body on its way out of a thrower meets only the world (see THROWN).
-    if (a == Layers::THROWN || b == Layers::THROWN) {
-      const JPH::ObjectLayer o = a == Layers::THROWN ? b : a;
-      return o == Layers::STATIC || o == Layers::MOVING;
+    if (a == Layers::STATIC && b == Layers::STATIC) return false;
+    // A capsule meets bodies only (terrain is the AABB controller's), never
+    // another capsule, and never a body exempt from IT: the EXEMPT layer is
+    // exempt from everyone, an OWNED/THROWN one from its own player only.
+    const bool pa = Layers::IsPlayer(a), pb = Layers::IsPlayer(b);
+    if (pa && pb) return false;
+    if (pa || pb) {
+      const JPH::ObjectLayer p = pa ? a : b, o = pa ? b : a;
+      return !Layers::ExemptFromPlayer(o, p);
     }
-    // The avatar's own limbs never touch the player proxy they live inside.
-    if ((a == Layers::PLAYER && b == Layers::AVATAR) ||
-        (a == Layers::AVATAR && b == Layers::PLAYER))
-      return false;
-    if (a == Layers::PLAYER || b == Layers::PLAYER)
-      return a == Layers::MOVING || b == Layers::MOVING;
-    return !(a == Layers::STATIC && b == Layers::STATIC);
+    // A body on its way out of a thrower meets only the world — terrain and
+    // ordinary bodies — plus, when the thrower is known, bodies owned by
+    // somebody ELSE (see THROWN / THROWN_BASE).
+    if (Layers::IsThrown(a) || Layers::IsThrown(b)) {
+      const JPH::ObjectLayer t = Layers::IsThrown(a) ? a : b;
+      const JPH::ObjectLayer o = t == a ? b : a;
+      if (o == Layers::STATIC || o == Layers::MOVING) return true;
+      const int ts = Layers::ThrownSlot(t), os = Layers::OwnedSlot(o);
+      return ts >= 0 && os >= 0 && os != ts;
+    }
+    return true;
   }
 };
 
@@ -168,10 +213,39 @@ class ObjPairFilter final : public JPH::ObjectLayerPairFilter {
 class DynamicLayerFilter final : public JPH::ObjectLayerFilter {
  public:
   bool ShouldCollide(JPH::ObjectLayer layer) const override {
-    return layer == Layers::MOVING || layer == Layers::AVATAR ||
-           layer == Layers::PROP || layer == Layers::THROWN;
+    return layer != Layers::STATIC && !Layers::IsPlayer(layer);
   }
 };
+
+// What a player capsule's PlayerPushOut may be shoved by: ordinary bodies,
+// and bodies OWNED by some other player (their limbs, their grabbed load) —
+// never its own. `ownSlot` -1 (an unslotted capsule) owns nothing, so every
+// OWNED body reaches it, exactly as the pair filter lets them meet.
+class PushLayerFilter final : public JPH::ObjectLayerFilter {
+ public:
+  explicit PushLayerFilter(int ownSlot) : ownSlot_(ownSlot) {}
+  bool ShouldCollide(JPH::ObjectLayer layer) const override {
+    if (layer == Layers::MOVING) return true;
+    const int s = Layers::OwnedSlot(layer);
+    return s >= 0 && s != ownSlot_;
+  }
+
+ private:
+  int ownSlot_;
+};
+
+// Role + owner packed into a Jolt body's user data (see Physics::BodyRole):
+// role in the low byte, owner handle above it. 0 = Debris, no owner, which is
+// what every freshly created body already carries.
+uint64_t PackRole(Physics::BodyRole r, uint64_t owner) {
+  return (uint64_t)r | ((owner & Physics::kAnyPlayer) << 8);
+}
+Physics::BodyRole UnpackRole(uint64_t ud) {
+  const uint64_t r = ud & 0xFF;
+  return r < (uint64_t)Physics::BodyRole::Count ? (Physics::BodyRole)r
+                                                : Physics::BodyRole::Debris;
+}
+uint64_t UnpackOwner(uint64_t ud) { return ud >> 8; }
 
 float VoxToM(float v) { return v * kVoxelMeters; }
 
@@ -268,13 +342,14 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
                       const JPH::ContactManifold& m,
                       JPH::ContactSettings&) override {
     CountManifold(b1, b2, m);
-    // YOUR OWN BODY MUST NOT FIRE DEBRIS IMPACTS. Layers::AVATAR exists
-    // precisely to split the player's limbs out of contact handling, and the
-    // player proxy is teleported onto the player every tick so its contacts
+    // YOUR OWN BODY MUST NOT FIRE DEBRIS IMPACTS. The OWNED and EXEMPT layers
+    // exist precisely to split a player's limbs out of contact handling, and
+    // a player proxy is teleported onto its player every tick so its contacts
     // are an artifact of that, not of anything landing.
     const JPH::ObjectLayer l1 = b1.GetObjectLayer(), l2 = b2.GetObjectLayer();
     for (JPH::ObjectLayer l : {l1, l2})
-      if (l == Layers::AVATAR || l == Layers::PLAYER) return;
+      if (l == Layers::EXEMPT || Layers::IsOwned(l) || Layers::IsPlayer(l))
+        return;
     // Something has to be moving. Two statics never reach here, but a
     // static-vs-static pair would carry no speed anyway.
     if (b1.IsStatic() && b2.IsStatic()) return;
@@ -1444,13 +1519,31 @@ uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
   if (!system_) return 0;
   float radius = VoxToM(halfXZVox);
   float cylHalf = std::max(VoxToM(halfYVox) - radius, 0.01f);
+  // THE OWNER-SCOPING SLOT: the lowest one no live proxy holds, carried as the
+  // proxy's own object layer (PLAYER_BASE + slot). Past kSlots the proxy is
+  // the unslotted PLAYER, which owns nothing (every OWNED body meets it).
+  static_assert(Layers::kSlots == kMaxPlayerProxies,
+                "one owner-scoping slot per proxy the release sweep tests");
+  JPH::ObjectLayer layer = Layers::PLAYER;
+  {
+    bool used[Layers::kSlots] = {};
+    for (uint64_t p : playerBodies_) {
+      const int s = PlayerSlotOf(p);
+      if (s >= 0) used[s] = true;
+    }
+    for (int s = 0; s < Layers::kSlots; s++)
+      if (!used[s]) {
+        layer = (JPH::ObjectLayer)(Layers::PLAYER_BASE + s);
+        break;
+      }
+  }
   // Dynamic, not kinematic — see the header comment: finite mass is what
   // makes shoves scale with the shoved body's mass. Rotation is locked (a
   // capsule that tips over is not a player) and gravity is off (the AABB
   // controller owns vertical motion; the proxy just mirrors it).
   JPH::BodyCreationSettings bcs(new JPH::CapsuleShape(cylHalf, radius),
                                 JPH::RVec3::sZero(), JPH::Quat::sIdentity(),
-                                JPH::EMotionType::Dynamic, Layers::PLAYER);
+                                JPH::EMotionType::Dynamic, layer);
   bcs.mAllowedDOFs = JPH::EAllowedDOFs::TranslationX |
                      JPH::EAllowedDOFs::TranslationY |
                      JPH::EAllowedDOFs::TranslationZ;
@@ -1465,8 +1558,8 @@ uint64_t Physics::CreatePlayerBody(float halfXZVox, float halfYVox) {
   // NOT in dynamicBodies_: the proxy never despawns and must not receive
   // explosion impulses or WakeNear — the player controller owns its motion.
   if (id.IsInvalid()) return 0;
-  // EVERY live proxy is A player for ReleaseToWorldWhenClear (see the member's
-  // note): a piece leaves the AVATAR layer only once it is clear of all of
+  // EVERY live proxy is A player for CLEARING (see the member's note): a
+  // piece leaves the EXEMPT layer only once it is clear of all of
   // them. RemoveBody erases, so the selftests that make and drop several
   // proxies do not accumulate stale handles here.
   const uint64_t h = FromBodyID(id);
@@ -1510,11 +1603,12 @@ Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel,
                     VoxToM(centerVoxel.z));
   JPH::CollideShapeSettings settings;
   JPH::AllHitCollisionCollector<JPH::CollideShapeCollector> collector;
-  JPH::SpecifiedObjectLayerFilter movingOnly(Layers::MOVING);
+  // MOVING, plus whatever another player owns — never this player's own.
+  PushLayerFilter pushable(PlayerSlotOf(handle));
   JPH::IgnoreSingleBodyFilter ignoreSelf(id);
   system_->GetNarrowPhaseQuery().CollideShape(
       shape, JPH::Vec3::sReplicate(1.0f), JPH::RMat44::sTranslation(center),
-      settings, JPH::RVec3::sZero(), collector, {}, movingOnly, ignoreSelf);
+      settings, JPH::RVec3::sZero(), collector, {}, pushable, ignoreSelf);
 
   // ONE DEPTH PER BODY, and only from a body heavy enough to move you.
   //
@@ -1533,7 +1627,9 @@ Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel,
   // player's. Above it — a log, a boulder, a corpse's torso — the full push
   // applies, so standing on debris and being shoved by heavy things is as it
   // was. Kinematic limbs (a living creature's) report their rig mass and
-  // keep pushing; the avatar's own are on Layers::AVATAR and never seen here.
+  // keep pushing — another PLAYER's included (their limbs are OWNED by them,
+  // not by this capsule); this player's own are OWNED by it (or EXEMPT) and
+  // never seen here.
   constexpr float kPushMinMassFrac = 0.05f;
   const Tuning::Physics& pt = CurrentTuning().physics;
   const float minMass = kPushMinMassFrac * std::max(pt.playerMassKg, 1.0f);
@@ -1551,9 +1647,10 @@ Vec3 Physics::PlayerPushOut(uint64_t handle, Vec3 centerVoxel,
     }
     if (merged) continue;
     // A LIVE CREATURE'S POSED LIMB, and the motion type IS the question.
-    // Kinematic on MOVING is only ever a rig somebody is driving: a corpse or
-    // a ragdoll has been handed to the solver and is dynamic, a held weapon is
-    // on PROP, a severed limb mid-hold is on AVATAR. See the tuning note on
+    // Kinematic on MOVING/OWNED is only ever a rig somebody is driving: a
+    // corpse or a ragdoll has been handed to the solver and is dynamic, a held
+    // weapon is a HeldProp, a severed limb mid-hold a SeveredHold (EXEMPT),
+    // neither seen here. See the tuning note on
     // physics.creaturePhaseVox for why that distinction earns a softer rule.
     const bool alive = bi.GetMotionType(hit.mBodyID2) == JPH::EMotionType::Kinematic;
     perBody.push_back({hit.mBodyID2, hit.mPenetrationAxis / len,
@@ -1783,7 +1880,7 @@ void Physics::ReplaceBody(uint64_t oldHandle, uint64_t newHandle) {
   if (bi.IsAdded(oldId) && bi.IsAdded(newId)) {
     // Body state, not shape state, so a fresh body starts without it: the
     // exclusion set that stops one mob's limbs fighting their own joints
-    // (DisableCollisionsAmong) and the avatar layer (SetBodyAvatarLayer).
+    // (DisableCollisionsAmong) and the role + layer (SetBodyRole, CarryLayer).
     JPH::CollisionGroup group;
     {
       JPH::BodyLockRead lock(bli, oldId);
@@ -1812,20 +1909,16 @@ void Physics::CarryLayer(uint64_t from, uint64_t to) {
   JPH::BodyInterface& bi = system_->GetBodyInterface();
   const JPH::BodyID fromId = ToBodyID(from), toId = ToBodyID(to);
   if (!bi.IsAdded(fromId) || !bi.IsAdded(toId)) return;
+  // The role and owner travel in the user data, the layer is what they
+  // resolved to (and whether the body is still clearing, below).
+  bi.SetUserData(toId, bi.GetUserData(fromId));
   bi.SetObjectLayer(toId, bi.GetObjectLayer(fromId));
   bool fromPending = false, toPending = false;
   for (uint64_t h : pendingRelease_) {
     fromPending |= h == from;
     toPending |= h == to;
   }
-  if (fromPending && !toPending) {
-    if (pendingRelease_.size() >= kMaxPendingRelease) {
-      const JPH::BodyID old = ToBodyID(pendingRelease_.front());
-      if (bi.IsAdded(old)) bi.SetObjectLayer(old, Layers::MOVING);
-      pendingRelease_.erase(pendingRelease_.begin());
-    }
-    pendingRelease_.push_back(to);
-  }
+  if (fromPending && !toPending) AddPending(to);
 }
 
 uint32_t Physics::JointCount(uint64_t handle) const {
@@ -2146,35 +2239,158 @@ bool Physics::ApplyBuoyancy(uint64_t handle, float surfaceYVoxel, float buoyancy
                                    system_->GetGravity(), dt);
 }
 
-void Physics::SetBodyAvatarLayer(uint64_t handle, bool isAvatar) {
-  if (!system_ || handle == 0) return;
-  JPH::BodyInterface& bi = system_->GetBodyInterface();
-  JPH::BodyID id = ToBodyID(handle);
-  if (!bi.IsAdded(id)) return;
-  // Both layers map to BP::MOVING, so this never needs a broadphase rebuild.
-  bi.SetObjectLayer(id, isAvatar ? Layers::AVATAR : Layers::MOVING);
+// ---- ROLE -> LAYER (W2-N; the table is in physics.h) -----------------------
+
+const char* Physics::RoleName(BodyRole r) {
+  switch (r) {
+    case BodyRole::Debris: return "debris";
+    case BodyRole::RigLive: return "rig-live";
+    case BodyRole::RigLimp: return "rig-limp";
+    case BodyRole::RigDead: return "rig-dead";
+    case BodyRole::WornShell: return "worn-shell";
+    case BodyRole::HeldProp: return "held-prop";
+    case BodyRole::Carried: return "carried";
+    case BodyRole::SeveredHold: return "severed-hold";
+    case BodyRole::Thrown: return "thrown";
+    default: return "?";
+  }
 }
 
-void Physics::SetBodyPropLayer(uint64_t handle, bool isProp) {
+int Physics::ResolveLayer(BodyRole role, int ownerSlot, bool clearing) {
+  switch (role) {
+    case BodyRole::HeldProp:
+      return Layers::PROP;
+    case BodyRole::SeveredHold:
+      return Layers::EXEMPT;
+    case BodyRole::Thrown:
+      if (!clearing) return Layers::MOVING;
+      return ownerSlot >= 0 ? Layers::THROWN_BASE + ownerSlot : Layers::THROWN;
+    case BodyRole::RigLive:
+    case BodyRole::WornShell:
+    case BodyRole::Carried:
+      if (clearing || ownerSlot == -1) return Layers::EXEMPT;
+      return ownerSlot >= 0 ? Layers::OWNED_BASE + ownerSlot : Layers::MOVING;
+    default:  // Debris, RigLimp, RigDead: the loose roles
+      return clearing ? Layers::EXEMPT : Layers::MOVING;
+  }
+}
+
+int Physics::PlayerSlotOf(uint64_t proxy) const {
+  if (!system_ || proxy == 0) return -1;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(proxy);
+  if (!bi.IsAdded(id)) return -1;
+  return Layers::PlayerSlot(bi.GetObjectLayer(id));
+}
+
+int Physics::OwnerSlot(uint64_t owner) const {
+  if (owner == kNoOwner) return -2;
+  if (owner == kAnyPlayer) return -1;
+  return PlayerSlotOf(owner);  // -1 for a dead or unslotted proxy: exempt from all
+}
+
+bool Physics::AnyLivePlayer() const {
+  // "Nobody" is "not one live proxy among them" -- a dead handle that
+  // RemoveBody never saw (Shutdown order, a Jolt-side destroy) must not count
+  // as a player to hide behind.
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  for (uint64_t p : playerBodies_)
+    if (p != 0 && bi.IsAdded(ToBodyID(p))) return true;
+  return false;
+}
+
+void Physics::SettleBody(uint64_t handle) {
+  JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return;
+  const uint64_t ud = bi.GetUserData(id);
+  BodyRole role = UnpackRole(ud);
+  const uint64_t owner = UnpackOwner(ud);
+  // A throw that has cleared its thrower is a thing lying in the world.
+  if (role == BodyRole::Thrown) {
+    role = BodyRole::Debris;
+    bi.SetUserData(id, PackRole(role, owner));
+  }
+  // Every layer maps to BP::MOVING, so no transition here needs a broadphase
+  // rebuild.
+  bi.SetObjectLayer(id, (JPH::ObjectLayer)ResolveLayer(role, OwnerSlot(owner), false));
+}
+
+void Physics::AddPending(uint64_t handle) {
+  for (uint64_t h : pendingRelease_)
+    if (h == handle) return;
+  if (pendingRelease_.size() >= kMaxPendingRelease) {
+    // Bounded (CLAUDE.md rule 2): the oldest settles now, clear or not. At 256
+    // simultaneous pieces inside one player something else is already wrong.
+    const uint64_t old = pendingRelease_.front();
+    pendingRelease_.erase(pendingRelease_.begin());
+    SettleBody(old);
+  }
+  pendingRelease_.push_back(handle);
+}
+
+void Physics::SetBodyRole(uint64_t handle, BodyRole role, uint64_t owner) {
   if (!system_ || handle == 0) return;
   JPH::BodyInterface& bi = system_->GetBodyInterface();
-  JPH::BodyID id = ToBodyID(handle);
+  const JPH::BodyID id = ToBodyID(handle);
   if (!bi.IsAdded(id)) return;
-  // IDEMPOTENT, AND IT DOES NOT CLOBBER. This is called every time a held
-  // item's collider is rebuilt (a carve, a burn) and once per equip, so it has
-  // to be safe to repeat; and clearing it must not overwrite a layer somebody
-  // else set for a reason. In particular ReleaseToWorldWhenClear parks a
-  // just-dropped weapon on AVATAR until it has fallen clear of the player, and
-  // a blanket `isProp ? PROP : MOVING` here would undo that and hand the
-  // player the exact shove that release exists to prevent.
-  const JPH::ObjectLayer cur = bi.GetObjectLayer(id);
-  if (isProp) {
-    if (cur != Layers::PROP) bi.SetObjectLayer(id, Layers::PROP);
-  } else if (cur == Layers::PROP) {
-    bi.SetObjectLayer(id, Layers::MOVING);
+  bi.SetUserData(id, PackRole(role, owner));
+  const int slot = OwnerSlot(owner);
+  auto pendingAt = std::find(pendingRelease_.begin(), pendingRelease_.end(), handle);
+  const bool pending = pendingAt != pendingRelease_.end();
+  if (IsLooseRole(role)) {
+    // CLEARING: every loose role enters by waiting until clear of every
+    // player — or settles at once when there is nobody to protect.
+    if (!AnyLivePlayer()) {
+      if (pending) pendingRelease_.erase(pendingAt);
+      SettleBody(handle);
+      return;
+    }
+    bi.SetObjectLayer(id, (JPH::ObjectLayer)ResolveLayer(role, slot, true));
+    AddPending(handle);
+    return;
   }
-  // Like the avatar split, both layers map to BP::MOVING: no broadphase
-  // rebuild, so this is free to call per tick if it ever needs to be.
+  // ATTACHED: at once. A body still clearing keeps clearing if the role it
+  // was given could be felt by some player (MOVING, or OWNED by one of them) —
+  // a limp NPC standing back up inside the player is still inside the player —
+  // and settles on that role's layer when clear.
+  const JPH::ObjectLayer settled = (JPH::ObjectLayer)ResolveLayer(role, slot, false);
+  const bool felt = settled == Layers::MOVING || Layers::IsOwned(settled);
+  if (pending && felt) {
+    bi.SetObjectLayer(id, (JPH::ObjectLayer)ResolveLayer(role, slot, true));
+    return;
+  }
+  if (pending) pendingRelease_.erase(pendingAt);
+  bi.SetObjectLayer(id, settled);
+}
+
+Physics::BodyRole Physics::BodyRoleOf(uint64_t handle) const {
+  if (!system_ || handle == 0) return BodyRole::Debris;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return BodyRole::Debris;
+  return UnpackRole(bi.GetUserData(id));
+}
+
+uint64_t Physics::BodyOwnerOf(uint64_t handle) const {
+  if (!system_ || handle == 0) return kNoOwner;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID id = ToBodyID(handle);
+  if (!bi.IsAdded(id)) return kNoOwner;
+  return UnpackOwner(bi.GetUserData(id));
+}
+
+bool Physics::BodyClearing(uint64_t handle) const {
+  return handle != 0 && std::find(pendingRelease_.begin(), pendingRelease_.end(),
+                                  handle) != pendingRelease_.end();
+}
+
+bool Physics::LayersCollide(uint64_t a, uint64_t b) const {
+  if (!system_ || !layers_) return false;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  const JPH::BodyID ia = ToBodyID(a), ib = ToBodyID(b);
+  if (a == 0 || b == 0 || !bi.IsAdded(ia) || !bi.IsAdded(ib)) return false;
+  return layers_->objPair.ShouldCollide(bi.GetObjectLayer(ia), bi.GetObjectLayer(ib));
 }
 
 bool Physics::WorldBounds(uint64_t handle, float outMin[3],
@@ -2187,34 +2403,6 @@ bool Physics::WorldBounds(uint64_t handle, float outMin[3],
   outMin[0] = b.mMin.GetX(); outMin[1] = b.mMin.GetY(); outMin[2] = b.mMin.GetZ();
   outMax[0] = b.mMax.GetX(); outMax[1] = b.mMax.GetY(); outMax[2] = b.mMax.GetZ();
   return true;
-}
-
-void Physics::ReleaseToWorldWhenClear(uint64_t handle, bool thrown) {
-  if (!system_ || handle == 0) return;
-  JPH::BodyInterface& bi = system_->GetBodyInterface();
-  const JPH::BodyID id = ToBodyID(handle);
-  if (!bi.IsAdded(id)) return;
-  // Nobody to protect: straight to the ordinary layer. "Nobody" is now "not one
-  // live proxy among them" -- a dead handle that RemoveBody never saw (Shutdown
-  // order, a Jolt-side destroy) must not count as a player to hide behind.
-  bool anyPlayer = false;
-  for (uint64_t p : playerBodies_)
-    if (p != 0 && bi.IsAdded(ToBodyID(p))) { anyPlayer = true; break; }
-  if (!anyPlayer) {
-    bi.SetObjectLayer(id, Layers::MOVING);
-    return;
-  }
-  bi.SetObjectLayer(id, thrown ? Layers::THROWN : Layers::AVATAR);
-  for (uint64_t h : pendingRelease_)
-    if (h == handle) return;
-  if (pendingRelease_.size() >= kMaxPendingRelease) {
-    // Bounded (CLAUDE.md rule 2): the oldest goes now, clear or not. At 256
-    // simultaneous pieces inside one player something else is already wrong.
-    const JPH::BodyID old = ToBodyID(pendingRelease_.front());
-    if (bi.IsAdded(old)) bi.SetObjectLayer(old, Layers::MOVING);
-    pendingRelease_.erase(pendingRelease_.begin());
-  }
-  pendingRelease_.push_back(handle);
 }
 
 void Physics::TickPendingReleases() {
@@ -2245,7 +2433,7 @@ void Physics::TickPendingReleases() {
     if (nPlayers > 0 && WorldBounds(h, bmin, bmax)) {
       // INSIDE ANY player holds the piece. A piece released the moment it left
       // player 0 while still buried in player 1 would be shoved out of them at
-      // full contact force; the AVATAR layer exists precisely to stop that.
+      // full contact force; the EXEMPT layer exists precisely to stop that.
       for (int pi = 0; pi < nPlayers && !overlaps; pi++) {
         bool hit = true;
         for (int a = 0; a < 3; a++)
@@ -2258,7 +2446,12 @@ void Physics::TickPendingReleases() {
       pendingRelease_[w++] = h;
       continue;
     }
-    bi.SetObjectLayer(id, Layers::MOVING);
+    // Clear: onto the layer its ROLE resolves to — MOVING for anything loose,
+    // but OWNED/PROP for a body that was given an attached role while it was
+    // still clearing (SetBodyRole). This used to be MOVING unconditionally,
+    // which is how a get-up NPC's re-held sword could be dropped back onto
+    // MOVING by the release its ragdoll had left pending.
+    SettleBody(h);
   }
   pendingRelease_.resize(w);
 }

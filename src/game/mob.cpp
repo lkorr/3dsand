@@ -2793,10 +2793,10 @@ bool MobSystem::ServiceRising(size_t ri) {
 //     shared services, copied;
 //   * the vtable is Mob's: AvatarLayer() is false, OnDying and the avatar's
 //     own instance flag no longer apply;
-//   * the avatar LAYER: EnterDeadRagdoll put every dynamic limb through
-//     ReleaseToWorldWhenClear at death, but a worn shell (a follower) and a
-//     limb still on the avatar layer for any other reason did not go — they
-//     go here, so nothing of the corpse is left where the player's capsule
+//   * the avatar's ROLES: EnterDeadRagdoll made every dynamic limb RigDead at
+//     death, but a worn shell (a follower) and anything else still holding a
+//     living player's role did not go — they go here, so nothing of the
+//     corpse is left where the player's capsule
 //     cannot feel it once it has fallen clear;
 //   * render-only state the avatar drives per frame — the first-person hide
 //     mask and the render offset — is the LIVING player's, and a corpse that
@@ -2844,10 +2844,15 @@ uint64_t MobSystem::AdoptDeadAvatar(Mob& av) {
   corpse.hidden_.assign(corpse.limbs_.size(), 0);
   corpse.renderOffset_ = Vec3{0, 0, 0};
   corpse.WakeDead();
+  // Whatever still has a LIVING player's role (a worn shell: EnterDeadRagdoll
+  // leaves followers alone) is a corpse's now, and clears the capsule first.
   if (phys_)
-    for (const MobLimb& l : corpse.limbs_)
-      if (l.body && phys_->BodyObjectLayer(l.body) == 3 /*AVATAR*/)
-        phys_->ReleaseToWorldWhenClear(l.body);
+    for (const MobLimb& l : corpse.limbs_) {
+      if (!l.body) continue;
+      const Physics::BodyRole r = phys_->BodyRoleOf(l.body);
+      if (r == Physics::BodyRole::RigLive || r == Physics::BodyRole::WornShell)
+        phys_->SetBodyRole(l.body, Physics::BodyRole::RigDead);
+    }
   // The booking follows the body.
   for (PendingRise& r : rises_)
     if (r.mobId == avatarId) r.mobId = corpse.id_;
@@ -3071,10 +3076,7 @@ void Mob::ReleaseRig() {
   for (MobLimb& l : limbs_) {
     // held pieces are DebrisSystem's now; only drop the kinematic hold
     if (l.holdBody) {
-      phys_->SetBodyKinematic(l.holdBody, false);
-      phys_->ClearCollisionGroup(l.holdBody);
-      GroupSeveredPiece(l.holdBody);
-      phys_->ReleaseToWorldWhenClear(l.holdBody);
+      EndSeveredHold(l.holdBody);
       l.holdBody = 0;
     }
     // A carved limb owns a copy-on-write brick; dropping the rig without
@@ -3649,7 +3651,10 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
     phys_->SetBodyKinematic(limb.body, true);
     // The avatar's limbs live inside the player's capsule proxy and must not
     // push it (avatar.cpp Spawn); an NPC's stay on the normal dynamic layer.
-    if (AvatarLayer()) phys_->SetBodyAvatarLayer(limb.body, true);
+    // Both are the same statement: a live limb, owned by whoever owns it. (Set
+    // outright rather than derived: a rig is always BUILT live, and the paths
+    // that load a corpse enter the dead state after this, EnterLoadedDead.)
+    phys_->SetBodyRole(limb.body, Physics::BodyRole::RigLive, CollisionOwner());
     limb.xf.pos = o;
     limb.xf.quat[3] = 1;
   }
@@ -3676,11 +3681,7 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   }
   // limbs of one creature never collide with each other (they'd fight the
   // joints and jitter forever); different creatures and debris still collide
-  {
-    std::vector<uint64_t> handles;
-    for (const MobLimb& l : limbs_) handles.push_back(l.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
+  RegroupRig();
 
   // Root's "anchor" is its own centre (the yaw pivot) — again taken from the
   // rig, which already computed exactly that at load.
@@ -7576,16 +7577,9 @@ void Mob::TickSeveredHolds(float dt) {
       limb.holdBody = 0;
       continue;
     }
-    phys_->SetBodyKinematic(limb.holdBody, false);
-    // A severed part must collide with the body it came off again: the
-    // rig's GroupFilterTable suppressed those contacts forever otherwise.
-    phys_->ClearCollisionGroup(limb.holdBody);
-    // ...but NOT with the gear riding it, nor with the rest of the part it came
-    // off as (GroupSeveredPiece).
-    GroupSeveredPiece(limb.holdBody);
-    // It also stops being part of ANY creature — but it may not touch the
-    // player until it has fallen clear of them (see DetachLimb).
-    phys_->ReleaseToWorldWhenClear(limb.holdBody);
+    // Dynamic, regrouped, and loose — clear of the player first (see
+    // DetachLimb). One transition, shared with every other end of a hold.
+    EndSeveredHold(limb.holdBody);
     limb.holdBody = 0;
   }
   // HUSKS OF GEAR. A body limb that is gone keeps its slot forever (the rig's
@@ -7638,6 +7632,68 @@ void Mob::GroupSeveredPiece(uint64_t handle) {
   if (piece.size() < 2) return;
   for (size_t k = 1; k < piece.size(); k++) phys_->ClearCollisionGroup(piece[k]);
   phys_->DisableCollisionsAmong(piece);
+}
+
+// ---- COLLISION ROLES (W2-N; the table is Physics::BodyRole) ----------------
+
+void Mob::EndSeveredHold(uint64_t handle) {
+  if (!phys_ || handle == 0) return;
+  phys_->SetBodyKinematic(handle, false);
+  // A severed part must collide with the body it came off again: the rig's
+  // GroupFilterTable suppressed those contacts forever otherwise...
+  phys_->ClearCollisionGroup(handle);
+  // ...but NOT with the gear riding it, nor with the rest of the part it came
+  // off as (GroupSeveredPiece).
+  GroupSeveredPiece(handle);
+  // It stops being part of ANY creature — but it may not touch the player
+  // until it has fallen clear of them: a loose role clears first.
+  phys_->SetBodyRole(handle, Physics::BodyRole::Debris);
+}
+
+uint64_t Mob::CollisionOwner() const {
+  if (!AvatarLayer()) return Physics::kNoOwner;
+  return collisionOwner_ != 0 ? collisionOwner_ : Physics::kAnyPlayer;
+}
+
+void Mob::SetCollisionOwner(uint64_t proxy) {
+  collisionOwner_ = proxy;
+  // A living avatar's attached slots take the owner now; everything else
+  // (a dead body's limbs, a piece in its hold) is not the player's any more.
+  if (!phys_ || !alive_ || !AvatarLayer()) return;
+  for (size_t i = 0; i < limbs_.size(); i++) ApplyLimbRole(i);
+}
+
+Physics::BodyRole Mob::LimbRole(size_t i) const {
+  using R = Physics::BodyRole;
+  if (i >= limbs_.size()) return R::Debris;
+  const MobLimb& l = limbs_[i];
+  if (l.holdSeconds > 0) return R::SeveredHold;
+  if (!alive_) return R::RigDead;
+  // A GARMENT IS A FOLLOWER in every phase a live creature has (wornHost):
+  // kinematic, posed by DriveWornShells, never handed to the solver.
+  if (l.wornHost >= 0) return R::WornShell;
+  const bool limp = ragdoll_ == RagdollPhase::Limp;
+  // A weapon is CARRIED only while a living hand is posing it; under a
+  // ragdoll it is solved for like every other limb and needs the floor.
+  if ((int)i == heldSlot_ && !limp) return R::HeldProp;
+  // An NPC's limp limbs are solver-owned bodies that may be lying inside the
+  // player (a blast at sword's reach): loose, so they clear first. The
+  // avatar's own stay its own — exempt from its capsule, limp or not.
+  if (limp && !AvatarLayer()) return R::RigLimp;
+  return R::RigLive;
+}
+
+void Mob::ApplyLimbRole(size_t i) {
+  if (!phys_ || i >= limbs_.size() || limbs_[i].body == 0) return;
+  phys_->SetBodyRole(limbs_[i].body, LimbRole(i), CollisionOwner());
+}
+
+void Mob::RegroupRig() {
+  if (!phys_) return;
+  std::vector<uint64_t> handles;
+  for (const MobLimb& l : limbs_)
+    if (l.body) handles.push_back(l.body);
+  phys_->DisableCollisionsAmong(handles);
 }
 
 // ---- gear leaving the body by force ----------------------------------------
@@ -7963,38 +8019,29 @@ void Mob::StartRagdoll(float minSeconds, const char* why) {
     phys_->GetTransform(limb.body, limb.xf);
     phys_->SetBodyKinematic(limb.body, false);
     phys_->ActivateBody(limb.body);
-    // A WEAPON THAT IS NO LONGER BEING CARRIED IS AN OBJECT AGAIN. The held
-    // slot is exempt from contacts while a living hand is posing it
-    // (Layers::PROP, EquipItem) — and the line above has just handed it to the
-    // solver, so from here it is solved for like every other limb and needs
-    // the floor to exist. Left on PROP it would fall through the world,
-    // dragging the wrist it is jointed to after it.
-    //
-    // The NPC branch below would clear it as a side effect (a release sets the
-    // layer outright); this is said explicitly because the AVATAR branch
-    // takes no exemption and would otherwise drop the player's own sword out
-    // of the map every time they were knocked down.
-    if ((int)i == heldSlot_) {
-      phys_->SetBodyPropLayer(limb.body, false);
-      // ...and it rejoins the layer the rest of THIS creature's limbs are on,
-      // which for the avatar is the player-exempt one. Clearing PROP on its
-      // own drops to the plain MOVING layer, and the player's own guard going
-      // limp inside the player's own capsule is precisely the unresolvable
-      // overlap Die() and DetachLimb both document. An NPC's falls through to
-      // the release below, exactly as its limbs do.
-      if (AvatarLayer()) phys_->SetBodyAvatarLayer(limb.body, true);
-    }
-    // An NPC's limbs live on the plain MOVING layer. Flipping them dynamic
-    // inside the player's capsule — a blast at sword's reach — is the same
-    // unresolvable overlap Die() documents, and the answer is the same: off
-    // the player's contact layer until the piece has fallen clear, then an
-    // ordinary body that can be stood on and bumped into. The avatar's own
-    // limbs are exempt for good already (AvatarLayer).
-    if (!AvatarLayer()) phys_->ReleaseToWorldWhenClear(limb.body);
     flipped++;
   }
   if (flipped == 0) return;
   ragdoll_ = RagdollPhase::Limp;
+  // THE ROLES FOLLOW THE PHASE (LimbRole), set once the phase is Limp:
+  //   * a WEAPON THAT IS NO LONGER BEING CARRIED IS AN OBJECT AGAIN — the
+  //     held slot was a HeldProp while a living hand posed it, and has just
+  //     been handed to the solver, so it needs the floor to exist (left on
+  //     PROP it fell through the world, dragging the wrist after it);
+  //   * an NPC's limp limbs are RigLimp, a LOOSE role: flipping them dynamic
+  //     inside the player's capsule — a blast at sword's reach — is the same
+  //     unresolvable overlap Die() documents, so they clear the player first,
+  //     then are ordinary bodies that can be stood on and bumped into;
+  //   * the avatar's own stay RigLive, exempt from its own capsule for good —
+  //     its sword included, or the player's own guard going limp inside the
+  //     player's own capsule would shove them.
+  // Only the slots the loop above flipped: a severed piece mid-hold and a
+  // worn shell were skipped there and keep their roles.
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    const MobLimb& limb = limbs_[i];
+    if (!limb.body || limb.holdSeconds > 0 || limb.wornHost >= 0) continue;
+    ApplyLimbRole(i);
+  }
   ragdollT_ = 0.0f;
   ragdollMinT_ = std::max(minSeconds, 0.0f);
   ragdollStillT_ = 0.0f;
@@ -8453,15 +8500,22 @@ void Mob::BeginGetUp(World& world) {
     phys_->GetTransform(limb.body, limb.xf);
     getUpFrom_[i] = limb.xf;
     phys_->SetBodyKinematic(limb.body, true);
-    // BACK IN THE FIST, BACK OFF THE SOLVER. The mirror of StartRagdoll: the
-    // hand is posing this weapon again from the next tick, so its contacts go
-    // back to being something that can only move other people. Without this a
-    // creature that had been knocked down once would be swinging a blade that
-    // shoves the player, and the bug would only ever reproduce after a
-    // ragdoll.
-    if ((int)i == heldSlot_) phys_->SetBodyPropLayer(limb.body, true);
   }
   ragdoll_ = RagdollPhase::GetUp;
+  // BACK IN THE FIST, BACK OFF THE SOLVER. The mirror of StartRagdoll: the
+  // hand is posing this weapon again from the next tick, so it is a HeldProp
+  // again, whose contacts can only move other people. Without this a creature
+  // that had been knocked down once would be swinging a blade that shoves the
+  // player, and the bug would only ever reproduce after a ragdoll. The other
+  // limbs are live again (RigLive); one still clearing the player it fell in
+  // keeps clearing, and settles when clear (Physics::SetBodyRole) — and the
+  // sword can no longer be knocked back onto MOVING by that pending release,
+  // which it could while the release set MOVING unconditionally.
+  for (size_t i = 0; alive_ && i < limbs_.size(); i++) {
+    const MobLimb& limb = limbs_[i];
+    if (!limb.body || limb.holdSeconds > 0 || limb.wornHost >= 0) continue;
+    ApplyLimbRole(i);
+  }
   ragdollT_ = 0.0f;
   std::printf("mob %llu ragdoll: get up at (%.1f, %.1f, %.1f) heading %.2f\n",
               (unsigned long long)id_, origin_.x, origin_.y, origin_.z, heading_);
@@ -11486,10 +11540,10 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   uint64_t nh = phys_->CreateDebrisBodyXf(limb.voxels, limb.xf, DensityOf(),
                                           true /*allowKinematic*/, pitch);
   if (nh == 0) return false;  // Jolt refused: keep the old collider, stay carved
-  // ...and where the old body was allowed to be: its object layer and its
-  // place in ReleaseToWorldWhenClear's list (an NPC knocked limp beside the
-  // player is off the player's contact layer until it has fallen clear, and
-  // the rebuilt limb must be too, or it shoves them). Before RemoveBody.
+  // ...and what the old body WAS: its role, owner and layer, and whether it
+  // was still clearing the player (an NPC knocked limp beside the player is
+  // off the player's contact layer until it has fallen clear, and the rebuilt
+  // limb must be too, or it shoves them). Before RemoveBody.
   phys_->CarryLayer(limb.body, nh);
 
   // The handle CHANGES, so every reference to the old one must be re-pointed
@@ -11524,31 +11578,20 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   limb.body = nh;
   phys_->SetBodyKinematic(limb.body, kinematic);
   if (!kinematic && hadVel) phys_->SetBodyVelocities(limb.body, oldLin, oldAng);
-  // ...and the AVATAR-LAYER EXEMPTION, which is part of "every reference to the
-  // old handle" exactly as much as the joints above are. A new handle starts on
-  // the plain MOVING layer, and a still-attached avatar limb on MOVING is back
-  // inside the player's own capsule proxy, where the solver sees a contact it
-  // can never resolve and PlayerPushOut sums a depenetration vector whose
-  // direction swings with the gait (Layers::AVATAR, phys/physics.cpp).
-  //
-  // That is the whole "acid eats a bite out of me and I start flying off
-  // upwards at an angle" bug, and it was reachable from every damage source
-  // there is: acid, fire, laser and blast all end in a carve, and every carve
-  // rebuilds the collider. Your own body must not push you — including after it
-  // has been rebuilt.
-  // Not a dead avatar's: those limbs were handed to ReleaseToWorldWhenClear at
-  // death, and CarryLayer above already carried that state across.
-  if (AvatarLayer() && alive_) phys_->SetBodyAvatarLayer(limb.body, true);
-  // ...and the PROP EXEMPTION, for exactly the same reason and reachable from
-  // exactly the same places. A weapon is carved and burned like any other
-  // slot, and a rebuilt blade that started back on the plain MOVING layer
-  // would be shoving the player again from the first acid drop or laser graze
-  // that touched it. Only while it is still BEING HELD: a rebuild during a
-  // ragdoll deliberately hands the piece back to the solver (`kinematic` is
-  // false above), and a prop that is not carried has to be able to hit the
-  // floor.
-  if (limbIndex == heldSlot_ && kinematic)
-    phys_->SetBodyPropLayer(limb.body, true);
+  // ...and the ROLE, which is part of "every reference to the old handle"
+  // exactly as much as the joints above are. It travelled with CarryLayer:
+  // a still-attached avatar limb back on MOVING is inside the player's own
+  // capsule proxy, where the solver sees a contact it can never resolve and
+  // PlayerPushOut sums a depenetration vector whose direction swings with the
+  // gait — the whole "acid eats a bite out of me and I start flying off
+  // upwards at an angle" bug, reachable from every carve (acid, fire, laser,
+  // blast) — and a rebuilt blade back on MOVING shoved the player from the
+  // first acid drop that touched it. Both were once separate re-sets here,
+  // each added after its own bug. Re-derived for a LIVE creature's attached
+  // roles (a no-op when the carried role agrees, which it should); a loose
+  // role is left as carried, since re-setting one re-arms its clearing.
+  if (alive_ && !Physics::IsLooseRole(LimbRole((size_t)limbIndex)))
+    ApplyLimbRole((size_t)limbIndex);
 
   if (limb.joint) {
     phys_->DestroyJoint(limb.joint);
@@ -11573,12 +11616,7 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // Re-exclude the whole mob: the new handle is not in the old exclusion set,
   // so without this a carved limb starts colliding with its own siblings and
   // the rig fights itself into a jitter.
-  {
-    std::vector<uint64_t> handles;
-    for (const MobLimb& l : limbs_)
-      if (l.body) handles.push_back(l.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
+  RegroupRig();
   return true;
 }
 
@@ -11648,8 +11686,8 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
   // shove; a spray of them is the player skating off sideways every time acid
   // takes a bite (or a blade a chunk). Kept off the player until it has
   // fallen clear, then ordinary debris — the same rule every piece that
-  // leaves a rig now follows.
-  phys_->ReleaseToWorldWhenClear(h);
+  // leaves a rig now follows (a loose role clears first).
+  phys_->SetBodyRole(h, Physics::BodyRole::Debris);
   // Push it off the wound so it visibly leaves the body rather than resting in
   // the cavity it came from.
   Vec3 away = xf.pos - src.xf.pos;
@@ -18862,8 +18900,8 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
       // spawned overlapping the wearer's capsule on the normal contact layer,
       // and Jolt's resolution of the overlap fired the player across the room
       // — "clothes burning off launches the player". The layer half of that is
-      // now handled for every body that leaves a rig (DetachLimb,
-      // Physics::ReleaseToWorldWhenClear); what remains true is the physical
+      // now handled for every body that leaves a rig (DetachLimb, the loose
+      // Physics::BodyRole clearing); what remains true is the physical
       // half: a garment consumed BY FIRE has nothing left to fall off, so
       // there should be no body. Rags cut loose by a blade still drop, because
       // that is a piece of gear hitting the floor — and if the rag is the
@@ -19138,10 +19176,11 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     // cut it. On the normal layer that is an unresolvable overlap the proxy
     // cannot move, so PlayerPushOut moved the player instead, a body-width a
     // tick for fifteen ticks: "I dismembered him and flew across the field".
-    // The avatar's own pieces were already exempt; now everything is, and
-    // TickSeveredHolds hands the piece to ReleaseToWorldWhenClear rather than
-    // straight back to the world.
-    phys_->SetBodyAvatarLayer(limb.body, true);
+    // The avatar's own pieces were already exempt; now everything is (the
+    // SeveredHold role: exempt from EVERY player, since an NPC's arm is inside
+    // whoever cut it), and TickSeveredHolds ends the hold as a loose role that
+    // clears the player first rather than going straight back to the world.
+    phys_->SetBodyRole(limb.body, Physics::BodyRole::SeveredHold);
     // The wound went with the body. Left here it would go on paying out of
     // the husk entry: BleedTick's bodyless fallback drips at the rest-pose
     // anchor of a limb that is no longer on this creature.
@@ -19342,14 +19381,14 @@ void Mob::EnterDeadRagdoll() {
     phys_->GetTransform(limb.body, limb.xf);
     phys_->SetBodyKinematic(limb.body, false);
     phys_->ActivateBody(limb.body);
-    // A weapon nobody is carrying is an object again (StartRagdoll's note).
-    if ((int)i == heldSlot_) phys_->SetBodyPropLayer(limb.body, false);
     // A CORPSE FALLS WHERE IT STOOD, which for an NPC killed at sword's reach
     // is often half inside the player's capsule proxy, and for the avatar
-    // entirely inside it: off the player's contact layer until it has fallen
-    // clear, then an ordinary body (the "I died and my body went FLYING" fix,
-    // made for every body that leaves the living, the avatar's included).
-    phys_->ReleaseToWorldWhenClear(limb.body);
+    // entirely inside it: RigDead is a LOOSE role, so it clears the player
+    // before it is an ordinary body (the "I died and my body went FLYING" fix,
+    // made for every body that leaves the living, the avatar's included). The
+    // held weapon is one of these limbs, so it stops being a prop here too —
+    // a weapon nobody is carrying is an object again (StartRagdoll's note).
+    phys_->SetBodyRole(limb.body, Physics::BodyRole::RigDead);
   }
   MarkInstancesDirty();
 }
@@ -19411,9 +19450,9 @@ void Mob::ReleaseRigToDebris() {
                        std::move(limb.skinVoxels),
                        IsBloodless((int)i) ? 0u : def_->bleedMat,
                        WoundOf(limb), /*dead=*/true, defIndex_, id_);
-    // Off the player's contact layer until it has fallen clear, then debris
-    // like any other: the same rule a severed piece follows (Mob::Die's note).
-    phys_->ReleaseToWorldWhenClear(limb.body);
+    // DebrisSystem's now: loose Debris, clear of the player first, then debris
+    // like any other — the same rule a severed piece follows (Mob::Die's note).
+    phys_->SetBodyRole(limb.body, Physics::BodyRole::Debris);
     limb.skinVoxels.clear();
     limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
     // ...and the index with it. The avatar keeps its limb list past death,
@@ -22890,14 +22929,14 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // for: the blade is pinned to a hand by a Fixed joint and posed every tick,
   // so a contact can never move the WEAPON, only its victim.
   //
-  // Layers::PROP is the whole fix (phys/physics.h SetBodyPropLayer): no
+  // The HeldProp role is the whole fix (phys/physics.h BodyRole -> PROP): no
   // contacts with anything, still visible to every ray. The swing is
   // unaffected — MeleeSweepDamage probes with CastRayBody, FindParry is
   // segment-vs-segment geometry, and melee applies no impulses at all — and
   // the moment this item stops being held, every path that lets go of it
-  // (DetachLimb, TickSeveredHolds, DropItemToWorld, GoLimp) ends in
-  // ReleaseToWorldWhenClear or AdoptBody, which set the layer outright.
-  phys_->SetBodyPropLayer(p.body, true);
+  // (DetachLimb, TickSeveredHolds, DropItemToWorld, StartRagdoll, Die) sets
+  // the role it becomes, which is a whole layer.
+  phys_->SetBodyRole(p.body, Physics::BodyRole::HeldProp, CollisionOwner());
 
   // THE GRIP POINT IN THE BODY'S OWN FRAME.
   //
@@ -22927,12 +22966,7 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // The new body must not collide with the rest of this creature, exactly as
   // BuildRig arranges for the limbs — a sword resting against the thigh would
   // otherwise fight the solver every tick.
-  {
-    std::vector<uint64_t> handles;
-    for (const MobLimb& q2 : limbs_)
-      if (q2.body) handles.push_back(q2.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
+  RegroupRig();
 
   anim_.partAlive.resize(skel_.parts.size(), 1);
   anim_.springs.resize(skel_.parts.size(), SpringState{});
@@ -22990,10 +23024,7 @@ void Mob::RemoveAppendedSlots(int first, int count) {
     // is being erased under it: finish the hold now, or the piece stays
     // kinematic in mid-air forever with nothing left to time it out.
     if (L.holdBody) {
-      phys_->SetBodyKinematic(L.holdBody, false);
-      phys_->ClearCollisionGroup(L.holdBody);
-      GroupSeveredPiece(L.holdBody);
-      phys_->ReleaseToWorldWhenClear(L.holdBody);
+      EndSeveredHold(L.holdBody);
       L.holdBody = 0;
       L.holdSeconds = 0;
     }
@@ -23334,7 +23365,9 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
     return -1;
   }
   phys_->SetBodyKinematic(p.body, true);
-  if (AvatarLayer()) phys_->SetBodyAvatarLayer(p.body, true);
+  // Worn by whoever wears it: the avatar's shells are exempt from its own
+  // capsule exactly as its limbs are, an NPC's are ordinary kinematic bodies.
+  phys_->SetBodyRole(p.body, Physics::BodyRole::WornShell, CollisionOwner());
   p.xf = bxf;
   // ---- STRAPPED, NOT JOINTED ------------------------------------------------
   //
@@ -23401,12 +23434,7 @@ bool Mob::WearItem(const ItemDef* item, int equipSlot,
   // Nothing on this creature collides with anything else on it: a pauldron
   // resting against a helmet would fight the solver every tick, exactly as a
   // sword resting against a thigh would.
-  {
-    std::vector<uint64_t> handles;
-    for (const MobLimb& l : limbs_)
-      if (l.body) handles.push_back(l.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
+  RegroupRig();
 
   worn_.push_back(std::move(piece));
   if (!AppendedInvariantHolds())

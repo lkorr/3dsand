@@ -1798,6 +1798,22 @@ class Mob {
   // the fixtures that build a Mob by hand have nobody to be a ghost of.
   bool IsGhost() const;
 
+  // ---- WHOSE CAPSULE THIS BODY IS EXEMPT FROM (W2-N) -----------------------
+  //
+  // A player's body is exempt from THAT player's capsule proxy and nobody
+  // else's (Physics::BodyRole, OWNED). The proxy is told once, by whoever made
+  // it (main.cpp for the local player, RemotePlayers for a ghost); every limb
+  // role is re-applied on the spot and every later Spawn/Equip/Wear reads it.
+  // An NPC has no owner. An avatar that was never told one is exempt from
+  // EVERY capsule — the pre-W2-N AVATAR layer, and what every fixture that
+  // builds an avatar without wiring its proxy still gets.
+  void SetCollisionOwner(uint64_t proxy);
+  uint64_t CollisionOwner() const;
+  // THE ROLE OF ONE SLOT, derived from the creature's state (alive/limp/dead,
+  // held slot, worn shell, severed hold) — the one place a limb's collision
+  // layer is decided. Physics resolves the role to a layer.
+  Physics::BodyRole LimbRole(size_t i) const;
+
   // ---- THE PER-MOB RECORD --------------------------------------------------
   //
   // One creature's damage, carve state and rig geometry, in the bytes
@@ -3085,12 +3101,13 @@ class Mob {
   // these. Adding avatar behaviour anywhere else in the shared mechanics is
   // the bug this class was built to make impossible.
   //
-  // Limbs of the player's body live on the AVATAR physics layer (they sit
-  // inside the player capsule and must not push it — see avatar.cpp Spawn).
+  // Limbs of the player's body are exempt from the player's capsule (they sit
+  // inside it and must not push it — see avatar.cpp Spawn): LimbRole gives
+  // them CollisionOwner(), which is non-zero only when this is true.
   virtual bool AvatarLayer() const { return false; }
   // (There used to be an OnBodyReleasedToWorld here, where the avatar put a
   // severed piece back on the normal layer after its hold. Gone: EVERY body
-  // that leaves ANY rig now goes through Physics::ReleaseToWorldWhenClear,
+  // that leaves ANY rig now becomes a loose Physics::BodyRole (CLEARING),
   // which keeps it off the player until it has fallen clear — an NPC's
   // severed arm inside the player's capsule launched the player exactly as
   // the avatar's own used to, and the fix belongs to the body, not to who it
@@ -3487,6 +3504,17 @@ class Mob {
   // joint once the pieces are free (the corpse keeps the mob's group for the
   // same reason). Called wherever a hold is released.
   void GroupSeveredPiece(uint64_t handle);
+  // THE END OF A SEVERED HOLD, from every path that ends one (the timer, a
+  // despawn, an appended slot erased under it): dynamic, out of the rig's
+  // group into the piece's own, and a loose Debris body (Physics clears it of
+  // every player first).
+  void EndSeveredHold(uint64_t handle);
+  // Set LimbRole(i) on slot i's body (no-op for a slot with none).
+  void ApplyLimbRole(size_t i);
+  // One exclusion group over every limb body this creature has: its limbs,
+  // shells and held item never collide with each other. Re-run whenever a
+  // handle joins the rig (spawn, rebuild, equip, wear).
+  void RegroupRig();
   // Tear down every body/joint/brick this rig still owns (despawn, reset).
   void ReleaseRig();
 
@@ -3692,6 +3720,7 @@ class Mob {
   uint64_t deadWakeKey_ = 0;   // DeadWakeKey() when it fell asleep
   uint64_t deathSeq_ = 0;      // see DeathSeq()
   bool playerCorpse_ = false;  // see PlayerCorpse()
+  uint64_t collisionOwner_ = 0;  // see SetCollisionOwner (avatars only)
   bool swinging_ = false;
   GoreProfile gore_;           // this creature's own bleed character
   // ---- blood loss and the burn cap (see the public block above) -----------

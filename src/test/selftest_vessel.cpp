@@ -1163,14 +1163,19 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
           phys.CreateDebrisBodyXf(arm, ax, debris.DensityOf(), true);
       if (!limb) return -2;
       phys.SetBodyKinematic(limb, true);
-      phys.SetBodyAvatarLayer(limb, true);
+      // A player's own live limb, owner not wired (exempt from every capsule:
+      // the old AVATAR layer this arm was written against).
+      phys.SetBodyRole(limb, Physics::BodyRole::RigLive, Physics::kAnyPlayer);
       const Vec3 vel{0, full * 0.25f, -full};
       const uint64_t f = drop(pc - Vec3{0.5f, 0.5f, 0.5f}, vel);
       if (!f) {
         phys.RemoveBody(limb);
         return -2;
       }
-      phys.ReleaseToWorldWhenClear(f, thrown);
+      // `thrown`: the throw role (THROWN); the control is the plain loose
+      // release (EXEMPT, which meets EXEMPT/owned limbs: the bug).
+      phys.SetBodyRole(f, thrown ? Physics::BodyRole::Thrown
+                                 : Physics::BodyRole::Debris);
       BodyTransform f0{};
       phys.GetTransform(f, f0);
       int broke = -1;

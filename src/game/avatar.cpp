@@ -1973,8 +1973,8 @@ void PlayerAvatar::PreTick(uint32_t tick, const Player& player, float heading,
 
   // Shared per-tick body upkeep (Mob) — identical to what MobSystem::PreTick
   // runs for every NPC: drain gore authored outside the tick, and tick the
-  // severed holds down (a released piece goes to
-  // Physics::ReleaseToWorldWhenClear, the same as an NPC's).
+  // severed holds down (a released piece becomes loose Debris and clears the
+  // player first, Mob::EndSeveredHold, the same as an NPC's).
   DrainPendingSpawns(world, spawns);
   TickSeveredHolds(dt);
   // ...and the hit flash, which is the same kind of thing: per-limb state that

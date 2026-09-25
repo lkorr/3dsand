@@ -773,7 +773,7 @@ bool pushOk = false;
   float pushFar = phys.PlayerPushOut(pb, at).len();
   phys.RemoveBody(farBody);
 
-  // RELEASE WHEN CLEAR (Physics::ReleaseToWorldWhenClear). A body born inside
+  // RELEASE WHEN CLEAR (a loose Physics::BodyRole). A body born inside
   // the proxy — a severed limb, a cut strap's plate, a sword knocked from a
   // hand — must be invisible to the push while it overlaps, and ordinary
   // debris once it is clear: one that stayed exempt would be walk-through
@@ -791,7 +791,7 @@ bool pushOk = false;
     };
     pin();
     uint64_t inside = stoneBlock({499, 499, 499});  // straddles the capsule
-    phys.ReleaseToWorldWhenClear(inside);
+    phys.SetBodyRole(inside, Physics::BodyRole::Debris);
     const float pushHeld = phys.PlayerPushOut(pb, at).len();
     phys.Step(kTickDt);   // still overlapping after a step: still exempt
     const float pushHeld2 = phys.PlayerPushOut(pb, at).len();
@@ -817,7 +817,7 @@ bool pushOk = false;
   }
 
   // A CARRIED PROP HAS NO CONTACTS, IN EITHER DIRECTION
-  // (Physics::SetBodyPropLayer, Layers::PROP).
+  // (Physics::BodyRole::HeldProp, Layers::PROP).
   //
   // A held weapon is a kinematic body posed by its wielder's hand and pinned
   // to it by a joint, so a contact can never move the WEAPON — only whatever
@@ -844,7 +844,7 @@ bool pushOk = false;
 
     uint64_t prop = stoneBlock({499, 499, 499});  // straddles the capsule
     const float pushPlain = phys.PlayerPushOut(pb, at).len();
-    phys.SetBodyPropLayer(prop, true);
+    phys.SetBodyRole(prop, Physics::BodyRole::HeldProp);
     const float pushProp = phys.PlayerPushOut(pb, at).len();
     // ...and a ray fired along +x from well outside still finds it.
     float frac = 1.0f;
@@ -852,7 +852,10 @@ bool pushOk = false;
         phys.CastRayBody(Vec3{480.0f, 500.0f, 500.0f}, Vec3{1, 0, 0}, 40.0f,
                          frac);
     const int layerWhileProp = phys.BodyObjectLayer(prop);
-    phys.SetBodyPropLayer(prop, false);
+    // Back to an ATTACHED, unowned role (a live NPC limb: MOVING at once, no
+    // clearing) — the old SetBodyPropLayer(false). A loose role would clear
+    // the capsule first and read 0 here, correctly.
+    phys.SetBodyRole(prop, Physics::BodyRole::RigLive);
     const float pushBack = phys.PlayerPushOut(pb, at).len();
     phys.RemoveBody(prop);
 
@@ -872,7 +875,7 @@ bool pushOk = false;
       const uint64_t blade =
           phys.CreateDebrisBodyXf(vox, bxf, dens, /*allowKinematic=*/true);
       phys.SetBodyKinematic(blade, true);
-      if (asProp) phys.SetBodyPropLayer(blade, true);
+      if (asProp) phys.SetBodyRole(blade, Physics::BodyRole::HeldProp);
       const float startX = 612.0f;
       // 10 kg: comfortably under the player's kick-it-aside mass, and the
       // kind of thing a blade would otherwise punt across the field.
