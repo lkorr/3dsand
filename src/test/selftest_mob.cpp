@@ -4003,8 +4003,9 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
   // (debris.cpp had already split them out as matSelfScaled_). The "you
   // walked out of the fire" case: light a patch of an arm's skin, put the
   // fire out, and ask the burn pass's own bookkeeping. Every limb carrying
-  // char must be off the front with its latch cleared, and must sleep
-  // whenever an unburnt limb of the same creature does. Its own fixture
+  // char must be off the front with its latch cleared, and every limb,
+  // charred or not, must then sleep (W2-I: absolute, not relative to the
+  // unburnt limbs, which did not sleep either). Its own fixture
   // because F's creature is still burning somewhere at the end of F (a slow
   // tail F allows), and heat from a neighbour keeps a limb awake for a reason
   // that is not its char. Measured before the fix: 6 limbs carrying 185
@@ -4068,17 +4069,41 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
         for (size_t m = 1; m < mats.size(); m++)
           if (mats[m].burnStage)
             ch += mobs.LimbMaterialCount(id, li, (uint32_t)m);
+        const MobSystem::LimbBurnProbe pr = mobs.LimbBurnStateOf(id, li);
         if (ch == 0) {
           k.cleanLimbs++;
-          if (mobs.LimbBurnStateOf(id, li).asleep) k.cleanAsleep++;
-          continue;
+          if (pr.asleep) k.cleanAsleep++;
+        } else {
+          k.charVox += ch;
+          k.charLimbs++;
+          k.front += pr.front;
+          k.charOnFront += pr.frontBurnt;
+          if (pr.asleep) k.asleep++;
         }
-        k.charVox += ch;
-        k.charLimbs++;
-        const MobSystem::LimbBurnProbe pr = mobs.LimbBurnStateOf(id, li);
-        k.front += pr.front;
-        k.charOnFront += pr.frontBurnt;
-        if (pr.asleep) k.asleep++;
+        // Not asleep: say which half of the sleep test failed and who holds
+        // the index -- for the CLEAN limbs too, which are the control and
+        // used to be reported only as a count (W2-I: "0 of 10 unburnt limbs
+        // asleep" bought no hypothesis at all). holdBy: the passes that kept
+        // the index warm (contact / rain / wet / splatter); miss: busy /
+        // index held / uncached chunk / pose moved / box moved / world moved
+        // / first visit (BodyBurnState::kHold* / kMiss*).
+        if (print && !pr.asleep && !pr.alight && !pr.front) {
+          auto bits = [](uint8_t b, const char* const* names, int n) {
+            std::string s;
+            for (int i = 0; i < n; i++)
+              if (b & (1u << i)) s += std::string(s.empty() ? "" : "+") + names[i];
+            return s.empty() ? std::string("-") : s;
+          };
+          static const char* const kHoldN[] = {"contact", "rain", "wet",
+                                               "splatter"};
+          static const char* const kMissN[] = {"busy", "index", "uncached",
+                                               "pose", "box", "world", "first"};
+          std::printf("    %s limb %d not asleep: holdBy %s, miss %s\n",
+                      ch ? "charred" : "clean", li,
+                      bits(pr.holdBy, kHoldN, 4).c_str(),
+                      bits(pr.sleepMiss, kMissN, 7).c_str());
+        }
+        if (ch == 0) continue;
         // Off the front but not asleep: say which half of the idle test is
         // missing. An index still held with `quiet` stuck low is something
         // reactive near the limb (the walk found it); no index and no sleep
@@ -4164,27 +4189,53 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // (30) quiet ticks before releasing it, and the sleep engages on the walk
     // AFTER the release.
     for (int i = 0; i < 40 && mobs.IsAlive(id); i++) burnTick(id, 0, 0);
+    // THE SLEEP, MEASURED OVER A WINDOW rather than read off one tick, and for
+    // EVERY limb: a limb-visit counts as asleep when the burn pass skipped its
+    // world walk (the key matched). An absolute claim, not one relative to the
+    // unburnt limbs (W2-I): until 2026-09-24 this compared charred limbs
+    // against a control in which NO limb slept either ("0 of 10 unburnt limbs
+    // asleep"), so it could not fail on the thing it was named for. What held
+    // them, per the attribution below (measured before the fix: every limb
+    // "holdBy wet", five also "contact", "miss index", 0 of 900 limb-visits
+    // asleep): the coat passes keep the index warm on a creature that was
+    // just doused (WetOneLimb while water is on it, StainOneLimb against the
+    // wet ground), and the sleep demanded an EMPTY index. A fraction rather
+    // than every visit, so a limb whose box flickers across a cell boundary
+    // (it re-walks that tick and sleeps the next) is not a failure.
+    const int kSleepWindow = 60;
+    uint32_t charVisits = 0, charSlept = 0, cleanVisits = 0, cleanSlept = 0;
+    std::vector<uint8_t> isChar(nLimbs, 0);
+    for (int li : charred) isChar[li] = 1;
+    for (int i = 0; i < kSleepWindow && mobs.IsAlive(id); i++) {
+      burnTick(id, 0, 0);
+      for (int li = 0; li < nLimbs; li++) {
+        const bool s = mobs.LimbBurnStateOf(id, li).asleep;
+        if (isChar[li]) { charVisits++; charSlept += s ? 1u : 0u; }
+        else { cleanVisits++; cleanSlept += s ? 1u : 0u; }
+      }
+    }
     const KCensus k = kCensus(true);
-    // Char never holds a front, before OR after the finite tail drains, and
-    // every charred limb then leaves the front with its latch cleared -- the
-    // two things that kept it from the idle exit. Whether the sleepKey then
-    // engages is the idle walk's own business (cached chunks, no foreign
-    // heat), so it is asserted AGAINST THE CONTROL rather than absolutely: a
-    // charred limb must sleep whenever an unburnt limb of the same creature
-    // does. Measured 2026-09-24: in this harness NO limb sleeps, burnt or not
-    // (0 of 10 unburnt), with the index held and `quiet` resetting -- a
-    // harness property, recorded here rather than papered over.
+    const double sleepMin = BaselineNumber("mobBurnSleepFracMin", 0.9);
+    const double charFrac = charVisits ? (double)charSlept / charVisits : 0.0;
+    const double cleanFrac =
+        cleanVisits ? (double)cleanSlept / cleanVisits : 0.0;
+    // Char never holds a front, before OR after the finite tail drains, every
+    // charred limb then leaves the front with its latch cleared, and every
+    // limb -- charred and unburnt alike -- sleeps.
     const bool kOk = lit > 0 && outAt >= 0 && k.charLimbs > 0 &&
                      k0.charOnFront == 0 && k.charOnFront == 0 &&
-                     k.awake == 0 && (k.cleanAsleep == 0 || k.asleep > 0);
+                     k.awake == 0 && charVisits > 0 && cleanVisits > 0 &&
+                     charFrac >= sleepMin && cleanFrac >= sleepMin;
     std::printf(
-        "  charred limbs sleep: %s (%u lit, out at t+%d; %u limbs carry %u "
+        "  limbs sleep: %s (%u lit, out at t+%d; %u limbs carry %u "
         "burnt voxels; char on the front %u -> %u; right after: %u limbs "
-        "alight/fronted, front %u; off the front at t+%d: %u awake, %u asleep; "
-        "control: %u of %u unburnt limbs asleep)\n",
+        "alight/fronted, front %u; off the front at t+%d: %u awake; over %d "
+        "ticks charred limbs asleep %u/%u visits (%.0f%%), unburnt %u/%u "
+        "(%.0f%%), floor %.0f%%)\n",
         kOk ? "PASS" : "FAIL", lit, outAt, k.charLimbs, k.charVox,
         k0.charOnFront, k.charOnFront, k0.awake, k0.front, settled, k.awake,
-        k.asleep, k.cleanAsleep, k.cleanLimbs);
+        kSleepWindow, charSlept, charVisits, 100.0 * charFrac, cleanSlept,
+        cleanVisits, 100.0 * cleanFrac, 100.0 * sleepMin);
     if (!mobs.IsAlive(id))
       std::printf("    creature died: %s (the claim is about a LIVE limb)\n",
                   mobs.DeathCause(id));

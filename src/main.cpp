@@ -7319,7 +7319,7 @@ int main(int argc, char** argv) {
   if (g_forestFire && !g_fellTree) {
     // ---- --forest-fire (see g_forestFire). Borrows the fell-tree slot: it is
     // the frame layer's one cell-op hook, and the two harnesses are exclusive.
-    tickCtx.fellTree = [&world, &mats, &debris, &player, &sim](
+    tickCtx.fellTree = [&world, &mats, &debris, &mobs, &player, &sim](
                            uint32_t tick, std::vector<CellOp>& cellOps) {
       static std::vector<CellOp> seed;
       static size_t seedAt = 0;
@@ -7392,6 +7392,7 @@ int main(int argc, char** argv) {
         // is a sum -- this says which phase of it.
         debris.SetProfiling(true);
         debris.ResetProfile();
+        mobs.ResetBurnStats();  // the body-reaction evaluator's cost split
         std::printf("--forest-fire: MEASURING from tick %u\n", tick);
         std::fflush(stdout);
       }
@@ -7404,6 +7405,20 @@ int main(int argc, char** argv) {
       if (tick >= t0 + 1200u) {
         std::printf("--forest-fire: debris profile over the measured window: %s\n",
                     debris.ProfileReport().c_str());
+        // WHERE burnBodies' time goes, from the one evaluator's own counters
+        // (every body population goes through MobSystem::BurnOneLimb).
+        const MobSystem::BurnStats& bs = mobs.Burn();
+        std::printf("--forest-fire: body-reaction evaluator over the window: "
+                    "%llu visits (%llu loose debris, %llu of them deferred by "
+                    "the walk pot), %llu asleep, %llu world cells walked, %llu "
+                    "index builds over %llu cells, %u candidates evaluated\n",
+                    (unsigned long long)bs.visits,
+                    (unsigned long long)bs.looseVisits,
+                    (unsigned long long)bs.walkDeferred,
+                    (unsigned long long)bs.sleeps,
+                    (unsigned long long)bs.walkCells,
+                    (unsigned long long)bs.indexBuilds,
+                    (unsigned long long)bs.indexCells, bs.candidates);
         std::fflush(stdout);
         g_forestFireDone = true;
       }

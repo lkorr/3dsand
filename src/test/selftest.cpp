@@ -374,7 +374,9 @@ const char* const kOrder[] = {
     // longer resolves takes every mob gate after it down, and the run should
     // say which one it was.
     "prefab",      "sidecar-resolve", "anatomy-parity", "damage-cause", "mob",
-    "settle-back", "player-body",
+    // `debris-coat` beside `settle-back`: the same loose-body burn path, run
+    // from debris.Reset() on its own pads, and it leaves no bodies behind.
+    "settle-back", "debris-coat", "player-body",
     // Wearing things. After `mob` because it spawns the avatar def on real
     // terrain and carves a shell, which wants the same standing world the
     // body gates run in; before `ragdoll-joints` because it leaves the rig

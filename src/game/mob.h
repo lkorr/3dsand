@@ -797,7 +797,8 @@ struct BodyBurnState {
   // ---- ASLEEP: THE LAST WORLD WALK FOUND NOTHING, AND NOTHING HAS MOVED ----
   // A digest of everything the cheap gate's world walk reads (pose, box, the
   // cached chunks' versions, the window) as of the last walk that took the
-  // idle exit with no index held. Equal next tick = the walk would read the
+  // idle exit -- index held or not, since W2-I: the coat passes keep the
+  // index warm for their own lists and that is not fire. Equal next tick = the walk would read the
   // same cells and exit the same way, so it is skipped (rule 2: a corpse
   // lying still in a settled world costs a handful of chunk lookups, not a
   // box of cell reads and a fetch request per piece per tick). 0 = awake.
@@ -805,11 +806,38 @@ struct BodyBurnState {
   uint64_t sleepKey = 0;
   // THE LAST VISIT FOUND NOTHING TO DO: BurnOneLimb took one of its idle exits
   // (the sleepKey match, or "nothing hot near, empty front, not alight").
-  // Unlike sleepKey this holds while an index is held, which matters because
-  // the stain passes build the index for their own surface lists (a body lying
-  // on grass keeps one), and that is not fire. A dead Mob's sleep test reads
+  // (Before W2-I sleepKey required a DROPPED index and this did not, which
+  // mattered because the stain passes build the index for their own surface
+  // lists -- a body lying on grass keeps one -- and that is not fire; the two
+  // now agree on that.) A dead Mob's sleep test reads
   // it (Mob::DeadAwakeReason). Cleared with the index and by any busy visit.
   bool idle = false;
+  // ---- WHY IS IT NOT ASLEEP (attribution, W2-I 2026-09-24) -----------------
+  // A bare "not asleep" bought one hypothesis per run (CLAUDE.md rule 6), so
+  // the state says which half of the sleep test failed and who is holding it.
+  //   holdBy     which OTHER passes kept the index warm (reset `quiet`) since
+  //              it was last built: kHold* bits. Cleared with the index.
+  //   sleepMiss  why the last visit did not take the asleep branch: kMiss*.
+  //   slept      the last visit DID take it (the walk was skipped).
+  static constexpr uint8_t kHoldContact = 1;   // StainOneLimb: something against it
+  static constexpr uint8_t kHoldRain = 2;      // RainOneLimb wrote water
+  static constexpr uint8_t kHoldWet = 4;       // WetOneLimb: a washer coat on it
+  static constexpr uint8_t kHoldSplatter = 8;  // SplatterView threw at it
+  static constexpr uint8_t kMissBusy = 1;      // front / alight / acid / cross heat
+  // An index was held: a miss only under the pre-W2-I rule, which demanded
+  // an empty index to sleep. Never set now; kept so the bit layout of old
+  // attribution lines still reads.
+  static constexpr uint8_t kMissIndex = 2;
+  static constexpr uint8_t kMissUncached = 4;  // a chunk in the box is not cached
+  static constexpr uint8_t kMissPose = 8;      // the pose moved (box did not)
+  static constexpr uint8_t kMissBox = 16;      // the walked box moved
+  static constexpr uint8_t kMissWorld = 32;    // a chunk version / window moved
+  static constexpr uint8_t kMissFirst = 64;    // no key recorded yet
+  uint8_t holdBy = 0;
+  uint8_t sleepMiss = 0;
+  bool slept = false;
+  // The two halves of the last key, for kMissPose / kMissBox / kMissWorld.
+  uint64_t keyPose = 0, keyBox = 0, keyWorld = 0;
 };
 
 // One limb or part, described in the terms the burn pass needs.
@@ -888,6 +916,30 @@ struct BurnLimbView {
   // .json `bareBlood`: bone). The creature's smear material on a live limb, a
   // corpse piece's bleedMat; 0 = nothing bleeds here (debris, a bloodless def).
   uint32_t bareBloodMat = 0;
+  // ---- WHAT A LEAVING VOXEL'S OWN MATTER LOOKS LIKE IN THE GRID -----------
+  // The state nibble a non-solid product takes when this voxel's matter leaves
+  // the body into the world (ash off a burning robe): given the product, the
+  // voxel's art slot and the default jitter variant. Loose debris sets it
+  // (DebrisSystem::GridStateFor: a purple robe's ash is whatever ash a purple
+  // robe leaves); null = the jitter variant, which every creature population
+  // has always used. A raw pointer and context for the reason `occlude` is one.
+  using GridStateFn = uint32_t (*)(void* ctx, uint32_t mat, uint32_t art,
+                                   uint32_t fallback);
+  GridStateFn gridState = nullptr;
+  void* gridStateCtx = nullptr;
+  // ---- A BUDGET FOR THE WORLD WALK (loose debris only) ---------------------
+  // The cheap gate's walk reads every world cell of the body's box, and a
+  // creature pays it per limb per tick because a creature is a handful of
+  // limbs. A forest fire is two hundred loose bodies with smoke in every
+  // chunk around them, so no key ever matches and the walk ran for all of
+  // them every tick: measured, 193k cells a tick, 2.96 ms of burnBodies
+  // against the old evaluator's 1.22 (W2-I). The debris scheduler hands out
+  // a per-tick pot of walk cells; a visit whose walk does not fit is DEFERRED
+  // whole -- nothing read, nothing changed, `walkDeferred` set -- never run
+  // on a partial walk, which would take the idle exit on a box it had not
+  // finished reading and could sleep through a fire. Null = unbudgeted.
+  uint32_t* walkBudget = nullptr;
+  bool walkDeferred = false;
 
   // ---- IS SOMETHING WORN IN THE WAY? --------------------------------------
   //
@@ -5377,7 +5429,7 @@ class MobSystem {
   uint32_t LimbBurningCount(uint64_t mobId, int limbIndex) const;
   // The burn pass's own bookkeeping for one limb (BodyBurnState), for the
   // mob-burn gate's "a charred limb sleeps" claim (W1-F): front size, the
-  // `alight` latch, and whether the idle walk is asleep (sleepKey != 0).
+  // `alight` latch, and whether the last visit was asleep (skipped the walk).
   struct LimbBurnProbe {
     uint32_t front = 0;
     bool alight = false, asleep = false;
@@ -5385,6 +5437,9 @@ class MobSystem {
     uint32_t frontBurnt = 0;  // front voxels of a burnStage material (char)
     bool indexed = false;     // the burn index is held
     uint32_t quiet = 0;       // consecutive idle ticks with the index held
+    // BodyBurnState::holdBy / sleepMiss: who holds the index, and which half
+    // of the sleep test the last visit failed (kHold* / kMiss* bits).
+    uint8_t holdBy = 0, sleepMiss = 0;
   };
   LimbBurnProbe LimbBurnStateOf(uint64_t mobId, int limbIndex) const;
   // How many of this limb's voxels are of material `mat`. The differential the
@@ -5808,6 +5863,14 @@ class MobSystem {
     // did not catch" buys one hypothesis per run; these say which of "no cells
     // were built", "no face found one" and "the roll refused" it was.
     uint32_t crossCells = 0, crossFaces = 0, crossOnly = 0;
+    // WHERE THE PASS'S COST GOES (W2-I): visits, visits that slept (skipped
+    // the walk), world cells the walk read, dense-index builds and the
+    // cells they allocated, and how many of the visits were loose debris
+    // (BurnLooseBody). "burnBodies got slower" buys one hypothesis; these
+    // say whether it is the walk, the index or the rule evaluation.
+    uint64_t visits = 0, sleeps = 0, walkCells = 0;
+    uint64_t indexBuilds = 0, indexCells = 0, looseVisits = 0;
+    uint64_t walkDeferred = 0;  // loose visits deferred: the walk pot was spent
   };
   const BurnStats& Burn() const { return burnStats_; }
   void ResetBurnStats() { burnStats_ = BurnStats{}; }
@@ -6344,6 +6407,21 @@ class MobSystem {
     uint32_t seen = 0;
   };
   std::map<uint64_t, FleshCoat> fleshCoat_;
+  // ---- LOOSE MATTER THROUGH THE SAME EVALUATOR (W2-I, 2026-09-24) ---------
+  // Every NON-flesh debris body DebrisSystem::BurnBodies offers (logs, dropped
+  // items, strapped shells, rubble) is burnt by BurnOneLimb through this, with
+  // its burn state here keyed on the body's global id like a severed part's.
+  // No coat ledger (so no corrosive-coat seeding), no creature (no cross-limb
+  // heat), no shells, no wound table: the population's inputs, through the
+  // view. An entry not offered for kBurnIndexGrace ticks is retired
+  // (RetireLooseBurn) -- the body settled, burnt away or left -- and a body
+  // offered again rebuilds it (FleshView re-seeds `alight` from the body).
+  std::map<uint64_t, FleshCoat> looseBurn_;
+  bool BurnLooseBody(DebrisSystem::FleshLattice& f, uint32_t tick, World& world,
+                     std::vector<CellOp>& cellOps, uint32_t& frontBudget,
+                     uint32_t& opsBudget, uint32_t& walkBudget,
+                     uint32_t& removed, bool& deferred);
+  void RetireLooseBurn(uint32_t tick);
   // One march index per shell strapped to a severed part, keyed on the shell
   // body's global id; dropped when unasked-for for two seconds (the body left).
   struct FleshShellMarch {
