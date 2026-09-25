@@ -776,3 +776,22 @@ new gates, run from a scratch directory.
   burns past `burnDeathFraction`, with no blast, fall, contact or bleed
   involved. That is the intended consequence of lighting every part of a
   robed player and leaving them in the fire for 400 ticks.
+
+## 2026-09-24 — rule-unification W2-L (one pose pipeline) + W2-O (gates on the real tick)
+
+Hash unchanged (5cede91d); twice-run reproduces after each package.
+
+- **`impact-fist` recorded `fail` — a FINDING of W2-O, not a regression.**
+  Converted to `RunTicks` it runs the whole tick for the first time. Its
+  target walked off (61.9 vox) until pinned with the `dummy` profile; pinned,
+  the bare-fist limb still loses 7 voxels, and an added never-struck control
+  limb ALSO loses flesh with no hp charged (3 vox at the gate's raised pulp
+  rate, 2 at the shipped rate). A standing, unhurt human's thigh loses flesh
+  in place on the real tick: likely a real-tick bug (candidate: a pulp /
+  bruise / stain pass the old hand-rolled tick never ran). Untraced. Flip back
+  to `pass` when that is found and fixed.
+- `ragdoll-dress` fail -> pass under W2-L (knife-edge slam arm; NPC leg IK
+  now fades in on the spawn tick). Recorded as before.
+- `corpse-splatter` fails only in per-file subsets; passes standalone on both
+  exes (subset artifact). `mob-loot` 'rose with 0' and `ai-pursue`: identical
+  before conversion (subset artifacts).
