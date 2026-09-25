@@ -714,6 +714,8 @@ class Simulation {
   // Wind primitive footprint wake (sim_mutate.wgsl `windWake`) — see
   // docs/RESEARCH_wind.md §4.3.
   rhi::ComputePipeline windWake_;
+  // Rain on the ground + drying of wet top surfaces (sim_mutate.wgsl rainFall).
+  rhi::ComputePipeline rainFall_;
   rhi::ComputePipeline explodeMark_, explodeApply_, pArgs1_, pSpawn_, pIntegrate_,
       pArgs2_, pResolve_;
   // Gas particles (sim_gas.wgsl, docs/PLAN_gas_particles.md stage 1). Five

@@ -284,3 +284,110 @@ fn windWake(@builtin(global_invocation_id) gid : vec3<u32>) {
   atomicOr(&dirtyIn[slot], DIRTY_R_MUTATE);
   atomicOr(&dirtyOut[slot], DIRTY_R_MUTATE);
 }
+
+// ---- RAIN ON THE GROUND (2026-09-25) ----------------------------------------
+//
+// Rain does not delete stains. It STAINS THE GROUND WITH WATER, through the
+// same common.wgsl stainStep a pouring liquid uses -- and the newest stain wins,
+// so a drop landing on blood-soaked ground replaces the blood with wet, and the
+// wet then dries (a stain type's `dries`). The rain material is data: the one
+// that authors `"stain": {"rain": true}` (water), published in stain palette
+// entry 0's `_r3` (materials.h kStainPal*).
+//
+// THE COST IS FIXED, NOT THE WORLD'S (rule 2). A storm falls on every surface
+// of the window, and a kernel that woke every surface chunk for it would keep
+// the whole visible world awake for as long as it rained. So this is a SAMPLER:
+// one thread per RAIN_TILE x RAIN_TILE tile of columns, each tick landing on
+// one column of its tile (a hash of seed, tick and tile), walking down past
+// sky -- a whole chunk at a time over an EMPTY sentinel -- to the first thing
+// that is not air or gas, and acting on that one cell:
+//   * while it rains (T.weatherRain's amount, as that chance out of 255): wet
+//     it. A cell that was dry or wore another stain dirty-marks its chunk --
+//     the chunk has changed what it IS (modified tracking; its coat rules must
+//     see the water) -- but re-wetting what is already wet marks nothing, so a
+//     steady storm on a wet meadow keeps nothing awake;
+//   * while it does not: a wet top surface loses a level, at its type's `dries`
+//     scaled up by the tile area (a column is visited once per RAIN_TILE^2
+//     ticks on average), and never while the liquid that made it touches it.
+//     This is why sim_step's stainDry does not hold a chunk awake for a cell
+//     open above: the top surfaces dry here, asleep.
+// A liquid on top (a pond) takes the rain and nothing is stained; a solid
+// SENTINEL on top (a uniform chunk whose top face is the surface) has no page
+// to write, so the drop is dropped rather than faulted.
+//
+// DETERMINISM (rule 1). Every tile is one thread and owns its columns, so no
+// two threads write one cell; each writes only the STAIN bits of its cell, and
+// what it reads of a neighbour is its material, which nothing here changes.
+// The column and the rolls are hash3 of (seed, tick, tile); the rain word is
+// TickParams, which ops-replay records.
+const RAIN_TILE : u32 = 8u;            // pass_table.cpp kRainTile
+const RAIN_TILES : u32 = WORLD_N / RAIN_TILE;
+const RAIN_SALT : u32 = 0x5A1D0F00u;
+
+@compute @workgroup_size(64)
+fn rainFall(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= RAIN_TILES * RAIN_TILES) { return; }
+  let h = hash3(T.seed ^ RAIN_SALT, T.tick, gid.x);
+  let base = T.origin * i32(CHUNK);
+  let x = base.x + i32((gid.x % RAIN_TILES) * RAIN_TILE + (h % RAIN_TILE));
+  let z = base.z + i32((gid.x / RAIN_TILES) * RAIN_TILE + ((h / RAIN_TILE) % RAIN_TILE));
+  let rain = T.weatherRain & RAIN_AMOUNT_MASK;
+  let roll = hash3(h, 0x7A11u, T.tick);
+  // A dry sky dries; the drying chance is read off the cell's stain below.
+  // Rolled FIRST while it rains, so a drizzle's idle threads skip the walk.
+  if (rain != 0u && (roll % 255u) >= rain) { return; }
+
+  // Down the column to the first surface.
+  var y = base.y + i32(WORLD_N) - 1;
+  var idx = PT_NO_WORD;
+  var w = 0u;
+  loop {
+    if (y < base.y) { return; }
+    let e = pageEntryOf(voxSlotOfCell(vec3<i32>(x, y, z)));
+    if ((e & PT_SENTINEL_BIT) != 0u) {
+      let sm = e & PT_MAT_MASK;
+      if (sm != MAT_AIR && materials[sm].klass != CLASS_GAS) { return; }
+      y = ((y >> CHUNK_SHIFT) << CHUNK_SHIFT) - 1;  // the whole chunk is sky
+      continue;
+    }
+    let lo = vec3<u32>(vec3<i32>(x, y, z) & vec3<i32>(CHUNK_MASK));
+    let i = e * CHUNK_VOL + (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+    let cw = voxels[i];
+    let cm = voxMat(cw);
+    if (cm == MAT_AIR || materials[cm].klass == CLASS_GAS) { y -= 1; continue; }
+    idx = i;
+    w = cw;
+    break;
+  }
+  let c = vec3<i32>(x, y, z);
+  let m = materials[voxMat(w)];
+  if (m.klass != CLASS_SOLID && m.klass != CLASS_POWDER) { return; }
+
+  if (rain != 0u) {
+    let rm = materials[STAIN_PALETTE_BASE]._r3 & 0xFFFu;
+    if (rm == 0u) { return; }
+    let r = materials[rm];
+    let d = stainStep(matStainType(r), matStainAmount(r), matWashes(r), w, m);
+    if ((d.y & STAIN_WORK) == 0u) { return; }
+    voxStore(idx, d.x);
+    if (!voxStained(w) || voxStainType(w) != matStainType(r)) {
+      let own = dirtyFanSlot(c, T.origin, 0u);
+      if (own != SLOT_NONE) { atomicOr(&dirtyOut[own], DIRTY_R_STAINW); }
+    }
+    return;
+  }
+
+  if (!voxStained(w)) { return; }
+  let pal = materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3;
+  let chance = min(stainDryChance(pal) * RAIN_TILE * RAIN_TILE, 1000u);
+  if (chance == 0u || (roll % 1000u) >= chance) { return; }
+  let wetter = pal & 0xFFFu;
+  for (var k = 0u; k < 6u; k++) {
+    let n = c + faceDir(k);
+    if (inBounds(n) && voxMat(voxWordAt(n)) == wetter) { return; }
+  }
+  let left = voxStainAmt(w) - 1u;
+  var nw = w & ~STAIN_BITS;
+  if (left > 0u) { nw = nw | packStain(voxStainType(w), left); }
+  voxStore(idx, nw);
+}

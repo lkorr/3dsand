@@ -1542,7 +1542,7 @@ fn particleTick(@builtin(global_invocation_id) gid : vec3<u32>) {
     let nlo = vec3<u32>(n & vec3<i32>(CHUNK_MASK));
     let nci = (nbm - 1u) * CHUNK_VOL + (nlo.z * CHUNK + nlo.y) * CHUNK + nlo.x;
     atomicMax(&fluidCellScratch[nci * 2u], intent);
-    if (!bid && (stainStep(sType, sAmt, washes, nw, nm, stainWordWashes(nw)).y & STAIN_SPEND) != 0u) {
+    if (!bid && (stainStep(sType, sAmt, washes, nw, nm).y & STAIN_SPEND) != 0u) {
       atomicMax(&fluidCellScratch[nci * 2u + 1u], (gid.x + 1u) << 1u);
       bid = true;
     }
@@ -1646,14 +1646,6 @@ fn stainApply(@builtin(workgroup_id) wg : vec3<u32>,
 
 // One cell of stainApply: returns (Y-mask bits this cell lights, 1 if it took
 // a stain) for the fold above. The voxel write and the dirty mark are its own.
-// Is the stain ALREADY on word `w` a washer's (stainStep's `curWashes`, the
-// W2-J2 precedence rule)? Its type's material is the stain palette entry's
-// `_r3`. The same three lines as sim_step.wgsl's copy: materials[] is a
-// per-shader binding, so common.wgsl cannot hold them.
-fn stainWordWashes(w : u32) -> bool {
-  if (!voxStained(w)) { return false; }
-  return matWashes(materials[materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu]);
-}
 
 fn stainApplyCell(wgx : u32, li : u32) -> vec2<u32> {
   let block = wgx >> 4u;
@@ -1696,8 +1688,8 @@ fn stainApplyCell(wgx : u32, li : u32) -> vec2<u32> {
   let sm = materials[intent >> 16u];
   let h = hash3(T.seed ^ 0x5741u, T.tick, cellIndexW(c));
   if (!stainFires(sm, h)) { return vec2<u32>(ybits, 0u); }
-  let d = stainStep(sType, sAmt, matWashes(sm), w, materials[nmat], stainWordWashes(w));
-  // No work: saturated, or a foreign stain a non-washer may not touch.
+  let d = stainStep(sType, sAmt, matWashes(sm), w, materials[nmat]);
+  // No work: saturated, or a corrosive stain nothing here may paint over.
   // Monotone either way, so a wall under a standing flow goes quiet (rule 2).
   if ((d.y & STAIN_WORK) == 0u) { return vec2<u32>(ybits, 0u); }
   if ((d.y & STAIN_SPEND) != 0u) {

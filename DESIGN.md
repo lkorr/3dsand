@@ -3081,6 +3081,14 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     eighth of itself for, so that cycle drains both liquids and ends; on
     stone, where a mark is free, the strict order above still holds. Blood
     and ichor still never repaint each other.)
+    **SUPERSEDED 2026-09-25: THE NEWEST STAIN WINS.** The owner: "pouring oil
+    over blood-stained sand should rewrite it to oil stains". A stainer meeting
+    a foreign stain REPLACES it at one level, and a washer rinses it out in ONE
+    contact and leaves the cell wet -- on every surface, stone included -- and
+    every replacement is PAID (an eighth of the liquid), which is what the
+    strict order was standing in for: two liquids fighting over one cell drain
+    each other and stop. Only a corrosive coat outranks a newer non-corrosive
+    one (a body-only case). Gate `rain-stain`.
   - Both fit in `stainPack`'s spare bits (27..30 capacity, 31 washes), so the
     64-byte `Material` still did not grow.
   - **Sleep discipline (rule 2)** survives because every step is monotone toward
@@ -3093,6 +3101,32 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     (Since 2026-09-24 a stain on absorbent ground can be SPENT by a reaction --
     see "A coat is a co-located virtual neighbour" below. There is still no
     drying rule, and the monotone argument is replaced there by a mass one.)
+    **(2026-09-25: there IS a drying rule now, and it keeps the fixed point.)**
+    A stain type whose material authors `"stain": {"dries": n}` (water) loses a
+    level at `n` per mille per tick -- but NEVER while the liquid that makes it
+    touches the cell, so the wetting and the drying are never both live on one
+    cell (a pond's bank stays wet and sleeps), and never on a cell open to the
+    sky while it rains. `sim_step.wgsl` `stainDry` does it in awake chunks and
+    holds a chunk awake only for a COVERED cell (a wall or cave floor a flow
+    wetted: bounded by 15 levels, and only moving liquid makes one); an open
+    top surface is dried asleep by the rain sampler below, so a rained-on
+    meadow does not keep the surface awake while it dries.
+  - **Rain wets the ground (2026-09-25; `sim_mutate.wgsl` `rainFall`).** Rain
+    does not delete stains: it STAINS the ground with the material authored
+    `"stain": {"rain": true}` (water), through the same `stainStep` -- so under
+    the newest-stain rule it replaces blood and oil with wet, and the wet then
+    dries. It is a fixed-cost SAMPLER, not a wake of the surface (rule 2): one
+    thread per 8x8 column tile, each tick landing on one hashed column of its
+    tile, walking down past sky (a chunk at a time over an EMPTY sentinel) to
+    the first cell that is not air or gas. Raining (the tick's rain amount as a
+    chance out of 255): wet it, and dirty-mark its chunk only if the cell was
+    dry or wore another stain -- re-wetting wet ground marks nothing, so a
+    steady storm keeps nothing awake. Dry sky: a wet top surface loses a level
+    at its `dries` x 64 (a column is visited once per 64 ticks on average).
+    A liquid on top takes the rain; a solid SENTINEL on top has no page, so
+    the drop is dropped, never faulted. Each tile owns its columns, so no two
+    threads write one cell (rule 1); rain is a CA-skip input
+    (`NoteTickInputs`). Snow does not wet (its rain amount is 0).
   - Absorption writes SELF, which the stain rule otherwise never does. Reach is
     still ≤1 cell so the lattice argument holds, and the write sets the substep
     stamp so the movement code cannot also move the cell and double-spend the
@@ -3258,6 +3292,11 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
      the old section 3 (and the owner) wanted skin and flesh gone. The grid
      has S = 1 and no ground coat deeper than 1 (`bodyOnly` acid and lava are
      the only authored depths), so it never fires there.
+
+  **(2026-09-25: the rule below is now NEWEST WINS -- clean or same: climb;
+  a washer: rinse; a non-corrosive stain on a corrosive coat: refuse; a PAID
+  level: replace; an unpaid one: replace only what it strictly outweighs. Every
+  ground replacement is paid, stone included. See "Absorption and washing".)**
 
   **ONE STAIN PRECEDENCE (W2-J2; `common.wgsl` `stainPrecedence`, called by
   `stainStep`; `coatrule.h` `stainPrecedence`, called by every

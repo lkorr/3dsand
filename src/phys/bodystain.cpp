@@ -22,7 +22,6 @@ uint32_t BodyPrecedence(uint16_t cur, uint32_t mat, uint32_t amt) {
   const uint32_t curAmt = BodyStainAmt(cur), curMat = BodyStainMat(cur);
   return stainPrecedence(curAmt, curMat == mat, amt,
                          ClassHas(mat, kBodyCoatWashes),
-                         ClassHas(curMat, kBodyCoatWashes),
                          ClassHas(mat, kBodyCoatCorrodes),
                          ClassHas(curMat, kBodyCoatCorrodes), /*paid=*/true);
 }

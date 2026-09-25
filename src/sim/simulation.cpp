@@ -1151,9 +1151,18 @@ void Simulation::UploadTables(const rhi::Queue& queue,
     // MobSystem's matOfStainType_ gives a body. Ground types only: a `bodyOnly`
     // slot (no type bits in stainPack) is never on a grid cell, so it keeps 0
     // ("no coat material") and could not be read as one if it were.
+    // Bits 12..21 beside it: the stain's ground drying chance (kStainPalDry*,
+    // sim_step.wgsl stainDry), from the same first claimant.
     const uint32_t groundType = d.gpu.stainPack & kStainPackTypeMask;
-    if (groundType != 0 && table[kStainPaletteBase + groundType]._r3 == 0)
-      table[kStainPaletteBase + groundType]._r3 = (uint32_t)mi;
+    if (groundType != 0 && (table[kStainPaletteBase + groundType]._r3 & kStainPalMatMask) == 0)
+      table[kStainPaletteBase + groundType]._r3 =
+          ((uint32_t)mi & kStainPalMatMask) |
+          ((d.stainDries & kStainPalDryMask) << kStainPalDryShift) |
+          ((d.stainGroundOpacity & kStainPalOpacityMask) << kStainPalOpacityShift);
+    // Entry 0 (type 0 = clean, never drawn): the material that falls as rain
+    // (sim_mutate.wgsl rainFall). A ground stainer only; the first one wins.
+    if (groundType != 0 && d.stainIsRain && (table[kStainPaletteBase]._r3 & kStainPalMatMask) == 0)
+      table[kStainPaletteBase]._r3 = (uint32_t)mi & kStainPalMatMask;
     table[kStainPaletteBase + type].stainColor = d.gpu.stainColor;
     // ...and the body coat's glow + pulse in the palette entry's spare word
     // (materials.h kCoatGlow*). Only microbody.wgsl reads it.
@@ -1609,6 +1618,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // needs only dirtyIn/dirtyOut and TickParams, all of which simPL_ already
   // binds, so a fan costs no new binding and no new layout.
   pool.Add([&] { windWake_ = MakeComputePipeline(device, simPL_, mMutate, "windWake", "windWake"); });
+  pool.Add([&] { rainFall_ = MakeComputePipeline(device, simPL_, mMutate, "rainFall", "rainFall"); });
   pool.Add([&] { compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact"); });
   pool.Add([&] { compactNext_ = MakeComputePipeline(device, simPL_, mCompact, "mainNext", "compactNext"); });
   pool.Add([&] { step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step"); });
@@ -1744,7 +1754,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // skipped far row is a missing horizon rather than a wrong sim. Their
   // verdict is checked where they are published (PublishFarPipelines).
   if (!worldgen_ || !worldgenList_ || !pageFill_ || !mutate_ ||
-      !mutateCells_ || !windWake_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
+      !mutateCells_ || !windWake_ || !rainFall_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
@@ -2056,6 +2066,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::Mutate:         return mutate_;
     case P::MutateCells:    return mutateCells_;
     case P::WindWake:       return windWake_;
+    case P::RainFall:       return rainFall_;
     case P::Compact:        return compact_;
     case P::CompactNext:    return compactNext_;
     case P::Step:           return step_;

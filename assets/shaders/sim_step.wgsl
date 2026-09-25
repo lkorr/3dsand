@@ -1309,12 +1309,53 @@ fn coatMatOf(w : u32, sub : Material) -> u32 {
   return materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu;
 }
 
-// Is the stain ALREADY on word `w` a washer's (stainStep's `curWashes`, the
-// W2-J2 precedence rule)? The same lines as sim_fluid_seam.wgsl's copy:
-// materials[] is a per-shader binding, so common.wgsl cannot hold them.
-fn stainWordWashes(w : u32) -> bool {
-  if (!voxStained(w)) { return false; }
-  return matWashes(materials[materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu]);
+// ---- A WET STAIN DRIES (2026-09-25) -----------------------------------------
+// A stain type whose material authors `stain.dries` (water) comes off the
+// ground on its own: `dries` per mille per tick, one level at a time, the
+// chance packed into the stain palette entry's `_r3` bits 12..21 beside the
+// coat material (Simulation::UploadTables; common.wgsl stainDryChance). Never
+// while the cell touches the liquid that made it -- a pond's banks and bed stay
+// wet, and that is what lets them sleep.
+//
+// SLEEP (rule 2). A drying cell holds its chunk awake ONLY if its top face is
+// covered. A cell open above is a top surface, and top surfaces are dried by
+// sim_mutate.wgsl's rainFall sampler whether or not their chunk is awake -- so
+// a rained-on meadow does not keep every surface chunk awake for the half
+// minute it takes to dry; it dries asleep, a column sample at a time. A wet
+// wall or cave floor (a flow went past) is not sampled, so it holds its chunk
+// until dry: bounded, at most 15 levels at `dries`, and only liquid that
+// moved there -- which is activity -- makes one.
+//
+// Returns true when it WROTE the cell (the caller ends the cell's substep: the
+// word it holds is stale).
+fn stainDry(c : vec3<i32>, idx : u32, w : u32, m : Material, rnd : u32, probe : bool) -> bool {
+  if (m.klass != CLASS_SOLID && m.klass != CLASS_POWDER) { return false; }
+  let pal = materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3;
+  let chance = stainDryChance(pal);
+  if (chance == 0u) { return false; }
+  let wetter = pal & 0xFFFu;
+  for (var i = 0u; i < 6u; i++) {
+    let n = c + faceDir(i);
+    if (inBounds(n) && voxMat(voxWordAt(n)) == wetter) { return false; }
+  }
+  let up = c + vec3<i32>(0, 1, 0);
+  var open = true;
+  if (inBounds(up)) {
+    let um = voxMat(voxWordAt(up));
+    open = um == MAT_AIR || materials[um].klass == CLASS_GAS;
+  }
+  if (!open) { markDirtyR(c, DIRTY_R_STAIN); }
+  // Nothing open to the sky dries while it rains: that is the rain's surface.
+  // (Measured: drying through a storm left a third of a rained-on stone strip
+  // CLEAN -- its 1-level wet mark dried between drops.)
+  if (open && (T.weatherRain & RAIN_AMOUNT_MASK) != 0u) { return false; }
+  if (probe || (hash3(rnd, 0xD41E5u, 0u) % 1000u) >= chance) { return false; }
+  let left = voxStainAmt(w) - 1u;
+  var nw = w & ~STAIN_BITS;
+  if (left > 0u) { nw = nw | packStain(voxStainType(w), left); }
+  voxStore(idx, nw);
+  markDirtyR(c, DIRTY_R_STAINW);
+  return true;
 }
 
 fn isFlame(prod : u32) -> bool {
@@ -1732,22 +1773,24 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
 //     Capacity 0 (every material that predates this, all stone) means the
 //     liquid never soaks in and pools immediately.
 //
-//   * WASHING. A liquid with `stain: {washes: true}` rinses a FOREIGN stain out
-//     instead of repainting it: the foreign amount is stepped DOWN toward 0, and
-//     only once it is gone does the washer's own stain start to build. This is
-//     water cleaning blood off the ground. Overwriting (the old behaviour) would
-//     have relabelled blood as "wet" at full strength — the colour would change
-//     but the mess would never actually come out.
+//   * WASHING, and the newest stain winning (2026-09-25). A liquid with
+//     `stain: {washes: true}` rinses a FOREIGN stain out in one contact and
+//     leaves the cell wet at one level; any other staining liquid REPLACES a
+//     foreign stain the same way (oil over blood is oil). Either costs the
+//     liquid an eighth, on stone too. The wet then DRIES (stainDry), so the
+//     blood is actually gone and not merely relabelled.
 //
 // ---- SLEEP (rule 2) ----
 // Both additions preserve the termination argument, and that is the thing to
 // check when editing this. Every one of these is a monotone step toward a
-// bounded fixed point: stain rises only to min(capacity, addAmt); a washed
-// stain falls only to 0; absorbed fullness falls only to 0 (the cell dies).
+// bounded fixed point: stain rises only to min(capacity, addAmt); a replaced
+// stain costs the replacing liquid an eighth; absorbed fullness falls only to
+// 0 (the cell dies).
 // Nothing here ever increases the work remaining, so `progress` goes false and
 // stays false, and a saturated puddle on saturated ground sleeps. A rule that
-// could both wet and dry the same cell would NOT terminate — that is exactly
-// the trap in the drying variant, and why saturation here is terminal.
+// could both wet and dry the same cell would NOT terminate — which is why
+// stainDry never touches a cell while the liquid that makes its stain is
+// against it: the wetting and the drying are never both live on one cell.
 //
 // Returns whether the caller should keep the cell awake.
 fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
@@ -1798,7 +1841,7 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
     // whether the contact must be PAID for. What stays here is this kernel's
     // own half: the roll, the write, the spend in fullness eighths, and the
     // consumption of the marked voxel.
-    let d = stainStep(stainType, addAmt, washes, nw, materials[nmat], stainWordWashes(nw));
+    let d = stainStep(stainType, addAmt, washes, nw, materials[nmat]);
     if ((d.y & STAIN_WORK) == 0u) { continue; }
     progress = true;
     if (!fires) { break; }  // work remains, but not this tick
@@ -1807,12 +1850,6 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
     markVoxActive(ni);
     markDirtyR(n, DIRTY_R_STAINW);
     markDirtyR(c, DIRTY_R_STAINW);
-    // ---- washing: a rinse spends nothing and eats nothing ----
-    // One level per contact (stainStep), not `addAmt` levels: water authors a
-    // large amount, and reusing it here would erase blood in a single touch
-    // instead of visibly fading it under the flow.
-    if ((d.y & STAIN_WASH) != 0u) { break; }
-
     // ---- absorption: the liquid SPENDS itself soaking in ----
     // Only when the ground actually declared a capacity and the contact
     // deepened the stain (STAIN_SPEND), and only for a liquid that has mass to
@@ -1836,6 +1873,11 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
       }
       markVoxActive(idx);
     }
+
+    // ---- washing: a rinse eats nothing ----
+    // (It is paid for above like any replacement: water rinsing blood out and
+    // blood re-staining the rinsed cell is a cycle only mass can end.)
+    if ((d.y & STAIN_WASH) != 0u) { break; }
 
     // Consumption: the stain eats the voxel it just marked. Rolled from a
     // DIFFERENT slice of the hash than the stain roll, so the two are
@@ -2946,6 +2988,13 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // absorbent solid with an empty bucket). One stain-bits test for every cell
   // that reaches here; the palette load only for a stained absorbent one.
   let coat = coatMatOf(w, m);
+  // A wet stain dries (stainDry), on any surface, absorbent or not -- so this
+  // is tested before the inert return. One stain-bits test (already paid by
+  // coatMatOf) for every cell; the palette load only for a stained one.
+  if (P.substep == 0u && voxStained(w) &&
+      stainDry(c, idx, w, m, hash3(T.seed, T.tick * 2u, slotIdx), skip)) {
+    return;
+  }
   if (!matCanAct(m) && coat == 0u) { return; }
   let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
 

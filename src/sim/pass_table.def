@@ -184,6 +184,18 @@ PASS(mutateCells, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE_CELLS,K_C
 // read of DirtyIn.
 PASS(windWake, "prep(mutate+explode+compact)", PT_TICK, PIPE_WIND_WAKE, K_COMPUTE, D_WINDWAKE,1,1, GRP_SIM, DYN_ZERO, C_WINDWAKE, 1,
      USES(U(TickUBO) A(DirtyIn) A(DirtyOut)))
+// RAIN ON THE GROUND (2026-09-25). One thread per column tile: it walks its
+// sampled column down to the first surface and, while it rains, wets it with
+// the rain material's stain (common.wgsl stainStep -- which is what washes
+// blood off); while it does not, it dries a wet top surface by a level. Every
+// tick, at a fixed cost (64 workgroups at a 512 window) whatever the world
+// holds -- the sampler is what lets a rained-on meadow dry ASLEEP (sim_step
+// stainDry's sleep note). Writes only the stain bits of the one cell it lands
+// on; each thread owns its tile, so no two write one cell. A(DirtyOut): a cell
+// newly wetted declares its chunk (modified tracking, and the coat rules see
+// it); before `compact` for the windWake reason.
+PASS(rainFall, "prep(mutate+explode+compact)", PT_TICK, PIPE_RAIN_FALL, K_COMPUTE, kRainFallGroups,1,1, GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(R(Materials) U(TickUBO) RW(Voxels) A(DirtyOut) R(PageTable) A(PageFaults)))
 // mark reads the neighborhood, apply writes it. The two-phase split is what
 // makes the explosion kernel race-free (CLAUDE.md build gotchas); it only works
 // if the barrier between them exists, which under Dawn was free.

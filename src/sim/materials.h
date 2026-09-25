@@ -475,6 +475,24 @@ constexpr uint32_t kStainChanceMax = 1000;
 //   bits 8..19 : pulse rate in centi-Hz (0 = steady)
 constexpr uint32_t kCoatGlowMask = 0xFF;
 constexpr uint32_t kCoatPulseShift = 8, kCoatPulseMask = 0xFFF;
+// The STAIN MATERIAL word: the `_r3` of a STAIN PALETTE entry only
+// (table[kStainPaletteBase + type]), written by Simulation::UploadTables.
+//   bits 0..11  : the material id behind a GROUND stain type (the coat
+//                 material, DESIGN.md §6), 0 = none
+//   bits 12..21 : that stain's ground DRYING chance, per mille per tick
+//                 (materials.json "stain": {"dries": n}; common.wgsl
+//                 stainDryChance)
+//   bits 22..29 : that stain's GROUND OPACITY, 0..255 (materials.json
+//                 "stain": {"opacity": 0..1}, default 1) -- how strongly it
+//                 shows on the ground; raymarch.wgsl applyStain scales the
+//                 stain's coverage by it. Render-only. (The body coat's own
+//                 opacity is "coat": {"opacity"}, in stainColor's alpha byte.)
+// Entry 0 (stain type 0 = clean, never drawn) carries in bits 0..11 instead
+// the material that falls as RAIN ("stain": {"rain": true}); 0 = no rain
+// wets the ground. Read by sim_mutate.wgsl `rainFall`.
+constexpr uint32_t kStainPalMatMask = 0xFFF;
+constexpr uint32_t kStainPalDryShift = 12, kStainPalDryMask = 0x3FF;
+constexpr uint32_t kStainPalOpacityShift = 22, kStainPalOpacityMask = 0xFF;
 
 // ---- absorption (MaterialGpu.stainPack bits 27..30) ------------------------
 // How much staining liquid a GROUND material soaks up before the liquid starts
@@ -711,6 +729,17 @@ struct MaterialDef {
   // as a voxel's stain amount. 0 = never absorbs. Mirrors the top nibble of
   // gpu.stainPack; kept unpacked here for the tuner and the wiki.
   uint32_t absorbCapacity = 0;
+  // How fast this material's stain DRIES off the ground on its own, per mille
+  // per tick per level (materials.json "stain": {"dries": n}); 0 = it stays
+  // until something replaces it. Water's wet dries; blood and oil do not.
+  uint32_t stainDries = 0;
+  // How strongly this stain SHOWS on the ground, 0..255 (materials.json
+  // "stain": {"opacity": 0..1}). Water is a light darkening: at full strength
+  // its near-grey colour turned sand into what read as stone.
+  uint32_t stainGroundOpacity = 255;
+  // This is the material that falls as RAIN ("stain": {"rain": true}): the
+  // stain sim_mutate.wgsl `rainFall` lays on the ground it hits. One per table.
+  bool stainIsRain = false;
   // ---- WHAT THIS SUBSTANCE DOES WHILE IT IS ON A BODY ("coat") -------------
   //
   // A body voxel's coat names a MATERIAL (sim/voxload.h PrefabVoxel::stain),

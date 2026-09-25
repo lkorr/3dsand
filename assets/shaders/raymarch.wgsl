@@ -5407,7 +5407,12 @@ fn applyStain(albedo : vec3f, w : u32, cell : vec3<i32>, wetOut : ptr<function, 
   *wetOut = 0.0;
   if (!voxStained(w)) { return albedo; }
   let amt = f32(voxStainAmt(w)) / f32(STAIN_AMT_MAX);
-  let stainCol = unpackColor(materials[STAIN_PALETTE_BASE + voxStainType(w)].stainColor);
+  let pal = materials[STAIN_PALETTE_BASE + voxStainType(w)];
+  let stainCol = unpackColor(pal.stainColor);
+  // The stain's authored GROUND opacity (materials.json "stain": {"opacity"},
+  // materials.h kStainPalOpacity*): scales how much of the covered part is
+  // stain, not how far it spreads -- wet sand is darker sand, not grey stone.
+  let opacity = f32((pal._r3 >> 22u) & 0xFFu) / 255.0;
 
   // Break the stain up so it does not cover the voxel as a flat wash. A real
   // splatter has a mottled, uneven edge; sampling the existing value-noise
@@ -5421,6 +5426,7 @@ fn applyStain(albedo : vec3f, w : u32, cell : vec3<i32>, wetOut : ptr<function, 
                     TUNE_STAIN_COVERAGE, 0.0, 1.0);
   if (cover <= 0.0) { return albedo; }
   *wetOut = cover * amt;
+  let shown = cover * opacity;
 
   // MULTIPLY toward the stain colour rather than mixing to it. A stain soaks
   // in and DARKENS what is under it — it does not repaint it. Mixing makes a
@@ -5429,8 +5435,8 @@ fn applyStain(albedo : vec3f, w : u32, cell : vec3<i32>, wetOut : ptr<function, 
   // through the stain, which is what soaking looks like. The lerp toward the
   // pure stain colour at full coverage is what lets a really heavy stain still
   // read as its own colour rather than as an arbitrarily dark patch.
-  let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, cover);
-  return mix(soaked, stainCol, cover * TUNE_STAIN_OPACITY);
+  let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, shown);
+  return mix(soaked, stainCol, shown * TUNE_STAIN_OPACITY);
 }
 
 // ---- voxel ambient occlusion ----

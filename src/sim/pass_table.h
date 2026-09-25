@@ -263,6 +263,9 @@ enum class Pipe : uint8_t {
   // kernel in the engine that dirty-marks a chunk without writing a voxel.
   // See docs/RESEARCH_wind.md §4.3 and the note at the entry point.
   WindWake,
+  // Rain on the ground and the drying of wet top surfaces (sim_mutate.wgsl
+  // `rainFall`): one thread per kRainTile^2 column tile, every tick.
+  RainFall,
   Compact, CompactNext,
   Step,
   Occupancy, OccupancyDirty,

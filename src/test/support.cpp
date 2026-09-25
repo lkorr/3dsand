@@ -1966,7 +1966,11 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                                spawnCount > 0 || !windWake.empty() ||
                                (waterGpu && waterGpu->writesThisTick) ||
                                drainBodies > 0 ||
-                               fluidLive + fluidSpawnCount > 0);
+                               fluidLive + fluidSpawnCount > 0 ||
+                               // Rain is an input for the windWake reason:
+                               // sim_mutate.wgsl rainFall dirty-marks a chunk
+                               // whose surface it newly wets.
+                               (tp.weatherRain & 0xFFu) != 0);  // materials.h kRainAmountMask
   {
     // A snapshot can only license a skip if it is BOTH valid and fresh enough
     // (Simulation::NoteSnapshot enforces the freshness against lastDirtyTick_),

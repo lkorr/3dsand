@@ -109,7 +109,13 @@
         "amount": 15,
         "chance": 260,
         "consume": 0,
-        "washes": true
+        "washes": true,
+        "//opacity": "How strongly wet shows on the GROUND, 0..1 (the body's is coat.opacity). At 1 the near-grey wet colour replaced sand's hue and soaked sand read as stone (owner, 2026-09-25); 0.35 darkens it and keeps its colour.",
+        "opacity": 0.35,
+        "//dries": "Wet ground DRIES on its own (2026-09-25): 15 per mille per tick per level is ~2.2 s a level at 30 Hz (the body coat's decay 2 s), so a soaked meadow is dry again ~30 s after the rain stops. Never while water touches the cell, so pond banks stay wet and sleep. Blood and oil author no `dries`: they stay until something replaces them (the newest stain wins, and water replaces them with wet, which then dries).",
+        "dries": 15,
+        "//rain": "THIS is what falls as rain: while it rains, sim_mutate.wgsl rainFall drops it on the first surface of sampled columns as this stain, through the same stainStep a pouring liquid uses -- so rain washes blood off the ground by wetting it, and the wet then dries.",
+        "rain": true
       },
       "coat": {
         "decay": 2,

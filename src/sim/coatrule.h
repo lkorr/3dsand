@@ -58,23 +58,22 @@ inline uint32_t coatRampCount(uint32_t faces, bool coatHit, bool pitchFine) {
 
 // ONE stain-precedence rule for the ground and the body. `curAmt` / `sameType`:
 // what the voxel wears now and whether it is this stain. `newAmt`: the level the
-// write would lay (the ground lays ONE level per step, so a foreign stain, which
-// is at least one, is never out-weighed there). `paid`: the level is substance
-// (every body coat; a level absorbent ground paid for in liquid) rather than a
-// free one-level mark on a surface that does not absorb. The order is the
-// termination argument (DESIGN.md §6 "Absorption and washing"): a washer only
-// LOWERS a foreign stain; a stainer displaces one only if it is strictly heavier
-// or outranks it by class (a corrosive coat over one that is not; anything over
-// a washer's wetness) with a PAID level -- so a displacement is always either
-// out-weighed or paid for in liquid, and a free mark never starts a cycle.
+// write would lay. `paid`: the level is substance (every body coat; every
+// replacement on the ground, which costs the liquid an eighth) rather than a
+// free mark. THE NEWEST STAIN WINS (2026-09-25): a washer RINSES a foreign
+// stain (the ground in one contact, a body at the washer's rinse rate); any
+// other stainer REPLACES it with a paid level -- except that nothing that is
+// not corrosive paints over a corrosive coat. The termination argument
+// (DESIGN.md §6 "Absorption and washing") is mass: every replacement is paid,
+// so two liquids fighting over one voxel drain each other and stop.
 // MIRROR-BEGIN stainprec
 inline uint32_t stainPrecedence(uint32_t curAmt, bool sameType, uint32_t newAmt, bool washes,
-                   bool curWashes, bool corrodes, bool curCorrodes, bool paid) {
+                   bool corrodes, bool curCorrodes, bool paid) {
   if (curAmt == 0u || sameType) { return kStainPrecOwn; }
   if (washes) { return kStainPrecRinse; }
+  if (curCorrodes && !corrodes) { return kStainPrecRefuse; }
+  if (paid) { return kStainPrecOver; }
   if (newAmt > curAmt) { return kStainPrecOver; }
-  if (paid && corrodes && !curCorrodes) { return kStainPrecOver; }
-  if (paid && curWashes) { return kStainPrecOver; }
   return kStainPrecRefuse;
 }
 // MIRROR-END stainprec

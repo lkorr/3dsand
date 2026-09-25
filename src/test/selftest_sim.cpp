@@ -5648,6 +5648,212 @@ Status GateStainReact(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- rain-stain: the newest stain wins, rain wets, wet dries -----------------
+//
+// 2026-09-25 (the owner: "pouring oil over blood-stained sand should rewrite
+// it to oil stains; rain should wet the ground and the wet should go away on
+// its own, which removes the blood"). Four strips on a stone slab in open air,
+// each walled so a liquid poured on it stays on it:
+//
+//   oilOver  dirt wearing blood (12), a layer of OIL poured on it
+//   open     dirt wearing blood (12)                     -- the storm's subject
+//   stone    stone wearing blood (1), no dirt            -- a free mark, same claim
+//   roofed   dirt wearing blood (12) under a stone roof  -- the control
+//
+// Claims:
+//   OIL OVER  (clear sky, rainStainOilTicks) the oiled strip's dirt wears oil,
+//             not blood: blood cells 0, oil cells >= rainStainOilMinFrac
+//   WASHES    (storm, rainStainStormTicks, the oil lifted off first) every
+//             cell on the open, stone and oilOver strips wears WET, none blood
+//             or oil -- rain replaced them through stainStep (sim_mutate.wgsl
+//             rainFall), it did not delete them
+//   ROOFED    the roofed strip keeps all its blood (rain comes from the sky)
+//   DRIES     (clear again, rainStainDryTicks) the wet levels on the three
+//             rained strips fall to at most rainStainDryMaxFrac of their peak
+//   SLEEPS    at the end no fixture chunk is awake: drying a top surface is
+//             the sampler's job and holds nothing awake (rule 2)
+// Weather pinned and restored; world regenerated on the way out (rule 7).
+Status GateRainStain(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mDirt = matId("dirt"), mStone = matId("stone"),
+                 mOil = matId("oil"), mWater = matId("water"),
+                 mBlood = matId("blood");
+  if (!mDirt || !mStone || !mOil || !mWater || !mBlood) {
+    detail = "dirt/stone/oil/water/blood missing from materials.json";
+    return Status::Fail;
+  }
+  const uint32_t oilType = c.mats[mOil].gpu.stainPack & kStainPackTypeMask;
+  const uint32_t wetType = c.mats[mWater].gpu.stainPack & kStainPackTypeMask;
+  const uint32_t bloodType = c.mats[mBlood].gpu.stainPack & kStainPackTypeMask;
+  if (!oilType || !wetType || !bloodType) {
+    detail = "oil, water or blood has no ground stain type";
+    return Status::Fail;
+  }
+  const std::string prevPin = weather::Override();
+  weather::SetOverride("clear");
+  weather::Snap();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  enum { kOilOver, kOpen, kStone, kRoofed, kArms };
+  const int L = 12, x0 = 150, z0 = 300, kPitch = 4;
+  const int zSpan = kPitch * kArms;
+  const int y = FixtureYOver(x0 - 4, z0 - 4, x0 + L + 4, z0 + zSpan + 4,
+                             kDefaultSeed, 24);
+  auto stripZ = [&](int a) { return z0 + a * kPitch + 1; };
+  // One word per cell, decided once (the lower op index wins a cell).
+  std::map<std::tuple<int, int, int>, uint32_t> cells;
+  for (int x = x0 - 4; x <= x0 + L + 3; x++)
+    for (int z = z0 - 4; z <= z0 + zSpan + 3; z++) {
+      cells[{x, y - 1, z}] = mStone;
+      for (int yy = y; yy <= y + 6; yy++) cells[{x, yy, z}] = 0;
+    }
+  for (int a = 0; a < kArms; a++) {
+    const int z = stripZ(a);
+    for (int x = x0 - 1; x <= x0 + L; x++)       // the wall around the strip
+      for (int dz = -1; dz <= 1; dz++)
+        for (int yy = y; yy <= y + 1; yy++) cells[{x, yy, z + dz}] = mStone;
+    for (int x = x0; x < x0 + L; x++) {
+      cells[{x, y, z}] = a == kStone ? (mStone | PackStain(bloodType, 1))
+                                     : (mDirt | PackStain(bloodType, 12));
+      cells[{x, y + 1, z}] = a == kOilOver ? (mOil | (7u << 12)) : 0u;
+    }
+    if (a == kRoofed)
+      for (int x = x0 - 1; x <= x0 + L; x++)
+        for (int dz = -1; dz <= 1; dz++) cells[{x, y + 3, z + dz}] = mStone;
+  }
+  std::vector<CellOp> scene;
+  std::map<uint32_t, std::vector<uint32_t>> chunkBuf;
+  for (const auto& [p, wd] : cells) {
+    const uint32_t ci = World::SlotCellIndex({std::get<0>(p), std::get<1>(p),
+                                              std::get<2>(p)});
+    scene.push_back({ci, wd});
+    chunkBuf[ci / kChunkVol];
+  }
+  auto readFixture = [&](const char* label) {
+    ctx.WaitIdle();
+    for (auto& [slot, buf] : chunkBuf) {
+      buf.resize(kChunkVol);
+      ReadVoxelsSync(ctx, world, slot, 1, buf.data(), label);
+    }
+  };
+  auto at = [&](int x, int yy, int z) -> uint32_t {
+    const uint32_t ci = World::SlotCellIndex({x, yy, z});
+    auto it = chunkBuf.find(ci / kChunkVol);
+    return it == chunkBuf.end() ? 0u : it->second[ci % kChunkVol];
+  };
+  struct Strip { uint32_t blood = 0, oil = 0, wet = 0, wetLevels = 0, ground = 0; };
+  auto strip = [&](int a) {
+    Strip s;
+    for (int x = x0; x < x0 + L; x++) {
+      const uint32_t w = at(x, y, stripZ(a));
+      const uint32_t want = a == kStone ? mStone : mDirt;
+      if ((w & 0xFFFu) == want) s.ground++;
+      if (!VoxStainAmt(w)) continue;
+      const uint32_t t = VoxStainType(w);
+      if (t == bloodType) s.blood++;
+      if (t == oilType) s.oil++;
+      if (t == wetType) { s.wet++; s.wetLevels += VoxStainAmt(w); }
+    }
+    return s;
+  };
+  auto fmt = [](const Strip& s) {
+    char b[96];
+    std::snprintf(b, sizeof(b), "blood %u oil %u wet %u (lv %u) ground %u",
+                  s.blood, s.oil, s.wet, s.wetLevels, s.ground);
+    return std::string(b);
+  };
+
+  uint32_t t = 1;
+  const IVec3 pc{(x0 + L / 2) >> 4, y >> 4, (z0 + zSpan / 2) >> 4};
+  auto run = [&](uint32_t n, const std::vector<CellOp>& first) {
+    for (uint32_t i = 0; i < n; i++)
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {},
+                 i == 0 ? first : std::vector<CellOp>{}, false, pc, false, false);
+  };
+  const uint32_t kOilTicks = (uint32_t)BaselineNumber("rainStainOilTicks", 120.0);
+  const uint32_t kStormTicks = (uint32_t)BaselineNumber("rainStainStormTicks", 900.0);
+  const uint32_t kDryTicks = (uint32_t)BaselineNumber("rainStainDryTicks", 2400.0);
+  const double oilMinFrac = BaselineNumber("rainStainOilMinFrac", 0.75);
+  const double dryMaxFrac = BaselineNumber("rainStainDryMaxFrac", 0.05);
+
+  // 1. Oil over blood, clear sky.
+  run(kOilTicks, scene);
+  readFixture("rainStainOil");
+  const Strip oiled = strip(kOilOver);
+  // 2. Lift what is left of the oil off, then a storm.
+  std::vector<CellOp> lift;
+  for (int x = x0; x < x0 + L; x++)
+    for (int yy = y + 1; yy <= y + 2; yy++)
+      lift.push_back({World::SlotCellIndex({x, yy, stripZ(kOilOver)}), 0u});
+  weather::SetOverride("storm");
+  weather::Snap();
+  const uint32_t stormWord = weather::SimRainWord(CurrentTuning(), kDefaultSeed, t + 1);
+  run(kStormTicks, lift);
+  readFixture("rainStainStorm");
+  Strip storm[kArms];
+  for (int a = 0; a < kArms; a++) storm[a] = strip(a);
+  // 3. Clear again: the wet dries.
+  weather::SetOverride("clear");
+  weather::Snap();
+  run(kDryTicks, {});
+  readFixture("rainStainDry");
+  Strip dry[kArms];
+  for (int a = 0; a < kArms; a++) dry[a] = strip(a);
+  std::vector<uint32_t> dirty(kNumSlots, 0);
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0, dirty.data(),
+                        kNumSlots * 4, "rainStainDirty");
+  uint32_t awake = 0;
+  for (const auto& [slot, buf] : chunkBuf)
+    if (dirty[slot] != 0) awake++;
+
+  weather::SetOverride(prevPin);
+  weather::Snap();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const uint32_t Lu = (uint32_t)L;
+  const bool oilOk = oiled.blood == 0 && oiled.oil >= oilMinFrac * Lu;
+  bool washes = (stormWord & kRainAmountMask) != 0;
+  uint32_t peak = 0, left = 0;
+  for (int a : {(int)kOilOver, (int)kOpen, (int)kStone}) {
+    washes = washes && storm[a].blood == 0 && storm[a].oil == 0 &&
+             storm[a].wet == storm[a].ground && storm[a].ground > 0;
+    peak += storm[a].wetLevels;
+    left += dry[a].wetLevels;
+  }
+  const bool roofed = storm[kRoofed].blood == Lu && dry[kRoofed].blood == Lu;
+  const bool dries = peak > 0 && left <= dryMaxFrac * peak;
+  const bool sleeps = awake == 0;
+  const bool ok = oilOk && washes && roofed && dries && sleeps;
+  RecordObserved("rainStain.peakWetLevels", (double)peak);
+  RecordObserved("rainStain.leftWetLevels", (double)left);
+
+  char buf[1024];
+  std::snprintf(
+      buf, sizeof(buf),
+      "%s: OIL OVER %s (t%u: %s) | WASHES %s (storm rain %u, %u ticks: oilOver "
+      "%s | open %s | stone %s) | ROOFED %s (%s) | DRIES %s (wet levels %u -> "
+      "%u after %u clear ticks, want <= %.2f) | SLEEPS %s (%u of %zu fixture "
+      "chunks awake)",
+      ok ? "PASS" : "FAIL", oilOk ? "ok" : "FAIL", kOilTicks, fmt(oiled).c_str(),
+      washes ? "ok" : "FAIL", stormWord & kRainAmountMask, kStormTicks,
+      fmt(storm[kOilOver]).c_str(), fmt(storm[kOpen]).c_str(),
+      fmt(storm[kStone]).c_str(), roofed ? "ok" : "FAIL",
+      fmt(dry[kRoofed]).c_str(), dries ? "ok" : "FAIL", peak, left, kDryTicks,
+      dryMaxFrac, sleeps ? "ok" : "FAIL", awake, chunkBuf.size());
+  detail = buf;
+  std::printf("rain-stain: %s\n", buf);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- stamp-sleep: a matched cell keeps its chunk awake whatever the stamp says
 //
 // Rule-unification W2-R. sim_step.wgsl's substep gate skips a cell whose tick
@@ -5873,6 +6079,7 @@ const std::vector<Gate>& SimGates() {
       {"fire-down", "sim", {}, false, GateFireDown},
       {"rain-fire", "sim", {}, false, GateRainFire},
       {"stain-react", "sim", {}, false, GateStainReact},
+      {"rain-stain", "sim", {}, false, GateRainStain},
       {"stamp-sleep", "sim", {}, false, GateStampSleep},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
       {"support-flag", "sim", {}, false, GateSupportFlag},

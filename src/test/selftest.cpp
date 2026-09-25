@@ -543,6 +543,10 @@ const char* const kOrder[] = {
     // the weather clear and restores it, regenerates on the way out --
     // rain-fire's reasons, rain-fire's slot.
     "stain-react",
+    // The newest stain wins, rain wets, wet dries (2026-09-25): stains dirt at
+    // absolute coordinates under pinned skies, restores the pin, regenerates
+    // on the way out -- stain-react's reasons, stain-react's slot.
+    "rain-stain",
     // The substep stamp alias vs sleep (rule-unification W2-R): acid shafts
     // on anchored steel columns at absolute coordinates, weather pinned clear
     // and restored, regenerates on the way out -- stain-react's reasons.

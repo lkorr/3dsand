@@ -180,9 +180,12 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "lr_occupancyFull;ho_occupancyFull",
      "Full-world on hash ticks, dirty-list only otherwise. The hash-tick "
      "spike every 15 ticks is this row."},
-    {"wind", "Wind", "simTick", PerfSide::Gpu, PerfScope::Count, "windWake",
+    {"wind", "Wind + Rain", "simTick", PerfSide::Gpu, PerfScope::Count,
+     "windWake;rainFall",
      "windAt() is a pure function evaluated in the kernels that need it; only "
-     "the wake pass is separately timed."},
+     "the wake pass is separately timed. rainFall is the rain-on-the-ground "
+     "column sampler (wets while it rains, dries top surfaces while it does "
+     "not): a fixed cost every tick, one thread per 8x8 column tile."},
     {"readback", "Async Readback", "simTick", PerfSide::Cpu, PerfScope::Readback,
      "", "Map callbacks + the 3x3x3 CPU mirror rebuild. One tick latent, never "
      "blocking — if this is large the mirror copy is the reason. The blocking "

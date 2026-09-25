@@ -207,6 +207,27 @@ static void ParseStain(const json& m, const std::string& path,
   // the blood as "wet" — the stain would change colour but never actually come
   // out, which is not what washing looks like.
   if (s.value("washes", false)) d.gpu.stainPack |= kStainPackWashesBit;
+  // "dries": a GROUND stain of this type comes off by itself, `dries` per
+  // mille per tick per level, while the liquid that made it is not touching
+  // it (sim_step.wgsl stainDry; the top surfaces are dried by sim_mutate.wgsl
+  // `rainFall`'s column sample). "rain": this is what falls as rain.
+  const int dries = bodyOnly ? 0 : s.value("dries", 0);
+  if (dries < 0 || dries > (int)kStainChanceMax) {
+    errors += path + ": material \"" + d.name +
+              "\": stain dries must be 0..1000 per-mille\n";
+  } else {
+    d.stainDries = (uint32_t)dries;
+  }
+  d.stainIsRain = !bodyOnly && s.value("rain", false);
+  // "opacity" 0..1: how strongly the stain shows on the GROUND (the body
+  // coat's is "coat": {"opacity"}). Render-only.
+  const float gOpacity = s.value("opacity", 1.0f);
+  if (gOpacity < 0.0f || gOpacity > 1.0f) {
+    errors += path + ": material \"" + d.name +
+              "\": stain opacity must be 0..1\n";
+  } else {
+    d.stainGroundOpacity = (uint32_t)(gOpacity * 255.0f + 0.5f);
+  }
 
   // Preserve any absorb capacity already parsed for this material: the two
   // halves of stainPack are authored in separate JSON blocks and either may be

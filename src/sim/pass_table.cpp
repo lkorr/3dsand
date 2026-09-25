@@ -12,6 +12,15 @@
 // expansions, no possibility of drift.
 
 #include "sim/pass_table.h"
+#include "sim/world.h"
+
+namespace {
+// sim_mutate.wgsl `rainFall`: one thread per RAIN_TILE x RAIN_TILE column tile
+// of the window, 64 to a workgroup. kRainTile must match RAIN_TILE there.
+constexpr uint32_t kRainTile = 8;
+constexpr uint32_t kRainFallGroups = (kWorldN / kRainTile) * (kWorldN / kRainTile) / 64;
+static_assert(kRainFallGroups > 0 && kRainFallGroups < 0x10000000u, "literal extent");
+}  // namespace
 
 namespace pass {
 namespace {
@@ -36,6 +45,7 @@ namespace {
 #define PIPE_MUTATE          Pipe::Mutate
 #define PIPE_MUTATE_CELLS    Pipe::MutateCells
 #define PIPE_WIND_WAKE       Pipe::WindWake
+#define PIPE_RAIN_FALL       Pipe::RainFall
 #define PIPE_COMPACT         Pipe::Compact
 #define PIPE_COMPACT_NEXT    Pipe::CompactNext
 #define PIPE_STEP            Pipe::Step
