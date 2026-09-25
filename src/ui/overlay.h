@@ -469,9 +469,11 @@ struct UIState {
   int aiCadenceTicks = 40, aiJitterTicks = 18, aiCommitTicks = 10,
       aiDisengageTicks = 22;
   float aiHysteresis = 0.22f;
-  float aiIntentWeight[6] = {};        // one per ai::Intent, in enum order
-  int aiIntentCooldown[6] = {};
-  int aiIntentDwell[6] = {};
+  // One per ai::Intent, in enum order (main.cpp static_asserts the count).
+  static constexpr int kAiIntents = 7;
+  float aiIntentWeight[kAiIntents] = {};
+  int aiIntentCooldown[kAiIntents] = {};
+  int aiIntentDwell[kAiIntents] = {};
   // Last attack request drained from the seam, and the last PARRY. Both are
   // readouts rather than mechanisms: seeing the requests is what proves the AI
   // seam still fires at the right moments, and seeing the blocks is what

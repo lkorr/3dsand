@@ -4646,49 +4646,6 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
     }
   }
 
-  // THE SMEAR on a corpse's cut (bodystain.h SoakCut): the same rule the live
-  // limb's kerf and crater get, so a limb cut off and cut again is bloodied
-  // both times. Applied to the authoritative lattice AFTER the carve (so the
-  // hole's walls count as exposed) and BEFORE the shatter (so every fragment
-  // carries its share); the re-skin below writes it into the brick. Until
-  // 2026-09-13 a corpse cut showed clean flesh and clean bone.
-  if (b.bleedMat != 0 && !removed.empty() && b.bleedMat < matGpu_.size()) {
-    const uint32_t stainType = matGpu_[b.bleedMat].stainPack & kStainPackTypeMask;
-    const auto& gt = CurrentTuning().gore;
-    if (stainType != 0 && gt.stainCutRadius > 0.0f) {
-      // Tissue = what crumbles to this body's blood (MobDef::tissue's rule);
-      // everything else (bone) takes the floor and nothing more.
-      std::vector<uint8_t> tissue(rubbleOf_.size(), 0);
-      bool any = false;
-      for (size_t m = 0; m < rubbleOf_.size(); m++)
-        if (rubbleOf_[m] == b.bleedMat || m == b.bleedMat) { tissue[m] = 1; any = true; }
-      if (!any) tissue.clear();
-      const float ps = (float)std::max(1u, b.physScale);
-      const float sk = (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
-      Vec3 centroid{};
-      for (const DebrisVoxel& v : removed)
-        centroid += Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
-      centroid = centroid * (sk / (ps * (float)removed.size()));
-      CutSoak soak;
-      // The coat names the SUBSTANCE, not its palette slot: a corpse's cut is
-      // smeared with whatever that body bled. `stainType` above is still what
-      // decides the cut smears at all -- a bleed material with no stain block
-      // has nothing to draw.
-      soak.mat = b.bleedMat;
-      soak.radius = gt.stainCutRadius * sk;
-      soak.amountExposed = gt.stainCutAmount;
-      soak.amountBuried = gt.stainCutBuried;
-      soak.buriedChance = gt.stainCutBuriedChance;
-      soak.boneMin = gt.stainBoneMin;
-      soak.tissue = &tissue;
-      StainLattice L;
-      if (fine) L.skin = &b.skinVoxels; else L.coll = &b.voxels;
-      SoakCut(L, centroid, soak, (uint32_t)b.serial * 2654435761u ^ 0xC0125Eu,
-              nullptr, -1);
-      if (fine) DeriveColliderFromSkin(b);  // the coarse lattice carries it too
-    }
-  }
-
   // Wholly destroyed, or blown under the body-worthiness floor: the remainder
   // rejoins the world as loose voxels, exactly like the burn dissolve path.
   if (b.voxels.size() < MinBodyVoxels()) {

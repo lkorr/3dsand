@@ -1997,6 +1997,12 @@ class Mob {
   // of its own (a parry charges it) and is not life, so it is excluded, which
   // is what makes "total hp reaches zero" mean "dead" and not "sword broke".
   float TotalHp() const;
+  // The body's condition as the behaviour layer's rules read it
+  // (ai::SelfView hpFrac / burningFrac / limbsLost): life left as a fraction
+  // of the authored total, the fraction of limbs with fire on them, and the
+  // authored limbs no longer attached. All three over the same limbs TotalHp
+  // counts (base, not bloodless), so "hp" and "limbs" describe one body.
+  void BodyFacts(float& hpFrac, float& burningFrac, int& limbsLost) const;
   // Blood that has left this body in its life, in whole-voxel equivalents
   // (a micro droplet is 1/microScale^3 of one). Diagnostic and gate readout.
   float BloodLost() const { return bloodLost_; }
@@ -5965,7 +5971,7 @@ class MobSystem {
   // ---- SEVERED FLESH TAKES A COAT TOO (2026-09-22) --------------------------
   // Contact (blood stains, water rinses) and drying over every dead-flesh
   // DEBRIS body -- severed limbs and carved gobbets, the parts that have left
-  // a rig -- through StainOneLimb / DryOneLimb, the passes the living use. A
+  // a rig -- through StainOneLimb / DryOneLimb / WetOneLimb, the living's. A
   // CORPSE is not here: it is a dead Mob and its limbs go through StainLimbs
   // like anybody's (PLAN_corpse_is_a_mob.md).
   void StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
@@ -6642,10 +6648,9 @@ class MobSystem {
   // owner may not change halfway through its own tick.
   void RefreshOwnership();
   bool instancesDirty_ = false;
-  // Particles authored outside PreTick — Sever() is reached from damage
-  // handling at several points in the frame, and appending straight to the
-  // caller's spawn list from there would mean Sever needs it threaded through
-  // every one of those paths. Drained (and cleared) at the top of PreTick.
+  // Particles the system authors for no one creature: severed flesh's wet
+  // drips (StainDeadFlesh -> WetOneLimb), which run after the spawn list has
+  // gone. Drained (and cleared) near the top of the next PreTick.
   std::vector<ParticleSpawn> pendingSpawns_;
 
   // Drained by main.cpp each frame. Bounded by the same limits that bound

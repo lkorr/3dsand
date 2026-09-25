@@ -857,6 +857,10 @@ const char* const kOrder[] = {
     // test), appended by the same rule: it spawns two creatures and
     // regenerates worldgen on the way out.
     "splatter-armor",
+    // ...and the behaviour-rule gate, by the same append rule: its arbiter
+    // arms touch no world at all, and its one live arm spawns a creature,
+    // hurts it, lets it run and resets mobs + debris on the way out.
+    "ai-rules",
     // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
     // As late as it can go, by the rule the `floaters` block above spells out.
     // It regenerates worldgen three times (once per pacing arm and once on the

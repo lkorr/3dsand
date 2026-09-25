@@ -13613,6 +13613,314 @@ Status GateCreatureReach(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ai-rules --------------------------------------------------------------
+//
+// BEHAVIOUR AS DATA THAT READS THE BODY (ai_behavior.h "RULES"). A profile's
+// rules switch intents on and off from named facts about the creature -- hp,
+// burning, limbs lost, time since hurt, allies/enemies in sight -- and `flee`
+// is the first verb that exists only to be switched on by one.
+//
+// Five claims, cheapest first, so a failure names its layer:
+//   A. the SHIPPED behaviors.json loads every rule (nothing dropped) and its
+//      `skittish` profile carries the three it authors;
+//   B. a bad rule (unknown fact, unknown intent, unreadable test) is DROPPED
+//      WHOLE and SAID -- never half-applied;
+//   C. the rules round-trip through SaveBehaviors (the dev panel's "save"
+//      must not delete what an author wrote);
+//   D. pure Think arms: each skittish rule, alone, turns flee on and its
+//      absence leaves the creature standing; a DUELIST with one appended rule
+//      ("burning: attack x0, flee 3") stops swinging and runs, while the same
+//      fixture unburnt swings. No world, no GPU: the arbiter is a function;
+//   E. the live seam: a real skittish creature that is HURT (Mob::Damage)
+//      reads hp < 1 through Mob::BodyFacts, the hurt rule holds, and it runs.
+namespace {
+
+ai::Actor RulesActor(uint64_t id, Vec3 c, uint32_t faction) {
+  ai::Actor a;
+  a.id = id;
+  a.centre = c;
+  a.radius = 3.0f;
+  a.height = 17.0f;
+  a.faction = faction;
+  a.alive = true;
+  return a;
+}
+
+struct RulesArm {
+  int fleeTicks = 0, attacks = 0, firstFlee = -1;
+  float lastDrive = 0, lastHeading = 0;
+  uint32_t rulesHeld = 0;
+};
+
+// `hpAt(t)` / `burnAt(t)` script the body; the actor list is fixed.
+template <class HpFn, class BurnFn>
+RulesArm RunRulesArm(const ai::Library& lib, int prof,
+                     const std::vector<ai::Actor>& actors, int ticks,
+                     HpFn hpAt, BurnFn burnAt, float heading = 0.0f) {
+  ai::Brain b(prof);
+  ai::SelfView self;
+  self.id = 77;
+  self.origin = Vec3{-2.0f, 0.0f, -2.0f};
+  self.size = Vec3{4.0f, 17.0f, 4.0f};
+  self.heading = heading;
+  self.speed = 30.0f;
+  self.faction = ai::FactionId(lib.At(prof)->faction);
+  ai::GroundView g;   // haveGround false: Deflect passes headings through
+  ai::WorldView v;
+  v.actors = &actors;
+  RulesArm r;
+  for (int t = 0; t < ticks; t++) {
+    self.hpFrac = hpAt(t);
+    self.burningFrac = burnAt(t);
+    ai::IntentOut out;
+    ai::Think(b, lib, self, g, v, 9000u + (uint32_t)t, 1.0f / 30.0f, out);
+    if (b.intent == ai::Intent::Flee) {
+      r.fleeTicks++;
+      if (r.firstFlee < 0) r.firstFlee = t;
+    }
+    if (out.attack) r.attacks++;
+    r.lastDrive = out.driveScale;
+    r.lastHeading = out.desiredHeading;
+    r.rulesHeld |= b.rulesHeld;
+  }
+  return r;
+}
+
+}  // namespace
+
+Status GateAiRules(Ctx& c, std::string& detail) {
+  std::string why;
+  bool ok = true;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    if (!why.empty()) why += "; ";
+    why += s;
+  };
+
+  // ---- A: the shipped file ----------------------------------------------
+  ai::Library lib;
+  std::string log;
+  const std::string path = AssetDir() + "/mobs/behaviors.json";
+  if (!ai::LoadBehaviors(path, lib, log)) {
+    detail = "behaviors.json did not load: " + log;
+    return Status::Fail;
+  }
+  if (log.find("rule") != std::string::npos) fail("shipped rules dropped: " + log);
+  const int sk = lib.Find("skittish");
+  const int du = lib.Find("duelist");
+  if (sk < 0 || du < 0) {
+    detail = "behaviors.json lacks skittish or duelist";
+    return Status::Fail;
+  }
+  const size_t skRules = lib.At(sk)->rules.size();
+  if (skRules != 3) fail(Format("skittish has %zu rules, authored 3", skRules));
+
+  // ---- B: bad rules are dropped whole and reported ----------------------
+  const std::string badPath = "build/ai_rules_bad.json";
+  {
+    std::ofstream f(badPath, std::ios::trunc);
+    f << R"({ "profiles": [ { "name": "bad", "intents": { "idle": { "weight": 1 } },
+      "rules": [
+        { "when": { "hp": "<0.5" }, "weight": { "flee": 1 } },
+        { "when": { "moonPhase": ">0" }, "weight": { "flee": 1 } },
+        { "when": { "hp": "<0.5" }, "weight": { "fly": 1 } },
+        { "when": { "hp": "about half" }, "weight": { "flee": 1 } },
+        { "when": { "burning": ">= 0.25", "visible": true }, "scale": { "idle": 0 } }
+      ] } ] })";
+  }
+  int badKept = -1;
+  bool badLogged = false;
+  {
+    ai::Library bl;
+    std::string blog;
+    ai::LoadBehaviors(badPath, bl, blog);
+    if (const ai::Profile* bp = bl.At(bl.Find("bad"))) {
+      badKept = (int)bp->rules.size();
+      const auto& r4 = bp->rules.size() == 2 ? bp->rules[1] : ai::Rule{};
+      const bool parsed4 = r4.when.size() == 2 &&
+                           r4.when[0].op == ai::CmpOp::Ge &&
+                           r4.when[0].value == 0.25f &&
+                           r4.when[1].op == ai::CmpOp::Eq &&
+                           r4.when[1].value == 1.0f &&
+                           r4.scale[(int)ai::Intent::Idle] == 0.0f;
+      if (!parsed4) fail("rule \">= 0.25\" / bool test / scale misparsed");
+    }
+    size_t drops = 0;
+    for (size_t at = blog.find("rule dropped"); at != std::string::npos;
+         at = blog.find("rule dropped", at + 1))
+      drops++;
+    badLogged = drops == 3 && blog.find("moonPhase") != std::string::npos &&
+                blog.find("\"fly\"") != std::string::npos;
+  }
+  std::filesystem::remove(badPath);
+  if (badKept != 2) fail(Format("bad file kept %d rules, want 2", badKept));
+  if (!badLogged) fail("a dropped rule was not named in the load log");
+
+  // ---- C: round trip ----------------------------------------------------
+  // The duelist gets a rule first, so the trip covers `scale` as well as the
+  // skittish profile's `weight`-only rules.
+  {
+    ai::Rule hot;
+    hot.note = "burning: \"drop\" it and run";
+    hot.when.push_back({ai::Fact::Burning, ai::CmpOp::Gt, 0.0f});
+    hot.setWeight[(int)ai::Intent::Flee] = 3.0f;
+    hot.scale[(int)ai::Intent::RequestAttack] = 0.0f;
+    lib.At(du)->rules.push_back(hot);
+  }
+  const std::string tripPath = "build/ai_rules_roundtrip.json";
+  std::string serr, tlog;
+  ai::Library trip;
+  const bool saved = ai::SaveBehaviors(tripPath, lib, serr);
+  const bool reloaded = saved && ai::LoadBehaviors(tripPath, trip, tlog);
+  std::filesystem::remove(tripPath);
+  auto sameRules = [](const ai::Profile* a, const ai::Profile* b) {
+    if (!a || !b || a->rules.size() != b->rules.size()) return false;
+    for (size_t r = 0; r < a->rules.size(); r++) {
+      const ai::Rule &x = a->rules[r], &y = b->rules[r];
+      if (x.note != y.note || x.when.size() != y.when.size()) return false;
+      for (size_t k = 0; k < x.when.size(); k++)
+        if (x.when[k].fact != y.when[k].fact || x.when[k].op != y.when[k].op ||
+            x.when[k].value != y.when[k].value)
+          return false;
+      for (int i = 0; i < (int)ai::Intent::Count; i++)
+        if (x.setWeight[i] != y.setWeight[i] || x.scale[i] != y.scale[i])
+          return false;
+    }
+    return a->movement.fleeSpeed == b->movement.fleeSpeed &&
+           a->intents[(int)ai::Intent::Flee].minDwellTicks ==
+               b->intents[(int)ai::Intent::Flee].minDwellTicks;
+  };
+  const bool tripOk = reloaded && tlog.find("rule") == std::string::npos &&
+                      sameRules(lib.At(sk), trip.At(trip.Find("skittish"))) &&
+                      sameRules(lib.At(du), trip.At(trip.Find("duelist")));
+  if (!tripOk) fail("rules did not survive SaveBehaviors -> LoadBehaviors " + serr + tlog);
+
+  // ---- D: the arbiter, as a function ------------------------------------
+  const uint32_t foe = ai::FactionId("player");
+  const float kPiF = 3.14159265f;
+  auto one = [](int) { return 1.0f; };
+  auto zero = [](int) { return 0.0f; };
+  // An enemy 10 voxels down +x: inside skittish's sight (24).
+  const std::vector<ai::Actor> near{RulesActor(1ull << 62, Vec3{10, 8.5f, 0}, foe)};
+  const std::vector<ai::Actor> far{RulesActor(1ull << 62, Vec3{40, 8.5f, 0}, foe)};
+  const RulesArm calm = RunRulesArm(lib, sk, far, 60, one, zero);
+  const RulesArm seen = RunRulesArm(lib, sk, near, 30, one, zero);
+  const RulesArm hurt = RunRulesArm(
+      lib, sk, far, 200, [](int t) { return t < 5 ? 1.0f : 0.9f; }, zero);
+  const RulesArm fire = RunRulesArm(
+      lib, sk, far, 30, one, [](int t) { return t < 5 ? 0.0f : 0.2f; });
+  if (calm.fleeTicks != 0 || calm.rulesHeld != 0)
+    fail(Format("calm skittish fled %d ticks (rules 0x%x)", calm.fleeTicks,
+                calm.rulesHeld));
+  // Running from +x means heading -x: this engine's BearingTo is atan2(dx, dz),
+  // so -x is -pi/2.
+  const float awayErr =
+      std::abs(std::remainder(seen.lastHeading - (-kPiF * 0.5f), 2.0f * kPiF));
+  if (seen.firstFlee < 0 || seen.firstFlee > 1 || !(seen.rulesHeld & 1u) ||
+      awayErr > 0.01f || seen.lastDrive <= 0.0f)
+    fail(Format("enemy in sight: first flee %d, heading err %.3f, drive %.2f",
+                seen.firstFlee, awayErr, seen.lastDrive));
+  // Hurt at t=5; the rule holds for 90 ticks after the LAST loss (which is t=5
+  // itself: hp stays at 0.9), so it runs 5..94 and stops. Dwell 20 cannot hold
+  // it past that because a rule that zeroes the incumbent releases it.
+  if (hurt.firstFlee != 5 || !(hurt.rulesHeld & 2u) || hurt.fleeTicks != 90 ||
+      hurt.lastDrive != 0.0f)
+    fail(Format("hurt: first flee %d (want 5), %d flee ticks (want 90), final "
+                "drive %.2f",
+                hurt.firstFlee, hurt.fleeTicks, hurt.lastDrive));
+  if (fire.firstFlee != 5 || !(fire.rulesHeld & 4u))
+    fail(Format("burning: first flee %d (want 5)", fire.firstFlee));
+
+  // The duelist, target 8 voxels ahead (+z, heading 0), inside its reach 10.
+  const std::vector<ai::Actor> duelFoe{RulesActor(1ull << 62, Vec3{0, 8.5f, 8}, foe)};
+  const RulesArm duelCold = RunRulesArm(lib, du, duelFoe, 150, one, zero);
+  const RulesArm duelHot = RunRulesArm(
+      lib, du, duelFoe, 150, one, [](int t) { return t < 60 ? 0.0f : 0.5f; });
+  // The hot arm swings in its first 60 cold ticks like the cold arm does, and
+  // then never again; it runs from t=60 at the latest (a commit window from a
+  // swing just before may hold the facing for its commitTicks first).
+  if (duelCold.attacks < 2 || duelCold.fleeTicks != 0)
+    fail(Format("unburnt duelist: %d attacks, %d flee ticks", duelCold.attacks,
+                duelCold.fleeTicks));
+  const RulesArm duelHotHead = RunRulesArm(
+      lib, du, duelFoe, 60, one, zero);  // the same fixture's first 60 ticks
+  if (duelHot.attacks != duelHotHead.attacks || duelHot.firstFlee < 60 ||
+      duelHot.firstFlee > 60 + 14 || duelHot.fleeTicks < 60)
+    fail(Format("burning duelist: %d attacks (want %d, all before t=60), first "
+                "flee %d, %d flee ticks",
+                duelHot.attacks, duelHotHead.attacks, duelHot.firstFlee,
+                duelHot.fleeTicks));
+  lib.At(du)->rules.pop_back();
+
+  // ---- E: the live seam ---------------------------------------------------
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  float liveHp = -1, liveMoved = 0;
+  bool liveFled = false, liveHeld = false;
+  uint64_t id = 0;
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0 || c.mobs.Behaviors().Find("skittish") < 0) {
+    fail("no humanoid def or no skittish profile in the live library");
+  } else {
+    const MobDef& def = c.mobs.Defs()[defIndex];
+    int relief = 0;
+    const IVec3 anchor = AiFixtureCentre(c.world);
+    const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+    std::string swhy;
+    id = AiSpawn(c, defIndex, {spot.x, spot.y + 1, spot.z}, "skittish", swhy);
+    if (id == 0) fail(swhy);
+    // The player is placed far outside its sight, so the ONLY rule that can
+    // hold is the hurt one -- no enemy in range, nothing alight.
+    c.mobs.SetPlayerActor(
+        Vec3{(float)spot.x + 60.0f, (float)spot.y + 8.0f, (float)spot.z}, 3.0f,
+        17.0f, true);
+    AiTicker tick{c, 7000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+    for (int i = 0; i < 10 && id; i++) tick();
+    const ai::Brain* b0 = id ? c.mobs.MobBrain(id) : nullptr;
+    if (b0 && (b0->intent == ai::Intent::Flee || b0->rulesHeld != 0))
+      fail("live skittish ran before it was hurt");
+    const Vec3 p0 = id ? c.mobs.MobOrigin(id) : Vec3{};
+    if (id) {
+      if (const uint64_t rb = c.mobs.LimbBody(id, def.rootLimb))
+        c.mobs.Damage(rb, 2.0f, c.mobs.LimbVoxelPos(id, def.rootLimb, 0), 0.0f);
+    }
+    for (int i = 0; i < 45 && id && c.mobs.IsAlive(id); i++) {
+      tick();
+      if (const ai::Brain* b = c.mobs.MobBrain(id)) {
+        liveHp = b->facts[(int)ai::Fact::Hp];
+        if (b->rulesHeld & 2u) liveHeld = true;
+        if (b->intent == ai::Intent::Flee) liveFled = true;
+      }
+    }
+    if (id && c.mobs.IsAlive(id)) liveMoved = AiPlanar(c.mobs.MobOrigin(id), p0);
+    const float minMove = (float)BaselineNumber("aiRulesMinFleeVox", 8.0);
+    if (!(liveHp > 0.0f && liveHp < 1.0f) || !liveHeld || !liveFled ||
+        liveMoved < minMove)
+      fail(Format("live: hp fact %.3f, hurt rule held %d, fled %d, moved %.1f "
+                  "vox (>= %.1f)",
+                  liveHp, liveHeld ? 1 : 0, liveFled ? 1 : 0, liveMoved, minMove));
+    RecordObserved("aiRulesFleeVox", (double)liveMoved);
+  }
+  c.mobs.ClearPlayerActor();
+  c.mobs.ClearAttackRequests();
+  c.debris.Reset();
+  c.mobs.Reset();
+
+  detail = Format(
+      "A shipped rules ok (skittish %zu) | B bad file kept %d/5, logged %d | "
+      "C round trip %d | D calm %d flee, seen flee@%d err %.3f, hurt flee@%d "
+      "x%d, fire flee@%d, duelist cold %d atk / hot %d atk flee@%d | "
+      "E live hp %.3f held %d fled %d moved %.1f",
+      skRules, badKept, badLogged ? 1 : 0, tripOk ? 1 : 0, calm.fleeTicks,
+      seen.firstFlee, awayErr, hurt.firstFlee, hurt.fleeTicks, fire.firstFlee,
+      duelCold.attacks, duelHot.attacks, duelHot.firstFlee, liveHp,
+      liveHeld ? 1 : 0, liveFled ? 1 : 0, liveMoved);
+  if (!ok) detail += " || FAIL: " + why;
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
@@ -13709,6 +14017,10 @@ const std::vector<Gate>& MobGates() {
       // asserting the body stays ON it (never inside it) and does not lean
       // like furniture while climbing.
       {"ai-slope", "mob", {}, false, GateAiSlope, /*needsRender=*/false},
+      // Behaviour rules that read the body (ai_behavior.h "RULES") and the
+      // `flee` verb they switch on: parse, drop-and-say, round trip, pure
+      // arbiter arms, and one live creature that is hurt and runs.
+      {"ai-rules", "mob", {}, false, GateAiRules, /*needsRender=*/false},
       // A body with no legs lies ON the slope and stops re-aiming every voxel.
       {"crawl-slope", "mob", {}, false, GateCrawlSlope, /*needsRender=*/false},
       // Live ragdoll: blast knockdown, get-up, NPC gravity. Counts only.

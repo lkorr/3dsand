@@ -9388,6 +9388,27 @@ acquired (`keepRangeScale`), or anything standing on the boundary is acquired
 and dropped on alternate ticks and the arbiter above it oscillates for reasons
 that look like a bug in the arbiter.
 
+**Rules make character depend on the body (2026-09-24).** A profile's weights
+say what a creature wants when nothing is wrong with it; a profile's `rules`
+say how that changes when something is. A rule is
+`{when: {fact: test, ...}, weight: {intent: w}, scale: {intent: k}}`: while
+every test holds, `weight` replaces the intent's authored weight (so a rule can
+switch on a verb the profile leaves at 0) and `scale` multiplies it, rule by
+rule in order. The facts are vocabulary and so are code, like intents: `hp`
+(0..1 of authored life, which is blood), `burning` (fraction of limbs alight),
+`limbsLost`, `sinceHurt` (ticks since life last fell, bleeding included),
+`hasTarget`, `visible`, `targetDist`, and `allies`/`enemies` (live actors of
+our/another faction inside `sightRange`, no line-of-sight test: they are counts
+for character, not targets). The body facts arrive through `ai::SelfView`,
+filled by `MobSystem::DecideIntent` from `Mob::BodyFacts`, so the AI still never
+sees a rig. A rule naming an unknown fact or intent, or a test it cannot read,
+is dropped WHOLE and named in the load log; a rule never half-applies. A rule
+that zeroes the incumbent intent releases it at once rather than waiting out its
+`minDwellTicks`. `flee` (run from the target, else the nearest enemy in sight,
+else straight on) is the first verb that exists to be switched on by a rule;
+`skittish` is the first profile built from them. `SaveBehaviors` writes rules
+back, so the dev panel's save keeps them. Gate `ai-rules`.
+
 **Targets are actors, not "the player".** `MobSystem::PreTick` rebuilds one list
 per tick from the player capsule plus every live mob, keyed only by faction, and
 target selection scans it. Mob-vs-mob combat therefore needs no further code —

@@ -13086,7 +13086,9 @@ int main(int argc, char** argv) {
           ui.aiCommitTicks = (int)pe->attack.commitTicks;
           ui.aiDisengageTicks = (int)pe->attack.disengageTicks;
           ui.aiHysteresis = pe->hysteresis;
-          for (int k = 0; k < (int)ai::Intent::Count && k < 6; k++) {
+          static_assert((int)ai::Intent::Count == UIState::kAiIntents,
+                        "the dev panel's intent rows must match ai::Intent");
+          for (int k = 0; k < (int)ai::Intent::Count; k++) {
             ui.aiIntentWeight[k] = pe->intents[k].weight;
             ui.aiIntentCooldown[k] = (int)pe->intents[k].cooldownTicks;
             ui.aiIntentDwell[k] = (int)pe->intents[k].minDwellTicks;
@@ -13117,7 +13119,9 @@ int main(int argc, char** argv) {
           pe->attack.commitTicks = (uint32_t)ui.aiCommitTicks;
           pe->attack.disengageTicks = (uint32_t)ui.aiDisengageTicks;
           pe->hysteresis = ui.aiHysteresis;
-          for (int k = 0; k < (int)ai::Intent::Count && k < 6; k++) {
+          static_assert((int)ai::Intent::Count == UIState::kAiIntents,
+                        "the dev panel's intent rows must match ai::Intent");
+          for (int k = 0; k < (int)ai::Intent::Count; k++) {
             pe->intents[k].weight = ui.aiIntentWeight[k];
             pe->intents[k].cooldownTicks = (uint32_t)ui.aiIntentCooldown[k];
             pe->intents[k].minDwellTicks = (uint32_t)ui.aiIntentDwell[k];
