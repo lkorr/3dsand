@@ -5871,6 +5871,12 @@ class MobSystem {
     uint64_t visits = 0, sleeps = 0, walkCells = 0;
     uint64_t indexBuilds = 0, indexCells = 0, looseVisits = 0;
     uint64_t walkDeferred = 0;  // loose visits deferred: the walk pot was spent
+    // THE COAT RULE (DESIGN.md §6, W2-J2): coat rules that found a partner,
+    // fired, voxels a quenching coat covered, and voxel rules fired with the
+    // coat as their partner. "the wet arm still caught" is then one of "the
+    // water never matched", "it matched and did not cover" or "the rule
+    // below reached the coat".
+    uint64_t coatMatched = 0, coatFired = 0, coatCovered = 0, coatPartner = 0;
   };
   const BurnStats& Burn() const { return burnStats_; }
   void ResetBurnStats() { burnStats_ = BurnStats{}; }
@@ -6160,38 +6166,25 @@ class MobSystem {
   // and stopped by a worn shell the same way.
   std::vector<uint8_t> matCorrodes_;
   std::vector<uint32_t> corrosiveMats_;  // the ids matCorrodes_ marks
-  // A HOT coat (wearable and tag:hot). BurnOneLimb reads it as what is OUTSIDE
-  // every exposed face of the voxel wearing it, so the voxel's own heat rules
-  // (sear, ignite) see it exactly as they would a wall of lava against them.
-  std::vector<uint8_t> matCoatHot_;
   // A FUEL coat (wearable, and one of its own pair rules turns it into
-  // something hot: oil + tag:hot -> fire). Inert until heat touches it; then
-  // the coat flashes, lights the voxel under it (flashForm_) and the flame
-  // walks the rest of the coat through the lattice.
+  // something hot: oil + tag:hot -> fire). Read only by SoakLimb, which lays
+  // it on the SURFACE only: soaked through, a limb would flash from inside.
+  // How it burns is the coat rule's (BurnOneLimb section 0, DESIGN.md §6):
+  // one level and one released flame per flash.
   std::vector<uint8_t> matCoatFuel_;
-  // mat -> what it becomes when a fuel coat on it flashes: its ignited form,
-  // else the ignited form of what heat first turns it into (skin -> cooked ->
-  // burning), else that first product; 0 = nothing (bone, steel: the oil just
-  // burns off it).
+  // mat -> what a flame put straight onto it (IgniteOneLimb) catches it as:
+  // its ignited form, else the ignited form of what heat first turns it into
+  // (skin -> cooked -> burning), else that first product; 0 = nothing (bone,
+  // steel). No longer read by the burn pass: a fuel coat's flash no longer
+  // jumps the voxel under it to this form (W2-J2).
   std::vector<uint32_t> flashForm_;
   std::vector<float> coatDepth_;      // MaterialDef::coatDepth
   std::vector<float> matBareBlood_;   // MaterialDef::bareBlood
   std::vector<int32_t> coatContact_;  // MaterialDef::coatContact (-1 = stain chance)
-  // The coat a new coat of `mat` should be laid OVER: `cur`, except that a
-  // CORROSIVE coat arriving on a voxel wearing one that is not treats it as
-  // clean. Acid does not sit on top of blood waiting to be heavier than it --
-  // without this a bloodied arm could not be coated in acid at all, because a
-  // different coat is only ever replaced by a strictly larger amount.
-  //
-  // A WASHER'S coat (water) likewise gives way to anything that is not itself
-  // a washer. Wet is not a substance sitting on the skin competing for it --
-  // it is the skin being damp -- and under Raise's "strictly heavier" rule a
-  // rain-soaked body (wet 12) could not be oiled at all (oil pours at 6): the
-  // owner oiled their character in a storm and the HUD said only "water"
-  // (2026-09-23).
-  // The reverse direction is WashBodyStain's, unchanged: water arriving on oil
-  // rinses it rather than being refused.
-  uint16_t CoatBeneath(uint16_t cur, uint32_t mat) const;
+  // (MobSystem::CoatBeneath -- "a corrosive coat displaces one that is not;
+  // anything displaces a washer's wetness" -- is now the class clause of the
+  // one precedence rule, sim/coatrule.h stainPrecedence, which every
+  // RaiseBodyStain / AddBodyStain applies; rule-unification W2-J2.)
   // Deposits every creature together may track onto the ground this tick
   // (tune.coat.shedPerTick), charged BEFORE the droplet is queued and reset at
   // the top of PreTick. A budget and not a rate, for the reason every other

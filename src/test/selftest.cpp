@@ -376,7 +376,9 @@ const char* const kOrder[] = {
     "prefab",      "sidecar-resolve", "anatomy-parity", "damage-cause", "mob",
     // `debris-coat` beside `settle-back`: the same loose-body burn path, run
     // from debris.Reset() on its own pads, and it leaves no bodies behind.
-    "settle-back", "debris-coat", "player-body",
+    // `coat-parity` after it: the same loose-body path against the grid, one
+    // coat scenario on both (W2-J2); regenerates the world on the way out.
+    "settle-back", "debris-coat", "coat-parity", "player-body",
     // Wearing things. After `mob` because it spawns the avatar def on real
     // terrain and carves a shell, which wants the same standing world the
     // body gates run in; before `ragdoll-joints` because it leaves the rig

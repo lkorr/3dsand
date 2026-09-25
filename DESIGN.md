@@ -3076,6 +3076,11 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     so the surface eroded and the chunk never slept. With the strict order a
     washer only lowers a foreign amount and a stainer only raises its own, so
     every cell reaches a fixed point. Blood no longer recolours wet ground.
+    (Amended 2026-09-24, W2-J2 -- "One stain precedence" below: on ABSORBENT
+    ground a stainer displaces a washer's wetness at one level it PAYS an
+    eighth of itself for, so that cycle drains both liquids and ends; on
+    stone, where a mark is free, the strict order above still holds. Blood
+    and ichor still never repaint each other.)
   - Both fit in `stainPack`'s spare bits (27..30 capacity, 31 washes), so the
     64-byte `Material` still did not grow.
   - **Sleep discipline (rule 2)** survives because every step is monotone toward
@@ -3100,17 +3105,29 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     powders, both `moveEvery == 1`.
 
 - **A coat is a co-located virtual neighbour (2026-09-24; rule-unification
-  W2-J1; `sim_step.wgsl` `coatReact` + `doReactions`, gate `stain-react`).**
+  W2-J1 grid, W2-J2 bodies; `sim_step.wgsl` `coatReact` + `doReactions`,
+  `MobSystem::BurnOneLimb` section 0, the shared arithmetic in
+  `src/sim/coatrule.h`; gates `stain-react`, `coat-parity`).**
   Before this the grid ignored its own stains in reactions -- wet grass burnt
   like dry, oiled dirt was not flammable -- while a body wearing the same
   substances reacted to them through four hand-written sections of
   `MobSystem::BurnOneLimb` (hot coat, wet douse/boil, fuel flash, corrosive
-  bite). This is the ONE rule for both populations. The grid implements it
-  now; W2-J2 makes the body evaluator match it. It is expressed entirely in
-  `reactions.json` plus the `stain` / `absorb` blocks: no material is named.
+  bite). This is the ONE rule for both populations, and since W2-J2 both run
+  it: the four body sections are gone and section 0 of `BurnOneLimb` is this
+  rule over the body lattice. It is expressed entirely in `reactions.json`
+  plus the `stain` / `absorb` / `coat.depth` blocks: no material is named. The
+  parts that are pure arithmetic -- the verdict of a matched coat rule (rules
+  2-3), the level spend, the ramp count (rule 4 + clause 4a) -- are written
+  once per language and compared by `check_invariants.py coatrule`
+  (`sim_step.wgsl` <-> `coatrule.h`).
 
   **THE RULE.** A cell (a grid voxel, or a body voxel) of material V wearing a
-  coat of material C at amount a >= 1:
+  coat of material C at amount a >= 1. S is the cell's PITCH: lattice cells
+  per world voxel (1 on the grid and on a loose body of world voxels; a
+  creature's `skinScale`, 8 for the human). The numbered rules are W2-J1's;
+  the lettered clauses are W2-J2's, each population-neutral and each
+  satisfied trivially by the grid, which is how the body's load-bearing
+  behaviours were kept without a body-only case.
 
   0. *What is a coat.* On a body, every stain is a coat (the stain byte names
      a material, and a body coat is laid by contact, pour or splatter -- it is
@@ -3122,10 +3139,20 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
      type's material (the first material registered with that slot);
      `bodyOnly` stains have no ground type and are never grid coats.
   1. *The coat's rules.* C's PAIR rules, in file order, run with C as `self`
-     standing where the cell stands. Its partners are the cell's six face
-     neighbours (rule direction mask honoured) and then V itself. C's decay
-     and emit rules do NOT run through a coat: how long a coat lasts is its
-     stain's business (ground: monotone, no decay; body: `coat.decay`).
+     standing where the cell stands. Its partners are **V itself first** and
+     then the cell's six face neighbours (rule direction mask honoured on the
+     grid; RNG-rotated). C's decay and emit rules do NOT run through a coat:
+     how long a coat lasts is its stain's business (ground: monotone, no
+     decay; body: `coat.decay`).
+     - *1a. The coat touches what it is ON first (W2-J2).* The order was
+       faces-then-V. On a body that makes a coat on the surface bite the
+       voxel BESIDE or BEHIND its wearer before the wearer itself -- acid on
+       skin eating the flesh under the skin and the coated skin next to it,
+       destroying its own coat as it goes -- where the old section 3 ate the
+       voxel the acid was on. On the grid the order is not observable today:
+       no ground coat material (water, oil, blood, ichor) has a rule that
+       rewrites its partner, so which matching partner is taken changes no
+       write, and the rolls are per rule, not per partner.
   2. *Firing through the coat spends one level* (a -> a-1; at 0 the cell is
      clean) instead of rewriting the coat's side of the rule. The coat side's
      PRODUCT is put into the world only if it is a FLAME (a gas tagged `hot`,
@@ -3135,6 +3162,26 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
      liquid cell). The partner's side is ordinary: a face partner takes
      `neighborBecomes`; if the partner is V itself, V is rewritten and the new
      voxel is born clean (the coat goes with the voxel it was on).
+     - *2a. A partner outside the wearer's own storage is read-only.* A
+       coat rule whose `neighborBecomes` would rewrite such a partner does not
+       match it. For a body that is every grid cell, every sibling limb and
+       every worn shell -- the licence the body's own rules have always had
+       (a limb writes the grid only by fill-air emission) -- and "open face"
+       means the lattice, a sibling and a shell all leave that face open and
+       the grid cell there is air (else a gas; a flame released into a gas
+       cell is made and spent but the fill-air op is refused). The grid has
+       nothing outside its own storage.
+     - *2b. A FILM stays on a voxel rewritten in place; a HELD coat goes with
+       it.* A coat on a substrate that absorbs is liquid held IN it and is
+       released by any rewrite of that voxel (what rule 2's "born clean"
+       says); a coat on a substrate that does not absorb is a film ON it and
+       survives the voxel changing state in place (a SOLID product: skin ->
+       flesh_cooked), while a voxel that LEAVES (air, gas, liquid) takes its
+       coat with it. A firing through a film that rewrote V in place still
+       spends its one level. Every grid coat is held (rule 0), so the grid is
+       unchanged; every body material authored today is a film, so a lava
+       coat survives the sear it causes, and blood stays on seared skin as it
+       always did.
   3. *A quenching coat covers the cell.* If a coat rule MATCHED this tick
      (partner found, rolled or not) and its coat-side product is not a flame,
      the cell is COVERED for this tick: V's own rules see its coat and nothing
@@ -3146,12 +3193,66 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
      the coat as one more matching neighbour, capped at 6; an inverted ramp
      does not count it. Fired with the coat as partner, rule 2 applies to the
      coat side (`neighborBecomes` of a flame is released, of anything else
-     not created; one level spent unless V itself was rewritten).
+     not created; one level spent unless V itself was rewritten -- and see
+     2b for a film).
+     - *4a. On a lattice finer than the world (S > 1) a matching coat counts
+       as a face widened at world pitch: 5* (the face and its four tangential
+       neighbours, taken as a max against the direct count, exactly as a body
+       face into world matter is widened -- "On a body the count is taken at
+       world pitch", `BurnOneLimb`'s `ntan`). A coat is a sheet over the
+       voxel, and a skin voxel's other five faces are its own flesh however
+       much lava is on it, so "one more face" could never reach flesh's
+       authored `minCount` 3 and a lava coat would sear skin but never set it
+       alight. At S = 1 the widening is off and the coat counts 1, which is
+       the grid.
   5. *Two reactants.* The coat and the cell each fire at most one rule per
      tick, the coat's first; V's rules then see the coat as it is after.
   6. *Only the wearer sees its coat.* A neighbour's rules see V, never V's
      coat: `lava + tag:organic -> fire` still burns wet grass, as a body's
-     inbound pass burns a wet limb.
+     inbound pass burns a wet limb. On a body the "neighbour" includes a
+     lattice neighbour: a wet voxel no longer douses the burning voxel beside
+     it (its water boils instead, and it is covered while it does).
+  7. *A DEEP coat pays for what it eats (W2-J2).* A coat authored
+     `coat.depth` world voxels deep (default 1) is depth x S cells deep. When
+     depth x S > 1, a coat rule that rewrites matter of the wearer's own
+     storage -- V, or a face partner under 2a -- costs one layer's PRICE,
+     15 / (depth x S) levels (in milli-levels, rounded stochastically),
+     instead of rule 2's one level; if V LEAVES, what is left after the price
+     carries into V's lattice face neighbours (by the precedence rule below)
+     instead of going with the voxel. A coat THINNER than one layer's price
+     may rewrite only if its amount clears a threshold fixed per voxel
+     (keyed on V's lattice position, not the tick and not the amount); else
+     its rewriting rules do not match this tick. So a full coat eats
+     `coat.depth` WORLD voxels whatever the wearer's pitch, and is then
+     spent: the depth is what was poured (CLAUDE.md rule 2). Without it a
+     full acid coat would eat one 1/8-voxel layer of a human and stop, where
+     the old section 3 (and the owner) wanted skin and flesh gone. The grid
+     has S = 1 and no ground coat deeper than 1 (`bodyOnly` acid and lava are
+     the only authored depths), so it never fires there.
+
+  **ONE STAIN PRECEDENCE (W2-J2; `common.wgsl` `stainPrecedence`, called by
+  `stainStep`; `coatrule.h` `stainPrecedence`, called by every
+  `RaiseBodyStain` / `AddBodyStain`; `check_invariants.py stainprec`).**
+  Which of two stains owns a voxel. Clean or the same stain: climb (each
+  population's own ceiling -- the ground's capacity and one level a step, the
+  body's max or accumulation). A washer meeting a foreign stain: rinse it
+  down. Anything else meeting a foreign stain: displace it only if strictly
+  HEAVIER, or -- with a PAID level -- if it OUTRANKS it by class: a corrosive
+  coat over one that is not, anything over a washer's wetness. Otherwise the
+  foreign stain stays. Before this the body spelled it as `RaiseBodyStain`'s
+  "strictly larger" plus `MobSystem::CoatBeneath`'s two displacements, and the
+  ground as `stainStep`'s "a non-washer never paints over a foreign stain".
+  Where they legitimately differ: the ground names a stain by its PALETTE SLOT
+  (3 bits in the voxel word) and the body by its MATERIAL id (12 bits in the
+  coat word); the ground lays ONE level a step, so the weight clause never
+  fires there; and only absorbent ground PAYS for a level, so on stone a free
+  mark still never displaces (the 2026-09-23 cycle fix holds) while blood or
+  oil reaching WET absorbent ground now displaces the wet at one level it pays
+  an eighth of itself for -- a re-wet / re-stain cycle there drains both
+  liquids and ends (the mass argument below). Every body coat is paid (rule
+  0: it is the substance). The class of a coat material (washer / corrosive)
+  is derived at material load and published to `phys/bodystain.cpp` by
+  `MobSystem::SetMaterials`.
 
   **What falls out, with no material named:** wet ground (water `washes`,
   `water + tag:hot -> steam`) beside heat boils its coat level by level at
@@ -3185,19 +3286,53 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   palette load and a walk of C's pair rules; an absorbent solid with no rules
   of its own is no longer skipped as inert when it wears a coat.
 
-  **Where the body is today, against this rule (W2-J2's list):**
-  `BurnOneLimb` section 0 boils a wet coat at `coat.fireDrySeconds` rather than
-  at water's authored `water + tag:hot` chance, pays 4 levels per douse
-  (`kCoatDouseCost`) rather than 1, and blocks only rules whose product is hot
-  or a burn stage rather than covering the voxel; section 0b spends the WHOLE
-  fuel coat per flash and sets the voxel to `flashForm_` rather than one level
-  and letting the voxel's own rules answer the flame; the hot coat reads as
-  every open face widened to world pitch rather than one co-located partner
-  (a pitch correction the body may keep: a body voxel is a fraction of a world
-  voxel); section 3 charges a depth-derived layer price and carries the coat
-  into the voxels behind rather than one level with the coat going with the
-  voxel. Each is a deliberate body tuning or a divergence to retire; the
-  rule above is the reference either way.
+  **The body against this rule, since W2-J2.** W2-J1 listed six ways
+  `BurnOneLimb` differed. Each is now either the rule or a clause above:
+  - the wet coat boiled at `coat.fireDrySeconds`: it now boils at water's
+    authored `water + tag:hot` 180 per mille, a level per firing, like wet
+    ground. `coat.fireDrySeconds` is read by nothing in the engine any more
+    (its tuning row stays until the tuning owner retires it).
+  - a douse paid 4 levels (`kCoatDouseCost`, deleted): a douse through the
+    coat is rule 4 and pays one level (2b: the charred voxel keeps its film).
+  - wet blocked only hot / burn-stage products: a wet voxel beside heat is now
+    COVERED (rule 3) -- its water's own rule matched a hot partner -- so its
+    rules see only the water, and nothing hot.
+  - an oil flash spent the WHOLE coat and set the voxel to `flashForm_` (skin
+    straight to flesh_burning): it now spends ONE level and releases the
+    flame into an open face (rule 2); the voxel's own rules answer that flame
+    from the grid next tick, as oiled grass does. Retired, not kept: the
+    owner's "oiled voxels super flammable" is now carried only by the flames
+    the oil throws against the body. `flashForm_` remains for
+    `IgniteOneLimb` (a flame put straight onto skin).
+  - the hot coat read as every open face, widened: it is one co-located
+    partner (rule 4), widened at world pitch by clause 4a -- the one pitch
+    correction kept.
+  - acid charged a depth price and carried inward: clause 7, which is exactly
+    that, now stated for any deep coat and any matter it rewrites.
+  Also gone with the sections: a wet LATTICE NEIGHBOUR no longer douses a
+  burning voxel (rule 6), and the coat's four RNG index spaces (+96 douse,
+  +128 bite, +160 flash) are one (+128).
+
+  Measured at the change (same gate list, main's exe as control where the
+  gate exists there): `lava-oil-coat` oiled forearm 3,806 burning voxel-ticks
+  vs clean 1,595 (was 22,920 vs 1,189), its oil 576 -> 447 levels-voxels in
+  150 ticks (was -> 0); lava still severs the forearm in 90 ticks
+  (1,056 -> 0). `debris-coat`'s oiled plank burns no faster than the clean
+  one (0 vs 0 of 49 in 50 ticks; the gate's "oil speeds the fire" claim is
+  red and is the owner's call). `acid-coat` 1,344 -> 585 (was 569), control
+  limb untouched, acid spent a tick after. `corpse-acid` 3,702 -> 3,688 (was
+  3,706 -> 3,680). `body-coat`'s soaked root sears 2 voxels in the fire
+  column vs 415 dry (was 0 vs 409): the gate parked `fireDrySeconds` long to
+  keep the water on, and that knob no longer reaches anything, so the water
+  boils off at its authored rate and the last voxels to dry sear. `rain-oil`
+  unchanged. `coat-parity` (grid vs a scale-1 loose body, same scenario):
+  oil 25 vs 26 of 48 levels left, dirt kept; wet 53 vs 53 of 96, grass not
+  caught; partnerless oil untouched on both.
+
+  Termination on a body is the ground's argument with the pour for the
+  liquid: every firing spends at least one level (a deep coat its price), a
+  body coat is only what was poured or splashed, and `coat.decay` dries what
+  does not react.
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
@@ -5867,6 +6002,14 @@ every limb but one soaked, the creature stood in a fire column 90 ticks with
 note: `World::Cached` is only refreshed on request, and what re-requests a
 dirty chunk each tick is the debris island scan -- a fire fixture that skips
 `debris.QueueSupportEvents`/`PreTick` burns against a pre-fire mirror.
+**Superseded 2026-09-24 (W2-J2) by §6 "A coat is a co-located virtual
+neighbour":** the skip list, the `fireDrySeconds` boil, the wet-neighbour
+douse and `kCoatDouseCost` are gone. A wet voxel beside heat is COVERED by
+its water's own `water + tag:hot` rule (which boils it a level at water's
+180 per mille), a douse through the coat pays one level, and only the wearer
+sees its coat. `body-coat` now measures 2 seared vs 415 (the parked
+`fireDrySeconds` reaches nothing). `IgniteOneLimb` still refuses a wet voxel
+(a direct write, not a rule).
 
 **A coat that EATS: acid on a body (2026-09-23).** Owner report: acid poured
 on a character neither showed nor dissolved anything. Two gaps: acid had no
@@ -5881,7 +6024,9 @@ through `BurnOneLimb`'s inbound pass. Now:
   unmoved by construction.
 - **A corrosive coat** is any wearable coat whose material `matAttacksBody_`
   (its pair rules rewrite body matter) -- `MobSystem::matCorrodes_`, acid
-  named nowhere. `BurnOneLimb` section 3 evaluates the coat material's own
+  named nowhere. `BurnOneLimb` section 3 (since W2-J2: section 0, the §6 coat
+  rule, with the voxel as the coat's first partner and clause 7's depth price)
+  evaluates the coat material's own
   rules against the voxel it sits on (the inbound pass with the coat as the
   neighbour, rule index +128), so flesh/skin/cloth/leather go at 125 (halved from 250 the same day: too fast),
   dissolvables at 45, iron pits at 10, bone and steel shrug it off. The ledger
@@ -5897,7 +6042,9 @@ through `BurnOneLimb`'s inbound pass. Now:
   per-tick roll let a thin film bite eventually and doubled the depth. Acid
   `depth` 0.4: a full coat reaches the bone of a human limb, a splash (6) takes
   skin and some flesh. `coat.decay` 0.15 s/level: a splash is gone in ~2 s, a full coat in ~5, bone included. `DryOneLimb` dries every CORROSIVE coat when the ledger counted one, not only the ledger's ranked few -- blood outweighed a thin acid film on bone and it never dried.
-- **It displaces, it does not wait**: `MobSystem::CoatBeneath` treats a
+- **It displaces, it does not wait** (since W2-J2 the class clause of §6's
+  one stain precedence, `coatrule.h stainPrecedence`; `CoatBeneath` is
+  deleted): `MobSystem::CoatBeneath` treated a
   non-corrosive coat as clean when a corrosive one arrives, so a bloodied arm
   can be coated in acid at all (Raise only repaints with a strictly larger
   amount). A corrosive `SoakLimb` (the health panel's pour) coats the SURFACE

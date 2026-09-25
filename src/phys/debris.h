@@ -869,6 +869,24 @@ class DebrisSystem {
     }
     return n;
   }
+  // Coat LEVELS of `coatMat` summed over ONE body's authoritative lattice
+  // (BodyStainAmt of every voxel wearing it). Gate coat-parity reads it
+  // against the grid's stain amounts: same scenario, same unit.
+  uint32_t BodyCoatLevels(uint32_t i, uint32_t coatMat) const {
+    if (i >= bodies_.size()) return 0;
+    const Body& b = bodies_[i];
+    uint32_t n = 0;
+    auto add = [&](uint16_t s) {
+      if (BodyStainAmt(s) && BodyStainMat(s) == (coatMat & 0xFFFu))
+        n += BodyStainAmt(s);
+    };
+    if (b.HasFineSkin()) {
+      for (const PrefabVoxel& v : b.skinVoxels) add(v.stain);
+    } else {
+      for (const DebrisVoxel& v : b.voxels) add(v.stain);
+    }
+    return n;
+  }
   // The brick this body is DRAWN from (kMicroBodyNoModel on the cube path).
   // A gate reads the brick back through MicroSet() and censuses it against
   // the lattice above: the lattice is what burns, the brick is what the
