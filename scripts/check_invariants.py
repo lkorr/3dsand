@@ -14,15 +14,17 @@ Checks:
      engine silently resolves to nothing.
 
   2. TUNING CONSTANTS sim/tuning_params.def  ->  everything downstream of it
-     The TUNE_* set has one source now: that table drives TuningWgslBlock() and
-     GENERATES scripts/tuning_prelude.py, so the emitter and the shader-check
-     prelude cannot name different sets. What is checked here is that the
-     generated file was regenerated, that each row names a member tuning.h
-     really declares, and that every TUNE_* a shader references is in the table.
+     The TUNE_* set has one source: that table drives TuningWgslBlock() and
+     scripts/tuning_prelude.py parses it, so the emitter and the shader-check
+     prelude cannot name different sets. Checked: the generated
+     assets/tuning_params.js is fresh, and every TUNE_* a shader references is
+     a WGSL row of the table.
 
-  2b. TUNING REACH    tuning_params.def  <->  LoadTuning reads + tuning.h init
-     Every .def row is read by LoadTuning in its group, its default equals the
-     tuning.h initializer, and every tuning.json key has a reader.
+  2b. TUNING REACH    tuning_params.def  <->  tuning.h / tuning.json / schema
+     Reads, clamps and defaults are generated from the rows, so what is left
+     to check is the joins: each tuning.h member initializes from its OWN row,
+     rows are self-consistent, shipped values sit inside their ranges, every
+     tuning.json key has a reader, and tuner_schema.js states no second range.
 
   3. RENDER PATHS     assets/tuner.html RENDER_PATHS  <->  materials.cpp keys
      The wiki re-evaluates the shaders' authored-field tests to say which
@@ -115,45 +117,43 @@ def check_sound_slots():
 
 
 # ------------------------------------------------------------ tuning TUNE_*
-def check_tuning_consts():
-    """The TUNE_* set now has ONE source: src/sim/tuning_params.def.
+def _tuning_rows():
+    """The parsed .def (scripts/tuning_def.py), or None after reporting why."""
+    sys.path.insert(0, str(ROOT / "scripts"))
+    try:
+        import tuning_def
+        return tuning_def.rows()
+    except Exception as e:  # DefError, or a missing file
+        problems.append(f"src/sim/tuning_params.def: {e}")
+        return None
 
-    TuningWgslBlock() expands that table, and scripts/tuning_prelude.py is
-    generated from it, so the old emitter-vs-prelude name diff cannot fail by
-    construction. What is still worth checking is that the generated file has
-    actually been regenerated, that every row declares a member that exists in
-    tuning.h, and that no shader references a constant the table never emits.
+
+def check_tuning_consts():
+    """The TUNE_* set has ONE source: src/sim/tuning_params.def.
+
+    TuningWgslBlock() expands the table and scripts/tuning_prelude.py parses
+    it (no generated copy any more), so the emitter and the shader-check
+    prelude cannot name different sets. What is checked here is that the
+    tuner's generated assets/tuning_params.js is fresh, and that every TUNE_*
+    a shader references is a WGSL row of the table.
     """
-    table = read("src/sim/tuning_params.def")
-    header = read("src/sim/tuning.h")
-    if not table or not header:
+    if not read("src/sim/tuning_params.def"):
+        return
+    rows = _tuning_rows()
+    if rows is None:
         return
     checked.append("tuning constants")
+    emitted = {r.wgsl for r in rows if r.has_wgsl}
 
-    rows = re.findall(
-        r"^TP_(F|I|U|V3)\((\w+),\s*(\w+),\s*(TUNE_[A-Z0-9_]+),", table, re.M)
-    emitted = {name for _, _, _, name in rows}
-
-    # The generated prelude must be in step with the table it comes from.
-    gen = ROOT / "scripts" / "gen_tuning_prelude.py"
+    gen = ROOT / "scripts" / "gen_tuning_params.py"
     if gen.exists():
         r = subprocess.run([sys.executable, str(gen), "--check"],
                            capture_output=True, text=True)
         if r.returncode != 0:
             problems.append(
-                "scripts/tuning_prelude.py is stale relative to "
+                "assets/tuning_params.js is stale relative to "
                 "src/sim/tuning_params.def -- run "
-                "`python scripts/gen_tuning_prelude.py`")
-
-    # Every row has to name a real member, or TuningWgslBlock will not compile
-    # -- but the error lands in a macro expansion, which is a miserable read.
-    # Catching it here names the row instead.
-    for kind, group, member, name in rows:
-        decl = rf"\b{member}\s*(\[3\])?\s*(=|,|;)"
-        if not re.search(decl, header):
-            problems.append(
-                f"{name}: src/sim/tuning_params.def names {group}.{member}, "
-                f"which is not declared in src/sim/tuning.h")
+                "`python scripts/gen_tuning_params.py`")
 
     used = set()
     for w in (ROOT / "assets/shaders").glob("*.wgsl"):
@@ -161,17 +161,16 @@ def check_tuning_consts():
                                w.read_text(encoding="utf-8", errors="replace")))
     for k in sorted(used - emitted):
         problems.append(
-            f"{k} is referenced by a shader but is not a row in "
+            f"{k} is referenced by a shader but is not a WGSL row in "
             f"src/sim/tuning_params.def -- the pipeline build will fail at "
             f"runtime, not at compile time")
 
 
 # ------------------------------------------------------- tuning REACH
 def _tuning_group_slices(cpp):
-    """LoadTuning reads each group inside `if (const json* g = Find(j, "<g>"))`.
-    Map group -> the text from that line to the next top-level group read, so a
-    key is looked up where its group is actually parsed (a member name can
-    exist in two groups -- windEntrainSpeed is in sim AND wind)."""
+    """LoadTuning's hand-written blocks, `if (const json* g = Find(j, "<g>"))`.
+    group -> the text from that line to the next top-level group read. Only
+    hand reads (keys with no .def row) are looked up here now."""
     marks = [(m.start(), m.group(1)) for m in
              re.finditer(r'Find\(j,\s*"(\w+)"\)', cpp)]
     out = {}
@@ -202,103 +201,160 @@ def _tuning_struct_bodies(header):
     return body
 
 
-def _num(tok):
-    tok = tok.strip()
-    tok = re.sub(r"(?<=[0-9.])[fFuU]\b", "", tok)
-    if not re.fullmatch(r"[-+0-9.eE*/() ]+", tok):
-        return None
-    try:
-        return float(eval(tok, {"__builtins__": {}}, {}))  # arithmetic only
-    except Exception:
-        return None
+def _schema_rows(schema):
+    """(group, key, has_own_min_or_max) for every row of tuner_schema.js.
+    min/max are looked for at the row's TOP level only -- a `var:{max:..}`
+    popover bound is a different number."""
+    out = []
+    tab_id = tab_group = None
+    for ln in schema.splitlines():
+        m = re.match(r"^    id:\s*'(\w+)'", ln)
+        if m:
+            tab_id, tab_group = m.group(1), None
+            continue
+        m = re.match(r"^    group:\s*'(\w+)'", ln)
+        if m:
+            tab_group = m.group(1)
+            continue
+        m = re.match(r"^\s*\{k:'([\w.]+)'", ln)
+        if not m:
+            continue
+        flat = re.sub(r"'(?:[^'\\]|\\.)*'", "''", ln.strip()[1:])
+        gm = re.search(r"\bg:\s*'(\w+)'", ln)
+        while re.search(r"\{[^{}]*\}", flat):
+            flat = re.sub(r"\{[^{}]*\}", "@", flat)
+        own = bool(re.search(r"\b(min|max):\s*-?[0-9.]", flat))
+        grp = gm.group(1) if (gm and re.search(r"\bg:\s*''", flat)) else \
+            (tab_group or tab_id)
+        out.append((grp, m.group(1), own))
+    return out
 
 
 def check_tuning_reach():
-    """Every tuning_params.def row must be READ by LoadTuning and must carry
-    the same default as its tuning.h initializer.
+    """The .def row is the ONE place a knob's default and range are written.
 
-    A .def row with a struct field, a tuning.json value and a tuner slider
-    but no `ReadF(*g, "<member>", ...)` compiles, emits its WGSL constant and
-    looks entirely wired -- and the slider does nothing, because the constant
-    is always the C++ default. render.wave* (nine rows) sat in exactly that
-    state from 9a79eba to 2026-09-24. The default check exists because the two
-    copies of each default drifted too (render.fluidFoam 0.55 vs 0.35,
-    sim.fluidExciteMode 1 vs 0): the .def default is what the prelude cache
-    and scripts/tuning_prelude.py see, the tuning.h one is what a Tuning{}
-    built without a tuning.json runs.
+    Since W2-Q (2026-09-24) LoadTuning's read + clamp, tuning.h's initializer
+    and the tuner's min/max are all GENERATED from the row, so the old checks
+    ("the .def row is read", "the .def default equals the tuning.h
+    initializer") are true by construction. What can still go wrong, and is
+    checked here:
 
-    Also: every key in assets/materials/tuning.json must be read somewhere in
-    its group (a key with no reader is a slider that saves into nothing --
-    render.heatSpillStrength outlived its code by weeks)."""
+      - a tuning.h member not initialized from its own row: `TPD(g, m)` must
+        sit on member m of struct g, and every row must have exactly one such
+        member (a copy-pasted TPD(player, walkSpeed) on sprintSpeed compiles);
+      - a row whose default is outside its own range (the loader would clamp
+        the shipped default), or whose min > max, or a bool/string row with a
+        WGSL name (TuningWgslBlock would silently emit nothing);
+      - a tuning.json value outside its row's range (every load warns);
+      - a tuning.json key nothing reads (no row, no hand read) -- the slider
+        saves into nothing (render.heatSpillStrength outlived its code);
+      - a tuner_schema.js row that states its own min/max for a .def key --
+        a second range, which is what this package deleted.
+    """
     table = read("src/sim/tuning_params.def")
     header = read("src/sim/tuning.h")
     cpp = read("src/sim/tuning.cpp")
     if not table or not header or not cpp:
         return
+    rows = _tuning_rows()
+    if rows is None:
+        return
     checked.append("tuning reach")
-    slices = _tuning_group_slices(cpp)
     bodies = _tuning_struct_bodies(header)
-    compared = 0
+    bykey = {}
+    for r in rows:
+        if r.key in bykey:
+            problems.append(f"{r.key}: two rows in src/sim/tuning_params.def "
+                            f"(lines {bykey[r.key].line} and {r.line})")
+        bykey[r.key] = r
 
-    rows = re.findall(
-        r"^TP_(F|I|U|V3)\((\w+),\s*(\w+),\s*TUNE_[A-Z0-9_]+,\s*([^)]*)\)",
-        table, re.M)
-    for kind, group, member, dflt in rows:
-        key = f"{group}.{member}"
-        if f'"{member}"' not in slices.get(group, ""):
+    # 1. tuning.h initializes each member from its own row, once.
+    seen = {}
+    for group, body in bodies.items():
+        for m in re.finditer(r"\b(\w+)\s*(?:\[3\])?\s*=\s*TPD(_V3)?\(\s*(\w+)\s*,"
+                             r"\s*(\w+)\s*\)", body):
+            member, v3, g2, m2 = m.groups()
+            if (g2, m2) != (group, member):
+                problems.append(
+                    f"src/sim/tuning.h: {group}.{member} is initialized from "
+                    f"TPD{v3 or ''}({g2}, {m2}) -- a member must take its OWN "
+                    f"row's default")
+            seen[f"{group}.{member}"] = seen.get(f"{group}.{member}", 0) + 1
+    for r in rows:
+        n = seen.get(r.key, 0)
+        if n != 1:
             problems.append(
-                f"{key}: row in src/sim/tuning_params.def but LoadTuning "
-                f"(src/sim/tuning.cpp) never reads \"{member}\" in the "
-                f"\"{group}\" group -- its tuner slider and tuning.json value "
-                f"are dead, the shader always runs the tuning.h default")
-        body = bodies.get(group)
-        if body is None:
+                f"{r.key}: row in src/sim/tuning_params.def but tuning.h "
+                f"{'never initializes' if n == 0 else 'initializes twice'} "
+                f"`{r.member} = TPD({r.group}, {r.member})` in struct "
+                f"`{r.group}`")
+
+    # 2. the row is self-consistent.
+    for r in rows:
+        if r.kind in ("B", "S") and r.has_wgsl:
+            problems.append(f"{r.key}: a TP_{r.kind} row cannot have a WGSL "
+                            f"name ({r.wgsl}); TuningWgslBlock emits nothing "
+                            f"for it")
+        if r.kind not in ("F", "I", "U"):
             continue
-        # `\b` on BOTH sides: without the trailing one `fluidFoam` matched
-        # `fluidFoamSpeed = 22.0f` and the check compared the wrong field.
-        m = re.search(rf"\b{member}\b\s*(?:\[3\])?\s*"
-                      rf"(?:=\s*(\{{[^}}]*\}}|[^,;{{]+)|(\{{[^}}]*\}}))\s*[,;]",
-                      body)
-        if not m:
-            continue  # no initializer (or none we can see); nothing to compare
-        compared += 1
-        init = (m.group(1) or m.group(2)).strip()
-        if init.startswith("{"):
-            init = init[1:-1]
-        want = [_num(t) for t in dflt.split(",")]
-        have = [_num(t) for t in init.split(",")]
-        if None in want or None in have:
-            continue  # symbolic default (a k-constant); not comparable here
-        if len(want) != len(have) or any(
-                abs(a - b) > 1e-6 * max(1.0, abs(a)) for a, b in zip(want, have)):
-            problems.append(
-                f"{key}: default disagrees -- src/sim/tuning_params.def says "
-                f"{dflt.strip()}, src/sim/tuning.h initializes {init}; make "
-                f"both the value assets/materials/tuning.json ships")
-    # Rows the parser cannot read are skipped silently above; if it rots, fail
-    # loudly instead of passing by comparing nothing.
-    if rows and compared < len(rows) * 3 // 4:
-        problems.append(
-            f"tuning reach: compared only {compared} of {len(rows)} .def "
-            f"defaults against tuning.h -- the initializer parser no longer "
-            f"understands the header")
+        if r.lo is not None and r.hi is not None and r.lo > r.hi:
+            problems.append(f"{r.key}: min {r.lo_tok} > max {r.hi_tok}")
+        if (r.lo is not None and r.default < r.lo) or \
+                (r.hi is not None and r.default > r.hi):
+            problems.append(f"{r.key}: default {r.default_tok} is outside its "
+                            f"own range [{r.lo_tok}, {r.hi_tok}]")
+        if r.kind in ("I", "U"):
+            for b, tok in ((r.lo, r.lo_tok), (r.hi, r.hi_tok)):
+                if b is not None and b != int(b):
+                    problems.append(f"{r.key}: integer row with fractional "
+                                    f"bound {tok}")
 
+    # 3. tuning.json: every key has a reader, every row value is in range.
+    slices = _tuning_group_slices(cpp)
     try:
         tj = json.loads(read("assets/materials/tuning.json"))
     except Exception:
         tj = None
     if isinstance(tj, dict):
+        groups = {r.group for r in rows} | set(slices)
         for group, vals in tj.items():
-            if not isinstance(vals, dict) or group not in slices:
+            if not isinstance(vals, dict) or group not in groups:
                 continue
-            for k in vals:
+            for k, v in vals.items():
                 if k.startswith("_"):
                     continue  # "_comment"-style annotations
-                if f'"{k}"' not in slices[group]:
-                    problems.append(
-                        f"assets/materials/tuning.json {group}.{k}: no reader "
-                        f"in LoadTuning's \"{group}\" group -- an orphan key "
-                        f"(delete it, or add the read)")
+                r = bykey.get(f"{group}.{k}")
+                if r is None:
+                    if f'"{k}"' not in slices.get(group, ""):
+                        problems.append(
+                            f"assets/materials/tuning.json {group}.{k}: no "
+                            f"tuning_params.def row and no hand read in "
+                            f"LoadTuning's \"{group}\" group -- an orphan key "
+                            f"(delete it, or add the row)")
+                    continue
+                if r.kind in ("F", "I", "U") and isinstance(v, (int, float)) \
+                        and not isinstance(v, bool):
+                    # float32, as the loader compares (3.1400001 == 3.14f).
+                    import struct
+                    f32 = lambda x: struct.unpack("f", struct.pack("f", x))[0]
+                    vv = f32(v) if r.kind == "F" else v
+                    lo = f32(r.lo) if (r.lo is not None and r.kind == "F") else r.lo
+                    hi = f32(r.hi) if (r.hi is not None and r.kind == "F") else r.hi
+                    if (lo is not None and vv < lo) or (hi is not None and vv > hi):
+                        problems.append(
+                            f"assets/materials/tuning.json {group}.{k} = {v} "
+                            f"is outside its row's range [{r.lo_tok}, "
+                            f"{r.hi_tok}] -- every load clamps it and warns")
+
+    # 4. tuner_schema.js carries no second range for a .def key.
+    schema = read("assets/tuner_schema.js")
+    for group, k, own in _schema_rows(schema):
+        r = bykey.get(f"{group}.{k}")
+        if r is not None and own and r.kind in ("F", "I", "U"):
+            problems.append(
+                f"assets/tuner_schema.js {group}.{k} states its own min/max, "
+                f"but the range of a .def key comes from its row "
+                f"(tuning_params.js) -- delete the row's min/max")
 
 
 # ----------------------------------------------------------- RENDER_PATHS
@@ -756,7 +812,7 @@ def check_fluid_substeps():
     if not wh or not dfn:
         return
     m = re.search(r"constexpr\s+uint32_t\s+kFluidSubsteps\s*=\s*(\d+)", wh)
-    d = re.search(r"TP_I\(sim,\s*fluidSubsteps,\s*TUNE_FLUID_SUBSTEPS,\s*(\d+)\)",
+    d = re.search(r"TP_I\(sim,\s*fluidSubsteps,\s*TUNE_FLUID_SUBSTEPS,\s*(\d+)\s*[,)]",
                   dfn)
     if not m or not d:
         return
@@ -1053,11 +1109,8 @@ def _decomment(src):
 
 def _tune_map():
     """TUNE_FOO -> the tuning.h member name it stands for."""
-    out = {}
-    for m in re.finditer(r"^TP_[FIUB]?\w*\((\w+),\s*(\w+),\s*(TUNE_[A-Z0-9_]+),",
-                         read("src/sim/tuning_params.def"), re.M):
-        out[m.group(3)] = m.group(2)
-    return out
+    rows = _tuning_rows() or []
+    return {r.wgsl: r.member for r in rows if r.has_wgsl}
 
 
 def _normalise(src, wgsl, tunes):
@@ -2353,6 +2406,10 @@ RELEVANT = {
     "src/sim/tuning_params.def": ["tuning", "substeps", "tuningreach"],
     "assets/materials/tuning.json": ["tuningreach"],
     "scripts/tuning_prelude.py": ["tuning"],
+    "scripts/tuning_def.py": ["tuning", "tuningreach", "substeps"],
+    "scripts/gen_tuning_params.py": ["tuning"],
+    "assets/tuning_params.js": ["tuning"],
+    "assets/tuner_schema.js": ["tuningreach"],
     "assets/tuner.html": ["render", "arch", "perfnodes"],
     "assets/perfview.js": ["perfscopes"],
     "src/measure/perfnodes.h": ["perfnodes", "perfscopes"],

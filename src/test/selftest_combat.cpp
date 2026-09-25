@@ -681,19 +681,21 @@ Status GateCombatCues(Ctx& c, std::string& detail) {
 // ---------------------------------------------------------------------------
 // tuning-reach
 // ---------------------------------------------------------------------------
-// combat-tuning's one-key differential, applied to EVERY shader-facing row in
+// combat-tuning's one-key differential, applied to EVERY row in
 // sim/tuning_params.def by expanding the table itself, so a new row is covered
 // the moment it exists. For each row: write a tuning file holding only that
 // key at a value off its compiled default, LoadTuning it, and require the
-// struct field to have moved. A row whose field does not move has no Read* in
-// LoadTuning, and its tuner slider is dead -- nine render.wave* rows were, from
-// 9a79eba to 2026-09-24. scripts/check_invariants.py (`tuning reach`) states
-// the same property statically; this is the proof that the read it greps for
-// actually lands in the right field.
+// struct field to have moved. Nine render.wave* rows had no read from 9a79eba
+// to 2026-09-24 and every slider was dead.
 //
-// Two candidates per row (above and below the default) because LoadTuning
-// clamps: a default sitting on a clamp bound pulls one candidate straight back,
-// never both. "Moved" is judged against a default-constructed Tuning, which is
+// Since W2-Q the read itself is generated from the row (ReadDefRows), so a
+// missing read can no longer happen by omission. What this still proves is
+// that nothing AFTER the generated read -- a hand rule in LoadTuning, a
+// clamp range that collapses to the default -- pins the field in place.
+//
+// Candidates are the default +-a step and its negation (a sign-only knob like
+// melee.handLead moves under nothing else), each pulled inside the row's
+// range. "Moved" is judged against a default-constructed Tuning, which is
 // what LoadTuning starts from.
 Status GateTuningReach(Ctx& c, std::string& detail) {
   (void)c;
@@ -735,28 +737,52 @@ Status GateTuningReach(Ctx& c, std::string& detail) {
                                    group + "." + key;
   };
 
-#define TP_F(g, m, n, d)                                                  \
+  // Candidates are pulled inside the row's range first, so the probe never
+  // relies on the clamp to land somewhere different from the default.
+  auto inRange = [](double v, double lo, double hi) {
+    if (!std::isnan(lo) && v < lo) v = lo;
+    if (!std::isnan(hi) && v > hi) v = hi;
+    return v;
+  };
+#define TP_F(g, m, n, d, lo, hi)                                          \
   {                                                                       \
     const double v0 = base.g.m, s = 0.25 * (std::fabs(v0) + 1.0);        \
     bool moved = false;                                                   \
-    for (double cand : {v0 + s, v0 - s}) {                                \
+    for (double cand : {v0 + s, v0 - s, -v0}) {                           \
       t = base;                                                           \
-      if (loadOne(#g, #m, num(cand), t) && t.g.m != base.g.m) moved = true; \
+      if (loadOne(#g, #m, num(inRange(cand, lo, hi)), t) &&               \
+          t.g.m != base.g.m)                                              \
+        moved = true;                                                     \
     }                                                                     \
     report(#g, #m, moved);                                                \
   }
-#define TP_I(g, m, n, d)                                                  \
+#define TP_I(g, m, n, d, lo, hi)                                          \
   {                                                                       \
     const long long v0 = base.g.m;                                        \
     bool moved = false;                                                   \
     for (long long cand : {v0 + 1, v0 - 1}) {                             \
       t = base;                                                           \
-      if (loadOne(#g, #m, std::to_string(cand), t) && t.g.m != base.g.m)  \
+      const long long c2 = (long long)inRange((double)cand, lo, hi);      \
+      if (loadOne(#g, #m, std::to_string(c2), t) && t.g.m != base.g.m)    \
         moved = true;                                                     \
     }                                                                     \
     report(#g, #m, moved);                                                \
   }
-#define TP_U(g, m, n, d) TP_I(g, m, n, d)
+#define TP_U(g, m, n, d, lo, hi) TP_I(g, m, n, d, lo, hi)
+#define TP_B(g, m, n, d)                                                  \
+  {                                                                       \
+    t = base;                                                             \
+    report(#g, #m, loadOne(#g, #m, base.g.m ? "false" : "true", t) &&     \
+                       t.g.m != base.g.m);                                \
+  }
+  // A string row may carry a hand-written validator (world.mapLayer refuses
+  // a path), so the probe is a bare name no validator rejects.
+#define TP_S(g, m, n, d)                                                  \
+  {                                                                       \
+    t = base;                                                             \
+    report(#g, #m, loadOne(#g, #m, "\"reachprobe\"", t) &&                \
+                       t.g.m == "reachprobe");                            \
+  }
 #define TP_V3(g, m, n, ...)                                               \
   {                                                                       \
     const double v0 = base.g.m[0], s = 0.25 * (std::fabs(v0) + 1.0);      \
@@ -772,6 +798,8 @@ Status GateTuningReach(Ctx& c, std::string& detail) {
   }
 #include "sim/tuning_params.def"
 #undef TP_V3
+#undef TP_S
+#undef TP_B
 #undef TP_U
 #undef TP_I
 #undef TP_F

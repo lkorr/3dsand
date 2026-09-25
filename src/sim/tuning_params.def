@@ -1,109 +1,129 @@
-// The ONE table of shader-facing tuning parameters.
+// THE table of tuning parameters. Every plain number, flag and name in
+// assets/materials/tuning.json has exactly one row here, and the row is the
+// ONLY place its default and its range are written. From it:
 //
-// Every row here used to be written out by hand in THREE places that had to
-// agree and that nothing checked: the Emit* call in TuningWgslBlock()
-// (sim/tuning.cpp), the SPEC row in scripts/tuning_prelude.py, and the default
-// in both of those. A row present in one and missing from the other meant
-// shaders that validate offline and then fail to build for real, or — worse —
-// a shader silently compiled against a default the engine never uses.
+//   tuning.h        the member initializer: `float x = TPD(group, x);`
+//                   (namespace tuning_def, expanded at the top of tuning.h)
+//   tuning.cpp      LoadTuning's read + clamp (ReadDefRows), --sweep's setter
+//                   (SetTuningField) and the WGSL consts (TuningWgslBlock)
+//   Python          scripts/tuning_def.py parses this file for the offline
+//                   shader prelude (scripts/tuning_prelude.py), the invariant
+//                   checks, and scripts/gen_tuning_params.py, which writes
+//                   assets/tuning_params.js -- the tuner's min/max, joined to
+//                   tuner_schema.js's hand-written rows by group.key
+//   selftest        the `tuning-reach` gate expands every row
 //
-// Include this with TP_F / TP_I / TP_U / TP_V3 defined to whatever you need,
-// then #undef them. scripts/tuning_prelude.py is GENERATED from this file by
-// scripts/gen_tuning_prelude.py, so the Python side cannot drift at all.
+// Row forms (the macro name is the type):
+//   TP_F (group, member, WGSL, default, min, max)   float
+//   TP_I (group, member, WGSL, default, min, max)   int; the JSON must be an
+//                                                   integer (rule 1 for sim.*)
+//   TP_U (group, member, WGSL, default, min, max)   int, emitted as WGSL u32
+//   TP_B (group, member, WGSL, default)             bool; JSON true/false only
+//   TP_S (group, member, WGSL, default)             std::string
+//   TP_V3(group, member, WGSL, x, y, z)             float[3]; JSON [x, y, z]
 //
-// Columns: (group, member, WGSL name, default...)
-//   group  the Tuning sub-struct AND the tuning.json object name — they are
-//          always the same string; LoadTuning relies on it.
-//   member the C++ member inside that sub-struct, which is ALSO the JSON key.
-//   TUNE_* the WGSL constant name. Conventionally TUNE_ + SNAKE(member), but
-//          four rows predate that rule and keep their authored names.
+//   group    the Tuning sub-struct AND the tuning.json object name.
+//   member   the C++ member inside it AND the JSON key.
+//   WGSL     the shader constant name (TUNE_*, conventionally TUNE_ +
+//            SNAKE(member); four rows predate that) or NO_WGSL for a row no
+//            shader reads. NO_WGSL rows never reach the prelude, so they can
+//            never miss the shader cache.
+//   min/max  the LOAD CLAMP (a value outside is clamped and warned about) AND
+//            the tuner's slider range -- one range, not two. A literal, a
+//            world.h constant (kFarLevels), or TP_OPEN for no bound.
 //
-// The DECLARATIONS and the doc comments live in sim/tuning.h, and the reads
-// (with their per-parameter clamping and warnings) live in LoadTuning. This
-// table deliberately does not try to absorb either: the comments in tuning.h
-// are the reason that file is readable, and the clamps are real logic, not
-// boilerplate.
-//
-// A default changed here changes it for the engine AND for offline shader
-// validation at once. Values in the `sim` and `worldgen` groups feed the CA:
-// changing one changes the world hash, so re-run --selftest (CLAUDE.md rule 1).
+// Rules:
+//   - One row per line and NO trailing comment on a row: the Python side reads
+//     whole lines. Put the why on the line(s) above; it stays with the row.
+//   - A rule a row cannot state (a bound that depends on another field, a
+//     reset-to-default, an enum gate, a non-row read) is hand-written in
+//     LoadTuning's group block, which runs after the generated reads; the row
+//     is preceded by `// + a hand-written rule in LoadTuning`.
+//   - A knob with no row is still legal -- the gore.*Var variance objects are
+//     read by hand, and a branch may add a knob in the old style (literal
+//     initializer in tuning.h, Read* in LoadTuning). Both styles coexist;
+//     check_invariants.py only asks that every tuning.json key has a reader.
+//   - A WGSL-visible row change is a prelude change for every shader that
+//     reads it; `sim.*` rows feed the CA and move the world hash (rule 1).
 
 // clang-format off
 
 
 // ---- sky / sun ----
-TP_F(render, skyGradient, TUNE_SKY_GRADIENT, 1.4f)
-TP_F(render, skyHorizonOffset, TUNE_SKY_HORIZON_OFFSET, 0.25f)
-TP_V3(render, skyHorizon, TUNE_SKY_HORIZON, 0.72f, 0.8f, 0.9f)
+TP_V3(render, skyHorizon, TUNE_SKY_HORIZON, 0.72f, 0.80f, 0.90f)
 TP_V3(render, skyZenith, TUNE_SKY_ZENITH, 0.25f, 0.47f, 0.85f)
 TP_V3(render, sunTint, TUNE_SUN_TINT, 1.0f, 0.9f, 0.7f)
-TP_F(render, sunDiscPower, TUNE_SUN_DISC_POWER, 800.0f)
-TP_F(render, sunDiscGain, TUNE_SUN_DISC_GAIN, 3.0f)
-TP_F(render, sunHaloPower, TUNE_SUN_HALO_POWER, 8.0f)
-TP_F(render, sunHaloGain, TUNE_SUN_HALO_GAIN, 0.12f)
+TP_F(render, sunDiscGain, TUNE_SUN_DISC_GAIN, 3.0f, 0.0f, 20.0f)
 TP_V3(render, sunColor, TUNE_SUN_COLOR, 1.0f, 0.95f, 0.86f)
-TP_F(render, sunIntensity, TUNE_SUN_INTENSITY, 1.35f)
+TP_F(render, sunIntensity, TUNE_SUN_INTENSITY, 1.35f, 0.0f, 5.0f)
 
 // ---- atmospheric sky ----
-TP_F(render, skyRayleigh, TUNE_SKY_RAYLEIGH, 12.0f)
-TP_F(render, skyMie, TUNE_SKY_MIE, 1.0f)
-TP_F(render, skyMieG, TUNE_SKY_MIE_G, 0.76f)
-TP_F(render, skyMieStrength, TUNE_SKY_MIE_STRENGTH, 1.0f)
-TP_F(render, skyExposure, TUNE_SKY_EXPOSURE, 1.6f)
-TP_V3(render, skyGround, TUNE_SKY_GROUND, 0.22f, 0.2f, 0.17f)
-TP_F(render, sunSize, TUNE_SUN_SIZE, 3.0f)
-TP_F(render, sunReddening, TUNE_SUN_REDDENING, 1.0f)
+TP_F(render, skyRayleigh, TUNE_SKY_RAYLEIGH, 12.0f, 0.0f, 40.0f)
+TP_F(render, skyMie, TUNE_SKY_MIE, 1.0f, 0.0f, 8.0f)
+// + a hand-written rule in LoadTuning
+TP_F(render, skyMieG, TUNE_SKY_MIE_G, 0.76f, -0.9f, 0.95f)
+TP_F(render, skyMieStrength, TUNE_SKY_MIE_STRENGTH, 1.0f, 0.0f, 6.0f)
+TP_F(render, skyExposure, TUNE_SKY_EXPOSURE, 1.6f, 0.0f, 6.0f)
+TP_V3(render, skyGround, TUNE_SKY_GROUND, 0.22f, 0.20f, 0.17f)
+// + a hand-written rule in LoadTuning
+TP_F(render, sunSize, TUNE_SUN_SIZE, 3.0f, 0.25f, 20.0f)
+TP_F(render, sunReddening, TUNE_SUN_REDDENING, 1.0f, 0.0f, 4.0f)
 
 // ---- night sky ----
-TP_V3(render, nightZenith, TUNE_NIGHT_ZENITH, 0.006f, 0.01f, 0.028f)
-TP_V3(render, nightHorizon, TUNE_NIGHT_HORIZON, 0.03f, 0.036f, 0.062f)
-TP_F(render, fluidParticleSize, TUNE_FLUID_PARTICLE_SIZE, 0.58f)
-TP_F(render, fluidStretch, TUNE_FLUID_STRETCH, 0.4f)
-TP_F(render, fluidDensityShade, TUNE_FLUID_DENSITY_SHADE, 0.45f)
-TP_F(render, fluidFoam, TUNE_FLUID_FOAM, 0.55f)
+TP_V3(render, nightZenith, TUNE_NIGHT_ZENITH, 0.006f, 0.010f, 0.028f)
+TP_V3(render, nightHorizon, TUNE_NIGHT_HORIZON, 0.030f, 0.036f, 0.062f)
+TP_F(render, fluidParticleSize, TUNE_FLUID_PARTICLE_SIZE, 0.58f, 0.2f, 1.2f)
+TP_F(render, fluidStretch, TUNE_FLUID_STRETCH, 0.4f, 0.0f, 1.5f)
+TP_F(render, fluidDensityShade, TUNE_FLUID_DENSITY_SHADE, 0.45f, 0.0f, 1.0f)
+TP_F(render, fluidFoam, TUNE_FLUID_FOAM, 0.55f, 0.0f, 2.0f)
 // MPM fluid SURFACE rendering (raymarch.wgsl MPM FLUID SURFACE block):
 // fluidSurface is a 0-3 DRAW MODE (see tuning.h), iso x rest density,
 // smooth in voxels, clarity metres, foamSpeed vox/s.
-TP_F(render, fluidSurface, TUNE_FLUID_SURFACE, 2.0f)
-TP_F(render, fluidIso, TUNE_FLUID_ISO, 0.30f)
-TP_F(render, fluidSmooth, TUNE_FLUID_SMOOTH, 1.3f)
-TP_F(render, fluidLevel, TUNE_FLUID_LEVEL, 1.0f)
-TP_F(render, fluidIor, TUNE_FLUID_IOR, 1.33f)
-TP_F(render, fluidClarity, TUNE_FLUID_CLARITY, 1.3f)
-TP_F(render, fluidReflect, TUNE_FLUID_REFLECT, 1.0f)
-TP_F(render, fluidSpecular, TUNE_FLUID_SPECULAR, 1.0f)
-TP_F(render, fluidFoamSpeed, TUNE_FLUID_FOAM_SPEED, 22.0f)
-TP_F(render, fluidWobble, TUNE_FLUID_WOBBLE, 0.5f)
+TP_F(render, fluidSurface, TUNE_FLUID_SURFACE, 2.0f, 0.0f, 3.0f)
+TP_F(render, fluidIso, TUNE_FLUID_ISO, 0.30f, 0.08f, 1.0f)
+TP_F(render, fluidSmooth, TUNE_FLUID_SMOOTH, 1.3f, 0.4f, 3.0f)
+TP_F(render, fluidLevel, TUNE_FLUID_LEVEL, 1.0f, 0.0f, 1.0f)
+TP_F(render, fluidIor, TUNE_FLUID_IOR, 1.33f, 1.01f, 2.0f)
+TP_F(render, fluidClarity, TUNE_FLUID_CLARITY, 1.3f, 0.05f, 20.0f)
+TP_F(render, fluidReflect, TUNE_FLUID_REFLECT, 1.0f, 0.0f, 2.0f)
+TP_F(render, fluidSpecular, TUNE_FLUID_SPECULAR, 1.0f, 0.0f, 4.0f)
+TP_F(render, fluidFoamSpeed, TUNE_FLUID_FOAM_SPEED, 22.0f, 1.0f, 90.0f)
+TP_F(render, fluidWobble, TUNE_FLUID_WOBBLE, 0.5f, 0.0f, 2.0f)
 // Depth colour gradient (raymarch.wgsl, DEPTH GRADIENT block). The shallow
 // tint is what a thin film reads as, the deep tint what the body tends toward;
 // depth is the metres of path over which the ramp completes.
 TP_V3(render, fluidShallow, TUNE_FLUID_SHALLOW, 0.42f, 0.86f, 0.82f)
 TP_V3(render, fluidDeep, TUNE_FLUID_DEEP, 0.02f, 0.15f, 0.42f)
-TP_F(render, fluidDepth, TUNE_FLUID_DEPTH, 2.6f)
-TP_F(render, fluidGradient, TUNE_FLUID_GRADIENT, 1.0f)
+TP_F(render, fluidDepth, TUNE_FLUID_DEPTH, 2.6f, 0.05f, 20.0f)
+TP_F(render, fluidGradient, TUNE_FLUID_GRADIENT, 1.0f, 0.0f, 1.0f)
 // Grid foam field (sim_fluid.wgsl foam potentials, raymarch surface whitening).
-TP_F(render, fluidFoamField, TUNE_FLUID_FOAM_FIELD, 1.0f)
-TP_F(render, fluidFoamTexture, TUNE_FLUID_FOAM_TEXTURE, 0.65f)
+TP_F(render, fluidFoamField, TUNE_FLUID_FOAM_FIELD, 1.0f, 0.0f, 3.0f)
+TP_F(render, fluidFoamTexture, TUNE_FLUID_FOAM_TEXTURE, 0.65f, 0.0f, 1.0f)
 // Foam PARTICLE colour (debris.wgsl vsParticle, PPAY_FOAM). Foam is
 // entrained air, so it has no material - it is coloured from here.
 TP_V3(render, foamColor, TUNE_FOAM_COLOR, 0.97f, 0.98f, 1.0f)
-TP_F(render, foamColorVar, TUNE_FOAM_COLOR_VAR, 0.18f)
-TP_F(render, starBrightness, TUNE_STAR_BRIGHTNESS, 1.0f)
-TP_F(render, starDensity, TUNE_STAR_DENSITY, 150.0f)
-TP_F(render, starSize, TUNE_STAR_SIZE, 0.85f)
-TP_F(render, starSparsity, TUNE_STAR_SPARSITY, 0.012f)
-TP_F(render, starTwinkle, TUNE_STAR_TWINKLE, 0.35f)
-TP_F(render, milkyWayStrength, TUNE_MILKYWAY_STRENGTH, 0.55f)
+TP_F(render, foamColorVar, TUNE_FOAM_COLOR_VAR, 0.18f, 0.0f, 1.0f)
+TP_F(render, starBrightness, TUNE_STAR_BRIGHTNESS, 1.0f, 0.0f, 6.0f)
+TP_F(render, starDensity, TUNE_STAR_DENSITY, 150.0f, 1.0f, 900.0f)
+// + a hand-written rule in LoadTuning
+TP_F(render, starSize, TUNE_STAR_SIZE, 0.85f, 0.2f, 4.0f)
+TP_F(render, starSparsity, TUNE_STAR_SPARSITY, 0.012f, 0.0f, 1.0f)
+TP_F(render, starTwinkle, TUNE_STAR_TWINKLE, 0.35f, 0.0f, 2.0f)
+TP_F(render, milkyWayStrength, TUNE_MILKYWAY_STRENGTH, 0.55f, 0.0f, 4.0f)
 TP_V3(render, milkyWayColor, TUNE_MILKYWAY_COLOR, 0.52f, 0.56f, 0.78f)
+// + a hand-written rule in LoadTuning
 TP_V3(render, galaxyNormal, TUNE_GALAXY_NORMAL, 0.36f, 0.52f, -0.77f)
-TP_F(render, galaxyWidth, TUNE_GALAXY_WIDTH, 0.17f)
-TP_F(render, nebulaStrength, TUNE_NEBULA_STRENGTH, 0.4f)
-TP_V3(render, nebulaCool, TUNE_NEBULA_COOL, 0.16f, 0.3f, 0.62f)
-TP_V3(render, nebulaWarm, TUNE_NEBULA_WARM, 0.55f, 0.2f, 0.38f)
-TP_F(render, auroraStrength, TUNE_AURORA_STRENGTH, 0.55f)
-TP_F(render, auroraHeight, TUNE_AURORA_HEIGHT, 900.0f)
-TP_V3(render, auroraLow, TUNE_AURORA_LOW, 0.1f, 0.85f, 0.45f)
-TP_V3(render, auroraHigh, TUNE_AURORA_HIGH, 0.65f, 0.2f, 0.85f)
+// galaxyWidth is a smoothstep edge; at 0 the band is a zero-width slit and
+// the divide inside smoothstep degenerates.
+TP_F(render, galaxyWidth, TUNE_GALAXY_WIDTH, 0.17f, 0.001f, 0.6f)
+TP_F(render, nebulaStrength, TUNE_NEBULA_STRENGTH, 0.40f, 0.0f, 4.0f)
+TP_V3(render, nebulaCool, TUNE_NEBULA_COOL, 0.16f, 0.30f, 0.62f)
+TP_V3(render, nebulaWarm, TUNE_NEBULA_WARM, 0.55f, 0.20f, 0.38f)
+TP_F(render, auroraStrength, TUNE_AURORA_STRENGTH, 0.55f, 0.0f, 4.0f)
+// + a hand-written rule in LoadTuning
+TP_F(render, auroraHeight, TUNE_AURORA_HEIGHT, 900.0f, 50.0f, 5000.0f)
+TP_V3(render, auroraLow, TUNE_AURORA_LOW, 0.10f, 0.85f, 0.45f)
+TP_V3(render, auroraHigh, TUNE_AURORA_HIGH, 0.65f, 0.20f, 0.85f)
 
 // ---- moons ----
 // NOTE there is no moon RADIUS here any more. Apparent size is now an output
@@ -111,103 +131,130 @@ TP_V3(render, auroraHigh, TUNE_AURORA_HIGH, 0.65f, 0.2f, 0.85f)
 // arriving as R.moonAngRadius), because the eclipse test and the disc must
 // read ONE number for how big a moon is. A render-side radius knob would be a
 // second, diverging answer to that question.
-TP_F(render, moonBrightness, TUNE_MOON_BRIGHTNESS, 1.6f)
+TP_F(render, moonBrightness, TUNE_MOON_BRIGHTNESS, 1.6f, 0.0f, 8.0f)
 TP_V3(render, moonColor, TUNE_MOON_COLOR, 0.92f, 0.93f, 0.88f)
 TP_V3(render, moonMariaSeed, TUNE_MOON_MARIA_SEED, 4.0f, 1.0f, 9.0f)
-TP_F(render, moonGlow, TUNE_MOON_GLOW, 0.35f)
-TP_F(render, moonEarthshine, TUNE_MOON_EARTHSHINE, 0.055f)
+TP_F(render, moonGlow, TUNE_MOON_GLOW, 0.35f, 0.0f, 3.0f)
+TP_F(render, moonEarthshine, TUNE_MOON_EARTHSHINE, 0.055f, 0.0f, 0.5f)
 TP_V3(render, moonLightColor, TUNE_MOON_LIGHT_COLOR, 0.55f, 0.68f, 1.0f)
-TP_F(render, moonLightIntensity, TUNE_MOON_LIGHT_INTENSITY, 0.16f)
+TP_F(render, moonLightIntensity, TUNE_MOON_LIGHT_INTENSITY, 0.16f, 0.0f, 2.0f)
 // Moon B: a smaller, colder, dimmer body. Only look lives here; where it is
 // and how big it appears come from its orbit.
 TP_V3(render, moon2Color, TUNE_MOON2_COLOR, 0.78f, 0.80f, 0.86f)
 TP_V3(render, moon2MariaSeed, TUNE_MOON2_MARIA_SEED, -21.0f, 13.0f, 37.0f)
-TP_F(render, moon2Brightness, TUNE_MOON2_BRIGHTNESS, 0.72f)
-TP_F(render, moon2LightIntensity, TUNE_MOON2_LIGHT_INTENSITY, 0.055f)
+TP_F(render, moon2Brightness, TUNE_MOON2_BRIGHTNESS, 0.72f, 0.0f, 4.0f)
+TP_F(render, moon2LightIntensity, TUNE_MOON2_LIGHT_INTENSITY, 0.055f, 0.0f, 2.0f)
 TP_V3(render, moon2LightColor, TUNE_MOON2_LIGHT_COLOR, 0.62f, 0.62f, 0.86f)
 // How dark a TOTAL solar eclipse gets. 1 = full totality (the dome falls to
 // its night value); lower keeps some daylight so a total eclipse still reads
 // as daytime-gone-wrong rather than as night.
-TP_F(render, eclipseDarkness, TUNE_ECLIPSE_DARKNESS, 0.93f)
+// eclipseDarkness scales a subtraction from the daylight weight; past 1 it
+// would drive the weight negative and the sky would light from below.
+TP_F(render, eclipseDarkness, TUNE_ECLIPSE_DARKNESS, 0.93f, 0.0f, 1.0f)
 // The perceptual falloff of that darkening against covered AREA. 3 (the old
 // hardcoded cube) keeps the world bright until the last sliver of sun goes,
 // which is how a real partial eclipse reads; 1 tracks the covered area
 // linearly and looks like an exposure slide. Mirrored in common.wgsl's
 // eclipseDayWeightP and raymarch.wgsl's eclipseDim — they MUST agree.
-TP_F(render, eclipseCurve, TUNE_ECLIPSE_CURVE, 3.0f)
+// eclipseCurve is an exponent on a 0..1 fraction. At or below 0, pow()
+// takes the uncovered sky (f = 0) to infinity rather than to zero, so a
+// clear day would render as permanent totality.
+TP_F(render, eclipseCurve, TUNE_ECLIPSE_CURVE, 3.0f, 0.05f, 8.0f)
 
 // ---- night ambient ----
 TP_V3(render, nightAmbSky, TUNE_NIGHT_AMB_SKY, 0.055f, 0.075f, 0.135f)
 TP_V3(render, nightAmbGround, TUNE_NIGHT_AMB_GROUND, 0.022f, 0.026f, 0.042f)
 
 // ---- ambient / diffuse ----
-TP_V3(render, ambSky, TUNE_AMB_SKY, 0.4f, 0.48f, 0.62f)
+TP_V3(render, ambSky, TUNE_AMB_SKY, 0.40f, 0.48f, 0.62f)
 TP_V3(render, ambGround, TUNE_AMB_GROUND, 0.25f, 0.22f, 0.17f)
-TP_F(render, diffuseWrap, TUNE_DIFFUSE_WRAP, 0.55f)
-TP_F(render, faceX, TUNE_FACE_X, 0.96f)
-TP_F(render, faceZ, TUNE_FACE_Z, 0.92f)
+TP_F(render, diffuseWrap, TUNE_DIFFUSE_WRAP, 0.55f, 0.0f, 2.0f)
+TP_F(render, faceX, TUNE_FACE_X, 0.96f, 0.5f, 1.0f)
+TP_F(render, faceZ, TUNE_FACE_Z, 0.92f, 0.5f, 1.0f)
 
 // ---- AO / shadows ----
-TP_F(render, aoStrength, TUNE_AO_STRENGTH, 0.45f)
-TP_F(render, aoFar, TUNE_AO_FAR, 0.72f)
-TP_F(render, shadowBias, TUNE_SHADOW_BIAS, 0.02f)
-TP_I(render, shadowSteps, TUNE_SHADOW_STEPS, 384)
-TP_F(render, shadowSoftNear, TUNE_SHADOW_SOFT_NEAR, 0.6f)
-TP_F(render, shadowSoftFar, TUNE_SHADOW_SOFT_FAR, 9.0f)
-TP_F(render, shadowLift, TUNE_SHADOW_LIFT, 0.45f)
-TP_F(render, shadowFarLift, TUNE_SHADOW_FAR_LIFT, 0.3f)
-TP_I(render, shadowCache, TUNE_SHADOW_CACHE, 1)
-TP_I(render, shadowCacheSubdiv, TUNE_SHADOW_CACHE_SUBDIV, 4)
-TP_F(render, shadowSunAngle, TUNE_SHADOW_SUN_ANGLE, 1.0f)
+TP_F(render, aoStrength, TUNE_AO_STRENGTH, 0.45f, 0.0f, 1.0f)
+TP_F(render, aoFar, TUNE_AO_FAR, 0.72f, 0.0f, 1.0f)
+TP_F(render, shadowBias, TUNE_SHADOW_BIAS, 0.02f, 0.001f, 0.5f)
+TP_I(render, shadowSteps, TUNE_SHADOW_STEPS, 384, 0, 2048)
+TP_F(render, shadowSoftNear, TUNE_SHADOW_SOFT_NEAR, 0.6f, 0.0f, 5.0f)
+TP_F(render, shadowSoftFar, TUNE_SHADOW_SOFT_FAR, 9.0f, 0.5f, 60.0f)
+TP_F(render, shadowLift, TUNE_SHADOW_LIFT, 0.45f, 0.0f, 1.0f)
+TP_F(render, shadowFarLift, TUNE_SHADOW_FAR_LIFT, 0.3f, 0.0f, 1.0f)
+TP_I(render, shadowCache, TUNE_SHADOW_CACHE, 1, 0, 1)
+// Subdivision must be >= 1 and within the 3 bits the shadow request record
+// gives each sub-index (world.h kShadowSubdivMax). A 0 here would divide by
+// zero in shadowPatchCentre; anything over the max would alias two patches
+// onto one key, which reads as shadows flickering between neighbours.
+// 8 is world.h's kShadowSubdivMax, restated rather than included: this TU
+// does not pull in world.h, and the shader clamps to SHADOW_SUBDIV_MAX
+// independently, so an over-large value here is bounded twice over. The
+// clamp exists so the tuner slider cannot silently alias two patches onto
+// one key, not as the load-bearing guard.
+TP_I(render, shadowCacheSubdiv, TUNE_SHADOW_CACHE_SUBDIV, 4, 1, 8)
+// The penumbra cone's half-angle in degrees. 0 is legal and means "point
+// sun", i.e. the hard single-ray shadow this replaced. The ceiling is
+// where tan() stops being a small angle and the jittered ray would start
+// missing the blocker it is supposed to be sampling the edge of.
+TP_F(render, shadowSunAngle, TUNE_SHADOW_SUN_ANGLE, 1.0f, 0.0f, 15.0f)
 
 // ---- grain ----
-TP_F(render, grainBroadScale, TUNE_GRAIN_BROAD_SCALE, 11.0f)
-TP_F(render, grainFineScale, TUNE_GRAIN_FINE_SCALE, 2.5f)
-TP_F(render, grainMix, TUNE_GRAIN_MIX, 0.68f)
-TP_F(render, grainAmp, TUNE_GRAIN_AMP, 0.065f)
-TP_F(render, grainAmpFar, TUNE_GRAIN_AMP_FAR, 0.05f)
+TP_F(render, grainBroadScale, TUNE_GRAIN_BROAD_SCALE, 11.0f, 1.0f, 64.0f)
+TP_F(render, grainFineScale, TUNE_GRAIN_FINE_SCALE, 2.5f, 0.5f, 16.0f)
+TP_F(render, grainMix, TUNE_GRAIN_MIX, 0.68f, 0.0f, 1.0f)
+TP_F(render, grainAmp, TUNE_GRAIN_AMP, 0.065f, 0.0f, 0.4f)
+TP_F(render, grainAmpFar, TUNE_GRAIN_AMP_FAR, 0.05f, 0.0f, 0.4f)
 
 // ---- media / fire ----
-TP_F(render, mediaAbsorb, TUNE_MEDIA_ABSORB, 6.4f)
-TP_F(render, mediaTauMax, TUNE_MEDIA_TAU_MAX, 6.0f)
-TP_F(render, fireFlickerBase, TUNE_FIRE_FLICKER_BASE, 0.7f)
-TP_F(render, fireFlickerAmp, TUNE_FIRE_FLICKER_AMP, 0.55f)
-TP_F(render, fireFlickerRate, TUNE_FIRE_FLICKER_RATE, 13.0f)
-TP_F(render, fireGlowRate, TUNE_FIRE_GLOW_RATE, 1.4f)
-TP_F(render, fireIntensity, TUNE_FIRE_INTENSITY, 2.1f)
-TP_F(render, fireBreatheAmp, TUNE_FIRE_BREATHE_AMP, 0.08f)
-TP_F(render, fireBreatheRate, TUNE_FIRE_BREATHE_RATE, 5.3f)
-TP_F(render, emissiveStrength, TUNE_EMISSIVE_STRENGTH, 1.7f)
-TP_F(render, emissiveFlickerBase, TUNE_EMISSIVE_FLICKER_BASE, 0.82f)
-TP_F(render, emissiveFlickerAmp, TUNE_EMISSIVE_FLICKER_AMP, 0.28f)
-TP_F(render, emissiveFlickerRate, TUNE_EMISSIVE_FLICKER_RATE, 9.0f)
+TP_F(render, mediaAbsorb, TUNE_MEDIA_ABSORB, 6.4f, 0.0f, 40.0f)
+TP_F(render, mediaTauMax, TUNE_MEDIA_TAU_MAX, 6.0f, 1.0f, 20.0f)
+TP_F(render, fireFlickerBase, TUNE_FIRE_FLICKER_BASE, 0.70f, 0.0f, 2.0f)
+TP_F(render, fireFlickerAmp, TUNE_FIRE_FLICKER_AMP, 0.55f, 0.0f, 2.0f)
+TP_F(render, fireFlickerRate, TUNE_FIRE_FLICKER_RATE, 13.0f, 0.0f, 40.0f)
+TP_F(render, fireGlowRate, TUNE_FIRE_GLOW_RATE, 1.4f, 0.1f, 8.0f)
+TP_F(render, fireIntensity, TUNE_FIRE_INTENSITY, 2.1f, 0.0f, 10.0f)
+TP_F(render, fireBreatheAmp, TUNE_FIRE_BREATHE_AMP, 0.08f, 0.0f, 1.0f)
+TP_F(render, fireBreatheRate, TUNE_FIRE_BREATHE_RATE, 5.3f, 0.0f, 20.0f)
+TP_F(render, emissiveStrength, TUNE_EMISSIVE_STRENGTH, 1.7f, 0.0f, 8.0f)
+TP_F(render, emissiveFlickerBase, TUNE_EMISSIVE_FLICKER_BASE, 0.82f, 0.0f, 2.0f)
+TP_F(render, emissiveFlickerAmp, TUNE_EMISSIVE_FLICKER_AMP, 0.28f, 0.0f, 2.0f)
+TP_F(render, emissiveFlickerRate, TUNE_EMISSIVE_FLICKER_RATE, 9.0f, 0.0f, 40.0f)
 // Burn-tinted materials (materials.json "burnTint", sim/materials.h
 // kMatFlagBurnTint): the palette is the UNBURNT colour and each cell pulses
 // toward this flame colour on a slow per-cell phase. Min/Max bound the pulse
 // weight; the emission is scaled by the same weight (common.wgsl burnTint).
 TP_V3(render, burnTintColor, TUNE_BURN_TINT_COLOR, 1.0f, 0.52f, 0.14f)
-TP_F(render, burnTintRate, TUNE_BURN_TINT_RATE, 2.6f)
-TP_F(render, burnTintMin, TUNE_BURN_TINT_MIN, 0.25f)
-TP_F(render, burnTintMax, TUNE_BURN_TINT_MAX, 0.9f)
+TP_F(render, burnTintRate, TUNE_BURN_TINT_RATE, 2.6f, 0.0f, 20.0f)
+TP_F(render, burnTintMin, TUNE_BURN_TINT_MIN, 0.25f, 0.0f, 1.0f)
+TP_F(render, burnTintMax, TUNE_BURN_TINT_MAX, 0.9f, 0.0f, 1.0f)
 
 // ---- water ----
-TP_F(render, waterF0, TUNE_WATER_F0, 0.0204f)
-TP_V3(render, waterAbsorb, TUNE_WATER_ABSORB, 1.85f, 0.42f, 0.2f)
-TP_V3(render, waterScatter, TUNE_WATER_SCATTER, 0.045f, 0.16f, 0.2f)
-TP_F(render, waterFresnelPower, TUNE_WATER_FRESNEL_POWER, 5.0f)
-TP_F(render, rippleAmpScale, TUNE_RIPPLE_AMP_SCALE, 0.35f)
-TP_F(render, rippleSpeedScale, TUNE_RIPPLE_SPEED_SCALE, 0.4f)
-TP_F(render, waterFetchLow, TUNE_WATER_FETCH_LOW, 0.35f)
-TP_F(render, waterFetchHigh, TUNE_WATER_FETCH_HIGH, 0.85f)
-TP_F(render, waveDispersion, TUNE_WAVE_DISPERSION, 1.0f)
-TP_F(render, waveSteepness, TUNE_WAVE_STEEPNESS, 0.55f)
-TP_F(render, waveShoreDepth, TUNE_WAVE_SHORE_DEPTH, 0.45f)
-TP_F(render, waveFlowScale, TUNE_WAVE_FLOW_SCALE, 1.0f)
-TP_F(render, waveFoamThreshold, TUNE_WAVE_FOAM_THRESHOLD, 0.12f)
-TP_F(render, waveFoamGain, TUNE_WAVE_FOAM_GAIN, 3.0f)
-TP_F(render, waveImpactSpeed, TUNE_WAVE_IMPACT_SPEED, 1.8f)
-TP_F(render, waveImpactDecay, TUNE_WAVE_IMPACT_DECAY, 2.5f)
-TP_F(render, waveImpactLen, TUNE_WAVE_IMPACT_LEN, 0.70f)
+TP_F(render, waterF0, TUNE_WATER_F0, 0.0204f, 0.0f, 0.3f)
+TP_V3(render, waterAbsorb, TUNE_WATER_ABSORB, 1.85f, 0.42f, 0.20f)
+TP_V3(render, waterScatter, TUNE_WATER_SCATTER, 0.045f, 0.16f, 0.20f)
+TP_F(render, waterFresnelPower, TUNE_WATER_FRESNEL_POWER, 5.0f, 1.0f, 10.0f)
+TP_F(render, rippleAmpScale, TUNE_RIPPLE_AMP_SCALE, 0.35f, 0.0f, 4.0f)
+TP_F(render, rippleSpeedScale, TUNE_RIPPLE_SPEED_SCALE, 0.40f, 0.0f, 4.0f)
+TP_F(render, waterFetchLow, TUNE_WATER_FETCH_LOW, 0.35f, 0.0f, 1.0f)
+TP_F(render, waterFetchHigh, TUNE_WATER_FETCH_HIGH, 0.85f, 0.0f, 1.0f)
+// M4 surface waves (PLAN_water_master.md component 9). These had .def
+// rows, struct fields, tuning.json values and tuner sliders since 9a79eba
+// but no read here, so every slider was dead and the shader always ran the
+// tuning.h defaults. check_invariants.py now refuses a .def row with no
+// quoted read in this file.
+// Dispersion is a mix() weight and steepness a crest fraction: both mean
+// nothing outside 0..1. The rest are lengths / rates / gains that go
+// nonsensical (or divide by ~0 in raymarch.wgsl) below their floor; the
+// ceilings are generous past the tuner's slider range.
+TP_F(render, waveDispersion, TUNE_WAVE_DISPERSION, 1.0f, 0.0f, 1.0f)
+TP_F(render, waveSteepness, TUNE_WAVE_STEEPNESS, 0.55f, 0.0f, 1.0f)
+TP_F(render, waveShoreDepth, TUNE_WAVE_SHORE_DEPTH, 0.45f, 0.0f, 16.0f)
+TP_F(render, waveFlowScale, TUNE_WAVE_FLOW_SCALE, 1.0f, 0.0f, 16.0f)
+TP_F(render, waveFoamThreshold, TUNE_WAVE_FOAM_THRESHOLD, 0.12f, 0.0f, 16.0f)
+TP_F(render, waveFoamGain, TUNE_WAVE_FOAM_GAIN, 3.0f, 0.0f, 100.0f)
+TP_F(render, waveImpactSpeed, TUNE_WAVE_IMPACT_SPEED, 1.8f, 0.0f, 50.0f)
+TP_F(render, waveImpactDecay, TUNE_WAVE_IMPACT_DECAY, 2.5f, 0.05f, 60.0f)
+TP_F(render, waveImpactLen, TUNE_WAVE_IMPACT_LEN, 0.70f, 0.05f, 20.0f)
 // W3 render (docs/PLAN_water_relevel.md section 5, last bullet). The SIM's own
 // surface momentum, read in the fragment stage from `waterFlux`. The height is
 // already authoritative through liquidColumn(); what the pipes add is what the
@@ -218,32 +265,35 @@ TP_F(render, waveImpactLen, TUNE_WAVE_IMPACT_LEN, 0.70f)
 // BLOCK, including the buffer read, which is not a nicety: the raymarch
 // fragment shader has no register headroom and this is the arm --shader-stats
 // is compared against.
-TP_F(render, waveSimSlope, TUNE_WAVE_SIM_SLOPE, 0.030f)
-TP_F(render, waveSimFoam, TUNE_WAVE_SIM_FOAM, 0.55f)
-TP_F(render, dbgCurrentSpacing, TUNE_CUR_DBG_SPACING, 6.0f)
-TP_F(render, dbgCurrentRadius, TUNE_CUR_DBG_RADIUS, 40.0f)
-TP_F(render, reflectionCutoff, TUNE_REFLECTION_CUTOFF, 0.06f)
-TP_I(render, reflectionSteps, TUNE_REFLECTION_STEPS, 96)
-TP_F(render, causticGain, TUNE_CAUSTIC_GAIN, 1.5f)
-TP_F(render, causticCap, TUNE_CAUSTIC_CAP, 0.85f)
-TP_F(render, glintIntensity, TUNE_GLINT_INTENSITY, 0.85f)
-TP_F(render, glintPowerNear, TUNE_GLINT_POWER_NEAR, 180.0f)
-TP_F(render, glintPowerFar, TUNE_GLINT_POWER_FAR, 900.0f)
-TP_F(render, foamDepth, TUNE_FOAM_DEPTH, 0.42f)
-TP_F(render, foamStrength, TUNE_FOAM_STRENGTH, 0.55f)
-TP_F(render, iceF0, TUNE_ICE_F0, 0.021f)
-TP_F(render, iceFresnelPower, TUNE_ICE_FRESNEL_POWER, 5.0f)
-TP_F(render, iceAbsorb, TUNE_ICE_ABSORB, 3.2f)
-TP_F(render, iceAbsorbFloor, TUNE_ICE_ABSORB_FLOOR, 0.06f)
-TP_F(render, iceScatter, TUNE_ICE_SCATTER, 0.3f)
-TP_F(render, iceScatterDepth, TUNE_ICE_SCATTER_DEPTH, 1.6f)
-TP_F(render, iceScatterNight, TUNE_ICE_SCATTER_NIGHT, 0.25f)
-TP_F(render, iceGrain, TUNE_ICE_GRAIN, 0.09f)
-TP_F(render, iceGrainScale, TUNE_ICE_GRAIN_SCALE, 0.35f)
-TP_F(render, iceGloss, TUNE_ICE_GLOSS, 190.0f)
-TP_F(render, iceSpec, TUNE_ICE_SPEC, 0.55f)
-TP_F(render, iceDepthMax, TUNE_ICE_DEPTH_MAX, 3.0f)
-TP_F(render, iceReflectMin, TUNE_ICE_REFLECT_MIN, 0.12f)
+// W3 render (PLAN_water_relevel.md §5). Read from JSON rather than left to
+// the C++ default, so the tuner's slider actually reaches the shader const
+// TuningWgslBlock emits from the struct.
+TP_F(render, waveSimSlope, TUNE_WAVE_SIM_SLOPE, 0.030f, 0.0f, 0.5f)
+TP_F(render, waveSimFoam, TUNE_WAVE_SIM_FOAM, 0.55f, 0.0f, 4.0f)
+TP_F(render, dbgCurrentSpacing, TUNE_CUR_DBG_SPACING, 6.0f, 1.0f, 64.0f)
+TP_F(render, dbgCurrentRadius, TUNE_CUR_DBG_RADIUS, 40.0f, 0.0f, 256.0f)
+TP_F(render, reflectionCutoff, TUNE_REFLECTION_CUTOFF, 0.06f, 0.0f, 1.0f)
+TP_I(render, reflectionSteps, TUNE_REFLECTION_STEPS, 96, 0, 512)
+TP_F(render, causticGain, TUNE_CAUSTIC_GAIN, 1.5f, 0.0f, 8.0f)
+TP_F(render, causticCap, TUNE_CAUSTIC_CAP, 0.85f, 0.0f, 4.0f)
+TP_F(render, glintIntensity, TUNE_GLINT_INTENSITY, 0.85f, 0.0f, 4.0f)
+TP_F(render, glintPowerNear, TUNE_GLINT_POWER_NEAR, 180.0f, 10.0f, 2000.0f)
+TP_F(render, glintPowerFar, TUNE_GLINT_POWER_FAR, 900.0f, 10.0f, 4000.0f)
+TP_F(render, foamDepth, TUNE_FOAM_DEPTH, 0.42f, 0.0f, 3.0f)
+TP_F(render, foamStrength, TUNE_FOAM_STRENGTH, 0.55f, 0.0f, 1.0f)
+TP_F(render, iceF0, TUNE_ICE_F0, 0.021f, 0.0f, 0.3f)
+TP_F(render, iceFresnelPower, TUNE_ICE_FRESNEL_POWER, 5.0f, 1.0f, 8.0f)
+TP_F(render, iceAbsorb, TUNE_ICE_ABSORB, 3.2f, 0.0f, 12.0f)
+TP_F(render, iceAbsorbFloor, TUNE_ICE_ABSORB_FLOOR, 0.06f, 0.0f, 1.0f)
+TP_F(render, iceScatter, TUNE_ICE_SCATTER, 0.30f, 0.0f, 2.0f)
+TP_F(render, iceScatterDepth, TUNE_ICE_SCATTER_DEPTH, 1.6f, 0.1f, 8.0f)
+TP_F(render, iceScatterNight, TUNE_ICE_SCATTER_NIGHT, 0.25f, 0.0f, 1.0f)
+TP_F(render, iceGrain, TUNE_ICE_GRAIN, 0.09f, 0.0f, 0.6f)
+TP_F(render, iceGrainScale, TUNE_ICE_GRAIN_SCALE, 0.35f, 0.02f, 3.0f)
+TP_F(render, iceGloss, TUNE_ICE_GLOSS, 190.0f, 4.0f, 1200.0f)
+TP_F(render, iceSpec, TUNE_ICE_SPEC, 0.55f, 0.0f, 3.0f)
+TP_F(render, iceDepthMax, TUNE_ICE_DEPTH_MAX, 3.0f, 0.5f, 40.0f)
+TP_F(render, iceReflectMin, TUNE_ICE_REFLECT_MIN, 0.12f, 0.0f, 1.0f)
 
 // ---- submerged view (raymarch.wgsl shadeSubmerged / godRays / bedCaustic) ----
 // These only ever apply when the ray is INSIDE a liquid, which above water is
@@ -253,20 +303,24 @@ TP_F(render, iceReflectMin, TUNE_ICE_REFLECT_MIN, 0.12f)
 // (that is the depth cue), but living inside it at that strength leaves you in
 // a flat blue void with no visible distance at all. Underwater wants a longer
 // visibility range and a stronger scatter floor.
+// ---- submerged view ----
 TP_V3(render, subAbsorb, TUNE_SUB_ABSORB, 0.42f, 0.11f, 0.075f)
 TP_V3(render, subScatter, TUNE_SUB_SCATTER, 0.055f, 0.19f, 0.24f)
 // In-scatter strength and how fast the volume tint saturates with distance.
-TP_F(render, subScatterGain, TUNE_SUB_SCATTER_GAIN, 1.0f)
+TP_F(render, subScatterGain, TUNE_SUB_SCATTER_GAIN, 1.0f, 0.0f, 4.0f)
 // Distance (metres) at which the far view has fully faded to the scatter
 // colour. This is the underwater equivalent of fog distance and it is the
 // single knob that says "murky pond" vs "clear tropical water".
-TP_F(render, subVisibility, TUNE_SUB_VISIBILITY, 11.0f)
+// A visibility of 0 divides by zero in the shader's fade and takes the
+// whole submerged view to NaN, which renders as a black screen the moment
+// the player's head goes under. Floor it well clear of that.
+TP_F(render, subVisibility, TUNE_SUB_VISIBILITY, 11.0f, 0.5f, 60.0f)
 // Screen-edge darkening while submerged — a cheap, strong "you are in a
 // medium" cue that costs one dot product.
-TP_F(render, subVignette, TUNE_SUB_VIGNETTE, 0.34f)
+TP_F(render, subVignette, TUNE_SUB_VIGNETTE, 0.34f, 0.0f, 1.0f)
 // Snell's-window brightening: looking UP from under water compresses the whole
 // sky into a ~97 degree cone. Outside it the surface mirrors the murk.
-TP_F(render, subSnellGain, TUNE_SUB_SNELL_GAIN, 1.25f)
+TP_F(render, subSnellGain, TUNE_SUB_SNELL_GAIN, 1.25f, 0.0f, 4.0f)
 
 // ---- caustics cast onto submerged surfaces ----
 // The existing causticGain/Cap drive the caustic seen looking DOWN through a
@@ -274,30 +328,37 @@ TP_F(render, subSnellGain, TUNE_SUB_SNELL_GAIN, 1.25f)
 // while the camera is under the water, which is a different projection (from
 // the surface above the SURFACE point, not the bed point) and wants its own
 // strength or one of the two views always looks wrong.
-TP_F(render, bedCausticGain, TUNE_BED_CAUSTIC_GAIN, 2.4f)
-TP_F(render, bedCausticCap, TUNE_BED_CAUSTIC_CAP, 1.5f)
+TP_F(render, bedCausticGain, TUNE_BED_CAUSTIC_GAIN, 2.4f, 0.0f, 10.0f)
+TP_F(render, bedCausticCap, TUNE_BED_CAUSTIC_CAP, 1.5f, 0.0f, 6.0f)
 // Metres of water above a surface past which its caustics have washed out.
-TP_F(render, bedCausticFade, TUNE_BED_CAUSTIC_FADE, 6.0f)
+TP_F(render, bedCausticFade, TUNE_BED_CAUSTIC_FADE, 6.0f, 0.1f, 40.0f)
 // Sharpness of the caustic web. Higher = thinner, brighter filaments.
-TP_F(render, bedCausticSharp, TUNE_BED_CAUSTIC_SHARP, 2.2f)
+TP_F(render, bedCausticSharp, TUNE_BED_CAUSTIC_SHARP, 2.2f, 0.1f, 8.0f)
 
 // ---- volumetric light shafts (god rays) ----
 // Ray-marched with a real occlusion test per sample, so shafts break correctly
 // around the shore and any overhang. Sample count is a direct frame-time
 // multiplier on submerged pixels ONLY.
-TP_I(render, godRaySteps, TUNE_GODRAY_STEPS, 14)
-TP_F(render, godRayStrength, TUNE_GODRAY_STRENGTH, 0.55f)
+// ---- god rays ----
+// Both step counts are a direct per-submerged-pixel frame-time multiplier
+// (steps x shadowSteps is the real cost), so the ceilings here are a perf
+// guard, not a taste judgement. 0 steps disables the effect cleanly.
+TP_I(render, godRaySteps, TUNE_GODRAY_STEPS, 14, 0, 64)
+TP_F(render, godRayStrength, TUNE_GODRAY_STRENGTH, 0.55f, 0.0f, 4.0f)
 // Henyey-Greenstein forward-scattering asymmetry: shafts are much brighter
 // looking toward the sun than away from it, which is what makes them read as
 // beams rather than as uniform haze.
-TP_F(render, godRayAniso, TUNE_GODRAY_ANISO, 0.62f)
+// The Henyey-Greenstein phase function has a (1 - g^2) numerator and a
+// denominator that goes to zero as |g| -> 1, so a g of exactly 1 is a
+// division by zero and anything past it is not a valid phase function.
+TP_F(render, godRayAniso, TUNE_GODRAY_ANISO, 0.62f, -0.95f, 0.95f)
 // Metres the shaft march covers. Beyond this the scatter has saturated anyway.
-TP_F(render, godRayRange, TUNE_GODRAY_RANGE, 14.0f)
+TP_F(render, godRayRange, TUNE_GODRAY_RANGE, 14.0f, 0.1f, 60.0f)
 // Steps the per-sample occlusion ray gets. Short on purpose: it only has to
 // find the surface or a nearby blocker, not resolve distant geometry. Since
 // W2-B these are BLOCK steps (the ray is coarse from t=0), so 8 of them reach
 // 3.2 m where the old 20 voxel steps reached 2.0 m.
-TP_I(render, godRayShadowSteps, TUNE_GODRAY_SHADOW_STEPS, 8)
+TP_I(render, godRayShadowSteps, TUNE_GODRAY_SHADOW_STEPS, 8, 0, 64)
 
 // ---- coarse-terminate for secondary rays (PLAN_lin_followups.md W2-B) ------
 // Metres past which traceOpaque stops asking the voxel and asks the 4^3
@@ -305,22 +366,30 @@ TP_I(render, godRayShadowSteps, TUNE_GODRAY_SHADOW_STEPS, 8)
 // (exact), a set block stops the ray (conservative). 0 disables it and the
 // const-folded 1e30 deletes the code. It lives next to the god-ray rows
 // because god rays pass 0 for it — they are coarse from the first step.
-TP_F(render, shadowCoarseDist, TUNE_SHADOW_COARSE_DIST, 8.0f)
+// 0 is the OFF value (the shader const-folds the coarse march away), so
+// only negatives are refused — a negative would make every ray coarse from
+// its first cell, which is what god rays ask for explicitly and no shadow
+// ray should get by accident.
+TP_F(render, shadowCoarseDist, TUNE_SHADOW_COARSE_DIST, 8.0f, 0.0f, 60.0f)
 
 // ---- the openness (sky-visibility) grid (docs/PLAN_gi.md §2, W3 P0) --------
 // How far a hemisphere ray looks for a blocker, in metres. 12 m is chosen so a
 // ruin roof reads as cover and a 2 m overhang reads as shade; sky past it is
 // the plain n.y prior, which is what the old lerp already assumed.
-TP_F(render, opennessReach, TUNE_OPENNESS_REACH, 12.0f)
+// A negative reach would make every ray report "blocked at t < 0" and
+// paint the world black; a negative strength would brighten the ambient
+// past the sky value. Clamp rather than warn -- neither is expressible as
+// an intent, and both are one keystroke away in the tuner.
+TP_F(render, opennessReach, TUNE_OPENNESS_REACH, 12.0f, 0.0f, 40.0f)
 // Chunk slots the rolling refresh revisits per TICK (not per frame -- the pass
 // is on the tick table, see pass_table.def). The whole 32,768-slot window comes
 // round in kNumChunks / this ticks; every EDIT is covered by the dirty walk
 // instead, so this budget only has to cover cold start and streaming.
-TP_I(render, opennessChunksPerFrame, TUNE_OPENNESS_CHUNKS, 256)
+TP_I(render, opennessChunksPerFrame, TUNE_OPENNESS_CHUNKS, 256, 0, 2048)
 // 0 = the plain n.y hemisphere lerp, bit-identical to pre-P0, AND the pass is
 // not recorded at all -- which is what the `noopenness` --render-budget arm
 // measures. 1 = full spatial attenuation.
-TP_F(render, opennessStrength, TUNE_OPENNESS_STRENGTH, 1.0f)
+TP_F(render, opennessStrength, TUNE_OPENNESS_STRENGTH, 1.0f, 0.0f, 1.0f)
 // THE OLD LEAK, KEPT AS ITS OWN A/B ARM AND DEFAULTED OFF (2026-09-11). This
 // was the least the openness grid could scale the SKY ambient to, and because
 // the sky ambient is the entire day/night signal a sealed cave got a flat 30%
@@ -329,7 +398,7 @@ TP_F(render, opennessStrength, TUNE_OPENNESS_STRENGTH, 1.0f)
 // noon/midnight ratio was 8.6x. What it was standing in for -- "real enclosed
 // surfaces keep light from the surfaces around them" -- is enclosedAmbient
 // below plus the bounce gather, neither of which moves with the sun.
-TP_F(render, opennessFloor, TUNE_OPENNESS_FLOOR, 0.0f)
+TP_F(render, opennessFloor, TUNE_OPENNESS_FLOOR, 0.0f, 0.0f, 1.0f)
 // The ambient an ENCLOSED face keeps, ADDED rather than multiplied in, and
 // deliberately NOT a function of the sun, the moons or the sky: this is the
 // term that decides how bright a cave is, and a cave must not know what time
@@ -342,24 +411,34 @@ TP_V3(render, enclosedAmbient, TUNE_ENCLOSED_AMBIENT, 0.012f, 0.013f, 0.016f)
 // Bilinear over the four neighbouring blocks in the face plane. Nearest-only
 // tiles visibly on a flat wall at 40 cm blocks; this costs three more byte
 // reads on a hit that has already paid for a chunk lookup.
-TP_I(render, opennessBilinear, TUNE_OPENNESS_BILINEAR, 1)
+TP_I(render, opennessBilinear, TUNE_OPENNESS_BILINEAR, 1, 0, 1)
 
 // ---- one-bounce indirect light (docs/PLAN_gi.md §3, W3 P1) ----
 // Weight of the gathered bounce added at every near-field hit. 0 is an EXACT
 // off switch: the gather, the resolve-pass injection and the walk's sun
 // sample all const-fold away, which is what the `nogi` --render-budget arm
 // measures.
-TP_F(render, giStrength, TUNE_GI_STRENGTH, 2.0f)
+// Indirect light (PLAN_gi.md §3-4). A negative strength would subtract
+// light; a decay outside [0,1] is meaningless; and the P2 write-back must
+// stay strictly below the decay or every bounce adds more than the walk
+// forgets and the grid brightens without bound. That last one is the
+// assertion PLAN_gi.md §4 asks for, expressed as a warning plus a clamp
+// because a bad value is one keystroke away in the tuner and must not
+// take the game down.
+// + a hand-written rule in LoadTuning
+TP_F(render, giStrength, TUNE_GI_STRENGTH, 2.0f, 0.0f, 3.0f)
 // Fraction of a face's irradiance the openness walk forgets per visit when it
 // cannot re-measure the face (its front block holds a blocker, so no sun ray
 // can be cast from it) -- how fast light deposited under an old sun fades
 // once no patch of that face is on screen to re-deposit it.
-TP_F(render, giDecay, TUNE_GI_DECAY, 0.25f)
+// + a hand-written rule in LoadTuning
+TP_F(render, giDecay, TUNE_GI_DECAY, 0.25f, 0.0f, 1.0f)
 // P2 (PLAN_gi.md §4): fraction of a receiver's own gathered term blended back
 // into its block-face per frame, so bounces compound. 0 = one bounce only.
 // LoadTuning keeps it strictly below giDecay or the grid brightens without
 // bound.
-TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.2f)
+// + a hand-written rule in LoadTuning
+TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.2f, 0.0f, 1.0f)
 // The STEP BUDGET of each of the nine gather rays, not a distance: traceOpaque
 // jumps a whole CHUNK (1.6 m) per step wherever the chunk holds no blocker and
 // a 4^3 block otherwise, so open air is crossed four times faster than the
@@ -370,7 +449,11 @@ TP_F(render, giFeedback, TUNE_GI_FEEDBACK, 0.2f)
 // raymarch.wgsl for the 128 -> 168 register cliff a per-pixel budget costs.
 // Paid for by doubling giCachePeriod below: measured 2026-09-11, 12 steps at
 // period 16 costs the same 0.78 ms as 3 steps at period 8.
-TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 12)
+// A STEP budget, not a distance (tuning_params.def says why). The ceiling
+// is what bounds the gather's cost: nine rays x this many iterations on a
+// re-gather frame, amortised over giCachePeriod. 64 is already ~30 m of
+// open interior, which is past the residency window's useful half.
+TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 12, 0, 64)
 // The gather CACHE (PLAN_frame_perf.md s3 item 1): frames between re-gathers
 // of one chunk slot's block-faces. The nine rays run only on a slot's scheduled
 // frame (slots are staggered, so 1/N of the visible ones re-gather per frame)
@@ -383,33 +466,35 @@ TP_I(render, giGatherBlocks, TUNE_GI_GATHER_BLOCKS, 12)
 // buys the reach with is LATENCY -- the bounce now trails the sun and the
 // shadow cache by up to 16 frames instead of 8, about a quarter-second, which
 // is well under what the eye reads as a lag on a term this diffuse.
-TP_I(render, giCachePeriod, TUNE_GI_CACHE_PERIOD, 16)
+// Beyond 64 the bounce visibly lags the sun; 0 is the uncached path.
+TP_I(render, giCachePeriod, TUNE_GI_CACHE_PERIOD, 16, 0, 64)
 
 // ---- the glow field (src/sim/world.h kGlowBytes, assets/shaders/sim_glow.wgsl)
 // Weight of the sampled emitter light added at a consumer. 0 is an EXACT off
 // switch: both producer rows go unrecorded (C_GLOW) and every consumer's term
 // const-folds away, which is what the `noglow` --render-budget arm measures.
-TP_F(render, glowStrength, TUNE_GLOW_STRENGTH, 1.0f)
+TP_F(render, glowStrength, TUNE_GLOW_STRENGTH, 1.0f, 0.0f, 4.0f)
 // How far an emitter chunk throws light, in metres. LoadTuning clamps this to
 // one chunk plus half a block diagonal, because the producer's stencil is 3x3x3
 // CHUNKS and a reach past that would be a truncated kernel -- a hard edge at
 // the stencil boundary instead of a falloff that reaches zero on its own.
-TP_F(render, glowReach, TUNE_GLOW_REACH, 2.4f)
+// + a hand-written rule in LoadTuning
+TP_F(render, glowReach, TUNE_GLOW_REACH, 2.4f, 0.0f, 2.6f)
 // Emitting-cell fraction at which a chunk reads as a full-strength light
 // source. 32 means 1/32 of the chunk (128 of 4,096 cells) saturates it, so a
 // lava pool's surface layer counts fully while four stray embers do not. This
 // is the only knob between "how much lava" and "how bright"; the ceiling itself
 // is structural (see glowStoreSrc) and does not depend on it.
-TP_F(render, glowFill, TUNE_GLOW_FILL, 32.0f)
+TP_F(render, glowFill, TUNE_GLOW_FILL, 32.0f, 1.0f, 256.0f)
 // Chunk slots the rolling refresh revisits per TICK. Every EDIT is covered by
 // the dirty walk, so this only has to cover cold start, streaming, and chunks
 // the ring budget below turned away.
-TP_I(render, glowChunksPerFrame, TUNE_GLOW_CHUNKS, 64)
+TP_I(render, glowChunksPerFrame, TUNE_GLOW_CHUNKS, 64, 0, kNumChunks)
 // The per-tick ceiling on the expensive branch: how many of the dirty list's
 // workgroups may rewrite their whole 3x3x3 neighbourhood when their source word
 // moves. A prefix of the compacted list, so it is stable rather than
 // scheduling-dependent. 64 x 27 x 64 = 110,592 stores is the worst tick.
-TP_I(render, glowRingBudget, TUNE_GLOW_RING_BUDGET, 64)
+TP_I(render, glowRingBudget, TUNE_GLOW_RING_BUDGET, 64, 0, kNumChunks)
 // Sample the field at the near-field TERRAIN hit as well as on the raster body
 // paths. OFF by default and that is a correctness call, not caution: terrain
 // already receives emitter light through giGather over the irradiance grid,
@@ -417,14 +502,16 @@ TP_I(render, glowRingBudget, TUNE_GLOW_RING_BUDGET, 64)
 // DOUBLE-COUNTS every emitter within the gather's 1.2 m reach. On, it extends
 // emitter light to render.glowReach on terrain at the cost of that overlap --
 // worth having as a knob, not as a default.
-TP_I(render, glowTerrain, TUNE_GLOW_TERRAIN, 0)
+// + a hand-written rule in LoadTuning
+TP_I(render, glowTerrain, TUNE_GLOW_TERRAIN, 0, 0, 1)
 
 // ---- drifting particulate (silt) ----
 // Render-only motes in the water volume. This is what gives the shafts
 // something to catch, and it is most of why footage reads as underwater.
-TP_F(render, siltDensity, TUNE_SILT_DENSITY, 0.55f)
-TP_F(render, siltBrightness, TUNE_SILT_BRIGHTNESS, 0.5f)
-TP_F(render, siltDrift, TUNE_SILT_DRIFT, 0.05f)
+// ---- silt ----
+TP_F(render, siltDensity, TUNE_SILT_DENSITY, 0.55f, 0.0f, 4.0f)
+TP_F(render, siltBrightness, TUNE_SILT_BRIGHTNESS, 0.50f, 0.0f, 4.0f)
+TP_F(render, siltDrift, TUNE_SILT_DRIFT, 0.05f, 0.0f, 1.0f)
 
 // ---- waterfall mist and spray ----
 // Render-only. "Liquid with air under it" is not a field in the voxel word, so
@@ -432,16 +519,20 @@ TP_F(render, siltDrift, TUNE_SILT_DRIFT, 0.05f)
 // liquid hit and overlays procedural slabs on it -- no particle, no buffer, no
 // sim state, nothing hashed. mistDensity <= 0 deletes the whole term at
 // shader-compile time, which is why the dry overlook pays nothing for it.
-TP_F(render, mistDensity, TUNE_MIST_DENSITY, 1.0f)
-TP_F(render, mistBrightness, TUNE_MIST_BRIGHTNESS, 0.9f)
-TP_F(render, mistRadius, TUNE_MIST_RADIUS, 10.0f)
-TP_F(render, mistFallSpeed, TUNE_MIST_FALL_SPEED, 2.2f)
-TP_F(render, sprayDensity, TUNE_SPRAY_DENSITY, 1.3f)
-TP_F(render, sprayRadius, TUNE_SPRAY_RADIUS, 14.0f)
+// ---- waterfall mist / spray ----
+// Clamped at 0 on the low side so `mistDensity <= 0` stays the ONE off
+// switch the shader const-folds on, and generously on the high side
+// because these are look knobs with no stability hazard behind them.
+TP_F(render, mistDensity, TUNE_MIST_DENSITY, 1.0f, 0.0f, 4.0f)
+TP_F(render, mistBrightness, TUNE_MIST_BRIGHTNESS, 0.9f, 0.0f, 4.0f)
+TP_F(render, mistRadius, TUNE_MIST_RADIUS, 10.0f, 0.5f, 48.0f)
+TP_F(render, mistFallSpeed, TUNE_MIST_FALL_SPEED, 2.2f, 0.0f, 12.0f)
+TP_F(render, sprayDensity, TUNE_SPRAY_DENSITY, 1.3f, 0.0f, 4.0f)
+TP_F(render, sprayRadius, TUNE_SPRAY_RADIUS, 14.0f, 0.5f, 48.0f)
 
 // ---- surface-from-below ----
 // How much the underside of the water surface ripples the view of the sky.
-TP_F(render, subSurfaceRipple, TUNE_SUB_SURFACE_RIPPLE, 1.6f)
+TP_F(render, subSurfaceRipple, TUNE_SUB_SURFACE_RIPPLE, 1.6f, 0.0f, 8.0f)
 
 // ---- the generic per-liquid submerged profile (submergedProfile) ----
 // These shape the MAPPING from a liquid's authored opacity + palette to its
@@ -452,115 +543,162 @@ TP_F(render, subSurfaceRipple, TUNE_SUB_SURFACE_RIPPLE, 1.6f)
 //
 // Visibility in a fully opaque liquid. Being inside oil should be
 // claustrophobic — this is the "arm's length" end of the range.
-TP_F(render, subMurkVis, TUNE_SUB_MURK_VIS, 0.55f)
+// ---- generic per-liquid submerged profile ----
+// Same divide-by-zero hazard as subVisibility: visM is the denominator of
+// the extinction term, and a zero there takes a submerged frame to NaN,
+// which renders as a black screen the moment you go under.
+TP_F(render, subMurkVis, TUNE_SUB_MURK_VIS, 0.55f, 0.05f, 20.0f)
 // Exponent applied to clarity for the VISIBILITY mapping only. Separate from
 // the clarity curve itself because one shared exponent cannot both collapse
 // oil to arm's length and keep water classified as clear (see submergedProfile).
-TP_F(render, subVisCurve, TUNE_SUB_VIS_CURVE, 2.2f)
+// pow() with a negative exponent on a clarity approaching 0 explodes to
+// infinity; 0 would make every liquid equally visible and defeat the knob.
+TP_F(render, subVisCurve, TUNE_SUB_VIS_CURVE, 2.2f, 0.05f, 8.0f)
 // Opacity -> per-metre absorption gain for the derived (non-clear) case.
-TP_F(render, subAbsorbGain, TUNE_SUB_ABSORB_GAIN, 7.0f)
+TP_F(render, subAbsorbGain, TUNE_SUB_ABSORB_GAIN, 7.0f, 0.0f, 24.0f)
 // Absorption floor, so even a notionally clear liquid is not a vacuum.
-TP_F(render, subAbsorbFloor, TUNE_SUB_ABSORB_FLOOR, 0.05f)
+TP_F(render, subAbsorbFloor, TUNE_SUB_ABSORB_FLOOR, 0.05f, 0.0f, 1.0f)
 // How much of its own colour a liquid scatters back at the eye, at the dense
 // and clear ends of the clarity curve. A dense liquid IS what you see.
-TP_F(render, subScatterDense, TUNE_SUB_SCATTER_DENSE, 0.42f)
-TP_F(render, subScatterClear, TUNE_SUB_SCATTER_CLEAR, 0.16f)
+TP_F(render, subScatterDense, TUNE_SUB_SCATTER_DENSE, 0.42f, 0.0f, 2.0f)
+TP_F(render, subScatterClear, TUNE_SUB_SCATTER_CLEAR, 0.16f, 0.0f, 2.0f)
 // Clarity band over which a liquid crosses from the derived profile onto
 // water's hand-tuned coefficients. Water sits at clarity ~0.79, oil ~0.16.
 // Widening this band makes more liquids inherit water's look.
-TP_F(render, subClearLow, TUNE_SUB_CLEAR_LOW, 0.62f)
-TP_F(render, subClearHigh, TUNE_SUB_CLEAR_HIGH, 0.78f)
+// + a hand-written rule in LoadTuning
+TP_F(render, subClearLow, TUNE_SUB_CLEAR_LOW, 0.62f, 0.0f, 1.0f)
+// + a hand-written rule in LoadTuning
+TP_F(render, subClearHigh, TUNE_SUB_CLEAR_HIGH, 0.78f, 0.0f, 1.0f)
 
 // ---- blood / viscous liquids ----
-TP_F(render, bloodF0, TUNE_BLOOD_F0, 0.03f)
-TP_F(render, bloodGraze, TUNE_BLOOD_GRAZE, 0.55f)
-TP_F(render, bloodAbsorb, TUNE_BLOOD_ABSORB, 55.0f)
-TP_F(render, bloodTransmit, TUNE_BLOOD_TRANSMIT, 0.35f)
-TP_F(render, bloodMaxTransmit, TUNE_BLOOD_MAX_TRANSMIT, 0.06f)
-TP_F(render, bloodDepthRamp, TUNE_BLOOD_DEPTH_RAMP, 22.0f)
-TP_F(render, bloodPoolLow, TUNE_BLOOD_POOL_LOW, 0.18f)
-TP_F(render, bloodPoolHigh, TUNE_BLOOD_POOL_HIGH, 0.55f)
-TP_F(render, bloodSmooth, TUNE_BLOOD_SMOOTH, 1.0f)
-TP_F(render, bloodEdgeFeather, TUNE_BLOOD_EDGE_FEATHER, 0.1f)
-TP_F(render, bloodWobble, TUNE_BLOOD_WOBBLE, 0.004f)
-TP_F(render, bloodSheen, TUNE_BLOOD_SHEEN, 1.15f)
-TP_F(render, bloodSheenDrop, TUNE_BLOOD_SHEEN_DROP, 32.0f)
-TP_F(render, bloodSheenPool, TUNE_BLOOD_SHEEN_POOL, 220.0f)
-TP_F(render, bloodAmbientSheen, TUNE_BLOOD_AMBIENT_SHEEN, 0.35f)
-TP_F(render, bloodEdgeDepth, TUNE_BLOOD_EDGE_DEPTH, 0.035f)
-TP_F(render, bloodEdgeStrength, TUNE_BLOOD_EDGE_STRENGTH, 0.65f)
-TP_V3(render, bloodEdgeTint, TUNE_BLOOD_EDGE_TINT, 0.55f, 0.4f, 0.38f)
+TP_F(render, bloodF0, TUNE_BLOOD_F0, 0.030f, 0.0f, 0.3f)
+TP_F(render, bloodGraze, TUNE_BLOOD_GRAZE, 0.55f, 0.0f, 1.0f)
+TP_F(render, bloodAbsorb, TUNE_BLOOD_ABSORB, 55.0f, 0.0f, 200.0f)
+TP_F(render, bloodTransmit, TUNE_BLOOD_TRANSMIT, 0.35f, 0.0f, 1.0f)
+TP_F(render, bloodMaxTransmit, TUNE_BLOOD_MAX_TRANSMIT, 0.06f, 0.0f, 0.5f)
+TP_F(render, bloodDepthRamp, TUNE_BLOOD_DEPTH_RAMP, 22.0f, 0.0f, 100.0f)
+TP_F(render, bloodPoolLow, TUNE_BLOOD_POOL_LOW, 0.18f, 0.0f, 1.0f)
+TP_F(render, bloodPoolHigh, TUNE_BLOOD_POOL_HIGH, 0.55f, 0.0f, 1.0f)
+TP_F(render, bloodSmooth, TUNE_BLOOD_SMOOTH, 1.0f, 0.25f, 3.0f)
+TP_F(render, bloodEdgeFeather, TUNE_BLOOD_EDGE_FEATHER, 0.10f, 0.0f, 0.6f)
+TP_F(render, bloodWobble, TUNE_BLOOD_WOBBLE, 0.004f, 0.0f, 0.05f)
+TP_F(render, bloodSheen, TUNE_BLOOD_SHEEN, 1.15f, 0.0f, 5.0f)
+TP_F(render, bloodSheenDrop, TUNE_BLOOD_SHEEN_DROP, 32.0f, 2.0f, 2000.0f)
+TP_F(render, bloodSheenPool, TUNE_BLOOD_SHEEN_POOL, 220.0f, 2.0f, 2000.0f)
+TP_F(render, bloodAmbientSheen, TUNE_BLOOD_AMBIENT_SHEEN, 0.35f, 0.0f, 2.0f)
+TP_F(render, bloodEdgeDepth, TUNE_BLOOD_EDGE_DEPTH, 0.035f, 0.0f, 0.5f)
+TP_F(render, bloodEdgeStrength, TUNE_BLOOD_EDGE_STRENGTH, 0.65f, 0.0f, 1.0f)
+TP_V3(render, bloodEdgeTint, TUNE_BLOOD_EDGE_TINT, 0.55f, 0.40f, 0.38f)
 
 // ---- stains ----
-TP_F(render, stainCoverage, TUNE_STAIN_COVERAGE, 1.35f)
-TP_F(render, stainMottle, TUNE_STAIN_MOTTLE, 0.85f)
-TP_F(render, stainMottleScale, TUNE_STAIN_MOTTLE_SCALE, 0.55f)
-TP_F(render, stainDarken, TUNE_STAIN_DARKEN, 0.55f)
-TP_F(render, stainOpacity, TUNE_STAIN_OPACITY, 0.7f)
-TP_F(render, stainSheen, TUNE_STAIN_SHEEN, 0.55f)
-TP_F(render, stainSheenPower, TUNE_STAIN_SHEEN_POWER, 90.0f)
+TP_F(render, stainCoverage, TUNE_STAIN_COVERAGE, 1.35f, 0.0f, 4.0f)
+TP_F(render, stainMottle, TUNE_STAIN_MOTTLE, 0.85f, 0.0f, 2.0f)
+TP_F(render, stainMottleScale, TUNE_STAIN_MOTTLE_SCALE, 0.55f, 0.05f, 4.0f)
+TP_F(render, stainDarken, TUNE_STAIN_DARKEN, 0.55f, 0.0f, 1.0f)
+TP_F(render, stainOpacity, TUNE_STAIN_OPACITY, 0.70f, 0.0f, 1.0f)
+TP_F(render, stainSheen, TUNE_STAIN_SHEEN, 0.55f, 0.0f, 3.0f)
+TP_F(render, stainSheenPower, TUNE_STAIN_SHEEN_POWER, 90.0f, 2.0f, 1000.0f)
 
 // ---- lava / embers ----
-TP_F(render, lavaCrackFreq, TUNE_LAVA_CRACK_FREQ, 2.4f)
-TP_F(render, lavaCrackKneeLow, TUNE_LAVA_CRACK_KNEE_LOW, 0.5f)
-TP_F(render, lavaCrackKneeHigh, TUNE_LAVA_CRACK_KNEE_HIGH, 0.9f)
-TP_F(render, lavaWarmBias, TUNE_LAVA_WARM_BIAS, 0.035f)
-TP_F(render, lavaEmissionGain, TUNE_LAVA_EMISSION_GAIN, 1.9f)
-TP_F(render, lavaPulseAmp, TUNE_LAVA_PULSE_AMP, 0.06f)
-TP_F(render, lavaPulseRate, TUNE_LAVA_PULSE_RATE, 0.9f)
-TP_F(render, emberBrightness, TUNE_EMBER_BRIGHTNESS, 2.2f)
-TP_F(render, emberRise, TUNE_EMBER_RISE, 26.0f)
-TP_F(render, emberRate, TUNE_EMBER_RATE, 3.4f)
-TP_U(render, emberDensity, TUNE_EMBER_DENSITY, 84)
+TP_F(render, lavaCrackFreq, TUNE_LAVA_CRACK_FREQ, 2.4f, 0.1f, 12.0f)
+TP_F(render, lavaCrackKneeLow, TUNE_LAVA_CRACK_KNEE_LOW, 0.50f, 0.0f, 1.0f)
+TP_F(render, lavaCrackKneeHigh, TUNE_LAVA_CRACK_KNEE_HIGH, 0.90f, 0.0f, 1.0f)
+TP_F(render, lavaWarmBias, TUNE_LAVA_WARM_BIAS, 0.035f, -0.3f, 0.6f)
+TP_F(render, lavaEmissionGain, TUNE_LAVA_EMISSION_GAIN, 1.9f, 0.0f, 8.0f)
+TP_F(render, lavaPulseAmp, TUNE_LAVA_PULSE_AMP, 0.06f, 0.0f, 0.5f)
+TP_F(render, lavaPulseRate, TUNE_LAVA_PULSE_RATE, 0.9f, 0.0f, 8.0f)
 
 // ---- tonemap / budgets ----
-TP_F(render, exposureWhite, TUNE_EXPOSURE_WHITE, 4.2f)
-TP_F(render, bleachAmount, TUNE_BLEACH_AMOUNT, 0.9f)
-TP_F(render, gamma, TUNE_GAMMA, 2.2f)
+// + a hand-written rule in LoadTuning
+TP_F(render, exposureWhite, TUNE_EXPOSURE_WHITE, 4.2f, 0.2f, 32.0f)
+TP_F(render, bleachAmount, TUNE_BLEACH_AMOUNT, 0.9f, 0.0f, 1.0f)
+// + a hand-written rule in LoadTuning
+TP_F(render, gamma, TUNE_GAMMA, 2.2f, 1.0f, 3.2f)
 
 // ---- static micro-detail ----
-TP_F(render, microLodDist, TUNE_MICRO_LOD_DIST, 40.0f)
-TP_F(render, plantLodDist, TUNE_PLANT_LOD_DIST, 16.0f)
-TP_I(render, microMaxPerRay, TUNE_MICRO_MAX_PER_RAY, 8)
-TP_F(render, microSwayAmp, TUNE_MICRO_SWAY_AMP, 1.5f)
-TP_F(render, microSwaySpeed, TUNE_MICRO_SWAY_SPEED, 1.0f)
-TP_F(render, trampleRecover, TUNE_TRAMPLE_RECOVER, 1.4f)
-TP_F(render, trampleDepth, TUNE_TRAMPLE_DEPTH, 0.8f)
-TP_F(render, trampleLean, TUNE_TRAMPLE_LEAN, 0.35f)
-TP_F(render, trampleRadius, TUNE_TRAMPLE_RADIUS, 1.5f)
-TP_I(render, primarySteps, TUNE_PRIMARY_STEPS, 4096)
-TP_I(render, farSteps, TUNE_FAR_STEPS, 384)
-TP_F(render, farShadowReach, TUNE_FAR_SHADOW_REACH, 60.0f)
-TP_I(render, farBlockerHitLevel, TUNE_FAR_BLOCKER_HIT_LEVEL, 0)
+TP_F(render, microLodDist, TUNE_MICRO_LOD_DIST, 40.0f, 0.0f, 200.0f)
+TP_F(render, plantLodDist, TUNE_PLANT_LOD_DIST, 16.0f, 0.0f, 200.0f)
+// A negative micro budget would underflow the shader's u32 counter and
+// uncap the very thing the knob exists to bound; 0 means "never nest",
+// which is a legitimate way to turn the feature off by eye.
+TP_I(render, microMaxPerRay, TUNE_MICRO_MAX_PER_RAY, 8, 0, 32)
+// The sway models are authored with a 2-sub-voxel wall margin; a larger
+// amplitude shears blade tips out of the cell where they simply vanish.
+TP_F(render, microSwayAmp, TUNE_MICRO_SWAY_AMP, 1.5f, 0.0f, 2.0f)
+TP_F(render, microSwaySpeed, TUNE_MICRO_SWAY_SPEED, 1.0f, 0.0f, 6.0f)
+TP_F(render, trampleRecover, TUNE_TRAMPLE_RECOVER, 1.4f, 0.05f, 6.0f)
+TP_F(render, trampleDepth, TUNE_TRAMPLE_DEPTH, 0.8f, 0.0f, 0.95f)
+TP_F(render, trampleLean, TUNE_TRAMPLE_LEAN, 0.35f, 0.0f, 1.0f)
+TP_F(render, trampleRadius, TUNE_TRAMPLE_RADIUS, 1.5f, 0.0f, 4.0f)
+TP_I(render, primarySteps, TUNE_PRIMARY_STEPS, 4096, 1, 8192)
+TP_I(render, farSteps, TUNE_FAR_STEPS, 384, 1, 2048)
+// A zero/negative reach would clamp to the 8-step floor everywhere and
+// silently drop far shadows; keep it positive.
+TP_F(render, farShadowReach, TUNE_FAR_SHADOW_REACH, 60.0f, 1.0f, 400.0f)
+// A level cap, so the legal range is 0 (off) .. kFarLevels. Out-of-range
+// values are not merely useless here: the shader compares it against a
+// 1-based level, so a negative would read as "off" by accident rather
+// than by intent and anything past the top level is a lie about coverage.
+TP_I(render, farBlockerHitLevel, TUNE_FAR_BLOCKER_HIT_LEVEL, 0, 0, kFarLevels)
 
 // ---- gas voxel -> parcel crossfade (PLAN_gas_particles.md stage 1b) ----
-TP_F(render, gasBlendStart, TUNE_GAS_BLEND_START, 0.5f)
+// The LOD handoff must not land in front of the near clip: a zero here
+// would hand EVERY ray to the cascade at t=0 and render the world as
+// 40 cm blocks from the camera outward. Floored at 2 m, which is still
+// absurdly near but is a knob setting rather than a broken frame. There is
+// deliberately no ceiling — >= 25.6 m disables the handoff, which is the
+// documented way to A/B it.
+// A fraction of the window half-extent. Below 0 the band would start
+// outside the box on the far side; above 1 it would never reach 1 at the
+// face and the seam would come back with a step in it.
+TP_F(render, gasBlendStart, TUNE_GAS_BLEND_START, 0.5f, 0.0f, 1.0f)
 
 // ---- far FIRE PLUMES: smoke from fires the window has left behind ----
 // Render-only, and in the render group for that reason rather than for
 // convenience: nothing here reaches the CA or the parcel pool. Strength is a
 // density multiplier and 0 is the exact off switch (no row recorded at all);
 // height is how far the synthesized column climbs, in METRES.
-TP_F(render, farPlumeStrength, TUNE_FAR_PLUME_STRENGTH, 1.0f)
-TP_F(render, farPlumeHeight, TUNE_FAR_PLUME_HEIGHT, 28.0f)
+// Far fire plumes. 0 is the off switch and must stay reachable, so the
+// floor is 0 rather than a small positive; the ceiling keeps a mistyped
+// value from saturating every cell of the density box (GAS_OUTER_MAX) and
+// fogging the whole horizon white. Height is clamped to the box's own
+// half-extent in metres — past that the shader clamps anyway, and a knob
+// whose top half does nothing is a knob that reads as broken.
+TP_F(render, farPlumeStrength, TUNE_FAR_PLUME_STRENGTH, 1.0f, 0.0f, 16.0f)
+// + a hand-written rule in LoadTuning
+TP_F(render, farPlumeHeight, TUNE_FAR_PLUME_HEIGHT, 28.0f, 0.0f, 409.6f)
 // How far out a frozen fire still smokes, in METRES. Clamped to the long-range
 // box's own half-extent; 0 leaves the wide list empty, which is the exact off
 // switch for the whole long-range half.
-TP_F(render, farPlumeRange, TUNE_FAR_PLUME_RANGE, 3276.8f)
+// The long-range reach, clamped to the box that holds it: half of
+// (kGasFarOuterN << kGasFarOuterShift) voxels, in metres. Past that an
+// emitter is outside the box and the splat would drop it anyway, so the
+// clamp turns "does nothing" into "is the maximum".
+// + a hand-written rule in LoadTuning
+TP_F(render, farPlumeRange, TUNE_FAR_PLUME_RANGE, 3276.8f, 0.0f, 3276.8f)
 
 // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
-TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 26.0f)
-TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f)
+TP_F(render, lodHandoffDist, TUNE_LOD_HANDOFF_DIST, 26.0f, 2.0f, 60.0f)
+// 0 is meaningful here (all shadows go through the cascade), so only
+// negatives are refused.
+TP_F(render, shadowMaxDist, TUNE_SHADOW_MAX_DIST, 999.0f, 0.0f, 999.0f)
 
 // ---- SHORT-RANGE MODE (dev panel checkbox, RenderParams flag bit 2) ----
 // The look/perf comparison arm: a hard ray ceiling plus a fog ramp that hides
 // it, the way the fixed-100 m WebGPU voxel engines do it. These three shape
 // the mode; whether it is ON is NOT a tuning value (it is overlay state, so
 // toggling it cannot rewrite the user's tuning.json).
-TP_F(render, shortRangeDist, TUNE_SHORT_RANGE_DIST, 100.0f)
-TP_F(render, shortRangeNearDist, TUNE_SHORT_RANGE_NEAR_DIST, 50.0f)
-TP_F(render, shortRangeFogStart, TUNE_SHORT_RANGE_FOG_START, 0.65f)
-TP_F(render, shortRangeFogDensity, TUNE_SHORT_RANGE_FOG_DENSITY, 5.0f)
+// ---- short-range mode ----
+// The ceiling divides the fog ramp's span, so it must stay positive; 4 m
+// is under the near field's own reach and is already an absurd setting,
+// but it is a setting rather than a NaN frame.
+TP_F(render, shortRangeDist, TUNE_SHORT_RANGE_DIST, 100.0f, 4.0f, 2000.0f)
+TP_F(render, shortRangeNearDist, TUNE_SHORT_RANGE_NEAR_DIST, 50.0f, 4.0f, 2000.0f)
+// The start fraction is a fraction. 0.95 rather than 1.0 at the top so the
+// ramp always has a span to run over.
+TP_F(render, shortRangeFogStart, TUNE_SHORT_RANGE_FOG_START, 0.65f, 0.0f, 0.95f)
+// Zero density would renormalise 0/0 at the ceiling.
+TP_F(render, shortRangeFogDensity, TUNE_SHORT_RANGE_FOG_DENSITY, 5.0f, 0.05f, 24.0f)
 
 // ---- wind: the SHAPE of the field (docs/RESEARCH_wind.md, DESIGN.md 12) ----
 // These are the parts of windAt() that are authored once and const-folded into
@@ -571,31 +709,53 @@ TP_F(render, shortRangeFogDensity, TUNE_SHORT_RANGE_FOG_DENSITY, 5.0f)
 // directions: windAtQ (common.wgsl) const-evals these into integers exactly the
 // way sim_fluid.wgsl converts its own human-unit knobs, so the sim kernels that
 // read the field stay integer while the knobs stay in metres and seconds.
-TP_F(wind, gustWavelength, TUNE_WIND_GUST_WAVELENGTH, 4.8f)
-TP_F(wind, gustSpeed, TUNE_WIND_GUST_SPEED, 1.1f)
-TP_F(wind, altitudeGain, TUNE_WIND_ALT_GAIN, 0.6f)
-TP_F(wind, altitudeRefY, TUNE_WIND_ALT_REF_Y, 64.0f)
-TP_F(wind, dbgWindSpacing, TUNE_WIND_DBG_SPACING, 8.0f)
-TP_F(wind, dbgWindRadius, TUNE_WIND_DBG_RADIUS, 48.0f)
+// Clamps, in the order they can bite.
+//
+// A zero or negative gust wavelength is an infinite spatial frequency: the
+// gust phase changes by more than pi between adjacent samples and the
+// "field" aliases into per-cell noise. The shader has its own guard on
+// this constant (WIND_GUST_K) because a shader compiled offline never
+// passes through here at all.
+TP_F(wind, gustWavelength, TUNE_WIND_GUST_WAVELENGTH, 4.8f, 0.25f, 60.0f)
+TP_F(wind, gustSpeed, TUNE_WIND_GUST_SPEED, 1.1f, 0.0f, 5.0f)
+TP_F(wind, altitudeGain, TUNE_WIND_ALT_GAIN, 0.6f, -2.0f, 4.0f)
+TP_F(wind, altitudeRefY, TUNE_WIND_ALT_REF_Y, 64.0f, 0.0f, 256.0f)
+// The overlay's cost is cubic in radius/spacing, and the arrow count is
+// computed identically on the CPU (for the instance count) and in the
+// vertex shader (for the lattice). Clamping the INPUTS here is what keeps
+// those two derivations agreeing about a silly value instead of one of
+// them saturating and the other not.
+TP_F(wind, dbgWindSpacing, TUNE_WIND_DBG_SPACING, 8.0f, 1.0f, 64.0f)
+TP_F(wind, dbgWindRadius, TUNE_WIND_DBG_RADIUS, 48.0f, 0.0f, 256.0f)
 
 // ---- sim: DETERMINISM-CRITICAL, integer only (CLAUDE.md rule 1) ----
-TP_I(sim, partGravity, TUNE_PART_GRAVITY, 22)
-TP_I(sim, partMaxVel, TUNE_PART_MAX_VEL, 1536)
-TP_I(sim, partBuoyMax, TUNE_PART_BUOY_MAX, 88)
-TP_I(sim, partSettleSpeed, TUNE_PART_SETTLE_SPEED, 24)
-TP_U(sim, partFloatPatience, TUNE_PART_FLOAT_PATIENCE, 180)
-TP_I(sim, airDensity, TUNE_AIR_DENSITY, 10)
-TP_I(sim, falloffPerCell, TUNE_FALLOFF_PER_CELL, 6)
-TP_U(sim, ejectSolid, TUNE_EJECT_SOLID, 250)
-TP_U(sim, ejectLiquid, TUNE_EJECT_LIQUID, 500)
-TP_U(sim, ejectPowder, TUNE_EJECT_POWDER, 350)
-TP_U(sim, ejectGas, TUNE_EJECT_GAS, 0)
-TP_U(sim, liquidEqualize, TUNE_LIQUID_EQUALIZE, 2)
-TP_U(sim, liquidMinFilm, TUNE_LIQUID_MIN_FILM, 1)
-TP_U(sim, wanderHopMask, TUNE_WANDER_HOP_MASK, 7)
-TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900)
-TP_U(sim, expMicroLifeTicks, TUNE_EXP_MICRO_LIFE, 40)
-TP_U(sim, expMicroScaleIdx, TUNE_EXP_MICRO_SCALE_IDX, 2)
+TP_I(sim, partGravity, TUNE_PART_GRAVITY, 22, 0, 256)
+TP_I(sim, partMaxVel, TUNE_PART_MAX_VEL, 1536, 64, 8192)
+TP_I(sim, partBuoyMax, TUNE_PART_BUOY_MAX, 88, 0, 512)
+TP_I(sim, partSettleSpeed, TUNE_PART_SETTLE_SPEED, 24, 0, 256)
+TP_U(sim, partFloatPatience, TUNE_PART_FLOAT_PATIENCE, 180, 0, 1800)
+TP_I(sim, airDensity, TUNE_AIR_DENSITY, 10, 0, 2000)
+// A zero falloff makes every explosion reach the full residency window:
+// not a crash, but a guaranteed frame-time cliff and an unbounded emergent
+// process (CLAUDE.md rule 2). Clamp rather than trust the file.
+TP_I(sim, falloffPerCell, TUNE_FALLOFF_PER_CELL, 6, 1, 64)
+TP_U(sim, ejectSolid, TUNE_EJECT_SOLID, 250, 0, 1000)
+TP_U(sim, ejectLiquid, TUNE_EJECT_LIQUID, 500, 0, 1000)
+TP_U(sim, ejectPowder, TUNE_EJECT_POWDER, 350, 0, 1000)
+TP_U(sim, ejectGas, TUNE_EJECT_GAS, 0, 0, 1000)
+TP_U(sim, liquidEqualize, TUNE_LIQUID_EQUALIZE, 2, 1, 7)
+// 1 is "no floor" — the pre-WP5 halving, kept reachable as the A/B oracle.
+// The upper bound is 4 because the rule needs f >= 2*minFilm to split at
+// all, and a cell holds 8: past 4 no cell could ever spread into air and
+// water would stop advancing across a flat floor entirely.
+TP_U(sim, liquidMinFilm, TUNE_LIQUID_MIN_FILM, 1, 1, 4)
+TP_U(sim, wanderHopMask, TUNE_WANDER_HOP_MASK, 7, 0, 255)
+TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900, 0, 1000)
+// Both of these are packed into bit fields in Particle.flags; an
+// out-of-range value would wrap into the neighbouring field rather than
+// merely looking wrong, so clamp instead of trusting the file.
+TP_U(sim, expMicroLifeTicks, TUNE_EXP_MICRO_LIFE, 40, 1, 255)
+TP_U(sim, expMicroScaleIdx, TUNE_EXP_MICRO_SCALE_IDX, 2, 0, 3)
 // ---- MLS-MPM fluid, HUMAN units ----
 // These are floats in real units (voxels/s², voxels/s, vox²/s, seconds) —
 // the ONE deliberate exception to "sim.* is integer-only". The kernel still
@@ -612,24 +772,43 @@ TP_U(sim, expMicroScaleIdx, TUNE_EXP_MICRO_SCALE_IDX, 2)
 // also the fluid's terminal velocity (VMAX = 0.45*substeps cells/tick) and
 // the solver's whole per-tick price, so it is the one dial where the look and
 // the cost are the same number.
-TP_I(sim, fluidSubsteps, TUNE_FLUID_SUBSTEPS, 9)
-TP_F(sim, fluidStiffness, TUNE_FLUID_STIFFNESS, 14000.0f)
-TP_F(sim, fluidGravity, TUNE_FLUID_GRAVITY, 900.0f)
-TP_F(sim, fluidRestDensity, TUNE_FLUID_REST_DENSITY, 8.0f)
-TP_I(sim, fluidEosPower, TUNE_FLUID_EOS_POWER, 4)
-TP_F(sim, fluidCohesion, TUNE_FLUID_COHESION, 0.0f)
-TP_F(sim, fluidAttractSame, TUNE_FLUID_ATTRACT_SAME, 0.0f)
-TP_F(sim, fluidAttractDiff, TUNE_FLUID_ATTRACT_DIFF, 0.0f)
-TP_F(sim, fluidViscosity, TUNE_FLUID_VISCOSITY, 0.0f)
-TP_F(sim, fluidDamping, TUNE_FLUID_DAMPING, 0.0f)
-TP_F(sim, fluidFriction, TUNE_FLUID_FRICTION, 0.0f)
+// Substeps: the CFL budget and the solver's price. The 32 ceiling is the
+// pass-table/timer sanity bound (the substep table is recorded this many
+// times per tick); the 1 floor keeps every /FLUID_SUBSTEPS in the kernels
+// legal. Not warned against stiffness here — an under-budgeted stiffness
+// is legal, just clamped (FA_CLAMPED is the probe that says so).
+TP_I(sim, fluidSubsteps, TUNE_FLUID_SUBSTEPS, 9, 1, 32)
+// The float ranges below keep the CONVERTED values inside the ranges the
+// kernel's i32 overflow audit assumes — the human bound is the fixed-point
+// bound expressed in the human unit (x900 for per-tick² quantities, x30 for
+// per-tick). Out-of-range values would wrap i32 mid-kernel, not merely look
+// wrong, so the loader clamps rather than trusting the file.
+// 48 c²/t²
+TP_F(sim, fluidStiffness, TUNE_FLUID_STIFFNESS, 14000.0f, 0.0f, 43200.0f)
+// 2 c/t²
+TP_F(sim, fluidGravity, TUNE_FLUID_GRAVITY, 900.0f, 0.0f, 1800.0f)
+TP_F(sim, fluidRestDensity, TUNE_FLUID_REST_DENSITY, 8.0f, 1.0f, 32.0f)
+TP_I(sim, fluidEosPower, TUNE_FLUID_EOS_POWER, 4, 1, 7)
+// 16 c²/t²
+TP_F(sim, fluidCohesion, TUNE_FLUID_COHESION, 0.0f, 0.0f, 14400.0f)
+TP_F(sim, fluidAttractSame, TUNE_FLUID_ATTRACT_SAME, 0.0f, -7200.0f, 7200.0f)
+TP_F(sim, fluidAttractDiff, TUNE_FLUID_ATTRACT_DIFF, 0.0f, -7200.0f, 7200.0f)
+// 8 c²/t
+TP_F(sim, fluidViscosity, TUNE_FLUID_VISCOSITY, 0.0f, 0.0f, 240.0f)
+// <0.9/tick
+TP_F(sim, fluidDamping, TUNE_FLUID_DAMPING, 0.0f, 0.0f, 20.0f)
+// <0.9/tick
+TP_F(sim, fluidFriction, TUNE_FLUID_FRICTION, 0.0f, 0.0f, 20.0f)
 // Splash coupling: fast free-surface particles shed micro droplets into the
 // ballistic particle system (sim_fluid.wgsl g2p).
-TP_F(sim, fluidSplashRate, TUNE_FLUID_SPLASH_RATE, 4.0f)
-TP_F(sim, fluidSplashSpeed, TUNE_FLUID_SPLASH_SPEED, 18.0f)
-TP_F(sim, fluidSplashMaxDensity, TUNE_FLUID_SPLASH_MAXDENS, 0.7f)
-TP_F(sim, fluidSplashLife, TUNE_FLUID_SPLASH_LIFE, 1.1f)
-TP_U(sim, fluidSplashScaleIdx, TUNE_FLUID_SPLASH_SCALE_IDX, 2)
+// <=1/substep
+TP_F(sim, fluidSplashRate, TUNE_FLUID_SPLASH_RATE, 4.0f, 0.0f, 180.0f)
+// < VMAX
+TP_F(sim, fluidSplashSpeed, TUNE_FLUID_SPLASH_SPEED, 18.0f, 0.0f, 90.0f)
+TP_F(sim, fluidSplashMaxDensity, TUNE_FLUID_SPLASH_MAXDENS, 0.7f, 0.0f, 4.0f)
+// 255 ticks
+TP_F(sim, fluidSplashLife, TUNE_FLUID_SPLASH_LIFE, 1.1f, 0.05f, 8.5f)
+TP_U(sim, fluidSplashScaleIdx, TUNE_FLUID_SPLASH_SCALE_IDX, 2, 0, 3)
 // ---- diffuse material: spray / foam / bubbles (Ihmsen et al. 2012, CGI) ----
 // Three potentials, each mapped to 0..1 by the paper's clamping function
 //   Phi(I, tmin, tmax) = (min(I,tmax) - min(I,tmin)) / (tmax - tmin),
@@ -638,21 +817,36 @@ TP_U(sim, fluidSplashScaleIdx, TUNE_FLUID_SPLASH_SCALE_IDX, 2)
 // neighbourhood; wave crest is a convexity-gated curvature of the density
 // gradient; energy is the particle's kinetic energy. Thresholds are in the
 // natural unit of each measure so the tuner reads in vox/s and (vox/s)^2.
-TP_F(sim, fluidFoamRate, TUNE_FLUID_FOAM_RATE, 90.0f)
-TP_F(sim, fluidFoamCrestRate, TUNE_FLUID_FOAM_CREST_RATE, 120.0f)
-TP_F(sim, fluidTrappedMin, TUNE_FLUID_TRAPPED_MIN, 1.5f)
-TP_F(sim, fluidTrappedMax, TUNE_FLUID_TRAPPED_MAX, 11.0f)
-TP_F(sim, fluidCrestMin, TUNE_FLUID_CREST_MIN, 0.25f)
-TP_F(sim, fluidCrestMax, TUNE_FLUID_CREST_MAX, 2.0f)
-TP_F(sim, fluidFoamEnergyMin, TUNE_FLUID_FOAM_EMIN, 8.0f)
-TP_F(sim, fluidFoamEnergyMax, TUNE_FLUID_FOAM_EMAX, 260.0f)
-TP_F(sim, fluidFoamLife, TUNE_FLUID_FOAM_LIFE, 2.2f)
-TP_F(sim, fluidFoamLifeMin, TUNE_FLUID_FOAM_LIFE_MIN, 0.5f)
-TP_F(sim, fluidBubbleBuoyancy, TUNE_FLUID_BUBBLE_BUOY, 1.6f)
-TP_F(sim, fluidFoamDrag, TUNE_FLUID_FOAM_DRAG, 0.72f)
-TP_F(sim, fluidBubbleDensity, TUNE_FLUID_BUBBLE_RHO, 1.05f)
-TP_F(sim, fluidSprayDensity, TUNE_FLUID_SPRAY_RHO, 0.42f)
-TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3)
+// Diffuse material (spray/foam/bubbles). Same discipline as the splash
+// rows: these become Q16.16-per-tick constants and bit fields at shader
+// compile time, so an out-of-range value wraps i32 or bleeds into the
+// neighbouring flag field rather than merely looking wrong.
+// <=1/substep
+TP_F(sim, fluidFoamRate, TUNE_FLUID_FOAM_RATE, 90.0f, 0.0f, 180.0f)
+TP_F(sim, fluidFoamCrestRate, TUNE_FLUID_FOAM_CREST_RATE, 120.0f, 0.0f, 180.0f)
+// + a hand-written rule in LoadTuning
+TP_F(sim, fluidTrappedMin, TUNE_FLUID_TRAPPED_MIN, 1.5f, 0.0f, 400.0f)
+// + a hand-written rule in LoadTuning
+TP_F(sim, fluidTrappedMax, TUNE_FLUID_TRAPPED_MAX, 11.0f, 0.0f, 400.0f)
+// + a hand-written rule in LoadTuning
+TP_F(sim, fluidCrestMin, TUNE_FLUID_CREST_MIN, 0.25f, 0.0f, 64.0f)
+// + a hand-written rule in LoadTuning
+TP_F(sim, fluidCrestMax, TUNE_FLUID_CREST_MAX, 2.0f, 0.0f, 64.0f)
+// + a hand-written rule in LoadTuning
+TP_F(sim, fluidFoamEnergyMin, TUNE_FLUID_FOAM_EMIN, 8.0f, 0.0f, 8100.0f)
+// + a hand-written rule in LoadTuning
+TP_F(sim, fluidFoamEnergyMax, TUNE_FLUID_FOAM_EMAX, 260.0f, 0.0f, 8100.0f)
+// 255 ticks
+// + a hand-written rule in LoadTuning
+TP_F(sim, fluidFoamLife, TUNE_FLUID_FOAM_LIFE, 2.2f, 0.05f, 8.5f)
+// + a hand-written rule in LoadTuning
+TP_F(sim, fluidFoamLifeMin, TUNE_FLUID_FOAM_LIFE_MIN, 0.5f, 0.05f, 8.5f)
+TP_F(sim, fluidBubbleBuoyancy, TUNE_FLUID_BUBBLE_BUOY, 1.6f, -4.0f, 8.0f)
+// kd in 0..1
+TP_F(sim, fluidFoamDrag, TUNE_FLUID_FOAM_DRAG, 0.72f, 0.0f, 1.0f)
+TP_F(sim, fluidBubbleDensity, TUNE_FLUID_BUBBLE_RHO, 1.05f, 0.0f, 4.0f)
+TP_F(sim, fluidSprayDensity, TUNE_FLUID_SPRAY_RHO, 0.42f, 0.0f, 4.0f)
+TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3, 0, 3)
 // ---- MLS-MPM settle / excite seam ----
 // The CA <-> particle handover. Units: settle/wake speeds vox/s, settle
 // window in ticks, stain rate chances/s. exciteMode is a switch: 0 = the CA
@@ -665,21 +859,34 @@ TP_U(sim, fluidFoamScaleIdx, TUNE_FLUID_FOAM_SCALE_IDX, 3)
 // ever have live at once; the rate is how fast it may get there. Neither
 // applies to explicit spawns (the mpm tool, the lab pours) — pouring water is
 // something the player did, a lake exciting itself is not.
-TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 1)
-TP_I(sim, fluidExciteCeiling, TUNE_FLUID_EXCITE_CEILING, 8000)
-TP_I(sim, fluidExciteRate, TUNE_FLUID_EXCITE_RATE, 4096)
-TP_I(sim, fluidExcitePerch, TUNE_FLUID_EXCITE_PERCH, 0)
+// Settle/excite seam. Floats through the same clampWarnF discipline; the
+// int windows are open-coded like fluidEosPower. The settleTicks floor of
+// 8 is a HARD requirement — it covers the CPU-side page-materialization
+// readback latency (see tuning.h), so it clamps rather than warns-only.
+TP_I(sim, fluidExciteMode, TUNE_FLUID_EXCITE_MODE, 1, 0, 1)
+// The burst bound. 256 is the floor rather than 0 because a ceiling of
+// zero would silently turn excite off entirely — that is what
+// fluidExciteMode is for, and two ways to spell "off" is one too many.
+// The upper bound is the pool: a ceiling above kFluidCap is not a bound.
+TP_I(sim, fluidExciteCeiling, TUNE_FLUID_EXCITE_CEILING, 8000, 256, 262144)
+TP_I(sim, fluidExciteRate, TUNE_FLUID_EXCITE_RATE, 4096, 64, 262144)
+TP_I(sim, fluidExcitePerch, TUNE_FLUID_EXCITE_PERCH, 0, 0, 1)
 // exciteStep is the SURFACE-DISTURBANCE trigger, in whole cells: a body of
 // water whose surface stands this many cells proud of the water surface beside
 // it is a splash, not a pool, and goes to the solver so it lands with momentum
 // instead of relaxing in place. 0 disables it. Measured against the water
 // surface, so it is immune to the eighth-level shot noise a settle leaves.
-TP_I(sim, fluidExciteStep, TUNE_FLUID_EXCITE_STEP, 2)
+// 8 is the seam's own surface scan depth (SEAM_EX_STEP_SCAN); a step it
+// cannot see is a trigger that never fires, so the knob stops there.
+TP_I(sim, fluidExciteStep, TUNE_FLUID_EXCITE_STEP, 2, 0, 8)
 // How much of a SETTLED liquid cell's content the MPM grid carries as static
 // mass, as a fraction of rest density (1.0 = a full voxel reads exactly rest).
 // 0 restores the WP4 behaviour where the two representations pass through each
 // other. See the seeding block in sim_fluid.wgsl clearGrid.
-TP_F(sim, fluidSettledMass, TUNE_FLUID_SETTLED_MASS, 1.0f)
+// The WGSL side folds this to a Q8 scale (sim_fluid.wgsl
+// FLUID_SETTLED_Q8); past ~2 the static boundary out-pressures the fluid
+// and fires particles off a still pool.
+TP_F(sim, fluidSettledMass, TUNE_FLUID_SETTLED_MASS, 1.0f, 0.0f, 2.0f)
 // Does SUBMERGED settled liquid act as a boundary for MPM particles? The
 // static mass above puts a density STEP at the interface, which stops a slow
 // particle, but the field below it is flat rest with no depth profile — so a
@@ -687,10 +894,10 @@ TP_F(sim, fluidSettledMass, TUNE_FLUID_SETTLED_MASS, 1.0f)
 // the solver cannot see. A buried particle can never settle back (a submerged
 // column has no room by construction), so this is the termination fix, not a
 // cosmetic one. 0 is the control arm for `--sweep sim.fluidSubmergedSolid=0,1`.
-TP_I(sim, fluidSubmergedSolid, TUNE_FLUID_SUBMERGED_SOLID, 1)
-TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f)
-TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f)
-TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
+TP_I(sim, fluidSubmergedSolid, TUNE_FLUID_SUBMERGED_SOLID, 1, 0, 1)
+TP_F(sim, fluidSettleEps, TUNE_FLUID_SETTLE_EPS, 6.0f, 0.05f, 20.0f)
+TP_F(sim, fluidWakeSpeed, TUNE_FLUID_WAKE_SPEED, 24.0f, 0.1f, 50.0f)
+TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24, 8, 600)
 
 // ---- THE FORCE-SETTLE BACKSTOP (rule 2's termination guarantee) ------------
 // settleColumn walks its own 16 cells plus SETTLE_SPILL more, so a SUBMERGED
@@ -704,16 +911,21 @@ TP_I(sim, fluidSettleTicks, TUNE_FLUID_SETTLE_TICKS, 24)
 // The age must key on particle EXISTENCE, not on refusal: once submerged cells
 // can no longer excite, the stuck blocks are never CALM either, so they are
 // never picked and a refusal-triggered counter would never fire.
-TP_I(sim, fluidStuckTicks, TUNE_FLUID_STUCK_TICKS, 96)
+// The force-settle backstop. 0 is a legal value for stuckTicks — it is the
+// off switch — so the floor is 0, not the 8 fluidSettleTicks needs. The
+// ceiling on reach is what bounds the forced walk's write set, and the
+// block budget is capped at kFluidSettleMax because the forced picks share
+// settleScan's list with the calm ones.
+TP_I(sim, fluidStuckTicks, TUNE_FLUID_STUCK_TICKS, 96, 0, 6000)
 // Forced blocks per tick. Small on purpose: a forced walk's write set reaches
 // past SETTLE_SPILL, so forced picks take a stricter exclusion (no two may
 // share an (x,z) chunk column) and the budget bounds the drain rate.
-TP_I(sim, fluidForceBlocks, TUNE_FLUID_FORCE_BLOCKS, 4)
+TP_I(sim, fluidForceBlocks, TUNE_FLUID_FORCE_BLOCKS, 4, 0, kFluidSettleMax)
 // How many cells past the spill ceiling a forced walk may climb looking for
 // room. Buried mass belongs at the column's free surface; this bounds the
 // search. Exhausting it means a genuinely sealed column, which is counted
 // rather than silently retried.
-TP_I(sim, fluidForceReach, TUNE_FLUID_FORCE_REACH, 64)
+TP_I(sim, fluidForceReach, TUNE_FLUID_FORCE_REACH, 64, 0, 512)
 
 // ---- WATER BODIES (docs/PLAN_water_master.md, M1) ----
 // A still lake gets a NAME and a small record of aggregates, so that from M2
@@ -727,14 +939,22 @@ TP_I(sim, fluidForceReach, TUNE_FLUID_FORCE_REACH, 64)
 // The enter/exit pairs are deliberately far apart: a body parked on one
 // threshold would flip representation every tick, and every flip is a seam
 // crossing where mass can be lost.
-TP_I(sim, waterBodyMode, TUNE_WATER_BODY_MODE, 0)
-TP_I(sim, waterBodyMinVolume, TUNE_WATER_BODY_MIN_VOLUME, 65536)
-TP_I(sim, waterBodyExitVolume, TUNE_WATER_BODY_EXIT_VOLUME, 32768)
-TP_I(sim, waterBodySpreadEnter, TUNE_WATER_BODY_SPREAD_ENTER, 1)
-TP_I(sim, waterBodySpreadExit, TUNE_WATER_BODY_SPREAD_EXIT, 4)
-TP_I(sim, waterBodyQuietTicks, TUNE_WATER_BODY_QUIET_TICKS, 30)
-TP_I(sim, waterBodyMaxCount, TUNE_WATER_BODY_MAX_COUNT, 64)
-TP_I(sim, waterBodyTestDrain, TUNE_WATER_BODY_TEST_DRAIN, 0)
+// ---- water bodies (docs/PLAN_water_master.md) ----
+TP_I(sim, waterBodyMode, TUNE_WATER_BODY_MODE, 0, 0, 1)
+// + a hand-written rule in LoadTuning
+TP_I(sim, waterBodyMinVolume, TUNE_WATER_BODY_MIN_VOLUME, 65536, 0, 16777216)
+// + a hand-written rule in LoadTuning
+TP_I(sim, waterBodyExitVolume, TUNE_WATER_BODY_EXIT_VOLUME, 32768, 0, 16777216)
+// + a hand-written rule in LoadTuning
+TP_I(sim, waterBodySpreadEnter, TUNE_WATER_BODY_SPREAD_ENTER, 1, 0, 64)
+// + a hand-written rule in LoadTuning
+TP_I(sim, waterBodySpreadExit, TUNE_WATER_BODY_SPREAD_EXIT, 4, 1, 64)
+TP_I(sim, waterBodyQuietTicks, TUNE_WATER_BODY_QUIET_TICKS, 30, 0, 3600)
+// kWaterBodyCap (sim/waterbody.h) is the hard ceiling: from M2 the
+// descriptor array is a GPU layout, and a count past its end is not a
+// tuning mistake, it is an out-of-bounds write.
+TP_I(sim, waterBodyMaxCount, TUNE_WATER_BODY_MAX_COUNT, 64, 0, kWaterBodyCap)
+TP_I(sim, waterBodyTestDrain, TUNE_WATER_BODY_TEST_DRAIN, 0, 0, 65536)
 
 // ---- THE DISCHARGE LAW (component 6, M3) ----
 // A hole under a body of water is an orifice: Q = Cd * A * sqrt(2 g h). The
@@ -745,10 +965,24 @@ TP_I(sim, waterBodyTestDrain, TUNE_WATER_BODY_TEST_DRAIN, 0)
 // const-eval'd to fixed point at the top of sim_waterbody.wgsl by Tint under
 // IEEE-exact rules, so the kernel stays integer and bit-deterministic.
 // drainExciteRadius is component 7's v1 shell radius; 0 is an exact identity.
-TP_I(sim, drainMaxEighthsPerTick, TUNE_DRAIN_MAX_EIGHTHS, 512)
-TP_I(sim, drainExciteRadius, TUNE_DRAIN_EXCITE_RADIUS, 6)
-TP_F(sim, drainCd, TUNE_DRAIN_CD, 0.6f)
-TP_F(sim, drainGravity, TUNE_DRAIN_GRAVITY, 900.0f)
+// ---- the discharge law (component 6) -------------------------------
+// The rate cap is the rule-2 bound on the jet AND the size of the spawn-op
+// block the CPU reserves, so it is clamped to kWaterDrainOpsPerBody here
+// rather than in the kernel: an emission the block cannot hold would be a
+// debit with no particle behind it, which is exactly the mass pump plan §6
+// forbids. 0 turns the discharge off with no other effect.
+TP_I(sim, drainMaxEighthsPerTick, TUNE_DRAIN_MAX_EIGHTHS, 512, 0, kWaterDrainOpsPerBody)
+// Component 7's shell radius. Bounded because the shell is a DISC of cells
+// at the free surface plus a column: at r the surface term is ~pi*r^2 cells
+// of up to 8 eighths each, and plan §9 item 2 is that a violent drain's
+// solid-ball excite is ~33,000 particles against a ~40,000 envelope. 32
+// caps the disc at ~3,200 cells, which the 8,000 excite ceiling refuses
+// gracefully rather than converting the pool.
+TP_I(sim, drainExciteRadius, TUNE_DRAIN_EXCITE_RADIUS, 6, 0, 32)
+// Cd above 1 is not a discharge coefficient, it is a mass source. The
+// gravity bound is the fluid lane's, for the same fixed-point reason.
+TP_F(sim, drainCd, TUNE_DRAIN_CD, 0.6f, 0.0f, 1.0f)
+TP_F(sim, drainGravity, TUNE_DRAIN_GRAVITY, 900.0f, 0.0f, 4000.0f)
 
 // ---- RELEVEL (docs/PLAN_water_relevel.md W1) ----
 // The shave's mirror image: a disturbed body's columns relax toward the body's
@@ -761,9 +995,18 @@ TP_F(sim, drainGravity, TUNE_DRAIN_GRAVITY, 900.0f)
 // without W1, which is what `--sweep sim.waterRelevelMax=0,4` states.
 // waterRelevelDepth is clamped in the shader to world.h's
 // kWaterRelevelDepthMax, which is what the histogram block is sized from.
-TP_I(sim, waterRelevelMax, TUNE_WATER_RELEVEL_MAX, 4)
-TP_I(sim, waterRelevelGain, TUNE_WATER_RELEVEL_GAIN, 8)
-TP_I(sim, waterRelevelDepth, TUNE_WATER_RELEVEL_DEPTH, 32)
+// ---- relevel (docs/PLAN_water_relevel.md W1) ------------------------
+// The rate cap is a WHOLE VOXEL, for the shave's own reason (WB_MAX_STEPS):
+// a column that moves more than 8 eighths in a tick is not water finding
+// its level, it is a bulldozer, and the give branch cannot honour it
+// without emptying a second cell anyway. 0 is the identity arm.
+TP_I(sim, waterRelevelMax, TUNE_WATER_RELEVEL_MAX, 4, 0, 8)
+// A gain of 0 is a divide by zero in the kernel's k(s).
+TP_I(sim, waterRelevelGain, TUNE_WATER_RELEVEL_GAIN, 8, 1, 256)
+// Clamped to the ceiling the HISTOGRAM BLOCK is sized from (world.h's
+// kWaterRelevelDepthMax). Asking for more buckets than the buffer holds is
+// not an approximation, it is another body's block.
+TP_I(sim, waterRelevelDepth, TUNE_WATER_RELEVEL_DEPTH, 32, 0, kWaterRelevelDepthMax)
 
 // ---- SURFACE MOMENTUM (docs/PLAN_water_relevel.md W2) ----
 // The relevel relaxes and never overshoots. This is the overshoot: four
@@ -782,11 +1025,21 @@ TP_I(sim, waterRelevelDepth, TUNE_WATER_RELEVEL_DEPTH, 32)
 // the Q8 pipe magnitude a body must be strictly under to count as still, and
 // 256 is not a tolerance -- a pipe moves `q >> 8` whole eighths, so under 256
 // it moves nothing. A body sleeps after sim.fluidSettleTicks such ticks.
-TP_I(sim, waveMode, TUNE_WAVE_MODE, 0)
-TP_F(sim, waveGravity, TUNE_WAVE_GRAVITY, 98.0f)
-TP_I(sim, waveDepthCap, TUNE_WAVE_DEPTH_CAP, 10)
-TP_F(sim, waveDamping, TUNE_WAVE_DAMPING, 0.8f)
-TP_I(sim, waveSleepEps, TUNE_WAVE_SLEEP_EPS, 256)
+// + a hand-written rule in LoadTuning
+TP_I(sim, waveMode, TUNE_WAVE_MODE, 0, 0, 1)
+// A SANITY bound rather than the stability argument. The wave speed is
+// sqrt(g * depth) cells/tick and a reach-1 update cannot carry a ring
+// faster than one cell per tick; what actually holds that is the kernel's
+// own outflow clamp (a column may never give more than its top cell), so
+// these two only catch a typo rather than a physics error.
+TP_F(sim, waveGravity, TUNE_WAVE_GRAVITY, 98.0f, 0.0f, 4000.0f)
+TP_I(sim, waveDepthCap, TUNE_WAVE_DEPTH_CAP, 10, 1, 64)
+// Per SECOND, and 30 is one whole tick: a pipe that lost more than all of
+// its flux in a tick is "no momentum at all" written confusingly.
+TP_F(sim, waveDamping, TUNE_WAVE_DAMPING, 0.8f, 0.0f, 30.0f)
+// 0 is legal and means "never counts as still by itself", so the body
+// sleeps only once the relevel reports it flat. Negative is a typo.
+TP_I(sim, waveSleepEps, TUNE_WAVE_SLEEP_EPS, 256, 0, 4096)
 
 // ---- W3: WHAT DISTURBS THE SURFACE (docs/PLAN_water_relevel.md section 5) ----
 // Three sources, three knobs, each an identity at 0 and each independent of the
@@ -800,9 +1053,12 @@ TP_I(sim, waveSleepEps, TUNE_WAVE_SLEEP_EPS, 256)
 // for these two is the GATE, not the sweep (W-D learned the same lesson).
 // waveDrainSink IS a kernel const, because the sink is generated GPU-side from
 // WBS_EMIT -- a live discharge is a fact only the ledger knows.
-TP_I(sim, waveBlastImpulse, TUNE_WAVE_BLAST_IMPULSE, 3072)
-TP_I(sim, waveDrainSink, TUNE_WAVE_DRAIN_SINK, 1024)
-TP_I(sim, waveSwimWake, TUNE_WAVE_SWIM_WAKE, 512)
+// + a hand-written rule in LoadTuning
+TP_I(sim, waveBlastImpulse, TUNE_WAVE_BLAST_IMPULSE, 3072, 0, 65536)
+// + a hand-written rule in LoadTuning
+TP_I(sim, waveDrainSink, TUNE_WAVE_DRAIN_SINK, 1024, 0, 65536)
+// + a hand-written rule in LoadTuning
+TP_I(sim, waveSwimWake, TUNE_WAVE_SWIM_WAKE, 512, 0, 65536)
 
 // ---- DISCOVERY (docs/PLAN_water_relevel.md W-D) ----
 // A body the PLAYER created gets adopted; puddles stay CA at no cost. Both are
@@ -813,8 +1069,12 @@ TP_I(sim, waveSwimWake, TUNE_WAVE_SWIM_WAKE, 512)
 // waterDiscoverMinEighths is the off switch: at 0 no evidence is accumulated, no
 // probe is ever raised, no descriptor carries WBF_DISCOVER and the world is
 // bit-identical to a build without W-D.
-TP_I(sim, waterDiscoverMinEighths, TUNE_WATER_DISCOVER_MIN_EIGHTHS, 4096)
-TP_I(sim, waterAdoptMinArea, TUNE_WATER_ADOPT_MIN_AREA, 64)
+// W-D. A negative threshold would read as "off" by accident rather than on
+// purpose; 0 is the deliberate off switch and is left alone.
+TP_I(sim, waterDiscoverMinEighths, TUNE_WATER_DISCOVER_MIN_EIGHTHS, 4096, 0, 1000000)
+// A size gate of 0 adopts anything the volume threshold already let through,
+// which is a legal (if pointless) configuration; a negative one is a typo.
+TP_I(sim, waterAdoptMinArea, TUNE_WATER_ADOPT_MIN_AREA, 64, 0, 100000)
 
 // ---- wind COUPLING: how hard the field pushes the sim (research doc §4.5/4.6)
 // The SHAPE of the field is the wind.* group far above; this is what the three
@@ -825,26 +1085,45 @@ TP_I(sim, waterAdoptMinArea, TUNE_WATER_ADOPT_MIN_AREA, 64)
 // windMode is the gate and the only thing here that can move the world hash:
 // 0 off, 1 drift bias, 2 also settled-powder entrainment (kWindMode* in
 // world.h says what each promises about rule 2).
-TP_I(sim, windMode, TUNE_WIND_MODE, 1)
+// + a hand-written rule in LoadTuning
+TP_I(sim, windMode, TUNE_WIND_MODE, 1, kWindModeOff, kWindModeEntrain)
 // ---- gas particles (docs/PLAN_gas_particles.md) ----
 // The residency edge: 0 = WALL (what it was before stage 1 — a gas voxel that
 // wants out sheets along the top plane instead), 1 = SINK (it converts to a
 // parcel that keeps drifting outside the window). The gate, and the only thing
 // in this block that can move the world hash; at 0 no gas pass is recorded at
 // all, so it is an exact off switch and not a cheap path.
-TP_I(sim, gasMode, TUNE_GAS_MODE, 1)
-TP_F(sim, windDrag, TUNE_WIND_DRAG, 3.0f)
-TP_F(sim, windFluidGain, TUNE_WIND_FLUID_GAIN, 0.35f)
-TP_F(sim, windFluidMass, TUNE_WIND_FLUID_MASS, 0.5f)
-TP_F(sim, windDriftSpeed, TUNE_WIND_DRIFT_SPEED, 12.0f)
-TP_F(sim, windDriftMax, TUNE_WIND_DRIFT_MAX, 0.5f)
-TP_F(sim, windEntrainSpeed, TUNE_WIND_ENTRAIN_SPEED, 2.0f)
-TP_F(sim, windEntrainRate, TUNE_WIND_ENTRAIN_RATE, 6.0f)
+// Wind coupling. The gate first: an unknown mode must not fall through to
+// "some wind", because the whole hash argument for shipping this is that
+// mode 0 means literally no kernel reads the field.
+// The gas edge is a two-state gate; anything else is a typo, and silently
+// treating a 2 as "on" would hide the day someone means to add a mode.
+TP_I(sim, gasMode, TUNE_GAS_MODE, 1, kGasModeWall, kGasModeSink)
+// The rest are const-eval'd into integers by the kernels that read them
+// (sim_particle, sim_fluid, sim_step), so these bounds are the fixed-point
+// bounds written in the human unit — the same discipline as the fluid rows
+// above, and for the same reason: an out-of-range value wraps an i32
+// mid-kernel rather than merely looking wrong.
+TP_F(sim, windDrag, TUNE_WIND_DRAG, 3.0f, 0.0f, 30.0f)
+TP_F(sim, windFluidGain, TUNE_WIND_FLUID_GAIN, 0.35f, 0.0f, 4.0f)
+// The floor is not 0: a zero mass band would make the taper divide by
+// nothing, and "no node ever feels wind" is what windFluidGain 0 is for.
+TP_F(sim, windFluidMass, TUNE_WIND_FLUID_MASS, 0.5f, 0.02f, 4.0f)
+// A drift reference speed of 0 would make every breath of air a full-bias
+// gale, so the floor is a real wind rather than a nominal epsilon.
+TP_F(sim, windDriftSpeed, TUNE_WIND_DRIFT_SPEED, 12.0f, 0.5f, 200.0f)
+// Capped below 1: at 1.0 a moving voxel ALWAYS tries downwind first, which
+// removes the RNG order entirely and turns a gas into a conveyor belt.
+TP_F(sim, windDriftMax, TUNE_WIND_DRIFT_MAX, 0.5f, 0.0f, 0.95f)
+TP_F(sim, windEntrainSpeed, TUNE_WIND_ENTRAIN_SPEED, 2.0f, 0.5f, 200.0f)
+// Rate, not certainty (rule 2). 30/s is one hop per tick, which is the
+// most the substep gate can deliver anyway.
+TP_F(sim, windEntrainRate, TUNE_WIND_ENTRAIN_RATE, 6.0f, 0.0f, 30.0f)
 // ---- the CURRENT field's one sim coupling (PLAN_water_master.md comp 8)
 // The only current knob the SHADER reads. Everything else about the field is
 // resolved into primitives on the CPU, so this is the whole .def surface:
 // a human-unit rate const-eval'd into Q16-per-substep, the fluid lane's trick.
-TP_F(sim, currentDrag, TUNE_CURRENT_DRAG, 6.0f)
+TP_F(sim, currentDrag, TUNE_CURRENT_DRAG, 6.0f, 0.0f, 30.0f)
 
 // ---- worldgen: NOT KNOBS ANY MORE (P-G, docs/PLAN_environment_truth.md) ----
 // The terrain is the MAP's: assets/worldmap/<name>/map.json `terrain` (the
@@ -868,7 +1147,8 @@ TP_F(sim, currentDrag, TUNE_CURRENT_DRAG, 6.0f)
 // content: the analytic plant tracer costs per plant cell it can see, and
 // this is the one switch that removes every one of them. Terrain, water,
 // caves and ruins are untouched. MOVES THE WORLD HASH at 0.
-TP_U(debug, vegetation, TUNE_VEGETATION, 1)
+// + a hand-written rule in LoadTuning
+TP_U(debug, vegetation, TUNE_VEGETATION, 1, TP_OPEN, TP_OPEN)
 
 // THE GROUND-COVER SWITCH -- the SMALL half of the one above. 0 removes every
 // plant a body walks through and nothing else: the biome cover rows (tall
@@ -889,7 +1169,8 @@ TP_U(debug, vegetation, TUNE_VEGETATION, 1)
 // paid for either. IMPLIED OFF when vegetation is 0 -- GROUND_COVER in
 // worldgen.wgsl is the AND of the two, so the master stays the extreme end.
 // MOVES THE WORLD HASH at 0.
-TP_U(debug, groundCover, TUNE_GROUND_COVER, 1)
+// + a hand-written rule in LoadTuning
+TP_U(debug, groundCover, TUNE_GROUND_COVER, 1, TP_OPEN, TP_OPEN)
 
 // ---- oil / petroleum-like viscous liquids (shadeViscous) ----
 // Oil and blood share the viscous SURFACE path but look nothing alike, and the
@@ -901,78 +1182,970 @@ TP_U(debug, groundCover, TUNE_GROUND_COVER, 1)
 // Saturation band separating a biological fluid from a petroleum one. Blood's
 // authored colour0 is 0.85 saturated, oil's is 0.46 - pigment suspensions are
 // strongly chromatic, petroleum is a near-neutral brown-black.
-TP_F(render, oilSatLow, TUNE_OIL_SAT_LOW, 0.5f)
-TP_F(render, oilSatHigh, TUNE_OIL_SAT_HIGH, 0.78f)
+// ---- oil / petroleum-like viscous liquids ----
+// + a hand-written rule in LoadTuning
+TP_F(render, oilSatLow, TUNE_OIL_SAT_LOW, 0.50f, TP_OPEN, TP_OPEN)
+// + a hand-written rule in LoadTuning
+TP_F(render, oilSatHigh, TUNE_OIL_SAT_HIGH, 0.78f, TP_OPEN, TP_OPEN)
 // Head-on and grazing reflectance. Oil's IOR is ~1.47 against water's 1.33, so
 // F0 is roughly double, and unlike blood it really does approach a mirror at
 // the horizon - that hard bright rim is the look, not an artifact.
-TP_F(render, oilF0, TUNE_OIL_F0, 0.043f)
-TP_F(render, oilGraze, TUNE_OIL_GRAZE, 0.97f)
+TP_F(render, oilF0, TUNE_OIL_F0, 0.043f, TP_OPEN, TP_OPEN)
+TP_F(render, oilGraze, TUNE_OIL_GRAZE, 0.97f, TP_OPEN, TP_OPEN)
 // Specular exponent. Much tighter than blood's: a smooth film gives a small
 // hard glint where a rough suspension gives a broad soft one, and that
 // narrowness is most of what reads as "glossy" rather than "damp".
-TP_F(render, oilGloss, TUNE_OIL_GLOSS, 620.0f)
-TP_F(render, oilSheen, TUNE_OIL_SHEEN, 1.6f)
+// pow(x, e) with e <= 0 is 1 everywhere, which turns the specular lobe into
+// a full-screen white wash.
+TP_F(render, oilGloss, TUNE_OIL_GLOSS, 620.0f, 1.0f, TP_OPEN)
+TP_F(render, oilSheen, TUNE_OIL_SHEEN, 1.6f, TP_OPEN, TP_OPEN)
 // How much the reflection is tinted by the liquid's own colour. Near zero for
 // oil: a petroleum film is a near-NEUTRAL dark mirror, so what you see in it is
 // the sky and the far bank rather than a brown wash of its own body.
-TP_F(render, oilReflectTint, TUNE_OIL_REFLECT_TINT, 0.12f)
+TP_F(render, oilReflectTint, TUNE_OIL_REFLECT_TINT, 0.12f, TP_OPEN, TP_OPEN)
 // How far oil's body colour is pushed toward black. Petroleum absorbs nearly
 // everything that enters it and reflects the rest off the surface, the opposite
 // of blood's bright backscatter - this is the term that kills the beige.
-TP_F(render, oilDarken, TUNE_OIL_DARKEN, 0.35f)
+TP_F(render, oilDarken, TUNE_OIL_DARKEN, 0.35f, TP_OPEN, TP_OPEN)
 // Thin-film interference: the rainbow slick. Strength, and the spatial scale of
 // the film-thickness field that sets the band spacing.
-TP_F(render, oilIridescence, TUNE_OIL_IRIDESCENCE, 0.16f)
-TP_F(render, oilFilmScale, TUNE_OIL_FILM_SCALE, 1.1f)
+TP_F(render, oilIridescence, TUNE_OIL_IRIDESCENCE, 0.16f, TP_OPEN, TP_OPEN)
+// Divides into the band phase; zero makes the whole surface one flat colour.
+TP_F(render, oilFilmScale, TUNE_OIL_FILM_SCALE, 1.1f, 0.01f, TP_OPEN)
 // How readily a density difference counts as "floating on". The iridescent
 // sheen only appears where oil lies on a DENSER liquid (floatingOnLiquid);
 // this scales how much denser the layer below has to be before it reads as a
 // real boundary rather than a mixture. Oil 900 on water 1000 is a ratio of
 // 0.111, so at 9.0 that saturates immediately.
-TP_F(render, oilFloatSens, TUNE_OIL_FLOAT_SENS, 9.0f)
+TP_F(render, oilFloatSens, TUNE_OIL_FLOAT_SENS, 9.0f, 0.0f, TP_OPEN)
 // Width of the silhouette-softening band for oil, against blood's 0.28. Blood
 // can afford a wide feather because its body colour reads through the blend;
 // oil's body is nearly black by design, so the same fade leaves a droplet with
 // nothing to hold up against the background and it becomes a smear of the
 // scene behind it. This is most of why oil looked see-through.
-TP_F(render, oilEdgeBand, TUNE_OIL_EDGE_BAND, 0.07f)
+// A zero-width smoothstep band is a hard step, which puts the aliased cube
+// silhouette straight back; too wide and the droplet goes translucent,
+// which is the bug this parameter exists to fix.
+TP_F(render, oilEdgeBand, TUNE_OIL_EDGE_BAND, 0.07f, 0.01f, 0.5f)
 // How much plain sky reflection an UNPOOLED oil surface returns. A droplet is
 // a tiny curved mirror scattering the sky in every direction, so far less
 // reaches the eye than off a flat pool; at 1.0 a grazing droplet returns
 // full-brightness sky and reads as a hole in the world.
-TP_F(render, oilDropReflect, TUNE_OIL_DROP_REFLECT, 0.3f)
+TP_F(render, oilDropReflect, TUNE_OIL_DROP_REFLECT, 0.30f, 0.0f, 1.0f)
 
 // Faint directional glow toward the surface when submerged in a medium too
 // dense to see through. Without it a dense liquid is a featureless field of
 // colour with no sense of up and nothing in motion - physically honest, but it
 // reads as a broken shader rather than as being under the oil.
-TP_F(render, subMurkGlow, TUNE_SUB_MURK_GLOW, 2.2f)
+TP_F(render, subMurkGlow, TUNE_SUB_MURK_GLOW, 2.2f, 0.0f, TP_OPEN)
 
 // ---- clouds + weather (cloud.wgsl, src/sim/weather.h, DESIGN.md 9.w) ----
-TP_F(render, cloudShapeScaleM, TUNE_CLOUD_SHAPE_SCALE_M, 9000.0f)
-TP_F(render, cloudDetailScaleM, TUNE_CLOUD_DETAIL_SCALE_M, 700.0f)
-TP_F(render, cloudWeatherScaleM, TUNE_CLOUD_WEATHER_SCALE_M, 16000.0f)
-TP_F(render, cloudExtinction, TUNE_CLOUD_EXTINCTION, 0.045f)
-TP_F(render, cloudErosion, TUNE_CLOUD_EROSION, 0.45f)
-TP_U(render, cloudSteps, TUNE_CLOUD_STEPS, 64)
-TP_U(render, cloudLightSteps, TUNE_CLOUD_LIGHT_STEPS, 5)
-TP_F(render, cloudMaxDistM, TUNE_CLOUD_MAX_DIST_M, 45000.0f)
-TP_F(render, cloudHazeM, TUNE_CLOUD_HAZE_M, 32000.0f)
-TP_F(render, cloudPhaseG, TUNE_CLOUD_PHASE_G, 0.72f)
-TP_F(render, cloudMultiScatter, TUNE_CLOUD_MULTI_SCATTER, 0.5f)
-TP_F(render, cloudPowder, TUNE_CLOUD_POWDER, 0.7f)
-TP_F(render, cloudAmbient, TUNE_CLOUD_AMBIENT, 2.2f)
-TP_F(render, cloudSunGain, TUNE_CLOUD_SUN_GAIN, 1.0f)
-TP_F(render, cloudShadowStrength, TUNE_CLOUD_SHADOW_STRENGTH, 0.9f)
-TP_F(render, cloudRainDensity, TUNE_CLOUD_RAIN_DENSITY, 1.0f)
-TP_F(render, cloudRainStreaks, TUNE_CLOUD_RAIN_STREAKS, 1.0f)
-TP_F(render, cloudTemporal, TUNE_CLOUD_TEMPORAL, 0.12f)
-TP_U(render, cloudResDiv, TUNE_CLOUD_RES_DIV, 3)
-TP_F(render, cloudWindScale, TUNE_CLOUD_WIND_SCALE, 4.0f)
-TP_F(render, cloudWetDarken, TUNE_CLOUD_WET_DARKEN, 0.42f)
-TP_F(render, cloudRainbow, TUNE_CLOUD_RAINBOW, 1.0f)
-TP_F(render, cloudCirrusScaleM, TUNE_CLOUD_CIRRUS_SCALE_M, 7000.0f)
-TP_F(render, cloudFogMix, TUNE_CLOUD_FOG_MIX, 1.0f)
+// clouds (cloud.wgsl). Clamped to the tuner's ranges: a 0 scale divides
+// by zero in the march and a 0 step count marches nothing forever.
+TP_F(render, cloudShapeScaleM, TUNE_CLOUD_SHAPE_SCALE_M, 9000.0f, 1000.0f, 40000.0f)
+TP_F(render, cloudDetailScaleM, TUNE_CLOUD_DETAIL_SCALE_M, 700.0f, 50.0f, 5000.0f)
+TP_F(render, cloudWeatherScaleM, TUNE_CLOUD_WEATHER_SCALE_M, 16000.0f, 2000.0f, 100000.0f)
+TP_F(render, cloudExtinction, TUNE_CLOUD_EXTINCTION, 0.045f, 0.001f, 0.5f)
+TP_F(render, cloudErosion, TUNE_CLOUD_EROSION, 0.45f, 0.0f, 1.0f)
+TP_U(render, cloudSteps, TUNE_CLOUD_STEPS, 64, 8, 256)
+TP_U(render, cloudLightSteps, TUNE_CLOUD_LIGHT_STEPS, 5, 1, 12)
+TP_F(render, cloudMaxDistM, TUNE_CLOUD_MAX_DIST_M, 45000.0f, 2000.0f, 200000.0f)
+TP_F(render, cloudHazeM, TUNE_CLOUD_HAZE_M, 32000.0f, 1000.0f, 300000.0f)
+TP_F(render, cloudPhaseG, TUNE_CLOUD_PHASE_G, 0.72f, 0.0f, 0.95f)
+TP_F(render, cloudMultiScatter, TUNE_CLOUD_MULTI_SCATTER, 0.5f, 0.0f, 0.9f)
+TP_F(render, cloudPowder, TUNE_CLOUD_POWDER, 0.7f, 0.0f, 1.0f)
+TP_F(render, cloudAmbient, TUNE_CLOUD_AMBIENT, 2.2f, 0.0f, 10.0f)
+TP_F(render, cloudSunGain, TUNE_CLOUD_SUN_GAIN, 1.0f, 0.0f, 5.0f)
+TP_F(render, cloudShadowStrength, TUNE_CLOUD_SHADOW_STRENGTH, 0.9f, 0.0f, 1.0f)
+TP_F(render, cloudRainDensity, TUNE_CLOUD_RAIN_DENSITY, 1.0f, 0.0f, 10.0f)
+TP_F(render, cloudRainStreaks, TUNE_CLOUD_RAIN_STREAKS, 1.0f, 0.0f, 4.0f)
+TP_F(render, cloudTemporal, TUNE_CLOUD_TEMPORAL, 0.12f, 0.02f, 1.0f)
+TP_U(render, cloudResDiv, TUNE_CLOUD_RES_DIV, 3, 1, 8)
+TP_F(render, cloudWindScale, TUNE_CLOUD_WIND_SCALE, 4.0f, 0.0f, 40.0f)
+TP_F(render, cloudWetDarken, TUNE_CLOUD_WET_DARKEN, 0.42f, 0.0f, 0.9f)
+TP_F(render, cloudRainbow, TUNE_CLOUD_RAINBOW, 1.0f, 0.0f, 4.0f)
+TP_F(render, cloudCirrusScaleM, TUNE_CLOUD_CIRRUS_SCALE_M, 7000.0f, 500.0f, 50000.0f)
+TP_F(render, cloudFogMix, TUNE_CLOUD_FOG_MIX, 1.0f, 0.0f, 1.0f)
+
+
+
+// ==== player ====
+TP_S(player, model, NO_WGSL, "human")
+TP_F(player, flySpeed, NO_WGSL, 13.75f, 1.0f, 80.0f)
+TP_F(player, flySprint, NO_WGSL, 32.5f, 1.0f, 200.0f)
+TP_F(player, walkSpeed, NO_WGSL, 4.5f, 0.5f, 20.0f)
+TP_F(player, sprintSpeed, NO_WGSL, 8.0f, 0.5f, 30.0f)
+TP_F(player, gravity, NO_WGSL, 9.81f, 0.0f, 40.0f)
+TP_F(player, jumpSpeed, NO_WGSL, 5.25f, 0.0f, 15.0f)
+TP_F(player, swimUp, NO_WGSL, 17.5f, 0.0f, 60.0f)
+TP_F(player, swimDown, NO_WGSL, 7.5f, 0.0f, 60.0f)
+TP_F(player, maxFall, NO_WGSL, 30.0f, 1.0f, 120.0f)
+TP_F(player, fallDamageSpeed, NO_WGSL, 8.0f, 0.0f, 60.0f)
+TP_F(player, fallSplatSpeed, NO_WGSL, 25.0f, 1.0f, 120.0f)
+TP_F(player, fallDamageScale, NO_WGSL, 0.75f, 0.0f, 10.0f)
+TP_F(player, stepUp, NO_WGSL, 0.58f, 0.0f, 2.0f)
+TP_F(player, smoothBump, NO_WGSL, 0.12f, 0.0f, 1.0f)
+TP_F(player, stepSpeedPenaltyPerM, NO_WGSL, 2.8f, 0.0f, 10.0f)
+TP_F(player, minStepSpeedScale, NO_WGSL, 0.20f, 0.01f, 1.0f)
+TP_F(player, nonJumpSpeed, NO_WGSL, 0.5f, 0.0f, 5.0f)
+TP_F(player, coyoteTime, NO_WGSL, 0.12f, 0.0f, 0.5f)
+TP_F(player, jumpBufferTime, NO_WGSL, 0.12f, 0.0f, 0.5f)
+TP_F(player, jumpRepressTime, NO_WGSL, 0.3f, 0.0f, 1.0f)
+TP_F(player, groundAccel, NO_WGSL, 43.1f, 1.0f, 120.0f)
+TP_F(player, slipCoatStart, NO_WGSL, 0.15f, 0.0f, 1.0f)
+TP_F(player, slipCoatFull, NO_WGSL, 0.32f, 0.01f, 1.0f)
+TP_F(player, slipGrip, NO_WGSL, 0.035f, 0.01f, 1.0f)
+TP_F(player, airAccel, NO_WGSL, 6.2f, 0.0f, 60.0f)
+TP_F(player, liquidAccel, NO_WGSL, 16.3f, 0.1f, 60.0f)
+TP_F(player, liquidDrag, NO_WGSL, 8.3f, 0.0f, 40.0f)
+TP_F(player, liquidGravityScale, NO_WGSL, 0.25f, 0.0f, 1.0f)
+TP_F(player, liquidSpeedScale, NO_WGSL, 0.55f, 0.05f, 1.0f)
+TP_F(player, waterMantleSpeed, NO_WGSL, 4.5f, 0.0f, 20.0f)
+TP_F(player, waterMantleTime, NO_WGSL, 0.9f, 0.1f, 3.0f)
+TP_F(player, ledgeReach, NO_WGSL, 0.55f, 0.0f, 1.5f)
+TP_F(player, ledgeHangDrop, NO_WGSL, -0.15f, -0.5f, 1.0f)
+TP_F(player, ledgeBoostSpeed, NO_WGSL, 5.25f, 0.0f, 15.0f)
+TP_F(player, ledgeMantleSpeed, NO_WGSL, 1.5f, 0.1f, 20.0f)
+TP_F(player, ledgeMantleTime, NO_WGSL, 2.8f, 0.1f, 3.0f)
+TP_F(player, ledgeSettleSpeed, NO_WGSL, 4.5f, 0.1f, 20.0f)
+TP_F(player, ledgeShimmySpeed, NO_WGSL, 0.8f, 0.0f, 5.0f)
+TP_F(player, ledgePullDelay, NO_WGSL, 0.25f, 0.0f, 1.5f)
+TP_F(player, collisionWidth, NO_WGSL, 0.40f, 0.1f, 1.5f)
+TP_F(player, collisionHeight, NO_WGSL, 1.50f, 0.5f, 3.0f)
+TP_F(player, crouchHeight, NO_WGSL, 1.15f, 0.3f, 2.0f)
+TP_F(player, crouchSpeedScale, NO_WGSL, 0.5f, 0.1f, 1.0f)
+TP_F(player, crouchKneeDrop, NO_WGSL, 0.35f, 0.0f, 0.8f)
+TP_F(player, halfHeight, NO_WGSL, 0.85f, 0.2f, 3.0f)
+TP_F(player, eyeOffset, NO_WGSL, 0.65f, -1.0f, 2.0f)
+TP_F(player, viewSmoothHalflife, NO_WGSL, 0.10f, 0.0f, 0.4f)
+TP_F(player, unstickMaxDepth, NO_WGSL, 0.9f, 0.0f, 3.0f)
+TP_F(player, unstickSpeed, NO_WGSL, 3.0f, 0.1f, 20.0f)
+TP_F(player, grabHoldTime, NO_WGSL, 0.22f, 0.0f, 1.0f)
+TP_F(player, grabDistance, NO_WGSL, 2.0f, 0.5f, 6.0f)
+TP_F(player, grabFreeMass, NO_WGSL, 12.0f, 0.0f, 200.0f)
+// The grab's own clamps. `grabSlowMass` is a divisor (GrabHold::Weight)
+// and `grabMinSpeedScale` is the floor that keeps a carry from becoming a
+// standstill; both at zero is a division by zero and a softlock
+// respectively, and neither is a value anyone means to author.
+TP_F(player, grabSlowMass, NO_WGSL, 45.0f, 0.1f, 500.0f)
+TP_F(player, grabMaxMass, NO_WGSL, 400.0f, 0.0f, 5000.0f)
+TP_F(player, grabMinSpeedScale, NO_WGSL, 0.30f, 0.01f, 1.0f)
+TP_F(player, grabStiffness, NO_WGSL, 9.0f, 0.5f, 40.0f)
+TP_F(player, grabCarrySpeed, NO_WGSL, 9.0f, 0.5f, 40.0f)
+TP_F(player, grabBreakDistance, NO_WGSL, 2.5f, 0.2f, 10.0f)
+TP_F(player, grabSpinDamp, NO_WGSL, 0.80f, 0.0f, 1.0f)
+
+
+// ==== camera ====
+TP_F(camera, mouseSensitivity, NO_WGSL, 0.0022f, 0.0002f, 0.01f)
+TP_F(camera, fovY, NO_WGSL, 1.2f, 0.5f, 2.6f)
+TP_F(camera, pitchClamp, NO_WGSL, 1.55f, 0.5f, 1.5707f)
+// A scale of 0 would freeze the view while guarding, which reads as the
+// game having locked up rather than as a feel choice; above 1 it is a
+// speed-up, which is a legitimate thing to try, so only the floor is hard.
+TP_F(camera, meleeSensitivity, NO_WGSL, 0.5f, 0.05f, 2.0f)
+TP_F(camera, meleeSensHalflife, NO_WGSL, 0.08f, 0.0f, 1.0f)
+
+
+// ==== thirdPerson ====
+TP_F(thirdPerson, distance, NO_WGSL, 3.2f, 0.5f, 12.0f)
+TP_F(thirdPerson, shoulderDist, NO_WGSL, 1.7f, 0.3f, 6.0f)
+TP_F(thirdPerson, shoulderOffset, NO_WGSL, 0.55f, -2.0f, 2.0f)
+TP_F(thirdPerson, heightOffset, NO_WGSL, 0.25f, -1.0f, 2.0f)
+TP_F(thirdPerson, sideOffset, NO_WGSL, 0.0f, -2.0f, 2.0f)
+TP_F(thirdPerson, collideMargin, NO_WGSL, 0.35f, 0.0f, 1.5f)
+TP_F(thirdPerson, collideRadius, NO_WGSL, 0.25f, 0.0f, 1.0f)
+TP_B(thirdPerson, collide, NO_WGSL, true)
+TP_F(thirdPerson, focusHalflife, NO_WGSL, 0.06f, 0.0f, 0.5f)
+TP_F(thirdPerson, distInHalflife, NO_WGSL, 0.0f, 0.0f, 0.5f)
+TP_F(thirdPerson, distOutHalflife, NO_WGSL, 0.25f, 0.0f, 1.5f)
+TP_F(thirdPerson, pitchLift, NO_WGSL, 0.35f, 0.0f, 2.0f)
+TP_F(thirdPerson, stateFollow, NO_WGSL, 0.75f, 0.0f, 1.0f)
+TP_F(thirdPerson, speedFov, NO_WGSL, 0.06f, 0.0f, 0.4f)
+TP_F(thirdPerson, speedFovHalflife, NO_WGSL, 0.35f, 0.01f, 2.0f)
+TP_F(thirdPerson, zoomStep, NO_WGSL, 0.12f, 0.0f, 1.0f)
+// An inverted or degenerate range would let the wheel drive the boom to
+// zero (the camera inside the character) or past the far cascade. Clamped
+// rather than reported, because both ends have a defensible meaning and the
+// honest failure is a zoom that stops sooner than asked.
+// + a hand-written rule in LoadTuning
+TP_F(thirdPerson, zoomMin, NO_WGSL, 0.35f, 0.05f, 4.0f)
+// + a hand-written rule in LoadTuning
+TP_F(thirdPerson, zoomMax, NO_WGSL, 2.5f, 0.05f, 8.0f)
+
+
+// ==== gear ====
+TP_F(gear, ruinedCondition, NO_WGSL, 0.40f, 0.0f, 1.0f)
+TP_F(gear, cutHardnessRef, NO_WGSL, 8.0f, 0.0f, 64.0f)
+TP_F(gear, cutHardnessMin, NO_WGSL, 0.05f, 0.0f, 1.0f)
+// ---- trauma against a shell (game/impact.h) ----------------------------
+TP_F(gear, bluntDentRadius, NO_WGSL, 3.0f, 0.0f, 8.0f)
+TP_F(gear, bluntHardnessRef, NO_WGSL, 120.0f, 0.0f, 255.0f)
+TP_F(gear, bluntHardnessMin, NO_WGSL, 0.15f, 0.0f, 1.0f)
+// Above 1 would mean more energy reaching the body through a cuirass than
+// without one, which is not a balance choice -- it is a sign error.
+TP_F(gear, bluntThrough, NO_WGSL, 0.55f, 0.0f, 1.0f)
+TP_F(gear, bluntShellHp, NO_WGSL, 0.6f, 0.0f, 4.0f)
+TP_F(gear, biteOnShell, NO_WGSL, 0.3f, 0.0f, 1.0f)
+// + a hand-written rule in LoadTuning
+TP_F(gear, biteThroughSoft, NO_WGSL, 14.0f, 0.0f, 200.0f)
+// + a hand-written rule in LoadTuning
+TP_F(gear, biteThroughHard, NO_WGSL, 60.0f, 1.0f, 400.0f)
+
+
+// ==== avatar ====
+TP_B(avatar, enabled, NO_WGSL, true)
+TP_F(avatar, turnRate, NO_WGSL, 12.0f, 1.0f, 40.0f)
+TP_F(avatar, turnMinSpeed, NO_WGSL, 0.35f, 0.0f, 3.0f)
+TP_F(avatar, velocityHalflife, NO_WGSL, 0.08f, 0.0f, 0.5f)
+TP_F(avatar, firstPersonTurnHalflife, NO_WGSL, 0.05f, 0.0f, 0.3f)
+// 0 is meaningful (body always faces the camera, the old behaviour); the
+// ceiling stops a value that would let the head face backwards.
+// + a hand-written rule in LoadTuning
+TP_F(avatar, headLookYaw, NO_WGSL, 70.0f, 0.0f, 110.0f)
+// + a hand-written rule in LoadTuning
+TP_F(avatar, headLookReleaseYaw, NO_WGSL, 50.0f, 0.0f, 110.0f)
+TP_F(avatar, headLookPitchUp, NO_WGSL, 55.0f, 0.0f, 89.0f)
+TP_F(avatar, headLookPitchDown, NO_WGSL, 60.0f, 0.0f, 89.0f)
+TP_F(avatar, headLookSpine, NO_WGSL, 0.25f, 0.0f, 1.0f)
+TP_F(avatar, headLookHalflife, NO_WGSL, 0.07f, 0.0f, 1.0f)
+TP_F(avatar, headLookRecenterHalflife, NO_WGSL, 0.35f, 0.0f, 3.0f)
+TP_F(avatar, ikBlendHalflife, NO_WGSL, 0.08f, 0.0f, 0.4f)
+TP_F(avatar, airDebounce, NO_WGSL, 0.12f, 0.0f, 0.5f)
+TP_F(avatar, fallFlailDelay, NO_WGSL, 0.35f, 0.0f, 2.0f)
+TP_F(avatar, fallFlailRamp, NO_WGSL, 0.9f, 0.0f, 3.0f)
+TP_F(avatar, fallMinDrop, NO_WGSL, 1.2f, 0.0f, 6.0f)
+TP_B(avatar, airPose, NO_WGSL, true)
+// Floored rather than clamped to a range: these are DIVISORS of vel.y, so a
+// zero would make the pose phase infinite on the first airborne tick.
+TP_F(avatar, airPoseRiseSpeed, NO_WGSL, 5.25f, 0.1f, 20.0f)
+TP_F(avatar, airPoseFallSpeed, NO_WGSL, 9.0f, 0.1f, 40.0f)
+TP_F(avatar, airPoseLandHeight, NO_WGSL, 1.1f, 0.0f, 6.0f)
+TP_F(avatar, airPoseLean, NO_WGSL, 16.0f, 0.0f, 60.0f)
+TP_B(avatar, firstPersonArms, NO_WGSL, true)
+TP_F(avatar, firstPersonForward, NO_WGSL, 0.255f, 0.0f, 1.0f)
+TP_F(avatar, footTrim, NO_WGSL, 0.0f, -1.0f, 1.0f)
+TP_F(avatar, severImpulse, NO_WGSL, 6.0f, 0.0f, 40.0f)
+TP_F(avatar, respawnDelay, NO_WGSL, 3.0f, 0.0f, 20.0f)
+TP_B(avatar, keepKitOnTurn, NO_WGSL, true)
+
+
+// ==== audio ====
+TP_B(audio, enabled, NO_WGSL, true)
+TP_F(audio, masterVolume, NO_WGSL, 0.8f, 0.0f, 2.0f)
+TP_F(audio, footstepVolume, NO_WGSL, 0.85f, 0.0f, 2.0f)
+TP_F(audio, footstepRadius, NO_WGSL, 22.0f, 2.0f, 80.0f)
+TP_F(audio, footstepPitchJitter, NO_WGSL, 0.06f, 0.0f, 0.3f)
+TP_F(audio, footstepWalkGain, NO_WGSL, 0.55f, 0.0f, 2.0f)
+TP_F(audio, footstepSprintGain, NO_WGSL, 1.0f, 0.0f, 2.0f)
+TP_F(audio, footstepSprintSpeed, NO_WGSL, 7.0f, 1.0f, 20.0f)
+TP_F(audio, footstepFootDetune, NO_WGSL, 0.03f, 0.0f, 0.2f)
+TP_F(audio, landVolume, NO_WGSL, 1.0f, 0.0f, 2.0f)
+TP_F(audio, landFullSpeed, NO_WGSL, 12.0f, 1.0f, 40.0f)
+TP_F(audio, impactVolume, NO_WGSL, 0.9f, 0.0f, 2.0f)
+TP_F(audio, impactRadius, NO_WGSL, 30.0f, 2.0f, 120.0f)
+TP_F(audio, impactMinSpeed, NO_WGSL, 2.5f, 0.1f, 20.0f)
+TP_F(audio, impactFullSpeed, NO_WGSL, 14.0f, 1.0f, 60.0f)
+TP_F(audio, impactMinGap, NO_WGSL, 0.25f, 0.02f, 2.0f)
+TP_F(audio, breakVolume, NO_WGSL, 1.0f, 0.0f, 2.0f)
+TP_F(audio, breakRadius, NO_WGSL, 45.0f, 2.0f, 120.0f)
+// An octave of detune either way is already past the point where the
+// material stops sounding like itself; beyond that it is a bug, not taste.
+TP_F(audio, breakPitchSemitones, NO_WGSL, 5.0f, 0.0f, 12.0f)
+// Rates are clamped to what the resampler can do without turning a break
+// into a click or a drone.
+TP_F(audio, breakSmallRate, NO_WGSL, 1.25f, 0.25f, 4.0f)
+TP_F(audio, breakBigRate, NO_WGSL, 0.8f, 0.25f, 4.0f)
+// Guard the size mapping's divisor: a 0 here would make every break the
+// "big" pitch via a division by zero.
+TP_F(audio, breakBigVoxels, NO_WGSL, 400.0f, 1.0f, 4000.0f)
+TP_F(audio, mobVolume, NO_WGSL, 1.0f, 0.0f, 2.0f)
+TP_F(audio, mobRadius, NO_WGSL, 45.0f, 2.0f, 150.0f)
+TP_F(audio, mobPitchJitter, NO_WGSL, 0.07f, 0.0f, 0.3f)
+TP_F(audio, dismemberVolume, NO_WGSL, 1.0f, 0.0f, 2.0f)
+TP_F(audio, dismemberPitchJitter, NO_WGSL, 0.12f, 0.0f, 0.4f)
+TP_F(audio, bleedVolume, NO_WGSL, 0.9f, 0.0f, 2.0f)
+TP_F(audio, bleedRadius, NO_WGSL, 18.0f, 2.0f, 60.0f)
+// + a hand-written rule in LoadTuning
+TP_F(audio, bleedOnThreshold, NO_WGSL, 0.35f, 0.0f, 1.0f)
+// + a hand-written rule in LoadTuning
+TP_F(audio, bleedOffThreshold, NO_WGSL, 0.12f, 0.0f, 1.0f)
+TP_F(audio, ambienceVolume, NO_WGSL, 0.7f, 0.0f, 2.0f)
+TP_F(audio, ambienceRadius, NO_WGSL, 40.0f, 5.0f, 200.0f)
+TP_F(audio, nightVolume, NO_WGSL, 0.5f, 0.0f, 2.0f)
+TP_F(audio, nightRadius, NO_WGSL, 60.0f, 5.0f, 200.0f)
+TP_F(audio, nightChance, NO_WGSL, 0.08f, 0.0f, 1.0f)
+// A zero retry period would roll every frame, which is not "rare" at any
+// chance; a zero fade rate would leave the bed stuck silent forever.
+TP_F(audio, nightRetrySeconds, NO_WGSL, 60.0f, 1.0f, 600.0f)
+TP_F(audio, nightFadeRate, NO_WGSL, 0.004f, 0.0001f, 1.0f)
+TP_F(audio, reverbWet, NO_WGSL, 0.16f, 0.0f, 1.0f)
+TP_B(audio, occlusion, NO_WGSL, true)
+TP_F(audio, occlusionMaxDb, NO_WGSL, 24.0f, 0.0f, 60.0f)
+TP_F(audio, occlusionMinCutoffHz, NO_WGSL, 320.0f, 80.0f, 8000.0f)
+TP_F(audio, occlusionScale, NO_WGSL, 1.0f, 0.0f, 3.0f)
+TP_F(audio, occlusionCutoffScale, NO_WGSL, 1.0f, 0.1f, 8.0f)
+TP_F(audio, occlusionMaxRangeM, NO_WGSL, 40.0f, 5.0f, 120.0f)
+TP_F(audio, occlusionWetKeep, NO_WGSL, 0.7f, 0.0f, 1.0f)
+
+
+// ==== physics ====
+TP_F(physics, gravity, NO_WGSL, 9.81f, 0.0f, 40.0f)
+TP_I(physics, collisionSteps, NO_WGSL, 1, 1, 8)
+TP_F(physics, debrisFriction, NO_WGSL, 0.75f, 0.0f, 2.0f)
+TP_F(physics, debrisRestitution, NO_WGSL, 0.05f, 0.0f, 1.0f)
+TP_F(physics, debrisLinearDamping, NO_WGSL, 0.05f, 0.0f, 2.0f)
+TP_F(physics, debrisAngularDamping, NO_WGSL, 0.15f, 0.0f, 2.0f)
+TP_F(physics, waterLinearDrag, NO_WGSL, 0.8f, 0.0f, 4.0f)
+TP_F(physics, waterAngularDrag, NO_WGSL, 0.25f, 0.0f, 4.0f)
+TP_F(physics, terrainFriction, NO_WGSL, 0.85f, 0.0f, 2.0f)
+TP_F(physics, playerProxyFriction, NO_WGSL, 0.3f, 0.0f, 2.0f)
+TP_F(physics, explosionImpulseScale, NO_WGSL, 0.15f, 0.0f, 2.0f)
+TP_F(physics, explosionImpulseRadiusScale, NO_WGSL, 3.0f, 0.5f, 10.0f)
+TP_F(physics, explosionMaxSpeed, NO_WGSL, 30.0f, 5.0f, 200.0f)
+TP_F(physics, explosionBodyDamageScale, NO_WGSL, 1.0f, 0.0f, 4.0f)
+TP_F(physics, playerMassKg, NO_WGSL, 80.0f, 10.0f, 500.0f)
+TP_F(physics, creaturePhaseVox, NO_WGSL, 1.5f, 0.0f, 6.0f)
+TP_F(physics, creaturePushMaxVox, NO_WGSL, 0.35f, 0.0f, 8.0f)
+TP_F(physics, sphereFriction, NO_WGSL, 0.5f, 0.0f, 2.0f)
+TP_F(physics, sphereRestitution, NO_WGSL, 0.3f, 0.0f, 1.0f)
+TP_F(physics, sphereAngularDamping, NO_WGSL, 0.05f, 0.0f, 2.0f)
+
+
+// ==== debris ====
+TP_I(debris, minBodyVoxels, NO_WGSL, 8, 1, 200)
+TP_I(debris, minBurnFragmentVoxels, NO_WGSL, 24, 1, 400)
+TP_I(debris, maxNewBodiesPerTick, NO_WGSL, 4, 1, 32)
+TP_I(debris, settleAfterTicks, NO_WGSL, 60, 5, 600)
+TP_F(debris, alignCos, NO_WGSL, 0.94f, 0.5f, 0.9999f)
+TP_I(debris, maxBodies, NO_WGSL, 200, 8, 512)
+TP_I(debris, burnOpsPerTick, NO_WGSL, 384, 16, 4096)
+
+
+// ==== ragdoll ====
+TP_F(ragdoll, fallSeconds, NO_WGSL, 1.5f, 0.2f, 10.0f)
+TP_F(ragdoll, blastRadiusScale, NO_WGSL, 3.0f, 0.5f, 10.0f)
+TP_F(ragdoll, blastImpulseScale, NO_WGSL, 1.0f, 0.0f, 10.0f)
+TP_F(ragdoll, blastMinSpeed, NO_WGSL, 1.5f, 0.0f, 10.0f)
+TP_F(ragdoll, maxLaunchSpeed, NO_WGSL, 14.0f, 1.0f, 60.0f)
+TP_F(ragdoll, blastUpBias, NO_WGSL, 0.45f, 0.0f, 2.0f)
+TP_F(ragdoll, blastLimbBias, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_F(ragdoll, blastSpinGain, NO_WGSL, 0.65f, 0.0f, 2.0f)
+TP_F(ragdoll, blastMaxSpin, NO_WGSL, 8.0f, 0.0f, 30.0f)
+TP_F(ragdoll, minSeconds, NO_WGSL, 1.0f, 0.0f, 10.0f)
+TP_F(ragdoll, settleSpeed, NO_WGSL, 0.35f, 0.05f, 3.0f)
+TP_F(ragdoll, settleSeconds, NO_WGSL, 0.5f, 0.0f, 5.0f)
+TP_F(ragdoll, maxSeconds, NO_WGSL, 8.0f, 1.0f, 60.0f)
+TP_F(ragdoll, getUpSeconds, NO_WGSL, 1.5f, 0.1f, 6.0f)
+TP_F(ragdoll, getUpPitchDeg, NO_WGSL, 60.0f, 0.0f, 90.0f)
+TP_F(ragdoll, getUpDropFrac, NO_WGSL, 0.45f, 0.0f, 1.0f)
+TP_F(ragdoll, devSeconds, NO_WGSL, 3.0f, 0.5f, 30.0f)
+
+
+// ==== gore ====
+// Read order mirrors the banding in Tuning::Gore: micro spray first
+// (shared droplet properties, then bleed, then sever), whole-voxel blood
+// second, variance last.
+// ---- A. micro spray ----
+// The life field is 8 bits in Particle.flags (PMICRO_LIFE_MASK). A value
+// past 255 would wrap and produce droplets that die instantly, which reads
+// as "the spray stopped working" rather than as a bad number.
+TP_I(gore, microLifeTicks, NO_WGSL, 70, 1, 255)
+// + a hand-written rule in LoadTuning
+TP_I(gore, microScale, NO_WGSL, 4, 2, 6)
+TP_F(gore, bleedSprayPerDrip, NO_WGSL, 3.0f, 0.0f, 24.0f)
+TP_F(gore, bleedSpraySpeed, NO_WGSL, 3.5f, 0.0f, 30.0f)
+TP_F(gore, bleedSprayCone, NO_WGSL, 0.55f, 0.0f, 2.0f)
+TP_I(gore, severSpray, NO_WGSL, 220, 0, 2000)
+TP_I(gore, severDecayTicks, NO_WGSL, 45, 1, 300)
+TP_F(gore, severSpraySpeed, NO_WGSL, 9.0f, 0.0f, 40.0f)
+TP_F(gore, severSprayCone, NO_WGSL, 0.8f, 0.0f, 2.0f)
+// ---- B. whole-voxel blood ----
+TP_F(gore, bleedVoxelGain, NO_WGSL, 1.0f, 0.0f, 8.0f)
+// The cap is what bounds ONE wound's total output. Zero means a wound
+// never owes anything, i.e. drips are off; negative is meaningless.
+TP_F(gore, bleedBudgetCap, NO_WGSL, 120.0f, 0.0f, 600.0f)
+TP_F(gore, severStumpBudget, NO_WGSL, 40.0f, 0.0f, 400.0f)
+TP_F(gore, corpseBleedPerVoxel, NO_WGSL, 1.5f, 0.0f, 10.0f)
+TP_F(gore, corpseJointHold, NO_WGSL, 1.1f, 0.0f, 8.0f)
+TP_F(gore, corpseJointCut, NO_WGSL, 0.12f, 0.0f, 1.0f)
+// ---- whole-voxel bleeding bounds (rule 2) ----
+// The drip period and the op budget together cap how much real matter a
+// wound can push into the CA, so both need a hard floor/ceiling here
+// rather than a "should be sensible" comment. A period of 0 would drip
+// every tick AND divide nothing — it is the one value that turns a wound
+// into an unbounded fountain.
+TP_I(gore, bleedDripTicks, NO_WGSL, 4, 1, 60)
+// 64 is far above anything the look needs (six is the shipped value) and
+// still leaves the per-tick cell-op queue overwhelmingly free.
+TP_I(gore, bleedOpsPerTick, NO_WGSL, 6, 0, 64)
+// ---- clump size (rule 2) ----
+// 3 is the ceiling, not the shader's max brush radius of 7. A drip is a
+// REPEATING source: the sphere volume goes 1/7/33/123/257, so by radius 4
+// one wound is pushing a quarter of a chunk's worth of liquid per drip and
+// the CA cannot settle it between drips — the chunk stops sleeping, which
+// is a rule 2 failure that presents as a perf bug. The budget debit scales
+// with the same volume (BleedClumpVoxels), so a big clump empties a wound
+// proportionally faster rather than multiplying its total output.
+TP_I(gore, bleedClumpRadius, NO_WGSL, 0, 0, 3)
+TP_I(gore, severVoxels, NO_WGSL, 14, 0, 200)
+TP_F(gore, severVoxelSpeed, NO_WGSL, 6.0f, 0.0f, 30.0f)
+// A gobbet subdivides severVoxels rather than multiplying it, so the only
+// real bound needed is "at least one particle per gobbet". 64 is a sanity
+// ceiling: past it a gobbet exceeds any sane severVoxels and the throw
+// degenerates to a single lump.
+TP_I(gore, severGobbetVoxels, NO_WGSL, 1, 1, 64)
+TP_F(gore, severGobbetSpread, NO_WGSL, 0.6f, 0.0f, 4.0f)
+// ---- C. variance ----
+// A negative or zero gain would silently disable bleeding rather than
+// reading as a tuning mistake, so floor it just above zero.
+TP_F(gore, bleedGain, NO_WGSL, 1.0f, 0.0f, 8.0f)
+// ---- D. crater shape ----
+// 0 is a load-bearing value, not just the low end: the mob gate asserts
+// that carveChunkiness 0 removes byte-identically the same voxels the old
+// white-noise crater did. Clamping it here is what keeps that identity
+// reachable from a slider that has been dragged past the end.
+TP_F(gore, carveChunkiness, NO_WGSL, 0.65f, 0.0f, 1.0f)
+TP_F(gore, carveBlobSize, NO_WGSL, 3.5f, 0.5f, 12.0f)
+TP_F(gore, carveFalloff, NO_WGSL, 3.0f, 1.0f, 8.0f)
+// Each round is a full pass over the limb's voxels and can only ever
+// REMOVE, so an unbounded count is a way to erase a body one slider drag
+// at a time. Four is already past the point where more reads as different.
+TP_I(gore, carveSpallRounds, NO_WGSL, 2, 0, 4)
+// ---- E. the wound model (game/mob.h Mob::CutLimb) ----------------------
+// BOUNDS, not taste. Each of these is a value that turns the wound model
+// into something other than a wound model at the ends of its range, and
+// the tuner offers a text box as well as a slider.
+//
+// A negative depth or length is a kerf that removes nothing, which reads
+// as "the sword stopped working" rather than as a bad number; a huge one
+// is a swing that erases a limb, which is exactly the behaviour this whole
+// change exists to remove. woundHeftRef divides, so zero is a division by
+// zero dressed up as a slider.
+TP_F(gore, cutDepth, NO_WGSL, 0.08f, 0.0f, 8.0f)
+TP_F(gore, cutDepthPower, NO_WGSL, 0.32f, 0.0f, 8.0f)
+TP_F(gore, cutLength, NO_WGSL, 0.90f, 0.1f, 16.0f)
+TP_F(gore, cutWidth, NO_WGSL, 0.20f, 0.05f, 4.0f)
+TP_I(gore, cutSpallRounds, NO_WGSL, 1, 0, 4)
+TP_F(gore, cutSpallStrength, NO_WGSL, 0.30f, 0.0f, 1.0f)
+TP_F(gore, woundHeftRef, NO_WGSL, 5.3f, 0.01f, 60.0f)
+TP_F(gore, woundHeftMax, NO_WGSL, 4.0f, 1.0f, 32.0f)
+TP_F(gore, woundStainRadius, NO_WGSL, 0.90f, 0.0f, 16.0f)
+TP_F(gore, woundStainSurface, NO_WGSL, 0.90f, 0.0f, 1.0f)
+TP_F(gore, woundStainDensity, NO_WGSL, 0.30f, 0.0f, 1.0f)
+TP_F(gore, woundStainBlob, NO_WGSL, 0.5f, 0.25f, 16.0f)
+TP_F(gore, woundStainCoherence, NO_WGSL, 0.8f, 0.0f, 1.0f)
+TP_F(gore, craterStainRim, NO_WGSL, 1.5f, 0.0f, 16.0f)
+TP_B(gore, woundHeals, NO_WGSL, true)
+// A DIVISOR. Below 1 it would make a wound dry FASTER than the authored
+// rule, which is a different feature wearing this one's name; the ceiling
+// is where "slower" has become "never" anyway.
+TP_F(gore, woundHealSlow, NO_WGSL, 2.0f, 1.0f, 64.0f)
+TP_F(gore, stainCutRadius, NO_WGSL, 1.6f, 0.0f, 16.0f)
+TP_I(gore, stainCutAmount, NO_WGSL, 15, 0, 15)
+TP_I(gore, stainCutBuried, NO_WGSL, 6, 0, 15)
+TP_F(gore, stainCutBuriedChance, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_I(gore, stainBoneMin, NO_WGSL, 5, 0, 15)
+TP_F(gore, stainContactScale, NO_WGSL, 1.0f, 0.0f, 8.0f)
+TP_F(gore, stainFloorTransfer, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_I(gore, stainWashPerContact, NO_WGSL, 3, 0, 15)
+TP_F(gore, splatterReach, NO_WGSL, 48.0f, 0.0f, 256.0f)
+TP_I(gore, splatterAmount, NO_WGSL, 6, 0, 15)
+TP_I(gore, splatterPerLimb, NO_WGSL, 64, 0, 256)
+TP_F(gore, splatterSplatRadius, NO_WGSL, 0.3f, 0.0f, 2.0f)
+// A sever fraction of 0 severs on the first disconnected speck — that is
+// the straggler bug in Mob::CarveLimb wearing a slider — and 1 can never
+// fire at all. Both ends are excluded rather than merely discouraged.
+TP_F(gore, woundSeverFraction, NO_WGSL, 0.28f, 0.05f, 0.95f)
+TP_F(gore, woundNeckRadius, NO_WGSL, 0.80f, 0.0f, 16.0f)
+TP_F(gore, woundNeckFraction, NO_WGSL, 0.28f, 0.0f, 0.95f)
+TP_F(gore, woundImpactSeverScale, NO_WGSL, 4.0f, 0.0f, 20.0f)
+// ---- E6. trauma and teeth (game/impact.h) -------------------------------
+TP_F(gore, bruiseRadius, NO_WGSL, 0.9f, 0.0f, 8.0f)
+// The coat is a 0..15 nibble, so a step past it is a step to full opacity
+// in one blow -- legal, and what an author asking for 15 means.
+TP_F(gore, bruiseStep, NO_WGSL, 6.0f, 0.0f, 15.0f)
+TP_F(gore, bruiseMax, NO_WGSL, 12.0f, 0.0f, 15.0f)
+TP_F(gore, bruiseBleedChance, NO_WGSL, 0.55f, 0.0f, 1.0f)
+TP_F(gore, bruiseBleedFrom, NO_WGSL, 0.85f, 0.0f, 1.0f)
+// Non-negative only: 0 means "do not scale the step by hp at all", which is
+// the pre-2026-09-19 behaviour and the honest way to switch this off.
+TP_F(gore, bruiseHpRef, NO_WGSL, 16.0f, 0.0f, 64.0f)
+TP_F(gore, bruiseHpFloor, NO_WGSL, 0.45f, 0.0f, 1.0f)
+// BY NAME, not by id -- see Tuning::Gore::bruiseMat for why. An empty
+// string is legal and means "do not bruise"; an unknown name resolves to 0
+// at use and means the same thing, so there is nothing to clamp here.
+TP_S(gore, bruiseMat, NO_WGSL, "skin_bruised")
+TP_F(gore, bluntBleedScale, NO_WGSL, 0.1f, 0.0f, 1.0f)
+// Ceiling, not taste: a dent as wide as a limb stops being a dent and
+// becomes an amputation by arithmetic, which is the one thing a blunt hit
+// must never be (Mob::BluntCarveScope).
+TP_F(gore, bluntCarveRadius, NO_WGSL, 0.7f, 0.0f, 4.0f)
+TP_F(gore, pulpAmt, NO_WGSL, 8.0f, 1.0f, 15.0f)
+// 1 is legal and means "never": nothing short of a wholly bloodied core
+// earns a dent, and a core is never wholly anything because of the taper.
+TP_F(gore, pulpCarveFrom, NO_WGSL, 0.3f, 0.0f, 1.0f)
+TP_F(gore, pulpRotRate, NO_WGSL, 1.5f, 0.0f, 20.0f)
+TP_F(gore, unarmedBruiseRadius, NO_WGSL, -1.0f, -1.0f, 8.0f)
+TP_F(gore, unarmedBruiseStep, NO_WGSL, -1.0f, -1.0f, 15.0f)
+TP_F(gore, unarmedBleedChance, NO_WGSL, -1.0f, -1.0f, 1.0f)
+TP_F(gore, unarmedBleedScale, NO_WGSL, -1.0f, -1.0f, 1.0f)
+TP_F(gore, unarmedCarveRadius, NO_WGSL, -1.0f, -1.0f, 4.0f)
+TP_F(gore, unarmedPulpCarveFrom, NO_WGSL, -1.0f, -1.0f, 1.0f)
+TP_F(gore, biteRadius, NO_WGSL, 0.45f, 0.0f, 8.0f)
+// Floored at the same 0.5 the crater's and rot's blob sizes are: below one
+// lattice cell the correlated field degenerates to white noise and the
+// tear goes back to being speckle (see ValueNoise3).
+TP_F(gore, biteBlob, NO_WGSL, 2.5f, 0.5f, 12.0f)
+TP_F(gore, biteStainScale, NO_WGSL, 1.5f, 0.0f, 8.0f)
+// Floored at 1 for the reason woundHealSlow is: a divisor below 1 would
+// make rot decay FASTER than the puddle rule it is dividing, and 0 is a
+// division by zero rather than "never heals" (that is `woundHeals` off).
+TP_F(gore, infectHealSlow, NO_WGSL, 6.0f, 1.0f, 512.0f)
+// Ceilings rather than taste, and the same one for both: a rate past a
+// human body's worth of voxels a minute stops being a disease and becomes a
+// dissolve, and the pass's per-burst work scales with it. 0 is meaningful on
+// either (see the note in tuning.h) so neither has a floor above it.
+TP_F(gore, infectSpreadRate, NO_WGSL, 1.0f, 0.0f, 240.0f)
+TP_F(gore, infectRotRate, NO_WGSL, 0.5f, 0.0f, 240.0f)
+TP_F(gore, infectMobMult, NO_WGSL, 1.0f, 0.0f, 50.0f)
+// The coat the rot lays on the bone it uncovers. All three are cosmetic
+// and all three are meaningful at their floor: 0 stain = white bone back,
+// 0 vary = one flat shade, 0 ichor = the victim's blood only.
+TP_F(gore, infectBoneStain, NO_WGSL, 11.0f, 0.0f, 15.0f)
+TP_F(gore, infectBoneStainVary, NO_WGSL, 5.0f, 0.0f, 15.0f)
+TP_F(gore, infectBoneIchor, NO_WGSL, 0.45f, 0.0f, 1.0f)
+TP_F(gore, brainHpPerVoxel, NO_WGSL, 10.0f, 0.0f, 200.0f)
+// ---- F. blood is health / G. burns cap health (game/mob.h) -------------
+// A negative rate would make bleeding HEAL, which is not a tuning
+// mistake anyone means; zero is a legitimate "blood is cosmetic again".
+TP_F(gore, bleedHpPerVoxel, NO_WGSL, 0.6f, 0.0f, 5.0f)
+TP_B(gore, stumpBleedsOpen, NO_WGSL, true)
+// + a hand-written rule in LoadTuning
+TP_F(gore, burnCapMidFraction, NO_WGSL, 0.40f, 0.05f, 0.95f)
+TP_F(gore, burnCapMidHealth, NO_WGSL, 0.333f, 0.0f, 1.0f)
+// The burn curve must stay a curve: the mid knot strictly inside (0,
+// death), the death knot at most 1 (a body cannot be more than all
+// burnt), and the mid health inside [0, 1] so the cap is monotone.
+// + a hand-written rule in LoadTuning
+TP_F(gore, burnDeathFraction, NO_WGSL, 0.70f, 0.05f, 1.0f)
+
+
+// ==== coat ====
+// ---- coats: a substance on a body (Tuning::Coat) --------------------------
+// CPU-only, like `gore` above. The per-SUBSTANCE half of this feature is in
+// materials.json ("coat": { decay, shed, effects }); these are the engine's
+// cadences and budgets over it.
+// A recount period of 0 would retake the ledger every tick a body is
+// dirty, which is one full lattice pass per creature per tick — the rule 2
+// trap this cadence exists to close.
+TP_I(coat, recountTicks, NO_WGSL, 8, 1, 240)
+// decayScale DIVIDES the authored seconds, so 0 is a division by zero
+// dressed up as "nothing ever dries" — say that with a small number.
+// 300 is not arbitrary: it is what turns blood's authored 20 s per level
+// into a two-tick period, which is the `body-coat` gate's fast arm and the
+// fastest anything here is meant to be dialled.
+TP_F(coat, decayScale, NO_WGSL, 1.0f, 0.01f, 300.0f)
+TP_F(coat, sunDryScale, NO_WGSL, 2.0f, 1.0f, 20.0f)
+TP_F(coat, fireDrySeconds, NO_WGSL, 2.0f, 0.05f, 120.0f)
+TP_I(coat, shedCells, NO_WGSL, 3, 0, 32)
+TP_I(coat, shedPerTick, NO_WGSL, 64, 0, 1024)
+TP_I(coat, shedAmount, NO_WGSL, 2, 0, 15)
+TP_F(coat, hudMinFrac, NO_WGSL, 0.02f, 0.0f, 1.0f)
+
+
+// ==== melee ====
+// ---- BOUNDS, not taste ---------------------------------------------------
+// Every clamp here protects a STRUCTURAL property of the stroke rather than
+// an opinion about how it should feel, and each one is a thing a slider
+// dragged to its end can otherwise break outright:
+//
+//   * a zero or negative time divides in SlashProgress and in the phase
+//     machine's own normalisation;
+//   * a zero speed BAND makes the damage ramp `(v - min) / (full - min)`
+//     singular, and the sweep's own `max(..., 1e-3f)` would then quietly
+//     turn every touch into a full-power hit;
+//   * a smoothing halflife of 0 is a step function, which is what the lean
+//     plane's rate limit exists to avoid (melee.h: the interpolation
+//     between two opposite leans passes through the degenerate radius);
+//   * an aim gain of 0 disconnects the mouse, which reads as a hung game
+//     rather than as a setting.
+TP_F(melee, commitSpeed, NO_WGSL, 900.0f, 1.0f, 3000.0f)
+TP_F(melee, slashTime, NO_WGSL, 0.17f, 0.02f, 2.0f)
+TP_F(melee, recoverTime, NO_WGSL, 0.22f, 0.02f, 2.0f)
+// + a hand-written rule in LoadTuning
+TP_F(melee, fullSpeedMps, NO_WGSL, 20.0f, 0.05f, 60.0f)
+// + a hand-written rule in LoadTuning
+TP_F(melee, minSpeedMps, NO_WGSL, 0.9f, 0.0f, 60.0f)
+TP_F(melee, aimGainX, NO_WGSL, 0.0050f, 0.0002f, 0.10f)
+TP_F(melee, aimGainY, NO_WGSL, 0.0067f, 0.0002f, 0.10f)
+TP_F(melee, reachGainM, NO_WGSL, 0.0030f, 0.0f, 0.2f)
+// The azimuth stops are asymmetric because an arm is (melee.h), but both
+// have to leave a window the seed can live in: a walk cycle parks the
+// weapon arm near the bottom of the elevation range, and a window that
+// could not represent it would move the blade on the take-over tick — the
+// one thing the whole design forbids.
+TP_F(melee, azOut, NO_WGSL, 1.83f, 0.20f, 3.10f)
+TP_F(melee, azAcross, NO_WGSL, 1.40f, 0.20f, 3.10f)
+TP_F(melee, elMin, NO_WGSL, -1.50f, -1.55f, -0.10f)
+TP_F(melee, elMax, NO_WGSL, 1.48f, 0.10f, 1.55f)
+TP_F(melee, handExtend, NO_WGSL, 0.78f, 0.15f, 1.0f)
+TP_F(melee, extendSmoothing, NO_WGSL, 0.18f, 0.005f, 2.0f)
+TP_F(melee, leanTurnRate, NO_WGSL, 18.0f, 0.5f, 120.0f)
+// + a hand-written rule in LoadTuning
+TP_F(melee, handLead, NO_WGSL, 1.0f, -1.0f, 1.0f)
+TP_F(melee, fallbackReachM, NO_WGSL, 0.60f, 0.05f, 4.0f)
+// Strictly under 1: a fully straight two-bone chain is a locked elbow, and
+// AnimSolveTwoBone clamps to its own annulus anyway — a target outside the
+// reach costs mouse travel to wind back before the arm visibly moves, which
+// is exactly the "the input went dead" feel integration exists to avoid.
+TP_F(melee, reachFraction, NO_WGSL, 0.94f, 0.20f, 0.99f)
+TP_F(melee, guardForwardM, NO_WGSL, 0.22f, -2.0f, 2.0f)
+TP_F(melee, guardUpM, NO_WGSL, 0.26f, -2.0f, 2.0f)
+TP_F(melee, guardSideM, NO_WGSL, 0.16f, -2.0f, 2.0f)
+TP_F(melee, dirSmoothing, NO_WGSL, 0.06f, 0.005f, 1.0f)
+TP_F(melee, swingArc, NO_WGSL, 2.0f, 0.0f, 3.10f)
+TP_F(melee, swingAnticipate, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_F(melee, swingExtend, NO_WGSL, 0.16f, 0.0f, 1.0f)
+TP_F(melee, bladeSmoothing, NO_WGSL, 0.055f, 0.005f, 1.0f)
+// Past ~pi the "wrist" is a ball joint and the fist can end up facing
+// backwards down its own arm (game/mob.cpp applies this as a slerp limit).
+TP_F(melee, wristMaxAngle, NO_WGSL, 3.10f, 0.0f, 3.14f)
+// ---- THE STEER RAMP, and what each bound is protecting -------------------
+//
+//   * the two speeds are a BAND, so an inverted or zero-width one makes the
+//     ramp `(v - lo) / (hi - lo)` singular. `steerSpeedHiMps` is pushed
+//     above the low end rather than the pair being swapped: the low end is
+//     the one a player tunes ("how still is still?") and swapping would
+//     silently redefine the knob they just dragged.
+//   * steerFloor at 1 disables the ramp entirely and restores the previous
+//     always-align behaviour, which is a legitimate setting and the A/B for
+//     the whole change. 0 is legitimate too: a guard that shares nothing
+//     with the stroke.
+// + a hand-written rule in LoadTuning
+TP_F(melee, steerSpeedLoMps, NO_WGSL, 0.6f, 0.0f, 20.0f)
+// + a hand-written rule in LoadTuning
+TP_F(melee, steerSpeedHiMps, NO_WGSL, 3.0f, 0.0f, 40.0f)
+TP_F(melee, steerFloor, NO_WGSL, 0.15f, 0.0f, 1.0f)
+// ---- PER-JOINT SMOOTHING + THE HAND'S FRONTAL PLANE ---------------------
+// Halflives: 0 is a legitimate off switch (SmoothAlpha returns 1); the
+// ceilings only stop a fat-fingered "2" from turning the arm into taffy.
+// handBackFrac at 0 pins the hand to the plane exactly; past ~0.5 the
+// clamp stops meaning "in front" at all.
+TP_F(melee, armSmoothing, NO_WGSL, 0.04f, 0.0f, 1.0f)
+TP_F(melee, wristSmoothing, NO_WGSL, 0.10f, 0.0f, 1.0f)
+TP_F(melee, handBackFrac, NO_WGSL, 0.05f, 0.0f, 0.5f)
+// ---- THE ELBOW/SHOULDER CONES -------------------------------------------
+// Both are half-angles, so pi is "unbounded" and restores the old free
+// behaviour for an A/B. The floors are not zero: a cone of exactly 0 pins
+// the bend plane to the authored one, which is a stiff arm rather than a
+// wrong one, and is worth being able to ask for — but a NEGATIVE one would
+// make `acos(c) > cone` true on every tick including the aligned case.
+TP_F(melee, elbowPoleCone, NO_WGSL, 1.75f, 0.05f, 3.14f)
+TP_F(melee, elbowAxisCone, NO_WGSL, 3.14f, 0.0f, 3.14f)
+TP_F(melee, edgeFloor, NO_WGSL, 0.35f, 0.0f, 1.0f)
+// ---- THE BLOCK KNOBS, and what each clamp is protecting ------------------
+//
+//   * blockGapM is the slack in the segment-vs-segment test. NEGATIVE would
+//     mean the two blades must overlap to register, which no real pair of
+//     sweeps does, and a parry that can never fire is indistinguishable
+//     from the feature being absent. The ceiling is the other failure and
+//     the more insidious one: a gap of half a metre parries blows that
+//     passed a foot from the defender's blade, which reads as "the AI is
+//     invincible" rather than as a bad number.
+//   * blockItemDamage above 1 makes the blocking weapon take MORE than the
+//     blow carried, so parrying is worse than being cut, which inverts the
+//     mechanic. 0 is allowed on purpose — a world where blades never wear.
+//   * the two nudges are radians of stroke angle at full power, applied
+//     every parry. Past ~1 rad a single block spins the defender's guard
+//     most of the way across its own azimuth stops, and a fast exchange
+//     turns into the guard oscillating instead of guarding. 0 is allowed:
+//     that is "blocking is free", a legitimate setting, not a broken one.
+TP_F(melee, blockGapM, NO_WGSL, 0.22f, 0.0f, 0.5f)
+TP_F(melee, blockItemDamage, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_F(melee, blockNudgeAz, NO_WGSL, 0.30f, 0.0f, 1.0f)
+TP_F(melee, blockNudgeEl, NO_WGSL, 0.18f, 0.0f, 1.0f)
+// An out-of-range mode is a typo, not a request: clamp to the two that
+// exist so nothing downstream needs a default arm (handLead's convention).
+TP_I(melee, controlMode, NO_WGSL, 0, 0, 1)
+TP_F(melee, pickMinSpeed, NO_WGSL, 250.0f, 1.0f, 1500.0f)
+// 180 is meaningful: the swing follows the camera wherever it looks (the
+// pre-cone behaviour). 0 pins every swing to the body's facing.
+// + a hand-written rule in LoadTuning
+TP_F(melee, aimYaw, NO_WGSL, 70.0f, 0.0f, 180.0f)
+// + a hand-written rule in LoadTuning
+TP_F(melee, aimReleaseYaw, NO_WGSL, 50.0f, 0.0f, 110.0f)
+TP_F(melee, torsoShare, NO_WGSL, 0.35f, 0.0f, 1.0f)
+TP_F(melee, torsoPitch, NO_WGSL, 0.20f, 0.0f, 1.0f)
+TP_F(melee, headClearM, NO_WGSL, 0.06f, 0.0f, 0.5f)
+// Past half a metre the capsule is wider than the arm can reach round and
+// the stroke is pinned at the stop; 0 is the off switch and is legal.
+TP_F(melee, bodyClearM, NO_WGSL, 0.05f, 0.0f, 0.5f)
+// 0 pins the lean plane outright; pi is "never treat a turn as a
+// reversal", which is the old behaviour and the one-JSON-edit A/B.
+TP_F(melee, leanFlipHold, NO_WGSL, 3.14f, 0.0f, 3.15f)
+TP_F(melee, leanMinSpeed, NO_WGSL, 0.05f, 0.0f, 5.0f)
+// Past ~0.95 the roll would never be recomputed at all, which is a blade
+// whose edge stops leading the cut.
+TP_F(melee, flatMinSin, NO_WGSL, 0.20f, 0.0f, 0.95f)
+
+
+// ==== combatfx ====
+// ---- combat feel: hit-stop, hit flash, combat cues ------------------------
+TP_B(combatfx, hitStop, NO_WGSL, true)
+// ---- BOUNDS ---------------------------------------------------------------
+// THE DIP MAY NOT REACH ZERO AND MAY NOT LAST. A scale of 0 stops the tick
+// accumulator filling at all, which is a hang the player cannot get out of
+// by any input, since every input is consumed inside the tick loop. A
+// duration in whole seconds is the same hang with a timer on it. 0.02 and
+// 400 ms are both well past anything that reads as impact and comfortably
+// short of anything that reads as broken.
+TP_F(combatfx, hitStopChipScale, NO_WGSL, 0.45f, 0.02f, 1.0f)
+TP_F(combatfx, hitStopChipMs, NO_WGSL, 55.0f, 0.0f, 400.0f)
+TP_F(combatfx, hitStopFleshScale, NO_WGSL, 0.22f, 0.02f, 1.0f)
+TP_F(combatfx, hitStopFleshMs, NO_WGSL, 95.0f, 0.0f, 400.0f)
+TP_F(combatfx, hitStopSeverScale, NO_WGSL, 0.10f, 0.02f, 1.0f)
+TP_F(combatfx, hitStopSeverMs, NO_WGSL, 33.0f, 0.0f, 400.0f)
+// The flash is added to a LINEAR HDR colour before the tonemap. Past about
+// 4 the tonemap has nothing left to give and every tier looks identical, so
+// the ceiling is where the knob stops doing anything rather than where it
+// starts looking bad.
+TP_F(combatfx, flashChip, NO_WGSL, 0.35f, 0.0f, 4.0f)
+TP_F(combatfx, flashFlesh, NO_WGSL, 0.85f, 0.0f, 4.0f)
+TP_F(combatfx, flashSever, NO_WGSL, 1.60f, 0.0f, 4.0f)
+// A zero halflife would never decay (the per-frame factor is
+// exp2(-dt/halflife), which is 0/0 at 0), leaving every struck limb lit for
+// the rest of the session.
+TP_F(combatfx, flashHalflife, NO_WGSL, 0.075f, 0.01f, 2.0f)
+TP_B(combatfx, hitReact, NO_WGSL, true)
+// THE REACTION IS SLIGHT BY CONSTRUCTION, and these are the numbers that
+// say so. 25 degrees of lean or a fifth of a body height of shove is no
+// longer a flinch — it is a stagger, which is a different feature with a
+// recovery state and an AI opinion about it. A zero halflife never decays,
+// exactly as the flash's does not.
+TP_F(combatfx, hitReactRefDamage, NO_WGSL, 14.0f, 0.1f, 60.0f)
+TP_F(combatfx, hitReactMaxScale, NO_WGSL, 2.2f, 1.0f, 8.0f)
+TP_F(combatfx, hitReactLeanDeg, NO_WGSL, 10.0f, 0.0f, 25.0f)
+TP_F(combatfx, hitReactSpineShare, NO_WGSL, 0.55f, 0.0f, 1.0f)
+TP_F(combatfx, hitReactPushFrac, NO_WGSL, 0.050f, 0.0f, 0.2f)
+TP_F(combatfx, hitReactLimbDeg, NO_WGSL, 22.0f, 0.0f, 45.0f)
+TP_F(combatfx, hitReactHalflife, NO_WGSL, 0.110f, 0.01f, 0.6f)
+TP_F(combatfx, hitReactImpulse, NO_WGSL, 5.0f, 0.0f, 200.0f)
+TP_F(combatfx, whooshVolume, NO_WGSL, 0.55f, 0.0f, 4.0f)
+TP_F(combatfx, whooshMinSpeed, NO_WGSL, 300.0f, 0.0f, 2000.0f)
+TP_F(combatfx, whooshRateSlow, NO_WGSL, 0.82f, 0.25f, 4.0f)
+TP_F(combatfx, whooshRateFast, NO_WGSL, 1.25f, 0.25f, 4.0f)
+TP_F(combatfx, whooshEdgeFrac, NO_WGSL, 0.55f, 0.0f, 1.0f)
+TP_F(combatfx, whooshPan, NO_WGSL, 1.0f, 0.0f, 1.0f)
+TP_F(combatfx, fleshVolume, NO_WGSL, 0.90f, 0.0f, 4.0f)
+TP_F(combatfx, clangVolume, NO_WGSL, 0.85f, 0.0f, 4.0f)
+TP_F(combatfx, strikeEdgeVolume, NO_WGSL, 0.65f, 0.0f, 4.0f)
+TP_F(combatfx, strikeBluntVolume, NO_WGSL, 0.70f, 0.0f, 4.0f)
+TP_F(combatfx, cutVolume, NO_WGSL, 0.50f, 0.0f, 4.0f)
+TP_F(combatfx, cueRadius, NO_WGSL, 22.0f, 1.0f, 400.0f)
+
+
+// ==== grenade ====
+TP_F(grenade, throwSpeed, NO_WGSL, 20.0f, 1.0f, 80.0f)
+TP_F(grenade, fuse, NO_WGSL, 2.2f, 0.1f, 15.0f)
+TP_F(grenade, restitution, NO_WGSL, 0.45f, 0.0f, 1.0f)
+TP_F(grenade, friction, NO_WGSL, 0.8f, 0.0f, 1.0f)
+TP_F(grenade, waterDrag, NO_WGSL, 0.90f, 0.1f, 1.0f)
+TP_I(grenade, blastRadius, NO_WGSL, 13, 1, 20)
+TP_I(grenade, blastPower, NO_WGSL, 380, 10, 4000)
+
+
+// ==== tools ====
+TP_I(tools, detonateRadius, NO_WGSL, 12, 1, 20)
+TP_I(tools, detonatePower, NO_WGSL, 340, 10, 4000)
+TP_F(tools, laserRange, NO_WGSL, 200.0f, 10.0f, 1000.0f)
+TP_I(tools, laserMeltRadius, NO_WGSL, 2, 1, 8)
+TP_F(tools, laserCarveRadius, NO_WGSL, 0.3f, 0.1f, 3.0f)
+TP_F(tools, laserDamage, NO_WGSL, 1.5f, 0.1f, 20.0f)
+TP_F(tools, brushAirDistance, NO_WGSL, 48.0f, 4.0f, 200.0f)
+
+
+// ==== sim: rows no shader reads ====
+// + a hand-written rule in LoadTuning
+TP_F(sim, windGasScale, NO_WGSL, 1.0f, 0.0f, 16.0f)
+// + a hand-written rule in LoadTuning
+TP_F(sim, windPartScale, NO_WGSL, 1.0f, 0.0f, 16.0f)
+// The drag ramp reference. Floored well above zero because the kernel
+// divides by it: windDragRampQ's `max(refQ >> 16, 1)` keeps the shader
+// safe whatever arrives, but a reference of 0.1 m/s would saturate the
+// ramp in dead calm and quietly restore the fixed-rate behaviour this
+// replaces — which is a bug report about gravity, not about wind.
+TP_F(sim, windDragRef, NO_WGSL, 40.0f, 1.0f, 200.0f)
+// The wake budget cannot exceed the TickParams array it is copied into;
+// 0 is a legal "no primitive may wake anything", which is the switch that
+// turns entrainment off without turning the fans off.
+TP_I(sim, windWakeChunks, NO_WGSL, 96, 0, kWindWakeCap)
+// The current field (plan component 8). CPU-side by design —
+// the shader reads resolved primitives, never a knob.
+// ---- the current field (plan component 8) ----
+// The bounds are the shader's overflow audit expressed in human units:
+// kCurrentPrimMaxSpeed is 200 cells/s = 20 m/s, and kCurrentPrimMaxExtent
+// is what every intermediate in currentPrimEvalQ is bounded against.
+TP_I(sim, currentMode, NO_WGSL, 0, 0, 1)
+TP_F(sim, currentVortexGamma, NO_WGSL, 22.0f, 0.0f, 400.0f)
+// A decay of zero is the bug plan component 8 names outright — a funnel
+// standing open in still water — so the floor is a real number, not 0.
+TP_F(sim, currentVortexDecay, NO_WGSL, 3.0f, 0.05f, 120.0f)
+TP_I(sim, currentVortexRadius, NO_WGSL, 40, 4, kCurrentPrimMaxExtent)
+TP_F(sim, currentSinkSpeed, NO_WGSL, 3.0f, 0.0f, 20.0f)
+TP_F(sim, currentStreamScale, NO_WGSL, 1.2f, 0.0f, 20.0f)
+TP_I(sim, currentStreamMinSlope, NO_WGSL, 24, 0, 4096)
+
+
+// ==== dayNight ====
+// A zero-length day divides by zero in DayPhaseForTick and would freeze
+// the cycle at midnight; a negative one is meaningless.
+TP_I(dayNight, cycleMinutes, NO_WGSL, 20, 1, 240)
+TP_I(dayNight, freeze, NO_WGSL, 0, 0, 1)
+// + a hand-written rule in LoadTuning
+TP_I(dayNight, freezePhase, NO_WGSL, 32768, 0, 65535)
+// legacy, unread
+TP_F(dayNight, sunPeakElevation, NO_WGSL, 58.0f, 5.0f, 90.0f)
+TP_F(dayNight, sunAzimuth, NO_WGSL, 24.0f, -180.0f, 180.0f)
+// + a hand-written rule in LoadTuning
+TP_F(dayNight, twilightWidth, NO_WGSL, 0.22f, 0.02f, 1.0f)
+TP_F(dayNight, starRotSpeed, NO_WGSL, 1.0f, 0.0f, 8.0f)
+// ---- orbital elements (sim/celestial.cpp) ----
+TP_F(dayNight, axialTilt, NO_WGSL, 23.4f, 0.0f, 80.0f)
+// + a hand-written rule in LoadTuning
+TP_F(dayNight, latitudeDeg, NO_WGSL, 42.0f, -89.0f, 89.0f)
+TP_F(dayNight, yearLengthDays, NO_WGSL, 96.0f, 0.5f, 2000.0f)
+// ---- orbital sanity ----
+// Kepler's equation is only solved for bound elliptical orbits, and the
+// fixed-iteration Newton solver (celestial.cpp) is accurate well past 0.6
+// but not near 1. A parabolic or hyperbolic element set here is a JSON
+// typo, not a design choice, so clamp loudly rather than emit a sky that
+// flies off.
+TP_F(dayNight, orbitEccentricity, NO_WGSL, 0.017f, 0.0f, 0.7f)
+TP_F(dayNight, orbitArgPeriapsis, NO_WGSL, 283.0f, 0.0f, 360.0f)
+TP_F(dayNight, orbitMeanAnomaly0, NO_WGSL, 0.0f, 0.0f, 360.0f)
+// The apparent radii feed the eclipse geometry directly. Zero would make
+// eclipses impossible and a huge value would make one permanent, so bound
+// both to something a sky can hold.
+TP_F(dayNight, sunAngularRadius, NO_WGSL, 0.30f, 0.02f, 12.0f)
+TP_I(dayNight, lunarPeriodDays, NO_WGSL, 8, 1, 120)
+TP_F(dayNight, moonInclination, NO_WGSL, 5.1f, 0.0f, 45.0f)
+TP_F(dayNight, moonEccentricity, NO_WGSL, 0.055f, 0.0f, 0.7f)
+TP_F(dayNight, moonArgPeriapsis, NO_WGSL, 130.0f, 0.0f, 360.0f)
+TP_F(dayNight, moonNode, NO_WGSL, 0.0f, 0.0f, 360.0f)
+TP_F(dayNight, moonMeanAnomaly0, NO_WGSL, 40.0f, 0.0f, 360.0f)
+TP_F(dayNight, moonAngularRadius, NO_WGSL, 1.7f, 0.05f, 20.0f)
+TP_I(dayNight, moon2PeriodDays, NO_WGSL, 9, 1, 120)
+TP_F(dayNight, moon2Inclination, NO_WGSL, 8.7f, 0.0f, 45.0f)
+TP_F(dayNight, moon2Eccentricity, NO_WGSL, 0.03f, 0.0f, 0.7f)
+TP_F(dayNight, moon2ArgPeriapsis, NO_WGSL, 20.0f, 0.0f, 360.0f)
+TP_F(dayNight, moon2Node, NO_WGSL, 95.0f, 0.0f, 360.0f)
+TP_F(dayNight, moon2MeanAnomaly0, NO_WGSL, 200.0f, 0.0f, 360.0f)
+TP_F(dayNight, moon2AngularRadius, NO_WGSL, 1.05f, 0.05f, 20.0f)
+
+
+// ==== weather ====
+TP_B(weather, waterFreezes, NO_WGSL, true)
+TP_B(weather, iceMelts, NO_WGSL, true)
+// The sky half (weather.h). Clamped here, not trusted: a negative epoch or
+// a transition of 0 would divide by zero in weather::Resolve.
+TP_B(weather, clouds, NO_WGSL, true)
+TP_B(weather, autoCycle, NO_WGSL, true)
+TP_S(weather, preset, NO_WGSL, "fair")
+TP_F(weather, epochMinutes, NO_WGSL, 7.0f, 0.5f, 600.0f)
+TP_F(weather, cycleSpeed, NO_WGSL, 1.0f, 0.0f, 1000.0f)
+TP_I(weather, seedOffset, NO_WGSL, 0, 0, 1000)
+TP_F(weather, transitionSeconds, NO_WGSL, 12.0f, 0.0f, 600.0f)
+TP_F(weather, coverageBias, NO_WGSL, 0.0f, -1.0f, 1.0f)
+TP_F(weather, precipScale, NO_WGSL, 1.0f, 0.0f, 4.0f)
+TP_F(weather, drySeconds, NO_WGSL, 240.0f, 5.0f, 36000.0f)
+TP_B(weather, rainTouchesWorld, NO_WGSL, true)
+TP_F(weather, rainIgniteDamp, NO_WGSL, 0.6f, 0.0f, 1.0f)
+
+
+// ==== combustion ====
+// ---- combustion: read by the REACTION COMPILER, not by a kernel ----
+// Clamped rather than validated away, because the failure at the bottom is
+// silent and total: at 0 the divide would send every retire rule's chance
+// to the 1-unit floor materials.cpp applies, i.e. "a lit voxel effectively
+// never goes out", which is rule 2 broken by a typo. 25% is a quarter of
+// the authored duration and is already very fast; 800% is ~27 s per cloth
+// voxel and is well past anything playable.
+TP_I(combustion, burnDurationPct, NO_WGSL, 200, 25, 800)
+// Clamped for the same reason burnDurationPct is: at 0 every ignition
+// chance would land on the 1-unit floor materials.cpp applies, i.e. "fire
+// never spreads at all", which is a typo silently deleting a whole
+// mechanic. 1% is a hundredth of the authored rate and already glacial;
+// 400% is four times and is well past anything survivable.
+TP_I(combustion, spreadPct, NO_WGSL, 12, 1, 400)
+// 0 IS LEGAL HERE, unlike spreadPct: "the drifting flame ignites nothing,
+// only the coals spread fire" is a coherent game rather than a typo that
+// deletes a mechanic, and it is the one setting that makes the exception
+// absolute. The compiled chance still floors at 1 unit (materials.cpp), so
+// 0 means "as rare as the table can express", not "never".
+TP_I(combustion, flamePct, NO_WGSL, 100, 0, 800)
+TP_I(combustion, crossLimbPct, NO_WGSL, 25, 0, 100)
+
+
+// ==== wind: rows no shader reads ====
+// ---- wind (docs/RESEARCH_wind.md; the field itself is common.wgsl) ----
+TP_F(wind, windSpeed, NO_WGSL, 6.0f, 0.0f, 40.0f)
+TP_F(wind, windDirDeg, NO_WGSL, 45.0f, 0.0f, 360.0f)
+TP_F(wind, gustStrength, NO_WGSL, 1.0f, 0.0f, 2.0f)
+TP_B(wind, weatherAuto, NO_WGSL, true)
+TP_B(wind, dbgWindField, NO_WGSL, false)
+
+
+// ==== render: rows no shader reads ====
+TP_B(render, dbgCurrentField, NO_WGSL, false)
+TP_V3(render, sunDir, NO_WGSL, 0.50f, 0.55f, 0.38f)
+TP_F(render, fogOpticalDepths, NO_WGSL, 4.5f, 0.5f, 20.0f)
+TP_F(render, fogLerpPerFrame, NO_WGSL, 0.08f, 0.005f, 1.0f)
+// 0 would stall a refill forever (the horizon would never come back) and
+// the top is the whole farList buffer, which is the dispatch's own limit.
+TP_I(render, farRefillRate, NO_WGSL, 1024, 1, kFarListCap)
+// Same two bounds, same reasons: 0 would freeze the horizon wherever the
+// player left it, and farList is the dispatch's own ceiling.
+TP_I(render, farPlaneFillRate, NO_WGSL, 256, 1, kFarListCap)
+// A scale above 1 would be supersampling the most expensive shader in the
+// engine; below a quarter the frame is 400x225 and the UI text on top is
+// larger than the terrain. Present mode is an enum; fpsCap 0 = off.
+TP_F(render, renderScale, NO_WGSL, 1.0f, 0.25f, 1.0f)
+TP_I(render, taa, NO_WGSL, 0, 0, 1)
+// TAA: a history shorter than 1 sample is not a history, and one longer
+// than the f16 the shader stores it in cannot be counted. The clamp width
+// and the jitter are both allowed to be 0 (those are the A/B arms) but
+// neither is allowed to be negative, which would invert the test it feeds.
+TP_F(render, taaMaxHist, NO_WGSL, 24.0f, 1.0f, 512.0f)
+TP_F(render, taaClamp, NO_WGSL, 0.25f, 0.0f, 4.0f)
+TP_F(render, taaJitter, NO_WGSL, 1.0f, 0.0f, 2.0f)
+TP_I(render, taaSharpLod, NO_WGSL, 1, 0, 1)
+// 0 would make every tap weigh the same, i.e. a box filter over the
+// whole 3x3 and no reconstruction at all.
+TP_F(render, taaSharpness, NO_WGSL, 2.29f, 0.05f, 64.0f)
+TP_I(render, denoise, NO_WGSL, 0, 0, 1)
+// The shading-LOD filter: iterations are bounded by the bind groups
+// Simulation allocates (kDenoiseMaxIters); the ramp edges must be ordered
+// (smoothstep) and positive; the tolerances are widths, so > 0.
+TP_I(render, denoiseIters, NO_WGSL, 2, 0, 4)
+// + a hand-written rule in LoadTuning
+TP_F(render, denoisePxFull, NO_WGSL, 2.0f, 0.1f, 16.0f)
+// + a hand-written rule in LoadTuning
+TP_F(render, denoisePxStart, NO_WGSL, 8.0f, 0.2f, 32.0f)
+TP_F(render, denoiseDepthTol, NO_WGSL, 0.03f, 0.001f, 0.5f)
+TP_F(render, denoiseChromaTol, NO_WGSL, 0.25f, 0.01f, 2.0f)
+TP_F(render, denoiseStrength, NO_WGSL, 0.7f, 0.0f, 1.0f)
+// + a hand-written rule in LoadTuning
+TP_I(render, presentMode, NO_WGSL, 1, 0, 2)
+TP_F(render, fpsCap, NO_WGSL, 0.0f, 0.0f, 240.0f)
+
+
+// ==== world ====
+// A NAME, never a path: worldedit.cpp joins it under assets/worldedits/,
+// and a value with a separator in it would reach outside that directory.
+// + a hand-written rule in LoadTuning
+TP_S(world, mapLayer, NO_WGSL, "default")
+// + a hand-written rule in LoadTuning
+TP_S(world, editLayer, NO_WGSL, "")
 
 // clang-format on

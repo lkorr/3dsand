@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -90,26 +91,63 @@ float ApplyVariance(float base, const Variance& v, uint32_t seed, uint32_t tick,
 int ApplyVarianceI(int base, const Variance& v, uint32_t seed, uint32_t tick,
                    uint32_t index);
 
+// ---- defaults: generated from sim/tuning_params.def -------------------------
+// Every row of the table becomes one constexpr here, and the member below
+// initializes from it with TPD(group, member) -- so a default is written ONCE,
+// in the .def, and the struct, the loader, the shader prelude and the tuner
+// cannot hold different numbers for it. check_invariants.py (`tuning reach`)
+// refuses a TPD whose (group, member) is not the member it initializes.
+//
+// A member with a literal initializer instead of TPD is a knob with no .def
+// row (the gore.*Var objects, or a knob added in the old hand style); that is
+// still legal, it just has to be read by hand in LoadTuning.
+//
+// TP_OPEN is "no bound" in a row's min/max. NaN, so every comparison against
+// it is false and the generated clamp is a no-op on that side.
+inline constexpr double TP_OPEN = std::numeric_limits<double>::quiet_NaN();
+
+namespace tuning_def {
+#define TP_F(g, m, n, d, lo, hi) inline constexpr float g##_##m = d;
+#define TP_I(g, m, n, d, lo, hi) inline constexpr int g##_##m = d;
+#define TP_U(g, m, n, d, lo, hi) inline constexpr int g##_##m = d;
+#define TP_B(g, m, n, d) inline constexpr bool g##_##m = d;
+#define TP_S(g, m, n, d) inline constexpr const char* g##_##m = d;
+#define TP_V3(g, m, n, x, y, z) inline constexpr float g##_##m[3] = {x, y, z};
+#include "sim/tuning_params.def"
+#undef TP_V3
+#undef TP_S
+#undef TP_B
+#undef TP_U
+#undef TP_I
+#undef TP_F
+}  // namespace tuning_def
+
+#define TPD(g, m) (::tuning_def::g##_##m)
+#define TPD_V3(g, m) \
+  {::tuning_def::g##_##m[0], ::tuning_def::g##_##m[1], ::tuning_def::g##_##m[2]}
+
 struct Tuning {
   // ---- player movement (meters / seconds; converted to voxels at use) ----
   struct Player {
-    std::string model = "human";
-    float flySpeed = 13.75f, flySprint = 32.5f;
-    float walkSpeed = 4.5f, sprintSpeed = 8.0f;
-    float gravity = 9.81f;
-    float jumpSpeed = 5.25f;
-    float swimUp = 17.5f, swimDown = 7.5f;
-    float maxFall = 30.0f;
-    float fallDamageSpeed = 8.0f;
-    float fallSplatSpeed = 25.0f;
-    float fallDamageScale = 0.75f;
-    float stepUp = 0.58f;
-    float smoothBump = 0.12f;
-    float stepSpeedPenaltyPerM = 2.8f;
-    float minStepSpeedScale = 0.20f;
-    float nonJumpSpeed = 0.5f;
-    float coyoteTime = 0.12f, jumpBufferTime = 0.12f;
-    float jumpRepressTime = 0.3f;
+    std::string model = TPD(player, model);
+    float flySpeed = TPD(player, flySpeed), flySprint = TPD(player, flySprint);
+    float walkSpeed = TPD(player, walkSpeed);
+    float sprintSpeed = TPD(player, sprintSpeed);
+    float gravity = TPD(player, gravity);
+    float jumpSpeed = TPD(player, jumpSpeed);
+    float swimUp = TPD(player, swimUp), swimDown = TPD(player, swimDown);
+    float maxFall = TPD(player, maxFall);
+    float fallDamageSpeed = TPD(player, fallDamageSpeed);
+    float fallSplatSpeed = TPD(player, fallSplatSpeed);
+    float fallDamageScale = TPD(player, fallDamageScale);
+    float stepUp = TPD(player, stepUp);
+    float smoothBump = TPD(player, smoothBump);
+    float stepSpeedPenaltyPerM = TPD(player, stepSpeedPenaltyPerM);
+    float minStepSpeedScale = TPD(player, minStepSpeedScale);
+    float nonJumpSpeed = TPD(player, nonJumpSpeed);
+    float coyoteTime = TPD(player, coyoteTime);
+    float jumpBufferTime = TPD(player, jumpBufferTime);
+    float jumpRepressTime = TPD(player, jumpRepressTime);
     // Accel/damping are per-second rates, converted to a per-frame lerp with
     // 1-exp(-rate*dt) at the call site. The old code lerped by a raw constant
     // every frame (ground 0.35, air 0.06, liquid 0.15, vertical drag 0.92),
@@ -117,7 +155,9 @@ struct Tuning {
     // rates are chosen to reproduce exactly those blends at ~100 fps — the
     // speed the game actually runs — so the feel is unchanged where it was
     // tuned, and now stays put at 30 or 144 fps instead of drifting.
-    float groundAccel = 43.1f, airAccel = 6.2f, liquidAccel = 16.3f;
+    float groundAccel = TPD(player, groundAccel);
+    float airAccel = TPD(player, airAccel);
+    float liquidAccel = TPD(player, liquidAccel);
     // ---- slippery feet (a coat whose material lists "slippery" in its
     // materials.json coat.effects -- oil) ----
     // Grip on the ground is groundAccel scaled from 1 down to slipGrip as the
@@ -128,10 +168,12 @@ struct Tuning {
     // dries does not keep you skating until you wash it off. It was a
     // whole-foot fraction until 2026-09-23 and a foot fresh out of a pool read
     // ~0.1 of it, so oily feet did nothing.
-    float slipCoatStart = 0.15f, slipCoatFull = 0.32f, slipGrip = 0.035f;
-    float liquidDrag = 8.3f;
-    float liquidGravityScale = 0.25f;
-    float liquidSpeedScale = 0.55f;
+    float slipCoatStart = TPD(player, slipCoatStart);
+    float slipCoatFull = TPD(player, slipCoatFull);
+    float slipGrip = TPD(player, slipGrip);
+    float liquidDrag = TPD(player, liquidDrag);
+    float liquidGravityScale = TPD(player, liquidGravityScale);
+    float liquidSpeedScale = TPD(player, liquidSpeedScale);
     // ---- water-edge mantle (climbing out of a pool) ----
     // Swim thrust is drag-limited on purpose, which means it cannot climb out
     // of anything: at a pool wall you bob against the rim forever. So a jump
@@ -145,12 +187,12 @@ struct Tuning {
     //
     // How fast (m/s) the body climbs. Fast enough not to feel like a cutscene,
     // slow enough to read as pulling yourself out rather than teleporting.
-    float waterMantleSpeed = 4.5f;
+    float waterMantleSpeed = TPD(player, waterMantleSpeed);
     // Hard cap (seconds) on one climb. This is a timeout, not a duration: the
     // mantle normally ends on arrival. It exists so a climb blocked partway —
     // the bank collapsed, something shoved into the target — returns control
     // instead of holding movement hostage.
-    float waterMantleTime = 0.9f;
+    float waterMantleTime = TPD(player, waterMantleTime);
     // ---- ledge grab (procedural climbing) ----
     // Airborne with space held and the arms facing a voxel lip within hand
     // reach, the body latches on and dangles; W pulls it up (player.cpp
@@ -160,7 +202,7 @@ struct Tuning {
     // body's standing reach is ~2.25 m, so ~0.55 past the top. Physical like
     // stepUp, so voxel-size changes never change how much real wall is
     // grabbable. 0 disables ledge grabbing entirely.
-    float ledgeReach = 0.55f;
+    float ledgeReach = TPD(player, ledgeReach);
     // Dangling drop: how far below the held lip the top of the head hangs.
     // NEGATIVE means the head rides ABOVE the lip. The default is negative
     // deliberately: these are chibi rigs — mina's arm chain is ~3.3 voxels
@@ -169,33 +211,33 @@ struct Tuning {
     // the ledge edge, the way toon games hang. Long-armed rigs tolerate a
     // deeper drop; raise this and the hands stay planted as far as the
     // shrug allows.
-    float ledgeHangDrop = -0.15f;
+    float ledgeHangDrop = TPD(player, ledgeHangDrop);
     // Upward velocity of the ARM BOOST — the pull-up used when there is no
     // room to stand on the lip (a rough wall's one-voxel ledge): ballistic,
     // so the next lip up can catch near the apex and the climb chains.
     // Matches jumpSpeed by default so a boost feels like a jump's worth of
     // pull. 0 turns W-on-an-unstandable-lip into simply letting go.
-    float ledgeBoostSpeed = 5.25f;
+    float ledgeBoostSpeed = TPD(player, ledgeBoostSpeed);
     // Speed and timeout of the committed pull-up onto a standable lip. Same
     // semantics as the water mantle pair above — the timeout exists for a
     // climb blocked partway by a live world. Deliberately SLOW (a body-length
     // climb takes over a second): at the old 4.5 the pull-up read as a big
     // jump, not as hauling yourself up. The timeout must cover the full climb
     // at this speed or it aborts mid-pull.
-    float ledgeMantleSpeed = 1.5f;
-    float ledgeMantleTime = 2.8f;
+    float ledgeMantleSpeed = TPD(player, ledgeMantleSpeed);
+    float ledgeMantleTime = TPD(player, ledgeMantleTime);
     // How fast the body settles into the dead hang after a catch. Split from
     // the mantle speed on purpose: slowing the pull-up must not make the
     // catch itself feel sluggish.
-    float ledgeSettleSpeed = 4.5f;
+    float ledgeSettleSpeed = TPD(player, ledgeSettleSpeed);
     // Sideways hand-over-hand speed along the ledge (A/D while hanging).
     // Slow by design — it is a traverse, not a strafe. 0 disables.
-    float ledgeShimmySpeed = 0.8f;
+    float ledgeShimmySpeed = TPD(player, ledgeShimmySpeed);
     // Minimum time a grab hangs before W (held or pressed) pulls up. W is
     // almost always still held from the jump approach, so without this floor
     // the mantle fires on the first hang frame and the catch never appears on
     // screen. 0 restores instant pull-up.
-    float ledgePullDelay = 0.25f;
+    float ledgePullDelay = TPD(player, ledgePullDelay);
     // ---- the collision box (Player::Box) ----
     // The player's collision box is NOT the figure. It is a small box centred
     // on where the feet go — collisionWidth wide, collisionHeight tall from
@@ -203,28 +245,29 @@ struct Tuning {
     // to clip terrain by however much the 1.7 m art overhangs it. Movement
     // is decided by this box alone: a corridor one head-clip lower than the
     // figure still admits the figure. Metres; converted at use.
-    float collisionWidth = 0.40f;
-    float collisionHeight = 1.50f;
+    float collisionWidth = TPD(player, collisionWidth);
+    float collisionHeight = TPD(player, collisionHeight);
     // Ctrl. The box shrinks to this height while crouched (and stays crouched
     // under a ceiling the standing box would not fit back under), speed is
     // scaled by crouchSpeedScale, and the avatar bends its knees by
     // crouchKneeDrop — the pelvis drops that far and the leg IK, whose foot
     // targets are world points, turns the drop into a bend.
-    float crouchHeight = 1.15f;
-    float crouchSpeedScale = 0.5f;
-    float crouchKneeDrop = 0.35f;
+    float crouchHeight = TPD(player, crouchHeight);
+    float crouchSpeedScale = TPD(player, crouchSpeedScale);
+    float crouchKneeDrop = TPD(player, crouchKneeDrop);
     // The FIGURE contract, not collision: gen_human.py / gen_mina.py /
     // gen_asha.py read these out of tuning.json and assert that the art they
     // draw is halfHeight*2 tall with the face at halfHeight+eyeOffset. The
     // controller does not read them (it has Player::kHalfY/kEyeOffset for the
     // same 1.7 m / 1.5 m numbers); they are here so the file stays the one
     // place the figure's size is written down.
-    float halfHeight = 0.85f, eyeOffset = 0.65f;
+    float halfHeight = TPD(player, halfHeight);
+    float eyeOffset = TPD(player, eyeOffset);
     // Camera step smoothing: half-life (seconds) of the render-only eye
     // offset that cancels the vertical pop when the body steps up/down a
     // ledge (Player::ViewEyePos). 0 disables. CPU/render only — the physics
     // position and the sim are untouched.
-    float viewSmoothHalflife = 0.10f;
+    float viewSmoothHalflife = TPD(player, viewSmoothHalflife);
     // ---- unstick (de-penetration) ----
     // Every collision sweep is a hard veto that fails from an overlapping
     // start, so a body that ends up INSIDE solid ground cannot move on any
@@ -235,11 +278,11 @@ struct Tuning {
     // and teleporting out of it would be worse than being stuck. About a step
     // height and a half covers the cases that actually happen (a powder
     // settling into your feet, a step-down landing a fraction inside a face).
-    float unstickMaxDepth = 0.9f;
+    float unstickMaxDepth = TPD(player, unstickMaxDepth);
     // How fast (m/s) the body rises while being ejected. Rate-limited rather
     // than teleported so a two-voxel lift is a glide, not a pop; the climb is
     // banked into the same view offset a step-up uses.
-    float unstickSpeed = 3.0f;
+    float unstickSpeed = TPD(player, unstickSpeed);
     // ---- the physics grab (game/grab.h) ----
     // Hold E on a loose rigid body and it comes off the floor and rides in
     // front of the face until you let go. Tap E is unchanged (pick up / loot),
@@ -249,11 +292,11 @@ struct Tuning {
     // How long E must be down before the grab takes over. Long enough that a
     // deliberate tap never lifts anything, short enough that holding the key
     // is not a chore. 0 disables the physics grab entirely (E stays a tap).
-    float grabHoldTime = 0.22f;
+    float grabHoldTime = TPD(player, grabHoldTime);
     // Farthest (metres) a body can ride from the eye. A grab KEEPS the
     // distance the thing was already at, clamped to this, so the carry range
     // is a ceiling rather than a snap target — see GrabHold::Begin.
-    float grabDistance = 2.0f;
+    float grabDistance = TPD(player, grabDistance);
     // WEIGHT, in three numbers. Anything at or under `grabFreeMass` is carried
     // as if it weighed nothing; past that both the player's speed and the
     // speed the body can follow the crosshair fall off as
@@ -261,34 +304,36 @@ struct Tuning {
     // Nothing above `grabMaxMass` can be picked up at all (0 = no ceiling).
     // One curve for both so a thing that walks you at half speed is also the
     // thing that swings a beat behind where you are looking.
-    float grabFreeMass = 12.0f;   // kg
-    float grabSlowMass = 45.0f;   // kg of excess that halves you
-    float grabMaxMass = 400.0f;   // kg
+    float grabFreeMass = TPD(player, grabFreeMass);   // kg
+    // kg of excess that halves you
+    float grabSlowMass = TPD(player, grabSlowMass);
+    float grabMaxMass = TPD(player, grabMaxMass);   // kg
     // Floor under the carry speed penalty. Being unable to move while holding
     // something the game let you pick up is a softlock, not a weight.
-    float grabMinSpeedScale = 0.30f;
+    float grabMinSpeedScale = TPD(player, grabMinSpeedScale);
     // Servo gain (per second) and its speed cap (m/s, before the weight curve
     // scales it). Gain decides how tightly the body tracks the carry point;
     // the cap is what turns mass into lag. Very high gain with a low cap is a
     // thing that snaps to the crosshair then crawls; the defaults are a
     // followed-with-effort feel.
-    float grabStiffness = 9.0f;
-    float grabCarrySpeed = 9.0f;
+    float grabStiffness = TPD(player, grabStiffness);
+    float grabCarrySpeed = TPD(player, grabCarrySpeed);
     // How far the body may fall behind the carry point before the grab lets
     // go (metres). This is what drops a crate caught on a doorframe instead of
     // dragging it through the frame on the next servo step.
-    float grabBreakDistance = 2.5f;
+    float grabBreakDistance = TPD(player, grabBreakDistance);
     // Per-tick multiplier on the held body's spin. 1 keeps whatever tumble it
     // had (it windmills, since nothing it touches can slow it while the servo
     // owns its linear velocity); 0 welds it to one orientation.
-    float grabSpinDamp = 0.80f;
+    float grabSpinDamp = TPD(player, grabSpinDamp);
   } player;
 
   // ---- camera ----
   struct Camera {
-    float mouseSensitivity = 0.0022f;  // radians per pixel
-    float fovY = 1.2f;                 // radians (~69 deg)
-    float pitchClamp = 1.55f;
+    // radians per pixel
+    float mouseSensitivity = TPD(camera, mouseSensitivity);
+    float fovY = TPD(camera, fovY);                 // radians (~69 deg)
+    float pitchClamp = TPD(camera, pitchClamp);
     // Multiplier on look sensitivity while a melee weapon is up (any swing
     // phase but Idle). The same mouse motion both turns the view and steers
     // the blade (game/melee.h), so at 1.0 a cut you want to watch also whips
@@ -296,10 +341,10 @@ struct Tuning {
     // full gain is what makes a swing readable: the mouse travel buys mostly
     // arm, not mostly yaw. The melee state machine never sees this scale —
     // it is fed the raw delta, so commitSpeed still means true mouse pixels.
-    float meleeSensitivity = 0.5f;
+    float meleeSensitivity = TPD(camera, meleeSensitivity);
     // Half-life (seconds) of the scale easing in and out. Stepping the gain
     // on the click edge is a visible jolt in a mid-turn mouse stroke.
-    float meleeSensHalflife = 0.08f;
+    float meleeSensHalflife = TPD(camera, meleeSensHalflife);
   } camera;
 
   // ---- third-person camera rig ----
@@ -309,47 +354,55 @@ struct Tuning {
   // kVoxelMeters ever changes. Render-only — the picking ray and every sim
   // input keep using the player's own eye, so nothing here can move the hash.
   struct ThirdPerson {
-    float distance = 3.2f;        // boom length behind the focus point
-    float shoulderDist = 1.7f;    // boom length in over-shoulder mode
-    float shoulderOffset = 0.55f; // lateral offset, over-shoulder mode
-    float heightOffset = 0.25f;   // focus point above the head anchor
-    float sideOffset = 0.0f;      // lateral offset in plain third person
+    // boom length behind the focus point
+    float distance = TPD(thirdPerson, distance);
+    // boom length in over-shoulder mode
+    float shoulderDist = TPD(thirdPerson, shoulderDist);
+    // lateral offset, over-shoulder mode
+    float shoulderOffset = TPD(thirdPerson, shoulderOffset);
+    // focus point above the head anchor
+    float heightOffset = TPD(thirdPerson, heightOffset);
+    // lateral offset in plain third person
+    float sideOffset = TPD(thirdPerson, sideOffset);
     // Collision: the boom is swept against the voxel world and pulled in to
     // the first hit, minus this margin, so the near plane never clips inside
     // a wall. `collideRadius` fattens the sweep so the camera does not slip
     // through a one-voxel gap and pop to the far side.
-    float collideMargin = 0.35f;
-    float collideRadius = 0.25f;
-    bool collide = true;
+    float collideMargin = TPD(thirdPerson, collideMargin);
+    float collideRadius = TPD(thirdPerson, collideRadius);
+    bool collide = TPD(thirdPerson, collide);
     // Smoothing half-lives, seconds. The focus point is smoothed so the
     // camera does not jitter with every step bob; the boom length is smoothed
     // separately and ASYMMETRICALLY — pulling IN must be instant (or the
     // camera spends a frame inside the wall) while pushing back OUT is eased,
     // which is the standard fix for a camera that pops when clearing a corner.
-    float focusHalflife = 0.06f;
-    float distInHalflife = 0.0f;   // 0 = snap in immediately
-    float distOutHalflife = 0.25f;
+    float focusHalflife = TPD(thirdPerson, focusHalflife);
+    // 0 = snap in immediately
+    float distInHalflife = TPD(thirdPerson, distInHalflife);
+    float distOutHalflife = TPD(thirdPerson, distOutHalflife);
     // Extra pitch-driven lift: at steep downward pitch the boom rises so the
     // character stays framed instead of being hidden by its own hat.
-    float pitchLift = 0.35f;
+    float pitchLift = TPD(thirdPerson, pitchLift);
     // How strongly the dismemberment state's body drop moves the camera.
     // 1 = follow the pose exactly, 0 = ignore it. Below 1 the camera stays a
     // little higher than a crawling body, which reads better than lying on
     // the floor with it.
-    float stateFollow = 0.75f;
+    float stateFollow = TPD(thirdPerson, stateFollow);
     // Field-of-view widening with speed, radians at full sprint. Sells speed
     // without the player touching a setting.
-    float speedFov = 0.06f;
-    float speedFovHalflife = 0.35f;
+    float speedFov = TPD(thirdPerson, speedFov);
+    float speedFovHalflife = TPD(thirdPerson, speedFovHalflife);
     // ---- wheel zoom ---------------------------------------------------------
     // The boom length the player can dial for themselves, as a MULTIPLIER on
     // `distance`/`shoulderDist` rather than as its own pair of distances: the
     // two modes then keep their authored relationship (over-shoulder stays
     // tighter than plain third) at every zoom level, and re-tuning either
     // distance does not silently move where the player's zoom sits.
-    float zoomStep = 0.12f;   // multiplier change per wheel notch
-    float zoomMin = 0.35f;    // closest, as a fraction of the tuned boom
-    float zoomMax = 2.5f;     // farthest
+    // multiplier change per wheel notch
+    float zoomStep = TPD(thirdPerson, zoomStep);
+    // closest, as a fraction of the tuned boom
+    float zoomMin = TPD(thirdPerson, zoomMin);
+    float zoomMax = TPD(thirdPerson, zoomMax);     // farthest
   } thirdPerson;
 
   // ---- gear condition ----
@@ -359,13 +412,13 @@ struct Tuning {
     // THERE, because that is what the armour mechanic reads: a shell protects
     // by being geometrically in the way, so how much of it is in the way is
     // what its condition means.
-    float ruinedCondition = 0.40f;
+    float ruinedCondition = TPD(gear, ruinedCondition);
     // A blade's kerf into a WORN shell is scaled by cutHardnessRef divided by
     // the shell material's hardness (materials.json, 0..255), floored at
     // cutHardnessMin: a shell as hard as skin (8) is cut like flesh, iron
     // (160) is chipped. See Mob::CutLimb. 0 disables the scaling.
-    float cutHardnessRef = 8.0f;
-    float cutHardnessMin = 0.05f;
+    float cutHardnessRef = TPD(gear, cutHardnessRef);
+    float cutHardnessMin = TPD(gear, cutHardnessMin);
 
     // ---- A MACE IS THE ANSWER TO PLATE -------------------------------------
     //
@@ -381,28 +434,28 @@ struct Tuning {
     // the plate is genuinely gone there, so the flesh under it is exposed to
     // the next blow, to fire and to acid -- "indent/destroy plate (revealing
     // flesh)" in the owner's words, with no armour-value number anywhere.
-    float bluntDentRadius = 3.0f;
+    float bluntDentRadius = TPD(gear, bluntDentRadius);
     // ...scaled by the shell's own MATERIAL HARDNESS, exactly as the kerf is,
     // against this reference and floored here. 60 rather than the kerf's 8
     // because the whole point is that plate is much LESS proof against trauma
     // than against an edge: iron (160) keeps about 38% of the dent, where it
     // keeps 5% of a kerf.
-    float bluntHardnessRef = 120.0f;
-    float bluntHardnessMin = 0.15f;
+    float bluntHardnessRef = TPD(gear, bluntHardnessRef);
+    float bluntHardnessMin = TPD(gear, bluntHardnessMin);
     // WHAT GETS THROUGH. Fraction of a blunt blow's hp that is TRANSMITTED to
     // the limb the shell is strapped to (MobLimb::wornHost), as trauma with a
     // bruise and no dent. This is the number that says "plate stops swords
     // almost entirely; maces go through": it is charged whether or not the
     // shell broke, because the shell deforming is how the energy arrives.
-    float bluntThrough = 0.55f;
+    float bluntThrough = TPD(gear, bluntThrough);
     // ...and how much of it the shell itself takes as hp. Under 1 because a
     // plate that absorbed the whole blow would be destroyed by the same number
     // of hits that kill the wearer, and then the armour would have no history.
-    float bluntShellHp = 0.6f;
+    float bluntShellHp = TPD(gear, bluntShellHp);
     // A BITE ON ARMOUR IS A BLOW, NOT A WOUND. Fraction of a bite's damage
     // that lands as blunt trauma when the teeth meet a worn shell. No
     // shell-breaking on this path: teeth do not dent plate.
-    float biteOnShell = 0.3f;
+    float biteOnShell = TPD(gear, biteOnShell);
     // ---- ...BUT A LINEN SHIRT IS NOT ARMOUR (2026-09-16) -----------------
     //
     // "Armour defends" was applied to every garment equally, so a tunic
@@ -424,8 +477,8 @@ struct Tuning {
     // above `biteThroughHard`, and it is linear between. Iron is 160 and steel
     // 200, so plate stops a bite dead and keeps the behaviour the knob above
     // was written for.
-    float biteThroughSoft = 14.0f;
-    float biteThroughHard = 60.0f;
+    float biteThroughSoft = TPD(gear, biteThroughSoft);
+    float biteThroughHard = TPD(gear, biteThroughHard);
   } gear;
 
   // ---- player avatar ----
@@ -433,25 +486,25 @@ struct Tuning {
     // Which mob def the avatar rig is loaded from. Data, not code: pointing
     // this at another def in assets/mobs swaps the player character whole.
     // Not hot-reloadable by itself — it is read when the avatar is (re)spawned.
-    bool enabled = true;
+    bool enabled = TPD(avatar, enabled);
     // Body facing. In third person the body turns toward its MOTION and only
     // faces the camera when the player aims, which is what stops the character
     // from moon-walking sideways. This is the turn rate, radians/sec.
-    float turnRate = 12.0f;
+    float turnRate = TPD(avatar, turnRate);
     // Below this speed (m/s) the body keeps its last facing instead of
     // snapping to a near-zero velocity vector, which would spin on the spot.
-    float turnMinSpeed = 0.35f;
+    float turnMinSpeed = TPD(avatar, turnMinSpeed);
     // In first person the body is hidden, but the ARMS are kept so the player
     // can see their own hands and staff. Turning this off hides everything.
-    bool firstPersonArms = true;
+    bool firstPersonArms = TPD(avatar, firstPersonArms);
     // How far forward (metres) the first-person eye sits from the body centre.
     // Pushes the camera in front of the arms so looking down shows hands behind
     // you rather than surrounding you.
-    float firstPersonForward = 0.255f;
+    float firstPersonForward = TPD(avatar, firstPersonForward);
     // Vertical offset applied to the whole avatar relative to the player AABB,
     // in meters. The rig's own feet should land on the box's bottom face; this
     // is the trim for art whose contact point is not exactly at its origin.
-    float footTrim = 0.0f;
+    float footTrim = TPD(avatar, footTrim);
     // ---- motion smoothing ----
     // The rig's own measured speed drives cadence, bob, sway, roll, the
     // walk/run clip choice, the spring goals and the swing budget — so any
@@ -459,7 +512,7 @@ struct Tuning {
     // seconds (frame-rate independent): the measurement covers half the
     // remaining distance to the truth every this-many seconds. 0 disables the
     // smoothing entirely and uses the raw per-tick measurement.
-    float velocityHalflife = 0.08f;
+    float velocityHalflife = TPD(avatar, velocityHalflife);
     // Half-life (seconds) of the FIRST-PERSON body yaw. Third person has its
     // own rate limit (turnRate above) because you are watching the body pivot;
     // first person used to snap outright, on the reasoning that the body is
@@ -467,7 +520,7 @@ struct Tuning {
     // a fast mouse turn steps them across the view in hard jumps. A short
     // half-life keeps them attached to the view without visible lag. 0 restores
     // the old hard snap.
-    float firstPersonTurnHalflife = 0.05f;
+    float firstPersonTurnHalflife = TPD(avatar, firstPersonTurnHalflife);
     // ---- head look (the body does not turn until the neck runs out) --------
     // How far the HEAD may yaw away from the body's facing before the BODY
     // has to start turning, in degrees. Inside this cone a mouse turn is a
@@ -476,7 +529,7 @@ struct Tuning {
     // dragged along so that the offset never exceeds this angle — which is
     // why there is no separate "recenter" rate and no hysteresis to chatter
     // on: the constraint is geometric, not a state machine.
-    float headLookYaw = 70.0f;
+    float headLookYaw = TPD(avatar, headLookYaw);
     // THE LOOK LETS GO WHEN THE CAMERA COMES ROUND TO THE FRONT. Width, in
     // degrees measured inward from straight-behind (180), of the band where
     // the head-look goal fades back to the body's own facing. Third person
@@ -489,20 +542,20 @@ struct Tuning {
     // forward pose. The fade is a smoothstep, so it is flat at both ends: no
     // crease entering the band, and no snap across the 180 wrap (both signs
     // approach zero there). 0 disables it and restores the always-crane.
-    float headLookReleaseYaw = 50.0f;
+    float headLookReleaseYaw = TPD(avatar, headLookReleaseYaw);
     // Head pitch range, degrees up/down. The camera pitch clamp is ~89°, and
     // a neck does not do that, so this clamps separately.
-    float headLookPitchUp = 55.0f;
-    float headLookPitchDown = 60.0f;
+    float headLookPitchUp = TPD(avatar, headLookPitchUp);
+    float headLookPitchDown = TPD(avatar, headLookPitchDown);
     // Fraction of the head's yaw that is ALSO applied to the spine, so a look
     // to the side twists the chest a little instead of swivelling a head on a
     // rigid torso. Small on purpose: the arms are welded to the spine, so this
     // moves a held weapon across the screen. 0 = head only.
-    float headLookSpine = 0.25f;
+    float headLookSpine = TPD(avatar, headLookSpine);
     // Half-life (seconds) of the head easing to the look angle. This is what
     // keeps the head from stepping with the raw mouse; the body's own
     // firstPersonTurnHalflife sits behind it.
-    float headLookHalflife = 0.07f;
+    float headLookHalflife = TPD(avatar, headLookHalflife);
     // Half-life (seconds) of the FIRST-PERSON body squaring back up to the
     // view while the player WALKS. Without this the head-look cone is a drift
     // trap: inside the cone the body's turn is dropped to zero, so its facing
@@ -511,7 +564,7 @@ struct Tuning {
     // pointing off-view while you walk somewhere else. Standing still there is
     // deliberately no recentring; that is the glance. Longer feels looser;
     // 0 squares the body up immediately whenever you move.
-    float headLookRecenterHalflife = 0.35f;
+    float headLookRecenterHalflife = TPD(avatar, headLookRecenterHalflife);
     // Half-life (seconds) of the leg IK fading in and out as the gait starts
     // and stops. `grounded` is genuinely ragged crossing bumpy ground — the
     // body really does leave the surface cresting each bump — and switching the
@@ -519,7 +572,7 @@ struct Tuning {
     // hang every time, which is what "the arms shoot up straight going uphill"
     // is. Longer is smoother but makes the legs slower to commit to the ground
     // on landing; 0 restores the old hard switch.
-    float ikBlendHalflife = 0.08f;
+    float ikBlendHalflife = TPD(avatar, ikBlendHalflife);
     // How long (seconds) the body must be continuously off the ground before
     // the air-state clips believe it. `grounded` drops false for a tick at a
     // time cresting bumps, and the jump/fall/land clips used to fire on that
@@ -527,7 +580,7 @@ struct Tuning {
     // one-shot over and over, which is the tweaking. A real jump clears this in
     // one tick; a bump crest never does. Too high and a genuine jump animates
     // late. 0 restores the old undebounced behaviour.
-    float airDebounce = 0.12f;
+    float airDebounce = TPD(avatar, airDebounce);
     // ---- what counts as a FALL, and how wild it looks -----------------------
     // THE FLAIL IS RAMPED, NOT SWITCHED. `fall` used to be a single wide pose
     // (both arms out in front, both legs raked behind) that started whole the
@@ -540,8 +593,8 @@ struct Tuning {
     //
     // Seconds of air before the flail starts to come in, and seconds it takes
     // to reach full once it does.
-    float fallFlailDelay = 0.35f;
-    float fallFlailRamp = 0.9f;
+    float fallFlailDelay = TPD(avatar, fallFlailDelay);
+    float fallFlailRamp = TPD(avatar, fallFlailRamp);
     // ---- THE AIRBORNE POSE IS DRIVEN BY VERTICAL VELOCITY, NOT BY A CLOCK ----
     //
     // `fall` is a 900 ms LOOPING clip whose two keyframes are ten degrees apart,
@@ -555,35 +608,36 @@ struct Tuning {
     //
     // Off restores the clip-driven air pose (`jump` + `fall` + the flail ramp
     // above), which is the A/B arm for judging this.
-    bool airPose = true;
+    bool airPose = TPD(avatar, airPose);
     // The upward speed that reads as a full-power launch and the downward speed
     // that reads as a committed fall, m/s. These NORMALIZE `vel.y` into the
     // pose's phase: at +riseSpeed the body is fully in the tuck, at 0 it is at
     // the apex, at -fallSpeed it is fully in the reach. Default rise is the
     // player's own jumpSpeed, so a jump starts exactly at the tuck; fall is
     // higher than any jump because a drop keeps accelerating past it.
-    float airPoseRiseSpeed = 5.25f;
-    float airPoseFallSpeed = 9.0f;
+    float airPoseRiseSpeed = TPD(avatar, airPoseRiseSpeed);
+    float airPoseFallSpeed = TPD(avatar, airPoseFallSpeed);
     // Height above the ground, in metres, at which the legs start reaching for
     // the landing. This is the part that makes a fall read as a fall rather
     // than as a floating pose: the feet come down and the body tips into the
     // landing BEFORE contact. Probed against the CPU mirror, so a fall the
     // mirror cannot see yet simply keeps the reach pose. 0 disables it.
-    float airPoseLandHeight = 1.1f;
+    float airPoseLandHeight = TPD(avatar, airPoseLandHeight);
     // How far the body leans into its own horizontal travel while airborne,
     // degrees at the def's top speed. A running jump tips forward; a standing
     // one does not. Half of it is taken by the pelvis and half by the spine
     // above it, so the back curves rather than tilting as a plank.
-    float airPoseLean = 16.0f;
+    float airPoseLean = TPD(avatar, airPoseLean);
     // Meters the body must have DROPPED below the height it last had support at
     // before the fall clip may play at all. Air time alone is not a fall: a
     // step-down clears any debounce, and so does cresting a bump at speed.
     // Distance is the honest question, and it is the one a player would answer.
-    float fallMinDrop = 1.2f;
+    float fallMinDrop = TPD(avatar, fallMinDrop);
     // Damage/dismemberment feel.
-    float severImpulse = 6.0f;   // extra shove given to a part as it comes off
+    // extra shove given to a part as it comes off
+    float severImpulse = TPD(avatar, severImpulse);
     // How long the corpse's parts stay before the avatar can respawn, seconds.
-    float respawnDelay = 3.0f;
+    float respawnDelay = TPD(avatar, respawnDelay);
     // ---- WHAT YOUR ZOMBIE TAKES WITH IT -----------------------------------
     //
     // The avatar turns like anybody else: die with the rot in you and your own
@@ -601,7 +655,7 @@ struct Tuning {
     //
     // CPU-only, read at the one seam (MobSystem::SetAvatarKitFn, bound in
     // main.cpp). Nothing here reaches a shader or the CA.
-    bool keepKitOnTurn = true;
+    bool keepKitOnTurn = TPD(avatar, keepKitOnTurn);
   } avatar;
 
   // ---- sound ----
@@ -611,150 +665,160 @@ struct Tuning {
   // thread must never touch this struct, since F5 replaces it wholesale
   // (see src/audio/voice.h for the threading contract).
   struct Audio {
-    bool enabled = true;
-    float masterVolume = 0.8f;
+    bool enabled = TPD(audio, enabled);
+    float masterVolume = TPD(audio, masterVolume);
 
     // Footsteps. `volume` is the overall trim; per-material trims multiply it.
-    float footstepVolume = 0.85f;
+    float footstepVolume = TPD(audio, footstepVolume);
     // Audible radius in meters — the distance at which a step falls to the
     // gain floor. Steps are small sounds; a big radius makes them carry
     // unnaturally and wastes voices on inaudible ones.
-    float footstepRadius = 22.0f;
+    float footstepRadius = TPD(audio, footstepRadius);
     // Step pitch is randomized per trigger to hide sample repetition. This is
     // the half-range: 0.06 means each step lands in [0.94, 1.06] of natural
     // rate. Too much and the surface changes identity step to step.
-    float footstepPitchJitter = 0.06f;
+    float footstepPitchJitter = TPD(audio, footstepPitchJitter);
     // Loudness at walking pace vs at sprint. Speed maps between them, so a
     // sneak is quiet and a sprint is not merely faster but heavier.
-    float footstepWalkGain = 0.55f;
-    float footstepSprintGain = 1.0f;
+    float footstepWalkGain = TPD(audio, footstepWalkGain);
+    float footstepSprintGain = TPD(audio, footstepSprintGain);
     // Speed (m/s) that counts as a full sprint for the mapping above.
-    float footstepSprintSpeed = 7.0f;
+    float footstepSprintSpeed = TPD(audio, footstepSprintSpeed);
     // Left and right feet are pitched apart by this fraction so a gait reads
     // as two feet rather than one repeated impact.
-    float footstepFootDetune = 0.03f;
+    float footstepFootDetune = TPD(audio, footstepFootDetune);
 
     // Landing after a fall: gain scales with impact speed up to this speed
     // (m/s), which also caps the pitch drop.
-    float landVolume = 1.0f;
-    float landFullSpeed = 12.0f;
+    float landVolume = TPD(audio, landVolume);
+    float landFullSpeed = TPD(audio, landFullSpeed);
 
     // Physical impacts (debris, bodies).
-    float impactVolume = 0.9f;
-    float impactRadius = 30.0f;
+    float impactVolume = TPD(audio, impactVolume);
+    float impactRadius = TPD(audio, impactRadius);
     // THE GATE. Contact speed (m/s) below which a landing is not a sound at
     // all. This is the knob that makes a settling pile silent instead of a
     // machine gun, and it is enforced inside the Jolt contact listener, so
     // raising it is genuinely free — rejected contacts never become events.
     // A rock rolling to rest touches down at centimetres per second; a rock
     // that FELL arrives at several m/s, and the gap between them is wide.
-    float impactMinSpeed = 2.5f;
+    float impactMinSpeed = TPD(audio, impactMinSpeed);
     // Contact speed (m/s) that counts as a full-energy impact: gain tops out
     // and pitch bottoms out here. Held above impactMinSpeed by the consumer.
-    float impactFullSpeed = 14.0f;
+    float impactFullSpeed = TPD(audio, impactFullSpeed);
     // Minimum seconds between two impacts from the SAME body. A tumbling rock
     // generates a contact per bounce and per face; without this one fall is a
     // clatter of six identical thuds.
-    float impactMinGap = 0.25f;
+    float impactMinGap = TPD(audio, impactMinGap);
 
     // Something coming apart: terrain losing support and detaching as a
     // rigidbody, or being dug/blasted loose.
-    float breakVolume = 1.0f;
+    float breakVolume = TPD(audio, breakVolume);
     // Breaks carry further than impacts — a tree limb giving way is a loud,
     // low event and hearing it from off-screen is most of its value.
-    float breakRadius = 45.0f;
+    float breakRadius = TPD(audio, breakRadius);
     // Half-range of the per-event random detune, in SEMITONES. Expressed in
     // semitones rather than as a rate multiplier because that is the unit the
     // ear (and whoever is tuning this) actually thinks in; cues.cpp converts
     // with 2^(n/12). 5 is wide — deliberately, since one support scan can free
     // several islands in the same tick and identical repeats read as a
     // machine. Beyond ~7 the material stops sounding like itself.
-    float breakPitchSemitones = 5.0f;
+    float breakPitchSemitones = TPD(audio, breakPitchSemitones);
     // Pitch centre by piece size: a lone voxel snapping is a twig, a large
     // island is a log. These are the rate multipliers at the two ends, and a
     // piece's voxel count maps between them (see breakBigVoxels).
-    float breakSmallRate = 1.25f;
-    float breakBigRate = 0.8f;
+    float breakSmallRate = TPD(audio, breakSmallRate);
+    float breakBigRate = TPD(audio, breakBigRate);
     // Voxel count that counts as "big" for the mapping above.
-    float breakBigVoxels = 400.0f;
+    float breakBigVoxels = TPD(audio, breakBigVoxels);
     // Creature voices (hurt/death/sever/...). Kept separate from impacts
     // because a mob crying out and a rock landing are mixed against each
     // other, and one trim cannot serve both.
-    float mobVolume = 1.0f;
-    float mobRadius = 45.0f;
-    float mobPitchJitter = 0.07f;
+    float mobVolume = TPD(audio, mobVolume);
+    float mobRadius = TPD(audio, mobRadius);
+    float mobPitchJitter = TPD(audio, mobPitchJitter);
 
     // The blade cut itself, separate from the creature's cry (which is the
     // `sever` slot on mobVolume). Its own trim because a wet mechanical sound
     // and a voice sit differently in the mix, and a wider jitter because four
     // takes have to cover a whole fight.
-    float dismemberVolume = 1.0f;
-    float dismemberPitchJitter = 0.12f;
+    float dismemberVolume = TPD(audio, dismemberVolume);
+    float dismemberPitchJitter = TPD(audio, dismemberPitchJitter);
 
     // Bleeding: a positioned wet loop while a wound is pumping hard.
-    float bleedVolume = 0.9f;
-    float bleedRadius = 18.0f;
+    float bleedVolume = TPD(audio, bleedVolume);
+    float bleedRadius = TPD(audio, bleedRadius);
     // Intensity (0..1 of the bleed budget cap) to START the loop, and the
     // lower level it must fall back through to STOP. Two thresholds, not one:
     // a wound sitting exactly on a single threshold retriggers the voice every
     // frame. On > off is required and enforced at load.
-    float bleedOnThreshold = 0.35f;
-    float bleedOffThreshold = 0.12f;
+    float bleedOnThreshold = TPD(audio, bleedOnThreshold);
+    float bleedOffThreshold = TPD(audio, bleedOffThreshold);
 
     // The automatic material ambience bed: one positioned loop following the
     // largest nearby body of a material that binds an "ambience" set (water,
     // lava). Unlike the night bed this one IS a thing at a place — it pans and
     // it occludes — so the radius is what decides how far a lake carries.
-    float ambienceVolume = 0.7f;
-    float ambienceRadius = 40.0f;
+    float ambienceVolume = TPD(audio, ambienceVolume);
+    float ambienceRadius = TPD(audio, ambienceRadius);
 
     // The night bed (assets/sounds/ambience/starlight). Rare by design.
-    float nightVolume = 0.5f;
+    float nightVolume = TPD(audio, nightVolume);
     // Audible radius. Large because the bed is centred on the listener and is
     // meant to sit around them rather than to come from a place.
-    float nightRadius = 60.0f;
+    float nightRadius = TPD(audio, nightRadius);
     // Chance, per retry, that a new pass begins. With the defaults below that
     // is one roll a minute at 8%, so most nights stay silent and the bed is an
     // event rather than a backing track.
-    float nightChance = 0.08f;
-    float nightRetrySeconds = 60.0f;
+    float nightChance = TPD(audio, nightChance);
+    float nightRetrySeconds = TPD(audio, nightRetrySeconds);
     // Per-frame easing factor for the fade in and out. Small = slow: the bed
     // should arrive and leave without the player catching either moment.
-    float nightFadeRate = 0.004f;
+    float nightFadeRate = TPD(audio, nightFadeRate);
 
     // Reverb send for world sounds, 0..1. The engine's FDN reverb is what
     // makes a cave read as a cave; keep it modest for outdoor-heavy worlds.
-    float reverbWet = 0.16f;
+    float reverbWet = TPD(audio, reverbWet);
 
     // ---- occlusion ----
     // See src/audio/occlusion.h for the model. These are the knobs that decide
     // how much a wall between you and a sound matters.
-    bool occlusion = true;
-    float occlusionMaxDb = 24.0f;      // cap on the broadband duck
-    float occlusionMinCutoffHz = 320.0f;  // fully-muffled low-pass floor
-    float occlusionScale = 1.0f;       // multiplies the accumulated dB
-    float occlusionCutoffScale = 1.0f; // <1 = darker through walls
-    float occlusionMaxRangeM = 40.0f;  // never trace a ray longer than this
+    bool occlusion = TPD(audio, occlusion);
+    // cap on the broadband duck
+    float occlusionMaxDb = TPD(audio, occlusionMaxDb);
+    // fully-muffled low-pass floor
+    float occlusionMinCutoffHz = TPD(audio, occlusionMinCutoffHz);
+    // multiplies the accumulated dB
+    float occlusionScale = TPD(audio, occlusionScale);
+    // <1 = darker through walls
+    float occlusionCutoffScale = TPD(audio, occlusionCutoffScale);
+    // never trace a ray longer than this
+    float occlusionMaxRangeM = TPD(audio, occlusionMaxRangeM);
     // How much of the reverb send survives an occluded path. High values keep
     // a blocked sound present-but-muffled instead of switching it off.
-    float occlusionWetKeep = 0.7f;
+    float occlusionWetKeep = TPD(audio, occlusionWetKeep);
   } audio;
 
   // ---- Jolt rigid bodies ----
   struct Physics {
-    float gravity = 9.81f;
-    int collisionSteps = 1;
-    float debrisFriction = 0.75f, debrisRestitution = 0.05f;
-    float debrisLinearDamping = 0.05f, debrisAngularDamping = 0.15f;
+    float gravity = TPD(physics, gravity);
+    int collisionSteps = TPD(physics, collisionSteps);
+    float debrisFriction = TPD(physics, debrisFriction);
+    float debrisRestitution = TPD(physics, debrisRestitution);
+    float debrisLinearDamping = TPD(physics, debrisLinearDamping);
+    float debrisAngularDamping = TPD(physics, debrisAngularDamping);
     // Drag a rigidbody feels from the LIQUID it is in, as opposed to the air
     // damping above (docs/PLAN_debris_buoyancy.md phase 3). Jolt's own
     // buoyancy coefficients: linear is a quadratic drag against the submerged
     // frontal area, angular damps the tumble. The pair is what makes a floating
     // log stop wallowing and go to sleep instead of bobbing forever.
-    float waterLinearDrag = 0.8f, waterAngularDrag = 0.25f;
-    float terrainFriction = 0.85f, playerProxyFriction = 0.3f;
-    float explosionImpulseScale = 0.15f;
-    float explosionImpulseRadiusScale = 3.0f;
+    float waterLinearDrag = TPD(physics, waterLinearDrag);
+    float waterAngularDrag = TPD(physics, waterAngularDrag);
+    float terrainFriction = TPD(physics, terrainFriction);
+    float playerProxyFriction = TPD(physics, playerProxyFriction);
+    float explosionImpulseScale = TPD(physics, explosionImpulseScale);
+    float explosionImpulseRadiusScale =
+        TPD(physics, explosionImpulseRadiusScale);
     // The fastest the per-body blast impulse may make any ONE body go, m/s.
     // impulse / mass is unbounded from below in mass: a 0.05 kg gobbet carved
     // off a creature by the same explosion took 1000 m/s (Jolt's own ceiling
@@ -762,16 +826,16 @@ struct Tuning {
     // just left — "bodies zoom across the map" when a blast was big enough to
     // carve. Ordinary debris (a 2.5 kg stone voxel takes 20 m/s from the
     // X-detonate charge) never reaches this.
-    float explosionMaxSpeed = 30.0f;
+    float explosionMaxSpeed = TPD(physics, explosionMaxSpeed);
     // How far an explosion actually BLOWS VOXELS OFF bodies, as a multiple of
     // the destruction radius. Kept separate from the impulse reach on purpose:
     // the blast should push objects from further away than it dismembers them,
     // so this is normally the smaller of the two.
-    float explosionBodyDamageScale = 1.0f;
+    float explosionBodyDamageScale = TPD(physics, explosionBodyDamageScale);
     // Player proxy mass: the shove-strength knob. Contact impulses split by
     // mass ratio, so this vs a body's density-derived mass decides how far a
     // walking player moves it.
-    float playerMassKg = 80.0f;
+    float playerMassKg = TPD(physics, playerMassKg);
     // ---- A LIVING CREATURE MAY LEAN INTO YOU (PlayerPushOut) --------------
     //
     // How deep a LIVE rig's limb may sit inside the player's capsule before it
@@ -805,11 +869,12 @@ struct Tuning {
     // what the full depenetration was worth at 30 Hz (~36 m/s).
     //
     // Zero slack with a huge cap is the old behaviour exactly.
-    float creaturePhaseVox = 1.5f;
-    float creaturePushMaxVox = 0.35f;
+    float creaturePhaseVox = TPD(physics, creaturePhaseVox);
+    float creaturePushMaxVox = TPD(physics, creaturePushMaxVox);
     // Rolling spheres (analytic colliders, not boxed voxels).
-    float sphereFriction = 0.5f, sphereRestitution = 0.3f;
-    float sphereAngularDamping = 0.05f;
+    float sphereFriction = TPD(physics, sphereFriction);
+    float sphereRestitution = TPD(physics, sphereRestitution);
+    float sphereAngularDamping = TPD(physics, sphereAngularDamping);
   } physics;
 
   // ---- live ragdoll: a creature goes limp and gets back up (game/mob.h) ----
@@ -819,23 +884,23 @@ struct Tuning {
   struct Ragdoll {
     // Continuous freefall before a creature goes limp mid-air. NPCs fall under
     // the same gravity as the player since this landed (they used to hang).
-    float fallSeconds = 1.5f;
+    float fallSeconds = TPD(ragdoll, fallSeconds);
     // A blast within radius * blastRadiusScale of a body launches it. The
     // impulse at the centre is power * blastImpulseScale (kg*m/s), falling
     // off linearly to zero at that reach; launch speed is impulse / body mass,
     // so a heavy creature flies less far than a light one from the same
     // charge, and a grenade (power 380) sends ~70 kg about 5 m/s.
-    float blastRadiusScale = 3.0f;
-    float blastImpulseScale = 1.0f;
+    float blastRadiusScale = TPD(ragdoll, blastRadiusScale);
+    float blastImpulseScale = TPD(ragdoll, blastImpulseScale);
     // Below this launch speed (m/s) a blast does not knock the creature down
     // at all; above maxLaunchSpeed it is clamped, which is what keeps a large
     // charge from putting a body into orbit. "Across the room, not across
     // the map" — a massive explosion still tops out here.
-    float blastMinSpeed = 1.5f;
-    float maxLaunchSpeed = 14.0f;
+    float blastMinSpeed = TPD(ragdoll, blastMinSpeed);
+    float maxLaunchSpeed = TPD(ragdoll, maxLaunchSpeed);
     // Fraction of straight-up mixed into the launch direction, so a body on
     // the floor beside a blast arcs rather than skidding along the ground.
-    float blastUpBias = 0.45f;
+    float blastUpBias = TPD(ragdoll, blastUpBias);
     // ---- THE TUMBLE (Mob::BlastRadial) -------------------------------------
     // How much a limb's OWN distance to the charge varies the shove it takes,
     // as a fraction: 0 is the flat launch every limb used to get (a body that
@@ -843,7 +908,7 @@ struct Tuning {
     // each limb by its own falloff over the rig's mean. The differential is
     // deliberately small — enough that a blast at the ankles clearly lifts the
     // legs before the head, not enough to tear a rig apart.
-    float blastLimbBias = 0.35f;
+    float blastLimbBias = TPD(ragdoll, blastLimbBias);
     // The per-limb differential is reduced to ONE rigid motion — a launch
     // velocity at the rig's centre of mass plus a spin about it — so no
     // constraint is violated and the joints do no launching (see
@@ -851,36 +916,36 @@ struct Tuning {
     // POINT-MASS inertia (each limb's own spin inertia is ignored, which
     // overstates it), so this gain corrects for that and is the dial for how
     // hard a body tumbles. The cap is the "not a helicopter" rule.
-    float blastSpinGain = 0.65f;
-    float blastMaxSpin = 8.0f;  // rad/s
+    float blastSpinGain = TPD(ragdoll, blastSpinGain);
+    float blastMaxSpin = TPD(ragdoll, blastMaxSpin);  // rad/s
     // Shortest time a creature stays limp before it may start getting up,
     // and the stillness test that then lets it: the pelvis has moved slower
     // than settleSpeed (m/s) for settleSeconds. maxSeconds is the ceiling
     // for a body that never settles (wedged, twitching on a slope).
-    float minSeconds = 1.0f;
-    float settleSpeed = 0.35f;
-    float settleSeconds = 0.5f;
-    float maxSeconds = 8.0f;
+    float minSeconds = TPD(ragdoll, minSeconds);
+    float settleSpeed = TPD(ragdoll, settleSpeed);
+    float settleSeconds = TPD(ragdoll, settleSeconds);
+    float maxSeconds = TPD(ragdoll, maxSeconds);
     // The procedural get-up: every limb blends from where it landed into a
     // crouched pose (torso pitched getUpPitchDeg forward about the feet, hips
     // dropped getUpDropFrac of the standing hip height), which then rises to
     // the ordinary standing pose over getUpSeconds in total.
-    float getUpSeconds = 1.5f;
-    float getUpPitchDeg = 60.0f;
-    float getUpDropFrac = 0.45f;
+    float getUpSeconds = TPD(ragdoll, getUpSeconds);
+    float getUpPitchDeg = TPD(ragdoll, getUpPitchDeg);
+    float getUpDropFrac = TPD(ragdoll, getUpDropFrac);
     // How long the dev panel's "ragdoll me" keeps the player down.
-    float devSeconds = 3.0f;
+    float devSeconds = TPD(ragdoll, devSeconds);
   } ragdoll;
 
   // ---- debris / island -> rigidbody conversion ----
   struct Debris {
-    int minBodyVoxels = 8;
-    int minBurnFragmentVoxels = 24;
-    int maxNewBodiesPerTick = 4;
-    int settleAfterTicks = 60;
-    float alignCos = 0.94f;
-    int maxBodies = 200;
-    int burnOpsPerTick = 384;
+    int minBodyVoxels = TPD(debris, minBodyVoxels);
+    int minBurnFragmentVoxels = TPD(debris, minBurnFragmentVoxels);
+    int maxNewBodiesPerTick = TPD(debris, maxNewBodiesPerTick);
+    int settleAfterTicks = TPD(debris, settleAfterTicks);
+    float alignCos = TPD(debris, alignCos);
+    int maxBodies = TPD(debris, maxBodies);
+    int burnOpsPerTick = TPD(debris, burnOpsPerTick);
   } debris;
 
   // ---- gore ------------------------------------------------------------------
@@ -921,25 +986,27 @@ struct Tuning {
     // Lifetime in ticks, and how finely a droplet is subdivided (2/3/4/6 micro
     // voxels per world voxel). Life is the guarantee that spray CLEARS: no
     // droplet outlives it, whether or not it ever hits anything.
-    int microLifeTicks = 70;
-    int microScale = 4;
+    int microLifeTicks = TPD(gore, microLifeTicks);
+    int microScale = TPD(gore, microScale);
 
     // ---- A2. spray from an open wound (the drip's companion) ----
     // Droplets per whole blood voxel a wound drips. Bleeding already drips real
     // voxels into the grid; this is the visible spray that accompanies each
     // drip, so it multiplies an existing, already-bounded rate.
-    float bleedSprayPerDrip = 3.0f;
-    float bleedSpraySpeed = 3.5f;      // voxels/sec, upward-biased cone
-    float bleedSprayCone = 0.55f;      // lateral spread as a fraction of speed
+    float bleedSprayPerDrip = TPD(gore, bleedSprayPerDrip);
+    // voxels/sec, upward-biased cone
+    float bleedSpraySpeed = TPD(gore, bleedSpraySpeed);
+    // lateral spread as a fraction of speed
+    float bleedSprayCone = TPD(gore, bleedSprayCone);
 
     // ---- A3. spray from a dismemberment (the arterial gout) ----
     // `severSpray` droplets are emitted over `severDecayTicks`, front-loaded so
     // the gout is at the cut and the tail dies down — a flat rate over the same
     // window reads as a sprinkler rather than a wound.
-    int severSpray = 220;
-    int severDecayTicks = 45;
-    float severSpraySpeed = 9.0f;
-    float severSprayCone = 0.8f;
+    int severSpray = TPD(gore, severSpray);
+    int severDecayTicks = TPD(gore, severDecayTicks);
+    float severSpraySpeed = TPD(gore, severSpraySpeed);
+    float severSprayCone = TPD(gore, severSprayCone);
 
     // ========================================================================
     // B. WHOLE-VOXEL BLOOD — real matter the CA carries. Pools, flows, persists.
@@ -952,11 +1019,12 @@ struct Tuning {
     // it decides the size of the puddle still on the floor a minute later. The
     // cap is what stops a huge hit turning into a minute-long fountain, and is
     // the real bound on how much matter one wound can push into the CA.
-    float bleedVoxelGain = 1.0f;
-    float bleedBudgetCap = 120.0f;   // max voxels one wound can still owe
+    float bleedVoxelGain = TPD(gore, bleedVoxelGain);
+    // max voxels one wound can still owe
+    float bleedBudgetCap = TPD(gore, bleedBudgetCap);
     // Voxels added to the stump's budget when a limb comes off, on top of the
     // thrown sever voxels below. This is the puddle under a fresh amputation.
-    float severStumpBudget = 40.0f;
+    float severStumpBudget = TPD(gore, severStumpBudget);
     // A CORPSE BLEEDS FROM WHERE IT IS CUT. Every debris body that was once
     // flesh carries a wound of its own (DebrisSystem::BodyWound): the neck
     // stump on the torso and the head that came off it each drip from their
@@ -964,7 +1032,7 @@ struct Tuning {
     // through the same cap as a live wound; a cut that takes a piece off also
     // arms the sever gout and the stump budget above on BOTH pieces, so a
     // dismembered corpse bleeds like a dismembered creature, minus the hp.
-    float corpseBleedPerVoxel = 1.5f;
+    float corpseBleedPerVoxel = TPD(gore, corpseBleedPerVoxel);
     // ---- WHAT STILL HOLDS A CORPSE TOGETHER (2026-09-20) -------------------
     //
     // A corpse is a dozen bodies held by the joints Mob::Die leaves on, and
@@ -975,7 +1043,7 @@ struct Tuning {
     // no voxel survives within this many WORLD voxels of a joint's anchor,
     // the joint has nothing left to hold and lets go. 0 disables corpse
     // dismemberment entirely and puts the heads back on.
-    float corpseJointHold = 1.1f;
+    float corpseJointHold = TPD(gore, corpseJointHold);
     // ...AND HOW LITTLE OF IT IS TOO LITTLE. A binary "no voxel at all within
     // the radius" test is the trap phys/kerf.h already names in another form:
     // ONE surviving straggler keeps a head on forever. Measured — 60 chops at
@@ -985,14 +1053,16 @@ struct Tuning {
     // (Mob::CarveLimb measures its neck against `neckAtSpawn` for exactly this
     // reason). 1.0 parts a joint the moment anything is taken; 0 restores the
     // all-or-nothing rule and puts the heads back on.
-    float corpseJointCut = 0.12f;
+    float corpseJointCut = TPD(gore, corpseJointCut);
 
     // ---- B2. how fast that budget leaves the wound, and in what size lumps ----
     // Rate is a PERIOD, not a chance, because bleeding must stay bounded per
     // rule 2: a wound drips at most once every `bleedDripTicks`, and at most
     // `bleedOpsPerTick` drips happen across all limbs of all mobs in a tick.
-    int bleedDripTicks = 4;      // ticks between drips from one wound
-    int bleedOpsPerTick = 6;     // global op budget for drips, per tick
+    // ticks between drips from one wound
+    int bleedDripTicks = TPD(gore, bleedDripTicks);
+    // global op budget for drips, per tick
+    int bleedOpsPerTick = TPD(gore, bleedOpsPerTick);
     // CLUMP SIZE: the brush radius of one drip, so a drip can be a single bead
     // or a thick gout. A BrushOp paints a solid sphere (sim_mutate.wgsl tests
     // dot(local,local) <= radius^2), so this is a VOLUME dial, not a width one:
@@ -1006,12 +1076,12 @@ struct Tuning {
     // (see BleedClumpVoxels below). Otherwise raising clump size multiplies the
     // matter entering the world while `bleedBudgetCap` reports the same number,
     // and rule 2's bound quietly becomes a 123x underestimate.
-    int bleedClumpRadius = 0;
+    int bleedClumpRadius = TPD(gore, bleedClumpRadius);
     // Whole blood VOXELS thrown by a cut, alongside the sub-voxel gout. Kept
     // small next to the hundreds of micro droplets — the spray does the visual
     // work, these do the lasting mess.
-    int severVoxels = 14;
-    float severVoxelSpeed = 6.0f;
+    int severVoxels = TPD(gore, severVoxels);
+    float severVoxelSpeed = TPD(gore, severVoxelSpeed);
     // GOBBET SIZE: how many thrown voxels travel together as one lump.
     //
     // This is NOT a brush radius, and the difference is forced by the engine
@@ -1028,12 +1098,12 @@ struct Tuning {
     // rather than multiplying it: 14 voxels at gobbet 1 is fourteen scattered
     // cells, at gobbet 7 it is two fat gouts. Matter thrown is unchanged, which
     // is what keeps this a look knob and not a perf knob.
-    int severGobbetVoxels = 1;
+    int severGobbetVoxels = TPD(gore, severGobbetVoxels);
     // How far apart a gobbet's members are spread at launch, in voxels. Zero
     // stacks them on one cell, where the claim lattice lets exactly one win and
     // the rest retry next tick — a slow-motion drip instead of a lump. A small
     // jitter gives them distinct target cells so they land together.
-    float severGobbetSpread = 0.6f;
+    float severGobbetSpread = TPD(gore, severGobbetSpread);
 
     // ========================================================================
     // C. PER-INSTANCE VARIANCE
@@ -1058,7 +1128,7 @@ struct Tuning {
     // NOTE it scales COUNTS, not the whole-voxel budget: bleedVoxelGain is the
     // volume dial and is deliberately not per-instance, because a wound budget
     // that varies per mob makes the bleedBudgetCap bound unreadable.
-    float bleedGain = 1.0f;
+    float bleedGain = TPD(gore, bleedGain);
     Variance bleedGainVar;
 
     // ========================================================================
@@ -1077,24 +1147,24 @@ struct Tuning {
     // to the same Hash3 draw, the falloff exponent lerps back to 1, and the
     // spall pass is skipped) — that identity is asserted by the mob gate, so
     // the knob is a genuine A/B rather than an approximation of one.
-    float carveChunkiness = 0.65f;
+    float carveChunkiness = TPD(gore, carveChunkiness);
     // Feature size of the correlated noise, in SKIN voxels. This is the size of
     // the lumps that come off. Kept on the skin lattice for the same reason the
     // rim jitter already is: the crater's shape must be a property of the ART,
     // not of whichever collider resolution the engine happened to derive, or
     // the same blast tears differently on two rigs that differ only in scale.
-    float carveBlobSize = 3.5f;
+    float carveBlobSize = TPD(gore, carveBlobSize);
     // Exponent on the radial falloff at full chunkiness. Higher concentrates
     // the removal at the blast: at 3, the chance is 0.42 at half the radius and
     // 0.047 at 80% of it, against 0.75 and 0.36 before.
-    float carveFalloff = 3.0f;
+    float carveFalloff = TPD(gore, carveFalloff);
     // How many SPALL rounds run after the radial pass. Each round takes
     // surviving voxels that are inside the blast and already have enough
     // missing face-neighbours — so a hole grows into its own rim instead of a
     // second blast having to find fresh voxels. This is what makes damage
     // accumulate in one place, and what makes a blast beside an arm take the
     // arm. Bounded and small: each round is one pass over the limb's voxels.
-    int carveSpallRounds = 2;
+    int carveSpallRounds = TPD(gore, carveSpallRounds);
 
     // ========================================================================
     // E. THE WOUND MODEL — what a BLADE does, as opposed to a blast
@@ -1118,24 +1188,24 @@ struct Tuning {
     // full swing opens a gash three times as deep, and that ratio IS the
     // "a big enough sword dismembers in one or two blows" rule — no separate
     // chance roll decides it.
-    float cutDepth = 0.08f;
-    float cutDepthPower = 0.32f;
+    float cutDepth = TPD(gore, cutDepth);
+    float cutDepthPower = TPD(gore, cutDepthPower);
     // Half-length of the slot ALONG the edge, at full power. A cut is a slice,
     // not a hole: this is what makes it read as an edge passing through rather
     // than as a bite. Scaled by 0.4 + 0.6 * power so a graze is short.
-    float cutLength = 0.90f;
+    float cutLength = TPD(gore, cutLength);
     // Kerf half-thickness as a MULTIPLE of the blade's own authored
     // edgeHalfWidth (item.h). Below 1 because the authored half-width is the
     // widest part of the blade and the edge itself is thinner; the taper toward
     // the bottom of the cut is applied on top of this.
-    float cutWidth = 0.20f;
+    float cutWidth = TPD(gore, cutWidth);
     // Spall applied to a cut, separately from the blast's carveSpallRounds. A
     // cut wants a LITTLE of it — enough that the second blow into the same
     // gash widens it instead of stippling fresh flesh beside it (that is the
     // "sustained hits dismember" mechanism), and not so much that one swing
     // tears an arm off. Zero makes every cut a clean bore.
-    int cutSpallRounds = 1;
-    float cutSpallStrength = 0.30f;
+    int cutSpallRounds = TPD(gore, cutSpallRounds);
+    float cutSpallStrength = TPD(gore, cutSpallStrength);
 
     // ---- E2. heft: how much weapon is behind the edge -----------------------
     // The item's own voxel volume in WORLD voxels that reads as heft 1.0.
@@ -1144,10 +1214,10 @@ struct Tuning {
     // sync with it (item.h ItemDef::heftVolume). The stock arming sword is
     // 340 art voxels at scale 4 = 5.3 world voxels, which is where this
     // default comes from — retune it and every weapon rescales together.
-    float woundHeftRef = 5.3f;
+    float woundHeftRef = TPD(gore, woundHeftRef);
     // Ceiling on the derived factor, so a comically large authored prop cannot
     // turn one swing into an amputation by arithmetic alone.
-    float woundHeftMax = 4.0f;
+    float woundHeftMax = TPD(gore, woundHeftMax);
 
     // ---- E3. blood on the flesh --------------------------------------------
     // A cut leaves the meat around it soaked. Same mechanism as charring: the
@@ -1162,9 +1232,9 @@ struct Tuning {
     // wound looks like), `woundStainDensity` on a BURIED one (what a later cut
     // finds). Bone is never soaked (MobDef::tissue), so the hole shows it
     // through the blood instead of one more red voxel.
-    float woundStainRadius = 0.90f;
-    float woundStainSurface = 0.90f;
-    float woundStainDensity = 0.30f;
+    float woundStainRadius = TPD(gore, woundStainRadius);
+    float woundStainSurface = TPD(gore, woundStainSurface);
+    float woundStainDensity = TPD(gore, woundStainDensity);
     // WHITE NOISE CANNOT MAKE A SMEAR, for the same reason it cannot make a
     // chunk (see carveChunkiness). An independent draw per voxel has no
     // feature size, so a soak thresholded against it is a fine red speckle
@@ -1176,8 +1246,8 @@ struct Tuning {
     // the feature size in WORLD voxels, like every other radius here, so a
     // fine skin gets a finer-grained field of the same physical size instead
     // of blotches eight times too big.
-    float woundStainBlob = 0.5f;
-    float woundStainCoherence = 0.8f;
+    float woundStainBlob = TPD(gore, woundStainBlob);
+    float woundStainCoherence = TPD(gore, woundStainCoherence);
     // A CRATER IS NOT A KERF. The blade's soak is a ball of `woundStainRadius`
     // round the slot it cut, which describes a kerf fairly. A blast crater's
     // predicate removes with a chance that falls to zero at the rim, so a
@@ -1190,7 +1260,7 @@ struct Tuning {
     // is the right unit for "a cell of rim", and it is what keeps a scratch a
     // scratch on a rig authored at any scale. The tint rides at the same
     // stainCutRadius : woundStainRadius ratio the kerf uses.
-    float craterStainRim = 1.5f;
+    float craterStainRim = TPD(gore, craterStainRim);
     // ---- E3a. AND THEN THE SOAK DRIES BACK TO FLESH (2026-09-14) -----------
     // The soak above is the creature's blood as a MATERIAL, sitting in the
     // limb's own lattice — and the body burn pass runs the ordinary authored
@@ -1212,8 +1282,8 @@ struct Tuning {
     // a zombie go on rotting outward and shedding its parts. Per-creature as
     // well as global — mob sidecar `bleed.woundHeals` (MobDef::woundHeals) —
     // so the living and the walking dead can disagree in one content key.
-    bool woundHeals = true;
-    float woundHealSlow = 2.0f;
+    bool woundHeals = TPD(gore, woundHeals);
+    float woundHealSlow = TPD(gore, woundHealSlow);
 
     // ---- E3b. BLOOD ON A BODY: the stain lattice (2026-09-13) --------------
     // The soak above REWRITES flesh to blood. This is the other half, and it
@@ -1231,21 +1301,21 @@ struct Tuning {
     // `stainCutBuriedChance`, low so a later cut finds meat that bled a
     // little rather than a red interior. `stainBoneMin` is the FLOOR for any
     // exposed bone in range: bone is always shown bloodied to some degree.
-    float stainCutRadius = 1.6f;
-    int stainCutAmount = 15;
-    int stainCutBuried = 6;
-    float stainCutBuriedChance = 0.35f;
-    int stainBoneMin = 5;
+    float stainCutRadius = TPD(gore, stainCutRadius);
+    int stainCutAmount = TPD(gore, stainCutAmount);
+    int stainCutBuried = TPD(gore, stainCutBuried);
+    float stainCutBuriedChance = TPD(gore, stainCutBuriedChance);
+    int stainBoneMin = TPD(gore, stainBoneMin);
     // CONTACT. A limb in a blood pool, on a bloodied floor or under a drip
     // takes the liquid's authored stain (materials.json `stain`: type, amount,
     // per-mille chance per tick) on its exposed voxels, scaled by this. A dry
     // stain on the ground transfers at half its amount and this fraction of
     // its chance, so walking through old blood lightly bloodies the boots.
-    float stainContactScale = 1.0f;
-    float stainFloorTransfer = 0.35f;
+    float stainContactScale = TPD(gore, stainContactScale);
+    float stainFloorTransfer = TPD(gore, stainFloorTransfer);
     // WASHING. A liquid whose stain `washes` (water) rinses this much amount
     // off an exposed voxel per successful roll at the liquid's own chance.
-    int stainWashPerContact = 3;
+    int stainWashPerContact = TPD(gore, stainWashPerContact);
     // SPLATTER. A gout or a drip's spray is checked against every body within
     // this many voxels of the wound. The replay flies the particle kernel's
     // own arc (launch speed, then sim.partGravity), aimed across each limb in
@@ -1255,10 +1325,10 @@ struct Tuning {
     // `splatterAmount`, at most `splatterPerLimb` arcs per limb per event
     // (past that, one arc stands for several droplets and paints wider).
     // This is how killing something covers YOU in it.
-    float splatterReach = 48.0f;
-    int splatterAmount = 6;
-    int splatterPerLimb = 64;
-    float splatterSplatRadius = 0.3f;
+    float splatterReach = TPD(gore, splatterReach);
+    int splatterAmount = TPD(gore, splatterAmount);
+    int splatterPerLimb = TPD(gore, splatterPerLimb);
+    float splatterSplatRadius = TPD(gore, splatterSplatRadius);
 
     // ---- E4. when a cut becomes a dismemberment -----------------------------
     // Both rules are STRUCTURAL and both fire only on a blade cut (a burn's
@@ -1268,14 +1338,14 @@ struct Tuning {
     // this fraction of what the limb still had. That is the edge coming out the
     // other side, and it routes through Sever() so the gout, the byBlade audio
     // and the dismember loco states all fire.
-    float woundSeverFraction = 0.28f;
+    float woundSeverFraction = TPD(gore, woundSeverFraction);
     // HANGING BY A THREAD: the limb is still one piece, but the flesh at its
     // JOINT is mostly gone. Measured as the voxel count inside a sphere of
     // woundNeckRadius world voxels around the joint anchor, against the same
     // count taken on the intact limb (MobLimb::neckAtSpawn). Below this
     // fraction the limb is not attached to anything worth the name.
-    float woundNeckRadius = 0.80f;
-    float woundNeckFraction = 0.28f;
+    float woundNeckRadius = TPD(gore, woundNeckRadius);
+    float woundNeckFraction = TPD(gore, woundNeckFraction);
 
     // ---- E5. what is left of the old instant-sever thresholds ---------------
     // A limb's authored `severImpactSpeed` (assets/mobs/*.json) survives as an
@@ -1284,7 +1354,7 @@ struct Tuning {
     // outright, so at face value an ordinary swing trips them every time and
     // nothing below ever gets a chance to run. Scaling here rather than
     // rewriting every mob sidecar keeps it one knob and one rebuild-free edit.
-    float woundImpactSeverScale = 4.0f;
+    float woundImpactSeverScale = TPD(gore, woundImpactSeverScale);
 
     // ---- E6. TRAUMA AND TEETH (docs/PLAN_impact_unarmed.md §2) -------------
     //
@@ -1303,7 +1373,7 @@ struct Tuning {
     // glancing hit marks. There is no lower bound on how many blows this
     // takes: repeat hits deepen the same patch because the coat is keyed on
     // the lattice position, exactly as the blood soak is.
-    float bruiseRadius = 0.9f;
+    float bruiseRadius = TPD(gore, bruiseRadius);
     // ---- A BRUISE IS AN ALPHA THAT DEEPENS, NOT A REPAINT (2026-09-16) -----
     //
     // It used to REWRITE the skin voxel to `bruiseMat`, and that is why it
@@ -1333,11 +1403,11 @@ struct Tuning {
     // bruising at all", and that is why. At amt 6 the same expression clears
     // zero for ~87% of voxels; at 12 it saturates. A coat amount below about a
     // quarter of full is not a faint stain in this renderer, it is no stain.
-    float bruiseStep = 6.0f;
+    float bruiseStep = TPD(gore, bruiseStep);
     // ...AND IT STOPS SHORT OF OPAQUE. 12 of 15 is 80%: deep purple, and still
     // short of the flat stain colour that would cost the anatomy underneath.
     // What happens past here is not a darker bruise, it is blood.
-    float bruiseMax = 12.0f;
+    float bruiseMax = TPD(gore, bruiseMax);
     // AND THEN IT BREAKS. Per-voxel chance, at full power, that a blow lays
     // BLOOD over a voxel ALREADY AT THE CEILING instead of doing nothing --
     // "each hit adds until 80%, and then after that is blood". A chance rather
@@ -1345,7 +1415,7 @@ struct Tuning {
     // several blows and the two coats interleave the way a real contusion does;
     // at 0.5 a saturated patch is visibly bloody within two or three further
     // blows. 0 disables it and leaves a bruise a bruise forever.
-    float bruiseBleedChance = 0.55f;
+    float bruiseBleedChance = TPD(gore, bruiseBleedChance);
     // ---- HOW FAR UP THE CEILING A VOXEL HAS TO BE TO BREAK ------------------
     //
     // Fraction of `bruiseMax` at or past which `bruiseBleedChance` is rolled.
@@ -1356,7 +1426,7 @@ struct Tuning {
     // after it saturates instead of the blow after that, which is the whole
     // difference between "hit a bruise again and it bleeds" and "hit a bruise
     // three more times".
-    float bruiseBleedFrom = 0.85f;
+    float bruiseBleedFrom = TPD(gore, bruiseBleedFrom);
     // ---- A WEAK BLOW MARKS LESS (the fist/mace difference) ------------------
     //
     // `bruiseStep` is authored for a FULL blow, and until 2026-09-19 a punch
@@ -1373,9 +1443,9 @@ struct Tuning {
     // nothing" exactly as they once reported it of 15%-a-blow bruising. Rooted,
     // a 4 hp fist against a 16 hp reference lands half a step (20% a punch,
     // visible) and needs about twice the blows to reach the same place.
-    float bruiseHpRef = 16.0f;
+    float bruiseHpRef = TPD(gore, bruiseHpRef);
     // ...and the floor under that share, so an incidental tap still marks.
-    float bruiseHpFloor = 0.45f;
+    float bruiseHpFloor = TPD(gore, bruiseHpFloor);
     // ...and WHAT it discolours the skin to, BY NAME.
     //
     // THE ONE NAME-TYPED TUNING ROW IN THE FILE, and the reason is that it
@@ -1391,12 +1461,12 @@ struct Tuning {
     // lands, still hurts and still dents, it simply leaves no mark. That is
     // the right failure for a cosmetic row -- louder would mean a typo in a
     // colour costing somebody their combat.
-    std::string bruiseMat = "skin_bruised";
+    std::string bruiseMat = TPD(gore, bruiseMat);
     // A PUNCH DOES NOT OPEN YOU. Fraction of a cut's drip budget that blunt
     // trauma tops up (Mob::Damage and the dent's own carve). 0 makes a mace a
     // completely dry weapon; 1 makes it bleed like a sword, which is the
     // behaviour this whole split exists to avoid.
-    float bluntBleedScale = 0.1f;
+    float bluntBleedScale = TPD(gore, bluntBleedScale);
     // How deep a DENT a full-power blunt hit takes out of flesh, in world
     // voxels, before the weapon's own `bluntCarve` fraction scales it. A fist
     // authors 0 and removes nothing at all; a gauntlet ~0.35 and a mace ~0.6
@@ -1408,7 +1478,7 @@ struct Tuning {
     // NOTHING IS REMOVED UNTIL THE SPOT IS PULPED -- see `pulpCarveFrom`. This
     // is the radius a blow lands on tissue that has ALREADY been beaten open,
     // not the radius of a first blow on clean skin.
-    float bluntCarveRadius = 0.7f;
+    float bluntCarveRadius = TPD(gore, bluntCarveRadius);
     // ---- THE THIRD RUNG: PULPED TISSUE COMES AWAY (2026-09-19) --------------
     //
     // A blunt blow used to dent from the FIRST hit, at a radius that depended
@@ -1439,8 +1509,10 @@ struct Tuning {
     // it will become pretty gruesome"; the sever is still refused outright
     // (Mob::BluntCarveScope), so a caved-in skull is a caved-in skull and never
     // a decapitation.
-    float pulpAmt = 8.0f;        // blood-coat depth (0..15) that counts as pulped
-    float pulpCarveFrom = 0.3f;  // pulped share of the core below which nothing comes away
+    // blood-coat depth (0..15) that counts as pulped
+    float pulpAmt = TPD(gore, pulpAmt);
+    // pulped share of the core below which nothing comes away
+    float pulpCarveFrom = TPD(gore, pulpCarveFrom);
     // ---- PULPED TISSUE DISSOLVES (the blunt counterpart of bite rot) ---------
     //
     // Until now the dent was instant: `CarveLimbRadial` in one call, one tick,
@@ -1456,7 +1528,8 @@ struct Tuning {
     // the same limb. Further blows keep adding pulp; the dissolution keeps
     // eating it. Both run concurrently, which is why sustained hits on one
     // spot cave it in faster than the first blow alone would.
-    float pulpRotRate = 1.5f;  // world voxels/minute, per flagged limb
+    // world voxels/minute, per flagged limb
+    float pulpRotRate = TPD(gore, pulpRotRate);
     // ---- UNARMED OVERRIDES --------------------------------------------------
     //
     // A fist and a mace share every row above, and the only thing that
@@ -1468,12 +1541,12 @@ struct Tuning {
     // Each row below overrides the matching row above when the blow is from a
     // natural weapon (BluntHit::unarmed). A NEGATIVE value means "use the main
     // row": the default, and the way to say "fists and maces are the same here".
-    float unarmedBruiseRadius = -1.0f;
-    float unarmedBruiseStep = -1.0f;
-    float unarmedBleedChance = -1.0f;
-    float unarmedBleedScale = -1.0f;
-    float unarmedCarveRadius = -1.0f;
-    float unarmedPulpCarveFrom = -1.0f;
+    float unarmedBruiseRadius = TPD(gore, unarmedBruiseRadius);
+    float unarmedBruiseStep = TPD(gore, unarmedBruiseStep);
+    float unarmedBleedChance = TPD(gore, unarmedBleedChance);
+    float unarmedBleedScale = TPD(gore, unarmedBleedScale);
+    float unarmedCarveRadius = TPD(gore, unarmedCarveRadius);
+    float unarmedPulpCarveFrom = TPD(gore, unarmedPulpCarveFrom);
     // A BITE. Radius of the tear in world voxels at full power, scaled by
     // (0.4 + 0.6 * power); `biteBlob` is the correlated noise's feature size
     // in SKIN voxels, i.e. the size of one piece that comes away. Same pair,
@@ -1489,19 +1562,19 @@ struct Tuning {
     // flipped the answer. 0.45 is a hole about 9 cm across, which is a bite.
     // Enough of them still take a hand off, because the collapse sever is left
     // ON for a bite (Mob::BiteScope) -- it simply takes several.
-    float biteRadius = 0.45f;
-    float biteBlob = 2.5f;
+    float biteRadius = TPD(gore, biteRadius);
+    float biteBlob = TPD(gore, biteBlob);
     // ...and how much wider than a blade's crater rim the bite's soak reaches,
     // as a MULTIPLE of craterStainRim. Above 1 because a tear is a ragged hole
     // rather than a clean slot: the mess goes further than the damage.
-    float biteStainScale = 1.5f;
+    float biteStainScale = TPD(gore, biteStainScale);
     // ROT SETTLES SLOWER THAN BLOOD DOES. `woundHealSlow` divides blood's own
     // decay inside a limb so a cut fades over ~6 s instead of ~3 s; an
     // infection is not a wound settling, it is something living in you, so it
     // gets its own (larger) divisor. Applies to the material a BITE rewrote
     // flesh to (MobLimb::infectMat), on a creature whose wounds heal at all --
     // in an undead, whose do not, rot never goes away, which is the point.
-    float infectHealSlow = 6.0f;
+    float infectHealSlow = TPD(gore, infectHealSlow);
     // ---- AN INFECTION IS ALIVE, AND IT IS EATING YOU ------------------------
     //
     // Until 2026-09-16 a bite's rot was a PICTURE: `infectMat` rewrote the
@@ -1546,9 +1619,12 @@ struct Tuning {
     // uniformly from the eligible rim, because a batched average of the right
     // size still looks like a machine (see the note above Mob::InfectTick for
     // the version that did, and what it looked like).
-    float infectSpreadRate = 1.0f;  // world voxels/minute, per infected limb
-    float infectRotRate = 0.5f;     // world voxels/minute, per infected limb
-    float infectMobMult = 1.0f;     // multiplier on both rates for mob limbs only
+    // world voxels/minute, per infected limb
+    float infectSpreadRate = TPD(gore, infectSpreadRate);
+    // world voxels/minute, per infected limb
+    float infectRotRate = TPD(gore, infectRotRate);
+    // multiplier on both rates for mob limbs only
+    float infectMobMult = TPD(gore, infectMobMult);
 
     // ---- ...AND WHAT IT LEAVES STANDING IN THE HOLE ------------------------
     //
@@ -1563,7 +1639,7 @@ struct Tuning {
     // voxel's own colour, so this is "how much of the bone is hidden": 15 is
     // opaque gore, 0 turns the whole thing off and bone comes out white again
     // (the pre-2026-09-17 behaviour, kept reachable).
-    float infectBoneStain = 11.0f;
+    float infectBoneStain = TPD(gore, infectBoneStain);
     // ...AND THE SPREAD ROUND IT, +/- this, drawn per voxel and keyed on the
     // bone voxel's own position so a cell exposed twice does not change
     // colour. THIS IS THE ROW THAT KEEPS IT READING AS BONE: at 0 every
@@ -1571,14 +1647,14 @@ struct Tuning {
     // of red, however well chosen the mean. The variation is what lets the
     // bone show through in patches. Clamped into 0..15 after the jitter, so a
     // wide spread simply saturates at the ends rather than wrapping.
-    float infectBoneStainVary = 5.0f;
+    float infectBoneStainVary = TPD(gore, infectBoneStainVary);
     // WHICH SUBSTANCE, per voxel: this fraction take the INFECTION's own stain
     // (the biter's `bite.stain` -- a zombie's ichor, green) and the rest the
     // victim's blood (dark red). Two hues interleaved at the voxel scale read
     // as a diseased, mottled surface; 0 or 1 is one flat colour over the
     // whole exposure. Falls back to whichever of the two exists when the other
     // does not (a creature with no blood, a biter with no ichor).
-    float infectBoneIchor = 0.45f;
+    float infectBoneIchor = TPD(gore, infectBoneIchor);
     // ---- WHAT A VOXEL OF BRAIN IS WORTH -------------------------------------
     //
     // Flat hp per BRAIN voxel destroyed, by any cause, charged in
@@ -1593,7 +1669,7 @@ struct Tuning {
     // chews at half rate) is what takes the time, and what is behind it goes
     // fast. 0 disables the mechanic entirely and restores the pre-2026-09-18
     // behaviour, where brain was ordinary flesh with a different colour.
-    float brainHpPerVoxel = 10.0f;
+    float brainHpPerVoxel = TPD(gore, brainHpPerVoxel);
 
     // ========================================================================
     // F. BLOOD IS HEALTH — every drop that leaves a body is hp leaving it
@@ -1614,7 +1690,7 @@ struct Tuning {
     // creature dies of less blood because it has less. Time to bleed out from
     // a single open stump at the defaults (30 Hz, bleedDripTicks 4, clump
     // radius 0) is hpTotal / (7.5 drips/s x 1 voxel x this).
-    float bleedHpPerVoxel = 0.6f;
+    float bleedHpPerVoxel = TPD(gore, bleedHpPerVoxel);
     // AN AMPUTATION DOES NOT CLOSE. The stump's authored severStumpBudget was
     // the whole of what a lost limb bled, and it ran dry in seconds. With this
     // on, the stump wound is topped back up to one clump every tick for as
@@ -1622,7 +1698,7 @@ struct Tuning {
     // takes hp at a bounded rate until nothing is left. Rule 2 still holds
     // because the process is bounded by the creature's own hp — the drip ends
     // at death, and a corpse does not bleed. Off restores the finite stump.
-    bool stumpBleedsOpen = true;
+    bool stumpBleedsOpen = TPD(gore, stumpBleedsOpen);
 
     // ========================================================================
     // G. BURNS CAP HEALTH — the more of the body is burnt, the less it can hold
@@ -1648,9 +1724,9 @@ struct Tuning {
     // of its burnable volume with most of its skin raw under a black shell,
     // and would have stood there forever. Garments and held items are not the
     // body and are not counted (Mob::IsWornSlot).
-    float burnCapMidFraction = 0.40f;
-    float burnCapMidHealth = 0.333f;
-    float burnDeathFraction = 0.70f;
+    float burnCapMidFraction = TPD(gore, burnCapMidFraction);
+    float burnCapMidHealth = TPD(gore, burnCapMidHealth);
+    float burnDeathFraction = TPD(gore, burnDeathFraction);
   } gore;
 
   // ---- coats: a substance ON a body, as opposed to in the ground -------------
@@ -1662,40 +1738,40 @@ struct Tuning {
   // often the per-limb ledger is retaken, how the authored dry times are
   // scaled globally, and the budgets that keep tracking bounded (rule 2).
   //
-  // CPU-ONLY, like `gore` and `melee` above: no tuning_params.def row, no WGSL
-  // constant. A coat never reaches the sim.
+  // CPU-ONLY, like `gore` and `melee` above: NO_WGSL rows in tuning_params.def,
+  // no WGSL constant. A coat never reaches the sim.
   struct Coat {
     // Ticks between recounts of the per-limb coat ledger (game/mob.h
     // LimbCoat). Only ever taken when something changed a coat byte since the
     // last one, so this bounds the cost of a body that is ACTIVELY being
     // bloodied — a clean or settled one pays nothing whatever this says.
-    int recountTicks = 8;
+    int recountTicks = TPD(coat, recountTicks);
     // Global multiplier on how fast every authored coat dries: the material's
     // `coat.decay` seconds per amount level are DIVIDED by this, so 2 dries
     // everything twice as fast and small values make blood permanent. A dial
     // on the whole look rather than a per-material edit.
-    float decayScale = 1.0f;
+    float decayScale = TPD(coat, decayScale);
     // How much faster a WET coat (a washer, i.e. water) dries while the body is
     // in sunshine: daylight up and open sky over the limb (MobSystem::
     // InSunlight). Divides the drying period like decayScale; 1 = no effect.
-    float sunDryScale = 2.0f;
+    float sunDryScale = TPD(coat, sunDryScale);
     // Seconds of heat against a wet voxel to boil it from soaked (15) to dry.
     // A wet voxel cannot catch fire (BurnOneLimb section 0), so this is how
     // long water on the skin holds a flame off.
-    float fireDrySeconds = 2.0f;
+    float fireDrySeconds = TPD(coat, fireDrySeconds);
     // Ground cells one footfall may track a coat onto. A footprint is a patch,
     // not a point, and this is how big the patch may get.
-    int shedCells = 3;
+    int shedCells = TPD(coat, shedCells);
     // Deposits every creature together may make in one tick. The bound on how
     // much tracking a crowd can push into the world; a foot refused here
     // simply leaves no print that tick.
-    int shedPerTick = 64;
+    int shedPerTick = TPD(coat, shedPerTick);
     // Amount of coat one deposit takes off the foot, in the 0..15 scale — how
     // fast a bloodied boot walks itself clean.
-    int shedAmount = 2;
+    int shedAmount = TPD(coat, shedAmount);
     // Below this coated fraction of a body part, the HUD says nothing about
     // it: a single splashed voxel is not "covered in blood".
-    float hudMinFrac = 0.02f;
+    float hudMinFrac = TPD(coat, hudMinFrac);
   } coat;
 
   // ---- melee: the stroke driver's feel ---------------------------------------
@@ -1712,8 +1788,8 @@ struct Tuning {
   //    are the knobs being *designed*, not the ones being dialled; once the
   //    feel settles they belong in tuning.json like everything else."
   //
-  // CPU-ONLY, so there is no tuning_params.def row and no WGSL constant — same
-  // as `gore` above. Nothing in a shader reads a melee number, and nothing here
+  // CPU-ONLY, so its tuning_params.def rows are NO_WGSL — same as `gore`
+  // above. Nothing in a shader reads a melee number, and nothing here
   // may ever reach one: the sim must not see presentation state (rule 1).
   //
   // UNITS. Where MeleeTuning stores WORLD VOXELS derived from a physical size
@@ -1725,39 +1801,58 @@ struct Tuning {
   // seconds are unitless-in-voxels and carry their MeleeTuning name unchanged.
   struct Melee {
     // ---- the control law ----------------------------------------------------
-    float commitSpeed = 900.0f;      // mouse px/s that commits a guard to a cut
-    float slashTime = 0.17f;         // seconds the committed slash takes
-    float recoverTime = 0.22f;       // seconds of follow-through
-    float fullSpeedMps = 20.0f;      // tip speed for full damage
-    float minSpeedMps = 0.9f;        // tip speed below which a hit does nothing
-    float aimGainX = 0.0050f;        // radians of tip azimuth per mouse pixel
-    float aimGainY = 0.0067f;        // radians of tip elevation per mouse pixel
-    float reachGainM = 0.0030f;      // metres of tip reach per dReach unit
+    // mouse px/s that commits a guard to a cut
+    float commitSpeed = TPD(melee, commitSpeed);
+    // seconds the committed slash takes
+    float slashTime = TPD(melee, slashTime);
+    // seconds of follow-through
+    float recoverTime = TPD(melee, recoverTime);
+    // tip speed for full damage
+    float fullSpeedMps = TPD(melee, fullSpeedMps);
+    // tip speed below which a hit does nothing
+    float minSpeedMps = TPD(melee, minSpeedMps);
+    // radians of tip azimuth per mouse pixel
+    float aimGainX = TPD(melee, aimGainX);
+    // radians of tip elevation per mouse pixel
+    float aimGainY = TPD(melee, aimGainY);
+    // metres of tip reach per dReach unit
+    float reachGainM = TPD(melee, reachGainM);
     // ---- where the point may go --------------------------------------------
     // 2.36 (135 deg) drove the commanded point BEHIND the character and parked
     // the shoulder ball on its authored 50-degrees-past-the-back-plane stop.
     // 1.83 is 105 deg: the whole front plus a little past side-on. The full
     // note is on MeleeTuning::azOut in game/melee.h.
-    float azOut = 1.83f;             // radians, to the weapon side
-    float azAcross = 1.40f;          // radians, across the body
-    float elMin = -1.50f;            // radians, arm hanging at the side
-    float elMax = 1.48f;             // radians, overhead
+    float azOut = TPD(melee, azOut);             // radians, to the weapon side
+    float azAcross = TPD(melee, azAcross);          // radians, across the body
+    // radians, arm hanging at the side
+    float elMin = TPD(melee, elMin);
+    float elMax = TPD(melee, elMax);             // radians, overhead
     // ---- how the arm holds it ----------------------------------------------
-    float handExtend = 0.78f;        // fraction of arm reach
-    float extendSmoothing = 0.18f;   // seconds halflife
-    float leanTurnRate = 18.0f;      // radians/sec on the lean plane
-    float handLead = 1.0f;           // SIGN only: +1 hand leads, -1 point leads
-    float fallbackReachM = 0.60f;    // metres, only when the rig cannot say
-    float reachFraction = 0.94f;     // fraction of arm reach the hand may use
-    float guardForwardM = 0.22f;     // metres — the seed of last resort
-    float guardUpM = 0.26f;
-    float guardSideM = 0.16f;
-    float dirSmoothing = 0.06f;      // seconds of mouse history
+    float handExtend = TPD(melee, handExtend);        // fraction of arm reach
+    float extendSmoothing = TPD(melee, extendSmoothing);   // seconds halflife
+    // radians/sec on the lean plane
+    float leanTurnRate = TPD(melee, leanTurnRate);
+    // SIGN only: +1 hand leads, -1 point leads
+    float handLead = TPD(melee, handLead);
+    // metres, only when the rig cannot say
+    float fallbackReachM = TPD(melee, fallbackReachM);
+    // fraction of arm reach the hand may use
+    float reachFraction = TPD(melee, reachFraction);
+    // metres — the seed of last resort
+    float guardForwardM = TPD(melee, guardForwardM);
+    float guardUpM = TPD(melee, guardUpM);
+    float guardSideM = TPD(melee, guardSideM);
+    // seconds of mouse history
+    float dirSmoothing = TPD(melee, dirSmoothing);
     // ---- the committed arc --------------------------------------------------
-    float swingArc = 2.0f;           // radians the cut carries the point
-    float swingAnticipate = 0.35f;   // fraction of the arc pulled back first
-    float swingExtend = 0.16f;       // fraction of reach the arc bows out by
-    float bladeSmoothing = 0.055f;   // seconds halflife on the blade frame
+    // radians the cut carries the point
+    float swingArc = TPD(melee, swingArc);
+    // fraction of the arc pulled back first
+    float swingAnticipate = TPD(melee, swingAnticipate);
+    // fraction of reach the arc bows out by
+    float swingExtend = TPD(melee, swingExtend);
+    // seconds halflife on the blade frame
+    float bladeSmoothing = TPD(melee, bladeSmoothing);
     // HOW FAR THE WRIST MAY TAKE THE BLADE from what the solved forearm gives
     // it for free, radians. THIS IS A GROSS BUDGET, NOT AN ANATOMICAL ANGLE,
     // and reading it as the latter is what cost the phase C/D merge its only
@@ -1794,7 +1889,7 @@ struct Tuning {
     // authoring the neutral roll into {sword,cleaver}.json would let this come
     // down to a real wrist. The naive attempt ([180,0,-90]) made the follow
     // residual worse (8.08), so it is a piece of work rather than a sign flip.
-    float wristMaxAngle = 3.10f;
+    float wristMaxAngle = TPD(melee, wristMaxAngle);
     // ---- HOW MUCH OF THAT IS APPLIED, AND WHEN -----------------------------
     // The wrist RAMPS with commitment. Above is the ceiling; this is the
     // throttle. A blade held still keeps the orientation the solved forearm
@@ -1809,9 +1904,12 @@ struct Tuning {
     // the sword for an overhead wrench the wrist onto the radius — the band
     // is wider for the same reason, so a deliberate 1-2 m/s raise mostly
     // keeps the grip pose and the blade stays generally UP).
-    float steerSpeedLoMps = 0.6f;    // below: the grip pose
-    float steerSpeedHiMps = 3.0f;    // above: full alignment to the stroke
-    float steerFloor = 0.15f;        // applied at and below the low speed
+    // below: the grip pose
+    float steerSpeedLoMps = TPD(melee, steerSpeedLoMps);
+    // above: full alignment to the stroke
+    float steerSpeedHiMps = TPD(melee, steerSpeedHiMps);
+    // applied at and below the low speed
+    float steerFloor = TPD(melee, steerFloor);
     // ---- PER-JOINT SMOOTHING (seconds of halflife) -------------------------
     // Two knobs because the joints tolerate lag differently: the ARM lagging
     // the mouse reads as weight, the WRIST lagging a cut misaligns the edge.
@@ -1819,13 +1917,13 @@ struct Tuning {
     // (0 = off, bit for bit the old behaviour); `wristSmoothing` owns the
     // wrist's commitment envelope AND its chase of the commanded blade
     // orientation (3x faster through a Slash). See game/melee.h.
-    float armSmoothing = 0.04f;
-    float wristSmoothing = 0.10f;
+    float armSmoothing = TPD(melee, armSmoothing);
+    float wristSmoothing = TPD(melee, wristSmoothing);
     // How far BEHIND the shoulder's frontal plane the hand may sit, as a
     // fraction of arm reach. The azimuth window bounds the commanded POINT;
     // the hand is that point minus a whole blade, and unbounded it sat
     // voxels behind the plane at the stops — "the arm goes behind him".
-    float handBackFrac = 0.05f;
+    float handBackFrac = TPD(melee, handBackFrac);
     // ---- WHAT THE ARM MAY DO WHILE IT SERVES THE BLADE ---------------------
     // Radians. `elbowPoleCone` bounds the bend PLANE the driver asks for, off
     // straight-back in its own basis; `elbowAxisCone` caps how far the rig's
@@ -1833,18 +1931,25 @@ struct Tuning {
     // rig takes the tighter of it and the shoulder's own authored twist range.
     // Both exist because an unbounded override turned a one-way elbow into a
     // joint that bent either way — see game/melee.h and game/mob.cpp.
-    float elbowPoleCone = 1.75f;     // 100 deg: down, up or out, never forward
-    float elbowAxisCone = 3.14f;     // pi = OFF; an A/B knob, see game/mob.cpp
-    float edgeFloor = 0.35f;         // damage floor for a flat-on slap
+    // 100 deg: down, up or out, never forward
+    float elbowPoleCone = TPD(melee, elbowPoleCone);
+    // pi = OFF; an A/B knob, see game/mob.cpp
+    float elbowAxisCone = TPD(melee, elbowAxisCone);
+    // damage floor for a flat-on slap
+    float edgeFloor = TPD(melee, edgeFloor);
     // ---- BLADE ON BLADE (game/melee.h MeleeSweepDamage's parry block) -------
     // The four knobs a parry has. They are `melee.*` rather than `combatfx.*`
     // because a block is MECHANICS — it stops a cut, it costs the blocking
     // weapon hp, and it shoves the defender's guard — where combatfx is
     // presentation that can be switched off without changing an outcome.
-    float blockGapM = 0.22f;         // metres of slack around the two segments
-    float blockItemDamage = 0.35f;   // fraction of the blow the blade takes
-    float blockNudgeAz = 0.30f;      // radians the defender's guard is beaten
-    float blockNudgeEl = 0.18f;      //   open, azimuth and elevation, at power 1
+    // metres of slack around the two segments
+    float blockGapM = TPD(melee, blockGapM);
+    // fraction of the blow the blade takes
+    float blockItemDamage = TPD(melee, blockItemDamage);
+    // radians the defender's guard is beaten
+    float blockNudgeAz = TPD(melee, blockNudgeAz);
+    //   open, azimuth and elevation, at power 1
+    float blockNudgeEl = TPD(melee, blockNudgeEl);
     // ---- DISCRETE STRIKES (the player's default control, 2026-09-01) --------
     // 0 = discrete: a click fires an AUTHORED stroke program (the same
     //     attack_styles.json entries the NPCs replay), direction picked by the
@@ -1855,11 +1960,11 @@ struct Tuning {
     // Read in ONE place — main.cpp's controller, straight off CurrentTuning()
     // — and deliberately NOT copied into MeleeTuning: the driver's feel is
     // mode-blind, and a cached copy would let the two disagree across an F5.
-    int controlMode = 0;
+    int controlMode = TPD(melee, controlMode);
     // Mouse px/s at the press below which a click has no direction: the strike
     // alternates horizontal L/R instead. Same unit as commitSpeed, far lower —
     // a flick is a read of intent, not a commitment gesture.
-    float pickMinSpeed = 250.0f;
+    float pickMinSpeed = TPD(melee, pickMinSpeed);
     // ---- the swing is bound to the BODY, like the head ---------------------
     // The stroke basis handed to the driver is the camera's, yawed back toward
     // the body's facing by the same law the neck uses (avatar.headLookYaw /
@@ -1870,41 +1975,41 @@ struct Tuning {
     // that goes the way the character faces rather than at the lens. Pitch is
     // never touched. Applied in game/thirdperson.h ResolveSwingBasis; a cone of
     // 180 is the old behaviour (the camera IS the basis, wherever it looks).
-    float aimYaw = 70.0f;
-    float aimReleaseYaw = 50.0f;
+    float aimYaw = TPD(melee, aimYaw);
+    float aimReleaseYaw = TPD(melee, aimReleaseYaw);
     // ---- the body serves the swing (game/melee.h WeaponPose torso fields) --
     // Fractions of the stroke's own azimuth/elevation the torso carries, the
     // way `avatar.headLookSpine` shares the look yaw into the chest. 0 = arm
     // only (the pre-overhaul look, and the A/B).
-    float torsoShare = 0.35f;
-    float torsoPitch = 0.20f;
+    float torsoShare = TPD(melee, torsoShare);
+    float torsoPitch = TPD(melee, torsoPitch);
     // ---- the blade stays out of the wielder's own face ----------------------
     // Metres of clearance beyond the head's own radius the hand-to-tip segment
     // is pushed out to (a rigid translate in RebuildFrame, after the
     // frontal-plane clamp). 0 = clamp OFF — the A/B, same convention as
     // elbowAxisCone's pi.
-    float headClearM = 0.06f;
+    float headClearM = TPD(melee, headClearM);
     // ---- ...and the ARM stays out of the wielder's own chest (2026-09-21) --
     // Metres of clearance beyond the torso capsule's own half-width the HAND
     // is pushed out to. The head sphere covered the one body part a BLADE
     // could be swept through and left the one an ARM goes through untouched.
     // 0 = clamp OFF, the same A/B convention.
-    float bodyClearM = 0.05f;
+    float bodyClearM = TPD(melee, bodyClearM);
     // ---- and the lean plane does not chase a reversal (game/melee.h) ------
     // Radians. A commanded turn of the blade's lean plane larger than this is
     // a REVERSAL, not a turn: the travel flipped, and a real blade keeps its
     // lean rather than swapping which side the hilt leads on. The plane holds
     // instead. pi disables it, which is the A/B.
-    float leanFlipHold = 3.14f;
+    float leanFlipHold = TPD(melee, leanFlipHold);
     // Metres/sec of TANGENTIAL tip travel below which there is nothing to
     // chase and the lean plane and the roll simply hold. Under it the tangent
     // is numerical dust.
-    float leanMinSpeed = 0.05f;
+    float leanMinSpeed = TPD(melee, leanMinSpeed);
     // Sine of the angle between the blade and its travel below which the
     // blade's ROLL is held rather than recomputed. The flat is their cross
     // product, so its direction is noise as they approach parallel — every
     // thrust and every stall. 0.20 is 11.5 degrees.
-    float flatMinSin = 0.20f;
+    float flatMinSin = TPD(melee, flatMinSin);
   } melee;
 
   // ---- combat feel: hit-stop, hit flash, combat cues --------------------------
@@ -1925,7 +2030,7 @@ struct Tuning {
   struct CombatFx {
     // ---- hit-stop -----------------------------------------------------------
     // OFF is a real setting, not a debug escape: some players hate it.
-    bool hitStop = true;
+    bool hitStop = TPD(combatfx, hitStop);
     // Three tiers, weakest first. `Scale` is the multiplier on the rate the
     // tick accumulator fills at (0.15 = the world runs at 15% speed); `Ms` is
     // how long the dip lasts in REAL milliseconds, so it is the same length of
@@ -1936,25 +2041,25 @@ struct Tuning {
     // SEVER is a limb coming off. They are strictly ordered because the dip is
     // peak-held: a sever landing in the same frame as a chip must not be
     // shortened by it.
-    float hitStopChipScale = 0.45f;
-    float hitStopChipMs = 55.0f;
-    float hitStopFleshScale = 0.22f;
-    float hitStopFleshMs = 95.0f;
-    float hitStopSeverScale = 0.10f;
-    float hitStopSeverMs = 33.0f;
+    float hitStopChipScale = TPD(combatfx, hitStopChipScale);
+    float hitStopChipMs = TPD(combatfx, hitStopChipMs);
+    float hitStopFleshScale = TPD(combatfx, hitStopFleshScale);
+    float hitStopFleshMs = TPD(combatfx, hitStopFleshMs);
+    float hitStopSeverScale = TPD(combatfx, hitStopSeverScale);
+    float hitStopSeverMs = TPD(combatfx, hitStopSeverMs);
     // ---- hit flash ----------------------------------------------------------
     // Peak additive intensity per tier, in LINEAR HDR before the tonemap (the
     // micro-body pass tonemaps to match the cube path exactly, so the flash has
     // to be added on the linear side or the two paths diverge).
-    float flashChip = 0.35f;
-    float flashFlesh = 0.85f;
-    float flashSever = 1.60f;
+    float flashChip = TPD(combatfx, flashChip);
+    float flashFlesh = TPD(combatfx, flashFlesh);
+    float flashSever = TPD(combatfx, flashSever);
     // Seconds of halflife on the decay, aged on the TICK (MobSystem::PreTick)
     // so it runs in a gate as well as in the game — and so it slows down with
     // the world under hit-stop, which is right, since the two are describing
     // the same blow. Short: a flash the player can still see when the next blow
     // lands stops reading as a hit and starts reading as a shader bug.
-    float flashHalflife = 0.075f;
+    float flashHalflife = TPD(combatfx, flashHalflife);
     // ---- hit reaction: the body answers, and it answers DIRECTIONALLY -------
     //
     // Hit-stop says "something landed" and the flash says "here". Neither says
@@ -1969,16 +2074,16 @@ struct Tuning {
     // planted feet and every collider stay exactly where they were. It is a
     // pose-space lean the feet absorb, which is why it can fire on every hit
     // without an animation budget or a recovery state machine.
-    bool hitReact = true;
+    bool hitReact = TPD(combatfx, hitReact);
     // THE BLOW THIS IS ALL MEASURED AGAINST, in hp at full swing speed. A
     // strike's whole profile (game/impact.h StrikeProfile::Total) over this is
     // the multiplier on every peak below, so a mace shoves harder than a fist
     // because it IS harder, and nothing here has to know a weapon's name.
     // 14 is a sword's cut — the reference blow is "an ordinary sword hit".
-    float hitReactRefDamage = 14.0f;
+    float hitReactRefDamage = TPD(combatfx, hitReactRefDamage);
     // ...and the ceiling on that multiplier, so a freak number in an items.json
     // cannot fold somebody in half.
-    float hitReactMaxScale = 2.2f;
+    float hitReactMaxScale = TPD(combatfx, hitReactMaxScale);
     // Peak lean away from the blow at the reference blow, in DEGREES. The
     // spring is CLAMPED at this, so a cut that lasts four ticks and re-pumps
     // the spring on each of them still leans exactly this far — it just stays
@@ -1989,24 +2094,24 @@ struct Tuning {
     // right way and comes back, and cannot tell you 6 degrees is invisible.
     // It was 6 first, and at 6 the victim of a sword through the chest did not
     // perceptibly move.
-    float hitReactLeanDeg = 10.0f;
+    float hitReactLeanDeg = TPD(combatfx, hitReactLeanDeg);
     // ...of which the SPINE takes this share and the root limb the rest. All on
     // the root tips the creature like a signpost; all on the spine leaves the
     // hips unnaturally still. Same distribution law as Mob::ApplyAimPart.
-    float hitReactSpineShare = 0.55f;
+    float hitReactSpineShare = TPD(combatfx, hitReactSpineShare);
     // Peak shove of the root, as a fraction of the creature's OWN HEIGHT, so
     // one number means the same lurch on a rat and on a troll. Horizontal
     // components come from the blow's travel; the vertical one is what makes an
     // overhead blow drive a body DOWN into its knees.
-    float hitReactPushFrac = 0.050f;
+    float hitReactPushFrac = TPD(combatfx, hitReactPushFrac);
     // Peak flick of the STRUCK limb about its own joint, degrees. This is the
     // part that says which arm was hit. Stage 6 clamps it to the joint's
     // authored range like everything else, so it cannot produce a pose the rig
     // says is impossible.
-    float hitReactLimbDeg = 22.0f;
+    float hitReactLimbDeg = TPD(combatfx, hitReactLimbDeg);
     // Seconds to halve. The whole reaction is over in about 4x this; past
     // ~0.2 s it stops reading as a flinch and starts reading as a wobble.
-    float hitReactHalflife = 0.110f;
+    float hitReactHalflife = TPD(combatfx, hitReactHalflife);
     // ---- ...AND THE SAME BLOW ON A BODY JOLT OWNS (2026-09-20) --------------
     //
     // THE OTHER HALF OF THE SAME REACTION, not a second feature. Everything
@@ -2023,19 +2128,19 @@ struct Tuning {
     // harder than a fist because it is harder. Applied at the contact POINT,
     // so a blow off the centre of mass turns a body over instead of sliding
     // it. A human limb is ~3-8 kg, so 12 is roughly a 2-4 m/s kick.
-    float hitReactImpulse = 5.0f;
+    float hitReactImpulse = TPD(combatfx, hitReactImpulse);
     // ---- combat cues --------------------------------------------------------
     // Volumes are the same 0..N trim every other cue group uses; radius is the
     // audible radius in METRES, matching Tuning::Audio.
-    float whooshVolume = 0.55f;
+    float whooshVolume = TPD(combatfx, whooshVolume);
     // Mouse px/s below which a committed stroke gets no whoosh at all. A cut
     // that barely moved should not sound like one; this is the audio half of
     // the same "speed is the damage" law the sweep runs on.
-    float whooshMinSpeed = 300.0f;
+    float whooshMinSpeed = TPD(combatfx, whooshMinSpeed);
     // Rate multipliers at min speed and at commitSpeed. A faster cut is a
     // higher, tighter whoosh, so the LOW value belongs to the slow stroke.
-    float whooshRateSlow = 0.82f;
-    float whooshRateFast = 1.25f;
+    float whooshRateSlow = TPD(combatfx, whooshRateSlow);
+    float whooshRateFast = TPD(combatfx, whooshRateFast);
     // ---- where the whoosh IS, and how much of that you hear ----------------
     // A whoosh is not a point event: it is the air a blade is STILL moving, so
     // the voice follows the weapon for as long as the sample lasts and a cut
@@ -2046,7 +2151,7 @@ struct Tuning {
     // the sound does not travel; the tip is where most of the noise is made
     // (air drag goes with speed cubed) but on a long weapon it swings a metre
     // wide of the player holding it and the pan becomes a gimmick.
-    float whooshEdgeFrac = 0.55f;
+    float whooshEdgeFrac = TPD(combatfx, whooshEdgeFrac);
     // How much of the whoosh's position to actually USE, as a fraction of the
     // way from the listener's own ear to the tracked point. 1 = fully
     // spatialized; 0 = pinned to your head, which is effectively mono and is
@@ -2054,59 +2159,68 @@ struct Tuning {
     // reads as wrong rather than as physical. Only the player's own swings go
     // through this; an NPC's whoosh is somebody ELSE's weapon and is always
     // placed where it is.
-    float whooshPan = 1.0f;
-    float fleshVolume = 0.90f;
-    float clangVolume = 0.85f;
-    float strikeEdgeVolume = 0.65f;
-    float strikeBluntVolume = 0.70f;
-    float cutVolume = 0.50f;
-    float cueRadius = 22.0f;   // metres
+    float whooshPan = TPD(combatfx, whooshPan);
+    float fleshVolume = TPD(combatfx, fleshVolume);
+    float clangVolume = TPD(combatfx, clangVolume);
+    float strikeEdgeVolume = TPD(combatfx, strikeEdgeVolume);
+    float strikeBluntVolume = TPD(combatfx, strikeBluntVolume);
+    float cutVolume = TPD(combatfx, cutVolume);
+    float cueRadius = TPD(combatfx, cueRadius);   // metres
   } combatfx;
 
   // ---- grenade ----
   struct Grenade {
-    float throwSpeed = 20.0f;   // m/s
-    float fuse = 2.2f;          // seconds
-    float restitution = 0.45f;
-    float friction = 0.8f;
-    float waterDrag = 0.90f;
-    int blastRadius = 13, blastPower = 380;
+    float throwSpeed = TPD(grenade, throwSpeed);   // m/s
+    float fuse = TPD(grenade, fuse);          // seconds
+    float restitution = TPD(grenade, restitution);
+    float friction = TPD(grenade, friction);
+    float waterDrag = TPD(grenade, waterDrag);
+    int blastRadius = TPD(grenade, blastRadius);
+    int blastPower = TPD(grenade, blastPower);
   } grenade;
 
   // ---- tools ----
   struct Tools {
-    int detonateRadius = 12, detonatePower = 340;
-    float laserRange = 200.0f;
-    int laserMeltRadius = 2;
+    int detonateRadius = TPD(tools, detonateRadius);
+    int detonatePower = TPD(tools, detonatePower);
+    float laserRange = TPD(tools, laserRange);
+    int laserMeltRadius = TPD(tools, laserMeltRadius);
     // Carve radius when the beam is on LIVING flesh, in WORLD voxels — float,
     // and deliberately sub-voxel by default. This is the precision dial for
     // surgery: at mob scale 4 a micro voxel is 0.25 world voxels, so 0.3 bores
     // a channel roughly one micro voxel wide, while the same beam still melts
     // a 2-voxel hole in stone. Flesh is cut, not blasted.
-    float laserCarveRadius = 0.3f;
-    float laserDamage = 1.5f;
-    float brushAirDistance = 48.0f;
+    float laserCarveRadius = TPD(tools, laserCarveRadius);
+    float laserDamage = TPD(tools, laserDamage);
+    float brushAirDistance = TPD(tools, brushAirDistance);
   } tools;
 
   // ---- integer sim constants: DETERMINISM-CRITICAL (CLAUDE.md rule 1) ----
   // Emitted into the WGSL prelude as integers. Changing any of these changes
   // the world hash; --selftest must be re-run.
   struct Sim {
-    int partGravity = 22;        // 24.8 fixed voxels/tick^2
-    int partMaxVel = 1536;       // 24.8 fixed voxels/tick
+    int partGravity = TPD(sim, partGravity);        // 24.8 fixed voxels/tick^2
+    int partMaxVel = TPD(sim, partMaxVel);       // 24.8 fixed voxels/tick
     // ---- a voxel in flight, inside a liquid (materials.json "fluid") ----
     // Buoyancy itself is per material (density vs the liquid's); these three are
     // the parts that are a property of the SYSTEM rather than of a substance.
-    int partBuoyMax = 88;        // ceiling on the buoyant term, 24.8/tick^2 (4 g)
-    int partSettleSpeed = 24;    // below this speed a floater looks for a berth
-    int partFloatPatience = 180; // ticks it may hunt before it takes any cell
-    int airDensity = 10;         // density below which things rise
-    int falloffPerCell = 6;      // explosion power lost per cell
-    int ejectSolid = 250;        // per-mille of destroyed voxels that fly
-    int ejectLiquid = 500;
-    int ejectPowder = 350;
-    int ejectGas = 0;
-    int liquidEqualize = 2;      // eighths a neighbor must be emptier to flow
+    // ceiling on the buoyant term, 24.8/tick^2 (4 g)
+    int partBuoyMax = TPD(sim, partBuoyMax);
+    // below this speed a floater looks for a berth
+    int partSettleSpeed = TPD(sim, partSettleSpeed);
+    // ticks it may hunt before it takes any cell
+    int partFloatPatience = TPD(sim, partFloatPatience);
+    // density below which things rise
+    int airDensity = TPD(sim, airDensity);
+    // explosion power lost per cell
+    int falloffPerCell = TPD(sim, falloffPerCell);
+    // per-mille of destroyed voxels that fly
+    int ejectSolid = TPD(sim, ejectSolid);
+    int ejectLiquid = TPD(sim, ejectLiquid);
+    int ejectPowder = TPD(sim, ejectPowder);
+    int ejectGas = TPD(sim, ejectGas);
+    // eighths a neighbor must be emptier to flow
+    int liquidEqualize = TPD(sim, liquidEqualize);
     // MINIMUM FILM, in eighths. Lateral spread into AIR is repeated halving,
     // and with no floor the halving runs all the way down: one placed water
     // voxel (8 eighths) becomes 8 cells of ONE eighth each, i.e. a puddle
@@ -2118,16 +2232,18 @@ struct Tuning {
     // the footprint of a placement shrinks by the same factor.
     // 1 is the old behaviour bit-for-bit. Same-liquid EQUALIZE is untouched, so
     // ponds still level; this gates only the leading edge advancing into air.
-    int liquidMinFilm = 1;
-    int wanderHopMask = 7;       // critter hop chance = 1/(mask+1) per tick
+    int liquidMinFilm = TPD(sim, liquidMinFilm);
+    // critter hop chance = 1/(mask+1) per tick
+    int wanderHopMask = TPD(sim, wanderHopMask);
     // Explosion micro grit: sub-voxel spall thrown alongside the real ejecta.
     // Visual, but spawned BY A SIM KERNEL from the hashed RNG — the roll
     // advances sim state and the droplets can stain, so these are integers in
     // the determinism-critical group and --selftest must be re-run when they
     // change. expMicroScaleIdx indexes microScaleOf's 2/3/4/6 table.
-    int expMicroPerMille = 900;
-    int expMicroLifeTicks = 40;
-    int expMicroScaleIdx = 2;    // 0=2, 1=3, 2=4, 3=6 micro voxels per voxel
+    int expMicroPerMille = TPD(sim, expMicroPerMille);
+    int expMicroLifeTicks = TPD(sim, expMicroLifeTicks);
+    // 0=2, 1=3, 2=4, 3=6 micro voxels per voxel
+    int expMicroScaleIdx = TPD(sim, expMicroScaleIdx);
     // MLS-MPM fluid (sim_fluid.wgsl), HUMAN UNITS: real voxels-and-seconds
     // values, converted to Q16.16-per-tick integers at shader compile time by
     // sim_fluid.wgsl's const-eval block (IEEE-exact, so identical JSON gives
@@ -2146,69 +2262,82 @@ struct Tuning {
     // 9 is sqrt(14000)/(30*0.45) rounded up: at 6 the sound speed did not fit
     // and the VMAX clamp engaged on ~575 of 600 bench ticks, which is the
     // "mushy under agitation" regime (plan §1.2 item 1).
-    int fluidSubsteps = 9;
-    float fluidStiffness = 14000.0f;  // EOS stiffness, (vox/s)^2 — the square
-                                     // of a pseudo speed of sound. CHOSEN BY
-                                     // EYE in the fluid lab (2026-08-24) and
-                                     // DELIBERATELY above the CFL cap: 14000
-                                     // -> c = 118 vox/s = 0.66 cells/substep
-                                     // vs the 0.45 FLUID_VMAX ceiling. The
-                                     // WP2 analysis (plan §1.2) says that
-                                     // regime mushes out, and 3600 (0.33
-                                     // cells/substep) is the honest-headroom
-                                     // value — but this pairs with 9x gravity
-                                     // below, which is a fast-water look the
-                                     // owner picked over the physical one.
-                                     // DO NOT "fix" this back without asking:
-                                     // check FA_CLAMPED in --fluid-bench for
-                                     // what the clamp is actually doing, and
-                                     // raise kFluidSubsteps if it engages.
-    float fluidGravity = 900.0f;     // fall acceleration, voxels/s^2. 98.1 is
-                                     // Earth at 0.10 m voxels; 900 is ~9x,
-                                     // the owner's snappy-water default (see
-                                     // stiffness above — the two go together)
+    int fluidSubsteps = TPD(sim, fluidSubsteps);
+    // EOS stiffness, (vox/s)^2 — the square
+    // of a pseudo speed of sound. CHOSEN BY
+    // EYE in the fluid lab (2026-08-24) and
+    // DELIBERATELY above the CFL cap: 14000
+    // -> c = 118 vox/s = 0.66 cells/substep
+    // vs the 0.45 FLUID_VMAX ceiling. The
+    // WP2 analysis (plan §1.2) says that
+    // regime mushes out, and 3600 (0.33
+    // cells/substep) is the honest-headroom
+    // value — but this pairs with 9x gravity
+    // below, which is a fast-water look the
+    // owner picked over the physical one.
+    // DO NOT "fix" this back without asking:
+    // check FA_CLAMPED in --fluid-bench for
+    // what the clamp is actually doing, and
+    // raise kFluidSubsteps if it engages.
+    float fluidStiffness = TPD(sim, fluidStiffness);
+    // fall acceleration, voxels/s^2. 98.1 is
+    // Earth at 0.10 m voxels; 900 is ~9x,
+    // the owner's snappy-water default (see
+    // stiffness above — the two go together)
+    float fluidGravity = TPD(sim, fluidGravity);
     // Density EOS (grantkot MLS-MPM shape): pressure = stiffness *
     // ((rho/rest)^power - 1), clamped below at -cohesion. rho is sampled from
     // the P2G mass grid each substep, so cramming particles into a cavity
     // builds real ejecting pressure instead of saturating a per-particle J.
-    float fluidRestDensity = 8.0f;  // particle masses per voxel at rest (8 =
-                                    // the 8-per-cell spawn lattice exactly)
-    int fluidEosPower = 4;          // integer exponent 1..7; higher = harder
-                                    // incompressibility knee, sharper splashes
-    float fluidCohesion = 0.0f;     // max NEGATIVE pressure, (vox/s)^2.
-                                    // Surface tension: how hard under-dense
-                                    // fluid pulls itself together into blobs.
-                                    // 0 = water's zero-tension default (the
-                                    // EOS floor is then exactly p >= 0);
-                                    // non-zero is the honey/goo authoring
-                                    // surface — plan §5 item 3.
+    // particle masses per voxel at rest (8 =
+    // the 8-per-cell spawn lattice exactly)
+    float fluidRestDensity = TPD(sim, fluidRestDensity);
+    // integer exponent 1..7; higher = harder
+    // incompressibility knee, sharper splashes
+    int fluidEosPower = TPD(sim, fluidEosPower);
+    // max NEGATIVE pressure, (vox/s)^2.
+    // Surface tension: how hard under-dense
+    // fluid pulls itself together into blobs.
+    // 0 = water's zero-tension default (the
+    // EOS floor is then exactly p >= 0);
+    // non-zero is the honey/goo authoring
+    // surface — plan §5 item 3.
+    float fluidCohesion = TPD(sim, fluidCohesion);
     // Species interaction, both (vox/s)^2 and SIGNED. attractSame > 0 pulls a
     // particle toward its own species (blobbing/fusing); attractDiff < 0
     // pushes different species apart (immiscible layers that sit on each
     // other instead of interpenetrating), > 0 encourages mixing. Both 0 by
     // default: negative-pressure terms are the classic sticky-ropes look.
-    float fluidAttractSame = 0.0f;
-    float fluidAttractDiff = 0.0f;
-    float fluidViscosity = 0.0f;    // vox^2/s: resists shear via the APIC C
-                                    // matrix. 0 = the owner's default, every
-                                    // shear-damping term off (APIC's own
-                                    // smoothing is the only one left).
-                                    // References run 0.02-0.1; 1.5 was syrup.
-    float fluidDamping = 0.0f;      // fraction of velocity shed per SECOND
-                                    // (0..20). Non-physical settle aid
-    float fluidFriction = 0.0f;     // fraction/s of TANGENTIAL velocity shed
-                                    // while touching solid (gridUpdate's
-                                    // separate BC). 0 = free-slip water;
-                                    // authoring knob for mud/goo.
+    float fluidAttractSame = TPD(sim, fluidAttractSame);
+    float fluidAttractDiff = TPD(sim, fluidAttractDiff);
+    // vox^2/s: resists shear via the APIC C
+    // matrix. 0 = the owner's default, every
+    // shear-damping term off (APIC's own
+    // smoothing is the only one left).
+    // References run 0.02-0.1; 1.5 was syrup.
+    float fluidViscosity = TPD(sim, fluidViscosity);
+    // fraction of velocity shed per SECOND
+    // (0..20). Non-physical settle aid
+    float fluidDamping = TPD(sim, fluidDamping);
+    // fraction/s of TANGENTIAL velocity shed
+    // while touching solid (gridUpdate's
+    // separate BC). 0 = free-slip water;
+    // authoring knob for mud/goo.
+    float fluidFriction = TPD(sim, fluidFriction);
     // Splash coupling (sim_fluid.wgsl g2p): fluid particles that are FAST and
     // at LOW density (spray, breaking crests) shed PFLAG_MICRO droplets into
     // the ballistic particle system, carrying the species' pour material —
     // so MPM blood spatters stains and MPM water is pure sparkle.
-    float fluidSplashRate = 4.0f;        // droplets/s per eligible particle
-    float fluidSplashSpeed = 18.0f;      // vox/s a particle must exceed
-    float fluidSplashMaxDensity = 0.7f;  // eligible below this x rest density
-    float fluidSplashLife = 1.1f;        // droplet lifetime, seconds (<= 8.5)
-    int fluidSplashScaleIdx = 2;         // droplet size: 0=1/2,1=1/3,2=1/4,3=1/6 vox
+    // droplets/s per eligible particle
+    float fluidSplashRate = TPD(sim, fluidSplashRate);
+    // vox/s a particle must exceed
+    float fluidSplashSpeed = TPD(sim, fluidSplashSpeed);
+    // eligible below this x rest density
+    float fluidSplashMaxDensity = TPD(sim, fluidSplashMaxDensity);
+    // droplet lifetime, seconds (<= 8.5)
+    float fluidSplashLife = TPD(sim, fluidSplashLife);
+    // droplet size: 0=1/2,1=1/3,2=1/4,3=1/6 vox
+    int fluidSplashScaleIdx = TPD(sim, fluidSplashScaleIdx);
     // ---- diffuse material: spray / foam / bubbles ----
     // Ihmsen et al., "Unified Spray, Foam and Bubbles for Particle-Based
     // Fluids" (CGI 2012). Three potentials — trapped air, wave crest, kinetic
@@ -2218,30 +2347,44 @@ struct Tuning {
     // (ballistic), foam (advected by the fluid, ages out) and bubbles
     // (buoyant, dragged by the fluid) — the classification the paper does by
     // neighbour COUNT, which here is the density the solver already gathered.
-    float fluidFoamRate = 90.0f;      // kta: foam particles/s from trapped air
-    float fluidFoamCrestRate = 120.0f; // kwc: foam particles/s from wave crests
-    float fluidTrappedMin = 1.5f;     // Phi thresholds on the convergence-
-    float fluidTrappedMax = 11.0f;    //   weighted relative velocity, vox/s
-    float fluidCrestMin = 0.25f;       // Phi thresholds on gated curvature,
-    float fluidCrestMax = 2.0f;       //   dimensionless
-    float fluidFoamEnergyMin = 8.0f;  // Phi thresholds on kinetic energy,
-    float fluidFoamEnergyMax = 260.0f; //   (vox/s)^2
-    float fluidFoamLife = 2.2f;       // foam lifetime at full potential, s
-    float fluidFoamLifeMin = 0.5f;    // lifetime at the generation threshold, s
-    float fluidBubbleBuoyancy = 1.6f; // kb: bubble rise, x gravity, upward
-    float fluidFoamDrag = 0.72f;      // kd: how hard the fluid drags foam and
-                                      //   bubbles toward its own velocity
-    float fluidBubbleDensity = 1.05f; // above this x rest -> bubble
-    float fluidSprayDensity = 0.42f;  // below this x rest -> spray
-    int fluidFoamScaleIdx = 3;        // foam particle size (0=1/2 .. 3=1/6 vox)
+    // kta: foam particles/s from trapped air
+    float fluidFoamRate = TPD(sim, fluidFoamRate);
+    // kwc: foam particles/s from wave crests
+    float fluidFoamCrestRate = TPD(sim, fluidFoamCrestRate);
+    // Phi thresholds on the convergence-
+    float fluidTrappedMin = TPD(sim, fluidTrappedMin);
+    //   weighted relative velocity, vox/s
+    float fluidTrappedMax = TPD(sim, fluidTrappedMax);
+    // Phi thresholds on gated curvature,
+    float fluidCrestMin = TPD(sim, fluidCrestMin);
+    float fluidCrestMax = TPD(sim, fluidCrestMax);       //   dimensionless
+    // Phi thresholds on kinetic energy,
+    float fluidFoamEnergyMin = TPD(sim, fluidFoamEnergyMin);
+    float fluidFoamEnergyMax = TPD(sim, fluidFoamEnergyMax); //   (vox/s)^2
+    // foam lifetime at full potential, s
+    float fluidFoamLife = TPD(sim, fluidFoamLife);
+    // lifetime at the generation threshold, s
+    float fluidFoamLifeMin = TPD(sim, fluidFoamLifeMin);
+    // kb: bubble rise, x gravity, upward
+    float fluidBubbleBuoyancy = TPD(sim, fluidBubbleBuoyancy);
+    // kd: how hard the fluid drags foam and
+    //   bubbles toward its own velocity
+    float fluidFoamDrag = TPD(sim, fluidFoamDrag);
+    // above this x rest -> bubble
+    float fluidBubbleDensity = TPD(sim, fluidBubbleDensity);
+    // below this x rest -> spray
+    float fluidSprayDensity = TPD(sim, fluidSprayDensity);
+    // foam particle size (0=1/2 .. 3=1/6 vox)
+    int fluidFoamScaleIdx = TPD(sim, fluidFoamScaleIdx);
     // ---- MLS-MPM settle / excite seam: the CA <-> particle handover ----
-    int fluidExciteMode = 1;      // 0 = disturbance-excite off: the CA owns
-                                  // disturbed settled liquid; 1 = settled
-                                  // liquid with air below converts to MPM
-                                  // particles. 1 is what tuning.json ships and
-                                  // what the .def row says; this initializer
-                                  // said 0 until 2026-09-24
-                                  // (check_invariants.py pins them together)
+    // 0 = disturbance-excite off: the CA owns
+    // disturbed settled liquid; 1 = settled
+    // liquid with air below converts to MPM
+    // particles. 1 is what tuning.json ships.
+    // This initializer said 0 while the .def said
+    // 1 until 2026-09-24; since W2-Q it IS the
+    // .def value, so the two cannot drift again.
+    int fluidExciteMode = TPD(sim, fluidExciteMode);
     // ---- THE BURST BOUND (WP5) ----
     // Excite is a per-cell trigger with no notion of "only wake what the
     // disturbance can reach", and it emits one particle per eighth of
@@ -2263,125 +2406,129 @@ struct Tuning {
     // excite — never to explicit spawns. Pouring water with the mpm tool is
     // something the player asked for; a lake converting itself is not, and the
     // two must not share a budget or the tool stops working next to water.
-    int fluidExciteCeiling = 8000;   // most excited particles the seam will
-                                     // hold at once = 1,000 water voxels in
-                                     // motion, a 10-voxel cube. `--fluid-bench
-                                     // wp5b`, worldlake, same puncture, and
-                                     // the last column is the acceptance
-                                     // criterion frame time cannot express —
-                                     // eighths that reached the sealed chamber
-                                     // in the 400 ticks after the plug:
-                                     //  ceiling   p50    p95    p99   drained
-                                     //   CA only 15.00  15.87  17.12   70,743
-                                     //    4,000  23.43  24.93  26.21   73,672
-                                     //    8,000  25.05  27.13  28.60   72,996
-                                     //   16,000  27.10  28.82  29.86   74,572
-                                     //   32,000  33.23  34.80  36.22   75,599
-                                     //  262,144  69.34  72.28  73.74  102,402
-                                     // Drain THROUGHPUT is flat from 4k to 32k
-                                     // — the CA is doing the transport in all
-                                     // of them (71,479 of the 73,672 at 4,000
-                                     // arrived as settled voxels). So the
-                                     // ceiling buys nothing but COVERAGE: how
-                                     // much of the body is visibly in motion.
-                                     // 8,000 is the cheapest value that still
-                                     // clears the largest peak any scene
-                                     // reaches unforced (the pond's own 5,700),
-                                     // so it never clips a body that was not
-                                     // going to burst anyway. It is a LOOK
-                                     // knob above that — raise it for a wider
-                                     // churn at ~1.2 ms of frame per 4,000
-    int fluidExciteRate = 4096;      // most particles converted per TICK. Does
-                                     // not bind at any shipped ceiling (the
-                                     // worldlake ramp to 8,000 takes 46 ticks,
-                                     // ~174/tick); it is the guard for the case
-                                     // the ceiling cannot cover — a blast that
-                                     // exposes thousands of cells at once with
-                                     // the ceiling raised. Deliberately equal
-                                     // to kMaxFluidSpawnsPerTick: the seam may
-                                     // not convert world water faster than the
-                                     // MutationQueue can pour it
-    int fluidExcitePerch = 0;        // 1 = excite also takes water PERCHED on
-                                     // terrain (a base cell with a diagonal
-                                     // void beside it), not only water with
-                                     // air directly below.
-                                     //
-                                     // OFF, and that is a measured reversal of
-                                     // WP3's expectation. The trigger was for
-                                     // water the CA had parked on a slope, and
-                                     // the CA no longer parks water on slopes.
-                                     // `--fluid-bench wp5` / `wp5b`, perch 1 vs
-                                     // 0, everything else equal:
-                                     //   pond68     candidates 1,150 vs 1,150
-                                     //   worldlake  candidates 169,616 vs
-                                     //              169,616, emitted 35,158 vs
-                                     //              35,158, p50 33.23 vs 33.13
-                                     //   hill       basin capture 50.9% vs
-                                     //              51.7% (ceiling lifted, so
-                                     //              excite is actually live)
-                                     // Byte-identical on both settled-water
-                                     // scenes; on the ramp it is a fraction of
-                                     // a point and in the WRONG direction. It
-                                     // costs 24% of seam time (fluidSeam 0.230
-                                     // -> 0.174 ms on pond68) for nothing.
-                                     //
-                                     // EXCITE SIDE ONLY. settleCheck's
-                                     // stability veto evaluates the full
-                                     // predicate whatever this says, because
-                                     // settle refusing MORE than excite takes
-                                     // is the safe direction of the hysteresis
-                                     // — water stays particles a while longer —
-                                     // and the reverse lets settle create a
-                                     // configuration excite immediately tears
-                                     // up again
-    int fluidExciteStep = 2;         // SURFACE DISTURBANCE, in whole cells.
-                                     // A settled liquid cell whose own water
-                                     // surface stands this many cells or more
-                                     // above the water surface in a lateral
-                                     // neighbour's column is a SPLASH sitting
-                                     // on a pool, and goes to the solver so it
-                                     // falls with momentum and throws a wave,
-                                     // instead of relaxing in place as a mound.
-                                     // 0 disables the trigger.
-                                     //
-                                     // Measured in CELLS against the surface,
-                                     // not in eighths against the neighbouring
-                                     // cell, and that is the whole design. The
-                                     // eighth-level version is trigger (c) from
-                                     // plan §6, which was measured twice and
-                                     // rejected both times: a settled pool
-                                     // carries a couple of eighths of shot
-                                     // noise column to column, and bottom
-                                     // packing puts a deeper column's top cell
-                                     // beside a shallower one's empty cell, so
-                                     // "2 eighths lower" is true at the surface
-                                     // of every pool that is not perfectly
-                                     // level. A whole-cell step in the SURFACE
-                                     // is above that noise floor by
-                                     // construction: two columns that differ by
-                                     // a few eighths have surfaces in the same
-                                     // cell or one apart, never two.
-                                     //
-                                     // The trigger only looks over WATER — the
-                                     // neighbour column must itself hold liquid
-                                     // — so a puddle spreading across dry
-                                     // ground never fires it. It is a lakebed
-                                     // disturbance trigger, not a spill one.
-                                     //
-                                     // EXCITE SIDE ONLY, like fluidExcitePerch
-                                     // above, and this is the UNSAFE direction
-                                     // of that asymmetry: settle can in
-                                     // principle rebuild a 2-cell step that
-                                     // excite then tears up again. What makes
-                                     // it hold in practice is that the CA
-                                     // flattens such a step by itself (partial
-                                     // descent takes it straight down), so the
-                                     // configuration does not persist for
-                                     // either side to fight over, and the calm
-                                     // window throttles settle retries
-                                     // regardless. If a pool is ever seen
-                                     // churning at rest, set this to 0 first —
-                                     // that is the differential.
+    // most excited particles the seam will
+    // hold at once = 1,000 water voxels in
+    // motion, a 10-voxel cube. `--fluid-bench
+    // wp5b`, worldlake, same puncture, and
+    // the last column is the acceptance
+    // criterion frame time cannot express —
+    // eighths that reached the sealed chamber
+    // in the 400 ticks after the plug:
+    //  ceiling   p50    p95    p99   drained
+    //   CA only 15.00  15.87  17.12   70,743
+    //    4,000  23.43  24.93  26.21   73,672
+    //    8,000  25.05  27.13  28.60   72,996
+    //   16,000  27.10  28.82  29.86   74,572
+    //   32,000  33.23  34.80  36.22   75,599
+    //  262,144  69.34  72.28  73.74  102,402
+    // Drain THROUGHPUT is flat from 4k to 32k
+    // — the CA is doing the transport in all
+    // of them (71,479 of the 73,672 at 4,000
+    // arrived as settled voxels). So the
+    // ceiling buys nothing but COVERAGE: how
+    // much of the body is visibly in motion.
+    // 8,000 is the cheapest value that still
+    // clears the largest peak any scene
+    // reaches unforced (the pond's own 5,700),
+    // so it never clips a body that was not
+    // going to burst anyway. It is a LOOK
+    // knob above that — raise it for a wider
+    // churn at ~1.2 ms of frame per 4,000
+    int fluidExciteCeiling = TPD(sim, fluidExciteCeiling);
+    // most particles converted per TICK. Does
+    // not bind at any shipped ceiling (the
+    // worldlake ramp to 8,000 takes 46 ticks,
+    // ~174/tick); it is the guard for the case
+    // the ceiling cannot cover — a blast that
+    // exposes thousands of cells at once with
+    // the ceiling raised. Deliberately equal
+    // to kMaxFluidSpawnsPerTick: the seam may
+    // not convert world water faster than the
+    // MutationQueue can pour it
+    int fluidExciteRate = TPD(sim, fluidExciteRate);
+    // 1 = excite also takes water PERCHED on
+    // terrain (a base cell with a diagonal
+    // void beside it), not only water with
+    // air directly below.
+    //
+    // OFF, and that is a measured reversal of
+    // WP3's expectation. The trigger was for
+    // water the CA had parked on a slope, and
+    // the CA no longer parks water on slopes.
+    // `--fluid-bench wp5` / `wp5b`, perch 1 vs
+    // 0, everything else equal:
+    //   pond68     candidates 1,150 vs 1,150
+    //   worldlake  candidates 169,616 vs
+    //              169,616, emitted 35,158 vs
+    //              35,158, p50 33.23 vs 33.13
+    //   hill       basin capture 50.9% vs
+    //              51.7% (ceiling lifted, so
+    //              excite is actually live)
+    // Byte-identical on both settled-water
+    // scenes; on the ramp it is a fraction of
+    // a point and in the WRONG direction. It
+    // costs 24% of seam time (fluidSeam 0.230
+    // -> 0.174 ms on pond68) for nothing.
+    //
+    // EXCITE SIDE ONLY. settleCheck's
+    // stability veto evaluates the full
+    // predicate whatever this says, because
+    // settle refusing MORE than excite takes
+    // is the safe direction of the hysteresis
+    // — water stays particles a while longer —
+    // and the reverse lets settle create a
+    // configuration excite immediately tears
+    // up again
+    int fluidExcitePerch = TPD(sim, fluidExcitePerch);
+    // SURFACE DISTURBANCE, in whole cells.
+    // A settled liquid cell whose own water
+    // surface stands this many cells or more
+    // above the water surface in a lateral
+    // neighbour's column is a SPLASH sitting
+    // on a pool, and goes to the solver so it
+    // falls with momentum and throws a wave,
+    // instead of relaxing in place as a mound.
+    // 0 disables the trigger.
+    //
+    // Measured in CELLS against the surface,
+    // not in eighths against the neighbouring
+    // cell, and that is the whole design. The
+    // eighth-level version is trigger (c) from
+    // plan §6, which was measured twice and
+    // rejected both times: a settled pool
+    // carries a couple of eighths of shot
+    // noise column to column, and bottom
+    // packing puts a deeper column's top cell
+    // beside a shallower one's empty cell, so
+    // "2 eighths lower" is true at the surface
+    // of every pool that is not perfectly
+    // level. A whole-cell step in the SURFACE
+    // is above that noise floor by
+    // construction: two columns that differ by
+    // a few eighths have surfaces in the same
+    // cell or one apart, never two.
+    //
+    // The trigger only looks over WATER — the
+    // neighbour column must itself hold liquid
+    // — so a puddle spreading across dry
+    // ground never fires it. It is a lakebed
+    // disturbance trigger, not a spill one.
+    //
+    // EXCITE SIDE ONLY, like fluidExcitePerch
+    // above, and this is the UNSAFE direction
+    // of that asymmetry: settle can in
+    // principle rebuild a 2-cell step that
+    // excite then tears up again. What makes
+    // it hold in practice is that the CA
+    // flattens such a step by itself (partial
+    // descent takes it straight down), so the
+    // configuration does not persist for
+    // either side to fight over, and the calm
+    // window throttles settle retries
+    // regardless. If a pool is ever seen
+    // churning at rest, set this to 0 first —
+    // that is the differential.
+    int fluidExciteStep = TPD(sim, fluidExciteStep);
     // ---- settled liquid as MPM boundary mass ------------------------------
     // WP4 shipped the two representations passing straight THROUGH each other:
     // sim_fluid.wgsl's fluidSolid() blocks solids and powders only, and a
@@ -2404,77 +2551,84 @@ struct Tuning {
     // 1.0 = a full voxel reads exactly rest density. 0 restores WP4 exactly and
     // is the live A/B oracle for anything this changed. Above ~1 the boundary
     // over-pressurises and ejects particles off the surface.
-    float fluidSettledMass = 1.0f;
-    int fluidSubmergedSolid = 1;  // SUBMERGED settled liquid is a boundary, so
-                                  // particles ride the free surface instead of
-                                  // sinking into water that has no depth
-                                  // profile to push them back out. A buried
-                                  // particle can never settle (its column has
-                                  // no room), so this is what makes settle able
-                                  // to terminate. 0 = the pass-through control
-    float fluidSettleEps = 6.0f;  // vox/s: a fluid block whose FASTEST
-                                  // particle stays below this for
-                                  // settleTicks in a row counts as calm and
-                                  // may settle back into CA voxels.
-                                  // STILL SCALES WITH GRAVITY, and the reason
-                                  // is NOT the one an earlier WP3 revision
-                                  // gave. That revision blamed the solver's
-                                  // free-surface gravity bias (a surface node
-                                  // has no pressure, so it carries exactly
-                                  // gravity/substeps forever) and expected
-                                  // that stripping the bias — seamRestVy in
-                                  // sim_fluid_seam.wgsl — would let 0.9 come
-                                  // back and make the knob g-independent.
-                                  // Measured: it does not. The bias is only
-                                  // 3.3 vox/s at 900/9, and what actually
-                                  // sets the floor is the genuine turbulence
-                                  // of a 9x-gravity scene. Sweep on the lab
-                                  // basin, 400 ticks, eighths still live at
-                                  // the end (lower = more settled), with
-                                  // wakeSpeed held at 4x:
-                                  //   eps 0.9 -> 15,359   (nothing settles)
-                                  //   eps 2.7 ->  7,878
-                                  //   eps 4.0 ->  5,548
-                                  //   eps 6.0 ->  3,438
-                                  // and settle<->wake thrash falls the same
-                                  // way (re-excited/settled 100% -> 38%), so
-                                  // a LOWER threshold is worse on both axes,
-                                  // not a safer trade. 6.0 = 0.2 cells/tick =
-                                  // 0.6 m/s: a drift, not a motion. The
-                                  // excite-stability test in settleCheck is
-                                  // what guards the RESULT; this knob only
-                                  // decides when to ask it.
-    float fluidWakeSpeed = 24.0f; // vox/s: grid-node speed at an active/
-                                  // settled interface above this excites the
-                                  // neighbouring settled liquid (progressive
-                                  // wake). Keep ~4x settleEps: the gap is the
-                                  // hysteresis
-    int fluidSettleTicks = 24;    // consecutive calm ticks before a block
-                                  // settles. 24 beats the old 45 by 2x on
-                                  // settled mass with the bias stripped too
-                                  // (lab hill at exciteMode 0: 2,131 standing
-                                  // eighths at 24 against 1,071 at 45), so
-                                  // this half of the trio is confirmed, not
-                                  // inherited. The >= 8 floor is a HARD
-                                  // requirement: it covers the CPU-side
-                                  // page-materialization readback latency, so
-                                  // the settle converter never writes voxels
-                                  // into a chunk the mirror has not seen
-    int fluidStuckTicks = 96;     // ticks a chunk slot may hold particles
-                                  // before its blocks are force-settled
-                                  // regardless of calm. 0 disables the
-                                  // backstop entirely. Keyed on EXISTENCE, not
-                                  // on refusal: a submerged block is never
-                                  // calm, so it is never picked, so a
-                                  // refusal-triggered age would never fire
-    int fluidForceBlocks = 4;     // forced blocks per tick; bounds the drain
-                                  // rate, and forced picks take a stricter
-                                  // (x,z)-column exclusion because their write
-                                  // set reaches past SETTLE_SPILL
-    int fluidForceReach = 64;     // cells past the spill ceiling a forced walk
-                                  // may climb looking for room. Exhausting it
-                                  // means a sealed column — counted, not
-                                  // silently retried
+    float fluidSettledMass = TPD(sim, fluidSettledMass);
+    // SUBMERGED settled liquid is a boundary, so
+    // particles ride the free surface instead of
+    // sinking into water that has no depth
+    // profile to push them back out. A buried
+    // particle can never settle (its column has
+    // no room), so this is what makes settle able
+    // to terminate. 0 = the pass-through control
+    int fluidSubmergedSolid = TPD(sim, fluidSubmergedSolid);
+    // vox/s: a fluid block whose FASTEST
+    // particle stays below this for
+    // settleTicks in a row counts as calm and
+    // may settle back into CA voxels.
+    // STILL SCALES WITH GRAVITY, and the reason
+    // is NOT the one an earlier WP3 revision
+    // gave. That revision blamed the solver's
+    // free-surface gravity bias (a surface node
+    // has no pressure, so it carries exactly
+    // gravity/substeps forever) and expected
+    // that stripping the bias — seamRestVy in
+    // sim_fluid_seam.wgsl — would let 0.9 come
+    // back and make the knob g-independent.
+    // Measured: it does not. The bias is only
+    // 3.3 vox/s at 900/9, and what actually
+    // sets the floor is the genuine turbulence
+    // of a 9x-gravity scene. Sweep on the lab
+    // basin, 400 ticks, eighths still live at
+    // the end (lower = more settled), with
+    // wakeSpeed held at 4x:
+    //   eps 0.9 -> 15,359   (nothing settles)
+    //   eps 2.7 ->  7,878
+    //   eps 4.0 ->  5,548
+    //   eps 6.0 ->  3,438
+    // and settle<->wake thrash falls the same
+    // way (re-excited/settled 100% -> 38%), so
+    // a LOWER threshold is worse on both axes,
+    // not a safer trade. 6.0 = 0.2 cells/tick =
+    // 0.6 m/s: a drift, not a motion. The
+    // excite-stability test in settleCheck is
+    // what guards the RESULT; this knob only
+    // decides when to ask it.
+    float fluidSettleEps = TPD(sim, fluidSettleEps);
+    // vox/s: grid-node speed at an active/
+    // settled interface above this excites the
+    // neighbouring settled liquid (progressive
+    // wake). Keep ~4x settleEps: the gap is the
+    // hysteresis
+    float fluidWakeSpeed = TPD(sim, fluidWakeSpeed);
+    // consecutive calm ticks before a block
+    // settles. 24 beats the old 45 by 2x on
+    // settled mass with the bias stripped too
+    // (lab hill at exciteMode 0: 2,131 standing
+    // eighths at 24 against 1,071 at 45), so
+    // this half of the trio is confirmed, not
+    // inherited. The >= 8 floor is a HARD
+    // requirement: it covers the CPU-side
+    // page-materialization readback latency, so
+    // the settle converter never writes voxels
+    // into a chunk the mirror has not seen
+    int fluidSettleTicks = TPD(sim, fluidSettleTicks);
+    // ticks a chunk slot may hold particles
+    // before its blocks are force-settled
+    // regardless of calm. 0 disables the
+    // backstop entirely. Keyed on EXISTENCE, not
+    // on refusal: a submerged block is never
+    // calm, so it is never picked, so a
+    // refusal-triggered age would never fire
+    int fluidStuckTicks = TPD(sim, fluidStuckTicks);
+    // forced blocks per tick; bounds the drain
+    // rate, and forced picks take a stricter
+    // (x,z)-column exclusion because their write
+    // set reaches past SETTLE_SPILL
+    int fluidForceBlocks = TPD(sim, fluidForceBlocks);
+    // cells past the spill ceiling a forced walk
+    // may climb looking for room. Exhausting it
+    // means a sealed column — counted, not
+    // silently retried
+    int fluidForceReach = TPD(sim, fluidForceReach);
 
     // ---- water bodies (docs/PLAN_water_master.md; src/sim/waterbody.h) ----
     //
@@ -2493,7 +2647,7 @@ struct Tuning {
     // `--sweep sim.waterBodyMode=0,1` reports one hash and the pinned world is
     // provably untouched. It stays 0 until a milestone that moves the hash
     // arrives with its own rebaseline commit.
-    int waterBodyMode = 0;
+    int waterBodyMode = TPD(sim, waterBodyMode);
 
     // ENTER / EXIT VOLUME, in EIGHTHS (the CA's state nibble is eighths, so the
     // whole ledger is). Small ponds are cheap to simulate honestly AND the
@@ -2506,8 +2660,8 @@ struct Tuning {
     // a body oscillating across one shared threshold would change
     // representation every tick, and every change is a seam crossing where mass
     // can be lost.
-    int waterBodyMinVolume = 65536;
-    int waterBodyExitVolume = 32768;
+    int waterBodyMinVolume = TPD(sim, waterBodyMinVolume);
+    int waterBodyExitVolume = TPD(sim, waterBodyExitVolume);
 
     // SURFACE HEIGHT SPREAD, whole voxels — the error term of the entire model.
     // A stream down a hillside is ONE connected component with a 200-voxel head
@@ -2521,19 +2675,19 @@ struct Tuning {
     // spread can reach the ladder. `--gate waterbody` measures the true spread
     // from voxels and asserts it against these. The runtime measurement lands
     // with M2's GPU reduce, which is the pass that can see a whole lake.
-    int waterBodySpreadEnter = 1;
-    int waterBodySpreadExit = 4;
+    int waterBodySpreadEnter = TPD(sim, waterBodySpreadEnter);
+    int waterBodySpreadExit = TPD(sim, waterBodySpreadExit);
 
     // How long every enter test must hold before adoption. Ticks — 30 is one
     // second. A body still sloshing has a surface that is not an equipotential,
     // and adopting it would freeze that transient into a `level`.
-    int waterBodyQuietTicks = 30;
+    int waterBodyQuietTicks = TPD(sim, waterBodyQuietTicks);
 
     // Rule 2's bound on the whole feature. At the cap the SMALLEST candidate is
     // refused, and refusal is a safe degradation: unadopted means "simulated the
     // way it is today", never "lost". Hard-capped at kWaterBodyCap (waterbody.h)
     // because the descriptor array's size is a GPU layout from M2 onward.
-    int waterBodyMaxCount = 64;
+    int waterBodyMaxCount = TPD(sim, waterBodyMaxCount);
 
     // THE M2 TEST TAP, eighths per tick per governed body. M2 lands the ledger
     // and the shave but not the discharge law (component 6 is M3), so this is
@@ -2547,7 +2701,7 @@ struct Tuning {
     // footprint to the page table (so a labelled lake materializes no pages).
     // Idle cost is zero rather than small, and that is a property of this knob
     // being the only drain source rather than of a threshold.
-    int waterBodyTestDrain = 0;
+    int waterBodyTestDrain = TPD(sim, waterBodyTestDrain);
 
     // ---- THE DISCHARGE LAW (component 6) and THE LOCAL EXCITE (7), M3 ----
     //
@@ -2561,18 +2715,19 @@ struct Tuning {
     // this is clamped to that and the ledger can never publish an emission the
     // op block cannot hold. When the cap binds, the debit is what was ACTUALLY
     // written (discipline 3.2) — capping slows a drain, it cannot lose an eighth.
-    int drainMaxEighthsPerTick = 512;
+    int drainMaxEighthsPerTick = TPD(sim, drainMaxEighthsPerTick);
     // COMPONENT 7's v1 radius, world cells. The shell is the free-surface disc
     // at the body's level plus the throat column over the hole — NOT a solid
     // ball: plan §9 ranks the ball's ~33,000 particles against a ~40,000
     // measured envelope as the second-most-likely way this work fails. 0
     // disables the shell and is an exact identity (no cell can satisfy it).
-    int drainExciteRadius = 6;
+    int drainExciteRadius = TPD(sim, drainExciteRadius);
     // The two PHYSICAL quantities, human-unit floats in the sanctioned
     // sim.fluid* lane — const-eval'd to fixed point at the top of
     // sim_waterbody.wgsl, so the kernel stays integer (rule 1).
-    float drainCd = 0.6f;        // orifice discharge coefficient
-    float drainGravity = 900.0f; // vox/s^2; should match sim.fluidGravity
+    float drainCd = TPD(sim, drainCd);        // orifice discharge coefficient
+    // vox/s^2; should match sim.fluidGravity
+    float drainGravity = TPD(sim, drainGravity);
 
     // ---- RELEVEL (docs/PLAN_water_relevel.md W1) --------------------------
     //
@@ -2588,19 +2743,19 @@ struct Tuning {
     // pinned world hash is the pre-W1 one. 4 flattens a 10-voxel cone in ~20
     // ticks (0.7 s); 8 does it in 10 and starts to read as an edit rather than
     // as water finding its level.
-    int waterRelevelMax = 4;
+    int waterRelevelMax = TPD(sim, waterRelevelMax);
     // Eighths of deficit per EXTRA eighth of rate: k = clamp(|s - m| / gain, 1,
     // max). A column one voxel down moves at 1 eighth/tick, a column four
     // voxels down at 4 — so a crater closes fast and a one-eighth ripple does
     // not get bulldozed.
-    int waterRelevelGain = 8;
+    int waterRelevelGain = TPD(sim, waterRelevelGain);
     // How far below the body's level the measure looks, in VOXELS. This sizes
     // nothing at runtime — the histogram block is sized from world.h's
     // kWaterRelevelDepthMax and this is clamped to it — but it does decide how
     // deep a hole still counts as "a low column of this lake" rather than as a
     // void the MPM owns. A column further down than this clamps into the end
     // bucket and is treated as deep.
-    int waterRelevelDepth = 32;
+    int waterRelevelDepth = TPD(sim, waterRelevelDepth);
 
     // ---- W2: surface momentum (docs/PLAN_water_relevel.md §4) ----
     //
@@ -2614,7 +2769,7 @@ struct Tuning {
     // 0 = OFF and it is an EXACT IDENTITY, stronger than a cheap kernel: the
     // `waterFlux` pass row is not recorded at all (Cond::WaterWave), so the
     // pinned world hash cannot see the feature. 1 = the pipe layer is live.
-    int waveMode = 0;
+    int waveMode = TPD(sim, waveMode);
     // Gravity for the pipe acceleration, in VOXELS/s^2 — the sanctioned
     // human-unit float lane, exactly like `drainGravity`, and converted to Q8
     // cells/tick^2 by WGSL const-eval at the top of sim_waterbody.wgsl so the
@@ -2624,18 +2779,18 @@ struct Tuning {
     // sqrt(g * depth); at the shipped depth cap of 10 voxels that is ~1.04
     // cells/tick, which is the CFL limit for a reach-1 scheme — raise either
     // and the ring outruns the grid instead of travelling on it.
-    float waveGravity = 98.0f;
+    float waveGravity = TPD(sim, waveGravity);
     // VOXELS of depth the wave speed may see. A deep lake's waves would
     // otherwise travel faster than one cell per tick, which a reach-1 update
     // cannot represent; capping the depth caps the speed and reads fine,
     // because what the eye follows is the ring, not its absolute celerity.
-    int waveDepthCap = 10;
+    int waveDepthCap = TPD(sim, waveDepthCap);
     // How fast the ring dies, per SECOND. A pipe keeps (1 - damping/30) of its
     // flux each tick, so 0.8 is an e-folding time of ~1.25 s: a crater rings
     // three or four times and is gone. 0 never settles and is what the sleep
     // epsilon exists to make safe anyway; above ~8 the overshoot is invisible
     // and this is just a slower relevel.
-    float waveDamping = 0.8f;
+    float waveDamping = TPD(sim, waveDamping);
     // The Q8 pipe magnitude a body must be STRICTLY UNDER to count as still.
     // The shipped 256 is not a tolerance: a pipe transfers `q >> 8` whole
     // eighths, so under 256 it moves literally nothing. A body that is still
@@ -2643,7 +2798,7 @@ struct Tuning {
     // and both W2 passes then return after three loads — which is what keeps a
     // settled lake inside its hot window at zero cost (rule 2). Measured on the
     // harness lake: asleep 112 ticks after a 17x17x6 crater.
-    int waveSleepEps = 256;
+    int waveSleepEps = TPD(sim, waveSleepEps);
 
     // ---- W3: what disturbs the surface (PLAN_water_relevel.md §5) ----
     //
@@ -2661,18 +2816,18 @@ struct Tuning {
     //
     // At 0 the CPU emits no impulse record at all, so TickParams'
     // `waterImpulseCount` stays 0 and `wbFlux` is bit-identical.
-    int waveBlastImpulse = 3072;
+    int waveBlastImpulse = TPD(sim, waveBlastImpulse);
     // Q8 flux a LIVE DISCHARGE pulls its neighbours in with, so the surface
     // genuinely dips toward the throat instead of the render vortex sitting
     // over a flat lake. GPU-generated, because "this body is emitting" is a
     // fact only the ledger knows (WBS_EMIT) — the CPU could learn it only from
     // the async readback, which is rule 1 through the back door.
-    int waveDrainSink = 1024;
+    int waveDrainSink = TPD(sim, waveDrainSink);
     // Q8 flux a swimmer drags behind them, per whole voxel-per-tick of their
     // own submerged speed. Small on purpose: a wake is a trail, not a wave, and
     // a body that shoved the surface as hard as a blast would let a player pump
     // a lake by swimming in circles. Bounded anyway by the outflow clamp.
-    int waveSwimWake = 512;
+    int waveSwimWake = TPD(sim, waveSwimWake);
 
     // ---- W-D: discovery (docs/PLAN_water_relevel.md §8) ----
     //
@@ -2688,14 +2843,14 @@ struct Tuning {
     // burst pipe leaves behind. 0 is an EXACT IDENTITY: no evidence is
     // accumulated, no probe exists, no descriptor carries WBF_DISCOVER, and
     // the pinned world hash is the pre-W-D one.
-    int waterDiscoverMinEighths = 4096;
+    int waterDiscoverMinEighths = TPD(sim, waterDiscoverMinEighths);
     // MEASURED free-surface CELLS below which the GPU refuses a discovered
     // probe and parks it in WB_REFUSED (four ledger loads a tick, no footprint
     // work). This is the backstop behind the CPU filter above, for evidence
     // that evaporated, soaked away or ran off before the reduce ever looked:
     // the eighths were genuinely placed, and there is still no body there.
     // Never applied to an AUTHORED basin — see TickParams::waterAdoptMinArea.
-    int waterAdoptMinArea = 64;
+    int waterAdoptMinArea = TPD(sim, waterAdoptMinArea);
 
     // ---- wind coupling (docs/RESEARCH_wind.md §4.5/§4.6) ----
     // The SHAPE of the field is the `wind` group below; these are what the
@@ -2710,7 +2865,7 @@ struct Tuning {
     // settled-powder entrainment. See kWindMode* in world.h for what each step
     // promises about rule 2 — 2 is deliberately NOT rule-2 clean yet and is
     // there to be looked at, not shipped.
-    int windMode = 1;
+    int windMode = TPD(sim, windMode);
     // ---- gas particles (docs/PLAN_gas_particles.md stage 1) ----
     // THE EDGE. 0 = wall: `gasLeave` never fires and a gas voxel pressed
     // against the residency boundary spreads along it, which is the top-plane
@@ -2722,7 +2877,7 @@ struct Tuning {
     // At 0 the CPU records NO gas pass (Cond::Gas is false) and the kernel
     // branch is never reached, so this is an exact identity in the windMode /
     // waterBodyMode sense rather than merely a cheap path.
-    int gasMode = 1;
+    int gasMode = TPD(sim, gasMode);
     // Ballistic debris and spray: fraction of the gap between a particle's
     // velocity and the local wind that closes per SECOND, at a material's full
     // windResponse of 15. A drag law rather than a push, because drag is
@@ -2730,42 +2885,41 @@ struct Tuning {
     // so no gust can fling debris faster than the air is moving, whatever the
     // knob says. That bound is why this can be a plain multiplier and does not
     // need a budget.
-    float windDrag = 3.0f;
+    float windDrag = TPD(sim, windDrag);
     // MPM grid nodes: how much of the field a fully exposed node feels, as a
     // fraction. Below 1 because a fluid surface is not a free particle — it is
     // dragged by the air, not carried.
-    float windFluidGain = 0.35f;
+    float windFluidGain = TPD(sim, windFluidGain);
     // ...and which nodes count as exposed: node mass, as a fraction of the mass
     // a node deep inside fluid at rest density carries. Wind fades to nothing
     // as a node approaches this, so it acts on spray and the top skin of a pool
     // and not on its body. Full-body wind on a pond reads as a CURRENT, which
     // is a different phenomenon and the wrong one (research doc §8's open
     // question, answered here in favour of low-mass-only).
-    float windFluidMass = 0.5f;
+    float windFluidMass = TPD(sim, windFluidMass);
     // CA drift bias: the wind speed at which a full-response material reaches
     // the maximum bias probability, and that maximum. The bias only reorders
     // the direction candidates a moving voxel already tries, so the cap is what
     // keeps wind from becoming a second gravity — at 0.5 a gale still leaves an
     // even chance of the ordinary random order, which is what keeps smoke
     // looking like smoke rather than like a conveyor.
-    float windDriftSpeed = 12.0f;
-    float windDriftMax = 0.5f;
+    float windDriftSpeed = TPD(sim, windDriftSpeed);
+    float windDriftMax = TPD(sim, windDriftMax);
     // Entrainment (windMode 2): the per-axis wind speed that just lifts a grain
     // whose windFriction is 1; the threshold scales with the authored nibble,
     // so friction 4 needs four times this. Bagnold's fluid threshold, authored.
-    float windEntrainSpeed = 2.0f;
+    float windEntrainSpeed = TPD(sim, windEntrainSpeed);
     // ...and how often a grain over that threshold actually hops, in chances
     // per second. This is the bound (rule 2): entrainment is a rate, not a
     // certainty, so a dune creeps instead of exploding.
-    float windEntrainRate = 6.0f;
+    float windEntrainRate = TPD(sim, windEntrainRate);
 
     // ---- dev force multipliers, one per TIER ----
-    // Not in tuning_params.def, and that is deliberate rather than an
-    // omission. That table is "the ONE table of SHADER-FACING tuning
-    // parameters" — rows that become const-folded WGSL constants and therefore
-    // need F5. These two ride TickParams as Q8 integers instead, because they
+    // NO_WGSL rows in tuning_params.def, and that is deliberate rather than
+    // an omission: a WGSL row becomes a const-folded shader constant and
+    // needs F5. These two ride TickParams as Q8 integers instead, because they
     // exist to be DRAGGED: a slider you have to reload a shader to see is a
-    // slider nobody moves. (`sim.fluidExciteMode` carries a .def row it does
+    // slider nobody moves. (`sim.fluidExciteMode` carries a WGSL name it does
     // not use and rides the tick stream anyway; that is the wart, not this.)
     //
     // WHY TWO, AND WHY THEY SCALE DIFFERENT QUANTITIES. The engine's own split
@@ -2783,8 +2937,8 @@ struct Tuning {
     // early-out at exactly 1.0, so the pinned world hash cannot move until a
     // slider does. Off 1.0 they are still fully deterministic — integers on
     // the tick input stream, captured by replays and the twice-run gate.
-    float windGasScale = 1.0f;
-    float windPartScale = 1.0f;
+    float windGasScale = TPD(sim, windGasScale);
+    float windPartScale = TPD(sim, windPartScale);
     // ...and the third thing on that stream, which is not a multiplier: the
     // wind speed (m/s) at which windDrag above applies IN FULL. Below it the
     // drag RATE ramps linearly with the local wind, which is what keeps a calm
@@ -2795,10 +2949,10 @@ struct Tuning {
     // 40 the 6 m/s weather falls at 5.7 vox/tick and only a named storm looks
     // floaty; drop it to 20 and ordinary weather already halves the fall.
     //
-    // Here rather than in tuning_params.def for the windGasScale reason — this
-    // is the knob you drag WHILE watching an explosion, and one that needs F5
-    // between each nudge cannot be judged by eye.
-    float windDragRef = 40.0f;
+    // NO_WGSL for the windGasScale reason — this is the knob you drag WHILE
+    // watching an explosion, and one that needs F5 between each nudge cannot
+    // be judged by eye.
+    float windDragRef = TPD(sim, windDragRef);
     // ---- the wind primitive wake budget (docs/RESEARCH_wind.md §4.3) ----
     // Chunks a tick may WAKE across every wind primitive holding the
     // entrainment licence. This is the rule-2 budget for the whole feature and
@@ -2809,10 +2963,10 @@ struct Tuning {
     // footprint would read as "entrainment is flaky"). A refused primitive
     // still blows; it just cannot pick settled matter up this tick.
     //
-    // Here rather than in tuning_params.def for the windGasScale reason: it is
-    // read CPU-side per tick, so a gate can set it with no shader reload.
+    // NO_WGSL for the windGasScale reason: it is read CPU-side per tick, so a
+    // gate can set it with no shader reload.
     // Clamped to kWindWakeCap, which is the TickParams array it fills.
-    int windWakeChunks = 96;
+    int windWakeChunks = TPD(sim, windWakeChunks);
 
     // ---- THE CURRENT FIELD (docs/PLAN_water_master.md component 8) --------
     //
@@ -2825,7 +2979,7 @@ struct Tuning {
     // pipeline is designed to prevent is two places that must agree.
     //
     // The wave knobs are the opposite case — raymarch.wgsl evaluates the
-    // Gerstner sum itself — so those ARE .def rows, in the `water` group.
+    // Gerstner sum itself — so those are WGSL rows of the .def.
     //
     // THE OFF SWITCH. `currentMode` 0 must be bit-identical to a build without
     // this feature, and it is by construction: currentAtQ returns the zero
@@ -2840,41 +2994,41 @@ struct Tuning {
     // of currentAtQ's early return: it re-aims a damping term that already
     // existed and already aimed at zero, so a zero field reproduces it
     // bit-for-bit. It is still gated, to skip the primitive loop.
-    int currentMode = 0;
+    int currentMode = TPD(sim, currentMode);
     // Base circulation of a drain's whirlpool, m^2/s. Gamma, the quantity that
     // is actually conserved: v_theta = Gamma / (2 pi r), so this fixes how far
     // the swirl reaches, not how fast the throat is. 22 m^2/s is the figure the
     // plan's own excite-radius arithmetic is written against.
-    float currentVortexGamma = 22.0f;
+    float currentVortexGamma = TPD(sim, currentVortexGamma);
     // Seconds a whirlpool takes to wind down after the flow stops. Plan
     // component 8: "Gamma must decay when flow stops. Otherwise any funnel
     // effect stands open in still water, which is instantly and obviously
     // wrong." This is that number, and 0 would be the bug.
-    float currentVortexDecay = 3.0f;
+    float currentVortexDecay = TPD(sim, currentVortexDecay);
     // How far a whirlpool reaches, world cells. Separate from Gamma because
     // circulation sets the STRENGTH and this sets the FOOTPRINT — and the
     // footprint is what the shader's AABB reject and the per-sample cost are
     // paid against.
-    int currentVortexRadius = 40;
+    int currentVortexRadius = TPD(sim, currentVortexRadius);
     // Peak inflow speed at a drain's throat, m/s. The sink term is violent and
     // only a couple of voxels wide at any realistic discharge; that asymmetry
     // against the vortex is why real whirlpools look enormous while the actual
     // suction is a small hole.
-    float currentSinkSpeed = 3.0f;
+    float currentSinkSpeed = TPD(sim, currentSinkSpeed);
     // Chezy coefficient for the stream arm: v = scale * sqrt(slope * depth),
     // depth in metres. 0 disables the stream arm entirely.
-    float currentStreamScale = 1.2f;
+    float currentStreamScale = TPD(sim, currentStreamScale);
     // Landform slope below which standing water is a POND, not a stream, Q8
     // (256 = one voxel per voxel = the angle of repose). Read against
     // World::Column::slope, which is `Land.slope` — the HILL-octave gradient,
     // deliberately not the fine one. See the trap note over SeedStreams.
-    int currentStreamMinSlope = 24;
+    int currentStreamMinSlope = TPD(sim, currentStreamMinSlope);
     // How fast an MPM node closes the gap to the local current, per second.
     // The ONE current knob a shader reads (sim_fluid.wgsl const-evals it), and
     // it is a DRAG rather than a push for windDrag's reason: a drag law is
     // self-limiting, so no whirlpool and no knob value can fling water faster
     // than the field says it is moving. Only consulted when currentMode is 1.
-    float currentDrag = 6.0f;
+    float currentDrag = TPD(sim, currentDrag);
   } sim;
 
   // ---- day/night cycle ----
@@ -2889,9 +3043,12 @@ struct Tuning {
   // lunar phase, the 72-day beat between the two moons and eclipses are all
   // consequences, so there is no knob for any of them — you change the orbit.
   struct DayNight {
-    int cycleMinutes = 20;      // real minutes for one full in-game SOLAR day
-    int freeze = 0;             // 1 = pin the cycle at freezePhase
-    int freezePhase = 32768;    // 0..65535, 0 = midnight, 32768 = noon
+    // real minutes for one full in-game SOLAR day
+    int cycleMinutes = TPD(dayNight, cycleMinutes);
+    // 1 = pin the cycle at freezePhase
+    int freeze = TPD(dayNight, freeze);
+    // 0..65535, 0 = midnight, 32768 = noon
+    int freezePhase = TPD(dayNight, freezePhase);
 
     // ---- the planet ----
     // Axial tilt is the obliquity of the spin axis to the orbital plane, and
@@ -2901,57 +3058,65 @@ struct Tuning {
     // (90 - |lat - tilt| at the solstice) and day length — which is why it
     // replaced the old `sunPeakElevation` clamp, a knob that set the sun's
     // height while leaving day length wrong.
-    float axialTilt = 23.4f;        // degrees
-    float latitudeDeg = 42.0f;      // observer latitude, degrees north
-    float yearLengthDays = 96.0f;   // in-game days per orbit — the season rate
+    float axialTilt = TPD(dayNight, axialTilt);        // degrees
+    // observer latitude, degrees north
+    float latitudeDeg = TPD(dayNight, latitudeDeg);
+    // in-game days per orbit — the season rate
+    float yearLengthDays = TPD(dayNight, yearLengthDays);
     // Orbit shape. Near-circular by default: eccentricity mostly shows as the
     // sun changing apparent size and as the equation of time, both subtle.
-    float orbitEccentricity = 0.017f;
-    float orbitArgPeriapsis = 283.0f;   // degrees — where in the year perihelion falls
-    float orbitMeanAnomaly0 = 0.0f;     // degrees — the epoch (tick 0) position
+    float orbitEccentricity = TPD(dayNight, orbitEccentricity);
+    // degrees — where in the year perihelion falls
+    float orbitArgPeriapsis = TPD(dayNight, orbitArgPeriapsis);
+    // degrees — the epoch (tick 0) position
+    float orbitMeanAnomaly0 = TPD(dayNight, orbitMeanAnomaly0);
     // Rotates the whole sky about the vertical, i.e. picks which way is east.
-    float sunAzimuth = 24.0f;
+    float sunAzimuth = TPD(dayNight, sunAzimuth);
     // True angular RADIUS of the star as seen at a = 1, in degrees. The real
     // sun is 0.266; larger reads better at game FOV and, since the eclipse
     // test is pure geometry, directly sets how often a moon can cover it.
-    float sunAngularRadius = 0.30f;
+    float sunAngularRadius = TPD(dayNight, sunAngularRadius);
 
     // How sharply day turns into night. This is the smoothed daylight weight
     // (R.sunUp) that crossfades the sky, ambient and key light; widening it
     // lengthens twilight.
-    float twilightWidth = 0.22f;
+    float twilightWidth = TPD(dayNight, twilightWidth);
 
     // ---- moon A ----
     // Periods are SYNODIC (new moon to new moon) because that is the cycle a
     // player watches; celestial.cpp derives the sidereal period the orbit is
     // actually integrated with. Authoring the sidereal period instead would
     // make "an 8-day moon" mean an 8.7-day phase cycle.
-    int lunarPeriodDays = 8;
-    float moonInclination = 5.1f;    // degrees to the ecliptic — see below
-    float moonEccentricity = 0.055f;
-    float moonArgPeriapsis = 130.0f;
-    float moonNode = 0.0f;           // longitude of the ascending node, degrees
-    float moonMeanAnomaly0 = 40.0f;  // epoch position, degrees
+    int lunarPeriodDays = TPD(dayNight, lunarPeriodDays);
+    // degrees to the ecliptic — see below
+    float moonInclination = TPD(dayNight, moonInclination);
+    float moonEccentricity = TPD(dayNight, moonEccentricity);
+    float moonArgPeriapsis = TPD(dayNight, moonArgPeriapsis);
+    // longitude of the ascending node, degrees
+    float moonNode = TPD(dayNight, moonNode);
+    // epoch position, degrees
+    float moonMeanAnomaly0 = TPD(dayNight, moonMeanAnomaly0);
     // Angular radius in DEGREES at the orbit's mean distance.
-    float moonAngularRadius = 1.7f;
+    float moonAngularRadius = TPD(dayNight, moonAngularRadius);
 
     // ---- moon B ----
     // 9 days against A's 8: coprime, so the pair of phases takes 72 days to
     // repeat. Smaller, further out, and on a differently-oriented plane, so
     // the two moons cross each other rather than travelling together.
-    int moon2PeriodDays = 9;
-    float moon2Inclination = 8.7f;
-    float moon2Eccentricity = 0.03f;
-    float moon2ArgPeriapsis = 20.0f;
-    float moon2Node = 95.0f;
-    float moon2MeanAnomaly0 = 200.0f;
-    float moon2AngularRadius = 1.05f;
+    int moon2PeriodDays = TPD(dayNight, moon2PeriodDays);
+    float moon2Inclination = TPD(dayNight, moon2Inclination);
+    float moon2Eccentricity = TPD(dayNight, moon2Eccentricity);
+    float moon2ArgPeriapsis = TPD(dayNight, moon2ArgPeriapsis);
+    float moon2Node = TPD(dayNight, moon2Node);
+    float moon2MeanAnomaly0 = TPD(dayNight, moon2MeanAnomaly0);
+    float moon2AngularRadius = TPD(dayNight, moon2AngularRadius);
 
-    float starRotSpeed = 1.0f;       // multiplier on the star wheel rate
+    // multiplier on the star wheel rate
+    float starRotSpeed = TPD(dayNight, starRotSpeed);
 
     // Retained ONLY so an old tuning.json still loads without a warning storm.
     // Nothing reads it; noon elevation is now an output of tilt + latitude.
-    float sunPeakElevation = 58.0f;
+    float sunPeakElevation = TPD(dayNight, sunPeakElevation);
   } dayNight;
 
   // ---- weather: switches for the sun-driven reactions ----
@@ -2974,11 +3139,11 @@ struct Tuning {
   struct Weather {
     // Exposed water freezes to ice on clear nights (the shore-inward frontier
     // rule in reactions.json). Off leaves ponds liquid through the night.
-    bool waterFreezes = true;
+    bool waterFreezes = TPD(weather, waterFreezes);
     // Snow and ice in direct daylight melt back to water. Off makes winter
     // permanent — note that leaving this off while waterFreezes is on means
     // ice only ever accumulates, which is stable but one-way.
-    bool iceMelts = true;
+    bool iceMelts = TPD(weather, iceMelts);
 
     // ---- the SKY's weather (src/sim/weather.h, cloud.wgsl) ----------------
     // Everything below is RENDER-ONLY: it picks which assets/weather/*.json
@@ -2988,38 +3153,38 @@ struct Tuning {
     //
     // Master switch. Off skips every cloud pass (nothing is recorded) and the
     // sky is the bare atmosphere it was before clouds existed.
-    bool clouds = true;
+    bool clouds = TPD(weather, clouds);
     // On: the sky walks the moisture ladder of the presets on its own.
     // Off: it holds `preset`. The dev panel's weather row overrides both
     // without touching this file (weather::SetOverride).
-    bool autoCycle = true;
-    std::string preset = "fair";
+    bool autoCycle = TPD(weather, autoCycle);
+    std::string preset = TPD(weather, preset);
     // Length of one weather epoch in SIM minutes: the moisture signal gets one
     // new knot per epoch, so this is roughly how long a given sky lasts.
-    float epochMinutes = 7.0f;
+    float epochMinutes = TPD(weather, epochMinutes);
     // Multiplier on how fast the cycle runs (1 = epochMinutes as authored).
     // 0 freezes the automatic sky on whatever it is showing.
-    float cycleSpeed = 1.0f;
+    float cycleSpeed = TPD(weather, cycleSpeed);
     // Rerolls the whole weather sequence without touching the world seed.
-    int seedOffset = 0;
+    int seedOffset = TPD(weather, seedOffset);
     // How long a PINNED change (dev panel, preset edit) takes to ease in, in
     // wall seconds. The automatic cycle is continuous and needs no ease.
-    float transitionSeconds = 12.0f;
+    float transitionSeconds = TPD(weather, transitionSeconds);
     // Added to every preset's coverage (-1..1), and a multiplier on every
     // preset's raininess — the two global "make it cloudier / wetter" knobs.
-    float coverageBias = 0.0f;
-    float precipScale = 1.0f;
+    float coverageBias = TPD(weather, coverageBias);
+    float precipScale = TPD(weather, precipScale);
     // Time constant, in sim seconds, over which rained-on ground dries.
-    float drySeconds = 240.0f;
+    float drySeconds = TPD(weather, drySeconds);
     // ---- where the sky touches the WORLD (weather::SimRainWord) ----
     // The one sim-affecting half of the weather: rain on the tick stream, read
     // by reactions authored "rain" (douses) and "rainDamped" (ignitions).
     // Off = the word is 0 and every such rule behaves as if the sky were dry.
-    bool rainTouchesWorld = true;
+    bool rainTouchesWorld = TPD(weather, rainTouchesWorld);
     // How much of an exposed ignition's chance full rain / soaked ground
     // removes (0 = none, 1 = all of it). Scaled by max(rain, wetness), so a
     // drizzle already slows a fire and a field stays slow to catch after it.
-    float rainIgniteDamp = 0.6f;
+    float rainIgniteDamp = TPD(weather, rainIgniteDamp);
   } weather;
 
   // ---- combustion: how long anything in the world stays alight ----
@@ -3032,8 +3197,8 @@ struct Tuning {
   // both, including the F5 reload (see the note at the reload site in
   // main.cpp).
   //
-  // Nothing here reaches a shader, so there is no row in tuning_params.def and
-  // no TUNE_* constant. The multiplier is applied on the CPU in double and
+  // Nothing here reaches a shader, so its tuning_params.def rows are NO_WGSL
+  // and there is no TUNE_* constant. The multiplier is applied on the CPU in double and
   // rounded ONCE into the same integer chance an authored value compiles to
   // (rule 1) — the GPU cannot tell a scaled rule from a hand-authored one.
   struct Combustion {
@@ -3075,7 +3240,7 @@ struct Tuning {
     // raised and bodies caught readily but went out again in well under a
     // second, so a burning character neither spread the fire nor took much
     // damage from it.
-    int burnDurationPct = 200;
+    int burnDurationPct = TPD(combustion, burnDurationPct);
     // HOW FAST FIRE SPREADS THROUGH FUEL, as a percentage of the ignition
     // chances reactions.json authors. The twin of burnDurationPct next to it,
     // and the two are the pair that file's combustion note names as the two
@@ -3113,7 +3278,7 @@ struct Tuning {
     // numbers as written. MOVES THE WORLD HASH: every ignition chance in the
     // compiled table changes, so a change here is a rebaseline in the same
     // commit.
-    int spreadPct = 12;
+    int spreadPct = TPD(combustion, spreadPct);
     // HEAT CROSSES A JOINT. A creature's limbs are separate lattices that
     // cannot see each other, and a mob is not in the grid, so until 2026-09-03
     // a burning torso reached the legs only through the `fire` gas it emitted
@@ -3129,7 +3294,7 @@ struct Tuning {
     // behaviour, limbs invisible to each other. Low by owner request -- the
     // fire should cross a joint, not race across it. Read by the burn pass
     // every tick, no rebuild; F5 hot-reloads it.
-    int crossLimbPct = 25;
+    int crossLimbPct = TPD(combustion, crossLimbPct);
     // HOW MUCH OF A FIRE THE DRIFTING FLAME CARRIES. `fire` is the gas that
     // rises off every burning voxel and floats through the air; it carries
     // tag:hot like the coals do, so before neighborChance existed a flame that
@@ -3157,7 +3322,7 @@ struct Tuning {
     // MOVES THE WORLD HASH, like its two neighbours: the compiled chance of
     // every fire-exception rule changes. The `weak-flame` gate reads this and
     // scales its expected ratio with it, so moving the knob does not fail it.
-    int flamePct = 100;
+    int flamePct = TPD(combustion, flamePct);
   } combustion;
 
   // ---- wind: the ambient field (docs/RESEARCH_wind.md, DESIGN.md §12) ----
@@ -3172,11 +3337,11 @@ struct Tuning {
   //
   //   * windSpeed / windDirDeg / gustStrength / weatherAuto are CPU-side. They
   //     feed WindWeather() (sim/wind.h), whose three outputs ride RenderParams
-  //     to the shader each frame. They are here rather than in
-  //     tuning_params.def because a compile-time constant cannot drift over
-  //     minutes, which is exactly what weather has to do.
+  //     to the shader each frame. Their tuning_params.def rows are NO_WGSL
+  //     because a compile-time constant cannot drift over minutes, which is
+  //     exactly what weather has to do.
   //   * gustWavelength / gustSpeed / altitudeGain / altitudeRefY / dbgWind*
-  //     ARE in tuning_params.def and const-fold into every shader (F5).
+  //     are WGSL rows and const-fold into every shader (F5).
   //
   // Phase 1 is render-only: the two foliage sway sites and the debug overlay.
   // The CA does not read wind until phase 4, which is gated behind
@@ -3188,43 +3353,43 @@ struct Tuning {
     // kVoxelMeters 0.10) once, on the CPU. With weatherAuto on this is the
     // CENTRE the weather varies around (roughly 0.25x..1.75x), not a ceiling.
     // 6 m/s is a fresh breeze — grass visibly leaning and rippling.
-    float windSpeed = 6.0f;
+    float windSpeed = TPD(wind, windSpeed);
     // Direction the wind BLOWS TOWARD, degrees, using the engine's heading
     // convention: 0 = +Z, increasing toward +X. Ignored while weatherAuto is
     // on. This is the knob to turn to prove the field is real — arrows and
     // grass must both swing to follow it.
-    float windDirDeg = 45.0f;
+    float windDirDeg = TPD(wind, windDirDeg);
     // Gust amplitude as a FRACTION of the mean speed, which is how gustiness
     // actually behaves: a windier day has bigger gusts, not the same gusts on
     // a faster mean. At 1.0 the wind ranges from roughly still to twice the
     // mean; at 0 it is a dead steady breeze and the grass just leans.
-    float gustStrength = 1.0f;
+    float gustStrength = TPD(wind, gustStrength);
     // Let the weather evolve on its own (deterministic chaos keyed on the
     // tick — see WindWeather). Off pins direction and speed to the two knobs
     // above, which is what you want for inspecting the field or comparing
     // screenshots: an evolving field makes two shots incomparable.
-    bool weatherAuto = true;
+    bool weatherAuto = TPD(wind, weatherAuto);
 
     // ---- field shape (mirrored in tuning_params.def as TUNE_WIND_*) ----
     // Distance between gust crests along the wind, metres. Short wavelengths
     // read as a rippling meadow; long ones as slow rolling swells. 4.8 m
     // reproduces the spatial frequency the sway code shipped with.
-    float gustWavelength = 4.8f;
+    float gustWavelength = TPD(wind, gustWavelength);
     // Rate of the gust bands. This is the field's clock, shared by every
     // consumer — see the note on render.microSwaySpeed, which is now only a
     // foliage-local trim on top of it.
-    float gustSpeed = 1.1f;
+    float gustSpeed = TPD(wind, gustSpeed);
     // Fractional wind speed-up per 100 world voxels (10 m) above altitudeRefY.
     // SIGNED both ways: below the reference the boundary layer slows the wind,
     // which is why a valley floor is calmer than the ridge above it. Clamped
     // in the shader to [0.15x, 4x] so a silly value is still a look.
-    float altitudeGain = 0.6f;
+    float altitudeGain = TPD(wind, altitudeGain);
     // World Y the altitude ramp is measured from. 64 sits mid-terrain
     // (worldgen's band is y32..y86), so ridges get a gain and basins a loss.
     // Absolute Y rather than terrain-relative on purpose: terrain-relative
     // needs a height query at every sample point, and absolute is what makes
     // the field a pure function of position (research doc §8).
-    float altitudeRefY = 64.0f;
+    float altitudeRefY = TPD(wind, altitudeRefY);
 
     // ---- debug slope-field overlay (research doc §4.8) ----
     // Initial state of the arrow overlay; F4 toggles it in-game. It is a
@@ -3232,67 +3397,66 @@ struct Tuning {
     // tuning.json and from a headless screenshot run, neither of which can
     // press a key. Costs exactly nothing when off — the draw is skipped, not
     // drawn transparent.
-    bool dbgWindField = false;
+    bool dbgWindField = TPD(wind, dbgWindField);
     // Spacing between arrow lattice points, world voxels. The lattice is
     // snapped to this grid in WORLD space, so the arrows stay put as the
     // camera moves instead of swimming with it.
-    float dbgWindSpacing = 8.0f;
+    float dbgWindSpacing = TPD(wind, dbgWindSpacing);
     // Radius of the arrow lattice around the camera, world voxels. Cost is
     // cubic in radius/spacing, so this is the knob that decides whether the
     // overlay is free or not: the default 48/8 is 13^3 = 2197 arrows.
-    float dbgWindRadius = 48.0f;
+    float dbgWindRadius = TPD(wind, dbgWindRadius);
   } wind;
 
   // ---- render: everything below is emitted as WGSL and F5-reloadable ----
   struct Render {
     // sky / sun
-    float skyGradient = 1.4f, skyHorizonOffset = 0.25f;
-    float skyHorizon[3] = {0.72f, 0.80f, 0.90f};
-    float skyZenith[3] = {0.25f, 0.47f, 0.85f};
-    float sunTint[3] = {1.0f, 0.9f, 0.7f};
-    float sunDiscPower = 800.0f, sunDiscGain = 3.0f;
-    float sunHaloPower = 8.0f, sunHaloGain = 0.12f;
-    float sunDir[3] = {0.50f, 0.55f, 0.38f};
-    float sunColor[3] = {1.0f, 0.95f, 0.86f};
-    float sunIntensity = 1.35f;
+    float skyHorizon[3] = TPD_V3(render, skyHorizon);
+    float skyZenith[3] = TPD_V3(render, skyZenith);
+    float sunTint[3] = TPD_V3(render, sunTint);
+    float sunDiscGain = TPD(render, sunDiscGain);
+    float sunDir[3] = TPD_V3(render, sunDir);
+    float sunColor[3] = TPD_V3(render, sunColor);
+    float sunIntensity = TPD(render, sunIntensity);
 
     // ---- atmospheric sky (physically-flavoured scattering model) ----
     // Rayleigh scales the molecular scattering that makes the sky blue and the
     // sunset red; Mie is the forward-scattering haze that puts a glow around
     // the sun. These two, plus the air-mass curve, replace the old two-colour
     // lerp and are what let one model cover noon, sunset and night.
-    float skyRayleigh = 12.0f;
-    float skyMie = 1.0f;
-    float skyMieG = 0.76f;          // Mie anisotropy; higher = tighter halo
-    float skyMieStrength = 1.0f;
-    float skyExposure = 1.6f;
-    float skyGround[3] = {0.22f, 0.20f, 0.17f};  // below-horizon bounce
+    float skyRayleigh = TPD(render, skyRayleigh);
+    float skyMie = TPD(render, skyMie);
+    // Mie anisotropy; higher = tighter halo
+    float skyMieG = TPD(render, skyMieG);
+    float skyMieStrength = TPD(render, skyMieStrength);
+    float skyExposure = TPD(render, skyExposure);
+    float skyGround[3] = TPD_V3(render, skyGround);  // below-horizon bounce
     // Multiplier on the true 0.53 deg disc. 1.0 is physically correct and
     // reads as a pinprick on a 16:9 screen at a game FOV — every engine that
     // wants the sun to be a PRESENCE oversizes it. 3x is about the smallest
     // that still looks deliberate rather than like a dead pixel.
-    float sunSize = 3.0f;
+    float sunSize = TPD(render, sunSize);
     // How hard the atmosphere reddens a low sun. Scales the extinction that
     // colours BOTH the sun disc and the dome, and is deliberately separate
     // from skyRayleigh: that one sets how blue the sky is, and sharing one
     // constant between them makes a rich blue sky imply a permanently orange
     // sun (it did — the whole dome came out khaki).
-    float sunReddening = 1.0f;
+    float sunReddening = TPD(render, sunReddening);
 
     // ---- night sky ----
-    float nightZenith[3] = {0.006f, 0.010f, 0.028f};
-    float nightHorizon[3] = {0.030f, 0.036f, 0.062f};
+    float nightZenith[3] = TPD_V3(render, nightZenith);
+    float nightHorizon[3] = TPD_V3(render, nightHorizon);
     // MLS-MPM fluid prototype (debris.wgsl vsFluid). There is no fluid
     // colour knob: a particle is drawn in its MATERIAL's colour (W1-B2).
     // Cube half-extent per particle, in cells. 0.5 tiles the rest lattice
     // exactly; slightly over closes the gaps so a pool reads as a surface.
-    float fluidParticleSize = 0.58f;
+    float fluidParticleSize = TPD(render, fluidParticleSize);
     // How much a particle elongates along its velocity (0 = always a cube).
     // Motion blur for free: falling streams read as streaks, not dice.
-    float fluidStretch = 0.4f;
+    float fluidStretch = TPD(render, fluidStretch);
     // Albedo darkening with compression (density above rest), so pressure
     // visibly travels through a pool.
-    float fluidDensityShade = 0.45f;
+    float fluidDensityShade = TPD(render, fluidDensityShade);
     // ---- MPM fluid SURFACE rendering (raymarch.wgsl MPM FLUID SURFACE) ----
     // The Splash-style water look: the solver's node grid marched as a smooth
     // isosurface with traced reflection/refraction. All render-only.
@@ -3309,11 +3473,13 @@ struct Tuning {
     //       that reads as ordinary voxel water
     // Modes 2 and 3 are RENDER-ONLY quantization of the same density field the
     // isosurface marches; nothing is written to the voxel buffer (rules 1+3).
-    float fluidSurface = 2.0f;
-    float fluidIso = 0.30f;      // isosurface threshold, fraction of rest
-                                 // density. Lower = fatter, more merged fluid
-    float fluidSmooth = 1.3f;    // normal-gradient baseline, voxels. Higher
-                                 // smooths harder at the cost of small shapes
+    float fluidSurface = TPD(render, fluidSurface);
+    // isosurface threshold, fraction of rest
+    // density. Lower = fatter, more merged fluid
+    float fluidIso = TPD(render, fluidIso);
+    // normal-gradient baseline, voxels. Higher
+    // smooths harder at the cost of small shapes
+    float fluidSmooth = TPD(render, fluidSmooth);
     // How much of the CA's geometry SUPPORTED fluid borrows (raymarch.wgsl,
     // "TWO MODELS OF THE SAME WATER"). 1 = water resting on ground or on other
     // water is drawn as a height field with its surface at cell.y + fill,
@@ -3322,118 +3488,130 @@ struct Tuning {
     // behaviour, one isotropic blob field everywhere. Airborne water (a
     // droplet, a splash arch) is unaffected at any setting — it has nothing
     // underneath it, so the blob model keeps it.
-    float fluidLevel = 1.0f;
-    float fluidIor = 1.33f;      // refraction index (water 1.33, oil ~1.47)
-    float fluidClarity = 1.3f;   // metres of fluid to ~1/e absorption
-    float fluidReflect = 1.0f;   // traced/sky reflection gain
-    float fluidSpecular = 1.0f;  // sun glint gain
-    float fluidFoamSpeed = 22.0f; // surface speed (vox/s) for full churn foam
-    float fluidWobble = 0.5f;    // sub-voxel normal shimmer on moving fluid
+    float fluidLevel = TPD(render, fluidLevel);
+    // refraction index (water 1.33, oil ~1.47)
+    float fluidIor = TPD(render, fluidIor);
+    // metres of fluid to ~1/e absorption
+    float fluidClarity = TPD(render, fluidClarity);
+    // traced/sky reflection gain
+    float fluidReflect = TPD(render, fluidReflect);
+    float fluidSpecular = TPD(render, fluidSpecular);  // sun glint gain
+    // surface speed (vox/s) for full churn foam
+    float fluidFoamSpeed = TPD(render, fluidFoamSpeed);
+    // sub-voxel normal shimmer on moving fluid
+    float fluidWobble = TPD(render, fluidWobble);
     // Speed-driven whitening: fast, loose particles read as spray/foam.
-    // 0.55 = tuning.json and the .def row (this said 0.35 until 2026-09-24).
-    float fluidFoam = 0.55f;
+    float fluidFoam = TPD(render, fluidFoam);
     // ---- depth colour gradient (raymarch.wgsl DEPTH GRADIENT) ----
     // A thin film reads as `fluidShallow`, the deep body tends toward
     // `fluidDeep`, ramped over `fluidDepth` metres of in-fluid path. The ramped
     // colour is what drives the per-channel Beer-Lambert absorption, so the
     // gradient is a real absorption change, not a tint painted on top.
-    float fluidShallow[3] = {0.42f, 0.86f, 0.82f};
-    float fluidDeep[3] = {0.02f, 0.15f, 0.42f};
-    float fluidDepth = 2.6f;     // metres over which the ramp completes
-    float fluidGradient = 1.0f;  // 0 = flat species albedo (old look), 1 = full
+    float fluidShallow[3] = TPD_V3(render, fluidShallow);
+    float fluidDeep[3] = TPD_V3(render, fluidDeep);
+    // metres over which the ramp completes
+    float fluidDepth = TPD(render, fluidDepth);
+    // 0 = flat species albedo (old look), 1 = full
+    float fluidGradient = TPD(render, fluidGradient);
     // ---- grid foam field (sim_fluid.wgsl foam potentials) ----
-    float fluidFoamField = 1.0f;   // gain on the advected foam field's whitening
-    float fluidFoamTexture = 0.65f; // fbm break-up of the foam field, 0 = flat
+    // gain on the advected foam field's whitening
+    float fluidFoamField = TPD(render, fluidFoamField);
+    // fbm break-up of the foam field, 0 = flat
+    float fluidFoamTexture = TPD(render, fluidFoamTexture);
     // Foam PARTICLE colour (debris.wgsl, PPAY_FOAM). Foam is entrained air,
     // not a substance, so it has no material to take an albedo from — it is
     // coloured from here, jittered per particle by foamColorVar so a burst
     // reads as many bubbles rather than one flat white mass.
-    float foamColor[3] = {0.97f, 0.98f, 1.0f};
-    float foamColorVar = 0.18f;
-    float starBrightness = 1.0f;
-    float starDensity = 150.0f;     // direction-grid cells per unit
+    float foamColor[3] = TPD_V3(render, foamColor);
+    float foamColorVar = TPD(render, foamColorVar);
+    float starBrightness = TPD(render, starBrightness);
+    // direction-grid cells per unit
+    float starDensity = TPD(render, starDensity);
     // PSF core radius in PIXELS, not radians. Sizing in pixels is what keeps a
     // star a point at any resolution/FOV; the first version used a fixed
     // angular radius ~4x the SUN's, which read as nearby blobs with visible
     // pixel steps across their falloff.
-    float starSize = 0.85f;
+    float starSize = TPD(render, starSize);
     // Fraction of grid cells that hold a star (per layer; the fine layer uses
     // 1.7x this). Low on purpose — filling a fifth of the grid is TV static.
-    float starSparsity = 0.012f;
-    float starTwinkle = 0.35f;
-    float milkyWayStrength = 0.55f;
-    float milkyWayColor[3] = {0.52f, 0.56f, 0.78f};
+    float starSparsity = TPD(render, starSparsity);
+    float starTwinkle = TPD(render, starTwinkle);
+    float milkyWayStrength = TPD(render, milkyWayStrength);
+    float milkyWayColor[3] = TPD_V3(render, milkyWayColor);
     // Pole of the galactic plane, in the STAR SPHERE's frame (it wheels with
     // the stars). The band is drawn perpendicular to this, so rotating it
     // moves the Milky Way across the constellations.
-    float galaxyNormal[3] = {0.36f, 0.52f, -0.77f};
+    float galaxyNormal[3] = TPD_V3(render, galaxyNormal);
     // Half-width of the band in |cos| from that plane, before the fbm that
     // ragged-edges it. Small values give a tight bright river.
-    float galaxyWidth = 0.17f;
-    float nebulaStrength = 0.40f;
-    float nebulaCool[3] = {0.16f, 0.30f, 0.62f};
-    float nebulaWarm[3] = {0.55f, 0.20f, 0.38f};
+    float galaxyWidth = TPD(render, galaxyWidth);
+    float nebulaStrength = TPD(render, nebulaStrength);
+    float nebulaCool[3] = TPD_V3(render, nebulaCool);
+    float nebulaWarm[3] = TPD_V3(render, nebulaWarm);
     // Aurora — the Shivering Isles curtains.
-    float auroraStrength = 0.55f;
-    float auroraHeight = 900.0f;    // voxels; sets how curtains converge
-    float auroraLow[3] = {0.10f, 0.85f, 0.45f};
-    float auroraHigh[3] = {0.65f, 0.20f, 0.85f};
+    float auroraStrength = TPD(render, auroraStrength);
+    // voxels; sets how curtains converge
+    float auroraHeight = TPD(render, auroraHeight);
+    float auroraLow[3] = TPD_V3(render, auroraLow);
+    float auroraHigh[3] = TPD_V3(render, auroraHigh);
 
     // ---- moons ----
     // NOTE: no moon RADIUS here. Apparent size is an output of the orbit
     // (dayNight.moon*AngularRadius, modulated by orbital distance), because
     // the disc and the eclipse test must read ONE number for how big a moon
     // is. A render-side radius knob would be a second, diverging answer.
-    float moonBrightness = 1.6f;
-    float moonColor[3] = {0.92f, 0.93f, 0.88f};
+    float moonBrightness = TPD(render, moonBrightness);
+    float moonColor[3] = TPD_V3(render, moonColor);
     // Offsets the fbm that carves this moon's maria and craters. Not a colour
     // and not a position — it is the only thing making a moon a distinct rock
     // rather than the same face drawn twice, so changing it rerolls the
     // surface wholesale.
-    float moonMariaSeed[3] = {4.0f, 1.0f, 9.0f};
-    float moonGlow = 0.35f;
-    float moonEarthshine = 0.055f;
-    float moonLightColor[3] = {0.55f, 0.68f, 1.0f};
-    float moonLightIntensity = 0.16f;
+    float moonMariaSeed[3] = TPD_V3(render, moonMariaSeed);
+    float moonGlow = TPD(render, moonGlow);
+    float moonEarthshine = TPD(render, moonEarthshine);
+    float moonLightColor[3] = TPD_V3(render, moonLightColor);
+    float moonLightIntensity = TPD(render, moonLightIntensity);
     // Moon B: a smaller, colder, dimmer body. Look only.
-    float moon2Color[3] = {0.78f, 0.80f, 0.86f};
-    float moon2MariaSeed[3] = {-21.0f, 13.0f, 37.0f};
-    float moon2Brightness = 0.72f;
-    float moon2LightIntensity = 0.055f;
-    float moon2LightColor[3] = {0.62f, 0.62f, 0.86f};
+    float moon2Color[3] = TPD_V3(render, moon2Color);
+    float moon2MariaSeed[3] = TPD_V3(render, moon2MariaSeed);
+    float moon2Brightness = TPD(render, moon2Brightness);
+    float moon2LightIntensity = TPD(render, moon2LightIntensity);
+    float moon2LightColor[3] = TPD_V3(render, moon2LightColor);
     // How dark a TOTAL solar eclipse gets. 1 = the dome falls to its full
     // night value; lower keeps some daylight so totality reads as
     // daytime-gone-wrong rather than as night.
-    float eclipseDarkness = 0.93f;
+    float eclipseDarkness = TPD(render, eclipseDarkness);
     // Perceptual exponent on covered AREA before that darkening applies. 3 is
     // the old hardcoded cube: the world stays bright until the last sliver of
     // sun goes, which is how a real partial eclipse reads. 1 tracks area
     // linearly and looks like someone sliding the exposure down.
-    float eclipseCurve = 3.0f;
+    float eclipseCurve = TPD(render, eclipseCurve);
 
     // ---- night ambient ----
-    float nightAmbSky[3] = {0.055f, 0.075f, 0.135f};
-    float nightAmbGround[3] = {0.022f, 0.026f, 0.042f};
+    float nightAmbSky[3] = TPD_V3(render, nightAmbSky);
+    float nightAmbGround[3] = TPD_V3(render, nightAmbGround);
 
     // fog
-    float fogOpticalDepths = 4.5f;
-    float fogLerpPerFrame = 0.08f;
+    float fogOpticalDepths = TPD(render, fogOpticalDepths);
+    float fogLerpPerFrame = TPD(render, fogLerpPerFrame);
 
     // ambient / diffuse
-    float ambSky[3] = {0.40f, 0.48f, 0.62f};
-    float ambGround[3] = {0.25f, 0.22f, 0.17f};
-    float diffuseWrap = 0.55f;
-    float faceX = 0.96f, faceZ = 0.92f;
+    float ambSky[3] = TPD_V3(render, ambSky);
+    float ambGround[3] = TPD_V3(render, ambGround);
+    float diffuseWrap = TPD(render, diffuseWrap);
+    float faceX = TPD(render, faceX), faceZ = TPD(render, faceZ);
 
     // AO
-    float aoStrength = 0.45f;
-    float aoFar = 0.72f;
+    float aoStrength = TPD(render, aoStrength);
+    float aoFar = TPD(render, aoFar);
 
     // shadows
-    float shadowBias = 0.02f;
-    int shadowSteps = 384;
-    float shadowSoftNear = 0.6f, shadowSoftFar = 9.0f, shadowLift = 0.45f;
-    float shadowFarLift = 0.3f;
+    float shadowBias = TPD(render, shadowBias);
+    int shadowSteps = TPD(render, shadowSteps);
+    float shadowSoftNear = TPD(render, shadowSoftNear);
+    float shadowSoftFar = TPD(render, shadowSoftFar);
+    float shadowLift = TPD(render, shadowLift);
+    float shadowFarLift = TPD(render, shadowFarLift);
     // Voxel-keyed shadow cache (world.h kShadowCacheBuckets). `shadowCache` is
     // the A/B toggle and is const-folded, so flipping it in tuning.json + F5
     // recompiles raymarch.wgsl WITHOUT the shadow trace() call site — which is
@@ -3441,8 +3619,8 @@ struct Tuning {
     // against 2.29 ms of traversal (--render-budget, 2026-09-01).
     // `shadowCacheSubdiv` is the patch granularity per voxel-face axis: a
     // QUALITY knob, since the ray saving saturates well before it gets coarse.
-    int shadowCache = 1;
-    int shadowCacheSubdiv = 4;
+    int shadowCache = TPD(render, shadowCache);
+    int shadowCacheSubdiv = TPD(render, shadowCacheSubdiv);
     // THE SUN'S APPARENT RADIUS AS THE SHADOW RAY SEES IT, in DEGREES, and the
     // one knob that sets how wide a penumbra is (shadow_resolve.wgsl, world.h
     // kShadowHistBytes). The resolve pass jitters its ray inside this cone and
@@ -3454,51 +3632,66 @@ struct Tuning {
     // a canopy 10 m up softens over 10 cm — one voxel — which is physically
     // right and reads as the hard edge this replaced. This is the artistic one.
     // 0 turns the cone off and restores the single-ray hard shadow exactly.
-    float shadowSunAngle = 1.0f;
+    float shadowSunAngle = TPD(render, shadowSunAngle);
 
     // grain
-    float grainBroadScale = 11.0f, grainFineScale = 2.5f;
-    float grainMix = 0.68f;
-    float grainAmp = 0.065f, grainAmpFar = 0.05f;
+    float grainBroadScale = TPD(render, grainBroadScale);
+    float grainFineScale = TPD(render, grainFineScale);
+    float grainMix = TPD(render, grainMix);
+    float grainAmp = TPD(render, grainAmp);
+    float grainAmpFar = TPD(render, grainAmpFar);
 
     // media / smoke
-    float mediaAbsorb = 6.4f, mediaTauMax = 6.0f;
+    float mediaAbsorb = TPD(render, mediaAbsorb);
+    float mediaTauMax = TPD(render, mediaTauMax);
 
     // fire
-    float fireFlickerBase = 0.70f, fireFlickerAmp = 0.55f, fireFlickerRate = 13.0f;
-    float fireGlowRate = 1.4f, fireIntensity = 2.1f;
-    float fireBreatheAmp = 0.08f, fireBreatheRate = 5.3f;
-    float emissiveStrength = 1.7f;
-    float emissiveFlickerBase = 0.82f, emissiveFlickerAmp = 0.28f,
-          emissiveFlickerRate = 9.0f;
+    float fireFlickerBase = TPD(render, fireFlickerBase);
+    float fireFlickerAmp = TPD(render, fireFlickerAmp);
+    float fireFlickerRate = TPD(render, fireFlickerRate);
+    float fireGlowRate = TPD(render, fireGlowRate);
+    float fireIntensity = TPD(render, fireIntensity);
+    float fireBreatheAmp = TPD(render, fireBreatheAmp);
+    float fireBreatheRate = TPD(render, fireBreatheRate);
+    float emissiveStrength = TPD(render, emissiveStrength);
+    float emissiveFlickerBase = TPD(render, emissiveFlickerBase);
+    float emissiveFlickerAmp = TPD(render, emissiveFlickerAmp);
+    float emissiveFlickerRate = TPD(render, emissiveFlickerRate);
     // Burn-tinted materials (kMatFlagBurnTint): a burning leaf keeps its
     // leaf palette and pulses toward this flame colour. Rate in rad/s on a
     // per-cell phase; Min/Max bound the pulse weight (0 = pure leaf, 1 = pure
     // flame). The emission is scaled by the weight too, so the leaf phase is
     // lit like a leaf rather than glowing green.
-    float burnTintColor[3] = {1.0f, 0.52f, 0.14f};
-    float burnTintRate = 2.6f, burnTintMin = 0.25f, burnTintMax = 0.9f;
+    float burnTintColor[3] = TPD_V3(render, burnTintColor);
+    float burnTintRate = TPD(render, burnTintRate);
+    float burnTintMin = TPD(render, burnTintMin);
+    float burnTintMax = TPD(render, burnTintMax);
 
     // water
-    float waterF0 = 0.0204f;
-    float waterAbsorb[3] = {1.85f, 0.42f, 0.20f};
-    float waterScatter[3] = {0.045f, 0.16f, 0.20f};
-    float waterFresnelPower = 5.0f;
+    float waterF0 = TPD(render, waterF0);
+    float waterAbsorb[3] = TPD_V3(render, waterAbsorb);
+    float waterScatter[3] = TPD_V3(render, waterScatter);
+    float waterFresnelPower = TPD(render, waterFresnelPower);
     // Global calm-down of the travelling wave field. Water reads as still,
     // glassy water at rest rather than as a windswept sea; the column-height
     // gradient still gives real bodies their macro shape, so lowering these
     // makes water calm, not flat.
-    float rippleAmpScale = 0.35f, rippleSpeedScale = 0.40f;
+    float rippleAmpScale = TPD(render, rippleAmpScale);
+    float rippleSpeedScale = TPD(render, rippleSpeedScale);
     // Fetch gate (waterOpenness in raymarch.wgsl): fraction of a 12-tap
     // horizontal ring that must be liquid before travelling waves appear.
     // Below LOW a surface is a droplet or puddle and stays perfectly still.
-    float waterFetchLow = 0.35f, waterFetchHigh = 0.85f;
-    float reflectionCutoff = 0.06f;
-    int reflectionSteps = 96;
-    float causticGain = 1.5f, causticCap = 0.85f;
-    float glintIntensity = 0.85f;
-    float glintPowerNear = 180.0f, glintPowerFar = 900.0f;
-    float foamDepth = 0.42f, foamStrength = 0.55f;
+    float waterFetchLow = TPD(render, waterFetchLow);
+    float waterFetchHigh = TPD(render, waterFetchHigh);
+    float reflectionCutoff = TPD(render, reflectionCutoff);
+    int reflectionSteps = TPD(render, reflectionSteps);
+    float causticGain = TPD(render, causticGain);
+    float causticCap = TPD(render, causticCap);
+    float glintIntensity = TPD(render, glintIntensity);
+    float glintPowerNear = TPD(render, glintPowerNear);
+    float glintPowerFar = TPD(render, glintPowerFar);
+    float foamDepth = TPD(render, foamDepth);
+    float foamStrength = TPD(render, foamStrength);
 
     // ---- SURFACE WAVES (docs/PLAN_water_master.md component 9) -----------
     //
@@ -3514,27 +3707,29 @@ struct Tuning {
     // than the 0.5 m chop in 2.6 m of water and SLOWS as it reaches a bank,
     // which is shoaling, and it costs nothing but the choice of constant.
     // It exists as a knob because it is also the honest A/B for that claim.
-    float waveDispersion = 1.0f;
+    float waveDispersion = TPD(render, waveDispersion);
     // Gerstner crest sharpening, 0..1. Sinusoids have round crests and round
     // troughs; real gravity waves have sharp crests and flat troughs, and this
     // is the term that produces the difference.
-    float waveSteepness = 0.55f;
+    float waveSteepness = TPD(render, waveSteepness);
     // Depth in METRES below which wave amplitude fades to nothing. Sum-of-waves
     // does not reflect off a bank and shallow water damps chop anyway, so the
     // cheap fix is also the physically right one.
-    float waveShoreDepth = 0.45f;
+    float waveShoreDepth = TPD(render, waveShoreDepth);
     // How hard the current field advects the wave phase — the wave is evaluated
     // at `position - current * t`, so the Doppler stretch downstream is what
     // makes a surface look like it is GOING somewhere. 0 pins the waves to the
     // world and the flow stops reading as flow.
-    float waveFlowScale = 1.0f;
+    float waveFlowScale = TPD(render, waveFlowScale);
     // Foam on the current field's CONVERGENCE lines. `threshold` is the
     // convergence (1/s) at which foam starts and `gain` how fast it saturates.
-    float waveFoamThreshold = 0.12f, waveFoamGain = 3.0f;
+    float waveFoamThreshold = TPD(render, waveFoamThreshold);
+    float waveFoamGain = TPD(render, waveFoamGain);
     // Impact ripples: ring expansion speed (m/s), amplitude e-fold time
     // (seconds) and the wavelength of the ring train (metres).
-    float waveImpactSpeed = 1.8f, waveImpactDecay = 2.5f;
-    float waveImpactLen = 0.70f;
+    float waveImpactSpeed = TPD(render, waveImpactSpeed);
+    float waveImpactDecay = TPD(render, waveImpactDecay);
+    float waveImpactLen = TPD(render, waveImpactLen);
     // ---- W3: the SIM's surface momentum, in the fragment stage ----------
     // docs/PLAN_water_relevel.md §5, last bullet. `waterFlux` is bound
     // read-only to the render group and the water surface reads its OWN
@@ -3552,7 +3747,8 @@ struct Tuning {
     // BOTH AT 0 CONST-FOLDS THE ENTIRE BLOCK, the buffer read included. That is
     // the arm --shader-stats is compared against, and it is not optional
     // bookkeeping: this shader has no register headroom.
-    float waveSimSlope = 0.030f, waveSimFoam = 0.55f;
+    float waveSimSlope = TPD(render, waveSimSlope);
+    float waveSimFoam = TPD(render, waveSimFoam);
     // ---- the current-field arrow overlay (plan component 8) -------------
     // A clone of the wind overlay's two knobs, at a water scale: currents are
     // metres per second where wind is tens, so the lattice is tighter and the
@@ -3560,31 +3756,42 @@ struct Tuning {
     // a knob as well as a key, so the overlay is reachable from a saved
     // tuning.json and from a headless screenshot run, neither of which can
     // press anything.
-    bool dbgCurrentField = false;
-    float dbgCurrentSpacing = 6.0f;
-    float dbgCurrentRadius = 40.0f;
+    bool dbgCurrentField = TPD(render, dbgCurrentField);
+    float dbgCurrentSpacing = TPD(render, dbgCurrentSpacing);
+    float dbgCurrentRadius = TPD(render, dbgCurrentRadius);
 
     // translucent solids — ice, glass (shadeTranslucent in raymarch.wgsl).
     // A solid is translucent when its authored `opacity` is < 255; these
     // control what that translucency LOOKS like. Absorption is per metre of
     // real path through the slab, so one number covers "thin ice is clear"
     // and "thick ice is deep cyan" at once.
-    float iceF0 = 0.021f;           // head-on reflectance (ice IOR 1.31)
-    float iceFresnelPower = 5.0f;   // Schlick exponent
-    float iceAbsorb = 3.2f;         // absorption gain per metre, x opacity
-    float iceAbsorbFloor = 0.06f;   // floor so even clear ice tints slightly
-    float iceScatter = 0.30f;       // internal bubble/grain scatter strength
-    float iceScatterDepth = 1.6f;   // how fast scatter saturates with depth
-    float iceScatterNight = 0.25f;  // scatter retained with the sun down
-    float iceGrain = 0.09f;         // frost normal perturbation amplitude
-    float iceGrainScale = 0.35f;    // frost noise frequency (world space)
-    float iceGloss = 190.0f;        // specular exponent (higher = tighter)
-    float iceSpec = 0.55f;          // specular highlight strength
-    float iceDepthMax = 3.0f;       // metres of ice past which the march stops
+    // head-on reflectance (ice IOR 1.31)
+    float iceF0 = TPD(render, iceF0);
+    float iceFresnelPower = TPD(render, iceFresnelPower);   // Schlick exponent
+    // absorption gain per metre, x opacity
+    float iceAbsorb = TPD(render, iceAbsorb);
+    // floor so even clear ice tints slightly
+    float iceAbsorbFloor = TPD(render, iceAbsorbFloor);
+    // internal bubble/grain scatter strength
+    float iceScatter = TPD(render, iceScatter);
+    // how fast scatter saturates with depth
+    float iceScatterDepth = TPD(render, iceScatterDepth);
+    // scatter retained with the sun down
+    float iceScatterNight = TPD(render, iceScatterNight);
+    // frost normal perturbation amplitude
+    float iceGrain = TPD(render, iceGrain);
+    // frost noise frequency (world space)
+    float iceGrainScale = TPD(render, iceGrainScale);
+    // specular exponent (higher = tighter)
+    float iceGloss = TPD(render, iceGloss);
+    // specular highlight strength
+    float iceSpec = TPD(render, iceSpec);
+    // metres of ice past which the march stops
+    float iceDepthMax = TPD(render, iceDepthMax);
     // Fresnel weight below which the traced reflection is replaced by a plain
     // sky lookup. Unlike water, a translucent SOLID can present many surfaces
     // to one ray, so an ungated reflection here is a frame-time cliff.
-    float iceReflectMin = 0.12f;
+    float iceReflectMin = TPD(render, iceReflectMin);
 
     // ---- submerged view (shadeSubmerged in raymarch.wgsl) ----
     // Everything in this block applies ONLY when the view ray is inside a
@@ -3596,18 +3803,21 @@ struct Tuning {
     // blue void two metres from your face — there is no distance information
     // left to see. Underwater wants a much longer visibility range, so it gets
     // its own (weaker) coefficients and its own scatter floor.
-    float subAbsorb[3] = {0.42f, 0.11f, 0.075f};   // per metre, per channel
-    float subScatter[3] = {0.055f, 0.19f, 0.24f};  // colour the volume tends to
-    float subScatterGain = 1.0f;    // in-scatter strength multiplier
+    float subAbsorb[3] = TPD_V3(render, subAbsorb);   // per metre, per channel
+    // colour the volume tends to
+    float subScatter[3] = TPD_V3(render, subScatter);
+    // in-scatter strength multiplier
+    float subScatterGain = TPD(render, subScatterGain);
     // Metres at which the view has fully faded to the scatter colour. The
     // underwater analogue of fog distance: this is the "murky pond" vs "clear
     // tropical water" knob.
-    float subVisibility = 11.0f;
-    float subVignette = 0.34f;      // screen-edge darkening while submerged
+    float subVisibility = TPD(render, subVisibility);
+    // screen-edge darkening while submerged
+    float subVignette = TPD(render, subVignette);
     // Snell's window: from below, the entire sky is compressed into a ~97
     // degree cone straight up, and outside it the surface is a mirror of the
     // murk. This scales how bright that window reads.
-    float subSnellGain = 1.25f;
+    float subSnellGain = TPD(render, subSnellGain);
 
     // caustics cast onto submerged surfaces (bedCaustic in raymarch.wgsl).
     // Separate from causticGain/Cap, which drive the caustic seen looking DOWN
@@ -3615,81 +3825,104 @@ struct Tuning {
     // the surface directly above the LIT POINT rather than above the bed the
     // primary ray found — and sharing one gain makes one of the two views
     // always wrong.
-    float bedCausticGain = 2.4f;
-    float bedCausticCap = 1.5f;
-    float bedCausticFade = 6.0f;    // metres of water above, past which it washes out
-    float bedCausticSharp = 2.2f;   // higher = thinner, brighter filaments
+    float bedCausticGain = TPD(render, bedCausticGain);
+    float bedCausticCap = TPD(render, bedCausticCap);
+    // metres of water above, past which it washes out
+    float bedCausticFade = TPD(render, bedCausticFade);
+    // higher = thinner, brighter filaments
+    float bedCausticSharp = TPD(render, bedCausticSharp);
 
     // volumetric light shafts (godRays in raymarch.wgsl). Ray-marched with a
     // real per-sample occlusion test, so shafts break around the shore and any
     // overhang instead of passing through terrain. Sample count is a direct
     // frame-time multiplier, but on SUBMERGED pixels only.
-    int godRaySteps = 14;
-    float godRayStrength = 0.55f;
+    int godRaySteps = TPD(render, godRaySteps);
+    float godRayStrength = TPD(render, godRayStrength);
     // Henyey-Greenstein asymmetry. Shafts are far brighter looking toward the
     // sun than away from it; that anisotropy is what makes them read as beams
     // rather than as a uniform brightening of the whole volume.
-    float godRayAniso = 0.62f;
-    float godRayRange = 14.0f;      // metres the shaft march covers
-    int godRayShadowSteps = 8;      // BLOCK steps for the per-sample occ ray
+    float godRayAniso = TPD(render, godRayAniso);
+    // metres the shaft march covers
+    float godRayRange = TPD(render, godRayRange);
+    // BLOCK steps for the per-sample occ ray
+    int godRayShadowSteps = TPD(render, godRayShadowSteps);
     // Metres past which a shadow-class ray terminates on the 4^3 blocker mask
     // instead of the voxel (traceOpaque in common.wgsl). 0 = off, and 0 is
     // also bit-identical to the pre-W2-B tracer by construction.
-    float shadowCoarseDist = 8.0f;
+    float shadowCoarseDist = TPD(render, shadowCoarseDist);
 
     // ---- the openness (sky-visibility) grid (docs/PLAN_gi.md §2) ----
     // Per (4^3 block, face) sky visibility, marched over the blockers mask by
     // sim_openness.wgsl and read by ambientAt / ambientAtP. Render-only: the
     // sim has no binding for any of it and the world hash cannot move.
-    float opennessReach = 12.0f;        // metres a hemisphere ray looks
-    int opennessChunksPerFrame = 256;   // slots the rolling refresh walks/tick
-    float opennessStrength = 1.0f;      // 0 = old lerp AND the pass unrecorded
-    float opennessFloor = 0.0f;         // the pre-2026-09-11 daylight leak, kept as its A/B arm
+    // metres a hemisphere ray looks
+    float opennessReach = TPD(render, opennessReach);
+    // slots the rolling refresh walks/tick
+    int opennessChunksPerFrame = TPD(render, opennessChunksPerFrame);
+    // 0 = old lerp AND the pass unrecorded
+    float opennessStrength = TPD(render, opennessStrength);
+    // the pre-2026-09-11 daylight leak, kept as its A/B arm
+    float opennessFloor = TPD(render, opennessFloor);
     // The enclosed face's own ambient, ADDED at (1 - openness) and independent
     // of the sun/moons: a cave must not know what time it is.
-    float enclosedAmbient[3] = {0.012f, 0.013f, 0.016f};
-    int opennessBilinear = 1;           // blend the 4 blocks in the face plane
+    float enclosedAmbient[3] = TPD_V3(render, enclosedAmbient);
+    // blend the 4 blocks in the face plane
+    int opennessBilinear = TPD(render, opennessBilinear);
 
     // ---- one-bounce indirect light (docs/PLAN_gi.md §3) ----
     // The irradiance grid: injected by the shadow resolve pass and the
     // openness walk, gathered at every near-field hit. Render-only.
-    float giStrength = 2.0f;            // 0 = everything const-folded away
-    float giDecay = 0.25f;              // per-visit fade of unmeasurable faces
-    float giFeedback = 0.2f;            // P2 write-back weight, < giDecay
-    int giGatherBlocks = 12;            // STEP budget per gather ray (a clear chunk = 1 step)
-    int giCachePeriod = 16;             // frames between a slot's re-gathers; 0 = uncached
+    // 0 = everything const-folded away
+    float giStrength = TPD(render, giStrength);
+    // per-visit fade of unmeasurable faces
+    float giDecay = TPD(render, giDecay);
+    // P2 write-back weight, < giDecay
+    float giFeedback = TPD(render, giFeedback);
+    // STEP budget per gather ray (a clear chunk = 1 step)
+    int giGatherBlocks = TPD(render, giGatherBlocks);
+    // frames between a slot's re-gathers; 0 = uncached
+    int giCachePeriod = TPD(render, giCachePeriod);
 
     // ---- the glow field (src/sim/world.h kGlowBytes) ----
     // A coarse position-keyed field of emitter light, written by sim_glow.wgsl
     // and read with ONE buffer load by the paths giGather cannot serve (the
     // raster body/mob cubes). Render-only: the sim has no binding for it.
-    float glowStrength = 1.0f;          // 0 = both rows unrecorded, term folded
-    float glowReach = 2.4f;             // metres an emitter chunk throws light
-    float glowFill = 32.0f;             // emitting-cell fraction that saturates
-    int glowChunksPerFrame = 64;        // slots the rolling refresh walks/tick
-    int glowRingBudget = 64;            // dirty workgroups that may rewrite 3^3
-    int glowTerrain = 0;                // also sample at the terrain hit (dbl-counts giGather)
+    // 0 = both rows unrecorded, term folded
+    float glowStrength = TPD(render, glowStrength);
+    // metres an emitter chunk throws light
+    float glowReach = TPD(render, glowReach);
+    // emitting-cell fraction that saturates
+    float glowFill = TPD(render, glowFill);
+    // slots the rolling refresh walks/tick
+    int glowChunksPerFrame = TPD(render, glowChunksPerFrame);
+    // dirty workgroups that may rewrite 3^3
+    int glowRingBudget = TPD(render, glowRingBudget);
+    // also sample at the terrain hit (dbl-counts giGather)
+    int glowTerrain = TPD(render, glowTerrain);
 
     // drifting particulate. Render-only motes suspended in the water, which is
     // what gives the light shafts something visible to catch.
-    float siltDensity = 0.55f;
-    float siltBrightness = 0.50f;
-    float siltDrift = 0.05f;
+    float siltDensity = TPD(render, siltDensity);
+    float siltBrightness = TPD(render, siltBrightness);
+    float siltDrift = TPD(render, siltDrift);
 
     // ---- waterfall mist and spray ----
     // Render-only overlay on a FALLING CA liquid column and on its impact
     // site, both derived per pixel from the cells under/over a liquid hit
     // (raymarch.wgsl fallCueAt). No particle, no buffer, nothing hashed.
     // mistDensity <= 0 removes the whole term at shader-compile time.
-    float mistDensity = 1.0f;
-    float mistBrightness = 0.9f;
-    float mistRadius = 10.0f;     // voxels the veil wraps around the column
-    float mistFallSpeed = 2.2f;   // m/s the vapour field drifts DOWN
-    float sprayDensity = 1.3f;
-    float sprayRadius = 14.0f;    // voxels the impact puff reaches
+    float mistDensity = TPD(render, mistDensity);
+    float mistBrightness = TPD(render, mistBrightness);
+    // voxels the veil wraps around the column
+    float mistRadius = TPD(render, mistRadius);
+    // m/s the vapour field drifts DOWN
+    float mistFallSpeed = TPD(render, mistFallSpeed);
+    float sprayDensity = TPD(render, sprayDensity);
+    // voxels the impact puff reaches
+    float sprayRadius = TPD(render, sprayRadius);
 
     // how strongly the underside of the surface ripples the view of the sky
-    float subSurfaceRipple = 1.6f;
+    float subSurfaceRipple = TPD(render, subSurfaceRipple);
 
     // ---- the generic per-liquid submerged profile ----
     // (submergedProfile in raymarch.wgsl.) These shape the MAPPING from a
@@ -3702,24 +3935,30 @@ struct Tuning {
     // Opacity is the axis, because it is already the authored measure of how
     // much a medium blocks and it already orders the shipped liquids the way
     // submersion should: water 90, acid 170, blood 200, oil 235.
-    float subMurkVis = 0.55f;      // visibility (m) in a fully opaque liquid
-    float subVisCurve = 2.2f;      // clarity exponent for visibility only
-    float subAbsorbGain = 7.0f;    // opacity -> per-metre absorption
-    float subAbsorbFloor = 0.05f;  // so even a clear liquid is not a vacuum
+    // visibility (m) in a fully opaque liquid
+    float subMurkVis = TPD(render, subMurkVis);
+    // clarity exponent for visibility only
+    float subVisCurve = TPD(render, subVisCurve);
+    // opacity -> per-metre absorption
+    float subAbsorbGain = TPD(render, subAbsorbGain);
+    // so even a clear liquid is not a vacuum
+    float subAbsorbFloor = TPD(render, subAbsorbFloor);
     // How much of its own colour a liquid scatters back at the eye, at the
     // dense and clear ends. In a dense liquid, that scatter IS what you see.
-    float subScatterDense = 0.42f, subScatterClear = 0.16f;
+    float subScatterDense = TPD(render, subScatterDense);
+    float subScatterClear = TPD(render, subScatterClear);
     // Clarity band over which a liquid crosses from the derived profile onto
     // water's hand-tuned coefficients. Water sits at clarity ~0.79, oil ~0.25;
     // widening this band makes more liquids inherit water's look.
-    float subClearLow = 0.62f, subClearHigh = 0.78f;
+    float subClearLow = TPD(render, subClearLow);
+    float subClearHigh = TPD(render, subClearHigh);
 
     // Faint directional glow toward the surface when submerged in a medium
     // too dense to see through. A near-opaque liquid gates off Snell's window,
     // and what that left was a featureless field of colour with no sense of up
     // and nothing in motion - honest, but it reads as a broken shader rather
     // than as being under the oil.
-    float subMurkGlow = 2.2f;
+    float subMurkGlow = TPD(render, subMurkGlow);
 
     // ---- oil / petroleum-like viscous liquids ----
     // Oil and blood share the viscous SURFACE path (isViscousLiquid) but look
@@ -3732,92 +3971,109 @@ struct Tuning {
     // principle isViscousLiquid itself follows. Blood's colour0 is 0.85
     // saturated and oil's is 0.46: pigment suspensions are strongly chromatic,
     // petroleum is a near-neutral brown-black.
-    float oilSatLow = 0.50f, oilSatHigh = 0.78f;
+    float oilSatLow = TPD(render, oilSatLow);
+    float oilSatHigh = TPD(render, oilSatHigh);
     // Oil's IOR (~1.47 vs water's 1.33) puts F0 at roughly double water's, and
     // unlike blood it approaches a real mirror at grazing - that hard bright
     // rim is the look, not the artifact blood's lower graze guards against.
-    float oilF0 = 0.043f, oilGraze = 0.97f;
+    float oilF0 = TPD(render, oilF0), oilGraze = TPD(render, oilGraze);
     // Tighter lobe than blood's: a smooth film gives a small hard glint where
     // a rough suspension gives a broad soft one, and that narrowness is most
     // of what the eye reads as "glossy" rather than "damp".
-    float oilGloss = 620.0f, oilSheen = 1.6f;
+    float oilGloss = TPD(render, oilGloss), oilSheen = TPD(render, oilSheen);
     // How much the reflection is tinted by the liquid itself. Near zero: a
     // petroleum film is a near-NEUTRAL dark mirror, so what you see in it is
     // the sky and the far bank, not a brown wash of its own body colour.
-    float oilReflectTint = 0.12f;
+    float oilReflectTint = TPD(render, oilReflectTint);
     // How far the body colour is pushed toward black. Petroleum absorbs nearly
     // everything entering it and reflects the rest off the surface - the
     // opposite of blood's bright backscatter, and the term that kills the beige.
-    float oilDarken = 0.35f;
+    float oilDarken = TPD(render, oilDarken);
     // Thin-film interference (the rainbow slick): strength, and the spatial
     // scale of the film-thickness field that sets the band spacing.
-    float oilIridescence = 0.16f, oilFilmScale = 1.1f;
+    float oilIridescence = TPD(render, oilIridescence);
+    float oilFilmScale = TPD(render, oilFilmScale);
     // The sheen appears ONLY where oil floats on a DENSER liquid - a film needs
     // two interfaces close together, and a deep pool on rock has no second one
     // within reach of the light (floatingOnLiquid in raymarch.wgsl). This
     // scales how much denser the layer below must be to count as a real
     // boundary; oil 900 on water 1000 is a ratio of 0.111.
-    float oilFloatSens = 9.0f;
+    float oilFloatSens = TPD(render, oilFloatSens);
     // Silhouette-feather width for oil, against blood's 0.28. Blood can afford
     // a wide fade because its body colour reads through the blend; oil's body
     // is nearly black, so the same fade leaves a droplet as a smear of the
     // scene behind it. This is most of why oil looked see-through.
-    float oilEdgeBand = 0.07f;
+    float oilEdgeBand = TPD(render, oilEdgeBand);
     // How much plain sky reflection an UNPOOLED oil surface returns. A droplet
     // is a tiny curved mirror scattering the sky everywhere, so far less
     // reaches the eye than off a flat pool; at 1.0 a grazing droplet returns
     // full-brightness sky and reads as a hole in the world.
-    float oilDropReflect = 0.30f;
+    float oilDropReflect = TPD(render, oilDropReflect);
 
     // blood / viscous liquids (shadeViscous in raymarch.wgsl)
-    float bloodF0 = 0.030f;        // head-on reflectance
-    float bloodGraze = 0.55f;      // grazing reflectance (water goes to 1.0)
-    float bloodAbsorb = 55.0f;     // opacity -> per-metre absorption
-    float bloodTransmit = 0.35f;   // how much of the surface behind shows through
+    float bloodF0 = TPD(render, bloodF0);        // head-on reflectance
+    // grazing reflectance (water goes to 1.0)
+    float bloodGraze = TPD(render, bloodGraze);
+    // opacity -> per-metre absorption
+    float bloodAbsorb = TPD(render, bloodAbsorb);
+    // how much of the surface behind shows through
+    float bloodTransmit = TPD(render, bloodTransmit);
     // Hard ceiling on that transmission. Beer-Lambert alone leaves a lone
     // droplet (path << one voxel) half-transparent no matter how absorbing the
     // material is; blood is opaque at sub-millimetre scale because it
     // backscatters, and this models that. Raise it and blood becomes red glass.
-    float bloodMaxTransmit = 0.06f;
-    float bloodDepthRamp = 22.0f;  // metres^-1: bright thin -> dark deep
-    float bloodPoolLow = 0.18f, bloodPoolHigh = 0.55f;  // droplet <-> pool ramp
-    float bloodEdgeFeather = 0.10f;  // field value below which the rim fades out
-    float bloodSmooth = 1.0f;   // field-gradient baseline in voxels (anti-faceting)
-    float bloodWobble = 0.004f;    // surface-tension wobble (NOT wind ripples)
-    float bloodSheen = 1.15f;      // wet highlight strength
-    float bloodSheenDrop = 32.0f;  // specular exponent on a droplet (broad)
-    float bloodSheenPool = 220.0f; // ... and on a pool (tight)
-    float bloodAmbientSheen = 0.35f;  // sky-lit sheen, so it reads wet in shade
-    float bloodEdgeDepth = 0.035f;    // metres of column counted as "thin edge"
-    float bloodEdgeStrength = 0.65f;
-    float bloodEdgeTint[3] = {0.55f, 0.40f, 0.38f};
+    float bloodMaxTransmit = TPD(render, bloodMaxTransmit);
+    // metres^-1: bright thin -> dark deep
+    float bloodDepthRamp = TPD(render, bloodDepthRamp);
+    // droplet <-> pool ramp
+    float bloodPoolLow = TPD(render, bloodPoolLow);
+    float bloodPoolHigh = TPD(render, bloodPoolHigh);
+    // field value below which the rim fades out
+    float bloodEdgeFeather = TPD(render, bloodEdgeFeather);
+    // field-gradient baseline in voxels (anti-faceting)
+    float bloodSmooth = TPD(render, bloodSmooth);
+    // surface-tension wobble (NOT wind ripples)
+    float bloodWobble = TPD(render, bloodWobble);
+    float bloodSheen = TPD(render, bloodSheen);      // wet highlight strength
+    // specular exponent on a droplet (broad)
+    float bloodSheenDrop = TPD(render, bloodSheenDrop);
+    // ... and on a pool (tight)
+    float bloodSheenPool = TPD(render, bloodSheenPool);
+    // sky-lit sheen, so it reads wet in shade
+    float bloodAmbientSheen = TPD(render, bloodAmbientSheen);
+    // metres of column counted as "thin edge"
+    float bloodEdgeDepth = TPD(render, bloodEdgeDepth);
+    float bloodEdgeStrength = TPD(render, bloodEdgeStrength);
+    float bloodEdgeTint[3] = TPD_V3(render, bloodEdgeTint);
 
     // stains (applyStain in raymarch.wgsl)
-    float stainCoverage = 1.35f;      // how fast amount turns into coverage
-    float stainMottle = 0.85f;        // splatter break-up (0 = flat wash)
-    float stainMottleScale = 0.55f;   // noise frequency of that break-up
-    float stainDarken = 0.55f;        // how much a stain darkens its substrate
-    float stainOpacity = 0.70f;       // how far it goes to the pure stain colour
-    float stainSheen = 0.55f;         // wet highlight on a fresh stain
-    float stainSheenPower = 90.0f;
+    // how fast amount turns into coverage
+    float stainCoverage = TPD(render, stainCoverage);
+    // splatter break-up (0 = flat wash)
+    float stainMottle = TPD(render, stainMottle);
+    // noise frequency of that break-up
+    float stainMottleScale = TPD(render, stainMottleScale);
+    // how much a stain darkens its substrate
+    float stainDarken = TPD(render, stainDarken);
+    // how far it goes to the pure stain colour
+    float stainOpacity = TPD(render, stainOpacity);
+    // wet highlight on a fresh stain
+    float stainSheen = TPD(render, stainSheen);
+    float stainSheenPower = TPD(render, stainSheenPower);
 
     // lava
-    float lavaCrackFreq = 2.4f;
-    float lavaCrackKneeLow = 0.50f, lavaCrackKneeHigh = 0.90f;
-    float lavaWarmBias = 0.035f;
-    float lavaEmissionGain = 1.9f;
-    float lavaPulseAmp = 0.06f, lavaPulseRate = 0.9f;
-
-    // embers (sub-voxel points; see emberGlow in raymarch.wgsl for why the
-    // splat radius is clamped to ~1/4 voxel and brightness is area-compensated)
-    float emberBrightness = 2.2f;
-    float emberRise = 26.0f, emberRate = 3.4f;
-    int emberDensity = 84;  // 0..255 threshold; higher = more sparks
+    float lavaCrackFreq = TPD(render, lavaCrackFreq);
+    float lavaCrackKneeLow = TPD(render, lavaCrackKneeLow);
+    float lavaCrackKneeHigh = TPD(render, lavaCrackKneeHigh);
+    float lavaWarmBias = TPD(render, lavaWarmBias);
+    float lavaEmissionGain = TPD(render, lavaEmissionGain);
+    float lavaPulseAmp = TPD(render, lavaPulseAmp);
+    float lavaPulseRate = TPD(render, lavaPulseRate);
 
     // tonemap
-    float exposureWhite = 4.2f;
-    float bleachAmount = 0.9f;
-    float gamma = 2.2f;
+    float exposureWhite = TPD(render, exposureWhite);
+    float bleachAmount = TPD(render, bleachAmount);
+    float gamma = TPD(render, gamma);
 
     // static micro-detail (traceMicro in raymarch.wgsl)
     // Distance in METRES past which a micro cell is drawn as a plain voxel
@@ -3825,7 +4081,7 @@ struct Tuning {
     // one pixel at ~110 m for a 1080p 90-degree view, so anything past that is
     // paying a 3*subdiv-step march to decide the colour of a sub-pixel — the
     // LOD is not an approximation there, it is the same answer for less.
-    float microLodDist = 40.0f;
+    float microLodDist = TPD(render, microLodDist);
     // The same cut for COLUMN plants (grass, flowers, small mushrooms —
     // tracePlant, not the brick DDA), and the reason it is a separate knob:
     // an analytic tuft costs a wind sample, a trample lookup and six to eight
@@ -3834,32 +4090,32 @@ struct Tuning {
     // 2026-09-04: a meadow at 40 m fell from ~50 to ~15 fps against ~50 in
     // snow. Tile plants (ferns, big toadstools) are 30-50 cm and keep
     // microLodDist. Effective distance is min(microLodDist, plantLodDist).
-    float plantLodDist = 16.0f;
+    float plantLodDist = TPD(render, plantLodDist);
     // Cap on nested micro marches per primary ray. A ray grazing a meadow can
     // cross dozens of grass cells, and each one that MISSES keeps the ray
     // alive, so without a cap one pixel can pay for the whole field. Past the
     // cap a micro cell is treated as SOLID (not as air), because terminating
     // the ray is bounded and correct-ish while letting it fly is neither.
-    int microMaxPerRay = 8;
+    int microMaxPerRay = TPD(render, microMaxPerRay);
     // Wind bend at a swaying plant's TIP, in sub-voxels (subdiv 8 => 1.25 cm
     // each). Clamped to 2.0: the models keep a 2-sub-voxel margin from their
     // cell walls, and anything past that shears blade tips through the wall
     // where the nested DDA never marches them — they vanish, not clip.
-    float microSwayAmp = 1.5f;
+    float microSwayAmp = TPD(render, microSwayAmp);
     // ---- trample (render-only; DESIGN.md §9 "Analytic plants") ----
     // Seconds a flattened plant takes to stand back up after the presser
     // leaves. The press-in itself is fixed (~0.12 s) because a foot lands
     // faster than anything worth tuning.
-    float trampleRecover = 1.4f;
+    float trampleRecover = TPD(render, trampleRecover);
     // How far a fully trampled plant compresses: 0.8 leaves 20% of its height.
-    float trampleDepth = 0.8f;
+    float trampleDepth = TPD(render, trampleDepth);
     // Lateral lean of a fully trampled plant's tip, in cells, AWAY from the
     // presser. Clamped inside the plant's own column by the renderer, so past
     // ~0.4 it saturates rather than shearing blades into neighbour cells.
-    float trampleLean = 0.35f;
+    float trampleLean = TPD(render, trampleLean);
     // Multiplier on a presser's collision half-width to get its stamp radius:
     // feet reach a little past the capsule, and grass bends past the foot.
-    float trampleRadius = 1.5f;
+    float trampleRadius = TPD(render, trampleRadius);
     // FOLIAGE-LOCAL trim on the wind clock, applied on top of wind.gustSpeed.
     // It used to be the band rate outright; since the wind rewrite the field
     // itself owns that (windAt in common.wgsl, wind.gustSpeed), and this is a
@@ -3868,7 +4124,7 @@ struct Tuning {
     // different phase than the debug arrow overlay draws, so the overlay stops
     // being evidence about the grass. Move wind.gustSpeed instead unless you
     // specifically want foliage running off the shared clock.
-    float microSwaySpeed = 1.0f;
+    float microSwaySpeed = TPD(render, microSwaySpeed);
 
     // ---- how fast the cascade REBUILDS, in sieve entries per tick --------
     // CPU-ONLY (never reaches a shader): FarField::SetBulkCap. Applies to a
@@ -3902,7 +4158,7 @@ struct Tuning {
     // median within 4 ms of the cheapest arm. Raise it toward 4096 to get the
     // horizon back sooner and accept the hitches; lower it toward 256 if a
     // dropped frame matters more than a busy minute. Hot-reloads on F5.
-    int farRefillRate = 1024;
+    int farRefillRate = TPD(render, farRefillRate);
 
     // ---- THE ORDINARY-TRAVEL CAP (farfield.h kPlayFillCap) -----------------
     // Entries an INCOMING PLANE may drain per tick: the horizon keeping up
@@ -3914,16 +4170,16 @@ struct Tuning {
     // enough that the valid-box face counts overflowed and the renderer fell
     // through to house-sized cells at 40 m. 256 is ~4.8 ms/tick of sieve,
     // still under what 64 was sized to spend. Hot-reloads on F5.
-    int farPlaneFillRate = 256;
+    int farPlaneFillRate = TPD(render, farPlaneFillRate);
 
     // budgets
-    int primarySteps = 4096;
-    int farSteps = 384;
+    int primarySteps = TPD(render, primarySteps);
+    int farSteps = TPD(render, farSteps);
     // How far a far-field sun shadow ray reaches, in METERS. Converted to a
     // per-level step count by farShadowSteps() in raymarch.wgsl so the reach
     // is the same world distance at every cascade level (a raw step count is
     // not: it scales with the level's cell size — see the comment there).
-    float farShadowReach = 60.0f;
+    float farShadowReach = TPD(render, farShadowReach);
     // Highest cascade level at which the conservative "any blocker" flag
     // (common.wgsl FAR_BLOCKER_BIT) may terminate a PRIMARY ray. Shadows use
     // it at every level unconditionally; the visible surface only up to here,
@@ -3945,7 +4201,7 @@ struct Tuning {
     // never take the flag), and the change is confined to the bottom 40% of
     // the frame. Raise it to 2 to see the trade; it is one tuning edit and no
     // rebuild.
-    int farBlockerHitLevel = 0;
+    int farBlockerHitLevel = TPD(render, farBlockerHitLevel);
 
     // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
     // Distance in METERS past which the PRIMARY march stops resolving fine
@@ -3985,7 +4241,7 @@ struct Tuning {
     // 1.0 disables the crossfade (voxels at full opacity right up to the face,
     // coarse gas starting at the face) and gets stage 1's hard edge back --
     // which is how to A/B it without a rebuild, since F5 reloads this.
-    float gasBlendStart = 0.5f;
+    float gasBlendStart = TPD(render, gasBlendStart);
     // ---- FAR FIRE PLUMES (world.h kGasFarEmitMax, sim_gas.wgsl
     // `gasFarPlume`) ---------------------------------------------------------
     //
@@ -4001,13 +4257,13 @@ struct Tuning {
     // splat row is not recorded, no buffer is written, and the box's clear
     // falls back to the parcel latch exactly as it did before the feature
     // existed. That is the A/B arm, and F5 reloads it.
-    float farPlumeStrength = 1.0f;
+    float farPlumeStrength = TPD(render, farPlumeStrength);
     // How far the synthesized column climbs above the fire, in METRES. The
     // shader converts with kVoxelMeters and then clamps to the density box, so
     // a value past the box edge costs nothing extra and simply saturates. 28 m
     // is a little over half the box's half-extent, which reads as a tall plume
     // from outside without the top of every column sitting on the box lid.
-    float farPlumeHeight = 28.0f;
+    float farPlumeHeight = TPD(render, farPlumeHeight);
     // HOW FAR OUT A FROZEN FIRE STILL SMOKES, in metres.
     //
     // There are TWO density boxes. gasOuter spans ±51.2 m at 0.8 m cells; the
@@ -4029,60 +4285,61 @@ struct Tuning {
     // gas-farplume2 gate, which sets its own range, ever exercised it. Fixed in
     // tuning.json on 2026-09-19; this struct default was left behind, and a
     // struct default matters whenever the key is missing from the JSON.
-    float farPlumeRange = 3276.8f;
+    float farPlumeRange = TPD(render, farPlumeRange);
 
     // ---- clouds (cloud.wgsl; DESIGN.md 9.w). The LOOK of the sky's clouds;
     // which weather is showing lives in `weather` (src/sim/weather.h). ----
     // Tile period of the Perlin-Worley shape volume, metres. Sets the size of individual cloud bodies: a quarter of this is roughly one cumulus tower.
-    float cloudShapeScaleM = 9000.0f;
+    float cloudShapeScaleM = TPD(render, cloudShapeScaleM);
     // Tile period of the Worley erosion volume. Smaller = finer cauliflower and wisps on the cloud edges.
-    float cloudDetailScaleM = 700.0f;
+    float cloudDetailScaleM = TPD(render, cloudDetailScaleM);
     // Feature size of the coverage/type/rain fields. Large = broad fronts and wide clear gaps; small = a sky of scattered patches.
-    float cloudWeatherScaleM = 16000.0f;
+    float cloudWeatherScaleM = TPD(render, cloudWeatherScaleM);
     // Optical density of cloud at density 1, per metre. Higher = more opaque, darker undersides, harder silhouettes.
-    float cloudExtinction = 0.045f;
+    float cloudExtinction = TPD(render, cloudExtinction);
     // How deep the detail noise eats into the base shape. 0 = smooth blobs, 1 = ragged wisps.
-    float cloudErosion = 0.45f;
+    float cloudErosion = TPD(render, cloudErosion);
     // View-ray samples through the deck per low-res pixel. The main cost knob.
-    int cloudSteps = 64;
+    int cloudSteps = TPD(render, cloudSteps);
     // Samples toward the sun per view sample (plus one long sample). Fewer = flatter clouds, cheaper.
-    int cloudLightSteps = 5;
+    int cloudLightSteps = TPD(render, cloudLightSteps);
     // How far along a ray the deck is marched. Past it the deck is left to the haze.
-    float cloudMaxDistM = 45000.0f;
+    float cloudMaxDistM = TPD(render, cloudMaxDistM);
     // e-folding distance of the aerial perspective on clouds: how quickly distant cloud dissolves into the horizon sky.
-    float cloudHazeM = 32000.0f;
+    float cloudHazeM = TPD(render, cloudHazeM);
     // Henyey-Greenstein anisotropy of the forward lobe. Higher = brighter silver lining when looking toward the sun.
-    float cloudPhaseG = 0.72f;
+    float cloudPhaseG = TPD(render, cloudPhaseG);
     // Octave falloff of the multiple-scattering approximation. Higher = brighter, softer cloud interiors.
-    float cloudMultiScatter = 0.5f;
+    float cloudMultiScatter = TPD(render, cloudMultiScatter);
     // Darkening of thin cloud edges seen away from the sun (the 'powdered sugar' look).
-    float cloudPowder = 0.7f;
+    float cloudPowder = TPD(render, cloudPowder);
     // Skylight on clouds, as a multiple of the terrain's hemisphere ambient.
-    float cloudAmbient = 2.2f;
+    float cloudAmbient = TPD(render, cloudAmbient);
     // Multiplier on direct sun/moon light scattered by clouds.
-    float cloudSunGain = 1.0f;
+    float cloudSunGain = TPD(render, cloudSunGain);
     // How much cloud shadows darken the direct light on the ground. 0 = clouds cast nothing.
-    float cloudShadowStrength = 0.9f;
+    float cloudShadowStrength = TPD(render, cloudShadowStrength);
     // Opacity of the distant rain shafts under raining cells.
-    float cloudRainDensity = 1.0f;
+    float cloudRainDensity = TPD(render, cloudRainDensity);
     // Brightness of the falling streaks (or flakes) around the camera.
-    float cloudRainStreaks = 1.0f;
+    float cloudRainStreaks = TPD(render, cloudRainStreaks);
     // Weight of the new frame in the low-res accumulation. Lower = smoother but more lag when clouds move fast.
-    float cloudTemporal = 0.12f;
+    float cloudTemporal = TPD(render, cloudTemporal);
     // The cloud buffer is the render target divided by this on each axis. 2 = quarter the pixels.
-    int cloudResDiv = 3;
+    int cloudResDiv = TPD(render, cloudResDiv);
     // Cloud drift as a multiple of the surface wind (winds aloft are faster than at the ground).
-    float cloudWindScale = 4.0f;
+    float cloudWindScale = TPD(render, cloudWindScale);
     // How much rain-soaked, sky-exposed ground darkens at full wetness.
-    float cloudWetDarken = 0.42f;
+    float cloudWetDarken = TPD(render, cloudWetDarken);
     // Strength of the rainbow in sunlit rain (42 degrees from the anti-solar point).
-    float cloudRainbow = 1.0f;
+    float cloudRainbow = TPD(render, cloudRainbow);
     // Feature size of the high ice-cloud streaks.
-    float cloudCirrusScaleM = 7000.0f;
+    float cloudCirrusScaleM = TPD(render, cloudCirrusScaleM);
     // How much the clouds in a direction colour the distance fog and reflections in it (the env map).
-    float cloudFogMix = 1.0f;
-    float lodHandoffDist = 26.0f;  // shipped: 26 = past the 25.6 m window face, i.e. OFF (tuning.json)
-    // ---- frame pacing and internal resolution (CPU-only: no .def row, no
+    float cloudFogMix = TPD(render, cloudFogMix);
+    // shipped: 26 = past the 25.6 m window face, i.e. OFF (tuning.json)
+    float lodHandoffDist = TPD(render, lodHandoffDist);
+    // ---- frame pacing and internal resolution (CPU-only: NO_WGSL rows, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------
     //
     // renderScale: the WORLD is rendered at (width, height) x this, into an
@@ -4093,7 +4350,7 @@ struct Tuning {
     // 1080p, so most of what a scaled frame loses is resolution the data
     // never had. 1.0 renders straight into the swapchain as before — the
     // offscreen target and the blit exist only below 1. Clamped to [0.25, 1].
-    float renderScale = 1.0f;
+    float renderScale = TPD(render, renderScale);
     // ---- TAA + temporal upscale (assets/shaders/taa.wgsl) ----------------
     //
     // taa: 1 replaces the NEAREST blit at the end of a scaled frame with a
@@ -4111,25 +4368,25 @@ struct Tuning {
     // uniform buffer, not through a TUNE_* shader constant, so changing one
     // costs no shader recompile and applies on the NEXT FRAME. That is
     // deliberate — an A/B you can flip mid-flight is one that gets run.
-    int taa = 0;
+    int taa = TPD(render, taa);
     // taaMaxHist: the ceiling on accumulated sample weight, i.e. the effective
     // length of the running average. 64 is voxelbit's stationary ceiling and
     // converges hardest; lower reacts faster to a change and ghosts less.
     // Below ~4 there is not enough history to reconstruct anything and the
     // pass is a cost with no product.
-    float taaMaxHist = 24.0f;
+    float taaMaxHist = TPD(render, taaMaxHist);
     // taaClamp: how far OUTSIDE the 3x3 colour box of the current frame a
     // history sample is allowed to sit before it is pulled in. 0 is the
     // hardest clamp (sharpest, most flicker), large is no clamp at all
     // (smoothest, ghosts behind every moving edge). This is the one knob that
     // trades ghosting against flicker; everything else trades cost.
-    float taaClamp = 0.25f;
+    float taaClamp = TPD(render, taaClamp);
     // taaJitter: scale on the R2 sub-pixel camera offset, in render pixels.
     // 1 = the full +/-0.5 px the reconstruction filter integrates over. 0
     // disables the jitter and leaves the accumulation running, which is the
     // arm that isolates "what did the jitter buy" from "what did the temporal
     // average buy" — with it at 0 the pass can only blur.
-    float taaJitter = 1.0f;
+    float taaJitter = TPD(render, taaJitter);
     // taaSharpLod: with TAA on, tell the raymarch its pixels are NATIVE-sized
     // rather than render-sized — `viewPx` goes to the window height instead of
     // the render height. This is the voxel equivalent of the negative mip bias
@@ -4143,7 +4400,7 @@ struct Tuning {
     // is what the accumulator is for) and finer LOD is kept further out (which
     // costs time). 0 keeps the old behaviour and is the A/B arm; `--gate taa`
     // measures both arms in one run and prints both errors.
-    int taaSharpLod = 1;
+    int taaSharpLod = TPD(render, taaSharpLod);
     // taaSharpness: the reconstruction filter's Gaussian exponent, in NATIVE
     // pixels — exp(-taaSharpness * d^2). At 2.29 a sample one native pixel away
     // still counts for 10%, i.e. a filter about half a native pixel wide.
@@ -4156,7 +4413,7 @@ struct Tuning {
     // rather than to the reference. Larger values let only the frames whose
     // jittered sample landed nearly on the pixel speak for it — sharper, at the
     // cost of starving pixels the jitter sequence keeps missing.
-    float taaSharpness = 2.29f;
+    float taaSharpness = TPD(render, taaSharpness);
     // ---- the shading-LOD filter (assets/shaders/denoise.wgsl) --------------
     // CPU-ONLY, all seven: they reach denoise.wgsl through its own uniform
     // (Simulation::WriteDenoiseParams), never the TUNE_ prelude, so a change
@@ -4171,13 +4428,13 @@ struct Tuning {
     // SHIPS OFF (owner's call, 2026-09-12): with the filter on, distant
     // terrain read as out of focus; the in-raymarch contact-term fade
     // (raymarch.wgsl lodShadeFade) stays on and is the part that ships.
-    int denoise = 0;
+    int denoise = TPD(render, denoise);
     // denoiseIters: a-trous iterations, each a 5x5 tap at dilation 2^i. 1 =
     // a 5-px support (takes the 1-2 px stipple and leaves the 6 px cascade
     // mosaic), 2 = 13 px (shipped: the mosaic averages, terrace bands and
     // relief survive), 3 = 25 px (measured 2026-09-12: every hillside reads
     // out of focus), 4 = 49 px. Cost is linear in it.
-    int denoiseIters = 2;
+    int denoiseIters = TPD(render, denoiseIters);
     // denoisePxFull / denoisePxStart: the strength ramp, in PROJECTED PIXELS
     // PER FINE VOXEL at the pixel's depth. Full strength at or below pxFull,
     // off at or above pxStart. At 1080p / 70 deg a 10 cm voxel is 2 px at
@@ -4188,37 +4445,37 @@ struct Tuning {
     // The ramp is this WIDE on purpose: a 15-31 m ramp measured as a visible
     // line where crisp voxels met filtered ones, the same defect as the LOD
     // ring the cascade seam dither exists to break.
-    float denoisePxFull = 2.0f;
-    float denoisePxStart = 8.0f;
+    float denoisePxFull = TPD(render, denoisePxFull);
+    float denoisePxStart = TPD(render, denoisePxStart);
     // denoiseDepthTol: the depth edge stop, as a fraction of view depth per
     // pixel of tap offset. A tap whose depth differs from the centre by more
     // than about this is a different surface (a crest against the hill
     // behind, a mob against the ground) and stops the filter. A grazing
     // ground plane at 100 m changes depth by ~1% per pixel, which this must
     // exceed or every tread becomes an edge.
-    float denoiseDepthTol = 0.03f;
+    float denoiseDepthTol = TPD(render, denoiseDepthTol);
     // denoiseChromaTol: the chroma edge stop, the width of a Gaussian on the
     // distance between two taps' luminance-normalised colours. The speckle is
     // LUMINANCE (lit vs shadowed faces of one material); a material boundary
     // is mostly hue. Smaller preserves more material edges and less of the
     // lit/shadow averaging (shadow is slightly bluer than sun); larger blurs
     // across everything.
-    float denoiseChromaTol = 0.25f;
+    float denoiseChromaTol = TPD(render, denoiseChromaTol);
     // denoiseStrength: overall ceiling on the filter (0..1). 1 is the full
     // average; 0.5 keeps half the original speckle under it. Shipped 0.7 with
     // two iterations: the residual is what keeps the picture reading as
     // in-focus terrain rather than a soft gradient.
-    float denoiseStrength = 0.7f;
+    float denoiseStrength = TPD(render, denoiseStrength);
     // presentMode: 0 fifo (vsync, quantises a 22 ms frame to 33), 1 mailbox
     // (newest frame at each vblank, no tearing, no quantisation), 2 immediate
     // (tears). Applied when it CHANGES (a swapchain recreate). Use fifo or an
     // fpsCap while recording: mailbox lets the game submit as fast as it can,
     // which starves a capture tool of GPU time.
-    int presentMode = 1;
+    int presentMode = TPD(render, presentMode);
     // fpsCap: frames per second the loop will not exceed, 0 = uncapped. A
     // sleep at the end of the frame, billed to the `present` scope as a wait.
     // The way to leave a recorder (OBS) its share of the GPU.
-    float fpsCap = 0.0f;
+    float fpsCap = TPD(render, fpsCap);
     // Distance in METERS past which a PRIMARY hit takes the cascade shadow
     // (farShadowed) instead of a real per-voxel sun ray (A3).
     //
@@ -4229,7 +4486,7 @@ struct Tuning {
     // size before it may conclude "unshadowed". See the long comment on
     // sunShadowAt in raymarch.wgsl for why, and for what would actually work.
     // Kept as a knob so the experiment is re-runnable, not as a feature.
-    float shadowMaxDist = 999.0f;
+    float shadowMaxDist = TPD(render, shadowMaxDist);
 
     // ---- SHORT-RANGE MODE (dev panel "short range (100 m + fog)") ----
     // A comparison arm against the dense-100 m WebGPU voxel engines
@@ -4247,7 +4504,7 @@ struct Tuning {
     // only say what the mode LOOKS like when it is on.
     //
     // Ray ceiling in METERS. Nothing past this is marched at all.
-    float shortRangeDist = 100.0f;
+    float shortRangeDist = TPD(render, shortRangeDist);
     // The NEAR arm's ceiling, in metres: the same mode with a tighter wall, so
     // the panel can compare two cutoffs without the tuner (dev panel radio
     // "50 m" vs "100 m"). A SECOND DISTANCE rather than a fraction of the
@@ -4255,17 +4512,17 @@ struct Tuning {
     // shortRangeDist would silently move this one too the moment the far arm
     // is retuned. Which arm is live is flag bit 4, not a tuning value, for the
     // same reason the mode's on/off is not one.
-    float shortRangeNearDist = 50.0f;
+    float shortRangeNearDist = TPD(render, shortRangeNearDist);
     // Where the fog ramp starts, as a FRACTION of shortRangeDist. Below it the
     // image is unfogged; the mode's whole point is that the near field looks
     // untouched and only the wall dissolves. 0.65 = fog begins at 65 m of 100.
-    float shortRangeFogStart = 0.65f;
+    float shortRangeFogStart = TPD(render, shortRangeFogStart);
     // Steepness of the ramp between the start fraction and the ceiling. The
     // curve is 1 - exp(-density * x^2) renormalised so it reaches EXACTLY 1 at
     // the ceiling — the renormalisation is what stops the mode from trading a
     // geometric cliff for a colour one. Higher = the fog closes sooner and
     // the last few metres are pure sky; lower = a longer, thinner haze.
-    float shortRangeFogDensity = 5.0f;
+    float shortRangeFogDensity = TPD(render, shortRangeFogDensity);
   } render;
 
   // ---- world: which authored map and edit layer the game loads ---------------
@@ -4277,13 +4534,13 @@ struct Tuning {
     // biome/landform planes, the terrain numbers and the site table. NOT
     // optional -- "default" ships, and a missing or unparsable map ABORTS at
     // load rather than silently generating an all-ocean or all-forest world.
-    std::string mapLayer = "default";
+    std::string mapLayer = TPD(world, mapLayer);
     // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
     // World map page's voxel view writes. Applied through the MutationQueue
     // to every chunk worldgen produces, so it survives streaming and composes
     // with any seed. EMPTY BY DEFAULT, and no gate may set it: a layer moves
     // the world hash by construction.
-    std::string editLayer;
+    std::string editLayer = TPD(world, editLayer);
   } world;
 
   // ---- debug: dev switches that are not world content ---------------------------
@@ -4291,12 +4548,12 @@ struct Tuning {
     // 1 = plants generate, 0 = a bare world (trees, cacti, flowers, grass,
     // undergrowth, cover rows, shore/pond/cave flora, alpine cushion, wet moss
     // all off). A frame-rate A/B lever; see tuning_params.def.
-    int vegetation = 1;
+    int vegetation = TPD(debug, vegetation);
     // 1 = the small plants generate, 0 = trees and cacti stand on bare ground
     // (cover rows, tile plants, shore rows, pond life, wet moss and cave flora
     // all off). The half of `vegetation` you usually want; ANDed with it, so
     // vegetation = 0 is still the bare world. See tuning_params.def.
-    int groundCover = 1;
+    int groundCover = TPD(debug, groundCover);
   } debug;
 
   // Values that failed validation, for the overlay / console. Empty on success.
@@ -4306,7 +4563,9 @@ struct Tuning {
 // Loads tuning.json over `out` (which starts at the compiled-in defaults, so a
 // missing file or a partial JSON is fine — anything absent keeps its default).
 // Returns false only on unreadable/unparseable JSON; per-field problems are
-// clamped and reported through out.warnings.
+// clamped and reported through out.warnings. Every tuning_params.def row is
+// read and clamped by generated code; the hand-written remainder is only what
+// a row cannot state.
 bool LoadTuning(const std::string& path, Tuning& out);
 
 // ---- writing the combat groups back ----------------------------------------
@@ -4341,7 +4600,8 @@ void SetCurrentTuning(const Tuning& t);
 
 // Any group, by the tuning_params.def name. This is what --sweep uses, so a new
 // row is sweepable the moment it exists. Returns false for an unknown group or
-// member, and for TP_V3 rows (a vec3 has no single float to sweep).
+// member, and for TP_V3 / TP_S rows (a vec3 has no single float to sweep, a
+// string is not a number). Not clamped to the row's range.
 bool SetTuningField(Tuning& t, const std::string& group,
                     const std::string& name, float value);
 

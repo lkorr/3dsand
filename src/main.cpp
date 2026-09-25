@@ -13071,7 +13071,7 @@ int main(int argc, char** argv) {
       // and these two knobs ride TickParams precisely so they do not need one.
       // A slider that recompiled every shader on each frame of a drag would be
       // unusable, which is the whole reason they are on the tick stream and
-      // not in tuning_params.def.
+      // are NO_WGSL rows of tuning_params.def.
       if (ui.windTuningDirty) {
         ui.windTuningDirty = false;
         Tuning t = CurrentTuning();

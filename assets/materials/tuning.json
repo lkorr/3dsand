@@ -573,8 +573,6 @@
     "windWakeChunks": 96
   },
   "render": {
-    "skyGradient": 1.4,
-    "skyHorizonOffset": 0.25,
     "skyHorizon": [
       0.72,
       0.8,
@@ -624,10 +622,7 @@
       0.9,
       0.7
     ],
-    "sunDiscPower": 800,
     "sunDiscGain": 3,
-    "sunHaloPower": 8,
-    "sunHaloGain": 0.12,
     "sunDir": [
       0.5,
       0.55,
@@ -834,10 +829,6 @@
     "lavaEmissionGain": 1.9,
     "lavaPulseAmp": 0.06,
     "lavaPulseRate": 0.9,
-    "emberBrightness": 2.2,
-    "emberRise": 26,
-    "emberRate": 3.4,
-    "emberDensity": 84,
     "exposureWhite": 4.2,
     "bleachAmount": 0.9,
     "gamma": 2.2,

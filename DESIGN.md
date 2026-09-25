@@ -3089,8 +3089,37 @@ Where `materials.json` says what a voxel *is*, `tuning.json` says how the engine
 renders and moves it: sky/sun/fog, water and lava shading, AO and shadows,
 tonemap, player speeds, Jolt body materials, debris budgets, the integer sim
 constants, and worldgen shape. Edited with `assets/tuner.html` (Tuning tab),
-which builds its whole UI from `assets/tuner_schema.js` — range, units and a
-plain-English description per parameter.
+which builds its whole UI from `assets/tuner_schema.js` — units, step and a
+plain-English description per parameter — plus the range, which it does NOT
+write itself (below).
+
+**One row per knob (W2-Q, 2026-09-24).** `src/sim/tuning_params.def` has a row
+for every plain number, flag and name in `tuning.json` (899 rows: 402 carry a
+WGSL name, 497 are `NO_WGSL`), and the row is the only place the knob's type,
+default and range are written:
+
+```
+TP_F(player, walkSpeed, NO_WGSL, 4.5f, 0.5f, 20.0f)
+TP_I(sim, fluidSubsteps, TUNE_FLUID_SUBSTEPS, 9, 1, 32)
+TP_B(avatar, enabled, NO_WGSL, true)        TP_S(player, model, NO_WGSL, "human")
+TP_V3(render, sunColor, TUNE_SUN_COLOR, 1.0f, 0.95f, 0.86f)
+```
+
+Everything else is generated from it: the `tuning.h` initializer
+(`float walkSpeed = TPD(player, walkSpeed);`), `LoadTuning`'s read and clamp
+(`ReadDefRows`, which runs before the hand-written group blocks), the WGSL
+`const` block, `--sweep` for every group, the `tuning-reach` gate, the offline
+prelude (`scripts/tuning_prelude.py` parses the .def through
+`scripts/tuning_def.py`), and the tuner's slider range
+(`scripts/gen_tuning_params.py` writes `assets/tuning_params.js`, which
+`tuner_schema.js` joins onto its rows by `group.key`). **The slider range IS
+the load clamp**: one range, not an editor range beside a loader range. The
+hand-written remainder of `LoadTuning` is only what a row cannot state — a
+bound that depends on another field (`zoomMax >= zoomMin`), a reset-to-default,
+an enum gate, the `gore.*Var` variance objects — and the row says so
+(`// + a hand-written rule in LoadTuning`). A knob added in the old style
+(literal initializer, hand `Read*`) still works; `check_invariants.py` asks only
+that every `tuning.json` key has a reader.
 
 Two delivery paths, because the values land in two places:
 
@@ -3624,19 +3653,22 @@ took the lab branch). It is gone; `farSurfaceMat` takes the column.
 `World::TerrainHeight` reads the same map words as the shader
 (`WorldMapData::terrainWords`, the very `TerrainWords()` the packer wrote),
 so editing the terrain cannot desync collision from the terrain you can see. `scripts/tuning_prelude.py` supplies the same constants
-to `check_shaders.sh`, and is **generated** from `src/sim/tuning_params.def` —
-the one table the emitter itself expands — so the offline validator and the
-engine cannot disagree about a name, a type, or a default. They used to be two
-hand-maintained lists, and only the *names* were ever compared.
+to `check_shaders.sh` by **parsing** `src/sim/tuning_params.def` — the one
+table the emitter itself expands — so the offline validator and the engine
+cannot disagree about a name, a type, or a default. They used to be two
+hand-maintained lists, and only the *names* were ever compared; then one list
+and a generated copy; since W2-Q there is no copy.
 
-The table does NOT generate the `tuning.h` initializer or the `LoadTuning`
-read, and both drifted: nine `render.wave*` rows had no read from 9a79eba until
-2026-09-24 (every slider dead, the shader always on the C++ default), and
-`render.fluidFoam` / `sim.fluidExciteMode` carried different defaults in the
-`.def` and in `tuning.h`. `check_invariants.py`'s `tuning reach` check now
-refuses a `.def` row whose key `LoadTuning` never reads in its group, a `.def`
-default that differs from the `tuning.h` initializer, and a `tuning.json` key
-no reader consumes.
+Until W2-Q (2026-09-24) the table did NOT generate the `tuning.h` initializer or
+the `LoadTuning` read, and both drifted: nine `render.wave*` rows had no read
+from 9a79eba until 2026-09-24 (every slider dead, the shader always on the C++
+default), and `render.fluidFoam` / `sim.fluidExciteMode` carried different
+defaults in the `.def` and in `tuning.h`. Both are generated now (see the
+tuning.json section), so those drifts cannot recur; `check_invariants.py`'s
+`tuning reach` check covers the joins that remain — a `TPD(g, m)` sitting on
+the wrong member, a default outside its own range, a shipped value outside its
+range, a `tuning.json` key no reader consumes, and a `tuner_schema.js` row that
+states a second range for a `.def` key.
 
 #### Per-instance variance (2026-08-20)
 A tuned constant makes every instance identical: every NPC bleeds exactly the
@@ -12760,7 +12792,7 @@ Q = Cd * A * v * 8            (eighths/tick; A is the orifice's cell count)
 `sim.drainCd` and `sim.drainGravity` are human-unit floats in the sanctioned
 `sim.fluid*` lane, const-eval'd to fixed point at the top of
 `sim_waterbody.wgsl`; `sim.drainMaxEighthsPerTick` and `sim.drainExciteRadius`
-are integers. Same five-place `TUNE_*` pipeline as everything else.
+are integers. Same one-row `tuning_params.def` pipeline as everything else.
 
 **The FLUID_VMAX trap, made structural.** `spawnAppend` clamps spawn velocity to
 ±`FLUID_VMAX` (0.45 cell/substep), and a Torricelli velocity under real head
