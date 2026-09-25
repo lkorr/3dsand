@@ -1040,7 +1040,7 @@ fn excitedReact(c : vec3<i32>, idx : u32, slotIdx : u32) {
   let m = materials[fm];
   if (m.reactCount == 0u) { return; }
   let rnd = hash3(T.seed, T.tick * 2u + P.substep, slotIdx);
-  _ = doReactions(c, idx, slotIdx, 0u, fm, m, rnd, true, 0u, false);
+  _ = doReactions(c, idx, slotIdx, 0u, fm, m, rnd, true, 0u, false, false);
 }
 
 // A rule fired against synthesized excited fluid and takes the neighbour:
@@ -1312,7 +1312,9 @@ fn coatRelease(c : vec3<i32>, face : u32, prod : u32, rr : u32, stamp : u32) {
 // (common.wgsl), skipping the cell before it can mark keepAwake. Measured in
 // `stain-react`: the last oiled cells beside a lava channel stamped by their
 // own flashes let the chunk fall asleep on such a tick with 2 of 72 levels
-// unburnt, heat still there, forever. STAMP_NEVER never aliases.
+// unburnt, heat still there, forever. STAMP_NEVER never aliases. (Since W2-R
+// main's stamp-skipped cells probe their rules and mark keepAwake anyway, so
+// this is no longer load-bearing; kept, because a spend is not a move.)
 fn coatSpend(c : vec3<i32>, idx : u32, w : u32, stamp : u32) -> u32 {
   _ = stamp;
   let amt = voxStainAmt(w);
@@ -1326,7 +1328,7 @@ fn coatSpend(c : vec3<i32>, idx : u32, w : u32, stamp : u32) -> u32 {
 
 // Rules 1-3: the coat material `cm`'s pair rules, run with the coat as self.
 fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
-             m : Material, cm : u32, rnd : u32) -> vec2<u32> {
+             m : Material, cm : u32, rnd : u32, probe : bool) -> vec2<u32> {
   let cmat = materials[cm];
   let stamp = stampFor(T.tick, P.substep);
   var keepAwake = false;
@@ -1382,7 +1384,7 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     }
     keepAwake = keepAwake || (rule.cond & RCOND_GATES) == 0u;
     covered = covered || !flame;
-    if ((rr % REACT_CHANCE_DEN) >= rainChance(rule, c, rule.chance)) { continue; }
+    if (probe || (rr % REACT_CHANCE_DEN) >= rainChance(rule, c, rule.chance)) { continue; }
     // ---- FIRED ----
     if (rf < 6u) { coatRelease(c, rf, rule.prodSelf, rr, stamp); }
     if (rule.prodNbr != PROD_KEEP) {
@@ -1432,7 +1434,7 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
 // even where the material did not, and the caller must not move the stale one.
 fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
                m : Material, rnd : u32, synthSelf : bool, coat : u32,
-               covered : bool) -> bool {
+               covered : bool, probe : bool) -> bool {
   var keepAwake = false;
   let stamp = stampFor(T.tick, P.substep);
 
@@ -1481,7 +1483,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       let chance = rainChance(rule, c, scaledChance(rule, c, coat, covered));
       if (chance == 0u) { continue; }
       keepAwake = keepAwake || !lightGated;
-      if ((rr % REACT_CHANCE_DEN) < chance) {
+      if (!probe && (rr % REACT_CHANCE_DEN) < chance) {
         reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
         return true;
       }
@@ -1495,7 +1497,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if (!inBounds(n)) { continue; }
         if (voxMat(voxWordAt(n)) != MAT_AIR) { continue; }
         keepAwake = keepAwake || !lightGated;
-        if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
+        if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
           let ni = voxWordIndex(n);  // resolved only for the cell that is written
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
           markVoxActive(ni);
@@ -1548,7 +1550,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         faceMatched = true;
         // Weather scale here, after the neighbour matched, so a dry-sky tick
         // and a wood cell with nothing hot beside it never pay the probe.
-        if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
+        if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
           if (rule.prodNbr != PROD_KEEP) {
             if (synthFluid) { flagFluidConsume(n); }
             // For a synthesized neighbour ni is the air cell: a product
@@ -1585,7 +1587,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if (flame) { rf = coatReleaseFace(c, dmask, rot, 6u); }
         if (!flame || rf < 6u) {
           keepAwake = keepAwake || !lightGated;
-          if ((rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
+          if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
             if (rf < 6u) { coatRelease(c, rf, rule.prodNbr, rr, stamp); }
             if (rule.prodSelf != PROD_KEEP) {
               reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
@@ -1682,7 +1684,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
 //
 // Returns whether the caller should keep the cell awake.
 fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
-               rnd : u32) -> bool {
+               rnd : u32, probe : bool) -> bool {
   let stainType = matStainType(m);
   let addAmt = matStainAmount(m);
   let washes = matWashes(m);
@@ -1691,7 +1693,7 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
   // Rotate the scan so the stained neighbour is not biased toward -Y. One roll
   // decides WHETHER we stain this tick; the rotation decides WHICH neighbour.
   let rot = rnd >> 7u;
-  let fires = stainFires(m, rnd);
+  let fires = !probe && stainFires(m, rnd);
 
   // This cell's own word, for the absorption debit below. Passed in from main
   // rather than re-read: doReactions returns true (and main returns) whenever
@@ -2698,6 +2700,49 @@ fn windEntrain(c : vec3<i32>, w32 : u32, m : Material, slotIdx : u32) -> bool {
   return tryMove(c, c + vec3<i32>(d.x, 1, d.y), w32, m.density, false);
 }
 
+// ---- THE STAMP GATE MUST NOT EAT A KEEP-AWAKE MARK (rule-unification W2-R) --
+//
+// main's substep gate skips a cell whose stamp equals stampFor(tick, substep).
+// It means "this word was written earlier in THIS substep" (a mover landed here
+// from an earlier colour pass, a product was written here), and for that it is
+// exact. But the field is 3 bits cycling 1..7 (common.wgsl STAMP_CYCLE), so a
+// cell that moved and then SITS STILL keeps a stale stamp that equals the
+// current code once every 7 ticks: at substep 0, 7 ticks after a substep-0
+// write, 4 after a substep-1 one. Movement loses nothing to that (the other
+// substep of the same tick moves the cell). Reactions and staining do: they
+// run on substep 0 only, and their keepAwake mark (DIRTY_R_REACT / _STAIN) is
+// how "matched but did not fire" holds the chunk awake. On the alias tick the
+// cell never got there, and if it was the only mark in its chunk the chunk
+// slept with the reaction pending -- for good, since nothing else would wake
+// it. `stamp-sleep` measured it: 7 of 8 acid voxels dropped onto iron slept on
+// exactly the alias tick and never ate it; W2-J1 met it as 2 of 72 oil levels
+// left unburnt beside live lava (its coatSpend STAMP_NEVER workaround).
+//
+// So a skipped cell, on substep 0, still runs its rules and its staining, with
+// `probe` set (main's `skip`): every predicate, every keepAwake, no roll, no
+// write, then it returns before the movement code. The only thing it can do
+// is OR a reason bit into its OWN chunk. It goes through main's ONE call site
+// of each evaluator rather than a helper of its own: a second call site
+// inlined a second copy of doReactions into main and cost the forest fire
+// 7% of CA time (27.2 -> 29.2 ms/frame, active chunks unchanged).
+//   * Move once per substep / react once per tick: untouched. The cell still
+//     returns; nothing fires twice.
+//   * Genuinely-acted cells: every write that leaves a live stamp (tryMove,
+//     transferLiquid, a product, absorption, coatRelease) already marks the
+//     written cell's chunk for next tick, so the probe cannot change which
+//     chunks are awake -- only add a reason bit to one that already is. Where
+//     it changes membership is exactly the alias.
+//   * Rule 1: reads at reach 1 (the same reads the unskipped evaluation makes,
+//     in the same colour pass), writes nothing but an order-free atomicOr.
+//   * Rule 2: marks only what the unaliased tick would have marked, so it
+//     keeps nothing awake that the fix-free kernel would let sleep on the
+//     other six ticks.
+// Cost: a skipped cell on substep 0 pays its rule walk twice in the tick it
+// arrived (once where it came from, once here); a settled cell 1 tick in 7.
+// Measured on `--perf forestfire` (smoke-heavy, ~4,050 awake chunks, one run
+// each side): CA 27.2 -> 27.9 ms/frame, frame p50 37.5 -> 38.0 ms, awake
+// chunks +0.3%.
+
 @compute @workgroup_size(6, 6, 6)
 fn main(@builtin(workgroup_id) wg : vec3<u32>,
         @builtin(local_invocation_id) lid : vec3<u32>) {
@@ -2768,7 +2813,12 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   }
   gSelfCell = c;
   gSelfIdx = idx;
-  if (voxStamp(w) == stampFor(T.tick, P.substep)) { return; }  // already acted this substep
+  // Already acted this substep -- OR a stale stamp that ALIASES this one ("THE
+  // STAMP GATE MUST NOT EAT A KEEP-AWAKE MARK" above): the gate cannot tell
+  // which, so on substep 0 a skipped cell runs its rules as a PROBE (match,
+  // mark, never fire) and returns after staining; on substep 1 it just returns.
+  let skip = voxStamp(w) == stampFor(T.tick, P.substep);
+  if (skip && P.substep != 0u) { return; }
 
   let m = materials[mat];
 
@@ -2804,7 +2854,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // AN UNSEEN NEIGHBOUR COUNTS AS ATTACHED, the same conservative direction
   // RunIslandDetection's `solidOutside` takes at the residency edge: refuse to
   // move matter on a guess.
-  if (m.klass == CLASS_SOLID && soloSolid(c)) {
+  if (!skip && m.klass == CLASS_SOLID && soloSolid(c)) {
     // Straight down, and only down. Displacement rules still apply, so a chip
     // resting on lava it cannot sink into simply stays — which is support, and
     // reads as such. Failure does NOT markDirty: nothing here may keep a chunk
@@ -2847,7 +2897,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     var wNow = w;
     var coatNow = coat;
     if (coat != 0u) {
-      let cr = coatReact(c, idx, slotIdx, w, mat, m, coat, rnd);
+      let cr = coatReact(c, idx, slotIdx, w, mat, m, coat, rnd, skip);
       if ((cr.x & COAT_GONE) != 0u) { return; }
       covered = (cr.x & COAT_COVERED) != 0u;
       spent = (cr.x & COAT_SPENT) != 0u;
@@ -2855,7 +2905,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       if (!voxStained(wNow)) { coatNow = 0u; }
     }
     if (m.reactCount > 0u &&
-        doReactions(c, idx, slotIdx, wNow, mat, m, rnd, false, coatNow, covered)) {
+        doReactions(c, idx, slotIdx, wNow, mat, m, rnd, false, coatNow, covered, skip)) {
       return;
     }
     if (spent) { return; }
@@ -2866,7 +2916,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // Keeps the chunk awake only while unstained surface remains in reach — see
   // the sleep note on doStaining.
   if (P.substep == 0u && matStains(m)) {
-    if (doStaining(c, idx, w, m, rnd)) { markDirtyR(c, DIRTY_R_STAIN); }
+    if (doStaining(c, idx, w, m, rnd, skip)) { markDirtyR(c, DIRTY_R_STAIN); }
     // Absorption can have emptied this cell (the liquid soaked away) or docked
     // its fullness and stamped it. Re-read before the movement code below acts
     // on a stale word: moving an already-spent eighth would create mass.
@@ -2875,7 +2925,8 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     if (voxStamp(after) == stampFor(T.tick, P.substep)) { return; }
   }
 
-  if (m.klass == CLASS_SOLID) { return; }
+  // A stamp-skipped cell has said whether it has matched work; it does not move.
+  if (skip || m.klass == CLASS_SOLID) { return; }
 
   // Viscosity: thick liquids (lava, molten glass, blood) only move on their
   // tick. On an off-tick the cell stays awake for the tick it MAY move on —

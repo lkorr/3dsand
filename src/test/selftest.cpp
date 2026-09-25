@@ -531,6 +531,10 @@ const char* const kOrder[] = {
     // the weather clear and restores it, regenerates on the way out --
     // rain-fire's reasons, rain-fire's slot.
     "stain-react",
+    // The substep stamp alias vs sleep (rule-unification W2-R): acid shafts
+    // on anchored steel columns at absolute coordinates, weather pinned clear
+    // and restored, regenerates on the way out -- stain-react's reasons.
+    "stamp-sleep",
     // ---- THE WINDOW EDGE AS A SINK (docs/PLAN_gas_particles.md §4) --------
     // Straight after `fire-down`, and for exactly the reasons the three gates
     // above it give. Both of these light no fire, but they do the same KIND of
