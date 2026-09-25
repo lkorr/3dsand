@@ -7466,12 +7466,15 @@ and the aura beyond it is charged and attaches nothing (rule 2). A sustained
 Mod acts on the body as if the body were the delivery: gravity is a per-tick
 impulse the owner applies (`bodyImpulses`), the rest have no meaning on a body
 and were charged for the word. **The impulse reaches ANY body since
-2026-09-22** — `Mob::AddLift` is the mobs' seam, and it is two seams behind one
-name, because "add a velocity" means two different things to a creature: a LIMP
+2026-09-22** — `Mob::AddBodyVelocity` (`AddLift` until W2-L, which also routed
+the caster's own lift through it instead of session.cpp writing `player.vel`)
+is the one seam, and it is several behind one name, because "add a velocity"
+means different things to a creature: a LIMP
 rig belongs to Jolt (an impulse at each live limb's centre of mass, mass × dv,
 so the rig gains one uniform speed and a lift does not spin it) and a LIVE one
-belongs to us (the ballistic state `UpdateFall` integrates, the same one
-`Launch` fills). A lift is not a fall: an UPWARD one holds the `launched_`
+belongs to its DRIVER (`Mob::AddDriverVelocity`: for an NPC the ballistic
+state `UpdateFall` integrates, the same one `Launch` fills; for a player the
+controller's own `Player::vel`). A lift is not a fall: an UPWARD one holds the `launched_`
 latch so the body does not land on the ground it is leaving, and keeps
 `airTime_` at zero so it does not go limp for having been held up past
 `ragdoll.fallSeconds`. A downward one (`heavy aura`) does neither, so it still
@@ -9242,7 +9245,8 @@ compose on sloped ground, which is why flat fixtures never saw any of them:
    slope a quad of two feet and two hands has a normal nothing like the
    ground's, bounded only by "the normal's y is above 0.6" — 53 degrees, in any
    direction including pure roll. That is the "rotated 45 degrees" report, and
-   `PlayerAvatar::UpdateGait` has filtered on the `leg` tag since it was written.
+   the player's gait filtered on the `leg` tag from the day it was written (one
+   gait since W2-L: `Mob::StepGait`, `Mob::IsLegChain`).
 
 What replaced them:
 
@@ -10221,6 +10225,87 @@ consumes it and owns the physics plumbing. Per mob per tick:
    assertion would measure nothing.
 7. **Physics blend / submit** through the existing `MoveKinematicBody` path.
 
+### One pose pipeline (2026-09-24, rule-unification W2-L; `game/pose.h`, `Mob::PosePipeline`, gate `pose-parity`)
+
+**Every creature is posed by ONE function, `Mob::PosePipeline(const
+PoseInputs&, dt, world, tick)`, and both drivers call it.** Until W2-L there
+were two: `MobSystem::UpdateAnimation` + `MobSystem::UpdateGait` for NPCs and
+`PlayerAvatar::UpdateAnimation` + `UpdateGait` for the player, calling the same
+stages in the same order (loco state, sample+blend, springs, spine twist, hit
+reaction, stump drag, flatten, gait, IK, weapon arm, clamp), with the
+loco-state block copied word for word and a ~480-line and a ~390-line gait
+between them. Stages written once on `Mob` were marked "called by both drivers"
+and kept in step by hand; dc7f896 and 214770a are two of the bugs the split
+produced. The pipeline, the one gait (`Mob::StepGait`), the stride clock, the
+airborne pose, the ledge-hang palms, the go-limp rule and the body-velocity
+router live in `game/pose.cpp` now.
+
+**A driver's job is to fill in `PoseInputs` and add its own genuine extras.**
+The inputs are the facts only a driver has:
+
+| field | the player (`PlayerAvatar::AvatarPoseInputs`) | an NPC (`MobSystem::UpdateAnimation`) |
+|---|---|---|
+| `velocity` | `player.vel - player.slideVel` (the controller runs per FRAME; differencing the origin over `kTickDt` measured the wrong interval) | the origin's own travel over the tick (it moves itself once per tick, so the difference is exact); `y` = `fallVel_` while airborne |
+| `grounded` | the gait's coyote-debounced support | `!airborne_` (does not flicker) |
+| `airPoseEligible` | not hanging / mantling / swimming / flying | `airborne_` (lunge, blast, lift, ledge) |
+| `height` | `FromDriver` — the AABB is the truth | `FromFeet` — the foot average, bounded by the footprint's ground, eased |
+| `tiltFromGround` | false (the avatar has never leaned into a grade) | true (the four-probe grade) |
+| look target | the camera's head-look goal (`SetLook`) | none (`ApplyStrikeAim` looks at `aimLook_`) |
+| aim target | `strikeAim` on (a no-op without an Aim effector) | `strikeAim` on |
+| extras | held crouch, ledge-hang lip | `chaseWant` |
+
+What stays per driver is the part that is genuinely per driver: the player's
+clip family (idle/walk/run/jump/land/fall/hang, the stride-locked clip rate,
+the flail ramp), its air clock and landing edges, fall damage off
+`Player::impactDeltaV`; the NPC's sense/intent/steer/drive and the stroke.
+
+**Which drift was resolved which way.** The player's copy is the base: every
+one of its departures from the NPC copy was a measured bug fix, so the NPCs
+adopted them and the player's pose did not move (the mob gate's avatar lines are
+byte-identical before and after, and `pose-parity` asserts the two drivers now
+produce the same pose from the same inputs):
+
+- *Velocity smoothing* — the player's half-life (`avatar.velocityHalflife`,
+  0.08 s), not the NPC's per-call `0.7/0.3` blend, whose time constant scales
+  with how many ticks fire (0.065 s at the NPC's fixed 30 Hz).
+- *Stride clock* — foot-synced for every rig with legs (above).
+- *Swing* — the stride-budget bound (`kSwingTravelFrac`), the mid-swing
+  re-target and the landing ease; the NPC's flat `stepDuration` swing lost
+  ground every step at two voxels a tick, the same negative budget the player
+  had, and `ai-slope` had found it as a foot welded to the bottom of a hill.
+- *Foot target* — the rest foot anchor plus a velocity lead CLAMPED to 0.9 of
+  the leg (the NPC's unclamped `strideBias·legLength·speedFactor + vel·lead`
+  sat 6.0 voxels ahead at a human's walk against a 6.1 reach), aimed at the
+  ANKLE (`ground + restSoleY_ + footTrim`). The feet-derived height subtracts
+  that rise again, so an NPC stands exactly where it stood.
+- *Leg IK* — faded on `avatar.ikBlendHalflife` with the stale-plant ghost guard;
+  the NPC's switched on `!airborne_` as a bool.
+- *Pelvis bob* — gated on `grounded` (the NPC's bobbed through a fall).
+- *Airborne pose and head look* — available to every creature: an NPC in the
+  air (lunge, blast, lift, ledge) now tucks, reaches and prepares to land like
+  the player; any driver that has a look target can hand it in.
+- *Kept from the NPC copy* — group step awards (a quadruped trot is a diagonal
+  PAIR stepping together; identical for a biped), the legacy "no chain is
+  tagged `leg`" fallback (`Mob::IsLegChain`, now one predicate for the gait,
+  the stride clock, the IK and the air scissor), the feet-derived height and
+  the ground tilt (as inputs), and the data-gated NPC stages (chase clip,
+  legacy `swingAmp` layer, flipbooks — no player def authors any of them).
+- *Foot probe start* — 0.20 m above the sole (`kFootProbeLift`), which is the
+  player's historical 2 cells written in metres; the NPC's was 0.30 m.
+  `GroundHeightAt` climbs out of matter it starts inside, so a step is found
+  from either; the lower start only differs under an overhang three cells up.
+
+**One go-limp rule and one body velocity.** `Mob::ShouldGoLimp(airTime,
+LimpExemptions{fly, hanging, blindFall})` is the fall-to-ragdoll rule both
+drivers read (the NPC copy had no exemptions to state and handed the limbs
+`{0, fallVel_, 0}`, dropping the planar half of a lunge or a blast on the tick
+it went limp). `Mob::BodyVelocity` / `AddBodyVelocity` route to whichever
+integrator owns the body — Jolt when limp, else the driver's
+(`AddDriverVelocity`: the NPC's ballistic state, the player's `Player::vel`
+through `PlayerAvatar::BindPlayer`). `AddLift` is gone, and so is session.cpp
+writing `player.vel.y` for the caster's own `float aura` — which now also lifts
+a LIMP player, whose controller is not integrating.
+
 **Gait** is the base layer and needs no per-gait table. Each leg's ideal
 contact is `hip + fwd·strideBias + vel·leadTime`, snapped down through
 `GroundHeightAt`; a foot unplants when it has drifted past
@@ -10239,8 +10324,11 @@ swing phase and never fired at all on a two-legged rig. Pelvis bob runs at 2× s
 frequency (one rise per footfall), sway/roll at 1×, plus spine
 counter-rotation and a progressive phase lag per hierarchy level.
 
-**The avatar's gait differs from a mob's in three ways**, all forced by the
-fact that the *player* owns the body rather than the gait:
+**Two height policies, and they are an INPUT, not a driver** (since W2-L,
+`PoseInputs::Height`). A body whose height a driver already knows (the
+player: `Height::FromDriver`) differs from one whose height the feet derive (an
+NPC: `Height::FromFeet`) in three ways, all forced by the fact that the
+*player* owns the body rather than the gait:
 
 - **Body height comes from the player**, not from the foot average — the AABB
   has already resolved against the terrain, and re-deriving height from feet
@@ -10281,23 +10369,27 @@ fact that the *player* owns the body rather than the gait:
 
 **One stride clock.** `gaitPhase` on the avatar is driven **by the feet**: the
 rate is the measured period between touchdowns and the phase is pulled onto a
-half-turn boundary at each one (`PlayerAvatar::SyncStrideClock`). The feet step
+half-turn boundary at each one (`Mob::SyncStrideClock`). The feet step
 on a *drift threshold* while the bob/sway ran off `cadence × speedFactor` — two
 clocks that disagreed by ~2.6× on the stock human, which at a 30 Hz tick is a
 bob under four samples per cycle and reads on screen as a fast lateral jitter.
 It cannot be tuned out, because the ratio itself moves with speed. With one
 clock, `bobFreqMul 2` means "once per footfall" *by construction*. The walk/run
 clips ride the same rate through `ClipInstance::rate`, so the arms stay locked
-to the feet at speeds between the two authored clip periods. The NPC path
-deliberately keeps the free oscillator — its swing is a flat `stepDuration` at
-mob speeds, where the mismatch is small — and rigs with no leg chains
-(`dummy.json`) keep it because they have no foot to lock to.
+to the feet at speeds between the two authored clip periods. **Every creature
+runs it since W2-L.** The NPC path kept the free oscillator on purpose while its
+swing was a flat `stepDuration` (the mismatch was small at mob speeds), with a
+note that whoever unified the two should port the sync, not the oscillator;
+once the NPCs took the stride-budget swing too the two clocks would have
+disagreed on them exactly as they did on the player, so the sync is what they
+got. Rigs with no leg chains (`dummy.json`) keep the oscillator because they
+have no foot to lock to.
 
 **The gait keeps its footing across a lost tick, and needs more slack than the
 clips do.** `Player::grounded` is a 0.1-voxel positional probe, so on microvoxel
 terrain it drops false constantly — cresting a bump, stepping down a voxel (a
 genuine ~0.14 s of air at walk pace, longer than `avatar.airDebounce`). Losing
-the gait for even one tick is not a subtle artifact: `UpdateAirPose` clears
+the gait for even one tick is not a subtle artifact: `Mob::ParkGaitForAir` clears
 `footInit_`, so both feet re-plant from scratch, and `gaitWeight_` fades the leg
 IK out to the rest hang — the legs snap to standing in the middle of a stride,
 over and over. So the gait runs on its own coyote window (`kGaitCoyoteSeconds`),
@@ -10379,11 +10471,11 @@ real carving, its burn flush never rebuilt the collider, its bleeding lacked
 the variance profile and drip spray).
 
 What the avatar does differently is confined to two seams. The DRIVER:
-`PlayerAvatar::PreTick` takes position and facing from `Player` (plus its own
-gait, ledge-hang arm IK, weapon-arm pose, footfall events, and the ANGLES for
-its head look — the look itself is `Mob::ApplyAimPart`, which lives on the base
-class because a creature pointing its jaws at your throat is the same
-operation) where
+`PlayerAvatar::PreTick` takes position and facing from `Player` and fills the
+`PoseInputs` of the one pose pipeline (the player's velocity and support, a
+driver-owned height, the head-look ANGLES, the held crouch and the ledge-hang
+lip — see "One pose pipeline"; the gait, the IK, the look and the weapon arm are
+`Mob::PosePipeline`'s, shared with every NPC since W2-L) where
 `MobSystem::PreTick` runs the AI stages — everything else in the two PreTicks
 is the same `Mob` upkeep calls. And the EXPLICIT-EXCEPTION virtuals on `Mob`:
 `AvatarLayer()` (limbs ride the AVATAR physics layer), `OnBodyReleasedToWorld`

@@ -518,6 +518,9 @@ add_library(sandvox_core OBJECT
   src/game/persist.cpp
   src/game/anim.cpp
   src/game/avatar.cpp
+  # ONE POSE PIPELINE for NPCs and the player (game/pose.h, W2-L):
+  # Mob::PosePipeline, the one gait, the air pose, the go-limp rule.
+  src/game/pose.cpp
   src/game/thirdperson.cpp
   src/game/spell.cpp
   src/game/spellgraph.cpp
@@ -571,6 +574,8 @@ add_library(sandvox_core OBJECT
   src/test/selftest_vessel.cpp
   src/test/selftest_swing.cpp
   src/test/selftest_combat.cpp
+  # One pose pipeline, whoever drives the body (W2-L): pose-parity.
+  src/test/selftest_pose.cpp
   src/test/selftest_equipment.cpp
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp

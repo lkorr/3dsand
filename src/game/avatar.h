@@ -25,8 +25,11 @@
 // What this class adds is the DRIVER and the player-only surface:
 //   - position and facing come from Player (input + the voxel sweeps in
 //     player.cpp), not from MobSystem's sense/steer/drive AI;
-//   - its own animation pass (gait tuned for a player-driven body, ledge-hang
-//     arm IK, head look, weapon-arm IK, footfall events);
+//   - the INPUTS to the one pose pipeline every creature runs (Mob::
+//     PosePipeline, game/pose.h): the player's velocity and debounced support,
+//     a driver-owned height, the camera's head-look goal, the held crouch and
+//     the ledge-hang lip — plus the player-only clip family (jump/land/fall/
+//     hang) and footfall events;
 //   - the health API the caster VM spends (TotalHealth/SpendHealth);
 //   - fall/impact damage driven by Player::impactDeltaV;
 //   - first-person part hiding, camera transforms, persistence ('AVTR').
@@ -67,33 +70,8 @@ struct AvatarLocoClips {
   int idle = -1, walk = -1, run = -1, fall = -1, hang = -1;
 };
 
-// ONE SHAPE OF THE AIRBORNE POSE (avatar.cpp's kAirTuck / kAirFloat / kAirReach
-// / kAirPrepare, and the blend of them the current `vel.y` asks for).
-//
-// Authored in LEG LENGTHS and ARM REACHES, never in voxels or metres, so one
-// table poses any rig — the same argument the gait's leg-length thresholds are
-// written down under in sim/scale.h. Foot offsets are relative to that leg's own
-// hip, hand offsets to that arm's own shoulder, in prefab space tilted by the
-// body's lean: +Y up, +Z forward, `Out` away from the midline on that limb's
-// side. See the table in avatar.cpp for what each shape is and why.
-struct AvatarAirKey {
-  float footDown = 0.95f;  // below the hip
-  float footFwd = 0;       // fore/aft; SIGNED per leg by the scissor split
-  float footLead = 0;      // ...and the part BOTH feet share (a landing)
-  float footOut = 0;       // lateral splay, outward
-  // ---- THE ARMS ARE JOINT ANGLES, NOT A HAND TARGET ----------------------
-  // Radians, applied at the joints the rig already authors limits for:
-  // `armPitch` +/- `armSwing` swings the whole arm fore and aft at the
-  // shoulder (positive = forward), `armOut` abducts it away from the midline,
-  // `armFlex` bends the elbow. Unlike the legs these are NOT solved as IK —
-  // see the note at the key table in avatar.cpp for why an off-plane hand
-  // target leaves a hinged elbow pointing somewhere nobody asked for.
-  float armPitch = 0;
-  float armSwing = 0;  // signed OPPOSITE this arm's own leg
-  float armOut = 0;
-  float armFlex = 0;
-  float lean = 0;  // radians of forward torso pitch this shape carries
-};
+// ONE SHAPE OF THE AIRBORNE POSE is game/pose.h AirKeyPose (AvatarAirKey is
+// its alias), since every creature runs the air pose (W2-L).
 
 // What the avatar wants the rest of the game to do about its current state.
 // Movement and camera read this instead of querying part liveness themselves,
@@ -209,6 +187,11 @@ class PlayerAvatar : public Mob {
   // camera pitch, radians, positive up. Both are CLAMPED here against the
   // neck limits in tuning.json rather than trusted.
   void SetLook(float yawRel, float pitch);
+  // The controller this body is driven by. Mob::AddBodyVelocity on a live
+  // player-driven body writes Player::vel through it (a `float aura` on the
+  // caster), and Mob::BodyVelocity reads it (the go-limp velocity). The owner
+  // binds it once; it must outlive the avatar or be rebound to null.
+  void BindPlayer(Player* p) { player_ = p; }
 
   // ---- footfall events (presentation only) --------------------------------
   // `Footfall`, `Footfalls()` and `ClearFootfalls()` are inherited from Mob:
@@ -407,8 +390,7 @@ class PlayerAvatar : public Mob {
                : -1;
   }
   int ActiveClips() const { return (int)anim_.clips.size(); }
-  // Measured planar speed in world voxels/sec (presentation/diagnostics only).
-  float SpeedNow() const { return speedNow_; }
+  // (SpeedNow is Mob's: the pose pipeline's smoothed planar speed.)
   // The AUTHORED model-space pose, before it is handed to Jolt. Comparing this
   // against PartWorldTransform (which reads back what the solver did) is how
   // you tell an animation bug from physics fighting the animation.
@@ -426,29 +408,12 @@ class PlayerAvatar : public Mob {
     return skel_.clips[c].name.c_str();
   }
   int LocoState() const { return anim_.locoState; }
-  // ---- stride clock readouts (diagnostics and the mob gate) ----------------
-  // The pelvis bob/sway and the arm clips run off THIS phase, and the feet are
-  // what advance it. Counting its cycles against the footfalls is the only way
-  // to assert the two clocks are one — a bob at 2.6x the footfall rate looks
-  // fine in every per-part pose measure and is exactly the reported jitter.
-  float GaitPhase() const { return anim_.gaitPhase; }
-  float StrideRate() const { return strideRate_; }   // strides/sec, 0 = parked
-  // How far the pelvis is dropped below the player's AABB sole, world voxels.
-  float StanceCrouch() const { return stanceCrouch_; }
-  // The held (Ctrl) crouch's pelvis drop, world voxels; 0 when standing.
-  float CrouchHold() const { return crouchHold_; }
-  // How far the velocity-driven airborne pose is driving the body, 0..1 — the
-  // successor to "is the fall clip active" for every question about whether the
-  // rig thinks it is in the air. The mob gate's bumpy-climb pass asserts on it
-  // for that reason: with avatar.airPose on, the jump/fall CLIPS never start at
-  // all, so a check phrased against them would be green by construction.
-  float AirPoseWeight() const { return airFrac_; }
-  // Signed vertical speed the air pose is posing from, world voxels/s.
-  float AirPoseVy() const { return airVy_; }
-  // How far into the LANDING REACH the ground probe says the body is, 0..1.
-  // Separate from the weight above because they answer different questions:
-  // one is "is the rig in the air", this is "is it about to stop being".
-  float AirPoseLand() const { return airLandW_; }
+  // ---- stride clock / crouch / air-pose readouts ---------------------------
+  // GaitPhase, StrideRate, StanceCrouch, CrouchHold, AirPoseWeight, AirPoseVy
+  // and AirPoseLand are Mob's now (game/pose.h PoseDrive): every creature runs
+  // the stages that produce them. The bob/sway and the arm clips run off the
+  // phase and the feet advance it, so counting its cycles against footfalls
+  // is how the mob gate asserts the two clocks are one.
   // Requested weight of the named clip's live instance, or 0 if not running.
   // The fall flail is a RAMP now, so "is the fall clip active" is no longer the
   // question — "how far in is it" is.
@@ -499,34 +464,18 @@ class PlayerAvatar : public Mob {
   // Called once from Die(), before the rig comes apart (SetDyingObserver).
   std::function<void()> onDying_;
 
-  // ---- the PLAYER DRIVER's animation pass ----------------------------------
-  // These are the avatar's own: a player-driven body needs its gait fed by
-  // the player's true velocity and grounded state, ledge-hang arm IK, head
-  // look and the weapon arm. The MECHANICS underneath (clips, IK solver,
-  // springs, dismemberment states) are the shared anim runtime.
-  // `tick` reaches these for one reason only: the gait's PLANT runs
-  // Mob::ShedCoat, whose roll is tick-keyed like every other RNG here. The
-  // pose is still a pure function of dt.
-  void UpdateAnimation(float dt, World& world, bool grounded,
-                       const Vec3& playerVel, uint32_t tick);
-  void UpdateGait(float dt, World& world, uint32_t tick);
-  // Airborne leg pose: relaxes the legs toward their rest hang instead of
-  // leaving IK chasing a stale world-space foot plant.
-  void UpdateAirPose(float dt);
-  // ---- the airborne pose, as a function of vel.y (avatar.airPose) ----------
-  // Advance airFrac_/airVy_/airLandW_ and resolve the shape the current phase
-  // asks for. Runs BEFORE the flatten (the lean is a spine rotation and the
-  // children have to inherit it); the IK pass after the flatten then reads
-  // airKey_ back. `world` is only touched for the landing probe.
-  void UpdateAirDrive(float dt, World& world, bool grounded, bool clipOwnsPose,
-                      const Vec3& playerVel);
-  // Swing the arms into airKey_. Composed onto the LOCAL pose before the
-  // flatten, at the shoulder and elbow, because those are the joints the rig
-  // states its limits about — see the key table's note on the hinged elbow.
-  void ApplyAirArms(const AnimSkeleton& sk, AnimState& st);
-  // Lock the pelvis/arm clock onto a foot touchdown on leg chain `chain`.
-  // The ONLY writer of strideRate_ and of anim_.gaitPhase's correction term.
-  void SyncStrideClock(int chain);
+  // ---- the PLAYER DRIVER's half of the pose (W2-L) -------------------------
+  // The pipeline itself is Mob::PosePipeline (game/pose.cpp), shared with
+  // every NPC. What stays here is FILLING ITS INPUTS: the player's true
+  // velocity and debounced support, the head-look goal, the held crouch and
+  // the ledge-hang lip — everything a PoseInputs field names and only the
+  // player knows.
+  PoseInputs AvatarPoseInputs(bool grounded, const Vec3& playerVel) const;
+  // THE LIVE HALF OF Mob::AddBodyVelocity / BodyVelocity for a player-driven
+  // body: the controller's own velocity. Bound by the owner (BindPlayer); an
+  // unbound avatar (a harness that never runs the controller) has none.
+  Vec3 DriverVelocity() const override;
+  void AddDriverVelocity(Vec3 velVoxPerSec) override;
   void ResolveParts();
   // Per-voxel burning under the avatar's PRIVATE budget — a crowd of burning
   // NPCs must not starve the fire on the player character.
@@ -542,55 +491,25 @@ class PlayerAvatar : public Mob {
   bool instancesDirty_ = false;
 
   bool footfallInit_ = false;
-  // How strongly the leg IK is applied, 0..1. Eased rather than switched: on
-  // bumpy ground `grounded` is genuinely ragged, and gating the IK on it as a
-  // bool made the legs and arms snap between the IK pose and the rest hang on
-  // every bump. See the note in UpdateAnimation.
-  // ...and since the AIR POSE drives the same chains, this is now "the legs are
-  // IK-driven", not "the gait is running": it stays at 1 straight through a
-  // take-off, and it is the TARGET that crossfades from the last foot plant to
-  // the air pose (airFrac_ below). Fading the two solves against each other
-  // instead would leave a window mid-jump where neither owned the legs and the
-  // rest hang showed through — the exact snap this weight exists to remove.
-  float gaitWeight_ = 0.0f;
+  // (The IK fade, gaitWeight, is Mob::pose_ now — every creature fades it.)
   bool wasGrounded_ = true;
-  // ---- the velocity-driven airborne pose (avatar.airPose) -----------------
-  // How much of the pose the air shapes own: 1 while airborne, faded on
-  // ikBlendHalflife. For the LEGS it blends the IK target away from the stale
-  // foot plant; for the ARMS, which nothing else IKs, it is the solve weight.
-  float airFrac_ = 0.0f;
-  // Vertical velocity, world voxels/s, lightly smoothed — THE phase of the air
-  // pose. Smoothed for the same reason the planar velocity is (UpdateAnimation
-  // runs 0..4 times a frame off a once-per-frame controller), but only just:
-  // the launch spike is the most expressive part of a jump and must survive.
-  float airVy_ = 0.0f;
-  // How far into the landing reach the ground probe says we are, 0..1, eased.
-  // Eased because the probe can lose the ground outright (a chunk the CPU
-  // mirror has not streamed) and the legs must not snap back when it does.
-  float airLandW_ = 0.0f;
-  // The lean, radians, recomputed per tick and consumed twice: once as a spine
-  // rotation before the flatten, once as the frame the IK offsets are taken in
-  // so the limbs lean WITH the body rather than about a fixed vertical.
-  float airLeanPitch_ = 0.0f, airLeanRoll_ = 0.0f;
-  // The blended shape the current phase asks for, resolved once per tick by
-  // UpdateAirDrive and consumed by ApplyAirPose after the flatten.
-  AvatarAirKey airKey_;
+  // (The airborne pose's state is Mob::pose_ — every creature runs it.)
   // Mirrored out of Player: the states that are airborne by the gait's reckoning
   // but must NOT play a jump/fall pose — a hang and a mantle are held by the
   // hands, a swimmer is carried by the water, and fly mode is not falling at
-  // all. UpdateAnimation's signature stays player-free, so this comes across
+  // all. The pipeline reads PoseInputs, not Player, so this comes across
   // the same way hangActive_ does.
   bool airPoseEligible_ = false;
   // Was the support a LEDGE HANG last tick? Losing that support must not fire
   // the "jump" clip — the arms are already up in the hang pose.
   bool wasHanging_ = false;
   // ---- ledge-hang arm IK ----
-  // Mirrored out of Player each PreTick so UpdateAnimation (whose signature
+  // Mirrored out of Player each PreTick so the pipeline (whose inputs
   // deliberately stays player-free) can pin the palms to the held lip.
   bool hangActive_ = false;
   IVec3 hangLipW_{};        // the held lip voxel, world
   Vec3 hangDirW_{1, 0, 0};  // horizontal facing at grab time, toward the wall
-  float hangIkWeight_ = 0.0f;  // faded like gaitWeight_, never a hard switch
+
   // Seconds spent continuously off the ground; debounces the flickering
   // `grounded` bit so air-state clips fire once per real takeoff.
   float airOffTime_ = 0.0f;
@@ -609,32 +528,17 @@ class PlayerAvatar : public Mob {
   // alone answers it wrong for every step-down.
   float supportY_ = 0.0f;
 
-  // ---- the stride clock (PlayerAvatar::SyncStrideClock) --------------------
-  // The pelvis bob/sway/roll and the walk/run arm clips are driven from the
-  // FEET, not from a free-running oscillator. These are its whole state:
-  // seconds since the last touchdown, the smoothed step period it measures,
-  // the stride rate derived from that (strides/sec, 0 = not walking) and which
-  // leg landed last.
-  float sinceTouchdown_ = 0.0f;
-  float stepPeriod_ = 0.0f;
-  float strideRate_ = 0.0f;
-  int lastFootDown_ = -1;
-  // How far the pelvis is dropped below the player's AABB sole, world voxels.
-  // Derived from the rig and the current speed — this is the reach the stride
-  // is spent out of. See the stance note in UpdateGait.
-  float stanceCrouch_ = 0.0f;
-  // The HELD crouch (Ctrl): Player::crouching mirrored in each PreTick, and
-  // the eased pelvis drop it drives, world voxels. Kept apart from
-  // stanceCrouch_ on purpose — that is the gait's own reach budget, oscillates
-  // per step and is what the mob gate measures; this is a pose the player
-  // asked for. Both subtract from bodyY_, and because the leg IK targets are
-  // world points the drop lands in the knees with the feet where they were.
+  // (The stride clock and the stance/held crouch are Mob::pose_ — see
+  // Mob::SyncStrideClock. `crouchWant_` below is the player's REQUEST, mirrored
+  // from Player::crouching into PoseInputs::crouch.)
   bool crouchWant_ = false;
-  float crouchHold_ = 0.0f;
 
-  // Head look: the goal set by SetLook, and the smoothed value the rig is
-  // actually posed at. Two of them so the head EASES onto the mouse rather
-  // than stepping with it — the same reason the body yaw has a half-life.
+  // Head look: the GOAL set by SetLook (the avatar's release-band policy).
+  // The smoothed angles the rig is actually posed at are Mob::pose_'s, eased
+  // inside the pipeline so the head EASES onto the mouse.
   float lookYawGoal_ = 0, lookPitchGoal_ = 0;
-  float lookYaw_ = 0, lookPitch_ = 0;
+  // The controller whose velocity this body's live integrator IS (BindPlayer),
+  // and the velocity PreTick last saw, for an avatar nobody bound.
+  Player* player_ = nullptr;
+  Vec3 playerVel_{};
 };

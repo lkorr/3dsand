@@ -69,6 +69,8 @@ const std::vector<Gate>& ImpactGates();
 // though kOrder splits them to opposite ends of the run: the registry is a
 // pool of every gate a TU offers and the ORDER is kOrder's business alone.
 const std::vector<Gate>& CombatGates();
+// One pose pipeline, whoever drives the body (W2-L, selftest_pose.cpp).
+const std::vector<Gate>& PoseGates();
 // The network layer (src/net/*). CPU-only: no world, no GPU, no assets.
 const std::vector<Gate>& NetGates();
 
@@ -861,6 +863,11 @@ const char* const kOrder[] = {
     // arms touch no world at all, and its one live arm spawns a creature,
     // hurts it, lets it run and resets mobs + debris on the way out.
     "ai-rules",
+    // ...and one pose pipeline, whoever drives the body (W2-L), by the same
+    // append rule: it spawns an NPC and an avatar, poses both through
+    // Mob::PosePipeline only (no PreTick, no Jolt step), and resets mobs +
+    // debris and regenerates worldgen on the way out.
+    "pose-parity",
     // ---- THE SNAPSHOT LATENCY IS A CONSTANT (PLAN_multiplayer_now N1) ----
     // As late as it can go, by the rule the `floaters` block above spells out.
     // It regenerates worldgen three times (once per pacing arm and once on the
@@ -891,7 +898,7 @@ const std::vector<Gate>& Registry() {
                           &SpellGates(), &PlayerKitGates(), &VesselGates(), &GrimoireGates(), &SpellGraphGates(),
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
-                          &CombatGates(),
+                          &CombatGates(), &PoseGates(),
                           &NetGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 

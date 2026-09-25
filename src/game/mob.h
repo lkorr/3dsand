@@ -10,6 +10,7 @@
 
 #include "game/ai_behavior.h"
 #include "game/anim.h"
+#include "game/pose.h"     // PoseInputs / PoseDrive: the one pose pipeline (W2-L)
 #include "game/equipment.h"
 #include "game/impact.h"    // StrikeProfile / StrikeEffectorMode: what a blow IS
 #include "game/melee.h"     // WeaponPose: the stroke driver's command to the rig
@@ -1765,6 +1766,16 @@ class Mob {
   MobSystem* Sys() const { return sys_; }
   Vec3 Origin() const { return origin_; }
   float BodyY() const { return bodyY_; }
+  // WHAT A DRIVER DOES BEFORE Mob::PosePipeline: say where the collider stands
+  // and which way it faces. The drivers own these (the player's controller,
+  // the NPC's drive and steer); the `pose-parity` gate drives two bodies
+  // through the pipeline with it and nothing else.
+  void SetDriverPlacement(Vec3 origin, float heading) {
+    origin_ = origin;
+    heading_ = heading;
+  }
+  // The model-space pose the pipeline left (stage 4-6 output).
+  const std::vector<Transform>& ModelPose() const { return anim_.model; }
 
   // ---- WHAT MIND DRIVES THIS BODY (W2-K, "one creature list") --------------
   //
@@ -2639,27 +2650,62 @@ class Mob {
   // ground" branch zeroing the very velocity that put the body there.
   void Launch(Vec3 vel);
   bool Launched() const { return launched_; }
-  // ---- A SUSTAINED LIFT: what `float aura` does to a body that is NOT the
-  // caster (spell.h `SpellBodyImpulse`, 2026-09-22) ------------------------
+  // ---- ONE BODY VELOCITY, ROUTED TO WHOEVER OWNS THE BODY (W2-L) ---------
   //
-  // `vps` is the per-tick velocity change the status asks for, world
-  // voxels/sec, exactly the number the player's own controller adds to
-  // `player.vel`. The owner routes it here because the spell VM cannot reach a
-  // body (spell.h thesis 4) and because "add a velocity" means two different
-  // things to this class:
+  // "Add a velocity to this body" meant three different things and every
+  // caller picked one by hand — which is why `AddLift` existed, and why
+  // session.cpp wrote `player.vel.y +=` itself for the player's own `float
+  // aura`:
   //
-  //   LIMP  the rig is Jolt's, so it is an impulse at each live limb's centre
-  //         of mass (mass x dv, so every limb gains the same speed and the
-  //         joints are not yanked; at the COM, so a lift does not spin it).
-  //   LIVE  the rig is ours, so it goes into the ballistic state `UpdateFall`
-  //         integrates - the same one `Launch` fills.
+  //   LIMP    the rig is Jolt's: an impulse at each live limb's centre of mass
+  //           (mass x dv, so every limb gains the same speed and the joints are
+  //           not yanked; at the COM, so a lift does not spin it).
+  //   LIVE    the rig is the DRIVER's (AddDriverVelocity): for an NPC the
+  //           ballistic state `UpdateFall` integrates (the one `Launch` fills);
+  //           for a player the controller's own `Player::vel`.
   //
-  // A LIFT IS NOT A FALL, and that is the whole reason this is not `Launch`:
-  // it must not land the body on the ground it is rising off (the `launched_`
-  // latch) and it must not go limp after `ragdoll.fallSeconds` of being held
-  // up (`airTime_`). Both are reset only for an UPWARD lift, so `heavy aura`
-  // still drives a body down onto the floor and stops there.
-  void AddLift(Vec3 velVoxPerSec);
+  // A LIFT IS NOT A FALL: an upward push resets the NPC's `launched_` latch and
+  // air clock, so `float aura` neither lands the body on the ground it is
+  // leaving nor lets it go limp for being held up, while `heavy aura` still
+  // drives it down onto the floor. `BodyVelocity` reads from the same owner.
+  void AddBodyVelocity(Vec3 velVoxPerSec);
+  Vec3 BodyVelocity() const;
+  // ---- ONE GO-LIMP RULE (W2-L) -------------------------------------------
+  // Long enough in the air to go limp (ragdoll.fallSeconds) unless the body is
+  // not actually falling: fly mode, a ledge hang, or a blind fall the
+  // controller is holding. The air clock is the DRIVER's (the NPC ballistic
+  // `airTime_`; the avatar's debounced one), so it is an argument.
+  struct LimpExemptions {
+    bool fly = false;
+    bool hanging = false;
+    bool blindFall = false;
+  };
+  bool ShouldGoLimp(float airTime, const LimpExemptions& ex) const;
+  // StartRagdoll("fall") with the limbs carrying the body's WHOLE velocity
+  // (BodyVelocity): the NPC copy of this line dropped the planar half.
+  void GoLimpFromFall();
+  // ---- THE POSE PIPELINE (game/pose.h, game/pose.cpp; W2-L) ---------------
+  // One per tick per posed creature, BOTH drivers: the NPC loop
+  // (MobSystem::UpdateAnimation) and the player (PlayerAvatar::PreTick) fill a
+  // PoseInputs and call this. Leaves the model-space pose in anim_.model and
+  // the drawn height/tilt in bodyY_/bodyUp_. Pure presentation; `tick` reaches
+  // it only for the gait plant's Mob::ShedCoat roll.
+  void PosePipeline(const PoseInputs& in, float dt, World& world,
+                    uint32_t tick);
+  const PoseDrive& Pose() const { return pose_; }
+  // ---- readouts of the pipeline's own state (the gates, the overlay) -----
+  float GaitPhase() const { return anim_.gaitPhase; }
+  float StrideRate() const { return pose_.strideRate; }   // strides/sec
+  float StanceCrouch() const { return pose_.stanceCrouch; }
+  float CrouchHold() const { return pose_.crouchHold; }
+  // How far the velocity-driven airborne pose is driving the body, 0..1 — the
+  // successor to "is the fall clip active". With avatar.airPose on the jump/
+  // fall CLIPS never start at all, so a check phrased against them would be
+  // green by construction.
+  float AirPoseWeight() const { return pose_.airFrac; }
+  float AirPoseVy() const { return pose_.airVy; }
+  float AirPoseLand() const { return pose_.airLandW; }
+  float SpeedNow() const { return speedNow_; }
   Vec3 AirVelocity() const { return airVel_; }
   // Off the ground at all — walked off a ledge, blasted, or lunging. Public so
   // the `lunge` gate can state "it left the ground" as the fact it is rather
@@ -3253,6 +3299,25 @@ class Mob {
   // WeaponArmDiag::clampMove, the one piece of attribution that cannot be
   // collected inside ApplyWeaponArm because the clamp has not run yet.
   void RecordWeaponClamp(const AnimSkeleton& sk, const AnimState& st) const;
+
+  // ---- THE POSE PIPELINE'S STAGES (game/pose.cpp) ---------------------------
+  // One gait solver (StepGait) for every creature; the rest are the stages
+  // PosePipeline runs in order. See the notes at the definitions.
+  static bool IsLegChain(const AnimSkeleton& sk, size_t chain);
+  void StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick);
+  void SyncStrideClock(int chain);
+  void ParkGaitForAir(const PoseInputs& in, float dt);
+  void UpdateAirDrive(const PoseInputs& in, float dt, World& world,
+                      bool clipOwnsPose);
+  void ApplyAirLean(const AnimSkeleton& sk, AnimState& st);
+  void ApplyAirArms(const AnimSkeleton& sk, AnimState& st);
+  void ApplyHangArms(const PoseInputs& in, float dt, const AnimSkeleton& sk,
+                     AnimState& st);
+  // The LIVE half of AddBodyVelocity / BodyVelocity: whichever integrator the
+  // DRIVER runs. An NPC's is its ballistic state; the avatar overrides both to
+  // reach Player::vel.
+  virtual Vec3 DriverVelocity() const;
+  virtual void AddDriverVelocity(Vec3 velVoxPerSec);
 
   // ---- THE EXPLICIT-EXCEPTION SEAM ------------------------------------------
   // Everything the avatar does differently from an NPC goes through one of
@@ -4183,6 +4248,10 @@ class Mob {
   // consumed the entire reach reserve and the IK sat on its clamp.
   float restFootAhead_ = 0;
   bool footInit_ = false;
+  // The pose pipeline's state between ticks (game/pose.h PoseDrive): the IK
+  // fade, the airborne pose, the stride clock, the crouches, the smoothed
+  // head look. Every creature's, since every creature runs the pipeline.
+  PoseDrive pose_;
   // Touchdowns since the consumer last drained (see Footfall). Capped, so an
   // NPC nobody listens to costs eight entries and never more.
   std::vector<Footfall> footfalls_;
@@ -6380,8 +6449,6 @@ class MobSystem {
   // still a pure function of dt.
   void UpdateAnimation(Mob& mob, const MobDef& def, World& world, float dt,
                        uint32_t tick);
-  void UpdateGait(Mob& mob, const MobDef& def, World& world, float dt,
-                  uint32_t tick);
   // Ease the DRAWN body height (Mob::bodyY_) toward `targetY`: a rate in
   // metres per second AND a hard bound on the lag. See the long note at the
   // definition for why the bound is the load-bearing half.

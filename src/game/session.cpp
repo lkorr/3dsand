@@ -2413,6 +2413,8 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           }
           avatar.SetLook(lookRel, lookPitch);
         }
+        // The body's live velocity IS this controller's (Mob::BodyVelocity).
+        avatar.BindPlayer(&player);
         if (avatar.Spawned())
           avatar.PreTick(tick, player, avatarHeading, kTickDt, world, ops,
                          cellOps,
@@ -2855,9 +2857,16 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // `float aura` lifted you and left an enemy standing. MobSystem knows
         // which of its two velocity states the body is in (limp or walking);
         // this only has to hand the number over.
+        // ONE ROUTE FOR EVERY BODY (Mob::AddBodyVelocity, W2-L): the
+        // caster's own lift goes through its body too, which is what reaches a
+        // LIMP player's limbs (the controller is not integrating then).
         for (const SpellBodyImpulse& bi : emit.bodyImpulses) {
-          if (bi.target == kPlayerCasterId) player.vel.y += bi.vps.y;
-          else mobs.LiftMob(bi.target, bi.vps);
+          if (bi.target == kPlayerCasterId) {
+            avatar.BindPlayer(&player);
+            avatar.AddBodyVelocity(bi.vps);
+          } else {
+            mobs.LiftMob(bi.target, bi.vps);
+          }
         }
         // GRAFTS: the world half already left as ops; the body half fills the
         // caster's missing anatomy cells with that matter, root-first. The VM

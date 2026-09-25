@@ -4078,7 +4078,7 @@ Status GateHitReact(Ctx& c, std::string& detail) {
 
 // ---- levitate: a sustained gravity mod on a body that is NOT the caster ----
 //
-// (spell.h `SpellBodyImpulse` -> session.cpp's routing -> mob.h `Mob::AddLift`,
+// (spell.h `SpellBodyImpulse` -> session.cpp's routing -> `Mob::AddBodyVelocity`,
 // 2026-09-22, from the owner's report that `float aura` worked on himself, did
 // nothing to an enemy, and did nothing to a ragdoll.)
 //
