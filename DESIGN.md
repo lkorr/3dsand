@@ -15942,6 +15942,33 @@ same binary — needed `SANDVOX_TICKS_PER_FRAME`, because the frame loop's tick
 schedule and the OS cursor are both wall-clock inputs and an unattended
 `--autofly-hard` run had never been quite reproducible without it.
 
+**The gates tick THIS tick (rule-unification W2-O, 2026-09-24;
+`src/test/tickrig.h`).** Until W2-O no gate called `TickAuthority`: ~123
+hand-rolled `.PreTick(` sites across 14 selftest files, each a copy of part of
+the tick as it stood the day the gate was written — no day phase or rain word
+for the body reactions, no contact-damage pass after the step, no vessel pass,
+no op order. `support::TickRig` builds the `TickAuthorityCtx` a gate lacks (an
+un-Init'ed, therefore inert, far field; empty glyphs and prefabs; the
+collision classes; a presentation seam nobody reads) around one
+`PlayerSession` whose body is a fly-mode camera with no avatar and no input;
+`support::RunTicks` / `TickCursor` run the tick plus the harness pump.
+`TickAuthorityCtx::harness` (section J, all off in the game) says what that
+body must not drag with it: the window is PINNED (`Stream::Update` with an
+empty interest set, its own "no shift"), the submit centres the CPU mirror on
+the gate's FIXTURE chunk, the NPC player list is the gate's, the gate's ops are
+pushed at the top of the tick (lowest op indices), its explosions go off in the
+primary's grenade slot (so they get phase K's body block and phase N's crater
+scan), and `mobPhase` records where `mobs.PreTick`'s own authoring sits in the
+batch — an accounting claim about what the creature system emitted is scoped
+to that span, because the rest of the batch has other authors. A direct phase
+call survives only where a gate tests that one phase, marked `DIRECT PHASE
+CALLS ON PURPOSE (W2-O)`. What the conversion found: fixtures the hand-rolled
+ticks held still only because they never submitted a world (a creature with no
+ground cannot walk) walked on the real tick — pinned with the authored `dummy`
+profile; and, open, an UNSTRUCK standing human's thigh gains tombstones (flesh
+zeroed in place, no hp charged yet) over 60 real ticks even at the shipped
+pulp rate, which is what now holds `impact-fist` red.
+
 **N players in one tick (M9.1, 2026-09-21; `docs/PLAN_multiplayer_m9.md` §2).**
 `TickAuthority` takes a `std::span<SessionTick>` — one `PlayerSession` plus its
 `FrameIntent` and `TickInput` per player — and is the alternation of sixteen

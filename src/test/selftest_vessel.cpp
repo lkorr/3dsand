@@ -1039,6 +1039,11 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
   Vec3 aWhere{};
   std::vector<std::pair<uint64_t, Vec3>> lastVel;
   std::vector<ContainerSpill> spills;
+  // STILL HAND-ROLLED (W2-O), ON PURPOSE: the subject is ContainerBreakPass's
+  // per-tick verdict and the spill it leaves. The real tick runs the same pass
+  // (phase H, with TickAuthorityCtx::ground bound) but drains the spill inside
+  // that phase, so neither the verdict nor the spill's position survives to be
+  // read; converting this needs the rig to surface them first.
   auto tick = [&](std::vector<CellOp> cellOps) {
     std::vector<ParticleSpawn> spawns;
     debris.PreTick(t + 1, world, cellOps, spawns);

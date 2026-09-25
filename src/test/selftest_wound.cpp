@@ -73,6 +73,7 @@
 #include "test/selftest.h"
 #include "sim/scale.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -233,6 +234,9 @@ uint64_t SpawnTarget(Ctx& c, const Target& t, int inset, IVec3& outChunk) {
   // A few physics steps only — no world submit. The creature has to be posed
   // and its limb transforms real before anything is measured off them, and
   // nothing here needs the CA to have run.
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture POSING, not the subject, and
+  // every spawn replays ticks 1000.. so each target is posed identically; the
+  // real tick would advance the world clock between fixtures.
   for (int i = 0; i < 8; i++) {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
@@ -570,29 +574,22 @@ Status GateWoundBleed(Ctx& c, std::string& detail) {
   uint32_t bloodOps = 0, bloodDrops = 0, worstTickOps = 0;
   int lastBleedTick = -1;
   const int kWatch = 600;
+  // THE REAL TICK (W2-O, test/tickrig.h). The blood counted is the MOB
+  // PHASE's own (TickRig::MobPhase): gore.bleedOpsPerTick is the creature
+  // system's shared drip budget, so that is the span it bounds.
+  support::TickCursor bleedTicker{c, t0, pchunk};
   for (int i = 0; i < kWatch; i++) {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(t0 + 1, world, ops, cellOps, spawns);
+    bleedTicker();
+    const OpBatch& tb = bleedTicker.Rig().LastBatch();
+    const auto& mp = bleedTicker.Rig().MobPhase();
     uint32_t tickOps = 0;
-    for (const BrushOp& op : ops)
-      if (op.material == bleedMat) tickOps++;
-    for (const ParticleSpawn& s : spawns)
-      if ((s.payload & 0xFFFu) == bleedMat) bloodDrops++;
+    for (size_t k = mp.ops0; k < mp.ops1 && k < tb.ops.size(); k++)
+      if (tb.ops[k].material == bleedMat) tickOps++;
+    for (size_t k = mp.spawns0; k < mp.spawns1 && k < tb.spawns.size(); k++)
+      if ((tb.spawns[k].payload & 0xFFFu) == bleedMat) bloodDrops++;
     if (tickOps || !mobs.BleedSources().empty()) lastBleedTick = i;
     bloodOps += tickOps;
     worstTickOps = std::max(worstTickOps, tickOps);
-    c.debris.QueueSupportEvents(world.Snap());
-    c.debris.PreTick(t0 + 1, world, cellOps, spawns);
-    ++t0;
-    SubmitTick(ctx, world, sim, t0, kDefaultSeed, ops, {}, cellOps, false,
-               pchunk, true, true, spawns);
-    ctx.WaitIdle();
-    ctx.ProcessEvents();
-    c.phys.Step(kTickDt);
-    c.debris.PostStep();
-    mobs.PostStep();
   }
 
   const int stopBy = (int)BaselineNumber("woundBleedStopTicks", 400);
@@ -603,9 +600,9 @@ Status GateWoundBleed(Ctx& c, std::string& detail) {
   // ...AND THE WORLD SLEEPS AFTERWARDS. Blood is real matter the CA carries,
   // so a wound that keeps a chunk awake is rule 2 broken however tidy the
   // budget looked. Settled by ticking on with nothing left to emit.
-  for (int i = 0; i < 400; i++)
-    SubmitTick(ctx, world, sim, ++t0, kDefaultSeed, {}, {}, {}, false, pchunk,
-               false, false);
+  // On the real tick too: the creature is still standing there, and whatever
+  // it goes on doing to the world (staining, dripping) is part of the claim.
+  for (int i = 0; i < 400; i++) bleedTicker();
   ctx.WaitIdle();
   const uint32_t active = ReadActiveChunksSync(ctx, world, sim);
   const uint32_t restCap = (uint32_t)BaselineNumber("woundBleedRestChunks", 32);
@@ -680,6 +677,7 @@ Status GateBleedOut(Ctx& c, std::string& detail) {
     bool monotone = true;
     int ticks = 0;
     float bloodLost = 0;
+    double otherBlood = 0;        // blood other authors put in the same ticks
   };
   auto run = [&](bool stumpOpen, int inset, int window) {
     Run r;
@@ -689,28 +687,50 @@ Status GateBleedOut(Ctx& c, std::string& detail) {
     IVec3 pchunk{};
     const uint64_t id = SpawnTarget(c, t, inset, pchunk);
     if (!id) { SetCurrentTuning(saved); return r; }
+    // PINNED (the authored `dummy` profile, mobile: false), found by W2-O: the
+    // claim is about a body standing where it was put, and an unprofiled one
+    // only stood still under the hand-rolled ticks because they never
+    // submitted a world, so it had no ground. On the real tick it walked: the
+    // one-legged body dragged its stump and tracked its own blood.
+    mobs.SetMobBehavior(id, "dummy");
     r.hp0 = mobs.TotalHp(id);
     mobs.Sever(id, t.limb);
     // The thrown sever voxels are charged INSIDE Sever(); the baseline is
     // taken after it so the identity below is over what the ticks emit.
     r.hpBefore = mobs.TotalHp(id);
     r.hpAtLast = r.hpBefore;
-    uint32_t tick = 30000;
+    uint32_t tick = 29999;
+    // THE REAL TICK (W2-O, test/tickrig.h). The identity is about what the
+    // CREATURE emitted — Mob::DrainBlood's "every drop is hp" — so what is
+    // counted is the mob phase's own span of the batch (TickRig::MobPhase).
+    // The rest of the tick's blood is other authors (reported in the detail
+    // line). Counted over the WHOLE batch on the first W2-O run the identity
+    // read 1483.16 vox owed against 877.07 hp lost: 21 voxels the creature was
+    // never charged for, because it never emitted them.
+    support::TickCursor ticker{c, tick, pchunk};
     for (int i = 0; i < window; i++) {
-      std::vector<BrushOp> ops;
-      std::vector<ParticleSpawn> spawns;
-      std::vector<CellOp> cellOps;
-      mobs.PreTick(tick++, c.world, ops, cellOps, spawns);
+      ticker();
+      const OpBatch& tb = ticker.Rig().LastBatch();
+      const auto& mp = ticker.Rig().MobPhase();
       uint32_t tickOps = 0;
       double emitted = 0;
-      for (const BrushOp& op : ops)
-        if (op.material == bleedMat) {
+      for (size_t k = 0; k < tb.ops.size(); k++) {
+        const BrushOp& op = tb.ops[k];
+        if (op.material != bleedMat) continue;
+        const double v = (double)BleedClumpVoxels(op.radius);
+        if (k >= mp.ops0 && k < mp.ops1) {
           tickOps++;
-          emitted += (double)BleedClumpVoxels(op.radius);
+          emitted += v;
+        } else {
+          r.otherBlood += v;
         }
-      for (const ParticleSpawn& s : spawns)
-        if ((s.payload & 0xFFFu) == bleedMat && (s.flags & kPFlagMicro))
-          emitted += dropletVox;
+      }
+      for (size_t k = 0; k < tb.spawns.size(); k++) {
+        const ParticleSpawn& s = tb.spawns[k];
+        if ((s.payload & 0xFFFu) != bleedMat || !(s.flags & kPFlagMicro)) continue;
+        if (k >= mp.spawns0 && k < mp.spawns1) emitted += dropletVox;
+        else r.otherBlood += dropletVox;
+      }
       // Whole-voxel spawns (the sever's thrown gobbets, drained through
       // pendingSpawns_ on this first tick) were charged before the baseline
       // and are deliberately not counted here.
@@ -724,8 +744,6 @@ Status GateBleedOut(Ctx& c, std::string& detail) {
       r.hpAtLast = hp;
       r.countedAtLast = r.counted;
       r.bloodLost = mobs.BloodLost(id);
-      c.phys.Step(kTickDt);
-      mobs.PostStep();
     }
     mobs.Reset();
     c.debris.Reset();
@@ -778,11 +796,13 @@ Status GateBleedOut(Ctx& c, std::string& detail) {
   detail = Format(
       "%s/%s: hp %.1f -> %.1f at sever, %.2f blood vox = %.2f hp owed vs %.2f "
       "lost (tol %.2f), died at tick %d (expected ~%d), worst tick %u/%d, "
-      "monotone=%d; stump shut: alive=%d, dry at tick %d of %d",
+      "monotone=%d; stump shut: alive=%d, dry at tick %d of %d | blood from "
+      "other authors in the same ticks (not the creature's): %.2f vox",
       t.defName.c_str(), t.limbName.c_str(), open.hp0, open.hpBefore,
       open.countedAtLast, owedHp, lostHp, tol, open.deathTick, expected,
       open.worstTickOps, opCap, open.monotone ? 1 : 0,
-      shut.deathTick < 0 ? 1 : 0, shut.lastBleedTick, shut.ticks);
+      shut.deathTick < 0 ? 1 : 0, shut.lastBleedTick, shut.ticks,
+      open.otherBlood);
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -843,6 +863,9 @@ Status GateBurnCap(Ctx& c, std::string& detail) {
     detail = "spawn refused";
     return Status::Fail;
   }
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): arm B is the burn pass ALONE on a
+  // directly ignited limb (the note above the gate: "A and B are CPU only").
+  // Arm C, the world fire, runs the real tick.
   auto tickOnce = [&](uint32_t tick) {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
@@ -892,12 +915,13 @@ Status GateBurnCap(Ctx& c, std::string& detail) {
   float fracAtDeath = -1.0f, capAtDeath = -1.0f, lastFrac = fracB;
   float fracAt[2] = {-1.0f, -1.0f};  // at 400 and 800 ticks: is it climbing?
   uint32_t simTick = 41000;
+  // THE REAL TICK (W2-O, test/tickrig.h); the bonfire is the gate's own cell
+  // ops, pushed at the top of each tick.
+  support::TickCursor fireTicker{c, simTick, pchunk};
   if (mFire && rootLimb >= 0) {
     for (int i = 0; i < 1200; i++) {
-      std::vector<BrushOp> ops;
-      std::vector<ParticleSpawn> spawns;
-      std::vector<CellOp> cellOps;
-      mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
+      support::TickOps pre;
+      std::vector<CellOp>& cellOps = pre.cells;
       if (mobs.LimbBody(id, rootLimb)) {
         const Vec3 at = mobs.LimbVoxelPos(id, rootLimb, 0);
         const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
@@ -925,16 +949,7 @@ Status GateBurnCap(Ctx& c, std::string& detail) {
                    PackVoxNew(mFire, 7u) | (aboveGround ? 0u : kCellOpIfAir)});
             }
       }
-      c.debris.QueueSupportEvents(c.world.Snap());
-      c.debris.PreTick(simTick + 1, c.world, cellOps, spawns);
-      ++simTick;
-      SubmitTick(c.ctx, c.world, c.sim, simTick, kDefaultSeed, ops, {}, cellOps,
-                 false, pchunk, true, false, spawns);
-      c.ctx.WaitIdle();
-      c.ctx.ProcessEvents();
-      c.phys.Step(kTickDt);
-      c.debris.PostStep();
-      mobs.PostStep();
+      fireTicker(pre);
       if (!mobs.IsAlive(id)) {
         deathTick = i;
         break;
@@ -1087,21 +1102,18 @@ Status GateOneHit(Ctx& c, std::string& detail) {
   const size_t severs = mobs.SeverEvents().size();
   std::string cause = mobs.DeathCause(id);
 
-  // Then the wound bleeds for five seconds of game time.
-  uint32_t tick = 50000;
+  // Then the wound bleeds for five seconds of game time, on THE REAL TICK
+  // (W2-O, test/tickrig.h).
+  uint32_t tick = 49999;
   int deathTick = -1;
+  support::TickCursor ticker{c, tick, pchunk};
   for (int i = 0; i < 150 && mobs.IsAlive(id); i++) {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> sp;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(tick++, c.world, ops, cellOps, sp);
+    ticker();
     if (!mobs.IsAlive(id)) {
       deathTick = i;
       cause = mobs.DeathCause(id);
       break;
     }
-    c.phys.Step(kTickDt);
-    mobs.PostStep();
   }
   const bool alive = mobs.IsAlive(id);
   const float hpEnd = alive ? mobs.TotalHp(id) : 0.0f;
@@ -1206,16 +1218,11 @@ Status GateCorpseIntact(Ctx& c, std::string& detail) {
   }
   const uint32_t vox0 = mobs.LimbArtVoxelCount(id, root);
 
-  uint32_t tick = 52000;
-  auto step = [&]() {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> sp;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(tick++, c.world, ops, cellOps, sp);
-    c.phys.Step(kTickDt);
-    mobs.PostStep();
-    c.debris.PostStep();
-  };
+  // THE REAL TICK (W2-O, test/tickrig.h): this gate exists because the game
+  // kept going past where the old fixture stopped.
+  uint32_t tick = 51999;
+  support::TickCursor ticker{c, tick, pchunk};
+  auto step = [&]() { ticker(); };
   // The rest of the stroke: three ticks of the edge crossing the torso at the
   // sword's own kerf width (halfWidth + carveBonus is about a voxel) — the
   // laser's sphere carve, which is what the melt on dead flesh always was.
@@ -1543,18 +1550,11 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
     tt.gore.pulpRotRate = (float)BaselineNumber("impactPulpRot", 30.0);
     SetCurrentTuning(tt);
   }
-  uint32_t tick = 61000;
-  for (int i = 0; i < 45; i++) {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> st;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(tick, c.world, ops, cellOps, st);
-    c.debris.PreTick(tick, c.world, cellOps, st);
-    c.phys.Step(kTickDt);
-    mobs.PostStep();
-    c.debris.PostStep();
-    tick++;
-  }
+  // THE REAL TICK (W2-O, test/tickrig.h): "nobody touching it" is the whole
+  // tick running around the corpse, not two of its phases.
+  uint32_t tick = 60999;
+  support::TickCursor ticker{c, tick, pchunk};
+  for (int i = 0; i < 45; i++) ticker();
   SetCurrentTuning(savedTune);
   const uint32_t vox2 = mobs.LimbArtVoxelCount(id, t.limb);
 
@@ -1899,6 +1899,9 @@ Status GateHitDrive(Ctx& c, std::string& detail) {
       why = "spawn refused";
       break;
     }
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture posing. Each arm replays
+    // ticks 3000.. so the three bodies meet the blow in the same pose and the
+    // arms differ only by the drive state under test.
     auto step = [&](uint32_t tick) {
       std::vector<BrushOp> ops;
       std::vector<ParticleSpawn> st;
@@ -2156,6 +2159,9 @@ Status GateCorpseArmor(Ctx& c, std::string& detail) {
   // mirror, no collider, nothing to land on, and therefore none of the ground
   // contact that the report is about. That is the trap recorded as
   // "a CPU-only fixture has no ground", and it costs a GPU submit per tick.
+  // STILL HAND-ROLLED (W2-O), ON PURPOSE: the claim is the cost of the
+  // PHYSICS STEP ALONE with the proxy pinned between the submit and the step,
+  // and the real tick cannot time one of its phases from outside.
   auto step = [&](double* outMs) {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> sp;
@@ -2745,13 +2751,12 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
   Vec3 neckLast{}, neckFirst{};
   float neckBudgetAtGone = -1.0f;
   const int window = 700;
+  // THE REAL TICK (W2-O, test/tickrig.h). The wound points are read at the
+  // top of each tick and the tick's blood drops sorted between them after it.
+  support::TickCursor ticker{c, tick, pchunk};
   for (int i = 0; i < window; i++) {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> sp;
-    std::vector<CellOp> cellOps;
     // The corpse's own tick drains the NECK (Mob::BleedTick on a dead Mob);
     // the debris tick drains the severed head. Both streams are counted.
-    mobs.PreTick(tick + 1, c.world, ops, cellOps, sp);
     const int hi = indexOf(headBody);
     const bool ni = neckOn();
     const Vec3 hw = hi >= 0 ? c.debris.BodyWoundWorld((uint32_t)hi) : Vec3{};
@@ -2764,8 +2769,8 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
       neckGoneTick = i;
     }
     if (hi < 0 && headGoneTick < 0) headGoneTick = i;
-    c.debris.QueueSupportEvents(c.world.Snap());
-    c.debris.PreTick(tick + 1, c.world, cellOps, sp);
+    ticker();
+    const std::vector<ParticleSpawn>& sp = ticker.Rig().LastBatch().spawns;
     for (size_t k = 0; k < sp.size(); k++) {
       const ParticleSpawn& p = sp[k];
       if ((p.payload & 0xFFFu) != (bleedMat & 0xFFFu)) continue;
@@ -2775,18 +2780,9 @@ Status GateCorpseBleed(Ctx& c, std::string& detail) {
       const float dn = ni ? (at - nw).len() : 1e9f;
       if (dh < dn) bloodHead += 1.0; else bloodNeck += 1.0;
     }
-    // A REAL TICK, because the corpse needs ground: debris terrain meshes are
-    // built from the chunk cache the tick's readback fills (ManageTerrain
-    // requests a fetch and waits), and without one the whole ragdoll fell
-    // 225 voxels out of the window at t+66 with 24 voxels of budget unspent.
-    ++tick;
-    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
-               false, pchunk, true, true, sp);
-    c.ctx.WaitIdle();
-    c.ctx.ProcessEvents();
-    c.phys.Step(kTickDt);
-    c.debris.PostStep();
-    mobs.PostStep();
+    // (A REAL TICK was already needed here because the corpse needs ground:
+    // debris terrain meshes are built from the chunk cache the tick's readback
+    // fills, and without one the ragdoll fell 225 voxels out of the window.)
     if (closedTick < 0 && woundedNow() == 0) {
       closedTick = i;
       // ---- D. a cut on the corpse opens a wound again ----------------------
@@ -2936,23 +2932,13 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
   // the DEBRIS pass pushed are counted before the fixture adds its own, and
   // only the debris pass's — the mob's go with the mob.
   Vec3 pyre{};
+  // THE REAL TICK (W2-O, test/tickrig.h). The pyre is the gate's own cell ops
+  // (pushed at the top of the tick, so they are the batch's FIRST entries);
+  // everything after them is what the tick's systems authored.
+  support::TickCursor ticker{c, tick, pchunk};
   auto tickOnce = [&](bool soak) {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(tick + 1, c.world, ops, cellOps, spawns);
-    c.debris.QueueSupportEvents(c.world.Snap());
-    c.debris.PreTick(tick + 1, c.world, cellOps, spawns);
-    // BOTH passes' ops, since 2026-09-22: a corpse's flesh burns in the living
-    // limb pass (MobSystem::BurnDeadFlesh, inside mobs.PreTick) and only its
-    // garments in the debris one. The counters are zeroed after the death
-    // (phase B below), when the corpse is the only thing left emitting, so
-    // counting from the top of the list measures the corpse and nothing else.
-    for (size_t k = 0; k < cellOps.size(); k++) {
-      const uint32_t m = cellOps[k].word & 0xFFFu;
-      if (m == mFire) debrisFireOps++;
-      else if (m == mSmoke || m == mAsh) debrisResidueOps++;
-    }
+    support::TickOps pre;
+    std::vector<CellOp>& cellOps = pre.cells;
     if (soak) {
       if (mobs.IsAlive(id) && mobs.LimbBody(id, rootLimb))
         pyre = mobs.LimbVoxelPos(id, rootLimb, 0);
@@ -2970,14 +2956,18 @@ Status GateCorpseBurn(Ctx& c, std::string& detail) {
                  PackVoxNew(mFire, 7u) | (aboveGround ? 0u : kCellOpIfAir)});
           }
     }
-    ++tick;
-    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
-               false, pchunk, true, false, spawns);
-    c.ctx.WaitIdle();
-    c.ctx.ProcessEvents();
-    c.phys.Step(kTickDt);
-    c.debris.PostStep();
-    mobs.PostStep();
+    const size_t own = cellOps.size();
+    ticker(pre);
+    // BOTH passes' ops, since 2026-09-22: a corpse's flesh burns in the living
+    // limb pass (MobSystem::BurnDeadFlesh, inside mobs.PreTick) and only its
+    // garments in the debris one. The counters are zeroed after the death
+    // (phase B below), when the corpse is the only thing left emitting.
+    const std::vector<CellOp>& tc = ticker.Rig().LastBatch().cells;
+    for (size_t k = own; k < tc.size(); k++) {
+      const uint32_t m = tc[k].word & 0xFFFu;
+      if (m == mFire) debrisFireOps++;
+      else if (m == mSmoke || m == mAsh) debrisResidueOps++;
+    }
   };
 
   // ---- A. die in the fire -------------------------------------------------
@@ -3366,6 +3356,8 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
   const IVec3 site0 = FixtureSite(c.world, 330);
   const IVec3 roomChunk{site0.x >> 4, site0.y >> 4, site0.z >> 4};
   constexpr int kRoomHalf = 9, kRoomUp = 24;
+  // A WORLD-ONLY tick on purpose (W2-O): fixture construction, before any
+  // creature exists -- walls and pools going in through the queue.
   auto bareTick = [&](uint32_t tick, std::vector<CellOp>& cellOps) {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
@@ -3423,28 +3415,20 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
   // out to the real surface, which in the full suite (window origin walked
   // by `streaming`) was a chunk and a half higher, so a mirror centred on
   // the spawn never held the cells round the feet and the pass saw nothing.
+  // THE REAL TICK (W2-O, test/tickrig.h); the liquid is the gate's own cell
+  // ops, written at the top of the tick, and the mirror follows the creature.
   uint32_t simTick = 29000;
+  support::TickCursor liquidTicker{c, simTick, pchunk};
   auto liquidTick = [&](const std::function<void(std::vector<CellOp>&)>& fill) {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
-    fill(cellOps);
-    c.debris.QueueSupportEvents(c.world.Snap());
-    c.debris.PreTick(simTick + 1, c.world, cellOps, spawns);
-    ++simTick;
+    support::TickOps pre;
+    fill(pre.cells);
     IVec3 centre = pchunk;
     if (root >= 0 && mobs.LimbBody(id, root)) {
       const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
       centre = IVec3{ifloor(at.x) >> 4, ifloor(at.y) >> 4, ifloor(at.z) >> 4};
     }
-    SubmitTick(c.ctx, c.world, c.sim, simTick, kDefaultSeed, ops, {}, cellOps,
-               false, centre, true, false, spawns);
-    c.ctx.WaitIdle();
-    c.ctx.ProcessEvents();
-    c.phys.Step(kTickDt);
-    c.debris.PostStep();
-    mobs.PostStep();
+    liquidTicker.chunk = centre;
+    liquidTicker(pre);
   };
 
   // ---- 0. the shallow pool, on a body that is not yet bleeding ------------
@@ -3541,14 +3525,10 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
     ev.tick = 29900u;
     ev.seed = 0xD1E7u;
     mobs.QueueSplatter(ev);
-    for (int i = 0; i < 2; i++) {
-      std::vector<BrushOp> ops;
-      std::vector<ParticleSpawn> spawns;
-      std::vector<CellOp> cellOps;
-      mobs.PreTick(29901u + (uint32_t)i, c.world, ops, cellOps, spawns);
-      c.phys.Step(kTickDt);
-      mobs.PostStep();
-    }
+    // THE REAL TICK (W2-O), on the burst's own clock: the replay is keyed to
+    // the tick after `ev.tick`, so the gate's clock is moved there first.
+    simTick = 29900u;
+    for (int i = 0; i < 2; i++) liquidTick([](std::vector<CellOp>&) {});
     const uint32_t after = mobs.LimbStainCount(id, root, 1);
     unreachableMarks = after > before ? after - before : 0u;
   }
@@ -3620,16 +3600,12 @@ Status GateBodyStain(Ctx& c, std::string& detail) {
     ev.tick = 30000u;
     ev.seed = 0x5B1A7u;
     mobs.QueueSplatter(ev);
+    simTick = 30000u;   // the burst's own clock (see the unreachable arm)
     for (int i = 0; i < 6; i++) {
-      std::vector<BrushOp> ops;
-      std::vector<ParticleSpawn> spawns;
-      std::vector<CellOp> cellOps;
-      mobs.PreTick(30001u + (uint32_t)i, c.world, ops, cellOps, spawns);
+      liquidTick([](std::vector<CellOp>&) {});
       // The chip above left a bleeding wound; its drip spray must queue
       // bursts of its own (counted before the age-out at the next PreTick).
       queuedByWound = std::max(queuedByWound, mobs.SplatterEventsQueued());
-      c.phys.Step(kTickDt);
-      mobs.PostStep();
     }
     rootSplashed = mobs.LimbBody(id, root) ? mobs.LimbStainCount(id, root, 1) : 0;
   }
@@ -3785,13 +3761,14 @@ Status GateCorpseWash(Ctx& c, std::string& detail) {
 
   // One real tick with liquid written round the torso (body-stain's
   // liquidTick, with the mirror centred on the corpse rather than a limb).
+  // THE REAL TICK (W2-O, test/tickrig.h); the liquid is the gate's own cell
+  // ops at the top of each tick, the mirror centred on the corpse.
   uint32_t simTick = 33000;
+  support::TickCursor ticker{c, simTick, pchunk};
   auto soak = [&](uint32_t mat, int ticks) -> uint32_t {
     for (int i = 0; i < ticks; i++) {
-      std::vector<BrushOp> ops;
-      std::vector<ParticleSpawn> spawns;
-      std::vector<CellOp> cellOps;
-      mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
+      support::TickOps pre;
+      std::vector<CellOp>& cellOps = pre.cells;
       IVec3 centre = pchunk;
       if (torsoOn()) {
         const Vec3 at = torsoCentre();
@@ -3807,16 +3784,8 @@ Status GateCorpseWash(Ctx& c, std::string& detail) {
               cellOps.push_back({World::SlotCellIndex(cc), PackVoxNew(mat, 8u)});
             }
       }
-      c.debris.QueueSupportEvents(c.world.Snap());
-      c.debris.PreTick(simTick + 1, c.world, cellOps, spawns);
-      ++simTick;
-      SubmitTick(c.ctx, c.world, c.sim, simTick, kDefaultSeed, ops, {}, cellOps,
-                 false, centre, true, false, spawns);
-      c.ctx.WaitIdle();
-      c.ctx.ProcessEvents();
-      c.phys.Step(kTickDt);
-      c.debris.PostStep();
-      mobs.PostStep();
+      ticker.chunk = centre;
+      ticker(pre);
     }
     return torsoOn() ? mobs.LimbCoatMatCount(id, root, mBlood, 1) : 0u;
   };
@@ -3877,22 +3846,21 @@ struct DeadFixture {
   uint32_t tick = 0;
   std::string why;
   explicit DeadFixture(Ctx& ctx) : c(ctx) {}
+  // THE REAL TICK (W2-O, test/tickrig.h); `fill` writes the gate's own cell
+  // ops at the top of it.
+  std::unique_ptr<support::TickRig> rig;
   void Step(const std::function<void(std::vector<CellOp>&)>& fill = nullptr) {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> sp;
-    std::vector<CellOp> cellOps;
-    c.mobs.PreTick(tick + 1, c.world, ops, cellOps, sp);
-    if (fill) fill(cellOps);
-    c.debris.QueueSupportEvents(c.world.Snap());
-    c.debris.PreTick(tick + 1, c.world, cellOps, sp);
-    ++tick;
-    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
-               false, pchunk, true, false, sp);
-    c.ctx.WaitIdle();
-    c.ctx.ProcessEvents();
-    c.phys.Step(kTickDt);
-    c.debris.PostStep();
-    c.mobs.PostStep();
+    if (!rig) rig = std::make_unique<support::TickRig>(c, tick, pchunk);
+    rig->tick = tick;
+    rig->SetFixtureChunk(pchunk);
+    if (fill) {
+      support::RunTicks(*rig, 1, [&](uint32_t, support::TickOps& o) {
+        fill(o.cells);
+      });
+    } else {
+      support::RunTicks(*rig, 1);
+    }
+    tick = rig->tick;
   }
   // THE TORSO IS THE CORPSE'S ROOT LIMB, addressed by rig slot: a burn or a
   // carve rebuilds its collider under a new handle, and the slot is the one
@@ -4369,6 +4337,10 @@ Status GateMobRain(Ctx& c, std::string& detail) {
     mobs.SetMobBehavior(id, "dummy");
     mobs.SetWeatherRain(rainWord);
     mobs.rainStats_ = {};
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): the rain word is this fixture's
+    // INPUT, set on MobSystem per arm. The real tick latches the weather's own
+    // word in phase H every tick and would overwrite it; pinning a weather
+    // preset instead would also rain on the GPU grid, a different fixture.
     for (int k = 0; k < kTicks; k++) {
       ++simTick;
       std::vector<BrushOp> ops;
@@ -4463,6 +4435,8 @@ Status GateRainOil(Ctx& c, std::string& detail) {
   }
   mobs.SetMobBehavior(id, "dummy");
   uint32_t simTick = 53000;
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): as mob-rain, the rain word is the
+  // fixture's input on MobSystem, which the real tick's phase H overwrites.
   auto run = [&](int ticks) {
     for (int k = 0; k < ticks; k++) {
       ++simTick;
@@ -4569,6 +4543,8 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   const IVec3 site0 = FixtureSite(c.world, kInset);
   const IVec3 roomChunk{site0.x >> 4, site0.y >> 4, site0.z >> 4};
   constexpr int kRoomHalf = 9, kRoomUp = 24;
+  // A WORLD-ONLY tick on purpose (W2-O): fixture construction, before any
+  // creature exists -- walls and pools going in through the queue.
   auto bareTick = [&](uint32_t tick, std::vector<CellOp>& cellOps) {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
@@ -4638,6 +4614,10 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   // A tick with no world submit: the pose, the bleed, the stain pass and — at
   // its tail — the coat ledger and the drying sweep. Everything below except
   // the deposit is measured through this.
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): the ledger and drying claims below
+  // are about the BODY's own passes. A world ticking under it adds the contact
+  // pass's coats from the ground (the cut's own blood, once it lands) to the
+  // same ledger, which is a different quantity from the one asserted.
   auto poseTick = [&]() {
     ++simTick;
     std::vector<BrushOp> ops;
@@ -4647,27 +4627,17 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
     c.phys.Step(kTickDt);
     mobs.PostStep();
   };
-  // A tick that DOES submit, for the deposit (the particle kernel has to run).
+  // A tick that DOES submit, for the deposit (the particle kernel has to run):
+  // THE REAL TICK (W2-O, test/tickrig.h), the mirror on the creature.
+  support::TickCursor worldTicker{c, simTick, pchunk};
   auto worldTick = [&]() {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
-    c.debris.QueueSupportEvents(c.world.Snap());
-    c.debris.PreTick(simTick + 1, c.world, cellOps, spawns);
-    ++simTick;
     IVec3 centre = pchunk;
     if (root >= 0 && mobs.LimbBody(id, root)) {
       const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
       centre = IVec3{ifloor(at.x) >> 4, ifloor(at.y) >> 4, ifloor(at.z) >> 4};
     }
-    SubmitTick(c.ctx, c.world, c.sim, simTick, kDefaultSeed, ops, {}, cellOps,
-               false, centre, true, false, spawns);
-    c.ctx.WaitIdle();
-    c.ctx.ProcessEvents();
-    c.phys.Step(kTickDt);
-    c.debris.PostStep();
-    mobs.PostStep();
+    worldTicker.chunk = centre;
+    worldTicker();
   };
   for (int i = 0; i < 20; i++) worldTick();  // let it find the floor
 
@@ -4956,11 +4926,12 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
       if (li != dryLimb && mobs.LimbBody(id, li))
         for (int k = 0; k < 8; k++)
           mobs.DouseLimb(id, li, mWater, 15, ++simTick);
+    // THE REAL TICK (W2-O, test/tickrig.h); the fire column is the gate's own
+    // cell ops, written at the top of each tick.
+    support::TickCursor fireTicker{c, simTick, pchunk};
     for (int k = 0; k < kFireTicks; k++) {
-      std::vector<BrushOp> ops;
-      std::vector<ParticleSpawn> spawns;
-      std::vector<CellOp> cellOps;
-      mobs.PreTick(simTick + 1, c.world, ops, cellOps, spawns);
+      support::TickOps pre;
+      std::vector<CellOp>& cellOps = pre.cells;
       const Vec3 at = mobs.LimbVoxelPos(id, root, 0);
       const IVec3 b{ifloor(at.x), ifloor(at.y), ifloor(at.z)};
       for (int dy = -8; dy <= 8; dy++)
@@ -4992,20 +4963,10 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
       if (mobs.LimbBody(id, dryLimb))
         dryBurningPeak =
             std::max(dryBurningPeak, mobs.LimbBurningCount(id, dryLimb));
-      // The debris island scan is what RE-FETCHES a dirty chunk the mirror
-      // already holds; without it the burn pass reads the room as it was
-      // before the fire (a cached chunk is never refreshed on its own).
-      c.debris.QueueSupportEvents(c.world.Snap());
-      c.debris.PreTick(simTick + 1, c.world, cellOps, spawns);
-      ++simTick;
-      SubmitTick(c.ctx, c.world, c.sim, simTick, kDefaultSeed, ops, {},
-                 cellOps, false, IVec3{b.x >> 4, b.y >> 4, b.z >> 4}, true,
-                 false, spawns);
-      c.ctx.WaitIdle();
-      c.ctx.ProcessEvents();
-      c.phys.Step(kTickDt);
-      c.debris.PostStep();
-      mobs.PostStep();
+      // (The debris island scan is what RE-FETCHES a dirty chunk the mirror
+      // already holds; the real tick runs it, phase J.)
+      fireTicker.chunk = IVec3{b.x >> 4, b.y >> 4, b.z >> 4};
+      fireTicker(pre);
     }
     wetSeared = mobs.LimbBody(id, root) ? searedOn(root) : 0u;
     drySeared = mobs.LimbBody(id, dryLimb) ? searedOn(dryLimb) : 0u;
@@ -5324,15 +5285,11 @@ Status GateWoundHeal(Ctx& c, std::string& detail) {
     // Count 0: nothing is set alight, the index is built, and the soak in it
     // is what makes the limb `alight` (see the note above).
     mobs.IgniteLimb(id, t.limb, 0, 0);
-    uint32_t tick = 50000;
-    for (int i = 0; i < kTicks && mobs.IsAlive(id); i++) {
-      std::vector<BrushOp> ops;
-      std::vector<CellOp> cellOps;
-      spawns.clear();
-      mobs.PreTick(tick++, c.world, ops, cellOps, spawns);
-      c.phys.Step(kTickDt);
-      mobs.PostStep();
-    }
+    // THE REAL TICK (W2-O, test/tickrig.h). Both arms replay ticks 50000.. so
+    // they differ by the healing rule, not by the clock.
+    uint32_t tick = 49999;
+    support::TickCursor ticker{c, tick, pchunk};
+    for (int i = 0; i < kTicks && mobs.IsAlive(id); i++) ticker();
     a.alive = mobs.IsAlive(id);
     a.attached = mobs.LimbBody(id, t.limb) != 0;
     if (a.attached) {
@@ -5437,6 +5394,11 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
     detail = "spawn refused";
     return Status::Fail;
   }
+  // PINNED (the authored `dummy` profile, mobile: false), found by W2-O: the
+  // claim is about a body standing where it was put, and an unprofiled one
+  // only stood still under the hand-rolled ticks because they never submitted
+  // a world, so it had no ground. On the real tick it walked (the head left the beam after three hits).
+  mobs.SetMobBehavior(id, "dummy");
   const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
   const Vec3 centre = ax.anchor + ax.along * (ax.reach * 0.5f);
   const Vec3 dir = ax.edge;
@@ -5444,7 +5406,13 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
   const float range = 24.0f;
   const auto& tools = CurrentTuning().tools;
 
-  uint32_t tick = 53000;
+  uint32_t tick = 52999;
+  // THE REAL TICK between beam hits (W2-O, test/tickrig.h).
+  support::TickCursor ticker{c, tick, pchunk};
+  // How far the target moved under the beam (rule 6): a beam that stops
+  // hitting has either bored through or lost its target.
+  const Vec3 origin0 = mobs.MobOrigin(id);
+  float movedAtThrough = -1.0f;
   int deathTick = -1, throughTick = -1, hits = 0, severTick = -1,
       severLimb = -1;
   std::string cause;
@@ -5453,7 +5421,10 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
     float frac = 1.0f;
     const uint64_t hit = c.phys.CastRayBody(muzzle, dir, range, frac);
     if (!hit) {
-      if (throughTick < 0) throughTick = i;
+      if (throughTick < 0) {
+        throughTick = i;
+        movedAtThrough = (mobs.MobOrigin(id) - origin0).len();
+      }
       if (deathTick >= 0) break;
     } else {
       const Vec3 at = muzzle + dir * (frac * range);
@@ -5475,13 +5446,7 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
       severTick = i;
       severLimb = mobs.SeverEvents().front().limbIndex;
     }
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> sp;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(tick++, c.world, ops, cellOps, sp);
-    c.phys.Step(kTickDt);
-    mobs.PostStep();
-    c.debris.PostStep();
+    ticker();
     // Held on after the kill for a second, so the corpse half is exercised.
     if (deathTick >= 0 && i >= deathTick + 30) break;
   }
@@ -5512,7 +5477,11 @@ Status GateLaserHead(Ctx& c, std::string& detail) {
           ? Format(" (first: limb %d at tick %d)", severLimb, severTick).c_str()
           : "",
       jointed,
-      bodies, throughTick >= 0 ? Format("tick %d", throughTick).c_str() : "no",
+      bodies,
+      throughTick >= 0
+          ? Format("tick %d (target moved %.1f vox by then)", throughTick,
+                   movedAtThrough).c_str()
+          : "no",
       cause.empty() ? "" : Format(" cause: %s", cause.c_str()).c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -5652,6 +5621,8 @@ Status GateJointTwins(Ctx& c, std::string& detail) {
   mobs.SetLimbCellAt(id, pr.b, pr.rest, 0, 0);
 
   {
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): "the only writer is this gate and
+    // the sync; one tick of PreTick is what the claim is about" (above).
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
     std::vector<CellOp> cellOps;
@@ -5681,6 +5652,7 @@ Status GateJointTwins(Ctx& c, std::string& detail) {
   }
   const uint32_t linksAfter = mobs.JointTwinCount(id);
 
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): the twin sync alone, as above.
   auto tickOnce = [&](uint32_t tick) {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
@@ -5882,16 +5854,11 @@ Status GateAcidCoat(Ctx& c, std::string& detail) {
     if (n > ctlN) { ctlN = n; ctl = (int)li; }
   }
 
+  // THE REAL TICK (W2-O, test/tickrig.h): the acid eats a body standing in a
+  // world, and whatever it drips reaches that world.
   uint32_t simTick = 35000;
-  auto poseTick = [&]() {
-    ++simTick;
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
-    c.phys.Step(kTickDt);
-    mobs.PostStep();
-  };
+  support::TickCursor poseTicker{c, simTick, pchunk};
+  auto poseTick = [&]() { poseTicker(); };
   for (int i = 0; i < 10; i++) poseTick();
 
   // Blood first on BOTH limbs, then acid on the target only: the acid has to
@@ -6067,19 +6034,16 @@ Status GateLavaOilCoat(Ctx& c, std::string& detail) {
   t.defIndex = di;
   t.limb = foreL;
 
+  // THE REAL TICK (W2-O, test/tickrig.h), the mirror on the fixture's chunk.
   uint32_t simTick = 37000;
+  IVec3 pchunk{};
+  support::TickCursor poseTicker{c, simTick, pchunk};
   auto poseTick = [&]() {
-    ++simTick;
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
-    c.phys.Step(kTickDt);
-    mobs.PostStep();
+    poseTicker.chunk = pchunk;
+    poseTicker();
   };
 
   // ---- LAVA -----------------------------------------------------------------
-  IVec3 pchunk{};
   uint64_t id = SpawnTarget(c, t, kInset, pchunk);
   if (!id) {
     detail = "spawn refused";
@@ -6203,15 +6167,14 @@ Status GateSeveredHand(Ctx& c, std::string& detail) {
   t.defIndex = di;
   t.limb = fore;
 
+  // THE REAL TICK (W2-O, test/tickrig.h): a piece that comes off falls in the
+  // world the game runs, not in two phases of it.
   uint32_t simTick = 36000;
+  IVec3 pchunkT{};
+  support::TickCursor poseTicker{c, simTick, pchunkT};
   auto poseTick = [&]() {
-    ++simTick;
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(simTick, c.world, ops, cellOps, spawns);
-    c.phys.Step(kTickDt);
-    mobs.PostStep();
+    poseTicker.chunk = pchunkT;
+    poseTicker();
   };
   // Is `body` jointed to something, and is that something off the rig?
   auto rigHas = [&](uint64_t id, uint64_t h) {
@@ -6233,7 +6196,7 @@ Status GateSeveredHand(Ctx& c, std::string& detail) {
   };
 
   // ---- SPLIT ----------------------------------------------------------------
-  IVec3 pchunk{};
+  IVec3& pchunk = pchunkT;   // the fixture chunk the pose ticks centre on
   uint64_t id = SpawnTarget(c, t, kInset, pchunk);
   if (!id) {
     detail = "spawn refused";
@@ -7221,6 +7184,9 @@ Status GateCorpseCap(Ctx& c, std::string& detail) {
   }
   const bool fixtureOk = (int)order.size() == kills;
   // One tick: the cap is enforced at the top of PreTick (MobSystem::EvictDead).
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): the subject is that one step of the
+  // mob phase, and every count below is read before anything else in a tick
+  // (the husk sweep, the step) could move a body.
   {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> sp;

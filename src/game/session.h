@@ -815,6 +815,52 @@ struct TickAuthorityCtx {
   // it is null in the game, on a server and in every harness, so the
   // single-player op record is untouched.
   std::function<void(uint32_t tick, std::vector<CellOp>& cells)> driftCells;
+
+  // ---- J. THE SELFTEST HARNESS (rule-unification W2-O; test/tickrig.h) ----
+  //
+  // A gate runs THIS tick now (support::RunTicks), not a hand-rolled copy of
+  // part of it. What a gate's world lacks is a player standing in it: the
+  // harness session is a fly-mode body with no avatar and no input, and these
+  // four pins say what that body must NOT drag along with it. All four are
+  // inert in the game and on a server (default-constructed = off), so the
+  // frame loop's tick and its `--record-ops` stream are untouched.
+  struct Harness {
+    // THE WINDOW STAYS WHERE THE GATE PUT IT. Phase B recentres the residency
+    // window on the primary, two chunks of hysteresis on every axis — a gate's
+    // fixture sits on the terrain, well off the window's vertical centre, so a
+    // player standing in it would drag the window down a plane a tick and
+    // regenerate the world under the fixture. Pinned, Stream::Update still runs
+    // (the harvests and deferred wakes it owes are ticks, not motion) with an
+    // empty interest set, which is its own "no shift" answer.
+    bool pinWindow = false;
+    // The chunk the submit centres the CPU mirror on (SubmitTick's
+    // playerChunk), when it is not the player's: the gate's FIXTURE chunk,
+    // which is what every hand-rolled ticker passed.
+    bool haveSubmitChunk = false;
+    IVec3 submitChunk{};
+    // The gate owns the NPC targeting layer's player list: phase H does not
+    // overwrite it with the harness body (who is not a combatant).
+    bool ownsActors = false;
+    // The gate's own ops for this tick, pushed at the TOP of the tick before
+    // any system authors anything, so they take the lowest op indices — the
+    // position every hand-rolled ticker gave them (CLAUDE.md rule 3).
+    std::function<void(uint32_t tick, OpBatch& out)> inject;
+    // The gate's EXPLOSIONS for this tick. Not injected with the other ops:
+    // a blast is more than an op (phase K's crater scan, body carve, debris
+    // impulse and rig launch all key off the explosions a session authored),
+    // so they go off in the primary's explosion slot, as a grenade would.
+    std::vector<ExplosionOp> blasts;
+    // WHERE THE MOB PHASE'S OWN AUTHORING SITS IN THIS TICK'S BATCH: the
+    // vector sizes either side of phase H's mobs.PreTick, written every tick
+    // (six size reads). An accounting claim about what the creature system
+    // emitted — "every drop it bled was charged as hp" — is scoped to this
+    // span; the rest of the batch is other authors (a severed piece bleeding
+    // through debris, a gate's own ops).
+    struct Span {
+      size_t ops0 = 0, ops1 = 0, cells0 = 0, cells1 = 0, spawns0 = 0,
+             spawns1 = 0;
+    } mobPhase;
+  } harness;
 };
 
 // ---- one tick of authority, for N players ---------------------------------

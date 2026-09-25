@@ -718,7 +718,10 @@ static void PhaseB(TickAuthorityCtx& w, WorldScratch& ws,
         // as "input" — it had no timer, so it fell into the residual, and the
         // residual was billed to the input row.
         sandvox::PerfSpan spanStream(sandvox::PerfScope::Stream);
-        stream.Update(interest, tick);
+        // A HARNESS PINS THE WINDOW (session.h section J): an empty interest
+        // set is Stream::Update's own "no shift", and it still pays the
+        // harvests and deferred wakes it owes.
+        stream.Update(w.harness.pinWindow ? InterestSet{} : interest, tick);
         // THE HORIZON ARRIVING. `far`/`fardown` compile on a background thread
         // (docs/PLAN_shader_compile.md package A) and this is the one place
         // that notices they landed. Nothing was recorded for the cascades
@@ -749,7 +752,7 @@ static void PhaseB(TickAuthorityCtx& w, WorldScratch& ws,
         // which a shader edit can move by more than 2x without a rebuild.
         far.SetPlaneCap((uint32_t)CurrentTuning().render.farPlaneFillRate);
         // far-field cascades track the same interest set (render-only)
-        if (!farBlind) far.Update(interest);
+        if (!farBlind && !w.harness.pinWindow) far.Update(interest);
         farCount = far.PrepareTick(ctx.queue, !farBlind);
         if (farCount) {
           g_farEntries += farCount;
@@ -2000,12 +2003,21 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
                                     ws.sessionAvatars.size()));
         }
       }
-      mobs.SetPlayerActors(ws.actors);
+      // A gate that owns the actor list keeps it (session.h section J): the
+      // harness body is not a combatant.
+      if (!w.harness.ownsActors) mobs.SetPlayerActors(ws.actors);
 
       // mobs: kinematic walk drive, terrain anchors for ManageTerrain,
       // bleeding ops, per-voxel burning — must run before debris.PreTick
       // consumes the anchors
+      w.harness.mobPhase.ops0 = ops.size();
+      w.harness.mobPhase.cells0 = cellOps.size();
+      w.harness.mobPhase.spawns0 = spawns.size();
       mobs.PreTick(tick, world, ops, cellOps, spawns);
+      // (session.h Harness::mobPhase: what this phase authored, for a gate.)
+      w.harness.mobPhase.ops1 = ops.size();
+      w.harness.mobPhase.cells1 = cellOps.size();
+      w.harness.mobPhase.spawns1 = spawns.size();
   }
 }
 
@@ -3320,6 +3332,12 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
       // re-shove every body the first player's grenade already hit. For one
       // session expBegin is 0 and every test below is the one it replaces.
       const size_t expBegin = exps.size();
+      // A GATE'S BLAST IS THE PRIMARY'S (session.h section J): it goes off in
+      // this slot so it gets the crater scan, the body carve, the debris
+      // impulse and the rig launch a grenade gets. Empty in the game.
+      if (s.index == 0)
+        for (const ExplosionOp& e : w.harness.blasts)
+          if (exps.size() < kMaxExplosionsPerTick) exps.push_back(e);
       for (const ExplosionOp& e : spellExps)
         if (exps.size() < kMaxExplosionsPerTick) exps.push_back(e);
       // X-detonate is the DEV PANEL's, so it fires once, with the primary.
@@ -3521,6 +3539,8 @@ static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
       pc = IVec3{ifloor(player.pos.x) / (int)kChunk,
                  ifloor(player.pos.y) / (int)kChunk,
                  ifloor(player.pos.z) / (int)kChunk};
+      // A harness centres the mirror on its FIXTURE (session.h section J).
+      if (w.harness.haveSubmitChunk) pc = w.harness.submitChunk;
       t0 = NowSeconds();
       spanGame.Close();
       // ---- the celestial clock (sim/world.h) -----------------------------
@@ -3895,6 +3915,9 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
   // order is deterministic" (CLAUDE.md rule 3) still holds with two players:
   // the order is (session 0's ops in phase order), then session 1's.
   out.Clear();
+  // A GATE'S OWN OPS GO FIRST (session.h section J): the lowest op indices,
+  // where every hand-rolled harness ticker put them. Null in the game.
+  if (w.harness.inject) w.harness.inject(tick, out);
 
   if (!w.tickScratch) w.tickScratch = std::make_shared<TickScratch>();
   w.tickScratch->Reset(players.size());

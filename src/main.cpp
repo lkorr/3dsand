@@ -101,6 +101,7 @@
 #include "gpu/passtimer.h"
 #include "measure/renderstats.h"
 #include "test/support.h"
+#include "test/tickrig.h"   // support::TickRig: the --shot-* harnesses tick TickAuthority
 #include "test/treefixture.h"
 #include "ui/overlay.h"
 #include "crash.h"
@@ -3043,7 +3044,8 @@ int RunFluidShot(GpuContext& ctx, World& world, Simulation& sim,
 // and "do the sleeves sit on the arms" ten-second questions.
 int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
                DebrisSystem& debris, MobSystem& mobs, const ItemLibrary& items,
-               const std::string& spec) {
+               const std::string& spec, Stream& stream,
+               const std::vector<MaterialDef>& mats) {
   std::string defName = spec, limbCsv;
   // optional trailing "@x,z" picks the spawn column (default 137,139) — the
   // default area is forested and a wandering mob ends its shot behind a trunk
@@ -3085,21 +3087,14 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     std::fprintf(stderr, "--shot-mob: spawn failed\n");
     return 1;
   }
+  // THE GAME'S OWN TICK (W2-O, test/tickrig.h): a picture of a creature is a
+  // picture of what the tick does to it, not of a hand-copied part of it.
+  support::TickRig rig(
+      support::TickEngine{ctx, world, sim, stream, phys, mobs, debris, mats, items},
+      t, IVec3{8, h / 16, 8});
   auto mobTick = [&]() {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(t + 1, world, ops, cellOps, spawns);
-    debris.QueueSupportEvents(world.Snap());
-    debris.PreTick(t + 1, world, cellOps, spawns);
-    ++t;
-    SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
-               {8, h / 16, 8}, true, false, spawns);
-    ctx.WaitIdle();
-    ctx.ProcessEvents();
-    phys.Step(kTickDt);
-    debris.PostStep();
-    mobs.PostStep();
+    support::RunTicks(rig, 1);
+    t = rig.tick;
   };
 
   for (int i = 0; i < 20; i++) mobTick();  // healthy walk first: live gait pose
@@ -3492,7 +3487,8 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
                   DebrisSystem& debris, MobSystem& mobs,
                   const ItemLibrary& items, const std::string& attackerSpec,
                   const std::string& styleName,
-                  const std::string& targetSpec, int tailTicksWanted) {
+                  const std::string& targetSpec, int tailTicksWanted,
+                  Stream& stream, const std::vector<MaterialDef>& mats) {
   const StrikeSide A = ParseStrikeSide(attackerSpec);
   const StrikeSide B =
       ParseStrikeSide(targetSpec.empty() ? std::string("human") : targetSpec);
@@ -3551,21 +3547,14 @@ int RunStrikeShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
                {8, h / 16, 8}, false, false);
   ctx.WaitIdle();
 
+  // THE GAME'S OWN TICK (W2-O, test/tickrig.h), as --shot-mob's.
+  support::TickRig rig(
+      support::TickEngine{ctx, world, sim, stream, phys, mobs, debris, mats, items},
+      t, IVec3{8, h / 16, 8});
   auto mobTick = [&]() {
-    std::vector<BrushOp> ops;
-    std::vector<ParticleSpawn> spawns;
-    std::vector<CellOp> cellOps;
-    mobs.PreTick(t + 1, world, ops, cellOps, spawns);
-    debris.QueueSupportEvents(world.Snap());
-    debris.PreTick(t + 1, world, cellOps, spawns);
-    ++t;
-    SubmitTick(ctx, world, sim, t, kDefaultSeed, ops, {}, cellOps, false,
-               {8, h / 16, 8}, true, false, spawns);
-    ctx.WaitIdle();
-    ctx.ProcessEvents();
-    phys.Step(kTickDt);
-    debris.PostStep();
-    mobs.PostStep();
+    rig.tick = t;
+    support::RunTicks(rig, 1);
+    t = rig.tick;
   };
 
   // ---- HOW FAR APART: THE DISTANCE THE AI WOULD ACTUALLY COMMIT FROM -----
@@ -5688,11 +5677,12 @@ int main(int argc, char** argv) {
     return RunFluidBench(ctx, world, sim, mats, fluidBenchScene,
                          stOpt.jsonPath);
   if (!shotMob.empty())
-    return RunMobShot(ctx, world, sim, phys, debris, mobs, items, shotMob);
+    return RunMobShot(ctx, world, sim, phys, debris, mobs, items, shotMob,
+                      stream, mats);
   if (!shotStrikeA.empty())
     return RunStrikeShot(ctx, world, sim, phys, debris, mobs, items,
                          shotStrikeA, shotStrikeStyle, shotStrikeB,
-                         shotStrikeTail);
+                         shotStrikeTail, stream, mats);
   if (rebaseline) stOpt.rebaseline = true;
 
   // ---- --replay-ops <file> [--ticks N]: the record, played back ------------

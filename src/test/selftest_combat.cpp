@@ -79,6 +79,7 @@
 #include "sim/tuning.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -865,28 +866,25 @@ IVec3 FlatSpot(int cx, int cz, uint32_t seed) {
   return IVec3{bestX, World::TerrainHeight(bestX, bestZ, seed), bestZ};
 }
 
-// One tick, in the order PreTick runs in the game. A gate that ticked the
-// systems in a different order would be asserting on an ordering the frame loop
-// does not have.
+// ONE TICK OF THE GAME'S OWN TICK (W2-O): support::RunTicks runs
+// TickAuthority. This used to be "one tick, in the order PreTick runs in the
+// game" written out by hand — mobs.PreTick, debris, SubmitTick, the step — and
+// it was a copy of the tick as it stood that day: no day phase or rain word for
+// the body reactions, no contact-damage pass after the step, no vessel pass,
+// none of what the tick grew after it. The rig is built on first use, from the
+// tick and the fixture chunk the gate constructed this with; a gate may move
+// either between calls.
 struct Ticker {
   Ctx& c;
   uint32_t tick = 26000;
   IVec3 playerChunk{8, 8, 8};
+  std::unique_ptr<support::TickRig> rig;
   void operator()() {
-    std::vector<BrushOp> ops;
-    std::vector<CellOp> cellOps;
-    std::vector<ParticleSpawn> spawns;
-    c.mobs.PreTick(tick + 1, c.world, ops, cellOps, spawns);
-    c.debris.QueueSupportEvents(c.world.Snap());
-    c.debris.PreTick(tick + 1, c.world, cellOps, spawns);
-    ++tick;
-    SubmitTick(c.ctx, c.world, c.sim, tick, kDefaultSeed, ops, {}, cellOps,
-               false, playerChunk, true, false, spawns);
-    c.ctx.WaitIdle();
-    c.ctx.ProcessEvents();
-    c.phys.Step(kTickDt);
-    c.debris.PostStep();
-    c.mobs.PostStep();
+    if (!rig) rig = std::make_unique<support::TickRig>(c, tick, playerChunk);
+    rig->tick = tick;
+    rig->SetFixtureChunk(playerChunk);
+    support::RunTicks(*rig, 1);
+    tick = rig->tick;
   }
 };
 

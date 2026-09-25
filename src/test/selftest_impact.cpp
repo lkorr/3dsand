@@ -68,6 +68,7 @@
 #include "sim/tuning.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -186,9 +187,17 @@ uint64_t SpawnTarget(Ctx& c, const Target& t, int inset) {
   c.debris.Reset();
   const uint64_t id = mobs.Spawn(t.defIndex, FixtureSite(c.world, inset));
   if (!id) return 0;
+  // PINNED (the authored `dummy` profile, mobile: false), found by W2-O: the
+  // dissolution arms measure a limb on a body standing still, and an
+  // unprofiled creature only stood still under the hand-rolled ticks because
+  // they never submitted a world and it had no ground. On the real tick the
+  // bare-fist arm's body walked 61.9 voxels during its 60 dissolve ticks.
+  mobs.SetMobBehavior(id, "dummy");
   // A few physics steps only — no world submit. The creature has to be posed
   // and its limb transforms real before anything is measured off them, and
   // nothing here needs the CA to have run.
+  // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture POSING, not the subject, and
+  // every spawn replays ticks 3000.. so the arms' targets are posed alike.
   for (int i = 0; i < 8; i++) {
     std::vector<BrushOp> ops;
     std::vector<ParticleSpawn> spawns;
@@ -359,13 +368,17 @@ DissolveResult Dissolve(Ctx& c, uint64_t id, int limb, int ticks, float rate,
   tt.gore.bleedHpPerVoxel = 0.0f;
   SetCurrentTuning(tt);
   DissolveResult r;
-  std::vector<ParticleSpawn> spawns;
+  // THE REAL TICK (W2-O, test/tickrig.h): the dent is eaten by the body's own
+  // tick, and the rest of the tick (the world, the step, the contact pass)
+  // runs around it as it does in play. Every arm replays tick0.. so the arms
+  // differ by the profile, not by the clock.
+  const Vec3 o = mobs.MobOrigin(id);
+  uint32_t tick = tick0 - 1;
+  support::TickCursor ticker{
+      c, tick, IVec3{ifloor(o.x) >> 4, ifloor(o.y) >> 4, ifloor(o.z) >> 4}};
   for (int i = 0; i < ticks; i++) {
     if (!mobs.IsAlive(id) || !mobs.LimbBody(id, limb)) break;
-    std::vector<BrushOp> ops;
-    std::vector<CellOp> cellOps;
-    spawns.clear();
-    mobs.PreTick(tick0 + (uint32_t)i, c.world, ops, cellOps, spawns);
+    ticker();
     r.ticks = i + 1;
   }
   r.alive = mobs.IsAlive(id);
@@ -434,6 +447,7 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
       detail = "spawn refused";
       return Status::Fail;
     }
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture posing (SpawnTarget's).
     for (int i = 0; i < 8; i++) {
       std::vector<BrushOp> ops;
       std::vector<ParticleSpawn> st;
@@ -927,6 +941,7 @@ Status GateImpactArmor(Ctx& c, std::string& detail) {
       if (!m->WearItem(cuirass, chestSlot)) return r;
       r.wore = true;
     }
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture posing (SpawnTarget's).
     for (int i = 0; i < 8; i++) {
       std::vector<BrushOp> ops;
       std::vector<ParticleSpawn> st;
@@ -1162,6 +1177,9 @@ Status GateImpactFist(Ctx& c, std::string& detail) {
     uint32_t before = 0, afterBlows = 0, after = 0, bruise = 0, pulped = 0;
     bool attached = false, alive = false;
     int ticks = 0;
+    // WHAT THE DISSOLVE PHASE DID BESIDES THE PULP (CLAUDE.md rule 6): hp by
+    // the cause that charged it, falls billed, and how far the body moved.
+    std::string why;
   };
   auto run = [&](int inset, const StrikeProfile& p, uint32_t salt,
                  uint32_t tick0) -> Arm {
@@ -1193,8 +1211,28 @@ Status GateImpactFist(Ctx& c, std::string& detail) {
       // asserted: the gauntlet's ladder is impact-blunt's claim, made there.
       a.pulped =
           bloodMat ? mobs.LimbCoatMatCount(id, t.limb, bloodMat, pulpAt) : 0u;
+      float hp0[(int)DamageCause::Count] = {};
+      uint32_t falls0 = 0;
+      Vec3 o0{};
+      if (const Mob* m = mobs.FindMobById(id)) {
+        for (int k = 0; k < (int)DamageCause::Count; k++)
+          hp0[k] = m->HpLostBy((DamageCause)k);
+        falls0 = m->FallsBilled();
+        o0 = m->Origin();
+      }
       const DissolveResult d =
           Dissolve(c, id, t.limb, kPulpTicks, kPulpRot, tick0);
+      if (const Mob* m = mobs.FindMobById(id)) {
+        static const char* kCause[] = {"other", "blade", "blunt", "bite", "beam",
+                                       "blast", "unarmed", "burn", "spawnRot",
+                                       "fall"};
+        a.why = Format("moved %.1f vox, falls %u, hp by cause:",
+                       (m->Origin() - o0).len(), m->FallsBilled() - falls0);
+        for (int k = 0; k < (int)DamageCause::Count; k++) {
+          const float dh = m->HpLostBy((DamageCause)k) - hp0[k];
+          if (dh > 1e-4f) a.why += Format(" %s %.2f", kCause[k], dh);
+        }
+      }
       a.ticks = d.ticks;
       a.attached = d.attached;
       a.alive = d.alive;
@@ -1207,6 +1245,39 @@ Status GateImpactFist(Ctx& c, std::string& detail) {
 
   const Arm bare = run(415, fist, 0xF15Du, 9000u);
   const Arm iron = run(425, gaunt->strike, 0x1207u, 9500u);
+  std::printf("impact-fist dissolve: BARE %s | GAUNTLET %s\n", bare.why.c_str(),
+              iron.why.c_str());
+  // THE UNSTRUCK CONTROL (W2-O attribution): the same limb, same ticks, same
+  // rate, no blow at all. Whatever it loses is not the fist's.
+  {
+    const uint64_t cid = SpawnTarget(c, t, 435);
+    if (cid) {
+      const uint32_t b0 = LiveVoxels(mobs, cid, t.limb);
+      const uint32_t art0 = mobs.LimbArtVoxelCount(cid, t.limb);
+      const uint32_t tomb0 = mobs.LimbMaterialCount(cid, t.limb, 0u);
+      Dissolve(c, cid, t.limb, kPulpTicks, kPulpRot, 9800u);
+      const uint32_t b1 = mobs.LimbBody(cid, t.limb) ? LiveVoxels(mobs, cid, t.limb) : 0u;
+      std::printf("impact-fist control (no blows): live %u -> %u (art %u -> %u, "
+                  "tombstones %u -> %u)\n", b0, b1, art0,
+                  mobs.LimbArtVoxelCount(cid, t.limb), tomb0,
+                  mobs.LimbMaterialCount(cid, t.limb, 0u));
+      mobs.Reset();
+      c.debris.Reset();
+    }
+    // ...and the same at the SHIPPED pulp rate: tombstones that still appear
+    // here are not the pulp tick's at all.
+    const uint64_t cid2 = SpawnTarget(c, t, 445);
+    if (cid2) {
+      const uint32_t tomb0 = mobs.LimbMaterialCount(cid2, t.limb, 0u);
+      Dissolve(c, cid2, t.limb, kPulpTicks, CurrentTuning().gore.pulpRotRate,
+               9900u);
+      std::printf("impact-fist control (no blows, shipped pulp rate %.2f): "
+                  "tombstones %u -> %u\n", CurrentTuning().gore.pulpRotRate,
+                  tomb0, mobs.LimbMaterialCount(cid2, t.limb, 0u));
+      mobs.Reset();
+      c.debris.Reset();
+    }
+  }
 
   const uint32_t bareLost = bare.before > bare.after ? bare.before - bare.after : 0u;
   const uint32_t ironLost = iron.before > iron.after ? iron.before - iron.after : 0u;
@@ -1581,13 +1652,15 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
     r.rot1 = r.rot0;
     r.vox1 = r.vox0;
     r.bone1 = r.bone0;
-    uint32_t tick = 40000;
+    // THE REAL TICK (W2-O, test/tickrig.h): the rot spreads through the body's
+    // own tick with the world, the step and the contact pass running round it.
+    uint32_t tick = 39999;
+    const Vec3 fo = mobs.MobOrigin(id);
+    support::TickCursor ticker{
+        c, tick, IVec3{ifloor(fo.x) >> 4, ifloor(fo.y) >> 4, ifloor(fo.z) >> 4}};
     for (int i = 0; i < kTicks; i++) {
       if (!mobs.LimbBody(id, t.limb)) break;
-      std::vector<BrushOp> ops;
-      std::vector<CellOp> cellOps;
-      spawns.clear();
-      mobs.PreTick(tick++, c.world, ops, cellOps, spawns);
+      ticker();
       // Kept from the last tick the limb was STILL ON, for arm A of
       // `bite-rot`'s reason: reading after a collapse measures a stump.
       const uint32_t was = r.rot1;
@@ -1835,7 +1908,11 @@ Status GateJointRot(Ctx& c, std::string& detail) {
     // it.
     r.vox0 = mobs.LimbArtVoxelCount(id, t.limb);
     r.voxLast = r.vox0;
-    uint32_t tick = 40000;
+    // THE REAL TICK (W2-O, test/tickrig.h), as bite-rot's.
+    uint32_t tick = 39999;
+    const Vec3 fo = mobs.MobOrigin(id);
+    support::TickCursor ticker{
+        c, tick, IVec3{ifloor(fo.x) >> 4, ifloor(fo.y) >> 4, ifloor(fo.z) >> 4}};
     for (int i = 0; i < kTicks; i++) {
       if (!mobs.LimbBody(id, t.limb)) {
         r.offAt = i;
@@ -1846,10 +1923,7 @@ Status GateJointRot(Ctx& c, std::string& detail) {
       // The last reading taken while the limb was STILL ON is the only one
       // that means anything — after the sever this counts a stump.
       r.voxLast = mobs.LimbArtVoxelCount(id, t.limb);
-      std::vector<BrushOp> ops;
-      std::vector<CellOp> cellOps;
-      spawns.clear();
-      mobs.PreTick(tick++, c.world, ops, cellOps, spawns);
+      ticker();
     }
     mobs.Reset();
     c.debris.Reset();
@@ -1997,6 +2071,7 @@ Status GateBiteLimbs(Ctx& c, std::string& detail) {
     c.debris.Reset();
     const uint64_t id = mobs.Spawn(defIndex, FixtureSite(c.world, inset));
     if (!id) return 0;
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture posing (SpawnTarget's).
     for (int i = 0; i < 8; i++) {
       std::vector<BrushOp> ops;
       std::vector<ParticleSpawn> spawns;

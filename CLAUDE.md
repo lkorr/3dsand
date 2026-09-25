@@ -243,6 +243,21 @@ better answer than eight redundant green runs.
 The rules above tell you to RUN less. These tell you to BUILD things that don't
 need many runs:
 
+- **A gate ticks THE tick: `support::RunTicks` / `support::TickCursor`
+  (`src/test/tickrig.h`), which run `TickAuthority`.** Never hand-roll
+  `mobs.PreTick` + `debris.PreTick` + `SubmitTick` + `phys.Step`: every such
+  copy froze the tick as it stood the day it was written and missed what the
+  real one grew after (the day phase and rain word the body reactions read,
+  the contact-damage pass, the vessel pass, the op order) — the "harness stops
+  where the game keeps going" trap. The rig's body is a fly-mode camera; the
+  window stays pinned, the mirror centres on your fixture chunk, the NPC
+  player list is yours, your ops go in first and your explosions go off in
+  the grenade slot. A direct phase call is allowed ONLY when the gate
+  deliberately tests that one phase, and carries a `DIRECT PHASE CALLS ON
+  PURPOSE (W2-O): <why>` comment. Still hand-rolled as of W2-O: the
+  avatar-driven tickers (a gate scripting `Player` directly — needs a
+  scripted-controller seam on the rig) and the files not yet converted
+  (phys, player, swing, floaters, equipment, audio, sim, worldio, net).
 - **A new gate must be verifiable with `--gate <name>` alone.** If confirming it
   works requires a separate smoke pass, a manual read of terminal output, or a
   second run with different flags, the gate is too expensive to iterate on.

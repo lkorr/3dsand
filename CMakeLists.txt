@@ -548,6 +548,9 @@ add_library(sandvox_core OBJECT
   # do, not because it is a test.
   src/tools/voxregion.cpp
   src/test/support.cpp
+  # THE REAL TICK FOR GATES (W2-O): support::TickRig / RunTicks drive
+  # TickAuthority, not a hand-rolled copy of part of it.
+  src/test/tickrig.cpp
   src/test/selftest.cpp
   src/test/selftest_voxregion.cpp
   src/test/selftest_grimoire.cpp

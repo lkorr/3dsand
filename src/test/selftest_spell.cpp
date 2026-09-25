@@ -38,6 +38,7 @@
 #include "sim/worldmap.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 
 using namespace sandvox;
 
@@ -1361,21 +1362,12 @@ Status GateSpells(Ctx& c, std::string& detail) {
         return -1;
       };
       uint32_t t = 9000;
+      // THE REAL TICK (W2-O, test/tickrig.h), the mirror on `pc` (which the
+      // cauterise arm moves with the wandering creature).
+      support::TickCursor ticker{c, t, pc};
       auto mobTick = [&]() {
-        std::vector<BrushOp> ops;
-        std::vector<ParticleSpawn> spawns;
-        std::vector<CellOp> cellOps;
-        mobs.PreTick(t + 1, world, ops, cellOps, spawns);
-        c.debris.QueueSupportEvents(world.Snap());
-        c.debris.PreTick(t + 1, world, cellOps, spawns);
-        ++t;
-        SubmitTick(c.ctx, world, c.sim, t, kDefaultSeed, ops, {}, cellOps, false, pc,
-                   true, false, spawns);
-        c.ctx.WaitIdle();
-        c.ctx.ProcessEvents();
-        c.phys.Step(kTickDt);
-        c.debris.PostStep();
-        mobs.PostStep();
+        ticker.chunk = pc;
+        ticker();
       };
       for (int i = 0; i < 6; i++) mobTick();
       // A small blast into the torso (the biggest limb) takes a bite out of it.
@@ -1427,12 +1419,8 @@ Status GateSpells(Ctx& c, std::string& detail) {
         // clock and is nowhere near the fire).
         const uint64_t stumpKey = (id << 8) ^ (uint64_t)(parent + 1);
         auto soakTick = [&]() {
-          std::vector<BrushOp> ops;
-          std::vector<ParticleSpawn> spawns2;
-          std::vector<CellOp> cellOps;
-          mobs.PreTick(t + 1, world, ops, cellOps, spawns2);
-          c.debris.QueueSupportEvents(world.Snap());
-          c.debris.PreTick(t + 1, world, cellOps, spawns2);
+          support::TickOps pre;
+          std::vector<CellOp>& cellOps = pre.cells;
           const IVec3 b{ifloor(woundW.x), ifloor(woundW.y), ifloor(woundW.z)};
           for (int dz = -2; dz <= 2; dz++)
             for (int dy = -2; dy <= 2; dy++)
@@ -1443,14 +1431,8 @@ Status GateSpells(Ctx& c, std::string& detail) {
                 cellOps.push_back({World::SlotCellIndex(cc),
                                    PackVoxNew(mFire, 7u) | kCellOpIfAir});
               }
-          ++t;
-          SubmitTick(c.ctx, world, c.sim, t, kDefaultSeed, ops, {}, cellOps, false, pc,
-                     true, false, spawns2);
-          c.ctx.WaitIdle();
-          c.ctx.ProcessEvents();
-          c.phys.Step(kTickDt);
-          c.debris.PostStep();
-          mobs.PostStep();
+          ticker.chunk = pc;
+          ticker(pre);
         };
         for (int i = 0; haveWound && i < 1500 && charTick < 0; i++) {
           // The creature WANDERS: the fire follows the wound, and the mirror
