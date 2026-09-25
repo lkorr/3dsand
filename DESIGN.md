@@ -4986,6 +4986,103 @@ The `damage-cause` gate is the proof it changed nothing: it walks every
 expression, written out verbatim, and checks that the shipped `undead` defs
 are exactly the `rotten` ones.
 
+### One damage event, one shell response (2026-09-24, W2-H; `game/shellresponse.h`, `BlastForceOf`, `Mob::ApplyFallDamage`, gate `damage-sources`)
+
+**What a worn shell does to a blow is ONE function of two things**: the
+hardness of the voxel the blow STRUCK (`Mob::ShellMaterialAt`: the nearest
+live voxel of the shell's authoritative lattice) and the blow's
+`DamageCause`. `ShellResponseOf(hardness, cause)` answers four numbers, each a
+scale on something the caller already did: `carve` (the shell's share of the
+matter removal — kerf depth/length, dent radius, bore), `passed` (the share of
+the hp that reaches the limb underneath, `MobLimb::wornHost`), `shellHp` (the
+share the shell is charged itself) and `stop` (blast only: power a ray loses
+crossing it). The rows (`ShellRowOf`) read their numbers from `Tuning::Gear`:
+
+| cause | carve | passed | shellHp | stop |
+|---|---|---|---|---|
+| Blade | ratio `cutHardnessRef`/h, floor `cutHardnessMin` | 0 | 1 | — |
+| Blunt, Unarmed | ratio `bluntHardnessRef`/h, floor `bluntHardnessMin` | `bluntThrough` | `bluntShellHp` | — |
+| Bite | 0 | ramp `biteThroughSoft`..`biteThroughHard` | `biteOnShell` (as a blunt blow) | — |
+| Blast | 1 (the terrain rule acts per voxel) | 1 | 1 | h × `blastShellCells` |
+| Beam, Other, Burn, SpawnRot | 1 | 0 | 1 | — |
+| Fall | 0 | 1 | 0 | — |
+
+Until W2-H this existed three times (`CutLimb`, `BluntHit`, `BiteHit`, three
+curves, three tuning pairs, each reading `skinVoxels[0]` — the lattice's FIRST
+voxel, not the struck one), and every other source ignored shells. The melee
+rows are the old numbers moved; `damage-sources` arm A walks a hardness sweep
+against the three formulas written out verbatim. Reading the struck voxel
+changes nothing for any shipped garment (the gate's report: every shell of
+every shipped worn item is one material) — it matters for a mixed-material
+piece and for a shell whose first voxel has been burnt to a tombstone.
+
+**An explosion's body crater follows POWER, like the terrain's.**
+`sim_explode.wgsl` decides a cell by the power that reaches it: the blast's,
+less `sim.falloffPerCell` per cell of distance, less the hardness of
+everything the ray crossed; the cell goes if that beats its own hardness. The
+body crater (`Mob::CarveLimbRadial` with `blastPower` > 0, which is what
+`ExplosionHitsBodies` passes) takes the same budget per voxel — less the
+`stop` of every worn shell over that limb the ray from the centre crosses
+(`Mob::BlastShellStop`, the shell-index march the burn probe uses, memoised
+per half-voxel) — and what is left over the voxel's own hardness, against
+`gore.blastPowerRef`, scales the crater radius AT that voxel. The ragged rim is
+drawn inside that radius, so plate leaves a smaller torn crater rather than a
+thinned speckle. At or above the reference the crater is the full radius, so
+a grenade on bare flesh is exactly what it was (asserted); behind an iron
+cuirass (160 off a grenade's 380) or from a weak blast it shrinks. A blast
+that states no power (a splat, a test) keeps the radius-only crater. Body
+limbs carve before their appended shells, so the flesh sees the plate the
+blast met, not the hole the same blast puts in it.
+
+**One place reads a blast's reach and strength**: `BlastForceOf(ExplosionOp)`
+(`game/session.h`) — `craterRadius` (radius × `physics.explosionBodyDamageScale`),
+ONE `pushRadius` (radius × `physics.explosionImpulseRadiusScale`) for the debris
+impulse and the rig launch alike (`ragdoll.blastRadiusScale`, which held the
+same 3.0, is retired), `debrisImpulse` per loose body and `rigImpulse` per
+creature. The two impulse scales stay two numbers because they are two
+quantities (a shove per body, a launch per creature divided by its mass); one
+scale for both would have moved a grenade's launch 6.7×.
+
+**A landing is the body's, not the player's.** `Mob::ApplyFallDamage` (was
+`PlayerAvatar::ApplyFallDamage`) bills every creature: the avatar's two
+producers as before, and now `MobSystem::PreTick` bills a limp NPC's
+`TakeRagdollImpact`, so a blasted creature that lands hard is hurt and one that
+lands at splat speed comes apart. Its constants are `player.fall*` in
+tuning.json; the legs that bleed are the limbs TAGGED `leg`/`foot`, not names
+containing "leg"; the splat's shove skips every living creature's limbs, like
+an explosion's. The sub-lethal bill and the caster's overcast both go through
+`Mob::SpendHp`, which spreads the hp over the live slots as one `Mob::Damage`
+per slot with the caller's cause — so hp 0 means what the sever table says (a
+vital limb dies in place; an arm stays on) rather than the old "sever whatever
+reached zero". A fatal overcast (`PlayerAvatar::SelfDestruct`) is the ordinary
+radial carve and then death, where it used to sever every limb in range.
+
+**The laser charges once** (`MobSystem::LaserHit`): one `Mob::Damage` with
+`DamageCause::Beam` on whichever creature owns the body, through the Beam row
+on a worn shell. The session called `avatar.Damage` and then `mobs.Damage`,
+whose second half already walks every avatar.
+
+**A thrown rock is a blow** (`MobSystem::ApplyContactDamage`, phase 2). The
+Jolt contact listener fed only audio and vessel breaks, so a thrown rock, a
+falling log or a flung limb never hurt anybody. After every physics step the
+session reads the step's NEW contacts (`Physics::ContactImpacts`); one between
+a loose body and a living creature's limb is a BLUNT blow on that limb through
+`Mob::BluntHit` (bruise, hp, and on a shell the Blunt row's transmitted share),
+no dent and no plate broken. Its size is the contact IMPULSE — the striker's
+mass (reduced against the whole creature's when the creature is limp) times
+the STRIKER's approach speed: the limb's own velocity toward the other body is
+taken back out, so a creature walking into a resting log kicks it rather than
+being struck by it — over `gore.contactImpulseMin`, at `gore.contactHpPerImpulse`,
+capped at `gore.contactMaxHp` a contact and `gore.contactMaxPerTick` contacts a
+tick. The listener fills its list from Jolt's job threads in no fixed order, so
+the candidates are SORTED (impulse, then handles) before the cap is taken.
+Creature-on-creature and body-on-terrain contacts are not this path's (melee
+and the landing own them). The player is NOT reached: its limbs are on
+`Layers::AVATAR`, which the listener drops by design (your own limbs are
+permanently inside your capsule). Measured (`damage-sources` F): a 70 kg stone
+block at 15 m/s costs a standing human 102 hp over 5 contacts; in the iron
+cuirass 66, with 36 on the plate; at 1.5 m/s nothing.
+
 ### Damage kinds: cut, blunt, bite (2026-09-15; `game/impact.h`, `Mob::BluntHit` / `Mob::BiteHit`, `sim/tuning.h` §E6, `docs/PLAN_impact_unarmed.md`)
 
 Everything above is a KERF, and until this landed a kerf was all there was:
@@ -5255,7 +5352,7 @@ by), the drip's spray, the arterial gout, and the whole voxels a sever throws.
 A whole voxel costs `gore.bleedHpPerVoxel`; a micro droplet costs
 `1/microScale³` of that, because that is the fraction of a voxel it is. The cost
 is spread across the live *authored* limbs in proportion to what each still has
-(the same spread `PlayerAvatar::SpendHealth` uses for an overcast, and for the
+(the same spread `Mob::SpendHp` uses for an overcast, and for the
 same reason: draining the first limb to zero picks an arbitrary limb to ruin),
 so every limb reaches zero on the same tick and the creature dies through the
 ordinary `Die()` — systemic, the corpse keeps its limbs. Held items and worn
@@ -6293,7 +6390,8 @@ already being per voxel: the derived collider's plurality blocks take flesh
 and muscle in the world grid; the burn gate's body census counts flesh and
 muscle as body and as charrable flesh (bone in neither). What it does NOT do
 yet, stated so nobody infers it from a screenshot: hp per carved voxel is
-still pure volume (`kCarveDamagePerVolume`) — bone costs what skin costs;
+still pure volume (`gore.carveHpPerVolume`, the former constant
+`kCarveDamagePerVolume`) — bone costs what skin costs;
 severing (`Sever`) still does nothing to the cross-section, which is now
 exactly why it needs nothing. (`StainWound` stopped soaking bone the same
 day — see "A wound is seen" above.)
@@ -8272,8 +8370,8 @@ capsule otherwise fires out of it.
 
 **The launch is a velocity, not an impulse, and it is capped.** A blast's
 other half runs beside the debris impulse in the explosion loop:
-`MobSystem::BlastMobsRadial(ec, radius × blastRadiusScale, power ×
-blastImpulseScale)`. Per creature: impulse at the pelvis by linear falloff,
+`MobSystem::BlastMobsRadial(ec, radius × explosionImpulseRadiusScale, power ×
+blastImpulseScale)` (both read through `BlastForceOf` since W2-H). Per creature: impulse at the pelvis by linear falloff,
 divided by the rig's Jolt mass (`Physics::BodyMass`, readable on a kinematic
 body), gives a speed in m/s; below `blastMinSpeed` nothing happens (a distant
 boom rattles, it does not floor you), above `maxLaunchSpeed` it is clamped —
@@ -8413,8 +8511,9 @@ off the solver rather than off a sweep: `Mob::TickRagdollArrest` differences the
 rig's mass-weighted centre-of-mass velocity tick over tick, subtracts the gravity
 step so free flight reads as zero, and keeps only change that OPPOSES the travel,
 so neither gravity nor a blast (which SETS the velocity) can be read as a
-landing. `PlayerAvatar::PreTick`'s limp branch hands it to the same
-`ApplyFallDamage` and the same `player.fallDamageSpeed` / `fallSplatSpeed`
+landing. `PlayerAvatar::PreTick`'s limp branch — and, since W2-H, an NPC's in
+`MobSystem::PreTick` — hands it to the same
+`Mob::ApplyFallDamage` and the same `player.fallDamageSpeed` / `fallSplatSpeed`
 thresholds the driven branch uses. Three things about it are not obvious and all
 three were found by measurement, not design:
 - **A rig does not stop in one tick.** The player's AABB sweep refuses the whole

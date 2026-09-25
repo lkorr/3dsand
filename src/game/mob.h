@@ -15,6 +15,7 @@
 #include "game/melee.h"     // WeaponPose: the stroke driver's command to the rig
 #include "game/selfclip.h"  // ClipReport: is this pose inside itself
 #include "game/severpolicy.h"  // DamageCtx + the (cause, tissue) sever table
+#include "game/shellresponse.h"  // what a worn shell does to a blow (W2-H)
 #include "game/strokes.h"   // NpcStroke: one authored swing, live
 #include "math3d.h"
 #include "phys/debris.h"
@@ -2080,14 +2081,61 @@ class Mob {
   // screen (game/avatar.h).
   virtual void OnDying() {}
   // Per-voxel carving: remove real voxels from a live limb (docs/DESIGN.md §7).
+  //
+  // `blastPower` > 0 (a Blast that states its power: an explosion) switches
+  // the crater to the terrain rule (W2-H): the power reaching each voxel is
+  // blastPower less sim.falloffPerCell per voxel of distance less every worn
+  // shell the ray from the centre crossed (game/shellresponse.h), and what is
+  // left over the voxel's hardness, against gore.blastPowerRef, scales the
+  // crater radius AT that voxel. 0 = the radius-only crater (a splat, a test).
   bool CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                        float radiusVoxels, bool ragged, bool eject, World& world,
                        std::vector<ParticleSpawn>& spawns,
-                       const DamageCtx& ctx = {});
+                       const DamageCtx& ctx = {}, float blastPower = 0.0f);
   // Every live limb of THIS creature within the blast — the explosion path
-  // (DamageCause::Blast).
+  // (DamageCause::Blast by default; a splat or an overcast states its own).
+  // `power` as CarveLimbRadial's `blastPower`.
   void CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
-                      std::vector<ParticleSpawn>& spawns);
+                      std::vector<ParticleSpawn>& spawns, float power = 0.0f,
+                      const DamageCtx& ctx = DamageCtx(DamageCause::Blast));
+  // ---- ONE DAMAGE EVENT, ONE SHELL RESPONSE (W2-H, game/shellresponse.h) --
+  //
+  // The material of the voxel of slot `limbIndex` a blow STRUCK: the live
+  // lattice voxel nearest `worldPos` (the authoritative lattice -- the skin
+  // when there is one). 0 when the slot has no live voxel. Until W2-H the
+  // three shell rules read `skinVoxels[0]`, whatever that was.
+  uint32_t ShellMaterialAt(int limbIndex, Vec3 worldPos) const;
+  // Hardness (materials.json 0..255) of a material id; 0 when unknown.
+  float MaterialHardness(uint32_t mat) const;
+  // ShellResponseOf(hardness of the struck voxel, cause) for a worn slot.
+  ShellResponse ShellResponseAt(int limbIndex, Vec3 worldPos,
+                                const DamageCtx& ctx) const;
+  // The power a blast ray loses to the shells worn over body limb `bodyLimb`
+  // between `from` and `from + dir * dist`: the sum of each crossed shell's
+  // ShellResponse::stop (each shell counted once). 0 undressed.
+  float BlastShellStop(int bodyLimb, const Vec3& from, const Vec3& dir,
+                       float dist);
+  // ---- hp spent without a wound: an overcast, a landing (W2-H) ------------
+  // Spread `amount` over every live, blooded slot (the set the player's bar
+  // sums: PlayerAvatar::TotalHealth) in proportion to what each holds, as one
+  // Mob::Damage per slot carrying `ctx` -- so what hp 0 does is W2-G's table
+  // (a vital limb at zero dies in place, an arm at zero stays on), not a
+  // Sever() of whatever reached zero. Returns false if the creature died.
+  bool SpendHp(float amount, const DamageCtx& ctx);
+  // The summed hp of SpendHp's set.
+  float SpendableHp() const;
+  // A hard landing, for EVERY creature (was PlayerAvatar::ApplyFallDamage).
+  // `impactDeltaV` is voxels/s (Player::impactDeltaV for the controller,
+  // Mob::TakeRagdollImpact for a limp rig); `centerWorldVoxel` is where a splat
+  // is centred. Thresholds and consequences are player.fall* in tuning.json.
+  // Returns true when a landing was billed.
+  bool ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel, uint32_t tick,
+                       World& world, std::vector<BrushOp>& ops,
+                       std::vector<ParticleSpawn>& spawns);
+  // Landings billed to this creature since spawn, and the hp they cost
+  // (gate readout: damage-sources).
+  uint32_t FallsBilled() const { return fallsBilled_; }
+  float FallHpBilled() const { return fallHpBilled_; }
 
   // ---- per-voxel burning ----------------------------------------------------
   // Set fire to up to `count` of a limb's surface voxels; returns how many took.
@@ -3836,6 +3884,8 @@ class Mob {
   Vec3 ragdollLastVel_{};
   bool ragdollVelValid_ = false;
   Vec3 ragdollImpact_{};     // peak braking EVENT since last drained
+  uint32_t fallsBilled_ = 0;  // ApplyFallDamage bills (FallsBilled)
+  float fallHpBilled_ = 0.0f;
   Vec3 ragdollArrestRun_{};  // the braking event in progress
   float ragdollArrestCap_ = 0.0f;  // ...and the speed it opened with
   uint8_t ragdollArrestTicks_ = 0;
@@ -4124,8 +4174,8 @@ class Mob {
   static constexpr uint32_t kMaxCarveFragments = 3;
   // Below this fraction of its authored volume a limb severs.
   static constexpr float kLimbCollapseFraction = 0.25f;
-  // Carve damage per voxel removed, as a fraction of the limb's volume.
-  static constexpr float kCarveDamagePerVolume = 1.5f;
+  // (Carve damage per volume lost is gore.carveHpPerVolume in tuning.json
+  // since W2-H; it was the constant kCarveDamagePerVolume = 1.5.)
   // Voxels a limb may burn away before its collider is re-derived:
   // max(floor, voxels >> shift).
   static constexpr uint32_t kBurnRebuildFloor = 12;
@@ -4674,6 +4724,31 @@ class MobSystem {
   // a blow is HitReact below, not a keyframed pose. `ctx`: Mob::Damage.
   bool Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
               float impactSpeed = 0.0f, const DamageCtx& ctx = {});
+  // ONE TICK OF THE LASER ON A CREATURE (W2-H). One Mob::Damage of
+  // tools.laserDamage with DamageCause::Beam on whichever creature -- NPC,
+  // corpse, any avatar -- owns `bodyHandle`; on a worn shell both the hp and
+  // the bore are scaled by the Beam row of game/shellresponse.h. True when
+  // the handle was a creature's limb and was charged; `boreOut` is then the
+  // radius the caller carves next phase. Replaces the session's
+  // `avatar.Damage` + `mobs.Damage` pair, whose first half was already
+  // covered by the second.
+  bool LaserHit(uint64_t bodyHandle, Vec3 hitWorldVoxel, float& boreOut);
+  // Laser ticks that charged a creature (gate readout: damage-sources).
+  uint32_t LaserHitsCharged() const { return laserHitsCharged_; }
+  // ---- A THROWN ROCK IS A BLOW (W2-H phase 2) ------------------------------
+  // Read the last physics step's NEW contacts (Physics::ContactImpacts) and
+  // bill every one where a loose body struck a living creature's limb with an
+  // impulse over gore.contactImpulseMin as a Mob::BluntHit on that limb (so a
+  // worn shell answers it through the shell table). Deterministic: the
+  // listener fills its list from Jolt's job threads in no fixed order, so the
+  // candidates are SORTED (impulse, then handles) before the per-tick cap is
+  // taken and before anything is charged. Call after Physics::Step. Returns
+  // the number billed. Creature-on-creature and body-on-terrain contacts are
+  // not this path's (melee and the landing own those); the player's limbs are
+  // on Layers::AVATAR, which the listener does not report.
+  int ApplyContactDamage(const Physics& phys, World& world,
+                         std::vector<ParticleSpawn>& spawns);
+  uint32_t ContactHitsBilled() const { return contactHitsBilled_; }
 
   // THE DIRECTIONAL HALF OF A LANDED BLOW (Mob::HitReact). By body handle for
   // the reason Damage is: the melee sweep knows a Jolt body and a travel
@@ -4722,13 +4797,17 @@ class MobSystem {
   // its real body at the landing tick (RemoteExplosionsHitOwnAvatars) and its
   // gore reaches both worlds from there. Emitting it here too would put the
   // blood in the shared batch twice.
+  //
+  // `power` is the explosion's (ExplosionOp::power): > 0 carves by the terrain
+  // rule with worn shells in the way (Mob::CarveLimbRadial); 0 = radius only.
   void CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels, World& world,
-                       std::vector<ParticleSpawn>& spawns);
+                       std::vector<ParticleSpawn>& spawns, float power = 0.0f);
   // Only THIS process's avatars (the leading `localCount` of SetAvatars): the
   // owner-side half of a PEER's blast. No NPC, no ghost.
   void CarveLocalAvatarsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                World& world,
-                               std::vector<ParticleSpawn>& spawns);
+                               std::vector<ParticleSpawn>& spawns,
+                               float power = 0.0f);
   int BlastLocalAvatarsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                               float impulseKgMs);
   // The blast's OTHER half: knock every creature in reach off its feet
@@ -6226,6 +6305,8 @@ class MobSystem {
       if (avatars_[i] != nullptr) avatars_[i]->owner_ = localPlayerId_;
   }
   std::vector<ParticleSpawn> ghostSpawns_;  // CarveMobsRadial's discard
+  uint32_t laserHitsCharged_ = 0;  // LaserHit: ticks that charged a creature
+  uint32_t contactHitsBilled_ = 0;  // ApplyContactDamage: contacts billed
   uint64_t nextId_ = 1;
   // ---- ownership state (M9.4-B) -------------------------------------------
   // All three are PROCESS state, not world state: none is hashed, none is

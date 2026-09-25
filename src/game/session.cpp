@@ -835,11 +835,15 @@ static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
           // expired is back on MOVING and no longer owned, so it takes the
           // beam like any other debris — which is the intent. What it must
           // never again do is take the beam off the head it was fired from.
-          if (avatar.Damage(hitBody, CurrentTuning().tools.laserDamage,
-                            hitPos, 0.0f, DamageCtx(DamageCause::Beam))) {
-            // handled by the avatar
-          } else if (mobs.Damage(hitBody, CurrentTuning().tools.laserDamage,
-                                 hitPos, 0.0f, DamageCtx(DamageCause::Beam))) {
+          //
+          // ONE CHARGE (W2-H). This was `avatar.Damage(...)` and then
+          // `mobs.Damage(...)`, and the second already walks every avatar
+          // (MobSystem's registered list, W1-F) -- so the first was a copy
+          // that could only ever find what the second finds, and a hit it did
+          // find was charged but never bored. MobSystem::LaserHit is the one
+          // charge, through the shell table on a worn slot.
+          float bore = 0.0f;
+          if (mobs.LaserHit(hitBody, hitPos, bore)) {
             // A limb hit is now BOTH: the hp/sever logic above (joint
             // crossings, flinch, loco states) AND a real channel bored through
             // the flesh. Deferred like the melt below, for the same reason.
@@ -847,8 +851,7 @@ static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
             // Damage() may have severed the limb outright, in which case this
             // handle is no longer a live limb — the carve then simply misses
             // (CarveLimbRadial returns false) rather than touching stale state.
-            laserCut = {hitBody, hitPos,
-                        (float)CurrentTuning().tools.laserCarveRadius, true};
+            laserCut = {hitBody, hitPos, bore, true};
           } else {
             // Deferred: the melt needs the `spawns` list that debris.PreTick
             // fills further down, and the ray must be cast HERE where the
@@ -3402,22 +3405,32 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
 }
 
 // ---- ONE EXPLOSION AGAINST EVERY BODY (session.h) -------------------------
+BlastForce BlastForceOf(const ExplosionOp& e) {
+  const Tuning& t = CurrentTuning();
+  BlastForce f;
+  f.center = Vec3{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
+  f.debrisCenter = Vec3{(float)e.x, (float)e.y, (float)e.z};
+  f.craterRadius = (float)e.radius * t.physics.explosionBodyDamageScale;
+  f.pushRadius = (float)e.radius * t.physics.explosionImpulseRadiusScale;
+  f.debrisImpulse = (float)e.power * t.physics.explosionImpulseScale;
+  f.rigImpulse = (float)e.power * t.ragdoll.blastImpulseScale;
+  f.power = (float)e.power;
+  return f;
+}
+
 void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
                          DebrisSystem& debris, MobSystem& mobs,
                          std::vector<ParticleSpawn>& spawns, BlastBodies who) {
-  const Vec3 ec{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
-  const float edr =
-      (float)e.radius * CurrentTuning().physics.explosionBodyDamageScale;
-  const auto& rg = CurrentTuning().ragdoll;
-  const float reach = (float)e.radius * rg.blastRadiusScale;
-  const float impulse = (float)e.power * rg.blastImpulseScale;
+  // Reach and strength come from ONE place (BlastForceOf, session.h).
+  const BlastForce f = BlastForceOf(e);
   if (who == BlastBodies::OwnAvatars) {
     // A PEER's blast on this machine: the same carve and the same launch as
     // below, on this process's own avatars only. The debris, the NPCs and the
     // impulse are left alone -- this is the owner-side half of a player hit,
     // not a second application of the whole blast.
-    mobs.CarveLocalAvatarsRadial(ec, edr, world, spawns);
-    mobs.BlastLocalAvatarsRadial(ec, reach, impulse);
+    mobs.CarveLocalAvatarsRadial(f.center, f.craterRadius, world, spawns,
+                                 f.power);
+    mobs.BlastLocalAvatarsRadial(f.center, f.pushRadius, f.rigImpulse);
     return;
   }
   // Blow voxels OFF the bodies in range before shoving what survives:
@@ -3425,7 +3438,7 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   // separate bodies when the crater severs it. Runs first so the
   // impulse below acts on the post-damage bodies (including the new
   // fragments, which is what makes a blown-apart object scatter).
-  debris.DamageBodiesRadial(ec, edr, world, spawns);
+  debris.DamageBodiesRadial(f.center, f.craterRadius, world, spawns);
   // Living flesh craters too: a blast next to a mob tears voxels off
   // its limbs, and takes a limb clean off when it removes enough of it.
   // Same call shape as the debris line above — that parallel is the
@@ -3433,7 +3446,12 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   // its registered avatars after the NPCs, so another player standing
   // in this session's blast is carved. It used to be this session's
   // own `avatar.CarveRadial` beside it, which reached nobody else.
-  mobs.CarveMobsRadial(ec, edr, world, spawns);
+  //
+  // WITH ITS POWER (W2-H): the body crater follows the terrain crater's
+  // rule, so a weak blast tears less than a strong one of the same radius
+  // and a worn shell in the way takes its hardness off the flesh behind it
+  // (Mob::CarveLimbRadial, game/shellresponse.h).
+  mobs.CarveMobsRadial(f.center, f.craterRadius, world, spawns, f.power);
   // The per-body impulse is for DEBRIS. A living creature's limbs are
   // skipped whether kinematic (standing) or dynamic (already limp
   // from an earlier blast): impulse / limb mass on a 0.3 kg hand is
@@ -3442,11 +3460,8 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   std::vector<uint64_t> rigBodies;
   mobs.AppendLiveLimbBodies(rigBodies);  // NPCs + every avatar
   std::sort(rigBodies.begin(), rigBodies.end());
-  phys.ApplyRadialImpulse(
-      Vec3{(float)e.x, (float)e.y, (float)e.z},
-      (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
-      (float)e.power * CurrentTuning().physics.explosionImpulseScale,
-      &rigBodies);
+  phys.ApplyRadialImpulse(f.debrisCenter, f.pushRadius, f.debrisImpulse,
+                          &rigBodies);
   // ...and the LIVING are knocked flying. A standing creature's limbs
   // are kinematic, so the impulse above never touched them; this is
   // the blast's other half (Mob::BlastRadial): go limp, take a launch
@@ -3454,7 +3469,7 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   // capped at ragdoll.maxLaunchSpeed, and get back up once landed.
   // NPCs + every LOCAL avatar; a peer's ghost is carved above but
   // never launched — its position is the wire's (game/mob.h).
-  mobs.BlastMobsRadial(ec, reach, impulse);
+  mobs.BlastMobsRadial(f.center, f.pushRadius, f.rigImpulse);
 }
 
 uint32_t RemoteExplosionsHitOwnAvatars(std::span<const ExplosionOp> exps,
@@ -3793,6 +3808,14 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       tPhys1 = NowSeconds();
       debris.PostStep();
       mobs.PostStep();
+      // A THROWN ROCK IS A BLOW (W2-H): this step's new contacts, read while
+      // they are this step's. A contact blow neither dents nor breaks plate
+      // (MobSystem::ApplyContactDamage), so it authors no particles; the
+      // scratch list is where they would go if it ever did.
+      {
+        std::vector<ParticleSpawn> contactGore;
+        mobs.ApplyContactDamage(phys, world, contactGore);
+      }
   }
 }
 

@@ -21,6 +21,7 @@
 #include "phys/lattice.h"
 #include "sim/bytestream.h"
 #include "sim/mattable.h"
+#include "sim/oprecord.h"  // BrushAuthorScope: a landing's ops (ApplyFallDamage)
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
 #include "sim/scale.h"   // SkinScaleFor / NeededArtUpsample / MetresToCells
@@ -7450,6 +7451,14 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // still runs — a body knocked flat goes on bleeding from where it lies.
     if (mob.alive_ && mob.ragdoll_ == Mob::RagdollPhase::Limp) {
       mob.TickRagdollLimp(world, dt);
+      // ---- ...AND A LIMP BODY HITS THE GROUND (W2-H) ----------------------
+      // The arrest TickRagdollLimp just measured is billed, exactly as the
+      // avatar's limp branch bills it (PlayerAvatar::Update): one function,
+      // one set of thresholds (player.fallDamageSpeed / fallSplatSpeed), every
+      // creature. A blasted NPC that lands hard is hurt; one that lands at
+      // splat speed comes apart. Centred at the pelvis, where the body is.
+      mob.ApplyFallDamage(mob.TakeRagdollImpact(), mob.RootWorldPos(), tick,
+                          world, ops, spawns);
     } else if (mob.alive_ && mob.ragdoll_ == Mob::RagdollPhase::GetUp) {
       // ---- GETTING UP: the pose pipeline runs, the driver does not ----
       // The rig is kinematic again and animates a standing pose at the spot
@@ -8850,6 +8859,233 @@ float Mob::TotalHp() const {
   return sum;
 }
 
+// ---- hp spent without a wound (W2-H) ----------------------------------------
+
+float Mob::SpendableHp() const {
+  if (!alive_) return 0.0f;
+  float sum = 0.0f;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (LimbAlive((int)i) && limbs_[i].hp > 0.0f &&
+        !(i < limbDefs_.size() && limbDefs_[i].bloodless))
+      sum += limbs_[i].hp;
+  return sum;
+}
+
+bool Mob::SpendHp(float amount, const DamageCtx& ctx) {
+  if (!alive_ || !def_ || amount <= 0.0f) return alive_;
+  // Whole hp, the way PlayerAvatar::SpendHealth always compared (its bar is
+  // an integer): a bill of the whole body or more is a death, not a spread.
+  const float total = std::floor(SpendableHp());
+  if (total <= 0.0f || amount >= total) {
+    if (ctx.cause == DamageCause::Fall) deathCause_ = "fall";
+    Die();
+    return false;
+  }
+  // In proportion to what each slot still has, so no slot is picked to be
+  // ruined (an overcast that drained the first limb to zero read as a bug).
+  // COLLECTED FIRST: Damage() may kill, and a death reshapes nothing but ends
+  // the walk; handles, not indices, because a sever would reshape `limbs_`.
+  //
+  // THROUGH Mob::Damage, with the caller's cause, and that is the point of
+  // routing it here (W2-H): this used to subtract hp and Sever() any slot
+  // that reached zero, which is fire's old rule and contradicts the table
+  // every other damage path reads -- hp is a statement about DEATH, so a
+  // vital limb at zero dies in place and an arm at zero stays on
+  // (game/severpolicy.h, Mob::HpZeroSevers). The hit point is the slot's own
+  // centre, which is where the flash and the drip are placed.
+  const float frac = amount / total;
+  struct Share {
+    uint64_t body;
+    float hp;
+    Vec3 at;
+  };
+  std::vector<Share> shares;
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    if (!LimbAlive((int)i) || limbs_[i].hp <= 0.0f ||
+        (i < limbDefs_.size() && limbDefs_[i].bloodless))
+      continue;
+    const MobLimb& L = limbs_[i];
+    const Quat q{L.xf.quat[0], L.xf.quat[1], L.xf.quat[2], L.xf.quat[3]};
+    const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(L));
+    const Vec3 half{(float)L.size.x * 0.5f * inv, (float)L.size.y * 0.5f * inv,
+                    (float)L.size.z * 0.5f * inv};
+    shares.push_back({L.body, L.hp * frac, L.xf.pos + Rotate(q, half)});
+  }
+  for (const Share& s : shares) {
+    if (!alive_) break;
+    Damage(s.body, s.hp, s.at, /*impactSpeed=*/0.0f, ctx);
+  }
+  return alive_;
+}
+
+bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
+                          uint32_t tick, World& world,
+                          std::vector<BrushOp>& ops,
+                          std::vector<ParticleSpawn>& spawns) {
+  // THE BODY'S, NOT THE PLAYER'S (W2-H). This was PlayerAvatar::ApplyFallDamage
+  // until 2026-09-24, and Mob measured the arrest (TakeRagdollImpact) for every
+  // creature while billing it for one: an NPC blown off a cliff landed at 30
+  // m/s and got up. Now MobSystem::PreTick bills a limp NPC's landing through
+  // this same function, and the avatar's two producers (the controller's sweep
+  // and its own limp arrest) still call it as before.
+  //
+  // THE AUTHOR SCOPE (sim/oprecord.h). Everything pushed into `ops` here is
+  // this body coming apart; the record attributes that range to the avatar
+  // producer, which is what it was named for (an NPC's landing is attributed
+  // the same way -- the producer names the MECHANISM, and it is this one).
+  // CPU-side only: it reaches no shader and cannot move the world hash.
+  sandvox::opstream::BrushAuthorScope author(
+      ops, sandvox::opstream::Producer::Avatar, 0);
+  if (!alive_ || !def_ || limbs_.empty()) return false;
+  const float impactVox = impactDeltaV.len();
+  if (impactVox < 1e-3f) return false;
+  const auto& pt = CurrentTuning().player;
+  const float impactMs = impactVox * kVoxelMeters;
+  if (impactMs < pt.fallDamageSpeed) return false;
+
+  const MobDef& def = *def_;
+  const auto& gore = CurrentTuning().gore;
+  const Vec3 center = centerWorldVoxel;
+
+  const float excess = impactMs - pt.fallDamageSpeed;
+  const float damage = excess * excess * pt.fallDamageScale;
+  const float bar = std::floor(SpendableHp());
+
+  const bool lethal = impactMs >= pt.fallSplatSpeed || damage >= bar;
+  fallsBilled_++;
+  fallHpBilled_ += std::min(damage, bar);
+  // ONE LINE PER HIT, because there are two producers for the avatar and
+  // they can disagree: the controller's sweep (Player::impactDeltaV) and the
+  // ragdoll's arrest (Mob::TakeRagdollImpact). "The fall killed me" and "four
+  // folds of the landing each billed" look identical in the health bar and
+  // nowhere else.
+  std::printf("%s %llu impact: %.1f m/s (%s, %.0f of %d hp) at (%.1f, %.1f, "
+              "%.1f)%s\n",
+              def.name.c_str(), (unsigned long long)id_, impactMs,
+              Ragdolled() ? "limp" : "sweep", damage, (int)bar, center.x,
+              center.y, center.z, lethal ? " LETHAL" : "");
+
+  if (lethal) {
+    // --- splat: carve voxels out of the body, sever some limbs, die ---
+    //
+    // The carve blows chunks out of every live limb as a blast would, but with
+    // the Fall cause and no power: a landing is not an explosion and no plate
+    // stops it (game/shellresponse.h, the Fall row).
+    const float carveRadius =
+        pt.fallSplatCarveBase + impactMs * pt.fallSplatCarvePerMs;
+    CarveRadialAll(center, carveRadius, world, spawns, /*power=*/0.0f,
+                   DamageCtx(DamageCause::Fall));
+
+    // Sever roughly half the remaining severable limbs at random.
+    std::vector<int> severable;
+    for (size_t i = 0; i < limbs_.size(); i++) {
+      if (!LimbAlive((int)i) || !limbs_[i].body) continue;
+      const MobLimbDef& ld = limbDefs_[i];
+      if ((int)i == def.rootLimb || ld.vital || !ld.severable) continue;
+      severable.push_back((int)i);
+    }
+    for (size_t j = 0; j < severable.size(); j++) {
+      uint32_t h = Hash3((uint32_t)id_ ^ 0xFA11u, tick, (uint32_t)j);
+      if ((h & 1) == 0) continue;
+      int i = severable[j];
+      if (LimbAlive(i)) {
+        Sever(i, DamageCtx(DamageCause::Fall));
+        if (i < (int)limbs_.size() && limbs_[i].holdBody)
+          limbs_[i].holdSeconds = 0.0f;
+      }
+    }
+    if (alive_) deathCause_ = "fall";
+    Die();
+
+    // Radial impulse scatters debris outward from the impact -- and, like an
+    // explosion's, skips every living creature's limbs (MobSystem::
+    // AppendLiveLimbBodies): an impulse / 0.3 kg hand is a launch, and the
+    // joints drag the rest of a rig after it. This body's own limbs are debris
+    // or a dead rig now and are shoved like any debris.
+    if (phys_ && pt.fallSplatImpulseRadius > 0.0f) {
+      std::vector<uint64_t> skip;
+      if (sys_ != nullptr) sys_->AppendLiveLimbBodies(skip);
+      // The splatting body itself is dead by now; its own parts are what the
+      // shove is for, so they come back OUT of the skip list.
+      std::vector<uint64_t> own;
+      for (const MobLimb& l : limbs_)
+        if (l.body) own.push_back(l.body);
+      std::sort(own.begin(), own.end());
+      skip.erase(std::remove_if(skip.begin(), skip.end(),
+                                [&](uint64_t h) {
+                                  return std::binary_search(own.begin(),
+                                                            own.end(), h);
+                                }),
+                 skip.end());
+      std::sort(skip.begin(), skip.end());
+      phys_->ApplyRadialImpulse(center, pt.fallSplatImpulseRadius,
+                                impactMs * pt.fallSplatImpulsePerMs, &skip);
+    }
+
+    // Blood micro-spray burst.
+    if (def.bleedMat != 0) {
+      const int droplets = std::max(0, pt.fallSplatDroplets);
+      for (int k = 0; k < droplets; k++) {
+        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        uint32_t h = Hash3((uint32_t)id_ ^ 0xFA11u, tick, (uint32_t)(k + 100));
+        Vec3 dir{SignedUnit(h),
+                 0.3f + 0.7f * (float)(Pcg(h ^ 0xA001u) & 0xFFFFu) / 65535.0f,
+                 SignedUnit(Pcg(h ^ 0xB002u))};
+        float len = dir.len();
+        if (len > 1e-4f) dir = dir * (1.0f / len);
+        float sp = gore.severSpraySpeed *
+                   (0.5f + 1.0f * (float)(Pcg(h ^ 0xC003u) & 0xFFFFu) / 65535.0f);
+        int life = std::clamp(gore.microLifeTicks, 1, 255);
+        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, true,
+                                     life, gore.microScale));
+      }
+      // Whole-voxel blood thrown outward — pools and persists.
+      const int blood = std::max(0, pt.fallSplatBloodVoxels);
+      for (int k = 0; k < blood; k++) {
+        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        uint32_t h = Hash3((uint32_t)id_ ^ 0xB10Du, tick, (uint32_t)(k + 500));
+        Vec3 dir{SignedUnit(h),
+                 0.2f + 0.4f * (float)(Pcg(h ^ 0xD004u) & 0xFFFFu) / 65535.0f,
+                 SignedUnit(Pcg(h ^ 0xE005u))};
+        float len = dir.len();
+        if (len > 1e-4f) dir = dir * (1.0f / len);
+        float sp = gore.severVoxelSpeed *
+                   (0.6f + 0.8f * (float)(Pcg(h ^ 0xF006u) & 0xFFFFu) / 65535.0f);
+        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, false,
+                                     0, 0));
+      }
+      // Blood stain at the impact site. Budget charged BEFORE emission
+      // (CLAUDE.md): the brush stream is capped at kMaxOpsPerTick and
+      // SubmitTick refuses the overflow, so a producer that pushes past the
+      // cap is authoring an op that silently never happens.
+      if (ops.size() < kMaxOpsPerTick)
+        ops.push_back({(int)std::floor(center.x), (int)std::floor(center.y),
+                       (int)std::floor(center.z), 2, def.bleedMat, 0, 0, 0});
+    }
+    return true;
+  }
+
+  // --- sub-lethal impact: proportional damage, bleed on legs ---
+  if (!SpendHp((float)std::lround(damage), DamageCtx(DamageCause::Fall)))
+    return true;
+  if (def.bleedMat != 0) {
+    for (size_t i = 0; i < limbs_.size(); i++) {
+      if (!LimbAlive((int)i) || !limbs_[i].body) continue;
+      // WHICH LIMBS TOOK THE LANDING is the limb's ROLE -- the tag gait and
+      // the IK chains already read ("leg" / "foot") -- not a substring of
+      // its name, which a sidecar is free to call anything.
+      const MobLimbDef& ld = limbDefs_[i];
+      if (ld.tag != "leg" && ld.tag != "foot") continue;
+      limbs_[i].bleedBudget = AddBleedBudget(
+          limbs_[i].bleedBudget, damage * pt.fallLegBleed * def.bleedPerDamage);
+      Quat q{limbs_[i].xf.quat[0], limbs_[i].xf.quat[1],
+             limbs_[i].xf.quat[2], limbs_[i].xf.quat[3]};
+      limbs_[i].woundLocal = RotateInv(q, center - limbs_[i].xf.pos);
+    }
+  }
+  return true;
+}
+
 bool Mob::DrainBlood(float voxels) {
   // A CORPSE BLEEDS OUT FOR NOTHING: its wounds still pay out (BleedTick),
   // but blood is health only while there is somebody to lose it, and nothing
@@ -9509,6 +9745,120 @@ bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     if (av->Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed, ctx))
       return true;
   return false;
+}
+
+bool MobSystem::LaserHit(uint64_t bodyHandle, Vec3 hitWorldVoxel,
+                         float& boreOut) {
+  const auto& tools = CurrentTuning().tools;
+  float hp = tools.laserDamage;
+  float bore = (float)tools.laserCarveRadius;
+  const DamageCtx beam(DamageCause::Beam);
+  int li = -1;
+  Mob* owner = FindOwner(bodyHandle, &li);
+  if (owner == nullptr || li < 0) return false;
+  // A SHELL IN THE BEAM answers through the one shell table like every other
+  // blow. The Beam row is the identity the laser always had (the plate is
+  // bored like flesh and takes the hp itself), so this changes no number; it
+  // is where a laser that skates off polished steel would be authored.
+  if (owner->IsWornSlot(li)) {
+    const ShellResponse r = owner->ShellResponseAt(li, hitWorldVoxel, beam);
+    hp *= r.shellHp;
+    bore *= r.carve;
+  }
+  if (!owner->Damage(bodyHandle, hp, hitWorldVoxel, 0.0f, beam)) return false;
+  laserHitsCharged_++;
+  // Damage() may have severed the slot outright; the carve then misses
+  // (CarveLimbRadial returns false) rather than touching stale state.
+  boreOut = bore;
+  return true;
+}
+
+int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
+                                  std::vector<ParticleSpawn>& spawns) {
+  const Tuning::Gore& gt = CurrentTuning().gore;
+  if (gt.contactHpPerImpulse <= 0.0f || gt.contactMaxPerTick <= 0) return 0;
+  struct Hit {
+    uint64_t limb, other;
+    Vec3 at;
+    float impulse;
+  };
+  std::vector<Hit> hits;
+  for (const Physics::ContactImpact& ci : phys.ContactImpacts()) {
+    for (int side = 0; side < 2; side++) {
+      const uint64_t limbBody = side ? ci.bodyB : ci.bodyA;
+      const uint64_t other = side ? ci.bodyA : ci.bodyB;
+      // Terrain is the landing's business (Mob::ApplyFallDamage), and a
+      // contact with no creature on it is nobody's.
+      if (limbBody == 0 || other == 0) continue;
+      int li = -1;
+      Mob* m = FindOwner(limbBody, &li);
+      if (m == nullptr || li < 0 || !m->alive_ || m->IsGhost()) continue;
+      // Creature against creature (a ragdoll's own limbs, a held weapon, two
+      // bodies in a scrum) is melee's and the ragdoll's, not a thrown thing.
+      if (FindOwner(other) != nullptr) continue;
+      const float mo = phys.BodyMass(other);
+      if (mo <= 0.0f) continue;
+      // A standing creature's limbs are kinematic: the striker meets an
+      // immovable body and its whole momentum is the blow. A limp one is
+      // free, so the blow is the REDUCED mass against the whole creature's.
+      float mu = mo;
+      if (m->ragdoll_ != Mob::RagdollPhase::None) {
+        const float M = std::max(m->BodyMassKg(), 1.0f);
+        mu = mo * M / (mo + M);
+      }
+      // THE STRIKER'S SPEED, NOT THE CLOSING SPEED. The listener reports how
+      // fast the pair closed; a creature walking into a resting log closes
+      // on it at walking pace, and that is the creature kicking the log, not
+      // the log striking the creature. So the limb's own velocity toward the
+      // other body is taken back out (`normal` points bodyA -> bodyB).
+      float strike = ci.speedVoxPerSec;
+      Vec3 lv{}, la{};
+      if (phys.GetBodyVelocities(limbBody, lv, la)) {
+        const Vec3 toOther = side == 0 ? ci.normal : ci.normal * -1.0f;
+        strike -= std::max(0.0f, lv.dot(toOther));
+      }
+      if (strike <= 0.0f) continue;
+      const float impulse = mu * strike * kVoxelMeters;
+      if (impulse <= gt.contactImpulseMin) continue;
+      hits.push_back({limbBody, other, ci.posVoxel, impulse});
+    }
+  }
+  if (hits.empty()) return 0;
+  // A FIXED ORDER, because the listener's is Jolt's job threads': hardest
+  // first, then by handle, so the cap takes the same contacts every replay.
+  std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
+    if (a.impulse != b.impulse) return a.impulse > b.impulse;
+    if (a.limb != b.limb) return a.limb < b.limb;
+    return a.other < b.other;
+  });
+  const size_t cap =
+      std::min(hits.size(), (size_t)std::max(0, gt.contactMaxPerTick));
+  int billed = 0;
+  for (size_t k = 0; k < cap; k++) {
+    const Hit& h = hits[k];
+    const float hp = std::min((h.impulse - gt.contactImpulseMin) *
+                                  gt.contactHpPerImpulse,
+                              std::max(gt.contactMaxHp, 0.0f));
+    if (hp <= 0.0f) continue;
+    ::BluntHit b;
+    b.at = h.at;
+    b.hp = hp;
+    // How hard, 0..1, for the bruise's radius: a blow at the cap is full.
+    b.power = gt.contactMaxHp > 0.0f ? std::clamp(hp / gt.contactMaxHp, 0.0f, 1.0f)
+                                     : 1.0f;
+    // A rock is not a mace: no dent in flesh, no plate broken in. It bruises,
+    // it charges hp, and on a shell it transmits the Blunt row's share.
+    b.carve = 0.0f;
+    b.armorBreak = 0.0f;
+    b.impactSpeed = 0.0f;
+    b.seed = (uint32_t)(h.limb * 2654435761u) ^ (uint32_t)(h.other * 40503u) ^
+             tick_;
+    // The first contact may have severed or killed; BluntHit re-resolves the
+    // handle and returns false if it no longer names a limb.
+    if (BluntHit(h.limb, b, world, spawns)) billed++;
+  }
+  contactHitsBilled_ += (uint32_t)billed;
+  return billed;
 }
 
 namespace {
@@ -10597,19 +10947,15 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     // does wear through under a patient enemy. A worn slot only: a held blade
     // is never carved (melee.cpp skips the held slot), and flesh keeps the
     // wound model the `wound` gate pins.
+    //
+    // The scale is the Blade row of game/shellresponse.h (W2-H), read off the
+    // voxel the edge STRUCK rather than the lattice's first voxel.
     if (IsWornSlot((int)i) && sys_ != nullptr) {
-      uint32_t m = 0;
-      if (!limb.skinVoxels.empty())
-        m = limb.skinVoxels[0].material & 0xFFFu;
-      else if (!limb.voxels.empty())
-        m = limb.voxels[0].payload & 0xFFFu;
       const auto& gear = CurrentTuning().gear;
-      const float hard =
-          m < sys_->matGpu_.size() ? (float)sys_->matGpu_[m].hardness : 0.0f;
+      const float hard = MaterialHardness(ShellMaterialAt((int)i, cut.at));
       if (hard > 0.0f && gear.cutHardnessRef > 0.0f) {
-        const float k = std::clamp(gear.cutHardnessRef / hard,
-                                   std::clamp(gear.cutHardnessMin, 0.0f, 1.0f),
-                                   1.0f);
+        const float k =
+            ShellResponseOf(hard, DamageCause::Blade, gear).carve;
         // The chip is at least one lattice cell in every direction, or a
         // blade thinner than a cell (a stock edge is 0.08 voxels against a
         // 0.125-voxel skin cell) would slip between cell centres and cost
@@ -11931,7 +12277,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // Nothing noticed while carves were rare (one blade, one blast). BURNING is
   // what exposed it: FlushBurn expresses itself as a carve and fires every
   // max(12, n>>6) voxels removed, so a limb on fire carves itself dozens of
-  // times, and at kCarveDamagePerVolume 1.5 it reached hp 0 having lost about
+  // times, and at gore.carveHpPerVolume 1.5 it reached hp 0 having lost about
   // 14% of its volume. Every burning limb dismembered, and the torso reaching 0
   // is a vital limb, so Sever() called Die() — a creature that caught fire came
   // apart instead of charring. The fraction is still measured against `at0`
@@ -11971,7 +12317,8 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // Charged to the LIVING only (Mob::Damage's note): a corpse carved keeps
   // the hp it died with.
   if (alive_)
-    limb.hp -= (lostWeight / w0) * limbDefs_[limbIndex].hp * kCarveDamagePerVolume;
+    limb.hp -= (lostWeight / w0) * limbDefs_[limbIndex].hp *
+               CurrentTuning().gore.carveHpPerVolume;
   // ---- ...AND THE BRAIN IS NOT A FRACTION OF ANYTHING ----------------------
   //
   // The one absolute charge in this function. Every brain voxel destroyed --
@@ -12485,7 +12832,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // route out of this function above went through Sever(), which reports its
   // own event, and the sever cue falls back to the hurt set when nothing is
   // bound; voicing both would double a single blow. `lost` is already the
-  // fraction of the limb's volume removed, so `lost * kCarveDamagePerVolume`
+  // fraction of the limb's volume removed, so `lost * gore.carveHpPerVolume`
   // is the fraction of its max hp — exactly what the hurt slot documents.
   //
   // A GARMENT DOES NOT CRY OUT. Same exclusion as the blood above: a hole
@@ -12494,7 +12841,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   if (lost > 0.0f && !IsBloodless(limbIndex))
     if (sys_)
     sys_->PushVoice(*this, MobSystem::VoiceKind::Hurt, limb.xf.pos,
-                    lost * kCarveDamagePerVolume);
+                    lost * CurrentTuning().gore.carveHpPerVolume);
 
   // ---- WHAT WAS HANGING OFF WHAT THIS CARVE JUST ATE ------------------------
   //
@@ -17363,7 +17710,7 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                           float radiusVoxels, bool ragged, bool eject,
                           World& world,
                           std::vector<ParticleSpawn>& spawns,
-                          const DamageCtx& ctx) {
+                          const DamageCtx& ctx, float blastPower) {
   if (!phys_ || radiusVoxels <= 0.0f) return false;
   for (size_t i = 0; i < limbs_.size(); i++) {
     if (limbs_[i].body != bodyHandle) continue;
@@ -17435,26 +17782,152 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     }
     const Mob::CarveSpall* spallPtr = wantSpall ? &spallData : nullptr;
 
+    // ---- A BLAST'S POWER, AND WHAT IS IN ITS WAY (W2-H) ---------------------
+    //
+    // The TERRAIN crater (sim_explode.wgsl) is decided per cell by power, not
+    // by radius: what reaches a cell is the blast's power less
+    // sim.falloffPerCell per cell of distance less the hardness of everything
+    // the ray crossed, and the cell goes if that exceeds its own hardness.
+    // Until W2-H a body crater was the radius alone, so an iron cuirass was as
+    // much use against a grenade as a shirt and a spark and a charge of equal
+    // radius tore a body the same.
+    //
+    // Same rule here, in the body's own units: the power left over the voxel's
+    // hardness, against gore.blastPowerRef, scales the crater radius AT that
+    // voxel -- at or above the reference the crater is the full radius (a
+    // grenade on bare flesh is exactly what it was), below it the crater
+    // shrinks, at nothing it spares the voxel. What the ray crossed is every
+    // worn SHELL over this limb (Mob::BlastShellStop: each crossing costs its
+    // ShellResponse::stop, hardness x gear.blastShellCells). The ragged rim
+    // below is then drawn inside that smaller radius, so an armoured body
+    // loses a smaller, still-torn crater rather than a thinned-out speckle.
+    //
+    // Memoised per HALF VOXEL of the limb's frame: the collider and skin
+    // passes and every skin cell in one half-voxel share one ray, which is
+    // what keeps a march per voxel off a 40,000-voxel torso.
+    struct BlastField {
+      bool on = false;
+      float power = 0.0f, falloff = 0.0f, ref = 1.0f;
+      bool shells = false;
+      Vec3 cWorld{};
+      Quat q{};
+      Vec3 pos{};
+      std::unordered_map<uint64_t, float> stop;  // half-voxel key -> power lost
+    };
+    auto field = std::make_shared<BlastField>();
+    if (blastPower > 0.0f && ctx.cause == DamageCause::Blast) {
+      field->on = true;
+      field->power = blastPower;
+      field->falloff = (float)std::max(1, CurrentTuning().sim.falloffPerCell);
+      field->ref = std::max(1.0f, gt.blastPowerRef);
+      field->shells = (int)i < baseLimbs_ && LimbHasShells((int)i);
+      field->cWorld = centerWorldVoxel;
+      field->q = q;
+      field->pos = limb.xf.pos;
+    }
+    const int limbIdx = (int)i;
+    // The crater-radius scale at a point `bodyLocal` of this limb (world
+    // voxels, limb frame) holding a voxel of hardness `hard`. 1 when the
+    // power model is off.
+    auto powerScale = [this, field, cBody, limbIdx](Vec3 bodyLocal,
+                                                     float hard) -> float {
+      if (!field->on) return 1.0f;
+      const Vec3 dv = bodyLocal - cBody;
+      const float d = dv.len();
+      float stop = 0.0f;
+      if (field->shells && d > 1e-3f) {
+        const int kx = (int)std::floor(bodyLocal.x * 2.0f);
+        const int ky = (int)std::floor(bodyLocal.y * 2.0f);
+        const int kz = (int)std::floor(bodyLocal.z * 2.0f);
+        const uint64_t key = ((uint64_t)(uint16_t)kx << 32) |
+                             ((uint64_t)(uint16_t)ky << 16) |
+                             (uint64_t)(uint16_t)kz;
+        auto it = field->stop.find(key);
+        if (it != field->stop.end()) {
+          stop = it->second;
+        } else {
+          const Vec3 from = field->pos + Rotate(field->q, bodyLocal);
+          const Vec3 to = field->cWorld - from;
+          const float dist = to.len();
+          stop = dist > 1e-3f
+                     ? BlastShellStop(limbIdx, from, to * (1.0f / dist), dist)
+                     : 0.0f;
+          field->stop.emplace(key, stop);
+        }
+      }
+      const float left =
+          field->power - field->falloff * d - stop - std::max(hard, 0.0f);
+      return std::clamp(left / field->ref, 0.0f, 1.0f);
+    };
+    // The spall pass is a sphere with no per-voxel say, so it takes the scale
+    // at the limb's point nearest the blast: a plate that shrank the crater
+    // shrinks the tearing round its rim with it.
+    if (field->on && wantSpall) {
+      const Vec3 near = ClampToLimbBox(limb, cBody);
+      spallData.radius =
+          radiusVoxels *
+          powerScale(near, MaterialHardness(ShellMaterialAt(
+                               (int)i, limb.xf.pos + Rotate(q, near))));
+    }
+    if (field->on && spallData.radius <= 0.0f) spallPtr = nullptr;
+
     Mob::CarveReport rep{};
     const bool alive = CarveLimb(
         (int)i, ctx, world, spawns, eject,
-        [&, cBody, seed, jitterScale, chunk, falloffExp,
-         blob](float scale) -> LimbCarveKeep {
+        [&, cBody, seed, jitterScale, chunk, falloffExp, blob, field,
+         powerScale](float scale) -> LimbCarveKeep {
           const Vec3 cLocal = cBody * scale;
           const float rLocal = radiusVoxels * scale;
           const float rLocal2 = rLocal * rLocal;
           const float toSkin = jitterScale / scale;
+          // Per-voxel hardness for the power model, from whichever lattice
+          // this pass tests (the skin carries the anatomy's materials; the
+          // collider its majority material). Built only when the model is on.
+          std::shared_ptr<std::unordered_map<uint64_t, float>> hardAt;
+          if (field->on) {
+            hardAt = std::make_shared<std::unordered_map<uint64_t, float>>();
+            const MobLimb& L = limbs_[limbIdx];
+            auto key = [](int x, int y, int z) {
+              return ((uint64_t)(uint16_t)x << 32) |
+                     ((uint64_t)(uint16_t)y << 16) | (uint64_t)(uint16_t)z;
+            };
+            const bool skinPass =
+                L.HasFineSkin() &&
+                (uint32_t)scale == std::max(1u, SkinScaleOf(L));
+            if (skinPass) {
+              hardAt->reserve(L.skinVoxels.size());
+              for (const PrefabVoxel& v : L.skinVoxels)
+                hardAt->emplace(key(v.x, v.y, v.z),
+                                MaterialHardness(v.material & 0xFFFu));
+            } else {
+              hardAt->reserve(L.voxels.size());
+              for (const DebrisVoxel& v : L.voxels)
+                hardAt->emplace(key(v.x, v.y, v.z),
+                                MaterialHardness(v.payload & 0xFFFu));
+            }
+          }
           return [=](int x, int y, int z) {
             Vec3 c{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
             Vec3 dv = c - cLocal;
             float d2 = dv.dot(dv);
             if (d2 >= rLocal2) return true;  // outside
+            // THE POWER MODEL shrinks the radius at this voxel (above).
+            float rEff2 = rLocal2;
+            if (hardAt) {
+              const auto it = hardAt->find(((uint64_t)(uint16_t)x << 32) |
+                                           ((uint64_t)(uint16_t)y << 16) |
+                                           (uint64_t)(uint16_t)z);
+              const float hard = it != hardAt->end() ? it->second : 0.0f;
+              const float s = powerScale(c * (1.0f / scale), hard);
+              rEff2 = rLocal2 * s * s;
+              if (d2 >= rEff2) return true;  // the power ran out first
+            }
             if (!ragged) return false;       // clean bore (laser kerf)
             // Ragged rim: certain removal in the core, thinning outward,
             // so a blast crater in flesh is torn rather than scooped.
             // CPU gameplay state (limbs are outside the hashed domain),
             // so a float hash is fine -- rule 1 governs the grid.
-            float t = std::sqrt(d2 / rLocal2);
+            float t = std::sqrt(d2 / rEff2);
             float chance = 1.0f - t * t;
             // TIGHTEN THE CRATER. `1 - t^2` is 0.75 at half the radius and
             // 0.36 at 80% of it, which is why a large blast really did remove
@@ -17644,27 +18117,16 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
     const uint64_t hostBody =
         (hostIdx >= 0 && hostIdx < (int)limbs_.size()) ? limbs_[hostIdx].body
                                                        : 0ull;
-    // The shell's own material hardness, read the same way Mob::CutLimb reads
-    // it for the kerf -- first voxel of the authoritative lattice, because a
-    // shell is one material all over.
-    float hard = 0.0f;
-    if (sys_ != nullptr) {
-      uint32_t m = 0;
-      if (!limbs_[li].skinVoxels.empty())
-        m = limbs_[li].skinVoxels[0].material & 0xFFFu;
-      else if (!limbs_[li].voxels.empty())
-        m = limbs_[li].voxels[0].payload & 0xFFFu;
-      if (m < sys_->matGpu_.size()) hard = (float)sys_->matGpu_[m].hardness;
-    }
-    float k = 1.0f;
-    if (hard > 0.0f && gear.bluntHardnessRef > 0.0f)
-      k = std::clamp(gear.bluntHardnessRef / hard,
-                     std::clamp(gear.bluntHardnessMin, 0.0f, 1.0f), 1.0f);
+    // WHAT THE SHELL DOES TO TRAUMA is the Blunt row of game/shellresponse.h
+    // (W2-H): `carve` scales the dent by the hardness of the voxel the blow
+    // STRUCK (it read the lattice's first voxel until then), `shellHp` is
+    // gear.bluntShellHp, `passed` is gear.bluntThrough.
+    const ShellResponse resp = ShellResponseAt(li, hit.at, blunt);
+    const float k = resp.carve;
 
     // 1. THE SHELL TAKES hp. Ordinary Damage on the shell's own slot, which is
     //    what a piece's condition is made of, at gear.bluntShellHp of the blow.
-    Damage(bodyHandle, hit.hp * gear.bluntShellHp, hit.at, hit.impactSpeed,
-           blunt);
+    Damage(bodyHandle, hit.hp * resp.shellHp, hit.at, hit.impactSpeed, blunt);
 
     // 2. ...AND IS BEATEN IN. Real voxels, through the ordinary radial carve --
     //    the same call an explosion makes, so a dented cuirass is dented in
@@ -17682,9 +18144,9 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
     //    through, which is the whole difference from a blade. No dent and no
     //    armour break on this pass -- what is under the plate is flesh, and the
     //    bruise is what a transmitted blow leaves.
-    if (hostBody != 0ull && gear.bluntThrough > 0.0f) {
+    if (hostBody != 0ull && resp.passed > 0.0f) {
       ::BluntHit through = hit;
-      through.hp = hit.hp * gear.bluntThrough;
+      through.hp = hit.hp * resp.passed;
       through.carve = 0.0f;
       through.armorBreak = 0.0f;
       // The knock-loose rule is the SHELL's, not the wearer's: a strap does not
@@ -17829,32 +18291,22 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   // material all over. No new authored field, and a garment added tomorrow
   // answers this without being edited. See Tuning::Gear::biteThroughSoft.
   if (IsWornSlot(li)) {
-    const Tuning::Gear& gear = tune.gear;
-    float hard = 0.0f;
-    if (sys_ != nullptr) {
-      uint32_t m = 0;
-      if (!limbs_[li].skinVoxels.empty())
-        m = limbs_[li].skinVoxels[0].material & 0xFFFu;
-      else if (!limbs_[li].voxels.empty())
-        m = limbs_[li].voxels[0].payload & 0xFFFu;
-      if (m < sys_->matGpu_.size()) hard = (float)sys_->matGpu_[m].hardness;
-    }
-    // 1 at or below the soft point, 0 at or above the hard one, linear
-    // between. A shell whose material could not be read (hardness 0) counts as
-    // soft, which is the safe way round: the failure is a bite that lands, not
-    // a creature that is silently invulnerable.
-    float through = 1.0f;
-    if (hard > gear.biteThroughSoft) {
-      const float span = std::max(gear.biteThroughHard - gear.biteThroughSoft, 1e-3f);
-      through = std::clamp((gear.biteThroughHard - hard) / span, 0.0f, 1.0f);
-    }
+    // The Bite row of game/shellresponse.h (W2-H), read off the voxel the
+    // teeth STRUCK: `passed` is the ramp -- 1 at or below the soft point, 0 at
+    // or above the hard one, linear between. A shell whose material could not
+    // be read (hardness 0) counts as soft, which is the safe way round: the
+    // failure is a bite that lands, not a creature that is silently
+    // invulnerable. `shellHp` is gear.biteOnShell, delivered as a blunt blow.
+    const ShellResponse resp =
+        ShellResponseAt(li, hit.at, DamageCtx(DamageCause::Bite));
+    const float through = resp.passed;
     // THE GARMENT IS BITTEN WHATEVER IT IS MADE OF. Teeth closing on a shirt
     // still charge it hp and still bruise the wearer through it -- that is the
     // path this branch always had, and a bite that tore the flesh underneath
     // without marking the cloth would be a hole with no hole in the sleeve.
     ::BluntHit b;
     b.at = hit.at;
-    b.hp = hit.hp * std::clamp(gear.biteOnShell, 0.0f, 1.0f);
+    b.hp = hit.hp * std::clamp(resp.shellHp, 0.0f, 1.0f);
     b.power = power;
     b.carve = 0.0f;
     b.armorBreak = 0.0f;
@@ -18576,33 +19028,37 @@ uint32_t Mob::RotAtSpawn(World& world) {
 
 void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                 World& world,
-                                std::vector<ParticleSpawn>& spawns) {
+                                std::vector<ParticleSpawn>& spawns,
+                                float power) {
   for (Mob& mob : mobs_)
-    mob.CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
+    mob.CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns, power);
   // Then every avatar, ghosts included (mob.h). The empty-limb test is
   // PlayerAvatar::CarveRadial's Spawned() guard.
-  CarveLocalAvatarsRadial(centerWorldVoxel, radiusVoxels, world, spawns);
+  CarveLocalAvatarsRadial(centerWorldVoxel, radiusVoxels, world, spawns, power);
   // A ghost's gore goes to the discard (mob.h): its owner authors it.
   ghostSpawns_.clear();
   for (size_t i = localAvatars_; i < avatars_.size(); i++) {
     Mob* av = avatars_[i];
     if (av && !av->limbs_.empty())
-      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, ghostSpawns_);
+      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, ghostSpawns_,
+                         power);
   }
 }
 
 void MobSystem::CarveLocalAvatarsRadial(Vec3 centerWorldVoxel,
                                         float radiusVoxels, World& world,
-                                        std::vector<ParticleSpawn>& spawns) {
+                                        std::vector<ParticleSpawn>& spawns,
+                                        float power) {
   for (size_t i = 0; i < localAvatars_ && i < avatars_.size(); i++) {
     Mob* av = avatars_[i];
     if (av && !av->limbs_.empty())
-      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
+      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns, power);
   }
 }
 
 void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
-                         World& world, std::vector<ParticleSpawn>& spawns) {
+                         World& world, std::vector<ParticleSpawn>& spawns,
+                         float power, const DamageCtx& ctx) {
   // A blast craters a corpse exactly as it craters the living (it always
   // cratered the dead as debris). Only a released rig has nothing to carve.
   if (!phys_ || rigReleased_ || radiusVoxels <= 0.0f) return;
@@ -18624,10 +19080,14 @@ void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
       if ((xf.pos - centerWorldVoxel).len() <= radiusVoxels + r + 2.0f)
         handles.push_back(l.body);
     }
+  // IN LIMB ORDER, and that order is load-bearing for the blast's power
+  // model: a worn shell is an APPENDED slot, so every body limb is carved
+  // while the shells over it are still whole -- the flesh sees the plate the
+  // blast met, not the hole the same blast is about to put in it (the
+  // tick-start reading every other simultaneous rule here takes).
   for (uint64_t h : handles)
     CarveLimbRadial(h, centerWorldVoxel, radiusVoxels, true /*ragged*/,
-                    true /*eject*/, world, spawns,
-                    DamageCtx(DamageCause::Blast));
+                    true /*eject*/, world, spawns, ctx, power);
 }
 
 void MobSystem::Sever(uint64_t mobId, int limbIndex) {
@@ -23501,6 +23961,83 @@ int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
     }
   }
   return -1;
+}
+
+// ---- ONE SHELL RESPONSE (W2-H, game/shellresponse.h) -----------------------
+
+float Mob::MaterialHardness(uint32_t mat) const {
+  if (sys_ == nullptr || mat == 0 || mat >= sys_->matGpu_.size()) return 0.0f;
+  return (float)sys_->matGpu_[mat].hardness;
+}
+
+uint32_t Mob::ShellMaterialAt(int limbIndex, Vec3 worldPos) const {
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0u;
+  const MobLimb& L = limbs_[limbIndex];
+  // The pose the caller measured against (limb.xf), never re-read from Jolt:
+  // the same contract every carve predicate keeps (gotcha-live-limb-carve-pose).
+  const Quat q{L.xf.quat[0], L.xf.quat[1], L.xf.quat[2], L.xf.quat[3]};
+  const bool fine = L.HasFineSkin();
+  const float scale =
+      (float)std::max(1u, fine ? SkinScaleOf(L) : PhysScaleOf(L));
+  const Vec3 p = RotateInv(q, worldPos - L.xf.pos) * scale;
+  // Nearest LIVE voxel of the authoritative lattice. A linear scan: a shell is
+  // a few thousand voxels and this runs once per blow, not per voxel. Ties go
+  // to the earlier voxel, so the answer is a pure function of the lattice.
+  uint32_t best = 0u;
+  float bestD2 = 3.4e38f;
+  auto test = [&](int x, int y, int z, uint32_t m) {
+    if (m == 0u) return;  // a burn tombstone is not there
+    const Vec3 d{(float)x + 0.5f - p.x, (float)y + 0.5f - p.y,
+                 (float)z + 0.5f - p.z};
+    const float d2 = d.dot(d);
+    if (d2 < bestD2) {
+      bestD2 = d2;
+      best = m;
+    }
+  };
+  if (fine)
+    for (const PrefabVoxel& v : L.skinVoxels)
+      test(v.x, v.y, v.z, v.material & 0xFFFu);
+  else
+    for (const DebrisVoxel& v : L.voxels)
+      test(v.x, v.y, v.z, v.payload & 0xFFFu);
+  return best;
+}
+
+ShellResponse Mob::ShellResponseAt(int limbIndex, Vec3 worldPos,
+                                   const DamageCtx& ctx) const {
+  return ShellResponseOf(MaterialHardness(ShellMaterialAt(limbIndex, worldPos)),
+                         ctx, CurrentTuning().gear);
+}
+
+float Mob::BlastShellStop(int bodyLimb, const Vec3& from, const Vec3& dir,
+                          float dist) {
+  if (worn_.empty() || bodyLimb < 0 || sys_ == nullptr) return 0.0f;
+  // Far enough to cross half a torso from its middle and meet the coat on the
+  // blast's side: the march starts INSIDE the flesh (the voxel being carved)
+  // and walks out toward the centre, one shell-lattice cell a step.
+  constexpr int kBlastMarchMax = 96;
+  const Tuning::Gear& gear = CurrentTuning().gear;
+  float stop = 0.0f;
+  for (WornPiece& piece : worn_) {
+    for (size_t k = 0; k < piece.slots.size(); k++) {
+      const int s = piece.slots[k];
+      if (s < 0 || s >= (int)limbs_.size()) continue;
+      if (skel_.parts[s].parent != bodyLimb) continue;
+      MobLimb& shell = limbs_[s];
+      if (!shell.body) continue;  // strap cut: not in the way any more
+      if (k >= piece.index.size()) continue;
+      const bool fine = shell.HasFineSkin();
+      const uint32_t m = MarchShell(
+          piece.index[k], fine ? &shell.skinVoxels : nullptr,
+          fine ? nullptr : &shell.voxels, shell.xf, SkinScaleOf(shell), from,
+          dir, dist, kBlastMarchMax, nullptr);
+      if (m)
+        stop += ShellResponseOf(MaterialHardness(m), DamageCause::Blast, gear)
+                    .stop;
+    }
+  }
+  return stop;
 }
 
 uint32_t MarchShell(ShellMarchIndex& ix, const std::vector<PrefabVoxel>* skin,

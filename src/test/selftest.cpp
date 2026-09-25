@@ -604,6 +604,10 @@ const char* const kOrder[] = {
     // regenerates the world on both the way in and the way out, so it is
     // order-independent past that.
     "ragdoll-falldamage",
+    // W2-H's one damage event. Same self-contained shape: resets mobs + debris
+    // and regenerates worldgen on the way in and out, and pins the mob id
+    // counter (IdCounterScope) so it perturbs nothing after it.
+    "damage-sources",
     // ...and the dressed one, last in the group for the reason the AI gates
     // give. Same self-contained shape again — resets mobs + debris and
     // regenerates worldgen on the way in and the way out — but it also WEARS

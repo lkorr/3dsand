@@ -800,6 +800,13 @@ void StrikeReact(uint64_t body, const Vec3& dirWorld, const Vec3& atWorld,
   phys.ApplyImpulseAt(body, dirWorld, fx.hitReactImpulse * scale, atWorld);
 }
 
+// How far back along a blow's travel the sweep looks for ARMOUR in the way of
+// a flesh hit, in world voxels: half a torso plus a coat, so a probe that
+// started deep inside the body can cross the flesh's own interior before it
+// meets the entry side. ONE constant for both populations -- the living
+// (a shell-index march) and the dead (a collider cast); it was declared twice.
+constexpr float kCoverReach = 6.0f;
+
 }  // namespace
 
 // =============================================================================
@@ -1126,7 +1133,6 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         const Vec3 back = (sweepDir.len() > 1e-4f ? sweepDir * -1.0f
                                                   : dir * -1.0f)
                               .normalized();
-        constexpr float kCoverReach = 6.0f;   // world voxels
         constexpr int kCoverSteps = 64;       // lattice cells, whatever scale
         // A HOLE IS AS WIDE AS THE BLADE, OR IT IS A SCRATCH. One march is one
         // lattice cell wide, and the chip a sword leaves in iron is a one-cell
@@ -1287,7 +1293,6 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
           const Vec3 back = (sweepDir.len() > 1e-4f ? sweepDir * -1.0f
                                                     : dir * -1.0f)
                                 .normalized();
-          constexpr float kCoverReach = 6.0f;   // world voxels
           float cf = 1.0f;
           const uint64_t cover = phys.CastRayBody(at + back * kCoverReach,
                                                   back * -1.0f, kCoverReach, cf);

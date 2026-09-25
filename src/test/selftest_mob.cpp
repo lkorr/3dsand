@@ -28,6 +28,7 @@
 #include "game/camera.h"
 #include "game/player.h"
 #include "game/remoteplayer.h"
+#include "game/session.h"  // ExplosionHitsBodies / BlastForceOf
 #include "gpu/resources.h"
 #include "net/entitysync.h"
 #include "phys/debris.h"
@@ -8867,7 +8868,7 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
   // at pelvis height, through the same scale main.cpp's explosion loop uses.
   const auto& tune = CurrentTuning();
   const Vec3 ec{p0.x - 6.0f, p0.y + 2.0f, p0.z};
-  const float reach = (float)tune.tools.detonateRadius * tune.ragdoll.blastRadiusScale;
+  const float reach = (float)tune.tools.detonateRadius * tune.physics.explosionImpulseRadiusScale;
   const float impulse = (float)tune.tools.detonatePower * tune.ragdoll.blastImpulseScale;
   const int knocked = mobs.BlastMobsRadial(ec, reach, impulse);
   const int phaseAfter = mobs.RagdollPhaseOf(id);
@@ -8980,18 +8981,10 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
         debris.AddDestructionEvent(tick + 1,
                                    {e->x - e->radius, e->y - e->radius, e->z - e->radius},
                                    {e->x + e->radius, e->y + e->radius, e->z + e->radius});
-        const Vec3 ec{(float)e->x + 0.5f, (float)e->y + 0.5f, (float)e->z + 0.5f};
-        const float edr = (float)e->radius * tune.physics.explosionBodyDamageScale;
-        debris.DamageBodiesRadial(ec, edr, world, spawns);
-        mobs.CarveMobsRadial(ec, edr, world, spawns);
-        std::vector<uint64_t> rig;
-        mobs.AppendLiveLimbBodies(rig);
-        std::sort(rig.begin(), rig.end());
-        phys.ApplyRadialImpulse(Vec3{(float)e->x, (float)e->y, (float)e->z},
-                                (float)e->radius * tune.physics.explosionImpulseRadiusScale,
-                                (float)e->power * tune.physics.explosionImpulseScale, &rig);
-        mobs.BlastMobsRadial(ec, (float)e->radius * tune.ragdoll.blastRadiusScale,
-                             (float)e->power * tune.ragdoll.blastImpulseScale);
+        // The game's own block now (session.h), not a copy of it: W2-H moved
+        // the reach and strength into BlastForceOf, and a replica would have
+        // gone on reading the retired knobs.
+        ExplosionHitsBodies(*e, world, phys, debris, mobs, spawns);
       }
       ++tick;
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps, false,
@@ -12711,6 +12704,463 @@ Status GateNetPlayerCorpse(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- damage-sources -----------------------------------------------------
+//
+// ONE DAMAGE EVENT, ONE SHELL RESPONSE (W2-H, game/shellresponse.h). Every
+// source that hurts a body now answers the same two questions the same way --
+// what did a worn shell in the way do, and whose body is it -- and this gate
+// holds each source to it, beside the number it used to produce:
+//
+//   A. THE TABLE IS TODAY'S NUMBERS. ShellResponseOf at a sweep of hardnesses
+//      against the three formulas it replaced, written out verbatim (the
+//      CutLimb kerf ratio, the BluntHit dent ratio + gear.bluntThrough /
+//      bluntShellHp, the BiteHit ramp + biteOnShell). Melee may not move.
+//   B. A GRENADE AGAINST PLATE. The same grenade (tuning grenade.*) beside a
+//      bare and a cuirassed human, through ExplosionHitsBodies, twice: with no
+//      power (the pre-W2-H radius-only crater) and with the grenade's power
+//      (the terrain rule). Claims: on BARE flesh the two are identical (a
+//      grenade's power is past gore.blastPowerRef everywhere in its radius);
+//      in the cuirass the torso loses at most damageSourcesArmourMaxFrac of
+//      what it loses bare; and a WEAK blast of the same radius takes less than
+//      the grenade -- the crater follows power, not radius alone.
+//   C. AN NPC LANDS. A limp human handed a 15 m/s landing is billed through
+//      Mob::ApplyFallDamage by MobSystem::PreTick: hurt, alive. Before W2-H
+//      only the avatar was billed and this cost nothing.
+//   D. THE LASER CHARGES ONCE. MobSystem::LaserHit on a torso charges exactly
+//      tools.laserDamage once (the session used to call avatar.Damage and then
+//      mobs.Damage), and on a worn shell the Beam row's identity.
+//   E. THE STRUCK VOXEL (report only): per shipped worn item, how many of its
+//      shells hold more than one material -- the shells where the old
+//      `skinVoxels[0]` reading and the struck-voxel reading can disagree.
+//   F. A THROWN ROCK IS A BLOW (phase 2): a stone block flung at a torso at
+//      15 m/s through the real contact listener is billed as blunt trauma; at
+//      1.5 m/s it is not; into a cuirass the plate takes it and the torso
+//      only the transmitted share.
+Status GateDamageSources(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const Tuning& tune = CurrentTuning();
+  const Tuning::Gear& g = tune.gear;
+  bool ok = true;
+  std::string why;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    if (why.empty()) why = s;
+  };
+
+  // ---- A. the table ---------------------------------------------------------
+  auto oldRatio = [](float hard, float ref, float mn) {
+    if (!(hard > 0.0f && ref > 0.0f)) return 1.0f;
+    return std::clamp(ref / hard, std::clamp(mn, 0.0f, 1.0f), 1.0f);
+  };
+  auto oldBite = [&](float hard) {
+    float through = 1.0f;
+    if (hard > g.biteThroughSoft) {
+      const float span = std::max(g.biteThroughHard - g.biteThroughSoft, 1e-3f);
+      through = std::clamp((g.biteThroughHard - hard) / span, 0.0f, 1.0f);
+    }
+    return through;
+  };
+  int rows = 0, bad = 0;
+  for (float h : {0.0f, 2.0f, 4.0f, 5.0f, 8.0f, 10.0f, 14.0f, 24.0f, 30.0f,
+                  40.0f, 60.0f, 90.0f, 120.0f, 160.0f, 200.0f, 255.0f}) {
+    const ShellResponse cut = ShellResponseOf(h, DamageCause::Blade, g);
+    const ShellResponse blunt = ShellResponseOf(h, DamageCause::Blunt, g);
+    const ShellResponse fist = ShellResponseOf(h, DamageCause::Unarmed, g);
+    const ShellResponse bite = ShellResponseOf(h, DamageCause::Bite, g);
+    const ShellResponse blast = ShellResponseOf(h, DamageCause::Blast, g);
+    const ShellResponse beam = ShellResponseOf(h, DamageCause::Beam, g);
+    const ShellResponse fall = ShellResponseOf(h, DamageCause::Fall, g);
+    rows++;
+    const bool same =
+        cut.carve == oldRatio(h, g.cutHardnessRef, g.cutHardnessMin) &&
+        cut.passed == 0.0f && cut.shellHp == 1.0f &&
+        blunt.carve == oldRatio(h, g.bluntHardnessRef, g.bluntHardnessMin) &&
+        blunt.passed == g.bluntThrough && blunt.shellHp == g.bluntShellHp &&
+        fist.carve == blunt.carve && fist.passed == blunt.passed &&
+        fist.shellHp == blunt.shellHp && bite.passed == oldBite(h) &&
+        bite.carve == 0.0f &&
+        std::clamp(bite.shellHp, 0.0f, 1.0f) ==
+            std::clamp(g.biteOnShell, 0.0f, 1.0f) &&
+        blast.stop == h * g.blastShellCells && blast.passed == 1.0f &&
+        beam.carve == 1.0f && beam.shellHp == 1.0f && fall.passed == 1.0f &&
+        fall.shellHp == 0.0f;
+    if (!same) {
+      bad++;
+      fail(Format("table row at hardness %.0f is not the old formula", h));
+    }
+  }
+  std::printf("  damage-sources table: %d/%d hardness rows match the melee "
+              "formulas they replaced\n", rows - bad, rows);
+  for (const char* m : {"linen", "cloth", "leather", "iron", "steel"}) {
+    const uint32_t id = mobs.MaterialIdNamed(m);
+    const float h = id < c.mats.size() ? (float)c.mats[id].gpu.hardness : 0.0f;
+    const ShellResponse cut = ShellResponseOf(h, DamageCause::Blade, g);
+    const ShellResponse blunt = ShellResponseOf(h, DamageCause::Blunt, g);
+    const ShellResponse bite = ShellResponseOf(h, DamageCause::Bite, g);
+    const ShellResponse blast = ShellResponseOf(h, DamageCause::Blast, g);
+    std::printf("    %-8s hardness %3.0f: blade carve %.3f | blunt carve %.3f "
+                "passed %.2f shellHp %.2f | bite passed %.2f shellHp %.2f | "
+                "blast stop %.0f\n",
+                m, h, cut.carve, blunt.carve, blunt.passed, blunt.shellHp,
+                bite.passed, bite.shellHp, blast.stop);
+  }
+
+  // ---- the fixture: one human on its feet, optionally in the cuirass -------
+  const int def = mobs.FindDef(kAvatarDefName);
+  const ItemDef* cuirass = c.items.At(c.items.Find("iron_cuirass"));
+  if (def < 0 || cuirass == nullptr) {
+    detail = "needs the avatar def and `iron_cuirass`";
+    std::printf("damage-sources: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const IVec3 org = c.world.WindowOrigin();
+  const int fx = org.x * (int)kChunk + 470, fz = org.z * (int)kChunk + 470;
+  const IVec3 site{fx, World::TerrainHeight(fx, fz, kDefaultSeed) + 1, fz};
+  const uint64_t firstId = mobs.NextIdCounter();
+  const int torso = mobs.Defs()[def].rootLimb;
+  auto settle = [&](int n) {
+    for (int i = 0; i < n; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(3000u + (uint32_t)i, c.world, ops, cellOps, spawns);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+  };
+  // SAME ID EVERY ARM: the ragged rim is hashed off the creature's id, so two
+  // arms that spawned different ids would differ by noise, not by rule.
+  auto spawnFixture = [&](bool armoured) -> uint64_t {
+    mobs.Reset();
+    c.debris.Reset();
+    mobs.SetNextIdCounter(firstId);
+    const uint64_t id = mobs.Spawn(def, site);
+    if (!id) return 0;
+    settle(8);
+    if (armoured) {
+      Mob* m = mobs.FindMobById(id);
+      if (!m || !m->WearItem(cuirass, (int)EquipSlotId::Chest)) return 0;
+      settle(4);
+    }
+    return id;
+  };
+  auto bodyVoxels = [&](uint64_t id) {
+    uint32_t n = 0;
+    const Mob* m = mobs.FindMobById(id);
+    const int base = m ? m->AppendedBase() : 0;
+    for (int li = 0; li < base; li++)
+      if (mobs.LimbBody(id, li)) n += mobs.LimbArtVoxelCount(id, li);
+    return n;
+  };
+
+  // ---- B. the grenade -------------------------------------------------------
+  struct Blast {
+    uint32_t torso0 = 0, torso1 = 0, body0 = 0, body1 = 0, shell0 = 0,
+             shell1 = 0;
+    bool alive = false, ran = false;
+  };
+  const int gR = tune.grenade.blastRadius;
+  const int gP = tune.grenade.blastPower;
+  const float offset = (float)BaselineNumber("damageSourcesBlastOffset", 7.0);
+  auto blastArm = [&](bool armoured, int power, int radius, float off) {
+    Blast b;
+    const uint64_t id = spawnFixture(armoured);
+    if (!id || !mobs.LimbBody(id, torso)) return b;
+    int shell = -1;
+    if (Mob* m = mobs.FindMobById(id))
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+        if (m->WornHostOf(li) == torso) shell = li;
+    Vec3 sum{};
+    for (uint32_t k = 0; k < 16; k++)
+      sum += mobs.LimbVoxelPos(id, torso, k * 7919u);
+    const Vec3 tc = sum * (1.0f / 16.0f);
+    b.torso0 = mobs.LimbArtVoxelCount(id, torso);
+    b.body0 = bodyVoxels(id);
+    if (shell >= 0) b.shell0 = mobs.LimbArtVoxelCount(id, shell);
+    // Level with the torso and off to one side, so the crater BITES the torso
+    // rather than engulfing the whole body: a grazing blast is the case where
+    // what is in the way decides how much comes off.
+    ExplosionOp e{(int32_t)std::floor(tc.x + off), (int32_t)std::floor(tc.y),
+                  (int32_t)std::floor(tc.z), radius, power, 0, 0, 0};
+    std::vector<ParticleSpawn> spawns;
+    ExplosionHitsBodies(e, c.world, c.phys, c.debris, mobs, spawns);
+    b.torso1 = mobs.LimbBody(id, torso) ? mobs.LimbArtVoxelCount(id, torso) : 0;
+    b.body1 = bodyVoxels(id);
+    if (shell >= 0 && mobs.LimbBody(id, shell))
+      b.shell1 = mobs.LimbArtVoxelCount(id, shell);
+    b.alive = mobs.IsAlive(id);
+    b.ran = true;
+    return b;
+  };
+  // power 0 = the radius-only crater (the pre-W2-H model, still the path a
+  // blast with no stated power takes).
+  const Blast bare0 = blastArm(false, 0, gR, offset),
+              plate0 = blastArm(true, 0, gR, offset);
+  const Blast bare1 = blastArm(false, gP, gR, offset),
+              plate1 = blastArm(true, gP, gR, offset);
+  const int weakP = (int)BaselineNumber("damageSourcesWeakPower", 150.0);
+  const Blast weak = blastArm(false, weakP, gR, offset);
+  // The spell's `explosive` glyph (radius 6, power 220) three voxels off the
+  // torso, bare: reported before/after, not asserted -- it is the one shipped
+  // blast whose power sits near gore.blastPowerRef, so it is where the power
+  // model moves a number the game already had.
+  const Blast spell0 = blastArm(false, 0, 6, 3.0f);
+  const Blast spell1 = blastArm(false, 220, 6, 3.0f);
+  auto lost = [](uint32_t a, uint32_t b) { return a > b ? a - b : 0u; };
+  const uint32_t tBare0 = lost(bare0.torso0, bare0.torso1),
+                 tPlate0 = lost(plate0.torso0, plate0.torso1),
+                 tBare1 = lost(bare1.torso0, bare1.torso1),
+                 tPlate1 = lost(plate1.torso0, plate1.torso1),
+                 tWeak = lost(weak.torso0, weak.torso1),
+                 tSpell0 = lost(spell0.torso0, spell0.torso1),
+                 tSpell1 = lost(spell1.torso0, spell1.torso1);
+  std::printf("  grenade (r %d, power %d) %.0f vox beside the torso, torso "
+              "voxels lost:\n"
+              "    radius-only (pre-W2-H): bare %u of %u (body %u) | cuirass %u "
+              "of %u (body %u, plate %u -> %u)\n"
+              "    power model (W2-H):     bare %u of %u (body %u) | cuirass %u "
+              "of %u (body %u, plate %u -> %u)\n"
+              "    weak blast (r %d, power %d), bare: %u\n"
+              "    spell explosive (r 6, power 220) 3 vox off, bare: "
+              "radius-only %u, power model %u (body %u -> %u)\n",
+              gR, gP, offset, tBare0, bare0.torso0,
+              lost(bare0.body0, bare0.body1), tPlate0, plate0.torso0,
+              lost(plate0.body0, plate0.body1), plate0.shell0, plate0.shell1,
+              tBare1, bare1.torso0, lost(bare1.body0, bare1.body1), tPlate1,
+              plate1.torso0, lost(plate1.body0, plate1.body1), plate1.shell0,
+              plate1.shell1, gR, weakP, tWeak, tSpell0, tSpell1,
+              lost(spell0.body0, spell0.body1), lost(spell1.body0, spell1.body1));
+  RecordObserved("damageSourcesGrenadeBareBefore", (double)tBare0);
+  RecordObserved("damageSourcesGrenadePlateBefore", (double)tPlate0);
+  RecordObserved("damageSourcesGrenadeBare", (double)tBare1);
+  RecordObserved("damageSourcesGrenadePlate", (double)tPlate1);
+  RecordObserved("damageSourcesWeakBlast", (double)tWeak);
+  RecordObserved("damageSourcesSpellBefore", (double)tSpell0);
+  RecordObserved("damageSourcesSpell", (double)tSpell1);
+  const double armourMax = BaselineNumber("damageSourcesArmourMaxFrac", 0.75);
+  if (!bare0.ran || !plate0.ran || !bare1.ran || !plate1.ran || !weak.ran)
+    fail("a blast fixture did not spawn");
+  else if (tBare1 == 0)
+    fail("the grenade took nothing off the bare torso (the fixture proves nothing)");
+  else if (bare1.torso1 != bare0.torso1 || bare1.body1 != bare0.body1)
+    fail("a grenade on BARE flesh changed under the power model");
+  else if ((double)tPlate1 > armourMax * (double)tBare1)
+    fail(Format("the cuirass kept only %u of %u torso voxels' loss off",
+                tBare1 - std::min(tBare1, tPlate1), tBare1));
+  else if (tWeak >= tBare1)
+    fail("a weak blast of the grenade's radius took as much as the grenade");
+
+  // ---- C. an NPC lands ------------------------------------------------------
+  uint32_t billed = 0;
+  float hp0 = 0.0f, hp1 = 0.0f;
+  bool npcAlive = false;
+  {
+    mobs.Reset();
+    c.debris.Reset();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    int relief = 0;
+    const IVec3 anchor = AiFixtureCentre(c.world);
+    const IVec3 spot =
+        AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+    AiTicker ticker{c, 14000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+    const uint64_t id = mobs.Spawn(def, {spot.x, spot.y + 1, spot.z});
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    if (!m) {
+      fail("the NPC fall fixture did not spawn");
+    } else {
+      for (int i = 0; i < 40; i++) ticker();
+      m = mobs.FindMobById(id);
+      hp0 = mobs.TotalHp(id);
+      const uint32_t before = m ? m->FallsBilled() : 0u;
+      if (m) {
+        m->StartRagdoll(2.0f, "gate");
+        m->SetLimbVelocities(Vec3{0.0f, -15.0f / kVoxelMeters, 0.0f});
+      }
+      for (int i = 0; i < 40; i++) ticker();
+      m = mobs.FindMobById(id);
+      hp1 = mobs.TotalHp(id);
+      billed = m ? m->FallsBilled() - before : 0u;
+      npcAlive = mobs.IsAlive(id);
+      if (billed == 0) fail("a limp NPC's 15 m/s landing was not billed");
+      else if (!(hp1 < hp0)) fail("the NPC's landing cost no hp");
+      else if (!npcAlive) fail("a sub-lethal landing killed the NPC");
+    }
+    std::printf("  NPC landing at 15 m/s: billed %u, hp %.1f -> %.1f, alive %d "
+                "(pre-W2-H: never billed)\n",
+                billed, hp0, hp1, (int)npcAlive);
+    RecordObserved("damageSourcesNpcFallHp", (double)(hp0 - hp1));
+  }
+
+  // ---- D. the laser ---------------------------------------------------------
+  float laserFlesh = -1.0f, laserShell = -1.0f;
+  uint32_t charges = 0;
+  {
+    const uint64_t id = spawnFixture(true);
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    int shell = -1;
+    if (m)
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+        if (m->WornHostOf(li) == torso) shell = li;
+    if (!m || shell < 0 || !mobs.LimbBody(id, torso)) {
+      fail("the laser fixture did not dress");
+    } else {
+      const uint32_t n0 = mobs.LaserHitsCharged();
+      float bore = 0.0f;
+      const float t0 = mobs.LimbHp(id, torso);
+      mobs.LaserHit(mobs.LimbBody(id, torso), mobs.LimbVoxelPos(id, torso, 11u),
+                    bore);
+      laserFlesh = t0 - mobs.LimbHp(id, torso);
+      const float s0 = mobs.LimbHp(id, shell);
+      float bore2 = 0.0f;
+      mobs.LaserHit(mobs.LimbBody(id, shell), mobs.LimbVoxelPos(id, shell, 11u),
+                    bore2);
+      laserShell = s0 - mobs.LimbHp(id, shell);
+      charges = mobs.LaserHitsCharged() - n0;
+      if (charges != 2 || laserFlesh != tune.tools.laserDamage ||
+          laserShell != tune.tools.laserDamage ||
+          bore != (float)tune.tools.laserCarveRadius)
+        fail("the laser did not charge exactly once per tick");
+    }
+    std::printf("  laser: 2 ticks -> %u charges; torso -%.2f hp, cuirass -%.2f "
+                "hp (tools.laserDamage %.2f)\n",
+                charges, laserFlesh, laserShell, tune.tools.laserDamage);
+  }
+
+  // ---- F. a thrown rock (W2-H phase 2) --------------------------------------
+  //
+  // A 3x3x3 stone block flung at the torso at `mps`, through the real contact
+  // listener (Physics::ContactImpacts) and MobSystem::ApplyContactDamage.
+  // Fast: billed, torso hurt. Slow: under gore.contactImpulseMin, nothing. In
+  // the cuirass: billed on the plate, and the torso takes only the Blunt
+  // row's transmitted share.
+  struct Throw {
+    uint32_t billed = 0;
+    float torsoHp = 0.0f, shellHp = 0.0f, mass = 0.0f;
+    bool ran = false;
+  };
+  std::vector<float> density(c.mats.size(), 1000.0f);
+  for (size_t i = 0; i < c.mats.size(); i++)
+    density[i] = std::max(1.0f, (float)c.mats[i].gpu.density);
+  auto throwArm = [&](bool armoured, float mps) {
+    Throw t;
+    const uint64_t id = spawnFixture(armoured);
+    if (!id || !mobs.LimbBody(id, torso)) return t;
+    int shell = -1;
+    if (Mob* m = mobs.FindMobById(id))
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+        if (m->WornHostOf(li) == torso) shell = li;
+    Vec3 sum{};
+    for (uint32_t k = 0; k < 16; k++)
+      sum += mobs.LimbVoxelPos(id, torso, k * 7919u);
+    const Vec3 tc = sum * (1.0f / 16.0f);
+    std::vector<DebrisVoxel> vox;
+    for (int8_t z = 0; z < 3; z++)
+      for (int8_t y = 0; y < 3; y++)
+        for (int8_t x = 0; x < 3; x++)
+          vox.push_back(DebrisVoxel{x, y, z, 0, (uint16_t)kMatStone});
+    const IVec3 at0{(int)std::floor(tc.x) + 6, (int)std::floor(tc.y) - 1,
+                    (int)std::floor(tc.z) - 1};
+    const uint64_t bh = c.phys.CreateDebrisBody(vox, at0, density);
+    if (bh == 0) return t;
+    t.mass = c.phys.BodyMass(bh);
+    c.phys.SetBodyVelocities(bh, Vec3{-mps / kVoxelMeters, 0.0f, 0.0f},
+                             Vec3{});
+    // The WHOLE body's hp and the whole garment's: a block thrown at the
+    // torso meets whatever is in front of it first (an arm, a sleeve).
+    auto shellHp = [&]() {
+      float s = 0.0f;
+      if (Mob* m = mobs.FindMobById(id))
+        for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+          if (m->WornHostOf(li) >= 0) s += std::max(0.0f, m->LimbHpAt(li));
+      return s;
+    };
+    const float torso0 = mobs.TotalHp(id);
+    const float shell0 = shellHp();
+    (void)shell;
+    const uint32_t n0 = mobs.ContactHitsBilled();
+    std::vector<ParticleSpawn> spawns;
+    for (int i = 0; i < 20; i++) {
+      c.phys.Step(kTickDt);
+      mobs.ApplyContactDamage(c.phys, c.world, spawns);
+    }
+    t.billed = mobs.ContactHitsBilled() - n0;
+    t.torsoHp = torso0 - mobs.TotalHp(id);
+    t.shellHp = shell0 - shellHp();
+    c.phys.RemoveBody(bh);
+    t.ran = true;
+    return t;
+  };
+  const Throw fast = throwArm(false, 15.0f);
+  const Throw slow = throwArm(false, 1.5f);
+  const Throw plated = throwArm(true, 15.0f);
+  std::printf("  thrown stone (%.1f kg): 15 m/s bare billed %u, body -%.1f hp | "
+              "1.5 m/s billed %u, body -%.1f | 15 m/s in the cuirass billed "
+              "%u, plate -%.1f, body -%.1f (pre-W2-H: never billed)\n",
+              fast.mass, fast.billed, fast.torsoHp, slow.billed, slow.torsoHp,
+              plated.billed, plated.shellHp, plated.torsoHp);
+  RecordObserved("damageSourcesThrownHp", (double)fast.torsoHp);
+  if (!fast.ran || !slow.ran || !plated.ran)
+    fail("a thrown-stone fixture did not run");
+  else if (fast.billed == 0 || !(fast.torsoHp > 0.0f))
+    fail("a 15 m/s stone into a body was not a blow");
+  else if (slow.billed != 0 || slow.torsoHp != 0.0f)
+    fail("a 1.5 m/s stone hurt somebody");
+  else if (plated.billed == 0 || !(plated.shellHp > 0.0f) ||
+           !(plated.torsoHp < fast.torsoHp))
+    fail("the cuirass did not take the stone");
+
+  // ---- E. the struck voxel (report) -----------------------------------------
+  {
+    std::string rep;
+    Equipment eq;
+    for (const ItemDef& it : c.items.items) {
+      const int slot = EquipSlotFor(it.kind, eq);
+      if (slot < 0 || it.cover.empty()) continue;
+      const uint64_t id = spawnFixture(false);
+      Mob* m = id ? mobs.FindMobById(id) : nullptr;
+      if (!m || !m->WearItem(&it, slot)) continue;
+      int shells = 0, mixed = 0;
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++) {
+        if (m->WornHostOf(li) < 0) continue;
+        shells++;
+        const uint32_t first =
+            m->ShellMaterialAt(li, mobs.LimbVoxelPos(id, li, 0u));
+        for (uint32_t k = 1; k < 64; k++)
+          if (m->ShellMaterialAt(li, mobs.LimbVoxelPos(id, li, k * 7919u)) !=
+              first) {
+            mixed++;
+            break;
+          }
+      }
+      if (mixed) rep += Format(" %s %d/%d", it.name.c_str(), mixed, shells);
+    }
+    std::printf("  struck voxel vs first voxel: shells holding more than one "
+                "material:%s\n", rep.empty() ? " none" : rep.c_str());
+  }
+
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  detail = Format(
+      "table %d/%d; grenade torso loss bare %u->%u, cuirass %u->%u, weak %u, "
+      "spell %u->%u; "
+      "NPC 15 m/s landing billed %u (hp -%.1f, alive %d); laser %u charges "
+      "(-%.2f flesh, -%.2f shell); thrown stone 15 m/s: %u billed -%.1f hp, "
+      "slow %u, plated %u (body -%.1f)%s%s",
+      rows - bad, rows, tBare0, tBare1, tPlate0, tPlate1, tWeak, tSpell0,
+      tSpell1, billed,
+      hp0 - hp1, (int)npcAlive, charges, laserFlesh, laserShell, fast.billed,
+      fast.torsoHp, slow.billed, plated.billed, plated.torsoHp,
+      why.empty() ? "" : "; FAIL: ", why.c_str());
+  std::printf("damage-sources: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
@@ -12814,6 +13264,12 @@ const std::vector<Gate>& MobGates() {
       // ...and what a limp landing COSTS. Its own gate rather than another
       // `ragdoll` arm: that gate's arms inherit each other's tick phase.
       {"ragdoll-falldamage", "mob", {}, false, GateRagdollFallDamage,
+       /*needsRender=*/false},
+      // ONE DAMAGE EVENT, ONE SHELL RESPONSE (W2-H): the shell table vs the
+      // melee formulas it replaced, a grenade against bare and plated flesh
+      // (with and without its power), an NPC's landing, the laser's single
+      // charge. Resets mobs + debris and regenerates on the way in and out.
+      {"damage-sources", "mob", {}, false, GateDamageSources,
        /*needsRender=*/false},
       // ...and whether the thing that landed is still ONE body. Dressed, limp,
       // 50 m of fall: the clothes may not leave the limbs and the joints may not

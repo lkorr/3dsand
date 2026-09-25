@@ -254,11 +254,12 @@ class PlayerAvatar : public Mob {
   // draws the span between the two as charred off, and nothing may heal past
   // it (sim/tuning.h Gore §G).
   int32_t HealthCap() const;
-  // Spend health across live parts, proportionally to what each still has.
-  // Parts driven to zero are severed through the ordinary Sever() path, so an
-  // overcast dismembers you with no new gore code.
+  // Spend health across live parts, proportionally to what each still has:
+  // Mob::SpendHp with the Other cause, so hp reaching zero means what it means
+  // everywhere else (a vital part dies in place; an arm stays on).
   void SpendHealth(int32_t amount);
-  // Kill the caster spectacularly at `atWorldVoxel` (FATAL overcast).
+  // Kill the caster spectacularly at `atWorldVoxel` (FATAL overcast): the
+  // ordinary radial carve (Mob::CarveRadialAll), then death.
   void SelfDestruct(Vec3 atWorldVoxel, float radiusVox, World& world,
                     std::vector<ParticleSpawn>& spawns);
   // Explosion damage to the avatar's body. Same call shape as
@@ -280,12 +281,10 @@ class PlayerAvatar : public Mob {
   // not take fall damage on landing: the controller never saw the fall.
   bool RagdollFollow(Vec3& outPlayerPos) const;
 
-  // Impact damage, driven by Player::impactDeltaV — the velocity a collision
-  // sweep refused. Covers falls and horizontal wall slams with one path.
-  // `centerWorldVoxel` is the player AABB centre (mid-torso), NOT origin_.
-  void ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel, uint32_t tick,
-                       World& world, std::vector<BrushOp>& ops,
-                       std::vector<ParticleSpawn>& spawns);
+  // Impact damage is Mob::ApplyFallDamage (W2-H), driven for the player by
+  // Player::impactDeltaV — the velocity a collision sweep refused, so falls
+  // and horizontal wall slams share one path — and by the limp arrest. The
+  // player's `centerWorldVoxel` is the AABB centre (mid-torso), NOT origin_.
 
   // ---- persistence (sim/worldio.h, entities.sve section 'AVTR') -----------
   // Per-part hp and sever state, def by NAME. LoadState runs while the avatar

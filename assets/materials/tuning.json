@@ -14,6 +14,13 @@
     "fallDamageSpeed": 8,
     "fallSplatSpeed": 25,
     "fallDamageScale": 0.75,
+    "fallSplatCarveBase": 4,
+    "fallSplatCarvePerMs": 0.1,
+    "fallSplatDroplets": 400,
+    "fallSplatBloodVoxels": 30,
+    "fallSplatImpulseRadius": 8,
+    "fallSplatImpulsePerMs": 2,
+    "fallLegBleed": 0.3,
     "stepUp": 0.58,
     "smoothBump": 0.12,
     "stepSpeedPenaltyPerM": 2.8,
@@ -99,7 +106,8 @@
     "bluntShellHp": 0.600000024,
     "biteOnShell": 0.300000012,
     "biteThroughSoft": 14,
-    "biteThroughHard": 60
+    "biteThroughHard": 60,
+    "blastShellCells": 1
   },
   "avatar": {
     "enabled": true,
@@ -203,7 +211,6 @@
   },
   "ragdoll": {
     "fallSeconds": 1.5,
-    "blastRadiusScale": 3,
     "blastImpulseScale": 1,
     "blastMinSpeed": 1.5,
     "maxLaunchSpeed": 14,
@@ -345,7 +352,13 @@
     "infectBoneStain": 11,
     "infectBoneStainVary": 5,
     "infectBoneIchor": 0.449999988,
-    "brainHpPerVoxel": 3.5
+    "brainHpPerVoxel": 3.5,
+    "carveHpPerVolume": 1.5,
+    "blastPowerRef": 200,
+    "contactImpulseMin": 40,
+    "contactHpPerImpulse": 0.25,
+    "contactMaxHp": 60,
+    "contactMaxPerTick": 8
   },
   "coat": {
     "recountTicks": 8,
