@@ -325,6 +325,20 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "fallDamageSpeed", p.fallDamageSpeed, out, at);
     ReadF(*g, "fallSplatSpeed", p.fallSplatSpeed, out, at);
     ReadF(*g, "fallDamageScale", p.fallDamageScale, out, at);
+    ReadF(*g, "fallSplatCarveBase", p.fallSplatCarveBase, out, at);
+    ReadF(*g, "fallSplatCarvePerMs", p.fallSplatCarvePerMs, out, at);
+    ReadI(*g, "fallSplatDroplets", p.fallSplatDroplets, out, at);
+    ReadI(*g, "fallSplatBloodVoxels", p.fallSplatBloodVoxels, out, at);
+    ReadF(*g, "fallSplatImpulseRadius", p.fallSplatImpulseRadius, out, at);
+    ReadF(*g, "fallSplatImpulsePerMs", p.fallSplatImpulsePerMs, out, at);
+    ReadF(*g, "fallLegBleed", p.fallLegBleed, out, at);
+    p.fallSplatCarveBase = std::max(0.0f, p.fallSplatCarveBase);
+    p.fallSplatCarvePerMs = std::max(0.0f, p.fallSplatCarvePerMs);
+    p.fallSplatDroplets = std::clamp(p.fallSplatDroplets, 0, 4096);
+    p.fallSplatBloodVoxels = std::clamp(p.fallSplatBloodVoxels, 0, 512);
+    p.fallSplatImpulseRadius = std::max(0.0f, p.fallSplatImpulseRadius);
+    p.fallSplatImpulsePerMs = std::max(0.0f, p.fallSplatImpulsePerMs);
+    p.fallLegBleed = std::max(0.0f, p.fallLegBleed);
     ReadF(*g, "stepUp", p.stepUp, out, at);
     ReadF(*g, "smoothBump", p.smoothBump, out, at);
     ReadF(*g, "stepSpeedPenaltyPerM", p.stepSpeedPenaltyPerM, out, at);
@@ -461,6 +475,8 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // The ramp must have width, or a hardness exactly on the pair divides by
     // zero; an author who wants a hard cliff gets it from a narrow band.
     c.biteThroughHard = std::max(c.biteThroughHard, c.biteThroughSoft + 1e-3f);
+    ReadF(*g, "blastShellCells", c.blastShellCells, out, at);
+    c.blastShellCells = std::clamp(c.blastShellCells, 0.0f, 8.0f);
   }
 
   if (const json* g = Find(j, "avatar")) {
@@ -644,7 +660,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     auto& r = out.ragdoll;
     const std::string at = "ragdoll";
     ReadF(*g, "fallSeconds", r.fallSeconds, out, at);
-    ReadF(*g, "blastRadiusScale", r.blastRadiusScale, out, at);
     ReadF(*g, "blastImpulseScale", r.blastImpulseScale, out, at);
     ReadF(*g, "blastMinSpeed", r.blastMinSpeed, out, at);
     ReadF(*g, "maxLaunchSpeed", r.maxLaunchSpeed, out, at);
@@ -837,6 +852,18 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     e.infectBoneIchor = std::clamp(e.infectBoneIchor, 0.0f, 1.0f);
     ReadF(*g, "brainHpPerVoxel", e.brainHpPerVoxel, out, at);
     e.brainHpPerVoxel = std::clamp(e.brainHpPerVoxel, 0.0f, 200.0f);
+    ReadF(*g, "carveHpPerVolume", e.carveHpPerVolume, out, at);
+    e.carveHpPerVolume = std::clamp(e.carveHpPerVolume, 0.0f, 20.0f);
+    ReadF(*g, "blastPowerRef", e.blastPowerRef, out, at);
+    e.blastPowerRef = std::max(1.0f, e.blastPowerRef);
+    ReadF(*g, "contactImpulseMin", e.contactImpulseMin, out, at);
+    ReadF(*g, "contactHpPerImpulse", e.contactHpPerImpulse, out, at);
+    ReadF(*g, "contactMaxHp", e.contactMaxHp, out, at);
+    ReadI(*g, "contactMaxPerTick", e.contactMaxPerTick, out, at);
+    e.contactImpulseMin = std::max(0.0f, e.contactImpulseMin);
+    e.contactHpPerImpulse = std::max(0.0f, e.contactHpPerImpulse);
+    e.contactMaxHp = std::max(0.0f, e.contactMaxHp);
+    e.contactMaxPerTick = std::clamp(e.contactMaxPerTick, 0, 64);
     // ---- F. blood is health / G. burns cap health (game/mob.h) -------------
     ReadF(*g, "bleedHpPerVoxel", e.bleedHpPerVoxel, out, at);
     ReadB(*g, "stumpBleedsOpen", e.stumpBleedsOpen, out, at);
@@ -3179,6 +3206,12 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("infectBoneStainVary", g.infectBoneStainVary);
     put("infectBoneIchor", g.infectBoneIchor);
     put("brainHpPerVoxel", g.brainHpPerVoxel);
+    put("carveHpPerVolume", g.carveHpPerVolume);
+    put("blastPowerRef", g.blastPowerRef);
+    put("contactImpulseMin", g.contactImpulseMin);
+    put("contactHpPerImpulse", g.contactHpPerImpulse);
+    put("contactMaxHp", g.contactMaxHp);
+    putI("contactMaxPerTick", g.contactMaxPerTick);
   }
   if (group("gear", lo, hi)) {
     const Tuning::Gear& gr = t.gear;
@@ -3193,6 +3226,7 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("biteOnShell", gr.biteOnShell);
     put("biteThroughSoft", gr.biteThroughSoft);
     put("biteThroughHard", gr.biteThroughHard);
+    put("blastShellCells", gr.blastShellCells);
   }
 
   if (!missing.empty()) {

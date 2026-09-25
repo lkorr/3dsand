@@ -2467,65 +2467,27 @@ int32_t PlayerAvatar::HealthCap() const {
 
 void PlayerAvatar::SpendHealth(int32_t amount) {
   if (!spawned_ || !alive_ || amount <= 0) return;
-  // Spread the cost across live limbs_ in proportion to what each still has,
-  // rather than draining the first one to zero — otherwise a mana overdraw
-  // deterministically severs whichever limb happens to sort first, which reads
-  // as a bug rather than as a cost.
-  const int32_t total = TotalHealth();
-  if (total <= 0) {
-    Die();
-    return;
-  }
-  if (amount >= total) {
-    Die();
-    return;
-  }
-  const float frac = (float)amount / (float)total;
-  // Collect first: Sever() mutates `limbs_` (it detaches children too), so
-  // deciding everything against the pre-carve state and acting afterwards is
-  // what keeps this from walking a list that reshapes underneath it.
-  std::vector<int> severed;
-  for (size_t i = 0; i < limbs_.size(); i++) {
-    if (!PartAlive((int)i) || limbs_[i].hp <= 0 ||
-        (i < limbDefs_.size() && limbDefs_[i].bloodless))
-      continue;
-    limbs_[i].hp -= limbs_[i].hp * frac;
-    // Bleeding from the strain of the overcast, through the ordinary budget.
-    if (def_)
-      limbs_[i].bleedBudget = AddBleedBudget(limbs_[i].bleedBudget,
-                                            6.0f * frac * def_->bleedPerDamage);
-    if (limbs_[i].hp <= 0.0f) severed.push_back((int)i);
-  }
-  for (int i : severed)
-    if (PartAlive(i)) Sever(i);
+  // Spread across live slots in proportion to what each still has, through
+  // Mob::Damage with the Other cause ("the caster's cost",
+  // phys/damagecause.h) -- Mob::SpendHp. It used to subtract the hp here and
+  // Sever() whatever reached zero, which contradicted the hp-kills-in-place
+  // rule every other damage path reads (W2-H).
+  SpendHp((float)amount, DamageCtx(DamageCause::Other));
 }
 
 void PlayerAvatar::SelfDestruct(Vec3 atWorldVoxel, float radiusVox,
                                 World& world,
                                 std::vector<ParticleSpawn>& spawns) {
-  (void)world;
-  (void)spawns;
   if (!spawned_ || !def_) return;
-  // Take off every severable part whose body is inside the blast, then die.
-  // Severing rather than carving is a deliberate simplification for this
-  // slice: the avatar has no equivalent of MobSystem's private CarveLimb, and
-  // duplicating that machinery here to shave voxels off a body that is about
-  // to become a corpse anyway is not worth the second copy. Everything after
-  // the sever — ragdoll, gore spray, debris adoption, settle-back — is the
-  // existing pipeline with no spell-specific code.
-  std::vector<int> hits;
-  for (size_t i = 0; i < limbs_.size(); i++) {
-    if (!PartAlive((int)i) || !limbs_[i].body) continue;
-    const MobLimbDef& ld = limbDefs_[i];
-    if ((int)i == def_->rootLimb || ld.vital || !ld.severable) continue;
-    // 20 cm of margin past the blast radius, so the limb sweep covers the same
-    // real shell at any voxel size.
-    if ((limbs_[i].xf.pos - atWorldVoxel).len() <=
-        radiusVox + MetresToCells(0.2f))
-      hits.push_back((int)i);
-  }
-  for (int i : hits)
-    if (PartAlive(i)) Sever(i);
+  // A FATAL OVERCAST TEARS THE BODY THE WAY A BLAST DOES, and then it dies.
+  // This severed every severable part in range "because the avatar has no
+  // CarveLimb" -- it has had Mob's since the refactor that made PlayerAvatar a
+  // Mob, so the carve is the ordinary radial one (ejected gobbets,
+  // connectivity splits, collapse severing, the crater soak), carrying the
+  // caster's-cost cause. 20 cm of margin, as the sever sweep had, so the same
+  // real shell of body is reached at any voxel size.
+  CarveRadialAll(atWorldVoxel, radiusVox + MetresToCells(0.2f), world, spawns,
+                 /*power=*/0.0f, DamageCtx(DamageCause::Other));
   Die();
 }
 
@@ -2541,131 +2503,8 @@ void PlayerAvatar::CarveRadial(Vec3 centerWorldVoxel, float radiusVoxels,
   CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
 }
 
-void PlayerAvatar::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
-                                   uint32_t tick,
-                                   World& world, std::vector<BrushOp>& ops,
-                                   std::vector<ParticleSpawn>& spawns) {
-  // THE FIRST PRODUCER TO ADOPT THE AUTHOR SCOPE (sim/oprecord.h). Everything
-  // this function pushes into `ops` is the player's own body coming apart, so
-  // the record attributes that range to the avatar rather than to "unknown".
-  // CPU-side only: it reaches no shader and cannot move the world hash.
-  sandvox::opstream::BrushAuthorScope author(
-      ops, sandvox::opstream::Producer::Avatar, 0);
-  if (!spawned_ || !alive_ || !def_) return;
-  const float impactVox = impactDeltaV.len();
-  if (impactVox < 1e-3f) return;
-  const auto& pt = CurrentTuning().player;
-  const float impactMs = impactVox * kVoxelMeters;
-  if (impactMs < pt.fallDamageSpeed) return;
-
-  const MobDef& def = *def_;
-  const auto& gore = CurrentTuning().gore;
-  const Vec3 center = centerWorldVoxel;
-
-  float excess = impactMs - pt.fallDamageSpeed;
-  float damage = excess * excess * pt.fallDamageScale;
-
-  bool lethal = impactMs >= pt.fallSplatSpeed ||
-                damage >= (float)TotalHealth();
-  // ONE LINE PER HIT, because there are two producers now and they can
-  // disagree: the controller's sweep (Player::impactDeltaV) and the ragdoll's
-  // arrest (Mob::TakeRagdollImpact). "The fall killed me" and "four folds of the
-  // landing each billed" look identical in the health bar and nowhere else.
-  std::printf("avatar impact: %.1f m/s (%s, %.0f of %d hp) at (%.1f, %.1f, "
-              "%.1f)%s\n",
-              impactMs, Ragdolled() ? "limp" : "sweep", damage, TotalHealth(),
-              center.x, center.y, center.z, lethal ? " LETHAL" : "");
-
-  if (lethal) {
-    // --- splat: carve voxels out of the body, sever some limbs, die ---
-
-    // CarveRadial blows chunks out of every live limb like an explosion would:
-    // voxels get ejected as particles, limbs_ losing >75% of volume collapse.
-    float carveRadius = 4.0f + impactMs * 0.1f;
-    CarveRadial(center, carveRadius, world, spawns);
-
-    // Sever roughly half the remaining severable limbs at random.
-    std::vector<int> severable;
-    for (size_t i = 0; i < limbs_.size(); i++) {
-      if (!PartAlive((int)i) || !limbs_[i].body) continue;
-      const MobLimbDef& ld = limbDefs_[i];
-      if ((int)i == def.rootLimb || ld.vital || !ld.severable) continue;
-      severable.push_back((int)i);
-    }
-    for (size_t j = 0; j < severable.size(); j++) {
-      uint32_t h = Hash3((uint32_t)id_ ^ 0xFA11u, tick, (uint32_t)j);
-      if ((h & 1) == 0) continue;
-      int i = severable[j];
-      if (PartAlive(i)) {
-        Sever(i, DamageCtx(DamageCause::Fall));
-        if (limbs_[i].holdBody) limbs_[i].holdSeconds = 0.0f;
-      }
-    }
-    Die();
-
-    // Radial impulse scatters debris outward from the impact.
-    if (phys_)
-      phys_->ApplyRadialImpulse(center, 8.0f, impactMs * 2.0f);
-
-    // Blood micro-spray burst.
-    if (def.bleedMat != 0) {
-      int droplets = 400;
-      for (int k = 0; k < droplets; k++) {
-        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
-        uint32_t h = Hash3((uint32_t)id_ ^ 0xFA11u, tick, (uint32_t)(k + 100));
-        Vec3 dir{SignedUnit(h),
-                 0.3f + 0.7f * (float)(Pcg(h ^ 0xA001u) & 0xFFFFu) / 65535.0f,
-                 SignedUnit(Pcg(h ^ 0xB002u))};
-        float len = dir.len();
-        if (len > 1e-4f) dir = dir * (1.0f / len);
-        float sp = gore.severSpraySpeed *
-                   (0.5f + 1.0f * (float)(Pcg(h ^ 0xC003u) & 0xFFFFu) / 65535.0f);
-        int life = std::clamp(gore.microLifeTicks, 1, 255);
-        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, true,
-                                     life, gore.microScale));
-      }
-      // Whole-voxel blood thrown outward — pools and persists.
-      for (int k = 0; k < 30; k++) {
-        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
-        uint32_t h = Hash3((uint32_t)id_ ^ 0xB10Du, tick, (uint32_t)(k + 500));
-        Vec3 dir{SignedUnit(h),
-                 0.2f + 0.4f * (float)(Pcg(h ^ 0xD004u) & 0xFFFFu) / 65535.0f,
-                 SignedUnit(Pcg(h ^ 0xE005u))};
-        float len = dir.len();
-        if (len > 1e-4f) dir = dir * (1.0f / len);
-        float sp = gore.severVoxelSpeed *
-                   (0.6f + 0.8f * (float)(Pcg(h ^ 0xF006u) & 0xFFFFu) / 65535.0f);
-        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, false,
-                                     0, 0));
-      }
-      // Blood stain at the impact site. Budget charged BEFORE emission
-      // (CLAUDE.md): the brush stream is capped at kMaxOpsPerTick and
-      // SubmitTick refuses the overflow, so a producer that pushes past the
-      // cap is authoring an op that silently never happens.
-      if (ops.size() < kMaxOpsPerTick)
-        ops.push_back({ifloor(center.x), ifloor(center.y),
-                       ifloor(center.z), 2, def.bleedMat, 0, 0, 0});
-    }
-    return;
-  }
-
-  // --- sub-lethal impact: proportional damage, bleed on legs ---
-  SpendHealth((int32_t)std::lround(damage));
-  if (def.bleedMat != 0) {
-    for (size_t i = 0; i < limbs_.size(); i++) {
-      if (!PartAlive((int)i) || !limbs_[i].body) continue;
-      const MobLimbDef& ld = limbDefs_[i];
-      if (ld.name.find("leg") == std::string::npos &&
-          ld.name.find("foot") == std::string::npos)
-        continue;
-      limbs_[i].bleedBudget =
-          AddBleedBudget(limbs_[i].bleedBudget, damage * 0.3f * def.bleedPerDamage);
-      Quat q{limbs_[i].xf.quat[0], limbs_[i].xf.quat[1],
-             limbs_[i].xf.quat[2], limbs_[i].xf.quat[3]};
-      limbs_[i].woundLocal = RotateInv(q, center - limbs_[i].xf.pos);
-    }
-  }
-}
+// (PlayerAvatar::ApplyFallDamage moved to Mob::ApplyFallDamage in W2-H: every
+// creature takes a landing now, through the one function.)
 
 bool PlayerAvatar::SeverByName(const std::string& name) {
   int i = PartIndex(name);
