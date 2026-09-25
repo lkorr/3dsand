@@ -2562,23 +2562,47 @@ bool MobSystem::ServiceRising(size_t ri) {
     gear.push_back(std::move(g));
   }
   // ---- AND ITS PACK --------------------------------------------------------
-  // Without this, turning would be a way to delete a purse.
-  std::vector<CarriedItem> carried = src->carried_;
+  // Without this, turning would be a way to delete a purse. Whole
+  // ItemInstances (W2-M): a flask in the pack rises still holding what it held.
+  std::vector<ItemInstance> carried = src->Carried();
   // ---- ...AND, FOR THE AVATAR, THE PLAYER'S OWN KIT ------------------------
   //
-  // The player's bag and hotbar are not on the player's body — they are in
-  // PlayerKit on the session, which this class cannot reach and must not
-  // (game/session.h: per-player state is not a process global). So the owner
-  // of the kit answers the question, at the one moment the answer is wanted.
-  // The callback also decides whether the player KEEPS what it hands back
-  // (`avatar.keepKitOnTurn`); see MobSystem::SetAvatarKitFn.
-  // A PlayerCorpse() is the same body after AdoptDeadAvatar moved it into
-  // mobs_: still the player's kit, and still only the callback can read it.
-  if ((avatar || src->playerCorpse_) && avatarKitFn_) {
-    std::vector<CarriedItem> kit;
-    avatarKitFn_(kit);
-    for (CarriedItem& c : kit)
-      if (!c.item.empty() && c.count > 0) carried.push_back(std::move(c));
+  // The player's bag and hotbar are the AVATAR's kit (Mob::kit_), and it stays
+  // on the avatar when the dead rig becomes a corpse (AdoptDeadAvatar moves it
+  // back), so a PlayerCorpse() reads it off the local avatar that owns it.
+  // Worn pieces are not in this list: they are on the rig and came across in
+  // the gear walk above.
+  //
+  // COPY OR MOVE, and that is the whole of `avatar.keepKitOnTurn`:
+  //   true  (default) — the zombie rises with a COPY and you respawn with
+  //                     everything. A duplication machine, deliberately the
+  //                     default while the feature is played with.
+  //   false           — bag, hotbar and equipment are EMPTIED on the way out:
+  //                     your kit walks away wearing your face. Equipment is
+  //                     cleared but NOT copied (the worn pieces are already on
+  //                     the rig); clearing it is what stops DressFromKit
+  //                     re-dressing the respawned body from the slot.
+  if (avatar || src->playerCorpse_) {
+    Mob* holder = avatar ? src : nullptr;
+    for (size_t a = 0; holder == nullptr && a < localAvatars_ &&
+                       a < avatars_.size();
+         a++)
+      if (avatars_[a] != nullptr && avatars_[a]->owner_ == src->owner_)
+        holder = avatars_[a];
+    if (holder != nullptr) {
+      const bool keep = CurrentTuning().avatar.keepKitOnTurn;
+      auto take = [&](ItemStack& s) {
+        if (s.Empty()) return;
+        carried.push_back(s);
+        if (!keep) s = ItemStack{};
+      };
+      for (ItemStack& s : holder->kit_.bag.slots) take(s);
+      for (ItemStack& s : holder->kit_.hotbar.slots) take(s);
+      if (!keep) {
+        holder->kit_.equip = Equipment{};
+        holder->KitWornStale();
+      }
+    }
   }
 
   // ---- THE REMAINS COME OUT OF THE WORLD FIRST -----------------------------
@@ -2748,8 +2772,8 @@ bool MobSystem::ServiceRising(size_t ri) {
   // Through AddCarried, so the merge and the cap are the ones every other pack
   // obeys.
   size_t packed = 0;
-  for (const CarriedItem& c : carried)
-    if (now.AddCarried(c.item, c.count, c.dye)) packed++;
+  for (const ItemInstance& c : carried)
+    if (now.AddCarried(c)) packed++;
   // ---- IT RISES FROM WHERE IT FELL, NOT FROM STANDING ----------------------
   //
   // Teleport each of the zombie's limbs to where the corpse's limb lay and
@@ -2838,6 +2862,12 @@ uint64_t MobSystem::AdoptDeadAvatar(Mob& av) {
              (++playerCorpseSeq_ & ((1ull << 40) - 1));
   } while (FindMobById(cidNew) != nullptr);
   Mob corpse(std::move(av));   // the slice: Mob's move constructor only
+  // THE KIT STAYS WITH THE PLAYER. It is the avatar's (Mob::kit_), not the
+  // body's: the corpse keeps the shells it was wearing (its rig), and the
+  // player keeps what they carry and respawns dressed from it. A corpse
+  // holding the kit too would be the duplication Lootable() refuses.
+  av.kit_ = std::move(corpse.kit_);
+  corpse.kit_ = Kit{};
   corpse.id_ = cidNew;
   corpse.defIndex_ = di;
   corpse.def_ = &defs_[di];
@@ -2860,10 +2890,9 @@ uint64_t MobSystem::AdoptDeadAvatar(Mob& av) {
 
   // ---- THE HUSK THE AVATAR KEEPS -------------------------------------------
   // What ReleaseRigToDebris used to leave: the same part list with no bodies,
-  // partAlive zeroed, and the names, rig and kit bookkeeping the death screen
-  // and the equip loops still read (session.cpp compares WornItem/HeldItem
-  // against the kit every tick, dead or alive — an emptied worn_ would read as
-  // "take it off", an emptied heldItem_ as "equip the sword" on a dead husk).
+  // partAlive zeroed, and the names and rig bookkeeping the death screen still
+  // reads (WornItem/HeldItem: what the body died wearing). DressFromKit does
+  // nothing on a released rig, so the husk is never re-dressed or stripped.
   // Revive rebuilds all of it (Despawn + Spawn -> BuildRig).
   av.id_ = avatarId;
   av.alive_ = false;
@@ -3122,36 +3151,145 @@ void Mob::MarkInstancesDirty() {
 // longer, which reads as a different material rather than a worse wound.
 // ---- THE PACK ---------------------------------------------------------------
 //
-// Three list operations and a roll. Nothing here touches the rig, physics or
-// the grid — a carried stack is a line of text on a creature, which is exactly
+// Three list operations over the kit's bag and a roll. Nothing here touches
+// the rig, physics or the grid — a carried stack is a line of text on a creature, which is exactly
 // why a loot table can be pure data while a suit of armour cannot (MobDef::
 // LootEntry, and the note on Mob::Carried()).
 
-bool Mob::AddCarried(const std::string& item, int count, uint32_t dye) {
-  if (item.empty() || count <= 0) return false;
-  // Merge by item AND DYE, the rule the bag and the hotbar already follow
-  // (item.h ItemStack::dye): a stack is one colour, so a red tunic must not
-  // fold into a stack of blue ones and quietly repaint them.
-  for (CarriedItem& c : carried_)
-    if (c.item == item && c.dye == dye) {
-      c.count += count;
-      return true;
-    }
-  if (carried_.size() >= kMaxCarried) return false;
-  carried_.push_back(CarriedItem{item, count, dye});
-  return true;
+bool Mob::AddCarried(const ItemInstance& item) {
+  if (item.Empty()) return false;
+  // THE PACK IS THE KIT'S BAG (W2-M), so this is the bag's own Add: merge by
+  // the one rule every slot obeys (ItemInstance::StacksWith — same item, same
+  // dye, both plain), else the first free slot, else refused. A red tunic
+  // does not fold into a stack of blue ones, and a filled flask stays alone.
+  return kit_.bag.Add(item) >= 0;
 }
 
 int Mob::TakeCarried(int index, int count) {
-  if (index < 0 || index >= (int)carried_.size()) return 0;
-  CarriedItem& c = carried_[(size_t)index];
+  const int slot = kit_.bag.NthUsed(index);
+  if (slot < 0) return 0;
+  ItemStack& c = kit_.bag.slots[slot];
   const int take = count < 0 ? c.count : std::min(count, c.count);
   if (take <= 0) return 0;
   c.count -= take;
-  if (c.count <= 0) carried_.erase(carried_.begin() + index);
+  if (c.count <= 0) c = ItemStack{};
   return take;
 }
 
+std::vector<ItemInstance> Mob::Carried() const {
+  std::vector<ItemInstance> out;
+  for (const ItemStack& s : kit_.bag.slots)
+    if (!s.Empty()) out.push_back(s);
+  return out;
+}
+
+// ---- THE KIT (see the note in mob.h) -----------------------------------------
+//
+// The equipment in kit_ is the truth of what this creature wears; worn_ and
+// its shells realise it. Everything below is the seam between the two, and it
+// is the whole of what session.cpp's per-tick wear loop and its latches used
+// to do from outside.
+
+bool Mob::KitFlushWorn(int equipSlot) {
+  if (equipSlot < 0 || equipSlot >= kEquipSlotCount ||
+      !EquipSlotIsWorn(equipSlot))
+    return false;
+  ItemStack& st = kit_.equip.slots[equipSlot];
+  // Only when the rig is wearing THIS stack's item: a slot whose piece was
+  // refused, is not dressed yet, or belongs to a released husk has no shells
+  // to read, and the stack's own damage is already the truth.
+  if (st.Empty() || rigReleased_ || WornItem(equipSlot) != st.name)
+    return false;
+  WornDamage d;
+  if (!CaptureWorn(equipSlot, d)) return false;
+  // An untouched piece captures as an empty blob (CaptureWorn writes only
+  // what differs); normalising it keeps the stack PLAIN, so it still stacks
+  // with its pristine twins when it goes back in the bag.
+  if (d.Empty()) d.Clear();
+  st.damage = std::move(d);
+  return true;
+}
+
+void Mob::KitFlushWorn() {
+  for (int s = 0; s < kEquipSlotCount; s++) KitFlushWorn(s);
+}
+
+void Mob::KitWornStale(int equipSlot) {
+  for (int s = 0; s < kEquipSlotCount; s++)
+    if (equipSlot < 0 || s == equipSlot) kitDressed_[s].stale = true;
+}
+
+MoveResult Mob::KitMove(const KitRef& from, const KitRef& to,
+                        const ItemLibrary& lib) {
+  // Both ends first: whichever stack is leaving a worn slot takes the holes it
+  // gained while on the body. Flushing a slot the move then refuses is
+  // harmless — it only brings the stack up to date.
+  if (from.space == KitSpace::Equip) KitFlushWorn(from.index);
+  if (to.space == KitSpace::Equip) KitFlushWorn(to.index);
+  const MoveResult r = kit_.Move(from, to, lib);
+  if (r == MoveResult::Ok) {
+    // Two identical tunics swapped are two different objects: re-dress even
+    // though the name and the dye on the rig did not change.
+    if (from.space == KitSpace::Equip) KitWornStale(from.index);
+    if (to.space == KitSpace::Equip) KitWornStale(to.index);
+  }
+  return r;
+}
+
+ItemStack Mob::KitTake(const KitRef& r, int count) {
+  ItemStack* st = kit_.Resolve(r);
+  if (st == nullptr || st->Empty()) return ItemStack{};
+  if (r.space == KitSpace::Equip) KitFlushWorn(r.index);
+  const int take = count < 0 ? st->count : std::min(count, st->count);
+  if (take <= 0) return ItemStack{};
+  ItemStack out = *st;
+  out.count = take;
+  st->count -= take;
+  if (st->count <= 0) *st = ItemStack{};
+  if (r.space == KitSpace::Equip) KitWornStale(r.index);
+  return out;
+}
+
+int Mob::DressFromKit(const ItemLibrary& lib) {
+  // Only a living body with a rig of its own is dressed. A dead one keeps
+  // what it died in (it is a corpse's loot now, read off the shells), and a
+  // released husk has no rig to hang anything on.
+  if (!alive_ || rigReleased_ || limbs_.empty()) return 0;
+  int refused = 0;
+  for (int s = 0; s < kEquipSlotCount; s++) {
+    if (!EquipSlotIsWorn(s)) continue;
+    KitDressMemo& memo = kitDressed_[s];
+    const ItemStack& st = kit_.equip.slots[s];
+    const ItemDef* want = lib.Of(st);
+    const std::string wantName = want ? want->name : std::string();
+    const uint32_t wantDye = want ? st.dye : 0u;
+    const std::string& onRig = WornItem(s);
+    if (!memo.stale) {
+      // On the body already, as asked: nothing to do.
+      if (onRig == wantName && memo.name == wantName && memo.dye == wantDye)
+        continue;
+      // Asked for exactly this before and it would not go on (no limb to hang
+      // it from): nothing has changed, so do not ask thirty times a second.
+      if (memo.name == wantName && memo.dye == wantDye && onRig.empty() &&
+          !wantName.empty())
+        continue;
+      // THE SAME PIECE RECOLOURED IN PLACE (a dye applied to what you are
+      // wearing): its shells carry what it has been through, so they go back
+      // into the stack before it is rebuilt in the new colour.
+      if (!onRig.empty() && onRig == wantName) KitFlushWorn(s);
+    }
+    memo.stale = false;
+    memo.name = wantName;
+    memo.dye = wantDye;
+    if (wantName.empty()) {
+      UnwearItem(s);
+    } else if (!WearItem(want, s, st.damage.Empty() ? nullptr : &st.damage,
+                         wantDye)) {
+      refused++;
+    }
+  }
+  return refused;
+}
 // ONE CREATURE'S PURSE, DRAWN FROM ITS IDENTITY.
 //
 // Keyed on the mob id and the row index alone — no tick, no counter, no
@@ -3190,7 +3328,7 @@ void Mob::RollLoot() {
                   def_->name.c_str(), e.item.c_str());
       continue;
     }
-    AddCarried(e.item, n, e.dye);
+    AddCarried(ItemInstance{e.item, n, e.dye});
   }
 }
 
@@ -3593,9 +3731,11 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   heldPart_.clear();
   // Same rule as the weapon, and for the same reason: a respawn must not
   // inherit the last life's coat. The armour itself is not lost — it lives in
-  // the wearer's Equipment, which is a different owner — but the SHELLS are
-  // rig state and belong to this rig only.
+  // the wearer's Kit (kit_), which a rig rebuild does not touch — but the
+  // SHELLS are rig state and belong to this rig only, so every equipment slot
+  // is offered to the new rig again (DressFromKit).
   worn_.clear();
+  for (KitDressMemo& m : kitDressed_) m = KitDressMemo{};
   baseLimbs_ = (int)def.limbs.size();
   limbs_.assign(def.limbs.size(), MobLimb{});
   // The joint-twin links are facts about THESE lattices (Mob::SyncJointTwins).
@@ -7748,8 +7888,8 @@ int Mob::IdentityShellOf(int pieceIndex) const {
   return bestSlot;
 }
 
-std::string Mob::ShedGearBeforeDetach(int limbIndex) {
-  std::string name;
+ItemInstance Mob::ShedGearBeforeDetach(int limbIndex) {
+  ItemInstance shed;
   auto report = [&](LostGear lg) {
     if (lostGear_.size() >= kMaxLostGear)   // bounded; nobody drains an NPC's
       lostGear_.erase(lostGear_.begin());
@@ -7765,21 +7905,23 @@ std::string Mob::ShedGearBeforeDetach(int limbIndex) {
     LostGear lg;
     lg.item = heldItem_;
     lg.held = true;
-    name = heldItem_;
+    shed.name = heldItem_;
+    if (limbIndex >= 0 && limbIndex < (int)limbs_.size())
+      shed.dye = limbs_[limbIndex].dye;
     report(std::move(lg));
     heldSlot_ = -1;
     heldPartIndex_ = -1;
     heldItem_.clear();
     heldPart_.clear();
-    return name;
+    return shed;
   }
-  if (!IsWornSlot(limbIndex)) return name;
+  if (!IsWornSlot(limbIndex)) return shed;
   const int pi = WornPieceOfSlot(limbIndex);
-  if (pi < 0) return name;
+  if (pi < 0) return shed;
   // A SLEEVE CUT OFF IS A RAG, and the piece goes on being worn without it —
   // the strap-cut behaviour armour shipped with. Only the identity shell
   // takes the piece with it.
-  if (IdentityShellOf(pi) != limbIndex) return name;
+  if (IdentityShellOf(pi) != limbIndex) return shed;
   LostGear lg;
   lg.equipSlot = worn_[pi].equipSlot;
   lg.item = worn_[pi].item;
@@ -7788,7 +7930,21 @@ std::string Mob::ShedGearBeforeDetach(int limbIndex) {
   if (limbIndex >= 0 && limbIndex < (int)limbs_.size())
     lg.dye = limbs_[limbIndex].dye;
   CaptureWorn(lg.equipSlot, lg.damage);
-  name = lg.item;
+  if (lg.damage.Empty()) lg.damage.Clear();
+  // The item the body on the ground IS: its name, its colour and every hole
+  // it carried off the wearer (W2-M; the ground registry keeps it whole).
+  shed.name = lg.item;
+  shed.dye = lg.dye;
+  shed.damage = lg.damage;
+  // ...AND IT LEAVES THE KIT. The equipment slot that dressed it is emptied
+  // (the piece is on the ground now, as the item, with these holes), so
+  // DressFromKit does not put a second one on the body the plate has just
+  // fallen off.
+  if (lg.equipSlot >= 0 && lg.equipSlot < kEquipSlotCount &&
+      kit_.equip.slots[lg.equipSlot].name == lg.item) {
+    kit_.equip.slots[lg.equipSlot] = ItemStack{};
+    kitDressed_[lg.equipSlot] = KitDressMemo{};
+  }
   // The other shells are sewn to this one: they fall as rags. Collected
   // first and the piece erased BEFORE they detach, so the recursion below
   // finds no piece for them and reports nothing twice.
@@ -7799,7 +7955,7 @@ std::string Mob::ShedGearBeforeDetach(int limbIndex) {
   worn_.erase(worn_.begin() + pi);
   report(std::move(lg));
   for (int s : others) DetachLimb(s, /*adopt=*/true);
-  return name;
+  return shed;
 }
 
 void Mob::RegisterTerrainAnchor() {
@@ -19579,7 +19735,7 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     // GEAR FIRST, while the shells still hold their lattices (CaptureWorn
     // reads them, and AdoptBody below moves this one out). Names the item the
     // adopted body is registered as, or nothing for anatomy and rags.
-    const std::string shedAs = ShedGearBeforeDetach(limbIndex);
+    const ItemInstance shedAs = ShedGearBeforeDetach(limbIndex);
     // Hand the micro description over with the body: that is what makes a
     // severed microvoxel limb keep its detail as ordinary debris (PLAN §C4) —
     // and, for a CARVED limb, what makes it keep its wounds. The brick this
@@ -19648,8 +19804,8 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     limb.gushTicks = 0;
     // A PIECE OF GEAR HITTING THE FLOOR: tell the ground registry which item
     // that body is, so `E` can pick it up (Mob::LostGear).
-    if (!shedAs.empty() && sys_ && sys_->onItemShed_)
-      sys_->onItemShed_(limb.holdBody, shedAs, limb.dye);
+    if (!shedAs.name.empty() && sys_ && sys_->onItemShed_)
+      sys_->onItemShed_(limb.holdBody, shedAs);
     // A GARMENT THAT HAS LEFT IS NOT A FOLLOWER. It is DebrisSystem's now and
     // has real dynamics of its own from the end of the sever hold; a shell that
     // kept its host would be teleported back onto a limb it has fallen off,
@@ -20189,7 +20345,7 @@ bool Mob::Lootable() const {
   // while the owner's corpse still wore it. Loot over the network was never
   // supported for corpses, and this keeps that limit rather than opening a
   // duplication path. A PlayerCorpse() is refused for the reason the avatar
-  // is: its kit lives in PlayerKit and re-dresses the respawned rig.
+  // is: its kit stays on the avatar and re-dresses the respawned rig.
   return !alive_ && !rigReleased_ && !playerCorpse_ && sys_ != nullptr &&
          !sys_->IsAvatar(this) && !AvatarLayer() && !IsGhost();
 }
@@ -20204,7 +20360,7 @@ void Mob::LootPieces(std::vector<LootPiece>& out) const {
       continue;   // the panel that IS the piece is gone: rags only
     LootPiece piece;
     piece.kind = LootPiece::Kind::Worn;
-    piece.item = p.item;
+    piece.name = p.item;
     piece.equipSlot = p.equipSlot;
     // The colour, off the identity shell — every shell of one garment carries
     // the same word (Mob::WearItem hands it to all of them).
@@ -20218,17 +20374,17 @@ void Mob::LootPieces(std::vector<LootPiece>& out) const {
       limbs_[heldSlot_].body && !heldItem_.empty()) {
     LootPiece piece;
     piece.kind = LootPiece::Kind::Held;
-    piece.item = heldItem_;
+    piece.name = heldItem_;
     out.push_back(std::move(piece));
   }
   // The pack last, so the worn and held entries keep the indices the loot
   // panel has always given them and a pack item is simply further down.
-  for (const CarriedItem& c : carried_) {
+  // Whole instances (W2-M): a looted flask holds what it held.
+  for (const ItemStack& c : kit_.bag.slots) {
+    if (c.Empty()) continue;
     LootPiece piece;
+    static_cast<ItemInstance&>(piece) = c;
     piece.kind = LootPiece::Kind::Carried;
-    piece.item = c.item;
-    piece.count = c.count;
-    piece.dye = c.dye;
     out.push_back(std::move(piece));
   }
 }
@@ -20251,8 +20407,8 @@ bool Mob::TakeLootPiece(int index, LootPiece* out, int count) {
       EquipItem(nullptr);   // unequip: the borrowed slot leaves with the item
       break;
     case LootPiece::Kind::Carried: {
-      // The carried entries are the tail of the list, in carried_ order.
-      const int ci = index - (int)(list.size() - carried_.size());
+      // The carried entries are the tail of the list, in pack order.
+      const int ci = index - (int)(list.size() - (size_t)kit_.bag.Count());
       const int took = TakeCarried(ci, count);
       if (took <= 0) return false;
       if (out) {
@@ -20285,7 +20441,7 @@ bool Mob::ShedLootPiece(int index, std::string* outItem) {
   if (slot < 0 || slot >= (int)limbs_.size() || !limbs_[slot].body)
     return false;
   WakeDead();
-  if (outItem) *outItem = piece.item;
+  if (outItem) *outItem = piece.name;
   // OFF THE CORPSE MEANS OFF IT: the ordinary gear-leaves-the-body path. The
   // identity shell (or the sword) becomes debris and is registered as the
   // item through SetOnItemShed, so `E` sees it as the thing it is; the
@@ -21652,33 +21808,37 @@ bool Mob::LimbIsPristine(size_t i) const {
   return SameCollider(L.voxels, p->voxels) && SameSkin(L.skinVoxels, p->skinVoxels);
 }
 
-// ---- MOBS v6 helpers ---------------------------------------------------------
+// ---- MOBS v6/v7 helpers ------------------------------------------------------
 //
-// The gear list's bytes: net/mobsync.cpp's WriteGear shape, written here
-// rather than borrowed because that file's helpers are its own and the save
-// format must not move when the wire's does.
+// The gear list's bytes. v7 (W2-M) writes each entry as an ItemInstance
+// (game/iteminstance.h's WriteItemInstance — the one item shape the wire and
+// every save share) followed by where it sits; v6 wrote name, slot, held, dye
+// and the damage, and is still written for the `mob-save-delta` gate's
+// older-format records and still read.
 static void WriteRecordGear(ByteWriter& w,
-                            const std::vector<::net::WireGear>& gear) {
+                            const std::vector<::net::WireGear>& gear,
+                            uint32_t version) {
   w.U32((uint32_t)gear.size());
   for (const ::net::WireGear& g : gear) {
-    w.Str(g.item);
+    if (version >= 7) {
+      WriteItemInstance(w, g);
+      w.Pod(g.equipSlot);
+      w.U32(g.held);
+      continue;
+    }
+    w.Str(g.name);
     w.Pod(g.equipSlot);
     w.U32(g.held);
     w.U32(g.dye);
-    w.U32((uint32_t)g.damage.shells.size());
-    for (const WornShellDamage& sh : g.damage.shells) {
-      w.F32(sh.hp);
-      w.U32(sh.atSpawn);
-      w.U32(sh.live);
-      w.PodVec(sh.lattice);
-    }
+    WriteWornDamage(w, g.damage);
   }
 }
 
 // Bounded like the limb count: a count the remaining bytes cannot hold is a
 // corrupt record, refused before it sizes anything. The reader is sticky, so a
 // lying count otherwise just runs out against `ok`.
-static bool ReadRecordGear(ByteReader& r, std::vector<::net::WireGear>& gear) {
+static bool ReadRecordGear(ByteReader& r, std::vector<::net::WireGear>& gear,
+                           uint32_t version) {
   uint32_t n = 0;
   r.U32(n);
   gear.clear();
@@ -21689,23 +21849,16 @@ static bool ReadRecordGear(ByteReader& r, std::vector<::net::WireGear>& gear) {
   }
   for (uint32_t i = 0; i < n && r.ok; i++) {
     ::net::WireGear g;
-    r.Str(g.item);
-    r.Pod(g.equipSlot);
-    r.U32(g.held);
-    r.U32(g.dye);
-    uint32_t ns = 0;
-    r.U32(ns);
-    if (!r.ok || ns > kMaxRecordGear) {
-      r.ok = false;
-      break;
-    }
-    for (uint32_t k = 0; k < ns && r.ok; k++) {
-      WornShellDamage sh;
-      r.F32(sh.hp);
-      r.U32(sh.atSpawn);
-      r.U32(sh.live);
-      r.PodVec(sh.lattice);
-      if (r.ok) g.damage.shells.push_back(std::move(sh));
+    if (version >= 7) {
+      ReadItemInstance(r, g);
+      r.Pod(g.equipSlot);
+      r.U32(g.held);
+    } else {
+      r.Str(g.name);
+      r.Pod(g.equipSlot);
+      r.U32(g.held);
+      r.U32(g.dye);
+      ReadWornDamage(r, g.damage, kMaxRecordGear);
     }
     if (r.ok) gear.push_back(std::move(g));
   }
@@ -21749,7 +21902,7 @@ void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
     if (idSlot < 0 || idSlot >= (int)limbs_.size() || !limbs_[idSlot].body)
       continue;
     ::net::WireGear g;
-    g.item = p.item;
+    g.name = p.item;
     g.equipSlot = p.equipSlot;
     g.dye = limbs_[idSlot].dye;
     CaptureWorn(p.equipSlot, g.damage);
@@ -21758,7 +21911,7 @@ void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
   if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
       limbs_[heldSlot_].body && !heldItem_.empty()) {
     ::net::WireGear g;
-    g.item = heldItem_;
+    g.name = heldItem_;
     g.held = 1;
     bySlot.emplace_back(heldSlot_, std::move(g));
   }
@@ -21847,12 +22000,20 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   //
   // By NAME, not by library index (item.h's index hazard): the item table is
   // file order and an R reload reorders it, so an index written today means a
-  // different item tomorrow.
-  w.U32((uint32_t)carried_.size());
-  for (const CarriedItem& c : carried_) {
-    w.Str(c.item);
-    w.U32((uint32_t)std::max(0, c.count));
-    w.U32(c.dye);
+  // different item tomorrow. v7 writes each stack whole (WriteItemInstance:
+  // a flask in the pack keeps its fill); v3..v6 wrote name, count, dye.
+  {
+    const std::vector<ItemInstance> pack = Carried();
+    w.U32((uint32_t)pack.size());
+    for (const ItemInstance& c : pack) {
+      if (version >= 7) {
+        WriteItemInstance(w, c);
+        continue;
+      }
+      w.Str(c.name);
+      w.U32((uint32_t)std::max(0, c.count));
+      w.U32(c.dye);
+    }
   }
   if (version < 5) return;
   // ---- AND THE BRAIN'S MEMORY (kSaveVersion 5, save plan S5b) --------------
@@ -21895,7 +22056,7 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   }
   std::vector<::net::WireGear> gear;
   CaptureGear(gear);
-  WriteRecordGear(w, gear);
+  WriteRecordGear(w, gear, version);
   if (!dead) return;
   // The cause by NAME: deathCause_ points at a literal in this file, and the
   // loader interns the name back onto the same literal (InternDeathCause).
@@ -21980,7 +22141,7 @@ struct MobSystem::MobRecord {
     std::vector<PrefabVoxel> skinVoxels;
   };
   std::vector<LimbState> limbs;
-  std::vector<CarriedItem> carried;
+  std::vector<ItemInstance> carried;
   // v5: the brain's memory (Mob::SaveOne's tail). `haveBrain` false for v3/v4.
   bool haveBrain = false;
   std::string brainProfile;
@@ -22063,7 +22224,7 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
   }
   // The pack, mirroring SaveOne's tail.
   //
-  // EVERY ENTRY IS READ, and only the first kMaxCarried are KEPT. Stopping at
+  // EVERY ENTRY IS READ, and only a bag's worth are KEPT. Stopping at
   // the cap would leave the rest of this mob's bytes in the stream and every
   // record after it would parse garbage — a truncation is a bound on what the
   // creature gets, never a bound on how far the cursor moves. (The reader is
@@ -22073,13 +22234,17 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
   r.U32(nCarried);
   out.carried.clear();
   for (uint32_t i = 0; i < nCarried && r.ok; i++) {
-    CarriedItem c;
-    uint32_t count = 0;
-    r.Str(c.item);
-    r.U32(count);
-    r.U32(c.dye);
-    c.count = (int)count;
-    if (out.carried.size() < Mob::kMaxCarried && !c.item.empty() && c.count > 0)
+    ItemInstance c;
+    if (version >= 7) {
+      ReadItemInstance(r, c);
+    } else {
+      uint32_t count = 0;
+      r.Str(c.name);
+      r.U32(count);
+      r.U32(c.dye);
+      c.count = (int)count;
+    }
+    if (out.carried.size() < (size_t)Bag::kSlots && !c.Empty())
       out.carried.push_back(std::move(c));
   }
   // v5's brain tail, mirroring SaveOne.
@@ -22114,7 +22279,7 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
     }
     out.appendedNames.assign(nApp, std::string());
     for (std::string& nm : out.appendedNames) r.Str(nm);
-    if (!ReadRecordGear(r, out.gear)) return false;
+    if (!ReadRecordGear(r, out.gear, version)) return false;
     if (out.dead) {
       r.Str(out.deathCause);
       r.Pod(out.deathSeq);
@@ -22137,11 +22302,16 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
   // MATERIAL NAMES (sim/mattable.h, W1-D): a stored lattice's ids are in the
   // table its save file named; a loader that found that table differs from
   // the running one has a remap in scope. Null (identity) for a handoff.
-  if (const MatRemap* mr = ActiveLoadRemap())
+  if (const MatRemap* mr = ActiveLoadRemap()) {
     for (MobRecord::LimbState& s : out.limbs) {
       RemapDebrisVoxels(s.voxels, *mr);
       RemapPrefabVoxels(s.skinVoxels, *mr);
     }
+    // ...and the items: a pack vessel's contents, a worn piece's damaged
+    // lattice (W2-M: both are ItemInstances, one remap for both).
+    for (ItemInstance& c : out.carried) RemapItemInstance(c, *mr);
+    for (::net::WireGear& g : out.gear) RemapItemInstance(g, *mr);
+  }
   return r.ok;
 }
 
@@ -22206,7 +22376,8 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   // rolling a fresh table over it (the saved purse is the one the player
   // spent an hour not looting), and on a handoff the owner's list is
   // authoritative over whatever the ghost happened to be holding.
-  m.carried_ = std::move(rec.carried);
+  m.ClearCarried();
+  for (const ItemInstance& c : rec.carried) m.AddCarried(c);
   // v5: the brain's memory, onto a FRESH brain on the named profile
   // (ApplyHandoff's rule: timers and half-walked paths belong to the run that
   // made them). A name no profile answers to any more is no AI, which is what
@@ -22825,7 +22996,7 @@ bool MobSystem::TakeHandoff(uint64_t mobId, uint32_t newOwner,
 void MobSystem::ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear) {
   if (items_ == nullptr) return;
   for (const ::net::WireGear& g : gear) {
-    const ItemDef* item = items_->At(items_->Find(g.item));
+    const ItemDef* item = items_->Of(g);
     if (item == nullptr) continue;   // retired item: it arrives without it
     if (g.held)
       m.EquipItem(item);
@@ -22865,7 +23036,7 @@ Mob* MobSystem::ApplyAnnounce(const ::net::MobAnnounce& a) {
     ::net::MobAnnounce now{};
     bool same = BuildAnnounce(a.id, now) && now.gear.size() == a.gear.size();
     for (size_t k = 0; k < a.gear.size() && same; k++)
-      same = now.gear[k].item == a.gear[k].item &&
+      same = now.gear[k].name == a.gear[k].name &&
              now.gear[k].equipSlot == a.gear[k].equipSlot &&
              now.gear[k].held == a.gear[k].held &&
              now.gear[k].dye == a.gear[k].dye;
@@ -23122,11 +23293,13 @@ uint64_t MobSystem::StateKey(uint64_t mobId) const {
     mixStr(p.item);
   }
   mixStr(m->heldItem_);
-  mix(m->carried_.size());
-  for (const CarriedItem& c : m->carried_) {
-    mixStr(c.item);
+  const std::vector<ItemInstance> pack = m->Carried();
+  mix(pack.size());
+  for (const ItemInstance& c : pack) {
+    mixStr(c.name);
     mix((uint64_t)(int64_t)c.count);
     mix(c.dye);
+    mix(c.Fill());
   }
   return h == 0 ? 1 : h;   // 0 is "unknown id"
 }
@@ -23177,7 +23350,7 @@ bool MobSystem::ApplyState(const ::net::MobState& st) {
   bool same = BuildAnnounce(st.announce.id, now) &&
               now.gear.size() == st.announce.gear.size();
   for (size_t k = 0; k < st.announce.gear.size() && same; k++)
-    same = now.gear[k].item == st.announce.gear[k].item &&
+    same = now.gear[k].name == st.announce.gear[k].name &&
            now.gear[k].equipSlot == st.announce.gear[k].equipSlot &&
            now.gear[k].held == st.announce.gear[k].held &&
            now.gear[k].dye == st.announce.gear[k].dye;

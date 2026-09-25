@@ -3901,7 +3901,7 @@ void DebrisSystem::SetChunkOwnedFn(std::function<bool(IVec3)> fn) {
 }
 
 void DebrisSystem::SetItemLookupFn(
-    std::function<bool(uint64_t, std::string&, uint32_t&, uint32_t&)> fn) {
+    std::function<bool(uint64_t, ItemInstance&)> fn) {
   itemLookupFn_ = std::move(fn);
 }
 
@@ -4156,8 +4156,7 @@ bool DebrisSystem::BuildAnnounce(uint64_t handle, net::BodyAnnounce& out) const 
     out.bleedMat = b.bleedMat;
     out.dead = b.dead ? 1u : 0u;
     // The item identity, if the registry above us says this body is one.
-    if (itemLookupFn_) itemLookupFn_(handle, out.item, out.itemDye,
-                                     out.itemDamage);
+    if (itemLookupFn_) itemLookupFn_(handle, out.item);
     return true;
   }
   return false;
@@ -4258,7 +4257,7 @@ void DebrisSystem::ApplyItemTake(const net::ItemTake& t) {
   // it" from "there was nothing there": without the second the ghost item sits
   // on its ground forever and no E will ever take it again.
   if (h && !IsGhost(h) && itemLookupFn_ &&
-      itemLookupFn_(h, g.item, g.dye, g.damage) && itemTakeFn_ &&
+      itemLookupFn_(h, g.item) && itemTakeFn_ &&
       itemTakeFn_(h)) {
     g.granted = 1;
     ownerProbe_.itemsGranted++;

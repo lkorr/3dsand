@@ -42,7 +42,7 @@
 #include <string>
 #include <vector>
 
-#include "game/equipment.h"  // WornDamage: the damage a worn piece carries
+#include "game/iteminstance.h"  // ItemInstance: what one piece of gear IS
 #include "math3d.h"
 #include "sim/bytestream.h"
 
@@ -55,7 +55,8 @@ namespace net {
 
 // Bumped whenever any record below changes shape. A decoder that sees another
 // number fails the read (ByteReader::ok goes false) instead of guessing.
-inline constexpr uint32_t kMobSyncVersion = 1;
+// v2 (W2-M): a WireGear is an ItemInstance (adds count and fill).
+inline constexpr uint32_t kMobSyncVersion = 2;
 
 // ---- one piece of kit, BY NAME ---------------------------------------------
 //
@@ -65,17 +66,16 @@ inline constexpr uint32_t kMobSyncVersion = 1;
 // through the ordinary `Mob::WearItem` / `Mob::EquipItem` — the same path a
 // rising re-dresses a corpse through (mob.cpp ServiceRisings).
 //
-// `WornDamage` comes from game/equipment.h rather than being restated here:
-// it is a plain data struct with no behaviour, and a second copy of "what is
-// missing from a breastplate" is exactly the unowned diverging representation
-// DESIGN.md guideline 3 forbids. Including it costs this header no dependency
-// on the mob system, the physics or the tick.
-struct WireGear {
-  std::string item;        // ItemDef name; "" is never sent
+// The item half is game/iteminstance.h's ItemInstance rather than being
+// restated here: a second copy of "what one item is" is exactly the unowned
+// diverging representation DESIGN.md guideline 3 forbids (W2-M found five).
+// Including it costs this header no dependency on the mob system, the physics
+// or the tick.
+struct WireGear : ItemInstance {
+  // The ItemInstance half: name ("" is never sent), count (1), the dye, the
+  // fill (a held flask) and the damage already missing from a worn piece.
   int32_t equipSlot = -1;  // -1 = the held item
   uint32_t held = 0;       // 1 = held in the fist rather than worn
-  uint32_t dye = 0;        // the colour the piece was dyed
-  WornDamage damage;       // what is already missing from it
 };
 
 // ---- "this creature exists" -------------------------------------------------

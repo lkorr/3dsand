@@ -31,52 +31,40 @@
 // sword". DebrisSystem calls OnBodyGone for every body it releases, which is
 // the one seam that keeps the two in step. A robe that burns up on the ground
 // is GONE, and that is correct.
-struct WorldItem {
+struct WorldItem : ItemInstance {
   uint64_t body = 0;
-  std::string item;
+  // The ItemInstance half (game/iteminstance.h) is the thing's IDENTITY — the
+  // facts a pile of voxels cannot reproduce: its name; its DYE (the art a dye
+  // colours is a neutral greyscale weave, so a red tunic whose dye the
+  // registry forgot is a grey tunic when you pick it up again); what a vessel
+  // HOLDS (a corked flask of blood lying in the grass is not recoverable from
+  // its glass); and what a worn piece has BEEN THROUGH (the per-shell damage
+  // its wearer's shells carried when it came off — the body on the ground is
+  // only its largest panel). `count` is always 1: a ground body is one object.
+  //
+  // It is the whole of what a remote pickup hands the asking machine
+  // (net::ItemGrant embeds the same struct) and of what a pickup puts back in
+  // a slot, which is the point: before W2-M a grant carried name, dye and a
+  // "damage" word nothing ever wrote, and a flask picked up over the network
+  // arrived empty.
+
   // The lattice as it actually is, when the thing on the ground is DAMAGED.
   // Empty means "as authored", which is the overwhelmingly common case and
   // costs nothing to store. Only the save format reads this; the live body
   // already holds its own voxels.
   std::vector<DebrisVoxel> voxels;
-  // WHAT COLOUR IT IS (game/dye.h), 0 for undyed. Unlike the lattice above,
-  // this is NOT recoverable from the body: the art a dye colours is a neutral
-  // greyscale weave, so a dropped red tunic whose dye the registry forgot is a
-  // grey tunic when you pick it up again, with nothing anywhere to say
-  // otherwise. The body carries the same word for RENDERING
-  // (MicroBodyRef::dye); this is the copy that survives into an ItemStack.
-  uint32_t dye = 0;
-  // HOW BEATEN IT IS. Carried for the same reason `dye` is: it is identity
-  // that the body cannot reproduce. A body's LATTICE records the holes fire
-  // burned in a robe, but "this sword is at 40 durability" is a number on the
-  // ItemStack and nothing about a pile of voxels implies it, so a sword
-  // dropped at 40 came back as new.
-  //
-  // It is also the third field net::ItemGrant carries (net/debrissync.h): the
-  // whole of what a remote pickup has to hand the asking machine is name, dye
-  // and damage, and that is not a coincidence -- those are exactly the three
-  // facts that are identity rather than matter.
-  uint32_t damage = 0;
-  // WHAT IS IN IT, for a vessel (ItemStack::fillMat/fillAmt, packed by
-  // PackItemFill). Identity for the same reason as the dye: a corked flask of
-  // blood lying in the grass is not recoverable from its glass.
-  uint32_t fill = 0;
 };
-
-// ItemStack's two vessel fields <-> the one word a registry entry carries.
-inline uint32_t PackItemFill(uint16_t mat, uint16_t amt) {
-  return (uint32_t)mat | ((uint32_t)amt << 16);
-}
-inline uint16_t ItemFillMat(uint32_t f) { return (uint16_t)(f & 0xFFFFu); }
-inline uint16_t ItemFillAmt(uint32_t f) { return (uint16_t)(f >> 16); }
 
 class WorldItems {
  public:
-  void Add(uint64_t body, std::string name, uint32_t dye = 0,
-            uint32_t damage = 0, uint32_t fill = 0) {
-    if (!body || name.empty()) return;
+  // Register `body` as the item `it` (one of it: the count is forced to 1).
+  void Add(uint64_t body, const ItemInstance& it) {
+    if (!body || it.name.empty()) return;
     Remove(body);   // a reused handle must not resolve to the old item
-    items_.push_back(WorldItem{body, std::move(name), {}, dye, damage, fill});
+    WorldItem w;
+    static_cast<ItemInstance&>(w) = it.One();
+    w.body = body;
+    items_.push_back(std::move(w));
   }
   const WorldItem* Find(uint64_t body) const {
     for (const WorldItem& w : items_)
@@ -111,15 +99,11 @@ class WorldItems {
   //
   // (the take function is the CALLER's, because "picked up" means putting the
   // thing in somebody's inventory and only the session knows whose.)
-  std::function<bool(uint64_t, std::string&, uint32_t&, uint32_t&)> LookupFn()
-      const {
-    return [this](uint64_t body, std::string& name, uint32_t& dye,
-                  uint32_t& damage) {
+  std::function<bool(uint64_t, ItemInstance&)> LookupFn() const {
+    return [this](uint64_t body, ItemInstance& out) {
       const WorldItem* w = Find(body);
       if (!w) return false;
-      name = w->item;
-      dye = w->dye;
-      damage = w->damage;
+      out = static_cast<const ItemInstance&>(*w);
       return true;
     };
   }
@@ -165,12 +149,15 @@ inline const std::vector<PrefabVoxel>* ItemGroundVoxels(const ItemDef& d,
 // `lattice` overrides the item's authored geometry — the SAVE path uses it to
 // put a burnt robe back burnt (persist.cpp 'ITMS'). Null is the ordinary case:
 // a thing you just dropped is whatever the library says it is.
-inline uint64_t DropItemToWorld(const ItemDef& def, Vec3 at, Vec3 vel,
-                                Physics& phys, DebrisSystem& debris,
-                                MicroBodySet* micro, WorldItems& reg,
+// `inst` is WHICH one of `def` this is (its dye, what it holds, what it has
+// been through) and is registered whole; its name is `def`'s.
+inline uint64_t DropItemToWorld(const ItemDef& def, const ItemInstance& inst,
+                                Vec3 at, Vec3 vel, Physics& phys,
+                                DebrisSystem& debris, MicroBodySet* micro,
+                                WorldItems& reg,
                                 const std::vector<PrefabVoxel>* lattice =
-                                    nullptr,
-                                uint32_t dye = 0, uint32_t fill = 0) {
+                                    nullptr) {
+  const uint32_t dye = inst.dye;
   uint32_t scale = 1;
   const std::vector<PrefabVoxel>* authored = ItemGroundVoxels(def, scale);
   const std::vector<PrefabVoxel>* src =
@@ -223,6 +210,8 @@ inline uint64_t DropItemToWorld(const ItemDef& def, Vec3 at, Vec3 vel,
   // ground LOOKS right, and on the registry entry so picking it up gives you
   // back the garment you dropped. Neither is derivable from the other — the
   // body's word is render state a reload re-packs, the registry's is identity.
-  reg.Add(body, def.name, dye, 0, fill);
+  ItemInstance it = inst;
+  it.name = def.name;
+  reg.Add(body, it);
   return body;
 }

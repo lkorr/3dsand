@@ -8351,7 +8351,7 @@ handmade art becomes matter the existing destruction pipeline already breaks.
 **Death is a state of the Mob, not a change of owner.** `Mob::Die` sets
 `alive_ = false`, books a rising if the rot is in the flesh, and flips the rig
 limp (`EnterDeadRagdoll`); every body, joint, worn shell, twin table, burn
-index, coat ledger, wound, `worn_`, `heldItem_` and `carried_` stays where it
+index, coat ledger, wound, `worn_`, `heldItem_` and the pack stays where it
 was, in `MobSystem::mobs_`. Until this, `Die` handed every limb to
 `DebrisSystem::AdoptBody(dead=true)` and the Mob was swept a tick later, and a
 parallel system rebuilt what the rig had known (`CorpseReport`/`Corpses` for
@@ -8393,7 +8393,8 @@ debris for the network). All of that is gone.
 - **The player's corpse** (`MobSystem::AdoptDeadAvatar`): at the top of the
   PreTick after the death the dead avatar's rig is slice-moved into `mobs_`
   under an id from its own band (bit 61 | player << 40 | seq, so `nextId_` is
-  untouched), `PlayerCorpse()`, never lootable (the kit lives on the session);
+  untouched), `PlayerCorpse()`, never lootable (the kit is the avatar's
+  `Mob::kit_` and is moved back onto the avatar, not into the corpse, W2-M);
   the avatar keeps a bodiless husk until `Revive`. Gate `player-corpse`.
 - **Save (MOBS v6).** A record carries a flags word (bit 0 dead, bit 1 player
   corpse), the appended slots' names (loaded records are aligned onto the
@@ -14459,12 +14460,13 @@ step, and it means a robe that burns up on the ground is simply GONE.
 Not a durability percentage — the holes themselves. While a piece is on, its
 wounds are the shells'; the shells die with the slots, so `Mob::CaptureWorn`
 reads them out one call before the rig forgets and `WearItem` puts them back.
-Off the body they live in `PlayerKit::wornDamage`, keyed by ITEM NAME (not by
-slot, or dragging the robe through the pack would mend it; not by instance,
-because an `ItemStack` has no identity and giving stacks one is a much larger
-change than armour needed). `PLYR` is at v3 for the map, `ITMS` carries a
-ground item's lattice the same way, and an older payload is refused rather than
-half-applied.
+Off the body they live ON THE PIECE: `ItemInstance::damage`, a field of the
+stack in whatever slot the piece is in (see *One item instance, one kit*
+below). Until W2-M (2026-09-24) they lived in `PlayerKit::wornDamage`, keyed by
+ITEM NAME, so two robes in one pack shared one set of holes. `PLYR` v7 carries
+it per slot, `ITMS` v4 per ground item, MOBS v7 per gear entry; older payloads
+still load (a by-name blob lands on every stack of that name, which is what
+those files meant).
 
 **Condition is a summary, not the record.** The lattice above stays the truth —
 it is what puts the wear back in the right places, and on armour whose whole
@@ -14485,6 +14487,58 @@ still wearable (whatever remains still covers whatever it still covers), but
 that is the line a repair, and anything that scales with condition, is expected
 to refuse. There is deliberately no repair and no enchantment system yet; this
 is the substrate either would read.
+
+### One item instance, one kit (rule-unification W2-M, 2026-09-24)
+
+**One item is one `ItemInstance`** (`game/iteminstance.h`): `{name, count, dye,
+fillMat/fillAmt, damage}`. Every record that says "there is an item here"
+embeds it, and a crossing between two of them copies it whole: the slot
+(`ItemStack` IS `ItemInstance`, no library index), a creature's pack (its
+Kit's bag), a ground item (`WorldItem`), a piece of gear on the wire and in the
+MOBS record (`net::WireGear`), a pickup grant and a ground body's announce
+(`net::ItemGrant`, `net::BodyAnnounce::item`), a loot entry (`LootPiece`), a
+shed piece (`MobSystem::SetOnItemShed`). Before it each carried its own subset,
+and every crossing dropped what the narrower one lacked: a flask's contents
+were lost on a network pickup (the grant had no fill) and when a corpse's pack
+rose (`CarriedItem` had no fill), and "item damage" was a uint32 threaded
+through three structs that nothing ever wrote. The wire and MOBS share one
+byte shape (`WriteItemInstance`/`ReadItemInstance`); PLYR/ITMS keep their
+append-only layouts. Stacking is one rule (`ItemInstance::StacksWith`): same
+name, same dye, and BOTH plain — a filled vessel or a damaged piece is one
+object and stacks with nothing. A slot holds a NAME, so an R reload that
+reorders items.json is a no-op; `Kit::DropUnknown` empties the slots whose item
+is gone.
+
+**One kit per creature** (`Mob::kit_`, `Kit` in `game/equipment.h`: equipment,
+bag, hotbar). The player's kit IS the avatar's (`PlayerSession::kit()` is
+`avatar.KitMut()`); it used to be `PlayerKit` + a hotbar on the session, with
+the rig keeping its own copy of what was worn and a per-tick loop in
+session.cpp reconciling the two through `wearTried`/`wearDye` latches and a
+`CaptureWorn` copy-back. Now **the kit's equipment is the truth and the rig's
+worn shells are derived from it** — `Mob::DressFromKit` runs where the loop
+did (before PreTick), re-dresses a slot only when its name or dye changed or
+it was marked stale, and asks a refused piece once. The one thing the rig
+holds that the kit cannot is a worn piece's LIVE damage (shells are carved in
+place), so it is written back into the stack at every moment the stack is read
+without the body: `Mob::KitMove` (flush both ends, swap, mark stale — two
+identical tunics swapped are two objects), `Mob::KitTake`, a recolour in place
+(DressFromKit flushes before re-wearing), and the PLYR save
+(`PlayerKitRefs::wearer`). A worn piece cut loose leaves the kit in
+`ShedGearBeforeDetach` and lands on the ground carrying its damage. The corpse
+rising reads the avatar's kit directly (`avatarKitFn_` is gone;
+`avatar.keepKitOnTurn` is read in `MobSystem::ServiceRising`), and
+`AdoptDeadAvatar` moves the kit back onto the avatar, so the corpse never holds
+it. An NPC's pack is its kit's bag (`Mob::Carried`, `AddCarried`), so a looted
+or risen flask keeps its fill.
+
+**Not yet (deferred):** an NPC's worn and held gear is still dressed directly
+(`WearItem`/`EquipItem` from its loadout, a rising, a handoff, a load) and read
+live off the rig (`LootPieces`, `CaptureGear`) — its kit holds only its pack.
+A held item knocked from the player's hand goes to the ground without its fill
+(the shed hook does not know which hotbar slot filled the hand). Gate
+`kit-instance` (identical robes, per-instance damage through dress / swap /
+recolour / take-off); `player-kit`, `item-ground`, `mob-loot`, `debris-ghost`
+and `vessel` carry the round trips.
 
 ### A shell is a rig slot, and the gore path did not know that
 
@@ -14751,8 +14805,8 @@ through `MobSystem::SetOnCorpse` to `Corpses` (`game/corpses.h`), which is
 `WorldItems`' shape over the same bodies and hangs off the same
 `SetOnBodyGone` hook: a piece whose body burns off the corpse leaves the list,
 a corpse with no bodies left is forgotten, and the list is capped at 64 oldest-
-first. Not fired for the avatar (its kit lives in `PlayerKit` and the wear loop
-re-dresses the respawn from it). Not saved: a loaded world has heaps, not
+first. Not fired for the avatar (its kit lives on the avatar and re-dresses
+the respawn from it). Not saved: a loaded world has heaps, not
 corpses, the same call the `'ITMS'` re-drop made.
 
 **The reach ray runs every frame, not on the press.** The prompt is the
@@ -14778,7 +14832,7 @@ character screen with a LOOT panel in the SPELLBOOK's place (looting is a
 moment; the words are not going anywhere, and a fourth column would not fit on
 most screens), one `KitSlotUI` per piece through the same mirror, and
 `KitSpace::Loot` is one more address the same drag can name. `TakeCorpseLoot`
-executes it beside `PlayerKit::Move` rather than inside it — a corpse is not
+executes it beside `Kit::Move` rather than inside it — a corpse is not
 one of the player's containers and has no `ItemStack` to swap — with Move's
 discipline: `EquipSlotAccepts` on an equip destination, a sentence per refusal,
 an occupied destination sends its stack to the pack rather than overwriting,
@@ -15060,7 +15114,7 @@ not pour or scoop. The HUD meter under the crosshair (`UIState::throwCharge`)
 is ten pixel pips that light gold and, at full, turn ember and SHAKE by whole
 pixels. A THROWN VESSEL IS A DROPPED ITEM WITH SPEED: `DropItemToWorld` with
 the launch velocity and an end-over-end spin, so the flight is Jolt's and the
-fill rides `WorldItem::fill` as a drop's does. `ContainerBreakPass` (phase H,
+fill rides the `WorldItem`'s ItemInstance as a drop's does. `ContainerBreakPass` (phase H,
 before submit; the `TickAuthorityCtx::ground` registry) breaks any vessel with
 `breakSpeedMps` > 0 (flask 6.5) on either of two witnesses: a NEW contact from
 the last step whose closing speed reaches it -- relative speed, so the flask

@@ -3,6 +3,7 @@
 #include <string>
 #include <vector>
 
+#include "game/iteminstance.h"  // ItemInstance: a ground item's identity
 #include "math3d.h"
 #include "phys/physics.h"   // BodyTransform, DebrisVoxel
 #include "sim/voxload.h"   // PrefabVoxel (the fine skin lattice)
@@ -43,7 +44,9 @@ namespace net {
 // Bumped whenever any struct below changes shape. A peer that announces a
 // different value is not compatible; the handshake (M9.2-A) is where that is
 // noticed, and the decoders below refuse it on their own as a backstop.
-constexpr uint32_t kDebrisWireVersion = 1;
+// v2 (W2-M): the ground-item identity in BodyAnnounce and ItemGrant is a whole
+// ItemInstance (name, count, dye, fill, damage) instead of name/dye/"damage".
+constexpr uint32_t kDebrisWireVersion = 2;
 
 // ---- identity ---------------------------------------------------------------
 //
@@ -85,12 +88,11 @@ struct BodyAnnounce {
                              // re-packs one from the lattice, as LoadState does)
   uint32_t bleedMat = 0;
   uint32_t dead = 0;         // came off a creature (Body::dead)
-  // Ground-item identity, empty for matter that is not an item. By NAME, for
-  // the reason worlditems.h gives: ItemLibrary indices are file-order and die
-  // on every R hot-reload.
-  std::string item;
-  uint32_t itemDye = 0;
-  uint32_t itemDamage = 0;
+  // Ground-item identity (game/worlditems.h WorldItem's ItemInstance half),
+  // `item.name` empty for matter that is not an item. By NAME, for the reason
+  // worlditems.h gives: ItemLibrary indices are file-order and die on every R
+  // hot-reload.
+  ItemInstance item;
 };
 
 // PER TICK, FOR EVERY OWNED BODY IN THE PEER'S INTEREST SET. The smallest
@@ -145,9 +147,10 @@ struct ItemTake {
 struct ItemGrant {
   uint64_t globalId = 0;
   uint32_t toPlayer = 0;
-  std::string item;
-  uint32_t dye = 0;
-  uint32_t damage = 0;
+  // The WHOLE item (W2-M): a flask granted across the wire arrives holding
+  // what it held, a robe with the holes it had. It was name + dye + a damage
+  // word nothing wrote, and a picked-up flask came back empty.
+  ItemInstance item;
   uint32_t granted = 0;
 };
 

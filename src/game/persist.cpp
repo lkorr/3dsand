@@ -83,18 +83,95 @@ void PutF32(std::vector<uint8_t>& out, float v) {
   PutU32(out, bits);
 }
 
+// ONE WORN PIECE'S DAMAGE, in the PLYR/ITMS encoding (the v2 map's per-piece
+// body, now also the v7 per-slot record and the ITMS v4 tail):
+//
+//   u32 shells  then per shell: f32 hp (-1 = as authored),
+//                               u32 atSpawn, u32 live,
+//                               u32 voxelCount, then per voxel:
+//                                 i32 x, i32 y, i32 z, u32 material, u32 colour
+//
+// EXACT, not a durability percentage: the owner's decision is that the holes
+// round-trip. A percentage would put the wear back in the wrong places, which
+// on armour whose whole mechanic is "the world reaches you through the gap" is
+// not a cosmetic difference.
+void PutDamage(std::vector<uint8_t>& out, const WornDamage& d) {
+  PutU32(out, (uint32_t)d.shells.size());
+  for (const WornShellDamage& sh : d.shells) {
+    PutF32(out, sh.hp);
+    PutU32(out, sh.atSpawn);
+    PutU32(out, sh.live);
+    PutU32(out, (uint32_t)sh.lattice.size());
+    for (const PrefabVoxel& v : sh.lattice) {
+      PutU32(out, (uint32_t)(int32_t)v.x);
+      PutU32(out, (uint32_t)(int32_t)v.y);
+      PutU32(out, (uint32_t)(int32_t)v.z);
+      PutU32(out, v.material);
+      PutU32(out, v.color);
+    }
+  }
+}
+
+// The reader half. Ids are remapped by the table this payload was written
+// under (mattable.h). False on a truncated or lying payload (`rd.ok` latches).
+bool GetDamage(Reader& rd, WornDamage& d) {
+  d.Clear();
+  const uint32_t nsh = rd.U32();
+  // A count that cannot fit is a corrupt file: at least four u32 per shell.
+  if (!rd.ok || (size_t)nsh * 16u > rd.left) {
+    rd.ok = false;
+    return false;
+  }
+  for (uint32_t k = 0; k < nsh && rd.ok; k++) {
+    WornShellDamage sh;
+    const uint32_t hpBits = rd.U32();
+    std::memcpy(&sh.hp, &hpBits, 4);
+    sh.atSpawn = rd.U32();
+    sh.live = rd.U32();
+    const uint32_t nv = rd.U32();
+    // A count that cannot fit is a corrupt file, not a very large robe.
+    // Five u32 per voxel, so refuse BEFORE reserving whatever it asked
+    // for -- the same rule Reader::Str already applies to a string length.
+    if (!rd.ok || (size_t)nv * 20u > rd.left) {
+      rd.ok = false;
+      break;
+    }
+    sh.lattice.reserve(nv);
+    for (uint32_t vi = 0; vi < nv && rd.ok; vi++) {
+      const int32_t x = (int32_t)rd.U32();
+      const int32_t y = (int32_t)rd.U32();
+      const int32_t z = (int32_t)rd.U32();
+      const uint32_t m = rd.U32();
+      const uint32_t col = rd.U32();
+      if (!rd.ok) break;
+      sh.lattice.push_back(PrefabVoxel{(int16_t)x, (int16_t)y, (int16_t)z,
+                                       (uint16_t)m, (uint8_t)col});
+    }
+    if (const MatRemap* mr = ActiveLoadRemap()) RemapPrefabVoxels(sh.lattice, *mr);
+    d.shells.push_back(std::move(sh));
+  }
+  if (d.Empty()) d.Clear();
+  return rd.ok;
+}
+
 void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint32_t version) {
+  // A worn piece's live holes are on its shells, not in its stack, until
+  // something reads the stack without the body — and this is that something
+  // (Mob::KitFlushWorn). Without it a save made while wearing a burnt robe
+  // wrote the robe as it was when it went on.
+  if (r.wearer) r.wearer->KitFlushWorn();
+  Kit& kit = *r.kit;
   auto putSlots = [&](const ItemStack* v, int n) {
     PutU32(out, (uint32_t)n);
     for (int i = 0; i < n; i++) {
-      PutStr(out, KitItemName(v[i], *r.items));
+      PutStr(out, v[i].Empty() ? std::string() : v[i].name);
       PutU32(out, (uint32_t)(v[i].Empty() ? 0 : v[i].count));
     }
   };
-  putSlots(r.hotbar->slots, kItemSlots);
-  putSlots(r.kit->bag.slots, Bag::kSlots);
-  putSlots(r.kit->equip.slots, kEquipSlotCount);
-  PutU32(out, (uint32_t)r.hotbar->selected);
+  putSlots(kit.hotbar.slots, kItemSlots);
+  putSlots(kit.bag.slots, Bag::kSlots);
+  putSlots(kit.equip.slots, kEquipSlotCount);
+  PutU32(out, (uint32_t)kit.hotbar.selected);
 
   const GlyphInventory& gi = r.caster->inventory;
   auto glyphName = [&](int idx) {
@@ -107,38 +184,35 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   PutU32(out, (uint32_t)kGlyphSlots);
   for (int i = 0; i < kGlyphSlots; i++) PutStr(out, glyphName(gi.At(i)));
 
-  // ---- v2: worn damage ------------------------------------------------------
+  // ---- v2: worn damage BY NAME ----------------------------------------------
   //
-  //   u32 pieces  then per piece: str item, u32 shells,
-  //                 then per shell: f32 hp (-1 = as authored),
-  //                                 u32 atSpawn, u32 live   (v3, condition)
-  //                                 u32 voxelCount, then per voxel:
-  //                                   i32 x, i32 y, i32 z, u32 material,
-  //                                   u32 colour
+  //   u32 pieces  then per piece: str item, PutDamage
   //
-  // EXACT, not a durability percentage: the owner's decision is that the holes
-  // round-trip. A percentage would be cheaper and would put the wear back in
-  // the wrong places, which on armour whose whole mechanic is "the world
-  // reaches you through the gap" is not a cosmetic difference.
-  //
-  // Only DAMAGED pieces appear (PlayerKit::SetDamage erases an empty blob), so
-  // a full suit of untouched armour costs four bytes.
-  PutU32(out, (uint32_t)r.kit->wornDamage.size());
-  for (const auto& kv : r.kit->wornDamage) {
-    PutStr(out, kv.first);
-    PutU32(out, (uint32_t)kv.second.shells.size());
-    for (const WornShellDamage& sh : kv.second.shells) {
-      PutF32(out, sh.hp);
-      PutU32(out, sh.atSpawn);
-      PutU32(out, sh.live);
-      PutU32(out, (uint32_t)sh.lattice.size());
-      for (const PrefabVoxel& v : sh.lattice) {
-        PutU32(out, (uint32_t)(int32_t)v.x);
-        PutU32(out, (uint32_t)(int32_t)v.y);
-        PutU32(out, (uint32_t)(int32_t)v.z);
-        PutU32(out, v.material);
-        PutU32(out, v.color);
+  // v2..v6 kept one damage blob per item NAME (two robes shared one set of
+  // holes). v7 carries damage PER SLOT (the tail below), and writes this
+  // section EMPTY so every byte after it stays where older readers expect it.
+  // An older version is still WRITTEN for the gates that manufacture one:
+  // the first damaged stack of each name stands for the name, which is all an
+  // older reader could hold.
+  if (version >= 7) {
+    PutU32(out, 0u);
+  } else {
+    std::vector<const ItemStack*> firsts;
+    auto collect = [&](const ItemStack* v, int n) {
+      for (int i = 0; i < n; i++) {
+        if (v[i].Empty() || v[i].damage.Empty()) continue;
+        bool seen = false;
+        for (const ItemStack* f : firsts) seen = seen || f->name == v[i].name;
+        if (!seen) firsts.push_back(&v[i]);
       }
+    };
+    collect(kit.equip.slots, kEquipSlotCount);
+    collect(kit.bag.slots, Bag::kSlots);
+    collect(kit.hotbar.slots, kItemSlots);
+    PutU32(out, (uint32_t)firsts.size());
+    for (const ItemStack* f : firsts) {
+      PutStr(out, f->name);
+      PutDamage(out, f->damage);
     }
   }
   if (version < 4) return;
@@ -184,9 +258,9 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
     PutU32(out, (uint32_t)n);
     for (int i = 0; i < n; i++) PutU32(out, v[i].Empty() ? 0u : v[i].dye);
   };
-  putDyes(r.hotbar->slots, kItemSlots);
-  putDyes(r.kit->bag.slots, Bag::kSlots);
-  putDyes(r.kit->equip.slots, kEquipSlotCount);
+  putDyes(kit.hotbar.slots, kItemSlots);
+  putDyes(kit.bag.slots, Bag::kSlots);
+  putDyes(kit.equip.slots, kEquipSlotCount);
   if (version < 6) return;
 
   // ---- v6: what the vessels hold (game/container.h) --------------------------
@@ -202,12 +276,29 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   // so a renumbering content change no longer repaints either.
   auto putFills = [&](const ItemStack* v, int n) {
     PutU32(out, (uint32_t)n);
-    for (int i = 0; i < n; i++)
-      PutU32(out, v[i].Empty() ? 0u : PackItemFill(v[i].fillMat, v[i].fillAmt));
+    for (int i = 0; i < n; i++) PutU32(out, v[i].Empty() ? 0u : v[i].Fill());
   };
-  putFills(r.hotbar->slots, kItemSlots);
-  putFills(r.kit->bag.slots, Bag::kSlots);
-  putFills(r.kit->equip.slots, kEquipSlotCount);
+  putFills(kit.hotbar.slots, kItemSlots);
+  putFills(kit.bag.slots, Bag::kSlots);
+  putFills(kit.equip.slots, kEquipSlotCount);
+  if (version < 7) return;
+
+  // ---- v7: worn damage PER SLOT (rule-unification W2-M) ----------------------
+  //
+  //   u32 hotbarCount  then per slot: PutDamage (u32 0 = as authored)
+  //   u32 bagCount     then per slot: PutDamage
+  //   u32 equipCount   then per slot: PutDamage
+  //
+  // The damage is a field of the ItemInstance in the slot, so two robes in one
+  // pack keep two sets of holes. The dyes' parallel-array shape again.
+  auto putDamage = [&](const ItemStack* v, int n) {
+    PutU32(out, (uint32_t)n);
+    for (int i = 0; i < n; i++)
+      PutDamage(out, v[i].Empty() ? WornDamage{} : v[i].damage);
+  };
+  putDamage(kit.hotbar.slots, kItemSlots);
+  putDamage(kit.bag.slots, Bag::kSlots);
+  putDamage(kit.equip.slots, kEquipSlotCount);
 }
 
 bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
@@ -218,6 +309,7 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
                  kPlayerKitSaveVersion);
     return false;
   }
+  Kit& kit = *r.kit;
   Reader rd{data, len};
   int dropped = 0;
   auto getSlots = [&](ItemStack* v, int n) {
@@ -227,14 +319,17 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
       const int c = (int)rd.U32();
       if (!rd.ok) return;
       if ((int)i >= n) continue;   // the file has more slots than this build
-      v[i] = KitItemFromName(name, c, *r.items);
+      ItemInstance in;
+      in.name = name;
+      in.count = c;
+      v[i] = KitStackFrom(in, *r.items);
       if (!name.empty() && v[i].Empty()) dropped++;
     }
   };
-  getSlots(r.hotbar->slots, kItemSlots);
-  getSlots(r.kit->bag.slots, Bag::kSlots);
-  getSlots(r.kit->equip.slots, kEquipSlotCount);
-  r.hotbar->Select((int)rd.U32());
+  getSlots(kit.hotbar.slots, kItemSlots);
+  getSlots(kit.bag.slots, Bag::kSlots);
+  getSlots(kit.equip.slots, kEquipSlotCount);
+  kit.hotbar.Select((int)rd.U32());
 
   GlyphInventory& gi = r.caster->inventory;
   gi.owned.clear();
@@ -262,47 +357,22 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
       gi.Bind((int)i, id.empty() ? -1 : r.glyphs->Find(id));
     }
   }
-  // ---- v2: worn damage ------------------------------------------------------
-  r.kit->wornDamage.clear();
+  // ---- v2: worn damage BY NAME (v2..v6; empty in v7) --------------------------
+  // An older file kept one blob per item NAME, which every stack of that name
+  // shared. Loaded the way it was meant: onto every stack of the name — the
+  // pieces were indistinguishable in that format, and the first damage either
+  // of them takes from here on is its own. Damage for a piece that no longer
+  // exists is simply forgotten.
   {
     const uint32_t pieces = rd.U32();
     for (uint32_t i = 0; i < pieces && rd.ok; i++) {
       const std::string name = rd.Str();
-      const uint32_t nsh = rd.U32();
       WornDamage d;
-      for (uint32_t k = 0; k < nsh && rd.ok; k++) {
-        WornShellDamage sh;
-        const uint32_t hpBits = rd.U32();
-        std::memcpy(&sh.hp, &hpBits, 4);
-        sh.atSpawn = rd.U32();
-        sh.live = rd.U32();
-        const uint32_t nv = rd.U32();
-        // A count that cannot fit is a corrupt file, not a very large robe.
-        // Five u32 per voxel, so refuse BEFORE reserving whatever it asked
-        // for -- the same rule Reader::Str already applies to a string length.
-        if (!rd.ok || (size_t)nv * 20u > rd.left) {
-          rd.ok = false;
-          break;
-        }
-        sh.lattice.reserve(nv);
-        for (uint32_t vi = 0; vi < nv && rd.ok; vi++) {
-          const int32_t x = (int32_t)rd.U32();
-          const int32_t y = (int32_t)rd.U32();
-          const int32_t z = (int32_t)rd.U32();
-          const uint32_t m = rd.U32();
-          const uint32_t col = rd.U32();
-          if (!rd.ok) break;
-          sh.lattice.push_back(PrefabVoxel{(int16_t)x, (int16_t)y, (int16_t)z,
-                                           (uint16_t)m, (uint8_t)col});
-        }
-        // Ids by the table this payload was written under (mattable.h).
-        if (const MatRemap* mr = ActiveLoadRemap()) RemapPrefabVoxels(sh.lattice, *mr);
-        d.shells.push_back(std::move(sh));
-      }
-      // Damage for a piece that no longer exists is simply forgotten -- the
-      // same rule the slots above follow for an unresolvable name.
-      if (rd.ok && !d.Empty() && r.items->Find(name) >= 0)
-        r.kit->wornDamage[name] = std::move(d);
+      if (!GetDamage(rd, d)) break;
+      if (d.Empty()) continue;
+      kit.ForEachStack([&](ItemStack& s) {
+        if (!s.Empty() && s.name == name) s.damage = d;
+      });
     }
   }
   // ---- v4: the grimoire ------------------------------------------------------
@@ -352,9 +422,9 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
         if (!v[i].Empty()) v[i].dye = d;
       }
     };
-    getDyes(r.hotbar->slots, kItemSlots);
-    getDyes(r.kit->bag.slots, Bag::kSlots);
-    getDyes(r.kit->equip.slots, kEquipSlotCount);
+    getDyes(kit.hotbar.slots, kItemSlots);
+    getDyes(kit.bag.slots, Bag::kSlots);
+    getDyes(kit.equip.slots, kEquipSlotCount);
   }
   // ---- v6: vessel contents ---------------------------------------------------
   // Only onto a slot that resolved to a VESSEL: contents on anything else are
@@ -365,7 +435,7 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
       for (uint32_t i = 0; i < count && rd.ok; i++) {
         const uint32_t f = rd.U32();
         if (!rd.ok || (int)i >= n || v[i].Empty()) continue;
-        const ItemDef* d = r.items->At(v[i].def);
+        const ItemDef* d = r.items->Of(v[i]);
         if (!d || !d->IsContainer()) continue;
         v[i].fillMat = ItemFillMat(f);
         if (const MatRemap* mr = ActiveLoadRemap())
@@ -375,9 +445,24 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
         if (v[i].fillAmt == 0) v[i].fillMat = 0;
       }
     };
-    getFills(r.hotbar->slots, kItemSlots);
-    getFills(r.kit->bag.slots, Bag::kSlots);
-    getFills(r.kit->equip.slots, kEquipSlotCount);
+    getFills(kit.hotbar.slots, kItemSlots);
+    getFills(kit.bag.slots, Bag::kSlots);
+    getFills(kit.equip.slots, kEquipSlotCount);
+  }
+  // ---- v7: worn damage per slot ------------------------------------------------
+  if (version >= 7) {
+    auto getDamage = [&](ItemStack* v, int n) {
+      const uint32_t count = rd.U32();
+      for (uint32_t i = 0; i < count && rd.ok; i++) {
+        WornDamage d;
+        if (!GetDamage(rd, d)) return;
+        if ((int)i >= n || v[i].Empty()) continue;
+        v[i].damage = std::move(d);
+      }
+    };
+    getDamage(kit.hotbar.slots, kItemSlots);
+    getDamage(kit.bag.slots, Bag::kSlots);
+    getDamage(kit.equip.slots, kEquipSlotCount);
   }
   if (dropped > 0)
     std::fprintf(stderr,
@@ -389,6 +474,9 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
     return false;
   }
   r.caster->Clear(*r.glyphs);   // a half-spoken spell does not survive a load
+  // The equipment was replaced wholesale: whatever the rig is wearing is not
+  // these stacks, even where a name matches (Mob::DressFromKit re-dresses).
+  if (r.wearer) r.wearer->KitWornStale();
   return true;
 }
 
@@ -413,14 +501,14 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
 void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
                       std::vector<uint8_t>& out, Vec3* posOut) {
   {
-    PutStr(out, w.item);
+    PutStr(out, w.name);
     // v2: THE DYE (game/dye.h). Written next to the name because it is the
     // other half of what the thing on the ground IS — a dropped red tunic and
     // a dropped blue one share a name and a lattice, and the word is not
     // recoverable from either.
     PutU32(out, w.dye);
-    // v3: what a dropped vessel holds (WorldItem::fill).
-    PutU32(out, w.fill);
+    // v3: what a dropped vessel holds (the ItemInstance's fill).
+    PutU32(out, w.Fill());
     BodyTransform xf{};
     r.phys->GetTransform(w.body, xf);
     if (posOut) *posOut = xf.pos;
@@ -430,7 +518,7 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
 
     std::vector<PrefabVoxel> lat;
     uint32_t latScale = 1;
-    const ItemDef* d = r.items->At(r.items->Find(w.item));
+    const ItemDef* d = r.items->Of(w);
     uint32_t authored = 0;
     if (d) {
       uint32_t s2 = 1;
@@ -448,6 +536,10 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
       PutU32(out, v.material);
       PutU32(out, v.color);
     }
+    // v4 (W2-M): what the piece has BEEN THROUGH, every shell of it — the body
+    // above is only its largest panel. A cut-loose cuirass picked up after a
+    // reload goes back on with the holes it came off with.
+    PutDamage(out, w.damage);
   }
 }
 
@@ -472,7 +564,9 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
   int dropped = 0;
   for (uint32_t i = 0; i < n && rd.ok; i++) {
     const std::string name = rd.Str();
-    const uint32_t dye = version >= 2 ? rd.U32() : 0u;
+    ItemInstance inst;
+    inst.name = name;
+    inst.dye = version >= 2 ? rd.U32() : 0u;
     uint32_t fill = version >= 3 ? rd.U32() : 0u;
     const uint32_t bx = rd.U32(), by = rd.U32(), bz = rd.U32();
     if (!rd.ok) break;
@@ -498,6 +592,8 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
       lat.push_back(PrefabVoxel{(int16_t)vx, (int16_t)vy, (int16_t)vz,
                                 (uint16_t)vm, (uint8_t)vc});
     }
+    // v4: the piece's damage (GetDamage remaps its own lattice ids).
+    if (version >= 4 && !GetDamage(rd, inst.damage)) break;
     // The lattice and the vessel's contents are ids in the table this record
     // was written under; running ids from here on (sim/mattable.h).
     if (const MatRemap* mr = ActiveLoadRemap()) {
@@ -505,7 +601,8 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
       if (fill != 0)
         fill = PackItemFill((uint16_t)mr->Mat(ItemFillMat(fill)), ItemFillAmt(fill));
     }
-    const ItemDef* d = r.items->At(r.items->Find(name));
+    inst.SetFill(fill);
+    const ItemDef* d = r.items->Named(name);
     // Content legitimately disappears between saves. The item is dropped with
     // a log line rather than restored as something else, which is the same
     // rule PLYR follows for a name it cannot resolve.
@@ -513,8 +610,8 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
       dropped++;
       continue;
     }
-    DropItemToWorld(*d, at, Vec3{}, *r.phys, *r.debris, r.micro, *r.reg,
-                    lat.empty() ? nullptr : &lat, dye, fill);
+    DropItemToWorld(*d, inst, at, Vec3{}, *r.phys, *r.debris, r.micro, *r.reg,
+                    lat.empty() ? nullptr : &lat);
   }
   if (dropped > 0)
     std::fprintf(stderr,
@@ -646,12 +743,8 @@ EntityIO MakeEntityIO(DebrisSystem& debris, MobSystem& mobs,
         // not leave this session's pack standing in the loaded world, which is
         // the same rule the avatar's reset follows.
         [r] {
-          for (int i = 0; i < kItemSlots; i++) r.hotbar->slots[i] = ItemStack{};
-          r.hotbar->Select(0);
-          for (int i = 0; i < Bag::kSlots; i++) r.kit->bag.slots[i] = ItemStack{};
-          for (int i = 0; i < kEquipSlotCount; i++)
-            r.kit->equip.slots[i] = ItemStack{};
-          r.kit->wornDamage.clear();
+          r.kit->Clear();
+          if (r.wearer) r.wearer->KitWornStale();
           r.caster->inventory.owned.clear();
           for (int i = 0; i < kGlyphSlots; i++) r.caster->inventory.Bind(i, -1);
           r.caster->grimoire.pages.clear();

@@ -612,8 +612,7 @@ void EntitySync::ApplyForTick(uint32_t tick, MobSystem& mobs,
       // layer above debris and the announce is the only place the name
       // travels; without this the sword on the peer's ground is a nameless
       // pile of voxels and `ground.Find()` returns null.
-      if (items != nullptr && !a.item.empty())
-        items->Add(h, a.item, a.itemDye, a.itemDamage);
+      if (items != nullptr && !a.item.name.empty()) items->Add(h, a.item);
     }
 
     // ---- states (P2c): a corpse's shape, before the pose that indexes it --
