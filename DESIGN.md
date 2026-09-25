@@ -3182,6 +3182,35 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
        unchanged; every body material authored today is a film, so a lava
        coat survives the sear it causes, and blood stays on seared skin as it
        always did.
+     - *2c. A flame a coat makes is made ON its wearer (2026-09-24, the
+       owner's "oil should catch fire easily in all scenarios").* When a coat
+       rule FIRES, its coat-side product is a flame (so it was released, rule
+       2), and the firing did not itself rewrite V, then V CATCHES if it can:
+       it becomes its CATCH FORM, with no roll of its own. The catch form is
+       derived at load from V's own rules, never named
+       (`sim/bodyreact.h CatchFormTable`; the grid reads it from the
+       material's spare GPU word `_r2`, the body from `BodyReactFlags`): the
+       product of V's first HEAT rule (a pair rule whose partner can be hot,
+       or a decay behind a direct ramp counting something hot) that is itself
+       hot -- wood -> ember, grass -> fire, leaves -> leaf_burning -- else, one
+       step, that of its first heat rule's product -- skin -> flesh_cooked ->
+       flesh_burning; 0 (does not catch) for a material already hot, with no
+       heat rule (dirt, sand, stone), or whose heat product never burns (ice
+       -> water). It is V's one rewrite this tick (rule 5); the coat already
+       spent its one level, a film stays (2b), a held coat goes with V, and a
+       V that leaves takes it. So "how easily an oiled thing catches" is ONE
+       authored number, oil's `oil + tag:hot -> fire` chance (raised 350 -> 700
+       per mille for this, against a stationary heat source; a drifting flame
+       gets that rule's `neighborChance` share; both compiled through
+       `combustion.spreadPct` / `flamePct` like every ignition), the same everywhere: oiled
+       grass, an oiled limb, live or dead, an oiled plank. Oiled dirt, which
+       cannot catch, is unchanged: its oil still burns off a level a flash.
+       Not a body case: it is what the old fuel section did (without that
+       section's whole-coat spend), and the grid runs it too. Termination is
+       rule 2's: the catch is paid by the flash's level, and what V catches
+       as is its own combustion, bounded by the fire chain. It applies to the
+       coat's OWN rules only; a flame released through rule 4 was V's own
+       rule firing, which is V's one rule already.
   3. *A quenching coat covers the cell.* If a coat rule MATCHED this tick
      (partner found, rolled or not) and its coat-side product is not a flame,
      the cell is COVERED for this tick: V's own rules see its coat and nothing
@@ -3262,8 +3291,8 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   `X + tag:extinguisher` douse runs against the coat. Oiled absorbent ground
   (`oil + tag:hot -> fire`) beside heat flashes: each flash spends a level and
   puts a flame in the open face above; oiled dirt, which cannot burn, burns
-  for as many flashes as it holds levels; oiled grass rolls its own ignition
-  at the dry rate as well. Blood and ichor own no pair rule, so a bloody cell
+  for as many flashes as it holds levels; oiled grass CATCHES on a flash
+  (clause 2c) and rolls its own ignition at the dry rate as well. Blood and ichor own no pair rule, so a bloody cell
   reacts exactly as a clean one.
 
   **Rule 2 (termination), which the old argument no longer covers.** "Stain
@@ -3300,10 +3329,12 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   - an oil flash spent the WHOLE coat and set the voxel to `flashForm_` (skin
     straight to flesh_burning): it now spends ONE level and releases the
     flame into an open face (rule 2); the voxel's own rules answer that flame
-    from the grid next tick, as oiled grass does. Retired, not kept: the
-    owner's "oiled voxels super flammable" is now carried only by the flames
-    the oil throws against the body. `flashForm_` remains for
-    `IgniteOneLimb` (a flame put straight onto skin).
+    from the grid next tick, as oiled grass does. The owner then asked for
+    it back, everywhere ("oil should catch fire easily in all scenarios",
+    2026-09-24): clause 2c -- a flash makes its flame ON the voxel, which
+    catches as its derived catch form -- for the grid and every body alike,
+    still one level a flash. `flashForm_` remains for `IgniteOneLimb` (a
+    flame put straight onto skin).
   - the hot coat read as every open face, widened: it is one co-located
     partner (rule 4), widened at world pitch by clause 4a -- the one pitch
     correction kept.
@@ -3328,6 +3359,19 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   unchanged. `coat-parity` (grid vs a scale-1 loose body, same scenario):
   oil 25 vs 26 of 48 levels left, dirt kept; wet 53 vs 53 of 96, grass not
   caught; partnerless oil untouched on both.
+
+  Measured at clause 2c (same gate list, W2-J2's exe as control): the
+  `lava-oil-coat` oiled forearm 3,806 -> 21,728 burning voxel-ticks (clean
+  1,595 -> 1,707: ~13x, against the pre-W2-J2 19x; oil at 1,000 per mille
+  gives 21,181, so the burn is heat-limited past 700 and the missing ratio is
+  the clean arm, which W2-J2 raised); oil 447 -> 396 left. `debris-coat`
+  green again: oiled plank 42 of 49 burnt vs clean 0 (was 0 vs 0).
+  `stain-react` gains an oiled-GRASS arm (CATCHES: 20 grass-cell-ticks
+  unburnt over its first 9 ticks vs dry grass 69); its oiled-dirt arm cannot
+  catch and only burns its oil faster (72 -> 43 levels by t10, was 72 -> 63).
+  `coat-parity` same classes (oil 6 vs 5 of 48 left, from 25 vs 26: oil
+  flashes twice as often). `rain-oil`, `acid-coat`, `sleep` unchanged;
+  `mob-burn`'s red sub-claims identical to the control's.
 
   Termination on a body is the ground's argument with the pour for the
   liquid: every firing spends at least one level (a deep coat its price), a

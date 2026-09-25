@@ -5395,6 +5395,8 @@ Status GateChunkResync(Ctx& c, std::string& detail) {
 //   dry    ember | grass
 //   wet    ember | grass wearing water (12)
 //   inert  stone | dirt wearing oil (6)     -- a coat with no partner is inert
+//   oilgr  ember | grass wearing oil (6)    -- clause 2c: the flash is made ON
+//                                              the grass, which catches
 //
 // Claims, each against its arm's control:
 //   IGNITES    flame over the oiled dirt, sampled every tick, exceeds the clean
@@ -5405,6 +5407,10 @@ Status GateChunkResync(Ctx& c, std::string& detail) {
 //              stainReactDryMinPct -- wet resists, it is not merely slower luck
 //   CLEAN      the clean dirt is unchanged: dirt, unstained
 //   INERT      the partnerless oil is untouched, level for level
+//   CATCHES    oiled grass catches faster than dry grass beside the same ember:
+//              grass-cell-ticks still unburnt over the first stainReactCatchTicks
+//              ticks are at most stainReactCatchMaxFrac of the dry arm's
+//              (clause 2c: the oil's flash lights its wearer, at oil's chance)
 //   SLEEPS     heat replaced by stone, 1000 ticks later every chunk the fixture
 //              occupies is asleep with the inert oil still on it (rule 2: a coat
 //              without a partner marks nothing)
@@ -5439,7 +5445,7 @@ Status GateStainReact(Ctx& c, std::string& detail) {
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
 
-  enum { kOil, kClean, kDry, kWet, kInert, kArms };
+  enum { kOil, kClean, kDry, kWet, kInert, kOilGrass, kArms };
   const int L = 12, x0 = 150, z0 = 300, kPitch = 6;
   const int zSpan = kPitch * kArms;
   const int y = FixtureYOver(x0 - 4, z0 - 4, x0 + L + 4, z0 + zSpan + 4,
@@ -5468,6 +5474,7 @@ Status GateStainReact(Ctx& c, std::string& detail) {
     uint32_t fuel = mDirt;
     if (a == kOil || a == kInert) fuel = mDirt | PackStain(oilType, 6);
     if (a == kDry) fuel = mGrass;
+    if (a == kOilGrass) fuel = mGrass | PackStain(oilType, 6);
     if (a == kWet) fuel = mGrass | PackStain(wetType, 12);
     for (int x = x0; x < x0 + L; x++) {
       cells[{x, y, heatZ(a)}] = heat;
@@ -5513,7 +5520,8 @@ Status GateStainReact(Ctx& c, std::string& detail) {
       const uint32_t hm = at(x, y, heatZ(a)) & 0xFFFu;
       if (hm == mEmber || hm == mLava) s.heat++;
       const uint32_t w = at(x, y, fuelZ(a));
-      const uint32_t want = (a == kDry || a == kWet) ? mGrass : mDirt;
+      const uint32_t want =
+          (a == kDry || a == kWet || a == kOilGrass) ? mGrass : mDirt;
       if ((w & 0xFFFu) == want) s.fuelMat++;
       if (VoxStainAmt(w)) s.stainType |= 1u << VoxStainType(w);
       s.levels += VoxStainAmt(w);
@@ -5530,6 +5538,9 @@ Status GateStainReact(Ctx& c, std::string& detail) {
   const uint32_t kWetTicks = (uint32_t)BaselineNumber("stainReactWetTicks", 40.0);
   const uint32_t kBurnTicks = (uint32_t)BaselineNumber("stainReactBurnTicks", 200.0);
   uint32_t flameOil = 0, flameClean = 0;
+  const uint32_t kCatchTicks =
+      (uint32_t)BaselineNumber("stainReactCatchTicks", 10.0);
+  uint32_t unburntDry = 0, unburntOilGrass = 0;  // grass-cell-ticks
   ArmStat wetAt[kArms];
   // The oil arm's burn, as a trace: t:levels/embers left. Attribution for a
   // BURNS OUT failure (a coat that stops reacting vs heat that went out).
@@ -5542,6 +5553,10 @@ Status GateStainReact(Ctx& c, std::string& detail) {
       readFixture("stainReactFlame");
       flameOil += armStat(kOil).flame;
       flameClean += armStat(kClean).flame;
+      if (i <= kCatchTicks) {
+        unburntDry += armStat(kDry).fuelMat;
+        unburntOilGrass += armStat(kOilGrass).fuelMat;
+      }
     }
     if (i == 5 || i == 10 || i == 20 || i == 40 || i == 100 || i == kBurnTicks) {
       if (i > 40) readFixture("stainReactTrace");
@@ -5600,9 +5615,13 @@ Status GateStainReact(Ctx& c, std::string& detail) {
                        inertEnd.levels == 6u * Lu &&
                        inertEnd.stainType == (1u << oilType);
   const bool sleeps = awake == 0;
-  const bool ok = ignites && burnsOut && wetOk && cleanOk && inertOk && sleeps;
+  const double catchMaxFrac = BaselineNumber("stainReactCatchMaxFrac", 0.6);
+  const bool catches = unburntDry > 0 &&
+                       (double)unburntOilGrass <= catchMaxFrac * (double)unburntDry;
+  const bool ok = ignites && burnsOut && wetOk && cleanOk && inertOk && sleeps &&
+                  catches;
 
-  char buf[1024];
+  char buf[1536];
   std::snprintf(
       buf, sizeof(buf),
       "%s: IGNITES %s (flame-ticks over oiled dirt %u vs clean %u, first 40 "
@@ -5610,7 +5629,8 @@ Status GateStainReact(Ctx& c, std::string& detail) {
       "levels/heat%s) | WET %s "
       "(t%u: dry burnt %u/%u, wet burnt %u/%u, wet levels %u/%u) | CLEAN %s "
       "(dirt %u/%u, levels %u) | INERT %s (oil levels %u, %u after rest) | "
-      "SLEEPS %s (%u of %zu fixture chunks awake %u ticks after quench)",
+      "SLEEPS %s (%u of %zu fixture chunks awake %u ticks after quench) | "
+      "CATCHES %s (grass-cell-ticks unburnt over t2..t%u: oiled %u vs dry %u)",
       ok ? "PASS" : "FAIL", ignites ? "ok" : "FAIL", flameOil, flameClean,
       burnsOut ? "ok" : "FAIL", 6u * Lu, burnt[kOil].levels, kBurnTicks,
       burnt[kOil].fuelMat, Lu, oilTrace.c_str(), wetOk ? "ok" : "FAIL",
@@ -5618,7 +5638,11 @@ Status GateStainReact(Ctx& c, std::string& detail) {
       wetBurnt, Lu, wetAt[kWet].levels, 12u * Lu, cleanOk ? "ok" : "FAIL",
       burnt[kClean].fuelMat, Lu, burnt[kClean].levels, inertOk ? "ok" : "FAIL",
       burnt[kInert].levels, inertEnd.levels, sleeps ? "ok" : "FAIL", awake,
-      chunkBuf.size(), kRestTicks);
+      chunkBuf.size(), kRestTicks, catches ? "ok" : "FAIL", kCatchTicks,
+      unburntOilGrass, unburntDry);
+  RecordObserved("stainReact.catchUnburntOilGrass", (double)unburntOilGrass);
+  RecordObserved("stainReact.catchUnburntDry", (double)unburntDry);
+  RecordObserved("stainReact.flameOil", (double)flameOil);
   detail = buf;
   std::printf("stain-react: %s\n", buf);
   return ok ? Status::Pass : Status::Fail;

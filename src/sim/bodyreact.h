@@ -55,6 +55,9 @@ struct BodyReactFlags {
   // rewritesNbr on purpose: `grass + tag:soil -> grass` rewrites a neighbour
   // and is under every creature in the world.
   std::vector<uint8_t> attacksBody;
+  // What a voxel of this material CATCHES as when a flame is made on it
+  // (DESIGN.md §6 clause 2c; CatchFormTable below). 0 = it does not catch.
+  std::vector<uint32_t> catchForm;
 };
 
 // The BIT one tag name owns, recovered from the compiled masks: the bits
@@ -78,6 +81,73 @@ inline uint32_t BodyReactTagBit(const std::vector<MaterialDef>& mats,
   return any ? (all & ~none) : 0u;
 }
 
+// ---- WHAT A MATERIAL CATCHES AS (DESIGN.md §6 clause 2c) --------------------
+// A coat rule whose coat-side product is a FLAME makes that flame ON the voxel
+// wearing it (an oiled plank's oil flashing), and the voxel CATCHES: it takes
+// the form its OWN rules give it under heat. Read off the table, never named:
+//   * a HEAT rule is a pair rule whose partner predicate matches some hot
+//     material, or a decay behind a direct neighbour-count ramp that counts
+//     one (flesh_cooked's minCount-3 relight);
+//   * the catch form is the product of the material's first heat rule whose
+//     product is itself hot (wood -> ember, grass -> fire, leaves ->
+//     leaf_burning); failing that, the catch form of the product of its first
+//     heat rule (skin -> flesh_cooked -> flesh_burning: the sear, then the
+//     relight), one step only;
+//   * 0 = does not catch: a material that is already hot, one with no heat
+//     rule (dirt, sand, stone), or one whose heat product never burns (ice ->
+//     water -> steam, which is not hot).
+// ONE derivation for both populations: Simulation::UploadTables puts it in
+// each material's spare GPU word for sim_step.wgsl coatReact, and
+// BuildBodyReactFlags hands it to MobSystem::BurnOneLimb. Returns one id per
+// material, sized mats.size().
+inline std::vector<uint32_t> CatchFormTable(const std::vector<MaterialDef>& mats,
+                                            const std::vector<ReactionGpu>& reactions) {
+  const size_t n = mats.size();
+  const uint32_t hotMask = BodyReactTagBit(mats, "hot");
+  std::vector<MaterialGpu> gpu;
+  gpu.reserve(n);
+  for (const auto& m : mats) gpu.push_back(m.gpu);
+  auto isHot = [&](uint32_t id) {
+    return id != 0 && id < n && (gpu[id].tagMask & hotMask) != 0;
+  };
+  auto heatRule = [&](const ReactionGpu& r) {
+    const uint32_t kind = r.packed & 3u;
+    if (kind == kReactDecay && (!ReactScaleArmed(r) || ReactScaleInverted(r)))
+      return false;
+    if (kind != kReactPair && kind != kReactDecay) return false;
+    for (size_t h = 1; h < n; h++)
+      if (isHot((uint32_t)h) && ReactNbrMatches(r, (uint32_t)h, gpu)) return true;
+    return false;
+  };
+  // (first hot product of a heat rule, first product of a heat rule)
+  auto direct = [&](uint32_t mi, uint32_t& hot, uint32_t& first) {
+    hot = first = 0;
+    const MaterialGpu& g = gpu[mi];
+    for (uint32_t ri = 0; ri < g.reactCount; ri++) {
+      const size_t k = (size_t)g.reactOffset + ri;
+      if (k >= reactions.size()) break;
+      const ReactionGpu& r = reactions[k];
+      if (r.prodSelf == kProdKeep || r.prodSelf == 0 || !heatRule(r)) continue;
+      const uint32_t pm = r.prodSelf & 0xFFFu;
+      if (!first) first = pm;
+      if (isHot(pm)) { hot = pm; return; }
+    }
+  };
+  std::vector<uint32_t> out(n, 0u);
+  for (size_t mi = 1; mi < n; mi++) {
+    if (isHot((uint32_t)mi)) continue;
+    uint32_t hot = 0, first = 0;
+    direct((uint32_t)mi, hot, first);
+    if (!hot && first && first < n && first != mi && !isHot(first)) {
+      uint32_t hot2 = 0, first2 = 0;
+      direct(first, hot2, first2);
+      hot = hot2;
+    }
+    out[mi] = hot;
+  }
+  return out;
+}
+
 inline void BuildBodyReactFlags(const std::vector<MaterialDef>& mats,
                                 const std::vector<ReactionGpu>& reactions,
                                 BodyReactFlags& out) {
@@ -90,6 +160,7 @@ inline void BuildBodyReactFlags(const std::vector<MaterialDef>& mats,
   out.inboundTarget.assign(n, 0);
   out.hot.assign(n, 0);
   out.attacksBody.assign(n, 0);
+  out.catchForm = CatchFormTable(mats, reactions);
   const uint32_t hotMask = BodyReactTagBit(mats, "hot");
   const uint32_t dissolvableMask = BodyReactTagBit(mats, "dissolvable");
   std::vector<MaterialGpu> gpu;

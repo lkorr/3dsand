@@ -420,7 +420,11 @@ struct MaterialGpu {
   uint32_t stainColor;              // RGBA8 the renderer paints for this stain
   uint32_t repose = 0;              // powder pile slope, packed (see above); 0 = 45 degrees
   uint32_t fluidPack = 0;           // packed liquid coupling (see above)
-  uint32_t _r2 = 0, _r3 = 0;        // reserved: the next field costs no struct grow
+  // Reserved in the AUTHORED record (always 0 here). Filled only in the
+  // UPLOADED table (Simulation::UploadTables): a real material's `_r2` is its
+  // catch form (DESIGN.md §6 clause 2c, sim/bodyreact.h CatchFormTable); a
+  // stain palette entry's `_r2` / `_r3` are the coat glow and coat material.
+  uint32_t _r2 = 0, _r3 = 0;
 };
 // 80 bytes, not the 68 the fluid block above says on its own: `repose` grew it
 // to 80 with three spare words, and `fluidPack` spent one of them. That is the
