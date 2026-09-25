@@ -10102,6 +10102,15 @@ int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
       // Creature against creature (a ragdoll's own limbs, a held weapon, two
       // bodies in a scrum) is melee's and the ragdoll's, not a thrown thing.
       if (FindOwner(other) != nullptr) continue;
+      // ...AND A PLAYER'S CAPSULE IS A CREATURE TOO. It is no limb, so
+      // FindOwner misses it, and the proxy is a dynamic body carrying the
+      // player's whole mass (Physics::CreatePlayerBody): read as a thrown
+      // rock, a player walking into an NPC billed it up to contactMaxHp per
+      // new contact, as if the player were a rock thrown at it.
+      if (FirstCreature([&](const Mob& c) {
+            return c.CollisionOwner() != 0 && c.CollisionOwner() == other;
+          }) != nullptr)
+        continue;
       const float mo = phys.BodyMass(other);
       if (mo <= 0.0f) continue;
       // A standing creature's limbs are kinematic: the striker meets an
@@ -20031,6 +20040,24 @@ void Mob::Die() {
   // P1 stopgap): anonymous bodies this machine then OWNED, for a creature the
   // peer was still stepping.
   if (IsGhost()) return;
+  // ONE LINE PER DEATH, with the hp ledger by cause: "dropped dead" is a
+  // bare fact, and which cause drained the body is the whole diagnosis.
+  {
+    static const char* const kCause[(int)DamageCause::Count] = {
+        "other", "blade", "blunt", "bite", "beam", "blast",
+        "unarmed", "burn", "spawnrot", "fall"};
+    std::string led;
+    for (int c = 0; c < (int)DamageCause::Count; c++)
+      if (hpLostBy_[c] > 0.0f) {
+        char b[48];
+        std::snprintf(b, sizeof b, " %s=%.1f", kCause[c], hpLostBy_[c]);
+        led += b;
+      }
+    std::printf("mob death: %s %llu cause '%s' tick %u hp-lost:%s\n",
+                def_ ? def_->name.c_str() : "?", (unsigned long long)id_,
+                deathCause_, sys_ ? sys_->tick_ : 0u,
+                led.empty() ? " (none)" : led.c_str());
+  }
   alive_ = false;
   // The ORDER a corpse fell in, for the dead cap (MobSystem::EvictDead): the
   // oldest decays to debris first.
