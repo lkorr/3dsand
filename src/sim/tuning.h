@@ -1509,8 +1509,8 @@ struct Tuning {
     // How deep a DENT a full-power blunt hit takes out of flesh, in world
     // voxels, before the weapon's own `bluntCarve` fraction scales it. A fist
     // authors 0 and removes nothing at all; a gauntlet ~0.35 and a mace ~0.6
-    // of this. Radial, never a kerf, and inside a Mob::BluntCarveScope that
-    // refuses the collapse sever -- the crater is still soaked in the victim's
+    // of this. Radial, never a kerf, and carved as DamageCause::Blunt, whose
+    // row in game/severpolicy.h refuses the collapse sever -- the crater is still soaked in the victim's
     // woundMat, which is the "replace them with gore" half of the owner's
     // spec.
     //
@@ -1546,7 +1546,7 @@ struct Tuning {
     // reads as pulped to the NEXT blow and the hole deepens faster than it
     // started. That is "if a player consistently hits just the exact same spot
     // it will become pretty gruesome"; the sever is still refused outright
-    // (Mob::BluntCarveScope), so a caved-in skull is a caved-in skull and never
+    // (the Blunt row's collapseSevers, game/severpolicy.h), so a caved-in skull is a caved-in skull and never
     // a decapitation.
     // blood-coat depth (0..15) that counts as pulped
     float pulpAmt = TPD(gore, pulpAmt);
@@ -1600,7 +1600,8 @@ struct Tuning {
     // teeth, and it put the gate on a knife-edge where a different mob id
     // flipped the answer. 0.45 is a hole about 9 cm across, which is a bite.
     // Enough of them still take a hand off, because the collapse sever is left
-    // ON for a bite (Mob::BiteScope) -- it simply takes several.
+    // ON for a bite (the Bite row's collapseSevers, game/severpolicy.h) -- it
+    // simply takes several.
     float biteRadius = TPD(gore, biteRadius);
     float biteBlob = TPD(gore, biteBlob);
     // ...and how much wider than a blade's crater rim the bite's soak reaches,

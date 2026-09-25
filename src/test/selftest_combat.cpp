@@ -3027,7 +3027,8 @@ Status GateUnarmedAttack(Ctx& c, std::string& detail) {
   check(hits > 0, "...that landed on the target");
   // "A PUNCH NEVER DISMEMBERS": a bare fist's profile is all `blunt`
   // (human.json `natural`), and the blunt resolver (Mob::BluntHit) never
-  // amputates (Mob::JointRuleApplies, BluntCarveScope). That half is a limb
+  // amputates (Mob::JointRuleApplies; the Unarmed/Blunt rows of
+  // game/severpolicy.h). That half is a limb
   // count, and it is unconditional.
   check(limbs1 >= limbs0, "a fist took no limb off the target");
   // ...AND "NEVER KERFS" IS NOW CONDITIONAL ON THE TUNING (2026-09-19).

@@ -359,8 +359,9 @@ struct UIState {
   bool aiRagdollSpawned = false;  // one-shot: knock everything this panel made flat
   // WHAT THE SPAWN BUTTONS PUT IN ITS HAND. Names rather than library indices,
   // for the reason selftest_playerkit's "names survive a library reorder" case
-  // exists: an ItemStack's index is items.json's ORDER, so inserting a weapon
-  // renumbers every entry after it. main.cpp rebuilds this list from the item
+  // exists: an item's library index is items.json's ORDER, so inserting a
+  // weapon renumbers every entry after it (which is why an ItemStack holds a
+  // NAME since W2-M, and why this picker does too). main.cpp rebuilds this list from the item
   // library at load and on every R hot-reload, and re-finds the selection by
   // name — so adding a blade to items.json and hitting R moves the picker
   // without moving what is already selected.

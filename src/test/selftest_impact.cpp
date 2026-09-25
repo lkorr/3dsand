@@ -1307,7 +1307,7 @@ Status GateBiteRot(Ctx& c, std::string& detail) {
     //
     // Because the limb is SUPPOSED to come off eventually: a bite severs by
     // collapse, which is the one rule separating it from a punch
-    // (Mob::BiteScope). The first version of this arm bit ten times and then
+    // (the Bite row's collapseSevers, game/severpolicy.h). The first version of this arm bit ten times and then
     // measured, found the limb already gone, and reported four zeroes -- a
     // correct measurement of nothing. So the state is kept from the last bite
     // that LEFT THE LIMB ON THE BODY, and the sever is asserted separately as
@@ -1433,7 +1433,8 @@ Status GateBiteRot(Ctx& c, std::string& detail) {
   const bool infected = rot > 0;
   const bool wet = stained > 0;
   // ...and it BLEEDS, unlike a punch. This is the line that separates a bite
-  // from trauma: it is an open wound and Mob::BiteHit opens no BluntCarveScope.
+  // from trauma: it is an open wound: Mob::BiteHit carves as DamageCause::Bite, whose
+  // row bleeds at the full rate (game/severpolicy.h).
   const bool bled = bleed > 0.0f;
   // ARMOUR DEFENDS: not one rotten voxel, on the plate or on the man inside
   // it — and he was still hit, which is what makes the zero a refusal rather
@@ -1442,7 +1443,8 @@ Status GateBiteRot(Ctx& c, std::string& detail) {
   const bool landed = !wore || shellHostHp1 < shellHostHp0;
 
   // A BITE IS A WOUND, NOT AN AMPUTATION -- and this is the assertion that
-  // earned its place. The collapse sever is left ON for a bite (Mob::BiteScope)
+  // earned its place. The collapse sever is left ON for a bite (the Bite row of
+  // game/severpolicy.h)
   // precisely so that enough of them take a hand off, and the first version of
   // this gate asserted exactly that. It was the wrong claim: with the plan's
   // starting radius of 1.1 world voxels ONE bite took 936 of a thigh's 1344
@@ -1747,7 +1749,8 @@ Status GateBiteInfect(Ctx& c, std::string& detail) {
 // and the reason was that the only dismemberment rule rot could reach was
 // whole-limb volume (kLimbCollapseFraction, 25%), while an infection that opens
 // a hole THROUGH a shoulder removes a few percent of an arm. The joint rule
-// that makes "cut at the joint" work for a sword was gated `inBladeCut_`.
+// that makes "cut at the joint" work for a sword was gated on a blade cut (then the `inBladeCut_` flag; now the `joint`
+// column of game/severpolicy.h, IfInfected for Burn-eaten rot).
 //
 // THE TEETH GO INTO THE TORSO AND THE ARM IS WHAT COMES OFF. That is the exact
 // shape of the report, and it is also the only fixture that states the claim
