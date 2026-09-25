@@ -732,3 +732,47 @@ green in its own worktree). Arm A lost 1.04 cells of separation vs arm B's
 run (A 9569 -> 7954, B 7164 -> 5643), which points at W1-B1's excited acid
 now running its own rules (stone/dissolvable erosion, acid `selfBecomes`
 air) inside the fixture. Needs a fixture decision, not a margin change.
+
+## 2026-09-24 — `d2ea6c23` → `5cede91d` (rule unification wave 2, docs/PLAN_rule_unification_2026-09-24.md)
+
+Moved by the wave-2 packages that changed hashed state on purpose: W2-J1
+(grid stains take part in reactions), W2-R (a stamp-skipped cell probes its
+rules on substep 0), W2-I (debris burns through the one body evaluator: new
+burn order and ops), W2-J2 (body coats follow the coat rule) and the oil rule
+(`oil + tag:hot -> fire` 350 -> 700, DESIGN.md §6 clause 2c). W2-G, W2-M,
+W2-N, W2-Q and the unused-knob cleanup reported the hash unmoved. The
+twice-run comparison passed on the integration tree (after merging main
+2ee903f). Pinned with `--selftest --gate determinism --rebaseline`. Smoke
+probe tables were NOT re-pinned (no smoke runs for this wave).
+
+New gates recorded `pass`: stain-react, stamp-sleep, damage-cause,
+damage-sources, debris-coat, coat-parity, layer-roles, kit-instance,
+creature-reach.
+
+Control arm: main's exe (built 19:09 on 2026-09-24), same gate list minus the
+new gates, run from a scratch directory.
+
+- **Inherited** (identical sub-claims on the control): `mob-burn` (cloth vs
+  flesh, burn terminates, burn leaves char) and `ragdoll` ("repeat blast").
+  `acid-coat` is also red on main's exe; recorded `pass` here as it is on
+  main.
+- **New, from W2-J2, accepted-red pending the owner:** `body-coat`'s "a wet
+  body does not catch" arm: the soaked root has **1** seared voxel against the
+  dry control limb's 465 (want 0). W2-J2 reported it at 2 when it landed. The
+  arm's premise was to park `coat.fireDrySeconds`, and W2-Q then deleted that
+  knob. Under the coat rule, water boils off at its own reaction chance, so a
+  wet voxel can dry and sear inside the 90-tick window. Changing "0" to a
+  ratio against the dry control is a fixture decision for the owner, and no
+  compensating mechanic was added. Still recorded `pass`, so it reports as a
+  regression until that decision is made.
+- **The ragdoll gate's "player on fire" arm ends with the player DEAD, on
+  main's exe too** (`alive 0`, 24 pieces off on main, 27 here). The claim
+  (push ceilings) passes on both sides and is not about survival. W2-H's
+  "alive on main" did not reproduce against the current main binary. The
+  arm now prints a `fate:` line from `Mob::HpLostBy` (hp by DamageCause):
+  `DEAD at burn tick 257 (cause "burnt past the death knot"); hp 18.5 of
+  1035.0 on the last living tick, burnt 0.684 (cap 0.018), blood lost 0.0; hp
+  charged by cause: burn 95.5`. The player dies of the burn cap: its lattice
+  burns past `burnDeathFraction`, with no blast, fall, contact or bleed
+  involved. That is the intended consequence of lighting every part of a
+  robed player and leaving them in the fire for 400 ticks.
