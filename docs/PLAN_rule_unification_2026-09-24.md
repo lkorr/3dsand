@@ -198,7 +198,315 @@ local, no drive-by cleanup, no renames.
 Files: `session.cpp`, `mob.cpp`/`mob.h` (surgical), `materials.*`,
 `materials.json`, `main.cpp` (HUD hunk only), `selftest_net.cpp`, burn gates.
 
-## Wave 2 (after the corpse refactor lands on main; launched then)
+## Wave 2a (launched 2026-09-24 after corpse-is-a-mob landed, main 3af438e)
+
+Common rules above still apply. Every package touches mob.cpp regions another
+wave-2 package also touches: keep hunks local, no drive-by renames, and do not
+reformat. The corpse refactor is now ON MAIN (a corpse is a dead Mob;
+severed parts are dead-flesh debris, passes `BurnDeadFlesh`/`FleshView`):
+read DESIGN.md "Corpses are Mobs" first.
+
+### W2-G explicit damage cause
+Six ambient flags (`inBurnFlush_`, `inSpawnRot_`, `inBladeCut_`,
+`inBluntCarve_`, `inUnarmedBlunt_`, `inBite_`; 40 refs in mob.cpp, 11 in mob.h)
+plus `BladeCutScope` are set by scope guards around damage entry points and
+read by `Damage`/`HpZeroSevers`/`CarveLimb`/`Sever` in combinations
+(`inBurnFlush_ && !inBluntCarve_`, `!inBluntCarve_ && !inSpawnRot_ && ...`).
+Every new cause re-patched every sever rule: b4daa6e, fd90f11, 904dd30,
+719df2d, 9d1701d. Debris already has `DamageCause { Other, Blade, Blunt, Bite,
+Beam, Blast }` (`debris.h:~330`).
+1. Promote one cause enum to a shared header (extend it with the causes the
+   flags encode: Burn, Rot/Spawn, Unarmed-blunt, Fall, ...; keep debris using
+   the same enum).
+2. Pass the cause EXPLICITLY through Damage/CarveLimb/Sever/HpZeroSevers (a
+   small `DamageCtx`/`CarveCause` struct if more than the enum is needed:
+   bleeds, mayDetach, vitalDetaches, impactSevers, bloodScale, deathCause).
+   Delete the six flags and the scope guards.
+3. The sever/detach/bleed policy becomes ONE table keyed by (cause, tissue
+   class), in code or data — your call, justify it. Every current behaviour is
+   preserved exactly (enumerate the current combinations before you change
+   anything and make each a table row; a gate or unit assert that walks the
+   table vs the old predicates is the proof).
+4. `undead` currently has a third consequence hidden at a flag site (blunt
+   dismembers the undead, mob.cpp ~8909, contradicting mob.h's "two
+   consequences" contract): move it to def data (e.g. a tissue/def field the
+   zombie effect overlay sets), not an `undead` check.
+5. The audio `MobSystem::bladeCut_` flag: fold into the cause if it means the
+   same thing, else leave and document.
+Behaviour-preserving. Verify: the wound/impact/combat gates that cover
+severing (grep selftest_wound.cpp/selftest_impact.cpp for sever/decap/blunt/
+bite/laser/burn), mob-burn, corpse gates, determinism (twice-run).
+
+### W2-I one body-reaction evaluator + limb sleep
+`MobSystem::BurnOneLimb` (mob.cpp ~12680) evaluates reactions.json over a live
+limb / dead-Mob limb / dead-flesh part (`BurnDeadFlesh`). `DebrisSystem::
+BurnBodies` (debris.cpp ~2918) is a SECOND CPU copy for non-flesh debris
+(logs, dropped items, shells, cloth), with its own derived flag tables
+(`debris.h ~1741` "twins of mob.h's"); `BurnFleshBodies` (debris.cpp ~2804)
+may be a third. Fixes were ported by hand (3760ba5 -> ab2250f). BurnBodies
+lacks coats, wet-doesn't-burn, wound decay slowdown, joint heat.
+1. Make ONE population-neutral evaluator over a body-lattice view (the
+   BurnLimbView/FleshView shape), used by live limbs, dead Mobs, dead-flesh
+   parts and non-flesh debris. Delete the debris copy. Debris keeps only its
+   scheduling (cursor scan budget, BurnTail) and population-specific inputs
+   supplied through the view (no coat ledger -> no coat, etc.).
+2. ONE derived material-flags builder (self-active ungated vs neighbour-gated
+   `matSelfScaled_`), used by both systems.
+3. Limb sleep (found by W1-F): unburnt limbs on a live creature never reach
+   burn sleep — their burn index stays held and the idle-tick counter keeps
+   resetting. Find why (attribute, don't eliminate: add the reason to the
+   reporter first, CLAUDE.md rule 6), fix, and make mob-burn subtest K's sleep
+   assertion falsifiable (it is currently relative to limbs that also never
+   sleep). Note corpse P1 added `BodyBurnState::idle` / idle verdict for the
+   dead — reuse it for the living if it is the right mechanism.
+Behaviour change expected (debris now gets the full rule set: an oiled/wet
+plank burns like an oiled/wet limb). Verify: mob-burn, corpse-burn, the debris
+burn / tree-fire / forest-fire gates, corpse-sleep, a perf number for the
+forest-fire harness before/after (`--perf forestfire` under
+SANDVOX_RUN_EXCLUSIVE=1, one run each side) since this is a hot path.
+
+### W2-J1 grid stains take part in reactions (owns common.wgsl this wave)
+Bodies treat a coat as matter that reacts (mob.cpp BurnOneLimb: hot coat,
+wet coat blocks hot products + douses, fuel coat flashes, corrosive coat
+eats). The grid ignores its own stains in reactions (`sim_step.wgsl` touches
+stain only in `doStaining`): wet ground burns like dry, oiled ground is not
+flammable.
+1. Read the body coat semantics and write them down ONCE as a rule in
+   DESIGN.md ("a coat is a co-located virtual neighbour: the voxel's pair rules
+   see the coat material as a neighbour, and the coat material's pair rules see
+   the voxel; a rule fired through the coat spends coat amount instead of
+   rewriting the voxel, unless ..."). This spec is what W2-J2 will make the body
+   evaluator match, so make it precise, data-driven (no material names), and
+   expressible from reactions.json + the stain block.
+2. Implement it in the CA (`matOfStainType` gives the stain's material; bodyOnly
+   stains have no ground type bits and stay out). Deterministic, write reach
+   ≤1, subcritical: a burning oil film must be bounded by its stain amount.
+   Mind the stain palette is FULL (memory project-lava-oil-body-coats).
+3. Gate `stain-react`: oil-stained ground next to fire ignites and burns out
+   (bounded); wet (water-stained) flammable ground resists ignition relative to
+   dry; a clean control is unchanged. Check `rain-fire` and `blood-stain` still
+   pass.
+Behaviour change is the point. Watch rule 2: stains are everywhere after rain;
+a rule gated on a stain must not keep chunks awake (memory
+gotcha-light-gated-rules-never-sleep).
+
+W2-J1 DONE (8dda85c): the coat rule is DESIGN.md §6 "A coat is a co-located
+virtual neighbour"; the same section lists BurnOneLimb's six divergences = W2-J2's
+to-do. Found: a cell with a live tick stamp that then sits still is skipped 1
+tick in 7, which can drop the only keep-awake mark in its chunk and let the chunk
+sleep with work left (rule-2 correctness) — fix in W2-R.
+
+W2-G DONE (2a4b68f): `src/phys/damagecause.h` (DamageCause + DamageCtx
+{cause, eaten, severity}), `src/game/severpolicy.h` kCauseRows (cause, eaten,
+tissue) table, gate damage-cause. Rotten tissue = def data `bodyTissue`.
+
+## Wave 2b
+
+### W2-H one damage event, one shell response
+Base: branch `rule-unif-w2` (has W2-G's DamageCause/DamageCtx — build on them,
+do not re-invent). Today only melee has a unified model (StrikeProfile, one
+sweep); every other source rolls its own hp/armour/knockback.
+1. **ShellResponse.** Three copies of the worn-shell hardness read with three
+   curves and three tuning pairs: `CutLimb` (cutHardnessRef/Min), `BluntHit`
+   (bluntHardnessRef/Min), `BiteHit` (biteThroughSoft/Hard) — all read
+   `skinVoxels[0]` instead of the struck voxel. Make ONE
+   `ShellResponse(shellMaterial, DamageCtx/cause) -> {absorbed, passed}` with
+   the per-cause parameters in one table (keep today's numbers per cause so
+   melee is unchanged; reading the STRUCK voxel instead of skinVoxels[0] is an
+   intended fix — report its effect).
+2. **Every source goes through it.** Explosions (`CarveRadialAll`, carve hp =
+   volume x hard-coded `kCarveDamagePerVolume` 1.5 in mob.h — move to tuning),
+   the laser (`session.cpp`, flat `tools.laserDamage`; also drop its redundant
+   `avatar.Damage` + `mobs.Damage` double call), fall damage, spell overcast.
+   An iron cuirass must now resist a grenade the way stone does in
+   `sim_explode.wgsl` (hardness along the ray); body blast damage scales with
+   blast POWER like the terrain model, not radius alone.
+3. **Fall damage is the body's.** `PlayerAvatar::ApplyFallDamage` (avatar.cpp)
+   bills landings only for the player though `Mob` measures `ragdollImpact_`
+   for every creature. Move it to Mob so NPCs take it (blasted NPCs landing
+   hard get hurt); constants (`4.0f + impactMs*0.1f`, 400 droplets, 30 blood
+   voxels, 0.3 leg bleed) to tuning; `name.find("leg")` becomes limb role data;
+   its `ApplyRadialImpulse` gets the living-limb skip list like explosions.
+   `PlayerAvatar::SpendHealth`'s hp-zero "sever any limb" contradicts the
+   hp-kills-in-place policy — route it through Damage with the Fall/Other cause
+   and W2-G's table. `SelfDestruct` severs instead of carving "because there is
+   no CarveLimb" — use `CarveRadial`.
+4. **One knockback path**: blast reach has three knobs
+   (`explosionBodyDamageScale`, `explosionImpulseRadiusScale`,
+   `ragdoll.blastRadiusScale`) + two impulse scales. Consolidate to one reach
+   and one impulse definition consumed by carve, debris impulse and rig launch
+   (keep current effective values).
+5. **(phase 2, only if 1-4 are clean)** Contact damage: the Jolt contact
+   listener feeds only audio (debris.cpp) and vessel breaks (container.cpp).
+   Thrown rocks, falling trees and flung debris never hurt a creature. Add a
+   bounded, tunable contact-damage path producing a Blunt DamageEvent from
+   relative impulse above a threshold, through ShellResponse. Deterministic
+   (contact events in a sorted order). Gate it.
+Also: `kCoverReach = 6.0f` declared twice in melee.cpp — one constant.
+Gates: a new `damage-sources` gate (grenade vs armoured vs unarmoured
+creature; NPC fall damage; laser once not twice), plus the melee/impact/
+armour/wound/blast gates vs a control arm on main's exe.
+
+### W2-M one item instance, one kit
+1. `ItemInstance{name, count, dye, fill, damage}` embedded by every item
+   record: `ItemStack` (item.h, no damage), `CarriedItem` (mob.h, no fill),
+   `WorldItem` (worlditems.h, damage always 0), `WireGear` (mobsync.h),
+   `ItemGrant` + BodyAnnounce item fields (debrissync.h, no fill),
+   `PlayerKit.wornDamage` (equipment.h, keyed by NAME so two tunics share one
+   damage record). Fixes: flask contents lost on network pickup and when a
+   corpse's pack rises; item damage threaded through three structs and never
+   written.
+2. **One kit per creature.** The player's gear lives twice: `PlayerKit` on the
+   session and `Mob::worn_/heldItem_` on the rig, reconciled every tick in
+   session.cpp (wearTried/wearDye latches, CaptureWorn copy-back). NPCs use
+   `carried_` + worn_. Make one `Kit` on Mob (bag/equipment/instances); the
+   rig's worn/held slots are DERIVED from it and hold no separate truth; the
+   session reconcile loop and `avatarKitFn_` go away if they can.
+3. Saves (players/*.svp, MOBS records) and net records carry ItemInstance;
+   bump versions minimally; old saves load.
+Gates: extend the equipment/inventory/save/net gates: two identical tunics
+keep separate damage; a flask keeps its fill through drop -> network pickup ->
+save -> load -> corpse rise; loot panel still works on a dead Mob.
+
+W2-I DONE (c6d53a3): every body burns through MobSystem::BurnOneLimb
+(debris via SetBodyReactor -> BurnLooseBody); src/sim/bodyreact.h
+BuildBodyReactFlags; living limbs sleep (wet/stain passes held the index).
+W2-R DONE (930ef03): substep-0 probe keeps a stamp-aliased matched cell's
+chunk awake; gate stamp-sleep; CA +2.5%.
+
+### W2-J2 body coats follow the coat rule
+Base `rule-unif-w2` (has W2-J1's rule text in DESIGN.md §6 "A coat is a
+co-located virtual neighbour" and W2-I's unified evaluator). `BurnOneLimb`'s
+four hand-written coat sections (hot / wet / fuel / corrosive, each with its
+own RNG index space +96/+128/+160) differ from the rule in six ways, listed in
+that DESIGN section: wet boils at `coat.fireDrySeconds` not water's rule
+chance; a douse costs 4 levels not 1; wet blocks only hot/burn-stage products
+instead of covering; an oil flash spends the whole coat and jumps the voxel to
+its burning form; a hot coat counts as every open face widened to world pitch
+instead of one partner; an acid bite charges a depth-based layer price and
+carries the coat inward.
+1. Replace the four sections with ONE implementation of the §6 rule over the
+   body lattice, shared in spirit (and in code where possible, e.g. a pure
+   C++ `CoatReact` whose GPU twin is W2-J1's `coatReact` — add a
+   check_invariants parity check like `reactgate`).
+2. Where a current body behaviour is load-bearing and the rule can't express
+   it (e.g. acid depth pricing, world-pitch widening for fine-lattice bodies —
+   a body voxel is smaller than a world voxel), EXTEND the rule in DESIGN.md
+   §6 with a data-driven, population-neutral clause that the grid satisfies
+   trivially (pitch = 1), rather than keeping a body-only special case.
+   Justify each clause.
+3. One stain-precedence function: ground (`stainStep`, sim_step/common.wgsl)
+   and body (`bodystain.cpp` RaiseBodyStain/AddBodyStain/CoatBeneath) differ
+   (foreign coat overwritten by any larger amount on bodies; ground never
+   paints over a foreign stain). Make one precedence rule (C++ + WGSL twins +
+   parity check); document where body vs ground legitimately differ (material
+   id vs palette slot).
+4. (report only) `BurnLimbView::Set` zeroes the art colour on every reaction,
+   so cloth/linen/undercloth each needed a cloned burn chain. Make reaction
+   products KEEP the voxel's art/tint slot (like the grid's MATF_TINTED) if it
+   is a contained change; then LIST which cloned material chains could now
+   collapse — do NOT delete materials (content; the owner decides; deleting a
+   material also turns saved instances into air under W1-D's remap).
+Gates: acid-coat, lava-oil-coat, rain-oil, corpse-acid, mob-burn, debris-coat,
+stain-react, blood-stain, rain-fire, a new `coat-parity` fixture that runs the
+same coat scenario on a grid cell and a body voxel (coarse pitch) and asserts
+the same outcome class. Behaviour changes are expected; report them with
+numbers, do not retune to compensate.
+
+### W2-N collision layer derived from role
+A body's Jolt layer (MOVING / AVATAR / PROP / THROWN) is set imperatively at
+~24 sites (`SetBodyAvatarLayer` x6, `SetBodyPropLayer` x4,
+`ReleaseToWorldWhenClear` x9, `DisableCollisionsAmong` x6; mob.cpp, grab.h,
+session.cpp, physics.*). Memory project-held-weapon-prop-layer: "the flag is
+not set once, and every miss is a separate bug" (d960a54; also 4689b1 thrown
+flask). AVATAR exempts a body from EVERY player's capsule, not just its owner's
+(physics.cpp ~62-70) — wrong with two players.
+1. A body role enum (rig limb live / rig limb dead / held prop / worn shell /
+   loose debris / thrown / clearing-release, owner id) stored per body; ONE
+   `ResolveLayer(role, owner)` computes the layer + pair filter; every site
+   sets the ROLE, never the layer.
+2. Owner-scoped exemption: a body exempt from its owner's capsule only (Jolt
+   group filter / object-layer pair filter with owner ids). Gate with two
+   avatars: A's limbs do not shove A, DO collide with B.
+3. `ReleaseToWorldWhenClear` becomes a role transition with the clearing
+   logic in one place.
+Gates: vessel-break, grab/held-prop gates, remote-ghost, two-players, ragdoll,
+player-corpse, a new `layer-roles` gate.
+
+### W2-Q tuning generated from the .def table
+Base: main (e312b51 or newer). Owner decisions 2026-09-24: W2-P (severed-limb
+flesh part) DROPPED; the nine dead render knobs are DELETED here.
+1. Delete `render.skyGradient, skyHorizonOffset, sunDiscPower, sunHaloPower,
+   sunHaloGain, emberBrightness, emberRise, emberRate, emberDensity` from every
+   place (confirm first that nothing in C++/WGSL reads them).
+2. A new knob today needs up to 8 hand edits, 2 generated. Widen
+   `tuning_params.def` rows to carry (group, member, WGSL name or none, type,
+   default, min, max) and GENERATE from them: the `tuning.h` default
+   initializers (no second copy of the default), the plain `LoadTuning`
+   read+clamp for rows with no custom logic, and the tuner schema's
+   `k/min/max` (descriptions/units/steps stay hand-written in
+   `tuner_schema.js`, joined by key; one min/max truth — today e.g.
+   `windDragRef` is max 120 in the schema and 200 in the clamp: pick the clamp's
+   and report every disagreement you resolved). Hand code stays only for real
+   logic (enum gates, derived values) and is marked as such.
+3. Rows that are not WGSL-visible (most `player.*`, `gore.*`, ...) must not end
+   up in the shader prelude — check how `gen_tuning_prelude.py` /
+   `tuning_prelude.py` decide, keep that behaviour. No trailing comments on
+   `.def` rows (the parser chokes). A `.def` change is a prelude-wide shader
+   cache miss — expect one ~9 min compile, once.
+4. Delete the redundant `scripts/tuning_prelude.py` table if it duplicates the
+   `.def` (W1-B1 found the same row in both).
+5. W1-A's `check_invariants.py` "tuning reach" + the `tuning-reach` gate must
+   stay green and should get SIMPLER (most of what they check becomes true by
+   construction).
+Concurrency: W2-H/W2-M may add knobs on `rule-unif-w2` in the old hand style;
+that is fine — the orchestrator converts them at integration. Keep the
+generated and hand-written styles able to coexist.
+Gates: tuning-reach, combat-tuning, determinism (must NOT move: shipped
+values are unchanged), a `--sweep` on one converted `sim.*` row and one
+`render.*` row proving reach.
+
+W2-H DONE (c881f05) — owner chose to keep ALL behaviour changes (armour vs
+blasts/laser/falls, power-scaled blasts, NPC fall damage, contact damage).
+W2-N DONE (3c56f7c) Physics::SetBodyRole/ResolveLayer, owner-scoped OWNED(P).
+W2-M DONE (127396b) ItemInstance everywhere, player Kit on the avatar; NPC
+rig-from-kit DEFERRED to W2-K.
+
+### W2-K one creature list
+Base `rule-unif-w2`. `MobSystem` keeps players in `avatars_` apart from
+`mobs_`; ~99 loops walk `mobs_`, ~8 also walk `avatars_`, ~14 by-id lookups
+repeat `if (!mob) mob = AvatarById(id)`. Every world effect that forgot the
+avatar list is a player-only (or NPC-only) bug (W1-F's explosions were one).
+1. ONE way to reach "every creature": a controller attribute on Mob (Ai /
+   LocalPlayer / RemoteGhost) and one iteration + lookup API
+   (`ForEachCreature`, `FindCreature(id)`) — collapsing the storage into one
+   container is preferred if `PlayerAvatar : Mob` slicing allows it; if not,
+   keep two containers behind the one API and say why.
+2. Audit EVERY `mobs_`/`avatars_` loop and by-id lookup: world/matter effects
+   (burn, stain, wet, rain, blast, carve, contact damage, crowd spacing,
+   BlockedByMob, splatter...) reach all creatures; agency passes (AI,
+   steering, target selection) are gated by the controller, not by which list
+   the creature is in. Produce the audit table (site -> all / controller-gated
+   / list-specific-with-reason) in the report.
+3. Contact damage reaches the player: W2-H's `ApplyContactDamage` never sees
+   player limbs because the contact listener filters the player/owned layers
+   (physics.cpp). Report player limbs to the damage path for contacts with
+   loose bodies WITHOUT changing collision response (W2-N's role/layer
+   table). [pending owner OK — do it; the orchestrator will revert if the
+   owner declines]
+4. (from W2-M) NPC worn/held gear derived from its Kit like the player's
+   (`Mob::DressFromKit`), so loot, corpse gear capture, rising, handoff and
+   load read the kit, not the rig. Keep save/net formats (W2-M already bumped
+   them to ItemInstance).
+Gates: two-players, remote-ghost, blast-players, player-corpse, mob-loot,
+loot, kit-instance, npc-block, damage-sources (+ a player contact-damage arm),
+mob, and a new `creature-reach` gate that applies each world effect once and
+asserts it reached an NPC AND the local avatar.
+
+## Wave 2 (remaining; launched as dependencies land)
+- W2-R stamp-skip sleep hole (above): make "matched but not fired" keep its
+  chunk awake regardless of the substep stamp gate; gate that reproduces the
+  stranded-cell case.
 - W2-G explicit damage cause: replace `inBurnFlush_/inSpawnRot_/inBladeCut_/
   inBluntCarve_/inUnarmedBlunt_/inBite_` + `BladeCutScope` with one cause value
   (promote debris's `DamageCause`) passed through Damage/CarveLimb/Sever; sever
