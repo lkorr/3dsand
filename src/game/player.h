@@ -331,6 +331,10 @@ class Player {
   // happens to be cresting a bump.
   float coyoteTimer = 0.0f;
   float jumpBuffer = 0.0f;
+  // Seconds until a jump press counts again. Every press arms it, used or
+  // not, so mashing space cannot keep the buffer permanently primed — the
+  // one-legged hop was an infinite bunny-hop by spam.
+  float jumpLockout = 0.0f;
 
   // View-smoothing state (voxels): when the BODY snaps vertically by a step
   // (step-up climb or the walk-down ground snap), the negative of that snap is

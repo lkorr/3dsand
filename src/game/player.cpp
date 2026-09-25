@@ -231,6 +231,8 @@ constexpr float kSwimSubmersion = 0.75f;
 // ragged, and a player pressing jump "while running over gravel" is otherwise
 // at the mercy of which frame the press lands on.
 // -> tuning.json player.coyoteTime / player.jumpBufferTime
+// A third window, the re-press lockout, stops a mashed key from abusing the
+// buffer: -> player.jumpRepressTime
 }  // namespace
 
 namespace {
@@ -683,7 +685,14 @@ void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {
   // Timers run every frame regardless of mode so they never go stale in fly.
   if (coyoteTimer > 0.0f) coyoteTimer -= dt;
   if (jumpBuffer > 0.0f) jumpBuffer -= dt;
-  if (in.Pressed(TB_JUMP)) jumpBuffer = T().jumpBufferTime;
+  if (jumpLockout > 0.0f) jumpLockout -= dt;
+  // A press inside the lockout is swallowed and does NOT re-arm it, so a
+  // steady mash still gets one live press per window — just not one per
+  // landing. Held-jump uses (climb, swim-up, wall boost) are untouched.
+  if (in.Pressed(TB_JUMP) && jumpLockout <= 0.0f) {
+    jumpBuffer = T().jumpBufferTime;
+    jumpLockout = T().jumpRepressTime;
+  }
 
   // ---- water-edge mantle: drive the body onto the ledge it committed to ----
   //

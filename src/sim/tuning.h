@@ -109,6 +109,7 @@ struct Tuning {
     float minStepSpeedScale = 0.20f;
     float nonJumpSpeed = 0.5f;
     float coyoteTime = 0.12f, jumpBufferTime = 0.12f;
+    float jumpRepressTime = 0.3f;
     // Accel/damping are per-second rates, converted to a per-frame lerp with
     // 1-exp(-rate*dt) at the call site. The old code lerped by a raw constant
     // every frame (ground 0.35, air 0.06, liquid 0.15, vertical drag 0.92),

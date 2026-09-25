@@ -332,6 +332,7 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     ReadF(*g, "nonJumpSpeed", p.nonJumpSpeed, out, at);
     ReadF(*g, "coyoteTime", p.coyoteTime, out, at);
     ReadF(*g, "jumpBufferTime", p.jumpBufferTime, out, at);
+    ReadF(*g, "jumpRepressTime", p.jumpRepressTime, out, at);
     ReadF(*g, "groundAccel", p.groundAccel, out, at);
     ReadF(*g, "slipCoatStart", p.slipCoatStart, out, at);
     ReadF(*g, "slipCoatFull", p.slipCoatFull, out, at);
