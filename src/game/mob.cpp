@@ -1999,8 +1999,10 @@ void MobSystem::Init(Physics* phys, World* world, DebrisSystem* debris,
   // ONE body-reaction evaluator for every population (W2-I): the debris pass
   // over non-flesh bodies schedules and runs its tail, and evaluates through
   // BurnOneLimb here, as severed flesh already did (BurnDeadFlesh).
-  if (debris_)
-    debris_->SetBodyReactor(
+  // Installed with this system as its owner, and the hook it displaced kept:
+  // ReleaseDebrisHooks hands it back (DebrisSystem::InstallBodyReactor).
+  if (debris_) {
+    DebrisSystem::BodyReactor prev = debris_->InstallBodyReactor(
         [this](DebrisSystem::FleshLattice& f, uint32_t tick, World& w,
                std::vector<CellOp>& ops, uint32_t& frontBudget,
                uint32_t& opsBudget, uint32_t& walkBudget, uint32_t& removed,
@@ -2011,8 +2013,18 @@ void MobSystem::Init(Physics* phys, World* world, DebrisSystem* debris,
         [this](uint32_t tick, bool forgetAll) {
           if (forgetAll) looseBurn_.clear();
           else RetireLooseBurn(tick);
-        });
+        },
+        this);
+    // A re-Init displaces its own hook: keep the one from before it.
+    if (prev.owner != this) prevBodyReactor_ = std::move(prev);
+  }
   OnMaterialsReloaded(mats, reactions);
+}
+
+void MobSystem::ReleaseDebrisHooks() {
+  if (debris_ == nullptr) return;
+  debris_->RestoreBodyReactor(this, std::move(prevBodyReactor_));
+  prevBodyReactor_ = DebrisSystem::BodyReactor{};
 }
 
 void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
@@ -2463,19 +2475,13 @@ bool MobSystem::ServiceRising(size_t ri) {
   // The remains are READ, not remembered. A booking whose corpse is no longer
   // a rig of its own — released to debris by the dead cap or the window, or
   // taken out of the world — has nothing to stand up, and stays down.
-  Mob* src = nullptr;
-  size_t srcIndex = (size_t)-1;
-  for (size_t k = 0; k < mobs_.size(); k++)
-    if (mobs_[k].id_ == r.mobId) {
-      src = &mobs_[k];
-      srcIndex = k;
-      break;
-    }
-  bool avatar = false;
-  if (src == nullptr) {
-    src = AvatarById(r.mobId);
-    avatar = src != nullptr;
-  }
+  // FindCreature (every creature), and then WHICH CONTAINER it is in, because
+  // that is what the teardown below differs by: an entry of mobs_ is erased,
+  // a registered avatar living elsewhere keeps its husk.
+  Mob* src = FindCreature(r.mobId);
+  const bool avatar = src != nullptr && !InMobList(src);
+  const size_t srcIndex =
+      src != nullptr && !avatar ? (size_t)(src - mobs_.data()) : (size_t)-1;
   if (src == nullptr || src->alive_ || src->rigReleased_ ||
       src->def_ == nullptr || src->LimbBodyCount() == 0) {
     consume();
@@ -2599,12 +2605,12 @@ bool MobSystem::ServiceRising(size_t ri) {
   //                     the rig); clearing it is what stops DressFromKit
   //                     re-dressing the respawned body from the slot.
   if (avatar || src->playerCorpse_) {
-    Mob* holder = avatar ? src : nullptr;
-    for (size_t a = 0; holder == nullptr && a < localAvatars_ &&
-                       a < avatars_.size();
-         a++)
-      if (avatars_[a] != nullptr && avatars_[a]->owner_ == src->owner_)
-        holder = avatars_[a];
+    // The kit is the LOCAL player's who owned this body (a peer's kit is on
+    // the peer's machine): picked by controller + owner, not by list index.
+    Mob* holder = avatar ? src : FirstCreature([&](const Mob& m) {
+      return m.controller_ == Mob::Controller::LocalPlayer &&
+             m.owner_ == src->owner_;
+    });
     if (holder != nullptr) {
       const bool keep = CurrentTuning().avatar.keepKitOnTurn;
       auto take = [&](ItemStack& s) {
@@ -2885,6 +2891,8 @@ uint64_t MobSystem::AdoptDeadAvatar(Mob& av) {
   av.kit_ = std::move(corpse.kit_);
   corpse.kit_ = Kit{};
   corpse.id_ = cidNew;
+  // Nobody drives the dead: the body is the world's (Mob::Controller).
+  corpse.controller_ = Mob::Controller::Ai;
   corpse.defIndex_ = di;
   corpse.def_ = &defs_[di];
   corpse.playerCorpse_ = true;
@@ -3297,10 +3305,12 @@ int Mob::DressFromKit(const ItemLibrary& lib) {
     memo.stale = false;
     memo.name = wantName;
     memo.dye = wantDye;
+    // The RIG half only: the kit is already what it should be (it is what
+    // this loop is reading), so the kit-writing WearItem is not the call.
     if (wantName.empty()) {
-      UnwearItem(s);
-    } else if (!WearItem(want, s, st.damage.Empty() ? nullptr : &st.damage,
-                         wantDye)) {
+      UnwearFromRig(s);
+    } else if (!WearOnRig(want, s, st.damage.Empty() ? nullptr : &st.damage,
+                          wantDye)) {
       refused++;
     }
   }
@@ -3402,7 +3412,9 @@ GoreProfile Mob::MakeGoreProfile(uint64_t mobId) {
 void MobSystem::RefreshGoreProfiles() {
   // Same id -> same draw, so a mob keeps its identity across a reload unless
   // the variance settings themselves changed.
-  for (Mob& mob : mobs_) mob.gore_ = Mob::MakeGoreProfile(mob.id_);
+  // Every creature (W2-K): the player's body took its profile at Spawn only,
+  // so an F5 that moved the gore variance left the player on the old draw.
+  ForEachCreature([](Mob& mob) { mob.gore_ = Mob::MakeGoreProfile(mob.id_); });
 }
 
 Mob* MobSystem::FindMobById(uint64_t id) {
@@ -6326,15 +6338,20 @@ Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
   // cheaper than one ground probe, and it sleeps to nothing the moment bodies
   // are apart. Not worth a spatial index at this bound, and a grid here would
   // be a second source of truth about where creatures are.
-  for (const Mob& other : mobs_) {
-    if (&other == &self) continue;
-    if (!other.alive_ || other.def_ == nullptr) continue;
+  //
+  // EVERY CREATURE, THE PLAYERS INCLUDED (W2-K): a player's body is a body in
+  // the crowd, and an NPC that walked through it was the list-shaped bug this
+  // package removes. The avatars add at most kMaxPlayerProxies more entries.
+  // An unspawned avatar (no limbs) is not standing anywhere.
+  ForEachCreature([&](const Mob& other) {
+    if (&other == &self) return;
+    if (!other.alive_ || other.def_ == nullptr || other.limbs_.empty()) return;
     // A limp body is lying down and is not part of a crowd — it is scenery,
     // and the walk drive steps over prone things rather than round them.
-    if (other.ragdoll_ != Mob::RagdollPhase::None) continue;
+    if (other.ragdoll_ != Mob::RagdollPhase::None) return;
     const MobDef& od = *other.def_;
     const float want = (rSelf + BodyRadius(od)) * lo.spacingMul;
-    if (want <= 0.0f) continue;
+    if (want <= 0.0f) return;
     const Vec3 cOther = BodyCentre(other, od);
     float dx = cSelf.x - cOther.x, dz = cSelf.z - cOther.z;
     // HEIGHT IS A SEPARATOR TOO. Two creatures on floors ten voxels apart are
@@ -6344,9 +6361,9 @@ Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
     // ignore a staircase and strict enough to separate storeys, and it scales
     // with the creature instead of being a constant that rots when the voxel
     // size moves.
-    if (std::abs(cSelf.y - cOther.y) > selfDef.worldSize.y * 0.5f) continue;
+    if (std::abs(cSelf.y - cOther.y) > selfDef.worldSize.y * 0.5f) return;
     const float d2 = dx * dx + dz * dz;
-    if (d2 >= want * want) continue;
+    if (d2 >= want * want) return;
     float len = std::sqrt(d2);
     if (len < 1e-4f) {
       // EXACTLY CO-LOCATED, which a normalize would turn into a NaN and a
@@ -6368,7 +6385,7 @@ Vec3 MobSystem::CrowdPush(const Mob& self, const MobDef& selfDef) const {
     const float w = (want - len) / want;
     push.x += (dx / len) * w;
     push.z += (dz / len) * w;
-  }
+  });
   // The SUM is uncapped (three neighbours push three times as hard) but the
   // result is not: a body surrounded on all sides would otherwise be asked for
   // several times its own walk speed and would jitter.
@@ -6413,13 +6430,15 @@ bool MobSystem::BlockedByMob(const Mob& self, const MobDef& def, float cx,
   if (lo.spacingMul <= 0.0f) return false;
   const float rSelf = BodyRadius(def);
   const Vec3 cNow = BodyCentre(self, def);
-  for (const Mob& other : mobs_) {
-    if (&other == &self) continue;
-    if (!other.alive_ || other.def_ == nullptr) continue;
-    if (other.ragdoll_ != Mob::RagdollPhase::None) continue;
+  // Every creature (CrowdPush's note): a player's body is a body.
+  return FirstCreature([&](const Mob& other) -> bool {
+    if (&other == &self) return false;
+    if (!other.alive_ || other.def_ == nullptr || other.limbs_.empty())
+      return false;
+    if (other.ragdoll_ != Mob::RagdollPhase::None) return false;
     const MobDef& od = *other.def_;
     const Vec3 cOther = BodyCentre(other, od);
-    if (std::abs(cNow.y - cOther.y) > def.worldSize.y * 0.5f) continue;
+    if (std::abs(cNow.y - cOther.y) > def.worldSize.y * 0.5f) return false;
     // THE HARD FLOOR IS THE BODIES TOUCHING, not the spacing radius. Spacing is
     // a preference the push expresses; this is the geometry. Blocking at the
     // full spacing radius would fence creatures apart at arm's length and stop
@@ -6427,16 +6446,15 @@ bool MobSystem::BlockedByMob(const Mob& self, const MobDef& def, float cx,
     const float minSep = rSelf + BodyRadius(od);
     const float ndx = cx - cOther.x, ndz = cz - cOther.z;
     const float nd2 = ndx * ndx + ndz * ndz;
-    if (nd2 >= minSep * minSep) continue;          // no overlap there
+    if (nd2 >= minSep * minSep) return false;          // no overlap there
     const float odx = cNow.x - cOther.x, odz = cNow.z - cOther.z;
     // ALWAYS ALLOW A MOVE THAT SEPARATES. Without this an overlap is a TRAP:
     // two bodies that start inside each other (spawned on one column, shoved
     // together by terrain, teleported) would find every move refused and weld
     // themselves in place forever. This makes overlap self-correcting instead.
-    if (nd2 > odx * odx + odz * odz) continue;
+    if (nd2 > odx * odx + odz * odz) return false;
     return true;
-  }
-  return false;
+  }) != nullptr;
 }
 
 void MobSystem::DriveLocomotion(Mob& mob, const MobDef& def,
@@ -7389,8 +7407,11 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // stops being a target by not being here.
   actors_.clear();
   for (const ai::Actor& pa : playerActors_) actors_.push_back(pa);
+  // The AI's own creatures: the players are in the list above, as ACTORS
+  // (their ids live in the player-actor band), so a body a player drives is
+  // skipped here by its controller rather than by which container holds it.
   for (const Mob& m : mobs_) {
-    if (!m.alive_ || m.def_ == nullptr) continue;
+    if (!m.alive_ || m.def_ == nullptr || m.PlayerControlled()) continue;
     const ai::Profile* pr = behaviors_.At(m.ai_.profile);
     ai::Actor a;
     a.id = m.id_;
@@ -7576,6 +7597,16 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // a body nobody simulates is exactly the idle cost rule 2 forbids.
     if (mob.IsGhost()) {
       mob.TickGhost(dt);
+      mi++;
+      continue;
+    }
+    // THIS LOOP IS THE Ai DRIVER (Mob::Controller). A body a player drives is
+    // stepped by its own session (PlayerAvatar::PreTick) and never by this
+    // system's sense/intent/steer/drive, whichever container it sits in. No
+    // entry of mobs_ is player-driven today (SetAvatars leaves a borrowed NPC
+    // Ai, AdoptDeadAvatar hands the dead to the world as Ai); this is the rule
+    // written where it applies, not a branch that currently fires.
+    if (mob.PlayerControlled()) {
       mi++;
       continue;
     }
@@ -8245,25 +8276,22 @@ void Mob::AppendLiveLimbBodies(std::vector<uint64_t>& out) const {
 }
 
 void MobSystem::AppendLiveLimbBodies(std::vector<uint64_t>& out) const {
-  for (const Mob& m : mobs_) {
+  // Every creature, ghosts included (mob.h ForEachCreature).
+  ForEachCreature([&](const Mob& m) {
     // A CORPSE IS STILL A RIG (PLAN_corpse_is_a_mob.md). This list is what the
     // explosion's per-body impulse skips, and that impulse on a dead Mob's
     // 0.3 kg hand is the same "bodies zoom across the map" it is on a limp
     // living one: the dead take the one capped rig launch instead
     // (BlastMobsRadial). A released rig's limbs are DebrisSystem's and are
-    // not listed.
+    // not listed; neither are an avatar husk's (AdoptDeadAvatar left it
+    // rigReleased_) or an unspawned avatar's (no limbs).
     if (!m.alive_ && !m.rigReleased_) {
       for (const MobLimb& l : m.limbs_)
         if (l.body && l.holdSeconds <= 0) out.push_back(l.body);
-      continue;
+      return;
     }
     m.AppendLiveLimbBodies(out);
-  }
-  // Then every avatar, ghosts included (mob.h). An unspawned avatar has no
-  // limbs (PlayerAvatar::Despawn clears them), which is its Spawned() test.
-  // A dead one's rig is in mobs_ by now (AdoptDeadAvatar) and listed above.
-  for (const Mob* av : avatars_)
-    if (av && !av->limbs_.empty()) av->AppendLiveLimbBodies(out);
+  });
 }
 
 void Mob::SetLimbVelocities(Vec3 velVoxPerSec) {
@@ -8713,27 +8741,32 @@ void Mob::TickGetUp(float dt) {
 
 int MobSystem::BlastMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                float impulseKgMs) {
+  // Every creature this machine may LAUNCH: the NPCs, the dead (a corpse is a
+  // limp rig and takes the same one launch, Mob::BlastRadial, never the
+  // per-body impulse, AppendLiveLimbBodies) and the local players. A peer's
+  // ghost is carved (CarveMobsRadial) but never launched — its position is
+  // the wire's (mob.h). ForEachCreature's order: NPCs, then local avatars.
   int n = 0;
-  // The dead too: a corpse is a limp rig and takes the same one launch
-  // (Mob::BlastRadial), never the per-body impulse (AppendLiveLimbBodies).
-  for (Mob& mob : mobs_)
-    if (!mob.rigReleased_ &&
-        mob.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
+  ForEachCreature([&](Mob& m) {
+    if (m.controller_ == Mob::Controller::RemoteGhost) return;
+    if (!m.rigReleased_ && !m.limbs_.empty() &&
+        m.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
       n++;
-  // The LOCAL avatars after the NPCs (mob.h: never a ghost's).
-  return n + BlastLocalAvatarsRadial(centerWorldVoxel, radiusVoxels,
-                                     impulseKgMs);
+  });
+  return n;
 }
 
 int MobSystem::BlastLocalAvatarsRadial(Vec3 centerWorldVoxel,
                                        float radiusVoxels, float impulseKgMs) {
+  // A PEER's blast on this machine (session.cpp ExplosionHitsBodies,
+  // OwnAvatars): the same rule as above, on this process's players only.
   int n = 0;
-  for (size_t i = 0; i < localAvatars_ && i < avatars_.size(); i++) {
-    Mob* av = avatars_[i];
-    if (av && av->alive_ && !av->limbs_.empty() &&
-        av->BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
+  ForEachCreature([&](Mob& m) {
+    if (m.controller_ != Mob::Controller::LocalPlayer) return;
+    if (!m.rigReleased_ && !m.limbs_.empty() &&
+        m.BlastRadial(centerWorldVoxel, radiusVoxels, impulseKgMs))
       n++;
-  }
+  });
   return n;
 }
 
@@ -8757,13 +8790,13 @@ int MobSystem::RagdollAll(float minSeconds) {
 }
 
 int MobSystem::RagdollPhaseOf(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return (int)mob.ragdoll_;
   return -1;
 }
 
 Vec3 MobSystem::MobRootPos(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.RootWorldPos();
   return {};
 }
@@ -9510,12 +9543,12 @@ void Mob::ApplyBurnCap() {
 }
 
 float MobSystem::TotalHp(uint64_t mobId) const {
-  for (const Mob& m : mobs_)
+  for (const Mob& m : CreatureWithId(mobId))
     if (m.id_ == mobId) return m.TotalHp();
   return -1.0f;
 }
 float MobSystem::LimbHp(uint64_t mobId, int limbIndex) const {
-  for (const Mob& m : mobs_)
+  for (const Mob& m : CreatureWithId(mobId))
     if (m.id_ == mobId) return m.LimbHpAt(limbIndex);
   return -1.0f;
 }
@@ -9612,8 +9645,7 @@ uint32_t MobSystem::LimbVoxelsNearWorld(uint64_t mobId, int limbIndex, Vec3 p,
 uint32_t MobSystem::RewriteLimbMaterial(uint64_t mobId, int limbIndex,
                                         uint32_t fromMat, uint32_t toMat,
                                         uint32_t maxCount) {
-  Mob* m = FindMobById(mobId);
-  if (!m) m = AvatarById(mobId);
+  Mob* m = FindCreature(mobId);
   if (!m || limbIndex < 0 || limbIndex >= (int)m->limbs_.size()) return 0;
   MobLimb& l = m->limbs_[limbIndex];
   if (!l.body) return 0;
@@ -9680,7 +9712,7 @@ const char* MobSystem::DeathCause(uint64_t mobId) const {
   return m ? m->DeathCause() : "";
 }
 uint32_t MobSystem::LimbSurfaceAtSpawn(uint64_t mobId, int limbIndex) const {
-  for (const Mob& m : mobs_)
+  for (const Mob& m : CreatureWithId(mobId))
     if (m.id_ == mobId)
       return limbIndex >= 0 && limbIndex < (int)m.limbs_.size()
                  ? m.limbs_[limbIndex].surfaceAtSpawn
@@ -9688,17 +9720,17 @@ uint32_t MobSystem::LimbSurfaceAtSpawn(uint64_t mobId, int limbIndex) const {
   return 0u;
 }
 float MobSystem::BloodLost(uint64_t mobId) const {
-  for (const Mob& m : mobs_)
+  for (const Mob& m : CreatureWithId(mobId))
     if (m.id_ == mobId) return m.BloodLost();
   return -1.0f;
 }
 float MobSystem::BurnFraction(uint64_t mobId) const {
-  for (const Mob& m : mobs_)
+  for (const Mob& m : CreatureWithId(mobId))
     if (m.id_ == mobId) return m.BurnFraction();
   return -1.0f;
 }
 float MobSystem::BurnHealthCap(uint64_t mobId) const {
-  for (const Mob& m : mobs_)
+  for (const Mob& m : CreatureWithId(mobId))
     if (m.id_ == mobId) return m.BurnHealthCap();
   return -1.0f;
 }
@@ -9816,21 +9848,12 @@ void MobSystem::PostStep() {
 // because the frame loop already asks the avatar first at its own call sites.
 bool MobSystem::FindLimb(uint64_t bodyHandle, uint64_t& mobId,
                          int& limbIndex) const {
-  for (const Mob& mob : mobs_)
-    for (size_t i = 0; i < mob.limbs_.size(); i++)
-      if (mob.limbs_[i].body == bodyHandle) {
-        mobId = mob.id_;
-        limbIndex = (int)i;
-        return true;
-      }
-  for (Mob* av : avatars_)
-    for (size_t i = 0; i < av->limbs_.size(); i++)
-      if (av->limbs_[i].body == bodyHandle) {
-        mobId = av->id_;
-        limbIndex = (int)i;
-        return true;
-      }
-  return false;
+  int li = -1;
+  const Mob* m = const_cast<MobSystem*>(this)->FindOwner(bodyHandle, &li);
+  if (m == nullptr) return false;
+  mobId = m->id_;
+  limbIndex = li;
+  return true;
 }
 
 Mob* MobSystem::FindOwner(uint64_t bodyHandle, int* outLimbIndex) {
@@ -9842,19 +9865,14 @@ Mob* MobSystem::FindOwner(uint64_t bodyHandle, int* outLimbIndex) {
       }
     return false;
   };
-  for (Mob& mob : mobs_)
-    if (scan(mob)) return &mob;
-  for (Mob* av : avatars_)
-    if (scan(*av)) return av;
+  if (Mob* m = FirstCreature(scan)) return m;
   if (outLimbIndex) *outLimbIndex = -1;
   return nullptr;
 }
 
 const NpcStroke* MobSystem::MobStroke(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
-    if (mob.id_ == mobId) return &mob.stroke_;
-  if (const Mob* av = AvatarById(mobId)) return &av->stroke_;
-  return nullptr;
+  const Mob* m = FindCreature(mobId);
+  return m ? &m->stroke_ : nullptr;
 }
 
 namespace {
@@ -9919,8 +9937,7 @@ bool MobSystem::FindParry(const Mob& wielder, const Vec3& aPrev,
       }
     }
   };
-  for (Mob& m : mobs_) test(m);
-  for (Mob* av : avatars_) test(*av);
+  ForEachCreature(test);
   return outBlocker != nullptr && outBody != 0;
 }
 
@@ -9934,8 +9951,11 @@ void MobSystem::PushBlockEvent(const BlockEvent& ev, const MeleeTuning& t) {
   // of the same fight beat the same guard the same way. Only the SIGN comes
   // from the hash — the size is the authored knob times the blow's power, so a
   // light tap moves nothing and a committed cut moves the full amount.
-  Mob* def = FindMobById(ev.blockerId);
-  if (def == nullptr) return;   // the player's own MeleeState is main.cpp's
+  // The guard is an NPC stroke's: a player's blocking arm is its own
+  // MeleeState (session.cpp), driven by input, so it is gated by WHO DRIVES
+  // the body (Mob::Controller), not by which list it is in.
+  Mob* def = FindCreature(ev.blockerId);
+  if (def == nullptr || def->PlayerControlled()) return;
   const uint32_t h = rng::Hash3((uint32_t)ev.blockerId ^ 0xB10Cu,
                                 (uint32_t)ev.attackerId, 0);
   const float sx = (h & 1u) ? 1.0f : -1.0f;
@@ -9946,13 +9966,9 @@ void MobSystem::PushBlockEvent(const BlockEvent& ev, const MeleeTuning& t) {
 
 bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
                        float impactSpeed, const DamageCtx& ctx) {
-  for (Mob& mob : mobs_)
-    if (mob.Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed, ctx))
-      return true;
-  for (Mob* av : avatars_)
-    if (av->Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed, ctx))
-      return true;
-  return false;
+  return FirstCreature([&](Mob& m) {
+           return m.Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed, ctx);
+         }) != nullptr;
 }
 
 bool MobSystem::LaserHit(uint64_t bodyHandle, Vec3 hitWorldVoxel,
@@ -9981,6 +9997,35 @@ bool MobSystem::LaserHit(uint64_t bodyHandle, Vec3 hitWorldVoxel,
   return true;
 }
 
+int Mob::ContactLimbNear(Vec3 worldVoxel) const {
+  if (!phys_) return -1;
+  int best = -1;
+  float bestD2 = 0.0f;
+  for (int i = 0; i < baseLimbs_ && i < (int)limbs_.size(); i++) {
+    const MobLimb& l = limbs_[i];
+    if (!l.body) continue;
+    BodyTransform xf{};
+    if (!phys_->GetTransform(l.body, xf)) continue;
+    // The collider's centre: `size` is in collider units (CarveRadialAll).
+    const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(l));
+    const Vec3 half{(float)l.size.x * 0.5f * inv, (float)l.size.y * 0.5f * inv,
+                    (float)l.size.z * 0.5f * inv};
+    const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+    const Vec3 d = xf.pos + Rotate(q, half) - worldVoxel;
+    const float d2 = d.dot(d);
+    if (best < 0 || d2 < bestD2) {
+      best = i;
+      bestD2 = d2;
+    }
+  }
+  if (best < 0) return -1;
+  // The outermost shell over it takes the blow first (appended in wear
+  // order, so the last one strapped to this limb is the top layer).
+  for (int s = (int)limbs_.size() - 1; s >= baseLimbs_; s--)
+    if (limbs_[s].body && limbs_[s].wornHost == best) return s;
+  return best;
+}
+
 int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
                                   std::vector<ParticleSpawn>& spawns) {
   const Tuning::Gore& gt = CurrentTuning().gore;
@@ -9989,18 +10034,38 @@ int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
     uint64_t limb, other;
     Vec3 at;
     float impulse;
+    bool viaCapsule;
   };
   std::vector<Hit> hits;
-  for (const Physics::ContactImpact& ci : phys.ContactImpacts()) {
+  // BOTH REPORTS (W2-K): the loose-vs-loose list an NPC's limbs are on, and
+  // the list a PLAYER's limbs and capsule are on (their OWNED/EXEMPT/PLAYER
+  // layers keep them out of the first, for the mixer's sake). Every creature
+  // is struck by the one rule below; the sort makes the union order-free.
+  auto scan = [&](const Physics::ContactImpact& ci) {
     for (int side = 0; side < 2; side++) {
-      const uint64_t limbBody = side ? ci.bodyB : ci.bodyA;
+      // `hitBody` is what the listener saw touch: a limb, or a player capsule.
+      const uint64_t hitBody = side ? ci.bodyB : ci.bodyA;
       const uint64_t other = side ? ci.bodyA : ci.bodyB;
       // Terrain is the landing's business (Mob::ApplyFallDamage), and a
       // contact with no creature on it is nobody's.
-      if (limbBody == 0 || other == 0) continue;
+      if (hitBody == 0 || other == 0) continue;
       int li = -1;
-      Mob* m = FindOwner(limbBody, &li);
-      if (m == nullptr || li < 0 || !m->alive_ || m->IsGhost()) continue;
+      Mob* m = FindOwner(hitBody, &li);
+      uint64_t limbBody = hitBody;
+      if (m == nullptr) {
+        // A PLAYER'S CAPSULE (W2-K). It encloses the torso, so a rock thrown
+        // at a player meets it before any limb: the blow lands on that
+        // player's body where the capsule was struck — the outermost thing
+        // there (Mob::ContactLimbNear: a worn shell over the nearest limb).
+        m = FirstCreature([&](const Mob& c) {
+          return c.PlayerControlled() && c.CollisionOwner() == hitBody;
+        });
+        if (m == nullptr) continue;
+        li = m->ContactLimbNear(ci.posVoxel);
+        if (li < 0) continue;
+        limbBody = m->limbs_[li].body;
+      }
+      if (li < 0 || !m->alive_ || m->IsGhost()) continue;
       // Creature against creature (a ragdoll's own limbs, a held weapon, two
       // bodies in a scrum) is melee's and the ragdoll's, not a thrown thing.
       if (FindOwner(other) != nullptr) continue;
@@ -10019,18 +10084,23 @@ int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
       // on it at walking pace, and that is the creature kicking the log, not
       // the log striking the creature. So the limb's own velocity toward the
       // other body is taken back out (`normal` points bodyA -> bodyB).
+      // (The velocity of what was TOUCHED: a capsule walked into a log is the
+      // player kicking it, exactly as a limb is.)
       float strike = ci.speedVoxPerSec;
       Vec3 lv{}, la{};
-      if (phys.GetBodyVelocities(limbBody, lv, la)) {
+      if (phys.GetBodyVelocities(hitBody, lv, la)) {
         const Vec3 toOther = side == 0 ? ci.normal : ci.normal * -1.0f;
         strike -= std::max(0.0f, lv.dot(toOther));
       }
       if (strike <= 0.0f) continue;
       const float impulse = mu * strike * kVoxelMeters;
       if (impulse <= gt.contactImpulseMin) continue;
-      hits.push_back({limbBody, other, ci.posVoxel, impulse});
+      hits.push_back({limbBody, other, ci.posVoxel, impulse,
+                      limbBody != hitBody});
     }
-  }
+  };
+  for (const Physics::ContactImpact& ci : phys.ContactImpacts()) scan(ci);
+  for (const Physics::ContactImpact& ci : phys.OwnedBodyImpacts()) scan(ci);
   if (hits.empty()) return 0;
   // A FIXED ORDER, because the listener's is Jolt's job threads': hardest
   // first, then by handle, so the cap takes the same contacts every replay.
@@ -10039,6 +10109,22 @@ int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
     if (a.limb != b.limb) return a.limb < b.limb;
     return a.other < b.other;
   });
+  // A CAPSULE READING IS NOT A SECOND BLOW: a rock that touched a player's
+  // capsule AND the limb the capsule resolves to, in one step, is one blow
+  // (the harder reading, sorted first). Only capsule-derived entries are
+  // dropped, so a limb-on-limb report is billed exactly as it always was.
+  {
+    std::vector<Hit> uniq;
+    for (const Hit& h : hits) {
+      bool dup = false;
+      for (const Hit& u : uniq)
+        if (u.limb == h.limb && u.other == h.other &&
+            (u.viaCapsule || h.viaCapsule))
+          dup = true;
+      if (!dup) uniq.push_back(h);
+    }
+    hits.swap(uniq);
+  }
   const size_t cap =
       std::min(hits.size(), (size_t)std::max(0, gt.contactMaxPerTick));
   int billed = 0;
@@ -11098,15 +11184,14 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
 
 bool MobSystem::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
                         std::vector<ParticleSpawn>& spawns, float severity) {
-  for (Mob& mob : mobs_)
-    if (mob.CutLimb(bodyHandle, cut, world, spawns, severity)) return true;
-  // AND THE PLAYER BLEEDS TOO. Without this line an NPC's sweep found the
-  // avatar's arm, failed to recognise it as live flesh, and fell through to
+  // AND THE PLAYER BLEEDS TOO (every creature, ForEachCreature's order).
+  // Without the avatar in this walk an NPC's sweep found the avatar's arm,
+  // failed to recognise it as live flesh, and fell through to
   // DebrisSystem::MeltBodyAt — the player was hittable only in the sense that
   // their limbs quietly evaporated with no wound, no stain and no sever.
-  for (Mob* av : avatars_)
-    if (av->CutLimb(bodyHandle, cut, world, spawns, severity)) return true;
-  return false;
+  return FirstCreature([&](Mob& m) {
+           return m.CutLimb(bodyHandle, cut, world, spawns, severity);
+         }) != nullptr;
 }
 
 bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
@@ -12013,13 +12098,13 @@ int Mob::RestoreBody(uint32_t material, int count) {
 }
 
 int MobSystem::RestoreMob(uint64_t mobId, uint32_t material, int count) {
-  for (Mob& m : mobs_)
+  for (Mob& m : CreatureWithId(mobId))
     if (m.Id() == mobId) return m.RestoreBody(material, count);
   return 0;
 }
 
 uint32_t MobSystem::MissingVoxelCount(uint64_t mobId, int limbIndex) const {
-  for (const Mob& m : mobs_)
+  for (const Mob& m : CreatureWithId(mobId))
     if (m.Id() == mobId) return m.MissingVoxelCount(limbIndex);
   return 0;
 }
@@ -13244,7 +13329,7 @@ uint32_t MobSystem::IgniteOneLimb(BurnLimbView& v, uint32_t count,
 
 uint32_t MobSystem::IgniteLimb(uint64_t mobId, int limbIndex, uint32_t count,
                                uint32_t onlyMat) {
-  Mob* mob = FindMobById(mobId);
+  Mob* mob = FindCreature(mobId);
   return mob ? mob->Ignite(limbIndex, count, onlyMat) : 0;
 }
 
@@ -15963,7 +16048,7 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
 // ---- joint-twin test hooks (the `joint-twins` gate) -------------------------
 
 uint32_t MobSystem::JointTwinCount(uint64_t mobId) {
-  Mob* m = FindMobById(mobId);
+  Mob* m = FindCreature(mobId);
   if (!m) return 0;
   if (!m->twinsBuilt_) m->BuildJointTwins();
   uint32_t n = 0;
@@ -15973,7 +16058,7 @@ uint32_t MobSystem::JointTwinCount(uint64_t mobId) {
 
 bool MobSystem::JointTwinAt(uint64_t mobId, uint32_t k, int& limbA, int& limbB,
                             IVec3& rest) {
-  Mob* m = FindMobById(mobId);
+  Mob* m = FindCreature(mobId);
   if (!m) return false;
   if (!m->twinsBuilt_) m->BuildJointTwins();
   for (const JointTwinPair& tp : m->twins_) {
@@ -16004,7 +16089,7 @@ int LimbCellIndex(MobLimb& l, const BurnLimbView& v, uint32_t scale,
 
 bool MobSystem::LimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t& mat,
                            uint16_t& stain) {
-  Mob* m = FindMobById(mobId);
+  Mob* m = FindCreature(mobId);
   if (!m || limb < 0 || limb >= (int)m->limbs_.size()) return false;
   MobLimb& l = m->limbs_[limb];
   BurnLimbView v = m->ViewOf(l);
@@ -16017,7 +16102,7 @@ bool MobSystem::LimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t& mat,
 
 std::string MobSystem::LimbCoatResidue(uint64_t mobId, int limb,
                                        uint32_t coatMat) {
-  Mob* m = FindMobById(mobId);
+  Mob* m = FindCreature(mobId);
   if (!m || limb < 0 || limb >= (int)m->limbs_.size()) return "";
   MobLimb& l = m->limbs_[limb];
   BurnLimbView v = m->ViewOf(l);
@@ -16060,7 +16145,7 @@ std::string MobSystem::LimbCoatResidue(uint64_t mobId, int limb,
 
 bool MobSystem::SetLimbCellAt(uint64_t mobId, int limb, IVec3 rest,
                               uint32_t mat, uint16_t stain) {
-  Mob* m = FindMobById(mobId);
+  Mob* m = FindCreature(mobId);
   if (!m || limb < 0 || limb >= (int)m->limbs_.size()) return false;
   MobLimb& l = m->limbs_[limb];
   BurnLimbView v = m->ViewOf(l);
@@ -18061,15 +18146,10 @@ bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                                 World& world,
                                 std::vector<ParticleSpawn>& spawns,
                                 const DamageCtx& ctx) {
-  for (Mob& mob : mobs_)
-    if (mob.CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels, ragged,
-                            eject, world, spawns, ctx))
-      return true;
-  for (Mob* av : avatars_)
-    if (av->CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels, ragged,
-                            eject, world, spawns, ctx))
-      return true;
-  return false;
+  return FirstCreature([&](Mob& m) {
+           return m.CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels,
+                                    ragged, eject, world, spawns, ctx);
+         }) != nullptr;
 }
 
 bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
@@ -18391,24 +18471,20 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
 
 bool MobSystem::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit,
                          World& world, std::vector<ParticleSpawn>& spawns) {
-  for (Mob& mob : mobs_)
-    if (mob.BluntHit(bodyHandle, hit, world, spawns)) return true;
-  // ...AND THE PLAYER IS BRUISED TOO. Same line, same reason, as the one at
-  // the top of MobSystem::CutLimb: the avatar is a Mob that does not live in
-  // `mobs_`, and a handle-keyed entry point that forgot it would let an NPC's
-  // mace pass through the player and melt their arm as debris instead.
-  for (Mob* av : avatars_)
-    if (av->BluntHit(bodyHandle, hit, world, spawns)) return true;
-  return false;
+  // ...AND THE PLAYER IS BRUISED TOO. Same walk, same reason, as
+  // MobSystem::CutLimb: a handle-keyed entry point that forgot the avatar
+  // would let an NPC's mace pass through the player and melt their arm as
+  // debris instead.
+  return FirstCreature([&](Mob& m) {
+           return m.BluntHit(bodyHandle, hit, world, spawns);
+         }) != nullptr;
 }
 
 bool MobSystem::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
                         std::vector<ParticleSpawn>& spawns) {
-  for (Mob& mob : mobs_)
-    if (mob.BiteHit(bodyHandle, hit, world, spawns)) return true;
-  for (Mob* av : avatars_)
-    if (av->BiteHit(bodyHandle, hit, world, spawns)) return true;
-  return false;
+  return FirstCreature([&](Mob& m) {
+           return m.BiteHit(bodyHandle, hit, world, spawns);
+         }) != nullptr;
 }
 
 uint32_t MobSystem::MaterialIdNamed(const std::string& name) const {
@@ -19396,30 +19472,29 @@ void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                 World& world,
                                 std::vector<ParticleSpawn>& spawns,
                                 float power) {
-  for (Mob& mob : mobs_)
-    mob.CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns, power);
-  // Then every avatar, ghosts included (mob.h). The empty-limb test is
-  // PlayerAvatar::CarveRadial's Spawned() guard.
-  CarveLocalAvatarsRadial(centerWorldVoxel, radiusVoxels, world, spawns, power);
-  // A ghost's gore goes to the discard (mob.h): its owner authors it.
+  // Every creature, a peer's ghost player included (mob.h ForEachCreature):
+  // the blast craters its body here too. A ghost PLAYER's gore goes to the
+  // discard (mob.h): its owner authors it. An unspawned avatar has no limbs,
+  // which is PlayerAvatar::CarveRadial's Spawned() guard.
   ghostSpawns_.clear();
-  for (size_t i = localAvatars_; i < avatars_.size(); i++) {
-    Mob* av = avatars_[i];
-    if (av && !av->limbs_.empty())
-      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, ghostSpawns_,
-                         power);
-  }
+  ForEachCreature([&](Mob& m) {
+    if (m.limbs_.empty()) return;
+    m.CarveRadialAll(centerWorldVoxel, radiusVoxels, world,
+                     m.controller_ == Mob::Controller::RemoteGhost
+                         ? ghostSpawns_
+                         : spawns,
+                     power);
+  });
 }
 
 void MobSystem::CarveLocalAvatarsRadial(Vec3 centerWorldVoxel,
                                         float radiusVoxels, World& world,
                                         std::vector<ParticleSpawn>& spawns,
                                         float power) {
-  for (size_t i = 0; i < localAvatars_ && i < avatars_.size(); i++) {
-    Mob* av = avatars_[i];
-    if (av && !av->limbs_.empty())
-      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns, power);
-  }
+  ForEachCreature([&](Mob& m) {
+    if (m.controller_ == Mob::Controller::LocalPlayer && !m.limbs_.empty())
+      m.CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns, power);
+  });
 }
 
 void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
@@ -19457,7 +19532,7 @@ void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
 }
 
 void MobSystem::Sever(uint64_t mobId, int limbIndex) {
-  Mob* mob = FindMobById(mobId);
+  Mob* mob = FindCreature(mobId);
   if (mob) mob->Sever(limbIndex);
 }
 
@@ -20395,9 +20470,10 @@ bool Mob::Lootable() const {
   // while the owner's corpse still wore it. Loot over the network was never
   // supported for corpses, and this keeps that limit rather than opening a
   // duplication path. A PlayerCorpse() is refused for the reason the avatar
-  // is: its kit stays on the avatar and re-dresses the respawned rig.
+  // is: its kit stays on the avatar and re-dresses the respawned rig. "Is a
+  // player's body" is the controller (W2-K), not registration in a list.
   return !alive_ && !rigReleased_ && !playerCorpse_ && sys_ != nullptr &&
-         !sys_->IsAvatar(this) && !AvatarLayer() && !IsGhost();
+         !PlayerControlled() && !IsGhost();
 }
 
 void Mob::LootPieces(std::vector<LootPiece>& out) const {
@@ -20667,12 +20743,13 @@ void Mob::DecayHitFlash(float dt) {
 
 void MobSystem::FlashBody(uint64_t bodyHandle, float amount) {
   if (!bodyHandle || amount <= 0.0f) return;
-  for (Mob& mob : mobs_)
-    for (MobLimb& limb : mob.limbs_)
-      if (limb.body == bodyHandle) {
-        limb.hitFlash = std::max(limb.hitFlash, amount);
-        return;
-      }
+  // Every creature: a player's limb flashes as an NPC's does (its own
+  // PlayerAvatar::Update ages it, Mob::DecayHitFlash).
+  int li = -1;
+  if (Mob* m = FindOwner(bodyHandle, &li); m != nullptr && li >= 0) {
+    MobLimb& limb = m->limbs_[li];
+    limb.hitFlash = std::max(limb.hitFlash, amount);
+  }
 }
 
 uint32_t MobSystem::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
@@ -20748,27 +20825,27 @@ void Mob::AppendMicroHolders(std::vector<MicroHolder>& out) const {
 }
 
 uint64_t MobSystem::LimbBody(uint64_t mobId, int limbIndex) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId && limbIndex >= 0 && limbIndex < (int)mob.limbs_.size())
       return mob.limbs_[limbIndex].body;
   return 0;
 }
 
 bool MobSystem::IsAlive(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.alive_;
   return false;
 }
 
 
 Vec3 MobSystem::MobOrigin(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.origin_;
   return {};
 }
 
 bool MobSystem::MobBodyBox(uint64_t mobId, Vec3& lo, Vec3& hi) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId) continue;
     // `origin_` is the prefab MIN CORNER in x/z and the feet in y, which is
     // exactly how BodyCentre reads it.
@@ -20793,49 +20870,49 @@ Vec3 MobSystem::MobFacing(uint64_t mobId) const {
   // Mob::Facing holds the formula; this is only the id-keyed lookup in front of
   // it. Two copies of "which way is forward" is exactly the sort of thing that
   // rots when the rotation convention moves.
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.Facing();
   return {0, 0, 1};
 }
 
 float MobSystem::MobHeading(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.heading_;
   return 0;
 }
 
 float MobSystem::MobBodyY(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.bodyY_;
   return 0;
 }
 
 Vec3 MobSystem::MobBodyUp(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.bodyUp_;
   return {0, 1, 0};
 }
 
 int MobSystem::MobStepUpCells(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.StepUpCells();
   return 1;
 }
 
 float MobSystem::MobTiltMaxDeg(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.skel_.loco.tiltMaxDeg;
   return 0;
 }
 
 float MobSystem::MobDesiredHeading(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.desiredHeading_;
   return 0;
 }
 
 float MobSystem::MobTurnVel(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.turnVel_;
   return 0;
 }
@@ -20862,7 +20939,7 @@ void MobSystem::SetDesiredHeading(uint64_t mobId, float radians) {
 }
 
 int MobSystem::SwingingFeet(uint64_t mobId) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId) continue;
     int n = 0;
     for (const FootState& f : mob.anim_.feet) n += (f.valid && f.swinging) ? 1 : 0;
@@ -20872,7 +20949,7 @@ int MobSystem::SwingingFeet(uint64_t mobId) const {
 }
 
 int MobSystem::PlantedFeet(uint64_t mobId) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId) continue;
     int n = 0;
     for (const FootState& f : mob.anim_.feet) n += (f.valid && !f.swinging) ? 1 : 0;
@@ -20882,7 +20959,7 @@ int MobSystem::PlantedFeet(uint64_t mobId) const {
 }
 
 int MobSystem::ActiveClips(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return (int)mob.anim_.clips.size();
   return -1;
 }
@@ -20899,7 +20976,7 @@ bool MobSystem::PlayClip(uint64_t mobId, const std::string& name) {
 }
 
 int MobSystem::LocoState(uint64_t mobId) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId) return mob.anim_.locoState;
   return -1;
 }
@@ -20919,7 +20996,7 @@ std::vector<std::pair<std::string, float>> MobSystem::ClipWeights(
 }
 
 Vec3 MobSystem::LimbLocalUp(uint64_t mobId, int limbIndex) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId) continue;
     if (limbIndex < 0 || limbIndex >= (int)mob.anim_.local.size()) break;
     return QuatRotate(mob.anim_.local[limbIndex].rot, {0, 1, 0});
@@ -20928,7 +21005,7 @@ Vec3 MobSystem::LimbLocalUp(uint64_t mobId, int limbIndex) const {
 }
 
 Vec3 MobSystem::LimbModelUp(uint64_t mobId, int limbIndex) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId) continue;
     if (limbIndex < 0 || limbIndex >= (int)mob.anim_.model.size()) break;
     return QuatRotate(mob.anim_.model[limbIndex].rot, {0, 1, 0});
@@ -20937,14 +21014,14 @@ Vec3 MobSystem::LimbModelUp(uint64_t mobId, int limbIndex) const {
 }
 
 uint32_t MobSystem::LimbVoxelCount(uint64_t mobId, int limbIndex) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId && limbIndex >= 0 && limbIndex < (int)mob.limbs_.size())
       return (uint32_t)mob.limbs_[limbIndex].voxels.size();
   return 0;
 }
 
 uint32_t MobSystem::LimbSkinVoxelCount(uint64_t mobId, int limbIndex) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId && limbIndex >= 0 &&
         limbIndex < (int)mob.limbs_.size()) {
       const MobLimb& L = mob.limbs_[limbIndex];
@@ -20956,7 +21033,7 @@ uint32_t MobSystem::LimbSkinVoxelCount(uint64_t mobId, int limbIndex) const {
 
 uint32_t MobSystem::LimbOpenFaceCount(uint64_t mobId, int limbIndex,
                                       int minOpen) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId || limbIndex < 0 ||
         limbIndex >= (int)mob.limbs_.size())
       continue;
@@ -20994,7 +21071,7 @@ uint32_t MobSystem::LimbOpenFaceCount(uint64_t mobId, int limbIndex,
 }
 
 uint32_t MobSystem::LimbBurningCount(uint64_t mobId, int limbIndex) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId && limbIndex >= 0 && limbIndex < (int)mob.limbs_.size())
       // hotVox, NOT front.size(): the front is every self-reacting voxel, and
       // drying blood and crumbling char are on it (see BodyBurnState::hotVox).
@@ -21005,7 +21082,7 @@ uint32_t MobSystem::LimbBurningCount(uint64_t mobId, int limbIndex) const {
 MobSystem::LimbBurnProbe MobSystem::LimbBurnStateOf(uint64_t mobId,
                                                     int limbIndex) const {
   LimbBurnProbe p;
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId && limbIndex >= 0 &&
         limbIndex < (int)mob.limbs_.size()) {
       const MobLimb& l = mob.limbs_[limbIndex];
@@ -21046,7 +21123,7 @@ MobSystem::LimbBurnProbe MobSystem::LimbBurnStateOf(uint64_t mobId,
 
 uint32_t MobSystem::LimbMaterialCount(uint64_t mobId, int limbIndex,
                                       uint32_t mat) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId || limbIndex < 0 || limbIndex >= (int)mob.limbs_.size())
       continue;
     const MobLimb& l = mob.limbs_[limbIndex];
@@ -21070,10 +21147,7 @@ uint32_t MobSystem::LimbStainCount(uint64_t mobId, int limbIndex,
 
 uint32_t MobSystem::LimbStainedMatCount(uint64_t mobId, int limbIndex,
                                         uint32_t mat, uint32_t minAmt) const {
-  const Mob* mob = nullptr;
-  for (const Mob& m : mobs_)
-    if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob) mob = AvatarById(mobId);
+  const Mob* mob = FindCreature(mobId);
   if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
   const MobLimb& l = mob->limbs_[limbIndex];
   const bool any = mat == 0xFFFFFFFFu;
@@ -21096,10 +21170,7 @@ uint32_t MobSystem::LimbExposedMatCount(uint64_t mobId, int limbIndex,
                                         uint32_t mat, uint32_t coatMat,
                                         uint32_t* coated) const {
   if (coated) *coated = 0;
-  const Mob* mob = nullptr;
-  for (const Mob& m : mobs_)
-    if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob) mob = AvatarById(mobId);
+  const Mob* mob = FindCreature(mobId);
   if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
   const MobLimb& l = mob->limbs_[limbIndex];
   auto key = [](int x, int y, int z) {
@@ -21130,10 +21201,7 @@ uint32_t MobSystem::LimbExposedMatCount(uint64_t mobId, int limbIndex,
 }
 
 uint32_t MobSystem::LimbInfectBoneCoated(uint64_t mobId, int limbIndex) const {
-  const Mob* mob = nullptr;
-  for (const Mob& m : mobs_)
-    if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob) mob = AvatarById(mobId);
+  const Mob* mob = FindCreature(mobId);
   if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
   return mob->limbs_[limbIndex].infectBoneCoated;
 }
@@ -21154,10 +21222,7 @@ uint32_t MobSystem::LimbInfectBoneCoated(uint64_t mobId, int limbIndex) const {
 // the change.
 uint32_t MobSystem::LimbCoatMatCount(uint64_t mobId, int limbIndex,
                                      uint32_t coatMat, uint32_t minAmt) const {
-  const Mob* mob = nullptr;
-  for (const Mob& m : mobs_)
-    if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob) mob = AvatarById(mobId);
+  const Mob* mob = FindCreature(mobId);
   if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
   const MobLimb& l = mob->limbs_[limbIndex];
   const bool any = coatMat == 0xFFFFFFFFu;
@@ -21178,10 +21243,7 @@ uint32_t MobSystem::LimbCoatMatCount(uint64_t mobId, int limbIndex,
 }
 
 uint64_t MobSystem::CoatDigest(uint64_t mobId, uint64_t* sumAmt) const {
-  const Mob* mob = nullptr;
-  for (const Mob& m : mobs_)
-    if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob) mob = AvatarById(mobId);
+  const Mob* mob = FindCreature(mobId);
   uint64_t h = 1469598103934665603ull, sum = 0;
   auto mix = [&h](uint64_t x) {
     h ^= x;
@@ -21210,7 +21272,7 @@ uint64_t MobSystem::CoatDigest(uint64_t mobId, uint64_t* sumAmt) const {
 
 uint8_t MobSystem::ShadowStainTick(uint64_t mobId, uint32_t tick,
                                    World& world) {
-  for (Mob& m : mobs_)
+  for (Mob& m : CreatureWithId(mobId))
     if (m.id_ == mobId) {
       uint32_t budget = kStainLatticePerTick, rain = kRainLatticePerTick;
       m.StainTick(tick, world, budget, rain);
@@ -21221,7 +21283,7 @@ uint8_t MobSystem::ShadowStainTick(uint64_t mobId, uint32_t tick,
 
 const char* MobSystem::DeadAwakeCriterionOf(uint64_t mobId,
                                             bool passiveDrySleeps) const {
-  for (const Mob& m : mobs_)
+  for (const Mob& m : CreatureWithId(mobId))
     if (m.id_ == mobId) return m.DeadAwakeCriterion(passiveDrySleeps);
   return nullptr;
 }
@@ -21238,10 +21300,7 @@ uint32_t MobSystem::StainTypeOf(uint32_t mat) const {
 // `mobs_` (see SetAvatar), and a query that forgot it would answer 0 for the
 // one creature the HUD is about.
 const Mob* MobSystem::FindMob(uint64_t mobId) const {
-  for (const Mob& m : mobs_)
-    if (m.id_ == mobId) return &m;
-  if (const Mob* av = AvatarById(mobId)) return av;
-  return nullptr;
+  return FindCreature(mobId);   // W2-K: the one lookup (mob.h)
 }
 
 const LimbCoat* MobSystem::LimbCoatOf(uint64_t mobId, int limb) const {
@@ -21288,27 +21347,19 @@ float MobSystem::CoatTagFraction(uint64_t mobId, const char* tag,
 
 bool MobSystem::DepositCoatOn(uint64_t mobId, uint32_t mat, IVec3 groundCell,
                               uint32_t tick) {
-  for (Mob& m : mobs_)
-    if (m.id_ == mobId) return m.DepositCoat(mat, groundCell, tick);
-  if (Mob* av = AvatarById(mobId)) return av->DepositCoat(mat, groundCell, tick);
-  return false;
+  Mob* m = FindCreature(mobId);
+  return m ? m->DepositCoat(mat, groundCell, tick) : false;
 }
 
 uint32_t MobSystem::ShedCoatOn(uint64_t mobId, int footLimb, Vec3 footPosVox,
                                uint32_t tick, World& world) {
-  for (Mob& m : mobs_)
-    if (m.id_ == mobId) return m.ShedCoat(footLimb, footPosVox, tick, world);
-  if (Mob* av = AvatarById(mobId))
-    return av->ShedCoat(footLimb, footPosVox, tick, world);
-  return 0;
+  Mob* m = FindCreature(mobId);
+  return m ? m->ShedCoat(footLimb, footPosVox, tick, world) : 0;
 }
 
 uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
                              uint32_t amount, uint32_t tick) {
-  Mob* mob = nullptr;
-  for (Mob& m : mobs_)
-    if (m.id_ == mobId) mob = &m;
-  if (!mob) mob = AvatarById(mobId);
+  Mob* mob = FindCreature(mobId);
   if (!mob || !mob->def_ || mat == 0) return 0;
   if (limb < 0 || limb >= (int)mob->limbs_.size()) return 0;
   MobLimb& l = mob->limbs_[limb];
@@ -21376,10 +21427,7 @@ uint32_t MobSystem::DouseLimb(uint64_t mobId, int limb, uint32_t mat,
                               uint32_t amount, uint32_t tick, uint32_t* marked) {
   const uint32_t n = SoakLimb(mobId, limb, mat, amount, tick);
   if (marked) *marked = n;
-  Mob* mob = nullptr;
-  for (Mob& m : mobs_)
-    if (m.id_ == mobId) mob = &m;
-  if (!mob) mob = AvatarById(mobId);
+  Mob* mob = FindCreature(mobId);
   if (!mob || limb < 0 || limb >= (int)mob->limbs_.size()) return 0;
   return CoatEffectsOn(*mob, limb, mat);
 }
@@ -21408,10 +21456,7 @@ uint32_t MobSystem::CoatEffectsOn(Mob& mob, int limb, uint32_t mat) {
 MobSystem::BodyRayHit MobSystem::PickBody(uint64_t mobId, Vec3 ro, Vec3 rd,
                                           float maxT) {
   BodyRayHit out;
-  Mob* mob = nullptr;
-  for (Mob& m : mobs_)
-    if (m.id_ == mobId) mob = &m;
-  if (!mob) mob = AvatarById(mobId);
+  Mob* mob = FindCreature(mobId);
   if (!mob || !mob->def_) return out;
   rd = rd.normalized();
   if (rd.len() < 0.5f) return out;
@@ -21468,10 +21513,7 @@ uint32_t MobSystem::PourOnBody(uint64_t mobId, const BodyRayHit& hit, Vec3 rd,
   if (marked) *marked = 0;
   if (drawn) *drawn = 0;
   if (!hit.hit || mat == 0 || amount == 0 || radius <= 0.0f) return 0;
-  Mob* mob = nullptr;
-  for (Mob& m : mobs_)
-    if (m.id_ == mobId) mob = &m;
-  if (!mob) mob = AvatarById(mobId);
+  Mob* mob = FindCreature(mobId);
   if (!mob || !mob->def_) return 0;
   mob->WakeDead();
   rd = rd.normalized();
@@ -21576,12 +21618,7 @@ uint32_t MobSystem::PourOnBody(uint64_t mobId, const BodyRayHit& hit, Vec3 rd,
 }
 
 void MobSystem::RecountCoatOn(uint64_t mobId, uint32_t tick) {
-  for (Mob& m : mobs_)
-    if (m.id_ == mobId) {
-      m.RecountCoat(tick, /*force=*/true);
-      return;
-    }
-  if (Mob* av = AvatarById(mobId)) av->RecountCoat(tick, /*force=*/true);
+  if (Mob* m = FindCreature(mobId)) m->RecountCoat(tick, /*force=*/true);
 }
 
 void MobSystem::QueueSplatter(const SplatterEvent& e) {
@@ -21606,10 +21643,7 @@ float MobSystem::LimbStainMaxWorldY(uint64_t mobId, int limbIndex,
 
 bool MobSystem::LimbStainWorldYRange(uint64_t mobId, int limbIndex,
                                      uint32_t minAmt, float& lo, float& hi) const {
-  const Mob* mob = nullptr;
-  for (const Mob& m : mobs_)
-    if (m.id_ == mobId) { mob = &m; break; }
-  if (!mob) mob = AvatarById(mobId);
+  const Mob* mob = FindCreature(mobId);
   if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return false;
   const MobLimb& l = mob->limbs_[limbIndex];
   const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
@@ -21640,7 +21674,7 @@ bool MobSystem::LimbStainWorldYRange(uint64_t mobId, int limbIndex,
 std::vector<PrefabVoxel> MobSystem::LimbLattice(uint64_t mobId,
                                                 int limbIndex) const {
   std::vector<PrefabVoxel> out;
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId || limbIndex < 0 || limbIndex >= (int)mob.limbs_.size())
       continue;
     const MobLimb& l = mob.limbs_[limbIndex];
@@ -21655,22 +21689,24 @@ std::vector<PrefabVoxel> MobSystem::LimbLattice(uint64_t mobId,
 }
 
 uint32_t MobSystem::LimbVoxelsAtSpawn(uint64_t mobId, int limbIndex) const {
-  for (const Mob& mob : mobs_)
+  for (const Mob& mob : CreatureWithId(mobId))
     if (mob.id_ == mobId && limbIndex >= 0 && limbIndex < (int)mob.limbs_.size())
       return mob.limbs_[limbIndex].voxelsAtSpawn;
   return 0;
 }
 
 Vec3 MobSystem::LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId) continue;
     if (limbIndex < 0 || limbIndex >= (int)mob.limbs_.size()) break;
     const MobLimb& limb = mob.limbs_[limbIndex];
     if (limb.voxels.empty()) return limb.xf.pos;
     const DebrisVoxel& v = limb.voxels[n % (uint32_t)limb.voxels.size()];
     // Reading limb.voxels, which are COLLIDER units.
+    // def_, not defs_[defIndex_]: a player's def need not be one of this
+    // system's (CreatureWithId reaches avatars). The same def for an NPC.
     const float inv =
-        1.0f / (float)std::max(1u, defs_[mob.defIndex_].physScale);
+        1.0f / (float)std::max(1u, mob.def_ ? mob.def_->physScale : 1u);
     Vec3 c{((float)v.x + 0.5f) * inv, ((float)v.y + 0.5f) * inv,
            ((float)v.z + 0.5f) * inv};
     Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
@@ -21680,7 +21716,7 @@ Vec3 MobSystem::LimbVoxelPos(uint64_t mobId, int limbIndex, uint32_t n) const {
 }
 
 Vec3 MobSystem::LimbAnchorPos(uint64_t mobId, int limbIndex) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId) continue;
     if (limbIndex < 0 || limbIndex >= (int)mob.limbs_.size()) break;
     const MobLimb& limb = mob.limbs_[limbIndex];
@@ -21701,7 +21737,7 @@ Vec3 MobSystem::LimbAnchorPos(uint64_t mobId, int limbIndex) const {
 }
 
 uint32_t MobSystem::LimbArtVoxelCount(uint64_t mobId, int limbIndex) const {
-  for (const Mob& mob : mobs_) {
+  for (const Mob& mob : CreatureWithId(mobId)) {
     if (mob.id_ != mobId || limbIndex < 0 ||
         limbIndex >= (int)mob.limbs_.size())
       continue;
@@ -24062,8 +24098,42 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
   return slot;
 }
 
+// THE KIT'S WAY ON AND OFF (mob.h WearItem). The rig half is WearOnRig; this
+// keeps the kit's equipment slot saying what the rig now wears, and the
+// DressFromKit memo saying it was asked for, so a later DressFromKit (the
+// player's per-tick one) sees nothing to do.
 bool Mob::WearItem(const ItemDef* item, int equipSlot,
                    const WornDamage* damage, uint32_t dye) {
+  const bool ok = WearOnRig(item, equipSlot, damage, dye);
+  if (!EquipSlotIsWorn(equipSlot)) return ok;   // not a kit slot: rig only
+  ItemStack& st = kit_.equip.slots[equipSlot];
+  KitDressMemo& memo = kitDressed_[equipSlot];
+  if (ok) {
+    st = ItemStack{};
+    st.name = item->name;
+    st.count = 1;
+    st.dye = dye;
+    if (damage != nullptr && !damage->Empty()) st.damage = *damage;
+    memo = KitDressMemo{st.name, dye, false};
+  } else if (WornItem(equipSlot).empty()) {
+    // Refused, and the slot is bare on the rig: the kit must not claim it.
+    st = ItemStack{};
+    memo = KitDressMemo{};
+  }
+  return ok;
+}
+
+bool Mob::UnwearItem(int equipSlot) {
+  const bool had = UnwearFromRig(equipSlot);
+  if (EquipSlotIsWorn(equipSlot)) {
+    kit_.equip.slots[equipSlot] = ItemStack{};
+    kitDressed_[equipSlot] = KitDressMemo{};
+  }
+  return had;
+}
+
+bool Mob::WearOnRig(const ItemDef* item, int equipSlot,
+                    const WornDamage* damage, uint32_t dye) {
   if (!def_ || !phys_ || !item) return false;
   if (limbs_.empty()) return false;   // unspawned: nothing to put it on
   if (item->cover.empty()) return false;
@@ -24071,7 +24141,7 @@ bool Mob::WearItem(const ItemDef* item, int equipSlot,
   // Take off whatever was in this slot first, always — including on a
   // re-wear, so swapping a hood for a helm goes through one path rather than a
   // "replace in place" variant that would duplicate the teardown.
-  UnwearItem(equipSlot);
+  UnwearFromRig(equipSlot);
 
   WornPiece piece;
   piece.equipSlot = equipSlot;
@@ -24112,7 +24182,7 @@ bool Mob::WearItem(const ItemDef* item, int equipSlot,
   return true;
 }
 
-bool Mob::UnwearItem(int equipSlot) {
+bool Mob::UnwearFromRig(int equipSlot) {
   for (size_t w = 0; w < worn_.size(); w++) {
     if (worn_[w].equipSlot != equipSlot) continue;
     // The slots of one piece are contiguous ONLY when nothing was appended

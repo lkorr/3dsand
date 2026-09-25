@@ -131,7 +131,12 @@ class PlayerAvatar : public Mob {
   // NOT the ACTOR id — that is ai::kPlayerActorId + index, a different space
   // (see ai_behavior.h). This one is a MOB id, the key MobSystem::AvatarById
   // and every handle-keyed lookup use.
-  explicit PlayerAvatar(uint64_t id = 0x5A11EDU) { id_ = id; }
+  // A player's body is driven by a player from birth (Mob::Controller);
+  // MobSystem::SetAvatars re-stamps a peer's as RemoteGhost.
+  explicit PlayerAvatar(uint64_t id = 0x5A11EDU) {
+    id_ = id;
+    controller_ = Controller::LocalPlayer;
+  }
 
   // `mobs` is the shared-services system (Mob::sys_): the def list, the one
   // compiled reaction table, the micro brick pool and the event sinks. The

@@ -624,6 +624,10 @@ const char* const kOrder[] = {
     // and regenerates worldgen on the way in and out, and pins the mob id
     // counter (IdCounterScope) so it perturbs nothing after it.
     "damage-sources",
+    // W2-K's one creature list. The same self-contained shape (resets mobs +
+    // debris, regenerates worldgen both ways, IdCounterScope), and it unhooks
+    // its avatar and removes its proxy before it returns.
+    "creature-reach",
     // ...and the dressed one, last in the group for the reason the AI gates
     // give. Same self-contained shape again — resets mobs + debris and
     // regenerates worldgen on the way in and the way out — but it also WEARS

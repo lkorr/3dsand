@@ -8666,6 +8666,78 @@ debris for the network). All of that is gone.
   `SplatterDeadFlesh` over `ForEachDeadFlesh`, the living limb passes through
   `FleshView`.
 
+### One creature list (2026-09-24, rule-unification W2-K; `MobSystem::ForEachCreature` / `FindCreature`, `Mob::Controller`, gate `creature-reach`)
+
+**Every creature is a Mob, and one API reaches all of them.** The players'
+bodies (`PlayerAvatar : Mob`) are registered with `MobSystem::SetAvatars` but
+live in their `PlayerSession`/`RemotePlayer`, not in `mobs_`, and every world
+effect written as `for (Mob& m : mobs_)` was an NPC-only effect by accident
+(W1-F's explosions were one; `IgniteLimb`/`Sever`/`TotalHp`/~40 id-keyed
+queries by player id answered "nobody"; an NPC walked through the player's
+body; a thrown rock never hurt the player). The rule now:
+
+- **World and matter effects** reach every creature through
+  `ForEachCreature(f)` / `FirstCreature(pred)` (handle-keyed entry points:
+  Damage, CutLimb, BluntHit, BiteHit, CarveLimbRadial, FindOwner, FindParry,
+  AppendLiveLimbBodies, CarveMobsRadial, BlastMobsRadial, CrowdPush,
+  BlockedByMob, FlashBody, ApplyContactDamage) and `FindCreature(id)` /
+  `CreatureWithId(id)` (every id-keyed read and poke: coats, stains, soak,
+  douse, pour, ignite, sever, joint twins, lattice probes, hp, burn state).
+  Order is the NPC list then the registered avatars, which is the order the
+  hand-written two-list loops used. `FindMobById` stays the NPC-LIST lookup
+  (id allocation probes, save/net apply, fixtures).
+- **Agency passes are gated by the controller, not by the list.**
+  `Mob::Controller { Ai, LocalPlayer, RemoteGhost }`: Ai by default,
+  LocalPlayer from `PlayerAvatar`'s constructor, RemoteGhost from
+  `SetAvatars`' ghost range / `SetAvatarOwner`; a player's corpse is handed to
+  the world as Ai (`AdoptDeadAvatar`). The Ai driver in `PreTick` (intent,
+  steer, drive, stroke), the AI actor list and the block nudge skip a
+  player-controlled body; the blast LAUNCH skips a RemoteGhost (its position
+  is the wire's) and a RemoteGhost's carve gore goes to the discard; "is a
+  player's body" in `Lootable` is the controller. A different axis from
+  `IsGhost()` (which machine steps it): a peer-owned NPC is Ai and a ghost.
+- **List-specific on purpose:** spawn/evict/rising teardown/save/net
+  (`mobs_` IS the NPC record set; the avatar saves as 'AVTR' and syncs as a
+  RemotePlayer), the render appends (the avatar draws through its own
+  instances), `AdoptDeadAvatar`'s walk of `avatars_` (it pushes into `mobs_`),
+  `FindCombatantById` (the player-actor band indexes registration order), and
+  the burn/stain/rain PASSES, which run on the avatar from
+  `PlayerAvatar::BurnParts` through the same `Mob::BurnTick`/`StainTick` with
+  its own budget so a burning crowd cannot starve the body the camera is on.
+
+**Why two containers behind one API, not one container.** `mobs_` is a
+`std::vector<Mob>` by value (swap-with-back erase, reallocation, and the
+deliberate slice-move of `AdoptDeadAvatar`); a `PlayerAvatar` is a subclass
+with its own state and vtable owned by its session. One container means
+pointer storage and re-typing ~150 sites and the ownership of every avatar,
+and would move the op order of every NPC pass, for no behaviour. The storage
+stays split and nothing outside `ForEachCreature`/`FindCreature` may care; an
+avatar that IS an entry of `mobs_` (a fixture borrowing an NPC for the seat) is
+visited once.
+
+**Contact damage reaches the player.** The contact listener drops every
+contact on a player's own layers (OWNED/EXEMPT limbs, the PLAYER capsule) so
+your footsteps never reach the mixer. Those contacts against a LOOSE body
+(MOVING/THROWN) now go to their own list, `Physics::OwnedBodyImpacts()`, read
+only by `ApplyContactDamage`; the audio/vessel list and the collision response
+are unchanged. A hit on the capsule — which encloses the torso and is what a
+thrown rock mostly meets — lands on the body at the contact point
+(`Mob::ContactLimbNear`: the nearest limb, or the outermost shell strapped to
+it), with the capsule's own velocity taken out as a limb's is; a capsule
+reading and a limb reading of one rock in one step are one blow. Gate
+`damage-sources` G.
+
+**A worn piece goes through the kit for every creature** (W2-M's deferred
+half). `Mob::WearItem`/`UnwearItem` are kit writes — the equipment slot is set
+and the rig realised (`WearOnRig`/`UnwearFromRig` are the rig half, what
+`DressFromKit` calls) — so a spawn wave, a rising, a handoff, a load, a loot
+take and the dev menu leave an NPC's kit saying what it wears. The readers
+(`LootPieces`, `CaptureGear`, the rising's gear walk) still walk the rig: the
+live damage is in the shells, a player's corpse wears pieces whose kit went
+back to the avatar, and the MOBS/wire gear order is rig-slot order. The HELD
+item is not a kit slot for anyone (the player's is the hotbar selection,
+re-equipped every tick; an NPC's is `EquipItem`).
+
 ### A creature knocked down gets back up: the live ragdoll (2026-09-09; `Mob::StartRagdoll`, `sim/tuning.h` Ragdoll)
 
 Until now the only ragdoll was death. `Mob::Die` flips every limb dynamic and
@@ -9058,6 +9130,12 @@ overlap". They did, and nothing in the locomotion pipeline had an opinion about
 it — "walk at the target" is exactly what each of them was told and the target
 is one point, so convergence is the correct answer to the question they were
 each asked. The missing constraint is that the other bodies exist.
+
+**The other bodies include the players' (W2-K).** `CrowdPush` and
+`BlockedByMob` walk `ForEachCreature`, so an NPC gives the player's body room
+and may not step into it, exactly as for another NPC; an unspawned avatar (no
+limbs) stands nowhere. Before, both walked `mobs_` and an NPC closing on the
+player walked into the body.
 
 **Separation is a DRIVE, never a heading.** This is the whole design decision.
 Folding a repulsion vector into `desiredHeading_` is the textbook boids answer
@@ -9684,7 +9762,9 @@ sample point plus the blade's own half-thickness.
 sweep melted the player's limbs as debris instead of wounding them.
 `MobSystem::SetAvatar` registers it, and `FindLimb`/`FindOwner`/`Damage`/
 `CutLimb`/`CarveLimbRadial` consult it **after** the mob list — every existing
-caller that already checked the avatar first is bit-identical. Death was then
+caller that already checked the avatar first is bit-identical. (Since W2-K
+every creature-wide walk and lookup is `ForEachCreature`/`FindCreature`, "One
+creature list".) Death was then
 what it already was: the parts were handed to `DebrisSystem` and the corpse
 settled like any other debris. (Since 2026-09-24 the player's corpse is a dead
 Mob, `MobSystem::AdoptDeadAvatar` -- "Corpses are Mobs".)
@@ -14770,10 +14850,9 @@ rising reads the avatar's kit directly (`avatarKitFn_` is gone;
 it. An NPC's pack is its kit's bag (`Mob::Carried`, `AddCarried`), so a looted
 or risen flask keeps its fill.
 
-**Not yet (deferred):** an NPC's worn and held gear is still dressed directly
-(`WearItem`/`EquipItem` from its loadout, a rising, a handoff, a load) and read
-live off the rig (`LootPieces`, `CaptureGear`) — its kit holds only its pack.
-A held item knocked from the player's hand goes to the ground without its fill
+**Since W2-K** an NPC's worn gear goes through its kit too (`WearItem` is a
+kit write for every creature; "One creature list"); the readers still walk the
+rig, and the held item is rig state for everyone. A held item knocked from the player's hand goes to the ground without its fill
 (the shed hook does not know which hotbar slot filled the hand). Gate
 `kit-instance` (identical robes, per-instance damage through dress / swap /
 recolour / take-off); `player-kit`, `item-ground`, `mob-loot`, `debris-ghost`

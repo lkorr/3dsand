@@ -306,9 +306,18 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
 
   std::mutex mu;
   std::vector<ContactImpact> impacts;
+  // A PLAYER's body (OWNED / EXEMPT layer) met by a LOOSE body (MOVING,
+  // THROWN) — Physics::OwnedBodyImpacts. Its own list, so the audio and vessel
+  // consumers of `impacts` see exactly what they saw before (W2-K), and its
+  // own cap for the reason `impacts` has one.
+  static constexpr size_t kMaxBodyPerStep = 32;
+  std::vector<ContactImpact> bodyImpacts;
   float minSpeedVox = 0.0f;  // latched by Step; read-only during Update
 
-  ContactImpls() { impacts.reserve(kMaxPerStep); }
+  ContactImpls() {
+    impacts.reserve(kMaxPerStep);
+    bodyImpacts.reserve(kMaxBodyPerStep);
+  }
 
   // ---- WHAT THE NARROW PHASE DID THIS STEP, for the watchdog line ---------
   // A slow Update used to report only "N active bodies", which cannot tell a
@@ -346,10 +355,24 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
     // exist precisely to split a player's limbs out of contact handling, and
     // a player proxy is teleported onto its player every tick so its contacts
     // are an artifact of that, not of anything landing.
+    //
+    // ...BUT A LOOSE BODY HITTING IT IS A BLOW (W2-K). A thrown rock or a
+    // falling log meeting a player's limb — or the player's CAPSULE, which
+    // encloses the torso and is what a rock thrown at a player mostly meets —
+    // goes to its OWN list (`bodyImpacts`), which only
+    // MobSystem::ApplyContactDamage reads. The audio and vessel-break
+    // consumers of `impacts` are unchanged, and so is the collision response
+    // (this only REPORTS a contact the pair filter already allowed). Player
+    // side vs player side (a body in its own capsule, two players) or vs the
+    // terrain (a landing: fall damage) is still dropped.
     const JPH::ObjectLayer l1 = b1.GetObjectLayer(), l2 = b2.GetObjectLayer();
-    for (JPH::ObjectLayer l : {l1, l2})
-      if (l == Layers::EXEMPT || Layers::IsOwned(l) || Layers::IsPlayer(l))
-        return;
+    const bool own1 = l1 == Layers::EXEMPT || Layers::IsOwned(l1) ||
+                      Layers::IsPlayer(l1);
+    const bool own2 = l2 == Layers::EXEMPT || Layers::IsOwned(l2) ||
+                      Layers::IsPlayer(l2);
+    if (own1 && own2) return;
+    const bool toBody = own1 || own2;
+    if (toBody && (own1 ? b2 : b1).IsStatic()) return;
     // Something has to be moving. Two statics never reach here, but a
     // static-vs-static pair would carry no speed anyway.
     if (b1.IsStatic() && b2.IsStatic()) return;
@@ -377,7 +400,11 @@ struct Physics::ContactImpls final : public JPH::ContactListener {
     ci.speedVoxPerSec = speedVox;
 
     std::lock_guard<std::mutex> lk(mu);
-    if (impacts.size() < kMaxPerStep) impacts.push_back(ci);
+    if (toBody) {
+      if (bodyImpacts.size() < kMaxBodyPerStep) bodyImpacts.push_back(ci);
+    } else if (impacts.size() < kMaxPerStep) {
+      impacts.push_back(ci);
+    }
   }
 };
 
@@ -458,6 +485,11 @@ void Physics::Shutdown() {
 const std::vector<Physics::ContactImpact>& Physics::ContactImpacts() const {
   static const std::vector<ContactImpact> kNone;
   return contacts_ ? contacts_->impacts : kNone;
+}
+
+const std::vector<Physics::ContactImpact>& Physics::OwnedBodyImpacts() const {
+  static const std::vector<ContactImpact> kNone;
+  return contacts_ ? contacts_->bodyImpacts : kNone;
 }
 
 void Physics::SetContactReportSpeed(float voxPerSec) {
@@ -1072,6 +1104,7 @@ void Physics::Step(float dt) {
   // drains (a headless run never reads this at all).
   if (contacts_) {
     contacts_->impacts.clear();
+    contacts_->bodyImpacts.clear();
     contacts_->ResetCounts();
   }
   // WALL CLOCK, REPORT ONLY. The owner's report was "the whole game froze for
