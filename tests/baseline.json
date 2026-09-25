@@ -368,6 +368,7 @@
   "waterbodyVolTolPct": "2.0",
   "waterbodyAreaTolPct": "2.0",
   "waterbodySpreadMax": "4",
+  "bodyCoatWetSearFrac": "0.02",
   "waterbodyAwakeMax": "32",
   "waterbodyDrainTicks": "60",
   "waterbodyExciteSlackEighths": "0",

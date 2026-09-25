@@ -4920,10 +4920,12 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
   // Every limb but one soaked in water (doused enough times that any blood is
   // rinsed and the skin left wet), then the creature stood in a column of
   // world fire. Since W2-J2 water boils off at its own reaction chance (no
-  // tuning knob); this is the claim that WET does
-  // not catch. The ROOT must come out with no seared (burn-stage)
-  // voxel; the one dry limb is the control, and must sear, or "the wet limb
-  // did not burn" says nothing about the water.
+  // tuning knob), so a soaked limb in a standing fire is PROTECTED, not
+  // immune: once the water on a voxel has boiled off, that voxel may sear
+  // (owner accepted, 2026-09-24). The claim is that the wet root sears at
+  // most `bodyCoatWetSearFrac` (tests/baseline.json, default 2%) of what the
+  // one dry limb -- the control -- sears; the control must sear, or "the wet
+  // limb did not burn" says nothing about the water.
   uint32_t mWater = 0, mFire = 0;
   for (size_t i = 0; i < c.mats.size(); i++) {
     if (c.mats[i].name == "water") mWater = (uint32_t)i;
@@ -5009,7 +5011,9 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
     drySeared = mobs.LimbBody(id, dryLimb) ? searedOn(dryLimb) : 0u;
   }
   const bool wetOk =
-      mWater && mFire && dryLimb >= 0 && wetSeared == 0 && drySeared > 0;
+      mWater && mFire && dryLimb >= 0 && drySeared > 0 &&
+      (double)wetSeared <=
+          BaselineNumber("bodyCoatWetSearFrac", 0.02) * (double)drySeared;
   RecordObserved("bodyCoatWetSeared", (double)wetSeared);
   RecordObserved("bodyCoatDrySeared", (double)drySeared);
 
@@ -5020,7 +5024,7 @@ Status GateBodyCoat(Ctx& c, std::string& detail) {
 
   const bool ok = ledgerOk && holdOk && decayOk && depositOk && printOk && wetOk;
   detail = Format(
-      "%s/%s%s: in fire, wet root seared %u (want 0) vs dry control %s seared %u (want >0) [fire ops %u, mirror saw fire %u/%d ticks (last: mat %d ver %u at (%d,%d,%d), tick %u), control burning peak %u]; "
+      "%s/%s%s: in fire, wet root seared %u (want <= 2%% of dry) vs dry control %s seared %u (want >0) [fire ops %u, mirror saw fire %u/%d ticks (last: mat %d ver %u at (%d,%d,%d), tick %u), control burning peak %u]; "
       "ledger top = mat %u (want %u, blood %u) over %u voxels, "
       "frac %.4f, body sum %u >= limb sum %u, unknown tag %.2f; "
       "stained above the authored decayFloor %u: %u -> %u over %u ticks at "
