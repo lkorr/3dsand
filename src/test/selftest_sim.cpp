@@ -5624,6 +5624,205 @@ Status GateStainReact(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- stamp-sleep: a matched cell keeps its chunk awake whatever the stamp says
+//
+// Rule-unification W2-R. sim_step.wgsl's substep gate skips a cell whose tick
+// stamp equals this substep's stampFor(). The field cycles 1..7 (common.wgsl
+// STAMP_CYCLE), so a cell that MOVED and then sits still carries a stale stamp
+// that equals the current one once every 7 ticks: substep 0 aliases 4 ticks
+// after a substep-1 write, 7 after a substep-0 one. Reactions (and staining)
+// only run on substep 0, so on that tick a matched-but-unfired cell never
+// reaches its keepAwake mark -- and if it was the only mark in its chunk, the
+// chunk sleeps with the reaction still pending, forever. W2-J1 met it as 2 of
+// 72 oil levels left unburnt beside live lava and worked around it for coats.
+//
+// Fixture, no coats: kArms steel shafts, one per chunk (acid's REACT mark is
+// own-chunk only, so each arm sleeps or wakes on its own), each with an IRON
+// floor cell. One full acid voxel is dropped 1 or 2 cells down the shaft, arm
+// a at tick 2 + a, so each arrives carrying a LIVE stamp (a longer drop lands
+// STAMP_NEVER -- measured: drops of 3..8 all did, so they never alias and
+// test nothing) from a different tick/substep phase, and rests on the iron: `acid + iron -> air` matches at 10 per mille, nothing else
+// in the chunk has a rule, and steel has no rule of acid's. Weather pinned
+// clear (rain in the shaft would wake it); regenerated on the way out.
+//
+// Claims:
+//   AWAKE   for every tick of the watch window, every arm whose acid rests on
+//           its iron has its chunk dirty for the next tick. The REPORTER, per
+//           violation: the tick t the chunk went unmarked, the acid's stamp,
+//           and stampFor(t, 0) -- equal is the alias, attributed on one line.
+//   EATS    by stampSleepTicks every arm's iron is gone (p = 1 - e^-15 each)
+//   SLEEPS  and every arm's chunk is asleep (acid on steel matches nothing)
+//   STAMPED precondition: the acid came to rest carrying a LIVE stamp in at
+//           least one arm, so the fixture exercises the case at all
+Status GateStampSleep(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mAcid = matId("acid"), mIron = matId("iron"),
+                 mSteel = matId("steel");
+  if (!mAcid || !mIron || !mSteel) {
+    detail = "acid/iron/steel missing from materials.json";
+    return Status::Fail;
+  }
+  // common.wgsl stampFor(); the CPU never WRITES one (world.h kStampNever),
+  // this only names the alias in the report.
+  auto stampFor = [](uint32_t tick, uint32_t sub) {
+    return ((tick * 2u + sub) % 7u) + 1u;
+  };
+  const std::string prevPin = weather::Override();
+  weather::SetOverride("clear");
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  constexpr int kArms = 8;
+  const int cz = 20 * 16 + 8;  // chunk-centred: marks never fan to a neighbour
+  struct Arm {
+    int x = 0, yIron = 0;
+    uint32_t slot = 0;          // the acid's (and iron's) chunk slot
+    int sleptAt = -1;           // first tick the chunk went unmarked while matched
+    uint32_t sleptStamp = 0;    // acid's stamp then
+    bool alias = false;
+    bool rested = false;
+    uint32_t restStamp = 0;     // acid's stamp the first tick it rests on iron
+    int eatenAt = -1;
+  };
+  Arm arms[kArms];
+  std::map<std::tuple<int, int, int>, uint32_t> cells;
+  for (int a = 0; a < kArms; a++) {
+    Arm& A = arms[a];
+    A.x = (12 + 2 * a) * 16 + 8;  // every other chunk: no shared faces either
+    int hMin = INT32_MAX, hMax = INT32_MIN;
+    for (int dx = -1; dx <= 1; dx++)
+      for (int dz = -1; dz <= 1; dz++) {
+        const int h = World::TerrainHeight(A.x + dx, cz + dz, kDefaultSeed);
+        hMin = std::min(hMin, h);
+        hMax = std::max(hMax, h);
+      }
+    // Iron at chunk-local y 2 of the first chunk wholly above the ground, so
+    // the acid's chunk holds nothing but this shaft; the steel runs down into
+    // the terrain so the column is anchored (not a floating island).
+    A.yIron = ((hMax + 2 + 15) & ~15) + 2;
+    const int top = A.yIron + 10;
+    for (int yy = hMin - 2; yy <= top; yy++)
+      for (int dx = -1; dx <= 1; dx++)
+        for (int dz = -1; dz <= 1; dz++) {
+          uint32_t wd = mSteel;
+          if (dx == 0 && dz == 0) {
+            if (yy == A.yIron) wd = mIron;
+            else if (yy > A.yIron) wd = 0;
+          }
+          cells[{A.x + dx, yy, cz + dz}] = wd;
+        }
+    for (int yy = top + 1; yy <= top + 3; yy++)  // clear air over the mouth
+      for (int dx = -1; dx <= 1; dx++)
+        for (int dz = -1; dz <= 1; dz++) cells[{A.x + dx, yy, cz + dz}] = 0;
+    A.slot = World::SlotCellIndex({A.x, A.yIron, cz}) / kChunkVol;
+  }
+  std::vector<CellOp> scene;
+  for (const auto& [p, wd] : cells)
+    scene.push_back({World::SlotCellIndex({std::get<0>(p), std::get<1>(p),
+                                           std::get<2>(p)}),
+                     wd});
+
+  std::vector<uint32_t> buf(kChunkVol);
+  std::vector<uint32_t> dirty(kNumSlots, 0);
+  auto wordAt = [&](const Arm& A, int yy) {
+    return buf[World::SlotCellIndex({A.x, yy, cz}) % kChunkVol];
+  };
+
+  uint32_t t = 1;
+  const IVec3 pc{arms[kArms / 2].x >> 4, arms[0].yIron >> 4, cz >> 4};
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false, pc, false,
+             false);
+  const uint32_t kWatch = (uint32_t)BaselineNumber("stampSleepWatchTicks", 300.0);
+  const uint32_t kTicks = (uint32_t)BaselineNumber("stampSleepTicks", 1500.0);
+  uint32_t matchedTicks = 0;  // arm-ticks observed matched (the denominator)
+  for (uint32_t i = 2; i <= kTicks; i++) {
+    std::vector<CellOp> drop;
+    if (i - 2 < (uint32_t)kArms) {
+      const Arm& A = arms[i - 2];
+      drop.push_back({World::SlotCellIndex({A.x, A.yIron + 2 + (int)((i - 2) & 1u), cz}),
+                      mAcid | (7u << 12)});  // a full voxel, 1 or 2 cells up
+    }
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, drop, false, pc,
+               false, false);
+    if (i > kWatch) continue;
+    ctx.WaitIdle();
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                          dirty.data(), kNumSlots * 4, "stampSleepDirty");
+    for (Arm& A : arms) {
+      if (A.eatenAt >= 0) continue;
+      ReadVoxelsSync(ctx, world, A.slot, 1, buf.data(), "stampSleepArm");
+      const uint32_t floor = wordAt(A, A.yIron), acid = wordAt(A, A.yIron + 1);
+      if ((floor & 0xFFFu) != mIron) { A.eatenAt = (int)t; continue; }
+      if ((acid & 0xFFFu) != mAcid) continue;  // still falling
+      if (!A.rested) { A.rested = true; A.restStamp = VoxStamp(acid); }
+      matchedTicks++;
+      if (dirty[A.slot] == 0 && A.sleptAt < 0) {
+        // Nothing marked the chunk during tick t, with the acid matched.
+        A.sleptAt = (int)t;
+        A.sleptStamp = VoxStamp(acid);
+        A.alias = A.sleptStamp == stampFor(t, 0);
+      }
+    }
+  }
+  ctx.WaitIdle();
+  rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                        dirty.data(), kNumSlots * 4, "stampSleepDirtyEnd");
+  uint32_t eaten = 0, awakeEnd = 0, slept = 0, aliased = 0, stamped = 0;
+  std::string rep;
+  for (int a = 0; a < kArms; a++) {
+    Arm& A = arms[a];
+    ReadVoxelsSync(ctx, world, A.slot, 1, buf.data(), "stampSleepEnd");
+    const bool ironGone = (wordAt(A, A.yIron) & 0xFFFu) != mIron;
+    if (ironGone) eaten++;
+    if (dirty[A.slot] != 0) awakeEnd++;
+    if (A.restStamp != kStampNever) stamped++;
+    if (A.sleptAt >= 0) {
+      slept++;
+      if (A.alias) aliased++;
+      char line[160];
+      std::snprintf(line, sizeof(line),
+                    " [arm %d: chunk unmarked at t%d with acid on iron, acid "
+                    "stamp %u, stampFor(t%d,0)=%u -> %s; iron %s]",
+                    a, A.sleptAt, A.sleptStamp, A.sleptAt,
+                    stampFor((uint32_t)A.sleptAt, 0), A.alias ? "ALIAS" : "other",
+                    ironGone ? "eaten later" : "NEVER EATEN");
+      rep += line;
+    }
+  }
+
+  weather::SetOverride(prevPin);
+  weather::Snap();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  const bool awakeOk = slept == 0;
+  const bool eatsOk = eaten == (uint32_t)kArms;
+  const bool sleepsOk = awakeEnd == 0;
+  const bool stampedOk = stamped > 0;
+  const bool ok = awakeOk && eatsOk && sleepsOk && stampedOk;
+  char head[512];
+  std::snprintf(head, sizeof(head),
+                "%s: AWAKE %s (%u of %d arms' chunks went unmarked while "
+                "matched, %u by stamp alias; %u matched arm-ticks watched over "
+                "%u ticks) | EATS %s (iron eaten %u/%d by t%u) | SLEEPS %s (%u "
+                "arm chunks awake at the end) | STAMPED %s (%u/%d arms rested "
+                "with a live stamp)",
+                ok ? "PASS" : "FAIL", awakeOk ? "ok" : "FAIL", slept, kArms,
+                aliased, matchedTicks, kWatch, eatsOk ? "ok" : "FAIL", eaten,
+                kArms, t, sleepsOk ? "ok" : "FAIL", awakeEnd,
+                stampedOk ? "ok" : "FAIL", stamped, kArms);
+  detail = std::string(head) + rep;
+  std::printf("stamp-sleep: %s\n", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& SimGates() {
   static const std::vector<Gate> g = {
       {"simd", "sim", {}, false, GateSimd},
@@ -5650,6 +5849,7 @@ const std::vector<Gate>& SimGates() {
       {"fire-down", "sim", {}, false, GateFireDown},
       {"rain-fire", "sim", {}, false, GateRainFire},
       {"stain-react", "sim", {}, false, GateStainReact},
+      {"stamp-sleep", "sim", {}, false, GateStampSleep},
       {"daylight-boundary", "sim", {}, false, GateDaylightBoundary},
       {"support-flag", "sim", {}, false, GateSupportFlag},
       {"snapshot-latency", "sim", {}, false, GateSnapshotLatency},

@@ -1215,7 +1215,27 @@ reproducible (killing lockstep networking and replay debugging).
   updated again by a later color pass in the same tick. v0 stores each voxel in
   a u32 word (16-bit voxel + 8-bit stamp + 8 spare) since WebGPU storage buffers
   address u32s; repacking to 16 bpv + separate stamp layer is an M2+ memory
-  optimization.
+  optimization. (Since narrowed to 3 bits cycling 1..7, `STAMP_NEVER` = 0 —
+  common.wgsl `stampFor`.)
+- **The stamp gate must not eat a keep-awake mark (2026-09-24, rule-unification
+  W2-R; `sim_step.wgsl` main's `skip`, gate `stamp-sleep`).** A cell that moved
+  and then sits still keeps a stale stamp that EQUALS the current code once
+  every 7 ticks (at substep 0: 7 ticks after a substep-0 write, 4 after a
+  substep-1 one). Movement loses nothing (the other substep moves it), but
+  reactions and staining run on substep 0 only, and "matched but did not fire"
+  (`DIRTY_R_REACT` / `_STAIN`) is what holds a chunk awake. On the alias tick
+  a lone matched cell never marked, its chunk slept with the reaction pending,
+  and nothing woke it: `stamp-sleep` dropped one acid voxel onto iron in each
+  of 8 shafts and 7 slept exactly on their alias tick, iron never eaten.
+  Fix: on substep 0 a stamp-skipped cell still runs its coat rules, its
+  bucket and its staining as a PROBE — every predicate and keepAwake, no roll,
+  no write — then returns before the movement code. Nothing fires or moves
+  twice. Every write that leaves a live stamp already marks the written cell's
+  chunk, so for a genuinely-acted cell the probe only adds a reason bit to an
+  awake chunk; membership changes exactly at the alias. One call site per
+  evaluator (a separate helper inlined a second `doReactions` into `main` and
+  cost the forest fire 7% of CA time); as landed, `--perf forestfire` CA 27.2
+  -> 27.9 ms/frame, awake chunks +0.3%.
 - **The stain layer (2026-08-20)** claims 7 of those 8 spare bits: bits 24..27 a
   stain AMOUNT (1..15) and bits 28..30 a stain TYPE (1..7, 0 = unstained). Bit 31
   stays reserved for `kCellOpIfAir`, a transient CPU→GPU message flag that
@@ -3157,9 +3177,11 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   stamp: a live stamp on a cell that then sits still aliases the current one
   every `STAMP_CYCLE` (7) ticks, the cell is skipped before it can mark
   keepAwake, and the first version let a chunk fall asleep mid-burn with 2 of
-  72 oil levels left beside live lava. (The same alias can in principle skip
-  ANY lone matched-but-unfired cell that once moved; not seen elsewhere, not
-  changed here.) Cost: a stained cell on absorbent ground in an AWAKE chunk pays a
+  72 oil levels left beside live lava. (The same alias skipped ANY lone
+  matched-but-unfired cell that once moved; W2-R fixed it at the gate for
+  every cell -- see "The stamp gate must not eat a keep-awake mark" under
+  Update hygiene -- which makes this STAMP_NEVER workaround redundant. It is
+  kept: it is harmless, and a spend is not a move.) Cost: a stained cell on absorbent ground in an AWAKE chunk pays a
   palette load and a walk of C's pair rules; an absorbent solid with no rules
   of its own is no longer skipped as inert when it wears a coat.
 
