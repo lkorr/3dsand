@@ -6026,6 +6026,8 @@ class MobSystem {
     // water never matched", "it matched and did not cover" or "the rule
     // below reached the coat".
     uint64_t coatMatched = 0, coatFired = 0, coatCovered = 0, coatPartner = 0;
+    // Clause 2c: coat firings that made a flame ON a voxel that then caught.
+    uint64_t coatCaught = 0;
   };
   const BurnStats& Burn() const { return burnStats_; }
   void ResetBurnStats() { burnStats_ = BurnStats{}; }
@@ -6293,6 +6295,10 @@ class MobSystem {
   // if its neighbour predicate can match something dissolvable. tag:soil cannot;
   // tag:dissolvable can.
   std::vector<uint8_t> matAttacksBody_;
+  // What each material CATCHES as when its coat makes a flame on it (DESIGN.md
+  // §6 clause 2c; sim/bodyreact.h CatchFormTable, the table the grid reads
+  // from the material's spare `_r2`). 0 = does not catch.
+  std::vector<uint32_t> matCatchForm_;
   // ---- the stain palette, both ways round ----------------------------------
   // mat -> its stain palette slot (1..7, 0 = does not stain), and slot -> the
   // FIRST material registered against it. The second exists because the voxel

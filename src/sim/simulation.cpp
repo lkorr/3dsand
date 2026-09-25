@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "gpu/resources.h"
+#include "sim/bodyreact.h"  // CatchFormTable (what a coat flame lights, §6 clause 2c)
 #include "sim/farplumes.h"  // FarPlumes::SetMaterials (what a frozen fire is)
 #include "sim/pagetable.h"
 #include "sim/renderspec.h"  // LastRenderSpec(): which raymarch variant this frame takes
@@ -1119,6 +1120,17 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   // far fire-plume index (src/sim/farplumes.h) asks this per evicted voxel and
   // must not be scanning tag STRINGS to do it.
   FarPlumes::SetMaterials(mats, reactions);
+
+  // WHAT EACH MATERIAL CATCHES AS, in its spare `_r2` (DESIGN.md §6 clause
+  // 2c; sim/bodyreact.h CatchFormTable, the one derivation the body uses
+  // too): sim_step.wgsl coatReact rewrites a cell to it when the cell's coat
+  // makes a flame on it. Real material ids only -- the stain palette entries
+  // above kStainPaletteBase own their `_r2` (coat glow, below).
+  {
+    const std::vector<uint32_t> catchForm = CatchFormTable(mats, reactions);
+    for (size_t i = 0; i < catchForm.size() && i < kStainPaletteBase; i++)
+      table[i]._r2 = catchForm[i] & 0xFFFu;
+  }
 
   // Mirror the stain palette into the reserved top entries (kStainPaletteBase,
   // materials.h): the renderer maps a voxel's 3-bit stain TYPE to a colour by

@@ -1218,6 +1218,14 @@ fn scaledChance(rule : Reaction, c : vec3<i32>, coat : u32, covered : bool) -> u
 //      PARTNER's side is ordinary: a face partner takes `neighborBecomes`; the
 //      cell itself taking `neighborBecomes` is rewritten and born clean (the
 //      coat goes with the voxel).
+//      2c. A FLAME A COAT MAKES IS MADE ON ITS WEARER (2026-09-24, the owner's
+//      "oil should catch fire easily in all scenarios"): when the coat rule
+//      that fired released a flame and did not itself rewrite the cell, the
+//      cell CATCHES if it can -- it becomes its catch form (the burning
+//      product of its own heat rules, derived at load into `_r2`) -- and the
+//      coat goes with it. Oiled grass beside an ember goes up at oil's 700
+//      per mille as well as grass's own 220 (both before combustion.spreadPct);
+//      oiled dirt, which cannot catch, is unchanged.
 //   3. A QUENCHING COAT COVERS THE CELL. If any coat rule MATCHED this tick
 //      (partner found, whether or not it rolled) and its coat-side product is
 //      not a flame, the cell is COVERED: its own rules below see its coat and
@@ -1445,6 +1453,20 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       markVoxActive(pni);
       markDirtyR(n, DIRTY_R_REACTW);
       if (!psyn) { flagSupportLoss(n, materials[pmat].klass, rule.prodNbr); }
+    }
+    // Clause 2c: the flame was made ON the cell, so a cell that can catch
+    // CATCHES -- it takes its catch form (its own heat rules' burning product,
+    // derived at load: sim/bodyreact.h CatchFormTable, uploaded in the
+    // material's spare `_r2`; 0 = it does not catch). No roll of its own: the
+    // coat rule's chance is how easily an oiled thing catches. That is the
+    // cell's one rewrite this tick (rule 5), and the grid's coat is HELD, so
+    // it goes with the cell exactly as a coat rule rewriting its wearer does.
+    if (rf < 6u) {
+      let catchMat = m._r2 & 0xFFFu;
+      if (catchMat != 0u && catchMat != mat) {
+        reactWriteSelf(c, idx, false, m.klass, catchMat, rnd, stamp);
+        return vec2<u32>(COAT_GONE, 0u);
+      }
     }
     let nw = coatSpend(c, idx, w, stamp);
     if (keepAwake) { markDirtyR(c, DIRTY_R_REACT); }

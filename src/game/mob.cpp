@@ -2082,6 +2082,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     matRewritesNbr_ = std::move(rf.rewritesNbr);
     matHot_ = std::move(rf.hot);
     matAttacksBody_ = std::move(rf.attacksBody);
+    matCatchForm_ = std::move(rf.catchForm);
   }
   for (size_t mi = 0; mi < mats.size(); mi++) {
     const MaterialDef& m = mats[mi];
@@ -14360,6 +14361,21 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           const uint32_t left =
               rewrites ? paidLeft(coatAmt, rr) : coatLevelsAfter(coatAmt, 1u);
           setCoat(i, left ? PackBodyStain(coat, left) : (uint16_t)0);
+          // CLAUSE 2c: the flame was made ON this voxel, so a voxel that can
+          // catch CATCHES (its catch form, sim/bodyreact.h CatchFormTable --
+          // the same table the grid reads: skin -> flesh_burning, wood ->
+          // ember). No roll of its own: the coat rule's chance is how easily
+          // an oiled thing catches. Its one rewrite this tick (rule 5). The
+          // coat was already spent its level above: a FILM stays on a voxel
+          // rewritten in place (2b), a HELD coat goes with it, and a voxel
+          // that leaves takes the coat (applyTo clears the tombstone's).
+          const uint32_t cf = m < matCatchForm_.size() ? matCatchForm_[m] : 0u;
+          if (rf >= 0 && cf != 0 && cf != m) {
+            burnStats_.coatCaught++;
+            applyTo(cell, cf, Pcg(rr ^ 0x2Cu));
+            selfDone = true;
+            if ((st.idx[cell] & ~kBurnQueued) != 0 && heldCoat) setCoat(i, 0);
+          }
         }
         break;  // rule 5: one coat rule a tick
       }

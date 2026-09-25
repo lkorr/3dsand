@@ -360,9 +360,12 @@
       }
     },
     {
+      "note": "OIL IS HOW EASILY AN OILED THING CATCHES (2026-09-24). This one rule runs for a pool of oil AND, through the coat rule (DESIGN.md §6), for every oiled voxel, ground or body: each firing spends one level of the coat, throws a flame into an open face, and (clause 2c) makes the flame ON the voxel, which catches as its own catch form -- oiled grass to fire, an oiled plank to ember, oiled skin to flesh_burning. So this chance is the owner's \"oil should catch fire easily in all scenarios\", one number for all of them. 350 -> 700 on that ask: at 350 an oiled forearm under lava burnt 14,246 voxel-ticks against the pre-W2-J2 22,920; at 700 21,728; at 1000 21,181 (saturated: past ~700 the limit is heat reaching the oiled skin, not the oil catching). Compiled through combustion.spreadPct like every ignition, and a drifting flame lights oil at neighborChance x combustion.flamePct of it."
+    },
+    {
       "self": "oil",
       "neighbor": "tag:hot",
-      "chance": 350,
+      "chance": 700,
       "rainDamped": true,
       "selfBecomes": "fire",
       "neighborChance": {
