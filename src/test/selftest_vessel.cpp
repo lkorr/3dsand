@@ -47,6 +47,16 @@ using namespace sandvox;
 namespace selftest {
 namespace {
 
+// A vessel stack of library entry `def`, holding `amt` eighths of `mat`
+// (W2-M: a slot is an ItemInstance, BY NAME).
+ItemStack Vs(const ItemLibrary& lib, int def, int count, uint16_t mat = 0,
+             uint16_t amt = 0) {
+  ItemStack s = StackOf(lib, def, count);
+  s.fillMat = mat;
+  s.fillAmt = amt;
+  return s;
+}
+
 Status GateVessel(Ctx& c, std::string& detail) {
   int checks = 0, failed = 0;
   std::string first;
@@ -122,7 +132,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
 
   // ---- what goes in --------------------------------------------------------
   {
-    ItemStack st{pouchI, 1};
+    ItemStack st = Vs(c.items, pouchI, 1);
     std::vector<CellOp> ops;
     const char* why = nullptr;
     const int n = ContainerScoop(*pouch, st, base, wordAt, c.world, c.mats, ops, &why);
@@ -134,13 +144,13 @@ Status GateVessel(Ctx& c, std::string& detail) {
     check(m > 0 && st.fillMat == mSand, "but takes sand");
   }
   {
-    ItemStack st{flaskI, 1};
+    ItemStack st = Vs(c.items, flaskI, 1);
     std::vector<CellOp> ops;
     const char* why = nullptr;
     ContainerScoop(*flask, st, {base.x + 3, base.y, base.z}, wordAt, c.world,
                    c.mats, ops, &why);
     check(!st.Filled() && ops.empty(), "a flask will not take sand");
-    ItemStack blood{flaskI, 1, 0, (uint16_t)mBlood, 8};
+    ItemStack blood = Vs(c.items, flaskI, 1, (uint16_t)mBlood, 8);
     const char* why2 = nullptr;
     check(!ContainerAccepts(*flask, blood, mWater, c.mats, &why2),
           "a flask of blood will not take water");
@@ -148,7 +158,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
 
   // ---- matter is not minted ------------------------------------------------
   {
-    ItemStack st{flaskI, 1};
+    ItemStack st = Vs(c.items, flaskI, 1);
     ContainerScoopMemo memo;
     std::vector<CellOp> ops;
     const char* why = nullptr;
@@ -238,13 +248,12 @@ Status GateVessel(Ctx& c, std::string& detail) {
       m2.ledger.tick = 299;
       m2.ledger.eighths = 1000;
       m2.claims.push_back({300, (uint16_t)mWater, 32});
-      ItemStack f2{flaskI, 1};
+      ItemStack f2 = Vs(c.items, flaskI, 1);
       ContainerSettle(m2, 300, 1000 + 8, flask, &f2);
       check(f2.fillAmt == 8, "a claim is paid what the GPU took, not what it asked");
     }
     // ...and capacity stops it.
-    ItemStack nearlyFull{flaskI, 1, 0, (uint16_t)mWater,
-                         (uint16_t)(flask->container.capacity - 4)};
+    ItemStack nearlyFull = Vs(c.items, flaskI, 1, (uint16_t)mWater, (uint16_t)(flask->container.capacity - 4));
     std::vector<CellOp> ops3;
     ContainerScoopMemo memo3;
     ContainerScoop(*flask, nearlyFull, hit, wordAt, c.world, c.mats, ops3, &why,
@@ -255,7 +264,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
 
   // ---- the pour lands where it is aimed ------------------------------------
   {
-    ItemStack st{flaskI, 1, 0, (uint16_t)mBlood, 1024};
+    ItemStack st = Vs(c.items, flaskI, 1, (uint16_t)mBlood, 1024);
     // Within reach (flask pourRangeM), so this is the AIMED path.
     const Vec3 mouth{(float)base.x, (float)base.y + 12.0f, (float)base.z};
     const Vec3 target{(float)base.x + 12.0f, (float)base.y, (float)base.z + 4.0f};
@@ -318,7 +327,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
     // front -- the owner's report was a stream solved toward a point in
     // mid-air, which came down far off at an angle.
     {
-      ItemStack tip{flaskI, 1, 0, (uint16_t)mWater, 64};
+      ItemStack tip = Vs(c.items, flaskI, 1, (uint16_t)mWater, 64);
       std::vector<ParticleSpawn> ts;
       const Vec3 far = mouth + Vec3{1000, 0, 0};
       ContainerPour(*flask, tip, mouth, Vec3{1, 0, 0}, &far, g, 600, 0x99u, ts,
@@ -348,38 +357,39 @@ Status GateVessel(Ctx& c, std::string& detail) {
   // ---- stacks --------------------------------------------------------------
   {
     Inventory hb;
-    hb.slots[0] = ItemStack{flaskI, 1, 0, (uint16_t)mWater, 40};
-    const int where = hb.Add(flaskI, 1);
+    hb.slots[0] = Vs(c.items, flaskI, 1, (uint16_t)mWater, 40);
+    const int where = hb.Add(Vs(c.items, flaskI, 1));
     check(where != 0 && hb.slots[0].count == 1,
           "an empty flask does not fold into a filled one");
-    hb.slots[3] = ItemStack{flaskI, 3};
+    hb.slots[3] = Vs(c.items, flaskI, 3);
     Bag bag;
     check(ContainerIsolateOne(hb.slots, kItemSlots, 3, bag.slots, Bag::kSlots) &&
               hb.slots[3].count == 1,
           "filling one of a stack sets the others down");
     int rest = 0;
     for (const ItemStack& s : hb.slots)
-      if (!s.Empty() && s.def == flaskI && !s.Filled()) rest += s.count;
+      if (!s.Empty() && s.name == "flask" && !s.Filled()) rest += s.count;
     check(rest == 4, "and none of them is lost");
     // TWO IDENTICAL FILLS DO NOT STACK: a count-2 stack has ONE fillAmt, so a
     // merge would destroy a flask's worth on the first pour.
     Inventory h2;
-    h2.slots[0] = ItemStack{flaskI, 1, 0, (uint16_t)mWater, 40};
-    const int w2 = h2.Add(flaskI, 1, 0, (uint16_t)mWater, 40);
+    h2.slots[0] = Vs(c.items, flaskI, 1, (uint16_t)mWater, 40);
+    const int w2 = h2.Add(Vs(c.items, flaskI, 1, (uint16_t)mWater, 40));
     check(w2 > 0 && h2.slots[0].count == 1 && h2.slots[w2].count == 1 &&
               h2.slots[w2].fillAmt == 40,
           "two flasks of the same fill stay two stacks");
     Bag b2;
-    b2.slots[0] = ItemStack{flaskI, 1, 0, (uint16_t)mWater, 40};
-    check(b2.Add(flaskI, 1, 0, (uint16_t)mWater, 40) != 0,
+    b2.slots[0] = Vs(c.items, flaskI, 1, (uint16_t)mWater, 40);
+    check(b2.Add(Vs(c.items, flaskI, 1, (uint16_t)mWater, 40)) != 0,
           "and the pack keeps them apart too");
-    check(h2.Add(flaskI, 2) == h2.Add(flaskI, 1), "empty flasks still stack");
+    check(h2.Add(Vs(c.items, flaskI, 2)) == h2.Add(Vs(c.items, flaskI, 1)),
+          "empty flasks still stack");
     // No path charges or pays a whole stack as one vessel.
-    ItemStack three{flaskI, 3};
+    ItemStack three = Vs(c.items, flaskI, 3);
     check(ContainerDeposit(*flask, three, (uint16_t)mWater, 64) == 0 &&
               !three.Filled(),
           "a scoop is never paid into a stack of three (it would triple)");
-    ItemStack pair{flaskI, 2, 0, (uint16_t)mWater, 64};
+    ItemStack pair = Vs(c.items, flaskI, 2, (uint16_t)mWater, 64);
     std::vector<ParticleSpawn> none;
     std::vector<FluidSpawnOp> noneF;
     const Vec3 m0{(float)base.x, (float)base.y + 12.0f, (float)base.z};
@@ -396,7 +406,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
   // lava, pour it, and a whole cell came down (scoop 8/8, repeat: unbounded).
   {
     const uint32_t liq = mLava ? mLava : mBlood;
-    ItemStack st{flaskI, 1, 0, (uint16_t)liq, 3};
+    ItemStack st = Vs(c.items, flaskI, 1, (uint16_t)liq, 3);
     std::vector<ParticleSpawn> sp;
     const Vec3 m0{(float)base.x, (float)base.y + 12.0f, (float)base.z};
     const int n = ContainerPour(*flask, st, m0, Vec3{1, 0, 0}, nullptr,
@@ -408,7 +418,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
           "3 eighths pour as ONE particle measured at fullness 3/8, not a cell");
     // A pouch with a partial cell (the portrait brush can leave one): the
     // whole cells fall as grains, the rest is dust -- never a whole grain.
-    ItemStack sand{pouchI, 1, 0, (uint16_t)mSand, 12};
+    ItemStack sand = Vs(c.items, pouchI, 1, (uint16_t)mSand, 12);
     sp.clear();
     ContainerPour(*pouch, sand, m0, Vec3{1, 0, 0}, nullptr,
                   CurrentTuning().sim.partGravity, 701, 3u, sp, nullptr,
@@ -416,7 +426,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
     check(sp.size() == 1 && !sand.Filled() && (sp[0].flags & kPFlagMeasured) == 0,
           "a pouch's partial last cell is dust, not a grain");
     // THE RING'S ROOM: charged only for the particles that fit.
-    ItemStack big{flaskI, 1, 0, (uint16_t)liq, 64};
+    ItemStack big = Vs(c.items, flaskI, 1, (uint16_t)liq, 64);
     sp.clear();
     const int got = ContainerPour(*flask, big, m0, Vec3{1, 0, 0}, nullptr,
                                   CurrentTuning().sim.partGravity, 702, 3u, sp,
@@ -443,7 +453,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
     b.claims.push_back({300, (uint16_t)mWater, 32});
     ContainerLedgerObserve(L, 300, 1000 + 40, 2);   // the tick removed 40
     ContainerLedgerObserve(L, 300, 1000 + 40, 2);   // seen again: no refill
-    ItemStack fa{flaskI, 1}, fb{flaskI, 1};
+    ItemStack fa = Vs(c.items, flaskI, 1), fb = Vs(c.items, flaskI, 1);
     const ItemDef& fd = *flask;
     ContainerSettle(L, a, 300,
                     [&](uint16_t m, int u) { return ContainerDeposit(fd, fa, m, u); },
@@ -475,8 +485,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
     m2.ledger.tick = 400;
     m2.ledger.eighths = 24;
     m2.claims.push_back({401, (uint16_t)mWater, 24});
-    ItemStack nearly{flaskI, 1, 0, (uint16_t)mWater,
-                     (uint16_t)(flask->container.capacity - 10)};
+    ItemStack nearly = Vs(c.items, flaskI, 1, (uint16_t)mWater, (uint16_t)(flask->container.capacity - 10));
     unpaid.clear();
     const int p2 = ContainerSettle(m2, 401, 48, flask, &nearly, &unpaid);
     check(p2 == 10 && nearly.fillAmt == flask->container.capacity &&
@@ -582,11 +591,11 @@ Status GateVessel(Ctx& c, std::string& detail) {
   {
     GlyphLibrary glyphs;
     PlayerCaster caster;
-    Inventory hb;
-    PlayerKit kit;
-    hb.slots[4] = ItemStack{flaskI, 1, 0, (uint16_t)mBlood, 77};
-    kit.bag.slots[2] = ItemStack{pouchI, 1, 0, (uint16_t)mSand, 16};
-    PlayerKitRefs refs{&caster, &glyphs, &hb, &kit, &c.items};
+    Kit kit;
+    Inventory& hb = kit.hotbar;
+    hb.slots[4] = Vs(c.items, flaskI, 1, (uint16_t)mBlood, 77);
+    kit.bag.slots[2] = Vs(c.items, pouchI, 1, (uint16_t)mSand, 16);
+    PlayerKitRefs refs{&caster, &glyphs, &kit, &c.items};
     EntityIO io = MakeEntityIO(c.debris, c.mobs, nullptr, &refs);
     const EntitySection* plyr = nullptr;
     for (const EntitySection& s : io.sections)
@@ -607,7 +616,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
       SavePlayerKit(refs, v5, 5);
       plyr->reset();
       check(plyr->load(v5.data(), v5.size(), 5) && !hb.slots[4].Filled() &&
-                hb.slots[4].def == flaskI,
+                hb.slots[4].name == "flask",
             "a v5 payload loads with the flask empty");
     }
   }
@@ -876,7 +885,7 @@ Status VesselRoundTrip(Ctx& c, std::string& detail, bool mpm) {
 
   // THE SCOOP, aimed each tick at the highest water the snapshot shows -- the
   // cell the pick ray would strike looking down into the basin.
-  ItemStack st{flaskI, 1};
+  ItemStack st = Vs(c.items, flaskI, 1);
   ContainerScoopMemo memo;
   const Vec3 mouth{base.x + 0.5f, base.y + 10.5f, base.z + 0.5f};
   uint32_t ghosts = 0, ghostPeak = 0;
@@ -1062,10 +1071,12 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
   }
   for (int i = 0; i < 24; i++) tick({});
 
-  const uint32_t fill = PackItemFill((uint16_t)mWater, 1024);
+  ItemInstance full1024{flask->name};
+  full1024.fillMat = (uint16_t)mWater;
+  full1024.fillAmt = 1024;
   auto drop = [&](Vec3 at, Vec3 vel) {
-    return DropItemToWorld(*flask, at, vel, phys, debris, nullptr, ground,
-                           nullptr, 0, fill);
+    return DropItemToWorld(*flask, full1024, at, vel, phys, debris, nullptr,
+                           ground);
   };
   const float top = (float)slabY + 1.0f;
   bool ok = true;
@@ -1085,7 +1096,7 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
   const WorldItem* wa = ground.Find(a);
   if (!a) fail("A: the flask did not become a body");
   else if (brokeA || !wa) fail("A: a flask SET DOWN from two voxels broke");
-  else if (ItemFillAmt(wa->fill) != 1024) fail("A: the set-down flask lost its water");
+  else if (wa->fillAmt != 1024) fail("A: the set-down flask lost its water");
 
   // ---- B: thrown down hard ---------------------------------------------------
   spills.clear();
@@ -1163,14 +1174,19 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
           phys.CreateDebrisBodyXf(arm, ax, debris.DensityOf(), true);
       if (!limb) return -2;
       phys.SetBodyKinematic(limb, true);
-      phys.SetBodyAvatarLayer(limb, true);
+      // A player's own live limb, owner not wired (exempt from every capsule:
+      // the old AVATAR layer this arm was written against).
+      phys.SetBodyRole(limb, Physics::BodyRole::RigLive, Physics::kAnyPlayer);
       const Vec3 vel{0, full * 0.25f, -full};
       const uint64_t f = drop(pc - Vec3{0.5f, 0.5f, 0.5f}, vel);
       if (!f) {
         phys.RemoveBody(limb);
         return -2;
       }
-      phys.ReleaseToWorldWhenClear(f, thrown);
+      // `thrown`: the throw role (THROWN); the control is the plain loose
+      // release (EXEMPT, which meets EXEMPT/owned limbs: the bug).
+      phys.SetBodyRole(f, thrown ? Physics::BodyRole::Thrown
+                                 : Physics::BodyRole::Debris);
       BodyTransform f0{};
       phys.GetTransform(f, f0);
       int broke = -1;

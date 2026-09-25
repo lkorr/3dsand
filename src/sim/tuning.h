@@ -140,6 +140,24 @@ struct Tuning {
     float fallDamageSpeed = TPD(player, fallDamageSpeed);
     float fallSplatSpeed = TPD(player, fallSplatSpeed);
     float fallDamageScale = TPD(player, fallDamageScale);
+    // ---- what a landing does to a body (Mob::ApplyFallDamage, W2-H) --------
+    // EVERY creature's since 2026-09-24, not only the player's: an NPC's limp
+    // landing is measured by the same Mob::TakeRagdollImpact the avatar's is,
+    // and billed by the same function. They live in this group because the
+    // three onset knobs above always did. A SPLAT (>= fallSplatSpeed, or a
+    // bill larger than the body's hp) carves a sphere of fallSplatCarveBase +
+    // fallSplatCarvePerMs x impact m/s out of the body, throws
+    // fallSplatDroplets micro droplets and fallSplatBloodVoxels whole blood
+    // voxels, and shoves loose bodies within fallSplatImpulseRadius voxels by
+    // fallSplatImpulsePerMs x impact m/s. A sub-lethal landing opens a bleed on
+    // every LEG/FOOT-tagged limb of fallLegBleed x the damage.
+    float fallSplatCarveBase = TPD(player, fallSplatCarveBase);
+    float fallSplatCarvePerMs = TPD(player, fallSplatCarvePerMs);
+    int fallSplatDroplets = TPD(player, fallSplatDroplets);
+    int fallSplatBloodVoxels = TPD(player, fallSplatBloodVoxels);
+    float fallSplatImpulseRadius = TPD(player, fallSplatImpulseRadius);
+    float fallSplatImpulsePerMs = TPD(player, fallSplatImpulsePerMs);
+    float fallLegBleed = TPD(player, fallLegBleed);
     float stepUp = TPD(player, stepUp);
     float smoothBump = TPD(player, smoothBump);
     float stepSpeedPenaltyPerM = TPD(player, stepSpeedPenaltyPerM);
@@ -479,6 +497,17 @@ struct Tuning {
     // was written for.
     float biteThroughSoft = TPD(gear, biteThroughSoft);
     float biteThroughHard = TPD(gear, biteThroughHard);
+    // ---- A SHELL IN A BLAST'S WAY (W2-H, game/shellresponse.h) ----------
+    //
+    // How many terrain CELLS of its material one crossing of a worn shell
+    // counts as, on the ray from an explosion to a voxel of the limb under it.
+    // sim_explode.wgsl walks that ray summing the hardness of every cell it
+    // samples; a shell is thinner than a cell (one authored micro), and 1 says
+    // "the finest thing that stops a ray costs what one sample of it costs",
+    // so an iron cuirass (160) takes 160 off a grenade's 380 before the flesh
+    // behind it is reached. 0 = shells do not occlude a blast (the pre-W2-H
+    // behaviour).
+    float blastShellCells = TPD(gear, blastShellCells);
   } gear;
 
   // ---- player avatar ----
@@ -653,8 +682,9 @@ struct Tuning {
     //         moment of death and everything is on the thing wearing your
     //         face. No duplication, and the death penalty this becomes.
     //
-    // CPU-only, read at the one seam (MobSystem::SetAvatarKitFn, bound in
-    // main.cpp). Nothing here reaches a shader or the CA.
+    // CPU-only, read at the one seam (MobSystem::ServiceRising, where a
+    // rising takes the owning avatar's Kit). Nothing here reaches a shader or
+    // the CA.
     bool keepKitOnTurn = TPD(avatar, keepKitOnTurn);
   } avatar;
 
@@ -885,12 +915,15 @@ struct Tuning {
     // Continuous freefall before a creature goes limp mid-air. NPCs fall under
     // the same gravity as the player since this landed (they used to hang).
     float fallSeconds = TPD(ragdoll, fallSeconds);
-    // A blast within radius * blastRadiusScale of a body launches it. The
-    // impulse at the centre is power * blastImpulseScale (kg*m/s), falling
+    // A blast within the ONE push reach (radius x
+    // physics.explosionImpulseRadiusScale -- the same reach the per-body
+    // debris impulse uses; the separate `blastRadiusScale` that held the same
+    // 3.0 was retired by W2-H) launches a creature. The impulse at the centre
+    // is power * blastImpulseScale (kg*m/s) for the WHOLE creature, falling
     // off linearly to zero at that reach; launch speed is impulse / body mass,
     // so a heavy creature flies less far than a light one from the same
-    // charge, and a grenade (power 380) sends ~70 kg about 5 m/s.
-    float blastRadiusScale = TPD(ragdoll, blastRadiusScale);
+    // charge, and a grenade (power 380) sends ~70 kg about 5 m/s. Read only
+    // through BlastForceOf (game/session.h).
     float blastImpulseScale = TPD(ragdoll, blastImpulseScale);
     // Below this launch speed (m/s) a blast does not knock the creature down
     // at all; above maxLaunchSpeed it is clamped, which is what keeps a large
@@ -1670,6 +1703,40 @@ struct Tuning {
     // fast. 0 disables the mechanic entirely and restores the pre-2026-09-18
     // behaviour, where brain was ordinary flesh with a different colour.
     float brainHpPerVoxel = TPD(gore, brainHpPerVoxel);
+    // ---- WHAT LOSING MATTER COSTS (was mob.h kCarveDamagePerVolume) ------
+    //
+    // Mob::CarveLimb charges a limb this multiple of its max hp for the whole
+    // of its (woundHp-weighted) volume: losing a third of a limb costs half of
+    // its hp at 1.5. Every carve pays it -- blade, blast, beam, burn, rot.
+    float carveHpPerVolume = TPD(gore, carveHpPerVolume);
+    // ---- A BLAST'S POWER, NOT ONLY ITS RADIUS (W2-H) ---------------------
+    //
+    // The body crater follows the terrain crater's rule (sim_explode.wgsl): the
+    // power that reaches a voxel is the blast's power, less
+    // sim.falloffPerCell per voxel of distance, less every worn shell the ray
+    // crossed (gear.blastShellCells). What is left over the voxel's own
+    // hardness, as a fraction of THIS, scales the crater radius at that voxel:
+    // at or above it the crater is the full blast radius (a grenade on bare
+    // flesh, unchanged), below it the crater shrinks, and at nothing left the
+    // voxel is untouched. Only a blast that states a power reads it (an
+    // explosion does; a fall's splat is radius-only).
+    float blastPowerRef = TPD(gore, blastPowerRef);
+    // ---- A THROWN ROCK IS A BLOW (W2-H phase 2, MobSystem::ApplyContactDamage)
+    //
+    // A loose body (debris, a log, a flung limb) that strikes a living
+    // creature's limb hard enough is a BLUNT blow on that limb, through the
+    // same Mob::BluntHit (so the shell table, the bruise and the transmitted
+    // share all apply). Strength is the IMPULSE of the contact -- the
+    // striking body's mass (reduced against the creature's when the creature
+    // is limp) x its approach speed, kg*m/s -- and only what exceeds
+    // contactImpulseMin counts, at contactHpPerImpulse hp per kg*m/s, capped
+    // at contactMaxHp per contact. At most contactMaxPerTick contacts are
+    // billed per tick (the hardest first): rule 2, a collapsing wall must not
+    // bill a thousand. contactHpPerImpulse 0 switches it off.
+    float contactImpulseMin = TPD(gore, contactImpulseMin);
+    float contactHpPerImpulse = TPD(gore, contactHpPerImpulse);
+    float contactMaxHp = TPD(gore, contactMaxHp);
+    int contactMaxPerTick = TPD(gore, contactMaxPerTick);
 
     // ========================================================================
     // F. BLOOD IS HEALTH — every drop that leaves a body is hp leaving it
@@ -1755,10 +1822,6 @@ struct Tuning {
     // in sunshine: daylight up and open sky over the limb (MobSystem::
     // InSunlight). Divides the drying period like decayScale; 1 = no effect.
     float sunDryScale = TPD(coat, sunDryScale);
-    // Seconds of heat against a wet voxel to boil it from soaked (15) to dry.
-    // A wet voxel cannot catch fire (BurnOneLimb section 0), so this is how
-    // long water on the skin holds a flame off.
-    float fireDrySeconds = TPD(coat, fireDrySeconds);
     // Ground cells one footfall may track a coat onto. A footprint is a patch,
     // not a point, and this is how big the patch may get.
     int shedCells = TPD(coat, shedCells);

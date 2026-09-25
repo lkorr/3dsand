@@ -355,6 +355,9 @@ const char* const kOrder[] = {
     // debris and mobs into every arm and regenerates pristine worldgen at
     // kDefaultSeed on the way out.
     "remote-ghost",
+    // W2-N: roles -> layers, owner-scoped with two capsules and two avatars.
+    // CPU + Jolt only, touches no World state, removes every body it made.
+    "layer-roles",
     // W1-F: one player's grenade carves and launches the other (and carves,
     // but never launches, a peer's ghost). CPU + Jolt, resets debris and mobs
     // on both sides; beside the other two-body gates.
@@ -373,13 +376,22 @@ const char* const kOrder[] = {
     // milliseconds. Placed immediately before `mob` because a sidecar that no
     // longer resolves takes every mob gate after it down, and the run should
     // say which one it was.
-    "prefab",      "sidecar-resolve", "anatomy-parity", "mob",
-    "settle-back", "player-body",
+    "prefab",      "sidecar-resolve", "anatomy-parity", "damage-cause", "mob",
+    // `debris-coat` beside `settle-back`: the same loose-body burn path, run
+    // from debris.Reset() on its own pads, and it leaves no bodies behind.
+    // `coat-parity` after it: the same loose-body path against the grid, one
+    // coat scenario on both (W2-J2); regenerates the world on the way out.
+    "settle-back", "debris-coat", "coat-parity", "player-body",
     // Wearing things. After `mob` because it spawns the avatar def on real
     // terrain and carves a shell, which wants the same standing world the
     // body gates run in; before `ragdoll-joints` because it leaves the rig
     // undressed and MobSystem reset, which is what that gate expects to find.
-    "armor-wear", "item-ground", "loot", "armor-fit",
+    "armor-wear", "item-ground", "loot",
+    // One item instance, one kit (W2-M): dresses a rig from its Kit, carves the
+    // worn piece and swaps it with its identical twin. Spawns, resets and puts
+    // the id counter back, beside `loot` for the same standing world.
+    "kit-instance",
+    "armor-fit",
     // Pure anim over its own five-part fixture — it touches no shared World and
     // so is order-independent; it sits here to keep the armour gates together.
     "armor-track", "armor-stock",
@@ -524,6 +536,15 @@ const char* const kOrder[] = {
     // coordinates under three pinned skies, restores the pin and regenerates
     // on the way out — fire-down's reasons, fire-down's slot.
     "rain-fire",
+    // Grid coats in reactions (DESIGN.md §6, "A coat is a co-located virtual
+    // neighbour"): lights oiled and wet ground at absolute coordinates, pins
+    // the weather clear and restores it, regenerates on the way out --
+    // rain-fire's reasons, rain-fire's slot.
+    "stain-react",
+    // The substep stamp alias vs sleep (rule-unification W2-R): acid shafts
+    // on anchored steel columns at absolute coordinates, weather pinned clear
+    // and restored, regenerates on the way out -- stain-react's reasons.
+    "stamp-sleep",
     // ---- THE WINDOW EDGE AS A SINK (docs/PLAN_gas_particles.md §4) --------
     // Straight after `fire-down`, and for exactly the reasons the three gates
     // above it give. Both of these light no fire, but they do the same KIND of
@@ -599,6 +620,10 @@ const char* const kOrder[] = {
     // regenerates the world on both the way in and the way out, so it is
     // order-independent past that.
     "ragdoll-falldamage",
+    // W2-H's one damage event. Same self-contained shape: resets mobs + debris
+    // and regenerates worldgen on the way in and out, and pins the mob id
+    // counter (IdCounterScope) so it perturbs nothing after it.
+    "damage-sources",
     // ...and the dressed one, last in the group for the reason the AI gates
     // give. Same self-contained shape again — resets mobs + debris and
     // regenerates worldgen on the way in and the way out — but it also WEARS

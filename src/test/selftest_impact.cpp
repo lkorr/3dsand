@@ -300,9 +300,8 @@ void CutOnce(MobSystem& mobs, World& world, uint64_t id, int limb,
   cut.length = g.cutLength * (0.4f + 0.6f * power);
   cut.power = power;
   cut.seed = seed;
-  MobSystem::BladeCutScope blade(mobs, power);
-  if (mobs.Damage(body, dmg * power, cut.at, 0.0f))
-    mobs.CutLimb(body, cut, world, spawns);
+  if (mobs.Damage(body, dmg * power, cut.at, 0.0f, DamageCtx(DamageCause::Blade, power)))
+    mobs.CutLimb(body, cut, world, spawns, power);
 }
 
 // The mace, by name, or a default profile if the item is not shipped. Returns

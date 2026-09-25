@@ -1876,7 +1876,7 @@ void RunBlastArm(Ctx& c, Arm arm, BlastArm& r) {
   // 12 voxels to B's side at chest height: close enough that the crater
   // bites B's near flank, far enough that it does not kill (a grenade AT the
   // chest takes the whole body, and a dead body is not launched), and well
-  // inside the launch reach (radius x ragdoll.blastRadiusScale).
+  // inside the launch reach (radius x physics.explosionImpulseRadiusScale).
   const int off = 12;
   // (a)/(b): A 80 voxels off, out of reach. (c)/(d): A on the FAR side of the
   // blast, as close to it as B, so "A untouched" is a claim about who the

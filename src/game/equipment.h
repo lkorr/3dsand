@@ -2,18 +2,19 @@
 #include <cstdint>
 #include <map>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "game/item.h"
 #include "game/kitref.h"
 
-// WHAT THE CHARACTER IS WEARING AND CARRYING — the half of the player's kit
-// that is NOT the hotbar.
+// WHAT THE CHARACTER IS WEARING AND CARRYING — the equipment slots, the bag,
+// and (since W2-M) the Kit that bundles them with the hotbar.
 //
 // Deliberately shaped like game/item.h's Inventory and game/caster.h's
 // GlyphInventory, and for the same reasons: plain structs with no engine
-// coupling, owned by main.cpp, that neither Player nor PlayerAvatar has to
-// know about. Nothing here reaches into the rig, physics or the grid — an
+// coupling. The Kit is owned by the creature that carries it (Mob::kit_).
+// Nothing here reaches into the rig, physics or the grid — an
 // equipped item becomes visible on the body only through the SAME
 // Mob::EquipItem borrowed-slot path a hotbar weapon already uses.
 //
@@ -41,12 +42,11 @@
 //     Durability IS real, but it is the shell's own hp and its own voxels
 //     being carved away, not a number counting down.
 //
-// INDEX HAZARD (the one real trap). ItemStack::def is an index into
-// ItemLibrary::items, which is FILE-ORDER dependent and invalidated by every
-// R hot-reload. Anything that persists or must survive a reload stores the
-// item's NAME and re-resolves through ItemLibrary::Find — see
-// EquipmentSaveNames / EquipmentResolveNames below and the 'PLYR' section in
-// game/persist.cpp.
+// THE INDEX HAZARD IS GONE (W2-M). A slot used to hold an index into
+// ItemLibrary::items, which is FILE-ORDER dependent and invalidated by every R
+// hot-reload, and every save, packet and reload had to translate. A slot is
+// now an ItemInstance and holds the item's NAME; ItemLibrary::Of resolves it
+// at the moment a def is wanted.
 
 // Which equipment slots exist. The ORDER is the save format's order and the
 // panel's draw order; append new slots at the end, before Count.
@@ -190,79 +190,18 @@ inline int EquipSlotFor(ItemKind kind, const Equipment& eq);
 
 // ---- WHAT A WORN PIECE HAS BEEN THROUGH -------------------------------------
 //
-// A shell on the body is a rig slot and carries its own damage: burnt-through
-// cloth, a hole a blade opened, the hp that is left. The moment the piece comes
-// OFF, that rig slot is destroyed — and with it every trace of what happened to
-// the garment, unless something outside the body is holding it.
+// WornShellDamage / WornDamage live in game/iteminstance.h since W2-M: the
+// damage is a field of the ItemInstance (`ItemInstance::damage`), carried by
+// the slot the piece is in, so two robes in one pack are two robes with their
+// own holes. It used to be a map on the player's kit keyed by item NAME, which
+// made "your robe" the unit and let a second robe share the first one's
+// wounds.
 //
-// This is that something. One blob per equip slot, one entry per cover entry in
-// the item's own order.
-//
-// WHY NOT REBUILD FROM THE DEF. Because the def is the PRISTINE piece. Taking
-// off your boots to put on a different pair and finding the first pair mended
-// is the bug this exists to make unrepresentable, and it is a bug nothing else
-// in the suite would notice: everything still works, the armour is just
-// quietly free.
-//
-// THE LATTICE IS THE AUTHORITATIVE ONE — the skin where a shell has a separate
-// skin, the collider where it does not. Storing the derived side would be
-// storing something the next re-derive overwrites (phys/lattice.h's one-way
-// rule), which is a subtler way of losing the damage.
-//
-// KEYED BY ITEM NAME, not by slot and not by instance.
-//
-// Not by SLOT, because dragging the robe to the pack and back would then mend
-// it — the slot emptied, and the blob went with it. Not by INSTANCE, because
-// an ItemStack has no identity: it is a library index and a count, and giving
-// stacks instance ids is a far larger change than armour needed.
-//
-// So the unit is "your robe". Two robes in one pack would share one set of
-// holes, which is a real limitation and an acceptable one while nothing in the
-// game produces two of anything. What DOES hold — and is what the owner asked
-// for — is that damage survives unequip, re-equip, a move through the pack,
-// and a save.
-struct WornShellDamage {
-  float hp = -1.0f;                  // < 0 = as authored
-  // ---- CONDITION, as two counts rather than as a fraction -------------------
-  // `live` of `atSpawn` voxels are still there. Both 0 means "never measured",
-  // which is what an entry for a piece that has not been worn since this was
-  // added looks like, and reads as whole.
-  //
-  // Kept ALONGSIDE the exact lattice, not instead of it, and the distinction is
-  // the one the save format's own note makes: the lattice is the truth (it puts
-  // the holes back where they were), these are a SUMMARY for a piece that is
-  // not on a body, where there is no shell to count and re-deriving the
-  // denominator would mean re-running the per-axis fit resample against a
-  // wearer who is not wearing it.
-  uint32_t atSpawn = 0;
-  uint32_t live = 0;
-  std::vector<PrefabVoxel> lattice;  // empty = as authored
-  bool Empty() const {
-    return hp < 0.0f && lattice.empty() && live >= atSpawn;
-  }
-};
-
-struct WornDamage {
-  std::vector<WornShellDamage> shells;
-  bool Empty() const {
-    for (const WornShellDamage& s : shells)
-      if (!s.Empty()) return false;
-    return true;
-  }
-  void Clear() { shells.clear(); }
-  // How much of the whole piece is still there, 0..1. Volume-weighted across
-  // its shells (Mob::WornCondition computes the same thing off the live rig and
-  // the two must agree): a robe is a torso shell and two sleeves, and a mean of
-  // per-shell fractions would let a burnt-off sleeve weigh as much as the body
-  // of the garment.
-  float Condition() const {
-    uint64_t a = 0, l = 0;
-    for (const WornShellDamage& s : shells) { a += s.atSpawn; l += s.live; }
-    if (!a) return 1.0f;
-    const float f = (float)l / (float)a;
-    return f < 0.0f ? 0.0f : (f > 1.0f ? 1.0f : f);
-  }
-};
+// While a piece is ON a body its shells are the live truth and the stack's
+// `damage` is what it was when it went on; Mob::KitFlushWorn writes the shells
+// back into the stack at every moment the stack is about to be read without
+// the body — a move out of the slot, a recolour, a save (game/mob.h, "THE
+// KIT").
 
 // ---- RUINED ------------------------------------------------------------------
 //
@@ -313,7 +252,8 @@ inline int EquipSlotFor(ItemKind kind, const Equipment& eq) {
 
 // THE BAG: general storage, 4 rows of 8. Unlike the hotbar it has no selection
 // and no keys — it is where things live when they are not in hand, which is
-// the whole distinction between this and Inventory (game/item.h).
+// the whole distinction between this and Inventory (game/item.h). It is also
+// a creature's PACK (Mob::Carried): an NPC's loot-table stacks live here.
 struct Bag {
   static constexpr int kCols = 8;
   static constexpr int kRows = 4;
@@ -332,20 +272,23 @@ struct Bag {
       if (slots[i].Empty()) return i;
     return -1;
   }
-  // Merges by def AND DYE, for the reason ItemStack::dye states: a stack is one
-  // colour, so a red tunic must not fold into a stack of blue ones.
-  int Add(int defIndex, int count = 1, uint32_t dye = 0, uint16_t fillMat = 0,
-          uint16_t fillAmt = 0) {
-    if (defIndex < 0 || count <= 0) return -1;
+  // Merges by the ItemInstance::StacksWith rule (same plain item, same dye),
+  // else the first free slot; -1 when full.
+  int Add(const ItemStack& s) { return AddToSlots(slots, kSlots, s); }
+  int Count() const {
+    int n = 0;
+    for (const ItemStack& s : slots)
+      if (!s.Empty()) n++;
+    return n;
+  }
+  // The slot holding the `n`th non-empty stack in slot order, or -1. A pack's
+  // entries are addressed that way (a loot list, a save record) so the holes a
+  // take leaves never become entries.
+  int NthUsed(int n) const {
+    if (n < 0) return -1;
     for (int i = 0; i < kSlots; i++)
-      if (!slots[i].Empty() &&
-          slots[i].SameKind(defIndex, dye, fillMat, fillAmt)) {
-        slots[i].count += count;
-        return i;
-      }
-    int f = FirstFree();
-    if (f >= 0) slots[f] = {defIndex, count, dye, fillMat, fillAmt};
-    return f;
+      if (!slots[i].Empty() && n-- == 0) return i;
+    return -1;
   }
 };
 
@@ -353,36 +296,27 @@ struct Bag {
 // so the UI can name a slot without pulling the item system in — see
 // game/kitref.h for why that separation is load-bearing.
 
-// The player's whole non-magic kit, so main.cpp holds ONE thing rather than
-// three and the move logic has one place to live.
-struct PlayerKit {
+// ---- THE KIT: EVERYTHING ONE CREATURE CARRIES (W2-M) ------------------------
+//
+// Equipment, the bag and the hotbar, as ONE thing, owned by the creature
+// (Mob::kit_, game/mob.h). It was `PlayerKit` on the session plus a separate
+// hotbar, while the rig kept its own copy of what was worn (`Mob::worn_`) and a
+// per-tick loop in session.cpp reconciled the two through latches. Now the
+// Kit is the truth and the rig's worn shells are DERIVED from its equipment
+// (Mob::DressFromKit); an NPC's pack is its Kit's bag.
+//
+// A plain struct: nothing here reaches into the rig. The one rule the rig
+// needs from its callers — a stack leaving a WORN equip slot must take the
+// shells' live damage with it — is why a creature's kit is moved through
+// Mob::KitMove / Mob::KitTake rather than through Move below when the
+// creature is wearing it.
+struct Kit {
   Equipment equip;
   Bag bag;
-  // Damage carried by worn pieces that are not currently ON the body (see
-  // WornDamage). Held here rather than on Equipment because it outlives any
-  // one slot: a robe dragged to the pack and back is the same robe.
-  std::map<std::string, WornDamage> wornDamage;
+  Inventory hotbar;
 
-  // Read a piece's damage, or null when it has never been hurt. Const so a
-  // caller cannot create an entry by asking.
-  const WornDamage* Damage(const std::string& item) const {
-    auto it = wornDamage.find(item);
-    return it == wornDamage.end() ? nullptr : &it->second;
-  }
-  // Record it, or forget it when the piece is whole again (a re-wear of an
-  // undamaged piece must not leave an empty blob behind to be saved).
-  void SetDamage(const std::string& item, WornDamage d) {
-    if (item.empty()) return;
-    if (d.Empty())
-      wornDamage.erase(item);
-    else
-      wornDamage[item] = std::move(d);
-  }
-
-  // Resolve a reference to the stack it names. `hotbar` is passed in rather
-  // than owned: the hotbar predates this struct, main.cpp owns it, and moving
-  // it in here would be a refactor of the melee path for no gain.
-  ItemStack* Resolve(const KitRef& r, Inventory& hotbar) {
+  // Resolve a reference to the stack it names.
+  ItemStack* Resolve(const KitRef& r) {
     switch (r.space) {
       case KitSpace::Bag:
         return (r.index >= 0 && r.index < Bag::kSlots) ? &bag.slots[r.index]
@@ -398,6 +332,9 @@ struct PlayerKit {
         return nullptr;
     }
   }
+  const ItemStack* Resolve(const KitRef& r) const {
+    return const_cast<Kit*>(this)->Resolve(r);
+  }
 
   // MOVE ONE STACK. Always a SWAP, never an overwrite: dropping a sword onto
   // an occupied slot puts what was there into the slot you came from, which is
@@ -407,16 +344,19 @@ struct PlayerKit {
   // The kind check runs on BOTH ends, because a swap moves two items: dragging
   // a sword from the sheath onto a helm would otherwise put the helm in the
   // sheath without the sheath ever being asked.
-  MoveResult Move(const KitRef& from, const KitRef& to, Inventory& hotbar,
+  //
+  // Data only. On a creature that is WEARING this kit, call Mob::KitMove,
+  // which flushes the shells into the stacks first and re-dresses after.
+  MoveResult Move(const KitRef& from, const KitRef& to,
                   const ItemLibrary& lib) {
     if (from == to) return MoveResult::SameSlot;
-    ItemStack* a = Resolve(from, hotbar);
-    ItemStack* b = Resolve(to, hotbar);
+    ItemStack* a = Resolve(from);
+    ItemStack* b = Resolve(to);
     if (!a || !b) return MoveResult::BadSlot;
     if (a->Empty()) return MoveResult::Empty;
 
     auto kindOf = [&](const ItemStack& s) {
-      const ItemDef* d = lib.At(s.Empty() ? -1 : s.def);
+      const ItemDef* d = lib.Of(s);
       return d ? d->kind : ItemKind::None;
     };
     // Only EQUIP slots validate. Bag and hotbar take anything — they are
@@ -428,11 +368,43 @@ struct PlayerKit {
         !EquipSlotAccepts(from.index, kindOf(*b)))
       return MoveResult::WrongKind;
 
-    ItemStack tmp = *a;
-    *a = *b;
-    *b = tmp;
+    std::swap(*a, *b);
     return MoveResult::Ok;
   }
+
+  // Everything in it, bag then hotbar then equipment — the order the old
+  // avatar-kit callback handed a rising its stacks in.
+  template <typename F>
+  void ForEachStack(F&& f) {
+    for (ItemStack& s : bag.slots) f(s);
+    for (ItemStack& s : hotbar.slots) f(s);
+    for (ItemStack& s : equip.slots) f(s);
+  }
+
+  // THE ONE RELOAD RULE. Every slot holds a NAME, so an R hot-reload that
+  // reorders items.json changes nothing here; the only thing it can do to a
+  // kit is REMOVE an item, and a slot naming one is emptied with a log line
+  // rather than kept pointing at nothing. A vessel's contents are re-clamped
+  // to the (possibly edited) capacity. Returns how many slots it emptied.
+  int DropUnknown(const ItemLibrary& lib) {
+    int dropped = 0;
+    ForEachStack([&](ItemStack& s) {
+      if (s.Empty()) return;
+      const ItemDef* d = lib.Of(s);
+      if (!d) {
+        dropped++;
+        s = ItemStack{};
+        return;
+      }
+      if (!d->IsContainer()) {
+        s.fillMat = s.fillAmt = 0;
+      } else if (s.fillAmt > d->container.capacity) {
+        s.fillAmt = (uint16_t)d->container.capacity;
+      }
+    });
+    return dropped;
+  }
+  void Clear() { *this = Kit{}; }
 };
 
 // Why a move was refused, as the sentence the panel shows. Kept beside the
@@ -453,27 +425,16 @@ inline const char* MoveResultText(MoveResult r, const KitRef& to) {
   }
 }
 
-// ---- name <-> index, the reload/persistence seam ---------------------------
+// ---- instance <-> library, the reload/persistence seam ---------------------
 //
-// Every stored index dies on an R hot-reload or a save/load across a content
-// change, so both directions of the crossing go through these two helpers
-// rather than being re-derived at each call site. An unresolvable name drops
-// the stack and says so — content may legitimately have been removed between
-// saves, and silently keeping an index into a shorter library is the failure
-// mode that reads as "my sword turned into a rock".
-inline std::string KitItemName(const ItemStack& s, const ItemLibrary& lib) {
-  const ItemDef* d = lib.At(s.Empty() ? -1 : s.def);
-  return d ? d->name : std::string();
-}
-
-// `dye` rides across the crossing with the name, because it is the OTHER half
-// of what a stack is once garments can be coloured (game/dye.h): a name says
-// which pattern, a dye says which of the hundreds of shirts cut to it this one
-// is. A reload that carried only the name would quietly bleach the player's
-// whole wardrobe, which looks like a rendering bug rather than a data loss.
-inline ItemStack KitItemFromName(const std::string& name, int count,
-                                 const ItemLibrary& lib, uint32_t dye = 0) {
-  if (name.empty() || count <= 0) return ItemStack{};
-  int i = lib.Find(name);
-  return i < 0 ? ItemStack{} : ItemStack{i, count, dye};
+// A stack is an ItemInstance and already carries its NAME, so nothing crosses
+// a reload or a save by index any more. What remains is resolving a name that
+// arrived from outside (a save, a packet, a loot list) into a stack this
+// library can back: an unresolvable name drops the stack and the caller says
+// so — content may legitimately have been removed between saves, and keeping
+// a name nothing can resolve is the failure mode that reads as "my sword
+// turned into a rock".
+inline ItemStack KitStackFrom(const ItemInstance& in, const ItemLibrary& lib) {
+  if (in.Empty() || lib.Find(in.name) < 0) return ItemStack{};
+  return in;
 }

@@ -106,12 +106,18 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
     return Status::Fail;
   }
 
+  // A stack of library entry `def`, by NAME (W2-M: a slot is an ItemInstance).
+  auto S = [&](int def, int count) { return StackOf(items, def, count); };
+  auto nameAt = [](const ItemStack& s) {
+    return s.Empty() ? std::string() : s.name;
+  };
+
   // ---- 1. the refusal matrix ----------------------------------------------
   {
-    PlayerKit kit;
-    Inventory hb;
-    hb.slots[0] = {blade, 1};
-    hb.slots[1] = {rock, 1};
+    Kit kit;
+    Inventory& hb = kit.hotbar;
+    hb.slots[0] = S(blade, 1);
+    hb.slots[1] = S(rock, 1);
 
     const KitRef fromBlade{KitSpace::Hotbar, 0};
     const KitRef fromRock{KitSpace::Hotbar, 1};
@@ -119,14 +125,14 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
     const KitRef toHead{KitSpace::Equip, head};
     const KitRef toBag{KitSpace::Bag, 0};
 
-    check(kit.Move(fromBlade, toSheath, hb, items) == MoveResult::Ok,
+    check(kit.Move(fromBlade, toSheath, items) == MoveResult::Ok,
           "a melee weapon goes in the sheath");
-    check(kit.equip.At(sheath).def == blade, "and it is actually there");
+    check(nameAt(kit.equip.At(sheath)) == "kit_blade", "and it is actually there");
     check(hb.slots[0].Empty(), "and it left the hotbar slot it came from");
 
     // The head slot takes helms and nothing else. `kit_rock` is
     // ItemKind::None, which no slot may ever accept.
-    check(kit.Move(fromRock, toHead, hb, items) == MoveResult::WrongKind,
+    check(kit.Move(fromRock, toHead, items) == MoveResult::WrongKind,
           "the head slot refuses a rock");
     check(kit.equip.At(head).Empty(), "and nothing landed in it");
     check(!hb.slots[1].Empty(), "and the rock stayed where it was");
@@ -137,29 +143,56 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
     const char* why = MoveResultText(MoveResult::WrongKind, toHead);
     check(why && *why, "a refused move explains itself");
 
-    check(kit.Move(fromRock, toBag, hb, items) == MoveResult::Ok,
+    check(kit.Move(fromRock, toBag, items) == MoveResult::Ok,
           "the pack takes anything");
-    check(kit.Move(fromRock, toBag, hb, items) == MoveResult::Empty,
+    check(kit.Move(fromRock, toBag, items) == MoveResult::Empty,
           "moving from a slot you already emptied is refused, not repeated");
 
     // ---- 2. swap, never overwrite ----
-    hb.slots[0] = {rock, 3};
-    const int before = kit.equip.At(sheath).def;
-    check(kit.Move(KitRef{KitSpace::Equip, sheath}, fromBlade, hb, items) ==
+    hb.slots[0] = S(rock, 3);
+    const std::string before = nameAt(kit.equip.At(sheath));
+    check(kit.Move(KitRef{KitSpace::Equip, sheath}, fromBlade, items) ==
               MoveResult::WrongKind,
           "a swap validates the RETURNING item against the slot it goes into");
-    check(kit.equip.At(sheath).def == before,
+    check(nameAt(kit.equip.At(sheath)) == before,
           "and a refused swap changes nothing on either side");
-    check(hb.slots[0].def == rock && hb.slots[0].count == 3,
+    check(nameAt(hb.slots[0]) == "kit_rock" && hb.slots[0].count == 3,
           "including the count of the item that would have moved");
 
     // A legal swap: bag <-> sheath, both holding blades' worth of nothing
     // special, so the only thing under test is that both stacks survive.
-    kit.bag.slots[5] = {rock, 2};
-    kit.Move(KitRef{KitSpace::Bag, 5}, KitRef{KitSpace::Bag, 6}, hb, items);
-    check(kit.bag.At(6).def == rock && kit.bag.At(6).count == 2,
+    kit.bag.slots[5] = S(rock, 2);
+    kit.Move(KitRef{KitSpace::Bag, 5}, KitRef{KitSpace::Bag, 6}, items);
+    check(nameAt(kit.bag.At(6)) == "kit_rock" && kit.bag.At(6).count == 2,
           "a move carries the whole stack, count included");
     check(kit.bag.At(5).Empty(), "and empties the source");
+  }
+
+  // ---- 2a. ONE ITEM, ONE INSTANCE (W2-M) -----------------------------------
+  //
+  // A slot is an ItemInstance, so what makes an object ITSELF — its colour,
+  // what a vessel holds, the holes in a worn piece — is part of the slot and
+  // decides what stacks. Two pristine blades merge; a damaged one does not,
+  // and neither does a second damaged one with DIFFERENT damage: the two
+  // identical tunics of the plan keep separate holes.
+  {
+    Inventory hb;
+    ItemStack a = S(blade, 1), b = S(blade, 1);
+    check(a.StacksWith(b), "two pristine blades of one colour stack");
+    b.damage.shells.resize(1);
+    b.damage.shells[0].hp = 2.0f;
+    check(!a.StacksWith(b) && !b.StacksWith(b),
+          "a damaged piece stacks with nothing, not even its twin");
+    const int ia = hb.Add(a), ib = hb.Add(b);
+    ItemStack c = S(blade, 1);
+    c.damage.shells.resize(1);
+    c.damage.shells[0].hp = 7.0f;
+    const int ic = hb.Add(c);
+    check(ia >= 0 && ib >= 0 && ic >= 0 && ia != ib && ib != ic && ia != ic,
+          "so two damaged twins land in two slots");
+    check(ib >= 0 && ic >= 0 && hb.slots[ib].damage.shells[0].hp == 2.0f &&
+              hb.slots[ic].damage.shells[0].hp == 7.0f,
+          "each keeping its OWN damage");
   }
 
   // ---- 2b. WHERE A PIECE GOES WHEN NOBODY AIMED ---------------------------
@@ -193,13 +226,13 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
     // what makes right-click a swap rather than a refusal once you are
     // dressed. The empty-first preference only matters when a kind has more
     // than one home, which the quick slots give the melee kind.
-    eq.slots[m] = {blade, 1};
+    eq.slots[m] = S(blade, 1);
     const int again = EquipSlotFor(ItemKind::Melee, eq);
     check(again >= 0 && again != m,
           "with the sheath full, a second blade finds the next empty slot "
           "that takes it rather than knocking the first one out");
     for (int s = 0; s < kEquipSlotCount; s++)
-      if (EquipSlotAccepts(s, ItemKind::Melee)) eq.slots[s] = {blade, 1};
+      if (EquipSlotAccepts(s, ItemKind::Melee)) eq.slots[s] = S(blade, 1);
     check(EquipSlotFor(ItemKind::Melee, eq) == m,
           "and with every one of them full it falls back to the first, which "
           "swaps");
@@ -222,40 +255,39 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
   }
 
   // ---- 4. names survive a library reorder ---------------------------------
-  // THE BUG THIS EXISTS FOR: every item slot stores an index into
+  // THE BUG THIS EXISTED FOR: every item slot stored an index into
   // ItemLibrary::items, and that order is the order of items.json. Editing
-  // that file — even just moving an entry — renumbers everything. The
-  // crossing has to go through names in BOTH directions.
+  // that file — even just moving an entry — renumbered everything. Since
+  // W2-M a slot holds the NAME, so a reorder is a no-op by construction and
+  // this asserts exactly that, plus the one thing a reload can still do.
   {
-    PlayerKit kit;
-    Inventory hb;
-    kit.equip.slots[sheath] = {blade, 1};
-    hb.slots[3] = {rock, 4};
-
-    // Snapshot by name, "reload" a library with the entries swapped, restore.
-    const std::string sheathName = KitItemName(kit.equip.At(sheath), items);
-    const std::string hbName = KitItemName(hb.slots[3], items);
-    const int hbCount = hb.slots[3].count;
+    Kit kit;
+    kit.equip.slots[sheath] = S(blade, 1);
+    kit.hotbar.slots[3] = S(rock, 4);
 
     const ItemLibrary reordered = MakeItems(true);
     check(reordered.Find("kit_blade") != blade,
           "the fixture reorder actually MOVED the blade's index");
-
-    kit.equip.slots[sheath] = KitItemFromName(sheathName, 1, reordered);
-    hb.slots[3] = KitItemFromName(hbName, hbCount, reordered);
-    check(KitItemName(kit.equip.At(sheath), reordered) == "kit_blade",
+    check(kit.DropUnknown(reordered) == 0, "a reorder drops nothing");
+    const ItemDef* sd = reordered.Of(kit.equip.At(sheath));
+    const ItemDef* hd = reordered.Of(kit.hotbar.slots[3]);
+    check(sd && sd->name == "kit_blade",
           "the sheathed weapon is still the weapon after a reorder");
-    check(KitItemName(hb.slots[3], reordered) == "kit_rock" &&
-              hb.slots[3].count == hbCount,
+    check(hd && hd->name == "kit_rock" && kit.hotbar.slots[3].count == 4,
           "and so is the hotbar stack, count and all");
 
     // A name that is GONE drops the slot rather than resolving to a neighbour.
     ItemLibrary shrunk;
     shrunk.items.push_back(reordered.items[0]);
-    const ItemStack lost = KitItemFromName("kit_blade", 1, shrunk);
-    check(lost.Empty(),
-          "an item removed from the library empties its slot instead of "
-          "pointing at whatever took its index");
+    const std::string kept = reordered.items[0].name;
+    check(kit.DropUnknown(shrunk) == 1,
+          "an item removed from the library empties exactly its slot");
+    check(nameAt(kit.equip.At(sheath)) == (kept == "kit_blade" ? kept : "") &&
+              nameAt(kit.hotbar.slots[3]) == (kept == "kit_rock" ? kept : ""),
+          "instead of pointing at whatever took its index");
+    check(KitStackFrom(ItemInstance{"kit_blade", 1}, shrunk).Empty() ==
+              (kept != "kit_blade"),
+          "and a name arriving from outside resolves only if it exists");
   }
 
   // ---- 5. the 'PLYR' section round-trips ----------------------------------
@@ -265,34 +297,38 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
   // game/persist.h exists to close.
   {
     PlayerCaster caster;
-    Inventory hb;
-    PlayerKit kit;
+    Kit kit;
+    Inventory& hb = kit.hotbar;
     for (int i = 0; i < (int)glyphs.glyphs.size(); i++)
       caster.inventory.Grant(i);
     caster.inventory.Bind(0, glyphs.Find("kit_trail"));
     caster.inventory.Bind(4, glyphs.Find("kit_fire"));
-    hb.slots[2] = {blade, 1};
-    hb.slots[7] = {rock, 9};
+    hb.slots[2] = S(blade, 1);
+    hb.slots[7] = S(rock, 9);
     hb.Select(7);
-    kit.bag.slots[0] = {rock, 2};
-    kit.bag.slots[Bag::kSlots - 1] = {blade, 1};
-    kit.equip.slots[sheath] = {blade, 1};
-    // v2: WORN DAMAGE. The owner's decision is that armour damage persists
+    kit.bag.slots[0] = S(rock, 2);
+    kit.bag.slots[Bag::kSlots - 1] = S(blade, 1);
+    kit.equip.slots[sheath] = S(blade, 1);
+    // WORN DAMAGE. The owner's decision is that armour damage persists
     // EXACTLY, so this is a lattice and not a percentage — and a lattice is
     // the one thing a format bump has to be able to carry without silently
     // truncating. Two shells, one holed and one intact, because "the empty
     // entries survive too" is the half that a save writing only the damaged
     // shells would get wrong by re-indexing them.
+    //
+    // ON ONE BLADE ONLY (v7, W2-M): the sheathed blade is holed, the hotbar
+    // and pack blades are not. Before v7 the damage was one blob per item
+    // NAME, and all three would have come back sharing it.
     {
       WornDamage d;
       d.shells.resize(2);
       d.shells[0].hp = 4.5f;
       d.shells[0].lattice.push_back(PrefabVoxel{1, 2, 3, 48, 200});
       d.shells[0].lattice.push_back(PrefabVoxel{4, 5, 6, 49, 0});
-      kit.SetDamage("kit_blade", std::move(d));
+      kit.equip.slots[sheath].damage = std::move(d);
     }
 
-    PlayerKitRefs refs{&caster, &glyphs, &hb, &kit, &items};
+    PlayerKitRefs refs{&caster, &glyphs, &kit, &items};
     EntityIO io = MakeEntityIO(c.debris, c.mobs, nullptr, &refs);
     const EntitySection* plyr = nullptr;
     for (const EntitySection& s : io.sections)
@@ -312,22 +348,21 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
                 kit.equip.At(sheath).Empty() &&
                 caster.inventory.owned.empty(),
             "reset clears the hotbar, the pack, the equipment and the glyphs");
-      check(kit.wornDamage.empty(), "and the worn damage with them");
+      check(kit.equip.At(sheath).damage.shells.empty(),
+            "and the worn damage with them");
 
       check(plyr->load(bytes.data(), bytes.size(), kPlayerKitSaveVersion),
             "and the payload loads back");
       // Compared BY NAME, which is the currency the format stores in: an
       // index-to-index comparison could pass on a format that never converted.
-      check(KitItemName(hb.slots[2], items) == "kit_blade",
-            "the hotbar came back");
-      check(KitItemName(hb.slots[7], items) == "kit_rock" &&
-                hb.slots[7].count == 9,
+      check(nameAt(hb.slots[2]) == "kit_blade", "the hotbar came back");
+      check(nameAt(hb.slots[7]) == "kit_rock" && hb.slots[7].count == 9,
             "with its counts");
       check(hb.selected == 7, "and the selected slot");
-      check(KitItemName(kit.bag.At(0), items) == "kit_rock" &&
-                KitItemName(kit.bag.At(Bag::kSlots - 1), items) == "kit_blade",
+      check(nameAt(kit.bag.At(0)) == "kit_rock" &&
+                nameAt(kit.bag.At(Bag::kSlots - 1)) == "kit_blade",
             "the pack came back, including its last slot");
-      check(KitItemName(kit.equip.At(sheath), items) == "kit_blade",
+      check(nameAt(kit.equip.At(sheath)) == "kit_blade",
             "and the sheathed weapon");
       check((int)caster.inventory.owned.size() == (int)glyphs.glyphs.size(),
             "every known glyph came back");
@@ -339,8 +374,14 @@ Status GatePlayerKit(Ctx& c, std::string& detail) {
       // v2: the holes came back where they were. Compared cell for cell,
       // because "the right number of voxels" is what a format that dropped
       // the coordinates would also report.
-      const WornDamage* d = kit.Damage("kit_blade");
+      const WornDamage* d = kit.equip.At(sheath).damage.shells.empty()
+                                ? nullptr
+                                : &kit.equip.At(sheath).damage;
       check(d != nullptr, "worn damage came back");
+      check(hb.slots[2].damage.Empty() &&
+                kit.bag.At(Bag::kSlots - 1).damage.Empty(),
+            "ON THE SLOT IT WAS ON: the other two blades came back whole "
+            "(W2-M: two identical pieces keep separate damage)");
       if (d) {
         check(d->shells.size() == 2,
               "including the intact shell, so the per-shell indices still line "

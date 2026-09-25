@@ -1215,7 +1215,27 @@ reproducible (killing lockstep networking and replay debugging).
   updated again by a later color pass in the same tick. v0 stores each voxel in
   a u32 word (16-bit voxel + 8-bit stamp + 8 spare) since WebGPU storage buffers
   address u32s; repacking to 16 bpv + separate stamp layer is an M2+ memory
-  optimization.
+  optimization. (Since narrowed to 3 bits cycling 1..7, `STAMP_NEVER` = 0 —
+  common.wgsl `stampFor`.)
+- **The stamp gate must not eat a keep-awake mark (2026-09-24, rule-unification
+  W2-R; `sim_step.wgsl` main's `skip`, gate `stamp-sleep`).** A cell that moved
+  and then sits still keeps a stale stamp that EQUALS the current code once
+  every 7 ticks (at substep 0: 7 ticks after a substep-0 write, 4 after a
+  substep-1 one). Movement loses nothing (the other substep moves it), but
+  reactions and staining run on substep 0 only, and "matched but did not fire"
+  (`DIRTY_R_REACT` / `_STAIN`) is what holds a chunk awake. On the alias tick
+  a lone matched cell never marked, its chunk slept with the reaction pending,
+  and nothing woke it: `stamp-sleep` dropped one acid voxel onto iron in each
+  of 8 shafts and 7 slept exactly on their alias tick, iron never eaten.
+  Fix: on substep 0 a stamp-skipped cell still runs its coat rules, its
+  bucket and its staining as a PROBE — every predicate and keepAwake, no roll,
+  no write — then returns before the movement code. Nothing fires or moves
+  twice. Every write that leaves a live stamp already marks the written cell's
+  chunk, so for a genuinely-acted cell the probe only adds a reason bit to an
+  awake chunk; membership changes exactly at the alias. One call site per
+  evaluator (a separate helper inlined a second `doReactions` into `main` and
+  cost the forest fire 7% of CA time); as landed, `--perf forestfire` CA 27.2
+  -> 27.9 ms/frame, awake chunks +0.3%.
 - **The stain layer (2026-08-20)** claims 7 of those 8 spare bits: bits 24..27 a
   stain AMOUNT (1..15) and bits 28..30 a stain TYPE (1..7, 0 = unstained). Bit 31
   stays reserved for `kCellOpIfAir`, a transient CPU→GPU message flag that
@@ -3056,6 +3076,11 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     so the surface eroded and the chunk never slept. With the strict order a
     washer only lowers a foreign amount and a stainer only raises its own, so
     every cell reaches a fixed point. Blood no longer recolours wet ground.
+    (Amended 2026-09-24, W2-J2 -- "One stain precedence" below: on ABSORBENT
+    ground a stainer displaces a washer's wetness at one level it PAYS an
+    eighth of itself for, so that cycle drains both liquids and ends; on
+    stone, where a mark is free, the strict order above still holds. Blood
+    and ichor still never repaint each other.)
   - Both fit in `stainPack`'s spare bits (27..30 capacity, 31 washes), so the
     64-byte `Material` still did not grow.
   - **Sleep discipline (rule 2)** survives because every step is monotone toward
@@ -3065,6 +3090,9 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     puddle on saturated ground sleeps. This is also why saturation is TERMINAL
     and there is no drying-out rule: a cell that could both wet and dry would
     never reach a fixed point, and those chunks would never sleep again.
+    (Since 2026-09-24 a stain on absorbent ground can be SPENT by a reaction --
+    see "A coat is a co-located virtual neighbour" below. There is still no
+    drying rule, and the monotone argument is replaced there by a mass one.)
   - Absorption writes SELF, which the stain rule otherwise never does. Reach is
     still ≤1 cell so the lattice argument holds, and the write sets the substep
     stamp so the movement code cannot also move the cell and double-spend the
@@ -3075,6 +3103,236 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
     now re-dirties only if `canFlowAnywhere` says the cell has somewhere to go.
     It went unnoticed because the sleep selftest only ever settled water and
     powders, both `moveEvery == 1`.
+
+- **A coat is a co-located virtual neighbour (2026-09-24; rule-unification
+  W2-J1 grid, W2-J2 bodies; `sim_step.wgsl` `coatReact` + `doReactions`,
+  `MobSystem::BurnOneLimb` section 0, the shared arithmetic in
+  `src/sim/coatrule.h`; gates `stain-react`, `coat-parity`).**
+  Before this the grid ignored its own stains in reactions -- wet grass burnt
+  like dry, oiled dirt was not flammable -- while a body wearing the same
+  substances reacted to them through four hand-written sections of
+  `MobSystem::BurnOneLimb` (hot coat, wet douse/boil, fuel flash, corrosive
+  bite). This is the ONE rule for both populations, and since W2-J2 both run
+  it: the four body sections are gone and section 0 of `BurnOneLimb` is this
+  rule over the body lattice. It is expressed entirely in `reactions.json`
+  plus the `stain` / `absorb` / `coat.depth` blocks: no material is named. The
+  parts that are pure arithmetic -- the verdict of a matched coat rule (rules
+  2-3), the level spend, the ramp count (rule 4 + clause 4a) -- are written
+  once per language and compared by `check_invariants.py coatrule`
+  (`sim_step.wgsl` <-> `coatrule.h`).
+
+  **THE RULE.** A cell (a grid voxel, or a body voxel) of material V wearing a
+  coat of material C at amount a >= 1. S is the cell's PITCH: lattice cells
+  per world voxel (1 on the grid and on a loose body of world voxels; a
+  creature's `skinScale`, 8 for the human). The numbered rules are W2-J1's;
+  the lettered clauses are W2-J2's, each population-neutral and each
+  satisfied trivially by the grid, which is how the body's load-bearing
+  behaviours were kept without a body-only case.
+
+  0. *What is a coat.* On a body, every stain is a coat (the stain byte names
+     a material, and a body coat is laid by contact, pour or splatter -- it is
+     the substance). On the ground, a stain is a coat iff the substrate
+     ABSORBS (`absorb.capacity` > 0), because only absorbent ground takes a
+     level the liquid PAID for (`stainStep`'s spend: an eighth of fullness, or
+     MPM mass); a capacity-0 surface takes a free one-level mark, and a free
+     mark that could react would make matter from nothing. C is the stain
+     type's material (the first material registered with that slot);
+     `bodyOnly` stains have no ground type and are never grid coats.
+  1. *The coat's rules.* C's PAIR rules, in file order, run with C as `self`
+     standing where the cell stands. Its partners are **V itself first** and
+     then the cell's six face neighbours (rule direction mask honoured on the
+     grid; RNG-rotated). C's decay and emit rules do NOT run through a coat:
+     how long a coat lasts is its stain's business (ground: monotone, no
+     decay; body: `coat.decay`).
+     - *1a. The coat touches what it is ON first (W2-J2).* The order was
+       faces-then-V. On a body that makes a coat on the surface bite the
+       voxel BESIDE or BEHIND its wearer before the wearer itself -- acid on
+       skin eating the flesh under the skin and the coated skin next to it,
+       destroying its own coat as it goes -- where the old section 3 ate the
+       voxel the acid was on. On the grid the order is not observable today:
+       no ground coat material (water, oil, blood, ichor) has a rule that
+       rewrites its partner, so which matching partner is taken changes no
+       write, and the rolls are per rule, not per partner.
+  2. *Firing through the coat spends one level* (a -> a-1; at 0 the cell is
+     clean) instead of rewriting the coat's side of the rule. The coat side's
+     PRODUCT is put into the world only if it is a FLAME (a gas tagged `hot`,
+     `kMatFlagFlame`), into an open face of the cell (air first, else a gas
+     cell); a flame with no open face makes the rule not match at all. Any
+     other coat-side product is not created (a level is at most an eighth of a
+     liquid cell). The partner's side is ordinary: a face partner takes
+     `neighborBecomes`; if the partner is V itself, V is rewritten and the new
+     voxel is born clean (the coat goes with the voxel it was on).
+     - *2a. A partner outside the wearer's own storage is read-only.* A
+       coat rule whose `neighborBecomes` would rewrite such a partner does not
+       match it. For a body that is every grid cell, every sibling limb and
+       every worn shell -- the licence the body's own rules have always had
+       (a limb writes the grid only by fill-air emission) -- and "open face"
+       means the lattice, a sibling and a shell all leave that face open and
+       the grid cell there is air (else a gas; a flame released into a gas
+       cell is made and spent but the fill-air op is refused). The grid has
+       nothing outside its own storage.
+     - *2b. A FILM stays on a voxel rewritten in place; a HELD coat goes with
+       it.* A coat on a substrate that absorbs is liquid held IN it and is
+       released by any rewrite of that voxel (what rule 2's "born clean"
+       says); a coat on a substrate that does not absorb is a film ON it and
+       survives the voxel changing state in place (a SOLID product: skin ->
+       flesh_cooked), while a voxel that LEAVES (air, gas, liquid) takes its
+       coat with it. A firing through a film that rewrote V in place still
+       spends its one level. Every grid coat is held (rule 0), so the grid is
+       unchanged; every body material authored today is a film, so a lava
+       coat survives the sear it causes, and blood stays on seared skin as it
+       always did.
+  3. *A quenching coat covers the cell.* If a coat rule MATCHED this tick
+     (partner found, rolled or not) and its coat-side product is not a flame,
+     the cell is COVERED for this tick: V's own rules see its coat and nothing
+     else (no face partner, no emit, faces not counted in ramps). A coat whose
+     matched rule makes a flame covers nothing.
+  4. *The cell's rules see the coat.* V's PAIR rules take the coat as a
+     partner after the six faces (one roll per rule per tick, whichever
+     partner it is; no direction mask). A direct neighbour-count ramp counts
+     the coat as one more matching neighbour, capped at 6; an inverted ramp
+     does not count it. Fired with the coat as partner, rule 2 applies to the
+     coat side (`neighborBecomes` of a flame is released, of anything else
+     not created; one level spent unless V itself was rewritten -- and see
+     2b for a film).
+     - *4a. On a lattice finer than the world (S > 1) a matching coat counts
+       as a face widened at world pitch: 5* (the face and its four tangential
+       neighbours, taken as a max against the direct count, exactly as a body
+       face into world matter is widened -- "On a body the count is taken at
+       world pitch", `BurnOneLimb`'s `ntan`). A coat is a sheet over the
+       voxel, and a skin voxel's other five faces are its own flesh however
+       much lava is on it, so "one more face" could never reach flesh's
+       authored `minCount` 3 and a lava coat would sear skin but never set it
+       alight. At S = 1 the widening is off and the coat counts 1, which is
+       the grid.
+  5. *Two reactants.* The coat and the cell each fire at most one rule per
+     tick, the coat's first; V's rules then see the coat as it is after.
+  6. *Only the wearer sees its coat.* A neighbour's rules see V, never V's
+     coat: `lava + tag:organic -> fire` still burns wet grass, as a body's
+     inbound pass burns a wet limb. On a body the "neighbour" includes a
+     lattice neighbour: a wet voxel no longer douses the burning voxel beside
+     it (its water boils instead, and it is covered while it does).
+  7. *A DEEP coat pays for what it eats (W2-J2).* A coat authored
+     `coat.depth` world voxels deep (default 1) is depth x S cells deep. When
+     depth x S > 1, a coat rule that rewrites matter of the wearer's own
+     storage -- V, or a face partner under 2a -- costs one layer's PRICE,
+     15 / (depth x S) levels (in milli-levels, rounded stochastically),
+     instead of rule 2's one level; if V LEAVES, what is left after the price
+     carries into V's lattice face neighbours (by the precedence rule below)
+     instead of going with the voxel. A coat THINNER than one layer's price
+     may rewrite only if its amount clears a threshold fixed per voxel
+     (keyed on V's lattice position, not the tick and not the amount); else
+     its rewriting rules do not match this tick. So a full coat eats
+     `coat.depth` WORLD voxels whatever the wearer's pitch, and is then
+     spent: the depth is what was poured (CLAUDE.md rule 2). Without it a
+     full acid coat would eat one 1/8-voxel layer of a human and stop, where
+     the old section 3 (and the owner) wanted skin and flesh gone. The grid
+     has S = 1 and no ground coat deeper than 1 (`bodyOnly` acid and lava are
+     the only authored depths), so it never fires there.
+
+  **ONE STAIN PRECEDENCE (W2-J2; `common.wgsl` `stainPrecedence`, called by
+  `stainStep`; `coatrule.h` `stainPrecedence`, called by every
+  `RaiseBodyStain` / `AddBodyStain`; `check_invariants.py stainprec`).**
+  Which of two stains owns a voxel. Clean or the same stain: climb (each
+  population's own ceiling -- the ground's capacity and one level a step, the
+  body's max or accumulation). A washer meeting a foreign stain: rinse it
+  down. Anything else meeting a foreign stain: displace it only if strictly
+  HEAVIER, or -- with a PAID level -- if it OUTRANKS it by class: a corrosive
+  coat over one that is not, anything over a washer's wetness. Otherwise the
+  foreign stain stays. Before this the body spelled it as `RaiseBodyStain`'s
+  "strictly larger" plus `MobSystem::CoatBeneath`'s two displacements, and the
+  ground as `stainStep`'s "a non-washer never paints over a foreign stain".
+  Where they legitimately differ: the ground names a stain by its PALETTE SLOT
+  (3 bits in the voxel word) and the body by its MATERIAL id (12 bits in the
+  coat word); the ground lays ONE level a step, so the weight clause never
+  fires there; and only absorbent ground PAYS for a level, so on stone a free
+  mark still never displaces (the 2026-09-23 cycle fix holds) while blood or
+  oil reaching WET absorbent ground now displaces the wet at one level it pays
+  an eighth of itself for -- a re-wet / re-stain cycle there drains both
+  liquids and ends (the mass argument below). Every body coat is paid (rule
+  0: it is the substance). The class of a coat material (washer / corrosive)
+  is derived at material load and published to `phys/bodystain.cpp` by
+  `MobSystem::SetMaterials`.
+
+  **What falls out, with no material named:** wet ground (water `washes`,
+  `water + tag:hot -> steam`) beside heat boils its coat level by level at
+  water's 180 per mille and, being covered meanwhile, does not catch until it
+  is dry -- the grid's version of the body's "wet does not burn". A wet
+  burning voxel is covered, stops emitting, and its own
+  `X + tag:extinguisher` douse runs against the coat. Oiled absorbent ground
+  (`oil + tag:hot -> fire`) beside heat flashes: each flash spends a level and
+  puts a flame in the open face above; oiled dirt, which cannot burn, burns
+  for as many flashes as it holds levels; oiled grass rolls its own ignition
+  at the dry rate as well. Blood and ichor own no pair rule, so a bloody cell
+  reacts exactly as a clean one.
+
+  **Rule 2 (termination), which the old argument no longer covers.** "Stain
+  only ever increases" is false now, so the argument is MASS: every level a
+  coat reaction spends was paid for in liquid (rule 0), each firing spends
+  exactly one, and a coat releases nothing but a flame, which the ordinary
+  fire chain bounds. So a re-wet / boil cycle (a pond wetting grass that
+  lava boils) drains the pond and ends. A matched coat rule holds its chunk
+  awake as any matched rule does, a light-gated one does not, and a coat with
+  no partner marks nothing: a rained-on meadow sleeps (`stain-react`'s SLEEPS
+  claim). A spend rewrites the cell's word with `STAMP_NEVER`, not the live
+  stamp: a live stamp on a cell that then sits still aliases the current one
+  every `STAMP_CYCLE` (7) ticks, the cell is skipped before it can mark
+  keepAwake, and the first version let a chunk fall asleep mid-burn with 2 of
+  72 oil levels left beside live lava. (The same alias skipped ANY lone
+  matched-but-unfired cell that once moved; W2-R fixed it at the gate for
+  every cell -- see "The stamp gate must not eat a keep-awake mark" under
+  Update hygiene -- which makes this STAMP_NEVER workaround redundant. It is
+  kept: it is harmless, and a spend is not a move.) Cost: a stained cell on absorbent ground in an AWAKE chunk pays a
+  palette load and a walk of C's pair rules; an absorbent solid with no rules
+  of its own is no longer skipped as inert when it wears a coat.
+
+  **The body against this rule, since W2-J2.** W2-J1 listed six ways
+  `BurnOneLimb` differed. Each is now either the rule or a clause above:
+  - the wet coat boiled at `coat.fireDrySeconds`: it now boils at water's
+    authored `water + tag:hot` 180 per mille, a level per firing, like wet
+    ground. `coat.fireDrySeconds` is read by nothing in the engine any more
+    (its tuning row stays until the tuning owner retires it).
+  - a douse paid 4 levels (`kCoatDouseCost`, deleted): a douse through the
+    coat is rule 4 and pays one level (2b: the charred voxel keeps its film).
+  - wet blocked only hot / burn-stage products: a wet voxel beside heat is now
+    COVERED (rule 3) -- its water's own rule matched a hot partner -- so its
+    rules see only the water, and nothing hot.
+  - an oil flash spent the WHOLE coat and set the voxel to `flashForm_` (skin
+    straight to flesh_burning): it now spends ONE level and releases the
+    flame into an open face (rule 2); the voxel's own rules answer that flame
+    from the grid next tick, as oiled grass does. Retired, not kept: the
+    owner's "oiled voxels super flammable" is now carried only by the flames
+    the oil throws against the body. `flashForm_` remains for
+    `IgniteOneLimb` (a flame put straight onto skin).
+  - the hot coat read as every open face, widened: it is one co-located
+    partner (rule 4), widened at world pitch by clause 4a -- the one pitch
+    correction kept.
+  - acid charged a depth price and carried inward: clause 7, which is exactly
+    that, now stated for any deep coat and any matter it rewrites.
+  Also gone with the sections: a wet LATTICE NEIGHBOUR no longer douses a
+  burning voxel (rule 6), and the coat's four RNG index spaces (+96 douse,
+  +128 bite, +160 flash) are one (+128).
+
+  Measured at the change (same gate list, main's exe as control where the
+  gate exists there): `lava-oil-coat` oiled forearm 3,806 burning voxel-ticks
+  vs clean 1,595 (was 22,920 vs 1,189), its oil 576 -> 447 levels-voxels in
+  150 ticks (was -> 0); lava still severs the forearm in 90 ticks
+  (1,056 -> 0). `debris-coat`'s oiled plank burns no faster than the clean
+  one (0 vs 0 of 49 in 50 ticks; the gate's "oil speeds the fire" claim is
+  red and is the owner's call). `acid-coat` 1,344 -> 585 (was 569), control
+  limb untouched, acid spent a tick after. `corpse-acid` 3,702 -> 3,688 (was
+  3,706 -> 3,680). `body-coat`'s soaked root sears 2 voxels in the fire
+  column vs 415 dry (was 0 vs 409): the gate parked `fireDrySeconds` long to
+  keep the water on, and that knob no longer reaches anything, so the water
+  boils off at its authored rate and the last voxels to dry sear. `rain-oil`
+  unchanged. `coat-parity` (grid vs a scale-1 loose body, same scenario):
+  oil 25 vs 26 of 48 levels left, dirt kept; wet 53 vs 53 of 96, grass not
+  caught; partnerless oil untouched on both.
+
+  Termination on a body is the ground's argument with the pour for the
+  liquid: every firing spends at least one level (a deep coat its price), a
+  body coat is only what was poured or splashed, and `coat.decay` dries what
+  does not react.
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
@@ -3094,8 +3352,8 @@ plain-English description per parameter — plus the range, which it does NOT
 write itself (below).
 
 **One row per knob (W2-Q, 2026-09-24).** `src/sim/tuning_params.def` has a row
-for every plain number, flag and name in `tuning.json` (899 rows: 402 carry a
-WGSL name, 497 are `NO_WGSL`), and the row is the only place the knob's type,
+for every plain number, flag and name in `tuning.json` (911 rows: 402 carry a
+WGSL name, 509 are `NO_WGSL`), and the row is the only place the knob's type,
 default and range are written:
 
 ```
@@ -4051,6 +4309,47 @@ neighbors, so this needs an explicit connectivity pass:
   current tick while anything burns would starve island detection forever.
   Selftest gate: `body burn` (ember-topped wood body must shed voxels and
   emit fire ops).
+- **One body-reaction evaluator (W2-I, 2026-09-24):** the pass described
+  above was a SECOND copy of the evaluator, forked from the living limb pass
+  and ported by hand ever since (3760ba5 -> ab2250f) — it never learned coats,
+  cross-limb heat or the wound slow-down, so an oiled plank caught like a
+  clean one and a soaked one too. It is gone. Every population is evaluated by
+  `MobSystem::BurnOneLimb` over a `BurnLimbView`: live limbs and dead-Mob
+  limbs (`BurnLimbs`), severed flesh (`BurnDeadFlesh` → `BurnFleshBodies`),
+  and every other debris body (`BurnBodies` → the reactor `MobSystem::Init`
+  installs with `DebrisSystem::SetBodyReactor` → `MobSystem::BurnLooseBody`).
+  `BurnBodies` keeps only the debris-shaped half: WHICH bodies are offered
+  (active / self-reacting / pair-or-scaled with a dirty chunk near / a solvent
+  against it), each offered body's fair SHARE of the tick's candidate budget
+  (floor `kBurnScanMinShare`), and the tail (`FinishBurn` → `BurnTail`). The
+  per-voxel candidates are the evaluator's FRONT, not a cursor (`burnCursor`
+  is deleted), so a burning log costs its burning surface. The evaluator's
+  cheap-gate WORLD WALK (every cell of the body's box) is paid from a per-tick
+  pot, `kBurnWalkPerTick` (65,536 cells, ~1 ms): a creature is a handful of
+  limbs, but a forest fire is ~200 bodies with smoke dirtying every chunk,
+  so no sleep key matched and every body walked every tick — measured on
+  `--forest-fire`, 193k cells/tick and `burnBodies` 1.22 → 2.96 ms/tick. A
+  visit whose walk does not fit is DEFERRED whole (`BurnLimbView::walkBudget`
+  / `walkDeferred`: nothing read, nothing changed — never a partial walk,
+  which could take the idle exit on a half-read box and sleep through a
+  fire), and `burnNext_` starts the next pass at it. After: 1.33 ms/tick,
+  debris row 1.82 → 1.96 ms/frame (the windowed harness moves ±15%; the
+  evaluator's counters print on its last line). Loose matter's
+  inputs ride the view: no coat ledger (no corrosive seeding), no creature
+  (no cross heat), no shells, no wound table, and the one thing only it has —
+  the dye a leaving voxel hands its grid product (`BurnLimbView::gridState` →
+  `DebrisSystem::GridStateFor`). Its burn state lives in
+  `MobSystem::looseBurn_`, keyed by the body's global id, retired after
+  `kBurnIndexGrace` ticks un-offered and cleared by `DebrisSystem::Reset`
+  (which restarts serials). `RecountBurn` counts a voxel whose COAT has pair
+  rules as pair-reactive, so an oiled stone is offered at all. The flag
+  columns (alight = ungated self rule; neighbour-gated self rules apart; pair;
+  rewrites-neighbour; inbound target; hot; attacks-body) come from ONE builder,
+  `BuildBodyReactFlags` (`sim/bodyreact.h`), used by both systems. The debris
+  copies of the day phase and rain word are gone with the evaluator.
+  Behaviour change, deliberate: debris now gets the full rule set. Gate
+  `debris-coat`: three ember-lit planks, clean / oiled / soaked — oil takes
+  the plank, the soaked plank neither catches nor keeps its ember.
 - **A corpse keeps burning (2026-09-02):** the scan budget above
   (`kBurnScanPerTick`, 4,096 voxels) was spent in list order to the last
   voxel, so whichever bodies came first took it all and every body after them
@@ -4065,7 +4364,8 @@ neighbors, so this needs an explicit connectivity pass:
   tick and each scanning body takes at most its SHARE (budget left over
   scanners left, floor `kBurnScanMinShare` = 256), handing the remainder on,
   with the per-body cursor carrying a body larger than its share across
-  ticks. Deterministic: order is a function of tick and the body list, rolls
+  ticks (the cursor is gone since W2-I: the candidates are the evaluator's
+  front, and the share bounds how much of it one body evaluates per tick). Deterministic: order is a function of tick and the body list, rolls
   of the (serial, voxel, tick, rule) key. Bodies burned below body-worthiness
   are erased after the loop, since the rotated order cannot survive a
   mid-loop swap-remove. **Gated self rules do not keep a body awake:** a
@@ -4872,6 +5172,148 @@ touch a creature with a sword, lose a limb, anywhere, every time.
 Gated by `wound-chip` / `wound-accumulate` / `wound-heft` / `wound-bleed`, with
 the hit-count BAND (not an exact count) in `tests/baseline.json`.
 
+### The damage cause is an argument (2026-09-24, W2-G; `phys/damagecause.h`, `game/severpolicy.h`, gate `damage-cause`)
+
+**What did this is a VALUE, passed down, never an ambient flag.** Every entry
+point that damages a creature states its cause and hands it explicitly through
+`Mob::Damage` → `CarveLimb` → `FlushBurn` → `Sever` (and
+`HpZeroSevers` / `JointRuleApplies` / `DropDisconnectedChildren`): `CutLimb`
+is `Blade`, `BluntHit` `Blunt` (`Unarmed` for a natural weapon), `BiteHit`
+`Bite`, `RotAtSpawn` `SpawnRot`, the burn / infection / joint-twin flushes
+`Burn`, the blast `Blast`, the laser `Beam`, a hard landing `Fall`, anything
+unstated `Other`. `DebrisSystem::DamageCause` is the same enum (an alias), so
+the living and the dead name a cause one way.
+
+It replaced six Mob flags (`inBurnFlush_`, `inSpawnRot_`, `inBladeCut_`,
+`inBluntCarve_`, `inUnarmedBlunt_`, `inBite_`) and MobSystem's audio
+`bladeCut_`, each set by a scope guard and read several calls deep in
+combinations. Every new cause had to re-patch every sever rule, because a flag
+nobody set read as "not me" to a rule it was not written for (b4daa6e, fd90f11,
+904dd30, 719df2d, 9d1701d). `bladeCut_` folded in exactly: it was set around
+precisely the `Damage` + `CutLimb` pair the Blade cause now marks.
+
+**`eaten` travels with the cause and is not one.** `DamageCtx::eaten` means
+the carve is `FlushBurn` expressing per-voxel removals in a batch — a burn tick,
+an infection step, the blunt pulp tick, or the pending tombstones a strike
+flushes before it reads the lattice. The pulp tick is `Blunt` + eaten; a sword
+that flushes a burning arm's tombstones is `Blade` + eaten. Eaten is what the
+old `inBurnFlush_` meant: consumed, not struck, so it cauterises and keeps
+fire's account of how a limb comes apart.
+
+**What each cause may do is ONE table** (`kCauseRows`, keyed `(cause, eaten)`,
+resolved against the limb's TISSUE by `SeverPolicyOf`). Columns: the
+extreme-impact sever, the bleed rate, whether a carve drips, brain charge, the
+collapse sever, children carried by a split, the cut-through rule, the joint
+rule, hp-0-severs-any-limb, the worn-shell exemption, gore, whether a severed
+garment drops, the death's name, a rotten vital limb detaching at hp 0, and
+the audio's blade cue. Tissue is a property of the slot: `Shell` (worn),
+`Bloodless` (hair), and for anatomy the body's `MobDef::bodyTissue` — `Flesh`,
+or `Rotten` where the zombie effect authors it. In code, not JSON, because
+every column is a structural rule a dozen gates describe in prose and nobody
+tunes; the content half (which bodies are rotten) is data.
+
+The `damage-cause` gate is the proof it changed nothing: it walks every
+`(cause, eaten, tissue)` and compares each column with the deleted flag
+expression, written out verbatim, and checks that the shipped `undead` defs
+are exactly the `rotten` ones.
+
+### One damage event, one shell response (2026-09-24, W2-H; `game/shellresponse.h`, `BlastForceOf`, `Mob::ApplyFallDamage`, gate `damage-sources`)
+
+**What a worn shell does to a blow is ONE function of two things**: the
+hardness of the voxel the blow STRUCK (`Mob::ShellMaterialAt`: the nearest
+live voxel of the shell's authoritative lattice) and the blow's
+`DamageCause`. `ShellResponseOf(hardness, cause)` answers four numbers, each a
+scale on something the caller already did: `carve` (the shell's share of the
+matter removal — kerf depth/length, dent radius, bore), `passed` (the share of
+the hp that reaches the limb underneath, `MobLimb::wornHost`), `shellHp` (the
+share the shell is charged itself) and `stop` (blast only: power a ray loses
+crossing it). The rows (`ShellRowOf`) read their numbers from `Tuning::Gear`:
+
+| cause | carve | passed | shellHp | stop |
+|---|---|---|---|---|
+| Blade | ratio `cutHardnessRef`/h, floor `cutHardnessMin` | 0 | 1 | — |
+| Blunt, Unarmed | ratio `bluntHardnessRef`/h, floor `bluntHardnessMin` | `bluntThrough` | `bluntShellHp` | — |
+| Bite | 0 | ramp `biteThroughSoft`..`biteThroughHard` | `biteOnShell` (as a blunt blow) | — |
+| Blast | 1 (the terrain rule acts per voxel) | 1 | 1 | h × `blastShellCells` |
+| Beam, Other, Burn, SpawnRot | 1 | 0 | 1 | — |
+| Fall | 0 | 1 | 0 | — |
+
+Until W2-H this existed three times (`CutLimb`, `BluntHit`, `BiteHit`, three
+curves, three tuning pairs, each reading `skinVoxels[0]` — the lattice's FIRST
+voxel, not the struck one), and every other source ignored shells. The melee
+rows are the old numbers moved; `damage-sources` arm A walks a hardness sweep
+against the three formulas written out verbatim. Reading the struck voxel
+changes nothing for any shipped garment (the gate's report: every shell of
+every shipped worn item is one material) — it matters for a mixed-material
+piece and for a shell whose first voxel has been burnt to a tombstone.
+
+**An explosion's body crater follows POWER, like the terrain's.**
+`sim_explode.wgsl` decides a cell by the power that reaches it: the blast's,
+less `sim.falloffPerCell` per cell of distance, less the hardness of
+everything the ray crossed; the cell goes if that beats its own hardness. The
+body crater (`Mob::CarveLimbRadial` with `blastPower` > 0, which is what
+`ExplosionHitsBodies` passes) takes the same budget per voxel — less the
+`stop` of every worn shell over that limb the ray from the centre crosses
+(`Mob::BlastShellStop`, the shell-index march the burn probe uses, memoised
+per half-voxel) — and what is left over the voxel's own hardness, against
+`gore.blastPowerRef`, scales the crater radius AT that voxel. The ragged rim is
+drawn inside that radius, so plate leaves a smaller torn crater rather than a
+thinned speckle. At or above the reference the crater is the full radius, so
+a grenade on bare flesh is exactly what it was (asserted); behind an iron
+cuirass (160 off a grenade's 380) or from a weak blast it shrinks. A blast
+that states no power (a splat, a test) keeps the radius-only crater. Body
+limbs carve before their appended shells, so the flesh sees the plate the
+blast met, not the hole the same blast puts in it.
+
+**One place reads a blast's reach and strength**: `BlastForceOf(ExplosionOp)`
+(`game/session.h`) — `craterRadius` (radius × `physics.explosionBodyDamageScale`),
+ONE `pushRadius` (radius × `physics.explosionImpulseRadiusScale`) for the debris
+impulse and the rig launch alike (`ragdoll.blastRadiusScale`, which held the
+same 3.0, is retired), `debrisImpulse` per loose body and `rigImpulse` per
+creature. The two impulse scales stay two numbers because they are two
+quantities (a shove per body, a launch per creature divided by its mass); one
+scale for both would have moved a grenade's launch 6.7×.
+
+**A landing is the body's, not the player's.** `Mob::ApplyFallDamage` (was
+`PlayerAvatar::ApplyFallDamage`) bills every creature: the avatar's two
+producers as before, and now `MobSystem::PreTick` bills a limp NPC's
+`TakeRagdollImpact`, so a blasted creature that lands hard is hurt and one that
+lands at splat speed comes apart. Its constants are `player.fall*` in
+tuning.json; the legs that bleed are the limbs TAGGED `leg`/`foot`, not names
+containing "leg"; the splat's shove skips every living creature's limbs, like
+an explosion's. The sub-lethal bill and the caster's overcast both go through
+`Mob::SpendHp`, which spreads the hp over the live slots as one `Mob::Damage`
+per slot with the caller's cause — so hp 0 means what the sever table says (a
+vital limb dies in place; an arm stays on) rather than the old "sever whatever
+reached zero". A fatal overcast (`PlayerAvatar::SelfDestruct`) is the ordinary
+radial carve and then death, where it used to sever every limb in range.
+
+**The laser charges once** (`MobSystem::LaserHit`): one `Mob::Damage` with
+`DamageCause::Beam` on whichever creature owns the body, through the Beam row
+on a worn shell. The session called `avatar.Damage` and then `mobs.Damage`,
+whose second half already walks every avatar.
+
+**A thrown rock is a blow** (`MobSystem::ApplyContactDamage`, phase 2). The
+Jolt contact listener fed only audio and vessel breaks, so a thrown rock, a
+falling log or a flung limb never hurt anybody. After every physics step the
+session reads the step's NEW contacts (`Physics::ContactImpacts`); one between
+a loose body and a living creature's limb is a BLUNT blow on that limb through
+`Mob::BluntHit` (bruise, hp, and on a shell the Blunt row's transmitted share),
+no dent and no plate broken. Its size is the contact IMPULSE — the striker's
+mass (reduced against the whole creature's when the creature is limp) times
+the STRIKER's approach speed: the limb's own velocity toward the other body is
+taken back out, so a creature walking into a resting log kicks it rather than
+being struck by it — over `gore.contactImpulseMin`, at `gore.contactHpPerImpulse`,
+capped at `gore.contactMaxHp` a contact and `gore.contactMaxPerTick` contacts a
+tick. The listener fills its list from Jolt's job threads in no fixed order, so
+the candidates are SORTED (impulse, then handles) before the cap is taken.
+Creature-on-creature and body-on-terrain contacts are not this path's (melee
+and the landing own them). The player is NOT reached: its limbs are on
+`Layers::AVATAR`, which the listener drops by design (your own limbs are
+permanently inside your capsule). Measured (`damage-sources` F): a 70 kg stone
+block at 15 m/s costs a standing human 102 hp over 5 contacts; in the iron
+cuirass 66, with 36 on the plate; at 1.5 m/s nothing.
+
 ### Damage kinds: cut, blunt, bite (2026-09-15; `game/impact.h`, `Mob::BluntHit` / `Mob::BiteHit`, `sim/tuning.h` §E6, `docs/PLAN_impact_unarmed.md`)
 
 Everything above is a KERF, and until this landed a kerf was all there was:
@@ -4905,7 +5347,8 @@ distinguished; then CLASSIFICATION, asked once (`StruckKind`: a slot below
 at `HeldSlot()` is a WEAPON, an unowned body is DEBRIS — three resolvers and two
 gates read it, and an enum is cheaper to keep agreeing than three copies of the
 same two `if`s); then the CUT if `cut > 0`, the whole wound model above
-unchanged, inside a `BladeCutScope` that now ENDS with the kerf, because a mace
+unchanged, carrying `DamageCause::Blade` on exactly the `Damage` + `CutLimb`
+pair (the cause ENDS with the kerf), because a mace
 caving a skull in is not a dismemberment and must not arm the wet dismember cue;
 then `Mob::BluntHit` if `blunt > 0`; then `Mob::BiteHit` if `bite > 0`, with the
 infection terms copied onto it ONLY when the classification said FLESH — armour
@@ -4924,8 +5367,10 @@ removes a voxel only if the weapon authored `bluntCarve` AND the spot it landed
 on has already been beaten open (see "A blunt blow climbs a ladder" below): a
 shallow radial DENT of `gore.bluntCarveRadius · bluntCarve · power · earned`,
 through the same `CarveLimbRadial` an explosion calls, soaked in the victim's
-own `woundMat` on the way out. The whole blow runs inside `Mob::BluntCarveScope`, and that scope
-is the entire implementation of the owner's one-line spec: the COLLAPSE sever is
+own `woundMat` on the way out. The whole blow carries `DamageCause::Blunt`
+(`Unarmed` for a natural weapon), and that cause's row of the sever table (see
+*The damage cause is an argument* below) is the entire implementation of the
+owner's one-line spec: the COLLAPSE sever is
 skipped, so a face may be caved in well past the point at which a blast would
 have shed the head, however many blows land. hp reaching zero on a vital limb
 still kills, because `HpZeroSevers` is about DEATH rather than about amputation.
@@ -4990,16 +5435,17 @@ exactly as the kerf is scaled but referenced at 120 rather than 8. That is
 "plate stops swords almost entirely; maces go through", as geometry.
 
 **A dent in a plate is still a dent** (2026-09-16). The shell branch returns
-before the flesh branch below it constructs `Mob::BluntCarveScope`, so for a
+before the flesh branch below it constructed its blunt scope, so for a
 while the armour carve ran UNSCOPED and the collapse sever was live against it:
 a worn slot is `severable` (a cut strap drops the pauldron), so once
 `CarveLimbRadial` had taken a cuirass below `kLimbCollapseFraction` — 25% of its
 spawn voxels — `CarveLimb` called `Sever()` and the piece fell off the body.
 Raising `gear.bluntDentRadius` 1.2 → 3.0 is what brought that inside a couple of
-blows, and from outside it reads as a mace dismembering people. The scope now
-opens at the top of the shell branch as well, so the rule
-`Mob::BluntCarveScope` states — A BLUNT HIT NEVER TAKES A LIMB OFF — holds for
-every slot rather than only for flesh. A mace beats plate IN and beats the
+blows, and from outside it reads as a mace dismembering people. The shell
+branch now passes the blunt cause to both its calls as well, so the rule the
+blunt rows state — A BLUNT HIT NEVER TAKES A LIMB OFF — holds for
+every slot rather than only for flesh. (Since W2-G the cause is an argument,
+so a call that forgets it gets `Other`, never a scope somebody left standing.) A mace beats plate IN and beats the
 wearer through it; shearing it off the straps is an edge's job.
 
 **A bite is a tear, and it severs only by collapse.** `Mob::BiteHit` on FLESH
@@ -5007,8 +5453,8 @@ charges hp, bleeds like a cut (refusing the drip would make a bite read as a
 bruise), and carves a correlated-noise BLOB of
 `gore.biteRadius · (0.4 + 0.6·power)` at feature size `gore.biteBlob` — the same
 predicate `Mob::RotAtSpawn` draws the undead's holes with, now one
-implementation shared through `Mob::CarveBlob`. `Mob::BiteScope` marks the carve
-as a tear so it cannot inherit a blade scope somebody left standing; the blade
+implementation shared through `Mob::CarveBlob`. The carve carries
+`DamageCause::Bite` (whose rows are `Other`'s); the blade
 rules stay off (a mouth has no direction to cut through in) and the collapse
 sever is deliberately left ON, because enough bites DO take a hand off and that
 is the single rule separating a bite from a punch. On a SHELL a bite is
@@ -5137,7 +5583,7 @@ by), the drip's spray, the arterial gout, and the whole voxels a sever throws.
 A whole voxel costs `gore.bleedHpPerVoxel`; a micro droplet costs
 `1/microScale³` of that, because that is the fraction of a voxel it is. The cost
 is spread across the live *authored* limbs in proportion to what each still has
-(the same spread `PlayerAvatar::SpendHealth` uses for an overcast, and for the
+(the same spread `Mob::SpendHp` uses for an overcast, and for the
 same reason: draining the first limb to zero picks an arbitrary limb to ruin),
 so every limb reaches zero on the same tick and the creature dies through the
 ordinary `Die()` — systemic, the corpse keeps its limbs. Held items and worn
@@ -5157,7 +5603,8 @@ body bleeds out at 4.5 hp/s from one stump. Topped up to a clump rather than to
 the wound cap so a stump that cannot drip this tick (out of ops) does not bank
 blood for later; cleared by `DetachLimb` so a stump that is itself cut off does
 not drip forever at its rest-pose anchor from a body it is no longer on. Fire
-still cauterises: a limb that burns through arms no stump (`inBurnFlush_`).
+still cauterises: a limb that burns through arms no stump (the carve is
+EATEN: `DamageCtx::eaten`, set by `FlushBurn`).
 
 **Burns cap the health a body can hold.** Burning already charged hp for the
 voxels it removed, but a body that is COOKED rather than consumed lost nothing
@@ -5204,7 +5651,26 @@ That split exposed the second half: `alight` is cleared only by the index
 SWEEP, and the sweep ran only on an index rebuild, so a fire that went out
 without a further carve latched the limb awake with an empty front. An empty
 front under a set latch now drops the index, and the next tick's sweep decides.
-Gate `mob-burn`, line "charred limbs sleep". Derived, not saved: a loaded avatar keeps its low hp but starts at
+
+...and NO live limb slept at all, charred or not (W2-I, 2026-09-24). The
+gate's control said so ("0 of 10 unburnt limbs asleep") and its assertion was
+relative to that control, so it could not fail. Attribution first
+(`BodyBurnState::holdBy` / `sleepMiss` / `slept`, printed per limb by the
+gate): every limb of the doused test creature was "holdBy wet" (five also
+"contact"), "miss index", 0 of 900 limb-visits asleep. The sleep demanded an
+EMPTY index, and the index is shared: `WetOneLimb` resets `quiet` every third
+tick while any water is on a limb and `StainOneLimb` while a limb touches
+anything that stains, so a creature that had been doused, rained on or stood
+in a puddle kept every index warm and never slept. The walk the key digests
+reads only the box, the cached chunks and the tables, never the index, so the
+burn pass now sleeps whoever holds the index, and the asleep branch goes on
+counting the grace that releases it (outcome unchanged; cost only). The pose
+floats are still in the key; the attribution has a `pose` bit for when an
+animated idle creature shows it. Gate `mob-burn`, line "limbs sleep", now
+ABSOLUTE: over 60 ticks at least `mobBurnSleepFracMin` (0.9) of every limb's
+visits must be asleep, charred and unburnt separately (97% / 96%). The
+dead-Mob sleep (`corpse-sleep`) reaches asleep sooner for the same reason
+(89 → 77 ticks). Derived, not saved: a loaded avatar keeps its low hp but starts at
 cap 1 until it burns again.
 
 **Heat crosses a joint, and until it did a burning torso never lit the legs.**
@@ -5589,6 +6055,9 @@ clean air; per-voxel roll on `Hash3(limbKey ^ cell, tick, salt)` so it thins
 unevenly, start rotated by tick under the same lattice budget, brick poked per
 change. Ground stains do NOT decay: the world rule is monotone so a stained
 chunk can sleep, and a drying rule would keep every stained chunk awake.
+(They can be SPENT by a reaction since 2026-09-24 -- a coat on absorbent
+ground is a reactant, §6 "A coat is a co-located virtual neighbour", which is
+also the reference rule for how a body coat reacts.)
 
 **Shedding.** NPCs never had a footfall; `Footfall` moved from `PlayerAvatar`
 down to `Mob` and the NPC plant emits it (the avatar's per-frame audio drain is
@@ -5620,7 +6089,9 @@ the cell is still stone.
 **Water on a body washes, wets, wicks and drips (2026-09-23;
 `WashBodyStain`, `MobSystem::WetOneLimb`, `kPFlagDrip`).** BODIES ONLY — the
 world's wet stain is unchanged and still never dries (a pond bed that dried
-would keep its chunks awake; see "Absorption and washing"). A washer
+would keep its chunks awake; see "Absorption and washing"); since 2026-09-24
+it does BOIL off absorbent ground beside heat, level by level, through the
+coat rule (§6). A washer
 (`stain.washes`) meeting a coat by any door — contact, splatter, the health
 panel's pour — goes through one rule: a foreign coat is stepped down by the
 rinse (`gore.stainWashPerContact`, 5; a pour rinses twice its own depth), and
@@ -5660,6 +6131,14 @@ every limb but one soaked, the creature stood in a fire column 90 ticks with
 note: `World::Cached` is only refreshed on request, and what re-requests a
 dirty chunk each tick is the debris island scan -- a fire fixture that skips
 `debris.QueueSupportEvents`/`PreTick` burns against a pre-fire mirror.
+**Superseded 2026-09-24 (W2-J2) by §6 "A coat is a co-located virtual
+neighbour":** the skip list, the `fireDrySeconds` boil, the wet-neighbour
+douse and `kCoatDouseCost` are gone. A wet voxel beside heat is COVERED by
+its water's own `water + tag:hot` rule (which boils it a level at water's
+180 per mille), a douse through the coat pays one level, and only the wearer
+sees its coat. `body-coat` now measures 2 seared vs 415 (the parked
+`fireDrySeconds` reaches nothing). `IgniteOneLimb` still refuses a wet voxel
+(a direct write, not a rule).
 
 **A coat that EATS: acid on a body (2026-09-23).** Owner report: acid poured
 on a character neither showed nor dissolved anything. Two gaps: acid had no
@@ -5674,7 +6153,9 @@ through `BurnOneLimb`'s inbound pass. Now:
   unmoved by construction.
 - **A corrosive coat** is any wearable coat whose material `matAttacksBody_`
   (its pair rules rewrite body matter) -- `MobSystem::matCorrodes_`, acid
-  named nowhere. `BurnOneLimb` section 3 evaluates the coat material's own
+  named nowhere. `BurnOneLimb` section 3 (since W2-J2: section 0, the §6 coat
+  rule, with the voxel as the coat's first partner and clause 7's depth price)
+  evaluates the coat material's own
   rules against the voxel it sits on (the inbound pass with the coat as the
   neighbour, rule index +128), so flesh/skin/cloth/leather go at 125 (halved from 250 the same day: too fast),
   dissolvables at 45, iron pits at 10, bone and steel shrug it off. The ledger
@@ -5690,7 +6171,9 @@ through `BurnOneLimb`'s inbound pass. Now:
   per-tick roll let a thin film bite eventually and doubled the depth. Acid
   `depth` 0.4: a full coat reaches the bone of a human limb, a splash (6) takes
   skin and some flesh. `coat.decay` 0.15 s/level: a splash is gone in ~2 s, a full coat in ~5, bone included. `DryOneLimb` dries every CORROSIVE coat when the ledger counted one, not only the ledger's ranked few -- blood outweighed a thin acid film on bone and it never dried.
-- **It displaces, it does not wait**: `MobSystem::CoatBeneath` treats a
+- **It displaces, it does not wait** (since W2-J2 the class clause of §6's
+  one stain precedence, `coatrule.h stainPrecedence`; `CoatBeneath` is
+  deleted): `MobSystem::CoatBeneath` treated a
   non-corrosive coat as clean when a corrosive one arrives, so a bloodied arm
   can be coated in acid at all (Raise only repaints with a strictly larger
   amount). A corrosive `SoakLimb` (the health panel's pour) coats the SURFACE
@@ -5901,6 +6384,9 @@ by another route, and a filter keeps tracking the original.
 
 **`undead` is a content word, not a subsystem.** It does exactly two things:
 it defaults `bleed.woundHeals` to false, and it makes `rot` apply at spawn.
+(A third was hidden in `Mob::Damage` until 2026-09-24 — a blunt blow took a
+vital limb off an undead body before it died. It is data now: the zombie
+effect authors `"bodyTissue": "rotten"`, one row of the sever table.)
 Nothing else in the engine branches on it, and that is deliberate — the slower
 walk, the paler skin and the shorter stride are ordinary sidecar numbers and
 stay ordinary sidecar numbers, so that "undead" never becomes the name of a
@@ -6000,8 +6486,9 @@ Four properties worth stating because each cost something to get right:
   a body no more chewed than before. What came off was the BLOOD, not the
   damage, so the damage is what compensates.
 
-  What stays refused is **bleeding**: `Mob::inSpawnRot_` joins the burn and the
-  garment on the line deciding whether a carve tops up a drip budget, and
+  What stays refused is **bleeding**: `DamageCause::SpawnRot` joins the burn
+  and the garment on the line deciding whether a carve tops up a drip budget
+  (`SeverPolicy::carveBleeds`), and
   `StainWound` has no drip in it. So the holes look wet and the creature is not
   haemorrhaging — which is exactly why the soak and the drip are separate
   functions. The hp charge stays outside both, for the reason the burn exclusion
@@ -6015,9 +6502,9 @@ Four properties worth stating because each cost something to get right:
   a tenth of its authored budget could still hollow out a shoulder socket and
   drop the arm — and `Sever` arms an arterial gout, charges `gore.severVoxels`
   through `DrainBlood`, and calls `Die()` outright if the limb was `vital`.
-  Zombies arrived dismembered, haemorrhaging and dead. `inSpawnRot_` is
-  therefore the third exclusion in `JointRuleApplies` too, beside blunt and
-  fire.
+  Zombies arrived dismembered, haemorrhaging and dead. `SpawnRot` is
+  therefore the third exclusion in `JointRuleApplies` too (`JointRule::Never`
+  on its rows), beside blunt and fire.
   `Mob::RebaseJointCounts` is the other half and is not optional: `neckAtSpawn`
   and `socketAtSpawn` are taken at the top of a limb's FIRST carve, which for a
   rotted body is the rot, so refusing the verdict alone would leave every joint
@@ -6165,7 +6652,8 @@ already being per voxel: the derived collider's plurality blocks take flesh
 and muscle in the world grid; the burn gate's body census counts flesh and
 muscle as body and as charrable flesh (bone in neither). What it does NOT do
 yet, stated so nobody infers it from a screenshot: hp per carved voxel is
-still pure volume (`kCarveDamagePerVolume`) — bone costs what skin costs;
+still pure volume (`gore.carveHpPerVolume`, the former constant
+`kCarveDamagePerVolume`) — bone costs what skin costs;
 severing (`Sever`) still does nothing to the cross-section, which is now
 exactly why it needs nothing. (`StainWound` stopped soaking bone the same
 day — see "A wound is seen" above.)
@@ -7806,7 +8294,7 @@ them.
 
 The two halves meet at exactly one number. `MeleeSweepDamage` forms
 `power = speedRamp * MeleeEdgeAlign(...)` once, and everything downstream reads
-that value: the damage, the `BladeCutScope`, and the kerf's `depth` and
+that value: the damage, the blade `DamageCtx`'s audio severity, and the kerf's `depth` and
 `length`. So a flat-on slap makes a shallower wound as well as a weaker one, for
 free, and the wound model never has to know that edge alignment exists.
 Multiplying `edgeAlign` in a second time when the kerf is built would square it.
@@ -8042,7 +8530,7 @@ handmade art becomes matter the existing destruction pipeline already breaks.
 **Death is a state of the Mob, not a change of owner.** `Mob::Die` sets
 `alive_ = false`, books a rising if the rot is in the flesh, and flips the rig
 limp (`EnterDeadRagdoll`); every body, joint, worn shell, twin table, burn
-index, coat ledger, wound, `worn_`, `heldItem_` and `carried_` stays where it
+index, coat ledger, wound, `worn_`, `heldItem_` and the pack stays where it
 was, in `MobSystem::mobs_`. Until this, `Die` handed every limb to
 `DebrisSystem::AdoptBody(dead=true)` and the Mob was swept a tick later, and a
 parallel system rebuilt what the rig had known (`CorpseReport`/`Corpses` for
@@ -8084,7 +8572,8 @@ debris for the network). All of that is gone.
 - **The player's corpse** (`MobSystem::AdoptDeadAvatar`): at the top of the
   PreTick after the death the dead avatar's rig is slice-moved into `mobs_`
   under an id from its own band (bit 61 | player << 40 | seq, so `nextId_` is
-  untouched), `PlayerCorpse()`, never lootable (the kit lives on the session);
+  untouched), `PlayerCorpse()`, never lootable (the kit is the avatar's
+  `Mob::kit_` and is moved back onto the avatar, not into the corpse, W2-M);
   the avatar keeps a bodiless husk until `Revive`. Gate `player-corpse`.
 - **Save (MOBS v6).** A record carries a flags word (bit 0 dead, bit 1 player
   corpse), the appended slots' names (loaded records are aligned onto the
@@ -8138,14 +8627,15 @@ exception: a carve mid-ragdoll rebuilds a DYNAMIC limb). Three things reach it
 and nothing else: a blast (`Mob::BlastRadial`), freefall past
 `ragdoll.fallSeconds` (NPC: `MobSystem::UpdateFall`; avatar: its own air
 clock), and the dev panel ("ragdoll me"; "ragdoll all spawned" in the NPC AI
-window). An NPC's limbs go through `ReleaseToWorldWhenClear` on the flip, for
+window). An NPC's limbs become the loose `RigLimp` role on the flip (they
+clear the player first; was `ReleaseToWorldWhenClear`), for
 the reason `Die()` documents — a body that goes dynamic inside the player's
 capsule otherwise fires out of it.
 
 **The launch is a velocity, not an impulse, and it is capped.** A blast's
 other half runs beside the debris impulse in the explosion loop:
-`MobSystem::BlastMobsRadial(ec, radius × blastRadiusScale, power ×
-blastImpulseScale)`. Per creature: impulse at the pelvis by linear falloff,
+`MobSystem::BlastMobsRadial(ec, radius × explosionImpulseRadiusScale, power ×
+blastImpulseScale)` (both read through `BlastForceOf` since W2-H). Per creature: impulse at the pelvis by linear falloff,
 divided by the rig's Jolt mass (`Physics::BodyMass`, readable on a kinematic
 body), gives a speed in m/s; below `blastMinSpeed` nothing happens (a distant
 boom rattles, it does not floor you), above `maxLaunchSpeed` it is clamped —
@@ -8285,8 +8775,9 @@ off the solver rather than off a sweep: `Mob::TickRagdollArrest` differences the
 rig's mass-weighted centre-of-mass velocity tick over tick, subtracts the gravity
 step so free flight reads as zero, and keeps only change that OPPOSES the travel,
 so neither gravity nor a blast (which SETS the velocity) can be read as a
-landing. `PlayerAvatar::PreTick`'s limp branch hands it to the same
-`ApplyFallDamage` and the same `player.fallDamageSpeed` / `fallSplatSpeed`
+landing. `PlayerAvatar::PreTick`'s limp branch — and, since W2-H, an NPC's in
+`MobSystem::PreTick` — hands it to the same
+`Mob::ApplyFallDamage` and the same `player.fallDamageSpeed` / `fallSplatSpeed`
 thresholds the driven branch uses. Three things about it are not obvious and all
 three were found by measurement, not design:
 - **A rig does not stop in one tick.** The player's AABB sweep refuses the whole
@@ -8375,7 +8866,68 @@ the world (`ragdoll player on fire`). What it found, in order of damage:
   5% of `playerMassKg` cannot push the player at all (the 80 kg proxy pushes
   it instead). Standing on a log or being shoved by a corpse is unchanged.
 
-### A held weapon is CARRIED, not simulated (2026-09-15; `Layers::PROP`, `Physics::SetBodyPropLayer`)
+### A body's collision layer is DERIVED FROM ITS ROLE (2026-09-24, W2-N; `Physics::BodyRole`)
+
+The sections below each added a layer and a call to set it: `AVATAR` for your
+own body, `PROP` for a held weapon, `ReleaseToWorldWhenClear` for everything
+that leaves a creature, `THROWN` for a flask. By 2026-09-24 that was ~24
+imperative sites (`SetBodyAvatarLayer` x6, `SetBodyPropLayer` x4,
+`ReleaseToWorldWhenClear` x9 plus the throw), and **every missed site was a
+separate bug** (d960a54 the rebuilt blade, 4689b1 the thrown flask, and a
+get-up sword a still-pending release later dropped back onto `MOVING`).
+`AVATAR` also exempted a body from EVERY player's capsule, which is wrong the
+moment there are two.
+
+Now a caller says what a body IS — `Physics::SetBodyRole(handle, role, owner)`
+— and `Physics::ResolveLayer(role, ownerSlot, clearing)` is the one place that
+turns it into a Jolt object layer. The role and owner live in the body's Jolt
+user data, so `ReplaceBody`/`CarryLayer` take them to a rebuilt collider with
+no caller involvement.
+
+| Role | owner none | owner = player P | owner any / unknown |
+|---|---|---|---|
+| `RigLive` (a live creature's limb) | `MOVING` | `OWNED(P)` | `EXEMPT` |
+| `WornShell` | `MOVING` | `OWNED(P)` | `EXEMPT` |
+| `Carried` (the grab) | `MOVING` | `OWNED(P)` | `EXEMPT` |
+| `HeldProp` | `PROP` | `PROP` | `PROP` |
+| `SeveredHold` (the 0.25 s beat) | `EXEMPT` | `EXEMPT` | `EXEMPT` |
+| `Debris`, `RigLimp` (an NPC's ragdoll), `RigDead` | `MOVING`, entered through CLEARING | | |
+| `Thrown` | `THROWN(P)` / `THROWN` while clearing, then `Debris` on `MOVING` | | |
+
+- **`OWNED(P)` is the owner-scoped exemption** (layer 16+slot): `MOVING`,
+  except that it never meets player P's capsule and P's `PlayerPushOut` never
+  sees it. Every OTHER capsule meets it and is pushed by it (with the
+  creature-phase rule for a kinematic limb, as for any NPC). Each player proxy
+  gets a slot at `CreatePlayerBody` (layer 8+slot; 8 slots = the release
+  sweep's `kMaxPlayerProxies`); a proxy past that is the unslotted `PLAYER` and
+  owns nothing. A player's avatar is told its proxy once by whoever made it —
+  `main.cpp` for the local session, `RemotePlayersPreTick` for a ghost —
+  through `Mob::SetCollisionOwner`; one never told keeps `EXEMPT` (the old
+  `AVATAR`, id 3), which is what every fixture that spawns an avatar without
+  wiring a proxy still gets.
+- **CLEARING is the one transition rule** (it was `ReleaseToWorldWhenClear`).
+  A LOOSE role always enters by waiting on `EXEMPT` (`THROWN` for a throw)
+  until its AABB is clear of every live proxy, then settles on its own layer;
+  with no proxy it settles at once. An ATTACHED role applies at once — except
+  that a body still clearing, given an attached role some player could feel
+  (`MOVING`/`OWNED`), keeps clearing and settles on THAT role's layer. The
+  settle is `ResolveLayer`, no longer a blanket `MOVING`.
+- **`THROWN(P)`** (24+slot) meets terrain, ordinary bodies, and bodies and
+  capsules that are not P's: a flask clears its thrower and still hits the man
+  it was thrown at. An unowned throw is the old `THROWN`.
+- **Mob side**: `Mob::LimbRole(i)` derives a slot's role from the creature's
+  state (alive / limp / dead, held slot, worn shell, hold);
+  `BuildRig`/`EquipItem`/`AppendWornShell` set their slot's role,
+  `StartRagdoll`/`BeginGetUp` re-derive every flipped slot, `Die` makes them
+  `RigDead`, and the three ends of a severed hold share `Mob::EndSeveredHold`.
+  The four "re-exclude the whole rig" group rebuilds are `Mob::RegroupRig`.
+
+Gate `layer-roles`: walks the whole table; two capsules and two avatars (A's
+limbs meet neither A's capsule nor A's push-out and DO meet B's and push B,
+plus an avatar never told its proxy as the control); a throw owned by A; and
+the clearing transitions, including the get-up case.
+
+### A held weapon is CARRIED, not simulated (2026-09-15; `Layers::PROP`, now the `HeldProp` role)
 
 Reported as "holding a sword moves other mobs, walking into an inactive sword
 moves me, fights feel clunky". Both halves are one mechanism, and it is not a
@@ -8417,9 +8969,13 @@ costs the swing nothing and is the part to check before touching it again:
 - `Mob::WeaponEdge` needs the body's TRANSFORM, which is why this moves a body
   between layers rather than removing it.
 
-**The flag is not set once.** A prop that stops being carried must come off the
-layer or it falls through the world, and a prop that resumes being carried must
-go back on:
+**The flag is not set once** — which is what the role derivation above
+replaced (2026-09-24): each row is now a ROLE the path sets or re-derives
+(`HeldProp` / `RigLive` / `RigLimp` / `RigDead` / `SeveredHold` / `Debris`),
+and `RebuildLimbBody`'s re-application is carried by the collider rebuild
+itself. The table is kept as the history of why each path matters. A prop that
+stops being carried must come off the layer or it falls through the world, and
+a prop that resumes being carried must go back on:
 | Path | What it does |
 |---|---|
 | `EquipItem` | sets it |
@@ -9713,7 +10269,11 @@ layers rather than a single-layer filter. `Physics::SetBodyAvatarLayer` moves a
 body on or off it; both layers map to the same broadphase layer, so this is
 never a broadphase rebuild. A severed limb is switched *back* to `MOVING` when
 its hold expires (and the whole corpse on death), because a detached arm has
-stopped being "you" and should bump you like any other debris.
+stopped being "you" and should bump you like any other debris. (Since W2-N the
+avatar's limbs are the `RigLive` role owned by the player's proxy — `OWNED`,
+exempt from THAT capsule only; `AVATAR` survives as `EXEMPT`, exempt from
+every capsule, for an avatar never told its proxy. See "A body's collision
+layer is DERIVED FROM ITS ROLE".)
 
 Selftest-gated: the avatar test walks a proxy alongside a spawned avatar for 30
 ticks and asserts the peak `PlayerPushOut` magnitude is zero. Sampled over many
@@ -14079,12 +14639,13 @@ step, and it means a robe that burns up on the ground is simply GONE.
 Not a durability percentage — the holes themselves. While a piece is on, its
 wounds are the shells'; the shells die with the slots, so `Mob::CaptureWorn`
 reads them out one call before the rig forgets and `WearItem` puts them back.
-Off the body they live in `PlayerKit::wornDamage`, keyed by ITEM NAME (not by
-slot, or dragging the robe through the pack would mend it; not by instance,
-because an `ItemStack` has no identity and giving stacks one is a much larger
-change than armour needed). `PLYR` is at v3 for the map, `ITMS` carries a
-ground item's lattice the same way, and an older payload is refused rather than
-half-applied.
+Off the body they live ON THE PIECE: `ItemInstance::damage`, a field of the
+stack in whatever slot the piece is in (see *One item instance, one kit*
+below). Until W2-M (2026-09-24) they lived in `PlayerKit::wornDamage`, keyed by
+ITEM NAME, so two robes in one pack shared one set of holes. `PLYR` v7 carries
+it per slot, `ITMS` v4 per ground item, MOBS v7 per gear entry; older payloads
+still load (a by-name blob lands on every stack of that name, which is what
+those files meant).
 
 **Condition is a summary, not the record.** The lattice above stays the truth —
 it is what puts the wear back in the right places, and on armour whose whole
@@ -14105,6 +14666,58 @@ still wearable (whatever remains still covers whatever it still covers), but
 that is the line a repair, and anything that scales with condition, is expected
 to refuse. There is deliberately no repair and no enchantment system yet; this
 is the substrate either would read.
+
+### One item instance, one kit (rule-unification W2-M, 2026-09-24)
+
+**One item is one `ItemInstance`** (`game/iteminstance.h`): `{name, count, dye,
+fillMat/fillAmt, damage}`. Every record that says "there is an item here"
+embeds it, and a crossing between two of them copies it whole: the slot
+(`ItemStack` IS `ItemInstance`, no library index), a creature's pack (its
+Kit's bag), a ground item (`WorldItem`), a piece of gear on the wire and in the
+MOBS record (`net::WireGear`), a pickup grant and a ground body's announce
+(`net::ItemGrant`, `net::BodyAnnounce::item`), a loot entry (`LootPiece`), a
+shed piece (`MobSystem::SetOnItemShed`). Before it each carried its own subset,
+and every crossing dropped what the narrower one lacked: a flask's contents
+were lost on a network pickup (the grant had no fill) and when a corpse's pack
+rose (`CarriedItem` had no fill), and "item damage" was a uint32 threaded
+through three structs that nothing ever wrote. The wire and MOBS share one
+byte shape (`WriteItemInstance`/`ReadItemInstance`); PLYR/ITMS keep their
+append-only layouts. Stacking is one rule (`ItemInstance::StacksWith`): same
+name, same dye, and BOTH plain — a filled vessel or a damaged piece is one
+object and stacks with nothing. A slot holds a NAME, so an R reload that
+reorders items.json is a no-op; `Kit::DropUnknown` empties the slots whose item
+is gone.
+
+**One kit per creature** (`Mob::kit_`, `Kit` in `game/equipment.h`: equipment,
+bag, hotbar). The player's kit IS the avatar's (`PlayerSession::kit()` is
+`avatar.KitMut()`); it used to be `PlayerKit` + a hotbar on the session, with
+the rig keeping its own copy of what was worn and a per-tick loop in
+session.cpp reconciling the two through `wearTried`/`wearDye` latches and a
+`CaptureWorn` copy-back. Now **the kit's equipment is the truth and the rig's
+worn shells are derived from it** — `Mob::DressFromKit` runs where the loop
+did (before PreTick), re-dresses a slot only when its name or dye changed or
+it was marked stale, and asks a refused piece once. The one thing the rig
+holds that the kit cannot is a worn piece's LIVE damage (shells are carved in
+place), so it is written back into the stack at every moment the stack is read
+without the body: `Mob::KitMove` (flush both ends, swap, mark stale — two
+identical tunics swapped are two objects), `Mob::KitTake`, a recolour in place
+(DressFromKit flushes before re-wearing), and the PLYR save
+(`PlayerKitRefs::wearer`). A worn piece cut loose leaves the kit in
+`ShedGearBeforeDetach` and lands on the ground carrying its damage. The corpse
+rising reads the avatar's kit directly (`avatarKitFn_` is gone;
+`avatar.keepKitOnTurn` is read in `MobSystem::ServiceRising`), and
+`AdoptDeadAvatar` moves the kit back onto the avatar, so the corpse never holds
+it. An NPC's pack is its kit's bag (`Mob::Carried`, `AddCarried`), so a looted
+or risen flask keeps its fill.
+
+**Not yet (deferred):** an NPC's worn and held gear is still dressed directly
+(`WearItem`/`EquipItem` from its loadout, a rising, a handoff, a load) and read
+live off the rig (`LootPieces`, `CaptureGear`) — its kit holds only its pack.
+A held item knocked from the player's hand goes to the ground without its fill
+(the shed hook does not know which hotbar slot filled the hand). Gate
+`kit-instance` (identical robes, per-instance damage through dress / swap /
+recolour / take-off); `player-kit`, `item-ground`, `mob-loot`, `debris-ghost`
+and `vessel` carry the round trips.
 
 ### A shell is a rig slot, and the gore path did not know that
 
@@ -14127,7 +14740,8 @@ of gear hitting the floor.
 expresses a tick of burning as a carve and fires every `max(12, n>>6)` voxels
 removed, so a limb alight carves itself dozens of times a second and each one
 topped the bleed budget back up — being on fire read as haemorrhaging. Both the
-drip and `Sever`'s arterial gout now refuse while `inBurnFlush_` is set. The hp
+drip and `Sever`'s arterial gout now refuse for an EATEN carve
+(`DamageCtx::eaten`; `carveBleeds`/`gore` false on those rows). The hp
 charge is deliberately outside the exclusion: fire still kills you, and a burnt
 shell still loses its own durability. Only the blood is refused.
 `mob-burn`'s `fire does not bleed` asserts zero droplets and zero open wounds
@@ -14312,7 +14926,8 @@ for fifteen ticks. That was "I dismembered him and flew across the field", and
 the avatar's own pieces had already been exempted once (`Layers::AVATAR`).
 
 The rule now belongs to the body, not to who it came off.
-`Physics::ReleaseToWorldWhenClear` puts a body on the no-player-contact layer
+`Physics::ReleaseToWorldWhenClear` (since W2-N: any LOOSE `Physics::BodyRole`,
+CLEARING) puts a body on the no-player-contact layer
 and remembers it; every step, each remembered body whose world AABB has left
 the proxy goes back to `MOVING` and is forgotten. So a piece never shoves the
 creature it came off, and the moment it has fallen clear it is ordinary debris
@@ -14369,8 +14984,8 @@ through `MobSystem::SetOnCorpse` to `Corpses` (`game/corpses.h`), which is
 `WorldItems`' shape over the same bodies and hangs off the same
 `SetOnBodyGone` hook: a piece whose body burns off the corpse leaves the list,
 a corpse with no bodies left is forgotten, and the list is capped at 64 oldest-
-first. Not fired for the avatar (its kit lives in `PlayerKit` and the wear loop
-re-dresses the respawn from it). Not saved: a loaded world has heaps, not
+first. Not fired for the avatar (its kit lives on the avatar and re-dresses
+the respawn from it). Not saved: a loaded world has heaps, not
 corpses, the same call the `'ITMS'` re-drop made.
 
 **The reach ray runs every frame, not on the press.** The prompt is the
@@ -14396,7 +15011,7 @@ character screen with a LOOT panel in the SPELLBOOK's place (looting is a
 moment; the words are not going anywhere, and a fourth column would not fit on
 most screens), one `KitSlotUI` per piece through the same mirror, and
 `KitSpace::Loot` is one more address the same drag can name. `TakeCorpseLoot`
-executes it beside `PlayerKit::Move` rather than inside it — a corpse is not
+executes it beside `Kit::Move` rather than inside it — a corpse is not
 one of the player's containers and has no `ItemStack` to swap — with Move's
 discipline: `EquipSlotAccepts` on an equip destination, a sentence per refusal,
 an occupied destination sends its stack to the pack rather than overwriting,
@@ -14678,7 +15293,7 @@ not pour or scoop. The HUD meter under the crosshair (`UIState::throwCharge`)
 is ten pixel pips that light gold and, at full, turn ember and SHAKE by whole
 pixels. A THROWN VESSEL IS A DROPPED ITEM WITH SPEED: `DropItemToWorld` with
 the launch velocity and an end-over-end spin, so the flight is Jolt's and the
-fill rides `WorldItem::fill` as a drop's does. `ContainerBreakPass` (phase H,
+fill rides the `WorldItem`'s ItemInstance as a drop's does. `ContainerBreakPass` (phase H,
 before submit; the `TickAuthorityCtx::ground` registry) breaks any vessel with
 `breakSpeedMps` > 0 (flask 6.5) on either of two witnesses: a NEW contact from
 the last step whose closing speed reaches it -- relative speed, so the flask
@@ -15278,6 +15893,16 @@ window origin (rule 1 below); the HUD has no net line (the `--frames` exit
 report is the readout). Every one of these is listed with its trigger in
 `docs/PLAN_multiplayer_m9.md`.
 
+**Two bodies can shove each other (W2-N, 2026-09-24).** A player's limbs,
+worn shells and grabbed load are `OWNED` by that player's capsule: exempt from
+it and from nobody else's (see "A body's collision layer is DERIVED FROM ITS
+ROLE"). Before, the `AVATAR` layer exempted them from EVERY capsule, so the
+local player walked straight through a peer's ghost. Now the local
+`PlayerPushOut` sees the ghost's kinematic limbs exactly as it sees an NPC's
+(creature-phase slack, rate-capped), and a flask thrown by one player clears
+its thrower but hits the other. The ghost's own proxy is still teleported to
+the wire position every tick, so nothing local can move a peer.
+
 **Player-on-player damage (W1-F, 2026-09-24; owner-side blasts at wave-1
 integration).** A sword or a grenade resolves on the ATTACKER's machine
 against every body that machine holds: NPCs, its own player, and the peer's
@@ -15857,7 +16482,8 @@ of the contact plane through the same chunk cache the body burn uses, and falls
 back to the other body's dominant material (cached per body, refreshed by
 `RecountBurn`) for a body-vs-body hit.
 
-**Your own body cannot fire one.** `Layers::AVATAR` and `Layers::PLAYER` are
+**Your own body cannot fire one.** `EXEMPT` (the old `AVATAR`), every
+`OWNED` layer and every `PLAYER` layer are
 rejected by name in the listener, and a LIVE mob limb is filtered for free by
 ownership: limb bodies belong to `MobSystem`, so the handle never resolves in
 `bodies_`. A SEVERED limb has been `AdoptBody`'d by then and does start

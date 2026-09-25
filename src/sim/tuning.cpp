@@ -1038,6 +1038,12 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("infectBoneStainVary", g.infectBoneStainVary);
     put("infectBoneIchor", g.infectBoneIchor);
     put("brainHpPerVoxel", g.brainHpPerVoxel);
+    put("carveHpPerVolume", g.carveHpPerVolume);
+    put("blastPowerRef", g.blastPowerRef);
+    put("contactImpulseMin", g.contactImpulseMin);
+    put("contactHpPerImpulse", g.contactHpPerImpulse);
+    put("contactMaxHp", g.contactMaxHp);
+    putI("contactMaxPerTick", g.contactMaxPerTick);
   }
   if (group("gear", lo, hi)) {
     const Tuning::Gear& gr = t.gear;
@@ -1052,6 +1058,7 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("biteOnShell", gr.biteOnShell);
     put("biteThroughSoft", gr.biteThroughSoft);
     put("biteThroughHard", gr.biteThroughHard);
+    put("blastShellCells", gr.blastShellCells);
   }
 
   if (!missing.empty()) {

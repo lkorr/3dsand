@@ -228,15 +228,16 @@ Status GateDye(Ctx& c, std::string& detail) {
       const uint32_t red = DyePack(0.8f, 0.1f, 0.1f);
       const uint32_t blue = DyePack(0.1f, 0.1f, 0.8f);
       Inventory hb;
-      const int a = hb.Add(di, 1, red);
-      const int b = hb.Add(di, 1, red);
-      const int d = hb.Add(di, 1, blue);
+      const int a = hb.Add(StackOf(c.items, di, 1, red));
+      const int b = hb.Add(StackOf(c.items, di, 1, red));
+      const int d = hb.Add(StackOf(c.items, di, 1, blue));
       check(a >= 0 && a == b && hb.slots[a].count == 2,
             "two of the same colour stack");
       check(d >= 0 && d != a && hb.slots[d].dye == blue,
             "a different colour takes its own slot instead of repainting one");
       Bag bag;
-      check(bag.Add(di, 1, red) != bag.Add(di, 1, blue),
+      check(bag.Add(StackOf(c.items, di, 1, red)) !=
+                bag.Add(StackOf(c.items, di, 1, blue)),
             "and the pack obeys the same rule");
     }
   }
@@ -345,19 +346,20 @@ Status GateDye(Ctx& c, std::string& detail) {
   {
     PlayerCaster caster;
     GlyphLibrary glyphs;
-    Inventory hb;
-    PlayerKit kit;
+    Kit kit;
+    Inventory& hb = kit.hotbar;
     const int di = c.items.Find(piece->name);
     const uint32_t red = DyePack(0.77f, 0.18f, 0.11f);
     const uint32_t black = DyePack(0.0f, 0.0f, 0.0f);
-    hb.slots[1] = {di, 1, red};
-    kit.bag.slots[3] = {di, 1, black};   // the flag-bit case, end to end
+    hb.slots[1] = StackOf(c.items, di, 1, red);
+    // the flag-bit case, end to end
+    kit.bag.slots[3] = StackOf(c.items, di, 1, black);
     int wornSlot = -1;
     for (int s = 0; s < kEquipSlotCount && wornSlot < 0; s++)
       if (EquipSlotIsWorn(s) && EquipSlotAccepts(s, piece->kind)) wornSlot = s;
-    if (wornSlot >= 0) kit.equip.slots[wornSlot] = {di, 1, red};
+    if (wornSlot >= 0) kit.equip.slots[wornSlot] = StackOf(c.items, di, 1, red);
 
-    PlayerKitRefs refs{&caster, &glyphs, &hb, &kit, &c.items};
+    PlayerKitRefs refs{&caster, &glyphs, &kit, &c.items};
     EntityIO io = MakeEntityIO(c.debris, c.mobs, nullptr, &refs);
     const EntitySection* plyr = nullptr;
     for (const EntitySection& s : io.sections)

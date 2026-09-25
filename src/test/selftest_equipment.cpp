@@ -487,8 +487,7 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
         cut.power = 1.0f;
         cut.seed = 0xC4A7u;
         std::vector<ParticleSpawn> spawns;
-        MobSystem::BladeCutScope blade(mobs, 1.0f);
-        mobs.CutLimb(body, cut, c.world, spawns);
+        mobs.CutLimb(body, cut, c.world, spawns, 1.0f);
         const uint32_t after = mobs.LimbSkinVoxelCount(id, slot);
         return before ? 1.0f - (float)after / (float)before : 0.0f;
       };
@@ -535,8 +534,8 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
   // rag. The sword knocked from the hand takes the same road.
   {
     std::vector<std::pair<uint64_t, std::string>> shed;
-    mobs.SetOnItemShed([&shed](uint64_t h, const std::string& n, uint32_t) {
-      shed.push_back({h, n});
+    mobs.SetOnItemShed([&shed](uint64_t h, const ItemInstance& it) {
+      shed.push_back({h, it.name});
     });
     check(mob->WearItem(&robe, chestSlot), "the robe goes on for the cut");
     int piece = -1;
@@ -1969,11 +1968,12 @@ Status GateItemGround(Ctx& c, std::string& detail) {
 
   // ---- 1. drop -------------------------------------------------------------
   const uint64_t body =
-      DropItemToWorld(*any, at, Vec3{}, c.phys, debris, nullptr, ground);
+      DropItemToWorld(*any, ItemInstance{any->name}, at, Vec3{}, c.phys,
+                      debris, nullptr, ground);
   check(body != 0, "dropping an item makes a real body");
   check(ground.Count() == 1, "and one registry entry");
   const WorldItem* w = ground.Find(body);
-  check(w && w->item == any->name, "which names the item that was dropped");
+  check(w && w->name == any->name, "which names the item that was dropped");
 
   // ---- 2. a body the registry does not know is not an item -----------------
   // The filter that keeps `E` from picking up somebody's wall.
@@ -1989,10 +1989,21 @@ Status GateItemGround(Ctx& c, std::string& detail) {
   // ---- 4. 'ITMS' round trip ------------------------------------------------
   {
     const uint64_t a =
-        DropItemToWorld(*any, at, Vec3{}, c.phys, debris, nullptr, ground);
+        DropItemToWorld(*any, ItemInstance{any->name}, at, Vec3{}, c.phys,
+                        debris, nullptr, ground);
     const Vec3 at2{at.x + 4.0f, at.y, at.z};
-    const uint64_t b =
-        DropItemToWorld(*any, at2, Vec3{}, c.phys, debris, nullptr, ground);
+    // THE SECOND ONE IS A PARTICULAR OBJECT (W2-M): a dye, and the damage its
+    // wearer's shells carried off. ITMS v4 carries the damage; a pickup after
+    // a reload must be the same beaten piece, not a fresh one.
+    ItemInstance beaten{any->name};
+    beaten.dye = (1u << 24) | 0x224466u;
+    beaten.damage.shells.resize(2);
+    beaten.damage.shells[1].hp = 3.5f;
+    beaten.damage.shells[1].atSpawn = 40;
+    beaten.damage.shells[1].live = 31;
+    beaten.damage.shells[1].lattice.push_back(PrefabVoxel{2, 3, 4, 1, 7});
+    const uint64_t b = DropItemToWorld(*any, beaten, at2, Vec3{}, c.phys,
+                                       debris, nullptr, ground);
     check(a && b && ground.Count() == 2, "two items on the ground");
 
     WorldItemRefs refs{&ground, &c.phys, &debris, nullptr, &c.items};
@@ -2017,9 +2028,21 @@ Status GateItemGround(Ctx& c, std::string& detail) {
       check(ground.Count() == 2, "with both items on the ground again");
       int named = 0;
       for (const WorldItem& g : ground.All())
-        if (g.item == any->name) named++;
+        if (g.name == any->name) named++;
       check(named == 2, "still named the same item, resolved through the "
                         "library rather than by index");
+      int beatenBack = 0, plainBack = 0;
+      for (const WorldItem& g : ground.All()) {
+        if (g.damage.Empty() && g.dye == 0) plainBack++;
+        if (g.dye == beaten.dye && g.damage.shells.size() == 2 &&
+            g.damage.shells[1].hp == 3.5f && g.damage.shells[1].live == 31 &&
+            g.damage.shells[1].lattice.size() == 1 &&
+            g.damage.shells[1].lattice[0].z == 4)
+          beatenBack++;
+      }
+      check(beatenBack == 1 && plainBack == 1,
+            "and each is still ITS instance: the beaten one with its dye and "
+            "every shell of its damage, the other untouched (ITMS v4)");
 
       // Truncation and an unknown version are REFUSED, not half-applied — the
       // same discipline PLYR keeps, and for the same reason: saves get
@@ -2107,8 +2130,8 @@ Status GateLoot(Ctx& c, std::string& detail) {
   mobs.Reset();
   WorldItems ground;
   debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
-  mobs.SetOnItemShed([&ground](uint64_t h, const std::string& name,
-                               uint32_t dye) { ground.Add(h, name, dye); });
+  mobs.SetOnItemShed(
+      [&ground](uint64_t h, const ItemInstance& it) { ground.Add(h, it); });
   auto teardown = [&]() {
     debris.SetOnBodyGone(nullptr);
     mobs.SetOnItemShed(nullptr);
@@ -2165,7 +2188,7 @@ Status GateLoot(Ctx& c, std::string& detail) {
       check(list.size() == 1, "one piece of gear on it");
       const LootPiece* pc = list.empty() ? nullptr : &list[0];
       const uint64_t robeBody = cr->LootPieceBody(0);
-      check(pc && pc->item == "fixture_robe", "which is the robe, BY NAME");
+      check(pc && pc->name == "fixture_robe", "which is the robe, BY NAME");
       check(pc && pc->kind == LootPiece::Kind::Worn && robeBody != 0,
             "with the body that IS the robe");
       check(cr->WornPieceCount() == 1 &&
@@ -2185,14 +2208,17 @@ Status GateLoot(Ctx& c, std::string& detail) {
     }
 
     // ---- 2. no room refuses with the piece still on the corpse -----------
-    PlayerKit kit;
-    Inventory hotbar;
-    for (ItemStack& st : kit.bag.slots) st = ItemStack{99, 1};
-    for (ItemStack& st : hotbar.slots) st = ItemStack{99, 1};
+    // The looter is a bare Mob: its Kit is the player's kit shape (W2-M), and
+    // with no rig there is nothing for KitFlushWorn to read.
+    Mob looter;
+    Kit& kit = looter.KitMut();
+    Inventory& hotbar = kit.hotbar;
+    for (ItemStack& st : kit.bag.slots) st = ItemInstance{"not_a_robe", 1};
+    for (ItemStack& st : hotbar.slots) st = ItemInstance{"not_a_robe", 1};
     {
       Mob* cw = mobs.FindMobById(id);
       std::string name;
-      const LootResult r = cw ? TakeCorpseLoot(*cw, 0, KitRef{}, kit, hotbar,
+      const LootResult r = cw ? TakeCorpseLoot(*cw, 0, KitRef{}, looter,
                                                lib, &name)
                               : LootResult::NoSuchPiece;
       check(r == LootResult::NoRoom, "a full pack and hotbar refuse the take");
@@ -2209,14 +2235,15 @@ Status GateLoot(Ctx& c, std::string& detail) {
       const uint64_t robeBody = cw ? cw->LootPieceBody(0) : 0;
       const uint32_t heapBefore = cw ? cw->LimbBodyCount() : 0;
       std::string name;
-      const LootResult r = cw ? TakeCorpseLoot(*cw, 0, KitRef{}, kit, hotbar,
+      const LootResult r = cw ? TakeCorpseLoot(*cw, 0, KitRef{}, looter,
                                                lib, &name)
                               : LootResult::NoSuchPiece;
       check(r == LootResult::Ok, "the robe comes off the corpse");
       check(name == "fixture_robe", "and the take names it");
       int inBag = 0;
       for (const ItemStack& st : kit.bag.slots)
-        if (!st.Empty() && st.def == robeIdx) inBag += st.count;
+        if (!st.Empty() && st.name == lib.items[(size_t)robeIdx].name)
+          inBag += st.count;
       check(inBag == 1, "one robe in the pack");
       check(robeBody != 0 && mobs.FindOwner(robeBody) == nullptr &&
                 !debris.HasBody(robeBody),
@@ -2225,10 +2252,12 @@ Status GateLoot(Ctx& c, std::string& detail) {
       check(pieces(id).empty(), "nothing left on the corpse");
       check(cw && cw->LimbBodyCount() == heapBefore - robeParts.size(),
             "and every one of the robe's shells left the body with it");
-      check(kit.Damage("fixture_robe") == nullptr,
-            "an untouched robe files no damage");
+      bool anyDamage = false;
+      for (const ItemStack& st : kit.bag.slots)
+        anyDamage |= !st.Empty() && !st.damage.Empty();
+      check(!anyDamage, "an untouched robe carries no damage");
       const LootResult again =
-          cw ? TakeCorpseLoot(*cw, 0, KitRef{}, kit, hotbar, lib)
+          cw ? TakeCorpseLoot(*cw, 0, KitRef{}, looter, lib)
              : LootResult::NoSuchPiece;
       check(again == LootResult::NoSuchPiece, "taking from an empty list is refused");
     }
@@ -2261,13 +2290,21 @@ Status GateLoot(Ctx& c, std::string& detail) {
       return Status::Fail;
     }
     mob->Die();
+    {
+      // Named, so a count that is off says WHAT is on the corpse.
+      std::string names;
+      for (const LootPiece& p : pieces(id))
+        names += " " + p.name + "x" + std::to_string(p.count);
+      if (pieces(id).size() != 2)
+        std::printf("loot: second corpse holds:%s\n", names.c_str());
+    }
     check(pieces(id).size() == 2, "two pieces on the second corpse");
-    PlayerKit kit;
-    Inventory hotbar;
+    Mob looter;
+    Kit& kit = looter.KitMut();
     auto indexOf = [&](const char* item) {
       const std::vector<LootPiece> list = pieces(id);
       for (size_t i = 0; i < list.size(); i++)
-        if (list[i].item == item) return (int)i;
+        if (list[i].name == item) return (int)i;
       return -1;
     };
     // The robe, dragged straight onto the chest slot.
@@ -2276,10 +2313,11 @@ Status GateLoot(Ctx& c, std::string& detail) {
       const int ri = indexOf("fixture_robe");
       const LootResult r =
           cw && ri >= 0 ? TakeCorpseLoot(*cw, ri, KitRef{KitSpace::Equip, chestSlot},
-                                         kit, hotbar, lib)
+                                         looter, lib)
                         : LootResult::NoSuchPiece;
       check(r == LootResult::Ok, "a robe drags straight onto the chest slot");
-      check(kit.equip.At(chestSlot).def == robeIdx, "and is there");
+      check(kit.equip.At(chestSlot).name == lib.items[(size_t)robeIdx].name,
+            "and is there");
     }
     // The boots onto the chest slot: refused, still on the corpse.
     {
@@ -2287,7 +2325,7 @@ Status GateLoot(Ctx& c, std::string& detail) {
       const int bi = indexOf("fixture_boots");
       const LootResult r =
           cw && bi >= 0 ? TakeCorpseLoot(*cw, bi, KitRef{KitSpace::Equip, chestSlot},
-                                         kit, hotbar, lib)
+                                         looter, lib)
                         : LootResult::NoSuchPiece;
       check(r == LootResult::WrongKind, "boots onto the chest slot are refused");
       check(indexOf("fixture_boots") >= 0, "and stay on the corpse");
@@ -2298,7 +2336,7 @@ Status GateLoot(Ctx& c, std::string& detail) {
       const LootResult in =
           cw && indexOf("fixture_boots") >= 0
               ? TakeCorpseLoot(*cw, indexOf("fixture_boots"),
-                               KitRef{KitSpace::Loot, 0}, kit, hotbar, lib)
+                               KitRef{KitSpace::Loot, 0}, looter, lib)
               : LootResult::NoSuchPiece;
       check(in == LootResult::WrongKind, "and a loot slot is never a destination");
     }
@@ -2312,7 +2350,7 @@ Status GateLoot(Ctx& c, std::string& detail) {
             "the boots come off onto the floor");
       check(name == "fixture_boots", "named");
       const WorldItem* w = ground.Find(bootBody);
-      check(w && w->item == "fixture_boots",
+      check(w && w->name == "fixture_boots",
             "and the body is now a ground item E can pick up");
       check(pieces(id).empty(), "the corpse has nothing left on it");
       check(bootBody != 0 && debris.HasBody(bootBody) &&
@@ -2476,6 +2514,169 @@ Status GateSplatterArmor(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ============================================================================
+// kit-instance -- ONE ITEM INSTANCE, ONE KIT (rule-unification W2-M).
+//
+// The creature's Kit is the truth of what it wears and the rig is dressed from
+// it (Mob::DressFromKit); a worn piece's damage lives on its OWN stack
+// (ItemInstance::damage), written back from the shells when the stack leaves
+// the slot (Mob::KitMove / KitTake / KitFlushWorn). Before W2-M the player's
+// kit sat on the session, a per-tick loop reconciled it with the rig through
+// two latch arrays, and a removed piece's damage went into a map keyed by item
+// NAME — so two identical tunics shared one set of holes.
+//
+// The claims, on a real rig with two IDENTICAL robes (same item, same dye):
+//   A  the kit dresses the rig;
+//   B  a carve on the body is the worn robe's damage;
+//   C  swapping it for its twin re-dresses the rig even though the name and
+//      the dye did not change, the twin goes on whole, and the damaged one is
+//      in the pack WITH its holes;
+//   D  swapping back puts exactly those holes back;
+//   E  recolouring the worn robe in place keeps its holes;
+//   F  taking it off (KitTake) hands out the damaged instance and bares the rig.
+Status GateKitInstance(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  DebrisSystem& debris = c.debris;
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("kit-instance: FAILED %s\n", what.c_str());
+    }
+  };
+
+  int avDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) avDef = (int)i;
+  if (avDef < 0) {
+    detail = Format("no '%s' def to dress", kAvatarDefName);
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[avDef];
+  std::string spine, arm;
+  for (const MobLimbDef& ld : def.limbs) {
+    if (spine.empty() && ld.tag == "spine") spine = ld.name;
+    if (arm.empty() && ld.tag == "arm") arm = ld.name;
+  }
+  if (spine.empty() || arm.empty()) {
+    detail = Format("'%s' has no spine/arm tags to cover", kAvatarDefName);
+    return Status::Skip;
+  }
+  MicroBodySet fixtureMicro;
+  ItemLibrary lib;
+  lib.items.push_back(MakeWornFixture("fixture_robe", ItemKind::ArmorChest,
+                                      {spine, arm}, 8, 1u, fixtureMicro));
+  const int chest = (int)EquipSlotId::Chest;
+  const KitRef inChest{KitSpace::Equip, chest};
+  const KitRef inPack{KitSpace::Bag, 0};
+
+  const uint64_t idsBefore = mobs.NextIdCounter();
+  debris.Reset();
+  mobs.Reset();
+  auto teardown = [&]() {
+    debris.Reset();
+    mobs.Reset();
+    mobs.SetNextIdCounter(idsBefore);
+  };
+
+  const IVec3 wOrg = c.world.WindowOrigin();
+  const int sx = wOrg.x * (int)kChunk + 170, sz = wOrg.z * (int)kChunk + 150;
+  const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+  const uint64_t id = mobs.Spawn(avDef, {sx, h + 1, sz});
+  Mob* m = mobs.FindMobById(id);
+  if (m == nullptr) {
+    teardown();
+    detail = "spawn failed";
+    return Status::Fail;
+  }
+  Kit& kit = m->KitMut();
+  kit.equip.slots[chest] = ItemInstance{"fixture_robe"};   // robe A
+  kit.bag.slots[0] = ItemInstance{"fixture_robe"};         // its twin, B
+
+  // ---- A: the kit dresses the rig -------------------------------------------
+  check(m->DressFromKit(lib) == 0, "A: nothing refused");
+  check(m->WornItem(chest) == "fixture_robe", "A: the kit dresses the rig");
+  check(m->DressFromKit(lib) == 0 && m->WornItem(chest) == "fixture_robe",
+        "A: and a second call with nothing changed is a no-op");
+
+  // ---- B: a carve on the body is the robe's damage ---------------------------
+  float condA = 1.0f;
+  {
+    // A small bite out of ONE shell, and not the identity shell if there is
+    // another: cutting the panel that IS the robe loose would take the piece
+    // off the body (LostGear) and this gate is not about that.
+    const std::vector<int> shells = m->WornSlotsAt(0);
+    const int ident = m->IdentityShellOf(0);
+    int target = -1;
+    for (int s : shells)
+      if (s != ident && mobs.LimbBody(id, s)) { target = s; break; }
+    if (target < 0) target = ident;
+    std::vector<ParticleSpawn> spawns;
+    if (const uint64_t b = target >= 0 ? mobs.LimbBody(id, target) : 0)
+      mobs.CarveLimbRadial(b, mobs.LimbVoxelPos(id, target, 0), 1.5f,
+                           /*ragged=*/false, /*eject=*/false, c.world, spawns);
+    m = mobs.FindMobById(id);
+    condA = m ? m->WornCondition(chest) : 1.0f;
+  }
+  check(m != nullptr && condA < 1.0f,
+        Format("B: a carve takes voxels out of the worn robe (condition %.3f)",
+               condA));
+  if (m == nullptr) {
+    teardown();
+    detail = "the fixture went away";
+    return Status::Fail;
+  }
+
+  // ---- C: swap it with its identical twin -------------------------------------
+  check(m->KitMove(inChest, inPack, lib) == MoveResult::Ok,
+        "C: the worn robe swaps with its twin in the pack");
+  const ItemStack& aNow = kit.bag.At(0);
+  check(!aNow.damage.Empty() &&
+            std::fabs(aNow.damage.Condition() - condA) < 1e-4f,
+        Format("C: the robe in the pack carries ITS holes (%.3f vs %.3f)",
+               aNow.damage.Condition(), condA));
+  check(kit.equip.At(chest).damage.Empty(),
+        "C: the twin now in the slot is whole — they are two robes, not one");
+  check(m->DressFromKit(lib) == 0, "C: nothing refused");
+  check(m->WornItem(chest) == "fixture_robe" &&
+            m->WornCondition(chest) == 1.0f,
+        Format("C: the rig re-dressed with the WHOLE twin although name and "
+               "dye did not change (condition %.3f)",
+               m->WornCondition(chest)));
+
+  // ---- D: and back ------------------------------------------------------------
+  check(m->KitMove(inPack, inChest, lib) == MoveResult::Ok, "D: swap back");
+  m->DressFromKit(lib);
+  check(std::fabs(m->WornCondition(chest) - condA) < 1e-4f,
+        Format("D: the damaged robe goes back on with exactly its holes "
+               "(%.3f vs %.3f)",
+               m->WornCondition(chest), condA));
+  check(kit.bag.At(0).damage.Empty(), "D: and the twin went to the pack whole");
+
+  // ---- E: recoloured in place -------------------------------------------------
+  kit.equip.slots[chest].dye = (1u << 24) | 0x3355AAu;
+  m->DressFromKit(lib);
+  check(std::fabs(m->WornCondition(chest) - condA) < 1e-4f,
+        Format("E: a dye on the worn robe keeps its holes (%.3f vs %.3f)",
+               m->WornCondition(chest), condA));
+
+  // ---- F: taken off -------------------------------------------------------------
+  const ItemStack off = m->KitTake(inChest);
+  m->DressFromKit(lib);
+  check(off.name == "fixture_robe" && !off.damage.Empty() &&
+            std::fabs(off.damage.Condition() - condA) < 1e-4f,
+        "F: taking it off hands out the damaged instance");
+  check(m->WornItem(chest).empty() && kit.equip.At(chest).Empty(),
+        "F: and the rig and the slot are bare");
+
+  teardown();
+  detail = Format("%d checks, carved robe at %.3f", checks, condA);
+  std::printf("kit-instance: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& EquipmentGates() {
@@ -2498,6 +2699,10 @@ const std::vector<Gate>& EquipmentGates() {
       // Corpses. Spawns, dresses and kills two fixtures on real terrain and
       // clears everything on the way out, so it sits with `item-ground`.
       {"loot", "equipment", {"prefab"}, false, GateLoot},
+      // One item instance, one kit (W2-M): a rig dressed from its Kit, and two
+      // identical robes that keep separate damage. Spawns one fixture and
+      // clears it on the way out, so it sits with `loot`.
+      {"kit-instance", "equipment", {"prefab"}, false, GateKitInstance},
       // Mostly a pure function over integers, plus one rig assertion. Cheap,
       // and it wants nothing any other gate leaves behind.
       {"armor-fit", "equipment", {"prefab"}, false, GateArmorFit},

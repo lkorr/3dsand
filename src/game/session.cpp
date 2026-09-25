@@ -334,10 +334,8 @@ struct TickScratch {
   bool& wasInLiquid = s.wasInLiquid;                       \
   Brush& brush = s.brush;                                  \
   PrefabPlacer& placer = s.placer;                         \
-  Inventory& hotbar = s.hotbar;                            \
-  PlayerKit& kit = s.kit;                                  \
-  std::string(&wearTried)[kEquipSlotCount] = s.wearTried;  \
-  uint32_t(&wearDye)[kEquipSlotCount] = s.wearDye;         \
+  Kit& kit = s.kit();                                      \
+  Inventory& hotbar = kit.hotbar;                          \
   GrabHold& grab = s.grab;                                 \
   SpellSystem& spells = s.spells;                          \
   PlayerCaster& caster = s.caster;                         \
@@ -835,11 +833,15 @@ static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
           // expired is back on MOVING and no longer owned, so it takes the
           // beam like any other debris — which is the intent. What it must
           // never again do is take the beam off the head it was fired from.
-          if (avatar.Damage(hitBody, CurrentTuning().tools.laserDamage,
-                            hitPos)) {
-            // handled by the avatar
-          } else if (mobs.Damage(hitBody, CurrentTuning().tools.laserDamage,
-                                 hitPos)) {
+          //
+          // ONE CHARGE (W2-H). This was `avatar.Damage(...)` and then
+          // `mobs.Damage(...)`, and the second already walks every avatar
+          // (MobSystem's registered list, W1-F) -- so the first was a copy
+          // that could only ever find what the second finds, and a hit it did
+          // find was charged but never bored. MobSystem::LaserHit is the one
+          // charge, through the shell table on a worn slot.
+          float bore = 0.0f;
+          if (mobs.LaserHit(hitBody, hitPos, bore)) {
             // A limb hit is now BOTH: the hp/sever logic above (joint
             // crossings, flinch, loco states) AND a real channel bored through
             // the flesh. Deferred like the melt below, for the same reason.
@@ -847,8 +849,7 @@ static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
             // Damage() may have severed the limb outright, in which case this
             // handle is no longer a live limb — the carve then simply misses
             // (CarveLimbRadial returns false) rather than touching stale state.
-            laserCut = {hitBody, hitPos,
-                        (float)CurrentTuning().tools.laserCarveRadius, true};
+            laserCut = {hitBody, hitPos, bore, true};
           } else {
             // Deferred: the melt needs the `spawns` list that debris.PreTick
             // fills further down, and the ray must be cast HERE where the
@@ -1175,7 +1176,7 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
   {
       // ---- WARDROBE panel: make a set of clothes in a colour --------------
       //
-      // Producers on the SAME paths the game uses: PlayerKit's own containers
+      // Producers on the SAME paths the game uses: the kit's own containers
       // and the ordinary equip slots, so a tunic this button made is a tunic,
       // not a dev-only object. The only thing the panel adds to an item that
       // picking one off the ground would not is the dye word.
@@ -1213,12 +1214,13 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
         const char* why = nullptr;
         if (!d || !mat) {
           ui.giveVesselStatus = "pick a vessel and a material";
-        } else if (!ContainerAccepts(*d, ItemStack{di, 1}, mat, mats, &why)) {
+        } else if (!ContainerAccepts(*d, StackOf(items, di), mat, mats, &why)) {
           ui.giveVesselStatus = why ? why : "refused";
         } else {
-          const uint16_t amt = (uint16_t)std::min(d->container.capacity, 0xFFFF);
-          const bool ok = hotbar.Add(di, 1, 0, (uint16_t)mat, amt) >= 0 ||
-                          kit.bag.Add(di, 1, 0, (uint16_t)mat, amt) >= 0;
+          ItemStack full = StackOf(items, di);
+          full.fillMat = (uint16_t)mat;
+          full.fillAmt = (uint16_t)std::min(d->container.capacity, 0xFFFF);
+          const bool ok = hotbar.Add(full) >= 0 || kit.bag.Add(full) >= 0;
           ui.giveVesselStatus = ok ? vname + " of " + mname + " — in your pack"
                                    : "no room in the hotbar or the bag";
         }
@@ -1233,13 +1235,14 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
         if (redye) {
           // RE-DYE WHAT IS ON. Only the dyeable pieces: the wizard's robe is
           // painted in real colours and multiplying them by another colour is
-          // not a feature (ItemDef::dyeable). The wear sync a few hundred lines
-          // down notices the changed dye and rebuilds those shells, which is
-          // why nothing here touches the rig.
+          // not a feature (ItemDef::dyeable). Mob::DressFromKit a few hundred
+          // lines down notices the changed dye, carries the shells' damage back
+          // into the stack and rebuilds them in the new colour, which is why
+          // nothing here touches the rig.
           int n = 0;
           for (int s = 0; s < kEquipSlotCount; s++) {
             ItemStack& st = kit.equip.slots[s];
-            const ItemDef* d = items.At(st.Empty() ? -1 : st.def);
+            const ItemDef* d = items.Of(st);
             if (d == nullptr || !d->dyeable) continue;
             st.dye = dye;
             n++;
@@ -1274,14 +1277,17 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
             if (wear) {
               const int slot = EquipSlotFor(d->kind, kit.equip);
               if (slot >= 0) {
-                const ItemStack was = kit.equip.At(slot);
-                if (!was.Empty()) kit.bag.Add(was.def, was.count, was.dye);
-                kit.equip.slots[slot] = ItemStack{di, 1, dye};
+                // Off the body WITH its holes (Mob::KitTake flushes the
+                // shells), and into the pack as the object it is.
+                const ItemStack was =
+                    avatar.KitTake(KitRef{KitSpace::Equip, slot});
+                if (!was.Empty()) kit.bag.Add(was);
+                kit.equip.slots[slot] = StackOf(items, di, 1, dye);
                 ok = true;
               }
             } else {
-              ok = hotbar.Add(di, 1, dye) >= 0 ||
-                   kit.bag.Add(di, 1, dye) >= 0;
+              ok = hotbar.Add(StackOf(items, di, 1, dye)) >= 0 ||
+                   kit.bag.Add(StackOf(items, di, 1, dye)) >= 0;
             }
             if (ok) {
               if (!names.empty()) names += ", ";
@@ -1537,7 +1543,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                                  int nSpill, uint16_t mat, int units) {
             ItemStack& cand = v[i];
             if (cand.Empty()) return 0;
-            const ItemDef* d = items.At(cand.def);
+            const ItemDef* d = items.Of(cand);
             if (!d || !d->IsContainer() || (cand.Filled() && cand.fillMat != mat))
               return 0;
             if (mat >= mats.size() || mats[mat].gpu.klass > 31 ||
@@ -1588,7 +1594,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         const int tslot = st.intent.vesselSlot;
         const ItemStack* ts =
             tslot >= 0 && tslot < kItemSlots ? &hotbar.slots[tslot] : nullptr;
-        const ItemDef* tdef = ts && !ts->Empty() ? items.At(ts->def) : nullptr;
+        const ItemDef* tdef = ts ? items.Of(*ts) : nullptr;
         if (!tdef || !ContainerThrowable(*tdef) || tslot != s.throwSlot) {
           if (s.throwTicks > 0 && avatar.Spawned())
             avatar.StopClip("throw_windup");
@@ -1632,8 +1638,10 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           // own voxels (`at` is the body's min corner). Without a body, from
           // in front of the eye. Either way it starts inside the capsule and
           // among the thrower's own limbs, which is why the release below is
-          // `thrown`: on the plain AVATAR layer it struck the thrower's head
-          // and arm on its first step and burst in their face.
+          // Thrown: on the plain exempt layer it struck the thrower's head
+          // and arm on its first step and burst in their face. Owned by THIS
+          // player's capsule, so it clears its thrower and still hits anyone
+          // else it is thrown at (Physics::BodyRole, THROWN(P)).
           Vec3 at = player.EyePos() + fwd * 2.0f - Vec3{0, 0.5f, 0};
           {
             Vec3 hp;
@@ -1651,12 +1659,12 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               at = hp - c;
             }
           }
+          // ONE of the stack leaves, as the object it is: its dye, its fill.
           const uint64_t body =
-              w.ground ? DropItemToWorld(*tdef, at, vel, phys, debris, &mbSet,
-                                         *w.ground, nullptr, vs.dye,
-                                         PackItemFill(vs.fillMat, vs.fillAmt))
+              w.ground ? DropItemToWorld(*tdef, vs.One(), at, vel, phys, debris,
+                                         &mbSet, *w.ground)
                        : 0;
-          if (body) phys.ReleaseToWorldWhenClear(body, /*thrown=*/true);
+          if (body) phys.SetBodyRole(body, Physics::BodyRole::Thrown, playerBody);
           if (body) {
             // End over end about the throw's own right axis: a spun flask
             // reads as thrown, a translating one as teleported.
@@ -1667,7 +1675,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             if (--vs.count <= 0) {
               vs = ItemStack{};
             } else {
-              // The fill was ONE flask's (item.h SameKind) and it just left
+              // The fill was ONE flask's (ItemInstance::StacksWith) and it just left
               // in the thrown one; what stays behind is empty, not a copy.
               vs.fillMat = 0;
               vs.fillAmt = 0;
@@ -1684,7 +1692,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
       if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots &&
           s.throwTicks == 0 && s.throwLaunchIn == 0) {
         ItemStack& vs = hotbar.slots[st.intent.vesselSlot];
-        const ItemDef* vdef = vs.Empty() ? nullptr : items.At(vs.def);
+        const ItemDef* vdef = items.Of(vs);
         const WorldSnapshot& vsnap = world.Snap();
         const Vec3 eye = player.EyePos();
         const Vec3 fwd = cam.Forward();
@@ -1893,11 +1901,11 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
       // burning emits REAL fire voxels into the grid, and mobs run first.
       // (`cellOps` is aliased out of the caller's OpBatch.)
 
-      // The day phase both body-burn passes gate their reactions on, taken
+      // The day phase the body-reaction evaluator gates its rules on (every
+      // body population, debris included, goes through MobSystem's), taken
       // from the ONE function that also puts it on TickParams — see
       // sim/reactcpu.h for why the CPU has to agree with the GPU here.
       mobs.SetDayPhase(DayPhaseNow(tick));
-      debris.SetDayPhase(DayPhaseNow(tick));
       // ...and the weather: the tick's rain word, LATCHED here once and taken
       // by SubmitTick for TickParams (weather::TakeTickRain), so the body
       // reactions and the GPU kernels read one value even if the weather pin
@@ -1906,7 +1914,6 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
         const uint32_t rainWord =
             weather::LatchTickRain(CurrentTuning(), kDefaultSeed, tick);
         mobs.SetWeatherRain(rainWord);
-        debris.SetWeatherRain(rainWord);
       }
 
       // ---- BROKEN VESSELS (game/container.h ContainerShouldBreak) -----------
@@ -2056,10 +2063,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           avatar.Spawn(player, avatarHeading);
           if (avatar.HasEyeLocal())
             player.SetModelEyeHeight(avatar.EyeRestHeight());
-          // A new rig wears nothing (Mob::BuildRig clears its shells), so the
-          // armour sync below has to be offered every slot again.
-          for (std::string& w : wearTried) w.clear();
-          for (uint32_t& d : wearDye) d = 0;
+          // A new rig wears nothing (Mob::BuildRig clears its shells and
+          // DressFromKit's memo), so the armour sync below offers every slot
+          // again on its own.
           tpRig.Snap();   // re-entering from fly: don't ease across the gap
         }
         if (!wantAvatar && avatar.Spawned()) avatar.Despawn();
@@ -2093,9 +2099,8 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // borrowed rig slot: the flask is a real part of the arm while
             // you hold it (game/container.h).
             const ItemDef* vesselDef = nullptr;
-            if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots &&
-                !hotbar.slots[st.intent.vesselSlot].Empty())
-              vesselDef = items.At(hotbar.slots[st.intent.vesselSlot].def);
+            if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots)
+              vesselDef = items.Of(hotbar.slots[st.intent.vesselSlot]);
             const ItemDef* want = meleeArmed ? heldItem : vesselDef;
             const std::string wantName = want ? want->name : std::string();
             if (avatar.HeldItem() != wantName) avatar.EquipItem(want);
@@ -2353,60 +2358,25 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             avatar.SetWeaponPose(melee.Pose());
           }
         }
-        // ---- ARMOUR: what the equipment says vs what the body wears --------
+        // ---- ARMOUR: the body wears what the kit's equipment says -----------
         //
-        // The SAME change-detection seam the weapon uses one block up, and in
-        // the same place in the frame for the same reason: WearItem builds
-        // bodies and joints, so it must run once per CHANGE rather than once
-        // per tick, and it must run before PreTick flattens the pose and
-        // submits the kinematic targets — a shell appended after that would
-        // sit at its spawn pose for a tick and visibly snap into place.
+        // Mob::DressFromKit (W2-M): the kit is the avatar's own, and the rig's
+        // shells are derived from it. Here, in the same place in the frame the
+        // weapon's seam uses one block up and for the same reason: WearItem
+        // builds bodies and joints, so it runs once per CHANGE, and before
+        // PreTick flattens the pose and submits the kinematic targets — a
+        // shell appended after that would sit at its spawn pose for a tick and
+        // visibly snap into place. A respawn clears the rig's shells
+        // (BuildRig) and the next call simply puts them back.
         //
-        // Compared BY NAME, which is also what makes this survive an R
-        // hot-reload: library indices renumber, the name does not. A respawn
-        // clears the rig's shells (BuildRig) and this loop simply puts them
-        // back on the next tick, with no despawn/respawn bookkeeping anywhere.
-        //
-        // `wearTried` is what stops a REFUSED piece from being retried every
-        // tick. Comparing against what the body is actually wearing is not
-        // enough on its own: a piece that finds no limb to hang on (a helm on
-        // a headless mob) leaves the slot un-worn, so the two would disagree
-        // forever and WearItem would rebuild nothing, loudly, 30 times a
-        // second. This records the last ATTEMPT, which the slot changing is
-        // what clears.
-        if (avatar.Spawned()) {
-          for (int s = 0; s < kEquipSlotCount; s++) {
-            if (!EquipSlotIsWorn(s)) continue;
-            const ItemStack& st = kit.equip.At(s);
-            const ItemDef* want = items.At(st.Empty() ? -1 : st.def);
-            const std::string wantName = want ? want->name : std::string();
-            const uint32_t wantDye = st.Empty() ? 0u : st.dye;
-            if (avatar.WornItem(s) == wantName && wearTried[s] == wantName &&
-                wearDye[s] == wantDye)
-              continue;
-            if (wearTried[s] == wantName && wearDye[s] == wantDye &&
-                avatar.WornItem(s).empty() && !wantName.empty())
-              continue;   // already refused this one; nothing has changed
-            // TAKING IT OFF KEEPS ITS WOUNDS. The shells are the only place
-            // the damage lives while the piece is on, and they are destroyed
-            // with the slots — so it is read out here, one call before the
-            // rig forgets it, and handed back on the next wear. Without this
-            // pair, changing boots mends the pair you took off.
-            const std::string had = avatar.WornItem(s);
-            if (!had.empty()) {
-              WornDamage d;
-              if (avatar.CaptureWorn(s, d)) kit.SetDamage(had, std::move(d));
-            }
-            wearTried[s] = wantName;
-            wearDye[s] = wantDye;
-            if (wantName.empty()) {
-              avatar.UnwearItem(s);
-            } else if (!avatar.WearItem(want, s, kit.Damage(wantName),
-                                        wantDye)) {
-              ui.kitMessage = "that does not fit you";
-              ui.kitMessageAge = 0.0f;
-            }
-          }
+        // This used to be a loop HERE that compared the session's PlayerKit
+        // with the rig by name every tick through two latch arrays, and read a
+        // removed piece's damage into a map keyed by item name — so two robes
+        // shared one set of holes. The damage now travels in the stack itself
+        // (Mob::KitMove/KitTake flush the shells into it on the way out).
+        if (avatar.Spawned() && avatar.DressFromKit(items) > 0) {
+          ui.kitMessage = "that does not fit you";
+          ui.kitMessageAge = 0.0f;
         }
         // Head look, the other half of the turn policy above: whatever yaw the
         // body did NOT take is what the head is asked for. Computed from the
@@ -2733,8 +2703,8 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // costs nothing, because nothing leaves the flask.
         {
           PlayerSession::PourStroke& ps = s.pourStroke;
-          ItemStack* vp = kit.Resolve(ps.vessel, hotbar);
-          // ONE VESSEL'S FILL (item.h SameKind): a filled stack left by an old
+          ItemStack* vp = kit.Resolve(ps.vessel);
+          // ONE VESSEL'S FILL (ItemInstance::StacksWith): a filled stack left by an old
           // save is split first, else the brush would drain one flask's fill
           // on behalf of the whole stack. Where the rest cannot be set down,
           // the brush does not pour.
@@ -2751,7 +2721,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                         : false;
             if (!split) vp = nullptr;
           }
-          const ItemDef* vdef = !vp || vp->Empty() ? nullptr : items.At(vp->def);
+          const ItemDef* vdef = vp ? items.Of(*vp) : nullptr;
           if (!ps.active || !avatar.Spawned() || !vdef || !vdef->IsContainer() ||
               !vp->Filled()) {
             s.pourStrokeTicks = 0;
@@ -2925,7 +2895,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           const uint64_t h = phys.CreateSphereBody(rq.pos, r, density);
           if (!h) continue;
           phys.SetBodyVelocity(h, rq.vel);
-          phys.ReleaseToWorldWhenClear(h);
+          phys.SetBodyRole(h, Physics::BodyRole::Debris);  // clears the caster first
           debris.AdoptBody(h, std::move(ball), xf);
           spells.AdoptBody(rq.token, h);
         }
@@ -3115,7 +3085,8 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
         // populations — see game/mob.h.
         if (laserCut.limb)
           mobs.CarveLimbRadial(laserCut.body, laserCut.at, laserCut.radius,
-                               false /*ragged*/, false /*eject*/, world, spawns);
+                               false /*ragged*/, false /*eject*/, world, spawns,
+                               DamageCtx(DamageCause::Beam));
         else
           debris.MeltBodyAt(laserCut.body, laserCut.at, laserCut.radius, world,
                             spawns);
@@ -3401,22 +3372,32 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
 }
 
 // ---- ONE EXPLOSION AGAINST EVERY BODY (session.h) -------------------------
+BlastForce BlastForceOf(const ExplosionOp& e) {
+  const Tuning& t = CurrentTuning();
+  BlastForce f;
+  f.center = Vec3{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
+  f.debrisCenter = Vec3{(float)e.x, (float)e.y, (float)e.z};
+  f.craterRadius = (float)e.radius * t.physics.explosionBodyDamageScale;
+  f.pushRadius = (float)e.radius * t.physics.explosionImpulseRadiusScale;
+  f.debrisImpulse = (float)e.power * t.physics.explosionImpulseScale;
+  f.rigImpulse = (float)e.power * t.ragdoll.blastImpulseScale;
+  f.power = (float)e.power;
+  return f;
+}
+
 void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
                          DebrisSystem& debris, MobSystem& mobs,
                          std::vector<ParticleSpawn>& spawns, BlastBodies who) {
-  const Vec3 ec{(float)e.x + 0.5f, (float)e.y + 0.5f, (float)e.z + 0.5f};
-  const float edr =
-      (float)e.radius * CurrentTuning().physics.explosionBodyDamageScale;
-  const auto& rg = CurrentTuning().ragdoll;
-  const float reach = (float)e.radius * rg.blastRadiusScale;
-  const float impulse = (float)e.power * rg.blastImpulseScale;
+  // Reach and strength come from ONE place (BlastForceOf, session.h).
+  const BlastForce f = BlastForceOf(e);
   if (who == BlastBodies::OwnAvatars) {
     // A PEER's blast on this machine: the same carve and the same launch as
     // below, on this process's own avatars only. The debris, the NPCs and the
     // impulse are left alone -- this is the owner-side half of a player hit,
     // not a second application of the whole blast.
-    mobs.CarveLocalAvatarsRadial(ec, edr, world, spawns);
-    mobs.BlastLocalAvatarsRadial(ec, reach, impulse);
+    mobs.CarveLocalAvatarsRadial(f.center, f.craterRadius, world, spawns,
+                                 f.power);
+    mobs.BlastLocalAvatarsRadial(f.center, f.pushRadius, f.rigImpulse);
     return;
   }
   // Blow voxels OFF the bodies in range before shoving what survives:
@@ -3424,7 +3405,7 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   // separate bodies when the crater severs it. Runs first so the
   // impulse below acts on the post-damage bodies (including the new
   // fragments, which is what makes a blown-apart object scatter).
-  debris.DamageBodiesRadial(ec, edr, world, spawns);
+  debris.DamageBodiesRadial(f.center, f.craterRadius, world, spawns);
   // Living flesh craters too: a blast next to a mob tears voxels off
   // its limbs, and takes a limb clean off when it removes enough of it.
   // Same call shape as the debris line above — that parallel is the
@@ -3432,7 +3413,12 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   // its registered avatars after the NPCs, so another player standing
   // in this session's blast is carved. It used to be this session's
   // own `avatar.CarveRadial` beside it, which reached nobody else.
-  mobs.CarveMobsRadial(ec, edr, world, spawns);
+  //
+  // WITH ITS POWER (W2-H): the body crater follows the terrain crater's
+  // rule, so a weak blast tears less than a strong one of the same radius
+  // and a worn shell in the way takes its hardness off the flesh behind it
+  // (Mob::CarveLimbRadial, game/shellresponse.h).
+  mobs.CarveMobsRadial(f.center, f.craterRadius, world, spawns, f.power);
   // The per-body impulse is for DEBRIS. A living creature's limbs are
   // skipped whether kinematic (standing) or dynamic (already limp
   // from an earlier blast): impulse / limb mass on a 0.3 kg hand is
@@ -3441,11 +3427,8 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   std::vector<uint64_t> rigBodies;
   mobs.AppendLiveLimbBodies(rigBodies);  // NPCs + every avatar
   std::sort(rigBodies.begin(), rigBodies.end());
-  phys.ApplyRadialImpulse(
-      Vec3{(float)e.x, (float)e.y, (float)e.z},
-      (float)e.radius * CurrentTuning().physics.explosionImpulseRadiusScale,
-      (float)e.power * CurrentTuning().physics.explosionImpulseScale,
-      &rigBodies);
+  phys.ApplyRadialImpulse(f.debrisCenter, f.pushRadius, f.debrisImpulse,
+                          &rigBodies);
   // ...and the LIVING are knocked flying. A standing creature's limbs
   // are kinematic, so the impulse above never touched them; this is
   // the blast's other half (Mob::BlastRadial): go limp, take a launch
@@ -3453,7 +3436,7 @@ void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
   // capped at ragdoll.maxLaunchSpeed, and get back up once landed.
   // NPCs + every LOCAL avatar; a peer's ghost is carved above but
   // never launched — its position is the wire's (game/mob.h).
-  mobs.BlastMobsRadial(ec, reach, impulse);
+  mobs.BlastMobsRadial(f.center, f.pushRadius, f.rigImpulse);
 }
 
 uint32_t RemoteExplosionsHitOwnAvatars(std::span<const ExplosionOp> exps,
@@ -3792,6 +3775,14 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
       tPhys1 = NowSeconds();
       debris.PostStep();
       mobs.PostStep();
+      // A THROWN ROCK IS A BLOW (W2-H): this step's new contacts, read while
+      // they are this step's. A contact blow neither dents nor breaks plate
+      // (MobSystem::ApplyContactDamage), so it authors no particles; the
+      // scratch list is where they would go if it ever did.
+      {
+        std::vector<ParticleSpawn> contactGore;
+        mobs.ApplyContactDamage(phys, world, contactGore);
+      }
   }
 }
 

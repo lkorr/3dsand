@@ -213,17 +213,17 @@ Status GateGrimoire(Ctx& c, std::string& detail) {
     rock.kind = ItemKind::None;
     items.items.push_back(rock);
     PlayerCaster caster;
-    Inventory hb;
-    PlayerKit kit;
+    Kit kit;
+    Inventory& hb = kit.hotbar;
     for (int i = 0; i < (int)lib.glyphs.size(); i++) caster.inventory.Grant(i);
     caster.grimoire.pages.push_back({"hellfire", {"kit_fire", "kit_boom", "kit_fan"}});
     caster.grimoire.pages.push_back({"nested", {"hellfire", "kit_bolt"}});
     caster.inventory.Bind(0, gFire);
     caster.inventory.Bind(12, gBoom);          // bank B
     caster.inventory.BindPage(3, "nested");    // a macro on a key
-    hb.slots[1] = {0, 2};
+    hb.slots[1] = StackOf(items, 0, 2);
 
-    PlayerKitRefs refs{&caster, &lib, &hb, &kit, &items};
+    PlayerKitRefs refs{&caster, &lib, &kit, &items};
     EntityIO io = MakeEntityIO(c.debris, c.mobs, nullptr, &refs);
     const EntitySection* plyr = nullptr;
     for (const EntitySection& s : io.sections)

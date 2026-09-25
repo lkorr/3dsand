@@ -693,7 +693,7 @@ int ContainerBreakPass(WorldItems& ground, const ItemLibrary& items,
   std::vector<Broke> broke;
   const std::vector<Physics::ContactImpact>& contacts = phys.ContactImpacts();
   for (const WorldItem& wi : ground.All()) {
-    const ItemDef* def = items.At(items.Find(wi.item));
+    const ItemDef* def = items.Of(wi);
     if (!def || !def->IsContainer() || def->container.breakSpeed <= 0.0f)
       continue;
     if (debris.IsGhost(wi.body)) continue;
@@ -737,8 +737,8 @@ int ContainerBreakPass(WorldItems& ground, const ItemLibrary& items,
     const WorldItem* wi = ground.Find(b.body);
     if (!wi) continue;
     ContainerSpill sp;
-    sp.mat = ItemFillMat(wi->fill);
-    sp.units = ItemFillAmt(wi->fill);
+    sp.mat = wi->fillMat;
+    sp.units = wi->fillAmt;
     sp.vel = b.prevVel;
     sp.away = b.away;
     sp.seed = (uint32_t)(b.body ^ (b.body >> 32)) ^ 0xF1A5Bu;

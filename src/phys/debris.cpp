@@ -257,9 +257,10 @@ constexpr uint32_t kMaxNewBodiesPerTick = 4;   // shatter's share, all bodies
 // below this they become ballistic particles and stay in the CA.
 constexpr uint32_t kMinBurnFragmentVoxels = 24;
 
-// Body burn budgets: voxel scans across all bodies per tick, grid writes
-// (emitted fire / escaping ash+smoke) per tick, and how many voxels must burn
-// away before the Jolt collider is rebuilt to match the charred shape.
+// Body burn budgets: evaluator candidates (front cells, MobSystem::
+// BurnOneLimb) across all non-flesh bodies per tick, grid writes (emitted
+// fire / escaping ash+smoke) per tick, and how many voxels must burn away
+// before the Jolt collider is rebuilt to match the charred shape.
 constexpr uint32_t kBurnScanPerTick = 4096;
 // The least any scanning body is offered of that per tick, however many
 // bodies are scanning: a body's share is the larger of this and an even split
@@ -267,6 +268,11 @@ constexpr uint32_t kBurnScanPerTick = 4096;
 // (a few hundred skin voxels) covered every tick or two even in a crowd.
 constexpr uint32_t kBurnScanMinShare = 256;
 constexpr uint32_t kBurnOpsPerTick = 384;
+// World cells the evaluator's cheap-gate walk may read across all non-flesh
+// bodies per tick (BurnLimbView::walkBudget). A cell read is ~15 ns, so this
+// is ~1 ms of walk in the worst tick; a body's walk is at most the
+// evaluator's own kBurnScanCells (4,096), so the pot always fits one.
+constexpr uint32_t kBurnWalkPerTick = 65536;
 constexpr uint32_t kBurnRebuildVoxels = 12;
 // Connectivity re-check after burning is O(n) per body; run it only when
 // enough matter has actually left to plausibly disconnect the remainder.
@@ -291,15 +297,9 @@ constexpr float kSimTicksPerSecond = 30.0f;
 // ImpactEvent comment in debris.h for why the cap picks rather than truncates.
 constexpr size_t kMaxImpactsPerStep = 4;
 
-// sim/rng.h — so burn rolls replay identically for a given
-// (body serial, tick, voxel, rule).
-using rng::Hash3;
-using rng::Pcg;
 
-uint32_t LocalKey(int x, int y, int z) {
-  return (uint32_t)(x & 0xFF) | ((uint32_t)(y & 0xFF) << 8) |
-         ((uint32_t)(z & 0xFF) << 16);
-}
+// sim/rng.h: counter-based, so a carve's jitter replays identically.
+using rng::Hash3;
 
 Vec3 QuatRot(const float q[4], Vec3 v) {
   Vec3 u{q[0], q[1], q[2]};
@@ -423,13 +423,14 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matTints_.clear();
   tintMapValid_ = false;  // tint lists just moved: the art map derived from them
   matGpu_.clear();
-  matSelfActive_.clear();
-  matSelfScaled_.clear();
-  matHasPair_.clear();
-  matHasScaled_.clear();
-  matRewritesNbr_.clear();
-  matInboundTarget_.clear();
   reactions_ = reactions;
+  // The flag columns RecountBurn, the scan gate and the solvent probe read:
+  // the ONE builder MobSystem uses too (sim/bodyreact.h). A self rule behind
+  // a neighbour-count ramp is NOT "self-driven" (selfScaled, not selfActive):
+  // it cannot fire until something hot sits next to the voxel, and counting
+  // it as active made every charred body one the burn pass scanned every
+  // tick for the rest of the session.
+  BuildBodyReactFlags(mats, reactions_, react_);
   uint32_t selfIdx = 0;
   matNames_.clear();
   for (const auto& m : mats) {
@@ -441,47 +442,6 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     // string; this is the loose-matter half of it.
     matNames_.push_back(m.name);
     matTints_.push_back(m.tints);
-    // which rule shapes this material owns (drives the burn-pass gates).
-    //
-    // A self rule behind a neighbour-count ramp is NOT "self-driven": it
-    // cannot fire until something hot sits next to the voxel, and until then
-    // it is exactly as inert as a pair rule with no partner. flesh_charred
-    // and flesh_cooked own only such rules (relight under a four-face front,
-    // catch under a three-face one), and counting them as active made every
-    // charred corpse a body BurnBodies scanned to its budget every tick for
-    // the rest of the session -- the light-gated-rules-never-sleep trap
-    // (CLAUDE.md rule 2) wearing a different condition. Gated self rules go
-    // in their own column and wake a body only with fire nearby.
-    uint8_t selfActive = 0, selfScaled = 0, hasPair = 0, rewrites = 0;
-    for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
-      const ReactionGpu& r = reactions_[m.gpu.reactOffset + ri];
-      uint32_t kind = r.packed & 3u;
-      if (kind == kReactDecay || kind == kReactEmit) {
-        if (ReactScaleArmed(r)) selfScaled = 1;
-        else selfActive = 1;
-      }
-      if (kind == kReactPair) {
-        hasPair = 1;
-        // ...and can it act on whatever is next to it? That is the rule shape
-        // the inbound pass runs, and it is the only shape that matters when
-        // the neighbour is a BODY: a rule that keeps its neighbour has nothing
-        // to say to one.
-        if (r.prodNbr != kProdKeep) rewrites = 1;
-      }
-    }
-    matSelfActive_.push_back(selfActive);
-    matSelfScaled_.push_back(selfScaled);
-    matHasPair_.push_back(hasPair);
-    matRewritesNbr_.push_back(rewrites);
-    // Does ANY of this material's rules use the neighbour-count ramp? The burn
-    // pass needs the body-local occupancy map to count neighbours, and an
-    // inactive body normally skips building it — so without this flag a scaled
-    // rule on an inactive body would count every direction as "world", which is
-    // the divergence in the opposite direction from the one reactcpu.h fixes.
-    uint8_t hasScaled = 0;
-    for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++)
-      if (ReactScaleArmed(reactions_[m.gpu.reactOffset + ri])) hasScaled = 1;
-    matHasScaled_.push_back(hasScaled);
     // Rubble = what a voxel becomes when it crumbles to loose matter. An
     // undeclared rubble form defaults to the material ITSELF: a scrap of wood
     // is still wood, and transmuting it (the old organic->dust / ->gravel
@@ -495,25 +455,6 @@ void DebrisSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     for (const auto& t : m.tags)
       if (t == "foliage") foliage = 1;
     foliageOf_.push_back(foliage);
-  }
-  // ---- WHICH MATERIALS THE GRID CAN EAT ------------------------------------
-  // A second pass, because the predicate test needs the whole material table
-  // and the loop above is still building it. Every rewrite rule is asked, once,
-  // which of the materials it would match — so a body can later answer "is
-  // there anything on me the world could act on?" with one array read per
-  // voxel instead of a rule walk. Nothing is hardcoded: adding a new solvent to
-  // reactions.json extends this table on the next reload, exactly as it
-  // extends the GPU's.
-  matInboundTarget_.assign(matGpu_.size(), 0);
-  for (size_t sm = 1; sm < matGpu_.size(); sm++) {
-    if (!matRewritesNbr_[sm]) continue;
-    const MaterialGpu& g = matGpu_[sm];
-    for (uint32_t ri = 0; ri < g.reactCount; ri++) {
-      const ReactionGpu& r = reactions_[g.reactOffset + ri];
-      if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep) continue;
-      for (size_t tm = 1; tm < matGpu_.size(); tm++)
-        if (ReactNbrMatches(r, (uint32_t)tm, matGpu_)) matInboundTarget_[tm] = 1;
-    }
   }
   for (Body& b : bodies_) RecountBurn(b);  // hot-reload can change rule sets
 }
@@ -574,21 +515,31 @@ void DebrisSystem::RecountBurn(Body& b) const {
   // majority-filled derivation, so a handful of burning skin voxels can vanish
   // from it entirely — and a body whose activeCount reads 0 is a body this pass
   // skips, i.e. a corpse that stops burning for no visible reason.
-  auto tally = [&](uint32_t m) {
+  const BodyReactFlags& rf = react_;
+  auto tally = [&](uint32_t m, uint16_t stain) {
     if (m == 0 || m >= matGpu_.size()) return;
-    if (matSelfActive_[m]) b.activeCount++;
-    if (matSelfScaled_[m]) b.scaledCount++;
-    if (matHasPair_[m]) b.pairCount++;
-    if (m < matInboundTarget_.size() && matInboundTarget_[m]) b.inboundCount++;
+    if (rf.selfActive[m]) b.activeCount++;
+    if (rf.selfScaled[m]) b.scaledCount++;
+    if (rf.hasPair[m]) b.pairCount++;
+    else if (BodyStainAmt(stain)) {
+      // A COAT IS MATTER THAT REACTS (W2-I): oil on a plank flashes when heat
+      // touches it, water on it douses and resists, whatever the plank itself
+      // authors. The burn pass reads the coat through its own sections, so a
+      // voxel wearing a coat with pair rules counts as ignitable/dousable
+      // here -- otherwise an oiled stone would never be offered to it at all.
+      const uint32_t cm = BodyStainMat(stain);
+      if (cm < rf.hasPair.size() && rf.hasPair[cm]) b.pairCount++;
+    }
+    if (rf.inboundTarget[m]) b.inboundCount++;
     if (!presentScratch_[m]) {
       presentScratch_[m] = 1;
       found.push_back(m);
     }
   };
   if (b.HasFineSkin()) {
-    for (const PrefabVoxel& v : b.skinVoxels) tally(v.material & 0xFFFu);
+    for (const PrefabVoxel& v : b.skinVoxels) tally(v.material & 0xFFFu, v.stain);
   } else {
-    for (const DebrisVoxel& v : b.voxels) tally(v.payload & 0xFFFu);
+    for (const DebrisVoxel& v : b.voxels) tally(v.payload & 0xFFFu, v.stain);
   }
   // ---- CAN IT REACT WITH ITSELF? (Body::internalPair) ----------------------
   // Every material present, against every pair rule every material present
@@ -597,7 +548,7 @@ void DebrisSystem::RecountBurn(Body& b) const {
   // 14k-voxel torso pays the same as a hand.
   for (uint32_t sm : found) {
     if (b.internalPair) break;
-    if (!matHasPair_[sm]) continue;
+    if (!rf.hasPair[sm]) continue;
     const MaterialGpu& g = matGpu_[sm];
     for (uint32_t ri = 0; ri < g.reactCount && !b.internalPair; ri++) {
       const ReactionGpu& r = reactions_[g.reactOffset + ri];
@@ -645,6 +596,10 @@ void DebrisSystem::Reset() {
   // destruction produces re-rolls a later fire's outcome entirely. Resetting
   // here makes a body's burn a function of the scenario, not of history.
   nextSerial_ = 1;
+  burnNext_ = 0;  // the burn scheduler's resume point indexes bodies_
+  // ...and the evaluator's per-body burn state, keyed on those serials: a new
+  // body re-using a serial must not inherit a dead one's index or sleep key.
+  if (bodyReactEnd_) bodyReactEnd_(0u, /*forgetAll=*/true);
   // The ghost bookkeeping goes with the bodies it described. NOT the ownership
   // FUNCTIONS: those are wiring the session set once at join, and a world regen
   // does not disconnect anybody. Same rule Reset() already applies to
@@ -2767,21 +2722,22 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
 // ---- body burn: fire continuity on rigidbodies ----
 // A detached island is CPU state no CA pass touches, so without this a burning
 // plank froze mid-flame the moment it became a body: its embers never advanced,
-// never spread, never lit anything. This pass runs the SAME reaction table
-// (per-material buckets, file order, first-fire-wins, per-mille chances) over
-// body voxel payloads each tick:
+// never spread, never lit anything. The SAME reaction table (per-material
+// buckets, file order, first-fire-wins, per-mille chances) runs over body
+// voxel payloads each tick -- through ONE evaluator, MobSystem::BurnOneLimb,
+// for every population (installed here by SetBodyReactor; see BurnBodies):
 //   - decay/emit rules advance in place: ember -> ash, ember emits fire. The
 //     emitted fire and any non-solid product (ash, smoke) land in the GRID at
 //     the voxel's world cell as fill-air-only CellOps — real fire voxels that
 //     rise, spread, and ignite neighbors through the normal CA rules. Escaped
 //     voxels leave the body, so burning debris visibly wastes away.
 //   - pair rules match body-internal 6-neighbors (ember ignites the wood next
-//     to it inside the body) and world cells sampled from the chunk cache
-//     (already fetched for terrain meshing around every live body), so grid
-//     fire licking a cold wooden body ignites it and water douses its embers.
-// Grid writes ride the MutationQueue like settle-back; RNG is counter-based
-// (serial, tick, voxel, rule). Idle cost is zero: bodies with no self-driven
-// voxels skip unless the sim is actually moving in a chunk they overlap.
+//     to it inside the body) and world cells sampled from the chunk cache, so
+//     grid fire licking a cold wooden body ignites it and water douses its
+//     embers; a coat on a voxel takes part the way it does on a limb.
+// Grid writes ride the MutationQueue like settle-back; RNG is counter-based.
+// Idle cost is zero: bodies with no self-driven voxels are not offered unless
+// the sim is actually moving in a chunk they overlap.
 DebrisSystem::FleshLattice DebrisSystem::FleshOf(Body& b) {
   RefreshLocalBounds(b);
   FleshLattice f;
@@ -2847,28 +2803,7 @@ void DebrisSystem::BurnFleshBodies(
   }
   std::vector<FleshBurn> out(lats.size());
   burn(lats, out);
-
-  std::vector<Body> fragments;
-  std::vector<size_t> dead;
-  uint32_t newBodyBudget = kMaxNewBodiesPerTick;
-  bool rebuiltOne = false;
-  for (size_t k = 0; k < which.size(); k++) {
-    if (!out[k].changed && !out[k].removed) continue;
-    Body& b = bodies_[which[k]];
-    if (BurnTail(b, out[k].removed, out[k].changed, world, fragments, spawns,
-                 newBodyBudget, rebuiltOne))
-      dead.push_back(which[k]);
-  }
-  std::sort(dead.begin(), dead.end());
-  for (size_t i = dead.size(); i-- > 0;) {
-    const size_t bi = dead[i];
-    bodies_[bi] = std::move(bodies_.back());
-    bodies_.pop_back();
-  }
-  for (Body& f : fragments) {
-    bodies_.push_back(std::move(f));
-    instancesDirty_ = true;
-  }
+  FinishBurn(which, out, /*changedOnly=*/true, world, spawns);
 }
 
 uint32_t DebrisSystem::RewriteBodyMaterial(uint64_t handle, uint32_t fromMat,
@@ -2918,570 +2853,165 @@ uint32_t DebrisSystem::RewriteBodyMaterial(uint64_t handle, uint32_t fromMat,
 void DebrisSystem::BurnBodies(uint32_t tick, World& world,
                               std::vector<CellOp>& cellOps,
                               std::vector<ParticleSpawn>& spawns) {
-  if (reactions_.empty() || bodies_.empty()) return;
+  // ---- THIS PASS SCHEDULES; IT DOES NOT EVALUATE (W2-I, 2026-09-24) ------
+  //
+  // It used to carry its own copy of the reaction evaluator: a rotating
+  // CURSOR over each body's voxel list, rolling the authored table per voxel
+  // against body-internal and chunk-cache neighbours. MobSystem::BurnOneLimb
+  // is the same table over the same kind of lattice, and every fix since the
+  // fork had to be ported by hand (3760ba5 -> ab2250f) or was not: this copy
+  // never learned coats (oil flashes, water douses and refuses to catch, a
+  // hot coat sears), cross-limb heat or the wound slow-down. So a wet plank
+  // caught like a dry one and an oiled one like a clean one.
+  //
+  // Now every population goes through that one evaluator -- a live limb, a
+  // dead Mob's limb, a severed part (BurnFleshBodies) and, here, everything
+  // else: logs, dropped items, strapped shells, rubble. What stays on this side
+  // is what only a debris body has: WHICH bodies are offered this tick (the
+  // gate below), how the per-tick budget is shared among them, and the body
+  // tail (BurnTail: compaction, shatter, the particle handoff, the batched
+  // collider rebuild). The per-voxel candidate set is the evaluator's front,
+  // not a cursor: fire lives on a surface, and a 35k-voxel log costs its
+  // burning surface rather than a fixed slice of its volume.
+  //
+  // Population-specific inputs ride the view: no coat ledger (so no
+  // corrosive-coat seeding), no creature (no cross-limb heat), no worn shell,
+  // no wound table -- and the one thing only loose matter has, the dye a
+  // leaving voxel hands to its grid product (GridStateFor).
+  if (!bodyReact_ || reactions_.empty()) return;
+  if (bodies_.empty()) {
+    if (bodyReactEnd_) bodyReactEnd_(tick, /*forgetAll=*/false);
+    return;
+  }
   const WorldSnapshot& snap = world.Snap();
-  uint32_t scanBudget = kBurnScanPerTick;
-  uint32_t opsBudget = kBurnOpsPerTick;
-  bool rebuiltOne = false;
-  // shared across every body this tick: a forest fire breaks many bodies at
-  // once, and each new body is a compound-shape build plus permanent per-tick
-  // upkeep. Past the budget, fragments become particles instead.
-  uint32_t newBodyBudget = kMaxNewBodiesPerTick;
-  // fragment bodies split off by ShatterBody, appended after the loop (a
-  // push_back into bodies_ mid-iteration would invalidate `b`)
-  std::vector<Body> fragments;
-  // bodies that burned below body-worthiness, erased after the loop: the
-  // rotated visit order below cannot survive a mid-loop swap-remove
-  std::vector<size_t> dead;
   // Per body: is a solvent in contact with it right now? Filled below, read by
-  // `willScan` and by the inbound pass. See the note where it is filled.
+  // `willScan`.
   std::vector<uint8_t> threat;
-
-  // FAIR SHARE OF THE SCAN BUDGET, or the tail of the list never burns.
-  //
-  // kBurnScanPerTick is spent in list order, and it used to be spent to the
-  // last voxel by whichever bodies came first: a body took min(n, whatever is
-  // left) and everything after it got `scanBudget == 0` and skipped. A corpse
-  // is fifteen bodies adopted in limb order, about 14k skin voxels on the
-  // human, against a 4,096 budget — so the first three or four pieces burned
-  // and the other eleven (torso included, 5,102 voxels of it) kept the exact
-  // ember count they died with, forever: the `corpse-burn` gate measured
-  // 622 -> 622 alight over 400 ticks on the torso, 245 -> 245, 333 -> 333,
-  // 160 -> 160, 396 -> 396 on the limbs behind it. On screen that is the
-  // owner report of 2026-09-02: the microvoxels on the corpse stay the colour
-  // they died in, glowing embers pulsing forever. The live creature had the
-  // same bug on its limbs (Mob::BurnTick, "ROTATE THE START LIMB BY TICK");
-  // this is the same fix for the same reason.
-  //
-  // Two parts. The START BODY rotates by tick, so no body is always last. And
-  // each body that will scan takes at most its SHARE — the budget left divided
-  // among the scanners left, with a floor so a crowd of tiny bodies does not
-  // grind every one of them to a handful of voxels — and hands the remainder
-  // on: a 60-voxel hand does not need a fifteenth of anything, and the torso
-  // behind it gets what the hand did not use. The per-body cursor
-  // (b.burnCursor) carries the scan across ticks, so a body larger than its
-  // share is covered in a few ticks rather than never. Deterministic: the
-  // order is a function of the tick and the body list, the rolls of the
-  // (serial, voxel, tick, rule) key, and the budget only decides WHICH voxels
-  // roll this tick.
   auto willScan = [&](const Body& b) {
-    // A ghost is not scanned and is not counted among the scanners, so the
+    // A ghost is not offered and is not counted among the scanners, so the
     // fair-share divisor below is the number of bodies that will really burn.
-    // Counting ghosts would quietly starve the owner's own bodies of budget in
-    // proportion to how much of the peer's battlefield is in view.
     if (!OwnedLocally(b)) return false;
-    // DEAD FLESH BURNS IN MobSystem::BurnDeadFlesh (see IsFlesh): the living
-    // limb pass, with the creature's cross-joint heat and its armour. Not
-    // counted among the scanners either, so it takes no share of this budget.
+    // DEAD FLESH BURNS IN MobSystem::BurnDeadFlesh (see IsFlesh), with the
+    // creature's cross-joint heat and its armour. Not counted here either.
     if (IsFlesh(b)) return false;
     const uint32_t n = (uint32_t)(b.HasFineSkin() ? b.skinVoxels.size()
                                                   : b.voxels.size());
     if (n == 0) return false;
     if (b.activeCount > 0) return true;
-    // A BODY THAT REACTS WITH ITSELF NEEDS NOTHING OUTSIDE IT. Rot creeping
-    // out of a bite through a corpse's own tissue is the case: it is a pair
-    // rule between two materials both ON the body, so the world can be
-    // perfectly settled and the process is still live. Demanding a dirty chunk
-    // for it is what stopped rot the moment the fight ended (Body::internalPair
-    // carries the rule-2 argument for why this still sleeps).
+    // A BODY THAT REACTS WITH ITSELF NEEDS NOTHING OUTSIDE IT (see
+    // Body::internalPair for why this still sleeps).
     if (b.internalPair) return true;
     // Nothing alight on it: only fire in the world can change it, through a
-    // pair rule (skin + hot) or a gated self rule (char relighting), and the
-    // world's fire shows as a dirty chunk. A body that is all char, lying in
-    // a settled world, costs these two reads and nothing else.
+    // pair rule (wood + hot, a coat's own rule) or a gated self rule (char
+    // relighting), and the world's fire shows as a dirty chunk. A body that is
+    // all char, lying in a settled world, costs these two reads and nothing
+    // else.
     if ((b.pairCount > 0 || b.scaledCount > 0) && AnyDirtyNear(b, snap, world))
       return true;
-    // ...and the SOLVENT case, which is `threat[]` below: asked once per body
-    // per tick and cached, because this predicate runs twice.
+    // ...and the SOLVENT case, `threat[]` below.
     return threat[&b - bodies_.data()] != 0;
   };
   const size_t nb = bodies_.size();
-  const size_t startBody = (size_t)(tick % (uint32_t)nb);
+  // Where the last pass stopped (burnNext_), so no body is always last and a
+  // budget-limited pass hands the next tick to the bodies it could not reach.
+  const size_t startBody = burnNext_ % nb;
   // ---- ...AND THE THING EATING IT MAY BE HOLDING PERFECTLY STILL -----------
-  // A pool of acid with a corpse in it settles: nothing in the grid changes,
-  // the chunk sleeps, and `AnyDirtyNear` says no forever — while the acid is
-  // still right there. Dirtiness is a proxy for "something is happening
-  // nearby", and for a solvent it is the wrong proxy, because the solvent
-  // doing its job is the body's business and not the grid's.
-  //
-  // So a body with something eatable on it asks the world DIRECTLY: nine
-  // cached chunk reads (ThreatNear), and only for bodies that have an inbound
-  // target at all — organics, i.e. corpses and dropped cloth, never a rock.
-  //
-  // THE ANSWER IS ALSO A BUDGET GATE, and that is the more important half. The
-  // inbound pass needs the body-local occupancy map to tell "outside me" from
-  // "inside me", and building that map is O(lattice) with a hash entry per
-  // voxel — 14k of them on a human torso. Keyed on `inboundCount` alone it
-  // would be built every tick for every corpse on the field whether or not
-  // anything was eating it, which measured as a 25x slowdown of the whole
-  // selftest suite. Keyed on a solvent actually being in contact, it costs
-  // nine reads and is paid only while a body is genuinely dissolving.
+  // A pool of acid with a body in it settles: nothing in the grid changes, the
+  // chunk sleeps, and `AnyDirtyNear` says no forever while the acid is still
+  // right there. So a body with something eatable on it asks the world
+  // DIRECTLY (ThreatNear: nine cached chunk reads), and only bodies with an
+  // inbound target at all -- organics, never a rock.
   threat.assign(nb, 0);
   for (size_t i = 0; i < nb; i++)
     if (bodies_[i].inboundCount > 0 && ThreatNear(bodies_[i], world))
       threat[i] = 1;
-  uint32_t scanners = 0;
-  for (const Body& b : bodies_)
-    if (willScan(b)) scanners++;
-
+  // WHICH BODIES, in order from where the last pass stopped.
+  std::vector<size_t> which;
   for (size_t k = 0; k < nb; k++) {
     const size_t bi = (startBody + k) % nb;
-    Body& b = bodies_[bi];
     // Burning emits fire and smoke ops into the grid and turns embers to ash
-    // in the lattice: both are the owner's to author, and the ash would
-    // otherwise be applied twice to two copies that then disagree about shape.
-    if (!OwnedLocally(b)) {
+    // in the lattice: both are the owner's to author.
+    if (!OwnedLocally(bodies_[bi])) {
       ownerProbe_.emittersSkipped++;
       continue;
     }
-    // THE AUTHORITATIVE LATTICE, which is not always `voxels`.
-    //
-    // A body with a finer skin carves `skinVoxels` and DERIVES `voxels` from it
-    // by majority-fill, so burning the collider would be writing to derived
-    // data — the "unowned diverging representation" failure the design
-    // guidelines name, and it would be silently undone by the next re-derive.
-    const bool fine = b.HasFineSkin();
-    BodyLattice lat{fine ? &b.skinVoxels : nullptr, fine ? nullptr : &b.voxels,
-                    fine ? b.micro.skinScale : b.physScale};
-    uint32_t n = (uint32_t)lat.Size();
-    bool active = b.activeCount > 0;
-    // MICRO BODIES BURN. They did not in v1, for two structural reasons that
-    // have both since expired: the copy-on-write brick pool shipped (so a
-    // per-body edit IS visible — MicroBodyPoke rewrites one 16-bit voxel in
-    // place), and this pass no longer maps body-local coordinates straight onto
-    // world cells, it divides by the lattice scale like everything else here.
-    //
-    // Leaving them out was the visible half of "a corpse does not burn": every
-    // mob limb of every rig with skinScale > 1 becomes a micro body the instant
-    // it is severed or its owner dies, and so does every dropped item.
-    if (!willScan(b) || scanBudget == 0) continue;
-    // This body's share of what is left (see the note above the loop).
+    if (willScan(bodies_[bi])) which.push_back(bi);
+  }
+  // FAIR SHARE OF THE BUDGET, or the tail of the list never burns. Each body
+  // offered takes at most its SHARE -- what is left divided among the bodies
+  // left, floored at kBurnScanMinShare so a crowd of tiny bodies does not
+  // grind every one of them to a handful of voxels -- and hands back what it
+  // did not spend: a 60-voxel hand does not need a fifteenth of anything, and
+  // the log behind it gets what the hand did not use. Measured before the
+  // rotation and the share existed (corpse-burn, 2026-09-02): the first three
+  // or four bodies spent it all and the other eleven kept their embers
+  // forever. The budget is the evaluator's candidate budget (front cells).
+  //
+  // ...AND A POT OF WORLD-WALK CELLS (W2-I). The evaluator's cheap gate reads
+  // every world cell of a body's box, which a creature pays per limb because
+  // it has a handful of them. A forest fire is two hundred bodies with smoke
+  // dirtying every chunk round them, so every one was offered and walked every
+  // tick: measured on --forest-fire, 193k cells a tick and burnBodies 1.22 ->
+  // 2.96 ms. The walk is now paid from kBurnWalkPerTick; a body whose walk
+  // does not fit is deferred whole, and the next pass starts with it.
+  uint32_t scanBudget = kBurnScanPerTick;
+  uint32_t opsBudget = kBurnOpsPerTick;
+  uint32_t walkBudget = kBurnWalkPerTick;
+  uint32_t scanners = (uint32_t)which.size();
+  std::vector<FleshBurn> out(which.size());
+  size_t visited = 0;
+  size_t resumeAt = SIZE_MAX;  // body index the next pass starts from
+  for (size_t k = 0; k < which.size(); k++, visited++) {
+    if (scanBudget == 0 || walkBudget == 0) {
+      resumeAt = which[k];
+      break;
+    }
+    FleshLattice f = FleshOf(bodies_[which[k]]);
     const uint32_t share =
         std::max(kBurnScanMinShare, scanBudget / std::max(1u, scanners));
     scanners = scanners > 0 ? scanners - 1 : 0;
-    // A micro body must OWN its brick before a poke can land: a shared model
-    // backs every instance of its def, and charring one would char them all.
-    //
-    // OWNED LAZILY, AT THE FIRST WRITE. This used to happen up front, "so the
-    // poke sites stay branch-free; a body that never changes pays one clone it
-    // did not need, which only happens to a body the pass has already decided
-    // is reactive." Reactive is not the same as CHANGING: `willScan` admits any
-    // body with a pair rule and a dirty chunk anywhere near it, which during a
-    // fight is every corpse on the ground. So a pile of corpses cloned fifteen
-    // bricks apiece for smoke drifting past, and a clone costs BOTH ceilings —
-    // a model record and ~1.5x the model's words (world.h kMaxMicroBodyModels,
-    // and the owner report it is now sized against). The branch it saved is one
-    // predictable test per poked voxel.
-    int ownState = 0;  // 0 not tried, 1 owned, -1 refused (don't retry per voxel)
-    auto poke = [&](IVec3 p, uint8_t mat) {
-      if (ownState == 0) {
-        if (!b.micro.Valid() || !microSet_) { ownState = -1; return; }
-        const int own = MicroBodyOwn(*microSet_, b.micro.model);
-        // Pool full: the body still really burns, its skin just stops keeping
-        // up — and now says so once (MicroBodySet::refusals).
-        if (own < 0) { ownState = -1; return; }
-        b.micro.model = (uint32_t)own;
-        ownState = 1;
-      }
-      if (ownState < 0) return;
-      MicroBodyPoke(*microSet_, b.micro.model, p.x, p.y, p.z, mat, 0);
-    };
-    // The lattice scale is also the divisor for every world-space quantity
-    // derived from a body-local coordinate. Getting this wrong does not fail
-    // loudly — it puts a scale-8 limb's fire eight cells away from the limb.
-    const float latInv = 1.0f / (float)std::max(1u, lat.scale);
-
-    // rotation helpers (same quaternion sandwich as SplitBody)
-    const float qx = b.xf.quat[0], qy = b.xf.quat[1], qz = b.xf.quat[2],
-                qw = b.xf.quat[3];
-    auto rotQ = [&](Vec3 v) {
-      Vec3 u{qx, qy, qz};
-      Vec3 t = u.cross(v) * 2.0f;
-      return v + t * qw + u.cross(t);
-    };
-    auto rotInvQ = [&](Vec3 v) {
-      Vec3 u{-qx, -qy, -qz};
-      Vec3 t = u.cross(v) * 2.0f;
-      return v + t * qw + u.cross(t);
-    };
-    // Body-local LATTICE coordinate -> the world cell it sits in. The division
-    // by the lattice scale is what makes this correct for a micro body: a
-    // scale-8 voxel is one eighth of a world cell, and mapping its coordinate
-    // straight onto a cell — which is what this did while micro bodies were
-    // excluded — puts a limb's fire eight cells from the limb.
-    auto worldOfLocal = [&](IVec3 v) {
-      return b.xf.pos + rotQ(Vec3{((float)v.x + 0.5f) * latInv,
-                                  ((float)v.y + 0.5f) * latInv,
-                                  ((float)v.z + 0.5f) * latInv});
-    };
-    auto worldCellOf = [&](IVec3 v) {
-      const Vec3 wp = worldOfLocal(v);
-      return IVec3{ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)};
-    };
-    // world direction -> nearest body-local lattice offset (occlusion checks)
-    auto localDirOf = [&](IVec3 d) {
-      Vec3 l = rotInvQ(Vec3{(float)d.x, (float)d.y, (float)d.z});
-      return IVec3{(int)std::lround(l.x), (int)std::lround(l.y),
-                   (int)std::lround(l.z)};
-    };
-    // grid material at a world cell via the chunk cache (terrain meshing keeps
-    // chunks around live bodies fetched + refreshed while they are dirty).
-    // Unknown/missing reads as air: ignition is best-effort, never wrong-way.
-    auto worldMatAt = [&](IVec3 c) -> uint32_t {
-      if (!world.CellInWindow(c)) return 0u;
-      const CachedChunk* cc = world.Cached(ChunkOfCell(c.x, c.y, c.z));
-      if (!cc || cc->voxels.size() != kChunkVol) return 0u;
-      uint32_t lx = (uint32_t)(c.x & 15), ly = (uint32_t)(c.y & 15),
-               lz = (uint32_t)(c.z & 15);
-      return cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFFu;
-    };
-    auto nbrMatches = [&](uint32_t nm, const ReactionGpu& r) -> bool {
-      return ReactNbrMatches(r, nm, matGpu_);
-    };
-
-    // Does any material present in this body use the neighbour-count ramp? If
-    // so the local occupancy map has to exist even on an inactive body, or the
-    // count would read every direction as world content.
-    bool anyScaled = false;
-    for (uint32_t i = 0; i < n && !anyScaled; i++) {
-      uint32_t m = lat.Mat(i);
-      if (m < matHasScaled_.size() && matHasScaled_[m]) anyScaled = true;
-    }
-    // local occupancy for internal spread; values are voxel indices, entries
-    // whose payload was zeroed this pass read as absent
-    //
-    // THE INBOUND PASS NEEDS IT TOO, and needs it for a reason worth stating:
-    // without the map every direction reads as "world", so an INTERIOR voxel
-    // of a body lying in acid would find acid on all six faces and the whole
-    // torso would dissolve at once instead of from its surface inward. The map
-    // is what makes "outside me" mean outside me.
-    //
-    // ...but ONLY while something is actually eating it (`threat`), never
-    // merely because it is edible. See where `threat` is filled: the
-    // difference between those two conditions was a 25x suite slowdown.
-    const bool inbound = threat[bi] != 0;
-    const bool haveLocal = active || anyScaled || inbound;
-    std::unordered_map<uint32_t, uint32_t> local;
-    if (haveLocal) {
-      local.reserve(n * 2);
-      for (uint32_t i = 0; i < n; i++) {
-        const IVec3 p = lat.At(i);
-        local[LocalKey(p.x, p.y, p.z)] = i;
-      }
-    }
-    auto localMatAt = [&](int x, int y, int z) -> uint32_t {
-      if (!haveLocal) return 0u;
-      auto it = local.find(LocalKey(x, y, z));
-      if (it == local.end()) return 0u;
-      return lat.Mat(it->second);
-    };
-
-    uint32_t removed = 0;
-    bool changed = false;
-    // rewrite a voxel to a rule product. Solids swap in place; anything else
-    // (ash, smoke, fire, air) escapes into the grid at the voxel's world cell
-    // and the voxel leaves the body.
-    auto applyProduct = [&](uint32_t vi, uint32_t prod, uint32_t rr) {
-      if (prod == kProdKeep) return;
-      const IVec3 p = lat.At(vi);
-      uint32_t pm = prod & 0xFFFu;
-      if (pm != 0 && pm < matGpu_.size() && matGpu_[pm].klass == CLASS_SOLID) {
-        lat.Set(vi, pm, (rr >> 6u) % 3u);
-        // One 16-bit word of one model's block. NOT ReskinMicro, which
-        // re-derives dims, rebases the origin and re-packs the whole payload —
-        // right for a carve (the shape changed), catastrophic per tick for a
-        // state change (the shape did not; one voxel's material did).
-        poke(p, (uint8_t)pm);
-      } else {
-        if (pm != 0 && pm < matGpu_.size() && opsBudget > 0 &&
-            cellOps.size() < kMaxCellOpsPerTick) {
-          IVec3 cell = worldCellOf(p);
-          if (world.CellInWindow(cell)) {
-            // THIS VOXEL'S OWN MATTER leaving the body (ash off a burning robe,
-            // blood off a shattering limb) — not the emission in the branch
-            // below, which puts fire into a neighbouring AIR cell and has no
-            // colour to inherit. So the dye follows it: quantize the voxel's art
-            // colour to the PRODUCT's tints, since a purple robe's ash is
-            // whatever ash a purple robe leaves, not whatever cloth is nearest.
-            uint32_t state = matGpu_[pm].klass == CLASS_LIQUID
-                                 ? 7u  // LIQ_FULL_STATE
-                                 : GridStateFor(pm, lat.Color(vi),
-                                                (rr >> 6u) % 3u);
-            cellOps.push_back({World::SlotCellIndex(cell),
-                               PackVoxNew(pm, state) | kCellOpIfAir});
-            opsBudget--;
-          }
-        }
-        lat.Set(vi, 0, 0);  // compacted below
-        poke(p, 0);
-        removed++;
-      }
-      changed = true;
-    };
-
-    const IVec3 kDirs[6] = {{0, 1, 0}, {0, -1, 0}, {1, 0, 0},
-                            {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
-    // body-local lattice offset -> nearest WORLD direction (the inverse of
-    // localDirOf, for the neighbour-count ramp's world fallback)
-    auto worldDirOf = [&](IVec3 d) {
-      Vec3 w = rotQ(Vec3{(float)d.x, (float)d.y, (float)d.z});
-      return IVec3{(int)std::lround(w.x), (int)std::lround(w.y),
-                   (int)std::lround(w.z)};
-    };
-    // The six face neighbours as scaleByNeighbors counts them: the body's own
-    // lattice first, and the world cell in that direction when the lattice has
-    // nothing there — because a SURFACE voxel's neighbours genuinely are grid
-    // cells, and treating them as air would make every rule that ramps on
-    // "matching neighbours" read a body's whole skin as isolated.
-    auto countMatches = [&](IVec3 v, const ReactionGpu& r) {
-      const bool invert = ReactScaleInverted(r);
-      uint32_t count = 0;
-      // ---- ...AND HOW WIDE THE FIRE OUTSIDE IS (2026-09-19) ---------------
-      // The widest single WORLD-pitch face found below. A corpse is the same
-      // scale-8 lattice a live limb is, and the whole argument
-      // MobSystem::BurnOneLimb makes about this applies here word for word:
-      // five of a skin sub-voxel's six faces are its own flesh however large
-      // the fire outside it is, so a lattice count reaches flesh's authored
-      // minCount 3 only on a convex CORNER. Measured on the live creature
-      // before the same fix: 92% of every ignition roll refused, 11 of 22,775
-      // flesh voxels lost over a 90-tick immersion. A CORPSE HAD NOTHING
-      // EQUIVALENT — which is the owner report that corpses do not really
-      // burn, and it is the same bug one population later.
-      //
-      // So a face pointing into matter the rule reacts to counts for as much
-      // as that matter is WIDE across the face (1..5), taken as a MAX against
-      // the lattice count rather than a sum: the two are the same quantity
-      // measured at two pitches and adding them would double-count the cell
-      // that produced the face in the first place. One cell of flame is still
-      // 1 and still gutters out; a wall of flame is 5 and takes hold. Direct
-      // ramps only, for the reason the live pass gives: an INVERTED ramp is
-      // counting what is NOT there and the wide reading is a different
-      // question.
-      uint32_t widest = 0;
-      for (const IVec3& d : kDirs) {
-        uint32_t nm = localMatAt(v.x + d.x, v.y + d.y, v.z + d.z);
-        bool fromWorld = false;
-        IVec3 wc{};
-        if (nm == 0) {
-          // ONE LATTICE STEP, not one world cell: on a scale-8 body a whole
-          // cell steps over eight of the body's own voxels and reads a
-          // neighbourhood the voxel is nowhere near.
-          const Vec3 wv = worldOfLocal(v) + rotQ(Vec3{(float)d.x * latInv,
-                                                      (float)d.y * latInv,
-                                                      (float)d.z * latInv});
-          wc = IVec3{ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)};
-          nm = worldMatAt(wc);
-          fromWorld = nm != 0;
-        }
-        const bool match = ReactNbrMatches(r, nm, matGpu_);
-        if (match != invert) count++;
-        if (invert || !fromWorld || !match) continue;
-        // The tangential ring around that world cell, at WORLD pitch. The
-        // direction the face points is `d` in LATTICE space; the ring is the
-        // four world axes perpendicular to where that points in the world.
-        const IVec3 wd = worldDirOf(d);
-        uint32_t w = 1;  // the face's own cell, already known to match
-        for (const IVec3& e : kDirs) {
-          if (e.x * wd.x + e.y * wd.y + e.z * wd.z != 0) continue;  // parallel
-          if (ReactNbrMatches(r, worldMatAt({wc.x + e.x, wc.y + e.y,
-                                             wc.z + e.z}), matGpu_))
-            w++;
-        }
-        widest = std::max(widest, w);
-      }
-      return std::max(count, widest);
-    };
-    uint32_t steps = std::min(n, std::min(share, scanBudget));
-    scanBudget -= steps;
-    for (uint32_t s = 0; s < steps; s++) {
-      uint32_t vi = (b.burnCursor + s) % n;
-      const IVec3 v = lat.At(vi);
-      uint32_t m = lat.Mat(vi);
-      if (m == 0 || m >= matGpu_.size()) continue;
-      const MaterialGpu& mg = matGpu_[m];
-      // WHETHER THE SELF PASS RUNS AT ALL is a separate question from whether
-      // the INBOUND pass below does, and conflating them is what made bone
-      // (which authors no rules whatsoever, on purpose) immune to acid on a
-      // corpse while dissolving on the creature it came off. A voxel with
-      // nothing to say still has something that can be said to it.
-      bool fired = false;
-      const bool runSelf = mg.reactCount != 0 &&
-                           (active || matHasPair_[m] || matSelfScaled_[m]);
-
-      for (uint32_t ri = 0; runSelf && ri < mg.reactCount; ri++) {
-        const ReactionGpu& r = reactions_[mg.reactOffset + ri];
-        uint32_t kind = r.packed & 3u;
-        uint32_t dmask = (r.packed >> 2u) & 7u;
-        // The two gates sim_step.wgsl applies before the roll, in the same
-        // order. Both were silently absent on this side until sim/reactcpu.h —
-        // a rule authored with a day/night condition or a neighbour-count ramp
-        // fired unconditionally at base chance on a body. See that header.
-        //
-        // seesSky = true: a rigidbody has no column to raycast, and refusing
-        // instead would make a sky-gated rule permanently inert on bodies.
-        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
-        uint32_t chance = r.chance;
-        if (ReactScaleArmed(r)) {
-          chance = ReactScaledChance(r, countMatches(v, r));
-          if (chance == 0) continue;  // below minCount: no frontier, no rule
-        }
-        // Weather (rain douses, wet damps ignition), as rainChance does in
-        // the grid; a body counts as rain-exposed (reactcpu.h).
-        chance = RainScaledChance(r.cond, chance, weatherRain_, true);
-        uint32_t rr = Hash3(b.serial * 0x9E3779B9u + vi, tick, ri);
-        // one roll per rule, GPU-style — chance is in 1/kReactChanceDen units,
-        // so this must use the same denominator sim_step.wgsl rolls against
-        if (rr % kReactChanceDen >= chance) continue;
-        fired = false;
-
-        if (kind == kReactDecay) {
-          applyProduct(vi, r.prodSelf, rr);
-          fired = true;
-        } else if (kind == kReactEmit) {
-          // emit in an allowed WORLD direction (fire rises in world space no
-          // matter how the body tumbles), first direction not occluded by the
-          // body itself; IfAir lets grid content win
-          IVec3 cand[6];
-          int nc = 0;
-          if (dmask & kDirUp) cand[nc++] = {0, 1, 0};
-          if (dmask & kDirDown) cand[nc++] = {0, -1, 0};
-          if (dmask & kDirSide) {
-            const IVec3 side[4] = {{1, 0, 0}, {-1, 0, 0}, {0, 0, 1}, {0, 0, -1}};
-            uint32_t rot = rr >> 12u;
-            for (int k = 0; k < 4; k++) cand[nc++] = side[(rot + k) & 3u];
-          }
-          IVec3 wc0 = worldCellOf(v);
-          for (int k = 0; k < nc; k++) {
-            IVec3 ld = localDirOf(cand[k]);
-            if (localMatAt(v.x + ld.x, v.y + ld.y, v.z + ld.z) != 0) continue;
-            IVec3 t{wc0.x + cand[k].x, wc0.y + cand[k].y, wc0.z + cand[k].z};
-            if (world.CellInWindow(t) && opsBudget > 0 &&
-                cellOps.size() < kMaxCellOpsPerTick) {
-              cellOps.push_back({World::SlotCellIndex(t),
-                                 PackVoxNew(r.prodNbr, (rr >> 8u) % 3u) |
-                                     kCellOpIfAir});
-              opsBudget--;
-            }
-            fired = true;  // rule consumed even if the write missed the budget
-            break;
-          }
-        } else {  // kReactPair
-          // body-internal neighbors first (ember ignites adjacent wood inside
-          // the plank), then the voxel's own world cell + 6 world neighbors
-          // (grid fire drifts into / around the body's footprint)
-          int matched = -2;  // -2 none, -1 world, >=0 internal voxel index
-          if (haveLocal) {
-            for (const IVec3& d : kDirs) {
-              uint32_t nm = localMatAt(v.x + d.x, v.y + d.y, v.z + d.z);
-              if (nm != 0 && nbrMatches(nm, r)) {
-                matched = (int)local[LocalKey(v.x + d.x, v.y + d.y, v.z + d.z)];
-                break;
-              }
-            }
-          }
-          if (matched == -2 && r.prodNbr == kProdKeep) {
-            // world neighbors are read-only: only rules that keep the
-            // neighbor are eligible (a body cannot rewrite grid content)
-            const Vec3 wp = worldOfLocal(v);
-            IVec3 wc{ifloor(wp.x), ifloor(wp.y), ifloor(wp.z)};
-            if (nbrMatches(worldMatAt(wc), r)) {
-              matched = -1;
-            } else {
-              for (const IVec3& d : kDirs) {
-                // ONE LATTICE STEP (see countMatches): on a scale-8 limb a
-                // whole-cell step reads eight voxels past its own surface.
-                const Vec3 wn = wp + rotQ(Vec3{(float)d.x * latInv,
-                                               (float)d.y * latInv,
-                                               (float)d.z * latInv});
-                if (nbrMatches(worldMatAt({ifloor(wn.x), ifloor(wn.y),
-                                           ifloor(wn.z)}), r)) {
-                  matched = -1;
-                  break;
-                }
-              }
-            }
-          }
-          if (matched != -2) {
-            applyProduct(vi, r.prodSelf, rr);
-            if (matched >= 0 && r.prodNbr != kProdKeep)
-              applyProduct((uint32_t)matched, r.prodNbr, Pcg(rr));
-            fired = true;
-          }
-        }
-        if (fired) {
-          changed = true;
-          break;  // at most one rule per voxel per tick, file order
-        }
-      }
-
-      // ---- 2. INBOUND: a world neighbour's rule that rewrites ME -----------
-      //
-      // THE DIRECTION A RIGIDBODY COULD NOT BE ACTED ON FROM, until now. Acid
-      // is authored as `acid + tag:organic -> neighborBecomes air`, i.e. from
-      // the ACID's side, which is the direction the GPU evaluates it over the
-      // grid and the direction MobSystem::BurnOneLimb evaluates it over a live
-      // limb. The pair branch above can only ever match a world cell whose
-      // rule KEEPS its neighbour — a body may not rewrite grid content — so
-      // every rule shaped like acid's fell straight through it.
-      //
-      // The consequence was the owner report of 2026-09-19 in one line: a
-      // creature standing in acid dissolved and its corpse, which is the same
-      // fifteen limbs one function call later, did not. Mirroring the rules
-      // per body material would be an N x M table whose two halves drift, so
-      // this is the same shape mob.cpp uses — evaluate the neighbour's own
-      // rule, in the neighbour's own direction, from the one table.
-      //
-      // WORLD NEIGHBOURS ONLY. A body-internal neighbour was already offered
-      // its rewrite by the pair branch above (`matched >= 0`), and running it
-      // again here would give one voxel two chances at the same rule.
-      if (!fired && inbound && m < matInboundTarget_.size() &&
-          matInboundTarget_[m]) {
-        const Vec3 wp = worldOfLocal(v);
-        for (const IVec3& d : kDirs) {
-          if (fired) break;
-          // ONE LATTICE STEP, for the reason countMatches gives.
-          if (localMatAt(v.x + d.x, v.y + d.y, v.z + d.z) != 0) continue;
-          const Vec3 wn = wp + rotQ(Vec3{(float)d.x * latInv,
-                                         (float)d.y * latInv,
-                                         (float)d.z * latInv});
-          const uint32_t wm =
-              worldMatAt({ifloor(wn.x), ifloor(wn.y), ifloor(wn.z)});
-          if (wm == 0 || wm >= matRewritesNbr_.size() || !matRewritesNbr_[wm])
-            continue;
-          const MaterialGpu& wg = matGpu_[wm];
-          for (uint32_t rj = 0; rj < wg.reactCount; rj++) {
-            const ReactionGpu& r = reactions_[wg.reactOffset + rj];
-            if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep)
-              continue;
-            if (!ReactNbrMatches(r, m, matGpu_)) continue;
-            if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
-            // A distinct rule-index space (+64) from the self pass, the same
-            // separation BurnOneLimb draws: a voxel that is both burning and
-            // dissolving must not roll one stream twice and correlate them.
-            const uint32_t rr =
-                Hash3(b.serial * 668265263u + vi, tick, 64u + rj);
-            if (rr % kReactChanceDen >=
-                RainScaledChance(r.cond, r.chance, weatherRain_, true))
-              continue;
-            applyProduct(vi, r.prodNbr, rr);
-            fired = true;
-            changed = true;
-            break;
-          }
-        }
-      }
-    }
-    b.burnCursor = n > 0 ? (b.burnCursor + steps) % n : 0;
-
-    if (BurnTail(b, removed, changed, world, fragments, spawns, newBodyBudget,
-                 rebuiltOne)) {
-      dead.push_back(bi);
-      continue;
-    }
+    const uint32_t offered = std::min(share, scanBudget);
+    uint32_t left = offered;
+    bool deferred = false;
+    out[k].changed = bodyReact_(f, tick, world, cellOps, left, opsBudget,
+                                walkBudget, out[k].removed, deferred);
+    scanBudget -= offered - left;
+    if (deferred && resumeAt == SIZE_MAX) resumeAt = which[k];
   }
+  // Everybody reached: advance one body, as a tick-rotated start would.
+  burnNext_ = resumeAt != SIZE_MAX ? resumeAt : startBody + 1;
+  if (bodyReactEnd_) bodyReactEnd_(tick, /*forgetAll=*/false);
+  which.resize(visited);
+  out.resize(visited);
+  // Every body offered goes through the tail, changed or not: a collider
+  // rebuild deferred because another body took this tick's one rebuild is
+  // retried on the body's next visit.
+  FinishBurn(which, out, /*changedOnly=*/false, world, spawns);
+}
 
-  // Erase the dead, highest index first so each swap-remove moves a body that
-  // is not itself waiting to be erased.
+void DebrisSystem::FinishBurn(const std::vector<size_t>& which,
+                              const std::vector<FleshBurn>& out,
+                              bool changedOnly, World& world,
+                              std::vector<ParticleSpawn>& spawns) {
+  // Shared across every body this tick: a forest fire breaks many bodies at
+  // once, and each new body is a compound-shape build plus permanent per-tick
+  // upkeep. Past the budget, fragments become particles instead.
+  uint32_t newBodyBudget = kMaxNewBodiesPerTick;
+  bool rebuiltOne = false;
+  // Fragment bodies split off by ShatterBody, appended after the loop (a
+  // push_back into bodies_ mid-iteration would invalidate `b`), and bodies
+  // that burned below body-worthiness, erased after it.
+  std::vector<Body> fragments;
+  std::vector<size_t> dead;
+  for (size_t k = 0; k < which.size(); k++) {
+    if (changedOnly && !out[k].changed && !out[k].removed) continue;
+    Body& b = bodies_[which[k]];
+    if (BurnTail(b, out[k].removed, out[k].changed, world, fragments, spawns,
+                 newBodyBudget, rebuiltOne))
+      dead.push_back(which[k]);
+  }
+  // Highest index first, so each swap-remove moves a body that is not itself
+  // waiting to be erased.
   std::sort(dead.begin(), dead.end());
   for (size_t i = dead.size(); i-- > 0;) {
     const size_t bi = dead[i];
@@ -3519,9 +3049,6 @@ bool DebrisSystem::BurnTail(Body& b, uint32_t removed, bool changed,
             b.voxels.end());
       }
       b.burnedSinceRebuild += removed;
-      const uint32_t latNow =
-          (uint32_t)(fine ? b.skinVoxels.size() : b.voxels.size());
-      if (latNow) b.burnCursor %= latNow;
       // removals can disconnect the remainder: split fragments off (bodies /
       // ballistic particles) before recounting. The connectivity flood is O(n)
       // over the body, so it waits until enough matter has actually burned
@@ -3630,8 +3157,8 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
   // carve or every kShatterCheckVoxels burned away, never per tick.
   const uint32_t ratio =
       b.HasFineSkin() ? std::max(1u, b.micro.skinScale / b.physScale) : 1u;
-  // 21 bits per axis, like DownsampleSkin's: the coarse lattice fits in
-  // LocalKey's byte per axis but a skin one does not (a human torso is ~240
+  // 21 bits per axis, like DownsampleSkin's: the coarse lattice fits in a
+  // byte per axis but a skin one does not (a human torso is ~240
   // skin voxels tall), and a packed-byte key would silently alias two ends of
   // it into one component.
   auto key64 = [](int x, int y, int z) -> uint64_t {
@@ -4044,7 +3571,9 @@ bool DebrisSystem::AnyDirtyNear(const Body& b, const WorldSnapshot& snap,
 // The still-pool answer to AnyDirtyNear (see willScan). Nine world cells —
 // the body's own centre and the eight corners of its local lattice box, all
 // transformed into world space — read through the chunk cache and tested
-// against matRewritesNbr_. Not a containment test and not meant to be: it is a
+// against the attacksBody column (sim/bodyreact.h): a rewrite the body pass
+// would actually run (MobSystem::BurnOneLimb seeds only from hot or
+// body-attacking cells). Not a containment test and not meant to be: it is a
 // WAKE signal, and the per-voxel pass that follows is what decides where the
 // acid actually touches. A miss costs a tick of probe cadence, never a wrong
 // dissolve.
@@ -4070,7 +3599,7 @@ bool DebrisSystem::ThreatNear(const Body& b, World& world) const {
     const uint32_t m =
         cc->voxels[(((uint32_t)c.z & 15u) * kChunk + ((uint32_t)c.y & 15u)) *
                        kChunk + ((uint32_t)c.x & 15u)] & 0xFFFu;
-    if (m != 0 && m < matRewritesNbr_.size() && matRewritesNbr_[m]) return true;
+    if (m != 0 && m < react_.attacksBody.size() && react_.attacksBody[m]) return true;
   }
   return false;
 }
@@ -4372,7 +3901,7 @@ void DebrisSystem::SetChunkOwnedFn(std::function<bool(IVec3)> fn) {
 }
 
 void DebrisSystem::SetItemLookupFn(
-    std::function<bool(uint64_t, std::string&, uint32_t&, uint32_t&)> fn) {
+    std::function<bool(uint64_t, ItemInstance&)> fn) {
   itemLookupFn_ = std::move(fn);
 }
 
@@ -4627,8 +4156,7 @@ bool DebrisSystem::BuildAnnounce(uint64_t handle, net::BodyAnnounce& out) const 
     out.bleedMat = b.bleedMat;
     out.dead = b.dead ? 1u : 0u;
     // The item identity, if the registry above us says this body is one.
-    if (itemLookupFn_) itemLookupFn_(handle, out.item, out.itemDye,
-                                     out.itemDamage);
+    if (itemLookupFn_) itemLookupFn_(handle, out.item);
     return true;
   }
   return false;
@@ -4729,7 +4257,7 @@ void DebrisSystem::ApplyItemTake(const net::ItemTake& t) {
   // it" from "there was nothing there": without the second the ghost item sits
   // on its ground forever and no E will ever take it again.
   if (h && !IsGhost(h) && itemLookupFn_ &&
-      itemLookupFn_(h, g.item, g.dye, g.damage) && itemTakeFn_ &&
+      itemLookupFn_(h, g.item) && itemTakeFn_ &&
       itemTakeFn_(h)) {
     g.granted = 1;
     ownerProbe_.itemsGranted++;
@@ -5193,7 +4721,6 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   for (const DebrisVoxel& v : b.voxels)
     r = std::max(r, Vec3{(float)v.x, (float)v.y, (float)v.z}.len());
   b.radiusVoxels = r / (float)std::max(1u, b.physScale) + 2.0f;
-  b.burnCursor = b.voxels.empty() ? 0 : b.burnCursor % (uint32_t)b.voxels.size();
   RecountBurn(b);
 
   // Arm the wound(s), now that every frame is final. A cut that took a piece

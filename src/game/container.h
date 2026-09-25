@@ -178,7 +178,7 @@ int ContainerSettle(ContainerScoopMemo& memo, uint32_t snapTick, uint32_t ledger
                     std::vector<ContainerUnpaid>* unpaid = nullptr);
 
 // Put up to `units` eighths of `mat` into ONE vessel. Refuses (returns 0) a
-// stack of more than one -- a fill is one object's (ItemStack::SameKind) and
+// stack of more than one -- a fill is one object's (ItemInstance::StacksWith) and
 // paying a stack of three would triple it -- and a vessel that already holds
 // something else. Returns what fit, capped by its room.
 int ContainerDeposit(const ItemDef& def, ItemStack& st, uint16_t mat, int units);
@@ -281,7 +281,8 @@ uint32_t ContainerScoopStream(IVec3 cell, uint32_t mat, Vec3 mouth, int life,
 // spawn all of its contents immediately into the world") -------------------
 //
 // A THROWN VESSEL IS A DROPPED ITEM WITH SPEED. DropItemToWorld already turns
-// a stack into a debris body that remembers its fill (WorldItem::fill), so the
+// a stack into a debris body that remembers its fill (the WorldItem's
+// ItemInstance), so the
 // throw is that call with a launch velocity and the flight is Jolt's. The
 // session counts the ticks Q is held (PlayerSession::throwTicks) and lets go
 // on the release; the charge is on the TICK clock, so a wind-up is the same

@@ -28,6 +28,7 @@
 #include "game/camera.h"
 #include "game/player.h"
 #include "game/remoteplayer.h"
+#include "game/session.h"  // ExplosionHitsBodies / BlastForceOf
 #include "gpu/resources.h"
 #include "net/entitysync.h"
 #include "phys/debris.h"
@@ -286,6 +287,144 @@ Status GateAnatomyParity(Ctx& c, std::string& detail) {
            (worst.empty() ? "" : "; first: " + worst);
   std::printf("anatomy-parity: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   if (!log.empty()) std::printf("%s", log.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- damage-cause ------------------------------------------------------
+//
+// THE PROOF THAT THE (cause, tissue) TABLE IS THE OLD FLAG PREDICATES
+// (W2-G, game/severpolicy.h). Until 2026-09-24 Mob answered "what may this
+// damage do" by combining six ambient flags set by scope guards. This walks
+// every (cause, eaten, tissue) the new table can be asked about, re-derives
+// the flags that cause would have set, and compares each column with the
+// expression it replaced -- written out below VERBATIM from the deleted code,
+// so a table edit that changes behaviour fails here with the cell named.
+//
+//   A. THE WALK. 10 causes x {struck, eaten} x 4 tissues, 16 columns each.
+//      The flag mapping is the whole claim about what the old scopes meant:
+//        inBurnFlush_     = eaten (only FlushBurn set it)
+//        inSpawnRot_      = SpawnRot   (RotAtSpawn)
+//        inBladeCut_      = Blade      (CutLimb; MobSystem::bladeCut_ was set
+//                                       around exactly the Blade-cause calls)
+//        inBluntCarve_    = Blunt or Unarmed (BluntHit, BluntPulpTick)
+//        inUnarmedBlunt_  = Unarmed
+//        inBite_          = (never read) -- Bite, Beam, Blast, Fall and Burn
+//                           set nothing, so they must equal Other.
+//      IsWornSlot = Shell; IsBloodless = Shell or Bloodless; undead = Rotten.
+//   B. THE UNDEAD RULE MOVED TO DATA WITHOUT MOVING. The hidden `undead` check
+//      in Mob::Damage is now MobDef::bodyTissue == Rotten, authored by the
+//      zombie effect. On the shipped content the two sets of defs must be
+//      identical, and the one place A's "undead = Rotten tissue" mapping
+//      could differ from the old def-level check -- a VITAL slot that is
+//      bloodless (a worn slot is never vital: WearItem/EquipItem force it) --
+//      must not exist.
+//
+// No world, no GPU, no ticks: a table walk and a def scan.
+Status GateDamageCause(Ctx& c, std::string& detail) {
+  int cells = 0, bad = 0;
+  std::string firstBad;
+  auto check = [&](bool same, const char* col, DamageCause cz, bool eaten,
+                   Tissue t) {
+    cells++;
+    if (same) return;
+    bad++;
+    if (firstBad.empty())
+      firstBad = std::string(col) + " at (cause " +
+                 std::to_string((int)cz) + (eaten ? ", eaten, " : ", struck, ") +
+                 TissueName(t) + ")";
+  };
+  for (int ci = 0; ci < (int)DamageCause::Count; ci++)
+    for (int e = 0; e < 2; e++)
+      for (int ti = 0; ti < (int)Tissue::Count; ti++) {
+        const DamageCause cz = (DamageCause)ci;
+        const bool eaten = e != 0;
+        const Tissue t = (Tissue)ti;
+        DamageCtx ctx(cz);
+        if (eaten) ctx = ctx.Eaten();
+        const SeverPolicy p = SeverPolicyOf(ctx, t);
+        // The old flags this cause stood for.
+        const bool inBurnFlush = eaten;
+        const bool inSpawnRot = cz == DamageCause::SpawnRot;
+        const bool inBladeCut = cz == DamageCause::Blade;
+        const bool inBluntCarve =
+            cz == DamageCause::Blunt || cz == DamageCause::Unarmed;
+        const bool inUnarmedBlunt = cz == DamageCause::Unarmed;
+        const bool worn = t == Tissue::Shell;
+        const bool bloodless = worn || t == Tissue::Bloodless;
+        const bool undead = t == Tissue::Rotten;
+        // The old rate: `inBluntCarve_ ? (inUnarmedBlunt_ && unarmed >= 0 ?
+        // unarmed : blunt) : 1`, as the kind of scale it picks (the >= 0
+        // fallback is BleedRateScale's, and is not a property of the cause).
+        const BleedRate oldRate =
+            inBluntCarve ? (inUnarmedBlunt ? BleedRate::Unarmed : BleedRate::Blunt)
+                         : BleedRate::Full;
+        // Mob::Damage
+        check(p.impactSevers == (!inBluntCarve && !worn), "impactSevers", cz,
+              eaten, t);
+        check(p.hitBleed == (bloodless ? BleedRate::None : oldRate), "hitBleed",
+              cz, eaten, t);
+        check(p.vitalHpZeroDetaches == !(!inBluntCarve || !undead),
+              "vitalHpZeroDetaches", cz, eaten, t);
+        // Mob::HpZeroSevers
+        check(p.hpZeroSeversAny == (inBurnFlush && !inBluntCarve),
+              "hpZeroSeversAny", cz, eaten, t);
+        // Mob::JointRuleApplies
+        const JointRule oldJoint =
+            inBluntCarve  ? JointRule::Never
+            : inSpawnRot  ? JointRule::Never
+            : !inBurnFlush ? JointRule::Always
+                           : JointRule::IfInfected;
+        check(p.joint == oldJoint, "joint", cz, eaten, t);
+        // Mob::CarveLimb
+        check(p.chargesBrain == !inSpawnRot, "chargesBrain", cz, eaten, t);
+        const bool oldBleeds = !inBurnFlush && !inSpawnRot && !bloodless;
+        check(p.carveBleeds == oldBleeds, "carveBleeds", cz, eaten, t);
+        check(!oldBleeds || p.carveBleed == oldRate, "carveBleed", cz, eaten, t);
+        check(p.shellStaysOn == (worn && !inBurnFlush), "shellStaysOn", cz,
+              eaten, t);
+        check(p.collapseSevers == !inBluntCarve, "collapseSevers", cz, eaten, t);
+        check(p.carriesChildren == (!inBluntCarve && !inSpawnRot),
+              "carriesChildren", cz, eaten, t);
+        check(p.cutThrough == inBladeCut, "cutThrough", cz, eaten, t);
+        // Mob::Sever
+        check(p.deathBurnt == inBurnFlush, "deathBurnt", cz, eaten, t);
+        check(p.gore == (!bloodless && !inBurnFlush), "gore", cz, eaten, t);
+        check(p.adopt == !(worn && inBurnFlush), "adopt", cz, eaten, t);
+        check(p.byBlade == inBladeCut, "byBlade", cz, eaten, t);
+      }
+
+  // ---- B: undead == rotten on the shipped defs ------------------------------
+  int defs = 0, undeadN = 0, rottenN = 0, disagree = 0, vitalBloodless = 0;
+  std::string defBad;
+  for (const MobDef& d : c.mobs.Defs()) {
+    defs++;
+    const bool rotten = d.bodyTissue == Tissue::Rotten;
+    undeadN += d.undead ? 1 : 0;
+    rottenN += rotten ? 1 : 0;
+    if (d.undead != rotten) {
+      disagree++;
+      if (defBad.empty())
+        defBad = d.name + (d.undead ? " is undead but not rotten"
+                                    : " is rotten but not undead");
+    }
+    for (const MobLimbDef& ld : d.limbs)
+      if (ld.vital && ld.bloodless) {
+        vitalBloodless++;
+        if (defBad.empty()) defBad = d.name + "/" + ld.name + " is vital AND bloodless";
+      }
+  }
+
+  const bool ok = bad == 0 && cells > 0 && defs > 0 && undeadN > 0 &&
+                  disagree == 0 && vitalBloodless == 0;
+  detail = "A: " + std::to_string(cells) + " (cause, eaten, tissue, column) " +
+           "cells vs the old flag predicates, " + std::to_string(bad) +
+           " differ (want 0)" + (firstBad.empty() ? "" : " -- first: " + firstBad) +
+           "; B: " + std::to_string(defs) + " defs, " + std::to_string(undeadN) +
+           " undead / " + std::to_string(rottenN) + " rotten, " +
+           std::to_string(disagree) + " disagree, " +
+           std::to_string(vitalBloodless) + " vital+bloodless slot(s) (want 0, 0)" +
+           (defBad.empty() ? "" : " -- " + defBad);
+  std::printf("damage-cause: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -3865,8 +4004,9 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
   // (debris.cpp had already split them out as matSelfScaled_). The "you
   // walked out of the fire" case: light a patch of an arm's skin, put the
   // fire out, and ask the burn pass's own bookkeeping. Every limb carrying
-  // char must be off the front with its latch cleared, and must sleep
-  // whenever an unburnt limb of the same creature does. Its own fixture
+  // char must be off the front with its latch cleared, and every limb,
+  // charred or not, must then sleep (W2-I: absolute, not relative to the
+  // unburnt limbs, which did not sleep either). Its own fixture
   // because F's creature is still burning somewhere at the end of F (a slow
   // tail F allows), and heat from a neighbour keeps a limb awake for a reason
   // that is not its char. Measured before the fix: 6 limbs carrying 185
@@ -3930,17 +4070,41 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
         for (size_t m = 1; m < mats.size(); m++)
           if (mats[m].burnStage)
             ch += mobs.LimbMaterialCount(id, li, (uint32_t)m);
+        const MobSystem::LimbBurnProbe pr = mobs.LimbBurnStateOf(id, li);
         if (ch == 0) {
           k.cleanLimbs++;
-          if (mobs.LimbBurnStateOf(id, li).asleep) k.cleanAsleep++;
-          continue;
+          if (pr.asleep) k.cleanAsleep++;
+        } else {
+          k.charVox += ch;
+          k.charLimbs++;
+          k.front += pr.front;
+          k.charOnFront += pr.frontBurnt;
+          if (pr.asleep) k.asleep++;
         }
-        k.charVox += ch;
-        k.charLimbs++;
-        const MobSystem::LimbBurnProbe pr = mobs.LimbBurnStateOf(id, li);
-        k.front += pr.front;
-        k.charOnFront += pr.frontBurnt;
-        if (pr.asleep) k.asleep++;
+        // Not asleep: say which half of the sleep test failed and who holds
+        // the index -- for the CLEAN limbs too, which are the control and
+        // used to be reported only as a count (W2-I: "0 of 10 unburnt limbs
+        // asleep" bought no hypothesis at all). holdBy: the passes that kept
+        // the index warm (contact / rain / wet / splatter); miss: busy /
+        // index held / uncached chunk / pose moved / box moved / world moved
+        // / first visit (BodyBurnState::kHold* / kMiss*).
+        if (print && !pr.asleep && !pr.alight && !pr.front) {
+          auto bits = [](uint8_t b, const char* const* names, int n) {
+            std::string s;
+            for (int i = 0; i < n; i++)
+              if (b & (1u << i)) s += std::string(s.empty() ? "" : "+") + names[i];
+            return s.empty() ? std::string("-") : s;
+          };
+          static const char* const kHoldN[] = {"contact", "rain", "wet",
+                                               "splatter"};
+          static const char* const kMissN[] = {"busy", "index", "uncached",
+                                               "pose", "box", "world", "first"};
+          std::printf("    %s limb %d not asleep: holdBy %s, miss %s\n",
+                      ch ? "charred" : "clean", li,
+                      bits(pr.holdBy, kHoldN, 4).c_str(),
+                      bits(pr.sleepMiss, kMissN, 7).c_str());
+        }
+        if (ch == 0) continue;
         // Off the front but not asleep: say which half of the idle test is
         // missing. An index still held with `quiet` stuck low is something
         // reactive near the limb (the walk found it); no index and no sleep
@@ -4026,27 +4190,53 @@ Status GateMobBurn(Ctx& c, std::string& detail) {
     // (30) quiet ticks before releasing it, and the sleep engages on the walk
     // AFTER the release.
     for (int i = 0; i < 40 && mobs.IsAlive(id); i++) burnTick(id, 0, 0);
+    // THE SLEEP, MEASURED OVER A WINDOW rather than read off one tick, and for
+    // EVERY limb: a limb-visit counts as asleep when the burn pass skipped its
+    // world walk (the key matched). An absolute claim, not one relative to the
+    // unburnt limbs (W2-I): until 2026-09-24 this compared charred limbs
+    // against a control in which NO limb slept either ("0 of 10 unburnt limbs
+    // asleep"), so it could not fail on the thing it was named for. What held
+    // them, per the attribution below (measured before the fix: every limb
+    // "holdBy wet", five also "contact", "miss index", 0 of 900 limb-visits
+    // asleep): the coat passes keep the index warm on a creature that was
+    // just doused (WetOneLimb while water is on it, StainOneLimb against the
+    // wet ground), and the sleep demanded an EMPTY index. A fraction rather
+    // than every visit, so a limb whose box flickers across a cell boundary
+    // (it re-walks that tick and sleeps the next) is not a failure.
+    const int kSleepWindow = 60;
+    uint32_t charVisits = 0, charSlept = 0, cleanVisits = 0, cleanSlept = 0;
+    std::vector<uint8_t> isChar(nLimbs, 0);
+    for (int li : charred) isChar[li] = 1;
+    for (int i = 0; i < kSleepWindow && mobs.IsAlive(id); i++) {
+      burnTick(id, 0, 0);
+      for (int li = 0; li < nLimbs; li++) {
+        const bool s = mobs.LimbBurnStateOf(id, li).asleep;
+        if (isChar[li]) { charVisits++; charSlept += s ? 1u : 0u; }
+        else { cleanVisits++; cleanSlept += s ? 1u : 0u; }
+      }
+    }
     const KCensus k = kCensus(true);
-    // Char never holds a front, before OR after the finite tail drains, and
-    // every charred limb then leaves the front with its latch cleared -- the
-    // two things that kept it from the idle exit. Whether the sleepKey then
-    // engages is the idle walk's own business (cached chunks, no foreign
-    // heat), so it is asserted AGAINST THE CONTROL rather than absolutely: a
-    // charred limb must sleep whenever an unburnt limb of the same creature
-    // does. Measured 2026-09-24: in this harness NO limb sleeps, burnt or not
-    // (0 of 10 unburnt), with the index held and `quiet` resetting -- a
-    // harness property, recorded here rather than papered over.
+    const double sleepMin = BaselineNumber("mobBurnSleepFracMin", 0.9);
+    const double charFrac = charVisits ? (double)charSlept / charVisits : 0.0;
+    const double cleanFrac =
+        cleanVisits ? (double)cleanSlept / cleanVisits : 0.0;
+    // Char never holds a front, before OR after the finite tail drains, every
+    // charred limb then leaves the front with its latch cleared, and every
+    // limb -- charred and unburnt alike -- sleeps.
     const bool kOk = lit > 0 && outAt >= 0 && k.charLimbs > 0 &&
                      k0.charOnFront == 0 && k.charOnFront == 0 &&
-                     k.awake == 0 && (k.cleanAsleep == 0 || k.asleep > 0);
+                     k.awake == 0 && charVisits > 0 && cleanVisits > 0 &&
+                     charFrac >= sleepMin && cleanFrac >= sleepMin;
     std::printf(
-        "  charred limbs sleep: %s (%u lit, out at t+%d; %u limbs carry %u "
+        "  limbs sleep: %s (%u lit, out at t+%d; %u limbs carry %u "
         "burnt voxels; char on the front %u -> %u; right after: %u limbs "
-        "alight/fronted, front %u; off the front at t+%d: %u awake, %u asleep; "
-        "control: %u of %u unburnt limbs asleep)\n",
+        "alight/fronted, front %u; off the front at t+%d: %u awake; over %d "
+        "ticks charred limbs asleep %u/%u visits (%.0f%%), unburnt %u/%u "
+        "(%.0f%%), floor %.0f%%)\n",
         kOk ? "PASS" : "FAIL", lit, outAt, k.charLimbs, k.charVox,
         k0.charOnFront, k.charOnFront, k0.awake, k0.front, settled, k.awake,
-        k.asleep, k.cleanAsleep, k.cleanLimbs);
+        kSleepWindow, charSlept, charVisits, 100.0 * charFrac, cleanSlept,
+        cleanVisits, 100.0 * cleanFrac, 100.0 * sleepMin);
     if (!mobs.IsAlive(id))
       std::printf("    creature died: %s (the claim is about a LIVE limb)\n",
                   mobs.DeathCause(id));
@@ -6004,7 +6194,7 @@ Status GateZombify(Ctx& c, std::string& detail) {
 // ---- mob-loot --------------------------------------------------------------
 //
 // THE PACK: what a creature is carrying that is not on its body (MobDef::loot,
-// Mob::carried_). Six claims, in the order the thing actually happens —
+// Mob::Carried — its Kit's bag since W2-M). Six claims, in the order the thing actually happens —
 // authored, rolled, dropped, looted, carried through a turning, saved.
 //
 // IT AUTHORS ITS OWN TABLE rather than reading human.json's. A gate that
@@ -6071,10 +6261,25 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
   auto countOf = [](const Mob* m, const char* item) {
     int n = 0;
     if (m != nullptr)
-      for (const CarriedItem& ci : m->Carried())
-        if (ci.item == item) n += ci.count;
+      for (const ItemInstance& ci : m->Carried())
+        if (ci.name == item) n += ci.count;
     return n;
   };
+  // What a carried FLASK holds, eighths (-1 = no flask in the pack). W2-M: the
+  // pack is ItemInstances, so a flask's fill rides every crossing a pack does.
+  const bool haveFlask = c.items.Find("flask") >= 0;
+  auto flaskFill = [](const Mob* m) {
+    if (m != nullptr)
+      for (const ItemInstance& ci : m->Carried())
+        if (ci.name == "flask") return (int)ci.fillAmt;
+    return -1;
+  };
+  uint16_t waterMat = 0;
+  for (size_t mi = 1; mi < c.mats.size() && !waterMat; mi++)
+    if (c.mats[mi].name == "water") waterMat = (uint16_t)mi;
+  ItemInstance kFlask{"flask", 1};
+  kFlask.fillMat = waterMat;
+  kFlask.fillAmt = 37;
 
   // ---- A: IT ROLLS, AND THE ROLL IS A FUNCTION OF THE CREATURE ------------
   //
@@ -6092,13 +6297,13 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
     const uint64_t id = c.mobs.Spawn(hi, {spot.x, spot.y + 1, spot.z});
     Mob* m = c.mobs.FindMobById(id);
     if (m != nullptr) {
-      const std::vector<CarriedItem> first = m->Carried();
+      const std::vector<ItemInstance> first = m->Carried();
       m->ClearCarried();
       m->RollLoot();
-      const std::vector<CarriedItem>& again = m->Carried();
+      const std::vector<ItemInstance> again = m->Carried();
       bool same = first.size() == again.size();
       for (size_t i = 0; same && i < first.size(); i++)
-        same = first[i].item == again[i].item &&
+        same = first[i].name == again[i].name &&
                first[i].count == again[i].count && first[i].dye == again[i].dye;
       sureN = countOf(m, kSure);
       // The certain row is certain, and it is a STACK: a roll that produced
@@ -6130,8 +6335,8 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
       const Mob* m = c.mobs.FindMobById(id);
       if (m == nullptr) continue;
       bool has = false;
-      for (const CarriedItem& ci : m->Carried())
-        if (ci.item == kFlip) { has = true; dyeSeen = ci.dye; }
+      for (const ItemInstance& ci : m->Carried())
+        if (ci.name == kFlip) { has = true; dyeSeen = ci.dye; }
       if (has) withFlip++; else withoutFlip++;
     }
     // ...and the DYE travelled with it. A colour authored in the table and
@@ -6172,19 +6377,18 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
         // The pack entry, found the way anything finds one: by what it is.
         int at = -1;
         for (size_t i = 0; i < list.size(); i++)
-          if (list[i].kind == LootPiece::Kind::Carried && list[i].item == kSure)
+          if (list[i].kind == LootPiece::Kind::Carried && list[i].name == kSure)
             at = (int)i;
-        PlayerKit kit;
-        Inventory hotbar;
+        Mob looter;
+        Kit& kit = looter.KitMut();
         std::string took;
         const LootResult lr =
-            at >= 0 ? TakeCorpseLoot(*cr, at, KitRef{}, kit, hotbar, c.items,
-                                     &took)
+            at >= 0 ? TakeCorpseLoot(*cr, at, KitRef{}, looter, c.items, &took)
                     : LootResult::NoSuchPiece;
         for (const ItemStack& s : kit.bag.slots)
-          if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
-        for (const ItemStack& s : hotbar.slots)
-          if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
+          if (!s.Empty() && s.name == kSure) gotN += s.count;
+        for (const ItemStack& s : kit.hotbar.slots)
+          if (!s.Empty() && s.name == kSure) gotN += s.count;
         // THE CORPSE IS STILL THERE, WHOLE. A pack item has no body, so taking
         // it must not have taken a limb out of the world with it.
         Mob* after = c.mobs.FindMobById(id);
@@ -6213,7 +6417,7 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
   // the `zombify` gate: PreTick with a later tick, not 180 real ones.
   bool carried = false;
   std::string carryWhy = "no spawn";
-  int roseN = 0;
+  int roseN = 0, roseFill = -1;
   {
     c.debris.Reset();
     c.mobs.Reset();
@@ -6224,6 +6428,9 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
     const uint16_t rotMat =
         zid >= 0 ? c.mobs.Defs()[zid].bite.infectMat : (uint16_t)0;
     const int want = m != nullptr ? countOf(m, kSure) : 0;
+    // ...and a FILLED FLASK in the pack (W2-M): the rising used to carry
+    // name/count/dye and nothing else, so the flask got up empty.
+    if (m != nullptr && haveFlask) m->AddCarried(kFlask);
     if (m != nullptr && rotMat != 0 && want > 0) {
       std::vector<BrushOp> ops;
       std::vector<CellOp> cellOps;
@@ -6252,6 +6459,7 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
           risen = oid;
       }
       roseN = countOf(c.mobs.FindMobById(risen), kSure);
+      roseFill = flaskFill(c.mobs.FindMobById(risen));
       // THE CONTROL, and the reason this cannot pass by accident: the zombie
       // def has NO loot table of its own, so a body that got up carrying two
       // daggers got them from the corpse and from nowhere else. If the rising
@@ -6259,10 +6467,12 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
       const uint64_t ctl =
           c.mobs.Spawn(zid, {spot.x + 4 * step, spot.y + 1, spot.z});
       const int ctlN = countOf(c.mobs.FindMobById(ctl), kSure);
-      carried = risen != 0 && roseN == want && ctlN == 0;
+      carried = risen != 0 && roseN == want && ctlN == 0 &&
+                (!haveFlask || roseFill == kFlask.fillAmt);
       if (!carried)
-        carryWhy = Format("risen=%llu carried=%d/%d control=%d",
-                          (unsigned long long)risen, roseN, want, ctlN);
+        carryWhy = Format("risen=%llu carried=%d/%d control=%d flask=%d/%d",
+                          (unsigned long long)risen, roseN, want, ctlN,
+                          roseFill, (int)kFlask.fillAmt);
     } else {
       carryWhy = m == nullptr ? "could not spawn a human"
                               : (rotMat == 0 ? "no bite.infectMat"
@@ -6288,6 +6498,10 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
         c.mobs.Spawn(hi, {spot.x + 6 * step, spot.y + 1, spot.z});
     const int wantA = countOf(c.mobs.FindMobById(a), kSure);
     const int wantB = countOf(c.mobs.FindMobById(b), kSure);
+    // MOBS v7: the pack is written as whole ItemInstances.
+    if (Mob* ma = c.mobs.FindMobById(a); ma != nullptr && haveFlask)
+      ma->AddCarried(kFlask);
+    int fillBack = -1;
     if (a != 0 && b != 0) {
       std::vector<uint8_t> blob;
       c.mobs.SaveState(blob);
@@ -6300,34 +6514,35 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
       if (back.size() == 2) {
         backN = countOf(c.mobs.FindMobById(back[0]), kSure);
         backN2 = countOf(c.mobs.FindMobById(back[1]), kSure);
+        fillBack = flaskFill(c.mobs.FindMobById(back[0]));
       }
       saved = read && back.size() == 2 && backN == wantA && backN2 == wantB &&
-              wantA > 0;
+              wantA > 0 && (!haveFlask || fillBack == kFlask.fillAmt);
       if (!saved)
-        saveWhy = Format("read=%d mobs=%zu packs=%d/%d vs %d/%d", read ? 1 : 0,
-                         back.size(), backN, backN2, wantA, wantB);
+        saveWhy = Format("read=%d mobs=%zu packs=%d/%d vs %d/%d flask=%d",
+                         read ? 1 : 0, back.size(), backN, backN2, wantA,
+                         wantB, fillBack);
     }
   }
 
   // ---- G: THE PLAYER'S OWN KIT RIDES THEIR OWN CORPSE ---------------------
   //
-  // The avatar turns like anybody else, and its pack is the one thing Die()
-  // cannot read: bag, hotbar and equipment live in PlayerKit on a session this
-  // system deliberately cannot see. So there is a callback, and THIS IS THE
-  // ONLY PLACE THE CALLBACK IS EXERCISED — main.cpp binds it to the real kit,
-  // which no gate has.
+  // The avatar turns like anybody else. Its kit is the AVATAR'S own (Mob::kit_,
+  // W2-M; it used to live on the session and reach the rising through a
+  // callback), it stays with the avatar when the dead rig becomes a corpse
+  // (AdoptDeadAvatar), and the rising reads it off the avatar that owns the
+  // corpse.
   //
   // Two arms, because "the zombie carried three daggers" means nothing without
-  // the control: with the callback UNSET the same death must produce a zombie
+  // the control: with an EMPTY kit the same death must produce a zombie
   // carrying NOTHING. Otherwise a rising that had quietly learned to roll the
   // human's table for itself would pass the first half.
   //
-  // The avatar's own `carried_` stays empty throughout (PlayerAvatar::Spawn
-  // builds its rig without going through MobSystem::Spawn, so it never rolls a
-  // table), which is what makes the count attributable to the hook alone.
+  // A filled FLASK rides in the armed kit's hotbar: the corpse-rise leg of the
+  // plan's "a flask keeps its fill through ... corpse rise".
   bool kitRode = false;
   std::string kitWhy = "no avatar";
-  int kitN = 0, kitCtl = -1;
+  int kitN = 0, kitCtl = -1, kitFill = -1;
   {
     const std::string avName = kAvatarDefName;
     const int avDef = c.mobs.FindDef(avName);
@@ -6344,12 +6559,10 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
         avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
         avatar.SetDefs(&c.mobs.Defs(), avName);
         c.mobs.SetAvatar(&avatar);
-        c.mobs.SetAvatarKitFn(
-            armed ? std::function<void(std::vector<CarriedItem>&)>(
-                        [&](std::vector<CarriedItem>& out) {
-                          out.push_back(CarriedItem{kSure, 3, 0});
-                        })
-                  : nullptr);
+        if (armed) {
+          avatar.KitMut().bag.Add(ItemInstance{kSure, 3});
+          if (haveFlask) avatar.KitMut().hotbar.Add(kFlask);
+        }
         Player pl;
         pl.fly = false;
         pl.grounded = true;
@@ -6384,19 +6597,22 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
           got = 0;
           for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
             const Mob* om = c.mobs.FindMobById(c.mobs.MobIdAt(i));
-            if (om != nullptr && om->Def() != nullptr && om->Def()->undead)
+            if (om != nullptr && om->Def() != nullptr && om->Def()->undead) {
               got = countOf(om, kSure);
+              if (armed) kitFill = flaskFill(om);
+            }
           }
         }
-        c.mobs.SetAvatarKitFn(nullptr);
         c.mobs.SetAvatar(nullptr);
         return got;
       };
       kitN = runOne(true);
       kitCtl = runOne(false);
-      kitRode = kitN == 3 && kitCtl == 0;
+      kitRode = kitN == 3 && kitCtl == 0 &&
+                (!haveFlask || kitFill == kFlask.fillAmt);
       if (!kitRode)
-        kitWhy = Format("carried=%d (want 3) control=%d (want 0)", kitN, kitCtl);
+        kitWhy = Format("carried=%d (want 3) control=%d (want 0) flask=%d/%d",
+                        kitN, kitCtl, kitFill, (int)kFlask.fillAmt);
     } else {
       kitWhy = avDef < 0 ? "no avatar def" : "no bite.infectMat";
     }
@@ -8729,7 +8945,7 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
   // at pelvis height, through the same scale main.cpp's explosion loop uses.
   const auto& tune = CurrentTuning();
   const Vec3 ec{p0.x - 6.0f, p0.y + 2.0f, p0.z};
-  const float reach = (float)tune.tools.detonateRadius * tune.ragdoll.blastRadiusScale;
+  const float reach = (float)tune.tools.detonateRadius * tune.physics.explosionImpulseRadiusScale;
   const float impulse = (float)tune.tools.detonatePower * tune.ragdoll.blastImpulseScale;
   const int knocked = mobs.BlastMobsRadial(ec, reach, impulse);
   const int phaseAfter = mobs.RagdollPhaseOf(id);
@@ -8842,18 +9058,10 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
         debris.AddDestructionEvent(tick + 1,
                                    {e->x - e->radius, e->y - e->radius, e->z - e->radius},
                                    {e->x + e->radius, e->y + e->radius, e->z + e->radius});
-        const Vec3 ec{(float)e->x + 0.5f, (float)e->y + 0.5f, (float)e->z + 0.5f};
-        const float edr = (float)e->radius * tune.physics.explosionBodyDamageScale;
-        debris.DamageBodiesRadial(ec, edr, world, spawns);
-        mobs.CarveMobsRadial(ec, edr, world, spawns);
-        std::vector<uint64_t> rig;
-        mobs.AppendLiveLimbBodies(rig);
-        std::sort(rig.begin(), rig.end());
-        phys.ApplyRadialImpulse(Vec3{(float)e->x, (float)e->y, (float)e->z},
-                                (float)e->radius * tune.physics.explosionImpulseRadiusScale,
-                                (float)e->power * tune.physics.explosionImpulseScale, &rig);
-        mobs.BlastMobsRadial(ec, (float)e->radius * tune.ragdoll.blastRadiusScale,
-                             (float)e->power * tune.ragdoll.blastImpulseScale);
+        // The game's own block now (session.h), not a copy of it: W2-H moved
+        // the reach and strength into BlastForceOf, and a replica would have
+        // gone on reading the retired knobs.
+        ExplosionHitsBodies(*e, world, phys, debris, mobs, spawns);
       }
       ++tick;
       SubmitTick(ctx, world, sim, tick, kDefaultSeed, ops, exps, cellOps, false,
@@ -10587,7 +10795,8 @@ Status GateCorpseSave(Ctx& c, std::string& detail) {
       break;
     }
   if (Mob* a = c.mobs.FindMobById(idA))
-    if (!c.items.items.empty()) a->AddCarried(c.items.items[0].name, 3, 0x40u);
+    if (!c.items.items.empty())
+      a->AddCarried(ItemInstance{c.items.items[0].name, 3, 0x40u});
   for (int i = 0; i < 8; i++) tick(true);
   // B: bitten with the rot, so its death books a rising.
   const MobDef& hd = c.mobs.Defs()[hi];
@@ -10636,9 +10845,8 @@ Status GateCorpseSave(Ctx& c, std::string& detail) {
     a->LootPieces(list);
     for (size_t i = 0; i < list.size(); i++)
       if (list[i].kind == LootPiece::Kind::Held) {
-        PlayerKit kit;
-        Inventory hotbar;
-        lootedHeld = TakeCorpseLoot(*a, (int)i, KitRef{}, kit, hotbar, c.items) ==
+        Mob looter;
+        lootedHeld = TakeCorpseLoot(*a, (int)i, KitRef{}, looter, c.items) ==
                      LootResult::Ok;
         break;
       }
@@ -10743,12 +10951,12 @@ Status GateCorpseSave(Ctx& c, std::string& detail) {
       return Format("loot %zu vs %zu entries", a.loot.size(), b.loot.size());
     for (size_t i = 0; i < a.loot.size(); i++) {
       const LootPiece &p = a.loot[i], &q = b.loot[i];
-      if (p.kind != q.kind || p.item != q.item || p.count != q.count ||
+      if (p.kind != q.kind || p.name != q.name || p.count != q.count ||
           p.dye != q.dye || p.equipSlot != q.equipSlot)
-        return Format("loot %zu '%s'x%d vs '%s'x%d", i, p.item.c_str(), p.count,
-                      q.item.c_str(), q.count);
+        return Format("loot %zu '%s'x%d vs '%s'x%d", i, p.name.c_str(), p.count,
+                      q.name.c_str(), q.count);
       if (std::fabs(p.damage.Condition() - q.damage.Condition()) > 1e-4f)
-        return Format("loot %zu '%s' condition %.4f vs %.4f", i, p.item.c_str(),
+        return Format("loot %zu '%s' condition %.4f vs %.4f", i, p.name.c_str(),
                       p.damage.Condition(), q.damage.Condition());
     }
     return std::string();
@@ -11340,7 +11548,7 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
         gearBack = (int)back.gear.size();
         gearSame = gearBack == gearSent;
         for (int k = 0; k < gearBack && gearSame; k++)
-          gearSame = back.gear[k].item == h.announce.gear[k].item &&
+          gearSame = back.gear[k].name == h.announce.gear[k].name &&
                      back.gear[k].held == h.announce.gear[k].held &&
                      back.gear[k].dye == h.announce.gear[k].dye;
       }
@@ -11592,7 +11800,7 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
       eGearBack = (int)back.gear.size();
       eGearSame = eGearBack == eGearSent && eGearSent > 0;
       for (int k = 0; k < eGearBack && eGearSame; k++)
-        eGearSame = back.gear[k].item == got.gear[k].item &&
+        eGearSame = back.gear[k].name == got.gear[k].name &&
                     back.gear[k].held == got.gear[k].held &&
                     back.gear[k].dye == got.gear[k].dye;
     }
@@ -12000,7 +12208,7 @@ Status GateNetCorpse(Ctx& c, std::string& detail) {
       gearB = (int)gb.gear.size();
       gearSame = gearA == gearB;
       for (int k = 0; k < gearA && gearSame; k++)
-        gearSame = ga.gear[(size_t)k].item == gb.gear[(size_t)k].item &&
+        gearSame = ga.gear[(size_t)k].name == gb.gear[(size_t)k].name &&
                    ga.gear[(size_t)k].held == gb.gear[(size_t)k].held;
     }
   }
@@ -12573,6 +12781,463 @@ Status GateNetPlayerCorpse(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- damage-sources -----------------------------------------------------
+//
+// ONE DAMAGE EVENT, ONE SHELL RESPONSE (W2-H, game/shellresponse.h). Every
+// source that hurts a body now answers the same two questions the same way --
+// what did a worn shell in the way do, and whose body is it -- and this gate
+// holds each source to it, beside the number it used to produce:
+//
+//   A. THE TABLE IS TODAY'S NUMBERS. ShellResponseOf at a sweep of hardnesses
+//      against the three formulas it replaced, written out verbatim (the
+//      CutLimb kerf ratio, the BluntHit dent ratio + gear.bluntThrough /
+//      bluntShellHp, the BiteHit ramp + biteOnShell). Melee may not move.
+//   B. A GRENADE AGAINST PLATE. The same grenade (tuning grenade.*) beside a
+//      bare and a cuirassed human, through ExplosionHitsBodies, twice: with no
+//      power (the pre-W2-H radius-only crater) and with the grenade's power
+//      (the terrain rule). Claims: on BARE flesh the two are identical (a
+//      grenade's power is past gore.blastPowerRef everywhere in its radius);
+//      in the cuirass the torso loses at most damageSourcesArmourMaxFrac of
+//      what it loses bare; and a WEAK blast of the same radius takes less than
+//      the grenade -- the crater follows power, not radius alone.
+//   C. AN NPC LANDS. A limp human handed a 15 m/s landing is billed through
+//      Mob::ApplyFallDamage by MobSystem::PreTick: hurt, alive. Before W2-H
+//      only the avatar was billed and this cost nothing.
+//   D. THE LASER CHARGES ONCE. MobSystem::LaserHit on a torso charges exactly
+//      tools.laserDamage once (the session used to call avatar.Damage and then
+//      mobs.Damage), and on a worn shell the Beam row's identity.
+//   E. THE STRUCK VOXEL (report only): per shipped worn item, how many of its
+//      shells hold more than one material -- the shells where the old
+//      `skinVoxels[0]` reading and the struck-voxel reading can disagree.
+//   F. A THROWN ROCK IS A BLOW (phase 2): a stone block flung at a torso at
+//      15 m/s through the real contact listener is billed as blunt trauma; at
+//      1.5 m/s it is not; into a cuirass the plate takes it and the torso
+//      only the transmitted share.
+Status GateDamageSources(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const Tuning& tune = CurrentTuning();
+  const Tuning::Gear& g = tune.gear;
+  bool ok = true;
+  std::string why;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    if (why.empty()) why = s;
+  };
+
+  // ---- A. the table ---------------------------------------------------------
+  auto oldRatio = [](float hard, float ref, float mn) {
+    if (!(hard > 0.0f && ref > 0.0f)) return 1.0f;
+    return std::clamp(ref / hard, std::clamp(mn, 0.0f, 1.0f), 1.0f);
+  };
+  auto oldBite = [&](float hard) {
+    float through = 1.0f;
+    if (hard > g.biteThroughSoft) {
+      const float span = std::max(g.biteThroughHard - g.biteThroughSoft, 1e-3f);
+      through = std::clamp((g.biteThroughHard - hard) / span, 0.0f, 1.0f);
+    }
+    return through;
+  };
+  int rows = 0, bad = 0;
+  for (float h : {0.0f, 2.0f, 4.0f, 5.0f, 8.0f, 10.0f, 14.0f, 24.0f, 30.0f,
+                  40.0f, 60.0f, 90.0f, 120.0f, 160.0f, 200.0f, 255.0f}) {
+    const ShellResponse cut = ShellResponseOf(h, DamageCause::Blade, g);
+    const ShellResponse blunt = ShellResponseOf(h, DamageCause::Blunt, g);
+    const ShellResponse fist = ShellResponseOf(h, DamageCause::Unarmed, g);
+    const ShellResponse bite = ShellResponseOf(h, DamageCause::Bite, g);
+    const ShellResponse blast = ShellResponseOf(h, DamageCause::Blast, g);
+    const ShellResponse beam = ShellResponseOf(h, DamageCause::Beam, g);
+    const ShellResponse fall = ShellResponseOf(h, DamageCause::Fall, g);
+    rows++;
+    const bool same =
+        cut.carve == oldRatio(h, g.cutHardnessRef, g.cutHardnessMin) &&
+        cut.passed == 0.0f && cut.shellHp == 1.0f &&
+        blunt.carve == oldRatio(h, g.bluntHardnessRef, g.bluntHardnessMin) &&
+        blunt.passed == g.bluntThrough && blunt.shellHp == g.bluntShellHp &&
+        fist.carve == blunt.carve && fist.passed == blunt.passed &&
+        fist.shellHp == blunt.shellHp && bite.passed == oldBite(h) &&
+        bite.carve == 0.0f &&
+        std::clamp(bite.shellHp, 0.0f, 1.0f) ==
+            std::clamp(g.biteOnShell, 0.0f, 1.0f) &&
+        blast.stop == h * g.blastShellCells && blast.passed == 1.0f &&
+        beam.carve == 1.0f && beam.shellHp == 1.0f && fall.passed == 1.0f &&
+        fall.shellHp == 0.0f;
+    if (!same) {
+      bad++;
+      fail(Format("table row at hardness %.0f is not the old formula", h));
+    }
+  }
+  std::printf("  damage-sources table: %d/%d hardness rows match the melee "
+              "formulas they replaced\n", rows - bad, rows);
+  for (const char* m : {"linen", "cloth", "leather", "iron", "steel"}) {
+    const uint32_t id = mobs.MaterialIdNamed(m);
+    const float h = id < c.mats.size() ? (float)c.mats[id].gpu.hardness : 0.0f;
+    const ShellResponse cut = ShellResponseOf(h, DamageCause::Blade, g);
+    const ShellResponse blunt = ShellResponseOf(h, DamageCause::Blunt, g);
+    const ShellResponse bite = ShellResponseOf(h, DamageCause::Bite, g);
+    const ShellResponse blast = ShellResponseOf(h, DamageCause::Blast, g);
+    std::printf("    %-8s hardness %3.0f: blade carve %.3f | blunt carve %.3f "
+                "passed %.2f shellHp %.2f | bite passed %.2f shellHp %.2f | "
+                "blast stop %.0f\n",
+                m, h, cut.carve, blunt.carve, blunt.passed, blunt.shellHp,
+                bite.passed, bite.shellHp, blast.stop);
+  }
+
+  // ---- the fixture: one human on its feet, optionally in the cuirass -------
+  const int def = mobs.FindDef(kAvatarDefName);
+  const ItemDef* cuirass = c.items.At(c.items.Find("iron_cuirass"));
+  if (def < 0 || cuirass == nullptr) {
+    detail = "needs the avatar def and `iron_cuirass`";
+    std::printf("damage-sources: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const IVec3 org = c.world.WindowOrigin();
+  const int fx = org.x * (int)kChunk + 470, fz = org.z * (int)kChunk + 470;
+  const IVec3 site{fx, World::TerrainHeight(fx, fz, kDefaultSeed) + 1, fz};
+  const uint64_t firstId = mobs.NextIdCounter();
+  const int torso = mobs.Defs()[def].rootLimb;
+  auto settle = [&](int n) {
+    for (int i = 0; i < n; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(3000u + (uint32_t)i, c.world, ops, cellOps, spawns);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+  };
+  // SAME ID EVERY ARM: the ragged rim is hashed off the creature's id, so two
+  // arms that spawned different ids would differ by noise, not by rule.
+  auto spawnFixture = [&](bool armoured) -> uint64_t {
+    mobs.Reset();
+    c.debris.Reset();
+    mobs.SetNextIdCounter(firstId);
+    const uint64_t id = mobs.Spawn(def, site);
+    if (!id) return 0;
+    settle(8);
+    if (armoured) {
+      Mob* m = mobs.FindMobById(id);
+      if (!m || !m->WearItem(cuirass, (int)EquipSlotId::Chest)) return 0;
+      settle(4);
+    }
+    return id;
+  };
+  auto bodyVoxels = [&](uint64_t id) {
+    uint32_t n = 0;
+    const Mob* m = mobs.FindMobById(id);
+    const int base = m ? m->AppendedBase() : 0;
+    for (int li = 0; li < base; li++)
+      if (mobs.LimbBody(id, li)) n += mobs.LimbArtVoxelCount(id, li);
+    return n;
+  };
+
+  // ---- B. the grenade -------------------------------------------------------
+  struct Blast {
+    uint32_t torso0 = 0, torso1 = 0, body0 = 0, body1 = 0, shell0 = 0,
+             shell1 = 0;
+    bool alive = false, ran = false;
+  };
+  const int gR = tune.grenade.blastRadius;
+  const int gP = tune.grenade.blastPower;
+  const float offset = (float)BaselineNumber("damageSourcesBlastOffset", 7.0);
+  auto blastArm = [&](bool armoured, int power, int radius, float off) {
+    Blast b;
+    const uint64_t id = spawnFixture(armoured);
+    if (!id || !mobs.LimbBody(id, torso)) return b;
+    int shell = -1;
+    if (Mob* m = mobs.FindMobById(id))
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+        if (m->WornHostOf(li) == torso) shell = li;
+    Vec3 sum{};
+    for (uint32_t k = 0; k < 16; k++)
+      sum += mobs.LimbVoxelPos(id, torso, k * 7919u);
+    const Vec3 tc = sum * (1.0f / 16.0f);
+    b.torso0 = mobs.LimbArtVoxelCount(id, torso);
+    b.body0 = bodyVoxels(id);
+    if (shell >= 0) b.shell0 = mobs.LimbArtVoxelCount(id, shell);
+    // Level with the torso and off to one side, so the crater BITES the torso
+    // rather than engulfing the whole body: a grazing blast is the case where
+    // what is in the way decides how much comes off.
+    ExplosionOp e{(int32_t)std::floor(tc.x + off), (int32_t)std::floor(tc.y),
+                  (int32_t)std::floor(tc.z), radius, power, 0, 0, 0};
+    std::vector<ParticleSpawn> spawns;
+    ExplosionHitsBodies(e, c.world, c.phys, c.debris, mobs, spawns);
+    b.torso1 = mobs.LimbBody(id, torso) ? mobs.LimbArtVoxelCount(id, torso) : 0;
+    b.body1 = bodyVoxels(id);
+    if (shell >= 0 && mobs.LimbBody(id, shell))
+      b.shell1 = mobs.LimbArtVoxelCount(id, shell);
+    b.alive = mobs.IsAlive(id);
+    b.ran = true;
+    return b;
+  };
+  // power 0 = the radius-only crater (the pre-W2-H model, still the path a
+  // blast with no stated power takes).
+  const Blast bare0 = blastArm(false, 0, gR, offset),
+              plate0 = blastArm(true, 0, gR, offset);
+  const Blast bare1 = blastArm(false, gP, gR, offset),
+              plate1 = blastArm(true, gP, gR, offset);
+  const int weakP = (int)BaselineNumber("damageSourcesWeakPower", 150.0);
+  const Blast weak = blastArm(false, weakP, gR, offset);
+  // The spell's `explosive` glyph (radius 6, power 220) three voxels off the
+  // torso, bare: reported before/after, not asserted -- it is the one shipped
+  // blast whose power sits near gore.blastPowerRef, so it is where the power
+  // model moves a number the game already had.
+  const Blast spell0 = blastArm(false, 0, 6, 3.0f);
+  const Blast spell1 = blastArm(false, 220, 6, 3.0f);
+  auto lost = [](uint32_t a, uint32_t b) { return a > b ? a - b : 0u; };
+  const uint32_t tBare0 = lost(bare0.torso0, bare0.torso1),
+                 tPlate0 = lost(plate0.torso0, plate0.torso1),
+                 tBare1 = lost(bare1.torso0, bare1.torso1),
+                 tPlate1 = lost(plate1.torso0, plate1.torso1),
+                 tWeak = lost(weak.torso0, weak.torso1),
+                 tSpell0 = lost(spell0.torso0, spell0.torso1),
+                 tSpell1 = lost(spell1.torso0, spell1.torso1);
+  std::printf("  grenade (r %d, power %d) %.0f vox beside the torso, torso "
+              "voxels lost:\n"
+              "    radius-only (pre-W2-H): bare %u of %u (body %u) | cuirass %u "
+              "of %u (body %u, plate %u -> %u)\n"
+              "    power model (W2-H):     bare %u of %u (body %u) | cuirass %u "
+              "of %u (body %u, plate %u -> %u)\n"
+              "    weak blast (r %d, power %d), bare: %u\n"
+              "    spell explosive (r 6, power 220) 3 vox off, bare: "
+              "radius-only %u, power model %u (body %u -> %u)\n",
+              gR, gP, offset, tBare0, bare0.torso0,
+              lost(bare0.body0, bare0.body1), tPlate0, plate0.torso0,
+              lost(plate0.body0, plate0.body1), plate0.shell0, plate0.shell1,
+              tBare1, bare1.torso0, lost(bare1.body0, bare1.body1), tPlate1,
+              plate1.torso0, lost(plate1.body0, plate1.body1), plate1.shell0,
+              plate1.shell1, gR, weakP, tWeak, tSpell0, tSpell1,
+              lost(spell0.body0, spell0.body1), lost(spell1.body0, spell1.body1));
+  RecordObserved("damageSourcesGrenadeBareBefore", (double)tBare0);
+  RecordObserved("damageSourcesGrenadePlateBefore", (double)tPlate0);
+  RecordObserved("damageSourcesGrenadeBare", (double)tBare1);
+  RecordObserved("damageSourcesGrenadePlate", (double)tPlate1);
+  RecordObserved("damageSourcesWeakBlast", (double)tWeak);
+  RecordObserved("damageSourcesSpellBefore", (double)tSpell0);
+  RecordObserved("damageSourcesSpell", (double)tSpell1);
+  const double armourMax = BaselineNumber("damageSourcesArmourMaxFrac", 0.75);
+  if (!bare0.ran || !plate0.ran || !bare1.ran || !plate1.ran || !weak.ran)
+    fail("a blast fixture did not spawn");
+  else if (tBare1 == 0)
+    fail("the grenade took nothing off the bare torso (the fixture proves nothing)");
+  else if (bare1.torso1 != bare0.torso1 || bare1.body1 != bare0.body1)
+    fail("a grenade on BARE flesh changed under the power model");
+  else if ((double)tPlate1 > armourMax * (double)tBare1)
+    fail(Format("the cuirass kept only %u of %u torso voxels' loss off",
+                tBare1 - std::min(tBare1, tPlate1), tBare1));
+  else if (tWeak >= tBare1)
+    fail("a weak blast of the grenade's radius took as much as the grenade");
+
+  // ---- C. an NPC lands ------------------------------------------------------
+  uint32_t billed = 0;
+  float hp0 = 0.0f, hp1 = 0.0f;
+  bool npcAlive = false;
+  {
+    mobs.Reset();
+    c.debris.Reset();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    int relief = 0;
+    const IVec3 anchor = AiFixtureCentre(c.world);
+    const IVec3 spot =
+        AiFlatSpot(anchor.x, anchor.z, 96, 16, kDefaultSeed, relief);
+    AiTicker ticker{c, 14000, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+    const uint64_t id = mobs.Spawn(def, {spot.x, spot.y + 1, spot.z});
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    if (!m) {
+      fail("the NPC fall fixture did not spawn");
+    } else {
+      for (int i = 0; i < 40; i++) ticker();
+      m = mobs.FindMobById(id);
+      hp0 = mobs.TotalHp(id);
+      const uint32_t before = m ? m->FallsBilled() : 0u;
+      if (m) {
+        m->StartRagdoll(2.0f, "gate");
+        m->SetLimbVelocities(Vec3{0.0f, -15.0f / kVoxelMeters, 0.0f});
+      }
+      for (int i = 0; i < 40; i++) ticker();
+      m = mobs.FindMobById(id);
+      hp1 = mobs.TotalHp(id);
+      billed = m ? m->FallsBilled() - before : 0u;
+      npcAlive = mobs.IsAlive(id);
+      if (billed == 0) fail("a limp NPC's 15 m/s landing was not billed");
+      else if (!(hp1 < hp0)) fail("the NPC's landing cost no hp");
+      else if (!npcAlive) fail("a sub-lethal landing killed the NPC");
+    }
+    std::printf("  NPC landing at 15 m/s: billed %u, hp %.1f -> %.1f, alive %d "
+                "(pre-W2-H: never billed)\n",
+                billed, hp0, hp1, (int)npcAlive);
+    RecordObserved("damageSourcesNpcFallHp", (double)(hp0 - hp1));
+  }
+
+  // ---- D. the laser ---------------------------------------------------------
+  float laserFlesh = -1.0f, laserShell = -1.0f;
+  uint32_t charges = 0;
+  {
+    const uint64_t id = spawnFixture(true);
+    Mob* m = id ? mobs.FindMobById(id) : nullptr;
+    int shell = -1;
+    if (m)
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+        if (m->WornHostOf(li) == torso) shell = li;
+    if (!m || shell < 0 || !mobs.LimbBody(id, torso)) {
+      fail("the laser fixture did not dress");
+    } else {
+      const uint32_t n0 = mobs.LaserHitsCharged();
+      float bore = 0.0f;
+      const float t0 = mobs.LimbHp(id, torso);
+      mobs.LaserHit(mobs.LimbBody(id, torso), mobs.LimbVoxelPos(id, torso, 11u),
+                    bore);
+      laserFlesh = t0 - mobs.LimbHp(id, torso);
+      const float s0 = mobs.LimbHp(id, shell);
+      float bore2 = 0.0f;
+      mobs.LaserHit(mobs.LimbBody(id, shell), mobs.LimbVoxelPos(id, shell, 11u),
+                    bore2);
+      laserShell = s0 - mobs.LimbHp(id, shell);
+      charges = mobs.LaserHitsCharged() - n0;
+      if (charges != 2 || laserFlesh != tune.tools.laserDamage ||
+          laserShell != tune.tools.laserDamage ||
+          bore != (float)tune.tools.laserCarveRadius)
+        fail("the laser did not charge exactly once per tick");
+    }
+    std::printf("  laser: 2 ticks -> %u charges; torso -%.2f hp, cuirass -%.2f "
+                "hp (tools.laserDamage %.2f)\n",
+                charges, laserFlesh, laserShell, tune.tools.laserDamage);
+  }
+
+  // ---- F. a thrown rock (W2-H phase 2) --------------------------------------
+  //
+  // A 3x3x3 stone block flung at the torso at `mps`, through the real contact
+  // listener (Physics::ContactImpacts) and MobSystem::ApplyContactDamage.
+  // Fast: billed, torso hurt. Slow: under gore.contactImpulseMin, nothing. In
+  // the cuirass: billed on the plate, and the torso takes only the Blunt
+  // row's transmitted share.
+  struct Throw {
+    uint32_t billed = 0;
+    float torsoHp = 0.0f, shellHp = 0.0f, mass = 0.0f;
+    bool ran = false;
+  };
+  std::vector<float> density(c.mats.size(), 1000.0f);
+  for (size_t i = 0; i < c.mats.size(); i++)
+    density[i] = std::max(1.0f, (float)c.mats[i].gpu.density);
+  auto throwArm = [&](bool armoured, float mps) {
+    Throw t;
+    const uint64_t id = spawnFixture(armoured);
+    if (!id || !mobs.LimbBody(id, torso)) return t;
+    int shell = -1;
+    if (Mob* m = mobs.FindMobById(id))
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+        if (m->WornHostOf(li) == torso) shell = li;
+    Vec3 sum{};
+    for (uint32_t k = 0; k < 16; k++)
+      sum += mobs.LimbVoxelPos(id, torso, k * 7919u);
+    const Vec3 tc = sum * (1.0f / 16.0f);
+    std::vector<DebrisVoxel> vox;
+    for (int8_t z = 0; z < 3; z++)
+      for (int8_t y = 0; y < 3; y++)
+        for (int8_t x = 0; x < 3; x++)
+          vox.push_back(DebrisVoxel{x, y, z, 0, (uint16_t)kMatStone});
+    const IVec3 at0{(int)std::floor(tc.x) + 6, (int)std::floor(tc.y) - 1,
+                    (int)std::floor(tc.z) - 1};
+    const uint64_t bh = c.phys.CreateDebrisBody(vox, at0, density);
+    if (bh == 0) return t;
+    t.mass = c.phys.BodyMass(bh);
+    c.phys.SetBodyVelocities(bh, Vec3{-mps / kVoxelMeters, 0.0f, 0.0f},
+                             Vec3{});
+    // The WHOLE body's hp and the whole garment's: a block thrown at the
+    // torso meets whatever is in front of it first (an arm, a sleeve).
+    auto shellHp = [&]() {
+      float s = 0.0f;
+      if (Mob* m = mobs.FindMobById(id))
+        for (int li = m->AppendedBase(); li < m->LimbCount(); li++)
+          if (m->WornHostOf(li) >= 0) s += std::max(0.0f, m->LimbHpAt(li));
+      return s;
+    };
+    const float torso0 = mobs.TotalHp(id);
+    const float shell0 = shellHp();
+    (void)shell;
+    const uint32_t n0 = mobs.ContactHitsBilled();
+    std::vector<ParticleSpawn> spawns;
+    for (int i = 0; i < 20; i++) {
+      c.phys.Step(kTickDt);
+      mobs.ApplyContactDamage(c.phys, c.world, spawns);
+    }
+    t.billed = mobs.ContactHitsBilled() - n0;
+    t.torsoHp = torso0 - mobs.TotalHp(id);
+    t.shellHp = shell0 - shellHp();
+    c.phys.RemoveBody(bh);
+    t.ran = true;
+    return t;
+  };
+  const Throw fast = throwArm(false, 15.0f);
+  const Throw slow = throwArm(false, 1.5f);
+  const Throw plated = throwArm(true, 15.0f);
+  std::printf("  thrown stone (%.1f kg): 15 m/s bare billed %u, body -%.1f hp | "
+              "1.5 m/s billed %u, body -%.1f | 15 m/s in the cuirass billed "
+              "%u, plate -%.1f, body -%.1f (pre-W2-H: never billed)\n",
+              fast.mass, fast.billed, fast.torsoHp, slow.billed, slow.torsoHp,
+              plated.billed, plated.shellHp, plated.torsoHp);
+  RecordObserved("damageSourcesThrownHp", (double)fast.torsoHp);
+  if (!fast.ran || !slow.ran || !plated.ran)
+    fail("a thrown-stone fixture did not run");
+  else if (fast.billed == 0 || !(fast.torsoHp > 0.0f))
+    fail("a 15 m/s stone into a body was not a blow");
+  else if (slow.billed != 0 || slow.torsoHp != 0.0f)
+    fail("a 1.5 m/s stone hurt somebody");
+  else if (plated.billed == 0 || !(plated.shellHp > 0.0f) ||
+           !(plated.torsoHp < fast.torsoHp))
+    fail("the cuirass did not take the stone");
+
+  // ---- E. the struck voxel (report) -----------------------------------------
+  {
+    std::string rep;
+    Equipment eq;
+    for (const ItemDef& it : c.items.items) {
+      const int slot = EquipSlotFor(it.kind, eq);
+      if (slot < 0 || it.cover.empty()) continue;
+      const uint64_t id = spawnFixture(false);
+      Mob* m = id ? mobs.FindMobById(id) : nullptr;
+      if (!m || !m->WearItem(&it, slot)) continue;
+      int shells = 0, mixed = 0;
+      for (int li = m->AppendedBase(); li < m->LimbCount(); li++) {
+        if (m->WornHostOf(li) < 0) continue;
+        shells++;
+        const uint32_t first =
+            m->ShellMaterialAt(li, mobs.LimbVoxelPos(id, li, 0u));
+        for (uint32_t k = 1; k < 64; k++)
+          if (m->ShellMaterialAt(li, mobs.LimbVoxelPos(id, li, k * 7919u)) !=
+              first) {
+            mixed++;
+            break;
+          }
+      }
+      if (mixed) rep += Format(" %s %d/%d", it.name.c_str(), mixed, shells);
+    }
+    std::printf("  struck voxel vs first voxel: shells holding more than one "
+                "material:%s\n", rep.empty() ? " none" : rep.c_str());
+  }
+
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  detail = Format(
+      "table %d/%d; grenade torso loss bare %u->%u, cuirass %u->%u, weak %u, "
+      "spell %u->%u; "
+      "NPC 15 m/s landing billed %u (hp -%.1f, alive %d); laser %u charges "
+      "(-%.2f flesh, -%.2f shell); thrown stone 15 m/s: %u billed -%.1f hp, "
+      "slow %u, plated %u (body -%.1f)%s%s",
+      rows - bad, rows, tBare0, tBare1, tPlate0, tPlate1, tWeak, tSpell0,
+      tSpell1, billed,
+      hp0 - hp1, (int)npcAlive, charges, laserFlesh, laserShell, fast.billed,
+      fast.torsoHp, slow.billed, plated.billed, plated.torsoHp,
+      why.empty() ? "" : "; FAIL: ", why.c_str());
+  std::printf("damage-sources: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
@@ -12596,6 +13261,10 @@ const std::vector<Gate>& MobGates() {
        /*needsRender=*/false},
       // With it, and for the same reasons: files and arithmetic, no world.
       {"anatomy-parity", "mob", {}, false, GateAnatomyParity,
+       /*needsRender=*/false},
+      // The (cause, tissue) sever table vs the ambient-flag predicates it
+      // replaced (W2-G). A table walk and a def scan: no world, no GPU.
+      {"damage-cause", "mob", {}, false, GateDamageCause,
        /*needsRender=*/false},
       {"mob", "mob", {}, false, GateMob, /*needsRender=*/true},
       // Per-voxel body reactivity. No render: every claim is a count.
@@ -12672,6 +13341,12 @@ const std::vector<Gate>& MobGates() {
       // ...and what a limp landing COSTS. Its own gate rather than another
       // `ragdoll` arm: that gate's arms inherit each other's tick phase.
       {"ragdoll-falldamage", "mob", {}, false, GateRagdollFallDamage,
+       /*needsRender=*/false},
+      // ONE DAMAGE EVENT, ONE SHELL RESPONSE (W2-H): the shell table vs the
+      // melee formulas it replaced, a grenade against bare and plated flesh
+      // (with and without its power), an NPC's landing, the laser's single
+      // charge. Resets mobs + debris and regenerates on the way in and out.
+      {"damage-sources", "mob", {}, false, GateDamageSources,
        /*needsRender=*/false},
       // ...and whether the thing that landed is still ONE body. Dressed, limp,
       // 50 m of fall: the clothes may not leave the limbs and the joints may not

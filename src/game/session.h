@@ -140,6 +140,40 @@ bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt);
 // OWNER's machine): only this process's own avatars, carved and launched --
 // the body the author's machine could only carve as a ghost.
 enum class BlastBodies : uint8_t { Everyone, OwnAvatars };
+
+// ---- WHAT ONE EXPLOSION DOES TO BODIES, IN ONE PLACE (W2-H) ----------------
+//
+// Every consumer of a blast -- the carve (debris and creatures), the per-body
+// debris impulse and the rig launch -- reads its reach and its strength from
+// here and nowhere else. It used to be read at each call site from THREE reach
+// knobs (physics.explosionBodyDamageScale, physics.explosionImpulseRadiusScale
+// and ragdoll.blastRadiusScale -- the last two both 3.0 and meaning the same
+// thing) and two impulse scales, and a gate that replicated the block had its
+// own copy. Now:
+//   craterRadius  radius x physics.explosionBodyDamageScale: how far matter is
+//                 blown OFF a body (smaller than the push, on purpose)
+//   pushRadius    radius x physics.explosionImpulseRadiusScale: THE one push
+//                 reach, for loose bodies and creatures alike
+//   debrisImpulse power x physics.explosionImpulseScale: kg*m/s at the centre
+//                 on EACH loose body (speed-capped per body)
+//   rigImpulse    power x ragdoll.blastImpulseScale: kg*m/s at the centre on a
+//                 WHOLE creature (divided by its mass). Two numbers because
+//                 they are two different quantities -- a shove per body and a
+//                 launch per creature; one scale for both would have changed a
+//                 grenade's launch by 6.7x.
+//   power         the explosion's power: the carve's terrain rule
+//                 (Mob::CarveLimbRadial) and the shells in its way
+struct BlastForce {
+  Vec3 center{};        // the op's cell CENTRE: carve and rig launch
+  Vec3 debrisCenter{};  // the op's cell CORNER, which the debris impulse has
+                        // always been applied from (kept: not this change)
+  float craterRadius = 0.0f;
+  float pushRadius = 0.0f;
+  float debrisImpulse = 0.0f;
+  float rigImpulse = 0.0f;
+  float power = 0.0f;
+};
+BlastForce BlastForceOf(const ExplosionOp& e);
 void ExplosionHitsBodies(const ExplosionOp& e, World& world, Physics& phys,
                          DebrisSystem& debris, MobSystem& mobs,
                          std::vector<ParticleSpawn>& spawns,
@@ -423,13 +457,13 @@ struct PlayerSession {
   // ---- tools ----
   Brush brush;
   PrefabPlacer placer;
-  Inventory hotbar;
-  PlayerKit kit;
-  // What we last ASKED the body to wear, per equip slot, and in what dye. Not
-  // a second copy of the equipment — it is the record that keeps a REFUSED
-  // piece from being retried thirty times a second.
-  std::string wearTried[kEquipSlotCount];
-  uint32_t wearDye[kEquipSlotCount] = {};
+  // THE KIT IS THE AVATAR'S (W2-M): hotbar, bag and equipment are
+  // `avatar.GetKit()` / `avatar.KitMut()` (Mob::kit_), and the rig is dressed
+  // from it by Mob::DressFromKit. The session used to hold `hotbar` and a
+  // `PlayerKit` here plus the `wearTried`/`wearDye` latches its per-tick wear
+  // loop reconciled the rig through.
+  Kit& kit() { return avatar.KitMut(); }
+  Inventory& hotbar() { return avatar.KitMut().hotbar; }
 
   // ---- looking at things, and looting them (game/corpses.h) ----
   // What the reach ray found this frame (a debris body handle or 0), the
@@ -559,7 +593,7 @@ struct PlayerSession {
 // belong to the same player" was a fact nobody could check.
 inline PlayerKitRefs PlayerKitOf(PlayerSession& s, const GlyphLibrary& glyphs,
                                  const ItemLibrary& items) {
-  return PlayerKitRefs{&s.caster, &glyphs, &s.hotbar, &s.kit, &items};
+  return PlayerKitRefs{&s.caster, &glyphs, &s.kit(), &items, &s.avatar};
 }
 
 // What the FRAME layer decided this frame that the tick has to act under.

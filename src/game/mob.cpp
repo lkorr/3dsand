@@ -21,6 +21,9 @@
 #include "phys/lattice.h"
 #include "sim/bytestream.h"
 #include "sim/mattable.h"
+#include "sim/bodyreact.h"
+#include "sim/oprecord.h"  // BrushAuthorScope: a landing's ops (ApplyFallDamage)
+#include "sim/coatrule.h"
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
 #include "sim/scale.h"   // SkinScaleFor / NeededArtUpsample / MetresToCells
@@ -714,6 +717,20 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
     else log += jp + ": undead: expected true or false\n";
   }
   if (def.undead) def.woundHeals = false;
+  // ---- BODY TISSUE (MobDef::bodyTissue) ------------------------------------
+  // The body's row of the sever table (game/severpolicy.h). Deliberately NOT
+  // defaulted from `undead`: the zombie effect states it, so `undead` keeps
+  // its two consequences and no more.
+  if (j.contains("bodyTissue")) {
+    const std::string bt =
+        j["bodyTissue"].is_string() ? j["bodyTissue"].get<std::string>() : "";
+    if (bt == "flesh")
+      def.bodyTissue = Tissue::Flesh;
+    else if (bt == "rotten")
+      def.bodyTissue = Tissue::Rotten;
+    else
+      log += jp + ": bodyTissue: expected \"flesh\" or \"rotten\"\n";
+  }
   // ---- AND WHAT IT GETS UP AS (MobDef::Turn) ------------------------------
   // Absent, or `null` in a patch (which is how the zombie effect opts its own
   // bodies out of turning again), leaves `into` empty: this creature stays
@@ -1979,6 +1996,22 @@ void MobSystem::Init(Physics* phys, World* world, DebrisSystem* debris,
   phys_ = phys;
   world_ = world;
   debris_ = debris;
+  // ONE body-reaction evaluator for every population (W2-I): the debris pass
+  // over non-flesh bodies schedules and runs its tail, and evaluates through
+  // BurnOneLimb here, as severed flesh already did (BurnDeadFlesh).
+  if (debris_)
+    debris_->SetBodyReactor(
+        [this](DebrisSystem::FleshLattice& f, uint32_t tick, World& w,
+               std::vector<CellOp>& ops, uint32_t& frontBudget,
+               uint32_t& opsBudget, uint32_t& walkBudget, uint32_t& removed,
+               bool& deferred) {
+          return BurnLooseBody(f, tick, w, ops, frontBudget, opsBudget,
+                               walkBudget, removed, deferred);
+        },
+        [this](uint32_t tick, bool forgetAll) {
+          if (forgetAll) looseBurn_.clear();
+          else RetireLooseBurn(tick);
+        });
   OnMaterialsReloaded(mats, reactions);
 }
 
@@ -2009,7 +2042,6 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   coatEffects_.clear();
   matCorrodes_.clear();
   corrosiveMats_.clear();
-  matCoatHot_.clear();
   matCoatFuel_.clear();
   flashForm_.clear();
   coatDepth_.clear();
@@ -2028,34 +2060,31 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
       if (t == "flammable") flammable = true;
     burnable_[i] = flammable ? 1u : 0u;
   }
-  // The tag bit for "hot" is looked up ONCE, by name, from whatever material
-  // declares it — there is no hardcoded id and no hardcoded bit. A material
-  // becomes a heat source by carrying the tag, which is the same contract the
-  // grid's combustion rules already work by.
-  // The BIT one tag name owns, recovered from the compiled masks: the bits
-  // common to every material carrying the tag, minus every bit any material
-  // without it carries. Exact, and it needs no access to the TagRegistry —
-  // which is a load-time local and deliberately not published.
-  //
-  // Doing it as a plain OR would be wrong in a way that only shows up later:
-  // every material carrying `hot` also carries `organic` now that flesh can
-  // burn, so an OR-derived "hot" mask would quietly mean "hot or organic".
-  auto tagBit = [&](const char* name) {
-    uint32_t all = 0xFFFFFFFFu, none = 0;
-    bool any = false;
-    for (const auto& m : mats) {
-      bool has = false;
-      for (const auto& t : m.tags)
-        if (t == name) has = true;
-      if (has) { all &= m.gpu.tagMask; any = true; } else { none |= m.gpu.tagMask; }
-    }
-    return any ? (all & ~none) : 0u;
-  };
-  const uint32_t hotMask = tagBit("hot");
-  const uint32_t infectiousMask = tagBit("infectious");
-  const uint32_t dissolvableMask = tagBit("dissolvable");
+  // Tag bits are looked up ONCE, by name, from whatever material declares
+  // them — no hardcoded id and no hardcoded bit (BodyReactTagBit: exact, not
+  // an OR, because every `hot` material also carries `organic`). `hot` and
+  // `dissolvable` are read by the shared flag builder below.
+  const uint32_t infectiousMask = BodyReactTagBit(mats, "infectious");
 
-  for (const auto& m : mats) {
+  // The flag columns every body-reaction consumer gates on come from ONE
+  // builder, shared with DebrisSystem (sim/bodyreact.h). UNGATED self rules
+  // only count as alight (W1-F, 2026-09-24): a decay/emit behind a
+  // neighbour-count ramp cannot fire until something hot is next to the
+  // voxel, and then that neighbour's own front (or the world / sibling face
+  // seeding) queues it anyway. flesh_charred, flesh_cooked and cloth_charred
+  // own only such rules, and counting them kept every charred LIVE limb on
+  // the front, `alight`, and awake forever.
+  {
+    BodyReactFlags rf;
+    BuildBodyReactFlags(mats, reactions_, rf);
+    matSelfActive_ = std::move(rf.selfActive);
+    matHasPair_ = std::move(rf.hasPair);
+    matRewritesNbr_ = std::move(rf.rewritesNbr);
+    matHot_ = std::move(rf.hot);
+    matAttacksBody_ = std::move(rf.attacksBody);
+  }
+  for (size_t mi = 0; mi < mats.size(); mi++) {
+    const MaterialDef& m = mats[mi];
     densityOf_.push_back((float)m.gpu.density);
     // Collision class, not raw klass: passable vegetation reads as gas so a
     // mob's ground probe walks through reeds instead of standing on them or
@@ -2063,42 +2092,9 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     classOf_.push_back((m.gpu.flags & kMatFlagPassable) ? (uint32_t)CLASS_GAS
                                                         : m.gpu.klass);
     matGpu_.push_back(m.gpu);
-    uint8_t selfActive = 0, hasPair = 0, rewritesNbr = 0;
-    for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
-      const ReactionGpu& r = reactions_[m.gpu.reactOffset + ri];
-      const uint32_t kind = r.packed & 3u;
-      // UNGATED self rules only (W1-F, 2026-09-24): a decay/emit behind a
-      // neighbour-count ramp cannot fire until something hot is next to the
-      // voxel, and then that neighbour's own front (or the world / sibling
-      // face seeding) queues it anyway. flesh_charred, flesh_cooked and
-      // cloth_charred own only such rules, and counting them kept every
-      // charred LIVE limb on the front, `alight`, and awake forever -- the
-      // split debris.cpp already makes (matSelfScaled_), measured by the
-      // mob-burn gate's "charred limbs sleep" line.
-      if ((kind == kReactDecay || kind == kReactEmit) && !ReactScaleArmed(r))
-        selfActive = 1;
-      if (kind == kReactPair) {
-        hasPair = 1;
-        if (r.prodNbr != kProdKeep) rewritesNbr = 1;
-      }
-    }
-    matSelfActive_.push_back(selfActive);
-    matHasPair_.push_back(hasPair);
-    matRewritesNbr_.push_back(rewritesNbr);
-    matHot_.push_back((m.gpu.tagMask & hotMask) != 0 ? 1 : 0);
     matInfectious_.push_back((infectiousMask && (m.gpu.tagMask & infectiousMask)) ? 1 : 0);
-    // Could any of those rewrites land on a creature? See matAttacksBody_.
-    uint8_t attacks = 0;
-    for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
-      const ReactionGpu& r = reactions_[m.gpu.reactOffset + ri];
-      if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep) continue;
-      // A wildcard predicate matches everything, so it matches a body too.
-      if (r.nbrMat == kNbrAny && r.nbrTags == 0) { attacks = 1; break; }
-      if (r.nbrTags & dissolvableMask) { attacks = 1; break; }
-      if (r.nbrMat != kNbrAny && r.nbrMat < mats.size() &&
-          (mats[r.nbrMat].gpu.tagMask & dissolvableMask)) { attacks = 1; break; }
-    }
-    matAttacksBody_.push_back(attacks);
+    // Could any rewrite of this material land on a creature? matAttacksBody_.
+    const uint8_t attacks = matAttacksBody_[mi];
     // ---- the stain palette, both ways round, and the coat block ------------
     // The slot is what the RENDERER can afford (three bits in the voxel word
     // and three in the micro brick's stain lattice); the material is what
@@ -2119,13 +2115,28 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     // A CORROSIVE COAT: wearable (a stain slot) and its rules can rewrite body
     // matter. Both halves come from the table, so "acid" is named nowhere.
     // A HOT coat (lava) acts on its own too -- it burns what it sits on.
-    const bool coatHot = slot != 0 && matHot_.back() != 0;
-    matCoatHot_.push_back(coatHot ? 1 : 0);
+    // Both are coats with work to do and NOTHING else around (the coat rule's
+    // partner is the voxel itself), which is what this column is for: seed,
+    // dry, keep to the surface, stop at a worn shell.
+    const bool coatHot = slot != 0 && matHot_[mi] != 0;
     matCorrodes_.push_back(slot != 0 && (attacks || coatHot) ? 1 : 0);
     if (matCorrodes_.back()) corrosiveMats_.push_back((uint32_t)(matCorrodes_.size() - 1));
     coatDepth_.push_back(m.coatDepth);
     matBareBlood_.push_back(m.bareBlood);
     coatContact_.push_back(m.coatContact);
+  }
+  // The coat CLASS the one stain-precedence rule reads (phys/bodystain.h,
+  // sim/coatrule.h stainPrecedence): a washer (materials.json `washes`) and a
+  // corrosive coat (matCorrodes_). Published for every body-stain writer --
+  // debris and the cut soak included -- because precedence is a property of
+  // the two materials, not of who is doing the staining.
+  {
+    std::vector<uint8_t> cls(mats.size(), 0u);
+    for (size_t mi = 0; mi < mats.size(); mi++) {
+      if (mats[mi].gpu.stainPack & kStainPackWashesBit) cls[mi] |= kBodyCoatWashes;
+      if (matCorrodes_[mi]) cls[mi] |= kBodyCoatCorrodes;
+    }
+    SetBodyCoatClasses(std::move(cls));
   }
   // The micro brick's stain lattice is the one consumer that still speaks in
   // palette slots, so it is handed the table rather than the material list
@@ -2566,23 +2577,47 @@ bool MobSystem::ServiceRising(size_t ri) {
     gear.push_back(std::move(g));
   }
   // ---- AND ITS PACK --------------------------------------------------------
-  // Without this, turning would be a way to delete a purse.
-  std::vector<CarriedItem> carried = src->carried_;
+  // Without this, turning would be a way to delete a purse. Whole
+  // ItemInstances (W2-M): a flask in the pack rises still holding what it held.
+  std::vector<ItemInstance> carried = src->Carried();
   // ---- ...AND, FOR THE AVATAR, THE PLAYER'S OWN KIT ------------------------
   //
-  // The player's bag and hotbar are not on the player's body — they are in
-  // PlayerKit on the session, which this class cannot reach and must not
-  // (game/session.h: per-player state is not a process global). So the owner
-  // of the kit answers the question, at the one moment the answer is wanted.
-  // The callback also decides whether the player KEEPS what it hands back
-  // (`avatar.keepKitOnTurn`); see MobSystem::SetAvatarKitFn.
-  // A PlayerCorpse() is the same body after AdoptDeadAvatar moved it into
-  // mobs_: still the player's kit, and still only the callback can read it.
-  if ((avatar || src->playerCorpse_) && avatarKitFn_) {
-    std::vector<CarriedItem> kit;
-    avatarKitFn_(kit);
-    for (CarriedItem& c : kit)
-      if (!c.item.empty() && c.count > 0) carried.push_back(std::move(c));
+  // The player's bag and hotbar are the AVATAR's kit (Mob::kit_), and it stays
+  // on the avatar when the dead rig becomes a corpse (AdoptDeadAvatar moves it
+  // back), so a PlayerCorpse() reads it off the local avatar that owns it.
+  // Worn pieces are not in this list: they are on the rig and came across in
+  // the gear walk above.
+  //
+  // COPY OR MOVE, and that is the whole of `avatar.keepKitOnTurn`:
+  //   true  (default) — the zombie rises with a COPY and you respawn with
+  //                     everything. A duplication machine, deliberately the
+  //                     default while the feature is played with.
+  //   false           — bag, hotbar and equipment are EMPTIED on the way out:
+  //                     your kit walks away wearing your face. Equipment is
+  //                     cleared but NOT copied (the worn pieces are already on
+  //                     the rig); clearing it is what stops DressFromKit
+  //                     re-dressing the respawned body from the slot.
+  if (avatar || src->playerCorpse_) {
+    Mob* holder = avatar ? src : nullptr;
+    for (size_t a = 0; holder == nullptr && a < localAvatars_ &&
+                       a < avatars_.size();
+         a++)
+      if (avatars_[a] != nullptr && avatars_[a]->owner_ == src->owner_)
+        holder = avatars_[a];
+    if (holder != nullptr) {
+      const bool keep = CurrentTuning().avatar.keepKitOnTurn;
+      auto take = [&](ItemStack& s) {
+        if (s.Empty()) return;
+        carried.push_back(s);
+        if (!keep) s = ItemStack{};
+      };
+      for (ItemStack& s : holder->kit_.bag.slots) take(s);
+      for (ItemStack& s : holder->kit_.hotbar.slots) take(s);
+      if (!keep) {
+        holder->kit_.equip = Equipment{};
+        holder->KitWornStale();
+      }
+    }
   }
 
   // ---- THE REMAINS COME OUT OF THE WORLD FIRST -----------------------------
@@ -2752,8 +2787,8 @@ bool MobSystem::ServiceRising(size_t ri) {
   // Through AddCarried, so the merge and the cap are the ones every other pack
   // obeys.
   size_t packed = 0;
-  for (const CarriedItem& c : carried)
-    if (now.AddCarried(c.item, c.count, c.dye)) packed++;
+  for (const ItemInstance& c : carried)
+    if (now.AddCarried(c)) packed++;
   // ---- IT RISES FROM WHERE IT FELL, NOT FROM STANDING ----------------------
   //
   // Teleport each of the zombie's limbs to where the corpse's limb lay and
@@ -2798,10 +2833,10 @@ bool MobSystem::ServiceRising(size_t ri) {
 //     shared services, copied;
 //   * the vtable is Mob's: AvatarLayer() is false, OnDying and the avatar's
 //     own instance flag no longer apply;
-//   * the avatar LAYER: EnterDeadRagdoll put every dynamic limb through
-//     ReleaseToWorldWhenClear at death, but a worn shell (a follower) and a
-//     limb still on the avatar layer for any other reason did not go — they
-//     go here, so nothing of the corpse is left where the player's capsule
+//   * the avatar's ROLES: EnterDeadRagdoll made every dynamic limb RigDead at
+//     death, but a worn shell (a follower) and anything else still holding a
+//     living player's role did not go — they go here, so nothing of the
+//     corpse is left where the player's capsule
 //     cannot feel it once it has fallen clear;
 //   * render-only state the avatar drives per frame — the first-person hide
 //     mask and the render offset — is the LIVING player's, and a corpse that
@@ -2842,6 +2877,12 @@ uint64_t MobSystem::AdoptDeadAvatar(Mob& av) {
              (++playerCorpseSeq_ & ((1ull << 40) - 1));
   } while (FindMobById(cidNew) != nullptr);
   Mob corpse(std::move(av));   // the slice: Mob's move constructor only
+  // THE KIT STAYS WITH THE PLAYER. It is the avatar's (Mob::kit_), not the
+  // body's: the corpse keeps the shells it was wearing (its rig), and the
+  // player keeps what they carry and respawns dressed from it. A corpse
+  // holding the kit too would be the duplication Lootable() refuses.
+  av.kit_ = std::move(corpse.kit_);
+  corpse.kit_ = Kit{};
   corpse.id_ = cidNew;
   corpse.defIndex_ = di;
   corpse.def_ = &defs_[di];
@@ -2849,20 +2890,24 @@ uint64_t MobSystem::AdoptDeadAvatar(Mob& av) {
   corpse.hidden_.assign(corpse.limbs_.size(), 0);
   corpse.renderOffset_ = Vec3{0, 0, 0};
   corpse.WakeDead();
+  // Whatever still has a LIVING player's role (a worn shell: EnterDeadRagdoll
+  // leaves followers alone) is a corpse's now, and clears the capsule first.
   if (phys_)
-    for (const MobLimb& l : corpse.limbs_)
-      if (l.body && phys_->BodyObjectLayer(l.body) == 3 /*AVATAR*/)
-        phys_->ReleaseToWorldWhenClear(l.body);
+    for (const MobLimb& l : corpse.limbs_) {
+      if (!l.body) continue;
+      const Physics::BodyRole r = phys_->BodyRoleOf(l.body);
+      if (r == Physics::BodyRole::RigLive || r == Physics::BodyRole::WornShell)
+        phys_->SetBodyRole(l.body, Physics::BodyRole::RigDead);
+    }
   // The booking follows the body.
   for (PendingRise& r : rises_)
     if (r.mobId == avatarId) r.mobId = corpse.id_;
 
   // ---- THE HUSK THE AVATAR KEEPS -------------------------------------------
   // What ReleaseRigToDebris used to leave: the same part list with no bodies,
-  // partAlive zeroed, and the names, rig and kit bookkeeping the death screen
-  // and the equip loops still read (session.cpp compares WornItem/HeldItem
-  // against the kit every tick, dead or alive — an emptied worn_ would read as
-  // "take it off", an emptied heldItem_ as "equip the sword" on a dead husk).
+  // partAlive zeroed, and the names and rig bookkeeping the death screen still
+  // reads (WornItem/HeldItem: what the body died wearing). DressFromKit does
+  // nothing on a released rig, so the husk is never re-dressed or stripped.
   // Revive rebuilds all of it (Despawn + Spawn -> BuildRig).
   av.id_ = avatarId;
   av.alive_ = false;
@@ -3040,6 +3085,7 @@ void MobSystem::Reset(bool rewindIds) {
   // torn down (StainDeadFlesh).
   fleshCoat_.clear();
   fleshShellIdx_.clear();
+  looseBurn_.clear();
   // THE ID COUNTER IS DELIBERATELY NOT REWOUND BY DEFAULT.
   //
   // A mob id is not just a handle: it seeds the entity-scoped gore variance
@@ -3075,10 +3121,7 @@ void Mob::ReleaseRig() {
   for (MobLimb& l : limbs_) {
     // held pieces are DebrisSystem's now; only drop the kinematic hold
     if (l.holdBody) {
-      phys_->SetBodyKinematic(l.holdBody, false);
-      phys_->ClearCollisionGroup(l.holdBody);
-      GroupSeveredPiece(l.holdBody);
-      phys_->ReleaseToWorldWhenClear(l.holdBody);
+      EndSeveredHold(l.holdBody);
       l.holdBody = 0;
     }
     // A carved limb owns a copy-on-write brick; dropping the rig without
@@ -3123,36 +3166,145 @@ void Mob::MarkInstancesDirty() {
 // longer, which reads as a different material rather than a worse wound.
 // ---- THE PACK ---------------------------------------------------------------
 //
-// Three list operations and a roll. Nothing here touches the rig, physics or
-// the grid — a carried stack is a line of text on a creature, which is exactly
+// Three list operations over the kit's bag and a roll. Nothing here touches
+// the rig, physics or the grid — a carried stack is a line of text on a creature, which is exactly
 // why a loot table can be pure data while a suit of armour cannot (MobDef::
 // LootEntry, and the note on Mob::Carried()).
 
-bool Mob::AddCarried(const std::string& item, int count, uint32_t dye) {
-  if (item.empty() || count <= 0) return false;
-  // Merge by item AND DYE, the rule the bag and the hotbar already follow
-  // (item.h ItemStack::dye): a stack is one colour, so a red tunic must not
-  // fold into a stack of blue ones and quietly repaint them.
-  for (CarriedItem& c : carried_)
-    if (c.item == item && c.dye == dye) {
-      c.count += count;
-      return true;
-    }
-  if (carried_.size() >= kMaxCarried) return false;
-  carried_.push_back(CarriedItem{item, count, dye});
-  return true;
+bool Mob::AddCarried(const ItemInstance& item) {
+  if (item.Empty()) return false;
+  // THE PACK IS THE KIT'S BAG (W2-M), so this is the bag's own Add: merge by
+  // the one rule every slot obeys (ItemInstance::StacksWith — same item, same
+  // dye, both plain), else the first free slot, else refused. A red tunic
+  // does not fold into a stack of blue ones, and a filled flask stays alone.
+  return kit_.bag.Add(item) >= 0;
 }
 
 int Mob::TakeCarried(int index, int count) {
-  if (index < 0 || index >= (int)carried_.size()) return 0;
-  CarriedItem& c = carried_[(size_t)index];
+  const int slot = kit_.bag.NthUsed(index);
+  if (slot < 0) return 0;
+  ItemStack& c = kit_.bag.slots[slot];
   const int take = count < 0 ? c.count : std::min(count, c.count);
   if (take <= 0) return 0;
   c.count -= take;
-  if (c.count <= 0) carried_.erase(carried_.begin() + index);
+  if (c.count <= 0) c = ItemStack{};
   return take;
 }
 
+std::vector<ItemInstance> Mob::Carried() const {
+  std::vector<ItemInstance> out;
+  for (const ItemStack& s : kit_.bag.slots)
+    if (!s.Empty()) out.push_back(s);
+  return out;
+}
+
+// ---- THE KIT (see the note in mob.h) -----------------------------------------
+//
+// The equipment in kit_ is the truth of what this creature wears; worn_ and
+// its shells realise it. Everything below is the seam between the two, and it
+// is the whole of what session.cpp's per-tick wear loop and its latches used
+// to do from outside.
+
+bool Mob::KitFlushWorn(int equipSlot) {
+  if (equipSlot < 0 || equipSlot >= kEquipSlotCount ||
+      !EquipSlotIsWorn(equipSlot))
+    return false;
+  ItemStack& st = kit_.equip.slots[equipSlot];
+  // Only when the rig is wearing THIS stack's item: a slot whose piece was
+  // refused, is not dressed yet, or belongs to a released husk has no shells
+  // to read, and the stack's own damage is already the truth.
+  if (st.Empty() || rigReleased_ || WornItem(equipSlot) != st.name)
+    return false;
+  WornDamage d;
+  if (!CaptureWorn(equipSlot, d)) return false;
+  // An untouched piece captures as an empty blob (CaptureWorn writes only
+  // what differs); normalising it keeps the stack PLAIN, so it still stacks
+  // with its pristine twins when it goes back in the bag.
+  if (d.Empty()) d.Clear();
+  st.damage = std::move(d);
+  return true;
+}
+
+void Mob::KitFlushWorn() {
+  for (int s = 0; s < kEquipSlotCount; s++) KitFlushWorn(s);
+}
+
+void Mob::KitWornStale(int equipSlot) {
+  for (int s = 0; s < kEquipSlotCount; s++)
+    if (equipSlot < 0 || s == equipSlot) kitDressed_[s].stale = true;
+}
+
+MoveResult Mob::KitMove(const KitRef& from, const KitRef& to,
+                        const ItemLibrary& lib) {
+  // Both ends first: whichever stack is leaving a worn slot takes the holes it
+  // gained while on the body. Flushing a slot the move then refuses is
+  // harmless — it only brings the stack up to date.
+  if (from.space == KitSpace::Equip) KitFlushWorn(from.index);
+  if (to.space == KitSpace::Equip) KitFlushWorn(to.index);
+  const MoveResult r = kit_.Move(from, to, lib);
+  if (r == MoveResult::Ok) {
+    // Two identical tunics swapped are two different objects: re-dress even
+    // though the name and the dye on the rig did not change.
+    if (from.space == KitSpace::Equip) KitWornStale(from.index);
+    if (to.space == KitSpace::Equip) KitWornStale(to.index);
+  }
+  return r;
+}
+
+ItemStack Mob::KitTake(const KitRef& r, int count) {
+  ItemStack* st = kit_.Resolve(r);
+  if (st == nullptr || st->Empty()) return ItemStack{};
+  if (r.space == KitSpace::Equip) KitFlushWorn(r.index);
+  const int take = count < 0 ? st->count : std::min(count, st->count);
+  if (take <= 0) return ItemStack{};
+  ItemStack out = *st;
+  out.count = take;
+  st->count -= take;
+  if (st->count <= 0) *st = ItemStack{};
+  if (r.space == KitSpace::Equip) KitWornStale(r.index);
+  return out;
+}
+
+int Mob::DressFromKit(const ItemLibrary& lib) {
+  // Only a living body with a rig of its own is dressed. A dead one keeps
+  // what it died in (it is a corpse's loot now, read off the shells), and a
+  // released husk has no rig to hang anything on.
+  if (!alive_ || rigReleased_ || limbs_.empty()) return 0;
+  int refused = 0;
+  for (int s = 0; s < kEquipSlotCount; s++) {
+    if (!EquipSlotIsWorn(s)) continue;
+    KitDressMemo& memo = kitDressed_[s];
+    const ItemStack& st = kit_.equip.slots[s];
+    const ItemDef* want = lib.Of(st);
+    const std::string wantName = want ? want->name : std::string();
+    const uint32_t wantDye = want ? st.dye : 0u;
+    const std::string& onRig = WornItem(s);
+    if (!memo.stale) {
+      // On the body already, as asked: nothing to do.
+      if (onRig == wantName && memo.name == wantName && memo.dye == wantDye)
+        continue;
+      // Asked for exactly this before and it would not go on (no limb to hang
+      // it from): nothing has changed, so do not ask thirty times a second.
+      if (memo.name == wantName && memo.dye == wantDye && onRig.empty() &&
+          !wantName.empty())
+        continue;
+      // THE SAME PIECE RECOLOURED IN PLACE (a dye applied to what you are
+      // wearing): its shells carry what it has been through, so they go back
+      // into the stack before it is rebuilt in the new colour.
+      if (!onRig.empty() && onRig == wantName) KitFlushWorn(s);
+    }
+    memo.stale = false;
+    memo.name = wantName;
+    memo.dye = wantDye;
+    if (wantName.empty()) {
+      UnwearItem(s);
+    } else if (!WearItem(want, s, st.damage.Empty() ? nullptr : &st.damage,
+                         wantDye)) {
+      refused++;
+    }
+  }
+  return refused;
+}
 // ONE CREATURE'S PURSE, DRAWN FROM ITS IDENTITY.
 //
 // Keyed on the mob id and the row index alone — no tick, no counter, no
@@ -3191,7 +3343,7 @@ void Mob::RollLoot() {
                   def_->name.c_str(), e.item.c_str());
       continue;
     }
-    AddCarried(e.item, n, e.dye);
+    AddCarried(ItemInstance{e.item, n, e.dye});
   }
 }
 
@@ -3594,9 +3746,11 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   heldPart_.clear();
   // Same rule as the weapon, and for the same reason: a respawn must not
   // inherit the last life's coat. The armour itself is not lost — it lives in
-  // the wearer's Equipment, which is a different owner — but the SHELLS are
-  // rig state and belong to this rig only.
+  // the wearer's Kit (kit_), which a rig rebuild does not touch — but the
+  // SHELLS are rig state and belong to this rig only, so every equipment slot
+  // is offered to the new rig again (DressFromKit).
   worn_.clear();
+  for (KitDressMemo& m : kitDressed_) m = KitDressMemo{};
   baseLimbs_ = (int)def.limbs.size();
   limbs_.assign(def.limbs.size(), MobLimb{});
   // The joint-twin links are facts about THESE lattices (Mob::SyncJointTwins).
@@ -3653,7 +3807,10 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
     phys_->SetBodyKinematic(limb.body, true);
     // The avatar's limbs live inside the player's capsule proxy and must not
     // push it (avatar.cpp Spawn); an NPC's stay on the normal dynamic layer.
-    if (AvatarLayer()) phys_->SetBodyAvatarLayer(limb.body, true);
+    // Both are the same statement: a live limb, owned by whoever owns it. (Set
+    // outright rather than derived: a rig is always BUILT live, and the paths
+    // that load a corpse enter the dead state after this, EnterLoadedDead.)
+    phys_->SetBodyRole(limb.body, Physics::BodyRole::RigLive, CollisionOwner());
     limb.xf.pos = o;
     limb.xf.quat[3] = 1;
   }
@@ -3680,11 +3837,7 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   }
   // limbs of one creature never collide with each other (they'd fight the
   // joints and jitter forever); different creatures and debris still collide
-  {
-    std::vector<uint64_t> handles;
-    for (const MobLimb& l : limbs_) handles.push_back(l.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
+  RegroupRig();
 
   // Root's "anchor" is its own centre (the yaw pivot) — again taken from the
   // rig, which already computed exactly that at load.
@@ -7436,6 +7589,14 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // still runs — a body knocked flat goes on bleeding from where it lies.
     if (mob.alive_ && mob.ragdoll_ == Mob::RagdollPhase::Limp) {
       mob.TickRagdollLimp(world, dt);
+      // ---- ...AND A LIMP BODY HITS THE GROUND (W2-H) ----------------------
+      // The arrest TickRagdollLimp just measured is billed, exactly as the
+      // avatar's limp branch bills it (PlayerAvatar::Update): one function,
+      // one set of thresholds (player.fallDamageSpeed / fallSplatSpeed), every
+      // creature. A blasted NPC that lands hard is hurt; one that lands at
+      // splat speed comes apart. Centred at the pelvis, where the body is.
+      mob.ApplyFallDamage(mob.TakeRagdollImpact(), mob.RootWorldPos(), tick,
+                          world, ops, spawns);
     } else if (mob.alive_ && mob.ragdoll_ == Mob::RagdollPhase::GetUp) {
       // ---- GETTING UP: the pose pipeline runs, the driver does not ----
       // The rig is kinematic again and animates a standing pose at the spot
@@ -7580,16 +7741,9 @@ void Mob::TickSeveredHolds(float dt) {
       limb.holdBody = 0;
       continue;
     }
-    phys_->SetBodyKinematic(limb.holdBody, false);
-    // A severed part must collide with the body it came off again: the
-    // rig's GroupFilterTable suppressed those contacts forever otherwise.
-    phys_->ClearCollisionGroup(limb.holdBody);
-    // ...but NOT with the gear riding it, nor with the rest of the part it came
-    // off as (GroupSeveredPiece).
-    GroupSeveredPiece(limb.holdBody);
-    // It also stops being part of ANY creature — but it may not touch the
-    // player until it has fallen clear of them (see DetachLimb).
-    phys_->ReleaseToWorldWhenClear(limb.holdBody);
+    // Dynamic, regrouped, and loose — clear of the player first (see
+    // DetachLimb). One transition, shared with every other end of a hold.
+    EndSeveredHold(limb.holdBody);
     limb.holdBody = 0;
   }
   // HUSKS OF GEAR. A body limb that is gone keeps its slot forever (the rig's
@@ -7644,6 +7798,68 @@ void Mob::GroupSeveredPiece(uint64_t handle) {
   phys_->DisableCollisionsAmong(piece);
 }
 
+// ---- COLLISION ROLES (W2-N; the table is Physics::BodyRole) ----------------
+
+void Mob::EndSeveredHold(uint64_t handle) {
+  if (!phys_ || handle == 0) return;
+  phys_->SetBodyKinematic(handle, false);
+  // A severed part must collide with the body it came off again: the rig's
+  // GroupFilterTable suppressed those contacts forever otherwise...
+  phys_->ClearCollisionGroup(handle);
+  // ...but NOT with the gear riding it, nor with the rest of the part it came
+  // off as (GroupSeveredPiece).
+  GroupSeveredPiece(handle);
+  // It stops being part of ANY creature — but it may not touch the player
+  // until it has fallen clear of them: a loose role clears first.
+  phys_->SetBodyRole(handle, Physics::BodyRole::Debris);
+}
+
+uint64_t Mob::CollisionOwner() const {
+  if (!AvatarLayer()) return Physics::kNoOwner;
+  return collisionOwner_ != 0 ? collisionOwner_ : Physics::kAnyPlayer;
+}
+
+void Mob::SetCollisionOwner(uint64_t proxy) {
+  collisionOwner_ = proxy;
+  // A living avatar's attached slots take the owner now; everything else
+  // (a dead body's limbs, a piece in its hold) is not the player's any more.
+  if (!phys_ || !alive_ || !AvatarLayer()) return;
+  for (size_t i = 0; i < limbs_.size(); i++) ApplyLimbRole(i);
+}
+
+Physics::BodyRole Mob::LimbRole(size_t i) const {
+  using R = Physics::BodyRole;
+  if (i >= limbs_.size()) return R::Debris;
+  const MobLimb& l = limbs_[i];
+  if (l.holdSeconds > 0) return R::SeveredHold;
+  if (!alive_) return R::RigDead;
+  // A GARMENT IS A FOLLOWER in every phase a live creature has (wornHost):
+  // kinematic, posed by DriveWornShells, never handed to the solver.
+  if (l.wornHost >= 0) return R::WornShell;
+  const bool limp = ragdoll_ == RagdollPhase::Limp;
+  // A weapon is CARRIED only while a living hand is posing it; under a
+  // ragdoll it is solved for like every other limb and needs the floor.
+  if ((int)i == heldSlot_ && !limp) return R::HeldProp;
+  // An NPC's limp limbs are solver-owned bodies that may be lying inside the
+  // player (a blast at sword's reach): loose, so they clear first. The
+  // avatar's own stay its own — exempt from its capsule, limp or not.
+  if (limp && !AvatarLayer()) return R::RigLimp;
+  return R::RigLive;
+}
+
+void Mob::ApplyLimbRole(size_t i) {
+  if (!phys_ || i >= limbs_.size() || limbs_[i].body == 0) return;
+  phys_->SetBodyRole(limbs_[i].body, LimbRole(i), CollisionOwner());
+}
+
+void Mob::RegroupRig() {
+  if (!phys_) return;
+  std::vector<uint64_t> handles;
+  for (const MobLimb& l : limbs_)
+    if (l.body) handles.push_back(l.body);
+  phys_->DisableCollisionsAmong(handles);
+}
+
 // ---- gear leaving the body by force ----------------------------------------
 
 int Mob::WornPieceOfSlot(int slot) const {
@@ -7687,8 +7903,8 @@ int Mob::IdentityShellOf(int pieceIndex) const {
   return bestSlot;
 }
 
-std::string Mob::ShedGearBeforeDetach(int limbIndex) {
-  std::string name;
+ItemInstance Mob::ShedGearBeforeDetach(int limbIndex) {
+  ItemInstance shed;
   auto report = [&](LostGear lg) {
     if (lostGear_.size() >= kMaxLostGear)   // bounded; nobody drains an NPC's
       lostGear_.erase(lostGear_.begin());
@@ -7704,21 +7920,23 @@ std::string Mob::ShedGearBeforeDetach(int limbIndex) {
     LostGear lg;
     lg.item = heldItem_;
     lg.held = true;
-    name = heldItem_;
+    shed.name = heldItem_;
+    if (limbIndex >= 0 && limbIndex < (int)limbs_.size())
+      shed.dye = limbs_[limbIndex].dye;
     report(std::move(lg));
     heldSlot_ = -1;
     heldPartIndex_ = -1;
     heldItem_.clear();
     heldPart_.clear();
-    return name;
+    return shed;
   }
-  if (!IsWornSlot(limbIndex)) return name;
+  if (!IsWornSlot(limbIndex)) return shed;
   const int pi = WornPieceOfSlot(limbIndex);
-  if (pi < 0) return name;
+  if (pi < 0) return shed;
   // A SLEEVE CUT OFF IS A RAG, and the piece goes on being worn without it —
   // the strap-cut behaviour armour shipped with. Only the identity shell
   // takes the piece with it.
-  if (IdentityShellOf(pi) != limbIndex) return name;
+  if (IdentityShellOf(pi) != limbIndex) return shed;
   LostGear lg;
   lg.equipSlot = worn_[pi].equipSlot;
   lg.item = worn_[pi].item;
@@ -7727,7 +7945,21 @@ std::string Mob::ShedGearBeforeDetach(int limbIndex) {
   if (limbIndex >= 0 && limbIndex < (int)limbs_.size())
     lg.dye = limbs_[limbIndex].dye;
   CaptureWorn(lg.equipSlot, lg.damage);
-  name = lg.item;
+  if (lg.damage.Empty()) lg.damage.Clear();
+  // The item the body on the ground IS: its name, its colour and every hole
+  // it carried off the wearer (W2-M; the ground registry keeps it whole).
+  shed.name = lg.item;
+  shed.dye = lg.dye;
+  shed.damage = lg.damage;
+  // ...AND IT LEAVES THE KIT. The equipment slot that dressed it is emptied
+  // (the piece is on the ground now, as the item, with these holes), so
+  // DressFromKit does not put a second one on the body the plate has just
+  // fallen off.
+  if (lg.equipSlot >= 0 && lg.equipSlot < kEquipSlotCount &&
+      kit_.equip.slots[lg.equipSlot].name == lg.item) {
+    kit_.equip.slots[lg.equipSlot] = ItemStack{};
+    kitDressed_[lg.equipSlot] = KitDressMemo{};
+  }
   // The other shells are sewn to this one: they fall as rags. Collected
   // first and the piece erased BEFORE they detach, so the recursion below
   // finds no piece for them and reports nothing twice.
@@ -7738,7 +7970,7 @@ std::string Mob::ShedGearBeforeDetach(int limbIndex) {
   worn_.erase(worn_.begin() + pi);
   report(std::move(lg));
   for (int s : others) DetachLimb(s, /*adopt=*/true);
-  return name;
+  return shed;
 }
 
 void Mob::RegisterTerrainAnchor() {
@@ -7967,38 +8199,29 @@ void Mob::StartRagdoll(float minSeconds, const char* why) {
     phys_->GetTransform(limb.body, limb.xf);
     phys_->SetBodyKinematic(limb.body, false);
     phys_->ActivateBody(limb.body);
-    // A WEAPON THAT IS NO LONGER BEING CARRIED IS AN OBJECT AGAIN. The held
-    // slot is exempt from contacts while a living hand is posing it
-    // (Layers::PROP, EquipItem) — and the line above has just handed it to the
-    // solver, so from here it is solved for like every other limb and needs
-    // the floor to exist. Left on PROP it would fall through the world,
-    // dragging the wrist it is jointed to after it.
-    //
-    // The NPC branch below would clear it as a side effect (a release sets the
-    // layer outright); this is said explicitly because the AVATAR branch
-    // takes no exemption and would otherwise drop the player's own sword out
-    // of the map every time they were knocked down.
-    if ((int)i == heldSlot_) {
-      phys_->SetBodyPropLayer(limb.body, false);
-      // ...and it rejoins the layer the rest of THIS creature's limbs are on,
-      // which for the avatar is the player-exempt one. Clearing PROP on its
-      // own drops to the plain MOVING layer, and the player's own guard going
-      // limp inside the player's own capsule is precisely the unresolvable
-      // overlap Die() and DetachLimb both document. An NPC's falls through to
-      // the release below, exactly as its limbs do.
-      if (AvatarLayer()) phys_->SetBodyAvatarLayer(limb.body, true);
-    }
-    // An NPC's limbs live on the plain MOVING layer. Flipping them dynamic
-    // inside the player's capsule — a blast at sword's reach — is the same
-    // unresolvable overlap Die() documents, and the answer is the same: off
-    // the player's contact layer until the piece has fallen clear, then an
-    // ordinary body that can be stood on and bumped into. The avatar's own
-    // limbs are exempt for good already (AvatarLayer).
-    if (!AvatarLayer()) phys_->ReleaseToWorldWhenClear(limb.body);
     flipped++;
   }
   if (flipped == 0) return;
   ragdoll_ = RagdollPhase::Limp;
+  // THE ROLES FOLLOW THE PHASE (LimbRole), set once the phase is Limp:
+  //   * a WEAPON THAT IS NO LONGER BEING CARRIED IS AN OBJECT AGAIN — the
+  //     held slot was a HeldProp while a living hand posed it, and has just
+  //     been handed to the solver, so it needs the floor to exist (left on
+  //     PROP it fell through the world, dragging the wrist after it);
+  //   * an NPC's limp limbs are RigLimp, a LOOSE role: flipping them dynamic
+  //     inside the player's capsule — a blast at sword's reach — is the same
+  //     unresolvable overlap Die() documents, so they clear the player first,
+  //     then are ordinary bodies that can be stood on and bumped into;
+  //   * the avatar's own stay RigLive, exempt from its own capsule for good —
+  //     its sword included, or the player's own guard going limp inside the
+  //     player's own capsule would shove them.
+  // Only the slots the loop above flipped: a severed piece mid-hold and a
+  // worn shell were skipped there and keep their roles.
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    const MobLimb& limb = limbs_[i];
+    if (!limb.body || limb.holdSeconds > 0 || limb.wornHost >= 0) continue;
+    ApplyLimbRole(i);
+  }
   ragdollT_ = 0.0f;
   ragdollMinT_ = std::max(minSeconds, 0.0f);
   ragdollStillT_ = 0.0f;
@@ -8457,15 +8680,22 @@ void Mob::BeginGetUp(World& world) {
     phys_->GetTransform(limb.body, limb.xf);
     getUpFrom_[i] = limb.xf;
     phys_->SetBodyKinematic(limb.body, true);
-    // BACK IN THE FIST, BACK OFF THE SOLVER. The mirror of StartRagdoll: the
-    // hand is posing this weapon again from the next tick, so its contacts go
-    // back to being something that can only move other people. Without this a
-    // creature that had been knocked down once would be swinging a blade that
-    // shoves the player, and the bug would only ever reproduce after a
-    // ragdoll.
-    if ((int)i == heldSlot_) phys_->SetBodyPropLayer(limb.body, true);
   }
   ragdoll_ = RagdollPhase::GetUp;
+  // BACK IN THE FIST, BACK OFF THE SOLVER. The mirror of StartRagdoll: the
+  // hand is posing this weapon again from the next tick, so it is a HeldProp
+  // again, whose contacts can only move other people. Without this a creature
+  // that had been knocked down once would be swinging a blade that shoves the
+  // player, and the bug would only ever reproduce after a ragdoll. The other
+  // limbs are live again (RigLive); one still clearing the player it fell in
+  // keeps clearing, and settles when clear (Physics::SetBodyRole) — and the
+  // sword can no longer be knocked back onto MOVING by that pending release,
+  // which it could while the release set MOVING unconditionally.
+  for (size_t i = 0; alive_ && i < limbs_.size(); i++) {
+    const MobLimb& limb = limbs_[i];
+    if (!limb.body || limb.holdSeconds > 0 || limb.wornHost >= 0) continue;
+    ApplyLimbRole(i);
+  }
   ragdollT_ = 0.0f;
   std::printf("mob %llu ragdoll: get up at (%.1f, %.1f, %.1f) heading %.2f\n",
               (unsigned long long)id_, origin_.x, origin_.y, origin_.z, heading_);
@@ -8834,6 +9064,233 @@ float Mob::TotalHp() const {
     if (limbs_[i].body && limbs_[i].hp > 0.0f && !IsBloodless(i))
       sum += limbs_[i].hp;
   return sum;
+}
+
+// ---- hp spent without a wound (W2-H) ----------------------------------------
+
+float Mob::SpendableHp() const {
+  if (!alive_) return 0.0f;
+  float sum = 0.0f;
+  for (size_t i = 0; i < limbs_.size(); i++)
+    if (LimbAlive((int)i) && limbs_[i].hp > 0.0f &&
+        !(i < limbDefs_.size() && limbDefs_[i].bloodless))
+      sum += limbs_[i].hp;
+  return sum;
+}
+
+bool Mob::SpendHp(float amount, const DamageCtx& ctx) {
+  if (!alive_ || !def_ || amount <= 0.0f) return alive_;
+  // Whole hp, the way PlayerAvatar::SpendHealth always compared (its bar is
+  // an integer): a bill of the whole body or more is a death, not a spread.
+  const float total = std::floor(SpendableHp());
+  if (total <= 0.0f || amount >= total) {
+    if (ctx.cause == DamageCause::Fall) deathCause_ = "fall";
+    Die();
+    return false;
+  }
+  // In proportion to what each slot still has, so no slot is picked to be
+  // ruined (an overcast that drained the first limb to zero read as a bug).
+  // COLLECTED FIRST: Damage() may kill, and a death reshapes nothing but ends
+  // the walk; handles, not indices, because a sever would reshape `limbs_`.
+  //
+  // THROUGH Mob::Damage, with the caller's cause, and that is the point of
+  // routing it here (W2-H): this used to subtract hp and Sever() any slot
+  // that reached zero, which is fire's old rule and contradicts the table
+  // every other damage path reads -- hp is a statement about DEATH, so a
+  // vital limb at zero dies in place and an arm at zero stays on
+  // (game/severpolicy.h, Mob::HpZeroSevers). The hit point is the slot's own
+  // centre, which is where the flash and the drip are placed.
+  const float frac = amount / total;
+  struct Share {
+    uint64_t body;
+    float hp;
+    Vec3 at;
+  };
+  std::vector<Share> shares;
+  for (size_t i = 0; i < limbs_.size(); i++) {
+    if (!LimbAlive((int)i) || limbs_[i].hp <= 0.0f ||
+        (i < limbDefs_.size() && limbDefs_[i].bloodless))
+      continue;
+    const MobLimb& L = limbs_[i];
+    const Quat q{L.xf.quat[0], L.xf.quat[1], L.xf.quat[2], L.xf.quat[3]};
+    const float inv = 1.0f / (float)std::max(1u, PhysScaleOf(L));
+    const Vec3 half{(float)L.size.x * 0.5f * inv, (float)L.size.y * 0.5f * inv,
+                    (float)L.size.z * 0.5f * inv};
+    shares.push_back({L.body, L.hp * frac, L.xf.pos + Rotate(q, half)});
+  }
+  for (const Share& s : shares) {
+    if (!alive_) break;
+    Damage(s.body, s.hp, s.at, /*impactSpeed=*/0.0f, ctx);
+  }
+  return alive_;
+}
+
+bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
+                          uint32_t tick, World& world,
+                          std::vector<BrushOp>& ops,
+                          std::vector<ParticleSpawn>& spawns) {
+  // THE BODY'S, NOT THE PLAYER'S (W2-H). This was PlayerAvatar::ApplyFallDamage
+  // until 2026-09-24, and Mob measured the arrest (TakeRagdollImpact) for every
+  // creature while billing it for one: an NPC blown off a cliff landed at 30
+  // m/s and got up. Now MobSystem::PreTick bills a limp NPC's landing through
+  // this same function, and the avatar's two producers (the controller's sweep
+  // and its own limp arrest) still call it as before.
+  //
+  // THE AUTHOR SCOPE (sim/oprecord.h). Everything pushed into `ops` here is
+  // this body coming apart; the record attributes that range to the avatar
+  // producer, which is what it was named for (an NPC's landing is attributed
+  // the same way -- the producer names the MECHANISM, and it is this one).
+  // CPU-side only: it reaches no shader and cannot move the world hash.
+  sandvox::opstream::BrushAuthorScope author(
+      ops, sandvox::opstream::Producer::Avatar, 0);
+  if (!alive_ || !def_ || limbs_.empty()) return false;
+  const float impactVox = impactDeltaV.len();
+  if (impactVox < 1e-3f) return false;
+  const auto& pt = CurrentTuning().player;
+  const float impactMs = impactVox * kVoxelMeters;
+  if (impactMs < pt.fallDamageSpeed) return false;
+
+  const MobDef& def = *def_;
+  const auto& gore = CurrentTuning().gore;
+  const Vec3 center = centerWorldVoxel;
+
+  const float excess = impactMs - pt.fallDamageSpeed;
+  const float damage = excess * excess * pt.fallDamageScale;
+  const float bar = std::floor(SpendableHp());
+
+  const bool lethal = impactMs >= pt.fallSplatSpeed || damage >= bar;
+  fallsBilled_++;
+  fallHpBilled_ += std::min(damage, bar);
+  // ONE LINE PER HIT, because there are two producers for the avatar and
+  // they can disagree: the controller's sweep (Player::impactDeltaV) and the
+  // ragdoll's arrest (Mob::TakeRagdollImpact). "The fall killed me" and "four
+  // folds of the landing each billed" look identical in the health bar and
+  // nowhere else.
+  std::printf("%s %llu impact: %.1f m/s (%s, %.0f of %d hp) at (%.1f, %.1f, "
+              "%.1f)%s\n",
+              def.name.c_str(), (unsigned long long)id_, impactMs,
+              Ragdolled() ? "limp" : "sweep", damage, (int)bar, center.x,
+              center.y, center.z, lethal ? " LETHAL" : "");
+
+  if (lethal) {
+    // --- splat: carve voxels out of the body, sever some limbs, die ---
+    //
+    // The carve blows chunks out of every live limb as a blast would, but with
+    // the Fall cause and no power: a landing is not an explosion and no plate
+    // stops it (game/shellresponse.h, the Fall row).
+    const float carveRadius =
+        pt.fallSplatCarveBase + impactMs * pt.fallSplatCarvePerMs;
+    CarveRadialAll(center, carveRadius, world, spawns, /*power=*/0.0f,
+                   DamageCtx(DamageCause::Fall));
+
+    // Sever roughly half the remaining severable limbs at random.
+    std::vector<int> severable;
+    for (size_t i = 0; i < limbs_.size(); i++) {
+      if (!LimbAlive((int)i) || !limbs_[i].body) continue;
+      const MobLimbDef& ld = limbDefs_[i];
+      if ((int)i == def.rootLimb || ld.vital || !ld.severable) continue;
+      severable.push_back((int)i);
+    }
+    for (size_t j = 0; j < severable.size(); j++) {
+      uint32_t h = Hash3((uint32_t)id_ ^ 0xFA11u, tick, (uint32_t)j);
+      if ((h & 1) == 0) continue;
+      int i = severable[j];
+      if (LimbAlive(i)) {
+        Sever(i, DamageCtx(DamageCause::Fall));
+        if (i < (int)limbs_.size() && limbs_[i].holdBody)
+          limbs_[i].holdSeconds = 0.0f;
+      }
+    }
+    if (alive_) deathCause_ = "fall";
+    Die();
+
+    // Radial impulse scatters debris outward from the impact -- and, like an
+    // explosion's, skips every living creature's limbs (MobSystem::
+    // AppendLiveLimbBodies): an impulse / 0.3 kg hand is a launch, and the
+    // joints drag the rest of a rig after it. This body's own limbs are debris
+    // or a dead rig now and are shoved like any debris.
+    if (phys_ && pt.fallSplatImpulseRadius > 0.0f) {
+      std::vector<uint64_t> skip;
+      if (sys_ != nullptr) sys_->AppendLiveLimbBodies(skip);
+      // The splatting body itself is dead by now; its own parts are what the
+      // shove is for, so they come back OUT of the skip list.
+      std::vector<uint64_t> own;
+      for (const MobLimb& l : limbs_)
+        if (l.body) own.push_back(l.body);
+      std::sort(own.begin(), own.end());
+      skip.erase(std::remove_if(skip.begin(), skip.end(),
+                                [&](uint64_t h) {
+                                  return std::binary_search(own.begin(),
+                                                            own.end(), h);
+                                }),
+                 skip.end());
+      std::sort(skip.begin(), skip.end());
+      phys_->ApplyRadialImpulse(center, pt.fallSplatImpulseRadius,
+                                impactMs * pt.fallSplatImpulsePerMs, &skip);
+    }
+
+    // Blood micro-spray burst.
+    if (def.bleedMat != 0) {
+      const int droplets = std::max(0, pt.fallSplatDroplets);
+      for (int k = 0; k < droplets; k++) {
+        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        uint32_t h = Hash3((uint32_t)id_ ^ 0xFA11u, tick, (uint32_t)(k + 100));
+        Vec3 dir{SignedUnit(h),
+                 0.3f + 0.7f * (float)(Pcg(h ^ 0xA001u) & 0xFFFFu) / 65535.0f,
+                 SignedUnit(Pcg(h ^ 0xB002u))};
+        float len = dir.len();
+        if (len > 1e-4f) dir = dir * (1.0f / len);
+        float sp = gore.severSpraySpeed *
+                   (0.5f + 1.0f * (float)(Pcg(h ^ 0xC003u) & 0xFFFFu) / 65535.0f);
+        int life = std::clamp(gore.microLifeTicks, 1, 255);
+        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, true,
+                                     life, gore.microScale));
+      }
+      // Whole-voxel blood thrown outward — pools and persists.
+      const int blood = std::max(0, pt.fallSplatBloodVoxels);
+      for (int k = 0; k < blood; k++) {
+        if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
+        uint32_t h = Hash3((uint32_t)id_ ^ 0xB10Du, tick, (uint32_t)(k + 500));
+        Vec3 dir{SignedUnit(h),
+                 0.2f + 0.4f * (float)(Pcg(h ^ 0xD004u) & 0xFFFFu) / 65535.0f,
+                 SignedUnit(Pcg(h ^ 0xE005u))};
+        float len = dir.len();
+        if (len > 1e-4f) dir = dir * (1.0f / len);
+        float sp = gore.severVoxelSpeed *
+                   (0.6f + 0.8f * (float)(Pcg(h ^ 0xF006u) & 0xFFFFu) / 65535.0f);
+        spawns.push_back(MakeDroplet(center, dir * sp, def.bleedMat, false,
+                                     0, 0));
+      }
+      // Blood stain at the impact site. Budget charged BEFORE emission
+      // (CLAUDE.md): the brush stream is capped at kMaxOpsPerTick and
+      // SubmitTick refuses the overflow, so a producer that pushes past the
+      // cap is authoring an op that silently never happens.
+      if (ops.size() < kMaxOpsPerTick)
+        ops.push_back({(int)std::floor(center.x), (int)std::floor(center.y),
+                       (int)std::floor(center.z), 2, def.bleedMat, 0, 0, 0});
+    }
+    return true;
+  }
+
+  // --- sub-lethal impact: proportional damage, bleed on legs ---
+  if (!SpendHp((float)std::lround(damage), DamageCtx(DamageCause::Fall)))
+    return true;
+  if (def.bleedMat != 0) {
+    for (size_t i = 0; i < limbs_.size(); i++) {
+      if (!LimbAlive((int)i) || !limbs_[i].body) continue;
+      // WHICH LIMBS TOOK THE LANDING is the limb's ROLE -- the tag gait and
+      // the IK chains already read ("leg" / "foot") -- not a substring of
+      // its name, which a sidecar is free to call anything.
+      const MobLimbDef& ld = limbDefs_[i];
+      if (ld.tag != "leg" && ld.tag != "foot") continue;
+      limbs_[i].bleedBudget = AddBleedBudget(
+          limbs_[i].bleedBudget, damage * pt.fallLegBleed * def.bleedPerDamage);
+      Quat q{limbs_[i].xf.quat[0], limbs_[i].xf.quat[1],
+             limbs_[i].xf.quat[2], limbs_[i].xf.quat[3]};
+      limbs_[i].woundLocal = RotateInv(q, center - limbs_[i].xf.pos);
+    }
+  }
+  return true;
 }
 
 bool Mob::DrainBlood(float voxels) {
@@ -9487,13 +9944,151 @@ void MobSystem::PushBlockEvent(const BlockEvent& ev, const MeleeTuning& t) {
 }
 
 bool MobSystem::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
-                       float impactSpeed) {
+                       float impactSpeed, const DamageCtx& ctx) {
   for (Mob& mob : mobs_)
-    if (mob.Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed)) return true;
+    if (mob.Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed, ctx))
+      return true;
   for (Mob* av : avatars_)
-    if (av->Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed)) return true;
+    if (av->Damage(bodyHandle, amount, hitWorldVoxel, impactSpeed, ctx))
+      return true;
   return false;
 }
+
+bool MobSystem::LaserHit(uint64_t bodyHandle, Vec3 hitWorldVoxel,
+                         float& boreOut) {
+  const auto& tools = CurrentTuning().tools;
+  float hp = tools.laserDamage;
+  float bore = (float)tools.laserCarveRadius;
+  const DamageCtx beam(DamageCause::Beam);
+  int li = -1;
+  Mob* owner = FindOwner(bodyHandle, &li);
+  if (owner == nullptr || li < 0) return false;
+  // A SHELL IN THE BEAM answers through the one shell table like every other
+  // blow. The Beam row is the identity the laser always had (the plate is
+  // bored like flesh and takes the hp itself), so this changes no number; it
+  // is where a laser that skates off polished steel would be authored.
+  if (owner->IsWornSlot(li)) {
+    const ShellResponse r = owner->ShellResponseAt(li, hitWorldVoxel, beam);
+    hp *= r.shellHp;
+    bore *= r.carve;
+  }
+  if (!owner->Damage(bodyHandle, hp, hitWorldVoxel, 0.0f, beam)) return false;
+  laserHitsCharged_++;
+  // Damage() may have severed the slot outright; the carve then misses
+  // (CarveLimbRadial returns false) rather than touching stale state.
+  boreOut = bore;
+  return true;
+}
+
+int MobSystem::ApplyContactDamage(const Physics& phys, World& world,
+                                  std::vector<ParticleSpawn>& spawns) {
+  const Tuning::Gore& gt = CurrentTuning().gore;
+  if (gt.contactHpPerImpulse <= 0.0f || gt.contactMaxPerTick <= 0) return 0;
+  struct Hit {
+    uint64_t limb, other;
+    Vec3 at;
+    float impulse;
+  };
+  std::vector<Hit> hits;
+  for (const Physics::ContactImpact& ci : phys.ContactImpacts()) {
+    for (int side = 0; side < 2; side++) {
+      const uint64_t limbBody = side ? ci.bodyB : ci.bodyA;
+      const uint64_t other = side ? ci.bodyA : ci.bodyB;
+      // Terrain is the landing's business (Mob::ApplyFallDamage), and a
+      // contact with no creature on it is nobody's.
+      if (limbBody == 0 || other == 0) continue;
+      int li = -1;
+      Mob* m = FindOwner(limbBody, &li);
+      if (m == nullptr || li < 0 || !m->alive_ || m->IsGhost()) continue;
+      // Creature against creature (a ragdoll's own limbs, a held weapon, two
+      // bodies in a scrum) is melee's and the ragdoll's, not a thrown thing.
+      if (FindOwner(other) != nullptr) continue;
+      const float mo = phys.BodyMass(other);
+      if (mo <= 0.0f) continue;
+      // A standing creature's limbs are kinematic: the striker meets an
+      // immovable body and its whole momentum is the blow. A limp one is
+      // free, so the blow is the REDUCED mass against the whole creature's.
+      float mu = mo;
+      if (m->ragdoll_ != Mob::RagdollPhase::None) {
+        const float M = std::max(m->BodyMassKg(), 1.0f);
+        mu = mo * M / (mo + M);
+      }
+      // THE STRIKER'S SPEED, NOT THE CLOSING SPEED. The listener reports how
+      // fast the pair closed; a creature walking into a resting log closes
+      // on it at walking pace, and that is the creature kicking the log, not
+      // the log striking the creature. So the limb's own velocity toward the
+      // other body is taken back out (`normal` points bodyA -> bodyB).
+      float strike = ci.speedVoxPerSec;
+      Vec3 lv{}, la{};
+      if (phys.GetBodyVelocities(limbBody, lv, la)) {
+        const Vec3 toOther = side == 0 ? ci.normal : ci.normal * -1.0f;
+        strike -= std::max(0.0f, lv.dot(toOther));
+      }
+      if (strike <= 0.0f) continue;
+      const float impulse = mu * strike * kVoxelMeters;
+      if (impulse <= gt.contactImpulseMin) continue;
+      hits.push_back({limbBody, other, ci.posVoxel, impulse});
+    }
+  }
+  if (hits.empty()) return 0;
+  // A FIXED ORDER, because the listener's is Jolt's job threads': hardest
+  // first, then by handle, so the cap takes the same contacts every replay.
+  std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
+    if (a.impulse != b.impulse) return a.impulse > b.impulse;
+    if (a.limb != b.limb) return a.limb < b.limb;
+    return a.other < b.other;
+  });
+  const size_t cap =
+      std::min(hits.size(), (size_t)std::max(0, gt.contactMaxPerTick));
+  int billed = 0;
+  for (size_t k = 0; k < cap; k++) {
+    const Hit& h = hits[k];
+    const float hp = std::min((h.impulse - gt.contactImpulseMin) *
+                                  gt.contactHpPerImpulse,
+                              std::max(gt.contactMaxHp, 0.0f));
+    if (hp <= 0.0f) continue;
+    ::BluntHit b;
+    b.at = h.at;
+    b.hp = hp;
+    // How hard, 0..1, for the bruise's radius: a blow at the cap is full.
+    b.power = gt.contactMaxHp > 0.0f ? std::clamp(hp / gt.contactMaxHp, 0.0f, 1.0f)
+                                     : 1.0f;
+    // A rock is not a mace: no dent in flesh, no plate broken in. It bruises,
+    // it charges hp, and on a shell it transmits the Blunt row's share.
+    b.carve = 0.0f;
+    b.armorBreak = 0.0f;
+    b.impactSpeed = 0.0f;
+    b.seed = (uint32_t)(h.limb * 2654435761u) ^ (uint32_t)(h.other * 40503u) ^
+             tick_;
+    // The first contact may have severed or killed; BluntHit re-resolves the
+    // handle and returns false if it no longer names a limb.
+    if (BluntHit(h.limb, b, world, spawns)) billed++;
+  }
+  contactHitsBilled_ += (uint32_t)billed;
+  return billed;
+}
+
+namespace {
+// A BleedRate (game/severpolicy.h) as the multiplier on a wound's drip budget.
+// The unarmed rate falls back to the blunt one when its override is negative,
+// which is what `gore.unarmedBleedScale >= 0 ? unarmed : blunt` always said.
+float BleedRateScale(BleedRate r) {
+  const Tuning::Gore& gt = CurrentTuning().gore;
+  switch (r) {
+    case BleedRate::None:
+      return 0.0f;
+    case BleedRate::Full:
+      return 1.0f;
+    case BleedRate::Unarmed:
+      if (gt.unarmedBleedScale >= 0.0f)
+        return std::clamp(gt.unarmedBleedScale, 0.0f, 1.0f);
+      return std::clamp(gt.bluntBleedScale, 0.0f, 1.0f);
+    case BleedRate::Blunt:
+      return std::clamp(gt.bluntBleedScale, 0.0f, 1.0f);
+  }
+  return 1.0f;
+}
+}  // namespace
 
 bool MobSystem::HitReact(uint64_t bodyHandle, Vec3 dirWorld, float hp,
                          float power) {
@@ -9509,7 +10104,7 @@ bool MobSystem::HitReact(uint64_t bodyHandle, Vec3 dirWorld, float hp,
 }
 
 bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
-                 float impactSpeed) {
+                 float impactSpeed, const DamageCtx& ctx) {
   if (!def_) return false;
   for (size_t i = 0; i < limbs_.size(); i++) {
     MobLimb& limb = limbs_[i];
@@ -9517,6 +10112,8 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     // limbDefs_, not def_->limbs: a borrowed item slot is damageable (and
     // severable — you can cut the sword out of a hand) like any limb.
     const MobLimbDef& ld = limbDefs_[i];
+    // What this cause may do to this slot's tissue (game/severpolicy.h).
+    const SeverPolicy pol = PolicyAt((int)i, ctx);
     Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
     // A blow on a sleeping corpse wakes it (Mob::DeadAsleep).
     WakeDead();
@@ -9544,8 +10141,9 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
         ld.severImpactSpeed * CurrentTuning().gore.woundImpactSeverScale;
     // A STRAP DOES NOT SNAP BECAUSE THE BLOW WAS FAST. The impact rule is the
     // sword-knocked-from-the-hand rule; a cuirass leaves by being cut through
-    // (CarveLimb) or never.
-    const bool impactSevers = !inBluntCarve_ && !IsWornSlot((int)i) &&
+    // (CarveLimb) or never. Trauma never takes it (Shell and the blunt rows
+    // both say no: SeverPolicy::impactSevers).
+    const bool impactSevers = pol.impactSevers &&
                               ld.severImpactSpeed > 0 && impactBar > 0 &&
                               impactSpeed >= impactBar;
     // hp is LIFE: a corpse has none to lose, and a rising reads the hp its
@@ -9572,32 +10170,29 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
     }
     // A PUNCH DOES NOT OPEN YOU (game/impact.h). Trauma still charges hp, still
     // flinches and still cries out -- only the BLOOD is refused, at
-    // gore.bluntBleedScale of a cut's rate. The same shape as the three
-    // exclusions CarveLimb makes for fire, a garment and a creature born
-    // bitten, and made the same way: a scope the caller opens, read here
-    // rather than threaded through a signature the laser and the blast share.
-    const float bleedScale =
-        inBluntCarve_
-            ? std::clamp((inUnarmedBlunt_ &&
-                          CurrentTuning().gore.unarmedBleedScale >= 0.0f)
-                             ? CurrentTuning().gore.unarmedBleedScale
-                             : CurrentTuning().gore.bluntBleedScale,
-                         0.0f, 1.0f)
-            : 1.0f;
-    // A BLOODLESS LIMB (hair) takes hp but opens no bleed budget: BleedTick
-    // would refuse to drip it anyway, and a budget left standing would read as
-    // an open wound to every "is this limb bleeding" query.
-    if (!IsBloodless((int)i))
+    // gore.bluntBleedScale of a cut's rate (gore.unarmedBleedScale for a
+    // fist). The same shape as the exclusions CarveLimb makes for fire, a
+    // garment and a creature born bitten, and made the same way: one column of
+    // the (cause, tissue) table, SeverPolicy::hitBleed.
+    //
+    // A BLOODLESS LIMB (hair) takes hp but opens no bleed budget (hitBleed is
+    // None for it): BleedTick would refuse to drip it anyway, and a budget left
+    // standing would read as an open wound to every "is this limb bleeding"
+    // query.
+    if (pol.hitBleed != BleedRate::None)
       limb.bleedBudget = AddBleedBudget(
-          limb.bleedBudget, amount * def_->bleedPerDamage * bleedScale);
+          limb.bleedBudget,
+          amount * def_->bleedPerDamage * BleedRateScale(pol.hitBleed));
     // hp reaching zero is a statement about DEATH, and a corpse has had its
     // one: on the dead only the impact exception (a sword knocked out of a
     // dead hand) still takes anything off.
-    if (impactSevers || (alive_ && limb.hp <= 0 && HpZeroSevers((int)i))) {
+    if (impactSevers || (alive_ && limb.hp <= 0 && HpZeroSevers((int)i, ctx))) {
       // A MACE KILLS BUT DOES NOT DISMEMBER — on living tissue. Rotten undead
       // tissue falls apart either way, which is the whole visual difference
       // between beating a man and beating a zombie. Sever() on a vital limb
       // detaches it THEN dies; here we skip the detach and die outright.
+      // "Rotten" is the body's TISSUE (MobDef::bodyTissue, authored by the
+      // zombie effect), not an `undead` check: SeverPolicy::vitalHpZeroDetaches.
       //
       // ...AND NEITHER DOES A BEAM, OR ANY OTHER DAMAGE (2026-09-22). hp is a
       // statement about DEATH, so a vital limb run to zero by damage alone
@@ -9607,12 +10202,11 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
       // the laser plus gore.brainHpPerVoxel took a head to zero in a few ticks
       // and popped it off, where the owner wants a clean hole you can see
       // through. Only the impact-speed exception still detaches outright.
-      if (ld.vital && !impactSevers &&
-          (!inBluntCarve_ || !def_ || !def_->undead)) {
+      if (ld.vital && !impactSevers && !pol.vitalHpZeroDetaches) {
         deathCause_ = "vital limb destroyed";
         Die();
       } else {
-        Sever((int)i);
+        Sever((int)i, ctx);
       }
     } else {
       // NO CLIP FIRES HERE. Being hit used to start the "attack" clip — a
@@ -9667,7 +10261,7 @@ bool Mob::Damage(uint64_t bodyHandle, float amount, Vec3 hitWorldVoxel,
 // sword either always takes a limb or never does. Geometry does neither.
 // ============================================================================
 
-bool Mob::HpZeroSevers(int limbIndex) const {
+bool Mob::HpZeroSevers(int limbIndex, const DamageCtx& ctx) const {
   // FIRE KEEPS ITS OLD ANSWER. FlushBurn expresses a tick of burning as a
   // carve, and `mob-burn` asserts a whole account of how a limb burns through
   // (the anchor component keeps the identity, a limb never leaves while it is
@@ -9676,14 +10270,15 @@ bool Mob::HpZeroSevers(int limbIndex) const {
   //
   // ...BUT NOT WHEN THE FLUSH IS A BEATING (2026-09-22). Mob::BluntPulpTick
   // expresses the blunt dissolution through the SAME FlushBurn tail the fire
-  // and the infection use, so `inBurnFlush_` is true there too -- and this line
+  // and the infection use, so the carve is EATEN there too -- and this line
   // then handed a mace the one sever the whole blunt model refuses: an arm
   // beaten to hp 0 (which Mob::Damage deliberately declines to take off) came
   // off at the next tick of its own crater opening. The owner's report was
-  // exactly that, "my arms fell off after being hit by a mace". Under a
-  // BluntCarveScope the ordinary rule below applies instead, so a vital or root
-  // limb at zero still routes to death and a limb does not.
-  if (inBurnFlush_ && !inBluntCarve_) return true;
+  // exactly that, "my arms fell off after being hit by a mace". For a blunt
+  // cause the ordinary rule below applies instead, so a vital or root limb at
+  // zero still routes to death and a limb does not.
+  // (CauseRow::hpZeroSeversAny: eaten, and not blunt.)
+  if (CauseRowOf(ctx).hpZeroSeversAny) return true;
   if (!def_) return true;
   if (limbIndex < 0 || limbIndex >= (int)limbDefs_.size()) return true;
   // A VITAL OR ROOT LIMB AT ZERO IS A DEATH, NOT AN AMPUTATION — and Sever()
@@ -9764,12 +10359,13 @@ uint32_t Mob::NeckCountAt(const MobLimb& limb, Vec3 centreLimb,
 // shoulder, the infection eats the shoulder out, and the arm hangs there on a
 // joint with nothing around it until you die of the blood instead.
 //
-//   * THE CAUSE. The neck test was `inBladeCut_` only, so rot, fire and blast
+//   * THE CAUSE. The neck test was blade-only, so rot, fire and blast
 //     could not reach it. Whole-limb `kLimbCollapseFraction` (25% of the limb's
 //     volume) is all that stood behind them, and an infection that opens a hole
 //     THROUGH THE SHOULDER removes maybe 5% of an arm's volume. Generalised
 //     here to every cause but blunt — blunt still never amputates, which is the
-//     owner's spec and the one exclusion that is deliberate (Mob::BluntCarveScope).
+//     owner's spec and the one exclusion that is deliberate (the blunt rows
+//     of game/severpolicy.h).
 //
 //   * THE SIDE. An arm is held on by the torso's shoulder as much as by the
 //     arm's. Rot spreads across the joint (Mob::InfectAcrossJoint) and then
@@ -9879,14 +10475,18 @@ void Mob::RebaseJointCounts() {
   }
 }
 
-bool Mob::JointRuleApplies(int limbIndex) const {
+bool Mob::JointRuleApplies(int limbIndex, const DamageCtx& ctx) const {
+  // ONE COLUMN OF THE SEVER TABLE (CauseRow::joint, game/severpolicy.h). The
+  // three answers and the reasons for them, in the order the table encodes:
+  //
   // BLUNT NEVER AMPUTATES. The owner's spec, and the one exclusion here that is
-  // about the weapon rather than about the physics (Mob::BluntCarveScope).
-  if (inBluntCarve_) return false;
+  // about the weapon rather than about the physics (JointRule::Never on the
+  // Blunt and Unarmed rows).
+  //
   // ---- A CREATURE BORN BITTEN DOES NOT COME APART ON ARRIVAL ---------------
   //
   // The third exclusion of the same family as CarveLimb's bleed and brain
-  // refusals (Mob::inSpawnRot_), and the one that was missed when this rule
+  // refusals (DamageCause::SpawnRot), and the one that was missed when this rule
   // stopped being about blades. RotAtSpawn's holes are the damage a zombie
   // ARRIVED with, not damage it is taking now — so they may not be the thing
   // that takes a limb off, and MobRotDef's own loader says so in as many
@@ -9907,8 +10507,9 @@ bool Mob::JointRuleApplies(int limbIndex) const {
   // The joint baselines are RE-TAKEN when the rot finishes (RotAtSpawn's tail),
   // so what this refuses is only the verdict at spawn: the rotted shoulder
   // becomes this creature's normal, and the next blade to land there is judged
-  // against the body that actually walked in.
-  if (inSpawnRot_) return false;
+  // against the body that actually walked in. (JointRule::Never on the
+  // SpawnRot rows.)
+  //
   // FIRE KEEPS ITS OWN ACCOUNT — the same carve-out HpZeroSevers makes, for a
   // sharper reason than "the gate says so". A joint measure is taken at a point
   // CLAMPED to the limb's surface (the anchor is a rig point and usually sits
@@ -9923,8 +10524,16 @@ bool Mob::JointRuleApplies(int limbIndex) const {
   // is local by construction — it works out from the bite through the tissue it
   // is touching, so when it reaches a joint it is genuinely eating that joint,
   // which is the whole of what this rule wants to know. So the test is "is this
-  // limb infected", not "is this a burn flush".
-  if (!inBurnFlush_) return true;
+  // limb infected", not "is this a burn flush" (JointRule::IfInfected on every
+  // EATEN row that is not blunt or spawn rot; Always on the struck ones).
+  switch (CauseRowOf(ctx).joint) {
+    case JointRule::Never:
+      return false;
+    case JointRule::Always:
+      return true;
+    case JointRule::IfInfected:
+      break;
+  }
   if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return false;
   return limbs_[limbIndex].infectMat != 0;
 }
@@ -9959,7 +10568,7 @@ bool Mob::JointAttached(int limbIndex) const {
   return (float)now >= gt.woundNeckFraction * (float)limb.socketAtSpawn;
 }
 
-bool Mob::DropDisconnectedChildren(int parentIndex) {
+bool Mob::DropDisconnectedChildren(int parentIndex, const DamageCtx& ctx) {
   // A CORPSE'S ARM FALLS OFF TOO when its shoulder is cut or rotted away:
   // this is geometry, not a death transition. The return is "the rig is still
   // this Mob's to touch", which a death no longer changes (Mob::Die keeps it).
@@ -9978,7 +10587,7 @@ bool Mob::DropDisconnectedChildren(int parentIndex) {
     if (k >= baseLimbs_ || IsWornSlot(k)) continue;
     if (!limbs_[k].body) continue;
     if (JointAttached(k)) continue;
-    Sever(k);
+    Sever(k, ctx);
   }
   return !rigReleased_;
 }
@@ -10487,20 +11096,20 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
 }
 
 bool MobSystem::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
-                        std::vector<ParticleSpawn>& spawns) {
+                        std::vector<ParticleSpawn>& spawns, float severity) {
   for (Mob& mob : mobs_)
-    if (mob.CutLimb(bodyHandle, cut, world, spawns)) return true;
+    if (mob.CutLimb(bodyHandle, cut, world, spawns, severity)) return true;
   // AND THE PLAYER BLEEDS TOO. Without this line an NPC's sweep found the
   // avatar's arm, failed to recognise it as live flesh, and fell through to
   // DebrisSystem::MeltBodyAt — the player was hittable only in the sense that
   // their limbs quietly evaporated with no wound, no stain and no sever.
   for (Mob* av : avatars_)
-    if (av->CutLimb(bodyHandle, cut, world, spawns)) return true;
+    if (av->CutLimb(bodyHandle, cut, world, spawns, severity)) return true;
   return false;
 }
 
 bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
-                  std::vector<ParticleSpawn>& spawns) {
+                  std::vector<ParticleSpawn>& spawns, float severity) {
   if (!phys_) return false;
   for (size_t i = 0; i < limbs_.size(); i++) {
     if (limbs_[i].body != bodyHandle) continue;
@@ -10545,19 +11154,15 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     // does wear through under a patient enemy. A worn slot only: a held blade
     // is never carved (melee.cpp skips the held slot), and flesh keeps the
     // wound model the `wound` gate pins.
+    //
+    // The scale is the Blade row of game/shellresponse.h (W2-H), read off the
+    // voxel the edge STRUCK rather than the lattice's first voxel.
     if (IsWornSlot((int)i) && sys_ != nullptr) {
-      uint32_t m = 0;
-      if (!limb.skinVoxels.empty())
-        m = limb.skinVoxels[0].material & 0xFFFu;
-      else if (!limb.voxels.empty())
-        m = limb.voxels[0].payload & 0xFFFu;
       const auto& gear = CurrentTuning().gear;
-      const float hard =
-          m < sys_->matGpu_.size() ? (float)sys_->matGpu_[m].hardness : 0.0f;
+      const float hard = MaterialHardness(ShellMaterialAt((int)i, cut.at));
       if (hard > 0.0f && gear.cutHardnessRef > 0.0f) {
-        const float k = std::clamp(gear.cutHardnessRef / hard,
-                                   std::clamp(gear.cutHardnessMin, 0.0f, 1.0f),
-                                   1.0f);
+        const float k =
+            ShellResponseOf(hard, DamageCause::Blade, gear).carve;
         // The chip is at least one lattice cell in every direction, or a
         // blade thinner than a cell (a stock edge is 0.08 voxels against a
         // 0.125-voxel skin cell) would slip between cell centres and cost
@@ -10616,19 +11221,13 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
       spall.seed = seed;
     }
 
-    // Everything the two structural sever rules in CarveLimb need to know is
-    // "an edge did this" — see Mob::inBladeCut_ for why the other carve causes
-    // are deliberately excluded. Scoped, because CarveLimb can re-enter this
-    // mob through Sever() and must not leave the flag standing.
-    struct BladeScope {
-      bool& f;
-      bool prev;
-      explicit BladeScope(bool& flag) : f(flag), prev(flag) { f = true; }
-      ~BladeScope() { f = prev; }
-    } bladeScope(inBladeCut_);
-
+    // Everything the structural sever rules in CarveLimb need to know is
+    // "an edge did this": DamageCause::Blade, the one row with the cut-through
+    // rule (game/severpolicy.h says why the other causes do not get it). An
+    // argument, not a scope, so nothing CarveLimb re-enters can inherit it.
     const bool alive = CarveLimb(
-        (int)i, world, spawns, /*eject=*/true,
+        (int)i, DamageCtx(DamageCause::Blade, severity), world, spawns,
+        /*eject=*/true,
         [slotAt, slot](float scale) -> LimbCarveKeep {
           // ONE world-space slot, re-expressed per lattice -- the same
           // contract CarveLimbRadial's factory has, so a fine-skinned limb
@@ -10796,6 +11395,7 @@ void Mob::DropBurnIndex(BodyBurnState& st) {
   st.quiet = 0;
   st.sleepKey = 0;
   st.idle = false;
+  st.holdBy = 0;  // nobody holds an index that is gone
   // `st.alight` deliberately SURVIVES. Everything above is an index INTO a
   // lattice that just changed shape; the flag is a fact ABOUT the lattice, and
   // it is the only thing that will make BurnOneLimb rebuild this index once the
@@ -11066,6 +11666,8 @@ void MobSystem::BuildBurnIndex(BurnLimbView& v) {
   // right: it makes the limb un-burnable this tick rather than spending the
   // memory, and no authored rig comes near the ceiling.
   if (cells > (1u << 20)) return;
+  burnStats_.indexBuilds++;
+  burnStats_.indexCells += cells;
 
   st.min = mn;
   st.dims = dims;
@@ -11455,10 +12057,10 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   uint64_t nh = phys_->CreateDebrisBodyXf(limb.voxels, limb.xf, DensityOf(),
                                           true /*allowKinematic*/, pitch);
   if (nh == 0) return false;  // Jolt refused: keep the old collider, stay carved
-  // ...and where the old body was allowed to be: its object layer and its
-  // place in ReleaseToWorldWhenClear's list (an NPC knocked limp beside the
-  // player is off the player's contact layer until it has fallen clear, and
-  // the rebuilt limb must be too, or it shoves them). Before RemoveBody.
+  // ...and what the old body WAS: its role, owner and layer, and whether it
+  // was still clearing the player (an NPC knocked limp beside the player is
+  // off the player's contact layer until it has fallen clear, and the rebuilt
+  // limb must be too, or it shoves them). Before RemoveBody.
   phys_->CarryLayer(limb.body, nh);
 
   // The handle CHANGES, so every reference to the old one must be re-pointed
@@ -11493,31 +12095,20 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   limb.body = nh;
   phys_->SetBodyKinematic(limb.body, kinematic);
   if (!kinematic && hadVel) phys_->SetBodyVelocities(limb.body, oldLin, oldAng);
-  // ...and the AVATAR-LAYER EXEMPTION, which is part of "every reference to the
-  // old handle" exactly as much as the joints above are. A new handle starts on
-  // the plain MOVING layer, and a still-attached avatar limb on MOVING is back
-  // inside the player's own capsule proxy, where the solver sees a contact it
-  // can never resolve and PlayerPushOut sums a depenetration vector whose
-  // direction swings with the gait (Layers::AVATAR, phys/physics.cpp).
-  //
-  // That is the whole "acid eats a bite out of me and I start flying off
-  // upwards at an angle" bug, and it was reachable from every damage source
-  // there is: acid, fire, laser and blast all end in a carve, and every carve
-  // rebuilds the collider. Your own body must not push you — including after it
-  // has been rebuilt.
-  // Not a dead avatar's: those limbs were handed to ReleaseToWorldWhenClear at
-  // death, and CarryLayer above already carried that state across.
-  if (AvatarLayer() && alive_) phys_->SetBodyAvatarLayer(limb.body, true);
-  // ...and the PROP EXEMPTION, for exactly the same reason and reachable from
-  // exactly the same places. A weapon is carved and burned like any other
-  // slot, and a rebuilt blade that started back on the plain MOVING layer
-  // would be shoving the player again from the first acid drop or laser graze
-  // that touched it. Only while it is still BEING HELD: a rebuild during a
-  // ragdoll deliberately hands the piece back to the solver (`kinematic` is
-  // false above), and a prop that is not carried has to be able to hit the
-  // floor.
-  if (limbIndex == heldSlot_ && kinematic)
-    phys_->SetBodyPropLayer(limb.body, true);
+  // ...and the ROLE, which is part of "every reference to the old handle"
+  // exactly as much as the joints above are. It travelled with CarryLayer:
+  // a still-attached avatar limb back on MOVING is inside the player's own
+  // capsule proxy, where the solver sees a contact it can never resolve and
+  // PlayerPushOut sums a depenetration vector whose direction swings with the
+  // gait — the whole "acid eats a bite out of me and I start flying off
+  // upwards at an angle" bug, reachable from every carve (acid, fire, laser,
+  // blast) — and a rebuilt blade back on MOVING shoved the player from the
+  // first acid drop that touched it. Both were once separate re-sets here,
+  // each added after its own bug. Re-derived for a LIVE creature's attached
+  // roles (a no-op when the carried role agrees, which it should); a loose
+  // role is left as carried, since re-setting one re-arms its clearing.
+  if (alive_ && !Physics::IsLooseRole(LimbRole((size_t)limbIndex)))
+    ApplyLimbRole((size_t)limbIndex);
 
   if (limb.joint) {
     phys_->DestroyJoint(limb.joint);
@@ -11542,12 +12133,7 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // Re-exclude the whole mob: the new handle is not in the old exclusion set,
   // so without this a carved limb starts colliding with its own siblings and
   // the rig fights itself into a jitter.
-  {
-    std::vector<uint64_t> handles;
-    for (const MobLimb& l : limbs_)
-      if (l.body) handles.push_back(l.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
+  RegroupRig();
   return true;
 }
 
@@ -11617,8 +12203,8 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
   // shove; a spray of them is the player skating off sideways every time acid
   // takes a bite (or a blade a chunk). Kept off the player until it has
   // fallen clear, then ordinary debris — the same rule every piece that
-  // leaves a rig now follows.
-  phys_->ReleaseToWorldWhenClear(h);
+  // leaves a rig now follows (a loose role clears first).
+  phys_->SetBodyRole(h, Physics::BodyRole::Debris);
   // Push it off the wound so it visibly leaves the body rather than resting in
   // the cavity it came from.
   Vec3 away = xf.pos - src.xf.pos;
@@ -11683,19 +12269,24 @@ void Mob::LimbWoundTotals(const MobLimb& limb, float& weight,
   }
 }
 
-bool Mob::CarveLimb(int limbIndex, World& world,
+bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
                           std::vector<ParticleSpawn>& spawns, bool eject,
                           const LimbCarveFactory& carveAt,
                           const CarveSpall* spall, CarveReport* report) {
   if (report) *report = CarveReport{};
+  // WHAT THIS CAUSE MAY DO TO THIS SLOT (game/severpolicy.h). Taken once: the
+  // slot's tissue is a fact about the rig slot, which nothing below changes.
+  const SeverPolicy pol = PolicyAt(limbIndex, ctx);
   // Burning leaves material-0 TOMBSTONES in the lattice between its batched
   // flushes, and every reader of the lattice has to see past them: counting
   // them as present would over-report the limb's volume (so a limb burnt to a
   // thread would not collapse) and majority-fill them into the collider (so
   // physics would keep matter the fire has already taken). The flush expresses
-  // itself as a carve, hence the guard.
-  if (!inBurnFlush_ && limbs_[limbIndex].burn.removed) {
-    if (!FlushBurn(limbIndex, world, spawns, /*force=*/true)) return false;
+  // itself as a carve, hence the guard. The flush carries THIS carve's cause
+  // (eaten): the pending removals are flushed on this blow's account, exactly
+  // as they were when the cause was an ambient flag the flush saw standing.
+  if (!ctx.eaten && limbs_[limbIndex].burn.removed) {
+    if (!FlushBurn(limbIndex, ctx, world, spawns, /*force=*/true)) return false;
   }
   MobLimb& limb = limbs_[limbIndex];
   if (!limb.body || limb.voxels.empty()) return true;
@@ -11880,7 +12471,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // Nothing noticed while carves were rare (one blade, one blast). BURNING is
   // what exposed it: FlushBurn expresses itself as a carve and fires every
   // max(12, n>>6) voxels removed, so a limb on fire carves itself dozens of
-  // times, and at kCarveDamagePerVolume 1.5 it reached hp 0 having lost about
+  // times, and at gore.carveHpPerVolume 1.5 it reached hp 0 having lost about
   // 14% of its volume. Every burning limb dismembered, and the torso reaching 0
   // is a vital limb, so Sever() called Die() — a creature that caught fire came
   // apart instead of charring. The fraction is still measured against `at0`
@@ -11920,7 +12511,8 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // Charged to the LIVING only (Mob::Damage's note): a corpse carved keeps
   // the hp it died with.
   if (alive_)
-    limb.hp -= (lostWeight / w0) * limbDefs_[limbIndex].hp * kCarveDamagePerVolume;
+    limb.hp -= (lostWeight / w0) * limbDefs_[limbIndex].hp *
+               CurrentTuning().gore.carveHpPerVolume;
   // ---- ...AND THE BRAIN IS NOT A FRACTION OF ANYTHING ----------------------
   //
   // The one absolute charge in this function. Every brain voxel destroyed --
@@ -11941,7 +12533,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // brain charge must not fire for them — a zombie whose spawn roll ate five
   // brain voxels would die before its first tick. Only NEW damage (rot
   // advancing, a blade, a blast) charges the flat penalty.
-  if (lostBrain && !inSpawnRot_ && alive_)
+  if (lostBrain && pol.chargesBrain && alive_)
     limb.hp -= (float)lostBrain * CurrentTuning().gore.brainHpPerVoxel;
   // ---- WHAT MAY BLEED, AND WHAT MAY NOT ------------------------------------
   //
@@ -11952,7 +12544,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   //   * A CREATURE BORN BITTEN IS NOT BLEEDING FROM THOSE BITES. RotAtSpawn's
   //     holes are the damage a zombie ARRIVED with, and a fresh drip budget on
   //     every one of them would have it haemorrhage its way across the map from
-  //     the first frame. See Mob::inSpawnRot_.
+  //     the first frame. DamageCause::SpawnRot.
   //   * A GARMENT HAS NO BLOOD IN IT. A shell is a borrowed rig slot, so
   //     `def.bleedMat` — the WEARER's blood — was being sprayed out of a
   //     burning robe. See Mob::IsWornSlot. Hair is the same case on a BASE
@@ -11966,7 +12558,9 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   //
   // The HP CHARGE above is deliberately outside both: fire still kills you, and
   // a burnt shell still loses its own durability. Only the blood is refused.
-  const bool bleeds = !inBurnFlush_ && !inSpawnRot_ && !IsBloodless(limbIndex);
+  // All three are SeverPolicy::carveBleeds: false on the eaten and spawn-rot
+  // rows, and for Shell / Bloodless tissue.
+  const bool bleeds = pol.carveBleeds;
   // ---- WHERE THE MATTER ACTUALLY LEFT ---------------------------------------
   // Centroid and spread of what was removed, in limb-local WORLD voxels — the
   // frame woundLocal is read in (PreTick rotates it by the limb's live quat).
@@ -12023,13 +12617,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
     if (carveN) limb.woundLocal = carveC;
     // ...and a DENT drips at the same reduced rate the trauma that made it
     // does (Mob::Damage's note): a caved-in face is not an open wound.
-    const float bleedScale =
-        inBluntCarve_
-            ? std::clamp((inUnarmedBlunt_ && gt.unarmedBleedScale >= 0.0f)
-                             ? gt.unarmedBleedScale
-                             : gt.bluntBleedScale,
-                         0.0f, 1.0f)
-            : 1.0f;
+    const float bleedScale = BleedRateScale(pol.carveBleed);
     limb.bleedBudget =
         AddBleedBudget(limb.bleedBudget,
                        lost * (float)at0 * def.bleedPerDamage * bleedScale);
@@ -12042,9 +12630,9 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // there is one); the absolute kMinFragmentVoxels floor stays on the collider,
   // which is what "too few voxels to be a body" has always meant to Jolt.
   // A BLUNT HIT NEVER TAKES A LIMB OFF, however many land -- the owner's spec
-  // in one line, and this is the whole implementation of it (see
-  // Mob::BluntCarveScope). A face may be caved in well past the point where a
-  // blast would have shed the head; hp reaching zero on a VITAL limb still
+  // in one line, and this is the whole implementation of it (see the blunt
+  // rows of game/severpolicy.h). A face may be caved in well past the point
+  // where a blast would have shed the head; hp reaching zero on a VITAL limb still
   // kills through HpZeroSevers below, because that is a statement about DEATH
   // rather than about amputation.
   // A WORN SHELL IS NOT SEVERED BY DAMAGE (2026-09-19). Every structural rule
@@ -12060,9 +12648,9 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // strapped to or with the corpse — never on its own because a blade cut it.
   // The absolute kMinFragmentVoxels floor stays for every cause: that one is
   // about whether Jolt can still be handed a body, not about dismemberment.
-  const bool shellStaysOn = IsWornSlot(limbIndex) && !inBurnFlush_;
+  const bool shellStaysOn = pol.shellStaysOn;  // Shell, and not eaten
   const bool collapsed =
-      !inBluntCarve_ &&
+      pol.collapseSevers &&
       (limb.voxels.size() < kMinFragmentVoxels ||
        (!shellStaysOn &&
         (float)nowCount < kLimbCollapseFraction * (float)at0));
@@ -12077,8 +12665,8 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // THE DEAD DO NOT DIE AGAIN: the hp clause is a statement about DEATH and
   // is the living's. `collapsed` is geometry and applies to a corpse as it
   // does to anybody (a limb carved to dust comes off).
-  if (collapsed || (alive_ && limb.hp <= 0 && HpZeroSevers(limbIndex))) {
-    // A vital limb killed by ROT or FIRE (inBurnFlush_) dies WITHOUT detaching.
+  if (collapsed || (alive_ && limb.hp <= 0 && HpZeroSevers(limbIndex, ctx))) {
+    // A vital limb killed by ROT or FIRE (an eaten carve) dies WITHOUT detaching.
     // Sever() for a severable vital limb pops the head off and then Dies,
     // which is correct for a blade decapitation but wrong for brain damage: the
     // rot ate the inside, not the neck. Die() directly leaves the head attached
@@ -12091,8 +12679,8 @@ bool Mob::CarveLimb(int limbIndex, World& world,
     // split/neck rules below) is still what takes a head off.
     if (!collapsed && limbIndex < (int)limbDefs_.size() &&
         limbDefs_[limbIndex].vital && limbDefs_[limbIndex].severable) {
-      deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
-                                 : "vital limb destroyed";
+      deathCause_ = pol.deathBurnt ? "vital limb burnt/dissolved away"
+                                   : "vital limb destroyed";
       Die();
       // THE CORPSE KEEPS ITS HEAD AND ITS CARVE. The rig is still here (Die
       // no longer hands it away), so the lattice this carve just changed must
@@ -12100,7 +12688,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       // a dead Mob drawing the pre-carve brick over a post-carve collider.
       if (rigReleased_) return false;
     } else {
-      Sever(limbIndex);
+      Sever(limbIndex, ctx);
       // A root or unseverable limb is not taken off by Sever(): it routes to
       // Die() and the limb stays on the corpse. Finish its carve too.
       if (rigReleased_ || !limbs_[limbIndex].body) return false;
@@ -12222,7 +12810,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       // rule skips them: a loose voxel nearer the wrist than the stub is not
       // what the hand is attached to.
       std::vector<std::pair<int, uint32_t>> seated;  // (child, component)
-      if (!inBluntCarve_ && !inSpawnRot_ && limbIndex < baseLimbs_ &&
+      if (pol.carriesChildren && limbIndex < baseLimbs_ &&
           !IsWornSlot(limbIndex)) {
         const float ps = (float)std::max(1u, PhysScaleOf(limb));
         const std::string& self = limbDefs_[limbIndex].name;
@@ -12306,7 +12894,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       }
 
       // The children seated in a piece that left go with it (see `seated`).
-      // Through the ordinary Sever() — the cause flags are already set, so a
+      // Through the ordinary Sever() with this carve's cause, so a
       // blade's gout and a burn's cauterised stump come out as for any other
       // amputation — and then jointed to the fragment at the live anchor, with
       // the hold skipped so the pair falls as one object instead of the
@@ -12322,7 +12910,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
                       child.xf.quat[3]};
         const Vec3 anchorW = child.xf.pos + Rotate(cq, child.anchorLimb);
         const Physics::JointDesc jd = JointDescFor(limbDefs_[k], anchorW);
-        Sever(k);
+        Sever(k, ctx);
         if (fragOf[c] != 0) {
           phys_->CreateJoint(fragOf[c], childBody, jd);
           if (k < (int)limbs_.size() && limbs_[k].holdBody == childBody)
@@ -12337,12 +12925,12 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       // Same lattice pairing as the first collapse test above -- and the same
       // blunt exclusion, for the same reason: a dent that disconnected a chip
       // and then found the remainder small is still a dent.
-      if (!inBluntCarve_ &&
+      if (pol.collapseSevers &&
           (limb.voxels.size() < kMinFragmentVoxels ||
            (!shellStaysOn &&
             (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
                 kLimbCollapseFraction * (float)at0))) {
-        Sever(limbIndex);
+        Sever(limbIndex, ctx);
         // Root/unseverable: Die() only, the limb stays (see above).
         if (rigReleased_ || !limbs_[limbIndex].body) return false;
       }
@@ -12363,13 +12951,19 @@ bool Mob::CarveLimb(int limbIndex, World& world,
       // is armed, the sever event carries its cause, and DetachLimb cascades
       // to children exactly as before.
       //
-      // BLADE ONLY — see Mob::inBladeCut_. A blast has no "other side" and
-      // fire has a tested account of its own.
+      // BLADE ONLY (SeverPolicy::cutThrough). BURNING already has a
+      // documented, tested account of how a limb comes apart (the anchor
+      // component keeps the identity, the rest leaves as fragments, and
+      // `mob-burn` asserts a limb never leaves while it is still mostly
+      // there) -- routing a burn-through here would re-open "a burning body
+      // dismembers instead of charring". A BLAST is a sphere and has no
+      // direction; "cut through" is not a thing it does. A blade is the one
+      // cause where the geometry says something the fraction cannot.
       // ...and never a WORN SHELL: the edge coming out the other side of a
       // plate is a hole in the plate, not a cut strap (shellStaysOn above).
-      if (inBladeCut_ && !shellStaysOn &&
+      if (pol.cutThrough && !shellStaysOn &&
           (float)partedOff >= gt.woundSeverFraction * (float)n) {
-        Sever(limbIndex);
+        Sever(limbIndex, ctx);
         if (rigReleased_ || !limbs_[limbIndex].body) return false;
       }
     }
@@ -12390,7 +12984,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // an arm to a thread and never take it off.
   //
   // EVERY CAUSE BUT BLUNT, and BOTH SIDES of the joint — see the block above
-  // Mob::ParentLimbIndex. This was `inBladeCut_` and the limb's own lattice
+  // Mob::ParentLimbIndex. This was blade-only and the limb's own lattice
   // only, which made it a statement about swords rather than about attachment:
   // rot ate the shoulder out and no rule in this function could see it, so the
   // arm hung on a joint surrounded by nothing until the blood loss killed you
@@ -12402,9 +12996,9 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // "neck" is wherever its anchor point happened to land on the panel, and a
   // few voxels carved there read as "hanging by a thread" on a plate that is
   // otherwise whole.
-  if (!shellStaysOn && JointRuleApplies(limbIndex) &&
+  if (!shellStaysOn && JointRuleApplies(limbIndex, ctx) &&
       !JointAttached(limbIndex)) {
-    Sever(limbIndex);
+    Sever(limbIndex, ctx);
     return false;
   }
 
@@ -12432,7 +13026,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // route out of this function above went through Sever(), which reports its
   // own event, and the sever cue falls back to the hurt set when nothing is
   // bound; voicing both would double a single blow. `lost` is already the
-  // fraction of the limb's volume removed, so `lost * kCarveDamagePerVolume`
+  // fraction of the limb's volume removed, so `lost * gore.carveHpPerVolume`
   // is the fraction of its max hp — exactly what the hurt slot documents.
   //
   // A GARMENT DOES NOT CRY OUT. Same exclusion as the blood above: a hole
@@ -12441,7 +13035,7 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   if (lost > 0.0f && !IsBloodless(limbIndex))
     if (sys_)
     sys_->PushVoice(*this, MobSystem::VoiceKind::Hurt, limb.xf.pos,
-                    lost * kCarveDamagePerVolume);
+                    lost * CurrentTuning().gore.carveHpPerVolume);
 
   // ---- WHAT WAS HANGING OFF WHAT THIS CARVE JUST ATE ------------------------
   //
@@ -12456,7 +13050,8 @@ bool Mob::CarveLimb(int limbIndex, World& world,
   // The CAUSE is judged on the limb that was carved — it is this limb's socket
   // that was destroyed, so it is this limb's infection (or blade, or blast)
   // that must be the thing allowed to do it.
-  if (JointRuleApplies(limbIndex) && !DropDisconnectedChildren(limbIndex))
+  if (JointRuleApplies(limbIndex, ctx) &&
+      !DropDisconnectedChildren(limbIndex, ctx))
     return false;
   return true;
 }
@@ -12476,7 +13071,7 @@ void Mob::StripBurnTombstones(MobLimb& limb) {
   MarkInstancesDirty();
 }
 
-bool Mob::FlushBurn(int limbIndex, World& world,
+bool Mob::FlushBurn(int limbIndex, const DamageCtx& ctx, World& world,
                           std::vector<ParticleSpawn>& spawns, bool force) {
   MobLimb& limb = limbs_[limbIndex];
   if (limb.burn.removed == 0) return true;
@@ -12546,9 +13141,11 @@ bool Mob::FlushBurn(int limbIndex, World& world,
     return (*idx)[((size_t)lz * bdim.y + ly) * bdim.x + lx] != 0;
   };
 
-  inBurnFlush_ = true;
+  // EATEN: the cause's per-voxel removals, expressed as one carve. That is
+  // what cauterises it, consumes a garment and keeps fire's account of how a
+  // limb comes apart (the eaten rows of game/severpolicy.h).
   const bool alive = CarveLimb(
-      limbIndex, world, spawns, /*eject=*/false,
+      limbIndex, ctx.Eaten(), world, spawns, /*eject=*/false,
       [&](float scale) -> LimbCarveKeep {
         // Only the AUTHORITATIVE lattice is carved. The other one is either the
         // same array or derived from this one by majority-fill, and carving it
@@ -12556,7 +13153,6 @@ bool Mob::FlushBurn(int limbIndex, World& world,
         if ((uint32_t)(scale + 0.5f) == latScale) return keepAt;
         return [](int, int, int) { return true; };
       });
-  inBurnFlush_ = false;
   if (!alive) return false;  // severed or the mob died: caller must not touch it
 
   // The carve compacted the lattice, so every index in the burn index moved.
@@ -12569,11 +13165,6 @@ bool Mob::FlushBurn(int limbIndex, World& world,
 namespace {
 bool OwnForStain(BurnLimbView& v, MicroBodySet* micro);  // defined below
 }  // namespace
-
-// Levels of a wet coat one DOUSE costs (BurnOneLimb section 0): putting a
-// burning voxel out flashes some of the water to steam, so a damp sleeve
-// puts out a few voxels of fire, not a bonfire.
-static constexpr uint32_t kCoatDouseCost = 4;
 
 uint32_t MobSystem::IgniteOneLimb(BurnLimbView& v, uint32_t count,
                                  uint32_t onlyMat) {
@@ -12607,8 +13198,9 @@ uint32_t MobSystem::IgniteOneLimb(BurnLimbView& v, uint32_t count,
       if (f < matHot_.size() && matHot_[f]) hot = f;
     }
     if (hot == 0) continue;  // bone, steel: no path to burning, no exception list
-    // A WET voxel does not take a flame either (BurnOneLimb section 0): a
-    // torch against a soaked arm lights the dry skin, or nothing.
+    // A WET voxel does not take a flame either (a wet coat COVERS it,
+    // BurnOneLimb section 0): a torch against a soaked arm lights the dry
+    // skin, or nothing.
     {
       const uint16_t c = v.Stain(i);
       const uint32_t cm = BodyStainMat(c);
@@ -12684,6 +13276,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   if (!BurnTablesReady() || v.Size() == 0 || frontBudget == 0) return false;
   BodyBurnState& st = *v.burn;
   const uint32_t limbKey = rngKey;
+  burnStats_.visits++;
 
   // One-entry chunk memo. A limb spans one or two chunks and the ignition scan
   // asks the same one over and over; without this the walk is a hash lookup per
@@ -12812,27 +13405,48 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   if (v.crossHeat && v.crossPct > 0)
     for (const CrossHeatCell& e : *v.crossHeat)
       if (e.limbs & ~selfBit) { foreignHeat = true; break; }
-  if (st.front.empty() && !st.alight && !v.corrodeCoat && st.idx.empty() &&
-      !foreignHeat) {
-    uint64_t h = 1469598103934665603ull;
-    auto mix = [&h](uint64_t x) {
+  // Attribution (BodyBurnState::sleepMiss): which half of the test failed.
+  //
+  // A HELD INDEX DOES NOT KEEP THE LIMB AWAKE (W2-I, 2026-09-24). The sleep
+  // used to demand an EMPTY index, and the index is shared: the coat passes
+  // build it for their own surface lists and keep it warm by resetting
+  // `quiet` while they have work -- WetOneLimb every third tick for as long as
+  // any water is on the limb, StainOneLimb for as long as the limb touches
+  // anything that stains (wet ground under a doused creature). So a creature
+  // that had been doused, rained on or was standing in a puddle never slept
+  // at all, burnt or not: measured on mob-burn subtest K, all 15 limbs of the
+  // doused human "holdBy wet" (5 also "contact"), "miss index", 0 of 900
+  // limb-visits asleep. Nothing the walk reads depends on whether an index is
+  // held -- the key digests the box, the chunks and the tables -- so the walk
+  // may be skipped whoever holds the index; the grace that releases it keeps
+  // counting in the asleep branch below.
+  st.slept = false;
+  uint8_t miss = 0;
+  const bool quietHere =
+      st.front.empty() && !st.alight && !v.corrodeCoat && !foreignHeat;
+  if (!quietHere) miss |= BodyBurnState::kMissBusy;
+  if (quietHere) {
+    // Three digests rather than one chain, so a miss can say WHICH moved: the
+    // pose, the box the walk reads, or the world in that box.
+    auto fnv = [](uint64_t& h, uint64_t x) {
       h ^= x;
       h *= 1099511628211ull;
     };
-    auto mixF = [&mix](float f) {
+    uint64_t hp = 1469598103934665603ull, hb = hp, hw = hp;
+    auto mixF = [&fnv](uint64_t& h, float f) {
       uint32_t u;
       std::memcpy(&u, &f, 4);
-      mix(u);
+      fnv(h, u);
     };
-    mixF(v.xf->pos.x); mixF(v.xf->pos.y); mixF(v.xf->pos.z);
-    for (int k = 0; k < 4; k++) mixF(v.xf->quat[k]);
-    mix((uint64_t)(uint32_t)lo.x << 32 | (uint32_t)lo.y);
-    mix((uint64_t)(uint32_t)lo.z << 32 | (uint32_t)hi.x);
-    mix((uint64_t)(uint32_t)hi.y << 32 | (uint32_t)hi.z);
+    mixF(hp, v.xf->pos.x); mixF(hp, v.xf->pos.y); mixF(hp, v.xf->pos.z);
+    for (int k = 0; k < 4; k++) mixF(hp, v.xf->quat[k]);
+    fnv(hb, (uint64_t)(uint32_t)lo.x << 32 | (uint32_t)lo.y);
+    fnv(hb, (uint64_t)(uint32_t)lo.z << 32 | (uint32_t)hi.x);
+    fnv(hb, (uint64_t)(uint32_t)hi.y << 32 | (uint32_t)hi.z);
     const IVec3 wo = world.WindowOrigin();
-    mix((uint64_t)(uint32_t)wo.x << 32 | (uint32_t)wo.y);
-    mix((uint64_t)(uint32_t)wo.z);
-    mix((uint64_t)(uintptr_t)matHot_.data() ^ matHot_.size());
+    fnv(hb, (uint64_t)(uint32_t)wo.x << 32 | (uint32_t)wo.y);
+    fnv(hb, (uint64_t)(uint32_t)wo.z);
+    fnv(hb, (uint64_t)(uintptr_t)matHot_.data() ^ matHot_.size());
     const IVec3 c0 = ChunkOfCell(lo.x, lo.y, lo.z),
                 c1 = ChunkOfCell(hi.x, hi.y, hi.z);
     bool known = true;
@@ -12846,15 +13460,57 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             known = false;
             break;
           }
-          mix((uint64_t)(uintptr_t)cc);
-          mix(cc->version);
+          fnv(hw, (uint64_t)(uintptr_t)cc);
+          fnv(hw, cc->version);
         }
-    if (known) sleepKey = h ? h : 1u;
+    if (!known) {
+      miss |= BodyBurnState::kMissUncached;
+    } else {
+      if ((st.keyPose | st.keyBox | st.keyWorld) == 0) {
+        miss |= BodyBurnState::kMissFirst;
+      } else {
+        if (hp != st.keyPose) miss |= BodyBurnState::kMissPose;
+        if (hb != st.keyBox) miss |= BodyBurnState::kMissBox;
+        if (hw != st.keyWorld) miss |= BodyBurnState::kMissWorld;
+      }
+      st.keyPose = hp;
+      st.keyBox = hb;
+      st.keyWorld = hw;
+      uint64_t h = hp;
+      fnv(h, hb);
+      fnv(h, hw);
+      sleepKey = h ? h : 1u;
+    }
     if (sleepKey && sleepKey == st.sleepKey) {  // asleep
+      burnStats_.sleeps++;
+      // The idle exit's grace, still counting: an index nobody else keeps
+      // warm is released on the same tick it would have been awake, and the
+      // key survives the release (it digests the world, not the index).
+      if (!st.idx.empty() && ++st.quiet > kBurnIndexGrace) {
+        Mob::DropBurnIndex(st);
+        st.sleepKey = sleepKey;
+      }
       st.idle = true;
+      st.slept = true;
+      st.sleepMiss = 0;
       return changed;
     }
   }
+  // The walk's own budget, when the caller gave one (BurnLimbView::
+  // walkBudget: loose debris). All or nothing, before any state moves.
+  if (v.walkBudget) {
+    const uint64_t box = (uint64_t)(hi.x - lo.x + 1) *
+                         (uint64_t)(hi.y - lo.y + 1) *
+                         (uint64_t)(hi.z - lo.z + 1);
+    const uint32_t need = (uint32_t)std::min<uint64_t>(box, kBurnScanCells);
+    if (*v.walkBudget < need) {
+      v.walkDeferred = true;
+      burnStats_.walkDeferred++;
+      return changed;
+    }
+    *v.walkBudget -= need;
+  }
+  st.sleepMiss = miss;
   st.sleepKey = 0;
   scanHot.clear();
   {
@@ -12871,6 +13527,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           // rules — see the inbound pass below).
           if (matHot_[m] || matAttacksBody_[m]) scanHot.push_back({x, y, z});
         }
+    burnStats_.walkCells += seen;
   }
 
   // ---- A SIBLING LIMB'S HEAT MUST ALSO WAKE THIS ONE ----------------------
@@ -12927,10 +13584,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // other tick, then released.
     if (!st.idx.empty() && ++st.quiet > kBurnIndexGrace)
       Mob::DropBurnIndex(st);
-    // Fall asleep only with no index held (the grace above has run out): a
-    // held index still counts its quiet ticks, and sleeping would freeze it.
-    // `sleepKey` is nonzero only when the index was ALREADY empty on entry.
-    if (st.idx.empty()) st.sleepKey = sleepKey;
+    // Fall asleep whether or not an index is held (see the note at the key):
+    // the asleep branch goes on counting the grace. After the drop above,
+    // which clears the key.
+    st.sleepKey = sleepKey;
     st.idle = true;
     return changed;
   }
@@ -12983,12 +13640,13 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const size_t vi = (e & ~kBurnQueued) - 1;
     const uint32_t m = v.Mat(vi);
     if (m == 0 || m >= matGpu_.size()) return;
-    // A voxel with nothing of its own to do may still wear FUEL (oil on
-    // bone), and the flame walking the coat has to reach it.
+    // A voxel with nothing of its own to do may still wear a coat that
+    // REACTS (oil or water on bone): the coat is a reactant in its own right
+    // (DESIGN.md §6), and the flame walking the coat has to reach it.
     if (matGpu_[m].reactCount == 0) {
       const uint16_t sc = v.Stain(vi);
       const uint32_t cm = BodyStainMat(sc);
-      if (!BodyStainAmt(sc) || cm >= matCoatFuel_.size() || !matCoatFuel_[cm])
+      if (!BodyStainAmt(sc) || cm >= matHasPair_.size() || !matHasPair_[cm])
         return;
     }
     queue(c);
@@ -13170,6 +13828,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // encoded as material identity — one 16-bit poke, no re-pack, no
       // realloc, no origin shift, no rig fix-up (PLAN §3.4/§3.5).
       v.Set(i, pm, (rr >> 6) % 3u);
+      // A coat HELD in an absorbent substrate is released by any rewrite of
+      // it, as on the ground; a FILM (every body material today) stays on
+      // the voxel (DESIGN.md §6 clause 2b).
+      if (was < matGpu_.size() &&
+          ((matGpu_[was].stainPack >> kStainPackAbsorbShift) &
+           kStainPackAbsorbMask) != 0 &&
+          v.Stain(i) != 0) {
+        v.SetStain(i, 0);
+        st.coatTouched = true;
+        if (OwnForStain(v, microSet_))
+          MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y,
+                             p.z, 0);
+      }
       if (v.carved && *v.carved && v.microModel && *v.microModel >= 0 && microSet_)
         MicroBodyPoke(*microSet_, (uint32_t)(*v.microModel), p.x, p.y, p.z,
                       (uint8_t)pm, 0);
@@ -13203,8 +13874,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // the voxel's own world cell, so burning matter visibly wastes away
       // instead of silently vanishing.
       if (pm != 0 && pm < matGpu_.size()) {
+        const uint32_t jitter = (rr >> 6) % 3u;
         const uint32_t state =
-            matGpu_[pm].klass == CLASS_LIQUID ? 7u : (rr >> 6) % 3u;
+            matGpu_[pm].klass == CLASS_LIQUID ? 7u
+            : v.gridState ? v.gridState(v.gridStateCtx, pm, v.Art(i), jitter)
+                          : jitter;
         const Vec3 wv = worldOf(p);
         emitCell({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, pm, state);
       }
@@ -13334,6 +14008,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // substituting a sibling's material would mean something other than heat
     // (an inverted ramp, and the inbound pass).
     bool ncross[6] = {};
+    // What the GRID holds at each world-facing face, before any worn shell or
+    // sibling limb was substituted for it: where a coat's released flame may
+    // go (DESIGN.md §6 rule 2, "an open face of the cell").
+    uint32_t nworld[6] = {};
     for (int k = 0; k < 6; k++) {
       const IVec3& d = kBurnDirs[k];
       const uint32_t nc = cellOf({vp.x + d.x, vp.y + d.y, vp.z + d.z});
@@ -13386,6 +14064,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             wornStats_.nbrMissInReach++;
         }
         nmat[k] = worn ? worn : wm;
+        nworld[k] = wm;
         ncell[k] = kNoBurnCell;
         // HEAT ACROSS A JOINT, and ONLY where the grid had nothing to say.
         // A cell holding real matter already answered this face -- fire in it
@@ -13454,32 +14133,6 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       }
     }
 
-    // ---- A HOT COAT IS WHAT IS OUTSIDE ME --------------------------------
-    //
-    // Lava poured on skin is lava against every face of it the world can
-    // touch, so each exposed face that read open air reads the coat instead
-    // -- as a face as WIDE as a world voxel of it (the four tangential cells
-    // too), because a coat is a sheet, not a lone ember, and flesh authored
-    // minCount 3 must catch under one. Only open air is replaced: real
-    // matter outside still answers, and a worn shell already answered with
-    // itself (the lava went on the shell, not the skin). The voxel's own
-    // rules then sear and ignite it with no rule mirrored for coats; the
-    // inbound pass skips these faces, because the coat's own bite is section
-    // 3's, which pays for it in depth.
-    bool coatFace[6] = {};
-    {
-      const uint16_t sc = v.Stain(i);
-      const uint32_t cm = BodyStainMat(sc);
-      if (BodyStainAmt(sc) && cm < matCoatHot_.size() && matCoatHot_[cm])
-        for (int k = 0; k < 6; k++) {
-          if (ncell[k] != kNoBurnCell || nmat[k] != 0 || ncross[k]) continue;
-          nmat[k] = cm;
-          for (int j = 0; j < 4; j++) ntan[k][j] = cm;
-          tanValid[k] = true;
-          coatFace[k] = true;
-        }
-    }
-
     // How much of this voxel the WORLD can touch. Recorded before any rule
     // runs, because it is the ceiling on every ramp count below and it is a
     // fact about the limb's SHAPE rather than about the fire (see BurnStats).
@@ -13491,40 +14144,54 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       burnStats_.exposed[exposed]++;
     }
 
-    // ---- 0. WATER ON THE SKIN: A WET BODY DOES NOT BURN --------------------
+    // ---- 0. THE COAT IS A CO-LOCATED VIRTUAL NEIGHBOUR (DESIGN.md §6) -------
     //
-    // The coat is read here, on the burn side, because this is where "does
-    // this voxel catch" is decided. Three things, all off the WASHER coat
-    // (stain block `washes`, i.e. water) and none naming a material:
+    // rule-unification W2-J2, 2026-09-24. This used to be four hand-written
+    // sections, each with its own RNG index space: a WET coat that refused
+    // hot products, boiled at coat.fireDrySeconds and paid 4 levels a douse; a
+    // FUEL coat that spent itself whole per flash and jumped the voxel to its
+    // burning form; a HOT coat read as every open face of the voxel, widened;
+    // and a CORROSIVE coat that bit the voxel at a depth price and carried
+    // inward. It is now the ONE rule the grid runs (sim_step.wgsl coatReact /
+    // doReactions), over the body lattice, with the arithmetic shared through
+    // sim/coatrule.h (check_invariants `coatrule`). No material is named: the
+    // coat's behaviour is its material's rules in reactions.json.
     //
-    //   * A wet voxel refuses every rule whose product is hot or a burn stage
-    //     (skipped in the loop below), so it neither ignites nor sears.
-    //   * Heat against a wet voxel BOILS the coat off, far faster than it
-    //     dries in air (coat.fireDrySeconds from soaked to dry), so fire
-    //     dries you out and then takes you.
-    //   * A BURNING voxel that is wet, or has a wet lattice neighbour, runs
-    //     its OWN authored douse rule (`X_burning + tag:extinguisher`) with
-    //     the water as the neighbour, and the water pays a few levels for it.
-    //     No new table: the rules that put a burning voxel out in a puddle put
-    //     it out under a wet sleeve.
-    const bool mHot = m < matHot_.size() && matHot_[m];
-    auto washerOf = [&](uint16_t c) -> uint32_t {
-      const uint32_t cm = BodyStainMat(c);
-      return BodyStainAmt(c) && cm && cm < matGpu_.size() &&
-                     (matGpu_[cm].stainPack & kStainPackWashesBit)
-                 ? cm
-                 : 0u;
-    };
-    const uint32_t selfWasher = washerOf(v.Stain(i));
-    // Lose `levels` of a washer coat on voxel `wi` (steam). Owned before the
-    // poke for the same COW reason every other coat write is.
-    auto boil = [&](size_t wi, uint32_t levels) {
-      const uint16_t c = v.Stain(wi);
-      const uint32_t amt = BodyStainAmt(c);
-      if (!amt || !washerOf(c)) return;
-      const uint32_t left = amt > levels ? amt - levels : 0u;
-      const uint16_t next =
-          left ? PackBodyStain(BodyStainMat(c), left) : (uint16_t)0;
+    //   1. THE COAT'S RULES FIRST. The coat material's PAIR rules, in file
+    //      order, with the coat as `self`: its partners are this voxel (clause
+    //      1a: the coat touches what it is ON first) and then the six faces,
+    //      in a rotation. A partner outside this lattice (a grid cell, a
+    //      sibling limb, a worn shell) is READ-ONLY (clause 2a), as it is to
+    //      the voxel's own rules below: a rule that would rewrite it does not
+    //      match it.
+    //   2. FIRED, it spends ONE level. A flame product goes into an open face
+    //      (the grid cell there is air, else a gas) and a flame with no open
+    //      face is not a match; any other coat-side product is not created.
+    //      The partner's side is ordinary. This voxel rewritten IN PLACE (a
+    //      solid product) keeps its coat -- on a body the coat is a FILM, not
+    //      liquid held in an absorbent substrate (clause 2b) -- and a voxel
+    //      that LEAVES takes its coat with it, unless the coat is DEEP
+    //      (clause 7: it pays a layer's price and the rest carries inward).
+    //   3. A matched rule whose coat side is not a flame COVERS the voxel for
+    //      the tick: its own rules below see the coat and nothing else.
+    //   4. The voxel's own rules take the coat as a pair partner after the
+    //      faces, and a direct ramp counts it (widened at world pitch on a
+    //      fine lattice, clause 4a).
+    //   5. The coat and the voxel each fire at most one rule a tick, the
+    //      coat's first; the voxel's rules see the coat as it is after.
+    //   6. Only the wearer sees its coat: a lattice neighbour's rules read this
+    //      voxel's material, never its coat (so a wet voxel no longer douses
+    //      the burning one beside it -- its water boils instead, and it is
+    //      covered while it does).
+    const uint16_t coatWord0 = v.Stain(i);
+    uint32_t coatAmt = BodyStainAmt(coatWord0);
+    uint32_t coat = BodyStainMat(coatWord0);
+    if (!coatAmt || coat == 0 || coat >= matGpu_.size()) coat = 0, coatAmt = 0;
+    const bool pitchFine = v.scale > 1u;
+    bool covered = false;
+    bool selfDone = false;
+    auto setCoat = [&](size_t wi, uint16_t next) {
+      if (v.Stain(wi) == next) return;
       v.SetStain(wi, next);
       st.coatTouched = true;
       changed = true;
@@ -13534,117 +14201,193 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                            wp.z, next);
       }
     };
-    if (mHot) {
-      // The water that douses: this voxel's own, else a lattice neighbour's.
-      size_t wetAt = selfWasher ? i : SIZE_MAX;
-      uint32_t washer = selfWasher;
-      for (int k = 0; k < 6 && !washer; k++) {
-        if (ncell[k] == kNoBurnCell) continue;
-        const uint32_t ni = st.idx[ncell[k]] & ~kBurnQueued;
-        if (!ni) continue;
-        washer = washerOf(v.Stain(ni - 1));
-        if (washer) wetAt = ni - 1;
+    auto isFlame = [&](uint32_t prod) {
+      if (prod == kProdKeep) return false;
+      const uint32_t pm = prod & 0xFFFu;
+      return pm != 0 && pm < matGpu_.size() &&
+             (matGpu_[pm].flags & kMatFlagFlame) != 0;
+    };
+    // Where a released flame goes (rule 2): the first face, in a rotation,
+    // whose GRID cell is open air, else the first that is a gas -- and only a
+    // face the lattice, a sibling and a worn shell all leave open. -1 = none.
+    // `avoid` is the partner face being rewritten. (A body's faces are
+    // lattice directions, so a rule's world direction mask is not consulted --
+    // as the voxel's own pair rules never did; no coat rule authors one.)
+    auto releaseFace = [&](uint32_t rot, int avoid) -> int {
+      int gasFace = -1;
+      for (int j = 0; j < 6; j++) {
+        const int k = (int)((rot + (uint32_t)j) % 6u);
+        if (k == avoid) continue;
+        if (ncell[k] != kNoBurnCell || ncross[k] || nmat[k] != nworld[k])
+          continue;
+        if (nworld[k] == 0) return k;
+        if (gasFace < 0 && nworld[k] < matGpu_.size() &&
+            matGpu_[nworld[k]].klass == CLASS_GAS)
+          gasFace = k;
       }
-      if (washer) {
-        const MaterialGpu& hg = matGpu_[m];
-        bool doused = false;
-        for (uint32_t ri = 0; ri < hg.reactCount && !doused; ri++) {
-          const ReactionGpu& r = reactions_[hg.reactOffset + ri];
-          if ((r.packed & 3u) != kReactPair || r.prodSelf == kProdKeep) continue;
-          if (!ReactNbrMatches(r, washer, matGpu_)) continue;
-          // Its own rule-index space (+96), apart from the self (+0) and
-          // inbound (+64) passes, so the douse roll correlates with neither.
-          const uint32_t rr =
-              Hash3(lk ^ (ck * 3266489917u), tick, 96u + ri);
-          if (rr % kReactChanceDen >= r.chance) continue;
-          applyTo(cell, r.prodSelf, rr);
-          doused = true;
-        }
-        if (doused) {
-          boil(wetAt, kCoatDouseCost);
-          continue;  // one rule per voxel per tick, as below
-        }
-      }
-    }
-    if (selfWasher && !mHot) {
-      bool heated = false;
-      for (int k = 0; k < 6 && !heated; k++)
-        heated = nmat[k] && nmat[k] < matHot_.size() && matHot_[nmat[k]];
-      if (heated) {
-        // A level per `fireDrySeconds * 30 / 15` ticks of contact, rolled per
-        // tick so a fractional rate is exact on average.
-        const float secs =
-            std::max(0.05f, CurrentTuning().coat.fireDrySeconds);
-        const uint32_t pm = (uint32_t)std::min(
-            1000.0f, 1000.0f * (float)kStainAmtMax / (secs * 30.0f));
-        const uint32_t rr = Hash3(lk ^ (ck * 2654435761u), tick, 0xB011u);
-        if (rr % 1000u < pm) boil(i, 1u);
-      }
-    }
+      return gasFace;
+    };
+    // The release itself is the body's one write path into the grid: a
+    // fill-air cell op, deduped per world cell (emitCell). Into a gas cell it
+    // is refused by the GPU -- the flame was still made, and spent the level.
+    auto release = [&](int k, uint32_t prod, uint32_t rr) {
+      const IVec3& d = kBurnDirs[k];
+      const Vec3 wv =
+          worldOf(vp) + Rotate(q, Vec3{(float)d.x * inv, (float)d.y * inv,
+                                       (float)d.z * inv});
+      emitCell({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, prod & 0xFFFu,
+               (rr >> 8u) % 3u);
+    };
+    // A HELD coat (the substrate absorbs: materials.json `absorb`) is liquid
+    // in the voxel and leaves with any rewrite of it, as on the ground; a FILM
+    // (every body material authored today) stays on a voxel rewritten in
+    // place (clause 2b).
+    const bool heldCoat =
+        ((matGpu_[m].stainPack >> kStainPackAbsorbShift) & kStainPackAbsorbMask) != 0;
 
-    // ---- 0b. A FUEL COAT FLASHES: OIL ON ME, HEAT BESIDE ME ---------------
-    //
-    // The coat's OWN rules with the coat as `self` and this voxel's six faces
-    // as its neighbours -- exactly the question a grid cell of oil asks -- and
-    // a rule whose product is hot (oil + tag:hot -> fire) fires the flash:
-    // the film is spent, a flame goes up off it into the world, and the voxel
-    // under it catches as flashForm_ (skin -> flesh_burning, straight past the
-    // sear). The flame then walks the coat: the voxel beside is wearing oil
-    // and now has a burning lattice neighbour, so it flashes on the next tick
-    // at oil's own authored odds. Bounded: a flash spends the coat it runs
-    // on and the coat was laid on the surface only (SoakLimb).
-    bool fired = false;
-    {
-      const uint16_t sc = v.Stain(i);
-      const uint32_t cm = BodyStainMat(sc);
-      if (BodyStainAmt(sc) && cm < matCoatFuel_.size() && matCoatFuel_[cm]) {
-        const MaterialGpu& fg = matGpu_[cm];
-        for (uint32_t rj = 0; rj < fg.reactCount && !fired; rj++) {
-          const ReactionGpu& r = reactions_[fg.reactOffset + rj];
-          if ((r.packed & 3u) != kReactPair || r.prodSelf == kProdKeep) continue;
-          const uint32_t ps = r.prodSelf & 0xFFFu;
-          if (ps >= matHot_.size() || !matHot_[ps]) continue;
-          if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
-          bool touch = false;
-          for (int k = 0; k < 6 && !touch; k++)
-            touch = nmat[k] && ReactNbrMatches(r, nmat[k], matGpu_);
-          if (!touch) continue;
-          // Its own rule-index space (+160), apart from self (+0), inbound
-          // (+64), douse (+96) and coat bite (+128).
-          const uint32_t rr =
-              Hash3(lk ^ (ck * 2891336453u), tick, 160u + rj);
-          if (rr % kReactChanceDen >=
-              RainScaledChance(r.cond, r.chance, weatherRain_, true))
-            continue;
-          v.SetStain(i, 0);
-          st.coatTouched = true;
-          changed = true;
-          if (OwnForStain(v, microSet_))
-            MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, vp.x, vp.y,
-                               vp.z, 0);
-          const Vec3 wv = worldOf(vp);
-          emitCell({ifloor(wv.x), ifloor(wv.y) + 1, ifloor(wv.z)}, ps,
-                   (rr >> 8u) % 3u);
-          const uint32_t into = m < flashForm_.size() ? flashForm_[m] : 0u;
-          if (into) applyTo(cell, into, rr);
-          fired = true;
-        }
+    // ---- CLAUSE 7: A DEEP COAT PAYS FOR WHAT IT EATS ----------------------
+    // A coat authored `coat.depth` world voxels deep is depth x scale lattice
+    // cells deep here. Deeper than one cell, rewriting a cell of this body --
+    // the voxel it is on, or a face neighbour -- costs one layer's PRICE,
+    // 15 / (depth x scale) levels (in milli-levels, rounded stochastically),
+    // instead of rule 2's one level; the voxel it was on LEAVING, what is left
+    // carries into the lattice neighbours behind it. A full coat therefore
+    // eats coat.depth WORLD voxels whatever this creature's pitch, and is then
+    // spent (rule 2 of CLAUDE.md: the depth is what was poured). A coat
+    // THINNER than one layer's price may still take the layer iff it clears a
+    // threshold fixed per voxel (keyed on the lattice position, not the tick
+    // and not the amount: a per-tick roll only delays a thin film and doubled
+    // the depth; an amount-keyed one re-rolls on every carry). The grid has
+    // scale 1 and no coat deeper than 1, so this never fires there.
+    bool deep = false;
+    bool canRewrite = true;
+    uint32_t costMilli = 1000u;
+    if (coat) {
+      const float depth =
+          coat < coatDepth_.size() ? std::max(1e-3f, coatDepth_[coat]) : 1.0f;
+      const float cells = depth * (float)std::max(1u, v.scale);
+      deep = cells > 1.0f;
+      if (deep) {
+        costMilli = std::max<uint32_t>(
+            1u, (uint32_t)std::min(15000.0f,
+                                   1000.0f * (float)kBodyStainAmtMax / cells));
+        const uint32_t haveMilli = coatAmt * 1000u;
+        if (haveMilli < costMilli &&
+            Hash3(lk ^ ((uint32_t)kp.x * 73856093u) ^
+                      ((uint32_t)kp.y * 19349663u) ^
+                      ((uint32_t)kp.z * 83492791u),
+                  0xAC1Du, 0u) % costMilli >= haveMilli)
+          canRewrite = false;
       }
     }
-    if (fired) continue;
+    // Levels left after a coat-side firing that rewrote matter of this body.
+    auto paidLeft = [&](uint32_t amt, uint32_t rr) -> uint32_t {
+      if (!deep) return coatLevelsAfter(amt, 1u);
+      const uint32_t leftMilli = coatLevelsAfter(amt * 1000u, costMilli);
+      return leftMilli / 1000u +
+             ((Pcg(rr) % 1000u) < leftMilli % 1000u ? 1u : 0u);
+    };
+
+    // ---- rules 1-3 and 5: the coat's own rules ----------------------------
+    if (coat) {
+      const MaterialGpu& cg = matGpu_[coat];
+      for (uint32_t rj = 0; rj < cg.reactCount; rj++) {
+        const ReactionGpu& r = reactions_[cg.reactOffset + rj];
+        if ((r.packed & 3u) != kReactPair) continue;
+        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_))
+          continue;
+        // The coat's own rule-index space (+128), apart from the voxel's
+        // self (+0) and inbound (+64) passes.
+        const uint32_t rr = Hash3(lk ^ (ck * 374761393u), tick, 128u + rj);
+        const uint32_t rot = rr >> 12u;
+        const bool rewrites = r.prodNbr != kProdKeep;
+        // Partner: this voxel (clause 1a), then the faces.
+        int pk = -2;  // -1 = this voxel, 0..5 = a face
+        if (ReactNbrMatches(r, m, matGpu_) &&
+            !(r.prodSelf == kProdKeep && r.prodNbr == m) &&
+            (!rewrites || canRewrite))
+          pk = -1;
+        for (int j = 0; j < 6 && pk == -2; j++) {
+          const int k = (int)((rot + (uint32_t)j) % 6u);
+          const uint32_t nm = nmat[k];
+          if (nm == 0 || !ReactNbrMatches(r, nm, matGpu_)) continue;
+          const bool lattice = ncell[k] != kNoBurnCell;
+          if (lattice && r.prodSelf == kProdKeep && r.prodNbr == nm) continue;
+          if (rewrites && (!lattice || !canRewrite)) continue;  // clause 2a
+          pk = k;
+        }
+        if (pk == -2) continue;
+        const bool flame = isFlame(r.prodSelf);
+        const int rf = flame ? releaseFace(rot, rewrites ? pk : -1) : -1;
+        const uint32_t verdict = coatRuleVerdict(flame, rf >= 0);
+        if ((verdict & kCoatVerdictMatch) == 0) continue;
+        if (verdict & kCoatVerdictCovers) covered = true;
+        burnStats_.coatMatched++;
+        if (rr % kReactChanceDen >=
+            RainScaledChance(r.cond, r.chance, weatherRain_, true))
+          continue;
+        // ---- FIRED ----
+        burnStats_.coatFired++;
+        if (rf >= 0) release(rf, r.prodSelf, rr);
+        if (rewrites && pk == -1) {
+          applyTo(cell, r.prodNbr, rr);
+          selfDone = true;
+          if ((st.idx[cell] & ~kBurnQueued) == 0) {
+            // It LEFT, and took the coat (applyTo cleared the tombstone's).
+            // A deep coat's remainder carries into the voxels behind.
+            const uint32_t left = deep ? paidLeft(coatAmt, rr) : 0u;
+            if (left) {
+              for (int k = 0; k < 6; k++) {
+                if (ncell[k] == kNoBurnCell) continue;
+                const uint32_t ni = st.idx[ncell[k]] & ~kBurnQueued;
+                if (!ni) continue;
+                const uint16_t cur = v.Stain(ni - 1);
+                const uint16_t next = RaiseBodyStain(cur, coat, left);
+                if (next == cur) continue;
+                const bool was = BodyStainAmt(cur) && corrodes(BodyStainMat(cur));
+                setCoat(ni - 1, next);
+                if (!was && corrodes(coat)) corrodeReached.push_back(ncell[k]);
+              }
+            }
+          } else if (heldCoat) {
+            setCoat(i, 0);  // released with the substrate that held it
+          } else {
+            const uint32_t left = paidLeft(coatAmt, rr);
+            setCoat(i, left ? PackBodyStain(coat, left) : (uint16_t)0);
+          }
+        } else {
+          if (rewrites) applyTo(ncell[pk], r.prodNbr, Pcg(rr));
+          const uint32_t left =
+              rewrites ? paidLeft(coatAmt, rr) : coatLevelsAfter(coatAmt, 1u);
+          setCoat(i, left ? PackBodyStain(coat, left) : (uint16_t)0);
+        }
+        break;  // rule 5: one coat rule a tick
+      }
+      // Rule 5: the voxel's own rules see the coat as it is NOW.
+      if (!selfDone) {
+        const uint16_t cw = v.Stain(i);
+        coatAmt = BodyStainAmt(cw);
+        coat = coatAmt ? BodyStainMat(cw) : 0u;
+        if (coat >= matGpu_.size()) coat = 0, coatAmt = 0;
+      }
+      if (covered) burnStats_.coatCovered++;
+    }
+    bool fired = selfDone;
 
     // ---- 1. this voxel's own rules ----
     const MaterialGpu& mg = matGpu_[m];
     for (uint32_t ri = 0; ri < mg.reactCount && !fired; ri++) {
       const ReactionGpu& r = reactions_[mg.reactOffset + ri];
       if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
-      // WET DOES NOT CATCH (section 0 above): no rule may turn a wet voxel
-      // into something burning or burnt.
-      if (selfWasher && (r.packed & 3u) != kReactEmit &&
-          r.prodSelf != kProdKeep) {
-        const uint32_t ps = r.prodSelf & 0xFFFu;
-        if ((ps < matHot_.size() && matHot_[ps]) || BurnStageOf(ps)) continue;
-      }
+      // (WET DOES NOT CATCH is no longer a skip list here: a wet voxel beside
+      // heat is COVERED by its water's own `+ tag:hot` rule (section 0, rule
+      // 3), so the rules below see only the coat and nothing hot.)
+      // A covered voxel has no open face: no emit (rule 3).
+      if (covered && (r.packed & 3u) == kReactEmit) continue;
+      // The coat as a partner (rule 4): does this rule's neighbour predicate
+      // match it? Not for an inverted ramp -- a film does not add to what
+      // the voxel is exposed to.
+      const bool coatHit = coat != 0 && ReactNbrMatches(r, coat, matGpu_);
       uint32_t chance = r.chance;
       // ---- A WOUND SETTLES SLOWER THAN A PUDDLE EVAPORATES ------------------
       // Blood's authored decay is a rate for a pool in the open (8 per-mille a
@@ -13677,8 +14420,8 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // Inverted ramps are excluded for the reason given at the ramp below.
       bool crossOnly = false;
       if (!ReactScaleInverted(r)) {
-        bool anyMatch = false, anyReal = false;
-        for (int k = 0; k < 6; k++) {
+        bool anyMatch = false, anyReal = coatHit;  // the coat is no sibling
+        for (int k = 0; k < 6 && !covered && !anyReal; k++) {
           if (!nmat[k] || !ReactNbrMatches(r, nmat[k], matGpu_)) continue;
           anyMatch = true;
           if (!ncross[k]) { anyReal = true; break; }
@@ -13700,11 +14443,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // (evaporation, freezing) and no body material does, so this is a
         // guard on a future rule rather than a live case; it is one line and
         // the alternative is a silent misreading.
-        uint32_t cnt = 0;
-        for (int k = 0; k < 6; k++) {
+        uint32_t faces = 0;
+        for (int k = 0; k < 6 && !covered; k++) {  // covered: the coat only
           const uint32_t nm2 = (invert && ncross[k]) ? 0u : nmat[k];
-          if (ReactNbrMatches(r, nm2, matGpu_) != invert) cnt++;
+          if (ReactNbrMatches(r, nm2, matGpu_) != invert) faces++;
         }
+        // THE COAT COUNTS (rule 4): once, capped at 6 -- and on a lattice
+        // finer than the world as a face widened at world pitch (clause 4a,
+        // sim/coatrule.h coatRampCount): a coat is a sheet over the voxel,
+        // and a skin voxel's other five faces are its own flesh however much
+        // lava is on it, so "one more face" could never reach flesh's
+        // authored minCount 3 -- the same argument as the ntan widening
+        // above, and the same number it reaches.
+        uint32_t cnt = coatRampCount(faces, !invert && coatHit, pitchFine);
         // WIDEN AT WORLD PITCH. A face pointing into matter this rule reacts
         // to counts for as much as that matter is wide across the face, so
         // `minCount 3` on a body means "a real fire" exactly as it does in the
@@ -13717,7 +14468,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // air on N sides"), and for those the wide-face reading is not the
         // same question, so they keep the lattice count they were authored
         // against.
-        if (!invert) {
+        if (!invert && !covered) {
           for (int k = 0; k < 6; k++) {
             if (!tanValid[k]) continue;
             if (!ReactNbrMatches(r, nmat[k], matGpu_)) continue;
@@ -13743,13 +14494,28 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // counter-based hash of (limb, cell, tick, rule index) rather than a
       // sequential stream, so reordering the comparison against it changes no
       // other roll anywhere and no rule's odds move.
-      int pairMatch = -1;
+      // The roll is drawn here, ahead of the match, for the same reason: the
+      // coat partner's flame needs its rotation (the pair path reads nothing
+      // else from it before the compare below).
+      const uint32_t rr = Hash3(lk ^ (ck * 2246822519u), tick, ri);
+      int pairMatch = -1;  // 0..5 a face, 6 the coat (rule 4)
+      int coatRelease = -1;
       if ((r.packed & 3u) == kReactPair) {
-        for (int k = 0; k < 6; k++)
+        for (int k = 0; k < 6 && !covered; k++)
           if (nmat[k] && ReactNbrMatches(r, nmat[k], matGpu_)) {
             pairMatch = k;
             break;
           }
+        // THE COAT AS PARTNER, after the faces (rule 4). The no-op skip as
+        // for a face; a flame on the coat side needs an open face to go
+        // into, or it is not a match (rule 2).
+        if (pairMatch < 0 && coatHit &&
+            !(r.prodSelf == kProdKeep && r.prodNbr == coat)) {
+          const bool flame = isFlame(r.prodNbr);
+          if (flame) coatRelease = releaseFace(rr >> 12u, -1);
+          if (coatRuleVerdict(flame, coatRelease >= 0) & kCoatVerdictMatch)
+            pairMatch = 6;
+        }
         if (pairMatch < 0) continue;
       }
       if (crossOnly && v.crossPct < 100) {
@@ -13764,7 +14530,6 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // Weather last, on the fully-scaled chance: rain douses a burning limb
       // and damps its catching exactly as it does a grid cell (reactcpu.h).
       chance = RainScaledChance(r.cond, chance, weatherRain_, true);
-      const uint32_t rr = Hash3(lk ^ (ck * 2246822519u), tick, ri);
       if (rr % kReactChanceDen >= chance) continue;
       const uint32_t kind = r.packed & 3u;
       if (kind == kReactDecay) {
@@ -13794,6 +14559,24 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         }
       } else {  // kReactPair
         const int match = pairMatch;  // found above, before the roll
+        if (match == 6) {
+          // FIRED THROUGH THE COAT (rule 4 with rule 2 on the coat side): a
+          // flame product is released, anything else is not created; the
+          // coat spends one level -- unless the voxel LEFT, taking its coat
+          // with it, or it was rewritten in place under a HELD coat, which
+          // goes with its substrate (clause 2b).
+          if (coatRelease >= 0) release(coatRelease, r.prodNbr, rr);
+          applyTo(cell, r.prodSelf, rr);
+          if ((st.idx[cell] & ~kBurnQueued) != 0) {
+            const bool rewrote = r.prodSelf != kProdKeep;
+            const uint32_t left =
+                rewrote && heldCoat ? 0u : coatLevelsAfter(coatAmt, 1u);
+            setCoat(i, left ? PackBodyStain(coat, left) : (uint16_t)0);
+          }
+          burnStats_.coatPartner++;
+          fired = true;
+          continue;
+        }
         // World neighbours are READ-ONLY from this side: a limb cannot
         // rewrite grid content, so only rules that keep the neighbour may
         // match against one. A CROSS neighbour is read-only for a stronger
@@ -13825,7 +14608,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // this feature deliberately does not have. Heat crosses a joint; damage
       // does not. No burning material rewrites its neighbour today, so this is
       // a guard on the authoring surface rather than a live case.
-      if (ncross[k] || coatFace[k]) continue;  // a coat bites in section 3
+      // Not gated on `covered`: only the WEARER sees its coat (rule 6), so a
+      // world cell's rule reaches a wet voxel exactly as the grid's lava
+      // still burns wet grass. A coat's own bite is section 0's.
+      if (ncross[k]) continue;
       const uint32_t wm = nmat[k];
       if (wm == 0 || wm >= matRewritesNbr_.size() || !matRewritesNbr_[wm])
         continue;
@@ -13848,109 +14634,6 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         break;
       }
     }
-
-    // ---- 3. INBOUND FROM MY OWN COAT: THE ACID IS ON ME -----------------
-    //
-    // Section 2 with the coat as the neighbour. A voxel wearing acid is a
-    // voxel with acid against it, so the acid's OWN rules are asked about
-    // this voxel's material exactly as they are for a grid cell of acid -- no
-    // rule mirrored per body material, nothing here names acid, and steel
-    // shrugs it off for the same reason it does in a pool (no tag to match).
-    //
-    // What the coat does on a bite is the one thing a grid cell has no
-    // version of: the voxel under it is gone, so it runs into the voxels that
-    // were behind it a little weaker. The cost per LATTICE layer is
-    // 15 / (coat.depth x scale) levels, rounded stochastically, so a full coat
-    // eats coat.depth WORLD voxels whatever this creature's skin pitch -- and
-    // is then spent: the depth is what was poured, never a chain reaction
-    // (rule 2). A rule that also spends the acid (a `selfBecomes`) costs the
-    // coat the same where it stands.
-    if (fired) continue;
-    {
-      const uint16_t sc = v.Stain(i);
-      const uint32_t cm = BodyStainMat(sc);
-      const uint32_t camt = BodyStainAmt(sc);
-      if (!camt || !corrodes(cm)) continue;
-      const MaterialGpu& cg = matGpu_[cm];
-      // One lattice layer's price, in milli-levels (see above).
-      const float depth =
-          cm < coatDepth_.size() ? std::max(1e-3f, coatDepth_[cm]) : 1.0f;
-      const uint32_t costMilli = std::max<uint32_t>(
-          1u, (uint32_t)std::min(
-                  15000.0f, 1000.0f * (float)kBodyStainAmtMax /
-                                (depth * (float)std::max(1u, v.scale))));
-      const uint32_t haveMilli = camt * 1000u;
-      // A coat THINNER than one layer's price may still take this layer, at
-      // odds of what it has over what the layer costs -- as a THRESHOLD fixed
-      // per voxel (keyed on its lattice position, not the tick and not the
-      // amount): the voxel goes iff the film on it is heavier than its own
-      // threshold. A per-tick roll only slows a thin film down (it sits there
-      // until it decays and bites eventually anyway), and a roll keyed on the
-      // amount re-rolls every time a second carry lands at a different
-      // amount; both measured about two layers for a splash authored to take
-      // one and a bit. A threshold is monotone -- more acid can only take more
-      // -- so the expected depth is the amount's share of coat.depth, and at a
-      // coarse pitch (one layer thicker than coat.depth) a coat takes the
-      // layer at those odds rather than always or never.
-      if (haveMilli < costMilli &&
-          Hash3(lk ^ ((uint32_t)kp.x * 73856093u) ^
-                    ((uint32_t)kp.y * 19349663u) ^ ((uint32_t)kp.z * 83492791u),
-                0xAC1Du, 0u) % costMilli >= haveMilli)
-        continue;
-      for (uint32_t rj = 0; rj < cg.reactCount; rj++) {
-        const ReactionGpu& r = reactions_[cg.reactOffset + rj];
-        if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep) continue;
-        if (!ReactNbrMatches(r, m, matGpu_)) continue;
-        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
-        // Its own rule-index space (+128), apart from self (+0), inbound
-        // (+64) and douse (+96).
-        const uint32_t rr =
-            Hash3(lk ^ (ck * 374761393u), tick, 128u + rj);
-        if (rr % kReactChanceDen >=
-            RainScaledChance(r.cond, r.chance, weatherRain_, true))
-          continue;
-        applyTo(cell, r.prodNbr, rr);
-        // What is left after paying for this layer, stochastically rounded.
-        const uint32_t leftMilli =
-            haveMilli > costMilli ? haveMilli - costMilli : 0u;
-        const uint32_t left =
-            leftMilli / 1000u +
-            ((Pcg(rr) % 1000u) < leftMilli % 1000u ? 1u : 0u);
-        auto setCoat = [&](size_t wi, uint16_t next) {
-          v.SetStain(wi, next);
-          st.coatTouched = true;
-          changed = true;
-          if (OwnForStain(v, microSet_)) {
-            const IVec3 wp = v.At(wi);
-            MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, wp.x, wp.y,
-                               wp.z, next);
-          }
-        };
-        if ((st.idx[cell] & ~kBurnQueued) == 0) {
-          // Eaten. The coat goes where the voxel was: into the lattice
-          // neighbours behind it.
-          if (left) {
-            for (int k = 0; k < 6; k++) {
-              if (ncell[k] == kNoBurnCell) continue;
-              const uint32_t ni = st.idx[ncell[k]] & ~kBurnQueued;
-              if (!ni) continue;
-              const uint16_t cur = v.Stain(ni - 1);
-              const uint16_t next =
-                  RaiseBodyStain(CoatBeneath(cur, cm), cm, left);
-              if (next == cur) continue;
-              const bool was = BodyStainAmt(cur) && corrodes(BodyStainMat(cur));
-              setCoat(ni - 1, next);
-              if (!was) corrodeReached.push_back(ncell[k]);
-            }
-          }
-        } else if (r.prodSelf != kProdKeep) {
-          // Rewritten in place (a solid product) and the rule spent the acid.
-          setCoat(i, left ? PackBodyStain(cm, left) : (uint16_t)0);
-        }
-        fired = true;
-        break;
-      }
-    }
   }
 
   // ---- WHAT A REMOVAL BARES IS BLOODY (materials.json `bareBlood`) --------
@@ -13964,7 +14647,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // The roll is keyed on the BARED voxel's position, never the tick, as
   // coatExposedBone's is: a voxel uncovered again by the next removal beside
   // it must get the same answer, or the mottle crawls as the hole widens.
-  // Run AFTER the loop so it lands over the acid section 3 just carried onto
+  // Run AFTER the loop so it lands over the acid section 0 (clause 7) just carried onto
   // that bone: bone is what acid cannot eat, so the acid there had nothing
   // left to do but glow and dry off -- and take the blood with it.
   const uint32_t bareAmt =
@@ -14196,7 +14879,8 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
     // Batched maintenance. May sever the limb or kill the creature, in which
     // case the limb list has been reshaped and nothing below may touch it --
     // including the rest of this loop.
-    if (limbs_[li].burn.removed && !FlushBurn(li, world, spawns, false))
+    if (limbs_[li].burn.removed &&
+        !FlushBurn(li, DamageCtx(DamageCause::Burn), world, spawns, false))
       return;
   }
   // WHAT A ZOMBIE LEFT IN YOU, one tick older. Here rather than in its own
@@ -14757,7 +15441,8 @@ bool Mob::InfectStep(int li, uint32_t tick, uint32_t nSpread, uint32_t nRot,
   // LAST, because it may sever the limb or kill the creature -- after which
   // `limb`, `v` and `st` are all dangling and the caller must touch nothing.
   if (eaten && limbs_[li].burn.removed &&
-      !FlushBurn(li, world, spawns, /*force=*/false))
+      !FlushBurn(li, DamageCtx(DamageCause::Burn), world, spawns,
+                 /*force=*/false))
     return false;
   return true;
 }
@@ -15252,7 +15937,9 @@ bool Mob::SyncJointTwins(World& world, std::vector<ParticleSpawn>& spawns) {
   // through their own links (gate acid-coat's control leg).
   for (int li = 0; li < (int)limbs_.size(); li++) {
     if (!limbs_[li].body || limbs_[li].burn.removed == 0) continue;
-    if (!FlushBurn(li, world, spawns, /*force=*/false)) return false;
+    if (!FlushBurn(li, DamageCtx(DamageCause::Burn), world, spawns,
+                   /*force=*/false))
+      return false;
   }
   return true;
 }
@@ -15420,12 +16107,13 @@ bool Mob::BluntPulpTick(uint32_t tick, World& world,
   // therefore live against it while the blow that caused it was scoped and the
   // crater it opens was not. That is a blunt amputation reached purely by the
   // voxels going away a few ticks late -- the collapse fraction, the split's
-  // straggler fallback, and (through `inBurnFlush_`) hp zero. The scope belongs
-  // on the whole sweep for exactly the reason Mob::BluntCarveScope states: A
-  // BLUNT HIT NEVER TAKES A LIMB OFF, and "never" has to include the crater.
-  // `unarmed` is not carried on the flag and does not matter here -- the two
-  // rules it picks are bleed rates, and a burn flush refuses the bleed anyway.
-  BluntCarveScope blunt(*this);
+  // straggler fallback, and (through the eaten row) hp zero. The flush below
+  // therefore carries DamageCause::Blunt, for the reason the blunt rows of
+  // game/severpolicy.h state: A BLUNT HIT NEVER TAKES A LIMB OFF, and "never"
+  // has to include the crater. Unarmed is not carried on the flag and does
+  // not matter here -- the two rows differ only in bleed rate, and an eaten
+  // carve refuses the bleed anyway.
+  const DamageCtx blunt(DamageCause::Blunt);
 
   for (int li = 0; li < (int)limbs_.size(); li++) {
     MobLimb& limb = limbs_[li];
@@ -15533,7 +16221,7 @@ bool Mob::BluntPulpTick(uint32_t tick, World& world,
       MarkInstancesDirty();
       burnFracDirty_ = true;
       if (limbs_[li].burn.removed &&
-          !FlushBurn(li, world, spawns, false))
+          !FlushBurn(li, blunt, world, spawns, false))
         return false;
     }
   }
@@ -15832,6 +16520,71 @@ void MobSystem::BurnDeadFlesh(uint32_t tick, World& world,
       world, spawns);
   for (auto it = fleshShellIdx_.begin(); it != fleshShellIdx_.end();)
     it = tick - it->second.seen > 60u ? fleshShellIdx_.erase(it) : std::next(it);
+}
+
+namespace {
+// The dye a loose body's leaving matter hands the grid (BurnLimbView::
+// gridState): DebrisSystem's art -> tint quantizer, which it keeps fresh.
+uint32_t LooseGridState(void* ctx, uint32_t mat, uint32_t art,
+                        uint32_t fallback) {
+  return static_cast<const DebrisSystem*>(ctx)->GridStateFor(mat, art,
+                                                             fallback);
+}
+}  // namespace
+
+// ---- LOOSE MATTER BURNS AS A LIMB DOES (W2-I, 2026-09-24) -------------------
+// One non-flesh debris body, offered by DebrisSystem::BurnBodies (which chose
+// it, sized its share of the budget, and runs the tail on what comes back).
+// It used to be evaluated by a copy of this system's evaluator in debris.cpp
+// that never learned coats, so an oiled plank did not flash and a soaked one
+// caught like a dry one; it now IS this evaluator, with the population's own
+// inputs on the view (none of a creature's: no ledger, no shells, no cross
+// heat, no wounds) and the dye hook only loose matter has.
+bool MobSystem::BurnLooseBody(DebrisSystem::FleshLattice& f, uint32_t tick,
+                              World& world, std::vector<CellOp>& cellOps,
+                              uint32_t& frontBudget, uint32_t& opsBudget,
+                              uint32_t& walkBudget, uint32_t& removed,
+                              bool& deferred) {
+  removed = 0;
+  deferred = false;
+  if (!BurnTablesReady()) return false;
+  burnStats_.looseVisits++;
+  FleshCoat& cc = looseBurn_[f.id];
+  cc.seen = tick + 1u;  // 0 is "never"
+  int model = -1;
+  BurnLimbView v = FleshView(f, cc, model);
+  bool carved = false;
+  v.carved = &carved;
+  if (debris_) {
+    v.gridState = &LooseGridState;
+    v.gridStateCtx = debris_;
+  }
+  // The debris scheduler's pot of world-walk cells (BurnLimbView::walkBudget).
+  v.walkBudget = &walkBudget;
+  // Its own stream: the body's global id, salted apart from the severed-flesh
+  // key so the two populations never share rolls.
+  const uint32_t key = FleshKey(f.id) ^ 0x1005E0u;
+  const bool changed =
+      BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget);
+  deferred = v.walkDeferred;
+  removed = cc.burn.removed;
+  cc.burn.removed = 0;
+  cc.burn.coatTouched = false;  // no ledger to tell; `changed` covers it
+  // The brick the view may have taken ownership of, back on its body.
+  if (model >= 0) *f.microModel = (uint32_t)model;
+  return changed;
+}
+
+void MobSystem::RetireLooseBurn(uint32_t tick) {
+  // Not offered for a grace period: the body settled into the grid, burnt
+  // away, left the window or simply has nothing near it. Its index is
+  // derived, and `alight` is re-seeded from the body the next time it is
+  // offered (FleshView), so nothing is lost but memory.
+  const uint32_t now = tick + 1u;
+  for (auto it = looseBurn_.begin(); it != looseBurn_.end();)
+    it = (now < it->second.seen || now - it->second.seen > kBurnIndexGrace)
+             ? looseBurn_.erase(it)
+             : std::next(it);
 }
 
 void MobSystem::StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
@@ -16209,6 +16962,7 @@ bool MobSystem::RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
   // the cap. A visit whose samples all fell inside the limb says nothing.
   if (changed) {
     st.quiet = 0;
+    st.holdBy |= BodyBurnState::kHoldRain;
     st.rainSated = 0;
   } else if (cappedHere > 0 && st.rainSated < 255) {
     st.rainSated++;
@@ -16263,6 +17017,7 @@ bool MobSystem::WetOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
   if (st.idx.empty()) BuildBurnIndex(v);
   if (st.idx.empty()) return false;
   st.quiet = 0;  // keep the index while there is water on the limb
+  st.holdBy |= BodyBurnState::kHoldWet;
   const IVec3 bd = st.dims, bm = st.min;
   auto idxAt = [&](IVec3 l) -> uint32_t {
     if (l.x < 0 || l.y < 0 || l.z < 0 || l.x >= bd.x || l.y >= bd.y || l.z >= bd.z)
@@ -16787,6 +17542,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   if (st.idx.empty()) BuildBurnIndex(v);
   if (st.idx.empty()) return false;
   st.quiet = 0;
+  st.holdBy |= BodyBurnState::kHoldContact;
   const IVec3 bd = st.dims, bm = st.min;
   auto idxAt = [&](int lx, int ly, int lz) -> uint32_t {
     if (lx < 0 || ly < 0 || lz < 0 || lx >= bd.x || ly >= bd.y || lz >= bd.z)
@@ -16879,7 +17635,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     } else {
       // Accumulates when the material matches: three splashes of blood
       // saturate; a different substance replaces only if heavier.
-      const uint16_t base = CoatBeneath(cur, c.mat);
+      const uint16_t base = cur;  // precedence: RaiseBodyStain
       const uint32_t a = BodyStainAmt(base);
       const uint32_t want = BodyStainMat(base) == c.mat || a == 0
                                 ? std::min(kBodyStainAmtMax, a + c.amount)
@@ -17056,6 +17812,7 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
     if (st.idx.empty()) BuildBurnIndex(v);
     if (st.idx.empty()) continue;
     st.quiet = 0;
+    st.holdBy |= BodyBurnState::kHoldSplatter;
     const IVec3 bd = st.dims, bm = st.min;
     const float scale = (float)std::max(1u, v.scale);
     const Vec3 boxLo{(float)bm.x, (float)bm.y, (float)bm.z};
@@ -17084,7 +17841,7 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
     };
     auto mark = [&](size_t vi, uint32_t amt) {
       const uint16_t cur = v.Stain(vi);
-      const uint16_t base = splashWashes ? cur : CoatBeneath(cur, e.mat);
+      const uint16_t base = cur;  // precedence: RaiseBodyStain / WashBodyStain
       const uint32_t a = BodyStainAmt(base);
       // Accumulates when the material matches: three splashes saturate; a
       // different substance replaces only if heavier. A WASHING splash (water
@@ -17286,14 +18043,15 @@ void Mob::ApplySplatter(const SplatterEvent& e) {
 bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                                 float radiusVoxels, bool ragged, bool eject,
                                 World& world,
-                                std::vector<ParticleSpawn>& spawns) {
+                                std::vector<ParticleSpawn>& spawns,
+                                const DamageCtx& ctx) {
   for (Mob& mob : mobs_)
     if (mob.CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels, ragged,
-                            eject, world, spawns))
+                            eject, world, spawns, ctx))
       return true;
   for (Mob* av : avatars_)
     if (av->CarveLimbRadial(bodyHandle, centerWorldVoxel, radiusVoxels, ragged,
-                            eject, world, spawns))
+                            eject, world, spawns, ctx))
       return true;
   return false;
 }
@@ -17301,7 +18059,8 @@ bool MobSystem::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
 bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
                           float radiusVoxels, bool ragged, bool eject,
                           World& world,
-                          std::vector<ParticleSpawn>& spawns) {
+                          std::vector<ParticleSpawn>& spawns,
+                          const DamageCtx& ctx, float blastPower) {
   if (!phys_ || radiusVoxels <= 0.0f) return false;
   for (size_t i = 0; i < limbs_.size(); i++) {
     if (limbs_[i].body != bodyHandle) continue;
@@ -17373,26 +18132,152 @@ bool Mob::CarveLimbRadial(uint64_t bodyHandle, Vec3 centerWorldVoxel,
     }
     const Mob::CarveSpall* spallPtr = wantSpall ? &spallData : nullptr;
 
+    // ---- A BLAST'S POWER, AND WHAT IS IN ITS WAY (W2-H) ---------------------
+    //
+    // The TERRAIN crater (sim_explode.wgsl) is decided per cell by power, not
+    // by radius: what reaches a cell is the blast's power less
+    // sim.falloffPerCell per cell of distance less the hardness of everything
+    // the ray crossed, and the cell goes if that exceeds its own hardness.
+    // Until W2-H a body crater was the radius alone, so an iron cuirass was as
+    // much use against a grenade as a shirt and a spark and a charge of equal
+    // radius tore a body the same.
+    //
+    // Same rule here, in the body's own units: the power left over the voxel's
+    // hardness, against gore.blastPowerRef, scales the crater radius AT that
+    // voxel -- at or above the reference the crater is the full radius (a
+    // grenade on bare flesh is exactly what it was), below it the crater
+    // shrinks, at nothing it spares the voxel. What the ray crossed is every
+    // worn SHELL over this limb (Mob::BlastShellStop: each crossing costs its
+    // ShellResponse::stop, hardness x gear.blastShellCells). The ragged rim
+    // below is then drawn inside that smaller radius, so an armoured body
+    // loses a smaller, still-torn crater rather than a thinned-out speckle.
+    //
+    // Memoised per HALF VOXEL of the limb's frame: the collider and skin
+    // passes and every skin cell in one half-voxel share one ray, which is
+    // what keeps a march per voxel off a 40,000-voxel torso.
+    struct BlastField {
+      bool on = false;
+      float power = 0.0f, falloff = 0.0f, ref = 1.0f;
+      bool shells = false;
+      Vec3 cWorld{};
+      Quat q{};
+      Vec3 pos{};
+      std::unordered_map<uint64_t, float> stop;  // half-voxel key -> power lost
+    };
+    auto field = std::make_shared<BlastField>();
+    if (blastPower > 0.0f && ctx.cause == DamageCause::Blast) {
+      field->on = true;
+      field->power = blastPower;
+      field->falloff = (float)std::max(1, CurrentTuning().sim.falloffPerCell);
+      field->ref = std::max(1.0f, gt.blastPowerRef);
+      field->shells = (int)i < baseLimbs_ && LimbHasShells((int)i);
+      field->cWorld = centerWorldVoxel;
+      field->q = q;
+      field->pos = limb.xf.pos;
+    }
+    const int limbIdx = (int)i;
+    // The crater-radius scale at a point `bodyLocal` of this limb (world
+    // voxels, limb frame) holding a voxel of hardness `hard`. 1 when the
+    // power model is off.
+    auto powerScale = [this, field, cBody, limbIdx](Vec3 bodyLocal,
+                                                     float hard) -> float {
+      if (!field->on) return 1.0f;
+      const Vec3 dv = bodyLocal - cBody;
+      const float d = dv.len();
+      float stop = 0.0f;
+      if (field->shells && d > 1e-3f) {
+        const int kx = (int)std::floor(bodyLocal.x * 2.0f);
+        const int ky = (int)std::floor(bodyLocal.y * 2.0f);
+        const int kz = (int)std::floor(bodyLocal.z * 2.0f);
+        const uint64_t key = ((uint64_t)(uint16_t)kx << 32) |
+                             ((uint64_t)(uint16_t)ky << 16) |
+                             (uint64_t)(uint16_t)kz;
+        auto it = field->stop.find(key);
+        if (it != field->stop.end()) {
+          stop = it->second;
+        } else {
+          const Vec3 from = field->pos + Rotate(field->q, bodyLocal);
+          const Vec3 to = field->cWorld - from;
+          const float dist = to.len();
+          stop = dist > 1e-3f
+                     ? BlastShellStop(limbIdx, from, to * (1.0f / dist), dist)
+                     : 0.0f;
+          field->stop.emplace(key, stop);
+        }
+      }
+      const float left =
+          field->power - field->falloff * d - stop - std::max(hard, 0.0f);
+      return std::clamp(left / field->ref, 0.0f, 1.0f);
+    };
+    // The spall pass is a sphere with no per-voxel say, so it takes the scale
+    // at the limb's point nearest the blast: a plate that shrank the crater
+    // shrinks the tearing round its rim with it.
+    if (field->on && wantSpall) {
+      const Vec3 near = ClampToLimbBox(limb, cBody);
+      spallData.radius =
+          radiusVoxels *
+          powerScale(near, MaterialHardness(ShellMaterialAt(
+                               (int)i, limb.xf.pos + Rotate(q, near))));
+    }
+    if (field->on && spallData.radius <= 0.0f) spallPtr = nullptr;
+
     Mob::CarveReport rep{};
     const bool alive = CarveLimb(
-        (int)i, world, spawns, eject,
-        [&, cBody, seed, jitterScale, chunk, falloffExp,
-         blob](float scale) -> LimbCarveKeep {
+        (int)i, ctx, world, spawns, eject,
+        [&, cBody, seed, jitterScale, chunk, falloffExp, blob, field,
+         powerScale](float scale) -> LimbCarveKeep {
           const Vec3 cLocal = cBody * scale;
           const float rLocal = radiusVoxels * scale;
           const float rLocal2 = rLocal * rLocal;
           const float toSkin = jitterScale / scale;
+          // Per-voxel hardness for the power model, from whichever lattice
+          // this pass tests (the skin carries the anatomy's materials; the
+          // collider its majority material). Built only when the model is on.
+          std::shared_ptr<std::unordered_map<uint64_t, float>> hardAt;
+          if (field->on) {
+            hardAt = std::make_shared<std::unordered_map<uint64_t, float>>();
+            const MobLimb& L = limbs_[limbIdx];
+            auto key = [](int x, int y, int z) {
+              return ((uint64_t)(uint16_t)x << 32) |
+                     ((uint64_t)(uint16_t)y << 16) | (uint64_t)(uint16_t)z;
+            };
+            const bool skinPass =
+                L.HasFineSkin() &&
+                (uint32_t)scale == std::max(1u, SkinScaleOf(L));
+            if (skinPass) {
+              hardAt->reserve(L.skinVoxels.size());
+              for (const PrefabVoxel& v : L.skinVoxels)
+                hardAt->emplace(key(v.x, v.y, v.z),
+                                MaterialHardness(v.material & 0xFFFu));
+            } else {
+              hardAt->reserve(L.voxels.size());
+              for (const DebrisVoxel& v : L.voxels)
+                hardAt->emplace(key(v.x, v.y, v.z),
+                                MaterialHardness(v.payload & 0xFFFu));
+            }
+          }
           return [=](int x, int y, int z) {
             Vec3 c{(float)x + 0.5f, (float)y + 0.5f, (float)z + 0.5f};
             Vec3 dv = c - cLocal;
             float d2 = dv.dot(dv);
             if (d2 >= rLocal2) return true;  // outside
+            // THE POWER MODEL shrinks the radius at this voxel (above).
+            float rEff2 = rLocal2;
+            if (hardAt) {
+              const auto it = hardAt->find(((uint64_t)(uint16_t)x << 32) |
+                                           ((uint64_t)(uint16_t)y << 16) |
+                                           (uint64_t)(uint16_t)z);
+              const float hard = it != hardAt->end() ? it->second : 0.0f;
+              const float s = powerScale(c * (1.0f / scale), hard);
+              rEff2 = rLocal2 * s * s;
+              if (d2 >= rEff2) return true;  // the power ran out first
+            }
             if (!ragged) return false;       // clean bore (laser kerf)
             // Ragged rim: certain removal in the core, thinning outward,
             // so a blast crater in flesh is torn rather than scooped.
             // CPU gameplay state (limbs are outside the hashed domain),
             // so a float hash is fine -- rule 1 governs the grid.
-            float t = std::sqrt(d2 / rLocal2);
+            float t = std::sqrt(d2 / rEff2);
             float chance = 1.0f - t * t;
             // TIGHTEN THE CRATER. `1 - t^2` is 0.75 at half the radius and
             // 0.36 at 80% of it, which is why a large blast really did remove
@@ -17559,8 +18444,8 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
   if (IsWornSlot(li)) {
     // ---- A DENT IN A PLATE IS STILL A DENT (2026-09-16) -------------------
     //
-    // The scope belongs here for exactly the reason Mob::BluntCarveScope
-    // states: A BLUNT HIT NEVER TAKES A LIMB OFF. A worn shell IS a limb slot
+    // The blunt cause belongs here for exactly the reason the blunt rows of
+    // game/severpolicy.h state: A BLUNT HIT NEVER TAKES A LIMB OFF. A worn shell IS a limb slot
     // (`ld.severable = true`, so a cut STRAP drops the pauldron), and this
     // branch used to `return` five lines before the flesh branch below
     // constructed its scope — so the armour carve ran unguarded and the
@@ -17572,7 +18457,9 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
     // kLimbCollapseFraction (25%) of its spawn voxels, CarveLimb calls Sever()
     // and the piece drops off the body. A mace should beat plate IN, and beat
     // the wearer through it; shearing it off the straps is a blade's job.
-    BluntCarveScope blunt(*this, hit.unarmed);
+    // Hence the cause on BOTH calls below (the blunt rows never collapse).
+    const DamageCtx blunt(hit.unarmed ? DamageCause::Unarmed
+                                      : DamageCause::Blunt);
     // The host limb's BODY HANDLE, captured before anything can sever the
     // shell: `wornHost` is an INDEX, and an index into a list that a Damage()
     // three lines down may reshape is the classic way to bruise the wrong arm.
@@ -17580,26 +18467,16 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
     const uint64_t hostBody =
         (hostIdx >= 0 && hostIdx < (int)limbs_.size()) ? limbs_[hostIdx].body
                                                        : 0ull;
-    // The shell's own material hardness, read the same way Mob::CutLimb reads
-    // it for the kerf -- first voxel of the authoritative lattice, because a
-    // shell is one material all over.
-    float hard = 0.0f;
-    if (sys_ != nullptr) {
-      uint32_t m = 0;
-      if (!limbs_[li].skinVoxels.empty())
-        m = limbs_[li].skinVoxels[0].material & 0xFFFu;
-      else if (!limbs_[li].voxels.empty())
-        m = limbs_[li].voxels[0].payload & 0xFFFu;
-      if (m < sys_->matGpu_.size()) hard = (float)sys_->matGpu_[m].hardness;
-    }
-    float k = 1.0f;
-    if (hard > 0.0f && gear.bluntHardnessRef > 0.0f)
-      k = std::clamp(gear.bluntHardnessRef / hard,
-                     std::clamp(gear.bluntHardnessMin, 0.0f, 1.0f), 1.0f);
+    // WHAT THE SHELL DOES TO TRAUMA is the Blunt row of game/shellresponse.h
+    // (W2-H): `carve` scales the dent by the hardness of the voxel the blow
+    // STRUCK (it read the lattice's first voxel until then), `shellHp` is
+    // gear.bluntShellHp, `passed` is gear.bluntThrough.
+    const ShellResponse resp = ShellResponseAt(li, hit.at, blunt);
+    const float k = resp.carve;
 
     // 1. THE SHELL TAKES hp. Ordinary Damage on the shell's own slot, which is
     //    what a piece's condition is made of, at gear.bluntShellHp of the blow.
-    Damage(bodyHandle, hit.hp * gear.bluntShellHp, hit.at, hit.impactSpeed);
+    Damage(bodyHandle, hit.hp * resp.shellHp, hit.at, hit.impactSpeed, blunt);
 
     // 2. ...AND IS BEATEN IN. Real voxels, through the ordinary radial carve --
     //    the same call an explosion makes, so a dented cuirass is dented in
@@ -17610,16 +18487,16 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
                          std::clamp(hit.armorBreak, 0.0f, 1.0f) * power * k;
     if (breakR > 0.0f)
       CarveLimbRadial(bodyHandle, hit.at, breakR, /*ragged=*/true,
-                      /*eject=*/true, world, spawns);
+                      /*eject=*/true, world, spawns, blunt);
 
     // 3. ...AND THE REST ARRIVES ON THE BODY UNDERNEATH. Not conditional on
     //    the shell breaking: the plate deforming IS how the energy gets
     //    through, which is the whole difference from a blade. No dent and no
     //    armour break on this pass -- what is under the plate is flesh, and the
     //    bruise is what a transmitted blow leaves.
-    if (hostBody != 0ull && gear.bluntThrough > 0.0f) {
+    if (hostBody != 0ull && resp.passed > 0.0f) {
       ::BluntHit through = hit;
-      through.hp = hit.hp * gear.bluntThrough;
+      through.hp = hit.hp * resp.passed;
       through.carve = 0.0f;
       through.armorBreak = 0.0f;
       // The knock-loose rule is the SHELL's, not the wearer's: a strap does not
@@ -17634,11 +18511,11 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
 
   // ---- LIVE FLESH: TRAUMA, A BRUISE, AND AT MOST A DENT -------------------
   //
-  // The scope covers the WHOLE blow rather than only the carve, because both
+  // The cause covers the WHOLE blow rather than only the carve, because both
   // rules it arms are about the same fact -- this is trauma, not an edge. See
-  // Mob::BluntCarveScope.
-  BluntCarveScope blunt(*this, hit.unarmed);
-  if (!Damage(bodyHandle, hit.hp, hit.at, hit.impactSpeed)) return false;
+  // the Blunt / Unarmed rows of game/severpolicy.h.
+  const DamageCtx blunt(hit.unarmed ? DamageCause::Unarmed : DamageCause::Blunt);
+  if (!Damage(bodyHandle, hit.hp, hit.at, hit.impactSpeed, blunt)) return false;
   // Damage() can sever (an extreme impact) or kill (a vital limb at zero), and
   // either reshapes limbs_. Re-resolve rather than trusting `li`; a handle that
   // is gone means the blow landed and there is nothing left to bruise.
@@ -17717,13 +18594,13 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
   return true;
 }
 
-bool Mob::CarveBlob(int limbIndex, Vec3 centreLocal, float radiusWorld,
-                    float blob, uint32_t seed, World& world,
+bool Mob::CarveBlob(int limbIndex, const DamageCtx& ctx, Vec3 centreLocal,
+                    float radiusWorld, float blob, uint32_t seed, World& world,
                     std::vector<ParticleSpawn>& spawns, CarveReport* report) {
   if (limbIndex < 0 || limbIndex >= (int)limbs_.size() || radiusWorld <= 0.0f)
     return true;
   const uint32_t skinScale = std::max(1u, SkinScaleOf(limbs_[limbIndex]));
-  return CarveLimb(limbIndex, world, spawns, /*eject=*/true,
+  return CarveLimb(limbIndex, ctx, world, spawns, /*eject=*/true,
                    BlobCarveFactory({centreLocal}, {radiusWorld},
                                     std::max(0.5f, blob), seed, skinScale),
                    /*spall=*/nullptr, report);
@@ -17764,32 +18641,22 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   // material all over. No new authored field, and a garment added tomorrow
   // answers this without being edited. See Tuning::Gear::biteThroughSoft.
   if (IsWornSlot(li)) {
-    const Tuning::Gear& gear = tune.gear;
-    float hard = 0.0f;
-    if (sys_ != nullptr) {
-      uint32_t m = 0;
-      if (!limbs_[li].skinVoxels.empty())
-        m = limbs_[li].skinVoxels[0].material & 0xFFFu;
-      else if (!limbs_[li].voxels.empty())
-        m = limbs_[li].voxels[0].payload & 0xFFFu;
-      if (m < sys_->matGpu_.size()) hard = (float)sys_->matGpu_[m].hardness;
-    }
-    // 1 at or below the soft point, 0 at or above the hard one, linear
-    // between. A shell whose material could not be read (hardness 0) counts as
-    // soft, which is the safe way round: the failure is a bite that lands, not
-    // a creature that is silently invulnerable.
-    float through = 1.0f;
-    if (hard > gear.biteThroughSoft) {
-      const float span = std::max(gear.biteThroughHard - gear.biteThroughSoft, 1e-3f);
-      through = std::clamp((gear.biteThroughHard - hard) / span, 0.0f, 1.0f);
-    }
+    // The Bite row of game/shellresponse.h (W2-H), read off the voxel the
+    // teeth STRUCK: `passed` is the ramp -- 1 at or below the soft point, 0 at
+    // or above the hard one, linear between. A shell whose material could not
+    // be read (hardness 0) counts as soft, which is the safe way round: the
+    // failure is a bite that lands, not a creature that is silently
+    // invulnerable. `shellHp` is gear.biteOnShell, delivered as a blunt blow.
+    const ShellResponse resp =
+        ShellResponseAt(li, hit.at, DamageCtx(DamageCause::Bite));
+    const float through = resp.passed;
     // THE GARMENT IS BITTEN WHATEVER IT IS MADE OF. Teeth closing on a shirt
     // still charge it hp and still bruise the wearer through it -- that is the
     // path this branch always had, and a bite that tore the flesh underneath
     // without marking the cloth would be a hole with no hole in the sleeve.
     ::BluntHit b;
     b.at = hit.at;
-    b.hp = hit.hp * std::clamp(gear.biteOnShell, 0.0f, 1.0f);
+    b.hp = hit.hp * std::clamp(resp.shellHp, 0.0f, 1.0f);
     b.power = power;
     b.carve = 0.0f;
     b.armorBreak = 0.0f;
@@ -17823,12 +18690,13 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   // ---- LIVE FLESH: A TEAR ------------------------------------------------
   //
   // Bleeds like a cut, deliberately: this is a hole torn in meat, and refusing
-  // the drip here would make a bite read as a bruise. The scope keeps the
-  // BLADE rules off (a mouth has no direction to cut through in) and leaves
-  // the COLLAPSE sever ON, which is the one line separating a bite from a
-  // punch -- enough bites do take a hand off.
-  BiteScope bite(*this);
-  if (!Damage(bodyHandle, hit.hp, hit.at, /*impactSpeed=*/0.0f)) return false;
+  // the drip here would make a bite read as a bruise. DamageCause::Bite keeps
+  // the BLADE rules off (a mouth has no direction to cut through in) and
+  // leaves the COLLAPSE sever ON, which is the one line separating a bite from
+  // a punch -- enough bites do take a hand off. (Its rows are Other's.)
+  const DamageCtx bite(DamageCause::Bite);
+  if (!Damage(bodyHandle, hit.hp, hit.at, /*impactSpeed=*/0.0f, bite))
+    return false;
   li = -1;
   for (size_t i = 0; i < limbs_.size(); i++)
     if (limbs_[i].body == bodyHandle) {
@@ -17922,7 +18790,7 @@ bool Mob::BiteHit(uint64_t bodyHandle, const ::BiteHit& hit, World& world,
   const uint32_t seed = (uint32_t)id_ * 2654435761u + (uint32_t)li * 40503u +
                         hit.seed;
   const bool survived =
-      CarveBlob(li, centre, biteR, gt.biteBlob, seed, world, spawns, &rep);
+      CarveBlob(li, bite, centre, biteR, gt.biteBlob, seed, world, spawns, &rep);
   if (kBiteDebug)
     std::printf(
         "bite %s: hp %.2f power %.2f | at (%.2f,%.2f,%.2f) local "
@@ -18162,10 +19030,9 @@ uint32_t Mob::RotAtSpawn(World& world) {
 
   const auto& gt = CurrentTuning().gore;
   // Nothing is thrown into the world (`eject` false) and nothing bleeds
-  // (inSpawnRot_), so this stays empty; it exists because CarveLimb's signature
-  // wants somewhere to put particles.
+  // (DamageCause::SpawnRot), so this stays empty; it exists because CarveLimb's
+  // signature wants somewhere to put particles.
   std::vector<ParticleSpawn> discard;
-  inSpawnRot_ = true;
   uint32_t removedTotal = 0;
 
   for (size_t i = 0; i < limbs_.size(); i++) {
@@ -18301,7 +19168,8 @@ uint32_t Mob::RotAtSpawn(World& world) {
     const uint32_t nseed = seed ^ 0xB0DEC0DEu;
     Mob::CarveReport rep{};
     const bool alive = CarveLimb(
-        (int)i, world, discard, /*eject=*/false,
+        (int)i, DamageCtx(DamageCause::SpawnRot), world, discard,
+        /*eject=*/false,
         BlobCarveFactory(centres, radii, blob, nseed, skinScale),
         nullptr, &rep);
     removedTotal += rep.count;
@@ -18329,7 +19197,7 @@ uint32_t Mob::RotAtSpawn(World& world) {
     // chance falls to zero at its rim, so it is a scatter whose centroid is
     // inside the limb, and a ball there paints the wrong place.
     //
-    // NOTE what this does NOT do: bleed. `inSpawnRot_` already refused the drip
+    // NOTE what this does NOT do: bleed. SpawnRot already refused the drip
     // budget inside CarveLimb, and StainWound has no drip in it — so the holes
     // look wet and the creature is not haemorrhaging. That distinction is the
     // whole reason the two are separate functions.
@@ -18478,13 +19346,11 @@ uint32_t Mob::RotAtSpawn(World& world) {
       // stop touching it. Said out loud rather than swallowed, because a def
       // that rots itself apart at spawn is a content bug and there is no other
       // moment at which anybody would notice.
-      inSpawnRot_ = false;
       RebaseJointCounts();
       return removedTotal;
     }
   }
 
-  inSpawnRot_ = false;
   RebaseJointCounts();
   if (RotDebug()) {
     // EVERY limb's brick record after the whole rot, in one place. A per-carve
@@ -18512,33 +19378,37 @@ uint32_t Mob::RotAtSpawn(World& world) {
 
 void MobSystem::CarveMobsRadial(Vec3 centerWorldVoxel, float radiusVoxels,
                                 World& world,
-                                std::vector<ParticleSpawn>& spawns) {
+                                std::vector<ParticleSpawn>& spawns,
+                                float power) {
   for (Mob& mob : mobs_)
-    mob.CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
+    mob.CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns, power);
   // Then every avatar, ghosts included (mob.h). The empty-limb test is
   // PlayerAvatar::CarveRadial's Spawned() guard.
-  CarveLocalAvatarsRadial(centerWorldVoxel, radiusVoxels, world, spawns);
+  CarveLocalAvatarsRadial(centerWorldVoxel, radiusVoxels, world, spawns, power);
   // A ghost's gore goes to the discard (mob.h): its owner authors it.
   ghostSpawns_.clear();
   for (size_t i = localAvatars_; i < avatars_.size(); i++) {
     Mob* av = avatars_[i];
     if (av && !av->limbs_.empty())
-      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, ghostSpawns_);
+      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, ghostSpawns_,
+                         power);
   }
 }
 
 void MobSystem::CarveLocalAvatarsRadial(Vec3 centerWorldVoxel,
                                         float radiusVoxels, World& world,
-                                        std::vector<ParticleSpawn>& spawns) {
+                                        std::vector<ParticleSpawn>& spawns,
+                                        float power) {
   for (size_t i = 0; i < localAvatars_ && i < avatars_.size(); i++) {
     Mob* av = avatars_[i];
     if (av && !av->limbs_.empty())
-      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns);
+      av->CarveRadialAll(centerWorldVoxel, radiusVoxels, world, spawns, power);
   }
 }
 
 void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
-                         World& world, std::vector<ParticleSpawn>& spawns) {
+                         World& world, std::vector<ParticleSpawn>& spawns,
+                         float power, const DamageCtx& ctx) {
   // A blast craters a corpse exactly as it craters the living (it always
   // cratered the dead as debris). Only a released rig has nothing to carve.
   if (!phys_ || rigReleased_ || radiusVoxels <= 0.0f) return;
@@ -18560,9 +19430,14 @@ void Mob::CarveRadialAll(Vec3 centerWorldVoxel, float radiusVoxels,
       if ((xf.pos - centerWorldVoxel).len() <= radiusVoxels + r + 2.0f)
         handles.push_back(l.body);
     }
+  // IN LIMB ORDER, and that order is load-bearing for the blast's power
+  // model: a worn shell is an APPENDED slot, so every body limb is carved
+  // while the shells over it are still whole -- the flesh sees the plate the
+  // blast met, not the hole the same blast is about to put in it (the
+  // tick-start reading every other simultaneous rule here takes).
   for (uint64_t h : handles)
     CarveLimbRadial(h, centerWorldVoxel, radiusVoxels, true /*ragged*/,
-                    true /*eject*/, world, spawns);
+                    true /*eject*/, world, spawns, ctx, power);
 }
 
 void MobSystem::Sever(uint64_t mobId, int limbIndex) {
@@ -18570,13 +19445,16 @@ void MobSystem::Sever(uint64_t mobId, int limbIndex) {
   if (mob) mob->Sever(limbIndex);
 }
 
-void Mob::Sever(int limbIndex) {
+void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
   if (!def_) return;
   const MobDef& def = *def_;
   if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return;
   // limbDefs_, not def.limbs: a borrowed item slot severs like any limb (the
   // sword is cut out of the hand), and its def row only exists on the copy.
   const MobLimbDef& ld = limbDefs_[limbIndex];
+  // What this cause makes of coming off (game/severpolicy.h): the death's
+  // name, the gore, whether a garment drops, whether the audio hears a blade.
+  const SeverPolicy pol = PolicyAt(limbIndex, ctx);
   // HOW MUCH OF THE LIMB WAS STILL THERE WHEN IT CAME OFF.
   //
   // The one number that separates the two ways a limb can leave: it ran out of
@@ -18602,8 +19480,8 @@ void Mob::Sever(int limbIndex) {
     // HOW IT DIED IS WRITTEN ONCE. A corpse is a dead Mob now and still loses
     // limbs (a fire, a later blast); that is not a second death.
     if (alive_)
-      deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
-                                 : "vital limb destroyed";
+      deathCause_ = pol.deathBurnt ? "vital limb burnt/dissolved away"
+                                   : "vital limb destroyed";
     Die();
   } else {
     // A VITAL LIMB THAT IS SEVERABLE COMES OFF, AND THEN THE CREATURE DIES OF
@@ -18616,8 +19494,8 @@ void Mob::Sever(int limbIndex) {
     // them out (BleedTick on the dead).
     const bool fatal = ld.vital;
     if (fatal && alive_)   // written once: see the root branch above
-      deathCause_ = inBurnFlush_ ? "vital limb burnt/dissolved away"
-                                 : "vital limb destroyed";
+      deathCause_ = pol.deathBurnt ? "vital limb burnt/dissolved away"
+                                   : "vital limb destroyed";
       // The cut point in WORLD space, captured BEFORE DetachLimb: the joint
       // anchor expressed through the severed limb's own live transform.
       //
@@ -18643,8 +19521,8 @@ void Mob::Sever(int limbIndex) {
       // the detach the limb has its own frame and the joint is gone.
       if (sys_)
       sys_->severs_.push_back(MobSystem::SeverEvent{
-          anchorW, id_, limbIndex, defIndex_, sys_->bladeCut_,
-          sys_->bladeCut_ ? sys_->bladeSeverity_ : 1.0f});
+          anchorW, id_, limbIndex, defIndex_, pol.byBlade,
+          pol.byBlade ? ctx.severity : 1.0f});
 
       // ---- A GARMENT THAT COMES OFF IS NOT AN AMPUTATION -------------------
       //
@@ -18664,7 +19542,7 @@ void Mob::Sever(int limbIndex) {
       // keeps asking IsWornSlot: hair burnt through at the root still drops
       // as a body, as a cut lock does.
       const bool worn = IsWornSlot(limbIndex);
-      const bool gore = !IsBloodless(limbIndex) && !inBurnFlush_;
+      const bool gore = pol.gore;  // blooded tissue, and not eaten
       // ...AND A GARMENT CONSUMED BY FIRE LEAVES NO BODY AT ALL.
       //
       // DetachLimb(adopt=true) hands the slot to DebrisSystem, which makes it
@@ -18672,14 +19550,14 @@ void Mob::Sever(int limbIndex) {
       // spawned overlapping the wearer's capsule on the normal contact layer,
       // and Jolt's resolution of the overlap fired the player across the room
       // — "clothes burning off launches the player". The layer half of that is
-      // now handled for every body that leaves a rig (DetachLimb,
-      // Physics::ReleaseToWorldWhenClear); what remains true is the physical
+      // now handled for every body that leaves a rig (DetachLimb, the loose
+      // Physics::BodyRole clearing); what remains true is the physical
       // half: a garment consumed BY FIRE has nothing left to fall off, so
       // there should be no body. Rags cut loose by a blade still drop, because
       // that is a piece of gear hitting the floor — and if the rag is the
       // piece's identity shell, the whole piece goes with it and lands as a
       // thing you can pick up (ShedGearBeforeDetach).
-      const bool adopt = !(worn && inBurnFlush_);
+      const bool adopt = pol.adopt;  // not (a garment, eaten)
       if (gore && adopt) {
         // THE PIECE BLEEDS TOO, from its own end of the cut: a head on the
         // floor bleeds from its neck. Armed on the limb here so DetachLimb's
@@ -18891,7 +19769,7 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     // GEAR FIRST, while the shells still hold their lattices (CaptureWorn
     // reads them, and AdoptBody below moves this one out). Names the item the
     // adopted body is registered as, or nothing for anatomy and rags.
-    const std::string shedAs = ShedGearBeforeDetach(limbIndex);
+    const ItemInstance shedAs = ShedGearBeforeDetach(limbIndex);
     // Hand the micro description over with the body: that is what makes a
     // severed microvoxel limb keep its detail as ordinary debris (PLAN §C4) —
     // and, for a CARVED limb, what makes it keep its wounds. The brick this
@@ -18948,10 +19826,11 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     // cut it. On the normal layer that is an unresolvable overlap the proxy
     // cannot move, so PlayerPushOut moved the player instead, a body-width a
     // tick for fifteen ticks: "I dismembered him and flew across the field".
-    // The avatar's own pieces were already exempt; now everything is, and
-    // TickSeveredHolds hands the piece to ReleaseToWorldWhenClear rather than
-    // straight back to the world.
-    phys_->SetBodyAvatarLayer(limb.body, true);
+    // The avatar's own pieces were already exempt; now everything is (the
+    // SeveredHold role: exempt from EVERY player, since an NPC's arm is inside
+    // whoever cut it), and TickSeveredHolds ends the hold as a loose role that
+    // clears the player first rather than going straight back to the world.
+    phys_->SetBodyRole(limb.body, Physics::BodyRole::SeveredHold);
     // The wound went with the body. Left here it would go on paying out of
     // the husk entry: BleedTick's bodyless fallback drips at the rest-pose
     // anchor of a limb that is no longer on this creature.
@@ -18959,8 +19838,8 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
     limb.gushTicks = 0;
     // A PIECE OF GEAR HITTING THE FLOOR: tell the ground registry which item
     // that body is, so `E` can pick it up (Mob::LostGear).
-    if (!shedAs.empty() && sys_ && sys_->onItemShed_)
-      sys_->onItemShed_(limb.holdBody, shedAs, limb.dye);
+    if (!shedAs.name.empty() && sys_ && sys_->onItemShed_)
+      sys_->onItemShed_(limb.holdBody, shedAs);
     // A GARMENT THAT HAS LEFT IS NOT A FOLLOWER. It is DebrisSystem's now and
     // has real dynamics of its own from the end of the sever hold; a shell that
     // kept its host would be teleported back onto a limb it has fallen off,
@@ -19152,14 +20031,14 @@ void Mob::EnterDeadRagdoll() {
     phys_->GetTransform(limb.body, limb.xf);
     phys_->SetBodyKinematic(limb.body, false);
     phys_->ActivateBody(limb.body);
-    // A weapon nobody is carrying is an object again (StartRagdoll's note).
-    if ((int)i == heldSlot_) phys_->SetBodyPropLayer(limb.body, false);
     // A CORPSE FALLS WHERE IT STOOD, which for an NPC killed at sword's reach
     // is often half inside the player's capsule proxy, and for the avatar
-    // entirely inside it: off the player's contact layer until it has fallen
-    // clear, then an ordinary body (the "I died and my body went FLYING" fix,
-    // made for every body that leaves the living, the avatar's included).
-    phys_->ReleaseToWorldWhenClear(limb.body);
+    // entirely inside it: RigDead is a LOOSE role, so it clears the player
+    // before it is an ordinary body (the "I died and my body went FLYING" fix,
+    // made for every body that leaves the living, the avatar's included). The
+    // held weapon is one of these limbs, so it stops being a prop here too —
+    // a weapon nobody is carrying is an object again (StartRagdoll's note).
+    phys_->SetBodyRole(limb.body, Physics::BodyRole::RigDead);
   }
   MarkInstancesDirty();
 }
@@ -19221,9 +20100,9 @@ void Mob::ReleaseRigToDebris() {
                        std::move(limb.skinVoxels),
                        IsBloodless((int)i) ? 0u : def_->bleedMat,
                        WoundOf(limb), /*dead=*/true, defIndex_, id_);
-    // Off the player's contact layer until it has fallen clear, then debris
-    // like any other: the same rule a severed piece follows (Mob::Die's note).
-    phys_->ReleaseToWorldWhenClear(limb.body);
+    // DebrisSystem's now: loose Debris, clear of the player first, then debris
+    // like any other — the same rule a severed piece follows (Mob::Die's note).
+    phys_->SetBodyRole(limb.body, Physics::BodyRole::Debris);
     limb.skinVoxels.clear();
     limb.carved = false;  // brick ownership moved with the body (see DetachLimb)
     // ...and the index with it. The avatar keeps its limb list past death,
@@ -19396,8 +20275,9 @@ const char* Mob::DeadAwakeCriterion(bool passiveDrySleeps) const {
     }
     // The burn pass's own idle verdict on its last visit: it walked the world
     // round this limb and found nothing (BodyBurnState::idle). NOT `sleepKey`,
-    // which also needs the index dropped — and the stain passes rebuild it
-    // for their surface lists on any body lying on something that stains.
+    // which is only a digest (and until W2-I also needed the index dropped,
+    // which the stain passes never allowed on a body lying on something
+    // that stains).
     if (burnTables && !l.burn.idle) {
       static thread_local char why[128];
       std::snprintf(why, sizeof why,
@@ -19499,7 +20379,7 @@ bool Mob::Lootable() const {
   // while the owner's corpse still wore it. Loot over the network was never
   // supported for corpses, and this keeps that limit rather than opening a
   // duplication path. A PlayerCorpse() is refused for the reason the avatar
-  // is: its kit lives in PlayerKit and re-dresses the respawned rig.
+  // is: its kit stays on the avatar and re-dresses the respawned rig.
   return !alive_ && !rigReleased_ && !playerCorpse_ && sys_ != nullptr &&
          !sys_->IsAvatar(this) && !AvatarLayer() && !IsGhost();
 }
@@ -19514,7 +20394,7 @@ void Mob::LootPieces(std::vector<LootPiece>& out) const {
       continue;   // the panel that IS the piece is gone: rags only
     LootPiece piece;
     piece.kind = LootPiece::Kind::Worn;
-    piece.item = p.item;
+    piece.name = p.item;
     piece.equipSlot = p.equipSlot;
     // The colour, off the identity shell — every shell of one garment carries
     // the same word (Mob::WearItem hands it to all of them).
@@ -19528,17 +20408,17 @@ void Mob::LootPieces(std::vector<LootPiece>& out) const {
       limbs_[heldSlot_].body && !heldItem_.empty()) {
     LootPiece piece;
     piece.kind = LootPiece::Kind::Held;
-    piece.item = heldItem_;
+    piece.name = heldItem_;
     out.push_back(std::move(piece));
   }
   // The pack last, so the worn and held entries keep the indices the loot
   // panel has always given them and a pack item is simply further down.
-  for (const CarriedItem& c : carried_) {
+  // Whole instances (W2-M): a looted flask holds what it held.
+  for (const ItemStack& c : kit_.bag.slots) {
+    if (c.Empty()) continue;
     LootPiece piece;
+    static_cast<ItemInstance&>(piece) = c;
     piece.kind = LootPiece::Kind::Carried;
-    piece.item = c.item;
-    piece.count = c.count;
-    piece.dye = c.dye;
     out.push_back(std::move(piece));
   }
 }
@@ -19561,8 +20441,8 @@ bool Mob::TakeLootPiece(int index, LootPiece* out, int count) {
       EquipItem(nullptr);   // unequip: the borrowed slot leaves with the item
       break;
     case LootPiece::Kind::Carried: {
-      // The carried entries are the tail of the list, in carried_ order.
-      const int ci = index - (int)(list.size() - carried_.size());
+      // The carried entries are the tail of the list, in pack order.
+      const int ci = index - (int)(list.size() - (size_t)kit_.bag.Count());
       const int took = TakeCarried(ci, count);
       if (took <= 0) return false;
       if (out) {
@@ -19595,7 +20475,7 @@ bool Mob::ShedLootPiece(int index, std::string* outItem) {
   if (slot < 0 || slot >= (int)limbs_.size() || !limbs_[slot].body)
     return false;
   WakeDead();
-  if (outItem) *outItem = piece.item;
+  if (outItem) *outItem = piece.name;
   // OFF THE CORPSE MEANS OFF IT: the ordinary gear-leaves-the-body path. The
   // identity shell (or the sword) becomes debris and is registered as the
   // item through SetOnItemShed, so `E` sees it as the thing it is; the
@@ -20116,9 +20996,14 @@ MobSystem::LimbBurnProbe MobSystem::LimbBurnStateOf(uint64_t mobId,
       const BodyBurnState& st = l.burn;
       p.front = (uint32_t)st.front.size();
       p.alight = st.alight;
-      p.asleep = st.sleepKey != 0;
+      // ASLEEP = the last visit SKIPPED the walk (its key matched). Not
+      // `sleepKey != 0`, which only says a key was recorded -- a limb whose
+      // pose moves every tick records one every tick and never uses it.
+      p.asleep = st.slept;
       p.indexed = !st.idx.empty();
       p.quiet = st.quiet;
+      p.holdBy = st.holdBy;
+      p.sleepMiss = st.sleepMiss;
       // WHICH material holds the front (attribution, not a count).
       std::vector<uint32_t> hist(matGpu_.size(), 0u);
       const bool fine = l.HasFineSkin();
@@ -20402,20 +21287,6 @@ uint32_t MobSystem::ShedCoatOn(uint64_t mobId, int footLimb, Vec3 footPosVox,
   return 0;
 }
 
-uint16_t MobSystem::CoatBeneath(uint16_t cur, uint32_t mat) const {
-  auto corrodes = [&](uint32_t m) {
-    return m < matCorrodes_.size() && matCorrodes_[m] != 0;
-  };
-  auto washes = [&](uint32_t m) {
-    return m < matGpu_.size() && (matGpu_[m].stainPack & kStainPackWashesBit);
-  };
-  if (BodyStainAmt(cur) == 0) return cur;
-  const uint32_t under = BodyStainMat(cur);
-  if (corrodes(mat) && !corrodes(under)) return 0;
-  if (washes(under) && !washes(mat)) return 0;
-  return cur;
-}
-
 uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
                              uint32_t amount, uint32_t tick) {
   Mob* mob = nullptr;
@@ -20437,7 +21308,7 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
   // whole lattice (the interior is never seen, so it costs nothing), but a
   // coat that eats would then eat from the inside out and a whole limb would
   // go in a few seconds; acid has to earn its depth voxel by voxel from the
-  // outside (BurnOneLimb section 3 carries it inward as it eats).
+  // outside (BurnOneLimb section 0, clause 7, carries it inward as it eats).
   // A FUEL coat (oil) too: soaked through, a whole limb would flash over from
   // the inside the moment one voxel caught.
   const bool surfaceOnly =
@@ -20469,7 +21340,7 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
     // what it cleans is left wet (bodystain.h WashBodyStain).
     const uint16_t next =
         washes ? WashBodyStain(cur, mat, amount, std::min(kBodyStainAmtMax, amount * 2u))
-               : RaiseBodyStain(CoatBeneath(cur, mat), mat, amount);
+               : RaiseBodyStain(cur, mat, amount);
     if (next == cur) continue;
     v.SetStain(i, next);
     marked++;
@@ -20665,7 +21536,7 @@ uint32_t MobSystem::PourOnBody(uint64_t mobId, const BodyRayHit& hit, Vec3 rd,
     const uint16_t cur = v.Stain(c.idx);
     const uint16_t next =
         washes ? WashBodyStain(cur, mat, amount, amount)
-               : AddBodyStain(CoatBeneath(cur, mat), mat, amount, kBodyStainAmtMax);
+               : AddBodyStain(cur, mat, amount, kBodyStainAmtMax);
     touched[c.limb] = 1;
     if (next == cur) continue;
     v.SetStain(c.idx, next);
@@ -20957,33 +21828,37 @@ bool Mob::LimbIsPristine(size_t i) const {
   return SameCollider(L.voxels, p->voxels) && SameSkin(L.skinVoxels, p->skinVoxels);
 }
 
-// ---- MOBS v6 helpers ---------------------------------------------------------
+// ---- MOBS v6/v7 helpers ------------------------------------------------------
 //
-// The gear list's bytes: net/mobsync.cpp's WriteGear shape, written here
-// rather than borrowed because that file's helpers are its own and the save
-// format must not move when the wire's does.
+// The gear list's bytes. v7 (W2-M) writes each entry as an ItemInstance
+// (game/iteminstance.h's WriteItemInstance — the one item shape the wire and
+// every save share) followed by where it sits; v6 wrote name, slot, held, dye
+// and the damage, and is still written for the `mob-save-delta` gate's
+// older-format records and still read.
 static void WriteRecordGear(ByteWriter& w,
-                            const std::vector<::net::WireGear>& gear) {
+                            const std::vector<::net::WireGear>& gear,
+                            uint32_t version) {
   w.U32((uint32_t)gear.size());
   for (const ::net::WireGear& g : gear) {
-    w.Str(g.item);
+    if (version >= 7) {
+      WriteItemInstance(w, g);
+      w.Pod(g.equipSlot);
+      w.U32(g.held);
+      continue;
+    }
+    w.Str(g.name);
     w.Pod(g.equipSlot);
     w.U32(g.held);
     w.U32(g.dye);
-    w.U32((uint32_t)g.damage.shells.size());
-    for (const WornShellDamage& sh : g.damage.shells) {
-      w.F32(sh.hp);
-      w.U32(sh.atSpawn);
-      w.U32(sh.live);
-      w.PodVec(sh.lattice);
-    }
+    WriteWornDamage(w, g.damage);
   }
 }
 
 // Bounded like the limb count: a count the remaining bytes cannot hold is a
 // corrupt record, refused before it sizes anything. The reader is sticky, so a
 // lying count otherwise just runs out against `ok`.
-static bool ReadRecordGear(ByteReader& r, std::vector<::net::WireGear>& gear) {
+static bool ReadRecordGear(ByteReader& r, std::vector<::net::WireGear>& gear,
+                           uint32_t version) {
   uint32_t n = 0;
   r.U32(n);
   gear.clear();
@@ -20994,23 +21869,16 @@ static bool ReadRecordGear(ByteReader& r, std::vector<::net::WireGear>& gear) {
   }
   for (uint32_t i = 0; i < n && r.ok; i++) {
     ::net::WireGear g;
-    r.Str(g.item);
-    r.Pod(g.equipSlot);
-    r.U32(g.held);
-    r.U32(g.dye);
-    uint32_t ns = 0;
-    r.U32(ns);
-    if (!r.ok || ns > kMaxRecordGear) {
-      r.ok = false;
-      break;
-    }
-    for (uint32_t k = 0; k < ns && r.ok; k++) {
-      WornShellDamage sh;
-      r.F32(sh.hp);
-      r.U32(sh.atSpawn);
-      r.U32(sh.live);
-      r.PodVec(sh.lattice);
-      if (r.ok) g.damage.shells.push_back(std::move(sh));
+    if (version >= 7) {
+      ReadItemInstance(r, g);
+      r.Pod(g.equipSlot);
+      r.U32(g.held);
+    } else {
+      r.Str(g.name);
+      r.Pod(g.equipSlot);
+      r.U32(g.held);
+      r.U32(g.dye);
+      ReadWornDamage(r, g.damage, kMaxRecordGear);
     }
     if (r.ok) gear.push_back(std::move(g));
   }
@@ -21054,7 +21922,7 @@ void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
     if (idSlot < 0 || idSlot >= (int)limbs_.size() || !limbs_[idSlot].body)
       continue;
     ::net::WireGear g;
-    g.item = p.item;
+    g.name = p.item;
     g.equipSlot = p.equipSlot;
     g.dye = limbs_[idSlot].dye;
     CaptureWorn(p.equipSlot, g.damage);
@@ -21063,7 +21931,7 @@ void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
   if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
       limbs_[heldSlot_].body && !heldItem_.empty()) {
     ::net::WireGear g;
-    g.item = heldItem_;
+    g.name = heldItem_;
     g.held = 1;
     bySlot.emplace_back(heldSlot_, std::move(g));
   }
@@ -21152,12 +22020,20 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   //
   // By NAME, not by library index (item.h's index hazard): the item table is
   // file order and an R reload reorders it, so an index written today means a
-  // different item tomorrow.
-  w.U32((uint32_t)carried_.size());
-  for (const CarriedItem& c : carried_) {
-    w.Str(c.item);
-    w.U32((uint32_t)std::max(0, c.count));
-    w.U32(c.dye);
+  // different item tomorrow. v7 writes each stack whole (WriteItemInstance:
+  // a flask in the pack keeps its fill); v3..v6 wrote name, count, dye.
+  {
+    const std::vector<ItemInstance> pack = Carried();
+    w.U32((uint32_t)pack.size());
+    for (const ItemInstance& c : pack) {
+      if (version >= 7) {
+        WriteItemInstance(w, c);
+        continue;
+      }
+      w.Str(c.name);
+      w.U32((uint32_t)std::max(0, c.count));
+      w.U32(c.dye);
+    }
   }
   if (version < 5) return;
   // ---- AND THE BRAIN'S MEMORY (kSaveVersion 5, save plan S5b) --------------
@@ -21200,7 +22076,7 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
   }
   std::vector<::net::WireGear> gear;
   CaptureGear(gear);
-  WriteRecordGear(w, gear);
+  WriteRecordGear(w, gear, version);
   if (!dead) return;
   // The cause by NAME: deathCause_ points at a literal in this file, and the
   // loader interns the name back onto the same literal (InternDeathCause).
@@ -21285,7 +22161,7 @@ struct MobSystem::MobRecord {
     std::vector<PrefabVoxel> skinVoxels;
   };
   std::vector<LimbState> limbs;
-  std::vector<CarriedItem> carried;
+  std::vector<ItemInstance> carried;
   // v5: the brain's memory (Mob::SaveOne's tail). `haveBrain` false for v3/v4.
   bool haveBrain = false;
   std::string brainProfile;
@@ -21368,7 +22244,7 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
   }
   // The pack, mirroring SaveOne's tail.
   //
-  // EVERY ENTRY IS READ, and only the first kMaxCarried are KEPT. Stopping at
+  // EVERY ENTRY IS READ, and only a bag's worth are KEPT. Stopping at
   // the cap would leave the rest of this mob's bytes in the stream and every
   // record after it would parse garbage — a truncation is a bound on what the
   // creature gets, never a bound on how far the cursor moves. (The reader is
@@ -21378,13 +22254,17 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
   r.U32(nCarried);
   out.carried.clear();
   for (uint32_t i = 0; i < nCarried && r.ok; i++) {
-    CarriedItem c;
-    uint32_t count = 0;
-    r.Str(c.item);
-    r.U32(count);
-    r.U32(c.dye);
-    c.count = (int)count;
-    if (out.carried.size() < Mob::kMaxCarried && !c.item.empty() && c.count > 0)
+    ItemInstance c;
+    if (version >= 7) {
+      ReadItemInstance(r, c);
+    } else {
+      uint32_t count = 0;
+      r.Str(c.name);
+      r.U32(count);
+      r.U32(c.dye);
+      c.count = (int)count;
+    }
+    if (out.carried.size() < (size_t)Bag::kSlots && !c.Empty())
       out.carried.push_back(std::move(c));
   }
   // v5's brain tail, mirroring SaveOne.
@@ -21419,7 +22299,7 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
     }
     out.appendedNames.assign(nApp, std::string());
     for (std::string& nm : out.appendedNames) r.Str(nm);
-    if (!ReadRecordGear(r, out.gear)) return false;
+    if (!ReadRecordGear(r, out.gear, version)) return false;
     if (out.dead) {
       r.Str(out.deathCause);
       r.Pod(out.deathSeq);
@@ -21442,11 +22322,16 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
   // MATERIAL NAMES (sim/mattable.h, W1-D): a stored lattice's ids are in the
   // table its save file named; a loader that found that table differs from
   // the running one has a remap in scope. Null (identity) for a handoff.
-  if (const MatRemap* mr = ActiveLoadRemap())
+  if (const MatRemap* mr = ActiveLoadRemap()) {
     for (MobRecord::LimbState& s : out.limbs) {
       RemapDebrisVoxels(s.voxels, *mr);
       RemapPrefabVoxels(s.skinVoxels, *mr);
     }
+    // ...and the items: a pack vessel's contents, a worn piece's damaged
+    // lattice (W2-M: both are ItemInstances, one remap for both).
+    for (ItemInstance& c : out.carried) RemapItemInstance(c, *mr);
+    for (::net::WireGear& g : out.gear) RemapItemInstance(g, *mr);
+  }
   return r.ok;
 }
 
@@ -21511,7 +22396,8 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
   // rolling a fresh table over it (the saved purse is the one the player
   // spent an hour not looting), and on a handoff the owner's list is
   // authoritative over whatever the ghost happened to be holding.
-  m.carried_ = std::move(rec.carried);
+  m.ClearCarried();
+  for (const ItemInstance& c : rec.carried) m.AddCarried(c);
   // v5: the brain's memory, onto a FRESH brain on the named profile
   // (ApplyHandoff's rule: timers and half-walked paths belong to the run that
   // made them). A name no profile answers to any more is no AI, which is what
@@ -22130,7 +23016,7 @@ bool MobSystem::TakeHandoff(uint64_t mobId, uint32_t newOwner,
 void MobSystem::ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear) {
   if (items_ == nullptr) return;
   for (const ::net::WireGear& g : gear) {
-    const ItemDef* item = items_->At(items_->Find(g.item));
+    const ItemDef* item = items_->Of(g);
     if (item == nullptr) continue;   // retired item: it arrives without it
     if (g.held)
       m.EquipItem(item);
@@ -22170,7 +23056,7 @@ Mob* MobSystem::ApplyAnnounce(const ::net::MobAnnounce& a) {
     ::net::MobAnnounce now{};
     bool same = BuildAnnounce(a.id, now) && now.gear.size() == a.gear.size();
     for (size_t k = 0; k < a.gear.size() && same; k++)
-      same = now.gear[k].item == a.gear[k].item &&
+      same = now.gear[k].name == a.gear[k].name &&
              now.gear[k].equipSlot == a.gear[k].equipSlot &&
              now.gear[k].held == a.gear[k].held &&
              now.gear[k].dye == a.gear[k].dye;
@@ -22427,11 +23313,13 @@ uint64_t MobSystem::StateKey(uint64_t mobId) const {
     mixStr(p.item);
   }
   mixStr(m->heldItem_);
-  mix(m->carried_.size());
-  for (const CarriedItem& c : m->carried_) {
-    mixStr(c.item);
+  const std::vector<ItemInstance> pack = m->Carried();
+  mix(pack.size());
+  for (const ItemInstance& c : pack) {
+    mixStr(c.name);
     mix((uint64_t)(int64_t)c.count);
     mix(c.dye);
+    mix(c.Fill());
   }
   return h == 0 ? 1 : h;   // 0 is "unknown id"
 }
@@ -22482,7 +23370,7 @@ bool MobSystem::ApplyState(const ::net::MobState& st) {
   bool same = BuildAnnounce(st.announce.id, now) &&
               now.gear.size() == st.announce.gear.size();
   for (size_t k = 0; k < st.announce.gear.size() && same; k++)
-    same = now.gear[k].item == st.announce.gear[k].item &&
+    same = now.gear[k].name == st.announce.gear[k].name &&
            now.gear[k].equipSlot == st.announce.gear[k].equipSlot &&
            now.gear[k].held == st.announce.gear[k].held &&
            now.gear[k].dye == st.announce.gear[k].dye;
@@ -22694,14 +23582,14 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // for: the blade is pinned to a hand by a Fixed joint and posed every tick,
   // so a contact can never move the WEAPON, only its victim.
   //
-  // Layers::PROP is the whole fix (phys/physics.h SetBodyPropLayer): no
+  // The HeldProp role is the whole fix (phys/physics.h BodyRole -> PROP): no
   // contacts with anything, still visible to every ray. The swing is
   // unaffected — MeleeSweepDamage probes with CastRayBody, FindParry is
   // segment-vs-segment geometry, and melee applies no impulses at all — and
   // the moment this item stops being held, every path that lets go of it
-  // (DetachLimb, TickSeveredHolds, DropItemToWorld, GoLimp) ends in
-  // ReleaseToWorldWhenClear or AdoptBody, which set the layer outright.
-  phys_->SetBodyPropLayer(p.body, true);
+  // (DetachLimb, TickSeveredHolds, DropItemToWorld, StartRagdoll, Die) sets
+  // the role it becomes, which is a whole layer.
+  phys_->SetBodyRole(p.body, Physics::BodyRole::HeldProp, CollisionOwner());
 
   // THE GRIP POINT IN THE BODY'S OWN FRAME.
   //
@@ -22731,12 +23619,7 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // The new body must not collide with the rest of this creature, exactly as
   // BuildRig arranges for the limbs — a sword resting against the thigh would
   // otherwise fight the solver every tick.
-  {
-    std::vector<uint64_t> handles;
-    for (const MobLimb& q2 : limbs_)
-      if (q2.body) handles.push_back(q2.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
+  RegroupRig();
 
   anim_.partAlive.resize(skel_.parts.size(), 1);
   anim_.springs.resize(skel_.parts.size(), SpringState{});
@@ -22794,10 +23677,7 @@ void Mob::RemoveAppendedSlots(int first, int count) {
     // is being erased under it: finish the hold now, or the piece stays
     // kinematic in mid-air forever with nothing left to time it out.
     if (L.holdBody) {
-      phys_->SetBodyKinematic(L.holdBody, false);
-      phys_->ClearCollisionGroup(L.holdBody);
-      GroupSeveredPiece(L.holdBody);
-      phys_->ReleaseToWorldWhenClear(L.holdBody);
+      EndSeveredHold(L.holdBody);
       L.holdBody = 0;
       L.holdSeconds = 0;
     }
@@ -23138,7 +24018,9 @@ int Mob::AppendWornShell(const ItemDef& item, const ItemCover& cover,
     return -1;
   }
   phys_->SetBodyKinematic(p.body, true);
-  if (AvatarLayer()) phys_->SetBodyAvatarLayer(p.body, true);
+  // Worn by whoever wears it: the avatar's shells are exempt from its own
+  // capsule exactly as its limbs are, an NPC's are ordinary kinematic bodies.
+  phys_->SetBodyRole(p.body, Physics::BodyRole::WornShell, CollisionOwner());
   p.xf = bxf;
   // ---- STRAPPED, NOT JOINTED ------------------------------------------------
   //
@@ -23205,12 +24087,7 @@ bool Mob::WearItem(const ItemDef* item, int equipSlot,
   // Nothing on this creature collides with anything else on it: a pauldron
   // resting against a helmet would fight the solver every tick, exactly as a
   // sword resting against a thigh would.
-  {
-    std::vector<uint64_t> handles;
-    for (const MobLimb& l : limbs_)
-      if (l.body) handles.push_back(l.body);
-    phys_->DisableCollisionsAmong(handles);
-  }
+  RegroupRig();
 
   worn_.push_back(std::move(piece));
   if (!AppendedInvariantHolds())
@@ -23433,6 +24310,83 @@ int Mob::WornShellAlong(int bodyLimb, const Vec3& from, const Vec3& dir,
     }
   }
   return -1;
+}
+
+// ---- ONE SHELL RESPONSE (W2-H, game/shellresponse.h) -----------------------
+
+float Mob::MaterialHardness(uint32_t mat) const {
+  if (sys_ == nullptr || mat == 0 || mat >= sys_->matGpu_.size()) return 0.0f;
+  return (float)sys_->matGpu_[mat].hardness;
+}
+
+uint32_t Mob::ShellMaterialAt(int limbIndex, Vec3 worldPos) const {
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0u;
+  const MobLimb& L = limbs_[limbIndex];
+  // The pose the caller measured against (limb.xf), never re-read from Jolt:
+  // the same contract every carve predicate keeps (gotcha-live-limb-carve-pose).
+  const Quat q{L.xf.quat[0], L.xf.quat[1], L.xf.quat[2], L.xf.quat[3]};
+  const bool fine = L.HasFineSkin();
+  const float scale =
+      (float)std::max(1u, fine ? SkinScaleOf(L) : PhysScaleOf(L));
+  const Vec3 p = RotateInv(q, worldPos - L.xf.pos) * scale;
+  // Nearest LIVE voxel of the authoritative lattice. A linear scan: a shell is
+  // a few thousand voxels and this runs once per blow, not per voxel. Ties go
+  // to the earlier voxel, so the answer is a pure function of the lattice.
+  uint32_t best = 0u;
+  float bestD2 = 3.4e38f;
+  auto test = [&](int x, int y, int z, uint32_t m) {
+    if (m == 0u) return;  // a burn tombstone is not there
+    const Vec3 d{(float)x + 0.5f - p.x, (float)y + 0.5f - p.y,
+                 (float)z + 0.5f - p.z};
+    const float d2 = d.dot(d);
+    if (d2 < bestD2) {
+      bestD2 = d2;
+      best = m;
+    }
+  };
+  if (fine)
+    for (const PrefabVoxel& v : L.skinVoxels)
+      test(v.x, v.y, v.z, v.material & 0xFFFu);
+  else
+    for (const DebrisVoxel& v : L.voxels)
+      test(v.x, v.y, v.z, v.payload & 0xFFFu);
+  return best;
+}
+
+ShellResponse Mob::ShellResponseAt(int limbIndex, Vec3 worldPos,
+                                   const DamageCtx& ctx) const {
+  return ShellResponseOf(MaterialHardness(ShellMaterialAt(limbIndex, worldPos)),
+                         ctx, CurrentTuning().gear);
+}
+
+float Mob::BlastShellStop(int bodyLimb, const Vec3& from, const Vec3& dir,
+                          float dist) {
+  if (worn_.empty() || bodyLimb < 0 || sys_ == nullptr) return 0.0f;
+  // Far enough to cross half a torso from its middle and meet the coat on the
+  // blast's side: the march starts INSIDE the flesh (the voxel being carved)
+  // and walks out toward the centre, one shell-lattice cell a step.
+  constexpr int kBlastMarchMax = 96;
+  const Tuning::Gear& gear = CurrentTuning().gear;
+  float stop = 0.0f;
+  for (WornPiece& piece : worn_) {
+    for (size_t k = 0; k < piece.slots.size(); k++) {
+      const int s = piece.slots[k];
+      if (s < 0 || s >= (int)limbs_.size()) continue;
+      if (skel_.parts[s].parent != bodyLimb) continue;
+      MobLimb& shell = limbs_[s];
+      if (!shell.body) continue;  // strap cut: not in the way any more
+      if (k >= piece.index.size()) continue;
+      const bool fine = shell.HasFineSkin();
+      const uint32_t m = MarchShell(
+          piece.index[k], fine ? &shell.skinVoxels : nullptr,
+          fine ? nullptr : &shell.voxels, shell.xf, SkinScaleOf(shell), from,
+          dir, dist, kBlastMarchMax, nullptr);
+      if (m)
+        stop += ShellResponseOf(MaterialHardness(m), DamageCause::Blast, gear)
+                    .stop;
+    }
+  }
+  return stop;
 }
 
 uint32_t MarchShell(ShellMarchIndex& ix, const std::vector<PrefabVoxel>* skin,

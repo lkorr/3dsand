@@ -9,7 +9,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -21,6 +23,7 @@
 #include "net/debrissync.h"
 #include "phys/marching_cubes.h"
 #include "sim/bytestream.h"  // ByteReader, for the wire-record round trip
+#include "sim/weather.h"     // SetOverride (coat-parity: clear sky)
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -600,6 +603,372 @@ auto note = [&failed](bool ok, const char* name) {
   return settleOk ? Status::Pass : Status::Fail;
 }
 
+// ---- debris-coat (W2-I, 2026-09-24) --------------------------------------
+// LOOSE MATTER GETS THE FULL RULE SET. Non-flesh debris used to burn through
+// its own copy of the reaction evaluator, which knew nothing of coats: an
+// oiled plank caught exactly like a clean one and a soaked one too. It now
+// goes through MobSystem::BurnOneLimb like every limb, so the coat sections
+// apply: a FUEL coat flashes when heat touches it and lights the voxel under
+// it, a WASHER coat refuses every hot product and douses what is burning.
+//
+// Three identical wood planks, one ember each at the same lattice cell,
+// resting on their own stone pads far enough apart that the grid fire one
+// emits cannot reach the next: clean, oiled, soaked. No world fire at all --
+// the only heat is the body's own ember, so the three differ in nothing but
+// the coat. Measured inside the window before a resting body settles back
+// into the grid (kSettleAfterTicks, 60 asleep ticks).
+Status GateDebrisCoat(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const std::vector<MaterialDef>& mats = c.mats;
+  Physics& phys = c.phys;
+  DebrisSystem& debris = c.debris;
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < mats.size(); i++)
+      if (mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mOil = matId("oil"), mWater = matId("water");
+  if (!mOil || !mWater) {
+    detail = "oil or water material missing";
+    return Status::Fail;
+  }
+  // Dry, whatever an earlier gate left the weather at: wood's ignition rule
+  // is rain-damped, and the claim is about the COAT.
+  c.mobs.SetWeatherRain(0u);
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  std::vector<float> dens;
+  for (const auto& m : mats) dens.push_back((float)m.gpu.density);
+
+  struct Plank {
+    const char* name;
+    uint32_t coat, amt;
+    int x;
+    uint32_t wood = 0, ember = 0, voxels = 0;
+    bool found = false;
+  };
+  Plank planks[3] = {{"clean", 0u, 0u, 72}, {"oiled", mOil, 8u, 96},
+                     {"soaked", mWater, 12u, 120}};
+  const int z = 96;
+  uint32_t t = 12000;
+  std::vector<CellOp> pad;
+  int padY[3];
+  for (int p = 0; p < 3; p++) {
+    padY[p] = World::TerrainHeight(planks[p].x, z, kDefaultSeed) + 2;
+    for (int dz = -4; dz <= 4; dz++)
+      for (int dx = -4; dx <= 4; dx++)
+        for (int y = padY[p] - 3; y <= padY[p]; y++)
+          pad.push_back({World::SlotCellIndex({planks[p].x + dx, y, z + dz}),
+                         (uint32_t)kMatStone});
+  }
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, pad, false,
+             {planks[1].x / 16, padY[1] / 16, z / 16}, true, false, {});
+  ctx.WaitIdle();
+  ctx.ProcessEvents();
+  // 5 x 2 x 5 of wood, ember at the top centre; every voxel wears the coat.
+  for (int p = 0; p < 3; p++) {
+    std::vector<DebrisVoxel> vox;
+    for (int zz = 0; zz < 5; zz++)
+      for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 5; x++) {
+          DebrisVoxel v{(int8_t)x, (int8_t)y, (int8_t)zz, 0,
+                        (uint16_t)((x == 2 && y == 1 && zz == 2) ? kMatEmber
+                                                                  : kMatWood)};
+          v.stain = PackBodyStain(planks[p].coat, planks[p].amt);
+          vox.push_back(v);
+        }
+    const IVec3 at{planks[p].x - 2, padY[p] + 1, z - 2};
+    const uint64_t h = phys.CreateDebrisBody(vox, at, dens);
+    BodyTransform xf{};
+    xf.pos = Vec3{(float)at.x, (float)at.y, (float)at.z};
+    xf.quat[3] = 1;
+    debris.AdoptBody(h, vox, xf);
+  }
+  constexpr int kTicks = 50;
+  uint32_t fireOps = 0;
+  for (int i = 0; i < kTicks; i++) {
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    for (const CellOp& op : cellOps)
+      if ((op.word & 0xFFFu) == kMatFire) fireOps++;
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+               {planks[1].x / 16, padY[1] / 16, z / 16}, true, true, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+  }
+  // Each body is told apart by where it lies (a burn rebuild replaces its
+  // handle, and a body index moves when another is erased).
+  for (uint32_t i = 0; i < debris.BodyCount(); i++) {
+    const Vec3 pos = debris.BodyPosition(i);
+    for (Plank& pk : planks) {
+      if (std::fabs(pos.x - (float)pk.x) > 8.0f) continue;
+      pk.found = true;
+      pk.wood += debris.BodyMaterialCount(i, kMatWood);
+      pk.ember += debris.BodyMaterialCount(i, kMatEmber);
+      pk.voxels += debris.BodyVoxelCount(i);
+    }
+  }
+  // Burnt = the wood that is no longer wood (ember, ash left, or gone).
+  auto burnt = [](const Plank& pk) { return pk.found ? 49u - std::min(49u, pk.wood) : 49u; };
+  const Plank& cl = planks[0];
+  const Plank& oi = planks[1];
+  const Plank& so = planks[2];
+  const bool allThere = cl.found && oi.found && so.found;
+  // The control burns at all (its ember is still lit, or it spread).
+  const bool cleanOk = cl.found && (burnt(cl) > 0 || cl.ember > 0);
+  // Oil flashes: far more of the plank taken in the same ticks.
+  const bool oilOk = oi.found && burnt(oi) >= burnt(cl) + 6;
+  // Wet does not catch, and the ember under the water goes out.
+  const bool wetOk = so.found && burnt(so) == 0 && so.ember == 0;
+  const bool ok = allThere && cleanOk && oilOk && wetOk;
+  char buf[384];
+  std::snprintf(buf, sizeof buf,
+                "after %d ticks, wood burnt of 49 / embers left / voxels: clean "
+                "%u/%u/%u, oiled %u/%u/%u, soaked %u/%u/%u; %u fire ops; %s",
+                kTicks, burnt(cl), cl.ember, cl.voxels, burnt(oi), oi.ember,
+                oi.voxels, burnt(so), so.ember, so.voxels, fireOps,
+                !allThere ? "a plank is missing (settled or burnt away)"
+                : !cleanOk ? "the clean control did not burn"
+                : !oilOk   ? "oil did not speed the fire"
+                : !wetOk   ? "the soaked plank caught or kept its ember"
+                           : "coats act on loose matter");
+  detail = buf;
+  std::printf("debris-coat: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  debris.Reset();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- coat-parity (rule-unification W2-J2, 2026-09-24) ----------------------
+// ONE COAT RULE, TWO POPULATIONS. DESIGN.md §6 "A coat is a co-located virtual
+// neighbour" is implemented twice -- sim_step.wgsl coatReact for the grid and
+// MobSystem::BurnOneLimb for every body -- with the arithmetic shared through
+// sim/coatrule.h. This runs the SAME scenario on both, at the same pitch (a
+// loose body at scale 1 is a lattice of world voxels, so clause 4a's widening
+// and clause 7's depth are off on both sides), and asserts the same OUTCOME
+// CLASS, not the same numbers: the two evaluators roll different streams.
+//
+//   OIL    ember | dirt wearing oil (6)     -> the coat is PARTLY spent (a level
+//                                             a flash) and the dirt is still dirt
+//   WET    ember | grass wearing water (12) -> the coat is PARTLY spent (boils a
+//                                             level at a time) and the grass has
+//                                             NOT caught (covered)
+//   INERT  stone | dirt wearing oil (6)     -> nothing happens (no partner)
+//
+// Grid: each arm is a row of kLen cells beside a row of its heat, on a stone
+// slab in open air. Body: each arm is one loose body, the heat row and the
+// coated row side by side in one lattice, on its own stone pad. Weather
+// pinned clear (oil's rule is rain-damped). Measured after kTicks, inside the
+// window before a resting body settles back into the grid.
+Status GateCoatParity(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Physics& phys = c.phys;
+  DebrisSystem& debris = c.debris;
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mDirt = matId("dirt"), mGrass = matId("grass"),
+                 mEmber = matId("ember"), mStone = matId("stone"),
+                 mOil = matId("oil"), mWater = matId("water");
+  if (!mDirt || !mGrass || !mEmber || !mStone || !mOil || !mWater) {
+    detail = "dirt/grass/ember/stone/oil/water missing from materials.json";
+    return Status::Fail;
+  }
+  const uint32_t oilType = c.mats[mOil].gpu.stainPack & kStainPackTypeMask;
+  const uint32_t wetType = c.mats[mWater].gpu.stainPack & kStainPackTypeMask;
+  if (!oilType || !wetType) {
+    detail = "oil or water has no ground stain type";
+    return Status::Fail;
+  }
+  const std::string prevPin = weather::Override();
+  weather::SetOverride("clear");
+  weather::Snap();
+  c.mobs.SetWeatherRain(0u);
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  enum { kOilArm, kWetArm, kInertArm, kArms };
+  struct Arm {
+    const char* name;
+    uint32_t heat, subj, coat, stainType, amt;
+  };
+  const Arm arms[kArms] = {
+      {"oil", mEmber, mDirt, mOil, oilType, 6u},
+      {"wet", mEmber, mGrass, mWater, wetType, 12u},
+      {"inert", mStone, mDirt, mOil, oilType, 6u}};
+  const int kLen = 8;
+  const uint32_t kTicks = (uint32_t)BaselineNumber("coatParityTicks", 30.0);
+
+  // ---- the grid half: rows on one slab (stain-react's layout) ------------
+  const int gx0 = 150, gz0 = 200, kPitch = 5;
+  const int gy = FixtureYOver(gx0 - 3, gz0 - 3, gx0 + kLen + 3,
+                              gz0 + kPitch * kArms + 3, kDefaultSeed, 24);
+  std::map<std::tuple<int, int, int>, uint32_t> cells;
+  for (int x = gx0 - 3; x <= gx0 + kLen + 2; x++)
+    for (int z = gz0 - 3; z <= gz0 + kPitch * kArms + 2; z++) {
+      cells[{x, gy - 1, z}] = mStone;
+      for (int yy = gy; yy <= gy + 5; yy++) cells[{x, yy, z}] = 0;
+    }
+  for (int a = 0; a < kArms; a++) {
+    const int hz = gz0 + a * kPitch;
+    for (int x = gx0; x < gx0 + kLen; x++) {
+      cells[{x, gy, hz - 1}] = mStone;  // back wall
+      cells[{x, gy, hz}] = arms[a].heat;
+      cells[{x, gy, hz + 1}] =
+          arms[a].subj | PackStain(arms[a].stainType, arms[a].amt);
+      cells[{x, gy, hz + 2}] = mStone;  // guard: dirt cannot slide off
+    }
+    for (int dz = -1; dz <= 2; dz++) {
+      cells[{gx0 - 1, gy, hz + dz}] = mStone;
+      cells[{gx0 + kLen, gy, hz + dz}] = mStone;
+    }
+  }
+  std::vector<CellOp> scene;
+  std::map<uint32_t, std::vector<uint32_t>> chunkBuf;
+  for (const auto& [p, wd] : cells) {
+    const uint32_t ci = World::SlotCellIndex(
+        {std::get<0>(p), std::get<1>(p), std::get<2>(p)});
+    scene.push_back({ci, wd});
+    chunkBuf[ci / kChunkVol];
+  }
+
+  // ---- the body half: one loose body per arm, on its own pad -------------
+  std::vector<float> dens;
+  for (const auto& m : c.mats) dens.push_back((float)m.gpu.density);
+  const int bz = 96, bx[kArms] = {72, 96, 120};
+  int padY[kArms];
+  for (int a = 0; a < kArms; a++) {
+    padY[a] = World::TerrainHeight(bx[a], bz, kDefaultSeed) + 2;
+    for (int dz = -4; dz <= 4; dz++)
+      for (int dx = -6; dx <= 6; dx++)
+        for (int y = padY[a] - 3; y <= padY[a]; y++)
+          scene.push_back({World::SlotCellIndex({bx[a] + dx, y, bz + dz}),
+                           (uint32_t)kMatStone});
+  }
+  uint32_t t = 13000;
+  const IVec3 pc{gx0 >> 4, gy >> 4, gz0 >> 4};
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false, pc, true,
+             false, {});
+  ctx.WaitIdle();
+  ctx.ProcessEvents();
+  for (int a = 0; a < kArms; a++) {
+    std::vector<DebrisVoxel> vox;
+    for (int x = 0; x < kLen; x++) {
+      vox.push_back({(int8_t)x, 0, 0, 0, (uint16_t)arms[a].heat});
+      DebrisVoxel s{(int8_t)x, 0, 1, 0, (uint16_t)arms[a].subj};
+      s.stain = PackBodyStain(arms[a].coat, arms[a].amt);
+      vox.push_back(s);
+    }
+    const IVec3 at{bx[a] - kLen / 2, padY[a] + 1, bz};
+    const uint64_t h = phys.CreateDebrisBody(vox, at, dens);
+    BodyTransform xf{};
+    xf.pos = Vec3{(float)at.x, (float)at.y, (float)at.z};
+    xf.quat[3] = 1;
+    debris.AdoptBody(h, vox, xf);
+  }
+  for (uint32_t i = 0; i < kTicks; i++) {
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false, pc,
+               true, true, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+  }
+
+  // ---- read both halves ----------------------------------------------------
+  for (auto& [slot, buf] : chunkBuf) {
+    buf.resize(kChunkVol);
+    ReadVoxelsSync(ctx, world, slot, 1, buf.data(), "coatParity");
+  }
+  auto at = [&](int x, int yy, int z) -> uint32_t {
+    const uint32_t ci = World::SlotCellIndex({x, yy, z});
+    auto it = chunkBuf.find(ci / kChunkVol);
+    return it == chunkBuf.end() ? 0u : it->second[ci % kChunkVol];
+  };
+  struct Outcome {
+    uint32_t levels = 0, subj = 0;
+    bool found = true;
+    bool Spent(const Arm& a) const { return levels < a.amt * (uint32_t)kLen; }
+    bool Kept() const { return subj == (uint32_t)kLen; }
+  };
+  Outcome grid[kArms], body[kArms];
+  for (int a = 0; a < kArms; a++) {
+    const int hz = gz0 + a * kPitch;
+    for (int x = gx0; x < gx0 + kLen; x++) {
+      const uint32_t w = at(x, gy, hz + 1);
+      if ((w & 0xFFFu) == arms[a].subj) grid[a].subj++;
+      if (VoxStainType(w) == arms[a].stainType) grid[a].levels += VoxStainAmt(w);
+    }
+    body[a].found = false;
+  }
+  for (uint32_t i = 0; i < debris.BodyCount(); i++) {
+    const Vec3 pos = debris.BodyPosition(i);
+    for (int a = 0; a < kArms; a++) {
+      if (std::fabs(pos.x - (float)bx[a]) > 8.0f) continue;
+      body[a].found = true;
+      body[a].subj += debris.BodyMaterialCount(i, arms[a].subj);
+      body[a].levels += debris.BodyCoatLevels(i, arms[a].coat);
+    }
+  }
+  debris.Reset();
+  weather::SetOverride(prevPin);
+  weather::Snap();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // The expected class per arm, and each population's.
+  // "partly" vs "gone" is what makes the oil arm falsifiable: the body's old
+  // fuel section spent a coat WHOLE per flash (and the wet one boiled at its
+  // own clock), so beside a steady ember the body's oil was gone in a few
+  // ticks while the grid's, a level a flash, was not.
+  auto cls = [&](int a, const Outcome& o) -> std::string {
+    if (!o.found) return "missing";
+    const char* s = !o.Spent(arms[a]) ? "unspent" : o.levels ? "partly" : "gone";
+    return std::string(s) + "/" + (o.Kept() ? "kept" : "changed");
+  };
+  const char* want[kArms] = {"partly/kept", "partly/kept", "unspent/kept"};
+  bool ok = true;
+  std::string out;
+  for (int a = 0; a < kArms; a++) {
+    const std::string g = cls(a, grid[a]), b = cls(a, body[a]);
+    const bool armOk = g == want[a] && b == want[a];
+    ok = ok && armOk;
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+                  "%s%s: grid %s (levels %u/%u, subject %u/%d) body %s (levels "
+                  "%u/%u, subject %u/%d) want %s%s",
+                  a ? " | " : "", arms[a].name, g.c_str(), grid[a].levels,
+                  arms[a].amt * (uint32_t)kLen, grid[a].subj, kLen, b.c_str(),
+                  body[a].levels, arms[a].amt * (uint32_t)kLen, body[a].subj,
+                  kLen, want[a], armOk ? "" : " FAIL");
+    out += buf;
+    RecordObserved((std::string("coatParity.") + arms[a].name + ".gridLevels").c_str(),
+                   (double)grid[a].levels);
+    RecordObserved((std::string("coatParity.") + arms[a].name + ".bodyLevels").c_str(),
+                   (double)body[a].levels);
+  }
+  char head[64];
+  std::snprintf(head, sizeof head, "after %u ticks: ", kTicks);
+  detail = head + out;
+  std::printf("coat-parity: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- player-body -------------------------------------------------------
 Status GatePlayerBody(Ctx& c, std::string& detail) {
   const std::vector<MaterialDef>& mats = c.mats;
@@ -631,7 +1000,7 @@ bool pushOk = false;
   float pushFar = phys.PlayerPushOut(pb, at).len();
   phys.RemoveBody(farBody);
 
-  // RELEASE WHEN CLEAR (Physics::ReleaseToWorldWhenClear). A body born inside
+  // RELEASE WHEN CLEAR (a loose Physics::BodyRole). A body born inside
   // the proxy — a severed limb, a cut strap's plate, a sword knocked from a
   // hand — must be invisible to the push while it overlaps, and ordinary
   // debris once it is clear: one that stayed exempt would be walk-through
@@ -649,7 +1018,7 @@ bool pushOk = false;
     };
     pin();
     uint64_t inside = stoneBlock({499, 499, 499});  // straddles the capsule
-    phys.ReleaseToWorldWhenClear(inside);
+    phys.SetBodyRole(inside, Physics::BodyRole::Debris);
     const float pushHeld = phys.PlayerPushOut(pb, at).len();
     phys.Step(kTickDt);   // still overlapping after a step: still exempt
     const float pushHeld2 = phys.PlayerPushOut(pb, at).len();
@@ -675,7 +1044,7 @@ bool pushOk = false;
   }
 
   // A CARRIED PROP HAS NO CONTACTS, IN EITHER DIRECTION
-  // (Physics::SetBodyPropLayer, Layers::PROP).
+  // (Physics::BodyRole::HeldProp, Layers::PROP).
   //
   // A held weapon is a kinematic body posed by its wielder's hand and pinned
   // to it by a joint, so a contact can never move the WEAPON — only whatever
@@ -702,7 +1071,7 @@ bool pushOk = false;
 
     uint64_t prop = stoneBlock({499, 499, 499});  // straddles the capsule
     const float pushPlain = phys.PlayerPushOut(pb, at).len();
-    phys.SetBodyPropLayer(prop, true);
+    phys.SetBodyRole(prop, Physics::BodyRole::HeldProp);
     const float pushProp = phys.PlayerPushOut(pb, at).len();
     // ...and a ray fired along +x from well outside still finds it.
     float frac = 1.0f;
@@ -710,7 +1079,10 @@ bool pushOk = false;
         phys.CastRayBody(Vec3{480.0f, 500.0f, 500.0f}, Vec3{1, 0, 0}, 40.0f,
                          frac);
     const int layerWhileProp = phys.BodyObjectLayer(prop);
-    phys.SetBodyPropLayer(prop, false);
+    // Back to an ATTACHED, unowned role (a live NPC limb: MOVING at once, no
+    // clearing) — the old SetBodyPropLayer(false). A loose role would clear
+    // the capsule first and read 0 here, correctly.
+    phys.SetBodyRole(prop, Physics::BodyRole::RigLive);
     const float pushBack = phys.PlayerPushOut(pb, at).len();
     phys.RemoveBody(prop);
 
@@ -730,7 +1102,7 @@ bool pushOk = false;
       const uint64_t blade =
           phys.CreateDebrisBodyXf(vox, bxf, dens, /*allowKinematic=*/true);
       phys.SetBodyKinematic(blade, true);
-      if (asProp) phys.SetBodyPropLayer(blade, true);
+      if (asProp) phys.SetBodyRole(blade, Physics::BodyRole::HeldProp);
       const float startX = 612.0f;
       // 10 kg: comfortably under the player's kick-it-aside mass, and the
       // kind of thing a blade would otherwise punt across the field.
@@ -1218,9 +1590,12 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
     a.hadMicro = 1;
     a.bleedMat = 9;
     a.dead = 1;
-    a.item = "iron sword";
-    a.itemDye = 3;
-    a.itemDamage = 41;
+    a.item.name = "iron sword";
+    a.item.dye = 3;
+    a.item.fillMat = 7;    // W2-M: the whole ItemInstance travels
+    a.item.fillAmt = 41;
+    a.item.damage.shells.resize(1);
+    a.item.damage.shells[0].hp = 2.5f;
     std::vector<uint8_t> buf;
     net::Encode(buf, a);
     // TWO RECORDS IN ONE BUFFER, on purpose: a datagram carries several, and
@@ -1243,7 +1618,11 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
               a2.physScale == a.physScale && a2.skinScale == a.skinScale &&
               a2.dye == a.dye && a2.hadMicro == a.hadMicro &&
               a2.bleedMat == a.bleedMat && a2.dead == a.dead &&
-              a2.item == a.item && a2.itemDamage == a.itemDamage &&
+              a2.item.name == a.item.name && a2.item.dye == a.item.dye &&
+              a2.item.fillMat == a.item.fillMat &&
+              a2.item.fillAmt == a.item.fillAmt &&
+              a2.item.damage.shells.size() == 1 &&
+              a2.item.damage.shells[0].hp == 2.5f &&
               std::memcmp(a2.voxels.data(), a.voxels.data(),
                           a.voxels.size() * sizeof(DebrisVoxel)) == 0;
     codecOk = codecOk && p2.tick == pose.tick && p2.vel.y == pose.vel.y;
@@ -1548,12 +1927,16 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
   std::string grantedName;
   {
     // The GHOST arm is the interesting one: E on a body another machine owns.
-    debris.SetItemLookupFn([&](uint64_t bh, std::string& name, uint32_t& dye,
-                               uint32_t& dmg) {
+    // The WHOLE item (W2-M): a grant used to carry name, dye and a damage word
+    // nothing wrote, and a flask picked up across the wire arrived empty.
+    debris.SetItemLookupFn([&](uint64_t bh, ItemInstance& it) {
       if (bh != ghostH) return false;
-      name = "iron sword";
-      dye = 5;
-      dmg = 12;
+      it.name = "iron sword";
+      it.dye = 5;
+      it.fillMat = 9;
+      it.fillAmt = 12;
+      it.damage.shells.resize(1);
+      it.damage.shells[0].hp = 12.0f;
       return true;
     });
     // A PICKUP TAKES THE THING OFF THE GROUND. The first version of this
@@ -1589,10 +1972,18 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
     debris.ApplyItemTake(out);
     net::ItemGrant g{};
     const bool gotGrant = debris.PopItemGrant(g);
-    grantedName = g.item;
+    grantedName = g.item.name;
+    // ...and it survives the wire: the requester sees what the owner took.
+    std::vector<uint8_t> gbuf;
+    net::Encode(gbuf, g);
+    ByteReader gr{gbuf.data(), gbuf.size()};
+    net::ItemGrant gw{};
+    const bool wired = net::Decode(gr, gw) && gr.off == gbuf.size();
     itemOk = queued && noEarlyGrant && sent && gotGrant && g.granted == 1 &&
-             g.item == "iron sword" && g.dye == 5 && g.damage == 12 &&
-             g.globalId == ghostId;
+             wired && gw.item.name == "iron sword" && gw.item.dye == 5 &&
+             gw.item.fillMat == 9 && gw.item.fillAmt == 12 &&
+             gw.item.damage.shells.size() == 1 &&
+             gw.item.damage.shells[0].hp == 12.0f && gw.globalId == ghostId;
     // A REFUSAL IS A REPLY, and it has to be distinguishable. Asking again for
     // the body that has now been taken must come back granted == 0 rather
     // than silently producing nothing.
@@ -1764,6 +2155,8 @@ const std::vector<Gate>& BodyGates() {
   static const std::vector<Gate> g = {
       {"debris", "phys", {}, false, GateDebris},
       {"settle-back", "phys", {}, false, GateSettleBack},
+      {"debris-coat", "phys", {}, false, GateDebrisCoat},
+      {"coat-parity", "phys", {}, false, GateCoatParity},
       {"player-body", "phys", {}, false, GatePlayerBody},
       {"ragdoll-joints", "phys", {}, false, GateRagdollJoints},
       {"body-fastfall", "phys", {}, false, GateBodyFastFall},

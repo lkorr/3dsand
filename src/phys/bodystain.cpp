@@ -6,18 +6,54 @@
 
 #include "sim/microbody.h"
 #include "sim/rng.h"
+#include "sim/coatrule.h"
+
+namespace {
+// The coat CLASS of every material (kBodyCoat*), published by the owner of the
+// material tables on every load (MobSystem::SetMaterials). Derived data, one
+// row per material; empty = no class known, so only weight decides.
+std::vector<uint8_t> gCoatClass;
+bool ClassHas(uint32_t mat, uint8_t bit) {
+  return mat < gCoatClass.size() && (gCoatClass[mat] & bit) != 0;
+}
+// The one precedence rule (sim/coatrule.h stainPrecedence) for a body coat.
+// Every body coat is substance (DESIGN.md §6 rule 0), so every level is PAID.
+uint32_t BodyPrecedence(uint16_t cur, uint32_t mat, uint32_t amt) {
+  const uint32_t curAmt = BodyStainAmt(cur), curMat = BodyStainMat(cur);
+  return stainPrecedence(curAmt, curMat == mat, amt,
+                         ClassHas(mat, kBodyCoatWashes),
+                         ClassHas(curMat, kBodyCoatWashes),
+                         ClassHas(mat, kBodyCoatCorrodes),
+                         ClassHas(curMat, kBodyCoatCorrodes), /*paid=*/true);
+}
+}  // namespace
+
+void SetBodyCoatClasses(std::vector<uint8_t> classes) {
+  gCoatClass = std::move(classes);
+}
+
+uint32_t BodyCoatClassOf(uint32_t mat) {
+  return mat < gCoatClass.size() ? gCoatClass[mat] : 0u;
+}
 
 uint16_t RaiseBodyStain(uint16_t cur, uint32_t mat, uint32_t amt) {
   if (amt == 0 || mat == 0) return cur;
-  const uint32_t curAmt = BodyStainAmt(cur), curMat = BodyStainMat(cur);
-  if (curAmt == 0 || curMat == mat) return PackBodyStain(mat, std::max(curAmt, amt));
-  return amt > curAmt ? PackBodyStain(mat, amt) : cur;
+  switch (BodyPrecedence(cur, mat, amt)) {
+    case kStainPrecOwn:
+      return PackBodyStain(mat, std::max<uint32_t>(BodyStainAmt(cur), amt));
+    case kStainPrecOver:
+      return PackBodyStain(mat, amt);
+    default:  // a rinse is WashBodyStain's road; a refusal leaves it be
+      return cur;
+  }
 }
 
 uint16_t WashBodyStain(uint16_t cur, uint32_t washMat, uint32_t wetAmt,
                        uint32_t rinse) {
   if (washMat == 0) return cur;
   const uint32_t curAmt = BodyStainAmt(cur), curMat = BodyStainMat(cur);
+  // The precedence rule says RINSE for any foreign coat (the caller is a
+  // washer by definition) and OWN for clean or already wet.
   if (curAmt != 0 && curMat != washMat) {
     if (curAmt > rinse) return PackBodyStain(curMat, curAmt - rinse);
     return PackBodyStain(washMat, wetAmt);  // amount 0 packs as clean
@@ -30,14 +66,17 @@ uint16_t AddBodyStain(uint16_t cur, uint32_t mat, uint32_t add, uint32_t cap) {
   if (add == 0 || mat == 0) return cur;
   cap = std::min<uint32_t>(cap, kBodyStainAmtMax);
   if (cap == 0) return cur;
-  const uint32_t curAmt = BodyStainAmt(cur), curMat = BodyStainMat(cur);
-  if (curAmt != 0 && curMat != mat) {
-    // Somebody else's coat is here. Same rule Raise uses -- only a strictly
-    // larger amount repaints -- so a deepening bruise never wipes blood off.
-    return add > curAmt ? PackBodyStain(mat, std::min(add, cap)) : cur;
+  const uint32_t curAmt = BodyStainAmt(cur);
+  switch (BodyPrecedence(cur, mat, add)) {
+    case kStainPrecOwn:
+      if (BodyStainMat(cur) != mat) return PackBodyStain(mat, std::min(add, cap));
+      if (curAmt >= cap) return cur;   // already at the ceiling: nothing to add
+      return PackBodyStain(mat, std::min(curAmt + add, cap));
+    case kStainPrecOver:
+      return PackBodyStain(mat, std::min(add, cap));
+    default:
+      return cur;
   }
-  if (curAmt >= cap) return cur;   // already at the ceiling: nothing to add
-  return PackBodyStain(mat, std::min(curAmt + add, cap));
 }
 
 CellDist BuildCellDist(const std::vector<IVec3>& seeds, int pad) {
