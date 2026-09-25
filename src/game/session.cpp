@@ -1893,11 +1893,11 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
       // burning emits REAL fire voxels into the grid, and mobs run first.
       // (`cellOps` is aliased out of the caller's OpBatch.)
 
-      // The day phase both body-burn passes gate their reactions on, taken
+      // The day phase the body-reaction evaluator gates its rules on (every
+      // body population, debris included, goes through MobSystem's), taken
       // from the ONE function that also puts it on TickParams — see
       // sim/reactcpu.h for why the CPU has to agree with the GPU here.
       mobs.SetDayPhase(DayPhaseNow(tick));
-      debris.SetDayPhase(DayPhaseNow(tick));
       // ...and the weather: the tick's rain word, LATCHED here once and taken
       // by SubmitTick for TickParams (weather::TakeTickRain), so the body
       // reactions and the GPU kernels read one value even if the weather pin
@@ -1906,7 +1906,6 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
         const uint32_t rainWord =
             weather::LatchTickRain(CurrentTuning(), kDefaultSeed, tick);
         mobs.SetWeatherRain(rainWord);
-        debris.SetWeatherRain(rainWord);
       }
 
       // ---- BROKEN VESSELS (game/container.h ContainerShouldBreak) -----------

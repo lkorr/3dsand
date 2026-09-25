@@ -600,6 +600,148 @@ auto note = [&failed](bool ok, const char* name) {
   return settleOk ? Status::Pass : Status::Fail;
 }
 
+// ---- debris-coat (W2-I, 2026-09-24) --------------------------------------
+// LOOSE MATTER GETS THE FULL RULE SET. Non-flesh debris used to burn through
+// its own copy of the reaction evaluator, which knew nothing of coats: an
+// oiled plank caught exactly like a clean one and a soaked one too. It now
+// goes through MobSystem::BurnOneLimb like every limb, so the coat sections
+// apply: a FUEL coat flashes when heat touches it and lights the voxel under
+// it, a WASHER coat refuses every hot product and douses what is burning.
+//
+// Three identical wood planks, one ember each at the same lattice cell,
+// resting on their own stone pads far enough apart that the grid fire one
+// emits cannot reach the next: clean, oiled, soaked. No world fire at all --
+// the only heat is the body's own ember, so the three differ in nothing but
+// the coat. Measured inside the window before a resting body settles back
+// into the grid (kSettleAfterTicks, 60 asleep ticks).
+Status GateDebrisCoat(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const std::vector<MaterialDef>& mats = c.mats;
+  Physics& phys = c.phys;
+  DebrisSystem& debris = c.debris;
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < mats.size(); i++)
+      if (mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mOil = matId("oil"), mWater = matId("water");
+  if (!mOil || !mWater) {
+    detail = "oil or water material missing";
+    return Status::Fail;
+  }
+  // Dry, whatever an earlier gate left the weather at: wood's ignition rule
+  // is rain-damped, and the claim is about the COAT.
+  c.mobs.SetWeatherRain(0u);
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  std::vector<float> dens;
+  for (const auto& m : mats) dens.push_back((float)m.gpu.density);
+
+  struct Plank {
+    const char* name;
+    uint32_t coat, amt;
+    int x;
+    uint32_t wood = 0, ember = 0, voxels = 0;
+    bool found = false;
+  };
+  Plank planks[3] = {{"clean", 0u, 0u, 72}, {"oiled", mOil, 8u, 96},
+                     {"soaked", mWater, 12u, 120}};
+  const int z = 96;
+  uint32_t t = 12000;
+  std::vector<CellOp> pad;
+  int padY[3];
+  for (int p = 0; p < 3; p++) {
+    padY[p] = World::TerrainHeight(planks[p].x, z, kDefaultSeed) + 2;
+    for (int dz = -4; dz <= 4; dz++)
+      for (int dx = -4; dx <= 4; dx++)
+        for (int y = padY[p] - 3; y <= padY[p]; y++)
+          pad.push_back({World::SlotCellIndex({planks[p].x + dx, y, z + dz}),
+                         (uint32_t)kMatStone});
+  }
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, pad, false,
+             {planks[1].x / 16, padY[1] / 16, z / 16}, true, false, {});
+  ctx.WaitIdle();
+  ctx.ProcessEvents();
+  // 5 x 2 x 5 of wood, ember at the top centre; every voxel wears the coat.
+  for (int p = 0; p < 3; p++) {
+    std::vector<DebrisVoxel> vox;
+    for (int zz = 0; zz < 5; zz++)
+      for (int y = 0; y < 2; y++)
+        for (int x = 0; x < 5; x++) {
+          DebrisVoxel v{(int8_t)x, (int8_t)y, (int8_t)zz, 0,
+                        (uint16_t)((x == 2 && y == 1 && zz == 2) ? kMatEmber
+                                                                  : kMatWood)};
+          v.stain = PackBodyStain(planks[p].coat, planks[p].amt);
+          vox.push_back(v);
+        }
+    const IVec3 at{planks[p].x - 2, padY[p] + 1, z - 2};
+    const uint64_t h = phys.CreateDebrisBody(vox, at, dens);
+    BodyTransform xf{};
+    xf.pos = Vec3{(float)at.x, (float)at.y, (float)at.z};
+    xf.quat[3] = 1;
+    debris.AdoptBody(h, vox, xf);
+  }
+  constexpr int kTicks = 50;
+  uint32_t fireOps = 0;
+  for (int i = 0; i < kTicks; i++) {
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    for (const CellOp& op : cellOps)
+      if ((op.word & 0xFFFu) == kMatFire) fireOps++;
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false,
+               {planks[1].x / 16, padY[1] / 16, z / 16}, true, true, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+  }
+  // Each body is told apart by where it lies (a burn rebuild replaces its
+  // handle, and a body index moves when another is erased).
+  for (uint32_t i = 0; i < debris.BodyCount(); i++) {
+    const Vec3 pos = debris.BodyPosition(i);
+    for (Plank& pk : planks) {
+      if (std::fabs(pos.x - (float)pk.x) > 8.0f) continue;
+      pk.found = true;
+      pk.wood += debris.BodyMaterialCount(i, kMatWood);
+      pk.ember += debris.BodyMaterialCount(i, kMatEmber);
+      pk.voxels += debris.BodyVoxelCount(i);
+    }
+  }
+  // Burnt = the wood that is no longer wood (ember, ash left, or gone).
+  auto burnt = [](const Plank& pk) { return pk.found ? 49u - std::min(49u, pk.wood) : 49u; };
+  const Plank& cl = planks[0];
+  const Plank& oi = planks[1];
+  const Plank& so = planks[2];
+  const bool allThere = cl.found && oi.found && so.found;
+  // The control burns at all (its ember is still lit, or it spread).
+  const bool cleanOk = cl.found && (burnt(cl) > 0 || cl.ember > 0);
+  // Oil flashes: far more of the plank taken in the same ticks.
+  const bool oilOk = oi.found && burnt(oi) >= burnt(cl) + 6;
+  // Wet does not catch, and the ember under the water goes out.
+  const bool wetOk = so.found && burnt(so) == 0 && so.ember == 0;
+  const bool ok = allThere && cleanOk && oilOk && wetOk;
+  char buf[384];
+  std::snprintf(buf, sizeof buf,
+                "after %d ticks, wood burnt of 49 / embers left / voxels: clean "
+                "%u/%u/%u, oiled %u/%u/%u, soaked %u/%u/%u; %u fire ops; %s",
+                kTicks, burnt(cl), cl.ember, cl.voxels, burnt(oi), oi.ember,
+                oi.voxels, burnt(so), so.ember, so.voxels, fireOps,
+                !allThere ? "a plank is missing (settled or burnt away)"
+                : !cleanOk ? "the clean control did not burn"
+                : !oilOk   ? "oil did not speed the fire"
+                : !wetOk   ? "the soaked plank caught or kept its ember"
+                           : "coats act on loose matter");
+  detail = buf;
+  std::printf("debris-coat: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
+  debris.Reset();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- player-body -------------------------------------------------------
 Status GatePlayerBody(Ctx& c, std::string& detail) {
   const std::vector<MaterialDef>& mats = c.mats;
@@ -1764,6 +1906,7 @@ const std::vector<Gate>& BodyGates() {
   static const std::vector<Gate> g = {
       {"debris", "phys", {}, false, GateDebris},
       {"settle-back", "phys", {}, false, GateSettleBack},
+      {"debris-coat", "phys", {}, false, GateDebrisCoat},
       {"player-body", "phys", {}, false, GatePlayerBody},
       {"ragdoll-joints", "phys", {}, false, GateRagdollJoints},
       {"body-fastfall", "phys", {}, false, GateBodyFastFall},

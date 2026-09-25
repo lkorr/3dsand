@@ -21,6 +21,7 @@
 #include "phys/lattice.h"
 #include "sim/bytestream.h"
 #include "sim/mattable.h"
+#include "sim/bodyreact.h"
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
 #include "sim/scale.h"   // SkinScaleFor / NeededArtUpsample / MetresToCells
@@ -1979,6 +1980,22 @@ void MobSystem::Init(Physics* phys, World* world, DebrisSystem* debris,
   phys_ = phys;
   world_ = world;
   debris_ = debris;
+  // ONE body-reaction evaluator for every population (W2-I): the debris pass
+  // over non-flesh bodies schedules and runs its tail, and evaluates through
+  // BurnOneLimb here, as severed flesh already did (BurnDeadFlesh).
+  if (debris_)
+    debris_->SetBodyReactor(
+        [this](DebrisSystem::FleshLattice& f, uint32_t tick, World& w,
+               std::vector<CellOp>& ops, uint32_t& frontBudget,
+               uint32_t& opsBudget, uint32_t& walkBudget, uint32_t& removed,
+               bool& deferred) {
+          return BurnLooseBody(f, tick, w, ops, frontBudget, opsBudget,
+                               walkBudget, removed, deferred);
+        },
+        [this](uint32_t tick, bool forgetAll) {
+          if (forgetAll) looseBurn_.clear();
+          else RetireLooseBurn(tick);
+        });
   OnMaterialsReloaded(mats, reactions);
 }
 
@@ -2028,34 +2045,31 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
       if (t == "flammable") flammable = true;
     burnable_[i] = flammable ? 1u : 0u;
   }
-  // The tag bit for "hot" is looked up ONCE, by name, from whatever material
-  // declares it — there is no hardcoded id and no hardcoded bit. A material
-  // becomes a heat source by carrying the tag, which is the same contract the
-  // grid's combustion rules already work by.
-  // The BIT one tag name owns, recovered from the compiled masks: the bits
-  // common to every material carrying the tag, minus every bit any material
-  // without it carries. Exact, and it needs no access to the TagRegistry —
-  // which is a load-time local and deliberately not published.
-  //
-  // Doing it as a plain OR would be wrong in a way that only shows up later:
-  // every material carrying `hot` also carries `organic` now that flesh can
-  // burn, so an OR-derived "hot" mask would quietly mean "hot or organic".
-  auto tagBit = [&](const char* name) {
-    uint32_t all = 0xFFFFFFFFu, none = 0;
-    bool any = false;
-    for (const auto& m : mats) {
-      bool has = false;
-      for (const auto& t : m.tags)
-        if (t == name) has = true;
-      if (has) { all &= m.gpu.tagMask; any = true; } else { none |= m.gpu.tagMask; }
-    }
-    return any ? (all & ~none) : 0u;
-  };
-  const uint32_t hotMask = tagBit("hot");
-  const uint32_t infectiousMask = tagBit("infectious");
-  const uint32_t dissolvableMask = tagBit("dissolvable");
+  // Tag bits are looked up ONCE, by name, from whatever material declares
+  // them — no hardcoded id and no hardcoded bit (BodyReactTagBit: exact, not
+  // an OR, because every `hot` material also carries `organic`). `hot` and
+  // `dissolvable` are read by the shared flag builder below.
+  const uint32_t infectiousMask = BodyReactTagBit(mats, "infectious");
 
-  for (const auto& m : mats) {
+  // The flag columns every body-reaction consumer gates on come from ONE
+  // builder, shared with DebrisSystem (sim/bodyreact.h). UNGATED self rules
+  // only count as alight (W1-F, 2026-09-24): a decay/emit behind a
+  // neighbour-count ramp cannot fire until something hot is next to the
+  // voxel, and then that neighbour's own front (or the world / sibling face
+  // seeding) queues it anyway. flesh_charred, flesh_cooked and cloth_charred
+  // own only such rules, and counting them kept every charred LIVE limb on
+  // the front, `alight`, and awake forever.
+  {
+    BodyReactFlags rf;
+    BuildBodyReactFlags(mats, reactions_, rf);
+    matSelfActive_ = std::move(rf.selfActive);
+    matHasPair_ = std::move(rf.hasPair);
+    matRewritesNbr_ = std::move(rf.rewritesNbr);
+    matHot_ = std::move(rf.hot);
+    matAttacksBody_ = std::move(rf.attacksBody);
+  }
+  for (size_t mi = 0; mi < mats.size(); mi++) {
+    const MaterialDef& m = mats[mi];
     densityOf_.push_back((float)m.gpu.density);
     // Collision class, not raw klass: passable vegetation reads as gas so a
     // mob's ground probe walks through reeds instead of standing on them or
@@ -2063,42 +2077,9 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     classOf_.push_back((m.gpu.flags & kMatFlagPassable) ? (uint32_t)CLASS_GAS
                                                         : m.gpu.klass);
     matGpu_.push_back(m.gpu);
-    uint8_t selfActive = 0, hasPair = 0, rewritesNbr = 0;
-    for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
-      const ReactionGpu& r = reactions_[m.gpu.reactOffset + ri];
-      const uint32_t kind = r.packed & 3u;
-      // UNGATED self rules only (W1-F, 2026-09-24): a decay/emit behind a
-      // neighbour-count ramp cannot fire until something hot is next to the
-      // voxel, and then that neighbour's own front (or the world / sibling
-      // face seeding) queues it anyway. flesh_charred, flesh_cooked and
-      // cloth_charred own only such rules, and counting them kept every
-      // charred LIVE limb on the front, `alight`, and awake forever -- the
-      // split debris.cpp already makes (matSelfScaled_), measured by the
-      // mob-burn gate's "charred limbs sleep" line.
-      if ((kind == kReactDecay || kind == kReactEmit) && !ReactScaleArmed(r))
-        selfActive = 1;
-      if (kind == kReactPair) {
-        hasPair = 1;
-        if (r.prodNbr != kProdKeep) rewritesNbr = 1;
-      }
-    }
-    matSelfActive_.push_back(selfActive);
-    matHasPair_.push_back(hasPair);
-    matRewritesNbr_.push_back(rewritesNbr);
-    matHot_.push_back((m.gpu.tagMask & hotMask) != 0 ? 1 : 0);
     matInfectious_.push_back((infectiousMask && (m.gpu.tagMask & infectiousMask)) ? 1 : 0);
-    // Could any of those rewrites land on a creature? See matAttacksBody_.
-    uint8_t attacks = 0;
-    for (uint32_t ri = 0; ri < m.gpu.reactCount; ri++) {
-      const ReactionGpu& r = reactions_[m.gpu.reactOffset + ri];
-      if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep) continue;
-      // A wildcard predicate matches everything, so it matches a body too.
-      if (r.nbrMat == kNbrAny && r.nbrTags == 0) { attacks = 1; break; }
-      if (r.nbrTags & dissolvableMask) { attacks = 1; break; }
-      if (r.nbrMat != kNbrAny && r.nbrMat < mats.size() &&
-          (mats[r.nbrMat].gpu.tagMask & dissolvableMask)) { attacks = 1; break; }
-    }
-    matAttacksBody_.push_back(attacks);
+    // Could any rewrite of this material land on a creature? matAttacksBody_.
+    const uint8_t attacks = matAttacksBody_[mi];
     // ---- the stain palette, both ways round, and the coat block ------------
     // The slot is what the RENDERER can afford (three bits in the voxel word
     // and three in the micro brick's stain lattice); the material is what
@@ -2119,7 +2100,7 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     // A CORROSIVE COAT: wearable (a stain slot) and its rules can rewrite body
     // matter. Both halves come from the table, so "acid" is named nowhere.
     // A HOT coat (lava) acts on its own too -- it burns what it sits on.
-    const bool coatHot = slot != 0 && matHot_.back() != 0;
+    const bool coatHot = slot != 0 && matHot_[mi] != 0;
     matCoatHot_.push_back(coatHot ? 1 : 0);
     matCorrodes_.push_back(slot != 0 && (attacks || coatHot) ? 1 : 0);
     if (matCorrodes_.back()) corrosiveMats_.push_back((uint32_t)(matCorrodes_.size() - 1));
@@ -3040,6 +3021,7 @@ void MobSystem::Reset(bool rewindIds) {
   // torn down (StainDeadFlesh).
   fleshCoat_.clear();
   fleshShellIdx_.clear();
+  looseBurn_.clear();
   // THE ID COUNTER IS DELIBERATELY NOT REWOUND BY DEFAULT.
   //
   // A mob id is not just a handle: it seeds the entity-scoped gore variance
@@ -10796,6 +10778,7 @@ void Mob::DropBurnIndex(BodyBurnState& st) {
   st.quiet = 0;
   st.sleepKey = 0;
   st.idle = false;
+  st.holdBy = 0;  // nobody holds an index that is gone
   // `st.alight` deliberately SURVIVES. Everything above is an index INTO a
   // lattice that just changed shape; the flag is a fact ABOUT the lattice, and
   // it is the only thing that will make BurnOneLimb rebuild this index once the
@@ -11066,6 +11049,8 @@ void MobSystem::BuildBurnIndex(BurnLimbView& v) {
   // right: it makes the limb un-burnable this tick rather than spending the
   // memory, and no authored rig comes near the ceiling.
   if (cells > (1u << 20)) return;
+  burnStats_.indexBuilds++;
+  burnStats_.indexCells += cells;
 
   st.min = mn;
   st.dims = dims;
@@ -12684,6 +12669,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   if (!BurnTablesReady() || v.Size() == 0 || frontBudget == 0) return false;
   BodyBurnState& st = *v.burn;
   const uint32_t limbKey = rngKey;
+  burnStats_.visits++;
 
   // One-entry chunk memo. A limb spans one or two chunks and the ignition scan
   // asks the same one over and over; without this the walk is a hash lookup per
@@ -12812,27 +12798,48 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   if (v.crossHeat && v.crossPct > 0)
     for (const CrossHeatCell& e : *v.crossHeat)
       if (e.limbs & ~selfBit) { foreignHeat = true; break; }
-  if (st.front.empty() && !st.alight && !v.corrodeCoat && st.idx.empty() &&
-      !foreignHeat) {
-    uint64_t h = 1469598103934665603ull;
-    auto mix = [&h](uint64_t x) {
+  // Attribution (BodyBurnState::sleepMiss): which half of the test failed.
+  //
+  // A HELD INDEX DOES NOT KEEP THE LIMB AWAKE (W2-I, 2026-09-24). The sleep
+  // used to demand an EMPTY index, and the index is shared: the coat passes
+  // build it for their own surface lists and keep it warm by resetting
+  // `quiet` while they have work -- WetOneLimb every third tick for as long as
+  // any water is on the limb, StainOneLimb for as long as the limb touches
+  // anything that stains (wet ground under a doused creature). So a creature
+  // that had been doused, rained on or was standing in a puddle never slept
+  // at all, burnt or not: measured on mob-burn subtest K, all 15 limbs of the
+  // doused human "holdBy wet" (5 also "contact"), "miss index", 0 of 900
+  // limb-visits asleep. Nothing the walk reads depends on whether an index is
+  // held -- the key digests the box, the chunks and the tables -- so the walk
+  // may be skipped whoever holds the index; the grace that releases it keeps
+  // counting in the asleep branch below.
+  st.slept = false;
+  uint8_t miss = 0;
+  const bool quietHere =
+      st.front.empty() && !st.alight && !v.corrodeCoat && !foreignHeat;
+  if (!quietHere) miss |= BodyBurnState::kMissBusy;
+  if (quietHere) {
+    // Three digests rather than one chain, so a miss can say WHICH moved: the
+    // pose, the box the walk reads, or the world in that box.
+    auto fnv = [](uint64_t& h, uint64_t x) {
       h ^= x;
       h *= 1099511628211ull;
     };
-    auto mixF = [&mix](float f) {
+    uint64_t hp = 1469598103934665603ull, hb = hp, hw = hp;
+    auto mixF = [&fnv](uint64_t& h, float f) {
       uint32_t u;
       std::memcpy(&u, &f, 4);
-      mix(u);
+      fnv(h, u);
     };
-    mixF(v.xf->pos.x); mixF(v.xf->pos.y); mixF(v.xf->pos.z);
-    for (int k = 0; k < 4; k++) mixF(v.xf->quat[k]);
-    mix((uint64_t)(uint32_t)lo.x << 32 | (uint32_t)lo.y);
-    mix((uint64_t)(uint32_t)lo.z << 32 | (uint32_t)hi.x);
-    mix((uint64_t)(uint32_t)hi.y << 32 | (uint32_t)hi.z);
+    mixF(hp, v.xf->pos.x); mixF(hp, v.xf->pos.y); mixF(hp, v.xf->pos.z);
+    for (int k = 0; k < 4; k++) mixF(hp, v.xf->quat[k]);
+    fnv(hb, (uint64_t)(uint32_t)lo.x << 32 | (uint32_t)lo.y);
+    fnv(hb, (uint64_t)(uint32_t)lo.z << 32 | (uint32_t)hi.x);
+    fnv(hb, (uint64_t)(uint32_t)hi.y << 32 | (uint32_t)hi.z);
     const IVec3 wo = world.WindowOrigin();
-    mix((uint64_t)(uint32_t)wo.x << 32 | (uint32_t)wo.y);
-    mix((uint64_t)(uint32_t)wo.z);
-    mix((uint64_t)(uintptr_t)matHot_.data() ^ matHot_.size());
+    fnv(hb, (uint64_t)(uint32_t)wo.x << 32 | (uint32_t)wo.y);
+    fnv(hb, (uint64_t)(uint32_t)wo.z);
+    fnv(hb, (uint64_t)(uintptr_t)matHot_.data() ^ matHot_.size());
     const IVec3 c0 = ChunkOfCell(lo.x, lo.y, lo.z),
                 c1 = ChunkOfCell(hi.x, hi.y, hi.z);
     bool known = true;
@@ -12846,15 +12853,57 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             known = false;
             break;
           }
-          mix((uint64_t)(uintptr_t)cc);
-          mix(cc->version);
+          fnv(hw, (uint64_t)(uintptr_t)cc);
+          fnv(hw, cc->version);
         }
-    if (known) sleepKey = h ? h : 1u;
+    if (!known) {
+      miss |= BodyBurnState::kMissUncached;
+    } else {
+      if ((st.keyPose | st.keyBox | st.keyWorld) == 0) {
+        miss |= BodyBurnState::kMissFirst;
+      } else {
+        if (hp != st.keyPose) miss |= BodyBurnState::kMissPose;
+        if (hb != st.keyBox) miss |= BodyBurnState::kMissBox;
+        if (hw != st.keyWorld) miss |= BodyBurnState::kMissWorld;
+      }
+      st.keyPose = hp;
+      st.keyBox = hb;
+      st.keyWorld = hw;
+      uint64_t h = hp;
+      fnv(h, hb);
+      fnv(h, hw);
+      sleepKey = h ? h : 1u;
+    }
     if (sleepKey && sleepKey == st.sleepKey) {  // asleep
+      burnStats_.sleeps++;
+      // The idle exit's grace, still counting: an index nobody else keeps
+      // warm is released on the same tick it would have been awake, and the
+      // key survives the release (it digests the world, not the index).
+      if (!st.idx.empty() && ++st.quiet > kBurnIndexGrace) {
+        Mob::DropBurnIndex(st);
+        st.sleepKey = sleepKey;
+      }
       st.idle = true;
+      st.slept = true;
+      st.sleepMiss = 0;
       return changed;
     }
   }
+  // The walk's own budget, when the caller gave one (BurnLimbView::
+  // walkBudget: loose debris). All or nothing, before any state moves.
+  if (v.walkBudget) {
+    const uint64_t box = (uint64_t)(hi.x - lo.x + 1) *
+                         (uint64_t)(hi.y - lo.y + 1) *
+                         (uint64_t)(hi.z - lo.z + 1);
+    const uint32_t need = (uint32_t)std::min<uint64_t>(box, kBurnScanCells);
+    if (*v.walkBudget < need) {
+      v.walkDeferred = true;
+      burnStats_.walkDeferred++;
+      return changed;
+    }
+    *v.walkBudget -= need;
+  }
+  st.sleepMiss = miss;
   st.sleepKey = 0;
   scanHot.clear();
   {
@@ -12871,6 +12920,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           // rules — see the inbound pass below).
           if (matHot_[m] || matAttacksBody_[m]) scanHot.push_back({x, y, z});
         }
+    burnStats_.walkCells += seen;
   }
 
   // ---- A SIBLING LIMB'S HEAT MUST ALSO WAKE THIS ONE ----------------------
@@ -12927,10 +12977,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // other tick, then released.
     if (!st.idx.empty() && ++st.quiet > kBurnIndexGrace)
       Mob::DropBurnIndex(st);
-    // Fall asleep only with no index held (the grace above has run out): a
-    // held index still counts its quiet ticks, and sleeping would freeze it.
-    // `sleepKey` is nonzero only when the index was ALREADY empty on entry.
-    if (st.idx.empty()) st.sleepKey = sleepKey;
+    // Fall asleep whether or not an index is held (see the note at the key):
+    // the asleep branch goes on counting the grace. After the drop above,
+    // which clears the key.
+    st.sleepKey = sleepKey;
     st.idle = true;
     return changed;
   }
@@ -13203,8 +13253,11 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // the voxel's own world cell, so burning matter visibly wastes away
       // instead of silently vanishing.
       if (pm != 0 && pm < matGpu_.size()) {
+        const uint32_t jitter = (rr >> 6) % 3u;
         const uint32_t state =
-            matGpu_[pm].klass == CLASS_LIQUID ? 7u : (rr >> 6) % 3u;
+            matGpu_[pm].klass == CLASS_LIQUID ? 7u
+            : v.gridState ? v.gridState(v.gridStateCtx, pm, v.Art(i), jitter)
+                          : jitter;
         const Vec3 wv = worldOf(p);
         emitCell({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, pm, state);
       }
@@ -15834,6 +15887,71 @@ void MobSystem::BurnDeadFlesh(uint32_t tick, World& world,
     it = tick - it->second.seen > 60u ? fleshShellIdx_.erase(it) : std::next(it);
 }
 
+namespace {
+// The dye a loose body's leaving matter hands the grid (BurnLimbView::
+// gridState): DebrisSystem's art -> tint quantizer, which it keeps fresh.
+uint32_t LooseGridState(void* ctx, uint32_t mat, uint32_t art,
+                        uint32_t fallback) {
+  return static_cast<const DebrisSystem*>(ctx)->GridStateFor(mat, art,
+                                                             fallback);
+}
+}  // namespace
+
+// ---- LOOSE MATTER BURNS AS A LIMB DOES (W2-I, 2026-09-24) -------------------
+// One non-flesh debris body, offered by DebrisSystem::BurnBodies (which chose
+// it, sized its share of the budget, and runs the tail on what comes back).
+// It used to be evaluated by a copy of this system's evaluator in debris.cpp
+// that never learned coats, so an oiled plank did not flash and a soaked one
+// caught like a dry one; it now IS this evaluator, with the population's own
+// inputs on the view (none of a creature's: no ledger, no shells, no cross
+// heat, no wounds) and the dye hook only loose matter has.
+bool MobSystem::BurnLooseBody(DebrisSystem::FleshLattice& f, uint32_t tick,
+                              World& world, std::vector<CellOp>& cellOps,
+                              uint32_t& frontBudget, uint32_t& opsBudget,
+                              uint32_t& walkBudget, uint32_t& removed,
+                              bool& deferred) {
+  removed = 0;
+  deferred = false;
+  if (!BurnTablesReady()) return false;
+  burnStats_.looseVisits++;
+  FleshCoat& cc = looseBurn_[f.id];
+  cc.seen = tick + 1u;  // 0 is "never"
+  int model = -1;
+  BurnLimbView v = FleshView(f, cc, model);
+  bool carved = false;
+  v.carved = &carved;
+  if (debris_) {
+    v.gridState = &LooseGridState;
+    v.gridStateCtx = debris_;
+  }
+  // The debris scheduler's pot of world-walk cells (BurnLimbView::walkBudget).
+  v.walkBudget = &walkBudget;
+  // Its own stream: the body's global id, salted apart from the severed-flesh
+  // key so the two populations never share rolls.
+  const uint32_t key = FleshKey(f.id) ^ 0x1005E0u;
+  const bool changed =
+      BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget);
+  deferred = v.walkDeferred;
+  removed = cc.burn.removed;
+  cc.burn.removed = 0;
+  cc.burn.coatTouched = false;  // no ledger to tell; `changed` covers it
+  // The brick the view may have taken ownership of, back on its body.
+  if (model >= 0) *f.microModel = (uint32_t)model;
+  return changed;
+}
+
+void MobSystem::RetireLooseBurn(uint32_t tick) {
+  // Not offered for a grace period: the body settled into the grid, burnt
+  // away, left the window or simply has nothing near it. Its index is
+  // derived, and `alight` is re-seeded from the body the next time it is
+  // offered (FleshView), so nothing is lost but memory.
+  const uint32_t now = tick + 1u;
+  for (auto it = looseBurn_.begin(); it != looseBurn_.end();)
+    it = (now < it->second.seen || now - it->second.seen > kBurnIndexGrace)
+             ? looseBurn_.erase(it)
+             : std::next(it);
+}
+
 void MobSystem::StainDeadFlesh(uint32_t tick, World& world, uint32_t& budget,
                                uint32_t& rainBudget) {
   if (!debris_ || matGpu_.empty()) return;
@@ -16209,6 +16327,7 @@ bool MobSystem::RainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t key,
   // the cap. A visit whose samples all fell inside the limb says nothing.
   if (changed) {
     st.quiet = 0;
+    st.holdBy |= BodyBurnState::kHoldRain;
     st.rainSated = 0;
   } else if (cappedHere > 0 && st.rainSated < 255) {
     st.rainSated++;
@@ -16263,6 +16382,7 @@ bool MobSystem::WetOneLimb(BurnLimbView& v, const LimbCoat& led, uint32_t tick,
   if (st.idx.empty()) BuildBurnIndex(v);
   if (st.idx.empty()) return false;
   st.quiet = 0;  // keep the index while there is water on the limb
+  st.holdBy |= BodyBurnState::kHoldWet;
   const IVec3 bd = st.dims, bm = st.min;
   auto idxAt = [&](IVec3 l) -> uint32_t {
     if (l.x < 0 || l.y < 0 || l.z < 0 || l.x >= bd.x || l.y >= bd.y || l.z >= bd.z)
@@ -16787,6 +16907,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   if (st.idx.empty()) BuildBurnIndex(v);
   if (st.idx.empty()) return false;
   st.quiet = 0;
+  st.holdBy |= BodyBurnState::kHoldContact;
   const IVec3 bd = st.dims, bm = st.min;
   auto idxAt = [&](int lx, int ly, int lz) -> uint32_t {
     if (lx < 0 || ly < 0 || lz < 0 || lx >= bd.x || ly >= bd.y || lz >= bd.z)
@@ -17056,6 +17177,7 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
     if (st.idx.empty()) BuildBurnIndex(v);
     if (st.idx.empty()) continue;
     st.quiet = 0;
+    st.holdBy |= BodyBurnState::kHoldSplatter;
     const IVec3 bd = st.dims, bm = st.min;
     const float scale = (float)std::max(1u, v.scale);
     const Vec3 boxLo{(float)bm.x, (float)bm.y, (float)bm.z};
@@ -19396,8 +19518,9 @@ const char* Mob::DeadAwakeCriterion(bool passiveDrySleeps) const {
     }
     // The burn pass's own idle verdict on its last visit: it walked the world
     // round this limb and found nothing (BodyBurnState::idle). NOT `sleepKey`,
-    // which also needs the index dropped — and the stain passes rebuild it
-    // for their surface lists on any body lying on something that stains.
+    // which is only a digest (and until W2-I also needed the index dropped,
+    // which the stain passes never allowed on a body lying on something
+    // that stains).
     if (burnTables && !l.burn.idle) {
       static thread_local char why[128];
       std::snprintf(why, sizeof why,
@@ -20116,9 +20239,14 @@ MobSystem::LimbBurnProbe MobSystem::LimbBurnStateOf(uint64_t mobId,
       const BodyBurnState& st = l.burn;
       p.front = (uint32_t)st.front.size();
       p.alight = st.alight;
-      p.asleep = st.sleepKey != 0;
+      // ASLEEP = the last visit SKIPPED the walk (its key matched). Not
+      // `sleepKey != 0`, which only says a key was recorded -- a limb whose
+      // pose moves every tick records one every tick and never uses it.
+      p.asleep = st.slept;
       p.indexed = !st.idx.empty();
       p.quiet = st.quiet;
+      p.holdBy = st.holdBy;
+      p.sleepMiss = st.sleepMiss;
       // WHICH material holds the front (attribution, not a count).
       std::vector<uint32_t> hist(matGpu_.size(), 0u);
       const bool fine = l.HasFineSkin();

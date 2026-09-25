@@ -16,6 +16,7 @@
 #include "phys/kerf.h"   // KerfCut/KerfSlot: the shape a blade takes out
 #include "phys/lattice.h"
 #include "phys/physics.h"
+#include "sim/bodyreact.h"
 #include "sim/materials.h"
 #include "sim/microbody.h"
 // THE WIRE RECORDS the ownership seam below names in its signatures.
@@ -720,12 +721,32 @@ class DebrisSystem {
   void SetOnBodyGone(std::function<void(uint64_t)> cb) {
     onBodyGone_ = std::move(cb);
   }
-  // This tick's integer day phase, so a day/night-gated reaction behaves the
-  // same on a body as it does in the grid (sim/reactcpu.h). Set it wherever the
-  // tick's dayPhase is already computed; leaving it unset means night.
-  void SetDayPhase(uint32_t phase) { dayPhase_ = phase; }
-  // TickParams::weatherRain for this tick (materials.h kRainAmountMask et al).
-  void SetWeatherRain(uint32_t w) { weatherRain_ = w; }
+  // (No day phase / rain word here any more: the reaction gates that read them
+  // run in MobSystem::BurnOneLimb, which has its own, set beside this.)
+
+  // ---- THE ONE BODY-REACTION EVALUATOR (W2-I, 2026-09-24) -----------------
+  // Every non-flesh body BurnBodies offers is evaluated by this function, the
+  // same MobSystem::BurnOneLimb the living, the dead and severed flesh go
+  // through (MobSystem::Init installs it). In: the body as a lattice view and
+  // this body's share of the candidate budget (spent down), the tick's grid
+  // op budget and the tick's pot of world-walk cells (both spent down). Out:
+  // whether anything changed, how many voxels it tombstoned (material 0,
+  // compacted by BurnTail), and whether the visit was DEFERRED whole because
+  // its walk did not fit the pot (then nothing was read or changed, and the
+  // scheduler starts there next tick). `end` runs once per
+  // BurnBodies call after the last body, so the evaluator can retire the state
+  // of bodies it has not been offered for a while -- and with `forgetAll` from
+  // Reset(), which restarts the serials that state is keyed on.
+  using BodyReactFn = std::function<bool(
+      FleshLattice& lat, uint32_t tick, World& world,
+      std::vector<CellOp>& cellOps, uint32_t& frontBudget,
+      uint32_t& opsBudget, uint32_t& walkBudget, uint32_t& removed,
+      bool& deferred)>;
+  using BodyReactEndFn = std::function<void(uint32_t tick, bool forgetAll)>;
+  void SetBodyReactor(BodyReactFn fn, BodyReactEndFn end) {
+    bodyReact_ = std::move(fn);
+    bodyReactEnd_ = std::move(end);
+  }
 
   // Once per tick AFTER Physics::Step: refresh transforms, cull fallen /
   // excess bodies.
@@ -1443,7 +1464,6 @@ class DebrisSystem {
     // carries one: the mob is despawned long before anything asks, and a
     // corpse being hacked apart should make ITS OWN species' sounds.
     int defIndex = -1;
-    uint32_t burnCursor = 0;      // rotating scan window into voxels
     uint32_t burnedSinceRebuild = 0;  // batched collider refresh threshold
     uint32_t burnedSinceShatter = 0;  // batched connectivity re-check
     // ---- THE COLLIDER FOOTPRINT (ManageTerrain) --------------------------
@@ -1533,12 +1553,21 @@ class DebrisSystem {
   void ManageTerrain(uint32_t tick, World& world);
   // Refresh Body::lmin/lmax if the voxel count moved. See the note there.
   static void RefreshLocalBounds(Body& b);
-  // Body burn: a CPU mirror of the reaction table over body voxel payloads,
-  // so detached matter keeps burning (embers advance to ash, emit real fire
-  // into the grid via fill-air-only ops, and grid fire ignites cold bodies
-  // through the chunk cache). Idle bodies cost nothing (see impl comment).
+  // Body burn: the reaction table over the voxel payloads of every NON-flesh
+  // body, so detached matter keeps burning (embers advance to ash, emit real
+  // fire into the grid via fill-air-only ops, and grid fire ignites cold
+  // bodies through the chunk cache). This pass only SCHEDULES -- which bodies,
+  // what share of the budget -- and runs the tail; the evaluator is the
+  // installed body reactor (SetBodyReactor). Idle bodies cost nothing.
   void BurnBodies(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                   std::vector<ParticleSpawn>& spawns);
+  // The body tail over one burn pass's bodies (indices into bodies_, with
+  // what the evaluator reported for each): BurnTail per body, then erase the
+  // ones that burned away and append the fragments. `changedOnly` skips the
+  // tail for a body the pass did not change (the flesh pass's rule).
+  void FinishBurn(const std::vector<size_t>& which,
+                  const std::vector<FleshBurn>& out, bool changedOnly,
+                  World& world, std::vector<ParticleSpawn>& spawns);
   void RecountBurn(Body& b) const;
   FleshLattice FleshOf(Body& b);
   // Everything a burn pass leaves for a BODY to do once it has tombstoned
@@ -1738,27 +1767,21 @@ class DebrisSystem {
   // hardcoded material IDs — the JSON stays the single source of behavior)
   std::vector<MaterialGpu> matGpu_;
   std::vector<ReactionGpu> reactions_;
-  std::vector<uint8_t> matSelfActive_;  // material has UNGATED decay/emit rules
-  std::vector<uint8_t> matSelfScaled_;  // ...or only neighbour-count gated ones
-  std::vector<uint8_t> matHasPair_;     // material has pair rules
-  std::vector<uint8_t> matHasScaled_;   // material has scaleByNeighbors rules
-  // ---- THE INBOUND DIRECTION (2026-09-19) ---------------------------------
-  // A rigidbody used to evaluate only the rules its OWN materials author. Acid
-  // is authored from the acid's side (`acid + tag:organic -> neighborBecomes
-  // air`), which is the direction the GPU evaluates it and the direction
-  // MobSystem::BurnOneLimb's second pass evaluates it on a live limb — so a
-  // corpse, whose limbs are these bodies, sat in a pool of acid untouched
-  // while the creature it had been a second earlier dissolved in it. These two
-  // columns are what let BurnBodies run the same pass; they are the debris
-  // twins of mob.h's matRewritesNbr_ and its attack table.
-  //
-  //   matRewritesNbr_  this material has a pair rule that REWRITES its
-  //                    neighbour — i.e. it can act on a body from the grid.
-  //   matInboundTarget_ some material's rewrite rule matches THIS one — i.e. a
-  //                    voxel of it is something the grid can eat, which is what
-  //                    decides whether a body needs the threat probe at all.
-  std::vector<uint8_t> matRewritesNbr_;
-  std::vector<uint8_t> matInboundTarget_;
+  // What each material can do on a body: the ONE builder MobSystem uses too
+  // (sim/bodyreact.h). Read here by RecountBurn (activeCount / scaledCount /
+  // pairCount / inboundCount / internalPair) and the solvent probe
+  // (ThreatNear); the evaluation itself is MobSystem::BurnOneLimb's.
+  BodyReactFlags react_;
+  // THE ONE BODY-REACTION EVALUATOR, installed by MobSystem (SetBodyReactor).
+  // Null in a process with no MobSystem: then non-flesh bodies do not burn.
+  BodyReactFn bodyReact_;
+  BodyReactEndFn bodyReactEnd_;
+  // Where BurnBodies starts next tick: the first body the last pass could
+  // not afford (a walk deferred, or the candidate budget spent), so the
+  // bodies behind a budget-limited pass are first in line rather than
+  // starved while a tick-rotated start creeps past them one body a tick.
+  // Reset with the bodies (Reset).
+  size_t burnNext_ = 0;
   // Scratch for RecountBurn's internal-pair test, one byte per material id.
   // A member rather than a local so a per-carve recount does not allocate.
   mutable std::vector<uint8_t> presentScratch_;
@@ -1774,13 +1797,6 @@ class DebrisSystem {
   std::vector<std::vector<uint8_t>> tintOfArt_;
   uint64_t tintArtStamp_ = 0;   // content stamp of the palette it was built from
   bool tintMapValid_ = false;   // cleared by OnMaterialsReloaded
-  // Integer day phase for the current tick, mirroring TickParams.dayPhase, so
-  // the CPU reaction mirror can evaluate a rule's day/night gate exactly as
-  // sim_step.wgsl does (sim/reactcpu.h). 0 (deep night) until the owner sets
-  // it; every headless harness leaves it there, and no authored body rule is
-  // phase-gated today, so that default changes nothing it can reach.
-  uint32_t dayPhase_ = 0;
-  uint32_t weatherRain_ = 0;
   uint32_t nextSerial_ = 1;
   // ---- ownership (M9.4-C) -------------------------------------------------
   // All defaulted so that a process that never calls the setters behaves

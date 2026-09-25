@@ -4019,6 +4019,47 @@ neighbors, so this needs an explicit connectivity pass:
   current tick while anything burns would starve island detection forever.
   Selftest gate: `body burn` (ember-topped wood body must shed voxels and
   emit fire ops).
+- **One body-reaction evaluator (W2-I, 2026-09-24):** the pass described
+  above was a SECOND copy of the evaluator, forked from the living limb pass
+  and ported by hand ever since (3760ba5 -> ab2250f) — it never learned coats,
+  cross-limb heat or the wound slow-down, so an oiled plank caught like a
+  clean one and a soaked one too. It is gone. Every population is evaluated by
+  `MobSystem::BurnOneLimb` over a `BurnLimbView`: live limbs and dead-Mob
+  limbs (`BurnLimbs`), severed flesh (`BurnDeadFlesh` → `BurnFleshBodies`),
+  and every other debris body (`BurnBodies` → the reactor `MobSystem::Init`
+  installs with `DebrisSystem::SetBodyReactor` → `MobSystem::BurnLooseBody`).
+  `BurnBodies` keeps only the debris-shaped half: WHICH bodies are offered
+  (active / self-reacting / pair-or-scaled with a dirty chunk near / a solvent
+  against it), each offered body's fair SHARE of the tick's candidate budget
+  (floor `kBurnScanMinShare`), and the tail (`FinishBurn` → `BurnTail`). The
+  per-voxel candidates are the evaluator's FRONT, not a cursor (`burnCursor`
+  is deleted), so a burning log costs its burning surface. The evaluator's
+  cheap-gate WORLD WALK (every cell of the body's box) is paid from a per-tick
+  pot, `kBurnWalkPerTick` (65,536 cells, ~1 ms): a creature is a handful of
+  limbs, but a forest fire is ~200 bodies with smoke dirtying every chunk,
+  so no sleep key matched and every body walked every tick — measured on
+  `--forest-fire`, 193k cells/tick and `burnBodies` 1.22 → 2.96 ms/tick. A
+  visit whose walk does not fit is DEFERRED whole (`BurnLimbView::walkBudget`
+  / `walkDeferred`: nothing read, nothing changed — never a partial walk,
+  which could take the idle exit on a half-read box and sleep through a
+  fire), and `burnNext_` starts the next pass at it. After: 1.33 ms/tick,
+  debris row 1.82 → 1.96 ms/frame (the windowed harness moves ±15%; the
+  evaluator's counters print on its last line). Loose matter's
+  inputs ride the view: no coat ledger (no corrosive seeding), no creature
+  (no cross heat), no shells, no wound table, and the one thing only it has —
+  the dye a leaving voxel hands its grid product (`BurnLimbView::gridState` →
+  `DebrisSystem::GridStateFor`). Its burn state lives in
+  `MobSystem::looseBurn_`, keyed by the body's global id, retired after
+  `kBurnIndexGrace` ticks un-offered and cleared by `DebrisSystem::Reset`
+  (which restarts serials). `RecountBurn` counts a voxel whose COAT has pair
+  rules as pair-reactive, so an oiled stone is offered at all. The flag
+  columns (alight = ungated self rule; neighbour-gated self rules apart; pair;
+  rewrites-neighbour; inbound target; hot; attacks-body) come from ONE builder,
+  `BuildBodyReactFlags` (`sim/bodyreact.h`), used by both systems. The debris
+  copies of the day phase and rain word are gone with the evaluator.
+  Behaviour change, deliberate: debris now gets the full rule set. Gate
+  `debris-coat`: three ember-lit planks, clean / oiled / soaked — oil takes
+  the plank, the soaked plank neither catches nor keeps its ember.
 - **A corpse keeps burning (2026-09-02):** the scan budget above
   (`kBurnScanPerTick`, 4,096 voxels) was spent in list order to the last
   voxel, so whichever bodies came first took it all and every body after them
@@ -4033,7 +4074,8 @@ neighbors, so this needs an explicit connectivity pass:
   tick and each scanning body takes at most its SHARE (budget left over
   scanners left, floor `kBurnScanMinShare` = 256), handing the remainder on,
   with the per-body cursor carrying a body larger than its share across
-  ticks. Deterministic: order is a function of tick and the body list, rolls
+  ticks (the cursor is gone since W2-I: the candidates are the evaluator's
+  front, and the share bounds how much of it one body evaluates per tick). Deterministic: order is a function of tick and the body list, rolls
   of the (serial, voxel, tick, rule) key. Bodies burned below body-worthiness
   are erased after the loop, since the rotated order cannot survive a
   mid-loop swap-remove. **Gated self rules do not keep a body awake:** a
@@ -5172,7 +5214,26 @@ That split exposed the second half: `alight` is cleared only by the index
 SWEEP, and the sweep ran only on an index rebuild, so a fire that went out
 without a further carve latched the limb awake with an empty front. An empty
 front under a set latch now drops the index, and the next tick's sweep decides.
-Gate `mob-burn`, line "charred limbs sleep". Derived, not saved: a loaded avatar keeps its low hp but starts at
+
+...and NO live limb slept at all, charred or not (W2-I, 2026-09-24). The
+gate's control said so ("0 of 10 unburnt limbs asleep") and its assertion was
+relative to that control, so it could not fail. Attribution first
+(`BodyBurnState::holdBy` / `sleepMiss` / `slept`, printed per limb by the
+gate): every limb of the doused test creature was "holdBy wet" (five also
+"contact"), "miss index", 0 of 900 limb-visits asleep. The sleep demanded an
+EMPTY index, and the index is shared: `WetOneLimb` resets `quiet` every third
+tick while any water is on a limb and `StainOneLimb` while a limb touches
+anything that stains, so a creature that had been doused, rained on or stood
+in a puddle kept every index warm and never slept. The walk the key digests
+reads only the box, the cached chunks and the tables, never the index, so the
+burn pass now sleeps whoever holds the index, and the asleep branch goes on
+counting the grace that releases it (outcome unchanged; cost only). The pose
+floats are still in the key; the attribution has a `pose` bit for when an
+animated idle creature shows it. Gate `mob-burn`, line "limbs sleep", now
+ABSOLUTE: over 60 ticks at least `mobBurnSleepFracMin` (0.9) of every limb's
+visits must be asleep, charred and unburnt separately (97% / 96%). The
+dead-Mob sleep (`corpse-sleep`) reaches asleep sooner for the same reason
+(89 → 77 ticks). Derived, not saved: a loaded avatar keeps its low hp but starts at
 cap 1 until it burns again.
 
 **Heat crosses a joint, and until it did a burning torso never lit the legs.**
