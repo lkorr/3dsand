@@ -545,6 +545,15 @@ class Physics {
     float speedVoxPerSec = 0;       // |approach speed| along `normal`
   };
   const std::vector<ContactImpact>& ContactImpacts() const;
+  // The contacts the filter above keeps OUT of that list because one side is
+  // a player's own body (OWNED or EXEMPT layer) or a player CAPSULE — reported
+  // here when the other side is a LOOSE body (MOVING / THROWN; not terrain,
+  // and not another player-side body). Same speed gate, same step lifetime,
+  // own cap. Read only by
+  // MobSystem::ApplyContactDamage, so a thrown rock hurts the player the way it
+  // hurts an NPC (W2-K) without the player's own footsteps reaching the mixer.
+  // Reporting only: the collision response is the pair filter's, unchanged.
+  const std::vector<ContactImpact>& OwnedBodyImpacts() const;
   // Contacts slower than this are not reported at all. Set from the game
   // thread; Step latches it into the listener before handing control to the
   // Jolt job threads, which must never read a game-side global themselves

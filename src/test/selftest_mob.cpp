@@ -11524,6 +11524,12 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
     {
       MobSystem far;
       far.Init(&c.phys, &c.world, &c.debris, c.mats, c.reactions);
+      // Hands c.debris's body-reaction hook back to c.mobs before `far` dies
+      // (W2-I installed it; a dangling one crashed the next debris PreTick).
+      struct HookGuard {
+        MobSystem& m;
+        ~HookGuard() { m.ReleaseDebrisHooks(); }
+      } farHooks{far};
       far.SetMicroSet(c.mobs.MicroSet());
       far.SetDefFactory(c.mobs.DefFactory());
       far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
@@ -11726,6 +11732,11 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
 
     MobSystem far;
     far.Init(&c.phys, &c.world, &c.debris, c.mats, c.reactions);
+    // Hands c.debris's body-reaction hook back to c.mobs before `far` dies.
+    struct HookGuard {
+      MobSystem& m;
+      ~HookGuard() { m.ReleaseDebrisHooks(); }
+    } farHooks{far};
     far.SetMicroSet(c.mobs.MicroSet());
     far.SetDefFactory(c.mobs.DefFactory());
     far.SetDefs(std::vector<MobDef>(c.mobs.Defs()));
@@ -13190,6 +13201,88 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
            !(plated.torsoHp < fast.torsoHp))
     fail("the cuirass did not take the stone");
 
+  // ---- G. the same stone at a PLAYER (W2-K) ---------------------------------
+  //
+  // A registered avatar with its collision owner wired, as main.cpp wires it:
+  // its limbs are OWNED and it stands in a capsule proxy, and the contact
+  // listener used to drop every contact on either (the mixer's filter), so a
+  // thrown rock never hurt the player. Now both are reported on their own
+  // list (Physics::OwnedBodyImpacts) and billed through the same rule. The
+  // audio list must not grow by them. Pre-W2-K: billed 0.
+  Throw atPlayer;
+  size_t audioOnPlayer = 0;
+  {
+    mobs.Reset();
+    c.debris.Reset();
+    PlayerAvatar av;
+    av.Init(&c.phys, &c.world, &c.debris, c.mats, &mobs);
+    av.SetDefs(&mobs.Defs(), kAvatarDefName);
+    Player pl;
+    pl.fly = false;
+    pl.grounded = true;
+    pl.pos = Vec3{(float)site.x + 0.5f,
+                  (float)(World::TerrainHeight(site.x, site.z, kDefaultSeed) +
+                          2) + Player::kHalfY,
+                  (float)site.z + 0.5f};
+    const uint64_t proxy =
+        c.phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+    c.phys.MovePlayerBody(proxy, pl.pos, kTickDt);
+    if (av.HasDef() && av.Spawn(pl, 0.0f)) {
+      av.SetCollisionOwner(proxy);
+      mobs.SetAvatar(&av);
+      const uint64_t id = av.Id();
+      Vec3 sum{};
+      for (uint32_t k = 0; k < 16; k++)
+        sum += mobs.LimbVoxelPos(id, torso, k * 7919u);   // CreatureWithId
+      const Vec3 tc = sum * (1.0f / 16.0f);
+      std::vector<DebrisVoxel> vox;
+      for (int8_t z = 0; z < 3; z++)
+        for (int8_t y = 0; y < 3; y++)
+          for (int8_t x = 0; x < 3; x++)
+            vox.push_back(DebrisVoxel{x, y, z, 0, (uint16_t)kMatStone});
+      const IVec3 at0{(int)std::floor(tc.x) + 6, (int)std::floor(tc.y) - 1,
+                      (int)std::floor(tc.z) - 1};
+      const uint64_t bh = c.phys.CreateDebrisBody(vox, at0, density);
+      if (bh != 0) {
+        atPlayer.mass = c.phys.BodyMass(bh);
+        c.phys.SetBodyVelocities(bh, Vec3{-15.0f / kVoxelMeters, 0.0f, 0.0f},
+                                 Vec3{});
+        const float hp0 = mobs.TotalHp(id);            // CreatureWithId
+        const uint32_t n0 = mobs.ContactHitsBilled();
+        std::vector<ParticleSpawn> spawns;
+        for (int i = 0; i < 20; i++) {
+          c.phys.Step(kTickDt);
+          for (const Physics::ContactImpact& ci : c.phys.ContactImpacts()) {
+            int li = -1;
+            if (ci.bodyA == proxy || ci.bodyB == proxy ||
+                mobs.FindOwner(ci.bodyA, &li) == &av ||
+                mobs.FindOwner(ci.bodyB, &li) == &av)
+              audioOnPlayer++;
+          }
+          mobs.ApplyContactDamage(c.phys, c.world, spawns);
+        }
+        atPlayer.billed = mobs.ContactHitsBilled() - n0;
+        atPlayer.torsoHp = hp0 - mobs.TotalHp(id);
+        c.phys.RemoveBody(bh);
+        atPlayer.ran = true;
+      }
+    }
+    mobs.SetAvatar(nullptr);
+    av.Despawn();
+    c.phys.RemoveBody(proxy);
+  }
+  std::printf("  thrown stone at a PLAYER (%.1f kg, 15 m/s, capsule + OWNED "
+              "limbs): billed %u, body -%.1f hp, audio-list entries on the "
+              "player %zu (pre-W2-K: never billed)\n",
+              atPlayer.mass, atPlayer.billed, atPlayer.torsoHp, audioOnPlayer);
+  RecordObserved("damageSourcesThrownPlayerHp", (double)atPlayer.torsoHp);
+  if (!atPlayer.ran)
+    fail("the player thrown-stone fixture did not run");
+  else if (atPlayer.billed == 0 || !(atPlayer.torsoHp > 0.0f))
+    fail("a 15 m/s stone into the PLAYER was not a blow");
+  else if (audioOnPlayer != 0)
+    fail("the player's contacts reached the audio list");
+
   // ---- E. the struck voxel (report) -----------------------------------------
   {
     std::string rep;
@@ -13228,13 +13321,264 @@ Status GateDamageSources(Ctx& c, std::string& detail) {
       "spell %u->%u; "
       "NPC 15 m/s landing billed %u (hp -%.1f, alive %d); laser %u charges "
       "(-%.2f flesh, -%.2f shell); thrown stone 15 m/s: %u billed -%.1f hp, "
-      "slow %u, plated %u (body -%.1f)%s%s",
+      "slow %u, plated %u (body -%.1f); at a player %u billed -%.1f hp%s%s",
       rows - bad, rows, tBare0, tBare1, tPlate0, tPlate1, tWeak, tSpell0,
       tSpell1, billed,
       hp0 - hp1, (int)npcAlive, charges, laserFlesh, laserShell, fast.billed,
-      fast.torsoHp, slow.billed, plated.billed, plated.torsoHp,
-      why.empty() ? "" : "; FAIL: ", why.c_str());
+      fast.torsoHp, slow.billed, plated.billed, plated.torsoHp, atPlayer.billed,
+      atPlayer.torsoHp, why.empty() ? "" : "; FAIL: ", why.c_str());
   std::printf("damage-sources: %s\n", ok ? "PASS" : "FAIL");
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- creature-reach ---------------------------------------------------------
+//
+// ONE CREATURE LIST (W2-K). The player's body is a Mob that does not live in
+// mobs_, and every world effect written as a walk of mobs_ used to be an
+// NPC-only effect (W1-F's explosions were one). This applies each effect ONCE
+// to a scene holding an NPC and a registered, spawned local avatar, and asserts
+// it reached BOTH. Each row is an effect that reaches its creatures through
+// ForEachCreature / FindCreature / CreatureWithId, so a row going red names the
+// path that forgot the player.
+//
+//   lookup    FindCreature finds both; FindMobById stays the NPC-list lookup;
+//             the controllers are Ai and LocalPlayer.
+//   query     an id-keyed read (TotalHp) answers for the player (was -1).
+//   ignite    IgniteLimb by id lights both torsos (was 0 for the player).
+//   soak      SoakLimb by id coats both (already reached both: regression row).
+//   crowd     an NPC may not step INTO the player's body (BlockedByMobAt),
+//             exactly as it may not step into a second NPC (the control).
+//   kit       a worn piece goes through the kit for both (NPC via
+//             MobSystem::WearItem, player via Mob::WearItem): kit + rig agree.
+//   sever     Sever by id takes a hand off both (was a no-op for the player).
+//   blast     one grenade beside each: both torsos cratered, both launched.
+//             Last: a grenade can take a hand off.
+Status GateCreatureReach(Ctx& c, std::string& detail) {
+  IdCounterScope idScope(c.mobs);
+  MobSystem& mobs = c.mobs;
+  const int def = mobs.FindDef(kAvatarDefName);
+  if (def < 0) {
+    detail = std::string("no mob def named \"") + kAvatarDefName + "\"";
+    return Status::Fail;
+  }
+  mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 20, kDefaultSeed, relief);
+  const MobDef& md = mobs.Defs()[def];
+  const int torso = md.rootLimb;
+  int hand = -1;
+  for (int i = 0; i < (int)md.limbs.size(); i++)
+    if (md.limbs[i].name.find("hand") != std::string::npos && i != torso) {
+      hand = i;
+      break;
+    }
+
+  // THE SCENE: the player at the spot, NPC A 12 voxels east, NPC B (the crowd
+  // control) 12 voxels west. Far enough apart that no effect aimed at one
+  // lands on another.
+  const uint64_t npc = mobs.Spawn(def, {spot.x + 12, spot.y + 1, spot.z});
+  const uint64_t npc2 = mobs.Spawn(def, {spot.x - 12, spot.y + 1, spot.z});
+  PlayerAvatar av;
+  av.Init(&c.phys, &c.world, &c.debris, c.mats, &mobs);
+  av.SetDefs(&mobs.Defs(), kAvatarDefName);
+  Player pl;
+  pl.fly = false;
+  pl.grounded = true;
+  pl.pos = Vec3{(float)spot.x + 0.5f,
+                (float)(World::TerrainHeight(spot.x, spot.z, kDefaultSeed) + 2) +
+                    Player::kHalfY,
+                (float)spot.z + 0.5f};
+  const uint64_t proxy = c.phys.CreatePlayerBody(Player::kHalfXZ, Player::kHalfY);
+  c.phys.MovePlayerBody(proxy, pl.pos, kTickDt);
+  auto cleanup = [&]() {
+    mobs.SetAvatar(nullptr);
+    av.Despawn();
+    c.phys.RemoveBody(proxy);
+    mobs.Reset();
+    c.debris.Reset();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+  };
+  if (!npc || !npc2 || !av.HasDef() || !av.Spawn(pl, 0.0f) || hand < 0) {
+    cleanup();
+    detail = "the scene did not spawn (two NPCs, one avatar, a hand limb)";
+    return Status::Fail;
+  }
+  av.SetCollisionOwner(proxy);
+  mobs.SetAvatar(&av);
+  const uint64_t pid = av.Id();
+
+  struct Row {
+    const char* name;
+    bool npc = false, player = false;
+    std::string note;
+  };
+  std::vector<Row> rows;
+
+  // ---- lookup -----------------------------------------------------------------
+  {
+    Row r{"lookup"};
+    int visited = 0, sawPlayer = 0;
+    mobs.ForEachCreature([&](const Mob& m) {
+      visited++;
+      if (&m == &av) sawPlayer++;
+    });
+    r.npc = mobs.FindCreature(npc) == mobs.FindMobById(npc) &&
+            mobs.FindCreature(npc) != nullptr &&
+            mobs.FindCreature(npc)->GetController() == Mob::Controller::Ai;
+    r.player = mobs.FindCreature(pid) == &av && mobs.FindMobById(pid) == nullptr &&
+               av.GetController() == Mob::Controller::LocalPlayer &&
+               sawPlayer == 1 && visited == (int)mobs.MobCount() + 1;
+    r.note = Format("walk visited %d (mobs %u + 1)", visited, mobs.MobCount());
+    rows.push_back(r);
+  }
+  // ---- query ------------------------------------------------------------------
+  {
+    Row r{"query"};
+    const float a = mobs.TotalHp(npc), b = mobs.TotalHp(pid);
+    r.npc = a > 0.0f;
+    r.player = b > 0.0f;
+    r.note = Format("TotalHp npc %.1f player %.1f", a, b);
+    rows.push_back(r);
+  }
+  // ---- ignite -----------------------------------------------------------------
+  {
+    Row r{"ignite"};
+    const uint32_t a = mobs.IgniteLimb(npc, torso, 8);
+    const uint32_t b = mobs.IgniteLimb(pid, torso, 8);
+    r.npc = a > 0;
+    r.player = b > 0;
+    r.note = Format("lit npc %u player %u", a, b);
+    rows.push_back(r);
+  }
+  // ---- soak -------------------------------------------------------------------
+  {
+    Row r{"soak"};
+    const uint32_t water = mobs.MaterialIdNamed("water");
+    const uint32_t a = water ? mobs.SoakLimb(npc, hand, water, 4, 9000u) : 0u;
+    const uint32_t b = water ? mobs.SoakLimb(pid, hand, water, 4, 9000u) : 0u;
+    r.npc = a > 0;
+    r.player = b > 0;
+    r.note = Format("marked npc %u player %u", a, b);
+    rows.push_back(r);
+  }
+  // ---- crowd ------------------------------------------------------------------
+  {
+    Row r{"crowd"};
+    Vec3 lo{}, hi{};
+    auto centre = [&](uint64_t id) {
+      mobs.MobBodyBox(id, lo, hi);
+      return Vec3{(lo.x + hi.x) * 0.5f, lo.y, (lo.z + hi.z) * 0.5f};
+    };
+    const Vec3 cp = centre(pid), c2 = centre(npc2);
+    const bool intoNpc = mobs.BlockedByMobAt(npc, c2.x, c2.z);
+    const bool intoPlayer = mobs.BlockedByMobAt(npc, cp.x, cp.z);
+    // The control has to block, or the fixture proves nothing about spacing.
+    r.npc = intoNpc;
+    r.player = intoNpc && intoPlayer;
+    r.note = Format("blocked into NPC %d, into player %d", (int)intoNpc,
+                    (int)intoPlayer);
+    rows.push_back(r);
+  }
+  // ---- kit --------------------------------------------------------------------
+  // A worn piece goes through the kit for every creature (W2-K, W2-M's
+  // deferred half): the NPC dressed through MobSystem::WearItem (the spawn
+  // wave / dev menu door) and the player through Mob::WearItem both end with
+  // the kit's chest slot naming the piece AND the rig wearing it; UnwearItem
+  // empties both. Pre-W2-K the NPC's kit stayed empty.
+  {
+    Row r{"kit"};
+    const ItemDef* cuirass = c.items.At(c.items.Find("iron_cuirass"));
+    const int chest = (int)EquipSlotId::Chest;
+    auto dressed = [&](const Mob* m, const char* want) {
+      return m != nullptr && m->GetKit().equip.slots[chest].name == want &&
+             m->WornItem(chest) == want;
+    };
+    bool npcOn = false, npcOff = false, plOn = false, plOff = false;
+    if (cuirass != nullptr) {
+      mobs.WearItem(npc, cuirass, chest);
+      npcOn = dressed(mobs.FindCreature(npc), "iron_cuirass");
+      mobs.UnwearItem(npc, chest);
+      npcOff = dressed(mobs.FindCreature(npc), "");
+      av.WearItem(cuirass, chest);
+      plOn = dressed(&av, "iron_cuirass");
+      av.UnwearItem(chest);
+      plOff = dressed(&av, "");
+    }
+    r.npc = npcOn && npcOff;
+    r.player = plOn && plOff;
+    r.note = Format("kit+rig on/off npc %d/%d player %d/%d%s", (int)npcOn,
+                    (int)npcOff, (int)plOn, (int)plOff,
+                    cuirass ? "" : " (no iron_cuirass)");
+    rows.push_back(r);
+  }
+  // ---- sever ------------------------------------------------------------------
+  {
+    Row r{"sever"};
+    const bool a0 = mobs.LimbBody(npc, hand) != 0;
+    const bool b0 = mobs.LimbBody(pid, hand) != 0;
+    mobs.Sever(npc, hand);
+    mobs.Sever(pid, hand);
+    const bool a1 = mobs.LimbBody(npc, hand) != 0;
+    const bool b1 = mobs.LimbBody(pid, hand) != 0;
+    r.npc = a0 && !a1;
+    r.player = b0 && !b1;
+    r.note = Format("hand body before/after npc %d/%d player %d/%d", (int)a0,
+                    (int)a1, (int)b0, (int)b1);
+    rows.push_back(r);
+  }
+  // ---- blast ------------------------------------------------------------------
+  {
+    Row r{"blast"};
+    const Tuning& tune = CurrentTuning();
+    auto blastBeside = [&](uint64_t id, uint32_t& lost, int& phase) {
+      Vec3 sum{};
+      for (uint32_t k = 0; k < 16; k++)
+        sum += mobs.LimbVoxelPos(id, torso, k * 7919u);
+      const Vec3 tc = sum * (1.0f / 16.0f);
+      const uint32_t v0 = mobs.LimbArtVoxelCount(id, torso);
+      ExplosionOp e{(int32_t)std::floor(tc.x + 4.0f), (int32_t)std::floor(tc.y),
+                    (int32_t)std::floor(tc.z), tune.grenade.blastRadius,
+                    tune.grenade.blastPower, 0, 0, 0};
+      std::vector<ParticleSpawn> spawns;
+      ExplosionHitsBodies(e, c.world, c.phys, c.debris, mobs, spawns);
+      const uint32_t v1 =
+          mobs.LimbBody(id, torso) ? mobs.LimbArtVoxelCount(id, torso) : 0u;
+      lost = v0 > v1 ? v0 - v1 : 0u;
+      phase = mobs.RagdollPhaseOf(id);
+    };
+    uint32_t la = 0, lb = 0;
+    int pa = -1, pb = -1;
+    blastBeside(npc, la, pa);
+    blastBeside(pid, lb, pb);
+    const int none = (int)Mob::RagdollPhase::None;
+    r.npc = la > 0 && pa != none;
+    r.player = lb > 0 && pb != none;
+    r.note = Format("torso voxels lost npc %u player %u, ragdoll phase npc %d "
+                    "player %d", la, lb, pa, pb);
+    rows.push_back(r);
+  }
+
+  bool ok = true;
+  std::string bad;
+  for (const Row& r : rows) {
+    std::printf("  %-7s npc %s player %s  (%s)\n", r.name, r.npc ? "yes" : "NO ",
+                r.player ? "yes" : "NO ", r.note.c_str());
+    if (!r.npc || !r.player) {
+      ok = false;
+      bad += Format(" %s(%s%s)", r.name, r.npc ? "" : "npc",
+                    r.player ? "" : (r.npc ? "player" : "+player"));
+    }
+  }
+  cleanup();
+  detail = Format("%zu effects, relief %d;%s", rows.size(), relief,
+                  ok ? " all reached the NPC and the player"
+                     : (" missed:" + bad).c_str());
+  std::printf("creature-reach: %s\n", ok ? "PASS" : "FAIL");
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -13347,6 +13691,11 @@ const std::vector<Gate>& MobGates() {
       // (with and without its power), an NPC's landing, the laser's single
       // charge. Resets mobs + debris and regenerates on the way in and out.
       {"damage-sources", "mob", {}, false, GateDamageSources,
+       /*needsRender=*/false},
+      // ONE CREATURE LIST (W2-K): each world effect applied once reaches an
+      // NPC AND the registered local avatar. Resets mobs + debris and
+      // regenerates on the way in and out.
+      {"creature-reach", "mob", {}, false, GateCreatureReach,
        /*needsRender=*/false},
       // ...and whether the thing that landed is still ONE body. Dressed, limp,
       // 50 m of fall: the clothes may not leave the limbs and the joints may not

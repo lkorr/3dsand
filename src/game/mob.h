@@ -1766,6 +1766,32 @@ class Mob {
   Vec3 Origin() const { return origin_; }
   float BodyY() const { return bodyY_; }
 
+  // ---- WHAT MIND DRIVES THIS BODY (W2-K, "one creature list") --------------
+  //
+  // Every creature is a Mob; this says who DECIDES what it does, and it is the
+  // only thing an agency pass (intent, steering, target selection, the actor
+  // list) may branch on. A world or matter effect (burn, stain, wet, rain,
+  // blast, carve, contact damage, crowd spacing, splatter) never asks: it
+  // reaches every creature through MobSystem::ForEachCreature/FindCreature.
+  //
+  //   Ai          — MobSystem's sense/intent/steer/drive. Every Mob in mobs_,
+  //                 a corpse included (AdoptDeadAvatar hands a player's body to
+  //                 the world as Ai: nobody drives the dead).
+  //   LocalPlayer — this process's input (PlayerAvatar's driver seam).
+  //   RemoteGhost — a peer's player, posed from the wire (RemotePlayer).
+  //
+  // A DIFFERENT AXIS FROM IsGhost(). That one is which MACHINE steps the body
+  // (M9.4 ownership): a peer-owned NPC is `Ai` and IsGhost(). A RemoteGhost is
+  // always IsGhost() as well, because its owner is the peer.
+  //
+  // Stamped once, by whoever made the body: Ai by default, LocalPlayer by
+  // PlayerAvatar's constructor, RemoteGhost by MobSystem::SetAvatars for the
+  // entries past `localCount`. Not hashed, not saved: the avatar is saved as
+  // 'AVTR' and every MOBS record is an Ai creature by construction.
+  enum class Controller : uint8_t { Ai = 0, LocalPlayer, RemoteGhost };
+  Controller GetController() const { return controller_; }
+  bool PlayerControlled() const { return controller_ != Controller::Ai; }
+
   // ---- WHO STEPS THIS CREATURE (docs/PLAN_multiplayer_m9.md M9.4-B) --------
   //
   // A playerId. `kLocalOwner` (0) is session 0's id and the default, so a
@@ -1798,6 +1824,12 @@ class Mob {
   // builds an avatar without wiring its proxy still gets.
   void SetCollisionOwner(uint64_t proxy);
   uint64_t CollisionOwner() const;
+  // The rig slot a blow landing at `worldVoxel` meets first: the base limb
+  // whose collider centre is nearest, or — when a worn piece covers that limb —
+  // its outermost shell (the last appended one strapped to it). -1 with no
+  // limb bodies. How a contact on a player's CAPSULE becomes a contact on the
+  // player's body (MobSystem::ApplyContactDamage, W2-K).
+  int ContactLimbNear(Vec3 worldVoxel) const;
   // THE ROLE OF ONE SLOT, derived from the creature's state (alive/limp/dead,
   // held slot, worn shell, severed hold) — the one place a limb's collision
   // layer is decided. Physics resolves the role to a layer.
@@ -2314,10 +2346,15 @@ class Mob {
   // moves a stack out of a worn slot through KitMut() directly loses the
   // damage it gained while worn.
   //
-  // An NPC's worn and held gear is still dressed directly (WearItem /
-  // EquipItem, by its def's loadout and by the rising/handoff/load paths) and
-  // read live off the rig (LootPieces, CaptureGear); its kit holds its PACK.
-  // Deriving an NPC's rig from kit equipment too is W2-M's deferred half.
+  // AN NPC'S WORN GEAR GOES THROUGH ITS KIT TOO (W2-K): WearItem/UnwearItem
+  // are kit writes for every creature (see WearItem), so a spawn wave, a
+  // rising, a handoff and a load dress the kit and the rig follows. The
+  // READERS (LootPieces, CaptureGear, the rising's gear walk) still walk the
+  // rig's worn_, deliberately: the live damage is in the shells, a player's
+  // corpse wears pieces whose kit went back to the avatar (AdoptDeadAvatar),
+  // and the save/wire order is rig-slot order. The HELD item is not a kit
+  // slot for anyone — the player's is the hotbar selection re-equipped every
+  // tick (session.cpp), an NPC's is EquipItem — so it stays rig state.
   const Kit& GetKit() const { return kit_; }
   // Direct access for the bag and hotbar (no rig consequence) and for
   // wholesale replacement (a load, a fixture). Equipment moves go through the
@@ -2370,9 +2407,22 @@ class Mob {
   // — which is every piece that is not a commoner weave, and every caller that
   // predates the wardrobe. It is carried onto each shell rather than stored on
   // the piece; see MobLimb::dye for why.
+  //
+  // A KIT WRITE, FOR EVERY CREATURE (W2-K, W2-M's deferred half). WearItem
+  // puts the piece in the kit's equipment slot and realises it on the rig;
+  // UnwearItem empties the slot and takes the shells off. So an NPC dressed by
+  // a spawn wave, a rising, a handoff, a load or the dev menu has a kit that
+  // says what it wears, exactly as the player's does — there is no second way
+  // onto the body. A refused piece (no limb to hang it on) does not stay in
+  // the kit unless the slot's old piece is still on the rig.
+  // WearOnRig/UnwearFromRig are the rig half alone: what DressFromKit (the
+  // kit -> rig direction, where the kit is already written) calls.
   bool WearItem(const ItemDef* item, int equipSlot,
                 const WornDamage* damage = nullptr, uint32_t dye = 0);
   bool UnwearItem(int equipSlot);
+  bool WearOnRig(const ItemDef* item, int equipSlot,
+                 const WornDamage* damage = nullptr, uint32_t dye = 0);
+  bool UnwearFromRig(int equipSlot);
   // Read what a worn piece has been through, in its item's cover order. Call
   // it BEFORE UnwearItem: the shells are the only place the damage lives while
   // the piece is on, and they are destroyed with the slots.
@@ -3792,6 +3842,7 @@ class Mob {
   DebrisSystem* debris_ = nullptr;
 
   uint64_t id_ = 0;
+  Controller controller_ = Controller::Ai;  // see GetController()
   int defIndex_ = -1;          // into MobSystem's def list (events, persistence)
   const MobDef* def_ = nullptr;
   bool alive_ = true;
@@ -4339,6 +4390,12 @@ class MobSystem {
   // "the record is self-contained" is not a claim you can make against the
   // system that wrote it, which still holds the live creature.
   MicroBodySet* MicroSet() const { return microSet_; }
+  // Init installs this system's body-reaction hook on the shared DebrisSystem
+  // (W2-I) and keeps the one it displaced. A SECOND system (mob-handoff's
+  // `far`) must call this before it dies: it hands the displaced hook back,
+  // or DebrisSystem::BurnBodies calls into a destroyed MobSystem on the next
+  // tick. Not in a destructor: a process may destroy the DebrisSystem first.
+  void ReleaseDebrisHooks();
   const std::shared_ptr<MobDefFactory>& DefFactory() const {
     return defFactory_;
   }
@@ -4530,35 +4587,120 @@ class MobSystem {
     avatars_.assign(avatars.begin(), avatars.end());
     localAvatars_ = localCount < avatars_.size() ? localCount : avatars_.size();
     StampLocalAvatars();
+    StampControllers();
   }
   void SetAvatar(Mob* avatar) {
     avatars_.clear();
     if (avatar) avatars_.push_back(avatar);
     localAvatars_ = avatars_.size();
     StampLocalAvatars();
+    StampControllers();
+  }
+
+  // ---- EVERY CREATURE: ONE WALK, ONE LOOKUP (W2-K) --------------------------
+  //
+  // THE ONE WAY TO REACH "every creature". A world or matter effect written as
+  // `for (Mob& m : mobs_)` reaches the NPCs and the dead and silently misses
+  // every player; W1-F's explosions were one such bug, and the ~14 by-id
+  // lookups that each repeated `if (!mob) mob = AvatarById(id)` were the same
+  // fall-through written out by hand. Use these; a bare mobs_ loop is for a
+  // pass that is about the LIST itself (spawn/evict/save/net) and says so in
+  // the audit (docs/PLAN_rule_unification_2026-09-24.md W2-K).
+  //
+  // WHY TWO CONTAINERS BEHIND ONE API, NOT ONE CONTAINER. `mobs_` is a
+  // std::vector<Mob> BY VALUE — swap-with-back erases and push_back
+  // reallocations move Mobs every tick, and AdoptDeadAvatar slices a player's
+  // body into it on purpose. A PlayerAvatar is a Mob SUBCLASS with ~40 fields
+  // of its own and a vtable (AvatarLayer, OnDying, MarkInstancesDirty), owned
+  // by its PlayerSession / RemotePlayer, whose lifetime is not this system's.
+  // Putting it in a value vector slices it; making mobs_ a vector of pointers
+  // re-types ~150 sites and ownership for no behaviour, and moves the op order
+  // of every NPC pass. So the storage stays split and nothing outside this
+  // block may care.
+  //
+  // ORDER: the NPC list, then every registered avatar in registration order
+  // (local sessions first, then peers' ghosts) — exactly the order the
+  // hand-written two-list loops used, so converting one is bit-identical.
+  // An avatar that IS an entry of mobs_ (a fixture borrowing an NPC for the
+  // player's seat, selftest_combat) is visited once, as the NPC.
+  //
+  // Not re-entrant against a spawn: `f` must not push to mobs_ (the same rule
+  // every range-for over mobs_ already obeys).
+  template <class F>
+  void ForEachCreature(F&& f) {
+    for (Mob& m : mobs_) f(m);
+    for (Mob* av : avatars_)
+      if (av != nullptr && !InMobList(av)) f(*av);
+  }
+  template <class F>
+  void ForEachCreature(F&& f) const {
+    for (const Mob& m : mobs_) f(m);
+    for (const Mob* av : avatars_)
+      if (av != nullptr && !InMobList(av)) f(*av);
+  }
+  // Early-out form: stops at the first creature `f` returns true for, and
+  // returns it (the handle-keyed entry points: Damage, CutLimb, BluntHit...).
+  template <class F>
+  Mob* FirstCreature(F&& f) {
+    for (Mob& m : mobs_)
+      if (f(m)) return &m;
+    for (Mob* av : avatars_)
+      if (av != nullptr && !InMobList(av) && f(*av)) return av;
+    return nullptr;
+  }
+  template <class F>
+  const Mob* FirstCreature(F&& f) const {
+    for (const Mob& m : mobs_)
+      if (f(m)) return &m;
+    for (const Mob* av : avatars_)
+      if (av != nullptr && !InMobList(av) && f(*av)) return av;
+    return nullptr;
+  }
+  // By MOB id, over every creature: an NPC, a corpse, a player, a peer.
+  // (`FindMobById` stays the NPC-list lookup: id allocation probes, the net
+  // apply paths and the fixtures mean "an entry of mobs_" by it.)
+  Mob* FindCreature(uint64_t mobId) {
+    return FirstCreature([&](const Mob& m) { return m.id_ == mobId; });
+  }
+  const Mob* FindCreature(uint64_t mobId) const {
+    return const_cast<MobSystem*>(this)->FindCreature(mobId);
+  }
+  // FindCreature as a 0-or-1 element range: `for (const Mob& m :
+  // CreatureWithId(id))` is "the creature with this id, if any". What the
+  // ~40 id-keyed queries (TotalHp, LimbVoxelCount, LimbBurnStateOf, ...) that
+  // were written as a scan of mobs_ now walk, so each answers for a player's
+  // body too without its body being rewritten.
+  std::span<Mob> CreatureWithId(uint64_t mobId) {
+    Mob* m = FindCreature(mobId);
+    return m ? std::span<Mob>(m, 1) : std::span<Mob>();
+  }
+  std::span<const Mob> CreatureWithId(uint64_t mobId) const {
+    const Mob* m = FindCreature(mobId);
+    return m ? std::span<const Mob>(m, 1) : std::span<const Mob>();
+  }
+  // Is `m` an element of mobs_ (vs a registered avatar living elsewhere)?
+  bool InMobList(const Mob* m) const {
+    return !mobs_.empty() &&
+           !std::less<const Mob*>()(m, mobs_.data()) &&
+           std::less<const Mob*>()(m, mobs_.data() + mobs_.size());
   }
   // A peer's ghost avatar belongs to that peer (RemotePlayersSyncAvatars).
+  // ...and is driven from the wire (Mob::Controller::RemoteGhost).
   static void SetAvatarOwner(Mob& avatar, uint32_t owner) {
     avatar.owner_ = owner;
+    avatar.controller_ = Mob::Controller::RemoteGhost;
   }
   // The LOCAL player's avatar, or null. Still singular on purpose: the render
   // path and the character screen draw one body, and that body is this one.
   Mob* Avatar() const { return avatars_.empty() ? nullptr : avatars_[0]; }
   const std::vector<Mob*>& Avatars() const { return avatars_; }
-  // The registered avatar carrying this mob id, or null. The id-keyed half of
-  // the same "and then every registered avatar" fall-through the handle-keyed
-  // lookups do; one function so the twelve callers cannot drift.
+  // The registered avatar carrying this mob id, or null. Only for a caller
+  // that must know the body is a PLAYER's (ServiceRising's kit hand-off);
+  // "find this creature" is FindCreature.
   Mob* AvatarById(uint64_t mobId) const {
     for (Mob* av : avatars_)
       if (av && av->Id() == mobId) return av;
     return nullptr;
-  }
-  // Is this body a PLAYER's rather than an NPC's? Asked where a rule must not
-  // fire for the player (the corpse report, so far).
-  bool IsAvatar(const Mob* m) const {
-    for (Mob* av : avatars_)
-      if (av == m) return true;
-    return false;
   }
   // WHICH CREATURE OWNS THIS BODY, and which of its rig slots it is. The
   // three-way flesh/garment/weapon classification the parry needs is then the
@@ -6409,6 +6551,8 @@ class MobSystem {
   std::vector<MobDef> defs_;
   std::shared_ptr<MobDefFactory> defFactory_;
   std::vector<Mob> mobs_;
+  // The debris body-reaction hook Init displaced (ReleaseDebrisHooks).
+  DebrisSystem::BodyReactor prevBodyReactor_;
   // ---- behaviour layer ------------------------------------------------------
   ai::Library behaviors_;
   // Rebuilt at the top of every PreTick from the player actor plus every live
@@ -6435,6 +6579,20 @@ class MobSystem {
   void StampLocalAvatars() {
     for (size_t i = 0; i < localAvatars_ && i < avatars_.size(); i++)
       if (avatars_[i] != nullptr) avatars_[i]->owner_ = localPlayerId_;
+  }
+  // Mob::Controller for every registered avatar: the leading `localAvatars_`
+  // are this process's players, the rest peers' ghosts. An entry that lives
+  // in mobs_ (a fixture borrowing an NPC for the player's seat) keeps Ai:
+  // it is still stepped by the NPC loop, and un-registering it later must not
+  // leave a stale player stamp on an NPC. Only ever WRITES entries being
+  // registered now — a previously registered avatar may already be destroyed.
+  void StampControllers() {
+    for (size_t i = 0; i < avatars_.size(); i++) {
+      Mob* av = avatars_[i];
+      if (av == nullptr || InMobList(av)) continue;
+      av->controller_ = i < localAvatars_ ? Mob::Controller::LocalPlayer
+                                          : Mob::Controller::RemoteGhost;
+    }
   }
   std::vector<ParticleSpawn> ghostSpawns_;  // CarveMobsRadial's discard
   uint32_t laserHitsCharged_ = 0;  // LaserHit: ticks that charged a creature

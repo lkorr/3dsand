@@ -753,6 +753,32 @@ class DebrisSystem {
     bodyReact_ = std::move(fn);
     bodyReactEnd_ = std::move(end);
   }
+  // THE HOOK IS BORROWED, AND HANDED BACK. The installer's closures capture
+  // it; a second MobSystem stood up against this DebrisSystem (mob-handoff's
+  // `far`) replaced the first one's hook and then died, leaving the next
+  // BurnBodies calling into a destroyed object (found 2026-09-24, W2-K).
+  // Install with an owner token; the owner restores what it displaced on its
+  // way out, and only if it is still the one installed.
+  struct BodyReactor {
+    BodyReactFn fn;
+    BodyReactEndFn end;
+    const void* owner = nullptr;
+  };
+  BodyReactor InstallBodyReactor(BodyReactFn fn, BodyReactEndFn end,
+                                 const void* owner) {
+    BodyReactor prev{std::move(bodyReact_), std::move(bodyReactEnd_),
+                     bodyReactOwner_};
+    bodyReact_ = std::move(fn);
+    bodyReactEnd_ = std::move(end);
+    bodyReactOwner_ = owner;
+    return prev;
+  }
+  void RestoreBodyReactor(const void* owner, BodyReactor prev) {
+    if (bodyReactOwner_ != owner) return;
+    bodyReact_ = std::move(prev.fn);
+    bodyReactEnd_ = std::move(prev.end);
+    bodyReactOwner_ = prev.owner;
+  }
 
   // Once per tick AFTER Physics::Step: refresh transforms, cull fallen /
   // excess bodies.
@@ -1782,6 +1808,7 @@ class DebrisSystem {
   // Null in a process with no MobSystem: then non-flesh bodies do not burn.
   BodyReactFn bodyReact_;
   BodyReactEndFn bodyReactEnd_;
+  const void* bodyReactOwner_ = nullptr;   // see InstallBodyReactor
   // Where BurnBodies starts next tick: the first body the last pass could
   // not afford (a walk deferred, or the candidate budget spent), so the
   // bodies behind a budget-limited pass are first in line rather than
