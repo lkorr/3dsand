@@ -23,6 +23,7 @@
 #include "sim/mattable.h"
 #include "sim/bodyreact.h"
 #include "sim/oprecord.h"  // BrushAuthorScope: a landing's ops (ApplyFallDamage)
+#include "sim/coatrule.h"
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
 #include "sim/scale.h"   // SkinScaleFor / NeededArtUpsample / MetresToCells
@@ -2041,7 +2042,6 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   coatEffects_.clear();
   matCorrodes_.clear();
   corrosiveMats_.clear();
-  matCoatHot_.clear();
   matCoatFuel_.clear();
   flashForm_.clear();
   coatDepth_.clear();
@@ -2115,13 +2115,28 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     // A CORROSIVE COAT: wearable (a stain slot) and its rules can rewrite body
     // matter. Both halves come from the table, so "acid" is named nowhere.
     // A HOT coat (lava) acts on its own too -- it burns what it sits on.
+    // Both are coats with work to do and NOTHING else around (the coat rule's
+    // partner is the voxel itself), which is what this column is for: seed,
+    // dry, keep to the surface, stop at a worn shell.
     const bool coatHot = slot != 0 && matHot_[mi] != 0;
-    matCoatHot_.push_back(coatHot ? 1 : 0);
     matCorrodes_.push_back(slot != 0 && (attacks || coatHot) ? 1 : 0);
     if (matCorrodes_.back()) corrosiveMats_.push_back((uint32_t)(matCorrodes_.size() - 1));
     coatDepth_.push_back(m.coatDepth);
     matBareBlood_.push_back(m.bareBlood);
     coatContact_.push_back(m.coatContact);
+  }
+  // The coat CLASS the one stain-precedence rule reads (phys/bodystain.h,
+  // sim/coatrule.h stainPrecedence): a washer (materials.json `washes`) and a
+  // corrosive coat (matCorrodes_). Published for every body-stain writer --
+  // debris and the cut soak included -- because precedence is a property of
+  // the two materials, not of who is doing the staining.
+  {
+    std::vector<uint8_t> cls(mats.size(), 0u);
+    for (size_t mi = 0; mi < mats.size(); mi++) {
+      if (mats[mi].gpu.stainPack & kStainPackWashesBit) cls[mi] |= kBodyCoatWashes;
+      if (matCorrodes_[mi]) cls[mi] |= kBodyCoatCorrodes;
+    }
+    SetBodyCoatClasses(std::move(cls));
   }
   // The micro brick's stain lattice is the one consumer that still speaks in
   // palette slots, so it is handed the table rather than the material list
@@ -13151,11 +13166,6 @@ namespace {
 bool OwnForStain(BurnLimbView& v, MicroBodySet* micro);  // defined below
 }  // namespace
 
-// Levels of a wet coat one DOUSE costs (BurnOneLimb section 0): putting a
-// burning voxel out flashes some of the water to steam, so a damp sleeve
-// puts out a few voxels of fire, not a bonfire.
-static constexpr uint32_t kCoatDouseCost = 4;
-
 uint32_t MobSystem::IgniteOneLimb(BurnLimbView& v, uint32_t count,
                                  uint32_t onlyMat) {
   if (!BurnTablesReady() || v.Size() == 0) return 0;
@@ -13188,8 +13198,9 @@ uint32_t MobSystem::IgniteOneLimb(BurnLimbView& v, uint32_t count,
       if (f < matHot_.size() && matHot_[f]) hot = f;
     }
     if (hot == 0) continue;  // bone, steel: no path to burning, no exception list
-    // A WET voxel does not take a flame either (BurnOneLimb section 0): a
-    // torch against a soaked arm lights the dry skin, or nothing.
+    // A WET voxel does not take a flame either (a wet coat COVERS it,
+    // BurnOneLimb section 0): a torch against a soaked arm lights the dry
+    // skin, or nothing.
     {
       const uint16_t c = v.Stain(i);
       const uint32_t cm = BodyStainMat(c);
@@ -13629,12 +13640,13 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     const size_t vi = (e & ~kBurnQueued) - 1;
     const uint32_t m = v.Mat(vi);
     if (m == 0 || m >= matGpu_.size()) return;
-    // A voxel with nothing of its own to do may still wear FUEL (oil on
-    // bone), and the flame walking the coat has to reach it.
+    // A voxel with nothing of its own to do may still wear a coat that
+    // REACTS (oil or water on bone): the coat is a reactant in its own right
+    // (DESIGN.md §6), and the flame walking the coat has to reach it.
     if (matGpu_[m].reactCount == 0) {
       const uint16_t sc = v.Stain(vi);
       const uint32_t cm = BodyStainMat(sc);
-      if (!BodyStainAmt(sc) || cm >= matCoatFuel_.size() || !matCoatFuel_[cm])
+      if (!BodyStainAmt(sc) || cm >= matHasPair_.size() || !matHasPair_[cm])
         return;
     }
     queue(c);
@@ -13816,6 +13828,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // encoded as material identity — one 16-bit poke, no re-pack, no
       // realloc, no origin shift, no rig fix-up (PLAN §3.4/§3.5).
       v.Set(i, pm, (rr >> 6) % 3u);
+      // A coat HELD in an absorbent substrate is released by any rewrite of
+      // it, as on the ground; a FILM (every body material today) stays on
+      // the voxel (DESIGN.md §6 clause 2b).
+      if (was < matGpu_.size() &&
+          ((matGpu_[was].stainPack >> kStainPackAbsorbShift) &
+           kStainPackAbsorbMask) != 0 &&
+          v.Stain(i) != 0) {
+        v.SetStain(i, 0);
+        st.coatTouched = true;
+        if (OwnForStain(v, microSet_))
+          MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, p.x, p.y,
+                             p.z, 0);
+      }
       if (v.carved && *v.carved && v.microModel && *v.microModel >= 0 && microSet_)
         MicroBodyPoke(*microSet_, (uint32_t)(*v.microModel), p.x, p.y, p.z,
                       (uint8_t)pm, 0);
@@ -13983,6 +14008,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     // substituting a sibling's material would mean something other than heat
     // (an inverted ramp, and the inbound pass).
     bool ncross[6] = {};
+    // What the GRID holds at each world-facing face, before any worn shell or
+    // sibling limb was substituted for it: where a coat's released flame may
+    // go (DESIGN.md §6 rule 2, "an open face of the cell").
+    uint32_t nworld[6] = {};
     for (int k = 0; k < 6; k++) {
       const IVec3& d = kBurnDirs[k];
       const uint32_t nc = cellOf({vp.x + d.x, vp.y + d.y, vp.z + d.z});
@@ -14035,6 +14064,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
             wornStats_.nbrMissInReach++;
         }
         nmat[k] = worn ? worn : wm;
+        nworld[k] = wm;
         ncell[k] = kNoBurnCell;
         // HEAT ACROSS A JOINT, and ONLY where the grid had nothing to say.
         // A cell holding real matter already answered this face -- fire in it
@@ -14103,32 +14133,6 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       }
     }
 
-    // ---- A HOT COAT IS WHAT IS OUTSIDE ME --------------------------------
-    //
-    // Lava poured on skin is lava against every face of it the world can
-    // touch, so each exposed face that read open air reads the coat instead
-    // -- as a face as WIDE as a world voxel of it (the four tangential cells
-    // too), because a coat is a sheet, not a lone ember, and flesh authored
-    // minCount 3 must catch under one. Only open air is replaced: real
-    // matter outside still answers, and a worn shell already answered with
-    // itself (the lava went on the shell, not the skin). The voxel's own
-    // rules then sear and ignite it with no rule mirrored for coats; the
-    // inbound pass skips these faces, because the coat's own bite is section
-    // 3's, which pays for it in depth.
-    bool coatFace[6] = {};
-    {
-      const uint16_t sc = v.Stain(i);
-      const uint32_t cm = BodyStainMat(sc);
-      if (BodyStainAmt(sc) && cm < matCoatHot_.size() && matCoatHot_[cm])
-        for (int k = 0; k < 6; k++) {
-          if (ncell[k] != kNoBurnCell || nmat[k] != 0 || ncross[k]) continue;
-          nmat[k] = cm;
-          for (int j = 0; j < 4; j++) ntan[k][j] = cm;
-          tanValid[k] = true;
-          coatFace[k] = true;
-        }
-    }
-
     // How much of this voxel the WORLD can touch. Recorded before any rule
     // runs, because it is the ceiling on every ramp count below and it is a
     // fact about the limb's SHAPE rather than about the fire (see BurnStats).
@@ -14140,40 +14144,54 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       burnStats_.exposed[exposed]++;
     }
 
-    // ---- 0. WATER ON THE SKIN: A WET BODY DOES NOT BURN --------------------
+    // ---- 0. THE COAT IS A CO-LOCATED VIRTUAL NEIGHBOUR (DESIGN.md §6) -------
     //
-    // The coat is read here, on the burn side, because this is where "does
-    // this voxel catch" is decided. Three things, all off the WASHER coat
-    // (stain block `washes`, i.e. water) and none naming a material:
+    // rule-unification W2-J2, 2026-09-24. This used to be four hand-written
+    // sections, each with its own RNG index space: a WET coat that refused
+    // hot products, boiled at coat.fireDrySeconds and paid 4 levels a douse; a
+    // FUEL coat that spent itself whole per flash and jumped the voxel to its
+    // burning form; a HOT coat read as every open face of the voxel, widened;
+    // and a CORROSIVE coat that bit the voxel at a depth price and carried
+    // inward. It is now the ONE rule the grid runs (sim_step.wgsl coatReact /
+    // doReactions), over the body lattice, with the arithmetic shared through
+    // sim/coatrule.h (check_invariants `coatrule`). No material is named: the
+    // coat's behaviour is its material's rules in reactions.json.
     //
-    //   * A wet voxel refuses every rule whose product is hot or a burn stage
-    //     (skipped in the loop below), so it neither ignites nor sears.
-    //   * Heat against a wet voxel BOILS the coat off, far faster than it
-    //     dries in air (coat.fireDrySeconds from soaked to dry), so fire
-    //     dries you out and then takes you.
-    //   * A BURNING voxel that is wet, or has a wet lattice neighbour, runs
-    //     its OWN authored douse rule (`X_burning + tag:extinguisher`) with
-    //     the water as the neighbour, and the water pays a few levels for it.
-    //     No new table: the rules that put a burning voxel out in a puddle put
-    //     it out under a wet sleeve.
-    const bool mHot = m < matHot_.size() && matHot_[m];
-    auto washerOf = [&](uint16_t c) -> uint32_t {
-      const uint32_t cm = BodyStainMat(c);
-      return BodyStainAmt(c) && cm && cm < matGpu_.size() &&
-                     (matGpu_[cm].stainPack & kStainPackWashesBit)
-                 ? cm
-                 : 0u;
-    };
-    const uint32_t selfWasher = washerOf(v.Stain(i));
-    // Lose `levels` of a washer coat on voxel `wi` (steam). Owned before the
-    // poke for the same COW reason every other coat write is.
-    auto boil = [&](size_t wi, uint32_t levels) {
-      const uint16_t c = v.Stain(wi);
-      const uint32_t amt = BodyStainAmt(c);
-      if (!amt || !washerOf(c)) return;
-      const uint32_t left = amt > levels ? amt - levels : 0u;
-      const uint16_t next =
-          left ? PackBodyStain(BodyStainMat(c), left) : (uint16_t)0;
+    //   1. THE COAT'S RULES FIRST. The coat material's PAIR rules, in file
+    //      order, with the coat as `self`: its partners are this voxel (clause
+    //      1a: the coat touches what it is ON first) and then the six faces,
+    //      in a rotation. A partner outside this lattice (a grid cell, a
+    //      sibling limb, a worn shell) is READ-ONLY (clause 2a), as it is to
+    //      the voxel's own rules below: a rule that would rewrite it does not
+    //      match it.
+    //   2. FIRED, it spends ONE level. A flame product goes into an open face
+    //      (the grid cell there is air, else a gas) and a flame with no open
+    //      face is not a match; any other coat-side product is not created.
+    //      The partner's side is ordinary. This voxel rewritten IN PLACE (a
+    //      solid product) keeps its coat -- on a body the coat is a FILM, not
+    //      liquid held in an absorbent substrate (clause 2b) -- and a voxel
+    //      that LEAVES takes its coat with it, unless the coat is DEEP
+    //      (clause 7: it pays a layer's price and the rest carries inward).
+    //   3. A matched rule whose coat side is not a flame COVERS the voxel for
+    //      the tick: its own rules below see the coat and nothing else.
+    //   4. The voxel's own rules take the coat as a pair partner after the
+    //      faces, and a direct ramp counts it (widened at world pitch on a
+    //      fine lattice, clause 4a).
+    //   5. The coat and the voxel each fire at most one rule a tick, the
+    //      coat's first; the voxel's rules see the coat as it is after.
+    //   6. Only the wearer sees its coat: a lattice neighbour's rules read this
+    //      voxel's material, never its coat (so a wet voxel no longer douses
+    //      the burning one beside it -- its water boils instead, and it is
+    //      covered while it does).
+    const uint16_t coatWord0 = v.Stain(i);
+    uint32_t coatAmt = BodyStainAmt(coatWord0);
+    uint32_t coat = BodyStainMat(coatWord0);
+    if (!coatAmt || coat == 0 || coat >= matGpu_.size()) coat = 0, coatAmt = 0;
+    const bool pitchFine = v.scale > 1u;
+    bool covered = false;
+    bool selfDone = false;
+    auto setCoat = [&](size_t wi, uint16_t next) {
+      if (v.Stain(wi) == next) return;
       v.SetStain(wi, next);
       st.coatTouched = true;
       changed = true;
@@ -14183,117 +14201,193 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                            wp.z, next);
       }
     };
-    if (mHot) {
-      // The water that douses: this voxel's own, else a lattice neighbour's.
-      size_t wetAt = selfWasher ? i : SIZE_MAX;
-      uint32_t washer = selfWasher;
-      for (int k = 0; k < 6 && !washer; k++) {
-        if (ncell[k] == kNoBurnCell) continue;
-        const uint32_t ni = st.idx[ncell[k]] & ~kBurnQueued;
-        if (!ni) continue;
-        washer = washerOf(v.Stain(ni - 1));
-        if (washer) wetAt = ni - 1;
+    auto isFlame = [&](uint32_t prod) {
+      if (prod == kProdKeep) return false;
+      const uint32_t pm = prod & 0xFFFu;
+      return pm != 0 && pm < matGpu_.size() &&
+             (matGpu_[pm].flags & kMatFlagFlame) != 0;
+    };
+    // Where a released flame goes (rule 2): the first face, in a rotation,
+    // whose GRID cell is open air, else the first that is a gas -- and only a
+    // face the lattice, a sibling and a worn shell all leave open. -1 = none.
+    // `avoid` is the partner face being rewritten. (A body's faces are
+    // lattice directions, so a rule's world direction mask is not consulted --
+    // as the voxel's own pair rules never did; no coat rule authors one.)
+    auto releaseFace = [&](uint32_t rot, int avoid) -> int {
+      int gasFace = -1;
+      for (int j = 0; j < 6; j++) {
+        const int k = (int)((rot + (uint32_t)j) % 6u);
+        if (k == avoid) continue;
+        if (ncell[k] != kNoBurnCell || ncross[k] || nmat[k] != nworld[k])
+          continue;
+        if (nworld[k] == 0) return k;
+        if (gasFace < 0 && nworld[k] < matGpu_.size() &&
+            matGpu_[nworld[k]].klass == CLASS_GAS)
+          gasFace = k;
       }
-      if (washer) {
-        const MaterialGpu& hg = matGpu_[m];
-        bool doused = false;
-        for (uint32_t ri = 0; ri < hg.reactCount && !doused; ri++) {
-          const ReactionGpu& r = reactions_[hg.reactOffset + ri];
-          if ((r.packed & 3u) != kReactPair || r.prodSelf == kProdKeep) continue;
-          if (!ReactNbrMatches(r, washer, matGpu_)) continue;
-          // Its own rule-index space (+96), apart from the self (+0) and
-          // inbound (+64) passes, so the douse roll correlates with neither.
-          const uint32_t rr =
-              Hash3(lk ^ (ck * 3266489917u), tick, 96u + ri);
-          if (rr % kReactChanceDen >= r.chance) continue;
-          applyTo(cell, r.prodSelf, rr);
-          doused = true;
-        }
-        if (doused) {
-          boil(wetAt, kCoatDouseCost);
-          continue;  // one rule per voxel per tick, as below
-        }
-      }
-    }
-    if (selfWasher && !mHot) {
-      bool heated = false;
-      for (int k = 0; k < 6 && !heated; k++)
-        heated = nmat[k] && nmat[k] < matHot_.size() && matHot_[nmat[k]];
-      if (heated) {
-        // A level per `fireDrySeconds * 30 / 15` ticks of contact, rolled per
-        // tick so a fractional rate is exact on average.
-        const float secs =
-            std::max(0.05f, CurrentTuning().coat.fireDrySeconds);
-        const uint32_t pm = (uint32_t)std::min(
-            1000.0f, 1000.0f * (float)kStainAmtMax / (secs * 30.0f));
-        const uint32_t rr = Hash3(lk ^ (ck * 2654435761u), tick, 0xB011u);
-        if (rr % 1000u < pm) boil(i, 1u);
-      }
-    }
+      return gasFace;
+    };
+    // The release itself is the body's one write path into the grid: a
+    // fill-air cell op, deduped per world cell (emitCell). Into a gas cell it
+    // is refused by the GPU -- the flame was still made, and spent the level.
+    auto release = [&](int k, uint32_t prod, uint32_t rr) {
+      const IVec3& d = kBurnDirs[k];
+      const Vec3 wv =
+          worldOf(vp) + Rotate(q, Vec3{(float)d.x * inv, (float)d.y * inv,
+                                       (float)d.z * inv});
+      emitCell({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, prod & 0xFFFu,
+               (rr >> 8u) % 3u);
+    };
+    // A HELD coat (the substrate absorbs: materials.json `absorb`) is liquid
+    // in the voxel and leaves with any rewrite of it, as on the ground; a FILM
+    // (every body material authored today) stays on a voxel rewritten in
+    // place (clause 2b).
+    const bool heldCoat =
+        ((matGpu_[m].stainPack >> kStainPackAbsorbShift) & kStainPackAbsorbMask) != 0;
 
-    // ---- 0b. A FUEL COAT FLASHES: OIL ON ME, HEAT BESIDE ME ---------------
-    //
-    // The coat's OWN rules with the coat as `self` and this voxel's six faces
-    // as its neighbours -- exactly the question a grid cell of oil asks -- and
-    // a rule whose product is hot (oil + tag:hot -> fire) fires the flash:
-    // the film is spent, a flame goes up off it into the world, and the voxel
-    // under it catches as flashForm_ (skin -> flesh_burning, straight past the
-    // sear). The flame then walks the coat: the voxel beside is wearing oil
-    // and now has a burning lattice neighbour, so it flashes on the next tick
-    // at oil's own authored odds. Bounded: a flash spends the coat it runs
-    // on and the coat was laid on the surface only (SoakLimb).
-    bool fired = false;
-    {
-      const uint16_t sc = v.Stain(i);
-      const uint32_t cm = BodyStainMat(sc);
-      if (BodyStainAmt(sc) && cm < matCoatFuel_.size() && matCoatFuel_[cm]) {
-        const MaterialGpu& fg = matGpu_[cm];
-        for (uint32_t rj = 0; rj < fg.reactCount && !fired; rj++) {
-          const ReactionGpu& r = reactions_[fg.reactOffset + rj];
-          if ((r.packed & 3u) != kReactPair || r.prodSelf == kProdKeep) continue;
-          const uint32_t ps = r.prodSelf & 0xFFFu;
-          if (ps >= matHot_.size() || !matHot_[ps]) continue;
-          if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
-          bool touch = false;
-          for (int k = 0; k < 6 && !touch; k++)
-            touch = nmat[k] && ReactNbrMatches(r, nmat[k], matGpu_);
-          if (!touch) continue;
-          // Its own rule-index space (+160), apart from self (+0), inbound
-          // (+64), douse (+96) and coat bite (+128).
-          const uint32_t rr =
-              Hash3(lk ^ (ck * 2891336453u), tick, 160u + rj);
-          if (rr % kReactChanceDen >=
-              RainScaledChance(r.cond, r.chance, weatherRain_, true))
-            continue;
-          v.SetStain(i, 0);
-          st.coatTouched = true;
-          changed = true;
-          if (OwnForStain(v, microSet_))
-            MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, vp.x, vp.y,
-                               vp.z, 0);
-          const Vec3 wv = worldOf(vp);
-          emitCell({ifloor(wv.x), ifloor(wv.y) + 1, ifloor(wv.z)}, ps,
-                   (rr >> 8u) % 3u);
-          const uint32_t into = m < flashForm_.size() ? flashForm_[m] : 0u;
-          if (into) applyTo(cell, into, rr);
-          fired = true;
-        }
+    // ---- CLAUSE 7: A DEEP COAT PAYS FOR WHAT IT EATS ----------------------
+    // A coat authored `coat.depth` world voxels deep is depth x scale lattice
+    // cells deep here. Deeper than one cell, rewriting a cell of this body --
+    // the voxel it is on, or a face neighbour -- costs one layer's PRICE,
+    // 15 / (depth x scale) levels (in milli-levels, rounded stochastically),
+    // instead of rule 2's one level; the voxel it was on LEAVING, what is left
+    // carries into the lattice neighbours behind it. A full coat therefore
+    // eats coat.depth WORLD voxels whatever this creature's pitch, and is then
+    // spent (rule 2 of CLAUDE.md: the depth is what was poured). A coat
+    // THINNER than one layer's price may still take the layer iff it clears a
+    // threshold fixed per voxel (keyed on the lattice position, not the tick
+    // and not the amount: a per-tick roll only delays a thin film and doubled
+    // the depth; an amount-keyed one re-rolls on every carry). The grid has
+    // scale 1 and no coat deeper than 1, so this never fires there.
+    bool deep = false;
+    bool canRewrite = true;
+    uint32_t costMilli = 1000u;
+    if (coat) {
+      const float depth =
+          coat < coatDepth_.size() ? std::max(1e-3f, coatDepth_[coat]) : 1.0f;
+      const float cells = depth * (float)std::max(1u, v.scale);
+      deep = cells > 1.0f;
+      if (deep) {
+        costMilli = std::max<uint32_t>(
+            1u, (uint32_t)std::min(15000.0f,
+                                   1000.0f * (float)kBodyStainAmtMax / cells));
+        const uint32_t haveMilli = coatAmt * 1000u;
+        if (haveMilli < costMilli &&
+            Hash3(lk ^ ((uint32_t)kp.x * 73856093u) ^
+                      ((uint32_t)kp.y * 19349663u) ^
+                      ((uint32_t)kp.z * 83492791u),
+                  0xAC1Du, 0u) % costMilli >= haveMilli)
+          canRewrite = false;
       }
     }
-    if (fired) continue;
+    // Levels left after a coat-side firing that rewrote matter of this body.
+    auto paidLeft = [&](uint32_t amt, uint32_t rr) -> uint32_t {
+      if (!deep) return coatLevelsAfter(amt, 1u);
+      const uint32_t leftMilli = coatLevelsAfter(amt * 1000u, costMilli);
+      return leftMilli / 1000u +
+             ((Pcg(rr) % 1000u) < leftMilli % 1000u ? 1u : 0u);
+    };
+
+    // ---- rules 1-3 and 5: the coat's own rules ----------------------------
+    if (coat) {
+      const MaterialGpu& cg = matGpu_[coat];
+      for (uint32_t rj = 0; rj < cg.reactCount; rj++) {
+        const ReactionGpu& r = reactions_[cg.reactOffset + rj];
+        if ((r.packed & 3u) != kReactPair) continue;
+        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_))
+          continue;
+        // The coat's own rule-index space (+128), apart from the voxel's
+        // self (+0) and inbound (+64) passes.
+        const uint32_t rr = Hash3(lk ^ (ck * 374761393u), tick, 128u + rj);
+        const uint32_t rot = rr >> 12u;
+        const bool rewrites = r.prodNbr != kProdKeep;
+        // Partner: this voxel (clause 1a), then the faces.
+        int pk = -2;  // -1 = this voxel, 0..5 = a face
+        if (ReactNbrMatches(r, m, matGpu_) &&
+            !(r.prodSelf == kProdKeep && r.prodNbr == m) &&
+            (!rewrites || canRewrite))
+          pk = -1;
+        for (int j = 0; j < 6 && pk == -2; j++) {
+          const int k = (int)((rot + (uint32_t)j) % 6u);
+          const uint32_t nm = nmat[k];
+          if (nm == 0 || !ReactNbrMatches(r, nm, matGpu_)) continue;
+          const bool lattice = ncell[k] != kNoBurnCell;
+          if (lattice && r.prodSelf == kProdKeep && r.prodNbr == nm) continue;
+          if (rewrites && (!lattice || !canRewrite)) continue;  // clause 2a
+          pk = k;
+        }
+        if (pk == -2) continue;
+        const bool flame = isFlame(r.prodSelf);
+        const int rf = flame ? releaseFace(rot, rewrites ? pk : -1) : -1;
+        const uint32_t verdict = coatRuleVerdict(flame, rf >= 0);
+        if ((verdict & kCoatVerdictMatch) == 0) continue;
+        if (verdict & kCoatVerdictCovers) covered = true;
+        burnStats_.coatMatched++;
+        if (rr % kReactChanceDen >=
+            RainScaledChance(r.cond, r.chance, weatherRain_, true))
+          continue;
+        // ---- FIRED ----
+        burnStats_.coatFired++;
+        if (rf >= 0) release(rf, r.prodSelf, rr);
+        if (rewrites && pk == -1) {
+          applyTo(cell, r.prodNbr, rr);
+          selfDone = true;
+          if ((st.idx[cell] & ~kBurnQueued) == 0) {
+            // It LEFT, and took the coat (applyTo cleared the tombstone's).
+            // A deep coat's remainder carries into the voxels behind.
+            const uint32_t left = deep ? paidLeft(coatAmt, rr) : 0u;
+            if (left) {
+              for (int k = 0; k < 6; k++) {
+                if (ncell[k] == kNoBurnCell) continue;
+                const uint32_t ni = st.idx[ncell[k]] & ~kBurnQueued;
+                if (!ni) continue;
+                const uint16_t cur = v.Stain(ni - 1);
+                const uint16_t next = RaiseBodyStain(cur, coat, left);
+                if (next == cur) continue;
+                const bool was = BodyStainAmt(cur) && corrodes(BodyStainMat(cur));
+                setCoat(ni - 1, next);
+                if (!was && corrodes(coat)) corrodeReached.push_back(ncell[k]);
+              }
+            }
+          } else if (heldCoat) {
+            setCoat(i, 0);  // released with the substrate that held it
+          } else {
+            const uint32_t left = paidLeft(coatAmt, rr);
+            setCoat(i, left ? PackBodyStain(coat, left) : (uint16_t)0);
+          }
+        } else {
+          if (rewrites) applyTo(ncell[pk], r.prodNbr, Pcg(rr));
+          const uint32_t left =
+              rewrites ? paidLeft(coatAmt, rr) : coatLevelsAfter(coatAmt, 1u);
+          setCoat(i, left ? PackBodyStain(coat, left) : (uint16_t)0);
+        }
+        break;  // rule 5: one coat rule a tick
+      }
+      // Rule 5: the voxel's own rules see the coat as it is NOW.
+      if (!selfDone) {
+        const uint16_t cw = v.Stain(i);
+        coatAmt = BodyStainAmt(cw);
+        coat = coatAmt ? BodyStainMat(cw) : 0u;
+        if (coat >= matGpu_.size()) coat = 0, coatAmt = 0;
+      }
+      if (covered) burnStats_.coatCovered++;
+    }
+    bool fired = selfDone;
 
     // ---- 1. this voxel's own rules ----
     const MaterialGpu& mg = matGpu_[m];
     for (uint32_t ri = 0; ri < mg.reactCount && !fired; ri++) {
       const ReactionGpu& r = reactions_[mg.reactOffset + ri];
       if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
-      // WET DOES NOT CATCH (section 0 above): no rule may turn a wet voxel
-      // into something burning or burnt.
-      if (selfWasher && (r.packed & 3u) != kReactEmit &&
-          r.prodSelf != kProdKeep) {
-        const uint32_t ps = r.prodSelf & 0xFFFu;
-        if ((ps < matHot_.size() && matHot_[ps]) || BurnStageOf(ps)) continue;
-      }
+      // (WET DOES NOT CATCH is no longer a skip list here: a wet voxel beside
+      // heat is COVERED by its water's own `+ tag:hot` rule (section 0, rule
+      // 3), so the rules below see only the coat and nothing hot.)
+      // A covered voxel has no open face: no emit (rule 3).
+      if (covered && (r.packed & 3u) == kReactEmit) continue;
+      // The coat as a partner (rule 4): does this rule's neighbour predicate
+      // match it? Not for an inverted ramp -- a film does not add to what
+      // the voxel is exposed to.
+      const bool coatHit = coat != 0 && ReactNbrMatches(r, coat, matGpu_);
       uint32_t chance = r.chance;
       // ---- A WOUND SETTLES SLOWER THAN A PUDDLE EVAPORATES ------------------
       // Blood's authored decay is a rate for a pool in the open (8 per-mille a
@@ -14326,8 +14420,8 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // Inverted ramps are excluded for the reason given at the ramp below.
       bool crossOnly = false;
       if (!ReactScaleInverted(r)) {
-        bool anyMatch = false, anyReal = false;
-        for (int k = 0; k < 6; k++) {
+        bool anyMatch = false, anyReal = coatHit;  // the coat is no sibling
+        for (int k = 0; k < 6 && !covered && !anyReal; k++) {
           if (!nmat[k] || !ReactNbrMatches(r, nmat[k], matGpu_)) continue;
           anyMatch = true;
           if (!ncross[k]) { anyReal = true; break; }
@@ -14349,11 +14443,19 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // (evaporation, freezing) and no body material does, so this is a
         // guard on a future rule rather than a live case; it is one line and
         // the alternative is a silent misreading.
-        uint32_t cnt = 0;
-        for (int k = 0; k < 6; k++) {
+        uint32_t faces = 0;
+        for (int k = 0; k < 6 && !covered; k++) {  // covered: the coat only
           const uint32_t nm2 = (invert && ncross[k]) ? 0u : nmat[k];
-          if (ReactNbrMatches(r, nm2, matGpu_) != invert) cnt++;
+          if (ReactNbrMatches(r, nm2, matGpu_) != invert) faces++;
         }
+        // THE COAT COUNTS (rule 4): once, capped at 6 -- and on a lattice
+        // finer than the world as a face widened at world pitch (clause 4a,
+        // sim/coatrule.h coatRampCount): a coat is a sheet over the voxel,
+        // and a skin voxel's other five faces are its own flesh however much
+        // lava is on it, so "one more face" could never reach flesh's
+        // authored minCount 3 -- the same argument as the ntan widening
+        // above, and the same number it reaches.
+        uint32_t cnt = coatRampCount(faces, !invert && coatHit, pitchFine);
         // WIDEN AT WORLD PITCH. A face pointing into matter this rule reacts
         // to counts for as much as that matter is wide across the face, so
         // `minCount 3` on a body means "a real fire" exactly as it does in the
@@ -14366,7 +14468,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         // air on N sides"), and for those the wide-face reading is not the
         // same question, so they keep the lattice count they were authored
         // against.
-        if (!invert) {
+        if (!invert && !covered) {
           for (int k = 0; k < 6; k++) {
             if (!tanValid[k]) continue;
             if (!ReactNbrMatches(r, nmat[k], matGpu_)) continue;
@@ -14392,13 +14494,28 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // counter-based hash of (limb, cell, tick, rule index) rather than a
       // sequential stream, so reordering the comparison against it changes no
       // other roll anywhere and no rule's odds move.
-      int pairMatch = -1;
+      // The roll is drawn here, ahead of the match, for the same reason: the
+      // coat partner's flame needs its rotation (the pair path reads nothing
+      // else from it before the compare below).
+      const uint32_t rr = Hash3(lk ^ (ck * 2246822519u), tick, ri);
+      int pairMatch = -1;  // 0..5 a face, 6 the coat (rule 4)
+      int coatRelease = -1;
       if ((r.packed & 3u) == kReactPair) {
-        for (int k = 0; k < 6; k++)
+        for (int k = 0; k < 6 && !covered; k++)
           if (nmat[k] && ReactNbrMatches(r, nmat[k], matGpu_)) {
             pairMatch = k;
             break;
           }
+        // THE COAT AS PARTNER, after the faces (rule 4). The no-op skip as
+        // for a face; a flame on the coat side needs an open face to go
+        // into, or it is not a match (rule 2).
+        if (pairMatch < 0 && coatHit &&
+            !(r.prodSelf == kProdKeep && r.prodNbr == coat)) {
+          const bool flame = isFlame(r.prodNbr);
+          if (flame) coatRelease = releaseFace(rr >> 12u, -1);
+          if (coatRuleVerdict(flame, coatRelease >= 0) & kCoatVerdictMatch)
+            pairMatch = 6;
+        }
         if (pairMatch < 0) continue;
       }
       if (crossOnly && v.crossPct < 100) {
@@ -14413,7 +14530,6 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // Weather last, on the fully-scaled chance: rain douses a burning limb
       // and damps its catching exactly as it does a grid cell (reactcpu.h).
       chance = RainScaledChance(r.cond, chance, weatherRain_, true);
-      const uint32_t rr = Hash3(lk ^ (ck * 2246822519u), tick, ri);
       if (rr % kReactChanceDen >= chance) continue;
       const uint32_t kind = r.packed & 3u;
       if (kind == kReactDecay) {
@@ -14443,6 +14559,24 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         }
       } else {  // kReactPair
         const int match = pairMatch;  // found above, before the roll
+        if (match == 6) {
+          // FIRED THROUGH THE COAT (rule 4 with rule 2 on the coat side): a
+          // flame product is released, anything else is not created; the
+          // coat spends one level -- unless the voxel LEFT, taking its coat
+          // with it, or it was rewritten in place under a HELD coat, which
+          // goes with its substrate (clause 2b).
+          if (coatRelease >= 0) release(coatRelease, r.prodNbr, rr);
+          applyTo(cell, r.prodSelf, rr);
+          if ((st.idx[cell] & ~kBurnQueued) != 0) {
+            const bool rewrote = r.prodSelf != kProdKeep;
+            const uint32_t left =
+                rewrote && heldCoat ? 0u : coatLevelsAfter(coatAmt, 1u);
+            setCoat(i, left ? PackBodyStain(coat, left) : (uint16_t)0);
+          }
+          burnStats_.coatPartner++;
+          fired = true;
+          continue;
+        }
         // World neighbours are READ-ONLY from this side: a limb cannot
         // rewrite grid content, so only rules that keep the neighbour may
         // match against one. A CROSS neighbour is read-only for a stronger
@@ -14474,7 +14608,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // this feature deliberately does not have. Heat crosses a joint; damage
       // does not. No burning material rewrites its neighbour today, so this is
       // a guard on the authoring surface rather than a live case.
-      if (ncross[k] || coatFace[k]) continue;  // a coat bites in section 3
+      // Not gated on `covered`: only the WEARER sees its coat (rule 6), so a
+      // world cell's rule reaches a wet voxel exactly as the grid's lava
+      // still burns wet grass. A coat's own bite is section 0's.
+      if (ncross[k]) continue;
       const uint32_t wm = nmat[k];
       if (wm == 0 || wm >= matRewritesNbr_.size() || !matRewritesNbr_[wm])
         continue;
@@ -14497,109 +14634,6 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         break;
       }
     }
-
-    // ---- 3. INBOUND FROM MY OWN COAT: THE ACID IS ON ME -----------------
-    //
-    // Section 2 with the coat as the neighbour. A voxel wearing acid is a
-    // voxel with acid against it, so the acid's OWN rules are asked about
-    // this voxel's material exactly as they are for a grid cell of acid -- no
-    // rule mirrored per body material, nothing here names acid, and steel
-    // shrugs it off for the same reason it does in a pool (no tag to match).
-    //
-    // What the coat does on a bite is the one thing a grid cell has no
-    // version of: the voxel under it is gone, so it runs into the voxels that
-    // were behind it a little weaker. The cost per LATTICE layer is
-    // 15 / (coat.depth x scale) levels, rounded stochastically, so a full coat
-    // eats coat.depth WORLD voxels whatever this creature's skin pitch -- and
-    // is then spent: the depth is what was poured, never a chain reaction
-    // (rule 2). A rule that also spends the acid (a `selfBecomes`) costs the
-    // coat the same where it stands.
-    if (fired) continue;
-    {
-      const uint16_t sc = v.Stain(i);
-      const uint32_t cm = BodyStainMat(sc);
-      const uint32_t camt = BodyStainAmt(sc);
-      if (!camt || !corrodes(cm)) continue;
-      const MaterialGpu& cg = matGpu_[cm];
-      // One lattice layer's price, in milli-levels (see above).
-      const float depth =
-          cm < coatDepth_.size() ? std::max(1e-3f, coatDepth_[cm]) : 1.0f;
-      const uint32_t costMilli = std::max<uint32_t>(
-          1u, (uint32_t)std::min(
-                  15000.0f, 1000.0f * (float)kBodyStainAmtMax /
-                                (depth * (float)std::max(1u, v.scale))));
-      const uint32_t haveMilli = camt * 1000u;
-      // A coat THINNER than one layer's price may still take this layer, at
-      // odds of what it has over what the layer costs -- as a THRESHOLD fixed
-      // per voxel (keyed on its lattice position, not the tick and not the
-      // amount): the voxel goes iff the film on it is heavier than its own
-      // threshold. A per-tick roll only slows a thin film down (it sits there
-      // until it decays and bites eventually anyway), and a roll keyed on the
-      // amount re-rolls every time a second carry lands at a different
-      // amount; both measured about two layers for a splash authored to take
-      // one and a bit. A threshold is monotone -- more acid can only take more
-      // -- so the expected depth is the amount's share of coat.depth, and at a
-      // coarse pitch (one layer thicker than coat.depth) a coat takes the
-      // layer at those odds rather than always or never.
-      if (haveMilli < costMilli &&
-          Hash3(lk ^ ((uint32_t)kp.x * 73856093u) ^
-                    ((uint32_t)kp.y * 19349663u) ^ ((uint32_t)kp.z * 83492791u),
-                0xAC1Du, 0u) % costMilli >= haveMilli)
-        continue;
-      for (uint32_t rj = 0; rj < cg.reactCount; rj++) {
-        const ReactionGpu& r = reactions_[cg.reactOffset + rj];
-        if ((r.packed & 3u) != kReactPair || r.prodNbr == kProdKeep) continue;
-        if (!ReactNbrMatches(r, m, matGpu_)) continue;
-        if (!ReactLightMatches(r, dayPhase_, /*seesSky=*/true, weatherRain_)) continue;
-        // Its own rule-index space (+128), apart from self (+0), inbound
-        // (+64) and douse (+96).
-        const uint32_t rr =
-            Hash3(lk ^ (ck * 374761393u), tick, 128u + rj);
-        if (rr % kReactChanceDen >=
-            RainScaledChance(r.cond, r.chance, weatherRain_, true))
-          continue;
-        applyTo(cell, r.prodNbr, rr);
-        // What is left after paying for this layer, stochastically rounded.
-        const uint32_t leftMilli =
-            haveMilli > costMilli ? haveMilli - costMilli : 0u;
-        const uint32_t left =
-            leftMilli / 1000u +
-            ((Pcg(rr) % 1000u) < leftMilli % 1000u ? 1u : 0u);
-        auto setCoat = [&](size_t wi, uint16_t next) {
-          v.SetStain(wi, next);
-          st.coatTouched = true;
-          changed = true;
-          if (OwnForStain(v, microSet_)) {
-            const IVec3 wp = v.At(wi);
-            MicroBodyPokeStain(*microSet_, (uint32_t)*v.microModel, wp.x, wp.y,
-                               wp.z, next);
-          }
-        };
-        if ((st.idx[cell] & ~kBurnQueued) == 0) {
-          // Eaten. The coat goes where the voxel was: into the lattice
-          // neighbours behind it.
-          if (left) {
-            for (int k = 0; k < 6; k++) {
-              if (ncell[k] == kNoBurnCell) continue;
-              const uint32_t ni = st.idx[ncell[k]] & ~kBurnQueued;
-              if (!ni) continue;
-              const uint16_t cur = v.Stain(ni - 1);
-              const uint16_t next =
-                  RaiseBodyStain(CoatBeneath(cur, cm), cm, left);
-              if (next == cur) continue;
-              const bool was = BodyStainAmt(cur) && corrodes(BodyStainMat(cur));
-              setCoat(ni - 1, next);
-              if (!was) corrodeReached.push_back(ncell[k]);
-            }
-          }
-        } else if (r.prodSelf != kProdKeep) {
-          // Rewritten in place (a solid product) and the rule spent the acid.
-          setCoat(i, left ? PackBodyStain(cm, left) : (uint16_t)0);
-        }
-        fired = true;
-        break;
-      }
-    }
   }
 
   // ---- WHAT A REMOVAL BARES IS BLOODY (materials.json `bareBlood`) --------
@@ -14613,7 +14647,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // The roll is keyed on the BARED voxel's position, never the tick, as
   // coatExposedBone's is: a voxel uncovered again by the next removal beside
   // it must get the same answer, or the mottle crawls as the hole widens.
-  // Run AFTER the loop so it lands over the acid section 3 just carried onto
+  // Run AFTER the loop so it lands over the acid section 0 (clause 7) just carried onto
   // that bone: bone is what acid cannot eat, so the acid there had nothing
   // left to do but glow and dry off -- and take the blood with it.
   const uint32_t bareAmt =
@@ -17601,7 +17635,7 @@ bool MobSystem::StainOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
     } else {
       // Accumulates when the material matches: three splashes of blood
       // saturate; a different substance replaces only if heavier.
-      const uint16_t base = CoatBeneath(cur, c.mat);
+      const uint16_t base = cur;  // precedence: RaiseBodyStain
       const uint32_t a = BodyStainAmt(base);
       const uint32_t want = BodyStainMat(base) == c.mat || a == 0
                                 ? std::min(kBodyStainAmtMax, a + c.amount)
@@ -17807,7 +17841,7 @@ bool MobSystem::SplatterView(const SplatterEvent& e, BurnLimbView& v,
     };
     auto mark = [&](size_t vi, uint32_t amt) {
       const uint16_t cur = v.Stain(vi);
-      const uint16_t base = splashWashes ? cur : CoatBeneath(cur, e.mat);
+      const uint16_t base = cur;  // precedence: RaiseBodyStain / WashBodyStain
       const uint32_t a = BodyStainAmt(base);
       // Accumulates when the material matches: three splashes saturate; a
       // different substance replaces only if heavier. A WASHING splash (water
@@ -21253,20 +21287,6 @@ uint32_t MobSystem::ShedCoatOn(uint64_t mobId, int footLimb, Vec3 footPosVox,
   return 0;
 }
 
-uint16_t MobSystem::CoatBeneath(uint16_t cur, uint32_t mat) const {
-  auto corrodes = [&](uint32_t m) {
-    return m < matCorrodes_.size() && matCorrodes_[m] != 0;
-  };
-  auto washes = [&](uint32_t m) {
-    return m < matGpu_.size() && (matGpu_[m].stainPack & kStainPackWashesBit);
-  };
-  if (BodyStainAmt(cur) == 0) return cur;
-  const uint32_t under = BodyStainMat(cur);
-  if (corrodes(mat) && !corrodes(under)) return 0;
-  if (washes(under) && !washes(mat)) return 0;
-  return cur;
-}
-
 uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
                              uint32_t amount, uint32_t tick) {
   Mob* mob = nullptr;
@@ -21288,7 +21308,7 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
   // whole lattice (the interior is never seen, so it costs nothing), but a
   // coat that eats would then eat from the inside out and a whole limb would
   // go in a few seconds; acid has to earn its depth voxel by voxel from the
-  // outside (BurnOneLimb section 3 carries it inward as it eats).
+  // outside (BurnOneLimb section 0, clause 7, carries it inward as it eats).
   // A FUEL coat (oil) too: soaked through, a whole limb would flash over from
   // the inside the moment one voxel caught.
   const bool surfaceOnly =
@@ -21320,7 +21340,7 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
     // what it cleans is left wet (bodystain.h WashBodyStain).
     const uint16_t next =
         washes ? WashBodyStain(cur, mat, amount, std::min(kBodyStainAmtMax, amount * 2u))
-               : RaiseBodyStain(CoatBeneath(cur, mat), mat, amount);
+               : RaiseBodyStain(cur, mat, amount);
     if (next == cur) continue;
     v.SetStain(i, next);
     marked++;
@@ -21516,7 +21536,7 @@ uint32_t MobSystem::PourOnBody(uint64_t mobId, const BodyRayHit& hit, Vec3 rd,
     const uint16_t cur = v.Stain(c.idx);
     const uint16_t next =
         washes ? WashBodyStain(cur, mat, amount, amount)
-               : AddBodyStain(CoatBeneath(cur, mat), mat, amount, kBodyStainAmtMax);
+               : AddBodyStain(cur, mat, amount, kBodyStainAmtMax);
     touched[c.limb] = 1;
     if (next == cur) continue;
     v.SetStain(c.idx, next);

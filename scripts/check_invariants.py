@@ -2338,7 +2338,74 @@ def check_coat_flame():
                             f"common.wgsl's {m.group(1)}")
 
 
+# --------------------------------------- the coat rule + stain precedence
+# assets/shaders/sim_step.wgsl (coatrule) and common.wgsl (stainprec)  <->
+# src/sim/coatrule.h (both tags). rule-unification W2-J2: DESIGN.md §6 "A coat
+# is a co-located virtual neighbour" is one rule for the grid and every body,
+# and ONE precedence decides which of two stains owns a voxel on the ground and
+# on a body. The pure arithmetic of both is written once per language and
+# compared here; a drift is a wet body that burns while the wet grass beside it
+# does not, or blood that paints a body where it would never paint the ground.
+_COATRULE_NAMES = {
+    "COAT_VERDICT_MATCH": "kCoatVerdictMatch",
+    "COAT_VERDICT_COVERS": "kCoatVerdictCovers",
+}
+_STAINPREC_NAMES = {
+    "STAIN_PREC_REFUSE": "kStainPrecRefuse", "STAIN_PREC_OWN": "kStainPrecOwn",
+    "STAIN_PREC_RINSE": "kStainPrecRinse", "STAIN_PREC_OVER": "kStainPrecOver",
+}
+
+
+def _check_mirror_pair(label, tag, wgsl_path, names):
+    wgsl, hpp = read(wgsl_path), read("src/sim/coatrule.h")
+    if not wgsl or not hpp:
+        problems.append(f"{label}: {wgsl_path} or src/sim/coatrule.h not found")
+        return
+    checked.append(label)
+    a, b = _mirror_blocks(wgsl, tag), _mirror_blocks(hpp, tag)
+    if len(a) != 1 or len(b) != 1:
+        problems.append(
+            f"{label}: expected exactly one `MIRROR-BEGIN {tag}` block in "
+            f"{wgsl_path} (found {len(a)}) and in coatrule.h (found {len(b)})")
+        return
+    ta = [names.get(t, t) for t in _normalise(a[0], True, {})]
+    tb = _normalise(b[0], False, {})
+    if ta != tb:
+        i = 0
+        while i < min(len(ta), len(tb)) and ta[i] == tb[i]:
+            i += 1
+        lo = max(0, i - 6)
+        problems.append(
+            f"{label}: {wgsl_path} and coatrule.h `{tag}` diverge at token {i} "
+            f"(of {len(ta)}/{len(tb)}) -- the grid and the bodies no longer "
+            "apply the same rule.\n"
+            f"      wgsl: ...{' '.join(ta[lo:i + 8])}\n"
+            f"      cpp : ...{' '.join(tb[lo:i + 8])}")
+    for w, c in names.items():
+        mw = re.search(r"const\s+" + w + r"\s*:\s*u32\s*=\s*(\d+)u?\s*;", wgsl)
+        mc = re.search(r"\b" + c + r"\s*=\s*(\d+)u?\b", hpp)
+        if not mw or not mc:
+            problems.append(f"{label}: cannot read {w} ({wgsl_path}) or {c} "
+                            "(coatrule.h)")
+            continue
+        if int(mw.group(1)) != int(mc.group(1)):
+            problems.append(f"{label}: {w} = {mw.group(1)} in {wgsl_path} but "
+                            f"{c} = {mc.group(1)} in coatrule.h")
+
+
+def check_coat_rule():
+    _check_mirror_pair("coat rule", "coatrule", "assets/shaders/sim_step.wgsl",
+                       _COATRULE_NAMES)
+
+
+def check_stain_prec():
+    _check_mirror_pair("stain precedence", "stainprec",
+                       "assets/shaders/common.wgsl", _STAINPREC_NAMES)
+
+
 ALL = {
+    "coatrule": check_coat_rule,
+    "stainprec": check_stain_prec,
     "coatflame": check_coat_flame,
     "reactgate": check_react_gate,
     "scoop": check_scoop_ledger,
@@ -2415,7 +2482,9 @@ RELEVANT = {
     "tests/env_predictions.json": ["envpred"],
     "scripts/test_environment.mjs": ["envpred"],
     "src/sim/materials.h": ["reactgate", "coatflame"],
-    "assets/shaders/sim_step.wgsl": ["coatflame"],
+    "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule"],
+    "assets/shaders/common.wgsl": ["stainprec"],
+    "src/sim/coatrule.h": ["coatrule", "stainprec"],
     "src/sim/reactcpu.h": ["reactgate"],
 }
 

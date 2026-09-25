@@ -9,7 +9,9 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -21,6 +23,7 @@
 #include "net/debrissync.h"
 #include "phys/marching_cubes.h"
 #include "sim/bytestream.h"  // ByteReader, for the wire-record round trip
+#include "sim/weather.h"     // SetOverride (coat-parity: clear sky)
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -739,6 +742,230 @@ Status GateDebrisCoat(Ctx& c, std::string& detail) {
   detail = buf;
   std::printf("debris-coat: %s (%s)\n", ok ? "PASS" : "FAIL", buf);
   debris.Reset();
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- coat-parity (rule-unification W2-J2, 2026-09-24) ----------------------
+// ONE COAT RULE, TWO POPULATIONS. DESIGN.md §6 "A coat is a co-located virtual
+// neighbour" is implemented twice -- sim_step.wgsl coatReact for the grid and
+// MobSystem::BurnOneLimb for every body -- with the arithmetic shared through
+// sim/coatrule.h. This runs the SAME scenario on both, at the same pitch (a
+// loose body at scale 1 is a lattice of world voxels, so clause 4a's widening
+// and clause 7's depth are off on both sides), and asserts the same OUTCOME
+// CLASS, not the same numbers: the two evaluators roll different streams.
+//
+//   OIL    ember | dirt wearing oil (6)     -> the coat is PARTLY spent (a level
+//                                             a flash) and the dirt is still dirt
+//   WET    ember | grass wearing water (12) -> the coat is PARTLY spent (boils a
+//                                             level at a time) and the grass has
+//                                             NOT caught (covered)
+//   INERT  stone | dirt wearing oil (6)     -> nothing happens (no partner)
+//
+// Grid: each arm is a row of kLen cells beside a row of its heat, on a stone
+// slab in open air. Body: each arm is one loose body, the heat row and the
+// coated row side by side in one lattice, on its own stone pad. Weather
+// pinned clear (oil's rule is rain-damped). Measured after kTicks, inside the
+// window before a resting body settles back into the grid.
+Status GateCoatParity(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  Physics& phys = c.phys;
+  DebrisSystem& debris = c.debris;
+  auto matId = [&](const char* n) -> uint32_t {
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
+  const uint32_t mDirt = matId("dirt"), mGrass = matId("grass"),
+                 mEmber = matId("ember"), mStone = matId("stone"),
+                 mOil = matId("oil"), mWater = matId("water");
+  if (!mDirt || !mGrass || !mEmber || !mStone || !mOil || !mWater) {
+    detail = "dirt/grass/ember/stone/oil/water missing from materials.json";
+    return Status::Fail;
+  }
+  const uint32_t oilType = c.mats[mOil].gpu.stainPack & kStainPackTypeMask;
+  const uint32_t wetType = c.mats[mWater].gpu.stainPack & kStainPackTypeMask;
+  if (!oilType || !wetType) {
+    detail = "oil or water has no ground stain type";
+    return Status::Fail;
+  }
+  const std::string prevPin = weather::Override();
+  weather::SetOverride("clear");
+  weather::Snap();
+  c.mobs.SetWeatherRain(0u);
+  debris.Reset();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  enum { kOilArm, kWetArm, kInertArm, kArms };
+  struct Arm {
+    const char* name;
+    uint32_t heat, subj, coat, stainType, amt;
+  };
+  const Arm arms[kArms] = {
+      {"oil", mEmber, mDirt, mOil, oilType, 6u},
+      {"wet", mEmber, mGrass, mWater, wetType, 12u},
+      {"inert", mStone, mDirt, mOil, oilType, 6u}};
+  const int kLen = 8;
+  const uint32_t kTicks = (uint32_t)BaselineNumber("coatParityTicks", 30.0);
+
+  // ---- the grid half: rows on one slab (stain-react's layout) ------------
+  const int gx0 = 150, gz0 = 200, kPitch = 5;
+  const int gy = FixtureYOver(gx0 - 3, gz0 - 3, gx0 + kLen + 3,
+                              gz0 + kPitch * kArms + 3, kDefaultSeed, 24);
+  std::map<std::tuple<int, int, int>, uint32_t> cells;
+  for (int x = gx0 - 3; x <= gx0 + kLen + 2; x++)
+    for (int z = gz0 - 3; z <= gz0 + kPitch * kArms + 2; z++) {
+      cells[{x, gy - 1, z}] = mStone;
+      for (int yy = gy; yy <= gy + 5; yy++) cells[{x, yy, z}] = 0;
+    }
+  for (int a = 0; a < kArms; a++) {
+    const int hz = gz0 + a * kPitch;
+    for (int x = gx0; x < gx0 + kLen; x++) {
+      cells[{x, gy, hz - 1}] = mStone;  // back wall
+      cells[{x, gy, hz}] = arms[a].heat;
+      cells[{x, gy, hz + 1}] =
+          arms[a].subj | PackStain(arms[a].stainType, arms[a].amt);
+      cells[{x, gy, hz + 2}] = mStone;  // guard: dirt cannot slide off
+    }
+    for (int dz = -1; dz <= 2; dz++) {
+      cells[{gx0 - 1, gy, hz + dz}] = mStone;
+      cells[{gx0 + kLen, gy, hz + dz}] = mStone;
+    }
+  }
+  std::vector<CellOp> scene;
+  std::map<uint32_t, std::vector<uint32_t>> chunkBuf;
+  for (const auto& [p, wd] : cells) {
+    const uint32_t ci = World::SlotCellIndex(
+        {std::get<0>(p), std::get<1>(p), std::get<2>(p)});
+    scene.push_back({ci, wd});
+    chunkBuf[ci / kChunkVol];
+  }
+
+  // ---- the body half: one loose body per arm, on its own pad -------------
+  std::vector<float> dens;
+  for (const auto& m : c.mats) dens.push_back((float)m.gpu.density);
+  const int bz = 96, bx[kArms] = {72, 96, 120};
+  int padY[kArms];
+  for (int a = 0; a < kArms; a++) {
+    padY[a] = World::TerrainHeight(bx[a], bz, kDefaultSeed) + 2;
+    for (int dz = -4; dz <= 4; dz++)
+      for (int dx = -6; dx <= 6; dx++)
+        for (int y = padY[a] - 3; y <= padY[a]; y++)
+          scene.push_back({World::SlotCellIndex({bx[a] + dx, y, bz + dz}),
+                           (uint32_t)kMatStone});
+  }
+  uint32_t t = 13000;
+  const IVec3 pc{gx0 >> 4, gy >> 4, gz0 >> 4};
+  SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, scene, false, pc, true,
+             false, {});
+  ctx.WaitIdle();
+  ctx.ProcessEvents();
+  for (int a = 0; a < kArms; a++) {
+    std::vector<DebrisVoxel> vox;
+    for (int x = 0; x < kLen; x++) {
+      vox.push_back({(int8_t)x, 0, 0, 0, (uint16_t)arms[a].heat});
+      DebrisVoxel s{(int8_t)x, 0, 1, 0, (uint16_t)arms[a].subj};
+      s.stain = PackBodyStain(arms[a].coat, arms[a].amt);
+      vox.push_back(s);
+    }
+    const IVec3 at{bx[a] - kLen / 2, padY[a] + 1, bz};
+    const uint64_t h = phys.CreateDebrisBody(vox, at, dens);
+    BodyTransform xf{};
+    xf.pos = Vec3{(float)at.x, (float)at.y, (float)at.z};
+    xf.quat[3] = 1;
+    debris.AdoptBody(h, vox, xf);
+  }
+  for (uint32_t i = 0; i < kTicks; i++) {
+    std::vector<CellOp> cellOps;
+    std::vector<ParticleSpawn> spawns;
+    debris.PreTick(t + 1, world, cellOps, spawns);
+    ++t;
+    SubmitTick(ctx, world, sim, t, kDefaultSeed, {}, {}, cellOps, false, pc,
+               true, true, spawns);
+    ctx.WaitIdle();
+    ctx.ProcessEvents();
+    phys.Step(kTickDt);
+    debris.PostStep();
+  }
+
+  // ---- read both halves ----------------------------------------------------
+  for (auto& [slot, buf] : chunkBuf) {
+    buf.resize(kChunkVol);
+    ReadVoxelsSync(ctx, world, slot, 1, buf.data(), "coatParity");
+  }
+  auto at = [&](int x, int yy, int z) -> uint32_t {
+    const uint32_t ci = World::SlotCellIndex({x, yy, z});
+    auto it = chunkBuf.find(ci / kChunkVol);
+    return it == chunkBuf.end() ? 0u : it->second[ci % kChunkVol];
+  };
+  struct Outcome {
+    uint32_t levels = 0, subj = 0;
+    bool found = true;
+    bool Spent(const Arm& a) const { return levels < a.amt * (uint32_t)kLen; }
+    bool Kept() const { return subj == (uint32_t)kLen; }
+  };
+  Outcome grid[kArms], body[kArms];
+  for (int a = 0; a < kArms; a++) {
+    const int hz = gz0 + a * kPitch;
+    for (int x = gx0; x < gx0 + kLen; x++) {
+      const uint32_t w = at(x, gy, hz + 1);
+      if ((w & 0xFFFu) == arms[a].subj) grid[a].subj++;
+      if (VoxStainType(w) == arms[a].stainType) grid[a].levels += VoxStainAmt(w);
+    }
+    body[a].found = false;
+  }
+  for (uint32_t i = 0; i < debris.BodyCount(); i++) {
+    const Vec3 pos = debris.BodyPosition(i);
+    for (int a = 0; a < kArms; a++) {
+      if (std::fabs(pos.x - (float)bx[a]) > 8.0f) continue;
+      body[a].found = true;
+      body[a].subj += debris.BodyMaterialCount(i, arms[a].subj);
+      body[a].levels += debris.BodyCoatLevels(i, arms[a].coat);
+    }
+  }
+  debris.Reset();
+  weather::SetOverride(prevPin);
+  weather::Snap();
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  // The expected class per arm, and each population's.
+  // "partly" vs "gone" is what makes the oil arm falsifiable: the body's old
+  // fuel section spent a coat WHOLE per flash (and the wet one boiled at its
+  // own clock), so beside a steady ember the body's oil was gone in a few
+  // ticks while the grid's, a level a flash, was not.
+  auto cls = [&](int a, const Outcome& o) -> std::string {
+    if (!o.found) return "missing";
+    const char* s = !o.Spent(arms[a]) ? "unspent" : o.levels ? "partly" : "gone";
+    return std::string(s) + "/" + (o.Kept() ? "kept" : "changed");
+  };
+  const char* want[kArms] = {"partly/kept", "partly/kept", "unspent/kept"};
+  bool ok = true;
+  std::string out;
+  for (int a = 0; a < kArms; a++) {
+    const std::string g = cls(a, grid[a]), b = cls(a, body[a]);
+    const bool armOk = g == want[a] && b == want[a];
+    ok = ok && armOk;
+    char buf[256];
+    std::snprintf(buf, sizeof buf,
+                  "%s%s: grid %s (levels %u/%u, subject %u/%d) body %s (levels "
+                  "%u/%u, subject %u/%d) want %s%s",
+                  a ? " | " : "", arms[a].name, g.c_str(), grid[a].levels,
+                  arms[a].amt * (uint32_t)kLen, grid[a].subj, kLen, b.c_str(),
+                  body[a].levels, arms[a].amt * (uint32_t)kLen, body[a].subj,
+                  kLen, want[a], armOk ? "" : " FAIL");
+    out += buf;
+    RecordObserved((std::string("coatParity.") + arms[a].name + ".gridLevels").c_str(),
+                   (double)grid[a].levels);
+    RecordObserved((std::string("coatParity.") + arms[a].name + ".bodyLevels").c_str(),
+                   (double)body[a].levels);
+  }
+  char head[64];
+  std::snprintf(head, sizeof head, "after %u ticks: ", kTicks);
+  detail = head + out;
+  std::printf("coat-parity: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -1929,6 +2156,7 @@ const std::vector<Gate>& BodyGates() {
       {"debris", "phys", {}, false, GateDebris},
       {"settle-back", "phys", {}, false, GateSettleBack},
       {"debris-coat", "phys", {}, false, GateDebrisCoat},
+      {"coat-parity", "phys", {}, false, GateCoatParity},
       {"player-body", "phys", {}, false, GatePlayerBody},
       {"ragdoll-joints", "phys", {}, false, GateRagdollJoints},
       {"body-fastfall", "phys", {}, false, GateBodyFastFall},

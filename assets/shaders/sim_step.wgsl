@@ -1125,8 +1125,8 @@ fn scaledChance(rule : Reaction, c : vec3<i32>, coat : u32, covered : bool) -> u
   if ((rule.cond & RSCALE_ON) == 0u) { return rule.chance; }
   let invert = (rule.cond & RSCALE_INVERT) != 0u;
 
-  var count = 0u;
-  if (!invert && coat != 0u && nbrMatches(rule, coat, materials[coat])) { count = 1u; }
+  let coatHit = !invert && coat != 0u && nbrMatches(rule, coat, materials[coat]);
+  var count = 0u;  // matching FACES; the coat is added by coatRampCount below
   for (var i = 0u; i < 6u && !covered; i++) {
     let n = c + faceDir(i);
     // Out-of-window space is solid and inert, and reads as "not the counted
@@ -1154,7 +1154,10 @@ fn scaledChance(rule : Reaction, c : vec3<i32>, coat : u32, covered : bool) -> u
     }
     if (hit != invert) { count++; }
   }
-  count = min(count, 6u);
+  // The coat as one more neighbour, capped at 6 (rule 4). The grid is at
+  // world pitch, so clause 4a's widening is off (pitchFine false): a body
+  // calls the same function with its lattice pitch (src/sim/coatrule.h).
+  count = coatRampCount(count, coatHit, false);
   // Hard gate: below the minimum count there is no frontier, so no reaction.
   // minCount defaults to 1 (any matching neighbour will do), which is the
   // freezing case. Evaporation raises it so that a water voxel with a couple
@@ -1267,10 +1270,43 @@ const COAT_ROLL_SALT : u32 = 0xC0A7F11Au;
 // here, not in common.wgsl: this kernel is its only reader.
 const MATF_FLAME : u32 = 64u;
 
+// ---- THE COAT RULE'S ARITHMETIC, shared with the body (W2-J2) --------------
+// Token for token the MIRROR block of the same tag in src/sim/coatrule.h,
+// which MobSystem::BurnOneLimb calls for every body; scripts/
+// check_invariants.py `coatrule` compares the two streams and the constants.
+// Declared here, not in common.wgsl: this kernel is the only WGSL reader.
+const COAT_VERDICT_MATCH : u32 = 1u;
+const COAT_VERDICT_COVERS : u32 = 2u;
+// MIRROR-BEGIN coatrule
+fn coatRuleVerdict(flame : bool, openFace : bool) -> u32 {
+  if (flame && !openFace) { return 0u; }
+  if (flame) { return COAT_VERDICT_MATCH; }
+  return COAT_VERDICT_MATCH | COAT_VERDICT_COVERS;
+}
+fn coatLevelsAfter(amt : u32, price : u32) -> u32 {
+  if (amt > price) { return amt - price; }
+  return 0u;
+}
+fn coatRampCount(faces : u32, coatHit : bool, pitchFine : bool) -> u32 {
+  if (!coatHit) { return min(faces, 6u); }
+  var n = min(faces + 1u, 6u);
+  if (pitchFine) { n = max(n, 5u); }
+  return n;
+}
+// MIRROR-END coatrule
+
 // The material of the cell's COAT, or 0 if its stain is not one (rule 0).
 fn coatMatOf(w : u32, sub : Material) -> u32 {
   if (!voxStained(w) || !matAbsorbs(sub)) { return 0u; }
   return materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu;
+}
+
+// Is the stain ALREADY on word `w` a washer's (stainStep's `curWashes`, the
+// W2-J2 precedence rule)? The same lines as sim_fluid_seam.wgsl's copy:
+// materials[] is a per-shader binding, so common.wgsl cannot hold them.
+fn stainWordWashes(w : u32) -> bool {
+  if (!voxStained(w)) { return false; }
+  return matWashes(materials[materials[STAIN_PALETTE_BASE + voxStainType(w)]._r3 & 0xFFFu]);
 }
 
 fn isFlame(prod : u32) -> bool {
@@ -1317,9 +1353,9 @@ fn coatRelease(c : vec3<i32>, face : u32, prod : u32, rr : u32, stamp : u32) {
 // this is no longer load-bearing; kept, because a spend is not a move.)
 fn coatSpend(c : vec3<i32>, idx : u32, w : u32, stamp : u32) -> u32 {
   _ = stamp;
-  let amt = voxStainAmt(w);
+  let left = coatLevelsAfter(voxStainAmt(w), 1u);
   var nw = packVox(voxMat(w), voxState(w), STAMP_NEVER);
-  if (amt > 1u) { nw = nw | packStain(voxStainType(w), amt - 1u); }
+  if (left > 0u) { nw = nw | packStain(voxStainType(w), left); }
   voxStore(idx, nw);
   markVoxActive(idx);
   markDirtyR(c, DIRTY_R_REACTW);
@@ -1340,7 +1376,13 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     let rr = hash3(rnd ^ COAT_ROLL_SALT, ri, slotIdx);  // SLOT index
     let rot = rr >> 12u;
     let dmask = (rule.packed >> 2u) & 7u;
-    // Partner: the six faces, then the cell's own material (k == 6u).
+    // Partner: the cell's own material FIRST (pk == 6u; clause 1a -- the coat
+    // touches what it is ON before what is beside it), then the six faces.
+    // (W2-J2 moved the cell ahead of the faces for the body's sake, where a
+    // coat on skin must bite the skin, not the flesh beside it. On the grid
+    // the order is not observable today: no ground coat material has a rule
+    // that rewrites its partner, so which matching partner is taken changes
+    // no write -- and the rolls are per rule, not per partner.)
     var pk = 7u;
     var pmat = 0u;
     var pni = 0u;
@@ -1350,8 +1392,8 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       var nm = mat;
       var nidx = idx;
       var syn = false;
-      if (k < 6u) {
-        di = (k + rot) % 6u;
+      if (k > 0u) {
+        di = (k - 1u + rot) % 6u;
         if ((faceDirBit(di) & dmask) == 0u) { continue; }
         let n = c + faceDir(di);
         if (!inBounds(n)) { continue; }
@@ -1380,10 +1422,13 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     if (flame) {
       let avoid = select(6u, pk, rule.prodNbr != PROD_KEEP);
       rf = coatReleaseFace(c, dmask, rot, avoid);
-      if (rf == 6u) { continue; }  // a flame with nowhere to go: not a match
     }
+    // Rules 2-3 (coatRuleVerdict, mirrored in src/sim/coatrule.h): a flame
+    // with nowhere to go is not a match; a non-flame match covers the cell.
+    let verdict = coatRuleVerdict(flame, rf < 6u);
+    if ((verdict & COAT_VERDICT_MATCH) == 0u) { continue; }
     keepAwake = keepAwake || (rule.cond & RCOND_GATES) == 0u;
-    covered = covered || !flame;
+    covered = covered || (verdict & COAT_VERDICT_COVERS) != 0u;
     if (probe || (rr % REACT_CHANCE_DEN) >= rainChance(rule, c, rule.chance)) { continue; }
     // ---- FIRED ----
     if (rf < 6u) { coatRelease(c, rf, rule.prodSelf, rr, stamp); }
@@ -1585,7 +1630,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         let flame = isFlame(rule.prodNbr);
         var rf = 6u;
         if (flame) { rf = coatReleaseFace(c, dmask, rot, 6u); }
-        if (!flame || rf < 6u) {
+        if ((coatRuleVerdict(flame, rf < 6u) & COAT_VERDICT_MATCH) != 0u) {
           keepAwake = keepAwake || !lightGated;
           if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
             if (rf < 6u) { coatRelease(c, rf, rule.prodNbr, rr, stamp); }
@@ -1731,7 +1776,7 @@ fn doStaining(c : vec3<i32>, idx : u32, selfWord : u32, m : Material,
     // whether the contact must be PAID for. What stays here is this kernel's
     // own half: the roll, the write, the spend in fullness eighths, and the
     // consumption of the marked voxel.
-    let d = stainStep(stainType, addAmt, washes, nw, materials[nmat]);
+    let d = stainStep(stainType, addAmt, washes, nw, materials[nmat], stainWordWashes(nw));
     if ((d.y & STAIN_WORK) == 0u) { continue; }
     progress = true;
     if (!fires) { break; }  // work remains, but not this tick

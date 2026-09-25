@@ -197,8 +197,12 @@ fn matStains(m : Material) -> bool { return (m.stainPack & 0x7u) != 0u; }
 // stainer on this neighbour; the word comes back unchanged.
 //
 // THE ORDER, and it is the termination argument (rule 2; see doStaining's
-// sleep notes): a FOREIGN stain (non-zero amount, other type) is work only for
-// a washer, which steps it DOWN one level, clearing the type with the last; a
+// sleep notes): who owns a cell is stainPrecedence's (below). A FOREIGN stain
+// (non-zero amount, other type) is work for a washer, which steps it DOWN one
+// level, clearing the type with the last -- and, since W2-J2, for a stainer
+// arriving on a washer's wetness on ABSORBENT ground, which displaces it at
+// one level it pays for (an eighth of itself), so a wet/stain cycle there
+// drains the liquids and ends. A free mark (capacity 0) never displaces. A
 // clean cell or one carrying this stain climbs toward
 // ceiling = min(sAmt, max(capacity, 1)). On ABSORBENT ground (capacity > 0)
 // the climb is one level per contact and every level is paid for (STAIN_SPEND);
@@ -208,8 +212,40 @@ fn matStains(m : Material) -> bool { return (m.stainPack & 0x7u) != 0u; }
 const STAIN_WORK  : u32 = 1u;  // the neighbour takes this write (it has work left)
 const STAIN_WASH  : u32 = 2u;  // ...and it is a rinse: no spend, no consume roll
 const STAIN_SPEND : u32 = 4u;  // ...and it deepened absorbent ground: pay one eighth
+// ---- ONE STAIN PRECEDENCE, ground and body (rule-unification W2-J2) --------
+// Which of two stains owns a voxel. Token for token the MIRROR block of the
+// same tag in src/sim/coatrule.h, which every body-coat writer applies
+// (phys/bodystain.cpp RaiseBodyStain / AddBodyStain); scripts/
+// check_invariants.py `stainprec` compares the streams and the constants.
+// Clean or the same stain: climb. A washer on a foreign stain: rinse it down.
+// Anything else on a foreign stain: displace it only if strictly heavier, or
+// -- with a PAID level -- if it outranks it by class (corrosive over not;
+// anything over a washer's wetness). The ground lays ONE level a step, so the
+// weight clause never fires here; it pays only on absorbent ground, so a free
+// mark on stone still never paints over a foreign one (the 2026-09-23 cycle
+// fix), while blood or oil reaching WET absorbent ground displaces the wet
+// and pays an eighth of itself for it -- a re-wet / re-stain cycle there
+// drains both liquids and ends (mass, as for the coat rule).
+const STAIN_PREC_REFUSE : u32 = 0u;
+const STAIN_PREC_OWN    : u32 = 1u;
+const STAIN_PREC_RINSE  : u32 = 2u;
+const STAIN_PREC_OVER   : u32 = 3u;
+// MIRROR-BEGIN stainprec
+fn stainPrecedence(curAmt : u32, sameType : bool, newAmt : u32, washes : bool,
+                   curWashes : bool, corrodes : bool, curCorrodes : bool, paid : bool) -> u32 {
+  if (curAmt == 0u || sameType) { return STAIN_PREC_OWN; }
+  if (washes) { return STAIN_PREC_RINSE; }
+  if (newAmt > curAmt) { return STAIN_PREC_OVER; }
+  if (paid && corrodes && !curCorrodes) { return STAIN_PREC_OVER; }
+  if (paid && curWashes) { return STAIN_PREC_OVER; }
+  return STAIN_PREC_REFUSE;
+}
+// MIRROR-END stainprec
+// `curWashes`: the stain ALREADY on the neighbour is a washer's (its type's
+// material has `washes`). The caller reads it off the stain palette's `_r3`
+// (materials[] is a per-shader binding), 0 type = false.
 fn stainStep(sType : u32, sAmt : u32, washes : bool, nw : u32,
-             nm : Material) -> vec2<u32> {
+             nm : Material, curWashes : bool) -> vec2<u32> {
   if (sType == 0u || sAmt == 0u || voxMat(nw) == MAT_AIR) {
     return vec2<u32>(nw, 0u);
   }
@@ -219,14 +255,24 @@ fn stainStep(sType : u32, sAmt : u32, washes : bool, nw : u32,
   }
   let cur = voxStainAmt(nw);
   let curType = voxStainType(nw);
-  if (cur != 0u && curType != sType) {
-    if (!washes) { return vec2<u32>(nw, 0u); }   // not ours to touch
+  let capacity = matAbsorbCapacity(nm);
+  // No corrosive stain reaches the ground (a corrosive coat is `bodyOnly`),
+  // so both class bits are false here; ONE level per step (newAmt 1u).
+  let prec = stainPrecedence(cur, curType == sType, 1u, washes, curWashes,
+                             false, false, capacity > 0u);
+  if (prec == STAIN_PREC_REFUSE) { return vec2<u32>(nw, 0u); }  // not ours to touch
+  if (prec == STAIN_PREC_RINSE) {
     let washed = cur - 1u;
     return vec2<u32>((nw & ~STAIN_BITS) |
                          packStain(select(curType, 0u, washed == 0u), washed),
                      STAIN_WORK | STAIN_WASH);
   }
-  let capacity = matAbsorbCapacity(nm);
+  if (prec == STAIN_PREC_OVER) {
+    // Displaced: this stain takes the cell at one PAID level (capacity > 0 is
+    // what let it through), exactly as a clean absorbent cell starts.
+    return vec2<u32>((nw & ~STAIN_BITS) | packStain(sType, 1u),
+                     STAIN_WORK | STAIN_SPEND);
+  }
   let ceiling = min(sAmt, max(capacity, 1u));
   // `cur < ceiling` for our own type; a stale type at amount 0 is clean.
   if (curType == sType && cur >= ceiling) { return vec2<u32>(nw, 0u); }

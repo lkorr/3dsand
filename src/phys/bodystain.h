@@ -48,11 +48,36 @@ struct StainLattice {
   }
 };
 
+// ---- WHICH OF TWO COATS OWNS A VOXEL (rule-unification W2-J2) ------------
+//
+// ONE precedence rule for the ground and the body: sim/coatrule.h
+// stainPrecedence, whose WGSL twin common.wgsl stainStep calls (the
+// `stainprec` mirror). Clean or the same coat: climb. A washer meeting a
+// foreign coat: rinse it down. Anything else meeting a foreign coat: displace
+// it only if strictly heavier, or -- with a PAID level, which every body coat
+// is -- if it outranks it by class: a corrosive coat over one that is not, and
+// anything over a washer's wetness. That is the rule the body used to spell as
+// RaiseBodyStain's "strictly larger" plus MobSystem::CoatBeneath, and the
+// ground as stainStep's "never paint over a foreign stain"; the ground lays one
+// level at a time and pays for it only on absorbent ground, which is why the
+// weight clause never fires there and the class clause fires only where the
+// displacement is paid for in liquid.
+//
+// The CLASS of a coat material is derived data (materials.json `washes`, and
+// "its rules rewrite body matter or it is hot"), published by the owner of the
+// material tables on every load. Legitimately different between the two
+// populations: the ground names a coat by its PALETTE SLOT (3 bits in the
+// voxel word), a body by its MATERIAL id (12 bits in the coat word).
+constexpr uint8_t kBodyCoatWashes = 1u;
+constexpr uint8_t kBodyCoatCorrodes = 2u;
+void SetBodyCoatClasses(std::vector<uint8_t> classes);
+uint32_t BodyCoatClassOf(uint32_t mat);
+
 // Raise a voxel's coat toward `amt` of `mat`: the same material (or a clean
-// voxel) keeps the larger amount; a DIFFERENT material overwrites only with a
-// strictly larger amount, so a splash of blood over a wet patch wins and a
-// splash of water over blood does not repaint it (washing is a separate,
-// subtractive rule). Returns the coat word.
+// voxel) keeps the larger amount; a DIFFERENT material displaces it by the
+// precedence rule above (heavier, or outranking by class), so a splash of blood
+// over a wet patch wins and a splash of water over blood does not repaint it
+// (washing is a separate, subtractive rule). Returns the coat word.
 uint16_t RaiseBodyStain(uint16_t cur, uint32_t mat, uint32_t amt);
 
 // ---- ...AND A WASHING LIQUID ON A BODY ------------------------------------
@@ -77,9 +102,10 @@ uint16_t WashBodyStain(uint16_t cur, uint32_t washMat, uint32_t wetAmt,
 // ACCUMULATES, and asking Raise to express it would peg it at one blow's worth
 // forever however many landed.
 //
-// The cross-material rule is Raise's, unchanged: a different coat already in
-// place is only repainted by a strictly larger amount, so a bruise spreading
-// under blood does not wash the blood off. Returns the coat word; `cur` when
+// The cross-material rule is Raise's (the precedence rule above): a different
+// coat already in place is only repainted by a strictly larger amount or a
+// coat that outranks it, so a bruise spreading under blood does not wash the
+// blood off. Returns the coat word; `cur` when
 // already at or past the cap, which is what makes the ceiling cheap to test.
 uint16_t AddBodyStain(uint16_t cur, uint32_t mat, uint32_t add, uint32_t cap);
 
