@@ -3376,8 +3376,24 @@ hand-written remainder of `LoadTuning` is only what a row cannot state — a
 bound that depends on another field (`zoomMax >= zoomMin`), a reset-to-default,
 an enum gate, the `gore.*Var` variance objects — and the row says so
 (`// + a hand-written rule in LoadTuning`). A knob added in the old style
-(literal initializer, hand `Read*`) still works; `check_invariants.py` asks only
+(literal initializer, hand `Read*`) still works; `check_invariants.py` asks
 that every `tuning.json` key has a reader.
+
+**A row must drive something (2026-09-24).** Because the read is generated, a
+row is always loaded, clamped and shown as a slider whether or not anything
+uses the value — and 21 rows were exactly that: dead sliders. The sweep that
+found them deleted the leftovers (the pre-scattering sky colours
+`render.skyHorizon/skyZenith/sunTint`, `avatar.firstPersonArms`,
+`dayNight.sunPeakElevation`), deleted the never-built promises
+(`avatar.severImpulse`, `sim.waterBodySpreadEnter/Exit`), and wired the rest to
+the code that had been carrying the same numbers as literals all along
+(`debris.*` in `phys/debris.cpp`, `grenade.restitution/friction/waterDrag` in
+`UpdateGrenade`, `tools.brushAirDistance` in `Brush::BuildOp`,
+`render.fogOpticalDepths/fogLerpPerFrame` in the frame loop's adaptive fog).
+`check_invariants.py tuningused` now fails on a row whose field no engine code
+reads and whose `TUNE_*` no shader names; a row read only by an offline tool is
+an explicit, commented `TUNING_CONSUMER_ALLOWLIST` entry
+(`player.halfHeight/eyeOffset`, the figure contract `test_mobgen.mjs` checks).
 
 Two delivery paths, because the values land in two places:
 
@@ -4235,7 +4251,7 @@ neighbors, so this needs an explicit connectivity pass:
   6-connected pieces become one rigid body each (an oak is one shard, a
   redwood three), welded along a spanning tree rooted at the heaviest shard
   with `JointType::Fixed` joints, collisions among them disabled, sharing a
-  `Body::assembly` id. Slivers under `kMinBodyVoxels` crumble as rubble.
+  `Body::assembly` id. Slivers under `debris.minBodyVoxels` crumble as rubble.
   Shards that fit the tick's op budget are made largest-first; the rest stay
   in the grid and are re-derived by the re-queued event. `SettleBodies`
   settles an assembly **as a unit or not at all**: every shard asleep,
@@ -4273,7 +4289,7 @@ neighbors, so this needs an explicit connectivity pass:
   permanent (compound-shape build up front, then broadphase + terrain-mesh
   upkeep every tick until it settles), while loose voxels in the CA are nearly
   free. So bodies are rationed, not granted to every loose component: at most
-  `kMaxNewBodiesPerScan` per island scan and `kMaxNewBodiesPerTick` per tick
+  `kMaxNewBodiesPerScan` per island scan and `debris.maxNewBodiesPerTick` per tick
   across all shatter, with components taken **largest first** so the tree earns
   the body and the twigs fall back to rubble rather than scan order deciding.
   Anything over budget or under the size floor goes back to the grid as rubble
@@ -4390,7 +4406,7 @@ neighbors, so this needs an explicit connectivity pass:
   empty meshes on the last sweep) is the instrument that said so.
 - **Body shatter (2026-08-19, implemented):** when burn removals disconnect a
   body's voxels, `ShatterBody` splits it: the largest 6-connected component
-  keeps the body, fragments ≥ `kMinBurnFragmentVoxels` (24) become bodies of
+  keeps the body, fragments ≥ `debris.minBurnFragmentVoxels` (24) become bodies of
   their own at the same pose with inherited momentum while the per-tick body
   budget allows (parent collider rebuilt immediately so its ghost boxes don't
   fight the new body), and everything else re-enters the world as **ballistic

@@ -245,9 +245,24 @@ constexpr size_t kMaxPendingSupport = 4096;
 // is what made felled wood change material on screen. It is now the body
 // ceiling itself: a scan may fill every free slot, and PostStep's oldest-first
 // despawn is what keeps the population bounded.
-constexpr uint32_t kMinBodyVoxels = 8;               // below this: rubble
+//
+// The numbers are tuning (`debris.*`, tuning_params.def). They were constexprs
+// here until 2026-09-24 while identical `debris.*` rows loaded into nothing;
+// read at use so an F5 reload or a --sweep reaches them. Every one feeds the
+// world hash (what becomes a body, and when a body re-enters the grid).
+static uint32_t MinBodyVoxels() {   // below this: rubble
+  return (uint32_t)std::max(CurrentTuning().debris.minBodyVoxels, 1);
+}
+static uint32_t MaxNewBodiesPerTick() {   // shatter's share, all bodies
+  return (uint32_t)std::max(CurrentTuning().debris.maxNewBodiesPerTick, 1);
+}
+// The body ceiling. kMaxBodies (debris.h) is the CAPACITY the render walks and
+// instance tables are sized for; the knob may only lower it.
+static uint32_t MaxBodies() {
+  return std::min<uint32_t>(
+      (uint32_t)std::max(CurrentTuning().debris.maxBodies, 1), kMaxBodies);
+}
 constexpr uint32_t kMaxNewBodiesPerScan = kMaxBodies;  // only the global cap
-constexpr uint32_t kMaxNewBodiesPerTick = 4;   // shatter's share, all bodies
 
 // Fragments broken off a BURNING body face a much higher bar than a fresh
 // island. A body disintegrating in a fire re-fragments every few ticks, and
@@ -255,7 +270,9 @@ constexpr uint32_t kMaxNewBodiesPerTick = 4;   // shatter's share, all bodies
 // what turned one burning tree into hundreds of tiny bodies chugging the CPU.
 // Charred bits that fall off a burning object are visually just embers, so
 // below this they become ballistic particles and stay in the CA.
-constexpr uint32_t kMinBurnFragmentVoxels = 24;
+static uint32_t MinBurnFragmentVoxels() {
+  return (uint32_t)std::max(CurrentTuning().debris.minBurnFragmentVoxels, 1);
+}
 
 // Body burn budgets: evaluator candidates (front cells, MobSystem::
 // BurnOneLimb) across all non-flesh bodies per tick, grid writes (emitted
@@ -267,7 +284,9 @@ constexpr uint32_t kBurnScanPerTick = 4096;
 // of what is left (BurnBodies, "FAIR SHARE"). 256 keeps a scale-8 finger
 // (a few hundred skin voxels) covered every tick or two even in a crowd.
 constexpr uint32_t kBurnScanMinShare = 256;
-constexpr uint32_t kBurnOpsPerTick = 384;
+static uint32_t BurnOpsPerTick() {   // debris.burnOpsPerTick
+  return (uint32_t)std::max(CurrentTuning().debris.burnOpsPerTick, 0);
+}
 // World cells the evaluator's cheap-gate walk may read across all non-flesh
 // bodies per tick (BurnLimbView::walkBudget). A cell read is ~15 ns, so this
 // is ~1 ms of walk in the worst tick; a body's walk is at most the
@@ -1296,7 +1315,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   curComp = -1;
 
   for (const Comp& cm : comps) {
-    const bool small = cm.complete && cm.cells.size() < kMinBodyVoxels;
+    const bool small = cm.complete && cm.cells.size() < MinBodyVoxels();
     if (!cm.anchored) {
       if (cm.touchedUnfetched) floaters_.deferredUnfetched++;
       else if (cm.heldByEarlier) {}
@@ -1478,7 +1497,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
   uint32_t madeThisScan = 0;
   for (uint32_t ci : order) {
     Comp& comp = comps[ci];
-    if (cellOps.size() + kMinBodyVoxels > kMaxCellOpsPerTick) {
+    if (cellOps.size() + MinBodyVoxels() > kMaxCellOpsPerTick) {
       // The op budget is spent: the region is genuinely re-queued (the event
       // was popped by the caller), and a re-scan re-derives what is left.
       floaters_.deferredCellOpBudget++;
@@ -1486,9 +1505,9 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
       break;
     }
 
-    bool worthBody = comp.cells.size() >= kMinBodyVoxels &&
+    bool worthBody = comp.cells.size() >= MinBodyVoxels() &&
                      madeThisScan < kMaxNewBodiesPerScan &&
-                     bodies_.size() < kMaxBodies;
+                     bodies_.size() < MaxBodies();
     if (!worthBody) {
       // Rubble handoff: too small to read as an object, so it crumbles to
       // individual voxels. It keeps its own material unless the JSON names a
@@ -1581,7 +1600,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     // is three; the int8 body lattice is never exceeded and a felled trunk
     // flexes at the welds as it goes over. Shards that fit this tick's op
     // budget are made now, largest first; the rest stay in the grid and are
-    // re-derived (smaller) by the re-queued event. Under kMinBodyVoxels a
+    // re-derived (smaller) by the re-queued event. Under MinBodyVoxels() a
     // lattice-cut sliver is rubble, exactly as a small component is.
     IVec3 mn{INT32_MAX, INT32_MAX, INT32_MAX}, mx{INT32_MIN, INT32_MIN, INT32_MIN};
     for (const IVec3& c : comp.cells) {
@@ -1661,8 +1680,8 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
     });
     uint32_t bodyShards = 0;
     for (uint32_t s : sorder)
-      if (shards[s].idx.size() >= kMinBodyVoxels) bodyShards++;
-    if (bodies_.size() + bodyShards > kMaxBodies) {
+      if (shards[s].idx.size() >= MinBodyVoxels()) bodyShards++;
+    if (bodies_.size() + bodyShards > MaxBodies()) {
       // Not enough body slots for the assembly: hold the whole component in
       // the grid and come back (PostStep retires the oldest bodies over time;
       // settle-back frees slots as things come to rest).
@@ -1680,7 +1699,7 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         anyDeferred = true;
         continue;
       }
-      if (sh.idx.size() < kMinBodyVoxels) {
+      if (sh.idx.size() < MinBodyVoxels()) {
         // a lattice-cut sliver: rubble, as a small component would be
         for (uint32_t j : sh.idx) {
           const IVec3 c = comp.cells[j];
@@ -2525,8 +2544,11 @@ void DebrisSystem::FloatBodies(uint32_t tick, World& world) {
 
 void DebrisSystem::SettleBodies(uint32_t tick, World& world,
                                 std::vector<CellOp>& cellOps) {
-  constexpr uint32_t kSettleAfterTicks = 60;   // 2 s asleep before converting
-  constexpr float kAlignCos = 0.94f;           // ~20°: snap or stay a body
+  // debris.settleAfterTicks (60 = 2 s asleep before converting) and
+  // debris.alignCos (0.94 = ~20°: snap or stay a body).
+  const uint32_t settleAfterTicks =
+      (uint32_t)std::max(CurrentTuning().debris.settleAfterTicks, 0);
+  const float alignCos = CurrentTuning().debris.alignCos;
 
   // Is this body's rotation within ~20° of some axis permutation? Fills the
   // snapped integer basis when it is.
@@ -2544,7 +2566,7 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
       int best = 0;
       for (int row = 1; row < 3; row++)
         if (std::abs(m[row][col]) > std::abs(m[best][col])) best = row;
-      if (std::abs(m[best][col]) < kAlignCos || rowUsed[best]) return false;
+      if (std::abs(m[best][col]) < alignCos || rowUsed[best]) return false;
       rowUsed[best] = true;
       snap[best][col] = m[best][col] > 0 ? 1 : -1;
     }
@@ -2582,7 +2604,7 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     ++b.inactiveTicks;
     settle_.maxInactiveTicks =
         std::max(settle_.maxInactiveTicks, b.inactiveTicks);
-    if (b.inactiveTicks < kSettleAfterTicks) continue;
+    if (b.inactiveTicks < settleAfterTicks) continue;
     if (b.wound.open) continue;
     if (b.inactiveTicks % 30 != 0) continue;  // re-test alignment cheaply
 
@@ -2612,7 +2634,7 @@ void DebrisSystem::SettleBodies(uint32_t tick, World& world,
     size_t totalOps = 0;
     for (size_t j : group) {
       Body& m = bodies_[j];
-      if (phys_->IsActive(m.handle) || m.inactiveTicks < kSettleAfterTicks ||
+      if (phys_->IsActive(m.handle) || m.inactiveTicks < settleAfterTicks ||
           m.wound.open) {
         ready = false;
         break;
@@ -2955,7 +2977,7 @@ void DebrisSystem::BurnBodies(uint32_t tick, World& world,
   // 2.96 ms. The walk is now paid from kBurnWalkPerTick; a body whose walk
   // does not fit is deferred whole, and the next pass starts with it.
   uint32_t scanBudget = kBurnScanPerTick;
-  uint32_t opsBudget = kBurnOpsPerTick;
+  uint32_t opsBudget = BurnOpsPerTick();
   uint32_t walkBudget = kBurnWalkPerTick;
   uint32_t scanners = (uint32_t)which.size();
   std::vector<FleshBurn> out(which.size());
@@ -2996,7 +3018,7 @@ void DebrisSystem::FinishBurn(const std::vector<size_t>& which,
   // Shared across every body this tick: a forest fire breaks many bodies at
   // once, and each new body is a compound-shape build plus permanent per-tick
   // upkeep. Past the budget, fragments become particles instead.
-  uint32_t newBodyBudget = kMaxNewBodiesPerTick;
+  uint32_t newBodyBudget = MaxNewBodiesPerTick();
   bool rebuiltOne = false;
   // Fragment bodies split off by ShatterBody, appended after the loop (a
   // push_back into bodies_ mid-iteration would invalidate `b`), and bodies
@@ -3064,7 +3086,7 @@ bool DebrisSystem::BurnTail(Body& b, uint32_t removed, bool changed,
                                 (uint32_t)b.voxels.size() / 16u));
       if (b.burnedSinceShatter >= shatterEvery) {
         b.burnedSinceShatter = 0;
-        ShatterBody(b, world, fragments, spawns, kMinBurnFragmentVoxels,
+        ShatterBody(b, world, fragments, spawns, MinBurnFragmentVoxels(),
                     newBodyBudget);
       }
     }
@@ -3343,7 +3365,7 @@ void DebrisSystem::ShatterBody(Body& b, World& world, std::vector<Body>& fragmen
   for (uint32_t c = 0; c < (uint32_t)parts.size(); c++) {
     if (c == keep) continue;
     if (parts[c].size() >= minFragment && budget > 0 &&
-        bodies_.size() + fragments.size() < kMaxBodies) {
+        bodies_.size() + fragments.size() < MaxBodies()) {
       // body-worthy fragment: its own body at the same pose, rebased to its
       // min corner (like SplitBody halves), keeping the parent's momentum
       IVec3 mn{127, 127, 127};
@@ -4070,7 +4092,7 @@ uint64_t DebrisSystem::ApplyBodyAnnounce(const net::BodyAnnounce& a) {
         return have;
       }
   }
-  if (bodies_.size() >= kMaxBodies) return 0;  // the ceiling spawning obeys
+  if (bodies_.size() >= MaxBodies()) return 0;  // the ceiling spawning obeys
   const uint32_t physScale = std::max(1u, a.physScale);
   // allowKinematic = true: this arrives as a ghost and is posed from the wire.
   // Created DYNAMIC (Jolt has no other way in) and flipped below, which is the
@@ -4669,7 +4691,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
 
   // Wholly destroyed, or blown under the body-worthiness floor: the remainder
   // rejoins the world as loose voxels, exactly like the burn dissolve path.
-  if (b.voxels.size() < kMinBodyVoxels) {
+  if (b.voxels.size() < MinBodyVoxels()) {
     VoxelsToParticles(b, b.voxels, lin, ang, world, spawns);
     ReleaseBody(b);
     bodies_[bi] = std::move(bodies_.back());
@@ -4686,7 +4708,7 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   const size_t collBefore = b.voxels.size();
   // fineConnectivity: a CARVE is the one cause whose cut can be narrower than
   // a collider block, so it is the one that may escalate to the skin lattice.
-  ShatterBody(b, world, fragments, spawns, kMinBodyVoxels, newBodyBudget,
+  ShatterBody(b, world, fragments, spawns, MinBodyVoxels(), newBodyBudget,
               /*fineConnectivity=*/true);
 
   // Rebase AFTER shatter (which rebases fragments itself) so the surviving
@@ -5102,7 +5124,7 @@ void DebrisSystem::DamageBodiesRadial(Vec3 centerVoxel, float radiusVoxels,
                                       std::vector<ParticleSpawn>& spawns) {
   if (!phys_ || radiusVoxels <= 0.0f) return;
   std::vector<Body> fragments;
-  uint32_t budget = kMaxNewBodiesPerTick;
+  uint32_t budget = MaxNewBodiesPerTick();
   const float r2 = radiusVoxels * radiusVoxels;
 
   for (size_t bi = 0; bi < bodies_.size();) {
@@ -5175,7 +5197,7 @@ bool DebrisSystem::MeltBodyAt(uint64_t handle, Vec3 pointVoxel,
   const float r2 = radiusVoxels * radiusVoxels;
 
   std::vector<Body> fragments;
-  uint32_t budget = kMaxNewBodiesPerTick;
+  uint32_t budget = MaxNewBodiesPerTick();
   // Same world-space sphere, re-expressed per lattice — see DamageBodiesRadial.
   // A clean bore, so no jitter and nothing keyed on a lattice at all.
   auto carve = [&](float lat) {
@@ -5266,7 +5288,7 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
   }
 
   std::vector<Body> fragments;
-  uint32_t budget = kMaxNewBodiesPerTick;
+  uint32_t budget = MaxNewBodiesPerTick();
   // eject=true, unlike the beam: a blade takes matter OFF and that matter is
   // the gore. The beam vaporizes and is the only carve here that should not.
   DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true,
@@ -5475,7 +5497,7 @@ void DebrisSystem::PulpTick(uint32_t tick, World& world,
     // from what survives, which is the one direction data flows.
     const float authScale = sc;
     std::vector<Body> fragments;
-    uint32_t budget = kMaxNewBodiesPerTick;
+    uint32_t budget = MaxNewBodiesPerTick();
     const bool alive = DamageBody(
         bi, world, spawns, fragments, budget, /*eject=*/true,
         [doomed, key, authScale](float lattice) -> CarveKeep {
@@ -5537,7 +5559,7 @@ bool DebrisSystem::BluntBody(uint64_t handle, Vec3 atVoxel, float radiusVoxels,
   };
 
   std::vector<Body> fragments;
-  uint32_t budget = kMaxNewBodiesPerTick;
+  uint32_t budget = MaxNewBodiesPerTick();
   DamageBody(bi, world, spawns, fragments, budget, /*eject=*/true, carve,
              cause, 1.0f);
   for (Body& f : fragments) {
@@ -6624,7 +6646,7 @@ void DebrisSystem::PostStep() {
     }
   }
   // body budget: oldest bodies despawn first (they are usually settled rubble)
-  while (bodies_.size() > kMaxBodies) {
+  while (bodies_.size() > MaxBodies()) {
     ReleaseBody(bodies_.front());
     bodies_.erase(bodies_.begin());
     instancesDirty_ = true;
@@ -6885,7 +6907,7 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
       RemapPrefabVoxels(skinVoxels, *mr);
       bleedMat = mr->Mat(bleedMat);
     }
-    if (bodies_.size() >= kMaxBodies) break;  // same ceiling spawning obeys
+    if (bodies_.size() >= MaxBodies()) break;  // same ceiling spawning obeys
 
     physScale = std::max(1u, physScale);
     const float pitch = 1.0f / (float)physScale;

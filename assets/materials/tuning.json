@@ -133,10 +133,8 @@
     "airPoseFallSpeed": 9,
     "airPoseLandHeight": 1.1,
     "airPoseLean": 16,
-    "firstPersonArms": true,
     "firstPersonForward": 0.15,
     "footTrim": 0,
-    "severImpulse": 6,
     "respawnDelay": 3,
     "keepKitOnTurn": true
   },
@@ -540,8 +538,6 @@
     "waterBodyMode": 1,
     "waterBodyMinVolume": 65536,
     "waterBodyExitVolume": 32768,
-    "waterBodySpreadEnter": 1,
-    "waterBodySpreadExit": 4,
     "waterBodyQuietTicks": 30,
     "waterBodyMaxCount": 64,
     "waterBodyTestDrain": 0,
@@ -585,16 +581,6 @@
     "windWakeChunks": 96
   },
   "render": {
-    "skyHorizon": [
-      0.72,
-      0.8,
-      0.9
-    ],
-    "skyZenith": [
-      0.25,
-      0.47,
-      0.85
-    ],
     "fluidParticleSize": 0.58,
     "fluidStretch": 0.4,
     "fluidDensityShade": 0.45,
@@ -629,11 +615,6 @@
       1
     ],
     "foamColorVar": 0.18,
-    "sunTint": [
-      1,
-      0.9,
-      0.7
-    ],
     "sunDiscGain": 3,
     "sunDir": [
       0.5,

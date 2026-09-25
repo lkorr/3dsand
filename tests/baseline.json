@@ -358,6 +358,7 @@
   "_waterbody_about": "Thresholds for the `waterbody` gate (docs/PLAN_water_master.md M1). The *TolPct and *Max keys are BOUNDS the gate fails against; the gate also records what it MEASURED through --rebaseline (waterbodyVolErrPct, waterbodyAreaErrPct, waterbodyBowlColumnErrPct, waterbodySurfaceSpread, waterbodyAwakeChunks). As of the M1 landing every measured error is EXACTLY 0.00% \u00e2\u20ac\u201d the analytic container curve reproduces the authored lake's 2,782,656 eighths and 14,493 surface cells cell for cell, and the parabolic bowl's level-walk matches its column-walk at 128,214 cells on a real r54 tarn. The tolerance is 2% rather than 0 because the WORLD is not obliged to stay that way: pond life replaces water cells with kelp and reeds, and a ruin or a cave could intrude. A non-zero number here is not automatically a bug, but it IS a number that wants explaining before M2's ledger is built on the curve.",
   "waterbodyVolTolPct": "2.0",
   "waterbodyAreaTolPct": "2.0",
+  "waterbodySpreadMax": "4",
   "waterbodyAwakeMax": "32",
   "waterbodyDrainTicks": "60",
   "waterbodyExciteSlackEighths": "0",

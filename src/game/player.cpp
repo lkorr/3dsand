@@ -8,6 +8,16 @@
 
 namespace {
 
+// player.halfHeight / player.eyeOffset are the FIGURE contract the offline
+// generators check (scripts/test_mobgen.mjs); the controller carries the same
+// numbers as constexprs because ~100 sites and the Jolt proxy are sized from
+// them at compile time. Nothing reads the rows at runtime, so this is what
+// keeps the two from drifting (check_invariants.py's allowlist names it).
+static_assert(TPD(player, halfHeight) / kVoxelMeters == Player::kHalfY &&
+                  TPD(player, eyeOffset) / kVoxelMeters == Player::kEyeOffset,
+              "tuning_params.def player.halfHeight/eyeOffset must match "
+              "Player::kHalfY/kEyeOffset");
+
 // The CPU mirror is 3x3x3 chunks, so collision only works while the player's
 // AABB fits inside it. Past that the body straddles the window, out-of-mirror
 // cells read Unknown, Collides() treats them as air, and the player quietly

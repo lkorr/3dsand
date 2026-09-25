@@ -11496,9 +11496,21 @@ int main(int argc, char** argv) {
       // — never thinner than the full-horizon pin, never so thick that the
       // residency window itself disappears — then eased so the horizon opens
       // smoothly rather than stepping with each landed plane.
-      float fogTarget = std::clamp(kFogOpticalDepths / far.SafeRadiusMeters(),
-                                   kFarFogDensity, kFarFogDensityMax);
-      fogSmooth += (fogTarget - fogSmooth) * kFogLerpPerFrame;
+      //
+      // The budget and the ease are render.fogOpticalDepths /
+      // render.fogLerpPerFrame (read here since 2026-09-24; they loaded into
+      // nothing before). world.h's constexpr pins are the same numbers for the
+      // --shot harnesses, so the clamp bounds scale by the knob's ratio to
+      // them: exactly 1 at the shipped default, which keeps this bit-identical.
+      static_assert(TPD(render, fogOpticalDepths) == kFogOpticalDepths &&
+                        TPD(render, fogLerpPerFrame) == kFogLerpPerFrame,
+                    "tuning_params.def fog defaults must match world.h's pins");
+      const Tuning::Render& fogTun = CurrentTuning().render;
+      const float fogScale = fogTun.fogOpticalDepths / kFogOpticalDepths;
+      float fogTarget = std::clamp(
+          fogTun.fogOpticalDepths / far.SafeRadiusMeters(),
+          kFarFogDensity * fogScale, kFarFogDensityMax * fogScale);
+      fogSmooth += (fogTarget - fogSmooth) * fogTun.fogLerpPerFrame;
       // ---- short range: the panel checkbox is the live authority ----------
       // Pushed into support.cpp rather than OR'd into extraFlags below so that
       // ONE place decides the flag bit for every drawing path — the portrait

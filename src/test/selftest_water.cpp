@@ -692,11 +692,15 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     // only closed analytic basins are registered and a stream has no basin, so
     // the model's error term SHOULD be zero here; this is what turns that
     // structural argument into a number.
+    // The bound lived in `sim.waterBodySpreadExit` until 2026-09-24, a knob
+    // nothing but this gate read: spread-based adopt/release was planned and
+    // never built, so the number is a gate threshold and lives in baseline.
     const int spread = v.surfaceMaxY - v.surfaceMinY;
-    if (spread > t.sim.waterBodySpreadExit)
-      fail(Format("%s: a settled surface spans %d voxels, over the release "
-                  "threshold of %d — the level model does not describe it",
-                  what, spread, t.sim.waterBodySpreadExit));
+    const int spreadMax = (int)BaselineNumber("waterbodySpreadMax", 4);
+    if (spread > spreadMax)
+      fail(Format("%s: a settled surface spans %d voxels, over the bound of "
+                  "%d — the level model does not describe it",
+                  what, spread, spreadMax));
     (void)b;
   };
 

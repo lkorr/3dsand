@@ -46,9 +46,12 @@ using namespace sandvox;
 bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt) {
   g.fuse -= dt;
   if (g.fuse <= 0.0f) return true;
+  // grenade.restitution / friction / waterDrag. Literals 0.45 / 0.8 / 0.90
+  // here until 2026-09-24 while the identical rows loaded into nothing.
+  const Tuning::Grenade& gt = CurrentTuning().grenade;
   g.vel.y -= (9.81f / kVoxelMeters) * dt;
   IVec3 at{ifloor(g.pos.x), ifloor(g.pos.y), ifloor(g.pos.z)};
-  if (kindAt(at) == CellKind::Liquid) g.vel = g.vel * 0.90f;  // water drag
+  if (kindAt(at) == CellKind::Liquid) g.vel = g.vel * gt.waterDrag;
 
   for (int axis = 0; axis < 3; axis++) {
     float& v = axis == 0 ? g.vel.x : axis == 1 ? g.vel.y : g.vel.z;
@@ -64,10 +67,10 @@ bool UpdateGrenade(Grenade& g, float dt, const Player::KindFn& kindAt) {
       IVec3 cell{ifloor(g.pos.x), ifloor(g.pos.y), ifloor(g.pos.z)};
       if (kindAt(cell) == CellKind::Solid) {
         *c = prev;
-        v = -v * 0.45f;  // bounce with restitution
-        if (axis != 0) g.vel.x *= 0.8f;
-        if (axis != 1) g.vel.y *= 0.8f;
-        if (axis != 2) g.vel.z *= 0.8f;
+        v = -v * gt.restitution;  // bounce
+        if (axis != 0) g.vel.x *= gt.friction;
+        if (axis != 1) g.vel.y *= gt.friction;
+        if (axis != 2) g.vel.z *= gt.friction;
         break;
       }
     }

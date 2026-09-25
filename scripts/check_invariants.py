@@ -26,6 +26,12 @@ Checks:
      rows are self-consistent, shipped values sit inside their ranges, every
      tuning.json key has a reader, and tuner_schema.js states no second range.
 
+  2c. TUNING USED     tuning_params.def  ->  a reader in src/ or a shader
+     The generated read loads every row, so "it is read" says nothing about
+     whether the game USES it. Each row must be read by engine code or have
+     its TUNE_* in a shader; offline-only readers are an explicit, commented
+     allowlist (TUNING_CONSUMER_ALLOWLIST). ~21 dead sliders on 2026-09-24.
+
   3. RENDER PATHS     assets/tuner.html RENDER_PATHS  <->  materials.cpp keys
      The wiki re-evaluates the shaders' authored-field tests to say which
      render path a material takes. The flag/field names it reads must be ones
@@ -355,6 +361,136 @@ def check_tuning_reach():
                 f"assets/tuner_schema.js {group}.{k} states its own min/max, "
                 f"but the range of a .def key comes from its row "
                 f"(tuning_params.js) -- delete the row's min/max")
+
+
+# ------------------------------------------------------- tuning CONSUMERS
+# Rows nothing in the engine reads, but that are still legitimate. Every entry
+# says WHO reads it, because "the scan cannot see the reader" is the only
+# acceptable reason to be here -- a row the game simply ignores is not
+# allowlisted, it is wired or deleted (the 2026-09-24 unused-knob sweep).
+#
+# A row read ONLY through its generated WGSL constant needs no entry: the check
+# looks for the TUNE_* name in assets/shaders/*.wgsl itself. What belongs here
+# is a read the scan is blind to: an offline tool reading tuning.json, or a
+# TUNE_* consumed only inside a constant the C++ prelude derives from it.
+TUNING_CONSUMER_ALLOWLIST = {
+    # The FIGURE contract. scripts/test_mobgen.mjs asserts the generated human
+    # is halfHeight*2 tall with the eye at halfHeight+eyeOffset. The controller
+    # carries the same numbers as Player::kHalfY/kEyeOffset (constexpr, used by
+    # ~100 sites incl. collision); player.h static_asserts they equal these
+    # rows' defaults so the two cannot drift.
+    "player.halfHeight": "scripts/test_mobgen.mjs (figure contract)",
+    "player.eyeOffset": "scripts/test_mobgen.mjs (figure contract)",
+}
+
+
+def _strip_cpp(text):
+    """Comments and string literals out: a knob named in prose ("the old
+    `sunPeakElevation` clamp") or in a warning string is not a reader."""
+    # One left-to-right pass, so a `"` inside a comment or a '"' char literal
+    # cannot open a phantom string that swallows real code.
+    return re.sub(r'//[^\n]*|/\*.*?\*/|"(?:\\.|[^"\\\n])*"|\'(?:\\.|[^\'\\\n])\'',
+                  lambda m: '""' if m.group(0)[0] == '"' else " ", text,
+                  flags=re.S)
+
+
+def check_tuning_consumers():
+    """Every .def row drives something.
+
+    The generated read + clamp means a row is ALWAYS loaded, so "the row is
+    read" (check 2b) proves nothing about whether the game uses it. On
+    2026-09-24 ~25 rows were loaded, clamped, shown as tuner sliders -- and read
+    by nothing: sky colours replaced by the scattering model in August, debris
+    and grenade constants the tuning pipeline exposed on day one and never
+    wired, a sever shove that was never implemented. A slider that moves
+    nothing is worse than no slider.
+
+    A row counts as CONSUMED when any of these holds (comments and string
+    literals stripped first):
+      - its WGSL name appears in an assets/shaders/*.wgsl file;
+      - some src/ file other than tuning.cpp (the generated read) and the
+        selftest gates reads `<group>.<member>` -- e.g. `tune.grenade.fuse`;
+      - some such file reads `.member` / `->member` AND names the group's
+        struct (`.group`, `->group` or `Tuning::Group`), which is how aliased
+        reads look: `const Tuning::Player& tp = ...; tp.grabDistance`;
+      - tuning.h's own inline helpers read it (AddBleedBudget,
+        TicksPerDayFromTuning); the struct's `= TPD(...)` initializers do not
+        match either pattern, so they are not mistaken for reads.
+    src/test/selftest*.cpp does NOT count: a knob only a gate reads is a
+    threshold, and thresholds live in tests/baseline.json (CLAUDE.md).
+    src/test/support.cpp does count -- it is the shared render plumbing the
+    game itself runs.
+
+    Anything else must be in TUNING_CONSUMER_ALLOWLIST with its reader named.
+    """
+    header = read("src/sim/tuning.h")
+    rows = _tuning_rows()
+    if rows is None or not header:
+        return
+    checked.append("tuning consumers")
+    # group -> struct type name, from `struct Name { ... } group;` in tuning.h
+    types = {}
+    lines = header.splitlines()
+    for i, ln in enumerate(lines):
+        m = re.match(r"^  \}\s*(\w+);", ln)
+        if not m:
+            continue
+        j = i - 1
+        while j >= 0 and not re.match(r"^  struct \w+\s*\{", lines[j]):
+            j -= 1
+        if j >= 0:
+            types[m.group(1)] = re.match(r"^  struct (\w+)", lines[j]).group(1)
+
+    skip = {"src/sim/tuning.cpp", "src/sim/tuning_params.def"}
+    files = {}
+    for p in sorted((ROOT / "src").rglob("*")):
+        if p.suffix not in (".cpp", ".h", ".inl"):
+            continue
+        rel = p.relative_to(ROOT).as_posix()
+        if rel in skip or re.match(r"src/test/selftest\w*\.cpp$", rel):
+            continue
+        files[rel] = _strip_cpp(p.read_text(encoding="utf-8",
+                                            errors="replace"))
+    member_files, qual = {}, set()
+    for rel, t in files.items():
+        for m in re.finditer(r"(?:\.|->)\s*([A-Za-z_]\w*)", t):
+            member_files.setdefault(m.group(1), set()).add(rel)
+        for m in re.finditer(r"\b([A-Za-z_]\w*)\s*(?:\.|->)\s*([A-Za-z_]\w*)",
+                             t):
+            qual.add(m.groups())
+    group_files = {}
+    for g, ty in types.items():
+        pat = re.compile(r"(?:(?:\.|->)\s*" + re.escape(g) + r"|\bTuning::" +
+                         re.escape(ty) + r")\b")
+        group_files[g] = {rel for rel, t in files.items() if pat.search(t)}
+    wgsl = set()
+    for p in (ROOT / "assets" / "shaders").glob("*.wgsl"):
+        txt = re.sub(r"//[^\n]*", "", p.read_text(encoding="utf-8",
+                                                  errors="replace"))
+        wgsl |= set(re.findall(r"\bTUNE_\w+", txt))
+
+    keys = {r.key for r in rows}
+    for k in TUNING_CONSUMER_ALLOWLIST:
+        if k not in keys:
+            problems.append(f"scripts/check_invariants.py "
+                            f"TUNING_CONSUMER_ALLOWLIST names {k}, which has "
+                            f"no tuning_params.def row -- drop the entry")
+    for r in rows:
+        if r.key in TUNING_CONSUMER_ALLOWLIST:
+            continue
+        if r.has_wgsl and r.wgsl in wgsl:
+            continue
+        if (r.group, r.member) in qual:
+            continue
+        if member_files.get(r.member, set()) & group_files.get(r.group, set()):
+            continue
+        problems.append(
+            f"{r.key}: loaded from tuning.json but nothing reads it -- no "
+            f"src/ read of .{r.member} next to the {r.group} group"
+            + (f", and no shader uses {r.wgsl}" if r.has_wgsl else "")
+            + ". Wire it to the code that does the job, or delete the row "
+            f"(.def, tuning.h, tuning.json, tuner_schema.js). An offline "
+            f"reader goes in TUNING_CONSUMER_ALLOWLIST with its name.")
 
 
 # ----------------------------------------------------------- RENDER_PATHS
@@ -2473,6 +2609,7 @@ ALL = {
     "substeps": check_fluid_substeps,
     "tuning": check_tuning_consts,
     "tuningreach": check_tuning_reach,
+    "tuningused": check_tuning_consumers,
     "render": check_render_paths,
     "world": check_world_consts,
     "arch": check_arch_paths,
@@ -2497,8 +2634,9 @@ RELEVANT = {
     "assets/sound_schema.js": ["sound"],
     "src/audio/cues.cpp": ["sound"],
     "src/sim/tuning.cpp": ["tuning", "tuningreach"],
-    "src/sim/tuning.h": ["tuning", "tuningreach"],
-    "src/sim/tuning_params.def": ["tuning", "substeps", "tuningreach"],
+    "src/sim/tuning.h": ["tuning", "tuningreach", "tuningused"],
+    "src/sim/tuning_params.def": ["tuning", "substeps", "tuningreach",
+                                  "tuningused"],
     "assets/materials/tuning.json": ["tuningreach"],
     "scripts/tuning_prelude.py": ["tuning"],
     "scripts/tuning_def.py": ["tuning", "tuningreach", "substeps"],

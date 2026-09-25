@@ -50,9 +50,6 @@
 
 
 // ---- sky / sun ----
-TP_V3(render, skyHorizon, TUNE_SKY_HORIZON, 0.72f, 0.80f, 0.90f)
-TP_V3(render, skyZenith, TUNE_SKY_ZENITH, 0.25f, 0.47f, 0.85f)
-TP_V3(render, sunTint, TUNE_SUN_TINT, 1.0f, 0.9f, 0.7f)
 TP_F(render, sunDiscGain, TUNE_SUN_DISC_GAIN, 3.0f, 0.0f, 20.0f)
 TP_V3(render, sunColor, TUNE_SUN_COLOR, 1.0f, 0.95f, 0.86f)
 TP_F(render, sunIntensity, TUNE_SUN_INTENSITY, 1.35f, 0.0f, 5.0f)
@@ -945,10 +942,6 @@ TP_I(sim, waterBodyMode, TUNE_WATER_BODY_MODE, 0, 0, 1)
 TP_I(sim, waterBodyMinVolume, TUNE_WATER_BODY_MIN_VOLUME, 65536, 0, 16777216)
 // + a hand-written rule in LoadTuning
 TP_I(sim, waterBodyExitVolume, TUNE_WATER_BODY_EXIT_VOLUME, 32768, 0, 16777216)
-// + a hand-written rule in LoadTuning
-TP_I(sim, waterBodySpreadEnter, TUNE_WATER_BODY_SPREAD_ENTER, 1, 0, 64)
-// + a hand-written rule in LoadTuning
-TP_I(sim, waterBodySpreadExit, TUNE_WATER_BODY_SPREAD_EXIT, 4, 1, 64)
 TP_I(sim, waterBodyQuietTicks, TUNE_WATER_BODY_QUIET_TICKS, 30, 0, 3600)
 // kWaterBodyCap (sim/waterbody.h) is the hard ceiling: from M2 the
 // descriptor array is a GPU layout, and a count past its end is not a
@@ -1433,10 +1426,8 @@ TP_F(avatar, airPoseRiseSpeed, NO_WGSL, 5.25f, 0.1f, 20.0f)
 TP_F(avatar, airPoseFallSpeed, NO_WGSL, 9.0f, 0.1f, 40.0f)
 TP_F(avatar, airPoseLandHeight, NO_WGSL, 1.1f, 0.0f, 6.0f)
 TP_F(avatar, airPoseLean, NO_WGSL, 16.0f, 0.0f, 60.0f)
-TP_B(avatar, firstPersonArms, NO_WGSL, true)
 TP_F(avatar, firstPersonForward, NO_WGSL, 0.255f, 0.0f, 1.0f)
 TP_F(avatar, footTrim, NO_WGSL, 0.0f, -1.0f, 1.0f)
-TP_F(avatar, severImpulse, NO_WGSL, 6.0f, 0.0f, 40.0f)
 TP_F(avatar, respawnDelay, NO_WGSL, 3.0f, 0.0f, 20.0f)
 TP_B(avatar, keepKitOnTurn, NO_WGSL, true)
 
@@ -1529,7 +1520,9 @@ TP_I(debris, minBurnFragmentVoxels, NO_WGSL, 24, 1, 400)
 TP_I(debris, maxNewBodiesPerTick, NO_WGSL, 4, 1, 32)
 TP_I(debris, settleAfterTicks, NO_WGSL, 60, 5, 600)
 TP_F(debris, alignCos, NO_WGSL, 0.94f, 0.5f, 0.9999f)
-TP_I(debris, maxBodies, NO_WGSL, 200, 8, 512)
+// The max is debris.h kMaxBodies, the capacity the body render walks and
+// instance tables are sized for: this knob can lower the ceiling, not raise it.
+TP_I(debris, maxBodies, NO_WGSL, 200, 8, 200)
 TP_I(debris, burnOpsPerTick, NO_WGSL, 384, 16, 4096)
 
 
@@ -2023,8 +2016,6 @@ TP_I(dayNight, cycleMinutes, NO_WGSL, 20, 1, 240)
 TP_I(dayNight, freeze, NO_WGSL, 0, 0, 1)
 // + a hand-written rule in LoadTuning
 TP_I(dayNight, freezePhase, NO_WGSL, 32768, 0, 65535)
-// legacy, unread
-TP_F(dayNight, sunPeakElevation, NO_WGSL, 58.0f, 5.0f, 90.0f)
 TP_F(dayNight, sunAzimuth, NO_WGSL, 24.0f, -180.0f, 180.0f)
 // + a hand-written rule in LoadTuning
 TP_F(dayNight, twilightWidth, NO_WGSL, 0.22f, 0.02f, 1.0f)

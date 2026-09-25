@@ -2,6 +2,8 @@
 
 #include <algorithm>
 
+#include "sim/tuning.h"
+
 bool Brush::BuildOp(const WorldSnapshot& snap, const Vec3& eye, const Vec3& fwd,
                     bool erase, BrushOp& out) const {
   int r = std::clamp(radius, 1, 7);
@@ -14,8 +16,9 @@ bool Brush::BuildOp(const WorldSnapshot& snap, const Vec3& eye, const Vec3& fwd,
       target = {(int)snap.pick[5], (int)snap.pick[6] + r / 2, (int)snap.pick[7]};
     }
   } else {
-    // nothing under the crosshair: paint in the air ahead
-    Vec3 p = eye + fwd * 48.0f;
+    // nothing under the crosshair: paint in the air ahead, tools.brushAirDistance
+    // voxels out (a literal 48 until 2026-09-24, the knob's own default)
+    Vec3 p = eye + fwd * CurrentTuning().tools.brushAirDistance;
     target = {ifloor(p.x), ifloor(p.y), ifloor(p.z)};
     if (erase) return false;
   }

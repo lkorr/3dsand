@@ -546,12 +546,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
           "(hysteresis); set to half the enter threshold");
       s.waterBodyExitVolume = s.waterBodyMinVolume / 2;
     }
-    if (s.waterBodySpreadExit <= s.waterBodySpreadEnter) {
-      out.warnings.push_back(
-          "sim.waterBodySpreadExit must be ABOVE sim.waterBodySpreadEnter "
-          "(hysteresis); set to enter + 3");
-      s.waterBodySpreadExit = s.waterBodySpreadEnter + 3;
-    }
     // ---- W2: surface momentum (docs/PLAN_water_relevel.md §4.2) ---------
     // The mode gate FIRST, and for windMode's reason: an unknown value must
     // not fall through to "some wave", because the whole identity argument is

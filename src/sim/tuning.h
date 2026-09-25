@@ -273,12 +273,12 @@ struct Tuning {
     float crouchHeight = TPD(player, crouchHeight);
     float crouchSpeedScale = TPD(player, crouchSpeedScale);
     float crouchKneeDrop = TPD(player, crouchKneeDrop);
-    // The FIGURE contract, not collision: gen_human.py / gen_mina.py /
-    // gen_asha.py read these out of tuning.json and assert that the art they
-    // draw is halfHeight*2 tall with the face at halfHeight+eyeOffset. The
-    // controller does not read them (it has Player::kHalfY/kEyeOffset for the
-    // same 1.7 m / 1.5 m numbers); they are here so the file stays the one
-    // place the figure's size is written down.
+    // The FIGURE contract, not collision: scripts/test_mobgen.mjs reads these
+    // out of tuning.json and asserts the generated human is halfHeight*2 tall
+    // with the face at halfHeight+eyeOffset. The controller does not read
+    // them (it has Player::kHalfY/kEyeOffset for the same 1.7 m / 1.5 m
+    // numbers, static_asserted equal to these defaults in player.cpp); they
+    // are in check_invariants.py's TUNING_CONSUMER_ALLOWLIST for that reason.
     float halfHeight = TPD(player, halfHeight);
     float eyeOffset = TPD(player, eyeOffset);
     // Camera step smoothing: half-life (seconds) of the render-only eye
@@ -523,9 +523,6 @@ struct Tuning {
     // Below this speed (m/s) the body keeps its last facing instead of
     // snapping to a near-zero velocity vector, which would spin on the spot.
     float turnMinSpeed = TPD(avatar, turnMinSpeed);
-    // In first person the body is hidden, but the ARMS are kept so the player
-    // can see their own hands and staff. Turning this off hides everything.
-    bool firstPersonArms = TPD(avatar, firstPersonArms);
     // How far forward (metres) the first-person eye sits from the body centre.
     // Pushes the camera in front of the arms so looking down shows hands behind
     // you rather than surrounding you.
@@ -662,9 +659,6 @@ struct Tuning {
     // step-down clears any debounce, and so does cresting a bump at speed.
     // Distance is the honest question, and it is the one a player would answer.
     float fallMinDrop = TPD(avatar, fallMinDrop);
-    // Damage/dismemberment feel.
-    // extra shove given to a part as it comes off
-    float severImpulse = TPD(avatar, severImpulse);
     // How long the corpse's parts stay before the avatar can respawn, seconds.
     float respawnDelay = TPD(avatar, respawnDelay);
     // ---- WHAT YOUR ZOMBIE TAKES WITH IT -----------------------------------
@@ -971,13 +965,25 @@ struct Tuning {
   } ragdoll;
 
   // ---- debris / island -> rigidbody conversion ----
+  // Read by phys/debris.cpp through its MinBodyVoxels()/... accessors. These
+  // were debris.cpp constexprs the tuning pipeline exposed on day one
+  // (46993d8) and never wired; they drive it since 2026-09-24. They decide
+  // what becomes a body and when a body re-enters the grid, so they feed the
+  // world hash.
   struct Debris {
+    // an island smaller than this crumbles to rubble instead of a body
     int minBodyVoxels = TPD(debris, minBodyVoxels);
+    // the (higher) floor for a fragment that breaks off a BURNING body
     int minBurnFragmentVoxels = TPD(debris, minBurnFragmentVoxels);
+    // new bodies a shatter/split may create per tick, across all bodies
     int maxNewBodiesPerTick = TPD(debris, maxNewBodiesPerTick);
+    // ticks a body must sleep before it may settle back into the grid
     int settleAfterTicks = TPD(debris, settleAfterTicks);
+    // how axis-aligned (cos of the worst axis) a body must be to settle back
     float alignCos = TPD(debris, alignCos);
+    // global body ceiling, oldest evicted first; at most debris.h kMaxBodies
     int maxBodies = TPD(debris, maxBodies);
+    // fire/ash grid writes all burning bodies may emit per tick
     int burnOpsPerTick = TPD(debris, burnOpsPerTick);
   } debris;
 
@@ -2235,6 +2241,9 @@ struct Tuning {
   struct Grenade {
     float throwSpeed = TPD(grenade, throwSpeed);   // m/s
     float fuse = TPD(grenade, fuse);          // seconds
+    // UpdateGrenade (game/session.cpp): the velocity kept along the axis it
+    // hit (bounce), on the other two axes at that contact (friction), and per
+    // tick while inside liquid (drag).
     float restitution = TPD(grenade, restitution);
     float friction = TPD(grenade, friction);
     float waterDrag = TPD(grenade, waterDrag);
@@ -2255,6 +2264,7 @@ struct Tuning {
     // a 2-voxel hole in stone. Flesh is cut, not blasted.
     float laserCarveRadius = TPD(tools, laserCarveRadius);
     float laserDamage = TPD(tools, laserDamage);
+    // How far ahead (voxels) the brush paints when the crosshair hits nothing.
     float brushAirDistance = TPD(tools, brushAirDistance);
   } tools;
 
@@ -2726,20 +2736,12 @@ struct Tuning {
     int waterBodyMinVolume = TPD(sim, waterBodyMinVolume);
     int waterBodyExitVolume = TPD(sim, waterBodyExitVolume);
 
-    // SURFACE HEIGHT SPREAD, whole voxels — the error term of the entire model.
-    // A stream down a hillside is ONE connected component with a 200-voxel head
-    // difference between its ends: connectivity is a topological fact, an
-    // equipotential surface is a hydrostatic one, and the two coincide only at
-    // equilibrium. Anything over the enter threshold is a stream and belongs
-    // entirely to the CA/MPM.
-    //
-    // At M1 this is structural rather than measured: only closed analytic
-    // basins are registered, and a stream has no basin, so nothing with a real
-    // spread can reach the ladder. `--gate waterbody` measures the true spread
-    // from voxels and asserts it against these. The runtime measurement lands
-    // with M2's GPU reduce, which is the pass that can see a whole lake.
-    int waterBodySpreadEnter = TPD(sim, waterBodySpreadEnter);
-    int waterBodySpreadExit = TPD(sim, waterBodySpreadExit);
+    // There is no SURFACE-SPREAD adopt/release pair. `waterBodySpreadEnter` /
+    // `waterBodySpreadExit` were written for it at M1 (681dd72) and deleted
+    // 2026-09-24 because nothing ever read them: only closed analytic basins
+    // are registered, so a stream never reaches the ladder, and the spread the
+    // GPU now measures (sim_waterbody.wgsl rvLo/rvHi) feeds only the wave's
+    // sleep. `--gate waterbody` bounds the settled spread from baseline.json.
 
     // How long every enter test must hold before adoption. Ticks — 30 is one
     // second. A body still sloshing has a surface that is not an equipotential,
@@ -3176,10 +3178,6 @@ struct Tuning {
 
     // multiplier on the star wheel rate
     float starRotSpeed = TPD(dayNight, starRotSpeed);
-
-    // Retained ONLY so an old tuning.json still loads without a warning storm.
-    // Nothing reads it; noon elevation is now an output of tilt + latitude.
-    float sunPeakElevation = TPD(dayNight, sunPeakElevation);
   } dayNight;
 
   // ---- weather: switches for the sun-driven reactions ----
@@ -3474,9 +3472,6 @@ struct Tuning {
   // ---- render: everything below is emitted as WGSL and F5-reloadable ----
   struct Render {
     // sky / sun
-    float skyHorizon[3] = TPD_V3(render, skyHorizon);
-    float skyZenith[3] = TPD_V3(render, skyZenith);
-    float sunTint[3] = TPD_V3(render, sunTint);
     float sunDiscGain = TPD(render, sunDiscGain);
     float sunDir[3] = TPD_V3(render, sunDir);
     float sunColor[3] = TPD_V3(render, sunColor);
@@ -3654,7 +3649,11 @@ struct Tuning {
     float nightAmbSky[3] = TPD_V3(render, nightAmbSky);
     float nightAmbGround[3] = TPD_V3(render, nightAmbGround);
 
-    // fog
+    // fog: the LIVE adaptive fog in the frame loop (main.cpp). The optical
+    // depth budget spent across the filled cascade radius, and the per-frame
+    // ease toward it. world.h kFogOpticalDepths/kFogLerpPerFrame are the same
+    // numbers for the constexpr static pin the --shot harnesses use;
+    // main.cpp static_asserts the defaults agree.
     float fogOpticalDepths = TPD(render, fogOpticalDepths);
     float fogLerpPerFrame = TPD(render, fogLerpPerFrame);
 

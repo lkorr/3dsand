@@ -205,7 +205,7 @@ enum class WaterBodyRefusal : uint32_t {
   TooSmall,      // volume below sim.waterBodyMinVolume
   Overflowing,   // level at or above the spill elevation
   Straddle,      // a chunk holds two basins (see the note on ChunkBody)
-  Spread,        // surface height spread over sim.waterBodySpreadEnter
+  Spread,        // NEVER PRODUCED: spread-based refusal was planned, not built
   AtCap,         // sim.waterBodyMaxCount bodies already proposed
   OutOfWindow,   // the basin is not fully resident
   // kWaterChunkCap is the rule-2 bound on the whole subsystem's dispatch, and
