@@ -5610,9 +5610,7 @@ int main(int argc, char** argv) {
   // makes, and the registry is what makes `E` see it (DESIGN.md §8c). The
   // release hook above already forgets it when the body goes.
   mobs.SetOnItemShed(
-      [&ground](uint64_t h, const std::string& name, uint32_t dye) {
-        ground.Add(h, name, dye);
-      });
+      [&ground](uint64_t h, const ItemInstance& it) { ground.Add(h, it); });
   Stream stream;
   stream.Init(&ctx, &world, &sim, kDefaultSeed);
   stream.OnMaterialsReloaded(mats);
@@ -6469,71 +6467,18 @@ int main(int argc, char** argv) {
   StrokeCursor& playerStrike = session.playerStrike;
   int& strikeQueued = session.strikeQueued;    // style latched at the press
   int& strikeBuffered = session.strikeBuffered;  // ONE strike banked mid-swing
-  Inventory& hotbar = session.hotbar;
-  // The rest of the kit: worn/sheathed/quick slots and the pack
-  // (game/equipment.h). Held beside the hotbar rather than inside it because
-  // the hotbar is WHAT IS IN YOUR HAND and predates all of this; the melee
-  // path reads Inventory::Selected() and must keep doing exactly that.
-  PlayerKit& kit = session.kit;
-  // ---- WHAT THE PLAYER IS CARRYING WHEN THEY DIE INFECTED -----------------
+  // THE KIT IS THE AVATAR'S (W2-M, Mob::kit_): hotbar, bag and equipment in
+  // one Kit on the body that carries them. The hotbar is still WHAT IS IN
+  // YOUR HAND; the melee path reads Inventory::Selected() exactly as before.
+  // Two references so the rest of this function reads as it always has.
   //
-  // The avatar is not excluded from turning (Mob::Die's rising test reads the
-  // def's `turn` block, and every character inherits one from human.json), so
-  // a player who dies with the rot in them stands up six seconds later as a
-  // zombie of themselves. It rises in the gear it fell in because `worn_` is
-  // on the body — but the BAG AND HOTBAR ARE NOT ON THE BODY, they are here,
-  // and MobSystem cannot see a session (game/session.h). This is the seam.
-  //
-  // COPY OR MOVE, and that is the whole of `avatar.keepKitOnTurn`:
-  //
-  //   true  (default) — the zombie rises with a COPY and you respawn with
-  //                     everything. Two swords exist where one did. That is a
-  //                     duplication machine and it is deliberately the default
-  //                     while the feature is being played with, because losing
-  //                     your kit to a test bite is worse than duplicating it.
-  //   false           — bag, hotbar and equipment are EMPTIED on the way out.
-  //                     Your kit walks away wearing your face; go and take it
-  //                     back off the thing. No duplication, and the death
-  //                     penalty this was always going to become.
-  //
-  // Equipment is cleared but NOT copied: the worn pieces are already on the
-  // rig and Die() captured them through the ordinary `worn_` walk, so copying
-  // them here would hand the zombie a second breastplate. Clearing it is what
-  // stops the wear loop re-dressing the respawned body from the slot.
-  mobs.SetAvatarKitFn([&kit, &hotbar, &items](std::vector<CarriedItem>& out) {
-    const bool keep = CurrentTuning().avatar.keepKitOnTurn;
-    auto take = [&](ItemStack& s) {
-      if (s.Empty()) return;
-      // BY NAME on the way out (item.h's index hazard): what this hands back
-      // travels through a rising, a save record and a handoff packet, and a
-      // library index survives none of those.
-      const ItemDef* d = items.At(s.def);
-      out.push_back(CarriedItem{d ? d->name : std::string(), s.count, s.dye});
-      if (!keep) s = ItemStack{};
-    };
-    for (ItemStack& s : kit.bag.slots) take(s);
-    for (ItemStack& s : hotbar.slots) take(s);
-    if (!keep)
-      for (int e = 0; e < kEquipSlotCount; e++) kit.equip.slots[e] = ItemStack{};
-    // A name the library no longer knows resolves to "" and would be dropped
-    // silently by the far side; drop it here instead, where the slot it came
-    // from can still be reported if that ever needs saying.
-    out.erase(std::remove_if(out.begin(), out.end(),
-                             [](const CarriedItem& c) { return c.item.empty(); }),
-              out.end());
-  });
-  // What we last ASKED the body to wear, per equip slot. Not a second copy of
-  // the equipment — it is the record that keeps a REFUSED piece (a helm on a
-  // creature with no head) from being retried thirty times a second. Cleared
-  // whenever the avatar is rebuilt, because a fresh rig wears nothing and
-  // every slot has to be offered to it again.
-  std::string (&wearTried)[kEquipSlotCount] = session.wearTried;
-  // ...and IN WHAT COLOUR. The sync below compares by item NAME, which is what
-  // makes it survive an R reload — and a name alone cannot tell a red tunic
-  // from a blue one, so dyeing a garment you are already wearing would change
-  // nothing until you took it off. The dye is part of the comparison for the
-  // same reason the name is the rest of it. 0 = undyed (game/dye.h).
-  uint32_t (&wearDye)[kEquipSlotCount] = session.wearDye;
+  // What used to sit here — the avatar-kit callback a rising asked for the
+  // bag and hotbar, and the `wearTried`/`wearDye` latches of the per-tick
+  // wear loop — is gone: a rising reads the avatar's kit directly
+  // (MobSystem::ServiceRising, `avatar.keepKitOnTurn`), and the rig dresses
+  // itself from the kit (Mob::DressFromKit, session.cpp).
+  Kit& kit = session.kit();
+  Inventory& hotbar = kit.hotbar;
   // The last frame's RENDER eye, for the pour point (ContainerPourPoint): the
   // crosshair ray starts there -- ahead of the head in first person
   // (avatar.firstPersonForward), on the boom in third -- and the tick's pour
@@ -6572,11 +6517,11 @@ int main(int argc, char** argv) {
             EquipSlotAccepts(s, it.kind) && kit.equip.At(s).Empty())
           home = s;
       if (home >= 0)
-        kit.equip.slots[home] = {i, 1};
+        kit.equip.slots[home] = StackOf(items, i);
       else if (ItemKindIsWorn(it.kind))
-        kit.bag.Add(i, 1);                     // armour, into the pack
+        kit.bag.Add(StackOf(items, i));        // armour, into the pack
       else
-        hotbar.Add(i, 1);
+        hotbar.Add(StackOf(items, i));
     }
   }
   // The equipment slot table, mirrored into the UI once. It is authored data
@@ -8893,7 +8838,7 @@ int main(int argc, char** argv) {
         for (size_t m = 0; m < mats.size(); m++)
           if (mats[m].name == "water") water = (uint16_t)m;
         for (int i = 0; i < kItemSlots; i++) {
-          const ItemDef* d = items.At(hotbar.slots[i].Empty() ? -1 : hotbar.slots[i].def);
+          const ItemDef* d = items.Of(hotbar.slots[i]);
           if (d && d->IsContainer() && water) {
             hotbar.slots[i].fillMat = water;
             hotbar.slots[i].fillAmt = (uint16_t)(d->container.capacity * 2 / 3);
@@ -8916,7 +8861,7 @@ int main(int argc, char** argv) {
           if (!ItemKindIsWorn(it.kind)) continue;
           for (int s = 0; s < kEquipSlotCount; s++)
             if (EquipSlotAccepts(s, it.kind) && kit.equip.At(s).Empty()) {
-              kit.equip.slots[s] = {i, 1};
+              kit.equip.slots[s] = StackOf(items, i);
               dressed++;
               break;
             }
@@ -9068,7 +9013,7 @@ int main(int argc, char** argv) {
               const int slot = EquipSlotFor(it.kind, worn);
               if (slot < 0 || !worn.At(slot).Empty()) continue;
               if (mobs.WearItem(id, &it, slot)) {
-                worn.slots[slot] = {items.Find(it.name), 1};
+                worn.slots[slot] = ItemInstance{it.name};
                 dressed++;
               }
             }
@@ -9570,7 +9515,7 @@ int main(int argc, char** argv) {
       // Then a DEAD MOB under the crosshair — any of its limbs, shells or the
       // sword in its hand answers as the corpse (MobSystem::FindOwner).
       if (const WorldItem* w = lookBody ? ground.Find(lookBody) : nullptr) {
-        ui.lookPrompt = "E  pick up " + w->item;
+        ui.lookPrompt = "E  pick up " + w->name;
       } else if (const Mob* c = lookBody ? mobs.FindOwner(lookBody) : nullptr;
                  c != nullptr && c->Lootable()) {
         std::vector<LootPiece> pieces;
@@ -9627,6 +9572,18 @@ int main(int argc, char** argv) {
     // two differ in what they must NOT do: the local branch destroys the body
     // (it owns it), this one must not (the owner already did, and its own
     // `BodyGone` removes the ghost).
+    //
+    // Both branches put the WHOLE ItemInstance in the kit (W2-M) — its colour,
+    // what a vessel holds, what a worn piece has been through — through this
+    // one helper: bag first, hotbar as the overflow, -1 when there is no room
+    // or the name is not an item this library has.
+    auto pocket = [&](const ItemInstance& it) -> int {
+      const ItemStack s = KitStackFrom(it.One(), items);
+      if (s.Empty()) return -1;
+      int where = kit.bag.Add(s);
+      if (where < 0) where = hotbar.Add(s);
+      return where;
+    };
     if (netPaced) {
       net::ItemGrant g;
       while (entities.PopLocalGrant(g)) {
@@ -9635,11 +9592,9 @@ int main(int argc, char** argv) {
           ui.kitMessageAge = 0.0f;
           continue;
         }
-        const int di = items.Find(g.item);
-        int where = di >= 0 ? kit.bag.Add(di, 1, g.dye) : -1;
-        if (where < 0 && di >= 0) where = hotbar.Add(di, 1, g.dye);
-        ui.kitMessage =
-            where >= 0 ? "picked up " + g.item : "you have no room for that";
+        const int where = pocket(g.item);
+        ui.kitMessage = where >= 0 ? "picked up " + g.item.name
+                                   : "you have no room for that";
         ui.kitMessageAge = 0.0f;
       }
     }
@@ -9672,11 +9627,10 @@ int main(int argc, char** argv) {
         // that would ever put it back. The reply is drained above.
         const uint64_t gid = debris.GlobalIdOf(hit);
         if (gid != 0 && debris.RequestItemTake(gid)) {
-          ui.kitMessage = "reaching for " + w->item;
+          ui.kitMessage = "reaching for " + w->name;
           ui.kitMessageAge = 0.0f;
         }
       } else if (w) {
-        const int di = items.Find(w->item);
         // Bag first, hotbar as the overflow. A full pack REFUSES rather than
         // silently swallowing or silently dropping: the item stays exactly
         // where it was, which is the only behaviour under which a pickup
@@ -9685,12 +9639,11 @@ int main(int argc, char** argv) {
         // registry carries the word because the art cannot: a dyed garment is
         // painted in neutral greys, so a pickup that forgot the dye would hand
         // back a grey tunic with nothing anywhere to say it had ever been red.
-        // ...holding what it held when it went down (WorldItem::fill).
-        const uint16_t fm = ItemFillMat(w->fill), fa = ItemFillAmt(w->fill);
-        int where = di >= 0 ? kit.bag.Add(di, 1, w->dye, fm, fa) : -1;
-        if (where < 0 && di >= 0) where = hotbar.Add(di, 1, w->dye, fm, fa);
+        // ...holding what it held when it went down, with the holes it had:
+        // the registry entry IS an ItemInstance and it goes in whole.
+        const int where = pocket(*w);
         if (where >= 0) {
-          ui.kitMessage = "picked up " + w->item;
+          ui.kitMessage = "picked up " + w->name;
           // Order matters: the registry entry is dropped by the release hook
           // when the body goes, so this is one call, not two.
           debris.DestroyBody(hit);
@@ -10200,64 +10153,23 @@ int main(int argc, char** argv) {
         // just thrown away, so a stale ItemDef would hold a model index into
         // a freed model.
         //
-        // AND EVERY SLOT THAT HOLDS AN ITEM INDEX MUST BE RE-RESOLVED. The
-        // hotbar, the pack and the equipment all store indices into
-        // ItemLibrary::items, which is file-order dependent; an items.json
-        // that merely reorders entries would otherwise turn a sheathed sword
-        // into whatever now sits at that index. This block used to carry a
-        // comment promising the hotbar was "re-validated below" — it was not,
-        // and the character screen makes the consequence permanent rather than
-        // transient, so the promise is kept here for all three containers.
+        // NO SLOT HOLDS AN ITEM INDEX (W2-M): every hotbar, pack and
+        // equipment slot is an ItemInstance and names its item, so a reorder
+        // of items.json changes nothing and the dye, a vessel's contents and
+        // a piece's damage ride through untouched. All a reload can do to the
+        // kit is REMOVE an item: Kit::DropUnknown empties those slots (and
+        // re-clamps a vessel to an edited capacity). This block used to
+        // snapshot every slot by name and re-resolve it, field by field, and
+        // it was one forgotten field away from bleaching the wardrobe.
         {
-          // Name, count AND DYE. The dye is the other half of what a stack is
-          // (game/dye.h): dropping it here would bleach every coloured garment
-          // the player owns on every R, which reads as a rendering bug rather
-          // than as the data loss it is.
-          // ...and WHAT A VESSEL HOLDS (game/container.h), for the dye's
-          // reason: an R that forgot it would empty every flask you carry.
-          struct KitSnap {
-            std::string name;
-            int count = 0;
-            uint32_t dye = 0;
-            uint16_t fillMat = 0, fillAmt = 0;
-          };
-          auto snapshot = [&](ItemStack* v, int n,
-                              std::vector<KitSnap>& out) {
-            out.clear();
-            for (int i = 0; i < n; i++)
-              out.push_back({KitItemName(v[i], items), v[i].count, v[i].dye,
-                             v[i].fillMat, v[i].fillAmt});
-          };
-          auto restore = [&](ItemStack* v, int n,
-                             const std::vector<KitSnap>& in) {
-            for (int i = 0; i < n && i < (int)in.size(); i++) {
-              ItemStack s = KitItemFromName(in[i].name, in[i].count,
-                                            items, in[i].dye);
-              if (const ItemDef* d = s.Empty() ? nullptr : items.At(s.def);
-                  d && d->IsContainer() && in[i].fillAmt > 0) {
-                s.fillMat = in[i].fillMat;
-                s.fillAmt = (uint16_t)std::min<int>(in[i].fillAmt,
-                                                    d->container.capacity);
-              }
-              if (!in[i].name.empty() && s.Empty())
-                std::fprintf(stderr,
-                             "items reload: \"%s\" is gone; slot emptied\n",
-                             in[i].name.c_str());
-              v[i] = s;
-            }
-          };
-          std::vector<KitSnap> hb, bg, eq;
-          snapshot(hotbar.slots, kItemSlots, hb);
-          snapshot(kit.bag.slots, Bag::kSlots, bg);
-          snapshot(kit.equip.slots, kEquipSlotCount, eq);
-
           std::string ierr;
           LoadItems(assetDir + "/items", mats.size(), mbSet, items, ierr);
           if (!ierr.empty()) std::fprintf(stderr, "%s", ierr.c_str());
-
-          restore(hotbar.slots, kItemSlots, hb);
-          restore(kit.bag.slots, Bag::kSlots, bg);
-          restore(kit.equip.slots, kEquipSlotCount, eq);
+          if (const int gone = kit.DropUnknown(items))
+            std::fprintf(stderr,
+                         "items reload: %d slot(s) named an item that is gone; "
+                         "emptied\n",
+                         gone);
           // The AI panel's weapon picker is a mirror of the same library, and
           // by name for the same reason the slots above are: a new blade in
           // items.json appears in the combo on this R without disturbing what
@@ -10463,7 +10375,6 @@ int main(int argc, char** argv) {
             if (!hs.Empty()) continue;
             hs = sh;
             sh = ItemStack{};
-            wearTried[e].clear();
             break;
           }
         }
@@ -10710,10 +10621,12 @@ int main(int argc, char** argv) {
     // the re-equip seams would faithfully put a second sword in your hand
     // from the hotbar while the first lies at your feet, and put the cuirass back on
     // a body the plate has just fallen off. The piece on the ground is
-    // registered under its name (SetOnItemShed), so picking it back up is the
-    // ordinary `E` and wearing it again restores exactly the holes it had:
-    // the damage travels through `kit.wornDamage` by name, the same road a
-    // piece dragged into the pack takes.
+    // registered as the item it is (SetOnItemShed hands the registry the whole
+    // ItemInstance), so picking it back up is the ordinary `E` and wearing it
+    // again restores exactly the holes it had. A worn piece has already left
+    // the kit (Mob::ShedGearBeforeDetach empties its equipment slot); the HAND
+    // is the one thing the body cannot fix, because it does not know which
+    // hotbar slot filled it.
     for (const Mob::LostGear& lg : avatar.LostGearEvents()) {
       if (lg.held) {
         // The slot the hand was FILLED FROM when the ticks ran, not the one
@@ -10724,16 +10637,9 @@ int main(int argc, char** argv) {
         // on the ground and still in its slot.
         const int from = heldItemSlot >= 0 ? heldItemSlot : hotbar.selected;
         ItemStack& sh = hotbar.slots[std::clamp(from, 0, kItemSlots - 1)];
-        if (KitItemName(sh, items) == lg.item) sh = ItemStack{};
+        if (!sh.Empty() && sh.name == lg.item) sh = ItemStack{};
         ui.kitMessage = "your " + lg.item + " was knocked from your hand";
       } else {
-        kit.SetDamage(lg.item, lg.damage);
-        if (lg.equipSlot >= 0 && lg.equipSlot < kEquipSlotCount &&
-            KitItemName(kit.equip.At(lg.equipSlot), items) == lg.item) {
-          kit.equip.slots[lg.equipSlot] = ItemStack{};
-          wearTried[lg.equipSlot].clear();
-          wearDye[lg.equipSlot] = 0;
-        }
         ui.kitMessage = "your " + lg.item + " was cut loose";
       }
       ui.kitMessageAge = 0.0f;
@@ -10741,8 +10647,7 @@ int main(int argc, char** argv) {
     avatar.ClearLostGear();
     const ItemDef* heldItem = [&]() -> const ItemDef* {
       if (ui.tool != UIState::kToolMelee || ui.magicMode) return nullptr;
-      const ItemStack& hs = hotbar.Selected();
-      const ItemDef* d = items.At(hs.Empty() ? -1 : hs.def);
+      const ItemDef* d = items.Of(hotbar.Selected());
       return d && d->kind == ItemKind::Melee ? d : nullptr;
     }();
     heldItemSlot = heldItem ? hotbar.selected : -1;
@@ -10768,8 +10673,7 @@ int main(int argc, char** argv) {
     // punch.
     const int vesselSlot = [&] {
       if (ui.tool != UIState::kToolMelee || ui.magicMode || heldItem) return -1;
-      const ItemStack& hs = hotbar.Selected();
-      const ItemDef* d = hs.Empty() ? nullptr : items.At(hs.def);
+      const ItemDef* d = items.Of(hotbar.Selected());
       return d && d->IsContainer() ? hotbar.selected : -1;
     }();
     // WHERE A FILLED VESSEL POURS (game/container.h ContainerPourPoint): on
@@ -10781,7 +10685,7 @@ int main(int argc, char** argv) {
     Vec3 pourAim{};
     if (vesselSlot >= 0) {
       const ItemStack& vs = hotbar.slots[vesselSlot];
-      const ItemDef* vdef = vs.Empty() ? nullptr : items.At(vs.def);
+      const ItemDef* vdef = items.Of(vs);
       if (vdef && vdef->IsContainer() && vs.Filled()) {
         static std::vector<uint64_t> own;
         own.clear();
@@ -11982,8 +11886,7 @@ int main(int argc, char** argv) {
       // hotbar + swing readout (game/item.h, game/melee.h)
       ui.itemNames.clear();
       for (int i = 0; i < kItemSlots; i++) {
-        const ItemDef* d = items.At(hotbar.slots[i].Empty() ? -1
-                                                            : hotbar.slots[i].def);
+        const ItemDef* d = items.Of(hotbar.slots[i]);
         // A vessel says what is in it, right on the strip: the only way to
         // know how much is left while pouring.
         if (d && d->IsContainer())
@@ -11998,8 +11901,8 @@ int main(int argc, char** argv) {
       // substance's own colour. A choice whose slot no longer holds a vessel
       // is dropped here, so the row never lights a slot the flask left.
       {
-        const ItemStack* hp = kit.Resolve(ui.activeVessel, hotbar);
-        const ItemDef* hd = !hp || hp->Empty() ? nullptr : items.At(hp->def);
+        const ItemStack* hp = kit.Resolve(ui.activeVessel);
+        const ItemDef* hd = hp ? items.Of(*hp) : nullptr;
         if (!hd || !hd->IsContainer()) ui.activeVessel = KitRef{};
         ui.applyText.clear();
         ui.applyColor = 0;
@@ -12219,7 +12122,7 @@ int main(int argc, char** argv) {
           if (!c) return false;
           std::string name;
           const LootResult r =
-              TakeCorpseLoot(*c, index, dest, kit, hotbar, items, &name);
+              TakeCorpseLoot(*c, index, dest, avatar, items, &name);
           if (r == LootResult::Ok) {
             say("took " + name);
             return true;
@@ -12281,15 +12184,17 @@ int main(int argc, char** argv) {
             // the bag's own drop uses, from the corpse rather than from the eye
             // — it should land on the body it came off, not in front of you.
             const LootPiece& pc = pieces[(size_t)gi];
-            const ItemDef* idef = items.At(items.Find(pc.item));
+            const ItemDef* idef = items.Of(pc);
             Vec3 at = player.EyePos() + cam.Forward() * 2.0f;
             {
               const Vec3 rp = c->RootWorldPos();
               at = rp + Vec3{0, 2, 0};
             }
-            if (idef && DropItemToWorld(*idef, at, Vec3{}, phys, debris, &mbSet,
-                                        ground, nullptr, pc.dye)) {
-              name = pc.item;
+            // ONE of it, as the object it was in the pack (its dye, what a
+            // vessel held).
+            if (idef && DropItemToWorld(*idef, pc.One(), at, Vec3{}, phys,
+                                        debris, &mbSet, ground)) {
+              name = pc.name;
               // ONE of the stack, the rule the bag's drop states one block
               // down: dropping a count you did not mean to is the mis-click
               // swap-never-overwrite exists to prevent.
@@ -12305,8 +12210,10 @@ int main(int argc, char** argv) {
       }
       if (ui.moveItem.pending) {
         ui.moveItem.pending = false;
+        // Through the WEARER (Mob::KitMove): a piece dragged off the body
+        // takes its holes with it, and the rig re-dresses from the result.
         const MoveResult r =
-            kit.Move(ui.moveItem.from, ui.moveItem.to, hotbar, items);
+            avatar.KitMove(ui.moveItem.from, ui.moveItem.to, items);
         const char* why = MoveResultText(r, ui.moveItem.to);
         if (why && *why) {
           ui.kitMessage = why;
@@ -12335,8 +12242,8 @@ int main(int argc, char** argv) {
       //     two rings put them on two fingers instead of one finger twice.
       if (ui.equipItem.pending) {
         ui.equipItem.pending = false;
-        const ItemStack* src = kit.Resolve(ui.equipItem.from, hotbar);
-        const ItemDef* def = src && !src->Empty() ? items.At(src->def) : nullptr;
+        const ItemStack* src = kit.Resolve(ui.equipItem.from);
+        const ItemDef* def = src ? items.Of(*src) : nullptr;
         KitRef to{};
         bool have = false;
         if (!def) {
@@ -12362,7 +12269,7 @@ int main(int argc, char** argv) {
           }
         }
         if (have) {
-          const MoveResult r = kit.Move(ui.equipItem.from, to, hotbar, items);
+          const MoveResult r = avatar.KitMove(ui.equipItem.from, to, items);
           const char* why = MoveResultText(r, to);
           if (why && *why) {
             ui.kitMessage = why;
@@ -12378,27 +12285,25 @@ int main(int argc, char** argv) {
       // rebuilt below.
       if (ui.dropItem.pending) {
         ui.dropItem.pending = false;
-        ItemStack* src = kit.Resolve(ui.dropItem.from, hotbar);
-        const ItemDef* def = src && !src->Empty() ? items.At(src->def) : nullptr;
+        ItemStack* src = kit.Resolve(ui.dropItem.from);
+        const ItemDef* def = src ? items.Of(*src) : nullptr;
         if (def) {
           // Thrown gently forward from the eye, so it lands in front of you
           // rather than inside your own capsule.
           const Vec3 at = player.EyePos() + cam.Forward() * 2.0f;
           const Vec3 vel = cam.Forward() * 4.0f + player.vel;
-          if (DropItemToWorld(*def, at, vel, phys, debris, &mbSet, ground,
-                              nullptr, src->dye,
-                              PackItemFill(src->fillMat, src->fillAmt))) {
+          // A piece dropped straight off the body goes down with its holes.
+          if (ui.dropItem.from.space == KitSpace::Equip)
+            avatar.KitFlushWorn(ui.dropItem.from.index);
+          if (DropItemToWorld(*def, src->One(), at, vel, phys, debris, &mbSet,
+                              ground)) {
             // ONE of the stack. Dropping a count you did not mean to is the
             // mis-click this system's swap-never-overwrite rule exists to
-            // prevent, and it applies here too.
-            if (--src->count <= 0) {
-              *src = ItemStack{};
-            } else {
-              // A fill is ONE vessel's (item.h SameKind) and it went with the
-              // dropped one; the rest of the stack stays empty, not a copy.
-              src->fillMat = 0;
-              src->fillAmt = 0;
-            }
+            // prevent, and it applies here too. A fill is ONE vessel's and it
+            // went with the dropped one (a filled stack of more than one is
+            // only ever an old save's): what stays is empty, not a copy.
+            avatar.KitTake(ui.dropItem.from, 1);
+            if (!src->Empty()) src->fillMat = src->fillAmt = 0;
             ui.kitMessage = "dropped";
           } else {
             ui.kitMessage = "there is nowhere to put that";
@@ -12704,28 +12609,28 @@ int main(int argc, char** argv) {
       // they carry were most of a frame's string work (P6.2).
       {
         // CONDITION COMES FROM WHEREVER THE PIECE ACTUALLY IS. On the body the
-        // shells are the truth and the blob in `kit.wornDamage` is stale (it is
-        // only written when a piece comes OFF); in the pack there are no shells
-        // and the blob is all there is. Asking the wrong one is not a rounding
-        // error — it is a robe that reads 100% while it burns off your back.
+        // shells are the truth and the stack's `damage` is stale (it is only
+        // written when a piece comes OFF, Mob::KitFlushWorn); in the pack there
+        // are no shells and the stack's own damage is all there is. Asking the
+        // wrong one is not a rounding error — it is a robe that reads 100%
+        // while it burns off your back. PER STACK now (W2-M): two robes, two
+        // conditions.
         const float ruinedAt = CurrentTuning().gear.ruinedCondition;
-        auto conditionOf = [&](const ItemDef* d) {
-          if (!d || !ItemKindIsWorn(d->kind)) return 1.0f;
-          for (int s = 0; s < kEquipSlotCount; s++)
-            if (avatar.Spawned() && avatar.WornItem(s) == d->name)
-              return avatar.WornCondition(s);
-          const WornDamage* w = kit.Damage(d->name);
-          return w ? w->Condition() : 1.0f;
+        auto conditionOf = [&](const ItemStack& st, int equipSlot) {
+          if (equipSlot >= 0 && EquipSlotIsWorn(equipSlot) && avatar.Spawned() &&
+              avatar.WornItem(equipSlot) == st.name)
+            return avatar.WornCondition(equipSlot);
+          return st.damage.Condition();
         };
-        auto mirror = [&](const ItemStack& st) {
+        auto mirror = [&](const ItemStack& st, int equipSlot = -1) {
           UIState::KitSlotUI u;
-          const ItemDef* d = items.At(st.Empty() ? -1 : st.def);
+          const ItemDef* d = items.Of(st);
           if (!d) return u;
           u.name = d->name;
           u.count = st.count;
           u.wearable = ItemKindIsWorn(d->kind);
           if (u.wearable) {
-            u.condition = conditionOf(d);
+            u.condition = conditionOf(st, equipSlot);
             u.ruined = GearRuined(u.condition, ruinedAt);
           }
           // THE KIND, AS THE ONE NAME THE FILE FORMAT ALREADY USES. It was
@@ -12784,7 +12689,7 @@ int main(int argc, char** argv) {
           ui.bagSlots.push_back(mirror(kit.bag.slots[i]));
         ui.equipSlots.clear();
         for (int i = 0; i < kEquipSlotCount; i++)
-          ui.equipSlots.push_back(mirror(kit.equip.slots[i]));
+          ui.equipSlots.push_back(mirror(kit.equip.slots[i], i));
         // The corpse's gear, through the same mirror so a robe on a corpse is
         // drawn and tipped exactly as one in the pack — with its condition
         // read off the death-time capture, the only record there is for a
@@ -12797,19 +12702,17 @@ int main(int argc, char** argv) {
             std::vector<LootPiece> pieces;
             c->LootPieces(pieces);
             for (const LootPiece& pc : pieces) {
-              const int di = items.Find(pc.item);
               // The COUNT comes off the piece now that a corpse can hold a
               // carried stack as well as a worn garment (LootPiece::count).
               // Worn and held pieces are always 1 — a rig slot is one garment —
               // so this reads exactly as the hard-coded 1 did for them, and a
               // pack item gets its badge (ui::CountBadge, inventory_ui.cpp).
-              const int cnt = di >= 0 ? (pc.count > 0 ? pc.count : 1) : 0;
-              UIState::KitSlotUI u = mirror(ItemStack{di, cnt, pc.dye});
-              if (u.name.empty()) u.name = pc.item;   // gone from the library
-              if (u.wearable) {
-                u.condition = pc.damage.Condition();
-                u.ruined = GearRuined(u.condition, ruinedAt);
-              }
+              // The piece IS an ItemInstance, so it mirrors as one: its
+              // condition is its own captured damage, its fill a flask's.
+              ItemStack st = static_cast<const ItemInstance&>(pc);
+              if (st.count <= 0) st.count = 1;
+              UIState::KitSlotUI u = mirror(st);
+              if (u.name.empty()) u.name = pc.name;   // gone from the library
               ui.lootSlots.push_back(std::move(u));
             }
           }
@@ -13676,8 +13579,7 @@ int main(int argc, char** argv) {
       // slot since (a throw, a pour to the last drop), so re-read it here.
       const ItemStack* vsM =
           pourAimValid ? &hotbar.slots[vesselSlot] : nullptr;
-      const ItemDef* vdefM =
-          vsM && !vsM->Empty() ? items.At(vsM->def) : nullptr;
+      const ItemDef* vdefM = vsM ? items.Of(*vsM) : nullptr;
       if (vdefM && vdefM->IsContainer() && vsM->Filled() &&
           dbg.size() < kMaxDebugBoxes) {
         static std::vector<uint64_t> ownM;

@@ -18,45 +18,15 @@
 namespace net {
 namespace {
 
-// Two small helpers so the gear and damage shapes are written once each.
-// `WornDamage` is a vector of vectors, so it cannot ride PodVec whole.
-void WriteDamage(ByteWriter& w, const WornDamage& d) {
-  w.U32((uint32_t)d.shells.size());
-  for (const WornShellDamage& s : d.shells) {
-    w.F32(s.hp);
-    w.U32(s.atSpawn);
-    w.U32(s.live);
-    w.PodVec(s.lattice);
-  }
-}
-
-bool ReadDamage(ByteReader& r, WornDamage& d) {
-  uint32_t n = 0;
-  if (!r.U32(n)) return false;
-  // A shell is four reads and a lattice; the reader is bounds-checked and
-  // sticky, so a hostile count simply runs the loop out against `ok` rather
-  // than allocating on the sender's word. resize() would allocate first.
-  d.shells.clear();
-  for (uint32_t i = 0; i < n && r.ok; i++) {
-    WornShellDamage s;
-    r.F32(s.hp);
-    r.U32(s.atSpawn);
-    r.U32(s.live);
-    r.PodVec(s.lattice);
-    if (!r.ok) break;
-    d.shells.push_back(std::move(s));
-  }
-  return r.ok;
-}
-
+// The gear list. Each entry is an ItemInstance (game/iteminstance.h's shared
+// shape, so the wire, the MOBS record and the ground-item records cannot
+// disagree about what an item is) plus where it sits on the rig.
 void WriteGear(ByteWriter& w, const std::vector<WireGear>& gear) {
   w.U32((uint32_t)gear.size());
   for (const WireGear& g : gear) {
-    w.Str(g.item);
+    WriteItemInstance(w, g);
     w.Pod(g.equipSlot);
     w.U32(g.held);
-    w.U32(g.dye);
-    WriteDamage(w, g.damage);
   }
 }
 
@@ -66,11 +36,10 @@ bool ReadGear(ByteReader& r, std::vector<WireGear>& gear) {
   gear.clear();
   for (uint32_t i = 0; i < n && r.ok; i++) {
     WireGear g;
-    r.Str(g.item);
+    if (!ReadItemInstance(r, g)) break;
     r.Pod(g.equipSlot);
     r.U32(g.held);
-    r.U32(g.dye);
-    if (!ReadDamage(r, g.damage)) break;
+    if (!r.ok) break;
     gear.push_back(std::move(g));
   }
   return r.ok;

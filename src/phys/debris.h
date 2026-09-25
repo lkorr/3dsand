@@ -555,11 +555,12 @@ class DebrisSystem {
   // body-as-item arrive as callbacks. That keeps the layering one-way and
   // keeps "which item is this" in the one place that owns it.
   //
-  // `lookup` fills name/dye/damage for a body handle and returns false if the
-  // body is not an item. `take` removes the body from the world exactly as the
-  // local E key does and returns true if it really was taken.
-  void SetItemLookupFn(std::function<bool(uint64_t handle, std::string& name,
-                                          uint32_t& dye, uint32_t& damage)> fn);
+  // `lookup` fills the item a body handle IS (the whole ItemInstance: name,
+  // dye, fill, damage) and returns false if the body is not an item. `take`
+  // removes the body from the world exactly as the local E key does and
+  // returns true if it really was taken.
+  void SetItemLookupFn(
+      std::function<bool(uint64_t handle, ItemInstance& item)> fn);
   void SetItemTakeFn(std::function<bool(uint64_t handle)> fn);
 
   // PICK UP THE BODY NAMED BY A GLOBAL ID -- the ONE entry point for E, on both
@@ -1793,7 +1794,7 @@ class DebrisSystem {
   uint32_t localPlayerId_ = kLocalOwner;
   std::function<uint32_t(uint64_t globalBodyId, Vec3 posVoxel)> ownershipFn_;
   std::function<bool(IVec3 wc)> chunkOwnedFn_;
-  std::function<bool(uint64_t, std::string&, uint32_t&, uint32_t&)> itemLookupFn_;
+  std::function<bool(uint64_t, ItemInstance&)> itemLookupFn_;
   std::function<bool(uint64_t)> itemTakeFn_;
   // Requests this machine has to SEND (E pressed on a ghost item) and grants
   // it has to CONSUME (its own pickups plus peers' replies). Plain deques:

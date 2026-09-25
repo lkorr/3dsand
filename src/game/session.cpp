@@ -334,10 +334,8 @@ struct TickScratch {
   bool& wasInLiquid = s.wasInLiquid;                       \
   Brush& brush = s.brush;                                  \
   PrefabPlacer& placer = s.placer;                         \
-  Inventory& hotbar = s.hotbar;                            \
-  PlayerKit& kit = s.kit;                                  \
-  std::string(&wearTried)[kEquipSlotCount] = s.wearTried;  \
-  uint32_t(&wearDye)[kEquipSlotCount] = s.wearDye;         \
+  Kit& kit = s.kit();                                      \
+  Inventory& hotbar = kit.hotbar;                          \
   GrabHold& grab = s.grab;                                 \
   SpellSystem& spells = s.spells;                          \
   PlayerCaster& caster = s.caster;                         \
@@ -1175,7 +1173,7 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
   {
       // ---- WARDROBE panel: make a set of clothes in a colour --------------
       //
-      // Producers on the SAME paths the game uses: PlayerKit's own containers
+      // Producers on the SAME paths the game uses: the kit's own containers
       // and the ordinary equip slots, so a tunic this button made is a tunic,
       // not a dev-only object. The only thing the panel adds to an item that
       // picking one off the ground would not is the dye word.
@@ -1213,12 +1211,13 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
         const char* why = nullptr;
         if (!d || !mat) {
           ui.giveVesselStatus = "pick a vessel and a material";
-        } else if (!ContainerAccepts(*d, ItemStack{di, 1}, mat, mats, &why)) {
+        } else if (!ContainerAccepts(*d, StackOf(items, di), mat, mats, &why)) {
           ui.giveVesselStatus = why ? why : "refused";
         } else {
-          const uint16_t amt = (uint16_t)std::min(d->container.capacity, 0xFFFF);
-          const bool ok = hotbar.Add(di, 1, 0, (uint16_t)mat, amt) >= 0 ||
-                          kit.bag.Add(di, 1, 0, (uint16_t)mat, amt) >= 0;
+          ItemStack full = StackOf(items, di);
+          full.fillMat = (uint16_t)mat;
+          full.fillAmt = (uint16_t)std::min(d->container.capacity, 0xFFFF);
+          const bool ok = hotbar.Add(full) >= 0 || kit.bag.Add(full) >= 0;
           ui.giveVesselStatus = ok ? vname + " of " + mname + " — in your pack"
                                    : "no room in the hotbar or the bag";
         }
@@ -1233,13 +1232,14 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
         if (redye) {
           // RE-DYE WHAT IS ON. Only the dyeable pieces: the wizard's robe is
           // painted in real colours and multiplying them by another colour is
-          // not a feature (ItemDef::dyeable). The wear sync a few hundred lines
-          // down notices the changed dye and rebuilds those shells, which is
-          // why nothing here touches the rig.
+          // not a feature (ItemDef::dyeable). Mob::DressFromKit a few hundred
+          // lines down notices the changed dye, carries the shells' damage back
+          // into the stack and rebuilds them in the new colour, which is why
+          // nothing here touches the rig.
           int n = 0;
           for (int s = 0; s < kEquipSlotCount; s++) {
             ItemStack& st = kit.equip.slots[s];
-            const ItemDef* d = items.At(st.Empty() ? -1 : st.def);
+            const ItemDef* d = items.Of(st);
             if (d == nullptr || !d->dyeable) continue;
             st.dye = dye;
             n++;
@@ -1274,14 +1274,17 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
             if (wear) {
               const int slot = EquipSlotFor(d->kind, kit.equip);
               if (slot >= 0) {
-                const ItemStack was = kit.equip.At(slot);
-                if (!was.Empty()) kit.bag.Add(was.def, was.count, was.dye);
-                kit.equip.slots[slot] = ItemStack{di, 1, dye};
+                // Off the body WITH its holes (Mob::KitTake flushes the
+                // shells), and into the pack as the object it is.
+                const ItemStack was =
+                    avatar.KitTake(KitRef{KitSpace::Equip, slot});
+                if (!was.Empty()) kit.bag.Add(was);
+                kit.equip.slots[slot] = StackOf(items, di, 1, dye);
                 ok = true;
               }
             } else {
-              ok = hotbar.Add(di, 1, dye) >= 0 ||
-                   kit.bag.Add(di, 1, dye) >= 0;
+              ok = hotbar.Add(StackOf(items, di, 1, dye)) >= 0 ||
+                   kit.bag.Add(StackOf(items, di, 1, dye)) >= 0;
             }
             if (ok) {
               if (!names.empty()) names += ", ";
@@ -1537,7 +1540,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                                  int nSpill, uint16_t mat, int units) {
             ItemStack& cand = v[i];
             if (cand.Empty()) return 0;
-            const ItemDef* d = items.At(cand.def);
+            const ItemDef* d = items.Of(cand);
             if (!d || !d->IsContainer() || (cand.Filled() && cand.fillMat != mat))
               return 0;
             if (mat >= mats.size() || mats[mat].gpu.klass > 31 ||
@@ -1588,7 +1591,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         const int tslot = st.intent.vesselSlot;
         const ItemStack* ts =
             tslot >= 0 && tslot < kItemSlots ? &hotbar.slots[tslot] : nullptr;
-        const ItemDef* tdef = ts && !ts->Empty() ? items.At(ts->def) : nullptr;
+        const ItemDef* tdef = ts ? items.Of(*ts) : nullptr;
         if (!tdef || !ContainerThrowable(*tdef) || tslot != s.throwSlot) {
           if (s.throwTicks > 0 && avatar.Spawned())
             avatar.StopClip("throw_windup");
@@ -1651,10 +1654,10 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               at = hp - c;
             }
           }
+          // ONE of the stack leaves, as the object it is: its dye, its fill.
           const uint64_t body =
-              w.ground ? DropItemToWorld(*tdef, at, vel, phys, debris, &mbSet,
-                                         *w.ground, nullptr, vs.dye,
-                                         PackItemFill(vs.fillMat, vs.fillAmt))
+              w.ground ? DropItemToWorld(*tdef, vs.One(), at, vel, phys, debris,
+                                         &mbSet, *w.ground)
                        : 0;
           if (body) phys.ReleaseToWorldWhenClear(body, /*thrown=*/true);
           if (body) {
@@ -1667,7 +1670,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             if (--vs.count <= 0) {
               vs = ItemStack{};
             } else {
-              // The fill was ONE flask's (item.h SameKind) and it just left
+              // The fill was ONE flask's (ItemInstance::StacksWith) and it just left
               // in the thrown one; what stays behind is empty, not a copy.
               vs.fillMat = 0;
               vs.fillAmt = 0;
@@ -1684,7 +1687,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
       if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots &&
           s.throwTicks == 0 && s.throwLaunchIn == 0) {
         ItemStack& vs = hotbar.slots[st.intent.vesselSlot];
-        const ItemDef* vdef = vs.Empty() ? nullptr : items.At(vs.def);
+        const ItemDef* vdef = items.Of(vs);
         const WorldSnapshot& vsnap = world.Snap();
         const Vec3 eye = player.EyePos();
         const Vec3 fwd = cam.Forward();
@@ -2056,10 +2059,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           avatar.Spawn(player, avatarHeading);
           if (avatar.HasEyeLocal())
             player.SetModelEyeHeight(avatar.EyeRestHeight());
-          // A new rig wears nothing (Mob::BuildRig clears its shells), so the
-          // armour sync below has to be offered every slot again.
-          for (std::string& w : wearTried) w.clear();
-          for (uint32_t& d : wearDye) d = 0;
+          // A new rig wears nothing (Mob::BuildRig clears its shells and
+          // DressFromKit's memo), so the armour sync below offers every slot
+          // again on its own.
           tpRig.Snap();   // re-entering from fly: don't ease across the gap
         }
         if (!wantAvatar && avatar.Spawned()) avatar.Despawn();
@@ -2093,9 +2095,8 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // borrowed rig slot: the flask is a real part of the arm while
             // you hold it (game/container.h).
             const ItemDef* vesselDef = nullptr;
-            if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots &&
-                !hotbar.slots[st.intent.vesselSlot].Empty())
-              vesselDef = items.At(hotbar.slots[st.intent.vesselSlot].def);
+            if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots)
+              vesselDef = items.Of(hotbar.slots[st.intent.vesselSlot]);
             const ItemDef* want = meleeArmed ? heldItem : vesselDef;
             const std::string wantName = want ? want->name : std::string();
             if (avatar.HeldItem() != wantName) avatar.EquipItem(want);
@@ -2353,60 +2354,25 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             avatar.SetWeaponPose(melee.Pose());
           }
         }
-        // ---- ARMOUR: what the equipment says vs what the body wears --------
+        // ---- ARMOUR: the body wears what the kit's equipment says -----------
         //
-        // The SAME change-detection seam the weapon uses one block up, and in
-        // the same place in the frame for the same reason: WearItem builds
-        // bodies and joints, so it must run once per CHANGE rather than once
-        // per tick, and it must run before PreTick flattens the pose and
-        // submits the kinematic targets — a shell appended after that would
-        // sit at its spawn pose for a tick and visibly snap into place.
+        // Mob::DressFromKit (W2-M): the kit is the avatar's own, and the rig's
+        // shells are derived from it. Here, in the same place in the frame the
+        // weapon's seam uses one block up and for the same reason: WearItem
+        // builds bodies and joints, so it runs once per CHANGE, and before
+        // PreTick flattens the pose and submits the kinematic targets — a
+        // shell appended after that would sit at its spawn pose for a tick and
+        // visibly snap into place. A respawn clears the rig's shells
+        // (BuildRig) and the next call simply puts them back.
         //
-        // Compared BY NAME, which is also what makes this survive an R
-        // hot-reload: library indices renumber, the name does not. A respawn
-        // clears the rig's shells (BuildRig) and this loop simply puts them
-        // back on the next tick, with no despawn/respawn bookkeeping anywhere.
-        //
-        // `wearTried` is what stops a REFUSED piece from being retried every
-        // tick. Comparing against what the body is actually wearing is not
-        // enough on its own: a piece that finds no limb to hang on (a helm on
-        // a headless mob) leaves the slot un-worn, so the two would disagree
-        // forever and WearItem would rebuild nothing, loudly, 30 times a
-        // second. This records the last ATTEMPT, which the slot changing is
-        // what clears.
-        if (avatar.Spawned()) {
-          for (int s = 0; s < kEquipSlotCount; s++) {
-            if (!EquipSlotIsWorn(s)) continue;
-            const ItemStack& st = kit.equip.At(s);
-            const ItemDef* want = items.At(st.Empty() ? -1 : st.def);
-            const std::string wantName = want ? want->name : std::string();
-            const uint32_t wantDye = st.Empty() ? 0u : st.dye;
-            if (avatar.WornItem(s) == wantName && wearTried[s] == wantName &&
-                wearDye[s] == wantDye)
-              continue;
-            if (wearTried[s] == wantName && wearDye[s] == wantDye &&
-                avatar.WornItem(s).empty() && !wantName.empty())
-              continue;   // already refused this one; nothing has changed
-            // TAKING IT OFF KEEPS ITS WOUNDS. The shells are the only place
-            // the damage lives while the piece is on, and they are destroyed
-            // with the slots — so it is read out here, one call before the
-            // rig forgets it, and handed back on the next wear. Without this
-            // pair, changing boots mends the pair you took off.
-            const std::string had = avatar.WornItem(s);
-            if (!had.empty()) {
-              WornDamage d;
-              if (avatar.CaptureWorn(s, d)) kit.SetDamage(had, std::move(d));
-            }
-            wearTried[s] = wantName;
-            wearDye[s] = wantDye;
-            if (wantName.empty()) {
-              avatar.UnwearItem(s);
-            } else if (!avatar.WearItem(want, s, kit.Damage(wantName),
-                                        wantDye)) {
-              ui.kitMessage = "that does not fit you";
-              ui.kitMessageAge = 0.0f;
-            }
-          }
+        // This used to be a loop HERE that compared the session's PlayerKit
+        // with the rig by name every tick through two latch arrays, and read a
+        // removed piece's damage into a map keyed by item name — so two robes
+        // shared one set of holes. The damage now travels in the stack itself
+        // (Mob::KitMove/KitTake flush the shells into it on the way out).
+        if (avatar.Spawned() && avatar.DressFromKit(items) > 0) {
+          ui.kitMessage = "that does not fit you";
+          ui.kitMessageAge = 0.0f;
         }
         // Head look, the other half of the turn policy above: whatever yaw the
         // body did NOT take is what the head is asked for. Computed from the
@@ -2733,8 +2699,8 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // costs nothing, because nothing leaves the flask.
         {
           PlayerSession::PourStroke& ps = s.pourStroke;
-          ItemStack* vp = kit.Resolve(ps.vessel, hotbar);
-          // ONE VESSEL'S FILL (item.h SameKind): a filled stack left by an old
+          ItemStack* vp = kit.Resolve(ps.vessel);
+          // ONE VESSEL'S FILL (ItemInstance::StacksWith): a filled stack left by an old
           // save is split first, else the brush would drain one flask's fill
           // on behalf of the whole stack. Where the rest cannot be set down,
           // the brush does not pour.
@@ -2751,7 +2717,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                         : false;
             if (!split) vp = nullptr;
           }
-          const ItemDef* vdef = !vp || vp->Empty() ? nullptr : items.At(vp->def);
+          const ItemDef* vdef = vp ? items.Of(*vp) : nullptr;
           if (!ps.active || !avatar.Spawned() || !vdef || !vdef->IsContainer() ||
               !vp->Filled()) {
             s.pourStrokeTicks = 0;

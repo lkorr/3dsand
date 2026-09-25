@@ -423,13 +423,13 @@ struct PlayerSession {
   // ---- tools ----
   Brush brush;
   PrefabPlacer placer;
-  Inventory hotbar;
-  PlayerKit kit;
-  // What we last ASKED the body to wear, per equip slot, and in what dye. Not
-  // a second copy of the equipment — it is the record that keeps a REFUSED
-  // piece from being retried thirty times a second.
-  std::string wearTried[kEquipSlotCount];
-  uint32_t wearDye[kEquipSlotCount] = {};
+  // THE KIT IS THE AVATAR'S (W2-M): hotbar, bag and equipment are
+  // `avatar.GetKit()` / `avatar.KitMut()` (Mob::kit_), and the rig is dressed
+  // from it by Mob::DressFromKit. The session used to hold `hotbar` and a
+  // `PlayerKit` here plus the `wearTried`/`wearDye` latches its per-tick wear
+  // loop reconciled the rig through.
+  Kit& kit() { return avatar.KitMut(); }
+  Inventory& hotbar() { return avatar.KitMut().hotbar; }
 
   // ---- looking at things, and looting them (game/corpses.h) ----
   // What the reach ray found this frame (a debris body handle or 0), the
@@ -559,7 +559,7 @@ struct PlayerSession {
 // belong to the same player" was a fact nobody could check.
 inline PlayerKitRefs PlayerKitOf(PlayerSession& s, const GlyphLibrary& glyphs,
                                  const ItemLibrary& items) {
-  return PlayerKitRefs{&s.caster, &glyphs, &s.hotbar, &s.kit, &items};
+  return PlayerKitRefs{&s.caster, &glyphs, &s.kit(), &items, &s.avatar};
 }
 
 // What the FRAME layer decided this frame that the tick has to act under.

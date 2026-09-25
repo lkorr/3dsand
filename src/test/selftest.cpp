@@ -379,7 +379,12 @@ const char* const kOrder[] = {
     // terrain and carves a shell, which wants the same standing world the
     // body gates run in; before `ragdoll-joints` because it leaves the rig
     // undressed and MobSystem reset, which is what that gate expects to find.
-    "armor-wear", "item-ground", "loot", "armor-fit",
+    "armor-wear", "item-ground", "loot",
+    // One item instance, one kit (W2-M): dresses a rig from its Kit, carves the
+    // worn piece and swaps it with its identical twin. Spawns, resets and puts
+    // the id counter back, beside `loot` for the same standing world.
+    "kit-instance",
+    "armor-fit",
     // Pure anim over its own five-part fixture — it touches no shared World and
     // so is order-independent; it sits here to keep the armour gates together.
     "armor-track", "armor-stock",

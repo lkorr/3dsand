@@ -7,6 +7,7 @@
 
 #include "game/anim.h"
 #include "game/impact.h"
+#include "game/iteminstance.h"
 #include "sim/microbody.h"
 #include "sim/voxload.h"
 
@@ -490,8 +491,9 @@ struct ItemDef {
 // Cells <-> the eighths a ContainerSpec counts in.
 constexpr int kContainerUnitsPerCell = 8;
 
-// The item library. Loaded once; indices into it are what a slot stores, the
-// same way a glyph slot stores an index into GlyphLibrary::glyphs.
+// The item library. Loaded once. A slot stores an ItemInstance BY NAME
+// (game/iteminstance.h), and `Of` is how a slot asks for its def: indices are
+// file order and change on every R hot-reload, so nothing keeps one.
 struct ItemLibrary {
   std::vector<ItemDef> items;
 
@@ -503,6 +505,14 @@ struct ItemLibrary {
   const ItemDef* At(int i) const {
     return (i >= 0 && i < (int)items.size()) ? &items[i] : nullptr;
   }
+  const ItemDef* Named(const std::string& name) const {
+    return name.empty() ? nullptr : At(Find(name));
+  }
+  // The def an instance names, or null for an empty slot or a name this
+  // library no longer has.
+  const ItemDef* Of(const ItemInstance& it) const {
+    return it.Empty() ? nullptr : Named(it.name);
+  }
 };
 
 // Which slots exist. 10, on the number row, matching kGlyphSlots — the two
@@ -510,50 +520,52 @@ struct ItemLibrary {
 // the same hand reaching for the same keys.
 constexpr int kItemSlots = 10;
 
-struct ItemStack {
-  int def = -1;      // index into ItemLibrary::items, -1 = empty
-  int count = 0;
-  // WHAT COLOUR THIS PARTICULAR ONE IS (game/dye.h). 0 = undyed, which is every
-  // stack that predates the wardrobe and every item that is not a dyeable
-  // garment.
-  //
-  // ON THE STACK, not on the def: the def is the PATTERN and two people in
-  // tunics are wearing the same def. That is the whole reason the dye is a
-  // runtime word rather than baked art — see the note at the top of dye.h.
-  //
-  // WHICH MEANS TWO DYES DO NOT STACK. `Add`/`Bag::Add` merge by def, so
-  // adding a red tunic to a stack of blue ones would quietly repaint them.
-  // Both now require the dye to match as well, and fall through to a fresh
-  // slot when it does not — the same rule every game with enchantments uses,
-  // arrived at for the same reason.
-  uint32_t dye = 0;
-  // WHAT IS IN IT, for a vessel (ItemKind::Container, game/container.h).
-  // Material id + eighths of a cell, and it is the fill of ONE vessel.
-  //
-  // A FILLED VESSEL NEVER STACKS, with anything, even an identical one. It
-  // used to be part of the merge key the way the dye is, so two flasks each
-  // holding 40 eighths of water merged into a count-2 stack with ONE fillAmt
-  // of 40: every path that charges or pays a fill (pour, the portrait brush,
-  // the scoop's settle) treats the stack as one flask, so pouring the pair
-  // destroyed a flask's worth and a scoop paid into a stack of three empties
-  // tripled it. A fill is per-object state, so the object stays alone; empty
-  // vessels still stack. 0/0 on everything that is not a vessel.
-  uint16_t fillMat = 0;
-  uint16_t fillAmt = 0;
-  bool Empty() const { return def < 0 || count <= 0; }
-  bool Filled() const { return fillMat != 0 && fillAmt != 0; }
-  bool SameKind(int d, uint32_t dy, uint16_t fm, uint16_t fa) const {
-    return def == d && dye == dy && fillAmt == 0 && fa == 0;
-  }
-};
+// ONE SLOT'S CONTENTS IS AN ITEM INSTANCE (W2-M). It was a library index plus
+// the fields that happened to have been needed so far (count, dye, fill), and
+// every record the item crossed into (a pack, the ground, the wire, a save)
+// had its own subset; now the slot and every one of those records carry the
+// same struct, and a crossing copies it whole. See game/iteminstance.h for
+// the fields and the stacking rule (ItemInstance::StacksWith).
+using ItemStack = ItemInstance;
+
+// An instance of library entry `def`, for the callers that found the item by
+// index (a spawn menu, the starting kit, a test). Empty for a bad index.
+inline ItemStack StackOf(const ItemLibrary& lib, int def, int count = 1,
+                         uint32_t dye = 0) {
+  const ItemDef* d = lib.At(def);
+  if (!d || count <= 0) return ItemStack{};
+  ItemStack s;
+  s.name = d->name;
+  s.count = count;
+  s.dye = dye;
+  return s;
+}
+
+// Put `s` into the first stack it merges with (ItemInstance::StacksWith), else
+// the first empty slot. Returns the slot, or -1 when there is no room — the
+// caller decides what that means (a pickup refused, an unequip that stays
+// equipped); nothing is ever dropped behind its back. Shared by the hotbar
+// and the bag so the merge rule is spelled once.
+inline int AddToSlots(ItemStack* slots, int n, const ItemStack& s) {
+  if (s.Empty()) return -1;
+  for (int i = 0; i < n; i++)
+    if (!slots[i].Empty() && slots[i].StacksWith(s)) {
+      slots[i].count += s.count;
+      return i;
+    }
+  for (int i = 0; i < n; i++)
+    if (slots[i].Empty()) {
+      slots[i] = s;
+      return i;
+    }
+  return -1;
+}
 
 struct Inventory {
   ItemStack slots[kItemSlots];
   int selected = 0;
 
   const ItemStack& Selected() const { return slots[Clamp(selected)]; }
-  // The def index of what is in hand, or -1 for an empty hand.
-  int HeldDef() const { return Selected().Empty() ? -1 : Selected().def; }
 
   void Select(int slot) { selected = Clamp(slot); }
   // Scroll wheel: wraps, because a hotbar that stops at the ends makes the
@@ -564,50 +576,29 @@ struct Inventory {
     selected = ((selected + delta) % n + n) % n;
   }
 
-  // Adds to the first slot already holding this def AND THIS DYE, else the
-  // first empty one. Returns the slot, or -1 when the hotbar is full — the
-  // caller decides what that means (here: the pickup is refused and the item
-  // stays in the world).
-  //
-  // The dye is part of the merge key for the reason ItemStack::dye states: a
-  // stack is one colour, and folding a red tunic into a stack of blue ones
-  // would repaint them.
-  int Add(int defIndex, int count = 1, uint32_t dye = 0, uint16_t fillMat = 0,
-          uint16_t fillAmt = 0) {
-    if (defIndex < 0 || count <= 0) return -1;
-    for (int i = 0; i < kItemSlots; i++)
-      if (!slots[i].Empty() &&
-          slots[i].SameKind(defIndex, dye, fillMat, fillAmt)) {
-        slots[i].count += count;
-        return i;
-      }
-    for (int i = 0; i < kItemSlots; i++)
-      if (slots[i].Empty()) {
-        slots[i] = {defIndex, count, dye, fillMat, fillAmt};
-        return i;
-      }
-    return -1;
-  }
+  // Merges into a stack of the same plain item and dye, else the first empty
+  // slot; -1 when the hotbar is full (AddToSlots).
+  int Add(const ItemStack& s) { return AddToSlots(slots, kItemSlots, s); }
 
-  // Removes one from a slot, emptying it at zero. Returns the def removed.
-  int TakeOne(int slot) {
+  // Removes one from a slot, emptying it at zero. Returns the one removed
+  // (empty when the slot was).
+  ItemStack TakeOne(int slot) {
     int s = Clamp(slot);
-    if (slots[s].Empty()) return -1;
-    int d = slots[s].def;
+    if (slots[s].Empty()) return ItemStack{};
+    ItemStack one = slots[s].One();
     if (--slots[s].count <= 0) slots[s] = ItemStack{};
-    return d;
+    return one;
   }
 
  private:
   static int Clamp(int s) { return s < 0 ? 0 : (s >= kItemSlots ? kItemSlots - 1 : s); }
 };
-
 // Loads assets/items/items.json and, for each item, its own
 // assets/items/<id>.{vox,json}. Errors are appended to `errors` and reported
 // the way materials and glyphs are: a malformed item is skipped loudly, a
-// missing file is a failure. Hot-reloadable (R) alongside them — nothing here
-// is cached by index anywhere except the hotbar, which is re-validated on
-// reload by the caller.
+// missing file is a failure. Hot-reloadable (R) alongside them — nothing
+// caches an index into it (every slot holds a NAME), so a reload only has to
+// drop the slots whose item is gone (Kit::DropUnknown).
 //
 // `micro` receives each item's packed brick, exactly as mob defs pack theirs:
 // a held item is drawn by the same micro-body path as the limb whose slot it

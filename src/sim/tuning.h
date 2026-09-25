@@ -598,8 +598,9 @@ struct Tuning {
     //         moment of death and everything is on the thing wearing your
     //         face. No duplication, and the death penalty this becomes.
     //
-    // CPU-only, read at the one seam (MobSystem::SetAvatarKitFn, bound in
-    // main.cpp). Nothing here reaches a shader or the CA.
+    // CPU-only, read at the one seam (MobSystem::ServiceRising, where a
+    // rising takes the owning avatar's Kit). Nothing here reaches a shader or
+    // the CA.
     bool keepKitOnTurn = true;
   } avatar;
 

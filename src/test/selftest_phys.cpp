@@ -1218,9 +1218,12 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
     a.hadMicro = 1;
     a.bleedMat = 9;
     a.dead = 1;
-    a.item = "iron sword";
-    a.itemDye = 3;
-    a.itemDamage = 41;
+    a.item.name = "iron sword";
+    a.item.dye = 3;
+    a.item.fillMat = 7;    // W2-M: the whole ItemInstance travels
+    a.item.fillAmt = 41;
+    a.item.damage.shells.resize(1);
+    a.item.damage.shells[0].hp = 2.5f;
     std::vector<uint8_t> buf;
     net::Encode(buf, a);
     // TWO RECORDS IN ONE BUFFER, on purpose: a datagram carries several, and
@@ -1243,7 +1246,11 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
               a2.physScale == a.physScale && a2.skinScale == a.skinScale &&
               a2.dye == a.dye && a2.hadMicro == a.hadMicro &&
               a2.bleedMat == a.bleedMat && a2.dead == a.dead &&
-              a2.item == a.item && a2.itemDamage == a.itemDamage &&
+              a2.item.name == a.item.name && a2.item.dye == a.item.dye &&
+              a2.item.fillMat == a.item.fillMat &&
+              a2.item.fillAmt == a.item.fillAmt &&
+              a2.item.damage.shells.size() == 1 &&
+              a2.item.damage.shells[0].hp == 2.5f &&
               std::memcmp(a2.voxels.data(), a.voxels.data(),
                           a.voxels.size() * sizeof(DebrisVoxel)) == 0;
     codecOk = codecOk && p2.tick == pose.tick && p2.vel.y == pose.vel.y;
@@ -1548,12 +1555,16 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
   std::string grantedName;
   {
     // The GHOST arm is the interesting one: E on a body another machine owns.
-    debris.SetItemLookupFn([&](uint64_t bh, std::string& name, uint32_t& dye,
-                               uint32_t& dmg) {
+    // The WHOLE item (W2-M): a grant used to carry name, dye and a damage word
+    // nothing wrote, and a flask picked up across the wire arrived empty.
+    debris.SetItemLookupFn([&](uint64_t bh, ItemInstance& it) {
       if (bh != ghostH) return false;
-      name = "iron sword";
-      dye = 5;
-      dmg = 12;
+      it.name = "iron sword";
+      it.dye = 5;
+      it.fillMat = 9;
+      it.fillAmt = 12;
+      it.damage.shells.resize(1);
+      it.damage.shells[0].hp = 12.0f;
       return true;
     });
     // A PICKUP TAKES THE THING OFF THE GROUND. The first version of this
@@ -1589,10 +1600,18 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
     debris.ApplyItemTake(out);
     net::ItemGrant g{};
     const bool gotGrant = debris.PopItemGrant(g);
-    grantedName = g.item;
+    grantedName = g.item.name;
+    // ...and it survives the wire: the requester sees what the owner took.
+    std::vector<uint8_t> gbuf;
+    net::Encode(gbuf, g);
+    ByteReader gr{gbuf.data(), gbuf.size()};
+    net::ItemGrant gw{};
+    const bool wired = net::Decode(gr, gw) && gr.off == gbuf.size();
     itemOk = queued && noEarlyGrant && sent && gotGrant && g.granted == 1 &&
-             g.item == "iron sword" && g.dye == 5 && g.damage == 12 &&
-             g.globalId == ghostId;
+             wired && gw.item.name == "iron sword" && gw.item.dye == 5 &&
+             gw.item.fillMat == 9 && gw.item.fillAmt == 12 &&
+             gw.item.damage.shells.size() == 1 &&
+             gw.item.damage.shells[0].hp == 12.0f && gw.globalId == ghostId;
     // A REFUSAL IS A REPLY, and it has to be distinguishable. Asking again for
     // the body that has now been taken must come back granted == 0 rather
     // than silently producing nothing.

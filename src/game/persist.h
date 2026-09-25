@@ -53,15 +53,21 @@
 //
 // Nullable: a headless path with no player writes no section, and a save
 // without one loads a fresh kit.
+//
+// W2-M: the hotbar, bag and equipment are ONE Kit, and the kit is the avatar's
+// (Mob::kit_). `wearer` is the creature wearing it — the save flushes its worn
+// shells' live damage into the stacks first (Mob::KitFlushWorn) and a load
+// marks its worn slots stale so the rig re-dresses from what was loaded.
+// Nullable: a fixture's bare Kit has nobody wearing it.
 struct PlayerKitRefs {
   PlayerCaster* caster = nullptr;
   const GlyphLibrary* glyphs = nullptr;
-  Inventory* hotbar = nullptr;
-  PlayerKit* kit = nullptr;
+  Kit* kit = nullptr;
   const ItemLibrary* items = nullptr;
+  Mob* wearer = nullptr;
 
   bool Complete() const {
-    return caster && glyphs && hotbar && kit && items;
+    return caster && glyphs && kit && items;
   }
 };
 
@@ -93,7 +99,12 @@ struct PlayerKitRefs {
 // it was.
 // Version 6 appends VESSEL CONTENTS (game/container.h): one packed word per
 // slot, the dyes' shape again. A v5 kit loads with every flask empty.
-constexpr uint32_t kPlayerKitSaveVersion = 6;
+// Version 7 (rule-unification W2-M) moves worn damage from the v2 section's
+// one-blob-per-item-NAME map onto the SLOTS: the v2 section is written empty
+// and a per-slot damage array is appended in the dyes' shape, so two robes in
+// one pack keep two sets of holes. A v2..v6 kit loads its by-name damage onto
+// every stack of that name, which is what those files meant.
+constexpr uint32_t kPlayerKitSaveVersion = 7;
 constexpr uint32_t kPlayerKitOldestLoadable = 3;
 
 // ITEMS ON THE GROUND ('ITMS'): what is lying around, by name and pose.
@@ -124,9 +135,12 @@ struct WorldItemRefs {
 // and a dropped blue one share a name and a lattice, so the colour is the only
 // thing telling them apart and nothing else in the record implies it. v1 still
 // loads — its items come back undyed, which is what they were.
-// v3 inserts the vessel FILL word after the dye (WorldItem::fill); a v2
-// ground flask loads empty.
-constexpr uint32_t kWorldItemSaveVersion = 3;
+// v3 inserts the vessel FILL word after the dye (the ItemInstance's fill); a
+// v2 ground flask loads empty.
+// v4 (W2-M) appends each entry's worn DAMAGE after its lattice (every shell of
+// the piece; the body is only its largest panel). A v3 item loads as
+// authored-under-its-lattice, which is what it was.
+constexpr uint32_t kWorldItemSaveVersion = 4;
 
 // The 'PLYR' serializer, exposed so the grimoire gate can write an OLDER
 // version's payload (everything up to that version's last block) and prove

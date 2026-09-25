@@ -6142,7 +6142,7 @@ Status GateZombify(Ctx& c, std::string& detail) {
 // ---- mob-loot --------------------------------------------------------------
 //
 // THE PACK: what a creature is carrying that is not on its body (MobDef::loot,
-// Mob::carried_). Six claims, in the order the thing actually happens —
+// Mob::Carried — its Kit's bag since W2-M). Six claims, in the order the thing actually happens —
 // authored, rolled, dropped, looted, carried through a turning, saved.
 //
 // IT AUTHORS ITS OWN TABLE rather than reading human.json's. A gate that
@@ -6209,10 +6209,25 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
   auto countOf = [](const Mob* m, const char* item) {
     int n = 0;
     if (m != nullptr)
-      for (const CarriedItem& ci : m->Carried())
-        if (ci.item == item) n += ci.count;
+      for (const ItemInstance& ci : m->Carried())
+        if (ci.name == item) n += ci.count;
     return n;
   };
+  // What a carried FLASK holds, eighths (-1 = no flask in the pack). W2-M: the
+  // pack is ItemInstances, so a flask's fill rides every crossing a pack does.
+  const bool haveFlask = c.items.Find("flask") >= 0;
+  auto flaskFill = [](const Mob* m) {
+    if (m != nullptr)
+      for (const ItemInstance& ci : m->Carried())
+        if (ci.name == "flask") return (int)ci.fillAmt;
+    return -1;
+  };
+  uint16_t waterMat = 0;
+  for (size_t mi = 1; mi < c.mats.size() && !waterMat; mi++)
+    if (c.mats[mi].name == "water") waterMat = (uint16_t)mi;
+  ItemInstance kFlask{"flask", 1};
+  kFlask.fillMat = waterMat;
+  kFlask.fillAmt = 37;
 
   // ---- A: IT ROLLS, AND THE ROLL IS A FUNCTION OF THE CREATURE ------------
   //
@@ -6230,13 +6245,13 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
     const uint64_t id = c.mobs.Spawn(hi, {spot.x, spot.y + 1, spot.z});
     Mob* m = c.mobs.FindMobById(id);
     if (m != nullptr) {
-      const std::vector<CarriedItem> first = m->Carried();
+      const std::vector<ItemInstance> first = m->Carried();
       m->ClearCarried();
       m->RollLoot();
-      const std::vector<CarriedItem>& again = m->Carried();
+      const std::vector<ItemInstance> again = m->Carried();
       bool same = first.size() == again.size();
       for (size_t i = 0; same && i < first.size(); i++)
-        same = first[i].item == again[i].item &&
+        same = first[i].name == again[i].name &&
                first[i].count == again[i].count && first[i].dye == again[i].dye;
       sureN = countOf(m, kSure);
       // The certain row is certain, and it is a STACK: a roll that produced
@@ -6268,8 +6283,8 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
       const Mob* m = c.mobs.FindMobById(id);
       if (m == nullptr) continue;
       bool has = false;
-      for (const CarriedItem& ci : m->Carried())
-        if (ci.item == kFlip) { has = true; dyeSeen = ci.dye; }
+      for (const ItemInstance& ci : m->Carried())
+        if (ci.name == kFlip) { has = true; dyeSeen = ci.dye; }
       if (has) withFlip++; else withoutFlip++;
     }
     // ...and the DYE travelled with it. A colour authored in the table and
@@ -6310,19 +6325,18 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
         // The pack entry, found the way anything finds one: by what it is.
         int at = -1;
         for (size_t i = 0; i < list.size(); i++)
-          if (list[i].kind == LootPiece::Kind::Carried && list[i].item == kSure)
+          if (list[i].kind == LootPiece::Kind::Carried && list[i].name == kSure)
             at = (int)i;
-        PlayerKit kit;
-        Inventory hotbar;
+        Mob looter;
+        Kit& kit = looter.KitMut();
         std::string took;
         const LootResult lr =
-            at >= 0 ? TakeCorpseLoot(*cr, at, KitRef{}, kit, hotbar, c.items,
-                                     &took)
+            at >= 0 ? TakeCorpseLoot(*cr, at, KitRef{}, looter, c.items, &took)
                     : LootResult::NoSuchPiece;
         for (const ItemStack& s : kit.bag.slots)
-          if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
-        for (const ItemStack& s : hotbar.slots)
-          if (!s.Empty() && s.def == c.items.Find(kSure)) gotN += s.count;
+          if (!s.Empty() && s.name == kSure) gotN += s.count;
+        for (const ItemStack& s : kit.hotbar.slots)
+          if (!s.Empty() && s.name == kSure) gotN += s.count;
         // THE CORPSE IS STILL THERE, WHOLE. A pack item has no body, so taking
         // it must not have taken a limb out of the world with it.
         Mob* after = c.mobs.FindMobById(id);
@@ -6351,7 +6365,7 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
   // the `zombify` gate: PreTick with a later tick, not 180 real ones.
   bool carried = false;
   std::string carryWhy = "no spawn";
-  int roseN = 0;
+  int roseN = 0, roseFill = -1;
   {
     c.debris.Reset();
     c.mobs.Reset();
@@ -6362,6 +6376,9 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
     const uint16_t rotMat =
         zid >= 0 ? c.mobs.Defs()[zid].bite.infectMat : (uint16_t)0;
     const int want = m != nullptr ? countOf(m, kSure) : 0;
+    // ...and a FILLED FLASK in the pack (W2-M): the rising used to carry
+    // name/count/dye and nothing else, so the flask got up empty.
+    if (m != nullptr && haveFlask) m->AddCarried(kFlask);
     if (m != nullptr && rotMat != 0 && want > 0) {
       std::vector<BrushOp> ops;
       std::vector<CellOp> cellOps;
@@ -6390,6 +6407,7 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
           risen = oid;
       }
       roseN = countOf(c.mobs.FindMobById(risen), kSure);
+      roseFill = flaskFill(c.mobs.FindMobById(risen));
       // THE CONTROL, and the reason this cannot pass by accident: the zombie
       // def has NO loot table of its own, so a body that got up carrying two
       // daggers got them from the corpse and from nowhere else. If the rising
@@ -6397,10 +6415,12 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
       const uint64_t ctl =
           c.mobs.Spawn(zid, {spot.x + 4 * step, spot.y + 1, spot.z});
       const int ctlN = countOf(c.mobs.FindMobById(ctl), kSure);
-      carried = risen != 0 && roseN == want && ctlN == 0;
+      carried = risen != 0 && roseN == want && ctlN == 0 &&
+                (!haveFlask || roseFill == kFlask.fillAmt);
       if (!carried)
-        carryWhy = Format("risen=%llu carried=%d/%d control=%d",
-                          (unsigned long long)risen, roseN, want, ctlN);
+        carryWhy = Format("risen=%llu carried=%d/%d control=%d flask=%d/%d",
+                          (unsigned long long)risen, roseN, want, ctlN,
+                          roseFill, (int)kFlask.fillAmt);
     } else {
       carryWhy = m == nullptr ? "could not spawn a human"
                               : (rotMat == 0 ? "no bite.infectMat"
@@ -6426,6 +6446,10 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
         c.mobs.Spawn(hi, {spot.x + 6 * step, spot.y + 1, spot.z});
     const int wantA = countOf(c.mobs.FindMobById(a), kSure);
     const int wantB = countOf(c.mobs.FindMobById(b), kSure);
+    // MOBS v7: the pack is written as whole ItemInstances.
+    if (Mob* ma = c.mobs.FindMobById(a); ma != nullptr && haveFlask)
+      ma->AddCarried(kFlask);
+    int fillBack = -1;
     if (a != 0 && b != 0) {
       std::vector<uint8_t> blob;
       c.mobs.SaveState(blob);
@@ -6438,34 +6462,35 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
       if (back.size() == 2) {
         backN = countOf(c.mobs.FindMobById(back[0]), kSure);
         backN2 = countOf(c.mobs.FindMobById(back[1]), kSure);
+        fillBack = flaskFill(c.mobs.FindMobById(back[0]));
       }
       saved = read && back.size() == 2 && backN == wantA && backN2 == wantB &&
-              wantA > 0;
+              wantA > 0 && (!haveFlask || fillBack == kFlask.fillAmt);
       if (!saved)
-        saveWhy = Format("read=%d mobs=%zu packs=%d/%d vs %d/%d", read ? 1 : 0,
-                         back.size(), backN, backN2, wantA, wantB);
+        saveWhy = Format("read=%d mobs=%zu packs=%d/%d vs %d/%d flask=%d",
+                         read ? 1 : 0, back.size(), backN, backN2, wantA,
+                         wantB, fillBack);
     }
   }
 
   // ---- G: THE PLAYER'S OWN KIT RIDES THEIR OWN CORPSE ---------------------
   //
-  // The avatar turns like anybody else, and its pack is the one thing Die()
-  // cannot read: bag, hotbar and equipment live in PlayerKit on a session this
-  // system deliberately cannot see. So there is a callback, and THIS IS THE
-  // ONLY PLACE THE CALLBACK IS EXERCISED — main.cpp binds it to the real kit,
-  // which no gate has.
+  // The avatar turns like anybody else. Its kit is the AVATAR'S own (Mob::kit_,
+  // W2-M; it used to live on the session and reach the rising through a
+  // callback), it stays with the avatar when the dead rig becomes a corpse
+  // (AdoptDeadAvatar), and the rising reads it off the avatar that owns the
+  // corpse.
   //
   // Two arms, because "the zombie carried three daggers" means nothing without
-  // the control: with the callback UNSET the same death must produce a zombie
+  // the control: with an EMPTY kit the same death must produce a zombie
   // carrying NOTHING. Otherwise a rising that had quietly learned to roll the
   // human's table for itself would pass the first half.
   //
-  // The avatar's own `carried_` stays empty throughout (PlayerAvatar::Spawn
-  // builds its rig without going through MobSystem::Spawn, so it never rolls a
-  // table), which is what makes the count attributable to the hook alone.
+  // A filled FLASK rides in the armed kit's hotbar: the corpse-rise leg of the
+  // plan's "a flask keeps its fill through ... corpse rise".
   bool kitRode = false;
   std::string kitWhy = "no avatar";
-  int kitN = 0, kitCtl = -1;
+  int kitN = 0, kitCtl = -1, kitFill = -1;
   {
     const std::string avName = kAvatarDefName;
     const int avDef = c.mobs.FindDef(avName);
@@ -6482,12 +6507,10 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
         avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
         avatar.SetDefs(&c.mobs.Defs(), avName);
         c.mobs.SetAvatar(&avatar);
-        c.mobs.SetAvatarKitFn(
-            armed ? std::function<void(std::vector<CarriedItem>&)>(
-                        [&](std::vector<CarriedItem>& out) {
-                          out.push_back(CarriedItem{kSure, 3, 0});
-                        })
-                  : nullptr);
+        if (armed) {
+          avatar.KitMut().bag.Add(ItemInstance{kSure, 3});
+          if (haveFlask) avatar.KitMut().hotbar.Add(kFlask);
+        }
         Player pl;
         pl.fly = false;
         pl.grounded = true;
@@ -6522,19 +6545,22 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
           got = 0;
           for (uint32_t i = 0; i < c.mobs.MobCount(); i++) {
             const Mob* om = c.mobs.FindMobById(c.mobs.MobIdAt(i));
-            if (om != nullptr && om->Def() != nullptr && om->Def()->undead)
+            if (om != nullptr && om->Def() != nullptr && om->Def()->undead) {
               got = countOf(om, kSure);
+              if (armed) kitFill = flaskFill(om);
+            }
           }
         }
-        c.mobs.SetAvatarKitFn(nullptr);
         c.mobs.SetAvatar(nullptr);
         return got;
       };
       kitN = runOne(true);
       kitCtl = runOne(false);
-      kitRode = kitN == 3 && kitCtl == 0;
+      kitRode = kitN == 3 && kitCtl == 0 &&
+                (!haveFlask || kitFill == kFlask.fillAmt);
       if (!kitRode)
-        kitWhy = Format("carried=%d (want 3) control=%d (want 0)", kitN, kitCtl);
+        kitWhy = Format("carried=%d (want 3) control=%d (want 0) flask=%d/%d",
+                        kitN, kitCtl, kitFill, (int)kFlask.fillAmt);
     } else {
       kitWhy = avDef < 0 ? "no avatar def" : "no bite.infectMat";
     }
@@ -10725,7 +10751,8 @@ Status GateCorpseSave(Ctx& c, std::string& detail) {
       break;
     }
   if (Mob* a = c.mobs.FindMobById(idA))
-    if (!c.items.items.empty()) a->AddCarried(c.items.items[0].name, 3, 0x40u);
+    if (!c.items.items.empty())
+      a->AddCarried(ItemInstance{c.items.items[0].name, 3, 0x40u});
   for (int i = 0; i < 8; i++) tick(true);
   // B: bitten with the rot, so its death books a rising.
   const MobDef& hd = c.mobs.Defs()[hi];
@@ -10774,9 +10801,8 @@ Status GateCorpseSave(Ctx& c, std::string& detail) {
     a->LootPieces(list);
     for (size_t i = 0; i < list.size(); i++)
       if (list[i].kind == LootPiece::Kind::Held) {
-        PlayerKit kit;
-        Inventory hotbar;
-        lootedHeld = TakeCorpseLoot(*a, (int)i, KitRef{}, kit, hotbar, c.items) ==
+        Mob looter;
+        lootedHeld = TakeCorpseLoot(*a, (int)i, KitRef{}, looter, c.items) ==
                      LootResult::Ok;
         break;
       }
@@ -10881,12 +10907,12 @@ Status GateCorpseSave(Ctx& c, std::string& detail) {
       return Format("loot %zu vs %zu entries", a.loot.size(), b.loot.size());
     for (size_t i = 0; i < a.loot.size(); i++) {
       const LootPiece &p = a.loot[i], &q = b.loot[i];
-      if (p.kind != q.kind || p.item != q.item || p.count != q.count ||
+      if (p.kind != q.kind || p.name != q.name || p.count != q.count ||
           p.dye != q.dye || p.equipSlot != q.equipSlot)
-        return Format("loot %zu '%s'x%d vs '%s'x%d", i, p.item.c_str(), p.count,
-                      q.item.c_str(), q.count);
+        return Format("loot %zu '%s'x%d vs '%s'x%d", i, p.name.c_str(), p.count,
+                      q.name.c_str(), q.count);
       if (std::fabs(p.damage.Condition() - q.damage.Condition()) > 1e-4f)
-        return Format("loot %zu '%s' condition %.4f vs %.4f", i, p.item.c_str(),
+        return Format("loot %zu '%s' condition %.4f vs %.4f", i, p.name.c_str(),
                       p.damage.Condition(), q.damage.Condition());
     }
     return std::string();
@@ -11478,7 +11504,7 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
         gearBack = (int)back.gear.size();
         gearSame = gearBack == gearSent;
         for (int k = 0; k < gearBack && gearSame; k++)
-          gearSame = back.gear[k].item == h.announce.gear[k].item &&
+          gearSame = back.gear[k].name == h.announce.gear[k].name &&
                      back.gear[k].held == h.announce.gear[k].held &&
                      back.gear[k].dye == h.announce.gear[k].dye;
       }
@@ -11730,7 +11756,7 @@ Status GateMobHandoff(Ctx& c, std::string& detail) {
       eGearBack = (int)back.gear.size();
       eGearSame = eGearBack == eGearSent && eGearSent > 0;
       for (int k = 0; k < eGearBack && eGearSame; k++)
-        eGearSame = back.gear[k].item == got.gear[k].item &&
+        eGearSame = back.gear[k].name == got.gear[k].name &&
                     back.gear[k].held == got.gear[k].held &&
                     back.gear[k].dye == got.gear[k].dye;
     }
@@ -12138,7 +12164,7 @@ Status GateNetCorpse(Ctx& c, std::string& detail) {
       gearB = (int)gb.gear.size();
       gearSame = gearA == gearB;
       for (int k = 0; k < gearA && gearSame; k++)
-        gearSame = ga.gear[(size_t)k].item == gb.gear[(size_t)k].item &&
+        gearSame = ga.gear[(size_t)k].name == gb.gear[(size_t)k].name &&
                    ga.gear[(size_t)k].held == gb.gear[(size_t)k].held;
     }
   }

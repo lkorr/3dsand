@@ -1670,9 +1670,9 @@ Status GateSaveSplit(Ctx& c, std::string& detail) {
   debris.SetOnBodyGone([&ground](uint64_t h) { ground.OnBodyGone(h); });
   PlayerCaster caster;
   GlyphLibrary glyphs;
-  Inventory hb;
-  PlayerKit kit;
-  PlayerKitRefs kitRefs{&caster, &glyphs, &hb, &kit, &c.items};
+  Kit kit;
+  Inventory& hb = kit.hotbar;
+  PlayerKitRefs kitRefs{&caster, &glyphs, &kit, &c.items};
   WorldItemRefs groundRefs{&ground, &c.phys, &debris, nullptr, &c.items};
   EntityIO eio = MakeEntityIO(debris, mobs, nullptr, &kitRefs, &groundRefs);
 
@@ -1683,10 +1683,11 @@ Status GateSaveSplit(Ctx& c, std::string& detail) {
     const int h = World::TerrainHeight(s[0], s[1], kDefaultSeed);
     mobs.Spawn(dummyDef, {s[0], h + 1, s[1]});
     const int hi = World::TerrainHeight(s[0] + 8, s[1] + 8, kDefaultSeed);
-    DropItemToWorld(itemDef, Vec3{(float)s[0] + 8, (float)(hi + 3), (float)s[1] + 8},
+    DropItemToWorld(itemDef, ItemInstance{itemDef.name},
+                    Vec3{(float)s[0] + 8, (float)(hi + 3), (float)s[1] + 8},
                     Vec3{}, c.phys, debris, nullptr, ground);
   }
-  hb.slots[2] = ItemStack{itemIdx, 1, 0};
+  hb.slots[2] = StackOf(c.items, itemIdx);
   // An ENGAGED clock at 3x, advanced off the sim tick, so every field of the
   // 'TIME' section carries something a default clock would not.
   Celestial() = CelestialClock{};
@@ -1743,7 +1744,7 @@ Status GateSaveSplit(Ctx& c, std::string& detail) {
   auto restored = [&]() {
     const CelestialClock& k = Celestial();
     return mobs.MobCount() == mobsBefore && ground.Count() == itemsBefore &&
-           !hb.slots[2].Empty() && hb.slots[2].def == itemIdx &&
+           !hb.slots[2].Empty() && hb.slots[2].name == itemDef.name &&
            k.engaged == clockSaved.engaged && k.scaleNum == clockSaved.scaleNum &&
            k.scaleDen == clockSaved.scaleDen && k.ticks == clockSaved.ticks &&
            k.rem == clockSaved.rem && k.prevTicks == clockSaved.prevTicks;
