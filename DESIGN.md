@@ -3594,12 +3594,14 @@ constant. The fade *width* is load-bearing: a ramp of magnitude A over width W
 adds slope up to 1.5·A/W, so squeezing 640 voxels of coarse relief into a
 300-voxel fade builds a cliff at exactly the boundary. Pass A4 measures it;
 read that number rather than guessing it. **Two centres** (environment truth
-P-C, 2026-09-04): the harness pad box gets the same fade measured from its
-*edge* (`harnessOutside()`, 0 anywhere inside the box) and the calmer of the
-two wins — kind `pad` is not in the site table, so `sitePadAt` never levels
-it, and its flatness only ever came from this fade. The fixtures were written
-against that ground; moving the spawn out of the pad must not move the pad's
-ground with it.
+P-C, 2026-09-04): a map's calm **pad box** (kind `pad`, at most one) gets the
+same fade measured from its *edge* (`padOutside()`, 0 anywhere inside the box)
+and the calmer of the two wins — kind `pad` is not in the site table, so
+`sitePadAt` never levels it, and its flatness only ever came from this fade.
+Since map-overhaul P3 (2026-09-26) only the selftest's own map
+(`assets/worldmap/harness`) authors one, over its fixture columns; the shipped
+`default` map has none, so its origin area grows trees, tarns and cover like
+anywhere else.
 
 **The sediment wedge** is what makes the relief mean something to the sim rather
 than only to the eye: low flat ground carries metres of loose dirt over gravel,
@@ -3961,8 +3963,10 @@ preset's sampled profile, linear in d² between knots so the shader needs no
 sqrt; a face steeper than a voxel per column wears the preset's substrate
 instead of its powder bed (`bowlSteep`), which is what let the depth stop
 being bounded by the radius. The `terrain` gate's C1 is still the per-voxel
-proof; the harness tarn at (420,420) is still the authored pool below, not
-a site.
+proof. The old harness tarn at (420,420) — a literal disc in `landColumnBare`
+and four copies in `world.cpp` — is now such a site too: `harness_lake` on the
+harness map, preset `fixture_lake` (a bare flat-floored stone tub), since
+map-overhaul P3.
 
 Two things are deliberately **outside** the contract. The **arena** levels its
 footprint as a material override in `genCellIn`, not as a change to `Col.h` —
@@ -13658,9 +13662,10 @@ Three pieces:
 
 * **The basin registry.** A container is a pure function of (seed, tuning),
   because the terrain overhaul made a tarn's bowl REPLACE the ground rather than
-  `min()` into it — so `pondAt` is an exact integer parabola and the three
-  authored pools are exact flat-floored cylinders. `World::PondTile` and
-  `World::AuthoredPoolList` publish what `world.cpp` already knows; nothing is
+  `min()` into it — so `pondAt` is an exact integer parabola and an authored
+  lake is its preset's sampled profile. `World::PondTile` and
+  `World::WaterSiteDisc` publish what `world.cpp` already knows (the old
+  `AuthoredPoolList` went with the literal lake, map-overhaul P3); nothing is
   re-derived, because a fourth copy of the terrain is how the deleted
   `surfHeightAt` went stale.
 * **The container curve** (component 2, analytic half). Cell count per height,
@@ -15949,6 +15954,26 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   said the `armor-react`-style fix is a levelled pad, which P5's site table
   gives every site. `RESEARCH_worldgen` §8.2's "the first landmark should
   introduce a proper table" is P5.
+* **MOVED (map overhaul P3, 2026-09-26): the harness is its own map.**
+  `assets/worldmap/harness` (planes + terrain copied from `default` that day)
+  is what `--selftest`, `--verify`, `--suite`, `--vk-smoke*`, the fluid
+  benches and `--shot*` generate (`worldmap::SetMapOverride` from `main.cpp`;
+  `SANDVOX_MAP=<name>` beats it, `world.mapLayer` is the game's map and the
+  fallback — `worldmap::ActiveMapName` is the one resolver every loader asks).
+  It carries the pad box (renamed `inPadBox` / `crownMeetsPad` / `padOutside`,
+  `WM_H_PAD_*`, `World::InPadBox`: a generic calm-box site kind, not a harness
+  special case; `crownMeetsPad` now honours an empty box), the fixture lake as
+  the water site `harness_lake` (preset `fixture_lake`). `pond-shore`'s
+  "rolled desert tarn" turned out to be a sea beach already (no tarn rolls
+  near it); it stays at its coordinate, now pinned by the harness map's own
+  planes and sea level. The literal (420,420) disc
+  is gone from `landColumnBare` and from `world.cpp` (`landColumnBare`,
+  `TerrainColumn`, `PondNearColumn`, `AuthoredPoolList` + `AuthoredPool`);
+  `LandCol`/`Col`'s `inPoolFloor`/`inRim` are now set only by the fluid lab's
+  slab. The shipped `default` map lost its pad. `spawn-site` still validates
+  the GAME's map (`world.mapLayer`), loading it beside the harness map.
+  `kDefaultSeed` moved to `sim/worlddefaults.h`, `SubmitWorldgen` +
+  `ReadVoxelsSync` to `sim/worldgen_run.*` (`test/support.h` re-exports both).
 * **LIVE (world map P3, 2026-09-04): the World map page.** Environment →
   World map (`assets/editor/map.js`) paints the biome plane (palette = the
   biome files), the landform plane (0..255, soft brush) and the harness pad

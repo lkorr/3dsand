@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -832,8 +833,8 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           log += at + "site \"" + id + "\" kind pad needs min[2]/max[2] in world voxels\n";
           return false;
         }
-        out.harnessX0 = s["min"][0].get<int>(); out.harnessZ0 = s["min"][1].get<int>();
-        out.harnessX1 = s["max"][0].get<int>(); out.harnessZ1 = s["max"][1].get<int>();
+        out.padX0 = s["min"][0].get<int>(); out.padZ0 = s["min"][1].get<int>();
+        out.padX1 = s["max"][0].get<int>(); out.padZ1 = s["max"][1].get<int>();
         havePad = true;
       } else if (kind == "stamp") {
         WorldMapData::StampSite st;
@@ -1030,7 +1031,7 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           bool tooClose = false;
           for (const WorldMapData::StampSite& o : out.sites)
             if (std::max(std::abs(o.x - wx), std::abs(o.z - wz)) < minSpacing) { tooClose = true; break; }
-          if (tooClose || out.InHarness(wx, wz)) continue;
+          if (tooClose || out.InPadBox(wx, wz)) continue;
           WorldMapData::StampSite st;
           st.id = rid + "_" + std::to_string(placed);
           st.templateName = tpl;
@@ -1097,10 +1098,10 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   W[kHOceanFade] = U(map.oceanFadeCells);
   W[kHWarpAmp] = U(map.warpAmpVox);
   W[kHOceanBiome] = U(map.oceanBiome);
-  W[kHHarnessX0] = U(map.harnessX0);
-  W[kHHarnessZ0] = U(map.harnessZ0);
-  W[kHHarnessX1] = U(map.harnessX1);
-  W[kHHarnessZ1] = U(map.harnessZ1);
+  W[kHPadX0] = U(map.padX0);
+  W[kHPadZ0] = U(map.padZ0);
+  W[kHPadX1] = U(map.padX1);
+  W[kHPadZ1] = U(map.padZ1);
   W[kHBiomePlane] = U(static_cast<int>(W.size()));
   AppendPlane(W, map.biome);
   W[kHLandformPlane] = U(static_cast<int>(W.size()));
@@ -1146,6 +1147,29 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
 
 const WorldMapData& CurrentWorldMap() { return Slot(); }
 void SetCurrentWorldMap(WorldMapData map) { Slot() = std::move(map); }
+
+namespace {
+std::string& MapOverrideSlot() {
+  static std::string s;
+  return s;
+}
+// A bare name only (world.mapLayer's rule in LoadTuning): the name is a
+// directory under assets/worldmap/, never a path.
+bool BareMapName(const std::string& n) {
+  return !n.empty() && n.find_first_of("/\\:") == std::string::npos;
+}
+}  // namespace
+
+void SetMapOverride(const std::string& name) { MapOverrideSlot() = name; }
+
+std::string ActiveMapName(const std::string& tuned) {
+  if (const char* e = std::getenv("SANDVOX_MAP")) {
+    if (BareMapName(e)) return e;
+    if (*e) std::fprintf(stderr, "SANDVOX_MAP='%s' is not a bare map name -- ignored\n", e);
+  }
+  if (BareMapName(MapOverrideSlot())) return MapOverrideSlot();
+  return tuned;
+}
 const TerrainParams& CurrentTerrain() { return Slot().terrain; }
 
 }  // namespace worldmap

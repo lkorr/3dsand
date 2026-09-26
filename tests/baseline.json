@@ -128,7 +128,7 @@
   "chunkResyncFrames": "80",
   "chunk-resync": "pass",
   "treeAtlasHash": "53691eda995f232e",
-  "determinismHash": "ef432d6d",  "determinism": "pass",
+  "determinismHash": "8467df83",  "determinism": "pass",
   "_repose_about": "repose gate (src/test/selftest_ca.cpp). THRESHOLDS, not observations: the runRiseMin/Max_* keys are read by the gate, so retuning what counts as a 2:1 or a 1:2 pile costs a JSON edit and no rebuild. run:rise is the pile's Manhattan reach over its peak height, so the ideal values are 3.0 / 2.0 / 1.0 / 0.5 for the four pure tiers -- the bands are wide because a 400-grain pile quantises hard (a peak of 4 vs 5 moves the ratio 25%) and because the apex starts as a 5x5 plateau rather than a point. The blend30/blend40 arms use REAL LOADER OUTPUT (PackRepose) and are the only arms that execute the per-grain blend hash at all; the gate asserts they differ from each other and sit between the pure tiers they mix, which is what catches a blend that has gone inert. The ORDERING is asserted separately and is the property that must not flap. awakeChunksMax is 0 on purpose: a lateral slide is the one powder move that does not lower a grain, so a nonzero count here means the termination argument in sim_step.wgsl's ANGLE OF REPOSE block is wrong, which is a rule-2 bug and not a threshold to raise. runRiseObserved_* are written by --rebaseline and read by nobody.",
   "repose.runRiseMin_flowy3": "1.9",
   "repose.runRiseMax_flowy3": "5.0",

@@ -639,12 +639,11 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   // world coordinate a few hundred thousand voxels out would overflow, and X/Z
   // are infinite here.
   //
-  // TWO CENTRES. The harness box gets the same fade, measured from its EDGE
-  // (harnessOutside is 0 anywhere inside it), and the calmer of the two wins.
-  // The pad's flatness only ever came from this fade -- kind "pad" is not in
-  // the site table, so sitePadAt never levels it -- and the fixtures were
-  // written against that ground (terrain C2, floaters, corpse-burn). Moving
-  // the spawn out of the pad must not move the pad's ground with it.
+  // TWO CENTRES. A map's calm pad box (map.json sites[], kind "pad"; the
+  // selftest map `harness` authors one over its fixture ground) gets the same
+  // fade, measured from its EDGE (padOutside is 0 anywhere inside it), and the
+  // calmer of the two wins. A map with no pad reports "far" and only the
+  // spawn's fade applies.
   let sc = spawnCentre();
   let fade = wmTerrain(WM_H_TERRAIN_HOME_FADE);
   let d = max(abs(x - sc.x), abs(z - sc.y)) - wmTerrain(WM_H_TERRAIN_HOME_R);
@@ -652,7 +651,7 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   if (d < fade) {
     w = (max(d, 0) * 16384) / fade;
   }
-  let dh = harnessOutside(x, z);
+  let dh = padOutside(x, z);
   var wh = 16384;
   if (dh < fade) {
     wh = (dh * 16384) / fade;
@@ -845,9 +844,9 @@ fn isqrtLe(v : i32, hi0 : i32) -> i32 {
 // where the profile crosses 2 voxels between integer radius rings -- 168 bed
 // grains on one marsh bowl face sat submerged at a >=2 step this test called
 // 1, and slid on tick 0. The exact fix (test the four axis neighbours' own
-// bowlDepth) exists and works, but it changes the harness pool's bed enough
-// to need the waterbody-gate ledger reconciled with it, so it ships with
-// that reconciliation, not here.
+// bowlDepth) exists and works, but it changes enough tarn beds to need the
+// waterbody-gate ledger reconciled with it, so it ships with that
+// reconciliation, not here.
 fn bowlSteep(p : Pond, x : i32, z : i32) -> bool {
   let dx = x - p.cx;
   let dz = z - p.cz;
@@ -921,7 +920,7 @@ fn pondRoll(pt : i32, pz : i32, seed : u32) -> Pond {
   if (tile - 2 * inset < 1) { return p; }
   cx = clamp(cx, pt * tile + inset, pt * tile + tile - 1 - inset);
   cz = clamp(cz, pz * tile + inset, pz * tile + tile - 1 - inset);
-  // Keep-outs, by CENTRE (as stamps always were): the harness box, every
+  // Keep-outs, by CENTRE (as stamps always were): the pad box, every
   // stamp's cells, every authored lake's disc + band. A site wins its ground.
   if (siteKeepOut(cx, cz)) { return p; }
   p.present = true; p.cx = cx; p.cz = cz; p.r = r; p.wp = wp;
@@ -1249,10 +1248,10 @@ const WM_H_OCEAN_BIOME   : u32 = 21u;
 const WM_H_SITE_INDEX    : u32 = 15u;
 const WM_H_SITE_TABLE    : u32 = 16u;
 const WM_H_SITE_COUNT    : u32 = 17u;
-const WM_H_HARNESS_X0    : u32 = 22u;
-const WM_H_HARNESS_Z0    : u32 = 23u;
-const WM_H_HARNESS_X1    : u32 = 24u;
-const WM_H_HARNESS_Z1    : u32 = 25u;
+const WM_H_PAD_X0        : u32 = 22u;
+const WM_H_PAD_Z0        : u32 = 23u;
+const WM_H_PAD_X1        : u32 = 24u;
+const WM_H_PAD_Z1        : u32 = 25u;
 const WM_H_WATER_RECORDS : u32 = 26u;
 const WM_H_WATER_COUNT   : u32 = 27u;
 const WM_H_SPAWN_X       : u32 = 28u;
@@ -1508,36 +1507,39 @@ fn wmInside(c : vec2<i32>) -> bool {
          c.y < i32(worldMap[WM_H_HEIGHT]);
 }
 
-// ---- THE HARNESS SITE ------------------------------------------------------
-// The one authored site the map ships until P5's site table: a box in world
-// voxels (map.json sites[], kind "pad") that keeps the selftest fixtures'
-// ground -- no tree trunks or crowns, no tarns, no cover, no caves' flora.
-// It replaces the spawn clearing, the fixture pads and the pond keep-out box
-// that used to be literals in this file and in world.cpp. Read from the
-// header so the C++ twin (World::InHarness) reads the same numbers.
-fn inHarness(x : i32, z : i32) -> bool {
-  return x >= i32(worldMap[WM_H_HARNESS_X0]) && x <= i32(worldMap[WM_H_HARNESS_X1]) &&
-         z >= i32(worldMap[WM_H_HARNESS_Z0]) && z <= i32(worldMap[WM_H_HARNESS_Z1]);
+// ---- THE PAD BOX -------------------------------------------------------------
+// A calm, bare box in world voxels (map.json sites[], kind "pad"; at most one
+// per map): no tree trunks or crowns, no tarns, no cover, and the coarse
+// octaves faded out toward its edge like the spawn's home area (landAt). The
+// shipped `default` map has none; the selftest map `harness` puts one over
+// its fixture ground. Read from the header so the C++ twin (World::InPadBox)
+// reads the same numbers. An empty box (x1 < x0) matches nothing.
+fn inPadBox(x : i32, z : i32) -> bool {
+  return x >= i32(worldMap[WM_H_PAD_X0]) && x <= i32(worldMap[WM_H_PAD_X1]) &&
+         z >= i32(worldMap[WM_H_PAD_Z0]) && z <= i32(worldMap[WM_H_PAD_Z1]);
 }
 // Does a tree at (wx,wz) with horizontal reach `r` put ANY of itself over the
-// harness? The trunk being outside is not enough -- see the note at the call
-// site in treeInfoAt.
-fn crownMeetsHarness(wx : i32, wz : i32, r : i32) -> bool {
-  return wx + r >= i32(worldMap[WM_H_HARNESS_X0]) && wx - r <= i32(worldMap[WM_H_HARNESS_X1]) &&
-         wz + r >= i32(worldMap[WM_H_HARNESS_Z0]) && wz - r <= i32(worldMap[WM_H_HARNESS_Z1]);
+// pad? The trunk being outside is not enough -- see the note at the call
+// site in treeInfoAt. The empty-box guard is load-bearing here, unlike in
+// inPadBox: with x1 < x0 the overlap test alone still catches every crown
+// that spans the gap between them.
+fn crownMeetsPad(wx : i32, wz : i32, r : i32) -> bool {
+  let x0 = i32(worldMap[WM_H_PAD_X0]);
+  let x1 = i32(worldMap[WM_H_PAD_X1]);
+  if (x1 < x0) { return false; }
+  return wx + r >= x0 && wx - r <= x1 &&
+         wz + r >= i32(worldMap[WM_H_PAD_Z0]) && wz - r <= i32(worldMap[WM_H_PAD_Z1]);
 }
-// Chebyshev distance from a column to the harness box, 0 inside it: the
-// mirrored landAt keeps the box's ground calm (its own coarse-octave fade,
-// beside the spawn's) so the fixtures stand on the ground their gates were
-// written against wherever the spawn site goes. A map with no pad (x1 < x0)
-// reports "far", which switches that fade off. Outside the height mirror on
-// both sides; world.cpp spells the same name.
-fn harnessOutside(x : i32, z : i32) -> i32 {
-  let x0 = i32(worldMap[WM_H_HARNESS_X0]);
-  let x1 = i32(worldMap[WM_H_HARNESS_X1]);
+// Chebyshev distance from a column to the pad box, 0 inside it: the
+// mirrored landAt fades the coarse octaves toward it, beside the spawn's
+// fade. A map with no pad (x1 < x0) reports "far", which switches that fade
+// off. Outside the height mirror on both sides; world.cpp spells the same name.
+fn padOutside(x : i32, z : i32) -> i32 {
+  let x0 = i32(worldMap[WM_H_PAD_X0]);
+  let x1 = i32(worldMap[WM_H_PAD_X1]);
   if (x1 < x0) { return 1073741824; }
-  let z0 = i32(worldMap[WM_H_HARNESS_Z0]);
-  let z1 = i32(worldMap[WM_H_HARNESS_Z1]);
+  let z0 = i32(worldMap[WM_H_PAD_Z0]);
+  let z1 = i32(worldMap[WM_H_PAD_Z1]);
   return max(max(max(x0 - x, x - x1), max(z0 - z, z - z1)), 0);
 }
 
@@ -1560,7 +1562,7 @@ fn spawnCentre() -> vec2<i32> {
 // per-cell overlay of the template's runs, exactly the tree atlas's shape,
 // so it is correct in `far` at any distance with nothing to patch. Keep-outs
 // (`siteKeepOut`) suppress trees, tarns and cover on the site's cells, the
-// harness box included.
+// pad box included.
 fn wmSiteAt(x : i32, z : i32) -> u32 {
   let plane = worldMap[WM_H_SITE_INDEX];
   if (plane == 0u) { return 0u; }
@@ -1576,7 +1578,7 @@ fn wmSiteI(sid : u32, w : u32) -> i32 {
 // bald the forest around every tarn on the map. Every other kind keeps its
 // cells, as before.
 fn siteKeepOut(x : i32, z : i32) -> bool {
-  if (inHarness(x, z)) { return true; }
+  if (inPadBox(x, z)) { return true; }
   let sid = wmSiteAt(x, z);
   if (sid == 0u) { return false; }
   if (u32(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return true; }
@@ -1988,7 +1990,7 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32, ponds : ptr<function, PondS
   // makes the clearing mean what its name says at any crown width.
   // Box OVERLAP, not a corner test: a crown wider than the clearing would pass
   // every corner check while covering the whole thing.
-  if (crownMeetsHarness(t.wx, t.wz, t.reach)) { return t; }
+  if (crownMeetsPad(t.wx, t.wz, t.reach)) { return t; }
   // No trunk on an authored site's cells (P5): the pad is a floor, the stamp
   // a building. A crown reaching in from outside is allowed and wanted.
   if (wmSiteAt(t.wx, t.wz) != 0u) { return t; }
@@ -2330,7 +2332,7 @@ fn cactusInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) ->
 
   // Only where the biome says so (cover.cacti), below the treeline, and never
   // on the keep-out ground every other feature avoids (siteKeepOut: the
-  // harness box and authored sites) or in a pond candidate's disc.
+  // pad box and authored sites) or in a pond candidate's disc.
   //
   // A saguaro is metre-scale and reads as a landmark the way a tree does, so
   // it answers to the MASTER switch only -- `groundCover` off leaves the cacti
@@ -2763,8 +2765,8 @@ struct Col {
   pw          : vec2<i32>,   // bowlAt's (bowl floor, surface), or (-1, -1)
   fluid       : u32,         // standing fluid material at this column
   fluidTop    : i32,         // its surface Y, or -1
-  inPoolFloor : bool,
-  inRim       : bool,
+  inPoolFloor : bool,        // the fluid lab's slab only: plain stone, no skin
+  inRim       : bool,        // the fluid lab's slab only: no caves, trees, cover
   shore       : Shore,
   // The shore band WITHOUT the bluff cut `shore` applies. `shore.onShore` asks
   // "does a wet fringe belong here", and answers NO on a column standing well
@@ -2908,8 +2910,8 @@ struct LandCol {
   pw          : vec2<i32>,   // bowlAt's (bowl floor, surface), or (-1, -1)
   fluid       : u32,         // standing fluid material at this column
   fluidTop    : i32,         // its surface Y, or -1
-  inPoolFloor : bool,
-  inRim       : bool,
+  inPoolFloor : bool,        // the fluid lab's slab only (genColumn's lab block)
+  inRim       : bool,        // the fluid lab's slab only
   near        : Shore,       // nearest disc OUTSIDE this column, or none
   wp          : u32,         // the covering pond's preset, else the near shore's; 0 = none
   bedSolid    : bool,        // inside a disc: face steeper than a powder bed can hold
@@ -2951,8 +2953,8 @@ fn landColumnBare(x : i32, z : i32, seed : u32,
   // the disc tests below run before anything is added to `bed`.
   //
   // `land.h` is `bed + land.sed` and every authored override here either
-  // REPLACES the height (a pool floor, a bowl carve) or LIFTS it (a rim, a
-  // berm). A lift is a deliberate STEP against the neighbouring column, and a
+  // REPLACES the height (a bowl carve) or LIFTS it (a berm). A lift is a
+  // deliberate STEP against the neighbouring column, and a
   // step is exactly where a powder wedge avalanches — so the wedge has to be
   // gone from those columns, and gone from `h` too, not merely relabelled.
   //
@@ -2964,54 +2966,22 @@ fn landColumnBare(x : i32, z : i32, seed : u32,
   (*L).slope = land.slope;
   let bed = land.h - land.sed;
 
-  // ---- authored origin-area set pieces (absolute world coords) ----
-  // Halved in the third scale pass (radii 136/64/48 -> 68/32/24): a swimmable
-  // ~8.5 m lake, a 4 m oil pond, a 3 m lava pool. Depths kept — halving depth
-  // too would leave water too shallow to submerge in. Floor/surface heights
-  // anchor to POOL_Y, and they sit outside the spawn clearing so they don't
-  // disturb the fixtures.
-  // SIZES scale with the voxel, CENTRES do not, and the split is deliberate.
-  // A radius and a depth are lengths: unscaled, the lake would be 3.4 m across
-  // at 20 voxels/m, and poolY would sit under terrain that HAD scaled — the
-  // pools would be buried, which is the loudest possible way for a voxel-size
-  // experiment to go wrong. The centres are POSITIONS in an origin-area content
-  // region whose other inhabitants — the selftest fixture columns at (60,60),
-  // (100,100), (140,140) — are absolute literals in a dozen files. Scaling one
-  // and not the other would pull the set pieces off the fixtures. So the whole
-  // origin region keeps its coordinates and simply occupies less ground at a
-  // finer voxel; everything in it stays in the same place relative to
-  // everything else.
-  // THE POOL FLOOR IS RELATIVE TO THE HOME PLAIN, not an absolute Y, and that
-  // is the line the datum move would otherwise have broken worst. It was a bare
-  // `vlen(44)` back when the terrain band was y32..y86; with the datum at y200
-  // the same literal put a 15 m crater with vertical walls at (420,420),
-  // reported by the `terrain` gate as a 143-voxel adjacent step and by the page
-  // table as 58 lost voxels' worth of matter avalanching down the inside of it.
-  //
-  // 15 below the plain, with a rim forced 26 above the floor, reproduces the
-  // relationship the old numbers had against the old band (floor 15 under the
-  // mean, rim 11 over it) at any datum.
-  let poolY = wmTerrain(WM_H_TERRAIN_HOME_Y) - vlen(15);
-  // Water lake at (420,420), ~8.5 m across
-  let pdx = x - 420; let pdz = z - 420;
-  let pd2 = pdx * pdx + pdz * pdz;
-  let pR = vlen(68); let pRim = vlen(80);
-  (*L).inPoolFloor = pd2 < pR * pR;
-  (*L).inRim = pd2 < pRim * pRim;
+  // No authored override lives here any more: the harness lake that was a
+  // literal disc at (420,420) is a `water` site on the selftest map
+  // (assets/worldmap/harness), shaped by its preset like any other lake.
+  (*L).inPoolFloor = false;
+  (*L).inRim = false;
 
   // ---- disc ponds, queried before the height is composed ----
-  // pondRoll's keep-out (siteKeepOut) excludes the harness box the pool sits
-  // in, so a rolled disc never overlaps its rim; the fluidTop<0 check below is
-  // belt-and-braces. `pondNear` is the one
-  // scan that serves BOTH the berm and the marsh fringe (genColumn narrows the
-  // same answer), and it is skipped inside a disc or an authored rim, where
-  // there is nothing outside to be near.
+  // `pondNear` is the one scan that serves BOTH the berm and the marsh fringe
+  // (genColumn narrows the same answer), and it is skipped inside a disc,
+  // where there is nothing outside to be near.
   // The column's pond candidates, scanned ONCE (the only table reads on this
   // path) and handed to the bowl, the shore and, through LandCol, every scan.
   (*L).ponds = pondScan(x, z, seed);
   let pc = pondCover((*L).ponds, x, z, seed);
   (*L).pw = bowlAt(pc, x, z);
-  if ((*L).pw.y < 0 && !(*L).inRim) { (*L).near = pondNear((*L).ponds, x, z, seed); }
+  if ((*L).pw.y < 0) { (*L).near = pondNear((*L).ponds, x, z, seed); }
   (*L).wp = select((*L).near.wp, pc.wp, pc.present);
 
   // ---- the wedge, after everything that has to suppress it ----
@@ -3019,20 +2989,13 @@ fn landColumnBare(x : i32, z : i32, seed : u32,
   // scans for THIS preset, so the wedge thins to nothing as it reaches the
   // water instead of ending in a wall of loose gravel above a bowl of sand.
   var sed = land.sed;
-  if ((*L).inRim || (*L).pw.y >= 0) {
+  if ((*L).pw.y >= 0) {
     sed = 0;
   } else if ((*L).near.onShore) {
     let band = max(wmWaterI((*L).near.wp, WM_W_BAND), 1);
     sed = (sed * min((*L).near.past, band)) / band;
   }
   var h = bed + sed;
-
-  if (pd2 < pR * pR) {
-    h = poolY;
-    (*L).fluid = M_WATER; (*L).fluidTop = poolY + vlen(24);
-  } else if (pd2 < pRim * pRim) {
-    h = max(h, poolY + vlen(26));    // containment rim
-  }
 
   // ---- carve the bowl inside a disc, raise the berm outside ----
   if ((*L).pw.y >= 0) {
@@ -3055,7 +3018,7 @@ fn landColumnBare(x : i32, z : i32, seed : u32,
     let fill = wmWater(pc.wp, WM_W_FILL);
     if ((*L).fluidTop < 0 && fill != 0u) { (*L).fluid = fill; (*L).fluidTop = (*L).pw.y; }
     (*L).bedSolid = bowlSteep(pc, x, z);
-  } else if (!(*L).inRim && (*L).near.onShore &&
+  } else if ((*L).near.onShore &&
              (*L).near.past < wmWaterI((*L).near.wp, WM_W_BERM_W)) {
     h = bermLift((*L).near.wp, h, (*L).near.surf, (*L).near.past);
   }
@@ -3257,9 +3220,9 @@ const CAP_REPOSE_Q8 : i32 = 256;
 fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
   // Every AUTHORED discontinuity, none of which is in the noise field:
   //   nearWater -- a water body's bermed / excavated bank (see above)
-  //   inRim     -- the annulus of an authored pool, a forced cylinder wall
-  //                (what the snow cap, the caves and the sediment wedge
-  //                also read as "this ground was placed, not grown").
+  //   inRim     -- the fluid lab's slab (what the snow cap, the caves and
+  //                the sediment wedge also read as "this ground was placed,
+  //                not grown").
   if ((*col).nearWater || (*col).inRim) { return 0; }
   // A CLAMPED taper, not a straight line from slope 0: full authored depth up
   // to terrain.sedSlope (the ground the sediment wedge already calls flat),
@@ -3656,7 +3619,7 @@ fn genCellIn(col : ptr<function, Col>,
   // ---- CACTI: the cactus biomes' metre-scale shape --------------------------
   // cactusAt, placed into air ABOVE the surface exactly the way a tree is, and
   // BEFORE the cover stack so the scrub floor fills around it. Keep-outs (the
-  // site / harness keep-out, pond discs, the treeline) are enforced at the
+  // site / pad keep-out, pond discs, the treeline) are enforced at the
   // SITE by cactusInfo, so a cactus rooted outside cannot lean back in; the
   // column tests here are the authored rim, the pond and the treeline.
   if (VEGETATION && mat == MAT_AIR && wmFlag(biome, WM_BF_CACTI) && !inRim && y > h && pond < 0 &&

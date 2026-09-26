@@ -1317,7 +1317,9 @@ Status GateCaGutter(Ctx& c, std::string& detail) {
 //
 // THE SHAPE `ca-gutter` PROVED SAFE, AT A PLACE WHERE IT IS NOT.
 //
-// The owner's report, 2026-09-16, from the live game at world (-2317,112,1674):
+// The owner's report, 2026-09-16, from the live game at world (-2317,112,1674)
+// (a rolled desert tarn then; a sea beach on the harness map's frozen ground
+// since, see the site comment in the gate):
 // "in a pond in the desert ... water voxels just swap back and forth really
 // really fast endlessly, keeping the simulation alive in all of those chunks."
 // A whole-cell swap of water and air is the CA's FILM STEP and nothing else —
@@ -1401,6 +1403,18 @@ Status GatePondShore(Ctx& c, std::string& detail) {
   // is kWorldN/kChunk chunks on a side, so back off half of that on each axis.
   // Written from the voxel coordinate rather than as three magic numbers so
   // that a change to kWorldN moves the window instead of decentring the pond.
+  //
+  // IT IS A SEA BEACH NOW, NOT A ROLLED TARN, and it is pinned by the HARNESS
+  // map, not by a roll. Checked 2026-09-26 (map-overhaul P3): the ground here
+  // is y99 under 13 voxels of sea (seaLevelY 112) and no pond tile rolls a
+  // tarn within ~600 voxels -- the map's repaint had turned the owner's desert
+  // tarn into a desert coastline, and the gate has been ticking that beach,
+  // which is still a loose SAND bank cut by a waterline (the whole subject
+  // below). An authored desert tarn does NOT reproduce it: a tarn's bank is
+  // its preset's shore mud and a firm sandstone berm wall (looseCoverDepth is
+  // 0 near water), so no waterline cell touches sand. The harness map's planes
+  // and sea level are the selftest's own (assets/worldmap/harness), so a
+  // repaint of the game's map can no longer move this beach.
   const int half = (int)(kWorldN / kChunk) / 2;
   const IVec3 site{-2317, 112, 1674};
   const IVec3 siteChunk{site.x >> 4, site.y >> 4, site.z >> 4};
@@ -1756,7 +1770,7 @@ Status GatePondShore(Ctx& c, std::string& detail) {
   const bool ok = foundPond && foundShore && (int)a.awake <= cap &&
                   (int)b.awake <= cap && (int)d.awake <= cap;
   detail = Format(
-      "the owner's desert shore at (%d,%d,%d), cap %d | %s | %s | %s | splash of"
+      "the owner's desert shore (a sea beach on the harness map) at (%d,%d,%d), cap %d | %s | %s | %s | splash of"
       " 32 cells at (%d,%d,%d) | water %llu -> %llu -> %llu -> %llu eighths"
       " (bank drank %+lld, splash %+lld, noon %+lld)",
       site.x, site.y, site.z, cap, say("A pristine", a, kTicksA).c_str(),

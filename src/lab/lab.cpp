@@ -89,42 +89,41 @@ constexpr int kCraterHalf = 4;    // 9x9 in plan
 constexpr int kCraterDepth = 6;   // voxels of floor removed
 bool sPondCrater = false;
 
-// `worldlake` uses the authored lake in worldgen.wgsl genColumn: a disc at
-// (420,420) of radius vlen(68) whose terrain is flattened to poolY and filled
-// to poolY + vlen(24). ~348,600 water voxels (a cylinder, not a bowl — bigger
-// than any generated pond of the same radius). It is authored rather than
-// hash-placed, so it is at a KNOWN address in every seed, which is what makes
-// the main-world arm of this measurement a scripted, repeatable run instead
-// of a description of somebody flying around.
+// `worldlake` uses the harness map's fixture lake (assets/worldmap/harness,
+// water site `harness_lake`, preset spawn_lake: a flat-floored disc of radius
+// 6.8 m, 2.4 m deep, its waterline the terrain at its centre). It is authored
+// rather than hash-placed, so it is at a KNOWN address in every seed, which is
+// what makes the main-world arm of this measurement a scripted, repeatable run
+// instead of a description of somebody flying around. --lab / --fluid-bench
+// load the harness map for exactly this (main.cpp, SetMapOverride).
 //
-// DERIVED, never literals. `poolY` is `worldgen.spawnPlainY - vlen(15)` and
-// the terrain overhaul has already moved `spawnPlainY` once (44 -> 200), which
-// carried the lake from y 44..68 to y 185..209. These constants were baked at
-// the OLD datum, so the audit box, the plug shaft and the sealed drain chamber
-// all sat ~141 voxels of solid rock BELOW the water: every `worldlake` arm of
-// `--fluid-bench` reported `plug pulled: 0 eighths standing`, and the three
-// worldlake rows of PLAN_water_master §1's baseline table became
-// unreproducible. `World::AuthoredPoolList` is the one authority for where
-// that lake is (the `waterbody` gate reads the same list); ask it instead.
-// Recomputed on every call rather than cached: tuning is loaded — and, in the
-// bench, re-set per run — after static init.
+// DERIVED, never literals: the site's disc from World::WaterSiteDisc, the same
+// numbers the waterbody gate and the basin registry read. Baked constants
+// here once sat ~141 voxels under the water after a datum move, and every
+// `worldlake` arm reported `plug pulled: 0 eighths standing`. Recomputed on
+// every call rather than cached: the map and tuning are loaded -- and, in the
+// bench, re-set per run -- after static init.
 struct LakeGeom {
   int cx, cz, r;
-  int floorY;       // poolY: the flat terrain top inside the disc
+  int floorY;       // the flat terrain top inside the disc
   int surfY;        // the fill level; water occupies (floorY, surfY]
   int chamberTop;   // drain chamber roof, buried under the lake floor
   int chamberLo;
 };
 LakeGeom Lake() {
-  World::AuthoredPool pools[World::kAuthoredPools];
-  World::AuthoredPoolList(pools);
-  const World::AuthoredPool& w = pools[0];   // basin 0 is the water lake
   LakeGeom g{};
-  g.cx = w.cx;
-  g.cz = w.cz;
-  g.r = w.r;
-  g.floorY = w.floorY;
-  g.surfY = w.waterY;
+  const int site = World::WaterSiteIndex(kHarnessLakeSite);
+  const World::PondDisc d = site >= 0 ? World::WaterSiteDisc(site, kDefaultSeed) : World::PondDisc{};
+  if (!d.present) {
+    std::fprintf(stderr, "lab: the loaded map has no water site '%s' -- worldlake needs the "
+                         "harness map (SANDVOX_MAP=harness)\n", kHarnessLakeSite);
+    return g;
+  }
+  g.cx = d.cx;
+  g.cz = d.cz;
+  g.r = d.r;
+  g.surfY = d.surf;
+  g.floorY = d.surf - d.depth;
   // Same 13-voxel rock plug under the floor the old literals described
   // (44 -> 31); the chamber then hangs kChamberH below its roof.
   g.chamberTop = g.floorY - 13;

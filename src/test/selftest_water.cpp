@@ -88,6 +88,14 @@ using namespace sandvox;
 namespace selftest {
 namespace {
 
+// The harness lake's basin id: the harness map's `harness_lake` water site
+// (sim/worlddefaults.h), which the registry names by its site index. 0 = the
+// loaded map has no such site, which Find/Basin answer with null.
+uint32_t LakeId() {
+  const int i = World::WaterSiteIndex(kHarnessLakeSite);
+  return i >= 0 ? WaterSiteBasinId(i) : 0u;
+}
+
 // What a sweep of the real voxels says about a basin. The RECOMPUTE half of
 // pass G: derived from the voxels alone, with no reference to the descriptor it
 // is about to be compared against.
@@ -611,12 +619,12 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
   uint32_t tick = RunQuietTicks(c, 1, 130);
 
   const WaterBodySystem& wb = WaterBodies();
-  const WaterBasin* lake = wb.Basin(1);
-  const WaterBodyDesc* desc = wb.Find(1);
+  const WaterBasin* lake = wb.Basin(LakeId());
+  const WaterBodyDesc* desc = wb.Find(LakeId());
   if (!lake || !desc) {
     SetCurrentTuning(base);
     SetHarnessSnapshotDrain(hadDrain);
-    detail = "the authored lake (basin 1) is not in the registry";
+    detail = "the harness lake (water site harness_lake) is not in the registry";
     std::printf("waterbody: FAIL (%s)\n", detail.c_str());
     return Status::Fail;
   }
@@ -795,13 +803,13 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     h.sim.waterBodyExitVolume = h.sim.waterBodyMinVolume / 2;
     h.sim.waterBodyQuietTicks = 4;
     SetCurrentTuning(h);
-    WaterBodyState last = WaterBodies().Find(1)
-                              ? WaterBodies().Find(1)->state
+    WaterBodyState last = WaterBodies().Find(LakeId())
+                              ? WaterBodies().Find(LakeId())->state
                               : WaterBodyState::Candidate;
     for (uint32_t i = 0; i < 200; i++) {
       tick = RunQuietTicks(c, tick, 1);
-      const WaterBodyDesc* d = WaterBodies().Find(1);
-      if (!d) { fail("basin 1 vanished from the registry mid-run"); break; }
+      const WaterBodyDesc* d = WaterBodies().Find(LakeId());
+      if (!d) { fail("the harness lake vanished from the registry mid-run"); break; }
       if (d->state != last) { flips++; last = d->state; }
     }
     if (flips > 1)
@@ -814,7 +822,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
   // The ladder must actually REACH adopted somewhere in this gate, or every
   // assertion above is about a body the classifier refused and the pass is
   // vacuous. Reported with the refusal reason, never as a bare count.
-  const WaterBodyDesc* fin = WaterBodies().Find(1);
+  const WaterBodyDesc* fin = WaterBodies().Find(LakeId());
   const char* why = "none";
   if (fin) {
     switch (fin->refusal) {
@@ -1115,7 +1123,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     SetCurrentTuning(ht);
     tick = RunQuietTicks(c, tick, 130);
 
-    const WaterBodyDesc* hd = WaterBodies().Find(1);
+    const WaterBodyDesc* hd = WaterBodies().Find(LakeId());
     if (!hd || hd->gpuSlot >= kWaterBodyCap) {
       fail(Format("pass %s: the authored lake is not proposed", arm.name));
       break;
@@ -1579,7 +1587,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       SetCurrentTuning(rt);
       tick = RunQuietTicks(c, tick, 130);
 
-      const WaterBodyDesc* rd = WaterBodies().Find(1);
+      const WaterBodyDesc* rd = WaterBodies().Find(LakeId());
       if (!rd || rd->gpuSlot >= kWaterBodyCap) {
         fail(Format("pass R (rate %d): the authored lake is not proposed", rate));
         return -1;
@@ -2391,7 +2399,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     uint32_t swAwake = 0, swPf = 0;
     std::vector<int64_t> swBins;
 
-    const WaterBodyDesc* sd = WaterBodies().Find(1);
+    const WaterBodyDesc* sd = WaterBodies().Find(LakeId());
     if (!sd || sd->gpuSlot >= kWaterBodyCap) {
       fail("pass S: the authored lake is not proposed");
     } else {
@@ -2717,7 +2725,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       SetCurrentTuning(armTuning(arm.swim ? 0 : arm.knob,
                                  arm.swim ? arm.knob : 0, 0, 0));
       tick = RunQuietTicks(c, tick, 130);
-      const WaterBodyDesc* wd = WaterBodies().Find(1);
+      const WaterBodyDesc* wd = WaterBodies().Find(LakeId());
       if (!wd || wd->gpuSlot >= kWaterBodyCap) {
         fail(Format("pass T (%s): the authored lake is not proposed", arm.name));
         continue;
@@ -2896,7 +2904,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       SubmitWorldgen(c.ctx, world, c.sim, kDefaultSeed);
       SetCurrentTuning(armTuning(0, 0, knob, 512));
       tick = RunQuietTicks(c, tick, 130);
-      const WaterBodyDesc* wd = WaterBodies().Find(1);
+      const WaterBodyDesc* wd = WaterBodies().Find(LakeId());
       if (!wd || wd->gpuSlot >= kWaterBodyCap) {
         fail(Format("pass T (sink %d): the authored lake is not proposed", knob));
         continue;
@@ -3026,7 +3034,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
     SetCurrentTuning(t);
     tick = RunQuietTicks(c, tick, 130);
 
-    const WaterBodyDesc* pd = WaterBodies().Find(1);
+    const WaterBodyDesc* pd = WaterBodies().Find(LakeId());
     // BY VALUE, IMMEDIATELY. `pd` points into WaterBodySystem's own vector and
     // every RunQuietTicks below re-runs Classify — the same use-after-free
     // pass H's `lakeGeo`/`lakeDesc` copies exist to avoid, and here it would
@@ -3173,7 +3181,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       // answered "I own nothing" — four different fixes. Every word that
       // separates them is printed.
       if (splitSlots != 2)
-        fail(Format("pass B: %u descriptors are adopted over basin 1, not 2. "
+        fail(Format("pass B: %u descriptors are adopted over the harness lake, not 2. "
                     "parent slot %u is %s; child slot %u is %s (quiet %d, "
                     "reduce sum %d, volume %d, level %d, min volume %d, %u "
                     "chunks listed)",
@@ -3195,7 +3203,7 @@ Status GateWaterBody(Ctx& c, std::string& detail) {
       if (splitSlots == 2 && heldParent + heldChild != splitVox)
         fail(Format(
             "pass B: the split is not mass-exact. parent holds %lld + child "
-            "holds %lld = %lld eighths, but the voxels of basin 1 sum to %lld "
+            "holds %lld = %lld eighths, but the voxels of the harness lake sum to %lld "
             "(%+lld). parent volume %d drained %d debit %d, child volume %d "
             "drained %d debit %d",
             (long long)heldParent, (long long)heldChild,

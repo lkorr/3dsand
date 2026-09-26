@@ -458,6 +458,9 @@ add_library(sandvox_core OBJECT
   src/sim/pagetable.cpp
   src/sim/worldio.cpp
   src/sim/worldedit.cpp
+  # SubmitWorldgen + ReadVoxelsSync: the game generates its world through this
+  # too, so it is sim code, not selftest support (PLAN_map_overhaul P3).
+  src/sim/worldgen_run.cpp
   src/sim/oprecord.cpp
   src/sim/stream.cpp
   src/sim/farfield.cpp

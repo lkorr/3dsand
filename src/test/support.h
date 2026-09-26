@@ -23,11 +23,12 @@
 #include "sim/simulation.h"
 #include "sim/tuning.h"
 #include "sim/world.h"
+#include "sim/worlddefaults.h"
+#include "sim/worldgen_run.h"
 
 namespace sandvox {
 
 constexpr float kTickDt = 1.0f / 30.0f;
-constexpr uint32_t kDefaultSeed = 1337;
 
 // Which mob def the player wears. Swapping the player character is meant to be
 // a one-line data change, so this lives in ONE place: the game's avatar and the
@@ -169,9 +170,6 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                 const std::vector<FluidSpawnOp>& fluidSpawns = {},
                 uint32_t fluidLive = 0,
                 bool vizActive = false);
-
-void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim,
-                    uint32_t seed);
 
 // Re-read the AUTHORED ENVIRONMENT from disk -- assets/biomes/*.json, the
 // world map named by world.mapLayer, assets/trees/* -- validate it the way
@@ -400,19 +398,6 @@ void ReadGasFarOuterBoxSync(GpuContext& ctx, World& world, IVec3 loVox,
                             IVec3 hiVox, uint32_t* outMax, uint64_t* outSum);
 uint32_t ReadActiveChunksSync(GpuContext& ctx, World& world, Simulation& sim);
 
-// THE CPU SEAM for gate voxel dumps (PLAN_page_table.md §2.1a, fifth site).
-//
-// Reads `count` chunks starting at slot `firstSlot` into `out` (count *
-// kChunkVol words), resolving each slot through World::PageOffsetOfSlot and
-// SYNTHESIZING sentinel chunks CPU-side. A gate that indexes the result with
-// World::SlotCellIndex therefore gets a dense-looking snapshot in slot order
-// whatever the residency mode is — which is what the gates want, since they
-// test sim behaviour rather than residency.
-//
-// `page-roundtrip` is the gate that reads THROUGH the translation instead, on
-// purpose; everything else goes through here.
-void ReadVoxelsSync(GpuContext& ctx, World& world, uint32_t firstSlot,
-                    uint32_t count, uint32_t* out, const char* label);
 
 // The scripted mutation stream the determinism gate hashes over. A pure
 // function of tick, so both runs of the twice-run comparison see the same ops.

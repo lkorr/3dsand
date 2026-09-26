@@ -21,8 +21,9 @@
  * is `size` cells with `originCell` at world (0,0). The biome plane holds
  * indices into `biomes[]` (the palette, by NAME); the landform plane is 0..255
  * (0 = ocean floor, 255 = alpine) and owns the height from P4; moisture is
- * reserved. Sites are a list: one `kind: "pad"` box (the selftest harness
- * region), one `kind: "spawn"` column (where the game starts and the centre
+ * reserved. Sites are a list: at most one `kind: "pad"` box (a calm bare
+ * region: no trunks, crowns, tarns or cover, coarse relief faded; the
+ * `harness` map carries the selftest's over its fixtures), one `kind: "spawn"` column (where the game starts and the centre
  * of the calm home area; PLAN_environment_truth P-C), `kind: "stamp"`
  * markers (P5), and `kind: "water"` AUTHORED LAKES (P-F: a water preset at a
  * fixed centre, the same on every seed).
@@ -835,7 +836,7 @@ function syncSites() {
     sel.addEventListener('click', () => { selected = s; syncSites(); paint(); });
     const del = el('button', {title: 'delete this site'}, '\u00d7');
     del.addEventListener('click', () => {
-      if (s.kind === 'pad' && !confirm('Delete the harness pad? The selftest fixtures stand on its ground.')) return;
+      if (s.kind === 'pad' && !confirm(map.name === 'harness' ? 'Delete the harness pad? The selftest fixtures stand on its ground.' : 'Delete the pad box?')) return;
       undo.push(snapshot()); if (undo.length > 40) undo.shift(); redo = [];
       sites.splice(sites.indexOf(s), 1);
       if (selected === s) selected = null;
@@ -879,7 +880,7 @@ function syncSites() {
   } else if (s.kind === 'spawn') {
     pnl.append(el('span', {class: 'mapnote'}, 'Where the game starts and the centre of the calm home area (Terrain \u2192 home area). Move it with the Spawn tool; the spawn-site gate checks it is on land, off the pad and off any lake.'));
   } else if (s.kind === 'pad') {
-    pnl.append(el('span', {class: 'mapnote'}, 'The selftest harness box: no trunks, crowns, tarns or cover inside. Drag it with the Pad box tool.'));
+    pnl.append(el('span', {class: 'mapnote'}, 'The calm pad box: no trunks, crowns, tarns or cover inside. Drag it with the Pad box tool.'));
   } else if (s.kind === 'stamp') {
     pnl.append(el('span', {class: 'mapnote'}, 'assets/prefabs/' + (s.template || '?') + '.vox' + (s.rot ? ', rotated ' + s.rot : '') + '. Shift+click its marker with the Stamp tool to delete.'));
   }
@@ -1004,7 +1005,7 @@ export function attach(hooks) {
   els.tools = {
     biome: el('button', {title: 'paint the selected biome (left-drag)'}, 'Biome brush'),
     landform: el('button', {title: 'paint landform 0..255 (left-drag)'}, 'Landform brush'),
-    pad: el('button', {title: 'drag the harness pad box (world voxels)'}, 'Pad box'),
+    pad: el('button', {title: 'drag the calm pad box (world voxels)'}, 'Pad box'),
     spawn: el('button', {title: 'click: put the spawn site there (where the game starts; the calm home area centres on it). One per map.'}, 'Spawn'),
     stamp: el('button', {title: 'click: place a stamp site (the template picked beside it, from assets/prefabs/); shift+click a marker: delete it'}, 'Stamp site'),
     water: el('button', {title: 'click: place an AUTHORED LAKE (a water preset at that column, same on every seed); drag a lake to move it; shift+click: delete it'}, 'Water'),
@@ -1080,7 +1081,7 @@ export function attach(hooks) {
   const note = el('div', {class: 'mapnote'},
     'Tier A: what you paint and declare here is where the biomes and the mountains ARE on every seed; the boundary warp and everything inside a region take the seed. ' +
     'Cells are 2^cellLog2 voxels (102.4 m). Right/middle-drag pans, wheel zooms, [ ] resize the brush. ' +
-    'The pad box is the selftest harness region (no trunks, crowns, tarns or cover inside); the spawn diamond is where the game starts and the centre of the calm home area (Terrain \u2192 home area) -- keep it outside the pad, on land, or the spawn-site gate says so. ' +
+    'The pad box is a calm bare region (no trunks, crowns, tarns or cover inside; the harness map\u2019s is the selftest\u2019s fixture ground); the spawn diamond is where the game starts and the centre of the calm home area (Terrain \u2192 home area) -- keep it outside the pad, on land, or the spawn-site gate says so. ' +
     'A stamp site places assets/prefabs/<name>.vox (picked from the files that exist) on a levelled pad at that column; a site whose .vox has since gone is skipped with a warning at load. ' +
     'A water site is an AUTHORED LAKE: the chosen preset (Environment > Water bodies) carved at that column on every seed. ' +
     'A landform site is a DECLARED mountain: a peak, ridge, basin or plateau overlaid onto the landform plane at load. ' +
