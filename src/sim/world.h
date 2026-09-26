@@ -456,6 +456,12 @@ static_assert(kDirtyGasMask == (DirtyReasonBit("gas") |
 // Particle system sizes — must match common.wgsl.
 constexpr uint32_t kParticleCap = 262144;
 constexpr uint32_t kClaimSize = 262144;
+// The claim buffer holds kClaimWords u32: the reinsertion claim itself in
+// [0, kClaimSize), then five more planes for GRAIN LANDING (sim_particle.wgsl:
+// every same-material grain aimed at one cell lands in the SAME tick): the
+// summed mass, and the max / max-of-complement of a two-word key that proves
+// every proposer to the slot agreed on (cell, material, cell mass).
+constexpr uint32_t kClaimWords = kClaimSize * 6;
 
 // ---- GAS PARTICLES (docs/PLAN_gas_particles.md stage 1) --------------------
 // Gas that has left the residency window. Its OWN pool, not a share of
@@ -4591,7 +4597,7 @@ class World {
   // ---- particles + explosions (M5, DESIGN.md §5/§7) ----
   rhi::Buffer particles[2];    // kParticleCap Particle (32 B), double-buffered
   rhi::Buffer particleCounts;  // 4 u32: [0]/[1] = live count per page
-  rhi::Buffer claim;           // kClaimSize u32 — reinsertion claim hash
+  rhi::Buffer claim;           // kClaimWords u32 — reinsertion claim hash + grain landing
   rhi::Buffer pArgsStage;      // 8 u32: [0..3] draw args, [4..6] dispatch args
   rhi::Buffer pDispatchArgs;   // 3 u32, indirect-only (see dispatchArgs note)
   rhi::Buffer drawArgs;        // 4 u32, indirect-only draw args for particles

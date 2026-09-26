@@ -221,7 +221,7 @@ void World::Init(const rhi::Device& device) {
   particles[1] = CreateBuffer(device, (uint64_t)kParticleCap * 32, U::Storage, "particlesB");
   particleCounts = CreateBuffer(device, 16, U::Storage | U::CopySrc | U::CopyDst,
                                 "particleCounts");
-  claim = CreateBuffer(device, (uint64_t)kClaimSize * 4, U::Storage | U::CopyDst, "claim");
+  claim = CreateBuffer(device, (uint64_t)kClaimWords * 4, U::Storage | U::CopyDst, "claim");
   pArgsStage = CreateBuffer(device, 32, U::Storage | U::CopySrc, "pArgsStage");
   pDispatchArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst, "pDispatchArgs");
   drawArgs = CreateBuffer(device, 16, U::Indirect | U::CopyDst, "drawArgs");

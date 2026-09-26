@@ -892,6 +892,23 @@ SSBO lists of chunk indices.
   ash off burning limbs, island rubble, blast ejecta, spell sprays and the
   brush's default "mixed" grain. Worldgen bulk, prefabs and in-place
   powder/liquid conversions keep their mass (`carriedState`).
+- **GRAINS LEAVE THE PARTICLE SIM ON CONTACT (2026-09-26; `sim_particle.wgsl`
+  GRAIN LANDING, gate `vessel-sand`).** The reinsertion claim is one winner per
+  cell per tick; a pouch's stream put every grain of a tick into one cell, so
+  ~1 grain landed per tick and a poured heap took 709 ticks to leave the
+  particle sim. Now a powder grain that touches the world picks, in an order
+  hashed from its own state, the first open cell of ten: a merge into the
+  partial cell of its own material that stopped it, or the air cell it backed
+  into and the eight around it (a grain over a drop is a CA grain that falls).
+  Every grain aimed at one cell publishes a key (cell, material, the cell's
+  mass as integrate read it) and adds its eighths to a per-slot sum in five
+  extra planes of the claim buffer (`kClaimWords`); in resolve, if the key is
+  uniform and the sum fits, the claim winner writes it all and every member is
+  absorbed -- decided without re-reading the cell, since nothing writes voxels
+  between integrate and resolve. Anything else falls back to one winner.
+  Landing grains keep their sub-cell offset: equal particle states are equal
+  claim priorities, i.e. two winners, and that lost matter. Measured: 512
+  eighths exact, last grain 29 ticks after the pour (was 709).
 - **PER-MATERIAL ANGLE OF REPOSE (2026-09-13).** One down, one across is 45°,
   and for years that was the angle of *every* powder in the engine — dry sand,
   angular gravel, snow, ash and dust all built the same cone. One optional
