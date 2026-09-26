@@ -538,6 +538,9 @@ bool LoadItems(const std::string& dir, size_t materialCount,
           std::clamp(c.value("capacity", 0), 0, 4096) * kContainerUnitsPerCell;
       d.container.scoopPerTick = std::clamp(c.value("scoopPerTick", 4), 1, 64);
       d.container.pourPerTick = std::clamp(c.value("pourPerTick", 2), 1, 64);
+      d.container.pourGrain =
+          std::clamp(c.value("pourGrainEighths", (int)kContainerUnitsPerCell), 1,
+                     (int)kContainerUnitsPerCell);
       d.container.applyCells = std::clamp(c.value("applyCells", 4), 1, 128);
       d.container.pourRange = MetresToCells(c.value("pourRangeM", 2.0f));
       d.container.pourSpeed = MetresToCells(c.value("pourSpeedMps", 1.5f));

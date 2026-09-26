@@ -416,18 +416,26 @@ Status GateVessel(Ctx& c, std::string& detail) {
               (sp[0].flags & kPFlagMeasured) != 0 &&
               ((sp[0].payload >> 12) & 7u) == 2u,
           "3 eighths pour as ONE particle measured at fullness 3/8, not a cell");
-    // A pouch with a partial cell: the whole cell falls full, the last four
-    // eighths as a PARTIAL cell of grains (powder mass, state 4 + 2 = 6) --
-    // never rounded up to a whole grain, and no longer lost as "dust".
+    // A pouch pours GRAINS of pouch.pourGrain eighths (items.json
+    // pourGrainEighths): 12 eighths leave as ceil(12 / grain) particles whose
+    // masses sum to exactly 12 -- never rounded up, nothing lost as "dust".
     ItemStack sand = Vs(c.items, pouchI, 1, (uint16_t)mSand, 12);
     sp.clear();
-    ContainerPour(*pouch, sand, m0, Vec3{1, 0, 0}, nullptr,
-                  CurrentTuning().sim.partGravity, 701, 3u, sp, nullptr,
-                  0xFFFFFFFFu, &c.mats);
-    check(sp.size() == 2 && !sand.Filled() && (sp[0].flags & kPFlagMeasured) == 0 &&
-              PowderMassOfState((sp[0].payload >> 12) & 0xFu) == 8u &&
-              PowderMassOfState((sp[1].payload >> 12) & 0xFu) == 4u,
-          "a pouch's partial last cell lands as 4/8 of grains, not dust");
+    int pouredTotal = 0;
+    for (int guard = 0; guard < 64 && sand.Filled(); guard++)
+      ContainerPour(*pouch, sand, m0, Vec3{1, 0, 0}, nullptr,
+                    CurrentTuning().sim.partGravity, 701 + (uint32_t)guard, 3u, sp,
+                    nullptr, 0xFFFFFFFFu, &c.mats);
+    bool grainsOk = !sand.Filled();
+    for (const ParticleSpawn& q : sp) {
+      const int e = (int)PowderMassOfState((q.payload >> 12) & 0xFu);
+      pouredTotal += e;
+      grainsOk = grainsOk && (q.flags & kPFlagMeasured) == 0 &&
+                 e <= pouch->container.pourGrain;
+    }
+    const int grain = pouch->container.pourGrain;
+    check(grainsOk && pouredTotal == 12 && (int)sp.size() == (12 + grain - 1) / grain,
+          "a pouch pours 12 eighths as grains of pourGrain, summing to 12");
     // THE RING'S ROOM: charged only for the particles that fit.
     ItemStack big = Vs(c.items, flaskI, 1, (uint16_t)liq, 64);
     sp.clear();

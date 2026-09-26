@@ -172,7 +172,8 @@
         "holds": ["powder"],
         "capacity": 128,
         "scoopPerTick": 4,
-        "pourPerTick": 2,
+        "pourPerTick": 16,
+        "pourGrainEighths": 1,
         "pourRangeM": 2.0,
         "pourSpeedMps": 1.5,
         "applyCells": 4
