@@ -42,9 +42,9 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   shaderDir_ = shaderDir;
   rhi::Queue queue = device.GetQueue();
 
-  // The tree lattice the atlas was loaded against becomes the TREE_TILE /
-  // TREE_SCAN / TREE_CAND_MAX prelude constants of every shader compiled from
-  // here on (gpu/resources.cpp ShaderConstantPrelude). Set BEFORE the first
+  // The tree lattice the atlas was loaded against becomes worldgen.wgsl's
+  // TREE_TILE / TREE_SCAN / TREE_CAND_MAX prelude constants from here on
+  // (gpu/resources.cpp WorldgenPrelude). Set BEFORE the first
   // LoadShader below, and it stays set for F5 reloads and --shader-stats.
   treeatlas::SetCurrentTreeLattice(trees.lattice);
   // The pond lattice the same way (POND_TILE, from the map already set as
@@ -221,7 +221,7 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // BOTH this layout and simSlimBGL_ for the same reason 17/18 are: one
         // WGSL identifier cannot carry two binding numbers across modules that
         // share common.wgsl, and the far-cascade pipelines (farPL_, on the slim
-        // group) call genCell and therefore call the tree sampler.
+        // group) call genCellIn and therefore call the tree sampler.
         entry(26, T::ReadOnlyStorage), // treeAtlas
         // The openness grid (world.h kOpenFaces, docs/PLAN_gi.md §2). Written
         // by sim_openness.wgsl and by nothing else; here rather than in a
@@ -335,10 +335,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // than given a seam-group entry of its own.
         entry(24, T::Storage),         // waterBodyState (atomic i32 ledger)
         // Same binding number as in simBGL_ above; `fardown`/`far` build on
-        // this layout and both reach genCell -> treeAt.
+        // this layout and both reach genCellIn -> treeAt.
         entry(26, T::ReadOnlyStorage), // treeAtlas
         // Same binding number as in simBGL_ above, same argument as treeAtlas:
-        // `far`/`fardown` build on this layout and both reach genCell's biome
+        // `far`/`fardown` build on this layout and both reach genCellIn's biome
         // sampler, which reads the map.
         entry(31, T::ReadOnlyStorage), // worldMap
     };

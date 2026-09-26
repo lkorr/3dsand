@@ -1505,25 +1505,17 @@ def check_run_word_layout():
 
 
 def check_biome_order():
-    """The engine biome list lives in three code places beside the files:
-    worldgen.wgsl's B_* constants, biomegen.js ENGINE_BIOMES (the tuner) and
-    biomes.cpp kEngineBiomes (the loader + gate); treeatlas.h's kBiomeCount
-    must stay gone (the count is data). A biome added to one and not the
-    others is an id the shader, the tuner and the loader disagree on, and no
-    gate would name it. (treegen.js BIOME_ORDER left with the .svtree weight
-    words it indexed: the atlas builds its weights from the biome files.)"""
-    wgsl = read("assets/shaders/worldgen.wgsl")
+    """The engine biome list lives in two code places beside the files:
+    biomegen.js ENGINE_BIOMES (the tuner) and biomes.cpp kEngineBiomes (the
+    biomes gate's engine-id census); treeatlas.h's kBiomeCount must stay gone
+    (the count is data). worldgen.wgsl names no biome by id and treegen.js no
+    longer bakes per-biome weights, so neither is listed."""
     bg = read("assets/editor/biomegen.js")
     cpp = read("src/sim/biomes.cpp")
     hdr = read("src/sim/treeatlas.h")
-    if not (wgsl and bg and cpp and hdr):
+    if not (bg and cpp and hdr):
         return
     checked.append("biome order")
-    # worldgen: const B_FOREST : u32 = 0u; ... -> name by id
-    ids = {}
-    for m in re.finditer(r"const\s+B_(\w+)\s*:\s*u32\s*=\s*(\d+)u", wgsl):
-        ids[int(m.group(2))] = m.group(1).lower()
-    wg_order = [ids[i] for i in sorted(ids)] if ids else []
     def js_list(src, name):
         m = re.search(rf"export const {name}\s*=\s*\[([^\]]*)\]", src)
         return re.findall(r"'(\w+)'", m.group(1)) if m else None
@@ -1532,17 +1524,15 @@ def check_biome_order():
     cpp_order = re.findall(r'"(\w+)"', m.group(1)) if m else None
     m = re.search(r"constexpr int kBiomeCount = (\d+);", hdr)
     k = int(m.group(1)) if m else None
-    lists = {"worldgen.wgsl B_*": wg_order,
-             "biomegen.js ENGINE_BIOMES": bg_order, "biomes.cpp kEngineBiomes": cpp_order}
+    lists = {"biomegen.js ENGINE_BIOMES": bg_order, "biomes.cpp kEngineBiomes": cpp_order}
     for name, val in lists.items():
         if not val:
             problems.append(f"biome order: cannot find the list in {name}")
             return
     # Since the world map's P1 the id space is the FILES: assets/biomes/*.json
     # `index` values must be exactly 0..N-1, and the tree atlas / worldMap
-    # record tables are laid out in that order at load. worldgen.wgsl still
-    # names the first four by id (B_* until P2 retires them), so the code
-    # lists must be a PREFIX of the file order, not equal to it.
+    # record tables are laid out in that order at load. The code lists carry
+    # only the first four, so they must be a PREFIX of the file order.
     import json as _json
     files = {}
     for p in (ROOT / "assets" / "biomes").glob("*.json"):

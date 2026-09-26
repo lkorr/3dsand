@@ -1367,7 +1367,7 @@ void Stream::ApplyGenVerdict(const std::vector<uint32_t>& genSlots,
     // is the ONE promotion rule (§2.3). The occupancy read only narrows WHICH
     // chunks are read. The one exception is the sky share below, and it is an
     // exception because these slots were overwritten end to end by the
-    // genChunk dispatch whose own in-kernel count this is: genCell returns
+    // genChunk dispatch whose own in-kernel count this is: genCellIn returns
     // packVox(mat, state, STAMP_NEVER), so it can set neither bit 31
     // (kCellOpIfAir) nor a stain bit, and `nonAir == 0` on a freshly generated
     // slot does not merely suggest PT_EMPTY's content, it IS PT_EMPTY's

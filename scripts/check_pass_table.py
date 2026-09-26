@@ -300,7 +300,7 @@ BUF_TO_WGSL = {
     # §4.1). Binding 36 of simBGL_ only -- no slim-group pipeline names it.
     "WaterFlux": {"waterFlux"},
     # The baked tree atlas, binding 26 of BOTH simBGL_ and simSlimBGL_ (the
-    # far-cascade pipelines call genCell, so they sample it too).
+    # far-cascade pipelines call genCellIn, so they sample it too).
     "TreeAtlas": {"treeAtlas"},
     # The authored world map, binding 31 of BOTH simBGL_ and simSlimBGL_, for
     # the same reason the tree atlas is in both (docs/PLAN_world_map.md).
@@ -392,7 +392,7 @@ _SLIM_GROUP0 = {"voxels", "dirtyIn", "dirtyOut", "materials", "T",
                 "reactions",
                 # treeAtlas is in the SLIM group as well as the full one: `far`
                 # and `fardown` build on farPL_ and both reach the tree sampler
-                # (genCell -> treeAt, farSurfaceMat -> treeCanopyAt), so binding
+                # (genCellIn -> treeAt, farSurfaceMat -> treeCanopyAt), so binding
                 # 26 has to name the same buffer in every module that declares
                 # it -- the same argument as waterBodyState above.
                 "treeAtlas",

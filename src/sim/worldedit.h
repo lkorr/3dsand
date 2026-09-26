@@ -3,7 +3,7 @@
 // WHAT IT IS. A sparse, chunk-keyed patch of world cell -> voxel word, authored
 // in the tuner's Worldgen tab (assets/worldview.js) and saved to
 // assets/worldedits/<name>.svedit. When a layer is named by
-// `worldgen.editLayer` in tuning.json, the engine applies it to every chunk it
+// `world.editLayer` in tuning.json, the engine applies it to every chunk it
 // generates — at startup worldgen and on every streaming refill — so a
 // hand-built structure is part of the world rather than part of one session.
 //
@@ -33,7 +33,7 @@
 // per generation of that chunk. Two runs of the same seed with the same layer
 // therefore see the same op stream on the same ticks, so the world hash is
 // reproducible. A layer that is present at all MOVES the hash, which is correct
-// and is why `worldgen.editLayer` is empty by default and no gate sets it.
+// and is why `world.editLayer` is empty by default and no gate sets it.
 
 #pragma once
 
@@ -99,7 +99,7 @@ class WorldEdits {
 // chunk been patched".
 WorldEdits& WorldEditLayer();
 
-// Loads `worldgen.editLayer` from the asset directory if it names one, and
+// Loads `world.editLayer` from the asset directory if it names one, and
 // reports what happened. Safe to call again after a tuning reload.
 void LoadWorldEditLayerFromTuning(const std::string& assetDir);
 

@@ -1,5 +1,9 @@
 # Stock-HEAD baselines, taken before the terrain overhaul
 
+> **HISTORICAL (2026-09-26).** Measurements of the pre-overhaul world, kept
+> for the before/after comparison they were taken for. Nothing here describes
+> the current generator; do not use these numbers as a baseline.
+
 Recorded 2026-08-26 on `main` @ the commit that adds the `terrain` gate, RTX 3060 Ti,
 quiet machine (`tasklist` confirmed no other `sandvox.exe`), every run under
 `scripts/run.sh` so nothing else had the GPU.

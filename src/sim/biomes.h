@@ -38,9 +38,10 @@
 
 namespace biomes {
 
-// worldgen.wgsl B_FOREST..B_DESERT, in id order. Mirrored by treegen.js
+// The four biomes the .svtree bake wrote weights for positionally (a species
+// file's placement.biomes names them), in id order. Mirrored by treegen.js
 // BIOME_ORDER and biomegen.js ENGINE_BIOMES; scripts/check_invariants.py
-// holds the three together.
+// holds the three together and to the head of the biome files' id order.
 inline constexpr int kEngineBiomeCount = 4;
 extern const char* const kEngineBiomes[kEngineBiomeCount];
 
@@ -107,11 +108,10 @@ struct BiomeDef {
   uint32_t firmSkinId = 0;
   int skinDepth = 1;
   int patchThreshold = 0, patchCellLog2 = 5;
-  // Which of worldgen's fixed-function ground layers this biome gets. These
-  // replace the `biome == B_DESERT` / `== B_PINE` tests that gated whole
-  // blocks of genCellIn on a hard-coded id (cover.groundFlora, cover.cacti,
-  // cover.sandCap in the JSON).
-  bool groundFlora = true;   // the canopy-inverted undergrowth + flower layer
+  // Which of worldgen's fixed-function ground layers this biome gets
+  // (cover.groundFlora, cover.cacti, cover.sandCap in the JSON; the kBF_*
+  // flags of its record).
+  bool groundFlora = true;   // the tile plants: fern banks, big toadstools
   bool cacti = false;        // the cactus proc shape
   bool sandCap = false;      // loose sand cap under the skin
   // P-E: the cactus density, when `cacti` is on. Percent of 2.5 m tiles that
@@ -169,7 +169,7 @@ struct WaterPresetDef {
   std::vector<std::string> unresolved;   // the subset materials.json does not have
   float tileM = 0;
   int rarity = 0, maxSlope = 0;
-  int minY = -1, maxY = -1;              // placement.minY / maxY (row defaults; the biome row's gate rolls)
+  int minY = -1, maxY = -1;              // placement.* : the row DEFAULTS the biome page seeds; never packed
   // P-F: the geometry half, packed by worldmap::WaterGeomOf into the kW_*
   // geometry words and the 17 sampled profile knots.
   std::vector<std::pair<float, float>> profile;   // bathymetry.profile, (u, depth fraction) pairs, sanitized

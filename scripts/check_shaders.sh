@@ -402,35 +402,30 @@ TUNING_TEXT="$(python "$ROOT/scripts/tuning_prelude.py")" || {
 }
 PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$TUNING_TEXT")"
 
-# The tree lattice (ShaderConstantPrelude's TREE_TILE / TREE_SCAN /
-# TREE_CAND_MAX). Load-time asset data in the engine -- the finest biome tile
-# and the atlas's widest reach -- so it is derived from the same assets here
-# (scripts/tree_lattice.py mirrors treeatlas.h TreeLatticeFor) rather than
-# scraped from a header. TREE_CAND_MAX sizes an array in worldgen.wgsl.
+# THE WORLDGEN-ONLY PRELUDE (resources.cpp WorldgenPrelude): load-time asset
+# data only worldgen.wgsl reads, so the engine emits it for that one shader
+# and so does this script (appended in the loop below, for worldgen.wgsl only).
+#   TREE_TILE / TREE_SCAN / TREE_CAND_MAX -- the tree lattice, derived from the
+#     assets by scripts/tree_lattice.py (mirrors treeatlas.h TreeLatticeFor).
+#     TREE_CAND_MAX sizes an array in worldgen.wgsl.
+#   POND_TILE -- the finest live water tile of any biome, scripts/pond_lattice.py
+#     (mirrors worldmap.cpp PondLatticeVox).
+#   REF_VOXELS_PER_METRE -- map.json terrain.refVoxelsPerMetre of the map
+#     tuning.json names, scripts/map_terrain.py (mirrors LoadWorldMap).
 TREE_TEXT="$(python "$ROOT/scripts/tree_lattice.py" --vpm "$W_VPM" --assets "$ROOT/assets")" || {
   echo "check_shaders: scripts/tree_lattice.py failed" >&2
   exit 1
 }
-PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$TREE_TEXT")"
-
-# The pond lattice (ShaderConstantPrelude's POND_TILE; P-F): the finest live
-# water tile of any biome, derived from the assets by scripts/pond_lattice.py
-# exactly as worldmap.cpp PondLatticeVox derives it at load.
 POND_TEXT="$(python "$ROOT/scripts/pond_lattice.py" --vpm "$W_VPM" --assets "$ROOT/assets")" || {
   echo "check_shaders: scripts/pond_lattice.py failed" >&2
   exit 1
 }
-PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$POND_TEXT")"
-
-# The map's reference scale (ShaderConstantPrelude's REF_VOXELS_PER_METRE;
-# P-G): map.json terrain.refVoxelsPerMetre of the map tuning.json names,
-# derived from the assets by scripts/map_terrain.py exactly as LoadWorldMap
-# reads it at load.
 MAP_TEXT="$(python "$ROOT/scripts/map_terrain.py" --assets "$ROOT/assets")" || {
   echo "check_shaders: scripts/map_terrain.py failed" >&2
   exit 1
 }
-PRELUDE_TEXT="$(printf '%s\n%s' "$PRELUDE_TEXT" "$MAP_TEXT")"
+WG_PRELUDE_TEXT="$(printf '%s\n%s\n%s' "$TREE_TEXT" "$POND_TEXT" "$MAP_TEXT")"
+WG_PRELUDE_LINES="$(printf '%s\n' "$WG_PRELUDE_TEXT" | wc -l | tr -d ' ')"
 
 # Lines contributed ahead of the body: prelude + its "\n" + common + its "\n".
 # Error line L in the combined source maps to line L - OFFSET in the body file.
@@ -518,9 +513,16 @@ fn ptTick() -> u32 { return ${u}.tick; }"
     ptseedLines=3
   fi
 
+  wgpre=""
+  if [ "$name" = "worldgen.wgsl" ]; then
+    wgpre="$WG_PRELUDE_TEXT"
+    ptseedLines=$((ptseedLines + WG_PRELUDE_LINES))
+  fi
+
   combined="$TMP/$name"
   { printf '%s\n\n' "$PRELUDE_TEXT"
     [ -n "$ptseed" ] && printf '%s\n' "$ptseed"
+    [ -n "$wgpre" ] && printf '%s\n' "$wgpre"
     cat "$commonSrc"; printf '\n'; cat "$f"; } > "$combined"
 
   # `-f wgsl` parses, resolves, and validates, then re-emits WGSL we discard.

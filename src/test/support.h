@@ -174,7 +174,7 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim,
                     uint32_t seed);
 
 // Re-read the AUTHORED ENVIRONMENT from disk -- assets/biomes/*.json, the
-// world map named by worldgen.mapLayer, assets/trees/* -- validate it the way
+// world map named by world.mapLayer, assets/trees/* -- validate it the way
 // boot does, and push it to the GPU (Simulation::UploadEnvironment) and to
 // the CPU twins (worldmap::SetCurrentWorldMap). docs/PLAN_environment_truth.md
 // P-A: this is what "regen world", F7, the tuner's Apply button and

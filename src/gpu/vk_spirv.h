@@ -13,7 +13,7 @@
 // The string compiled here is byte-for-byte the one LoadShader assembles:
 //
 //     ShaderConstantPrelude() + "\n" + TuningWgslBlock(...) + "\n"
-//         + common.wgsl + "\n" + <body>
+//         [+ WorldgenPrelude(), worldgen.wgsl only] + common.wgsl + "\n" + <body>
 //
 // which is also what scripts/check_shaders.sh reproduces. Three consumers of one
 // concatenation is already two too many; if a fourth appears, hoist it.

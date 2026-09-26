@@ -2329,17 +2329,6 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   // simply impossible.
   {
     const uint32_t kGenBatch = kWorldgenBatch;   // world.h: genAct covers it
-    // SANDVOX_GEN_VERDICT_CHECK=1: classify every batch BOTH ways — the GPU
-    // verdict and PageTable::Classify over the read-back words — install the
-    // words' answer, and count every disagreement. The verdict path's claim is
-    // "identical to Classify", and this is the switch that measures it rather
-    // than argues it (one --verify boot with it set covers every worldgen the
-    // gates run).
-    static const bool kVerdictCheck = [] {
-      const char* e = std::getenv("SANDVOX_GEN_VERDICT_CHECK");
-      return e && e[0] == '1';
-    }();
-    uint64_t verdictMismatch = 0, verdictChecked = 0;
     // The first submit still has to clear the transient buffers (hash,
     // support, particle counts, both dirty pages) exactly as EncodeWorldgen
     // does, so run it over an EMPTY slot list: the fills land, the dispatch
@@ -2382,11 +2371,10 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       // costs an 8 KiB readback instead of ReadVoxelsSync's 32 MiB — 512 MiB
       // per paged worldgen, which startup, every menu regen, vk_smoke and
       // ~220 selftest regens used to pay, plus a CPU Classify of 32,768
-      // chunks. The words are read only to CHECK the verdict
-      // (SANDVOX_GEN_VERDICT_CHECK=1) or when a verdict was not published.
+      // chunks. The words are read only when a verdict was not published.
       rhi::ReadbackBlocking(ctx.device, ctx.queue, world.genAct, 0,
                             verdict.data(), (size_t)n * 4, "wgVerdict");
-      bool needWords = kVerdictCheck;
+      bool needWords = false;
       for (uint32_t k = 0; k < n && !needWords; k++)
         if ((verdict[k] & kGenVerdictValid) == 0u) needWords = true;
       if (needWords) {
@@ -2396,18 +2384,8 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
       }
       for (uint32_t k = 0; k < n; k++) {
         uint32_t e = world.pages->ClassifyGenVerdict(verdict[k], seed);
-        if (needWords) {
-          const uint32_t ew = world.pages->Classify(
-              base + k, vox.data() + (size_t)k * kChunkVol);
-          if (kVerdictCheck && (verdict[k] & kGenVerdictValid) != 0u) {
-            verdictChecked++;
-            if (ew != e && verdictMismatch++ < 8)
-              std::printf("[genverdict] MISMATCH slot %u: verdict 0x%08x -> "
-                          "0x%08x, Classify(words) 0x%08x\n",
-                          base + k, verdict[k], e, ew);
-          }
-          e = ew;
-        }
+        if (needWords)
+          e = world.pages->Classify(base + k, vox.data() + (size_t)k * kChunkVol);
         if (e != PageTable::kNeedsPage) world.pages->SetSentinel(base + k, e);
       }
       world.pages->FlushTableWrites(ctx.queue);
@@ -2491,12 +2469,6 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
                 (double)world.pages->PagesInUse() * kChunkVol * 4.0 / 1048576.0,
                 (double)world.pages->PoolPages() * kChunkVol * 4.0 / 1048576.0,
                 world.pages->PagesHighWater(), woken);
-    if (kVerdictCheck)
-      std::printf("[genverdict] worldgen check: %llu verdicts vs "
-                  "Classify(words), %llu mismatch%s\n",
-                  (unsigned long long)verdictChecked,
-                  (unsigned long long)verdictMismatch,
-                  verdictMismatch == 1 ? "" : "es");
     return;
   }
 }

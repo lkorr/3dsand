@@ -108,8 +108,6 @@ WaterGeom WaterGeomOf(const biomes::WaterPresetDef& w) {
   g.mudWidth = std::clamp(vox(w.mudWidthM), 0, g.shoreBand);
   g.bedShallowDepth = std::clamp(vox(w.bedShallowDepthM), 0, 4096);
   g.bedThickness = std::clamp(vox(w.bedThicknessM), 0, 64);
-  g.maxSlope = std::clamp(w.maxSlope <= 0 ? 1024 : w.maxSlope, 0, 1024);
-  g.minY = w.minY; g.maxY = w.maxY;
   g.band = std::max(g.shoreBand, g.bermW);
   g.fill = w.fillId;
   g.mudMat = w.mudId;
@@ -347,7 +345,6 @@ std::vector<WaterRowPacked> PackWaterRows(const biomes::BiomeSet& set, const bio
     p.w[kR_MinY] = U(r.cond.minY);
     p.w[kR_MaxY] = U(r.cond.maxY);
     p.w[kR_MaxSlope] = U(std::clamp(r.cond.maxSlope, 0, 1024));
-    p.w[kR_PatchThreshold] = U(std::clamp(r.cond.patchThreshold, 0, 255));
     out.push_back(p);
   }
   return out;
@@ -435,7 +432,6 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
     }
     r[kB_CaveThreshold1] = U(std::clamp(t1, 0, 255));
     r[kB_CaveThreshold2] = U(std::clamp(t2, 0, 255));
-    r[kB_SedMax] = 0u;
     uint32_t flags = 0;
     if (b.groundFlora) flags |= kBF_GroundFlora;
     if (b.cacti) flags |= kBF_Cacti;
@@ -576,9 +572,6 @@ bool PackBiomeTable(const biomes::BiomeSet& set, std::vector<uint32_t>& W,
       rec(kW_BedShallowDepth) = U(g.bedShallowDepth);
       rec(kW_BedThickness) = U(g.bedThickness);
       rec(kW_BedSubstrate) = g.bedSubstrate;
-      rec(kW_MaxSlope) = U(g.maxSlope);
-      rec(kW_MinY) = U(g.minY);
-      rec(kW_MaxY) = U(g.maxY);
       rec(kW_Band) = U(g.band);
       for (int k = 0; k <= 16; k++)
         rec(kW_Knots + static_cast<uint32_t>(k >> 1)) |= U(g.knots[k]) << ((k & 1) * 16);

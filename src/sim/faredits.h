@@ -39,7 +39,7 @@ class ChunkStore;
 //
 // WHAT THE CPU CAN AND CANNOT COMPUTE. The far-field cell rule is
 //   byte = farSurfaceMat(material at the cell's center voxel, ...)
-// and `farSurfaceMat` needs `genCell`, which exists only in WGSL. So this
+// and `farSurfaceMat` needs `genCellIn`, which exists only in WGSL. So this
 // index deliberately stores the RAW MATERIAL at the sample voxel and nothing
 // else; the surface-skin recolor is applied by the same GPU function the sieve
 // and the downsample already call. That is what keeps a patched cell

@@ -36,7 +36,9 @@ void DumpGpuBufferBudget(const char* whenLabel);
 // proven nothing. NOTE that scripts/check_shaders.sh is a SECOND reproduction
 // of this same prelude, scraped from world.h in bash; adding a constant means
 // adding it there too. Memoized on its load-time inputs (resources.cpp
-// PreludeInputsKey), so it is cheap to call per shader.
+// PreludeInputsKey), so it is cheap to call per shader. Asset-derived
+// constants only worldgen.wgsl reads are NOT here: AssembleShaderSource adds
+// them for that shader alone (resources.cpp WorldgenPrelude).
 std::string ShaderConstantPrelude();
 
 // Whether this device enabled fragmentStoresAndAtomics, which the shadow cache

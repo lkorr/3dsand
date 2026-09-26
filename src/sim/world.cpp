@@ -1190,40 +1190,6 @@ static N2 vnoise2d(int x, int z, uint32_t csl, uint32_t seed) {
   o.dz = ((ha + (((hb - ha) * sx) >> 15)) * vsmoothd(tz)) >> 15;
   return o;
 }
-[[maybe_unused]] static int isin16(int a) {
-  int p = a & 65535;
-  int half = p & 32767;
-  int y = (4 * half * (32768 - half)) >> 15;
-  int r = (y * (25395 + ((7373 * y) >> 15))) >> 15;
-  if (p >= 32768) { return -r; }
-  return r;
-}
-[[maybe_unused]] static int vnoise3(int x, int y, int z, uint32_t cxl,
-                                    uint32_t cyl, uint32_t seed) {
-  int gx = x >> cxl;
-  int gz = z >> cxl;
-  int gy = y >> cyl;
-  int mxz = (int)((1u << cxl) - 1u);
-  int my = (int)((1u << cyl) - 1u);
-  int sx = vsmooth(q15frac(x & mxz, cxl));
-  int sz = vsmooth(q15frac(z & mxz, cxl));
-  int sy = vsmooth(q15frac(y & my, cyl));
-  uint32_t pz0 = pcg((uint32_t)(gz));
-  uint32_t pz1 = pcg((uint32_t)(gz + 1));
-  uint32_t i00 = pcg((uint32_t)(gx) ^ pz0);
-  uint32_t i10 = pcg((uint32_t)(gx + 1) ^ pz0);
-  uint32_t i01 = pcg((uint32_t)(gx) ^ pz1);
-  uint32_t i11 = pcg((uint32_t)(gx + 1) ^ pz1);
-  uint32_t s0 = seed ^ ((uint32_t)(gy) * 2654435769u);
-  uint32_t s1 = seed ^ ((uint32_t)(gy + 1) * 2654435769u);
-  int v0 = vbilerp((int)(pcg(s0 ^ i00) & 0x3FFFu), (int)(pcg(s0 ^ i10) & 0x3FFFu),
-                   (int)(pcg(s0 ^ i01) & 0x3FFFu), (int)(pcg(s0 ^ i11) & 0x3FFFu),
-                   sx, sz);
-  int v1 = vbilerp((int)(pcg(s1 ^ i00) & 0x3FFFu), (int)(pcg(s1 ^ i10) & 0x3FFFu),
-                   (int)(pcg(s1 ^ i01) & 0x3FFFu), (int)(pcg(s1 ^ i11) & 0x3FFFu),
-                   sx, sz);
-  return v0 + (((v1 - v0) * sy) >> 15);
-}
 // MIRROR-END noise
 
 // ---- the world map's biome, on the CPU (worldgen.wgsl mapBiomeAt) ---------
@@ -1349,9 +1315,6 @@ static uint32_t wmWater(uint32_t p, uint32_t w) {
     case worldmap::kW_BedShallowDepth: return (uint32_t)g->bedShallowDepth;
     case worldmap::kW_BedThickness: return (uint32_t)g->bedThickness;
     case worldmap::kW_BedSubstrate: return g->bedSubstrate;
-    case worldmap::kW_MaxSlope: return (uint32_t)g->maxSlope;
-    case worldmap::kW_MinY: return (uint32_t)g->minY;
-    case worldmap::kW_MaxY: return (uint32_t)g->maxY;
     case worldmap::kW_Band: return (uint32_t)g->band;
     default: return 0u;
   }
@@ -1923,14 +1886,17 @@ static IV2 bowlAt(Pond p, int x, int z) {
   return iv2(p.surf - depth, p.surf);
 }
 
-static int shoreD2(Pond p, int x, int z) {
+static int candD2(Pond p, int x, int z, int band) {
   if (!p.present) { return 0x7FFFFFFF; }
   const int dx = x - p.cx;
   const int dz = z - p.cz;
   const int d2 = dx * dx + dz * dz;
-  const int outer = p.r + wmWaterI(p.wp, WM_W_BAND);
+  const int outer = p.r + band;
   if (d2 > outer * outer) { return 0x7FFFFFFF; }
   return d2;
+}
+static int shoreD2(Pond p, int x, int z) {
+  return candD2(p, x, z, wmWaterI(p.wp, WM_W_BAND));
 }
 struct Shore {
   bool onShore;
@@ -2232,14 +2198,12 @@ int World::PondReachMax() {
 }
 
 void World::AuthoredPoolList(AuthoredPool out[kAuthoredPools]) {
-  // The same three discs TerrainHeight overrides `h` for, with the same
-  // vlen()-scaled radii and the same poolY datum. Water occupies (floorY,
-  // waterY], which is genCellIn's `fluidTop >= 0 && y <= fluidTop` branch taken
-  // after the `y <= h` terrain branch has already claimed the floor.
+  // The one disc TerrainHeight overrides `h` for (the harness tarn the
+  // waterbody gate reads as Basin(1)), with the same vlen()-scaled radii and
+  // the same poolY datum. Water occupies (floorY, waterY], which is
+  // genCellIn's `fluidTop >= 0 && y <= fluidTop` branch taken after the
+  // `y <= h` terrain branch has already claimed the floor.
   const int poolY = wmTerrain(WM_H_TERRAIN_HOME_Y) - vlen(15);
-  // One authored pool since the world map's P2b: the harness tarn the
-  // waterbody gate reads as Basin(1). The oil pond and the lava pool went
-  // with the arena and the deck.
   out[0] = {420, 420, vlen(68), poolY,            poolY + vlen(24),
             poolY + vlen(26), "water"};
 }
