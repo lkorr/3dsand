@@ -3426,6 +3426,28 @@ function pushStrokeTrail() {
       alpha: (cut ? 0.35 : 0.14) + age * (cut ? 0.65 : 0.3),
     };
   });
+  // THE ROWS THE GAME'S HIT TEST CASTS BETWEEN TWO CUT TICKS (melee.cpp
+  // MeleeSweepDamage): the edge lerped from last tick to this one, one row per
+  // `sweepSpacing` of TIP travel, capped at `sweepMaxSteps`. The lines above
+  // are where the blade IS each tick; these thin ones are where the game
+  // LOOKS for flesh in between, so a gap here is a gap a limb can pass
+  // through. The trail is in FILE voxels, the spacing in world voxels.
+  const mt = meleeTuning();
+  const S = rigScale();
+  const spacing = Math.max(mt.sweepSpacing, 0.05) * S;
+  const cap = Math.max(1, Math.round(mt.sweepMaxSteps));
+  for (let i = 1; i < n; i++) {
+    const p = strokeTrail[i - 1], q = strokeTrail[i];
+    if (q.phase !== MELEE.STROKE_PHASE.Cut) continue;
+    const steps = clamp(Math.ceil(AN.vlen(AN.vsub(q.tip, p.tip)) / spacing), 1, cap);
+    const alpha = 0.12 + 0.3 * ((i + 1) / n);
+    for (let k = 1; k < steps; k++) {
+      const u = k / steps;
+      const a = AN.vadd(p.base, AN.vmul(AN.vsub(q.base, p.base), u));
+      const b = AN.vadd(p.tip, AN.vmul(AN.vsub(q.tip, p.tip), u));
+      segs.push({ a: [a.x, a.y, a.z], b: [b.x, b.y, b.z], color: 0xff7a3a, alpha });
+    }
+  }
   ed.setStrokeTrail?.(goalMarkerSegs ? segs.concat(goalMarkerSegs) : segs);
 }
 

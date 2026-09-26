@@ -179,6 +179,8 @@ export function defaultMeleeTuning() {
     elbowPoleCone: 1.75,                                   // :418
     elbowAxisCone: 3.14,                                   // :419
     edgeFloor: 0.35,
+    sweepSpacing: metresToCells(0.05),                     // melee.cpp MeleeSweepDamage
+    sweepMaxSteps: 24,
     blockGap: metresToCells(0.22),
     blockItemDamage: 0.35,
     blockNudgeAz: 0.30,
@@ -240,6 +242,8 @@ export function meleeTuningFrom(tuningJson) {
     elbowPoleCone: n('elbowPoleCone', d.elbowPoleCone),
     elbowAxisCone: n('elbowAxisCone', d.elbowAxisCone),
     edgeFloor: n('edgeFloor', d.edgeFloor),
+    sweepSpacing: metresToCells(n('sweepSpacingM', d.sweepSpacing * kVoxelMeters)),
+    sweepMaxSteps: n('sweepMaxSteps', d.sweepMaxSteps),
     blockGap: metresToCells(n('blockGapM', d.blockGap * kVoxelMeters)),
     blockItemDamage: n('blockItemDamage', d.blockItemDamage),
     blockNudgeAz: n('blockNudgeAz', d.blockNudgeAz),
