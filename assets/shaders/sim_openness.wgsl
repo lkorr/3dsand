@@ -535,8 +535,18 @@ fn dirty(@builtin(workgroup_id) wg : vec3<u32>,
   } else {
     let pageBase = pe * CHUNK_VOL;
     for (var i = li; i < CHUNK_VOL; i += OPEN_WORDS_PER_CHUNK) {
-      let m = voxMat(voxels[pageBase + i]);
-      if (m != MAT_AIR && isRayBlocker(materials[m])) { acc += pcg((m << 12u) | i); }
+      let w = voxels[pageBase + i];
+      let m = voxMat(w);
+      if (m != MAT_AIR && isRayBlocker(materials[m])) {
+        // A PARTIAL powder folds its mass in, so grains merging in place
+        // (no material change) still re-walk the chunk. Full cells hash as
+        // they always did, so a page and its sentinel still agree.
+        var key = (m << 12u) | i;
+        if (materials[m].klass == CLASS_POWDER && powderIsPartial(w)) {
+          key ^= powderMass(w) << 24u;
+        }
+        acc += pcg(key);
+      }
     }
   }
   atomicAdd(&wgOpenSig, acc);

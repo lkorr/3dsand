@@ -140,7 +140,9 @@ fn mainDirty(@builtin(workgroup_id) wg : vec3<u32>,
         let sbit = subOccBitOfLocalIdx(i);
         let sm = 1u << (sbit & 31u);
         if (sbit < 32u) { sm0 |= sm; } else { sm1 |= sm; }
-        if (isRayBlocker(materials[m])) {
+        // Word-level (isRayBlockerW): a thin film of grains is not a
+        // blocker to the traced rays, so it must not be one here either.
+        if (isRayBlockerW(materials[m], w)) {
           block += 1u;
           if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
         }
@@ -341,7 +343,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       let sbit = subOccBitOfLocalIdx(i);
       let sm = 1u << (sbit & 31u);
       if (sbit < 32u) { sm0 |= sm; } else { sm1 |= sm; }
-      if (isRayBlocker(materials[m])) {
+      if (isRayBlockerW(materials[m], v)) {
         block += 1u;
         if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
       }

@@ -3178,6 +3178,36 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           out.tsMat = mat;
         }
         // fall through and keep marching
+      } else if (k == CLASS_POWDER && powderIsPartial(w)) {
+        // ---- a PARTIAL powder cell (docs/PLAN_powder_mass.md §3) ----------
+        // 1..7 eighths of grains, drawn in phase 2 as a 2x2x2 arrangement
+        // (tracePowder). Same deferral as a micro brick, and for the same
+        // register reason: only the cell and its t go into a record here.
+        // Past the micro LOD, or once the records are spent, the cell is
+        // decided by the SAME threshold the shadow rays use (isRayBlockerW):
+        // POWDER_BLOCK_MIN eighths or more is a whole cube, less is air.
+        // Both are bounded answers; on a settled surface the ray that passes
+        // through a thin film hits the ground under it one cell later.
+        if (detN < detMax && tCur * VOXEL_METERS <= TUNE_MICRO_LOD_DIST) {
+          let lc = vec3<u32>(cell - wloI);
+          let packed = lc.x | (lc.y << 10u) | (lc.z << 20u);
+          if (detN == 0) {
+            det0 = packed; detT0 = tCur;
+            detTau = out.mediaTau; detFire = out.fireGlow;
+          } else if (detN == 1) { det1 = packed; detT1 = tCur; }
+          else if (detN == 2) { det2 = packed; detT2 = tCur; }
+          else { det3 = packed; detT3 = tCur; }
+          detN += 1;
+        } else if (powderMass(w) >= POWDER_BLOCK_MIN) {
+          out.hit = true;
+          out.t = tCur;
+          out.cell = cell;
+          out.axis = axis;
+          out.sgn = sign(rd[axis]);
+          out.word = w;
+          break;
+        }
+        // else: pass through as air
       } else if (detN < detMax && (materials[mat].flags & MATF_MICRO) != 0u &&
                  microBricks[mat].base != MICRO_NONE) {
         // ---- static micro-detail: substitute a finer model for this cell ----
@@ -3484,12 +3514,16 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       let dw = voxWordAt(dc);
       let dm = voxMat(dw);
       let mb = microBricks[dm];
+      // A partial powder record (phase 1's CLASS_POWDER arm): no brick, the
+      // arrangement is derived from the cell's mass and its neighbours.
+      let isGrains = dm != MAT_AIR && materials[dm].klass == CLASS_POWDER &&
+                     powderIsPartial(dw);
       // The cell has not changed under us — the buffers are read-only for the
       // whole draw — so this is a re-read, not a re-test. It is here because
       // the record carries the CELL and not the word: four more live u32s in
       // the march would have been four more the allocator had to place.
-      if (dm == MAT_AIR || (materials[dm].flags & MATF_MICRO) == 0u ||
-          mb.base == MICRO_NONE) { continue; }
+      if (!isGrains && (dm == MAT_AIR || (materials[dm].flags & MATF_MICRO) == 0u ||
+          mb.base == MICRO_NONE)) { continue; }
       // Cell-local entry point, exactly as the march would have computed it:
       // `pt` is where the ray crossed INTO this cell.
       let entry = clamp((ro + rd * pt) - vec3f(dc), vec3f(0.0), vec3f(1.0));
@@ -3497,7 +3531,9 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       mh.hit = false;
       var isTile = false;
       rsAdd(RS_PLANT_EVAL, 1u);
-      if ((mb.flags & MICROF_PLANT) != 0u) {
+      if (isGrains) {
+        mh = tracePowder(dc, dw, entry, inv);
+      } else if ((mb.flags & MICROF_PLANT) != 0u) {
         let pd = plantDefOf(mb);
         isTile = pd.tile != 0;
         // THE CLIP BOUND IS ALSO THE FOOTPRINT CULL BOUND (see DEFERRED
@@ -3536,7 +3572,9 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
                      wloHi - vec3<i32>(1));
       let hw = voxWordAt(hc);
       let hm = voxMat(hw);
-      let hcOk = hm != MAT_AIR && (materials[hm].flags & MATF_MICRO) != 0u;
+      // Grains are clipped to their own cell by construction (tracePowder
+      // tests boxes inside it), so they always report the recorded cell.
+      let hcOk = !isGrains && hm != MAT_AIR && (materials[hm].flags & MATF_MICRO) != 0u;
       if (!hcOk && isTile) { continue; }
 
       out.hit = true;
@@ -3549,7 +3587,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
       // not with the sub-voxel) but report the micro material separately, so
       // fs() shades the blade's colour on the tuft's stain.
       out.word = select(dw, hw, hcOk);
-      out.micMat = mh.mat;
+      // Grains shade as ORDINARY TERRAIN (micMat 0): the terrain AO, GI,
+      // openness and shadow-cache paths, keyed on the enclosing cell's face.
+      // Only the micro path forces AO to 1 and reads light from below.
+      out.micMat = select(mh.mat, 0u, isGrains);
       out.micN = mh.n;
       out.micSmooth = select(0u, 1u, mh.curved);
       out.micKey = mh.key;
@@ -3601,6 +3642,105 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     }
   }
   return out;
+}
+
+// ---- POWDER GRAINS: a partial cell as a 2x2x2 arrangement -----------------
+// docs/PLAN_powder_mass.md §3. A partial powder cell holds 1..7 eighths
+// (common.wgsl POWDER MASS) and nothing records WHERE in the cell they are:
+// the arrangement is DERIVED, here, from the mass and the four lateral
+// neighbours, so it costs no state, no sim time and no save space, and it is
+// render-only (nothing here is hashed).
+//
+// THE RULE. Grains fill the bottom layer before the top one (gravity), and
+// within a layer they take the quarter-cells beside the HIGHEST neighbours
+// first, so a partial cell against a pile leans up it (a ramp) and a dusting
+// in a corner gathers in the corner. Ties break in a FIXED order, never a
+// hash of time or position, so a grain falling through a column of cells
+// keeps its corner instead of flickering between them.
+//
+// Neighbour height, in eighths: a partial powder its mass, anything the rays
+// treat as solid a whole 8, air/gas/translucent liquid 0.
+fn powderSideHeight(c : vec3<i32>) -> u32 {
+  if (!inBounds(c)) { return POWDER_FULL; }
+  let w = voxWordAt(c);
+  let m = voxMat(w);
+  if (m == MAT_AIR) { return 0u; }
+  let mt = materials[m];
+  if (mt.klass == CLASS_POWDER) { return powderMass(w); }
+  return select(0u, POWDER_FULL, isRayBlocker(mt));
+}
+
+// Occupancy of the eight half-cells, bit = sx | sz << 1 | sy << 2. Scalar
+// ranks, NOT an indexed array: a dynamically indexed local array spills to
+// local memory in this pipeline (common.wgsl's dynamic-index notes).
+fn powderGrainMask(c : vec3<i32>, mass : u32) -> u32 {
+  let hxn = powderSideHeight(c + vec3<i32>(-1, 0, 0));
+  let hxp = powderSideHeight(c + vec3<i32>(1, 0, 0));
+  let hzn = powderSideHeight(c + vec3<i32>(0, 0, -1));
+  let hzp = powderSideHeight(c + vec3<i32>(0, 0, 1));
+  // Quarter i = sx | sz << 1 touches the -x/+x side by sx and -z/+z by sz.
+  let s0 = hxn + hzn;
+  let s1 = hxp + hzn;
+  let s2 = hxn + hzp;
+  let s3 = hxp + hzp;
+  // rank = how many quarters beat this one (higher score, or an equal score
+  // and a lower index). The ranks are a permutation of 0..3.
+  let r0 = select(0u, 1u, s1 > s0) + select(0u, 1u, s2 > s0) + select(0u, 1u, s3 > s0);
+  let r1 = select(0u, 1u, s0 >= s1) + select(0u, 1u, s2 > s1) + select(0u, 1u, s3 > s1);
+  let r2 = select(0u, 1u, s0 >= s2) + select(0u, 1u, s1 >= s2) + select(0u, 1u, s3 > s2);
+  let r3 = select(0u, 1u, s0 >= s3) + select(0u, 1u, s1 >= s3) + select(0u, 1u, s2 >= s3);
+  let kb = min(mass, 4u);
+  let kt = mass - kb;
+  var m = 0u;
+  m |= select(0u, 1u, r0 < kb) | select(0u, 2u, r1 < kb) |
+       select(0u, 4u, r2 < kb) | select(0u, 8u, r3 < kb);
+  m |= select(0u, 16u, r0 < kt) | select(0u, 32u, r1 < kt) |
+       select(0u, 64u, r2 < kt) | select(0u, 128u, r3 < kt);
+  return m;
+}
+
+// Intersect the ray with the grains of the partial cell `dc` (word `dw`).
+// `entry` is the cell-local point the ray crossed into the cell at, `inv` the
+// march's 1/rd (already guarded against zero components). Up to eight slab
+// tests and no loop-carried state beyond the best hit: this runs in phase 2,
+// where the march's registers are dead. Returns t from `entry` in world voxel
+// units and the face entered (axis/sgn), which the terrain normal path uses.
+fn tracePowder(dc : vec3<i32>, dw : u32, entry : vec3f, inv : vec3f) -> MicroHit {
+  var mh : MicroHit;
+  mh.hit = false;
+  mh.mat = voxMat(dw);
+  mh.curved = false;
+  mh.key = 0u;
+  mh.n = vec3f(0.0);
+  let mask = powderGrainMask(dc, powderMass(dw));
+  var best = 1e30;
+  var bestAxis = 1;
+  for (var i = 0u; i < 8u; i++) {
+    if ((mask & (1u << i)) == 0u) { continue; }
+    let lo = vec3f(f32(i & 1u), f32((i >> 2u) & 1u), f32((i >> 1u) & 1u)) * 0.5;
+    let t0 = (lo - entry) * inv;
+    let t1 = (lo + vec3f(0.5) - entry) * inv;
+    let tn = min(t0, t1);
+    let tf = max(t0, t1);
+    let tNear = max(max(tn.x, max(tn.y, tn.z)), 0.0);
+    let tFar = min(tf.x, min(tf.y, tf.z));
+    if (tNear <= tFar && tNear < best) {
+      best = tNear;
+      // The entered face is the slab crossed LAST. When the ray enters the
+      // cell already inside this box, that is the cell face the march
+      // crossed, which is again the largest tn.
+      bestAxis = select(select(2, 1, tn.y >= tn.z), 0, tn.x >= tn.y && tn.x >= tn.z);
+    }
+  }
+  if (best < 1e29) {
+    mh.hit = true;
+    mh.t = best;
+    mh.axis = bestAxis;
+    var ia = inv.z;
+    if (bestAxis == 0) { ia = inv.x; } else if (bestAxis == 1) { ia = inv.y; }
+    mh.sgn = sign(ia);
+  }
+  return mh;
 }
 
 // ---- far-field cascade march (DESIGN.md §9) ----
@@ -5455,8 +5595,10 @@ fn aoSolidAt(c : vec3<i32>) -> f32 {
   let m = voxMat(w);
   if (m == MAT_AIR) { return 0.0; }
   // Only ray blockers occlude: smoke and shallow water must not stamp hard
-  // AO shadows onto the terrain they touch.
-  return select(0.0, 1.0, isRayBlocker(materials[m]));
+  // AO shadows onto the terrain they touch. Word-level, so a thin film of
+  // grains (under POWDER_BLOCK_MIN eighths) does not either -- the same test
+  // the shadow rays and occupancy use.
+  return select(0.0, 1.0, isRayBlockerW(materials[m], w));
 }
 
 // `uv` is the hit position's fractional offset within the face, in [0,1]^2
@@ -10356,6 +10498,16 @@ fn fs(in : VSOut) -> FSOut {
       // is one variant end to end; a brick keys per cell as before.
       let pk = select(cellIndexW(h.cell), h.micKey, h.micKey != 0u);
       albedo = paletteJitter(m, hash3(R.seed, 1u, pk ^ h.micMat));
+    } else if (m.klass == CLASS_POWDER && powderIsPartial(h.word)) {
+      // GRAINS (tracePowder): the nibble is mass, not a variant, so each
+      // half-cell takes its own variant from its WORLD half-cell position --
+      // a settled dusting is stable and every grain reads as its own speck.
+      // Nudged inward along the face normal so the face picks its own grain.
+      let gp = R.camPos + rd * h.t - axisVec(h.axis, -h.sgn) * 1e-3;
+      let gq = vec3<i32>(floor(gp * 2.0));
+      albedo = paletteJitter(m, hash3(R.seed, 2u, bitcast<u32>(gq.x) ^
+                                      (bitcast<u32>(gq.y) << 11u) ^
+                                      (bitcast<u32>(gq.z) << 22u)));
     } else {
       albedo = paletteColor(m, voxState(h.word), &materials);
     }
@@ -10476,7 +10628,17 @@ fn fs(in : VSOut) -> FSOut {
         // The cache or the cascade: the per-voxel traceOpaque fallback cannot
         // run from here, so it is not compiled in (sunShadowFar).
         if (h.t * VOXEL_METERS <= TUNE_SHADOW_MAX_DIST) {
-          sh = shadowCached(hitP, h.cell, h.axis, h.sgn, h.t);
+          // GRAINS (tracePowder) take the cell's TOP patch. A grain's side
+          // face lies INSIDE its cell, and the cache keys on the cell face
+          // beyond it: against a solid neighbour (a partial cell leaning on
+          // its pile) that patch's ray starts in rock, resolves "buried / no
+          // opinion" and read as LIT -- bright specks on the shaded side of a
+          // cave floor. A partial cell's light comes in through its open top,
+          // so that is the patch that answers for all its grains.
+          let grains = !isMicro && m.klass == CLASS_POWDER &&
+                       powderIsPartial(h.word);
+          sh = shadowCached(hitP, h.cell, select(h.axis, 1, grains),
+                            select(h.sgn, -1.0, grains), h.t);
         } else {
           sh = sunShadowFar(hitP, n, h.t);
         }

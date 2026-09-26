@@ -774,6 +774,7 @@ static void PhaseC(TickAuthorityCtx& w, WorldScratch& ws,
 
       // (`ops` is aliased out of the caller's OpBatch at the top.)
       brush.radius = ui.brushRadius;
+      brush.grainEighths = (uint32_t)ui.brushGrain;
       brush.material = (uint32_t)ui.brushMaterial;
 
       // laser (PLAN §C1/C2): laser tool + LMB, or hold F from any tool.

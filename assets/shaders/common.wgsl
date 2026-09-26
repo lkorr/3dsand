@@ -20,8 +20,9 @@ const CLASS_GAS    : u32 = 3u;
 const AIR_DENSITY : i32 = TUNE_AIR_DENSITY;
 
 // Liquids use the state nibble as fullness: code 0..7 = 1..8 eighths
-// (mass-conserving flow, DESIGN.md §4). Solids/powders/gases keep the state
-// nibble as a palette variant.
+// (mass-conserving flow, DESIGN.md §4). Solids/gases keep the state nibble as
+// a palette variant. Powders use it as MASS in eighths, encoded so that the
+// old palette variants 0..2 still mean "full" — see POWDER MASS below.
 const LIQ_FULL_STATE : u32 = 7u;
 
 // Material flags (bitfield).
@@ -4137,6 +4138,17 @@ fn isRayBlocker(m : Material) -> bool {
   return m.klass == CLASS_SOLID || m.klass == CLASS_POWDER ||
          (m.klass == CLASS_LIQUID && (m.flags & MATF_OPAQUE) != 0u);
 }
+// The WORD-level blocker test: isRayBlocker, except that a partial powder cell
+// lighter than POWDER_BLOCK_MIN eighths lets light through. A 1/8 dust film on
+// stone must not cast the shadow of a whole voxel. RENDER-ONLY by contract:
+// every reader that must agree with the traced blocker (traceOpaque, voxel AO,
+// sim_occupancy's blocker count) calls this one; the sim (seesSky, rainOpen)
+// deliberately keeps the material-level test so the mass of a grain can never
+// decide a reaction's light gate.
+fn isRayBlockerW(m : Material, w : u32) -> bool {
+  if (!isRayBlocker(m)) { return false; }
+  return m.klass != CLASS_POWDER || powderMass(w) >= POWDER_BLOCK_MIN;
+}
 // OCCUPANCY WORD: [31] anyStain | [30..16] rayBlockers | [15..0] nonAir count.
 //
 // Both counts are bounded by CHUNK_VOL = 4,096, so each needs 13 bits and bit
@@ -5070,6 +5082,49 @@ fn packVoxKeepStain(mat : u32, state : u32, stamp : u32, prev : u32) -> u32 {
   return packVox(mat, state, stamp) | (prev & STAIN_BITS);
 }
 
+// ---- POWDER MASS (docs/PLAN_powder_mass.md) ---------------------------------
+// A powder cell carries MASS in eighths in its state nibble, so a single
+// 1/8-voxel grain can exist, fall and merge. The encoding keeps what every
+// powder creator already writes meaning "full":
+//
+//   state 0..2   FULL (8/8), palette variant 0..2 — exactly the old meaning
+//   state 3..9   PARTIAL, mass = state - 2 (1..7 eighths)
+//   state 10..15 reserved; read as FULL
+//
+// That is the whole reason for the offset. Worldgen, the JITTER/UNIFORM
+// sentinels (synthWordAt), the chunkstore predictor, the brush, productState,
+// gas decay, rubble and every test fixture write 0..2, so none of them changed
+// and no save or sentinel was invalidated. A cell that fills back to 8 takes
+// the POSITIONAL variant (synthJitterState), not a tick hash, so a refilled
+// buried chunk still demotes to a JITTER sentinel.
+//
+// MATF_WANDER powders (mites) are creatures, not grains: nothing writes them a
+// partial state and no mass rule applies to them.
+//
+// Mirrored in world.h (PowderMassOfState / PowderStateFor); check_invariants.py
+// pins the constants together.
+const POWDER_FULL        : u32 = 8u;
+const POWDER_PARTIAL_LO  : u32 = 3u;   // state of a 1/8 grain
+const POWDER_PARTIAL_HI  : u32 = 9u;   // state of a 7/8 cell
+// Render-only: a partial powder blocks light (shadow rays, AO, occupancy's
+// blocker count) only from this many eighths up. See isRayBlockerW.
+const POWDER_BLOCK_MIN   : u32 = 5u;
+
+// Does this material take part in powder mass? (powder, and not a critter.)
+fn matHasPowderMass(m : Material) -> bool {
+  return m.klass == CLASS_POWDER && (m.flags & MATF_WANDER) == 0u;
+}
+fn powderStateIsPartial(s : u32) -> bool {
+  return s >= POWDER_PARTIAL_LO && s <= POWDER_PARTIAL_HI;
+}
+fn powderMassOfState(s : u32) -> u32 {
+  return select(POWDER_FULL, s - 2u, powderStateIsPartial(s));
+}
+// Mass of a powder word in eighths. Meaningless for other classes — callers
+// test the class first.
+fn powderMass(w : u32) -> u32 { return powderMassOfState(voxState(w)); }
+fn powderIsPartial(w : u32) -> bool { return powderStateIsPartial(voxState(w)); }
+
 // Stateless counter-based RNG (PCG output permutation).
 fn pcg(v : u32) -> u32 {
   let s = v * 747796405u + 2891336453u;
@@ -5491,6 +5546,16 @@ fn synthWordAt(entry : u32, c : vec3<i32>, seed : u32) -> u32 {
   return packVox(mat, synthJitterState(c, seed), STAMP_NEVER);
 }
 
+// POWDER MASS (see the block beside packVoxKeepStain): the state nibble for
+// `mass` eighths (1..8) at WORLD cell `c`. Full takes the positional palette
+// variant, the same one worldgen and the JITTER sentinel give that cell, so a
+// refilled buried chunk still demotes. Lives in the page-table block because
+// synthJitterState does.
+fn powderStateFor(mass : u32, c : vec3<i32>, seed : u32) -> u32 {
+  if (mass >= POWDER_FULL) { return synthJitterState(c, seed); }
+  return mass + 2u;
+}
+
 // The table entry for a slot chunk index. The three chunk-linear paths resolve
 // once with this and index their page directly, which is what they want anyway.
 fn pageEntryOf(chunkSlot : u32) -> u32 { return pageTable[chunkSlot]; }
@@ -5839,7 +5904,7 @@ fn traceOpaque(ro : vec3f, rdIn : vec3f, maxSteps : i32, coarseFromT : f32,
 
     let w = voxWordAtEntry(cchPt, cell);
     let mat = voxMat(w);
-    if (mat != MAT_AIR && isRayBlocker((*mats)[mat])) {
+    if (mat != MAT_AIR && isRayBlockerW((*mats)[mat], w)) {
       out.hit = true;
       out.t = tCur;
       out.cell = cell;

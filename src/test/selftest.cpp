@@ -286,7 +286,10 @@ const char* const kOrder[] = {
     // TABLE ENTRY for each arm — restoring the authored table before it
     // returns, which is why it sits with the other self-contained CA gates and
     // not next to anything that reads a material by hand.
-    "repose",      "ca-slope",
+    "repose",
+    // Powder mass in eighths (merge/sink/sleep). Same sealed-room pattern as
+    // repose, its own worldgen, patches nothing.
+    "powder-mass", "ca-slope",
     "ca-slope-hybrid", "ca-level-one", "ca-level", "ca-level-pond",
     // Right after the other liquid-shape gates: same fixture neighbourhood,
     // same dim-dawn pinning, and it is the negative of `ca-slope` — the

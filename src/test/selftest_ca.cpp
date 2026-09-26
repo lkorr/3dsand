@@ -12,11 +12,16 @@
 // one tick late"; two runs can.
 
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include "game/camera.h"
+#include "gpu/resources.h"
+#include "sim/celestial.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -2059,12 +2064,328 @@ Status GateRepose(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- powder-mass -----------------------------------------------------------
+//
+// POWDER MASS IN EIGHTHS (docs/PLAN_powder_mass.md). A powder cell's state
+// nibble is its mass: 0..2 full, 3..9 = 1..7 eighths. sim_step's
+// tryPowderOnto adds two moves onto a PARTIAL powder cell: MERGE (same
+// material, grains fill the cell below) and SINK (a different powder lighter
+// in mass swaps up). This gate asserts what those moves promise:
+//
+//   A. RAIN. 16 layers of 1/8 sand grains dropped on a floor. Every eighth
+//      is still there at rest (sum of masses exact), and grains COMPACT: no
+//      partial sand cell has sand directly on top of it -- a partial only ever
+//      tops its column, which is what a merge that works leaves behind.
+//   B. SINK. A 1/8 film of dust on the floor and a full sand column dropped
+//      onto it. Both materials' eighths are exact, and no dust grain is left
+//      buried under sand (the film rose through the column instead of holding
+//      it 7/8 of a voxel up).
+//   C. DUSTING. A stepped sand mound with a random sprinkle of 1..7-eighth
+//      grains over it: exact eighths again, no partial buried under sand, and
+//      the settled room is rendered to screenshot_powder.bmp -- the look of
+//      tracePowder's derived arrangement, for a human to judge.
+//   SLEEP. Every move lowers the grains, so every room falls asleep.
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): this tests the CA alone, in a sealed
+// room, exactly as `repose` beside it does; no body, mob or player phase has
+// anything to do with grains merging.
+Status GatePowderMass(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t dustId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++)
+    if (c.mats[i].name == "dust") { dustId = (uint32_t)i; break; }
+  if (dustId == 0) { detail = "no 'dust' material"; return Status::Fail; }
+  const uint32_t sandId = kMatSand;
+
+  constexpr int kR = 12;
+  const int cx = 160, cz = 160;
+  // THE ROOM STANDS ON THE SURFACE, not at a fixed height: at a fixed y it is
+  // a sealed cave under ~100 m of terrain, which the CA does not care about
+  // but arm C's screenshot does (no sun). The highest ground under its
+  // footprint + 1, in WORLD coordinates -- SlotCellIndex masks into the
+  // window, and cx/cz are slot coords the window's x/z map 1:1.
+  const IVec3 wo = world.WindowOrigin();
+  auto toWorld = [](int slot, int woc) {
+    const int base = woc * (int)kChunk;
+    return base + ((slot - base) & (int)(kWorldN - 1));
+  };
+  int groundTop = -1000000;
+  for (int dz = -kR - 1; dz <= kR + 1; dz++)
+    for (int dx = -kR - 1; dx <= kR + 1; dx++)
+      groundTop = std::max(groundTop,
+                           World::TerrainHeight(toWorld(cx + dx, wo.x),
+                                                toWorld(cz + dz, wo.z),
+                                                kDefaultSeed));
+  const int kFloorTop = groundTop + 1;
+  const int kCeil = kFloorTop + 30;
+  constexpr int kColHalf = 2;
+  constexpr int kSettleTicks = 120;
+  constexpr int kMaxTicks = 400;
+  constexpr int kMinTicks = 60;
+  constexpr int kPoll = 20;
+  constexpr int kBuildAt = 3, kPourAt = 8;
+  const int x0 = cx - kR - 1, x1 = cx + kR + 1;
+  const int z0 = cz - kR - 1, z1 = cz + kR + 1;
+  const int y0 = kFloorTop - 2, y1 = kCeil;
+
+  // NO LID and LOW WALLS: nothing in these rooms rises or climbs past the
+  // floor's spread, and an open room lets the sun onto arm C's screenshot.
+  // The box above the walls is still cleared to air.
+  const int kWallTop = kFloorTop + 6;
+  std::vector<CellOp> build;
+  for (int y = y0; y <= y1; y++)
+    for (int z = z0; z <= z1; z++)
+      for (int x = x0; x <= x1; x++) {
+        const bool solid = y <= kFloorTop ||
+                           (y <= kWallTop &&
+                            (x == x0 || x == x1 || z == z0 || z == z1));
+        build.push_back({World::SlotCellIndex({x, y, z}),
+                         solid ? (uint32_t)kMatStone : 0u});
+      }
+  auto grains = [](uint32_t mat, uint32_t eighths) {
+    return (mat & 0xFFFu) |
+           ((eighths >= kPowderFull ? 0u : eighths + 2u) << 12);
+  };
+  // Arm A: 16 separated-by-nothing layers of single grains, high enough that
+  // they are still falling when they meet.
+  std::vector<CellOp> pourA;
+  for (int y = kFloorTop + 6; y < kFloorTop + 6 + 16; y++)
+    for (int z = cz - kColHalf; z <= cz + kColHalf; z++)
+      for (int x = cx - kColHalf; x <= cx + kColHalf; x++)
+        pourA.push_back({World::SlotCellIndex({x, y, z}), grains(sandId, 1)});
+  const uint32_t sandA = (uint32_t)pourA.size();   // eighths
+  // Arm B: a one-grain film of dust on the floor, full sand above it.
+  std::vector<CellOp> pourB;
+  for (int z = cz - kColHalf; z <= cz + kColHalf; z++)
+    for (int x = cx - kColHalf; x <= cx + kColHalf; x++)
+      pourB.push_back({World::SlotCellIndex({x, kFloorTop + 1, z}),
+                       grains(dustId, 1)});
+  const uint32_t dustB = (uint32_t)pourB.size();
+  for (int y = kFloorTop + 4; y < kFloorTop + 7; y++)
+    for (int z = cz - kColHalf; z <= cz + kColHalf; z++)
+      for (int x = cx - kColHalf; x <= cx + kColHalf; x++)
+        pourB.push_back({World::SlotCellIndex({x, y, z}), grains(sandId, 8)});
+  const uint32_t sandB = ((uint32_t)pourB.size() - dustB) * 8u;
+  // Arm C: a stepped mound of whole sand (7x7x2 under 3x3x2) and a sprinkle of
+  // partial grains over a wider square, their masses and heights hashed.
+  std::vector<CellOp> pourC;
+  uint32_t sandC = 0;
+  for (int y = kFloorTop + 1; y <= kFloorTop + 4; y++) {
+    const int half = y <= kFloorTop + 2 ? 3 : 1;
+    for (int z = cz - half; z <= cz + half; z++)
+      for (int x = cx - half; x <= cx + half; x++) {
+        pourC.push_back({World::SlotCellIndex({x, y, z}), grains(sandId, 8)});
+        sandC += 8;
+      }
+  }
+  for (int z = cz - 9; z <= cz + 9; z++)
+    for (int x = cx - 9; x <= cx + 9; x++) {
+      const uint32_t hsh = rng::Hash3(0xD057u, (uint32_t)x, (uint32_t)z);
+      if (hsh % 3u != 0u) continue;
+      const uint32_t e = 1u + (hsh >> 8) % 7u;
+      const int y = kFloorTop + 9 + (int)((hsh >> 16) % 4u);
+      pourC.push_back({World::SlotCellIndex({x, y, z}), grains(sandId, e)});
+      sandC += e;
+    }
+
+  std::vector<uint32_t> boxChunks;
+  for (int qz = z0 >> 4; qz <= (z1 >> 4); qz++)
+    for (int qy = y0 >> 4; qy <= (y1 >> 4); qy++)
+      for (int qx = x0 >> 4; qx <= (x1 >> 4); qx++)
+        boxChunks.push_back(World::SlotChunkIndex({qx, qy, qz}));
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+  {
+    uint32_t t = 41000;
+    for (int i = 0; i < kSettleTicks; i++)
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, {}, false,
+                 {10, 7, 10}, false, false);
+    ctx.WaitIdle();
+  }
+
+  std::vector<uint32_t> flags(kNumChunks, 0);
+  std::vector<uint32_t> cbuf((size_t)kChunkVol);
+  struct Result {
+    uint32_t sand = 0, dust = 0;     // eighths found in the room
+    uint32_t partials = 0;           // partial powder cells
+    uint32_t buried = 0;             // the arm's forbidden stacking
+    uint32_t awake = 0;
+    int quietAt = -1;
+  } res[3];
+  const uint32_t awakeMax =
+      (uint32_t)BaselineNumber("powderMass.awakeChunksMax", 0);
+
+  for (int a = 0; a < 3; a++) {
+    const std::vector<CellOp>& pour = a == 0 ? pourA : a == 1 ? pourB : pourC;
+    uint32_t t = 42000;
+    for (int i = 0; i < kMaxTicks; i++) {
+      SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {},
+                 i == kBuildAt ? build
+                 : i == kPourAt ? pour
+                                : std::vector<CellOp>{},
+                 false, {10, 7, 10}, false, false);
+      if (i >= kMinTicks && (i % kPoll) == 0) {
+        ctx.WaitIdle();
+        rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                              flags.data(), kNumChunks * 4, "powderMassActive");
+        uint32_t live = 0;
+        for (uint32_t ci : boxChunks)
+          if (flags[ci] != 0) live++;
+        if (live == 0) { res[a].quietAt = i; break; }
+      }
+    }
+    ctx.WaitIdle();
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                          flags.data(), kNumChunks * 4, "powderMassActive");
+    for (uint32_t ci : boxChunks)
+      if (flags[ci] != 0) res[a].awake++;
+
+    // The room's grains by position, so "what is directly above" is a lookup
+    // rather than a second pass over chunks.
+    struct Grain { int x, y, z; uint32_t w; };
+    std::vector<Grain> grainsIn;
+    std::unordered_map<int64_t, uint32_t> at;
+    auto key = [](int x, int y, int z) {
+      return ((int64_t)x << 40) ^ ((int64_t)y << 20) ^ (int64_t)z;
+    };
+    for (int qz = z0 >> 4; qz <= (z1 >> 4); qz++)
+      for (int qy = y0 >> 4; qy <= (y1 >> 4); qy++)
+        for (int qx = x0 >> 4; qx <= (x1 >> 4); qx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({qx, qy, qz}), 1,
+                         cbuf.data(), "powderMassVox");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            const uint32_t w = cbuf[k];
+            const uint32_t m = w & 0xFFFu;
+            if (m != sandId && m != dustId) continue;
+            const int x = (int)(k % 16) + qx * 16;
+            const int y = (int)((k / 16) % 16) + qy * 16;
+            const int z = (int)(k / 256) + qz * 16;
+            if (x <= x0 || x >= x1 || z <= z0 || z >= z1) continue;
+            if (y <= kFloorTop || y >= kCeil) continue;
+            grainsIn.push_back({x, y, z, w});
+            at[key(x, y, z)] = w;
+          }
+        }
+    for (const Grain& g : grainsIn) {
+      const uint32_t m = g.w & 0xFFFu;
+      const uint32_t e = PowderMassOfState((g.w >> 12) & 0xFu);
+      (m == sandId ? res[a].sand : res[a].dust) += e;
+      if (e >= kPowderFull) continue;
+      res[a].partials++;
+      const auto it = at.find(key(g.x, g.y + 1, g.z));
+      const uint32_t am = it == at.end() ? 0u : (it->second & 0xFFFu);
+      // A: a partial sand cell under sand is a merge that did not happen.
+      // B: a dust grain under sand is a sink that did not happen.
+      if (a != 1 && m == sandId && am == sandId) res[a].buried++;
+      if (a == 1 && m == dustId && am == sandId) res[a].buried++;
+    }
+    std::printf(
+        "powder-mass: arm %s  sand %u/%u eighths, dust %u/%u, %u partial "
+        "cells, %u buried, %u/%zu room chunks awake (quiet at tick %d)\n",
+        a == 0 ? "A rain" : a == 1 ? "B sink" : "C dusting", res[a].sand,
+        a == 0 ? sandA : a == 1 ? sandB : sandC,
+        res[a].dust, a == 1 ? dustB : 0u, res[a].partials, res[a].buried,
+        res[a].awake, boxChunks.size(), res[a].quietAt);
+  }
+
+  // ---- arm C, rendered: the settled dusting from above and to one side ----
+  // (world coords: the room was built at SLOT coords, like the other CA gates)
+  {
+    const Vec3 target{(float)toWorld(cx, wo.x) + 0.5f,
+                      (float)toWorld(kFloorTop + 2, wo.y),
+                      (float)toWorld(cz, wo.z) + 0.5f};
+    const uint32_t W = 1280, H = 720;
+    rhi::Texture tex = ctx.device.CreateTexture(
+        {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+        "powderShotTex");
+    Camera cam2;
+    cam2.yaw = -2.356f;
+    cam2.pitch = -0.62f;
+    const Vec3 eye{target.x + 11.0f, target.y + 10.0f, target.z + 11.0f};
+    // Mid-morning, scanned rather than hardcoded (the shadow-cache gate says
+    // why): a sun about 35 degrees up, so the half-cell steps cast shadows.
+    uint32_t lightTick = 0;
+    {
+      float bestErr = 9.0f;
+      for (uint32_t tt = 0; tt < 200000u; tt += 64u) {
+        const float up = ComputeSky(CurrentTuning(), (double)tt).sunDir[1];
+        const float err = std::fabs(up - 0.57f);
+        if (err < bestErr) { bestErr = err; lightTick = tt; }
+      }
+    }
+    // A few frames first: the shadow cache and the GI charge converge over
+    // frames, and the first one shows them half-built.
+    for (int f = 0; f < 12; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam2, (float)W / H, true, 0,
+                        kFarFogDensity, (float)H, lightTick);
+      rhi::CommandEncoder e0 = ctx.device.CreateCommandEncoder();
+      rhi::RenderPass r0 = sim.BeginRenderPass(
+          e0, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(r0);
+      r0.End();
+      ctx.queue.Submit(e0.Finish());
+      ctx.WaitIdle();
+    }
+    WriteRenderParams(ctx.queue, world, eye, cam2, (float)W / H, true, 0,
+                      kFarFogDensity, (float)H, lightTick);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::RenderPass rp = sim.BeginRenderPass(
+        enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                                    rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                    "powderShot");
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = tex;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = shot;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    rhi::Extent3D ext{W, H, 1};
+    enc.CopyTextureToBuffer(srcT, dstB, ext);
+    ctx.queue.Submit(enc.Finish());
+    std::vector<uint8_t> pixels((size_t)W * H * 4);
+    if (rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(), pixels.size()) &&
+        WriteBmpFile("screenshot_powder.bmp", pixels, W, H))
+      std::printf("powder-mass: wrote screenshot_powder.bmp\n");
+  }
+
+  const bool massA = res[0].sand == sandA && res[0].dust == 0;
+  const bool massC = res[2].sand == sandC && res[2].dust == 0;
+  const bool massB = res[1].sand == sandB && res[1].dust == dustB;
+  const bool mergeOk = res[0].buried == 0 && res[2].buried == 0;
+  const bool sinkOk = res[1].buried == 0;
+  const bool sleepOk = res[0].awake <= awakeMax && res[1].awake <= awakeMax &&
+                       res[2].awake <= awakeMax;
+  const bool ok = massA && massB && massC && mergeOk && sinkOk && sleepOk;
+  detail = Format(
+      "A rain: sand %u/%u eighths %s, %u partials, %u partial-under-sand %s; "
+      "B sink: sand %u/%u dust %u/%u %s, %u dust-under-sand %s; C dusting: "
+      "sand %u/%u %s, %u partials, %u buried; awake %u/%u/%u (max %u) %s",
+      res[0].sand, sandA, massA ? "EXACT" : "LOST/MINTED", res[0].partials,
+      res[0].buried, mergeOk ? "(compact)" : "(MERGE FAILED)", res[1].sand,
+      sandB, res[1].dust, dustB, massB ? "EXACT" : "LOST/MINTED",
+      res[1].buried, sinkOk ? "(risen)" : "(SINK FAILED)", res[2].sand, sandC,
+      massC ? "EXACT" : "LOST/MINTED", res[2].partials, res[2].buried,
+      res[0].awake, res[1].awake, res[2].awake, awakeMax,
+      sleepOk ? "asleep" : "STILL AWAKE");
+  std::printf("powder-mass: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& CaGates() {
   static const std::vector<Gate> g = {
       {"ca-skip", "sim", {}, false, GateCaSkip},
       {"repose", "sim", {}, false, GateRepose},
+      {"powder-mass", "sim", {}, false, GatePowderMass},
       {"ca-slope", "sim", {}, false, GateCaSlope},
       {"ca-slope-hybrid", "sim", {}, false, GateCaSlopeHybrid},
       {"ca-level-one", "sim", {}, false, GateCaLevelOne},

@@ -152,6 +152,14 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   if (mat != MAT_AIR && materials[mat].klass == CLASS_LIQUID) {
     state = LIQ_FULL_STATE;
   }
+  // A powder brush with a GRAIN size (world.h BrushOp.pad1 bits 4..7, 1..7
+  // eighths; 0 = whole cells) paints partial cells: a fine brush lays a
+  // dusting instead of a block (common.wgsl POWDER MASS).
+  let grain = (op._p1 >> 4u) & 0xFu;
+  if (grain >= 1u && grain < POWDER_FULL && mat != MAT_AIR &&
+      matHasPowderMass(materials[mat])) {
+    state = grain + 2u;
+  }
   voxStore(idx, packVox(mat, state, STAMP_NEVER));
   markBoth(c);
   // An erase (mode 1 writing air) or a melt (solid -> lava) can be the thing a
@@ -217,6 +225,9 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
       let prevWord = voxWordInChunkAt(ci, lo);
       var units = 8u;
       if (materials[prevMat].klass == CLASS_LIQUID) { units = ((prevWord >> 12u) & 7u) + 1u; }
+      // A powder is paid its MASS (common.wgsl POWDER MASS); container.cpp
+      // ContainerCellUnits is the CPU twin and must agree.
+      if (matHasPowderMass(materials[prevMat])) { units = powderMass(prevWord); }
       atomicAdd(&pageFaults[SCOOP_EIGHTHS_WORD], units);
       atomicAdd(&pageFaults[SCOOP_APPLIED_WORD], 1u);
       word = 0u;

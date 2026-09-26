@@ -58,7 +58,8 @@ using ContainerWordFn = std::function<bool(IVec3, uint32_t&)>;
 bool ContainerSnapWord(const World& world, IVec3 c, uint32_t& word);
 
 // Eighths a cell of this word is worth to a vessel: a liquid's fullness (state
-// code 0..7 = 1..8 eighths), a whole 8 for anything else.
+// code 0..7 = 1..8 eighths), a powder's mass (world.h POWDER MASS), a whole 8
+// for anything else. MUST agree with sim_mutate.wgsl's scoop ledger credit.
 int ContainerCellUnits(uint32_t word, const MaterialDef& m);
 
 // Can this vessel take up `mat` at all, and does its current fill allow it?
@@ -207,9 +208,9 @@ int ContainerDeposit(const ItemDef& def, ItemStack& st, uint16_t mat, int units)
 // back as eight, and "scoop one eighth, pour, re-scoop eight" minted lava
 // without limit. A liquid particle now carries its charge as its fullness code
 // and the MEASURED flag tells sim_particle.wgsl to land it at that fullness. A
-// powder cannot be a fraction of a cell, so a pouch's last partial cell (only
-// the portrait brush can leave one) does not become a grain: it is spent as
-// dust, a loss under one cell, never a gain.
+// powder particle carries its charge as its MASS code (docs/PLAN_powder_mass.md:
+// powder is measured in eighths too), so a pouch's last partial cell lands as
+// a partial cell of grains -- nothing is lost to "dust" any more.
 //
 // `partRoom` is how many more grid particles the ring can be trusted to take
 // this tick (ContainerParticleRoom); the pour is charged only for particles

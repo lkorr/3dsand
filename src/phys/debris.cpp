@@ -6205,10 +6205,14 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
                 // occ coord -> world cell -> local cell in THIS neighbor
                 int lx = (origin.x + x - 1) & 15, ly = (origin.y + y - 1) & 15,
                     lz = (origin.z + z - 1) & 15;
-                uint32_t mat =
-                    n->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
+                const uint32_t w = n->voxels[(lz * kChunk + ly) * kChunk + lx];
+                const uint32_t mat = w & 0xFFF;
                 if (mat == 0 || mat >= classOf_.size()) continue;
-                if (classOf_[mat] == CLASS_SOLID || classOf_[mat] == CLASS_POWDER)
+                // A thin film of grains (powder mass under kPowderWalkMin
+                // eighths) is not ground: the same rule KindOfWord walks by.
+                if (classOf_[mat] == CLASS_SOLID ||
+                    (classOf_[mat] == CLASS_POWDER &&
+                     PowderMassOfState((w >> 12) & 0xFu) >= kPowderWalkMin))
                   McOccSet(occ, x, y, z);
               }
           // This system's own writes the mirror copy does not show yet: a
@@ -6223,8 +6227,11 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
                   oz >= kMcOccDim)
                 continue;
               const uint32_t m = word & 0xFFFu;
-              const bool matter = m != 0 && m < classOf_.size() &&
-                                  (classOf_[m] == CLASS_SOLID || classOf_[m] == CLASS_POWDER);
+              const bool matter =
+                  m != 0 && m < classOf_.size() &&
+                  (classOf_[m] == CLASS_SOLID ||
+                   (classOf_[m] == CLASS_POWDER &&
+                    PowderMassOfState((word >> 12) & 0xFu) >= kPowderWalkMin));
               if (matter) McOccSet(occ, ox, oy, oz);
               else McOccClear(occ, ox, oy, oz);
             }

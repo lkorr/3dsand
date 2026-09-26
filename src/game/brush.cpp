@@ -22,8 +22,10 @@ bool Brush::BuildOp(const WorldSnapshot& snap, const Vec3& eye, const Vec3& fwd,
     target = {ifloor(p.x), ifloor(p.y), ifloor(p.z)};
     if (erase) return false;
   }
+  const uint32_t g = std::clamp<uint32_t>(grainEighths, 1u, kPowderFull);
   out = BrushOp{target.x, target.y, target.z, r,
                 erase ? kMatAir : material,
-                erase ? 1u : 0u, 0, 0};
+                erase ? 1u : 0u, 0,
+                erase || g >= kPowderFull ? 0u : (g << kBrushGrainShift)};
   return true;
 }

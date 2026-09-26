@@ -416,15 +416,18 @@ Status GateVessel(Ctx& c, std::string& detail) {
               (sp[0].flags & kPFlagMeasured) != 0 &&
               ((sp[0].payload >> 12) & 7u) == 2u,
           "3 eighths pour as ONE particle measured at fullness 3/8, not a cell");
-    // A pouch with a partial cell (the portrait brush can leave one): the
-    // whole cells fall as grains, the rest is dust -- never a whole grain.
+    // A pouch with a partial cell: the whole cell falls full, the last four
+    // eighths as a PARTIAL cell of grains (powder mass, state 4 + 2 = 6) --
+    // never rounded up to a whole grain, and no longer lost as "dust".
     ItemStack sand = Vs(c.items, pouchI, 1, (uint16_t)mSand, 12);
     sp.clear();
     ContainerPour(*pouch, sand, m0, Vec3{1, 0, 0}, nullptr,
                   CurrentTuning().sim.partGravity, 701, 3u, sp, nullptr,
                   0xFFFFFFFFu, &c.mats);
-    check(sp.size() == 1 && !sand.Filled() && (sp[0].flags & kPFlagMeasured) == 0,
-          "a pouch's partial last cell is dust, not a grain");
+    check(sp.size() == 2 && !sand.Filled() && (sp[0].flags & kPFlagMeasured) == 0 &&
+              PowderMassOfState((sp[0].payload >> 12) & 0xFu) == 8u &&
+              PowderMassOfState((sp[1].payload >> 12) & 0xFu) == 4u,
+          "a pouch's partial last cell lands as 4/8 of grains, not dust");
     // THE RING'S ROOM: charged only for the particles that fit.
     ItemStack big = Vs(c.items, flaskI, 1, (uint16_t)liq, 64);
     sp.clear();
@@ -544,20 +547,24 @@ Status GateVessel(Ctx& c, std::string& detail) {
     const int got2 = ContainerSpillStep(sp, c.mats, 101, 4096, fl, pa, &ev);
     check(got == 300 && got2 == 724 && sp.units == 0,
           "a spill the budget cannot hold drains next tick, conserved");
-    // Sand (not fluid) leaves as grid particles, a whole cell each; the part
-    // cell left over cannot be a grain and is dust -- never rounded UP.
+    // Sand (not fluid) leaves as grid particles carrying their MASS: 20
+    // eighths = 8 + 8 + 4, the last a partial cell of grains -- never
+    // rounded up, and nothing lost as dust.
     sp = ContainerSpill{};
     sp.at = Vec3{10, 20, 30};
     sp.mat = (uint16_t)mSand;
     sp.units = 20;
     fl.clear();
     got = ContainerSpillStep(sp, c.mats, 100, 4096, fl, pa, &ev);
-    bool pOk = pa.size() == 2;
-    for (const ParticleSpawn& p : pa)
+    bool pOk = pa.size() == 3;
+    uint32_t sandEighths = 0;
+    for (const ParticleSpawn& p : pa) {
       pOk = pOk && (p.payload & 0xFFFu) == mSand && !(p.flags & kPFlagMicro) &&
             !(p.flags & kPFlagMeasured);
-    check(got == 20 && sp.units == 0 && fl.empty() && pOk,
-          "a broken pouch of sand is whole-cell grid particles, never rounded up");
+      sandEighths += PowderMassOfState((p.payload >> 12) & 0xFu);
+    }
+    check(got == 20 && sp.units == 0 && fl.empty() && pOk && sandEighths == 20,
+          "a broken pouch of sand lands exactly its 20 eighths (8 + 8 + 4)");
     // A liquid the seam cannot hold (lava/blood-like: grid particles) lands
     // at EXACTLY what it held: 20 eighths = 8 + 8 + 4, the last MEASURED at
     // fullness code 3 -- not three full cells.

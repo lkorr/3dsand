@@ -14525,10 +14525,21 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // instead of silently vanishing.
       if (pm != 0 && pm < matGpu_.size()) {
         const uint32_t jitter = (rr >> 6) % 3u;
-        const uint32_t state =
+        uint32_t state =
             matGpu_[pm].klass == CLASS_LIQUID ? 7u
             : v.gridState ? v.gridState(v.gridStateCtx, pm, v.Art(i), jitter)
                           : jitter;
+        // A POWDER product lands as the grains this sub-voxel is worth, not
+        // as a whole cell (docs/PLAN_powder_mass.md §5): at skinScale 2 one
+        // skin voxel IS one eighth of a world cell; finer skins round up to a
+        // single grain (the emit is deduped to one per cell per tick anyway).
+        // A burning corpse leaves a dusting of ash, not a heap of cubes.
+        if (matGpu_[pm].klass == CLASS_POWDER &&
+            (matGpu_[pm].flags & kMatFlagWander) == 0u && v.scale > 1) {
+          const uint32_t s3 = v.scale * v.scale * v.scale;
+          const uint32_t eighths = std::max(1u, kPowderFull / s3);
+          if (eighths < kPowderFull) state = eighths + 2u;
+        }
         const Vec3 wv = worldOf(p);
         emitCell({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, pm, state);
       }

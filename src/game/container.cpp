@@ -29,7 +29,18 @@ bool ContainerSnapWord(const World& world, IVec3 c, uint32_t& word) {
 int ContainerCellUnits(uint32_t word, const MaterialDef& m) {
   if (m.gpu.klass == CLASS_LIQUID)
     return (int)((word >> 12) & 7u) + 1;   // fullness code 0..7 = 1..8 eighths
+  if (m.gpu.klass == CLASS_POWDER && (m.gpu.flags & kMatFlagWander) == 0u)
+    return (int)PowderMassOfState((word >> 12) & 0xFu);   // powder mass, eighths
   return kContainerUnitsPerCell;
+}
+
+// The state nibble a poured/spilled cell of `eighths` (1..8) carries: a
+// liquid's fullness code, or a powder's mass code (world.h POWDER MASS; full
+// = variant 0). Powder needs no MEASURED flag: sim_particle.wgsl lands a
+// non-liquid's nibble verbatim.
+static uint32_t PouredState(bool liquid, int eighths) {
+  if (liquid) return (uint32_t)(eighths - 1);
+  return eighths >= (int)kPowderFull ? 0u : (uint32_t)eighths + 2u;
 }
 
 bool ContainerAccepts(const ItemDef& def, const ItemStack& st, uint32_t mat,
@@ -345,13 +356,6 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
     if ((uint32_t)k >= partRoom) break;   // charged only for what the ring takes
     const int spend = std::min<int>(kContainerUnitsPerCell, st.fillAmt);
-    if (!liquid && spend < kContainerUnitsPerCell) {
-      // A powder's last partial cell cannot be a grain: spent as dust (see
-      // ContainerPour in container.h), never landed as a whole cell.
-      st.fillAmt = 0;
-      st.fillMat = 0;
-      break;
-    }
     // A little spread so the stream is a stream and not one voxel column:
     // +-4% of the launch velocity and +-0.3 cell at the lip, both hashed from
     // (seed, tick, k) so a replayed pour lands the same cells.
@@ -371,12 +375,11 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     s.vx = (int32_t)std::lround(v.x * 256.0f);
     s.vy = (int32_t)std::lround(v.y * 256.0f);
     s.vz = (int32_t)std::lround(v.z * 256.0f);
-    // A liquid carries EXACTLY what it was charged as its fullness code
-    // (1..8 eighths = 0..7) and the MEASURED bit that tells the kernel to
-    // land it at that fullness rather than full: the last few eighths of a
-    // flask come out as a partial cell, not a whole one. A powder is always a
-    // whole cell here (the partial one was refused above).
-    s.payload = (mat & 0xFFFu) | ((uint32_t)(spend - 1) << 12);
+    // A cell carries EXACTLY what it was charged: a liquid as its fullness
+    // code plus the MEASURED bit that tells the kernel to land it at that
+    // fullness rather than full, a powder as its mass code (the last few
+    // eighths of a pouch land as a partial cell of grains).
+    s.payload = (mat & 0xFFFu) | (PouredState(liquid, spend) << 12);
     // CALM: a stream, not spray -- the wind does not carry it off.
     s.flags = kPFlagAlive | kPFlagCalm | (liquid ? kPFlagMeasured : 0u);
     spawns.push_back(s);
@@ -661,17 +664,12 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
     sp.units -= emitted;
   } else {
     // A cell per particle, MEASURED like the pour's (ContainerPour): a
-    // liquid's partial last cell lands at its fullness, a powder's is dust.
+    // partial last cell lands at its fullness (liquid) or mass (powder).
     const bool liquid = mats[sp.mat].gpu.klass == CLASS_LIQUID;
     uint32_t made = 0;
     while (sp.units > 0 && parts.size() < kMaxParticleSpawnsPerTick &&
            made < partRoom) {
       const int spend = std::min(kContainerUnitsPerCell, sp.units);
-      if (!liquid && spend < kContainerUnitsPerCell) {
-        emitted += spend;   // under a cell of grains: dust, not a grain
-        sp.units = 0;
-        break;
-      }
       Vec3 p, v;
       sample((uint32_t)sp.units, p, v);
       ParticleSpawn ps{};
@@ -681,7 +679,7 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
       ps.vx = (int32_t)std::lround(v.x * 256.0f);
       ps.vy = (int32_t)std::lround(v.y * 256.0f);
       ps.vz = (int32_t)std::lround(v.z * 256.0f);
-      ps.payload = ((uint32_t)sp.mat & 0xFFFu) | ((uint32_t)(spend - 1) << 12);
+      ps.payload = ((uint32_t)sp.mat & 0xFFFu) | (PouredState(liquid, spend) << 12);
       ps.flags = kPFlagAlive | (liquid ? kPFlagMeasured : 0u);
       parts.push_back(ps);
       made++;

@@ -522,6 +522,70 @@ fn tryCrush(src : vec3<i32>, dst : vec3<i32>, myWord : u32) -> bool {
   return true;
 }
 
+// ===================== POWDER MASS: MERGE AND SINK ==========================
+// docs/PLAN_powder_mass.md §2. A powder cell carries 1..8 eighths (common.wgsl
+// POWDER MASS), so a grain landing on a PARTIAL powder cell is no longer
+// simply blocked by it. Two moves, both onto a partial powder `dst` at reach
+// 1, both written by this one thread under the colour lattice exactly as
+// transferLiquid writes a liquid's two cells (no claim, no second phase):
+//
+//   MERGE  dst is the SAME powder. Transfer t = min(f, 8 - nf) eighths down;
+//          the source keeps the rest, or becomes air. Grains fill the cell
+//          below before they stack a new one, which is what turns a dusting
+//          into a surface instead of a column of 1/8 cubes.
+//   SINK   dst is a DIFFERENT powder lighter in MASS than me (nf < f): the
+//          two words swap whole, stains travelling with their grains. Without
+//          it a full cell of sand rests on a 1/8 film of dust as if the film
+//          were a whole voxel, floating 7/8 of a cell over it.
+//
+// TERMINATION (rule 2). Let E = sum over eighths of their height. A merge
+// moves t >= 1 eighths down one level (dE = -t); a sink moves f eighths down
+// and nf < f up (dE = nf - f < 0). Every move strictly lowers E and no move is
+// neutral, so neither can recur without new matter arriving, and a settled
+// partial writes nothing -- it sleeps like any grain. Deliberately there is NO
+// lateral levelling of powder mass: that is the liquid ladder, it would make
+// sand flow like water, and it carries the CA levelling limit with it.
+//
+// Mites (MATF_WANDER) are not grains and take no part (matHasPowderMass).
+fn tryPowderOnto(src : vec3<i32>, dst : vec3<i32>, myWord : u32, m : Material) -> bool {
+  if (!matHasPowderMass(m) || !inBounds(dst)) { return false; }
+  let dv = voxIndexAndWord(dst);
+  let tw = dv.y;
+  let tmat = voxMat(tw);
+  if (tmat == MAT_AIR || !powderIsPartial(tw)) { return false; }
+  let tm = materials[tmat];
+  if (!matHasPowderMass(tm)) { return false; }
+  let myMat = voxMat(myWord);
+  let f = powderMass(myWord);
+  let nf = powderMass(tw);
+  let stamp = stampFor(T.tick, P.substep);
+  var si = gSelfIdx;
+  if (any(src != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(src); }
+  var srcNow = tmat;   // what the source cell holds afterwards
+  if (tmat == myMat) {
+    let t = min(f, POWDER_FULL - nf);
+    if (t >= f) { srcNow = MAT_AIR; }
+    // The destination keeps its own stain (the grains already there), as
+    // transferLiquid's destination does; a source that empties goes to clean
+    // air -- its stain left with its grains.
+    voxStore(dv.x, packVoxKeepStain(myMat, powderStateFor(nf + t, dst, ptSeed()), stamp, tw));
+    if (t >= f) { voxStore(si, 0u); }
+    else { voxStore(si, packVoxKeepStain(myMat, powderStateFor(f - t, src, ptSeed()), stamp, myWord)); }
+  } else {
+    if (nf >= f) { return false; }
+    voxStore(dv.x, packVoxKeepStain(myMat, voxState(myWord), stamp, myWord));
+    voxStore(si, packVoxKeepStain(tmat, voxState(tw), stamp, tw));
+  }
+  markVoxActive(dv.x);
+  markVoxActive(si);
+  markDirtyR(src, DIRTY_R_MOVE);
+  markDirtyR(dst, DIRTY_R_MOVE);
+  // The source cell got lighter (or emptied): whatever rested on it may have
+  // lost its support, exactly as when tryMove slides a grain out from under.
+  flagSupportLoss(src, CLASS_POWDER, srcNow);
+  return true;
+}
+
 // ======================= ANGLE OF REPOSE (POWDERS) =========================
 //
 // WHY EVERY POWDER USED TO PILE AT EXACTLY 45 DEGREES. The chain in main() is
@@ -931,6 +995,34 @@ fn productState(mat : u32, r : u32) -> u32 {
   return r % 3u;
 }
 
+// ---- MASS THROUGH A REACTION (docs/PLAN_powder_mass.md §2.5, §10 Q2) --------
+// A partial cell that transmutes keeps its eighths when the product can hold
+// eighths: 3/8 of snow melts to 3/8 of water, 1/8 of gravel etched by acid is
+// 1/8 of sand. Before powder carried mass every product was born full, which
+// minted matter from any partial liquid; that is what this retires.
+//
+// The eighths the cell word `sw` holds: a liquid's fullness, a powder's mass,
+// and 8 for everything else (a solid, or a whole cell of anything).
+fn cellEighths(sw : u32) -> u32 {
+  let sm = materials[voxMat(sw)];
+  if (sm.klass == CLASS_LIQUID) { return voxState(sw) + 1u; }
+  if (matHasPowderMass(sm)) { return powderMass(sw); }
+  return 8u;
+}
+// The product's state nibble when the cell it replaces held `e` eighths. A
+// liquid or powder product keeps the mass; anything else (and anything made
+// from a whole cell) is born exactly as productState always made it. Solid
+// products from a partial POWDER never get here -- doReactions refuses the
+// rule (selfPartialPowder) -- and gas ones are thinned in reactWriteSelf.
+fn carriedState(prod : u32, e : u32, r : u32) -> u32 {
+  if (e < 8u && prod != MAT_AIR) {
+    let pm = materials[prod];
+    if (pm.klass == CLASS_LIQUID) { return e - 1u; }
+    if (matHasPowderMass(pm)) { return e + 2u; }
+  }
+  return productState(prod, r);
+}
+
 // ---- sky exposure (daylight-gated reactions) --------------------------------
 // "Is this cell exposed to the sky?" — answered by looking at the ONE cell
 // directly above it, and nothing further.
@@ -1118,8 +1210,23 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
     flagFluidConsume(c);
     if (prod == 0u) { return; }
   }
-  if (prod == 0u) { voxStore(idx, 0u); }
-  else { voxStore(idx, packVox(prod, productState(prod, rnd), stamp)); }
+  // Self's eighths (8 for a synthesized self: that cell is air). Read before
+  // the store below; nothing on the reaction paths writes self before this.
+  var e = 8u;
+  var selfPowder = false;
+  if (!synthSelf) {
+    let sw = voxWordAt(c);
+    e = cellEighths(sw);
+    selfPowder = matHasPowderMass(materials[voxMat(sw)]);
+  }
+  // A partial grain that becomes a GAS (dust flashing to fire) makes one whole
+  // gas cell with probability e/8 and otherwise just goes: a dusting burns
+  // like 1/8 of a pile, not like a pile. Gas has no eighths to carry, and the
+  // roll keeps expected mass exact without one.
+  let thinned = selfPowder && e < 8u && prod != 0u &&
+                materials[prod].klass == CLASS_GAS && ((rnd >> 5u) & 7u) >= e;
+  if (prod == 0u || thinned) { voxStore(idx, 0u); }
+  else { voxStore(idx, packVox(prod, carriedState(prod, e, rnd), stamp)); }
   markVoxActive(idx);
   flagSupportLoss(c, klass, prod);  // ember->ash drops the wood above
 }
@@ -1589,11 +1696,17 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
                covered : bool, probe : bool) -> bool {
   var keepAwake = false;
   let stamp = stampFor(T.tick, P.substep);
+  // A partial grain cannot become a whole SOLID (a 1/8 seed does not grow a
+  // whole sprout): such rules are skipped, not rolled, and do not hold the
+  // chunk awake. Eight grains that merge into a full cell react normally.
+  let selfPartialPowder = !synthSelf && matHasPowderMass(m) && powderIsPartial(w);
 
   for (var ri = 0u; ri < m.reactCount; ri++) {
     let rule = reactions[m.reactOffset + ri];
     let kind = rule.packed & 3u;
     let dmask = (rule.packed >> 2u) & 7u;
+    if (selfPartialPowder && rule.prodSelf != PROD_KEEP && rule.prodSelf != MAT_AIR &&
+        materials[rule.prodSelf].klass == CLASS_SOLID) { continue; }
 
     // Light/phase gate. A rule whose condition is not met is skipped WITHOUT
     // setting keepAwake — that is what lets a lit pond go back to sleep at
@@ -1709,7 +1822,11 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             // writes into it (condensed stone, grown plant); prodNbr == 0
             // rewrites air over air, harmless.
             if (rule.prodNbr == 0u) { voxStore(ni, 0u); }
-            else { voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp)); }
+            else {
+              // A partial neighbour keeps its eighths (carriedState).
+              let ne = select(cellEighths(niw.y), 8u, synthFluid);
+              voxStore(ni, packVox(rule.prodNbr, carriedState(rule.prodNbr, ne, rr >> 4u), stamp));
+            }
             markVoxActive(ni);
             markDirtyR(n, DIRTY_R_REACTW);
             if (!synthFluid) {
@@ -3168,6 +3285,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // 1) straight fall -- through air or a lighter fluid, or onto a plant it
   //    crushes (tryCrush)
   if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false) ||
+      tryPowderOnto(c, c + vec3<i32>(0, -1, 0), w, m) ||
       tryCrush(c, c + vec3<i32>(0, -1, 0), w)) {
     markDirtyR(c, cls);
     return;
@@ -3195,7 +3313,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   for (var i = 0u; i < 4u; i++) {
     let d = lateralDir(i + r);
     if (!reposeDiagAllowed(c, d, reposeCode)) { continue; }
-    if (tryMove(c, c + vec3<i32>(d.x, -1, d.y), w, m.density, false)) {
+    // Onto a partial powder diagonally too (merge/sink): grains settle into
+    // the hollow beside them. Same gate, same reach as the diagonal move.
+    if (tryMove(c, c + vec3<i32>(d.x, -1, d.y), w, m.density, false) ||
+        tryPowderOnto(c, c + vec3<i32>(d.x, -1, d.y), w, m)) {
       markDirtyR(c, cls);
       return;
     }

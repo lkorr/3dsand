@@ -119,8 +119,12 @@ GPU voxel sims. The requirements (adopted as day-one rules, see §4 and §10):
 ```
 bits 0–11 : material ID (4,096 materials)
 bits 12–15: state nibble — meaning is per-material:
-            powders/solids → visual variant (color/texture jitter resolved in
+            solids → visual variant (color/texture jitter resolved in
               shader, stable as the grain moves)
+            powders → MASS in eighths (2026-09-26, docs/PLAN_powder_mass.md):
+              0..2 = full, keeping the old variant meaning so every existing
+              creator, sentinel and save still means "full"; 3..9 = 1..7
+              eighths; 10..15 reserved (read as full). Mites never partial.
             liquids → fullness (mass-conserving flow, see §4)
             burning things → burn-stage counter
 ```
@@ -825,6 +829,34 @@ SSBO lists of chunk indices.
   adjacent cells *of the below cell* in random order (RNG replaces 2D's left/right
   alternation and breaks the symmetry that would create perfect square pyramids).
   Else stay and clear the moving bit. This alone produces angle-of-repose piles.
+- **POWDER MASS IN EIGHTHS (2026-09-26; docs/PLAN_powder_mass.md).** A powder
+  cell carries 1..8 eighths of grains in its state nibble (§3), so a single
+  1/8-voxel grain exists, falls and piles. Two moves onto a PARTIAL powder
+  cell, `sim_step.wgsl tryPowderOnto`, written by the acting thread at reach 1
+  exactly as `transferLiquid` writes a liquid's two cells:
+  - **merge** — same powder: `min(f, 8 - nf)` eighths move down, the rest stays
+    or the source empties to air. Straight down and on the repose-gated
+    diagonals.
+  - **sink** — a different powder lighter in MASS: the two words swap, so full
+    sand does not rest on a 1/8 dust film as if it were a whole voxel.
+
+  Every move strictly lowers the grains' summed height and none is neutral, so
+  there is no licence, no lateral levelling (that is the liquid ladder, and its
+  levelling limit), and a settled partial sleeps like any grain. Reactions carry
+  mass (`cellEighths`/`carriedState`): a partial cell's powder or liquid
+  product keeps its eighths; a solid product needs a full cell (a 1/8 seed does
+  not grow a whole sprout); a gas product fires with probability mass/8.
+  Vessels scoop and pour eighths of powder (`ContainerCellUnits`, the scoop
+  ledger), so a pouch's last partial cell lands as grains instead of "dust".
+  The renderer draws a partial cell as a 2x2x2 arrangement DERIVED from its
+  mass and its four lateral neighbours (`raymarch.wgsl tracePowder`: bottom
+  layer first, quarter-cells beside the highest neighbours first, fixed
+  tie-break), in the deferred-detail second pass the micro bricks use; light
+  (shadow rays, AO, occupancy's blocker count) treats a partial under
+  `POWDER_BLOCK_MIN` = 5 eighths as open (`isRayBlockerW`), and the CPU mirror
+  walks through a film under `kPowderWalkMin` = 3 eighths (`KindOfWord`).
+  Gate `powder-mass`: exact eighths through merge and sink, no buried partial,
+  both rooms asleep.
 - **PER-MATERIAL ANGLE OF REPOSE (2026-09-13).** One down, one across is 45°,
   and for years that was the angle of *every* powder in the engine — dry sand,
   angular gravel, snow, ash and dust all built the same cone. One optional

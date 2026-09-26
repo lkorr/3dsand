@@ -370,8 +370,12 @@ struct BrushOp {
   int32_t radius;
   uint32_t material;
   uint32_t mode;  // 0 = paint into air, 1 = overwrite
+  // pad0: a transmute's FROM filter; pad1 bit 0: its wildcard-matches-matter
+  // flag; pad1 bits 4..7: a powder brush's GRAIN size in eighths (0 = whole
+  // cells) -- sim_mutate.wgsl reads all three by the names _p0/_p1.
   uint32_t pad0 = 0, pad1 = 0;
 };
+constexpr uint32_t kBrushGrainShift = 4;
 constexpr uint32_t kMaxOpsPerTick = 64;
 
 // Must match ExplosionOp in common.wgsl (32 bytes). Part of the MutationQueue
@@ -1795,6 +1799,33 @@ inline uint32_t JitterStateFor(int x, int y, int z, uint32_t seed) {
                                   (uint32_t)x ^ ((uint32_t)z << 12), (uint32_t)y);
   return rnd % 3u;
 }
+// ---- POWDER MASS (docs/PLAN_powder_mass.md; common.wgsl POWDER MASS) ------
+// A powder's state nibble is its MASS in eighths: 0..2 = FULL (the old palette
+// variant, so every existing creator, sentinel, save and fixture still means
+// full), 3..9 = 1..7 eighths, 10..15 reserved (read as full). Mites
+// (kMatFlagWander) never carry a partial. check_invariants.py pins these four
+// to the WGSL constants.
+constexpr uint32_t kPowderFull = 8u;
+constexpr uint32_t kPowderPartialLo = 3u;
+constexpr uint32_t kPowderPartialHi = 9u;
+// Render-only: shadow/AO/occupancy blocker threshold (isRayBlockerW).
+constexpr uint32_t kPowderBlockMin = 5u;
+// CPU-only: a partial powder lighter than this is walked THROUGH — KindOfWord
+// reports it as air to the player, mobs and projectiles (owner, 2026-09-26:
+// "thin films should be walked through").
+constexpr uint32_t kPowderWalkMin = 3u;
+inline bool PowderStateIsPartial(uint32_t s) {
+  return s >= kPowderPartialLo && s <= kPowderPartialHi;
+}
+inline uint32_t PowderMassOfState(uint32_t s) {
+  return PowderStateIsPartial(s) ? s - 2u : kPowderFull;
+}
+// State nibble for `mass` eighths (1..8) at world (x,y,z); full takes the
+// positional variant, as common.wgsl powderStateFor does.
+inline uint32_t PowderStateFor(uint32_t mass, int x, int y, int z, uint32_t seed) {
+  return mass >= kPowderFull ? JitterStateFor(x, y, z, seed) : mass + 2u;
+}
+
 // The word a JITTER(mat) sentinel's cell at world (x,y,z) reads as.
 inline uint32_t SynthWordAt(uint32_t entry, int x, int y, int z, uint32_t seed) {
   const uint32_t mat = entry & kPtMatMask;
@@ -4230,7 +4261,12 @@ class World {
     if (mat == 0) return CellKind::Air;
     if (mat >= classOf.size()) return CellKind::Air;
     switch (classOf[mat]) {
-      case 0: case 1: return CellKind::Solid;  // solid + powder both carry weight
+      case 0: return CellKind::Solid;
+      case 1:
+        // Powder carries weight -- except a thin FILM of grains (under
+        // kPowderWalkMin eighths), which is walked and flown through.
+        return PowderMassOfState((word >> 12) & 0xFu) < kPowderWalkMin
+                   ? CellKind::Air : CellKind::Solid;
       case 2: return CellKind::Liquid;
       default: return CellKind::Gas;
     }

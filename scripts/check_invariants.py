@@ -2442,6 +2442,37 @@ def check_scoop_ledger():
                         "of the page-fault record (kPageFaultWords)")
 
 
+def check_powder_mass():
+    """world.h kPowder* <-> common.wgsl POWDER_* (docs/PLAN_powder_mass.md).
+
+    The powder state-nibble encoding (0..2 full, 3..9 = 1..7 eighths) is
+    decoded on both sides: the GPU CA/renderer and the CPU mirror, vessels and
+    collision. A drift is sand that weighs one thing to the sim and another to
+    the player's feet.
+    """
+    wh = read("src/sim/world.h")
+    cw = read("assets/shaders/common.wgsl")
+    if not wh or not cw:
+        return
+    checked.append("powder mass")
+    for cpp, wgsl in (("kPowderFull", "POWDER_FULL"),
+                      ("kPowderPartialLo", "POWDER_PARTIAL_LO"),
+                      ("kPowderPartialHi", "POWDER_PARTIAL_HI"),
+                      ("kPowderBlockMin", "POWDER_BLOCK_MIN")):
+        a = re.search(r"constexpr\s+uint32_t\s+" + cpp + r"\s*=\s*(\d+)u", wh)
+        b = re.search(r"const\s+" + wgsl + r"\s*:\s*u32\s*=\s*(\d+)u", cw)
+        if not a or not b:
+            problems.append(f"powder mass: {cpp} / {wgsl} not found")
+        elif a.group(1) != b.group(1):
+            problems.append(f"powder mass: world.h {cpp} = {a.group(1)} but "
+                            f"common.wgsl {wgsl} = {b.group(1)}")
+    # The offset (state = mass + 2) is written as a literal on both sides.
+    lo = re.search(r"constexpr\s+uint32_t\s+kPowderPartialLo\s*=\s*(\d+)u", wh)
+    if lo and int(lo.group(1)) != 3:
+        problems.append("powder mass: kPowderPartialLo moved off 3 but the "
+                        "`mass + 2` / `s - 2` offset literals did not")
+
+
 # ------------------------------------------- the reaction-condition gate
 # assets/shaders/common.wgsl  <->  src/sim/materials.h (MIRROR-BEGIN reactgate)
 #
@@ -2598,6 +2629,7 @@ ALL = {
     "coatflame": check_coat_flame,
     "reactgate": check_react_gate,
     "scoop": check_scoop_ledger,
+    "powdermass": check_powder_mass,
     "envpred": check_env_predictions,
     "autofly": check_autofly_surface,
     "worldgen": check_worldgen_mirror,
@@ -2678,7 +2710,7 @@ RELEVANT = {
     "scripts/test_environment.mjs": ["envpred"],
     "src/sim/materials.h": ["reactgate", "coatflame"],
     "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule"],
-    "assets/shaders/common.wgsl": ["stainprec"],
+    "assets/shaders/common.wgsl": ["stainprec", "powdermass"],
     "src/sim/coatrule.h": ["coatrule", "stainprec"],
     "src/sim/reactcpu.h": ["reactgate"],
 }
