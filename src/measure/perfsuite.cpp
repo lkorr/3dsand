@@ -890,38 +890,38 @@ bool SetupWater(Scene& s, std::string& why) {
   //      That was not a missing pond; ponds sit on a 448-voxel tile grid and a
   //      6-chunk (96-voxel) box is far finer than the thing it is looking for.
   //   2. Asking `World::PondTile` over the window found nothing either — and
-  //      that one is DELIBERATE. pondInfo() rejects any tarn whose centre lands
-  //      in -128..640 on both axes, and world.cpp says why in as many words:
-  //      that box is the authored origin region, "exactly the residency window
-  //      the harness runs in". A generated pond can never appear here.
+  //      on the harness map that is DELIBERATE: its pad box (-128..640 on both
+  //      axes) keeps rolled tarns out of the fixture ground. The game's map
+  //      has no pad, so there a tarn may well be in the window.
   //
-  // The water that IS here is authored: `World::AuthoredPoolList` returns the
-  // three set-piece pools at the origin — the lake, the oil pond, the lava pool
-  // — which is the same fixture `--fluid-bench pond68` measures. So this
-  // scenario uses the lake, and only falls back to a generated tarn if the
-  // window has been moved away from the origin.
+  // The water that IS here is authored: the loaded map's water sites
+  // (World::WaterSiteDisc) -- on the harness map that is the fixture lake at
+  // (420,420), the same one `--fluid-bench worldlake` measures. So this
+  // scenario uses an authored lake in the window, and only falls back to a
+  // generated tarn when there is none.
   {
-    World::AuthoredPool pools[World::kAuthoredPools];
-    World::AuthoredPoolList(pools);
     const IVec3 wo = s.world.WindowOrigin();
-    std::printf("    authored pools (window origin chunk %d,%d,%d = voxels "
+    std::printf("    authored lakes (window origin chunk %d,%d,%d = voxels "
                 "%d..%d, %d..%d, %d..%d):\n",
                 wo.x, wo.y, wo.z,
                 wo.x * (int)kChunk, (wo.x + (int)kNChunk) * (int)kChunk - 1,
                 wo.y * (int)kChunk, (wo.y + (int)kNChunk) * (int)kChunk - 1,
                 wo.z * (int)kChunk, (wo.z + (int)kNChunk) * (int)kChunk - 1);
-    for (const World::AuthoredPool& p : pools)
-      std::printf("      %-6s r=%-4d at (%d,%d,%d)  %s\n", p.mat, p.r,
-                  p.cx, p.waterY, p.cz,
-                  s.world.CellInWindow({p.cx, p.waterY, p.cz}) ? "IN WINDOW"
-                                                               : "outside");
-    for (const World::AuthoredPool& p : pools) {
-      if (std::strcmp(p.mat, "water") != 0) continue;
-      if (!s.world.CellInWindow({p.cx, p.waterY, p.cz})) continue;
-      s.pond = {p.cx, p.waterY, p.cz};
+    for (int i = 0; i < World::WaterSiteCount(); i++) {
+      const World::PondDisc p = World::WaterSiteDisc(i, kDefaultSeed);
+      if (!p.present) continue;
+      std::printf("      r=%-4d at (%d,%d,%d)  %s\n", p.r, p.cx, p.surf, p.cz,
+                  s.world.CellInWindow({p.cx, p.surf, p.cz}) ? "IN WINDOW"
+                                                             : "outside");
+    }
+    for (int i = 0; i < World::WaterSiteCount(); i++) {
+      const World::PondDisc p = World::WaterSiteDisc(i, kDefaultSeed);
+      if (!p.present || p.fillId == 0u) continue;
+      if (!s.world.CellInWindow({p.cx, p.surf, p.cz})) continue;
+      s.pond = {p.cx, p.surf, p.cz};
       s.crownR = p.r;
       const float d = (float)(p.r + 24);
-      s.eye = {(float)p.cx - d * 0.7071f, (float)(p.waterY + 20),
+      s.eye = {(float)p.cx - d * 0.7071f, (float)(p.surf + 20),
                (float)p.cz - d * 0.7071f};
       s.cam.yaw = 0.785f;
       s.cam.pitch = -0.32f;
@@ -929,7 +929,7 @@ bool SetupWater(Scene& s, std::string& why) {
       std::snprintf(note, sizeof note,
                     "authored lake: disc r=%d at (%d,%d), floor y=%d, surface "
                     "y=%d (%d voxels deep); bank punctured on tick 60",
-                    p.r, p.cx, p.cz, p.floorY, p.waterY, p.waterY - p.floorY);
+                    p.r, p.cx, p.cz, p.surf - p.depth, p.surf, p.depth);
       s.note = note;
       return true;
     }
@@ -2217,18 +2217,18 @@ bool CamCascade(Scene& s, uint32_t& tick, std::string& why) {
 // The pool must be INSIDE THE RESIDENCY WINDOW. Outside it a liquid shades
 // through the far-field cascade as flat colour with no submerged path at all
 // (main.cpp's oil shots relocate the window for exactly this reason), so the
-// budget would be of a grey slab. Hence the CellInWindow test, and hence the
-// authored lake rather than a generated tarn: pondInfo() refuses to place a
-// tarn anywhere in -128..640, which is precisely the window this harness runs.
+// budget would be of a grey slab. Hence the CellInWindow test, and hence an
+// authored lake rather than a generated tarn: its address is known (the
+// harness map's fixture lake at (420,420) sits in the origin window).
 bool CamSubmerged(Scene& s, uint32_t& tick, std::string& why) {
-  World::AuthoredPool pools[World::kAuthoredPools];
-  World::AuthoredPoolList(pools);
-  for (const World::AuthoredPool& p : pools) {
-    if (std::strcmp(p.mat, "water") != 0) continue;
+  for (int i = 0; i < World::WaterSiteCount(); i++) {
+    const World::PondDisc p = World::WaterSiteDisc(i, kDefaultSeed);
+    if (!p.present || p.fillId == 0u) continue;
+    const int floorY = p.surf - p.depth;
     // Mid-column: bed below, surface above, both inside the submerged path's
     // reach. An eye near the floor sees no Snell window; one near the surface
     // sees no caustics.
-    const int ey = (p.floorY + p.waterY) / 2;
+    const int ey = (floorY + p.surf) / 2;
     if (!s.world.CellInWindow({p.cx, ey, p.cz})) continue;
     s.eye = {(float)p.cx, (float)ey, (float)p.cz};
     s.cam.yaw = 0.0f;    // +x — Camera::Forward is (cos yaw, sin pitch, sin yaw)
@@ -2238,7 +2238,7 @@ bool CamSubmerged(Scene& s, uint32_t& tick, std::string& why) {
                   "INSIDE the authored lake: disc r=%d at (%d,%d), floor y=%d, "
                   "surface y=%d, eye y=%d — %d voxels of water overhead, "
                   "looking level toward the +x shore",
-                  p.r, p.cx, p.cz, p.floorY, p.waterY, ey, p.waterY - ey);
+                  p.r, p.cx, p.cz, floorY, p.surf, ey, p.surf - ey);
     s.note = note;
     tick = FindNoonTick(CurrentTuning());  // god rays need the sun up
     return true;

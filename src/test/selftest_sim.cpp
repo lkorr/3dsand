@@ -547,8 +547,8 @@ int settled = 0;  // tick at which the world went quiet (or the cap)
 // should contain none of them.
 //
 // Measured HERE rather than in a probe of its own because this gate already
-// generates the world, already settles it, and the map's harness pad already
-// contains the test tarn at (420,420) — the question costs one readback of the
+// generates the world, already settles it, and the harness map already
+// carries its fixture lake at (420,420) — the question costs one readback of the
 // chunk column over it instead of a ten-minute parked flight. (It was a parked
 // flight first. Nine of them, and the sampler kept missing the water.)
 //

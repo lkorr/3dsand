@@ -335,7 +335,7 @@ Status GateSpells(Ctx& c, std::string& detail) {
       }
       std::printf("spell delivery: map loaded=%d harness box (%d,%d)-(%d,%d) sea y%d spawn (%d,%d); "
                   "contract y at (100,100)=%d (150,150)=%d (72,72)=%d spawn=%d; mirror seed %u\n",
-                  m.Loaded() ? 1 : 0, m.harnessX0, m.harnessZ0, m.harnessX1, m.harnessZ1, m.seaLevelY,
+                  m.Loaded() ? 1 : 0, m.padX0, m.padZ0, m.padX1, m.padZ1, m.seaLevelY,
                   m.spawnX, m.spawnZ, World::TerrainHeight(100, 100, kDefaultSeed),
                   World::TerrainHeight(150, 150, kDefaultSeed), World::TerrainHeight(72, 72, kDefaultSeed),
                   World::TerrainHeight(m.spawnX, m.spawnZ, kDefaultSeed), world.WorldSeed());

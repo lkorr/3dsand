@@ -55,8 +55,8 @@
 //
 // Terrain overhaul package C made a tarn's bowl REPLACE the ground rather than
 // min() into it (worldgen.wgsl, the `h = L.pw.x` block), so `pondAt` is an
-// exact integer parabola with known parameters and the three authored pools are
-// exact flat-floored cylinders. That makes area-per-height a CLOSED FORM for
+// exact integer parabola with known parameters and an authored lake is its
+// preset's sampled profile. That makes area-per-height a CLOSED FORM for
 // every body worldgen creates — no flood fill, no measurement pass, no storage
 // beyond a tile coordinate. Player-dug basins need the height-ordered
 // union-find sweep of component 10 and are simply NOT ADOPTED until it exists;
@@ -136,11 +136,18 @@ constexpr uint32_t kWaterDrainSettleTicks = 64;
 // they crossed it.
 constexpr uint32_t kWaterImpulseHotTicks = 240;
 
+// The basin id of the loaded map's i-th authored water site
+// (World::WaterSiteDisc): source tag 01 in the top two bits (waterbody.cpp
+// isDiscoveredId's table) plus the site's index. Stable whatever the window.
+constexpr uint32_t WaterSiteBasinId(int waterSiteIndex) {
+  return 0x40000000u | (uint32_t)waterSiteIndex;
+}
+
 // How a basin's floor is shaped. Two kinds cover every body worldgen makes,
 // and both are closed forms; a third kind is what component 10's union-find
 // sweep will produce for dug terrain.
 enum class WaterBasinKind : uint32_t {
-  FlatDisc = 0,      // the three authored pools: floor is one Y, walls vertical
+  FlatDisc = 0,      // a discovered probe's placeholder: floor is one Y, walls vertical
   ParabolicBowl = 1, // the pre-P-F tarn: an integer parabola (kept for the gate's round-trip arm)
   Profiled = 2,      // a P-F tarn or authored lake: the preset's sampled profile,
                      // World::BowlDepth(preset, r, d2), inverted by bisection
@@ -151,7 +158,7 @@ enum class WaterBasinKind : uint32_t {
 struct WaterBasin {
   // Stable across ticks and across a window shift, because it is derived from
   // WHERE the basin is rather than from the order it was discovered in. Tarns
-  // key off their pond tile; the authored pools take fixed low ids. A descriptor
+  // key off their pond tile, authored lakes off their site index. A descriptor
   // that changed identity when the player walked away would re-adopt itself
   // every window move and flap through the seam that plan §5 calls a mass-loss
   // machine.
@@ -159,17 +166,17 @@ struct WaterBasin {
   int cx = 0, cz = 0;        // disc centre, world cells
   int radius = 0;            // disc radius, world cells
   // Inclusive squared-radius bound: a column is inside iff dx*dx+dz*dz <= this.
-  // Carried rather than derived because the two kinds disagree by one — pondAt
-  // rejects `d2 > r*r` while the authored pools test `d2 < r*r` — and a
-  // one-cell ring is 2*pi*r cells of silent disagreement at r=68.
+  // Carried rather than derived because the kinds could disagree by one (the
+  // retired authored pools tested `d2 < r*r` where pondAt rejects `d2 > r*r`),
+  // and a one-cell ring is 2*pi*r cells of silent disagreement at r=68.
   int discD2Max = 0;
   int surfY = 0;             // the free surface worldgen authored (fill level)
   int floorY = 0;            // the DEEPEST floor cell's Y (bowl centre)
   int rimDepth = 0;          // depth below surfY at the rim (0 for FlatDisc)
   int centreDepth = 0;       // depth below surfY at the centre
   // The elevation at which water leaves. For a tarn this is the berm core,
-  // `surfY + pondBerm` — the wall containment structurally rests on. For an
-  // authored pool it is the rim lift. Above it the area table is meaningless
+  // `surfY + pondBerm` — the wall containment structurally rests on. For a
+  // discovered probe it is a placeholder. Above it the area table is meaningless
   // because the body is no longer a body, it is a flow.
   int spillY = 0;
   WaterBasinKind kind = WaterBasinKind::FlatDisc;

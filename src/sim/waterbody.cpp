@@ -113,7 +113,8 @@ int64_t crossSectionD2(const WaterBasin& b, int y) {
 }
 
 // W-D: is this basin id from discovery's reserved range? The top two bits name
-// the source — 00 authored pool, 01 authored lake, 10 tarn, 11 discovered — so
+// the source — 00 unused (was the authored pools), 01 authored lake, 10 tarn,
+// 11 discovered — so
 // the test is a mask rather than a side table that could disagree.
 bool isDiscoveredId(uint32_t id) {
   return (id & 0xC0000000u) == kWaterDiscoverIdBase;
@@ -637,32 +638,6 @@ void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
   const int lox = o.x * (int)kChunk, loz = o.z * (int)kChunk;
   const int hix = lox + (int)kWorldN - 1, hiz = loz + (int)kWorldN - 1;
 
-  // The three authored pools first, so their ids stay 1..3 whatever the window
-  // is. `pond68` — the scene both fluid benches measure — is the first of them.
-  World::AuthoredPool pools[World::kAuthoredPools];
-  World::AuthoredPoolList(pools);
-  for (int i = 0; i < World::kAuthoredPools; i++) {
-    const World::AuthoredPool& p = pools[i];
-    WaterBasin b;
-    b.id = (uint32_t)(i + 1);
-    b.cx = p.cx;
-    b.cz = p.cz;
-    b.radius = p.r;
-    // A column is inside an authored pool iff d2 < r*r (TerrainHeight's test),
-    // one cell tighter than pondAt's `d2 <= r*r`. At r = 68 that ring is 428
-    // cells; carrying the BOUND rather than the radius is what stops the two
-    // conventions from quietly disagreeing by a ring of 2*pi*r cells.
-    b.discD2Max = p.r > 0 ? p.r * p.r - 1 : -1;
-    b.surfY = p.waterY;
-    b.floorY = p.floorY;
-    b.centreDepth = p.waterY - p.floorY;
-    b.rimDepth = b.centreDepth;
-    b.spillY = p.rimY;
-    b.kind = WaterBasinKind::FlatDisc;
-    b.matName = p.mat;
-    basins_.push_back(std::move(b));
-  }
-
   // A P-F pond (a rolled tarn or an authored lake) as a basin: the preset's
   // geometry rides in the PondDisc, so nothing here reads a knob. A dry
   // preset (no fill) is a bowl with no body and is not registered.
@@ -697,7 +672,7 @@ void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
     const World::PondDisc d = World::WaterSiteDisc(i, seed);
     if (!d.present) continue;
     if (d.cx + d.r < lox || d.cx - d.r > hix || d.cz + d.r < loz || d.cz - d.r > hiz) continue;
-    addDisc(d, 0x40000000u | (uint32_t)i);
+    addDisc(d, WaterSiteBasinId(i));
   }
   // Tarns: one scan of the pond tiles the window touches. A disc never leaves
   // its own tile (pondInfo's inset), so this finds every one that can reach in.
@@ -752,8 +727,8 @@ void WaterBodySystem::RebuildBasins(const World& world, uint32_t seed) {
     // SPILL ABOVE THE SEED, so the ladder's "not overflowing is not flowing"
     // test does not refuse every probe it is handed. A probe's real containment
     // is whatever the player dug; the sweep measures the true spill elevation
-    // once the basin goes curve-dirty, and until then this is the same analytic
-    // placeholder the authored pools carry.
+    // once the basin goes curve-dirty, and until then this is an analytic
+    // placeholder.
     b.spillY = b.surfY + 8;
     b.kind = WaterBasinKind::FlatDisc;
     b.matName = name;

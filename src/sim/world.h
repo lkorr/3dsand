@@ -4418,6 +4418,10 @@ class World {
   // gives them. The registry adds these beside the rolled tarns.
   static int WaterSiteCount();
   static PondDisc WaterSiteDisc(int index, uint32_t seed);
+  // The water-site index of the site whose map.json id is `id`, or -1 when
+  // the loaded map has no such water site (e.g. the harness lake, asked of the
+  // game's map).
+  static int WaterSiteIndex(const std::string& id);
   // The mirrored bowl depth at squared distance d2 from the centre of a disc
   // of radius r wearing `preset`: the basin curve inverts THIS by bisection
   // rather than re-deriving the profile (worldmap.h explains the knots).
@@ -4426,24 +4430,9 @@ class World {
   // of a tarn to its berm core stops after this many columns at most.
   static int PondReachMax();
 
-  // The three authored pools at the world origin — the lake, the oil pond and
-  // the lava pool of `--fluid-bench wp5`'s pond68 scene. Flat floors, vertical
-  // walls, a fixed fill level: the degenerate case of a container curve, and
-  // the one every bench scene in docs/PLAN_fluid_overhaul.md §8 measures.
-  //
-  // `mat` is the material NAME, resolved by the consumer (design guideline #4).
-  struct AuthoredPool {
-    int cx, cz, r;     // disc, world cells (a column is inside iff d2 < r*r)
-    int floorY;        // the flat floor
-    int waterY;        // the fill level; water occupies (floorY, waterY]
-    int rimY;          // the containment rim outside the disc = spill elevation
-    const char* mat;   // "water", "oil", "lava"
-  };
-  static constexpr int kAuthoredPools = 1;
-  // The harness pad box from the world map (worldmap.h): the CPU twin of
-  // worldgen.wgsl's inHarness, for fixtures that want to know they are on it.
-  static bool InHarness(int x, int z);
-  static void AuthoredPoolList(AuthoredPool out[kAuthoredPools]);
+  // The map's calm pad box (worldmap.h): the CPU twin of worldgen.wgsl's
+  // inPadBox, for fixtures that want to know they are on it.
+  static bool InPadBox(int x, int z);
 
   // Fluid-lab worldgen mode (kLabSlabY block above). A process-wide static
   // because TerrainHeight is static and the flag must gate BOTH the CPU

@@ -1,6 +1,6 @@
 {
-  "name": "default",
-  "about": "The shipped starting map (first written by scripts/seed_worldmap.py, repainted since). Edit it on the tuner's Environment > World map page. Tier A: seed-independent.",
+  "name": "harness",
+  "about": "THE SELFTEST'S GROUND (sim/worlddefaults.h kHarnessMapName): --selftest, --verify, --suite, --vk-smoke, the fluid benches and --shot generate this map, never the game's. Its planes and terrain are a copy of `default` as it stood when the harness moved out of it (2026-09-26), so repainting the shipped map cannot move a gate; edit THIS map only to change a fixture's ground, and expect to rebaseline.",
   "cellLog2": 10,
   "size": [
     196,
@@ -52,13 +52,36 @@
   ],
   "sites": [
     {
+      "id": "harness",
+      "kind": "pad",
+      "min": [
+        -128,
+        -128
+      ],
+      "max": [
+        640,
+        640
+      ],
+      "about": "The calm pad box over the fixture ground: no tree trunks or crowns, no tarns, no cover, coarse octaves faded toward its edge. Keeps every fixture column (60..150 on the x==z diagonal) on the ground the gates were written against."
+    },
+    {
+      "id": "harness_lake",
+      "kind": "water",
+      "preset": "fixture_lake",
+      "at": [
+        420,
+        420
+      ],
+      "about": "The fixture lake (sim/worlddefaults.h kHarnessLakeSite): the waterbody/current gates' basin, --fluid-bench worldlake and the water --shot scenes. Was a literal disc in worldgen.wgsl and four copies in world.cpp until 2026-09-26."
+    },
+    {
       "id": "spawn",
       "kind": "spawn",
       "at": [
         580,
         3515
       ],
-      "about": "Where the game starts, and the centre of the calm home area (terrain.homeArea). Must be on land and off any lake: the spawn-site gate checks all of that."
+      "about": "Where the game starts, and the centre of the calm home area (terrain.homeArea). Must be on land, off the harness pad and off any lake: the spawn-site gate checks all of that."
     },
     {
       "id": "home_lake",

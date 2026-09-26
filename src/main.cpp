@@ -685,8 +685,8 @@ bool g_forestFireDone = false;
 // landed in open desert and settled to 0 active chunks. Neither run says
 // anything about a material it never flew over. "Which materials hold a chunk
 // awake" is a question about a PLACE, and this engine has places at known
-// addresses: `World::AuthoredPoolList` gives the authored lake's centre and
-// waterline, `--voxdump`'s coordinates give any other.
+// addresses: the harness map's water sites (World::WaterSiteDisc) give the
+// fixture lake's centre and waterline, `--voxdump`'s coordinates give any other.
 //
 //   SANDVOX_PARK_AT=420,230,420 ./sandvox.exe --autofly-park --frames 600
 //
@@ -1946,7 +1946,12 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   // Oil is density 900 against water's 1000, so the sim floats it without any
   // help here; the ops just place it at the surface and let it spread.
   {
-    const int kLx = 420, kLz = 420, kSurf = 68;   // authored lake, surface y=68
+    // The harness map's fixture lake (--shot loads the harness map). Its
+    // surface is ASKED FOR: the literal y=68 this once carried predates the
+    // datum move to y200 and put the slick ~140 voxels inside the rock.
+    const int kLx = 420, kLz = 420;
+    const World::Column lakeCol = World::TerrainColumn(kLx, kLz, kDefaultSeed);
+    const int kSurf = lakeCol.water != INT32_MIN ? lakeCol.water : lakeCol.h;
     world.SetWindowOrigin({kLx / (int)kChunk - 8, 0, kLz / (int)kChunk - 8});
     SubmitWorldgen(ctx, world, sim, kDefaultSeed);
     ctx.WaitIdle();
@@ -5048,6 +5053,17 @@ int main(int argc, char** argv) {
   if (labFlag) World::SetLabWorld(LabSceneUsesLabWorld(labScene));
   else if (fluidBench) World::SetLabWorld(true);
 
+  // THE HARNESS MAP (sim/worlddefaults.h). Every mode whose fixtures are
+  // written against known ground -- the gates, the smokes, the fluid benches'
+  // `worldlake`, the --shot scenes -- generates assets/worldmap/harness, not
+  // the game's map, so repainting the shipped map can never move a gate.
+  // The game, --perf / --render-budget / --measure (which measure the game)
+  // and the tuner's tools keep world.mapLayer. SANDVOX_MAP still wins.
+  if (selftest || verify || suiteAcceptance || vkSmoke || vkSmokeLoud ||
+      fluidBench || labFlag || shot || shotFrames || shotFluid ||
+      shotWaterfall || shotDebrisPond || shotFluidPond)
+    worldmap::SetMapOverride(kHarnessMapName);
+
   // --list is pure metadata: answering it before any device or asset init
   // means an agent can ask "what gates exist" without a GPU or a built world.
   if (stOpt.list) return selftest::List();
@@ -5083,7 +5099,7 @@ int main(int argc, char** argv) {
       worldmap::WorldMapData map;
       std::string blog;
       if (!biomes::LoadBiomeSet(ad, m, set, blog) ||
-          !worldmap::LoadWorldMap(ad, CurrentTuning().world.mapLayer, set, m.size(), kDefaultSeed, map, blog)) {
+          !worldmap::LoadWorldMap(ad, worldmap::ActiveMapName(CurrentTuning().world.mapLayer), set, m.size(), kDefaultSeed, map, blog)) {
         std::fprintf(stderr, "--heightmap: %s", blog.c_str());
         return 1;
       }
@@ -5155,7 +5171,7 @@ int main(int argc, char** argv) {
       std::vector<uint32_t> stMapWords;
       { std::string wl;
         worldmap::WorldMapData stMap;
-        if (!worldmap::LoadWorldMap(ad, CurrentTuning().world.mapLayer, stBiomes, m.size(), kDefaultSeed, stMap, wl) ||
+        if (!worldmap::LoadWorldMap(ad, worldmap::ActiveMapName(CurrentTuning().world.mapLayer), stBiomes, m.size(), kDefaultSeed, stMap, wl) ||
             !worldmap::PackWorldMap(stBiomes, stMap, stMapWords, wl)) {
           std::fprintf(stderr, "%s", wl.c_str());
           return 1;
@@ -5355,12 +5371,12 @@ int main(int argc, char** argv) {
       return 1;
     }
     worldmap::WorldMapData map;
-    if (!worldmap::LoadWorldMap(assetDir, CurrentTuning().world.mapLayer, biomeSet, mats.size(), kDefaultSeed, map, blog) ||
+    if (!worldmap::LoadWorldMap(assetDir, worldmap::ActiveMapName(CurrentTuning().world.mapLayer), biomeSet, mats.size(), kDefaultSeed, map, blog) ||
         !worldmap::PackWorldMap(biomeSet, map, worldMapWords, blog)) {
       std::fprintf(stderr, "%s", blog.c_str());
       std::fprintf(stderr, "world map '%s' failed to load -- refusing to start (a world with no "
                            "map is not a world; see src/sim/worldmap.h)\n",
-                   CurrentTuning().world.mapLayer.c_str());
+                   worldmap::ActiveMapName(CurrentTuning().world.mapLayer).c_str());
       return 1;
     }
     worldmap::SetCurrentWorldMap(std::move(map));
@@ -5381,7 +5397,7 @@ int main(int argc, char** argv) {
   // is behind an Environment save (docs/PLAN_environment_truth.md P-A).
   // Re-stamped by every environment reload (F7 / regen world / Apply).
   biomes::EnvironmentStamp envStamp =
-      biomes::StampEnvironment(assetDir, CurrentTuning().world.mapLayer,
+      biomes::StampEnvironment(assetDir, worldmap::ActiveMapName(CurrentTuning().world.mapLayer),
                                 CurrentTuning().world.editLayer);
   std::printf("%s\n", envStamp.Line().c_str());
   // ...and the inputs that shape the world AFTER worldgen: tuning.json,

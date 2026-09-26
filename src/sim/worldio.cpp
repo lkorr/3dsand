@@ -10,6 +10,7 @@
 
 #include "gpu/resources.h"   // AssembleShaderSource: the fingerprint's WGSL
 #include "sim/biomes.h"      // EnvironmentStamp: map / biomes / trees
+#include "sim/worldmap.h"    // ActiveMapName
 #include "sim/tuning.h"      // CurrentTuning().world.editLayer
 #include "sim/tuningstamp.h" // HashOneFile, the same FNV the stamps use
 #include "test/support.h"    // AssetDir(): the one asset-path chokepoint
@@ -367,7 +368,7 @@ WorldgenFingerprint ComputeWorldgenFingerprint(const std::string& assetDir,
     fp.parts[0] = Fnv32(norm.data(), norm.size());
   }
   // [1..3] the authored environment, with the stamp the tuner already mirrors.
-  const std::string mapName = CurrentTuning().world.mapLayer;
+  const std::string mapName = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
   const biomes::EnvironmentStamp env = biomes::StampEnvironment(assetDir, mapName);
   fp.parts[1] = env.map;
   fp.parts[2] = env.biomes;

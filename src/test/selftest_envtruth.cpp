@@ -315,26 +315,14 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
   const treeatlas::TreeLattice& lat = treeatlas::CurrentTreeLattice();
   const int T = lat.tile;
 
-  // ---- the window, the authored rim ---------------------------------------------
+  // ---- the window -----------------------------------------------------------------
   const IVec3 org = c.world.WindowOrigin();
   const int x0 = org.x * static_cast<int>(kChunk), y0 = org.y * static_cast<int>(kChunk),
             z0 = org.z * static_cast<int>(kChunk);
   const int N = static_cast<int>(kWorldN);
-  // The authored pool (world.h AuthoredPool) is worldgen's, not the map's, so
-  // it is in every synthetic world; the shader keeps trees and cover out of
-  // its rim ring (`!inRim`, radius vlen(80)). Both are excluded from the
-  // measured ground, and so is everything World::PondNearColumn calls a tarn
-  // or its shore.
-  World::AuthoredPool pools[World::kAuthoredPools];
-  World::AuthoredPoolList(pools);
-  const int pRim = (80 * kVoxelsPerMetre) / std::max(1, worldmap::CurrentTerrain().refVoxelsPerMetre);
-  auto inRim = [&](int x, int z) {
-    for (const World::AuthoredPool& p : pools) {
-      const long long dx = x - p.cx, dz = z - p.cz;
-      if (dx * dx + dz * dz < static_cast<long long>(pRim) * pRim) return true;
-    }
-    return false;
-  };
+  // The synthetic maps carry no sites, so there is no authored lake in the
+  // measured ground; everything World::PondNearColumn calls a tarn or its
+  // shore is excluded below.
 
   std::vector<BiomeStat> stats;
   std::vector<int16_t> hcol(static_cast<size_t>(N) * N);
@@ -361,12 +349,9 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
     std::fill(syn.moisture.begin(), syn.moisture.end(), static_cast<uint8_t>(128));
     syn.sites.clear();
     syn.siteIndex.assign(syn.siteIndex.size(), 0);
-    // The harness box, FAR AWAY rather than empty: crownMeetsHarness has no
-    // "no box" case (an empty x1 < x0 box still catches crowns spanning the
-    // origin), while a box a million voxels off matches nothing and reports
-    // "far" to the home-area fade exactly as no box would.
-    syn.harnessX0 = syn.harnessZ0 = 1 << 20;
-    syn.harnessX1 = syn.harnessZ1 = (1 << 20) + 1;
+    // No pad box (crownMeetsPad and padOutside both read x1 < x0 as "none").
+    syn.padX0 = syn.padZ0 = 0;
+    syn.padX1 = syn.padZ1 = -1;
     syn.spawnX = x0 + N / 2;
     syn.spawnZ = z0 + N / 2;
     syn.spawnAuthored = true;
@@ -430,7 +415,7 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
         const size_t idx = static_cast<size_t>(z) * N + x;
         const int h = World::TerrainHeight(wx, wz, kDefaultSeed);
         hcol[idx] = static_cast<int16_t>(h);
-        bool ok = h < treeline && h - skinDepth >= y0 && h + 1 < y0 + N && !inRim(wx, wz);
+        bool ok = h < treeline && h - skinDepth >= y0 && h + 1 < y0 + N;
         if (ok) {
           const World::PondQuery pq = World::PondNearColumn(wx, wz, kDefaultSeed);
           ok = !pq.inDisc && !pq.near;
@@ -488,7 +473,7 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
           const int wz = tz * T + inset + static_cast<int>((hsh >> 9u) % span);
           if (wx < x0 || wx >= x0 + N || wz < z0 || wz >= z0 + N) continue;
           const int h = hcol[static_cast<size_t>(wz - z0) * N + (wx - x0)];
-          if (h >= treeline || h + 1 < y0 || h + 1 >= y0 + N || inRim(wx, wz)) continue;
+          if (h >= treeline || h + 1 < y0 || h + 1 >= y0 + N) continue;
           if (World::PondNearColumn(wx, wz, kDefaultSeed).inDisc) continue;
           st.sites++;
           {   // the readback band must reach the site's trunk cell too

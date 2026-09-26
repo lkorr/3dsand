@@ -95,10 +95,10 @@ enum : uint32_t {
   // keeps the selftest fixtures' ground clear of trees, tarns and cover. It
   // replaced the spawn clearing / fixture pads / pond keep-out literals in
   // P2b; P5's site table generalises it. i32 in u32 words.
-  kHHarnessX0 = 22,
-  kHHarnessZ0 = 23,
-  kHHarnessX1 = 24,
-  kHHarnessZ1 = 25,
+  kHPadX0 = 22,
+  kHPadZ0 = 23,
+  kHPadX1 = 24,
+  kHPadZ1 = 25,
   // The water preset table (P-E): one kWaterRecWords record per
   // assets/water/<name>.json, in the loader's (sorted file name) order, plus
   // the shore plant rows the records point into. kHMaxCoverH includes every
@@ -539,11 +539,11 @@ struct WorldMapData {
   int oceanFadeCells = 0;
   int warpAmpVox = 0;
   int oceanBiome = 0;                     // id of "ocean" in the set, or 0
-  // The harness pad box, world voxels, inclusive. From map.json sites[] with
-  // kind "pad"; a map without one gets an empty box (x1 < x0).
-  int harnessX0 = 0, harnessZ0 = 0, harnessX1 = -1, harnessZ1 = -1;
-  bool InHarness(int x, int z) const {
-    return x >= harnessX0 && x <= harnessX1 && z >= harnessZ0 && z <= harnessZ1;
+  // The calm pad box, world voxels, inclusive (worldgen.wgsl inPadBox). From
+  // map.json sites[] kind "pad"; a map without one gets an empty box (x1 < x0).
+  int padX0 = 0, padZ0 = 0, padX1 = -1, padZ1 = -1;
+  bool InPadBox(int x, int z) const {
+    return x >= padX0 && x <= padX1 && z >= padZ0 && z <= padZ1;
   }
   // The spawn site (kind "spawn"). `spawnAuthored` says the map named it;
   // otherwise these are the (140, 140) default and the loader said so.
@@ -638,5 +638,17 @@ void SetCurrentWorldMap(WorldMapData map);
  * (StampSite::padY), which runs it with the map being loaded installed.
  */
 int BareGroundHeight(int x, int z, uint32_t seed);
+
+/**
+ * WHICH MAP A RUN LOADS. `SANDVOX_MAP=<name>` in the environment wins (an
+ * explicit request: "show me the harness ground in the game"), then the
+ * process override (SetMapOverride; main.cpp sets it to the harness map for
+ * --selftest / --verify / --suite / --vk-smoke / the fluid benches / --shot, so
+ * no gate depends on the shipped map), then `tuned` -- world.mapLayer, the
+ * game's map. Every loader (boot, F7 / ReloadEnvironment, vk_smoke, the save
+ * fingerprint) asks here rather than reading world.mapLayer directly.
+ */
+std::string ActiveMapName(const std::string& tuned);
+void SetMapOverride(const std::string& name);
 
 }  // namespace worldmap

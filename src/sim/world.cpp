@@ -1209,13 +1209,13 @@ uint32_t World::MapBiomeAt(int x, int z, uint32_t seed) {
   return m.BiomeCell(cx, cz);
 }
 
-// The harness pad box (worldgen.wgsl inHarness): the one authored site until
-// P5's site table. Outside the mirror on both sides; the mirrored pondInfo
-// calls it by the same name.
-static bool inHarness(int x, int z) {
-  return worldmap::CurrentWorldMap().InHarness(x, z);
+// The map's calm pad box (worldgen.wgsl inPadBox; map.json kind "pad", which
+// only the selftest map `harness` authors). Outside the mirror on both sides;
+// siteKeepOut below calls it by the same name.
+static bool inPadBox(int x, int z) {
+  return worldmap::CurrentWorldMap().InPadBox(x, z);
 }
-bool World::InHarness(int x, int z) { return inHarness(x, z); }
+bool World::InPadBox(int x, int z) { return inPadBox(x, z); }
 
 // ---- the site table, on the CPU (worldgen.wgsl wmSiteAt / wmSiteI) --------
 // Same names as the shader so the mirrored sitePadAt below reads the same.
@@ -1251,7 +1251,7 @@ static int wmSiteI(uint32_t sid, uint32_t w) {
 // A water site (P-F) keeps out by its DISC plus its shore/berm band, not by
 // its cells; every other kind keeps its cells. Same test as the shader's.
 static bool siteKeepOut(int x, int z) {
-  if (inHarness(x, z)) { return true; }
+  if (inPadBox(x, z)) { return true; }
   const uint32_t sid = wmSiteAt(x, z);
   if (sid == 0u) { return false; }
   if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return true; }
@@ -1348,8 +1348,8 @@ struct IV2 {
 };
 static IV2 iv2(int a, int b) { IV2 v; v.x = a; v.y = b; return v; }
 
-// The spawn site and the harness box's edge distance (worldgen.wgsl
-// spawnCentre / harnessOutside): the two centres of the calm home area in
+// The spawn site and the pad box's edge distance (worldgen.wgsl
+// spawnCentre / padOutside): the two centres of the calm home area in
 // the mirrored landAt below. Outside the mirror on both sides; the mirrored
 // code calls them by name, and the `terrain` gate's C1 is the per-voxel
 // proof they read the same numbers. An empty box (x1 < x0) is "far", which
@@ -1358,11 +1358,11 @@ static IV2 spawnCentre() {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   return iv2(m.spawnX, m.spawnZ);
 }
-static int harnessOutside(int x, int z) {
+static int padOutside(int x, int z) {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  if (m.harnessX1 < m.harnessX0) return 1073741824;
-  return std::max(std::max(std::max(m.harnessX0 - x, x - m.harnessX1),
-                           std::max(m.harnessZ0 - z, z - m.harnessZ1)), 0);
+  if (m.padX1 < m.padX0) return 1073741824;
+  return std::max(std::max(std::max(m.padX0 - x, x - m.padX1),
+                           std::max(m.padZ0 - z, z - m.padZ1)), 0);
 }
 
 // ---- the map's terrain, on the CPU (worldgen.wgsl wmTerrain / wmTerrainU; P-G) ----
@@ -1648,7 +1648,7 @@ static Land landAt(int x, int z, uint32_t seed) {
   if (d < fade) {
     w = (std::max(d, 0) * 16384) / fade;
   }
-  int dh = harnessOutside(x, z);
+  int dh = padOutside(x, z);
   int wh = 16384;
   if (dh < fade) {
     wh = (dh * 16384) / fade;
@@ -1985,8 +1985,8 @@ static int sitePadY(uint32_t sid) {
 // per-voxel loop; the GPU has genColumn for that and it is hoisted per column.
 //
 // The ground BEFORE the ruin pad, which is what a pad's corner samples want.
-// Mirrors landColumnBare in worldgen.wgsl; `wet` is the shader's
-// `pw.y >= 0 || inRim`, the pair of facts ruinPad refuses a site on.
+// Mirrors landColumnBare in worldgen.wgsl; `wet` is "under a bowl or the
+// sea", the facts ruinPad refuses a site on.
 struct BareCol {
   int h;
   bool wet;
@@ -1994,53 +1994,37 @@ struct BareCol {
 static BareCol landColumnBare(int x, int z, uint32_t seed) {
   const Land land = landAt(x, z, seed);
   const int bed = land.h - land.sed;
-  // Authored origin-area set pieces, at their absolute world coordinates.
-  // Sizes scale with the voxel, centres do not; the pool FLOOR is relative to
-  // the home plain rather than an absolute Y. See the notes over the same block
-  // in landColumn (worldgen.wgsl), including what the bare literal did once the
-  // datum moved. The disc tests come first because the SEDIMENT decision needs
-  // them and the wedge lives inside `h`.
-  const int poolY = wmTerrain(WM_H_TERRAIN_HOME_Y) - vlen(15);
-  int pdx = x - 420; int pdz = z - 420;
-  int pd2 = pdx * pdx + pdz * pdz;
-  int pR = vlen(68); int pRim = vlen(80);
-  const bool inRim = pd2 < pRim * pRim;
-
+  // The disc tests come first because the SEDIMENT decision needs them and
+  // the wedge lives inside `h`.
   const PondSet s = pondScan(x, z, seed);
   const Pond pc = pondCover(s, x, z, seed);
   IV2 pw = bowlAt(pc, x, z);
   Shore near;
   near.onShore = false; near.past = 0; near.surf = -1; near.wp = 0u;
-  if (pw.y < 0 && !inRim) { near = pondNear(s, x, z, seed); }
+  if (pw.y < 0) { near = pondNear(s, x, z, seed); }
 
   // The wedge, ramped out across a tarn's bank rather than switched off at its
   // edge — a hard switch is a cliff of loose gravel over a bowl of sand. The
   // band is the near pond's preset's (P-F).
   int sed = land.sed;
-  if (inRim || pw.y >= 0) {
+  if (pw.y >= 0) {
     sed = 0;
   } else if (near.onShore) {
     const int band = std::max(wmWaterI(near.wp, WM_W_BAND), 1);
     sed = (sed * std::min(near.past, band)) / band;
   }
   int h = bed + sed;
-
-  if (pd2 < pR * pR) {
-    h = poolY;
-  } else if (pd2 < pRim * pRim) {
-    h = std::max(h, poolY + vlen(26));
-  }
   // Disc ponds: the bowl REPLACES the ground inside (see the block over the
   // same line in landColumn — as a min() the bed was raw hillside wherever the
   // terrain undercut the bowl, and genCellIn lays sand on it), berm outside.
   if (pw.y >= 0) {
     h = pw.x;
-  } else if (!inRim && near.onShore && near.past < wmWaterI(near.wp, WM_W_BERM_W)) {
+  } else if (near.onShore && near.past < wmWaterI(near.wp, WM_W_BERM_W)) {
     h = bermLift(near.wp, h, near.surf, near.past);
   }
   BareCol b;
   b.h = h;
-  b.wet = (pw.y >= 0 || inRim || h < seaLevelY());
+  b.wet = (pw.y >= 0 || h < seaLevelY());
   return b;
 }
 
@@ -2077,8 +2061,8 @@ int worldmap::BareGroundHeight(int x, int z, uint32_t seed) {
 
 // The map probe (world.h Column). Composed from the SAME functions the height
 // contract is built out of rather than re-deriving anything — `landAt` for the
-// wedge and the landform gradient, `TerrainHeight` for the ground, the authored
-// pool discs and `pondAt` for standing water. A separate implementation here
+// wedge and the landform gradient, `TerrainHeight` for the ground, and the
+// covering pond (rolled or an authored water site) for standing water. A separate implementation here
 // would be the fourth copy of the terrain, and the deleted `surfHeightAt` is
 // the file's own evidence for how that ends.
 World::Column World::TerrainColumn(int x, int z, uint32_t seed) {
@@ -2091,14 +2075,9 @@ World::Column World::TerrainColumn(int x, int z, uint32_t seed) {
   // The wedge as it SURVIVED the overrides, not as landAt proposed it: a
   // bermed or bowl-carved column reports bare ground, which is what genCellIn
   // will actually lay there.
-  const int poolY = wmTerrain(WM_H_TERRAIN_HOME_Y) - vlen(15);
-  const int pdx = x - 420, pdz = z - 420, pd2 = pdx * pdx + pdz * pdz;
-  const int pR = vlen(68), pRim = vlen(80);
-  const bool inRim = pd2 < pRim * pRim;
   const IV2 pw = bowlAt(pondCover(pondScan(x, z, seed), x, z, seed), x, z);
-  c.sed = (inRim || pw.y >= 0) ? 0 : l.sed;
-  if (pd2 < pR * pR) c.water = poolY + vlen(24);          // the harness tarn
-  else if (pw.y >= 0) c.water = pw.y;                     // a tarn
+  c.sed = (pw.y >= 0) ? 0 : l.sed;
+  if (pw.y >= 0) c.water = pw.y;                          // a tarn or lake
   else if (c.h < seaLevelY()) c.water = seaLevelY();      // the sea (P4)
   return c;
 }
@@ -2110,9 +2089,6 @@ World::PondQuery World::PondNearColumn(int x, int z, uint32_t seed) {
   PondQuery q{};
   q.surf = -1;
   if (sLabWorld) return q;
-  const int pdx = x - 420, pdz = z - 420;
-  const int pRim = vlen(80);
-  const bool inRim = pdx * pdx + pdz * pdz < pRim * pRim;
   const PondSet s = pondScan(x, z, seed);
   const Pond pc = pondCover(s, x, z, seed);
   const IV2 pw = bowlAt(pc, x, z);
@@ -2125,7 +2101,6 @@ World::PondQuery World::PondNearColumn(int x, int z, uint32_t seed) {
     q.band = wmWaterI(pc.wp, WM_W_BAND);
     return q;
   }
-  if (inRim) return q;
   const Shore near = pondNear(s, x, z, seed);
   q.near = near.onShore;
   q.past = near.past;
@@ -2158,7 +2133,7 @@ static World::PondDisc DiscOf(const Pond& p) {
   return d;
 }
 
-// ---- the basin registry's source (world.h PondDisc / AuthoredPool) ---------
+// ---- the basin registry's source (world.h PondDisc) --------------------------
 //
 // Thin publishers, on purpose. Every literal and every gate below already
 // exists above — `pondInfo` inside the token-compared MIRROR block, the pool
@@ -2183,6 +2158,15 @@ int World::WaterSiteCount() {
   for (const worldmap::WorldMapData::StampSite& s : worldmap::CurrentWorldMap().sites)
     if (s.kind == worldmap::kSiteWater) n++;
   return n;
+}
+int World::WaterSiteIndex(const std::string& id) {
+  int n = 0;
+  for (const worldmap::WorldMapData::StampSite& s : worldmap::CurrentWorldMap().sites) {
+    if (s.kind != worldmap::kSiteWater) continue;
+    if (s.id == id) return n;
+    n++;
+  }
+  return -1;
 }
 World::PondDisc World::WaterSiteDisc(int index, uint32_t seed) {
   if (sLabWorld) return PondDisc{};
@@ -2211,17 +2195,6 @@ int World::PondReachMax() {
   for (const worldmap::WorldMapData::StampSite& s : m.sites)
     if (s.kind == worldmap::kSiteWater) reach = std::max(reach, s.radius + s.padMargin);
   return reach + 4;
-}
-
-void World::AuthoredPoolList(AuthoredPool out[kAuthoredPools]) {
-  // The one disc TerrainHeight overrides `h` for (the harness tarn the
-  // waterbody gate reads as Basin(1)), with the same vlen()-scaled radii and
-  // the same poolY datum. Water occupies (floorY, waterY], which is
-  // genCellIn's `fluidTop >= 0 && y <= fluidTop` branch taken after the
-  // `y <= h` terrain branch has already claimed the floor.
-  const int poolY = wmTerrain(WM_H_TERRAIN_HOME_Y) - vlen(15);
-  out[0] = {420, 420, vlen(68), poolY,            poolY + vlen(24),
-            poolY + vlen(26), "water"};
 }
 
 // ---- MPM fluid render bounds (RenderParams::fluidLo/fluidHi) ---------------

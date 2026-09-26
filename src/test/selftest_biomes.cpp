@@ -144,45 +144,59 @@ Status GateWorldMap(Ctx& c, std::string& detail) {
 }
 
 // ---- spawn-site -----------------------------------------------------------
-// The map's kind "spawn" site is somewhere a player can start
+// The GAME's map's (world.mapLayer, not the harness map the gates run on)
+// kind "spawn" site is somewhere a player can start
 // (docs/PLAN_environment_truth.md P-C). Five claims, all CPU (the height
-// mirror and the loaded map), nothing left behind:
-//   A. the map AUTHORED a spawn (the loader's (140,140) default is the pad);
-//   B. it is outside the harness box, and on no stamp site's cells -- i.e.
+// mirror and that map), nothing left behind:
+//   A. the map AUTHORED a spawn (not the loader's (140,140) default);
+//   B. it is outside any pad box, and on no stamp site's cells -- i.e.
 //      siteKeepOut(spawn) is false, so trees, tarns and cover may grow there;
 //   C. the ground there is above the map's sea level;
 //   D. it is not under a tarn (World::PondNearColumn);
 //   E. the biome there is not the ocean.
-// The distance from the harness box and the calm-area residual
+// The distance from the pad box and the calm-area residual
 // (ground - spawnPlainY) are reported, not asserted: the crown reach that
 // decides how close the forest gets is the atlas's, and the residual is the
 // fine octaves plus the wedge by design.
 Status GateSpawnSite(Ctx& c, std::string& detail) {
   using sandvox::kDefaultSeed;
-  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  if (!m.Loaded()) {
-    detail = "no world map loaded (world.mapLayer = " + CurrentTuning().world.mapLayer + ")";
-    std::printf("spawn-site: FAIL (%s)\n", detail.c_str());
-    return Status::Fail;
-  }
+  // THE GAME'S MAP, not the loaded one. Gates generate the harness map
+  // (sim/worlddefaults.h); this gate validates the map a player starts on,
+  // world.mapLayer, so it loads that one and points the CPU twins at it for
+  // the duration (all its claims are CPU), then puts the harness map back.
+  const std::string gameMap = CurrentTuning().world.mapLayer;
   biomes::BiomeSet set;
   std::string log;
   const bool haveSet = biomes::LoadBiomeSet(sandvox::AssetDir(), c.mats, set, log);
+  worldmap::WorldMapData game;
+  if (!haveSet || !worldmap::LoadWorldMap(sandvox::AssetDir(), gameMap, set, c.mats.size(),
+                                          kDefaultSeed, game, log) || !game.Loaded()) {
+    detail = "the game's map '" + gameMap + "' did not load: " + log;
+    std::printf("spawn-site: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  const worldmap::WorldMapData loaded = worldmap::CurrentWorldMap();   // a COPY, restored below
+  worldmap::SetCurrentWorldMap(std::move(game));
+  struct Restore {
+    const worldmap::WorldMapData& m;
+    ~Restore() { worldmap::SetCurrentWorldMap(m); }
+  } restore{loaded};
+  const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
   const int sx = m.spawnX, sz = m.spawnZ;
   const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
   const World::PondQuery pq = World::PondNearColumn(sx, sz, kDefaultSeed);
-  const bool inBox = World::InHarness(sx, sz);
+  const bool inBox = World::InPadBox(sx, sz);
   int cx = 0, cz = 0;
   m.CellOf(sx, sz, &cx, &cz);
   const int siteCell = m.Inside(cx, cz) ? (int)m.SiteCell(cx, cz) : 0;
   const uint32_t b = World::MapBiomeAt(sx, sz, kDefaultSeed);
   const biomes::BiomeDef* def = haveSet ? biomes::BiomeById(set, (int)b) : nullptr;
   const std::string bname = def ? def->name : ("id " + std::to_string(b));
-  const int boxDist = std::max(std::max(std::max(m.harnessX0 - sx, sx - m.harnessX1),
-                                        std::max(m.harnessZ0 - sz, sz - m.harnessZ1)), 0);
+  const int boxDist = std::max(std::max(std::max(m.padX0 - sx, sx - m.padX1),
+                                        std::max(m.padZ0 - sz, sz - m.padZ1)), 0);
   std::string why;
   if (!m.spawnAuthored) why += "; map.json sites[] has no kind \"spawn\" (loader defaulted)";
-  if (inBox) why += "; inside the harness box";
+  if (inBox) why += "; inside the map's pad box";
   // A water site's cells are not a keep-out (its DISC + band is, P-F), so a
   // spawn on a lake's cells is fine as long as it is not under the water
   // (pq.inDisc, below) or on its wet fringe.
@@ -195,9 +209,9 @@ Status GateSpawnSite(Ctx& c, std::string& detail) {
   const bool ok = why.empty();
   char buf[320];
   std::snprintf(buf, sizeof buf,
-                "spawn (%d,%d) on %s: ground y%d (sea y%d, home y%d), %d vox past the harness box, "
+                "map '%s': spawn (%d,%d) on %s: ground y%d (sea y%d, home y%d), %d vox past the pad box, "
                 "site cell %d, tarn %s%s",
-                sx, sz, bname.c_str(), h, m.seaLevelY, worldmap::CurrentTerrain().homeY,
+                m.name.c_str(), sx, sz, bname.c_str(), h, m.seaLevelY, worldmap::CurrentTerrain().homeY,
                 boxDist, siteCell, pq.inDisc ? "YES" : (pq.near ? "near" : "no"), why.c_str());
   detail = buf;
   std::printf("spawn-site: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());

@@ -215,14 +215,16 @@ console.log('\n-- swatch --');
 }
 
 /* ---- 6. the world map ---------------------------------------------------------- */
-// assets/worldmap/default is what the engine boots on; the World map page
-// reads and writes the same two files. Pure checks: the planes parse, agree
-// with map.json, name only biomes that have files, and the harness pad is a
-// box. src/sim/worldmap.h is the authority for the format.
+// assets/worldmap/default is what the game boots on and assets/worldmap/harness
+// is what every gate generates (sim/worlddefaults.h); the World map page reads
+// and writes the same two files per map. Pure checks: the planes parse, agree
+// with map.json, name only biomes that have files; the harness map's pad box
+// covers the fixture columns and its fixture lake, and the shipped map carries
+// no pad at all. src/sim/worldmap.h is the authority for the format.
 console.log('\n-- world map --');
-{
-  const MAP = join(ROOT, 'assets', 'worldmap', 'default');
-  ok(existsSync(join(MAP, 'map.json')) && existsSync(join(MAP, 'map.svmap')), 'assets/worldmap/default has map.json + map.svmap');
+for (const mapName of ['default', 'harness']) {
+  const MAP = join(ROOT, 'assets', 'worldmap', mapName);
+  ok(existsSync(join(MAP, 'map.json')) && existsSync(join(MAP, 'map.svmap')), `assets/worldmap/${mapName} has map.json + map.svmap`);
   if (existsSync(join(MAP, 'map.json')) && existsSync(join(MAP, 'map.svmap'))) {
     const j = readJson(join(MAP, 'map.json'));
     const raw = readFileSync(join(MAP, 'map.svmap'));
@@ -238,8 +240,15 @@ console.log('\n-- world map --');
     ok(maxIdx < j.biomes.length, `biome plane indices < palette size (${maxIdx} < ${j.biomes.length})`);
     ok(j.warpAmpVox >= 0 && j.warpAmpVox <= (1 << j.cellLog2) / 4, `warpAmpVox ${j.warpAmpVox} <= cell/4`);
     const pad = (j.sites || []).find(s => s.kind === 'pad');
-    ok(!!pad && pad.min[0] <= pad.max[0] && pad.min[1] <= pad.max[1], 'a harness pad box exists and is a box');
-    ok(!!pad && pad.min[0] <= 60 && pad.max[0] >= 420 && pad.min[1] <= 60 && pad.max[1] >= 420, 'the pad covers the fixture columns and the (420,420) tarn');
+    if (mapName === 'harness') {
+      ok(!!pad && pad.min[0] <= pad.max[0] && pad.min[1] <= pad.max[1], 'harness: a pad box exists and is a box');
+      ok(!!pad && pad.min[0] <= 60 && pad.max[0] >= 420 && pad.min[1] <= 60 && pad.max[1] >= 420, 'harness: the pad covers the fixture columns and the (420,420) lake');
+      const lake = (j.sites || []).find(s => s.id === 'harness_lake');
+      ok(!!lake && lake.kind === 'water' && lake.at[0] === 420 && lake.at[1] === 420 &&
+         existsSync(join(ROOT, 'assets', 'water', lake.preset + '.json')), 'harness: water site harness_lake at (420,420) with an existing preset');
+    } else {
+      ok(!pad, `${mapName}: no pad box (the harness pad lives on the harness map)`);
+    }
     // stamp sites and rules (P5): every template named must exist as a .vox,
     // because the engine refuses to start otherwise.
     const prefabs = new Set(existsSync(join(ROOT, 'assets', 'prefabs')) ? readdirSync(join(ROOT, 'assets', 'prefabs')).filter(f => f.endsWith('.vox')).map(f => f.slice(0, -4)) : []);
