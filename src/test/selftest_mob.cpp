@@ -2753,12 +2753,11 @@ bool mobOk = false;
         mobOk = mobOk && faceOk;
 
         // ---- swing aim policy (ResolveSwingYaw / ResolveSwingBasis) ----
-        // The sword's copy of the neck rule. Same shape as the head-look
-        // assertions above: inside the cone the camera is the basis; past it
-        // the offset pins at the cone; across the rear band it releases to
-        // the body's forward from BOTH signs, so the +180/-180 wrap is
-        // seamless. Pure, so it is driven directly. Tuned values: melee.aimYaw
-        // 70, aimReleaseYaw 50 (band begins at 130).
+        // Inside the cone the camera is the basis; a look behind is reflected
+        // to the front across the body's left-right axis (side kept), then
+        // pinned at the cone; both signs reach 0 at straight-behind, so the
+        // +180/-180 wrap is seamless. Pure, so it is driven directly. Tuned
+        // value: melee.aimYaw 70.
         {
           const float kRad = 1.0f / 57.29578f;
           const float swIn = degOf(ResolveSwingYaw(30.0f * kRad));
@@ -2767,15 +2766,15 @@ bool mobOk = false;
           const float swNegPin = degOf(ResolveSwingYaw(-100.0f * kRad));
           const float swBehind = degOf(ResolveSwingYaw(179.0f * kRad));
           const float swBehindNeg = degOf(ResolveSwingYaw(-179.0f * kRad));
-          // 200 deg unwrapped must read as -160, on the far side of the band.
+          // 200 deg unwrapped must read as -160, reflected to -20.
           const float swUnwrapped = degOf(ResolveSwingYaw(200.0f * kRad));
           const bool yawOk = std::fabs(swIn - 30.0f) < 0.05f &&
                              std::fabs(swPin - 70.0f) < 0.05f &&
-                             std::fabs(swEdge - 70.0f) < 0.05f &&
+                             std::fabs(swEdge - 55.0f) < 0.05f &&
                              std::fabs(swNegPin + 70.0f) < 0.05f &&
-                             std::fabs(swBehind) < 1.0f &&
-                             std::fabs(swBehindNeg) < 1.0f &&
-                             swUnwrapped < -20.0f && swUnwrapped > -70.05f;
+                             std::fabs(swBehind - 1.0f) < 0.05f &&
+                             std::fabs(swBehindNeg + 1.0f) < 0.05f &&
+                             std::fabs(swUnwrapped + 20.0f) < 0.05f;
 
           // The basis: a pitched camera 100 deg round from the body. The
           // output must face body+70 in yaw, keep the camera's pitch exactly,
@@ -2812,7 +2811,7 @@ bool mobOk = false;
           const bool swingOk = yawOk && basisOk;
           std::printf(
               "avatar swing cone: %s (yaw 30 -> %+.1f, 100 -> %+.1f, 125 -> "
-              "%+.1f, -100 -> %+.1f pinned; rear release 179 -> %+.1f, -179 "
+              "%+.1f reflected, -100 -> %+.1f pinned; reflected 179 -> %+.1f, -179 "
               "-> %+.1f, 200 unwrapped -> %+.1f; basis 100 deg round: faces "
               "body+70 err %.2f deg, pitch err %.1e, ortho err %.1e, "
               "in-cone identity %s)\n",

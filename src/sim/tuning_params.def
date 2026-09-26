@@ -1878,12 +1878,9 @@ TP_F(melee, blockItemDamage, NO_WGSL, 0.35f, 0.0f, 1.0f)
 TP_F(melee, blockNudgeAz, NO_WGSL, 0.30f, 0.0f, 1.0f)
 TP_F(melee, blockNudgeEl, NO_WGSL, 0.18f, 0.0f, 1.0f)
 TP_F(melee, pickMinSpeed, NO_WGSL, 250.0f, 1.0f, 1500.0f)
-// 180 is meaningful: the swing follows the camera wherever it looks (the
-// pre-cone behaviour). 0 pins every swing to the body's facing.
-// + a hand-written rule in LoadTuning
-TP_F(melee, aimYaw, NO_WGSL, 70.0f, 0.0f, 180.0f)
-// + a hand-written rule in LoadTuning
-TP_F(melee, aimReleaseYaw, NO_WGSL, 50.0f, 0.0f, 110.0f)
+// Capped at 90: past it a look is reflected to the front (ResolveSwingYaw),
+// so a wider cone could never be reached. 0 pins every swing to the body.
+TP_F(melee, aimYaw, NO_WGSL, 70.0f, 0.0f, 90.0f)
 TP_F(melee, torsoShare, NO_WGSL, 0.35f, 0.0f, 1.0f)
 TP_F(melee, torsoPitch, NO_WGSL, 0.20f, 0.0f, 1.0f)
 TP_F(melee, headClearM, NO_WGSL, 0.06f, 0.0f, 0.5f)

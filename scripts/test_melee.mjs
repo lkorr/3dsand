@@ -586,7 +586,7 @@ section('the cut path (strokes.h "A CUT IS A PATH")');
     // by design: the controller's switches and the swing-basis cone (main.cpp
     // ResolveSwingBasis), read off the tuning document, never by the driver
     if (k === 'pickMinSpeed' ||
-        k === 'aimYaw' || k === 'aimReleaseYaw') return false;
+        k === 'aimYaw') return false;
     const base = k.replace(/(M|Mps)$/, '');
     return !(base in t);
   });

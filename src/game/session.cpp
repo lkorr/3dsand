@@ -2289,18 +2289,30 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
         // submits the kinematic limb targets — a weapon pose pushed in after
         // it would be a frame late and the blade would trail the mouse.
         {
-          // THE BASIS THE STROKE IS EXPRESSED IN is the camera's, yawed back
-          // toward the body by the neck's own law (melee.aimYaw /
-          // aimReleaseYaw; game/thirdperson.h ResolveSwingBasis). Without
+          // THE CAMERA, FOLDED ONTO THE BODY: yawed so a look behind is
+          // reflected to the front and a look past the cone pins at its edge
+          // (melee.aimYaw; game/thirdperson.h ResolveSwingBasis). Without
           // this, a third-person camera orbited behind the character made
           // every strike cut backwards at the lens. Resolved once per tick
-          // off the heading the policy above just produced, so the swing and
-          // the head agree about where "behind" is. No body (fly mode): the
-          // raw camera, as before.
+          // off the heading the policy above just produced. No body (fly
+          // mode): the raw camera, as before. `swFwd` is also the AIM RAY a
+          // strike program casts (below).
           Vec3 swRight = cam.Right(), swUp = cam.Up(), swFwd = cam.Forward();
           if (avatar.Spawned())
             ResolveSwingBasis(camHeading, avatarHeading, cam.Right(), cam.Up(),
                               cam.Forward(), swRight, swUp, swFwd);
+          // THE BASIS A STROKE PROGRAM IS EXPRESSED IN is the BODY's, level —
+          // the NPC's (mob.cpp StepStroke's basis), not the camera's. A keyed
+          // pose turns the shoulder by the aim's yaw/pitch in the CHEST's
+          // frame (Mob ApplyKeyedArm `aimed`), so the aim angles must be
+          // measured from the body too. Measured in the pitched camera basis
+          // the crosshair always sat at elevation ~0 — looking up or down
+          // changed nothing — and azimuth was only right while the body
+          // happened to face the camera.
+          const Vec3 bodyFwd{std::sin(avatarHeading), 0.0f,
+                             std::cos(avatarHeading)};
+          const Vec3 bodyUp{0.0f, 1.0f, 0.0f};
+          const Vec3 bodyRight = bodyFwd.cross(bodyUp).normalized();
           if (avatar.Spawned()) {
             // Equip/unequip only on a CHANGE. EquipItem builds a body and a
             // joint, so calling it every tick with the same weapon would
@@ -2455,7 +2467,12 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                     // 3x3x3 window for the voxel half (world.h KindAt).
                     constexpr float kAimRange = 40.0f;
                     const Vec3 eye = player.EyePos();
-                    const Vec3 look = cam.Forward();
+                    // The FOLDED camera line: identical to cam.Forward()
+                    // inside the cone (ResolveSwingBasis returns it
+                    // bit-for-bit), reflected to the front when the camera
+                    // looks at the character's face. Pitch is the camera's
+                    // either way.
+                    const Vec3 look = swFwd;
                     float hitDist = kAimRange;
                     strikeIgnore.clear();
                     avatar.AppendLiveLimbBodies(strikeIgnore);
@@ -2475,13 +2492,13 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                         break;
                       }
                     }
-                    StrokeAimAt(pivot, eye + look * hitDist, swRight, swUp,
-                                swFwd, aimAz, aimEl, aimDist);
+                    StrokeAimAt(pivot, eye + look * hitDist, bodyRight,
+                                bodyUp, bodyFwd, aimAz, aimEl, aimDist);
                   }
                 }
                 const StrokeStepResult r = StepStrokeProgram(
                     playerStrike, sty, melee, aimAz, aimEl, aimDist, kTickDt,
-                    swRight, swUp, swFwd);
+                    bodyRight, bodyUp, bodyFwd);
                 stepped = r != StrokeStepResult::Idle;
                 strikeCutEdge = playerStrike.Cutting() && !wasCutting;
                 if (r == StrokeStepResult::Finished) {
@@ -2505,7 +2522,10 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               // No program stepped the driver this tick: it idles/unwinds
               // exactly as a released button always did, so the arm hands
               // back over the usual ramp. ONE advance per tick either way.
-              melee.Update(kTickDt, false, meleeReady, swRight, swUp, swFwd);
+              // The body basis, like the program's: a recover the program
+              // began in it must unwind in it, not jump into the camera's.
+              melee.Update(kTickDt, false, meleeReady, bodyRight, bodyUp,
+                           bodyFwd);
             }
           }
           // ---- THE SWING WHOOSH, on the EDGE into the program's cut --------
