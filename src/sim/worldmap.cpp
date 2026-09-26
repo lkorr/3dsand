@@ -785,6 +785,15 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   }
   auto geti = [&](const char* k, int d) { return j.contains(k) && j[k].is_number() ? j[k].get<int>() : d; };
   out.name = name;
+  // P7: the edit layer is the map's (was tuning.json world.editLayer). A bare
+  // name: worldedit.cpp joins it under assets/worldedits/.
+  if (j.contains("editLayer") && j["editLayer"].is_string()) {
+    out.editLayer = j["editLayer"].get<std::string>();
+    if (out.editLayer.find_first_of("/\\:.") != std::string::npos) {
+      log += at + "editLayer must be a bare layer name; ignored\n";
+      out.editLayer.clear();
+    }
+  }
   // ---- terrain (P-G): the numbers that used to be worldgen.* --------------------
   // Every length is authored at `refVoxelsPerMetre` voxels to the metre and
   // rescaled to world.h's kVoxelsPerMetre here, exactly as LoadTuning used

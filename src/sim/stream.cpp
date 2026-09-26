@@ -1074,14 +1074,16 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
     // un-does a crater (see faredits.h). Re-queue every refilled chunk the
     // layer touches; the ops go out through the MutationQueue on the following
     // ticks. Cheap when there is no layer — QueueChunk returns on an empty map
-    // before it hashes anything.
+    // before it hashes anything. ONLY the generated slots: a slot FillSlots
+    // decoded from the store already holds whatever the layer became there,
+    // and re-stamping it would undo the player's edits of it.
     //
     // Stays at tick T under the deferred wake: the ops are CPU mutations that
     // travel the MutationQueue and target chunks by WORLD coordinate, so they
     // are unaffected by whether the CA has been told about the plane yet.
     if (!sandvox::WorldEditLayer().Empty())
       for (uint32_t gs : genSlots)
-        sandvox::WorldEditLayer().QueueChunk(world_->SlotToWorldChunk(gs));
+        sandvox::WorldEditLayer().QueueChunk(world_->SlotToWorldChunk(gs), seed_);
     timing_.fillGenMs += PtNowMs() - fT1;
 
     // ---- THE READBACK, AND WHY IT NO LONGER WAITS ------------------------
@@ -1668,9 +1670,31 @@ void Stream::HarvestDemotes(uint32_t tick) {
 void Stream::FoldSnapshot() {
   const WorldSnapshot& snap = world_->Snap();
   if (!snap.valid) return;
-  // The fold itself is unconditional and unchanged: eviction reads modified_,
-  // so what goes in here must stay a pure function of the published snapshot.
-  for (uint32_t i = 0; i < kNumSlots; i++) modified_[i] |= snap.dirtyFlags[i];
+  // The fold itself is unconditional: eviction reads modified_, so what goes
+  // in here must stay a pure function of the published snapshot (and of the
+  // edit layer's op record for that same submit, below).
+  //
+  // THE EDIT LAYER IS WORLDGEN (sim/worldedit.h, map-overhaul P7). Its ops
+  // wake the chunks they land in, and a wake is a dirty report. Where the
+  // layer's ops landed on this snapshot's submit and the ONLY reason the chunk
+  // reported was DIRTY_R_MUTATE, the report is the layer's own and is not a
+  // modification: genChunk + the layer re-derive that chunk on re-entry. Any
+  // CA consequence (a grain that falls, a stain that spreads) sets its own
+  // reason bit on its own tick and is folded like every other.
+  if (const std::vector<uint32_t>* lay =
+          sandvox::WorldEditLayer().AppliedSlotsAt(snap.submitSeq)) {
+    for (uint32_t i = 0; i < kNumSlots; i++) {
+      if (!snap.dirtyFlags[i]) continue;
+      if (snap.dirtyFlags[i] == World::kDirtyMutateOnly &&
+          std::binary_search(lay->begin(), lay->end(), i)) {
+        layerWakesIgnored_++;
+        continue;
+      }
+      modified_[i] |= snap.dirtyFlags[i];
+    }
+  } else {
+    for (uint32_t i = 0; i < kNumSlots; i++) modified_[i] |= snap.dirtyFlags[i];
+  }
   if (!trackOk_) return;
   const uint32_t ep = world_->SnapshotEpoch();
   if (!trackEpochKnown_) {
@@ -1751,8 +1775,14 @@ bool Stream::BuildSaveMask(std::vector<uint8_t>& mask, FlushReport& rep) {
       rep.why = buf;
       return false;
     }
+    // The same edit-layer exemption FoldSnapshot makes (see there).
+    const std::vector<uint32_t>* lay =
+        sandvox::WorldEditLayer().AppliedSlotsAt(sn.submitSeq);
     for (uint32_t i = 0; i < kNumSlots; i++) {
       if (sn.dirtyFlags[i] && !mask[i]) {
+        if (lay && sn.dirtyFlags[i] == World::kDirtyMutateOnly &&
+            std::binary_search(lay->begin(), lay->end(), i))
+          continue;
         mask[i] = 1;
         rep.tailOnly++;
       }

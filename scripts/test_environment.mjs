@@ -4,7 +4,7 @@
  * they read) and the one mirror between them:
  *
  *   1. DETERMINISM. Same preset + same seed -> byte-identical cells, for the
- *      water body and for the composed swatch. Without it a preview is a
+ *      water body. (The biome swatch is the engine's since P7.) Without it a preview is a
  *      screenshot, not a tool, and the day the engine reads these files a
  *      re-bake would move the world hash for no nameable reason.
  *   2. PRESET SANITY. Every shipped water preset generates, holds water (or is
@@ -159,59 +159,16 @@ for (const sp of speciesNames) {
 }
 
 /* ---- 5. the swatch --------------------------------------------------------------- */
-console.log('\n-- swatch --');
+// The biome page's swatch is the ENGINE's since map-overhaul P7 (voxserve
+// SWATCH: a synthetic one-biome map through genChunk), so there is no JS
+// composer left to hold to determinism here -- the engine's is the `determinism`
+// gate's. What stays pure and nominal is the rarity arithmetic.
+console.log('\n-- swatch (nominal rarity) --');
 {
-  const lib = {water: {}, trees: {}};
-  for (const n of presetNames) lib.water[n] = readJson(join(WATER, n + '.json'));
-  for (const n of speciesNames) lib.trees[n] = readJson(join(TREES, n + '.json'));
-  const cache = new Map();
-  const meadow = biomes.find(b => b.name === 'meadow') || biomes[0];
-  const a = BG.generateSwatch(meadow, lib, 5, {treeCache: cache, sizeM: 16, showcase: true});
-  const b = BG.generateSwatch(meadow, lib, 5, {treeCache: new Map(), sizeM: 16, showcase: true});
-  ok(fnv(a.cells) === fnv(b.cells), meadow.name + ' swatch seed 5 twice -> ' + fnv(a.cells) + ' (fresh tree cache)');
-  ok(a.meta.waterBodies >= 1, 'showcase composed ' + a.meta.waterBodies + ' water bod(ies): ' + JSON.stringify(a.meta.water));
-  ok(Object.keys(a.meta.cover).length > 0, 'ground cover placed: ' + Object.keys(a.meta.cover).length + ' kinds');
-  const forest = biomes.find(b => b.name === 'forest');
-  if (forest) {
-    const f = BG.generateSwatch(forest, lib, 7, {treeCache: cache, sizeM: 24, showcase: true});
-    ok(f.meta.treesPlaced > 0, 'forest 24 m swatch placed ' + f.meta.treesPlaced + ' trees: ' + JSON.stringify(f.meta.trees));
-    // Gating works: a species row demanding nearWaterMax 0.1 far from any water places nothing.
-    const g = BG.normalizeBiome(JSON.parse(JSON.stringify(forest)));
-    g.trees.species = [{species: 'oak', weight: 1, conditions: {nearWaterMax: 0.05}}];
-    g.water.features = [];
-    const h = BG.generateSwatch(g, lib, 7, {treeCache: cache, sizeM: 16, noWater: true});
-    ok(h.meta.treesPlaced === 0 && h.meta.skipped.trees > 0, 'a nearWater condition with no water gates every tree out (' + h.meta.skipped.trees + ' skipped)');
-  }
   const rs = BG.rarityStats(44.8, 4);
   ok(Math.abs(rs.pct - 25) < 1e-9 && Math.abs(rs.perKm2 - 124.6) < 0.1, 'rarity 1-in-4 of 44.8 m tiles = 25% = ' + rs.perKm2.toFixed(1) + ' per km2');
-
-  // The scale ladder: every offered size fits MAX_SWATCH at an integer vpm,
-  // the 1:1 sizes stay 1:1, and a big swatch composes at its coarser scale
-  // with the scale recorded on the result (the page draws it at lod = 10/vpm).
-  const ladder = BG.SWATCH_SIZES_M.map(m => m + 'm@' + BG.swatchScale(m, 10));
-  ok(BG.SWATCH_SIZES_M.every(m => Math.round(m * BG.swatchScale(m, 10)) <= BG.MAX_SWATCH &&
-                                  Number.isInteger(BG.swatchScale(m, 10))),
-     'swatch scale ladder: ' + ladder.join(' '));
-  ok(BG.swatchScale(24, 10) === 10 && BG.swatchScale(32, 10) === 10 && BG.swatchScale(96, 10) < 10,
-     'up to 32 m is 1:1, 96 m bakes coarser (' + BG.swatchScale(96, 10) + ' vpm)');
-  if (forest) {
-    const v = BG.swatchScale(96, 10);
-    const big = BG.generateSwatch(forest, lib, 7, {treeCache: cache, sizeM: 96, showcase: false, vpm: v});
-    ok(big.vpm === v && big.dim.x === Math.round(96 * v) && big.dim.x <= BG.MAX_SWATCH,
-       '96 m forest at ' + v + ' vpm -> ' + big.dim.x + 'x' + big.dim.y + 'x' + big.dim.z + ', ' + big.meta.treesPlaced + ' trees, ' + big.meta.waterBodies + ' bodies (true rarity)');
-    // remapToMaterials is in place, by name, and keeps the state nibble.
-    const before = big.cells.slice(), names = big.names.slice();
-    const ids = MATS.materials.map(m => m.id);
-    const missing = BG.remapToMaterials(big, ids);
-    let okRemap = big.remapped === true && missing.length === 0;
-    for (let i = 0; okRemap && i < before.length; i += 997) {
-      const w = before[i];
-      if (!w) { if (big.cells[i] !== 0) okRemap = false; continue; }
-      const want = (ids.indexOf(names[(w & 0xFFF) - 1]) + 1) | (w & 0xF000);
-      if (big.cells[i] !== want) okRemap = false;
-    }
-    ok(okRemap, 'remapToMaterials: in place, by name, state nibble kept, nothing missing');
-  }
+  ok(typeof BG.generateSwatch === 'undefined' && typeof BG.swatchScale === 'undefined',
+     'the JS swatch composer is gone (the swatch is the engine\'s, P7)');
 }
 
 /* ---- 6. the world map ---------------------------------------------------------- */

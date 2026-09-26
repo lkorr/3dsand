@@ -336,6 +336,9 @@ class Stream {
   // modified with no player input (docs/PLAN_save_system.md S2). Nothing
   // outside Stream may write it; every writer declares itself inside.
   const std::vector<uint8_t>& ModifiedFlags() const { return modified_; }
+  // MUTATE-only dirty reports the modified fold skipped because the edit
+  // layer's own ops caused them (FoldSnapshot, sim/worldedit.h). Diagnostic.
+  uint64_t LayerWakesIgnored() const { return layerWakesIgnored_; }
   size_t PendingEvictions() const { return pending_.size(); }
 
   // ---- WHERE A WINDOW SHIFT'S TIME GOES ------------------------------------
@@ -510,6 +513,7 @@ class Stream {
   FarPlumes farPlumes_;
   std::vector<uint8_t> blockerOf_;  // per material: stops a ray (occ high 16)
   std::vector<uint8_t> modified_;   // per slot, sticky since last recycle
+  uint64_t layerWakesIgnored_ = 0;  // see LayerWakesIgnored()
   // M9.3-C run counters. Not hashed, not saved: they exist so the --frames
   // net report can say "4 applied, 1 refused" instead of a chunk quietly not
   // arriving (CLAUDE.md rule 6).

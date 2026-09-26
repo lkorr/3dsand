@@ -4567,7 +4567,7 @@ struct Tuning {
     float shortRangeFogDensity = TPD(render, shortRangeFogDensity);
   } render;
 
-  // ---- world: which authored map and edit layer the game loads ---------------
+  // ---- world: which authored map the game loads -------------------------------
   // NOT the terrain. Every number that shapes the ground moved to the map
   // (assets/worldmap/<name>/map.json `terrain`) and to the biome files in
   // P-G of docs/PLAN_environment_truth.md; what is left here is which files.
@@ -4577,12 +4577,9 @@ struct Tuning {
     // optional -- "default" ships, and a missing or unparsable map ABORTS at
     // load rather than silently generating an all-ocean or all-forest world.
     std::string mapLayer = TPD(world, mapLayer);
-    // Names assets/worldedits/<editLayer>.svedit, the hand-built patch the
-    // World map page's voxel view writes. Applied through the MutationQueue
-    // to every chunk worldgen produces, so it survives streaming and composes
-    // with any seed. EMPTY BY DEFAULT, and no gate may set it: a layer moves
-    // the world hash by construction.
-    std::string editLayer = TPD(world, editLayer);
+    // (The edit layer used to be named here as world.editLayer. Since
+    // map-overhaul P7 the MAP names it — map.json `editLayer` — because a
+    // layer is authored against one map's ground. See sim/worldedit.h.)
   } world;
 
   // ---- debug: dev switches that are not world content ---------------------------

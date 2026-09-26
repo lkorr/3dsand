@@ -2262,7 +2262,10 @@ bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
   ctx.WaitIdle();
   worldmap::SetCurrentWorldMap(std::move(map));
   sim.UploadEnvironment(ctx.device, ctx.queue, trees, words);
-  stamp = biomes::StampEnvironment(assetDir, mapName, CurrentTuning().world.editLayer);
+  // The edit layer is the map's (P7): re-read it beside the map it belongs
+  // to. The caller's SubmitWorldgen queues it and re-seeds the far field.
+  LoadWorldEditLayerForMap(assetDir);
+  stamp = biomes::StampEnvironment(assetDir, mapName, worldmap::CurrentWorldMap().editLayer);
   return true;
 }
 

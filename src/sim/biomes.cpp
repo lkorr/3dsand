@@ -96,6 +96,12 @@ std::vector<fs::path> JsonFiles(const fs::path& dir) {
 
 bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& mats,
                   BiomeSet& out, std::string& log) {
+  return LoadBiomeSet(assetDir, mats, out, log, std::string(), std::string());
+}
+
+bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& mats,
+                  BiomeSet& out, std::string& log, const std::string& overrideStem,
+                  const std::string& overridePath) {
   out = BiomeSet{};
   std::unordered_map<std::string, uint32_t> byName;
   for (size_t i = 0; i < mats.size(); i++) byName[mats[i].name] = static_cast<uint32_t>(i);
@@ -107,7 +113,14 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
   bool ok = true;
 
   // ---- biomes ---------------------------------------------------------------
-  for (const fs::path& p : JsonFiles(fs::path(assetDir) / "biomes")) {
+  std::vector<fs::path> biomeFiles = JsonFiles(fs::path(assetDir) / "biomes");
+  if (!overrideStem.empty()) {
+    bool replaced = false;
+    for (fs::path& p : biomeFiles)
+      if (p.stem().string() == overrideStem) { p = overridePath; replaced = true; }
+    if (!replaced) biomeFiles.push_back(overridePath);
+  }
+  for (const fs::path& p : biomeFiles) {
     json j;
     if (!ReadJsonFile(p, j, log)) { ok = false; continue; }
     BiomeDef b;

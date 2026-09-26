@@ -1018,8 +1018,7 @@
     "starSparsity": 0.012
   },
   "world": {
-    "mapLayer": "default",
-    "editLayer": ""
+    "mapLayer": "default"
   },
   "debug": {
     "vegetation": 1,

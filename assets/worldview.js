@@ -54,9 +54,12 @@
  * EDITING. Brush strokes and selection operations write into an EDIT LAYER —
  * a sparse chunk-keyed map of world cell -> voxel word — never into the
  * generated data. The layer is the authored artifact: it saves to
- * assets/worldedits/<name>.svedit and the engine applies it after worldgen and
- * on every chunk stream-in, so an edit survives flying away and coming back and
- * composes with any seed. See src/sim/worldedit.h.
+ * assets/worldedits/<name>.svedit (stored GROUND-RELATIVE since map-overhaul
+ * P7, converted by the server) and the engine applies it as part of worldgen,
+ * at startup and on every chunk stream-in, so an edit survives flying away and
+ * coming back and follows the ground under it. The voxel server applies the
+ * saved layer to the regions it returns; this page composites only the
+ * strokes it has not saved yet. See src/sim/worldedit.h.
  *
  * Edits are only accepted inside level 0, where cells are 1:1 with world
  * voxels. A "brush" at lod 4 would have to invent 63 of every 64 voxels it
@@ -547,6 +550,10 @@
     };
 
     this.edit = new EditLayer();
+    // Which edit layer the voxel server applies to the regions it hands back
+    // (map-overhaul P7): '@map' = the one the map names (what the game spawns
+    // into), '-' = bare worldgen, or a layer name (the one being edited).
+    this.layerSel = '@map';
     this.tool = {
       name: 'none',               // none | brush | erase | box | picker | measure
       material: 1,
@@ -798,7 +805,8 @@
     var lod = 1 << w.level, ext = REGION_N * lod;
     var q = 'ox=' + (w.rx * ext) + '&oy=' + (w.ry * ext) + '&oz=' + (w.rz * ext) +
             '&nx=' + REGION_N + '&ny=' + REGION_N + '&nz=' + REGION_N +
-            '&lod=' + lod + '&seed=' + this.seed;
+            '&lod=' + lod + '&seed=' + this.seed +
+            '&layer=' + encodeURIComponent(this.layerSel || '@map');
     this.inflight++;
     var gen = this.gen;
     var t0 = performance.now();
@@ -843,9 +851,9 @@
         cells: m.cells, tex: null, op: null, fl: null, meshing: false,
         dirty: true, gen: this.gen, rev: 0
       };
-      // The edit layer is authored over the GENERATED world, so it has to be
-      // composited into a region the moment that region arrives — otherwise a
-      // fly-away-and-back would show the terrain the edit was meant to change.
+      // The SAVED layer is already in the region: the voxel server applies it
+      // (P7). What only this page knows is the UNSAVED strokes, so those are
+      // composited on arrival — otherwise a fly-away-and-back would lose them.
       this.edit.applyToRegion(r);
       this.regions.set(m.key, r);
       this._uploadTex(r);
@@ -1827,6 +1835,41 @@
     return n;
   };
 
+  // The selection as a MagicaVoxel .vox (P7): what `assets/prefabs/<name>.vox`
+  // holds, so a structure built here becomes a stamp the map page's site
+  // picker offers. The engine's prefab convention is palette index ==
+  // material id (src/sim/voxload.h), so only materials 1..255 fit; the rest
+  // are counted in `dropped`, never silently lost. .vox is Z-up and the engine
+  // Y-up: voxload.cpp maps a vox cell s to engine (s.x, s.z, -s.y), so engine
+  // (x, y, z) goes to vox (x, D-1-z, y). Returns null without a selection or
+  // when an axis exceeds the format's 256.
+  WorldView.prototype.selectionToVox = function () {
+    var b = this.selBox();
+    if (!b) return null;
+    var W = b[3] - b[0] + 1, H = b[4] - b[1] + 1, D = b[5] - b[2] + 1;
+    if (W > 256 || H > 256 || D > 256) return null;
+    var xyzi = [], dropped = 0, missing = 0;
+    for (var z = 0; z < D; z++) for (var y = 0; y < H; y++) for (var x = 0; x < W; x++) {
+      var v = this.cellAtWorld(b[0] + x, b[1] + y, b[2] + z, 0);
+      if (v < 0) { missing++; continue; }
+      var m = v & MAT_MASK;
+      if (!m) continue;
+      if (m > 255) { dropped++; continue; }
+      xyzi.push(x, D - 1 - z, y, m);
+    }
+    var n = xyzi.length / 4;
+    var sizeBytes = 12 + 12, xyziBytes = 12 + 4 + n * 4;
+    var buf = new ArrayBuffer(8 + 12 + sizeBytes + xyziBytes), d = new DataView(buf), p = 0;
+    function tag(s) { for (var i = 0; i < 4; i++) d.setUint8(p++, s.charCodeAt(i)); }
+    function u32(v) { d.setUint32(p, v >>> 0, true); p += 4; }
+    tag('VOX '); u32(150);
+    tag('MAIN'); u32(0); u32(sizeBytes + xyziBytes);
+    tag('SIZE'); u32(12); u32(0); u32(W); u32(D); u32(H);
+    tag('XYZI'); u32(4 + n * 4); u32(0); u32(n);
+    for (var i = 0; i < xyzi.length; i++) d.setUint8(p++, xyzi[i]);
+    return {buf: buf, voxels: n, dropped: dropped, missing: missing, size: [W, H, D]};
+  };
+
   // ===========================================================================
   // EditLayer — the authored patch over the generated world.
   // ===========================================================================
@@ -1837,6 +1880,10 @@
   // full for every chunk that streamed in.
   function EditLayer() {
     this.chunks = new Map();      // "cx,cy,cz" -> Map(localIdx -> word)
+    // Cells set since the last save or load, "x,y,z" -> word. The voxel
+    // server applies the SAVED layer to every region it returns (P7); these
+    // are the only cells a freshly arrived region can be missing.
+    this.unsaved = new Map();
     this.undoStack = [];
     this.redoStack = [];
     this.dirty = false;
@@ -1850,7 +1897,13 @@
     if (!m) { m = new Map(); this.chunks.set(k, m); }
     var li = ((z & 15) * CHUNK + (y & 15)) * CHUNK + (x & 15);
     m.set(li, word >>> 0);
+    this.unsaved.set(x + ',' + y + ',' + z, word >>> 0);
     this.dirty = true;
+  };
+  // The layer on disk now equals this copy: the server applies it from here on.
+  EditLayer.prototype.markSaved = function () {
+    this.unsaved.clear();
+    this.dirty = false;
   };
   EditLayer.prototype.get = function (x, y, z) {
     var m = this.chunks.get(this.key(x >> 4, y >> 4, z >> 4));
@@ -1864,6 +1917,7 @@
   };
   EditLayer.prototype.clear = function () {
     this.chunks.clear(); this.undoStack.length = 0; this.redoStack.length = 0;
+    this.unsaved.clear();
     this.dirty = true;
   };
   EditLayer.prototype.pushUndo = function (cells, label) {
@@ -1874,28 +1928,28 @@
   EditLayer.prototype.popUndo = function () { return this.undoStack.pop() || null; };
   EditLayer.prototype.popRedo = function () { return this.redoStack.pop() || null; };
 
-  // Composite the layer over a freshly arrived region. Only level 0 regions map
-  // 1:1 to world cells; at coarser levels one sample stands for up to 512
-  // voxels and an edit has no honest place to land, so the layer simply does
-  // not apply there — the coarse view shows the generated world, which is what
-  // it is for.
+  // Composite the UNSAVED strokes over a freshly arrived region. The saved
+  // layer is not composited here any more: the voxel server applies it, with
+  // the engine's own resolution of a ground-relative layer (map-overhaul P7),
+  // so the page draws what the game spawns into. Only level 0 regions map 1:1
+  // to world cells; at coarser levels one sample stands for up to 512 voxels
+  // and an unsaved stroke has no honest place to land.
   EditLayer.prototype.applyToRegion = function (r) {
-    if (r.lod !== 1 || !this.chunks.size) return;
-    var c0x = r.origin[0] >> 4, c0y = r.origin[1] >> 4, c0z = r.origin[2] >> 4;
-    var nc = r.nx >> 4;
-    for (var cz = 0; cz < nc; cz++) for (var cy = 0; cy < nc; cy++) for (var cx = 0; cx < nc; cx++) {
-      var m = this.chunks.get(this.key(c0x + cx, c0y + cy, c0z + cz));
-      if (!m) continue;
-      var bx = cx * CHUNK, by = cy * CHUNK, bz = cz * CHUNK;
-      m.forEach(function (word, li) {
-        var lx = li % CHUNK, ly = ((li / CHUNK) | 0) % CHUNK, lz = (li / (CHUNK * CHUNK)) | 0;
-        r.cells[(((bz + lz) * r.ny) + (by + ly)) * r.nx + (bx + lx)] = word & 0xFFFF;
-      });
-    }
+    if (r.lod !== 1 || !this.unsaved.size) return;
+    var ox = r.origin[0], oy = r.origin[1], oz = r.origin[2];
+    this.unsaved.forEach(function (word, k) {
+      var p = k.split(',');
+      var lx = (+p[0]) - ox, ly = (+p[1]) - oy, lz = (+p[2]) - oz;
+      if (lx < 0 || ly < 0 || lz < 0 || lx >= r.nx || ly >= r.ny || lz >= r.nz) return;
+      r.cells[((lz * r.ny) + ly) * r.nx + lx] = word & 0xFFFF;
+    });
   };
 
-  // ---- the .svedit binary. Twin of LoadWorldEdits in src/sim/worldedit.cpp;
-  // keep the two together.
+  // ---- the .svedit binary, v1 (ABSOLUTE cells). Twin of the v1 branch of
+  // WorldEdits::LoadBytes / WriteAbsolute in src/sim/worldedit.cpp; keep them
+  // together. The page only ever speaks v1: the tuner server converts to and
+  // from the ground-relative v2 the engine stores (P7) through --voxserve's
+  // EDITS command, because only the engine knows where the ground is.
   //
   //   0  'SVED'      12 u32 voxelCount    24 u32 reserved[2]
   //   4  u32 version 16 u32 seed
@@ -1949,6 +2003,7 @@
     }
     this.undoStack.length = 0;
     this.redoStack.length = 0;
+    this.unsaved.clear();
     this.dirty = false;
     return {chunks: chunks, seed: d.getUint32(16, true)};
   };

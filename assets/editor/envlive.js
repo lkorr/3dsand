@@ -110,9 +110,9 @@ export const LIVE = {
     'caves.features[].mushroomChance': R('WM_B_CAVE_MUSHROOM_CHANCE (the near_surface row; 1 in N floor cells, 0 = never)'),
     'caves.features[].crystalChance': R('WM_B_CAVE_CRYSTAL_CHANCE (the deep row; 1 in N floor/ceiling cells, 0 = never)'),
 
-    'swatch.sizeM': P('the swatch side; not a world value'),
-    'swatch.reliefM': P('ground noise under the swatch; not the engine’s terrain'),
-    'swatch.reliefFreq': P('ground noise under the swatch; not the engine’s terrain')
+    // The swatch's relief knobs went with the JS composer (P7): the swatch is
+    // the engine's own ground now. Old files may still carry them; nothing reads them.
+    'swatch.sizeM': P('the swatch side; not a world value')
   },
   conditions('cover.plants[]', ALL_CONDS, 'P-D', COND_COVER),
   conditions('trees.species[]', ALL_CONDS, 'P-D', COND_TREE),

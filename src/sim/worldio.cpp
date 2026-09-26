@@ -11,7 +11,7 @@
 #include "gpu/resources.h"   // AssembleShaderSource: the fingerprint's WGSL
 #include "sim/biomes.h"      // EnvironmentStamp: map / biomes / trees
 #include "sim/worldmap.h"    // ActiveMapName
-#include "sim/tuning.h"      // CurrentTuning().world.editLayer
+#include "sim/tuning.h"      // CurrentTuning().world.mapLayer
 #include "sim/tuningstamp.h" // HashOneFile, the same FNV the stamps use
 #include "test/support.h"    // AssetDir(): the one asset-path chokepoint
 
@@ -374,8 +374,10 @@ WorldgenFingerprint ComputeWorldgenFingerprint(const std::string& assetDir,
   fp.parts[1] = env.map;
   fp.parts[2] = env.biomes;
   fp.parts[3] = env.trees;
-  // [4] the edit layer genChunk's output is always patched with (worldedit.h).
-  const std::string& edit = CurrentTuning().world.editLayer;
+  // [4] the edit layer genChunk's output is always patched with (worldedit.h):
+  // the one the loaded map names (map.json `editLayer`, P7). Chunks the layer
+  // alone touched are not stored, so they regenerate from this on load.
+  const std::string& edit = worldmap::CurrentWorldMap().editLayer;
   if (!edit.empty())
     fp.parts[4] = sandvox::HashOneFile(assetDir + "/worldedits/" + edit + ".svedit",
                                        edit + ".svedit");

@@ -63,10 +63,29 @@ class FarEdits {
   static_assert(kChunkVol <= (1u << kCellBits), "cell index must fit 12 bits");
   static_assert(kMaterialSlots <= (1u << 12), "material id must fit 12 bits");
 
+  // Forgets every NOTED edit. The BASE (SetBase) survives: it is the authored
+  // edit layer, which belongs to the map, not to the store being replaced.
   void Clear() {
     byChunk_.clear();
+    merged_.clear();
     cells_ = 0;
   }
+
+  // ---- THE BASE: the authored edit layer (sim/worldedit.h, map-overhaul P7) --
+  // The sieve fills a level chunk from procgen and procgen has never heard of
+  // the edit layer, so without this the horizon shows the layer only where a
+  // layer chunk has been evicted MODIFIED — and P7 stops layer-only chunks
+  // counting as modified. The base is the layer's cells, swept into cascade
+  // samples exactly like a noted chunk (only the cells that ARE a sample
+  // center speak, the same resolution rule), and laid UNDER the noted edits:
+  // a crater dug into a layer structure and evicted wins over the structure.
+  // Replaces any earlier base; an empty list clears it.
+  struct BaseCell {
+    int32_t x, y, z;   // world voxel
+    uint32_t mat;      // raw material id
+  };
+  void SetBase(const std::vector<BaseCell>& cells);
+  size_t BaseLevelChunks() const { return base_.size(); }
   // ---- THE INDEX IS CAPPED (2026-09-24) ------------------------------------
   // It was an unbounded unordered_map, and what feeds it is every chunk the
   // stream's sticky `modified_` calls written — which includes a chunk that
@@ -78,7 +97,7 @@ class FarEdits {
   // 28,000 edited fine chunks' worth at 585 words each.
   static constexpr size_t kMaxCells = size_t(1) << 24;
   uint64_t RefusedChunks() const { return refused_; }
-  bool Empty() const { return byChunk_.empty(); }
+  bool Empty() const { return byChunk_.empty() && base_.empty(); }
   size_t LevelChunks() const { return byChunk_.size(); }
   // Samples recorded (before compaction — a cell re-noted by a second
   // eviction of the same chunk counts twice until its level chunk is
@@ -176,6 +195,11 @@ class FarEdits {
   void Sweep(IVec3 wc, const std::function<uint32_t(int, int, int)>& sample);
 
   std::unordered_map<LKey, Chunk, LKeyHash> byChunk_;
+  // The base (compacted, ColumnKey order) and, per level chunk that has BOTH a
+  // base and noted words, their merge (noted wins per cell). A merge is
+  // dropped whenever its noted list is appended to or the base is replaced.
+  std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash> base_;
+  std::unordered_map<LKey, std::vector<uint32_t>, LKeyHash> merged_;
   size_t cells_ = 0;                // appended samples, before compaction
   uint64_t refused_ = 0;            // new level chunks refused at kMaxCells
   std::vector<uint32_t> scratch_;   // per-level `add` list

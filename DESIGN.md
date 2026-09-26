@@ -3837,8 +3837,9 @@ The stale species height caps (`placement.maxY` 20–23 m, authored for a
 y32..y86 world and sitting on the 20 m home area) are lifted and the atlas
 re-baked.
 
-**What is left in tuning.json:** `world.mapLayer` / `world.editLayer` (which
-files the game loads; the map page's selectors) and the two plant dev
+**What is left in tuning.json:** `world.mapLayer` (which map the game loads;
+the map page's selector — the edit layer is the MAP's `map.json editLayer`
+since map-overhaul P7) and the two plant dev
 switches, `debug.vegetation` and `debug.groundCover` (Tuning → Dev switches).
 They are one axis, not two features: `groundCover` off removes every plant a
 body walks through (biome cover rows, tile plants, shore rows, pond life, wet
@@ -14921,9 +14922,11 @@ z-fighting double face that does not.
 
 ### 9c.4 The edit layer (`src/sim/worldedit.h`)
 
-Brush strokes and selection operations write a sparse, chunk-keyed patch of
-world cell → voxel word, saved to `assets/worldedits/<name>.svedit` and named by
-`world.editLayer` (the map page's edits selector).
+Brush strokes and selection operations write a sparse patch of world cell →
+voxel word, saved to `assets/worldedits/<name>.svedit` and named by the MAP:
+`map.json editLayer` (the map page's edits selector; it was tuning.json
+`world.editLayer` until map-overhaul P7 — a layer is authored against one
+map's ground, so the map owns the name).
 
 It is deliberately none of the three things it could have been:
 
@@ -14932,23 +14935,69 @@ It is deliberately none of the three things it could have been:
   premise of the preview pane is that you are still editing the map;
 * not **FarEdits**, which is derived, disposable cascade state;
 * not a **second writer into the voxel buffer**. It emits `CellOp`s and they go
-  through the MutationQueue like every other mutation (rule 3), which is what
-  keeps it inside the save/replay/network stream for free and is why application
-  is deferred by a tick rather than folded into `genChunk`.
+  through the MutationQueue like every other mutation (rule 3 — no exception
+  clause is used), which keeps it inside the replay stream for free and is why
+  application is deferred by a tick rather than folded into `genChunk`.
 
-Chunks are queued at the point of generation — startup worldgen queues the
-window, `Stream::FillSlots` queues each refilled slot — and paid out on the
-ordinary per-tick op stream. The streaming re-queue is not optional and fails
-the same way the far-field sieve does without `FarEdits`: `genChunk` overwrites
-a refilled slot with pristine procgen, so an edit would heal itself the moment
-you flew far enough for its chunk to scroll out and back.
+**Ground-relative (SVED v2, P7).** The file stores each edited COLUMN's cells
+as offsets from `World::TerrainHeight` at that column (the ground contract,
+sculpt layer included), resolved to world y for the seed and map in force
+(`WorldEdits::Resolve`, cached on seed + map content hash). A path painted
+into the grass stays in the grass after a re-sculpt or on another seed. The
+price is per-column shear on ground that changes SHAPE under a structure —
+rigid structures are stamps (map sites; the viewer's "→ prefab" writes the
+`.vox`). v1 files (absolute, chunk-keyed) still load. The viewer only speaks
+v1 absolute; `tuner_server.py` converts both ways through `--voxserve EDITS`,
+because only the engine knows where the ground is.
 
-A queued chunk that has scrolled out by the time it drains is DROPPED, not
-clamped: a cell index is window-relative, so applying one for a non-resident
-chunk punches a hole in whatever now owns that slot.
+**Worldgen, not a player edit (P7).** Chunks are queued at the point of
+generation — startup worldgen queues the window, `Stream::FillSlots` queues
+each GENERATED slot (never one decoded from the store) — and paid out on the
+ordinary per-tick op stream. What makes that worldgen rather than an edit:
+
+* **Not modified, not saved.** The ops wake their chunks (`DIRTY_R_MUTATE`)
+  and a dirty report is what `Stream::FoldSnapshot` turns into the sticky
+  `modified_` bit that makes eviction and a delta save store a chunk. The
+  snapshot now keeps one more fact per chunk — `World::kDirtyMutateOnly`
+  when MUTATE was the ONLY reason bit — and `WorldEdits` records which slots
+  (plus the 26-neighbour fan `sim_mutate` marks) its ops landed in on which
+  submit (`AppliedSlotsAt`). The fold and the save mask skip exactly that
+  pairing. Anything the CA does afterwards sets its own reason bit on its own
+  tick and is folded as always, so a layer chunk that STAYS quiet re-derives
+  from genChunk + the layer on re-entry and on load, and an edit to the layer
+  reaches an old save's untouched chunks. Limit, measured by the `worldedit`
+  gate's control arms: three of four candidate buried chunks in a fresh
+  window were already awake without any layer (`DIRTY_R_STAINW` — wet soil
+  settling after generation); such a chunk is modified whatever the layer
+  does, and it stores the layer with it. That is the gen-settle problem
+  (`gen-settle` gate), not a layer one.
+* **The far field sees it on load.** The sieve knows only procgen, so the
+  resolved layer is handed to `FarEdits::SetBase` — swept into cascade samples
+  by the same center-voxel rule, laid UNDER every noted edit, and kept across
+  the `Clear` a load or regen makes. `QueueWindow` (every whole-window
+  generation) re-seeds it.
+* **The voxel server applies it.** `BuildVoxRegion` patches each chunk's words
+  with `ApplyToChunk` before the downsample (a sky chunk the layer builds into
+  is read back instead of skipped), so the viewer draws what the game spawns
+  into; the page composites only strokes it has not saved. The region cache
+  key carries the layer name and a digest of the layer records in the box's
+  footprint, so a layer save invalidates only the regions it touches.
+
+The streaming re-queue is not optional: `genChunk` overwrites a refilled slot
+with pristine procgen, so an edit would heal itself the moment its chunk
+scrolled out and back. A queued chunk that has scrolled out by the time it
+drains is DROPPED, not clamped: a cell index is window-relative.
+
+**Exporting play into a layer.** F9 saves the world; `--export-edits
+<saveDir>,<layer>[,seed]` (or `--voxserve EXPORT`, the World map page's
+"Export save → layer") diffs every chunk the save stores against genChunk
+under the CURRENT map and seed, skipping stamp/excite scratch and gas, and
+writes the difference as a v2 layer. A save made under another map diffs
+wherever the two generators disagree — the report names the map it used.
 
 **Any layer moves the world hash**, because it puts voxels in the world. That is
-why `world.editLayer` ships empty and no gate sets it.
+why the shipped maps name none and no gate's map sets one; the `worldedit`
+gate installs its own in-process and clears it.
 
 ### 9c.5 Verification
 
@@ -14957,7 +15006,13 @@ a direct `ReadVoxelsSync` of the same voxels (stamp excluded), lod 4 invents no
 material the fine box lacks and keeps its fullness, malformed requests are
 refused rather than clamped, and a `.svedit` written as bytes and read through
 the real loader lands on the cell index it names — then goes through a real tick
-and reads back as the material it asked for.
+and reads back as the material it asked for. `--gate worldedit` (P7) holds the
+rest: a v2 cell resolves to `TerrainHeight + dy` and follows the ground to
+another seed while a v1 cell does not; a region dump carries the layer (and
+does not with `applyEdits` off); a sample-center cell is in the far field's
+base patch and survives `Clear`; and, against a control arm with no layer,
+a regenerated window's layer chunk holds the layer's word after the ticks
+without entering the stream's modified set (the exemption is counted).
 
 `bash scripts/check_worldview.sh` covers the half that C++ cannot see: real
 Chrome, real WebGL2, the real worker, `/api/voxregion` over HTTP, greedy
@@ -16013,8 +16068,8 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   tab's **Apply to game** over the telemetry socket (`{"cmd":
   "apply-environment"}`; `Telemetry` now reads client frames). Apply is
   EXACTLY F7 (2026-09-26): the F5 half first (tuning.json, so a changed
-  `world.mapLayer` / `editLayer` and the `.svedit` are re-read), then the
-  environment reload + regen. Boot and every reload print `environment: map
+  `world.mapLayer` is re-read), then the environment reload + regen, which
+  re-reads the map and the edit layer its `map.json editLayer` names (P7). Boot and every reload print `environment: map
   <name> <hash> | biomes <hash> | trees <hash> | edits <name> <hash>`
   (`biomes::StampEnvironment`, FNV-1a over the files; `edits` is the named
   edit layer's `.svedit`, 0 for none; mirrored by `tuner_server.py
@@ -16158,13 +16213,15 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
 * The `biomes` gate (`src/sim/biomes.*`, `selftest_biomes.cpp`) loads every
   file and refuses an unknown species, preset or material, a biome `index`
   that is not worldgen's id for its name, a stale species mirror, a preset
-  whose berm exceeds its shore lift. The swatch on the biome page composes
-  all of it, read or not.
+  whose berm exceeds its shore lift. The swatch on the biome page is the
+  ENGINE's render of the biome (P7, below), so it shows exactly what is read.
 
 ### The generators are the preview AND the future truth
 
 `assets/editor/watergen.js` and `biomegen.js` are pure modules (no DOM, hash
-RNG keyed on the column, Node-runnable) in the treegen.js mould. A water body
+RNG keyed on the column, Node-runnable) in the treegen.js mould. (biomegen.js
+is only the biome DATA MODEL since map-overhaul P7; its swatch composer is
+gone — see below.) A water body
 is a superellipse footprint (`squareness` is the Lamé exponent) with an fBm
 domain warp, optional smooth-min'd lobes and subtracted islands; a **depth
 profile curve** over the normalised radius (monotone cubic through authored
@@ -16174,8 +16231,8 @@ depth; a shore band with distance-ordered plants; and emergent / floating /
 submerged bands by water depth. Band WIDTHS are consequences of the
 bathymetry, not knobs — a steep kettle gets a one-cell reed fringe, a marsh is
 all fringe — which is what limnology says and what keeps the parameter count
-sane. `columnAt()` is the one answer to "what is at (x, z) of this body"; the
-standalone preview and the biome swatch both call it.
+sane. `columnAt()` is the one answer to "what is at (x, z) of this body" for
+the water page's standalone preview.
 
 The engine's pond is a DISC wearing a water preset (`pondRoll` / `pondGate` /
 `bowlDepth` / `bermLift` / `pondNear`, inside the CPU-mirrored `height`
@@ -16184,30 +16241,27 @@ band are packed into the worldMap buffer (`kW_*`) and read by both sides of
 the mirror through the same accessors. The shaped footprint (lobes, islands)
 and floor noise above are preview-only.
 
-### The swatch is a scale ladder, composed off the main thread (2026-09-01)
+### The swatch is the engine's (map-overhaul P7, 2026-09-26)
 
-The biome page's swatch runs from 16 m to 128 m on a side. Up to 32 m it is
-1:1 with the engine (10 vpm). Past that it does NOT get a bigger grid: it
-bakes COARSER, at the finest INTEGER vpm that keeps the side inside
-`MAX_SWATCH` = 384 cells (`biomegen.swatchScale`: 8 vpm at 48 m, 6 at 64,
-4 at 96, 3 at 128), and the viewer draws the one region at `lod = 10 / vpm`
-so it lands in world metres. The reason is the dense volume: a swatch is one
-`nx*ny*nz` Uint16 array copied twice more on the way to the screen (the
-viewer's cells, the mesher's lent copy) and once into a 3D texture, and a
-96 m forest at 10 vpm would be 16x the 24 m swatch's 32 MB per copy — over
-2 GB in flight before the mesher ran. Integer vpm because treegen bakes at
-integer vpm only, so every species goes through the real generator at the
-ground's scale and the composition stays exact rather than resampled; the
-tree cache is keyed on vpm, so the first swatch at a new scale bakes every
-species it places (seconds), reported as progress, and later ones do not.
-
-Composition runs in `assets/editor/swatch_worker.js`, a module worker that
-owns the libraries and the tree cache and returns the cells as one
-transferred buffer already remapped to engine material ids
-(`biomegen.remapToMaterials`). One request in flight; a request made while
-one runs waits as the single queued one, so a slider drag costs at most one
-extra compose and the page never stops answering. If the worker cannot be
-built the page composes inline as it did before.
+The biome page's swatch used to be composed by `biomegen.generateSwatch` — its
+own ground noise, its own tree stamping through treegen, its own cover rolls:
+a picture of the biome the engine never made. It is now the engine's own
+output. The page POSTs its biome JSON (saved or not) to `/api/biomeswatch`;
+`tuner_server.py` hands it to `--voxserve SWATCH` (`BuildBiomeSwatch`,
+`src/tools/voxregion.h`), which loads the biome set with that one file
+overridden, builds the env-truth gate's SYNTHETIC ONE-BIOME MAP (the loaded map
+with every cell painted this biome, flat landform, mid moisture, no sites),
+uploads it, runs the real `genChunk` over a `sizeVox` square around the map's
+spawn through `BuildVoxRegion` (tiled to the 128-sample / 512-voxel region
+caps, lod chosen so the side stays within 384 samples), then restores the
+real environment with `ReloadEnvironment`. The answer is an `SVSW` bundle of
+`SVVX` regions the page decodes and hands to `WorldView.setLocalRegions`; the
+stats line is the engine's own material census of the samples. ~0.5 s for a
+48 m forest. The trees / water / cover / showcase toggles and the swatch
+relief knobs went with the composer — the engine has no such switches, and a
+preview that can show what the world cannot is the thing this replaced.
+`densityStats` / `rarityStats` stay: they are the nominal numbers
+`tests/env_predictions.json` pins against the C++ port (`env-truth`).
 
 The viewer side is `worldview.js`'s greedy mesher, rewritten the same day:
 occupancy through a 4096-entry LUT built once per palette, both draw layers
@@ -16222,10 +16276,10 @@ than 25 m drew wrong, with no error anywhere.
 
 ### Verify
 
-`node scripts/test_environment.mjs` (data: determinism of both generators,
-preset sanity, biome validity, the species mirror, the swatch, the scale
-ladder and the in-place remap),
-`bash scripts/check_environment.sh` (the tab in real Chrome: mount, sidebar,
+`node scripts/test_environment.mjs` (data: water generator determinism,
+preset sanity, biome validity, the species mirror, the nominal rarity maths),
+`bash scripts/check_environment.sh` (the tab in real Chrome — and since P7 the
+built exe, for the engine swatch: mount, sidebar,
 three pages, WebGL meshing, framebuffer, plan/profile canvases, undo, deep
 links, save routes), `--selftest --gate biomes` (the engine's side),
 `python scripts/check_invariants.py` (biome order). `check_tabs.sh` and

@@ -109,11 +109,19 @@ function done(){
     // from the middle of the resident level-0 shell rather than from the
     // camera: a screenshot camera can legitimately be over a chasm, and a
     // check that depends on where you happened to point is not a check.
-    var e0 = wv.camEye();
-    var probe = [Math.floor(e0[0]/64)*64 + 32, 0, Math.floor(e0[2]/64)*64 + 32];
-    var top = Math.floor(e0[1]/64)*64 + 96;
-    var hit = wv.raycast(probe[0], top, probe[2], 0, -1, 0, 400, false);
-    say(!!hit, 'raycast down the centre column hit ' +
+    // Down the centre of each resident level-0 region's column, topmost
+    // first, until one hits: a fixed column 96 above the camera's region
+    // missed whenever the ground there sat below the resident shell (the
+    // shipped map's ground moved under the harness camera in the map
+    // overhaul; measured "hit nothing" at base 5755e59).
+    var hit = null, cols = [];
+    wv.regions.forEach(function (rg) { if (rg.level === 0 && rg.cells) cols.push(rg); });
+    cols.sort(function (a, b) { return b.origin[1] - a.origin[1]; });
+    for (var ci = 0; ci < cols.length && !hit; ci++) {
+      var rg = cols[ci];
+      hit = wv.raycast(rg.origin[0] + 32, rg.origin[1] + 63, rg.origin[2] + 32, 0, -1, 0, 63, false);
+    }
+    say(!!hit, 'raycast down a resident column hit ' +
         (hit ? (pal.materials[hit.mat].name + ' at y' + hit.vox[1]) : 'nothing'));
 
     // Edit -> undo round trip through the real apply path.
@@ -129,6 +137,31 @@ function done(){
       var info = L2.deserialize(buf);
       say(L2.count() === 1 && info.seed === 1337,
           '.svedit round trip: ' + buf.byteLength + ' bytes, ' + L2.count() + ' voxel, seed ' + info.seed);
+      // P7: the server applies the SAVED layer, so a re-fetched region only
+      // gets the UNSAVED strokes composited on arrival.
+      var host = wv.regions.get('0:' + Math.floor(target[0] / 64) + ',' + Math.floor(target[1] / 64) + ',' +
+                                Math.floor(target[2] / 64));
+      var fake = {lod: 1, nx: 64, ny: 64, nz: 64, cells: new Uint16Array(64 * 64 * 64),
+                  origin: host ? host.origin.slice() : [Math.floor(target[0] / 64) * 64,
+                                                        Math.floor(target[1] / 64) * 64,
+                                                        Math.floor(target[2] / 64) * 64]};
+      wv.edit.applyToRegion(fake);
+      var li = ((target[2] - fake.origin[2]) * 64 + (target[1] - fake.origin[1])) * 64 + (target[0] - fake.origin[0]);
+      say(wv.edit.unsaved.size === 1 && (fake.cells[li] & 0xFFF) === 2,
+          'an unsaved stroke is composited into an arriving region');
+      wv.edit.markSaved();
+      fake.cells.fill(0);
+      wv.edit.applyToRegion(fake);
+      say(wv.edit.unsaved.size === 0 && fake.cells[li] === 0,
+          'after a save the page composites nothing (the server applies the saved layer)');
+      // P7: a selection saves as a prefab .vox (palette index = material id).
+      wv.tool.sel = {a: target.slice(), b: target.slice()};
+      var vox = wv.selectionToVox();
+      var vd = vox ? new DataView(vox.buf) : null;
+      say(!!vox && vox.voxels === 1 && vd.getUint32(0, true) === 0x20584f56 &&
+          vd.getUint8(vox.buf.byteLength - 1) === 2,
+          'selection -> .vox: ' + (vox ? vox.buf.byteLength + ' bytes, ' + vox.voxels + ' voxel' : 'null'));
+      wv.tool.sel = null;
       wv.undo();
       var undone = wv.cellAtWorld(target[0], target[1], target[2], 0);
       say(undone === before, 'undo restored the original word');

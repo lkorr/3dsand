@@ -6,7 +6,7 @@
 // space, hand-placed sites, seeded placement rules) beside `map.svmap` (the
 // painted half -- three u8 planes: biome, landform, moisture). It is authored
 // on the tuner's Environment -> World map page and named by `world.mapLayer`
-// in tuning.json, exactly as `world.editLayer` names a `.svedit`.
+// in tuning.json (the map in turn names its `.svedit` edit layer, P7).
 //
 // WHY A MAP AND NOT MORE NOISE. docs/RESEARCH_worldgen.md §8 asked the
 // question and answered it: a falling-sand sandbox's replay value is in the
@@ -669,6 +669,9 @@ struct WorldMapData {
   std::vector<uint8_t> landform;
   std::vector<uint8_t> moisture;
   uint32_t contentHash = 0;               // FNV-1a over both files
+  // map.json `editLayer` (P7): assets/worldedits/<name>.svedit, applied over
+  // this map's worldgen (sim/worldedit.h). "" = none. A bare name, never a path.
+  std::string editLayer;
   bool Loaded() const { return width > 0 && height > 0; }
   /** Cell coordinates of a world voxel column (arithmetic shift: floors). */
   void CellOf(int x, int z, int* cx, int* cz) const {

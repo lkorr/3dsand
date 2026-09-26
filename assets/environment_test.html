@@ -132,10 +132,11 @@ function readLit(wv, cv){
     ok = await waitFor(function(){ return !!B._biome() && B.currentName() === 'forest'; });
     say(ok, 'biome page loaded forest: ' + (B._biome() && B._biome().displayName));
     var bstats = pages.biome.querySelector('.bmstats');
-    ok = await waitFor(function(){ return /voxels/.test(bstats.textContent); }, 120000);
-    say(ok, 'swatch composed: ' + bstats.textContent.replace(/\s+/g, ' ').slice(0, 160));
-    say(/trees: .*(oak|birch|pine|bush|great_oak|willow|spruce|redwood|dead|eucalyptus)/.test(bstats.textContent), 'swatch placed at least one tree');
-    say(/water: .*tarn/.test(bstats.textContent), 'swatch composed the tarn (showcase)');
+    // The swatch is the ENGINE's since map-overhaul P7 (--voxserve SWATCH), so
+    // this needs the built exe; the stats line is the engine's sample census.
+    ok = await waitFor(function(){ return /as the ENGINE generates it/.test(bstats.textContent); }, 180000);
+    say(ok, 'swatch rendered by the engine: ' + bstats.textContent.replace(/\s+/g, ' ').slice(0, 200));
+    say(/(wood|leaves|leaf_|bark)/.test(bstats.textContent), 'the engine swatch holds tree matter (a forest grows trees)');
     var valid = pages.biome.querySelector('.bmvalid');
     say(/valid/.test(valid.textContent), 'forest validates: ' + valid.textContent.slice(0, 80));
     var stackRows = pages.biome.querySelectorAll('.bmstackrow').length;
@@ -175,7 +176,7 @@ function readLit(wv, cv){
       brng.value = String(Math.max(parseFloat(brng.min), parseFloat(brng.value) - parseFloat(brng.step)));
       brng.dispatchEvent(new Event('input', {bubbles: true}));
     }
-    ok = await waitFor(function(){ return bstats.textContent !== bbefore && /voxels/.test(bstats.textContent); }, 120000);
+    ok = await waitFor(function(){ return bstats.textContent !== bbefore && /as the ENGINE generates it/.test(bstats.textContent); }, 180000);
     say(ok && brng.value !== bv0, 'a six-step density drag recomposed the swatch (' + bv0 + ' -> ' + brng.value + ')');
     say(B._undoDepth() === bdepth0 + 1, 'and cost exactly one undo step (' + (B._undoDepth() - bdepth0) + ')');
     document.dispatchEvent(new KeyboardEvent('keydown', {key: 'z', ctrlKey: true, bubbles: true}));
