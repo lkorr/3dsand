@@ -2286,6 +2286,12 @@ struct Tuning {
     // 1 is the old behaviour bit-for-bit. Same-liquid EQUALIZE is untouched, so
     // ponds still level; this gates only the leading edge advancing into air.
     int liquidMinFilm = TPD(sim, liquidMinFilm);
+    // SUB-VOXEL REPOSE (docs/PLAN_powder_mass.md P5). 1: a resting powder
+    // cell sheds eighths toward a neighbour column whose top is more than the
+    // material's repose threshold (eighths per cell) lower, and worldgen's
+    // loose cover gives its step columns partial tops that already satisfy
+    // it. 0: the whole-cell repose tiers only, and whole-cell generated tops.
+    int powderFineRepose = TPD(sim, powderFineRepose);
     // critter hop chance = 1/(mask+1) per tick
     int wanderHopMask = TPD(sim, wanderHopMask);
     // Explosion micro grit: sub-voxel spall thrown alongside the real ejecta.

@@ -1814,6 +1814,10 @@ constexpr uint32_t kPowderBlockMin = 5u;
 // reports it as air to the player, mobs and projectiles (owner, 2026-09-26:
 // "thin films should be walked through").
 constexpr uint32_t kPowderWalkMin = 3u;
+// CPU-only: a CREATURE's ground is a whole cell height (mob.cpp / pose.cpp
+// carry it as an int), so a partial powder cell ROUNDS for them -- ground
+// from half a cell of grains up; feet sink at most 3/8 or float at most 4/8.
+constexpr uint32_t kPowderMobSupportMin = 4u;
 inline bool PowderStateIsPartial(uint32_t s) {
   return s >= kPowderPartialLo && s <= kPowderPartialHi;
 }
@@ -4255,6 +4259,12 @@ class World {
   // same voxel word, or a second player's sweeps disagree with the first's
   // about the same cell. Copying four switch arms was how they would stop
   // agreeing, so neither owns them.
+  // HOW TALL the mirror's cell is, as a fraction of a voxel: a partial powder
+  // cell (POWDER MASS) is its grains, mass/8; everything else is 1. Only
+  // meaningful for a cell KindAt calls Solid. The player's slab collision
+  // (Player::TopFn) reads it.
+  float CellTopAt(IVec3 cell, const std::vector<uint32_t>& classOf) const;
+
   static CellKind KindOfWord(uint32_t word,
                              const std::vector<uint32_t>& classOf) {
     const uint32_t mat = word & 0xFFF;

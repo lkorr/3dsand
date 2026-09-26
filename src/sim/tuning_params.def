@@ -746,6 +746,12 @@ TP_U(sim, liquidEqualize, TUNE_LIQUID_EQUALIZE, 2, 1, 7)
 // all, and a cell holds 8: past 4 no cell could ever spread into air and
 // water would stop advancing across a flat floor entirely.
 TP_U(sim, liquidMinFilm, TUNE_LIQUID_MIN_FILM, 1, 1, 4)
+// Sub-voxel angle of repose (docs/PLAN_powder_mass.md P5): 1 = a resting
+// powder sheds EIGHTHS sideways by column-top height, and worldgen lays its
+// loose cover's step columns as partial cells (edge 4/8, stair 6/8) that are
+// already at rest under that rule. 0 = whole-cell repose and whole-cell tops.
+// The CA and worldgen read the same row, so they cannot disagree.
+TP_U(sim, powderFineRepose, TUNE_POWDER_FINE_REPOSE, 1, 0, 1)
 TP_U(sim, wanderHopMask, TUNE_WANDER_HOP_MASK, 7, 0, 255)
 TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900, 0, 1000)
 // Both of these are packed into bit fields in Particle.flags; an

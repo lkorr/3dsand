@@ -1067,6 +1067,20 @@ CellKind World::KindAt(IVec3 cell, const std::vector<uint32_t>& classOf) const {
   return KindOfWord(w, classOf);
 }
 
+float World::CellTopAt(IVec3 cell, const std::vector<uint32_t>& classOf) const {
+  if (!snap_.valid) return 1.0f;
+  int cx = (cell.x >> 4) - snap_.mirrorBase.x;
+  int cy = (cell.y >> 4) - snap_.mirrorBase.y;
+  int cz = (cell.z >> 4) - snap_.mirrorBase.z;
+  if (cx < 0 || cy < 0 || cz < 0 || cx >= 3 || cy >= 3 || cz >= 3) return 1.0f;
+  int lx = cell.x & 15, ly = cell.y & 15, lz = cell.z & 15;
+  const uint32_t w = snap_.mirror[(size_t)((cz * 3 + cy) * 3 + cx) * kChunkVol +
+                                  (lz * (int)kChunk + ly) * (int)kChunk + lx];
+  const uint32_t m = w & 0xFFFu;
+  if (m == 0 || m >= classOf.size() || classOf[m] != 1u) return 1.0f;
+  return (float)PowderMassOfState((w >> 12) & 0xFu) / (float)kPowderFull;
+}
+
 // ---- M9.1 P3: the same question, for a body the mirror is not centred on ---
 // world.h carries the whole argument (why the analytic fallback, why fluid is
 // not answered, why this is not const). This is only the three cases.

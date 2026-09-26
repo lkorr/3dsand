@@ -482,6 +482,7 @@
     "ejectGas": 0,
     "liquidEqualize": 2,
     "liquidMinFilm": 1,
+    "powderFineRepose": 1,
     "wanderHopMask": 7,
     "expMicroPerMille": 900,
     "expMicroLifeTicks": 40,

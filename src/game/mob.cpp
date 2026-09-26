@@ -4240,11 +4240,16 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
     }
     const uint32_t lx = (uint32_t)(wx & 15), ly = (uint32_t)(y & 15),
                    lz = (uint32_t)(wz & 15);
-    const uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
+    const uint32_t w = cc->voxels[(lz * kChunk + ly) * kChunk + lx];
+    const uint32_t mat = w & 0xFFF;
     // solids/powders carry weight; liquids/gases don't (creatures wade, not
-    // walk on blood pools)
+    // walk on blood pools). A PARTIAL powder cell ROUNDS (kPowderMobSupportMin):
+    // a creature's ground is a whole cell height everywhere downstream, so
+    // half a cell of grains or more is ground and less is sunk into.
     if (mat != 0 && mat < cls.size() &&
-        (cls[mat] == CLASS_SOLID || cls[mat] == CLASS_POWDER)) {
+        (cls[mat] == CLASS_SOLID ||
+         (cls[mat] == CLASS_POWDER &&
+          PowderMassOfState((w >> 12) & 0xFu) >= kPowderMobSupportMin))) {
       lastMat = mat;
       return true;
     }
@@ -4325,10 +4330,13 @@ bool Mob::CellSupportsWeightIn(const CachedChunk* cc, IVec3 cell) const {
   if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;  // unknown = open
   const uint32_t lx = (uint32_t)(cell.x & 15), ly = (uint32_t)(cell.y & 15),
                  lz = (uint32_t)(cell.z & 15);
-  const uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
+  const uint32_t w = cc->voxels[(lz * kChunk + ly) * kChunk + lx];
+  const uint32_t mat = w & 0xFFF;
   const std::vector<uint32_t>& cls = ClassOf();
   if (mat == 0 || mat >= cls.size()) return false;
-  return cls[mat] == CLASS_SOLID || cls[mat] == CLASS_POWDER;
+  return cls[mat] == CLASS_SOLID ||
+         (cls[mat] == CLASS_POWDER &&
+          PowderMassOfState((w >> 12) & 0xFu) >= kPowderMobSupportMin);
 }
 
 Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,

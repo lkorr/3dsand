@@ -61,6 +61,14 @@ struct MaterialNameTable {
   // Stain palette slot order, [0] = "" (clean). EMPTY = unknown (a legacy
   // table from meta.svm): stain types then read as identity.
   std::vector<std::string> stains;
+  // Material CLASS per id (CLASS_SOLID/POWDER/LIQUID/GAS), or EMPTY for a
+  // table written before 2026-09-26. The state nibble means a different thing
+  // per class (liquid fullness, powder mass, a palette variant), so a material
+  // that changed class between the save and this build needs its nibble
+  // CONVERTED, not just its id moved -- and only a table that recorded the
+  // classes can say that it did. Hashed only when present, so every older
+  // table keeps the hash its saves were tagged with.
+  std::vector<uint8_t> classes;
   bool Empty() const { return mats.empty(); }
   // FNV-1a 32 over both lists (NUL-separated, a marker between). Never 0:
   // 0 is "untagged" in every file header that carries one.
@@ -72,6 +80,14 @@ MaterialNameTable MaterialNameTableOf(const std::vector<MaterialDef>& mats);
 // saved id -> running id, and saved stain slot -> running stain slot.
 struct MatRemap {
   std::vector<uint16_t> mat;  // indexed by SAVED id; ids past it pass through
+  // Per SAVED id: how its state nibble converts (kNibble*), empty = none.
+  std::vector<uint8_t> nibble;
+  static constexpr uint8_t kNibbleKeep = 0;        // same meaning both sides
+  static constexpr uint8_t kNibbleLiqToPowder = 1; // fullness -> mass (eighths kept)
+  static constexpr uint8_t kNibblePowderToLiq = 2; // mass -> fullness (eighths kept)
+  static constexpr uint8_t kNibbleToVariant = 3;   // -> a solid/gas: variant 0..2
+  // The saved state nibble `s` of saved id `id`, as the running class reads it.
+  uint32_t State(uint32_t id, uint32_t s) const;
   uint8_t stain[8] = {0, 1, 2, 3, 4, 5, 6, 7};
   bool identity = true;
   // Names the running table does not have. Their voxels become air (a stain
@@ -88,7 +104,8 @@ struct MatRemap {
   uint32_t Word(uint32_t w) const;
   // DebrisVoxel::payload (material | state << 12).
   uint16_t Payload(uint16_t p) const {
-    return (uint16_t)((p & 0xF000u) | Mat(p & 0xFFFu));
+    return (uint16_t)((State(p & 0xFFFu, (p >> 12) & 0xFu) << 12) |
+                      Mat(p & 0xFFFu));
   }
   // A body coat word (voxload.h PackBodyStain: material | amount << 12).
   uint16_t BodyStain(uint16_t s) const {

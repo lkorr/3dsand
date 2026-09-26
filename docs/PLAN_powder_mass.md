@@ -1,7 +1,14 @@
 # PLAN: powder mass in eighths (sub-voxel grains)
 
-Status (2026-09-26): **P0-P3 LANDED on branch `powder-mass`; P4 PARTIAL; P5
-DEFERRED** (owner: "p5 can wait until i inspect behavior").
+Status (2026-09-26, second pass): **P0-P5 all implemented.** The list
+below was the first pass's gap list; every item in it is now done:
+player slab collision (Player::TopFn), creatures ROUND at 4/8 (their ground
+is an int end to end -- a real fractional mob ground is still open), Jolt
+mass-weighted marching cubes, grains under water, class-aware material
+remap, and P5 (tryFineRepose + worldgen looseStep tops, sim.powderFineRepose).
+
+First pass (kept for the record): **P0-P3 LANDED on branch `powder-mass`; P4
+PARTIAL; P5 DEFERRED** (owner: "p5 can wait until i inspect behavior").
 
 - P0 encoding, P1 CA (merge / sink / diagonal merge / reaction mass /
   scoop + pour eighths), P2 render (tracePowder in the deferred-detail pass,

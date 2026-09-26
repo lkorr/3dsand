@@ -12,6 +12,8 @@ namespace {
 // 'SVMT': u32 magic, u32 hash, u32 matCount, str mats[matCount],
 //         u32 stainCount, str stains[stainCount]      (str = u32 len + bytes)
 constexpr uint32_t kTableMagic = 0x544D5653;  // 'SVMT'
+// ...optionally followed by u32 'CLS1', u32 count, u8 class[count].
+constexpr uint32_t kClassMagic = 0x31534C43;  // 'CLS1'
 
 uint32_t Fnv(const void* p, size_t n, uint32_t h) {
   const unsigned char* b = static_cast<const unsigned char*>(p);
@@ -37,6 +39,11 @@ uint32_t MaterialNameTable::Hash() const {
     h = Fnv(s.data(), s.size(), h);
     h = Fnv(&zero, 1, h);
   }
+  // Classes only when recorded, so a pre-2026-09-26 table hashes as it did.
+  if (!classes.empty()) {
+    h = Fnv(&mark, 1, h);
+    h = Fnv(classes.data(), classes.size(), h);
+  }
   // 0 and 0xFFFFFFFF are the tag sentinels (MatTableSet::kUntagged/kLegacy).
   return (h == 0u || h == 0xFFFFFFFFu) ? 1u : h;
 }
@@ -45,8 +52,10 @@ MaterialNameTable MaterialNameTableOf(const std::vector<MaterialDef>& mats) {
   MaterialNameTable t;
   t.mats.reserve(mats.size());
   t.stains.assign(8, std::string());
+  t.classes.reserve(mats.size());
   for (const MaterialDef& m : mats) {
     t.mats.push_back(m.name);
+    t.classes.push_back((uint8_t)m.gpu.klass);
     // Slots are shared by stain NAME across materials (materials.cpp), so the
     // first writer and every later one agree.
     if (m.stainSlot > 0 && m.stainSlot < 8 && !m.stain.empty())
@@ -55,7 +64,25 @@ MaterialNameTable MaterialNameTableOf(const std::vector<MaterialDef>& mats) {
   return t;
 }
 
+uint32_t MatRemap::State(uint32_t id, uint32_t s) const {
+  const uint8_t k = id < nibble.size() ? nibble[id] : kNibbleKeep;
+  switch (k) {
+    case kNibbleLiqToPowder: {
+      const uint32_t f = (s & 7u) + 1u;                 // 1..8 eighths
+      return f >= kPowderFull ? 0u : f + 2u;
+    }
+    case kNibblePowderToLiq:
+      return PowderMassOfState(s) - 1u;                 // fullness code
+    case kNibbleToVariant:
+      return s <= 2u ? s : 0u;
+    default:
+      return s;
+  }
+}
+
 uint32_t MatRemap::Word(uint32_t w) const {
+  if (!nibble.empty() && (w & 0xFFFu) != 0u)
+    w = (w & ~0xF000u) | (State(w & 0xFFFu, (w >> 12) & 0xFu) << 12);
   const uint32_t mat = Mat(w & 0xFFFu);
   // A substance this build does not have becomes CLEAN air: no state nibble,
   // no stain left floating in an empty cell.
@@ -146,6 +173,28 @@ MatRemap BuildMatRemap(const MaterialNameTable& saved,
       if (to != s) r.identity = false;
     }
   }
+  // CLASS CHANGES: only when both tables recorded classes (an older save
+  // cannot say what its materials were, and its nibbles load as they are).
+  if (!saved.classes.empty() && !running.classes.empty()) {
+    bool any = false;
+    std::vector<uint8_t> nib(saved.mats.size(), MatRemap::kNibbleKeep);
+    for (size_t i = 1; i < saved.mats.size() && i < saved.classes.size(); i++) {
+      const uint16_t to = r.mat.empty() ? (uint16_t)i : r.mat[i];
+      if (to == 0 || to >= running.classes.size()) continue;
+      const uint8_t a = saved.classes[i], b = running.classes[to];
+      if (a == b) continue;
+      uint8_t k = MatRemap::kNibbleToVariant;
+      if (a == CLASS_LIQUID && b == CLASS_POWDER) k = MatRemap::kNibbleLiqToPowder;
+      else if (a == CLASS_POWDER && b == CLASS_LIQUID) k = MatRemap::kNibblePowderToLiq;
+      else if (b == CLASS_LIQUID) k = MatRemap::kNibbleKeep;  // solid/gas -> liquid: variant 0..2 reads as 1..3 eighths; nothing better to say
+      nib[i] = k;
+      any = any || k != MatRemap::kNibbleKeep;
+    }
+    if (any) {
+      r.nibble = std::move(nib);
+      r.identity = false;
+    }
+  }
   if (r.identity) r.mat.clear();  // Mat() passes everything through
   return r;
 }
@@ -208,6 +257,12 @@ bool MatTableSet::WriteTableFile(const std::string& path, const MaterialNameTabl
   for (const std::string& s : t.mats) str(s);
   u32((uint32_t)t.stains.size());
   for (const std::string& s : t.stains) str(s);
+  // Optional trailing section (2026-09-26): 'CLS1', count, one byte per id.
+  if (!t.classes.empty()) {
+    u32(kClassMagic);
+    u32((uint32_t)t.classes.size());
+    buf.insert(buf.end(), t.classes.begin(), t.classes.end());
+  }
   const std::string tmp = path + ".tmp";
   FILE* fp = std::fopen(tmp.c_str(), "wb");
   if (!fp) return false;
@@ -266,6 +321,13 @@ bool MatTableSet::ReadTableFile(const std::string& path, MaterialNameTable& t) {
   MaterialNameTable r;
   strs(r.mats);
   strs(r.stains);
+  if (ok && buf.size() - off >= 8) {
+    const uint32_t m = u32(), n = u32();
+    if (ok && m == kClassMagic && n <= buf.size() - off) {
+      r.classes.assign(buf.begin() + (long)off, buf.begin() + (long)(off + n));
+      off += n;
+    }
+  }
   // The stored hash is checked against the content: a table file that does
   // not hash to what it claims would remap a region as the wrong substances.
   if (!ok || r.Hash() != hash) return false;

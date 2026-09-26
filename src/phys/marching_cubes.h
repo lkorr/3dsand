@@ -42,6 +42,19 @@ inline bool McOccGet(const uint32_t* occ, int x, int y, int z) {
 // a half-integer lattice, so identical positions dedupe exactly by integer key
 // with no epsilon compare. Roughly 4x fewer vertices reach Jolt's MeshShape
 // build, which is the dominant cost of a terrain patch rebuild.
+//
+// MASS-WEIGHTED SURFACES (docs/PLAN_powder_mass.md P4). `dens`, when given, is
+// one byte per occ sample: how many EIGHTHS of the cell are matter (8 = a
+// solid or a full powder, 0 = open, 1..7 = a partial powder cell). An edge
+// vertex then sits where the density crosses one half, interpolated between
+// its two samples, instead of at the midpoint -- so a 3/8 dusting lies lower
+// than a full cell and a 7/8 one higher, and a slope of partial cells is a
+// slope rather than a staircase. The weld key is still the EDGE (its doubled
+// midpoint), and both cubes that share an edge compute the same position
+// from the same two samples, so welding stays exact. `occ` must agree:
+// a sample is occupied iff dens >= 4. Null `dens` is the binary surface.
 void PolygonizeChunk(IVec3 chunkOriginVoxel, const uint32_t* occ,
                      std::vector<float>& outVertsXYZ,
-                     std::vector<uint32_t>& outIndices);
+                     std::vector<uint32_t>& outIndices,
+                     const uint8_t* dens = nullptr);
+constexpr int kMcOccCells = kMcOccDim * kMcOccDim * kMcOccDim;

@@ -6175,6 +6175,24 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     pst.To(Phase::TerrainGather);
     if (prof_.on) prof_.gathers++;
     uint32_t occ[kMcOccWords] = {};
+    // Eighths of matter per sample (marching_cubes.h, MASS-WEIGHTED SURFACES):
+    // 8 for a solid or a full powder, a partial powder's mass, 0 otherwise.
+    // occ is exactly dens >= 4, so the binary and weighted views agree.
+    uint8_t dens[kMcOccCells] = {};
+    bool anyPartial = false;
+    auto put = [&](int x, int y, int z, uint32_t d) {
+      dens[McOccIndex(x, y, z)] = (uint8_t)d;
+      if (d >= 4u) McOccSet(occ, x, y, z);
+      else McOccClear(occ, x, y, z);
+      anyPartial = anyPartial || (d != 0u && d != kPowderFull);
+    };
+    auto densOf = [&](uint32_t w) -> uint32_t {
+      const uint32_t m = w & 0xFFFu;
+      if (m == 0 || m >= classOf_.size()) return 0u;
+      if (classOf_[m] == CLASS_SOLID) return kPowderFull;
+      if (classOf_[m] == CLASS_POWDER) return PowderMassOfState((w >> 12) & 0xFu);
+      return 0u;
+    };
     for (int ncz = -1; ncz <= 1; ncz++)
       for (int ncy = -1; ncy <= 1; ncy++)
         for (int ncx = -1; ncx <= 1; ncx++) {
@@ -6195,7 +6213,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
           if (!inWin) {
             for (int z = blo[2]; z <= bhi[2]; z++)
               for (int y = blo[1]; y <= bhi[1]; y++)
-                for (int x = blo[0]; x <= bhi[0]; x++) McOccSet(occ, x, y, z);
+                for (int x = blo[0]; x <= bhi[0]; x++) put(x, y, z, kPowderFull);
             continue;
           }
           if (!haveVox) continue;
@@ -6205,15 +6223,9 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
                 // occ coord -> world cell -> local cell in THIS neighbor
                 int lx = (origin.x + x - 1) & 15, ly = (origin.y + y - 1) & 15,
                     lz = (origin.z + z - 1) & 15;
-                const uint32_t w = n->voxels[(lz * kChunk + ly) * kChunk + lx];
-                const uint32_t mat = w & 0xFFF;
-                if (mat == 0 || mat >= classOf_.size()) continue;
-                // A thin film of grains (powder mass under kPowderWalkMin
-                // eighths) is not ground: the same rule KindOfWord walks by.
-                if (classOf_[mat] == CLASS_SOLID ||
-                    (classOf_[mat] == CLASS_POWDER &&
-                     PowderMassOfState((w >> 12) & 0xFu) >= kPowderWalkMin))
-                  McOccSet(occ, x, y, z);
+                const uint32_t d =
+                    densOf(n->voxels[(lz * kChunk + ly) * kChunk + lx]);
+                if (d != 0u) put(x, y, z, d);
               }
           // This system's own writes the mirror copy does not show yet: a
           // vacated cell is not ground, a settled one is. See NoteGridWrite.
@@ -6226,14 +6238,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
               if (ox < 0 || oy < 0 || oz < 0 || ox >= kMcOccDim || oy >= kMcOccDim ||
                   oz >= kMcOccDim)
                 continue;
-              const uint32_t m = word & 0xFFFu;
-              const bool matter =
-                  m != 0 && m < classOf_.size() &&
-                  (classOf_[m] == CLASS_SOLID ||
-                   (classOf_[m] == CLASS_POWDER &&
-                    PowderMassOfState((word >> 12) & 0xFu) >= kPowderWalkMin));
-              if (matter) McOccSet(occ, ox, oy, oz);
-              else McOccClear(occ, ox, oy, oz);
+              put(ox, oy, oz, densOf(word));
             }
           }
         }
@@ -6253,6 +6258,13 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
       h = (h ^ occ[i]) * 1099511628211ull;
       anyOcc = anyOcc || occ[i] != 0u;
     }
+    // A partial cell's MASS moves the weighted surface without flipping a bit,
+    // so it is part of the identity too -- folded only when there is one, so
+    // a box of whole cells hashes exactly as before.
+    if (anyPartial)
+      for (int i = 0; i < kMcOccCells; i++)
+        if (dens[i] != 0u && dens[i] != kPowderFull)
+          h = (h ^ ((uint64_t)i << 8 | dens[i])) * 1099511628211ull;
     if (t.builtVersion != 0 && h == t.occHash) {
       t.builtVersion = cc->version;
       t.vacateKey = vacateKey;
@@ -6278,7 +6290,7 @@ void DebrisSystem::ManageTerrain(uint32_t tick, World& world) {
     if (prof_.on) prof_.polys++;
     std::vector<float> verts;
     std::vector<uint32_t> indices;
-    PolygonizeChunk(origin, occ, verts, indices);
+    PolygonizeChunk(origin, occ, verts, indices, anyPartial ? dens : nullptr);
 
     pst.To(Phase::TerrainJolt);
     if (prof_.on) prof_.joltMeshes++;

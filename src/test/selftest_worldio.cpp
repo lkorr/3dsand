@@ -1965,12 +1965,17 @@ Status GateSaveMaterialRemap(Ctx& c, std::string& detail) {
     fs::remove_all(kDirL);
     MaterialNameTable S = R;
     S.mats.insert(S.mats.begin() + 3, "w1d_not_a_material");
+    // The class list travels with the names (mattable.h `classes`): a saved
+    // table whose classes did not follow its own ids would claim every
+    // material past the insert changed class.
+    if (!S.classes.empty()) S.classes.insert(S.classes.begin() + 3, (uint8_t)CLASS_SOLID);
     int sStone = -1, sWater = -1;
     for (size_t i = 0; i < S.mats.size(); i++) {
       if (S.mats[i] == "stone") sStone = (int)i;
       if (S.mats[i] == "water") sWater = (int)i;
     }
     std::swap(S.mats[sStone], S.mats[sWater]);
+    if (!S.classes.empty()) std::swap(S.classes[sStone], S.classes[sWater]);
     if (slotB != 0) std::swap(S.stains[slotA], S.stains[slotB]);
 
     constexpr uint32_t kSeed = 0x5eed;
@@ -2292,14 +2297,44 @@ Status GateSaveMaterialRemap(Ctx& c, std::string& detail) {
     ctx.WaitIdle();
   }
 
-  const bool ok = aOk && bOk;
+  // ======== C: a material that CHANGED CLASS keeps its eighths =============
+  // (docs/PLAN_powder_mass.md P4) A table that recorded classes and says
+  // "sand" was a LIQUID: its 3/8 fullness must load as 3/8 of grains, a full
+  // cell as full; and a saved powder "water" of 5/8 as fullness 5/8. Pure
+  // table arithmetic -- no GPU.
+  bool cOk = true;
+  {
+    MaterialNameTable S2 = R;
+    if (!S2.classes.empty()) {
+      S2.classes[(size_t)mSand] = (uint8_t)CLASS_LIQUID;
+      S2.classes[(size_t)mWater] = (uint8_t)CLASS_POWDER;
+      const MatRemap r2 = BuildMatRemap(S2, R);
+      const uint32_t sand38 = r2.Word((uint32_t)mSand | (2u << 12));      // fullness 3/8
+      const uint32_t sandFull = r2.Word((uint32_t)mSand | (7u << 12));    // fullness 8/8
+      const uint32_t water58 = r2.Word((uint32_t)mWater | (7u << 12));    // mass 5/8
+      cOk = PowderMassOfState((sand38 >> 12) & 0xFu) == 3u &&
+            PowderMassOfState((sandFull >> 12) & 0xFu) == kPowderFull &&
+            ((water58 >> 12) & 0xFu) == 4u && !r2.identity;
+      // ...and a table WITHOUT classes (every save before 2026-09-26) converts
+      // nothing: its nibbles load exactly as stored.
+      MaterialNameTable S3 = S2;
+      S3.classes.clear();
+      const MatRemap r3 = BuildMatRemap(S3, R);
+      cOk = cOk && r3.Word((uint32_t)mSand | (2u << 12)) == ((uint32_t)mSand | (2u << 12));
+    } else {
+      cOk = false;
+    }
+  }
+
+  const bool ok = aOk && bOk && cOk;
   detail = Format(
       "A store=%d (%u cells, %u ids moved, %u to air, %u stain types moved)%s | "
       "B end-to-end=%d (%u chunks / %u cells, %u cells moved by name; coat %u "
-      "blood -> %u water; debris 40 stone -> %u wood)%s",
+      "blood -> %u water; debris 40 stone -> %u wood)%s | C class change "
+      "keeps eighths=%d",
       aOk ? 1 : 0, aVoxels, aMoved, aToAir, aStains, whyA.empty() ? "" : (" " + whyA).c_str(),
       bOk ? 1 : 0, bChunks, bCells, bMoved, coatBefore, coatAfter, dbWoodAfter,
-      whyB.c_str());
+      whyB.c_str(), cOk ? 1 : 0);
   std::printf("save-material-remap: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

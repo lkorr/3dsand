@@ -26,7 +26,7 @@ constexpr int kEdge[12][2] = {
 }  // namespace
 
 void PolygonizeChunk(IVec3 o, const uint32_t* occ, std::vector<float>& outVerts,
-                     std::vector<uint32_t>& outIndices) {
+                     std::vector<uint32_t>& outIndices, const uint8_t* dens) {
   const int n = (int)kChunk;
 
   // Weld key: edge midpoints land on halves, so 2*coord is an exact integer.
@@ -43,9 +43,22 @@ void PolygonizeChunk(IVec3 o, const uint32_t* occ, std::vector<float>& outVerts,
     auto it = weld.find(key);
     if (it != weld.end()) return it->second;
     uint32_t idx = (uint32_t)(outVerts.size() / 3);
-    outVerts.push_back((float)o.x + 0.5f * (float)dx);
-    outVerts.push_back((float)o.y + 0.5f * (float)dy);
-    outVerts.push_back((float)o.z + 0.5f * (float)dz);
+    float px = 0.5f * (float)dx, py = 0.5f * (float)dy, pz = 0.5f * (float)dz;
+    if (dens != nullptr) {
+      // Where the density crosses 4 (one half) between the two samples.
+      const int d0 = dens[McOccIndex(x + a[0] + 1, y + a[1] + 1, z + a[2] + 1)];
+      const int d1 = dens[McOccIndex(x + b[0] + 1, y + b[1] + 1, z + b[2] + 1)];
+      if (d0 != d1) {
+        const float t = (4.0f - (float)d0) / (float)(d1 - d0);   // 0..1 from a
+        const float tc = t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
+        px = (float)(x + a[0]) + tc * (float)(b[0] - a[0]);
+        py = (float)(y + a[1]) + tc * (float)(b[1] - a[1]);
+        pz = (float)(z + a[2]) + tc * (float)(b[2] - a[2]);
+      }
+    }
+    outVerts.push_back((float)o.x + px);
+    outVerts.push_back((float)o.y + py);
+    outVerts.push_back((float)o.z + pz);
     weld.emplace(key, idx);
     return idx;
   };

@@ -6926,6 +6926,11 @@ int main(int argc, char** argv) {
     return world.KindAt(c, classOf);
   };
   const Player::KindFn& kindAt = session.kindAt;
+  // The player stands ON grains, not on the cell they sit in: a partial
+  // powder cell is only mass/8 tall (docs/PLAN_powder_mass.md P4).
+  session.player.cellTop = [&world, &classOf](IVec3 c) {
+    return world.CellTopAt(c, classOf);
+  };
 
   // ---- THE HARNESS HOOKS (session.h section E) ----------------------------
   // All three are argv state the FRAME layer owns; passing them as callbacks

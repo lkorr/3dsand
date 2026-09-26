@@ -24,6 +24,12 @@
 class Player {
  public:
   using KindFn = std::function<CellKind(IVec3)>;
+  // HOW TALL a Solid cell is, as a fraction 0..1 of a voxel (1 = a whole
+  // cell). Only a PARTIAL POWDER cell is shorter: it is grains up to
+  // y + mass/8 (docs/PLAN_powder_mass.md P4). Null = every Solid is whole,
+  // which is what every fixture and every non-player caller gets.
+  using TopFn = std::function<float(IVec3)>;
+  TopFn cellTop;
 
   // ONE TICK of the controller. `dt` is kTickDt from every live caller; it
   // stays a parameter because the fixtures drive shorter and longer steps to
@@ -66,6 +72,9 @@ class Player {
     float hx;   // half-width, voxels
     float yLo;  // bottom relative to pos.y (the sole: -kHalfY)
     float yHi;  // top relative to pos.y
+    // The body's cellTop (BoxFor fills it), carried on the box because the
+    // box is what every sweep and probe in player.cpp already receives.
+    const TopFn* top = nullptr;
   };
   Box BoxFor(bool crouched) const;
   Box CurrentBox() const { return BoxFor(crouching); }

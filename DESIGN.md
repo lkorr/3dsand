@@ -857,6 +857,30 @@ SSBO lists of chunk indices.
   walks through a film under `kPowderWalkMin` = 3 eighths (`KindOfWord`).
   Gate `powder-mass`: exact eighths through merge and sink, no buried partial,
   both rooms asleep.
+- **SUB-VOXEL REPOSE AND GRAINY TERRAIN (2026-09-26; PLAN_powder_mass.md P4/P5,
+  `sim.powderFineRepose`, default 1).** The repose rule restated on
+  column-top heights in eighths (`sim_step.wgsl tryFineRepose`): a SURFACE
+  powder cell (nothing solid or powder on it) sheds k = ceil((D - T)/2) eighths
+  into an axis neighbour column whose top is D > T eighths lower, where T is
+  the material's repose in eighths per cell (`reposeEighths`: 8 at 45 degrees,
+  one per-material number, never the per-grain blend roll). For whole cells it
+  moves exactly where the 1:1 tier does; between those it rests with
+  eighth-voxel steps. Every moved grain lands strictly lower, so it terminates
+  and sleeps. The stage-2 diagonal merge onto a partial asks the same drop
+  test (`fineDiagSteep`) and the same surface test, or it would flatten
+  generated steps. WORLDGEN lays loose cover tops as partial cells already at
+  rest under this rule (`worldgen.wgsl looseStep`): an upper step edge 4/8, a
+  staircase column 6/8, flats and feet whole, and only with air generated
+  above (a plant never floats) -- every upper/lower column pair then has
+  upper <= lower, D <= 8. The player stands on grains (`Player::TopFn`,
+  `World::CellTopAt`: a partial cell is solid to y + mass/8 in `Collides` and
+  the downward flush); creatures, whose ground is an int through mob.cpp and
+  pose.cpp, ROUND (`kPowderMobSupportMin` = 4); Jolt terrain is mass-weighted
+  marching cubes (`PolygonizeChunk` `dens`). Grains under standing water draw
+  their cell's empty part as that water (raymarch phase 2). A save's material
+  table records classes (`MaterialNameTable::classes`, 'CLS1'), so a material
+  that changed class converts its nibble (`MatRemap::State`: fullness <->
+  mass, eighths kept).
 - **PER-MATERIAL ANGLE OF REPOSE (2026-09-13).** One down, one across is 45°,
   and for years that was the angle of *every* powder in the engine — dry sand,
   angular gravel, snow, ash and dust all built the same cone. One optional

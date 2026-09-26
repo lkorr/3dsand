@@ -3638,6 +3638,29 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         out.tsMat = 0u;
       }
       if (out.gasHalfT >= tHit) { out.gasHalfT = 0.0; }
+      // ---- GRAINS UNDER WATER (docs/PLAN_powder_mass.md §3.4) --------------
+      // A partial powder cell is grains below and nothing above them, and the
+      // CA will not put water into the rest of the cell (one material per
+      // cell). Drawn literally that is a slot of AIR between a pond and its
+      // silt. The water above is standing on those grains, so the path the
+      // ray took inside this cell, entry to grain, is drawn as that water:
+      // the same optical depth and tint the media branch gives a liquid cell.
+      // Added AFTER the unwind above, which would otherwise take it back out.
+      if (isGrains) {
+        let ac = dc + vec3<i32>(0, 1, 0);
+        if (inBounds(ac)) {
+          let am = voxMat(voxWordAt(ac));
+          if (am != MAT_AIR && materials[am].klass == CLASS_LIQUID &&
+              (materials[am].flags & MATF_OPAQUE) == 0u) {
+            let dTau = mh.t * f32(materials[am].opacity) / 255.0;
+            out.mediaTau += dTau;
+            out.mediaTint += (unpackColor(materials[am].color0) +
+                              unpackColor(materials[am].color1)) * 0.5 * dTau;
+            out.liqPath += mh.t;
+            if (out.mediaMat == 0u) { out.mediaMat = am; out.mediaSurf = 1.0; }
+          }
+        }
+      }
       break;
     }
   }

@@ -3740,11 +3740,43 @@ fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
 // entry, where sand vs sandstone is one far palette slot (sandstone far-aliases
 // sand) and four more ground evaluations per sample would be pure cost.
 fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32) -> i32 {
-  var m = colHeightAt(x + 1, z, seed);
-  m = min(m, colHeightAt(x - 1, z, seed));
-  m = min(m, colHeightAt(x, z + 1, seed));
-  m = min(m, colHeightAt(x, z - 1, seed));
-  return min((*col).h, m + 1);
+  return looseStep(col, x, z, seed).x;
+}
+
+// ---- THE TOP CELL'S GRAINS (docs/PLAN_powder_mass.md P5) -----------------
+//
+// With sim.powderFineRepose a resting powder is judged on column-top heights
+// in EIGHTHS (sim_step.wgsl tryFineRepose): a surface cell sheds when a
+// neighbour column's top is more than T eighths lower, and T is 8 for every
+// powder worldgen lays as loose cover. A loose top cell already satisfies the
+// step line above (every axis neighbour's ground is at least h - 1), so the
+// only pairs that could move are an UPPER column one cell above a LOWER one,
+// and they hold iff  upper's mass <= lower's mass.  So the mass is read off
+// the local step shape, never off a noise that knows nothing of its
+// neighbours:
+//
+//   a lower neighbour and no higher one (the LIP of a step)   4/8
+//   both (a column in the middle of a staircase)              6/8
+//   a higher neighbour only (the FOOT), or flat               whole
+//
+// Every upper/lower pair then has upper in {4, 6} and lower in {6, 8}: at rest
+// by construction, and a 45-degree staircase of whole voxels becomes one of
+// half-voxel steps (the renderer leans a 6/8 cell's top grains uphill).
+// Returns (looseTop, mass); the four heights are the ones looseRestTop always
+// read, so the mass costs nothing extra.
+fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32) -> vec2<i32> {
+  let h = (*col).h;
+  let a = colHeightAt(x + 1, z, seed);
+  let b = colHeightAt(x - 1, z, seed);
+  let c = colHeightAt(x, z + 1, seed);
+  let d = colHeightAt(x, z - 1, seed);
+  let lo = min(min(a, b), min(c, d));
+  let hi = max(max(a, b), max(c, d));
+  var mass = 8;
+  if (TUNE_POWDER_FINE_REPOSE != 0u && lo < h) {
+    mass = select(4, 6, hi > h);
+  }
+  return vec2<i32>(min(h, lo + 1), mass);
 }
 
 // Does this column's cover get the loose/firm split at all? The same two opt-ins
@@ -4799,10 +4831,13 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     // the taper left loose depth to restrict. Every other column keeps
     // genColumn's `looseTop = h`.
     let coverDepth = max(4, i32(wmBiome(col.biome, WM_B_SKIN_DEPTH)));
+    var topMass = 8u;   // the ground cell's grains (looseStep), 8 = whole
     if (coverSplits(col.biome) && base.y <= col.h &&
         base.y + i32(CHUNK) > col.h - coverDepth &&
         looseCoverDepth(&col, coverDepth) > 0) {
-      col.looseTop = looseRestTop(&col, wx, wz, T.seed);
+      let ls = looseStep(&col, wx, wz, T.seed);
+      col.looseTop = ls.x;
+      topMass = u32(ls.y);
     }
     var canopy = -1;
     if (wmFlag(col.biome, WM_BF_CANOPY_ROWS) && !col.inRim && col.pond < 0 &&
@@ -4812,8 +4847,21 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
     }
     for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
       let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
-      let w = genCellIn(&col, &cave, caveValid, &trees, true, &ponds, max(canopy, 0),
+      var w = genCellIn(&col, &cave, caveValid, &trees, true, &ponds, max(canopy, 0),
                         wx, base.y + i32(ly), wz, T.seed);
+      // THE TOP CELL'S GRAINS (looseStep): only a loose POWDER ground cell,
+      // and only with open air above it -- a plant or a cactus standing on a
+      // partial cell would float over its empty half. The cell above is asked
+      // of genCellIn itself (a pure function of the column and y), so the
+      // answer is the same whichever chunk holds it.
+      if (topMass < 8u && base.y + i32(ly) == col.h) {
+        let tm = w & 0xFFFu;
+        if (tm != MAT_AIR && matHasPowderMass(materials[tm]) &&
+            genCellIn(&col, &cave, caveValid, &trees, true, &ponds, max(canopy, 0),
+                      wx, col.h + 1, wz, T.seed) == 0u) {
+          w = (w & ~0xF000u) | ((topMass + 2u) << 12u);
+        }
+      }
       // Chunk-linear: the slot's page resolved once, per §2.1's second entry
       // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
       // every target slot before the dispatch (§3.5c) and this never faults.
@@ -4827,7 +4875,8 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
         let sbit = subOccBitOfLocalIdx(i);
         let sm = 1u << (sbit & 31u);
         if (sbit < 32u) { sm0 |= sm; } else { sm1 |= sm; }
-        if (isRayBlocker(md)) {
+        // Word-level, as sim_occupancy counts it (a thin partial is open).
+        if (isRayBlockerW(md, w)) {
           block += 1u;
           if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
         }
