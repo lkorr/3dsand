@@ -9,6 +9,7 @@
 #include <cstring>
 #include <functional>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "gpu/resources.h"
@@ -30,6 +31,21 @@ static int sRefVpmCompiled = -1;
 // kPassStride (the passUBO dynamic-offset slice stride) moved to pass_table.h
 // when the Vulkan recorder became a second consumer of it — see the note there.
 using pass::kPassStride;
+
+// ---- the worldgen COLUMN CACHE's layout (worldgen.wgsl, same-named block) --
+// kColCacheWords / kColCacheHdr ARE the shader's CC_WORDS / CC_HDR
+// (check_invariants.py holds them together); a block is one chunk-column.
+// kGenColMax is how many distinct chunk-columns one list can name: the window's
+// kNChunk^2, plus every ticket box's own kTicketBoxN^2 (tickets map slots
+// outside the window). genCols holds the per-POSITION map ([0, kNumSlots),
+// worldgen.wgsl GC_REC_BASE) and then kGenColRecWords words per chunk-column.
+namespace {
+constexpr uint32_t kColCacheWords = 24;
+constexpr uint32_t kColCacheHdr = 16;
+constexpr uint32_t kColCacheBlock = kColCacheHdr + kChunk * kChunk * kColCacheWords;
+constexpr uint32_t kGenColMax = kNChunk * kNChunk + kTicketMax * kTicketBoxN * kTicketBoxN;
+constexpr uint32_t kGenColRecWords = 4;
+}  // namespace
 
 bool Simulation::Init(const rhi::Device& device, World& world,
                       const std::vector<MaterialDef>& mats,
@@ -89,7 +105,16 @@ bool Simulation::Init(const rhi::Device& device, World& world,
     queue.WriteBuffer(worldMapBuf_, 0, pad.data(), pad.size() * 4);
   }
 
-  materialBuf_ = CreateBuffer(device, sizeof(MaterialGpu) * 4096,
+  // The worldgen column cache (worldgen.wgsl's block; WriteGenList). Sized for
+  // the widest list: kGenColMax chunk-columns of 256 cached columns each —
+  // 24 MiB at a 512^3 window, written only by the `cols` pre-pass.
+  genColsBuf_ = CreateBuffer(device, (uint64_t)(kNumSlots + kGenColMax * kGenColRecWords) * 4,
+                             rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                             "genCols");
+  colCacheBuf_ = CreateBuffer(device, (uint64_t)kGenColMax * kColCacheBlock * 4,
+                              rhi::BufferUsage::Storage, "colCache");
+
+  materialBuf_ =CreateBuffer(device, sizeof(MaterialGpu) * 4096,
                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                               "materials");
   artPaletteLive_ = false;  // a new buffer holds no palette write
@@ -301,6 +326,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // dense 0..36 layout, and it is NOT mirrored in simSlimBGL_ -- only
         // sim_occupancy names it, and no slim-group pipeline does.
         entry(37, T::Storage),         // chunkHash (per-slot digest + tick)
+        // The worldgen column cache (worldgen.wgsl's block of that name,
+        // Simulation::WriteGenList). genCols is CPU-written list input;
+        // colCache is Storage because `cols` writes it and `main`/`list` read
+        // it, three entry points of one module. Neither is mirrored in
+        // simSlimBGL_: `far`/`fardown` never reach genChunk or `cols`.
+        entry(38, T::ReadOnlyStorage), // genCols (list position -> chunk-column)
+        entry(39, T::Storage),         // colCache (per-(x, z) column records)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1010,6 +1042,8 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(35, world_->reposeSnap),
         b(36, world_->waterFlux),
         b(37, world_->chunkHash),
+        b(38, genColsBuf_),
+        b(39, colCacheBuf_),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1583,6 +1617,11 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
       worldgenList_ =
           MakeComputePipeline(device, simPL_, mWorldgen, "list", "worldgenList");
     });
+    // The column-cache pre-pass both of the above read (worldgen.wgsl `cols`).
+    pool.Add([&] {
+      worldgenCols_ =
+          MakeComputePipeline(device, simPL_, mWorldgen, "cols", "worldgenCols");
+    });
     // Same module as worldgen: the JITTER page fill shares genChunk's
     // slot->world mapping and must not drift from it (world.h's JITTER block).
     pool.Add([&] {
@@ -1753,7 +1792,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // The far set is NOT in this list: it may still be compiling, and a
   // skipped far row is a missing horizon rather than a wrong sim. Their
   // verdict is checked where they are published (PublishFarPipelines).
-  if (!worldgen_ || !worldgenList_ || !pageFill_ || !mutate_ ||
+  if (!worldgen_ || !worldgenList_ || !worldgenCols_ || !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !rainFall_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
@@ -2035,6 +2074,8 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::ChunkHash:           return world_->chunkHash;
     case B::TreeAtlas:           return treeAtlasBuf_;
     case B::WorldMap:            return worldMapBuf_;
+    case B::GenCols:             return genColsBuf_;
+    case B::ColCache:            return colCacheBuf_;
     case B::GasParticlesRead:    return world_->gasParticles[page_];
     case B::GasParticlesWrite:   return world_->gasParticles[1 - page_];
     case B::GasCounts:           return world_->gasCounts;
@@ -2062,6 +2103,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
   switch (p) {
     case P::Worldgen:       return worldgen_;
     case P::WorldgenList:   return worldgenList_;
+    case P::WorldgenCols:   return worldgenCols_;
     case P::PageFill:       return pageFill_;
     case P::Mutate:         return mutate_;
     case P::MutateCells:    return mutateCells_;
@@ -2202,15 +2244,74 @@ void Simulation::EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen) {
   // worldgenList instead (§3.5c) and passes false, which suppresses only the
   // whole-world dispatch — the fill rows still clear the transient buffers.
   cx.denseWorldgen = denseGen;
+  // The dense `main` reads the column cache; WriteDenseGenList sized it.
+  cx.genColCount = genColCount_;
   RecordTable(enc, pass::Table::Worldgen, &cx);
   // A freshly generated world is maximally unsettled — the first hundreds of
   // ticks ARE the settling. Same self-declaration rule (§3.4).
   NoteWakeAll();
 }
 
+uint32_t Simulation::WriteGenList(const rhi::Queue& queue,
+                                  const std::vector<uint32_t>& slots) {
+  queue.WriteBuffer(world_->genList, 0, slots.data(), slots.size() * 4);
+  // genCols (worldgen.wgsl's column-cache block): per list POSITION the
+  // index of its chunk-column, then per chunk-column its world chunk x/z and
+  // the lowest / highest chunk y the list asks for there. Columns are
+  // numbered in first-appearance order, so the table is a pure function of
+  // the list and the window origin -- the same list replays the same
+  // dispatch (the op record carries the list, not this table).
+  const size_t n = slots.size();
+  std::vector<uint32_t>& g = genColScratch_;
+  g.assign(n, 0u);
+  std::vector<uint32_t> recs;
+  recs.reserve(64 * kGenColRecWords);
+  std::unordered_map<uint64_t, uint32_t> index;
+  index.reserve(n);
+  for (size_t p = 0; p < n; p++) {
+    const IVec3 wc = world_->SlotToWorldChunk(slots[p]);
+    const uint64_t key = ((uint64_t)(uint32_t)wc.x << 32) | (uint32_t)wc.z;
+    auto it = index.find(key);
+    uint32_t k;
+    if (it == index.end()) {
+      k = (uint32_t)(recs.size() / kGenColRecWords);
+      if (k >= kGenColMax) {
+        std::fprintf(stderr, "WriteGenList: %zu slots name more than kGenColMax = %u "
+                             "chunk-columns -- the column cache cannot hold them\n",
+                     n, kGenColMax);
+        std::abort();
+      }
+      index.emplace(key, k);
+      recs.push_back((uint32_t)wc.x);
+      recs.push_back((uint32_t)wc.z);
+      recs.push_back((uint32_t)wc.y);
+      recs.push_back((uint32_t)wc.y);
+    } else {
+      k = it->second;
+      const int32_t lo = std::min((int32_t)recs[k * kGenColRecWords + 2], wc.y);
+      const int32_t hi = std::max((int32_t)recs[k * kGenColRecWords + 3], wc.y);
+      recs[k * kGenColRecWords + 2] = (uint32_t)lo;
+      recs[k * kGenColRecWords + 3] = (uint32_t)hi;
+    }
+    g[p] = k;
+  }
+  if (n > 0) queue.WriteBuffer(genColsBuf_, 0, g.data(), n * 4);
+  if (!recs.empty())
+    queue.WriteBuffer(genColsBuf_, (uint64_t)kNumSlots * 4, recs.data(), recs.size() * 4);
+  genColCount_ = (uint32_t)(recs.size() / kGenColRecWords);
+  return genColCount_;
+}
+
+void Simulation::WriteDenseGenList(const rhi::Queue& queue) {
+  std::vector<uint32_t> all(kNumSlots);
+  for (uint32_t s = 0; s < kNumSlots; s++) all[s] = s;
+  WriteGenList(queue, all);
+}
+
 void Simulation::EncodeGenList(const rhi::CommandEncoder& enc, uint32_t count) {
   RecordCtx cx{};
   cx.genCount = count;
+  cx.genColCount = count > 0 ? genColCount_ : 0u;
   RecordTable(enc, pass::Table::GenList, &cx);
   // Streamed-in chunks arrive with fresh terrain that has never settled, and
   // worldgenList marks them dirty. Same self-declaration rule as EncodeWakeAll

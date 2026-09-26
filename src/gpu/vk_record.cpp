@@ -180,6 +180,7 @@ uint32_t Recorder::Extent(uint32_t v, const RecordCtx& cx) {
     case pass::DispatchSel::Chunks:   return kNumSlots;
     case pass::DispatchSel::Chunks64: return kNumSlots / 64;
     case pass::DispatchSel::GenCount: return cx.genCount;
+    case pass::DispatchSel::GenColCount: return cx.genColCount;
     case pass::DispatchSel::FarCount: return cx.farCount;
     case pass::DispatchSel::WindWakeSel: return (cx.windWakeCount + 63) / 64;
     case pass::DispatchSel::FluidSpawnSel: return (cx.fluidSpawnCount + 63) / 64;

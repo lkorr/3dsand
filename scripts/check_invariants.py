@@ -1908,6 +1908,30 @@ def check_readback_ring():
             f"kAcquireSlots = {mv.group(1)} -- the snapshot readback ring is "
             f"sized from the first and the GPU runs ahead by the second")
 
+def check_col_cache_layout():
+    """simulation.cpp kColCacheWords / kColCacheHdr  <->  worldgen.wgsl CC_WORDS / CC_HDR.
+
+    The worldgen column cache (worldgen.wgsl's block of that name) is sized
+    on the CPU and indexed on the GPU. A shader record wider than the CPU's
+    stride reads the next column's words; a narrower one strands the last
+    block's tail past the buffer. Neither faults -- the terrain just moves.
+    """
+    c = read("src/sim/simulation.cpp")
+    w = read("assets/shaders/worldgen.wgsl")
+    if not c or not w:
+        return
+    for cname, wname in (("kColCacheWords", "CC_WORDS"), ("kColCacheHdr", "CC_HDR")):
+        mc = re.search(cname + r"\s*=\s*(\d+)", c)
+        mw = re.search(r"const\s+" + wname + r"\s*:\s*u32\s*=\s*(\d+)u", w)
+        if not mc or not mw:
+            problems.append(f"column cache layout: cannot find {cname} (simulation.cpp) "
+                            f"or {wname} (worldgen.wgsl)")
+            continue
+        checked.append("column cache " + wname)
+        if mc.group(1) != mw.group(1):
+            problems.append(f"column cache layout: simulation.cpp {cname} = {mc.group(1)} "
+                            f"but worldgen.wgsl {wname} = {mw.group(1)}")
+
 def check_autofly_surface():
     """main.cpp's --autofly-surface clearances  <->  --perf's surface-sprint.
 
@@ -2643,6 +2667,7 @@ ALL = {
     "farbits": check_far_material_bits,
     "farface": check_far_face_word,
     "ringdepth": check_readback_ring,
+    "colcache": check_col_cache_layout,
     "burntint": check_burn_tint_sites,
     "plants": check_plant_tiles,
     "gas": check_gas_consts,

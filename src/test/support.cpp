@@ -2305,6 +2305,9 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   tp.labMode = World::LabWorld() ? 1u : 0u;  // fluid-lab slab (world.h)
   ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
   if (world.residency != World::Residency::Paged) {
+    // The dense `main` reads the column cache like `list` does: every slot is
+    // its own list position (before the encoder: WriteBuffer is deferred).
+    sim.WriteDenseGenList(ctx.queue);
     rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
     sim.EncodeWorldgen(enc);
     ctx.queue.Submit(enc.Finish());
@@ -2351,7 +2354,7 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
         world.pages->EnsurePageForOverwrite(base + k);
       }
       world.pages->FlushTableWrites(ctx.queue);
-      ctx.queue.WriteBuffer(world.genList, 0, batch.data(), batch.size() * 4);
+      sim.WriteGenList(ctx.queue, batch);
       TickParams gp{};
       gp.seed = seed;
       gp.genCount = (uint32_t)batch.size();

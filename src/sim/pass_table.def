@@ -855,9 +855,19 @@ PASS(wg_fill_fluidBlockMap, nullptr, PT_WORLDGEN, PIPE_NONE, K_FILL, 0,0,0, GRP_
 // the whole-window path never does. Declared anyway because check_pass_table.py
 // walks the CALL GRAPH from the entry point, not the branch conditions, and a
 // spurious barrier on a buffer no other row touches costs nothing.
+// The column-cache pre-pass (worldgen.wgsl `cols`) the dense dispatch reads,
+// over every chunk-column of the window (Simulation::WriteDenseGenList wrote
+// genCols for slots 0..N-1). Same pass group, so the ColCache W -> R edge
+// below is an in-pass barrier.
+PASS(worldgenColsDense, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN_COLS, K_COMPUTE, D_GENCOLS,1,1,
+     GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
+     USES(R(GenCols) R(Materials) U(TickUBO) W(ColCache) R(TreeAtlas) R(WorldMap)))
+// read-only in practice: `colCache` is read_write for the module because
+// `cols` writes it; genChunk only reads the column records.
 PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_DENSEWG, 1,
      USES(R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
-          R(PageTable) A(PageFaults) R(TreeAtlas) R(WorldMap) W(GenAct)))
+          R(PageTable) A(PageFaults) R(TreeAtlas) R(WorldMap) W(GenAct)
+          R(GenCols) R(ColCache)))
 
 // ========================================================== PT_GENLIST =====
 // Simulation::EncodeGenList — its own encoder, submitted MID-FRAME between
@@ -867,10 +877,20 @@ PASS(worldgen, "worldgen", PT_WORLDGEN, PIPE_WORLDGEN, K_COMPUTE, D_CHUNKS,1,1, 
 // in-flight tick's markDirty/markBoth atomically write the same two buffers —
 // a cross-submit WAW against a shader atomic, covered by barrier_graph §3.4's
 // head-of-command-buffer global barrier, not by anything in this row.
-PASS(worldgenList, "worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_GENCOUNT,1,1,
+// The column-cache pre-pass (worldgen.wgsl `cols`): every (x, z) of the list
+// evaluated ONCE, one workgroup per chunk-column (Simulation::WriteGenList),
+// before genChunk reads it. In the worldgenList pass group, so the PassTimer's
+// `worldgenList` span is the whole streamed-gen cost, pre-pass included.
+PASS(worldgenCols, "worldgenList", PT_GENLIST, PIPE_WORLDGEN_COLS, K_COMPUTE, D_GENCOLS,1,1,
+     GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
+     USES(R(GenCols) R(Materials) U(TickUBO) W(ColCache) R(TreeAtlas) R(WorldMap)))
+// read-only in practice: `colCache` is read_write for the module because
+// `cols` writes it; genChunk only reads the column records.
+PASS(worldgenList,"worldgenList", PT_GENLIST, PIPE_WORLDGEN_LIST, K_COMPUTE, D_GENCOUNT,1,1,
      GRP_SIM, DYN_ZERO, C_GENCOUNT, 1,
      USES(R(GenList) R(Materials) U(TickUBO) W(Voxels) W(Occupancy) A(DirtyIn) A(DirtyOut)
-          R(PageTable) A(PageFaults) R(TreeAtlas) R(WorldMap) W(GenAct)))
+          R(PageTable) A(PageFaults) R(TreeAtlas) R(WorldMap) W(GenAct)
+          R(GenCols) R(ColCache)))
 
 // ========================================================= PT_PAGEFILL =====
 // PageTable::DrainFills — materializes the JITTER pages of ONE tick, recorded

@@ -211,7 +211,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "", "Window shifts, chunk fetch/evict and worldgen. Zero while standing "
      "still; this is the row that flying lights up."},
     {"worldgen", "Worldgen", "worldStorage", PerfSide::Gpu, PerfScope::Count,
-     "worldgen;worldgenList", "Per-cell pure function. Cost is per chunk "
+     "worldgen;worldgenList;worldgenCols;worldgenColsDense", "Per-cell pure function. Cost is per chunk "
      "generated, and only on the frames that generate one."},
     {"pageTable", "Page Table", "worldStorage", PerfSide::Both,
      PerfScope::PageTableCpu,

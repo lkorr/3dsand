@@ -1225,6 +1225,7 @@ static constexpr uint32_t WM_S_Z = worldmap::kS_Z;
 static constexpr uint32_t WM_S_RADIUS = worldmap::kS_Radius;
 static constexpr uint32_t WM_S_PAD_MARGIN = worldmap::kS_PadMargin;
 static constexpr uint32_t WM_S_PRESET = worldmap::kS_Preset;
+static constexpr uint32_t WM_S_PAD_Y = worldmap::kS_PadY;
 static constexpr uint32_t WM_SITE_WATER = worldmap::kSiteWater;
 static uint32_t wmSiteAt(int x, int z) {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
@@ -1243,6 +1244,7 @@ static int wmSiteI(uint32_t sid, uint32_t w) {
     case worldmap::kS_Radius: return s.radius;
     case worldmap::kS_PadMargin: return s.padMargin;
     case worldmap::kS_Preset: return s.preset;
+    case worldmap::kS_PadY: return s.padY;
     default: return 0;
   }
 }
@@ -1946,6 +1948,15 @@ static bool sLabWorld = false;
 void World::SetLabWorld(bool on) { sLabWorld = on; }
 bool World::LabWorld() { return sLabWorld; }
 
+// The bare ground under a pad / stamp site's centre (worldgen.wgsl sitePadY):
+// LoadWorldMap's bake for the load seed. The lab slab is the one world where
+// the centre column is not that terrain -- the shader's landColumnBare returns
+// the slab there -- so the lab answers the slab, as the per-call form did.
+static int sitePadY(uint32_t sid) {
+  if (sLabWorld) { return kLabSlabY; }
+  return wmSiteI(sid, WM_S_PAD_Y);
+}
+
 
 // MIRROR-BEGIN landheight
 // THE HEIGHT CONTRACT (DESIGN.md; landColumn in worldgen.wgsl):
@@ -1967,9 +1978,9 @@ bool World::LabWorld() { return sLabWorld; }
 // stale. The `terrain` gate's pass C1 is the per-voxel proof.
 //
 // COST: ~25 hash3 (two octaves, one pond tile, one pond centre, up to four
-// neighbour tiles, one more centre) for the bare column, and FIVE TIMES THAT on
-// the ~1.5% of columns that fall inside a ruin's pad margin, where four corner
-// columns are sampled as well. That is fine at O(1) per frame — spawn
+// neighbour tiles, one more centre) for the bare column; a site pad adds no
+// second column (its centre height is baked at map load, sitePadY). That is
+// fine at O(1) per frame — spawn
 // placement, fixture anchoring, a mob ground probe. NEVER call it in a
 // per-voxel loop; the GPU has genColumn for that and it is hoisted per column.
 //
@@ -2033,7 +2044,7 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
   return b;
 }
 
-static int sitePadAt(int x, int z, int h, uint32_t seed) {
+static int sitePadAt(int x, int z, int h) {
   const uint32_t sid = wmSiteAt(x, z);
   if (sid == 0u) { return h; }
   if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) == WM_SITE_WATER) { return h; }
@@ -2043,7 +2054,7 @@ static int sitePadAt(int x, int z, int h, uint32_t seed) {
   const int margin = std::max(wmSiteI(sid, WM_S_PAD_MARGIN), 1);
   const int d = std::max(std::max(std::abs(x - sx), std::abs(z - sz)) - r, 0);
   if (d >= margin) { return h; }
-  const int padY = landColumnBare(sx, sz, seed).h;
+  const int padY = sitePadY(sid);
   const int w = ((margin - d) * 256) / margin;
   return h + (((padY - h) * w) >> 8);
 }
@@ -2054,9 +2065,14 @@ int World::TerrainHeight(int x, int z, uint32_t seed) {
   // knobs are tuned, or every scene's fixture heights drift.
   if (sLabWorld) return kLabSlabY;
   const int h = landColumnBare(x, z, seed).h;
-  return sitePadAt(x, z, h, seed);
+  return sitePadAt(x, z, h);
 }
 // MIRROR-END landheight
+
+// worldmap.h: LoadWorldMap's site-pad bake, against whatever map is current.
+int worldmap::BareGroundHeight(int x, int z, uint32_t seed) {
+  return landColumnBare(x, z, seed).h;
+}
 
 
 // The map probe (world.h Column). Composed from the SAME functions the height

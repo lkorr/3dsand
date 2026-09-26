@@ -87,6 +87,7 @@ def read(p):
 PIPE_TO_MEMBER = {
     "PIPE_WORLDGEN": "worldgen_",
     "PIPE_WORLDGEN_LIST": "worldgenList_",
+    "PIPE_WORLDGEN_COLS": "worldgenCols_",
     "PIPE_PAGEFILL": "pageFill_",
     "PIPE_MUTATE": "mutate_",
     "PIPE_MUTATE_CELLS": "mutateCells_",
@@ -271,6 +272,8 @@ BUF_TO_WGSL = {
     # sim_occupancy.wgsl's FULL entry point only; `mainDirty` never names it,
     # which is exactly the rooted-walk case this checker's header describes.
     "ChunkHash": {"chunkHash"},
+    "GenCols": {"genCols"},
+    "ColCache": {"colCache"},
     # MLS-MPM fluid (sim_fluid.wgsl + sim_fluid_seam.wgsl). The particle pair
     # is symbolic: the solver and every seam pass except the compaction source
     # bind the WRITE (working) buffer as `fluidParticles`; the seam's
@@ -339,6 +342,9 @@ _SIM_GROUP0 = {
     # The per-chunk digest table, binding 37 (docs/PLAN_multiplayer_m9.md
     # M9.3-A). simBGL_ only: sim_occupancy runs on the full sim group.
     "chunkHash",
+    # The worldgen column cache, bindings 38/39 (worldgen.wgsl, Simulation::
+    # WriteGenList). simBGL_ only: `cols`, `main` and `list` run on it.
+    "genCols", "colCache",
     # The baked tree atlas, binding 26.
     "treeAtlas",
     # The discharge's emission seam, binding 25 (M3).

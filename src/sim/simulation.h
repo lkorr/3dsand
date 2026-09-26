@@ -61,9 +61,23 @@ class Simulation {
   void UploadEnvironment(const rhi::Device& device, const rhi::Queue& queue,
                          const TreeAtlas& trees, const std::vector<uint32_t>& worldMapWords);
 
+  // A dense (denseGen = true) worldgen reads the column cache like `list`
+  // does, so the caller runs WriteGenList over every slot first
+  // (WriteDenseGenList) with the window origin it put in tickUBO.
   void EncodeWorldgen(const rhi::CommandEncoder& enc, bool denseGen = true);
-  // Generate `count` streamed-in chunks whose SLOT indices the caller wrote to
-  // world.genList (and whose count + window origin are in tickUBO).
+  // THE GEN LIST UPLOAD: writes `slots` to world.genList AND builds the column
+  // cache's input for them (genCols: each slot's chunk-column and the
+  // chunk-columns' y-ranges, worldgen.wgsl's column-cache block) against the
+  // CURRENT window origin -- the origin the caller writes into tickUBO for
+  // the same dispatch. Every EncodeGenList must be preceded by one of these
+  // for the same list; it remembers the chunk-column count the `cols`
+  // pre-pass dispatches. Returns that count.
+  uint32_t WriteGenList(const rhi::Queue& queue, const std::vector<uint32_t>& slots);
+  // WriteGenList over slots 0 .. kNumSlots-1, for the dense `main` dispatch
+  // (a slot is its own list position there).
+  void WriteDenseGenList(const rhi::Queue& queue);
+  // Generate `count` streamed-in chunks whose SLOT indices WriteGenList wrote
+  // (and whose count + window origin are in tickUBO).
   void EncodeGenList(const rhi::CommandEncoder& enc, uint32_t count);
   // Post-load reset: clears transient state (hash/particles/claims) and
   // rebuilds occupancy over freshly uploaded voxels. Caller has already
@@ -683,6 +697,15 @@ class Simulation {
   // atlas above.
   rhi::Buffer worldMapBuf_;
   size_t worldMapWords_ = 0;
+  // The worldgen COLUMN CACHE (worldgen.wgsl's block of that name, bindings
+  // 38/39 in simBGL_ only): genCols is the CPU-written map from list position
+  // to chunk-column plus each chunk-column's coords and y-range; colCache is
+  // what the `cols` pre-pass evaluates per (x, z) and genChunk reads.
+  // genColCount_ is the chunk-column count of the last WriteGenList, the
+  // `cols` dispatch extent. genColScratch_ is WriteGenList's staging.
+  rhi::Buffer genColsBuf_, colCacheBuf_;
+  uint32_t genColCount_ = 0;
+  std::vector<uint32_t> genColScratch_;
   // Art palette RGB (0x00RRGGBB), indexed from kArtPaletteBaseGpu. Cached so a
   // materials hot-reload can restore it — see SetArtPalette.
   std::vector<uint32_t> artPalette_;
@@ -709,7 +732,7 @@ class Simulation {
       farBGL_, microBodyBGL_, fluidBGL_, fluidSeamBGL_, shadowBGL_, gasBGL_;
   rhi::PipelineLayout simPL_, simPL2_, renderPL_, farPL_, microBodyPL_, fluidPL_,
       fluidSeamPL_, shadowPL_, gasPL_;
-  rhi::ComputePipeline worldgen_, worldgenList_, mutate_, mutateCells_, compact_,
+  rhi::ComputePipeline worldgen_, worldgenList_, worldgenCols_, mutate_, mutateCells_, compact_,
       compactNext_, step_, reposeSnap_, occupancy_, occupancyDirty_, pick_;
   // Wind primitive footprint wake (sim_mutate.wgsl `windWake`) — see
   // docs/RESEARCH_wind.md §4.3.

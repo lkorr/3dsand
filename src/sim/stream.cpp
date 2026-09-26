@@ -1049,8 +1049,9 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
     // the first window shift. Stashed here, folded into this tick's frame by
     // SubmitTick. Free unless a record or a replay is armed.
     sandvox::opstream::NoteGenList(lastTick_, genSlots);
-    ctx_->queue.WriteBuffer(world_->genList, 0, genSlots.data(),
-                            genSlots.size() * 4);
+    // genList plus the column cache's chunk-column table, against the window
+    // origin written into tickUBO below (Simulation::WriteGenList).
+    sim_->WriteGenList(ctx_->queue, genSlots);
     TickParams tp{};
     tp.seed = seed_;
     tp.genCount = (uint32_t)genSlots.size();

@@ -231,6 +231,12 @@ enum class Buf : uint8_t {
   // has to know about: a compute write followed by a transfer read in the same
   // command buffer, exactly Hash's situation one array wider.
   ChunkHash,
+  // ---- the worldgen column cache (worldgen.wgsl, Simulation::WriteGenList) ----
+  // genCols is CPU-written list input (WriteBuffer, drained at the head of the
+  // command buffer); colCache is written by `cols` and read by genChunk in
+  // the SAME command buffer, which is the hazard the table has to know about.
+  GenCols,
+  ColCache,
   kCount,
 };
 
@@ -258,6 +264,8 @@ enum class Kind : uint8_t { Compute, ComputeIndirect, Copy, Fill };
 enum class Pipe : uint8_t {
   None,
   Worldgen, WorldgenList,
+  // The column-cache pre-pass both of the above read (worldgen.wgsl `cols`).
+  WorldgenCols,
   Mutate, MutateCells,
   // The wind primitive footprint wake (sim_mutate.wgsl `windWake`): the only
   // kernel in the engine that dirty-marks a chunk without writing a voxel.
@@ -533,6 +541,7 @@ enum class DispatchSel : uint32_t {
   Chunks,     // kNumChunks
   Chunks64,   // kNumChunks / 64
   GenCount,   // EncodeGenList count
+  GenColCount,  // chunk-columns of the gen list (Simulation::WriteGenList)
   FarCount,   // EncodeFarFill count
   IndDispatchArgs,   // indirect: world.dispatchArgs @ 0
   IndPDispatchArgs,  // indirect: world.pDispatchArgs @ 0
@@ -654,6 +663,7 @@ struct RecordCtx {
   uint32_t expCount = 0;
   uint32_t spawnCount = 0;
   uint32_t genCount = 0;
+  uint32_t genColCount = 0;     // chunk-columns of the list: the `cols` pre-pass extent
   uint32_t farCount = 0;
   uint32_t fluidCount = 0;       // MLS-MPM particles alive AFTER this tick's spawns
   uint32_t fluidSpawnCount = 0;  // MLS-MPM spawn ops this tick

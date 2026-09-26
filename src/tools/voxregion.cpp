@@ -244,6 +244,7 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
 
   Tally tally;
   std::vector<uint32_t> scratch;
+  std::vector<uint32_t> verdict;   // genAct, one word per batch position
   // Batch size bounded by the pool so the materialize below can never fail,
   // and by a readback that stays a few MiB.
   const uint32_t poolBatch = std::max(64u, world.pages->PoolPages() / 2u);
@@ -257,7 +258,7 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
       world.pages->EnsurePageForOverwrite(batchSlots[k]);
     }
     world.pages->FlushTableWrites(ctx.queue);
-    ctx.queue.WriteBuffer(world.genList, 0, batchSlots.data(), n * 4);
+    sim.WriteGenList(ctx.queue, batchSlots);
     TickParams gp{};
     gp.seed = req.seed;
     gp.genCount = n;
@@ -272,13 +273,32 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
       ctx.queue.Submit(enc.Finish());
     }
 
-    // Read back in maximal runs of consecutive slots. ReadVoxelsSync already
-    // coalesces consecutive PAGES inside a run and synthesises sentinels, so
-    // this only has to find the slot runs.
+    // ---- THE SKY SKIP. genChunk publishes each listed chunk's page-table
+    // class into genAct (world.h kGenVerdict*; SubmitWorldgen demotes on the
+    // same words), and EMPTY is exact: genChunk writes no stain and no bit 31,
+    // so a chunk with no non-air cell is 4,096 zero words. Every sample such a
+    // chunk owns is therefore air -- 0, which `grid` already holds -- so it is
+    // neither read back (16 KiB each) nor downsampled. The sky is about half of
+    // a coarse box, and its readback was most of the request.
+    verdict.resize(n);
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, world.genAct, 0, verdict.data(),
+                          (size_t)n * 4, "voxVerdict");
+    auto skyChunk = [&](uint32_t i) {
+      const uint32_t v = verdict[i];
+      return (v & kGenVerdictValid) != 0u &&
+             ((v >> kGenVerdictClassShift) & kGenVerdictClassMask) == kGenVerdictEmpty;
+    };
+
+    // Read back in maximal runs of consecutive non-sky slots. ReadVoxelsSync
+    // already coalesces consecutive PAGES inside a run and synthesises
+    // sentinels, so this only has to find the slot runs.
     uint32_t k = 0;
     while (k < n) {
+      if (skyChunk(k)) { k++; continue; }
       uint32_t run = 1;
-      while (k + run < n && batchSlots[k + run] == batchSlots[k] + run) run++;
+      while (k + run < n && !skyChunk(k + run) &&
+             batchSlots[k + run] == batchSlots[k] + run)
+        run++;
       scratch.resize((size_t)run * kChunkVol);
       ReadVoxelsSync(ctx, world, batchSlots[k], run, scratch.data(),
                      "voxregion");

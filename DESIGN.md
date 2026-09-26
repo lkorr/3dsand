@@ -595,6 +595,23 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   do instead (do not generate the ~586 pure-sky chunks of a plane at all, which
   needs a CPU mirror of worldgen's `colTop`) are in
   docs/RESEARCH_streaming_hitch.md §R2/P4-G.
+- **The worldgen column cache (map-overhaul P4, 2026-09-26).** A streamed X/Z
+  plane is 32 chunks tall, and `genChunk` used to evaluate each of its ~8k
+  columns ~32 times. `Simulation::WriteGenList` now uploads, with the slot
+  list, each list position's CHUNK-COLUMN and each chunk-column's y-range
+  (`genCols`); a `cols` pre-pass (worldgen.wgsl, one workgroup per
+  chunk-column, same command buffer, pass-table edge on `ColCache`) evaluates
+  every (x, z) ONCE — `genColumn`, the cave bands, canopy memo, loose step
+  line, tree-candidate top and the column's sky ceiling — and `genChunk`
+  (`list` and the dense `main`) reads the records. The block header's max
+  ceiling is a GPU-side whole-chunk sky test: a chunk above it stores zeros
+  without reading a column. Tree tiles are evaluated once per chunk into
+  workgroup memory (`treeTilesFill`; the pond gates stay per column,
+  `treePondOk`). Every skip is exact (hash-neutral: `determinismHash`
+  unchanged, paged and dense). Measured under `SANDVOX_RUN_EXCLUSIVE=1 --perf
+  --scenario surface-sprint`: `worldgenList` 5.04 -> 3.96 ms per dispatch
+  (-21%); cold driver compile of `list`/`main` 107/108 s -> 5.3/5.1 s (the new
+  `cols` 31 s, compiled in parallel), `far` 79 -> 33 s.
 - **One shift per frame (R4, same doc):** `Stream::Update` is a per-TICK call
   and the frame loop runs up to four ticks, so a slow frame used to shift two
   or three times and compound its own slowness. `Stream::BeginFrame()` (called
@@ -663,9 +680,10 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
     neighbour is 0; nothing below one chunk under the surface except 19
     settle chunks.
   - **Cause 1 FIXED (2026-09-23, PLAN S2b): the local step line.**
-    `genChunk` computes, for every column whose cover splits (sand cap, or a
-    powder skin with an authored `firmSkin`) in the chunk that holds its loose
-    band, `looseTop = min(h, min(axis-neighbour ground) + 1)` from four
+    The column-cache pre-pass (`cols`, for `genChunk`) computes, for every
+    column whose cover splits (sand cap, or a powder skin with an authored
+    `firmSkin`) where a listed chunk holds its loose band,
+    `looseTop = min(h, min(axis-neighbour ground) + 1)` from four
     `colHeightAt` calls, and `genCellIn` lays a loose cell only at
     `y <= looseTop`; anything above goes to the firm cover (`sandstone`). This
     is exact, not statistical: sim_step moves a 1:1 powder only straight down
@@ -16032,7 +16050,10 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   plane (`site id + 1`). In the shader `wmSiteAt` is one plane read per
   column; **`sitePadAt`** (inside the height mirror, identical in
   `world.cpp`) levels the ground under the footprint to the site centre's
-  height and ramps back over the margin — `ruinPad` generalised, and
+  height and ramps back over the margin — that centre height (the BARE ground,
+  `landColumnBare`) is baked ONCE by `LoadWorldMap` for the load seed into
+  the record (`kS_PadY`, `sitePadY`; the lab slab answers the slab), not
+  re-derived per column and per stamp voxel — `ruinPad` generalised, and
   `World::TerrainHeight` applies it too, so the height contract holds;
   **`wmStampCell`** overlays the template's runs above the pad in
   `genCellIn` (non-air replaces, air leaves the world alone) — pure

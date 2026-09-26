@@ -42,6 +42,7 @@ namespace {
 #define PIPE_NONE            Pipe::None
 #define PIPE_WORLDGEN        Pipe::Worldgen
 #define PIPE_WORLDGEN_LIST   Pipe::WorldgenList
+#define PIPE_WORLDGEN_COLS   Pipe::WorldgenCols
 #define PIPE_MUTATE          Pipe::Mutate
 #define PIPE_MUTATE_CELLS    Pipe::MutateCells
 #define PIPE_WIND_WAKE       Pipe::WindWake
@@ -178,6 +179,7 @@ namespace {
 #define D_CHUNKS    (uint32_t)DispatchSel::Chunks
 #define D_CHUNKS64  (uint32_t)DispatchSel::Chunks64
 #define D_GENCOUNT  (uint32_t)DispatchSel::GenCount
+#define D_GENCOLS   (uint32_t)DispatchSel::GenColCount
 #define D_FARCOUNT  (uint32_t)DispatchSel::FarCount
 #define IND_DISPATCHARGS  (uint32_t)DispatchSel::IndDispatchArgs
 #define IND_PDISPATCHARGS (uint32_t)DispatchSel::IndPDispatchArgs

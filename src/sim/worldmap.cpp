@@ -1066,6 +1066,24 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       }
   }
 
+  // ---- the site pads: bare ground at each pad / stamp centre, for `seed` ----
+  // sitePadAt, the stamp overlay and the stamp's sky ceiling all need the
+  // ground the CENTRE column would have without its pad. It is seed-dependent
+  // but position-fixed, so it is computed ONCE here instead of by a
+  // landColumnBare per column (sitePadAt) and per voxel (the stamp) on the GPU.
+  // The CPU twin reads the CURRENT map, so the map being loaded is installed
+  // for the duration and the previous one put back: nothing it computes reads
+  // a pad (landColumnBare is the ground BEFORE the pad), so the order of the
+  // sites does not matter. Exact because the twin is the height mirror the
+  // `terrain` gate holds to the shader per voxel.
+  {
+    WorldMapData prev = std::move(Slot());
+    Slot() = out;
+    for (WorldMapData::StampSite& st : out.sites)
+      st.padY = st.kind == kSiteWater ? 0 : BareGroundHeight(st.x, st.z, seed);
+    Slot() = std::move(prev);
+  }
+
   uint32_t hsh = 2166136261u;
   hsh = FnvBytes(hsh, raw.data(), raw.size());
   {
@@ -1124,6 +1142,7 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
     r[kS_Rot] = U(s.rot);
     r[kS_Salt] = s.salt;
     r[kS_Preset] = U(s.preset);
+    r[kS_PadY] = U(s.padY);
     if (s.kind != kSiteStamp || s.words.empty()) continue;   // a water site has no block
     // The stamp block: rebase its relative offsets (column dir + run offsets)
     // onto the buffer as it is appended.

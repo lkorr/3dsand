@@ -8,6 +8,9 @@
 // per lattice tile by tile hash and re-derived by every cell that asks.
 //
 // ENTRY POINTS (one 64-thread workgroup per chunk unless noted):
+//   cols      the column-cache pre-pass: one workgroup per CHUNK-COLUMN of
+//             the list main / list are about to generate (genCols), each
+//             (x, z) evaluated once
 //   main      the whole slot space (NUM_SLOTS workgroups): startup / regen
 //   list      T.genCount slots from genList: streamed-in chunks; also
 //             publishes the generation verdict (genAct) the CPU classifies
@@ -17,12 +20,15 @@
 //   farpatch  re-applies persisted edits over a `far` refill
 //   fardown   downsamples live, dirty chunks into the cascades
 //
-// THE PIPELINE, per chunk: genChunk walks COLUMNS. genColumn(x, z) evaluates
-// everything that is a function of the column alone -- landColumn (the ground
-// height `h`: the landAt octave ladder, the pond bowl / berm, the sea, the
-// site pad; mirrored in world.cpp as World::TerrainHeight), the biome, the
-// shore band and the tile plant -- and genChunk adds the column's cave bands,
-// tree candidates and canopy cover. genCellIn(col, y) then decides the one
+// THE PIPELINE: genColumn(x, z) evaluates everything that is a function of the
+// column alone -- landColumn (the ground height `h`: the landAt octave ladder,
+// the pond bowl / berm, the sea, the site pad; mirrored in world.cpp as
+// World::TerrainHeight), the biome, the shore band and the tile plant -- and
+// colPrologue adds the column's cave bands, tree candidates and canopy cover
+// for the range of heights about to be asked. `cols` stores that per (x, z)
+// into the column cache with the column's sky ceiling; genChunk (main / list)
+// reads it back and walks each column's sixteen cells; `far` does the same
+// per sample column without a cache. genCellIn(col, y) then decides the one
 // material at each height: terrain body and skin, caves, standing fluid and
 // pond life, trees, shore plants, cacti, the biome cover stack, site stamps.
 //
@@ -75,6 +81,34 @@ const GEN_V_EMPTY : u32 = 1u;
 const GEN_V_UNIFORM : u32 = 2u;
 const GEN_V_JITTER : u32 = 3u;
 const GEN_V_MAT_SHIFT : u32 = 4u;
+// ---- THE COLUMN CACHE (the `cols` pre-pass; Simulation::WriteGenList) ------
+// A listed chunk's columns are functions of (x, z) alone, and a streamed
+// X/Z plane is 32 chunks tall: genChunk used to evaluate each column ~32
+// times. `cols` evaluates each (x, z) of the list ONCE, per chunk-COLUMN (the
+// 16x16 columns of one world chunk x/z), and genChunk reads the answer.
+//
+// genCols, written by the CPU with the list:
+//   [0, NUM_SLOTS)                  per list POSITION: its chunk-column index k
+//   [GC_REC_BASE + GC_REC_WORDS k]  chunk-column k: world chunk x, z, and the
+//                                   lowest / highest chunk y the list asks for
+//                                   on it (i32 as u32)
+// colCache, written by `cols` and read by `main` / `list`: one block of
+// CC_BLOCK words per chunk-column -- a CC_HDR-word header (CCH_*: the
+// block's highest column sky ceiling, highest tree-candidate top and lowest
+// ground), then CHUNK*CHUNK columns of CC_WORDS each (x fastest, the order
+// genChunk's ci walks; CCW_* below). The two layout numbers are
+// src/sim/simulation.cpp's kColCacheWords / kColCacheHdr (check_invariants).
+// Bindings 38/39 exist ONLY in simBGL_, like genAct.
+@group(0) @binding(38) var<storage, read> genCols : array<u32>;
+@group(0) @binding(39) var<storage, read_write> colCache : array<u32>;
+const GC_REC_BASE : u32 = NUM_SLOTS;
+const GC_REC_WORDS : u32 = 4u;
+const CC_WORDS : u32 = 24u;
+const CC_HDR : u32 = 16u;
+const CC_BLOCK : u32 = CC_HDR + CHUNK * CHUNK * CC_WORDS;
+const CCH_TOP : u32 = 0u;        // max over the block's columns of CCW_TOP
+const CCH_TREE_TOP : u32 = 1u;   // max of CCW_TREE_TOP
+const CCH_MIN_H : u32 = 2u;      // min of the columns' ground h
 // The BAKED TREE ATLAS (src/sim/treeatlas.h). Read-only asset data uploaded
 // once at load, like `materials` — see the tree section below for the layout
 // and for why worldgen samples a baked grid instead of evaluating tree shapes.
@@ -1297,6 +1331,7 @@ const WM_S_ROT           : u32 = 5u;
 const WM_S_SALT          : u32 = 6u;
 const WM_S_STAMP_OFF     : u32 = 7u;
 const WM_S_PRESET        : u32 = 8u;    // water site: 1 + preset index
+const WM_S_PAD_Y         : u32 = 9u;    // pad / stamp site: bare ground at the centre (baked)
 const WM_SITE_STAMP      : u32 = 1u;
 const WM_SITE_WATER      : u32 = 2u;    // an authored lake (worldmap.h kSiteWater)
 const WM_STAMP_HDR_WORDS : u32 = 4u;
@@ -1571,6 +1606,19 @@ fn wmSiteAt(x : i32, z : i32) -> u32 {
 fn wmSiteI(sid : u32, w : u32) -> i32 {
   return bitcast<i32>(worldMap[worldMap[WM_H_SITE_TABLE] + (sid - 1u) * WM_S_WORDS + w]);
 }
+// The bare ground under a pad / stamp site's CENTRE: landColumnBare's h there,
+// which the pad levels its footprint to and the stamp stands on. Seed-dependent
+// but position-fixed, so LoadWorldMap bakes it once for the load seed
+// (worldmap.h kS_PadY) instead of every column of a pad margin and every voxel
+// of a stamp re-running the octave ladder at the centre -- and, the bigger
+// half, instead of one more inlined landColumnBare in every caller the driver
+// compiles. The lab slab is the one world whose centre column is not that
+// terrain (landColumnBare returns the slab there), so it answers the slab, as
+// the per-call form did. world.cpp spells the same helper.
+fn sitePadY(sid : u32) -> i32 {
+  if (T.labMode != 0u) { return LAB_SLAB_Y; }
+  return wmSiteI(sid, WM_S_PAD_Y);
+}
 // A water site keeps out by its DISC plus its shore/berm band, not by
 // its cells: a lake's cells are four 102 m squares and a stamp's rule would
 // bald the forest around every tarn on the map. Every other kind keeps its
@@ -1587,7 +1635,7 @@ fn siteKeepOut(x : i32, z : i32) -> bool {
 }
 // The template voxel this world cell would carry, MAT_AIR if none: the
 // stamp's footprint is centred on the site, its bottom row sits one above
-// the pad height (`padY`, which the caller resolves the way sitePadAt does).
+// the pad height (`padY`, sitePadY: the same baked height sitePadAt levels to).
 fn wmStampCell(sid : u32, x : i32, y : i32, z : i32, padY : i32) -> u32 {
   let blk = u32(wmSiteI(sid, WM_S_STAMP_OFF));
   if (blk == 0u) { return MAT_AIR; }
@@ -1612,15 +1660,12 @@ fn wmStampCell(sid : u32, x : i32, y : i32, z : i32, padY : i32) -> u32 {
 // The top of whatever a site puts above the ground at this column, for the
 // sky early-out and the far blocker band: pad height + the stamp's height.
 // -1e6 where there is no site, so max() ignores it.
-fn wmSiteTopAt(x : i32, z : i32, seed : u32) -> i32 {
+fn wmSiteTopAt(x : i32, z : i32) -> i32 {
   let sid = wmSiteAt(x, z);
   if (sid == 0u) { return -1048576; }
   let blk = u32(wmSiteI(sid, WM_S_STAMP_OFF));
   if (blk == 0u) { return -1048576; }
-  var padCol : LandCol;
-  landColumnBare(wmSiteI(sid, WM_S_X), wmSiteI(sid, WM_S_Z), seed, &padCol);
-  let padY = padCol.h;
-  return padY + 1 + i32(worldMap[blk + WM_STAMP_NY]);
+  return sitePadY(sid) + 1 + i32(worldMap[blk + WM_STAMP_NY]);
 }
 
 // ---- THE LANDFORM PLANE (P4): the map owns the continental rung -----------
@@ -1775,6 +1820,10 @@ struct Tree {
   shade   : i32,   // 0..255 canopy cover cast on the forest floor
   autumn  : bool,  // this TREE (not this species) wears the autumn ramp
   rnd     : u32,   // spare bits for per-tree jitter
+  // The (biome, species) row's near-water bounds (-1 / 0 = unbounded), for
+  // treePondOk: the one gate that depends on the ASKING column's pond set.
+  nwMax   : i32,
+  nwMin   : i32,
 };
 
 // The HASH-ONLY half: WHERE the trunk stands, and nothing that costs a noise
@@ -1863,7 +1912,35 @@ fn nearWaterOk(d : i32, nearMax : i32, nearMin : i32) -> bool {
 // per-species steepness gate needs: `Land.slope` is the coarse landform
 // gradient (the hill octaves, not the grain), which is the only gradient a
 // slope gate may read — the grain octave crosses a whole gate in one column.
+//
+// SPLIT IN TWO AT THE POND SET. Every gate but two is a function of the TILE
+// alone; those two -- "no trunk inside a pond disc" and a row's near-water
+// bound -- read the ASKING column's pond candidates, which differ from column
+// to column. treeInfoBare is the tile half, treePondOk the column half, and a
+// tree is present exactly when both say so: every gate is a `return` of a
+// non-present tree, so their order cannot change the answer, and no reader
+// looks at a non-present tree's other fields. The split is what lets genChunk
+// and `cols` evaluate each tile ONCE per chunk (the tree tile cache, below)
+// instead of once per column that scans it.
 fn treeInfoAt(s : TreeSite, land : Land, seed : u32, ponds : ptr<function, PondSet>) -> Tree {
+  var t = treeInfoBare(s, land, seed);
+  if (t.present && !treePondOk(&t, ponds)) { t.present = false; }
+  return t;
+}
+// The column half: the trunk is not in a pond candidate's disc, and a row
+// that authors a water distance has it.
+fn treePondOk(t : ptr<function, Tree>, ponds : ptr<function, PondSet>) -> bool {
+  if (pondCoversP(ponds, (*t).wx, (*t).wz)) { return false; }
+  let nwMax = (*t).nwMax;
+  let nwMin = (*t).nwMin;
+  if (nwMax >= 0 || nwMin > 0) {
+    let d = waterDistAt(ponds, (*t).wx, (*t).wz, max(nwMax, nwMin));
+    if (!nearWaterOk(d, nwMax, nwMin)) { return false; }
+  }
+  return true;
+}
+// The tile half: everything else.
+fn treeInfoBare(s : TreeSite, land : Land, seed : u32) -> Tree {
   var t : Tree;
   t.present = false;
   t.sp = -1; t.varOff = 0u;
@@ -1871,6 +1948,7 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32, ponds : ptr<function, PondS
   t.rot = 0u; t.mir = false;
   t.reach = 0; t.above = 0; t.crownR = 0; t.shade = 0; t.autumn = false;
   t.rnd = s.hsh;
+  t.nwMax = -1; t.nwMin = 0;
 
   let ns = taSpeciesCount();
   if (ns <= 0) { return t; }            // no atlas: a legal, treeless world
@@ -1880,9 +1958,9 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32, ponds : ptr<function, PondS
   let hsh = s.hsh;
   let h = land.h;
 
-  // No trees on snowfields, in ponds, or over the selftest fixture sites.
+  // No trees on snowfields, in ponds (treePondOk), or over the selftest
+  // fixture sites.
   if (h >= treeline()) { return t; }
-  if (pondCoversP(ponds,t.wx, t.wz)) { return t; }
   // (The spawn clearing is checked AFTER the species draw, where the crown's
   // real width is known — see the note at that test.)
 
@@ -1946,12 +2024,10 @@ fn treeInfoAt(s : TreeSite, land : Land, seed : u32, ponds : ptr<function, PondS
     if (rMaxY >= 0 && h > rMaxY) { return t; }
     let rSlope = i32(treeAtlas[cb + TA_C_MAX_SLOPE]);
     if (rSlope > 0 && rSlope < 1024 && land.slope > rSlope) { return t; }
-    let nwMax = bitcast<i32>(treeAtlas[cb + TA_C_NEAR_WATER_MAX]);
-    let nwMin = i32(treeAtlas[cb + TA_C_NEAR_WATER_MIN]);
-    if (nwMax >= 0 || nwMin > 0) {
-      let d = waterDistAt(ponds, t.wx, t.wz, max(nwMax, nwMin));
-      if (!nearWaterOk(d, nwMax, nwMin)) { return t; }
-    }
+    // The water distance is the column's to ask (treePondOk); the bounds ride
+    // on the tree.
+    t.nwMax = bitcast<i32>(treeAtlas[cb + TA_C_NEAR_WATER_MAX]);
+    t.nwMin = i32(treeAtlas[cb + TA_C_NEAR_WATER_MIN]);
     // The biome's patch field, sampled at the trunk with a tree-only offset
     // so a stand of this species does not line up with a cover row's lattice.
     let rPatch = i32(treeAtlas[cb + TA_C_PATCH_THRESH]);
@@ -2122,6 +2198,44 @@ fn treeLocalXZ(t : Tree, dx : i32, dz : i32) -> vec2<i32> {
   return vec2<i32>(ax + rx, az + rz);
 }
 
+// One tile's tree offered to column (x, z)'s candidate set: `t` is the tile's
+// tree with the column's pond gates applied. The scan's per-tile half, shared
+// by the direct scan and the tile-cache scan so the two cannot disagree.
+fn treeCandAdd(c : ptr<function, TreeCands>, t : ptr<function, Tree>, x : i32, z : i32) {
+  if (!(*t).present) { return; }
+  // Now the species' OWN reach, which is what actually decides.
+  if (abs(x - (*t).wx) > (*t).reach || abs(z - (*t).wz) > (*t).reach) { return; }
+
+  // The column lookup, hoisted. A tree whose baked grid has nothing in this
+  // column is not a candidate at all: the atlas is the whole tree, so an
+  // empty column can contribute nothing.
+  let l = treeLocalXZ(*t, x - (*t).wx, z - (*t).wz);
+  let vo = (*t).varOff;
+  let nx = i32(treeAtlas[vo + TA_V_NX]);
+  let nz = i32(treeAtlas[vo + TA_V_NZ]);
+  if (l.x < 0 || l.y < 0 || l.x >= nx || l.y >= nz) { return; }
+  let ci = treeAtlas[vo + TA_V_COLUMNS] + u32(l.y * nx + l.x) * 2u;
+  let cnt = treeAtlas[ci + 1u];
+  if (cnt == 0u) { return; }
+
+  if ((*c).n >= TREE_CAND_MAX) { return; }   // see the derivation at TreeCands
+  var e : TreeCand;
+  e.wx = (*t).wx; e.wz = (*t).wz; e.base = (*t).base;
+  e.ny = i32(treeAtlas[vo + TA_V_NY]);
+  // Local y 0 sits one voxel ABOVE the ground: genCellIn only asks about
+  // cells with y > h, so a row at y == base could never be reached and
+  // baking one would waste a layer of every variant.
+  e.vtop = (*t).base + 1 + e.ny;
+  e.colOff = treeAtlas[ci];
+  e.colCnt = cnt;
+  e.leafSw = select(0u,
+      treeAtlas[TA_H_SPECIES_DIR] + u32((*t).sp) * TA_SPECIES_WORDS,
+      (*t).autumn);
+  (*c).t[(*c).n] = e;
+  (*c).n = (*c).n + 1;
+  (*c).top = max((*c).top, e.vtop);
+}
+
 fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) {
   (*c).n = 0;
   (*c).top = -1048576;
@@ -2137,39 +2251,76 @@ fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32, pon
       // that is the inner ring, on a fine one most of the scan.
       let s = treeSite(tx + ox, tz + oz, seed);
       if (abs(x - s.wx) > maxReach || abs(z - s.wz) > maxReach) { continue; }
-      let t = treeInfoAt(s, landAt(s.wx, s.wz, seed), seed, ponds);
-      if (!t.present) { continue; }
-      // Now the species' OWN reach, which is what actually decides.
-      if (abs(x - t.wx) > t.reach || abs(z - t.wz) > t.reach) { continue; }
+      var t = treeInfoAt(s, landAt(s.wx, s.wz, seed), seed, ponds);
+      treeCandAdd(c, &t, x, z);
+    }
+  }
+}
 
-      // The column lookup, hoisted. A tree whose baked grid has nothing in this
-      // column is not a candidate at all: the atlas is the whole tree, so an
-      // empty column can contribute nothing.
-      let l = treeLocalXZ(t, x - t.wx, z - t.wz);
-      let nx = i32(treeAtlas[t.varOff + TA_V_NX]);
-      let nz = i32(treeAtlas[t.varOff + TA_V_NZ]);
-      if (l.x < 0 || l.y < 0 || l.x >= nx || l.y >= nz) { continue; }
-      let ci = treeAtlas[t.varOff + TA_V_COLUMNS] +
-               u32(l.y * nx + l.x) * 2u;
-      let cnt = treeAtlas[ci + 1u];
-      if (cnt == 0u) { continue; }
+// ---- THE TREE TILE CACHE: a chunk's tiles, evaluated once per workgroup ------
+//
+// Every column of a 16x16 chunk scans the same few tiles: its own tile +-
+// TREE_SCAN, and at a 56-voxel lattice all 256 columns share at most 6x6 of
+// them. The tile's tree -- its site, the landAt under it, the biome draw, the
+// species and variant, every gate but the column's pond gates -- is a function
+// of the TILE alone (treeInfoBare), so genChunk and `cols` evaluate each
+// tile once into workgroup memory and every column's scan reads it, instead of
+// each column re-deriving ~25 trees (a landAt and a biome draw apiece). The
+// pond gates stay per column (treePondOk): they read the ASKING column's pond
+// set, and that is the half that genuinely differs between columns.
+//
+// The tile window of a chunk at (bx, bz): for a column x in [bx, bx + CHUNK),
+// fdiv(x, TREE_TILE) spans at most (CHUNK - 1) / TREE_TILE + 1 tiles, and the
+// scan adds TREE_SCAN on each side.
+const WG_TREE_AXIS : i32 = (i32(CHUNK) - 1) / TREE_TILE + 2 + 2 * TREE_SCAN;
+const WG_TREE_TILES : i32 = WG_TREE_AXIS * WG_TREE_AXIS;
+// The workgroup memory it costs, bounded well inside the 16 KiB every Vulkan
+// device guarantees: a Tree is 16 words, so 128 tiles is 8 KiB. The tree
+// atlas loader bounds TREE_SCAN (kTreeCandPerAxisCap); only a lattice finer
+// than ~6 voxels with tiny trees could reach this, and it fails the compile
+// loudly rather than overflowing.
+const_assert WG_TREE_TILES <= 128;
+var<workgroup> wgTree : array<Tree, WG_TREE_TILES>;
 
-      if ((*c).n >= TREE_CAND_MAX) { continue; }   // see the derivation at TreeCands
-      var e : TreeCand;
-      e.wx = t.wx; e.wz = t.wz; e.base = t.base;
-      e.ny = i32(treeAtlas[t.varOff + TA_V_NY]);
-      // Local y 0 sits one voxel ABOVE the ground: genCellIn only asks about
-      // cells with y > h, so a row at y == base could never be reached and
-      // baking one would waste a layer of every variant.
-      e.vtop = t.base + 1 + e.ny;
-      e.colOff = treeAtlas[ci];
-      e.colCnt = cnt;
-      e.leafSw = select(0u,
-          treeAtlas[TA_H_SPECIES_DIR] + u32(t.sp) * TA_SPECIES_WORDS,
-          t.autumn);
-      (*c).t[(*c).n] = e;
-      (*c).n = (*c).n + 1;
-      (*c).top = max((*c).top, e.vtop);
+fn wgTreeOrigin(b : i32) -> i32 { return fdiv(b, TREE_TILE) - TREE_SCAN; }
+
+// Fill the cache for the chunk whose lowest corner column is (bx, bz). Called
+// by the whole workgroup in uniform control flow; the caller barriers after.
+fn treeTilesFill(li : u32, bx : i32, bz : i32, seed : u32) {
+  let tx0 = wgTreeOrigin(bx);
+  let tz0 = wgTreeOrigin(bz);
+  for (var i = i32(li); i < WG_TREE_TILES; i += 64) {
+    let s = treeSite(tx0 + i % WG_TREE_AXIS, tz0 + i / WG_TREE_AXIS, seed);
+    wgTree[i] = treeInfoBare(s, landAt(s.wx, s.wz, seed), seed);
+  }
+}
+
+// The cached tile (tx, tz), pond-gated for the asking column.
+fn wgTreeFor(tx : i32, tz : i32, bx : i32, bz : i32, ponds : ptr<function, PondSet>) -> Tree {
+  var t = wgTree[(tz - wgTreeOrigin(bz)) * WG_TREE_AXIS + (tx - wgTreeOrigin(bx))];
+  if (t.present && !treePondOk(&t, ponds)) { t.present = false; }
+  return t;
+}
+
+// treeCandsInto, reading the cache of the chunk at (bx, bz). Same tiles, same
+// order, same rejects: the maxReach reject is on the site, which the cached
+// tree carries (t.wx / t.wz).
+fn treeCandsFromTiles(c : ptr<function, TreeCands>, x : i32, z : i32, bx : i32, bz : i32,
+                      ponds : ptr<function, PondSet>) {
+  (*c).n = 0;
+  (*c).top = -1048576;
+  if (taSpeciesCount() <= 0) { return; }
+  let maxReach = treeMaxReach();
+  let tx = fdiv(x, TREE_TILE);
+  let tz = fdiv(z, TREE_TILE);
+  for (var oz = -TREE_SCAN + unrollFence(); oz <= TREE_SCAN; oz++) {
+    for (var ox = -TREE_SCAN + unrollFence(); ox <= TREE_SCAN; ox++) {
+      let ti = (tz + oz - wgTreeOrigin(bz)) * WG_TREE_AXIS + (tx + ox - wgTreeOrigin(bx));
+      let sx = wgTree[ti].wx;
+      let sz = wgTree[ti].wz;
+      if (abs(x - sx) > maxReach || abs(z - sz) > maxReach) { continue; }
+      var t = wgTreeFor(tx + ox, tz + oz, bx, bz, ponds);
+      treeCandAdd(c, &t, x, z);
     }
   }
 }
@@ -2548,42 +2699,66 @@ fn undergrowthSite(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>)
   let tz = fdiv(z, TREE_TILE);
   for (var oz = -TREE_SCAN + unrollFence(); oz <= TREE_SCAN; oz++) {
     for (var ox = -TREE_SCAN + unrollFence(); ox <= TREE_SCAN; ox++) {
-      let t = treeInfo(tx + ox, tz + oz, seed, ponds);
-      if (!t.present) { continue; }
-      let dx = x - t.wx;
-      let dz = z - t.wz;
-      let d2 = dx * dx + dz * dz;
-
-      // Nearest trunk (plantSiteAt keeps a fern out of a bole).
-      u.trunkD2 = min(u.trunkD2, d2);
-
-      // Canopy cover, from the species' OWN authored shade and its MEASURED
-      // crown radius. A shrub is authored at shade 0 and contributes none —
-      // counting one made every meadow read as closed forest, because shrubs
-      // are the commonest meadow tile. An airy species and a dark one differ
-      // by their number here rather than by a branch on a species id.
-      let r = t.crownR;
-      let peak = t.shade;
-      if (peak <= 0 || r <= 0) { continue; }
-      if (d2 > r * r) { continue; }
-      // Linear ramp in the RADIUS (not in d2), so the falloff is even across
-      // the crown instead of hugging the rim. Integer sqrt-free: compare d2
-      // against r2 scaled by the fraction, which is the same ordering.
-      // cover = peak * (1 - d/r), computed as peak * (r2 - d2) / r2 would bias
-      // toward the centre; the halfway point of that ramp is where fern stops
-      // and grass starts, so it is worth getting the shape right.
-      let rr = max(r, 1);
-      // d/r in 1/256ths. Computed as isqrt(d2 << 16 / r^2) rather than as
-      // 256 * isqrt(d2) / r: the latter takes the square root FIRST and so
-      // throws away its fractional part before the scale, which quantises the
-      // ramp into visible concentric steps at small radii.
-      // Done in u32 deliberately: d2 << 16 is past i32 for a crown radius over
-      // 181 voxels, and every operand here is non-negative by construction.
-      let frac = i32(isqrt((u32(d2) << 16u) / u32(rr * rr)));   // 0..256
-      u.cover = min(255, u.cover + (peak * (256 - min(frac, 256))) / 256);
+      var t = treeInfo(tx + ox, tz + oz, seed, ponds);
+      undergrowthAdd(&u, &t, x, z);
     }
   }
   return u;
+}
+
+// undergrowthSite's canopy cover, reading the tree tile cache of the chunk at
+// (bx, bz) (treeTilesFill): the same 25 tiles in the same order.
+fn undergrowthCoverFromTiles(x : i32, z : i32, bx : i32, bz : i32,
+                             ponds : ptr<function, PondSet>) -> i32 {
+  var u : Undergrowth;
+  u.cover = 0;
+  u.trunkD2 = 1 << 24;
+  let tx = fdiv(x, TREE_TILE);
+  let tz = fdiv(z, TREE_TILE);
+  for (var oz = -TREE_SCAN + unrollFence(); oz <= TREE_SCAN; oz++) {
+    for (var ox = -TREE_SCAN + unrollFence(); ox <= TREE_SCAN; ox++) {
+      var t = wgTreeFor(tx + ox, tz + oz, bx, bz, ponds);
+      undergrowthAdd(&u, &t, x, z);
+    }
+  }
+  return u.cover;
+}
+
+// One tile's tree into column (x, z)'s undergrowth: the per-tile half of the
+// scan, shared by the direct form and the tile-cache form.
+fn undergrowthAdd(u : ptr<function, Undergrowth>, t : ptr<function, Tree>, x : i32, z : i32) {
+  if (!(*t).present) { return; }
+  let dx = x - (*t).wx;
+  let dz = z - (*t).wz;
+  let d2 = dx * dx + dz * dz;
+
+  // Nearest trunk (plantSiteAt keeps a fern out of a bole).
+  (*u).trunkD2 = min((*u).trunkD2, d2);
+
+  // Canopy cover, from the species' OWN authored shade and its MEASURED
+  // crown radius. A shrub is authored at shade 0 and contributes none —
+  // counting one made every meadow read as closed forest, because shrubs
+  // are the commonest meadow tile. An airy species and a dark one differ
+  // by their number here rather than by a branch on a species id.
+  let r = (*t).crownR;
+  let peak = (*t).shade;
+  if (peak <= 0 || r <= 0) { return; }
+  if (d2 > r * r) { return; }
+  // Linear ramp in the RADIUS (not in d2), so the falloff is even across
+  // the crown instead of hugging the rim. Integer sqrt-free: compare d2
+  // against r2 scaled by the fraction, which is the same ordering.
+  // cover = peak * (1 - d/r), computed as peak * (r2 - d2) / r2 would bias
+  // toward the centre; the halfway point of that ramp is where fern stops
+  // and grass starts, so it is worth getting the shape right.
+  let rr = max(r, 1);
+  // d/r in 1/256ths. Computed as isqrt(d2 << 16 / r^2) rather than as
+  // 256 * isqrt(d2) / r: the latter takes the square root FIRST and so
+  // throws away its fractional part before the scale, which quantises the
+  // ramp into visible concentric steps at small radii.
+  // Done in u32 deliberately: d2 << 16 is past i32 for a crown radius over
+  // 181 voxels, and every operand here is non-negative by construction.
+  let frac = i32(isqrt((u32(d2) << 16u) / u32(rr * rr)));   // 0..256
+  (*u).cover = min(255, (*u).cover + (peak * (256 - min(frac, 256))) / 256);
 }
 
 // ---- caves -------------------------------------------------------------------
@@ -2917,17 +3092,17 @@ struct LandCol {
 };
 
 // MIRROR-BEGIN landheight
-// THE GROUND BEFORE THE SITE PAD. Split out of landColumn because sitePadAt
-// has to sample the site's CENTRE column, and a landColumn that calls itself
-// is not a function. Everything the height contract is made of lives here
-// EXCEPT the pad, the one override that needs another column's ground.
+// THE GROUND BEFORE THE SITE PAD. Everything the height contract is made of
+// lives here EXCEPT the pad, the one override that needs another column's
+// ground -- the site centre's, which LoadWorldMap bakes on the CPU from THIS
+// function's twin (sitePadY), so the pad costs no second evaluation here.
 fn landColumnBare(x : i32, z : i32, seed : u32,
                   L : ptr<function, LandCol>) {
   // OUT-PARAMETER, not a return value: LandCol is ~65 words (the column
   // fields plus the embedded PondSet) and this function is inlined several
-  // times per far entry point (farColTop -> landColumn, and again through
-  // sitePadAt); a by-value return leaves one aggregate copy per inline site
-  // for the driver's front end, the documented NVIDIA compile cost.
+  // times per far entry point (genColumn, farColTop's corners, plantSiteAt);
+  // a by-value return leaves one aggregate copy per inline site for the
+  // driver's front end, the documented NVIDIA compile cost.
   (*L).pond = -1;
   (*L).pw = vec2<i32>(-1, -1);
   (*L).fluid = MAT_AIR;
@@ -3071,9 +3246,10 @@ fn landColumnBare(x : i32, z : i32, seed : u32,
 
 // The pad under an authored site: inside the footprint the ground IS
 // the height at the site's centre (exact, so a stamped floor is flat), and
-// over `margin` columns past it the terrain ramps back. Spelled identically
-// in world.cpp; the site readers it calls live outside the mirror.
-fn sitePadAt(x : i32, z : i32, h : i32, seed : u32) -> i32 {
+// over `margin` columns past it the terrain ramps back. The centre's height is
+// sitePadY's baked one. Spelled identically in world.cpp; the site readers it
+// calls live outside the mirror.
+fn sitePadAt(x : i32, z : i32, h : i32) -> i32 {
   let sid = wmSiteAt(x, z);
   if (sid == 0u) { return h; }
   // A water site is a bowl, not a building: the pond block above already
@@ -3085,9 +3261,7 @@ fn sitePadAt(x : i32, z : i32, h : i32, seed : u32) -> i32 {
   let margin = max(wmSiteI(sid, WM_S_PAD_MARGIN), 1);
   let d = max(max(abs(x - sx), abs(z - sz)) - r, 0);
   if (d >= margin) { return h; }
-  var padCol : LandCol;
-  landColumnBare(sx, sz, seed, &padCol);
-  let padY = padCol.h;
+  let padY = sitePadY(sid);
   let w = ((margin - d) * 256) / margin;
   return h + (((padY - h) * w) >> 8);
 }
@@ -3098,7 +3272,7 @@ fn sitePadAt(x : i32, z : i32, h : i32, seed : u32) -> i32 {
 fn landColumn(x : i32, z : i32, seed : u32,
               L : ptr<function, LandCol>) {
   landColumnBare(x, z, seed, L);
-  let hp = sitePadAt(x, z, (*L).h, seed);
+  let hp = sitePadAt(x, z, (*L).h);
   if (hp != (*L).h) {
     // Cut-and-fill under a building: the loose wedge goes with it, for the
     // reason the pond-bank block gives (powder under a stone floor creeps).
@@ -3332,6 +3506,172 @@ fn coverFirmMat(biome : u32) -> u32 {
 // tree candidate scan where it is false.
 fn colGrowsTrees(col : ptr<function, Col>) -> bool {
   return VEGETATION && !(*col).inRim && (*col).h < treeline() && (*col).pond < 0;
+}
+
+// The h-relative plant reach above a column: the biome's tallest cover row
+// and its water presets' shore / emergent plants (worldmap.cpp packs the
+// tallest authored row of either, jitter and head included, as
+// WM_B_MAX_COVER_H), never less than SKY_MARGIN_MIN.
+fn colSkyMargin(biome : u32) -> i32 {
+  return max(SKY_MARGIN_MIN, i32(wmBiome(biome, WM_B_MAX_COVER_H)));
+}
+
+// ---- THE COLUMN PROLOGUE: what a stack of cells over one column needs ------
+//
+// ONE statement of the exact skips, for the two callers that hold a column and
+// are about to ask genCellIn about cells whose y lies in [yLo, yHi]: the
+// column-cache pre-pass (`cols`, over the y-range of every listed chunk on
+// the column) and the far sweep (`far`, over its sixteen row samples). It
+// fills the cave bands and says which of the two tile scans the range needs;
+// the caller runs them (`cols` from the tree tile cache, `far` directly --
+// its sample columns are 2^shift apart and share no tiles). A declined
+// computation is one no cell in [yLo, yHi] can read:
+//
+//   cave bands   genCellIn reads them only for `y <= h && !inRim`: none when
+//                the column is an authored rim or yLo is above the ground
+//                (then `*cave` stays as the caller declared it, zeroed).
+//   trees        read only in the tree block, gated `colGrowsTrees && y > h`;
+//                and treeCandsInto admits only candidates below treeMaxTop(),
+//                so a range entirely above that gets nothing from the scan.
+//                Declined: n = 0, top = far below any y (colNoTrees).
+//   canopy       read only by a biome's cover rows (WM_BF_CANOPY_ROWS), only
+//                above the ground, never in a rim, a pond or a site keep-out,
+//                and every row breaks to air past its height (<= colSkyMargin).
+//                Declined: -1; callers hand genCellIn max(canopy, 0), and a
+//                non-negative memo is what keeps genCellIn's own per-cell scan
+//                from running (and lets the compiler drop it).
+//
+// genChunk used to carry a copy of this block with the chunk's own sixteen
+// cells as the range; `far` carried another with its sample rows.
+struct ColNeeds { trees : bool, canopy : bool };
+fn colPrologue(col : ptr<function, Col>, x : i32, z : i32, yLo : i32, yHi : i32,
+               cave : ptr<function, CaveBands>) -> ColNeeds {
+  let h = (*col).h;
+  if (!(*col).inRim && yLo <= h) {
+    *cave = caveBands(x, z, h, (*col).biome, T.seed);
+  }
+  var need : ColNeeds;
+  need.trees = colGrowsTrees(col) && yHi > h && yLo <= treeMaxTop();
+  need.canopy = wmFlag((*col).biome, WM_BF_CANOPY_ROWS) && !(*col).inRim && (*col).pond < 0 &&
+                !siteKeepOut(x, z) && yHi > h && yLo <= h + colSkyMargin((*col).biome);
+  return need;
+}
+fn colNoTrees(trees : ptr<function, TreeCands>) {
+  (*trees).n = 0;
+  (*trees).top = -1048576;   // the same "far below any y" treeCandsInto uses
+}
+
+// ---- one cached column: CC_WORDS words (the column cache, top of file) ----
+// Everything genChunk reads about a column that is a pure function of
+// (x, z): the Col genColumn returns, and the column prologue's answers --
+// the cave bands, the canopy memo, the loose step line, the sky ceiling
+// and the tree candidates' top. The candidate SET is not cached (TREE_CAND_MAX
+// x 8 words); genChunk rebuilds it in the few chunks that can hold a tree
+// cell. Neither is the pond set (51 words): a flag says whether it is empty,
+// and genChunk re-runs pondScan where it is not and a cell can read it.
+const CCW_H          : u32 = 0u;
+const CCW_SLOPE      : u32 = 1u;
+const CCW_SED        : u32 = 2u;
+const CCW_POND       : u32 = 3u;
+const CCW_PW_X       : u32 = 4u;
+const CCW_PW_Y       : u32 = 5u;
+const CCW_FLUID_TOP  : u32 = 6u;
+const CCW_SHORE_PAST : u32 = 7u;
+const CCW_SHORE_SURF : u32 = 8u;
+const CCW_PLANT_BASE : u32 = 9u;
+const CCW_PLANT_TOP  : u32 = 10u;
+const CCW_BIOME      : u32 = 11u;
+const CCW_WP         : u32 = 12u;
+const CCW_SHORE_WP   : u32 = 13u;
+const CCW_PACKED     : u32 = 14u;   // fluid | plant.mat << 12 | CCF_* flags << 24
+const CCW_LOOSE_TOP  : u32 = 15u;
+const CCW_CANOPY     : u32 = 16u;   // colPrologue's memo, -1 = not computed
+const CCW_TOP        : u32 = 17u;   // the column's sky ceiling (see `cols`)
+const CCW_TREE_TOP   : u32 = 18u;   // the tree candidates' top, or far below any y
+const CCW_CAVE       : u32 = 19u;   // f1, c1, f2, c2, top2
+// CCW_PACKED's flag byte. Material ids are 12 bits (the voxel word), so the
+// fluid and the tile plant fill the low 24.
+const CCF_POOL_FLOOR : u32 = 1u;
+const CCF_RIM        : u32 = 2u;
+const CCF_ON_SHORE   : u32 = 4u;
+const CCF_NEAR_WATER : u32 = 8u;
+const CCF_BED_SOLID  : u32 = 16u;
+const CCF_CAVE_ON1   : u32 = 32u;
+const CCF_CAVE_ON2   : u32 = 64u;
+const CCF_PONDS      : u32 = 128u;  // the column's pond set is not empty
+
+fn ccStore(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>,
+           pondsN : i32, canopy : i32, colTop : i32, treeTop : i32) {
+  var f = 0u;
+  f |= select(0u, CCF_POOL_FLOOR, (*col).inPoolFloor);
+  f |= select(0u, CCF_RIM, (*col).inRim);
+  f |= select(0u, CCF_ON_SHORE, (*col).shore.onShore);
+  f |= select(0u, CCF_NEAR_WATER, (*col).nearWater);
+  f |= select(0u, CCF_BED_SOLID, (*col).bedSolid);
+  f |= select(0u, CCF_CAVE_ON1, (*cave).on1);
+  f |= select(0u, CCF_CAVE_ON2, (*cave).on2);
+  f |= select(0u, CCF_PONDS, pondsN > 0);
+  colCache[w + CCW_H] = bitcast<u32>((*col).h);
+  colCache[w + CCW_SLOPE] = bitcast<u32>((*col).slope);
+  colCache[w + CCW_SED] = bitcast<u32>((*col).sed);
+  colCache[w + CCW_POND] = bitcast<u32>((*col).pond);
+  colCache[w + CCW_PW_X] = bitcast<u32>((*col).pw.x);
+  colCache[w + CCW_PW_Y] = bitcast<u32>((*col).pw.y);
+  colCache[w + CCW_FLUID_TOP] = bitcast<u32>((*col).fluidTop);
+  colCache[w + CCW_SHORE_PAST] = bitcast<u32>((*col).shore.past);
+  colCache[w + CCW_SHORE_SURF] = bitcast<u32>((*col).shore.surf);
+  colCache[w + CCW_PLANT_BASE] = bitcast<u32>((*col).plant.base);
+  colCache[w + CCW_PLANT_TOP] = bitcast<u32>((*col).plant.top);
+  colCache[w + CCW_BIOME] = (*col).biome;
+  colCache[w + CCW_WP] = (*col).wp;
+  colCache[w + CCW_SHORE_WP] = (*col).shore.wp;
+  colCache[w + CCW_PACKED] = ((*col).fluid & 0xFFFu) | (((*col).plant.mat & 0xFFFu) << 12u) |
+                             (f << 24u);
+  colCache[w + CCW_LOOSE_TOP] = bitcast<u32>((*col).looseTop);
+  colCache[w + CCW_CANOPY] = bitcast<u32>(canopy);
+  colCache[w + CCW_TOP] = bitcast<u32>(colTop);
+  colCache[w + CCW_TREE_TOP] = bitcast<u32>(treeTop);
+  colCache[w + CCW_CAVE] = bitcast<u32>((*cave).f1);
+  colCache[w + CCW_CAVE + 1u] = bitcast<u32>((*cave).c1);
+  colCache[w + CCW_CAVE + 2u] = bitcast<u32>((*cave).f2);
+  colCache[w + CCW_CAVE + 3u] = bitcast<u32>((*cave).c2);
+  colCache[w + CCW_CAVE + 4u] = bitcast<u32>((*cave).top2);
+}
+
+// The inverse of ccStore for the Col and the cave bands. Out-parameters, not
+// return values, for landColumnBare's reason (an aggregate by value is a copy
+// per inline site for the driver's front end).
+fn ccLoad(w : u32, col : ptr<function, Col>, cave : ptr<function, CaveBands>) {
+  let f = colCache[w + CCW_PACKED] >> 24u;
+  (*col).h = bitcast<i32>(colCache[w + CCW_H]);
+  (*col).slope = bitcast<i32>(colCache[w + CCW_SLOPE]);
+  (*col).sed = bitcast<i32>(colCache[w + CCW_SED]);
+  (*col).biome = colCache[w + CCW_BIOME];
+  (*col).pond = bitcast<i32>(colCache[w + CCW_POND]);
+  (*col).pw = vec2<i32>(bitcast<i32>(colCache[w + CCW_PW_X]),
+                        bitcast<i32>(colCache[w + CCW_PW_Y]));
+  (*col).fluid = colCache[w + CCW_PACKED] & 0xFFFu;
+  (*col).fluidTop = bitcast<i32>(colCache[w + CCW_FLUID_TOP]);
+  (*col).inPoolFloor = (f & CCF_POOL_FLOOR) != 0u;
+  (*col).inRim = (f & CCF_RIM) != 0u;
+  (*col).shore.onShore = (f & CCF_ON_SHORE) != 0u;
+  (*col).shore.past = bitcast<i32>(colCache[w + CCW_SHORE_PAST]);
+  (*col).shore.surf = bitcast<i32>(colCache[w + CCW_SHORE_SURF]);
+  (*col).shore.wp = colCache[w + CCW_SHORE_WP];
+  (*col).nearWater = (f & CCF_NEAR_WATER) != 0u;
+  (*col).wp = colCache[w + CCW_WP];
+  (*col).bedSolid = (f & CCF_BED_SOLID) != 0u;
+  (*col).plant.mat = (colCache[w + CCW_PACKED] >> 12u) & 0xFFFu;
+  (*col).plant.base = bitcast<i32>(colCache[w + CCW_PLANT_BASE]);
+  (*col).plant.top = bitcast<i32>(colCache[w + CCW_PLANT_TOP]);
+  (*col).looseTop = bitcast<i32>(colCache[w + CCW_LOOSE_TOP]);
+  (*cave).on1 = (f & CCF_CAVE_ON1) != 0u;
+  (*cave).f1 = bitcast<i32>(colCache[w + CCW_CAVE]);
+  (*cave).c1 = bitcast<i32>(colCache[w + CCW_CAVE + 1u]);
+  (*cave).on2 = (f & CCF_CAVE_ON2) != 0u;
+  (*cave).f2 = bitcast<i32>(colCache[w + CCW_CAVE + 2u]);
+  (*cave).c2 = bitcast<i32>(colCache[w + CCW_CAVE + 3u]);
+  (*cave).top2 = bitcast<i32>(colCache[w + CCW_CAVE + 4u]);
 }
 
 // ---- THE CELL HALF: everything that actually depends on y -----------------
@@ -3751,10 +4091,7 @@ fn genCellIn(col : ptr<function, Col>,
   {
     let sid = wmSiteAt(x, z);
     if (sid != 0u && y > h - 2) {
-      var padCol : LandCol;
-      landColumnBare(wmSiteI(sid, WM_S_X), wmSiteI(sid, WM_S_Z), seed, &padCol);
-      let padY = padCol.h;
-      let sm = wmStampCell(sid, x, y, z, padY);
+      let sm = wmStampCell(sid, x, y, z, sitePadY(sid));
       if (sm != MAT_AIR) { mat = sm; }
     }
   }
@@ -3900,7 +4237,7 @@ fn farCellIsSolid(mat : u32) -> bool {
 // column into a column of solid cubes. The canopy is carried at distance by
 // `farSurfaceMat`'s flattening, which paints crown colour onto the surface
 // cell at shift >= 5.
-fn farColTopFrom(h : i32, fluidTop : i32, x : i32, z : i32, seed : u32) -> i32 {
+fn farColTopFrom(h : i32, fluidTop : i32, x : i32, z : i32) -> i32 {
   var top = max(h, fluidTop);
   // The biome cover stack stands ON the ground and, since the world map's P1,
   // is authored data that can be taller than a far cell: a stalk that pokes
@@ -3909,7 +4246,7 @@ fn farColTopFrom(h : i32, fluidTop : i32, x : i32, z : i32, seed : u32) -> i32 {
   // Global max, not per-biome: the corner-column callers hold no biome, and
   // the bit is conservative by design -- over-flagging costs nothing.
   top = max(top, h + i32(worldMap[WM_H_MAX_COVER_H]));
-  top = max(top, wmSiteTopAt(x, z, seed));   // an authored stamp
+  top = max(top, wmSiteTopAt(x, z));   // an authored stamp
   return top;
 }
 // The same for a column the caller does not already hold. `landColumn`, not
@@ -3918,14 +4255,12 @@ fn farColTopFrom(h : i32, fluidTop : i32, x : i32, z : i32, seed : u32) -> i32 {
 fn farColTop(x : i32, z : i32, seed : u32) -> i32 {
   var L : LandCol;
   landColumn(x, z, seed, &L);
-  return farColTopFrom(L.h, L.fluidTop, x, z, seed);
+  return farColTopFrom(L.h, L.fluidTop, x, z);
 }
 
-// The flag for one level cell. `topC` is `farColTopFrom` at the cell's CENTRE
-// column — free at both call sites, because both already hold that column for
-// the colour lookup.
-//
-// THREE BANDS, and the middle one is the only one that costs anything:
+// The flag for one level cell, in THREE BANDS by the cell's floor `y0`
+// against `topC`, the `farColTopFrom` of the cell's CENTRE column (free at
+// every call site: each already holds that column for the colour lookup):
 //
 //   y0 <= topC              the cell's floor is at or below the centre
 //                           column's top: it is at or under the surface. Set,
@@ -3935,7 +4270,7 @@ fn farColTop(x : i32, z : i32, seed : u32) -> i32 {
 //   otherwise               THE SURFACE BAND — exactly ONE cell per column,
 //                           the one whose centre sampled air but whose span
 //                           straddles the ground. Here, and only here, the
-//                           four corner columns are evaluated.
+//                           four corner columns count (`btop`, farCornerTop).
 //
 // That band is where the missing half of every surface cell lives: the centre
 // sample calls a cell solid when `centre <= h`, and `centre` is `y0 + step/2`,
@@ -3948,24 +4283,41 @@ fn farColTop(x : i32, z : i32, seed : u32) -> i32 {
 // corners, or more than one cell taller than the centre column, is still lost.
 // A tighter bound needs either marching or a stored min/max pyramid, and this
 // is an experiment with a kill criterion, not a mipmap.
-fn farBlockerBitAt(topC : i32, cc : vec3<i32>, shift : u32, seed : u32) -> u32 {
-  let step = 1 << shift;
-  let y0 = cc.y << shift;               // the cell's bottom fine voxel
+//
+// ONE RULE, TWO SHAPES OF CALLER. `far` sweeps whole columns and hoists the
+// corner scan (at most one row per column is in the band, so it computes
+// `btop` once); `farpatch` and `fardown` visit scattered cells and pay the
+// scan only for a cell in the band (farBlockerBitAt). All three end in
+// farBlockerBand, so their bytes cannot drift (the `far-downsample` gate).
+fn farBlockerBand(y0 : i32, topC : i32, btop : i32, step : i32) -> u32 {
   if (y0 <= topC) { return FAR_BLOCKER_BIT; }
   if (y0 - topC >= step) { return 0u; }
-  let x0 = cc.x << shift; let x1 = x0 + step - 1;
-  let z0 = cc.z << shift; let z1 = z0 + step - 1;
+  return select(0u, FAR_BLOCKER_BIT, y0 <= btop);
+}
+// The surface band's bound: topC and the four corner columns of the level
+// cell at (ccx, ccz). One rolled loop, not four straight-line calls: each
+// farColTop inlines a full landColumn, and the unroll fence keeps this body in
+// the kernel once (see unrollFence(); this scan is what made `far`/`fardown`
+// compile forever after the pond table grew landColumn).
+fn farCornerTop(topC : i32, ccx : i32, ccz : i32, shift : u32, seed : u32) -> i32 {
+  let step = 1 << shift;
+  let x0 = ccx << shift; let x1 = x0 + step - 1;
+  let z0 = ccz << shift; let z1 = z0 + step - 1;
   var top = topC;
-  // One rolled loop, not four straight-line calls: each farColTop inlines a
-  // full landColumn, and the unroll fence keeps this body in the kernel once
-  // (see unrollFence(); this function is what made `far`/`fardown` compile
-  // forever after the pond table grew landColumn).
   for (var ci = unrollFenceU(); ci < 4u; ci++) {
     let cx = select(x0, x1, (ci & 1u) != 0u);
     let cz = select(z0, z1, (ci & 2u) != 0u);
     top = max(top, farColTop(cx, cz, seed));
   }
-  return select(0u, FAR_BLOCKER_BIT, y0 <= top);
+  return top;
+}
+// The per-cell form, for the scattered-cell callers.
+fn farBlockerBitAt(topC : i32, cc : vec3<i32>, shift : u32, seed : u32) -> u32 {
+  let step = 1 << shift;
+  let y0 = cc.y << shift;               // the cell's bottom fine voxel
+  var btop = topC;
+  if (y0 > topC && y0 - topC < step) { btop = farCornerTop(topC, cc.x, cc.z, shift, seed); }
+  return farBlockerBand(y0, topC, btop, step);
 }
 
 var<workgroup> wgCount : atomic<u32>;
@@ -3987,6 +4339,9 @@ var<workgroup> wgSub : array<atomic<u32>, 4>;
 // uniform control flow), and whether any cell differs from cell 0's word /
 // from the JITTER synthesis at its position.
 var<workgroup> wgGenFull : u32;
+// Whether genChunk fills the tree tile cache (read through
+// workgroupUniformLoad, because the fill ends in a barrier).
+var<workgroup> wgTreeOn : u32;
 var<workgroup> wgNotEq : atomic<u32>;
 var<workgroup> wgNotJit : atomic<u32>;
 
@@ -4022,166 +4377,137 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
   var act = 0u;
   var sm0 = 0u; var sm1 = 0u;   // sub-chunk TOTAL class
   var sb0 = 0u; var sb1 = 0u;   // sub-chunk BLOCKER class
-  // COLUMN-MAJOR, and that is the whole point of the genColumn/genCellIn
-  // split: the column half is evaluated ONCE per (x, z) and shared by the 16
-  // cells stacked on it. 256 columns over 64 threads is four columns each,
-  // 16 cells apiece.
+  // THE CHUNK'S COLUMNS COME FROM THE COLUMN CACHE (`cols`, below; the block
+  // at the top of the file). Everything about a column that is a function of
+  // (x, z) alone -- genColumn's Col, the cave bands, the canopy memo, the
+  // loose step line, the sky ceiling, the tree candidates' top -- was
+  // evaluated ONCE per (x, z) of the list by the pre-pass, not once per
+  // listed chunk on the column (~32 on a streamed X/Z plane).
+  let blk = genCols[actIdx] * CC_BLOCK;
+  let chunkTop = bitcast<i32>(colCache[blk + CCH_TOP]);
+  // ---- THE TREE TILE CACHE, if any column of this chunk rebuilds its tree
+  // candidates below: the chunk is not all sky, not above treeMaxTop() or
+  // every column's candidate top, and not below every column's ground (the
+  // per-column test further down, maxed / minned over the block). Decided by
+  // one thread and read back uniformly, because the fill ends in a barrier.
+  if (li == 0u) {
+    wgTreeOn = select(0u, 1u,
+        base.y <= chunkTop && base.y <= treeMaxTop() &&
+        base.y <= bitcast<i32>(colCache[blk + CCH_TREE_TOP]) &&
+        base.y + i32(CHUNK) - 1 > bitcast<i32>(colCache[blk + CCH_MIN_H]));
+  }
+  if (workgroupUniformLoad(&wgTreeOn) != 0u) {
+    treeTilesFill(li, base.x, base.z, T.seed);
+    workgroupBarrier();
+  }
+  // ---- THE SKY EARLY-OUT -------------------------------------------------
   //
-  // The writes stay coalesced enough: within one height step threads 0..15
-  // hold x = 0..15 of the same z and write 16 CONSECUTIVE words, so the wave
-  // issues four 64-byte runs instead of one 256-byte one.
-  var cave : CaveBands;
-  var trees : TreeCands;
-  var ponds : PondSet;
-  for (var ci = li; ci < CHUNK * CHUNK; ci += 64u) {
-    let lx = ci % CHUNK;
-    let lz = ci / CHUNK;
-    let wx = base.x + i32(lx);
-    let wz = base.z + i32(lz);
-    // The column, and with it the column's pond candidates (`ponds`, the
-    // pondScan landColumn already ran), handed by pointer to every scan below
-    // and into genCellIn.
-    var col = genColumn(wx, wz, T.seed, &ponds);
-    // ---- THE COLUMN PROLOGUE ------------------------------------------------
-    //
-    // Cave bands: only worth having where a cell of THIS chunk can be stone
-    // under the surface. A chunk whose base is above the ground has no such
-    // cell, and inside an authored rim genCellIn refuses to carve at all — in
-    // both cases the six noise samples would be thrown away. That guard is why
-    // the hoist lives in genChunk and not in genColumn: genColumn is also the
-    // far entries' per-column call, and cave bands there would be paid by
-    // every air column of every cascade fill.
-    let caveValid = base.y <= col.h && !col.inRim;
-    if (caveValid) { cave = caveBands(wx, wz, col.h, col.biome, T.seed); }
-    // Tree candidates: the answer is what makes the vertical reject a LOCAL
-    // ceiling (`trees.top`) instead of a world-wide constant. The scan is 25
-    // tile hashes plus a landAt for every tile that survives the horizontal
-    // reject, and it is SKIPPED -- exactly, not conservatively -- wherever no
-    // cell of this chunk can be a tree cell. genCellIn reads `trees` in one
-    // place, the tree block, gated `VEGETATION && !inRim && y > h &&
-    // h < treeline() && pond < 0` (colGrowsTrees plus `y > h`), so an empty
-    // set is indistinguishable from the full one when
-    //   * the column fails colGrowsTrees, or
-    //   * the whole chunk is at or below the ground (base.y + CHUNK - 1 <= h:
-    //     a buried chunk), or
-    //   * the chunk's lowest cell is above treeMaxTop(): treeCandsInto admits
-    //     only candidates with vtop <= treeMaxTop() (the invariant treeAt
-    //     relies on to agree with treeFromCands), so every one of them fails
-    //     treeFromCands' `y > top` test anyway.
-    // `trees.top` also enters the sky ceiling below, and needs to only where
-    // a tree cell can be placed in this column -- i.e. only where it is scanned.
-    if (colGrowsTrees(&col) && base.y + i32(CHUNK) - 1 > col.h &&
-        base.y <= treeMaxTop()) {
-      treeCandsInto(&trees, wx, wz, T.seed, &ponds);
-    } else {
-      trees.n = 0;
-      trees.top = -1048576;   // the same "far below any y" treeCandsInto uses
+  // On a streamed-in vertical plane most chunks are sky, and a sky cell would
+  // still walk the whole of genCellIn to conclude nothing. Each column's
+  // CEILING (CCW_TOP, computed by `cols` -- the enumeration and its proof are
+  // there) bounds every non-air cell genCellIn can place over it; when the
+  // chunk's lowest cell is above it the column stores sixteen zeros -- exactly
+  // the word genCellIn returns for MAT_AIR (`if (mat == MAT_AIR) { return 0u;
+  // }`), contributing nothing to `count`/`block`/`act` or to either
+  // sub-occupancy mask, and therefore the same chunk by every observable.
+  // The block header holds the MAX of its columns' ceilings: above THAT every
+  // column would skip, so the whole chunk stores zeros without reading one
+  // column record.
+  if (base.y > chunkTop) {
+    for (var i = li; i < CHUNK_VOL; i += 64u) {
+      voxStore(voxWordInChunk(slot, i), 0u);
     }
-    // ---- THE SKY EARLY-OUT: a column stack entirely above everything -----
+  } else {
+    // COLUMN-MAJOR: each column record is read ONCE and shared by the 16
+    // cells stacked on it. 256 columns over 64 threads is four columns each,
+    // 16 cells apiece.
     //
-    // On a streamed-in vertical plane most chunks are sky, and a sky cell would
-    // still walk the whole of genCellIn to conclude nothing. This computes the
-    // column's CEILING once and, when the chunk's lowest cell is already above
-    // it, stores sixteen zeros — exactly the word genCellIn returns for
-    // MAT_AIR (`if (mat == MAT_AIR) { return 0u; }`), contributing nothing to
-    // `count`/`block`/`act` or to either sub-occupancy mask, and therefore the
-    // same chunk by every observable.
-    //
-    // THE CEILING IS AN ENUMERATION, NOT AN ESTIMATE, and it is the only part
-    // of this that can be wrong. Every block in genCellIn that can leave `mat`
-    // non-air above the ground, with the highest y it can reach:
-    //
-    //   terrain body / skin / wet moss        h
-    //   standing fluid, and the pond life     fluidTop
-    //     placed INTO water cells
-    //   pond life above the waterline         max(pond + 1, h + emergent height)
-    //     (`bed` is min(h, pw.x) <= h, so the
-    //      reed test y - bed < H bounds by h)
-    //   trees                                 trees.top   (exact, per column)
-    //   shore rows, the biome cover stack     h + WM_B_MAX_COVER_H
-    //   tile plants (fern, big toadstool)     plant.top -- NOT a term below:
-    //     SKY_MARGIN_MIN covers it only while the plant's centre column
-    //     stands within 3 of this column's h, which is not proven (`far`
-    //     does add plant.top). Adding it here only declines skips, but would
-    //     move the hash if that gap is ever hit; left for the P4 pass.
-    //   an authored site's stamp              wmSiteTopAt
-    //   cacti                                 cactusMaxTop(), cactus biomes only
-    //
-    // All the h-relative plant reaches collapse into one margin, which is
-    // strictly conservative: over-estimating the ceiling only declines a skip.
-    // The biome's own cover stack AND its water presets' shore / emergent
-    // plants arrive as WM_B_MAX_COVER_H (worldmap.cpp packs the tallest
-    // authored row of either, jitter and head included).
-    //
-    // CACTI HAVE NO COLUMN-LOCAL BOUND: a saguaro stands at a NEIGHBOURING
-    // tile's ground height and cactusAt clips it against that site's own
-    // `base`, not against this column's `h`. The bound is the world-wide one
-    // (cactusMaxTop: a cactus roots only below the treeline), which still
-    // lets a cactus column's sky skip.
-    let skyMargin = max(SKY_MARGIN_MIN, i32(wmBiome(col.biome, WM_B_MAX_COVER_H)));
-    var colTop = col.h + skyMargin;
-    colTop = max(colTop, col.fluidTop);
-    colTop = max(colTop, col.pond + 1);
-    colTop = max(colTop, wmSiteTopAt(wx, wz, T.seed));
-    colTop = max(colTop, trees.top);
-    if (wmFlag(col.biome, WM_BF_CACTI)) { colTop = max(colTop, cactusMaxTop()); }
-    if (base.y > colTop) {
-      for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
-        voxStore(voxWordInChunk(slot, lx + ly * CHUNK + lz * CHUNK * CHUNK), 0u);
-      }
-      continue;
-    }
-
-    // The column's CANOPY COVER, once per column instead of once per cell of
-    // the cover band: the 25-tile scan behind the cover rows'
-    // canopyMin / canopyMax conditions. Every term of the guard is a property
-    // of the COLUMN -- the cover stack's own guard with the y test replaced by
-    // "does this chunk's 16-cell stack reach the band at all". -1 = not
-    // computed, and it is handed on as max(canopy, 0): genCellIn only ever
-    // reads it as max(canopy, 0), and where this guard declines the scan no
-    // cell of the chunk can reach a cover row that reads it (no cell above the
-    // ground, or every cell above the biome's tallest row, where each row
-    // breaks to air on `up > hgt`). A non-negative memo is what stops
-    // genCellIn's per-cell on-demand scan, and lets the compiler drop it.
-    // THE LOCAL STEP LINE for a loose cover (looseRestTop, above genCellIn):
-    // only where the cover splits, only where this chunk reaches the loose
-    // band (the cap is 4 deep, a skin its authored skinDepth), and only where
-    // the taper left loose depth to restrict. Every other column keeps
-    // genColumn's `looseTop = h`.
-    let coverDepth = max(4, i32(wmBiome(col.biome, WM_B_SKIN_DEPTH)));
-    if (coverSplits(col.biome) && base.y <= col.h &&
-        base.y + i32(CHUNK) > col.h - coverDepth &&
-        looseCoverDepth(&col, coverDepth) > 0) {
-      col.looseTop = looseRestTop(&col, wx, wz, T.seed);
-    }
-    var canopy = -1;
-    if (wmFlag(col.biome, WM_BF_CANOPY_ROWS) && !col.inRim && col.pond < 0 &&
-        !siteKeepOut(wx, wz) &&
-        base.y + i32(CHUNK) > col.h + 1 && base.y <= col.h + skyMargin) {
-      canopy = undergrowthSite(wx, wz, T.seed, &ponds).cover;
-    }
-    for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
-      let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
-      let w = genCellIn(&col, &cave, caveValid, &trees, true, &ponds, max(canopy, 0),
-                        wx, base.y + i32(ly), wz, T.seed);
-      // Chunk-linear: the slot's page resolved once, per §2.1's second entry
-      // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
-      // every target slot before the dispatch (§3.5c) and this never faults.
-      voxStore(voxWordInChunk(slot, i), w);
-      let m = w & 0xFFFu;
-      if (m != MAT_AIR) {
-        count += 1u;
-        let md = materials[m];
-        // The sub-chunk bit for this cell keys on the SAME chunk-linear index
-        // the store above used, so a change to either layout moves both.
-        let sbit = subOccBitOfLocalIdx(i);
-        let sm = 1u << (sbit & 31u);
-        if (sbit < 32u) { sm0 |= sm; } else { sm1 |= sm; }
-        if (isRayBlocker(md)) {
-          block += 1u;
-          if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
+    // The writes stay coalesced enough: within one height step threads 0..15
+    // hold x = 0..15 of the same z and write 16 CONSECUTIVE words, so the wave
+    // issues four 64-byte runs instead of one 256-byte one.
+    var col : Col;
+    var cave : CaveBands;
+    var trees : TreeCands;
+    var ponds : PondSet;
+    for (var ci = li; ci < CHUNK * CHUNK; ci += 64u) {
+      let lx = ci % CHUNK;
+      let lz = ci / CHUNK;
+      let wx = base.x + i32(lx);
+      let wz = base.z + i32(lz);
+      let cw = blk + CC_HDR + ci * CC_WORDS;
+      if (base.y > bitcast<i32>(colCache[cw + CCW_TOP])) {
+        for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
+          voxStore(voxWordInChunk(slot, lx + ly * CHUNK + lz * CHUNK * CHUNK), 0u);
         }
-        if (matCanAct(md)) { act += 1u; }
+        continue;
+      }
+      // The column and its cave bands. The bands are handed to genCellIn as
+      // VALID unconditionally (which drops its fallback caveBands from this
+      // entry): it reads them only for a cell `y <= h` in a column that is
+      // not a rim, and `cols` computed them wherever ANY listed chunk on the
+      // column has such a cell (colPrologue's cave guard over the list's
+      // y-range). The loose step line and the canopy memo are exact on the
+      // same argument: `cols` computed each wherever a cell of a listed
+      // chunk can read it, and no cell reads it anywhere else (looseRestTop's
+      // band is (h - max(4, skinDepth), h]; the canopy's, colPrologue's note).
+      ccLoad(cw, &col, &cave);
+      // Does this chunk hold a cell above the ground? Everything that reads
+      // the pond set or the tree candidates (the tree block, cacti, the cover
+      // rows' water distance) is gated `y > h`.
+      let above = base.y + i32(CHUNK) - 1 > col.h;
+      // The pond set: genColumn's is pondScan(x, z), and an EMPTY one is
+      // pondSetNone() exactly (pondScan pushes only present candidates onto
+      // pondSetNone()), so only a column the cache flags as non-empty re-runs
+      // the scan, and only in a chunk whose cells can read it.
+      if (above && (colCache[cw + CCW_PACKED] & (CCF_PONDS << 24u)) != 0u) {
+        ponds = pondScan(wx, wz, T.seed);
+      } else {
+        ponds = pondSetNone();
+      }
+      // Tree candidates: the SET, rebuilt only in a chunk that can hold a tree
+      // cell. genCellIn reads `trees` in one place, the tree block, gated
+      // `colGrowsTrees && y > h` (colGrowsTrees plus `y > h`), and a set
+      // answers air for every y above its `top` -- so an empty set is
+      // indistinguishable from the full one when
+      //   * no cell of the chunk is above the ground (`above` false), or
+      //   * the chunk's lowest cell is above treeMaxTop(), or
+      //   * the chunk's lowest cell is above the column's own candidate top
+      //     (CCW_TREE_TOP: `cols` scanned exactly this set wherever any listed
+      //     chunk passes the first two tests, and stored far below any y when
+      //     the column fails colGrowsTrees -- so it also carries that test).
+      // The set is read from the tree tile cache, filled above whenever this
+      // test can pass for any column of the chunk (its terms maxed / minned
+      // over the block imply the block-level test).
+      let treeTop = bitcast<i32>(colCache[cw + CCW_TREE_TOP]);
+      if (above && base.y <= treeMaxTop() && base.y <= treeTop) {
+        treeCandsFromTiles(&trees, wx, wz, base.x, base.z, &ponds);
+      } else {
+        colNoTrees(&trees);
+      }
+      let canopyArg = max(bitcast<i32>(colCache[cw + CCW_CANOPY]), 0);
+      for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
+        let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
+        let w = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
+                          wx, base.y + i32(ly), wz, T.seed);
+        // Chunk-linear: the slot's page resolved once, per §2.1's second entry
+        // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
+        // every target slot before the dispatch (§3.5c) and this never faults.
+        voxStore(voxWordInChunk(slot, i), w);
+        let m = w & 0xFFFu;
+        if (m != MAT_AIR) {
+          count += 1u;
+          let md = materials[m];
+          // The sub-chunk bit for this cell keys on the SAME chunk-linear index
+          // the store above used, so a change to either layout moves both.
+          let sbit = subOccBitOfLocalIdx(i);
+          let sm = 1u << (sbit & 31u);
+          if (sbit < 32u) { sm0 |= sm; } else { sm1 |= sm; }
+          if (isRayBlocker(md)) {
+            block += 1u;
+            if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
+          }
+          if (matCanAct(md)) { act += 1u; }
+        }
       }
     }
   }
@@ -4357,6 +4683,126 @@ fn list(@builtin(workgroup_id) wg : vec3<u32>,
   genChunk(genList[wg.x], li, wg.x, true);
 }
 
+// ---- THE COLUMN CACHE PRE-PASS ----------------------------------------------
+// One workgroup per CHUNK-COLUMN of the list (genCols record wg.x; the CPU
+// dispatches exactly that many -- the extent is the bound, as in `pagefill`),
+// four of its 256 columns per thread. Runs in the same command buffer as
+// `list` / `main`, ahead of it; the pass table's ColCache edge is the barrier.
+//
+// Every per-column answer is computed over [yLo, yHi], the y-range of ALL
+// the listed chunks on this column, and each skip in it is exact for any
+// chunk inside that range (colPrologue's note; genChunk's notes say why each
+// value it reads is exact for its own chunk).
+//
+// THE SKY CEILING (CCW_TOP) IS AN ENUMERATION, NOT AN ESTIMATE, and it is the
+// only part of the skip that can be wrong. Every block in genCellIn that can
+// leave `mat` non-air above the ground, with the highest y it can reach:
+//
+//   terrain body / skin / wet moss        h
+//   standing fluid, and the pond life     fluidTop
+//     placed INTO water cells
+//   pond life above the waterline         max(pond + 1, h + emergent height)
+//     (`bed` is min(h, pw.x) <= h, so the
+//      reed test y - bed < H bounds by h)
+//   trees                                 trees.top (exact, per column: see below)
+//   shore rows, the biome cover stack     h + colSkyMargin
+//   tile plants (fern, big toadstool)     plant.top -- NOT a term below:
+//     SKY_MARGIN_MIN covers it only while the plant's centre column stands
+//     within 3 of this column's h, which is not proven (`far` does add
+//     plant.top). Adding it here only declines skips, but would move the
+//     hash if that gap is ever hit, so it waits for a hash-moving package.
+//   an authored site's stamp              wmSiteTopAt
+//   cacti                                 cactusMaxTop(), cactus biomes only
+//
+// All the h-relative plant reaches collapse into one margin, which is
+// strictly conservative: over-estimating the ceiling only declines a skip.
+//
+// TREES: the per-chunk skip this replaced used the candidates scanned FOR THAT
+// CHUNK, empty where the chunk could hold no tree cell. This is the column's
+// scan over the list's y-range, and the decision `base.y > ceiling` is the
+// same for every chunk: where that chunk would have scanned, this IS its set;
+// where it would not have, it was either buried (base.y <= h <= ceiling, no
+// skip either way) or above treeMaxTop() (and every candidate's top is below
+// that, so the term cannot decide the compare).
+//
+// CACTI HAVE NO COLUMN-LOCAL BOUND: a saguaro stands at a NEIGHBOURING tile's
+// ground height and cactusAt clips it against that site's own `base`, not
+// against this column's `h`. The bound is the world-wide one (cactusMaxTop:
+// a cactus roots only below the treeline), which still lets a cactus column's
+// sky skip.
+var<workgroup> wgColTop : atomic<i32>;
+var<workgroup> wgColTreeTop : atomic<i32>;
+var<workgroup> wgColMinH : atomic<i32>;
+
+@compute @workgroup_size(64)
+fn cols(@builtin(workgroup_id) wg : vec3<u32>,
+        @builtin(local_invocation_index) li : u32) {
+  let r = GC_REC_BASE + wg.x * GC_REC_WORDS;
+  let cx = bitcast<i32>(genCols[r]);
+  let cz = bitcast<i32>(genCols[r + 1u]);
+  let yLo = bitcast<i32>(genCols[r + 2u]) * i32(CHUNK);
+  let yHi = bitcast<i32>(genCols[r + 3u]) * i32(CHUNK) + i32(CHUNK) - 1;
+  let bx = cx * i32(CHUNK);
+  let bz = cz * i32(CHUNK);
+  // The block's tree tiles, once (~36 trees), for the two tile scans below.
+  // Unconditional: it is cheap next to 256 genColumns, and a barrier under a
+  // storage-read condition would fail the uniformity analysis.
+  if (li == 0u) {
+    atomicStore(&wgColTop, -1048576);
+    atomicStore(&wgColTreeTop, -1048576);
+    atomicStore(&wgColMinH, 1048576);
+  }
+  treeTilesFill(li, bx, bz, T.seed);
+  workgroupBarrier();
+  let blk = wg.x * CC_BLOCK;
+  var top = -1048576;
+  var treeTopMax = -1048576;
+  var minH = 1048576;
+  for (var ci = li; ci < CHUNK * CHUNK; ci += 64u) {
+    let x = bx + i32(ci % CHUNK);
+    let z = bz + i32(ci / CHUNK);
+    var ponds : PondSet;
+    var col = genColumn(x, z, T.seed, &ponds);
+    var cave : CaveBands;
+    var trees : TreeCands;
+    let need = colPrologue(&col, x, z, yLo, yHi, &cave);
+    if (need.trees) { treeCandsFromTiles(&trees, x, z, bx, bz, &ponds); } else { colNoTrees(&trees); }
+    var canopy = -1;
+    if (need.canopy) { canopy = undergrowthCoverFromTiles(x, z, bx, bz, &ponds); }
+    // THE LOCAL STEP LINE for a loose cover (looseRestTop, above genCellIn):
+    // only where the cover splits, only where a listed chunk reaches the
+    // loose band (the cap is 4 deep, a skin its authored skinDepth), and only
+    // where the taper left loose depth to restrict. Every other column keeps
+    // genColumn's `looseTop = h`.
+    let coverDepth = max(4, i32(wmBiome(col.biome, WM_B_SKIN_DEPTH)));
+    if (coverSplits(col.biome) && yLo <= col.h && yHi + 1 > col.h - coverDepth &&
+        looseCoverDepth(&col, coverDepth) > 0) {
+      col.looseTop = looseRestTop(&col, x, z, T.seed);
+    }
+    var colTop = col.h + colSkyMargin(col.biome);
+    colTop = max(colTop, col.fluidTop);
+    colTop = max(colTop, col.pond + 1);
+    colTop = max(colTop, wmSiteTopAt(x, z));
+    colTop = max(colTop, trees.top);
+    if (wmFlag(col.biome, WM_BF_CACTI)) { colTop = max(colTop, cactusMaxTop()); }
+    ccStore(blk + CC_HDR + ci * CC_WORDS, &col, &cave, ponds.n, canopy, colTop, trees.top);
+    top = max(top, colTop);
+    treeTopMax = max(treeTopMax, trees.top);
+    minH = min(minH, col.h);
+  }
+  // Max and min are order-free, so the block header does not depend on which
+  // thread arrives first (rule 1).
+  atomicMax(&wgColTop, top);
+  atomicMax(&wgColTreeTop, treeTopMax);
+  atomicMin(&wgColMinH, minH);
+  workgroupBarrier();
+  if (li == 0u) {
+    colCache[blk + CCH_TOP] = bitcast<u32>(atomicLoad(&wgColTop));
+    colCache[blk + CCH_TREE_TOP] = bitcast<u32>(atomicLoad(&wgColTreeTop));
+    colCache[blk + CCH_MIN_H] = bitcast<u32>(atomicLoad(&wgColMinH));
+  }
+}
+
 // ---- JITTER page materialization (world.h's JITTER block) ----------------
 // Filling a page that replaces a JITTER sentinel cannot be a vkCmdFillBuffer:
 // the sentinel's words vary per cell, and a fill takes ONE 32-bit pattern.
@@ -4520,71 +4966,39 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     let fz = (cc0.z << shift) + half;
     var ponds : PondSet;
     var col = genColumn(fx, fz, T.seed, &ponds);
-    // The column top for the blocker bit (farBlockerBitAt's centre sample).
-    let topC = farColTopFrom(col.h, col.fluidTop, fx, fz, T.seed);
-    // Corner-max top for the ONE surface-band cell of this column — the middle
-    // band of farBlockerBitAt — hoisted out of the row loop for COMPILE cost,
-    // not run cost. farBlockerBitAt's middle band inlines FOUR farColTop, each
-    // a full landColumn, and calling it from the cell loop put those copies
-    // inside the loop body the driver unrolls; after the pond table grew landColumnBare
-    // the driver's compile of this entry went from part of a slow minute to
-    // tens of minutes at ~10 GB. For a fixed topC exactly one multiple of
-    // `step` lies inside (topC, topC + step), so the middle band fires for at
-    // most one cc.y per column: compute that row's corner max here, once —
-    // same values, same laziness.
+    // The column top for the blocker bit (farBlockerBand's centre sample).
+    let topC = farColTopFrom(col.h, col.fluidTop, fx, fz);
+    // Corner-max top for the ONE surface-band cell of this column, hoisted out
+    // of the row loop for COMPILE cost, not run cost: farCornerTop inlines FOUR
+    // farColTop, each a full landColumn, and calling it from the cell loop put
+    // those copies inside the loop body the driver unrolls; after the pond
+    // table grew landColumnBare the driver's compile of this entry went from
+    // part of a slow minute to tens of minutes at ~10 GB. For a fixed topC
+    // exactly one multiple of `step` lies inside (topC, topC + step), so the
+    // middle band fires for at most one cc.y per column: compute that row's
+    // corner max here, once — same values, same laziness.
     var btop = topC;
     let bcy = fdiv(topC, step) + 1;
     if (bcy * step - topC < step &&
         bcy >= base.y && bcy < base.y + i32(CHUNK)) {
-      let cx0 = cc0.x << shift; let cx1 = cx0 + step - 1;
-      let cz0 = cc0.z << shift; let cz1 = cz0 + step - 1;
-      for (var ci = unrollFenceU(); ci < 4u; ci++) {
-        let cx = select(cx0, cx1, (ci & 1u) != 0u);
-        let cz = select(cz0, cz1, (ci & 2u) != 0u);
-        btop = max(btop, farColTop(cx, cz, T.seed));
-      }
+      btop = farCornerTop(topC, cc0.x, cc0.z, shift, T.seed);
     }
 
-    // ---- THE COLUMN PROLOGUE, genChunk's, with the sample rows as the stack
-    //
-    // Pond candidates: genColumn's own (`ponds`), by pointer into every scan
-    // below and into farSurfaceMat.
-    // Cave bands: only where one of this column's samples can be stone under
-    // the surface. genCellIn reads them only for `y <= h && !inRim`, and every
-    // y it is asked about here is a row sample (>= yLo) or the surface skin
-    // (y == h, looked up only for a cell whose sample is <= h) — so when this
-    // guard is false nothing reads them, and caveValid can be the constant
-    // `true`, which drops genCellIn's fallback caveBands from this entry.
+    // ---- THE COLUMN PROLOGUE (colPrologue), with the sample rows as the
+    // stack. `ponds` is genColumn's own set, by pointer into every scan and
+    // into farSurfaceMat. The cave bands can be declared valid (the constant
+    // `true` below, which drops genCellIn's fallback caveBands from this
+    // entry): every y genCellIn is asked about here is a row sample (>= yLo)
+    // or the surface skin (y == h, looked up only for a cell whose sample is
+    // <= h), so wherever colPrologue declined them nothing reads them.
     var cave : CaveBands;
-    if (!col.inRim && yLo <= col.h) {
-      cave = caveBands(fx, fz, col.h, col.biome, T.seed);
-    }
-    // Tree candidates, under genChunk's EXACT skips (see its note): none when
-    // this column can hold no tree cell, none when every sample is at or below
-    // the ground, none when every sample is above the tallest possible tree.
     var trees : TreeCands;
-    if (colGrowsTrees(&col) && yHi > col.h && yLo <= treeMaxTop()) {
-      treeCandsInto(&trees, fx, fz, T.seed, &ponds);
-    } else {
-      trees.n = 0;
-      trees.top = -1048576;   // the same "far below any y" treeCandsInto uses
-    }
-    // The canopy memo for the cover rows' canopyMin / canopyMax, under
-    // genChunk's guard with the chunk's cell range replaced by the sample
-    // range. Passed as max(canopy, 0), which is exact both ways: genCellIn
-    // only ever reads it as max(canopy, 0), and where the guard declines the
-    // scan no cell can reach a cover row that reads it — either no sample is
-    // above ground, or every sample is above the biome's tallest cover row
-    // (skyMargin), where each row breaks to air on `up > hgt` whatever the
-    // canopy said. Non-negative is what keeps genCellIn's per-cell on-demand
-    // scan from running here (and lets the compiler drop it).
-    let skyMargin = max(SKY_MARGIN_MIN, i32(wmBiome(col.biome, WM_B_MAX_COVER_H)));
+    let need = colPrologue(&col, fx, fz, yLo, yHi, &cave);
+    if (need.trees) { treeCandsInto(&trees, fx, fz, T.seed, &ponds); } else { colNoTrees(&trees); }
     var canopy = -1;
-    if (wmFlag(col.biome, WM_BF_CANOPY_ROWS) && !col.inRim && col.pond < 0 &&
-        !siteKeepOut(fx, fz) && yHi > col.h && yLo <= col.h + skyMargin) {
-      canopy = undergrowthSite(fx, fz, T.seed, &ponds).cover;
-    }
+    if (need.canopy) { canopy = undergrowthSite(fx, fz, T.seed, &ponds).cover; }
     let canopyArg = max(canopy, 0);
+    let skyMargin = colSkyMargin(col.biome);
 
     // ---- THE SKY CEILING: the row above which this column has nothing ----
     //
@@ -4594,7 +5008,7 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
     // could report:
     //   topC + step   the column's conservative top (ground, standing fluid,
     //                 the cover stack, an authored stamp) plus one cell,
-    //                 because farBlockerBitAt's MIDDLE band fires for a floor
+    //                 because farBlockerBand's MIDDLE band fires for a floor
     //                 in (topC, topC + step) and must not be skipped.
     //   btop          that band's corner max, which can exceed topC.
     //   trees.top     trees are NOT in farColTopFrom (see its note), and a
@@ -4627,15 +5041,9 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
       let mat = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
                           fine.x, fine.y, fine.z, T.seed) & 0xFFFu;
       // The conservative flag first: it is what a cell keeps when the centre
-      // sample found nothing (common.wgsl FAR_BLOCKER_BIT). This is
-      // farBlockerBitAt flattened onto the hoisted topC/btop — the three bands
-      // are byte-identical.
-      var byteV = 0u;
-      if (yRow <= topC) {
-        byteV = FAR_BLOCKER_BIT;
-      } else if (yRow - topC < step) {
-        byteV = select(0u, FAR_BLOCKER_BIT, yRow <= btop);
-      }
+      // sample found nothing (common.wgsl FAR_BLOCKER_BIT), on the hoisted
+      // topC/btop.
+      var byteV = farBlockerBand(yRow, topC, btop, step);
       if (farCellIsSolid(mat)) {
         // shape from the center sample, color from the surface skin (phase 4).
         // What lands in the byte is the skin material's FAR PALETTE SLOT, not
@@ -4775,7 +5183,7 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
     // the TERRAIN under the patch and has to survive that.
     if (!haveCol || pfine.x != lastX || pfine.z != lastZ) {
       pcol = genColumn(pfine.x, pfine.z, T.seed, &pponds);
-      pTop = farColTopFrom(pcol.h, pcol.fluidTop, pfine.x, pfine.z, T.seed);
+      pTop = farColTopFrom(pcol.h, pcol.fluidTop, pfine.x, pfine.z);
       lastX = pfine.x;
       lastZ = pfine.z;
       haveCol = true;
@@ -4952,7 +5360,7 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
       let ccz = fz >> shift;
       var pponds : PondSet;
       var pcol = genColumn(fx, fz, T.seed, &pponds);
-      let topC = farColTopFrom(pcol.h, pcol.fluidTop, fx, fz, T.seed);
+      let topC = farColTopFrom(pcol.h, pcol.fluidTop, fx, fz);
       for (var iy = 0; iy < n.y; iy++) {
         // fine-voxel sample point, and the level cell it belongs to
         let fine = vec3<i32>(fx, first.y + iy * step, fz);

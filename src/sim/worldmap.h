@@ -400,7 +400,12 @@ enum : uint32_t {
   kS_Salt = 6,
   kS_StampOff = 7,      // word offset of the stamp block, 0 = none
   kS_Preset = 8,        // water site: 1 + index into the water preset table
-  // 9..15 reserved
+  kS_PadY = 9,          // pad / stamp site: the BARE ground at (kS_X, kS_Z) --
+                        // landColumnBare's h there, baked by LoadWorldMap for
+                        // the seed it loads with (StampSite::padY). The pad,
+                        // the stamp and its sky ceiling read it instead of
+                        // re-running landColumnBare per column / per voxel.
+  // 10..15 reserved
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
@@ -553,6 +558,10 @@ struct WorldMapData {
     int x = 0, z = 0, radius = 0, padMargin = 8, rot = 0;
     uint32_t salt = 0;
     int preset = 0;                       // water site: 1 + preset index
+    // Pad / stamp site: the bare ground at the centre for the LOAD seed
+    // (kS_PadY). Position-fixed and seed-dependent, so LoadWorldMap bakes it
+    // once with World::BareGroundHeight; 0 on a water site (never read).
+    int padY = 0;
     int nx = 0, ny = 0, nz = 0;
     std::vector<uint32_t> words;          // the packed stamp block, offsets RELATIVE to its start
   };
@@ -621,5 +630,13 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
  */
 const WorldMapData& CurrentWorldMap();
 void SetCurrentWorldMap(WorldMapData map);
+
+/**
+ * The CPU height mirror's BARE ground (landColumnBare's h, no site pad) at
+ * (x, z) against CurrentWorldMap(). Defined in world.cpp beside the mirror;
+ * declared here because its one caller is LoadWorldMap's site-pad bake
+ * (StampSite::padY), which runs it with the map being loaded installed.
+ */
+int BareGroundHeight(int x, int z, uint32_t seed);
 
 }  // namespace worldmap
