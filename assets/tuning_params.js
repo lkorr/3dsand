@@ -767,6 +767,8 @@ const TUNING_PARAMS = {
   'melee.edgeFloor':{t:'f',def:0.35,min:0,max:1},
   'melee.sweepSpacingM':{t:'f',def:0.05,min:0.01,max:0.5},
   'melee.sweepMaxSteps':{t:'i',def:24,min:1,max:64},
+  'melee.chainWindupRate':{t:'f',def:2,min:1,max:8},
+  'melee.chainSectorLeeway':{t:'i',def:1,min:0,max:4},
   'melee.blockGapM':{t:'f',def:0.22,min:0,max:0.5},
   'melee.blockItemDamage':{t:'f',def:0.35,min:0,max:1},
   'melee.blockNudgeAz':{t:'f',def:0.3,min:0,max:1},

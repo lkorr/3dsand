@@ -696,6 +696,42 @@ int QuantizeStrike(const PlayerStrikeMap& map, float dx, float dy) {
   return best;
 }
 
+bool StrikeChains(const PlayerStrikeMap& map, int prev, int next, int leeway) {
+  const int n = (int)map.sectors.size();
+  if (prev < 0 || next < 0 || n < 2) return false;
+  // The compass in angle order, so "one step round" means the neighbouring
+  // direction whatever order the JSON listed them in. Ties keep list order,
+  // so the ranking is a pure function of the map.
+  std::vector<int> order(n);
+  std::vector<float> ang(n);
+  for (int i = 0; i < n; i++) {
+    order[i] = i;
+    ang[i] = std::atan2(map.sectors[i].y, map.sectors[i].x);
+  }
+  std::stable_sort(order.begin(), order.end(),
+                   [&](int a, int b) { return ang[a] < ang[b]; });
+  std::vector<int> rank(n);
+  for (int r = 0; r < n; r++) rank[order[r]] = r;
+  const float kTau = 6.28318531f;
+  for (int i = 0; i < n; i++) {
+    if (map.sectors[i].style != prev) continue;
+    // The sector nearest straight back along prev's flick.
+    const float want = ang[i] + kTau * 0.5f;
+    int opp = -1;
+    float best = 1e9f;
+    for (int j = 0; j < n; j++) {
+      float d = std::fabs(std::remainder(ang[j] - want, kTau));
+      if (d < best) { best = d; opp = j; }
+    }
+    for (int j = 0; j < n; j++) {
+      if (map.sectors[j].style != next) continue;
+      const int step = std::abs(rank[j] - rank[opp]);
+      if (std::min(step, n - step) <= leeway) return true;
+    }
+  }
+  return false;
+}
+
 const PlayerStrikeMap& PlayerCompass(const StyleLibrary& lib, bool armed) {
   return armed ? lib.player : lib.playerUnarmed;
 }
@@ -926,7 +962,7 @@ StrokeCursor::Phase PhaseOfFrame(const StrokeCursor& cur, int k) {
 }  // namespace
 
 void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
-                        int styleIndex, uint32_t seed) {
+                        int styleIndex, uint32_t seed, float windupRate) {
   cur.style = styleIndex;
   cur.seed = seed;
   cur.fromPending = false;
@@ -944,6 +980,11 @@ void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
     const bool jittered = cur.lastCut < 0 || k <= cur.lastCut;
     cur.frameTicks[k] =
         std::max(1, jittered ? (int)std::lround(base * tempo) : base);
+    // A CHAINED STRIKE'S WINDUP is quicker (StrikeChains): the weapon is
+    // already on the side this stroke starts from.
+    if (windupRate > 1.0f && (cur.firstCut < 0 || k < cur.firstCut))
+      cur.frameTicks[k] =
+          std::max(1, (int)std::lround(cur.frameTicks[k] / windupRate));
   }
   int windup = 0, cut = 0, post = 0;
   for (int k = 0; k < cur.frames; k++) {

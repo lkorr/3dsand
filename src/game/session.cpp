@@ -350,6 +350,7 @@ struct TickScratch {
   StrokeCursor& playerStrike = s.playerStrike;             \
   int& strikeQueued = s.strikeQueued;                      \
   int& strikeBuffered = s.strikeBuffered;                  \
+  int& strikeBase = s.strikeBase;                          \
   Vec3& lastEdgeBase = s.lastEdgeBase;                     \
   Vec3& lastEdgeTip = s.lastEdgeTip;                       \
   bool& lastEdgeValid = s.lastEdgeValid;                   \
@@ -2402,7 +2403,39 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               strikeBuffered = -1;
               if (avatar.Spawned()) avatar.ClearStrikeEffector();
             }
+            // ---- STRIKE CHAINING (strokes.h StrikeChains) --------------------
+            // A swing ends with the weapon on the side it was flicked toward,
+            // so the strike flicked BACK the other way (or one compass step
+            // either side of that) starts from where the weapon already is:
+            // it may begin during the recover, and winds up
+            // melee.chainWindupRate times faster. Swinging the mouse back and
+            // forth is the fast rhythm. A strike from any other side waits
+            // the recover out through the bank below, as it always did.
+            const Tuning::Melee& chainT = CurrentTuning().melee;
+            const PlayerStrikeMap& chainCompass =
+                PlayerCompass(mobs.AttackStyles(), meleeArmed);
+            auto chainsNow = [&](int next) {
+              return playerStrike.phase == StrokeCursor::Phase::Recover &&
+                     StrikeChains(chainCompass, strikeBase, next,
+                                  chainT.chainSectorLeeway);
+            };
+            // A chaining strike clicked during the CUT was banked; it goes
+            // the moment the recover begins rather than at its end.
+            if (strikeQueued < 0 && strikeBuffered >= 0 &&
+                chainsNow(strikeBuffered)) {
+              strikeQueued = strikeBuffered;
+              strikeBuffered = -1;
+            }
             if (strikeQueued >= 0 && meleeReady && avatar.Spawned()) {
+              const bool chained =
+                  playerStrike.Active() && chainsNow(strikeQueued);
+              if (chained) {
+                // The recover is abandoned where it stands: the new stroke's
+                // first keyed frame blends from the live arm (mob.cpp
+                // keyLive), so there is no snap.
+                playerStrike.Reset();
+                avatar.ClearStrikeEffector();
+              }
               if (!playerStrike.Active()) {
                 // THE WEAPON'S OWN VERSION of the stroke the flick named
                 // (strokes.h WEAPON FORMS), resolved once, here, like the
@@ -2426,7 +2459,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                     // styles author jitter 0, so it only matters if an author
                     // turns jitter back on — and then it still replays.
                     BeginStrokeProgram(playerStrike, *sty, formed,
-                                       rng::Hash3(0x504Cu, tick, 0x5747u));
+                                       rng::Hash3(0x504Cu, tick, 0x5747u),
+                                       chained ? chainT.chainWindupRate : 1.0f);
+                    strikeBase = strikeQueued;
                     // ...and the style's body animation, exactly as the NPC's
                     // BeginStroke does (strokes.h AttackStyle::clip).
                     if (!sty->clip.empty()) avatar.PlayClip(sty->clip);

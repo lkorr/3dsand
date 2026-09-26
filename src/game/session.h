@@ -546,6 +546,9 @@ struct PlayerSession {
   StrokeCursor playerStrike;
   int strikeQueued = -1;    // style index latched at the press, -1 = none
   int strikeBuffered = -1;  // ONE strike banked mid-swing, fired at recover
+  // The BASE style (the compass's index, before ResolveForm) of the stroke in
+  // playerStrike, -1 = none: what StrikeChains asks "the opposite side of".
+  int strikeBase = -1;
   // THE LAST ATTACK PRESS, as the picker read it — for the HUD's strike
   // compass (overlay.cpp) and nothing else; the sim never reads it.
   // `flicked` false = no flick, the neutral alternate fired. `serial` bumps

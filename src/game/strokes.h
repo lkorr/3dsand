@@ -731,6 +731,14 @@ int QuantizeStrike(const PlayerStrikeMap& map, float dx, float dy);
 // which. Returns the other one when the asked-for side is unresolved, and -1
 // when neither is.
 int NeutralStrike(const PlayerStrikeMap& map, bool right);
+// DOES `next` CHAIN OFF `prev`? (the player's strike chaining, session.cpp)
+// A swing ends with the weapon on the side it was flicked toward, so the
+// follow-up that starts from there is the one flicked the OPPOSITE way: a
+// sector of `next` within `leeway` compass steps (sectors sorted by angle) of
+// the sector opposite a sector of `prev`. Base style indices, as the map
+// holds them. A chained strike may begin during the recover and winds up
+// faster; any other one waits the recover out.
+bool StrikeChains(const PlayerStrikeMap& map, int prev, int next, int leeway);
 // Which compass a player press reads: fists or armed. ONE armed compass for
 // every weapon — what differs by weapon is the stroke's FORM, not which
 // stroke a flick names. One function because the tick (session.cpp) and the
@@ -964,8 +972,13 @@ int PickAttackStyle(const StyleLibrary& lib,
 // player's bare cursor has nothing else) and owns re-seeding/re-tuning the
 // MeleeState the program will drive — see MobSystem::BeginStroke for why the
 // tuning is re-applied per swing.
+//
+// `windupRate` > 1 plays the WINDUP frames that many times faster (a chained
+// strike, StrikeChains): each windup frame's ticks are divided by it before
+// the two-tick telegraph floor, so a chain is quicker but never instant.
 void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
-                        int styleIndex, uint32_t seed);
+                        int styleIndex, uint32_t seed,
+                        float windupRate = 1.0f);
 
 // What one tick of the program did, so the caller knows whether to push a
 // pose. Split three ways rather than a bool because the two "no pose" cases

@@ -1864,6 +1864,13 @@ TP_F(melee, edgeFloor, NO_WGSL, 0.35f, 0.0f, 1.0f)
 // spacing holds up to a tip travelling 1.2 m per tick (36 m/s at 30 Hz).
 TP_F(melee, sweepSpacingM, NO_WGSL, 0.05f, 0.01f, 0.5f)
 TP_I(melee, sweepMaxSteps, NO_WGSL, 24, 1, 64)
+// STRIKE CHAINING (session.cpp, strokes.h StrikeChains). A player strike
+// flicked back the way the last one came may start during that one's recover,
+// its windup chainWindupRate times faster; chainSectorLeeway is how many
+// compass steps either side of dead opposite still count. Rate 1 keeps the
+// early start with no speed-up; leeway 0 allows exactly opposite only.
+TP_F(melee, chainWindupRate, NO_WGSL, 2.0f, 1.0f, 8.0f)
+TP_I(melee, chainSectorLeeway, NO_WGSL, 1, 0, 4)
 // ---- THE BLOCK KNOBS, and what each clamp is protecting ------------------
 //
 //   * blockGapM is the slack in the segment-vs-segment test. NEGATIVE would

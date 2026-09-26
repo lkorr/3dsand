@@ -2142,6 +2142,41 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
   check(lib.player.neutral[0] >= 0 && lib.player.neutral[1] >= 0,
         "both neutral-alternate strikes resolve");
 
+  // ---- STRIKE CHAINING (strokes.h StrikeChains) ----------------------------
+  // Pure functions of the shipped compass, so they sit ahead of the fixture.
+  // Flicked right, the follow-up that chains is flicked left, plus the two
+  // diagonals beside left at leeway 1; right itself, up and down do not.
+  {
+    const PlayerStrikeMap& m = lib.player;
+    const int hr = QuantizeStrike(m, 1, 0), hl = QuantizeStrike(m, -1, 0);
+    const int up = QuantizeStrike(m, 0, -1), dn = QuantizeStrike(m, 0, 1);
+    const int ul = QuantizeStrike(m, -0.7f, -0.7f);
+    const int dl = QuantizeStrike(m, -0.7f, 0.7f);
+    const int ur = QuantizeStrike(m, 0.7f, -0.7f);
+    check(StrikeChains(m, hr, hl, 1) && StrikeChains(m, hl, hr, 1),
+          "chain: the two horizontals chain off each other");
+    check(StrikeChains(m, hr, ul, 1) && StrikeChains(m, hr, dl, 1),
+          "chain: leeway 1 takes the diagonals beside the opposite side");
+    check(!StrikeChains(m, hr, ul, 0) && StrikeChains(m, hr, hl, 0),
+          "chain: leeway 0 is dead opposite only");
+    check(!StrikeChains(m, hr, hr, 1) && !StrikeChains(m, hr, up, 1) &&
+              !StrikeChains(m, hr, dn, 1) && !StrikeChains(m, hr, ur, 1),
+          "chain: the same side and the perpendiculars wait the recover out");
+    // ...and the chained windup is the rate faster, never under 2 ticks.
+    const AttackStyle* s = lib.At(hl);
+    if (s != nullptr) {
+      StrokeCursor a, b;
+      BeginStrokeProgram(a, *s, hl, 0x5C1Au);
+      BeginStrokeProgram(b, *s, hl, 0x5C1Au, 2.0f);
+      check(b.windupTicks >= 2 && b.windupTicks <= std::max(2, (a.windupTicks + 1) / 2 + 1),
+            "chain: a rate-2 windup is about half the normal one (" +
+                std::to_string(a.windupTicks) + " -> " +
+                std::to_string(b.windupTicks) + " ticks)");
+      check(b.cutTicks == a.cutTicks && b.recoverTicks == a.recoverTicks,
+            "chain: only the windup is sped up, not the cut or the recover");
+    }
+  }
+
   IdCounterScope idScope(mobs);
   debris.Reset();
   mobs.Reset();

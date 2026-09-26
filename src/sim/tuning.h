@@ -1998,6 +1998,11 @@ struct Tuning {
     float sweepSpacingM = TPD(melee, sweepSpacingM);
     // most rows one tick's sweep may cast (cost bound: x5 rays each)
     int sweepMaxSteps = TPD(melee, sweepMaxSteps);
+    // a follow-up strike from the opposite side starts in the recover, its
+    //   windup this many times faster (session.cpp strike chaining)
+    float chainWindupRate = TPD(melee, chainWindupRate);
+    // compass steps either side of dead opposite that still chain
+    int chainSectorLeeway = TPD(melee, chainSectorLeeway);
     // ---- BLADE ON BLADE (game/melee.h MeleeSweepDamage's parry block) -------
     // The four knobs a parry has. They are `melee.*` rather than `combatfx.*`
     // because a block is MECHANICS — it stops a cut, it costs the blocking
