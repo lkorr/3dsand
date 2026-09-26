@@ -228,6 +228,11 @@ const char* const kOrder[] = {
     // biome and leaves the pristine world through the same reload +
     // regen `env-reload` uses, so `waterbody` still sees what `terrain` left.
     "env-truth",
+    // Then: the P5 sculpt layer. Same seam as env-truth (a synthetic map in
+    // memory, uploaded, regenerated, read back) and the same exit: the real
+    // environment reloaded from disk, the world regenerated, and the far
+    // cascades refilled, so `waterbody` still sees what `terrain` left.
+    "sculpt",
     // SECOND, and it wants the same thing `terrain` does: pristine worldgen at
     // an unmoved origin. Its whole subject is the ANALYTIC basin registry, and
     // the authored lake at (420,420) has to be resident for that to mean

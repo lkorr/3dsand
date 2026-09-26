@@ -64,6 +64,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -694,9 +695,310 @@ Status GateEnvTruth(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- sculpt: the P5 height-offset layer (docs/PLAN_map_overhaul.md P5) --------
+//
+// The sculpt layer is a new term in landAt on BOTH sides of the height mirror,
+// read through a sampler that lives outside the token-compared block on each
+// side (worldgen.wgsl sculptOctave / world.cpp sculptOctave). The token compare
+// sees only the call; this gate is what holds the two samplers together, and
+// it builds its OWN layer rather than reading either map's file, so it tests
+// the same thing whichever map the run loaded and whatever anyone sculpted.
+//
+//   A. EMPTY IS NOTHING. No bytes, a header with no tiles, and a tile of zeros
+//      all pack to an empty block, and the map packs to the same words either
+//      way (kHSculpt stays 0). With the pinned determinism hash, that is the
+//      "an unsculpted map generates the pre-P5 world" claim.
+//   B. THE CPU TWIN MOVES, LOCALLY, BY THE AUTHORED AMOUNT. One synthetic tile
+//      in the residency window: a +120-voxel dome and a -40-voxel pit. At the
+//      dome's centre the ground rises by 120 less whatever sediment the higher
+//      bed no longer holds (0..sedMax); at the pit's it falls by 40 give or
+//      take sedMax (the lower bed holds more wedge, the steeper sides less);
+//      a ring of columns outside the tile's bilinear
+//      support does not move at all.
+//   C. THE GPU AGREES, PER VOXEL (the `terrain` gate's C1 claim over every
+//      column of the tile): body matter at y == h and y == h - 1, no bulk
+//      terrain at y >= h + 2. The tile sits in the harness pad, so no tree,
+//      tarn or cover stands on it to argue with the claim.
+//   D. THE FAR FIELD SEES IT. A full cascade refill over the tile, then at
+//      levels 1..3: the cell halfway up the dome (wholly above the unsculpted
+//      ground) is matter, the cell halfway down the pit (wholly below it) is
+//      air -- the far entry evaluates landAt too, not a copy of it.
+//
+// Leaves the pristine world: the real environment back from disk
+// (ReloadEnvironment), regenerated, the cascades refilled.
+static std::vector<uint8_t> SculptFile(const std::vector<std::pair<std::pair<int, int>, std::vector<int16_t>>>& tiles) {
+  const int T = worldmap::kSculptTileSamples;
+  std::vector<uint8_t> f(32 + tiles.size() * (8 + size_t(T) * T * 2), 0);
+  auto put32 = [&](size_t off, uint32_t v) { std::memcpy(f.data() + off, &v, 4); };
+  put32(0, worldmap::kSculptFileMagic);
+  put32(4, worldmap::kSculptVersion);
+  put32(8, worldmap::kSculptSpacingLog2);
+  put32(12, worldmap::kSculptTileLog2);
+  put32(16, static_cast<uint32_t>(tiles.size()));
+  size_t off = 32;
+  for (const auto& t : tiles) {
+    put32(off, static_cast<uint32_t>(t.first.first));
+    put32(off + 4, static_cast<uint32_t>(t.first.second));
+    std::memcpy(f.data() + off + 8, t.second.data(), size_t(T) * T * 2);
+    off += 8 + size_t(T) * T * 2;
+  }
+  return f;
+}
+
+static Status GateSculpt(Ctx& c, std::string& detail) {
+  using sandvox::ReadVoxelsSync;
+  using sandvox::ReloadEnvironment;
+  using sandvox::SubmitWorldgen;
+  const std::string dir = sandvox::AssetDir();
+  std::vector<std::string> problems;
+  auto fail = [&](const std::string& why) {
+    detail = why;
+    std::printf("sculpt: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  };
+  biomes::BiomeSet set;
+  std::string log;
+  if (!biomes::LoadBiomeSet(dir, c.mats, set, log)) return fail("biome files did not load: " + log);
+  TreeAtlas atlas;
+  if (!LoadTreeAtlas(dir + "/trees", c.mats, set, atlas, log)) return fail("tree atlas did not load: " + log);
+  const worldmap::WorldMapData real = worldmap::CurrentWorldMap();
+  if (!real.Loaded()) return fail("no world map loaded");
+  constexpr int T = worldmap::kSculptTileSamples;
+  constexpr int kSp = 1 << worldmap::kSculptSpacingLog2;
+  constexpr int kTileVox = T * kSp;
+
+  // ---- A. empty is nothing -------------------------------------------------------
+  {
+    std::vector<uint32_t> blk{1u};
+    int tiles = -1;
+    std::string l;
+    const bool noBytes = worldmap::PackSculpt(nullptr, 0, blk, &tiles, l) && blk.empty() && tiles == 0;
+    const std::vector<uint8_t> none = SculptFile({});
+    const bool noTiles = worldmap::PackSculpt(none.data(), none.size(), blk, &tiles, l) && blk.empty() && tiles == 0;
+    const std::vector<uint8_t> zero = SculptFile({{{3, -2}, std::vector<int16_t>(size_t(T) * T, 0)}});
+    const bool zeroTile = worldmap::PackSculpt(zero.data(), zero.size(), blk, &tiles, l) && blk.empty() && tiles == 0;
+    std::vector<uint8_t> bad = zero;
+    bad.pop_back();
+    const bool refused = !worldmap::PackSculpt(bad.data(), bad.size(), blk, &tiles, l);
+    worldmap::WorldMapData a = real, b = real;
+    a.sculpt.clear();
+    b.sculpt = blk;   // what the zero tile packed to
+    std::vector<uint32_t> wa, wb;
+    std::string pl;
+    const bool packed = worldmap::PackWorldMap(set, a, wa, pl) && worldmap::PackWorldMap(set, b, wb, pl);
+    const bool same = packed && wa == wb && wa[worldmap::kHSculpt] == 0u;
+    std::printf("sculpt: A empty layer: %s (no bytes %d, no tiles %d, zero tile %d -> empty block; truncated file refused %d; "
+                "map words identical with kHSculpt 0: %d; this map %s)\n",
+                noBytes && noTiles && zeroTile && refused && same ? "PASS" : "FAIL", noBytes, noTiles, zeroTile, refused, same,
+                real.sculpt.empty() ? "has no layer" : "HAS a layer");
+    if (!(noBytes && noTiles && zeroTile && refused && same)) problems.push_back("A: an empty layer is not nothing");
+  }
+
+  // ---- the synthetic tile: a dome and a pit ---------------------------------------
+  const IVec3 org = c.world.WindowOrigin();
+  const int ox = org.x * static_cast<int>(kChunk), oz = org.z * static_cast<int>(kChunk);
+  const int wx1 = ox + static_cast<int>(kWorldN) - 1;
+  const int tx = (ox + kTileVox) >> 8, tz = (oz + kTileVox - 1) >> 8;   // 256-voxel tiles
+  static_assert(T * kSp == 256, "tile = 256 voxels");
+  const int x0 = tx * kTileVox, z0 = tz * kTileVox;
+  struct Bump { int i, j, r, a; };
+  const Bump dome{12, 16, 11, 120}, pit{25, 16, 6, -40};
+  std::vector<int16_t> samples(size_t(T) * T, 0);
+  for (int j = 0; j < T; j++)
+    for (int i = 0; i < T; i++) {
+      double v = 0;
+      for (const Bump& b : {dome, pit}) {
+        const double d = std::sqrt(double((i - b.i) * (i - b.i) + (j - b.j) * (j - b.j)));
+        if (d < b.r) v += b.a * 0.5 * (1.0 + std::cos(3.14159265358979 * d / b.r));
+      }
+      samples[size_t(j) * T + i] = static_cast<int16_t>(std::lround(v));
+    }
+  const std::vector<uint8_t> file = SculptFile({{{tx, tz}, samples}});
+  worldmap::WorldMapData syn = real;
+  if (!worldmap::PackSculpt(file.data(), file.size(), syn.sculpt, &syn.sculptTiles, log) || syn.sculpt.empty())
+    return fail("the synthetic tile did not pack: " + log);
+  syn.name = "sculpt-gate";
+  syn.contentHash ^= 0x5C0197u;
+
+  // ---- B. the CPU twin -------------------------------------------------------------
+  const int M = 24;   // columns of margin around the tile, for the locality ring
+  const int nx = kTileVox + 2 * M;
+  std::vector<int> hE(size_t(nx) * nx), hS(size_t(nx) * nx);
+  auto idx = [&](int x, int z) { return size_t(z - (z0 - M)) * nx + size_t(x - (x0 - M)); };
+  for (int z = z0 - M; z < z0 + kTileVox + M; z++)
+    for (int x = x0 - M; x < x0 + kTileVox + M; x++) hE[idx(x, z)] = World::TerrainHeight(x, z, kDefaultSeed);
+  worldmap::SetCurrentWorldMap(syn);   // the CPU twins see the layer from here on
+  bool gpuState = false;
+  for (int z = z0 - M; z < z0 + kTileVox + M; z++)
+    for (int x = x0 - M; x < x0 + kTileVox + M; x++) hS[idx(x, z)] = World::TerrainHeight(x, z, kDefaultSeed);
+  const int sedMax = worldmap::CurrentTerrain().sedMax;
+  const int domeX = x0 + dome.i * kSp, domeZ = z0 + dome.j * kSp;
+  const int pitX = x0 + pit.i * kSp, pitZ = z0 + pit.j * kSp;
+  const int dDome = hS[idx(domeX, domeZ)] - hE[idx(domeX, domeZ)];
+  const int dPit = hS[idx(pitX, pitZ)] - hE[idx(pitX, pitZ)];
+  int ringMoved = 0, ringCols = 0;
+  for (int z = z0 - M; z < z0 + kTileVox + M; z++)
+    for (int x = x0 - M; x < x0 + kTileVox + M; x++) {
+      const bool outside = x < x0 - kSp || z < z0 - kSp || x >= x0 + kTileVox + kSp || z >= z0 + kTileVox + kSp;
+      if (!outside) continue;
+      ringCols++;
+      if (hS[idx(x, z)] != hE[idx(x, z)]) ringMoved++;
+    }
+  const bool domeOk = dDome <= dome.a && dDome >= dome.a - sedMax;
+  const bool pitOk = dPit >= pit.a - sedMax && dPit <= pit.a + sedMax;
+  const bool bOk = domeOk && pitOk && ringMoved == 0 && ringCols > 0;
+  std::printf("sculpt: B CPU twin: %s (tile (%d,%d) = x%d..%d z%d..%d; dome +%d authored -> ground %+d (want %d..%d); "
+              "pit %d authored -> ground %+d (want %d..%d); %d / %d ring columns outside the support moved)\n",
+              bOk ? "PASS" : "FAIL", tx, tz, x0, x0 + kTileVox - 1, z0, z0 + kTileVox - 1, dome.a, dDome,
+              dome.a - sedMax, dome.a, pit.a, dPit, pit.a - sedMax, pit.a + sedMax, ringMoved, ringCols);
+  if (!bOk) problems.push_back("B: the CPU twin did not move by the authored amount, or moved outside the tile");
+
+  // ---- C. the GPU, per voxel -------------------------------------------------------
+  std::vector<uint32_t> words;
+  if (!worldmap::PackWorldMap(set, syn, words, log)) {
+    worldmap::SetCurrentWorldMap(real);
+    return fail("the synthetic map did not pack: " + log);
+  }
+  if (words[worldmap::kHSculpt] == 0u) problems.push_back("C: the packed map has no sculpt block");
+  c.ctx.WaitIdle();
+  c.sim.UploadEnvironment(c.ctx.device, c.ctx.queue, atlas, words);
+  gpuState = true;
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  {
+    // Body matter, by NAME against the live table (the `terrain` gate's list;
+    // bulk = the ones that never sit a cell above the ground).
+    static const char* kBody[] = {"stone", "dirt", "sand", "grass", "snow", "mud", "gravel", "sandstone"};
+    static const char* kBulk[] = {"stone", "dirt", "mud", "gravel"};
+    std::vector<uint8_t> body(c.mats.size(), 0), bulk(c.mats.size(), 0);
+    for (size_t i = 0; i < c.mats.size(); i++) {
+      for (const char* n : kBody) if (c.mats[i].name == n) body[i] = 1;
+      for (const char* n : kBulk) if (c.mats[i].name == n) bulk[i] = 1;
+    }
+    const int xa = std::max(x0, ox), xb = std::min(x0 + kTileVox - 1, wx1);
+    const int za = z0, zb = z0 + kTileVox - 1;
+    int hmin = 1 << 30, hmax = -(1 << 30);
+    for (int z = za; z <= zb; z++)
+      for (int x = xa; x <= xb; x++) { hmin = std::min(hmin, hS[idx(x, z)]); hmax = std::max(hmax, hS[idx(x, z)]); }
+    const int cyLo = std::max(org.y, (hmin - 2) >> 4);
+    const int cyHi = std::min(org.y + static_cast<int>(kNChunk) - 1, (hmax + 6) >> 4);
+    // One run per (cy, cz): the WHOLE slot row, so a window origin that wraps
+    // the slot order mid-tile still reads right (chunk = (wx >> 4) & mask).
+    const int m = static_cast<int>(kNChunk) - 1;
+    std::vector<uint32_t> run(size_t(kNChunk) * kChunkVol);
+    int cols = 0, hollow = 0, buried = 0, exact = 0;
+    std::string hollowWhy, buriedWhy;
+    std::vector<uint8_t> atH((size_t)kTileVox * kTileVox, 0), atB((size_t)kTileVox * kTileVox, 0),
+        atA((size_t)kTileVox * kTileVox, 0);
+    std::vector<int16_t> top((size_t)kTileVox * kTileVox, INT16_MIN);
+    for (int cz = za >> 4; cz <= zb >> 4; cz++)
+      for (int cy = cyLo; cy <= cyHi; cy++) {
+        ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex({0, cy, cz}), kNChunk, run.data(), "sculpt");
+        for (int lz = 0; lz < static_cast<int>(kChunk); lz++) {
+          const int z = (cz << 4) + lz;
+          if (z < za || z > zb) continue;
+          for (int x = xa; x <= xb; x++) {
+            const int h = hS[idx(x, z)];
+            const size_t ci = size_t(z - z0) * kTileVox + size_t(x - x0);
+            for (int ly = 0; ly < static_cast<int>(kChunk); ly++) {
+              const int y = (cy << 4) + ly;
+              const uint32_t local = (uint32_t(lz) * kChunk + uint32_t(ly)) * kChunk + uint32_t(x & 15);
+              const uint32_t mat = run[size_t((x >> 4) & m) * kChunkVol + local] & 0xFFFu;
+              if (mat == 0 || mat >= c.mats.size()) continue;
+              if (y == h && body[mat]) atH[ci] = 1;
+              if (y == h - 1 && body[mat]) atB[ci] = 1;
+              if (y >= h + 2 && bulk[mat]) atA[ci] = 1;
+              if (body[mat] && y >= h - 4 && y <= h + 4) top[ci] = std::max<int16_t>(top[ci], static_cast<int16_t>(y));
+            }
+          }
+        }
+      }
+    for (int z = za; z <= zb; z++)
+      for (int x = xa; x <= xb; x++) {
+        const int h = hS[idx(x, z)];
+        if ((h - 1) >> 4 < cyLo || (h + 2) >> 4 > cyHi) continue;
+        const size_t ci = size_t(z - z0) * kTileVox + size_t(x - x0);
+        cols++;
+        if (top[ci] == h) exact++;
+        if (!atH[ci] || !atB[ci]) {
+          if (!hollow++) hollowWhy = Format("(%d,%d): mirror says ground at y%d (unsculpted y%d), the world has %s there and %s below",
+                                            x, z, h, hE[idx(x, z)], atH[ci] ? "terrain" : "none", atB[ci] ? "terrain" : "none");
+        }
+        if (atA[ci]) {
+          if (!buried++) buriedWhy = Format("(%d,%d): bulk terrain at y>=%d over the mirror's y%d (unsculpted y%d)",
+                                            x, z, h + 2, h, hE[idx(x, z)]);
+        }
+      }
+    const bool cOk = cols >= (xb - xa + 1) * (zb - za + 1) * 9 / 10 && hollow == 0 && buried == 0;
+    std::printf("sculpt: C GPU vs twin: %s (%d columns y%d..y%d, %d hollow, %d buried, %.2f%% with the top body voxel at "
+                "exactly the twin's h)\n",
+                cOk ? "PASS" : "FAIL", cols, hmin, hmax, hollow, buried, cols ? 100.0 * exact / cols : 0.0);
+    if (hollow) std::printf("sculpt:   hollow: %s\n", hollowWhy.c_str());
+    if (buried) std::printf("sculpt:   buried: %s\n", buriedWhy.c_str());
+    if (!cOk) problems.push_back(Format("C: %d hollow / %d buried of %d columns", hollow, buried, cols));
+  }
+
+  // ---- D. the far field ------------------------------------------------------------
+  {
+    const int hd = hS[idx(domeX, domeZ)], hp = hS[idx(pitX, pitZ)];
+    DrainFullRefill(c.ctx, c.world, c.sim, IVec3{domeX >> 4, hd >> 4, domeZ >> 4});
+    int good = 0, tried = 0;
+    std::string why;
+    for (uint32_t level = 1; level <= 3; level++) {
+      const int sh = static_cast<int>(level + kFarShiftBase);
+      const int s = 1 << sh;
+      // dome: a cell wholly above the unsculpted ground, below the sculpted top
+      const int eD = hE[idx(domeX, domeZ)];
+      const int cyD = ((eD + hd) / 2) >> sh;
+      if ((cyD << sh) > eD && (cyD << sh) + s <= hd) {
+        tried++;
+        const uint32_t b = FarVoxByte(c.ctx, c.world, level, {domeX >> sh, cyD, domeZ >> sh}) & 0x7Fu;
+        if (b != 0) good++;
+        else if (why.empty()) why = Format("level %u dome cell y%d..%d reads air", level, cyD << sh, (cyD << sh) + s - 1);
+      }
+      // pit: a cell wholly below the unsculpted ground, above the sculpted floor
+      const int eP = hE[idx(pitX, pitZ)];
+      const int cyP = ((eP + hp) / 2) >> sh;
+      if ((cyP << sh) > hp && (cyP << sh) + s <= eP) {
+        tried++;
+        const uint32_t b = FarVoxByte(c.ctx, c.world, level, {pitX >> sh, cyP, pitZ >> sh}) & 0x7Fu;
+        if (b == 0) good++;
+        else if (why.empty()) why = Format("level %u pit cell y%d..%d reads matter", level, cyP << sh, (cyP << sh) + s - 1);
+      }
+    }
+    const bool dOk = tried >= 4 && good == tried;
+    std::printf("sculpt: D far field: %s (%d / %d cascade cells over the dome and the pit, levels 1..3, read the sculpted "
+                "ground%s%s)\n",
+                dOk ? "PASS" : "FAIL", good, tried, why.empty() ? "" : "; ", why.c_str());
+    if (!dOk) problems.push_back("D: the far cascades do not see the layer" + (why.empty() ? std::string() : ": " + why));
+  }
+
+  // ---- the pristine world back -----------------------------------------------------
+  if (gpuState) {
+    biomes::EnvironmentStamp stamp;
+    if (!ReloadEnvironment(c.ctx, c.sim, c.mats, stamp, log)) {
+      worldmap::SetCurrentWorldMap(real);
+      problems.push_back("ReloadEnvironment REFUSED afterwards: " + log);
+    }
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    DrainFullRefill(c.ctx, c.world, c.sim, IVec3{108 >> 4, 122 >> 4, 108 >> 4});
+  } else {
+    worldmap::SetCurrentWorldMap(real);
+  }
+  if (!problems.empty()) {
+    detail = problems[0];
+    for (size_t i = 1; i < problems.size(); i++) detail += "; " + problems[i];
+    std::printf("sculpt: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  std::printf("sculpt: PASS\n");
+  return Status::Pass;
+}
+
 const std::vector<Gate>& EnvTruthGates() {
   static const std::vector<Gate> g = {
       {"env-truth", "sim", {}, false, GateEnvTruth},
+      {"sculpt", "sim", {}, false, GateSculpt},
   };
   return g;
 }

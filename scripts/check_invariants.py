@@ -1574,7 +1574,8 @@ def check_worldmap_layout():
         return
     checked.append("world map layout")
     cpp = {}
-    for m in re.finditer(r"\b(kH\w+|kB_\w+|kC_\w+|kS_\w+|kStamp_\w+|kW_\w+|kP_\w+|kR_\w+|kSite\w+)\s*=\s*(\d+)", hdr):
+    # kSculpt* / kSc_* (P5): the sculpt layer's geometry and block header.
+    for m in re.finditer(r"\b(kH\w+|kB_\w+|kC_\w+|kS_\w+|kStamp_\w+|kW_\w+|kP_\w+|kR_\w+|kSite\w+|kSculpt\w+|kSc_\w+)\s*=\s*(\d+)", hdr):
         cpp[m.group(1)] = int(m.group(2))
     for m in re.finditer(r"kBF_(\w+)\s*=\s*1u\s*<<\s*(\d+)", hdr):
         cpp["kBF_" + m.group(1)] = 1 << int(m.group(2))
@@ -1623,6 +1624,10 @@ def check_worldmap_layout():
             wname = "WM_R_" + snake(cname[3:])
         elif cname.startswith("kBF_"):
             wname = "WM_BF_" + snake(cname[4:])
+        elif cname.startswith("kSculpt"):
+            wname = "WM_SCULPT_" + snake(cname[7:])
+        elif cname.startswith("kSc_"):
+            wname = "WM_SC_" + snake(cname[4:])
         else:
             continue
         if wname not in wg:
@@ -1641,6 +1646,8 @@ def check_worldmap_layout():
         elif cname.startswith("kP_"): known.add("WM_P_" + snake(cname[3:]))
         elif cname.startswith("kR_"): known.add("WM_R_" + snake(cname[3:]))
         elif cname.startswith("kBF_"): known.add("WM_BF_" + snake(cname[4:]))
+        elif cname.startswith("kSculpt"): known.add("WM_SCULPT_" + snake(cname[7:]))
+        elif cname.startswith("kSc_"): known.add("WM_SC_" + snake(cname[4:]))
     for wname in wg:
         if wname not in known:
             problems.append(f"world map layout: worldgen.wgsl declares {wname} but worldmap.h has no matching word")

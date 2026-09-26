@@ -368,6 +368,7 @@ WorldgenFingerprint ComputeWorldgenFingerprint(const std::string& assetDir,
     fp.parts[0] = Fnv32(norm.data(), norm.size());
   }
   // [1..3] the authored environment, with the stamp the tuner already mirrors.
+  // The map part covers map.json, map.svmap and the sculpt layer (P5).
   const std::string mapName = worldmap::ActiveMapName(CurrentTuning().world.mapLayer);
   const biomes::EnvironmentStamp env = biomes::StampEnvironment(assetDir, mapName);
   fp.parts[1] = env.map;

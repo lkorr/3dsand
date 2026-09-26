@@ -151,8 +151,72 @@ enum : uint32_t {
   kHTerrainSedTopsoil = 51,
   kHTerrainTreeline = 52,        // snow and no trees at or above this ground Y
   kHTerrainRefVpm = 53,          // the voxels-per-metre the map's terrain was authored at
+  // THE SCULPT LAYER (P5 of docs/PLAN_map_overhaul.md): word offset of the
+  // packed sculpt block (kSculpt* / kSc_* below), 0 = the map has none. 0 is
+  // what every map without a sculpt.svsculpt packs, and the samplers return a
+  // zero offset for it, which is the whole "empty layer = byte-identical
+  // world" argument.
+  kHSculpt = 54,
   kHeaderWords = 64,    // padded, like treeatlas::kFileHeaderWords
 };
+
+// ---- the sculpt layer (P5) ---------------------------------------------------
+// A SPARSE, TILED, SIGNED HEIGHT OFFSET in whole voxels, authored with the
+// World map page's raise / lower / smooth / flatten / erase brushes and stored
+// beside the map as assets/worldmap/<name>/sculpt.svsculpt. The height mirror
+// adds it to the ground in landAt (both sides) after the octave ladder and the
+// calm-area fade and BEFORE the sediment wedge, the ponds, the sea test and the
+// site pads, so everything downstream reacts to the sculpted ground. It is the
+// tier between the 102 m landform cell and the single voxel (.svedit).
+//
+// GEOMETRY. One sample every 2^kSculptSpacingLog2 = 8 voxels (0.8 m), bilinear
+// between samples; a TILE is 32 x 32 samples = 256 voxels (25.6 m) square; a
+// directory REGION is 4 x 4 tiles = 1024 voxels. Why these numbers is in
+// DESIGN.md §9d ("THE SCULPT LAYER"): 8 voxels is the grain octave's cell, so a brush
+// can cancel every seeded octave but the +-2 voxel grain, and 256-voxel tiles
+// make a sculpted spot cost 2 KB on disk / 2.2 KB on the GPU while an unsculpted
+// 20 km map costs nothing at all.
+//
+// FILE (little-endian): u32 kSculptFileMagic, u32 kSculptVersion, u32 spacing
+// log2 (== kSculptSpacingLog2), u32 tile log2 (== kSculptTileLog2), u32 tile
+// count N, 3 x u32 reserved; then N records of { i32 tx, i32 tz, 32*32 i16
+// samples, z-major }. (tx, tz) is the WORLD tile: tile (tx, tz) owns sample
+// (sx, sz) = (tx*32 + i, tz*32 + j), i.e. world column (sx*8, sz*8). All-zero
+// tiles are dropped at load; a file with none is no layer.
+//
+// PACKED BLOCK (PackSculpt; every offset RELATIVE to the block's first word):
+//   [kSc_RegionX0, kSc_RegionZ0]  i32: region coords of directory entry 0
+//   [kSc_RegionW, kSc_RegionH]    directory extent in regions
+//   [kSculptHdrWords ..)          W*H region entries: 0 = no tile, else the
+//                                 offset of a 16-word tile directory (tile
+//                                 (tx & 3) + 4 * (tz & 3)): 0 = empty tile,
+//                                 else the offset of a tile body
+//   tile body                     kSculptTileSide^2 i16 samples, two per word,
+//                                 low half first, z-major, INCLUDING the +1
+//                                 row/column of the east/south neighbours so
+//                                 a column's bilinear never leaves its tile.
+// A tile body is materialised wherever any of its 33 x 33 samples is non-zero
+// (the loader adds the west / north / north-west neighbours of every authored
+// tile for that reason), so the sampler's "no tile = offset 0" is exact.
+enum : uint32_t {
+  kSculptSpacingLog2 = 3,   // voxels between samples, log2 (8 vox = 0.8 m)
+  kSculptTileLog2 = 5,      // samples per tile side, log2 (32 -> 256 vox)
+  kSculptRegionLog2 = 2,    // tiles per directory region side, log2 (4 -> 1024 vox)
+  kSculptTileSide = 33,     // stored samples per tile side: 32 + the shared edge
+  kSculptTileWords = 545,   // ceil(33 * 33 / 2)
+  kSculptHdrWords = 4,
+  kSc_RegionX0 = 0,
+  kSc_RegionZ0 = 1,
+  kSc_RegionW = 2,
+  kSc_RegionH = 3,
+};
+inline constexpr uint32_t kSculptFileMagic = 0x43535653u;   // 'SVSC'
+inline constexpr uint32_t kSculptVersion = 1u;
+inline constexpr int kSculptTileSamples = 1 << kSculptTileLog2;   // 32
+/** The directory's size ceiling, in region entries (16 MiB of words): a tile
+ *  set whose bounding box needs more is refused, not silently allocated. The
+ *  whole shipped 196 x 196-cell map is 38,416. */
+inline constexpr int64_t kSculptMaxRegions = int64_t(1) << 22;
 // Planes are packed FOUR CELLS PER WORD, little-endian: cell i of a plane at
 // word (off + (i >> 2)), byte (i & 3); i = cz * width + cx. The biome plane's
 // bytes are biome IDS (map.json's palette resolved by name at load), never
@@ -513,6 +577,16 @@ void OverlayLandformSites(const std::vector<LandformSite>& sites, int landformRa
                           std::vector<uint8_t>& landform);
 
 /**
+ * An .svsculpt file's bytes -> the packed sculpt block (layout above). An
+ * empty input, a file with no tiles, or tiles that are all zero give an EMPTY
+ * block and true: no layer. False, with `log`, on a malformed file (bad magic,
+ * version, geometry, size, a duplicate tile, or a directory past
+ * kSculptMaxRegions). Pure; LoadWorldMap and the `sculpt` gate call it.
+ */
+bool PackSculpt(const uint8_t* data, size_t n, std::vector<uint32_t>& block,
+                int* tilesOut, std::string& log);
+
+/**
  * Pack the loaded biome set into the `worldMap` buffer's words: header +
  * biome records + cover rows + water preset records + shore plant rows.
  * Biome ids must be contiguous 0..N-1
@@ -581,6 +655,12 @@ struct WorldMapData {
   uint32_t terrainWords[kTerrainWords] = {};
   std::vector<BiomeTerrainPacked> biomeTerrain;
   std::vector<LandformSite> landformSites;
+  // P5: the sculpt layer as the PACKED BLOCK both sides read (PackSculpt;
+  // offsets relative to its first word). Empty = the map has no layer, and
+  // PackWorldMap then leaves kHSculpt at 0. The CPU twin (world.cpp
+  // sculptOctave) reads these words with the shader's arithmetic.
+  std::vector<uint32_t> sculpt;
+  int sculptTiles = 0;                    // authored non-zero tiles in the file
   std::vector<uint8_t> siteIndex;         // width*height, site id + 1, 0 = none
   uint8_t SiteCell(int cx, int cz) const {
     return siteIndex.empty() ? 0 : siteIndex[static_cast<size_t>(cz) * width + cx];

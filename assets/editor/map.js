@@ -137,6 +137,205 @@ let palCache = {key: '', pal: []};   // biome palette -> RGB, rebuilt when map.j
 /** The planes changed: the next paint() rebuilds the image once. */
 function planesChanged() { imgDirty = true; }
 
+/* ---- THE SCULPT LAYER (P5): the author's own height offset ------------------------
+ * assets/worldmap/<name>/sculpt.svsculpt; src/sim/worldmap.h is the format's
+ * authority. A signed offset in voxels, one sample every 8 voxels, bilinear
+ * between them, stored in 256-voxel tiles (32 x 32 samples) that exist only
+ * where someone sculpted. The engine adds it to the ground AFTER the seeded
+ * octaves and the calm-area fade and BEFORE the sediment wedge, ponds, sea and
+ * site pads (worldgen.wgsl landAt + its world.cpp twin), so it is not scaled by
+ * noise and everything else reacts to it.
+ *
+ * Here a tile is a Float32Array(1024) while editing (a soft brush moves a
+ * sample by fractions of a voxel per dab) and is rounded to i16 on save; a
+ * tile that rounds to all zeros is not written, and a layer with no tiles
+ * deletes the file, so an erased layer is byte-for-byte the unsculpted map. */
+const SC_SP = 8, SC_T = 32, SC_TILE = SC_SP * SC_T;
+const SC_MAGIC = 0x43535653, SC_VERSION = 1;   // 'SVSC'
+const SC_MODES = ['raise', 'lower', 'smooth', 'flatten', 'erase'];
+let sculpt = {
+  tiles: new Map(),    // key -> Float32Array(1024): the layer being edited
+  saved: new Map(),    // key -> Float32Array(1024): the layer on disk
+  dirty: false,
+  version: 0,          // bumps per edit: the overlay's tile images rebuild on it
+  mode: 'raise', radius: 96, strength: 30,
+  target: null,        // flatten: the ground height sampled at the stroke's start
+  last: null,          // the last dab's world column (dab spacing)
+  show: true,
+  dirtyRect: null,     // world-voxel rect the live heights preview must reshade
+  tver: new Map(),     // key -> edit count: the overlay rebuilds a tile's image on change
+  over: new Map(),     // key -> {ver, canvas}: the overlay's tile images
+};
+const scKey = (tx, tz) => (tx + 32768) * 65536 + (tz + 32768);
+function scSample(tiles, sx, sz) {
+  const t = tiles.get(scKey(sx >> 5, sz >> 5));
+  return t ? t[(sz & 31) * SC_T + (sx & 31)] : 0;
+}
+/** The layer at a world column: the engine's bilinear (in floats). */
+function scAt(tiles, x, z) {
+  if (!tiles.size) return 0;
+  const sx = Math.floor(x / SC_SP), sz = Math.floor(z / SC_SP);
+  const fx = x / SC_SP - sx, fz = z / SC_SP - sz;
+  const s00 = scSample(tiles, sx, sz), s10 = scSample(tiles, sx + 1, sz);
+  const s01 = scSample(tiles, sx, sz + 1), s11 = scSample(tiles, sx + 1, sz + 1);
+  const a = s00 + (s10 - s00) * fx, b = s01 + (s11 - s01) * fx;
+  return a + (b - a) * fz;
+}
+export function parseSculpt(buf) {
+  const tiles = new Map();
+  if (!buf || !buf.byteLength) return tiles;
+  const d = new DataView(buf);
+  if (d.getUint32(0, true) !== SC_MAGIC || d.getUint32(4, true) !== SC_VERSION) throw new Error('not an SVSC v1 sculpt layer');
+  if (d.getUint32(8, true) !== 3 || d.getUint32(12, true) !== 5) throw new Error('sculpt layer geometry is not 8-voxel samples in 32-sample tiles');
+  const n = d.getUint32(16, true);
+  if (buf.byteLength !== 32 + n * 2056) throw new Error('sculpt layer size does not match its tile count');
+  for (let i = 0; i < n; i++) {
+    const o = 32 + i * 2056;
+    const tx = d.getInt32(o, true), tz = d.getInt32(o + 4, true);
+    const t = new Float32Array(SC_T * SC_T);
+    for (let k = 0; k < SC_T * SC_T; k++) t[k] = d.getInt16(o + 8 + k * 2, true);
+    tiles.set(scKey(tx, tz), t);
+  }
+  return tiles;
+}
+/** The file's bytes, or null for an empty layer (the caller deletes the file). */
+export function serializeSculpt(tiles) {
+  const keep = [];
+  for (const [k, t] of tiles) {
+    const q = new Int16Array(SC_T * SC_T);
+    let any = false;
+    for (let i = 0; i < q.length; i++) { q[i] = Math.max(-32767, Math.min(32767, Math.round(t[i]))); any = any || q[i] !== 0; }
+    if (any) keep.push({tx: Math.floor(k / 65536) - 32768, tz: (k % 65536) - 32768, q});
+  }
+  if (!keep.length) return null;
+  keep.sort((a, b) => a.tz - b.tz || a.tx - b.tx);   // canonical order: same layer, same bytes
+  const out = new Uint8Array(32 + keep.length * 2056);
+  const d = new DataView(out.buffer);
+  d.setUint32(0, SC_MAGIC, true); d.setUint32(4, SC_VERSION, true);
+  d.setUint32(8, 3, true); d.setUint32(12, 5, true); d.setUint32(16, keep.length, true);
+  keep.forEach((t, i) => {
+    const o = 32 + i * 2056;
+    d.setInt32(o, t.tx, true); d.setInt32(o + 4, t.tz, true);
+    for (let k = 0; k < t.q.length; k++) d.setInt16(o + 8 + k * 2, t.q[k], true);
+  });
+  return out;
+}
+function scClone(tiles) { const m = new Map(); for (const [k, t] of tiles) m.set(k, new Float32Array(t)); return m; }
+function scRound(tiles) {
+  const m = new Map();
+  for (const [k, t] of tiles) {
+    const r = new Float32Array(t.length);
+    let any = false;
+    for (let i = 0; i < t.length; i++) { r[i] = Math.max(-32767, Math.min(32767, Math.round(t[i]))); any = any || r[i] !== 0; }
+    if (any) m.set(k, r);
+  }
+  return m;
+}
+/** The engine's height at a world column as far as the page knows it: the
+ *  --heightmap backdrop (the layer that was on disk when it was fetched,
+ *  heights.base, baked in) with that layer taken out and the one being edited
+ *  put in. Exact where the layer is flat; elsewhere the sediment wedge's
+ *  reaction to the new slope is the part it cannot see until a save redraws.
+ *  null where no heights are loaded. */
+function heightsAt(x, z) {
+  if (!heights || !heights.D) return null;
+  const D = heights.D, step = D.span / D.res;
+  const fi = (x - (D.cx - D.span / 2)) / step - 0.5, fj = (z - (D.cz - D.span / 2)) / step - 0.5;
+  if (fi < 0 || fj < 0 || fi > D.res - 1 || fj > D.res - 1) return null;
+  const i = Math.min(D.res - 2, Math.floor(fi)), j = Math.min(D.res - 2, Math.floor(fj));
+  const u = fi - i, v = fj - j;
+  const h = (a, b) => D.h[b * D.res + a];
+  const a = h(i, j) + (h(i + 1, j) - h(i, j)) * u, b = h(i, j + 1) + (h(i + 1, j + 1) - h(i, j + 1)) * u;
+  return a + (b - a) * v;
+}
+function groundAt(x, z) {
+  const hb = heightsAt(x, z);
+  return hb == null ? null : hb - scAt(heights.base, x, z) + scAt(sculpt.tiles, x, z);
+}
+/** One dab of the sculpt brush at world column (wx, wz). Returns true if the
+ *  layer changed. `before` collects each touched tile's prior state for undo. */
+function sculptDab(wx, wz, before) {
+  const r = Math.max(4, sculpt.radius), mode = sculpt.mode;
+  const k = Math.max(0.01, Math.min(1, sculpt.strength / 100));
+  const amt = sculpt.strength / 5;           // raise / lower: voxels per dab at the centre
+  const sx0 = Math.floor((wx - r) / SC_SP), sx1 = Math.ceil((wx + r) / SC_SP);
+  const sz0 = Math.floor((wz - r) / SC_SP), sz1 = Math.ceil((wz + r) / SC_SP);
+  // smooth reads its neighbourhood BEFORE writing any of it
+  let smoothSrc = null;
+  if (mode === 'smooth') {
+    smoothSrc = new Map();
+    for (let sz = sz0 - 1; sz <= sz1 + 1; sz++)
+      for (let sx = sx0 - 1; sx <= sx1 + 1; sx++) {
+        const g = groundAt(sx * SC_SP, sz * SC_SP);
+        smoothSrc.set(sx + ',' + sz, g == null ? scSample(sculpt.tiles, sx, sz) : g);
+      }
+  }
+  let changed = false;
+  for (let sz = sz0; sz <= sz1; sz++)
+    for (let sx = sx0; sx <= sx1; sx++) {
+      const d = Math.hypot(sx * SC_SP - wx, sz * SC_SP - wz);
+      if (d >= r) continue;
+      const w = 0.5 * (1 + Math.cos(Math.PI * d / r));
+      const key = scKey(sx >> 5, sz >> 5);
+      const cur = scSample(sculpt.tiles, sx, sz);
+      let next = cur;
+      if (mode === 'raise') next = cur + amt * w;
+      else if (mode === 'lower') next = cur - amt * w;
+      else if (mode === 'erase') next = cur - cur * k * w;
+      else if (mode === 'smooth') {
+        let s = 0;
+        for (let dz = -1; dz <= 1; dz++) for (let dx = -1; dx <= 1; dx++) s += smoothSrc.get((sx + dx) + ',' + (sz + dz));
+        const here = smoothSrc.get(sx + ',' + sz);
+        next = cur + (s / 9 - here) * k * w;
+      } else if (mode === 'flatten') {
+        if (sculpt.target == null) continue;
+        const g = groundAt(sx * SC_SP, sz * SC_SP);
+        if (g == null) continue;
+        next = cur + (sculpt.target - g) * k * w;
+      }
+      if (Math.abs(next - cur) < 1e-4) continue;
+      let t = sculpt.tiles.get(key);
+      if (!t) {
+        if (before && !before.has(key)) before.set(key, null);
+        t = new Float32Array(SC_T * SC_T);
+        sculpt.tiles.set(key, t);
+      } else if (before && !before.has(key)) before.set(key, new Float32Array(t));
+      t[(sz & 31) * SC_T + (sx & 31)] = next;
+      sculpt.tver.set(key, (sculpt.tver.get(key) || 0) + 1);
+      changed = true;
+    }
+  if (changed) {
+    sculpt.version++;
+    // Samples on a tile's west / north edge also shape the neighbour's last
+    // bilinear strip: reshade a sample's width past the brush.
+    const R = sculpt.dirtyRect, x0 = wx - r - SC_SP, x1 = wx + r + SC_SP, z0 = wz - r - SC_SP, z1 = wz + r + SC_SP;
+    sculpt.dirtyRect = R ? [Math.min(R[0], x0), Math.min(R[1], z0), Math.max(R[2], x1), Math.max(R[3], z1)] : [x0, z0, x1, z1];
+  }
+  return changed;
+}
+/** Swap the tiles named in `m` (key -> Float32Array | null) into the layer;
+ *  returns the same keys' current state, for the opposite stack. */
+function sculptSwap(m) {
+  const back = new Map();
+  for (const [k, t] of m) {
+    const cur = sculpt.tiles.get(k);
+    back.set(k, cur ? new Float32Array(cur) : null);
+    if (t) sculpt.tiles.set(k, new Float32Array(t)); else sculpt.tiles.delete(k);
+    sculpt.tver.set(k, (sculpt.tver.get(k) || 0) + 1);
+  }
+  sculpt.version++;
+  sculpt.dirty = true;
+  sculpt.dirtyRect = null;
+  if (heights && heights.D) reshadeHeights(null);
+  return back;
+}
+async function loadSculpt(name) {
+  const r = await fetch('/api/worldmap/sculpt?name=' + encodeURIComponent(name), {cache: 'no-store'});
+  if (r.status === 404) return new Map();
+  if (!r.ok) throw new Error('sculpt.svsculpt: HTTP ' + r.status);
+  return parseSculpt(await r.arrayBuffer());
+}
+
 /* ---- helpers ---------------------------------------------------------------- */
 function toast(m, bad) { if (H && H.toast) H.toast(m, bad); }
 function markDirty(d = true) {
@@ -237,7 +436,9 @@ async function loadMap(name) {
   const rp = await fetch('/api/worldmap/planes?name=' + encodeURIComponent(name), {cache: 'no-store'});
   if (!rp.ok) throw new Error('map.svmap: HTTP ' + rp.status);
   const planes = parsePlanes(await rp.arrayBuffer(), json.size[0], json.size[1]);
+  const tiles = await loadSculpt(name);
   map = {name, json, ...planes};
+  sculpt.tiles = tiles; sculpt.saved = scClone(tiles); sculpt.dirty = false; sculpt.version++; sculpt.dirtyRect = null;
   planesChanged();
   undo = []; redo = [];
   selected = null; heights = null;
@@ -247,7 +448,8 @@ async function loadMap(name) {
   syncTerrain(); syncSites(); publishTerrain();
   fit();
   paint();
-  status(`loaded worldmap/${name}: ${json.size[0]}x${json.size[1]} cells of ${1 << json.cellLog2} vox (${(json.size[0] * (1 << json.cellLog2) / 10 / 1000).toFixed(1)} km)`);
+  status(`loaded worldmap/${name}: ${json.size[0]}x${json.size[1]} cells of ${1 << json.cellLog2} vox (${(json.size[0] * (1 << json.cellLog2) / 10 / 1000).toFixed(1)} km)` +
+         (tiles.size ? `, sculpt layer ${tiles.size} tiles` : ''));
 }
 // The water presets for the Water tool (P-F): the names under assets/water/
 // and, per preset, the radius and shore/berm band in voxels the engine
@@ -304,6 +506,19 @@ async function saveMap() {
   r = await fetch('/api/worldmap/planes?name=' + encodeURIComponent(name), {method: 'POST', body: blob});
   j = await r.json();
   if (!j.ok) { toast('planes save failed: ' + (j.error || '?'), true); return; }
+  if (sculpt.dirty) {
+    // An empty layer is an EMPTY body: the server deletes the file, so a
+    // layer erased back to nothing is the unsculpted map, hash and all.
+    const sb = serializeSculpt(sculpt.tiles);
+    r = await fetch('/api/worldmap/sculpt?name=' + encodeURIComponent(name), {method: 'POST', body: sb || new Uint8Array(0)});
+    j = await r.json();
+    if (!j.ok) { toast('sculpt save failed: ' + (j.error || '?'), true); return; }
+    // What is on disk now is the rounded layer; the backdrop keeps showing
+    // (heights - old saved + edited) until the redraw below replaces it.
+    sculpt.tiles = scRound(sculpt.tiles);
+    sculpt.saved = scClone(sculpt.tiles);
+    sculpt.dirty = false;
+  }
   markDirty(false);
   savedGen++;
   if (H.saved) H.saved();
@@ -378,6 +593,7 @@ function paint() {
   } else {
     ctx.drawImage(off, ox, oy, w * view.scale, h * view.scale);
   }
+  paintSculpt(ctx, ox, oy);
   // origin crosshair
   const [ocx, ocz] = map.json.originCell;
   ctx.strokeStyle = '#ffd866'; ctx.lineWidth = 1;
@@ -470,8 +686,17 @@ function paint() {
       ctx.beginPath(); ctx.arc(sx, sz, 10, 0, Math.PI * 2); ctx.stroke();
     }
   }
+  // the sculpt brush: its radius in world voxels, around the exact column
+  if (tool === 'sculpt' && els.hoverW) {
+    const cv = 1 << map.json.cellLog2;
+    const sx = ox + (els.hoverW[0] / cv + ocx) * view.scale, sz = oy + (els.hoverW[1] / cv + ocz) * view.scale;
+    ctx.strokeStyle = sculpt.mode === 'lower' ? 'rgba(120,180,255,0.9)' : sculpt.mode === 'raise' ? 'rgba(255,170,90,0.9)' : 'rgba(255,255,255,0.8)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(sx, sz, Math.max(2, sculpt.radius / cv * view.scale), 0, Math.PI * 2); ctx.stroke();
+    ctx.beginPath(); ctx.arc(sx, sz, Math.max(1, sculpt.radius / cv * view.scale * 0.5), 0, Math.PI * 2); ctx.setLineDash([2, 3]); ctx.stroke(); ctx.setLineDash([]);
+  }
   // brush cursor
-  if (els.hover && tool !== 'pad' && tool !== 'stamp' && tool !== 'spawn' && tool !== 'water' && tool !== 'landform' && tool !== 'site') {
+  if (els.hover && tool !== 'pad' && tool !== 'stamp' && tool !== 'spawn' && tool !== 'water' && tool !== 'landform' && tool !== 'site' && tool !== 'sculpt') {
     ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.arc(ox + (els.hover[0] + 0.5) * view.scale, oy + (els.hover[1] + 0.5) * view.scale,
@@ -503,6 +728,15 @@ function worldColumnAt(ev) {
   const fz = (ev.clientY - r.top - Hh / 2) / view.scale + view.cz;
   const cv = 1 << map.json.cellLog2;
   return [Math.round((fx - map.json.originCell[0]) * cv), Math.round((fz - map.json.originCell[1]) * cv)];
+}
+/** The world column under the cursor, fractional (the sculpt brush's centre). */
+function worldAtF(ev) {
+  const r = els.canvas.getBoundingClientRect();
+  const W = els.canvas.clientWidth, Hh = els.canvas.clientHeight;
+  const fx = (ev.clientX - r.left - W / 2) / view.scale + view.cx;
+  const fz = (ev.clientY - r.top - Hh / 2) / view.scale + view.cz;
+  const cv = 1 << map.json.cellLog2;
+  return [(fx - map.json.originCell[0]) * cv, (fz - map.json.originCell[1]) * cv];
 }
 function applyBrush(cx, cz) {
   const [w, h] = map.json.size;
@@ -609,6 +843,25 @@ function wire() {
       paint();
       return;
     }
+    if (tool === 'sculpt') {
+      // THE SCULPT BRUSH (P5): paints the map's height-offset layer, not
+      // voxels and not the landform plane. Flatten takes its target from the
+      // ground under the cursor at the stroke's start, so it needs the
+      // engine's heights there; smooth uses them when present (else it
+      // smooths the layer alone).
+      const [wx, wz] = worldAtF(ev);
+      if (sculpt.mode === 'flatten' && groundAt(wx, wz) == null) {
+        toast('Flatten levels to the ground under the cursor, so it needs the engine\u2019s heights here: fetching them for this view \u2014 stroke again when they are drawn');
+        fetchHeights().catch(e => toast('heights: ' + e.message, true));
+        return;
+      }
+      stroke = {sculptBefore: new Map(), changed: false};
+      sculpt.target = sculpt.mode === 'flatten' ? groundAt(wx, wz) : null;
+      sculpt.last = [wx, wz];
+      if (sculptDab(wx, wz, stroke.sculptBefore)) { stroke.changed = true; scheduleSculptPreview(); }
+      paint();
+      return;
+    }
     if (tool === 'site') {
       // The select tool: click the nearest site marker of any kind.
       const [wx, wz] = worldColumnAt(ev);
@@ -657,6 +910,7 @@ function wire() {
     if (!map) return;
     const cell = cellAt(ev);
     els.hover = cell;
+    els.hoverW = worldAtF(ev);
     if (panning) {
       view.cx = panning.cx - (ev.clientX - panning.x) / view.scale;
       view.cz = panning.cz - (ev.clientY - panning.y) / view.scale;
@@ -677,14 +931,34 @@ function wire() {
       landDrag.site.at = [wx + landDrag.dx, wz + landDrag.dz];
       stroke.changed = true;
       syncSites();
-    } else if (stroke && ev.buttons & 1) {
+    } else if (stroke && stroke.sculptBefore && ev.buttons & 1) {
+      // Dabs at a quarter of the radius along the drag, so a stroke's weight
+      // does not depend on how fast the mouse moved.
+      const [wx, wz] = els.hoverW;
+      const gap = Math.max(2, sculpt.radius * 0.25);
+      let [lx, lz] = sculpt.last;
+      let d = Math.hypot(wx - lx, wz - lz);
+      while (d >= gap) {
+        lx += (wx - lx) * gap / d; lz += (wz - lz) * gap / d;
+        if (sculptDab(lx, lz, stroke.sculptBefore)) stroke.changed = true;
+        d = Math.hypot(wx - lx, wz - lz);
+      }
+      sculpt.last = [lx, lz];
+      scheduleSculptPreview();
+    } else if (stroke && !stroke.sculptBefore && ev.buttons & 1) {
       if (applyBrush(...cell)) stroke.changed = true;
     }
     const [wx, wz] = worldOfCell(cell[0], cell[1]);
     const [w, h] = map.json.size;
     const inside = cell[0] >= 0 && cell[1] >= 0 && cell[0] < w && cell[1] < h;
     const i = cell[1] * w + cell[0];
-    status(inside
+    if (tool === 'sculpt') {
+      const [fx, fz] = els.hoverW;
+      const g = groundAt(fx, fz);
+      status(`world (${Math.round(fx)}, ${Math.round(fz)})  sculpt ${scAt(sculpt.tiles, fx, fz) >= 0 ? '+' : ''}${scAt(sculpt.tiles, fx, fz).toFixed(1)} vox` +
+             (g == null ? '  (no heights here: click Heights for the engine\u2019s ground)' : `  ground ~y${Math.round(g)}`) +
+             `  layer: ${sculpt.tiles.size} tiles${sculpt.dirty ? ' (unsaved)' : ''}`);
+    } else status(inside
       ? `cell (${cell[0]},${cell[1]})  world x ${wx}..${wx + (1 << map.json.cellLog2) - 1}  z ${wz}..  biome ${map.json.biomes[map.biome[i]]}  landform ${map.landform[i]}`
       : `outside the painted planes (ocean)`);
     paint();
@@ -695,14 +969,17 @@ function wire() {
     waterDrag = null;
     landDrag = null;
     if (stroke) {
-      if (stroke.changed) { undo.push(stroke); if (undo.length > 40) undo.shift(); redo = []; markDirty(true); }
+      if (stroke.changed) {
+        if (stroke.sculptBefore) sculpt.dirty = true;
+        undo.push(stroke); if (undo.length > 40) undo.shift(); redo = []; markDirty(true);
+      }
       stroke = null;
     }
     paint();
   };
   c.addEventListener('pointerup', up);
   c.addEventListener('pointercancel', up);
-  c.addEventListener('pointerleave', () => { els.hover = null; paint(); });
+  c.addEventListener('pointerleave', () => { els.hover = null; els.hoverW = null; paint(); });
   c.addEventListener('wheel', ev => {
     if (!map) return;
     ev.preventDefault();
@@ -721,20 +998,27 @@ function wire() {
     if (inField) return;
     if ((ev.ctrlKey || ev.metaKey) && ev.key === 'z') { ev.preventDefault(); doUndo(); }
     else if ((ev.ctrlKey || ev.metaKey) && ev.key === 'y') { ev.preventDefault(); doRedo(); }
+    else if (ev.key === '[' && tool === 'sculpt') { sculpt.radius = Math.max(8, Math.round(sculpt.radius / 1.25)); syncControls(); paint(); }
+    else if (ev.key === ']' && tool === 'sculpt') { sculpt.radius = Math.min(4096, Math.round(sculpt.radius * 1.25)); syncControls(); paint(); }
     else if (ev.key === '[') { brush.radius = Math.max(0, brush.radius - 1); syncControls(); paint(); }
     else if (ev.key === ']') { brush.radius = Math.min(24, brush.radius + 1); syncControls(); paint(); }
   });
 }
+// A sculpt stroke's entry is {sculptBefore: key -> tile | null}: swapping it
+// in returns the same keys' current state, which is the opposite stack's
+// entry. Everything else is a plane / sites / terrain snapshot.
 function doUndo() {
   if (!undo.length) return;
-  redo.push(snapshot());
-  restore(undo.pop());
+  const e = undo.pop();
+  if (e.sculptBefore) redo.push({sculptBefore: sculptSwap(e.sculptBefore)});
+  else { redo.push(snapshot()); restore(e); }
   markDirty(true); paint();
 }
 function doRedo() {
   if (!redo.length) return;
-  undo.push(snapshot());
-  restore(redo.pop());
+  const e = redo.pop();
+  if (e.sculptBefore) undo.push({sculptBefore: sculptSwap(e.sculptBefore)});
+  else { undo.push(snapshot()); restore(e); }
   markDirty(true); paint();
 }
 
@@ -796,7 +1080,13 @@ function syncTerrain() {
   const t = terrainOf();
   for (const [path] of TERRAIN_ROWS) { const inp = els.terrainInputs[path]; if (inp) inp.value = getPath(t, path); }
   if (els.terrainRef) els.terrainRef.textContent = 'refVoxelsPerMetre ' + t.refVoxelsPerMetre + ' \u00b7 sea level y' + (map.json.seaLevelY | 0) +
-      ' \u00b7 a painted 255 is ' + ((t.landformRangeVox / 2) / t.refVoxelsPerMetre).toFixed(0) + ' m above the datum, a painted 0 that far below';
+      ' \u00b7 a painted 255 is ' + ((t.landformRangeVox / 2) / t.refVoxelsPerMetre).toFixed(0) + ' m above the datum, a painted 0 that far below' +
+      // THE SCALES, side by side (P5): what one painted landform step is
+      // worth, what the seeded range octave adds on top of it, and the tier
+      // under both that the Sculpt brush writes exactly.
+      ' \u00b7 one landform step = ' + (t.landformRangeVox / 256).toFixed(1) + ' vox, but the seeded range octave swings \u00b1' + Math.round(t.rangeAmplitude / 2) +
+      ' vox (\u00b1' + Math.round(t.rangeAmplitude / 2 / Math.max(t.landformRangeVox / 256, 1e-6)) + ' steps) over ' + (1 << t.rangeLog2) +
+      ' vox on top of it, so painting sets the region\u2019s level, not a hill\u2019s. For exact ground use the Sculpt tool: its offset is added after all the noise, unscaled.';
 }
 
 /* ---- the SITES panel (P-I): every site by kind, select / rename / delete ---------------- */
@@ -897,30 +1187,102 @@ function decodeHeightmap(buf) {
   for (let i = 0; i < res * res; i++) { const b = 48 + i * 8; o.h[i] = d.getInt32(b, true); o.water[i] = d.getInt16(b + 4, true); }
   return o;
 }
-async function fetchHeights() {
-  if (!map) return;
+/** What a Heights click asks --heightmap for: THE VISIBLE SQUARE when zoomed
+ *  in, the whole map otherwise (a sculpt stroke is metres across and a
+ *  whole-map render is ~200 voxels a pixel). `key` says whether the backdrop
+ *  on screen already answers it. */
+function heightsRequest() {
   const [w, h] = map.json.size;
   const cv = 1 << map.json.cellLog2;
-  const span = Math.max(w, h) * cv;
-  const cx = ((w / 2) - map.json.originCell[0]) * cv, cz = ((h / 2) - map.json.originCell[1]) * cv;
-  const res = Math.min(1024, Math.max(64, Math.max(w, h) * 2));
-  status('rendering the engine\u2019s heights over the whole map (the SAVED file)\u2026');
+  const whole = Math.max(w, h) * cv;
+  const c = els.canvas;
+  const visCells = Math.max(c.clientWidth || 1, c.clientHeight || 1) / view.scale;
+  const span = Math.min(whole, Math.max(256, Math.round(visCells * cv)));
+  let cx, cz, res;
+  if (span >= whole) {
+    cx = ((w / 2) - map.json.originCell[0]) * cv; cz = ((h / 2) - map.json.originCell[1]) * cv;
+    res = Math.min(1024, Math.max(64, Math.max(w, h) * 2));
+  } else {
+    cx = (view.cx - map.json.originCell[0]) * cv; cz = (view.cz - map.json.originCell[1]) * cv;
+    res = Math.min(1024, Math.max(64, Math.round(span / 2)));
+  }
+  cx = Math.round(cx); cz = Math.round(cz);
+  return {cx, cz, span, res, whole, key: cx + ',' + cz + ',' + span};
+}
+async function fetchHeights() {
+  if (!map) return;
+  const {cx, cz, span, res, whole, key} = heightsRequest();
+  const cv = 1 << map.json.cellLog2;
+  status('rendering the engine’s heights over ' + (span >= whole ? 'the whole map' : 'this view') + ' (the SAVED files)…');
   // --heightmap reads tuning.json's world.mapLayer off disk: a map picked on
   // this page and not yet saved into tuning would render the OLD map.
   if (H.syncTuning) await H.syncTuning();
   const gen = savedGen;
+  const base = scClone(sculpt.saved);   // the layer the render bakes in
   const seed = H.previewSeed ? H.previewSeed() : 1337;
-  const r = await fetch('/api/heightmap?cx=' + Math.round(cx) + '&cz=' + Math.round(cz) + '&span=' + span + '&res=' + res + '&seed=' + seed, {cache: 'no-store'});
+  const r = await fetch('/api/heightmap?cx=' + cx + '&cz=' + cz + '&span=' + span + '&res=' + res + '&seed=' + seed, {cache: 'no-store'});
   if (!r.ok) { let m = 'HTTP ' + r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
   const D = decodeHeightmap(await r.arrayBuffer());
-  // shade: depth below sea in blues, land from the datum up in a ramp, hillshaded
-  const img = new ImageData(D.res, D.res), px = img.data;
+  // where the sampled square sits, in cells
+  const cells = D.span / cv;
+  heights = {res: D.res, img: new ImageData(D.res, D.res), D, base, hc: null, key,
+             cell0x: map.json.originCell[0] + (D.cx - D.span / 2) / cv, cell0z: map.json.originCell[1] + (D.cz - D.span / 2) / cv,
+             cellsW: cells, cellsH: cells, hMin: D.hMin, hMax: D.hMax, gen, seed};
+  reshadeHeights(null);
+  status('heights: y' + D.hMin + '..y' + D.hMax + ' over ' + (D.span / 10 / 1000).toFixed(2) + ' km at ' + (D.span / D.res).toFixed(1) +
+         ' vox/px, seed ' + seed + ' (the SAVED map, plus your unsaved sculpting live; a save redraws it)');
+  showHeights = true;
+  if (els.heightsBtn) els.heightsBtn.classList.add('on');
+  paint();
+}
+/** World-voxel box around every tile of the edited and the fetched layer, or null. */
+function sculptBounds() {
+  let b = null;
+  for (const m of [sculpt.tiles, heights && heights.base]) {
+    if (!m) continue;
+    for (const k of m.keys()) {
+      const tx = Math.floor(k / 65536) - 32768, tz = (k % 65536) - 32768;
+      const x0 = tx * SC_TILE - SC_SP, z0 = tz * SC_TILE - SC_SP, x1 = (tx + 1) * SC_TILE + SC_SP, z1 = (tz + 1) * SC_TILE + SC_SP;
+      b = b ? [Math.min(b[0], x0), Math.min(b[1], z0), Math.max(b[2], x1), Math.max(b[3], z1)] : [x0, z0, x1, z1];
+    }
+  }
+  return b;
+}
+/** Rebuild the heights image (all of it, or the pixels over world rect `rect`)
+ *  from the --heightmap grid PLUS the difference between the layer being edited
+ *  and the one the grid was rendered with: the live preview of a sculpt
+ *  stroke. Shading as before: depth below sea in blues, land from the datum up
+ *  in a ramp, hillshaded. */
+function reshadeHeights(rect) {
+  if (!heights || !heights.D) return;
+  const D = heights.D, res = D.res, step = D.span / res;
+  const X0 = D.cx - Math.trunc(D.span / 2), Z0 = D.cz - Math.trunc(D.span / 2);
+  if (!heights.hc) heights.hc = Float32Array.from(D.h);
+  const hc = heights.hc;
+  let i0 = 0, i1 = res - 1, j0 = 0, j1 = res - 1;
+  if (rect) {
+    i0 = Math.max(0, Math.floor((rect[0] - X0) / step - 1)); i1 = Math.min(res - 1, Math.ceil((rect[2] - X0) / step));
+    j0 = Math.max(0, Math.floor((rect[1] - Z0) / step - 1)); j1 = Math.min(res - 1, Math.ceil((rect[3] - Z0) / step));
+    if (i0 > i1 || j0 > j1) return;
+  }
+  const tb = sculptBounds();
+  for (let j = j0; j <= j1; j++) {
+    const z = Z0 + Math.trunc((j + 0.5) * step);
+    for (let i = i0; i <= i1; i++) {
+      const k = j * res + i;
+      const x = X0 + Math.trunc((i + 0.5) * step);
+      let d = 0;
+      if (tb && x >= tb[0] && x <= tb[2] && z >= tb[1] && z <= tb[3]) d = scAt(sculpt.tiles, x, z) - scAt(heights.base, x, z);
+      hc[k] = D.h[k] + d;
+    }
+  }
+  const px = heights.img.data;
   const sea = map.json.seaLevelY | 0;
   const zScale = 2.0 * D.res / Math.max(D.span, 1);
-  for (let j = 0; j < D.res; j++) for (let i = 0; i < D.res; i++) {
-    const k = j * D.res + i, hh = D.h[k];
-    const hx = D.h[j * D.res + Math.min(i + 1, D.res - 1)] - D.h[j * D.res + Math.max(i - 1, 0)];
-    const hz = D.h[Math.min(j + 1, D.res - 1) * D.res + i] - D.h[Math.max(j - 1, 0) * D.res + i];
+  for (let j = Math.max(0, j0 - 1); j <= Math.min(res - 1, j1 + 1); j++) for (let i = Math.max(0, i0 - 1); i <= Math.min(res - 1, i1 + 1); i++) {
+    const k = j * res + i, hh = hc[k];
+    const hx = hc[j * res + Math.min(i + 1, res - 1)] - hc[j * res + Math.max(i - 1, 0)];
+    const hz = hc[Math.min(j + 1, res - 1) * res + i] - hc[Math.max(j - 1, 0) * res + i];
     let r, g, b;
     if (hh < sea) { const t = Math.min(1, (sea - hh) / 400); r = 40 - 20 * t; g = 90 - 40 * t; b = 150 - 40 * t; }
     else { const t = Math.min(1, (hh - sea) / 900); r = 90 + 140 * t; g = 130 + 100 * t; b = 80 + 150 * t; }
@@ -928,14 +1290,49 @@ async function fetchHeights() {
     const o = k * 4;
     px[o] = Math.max(0, Math.min(255, r * k2)); px[o + 1] = Math.max(0, Math.min(255, g * k2)); px[o + 2] = Math.max(0, Math.min(255, b * k2)); px[o + 3] = 255;
   }
-  // where the sampled square sits, in cells
-  const cells = D.span / cv;
-  heights = {res: D.res, img, cell0x: map.json.originCell[0] + (D.cx - D.span / 2) / cv, cell0z: map.json.originCell[1] + (D.cz - D.span / 2) / cv,
-             cellsW: cells, cellsH: cells, hMin: D.hMin, hMax: D.hMax, gen, seed};
-  status('heights: y' + D.hMin + '..y' + D.hMax + ' over ' + (D.span / 10 / 1000).toFixed(1) + ' km, seed ' + seed + ' (the SAVED map; a save redraws it)');
-  showHeights = true;
-  if (els.heightsBtn) els.heightsBtn.classList.add('on');
-  paint();
+}
+let sculptPreviewQueued = false;
+function scheduleSculptPreview() {
+  if (sculptPreviewQueued) return;
+  sculptPreviewQueued = true;
+  requestAnimationFrame(() => {
+    sculptPreviewQueued = false;
+    if (heights && heights.D && sculpt.dirtyRect) reshadeHeights(sculpt.dirtyRect);
+    sculpt.dirtyRect = null;
+    paint();
+  });
+}
+/** The sculpt layer drawn over the map: warm = raised, cool = lowered, one
+ *  32x32 image per tile, rebuilt only when that tile changed. */
+function sculptTileCanvas(k, t) {
+  const ver = sculpt.tver.get(k) || 0;
+  let e = sculpt.over.get(k);
+  if (e && e.ver === ver) return e.canvas;
+  if (!e) { e = {ver: -1, canvas: document.createElement('canvas')}; e.canvas.width = SC_T; e.canvas.height = SC_T; sculpt.over.set(k, e); }
+  const ctx = e.canvas.getContext('2d');
+  const im = ctx.createImageData(SC_T, SC_T), d = im.data;
+  for (let i = 0; i < SC_T * SC_T; i++) {
+    const v = t[i], a = Math.min(1, Math.abs(v) / 60) * 200;
+    if (v > 0) { d[i * 4] = 255; d[i * 4 + 1] = 150; d[i * 4 + 2] = 60; } else { d[i * 4] = 80; d[i * 4 + 1] = 160; d[i * 4 + 2] = 255; }
+    d[i * 4 + 3] = Math.abs(v) < 0.5 ? 0 : Math.max(40, a);
+  }
+  ctx.putImageData(im, 0, 0);
+  e.ver = ver;
+  return e.canvas;
+}
+function paintSculpt(ctx, ox, oy) {
+  if (!sculpt.show || !sculpt.tiles.size) return;
+  const cv = 1 << map.json.cellLog2, [ocx, ocz] = map.json.originCell;
+  const side = SC_TILE / cv * view.scale;
+  const W = els.canvas.width, Hh = els.canvas.height;
+  ctx.imageSmoothingEnabled = side > SC_T;
+  for (const [k, t] of sculpt.tiles) {
+    const tx = Math.floor(k / 65536) - 32768, tz = (k % 65536) - 32768;
+    const x = ox + (tx * SC_TILE / cv + ocx) * view.scale, y = oy + (tz * SC_TILE / cv + ocz) * view.scale;
+    if (x > W || y > Hh || x + side < 0 || y + side < 0) continue;
+    ctx.drawImage(sculptTileCanvas(k, t), x, y, Math.max(1, side), Math.max(1, side));
+  }
+  ctx.imageSmoothingEnabled = false;
 }
 
 /* ---- UI --------------------------------------------------------------------------- */
@@ -951,6 +1348,12 @@ function rebuildPalette() {
 }
 function syncControls() {
   for (const [k, b] of Object.entries(els.tools)) b.classList.toggle('on', k === tool);
+  if (els.scMode) {
+    els.scMode.value = sculpt.mode;
+    els.scRadius.value = sculpt.radius; els.scRadiusOut.textContent = sculpt.radius + ' vox (' + (sculpt.radius / 10).toFixed(1) + ' m)';
+    els.scStrength.value = sculpt.strength;
+    els.scStrengthOut.textContent = (sculpt.mode === 'raise' || sculpt.mode === 'lower') ? (sculpt.strength / 5).toFixed(1) + ' vox/dab' : sculpt.strength + '%/dab';
+  }
   els.radius.value = brush.radius; els.radiusOut.textContent = brush.radius;
   els.land.value = brush.landform; els.landOut.textContent = brush.landform;
 }
@@ -1011,6 +1414,7 @@ export function attach(hooks) {
     water: el('button', {title: 'click: place an AUTHORED LAKE (a water preset at that column, same on every seed); drag a lake to move it; shift+click: delete it'}, 'Water'),
     landform: el('button', {title: 'click: DECLARE A LANDFORM (a peak / ridge / basin / plateau overlaid onto the landform plane at load, same on every seed); drag one to move it; shift+click: delete it'}, 'Landform'),
     site: el('button', {title: 'click a site marker of any kind to select it in the Sites panel'}, 'Select'),
+    sculpt: el('button', {title: 'SCULPT the ground: raise / lower / smooth / flatten / erase the map\u2019s height-offset layer (sculpt.svsculpt, 0.8 m samples). Zoom in, click Heights to see the engine\u2019s ground under it live.'}, 'Sculpt'),
   };
   for (const [k, b] of Object.entries(els.tools)) b.addEventListener('click', () => { tool = k; syncControls(); paint(); });
   // The water tool's preset and radius (P-F). The preset list is
@@ -1037,12 +1441,25 @@ export function attach(hooks) {
   els.lfHeight.addEventListener('change', () => { landform.heightVox = Math.round(+els.lfHeight.value || 0); });
   els.lfRot = el('input', {type: 'number', min: -180, max: 360, step: 5, value: landform.rotation, style: 'width:56px', title: 'a new ridge\u2019s heading in degrees (0 = along +X, 90 = along +Z)'});
   els.lfRot.addEventListener('change', () => { landform.rotation = Math.round(+els.lfRot.value || 0); });
+  // THE SCULPT BRUSH's controls (P5)
+  els.scMode = el('select', {title: 'raise / lower: add or remove height; smooth: pull toward the local average of the GROUND (the layer alone where no heights are loaded); flatten: level to the ground height under the cursor where the stroke started (needs Heights); erase: back toward the generated ground'});
+  for (const m of SC_MODES) els.scMode.append(el('option', {value: m}, m));
+  els.scMode.addEventListener('change', () => { sculpt.mode = els.scMode.value; tool = 'sculpt'; syncControls(); paint(); });
+  els.scRadius = el('input', {type: 'range', min: 8, max: 2048, step: 8, value: sculpt.radius, style: 'width:110px', title: 'sculpt brush radius in voxels ([ and ] with the Sculpt tool)'});
+  els.scRadiusOut = el('span', {});
+  els.scRadius.addEventListener('input', () => { sculpt.radius = +els.scRadius.value; syncControls(); paint(); });
+  els.scStrength = el('input', {type: 'range', min: 1, max: 100, value: sculpt.strength, style: 'width:90px', title: 'raise / lower: voxels per dab at the centre (strength / 5); smooth / flatten / erase: the fraction of the way per dab'});
+  els.scStrengthOut = el('span', {});
+  els.scStrength.addEventListener('input', () => { sculpt.strength = +els.scStrength.value; syncControls(); });
+  const scShow = el('input', {type: 'checkbox', checked: true, title: 'draw the sculpt layer over the map (warm = raised, cool = lowered)'});
+  scShow.addEventListener('change', () => { sculpt.show = scShow.checked; paint(); });
   els.heightsBtn = el('button', {title: 'draw the engine\u2019s own heights (World::TerrainColumn over the SAVED map, --heightmap) under the biomes; click again to hide'}, 'Heights');
   els.heightsBtn.addEventListener('click', () => {
     // Shown AND current: hide. Shown but stale (a save since, or another
     // seed in the preview pane): refresh in the same click, not hide-then-show.
     const seed = H.previewSeed ? H.previewSeed() : 1337;
-    const current = heights && heights.gen === savedGen && heights.seed === seed;
+    // ...and for the same square: zoomed in, Heights renders the VIEW.
+    const current = heights && heights.gen === savedGen && heights.seed === seed && map && heights.key === heightsRequest().key;
     if (showHeights && current) { showHeights = false; els.heightsBtn.classList.remove('on'); paint(); return; }
     fetchHeights().catch(e => { toast('heights: ' + e.message, true); status('heights failed: ' + e.message); });
   });
@@ -1071,7 +1488,8 @@ export function attach(hooks) {
     el('label', {title: 'the edit layer the game applies over worldgen (tuning.json world.editLayer)'}, ' edits ', els.editSel),
     els.save, undoBtn, redoBtn, fitBtn, els.heightsBtn,
     el('span', {style: 'width:10px'}),
-    els.tools.site, els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water,
+    els.tools.site, els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.sculpt,
+    el('label', {}, ' sculpt ', els.scMode, ' r ', els.scRadius, ' ', els.scRadiusOut, ' str ', els.scStrength, ' ', els.scStrengthOut, ' ', scShow, ' show'),
     el('label', {}, ' lake ', els.waterPreset, ' r ', els.waterRadius, ' m'),
     el('label', {}, ' stamp ', els.stampTpl, ' ', els.stampRot),
     el('label', {}, ' new landform ', els.lfShape, ' r ', els.lfRadius, ' h ', els.lfHeight, ' \u00b0 ', els.lfRot),
@@ -1085,6 +1503,7 @@ export function attach(hooks) {
     'A stamp site places assets/prefabs/<name>.vox (picked from the files that exist) on a levelled pad at that column; a site whose .vox has since gone is skipped with a warning at load. ' +
     'A water site is an AUTHORED LAKE: the chosen preset (Environment > Water bodies) carved at that column on every seed. ' +
     'A landform site is a DECLARED mountain: a peak, ridge, basin or plateau overlaid onto the landform plane at load. ' +
+    'SCULPT shapes the ground itself: a signed height offset every 0.8 m (sculpt.svsculpt, 25.6 m tiles that exist only where you sculpt), added AFTER all the seeded noise and the home-area fade, so a 12 m raise is 12 m anywhere; the sediment, ponds, sea and site pads react to it. Zoom in and click Heights: the backdrop then covers the view and follows your strokes live (exact except the sediment wedge\u2019s reaction, which the next save redraws). An erased layer saves as no file at all. ' +
     'Saving writes assets/worldmap/<name>/ and moves the world hash; regenerate the world (F7 in the game, or Apply in the sidebar) to see it.');
   const main = el('div', {class: 'mapmain'}, bar, els.palette, els.canvas, els.status, note);
   const side = el('div', {class: 'mapside'}, buildTerrainSection(), buildSitesPanel());

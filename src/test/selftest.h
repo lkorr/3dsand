@@ -224,4 +224,12 @@ int Run(Ctx& c, const Options& opt);
 // Print the gate names and groups, one per line, and return 0.
 int List();
 
+// ---- far-cascade helpers, shared by the far gates (selftest_render.cpp) and
+// `sculpt` (selftest_envtruth.cpp): ONE definition of the far grid's
+// addressing. FarVoxByte reads one packed cell byte of cascade `level` at
+// cell `cc` (a blocking readback -- selftest only); DrainFullRefill fills
+// every level around `playerChunk` from scratch and waits.
+uint32_t FarVoxByte(GpuContext& ctx, World& world, uint32_t level, IVec3 cc);
+void DrainFullRefill(GpuContext& ctx, World& world, Simulation& sim, IVec3 playerChunk);
+
 }  // namespace selftest

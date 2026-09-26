@@ -30,7 +30,6 @@
 using namespace sandvox;
 
 namespace selftest {
-namespace {
 
 // ---- one packed material byte out of farVox -----------------------------
 // The far grid's own addressing (kFarN masks, chunk-major), mirroring
@@ -76,6 +75,8 @@ void DrainFullRefill(GpuContext& ctx, World& world, Simulation& sim,
   }
   ctx.WaitIdle();
 }
+
+namespace {
 
 // ---- the conservative blocker flag, bit 7 of the far cell byte -----------
 // (13.2.2 / W2-D; common.wgsl FAR_BLOCKER_BIT)

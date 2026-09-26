@@ -16091,6 +16091,51 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   first authored one exercises the whole path. Not yet: `proc:` kinds
   (the ruin shell is gone; a generator per kind is the follow-up plan),
   slope-gated rules, sites larger than 512 voxels a side.
+* **LIVE (map overhaul P5, 2026-09-26): THE SCULPT LAYER — the tier between
+  the 102 m landform cell and the voxel.** `assets/worldmap/<name>/
+  sculpt.svsculpt` is a sparse, tiled, SIGNED height offset in whole voxels
+  (format: `worldmap.h` kSculpt*), painted on the World map page with raise /
+  lower / smooth / flatten / erase brushes. `LoadWorldMap` packs it
+  (`PackSculpt`) into a block appended to the worldMap buffer (header word
+  `kHSculpt`, 0 = none); `sculptOctave(x, z)` samples it OUTSIDE the height
+  mirror on both sides (worldgen.wgsl / world.cpp, same arithmetic over the
+  same words) and the mirrored `landAt` adds `sp.dev` to `bed` **after** the
+  octave ladder, the biome curve and the calm-area fade (none of them scales
+  it: a 12 m raise is 12 m in the home area and on a mountain) and **before**
+  the sediment wedge, so the wedge, the ponds, the sea test, the site pads
+  (`BareGroundHeight` runs the mirror after the layer is loaded) and every
+  consumer of `h` — `TerrainHeight`, spawn, trees, cover, the far cascades,
+  `--voxserve`, `--heightmap` — follow. Its exact bilinear gradient joins
+  `Land.slope` (`|g2 + sp.g|`): an authored bank sheds the powder wedge as
+  a noise bank does (rule 2). It does NOT feed the octaves' attenuation —
+  the fine rungs stay at full amplitude on sculpted ground, which is why
+  `flatten` levels the TOTAL ground (the brush reads the engine's heights),
+  leaving the ±2-voxel grain octave, the one rung finer than the samples.
+  **Geometry, and why.** One sample every **8 voxels** (0.8 m): the grain
+  octave's own cell, so a brush can cancel every seeded rung but the grain,
+  and a footpath or a 2 m ditch is resolvable; finer belongs to the voxel-
+  exact `.svedit` layer, coarser than 1.6 m could not carve a path. Tiles of
+  **32 x 32 samples (256 voxels, 25.6 m)** stored with the east/south
+  neighbours' shared edge (33 x 33 i16, 2.2 KB on the GPU, 2 KB on disk) so a
+  column's bilinear reads one tile; a two-level directory — **regions of 4 x
+  4 tiles (1024 voxels)** over the bounding box of the sculpted tiles, one
+  word each, then 16 tile slots per touched region — so the cost is
+  proportional to what was sculpted: an unsculpted map is 0 words (and packs
+  byte-identically to a pre-P5 build), a map sculpted in places across the
+  whole 20 km `default` extent pays at most 38,416 directory words (150 KB)
+  plus ~2.2 KB per touched tile (~3.4 MB per fully sculpted km²). Per
+  column: one header word and a branch without a layer; with one, a
+  directory word, a tile slot and four sample words.
+  **Empty = nothing, by construction:** no file, a file of no tiles and a
+  file of all-zero tiles all pack to an empty block, the tuner deletes the
+  file when an erased layer is saved, and the environment stamp / worldgen
+  fingerprint / voxserve cache signature hash `.svsculpt` only when it
+  exists. Gate `sculpt` (selftest_envtruth.cpp) builds its own tile in the
+  window (a +120 dome and a -40 pit): empty-layer packing identity, the CPU
+  twin moving by the authored amount and nowhere else, the GPU per-voxel C1
+  claim over the whole tile, and the far cascades (levels 1..3) seeing both
+  bumps. Not yet: the same brushes in the 3D voxel view (worldview.js),
+  a per-tile material override.
 * **THE LIVE MANIFEST** (`assets/editor/envlive.js`, PLAN_environment_truth
   P-B, 2026-09-05). One table says, per JSON path of a biome file, a water
   preset and the map, `{read: true}` or `{read: false, package, why}`; every

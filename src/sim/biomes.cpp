@@ -396,7 +396,9 @@ EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string
   if (!editLayer.empty())
     s.edits = sandvox::HashOneFile(assetDir + "/worldedits/" + editLayer + ".svedit",
                                    editLayer + ".svedit");
-  s.map = HashFileSet(assetDir + "/worldmap/" + mapName, {".json", ".svmap"});
+  // .svsculpt (P5): the sculpt layer is part of the map. A map without one
+  // hashes exactly as it did before the layer existed.
+  s.map = HashFileSet(assetDir + "/worldmap/" + mapName, {".json", ".svmap", ".svsculpt"});
   // The water presets are a worldgen input since P-E (their flora rows are
   // packed into the same buffer as the biome records), so they are part of
   // the `biomes` stamp: an edited preset must light the apply button too.

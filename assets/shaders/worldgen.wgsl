@@ -693,8 +693,16 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   let ws = vsmooth(min(w, wh) << 1) >> 1;           // Q14 smoothstep of the ramp
   let homeY = wmTerrain(WM_H_TERRAIN_HOME_Y);
   let coarse = wmTerrain(WM_H_TERRAIN_BASE_HEIGHT) + cv.x - homeY;
+  // ---- THE SCULPT LAYER (P5): the author's offset, added whole ----
+  // AFTER the octaves, their attenuation and the calm-area fade, and scaled
+  // by none of them: an author who raises a hill by 12 m gets 12 m, in the
+  // home area or on a mountain. BEFORE the wedge (which thins on the sculpted
+  // slope, below), and so before the ponds, the sea test and the site pads,
+  // which all read this function's h. An empty layer is dev == gx == gz == 0,
+  // and every line below reads what it read before P5.
+  let sp = sculptOctave(x, z);
   let bed = homeY + o2.dev + o3.dev + o4.dev
-          + ((coarse * ws) >> 14);
+          + ((coarse * ws) >> 14) + sp.dev;
 
   // ---- THE SEDIMENT WEDGE ----
   // Low flat ground carries metres of loose dirt over gravel; ridges carry
@@ -729,7 +737,11 @@ fn landAt(x : i32, z : i32, seed : u32) -> Land {
   //
   // Physically it is also the better model in both cases: sediment is what
   // FILLS surface roughness, so roughness must not switch it off.
-  let slope = abs(g2x) + abs(g2z);
+  //
+  // The SCULPT's gradient joins it: an authored bank is landform, not
+  // roughness, and a wedge laid down a sculpted cliff is exactly the powder-
+  // on-a-wall the gate exists to prevent.
+  let slope = abs(g2x + sp.gx) + abs(g2z + sp.gz);
   let room = max(0, wmTerrain(WM_H_TERRAIN_SED_CEIL) - bed);
   var sed = ((room * wmTerrain(WM_H_TERRAIN_SED_FRACTION)) >> 8) - wmTerrain(WM_H_TERRAIN_SED_STRIP);
   let sedSlope = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
@@ -1317,6 +1329,17 @@ const WM_H_TERRAIN_SED_MAX          : u32 = 50u;
 const WM_H_TERRAIN_SED_TOPSOIL      : u32 = 51u;
 const WM_H_TERRAIN_TREELINE         : u32 = 52u;
 const WM_H_TERRAIN_REF_VPM          : u32 = 53u;
+// ---- the sculpt layer (worldmap.h kHSculpt / kSculpt* / kSc_*; P5) ----
+const WM_H_SCULPT                   : u32 = 54u;   // block offset, 0 = no layer
+const WM_SCULPT_SPACING_LOG2        : u32 = 3u;    // 8 voxels between samples
+const WM_SCULPT_TILE_LOG2           : u32 = 5u;    // 32 samples per tile side
+const WM_SCULPT_REGION_LOG2         : u32 = 2u;    // 4 tiles per directory region side
+const WM_SCULPT_TILE_SIDE           : u32 = 33u;   // stored side: 32 + the shared edge
+const WM_SCULPT_HDR_WORDS           : u32 = 4u;
+const WM_SC_REGION_X0               : u32 = 0u;
+const WM_SC_REGION_Z0               : u32 = 1u;
+const WM_SC_REGION_W                : u32 = 2u;
+const WM_SC_REGION_H                : u32 = 3u;
 fn wmTerrain(w : u32) -> i32 { return bitcast<i32>(worldMap[w]); }
 fn wmTerrainU(w : u32) -> u32 { return worldMap[w]; }
 // the site table (worldmap.h kS_* / kStamp_*)
@@ -1740,6 +1763,67 @@ fn mapLandformGz(x : i32, z : i32) -> i32 {
   let cz = (z - half + (i32(worldMap[WM_H_ORIGIN_Z]) << l)) >> l;
   let d = wmLandformCellQ8(cx, cz + 1) - wmLandformCellQ8(cx, cz);
   return (d * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> (8u + l);
+}
+
+// ---- THE SCULPT LAYER (P5, worldmap.h kSculpt*): the author's own shape ------
+// A sparse, tiled, signed height offset in voxels, one sample every 8 voxels,
+// bilinear between them. OUTSIDE the height mirror like the plane readers:
+// landAt calls sculptOctave() by name on both sides, and world.cpp spells the
+// same arithmetic over the same packed words (WorldMapData::sculpt); the
+// `sculpt` gate holds the two together per column over a synthetic tile.
+//
+// Returned as an Oct so landAt reads it like a rung: `dev` is the offset,
+// gx / gz its own gradient in the ladder's Q8-per-voxel units (the bilinear's
+// exact derivative: a sample difference over 8 voxels is * 32 in Q8, and the
+// other axis' weights sum to 8, hence * 4). The gradient feeds the SEDIMENT
+// SLOPE GATE only -- a sculpted cliff sheds its wedge like a noise cliff does
+// (rule 2), and nothing attenuates or scales the offset itself.
+//
+// Per-column cost with no layer: one header word and a branch. With one: the
+// directory entry, the region's tile slot, and four samples in one tile
+// body (its stored +1 edge means the bilinear never crosses into a second).
+fn sculptSample(t : u32, k : i32) -> i32 {
+  let w = worldMap[t + u32(k >> 1)];
+  let sh = u32(k & 1) * 16u;
+  return bitcast<i32>(w << (16u - sh)) >> 16u;
+}
+fn sculptOctave(x : i32, z : i32) -> Oct {
+  var o : Oct;
+  o.dev = 0;
+  o.gx = 0;
+  o.gz = 0;
+  let base = worldMap[WM_H_SCULPT];
+  if (base == 0u) { return o; }
+  let sx = x >> WM_SCULPT_SPACING_LOG2;
+  let sz = z >> WM_SCULPT_SPACING_LOG2;
+  let tx = sx >> WM_SCULPT_TILE_LOG2;
+  let tz = sz >> WM_SCULPT_TILE_LOG2;
+  let rx = (tx >> WM_SCULPT_REGION_LOG2) - bitcast<i32>(worldMap[base + WM_SC_REGION_X0]);
+  let rz = (tz >> WM_SCULPT_REGION_LOG2) - bitcast<i32>(worldMap[base + WM_SC_REGION_Z0]);
+  let rw = i32(worldMap[base + WM_SC_REGION_W]);
+  if (rx < 0 || rz < 0 || rx >= rw || rz >= i32(worldMap[base + WM_SC_REGION_H])) { return o; }
+  let dir = worldMap[base + WM_SCULPT_HDR_WORDS + u32(rz * rw + rx)];
+  if (dir == 0u) { return o; }
+  let rmask = (1 << WM_SCULPT_REGION_LOG2) - 1;
+  let body = worldMap[base + dir + u32(((tz & rmask) << WM_SCULPT_REGION_LOG2) + (tx & rmask))];
+  if (body == 0u) { return o; }
+  let t = base + body;
+  let smask = (1 << WM_SCULPT_TILE_LOG2) - 1;
+  let side = i32(WM_SCULPT_TILE_SIDE);
+  let k = (sz & smask) * side + (sx & smask);
+  let s00 = sculptSample(t, k);
+  let s10 = sculptSample(t, k + 1);
+  let s01 = sculptSample(t, k + side);
+  let s11 = sculptSample(t, k + side + 1);
+  let one = 1 << WM_SCULPT_SPACING_LOG2;
+  let fx = x & (one - 1);
+  let fz = z & (one - 1);
+  let a = s00 + (((s10 - s00) * fx) >> WM_SCULPT_SPACING_LOG2);
+  let b = s01 + (((s11 - s01) * fx) >> WM_SCULPT_SPACING_LOG2);
+  o.dev = a + (((b - a) * fz) >> WM_SCULPT_SPACING_LOG2);
+  o.gx = ((s10 - s00) * (one - fz) + (s11 - s01) * fz) << (8u - 2u * WM_SCULPT_SPACING_LOG2);
+  o.gz = ((s01 - s00) * (one - fx) + (s11 - s10) * fx) << (8u - 2u * WM_SCULPT_SPACING_LOG2);
+  return o;
 }
 // The painted cell's biome with NO warp and no seed: what decides whose water
 // rows roll at a pond tile (pondRoll). The warped read below costs two noise

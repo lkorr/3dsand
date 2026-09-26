@@ -39,6 +39,9 @@ happens in this process rather than in the page:
                               when the files under _world_signature moved)
   GET  /api/worldedits        list assets/worldedits/*.svedit
   GET  /api/worldmap/terrain-defaults   map.json terrain defaults (worldmap.h)
+  GET  /api/worldmap/sculpt?name=   the map's sculpt layer (binary 'SVSC'; 404 = none)
+  POST /api/worldmap/sculpt?name=   write it (write-then-rename); an EMPTY body
+                              deletes the file (no layer = the pre-P5 world)
   GET  /api/worldedit?name=   read one edit layer (binary 'SVED')
   POST /api/worldedit?name=   write one edit layer
   POST /api/worldedit/delete  delete one edit layer
@@ -531,6 +534,8 @@ VOXCACHE_MAX = 2000
 
 WORLDEDIT_DIR = os.path.join(ASSETS, "worldedits")
 WORLDEDIT_EXT = ".svedit"
+# The P5 sculpt layer's file, beside map.json / map.svmap (worldmap.h).
+SCULPT_FILE = "sculpt.svsculpt"
 # The authored world map (src/sim/worldmap.h): assets/worldmap/<name>/ holds
 # map.json (the diffable half) beside map.svmap (the three u8 planes). The
 # Environment tab's World map page reads and writes both through the
@@ -749,7 +754,8 @@ def _world_signature():
     The cache key has to move when the world does, and the voxel server's
     worldgen is a function of: tuning.json (world.mapLayer names the map, and
     the prelude consts), materials.json (the ids the words carry), the named
-    map (map.json + map.svmap: the terrain block, sites, planes), the biome and
+    map (map.json + map.svmap: the terrain block, sites, planes; + the P5
+    sculpt layer when the map has one), the biome and
     water files, and the tree atlases (.svtree; the species .json are only the
     bake's input). Hashed by CONTENT, not mtime: a tuner restart should not
     throw away a cache, and an edit that reverts a file should hit the entries
@@ -769,6 +775,11 @@ def _world_signature():
     d = _worldmap_dir(name)
     if d:
         paths += [os.path.join(d, "map.json"), os.path.join(d, "map.svmap")]
+        # Only when present, so a map without a layer keeps the signature (and
+        # the region cache) it had before the layer existed.
+        sp = os.path.join(d, SCULPT_FILE)
+        if os.path.isfile(sp):
+            paths.append(sp)
     for sub, ext in (("biomes", ".json"), ("water", ".json"), ("trees", ".svtree")):
         sd = os.path.join(ASSETS, sub)
         try:
@@ -1354,7 +1365,8 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {
                 "ok": True,
                 "map": name,
-                "mapHash": "%08x" % _fnv_file_set(d or "", (".json", ".svmap")),
+                # + .svsculpt (P5), mirroring StampEnvironment's map set
+                "mapHash": "%08x" % _fnv_file_set(d or "", (".json", ".svmap", ".svsculpt")),
                 # biomes ^ water: the presets' flora rows are packed with the
                 # biome records since P-E (mirrors StampEnvironment)
                 "biomesHash": "%08x" % (_fnv_file_set(os.path.join(ASSETS, "biomes"), (".json",)) ^
@@ -1387,6 +1399,18 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             return self._json(200, {"ok": True, "maps": maps})
+        if p == "/api/worldmap/sculpt":
+            # The P5 sculpt layer. 404 is the normal answer for a map nobody
+            # has sculpted: the page starts from an empty layer.
+            name = (self._query().get("name") or [""])[0]
+            d = _worldmap_dir(name)
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            path = os.path.join(d, SCULPT_FILE)
+            if not os.path.isfile(path):
+                return self._json(404, {"ok": False, "error": "no sculpt layer"})
+            with open(path, "rb") as f:
+                return self._send(200, f.read(), "application/octet-stream")
         if p == "/api/worldmap" or p == "/api/worldmap/planes":
             name = (self._query().get("name") or [""])[0]
             d = _worldmap_dir(name)
@@ -1716,6 +1740,40 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(500, {"ok": False, "error": str(e)})
             return self._json(200, {"ok": True, "bytes": len(blob)})
 
+        if p == "/api/worldmap/sculpt":
+            # The P5 sculpt layer (src/sim/worldmap.h: 'SVSC', v1, 32-byte
+            # header, 2056-byte tile records). An EMPTY body deletes the file:
+            # a map whose layer was erased back to nothing must hash, stamp
+            # and generate exactly as one that never had a layer.
+            name = (self._query().get("name") or [""])[0]
+            d = _worldmap_dir(name)
+            if not d:
+                return self._json(400, {"ok": False, "error": "bad map name"})
+            blob = self._raw()
+            path = os.path.join(d, SCULPT_FILE)
+            if not blob:
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError as e:
+                    return self._json(500, {"ok": False, "error": str(e)})
+                return self._json(200, {"ok": True, "bytes": 0, "deleted": True})
+            if len(blob) < 32 or blob[:4] != b"SVSC":
+                return self._json(400, {"ok": False, "error": "not an SVSC sculpt layer"})
+            count = int.from_bytes(blob[16:20], "little")
+            if len(blob) != 32 + count * 2056:
+                return self._json(400, {"ok": False, "error": "sculpt layer size does not match its tile count"})
+            try:
+                os.makedirs(d, exist_ok=True)
+                # Write-then-rename: a half-written layer is a map the engine
+                # refuses to load.
+                tmp = path + ".tmp"
+                with open(tmp, "wb") as f:
+                    f.write(blob)
+                os.replace(tmp, path)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            return self._json(200, {"ok": True, "bytes": len(blob), "tiles": count})
         if p == "/api/worldmap" or p == "/api/worldmap/planes":
             name = (self._query().get("name") or [""])[0]
             d = _worldmap_dir(name)

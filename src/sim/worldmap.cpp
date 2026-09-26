@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <unordered_map>
 
@@ -663,6 +664,109 @@ bool PackStamp(const Prefab& pf, int rot, WorldMapData::StampSite& s, std::strin
 
 }  // namespace
 
+bool PackSculpt(const uint8_t* data, size_t n, std::vector<uint32_t>& block,
+                int* tilesOut, std::string& log) {
+  block.clear();
+  if (tilesOut) *tilesOut = 0;
+  if (n == 0) return true;
+  constexpr size_t kHdrBytes = 32;
+  constexpr int T = kSculptTileSamples;
+  constexpr size_t kRecBytes = 8 + size_t(T) * T * 2;
+  auto rd32 = [&](size_t off) { uint32_t v; std::memcpy(&v, data + off, 4); return v; };
+  if (n < kHdrBytes) { log += "sculpt: file is " + std::to_string(n) + " bytes, shorter than its header\n"; return false; }
+  if (rd32(0) != kSculptFileMagic || rd32(4) != kSculptVersion) { log += "sculpt: bad magic/version\n"; return false; }
+  if (rd32(8) != kSculptSpacingLog2 || rd32(12) != kSculptTileLog2) {
+    log += "sculpt: sample spacing log2 " + std::to_string(rd32(8)) + " / tile log2 " + std::to_string(rd32(12)) +
+           " -- this build reads " + std::to_string(kSculptSpacingLog2) + " / " + std::to_string(kSculptTileLog2) + "\n";
+    return false;
+  }
+  const uint32_t count = rd32(16);
+  if (n != kHdrBytes + size_t(count) * kRecBytes) {
+    log += "sculpt: " + std::to_string(count) + " tiles need " + std::to_string(kHdrBytes + size_t(count) * kRecBytes) +
+           " bytes, the file has " + std::to_string(n) + "\n";
+    return false;
+  }
+  // The authored tiles, non-zero only, in a SORTED map: the packed block is a
+  // pure function of the file's content, whatever order it lists tiles in.
+  using Key = std::pair<int, int>;   // (tz, tx): z-major
+  std::map<Key, std::vector<int16_t>> tiles;
+  for (uint32_t i = 0; i < count; i++) {
+    const uint8_t* r = data + kHdrBytes + size_t(i) * kRecBytes;
+    int32_t tx, tz;
+    std::memcpy(&tx, r, 4); std::memcpy(&tz, r + 4, 4);
+    std::vector<int16_t> s(size_t(T) * T);
+    std::memcpy(s.data(), r + 8, s.size() * 2);
+    bool any = false;
+    for (int16_t v : s) any = any || v != 0;
+    if (!any) continue;
+    if (!tiles.emplace(Key{tz, tx}, std::move(s)).second) {
+      log += "sculpt: tile (" + std::to_string(tx) + "," + std::to_string(tz) + ") appears twice\n";
+      return false;
+    }
+  }
+  if (tiles.empty()) return true;
+  auto sampleAt = [&](int sx, int sz) -> int {
+    auto it = tiles.find(Key{sz >> kSculptTileLog2, sx >> kSculptTileLog2});
+    if (it == tiles.end()) return 0;
+    return it->second[size_t(sz & (T - 1)) * T + size_t(sx & (T - 1))];
+  };
+  // The bodies to materialise: every authored tile and the three whose +1
+  // edge reads it (west, north, north-west), kept only if non-zero.
+  constexpr int S = kSculptTileSide;
+  std::map<Key, std::vector<int>> bodies;
+  for (const auto& kv : tiles)
+    for (int dz = -1; dz <= 0; dz++)
+      for (int dx = -1; dx <= 0; dx++) {
+        const Key k{kv.first.first + dz, kv.first.second + dx};
+        if (bodies.count(k)) continue;
+        std::vector<int> v(size_t(S) * S);
+        bool any = false;
+        for (int j = 0; j < S; j++)
+          for (int i = 0; i < S; i++) {
+            const int s = sampleAt(k.second * T + i, k.first * T + j);
+            v[size_t(j) * S + i] = s;
+            any = any || s != 0;
+          }
+        if (any) bodies.emplace(k, std::move(v));
+      }
+  if (bodies.empty()) return true;
+  int rx0 = INT32_MAX, rz0 = INT32_MAX, rx1 = INT32_MIN, rz1 = INT32_MIN;
+  for (const auto& kv : bodies) {
+    const int rx = kv.first.second >> kSculptRegionLog2, rz = kv.first.first >> kSculptRegionLog2;
+    rx0 = std::min(rx0, rx); rx1 = std::max(rx1, rx);
+    rz0 = std::min(rz0, rz); rz1 = std::max(rz1, rz);
+  }
+  const int64_t rw = int64_t(rx1) - rx0 + 1, rh = int64_t(rz1) - rz0 + 1;
+  if (rw * rh > kSculptMaxRegions) {
+    log += "sculpt: the tiles span " + std::to_string(rw) + " x " + std::to_string(rh) +
+           " directory regions (limit " + std::to_string(kSculptMaxRegions) + " entries)\n";
+    return false;
+  }
+  block.assign(kSculptHdrWords + size_t(rw * rh), 0u);
+  block[kSc_RegionX0] = U(rx0);
+  block[kSc_RegionZ0] = U(rz0);
+  block[kSc_RegionW] = U(static_cast<int>(rw));
+  block[kSc_RegionH] = U(static_cast<int>(rh));
+  constexpr int R = 1 << kSculptRegionLog2;
+  for (const auto& kv : bodies) {
+    const int tx = kv.first.second, tz = kv.first.first;
+    const size_t e = kSculptHdrWords + size_t((tz >> kSculptRegionLog2) - rz0) * size_t(rw) +
+                     size_t((tx >> kSculptRegionLog2) - rx0);
+    if (block[e] == 0u) {
+      block[e] = U(static_cast<int>(block.size()));
+      block.resize(block.size() + size_t(R) * R, 0u);
+    }
+    const size_t slot = block[e] + size_t(tz & (R - 1)) * R + size_t(tx & (R - 1));
+    const uint32_t body = U(static_cast<int>(block.size()));
+    block.resize(block.size() + kSculptTileWords, 0u);
+    block[slot] = body;
+    for (int k = 0; k < S * S; k++)
+      block[body + (k >> 1)] |= (static_cast<uint32_t>(kv.second[size_t(k)]) & 0xFFFFu) << ((k & 1) * 16);
+  }
+  if (tilesOut) *tilesOut = static_cast<int>(tiles.size());
+  return true;
+}
+
 bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                   const biomes::BiomeSet& set, size_t materialCount, uint32_t seed,
                   WorldMapData& out, std::string& log) {
@@ -975,6 +1079,27 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   }
   std::memcpy(out.landform.data(), raw.data() + 16 + cells, cells);
   std::memcpy(out.moisture.data(), raw.data() + 16 + cells * 2, cells);
+  // ---- sculpt.svsculpt (P5): the sparse height-offset layer, optional --------
+  // Read BEFORE the site-pad bake below: a pad's height is the sculpted ground
+  // (BareGroundHeight runs the mirror, which reads out.sculpt). Absent = no
+  // layer, and nothing downstream sees a difference; malformed = refuse, like
+  // a bad map.svmap -- a half-read layer would be a different world.
+  std::vector<uint8_t> sculptRaw;
+  {
+    std::ifstream f(dir + "/sculpt.svsculpt", std::ios::binary);
+    if (f) {
+      std::ostringstream ss; ss << f.rdbuf();
+      const std::string s = ss.str();
+      sculptRaw.assign(s.begin(), s.end());
+      std::string slog;
+      if (!PackSculpt(sculptRaw.data(), sculptRaw.size(), out.sculpt, &out.sculptTiles, slog)) {
+        log += at + slog;
+        return false;
+      }
+      std::printf("world map: '%s' sculpt layer: %d tiles, %zu words\n", name.c_str(), out.sculptTiles,
+                  out.sculpt.size());
+    }
+  }
   // ---- the declared landforms, onto the painted plane (P-G) --------------------
   // After the plane is read, before anything samples it. The shader and the
   // CPU twin both read the OVERLAID plane and nothing else: a landform site
@@ -1091,6 +1216,8 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     const std::string js = j.dump();
     hsh = FnvBytes(hsh, reinterpret_cast<const uint8_t*>(js.data()), js.size());
   }
+  // Only when the file exists, so a map without one reports what it did.
+  if (!sculptRaw.empty()) hsh = FnvBytes(hsh, sculptRaw.data(), sculptRaw.size());
   out.contentHash = hsh;
   return true;
 }
@@ -1154,6 +1281,13 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
     for (size_t c = 0; c < cols; c++) blk[kStampHdrWords + c * 2] += base;
     W.insert(W.end(), blk.begin(), blk.end());
     W.data()[tab0 + i * kSiteRecWords + kS_StampOff] = base;   // W moved: re-index
+  }
+  // ---- the sculpt block (P5): appended as-is, its offsets are block-relative ----
+  // Nothing at all for a map without a layer: kHSculpt stays 0 and the words
+  // are the words a pre-P5 build packed.
+  if (!map.sculpt.empty()) {
+    W[kHSculpt] = U(static_cast<int>(W.size()));
+    W.insert(W.end(), map.sculpt.begin(), map.sculpt.end());
   }
   W[kHContentHash] = 0u;
   W[kHContentHash] = FnvWords(W) ^ map.contentHash;

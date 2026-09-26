@@ -1579,6 +1579,14 @@ static int mapLandformGz(int x, int z) {
   return (d * wmTerrain(WM_H_TERRAIN_LANDFORM_RANGE)) >> (8u + l);
 }
 
+// ---- the sculpt layer, on the CPU (worldgen.wgsl sculptSample / sculptOctave; P5) ----
+// Outside the height mirror on both sides, like the plane readers: the
+// mirrored landAt calls sculptOctave by name. Declared here, defined after the
+// mirror (it returns the mirror's Oct); the `sculpt` gate compares the two
+// implementations per column over a synthetic tile.
+struct Oct;
+static Oct sculptOctave(int x, int z);
+
 // MIRROR-BEGIN height
 // The height chain, mirrored. Everything here is a pure function of (x, z,
 // seed) and of the worldgen tuning; nothing reads a material id, which is what
@@ -1656,10 +1664,11 @@ static Land landAt(int x, int z, uint32_t seed) {
   int ws = vsmooth(std::min(w, wh) << 1) >> 1;
   int homeY = wmTerrain(WM_H_TERRAIN_HOME_Y);
   int coarse = wmTerrain(WM_H_TERRAIN_BASE_HEIGHT) + cv.x - homeY;
+  Oct sp = sculptOctave(x, z);
   int bed = homeY + o2.dev + o3.dev + o4.dev
-          + ((coarse * ws) >> 14);
+          + ((coarse * ws) >> 14) + sp.dev;
 
-  int slope = std::abs(g2x) + std::abs(g2z);
+  int slope = std::abs(g2x + sp.gx) + std::abs(g2z + sp.gz);
   int room = std::max(0, wmTerrain(WM_H_TERRAIN_SED_CEIL) - bed);
   int sed = ((room * wmTerrain(WM_H_TERRAIN_SED_FRACTION)) >> 8) - wmTerrain(WM_H_TERRAIN_SED_STRIP);
   int sedSlope = wmTerrain(WM_H_TERRAIN_SED_SLOPE);
@@ -1941,6 +1950,52 @@ static Shore pondNear(PondSet s, int x, int z, uint32_t seed) {
   return sh;
 }
 // MIRROR-END height
+
+// The same arithmetic as the shader over WorldMapData::sculpt, the block
+// PackWorldMap appends (offsets relative to its first word, so base 0 here).
+static int sculptSample(const std::vector<uint32_t>& blk, uint32_t t, int k) {
+  const uint32_t w = blk[t + (uint32_t)(k >> 1)];
+  const uint32_t sh = (uint32_t)(k & 1) * 16u;
+  return (int32_t)(w << (16u - sh)) >> 16;
+}
+static Oct sculptOctave(int x, int z) {
+  using namespace worldmap;
+  Oct o;
+  o.dev = 0;
+  o.gx = 0;
+  o.gz = 0;
+  const std::vector<uint32_t>& blk = CurrentWorldMap().sculpt;
+  if (blk.empty()) return o;
+  const int sx = x >> kSculptSpacingLog2;
+  const int sz = z >> kSculptSpacingLog2;
+  const int tx = sx >> kSculptTileLog2;
+  const int tz = sz >> kSculptTileLog2;
+  const int rx = (tx >> kSculptRegionLog2) - (int32_t)blk[kSc_RegionX0];
+  const int rz = (tz >> kSculptRegionLog2) - (int32_t)blk[kSc_RegionZ0];
+  const int rw = (int)blk[kSc_RegionW];
+  if (rx < 0 || rz < 0 || rx >= rw || rz >= (int)blk[kSc_RegionH]) return o;
+  const uint32_t dir = blk[kSculptHdrWords + (uint32_t)(rz * rw + rx)];
+  if (dir == 0u) return o;
+  const int rmask = (1 << kSculptRegionLog2) - 1;
+  const uint32_t body = blk[dir + (uint32_t)(((tz & rmask) << kSculptRegionLog2) + (tx & rmask))];
+  if (body == 0u) return o;
+  const int smask = (1 << kSculptTileLog2) - 1;
+  const int side = (int)kSculptTileSide;
+  const int k = (sz & smask) * side + (sx & smask);
+  const int s00 = sculptSample(blk, body, k);
+  const int s10 = sculptSample(blk, body, k + 1);
+  const int s01 = sculptSample(blk, body, k + side);
+  const int s11 = sculptSample(blk, body, k + side + 1);
+  const int one = 1 << kSculptSpacingLog2;
+  const int fx = x & (one - 1);
+  const int fz = z & (one - 1);
+  const int a = s00 + (((s10 - s00) * fx) >> kSculptSpacingLog2);
+  const int b = s01 + (((s11 - s01) * fx) >> kSculptSpacingLog2);
+  o.dev = a + (((b - a) * fz) >> kSculptSpacingLog2);
+  o.gx = ((s10 - s00) * (one - fz) + (s11 - s01) * fz) << (8u - 2u * kSculptSpacingLog2);
+  o.gz = ((s01 - s00) * (one - fx) + (s11 - s10) * fx) << (8u - 2u * kSculptSpacingLog2);
+  return o;
+}
 
 // Fluid-lab flat-slab mode (world.h kLabSlabY). Process-wide, set once at
 // startup by --lab / --fluid-bench, mirrored to the GPU as TickParams.labMode.

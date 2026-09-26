@@ -250,7 +250,8 @@ uint32_t TreeChanceQ16(const BiomeDef& b, int latticeVox);
 /**
  * THE ENVIRONMENT STAMP (docs/PLAN_environment_truth.md P-A): one
  * change-detector per authored input worldgen takes from disk -- the world
- * map (map.json + map.svmap), the biome files, and the tree species + baked
+ * map (map.json + map.svmap + sculpt.svsculpt when present), the biome
+ * files, and the tree species + baked
  * atlases. Each is FNV-1a over every file's NAME, a zero byte, and its BYTES,
  * files in sorted-name order. Deliberately that simple, because the tuner
  * server computes the SAME number in Python (/api/environment/hashes) and
