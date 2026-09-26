@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-/* gen_mobs.mjs — author-side bake: a GENOME -> assets/mobs/<name>.{vox,json}
+/* gen_mobs.mjs — author-side bake: a GENOME -> assets/mobs/human/<name>.{vox,json}
  *
  *   node scripts/gen_mobs.mjs peasant --preset stocky
  *   node scripts/gen_mobs.mjs peasant --genome my.json     # a saved genome file
@@ -46,9 +46,10 @@
  * spawner names it. Re-baking one the game already spawns does, and that is a
  * one-command rebaseline (`--selftest --rebaseline`), not an investigation.
  */
-import { readFileSync, writeFileSync, existsSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, join } from 'path';
+import { listMobFiles, mobFile, protoOf } from './mobfiles.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const load = rel => import(pathToFileURL(join(ROOT, rel)).href);
@@ -107,15 +108,14 @@ const GEN_OPTS = { materials, player: tuning.player, avatar: avatarConstants() }
 // ---- --list ----------------------------------------------------------------
 if (flag('list')) {
   const rows = [];
-  for (const f of readdirSync(MOBS).filter(n => n.endsWith('.json')).sort()) {
-    const stem = f.slice(0, -5);
+  for (const { stem, path: fp, folder } of listMobFiles('.json')) {
     let j;
-    try { j = readJson(join(MOBS, f)); } catch { continue; }
+    try { j = readJson(fp); } catch { continue; }
     if (!j.limbs && !j.extends) continue;          // behaviors.json et al
     rows.push({
-      name: stem,
+      name: folder ? `${folder}/${stem}` : stem,
       kind: j.extends ? `variant of ${j.extends}` :
-            existsSync(join(MOBS, stem + '.vox')) ? 'body' : 'sidecar only',
+            existsSync(mobFile(stem, '.vox')) ? 'body' : 'sidecar only',
       genome: j.genome ? 'yes' : '-',
       palette: j.palette ? 'filter' : '-',
     });
@@ -136,8 +136,8 @@ if (opt('variant-of')) {
   const base = opt('variant-of');
   const name = positional[0];
   if (!name) die('a variant needs a name: gen_mobs.mjs <name> --variant-of <base>');
-  if (!existsSync(join(MOBS, base + '.json')))
-    die(`no such base def: assets/mobs/${base}.json`);
+  if (!existsSync(mobFile(base, '.json')))
+    die(`no such base def: ${base} (not in assets/mobs/ or a variant folder)`);
   const pal = {};
   if (opt('saturation')) pal.saturation = Number(opt('saturation'));
   if (opt('brightness')) pal.brightness = Number(opt('brightness'));
@@ -164,10 +164,11 @@ if (opt('variant-of')) {
     palette: pal,
   };
   if (opt('behavior')) doc.behavior = opt('behavior');
-  const p = join(outDir, name + '.json');
+  const p = join(fileDirFor(name, base), name + '.json');
   console.log(`${name}: variant of ${base}, ` +
               Object.entries(pal).map(([k, v]) => `${k} ${v}`).join(', '));
   if (dry) { console.log('(--dry: wrote nothing)'); process.exit(0); }
+  mkdirSync(dirname(p), { recursive: true });
   writeFileSync(p, JSON.stringify(doc, null, 2) + '\n');
   console.log(`wrote ${rel(p)} (${JSON.stringify(doc).length} bytes, no .vox)`);
   process.exit(0);
@@ -217,8 +218,19 @@ function rel(p) { return p.replace(ROOT + '\\', '').replace(ROOT + '/', ''); }
  *  carries its own genome in its sidecar, which is what makes "load it back
  *  into the sliders and breed from it" possible at all — the alternative is
  *  reverse-engineering a genome out of voxels, which is not possible. */
+/** Where `name` is written. Into the assets tree it is FILED as a variant of
+ *  the prototype it extends (assets/mobs/<proto>/<name>), or where it already
+ *  is if it exists — an overwrite must not leave a second copy of the stem for
+ *  the loader to refuse. A `--out` sandbox is written flat, as before. */
+function fileDirFor(name, base) {
+  if (outDir !== MOBS) return outDir;
+  const have = mobFile(name, '.json');
+  if (existsSync(have)) return dirname(have);
+  return join(MOBS, protoOf(base));
+}
+
 function loadGenomeByName(name) {
-  const p = join(MOBS, name + '.json');
+  const p = mobFile(name, '.json');
   if (!existsSync(p)) die(`no such def: ${rel(p)}`);
   const j = readJson(p);
   if (!j.genome)
@@ -277,7 +289,9 @@ function write(name, genome) {
       .sort((a, b) => b[1] - a[1]).map(([m, n]) => `${m} ${n}`).join(', '));
   }
   if (dry) { console.log('  (--dry: wrote nothing)'); return; }
-  const vp = join(outDir, name + '.vox'), jp = join(outDir, name + '.json');
+  const fd = fileDirFor(name, mg.BASE_MOB);
+  mkdirSync(fd, { recursive: true });
+  const vp = join(fd, name + '.vox'), jp = join(fd, name + '.json');
   // THE FILE IS THE DIFF. `built.sidecar` is the whole creature; what is
   // written is only what this body makes different from the base it extends,
   // so the rig keeps tracking the human instead of freezing a copy of it (see

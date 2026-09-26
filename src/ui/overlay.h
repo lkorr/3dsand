@@ -161,8 +161,9 @@ struct UIState {
   int windFanKind = 0;            // 0 cone, 1 burst, 2 vortex
   bool windFanEntrain = true;     // may it pull SETTLED powder loose
   int brushRadius = 4;
-  // Powder brush grain size, eighths of a cell (8 = whole cells).
-  int brushGrain = 8;
+  // Powder brush grain size, eighths of a cell: 0 = mixed grains (default),
+  // 8 = whole cells.
+  int brushGrain = 0;
   int brushMaterial = 3;     // sand
   bool reloadShaders = false;
   bool reloadMaterials = false;
@@ -268,6 +269,30 @@ struct UIState {
   // the player must be able to tell "the game misread my flick" from "I
   // misjudged the cut" — main.cpp fills it, the overlay only draws it.
   std::string swingStyle;
+
+  // ---- THE STRIKE COMPASS (debug, HUD, right of the hp bar) ----------------
+  // Drawn while a weapon is in hand: the active flick map's sectors, the live
+  // flick (the picker's smoothed mouse velocity against the pick threshold),
+  // the sector a press would pick RIGHT NOW, and a readout naming the strike
+  // the last press actually resolved to and the frame the running one is on.
+  // main.cpp fills it from PlayerSession; the overlay only draws it.
+  struct StrikeSector {
+    float x = 0, y = 0;      // screen space, +y DOWN (strokes.h PlayerStrikeMap)
+    std::string name;        // base style id, ":player" stripped
+    bool neutral = false;    // one of the two a no-flick click alternates
+  };
+  bool strikeCompass = false;
+  std::vector<StrikeSector> strikeSectors;
+  float strikeFlickX = 0, strikeFlickY = 0;   // picker velocity, px/s
+  float strikePickMin = 1;                    // melee.pickMinSpeed, px/s
+  int strikeHover = -1;      // sector a press would pick now; -1 = neutral
+  int strikeLastSector = -1; // sector the last press resolved to
+  bool strikeLastFlicked = false;
+  float strikeLastX = 0, strikeLastY = 0;     // the last press's flick dir
+  std::string strikeLastText;   // "OVERHEAD  flick up" / "... no flick"
+  float strikeLastAge = 1e9f;   // seconds since that press
+  uint32_t strikeLastSerial = 0;  // main.cpp's edge detector on the press
+  std::string strikeNowText;    // running strike: name, phase, frame
 
   // Ledge-grab readout (dev panel). main.cpp composes the text from the
   // player's per-frame probe so a refused grab says WHICH latch gate refused;

@@ -59,11 +59,39 @@ bool Collides(const Vec3& p, const Player::Box& b,
   // Feet upward: ground is the overwhelmingly common blocker, and the body
   // spans collisionHeight/kVoxelMeters rows (30 at 0.05 m voxels), so finding
   // the hit on the first row instead of the last is most of the cost.
+  // A PARTIAL POWDER cell is grains up to y + top (Player::TopFn). Only the
+  // BOTTOM row can hold one the box is above: every higher row is entered
+  // from below, where the grains are. The sole clears it when it stands at or
+  // above that top -- kSkin as for a whole cell, so flush contact reads free.
+  const float sole = p.y + b.yLo + kSkin;
   for (int y = y0; y <= y1; y++)
     for (int z = z0; z <= z1; z++)
       for (int x = x0; x <= x1; x++)
-        if (kindAt({x, y, z}) == CellKind::Solid) return true;
+        if (kindAt({x, y, z}) == CellKind::Solid) {
+          if (y == y0 && b.top != nullptr && sole >= (float)y + (*b.top)({x, y, z}))
+            continue;
+          return true;
+        }
   return false;
+}
+
+// The highest cell top under the box's footprint between two sole heights --
+// where a downward sweep lands when the floor is a partial powder cell rather
+// than a whole one. -1e30 if nothing Solid is there.
+float HighestTopBelow(const Vec3& p, const Player::Box& b,
+                      const Player::KindFn& kindAt, float soleHi, float soleLo) {
+  const float hx = b.hx - kSkin;
+  const int x0 = ifloor(p.x - hx), x1 = ifloor(p.x + hx);
+  const int z0 = ifloor(p.z - hx), z1 = ifloor(p.z + hx);
+  float best = -1e30f;
+  for (int y = ifloor(soleLo); y <= ifloor(soleHi); y++)
+    for (int z = z0; z <= z1; z++)
+      for (int x = x0; x <= x1; x++) {
+        if (kindAt({x, y, z}) != CellKind::Solid) continue;
+        const float t = (float)y + (b.top ? (*b.top)({x, y, z}) : 1.0f);
+        if (t <= soleHi + 1e-4f && t > best) best = t;
+      }
+  return best;
 }
 
 // Move along one axis, clamping against solids. Returns true if blocked.
@@ -109,8 +137,17 @@ bool SweepAxis(Vec3& pos, float delta, int axis, const Player::Box& b,
       // covers the float edge cases; if it trips we keep the old answer.
       const float lo = axis == 1 ? b.yLo : -b.hx;
       const float hi = axis == 1 ? b.yHi : b.hx;
-      const float flush = delta < 0 ? std::floor(prev + lo) - lo
-                                    : std::ceil(prev + hi) - hi;
+      float flush = delta < 0 ? std::floor(prev + lo) - lo
+                              : std::ceil(prev + hi) - hi;
+      // Landing on grains: the stopping surface is a partial cell's TOP, not
+      // the integer boundary above it -- or the body hovers up to 7/8 of a
+      // voxel over a dusting (docs/PLAN_powder_mass.md P4).
+      if (axis == 1 && delta < 0 && b.top != nullptr) {
+        Vec3 at = pos;
+        at.y = prev;
+        const float t = HighestTopBelow(at, b, kindAt, prev + lo, next + lo);
+        if (t > -1e29f) flush = t - lo;
+      }
       const bool inRange = delta < 0 ? (flush <= prev && flush >= next)
                                      : (flush >= prev && flush <= next);
       *c = flush;
@@ -535,7 +572,7 @@ Player::Box Player::BoxFor(bool crouched) const {
   const float h =
       (crouched ? T().crouchHeight : T().collisionHeight) / kVoxelMeters;
   return Box{0.5f * T().collisionWidth / kVoxelMeters, -kHalfY,
-             -kHalfY + std::max(h, 1.0f)};
+             -kHalfY + std::max(h, 1.0f), cellTop ? &cellTop : nullptr};
 }
 
 void Player::Update(float dt, const TickInput& in, const KindFn& kindAt) {

@@ -59,16 +59,15 @@ float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
 // the lens, or sideways at nothing. The body cannot turn to follow (that would
 // make every glance a turn again), so the SWING is bound to the body instead:
 //
+//   - a look BEHIND the body (|yawRel| > 90) is first reflected to the front
+//     across the body's left-right axis: 150 deg right swings at 30 deg
+//     right, looking the character in the face swings straight ahead. Both
+//     signs reach 0 at the +180/-180 wrap, so the wrap is a non-event;
 //   - inside `melee.aimYaw` degrees of the body's facing the camera IS the
 //     basis, unchanged — a strike goes where you look;
 //   - past the cone the basis is pinned at the cone's edge (the yaw excess is
 //     removed, pitch kept), so aiming further round your own shoulder does not
-//     put the blade behind you;
-//   - across the last `melee.aimReleaseYaw` degrees before straight-behind the
-//     offset smoothsteps to zero, so looking at the character's face swings
-//     the way the character faces — as if you were looking forward again. The
-//     smoothstep is what makes the +180/-180 wrap a non-event (both signs
-//     reach zero there), exactly as PlayerAvatar::SetLook argues.
+//     put the blade behind you.
 //
 // `yawRel` is camera heading minus body heading, radians, any range (wrapped
 // here). Returns the yaw offset the swing basis should actually have, radians

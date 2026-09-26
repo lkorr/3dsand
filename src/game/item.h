@@ -413,9 +413,9 @@ struct ItemDef {
   // since the blade geometry is supposed to be what decides the wound.
   float carveBonus = 0.0f;
 
-  // Which player strike compass this weapon selects: "dagger" uses
-  // playerDagger, anything else (or empty) uses player. Authored in
-  // items.json; absent defaults to the armed compass.
+  // Which FORM of every attack style this weapon swings: "short", "long" or
+  // "blunt" (strokes.h WEAPON FORMS). Authored in items.json; absent or
+  // unknown swings the styles' own frames.
   std::string weaponClass;
 
   // ---- HEFT: how much weapon is behind the edge ---------------------------
@@ -465,7 +465,14 @@ struct ItemDef {
     uint32_t holds = 0;
     int capacity = 0;      // eighths; 128 cells authored = 1024
     int scoopPerTick = 4;  // cells lifted per tick while the button is held
-    int pourPerTick = 2;   // cells thrown per tick while the button is held
+    int pourPerTick = 2;   // particles thrown per tick while the button is held
+    // Eighths of a cell each poured POWDER particle carries (1..8; 8 = whole
+    // cells, the old pour). A pouch pours fine grains: 1/8-voxel particles
+    // that land and merge into partial cells (docs/PLAN_powder_mass.md), so a
+    // poured heap is made of grains, not bricks. Liquids ignore it -- a
+    // grid-particle liquid always leaves in whole cells plus a measured
+    // remainder, and a seam liquid pours as MPM eighths anyway.
+    int pourGrain = 8;
     float pourRange = MetresToCells(2.0f);  // farthest AIMED target, voxels
     float pourSpeed = MetresToCells(1.5f);  // launch speed, world voxels/s
     float aimDist = MetresToCells(1.0f);    // the pour point, along the look

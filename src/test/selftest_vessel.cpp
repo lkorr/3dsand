@@ -416,18 +416,26 @@ Status GateVessel(Ctx& c, std::string& detail) {
               (sp[0].flags & kPFlagMeasured) != 0 &&
               ((sp[0].payload >> 12) & 7u) == 2u,
           "3 eighths pour as ONE particle measured at fullness 3/8, not a cell");
-    // A pouch with a partial cell: the whole cell falls full, the last four
-    // eighths as a PARTIAL cell of grains (powder mass, state 4 + 2 = 6) --
-    // never rounded up to a whole grain, and no longer lost as "dust".
+    // A pouch pours GRAINS of pouch.pourGrain eighths (items.json
+    // pourGrainEighths): 12 eighths leave as ceil(12 / grain) particles whose
+    // masses sum to exactly 12 -- never rounded up, nothing lost as "dust".
     ItemStack sand = Vs(c.items, pouchI, 1, (uint16_t)mSand, 12);
     sp.clear();
-    ContainerPour(*pouch, sand, m0, Vec3{1, 0, 0}, nullptr,
-                  CurrentTuning().sim.partGravity, 701, 3u, sp, nullptr,
-                  0xFFFFFFFFu, &c.mats);
-    check(sp.size() == 2 && !sand.Filled() && (sp[0].flags & kPFlagMeasured) == 0 &&
-              PowderMassOfState((sp[0].payload >> 12) & 0xFu) == 8u &&
-              PowderMassOfState((sp[1].payload >> 12) & 0xFu) == 4u,
-          "a pouch's partial last cell lands as 4/8 of grains, not dust");
+    int pouredTotal = 0;
+    for (int guard = 0; guard < 64 && sand.Filled(); guard++)
+      ContainerPour(*pouch, sand, m0, Vec3{1, 0, 0}, nullptr,
+                    CurrentTuning().sim.partGravity, 701 + (uint32_t)guard, 3u, sp,
+                    nullptr, 0xFFFFFFFFu, &c.mats);
+    bool grainsOk = !sand.Filled();
+    for (const ParticleSpawn& q : sp) {
+      const int e = (int)PowderMassOfState((q.payload >> 12) & 0xFu);
+      pouredTotal += e;
+      grainsOk = grainsOk && (q.flags & kPFlagMeasured) == 0 &&
+                 e <= pouch->container.pourGrain;
+    }
+    const int grain = pouch->container.pourGrain;
+    check(grainsOk && pouredTotal == 12 && (int)sp.size() == (12 + grain - 1) / grain,
+          "a pouch pours 12 eighths as grains of pourGrain, summing to 12");
     // THE RING'S ROOM: charged only for the particles that fit.
     ItemStack big = Vs(c.items, flaskI, 1, (uint16_t)liq, 64);
     sp.clear();
@@ -556,7 +564,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
     sp.units = 20;
     fl.clear();
     got = ContainerSpillStep(sp, c.mats, 100, 4096, fl, pa, &ev);
-    bool pOk = pa.size() == 3;
+    bool pOk = pa.size() == 20;   // one-eighth grains (POWDER ENTERS THE WORLD AS GRAINS)
     uint32_t sandEighths = 0;
     for (const ParticleSpawn& p : pa) {
       pOk = pOk && (p.payload & 0xFFFu) == mSand && !(p.flags & kPFlagMicro) &&
@@ -564,7 +572,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
       sandEighths += PowderMassOfState((p.payload >> 12) & 0xFu);
     }
     check(got == 20 && sp.units == 0 && fl.empty() && pOk && sandEighths == 20,
-          "a broken pouch of sand lands exactly its 20 eighths (8 + 8 + 4)");
+          "a broken pouch of sand spills exactly its 20 eighths, as 20 grains");
     // A liquid the seam cannot hold (lava/blood-like: grid particles) lands
     // at EXACTLY what it held: 20 eighths = 8 + 8 + 4, the last MEASURED at
     // fullness code 3 -- not three full cells.
@@ -1016,6 +1024,125 @@ Status VesselRoundTrip(Ctx& c, std::string& detail, bool mpm) {
 Status GateVesselGrid(Ctx& c, std::string& detail) {
   return VesselRoundTrip(c, detail, false);
 }
+
+// ---- vessel-sand ------------------------------------------------------------
+//
+// A POUCH EMPTIED ONTO THE GROUND LANDS AS FAST AS IT FALLS (owner, 2026-09-26:
+// "it takes like 20 seconds for it to settle because most of the sand stays on
+// top stuck as a particle"). The pouch pours one-eighth grains, 16 a tick, into
+// a stream a few cells wide; with one reinsertion claim per cell per tick only
+// ~3 landed per tick and the rest queued and climbed. GRAIN LANDING
+// (sim_particle.wgsl) lands every same-material grain aimed at a cell in one
+// tick. Asserted: every eighth poured is on the grid (EXACT), nothing is still
+// in flight, and the last grain landed within vesselSand.landTicksMax ticks of
+// the pour ending (baseline.json, so the bound is data).
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): the same hand-rolled step as the
+// flask's round trip beside it -- a pour and a landing, no bodies.
+Status GateVesselSand(Ctx& c, std::string& detail) {
+  uint32_t mSand = 0, mStone = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "sand") mSand = (uint32_t)i;
+    if (c.mats[i].name == "stone") mStone = (uint32_t)i;
+  }
+  const int pouchI = c.items.Find("pouch");
+  const ItemDef* pouch = c.items.At(pouchI);
+  if (!mSand || !mStone || pouch == nullptr) { detail = "no sand/stone/pouch"; return Status::Fail; }
+
+  const IVec3 o = c.world.WindowOrigin();
+  const IVec3 base{o.x * (int)kChunk + (int)kWorldN / 2 + 8,
+                   o.y * (int)kChunk + (int)kWorldN - 40,
+                   o.z * (int)kChunk + (int)kWorldN / 2 + 8};
+  const IVec3 chunk{base.x >> 4, base.y >> 4, base.z >> 4};
+  uint32_t tick = 73000;
+  auto step = [&](const std::vector<CellOp>& cells,
+                  const std::vector<ParticleSpawn>& spawns = {}) {
+    std::vector<BrushOp> ops;
+    SubmitTick(c.ctx, c.world, c.sim, tick++, kDefaultSeed, ops, {}, cells, false,
+               chunk, true, true, spawns, 0, {}, 0);
+    c.ctx.WaitIdle();
+    c.ctx.ProcessEvents();
+  };
+  auto sandOnGrid = [&]() {
+    long total = 0;
+    std::vector<uint32_t> buf(kChunkVol);
+    for (int cz = -1; cz <= 1; cz++)
+      for (int cy = -1; cy <= 1; cy++)
+        for (int cx = -1; cx <= 1; cx++) {
+          const IVec3 cc{(chunk.x + cx) * (int)kChunk, (chunk.y + cy) * (int)kChunk,
+                         (chunk.z + cz) * (int)kChunk};
+          if (!c.world.CellInWindow(cc)) continue;
+          ReadVoxelsSync(c.ctx, c.world, World::SlotCellIndex(cc) / kChunkVol, 1,
+                         buf.data(), "vessel-sand");
+          for (uint32_t w : buf)
+            if ((w & 0xFFFu) == mSand) total += ContainerCellUnits(w, c.mats[mSand]);
+        }
+    return total;
+  };
+  {  // a 25x25 stone tray with a rim, air above, in the sky
+    std::vector<CellOp> cells;
+    constexpr int kTray = 12;
+    for (int dz = -kTray; dz <= kTray; dz++)
+      for (int dx = -kTray; dx <= kTray; dx++)
+        for (int dy = -1; dy <= 14; dy++) {
+          const IVec3 p{base.x + dx, base.y + dy, base.z + dz};
+          const int ring = std::max(std::abs(dx), std::abs(dz));
+          const bool tray = dy == -1 || (ring == kTray && dy <= 1);
+          cells.push_back({World::SlotCellIndex(p), tray ? PackVoxNew(mStone, 0u) : 0u});
+        }
+    step(cells);
+  }
+  for (int i = 0; i < 12; i++) step({});
+  const long s0 = sandOnGrid();
+
+  ItemStack st = Vs(c.items, pouchI, 1, (uint16_t)mSand, 512);   // 64 cells of sand
+  const int held = st.fillAmt;
+  const Vec3 mouth{base.x + 0.5f, base.y + 10.5f, base.z + 0.5f};
+  const Vec3 target{base.x + 0.5f, base.y + 0.5f, base.z + 0.5f};
+  int pourTicks = 0;
+  for (; pourTicks < 400 && st.Filled(); pourTicks++) {
+    std::vector<ParticleSpawn> spawns;
+    ContainerPour(*pouch, st, mouth, Vec3{0, -1, 0}, &target,
+                  CurrentTuning().sim.partGravity, tick, 0x5A4Du, spawns, nullptr,
+                  0xFFFFFFFFu, &c.mats);
+    step({}, spawns);
+  }
+  // Count ticks until no particle is left in flight (the snapshot trails the
+  // GPU by kSnapshotLatency ticks; that latency is subtracted).
+  int landed = -1;
+  std::string timeline;
+  for (int i = 1; i <= 1200; i++) {
+    step({});
+    if (i == 1 || i == 5 || i == 10 || i == 20 || i == 40 || i == 80 || i == 160 ||
+        i == 320 || i == 640)
+      timeline += Format(" +%d:%u flying/%ld on grid", i, c.world.Snap().particleCount,
+                         sandOnGrid() - s0);
+    if (c.world.Snap().valid && c.world.Snap().particleCount == 0) {
+      landed = std::max(0, i - (int)World::kSnapshotLatency);
+      break;
+    }
+  }
+  std::printf("vessel-sand: timeline%s\n", timeline.c_str());
+  const long got = sandOnGrid() - s0;
+
+  c.mobs.Reset();
+  c.debris.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  const int landMax = (int)BaselineNumber("vesselSand.landTicksMax", 60);
+  RecordObserved("vesselSand.landTicks", (double)landed);
+  const bool exact = got == held && !st.Filled();
+  const bool fast = landed >= 0 && landed <= landMax;
+  detail = Format("poured %d eighths in %d ticks as %d-eighth grains; grid gained %ld "
+                  "(%s); last grain landed %d ticks after the pour (max %d) %s",
+                  held, pourTicks, pouch->container.pourGrain, got,
+                  exact ? "EXACT" : "LOST/MINTED", landed, landMax,
+                  fast ? "ok" : "TOO SLOW");
+  std::printf("vessel-sand: %s (%s)\n", exact && fast ? "PASS" : "FAIL", detail.c_str());
+  return exact && fast ? Status::Pass : Status::Fail;
+}
+
 Status GateVesselMpm(Ctx& c, std::string& detail) {
   return VesselRoundTrip(c, detail, true);
 }
@@ -1281,6 +1408,7 @@ const std::vector<Gate>& VesselGates() {
       {"vessel", "player", {}, false, GateVessel},
       // Builds in the sky and regenerates the world after itself.
       {"vessel-grid", "player", {}, false, GateVesselGrid},
+      {"vessel-sand", "player", {}, false, GateVesselSand},
       // The same, the way the game pours water: MPM out, ghost stream in.
       {"vessel-mpm", "player", {}, false, GateVesselMpm},
       // Real Jolt on a stone table; resets debris and regenerates on entry.

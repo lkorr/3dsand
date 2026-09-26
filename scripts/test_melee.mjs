@@ -289,7 +289,7 @@ function runParsed(sty, si = 0, aimAz = 0, aimEl = 0, seed = 1) {
 // strokes.h: "the windup's own target is aim - cut/2 + windup, so the MIDDLE
 // of the travel passes through it rather than the beginning. A stroke aimed at
 // its own start point cuts the air behind the target every time."
-for (const nm of ['horizontal_r', 'horizontal_l', 'diagonal', 'overhead']) {
+for (const nm of ['horizontal_r', 'horizontal_l', 'diag_tr_bl', 'overhead']) {
   const r = runStyle(nm, 0.25, 0.10);
   if (!r) { check(false, `style "${nm}" exists`); continue; }
   const cutTicks = r.trace.filter(t => t.phase === MELEE.STROKE_PHASE.Cut);
@@ -468,7 +468,7 @@ section('the cut path (strokes.h "A CUT IS A PATH")');
 // blade IS rigid — that is the law of cosines earning its keep.
 {
   const t = MELEE.defaultMeleeTuning();
-  for (const nm of ['diagonal', 'horizontal_r', 'thrust', 'overhead']) {
+  for (const nm of ['diag_tr_bl', 'horizontal_r', 'thrust', 'overhead']) {
     const r = runStyle(nm, 0.2, 0);
     if (!r) continue;
     const L = r.m.bladeLen_;
@@ -586,7 +586,7 @@ section('the cut path (strokes.h "A CUT IS A PATH")');
     // by design: the controller's switches and the swing-basis cone (main.cpp
     // ResolveSwingBasis), read off the tuning document, never by the driver
     if (k === 'pickMinSpeed' ||
-        k === 'aimYaw' || k === 'aimReleaseYaw') return false;
+        k === 'aimYaw') return false;
     const base = k.replace(/(M|Mps)$/, '');
     return !(base in t);
   });
@@ -733,6 +733,21 @@ section('cut pacing (strokes.h StrokeEase)');
    arithmetic underneath it is, and that is where a wrong answer would hide.
    ------------------------------------------------------------------------ */
 section('goal frames (melee.js strokeGoalPose)');
+// FRAME KEYS. Every destination is a frame now (strokes.h "AN ATTACK IS A
+// LIST OF FRAMES"); these tests were written against windup / cutN / recover
+// and still state the same claims, so the names are mapped rather than the
+// claims rewritten. A converted style's frames are windup, the cut legs, then
+// a posed recover.
+const GK = (s, k) => {
+  const fr = s.frames || [];
+  if (k === 'windup') return 'f0';
+  if (k === 'recover') {
+    const r = fr.findIndex(f => f.name === 'recover');
+    return r < 0 ? 'none' : 'f' + r;
+  }
+  if (k.startsWith('cut')) return 'f' + (1 + (+k.slice(3)));
+  return k;
+};
 {
   const AIM_AZ = 0.2, AIM_EL = -0.1;
   const sty = MELEE.parseStyleLibrary({ styles: [{
@@ -747,15 +762,15 @@ section('goal frames (melee.js strokeGoalPose)');
   // 1. THE LIST is windup, one entry per leg, then the recover — and the
   //    recover only when it has a pose to hold.
   const goals = MELEE.strokeGoals(sty);
-  check(goals.map(g => g.key).join(',') === 'windup,cut0,cut1,recover',
+  check(goals.map(g => g.label).join(',') === 'windup,cut 1,cut 2,recover',
     'the goals are windup, each cut leg, then a posed recover',
-    'got ' + goals.map(g => g.key).join(','));
+    'got ' + goals.map(g => g.label).join(','));
   const unposed = MELEE.parseStyleLibrary({ styles: [{
     name: 'u', cut: { ticks: 5, az: -1 }, recover: { ticks: 5 },
   }] }).styles[0];
-  check(MELEE.strokeGoals(unposed).every(g => g.key !== 'recover'),
+  check(MELEE.strokeGoals(unposed).every(g => g.label !== 'recover'),
     'an UNPOSED recover is not a goal (it has no pose of its own)');
-  check(MELEE.strokeGoalPose(unposed, freshDriver(), 'recover', 0, 0) === null,
+  check(MELEE.strokeGoalPose(unposed, freshDriver(), GK(unposed, 'recover'), 0, 0) === null,
     'and resolving it returns null rather than a fabricated pose');
 
   // 2. EVERY GOAL RESOLVES, and a key this style has not got does not.
@@ -763,9 +778,9 @@ section('goal frames (melee.js strokeGoalPose)');
   for (const g of goals)
     check(MELEE.strokeGoalPose(sty, m0, g.key, AIM_AZ, AIM_EL) !== null,
       `goal "${g.key}" resolves to a pose`);
-  check(MELEE.strokeGoalPose(sty, m0, 'cut9', AIM_AZ, AIM_EL) === null,
+  check(MELEE.strokeGoalPose(sty, m0, GK(sty, 'cut9'), AIM_AZ, AIM_EL) === null,
     'a leg index this style has not got resolves to null');
-  check(MELEE.strokeGoalPose(sty, m0, 'nonsense', AIM_AZ, AIM_EL) === null,
+  check(MELEE.strokeGoalPose(sty, m0, GK(sty, 'nonsense'), AIM_AZ, AIM_EL) === null,
     'an unknown goal key resolves to null');
 
   // 3. THE CENTRAL CLAIM: the program ARRIVES at the goals.
@@ -794,7 +809,7 @@ section('goal frames (melee.js strokeGoalPose)');
 
   const roomy = withWindup(90);
   const rr = runParsed(roomy, 0, AIM_AZ, AIM_EL);
-  const grw = MELEE.strokeGoalPose(roomy, rr.m, 'windup', AIM_AZ, AIM_EL);
+  const grw = MELEE.strokeGoalPose(roomy, rr.m, GK(roomy, 'windup'), AIM_AZ, AIM_EL);
   const rw = lastIn(rr, P.Windup);
   check(rw && Math.abs(rw.az - grw.az) < 0.02 &&
         Math.abs(rw.el - grw.el) < 0.02,
@@ -804,23 +819,38 @@ section('goal frames (melee.js strokeGoalPose)');
 
   const tight = withWindup(10);
   const rt = runParsed(tight, 0, AIM_AZ, AIM_EL);
-  const gtw = MELEE.strokeGoalPose(tight, rt.m, 'windup', AIM_AZ, AIM_EL);
+  const gtw = MELEE.strokeGoalPose(tight, rt.m, GK(tight, 'windup'), AIM_AZ, AIM_EL);
   const tw = lastIn(rt, P.Windup);
-  // Short of the goal on the side it started from, and NOT past it. "Past"
-  // would mean the clamp had banked travel, which melee.h forbids.
-  check(tw && tw.az < gtw.az - 0.1,
-    'a windup with too few ticks stops SHORT of its goal, never past it',
-    tw ? `az ${tw.az.toFixed(3)} vs goal ${gtw.az.toFixed(3)} `
-         + '(short is correct here — 10 ticks cannot cross that gap under the '
-         + 'clamp; the goal frame is how an author sees it)'
-       : 'no windup ticks');
+  // A pre-frames windup CONVERTS TO A CHASE FRAME (visible as the "chase"
+  // pacing): it closes at a capped rate and a short one stops SHORT, exactly
+  // as it always did — and never PAST (the clamp banks nothing).
+  check(tight.frames[0].ease === 'chase' && tw && tw.az < gtw.az - 0.1,
+    'a converted windup is a chase frame, and a short one stops SHORT',
+    tw ? `az ${tw.az.toFixed(3)} vs goal ${gtw.az.toFixed(3)}` : 'no windup ticks');
+  // ...and the same frame on a CURVE arrives on its last tick, however short.
+  {
+    const lin = MELEE.parseStyleLibrary({ strokeFrame: 'target', styles: [{
+      name: 'lin', release: 6,
+      frames: [
+        { name: 'windup', ticks: 10, az: tight.frames[0].az, el: tight.frames[0].el,
+          reach: tight.frames[0].reach },
+        { name: 'cut', ticks: 8, az: -1.2, el: -0.2, reach: 0.1, cuts: true },
+      ],
+    }] }).styles[0];
+    const rl = runParsed(lin, 0, AIM_AZ, AIM_EL);
+    const gl = MELEE.strokeGoalPose(lin, rl.m, 'f0', AIM_AZ, AIM_EL);
+    const wl = lastIn(rl, P.Windup);
+    check(wl && Math.abs(wl.az - gl.az) < 2e-3 && Math.abs(wl.el - gl.el) < 2e-3,
+      'the same windup paced linear lands ON its goal (a curve always arrives)',
+      wl ? `az ${wl.az.toFixed(3)} vs goal ${gl.az.toFixed(3)}` : 'no windup ticks');
+  }
 
   const r = rr;
 
   // The CUT must arrive exactly — it is an open-loop distribution of a known
   // travel, and "exactly" is the property StrokeEaseStep is built to keep.
   const cutRows = r.trace.filter(t => t.phase === P.Cut);
-  const gLast = MELEE.strokeGoalPose(sty, r.m, 'cut1', AIM_AZ, AIM_EL);
+  const gLast = MELEE.strokeGoalPose(sty, r.m, GK(sty, 'cut1'), AIM_AZ, AIM_EL);
   const cEnd = cutRows[cutRows.length - 1];
   check(cEnd && Math.abs(cEnd.az - gLast.az) < 2e-3 &&
         Math.abs(cEnd.el - gLast.el) < 2e-3,
@@ -845,7 +875,7 @@ section('goal frames (melee.js strokeGoalPose)');
     }] }).styles[0];
     const r2 = runParsed(s2, 0, AIM_AZ, AIM_EL);
     const rows2 = r2.trace.filter(t => t.phase === P.Cut);
-    const g2 = MELEE.strokeGoalPose(s2, r2.m, 'cut1', AIM_AZ, AIM_EL);
+    const g2 = MELEE.strokeGoalPose(s2, r2.m, GK(s2, 'cut1'), AIM_AZ, AIM_EL);
     const e2 = rows2[rows2.length - 1];
     const where = `az ${e2 ? e2.az.toFixed(4) : '?'} vs goal ${g2.az.toFixed(4)}`;
     check(e2 && Math.abs(e2.az - g2.az) < 2e-3 &&
@@ -858,7 +888,7 @@ section('goal frames (melee.js strokeGoalPose)');
   // its authored end by ~1.7 rad before snapping back. Every cut tick must
   // now sit between the leg's start and end — a linear drive is monotone.
   {
-    const s3 = MELEE.parseStyleLibrary({ styles: [{
+    const s3 = MELEE.parseStyleLibrary({ strokeFrame: 'target', styles: [{
       name: 'short', windup: { ticks: 10, az: 0.6, el: -0.3, reach: 0 },
       cut: { ticks: 6, az: -1.2, el: -0.2, reach: 0 },
       recover: { ticks: 12, az: 0.2, el: -0.4, reach: 0, posed: true, settle: 8 },
@@ -884,8 +914,8 @@ section('goal frames (melee.js strokeGoalPose)');
     const probe = (history) => {
       const m = freshDriver();
       history(m);
-      const g = MELEE.strokeGoalPose(sty, m, 'recover', AIM_AZ, AIM_EL)
-             || MELEE.strokeGoalPose(sty, m, 'cut0', AIM_AZ, AIM_EL);
+      const g = MELEE.strokeGoalPose(sty, m, GK(sty, 'recover'), AIM_AZ, AIM_EL)
+             || MELEE.strokeGoalPose(sty, m, GK(sty, 'cut0'), AIM_AZ, AIM_EL);
       m.snapToPose(g.az, g.el, g.reach, RIGHT, UP, FWD, g.travel);
       return m.pose();
     };
@@ -901,6 +931,35 @@ section('goal frames (melee.js strokeGoalPose)');
                          d(a.bladeFlat, b.bladeFlat), d(a.bendPole, b.bendPole));
     check(gap < 1e-9, 'a held goal builds the same arm whatever came before',
       `max difference ${gap.toExponential(2)}`);
+  }
+
+  // THE HELD GOAL IS THE SOLO'S LAST FRAME (2026-09-25). The report: "windup's
+  // goal is NOT at all what happens if I solo windup". The Attacks lane now
+  // holds runStrokeToFrame, so on every SHIPPED style, with a jitter draw, the
+  // held windup must be the very arm a solo of the windup freezes on (the tick
+  // the program leaves Windup) — tip, hand, wrist and elbow pole.
+  {
+    const d = (x, y) => Math.hypot(x.x - y.x, x.y - y.y, x.z - y.z);
+    let worst = 0, where = '';
+    lib.styles.forEach((s, si) => {
+      if (!s.frames || !s.frames.length) return;
+      const seed = Math.imul(1, 2654435761) >>> 0;
+      const solo = freshDriver(), c = MELEE.newStrokeCursor();
+      MELEE.beginStrokeProgram(c, s, si, seed);
+      for (let i = 0; i < 400; i++) {
+        const r = MELEE.stepStrokeProgram(c, s, solo, AIM_AZ, AIM_EL, DT, RIGHT, UP, FWD);
+        if (r === MELEE.STEP.Finished || c.phase > P.Windup) break;
+      }
+      const held = freshDriver();
+      const k = Math.max(0, (c.firstCut > 0 ? c.firstCut : 1) - 1);
+      MELEE.runStrokeToFrame(s, si, seed, held, 'f' + k, AIM_AZ, AIM_EL, DT, RIGHT, UP, FWD);
+      const a = solo.pose(), b = held.pose();
+      const gap = Math.max(d(a.hand, b.hand), d(solo.tip_, held.tip_),
+                           d(a.bladeDir, b.bladeDir), d(a.bendPole, b.bendPole));
+      if (gap > worst) { worst = gap; where = s.name; }
+    });
+    check(worst < 1e-9, 'a held windup is the arm a solo\'d windup freezes on (every shipped style)',
+      `worst ${worst.toExponential(2)} on ${where}`);
   }
 
   // A SLOW CUT KEEPS THE BLADE ON ITS PATH. The report: "the last frame of the
@@ -931,6 +990,157 @@ section('goal frames (melee.js strokeGoalPose)');
     check(worst > 0.99, `a ${ticks}-tick cut keeps the wrist fully aligned`,
       `lowest alignment ${worst.toFixed(3)}`);
   }
+  // THE RETURN HOLDS ITS LEAN. The report: "the hand teleports above its
+  // head at the beginning of the settle" on the stock dagger horizontal_r.
+  // The settle travels back against the cut, the lean plane chased that
+  // reversal half a turn round the blade — over the top — and the hand
+  // climbed ~2.5 voxels while the tip barely moved. A program's Recover holds
+  // the lean the cut left (melee.h SetProgramDrive's holdLean).
+  {
+    const hr = lib.styles.find(x => x.name === 'horizontal_r');
+    if (hr) {
+      const m = new MELEE.MeleeState(MELEE.defaultMeleeTuning());
+      m.setHandSign(1);
+      m.setStroke({ x: 0, y: -5, z: 0 }, { x: 0, y: -5, z: 2.5 },
+                  { x: 0, y: 1, z: 0 }, 5.3);            // a dagger-length blade
+      const c = MELEE.newStrokeCursor();
+      MELEE.beginStrokeProgram(c, hr, 0, 1);
+      let startY = null, maxY = -1e9;
+      for (let i = 0; i < 200; i++) {
+        const ph = c.phase;
+        const r = MELEE.stepStrokeProgram(c, hr, m, 0, 0, DT, RIGHT, UP, FWD);
+        if (ph === MELEE.STROKE_PHASE.Recover) {
+          if (startY === null) startY = m.handL_.y;
+          maxY = Math.max(maxY, m.handL_.y);
+        }
+        if (r === MELEE.STEP.Finished) break;
+      }
+      check(startY !== null && maxY - startY < 0.5,
+        'horizontal_r (dagger): the settle does not lift the hand over the blade',
+        `hand y ${startY?.toFixed(2)} at the settle, peaked ${maxY.toFixed(2)}`);
+    }
+  }
+  // THE ARM'S SHAPE IS AUTHORED. Blade angle 0 = the blade continues the arm
+  // (the owner's "az/el/reach 0 and the dagger is 45 degrees off" report was
+  // the hidden hand-at-handExtend rule); the elbow direction is where the
+  // elbow points. And a change between frames is BLENDED, never a snap.
+  {
+    const sh = MELEE.parseStyleLibrary({ strokeFrame: 'target', styles: [{
+      name: 'shape', release: 4,
+      frames: [
+        { name: 'a', ticks: 10, az: 0, el: 0, reach: 0, bladeAngle: 0, elbow: Math.PI / 2 },
+        { name: 'b', ticks: 10, az: 0, el: 0, reach: 0, bladeAngle: 1.2, elbow: 0, cuts: true },
+      ],
+    }] }).styles[0];
+    const m = freshDriver();
+    const c = MELEE.newStrokeCursor();
+    MELEE.beginStrokeProgram(c, sh, 0, 1);
+    let endA = null, prevHand = null;
+    const steps = [];
+    for (let i = 0; i < 60; i++) {
+      const ph = c.phase, fr = c.frame, ft = c.frameTick;
+      const r = MELEE.stepStrokeProgram(c, sh, m, 0, 0, DT, RIGHT, UP, FWD);
+      // Frame b only: the arm is re-shaped from a's shape over b's 10 ticks.
+      if (fr === 1 && prevHand) steps.push(Math.hypot(
+        m.handL_.x - prevHand.x, m.handL_.y - prevHand.y, m.handL_.z - prevHand.z));
+      prevHand = { ...m.handL_ };
+      if (fr === 0 && ft === 9) endA = { blade: m.bladeAngleNow_, elbow: m.elbowSwivelNow_,
+        align: MELEE.vecAngle ? 0 : 0, hand: { ...m.handL_ }, tip: { ...m.tipL_ } };
+      if (r === MELEE.STEP.Finished) break;
+    }
+    // At the end of frame a: blade in line with the shoulder-to-tip line.
+    const tip = endA.tip, hand = endA.hand;
+    const cross = Math.hypot(tip.y * hand.z - tip.z * hand.y, tip.z * hand.x - tip.x * hand.z,
+                             tip.x * hand.y - tip.y * hand.x) / Math.max(1e-6, Math.hypot(tip.x, tip.y, tip.z));
+    check(Math.abs(endA.blade) < 1e-3 && cross < 1e-3,
+      'blade angle 0°: the hand sits ON the shoulder-to-tip line (blade continues the arm)',
+      `blade ${endA.blade.toFixed(4)} rad, hand off the line ${cross.toFixed(4)} vox`);
+    check(Math.abs(endA.elbow - Math.PI / 2) < 0.02,
+      'elbow direction +90°: the elbow points out to the weapon side',
+      `swivel ${(endA.elbow * 180 / Math.PI).toFixed(1)}°`);
+    // BLENDED: the re-shape is spread over the frame, so no tick carries much
+    // more than its share (a snap would put it all in one tick).
+    const total = steps.reduce((x, y) => x + y, 0);
+    const worst = Math.max(...steps);
+    check(steps.length >= 8 && worst < 2.5 * total / steps.length,
+      'changing blade angle and elbow between frames is blended, not snapped',
+      `largest step ${worst.toFixed(3)} vs mean ${(total / steps.length).toFixed(3)} vox/tick`);
+  }
+  // THE MANUAL-MODE GEOMETRY IS THE DRIVER'S (rig.js drawPoseHandles solves
+  // drags against these three formulas). If a convention drifts — the lean
+  // angle once named the side OPPOSITE the hand — a drag moves the wrong way.
+  {
+    const add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z });
+    const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z });
+    const mul = (a, k) => ({ x: a.x * k, y: a.y * k, z: a.z * k });
+    const len = a => Math.hypot(a.x, a.y, a.z), nrm = a => mul(a, 1 / len(a));
+    const crs = (a, b) => ({ x: a.y * b.z - a.z * b.y, y: a.z * b.x - a.x * b.z, z: a.x * b.y - a.y * b.x });
+    // melee.cpp AxisFrame, written out independently: straight down CARRIED
+    // from B (behind the body and across it, where a right arm cannot point)
+    // to the axis by the shortest rotation — here as an explicit axis-angle
+    // rotation rather than the driver's Rodrigues shortcut.
+    const dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
+    const ds = (axis) => {
+      const B = nrm({ x: -1, y: 0, z: -1 });
+      const k = crs(B, axis), s = len(k), c = dot(B, axis);
+      const d0 = { x: 0, y: -1, z: 0 };
+      let down = d0;
+      if (s > 1e-9) {
+        const u = mul(k, 1 / s), ang = Math.atan2(s, c);
+        down = add(add(mul(d0, Math.cos(ang)), mul(crs(u, d0), Math.sin(ang))),
+                   mul(u, dot(u, d0) * (1 - Math.cos(ang))));
+      }
+      down = nrm(sub(down, mul(axis, dot(axis, down))));
+      return { down, side: crs(axis, down) };
+    };
+    // A LEVEL arm reads exactly the old projected "down", so every level pose
+    // means what it meant before the reference changed...
+    {
+      let worstLevel = 0;
+      for (let a = -2.5; a <= 2.5; a += 0.25) {
+        const axis = { x: Math.sin(a), y: 0, z: Math.cos(a) };
+        worstLevel = Math.max(worstLevel, len(sub(ds(axis).down, { x: 0, y: -1, z: 0 })));
+      }
+      check(worstLevel < 1e-9, 'the elbow / lean reference is plain "down" for every level arm',
+        `worst ${worstLevel.toExponential(2)}`);
+    }
+    // ...and it does NOT SPIN near the vertical, which is what it is for: the
+    // arm hanging nearly straight down, drifting 0.2 voxels a tick, spun the
+    // old reference by tens of degrees (a 56 degree elbow jump, hand still).
+    {
+      let worstTurn = 0, prevDown = null;
+      for (let i = 0; i <= 40; i++) {
+        const t = i / 40;
+        const axis = nrm({ x: 0.06 * Math.cos(t * 6), y: -1, z: 0.06 * Math.sin(t * 6) });
+        const dn = MELEE.axisFrame(axis, 1).down;
+        if (prevDown) worstTurn = Math.max(worstTurn, Math.acos(Math.min(1, dot(dn, prevDown))));
+        prevDown = dn;
+      }
+      check(worstTurn < 0.05, 'the reference does not spin while the arm points nearly straight down',
+        `worst ${(worstTurn * 180 / Math.PI).toFixed(1)} deg between neighbouring samples`);
+    }
+    let worst = 0, readBack = 0;
+    for (const [az, el, th, ph, sw] of [[0.3, -0.2, 0.5, 0.7, 1.0], [-0.8, 0.4, 1.2, -1.4, -0.6], [1.1, -0.9, 0.2, 2.5, 2.9]]) {
+      const m = freshDriver();
+      // A DAGGER-length blade: with freshDriver's 11-voxel one these hands
+      // land past the arm's reach and the driver's reach clamp (a separate,
+      // visible safety net) moves them — which is not what this measures.
+      m.setStroke({ x: 0, y: -5, z: 0 }, { x: 0, y: -5, z: 2.5 }, { x: 0, y: 1, z: 0 }, 5.3);
+      m.snapToPose(az, el, MELEE.strokeReachIn(m, 0.2), RIGHT, UP, FWD, { az: -1, el: 0 },
+        { lean: 4, leanAngle: ph, bladeAngle: th, elbowSet: true, elbowSwivel: sw, wristAlign: 1 });
+      const tip = m.tipL_, rad = nrm(tip), r1 = ds(rad), L = m.bladeLen_;
+      const hand = add(sub(tip, mul(rad, L * Math.cos(th))),
+        mul(add(mul(r1.down, Math.cos(ph)), mul(r1.side, Math.sin(ph))), L * Math.sin(th)));
+      const hd = nrm(m.handL_), r2 = ds(hd);
+      const pole = add(mul(r2.down, Math.cos(sw)), mul(r2.side, Math.sin(sw)));
+      worst = Math.max(worst, len(sub(hand, m.handL_)), len(sub(pole, m.poleL_)));
+      readBack = Math.max(readBack, Math.abs(m.bladeAngleNow_ - th),
+        Math.abs(m.leanAngleNow_ - ph), Math.abs(m.elbowSwivelNow_ - sw));
+    }
+    check(worst < 1e-6 && readBack < 1e-6,
+      'blade angle / lean angle / elbow direction: the hand and elbow sit where the numbers say, and read back exactly',
+      `worst position ${worst.toExponential(2)}, worst read-back ${readBack.toExponential(2)}`);
+  }
   // ...and the flag is one-shot: a driver stepped by hand afterwards earns
   // alignment from speed again (a standing guard rides the grip).
   {
@@ -944,12 +1154,12 @@ section('goal frames (melee.js strokeGoalPose)');
 
   // 4. THE RECOVER GOAL IS ABSOLUTE, not aim-relative — the one place the
   //    three differ, and the easiest thing to get backwards.
-  const gr1 = MELEE.strokeGoalPose(sty, m0, 'recover', 0, 0);
-  const gr2 = MELEE.strokeGoalPose(sty, m0, 'recover', 1.1, -0.7);
+  const gr1 = MELEE.strokeGoalPose(sty, m0, GK(sty, 'recover'), 0, 0);
+  const gr2 = MELEE.strokeGoalPose(sty, m0, GK(sty, 'recover'), 1.1, -0.7);
   check(near(gr1.az, gr2.az) && near(gr1.el, gr2.el),
     'the recover goal does NOT move with the aim (it is a stance)');
-  const gc1 = MELEE.strokeGoalPose(sty, m0, 'cut0', 0, 0);
-  const gc2 = MELEE.strokeGoalPose(sty, m0, 'cut0', 1.1, -0.7);
+  const gc1 = MELEE.strokeGoalPose(sty, m0, GK(sty, 'cut0'), 0, 0);
+  const gc2 = MELEE.strokeGoalPose(sty, m0, GK(sty, 'cut0'), 1.1, -0.7);
   check(Math.abs(gc1.az - gc2.az) > 1.0,
     'a cut goal DOES move with the aim (it is aimed)');
 
@@ -960,8 +1170,8 @@ section('goal frames (melee.js strokeGoalPose)');
     cut: { ticks: 6, az: -1, el: 0, reach: 0 }, recover: { ticks: 4 },
     jitter: { az: 0.4, el: 0.3, tempo: 0 },
   }] }).styles[0];
-  const a = MELEE.strokeGoalPose(jit, m0, 'windup', 0, 0);
-  const b = MELEE.strokeGoalPose(jit, m0, 'windup', 0, 0);
+  const a = MELEE.strokeGoalPose(jit, m0, GK(jit, 'windup'), 0, 0);
+  const b = MELEE.strokeGoalPose(jit, m0, GK(jit, 'windup'), 0, 0);
   check(near(a.az, b.az) && near(a.el, b.el),
     'a goal pose is the authored number, with no jitter draw in it');
 }
@@ -1458,7 +1668,7 @@ section('the stroke frame: windup measured from the target');
     name: 'z', windup: { ticks: 30, az: 0, el: 0, reach: 0 },
     cut: { ticks: 6, az: -1.2, el: 0, reach: 0 }, recover: { ticks: 4 } }] });
   const zs = zero.styles[0];
-  const g = MELEE.strokeGoalPose(zs, freshDriver(), 'windup', 0.3, -0.1);
+  const g = MELEE.strokeGoalPose(zs, freshDriver(), GK(zs, 'windup'), 0.3, -0.1);
   check(g && near(g.az, 0.3) && near(g.el, -0.1),
     'windup 0/0 resolves to the aim itself', g && `${g.az} ${g.el}`);
   const zr = runParsed(zs, 0, 0.3, -0.1);
@@ -1466,7 +1676,7 @@ section('the stroke frame: windup measured from the target');
   check(Math.abs(lastW.az - 0.3) < 0.05 && Math.abs(lastW.el + 0.1) < 0.05,
     'a long 0/0 windup arrives pointing at the target',
     `${lastW.az.toFixed(3)} ${lastW.el.toFixed(3)}`);
-  const g0 = MELEE.strokeGoalPose(zs, freshDriver(), 'cut0', 0.3, -0.1);
+  const g0 = MELEE.strokeGoalPose(zs, freshDriver(), GK(zs, 'cut0'), 0.3, -0.1);
   check(near(g0.az, 0.3 - 1.2), 'the cut travels FROM the windup pose');
 
   // A LEGACY FILE plays exactly as the same file migrated.
@@ -1492,6 +1702,67 @@ section('the stroke frame: windup measured from the target');
     check(worst < 1e-5, `${nm}: a legacy file and its migration are the same swing`,
       `worst ${worst}`);
   }
+}
+
+/* ==========================================================================
+   A FRAME IS A POSE (strokes.h) — the keyed runner, arithmetic only. The
+   rig's half (slerp + re-flatten + the clamp exemption) is the tuner's and the
+   engine's; tools/_bake_poses-style traces measure it on the real page.
+   ========================================================================== */
+section('keyed frames (strokes.cpp StrokeKeyedPose)');
+{
+  // The aim turn carries straight ahead onto the bearing, in the driver's own
+  // az/el convention (right = -X, up = +Y, fwd = +Z at heading 0).
+  for (const [az, el] of [[0.7, 0], [0, 0.4], [-1.1, -0.3]]) {
+    const d = AN.qrot(MELEE.aimQuat(az, el), AN.v3(0, 0, 1));
+    const want = AN.v3(-Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az));
+    check(AN.vlen(AN.vsub(d, want)) < 1e-6, `aimQuat(${az}, ${el}) turns fwd onto the bearing`,
+      JSON.stringify(d));
+  }
+  const q = (x, y, z, w) => { const n = Math.hypot(x, y, z, w); return [x / n, y / n, z / n, w / n]; };
+  const pose = (s, e, tw) => ({ shoulder: s, elbow: e, wrist: [0, 0, 0, 1], twist: tw });
+  const raw = { styles: [{ name: 'K', frames: [
+    { name: 'windup', ticks: 4, ease: 'quadInOut', pose: pose(q(0, 0, 0.5, 1), q(0.3, 0, 0, 1), 0.2) },
+    { name: 'cut', ticks: 6, cuts: true, pose: pose(q(0, 0, -0.5, 1), q(0.1, 0, 0, 1), -0.3) },
+  ], release: 3 }] };
+  const lib = MELEE.parseStyleLibrary(raw);
+  const sty = lib.styles.find(s => s.name === 'K');
+  check(MELEE.styleKeyed(sty), 'a style whose every frame has a pose is keyed');
+  // Round trip through the file spelling: the pose and the timing survive,
+  // the driver's steering fields are not written.
+  const back = MELEE.frameToJson(sty.frames[1]);
+  check(back.pose && back.cuts && back.ticks === 6 && back.az === undefined,
+    'a pose frame writes back as its pose and timing only', JSON.stringify(back));
+  // Step the program and read the keyed pose after each tick: the first frame
+  // blends from the live arm, the second from the first's pose, t is eased
+  // and reaches 1 exactly at each frame's end, the torso blends with it.
+  const m = new MELEE.MeleeState(MELEE.defaultMeleeTuning());
+  m.setStroke(AN.v3(0, -3, 1), AN.v3(0, -3, 8), AN.v3(1, 0, 0), 6);
+  const cur = MELEE.newStrokeCursor();
+  MELEE.beginStrokeProgram(cur, sty, 0, 1);
+  const R = AN.v3(-1, 0, 0), U = AN.v3(0, 1, 0), F = AN.v3(0, 0, 1);
+  const seen = [];
+  for (let i = 0; i < 20; i++) {
+    const r = MELEE.stepStrokeProgram(cur, sty, m, 0.1, -0.05, 1 / 30, R, U, F);
+    seen.push(MELEE.strokeKeyedPose(cur, sty, m.pose().release));
+    if (r !== MELEE.STEP.Live) break;
+  }
+  check(seen[0].on && seen[0].fromLive, 'frame 1 blends FROM the live arm');
+  const endW = seen[3];
+  check(endW.on && !endW.fromLive && endW.t === 0 && Math.abs(endW.twist - 0.2) < 1e-9,
+    'on the tick frame 1 ends the arm IS its pose (the next frame at t = 0)',
+    JSON.stringify({ t: endW.t, twist: endW.twist, fromLive: endW.fromLive }));
+  let mono = true;
+  for (let i = 4; i < 9; i++) mono = mono && seen[i].t > seen[i - 1].t - 1e-9;
+  check(mono, 'the cut frame\'s t only goes forward');
+  // The tick the last frame ends the driver has not begun its hand-back:
+  // the arm HOLDS the last pose instead of falling to the driver's IK.
+  const hold = seen[9];
+  check(hold && hold.on && hold.t === 1 && Math.abs(hold.twist + 0.3) < 1e-9,
+    'the tick after the last frame holds its pose', JSON.stringify(hold && { on: hold.on, t: hold.t }));
+  // The aim turns target-measured frames, and each end carries its own.
+  check(Math.abs(seen[5].aimTo.yaw - 0.1) < 1e-9 && Math.abs(seen[5].aimTo.pitch + 0.05) < 1e-9,
+    'a target-measured frame is turned by the live aim', JSON.stringify(seen[5].aimTo));
 }
 
 /* ========================================================================== */

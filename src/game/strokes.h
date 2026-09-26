@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -370,6 +371,123 @@ inline float StrokeEaseStep(Ease e, float p0, float p1) {
   return s < 0.0f ? 0.0f : (s > 1.0f ? 1.0f : s);
 }
 
+// ============================================================================
+// AN ATTACK IS A LIST OF FRAMES (2026-09-25)
+//
+// Every frame is the same kind of thing: WHERE THE TIP IS when the frame ends,
+// how long it takes to get there, how the speed is spread over that time, and
+// every control that shapes the arm on the way — which side the hand leans,
+// how much the wrist lays the blade along the stroke, how much the torso turns
+// with it, and the per-joint brakes. "windup", "cut" and "recover" are only
+// NAMES. What makes a frame a cut is `cuts` (the damage sweep is live in it).
+//
+// Before this, the three rows of a style meant three different things — the
+// windup a pose relative to the target driven closed-loop at a HIDDEN 16
+// units/tick cap, the cut a TRAVEL added to wherever the windup ended, the
+// recover a pose relative to the body — and a dozen numbers that shaped the
+// motion (torso share, wrist alignment, lean side, joint smoothing) were either
+// global or not exposed at all. The owner's words: "cut and windup shouldn't be
+// different from each other other than name", and "every parameter that
+// relates to how the character moves [...] directly controllable".
+//
+// THE PHASES THE REST OF THE ENGINE READS ARE DERIVED, not authored: frames
+// before the first `cuts` frame are the Windup (the aim is FROZEN at the end
+// of it), the `cuts` frames are the Cut (contiguous; the loader enforces it),
+// the frames after are the Recover, and `release` ticks of hand-back follow
+// the last frame. NPC AI, parry, lunge and the damage sweep keep their phase
+// vocabulary unchanged.
+enum class FrameLean : uint8_t {
+  Follow = 0,  // the hand leads the tip's travel (the edge leads a cut)
+  Hold,        // keep whichever side it is on (a return, a feint)
+  Left,        // hand on the wielder's left of the tip
+  Right,       // ...or right
+  Angle,       // at `leanAngle` about the shoulder-to-tip line (0 = below)
+};
+// ---------------------------------------------------------------------------
+// A FRAME IS A POSE (2026-09-25).
+//
+// The tip-target frames above ask the stroke driver where the arm goes, and
+// the driver answers with a chain of chasers — the lean plane follows the
+// tip's travel, the flat follows it too, the elbow pole chases the hand's
+// velocity, the blade angle is a law-of-cosines solve, then the two-bone IK
+// and the joint clamp. Between two frames the arm is whatever that feedback
+// system does, and on a swing whose travel turns (every windup-to-cut) it
+// turns the blade plane with it: "the sword spins out everywhere".
+//
+// A POSE FRAME states the arm instead: the weapon arm's shoulder, elbow and
+// wrist rotations RELATIVE TO THEIR PARENTS, plus the torso's twist and pitch.
+// A style whose every frame has one is KEYED, and a keyed stroke slerps each
+// joint from the previous frame's pose to this one's on the frame's own ease
+// (StrokeKeyedPose -> WeaponPose::keyed -> Mob::SmoothWeaponArm). Nothing is
+// solved, so nothing between two frames can do what the frames do not show.
+// The first frame blends from the arm as the stroke found it.
+//
+// Authored in the tuner (Attacks lane: "bake to poses", then the ✋ manual
+// handles, which edit joints), and stored AS IF AIMED STRAIGHT AHEAD: a
+// target-measured frame is turned about the shoulder by the target's bearing
+// at playback (yaw about the body's up, then pitch about its right); a
+// `from: body` frame is not. The driver still runs underneath a keyed stroke
+// for the phase clock, the cut window and the sounds — its arm is not used.
+//
+//   "pose": { "shoulder": [x,y,z,w], "elbow": [x,y,z,w], "wrist": [x,y,z,w],
+//             "twist": 0.2, "pitch": 0.0 }
+//
+// Parts are named by ROLE (the weapon chain's upper bone, lower bone, hand),
+// not by limb name, so the same style plays on either arm of any rig with the
+// human's topology. `wrist` may be absent (a chain whose lower bone is the
+// hand has none; an absent one leaves the animation's).
+struct StrokePose {
+  bool has = false;
+  Quat joint[kArmJoints]{};
+  bool hasJoint[kArmJoints] = {false, false, false};
+  float twist = 0, pitch = 0;   // torso, radians: + toward the right, + chest up
+};
+
+struct StrokeFrame {
+  std::string name;
+  int ticks = 8;
+  // WHERE THE TIP IS AT THE END OF THIS FRAME. az/el radians; reach a BAND
+  // POSITION offset (0 = the neutral 0.60 of the arm's own annulus, +1 out,
+  // -1 in). Measured from the TARGET (0/0 = straight at it) unless
+  // `fromBody`, which measures it from the wielder's own facing instead.
+  float az = 0, el = 0, reach = 0;
+  bool fromBody = false;
+  // How the travel is spread over the ticks. Every curve ARRIVES on the last
+  // tick. OR `chase`: close on the pose at up to `chaseRate` input units per
+  // tick (16 = about 4.6 deg/tick sideways, 6.1 up/down), arriving whenever
+  // it arrives — possibly never, in a short frame. That is how every windup
+  // and every return moved before frames, and a converted stock attack keeps
+  // it, VISIBLY, until its author picks a curve.
+  Ease ease = Ease::Linear;
+  bool chase = false;
+  float chaseRate = 16.0f;
+  bool cuts = false;             // the damage sweep is live in this frame
+  FrameLean lean = FrameLean::Follow;
+  // 0..1: how much the wrist lays the blade along the commanded stroke
+  // (1) versus letting it ride the grip (0).
+  float wristAlign = 1.0f;
+  // Fractions of the stroke's azimuth / elevation the torso carries; < 0 =
+  // the global melee.torsoShare / torsoPitch.
+  float torsoTwist = -1.0f, torsoPitch = -1.0f;
+  // The per-joint brakes (melee.h ArmSmooth) IN FORCE DURING THIS FRAME.
+  ArmSmooth joints;
+  // THE ARM'S SHAPE at the end of the frame (melee.h ProgramDrive): the
+  // blade's angle off the arm line (radians; < 0 = auto, the old
+  // hand-at-melee.handExtend rule), and the elbow's direction about the
+  // shoulder-to-hand line (radians, 0 = down, + = out; `elbowSet` false =
+  // auto). Both are blended from where the arm is when the frame starts.
+  float bladeAngle = -1.0f;
+  bool elbowSet = false;
+  float elbow = 0.0f;
+  float leanAngle = 0.0f;   // used when lean == Angle; blended like the elbow
+  // THE ARM ITSELF at the end of the frame ("A FRAME IS A POSE" below). When
+  // every frame of a style has one, the style is KEYED and nothing above this
+  // line but ticks / ease / cuts / fromBody / joints is read.
+  StrokePose pose;
+};
+
+constexpr int kMaxFrames = 12;
+
 struct AttackStyle {
   std::string name;    // the id a behaviour profile refers to
   std::string label;   // human text for the dev readout
@@ -394,6 +512,34 @@ struct AttackStyle {
   // Absent = all zero = the solve untouched. Carried to the rig on the
   // WeaponPose by whoever runs the program.
   ArmSmooth joints;
+  // ---- THE TRUTH (see "AN ATTACK IS A LIST OF FRAMES" above) --------------
+  // Everything above this line — windup, cut, aimLeg, recover, joints, ease —
+  // is a DERIVED VIEW kept for the readers that predate frames (gates, the AI
+  // reach estimate). The runner reads only `frames` and `release`.
+  std::vector<StrokeFrame> frames;
+  // Ticks of hand-back after the last frame: the arm is released and its
+  // claim fades to the walk cycle over exactly this long.
+  int release = 6;
+  int FirstCut() const {
+    for (int k = 0; k < (int)frames.size(); k++) if (frames[k].cuts) return k;
+    return -1;
+  }
+  int LastCut() const {
+    for (int k = (int)frames.size() - 1; k >= 0; k--) if (frames[k].cuts) return k;
+    return -1;
+  }
+  // Every frame is a pose ("A FRAME IS A POSE").
+  bool Keyed() const {
+    if (frames.empty()) return false;
+    for (const StrokeFrame& f : frames) if (!f.pose.has) return false;
+    return true;
+  }
+  // The pre-frames spelling (windup / cut legs / recover, already in the
+  // TARGET stroke frame) turned into frames, replacing `frames`. Exact: the
+  // runner's targets are the same expressions the old phases used.
+  void BuildFramesFromLegacy();
+  // ...and the other way: refill the derived views from `frames`.
+  void DeriveLegacyViews();
   // The ease a cut leg with no `ease` of its own is paced by.
   Ease LegEase(int k) const {
     return (k >= 0 && k < (int)cut.size() && cut[k].paced) ? cut[k].ease : ease;
@@ -506,7 +652,25 @@ struct AttackStyle {
   // claim still wins on the arm. A name no rig knows is a loud loader line,
   // not a crash: PlayClip no-ops on a miss.
   std::string clip;
+  // THE WEAPON FORM this copy is ("short" / "long" / "blunt"), "" for the
+  // style itself. Set only on the copies the loader makes from `forms`.
+  std::string form;
 };
+
+// ---- WEAPON FORMS (attack_styles.json `forms` per style) --------------------
+// ONE STYLE, ONE VERSION PER KIND OF WEAPON. `horizontal_r` is the stroke the
+// compass and every behaviour profile name; `forms.short` / `.long` / `.blunt`
+// each may carry that stroke's own frames (and release) for a weapon of that
+// class (ItemDef::weaponClass). A form that is not authored is the style's
+// own frames, so a new weapon class never needs a line of JSON to swing.
+// Resolved ONCE, at the stroke's start (the player's press and
+// MobSystem::StartStroke), into a separate library entry, so every runner
+// below sees an ordinary AttackStyle.
+constexpr int kWeaponForms = 3;
+extern const char* const kWeaponFormNames[kWeaponForms];   // short, long, blunt
+// An item's weaponClass -> its form index; -1 for none/unknown (the style's
+// own frames).
+int WeaponFormOf(const std::string& weaponClass);
 
 // THE PLAYER'S FLICK COMPASS (the `player` block of attack_styles.json): a
 // screen-space direction per style, quantized by max dot at the attack press.
@@ -534,7 +698,16 @@ struct StyleLibrary {
   // asking one set of sectors to mean both would make every punch a
   // re-labelled sword cut.
   PlayerStrikeMap playerUnarmed;
-  PlayerStrikeMap playerDagger;
+  // forms[style][form] -> the entry for that style swung with that class of
+  // weapon, -1 when the style has no such form (strokes.h WEAPON FORMS).
+  std::vector<std::array<int, kWeaponForms>> forms;
+  int ResolveForm(int style, int form) const {
+    if (form < 0 || form >= kWeaponForms || style < 0 ||
+        style >= (int)forms.size())
+      return style;
+    const int f = forms[style][form];
+    return f >= 0 ? f : style;
+  }
   int Find(const std::string& n) const {
     for (size_t i = 0; i < styles.size(); i++)
       if (styles[i].name == n) return (int)i;
@@ -558,6 +731,11 @@ int QuantizeStrike(const PlayerStrikeMap& map, float dx, float dy);
 // which. Returns the other one when the asked-for side is unresolved, and -1
 // when neither is.
 int NeutralStrike(const PlayerStrikeMap& map, bool right);
+// Which compass a player press reads: fists or armed. ONE armed compass for
+// every weapon — what differs by weapon is the stroke's FORM, not which
+// stroke a flick names. One function because the tick (session.cpp) and the
+// HUD's strike compass must never disagree about it.
+const PlayerStrikeMap& PlayerCompass(const StyleLibrary& lib, bool armed);
 
 // Load assets/mobs/attack_styles.json. Follows every other loader here: a bad
 // entry is skipped LOUDLY into `log` and is never fatal, and an unknown key is
@@ -604,12 +782,40 @@ struct StrokeCursor {
   // the button is released (StrokeRecover::settle, resolved and clamped at
   // BeginStrokeProgram). 0 = release immediately, the historical recover.
   int settleTicks = 0;
+  // ---- the frame program (AttackStyle::frames) ----------------------------
+  int frames = 0;                  // how many frames this swing runs
+  int frameTicks[kMaxFrames] = {}; // after tempo jitter
+  int frame = 0;                   // the current one
+  int frameTick = 0;               // ticks into it
+  int firstCut = -1, lastCut = -1;
+  // After the last frame: the arm is released and `releaseLeft` ticks of
+  // hand-back remain. Also how a dropped guard ends (MobSystem::ClearGuard).
+  bool releasing = false;
+  int releaseLeft = 0;
+  // Where the arm's shape was when the current frame started (blended FROM).
+  float bladeFrom = 0.0f, elbowFrom = 0.0f, leanFrom = 0.0f;
+  // The frame began on the TAKE-OVER tick, when the driver was still Idle and
+  // had no shape of its own to read: capture on the next tick instead.
+  bool fromPending = false;
+  // The frame tick the shape was captured on (0, or 1 after a take-over): the
+  // blend runs over the ticks left from there.
+  int fromTick = 0;
+  void StartRelease(int ticks) {
+    phase = Phase::Recover;
+    phaseTick = 0;
+    releasing = true;
+    releaseLeft = ticks > 0 ? ticks : 1;
+    recoverTicks = releaseLeft;
+  }
   uint32_t seed = 0;         // wielder ^ salt ^ startTick; every draw keys off it
   // The aim, resolved ONCE at the end of the windup and never refreshed.
   float aimAz = 0, aimEl = 0;
   bool aimed = false;
   // Where the windup is steering to, in the wielder's basis.
   float wantAz = 0, wantEl = 0, wantReach = 0;
+  // The aim the last step was handed, which a KEYED frame's pose is turned
+  // toward before the commit freezes `aimAz`/`aimEl` (StrokeKeyedPose).
+  float liveAz = 0, liveEl = 0;
 
   // ---- WHAT THIS STROKE HAS ALREADY BRUISED (melee.h EdgeSweep::struck) --
   // Rig slots this swing has already delivered its BLUNT/BITE impulse to. On
@@ -797,6 +1003,26 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
 // because the gates state their expectations in the same band positions the
 // styles are authored in.
 float StrokeReachIn(const MeleeState& m, float offset);
+
+// The per-joint brakes in force RIGHT NOW: the current frame's (the last
+// frame's through the release). What a caller hands WeaponPose::smooth.
+const ArmSmooth& StrokeJointsNow(const StrokeCursor& cur, const AttackStyle& sty);
+
+// A KEYED style's arm this tick ("A FRAME IS A POSE"), read off the cursor
+// AFTER StepStrokeProgram, onto a pose the caller already filled from
+// MeleeState::Pose(): sets `wp.keyed` while a frame is running and replaces
+// the torso shares with the frames' own (faded by the release). A style that
+// is not keyed leaves `wp` alone. Both stroke callers make this call right
+// beside StrokeJointsNow.
+void StrokeKeyedPose(const StrokeCursor& cur, const AttackStyle& sty, WeaponPose& wp);
+
+// THE POSE A RUNNING STROKE HANDS THE RIG: the driver's (MeleeState::Pose),
+// the current frame's joint brakes, and -- for a KEYED style -- the frames'
+// joints and torso. The one call both stroke callers make, and the one a gate
+// that ticks a stroke by hand must make too, or it measures the driver's arm
+// where the game shows the keyed one.
+WeaponPose StrokePoseNow(const StrokeCursor& cur, const AttackStyle* sty,
+                         const MeleeState& m);
 
 // A WORLD POINT -> THE THREE NUMBERS `StepStrokeProgram` AIMS WITH.
 //

@@ -54,8 +54,8 @@ cleanup() {
   rm -rf "$PROF"
   # The harness SAVES two scratch mobs through the real route (that is the
   # point of it); do not leave them in the tree.
-  rm -f "$ROOT/assets/mobs/_harness.vox" "$ROOT/assets/mobs/_harness.json" \
-        "$ROOT/assets/mobs/_harness_pale.json"
+  rm -f "$ROOT/assets/mobs/human/_harness.vox" "$ROOT/assets/mobs/human/_harness.json" \
+        "$ROOT/assets/mobs/human/_harness_pale.json"
 }
 trap cleanup EXIT
 

@@ -21,6 +21,13 @@ constexpr unsigned kPreferredRate = 48000;
 // two genuinely separate hits are two sounds.
 constexpr double kMobVoiceMinGap = 0.12;
 
+// Minimum gap between two flask-fill bubbles (Cues::FlaskFill). Under one
+// 30 Hz tick, so every tick that pays liquid in gets its bubble.
+constexpr double kFlaskFillMinGap = 0.02;
+// Loudness of a bubble at half full and below, before the -6 dB top-half fall.
+constexpr float kFlaskFillGain = 0.7f;
+constexpr float kFlaskFillRadius = 12.0f;  // metres
+
 // ---- material ambience ------------------------------------------------------
 // The 3x3x3 mirror is 48 voxels on a side. Sampling every 4th cell on each axis
 // makes one scan 1728 reads and gives each sample a 4^3 = 64-voxel footprint,
@@ -140,6 +147,9 @@ const std::map<std::string, std::string> Cues::kSlotPrefix = {
     // set name is fixed in code; the slot exists here so the tuner and the
     // wiki can describe it.
     {"night", "ambience"},
+    // Liquid landing in a flask (the `vessel` owner): set vessel/fill, fixed
+    // in code like the combat sets. See Cues::FlaskFill.
+    {"fill", "vessel"},
 };
 
 namespace {
@@ -208,6 +218,7 @@ int Cues::ResolveMaterialSlot(const MaterialDef& m, const char* slot) const {
 void Cues::RebuildMaterialTable(const std::vector<MaterialDef>& mats) {
   warnings_.clear();
   mobSetCache_.clear();  // a rescan may have added the set a mob asked for
+  flaskSetId_ = -2;
   const size_t n = mats.size();
   footstep_.assign(n, FootstepMapping{});
   land_.assign(n, FootstepMapping{});
@@ -597,6 +608,41 @@ int Cues::Combat(CombatCue cue, const Vec3& posVox, float power) {
   const int handle = world_.PlayOneShotTracked(buf, posVox, cfg);
   if (handle < 0) stats_.dropped++;
   return handle;
+}
+
+int Cues::FlaskFillSetId() const {
+  if (flaskSetId_ == -2) flaskSetId_ = lib_.Find("vessel/fill");
+  return flaskSetId_;
+}
+
+void Cues::FlaskFill(const Vec3& posVox, float fill, int cells) {
+  stats_.flaskCells += (uint32_t)std::max(0, cells);
+  if (!enabled_ || cells <= 0) return;
+  if (now_ - lastFlaskFill_ < kFlaskFillMinGap) return;
+  const int setId = FlaskFillSetId();
+  if (setId < 0) return;  // no vessel/fill recorded: silent
+  const float f = std::clamp(fill, 0.0f, 1.0f);
+  // Octaves: -1 empty, 0 half, +1 full -- linear in pitch, so each cell
+  // raises the note by the same interval.
+  const float rate = std::pow(2.0f, 2.0f * f - 1.0f);
+  // 0 dB up to half full, then down to -6 dB at full.
+  const float db = f <= 0.5f ? 0.0f : -6.0f * (f - 0.5f) * 2.0f;
+
+  if ((int)lastVariant_.size() <= setId)
+    lastVariant_.assign((size_t)lib_.Count(), -1);
+  const std::vector<float>* buf = PickStep(setId, lastVariant_[(size_t)setId]);
+  VoiceConfig cfg;
+  cfg.gain = kFlaskFillGain * std::pow(10.0f, db / 20.0f);
+  cfg.audibleRadius = kFlaskFillRadius;
+  cfg.verbWet = CurrentTuning().audio.reverbWet;
+  cfg.doppler = false;  // the flask is in your own hand
+  cfg.rate = rate;
+  if (world_.PlayOneShot(buf, posVox, cfg)) {
+    lastFlaskFill_ = now_;
+    stats_.flaskVoices++;
+  } else {
+    stats_.dropped++;
+  }
 }
 
 int Cues::MobSetId(const MobDef& def, MobEvent ev) const {

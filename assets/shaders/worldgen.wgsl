@@ -103,12 +103,13 @@ const GEN_V_MAT_SHIFT : u32 = 4u;
 @group(0) @binding(39) var<storage, read_write> colCache : array<u32>;
 const GC_REC_BASE : u32 = NUM_SLOTS;
 const GC_REC_WORDS : u32 = 4u;
-const CC_WORDS : u32 = 24u;
+const CC_WORDS : u32 = 25u;
 const CC_HDR : u32 = 16u;
 const CC_BLOCK : u32 = CC_HDR + CHUNK * CHUNK * CC_WORDS;
 const CCH_TOP : u32 = 0u;        // max over the block's columns of CCW_TOP
 const CCH_TREE_TOP : u32 = 1u;   // max of CCW_TREE_TOP
 const CCH_MIN_H : u32 = 2u;      // min of the columns' ground h
+const CCH_MIN_GRAIN_H : u32 = 3u; // min h over columns with a partial top (CCW_TOP_MASS < 8)
 // The BAKED TREE ATLAS (src/sim/treeatlas.h). Read-only asset data uploaded
 // once at load, like `materials` — see the tree section below for the layout
 // and for why worldgen samples a baked grid instead of evaluating tree shapes.
@@ -3702,11 +3703,43 @@ fn looseCoverDepth(col : ptr<function, Col>, depth : i32) -> i32 {
 // sand vs sandstone is one far palette slot and four more ground evaluations
 // per sample would be pure cost.
 fn looseRestTop(col : ptr<function, Col>, x : i32, z : i32, seed : u32) -> i32 {
-  var m = colHeightAt(x + 1, z, seed);
-  m = min(m, colHeightAt(x - 1, z, seed));
-  m = min(m, colHeightAt(x, z + 1, seed));
-  m = min(m, colHeightAt(x, z - 1, seed));
-  return min((*col).h, m + 1);
+  return looseStep(col, x, z, seed).x;
+}
+
+// ---- THE TOP CELL'S GRAINS (docs/PLAN_powder_mass.md P5) -----------------
+//
+// With sim.powderFineRepose a resting powder is judged on column-top heights
+// in EIGHTHS (sim_step.wgsl tryFineRepose): a surface cell sheds when a
+// neighbour column's top is more than T eighths lower, and T is 8 for every
+// powder worldgen lays as loose cover. A loose top cell already satisfies the
+// step line above (every axis neighbour's ground is at least h - 1), so the
+// only pairs that could move are an UPPER column one cell above a LOWER one,
+// and they hold iff  upper's mass <= lower's mass.  So the mass is read off
+// the local step shape, never off a noise that knows nothing of its
+// neighbours:
+//
+//   a lower neighbour and no higher one (the LIP of a step)   4/8
+//   both (a column in the middle of a staircase)              6/8
+//   a higher neighbour only (the FOOT), or flat               whole
+//
+// Every upper/lower pair then has upper in {4, 6} and lower in {6, 8}: at rest
+// by construction, and a 45-degree staircase of whole voxels becomes one of
+// half-voxel steps (the renderer leans a 6/8 cell's top grains uphill).
+// Returns (looseTop, mass); the four heights are the ones looseRestTop always
+// read, so the mass costs nothing extra.
+fn looseStep(col : ptr<function, Col>, x : i32, z : i32, seed : u32) -> vec2<i32> {
+  let h = (*col).h;
+  let a = colHeightAt(x + 1, z, seed);
+  let b = colHeightAt(x - 1, z, seed);
+  let c = colHeightAt(x, z + 1, seed);
+  let d = colHeightAt(x, z - 1, seed);
+  let lo = min(min(a, b), min(c, d));
+  let hi = max(max(a, b), max(c, d));
+  var mass = 8;
+  if (TUNE_POWDER_FINE_REPOSE != 0u && lo < h) {
+    mass = select(4, 6, hi > h);
+  }
+  return vec2<i32>(min(h, lo + 1), mass);
 }
 
 // Does this column's cover get the loose/firm split at all? The same two opt-ins
@@ -3820,6 +3853,7 @@ const CCW_CANOPY     : u32 = 16u;   // colPrologue's memo, -1 = not computed
 const CCW_TOP        : u32 = 17u;   // the column's sky ceiling (see `cols`)
 const CCW_TREE_TOP   : u32 = 18u;   // the tree candidates' top, or far below any y
 const CCW_CAVE       : u32 = 19u;   // f1, c1, f2, c2, top2
+const CCW_TOP_MASS   : u32 = 24u;   // looseStep's top-cell grains, 8 = whole (`cols` writes it)
 // CCW_PACKED's flag byte. Material ids are 12 bits (the voxel word), so the
 // fluid and the tile plant fill the low 24.
 const CCF_POOL_FLOOR : u32 = 1u;
@@ -4635,11 +4669,18 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
   // every column's candidate top, and not below every column's ground (the
   // per-column test further down, maxed / minned over the block). Decided by
   // one thread and read back uniformly, because the fill ends in a barrier.
+  // The last term is the per-column `above` below, minned over the block:
+  // some column's ground is below the chunk's top cell, OR some column with
+  // a partial top (CCW_TOP_MASS < 8) has its ground AT or below the top cell
+  // -- that column's ground cell may be this chunk's top, and then it asks
+  // for the tree set at h + 1 (the top cell's grains, below).
   if (li == 0u) {
+    let topCell = base.y + i32(CHUNK) - 1;
     wgTreeOn = select(0u, 1u,
         base.y <= chunkTop && base.y <= treeMaxTop() &&
         base.y <= bitcast<i32>(colCache[blk + CCH_TREE_TOP]) &&
-        base.y + i32(CHUNK) - 1 > bitcast<i32>(colCache[blk + CCH_MIN_H]));
+        (topCell > bitcast<i32>(colCache[blk + CCH_MIN_H]) ||
+         topCell >= bitcast<i32>(colCache[blk + CCH_MIN_GRAIN_H])));
   }
   if (workgroupUniformLoad(&wgTreeOn) != 0u) {
     treeTilesFill(li, base.x, base.z, T.seed);
@@ -4696,10 +4737,34 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
       // chunk can read it, and no cell reads it anywhere else (looseRestTop's
       // band is (h - max(4, skinDepth), h]; the canopy's, colPrologue's note).
       ccLoad(cw, &col, &cave);
-      // Does this chunk hold a cell above the ground? Everything that reads
-      // the pond set or the tree candidates (the tree block, cacti, the cover
-      // rows' water distance) is gated `y > h`.
-      let above = base.y + i32(CHUNK) - 1 > col.h;
+      // THE TOP CELL'S GRAINS (looseStep, docs/PLAN_powder_mass.md P5):
+      // `cols` cached the ground cell's mass wherever a listed chunk holds
+      // that cell (the same band test the step line takes, so it is set in
+      // every chunk the old per-chunk looseStep ran in that holds y == h). A
+      // partial mass is written only onto a powder-mass ground cell with
+      // generated AIR above it -- a plant or a cactus standing on a partial
+      // cell would float over its empty half -- and "the cell above" is
+      // genCellIn itself at h + 1, so the answer is the same whichever chunk
+      // holds it.
+      //
+      // When h is this chunk's TOP cell, h + 1 lies in the chunk above, and
+      // every gate here keyed on "a cell of this chunk is above h" would
+      // decline the tree set and the pond set that cell reads. `reach` is
+      // therefore the highest y this column evaluates: the top cell, or
+      // h + 1 in exactly that case. Keying `above` on it makes the extra
+      // cell's sets exact by the same arguments as every in-chunk cell's
+      // (the tile cache's fill and `cols`' tree top / canopy memo were
+      // widened to h + 1 on the same condition). The extra cell is evaluated
+      // by the ONE genCellIn call site below (one more trip of the loop, top
+      // down) and never stored: a second inlined call would be a second copy
+      // of the whole cell stack in this kernel.
+      let topMass = colCache[cw + CCW_TOP_MASS];
+      let extra = select(0u, 1u, topMass < 8u && col.h == base.y + i32(CHUNK) - 1);
+      let reach = base.y + i32(CHUNK) - 1 + i32(extra);
+      // Does this column evaluate a cell above the ground? Everything that
+      // reads the pond set or the tree candidates (the tree block, cacti, the
+      // cover rows' water distance) is gated `y > h`.
+      let above = reach > col.h;
       // The pond set: genColumn's is pondScan(x, z), and an EMPTY one is
       // pondSetNone() exactly (pondScan pushes only present candidates onto
       // pondSetNone()), so only a column the cache flags as non-empty re-runs
@@ -4730,10 +4795,25 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
         colNoTrees(&trees);
       }
       let canopyArg = max(bitcast<i32>(colCache[cw + CCW_CANOPY]), 0);
-      for (var ly = unrollFenceU(); ly < CHUNK; ly += 1u) {
+      // TOP DOWN, so the cell above is known when the ground cell is reached
+      // (`wUp`); stores are per cell and the tallies are sums and ORs, so the
+      // order is not observable. ly == CHUNK is the extra cell above.
+      let nCells = CHUNK + extra;
+      var wUp = 0u;
+      for (var k = unrollFenceU(); k < nCells; k += 1u) {
+        let ly = nCells - 1u - k;
+        let y = base.y + i32(ly);
+        var w = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
+                          wx, y, wz, T.seed);
+        if (ly == CHUNK) { wUp = w; continue; }
+        if (topMass < 8u && y == col.h) {
+          let tm = w & 0xFFFu;
+          if (tm != MAT_AIR && matHasPowderMass(materials[tm]) && wUp == 0u) {
+            w = (w & ~0xF000u) | ((topMass + 2u) << 12u);
+          }
+        }
+        wUp = w;
         let i = lx + ly * CHUNK + lz * CHUNK * CHUNK;
-        let w = genCellIn(&col, &cave, true, &trees, true, &ponds, canopyArg,
-                          wx, base.y + i32(ly), wz, T.seed);
         // Chunk-linear: the slot's page resolved once, per §2.1's second entry
         // point. genChunk overwrites the WHOLE chunk, so the CPU materializes
         // every target slot before the dispatch (§3.5c) and this never faults.
@@ -4747,7 +4827,8 @@ fn genChunk(slot : u32, li : u32, actIdx : u32, publish : bool) {
           let sbit = subOccBitOfLocalIdx(i);
           let sm = 1u << (sbit & 31u);
           if (sbit < 32u) { sm0 |= sm; } else { sm1 |= sm; }
-          if (isRayBlocker(md)) {
+          // Word-level, as sim_occupancy counts it (a thin partial is open).
+          if (isRayBlockerW(md, w)) {
             block += 1u;
             if (sbit < 32u) { sb0 |= sm; } else { sb1 |= sm; }
           }
@@ -4978,6 +5059,7 @@ fn list(@builtin(workgroup_id) wg : vec3<u32>,
 var<workgroup> wgColTop : atomic<i32>;
 var<workgroup> wgColTreeTop : atomic<i32>;
 var<workgroup> wgColMinH : atomic<i32>;
+var<workgroup> wgColMinGrainH : atomic<i32>;
 
 @compute @workgroup_size(64)
 fn cols(@builtin(workgroup_id) wg : vec3<u32>,
@@ -4996,6 +5078,7 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&wgColTop, -1048576);
     atomicStore(&wgColTreeTop, -1048576);
     atomicStore(&wgColMinH, 1048576);
+    atomicStore(&wgColMinGrainH, 1048576);
   }
   treeTilesFill(li, bx, bz, T.seed);
   workgroupBarrier();
@@ -5003,6 +5086,7 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
   var top = -1048576;
   var treeTopMax = -1048576;
   var minH = 1048576;
+  var minGrainH = 1048576;
   for (var ci = li; ci < CHUNK * CHUNK; ci += 64u) {
     let x = bx + i32(ci % CHUNK);
     let z = bz + i32(ci / CHUNK);
@@ -5010,20 +5094,37 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     var col = genColumn(x, z, T.seed, &ponds);
     var cave : CaveBands;
     var trees : TreeCands;
-    let need = colPrologue(&col, x, z, yLo, yHi, &cave);
-    if (need.trees) { treeCandsFromTiles(&trees, x, z, bx, bz, &ponds); } else { colNoTrees(&trees); }
-    var canopy = -1;
-    if (need.canopy) { canopy = undergrowthCoverFromTiles(x, z, bx, bz, &ponds); }
-    // THE LOCAL STEP LINE for a loose cover (looseRestTop, above genCellIn):
+    // THE LOCAL STEP LINE for a loose cover (looseStep, above genCellIn):
     // only where the cover splits, only where a listed chunk reaches the
     // loose band (the cap is 4 deep, a skin its authored skinDepth), and only
     // where the taper left loose depth to restrict. Every other column keeps
-    // genColumn's `looseTop = h`.
+    // genColumn's `looseTop = h` and a whole top cell (mass 8). Taken BEFORE
+    // the prologue because the top cell's grains widen the prologue's range
+    // (below); it reads only the column and its neighbours' ground, never
+    // anything the prologue computes.
     let coverDepth = max(4, i32(wmBiome(col.biome, WM_B_SKIN_DEPTH)));
+    var topMass = 8;
     if (coverSplits(col.biome) && yLo <= col.h && yHi + 1 > col.h - coverDepth &&
         looseCoverDepth(&col, coverDepth) > 0) {
-      col.looseTop = looseRestTop(&col, x, z, T.seed);
+      let ls = looseStep(&col, x, z, T.seed);
+      col.looseTop = ls.x;
+      topMass = ls.y;
     }
+    // THE TOP CELL'S GRAINS are written only under generated AIR (genChunk),
+    // so the chunk holding the ground cell h also asks genCellIn about
+    // y = h + 1 -- a cell OUTSIDE every listed chunk when h == yHi, where the
+    // plain range would have declined the tree set and the canopy memo that
+    // cell reads. Widening the range to h + 1 there makes that one extra cell
+    // exact by the same colPrologue rule as every other cell. Computing a
+    // value no cell reads is harmless (each is exact wherever it is
+    // computed); the sky ceiling can only rise, and no listed chunk on this
+    // column is above yHi = h to be skipped by it.
+    var yHiP = yHi;
+    if (topMass < 8 && yLo <= col.h && col.h <= yHi) { yHiP = max(yHi, col.h + 1); }
+    let need = colPrologue(&col, x, z, yLo, yHiP, &cave);
+    if (need.trees) { treeCandsFromTiles(&trees, x, z, bx, bz, &ponds); } else { colNoTrees(&trees); }
+    var canopy = -1;
+    if (need.canopy) { canopy = undergrowthCoverFromTiles(x, z, bx, bz, &ponds); }
     var colTop = col.h + colSkyMargin(col.biome);
     colTop = max(colTop, col.fluidTop);
     colTop = max(colTop, col.pond + 1);
@@ -5031,20 +5132,24 @@ fn cols(@builtin(workgroup_id) wg : vec3<u32>,
     colTop = max(colTop, trees.top);
     if (wmFlag(col.biome, WM_BF_CACTI)) { colTop = max(colTop, cactusMaxTop()); }
     ccStore(blk + CC_HDR + ci * CC_WORDS, &col, &cave, ponds.n, canopy, colTop, trees.top);
+    colCache[blk + CC_HDR + ci * CC_WORDS + CCW_TOP_MASS] = u32(topMass);
     top = max(top, colTop);
     treeTopMax = max(treeTopMax, trees.top);
     minH = min(minH, col.h);
+    if (topMass < 8) { minGrainH = min(minGrainH, col.h); }
   }
   // Max and min are order-free, so the block header does not depend on which
   // thread arrives first (rule 1).
   atomicMax(&wgColTop, top);
   atomicMax(&wgColTreeTop, treeTopMax);
   atomicMin(&wgColMinH, minH);
+  atomicMin(&wgColMinGrainH, minGrainH);
   workgroupBarrier();
   if (li == 0u) {
     colCache[blk + CCH_TOP] = bitcast<u32>(atomicLoad(&wgColTop));
     colCache[blk + CCH_TREE_TOP] = bitcast<u32>(atomicLoad(&wgColTreeTop));
     colCache[blk + CCH_MIN_H] = bitcast<u32>(atomicLoad(&wgColMinH));
+    colCache[blk + CCH_MIN_GRAIN_H] = bitcast<u32>(atomicLoad(&wgColMinGrainH));
   }
 }
 

@@ -612,6 +612,16 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   --scenario surface-sprint`: `worldgenList` 5.04 -> 3.96 ms per dispatch
   (-21%); cold driver compile of `list`/`main` 107/108 s -> 5.3/5.1 s (the new
   `cols` 31 s, compiled in parallel), `far` 79 -> 33 s.
+  **Merged with powder mass P5 (2026-09-26):** `cols` also caches the ground
+  cell's `looseStep` mass (`CCW_TOP_MASS`, 25 words per column) and the
+  header the min ground of the partial-top columns (`CCH_MIN_GRAIN_H`). The
+  partial top is written only under generated air, i.e. it reads the cell at
+  h + 1; when h is a chunk's top cell that cell is in the chunk above, so the
+  cell loop runs top-down with one extra, unstored trip at h + 1 (one
+  `genCellIn` call site, no second inlined copy), and the three gates keyed on
+  "a cell above h" — `cols`' prologue range, the per-column `above`, and the
+  tile-cache fill — are widened to h + 1 on exactly that condition, so the
+  extra cell sees the same tree / pond / canopy sets as any in-chunk cell.
 - **One shift per frame (R4, same doc):** `Stream::Update` is a per-TICK call
   and the frame loop runs up to four ticks, so a slow frame used to shift two
   or three times and compound its own slowness. `Stream::BeginFrame()` (called
@@ -874,6 +884,58 @@ SSBO lists of chunk indices.
   walks through a film under `kPowderWalkMin` = 3 eighths (`KindOfWord`).
   Gate `powder-mass`: exact eighths through merge and sink, no buried partial,
   both rooms asleep.
+- **SUB-VOXEL REPOSE AND GRAINY TERRAIN (2026-09-26; PLAN_powder_mass.md P4/P5,
+  `sim.powderFineRepose`, default 1).** The repose rule restated on
+  column-top heights in eighths (`sim_step.wgsl tryFineRepose`): a SURFACE
+  powder cell (nothing solid or powder on it) sheds k = ceil((D - T)/2) eighths
+  into an axis neighbour column whose top is D > T eighths lower, where T is
+  the material's repose in eighths per cell (`reposeEighths`: 8 at 45 degrees,
+  one per-material number, never the per-grain blend roll). For whole cells it
+  moves exactly where the 1:1 tier does; between those it rests with
+  eighth-voxel steps. Every moved grain lands strictly lower, so it terminates
+  and sleeps. The stage-2 diagonal merge onto a partial asks the same drop
+  test (`fineDiagSteep`) and the same surface test, or it would flatten
+  generated steps. WORLDGEN lays loose cover tops as partial cells already at
+  rest under this rule (`worldgen.wgsl looseStep`): an upper step edge 4/8, a
+  staircase column 6/8, flats and feet whole, and only with air generated
+  above (a plant never floats) -- every upper/lower column pair then has
+  upper <= lower, D <= 8. The player stands on grains (`Player::TopFn`,
+  `World::CellTopAt`: a partial cell is solid to y + mass/8 in `Collides` and
+  the downward flush); creatures, whose ground is an int through mob.cpp and
+  pose.cpp, ROUND (`kPowderMobSupportMin` = 4); Jolt terrain is mass-weighted
+  marching cubes (`PolygonizeChunk` `dens`). Grains under standing water draw
+  their cell's empty part as that water (raymarch phase 2). A save's material
+  table records classes (`MaterialNameTable::classes`, 'CLS1'), so a material
+  that changed class converts its nibble (`MatRemap::State`: fullness <->
+  mass, eighths kept).
+- **POWDER ENTERS THE WORLD AS GRAINS (2026-09-26).** A whole cell of sand on
+  flat ground is exactly at its 45-degree repose, so a heap built of whole
+  cells stays a heap of cubes; the grains must be there when the powder
+  appears. Every creator uses one of two spellings (common.wgsl / world.h):
+  GRAIN (one eighth) where matter is conserved and SPLIT -- wind lifting sand
+  (`windGrain`), a pouch pouring (`pourGrainEighths`) or spilling; CRUMBLE (a
+  hashed 1..8 eighths) where powder is created or converted from something
+  that was not powder -- reaction and gas-decay products, fountain emissions,
+  ash off burning limbs, island rubble, blast ejecta, spell sprays and the
+  brush's default "mixed" grain. Worldgen bulk, prefabs and in-place
+  powder/liquid conversions keep their mass (`carriedState`).
+- **GRAINS LEAVE THE PARTICLE SIM ON CONTACT (2026-09-26; `sim_particle.wgsl`
+  GRAIN LANDING, gate `vessel-sand`).** The reinsertion claim is one winner per
+  cell per tick; a pouch's stream put every grain of a tick into one cell, so
+  ~1 grain landed per tick and a poured heap took 709 ticks to leave the
+  particle sim. Now a powder grain that touches the world picks, in an order
+  hashed from its own state, the first open cell of ten: a merge into the
+  partial cell of its own material that stopped it, or the air cell it backed
+  into and the eight around it (a grain over a drop is a CA grain that falls).
+  Every grain aimed at one cell publishes a key (cell, material, the cell's
+  mass as integrate read it) and adds its eighths to a per-slot sum in five
+  extra planes of the claim buffer (`kClaimWords`); in resolve, if the key is
+  uniform and the sum fits, the claim winner writes it all and every member is
+  absorbed -- decided without re-reading the cell, since nothing writes voxels
+  between integrate and resolve. Anything else falls back to one winner.
+  Landing grains keep their sub-cell offset: equal particle states are equal
+  claim priorities, i.e. two winners, and that lost matter. Measured: 512
+  eighths exact, last grain 29 ticks after the pour (was 709).
 - **PER-MATERIAL ANGLE OF REPOSE (2026-09-13).** One down, one across is 45°,
   and for years that was the angle of *every* powder in the engine — dry sand,
   angular gravel, snow, ash and dust all built the same cone. One optional
@@ -6477,6 +6539,20 @@ happens before `model` is read, which is exactly the shape a generated
 character wants (inherit the rig, keep the body) and is now said out loud in
 the log when a `model` key is thereby ignored.
 
+**Prototypes and variants are FILED apart (2026-09-26).** `assets/mobs/<proto>.{vox,json}`
+is a prototype (human, critter, dummy); `assets/mobs/<proto>/<name>.{vox,json}`
+is a variant of it — every generated character, recolour and zombie of the
+human lives in `assets/mobs/human/`. The folder is filing, not semantics: a def
+is still named for its STEM wherever it is filed, `extends`/`model` still name
+stems, and a stem filed twice is refused with a log line (root wins). Stems stay
+globally sorted, so moving a file between folders does not renumber defs.
+`effects/` and `pool/` are not variant folders. One rule, four readers:
+`sidecar::IsVariantDir`/`StemPath`/`ListStems` (C++), `scripts/mobfiles.mjs`
+(Node), `tuner_server.py`'s `/api/models` (`variantOf` on each variant file),
+and the Models tab, which lists prototypes in its main picker and the open
+prototype's variants in a second one. The Characters page and `gen_mobs.mjs`
+write new characters into the folder of the prototype they extend.
+
 **The merge is three rules, and they live in `src/game/sidecar.cpp` with a
 line-for-line mirror in `assets/editor/sidecar.js`** (the Models tab, the
 Characters page, `gen_mobs.mjs` and `test_mobgen.mjs` all resolve through the
@@ -8399,7 +8475,84 @@ attributes each jump to `clampShift`). It is a true nearest-point projection
 now (never farther than the old one, up to 17 degrees nearer). The one
 irreducible discontinuity left is a bone aimed straight into the corner where
 BOTH stops are pressed: two answers are equally near there, and no clamp can
-be continuous everywhere on a sphere.
+be continuous everywhere on a sphere. (3) The lean plane (`perpL_`, which side of the tip the hand sits so it
+leads the edge) chased the settle's reversed travel half a turn round the blade
+OVER THE TOP, lifting the hand past the head while the tip stood still; a
+program's Recover now holds the lean the cut left (`SetProgramDrive(holdLean)`).
+The tuner port also gained the `leanFlipHold` / `leanMinSpeed` / `flatMinSin`
+guards it had been missing; the torso keep-out (`bodyClearM`) is still unported.
+
+**AN ATTACK IS A LIST OF FRAMES (2026-09-25; `strokes.h`).** The windup /
+cut-legs / recover triple — three rows meaning three different things (a pose
+from the target driven at a hidden capped rate, a TRAVEL added to wherever the
+windup ended, a pose from the body) — is replaced by `AttackStyle::frames`,
+every one the same kind of thing: where the TIP is when the frame ends, measured
+from the target or the body, `ticks`, pacing (`ease`: linear / a curve, both of
+which ARRIVE, or `chase` + `chaseRate`, the old capped closed loop, now visible),
+`cuts`, `lean` (follow / hold / left / right), `wrist` (0..1 alignment),
+`torsoTwist` / `torsoPitch`, and per-frame `joints` smoothing — plus `release`
+ticks of hand-back after the last frame. The PHASES the engine reads (Windup /
+Cut / Recover; aim frozen at the end of the windup) are DERIVED from the run of
+`cuts` frames, so NPC AI, parry, lunge and the sweep are unchanged. The loader
+converts the old spelling exactly (`BuildFramesFromLegacy`) and refills the old
+fields as derived views for their readers (`DeriveLegacyViews`);
+`attack_styles.json` was migrated once, bit-identical traces for all 18 styles.
+Per-frame shaping reaches the driver through `MeleeState::SetProgramDrive` and
+the rig through `StrokeJointsNow`.
+The ARM'S SHAPE is per frame too: `bladeAngle` (the blade off the
+shoulder-to-tip line; 0 = straight along the arm — replaces the
+hand-at-`melee.handExtend` rule when set), `elbow` (the elbow's direction about
+the shoulder-to-hand line, 0 = down, + = out — the arm's last free angle, so it
+fixes shoulder rotation and elbow bend plane together) and `lean: "angle"` +
+`leanAngle` (which side of the blade the hand sits). Each is BLENDED over its
+frame from the measured value at frame start (`BladeAngleNow` /
+`ElbowSwivelNow` / `LeanAngleNow`); absent = auto, the old rule. The tuner's
+MANUAL mode poses a held frame by dragging handles (tip, shoulder az/el,
+upper arm, reach, elbow, wrist); rig.js solves each drag in screen space
+against the driver's own geometry (pinned by test_melee). Still automatic and
+NOT per frame: the safety clamps (hand within `reachFraction`, not behind the
+body `handBackFrac`, blade out of the face `headClear`, torso `bodyClear`) and
+the rig's anatomy limits.
+
+**A FRAME IS A POSE (2026-09-25; `strokes.h` "A FRAME IS A POSE").** The
+tip-target frames above left the in-between to the driver's chasers (lean plane
+following the travel, flat following it, pole chasing the hand, law-of-cosines
+blade angle, IK, clamp), and on any swing whose travel turns that feedback
+system turned the blade plane with it — measured in the tuner on horizontal_r:
+single-tick hand turns of 90–165° through the cut. A frame may now carry a
+`pose` instead: the weapon chain's shoulder / elbow / wrist rotations RELATIVE
+TO THEIR PARENTS plus torso `twist`/`pitch`, stored as aimed straight ahead. A
+style whose every frame has one is KEYED: `StrokeKeyedPose` (strokes.cpp,
+melee.js `strokeKeyedPose`) hands the rig `WeaponPose::keyed` — from-pose,
+to-pose, eased t, each end's aim turn — and `Mob::SmoothWeaponArm` (rig.js
+`smoothWeaponArm`) slerps each joint and re-flattens the arm; `ApplyWeaponArm`
+solves nothing. The first frame blends from the arm the stroke took over; the
+tick the last frame ends HOLDS it (the driver has not begun its release yet);
+the release is the existing joint-space hand-back. A keyed arm is **exempt from
+the stage-6 clamp** (`ReapplyKeyedArm` / `reapplyKeyedArm` rewrite it after
+`AnimClampPoseLimits`): the clamp projecting a slerp that crosses a limit's edge
+was a second source of the same single-tick jumps. Aim: a target-measured frame
+is turned whole-arm about the shoulder by the target bearing (yaw about the
+body's up, then pitch); a `from: body` frame is not; each end of a blend carries
+its own turn so body→target frames swing over. The driver still runs underneath
+for the phase clock, cut window, sounds and AI; its arm is unused.
+`StrokePoseNow` is the one pose a stroke hands the rig — both callers and the
+hand-rolled swing gates use it. The shipped styles were BAKED
+(tuner "⤓ bake to poses", attacks.js `bakeStyle`): each frame's held pose
+captured from the old driver in the tuner, with the engine's wrist alignment
+now ported to rig.js (`steerWristToBlade`) so the preview is the game's arm, and
+every cut ≥ 4 ticks split at a middle key built BY BEARING (`bakeMidPose`) —
+two ends alone slerp by the shortest joint path, which takes a wide horizontal
+cut over the head. Measured after the bake (tuner, per tick): worst hand turn
+≤ 36°/tick on every sword style, no spikes; the engine's posed hand path matches
+the tuner's tick for tick. Known costs: a keyed cut's tip speed is its honest
+arc (~135 vox/s on horizontal_r vs ~440 when the wrist whipped), so cut damage
+fell and `npc-strike` is red until cuts are re-timed/re-posed; the reach cap
+against a close target (`toTarget`) does not apply to a keyed frame; a style is
+not mirrored for the other hand; aim (jaws) styles stay tip-targeted. Authoring:
+the ✋ manual handles on a keyed frame edit joints (hand = two-bone move keeping
+the blade's direction, tip = wrist, elbow = swivel, roll, arm = whole-arm turn),
+each solved against the stored pose, never the drawn one.
 
 **DISCRETE STRIKES (2026-09-01).** A click fires an **authored stroke program** — the same
 `attack_styles.json` entries the NPCs replay, new `player_*` rows with short
@@ -9972,6 +10125,20 @@ author a creature with claws and nothing in the frame loop changes.
 `meleeArmed` still means "a weapon is drawn" and still decides what to equip;
 `meleeReady = meleeArmed || meleeUnarmed` is what the driver, the program and
 the sweep gate on, because a fist is as live as a sword.
+
+**Weapon forms (2026-09-26): one stroke, one version per kind of weapon.** A
+style may carry `forms.short` / `forms.long` / `forms.blunt`, each with its own
+`frames` and `release`; `ItemDef::weaponClass` (items.json) names which one a
+weapon swings. The compass and every behaviour profile keep naming the stroke
+(`horizontal_r`); the form is resolved ONCE at the stroke's start — the
+player's press in `session.cpp` and `MobSystem::StartStroke` for NPCs, through
+`StyleLibrary::ResolveForm` — into a library entry the loader built
+(`horizontal_r@short`, and `@short:player` over the player copy), so every
+runner downstream sees an ordinary `AttackStyle`. An unauthored form is the
+style's own frames. This replaced a `playerDagger` compass whose sectors named
+the SAME styles as the sword's, so the two weapons could never differ. `player`
+blocks are jitter-only since the same day: NPCs and the player swing the same
+frames.
 
 The content that came with it: `punch_r` / `punch_l` / `hook_r` are
 `fallback: true`, so the armed profiles that now list them are behaviourally

@@ -1387,6 +1387,30 @@ class Handler(BaseHTTPRequestHandler):
                     files.append({"path": "%s/%s" % (d, n), "dir": d, "name": n,
                                   "size": os.path.getsize(full),
                                   "mtime": int(os.path.getmtime(full))})
+                if d != "mobs":
+                    continue
+                # VARIANT FOLDERS: assets/mobs/<proto>/<name>.{vox,json} is a
+                # variant of the prototype mobs/<proto>.vox (a generated
+                # character, a recolour, a zombie of somebody). Same `dir` so
+                # every "is it a mob" filter keeps working; `variantOf` names
+                # the prototype, and `path` is the one to fetch. effects/ and
+                # pool/ are not bodies you pick: src/game/sidecar.h
+                # IsVariantDir is the same rule.
+                for sub in names:
+                    subdir = os.path.join(absdir, sub)
+                    if (sub in ("effects", "pool") or sub.startswith(".")
+                            or not os.path.isdir(subdir)):
+                        continue
+                    for n in sorted(os.listdir(subdir)):
+                        if os.path.splitext(n)[1].lower() not in MODEL_EXTS:
+                            continue
+                        full = os.path.join(subdir, n)
+                        if not os.path.isfile(full):
+                            continue
+                        files.append({"path": "%s/%s/%s" % (d, sub, n),
+                                      "dir": d, "name": n, "variantOf": sub,
+                                      "size": os.path.getsize(full),
+                                      "mtime": int(os.path.getmtime(full))})
             return self._json(200, {"ok": True, "dirs": list(MODEL_DIRS),
                                     "files": files})
 

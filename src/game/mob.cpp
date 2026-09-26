@@ -469,7 +469,7 @@ constexpr int kMaxSidecarExtends = sidecar::kMaxExtends;
 static std::string ModelStemFor(const std::string& dir, const std::string& stem,
                                 int depth) {
   if (depth > kMaxSidecarExtends) return stem;
-  const std::string jp = (std::filesystem::path(dir) / (stem + ".json")).string();
+  const std::string jp = sidecar::StemPath(dir, stem, ".json");
   std::ifstream f(jp);
   if (!f) return stem;
   json j;
@@ -509,18 +509,56 @@ static std::vector<MobSource> CollectMobSources(const std::string& dir,
                                                 std::error_code& ec) {
   std::vector<MobSource> src;
   std::vector<std::string> voxStems, jsonStems;
-  for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
-    if (!e.is_regular_file()) continue;
-    const std::string ext = e.path().extension().string();
-    if (ext == ".vox") voxStems.push_back(e.path().stem().string());
-    else if (ext == ".json") jsonStems.push_back(e.path().stem().string());
-  }
+  // WHERE each stem lives: the root (a prototype) or one variant folder
+  // (sidecar.h "PROTOTYPES AND VARIANTS"). Keyed by stem because a def is
+  // named for its stem wherever it is filed, which is also why a stem filed
+  // twice is refused rather than numbered: `extends: "zeus"` has to mean one
+  // file. The root is scanned first, so a root file wins a collision.
+  std::map<std::string, std::filesystem::path> voxAt, jsonAt;
+  auto scan = [&](const std::filesystem::path& d) {
+    std::error_code sec;
+    for (auto& e : std::filesystem::directory_iterator(d, sec)) {
+      if (!e.is_regular_file()) continue;
+      const std::string ext = e.path().extension().string();
+      if (ext != ".vox" && ext != ".json") continue;
+      const std::string stem = e.path().stem().string();
+      auto& at = ext == ".vox" ? voxAt : jsonAt;
+      auto [it, fresh] = at.emplace(stem, e.path());
+      if (!fresh)
+        log += e.path().string() + ": a mob named \"" + stem +
+               "\" is already filed at " + it->second.string() +
+               " — ignored. A def is named for its stem wherever it is filed, "
+               "so stems must be unique across mobs/ and its variant "
+               "folders.\n";
+    }
+    return sec;
+  };
+  ec = scan(dir);
   if (ec) return src;
+  {
+    std::vector<std::filesystem::path> subs;
+    std::error_code sec;
+    for (auto& e : std::filesystem::directory_iterator(dir, sec))
+      if (e.is_directory() &&
+          sidecar::IsVariantDir(e.path().filename().string()))
+        subs.push_back(e.path());
+    std::sort(subs.begin(), subs.end());
+    for (const auto& d : subs) scan(d);
+  }
+  for (auto& kv : voxAt) voxStems.push_back(kv.first);
+  for (auto& kv : jsonAt) jsonStems.push_back(kv.first);
   // Sorted for a stable hot-reload order, which is also a stable def INDEX
   // order — the spawn UI and every save file address defs by index.
   std::sort(voxStems.begin(), voxStems.end());
   std::sort(jsonStems.begin(), jsonStems.end());
   auto path = [&](const std::string& stem, const char* ext) {
+    const bool vox = std::string(ext) == ".vox";
+    const auto& at = vox ? voxAt : jsonAt;
+    if (auto it = at.find(stem); it != at.end()) return it->second.string();
+    // Unpaired: the partner would sit beside the file that does exist.
+    const auto& other = vox ? jsonAt : voxAt;
+    if (auto ot = other.find(stem); ot != other.end())
+      return (ot->second.parent_path() / (stem + ext)).string();
     return (std::filesystem::path(dir) / (stem + ext)).string();
   };
   auto hasVox = [&](const std::string& s) {
@@ -562,7 +600,8 @@ static std::vector<MobSource> CollectMobSources(const std::string& dir,
     if (model == s) continue;  // no `model`, no `extends`: a shared table
     if (!hasVox(model)) {
       log += path(s, ".json") + ": wears model \"" + model +
-             "\", and there is no " + model + ".vox in this directory\n";
+             "\", and there is no " + model +
+             ".vox in mobs/ or its variant folders\n";
       continue;
     }
     src.push_back({s, path(model, ".vox"), path(s, ".json")});
@@ -4240,11 +4279,16 @@ bool Mob::GroundHeightAt(World& world, int wx, int wz, int yFrom,
     }
     const uint32_t lx = (uint32_t)(wx & 15), ly = (uint32_t)(y & 15),
                    lz = (uint32_t)(wz & 15);
-    const uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
+    const uint32_t w = cc->voxels[(lz * kChunk + ly) * kChunk + lx];
+    const uint32_t mat = w & 0xFFF;
     // solids/powders carry weight; liquids/gases don't (creatures wade, not
-    // walk on blood pools)
+    // walk on blood pools). A PARTIAL powder cell ROUNDS (kPowderMobSupportMin):
+    // a creature's ground is a whole cell height everywhere downstream, so
+    // half a cell of grains or more is ground and less is sunk into.
     if (mat != 0 && mat < cls.size() &&
-        (cls[mat] == CLASS_SOLID || cls[mat] == CLASS_POWDER)) {
+        (cls[mat] == CLASS_SOLID ||
+         (cls[mat] == CLASS_POWDER &&
+          PowderMassOfState((w >> 12) & 0xFu) >= kPowderMobSupportMin))) {
       lastMat = mat;
       return true;
     }
@@ -4325,10 +4369,13 @@ bool Mob::CellSupportsWeightIn(const CachedChunk* cc, IVec3 cell) const {
   if (cc == nullptr || cc->voxels.size() != kChunkVol) return false;  // unknown = open
   const uint32_t lx = (uint32_t)(cell.x & 15), ly = (uint32_t)(cell.y & 15),
                  lz = (uint32_t)(cell.z & 15);
-  const uint32_t mat = cc->voxels[(lz * kChunk + ly) * kChunk + lx] & 0xFFF;
+  const uint32_t w = cc->voxels[(lz * kChunk + ly) * kChunk + lx];
+  const uint32_t mat = w & 0xFFF;
   const std::vector<uint32_t>& cls = ClassOf();
   if (mat == 0 || mat >= cls.size()) return false;
-  return cls[mat] == CLASS_SOLID || cls[mat] == CLASS_POWDER;
+  return cls[mat] == CLASS_SOLID ||
+         (cls[mat] == CLASS_POWDER &&
+          PowderMassOfState((w >> 12) & 0xFu) >= kPowderMobSupportMin);
 }
 
 Mob::Footing Mob::FootprintFooting(World& world, const MobDef& def, float cx,
@@ -5588,6 +5635,12 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
 // ============================================================================
 void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
                             Vec3 targetPoint, uint32_t tick, uint32_t seed) {
+  // THE HELD WEAPON'S OWN VERSION of the stroke (strokes.h WEAPON FORMS):
+  // the same resolve the player's press does, so a dagger in an NPC's fist
+  // swings the dagger form the player's does.
+  if (items_ != nullptr)
+    if (const ItemDef* held = items_->Named(mob.HeldItem()))
+      styleIndex = styles_.ResolveForm(styleIndex, WeaponFormOf(held->weaponClass));
   const AttackStyle& sty = *styles_.At(styleIndex);
   NpcStroke& st = mob.stroke_;
   st = NpcStroke{};
@@ -6002,9 +6055,7 @@ void MobSystem::ClearGuard(uint64_t mobId) {
   Mob* m = FindMobById(mobId);
   if (m == nullptr) return;
   if (m->stroke_.phase != NpcStroke::Phase::Guard) return;
-  m->stroke_.phase = NpcStroke::Phase::Recover;
-  m->stroke_.phaseTick = 0;
-  m->stroke_.recoverTicks = 8;
+  m->stroke_.StartRelease(8);
   // A DROPPED GUARD IS NOT A STYLE'S RETURN. There is no stroke program behind
   // this recover — no style, and therefore no authored stance to be driven
   // back to — so it releases on the first tick and fades, which is what
@@ -6348,9 +6399,8 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
       break;
   }
   // The style's per-joint brakes ride the pose to the rig (melee.h ArmSmooth).
-  WeaponPose wp = st.melee.Pose();
-  if (sty != nullptr) wp.smooth = sty->joints;
-  mob.SetWeaponPose(wp);
+  // ...with a KEYED style's joints and torso (strokes.h "A FRAME IS A POSE").
+  mob.SetWeaponPose(StrokePoseNow(st, sty, st.melee));
 }
 
 void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
@@ -14909,7 +14959,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           worldOf(vp) + Rotate(q, Vec3{(float)d.x * inv, (float)d.y * inv,
                                        (float)d.z * inv});
       emitCell({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, prod & 0xFFFu,
-               (rr >> 8u) % 3u);
+               (prod & 0xFFFu) < matGpu_.size() &&
+                       matGpu_[prod & 0xFFFu].klass == CLASS_POWDER
+                   ? PowderCrumbleState(rr >> 4u)
+                   : (rr >> 8u) % 3u);
     };
     // A HELD coat (the substrate absorbs: materials.json `absorb`) is liquid
     // in the voxel and leaves with any rewrite of it, as on the ground; a FILM
@@ -15241,7 +15294,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         for (int k = 0; k < nc2; k++) {
           const IVec3 t{ifloor(wv.x) + cnd[k].x, ifloor(wv.y) + cnd[k].y,
                         ifloor(wv.z) + cnd[k].z};
-          emitCell(t, r.prodNbr, (rr >> 8u) % 3u);
+          emitCell(t, r.prodNbr,
+                   r.prodNbr < matGpu_.size() && matGpu_[r.prodNbr].klass == CLASS_POWDER
+                       ? PowderCrumbleState(rr >> 4u)
+                       : (rr >> 8u) % 3u);
           fired = true;  // the rule is consumed even if the budget refused
           break;
         }
@@ -26334,6 +26390,13 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   // beside), so an aim written from here would be a write nobody reads.
   // Mob::ApplyStrikeAim, called at stage 3.5, is where it happens.
   if (effMode == StrikeEffectorMode::Aim) return;
+  // THE RELEASE IS NOT SOLVED: SmoothWeaponArm turns the arm's joints from
+  // the last driven pose to the animation's (WeaponPose::release), and it
+  // needs this stage to leave the animation's arm in st.model.
+  if (weapon_.release >= 0.0f) return;
+  // ...AND NEITHER IS A KEYED POSE (strokes.h "A FRAME IS A POSE"):
+  // SmoothWeaponArm writes the frames' joints, and there is nothing to solve.
+  if (weapon_.keyed.on) return;
 
   if (sk.chains.empty()) return;
   if ((size_t)effPart >= sk.parts.size()) return;
@@ -26657,16 +26720,69 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   }
 }
 
+// RE-FLATTEN THE ARM'S SUBTREE with the given locals. Parents-first storage
+// makes it one sweep from the shoulder: every part keeps its transform
+// RELATIVE TO ITS PARENT (so the sword and a gauntlet shell ride the hand
+// rigidly), except the three joints, whose relative rotation is replaced.
+void Mob::ReflattenArm(const AnimSkeleton& sk, AnimState& st,
+                       const int (&parts)[kArmJoints],
+                       const Quat (&got)[kArmJoints]) const {
+  const size_t n = std::min(sk.parts.size(), st.model.size());
+  const int root = parts[kArmShoulder];
+  if (root < 0 || (size_t)root >= n) return;
+  static thread_local std::vector<Transform> old;
+  old.assign(st.model.begin(), st.model.begin() + (std::ptrdiff_t)n);
+  static thread_local std::vector<uint8_t> moved;
+  moved.assign(n, 0);
+  for (size_t i = (size_t)root; i < n; i++) {
+    const int par = sk.parts[i].parent;
+    if ((int)i != root && (par < 0 || !moved[par])) continue;
+    moved[i] = 1;
+    if (par < 0 || (size_t)par >= n) continue;
+    Quat rel = QuatNormalize(QuatMul(QuatConj(old[par].rot), old[i].rot));
+    const Vec3 relPos = QuatRotateInv(old[par].rot, old[i].pos - old[par].pos);
+    for (int k = 0; k < kArmJoints; k++)
+      if (parts[k] == (int)i) rel = got[k];
+    st.model[i].rot = QuatNormalize(QuatMul(st.model[par].rot, rel));
+    st.model[i].pos = st.model[par].pos + QuatRotate(st.model[par].rot, relPos);
+  }
+}
+
+// A KEYED POSE IS NOT CLAMPED (strokes.h "A FRAME IS A POSE"). The frames are
+// the author's arm, and the stage-6 clamp projecting them onto the rig's
+// authored hinge and ball limits changed the arm BETWEEN two frames that were
+// each legal on their own -- the slerp crosses a limit's edge and the
+// projection jumps: measured in the tuner as 80-140 degree single-tick hand
+// turns mid-cut on horizontal_r, gone with this. So the clamp runs for the
+// rest of the body and the keyed arm is written again after it (rig.js
+// reapplyKeyedArm). Limits are the author's to respect while posing.
+void Mob::ReapplyKeyedArm(const AnimSkeleton& sk, AnimState& st) const {
+  const ArmSmoothState& S = armSmooth_;
+  if (!S.keyedNow) return;
+  ReflattenArm(sk, st, S.keyedPart, S.keyedGot);
+}
+
 void Mob::SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt) {
   ArmSmoothState& S = armSmooth_;
+  S.keyedNow = false;
   // WHICH BRAKES. The live pose's while it states any; after the stroke ends
   // (the caller pushes an empty WeaponPose) the LAST ones stay in force until
   // the arm has caught up with the pose it is being handed back to, because
   // dropping them with a lag outstanding is a one-tick snap of exactly the
   // size the brake was hiding.
-  const bool asked = weaponWeight_ > 0.0f && weapon_.smooth.Any();
+  // THE RELEASE (WeaponPose::release) takes this stage over; the brakes are
+  // off for it, and restart fresh when the next stroke drives the arm.
+  const bool releasing = weapon_.release >= 0.0f && weaponWeight_ > 0.0f;
+  const bool driven = weaponWeight_ > 0.0f && !releasing;
+  const bool keyed = driven && weapon_.keyed.on;
+  const bool asked = driven && weapon_.smooth.Any();
   if (asked) S.params = weapon_.smooth;
-  else if (!S.valid) return;
+  else if (!S.valid && !driven && !releasing) {
+    S.lastValid = false;
+    S.relActive = false;
+    S.keyLiveValid = false;
+    return;
+  }
 
   // THE THREE JOINTS: the weapon chain's upper and lower bones, and the hand
   // (skipped when the chain's lower bone IS the hand). The same resolution
@@ -26692,6 +26808,8 @@ void Mob::SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt) {
     if (parts[k] >= 0 && (size_t)parts[k] >= n) parts[k] = -1;
   if (parts[kArmShoulder] < 0 || parts[kArmElbow] < 0) {
     S.valid = false;
+    S.lastValid = false;
+    S.relActive = false;
     return;
   }
   // A DIFFERENT ARM (effector swapped, rig rebuilt) is a fresh start, not a
@@ -26713,24 +26831,98 @@ void Mob::SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt) {
   Quat want[kArmJoints]{};
   for (int k = 0; k < kArmJoints; k++)
     if (parts[k] >= 0) want[k] = localOf(parts[k]);
-  if (!S.valid) {
+
+  // ---- A KEYED POSE (strokes.h "A FRAME IS A POSE") ------------------------
+  // `want` becomes the frames' joints, slerped; the brakes below still see it
+  // as the pose asked for. ApplyWeaponArm solved nothing, so until this
+  // replaces it `want` is the animation's arm -- which is exactly the arm a
+  // stroke that starts from rest takes over from.
+  if (keyed) {
+    const WeaponPose::Keyed& K = weapon_.keyed;
+    if (K.fromLive) {
+      if (!S.keyLiveValid) {
+        bool same = S.lastValid;
+        for (int k = 0; k < kArmJoints; k++) same = same && S.lastPart[k] == parts[k];
+        for (int k = 0; k < kArmJoints; k++) S.keyLive[k] = same ? S.last[k] : want[k];
+        S.keyLiveValid = true;
+      }
+    } else {
+      S.keyLiveValid = false;
+    }
+    // The whole arm turned about the shoulder in the BODY's frame: a rotation
+    // R of the upper arm's model rotation is conj(P) R P on its local.
+    const int par0 = sk.parts[parts[kArmShoulder]].parent;
+    const Quat P = par0 >= 0 && (size_t)par0 < n ? st.model[par0].rot : Quat{0, 0, 0, 1};
+    auto aimed = [&](const Quat& q, float yaw, float pitch) {
+      if (yaw == 0.0f && pitch == 0.0f) return q;
+      const Quat R = QuatMul(QuatAxisAngle({0, 1, 0}, -yaw),
+                             QuatAxisAngle({1, 0, 0}, -pitch));
+      return QuatNormalize(QuatMul(QuatConj(P), QuatMul(R, QuatMul(P, q))));
+    };
+    for (int k = 0; k < kArmJoints; k++) {
+      if (parts[k] < 0 || !K.hasJoint[k]) continue;   // unkeyed: the animation's
+      Quat from = K.fromLive ? S.keyLive[k] : K.from[k];
+      Quat to = K.to[k];
+      if (k == kArmShoulder) {
+        from = aimed(from, K.aimFromYaw, K.aimFromPitch);
+        to = aimed(to, K.aimToYaw, K.aimToPitch);
+      }
+      want[k] = QuatNormalize(QuatSlerp(from, to, K.t));
+    }
+  } else {
+    S.keyLiveValid = false;
+  }
+  Quat got[kArmJoints]{};
+
+  // ---- THE RELEASE: every joint turns from the last driven pose to the
+  // animation's, by the eased progress. `want` IS the animation's arm here:
+  // ApplyWeaponArm solved nothing this tick.
+  if (releasing) {
+    if (!S.relActive) {
+      bool same = S.lastValid;
+      for (int k = 0; k < kArmJoints; k++) same = same && S.lastPart[k] == parts[k];
+      // Nothing recorded to turn from (the arm changed): the animation, as is.
+      if (!same) { S.valid = false; return; }
+      for (int k = 0; k < kArmJoints; k++) S.relFrom[k] = S.last[k];
+      S.relActive = true;
+      // A release out of a KEYED pose is not clamped either
+      // (ReapplyKeyedArm): its first tick is that pose, never clamped.
+      S.relKeyed = S.lastKeyed;
+    }
+    for (int k = 0; k < kArmJoints; k++)
+      if (parts[k] >= 0)
+        got[k] = QuatNormalize(QuatSlerp(S.relFrom[k], want[k], weapon_.release));
+    S.valid = false;
+    S.lastValid = false;
+  } else {
+  S.relActive = false;
+  // Driven with no brakes: nothing to change, only the joints to remember.
+  // (A keyed pose goes on to the re-flatten: nothing else has written it.)
+  if (!asked && !S.valid) {
+    for (int k = 0; k < kArmJoints; k++) { S.last[k] = want[k]; S.lastPart[k] = parts[k]; }
+    S.lastValid = driven;
+    if (!keyed) return;
+    for (int k = 0; k < kArmJoints; k++) got[k] = want[k];
+  } else if (!S.valid) {
     // SEED FROM THE LIVE POSE: the first braked tick changes nothing, so
     // turning a brake on never jumps the arm.
     for (int k = 0; k < kArmJoints; k++) {
       S.part[k] = parts[k];
       S.prev[k] = want[k];
+      S.last[k] = want[k];
+      S.lastPart[k] = parts[k];
     }
+    S.lastValid = driven;
     S.valid = asked;
-    return;
-  }
-
+    if (!keyed) return;
+    for (int k = 0; k < kArmJoints; k++) got[k] = want[k];
+  } else {
   // Frame-rate independent: the brakes are authored per 30 Hz TICK.
   const float ticks = std::max(dt * 30.0f, 0.0f);
   auto angleBetween = [](const Quat& a, const Quat& b) {
     const float d = std::fabs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
     return 2.0f * std::acos(std::min(1.0f, d));
   };
-  Quat got[kArmJoints]{};
   float lagMax = 0.0f;
   for (int k = 0; k < kArmJoints; k++) {
     if (parts[k] < 0) continue;
@@ -26757,29 +26949,22 @@ void Mob::SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt) {
   }
   // Released and caught up (under a fifth of a degree everywhere): done.
   if (!asked && lagMax < 0.0035f) S.valid = false;
-
-  // RE-FLATTEN THE ARM'S SUBTREE with the braked locals. Parents-first
-  // storage makes it one sweep from the shoulder: every part keeps its
-  // transform RELATIVE TO ITS PARENT (so the sword and a gauntlet shell ride
-  // the hand rigidly), except the three joints, whose relative rotation is
-  // replaced.
-  static thread_local std::vector<Transform> old;
-  old.assign(st.model.begin(), st.model.begin() + (std::ptrdiff_t)n);
-  static thread_local std::vector<uint8_t> moved;
-  moved.assign(n, 0);
-  const int root = parts[kArmShoulder];
-  for (size_t i = (size_t)root; i < n; i++) {
-    const int par = sk.parts[i].parent;
-    if ((int)i != root && (par < 0 || !moved[par])) continue;
-    moved[i] = 1;
-    if (par < 0 || (size_t)par >= n) continue;
-    Quat rel = QuatNormalize(QuatMul(QuatConj(old[par].rot), old[i].rot));
-    const Vec3 relPos = QuatRotateInv(old[par].rot, old[i].pos - old[par].pos);
-    for (int k = 0; k < kArmJoints; k++)
-      if (parts[k] == (int)i) rel = got[k];
-    st.model[i].rot = QuatNormalize(QuatMul(st.model[par].rot, rel));
-    st.model[i].pos = st.model[par].pos + QuatRotate(st.model[par].rot, relPos);
+  // What the release will turn from: the arm as this driven tick left it.
+  for (int k = 0; k < kArmJoints; k++) {
+    S.last[k] = parts[k] >= 0 ? got[k] : want[k];
+    S.lastPart[k] = parts[k];
   }
+  S.lastValid = driven;
+  }
+  }
+
+  ReflattenArm(sk, st, parts, got);
+  // A KEYED arm is written again AFTER the stage-6 clamp (ReapplyKeyedArm):
+  // the pose is the author's, exactly, at every tick.
+  if (driven) S.lastKeyed = keyed;
+  S.keyedNow = keyed || (releasing && S.relKeyed);
+  if (S.keyedNow)
+    for (int k = 0; k < kArmJoints; k++) { S.keyedPart[k] = parts[k]; S.keyedGot[k] = got[k]; }
   // The clamp diagnostics compare against a PRE-CLAMP snapshot ApplyWeaponArm
   // took before this ran; retake it so the braking is not reported as clamp
   // movement.

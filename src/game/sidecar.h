@@ -70,6 +70,7 @@
 // can diff the two languages against each other.
 //
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
@@ -99,6 +100,32 @@ void ApplyEffect(json& def, const json& effect, const std::string& where,
 // Read + parse one sidecar. False (with a line in `log`) if it is missing,
 // unparseable, or not an object.
 bool ReadJsonDoc(const std::string& path, json& out, std::string& log);
+
+// ---- PROTOTYPES AND VARIANTS: where a stem lives --------------------------
+//
+// `assets/mobs/<proto>.{vox,json}` is a PROTOTYPE (human, critter, dummy);
+// `assets/mobs/<proto>/<name>.{vox,json}` is a VARIANT of it — a generated
+// character, a recolour, a zombie of somebody. The folder is filing, not
+// semantics: a def is still named for its sidecar's STEM, `extends`/`model`
+// still name stems, and a stem must be unique across the root and every
+// variant folder (the loader says so when it is not). What the folder buys is
+// the authoring picker: open the prototype, then pick a variant of it.
+//
+// Two subfolders are not variant folders: `effects/` (modifiers, not bodies)
+// and `pool/` (the random-human pool, built at runtime by `pool:` name).
+bool IsVariantDir(const std::string& name);
+
+// The file for `stem` + `ext` (".json" / ".vox"): `<dir>/<stem><ext>` if it
+// exists, else the first `<dir>/<sub>/<stem><ext>` over the variant folders in
+// name order, else `<dir>/<stem><ext>` (so a miss reports the root path).
+std::string StemPath(const std::string& dir, const std::string& stem,
+                     const char* ext);
+
+// Every `<ext>` file filed in `dir` or one of its variant folders, as
+// {stem, path}, sorted by stem. A stem filed twice keeps the root copy (then
+// the first variant folder in name order) — CollectMobSources says so loudly.
+std::vector<std::pair<std::string, std::string>> ListStems(
+    const std::string& dir, const char* ext);
 
 // THE ONE ENTRY POINT. Resolve `<dir>/<path>`'s `extends` chain, then apply its
 // accumulated `effects` from `<dir>/effects/<name>.json`, into `out`.

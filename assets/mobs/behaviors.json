@@ -75,7 +75,7 @@
       "hysteresis": 0.28,
       "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
       "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30 },
-      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26, "pursueSpeed": 0.7, "leadTicks": 15 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diag_tr_bl", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26, "pursueSpeed": 0.7, "leadTicks": 15 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
@@ -109,7 +109,7 @@
       "hysteresis": 0.28,
       "perception": { "sightRange": 46, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 180, "keepRangeScale": 1.45 },
       "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.5, "retreatSpeed": 0.75, "circleTendency": 0.75, "circleHoldTicks": 34, "repathTicks": 10, "navRadius": 30 },
-      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diagonal", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26, "pursueSpeed": 0.7, "leadTicks": 15 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diag_tr_bl", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 22, "commitTicks": 10, "disengageTicks": 26, "pursueSpeed": 0.7, "leadTicks": 15 },
       "intents": {
         "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
         "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },

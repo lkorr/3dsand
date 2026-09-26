@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "game/camera.h"
+#include "game/player.h"
 #include "gpu/resources.h"
 #include "sim/celestial.h"
 #include "test/selftest.h"
@@ -1886,7 +1887,9 @@ Status GateRepose(Ctx& c, std::string& detail) {
     for (int z = cz - kColHalf; z <= cz + kColHalf; z++)
       for (int x = cx - kColHalf; x <= cx + kColHalf; x++)
         pour.push_back({World::SlotCellIndex({x, y, z}), dustId & 0xFFFu});
-  const uint32_t poured = (uint32_t)pour.size();
+  // In EIGHTHS (powder mass): with sim.powderFineRepose a pile sheds partial
+  // cells, so "400 grains" is 3,200 eighths spread over more than 400 cells.
+  const uint32_t poured = (uint32_t)pour.size() * kPowderFull;
 
   // The idle check is LOCAL: the rest of the generated world may still be
   // settling at these tick counts and would swamp a global count.
@@ -1982,7 +1985,7 @@ Status GateRepose(Ctx& c, std::string& detail) {
             const int dx = x - cx, dz = z - cz;
             if (dx < -kR || dx > kR || dz < -kR || dz > kR) continue;
             if (y <= kFloorTop || y >= kCeil) continue;
-            mass[a]++;
+            mass[a] += PowderMassOfState((cbuf[k] >> 12) & 0xFu);
             // A hash of WHERE the grains ended up, not of the whole world: it
             // isolates the pile, so "this arm built a different pile" is a
             // claim about repose and not about anything else the tick did.
@@ -2220,6 +2223,112 @@ Status GatePowderMass(Ctx& c, std::string& detail) {
                  {10, 7, 10}, false, false);
     ctx.WaitIdle();
   }
+  // One offscreen frame of the world at `target`, from above and to one side
+  // (world coords), written to `file`.
+  auto renderShot = [&](const Vec3& target, float dist, const char* file) {
+    const uint32_t W = 1280, H = 720;
+    rhi::Texture tex = ctx.device.CreateTexture(
+        {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+        "powderShotTex");
+    Camera cam2;
+    cam2.yaw = -2.356f;
+    cam2.pitch = -0.62f;
+    const Vec3 eye{target.x + dist, target.y + dist * 0.9f, target.z + dist};
+    // Mid-morning, scanned rather than hardcoded (the shadow-cache gate says
+    // why): a sun about 35 degrees up, so the half-cell steps cast shadows.
+    uint32_t lightTick = 0;
+    {
+      float bestErr = 9.0f;
+      for (uint32_t tt = 0; tt < 200000u; tt += 64u) {
+        const float up = ComputeSky(CurrentTuning(), (double)tt).sunDir[1];
+        const float err = std::fabs(up - 0.57f);
+        if (err < bestErr) { bestErr = err; lightTick = tt; }
+      }
+    }
+    // A few frames first: the shadow cache and the GI charge converge over
+    // frames, and the first one shows them half-built.
+    for (int f = 0; f < 12; f++) {
+      WriteRenderParams(ctx.queue, world, eye, cam2, (float)W / H, true, 0,
+                        kFarFogDensity, (float)H, lightTick);
+      rhi::CommandEncoder e0 = ctx.device.CreateCommandEncoder();
+      rhi::RenderPass r0 = sim.BeginRenderPass(
+          e0, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
+      sim.DrawWorld(r0);
+      r0.End();
+      ctx.queue.Submit(e0.Finish());
+      ctx.WaitIdle();
+    }
+    WriteRenderParams(ctx.queue, world, eye, cam2, (float)W / H, true, 0,
+                      kFarFogDensity, (float)H, lightTick);
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    rhi::RenderPass rp = sim.BeginRenderPass(
+        enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
+    sim.DrawWorld(rp);
+    rp.End();
+    rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
+                                    rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                    "powderShot");
+    rhi::TexelCopyTexture srcT{};
+    srcT.texture = tex;
+    rhi::TexelCopyBuffer dstB{};
+    dstB.buffer = shot;
+    dstB.bytesPerRow = W * 4;
+    dstB.rowsPerImage = H;
+    rhi::Extent3D ext{W, H, 1};
+    enc.CopyTextureToBuffer(srcT, dstB, ext);
+    ctx.queue.Submit(enc.Finish());
+    std::vector<uint8_t> pixels((size_t)W * H * 4);
+    if (rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(), pixels.size()) &&
+        WriteBmpFile(file, pixels, W, H))
+      std::printf("powder-mass: wrote %s\n", file);
+  };
+
+  // ---- GENERATED GRAINS (P5): does worldgen lay partial tops, and are they
+  // still where it put them after the settle? Counted over a 5x5-chunk
+  // surface patch around the site, BEFORE the room is carved into it. The
+  // count is reported, not asserted (the site's biome decides it); what IS
+  // asserted is that none of them moved: every partial top still has air
+  // above it and nothing of its own material beside it lower down... which
+  // is what `terrain`/`gen-settle` already hold the whole map to, so here it
+  // is only the number that says the feature reached the ground at all.
+  uint32_t genPartials = 0, genPowderTops = 0;
+  bool haveDune = false;
+  IVec3 dune{};
+  {
+    std::vector<uint32_t> gb((size_t)kChunkVol);
+    const int gy0 = (kFloorTop - 12) >> 4, gy1 = (kFloorTop + 4) >> 4;
+    for (int qz = (cz >> 4) - 2; qz <= (cz >> 4) + 2; qz++)
+      for (int qy = gy0; qy <= gy1; qy++)
+        for (int qx = (cx >> 4) - 2; qx <= (cx >> 4) + 2; qx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({qx, qy, qz}), 1,
+                         gb.data(), "powderMassGen");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            const uint32_t w = gb[k], m = w & 0xFFFu;
+            if (m == 0 || m >= c.mats.size() || c.mats[m].gpu.klass != CLASS_POWDER) continue;
+            // the cell above (same chunk only: good enough for a count)
+            if (((k / 16) % 16) == 15) continue;
+            if ((gb[k + 16] & 0xFFFu) != 0u) continue;
+            genPowderTops++;
+            if (PowderStateIsPartial((w >> 12) & 0xFu)) {
+              genPartials++;
+              if (!haveDune) {
+                haveDune = true;
+                dune = IVec3{(int)(k % 16) + qx * 16, (int)((k / 16) % 16) + qy * 16,
+                             (int)(k / 256) + qz * 16};
+              }
+            }
+          }
+        }
+  }
+  std::printf("powder-mass: generated surface around the site: %u powder tops, "
+              "%u of them partial (sim.powderFineRepose %d)\n",
+              genPowderTops, genPartials, CurrentTuning().sim.powderFineRepose);
+  // A generated partial top, close up, before anything is built near it.
+  if (haveDune)
+    renderShot(Vec3{(float)toWorld(dune.x, wo.x) + 0.5f, (float)toWorld(dune.y, wo.y),
+                    (float)toWorld(dune.z, wo.z) + 0.5f},
+               7.0f, "screenshot_powder_dune.bmp");
 
   std::vector<uint32_t> flags(kNumChunks, 0);
   std::vector<uint32_t> cbuf((size_t)kChunkVol);
@@ -2308,66 +2417,59 @@ Status GatePowderMass(Ctx& c, std::string& detail) {
 
   // ---- arm C, rendered: the settled dusting from above and to one side ----
   // (world coords: the room was built at SLOT coords, like the other CA gates)
+  renderShot(Vec3{(float)toWorld(cx, wo.x) + 0.5f, (float)toWorld(kFloorTop + 2, wo.y),
+                  (float)toWorld(cz, wo.z) + 0.5f},
+             11.0f, "screenshot_powder.bmp");
+
+  // ---- arm D: the player stands ON grains (pure CPU, no GPU) --------------
+  // Player::TopFn (P4 slab collision): a partial powder cell is solid only up
+  // to y + mass/8. Row 100 is 4/8 for x < 150, 6/8 for 150..159 and whole
+  // past 160, where row 101 carries 3/8 more. Drop the body at x 140.5, then
+  // walk +x across both steps: the sole must land on each grain top, not on
+  // the cell boundary above it. And KindOfWord's film rule: 2/8 is walked
+  // through, 3/8 carries weight.
+  bool slabOk = true;
+  float feetA = 0, feetB = 0, feetC = 0;
   {
-    const Vec3 target{(float)toWorld(cx, wo.x) + 0.5f,
-                      (float)toWorld(kFloorTop + 2, wo.y),
-                      (float)toWorld(cz, wo.z) + 0.5f};
-    const uint32_t W = 1280, H = 720;
-    rhi::Texture tex = ctx.device.CreateTexture(
-        {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
-        rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
-        "powderShotTex");
-    Camera cam2;
-    cam2.yaw = -2.356f;
-    cam2.pitch = -0.62f;
-    const Vec3 eye{target.x + 11.0f, target.y + 10.0f, target.z + 11.0f};
-    // Mid-morning, scanned rather than hardcoded (the shadow-cache gate says
-    // why): a sun about 35 degrees up, so the half-cell steps cast shadows.
-    uint32_t lightTick = 0;
-    {
-      float bestErr = 9.0f;
-      for (uint32_t tt = 0; tt < 200000u; tt += 64u) {
-        const float up = ComputeSky(CurrentTuning(), (double)tt).sunDir[1];
-        const float err = std::fabs(up - 0.57f);
-        if (err < bestErr) { bestErr = err; lightTick = tt; }
-      }
-    }
-    // A few frames first: the shadow cache and the GI charge converge over
-    // frames, and the first one shows them half-built.
-    for (int f = 0; f < 12; f++) {
-      WriteRenderParams(ctx.queue, world, eye, cam2, (float)W / H, true, 0,
-                        kFarFogDensity, (float)H, lightTick);
-      rhi::CommandEncoder e0 = ctx.device.CreateCommandEncoder();
-      rhi::RenderPass r0 = sim.BeginRenderPass(
-          e0, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
-      sim.DrawWorld(r0);
-      r0.End();
-      ctx.queue.Submit(e0.Finish());
-      ctx.WaitIdle();
-    }
-    WriteRenderParams(ctx.queue, world, eye, cam2, (float)W / H, true, 0,
-                      kFarFogDensity, (float)H, lightTick);
-    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    rhi::RenderPass rp = sim.BeginRenderPass(
-        enc, tex.CreateView(), rhi::TextureFormat::RGBA8Unorm, W, H);
-    sim.DrawWorld(rp);
-    rp.End();
-    rhi::Buffer shot = CreateBuffer(ctx.device, (uint64_t)W * H * 4,
-                                    rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
-                                    "powderShot");
-    rhi::TexelCopyTexture srcT{};
-    srcT.texture = tex;
-    rhi::TexelCopyBuffer dstB{};
-    dstB.buffer = shot;
-    dstB.bytesPerRow = W * 4;
-    dstB.rowsPerImage = H;
-    rhi::Extent3D ext{W, H, 1};
-    enc.CopyTextureToBuffer(srcT, dstB, ext);
-    ctx.queue.Submit(enc.Finish());
-    std::vector<uint8_t> pixels((size_t)W * H * 4);
-    if (rhi::ReadBufferBlocking(ctx.device, shot, 0, pixels.data(), pixels.size()) &&
-        WriteBmpFile("screenshot_powder.bmp", pixels, W, H))
-      std::printf("powder-mass: wrote screenshot_powder.bmp\n");
+    auto topOf = [](IVec3 c) -> float {
+      if (c.y == 100) return c.x < 150 ? 0.5f : (c.x < 160 ? 0.75f : 1.0f);
+      if (c.y == 101 && c.x >= 160) return 0.375f;
+      return 1.0f;
+    };
+    Player::KindFn kf = [](IVec3 c) {
+      if (c.y <= 100) return CellKind::Solid;
+      if (c.y == 101 && c.x >= 160) return CellKind::Solid;
+      return CellKind::Air;
+    };
+    Player p;
+    p.fly = false;
+    p.cellTop = topOf;
+    p.pos = Vec3{140.5f, 110.0f, 140.5f};
+    const Vec3 fwd{1, 0, 0}, right{0, 0, 1};
+    for (int i = 0; i < 200 && !p.grounded; i++) p.Update(0.033f, TickInput{}, fwd, right, fwd, kf);
+    for (int i = 0; i < 30; i++) p.Update(0.033f, TickInput{}, fwd, right, fwd, kf);
+    feetA = p.pos.y + p.CurrentBox().yLo;
+    TickInput walk;
+    walk.forward = 1.0f;
+    for (int i = 0; i < 600 && p.pos.x < 155.0f; i++) p.Update(0.033f, walk, fwd, right, fwd, kf);
+    for (int i = 0; i < 30; i++) p.Update(0.033f, TickInput{}, fwd, right, fwd, kf);
+    feetB = p.pos.y + p.CurrentBox().yLo;
+    for (int i = 0; i < 600 && p.pos.x < 166.0f; i++) p.Update(0.033f, walk, fwd, right, fwd, kf);
+    for (int i = 0; i < 30; i++) p.Update(0.033f, TickInput{}, fwd, right, fwd, kf);
+    feetC = p.pos.y + p.CurrentBox().yLo;
+    slabOk = std::fabs(feetA - 100.5f) < 0.05f && std::fabs(feetB - 100.75f) < 0.05f &&
+             std::fabs(feetC - 101.375f) < 0.05f;
+    // The film rule, on the word itself.
+    std::vector<uint32_t> cls(c.mats.size(), 0u);
+    for (size_t i = 0; i < c.mats.size(); i++) cls[i] = c.mats[i].gpu.klass;
+    const bool filmOk =
+        World::KindOfWord(sandId | ((2u + 2u) << 12), cls) == CellKind::Air &&
+        World::KindOfWord(sandId | ((3u + 2u) << 12), cls) == CellKind::Solid &&
+        World::KindOfWord(sandId, cls) == CellKind::Solid;
+    slabOk = slabOk && filmOk;
+    std::printf("powder-mass: arm D slab  feet %.3f / %.3f / %.3f (want 100.500 / "
+                "100.750 / 101.375), film rule %s\n", feetA, feetB, feetC,
+                filmOk ? "ok" : "WRONG");
   }
 
   const bool massA = res[0].sand == sandA && res[0].dust == 0;
@@ -2377,18 +2479,20 @@ Status GatePowderMass(Ctx& c, std::string& detail) {
   const bool sinkOk = res[1].buried == 0;
   const bool sleepOk = res[0].awake <= awakeMax && res[1].awake <= awakeMax &&
                        res[2].awake <= awakeMax;
-  const bool ok = massA && massB && massC && mergeOk && sinkOk && sleepOk;
+  const bool ok = massA && massB && massC && mergeOk && sinkOk && sleepOk && slabOk;
   detail = Format(
       "A rain: sand %u/%u eighths %s, %u partials, %u partial-under-sand %s; "
       "B sink: sand %u/%u dust %u/%u %s, %u dust-under-sand %s; C dusting: "
-      "sand %u/%u %s, %u partials, %u buried; awake %u/%u/%u (max %u) %s",
+      "sand %u/%u %s, %u partials, %u buried; awake %u/%u/%u (max %u) %s; "
+      "D slab feet %.2f/%.2f/%.2f %s",
       res[0].sand, sandA, massA ? "EXACT" : "LOST/MINTED", res[0].partials,
       res[0].buried, mergeOk ? "(compact)" : "(MERGE FAILED)", res[1].sand,
       sandB, res[1].dust, dustB, massB ? "EXACT" : "LOST/MINTED",
       res[1].buried, sinkOk ? "(risen)" : "(SINK FAILED)", res[2].sand, sandC,
       massC ? "EXACT" : "LOST/MINTED", res[2].partials, res[2].buried,
       res[0].awake, res[1].awake, res[2].awake, awakeMax,
-      sleepOk ? "asleep" : "STILL AWAKE");
+      sleepOk ? "asleep" : "STILL AWAKE", feetA, feetB, feetC,
+      slabOk ? "on the grains" : "WRONG");
   std::printf("powder-mass: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

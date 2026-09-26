@@ -993,6 +993,10 @@ bool LoadGlyphs(const std::string& path, const std::vector<MaterialDef>& mats,
   }
   out.arcane.resize(mats.size(), 0);
   for (size_t i = 0; i < mats.size(); i++) out.arcane[i] = mats[i].arcane;
+  out.crumbles.assign(mats.size(), 0);
+  for (size_t i = 0; i < mats.size(); i++)
+    out.crumbles[i] = mats[i].gpu.klass == CLASS_POWDER &&
+                      (mats[i].gpu.flags & kMatFlagWander) == 0u;
   return true;
 }
 
@@ -2861,8 +2865,12 @@ void ApplySpellEffect(const GlyphLibrary& lib, const std::vector<EffectInst>& pa
           s.vy = (int32_t)((int64_t)dirFx.y * sp / len + jit(0x85EBu) * cone / 32768);
           s.vz = (int32_t)((int64_t)dirFx.z * sp / len + jit(0xC2B2u) * cone / 32768);
           // A FULL-SIZE particle, not a micro droplet: real voxels of matter
-          // that must land in the grid and stay there.
+          // that must land in the grid and stay there. A POWDER spray lands as
+          // a CRUMBLE (world.h POWDER ENTERS THE WORLD AS GRAINS).
           s.payload = mat & 0xFFFu;
+          if (lib.Crumbles(mat))
+            s.payload |= PowderCrumbleState(Hash3((uint32_t)atFx.x, (uint32_t)atFx.y,
+                                                  (uint32_t)atFx.z)) << 12;
           s.flags = kPFlagAlive;
           out.spawns.push_back(s);
         }

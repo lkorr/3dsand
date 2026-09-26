@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "game/anim.h"   // Quat, for WeaponPose::Keyed
 #include "game/item.h"
 #include "math3d.h"
 
@@ -440,6 +441,12 @@ struct MeleeTuning {
   // weapon exactly what it would have cost their arm, which is too much: an arm
   // absorbs a cut by being cut, a blade absorbs it by being a blade.
   float blockItemDamage = 0.35f;
+  // THE SWEEP'S DENSITY (MeleeSweepDamage): the widest gap, world voxels,
+  // between two rows of probe rays across one tick's travel, and the most rows
+  // a sweep may cast. Dead initialisers: filled from Tuning::Melee
+  // (sweepSpacingM, sweepMaxSteps), kept equal to its defaults.
+  float sweepSpacing = MetresToCells(0.05f);
+  int sweepMaxSteps = 24;
   // How far a blocked blow beats the DEFENDER'S guard open, radians of stroke
   // azimuth/elevation at full power. Blocking must not be free: a heavy blow
   // that lands on your blade should still move it. Hash-seeded and bounded, so
@@ -936,6 +943,32 @@ struct WeaponPose {
   // never fills it — the driver has no style — so the stroke callers
   // (MobSystem::StepStroke, the player's discrete strike) copy it in.
   ArmSmooth smooth;
+  // THE RELEASE IS A JOINT-SPACE MOVE (2026-09-25). -1 while the stroke owns
+  // the arm; 0..1 (already eased) while it is handed back. The rig then does
+  // NOT solve the arm at all: each joint -- shoulder, elbow, wrist -- turns,
+  // relative to its parent, from where it was on the last driven tick to
+  // where the animation holds it, by exactly this much (Mob::SmoothWeaponArm).
+  // It used to fade the IK's hand target into the animation's and re-solve
+  // every tick, with the torso unwinding under it: a blend of two solvers,
+  // not a motion, and its first ticks visibly jerked on every style.
+  float release = -1.0f;
+  // A KEYED ARM (strokes.h "A FRAME IS A POSE", 2026-09-25). When `on`, the
+  // rig solves NOTHING: Mob::SmoothWeaponArm writes each joint as the slerp
+  // from `from` to `to` by `t` (already eased), the shoulder first turned
+  // about itself by that end's aim (yaw about the body's up, then pitch about
+  // its right). `fromLive` = blend from the arm as it stood when the stroke
+  // took it (the first frame) instead of `from`. The torso rides
+  // torsoTwist/torsoPitch above, which the stroke fills from the frames.
+  struct Keyed {
+    bool on = false;
+    bool fromLive = false;
+    Quat from[kArmJoints]{};
+    Quat to[kArmJoints]{};
+    bool hasJoint[kArmJoints] = {false, false, false};  // the wrist may be unkeyed
+    float t = 0;
+    float aimFromYaw = 0, aimFromPitch = 0;
+    float aimToYaw = 0, aimToPitch = 0;
+  } keyed;
 };
 
 // The player's melee state. One instance, owned by main.cpp beside the caster.
@@ -1107,7 +1140,59 @@ class MeleeState {
   // (steerSpeedLo/Hi, steerFloor — the freeform mode's "a slow raise rides
   // the grip") left a slow cut's blade at 15% alignment, its tip nowhere near
   // the authored point. More ticks made that WORSE, which is backwards.
-  void SetProgramDrive() { programDrive_ = true; }
+  //
+  // `holdLean`: THE RETURN DOES NOT RE-LEAN (2026-09-25). The lean plane
+  // (perpL_) chases the tip's travel so the hand leads the edge through a cut.
+  // A settle travels back the other way, so the chase swung the plane half a
+  // turn about the blade — OVER THE TOP — and carried the hand up past the
+  // wielder's head while the tip barely moved ("the hand teleports above the
+  // head at the start of the settle"). A return is not a cut; there is no edge
+  // to lead. The program passes true for its Recover ticks and the plane holds
+  // the lean the cut left.
+  //
+  // FRAMES (2026-09-25, strokes.h "AN ATTACK IS A LIST OF FRAMES"): the whole
+  // per-frame shaping arrives here. `lean` 0 follow / 1 hold / 2 left / 3
+  // right (strokes.h FrameLean, as an int so this header does not need that
+  // one); `wristAlign` replaces the full alignment above with the frame's own
+  // 0..1; the torso shares < 0 mean the global tuning. The torso shares are
+  // LATCHED (Pose() is read after Update) and cleared by Reset().
+  struct ProgramDrive {
+    int lean = 0;
+    float wristAlign = 1.0f;
+    float torsoTwist = -1.0f, torsoPitch = -1.0f;
+    // BLADE ANGLE, radians: the blade's angle off the shoulder-to-tip line
+    // (0 = the blade continues the arm straight). The hand is placed from it:
+    // tip minus a blade at this angle. < 0 = AUTO, the old rule — the hand
+    // held at melee.handExtend of the arm and the angle solved from that.
+    float bladeAngle = -1.0f;
+    // ELBOW DIRECTION, radians about the shoulder-to-hand line: 0 = the elbow
+    // points down, +pi/2 = out to the weapon side, -pi/2 = in across the body,
+    // pi = up. With the hand placed, this is the ONE remaining freedom of the
+    // arm, so it fixes the shoulder's rotation and the elbow's bend plane
+    // together. `elbowSet` false = AUTO, the old rule (the elbow trails the
+    // hand's travel, held inside melee.elbowPoleCone).
+    bool elbowSet = false;
+    float elbowSwivel = 0.0f;
+    // LEAN ANGLE (lean == 4): which way the HAND sits off the shoulder-to-tip
+    // line, radians about that line — 0 = below it, + toward the weapon side,
+    // the elbow's convention. Stated outright; nothing chases the travel.
+    float leanAngle = 0.0f;
+  };
+  float LeanAngleNow() const { return leanAngleNow_; }
+  // What the arm is doing NOW, for the program to blend a frame's blade angle
+  // and elbow direction FROM (so a change of either between frames is a
+  // motion, not a snap).
+  float BladeAngleNow() const { return bladeAngleNow_; }
+  // How far the hand-back is, 0..1 and eased, or -1 when not handing back
+  // (WeaponPose::release).
+  float ReleaseProgress() const;
+  float ElbowSwivelNow() const { return elbowSwivelNow_; }
+  void SetProgramDrive(const ProgramDrive& d) {
+    programDrive_ = true;
+    drive_ = d;
+    torsoTwistShare_ = d.torsoTwist;
+    torsoPitchShare_ = d.torsoPitch;
+  }
   float RecoverTime() const {
     return recoverOverride_ > 1e-4f ? recoverOverride_ : tuning.recoverTime;
   }
@@ -1144,6 +1229,11 @@ class MeleeState {
   // The stroke's own frame, rebuilt each tick from the basis handed to Update.
   void RebuildFrame(float dt, const Vec3& right, const Vec3& up,
                     const Vec3& fwd);
+  // The blade angle, lean angle and elbow swivel of the frame AS SEEDED by a
+  // take-over, in RebuildFrame's conventions. The take-over skips its rebuild,
+  // so without this the "now" angles a program frame blends FROM were the
+  // previous swing's, and the first driven tick snapped the blade to them.
+  void MeasureShapeNow(const Vec3& tipL, const Vec3& handL);
   // THE ANNULUS OF TIP RADII THE ARM CAN ACTUALLY SERVE, given the blade it is
   // holding and how extended `handExtend` says to hold it. Exactly the reach
   // annulus a two-bone solver clamps to, one link further out: hand-to-point is
@@ -1249,4 +1339,8 @@ class MeleeState {
   float recoverOverride_ = 0.0f;
   // See SetProgramDrive. One-shot: cleared at the end of every Update.
   bool programDrive_ = false;
+  ProgramDrive drive_{};    // see SetProgramDrive; one-shot like programDrive_
+  // Latched torso shares from the last program step; < 0 = tuning's.
+  float torsoTwistShare_ = -1.0f, torsoPitchShare_ = -1.0f;
+  float bladeAngleNow_ = 0.0f, elbowSwivelNow_ = 0.0f, leanAngleNow_ = 0.0f;
 };

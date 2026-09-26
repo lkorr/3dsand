@@ -586,6 +586,149 @@ fn tryPowderOnto(src : vec3<i32>, dst : vec3<i32>, myWord : u32, m : Material) -
   return true;
 }
 
+
+// ================== SUB-VOXEL REPOSE (docs/PLAN_powder_mass.md P5) ===========
+// The repose tiers above decide in WHOLE cells, so a pile's surface is a
+// staircase of whole voxels. With powder mass in eighths (POWDER MASS), the
+// same rule can be stated on COLUMN-TOP HEIGHTS IN EIGHTHS, and then a slope
+// rests at the same angle with eighth-voxel steps in it:
+//
+//   A resting surface cell c (mass f, top at 8y + f) looks at each axis
+//   neighbour column's top at its own level or one below -- a partial of the
+//   same powder beside it (8y + mL), or a partial of it one down (8y - 8 +
+//   mB), or open air standing on a solid / full cell (8y). If the drop
+//   D = (8y + f) - top exceeds the material's threshold T (eighths of rise per
+//   cell of run, reposeEighths), c sheds k = ceil((D - T) / 2) eighths into
+//   that neighbour's top (capped by c's mass and the room there).
+//
+// T at 45 degrees is 8, so for WHOLE cells (D a multiple of 8) the rule moves
+// at D = 16 and holds at D = 8 -- exactly the 1:1 tier. It only ever adds
+// moves between whole-cell rest states, it never contradicts one.
+//
+// TERMINATION. The moved grains leave heights top-k+1..top and land at
+// ntop+1..ntop+k with ntop + 2k <= top (k <= D/2, since T >= 3), so every
+// moved grain ends strictly lower: E = sum of grain heights strictly falls, no
+// move is neutral, and a surface with every D <= T writes nothing and sleeps.
+//
+// WRITE REACH 1: c, its axis neighbour, or that neighbour's cell below (a
+// reach-1 diagonal) -- the same boxes the diagonal move uses. All reads are
+// reach 1 and live, so no snapshot is needed.
+//
+// WORLDGEN IS A FIXED POINT OF THIS (worldgen.wgsl looseStepMass): generated
+// loose tops are 4/8 on an upper step edge, 6/8 on a staircase, whole on flats
+// and feet, so every upper/lower pair of columns has D <= 8 and a generated
+// dune does not move on tick 1.
+fn reposeTierEighths(code : u32) -> u32 {
+  switch (code) {
+    case REPOSE_3_1: { return 3u; }
+    case REPOSE_2_1: { return 4u; }
+    case REPOSE_1_2: { return 16u; }
+    case REPOSE_1_3: { return 24u; }
+    default: { return 8u; }
+  }
+}
+// The material's threshold, eighths of rise per cell. A BLENDED word mixes its
+// two tiers by the blend weight -- here as one per-MATERIAL number, never the
+// per-grain positional roll the whole-cell tiers use: two neighbouring columns
+// must agree on T or a surface could be at rest from one side and not the
+// other.
+fn reposeEighths(m : Material) -> u32 {
+  let a = (m.repose >> MAT_REPOSE_A_SHIFT) & MAT_REPOSE_A_MASK;
+  let blend = (m.repose >> MAT_REPOSE_BLEND_SHIFT) & MAT_REPOSE_BLEND_MASK;
+  let ta = reposeTierEighths(a);
+  if (blend == 0u) { return ta; }
+  let tb = reposeTierEighths((m.repose >> MAT_REPOSE_B_SHIFT) & MAT_REPOSE_B_MASK);
+  return (ta * (255u - blend) + tb * blend + 127u) / 255u;
+}
+
+// Is the diagonal step from a surface cell of mass `f` onto a partial of mass
+// `nf` one level down steep enough to take? D = f + 8 - nf against T. The
+// diagonal MERGE in stage 2 asks this when fine repose is on; without it a
+// 4/8 lip would pour into the 6/8 stair below it and flatten a generated dune.
+fn fineDiagSteep(f : u32, nf : u32, m : Material) -> bool {
+  return i32(f) + 8 - i32(nf) > i32(reposeEighths(m));
+}
+
+// A SURFACE cell: nothing rests on it (no solid, no powder above). Both
+// sub-voxel moves are surface moves: a cell with a plant or a cactus standing
+// on it keeps its grains, which is also what keeps a generated step whose
+// upper column carries a plant (and so stayed whole) at rest beside a 6/8
+// stair.
+fn powderSurface(c : vec3<i32>) -> bool {
+  let up = c + vec3<i32>(0, 1, 0);
+  if (!inBounds(up)) { return true; }
+  let um = voxMat(voxWordAt(up));
+  if (um == MAT_AIR) { return true; }
+  let uk = materials[um].klass;
+  return uk != CLASS_SOLID && uk != CLASS_POWDER;
+}
+
+fn tryFineRepose(c : vec3<i32>, w : u32, m : Material, r : u32) -> bool {
+  if (!matHasPowderMass(m) || !powderSurface(c)) { return false; }
+  let myMat = voxMat(w);
+  let f = powderMass(w);
+  let t = i32(reposeEighths(m));
+  for (var i = 0u; i < 4u; i++) {
+    let d = lateralDir(i + r);
+    let lat = c + vec3<i32>(d.x, 0, d.y);
+    if (!inBounds(lat)) { continue; }
+    let lw = voxWordAt(lat);
+    let lm = voxMat(lw);
+    var tgt = lat;
+    var tw = 0u;       // the target's word before (0 = air)
+    var tMass = 0u;
+    var top = 0;       // neighbour column top, eighths above 8y
+    if (lm == myMat && powderIsPartial(lw)) {
+      tw = lw;
+      tMass = powderMass(lw);
+      top = i32(tMass);
+    } else if (lm == MAT_AIR) {
+      let lb = lat + vec3<i32>(0, -1, 0);
+      if (!inBounds(lb)) { continue; }
+      let bw = voxWordAt(lb);
+      let bm = voxMat(bw);
+      if (bm == myMat && powderIsPartial(bw)) {
+        tgt = lb;
+        tw = bw;
+        tMass = powderMass(bw);
+        top = i32(tMass) - 8;
+      } else if (bm != MAT_AIR &&
+                 (materials[bm].klass == CLASS_SOLID ||
+                  (materials[bm].klass == CLASS_POWDER && !powderIsPartial(bw)))) {
+        top = 0;   // air on a whole cell: new grains stand on it
+      } else {
+        continue;  // a drop, a liquid, a thinner foreign powder: not this rule
+      }
+    } else {
+      continue;
+    }
+    let drop = i32(f) - top;
+    if (drop <= t) { continue; }
+    let k = min(min(u32((drop - t + 1) / 2), f), POWDER_FULL - tMass);
+    if (k == 0u) { continue; }
+    let stamp = stampFor(T.tick, P.substep);
+    let tv = voxIndexAndWord(tgt);
+    voxStore(tv.x, packVoxKeepStain(myMat, powderStateFor(tMass + k, tgt, ptSeed()),
+                                    stamp, tw));
+    var si = gSelfIdx;
+    if (si == PT_NO_WORD) { si = voxWordIndex(c); }
+    var srcNow = myMat;
+    if (k >= f) {
+      voxStore(si, 0u);
+      srcNow = MAT_AIR;
+    } else {
+      voxStore(si, packVoxKeepStain(myMat, powderStateFor(f - k, c, ptSeed()), stamp, w));
+    }
+    markVoxActive(tv.x);
+    markVoxActive(si);
+    markDirtyR(c, DIRTY_R_MOVE);
+    markDirtyR(tgt, DIRTY_R_MOVE);
+    flagSupportLoss(c, CLASS_POWDER, srcNow);
+    return true;
+  }
+  return false;
+}
+
 // ======================= ANGLE OF REPOSE (POWDERS) =========================
 //
 // WHY EVERY POWDER USED TO PILE AT EXACTLY 45 DEGREES. The chain in main() is
@@ -992,6 +1135,10 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
 // nibble is fullness, not a palette variant).
 fn productState(mat : u32, r : u32) -> u32 {
   if (mat != MAT_AIR && materials[mat].klass == CLASS_LIQUID) { return LIQ_FULL_STATE; }
+  // A powder CREATED from something that was not powder (ash off a burning
+  // solid, a fountain's emission, a product in an empty face) is born as a
+  // CRUMBLE -- see POWDER ENTERS THE WORLD AS GRAINS in common.wgsl.
+  if (mat != MAT_AIR && matHasPowderMass(materials[mat])) { return powderCrumbleState(r); }
   return r % 3u;
 }
 
@@ -1001,24 +1148,27 @@ fn productState(mat : u32, r : u32) -> u32 {
 // 1/8 of sand. Before powder carried mass every product was born full, which
 // minted matter from any partial liquid; that is what this retires.
 //
-// The eighths the cell word `sw` holds: a liquid's fullness, a powder's mass,
-// and 8 for everything else (a solid, or a whole cell of anything).
+// The eighths the cell word `sw` holds if it is MATTER THAT HAS EIGHTHS: a
+// liquid's fullness or a powder's mass (1..8). 0 for everything else -- a
+// solid, a gas, air -- which is "no mass to carry".
 fn cellEighths(sw : u32) -> u32 {
   let sm = materials[voxMat(sw)];
   if (sm.klass == CLASS_LIQUID) { return voxState(sw) + 1u; }
   if (matHasPowderMass(sm)) { return powderMass(sw); }
-  return 8u;
+  return 0u;
 }
-// The product's state nibble when the cell it replaces held `e` eighths. A
-// liquid or powder product keeps the mass; anything else (and anything made
-// from a whole cell) is born exactly as productState always made it. Solid
-// products from a partial POWDER never get here -- doReactions refuses the
-// rule (selfPartialPowder) -- and gas ones are thinned in reactWriteSelf.
+// The product's state nibble when the cell it replaces held `e` eighths
+// (cellEighths). A powder or liquid source hands its eighths on: 3/8 of snow
+// melts to 3/8 of water, a whole cell of gravel etched by acid is a whole
+// cell of sand. A source with no eighths (e == 0: wood burning to ash) gets
+// productState -- a crumble for a powder product. Solid products from a
+// partial POWDER never get here (doReactions refuses the rule) and gas ones
+// are thinned in reactWriteSelf.
 fn carriedState(prod : u32, e : u32, r : u32) -> u32 {
-  if (e < 8u && prod != MAT_AIR) {
+  if (e != 0u && prod != MAT_AIR) {
     let pm = materials[prod];
-    if (pm.klass == CLASS_LIQUID) { return e - 1u; }
-    if (matHasPowderMass(pm)) { return e + 2u; }
+    if (pm.klass == CLASS_LIQUID) { return min(e, 8u) - 1u; }
+    if (matHasPowderMass(pm)) { return select(e + 2u, r % 3u, e >= POWDER_FULL); }
   }
   return productState(prod, r);
 }
@@ -1212,7 +1362,7 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
   }
   // Self's eighths (8 for a synthesized self: that cell is air). Read before
   // the store below; nothing on the reaction paths writes self before this.
-  var e = 8u;
+  var e = 0u;
   var selfPowder = false;
   if (!synthSelf) {
     let sw = voxWordAt(c);
@@ -1223,7 +1373,7 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
   // gas cell with probability e/8 and otherwise just goes: a dusting burns
   // like 1/8 of a pile, not like a pile. Gas has no eighths to carry, and the
   // roll keeps expected mass exact without one.
-  let thinned = selfPowder && e < 8u && prod != 0u &&
+  let thinned = selfPowder && e < POWDER_FULL && prod != 0u &&
                 materials[prod].klass == CLASS_GAS && ((rnd >> 5u) & 7u) >= e;
   if (prod == 0u || thinned) { voxStore(idx, 0u); }
   else { voxStore(idx, packVox(prod, carriedState(prod, e, rnd), stamp)); }
@@ -1824,7 +1974,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             if (rule.prodNbr == 0u) { voxStore(ni, 0u); }
             else {
               // A partial neighbour keeps its eighths (carriedState).
-              let ne = select(cellEighths(niw.y), 8u, synthFluid);
+              let ne = select(cellEighths(niw.y), 0u, synthFluid);
               voxStore(ni, packVox(rule.prodNbr, carriedState(rule.prodNbr, ne, rr >> 4u), stamp));
             }
             markVoxActive(ni);
@@ -2976,10 +3126,39 @@ fn windEntrain(c : vec3<i32>, w32 : u32, m : Material, slotIdx : u32) -> bool {
   if (i32((windRnd(slotIdx) >> 10u) & 1023u) >= WIND_ENTRAIN_CHANCE) {
     return false;
   }
-  if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w32, m.density, false)) {
+  // A GRAIN, not a cell (POWDER ENTERS THE WORLD AS GRAINS): a wind that
+  // beats the friction lifts ONE EIGHTH off the surface into open air, and
+  // the rest of the cell stays. Matter is conserved exactly, a dune smokes
+  // grains instead of launching bricks, and each grain then falls and merges
+  // like any other. Into anything but air (a lighter fluid) it is the old
+  // whole-cell move. Mites are not grains and move whole.
+  if (windGrain(c, c + vec3<i32>(d.x, 0, d.y), w32, m) ||
+      tryMove(c, c + vec3<i32>(d.x, 0, d.y), w32, m.density, false)) {
     return true;
   }
-  return tryMove(c, c + vec3<i32>(d.x, 1, d.y), w32, m.density, false);
+  return windGrain(c, c + vec3<i32>(d.x, 1, d.y), w32, m) ||
+         tryMove(c, c + vec3<i32>(d.x, 1, d.y), w32, m.density, false);
+}
+
+// One eighth from c into the AIR cell dst (reach 1). A one-eighth cell has
+// nothing left to split and simply moves (tryMove), as before.
+fn windGrain(c : vec3<i32>, dst : vec3<i32>, w : u32, m : Material) -> bool {
+  if (!matHasPowderMass(m) || !inBounds(dst)) { return false; }
+  let f = powderMass(w);
+  if (f <= 1u) { return false; }
+  let dv = voxIndexAndWord(dst);
+  if (voxMat(dv.y) != MAT_AIR) { return false; }
+  let myMat = voxMat(w);
+  let stamp = stampFor(T.tick, P.substep);
+  voxStore(dv.x, packVox(myMat, POWDER_GRAIN_STATE, stamp));
+  var si = gSelfIdx;
+  if (any(c != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(c); }
+  voxStore(si, packVoxKeepStain(myMat, powderStateFor(f - 1u, c, ptSeed()), stamp, w));
+  markVoxActive(dv.x);
+  markVoxActive(si);
+  markDirtyR(c, DIRTY_R_MOVE);
+  markDirtyR(dst, DIRTY_R_MOVE);
+  return true;
 }
 
 // ---- THE STAMP GATE MUST NOT EAT A KEEP-AWAKE MARK (rule-unification W2-R) --
@@ -3315,8 +3494,22 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     if (!reposeDiagAllowed(c, d, reposeCode)) { continue; }
     // Onto a partial powder diagonally too (merge/sink): grains settle into
     // the hollow beside them. Same gate, same reach as the diagonal move.
-    if (tryMove(c, c + vec3<i32>(d.x, -1, d.y), w, m.density, false) ||
-        tryPowderOnto(c, c + vec3<i32>(d.x, -1, d.y), w, m)) {
+    let dg = c + vec3<i32>(d.x, -1, d.y);
+    if (tryMove(c, dg, w, m.density, false)) {
+      markDirtyR(c, cls);
+      return;
+    }
+    // Onto a partial below-diagonal: with fine repose on, only when the
+    // column-top drop is past the material's repose (fineDiagSteep) -- a
+    // generated 4/8 lip must not pour into the 6/8 stair under it.
+    var diagOk = true;
+    if (TUNE_POWDER_FINE_REPOSE != 0u && inBounds(dg)) {
+      let dw = voxWordAt(dg);
+      if (voxMat(dw) != MAT_AIR && powderIsPartial(dw)) {
+        diagOk = fineDiagSteep(powderMass(w), powderMass(dw), m) && powderSurface(c);
+      }
+    }
+    if (diagOk && tryPowderOnto(c, dg, w, m)) {
       markDirtyR(c, cls);
       return;
     }
@@ -3403,6 +3596,14 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
       }
     }
   }
+  // 2c) SUB-VOXEL REPOSE: shed eighths toward a neighbour column whose top is
+  //     past this material's repose (tryFineRepose). Only a grain that could
+  //     not descend reaches here, like the slide above.
+  if (TUNE_POWDER_FINE_REPOSE != 0u && tryFineRepose(c, w, m, r)) {
+    markDirtyR(c, cls);
+    return;
+  }
+
   // 4) wandering powders (mites): scuttle laterally, occasionally hop up.
   if (m.klass == CLASS_POWDER && (m.flags & MATF_WANDER) != 0u) {
     let r3 = rnd >> 18u;

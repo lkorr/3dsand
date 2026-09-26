@@ -272,10 +272,10 @@ var toasts = [], dirt = [];
     breed.__test.preset('stocky');
     st.name = '_harness';
     await breed.saveFromHost();
-    var okToast = toasts.some(function(t){ return /saved _harness\.vox/.test(t); });
+    var okToast = toasts.some(function(t){ return /saved \S*_harness\.vox/.test(t); });
     say(okToast, 'the save reported success',
         toasts.slice(-2).join(' | '));
-    var vox = await fetch('/api/model?path=mobs/_harness.vox', { cache: 'no-store' });
+    var vox = await fetch('/api/model?path=mobs/human/_harness.vox', { cache: 'no-store' });
     say(vox.ok, 'the .vox is on disk');
     var bytes = new Uint8Array(await vox.arrayBuffer());
     say(bytes[0] === 86 && bytes[1] === 79 && bytes[2] === 88,
@@ -301,7 +301,7 @@ var toasts = [], dirt = [];
     say(names.indexOf('bone') >= 0 && names.indexOf('brain') >= 0,
         'it has bone and a brain, so the head override ran too',
         names.join(','));
-    var side2 = await (await fetch('/api/model?path=mobs/_harness.json',
+    var side2 = await (await fetch('/api/model?path=mobs/human/_harness.json',
                                    { cache: 'no-store' })).json();
     say(Array.isArray(side2.limbs) && side2.limbs.length === 15,
         'the sidecar has the 15-limb rig', 'limbs: ' +
@@ -340,7 +340,7 @@ var toasts = [], dirt = [];
       await waitFor(function(){
         return toasts.some(function(t){ return /_harness_pale/.test(t); });
       }, 15000);
-      var vdoc = await fetch('/api/model?path=mobs/_harness_pale.json',
+      var vdoc = await fetch('/api/model?path=mobs/human/_harness_pale.json',
                              { cache: 'no-store' });
       say(vdoc.ok, 'the variant sidecar is on disk');
       if (vdoc.ok) {
@@ -351,7 +351,7 @@ var toasts = [], dirt = [];
         say(!v.limbs && !v.genome,
             'it restates nothing: no rig, no genome, no art');
       }
-      var noVox = await fetch('/api/model?path=mobs/_harness_pale.vox',
+      var noVox = await fetch('/api/model?path=mobs/human/_harness_pale.vox',
                               { cache: 'no-store' });
       say(!noVox.ok, 'and it wrote no .vox at all');
     }

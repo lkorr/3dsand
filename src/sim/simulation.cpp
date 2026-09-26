@@ -40,7 +40,7 @@ using pass::kPassStride;
 // outside the window). genCols holds the per-POSITION map ([0, kNumSlots),
 // worldgen.wgsl GC_REC_BASE) and then kGenColRecWords words per chunk-column.
 namespace {
-constexpr uint32_t kColCacheWords = 24;
+constexpr uint32_t kColCacheWords = 25;
 constexpr uint32_t kColCacheHdr = 16;
 constexpr uint32_t kColCacheBlock = kColCacheHdr + kChunk * kChunk * kColCacheWords;
 constexpr uint32_t kGenColMax = kNChunk * kNChunk + kTicketMax * kTicketBoxN * kTicketBoxN;

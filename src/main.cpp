@@ -6986,6 +6986,11 @@ int main(int argc, char** argv) {
     return world.KindAt(c, classOf);
   };
   const Player::KindFn& kindAt = session.kindAt;
+  // The player stands ON grains, not on the cell they sit in: a partial
+  // powder cell is only mass/8 tall (docs/PLAN_powder_mass.md P4).
+  session.player.cellTop = [&world, &classOf](IVec3 c) {
+    return world.CellTopAt(c, classOf);
+  };
 
   // ---- THE HARNESS HOOKS (session.h section E) ----------------------------
   // All three are argv state the FRAME layer owns; passing them as callbacks
@@ -11406,6 +11411,11 @@ int main(int argc, char** argv) {
           audioCues.Combat(audio::Cues::CombatCue::Clang, combatClangCue.at,
                            combatClangCue.power);
         }
+        // Liquid that landed in a flask since the last frame: one call, at
+        // the fill the LAST cell reached (Cues::FlaskFill rate-limits).
+        if (!session.flaskFills.empty())
+          audioCues.FlaskFill(session.flaskFillAt, session.flaskFills.back(),
+                              (int)session.flaskFills.size());
 
         // Limbs that came off this frame. The creature's cry fires for every
         // sever; the wet CUT only for one made by a blade, because an
@@ -11524,6 +11534,7 @@ int main(int argc, char** argv) {
       combatClangCue.pending = false;
       combatStrikeCue.pending = false;
       combatCutCue.pending = false;
+      session.flaskFills.clear();
       // (The hit flash is NOT decayed here. It ages on the tick, inside
       // MobSystem::PreTick, because a frame-driven decay is never called by
       // the selftest — see MobSystem::DecayHitFlash.)
@@ -12015,6 +12026,107 @@ int main(int argc, char** argv) {
         if (strikeBuffered >= 0) {
           if (const AttackStyle* nxt = mobs.AttackStyles().At(strikeBuffered))
             ui.swingStyle += "  (next: " + nxt->label + ")";
+        }
+      }
+      // ---- THE STRIKE COMPASS (overlay.h UIState::strikeCompass) -----------
+      // Debug readout while a weapon is in hand: the same map the press reads
+      // (strokes.h PlayerCompass), the picker's live velocity, and what the
+      // last press resolved to. Render-only; nothing here feeds the tick.
+      ui.strikeCompass = meleeArmed && avatar.Spawned();
+      if (ui.strikeCompass) {
+        const StyleLibrary& lib = mobs.AttackStyles();
+        const PlayerStrikeMap& map = PlayerCompass(lib, true);
+        auto baseName = [&](int si) -> std::string {
+          const AttackStyle* st = lib.At(si);
+          if (!st) return "?";
+          // "horizontal_r@short:player" -> "horizontal_r [short]".
+          std::string n = st->name;
+          const size_t c = n.find(":player");
+          if (c != std::string::npos) n.resize(c);
+          const size_t at = n.find('@');
+          if (at != std::string::npos) n = n.substr(0, at) + " [" + n.substr(at + 1) + "]";
+          return n;
+        };
+        ui.strikeSectors.clear();
+        for (const PlayerStrikeMap::Sector& sec : map.sectors) {
+          UIState::StrikeSector u;
+          const float len = std::sqrt(sec.x * sec.x + sec.y * sec.y);
+          u.x = len > 1e-6f ? sec.x / len : 0.0f;
+          u.y = len > 1e-6f ? sec.y / len : 0.0f;
+          u.name = baseName(sec.style);
+          u.neutral = sec.style == map.neutral[0] || sec.style == map.neutral[1];
+          ui.strikeSectors.push_back(std::move(u));
+        }
+        // Which sector a style index lands on (the FIRST sector naming it,
+        // which is also the one QuantizeStrike's max-dot picks among ties).
+        auto sectorOf = [&](int si, float fx, float fy) {
+          int best = -1;
+          float bestDot = -1e9f;
+          for (size_t k = 0; k < map.sectors.size(); k++) {
+            if (map.sectors[k].style != si) continue;
+            const float d = map.sectors[k].x * fx + map.sectors[k].y * fy;
+            if (d > bestDot) { bestDot = d; best = (int)k; }
+          }
+          return best;
+        };
+        const StrikePicker& pk = session.strikePicker;
+        ui.strikeFlickX = pk.vx;
+        ui.strikeFlickY = pk.vy;
+        ui.strikePickMin = std::max(1.0f, CurrentTuning().melee.pickMinSpeed);
+        ui.strikeHover = -1;
+        {
+          float fx = 0, fy = 0;
+          if (pk.Pick(ui.strikePickMin, fx, fy)) {
+            const int si = QuantizeStrike(map, fx, fy);
+            if (si >= 0) ui.strikeHover = sectorOf(si, fx, fy);
+          }
+        }
+        const PlayerSession::StrikePickNote& note = session.lastStrikePick;
+        if (note.serial != ui.strikeLastSerial) {
+          ui.strikeLastSerial = note.serial;
+          ui.strikeLastAge = 0.0f;
+          ui.strikeLastFlicked = note.flicked;
+          ui.strikeLastX = note.fx;
+          ui.strikeLastY = note.fy;
+          ui.strikeLastSector =
+              note.flicked ? sectorOf(note.style, note.fx, note.fy) : -1;
+          // Named as the weapon's FORM of it, which is what the press began.
+          const int formed = lib.ResolveForm(
+              note.style, heldItem ? WeaponFormOf(heldItem->weaponClass) : -1);
+          std::string t = note.style >= 0 ? baseName(formed) : "nothing";
+          for (char& ch : t) if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+          if (note.flicked) {
+            char b[48];
+            // Screen +y is down: a flick UP is fy < 0.
+            const float deg = std::atan2(-note.fy, note.fx) * 57.29578f;
+            std::snprintf(b, sizeof b, "  flick %.0f deg", deg);
+            t += b;
+          } else {
+            t += "  no flick (neutral alternate)";
+          }
+          ui.strikeLastText = std::move(t);
+        } else {
+          ui.strikeLastAge += dt;
+        }
+        ui.strikeNowText.clear();
+        if (playerStrike.Active()) {
+          if (const AttackStyle* sty = lib.At(playerStrike.style)) {
+            const char* ph =
+                playerStrike.phase == StrokeCursor::Phase::Windup ? "windup"
+              : playerStrike.phase == StrokeCursor::Phase::Cut    ? "CUT"
+              : playerStrike.phase == StrokeCursor::Phase::Recover
+                  ? (playerStrike.releasing ? "release" : "recover")
+                                                                 : "guard";
+            const int k = playerStrike.frame;
+            const std::string fname =
+                k >= 0 && k < (int)sty->frames.size() ? sty->frames[k].name : "";
+            char b[160];
+            std::snprintf(b, sizeof b, "%s  %s  frame %d/%d \"%s\"%s",
+                          baseName(playerStrike.style).c_str(), ph,
+                          std::min(k + 1, playerStrike.frames), playerStrike.frames,
+                          fname.c_str(), sty->Keyed() ? "  keyed" : "  TIP-DRIVEN");
+            ui.strikeNowText = b;
+          }
         }
       }
       ui.playerPos[0] = player.pos.x;

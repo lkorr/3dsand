@@ -684,7 +684,11 @@ fn gasIntegrate(@builtin(global_invocation_id) gid : vec3<u32>) {
         atomicAdd(&gasSpawn[GAS_SP_DIED], 1u);
         return;
       }
-      p.payload = prod | (((key >> 24u) % 3u) << 12u);
+      // A powder product (smoke settling as ash) lands as a CRUMBLE (common.wgsl
+      // POWDER ENTERS THE WORLD AS GRAINS); anything else keeps its variant.
+      var ps = (key >> 24u) % 3u;
+      if (matHasPowderMass(pm)) { ps = powderCrumbleState(key >> 20u); }
+      p.payload = prod | (ps << 12u);
       p.flags |= PFLAG_PENDING;
       atomicMax(&gasClaim[claimSlot(cellIndexW(c))], particlePriority(p));
       gasAppend(p);

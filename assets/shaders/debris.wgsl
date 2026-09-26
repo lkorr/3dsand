@@ -181,6 +181,13 @@ fn vsParticle(@builtin(vertex_index) vi : u32,
   // micro keeps the same proportion of its own smaller cell.
   var size = 0.7;
   if (isMicro(p)) { size = 0.7 / f32(microScaleOf(p.flags)); }
+  // A PARTIAL POWDER particle (a poured grain, docs/PLAN_powder_mass.md) is
+  // drawn at its MASS: a cube of the same volume fraction, so a 1/8-voxel
+  // grain flies at half the edge of a whole one instead of as a brick.
+  else if (materials[p.payload & 0xFFFu].klass == CLASS_POWDER &&
+           powderStateIsPartial((p.payload >> 12u) & 0xFu)) {
+    size = 0.7 * pow(f32(powderMassOfState((p.payload >> 12u) & 0xFu)) / 8.0, 1.0 / 3.0);
+  }
 
   var n : vec3f;
   let off = cubeOffset(vi, &n) * size;

@@ -69,18 +69,14 @@ float ResolveSwingYaw(float yawRel) {
   while (yawRel > 3.14159265f) yawRel -= 6.2831853f;
   while (yawRel < -3.14159265f) yawRel += 6.2831853f;
   const float cone = m.aimYaw * kDeg;
-  // The rear release, verbatim from PlayerAvatar::SetLook: scale the offset to
-  // nothing across the last `aimReleaseYaw` degrees before straight-behind.
-  // Smoothstep so it is flat at both ends — no crease where the band begins,
-  // and a genuine zone (not a single angle) where it is fully released.
-  float release = 1.0f;
-  const float band = m.aimReleaseYaw * kDeg;
-  if (band > 1e-4f) {
-    const float t =
-        std::clamp((3.14159265f - std::fabs(yawRel)) / band, 0.0f, 1.0f);
-    release = t * t * (3.0f - 2.0f * t);
-  }
-  return std::clamp(yawRel, -cone, cone) * release;
+  // A LOOK BEHIND IS REFLECTED TO THE FRONT, across the body's left-right
+  // axis: 150 deg round to the right swings at 30 deg right, straight behind
+  // swings straight ahead. The side is kept and so is the pitch (the caller
+  // rotates about +Y only). Continuous at +-90 (maps to itself) and at the
+  // +180/-180 wrap (both reach 0), so no band is needed to hide a seam.
+  const float a = std::fabs(yawRel);
+  if (a > 1.5707963f) yawRel = std::copysign(3.14159265f - a, yawRel);
+  return std::clamp(yawRel, -cone, cone);
 }
 
 void ResolveSwingBasis(float camHeading, float bodyHeading, Vec3 camRight,

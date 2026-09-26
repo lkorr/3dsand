@@ -2478,6 +2478,7 @@ def check_powder_mass():
         return
     checked.append("powder mass")
     for cpp, wgsl in (("kPowderFull", "POWDER_FULL"),
+                      ("kPowderGrainState", "POWDER_GRAIN_STATE"),
                       ("kPowderPartialLo", "POWDER_PARTIAL_LO"),
                       ("kPowderPartialHi", "POWDER_PARTIAL_HI"),
                       ("kPowderBlockMin", "POWDER_BLOCK_MIN")):

@@ -355,7 +355,11 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
   for (int k = 0; k < def.container.pourPerTick && st.Filled(); k++) {
     if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
     if ((uint32_t)k >= partRoom) break;   // charged only for what the ring takes
-    const int spend = std::min<int>(kContainerUnitsPerCell, st.fillAmt);
+    // A powder leaves in GRAINS of def.container.pourGrain eighths each (a
+    // pouch: 1/8-voxel grains that merge into partial cells where they land);
+    // a liquid in whole cells plus its measured remainder, as before.
+    const int unit = liquid ? kContainerUnitsPerCell : def.container.pourGrain;
+    const int spend = std::min<int>(unit, st.fillAmt);
     // A little spread so the stream is a stream and not one voxel column:
     // +-4% of the launch velocity and +-0.3 cell at the lip, both hashed from
     // (seed, tick, k) so a replayed pour lands the same cells.
@@ -669,7 +673,10 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
     uint32_t made = 0;
     while (sp.units > 0 && parts.size() < kMaxParticleSpawnsPerTick &&
            made < partRoom) {
-      const int spend = std::min(kContainerUnitsPerCell, sp.units);
+      // A powder spills as one-eighth GRAINS (world.h POWDER ENTERS THE WORLD
+      // AS GRAINS): matter conserved, split, and whatever the budget cannot
+      // take this tick waits for the next.
+      const int spend = std::min(liquid ? kContainerUnitsPerCell : 1, sp.units);
       Vec3 p, v;
       sample((uint32_t)sp.units, p, v);
       ParticleSpawn ps{};

@@ -372,7 +372,8 @@ struct BrushOp {
   uint32_t mode;  // 0 = paint into air, 1 = overwrite
   // pad0: a transmute's FROM filter; pad1 bit 0: its wildcard-matches-matter
   // flag; pad1 bits 4..7: a powder brush's GRAIN size in eighths (0 = whole
-  // cells) -- sim_mutate.wgsl reads all three by the names _p0/_p1.
+  // cells, 15 = MIXED: each cell a crumble) -- sim_mutate.wgsl reads all three
+// by the names _p0/_p1.
   uint32_t pad0 = 0, pad1 = 0;
 };
 constexpr uint32_t kBrushGrainShift = 4;
@@ -455,6 +456,12 @@ static_assert(kDirtyGasMask == (DirtyReasonBit("gas") |
 // Particle system sizes — must match common.wgsl.
 constexpr uint32_t kParticleCap = 262144;
 constexpr uint32_t kClaimSize = 262144;
+// The claim buffer holds kClaimWords u32: the reinsertion claim itself in
+// [0, kClaimSize), then five more planes for GRAIN LANDING (sim_particle.wgsl:
+// every same-material grain aimed at one cell lands in the SAME tick): the
+// summed mass, and the max / max-of-complement of a two-word key that proves
+// every proposer to the slot agreed on (cell, material, cell mass).
+constexpr uint32_t kClaimWords = kClaimSize * 6;
 
 // ---- GAS PARTICLES (docs/PLAN_gas_particles.md stage 1) --------------------
 // Gas that has left the residency window. Its OWN pool, not a share of
@@ -1814,11 +1821,24 @@ constexpr uint32_t kPowderBlockMin = 5u;
 // reports it as air to the player, mobs and projectiles (owner, 2026-09-26:
 // "thin films should be walked through").
 constexpr uint32_t kPowderWalkMin = 3u;
+// CPU-only: a CREATURE's ground is a whole cell height (mob.cpp / pose.cpp
+// carry it as an int), so a partial powder cell ROUNDS for them -- ground
+// from half a cell of grains up; feet sink at most 3/8 or float at most 4/8.
+constexpr uint32_t kPowderMobSupportMin = 4u;
 inline bool PowderStateIsPartial(uint32_t s) {
   return s >= kPowderPartialLo && s <= kPowderPartialHi;
 }
 inline uint32_t PowderMassOfState(uint32_t s) {
   return PowderStateIsPartial(s) ? s - 2u : kPowderFull;
+}
+// POWDER ENTERS THE WORLD AS GRAINS -- the C++ twin of common.wgsl's block of
+// that name (read it for which creator uses which). GRAIN = one eighth, for
+// flows that split conserved matter; CRUMBLE = a hashed 1..8 eighths, for
+// powder created or converted from something that was not powder.
+constexpr uint32_t kPowderGrainState = 3u;
+inline uint32_t PowderCrumbleState(uint32_t h) {
+  const uint32_t m = 1u + (h % 8u);
+  return m == kPowderFull ? (h >> 3) % 3u : m + 2u;
 }
 // State nibble for `mass` eighths (1..8) at world (x,y,z); full takes the
 // positional variant, as common.wgsl powderStateFor does.
@@ -4273,6 +4293,12 @@ class World {
   // same voxel word, or a second player's sweeps disagree with the first's
   // about the same cell. Copying four switch arms was how they would stop
   // agreeing, so neither owns them.
+  // HOW TALL the mirror's cell is, as a fraction of a voxel: a partial powder
+  // cell (POWDER MASS) is its grains, mass/8; everything else is 1. Only
+  // meaningful for a cell KindAt calls Solid. The player's slab collision
+  // (Player::TopFn) reads it.
+  float CellTopAt(IVec3 cell, const std::vector<uint32_t>& classOf) const;
+
   static CellKind KindOfWord(uint32_t word,
                              const std::vector<uint32_t>& classOf) {
     const uint32_t mat = word & 0xFFF;
@@ -4578,7 +4604,7 @@ class World {
   // ---- particles + explosions (M5, DESIGN.md §5/§7) ----
   rhi::Buffer particles[2];    // kParticleCap Particle (32 B), double-buffered
   rhi::Buffer particleCounts;  // 4 u32: [0]/[1] = live count per page
-  rhi::Buffer claim;           // kClaimSize u32 — reinsertion claim hash
+  rhi::Buffer claim;           // kClaimWords u32 — reinsertion claim hash + grain landing
   rhi::Buffer pArgsStage;      // 8 u32: [0..3] draw args, [4..6] dispatch args
   rhi::Buffer pDispatchArgs;   // 3 u32, indirect-only (see dispatchArgs note)
   rhi::Buffer drawArgs;        // 4 u32, indirect-only draw args for particles

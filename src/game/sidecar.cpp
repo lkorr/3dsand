@@ -196,6 +196,53 @@ bool ReadJsonDoc(const std::string& path, json& out, std::string& log) {
   return true;
 }
 
+bool IsVariantDir(const std::string& name) {
+  return !name.empty() && name != "effects" && name != "pool" && name[0] != '.';
+}
+
+std::string StemPath(const std::string& dir, const std::string& stem,
+                     const char* ext) {
+  namespace fs = std::filesystem;
+  const fs::path root = fs::path(dir) / (stem + ext);
+  std::error_code ec;
+  if (fs::is_regular_file(root, ec)) return root.string();
+  std::vector<std::string> subs;
+  for (auto& e : fs::directory_iterator(dir, ec))
+    if (e.is_directory() && IsVariantDir(e.path().filename().string()))
+      subs.push_back(e.path().filename().string());
+  std::sort(subs.begin(), subs.end());
+  for (const std::string& s : subs) {
+    const fs::path p = fs::path(dir) / s / (stem + ext);
+    if (fs::is_regular_file(p, ec)) return p.string();
+  }
+  return root.string();
+}
+
+std::vector<std::pair<std::string, std::string>> ListStems(
+    const std::string& dir, const char* ext) {
+  namespace fs = std::filesystem;
+  std::vector<std::pair<std::string, std::string>> out;
+  std::vector<fs::path> dirs{fs::path(dir)}, subs;
+  std::error_code ec;
+  for (auto& e : fs::directory_iterator(dir, ec))
+    if (e.is_directory() && IsVariantDir(e.path().filename().string()))
+      subs.push_back(e.path());
+  std::sort(subs.begin(), subs.end());
+  dirs.insert(dirs.end(), subs.begin(), subs.end());
+  for (const fs::path& d : dirs) {
+    std::error_code dec;
+    for (auto& e : fs::directory_iterator(d, dec)) {
+      if (!e.is_regular_file() || e.path().extension() != ext) continue;
+      const std::string stem = e.path().stem().string();
+      bool seen = false;
+      for (const auto& o : out) seen = seen || o.first == stem;
+      if (!seen) out.emplace_back(stem, e.path().string());
+    }
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
 namespace {
 
 bool ResolveExtends(const std::string& dir, const std::string& path, json& out,
@@ -214,8 +261,8 @@ bool ResolveExtends(const std::string& dir, const std::string& path, json& out,
     return true;
   }
   json parent;
-  const std::string bp =
-      (std::filesystem::path(dir) / (base + ".json")).string();
+  // By STEM, wherever it is filed: a variant may extend another variant.
+  const std::string bp = StemPath(dir, base, ".json");
   if (!ResolveExtends(dir, bp, parent, log, depth + 1, nullptr)) {
     log += path + ": extends \"" + base + "\", which did not load — skipped\n";
     return false;

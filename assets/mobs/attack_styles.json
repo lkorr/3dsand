@@ -1,133 +1,2401 @@
 {
-  "comment": "ATTACK STYLES. A style is a named STROKE PROGRAM: a windup that raises the blade into a stance, then a cut that drives it through the target line. It is fed to the SAME driver the player's mouse feeds (game/melee.h MeleeState, via StrokeSample), so an NPC swing is a motion a person could make and a fix to the feel is a fix to both. Hot-reloads on R alongside materials, behaviours, glyphs and items. The full schema, and the reasoning behind every field, is at the top of src/game/strokes.h.",
-
+  "comment": "ATTACK STYLES. A style is a named list of FRAMES (strokes.h \"AN ATTACK IS A LIST OF FRAMES\"). Every frame is the same kind of thing: where the weapon TIP is when the frame ends (az/el radians, reach a band position), what that is measured FROM (\"target\" = 0/0 points at what is attacked, the default; \"body\" = the wielder's own facing), ticks, pacing (\"ease\": linear, a curve, or \"chase\" + \"chaseRate\"), \"cuts\" (the damage sweep is live), \"lean\" (follow / hold / left / right: which side of the tip the hand is on), \"wrist\" (0..1 blade alignment), \"torsoTwist\"/\"torsoPitch\" (omit = global melee.*), and \"joints\" (per-joint smoothing while the frame runs). The cutting frames are one run: frames before it are the windup (the aim locks at its end), frames after it are the return; \"release\" ticks then hand the arm back. Edit in the tuner's Attacks lane.",
   "strokeFrame": "target",
-
-  "player_notes": "PLAYER OVERRIDES. Each style's optional `player` block states only the fields that differ from the base when the player swings it: shorter windups (a click must feel owned), zero jitter (a strike must go exactly where it was flicked), and sometimes different recover timing. The player compass references the BASE style by name; the loader creates a derived copy with overrides merged. Fields not mentioned in the override are inherited from the base. For `recover`, if the override is present but states no az/el/reach, the result has no posed return even if the base did (a player jab that hands back instantly does not need to be driven home). For `windup`, `cut`, and `jitter`, merge is per-field: stated fields override, unstated fields inherit.",
-
-  "recover_notes": "THE RECOVER IS A RETURN, AND IT IS DRIVEN (2026-09-21). Until now it was four lines in the runner and none of them was a motion: the program set held=false, the STORED stroke froze wherever the cut ended, and PoseWeight ramped 1 -> 0 over the ONE global `melee.recoverTime` shared by every attack in the game -- a number Mob::ApplyWeaponArm hands to AnimSolveTwoBone as a BLEND WEIGHT. So the path home from a cut was a rotation-space crossfade with nothing in it that knows about anatomy, and a stroke that ends with the blade across the body (horizontal_r finishes at az -2.00) blended THROUGH the torso to get back. That is the 'limbs move in impossible ways' report, and nothing in the windup or the cut could reach it because the recover was not being authored at all. Now: `az`/`el`/`reach` are a RETURN STANCE, `settle` is how many of the `ticks` are spent being STEERED to it with the claim still at full weight, and `fade` is the hand-back, overriding melee.recoverTime for this style alone. THE POSE IS ABSOLUTE, in the mob's own facing basis -- NOT relative to the aim like the windup. A recover is a return to stance, not a second aim: an arm that recovered relative to the target would finish every swing pointed back at whatever it just hit, which reads as re-chambering rather than as finishing. Stating no az/el/reach gets the old behaviour back exactly, which is what a style written before this loads as.",
-
-  "ease_notes": "CUT PACING (optional `\"ease\"` on a style). The `ticks` on each cut leg set how LONG that leg takes; `ease` sets where in that time the speed lives. THE NAMES ARE anim.h's -- the SAME eight curves a clip keyframe interpolates with (linear, instant, quadIn/Out/InOut, cubicIn/Out/InOut), because a cut's pacing and a keyframe's easing are one concept and the project keeps one vocabulary for it. \"linear\" is the default and what every style here is: the gap closes by the same amount every tick. \"quadIn\" is back-loaded, so the blade creeps out of the windup and is fastest as it passes the target -- which puts the tip speed (and SPEED IS THE DAMAGE) where the aim is. \"quadOut\" is front-loaded: it snaps and then settles, so the tip is SLOWEST at the target and hits weaker. Every curve arrives exactly on the leg's end (the last tick always spends the whole remaining gap, which is also what keeps `instant` a shape rather than a stall), so pacing never displaces a corner. IT PACES THE CUT ONLY: the windup and the settle are a closed-loop chase to a pose under melee.commitSpeed, a different control law with no authored travel to distribute -- and because that chase is CLAMPED (16 units/tick), a windup with too few ticks stops short of its pose no matter what this says. Every cut, short or long, lands exactly on its authored point (until 2026-09-25 a short cut crossed melee.commitSpeed and the driver's own Slash arc took over the endpoint; that Slash is gone). The Attacks lane's `goal` chips hold each destination still so both of those are visible rather than inferred.",
-
-  "notes": "ANGLES ARE RADIANS in the mob's own facing basis: azimuth 0 is straight ahead and positive is the mob's right; elevation 0 is level. REACH is a fraction of the arm's own reach band, so a thrust is the same lunge on a long arm and a short one. TICKS are 30 Hz sim ticks -- a windup of 12 is 0.40 s of visible blade raise, which IS the telegraph (there is no UI indicator). THE WINDUP IS MEASURED FROM THE TARGET (\"strokeFrame\": \"target\", 2026-09-25): windup az 0 / el 0 points straight at the target, and the cut TRAVELS from wherever the windup put the arm. To make the cut pass through the target in its middle, the windup sits half a cut back: windup = -(cut travel / 2), or the middle of the leg marked \"aim\": true -- the Attacks lane's centre button writes exactly that. Files without \"strokeFrame\" are in the old frame (windup measured from half a cut short of the aim) and are converted at load; see src/game/strokes.h \"THE STROKE FRAME\".",
-
+  "player_notes": "PLAYER OVERRIDES. A style's optional `player` block holds what differs when the PLAYER swings it: its own `frames` (a full list — it replaces the base's), `release`, `jitter` (0 on purpose: a strike goes exactly where it was flicked), `ease`. The flick compasses (`player`, `playerDagger`, `playerUnarmed`) name base styles and use the player copy when one exists.",
+  "notes": "ANGLES ARE RADIANS in the wielder's facing basis: azimuth 0 is straight ahead (or straight at the target, for a target-measured frame) and positive is the wielder's right; elevation 0 is level, positive up. REACH is a position in the arm's own reach band: 0 = the neutral 0.60, +1 out, -1 in. The tuner shows degrees.",
   "player": {
     "sectors": [
-      { "dir": [1.0, 0.0], "style": "horizontal_r" },
-      { "dir": [-1.0, 0.0], "style": "horizontal_l" },
-      { "dir": [0.0, -1.0], "style": "overhead" },
-      { "dir": [0.0, 1.0], "style": "thrust" },
-      { "dir": [0.7, -0.7], "style": "diagonal" }
+      {
+        "dir": [
+          1,
+          0
+        ],
+        "style": "horizontal_r"
+      },
+      {
+        "dir": [
+          -1,
+          0
+        ],
+        "style": "horizontal_l"
+      },
+      {
+        "dir": [
+          0,
+          -1
+        ],
+        "style": "overhead"
+      },
+      {
+        "dir": [
+          0,
+          1
+        ],
+        "style": "thrust"
+      },
+      {
+        "dir": [
+          0.7,
+          -0.7
+        ],
+        "style": "diag_tr_bl"
+      },
+      {
+        "dir": [
+          -0.7,
+          -0.7
+        ],
+        "style": "diag_tl_br"
+      },
+      {
+        "dir": [
+          0.7,
+          0.7
+        ],
+        "style": "diag_br_tl"
+      },
+      {
+        "dir": [
+          -0.7,
+          0.7
+        ],
+        "style": "diag_bl_tr"
+      }
     ],
-    "neutralAlternate": ["horizontal_r", "horizontal_l"]
+    "neutralAlternate": [
+      "horizontal_r",
+      "horizontal_l"
+    ]
   },
-
-  "playerDagger": {
-    "sectors": [
-      { "dir": [1.0, 0.0], "style": "horizontal_r" },
-      { "dir": [-1.0, 0.0], "style": "horizontal_l" },
-      { "dir": [0.0, -1.0], "style": "overhead" },
-      { "dir": [0.0, 1.0], "style": "thrust" }
-    ],
-    "neutralAlternate": ["horizontal_r", "horizontal_l"]
-  },
-
   "playerUnarmed": {
     "sectors": [
-      { "dir": [1.0, 0.0], "style": "punch_r" },
-      { "dir": [-1.0, 0.0], "style": "punch_l" },
-      { "dir": [0.0, 1.0], "style": "punch_thrust" },
-      { "dir": [0.0, -1.0], "style": "punch_r" }
+      {
+        "dir": [
+          1,
+          0
+        ],
+        "style": "punch_r"
+      },
+      {
+        "dir": [
+          -1,
+          0
+        ],
+        "style": "punch_l"
+      },
+      {
+        "dir": [
+          0,
+          1
+        ],
+        "style": "punch_thrust"
+      },
+      {
+        "dir": [
+          0,
+          -1
+        ],
+        "style": "punch_r"
+      }
     ],
-    "neutralAlternate": ["punch_r", "punch_l"]
+    "neutralAlternate": [
+      "punch_r",
+      "punch_l"
+    ]
   },
-
   "styles": [
     {
       "name": "horizontal_r",
       "label": "Horizontal cut, weapon side across",
-      "windup": { "ticks": 12, "az": 1.45, "el": 0.05, "reach": -0.05 },
-      "cut": { "ticks": 7, "az": -2.60, "el": -0.05, "reach": 0.10 },
-      "recover": { "ticks": 10, "az": 0.30, "el": 0.10, "reach": -0.10, "settle": 4, "fade": 6 },
-      "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 },
+      "jitter": {
+        "az": 0,
+        "el": 0,
+        "tempo": 0
+      },
       "player": {
-        "windup": { "ticks": 8 },
-        "recover": { "ticks": 8, "settle": 2 },
-        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 12,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.321511,
+              0.906109,
+              -0.259701,
+              0.090291
+            ],
+            "elbow": [
+              0.609365,
+              -0.051589,
+              0.095447,
+              0.785431
+            ],
+            "wrist": [
+              0.303033,
+              -0.564534,
+              0.666637,
+              -0.380877
+            ],
+            "twist": 0.253843,
+            "pitch": -0.120604
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 4,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.198757,
+              0.804003,
+              -0.547914,
+              -0.11775
+            ],
+            "elbow": [
+              0.260185,
+              -0.431927,
+              -0.395142,
+              0.767858
+            ],
+            "wrist": [
+              0.195807,
+              -0.776256,
+              0.053782,
+              -0.596819
+            ],
+            "twist": -0.065987,
+            "pitch": -0.044948
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 5,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.196479,
+              0.731807,
+              -0.587496,
+              -0.284082
+            ],
+            "elbow": [
+              0.267133,
+              -0.429394,
+              -0.422883,
+              0.751951
+            ],
+            "wrist": [
+              -0.023919,
+              -0.809521,
+              0.200577,
+              -0.551246
+            ],
+            "twist": -0.065987,
+            "pitch": -0.044948
+          }
+        },
+        {
+          "name": "recover pre",
+          "ticks": 3,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.002175,
+              0.949651,
+              -0.25137,
+              0.187008
+            ],
+            "elbow": [
+              0.160067,
+              -0.432773,
+              -0.283845,
+              0.840546
+            ],
+            "wrist": [
+              0.154935,
+              -0.701442,
+              0.08888,
+              0.689982
+            ],
+            "twist": -0.065987,
+            "pitch": -0.044948
+          }
+        }
+      ],
+      "release": 10,
+      "forms": {
+        "short": {
+          "frames": [
+            {
+              "name": "windup",
+              "ticks": 4,
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  -0.259701,
+                  -0.090291,
+                  -0.321511,
+                  0.906109
+                ],
+                "elbow": [
+                  -0.609365,
+                  -0.051589,
+                  -0.095447,
+                  0.785431
+                ],
+                "wrist": [
+                  0.666637,
+                  -0.380877,
+                  -0.303033,
+                  0.564534
+                ],
+                "twist": 0.253843,
+                "pitch": -0.120604
+              }
+            },
+            {
+              "name": "cut a",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.556118,
+                  0.122809,
+                  -0.193462,
+                  0.798888
+                ],
+                "elbow": [
+                  -0.245627,
+                  -0.436364,
+                  0.378208,
+                  0.778597
+                ],
+                "wrist": [
+                  0.11534,
+                  -0.390872,
+                  -0.122399,
+                  0.90495
+                ],
+                "twist": -0.065987,
+                "pitch": -0.044948
+              }
+            },
+            {
+              "name": "cut b",
+              "ticks": 1,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.587496,
+                  0.284082,
+                  -0.196479,
+                  0.731807
+                ],
+                "elbow": [
+                  -0.267133,
+                  -0.429394,
+                  0.422883,
+                  0.751951
+                ],
+                "wrist": [
+                  0.195423,
+                  -0.507564,
+                  0.035845,
+                  0.838394
+                ],
+                "twist": -0.065987,
+                "pitch": -0.044948
+              }
+            },
+            {
+              "name": "cut c",
+              "ticks": 1,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.615912,
+                  0.307331,
+                  -0.164305,
+                  0.706544
+                ],
+                "elbow": [
+                  -0.266118,
+                  -0.430668,
+                  0.419778,
+                  0.753321
+                ],
+                "wrist": [
+                  0.521165,
+                  -0.487154,
+                  0.46587,
+                  0.523481
+                ],
+                "twist": -0.065987,
+                "pitch": -0.044948
+              }
+            },
+            {
+              "name": "recover pre",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.178694,
+                  0.147061,
+                  -0.047011,
+                  0.971716
+                ],
+                "elbow": [
+                  -0.117861,
+                  -0.372992,
+                  0.314775,
+                  0.864814
+                ],
+                "wrist": [
+                  0.158168,
+                  0.430458,
+                  0.150537,
+                  0.875801
+                ],
+                "twist": -0.065987,
+                "pitch": -0.044948
+              },
+              "ease": "quadIn"
+            }
+          ],
+          "release": 4
+        }
       }
     },
     {
       "name": "horizontal_l",
       "label": "Backhand cut, across to weapon side",
-      "windup": { "ticks": 13, "az": -1.30, "el": 0.04, "reach": -0.05 },
-      "cut": { "ticks": 7, "az": 2.35, "el": -0.04, "reach": 0.10 },
-      "recover": { "ticks": 11, "az": 0.30, "el": 0.10, "reach": -0.10, "settle": 5, "fade": 6 },
-      "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 },
+      "jitter": {
+        "az": 0.1,
+        "el": 0.04,
+        "tempo": 0.25
+      },
       "player": {
-        "windup": { "ticks": 8 },
-        "recover": { "ticks": 8, "settle": 2 },
-        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup1 ",
+          "ticks": 4,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.301044,
+              -0.888482,
+              0.283506,
+              0.198987
+            ],
+            "elbow": [
+              0.102233,
+              -0.261774,
+              -0.566952,
+              0.774331
+            ],
+            "wrist": [
+              0.176205,
+              -0.588466,
+              0.11174,
+              0.781136
+            ],
+            "twist": -0.318624,
+            "pitch": 0.059913
+          }
+        },
+        {
+          "name": "windup 2",
+          "ticks": 7,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.048144,
+              -0.853196,
+              0.511807,
+              0.088276
+            ],
+            "elbow": [
+              0.144986,
+              -0.309489,
+              -0.513556,
+              0.787055
+            ],
+            "wrist": [
+              -0.129085,
+              0.527682,
+              -0.134754,
+              -0.828692
+            ],
+            "twist": -0.318624,
+            "pitch": 0.059913
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 5,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.496362,
+              -0.105067,
+              -0.42143,
+              0.751653
+            ],
+            "elbow": [
+              0.054643,
+              0.33031,
+              -0.377837,
+              -0.86322
+            ],
+            "wrist": [
+              0.107358,
+              0.687483,
+              -0.19632,
+              0.690869
+            ],
+            "twist": -0.081616,
+            "pitch": 0.05845
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 4,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.28505,
+              -0.688404,
+              -0.481373,
+              0.461656
+            ],
+            "elbow": [
+              0.004618,
+              -0.096127,
+              0.60811,
+              0.787997
+            ],
+            "wrist": [
+              0.411305,
+              0.737255,
+              -0.088986,
+              0.52855
+            ],
+            "twist": 0.155392,
+            "pitch": 0.056987
+          }
+        },
+        {
+          "name": "recover",
+          "ticks": 5,
+          "from": "body",
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.077277,
+              0.047097,
+              -0.737796,
+              0.668929
+            ],
+            "elbow": [
+              -0.064296,
+              -0.029243,
+              0.438698,
+              0.895854
+            ],
+            "wrist": [
+              0.112933,
+              -0.155563,
+              -0.018071,
+              0.981183
+            ],
+            "twist": 0.153826,
+            "pitch": 0.022677
+          }
+        }
+      ],
+      "release": 6,
+      "forms": {
+        "short": {
+          "frames": [
+            {
+              "name": "windup1 ",
+              "ticks": 4,
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  0.283506,
+                  -0.198987,
+                  0.301044,
+                  -0.888482
+                ],
+                "elbow": [
+                  -0.102233,
+                  -0.261774,
+                  0.566952,
+                  0.774331
+                ],
+                "wrist": [
+                  0.11174,
+                  0.781136,
+                  -0.176205,
+                  0.588466
+                ],
+                "twist": -0.318624,
+                "pitch": 0.059913
+              }
+            },
+            {
+              "name": "windup 2",
+              "ticks": 4,
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  0.511807,
+                  -0.088276,
+                  0.048144,
+                  -0.853196
+                ],
+                "elbow": [
+                  -0.144986,
+                  -0.309489,
+                  0.513556,
+                  0.787055
+                ],
+                "wrist": [
+                  -0.134754,
+                  -0.828692,
+                  0.129085,
+                  -0.527682
+                ],
+                "twist": -0.318624,
+                "pitch": 0.059913
+              }
+            },
+            {
+              "name": "cut a",
+              "ticks": 5,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  0.496362,
+                  0.105067,
+                  0.42143,
+                  -0.751653
+                ],
+                "elbow": [
+                  0.054643,
+                  0.33031,
+                  -0.377837,
+                  -0.86322
+                ],
+                "wrist": [
+                  -0.107358,
+                  -0.687483,
+                  0.19632,
+                  -0.690869
+                ],
+                "twist": -0.081616,
+                "pitch": 0.05845
+              }
+            },
+            {
+              "name": "cut b",
+              "ticks": 4,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  0.294979,
+                  0.472531,
+                  0.701162,
+                  -0.445055
+                ],
+                "elbow": [
+                  -0.07667,
+                  -0.149587,
+                  0.637435,
+                  0.751945
+                ],
+                "wrist": [
+                  -0.183617,
+                  -0.752062,
+                  0.248892,
+                  -0.582014
+                ],
+                "twist": 0.155392,
+                "pitch": 0.056987
+              }
+            },
+            {
+              "name": "recover",
+              "ticks": 5,
+              "from": "body",
+              "ease": "quadIn",
+              "pose": {
+                "shoulder": [
+                  0.218464,
+                  -0.283706,
+                  0.245895,
+                  -0.900733
+                ],
+                "elbow": [
+                  -0.041321,
+                  -0.06064,
+                  0.159253,
+                  0.984507
+                ],
+                "wrist": [
+                  0.085215,
+                  -0.153169,
+                  0.123899,
+                  -0.976692
+                ],
+                "twist": 0.153826,
+                "pitch": 0.022677
+              }
+            }
+          ],
+          "release": 3
+        }
       }
     },
     {
       "name": "overhead",
       "label": "Overhead chop from a high guard",
-      "windup": { "ticks": 14, "az": 0.135, "el": 1.50, "reach": -0.10 },
-      "cut": { "ticks": 6, "az": -0.21, "el": -2.45, "reach": 0.14 },
-      "recover": { "ticks": 12, "az": 0.25, "el": 0.15, "reach": -0.10, "settle": 6, "fade": 6 },
-      "jitter": { "az": 0.08, "el": 0.06, "tempo": 0.22 },
+      "jitter": {
+        "az": 0.08,
+        "el": 0.06,
+        "tempo": 0.22
+      },
       "player": {
-        "windup": { "ticks": 11 },
-        "recover": { "ticks": 9, "settle": 3 },
-        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup1 ",
+          "ticks": 3,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.001475,
+              0.931165,
+              -0.037167,
+              -0.362696
+            ],
+            "elbow": [
+              0.286102,
+              -0.06624,
+              0.660305,
+              0.691198
+            ],
+            "wrist": [
+              -0.128273,
+              -0.882692,
+              -0.037619,
+              -0.450539
+            ],
+            "twist": -0.054053,
+            "pitch": 0.133232
+          },
+          "joints": {
+            "elbow": {
+              "smooth": 1
+            },
+            "shoulder": {
+              "smooth": 1
+            }
+          }
+        },
+        {
+          "name": "windup2",
+          "ticks": 3,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.381474,
+              0.776457,
+              -0.397602,
+              -0.305784
+            ],
+            "elbow": [
+              0.396471,
+              0.166242,
+              0.695486,
+              0.575738
+            ],
+            "wrist": [
+              -0.121478,
+              -0.744335,
+              0.095413,
+              -0.649696
+            ],
+            "twist": -0.054053,
+            "pitch": 0.133232
+          },
+          "joints": {
+            "elbow": {
+              "smooth": 3
+            },
+            "shoulder": {
+              "smooth": 1
+            }
+          }
+        },
+        {
+          "name": "windup 3",
+          "ticks": 2,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.835766,
+              0.230029,
+              -0.07926,
+              -0.49224
+            ],
+            "elbow": [
+              0.053031,
+              -0.277027,
+              0.370794,
+              0.884848
+            ],
+            "wrist": [
+              -0.068912,
+              -0.59954,
+              -0.054258,
+              -0.795525
+            ],
+            "twist": -0.054053,
+            "pitch": 0.133232
+          },
+          "joints": {
+            "elbow": {
+              "smooth": 1
+            },
+            "shoulder": {
+              "smooth": 1
+            }
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.392465,
+              -0.75072,
+              0.218746,
+              0.484295
+            ],
+            "elbow": [
+              0.305176,
+              -0.21556,
+              0.143766,
+              0.916369
+            ],
+            "wrist": [
+              -0.226506,
+              -0.771942,
+              0.298262,
+              -0.513655
+            ],
+            "twist": -0.083225,
+            "pitch": 0.029461
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.143223,
+              0.79431,
+              -0.045328,
+              -0.588646
+            ],
+            "elbow": [
+              0.264758,
+              -0.681936,
+              -0.018483,
+              0.68156
+            ],
+            "wrist": [
+              -0.102459,
+              0.944064,
+              -0.306554,
+              0.065347
+            ],
+            "twist": -0.083225,
+            "pitch": 0.029461
+          }
+        },
+        {
+          "name": "recover",
+          "ticks": 3,
+          "from": "body",
+          "pose": {
+            "shoulder": [
+              -0.259019,
+              -0.678058,
+              -0.080076,
+              0.68318
+            ],
+            "elbow": [
+              -0.219403,
+              0.009058,
+              -0.141443,
+              -0.965284
+            ],
+            "wrist": [
+              -0.175245,
+              -0.927485,
+              -0.043435,
+              -0.327375
+            ],
+            "twist": 0.006202,
+            "pitch": -0.030434
+          }
+        }
+      ],
+      "release": 6,
+      "forms": {
+        "short": {
+          "frames": [
+            {
+              "name": "windup1 ",
+              "ticks": 2,
+              "ease": "quadIn",
+              "pose": {
+                "shoulder": [
+                  0.122908,
+                  0.528816,
+                  -0.137967,
+                  0.82838
+                ],
+                "elbow": [
+                  -0.286102,
+                  -0.06624,
+                  -0.660305,
+                  0.691198
+                ],
+                "wrist": [
+                  0.052099,
+                  -0.625348,
+                  -0.052293,
+                  0.776847
+                ],
+                "twist": -0.054053,
+                "pitch": 0.133232
+              },
+              "joints": {
+                "elbow": {
+                  "smooth": 1
+                },
+                "shoulder": {
+                  "smooth": 1
+                }
+              }
+            },
+            {
+              "name": "windup2",
+              "ticks": 1,
+              "pose": {
+                "shoulder": [
+                  -0.521054,
+                  0.327809,
+                  -0.383903,
+                  0.688232
+                ],
+                "elbow": [
+                  -0.287451,
+                  0.270044,
+                  -0.459901,
+                  0.795575
+                ],
+                "wrist": [
+                  -0.042808,
+                  -0.6255,
+                  -0.038225,
+                  0.77811
+                ],
+                "twist": -0.054053,
+                "pitch": 0.133232
+              },
+              "joints": {
+                "elbow": {
+                  "smooth": 3
+                },
+                "shoulder": {
+                  "smooth": 1
+                }
+              }
+            },
+            {
+              "name": "windup 3",
+              "ticks": 2,
+              "ease": "quadOut",
+              "pose": {
+                "shoulder": [
+                  -0.07926,
+                  0.49224,
+                  -0.835766,
+                  0.230029
+                ],
+                "elbow": [
+                  -0.053031,
+                  -0.277027,
+                  -0.370794,
+                  0.884848
+                ],
+                "wrist": [
+                  -0.054258,
+                  -0.795525,
+                  0.068912,
+                  0.59954
+                ],
+                "twist": -0.054053,
+                "pitch": 0.133232
+              },
+              "joints": {
+                "elbow": {
+                  "smooth": 1
+                },
+                "shoulder": {
+                  "smooth": 1
+                }
+              }
+            },
+            {
+              "name": "cut a",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  0.218746,
+                  -0.484295,
+                  0.392465,
+                  -0.75072
+                ],
+                "elbow": [
+                  -0.305176,
+                  -0.21556,
+                  -0.143766,
+                  0.916369
+                ],
+                "wrist": [
+                  0.298262,
+                  -0.513655,
+                  0.226506,
+                  0.771942
+                ],
+                "twist": -0.083225,
+                "pitch": 0.029461
+              }
+            },
+            {
+              "name": "cut b",
+              "ticks": 1,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.045328,
+                  0.588646,
+                  -0.143223,
+                  0.79431
+                ],
+                "elbow": [
+                  -0.264758,
+                  -0.681936,
+                  0.018483,
+                  0.68156
+                ],
+                "wrist": [
+                  -0.306554,
+                  0.065347,
+                  0.102459,
+                  -0.944064
+                ],
+                "twist": -0.083225,
+                "pitch": 0.029461
+              }
+            },
+            {
+              "name": "recover",
+              "ticks": 5,
+              "from": "body",
+              "pose": {
+                "shoulder": [
+                  -0.080076,
+                  -0.68318,
+                  0.259019,
+                  -0.678058
+                ],
+                "elbow": [
+                  0.219403,
+                  0.009058,
+                  0.141443,
+                  -0.965284
+                ],
+                "wrist": [
+                  -0.043435,
+                  -0.327375,
+                  0.175245,
+                  0.927485
+                ],
+                "twist": 0.006202,
+                "pitch": -0.030434
+              },
+              "ease": "cubicOut"
+            }
+          ],
+          "release": 3
+        }
       }
     },
     {
-      "name": "diagonal",
-      "label": "Descending diagonal, shoulder to hip",
-      "windup": { "ticks": 12, "az": 1.15, "el": 1.15, "reach": -0.08 },
-      "cut": { "ticks": 7, "az": -1.95, "el": -1.85, "reach": 0.12 },
-      "recover": { "ticks": 10, "az": 0.30, "el": 0.12, "reach": -0.10, "settle": 4, "fade": 6 },
-      "jitter": { "az": 0.12, "el": 0.06, "tempo": 0.25 },
+      "name": "diag_tr_bl",
+      "label": "Diagonal: top right to down left (descending forehand)",
+      "jitter": {
+        "az": 0.12,
+        "el": 0.06,
+        "tempo": 0.25
+      },
       "player": {
-        "windup": { "ticks": 7 },
-        "recover": { "ticks": 8, "settle": 2 },
-        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 12,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.084354,
+              0.18226,
+              -0.827526,
+              0.524277
+            ],
+            "elbow": [
+              0.155224,
+              0,
+              -0.877471,
+              0.453817
+            ],
+            "wrist": [
+              0.062943,
+              -0.273852,
+              -0.956768,
+              0.07509
+            ],
+            "twist": 0.253843,
+            "pitch": 0.090385
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 3,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.189425,
+              0.182139,
+              -0.952827,
+              0.151872
+            ],
+            "elbow": [
+              0.0935,
+              0,
+              -0.893531,
+              0.439158
+            ],
+            "wrist": [
+              0.094719,
+              -0.260759,
+              -0.718433,
+              0.637877
+            ],
+            "twist": -0.003832,
+            "pitch": 0.020905
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 4,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.224554,
+              -0.160822,
+              0.927626,
+              0.251437
+            ],
+            "elbow": [
+              0.031374,
+              0,
+              -0.905765,
+              0.422618
+            ],
+            "wrist": [
+              0.091003,
+              -0.149956,
+              -0.210892,
+              0.961643
+            ],
+            "twist": -0.261506,
+            "pitch": -0.048574
+          }
+        },
+        {
+          "name": "recover",
+          "ticks": 4,
+          "from": "body",
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.567476,
+              0.126539,
+              0.639027,
+              0.503591
+            ],
+            "elbow": [
+              -0.408956,
+              0,
+              -0.715816,
+              0.566006
+            ],
+            "wrist": [
+              0.242087,
+              0.234867,
+              -0.26677,
+              0.90281
+            ],
+            "twist": -0.2897,
+            "pitch": -0.019774
+          }
+        }
+      ],
+      "release": 6,
+      "forms": {
+        "short": {
+          "frames": [
+            {
+              "name": "windup",
+              "ticks": 6,
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  -0.649485,
+                  0.233665,
+                  -0.503959,
+                  0.519225
+                ],
+                "elbow": [
+                  -0.020372,
+                  0.13226,
+                  -0.114698,
+                  0.984346
+                ],
+                "wrist": [
+                  -0.0132,
+                  0.887482,
+                  -0.050552,
+                  -0.457872
+                ],
+                "twist": 0.253843,
+                "pitch": 0.090385
+              }
+            },
+            {
+              "name": "cut a",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.174387,
+                  0.712388,
+                  -0.460676,
+                  0.499869
+                ],
+                "elbow": [
+                  -0.077435,
+                  0.393883,
+                  -0.395894,
+                  0.82591
+                ],
+                "wrist": [
+                  -0.120249,
+                  0.966588,
+                  -0.136578,
+                  0.180541
+                ],
+                "twist": -0.003832,
+                "pitch": 0.020905
+              },
+              "ease": "quadIn"
+            },
+            {
+              "name": "cut b",
+              "ticks": 3,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  0.097133,
+                  -0.953148,
+                  0.283648,
+                  -0.040234
+                ],
+                "elbow": [
+                  -0.006842,
+                  -0.020441,
+                  -0.068923,
+                  0.997389
+                ],
+                "wrist": [
+                  0.160357,
+                  0.923271,
+                  -0.346023,
+                  -0.046082
+                ],
+                "twist": -0.261506,
+                "pitch": -0.048574
+              },
+              "ease": "quadOut"
+            },
+            {
+              "name": "recover",
+              "ticks": 4,
+              "from": "body",
+              "ease": "quadOut",
+              "pose": {
+                "shoulder": [
+                  -0.212664,
+                  -0.930624,
+                  0.084994,
+                  -0.285462
+                ],
+                "elbow": [
+                  -0.05047,
+                  -0.343482,
+                  -0.373051,
+                  0.86041
+                ],
+                "wrist": [
+                  -0.135206,
+                  -0.628279,
+                  -0.069441,
+                  0.762996
+                ],
+                "twist": -0.2897,
+                "pitch": -0.019774
+              }
+            }
+          ],
+          "release": 4
+        }
+      }
+    },
+    {
+      "name": "diag_tl_br",
+      "label": "Diagonal: top left to down right (descending backhand; generated: the saved diagonal mirrored)",
+      "jitter": {
+        "az": 0.12,
+        "el": 0.06,
+        "tempo": 0.25
+      },
+      "player": {
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 12,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.827526,
+              -0.524277,
+              -0.084354,
+              -0.18226
+            ],
+            "elbow": [
+              -0.155224,
+              0,
+              -0.877471,
+              0.453817
+            ],
+            "wrist": [
+              0.058133,
+              -0.908372,
+              -0.407239,
+              0.075081
+            ],
+            "twist": -0.253843,
+            "pitch": 0.090385
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 3,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.952827,
+              -0.151872,
+              -0.189425,
+              -0.182139
+            ],
+            "elbow": [
+              -0.0935,
+              0,
+              -0.893531,
+              0.439158
+            ],
+            "wrist": [
+              0.612384,
+              -0.67859,
+              -0.359995,
+              0.186828
+            ],
+            "twist": 0.003832,
+            "pitch": 0.020905
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 4,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.927627,
+              -0.251437,
+              0.224554,
+              0.160822
+            ],
+            "elbow": [
+              -0.031374,
+              0,
+              -0.905765,
+              0.422618
+            ],
+            "wrist": [
+              0.937167,
+              -0.194532,
+              -0.177856,
+              0.228568
+            ],
+            "twist": 0.261506,
+            "pitch": -0.048574
+          }
+        },
+        {
+          "name": "recover",
+          "ticks": 4,
+          "from": "body",
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.639027,
+              -0.503591,
+              -0.567476,
+              -0.126539
+            ],
+            "elbow": [
+              0.408956,
+              0,
+              -0.715816,
+              0.566006
+            ],
+            "wrist": [
+              0.856936,
+              -0.304365,
+              0.196163,
+              0.3668
+            ],
+            "twist": 0.2897,
+            "pitch": -0.019774
+          }
+        }
+      ],
+      "release": 6,
+      "forms": {
+        "short": {
+          "frames": [
+            {
+              "name": "windup",
+              "ticks": 6,
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  0.827432,
+                  -0.078658,
+                  -0.133821,
+                  -0.539686
+                ],
+                "elbow": [
+                  0.001215,
+                  -0.13314,
+                  -0.006966,
+                  0.991072
+                ],
+                "wrist": [
+                  0.441873,
+                  0.095136,
+                  0.779817,
+                  0.433108
+                ],
+                "twist": -0.253843,
+                "pitch": 0.090385
+              }
+            },
+            {
+              "name": "cut a",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  0.460676,
+                  -0.499869,
+                  0.174387,
+                  -0.712388
+                ],
+                "elbow": [
+                  0.077435,
+                  -0.393883,
+                  -0.395894,
+                  0.82591
+                ],
+                "wrist": [
+                  0.194835,
+                  -0.27461,
+                  0.936232,
+                  -0.100489
+                ],
+                "twist": 0.003832,
+                "pitch": 0.020905
+              }
+            },
+            {
+              "name": "cut b",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.307077,
+                  0.108257,
+                  0.131652,
+                  0.936297
+                ],
+                "elbow": [
+                  0.038497,
+                  0.02051,
+                  -0.462476,
+                  0.885558
+                ],
+                "wrist": [
+                  0.026059,
+                  -0.482982,
+                  0.875242,
+                  -0.001025
+                ],
+                "twist": 0.261506,
+                "pitch": -0.048574
+              }
+            },
+            {
+              "name": "recover",
+              "ticks": 3,
+              "from": "body",
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  -0.084994,
+                  0.285462,
+                  0.212664,
+                  0.930624
+                ],
+                "elbow": [
+                  0.05047,
+                  0.343482,
+                  -0.373051,
+                  0.86041
+                ],
+                "wrist": [
+                  0.773941,
+                  0.015288,
+                  -0.632754,
+                  -0.020096
+                ],
+                "twist": 0.2897,
+                "pitch": -0.019774
+              }
+            }
+          ],
+          "release": 3
+        }
+      }
+    },
+    {
+      "name": "diag_br_tl",
+      "label": "Diagonal: down right to top left (rising backhand; generated: mirrored and reversed)",
+      "jitter": {
+        "az": 0.12,
+        "el": 0.06,
+        "tempo": 0.25
+      },
+      "player": {
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 12,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.927627,
+              -0.251437,
+              0.224554,
+              0.160822
+            ],
+            "elbow": [
+              -0.031374,
+              0,
+              -0.905765,
+              0.422618
+            ],
+            "wrist": [
+              0.937167,
+              -0.194532,
+              -0.177856,
+              0.228568
+            ],
+            "twist": 0.261506,
+            "pitch": -0.048574
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 4,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.952827,
+              -0.151872,
+              -0.189425,
+              -0.182139
+            ],
+            "elbow": [
+              -0.0935,
+              0,
+              -0.893531,
+              0.439158
+            ],
+            "wrist": [
+              0.612384,
+              -0.67859,
+              -0.359995,
+              0.186828
+            ],
+            "twist": 0.003832,
+            "pitch": 0.020905
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 3,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.827526,
+              -0.524277,
+              -0.084354,
+              -0.18226
+            ],
+            "elbow": [
+              -0.155224,
+              0,
+              -0.877471,
+              0.453817
+            ],
+            "wrist": [
+              0.058133,
+              -0.908372,
+              -0.407239,
+              0.075081
+            ],
+            "twist": -0.253843,
+            "pitch": 0.090385
+          }
+        },
+        {
+          "name": "recover",
+          "ticks": 4,
+          "from": "body",
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.929916,
+              0.061356,
+              0.239048,
+              -0.272666
+            ],
+            "elbow": [
+              0.132937,
+              0,
+              -0.834767,
+              0.534314
+            ],
+            "wrist": [
+              0.573275,
+              -0.759759,
+              -0.132235,
+              0.276831
+            ],
+            "twist": 0.017929,
+            "pitch": 0.035306
+          }
+        }
+      ],
+      "release": 6,
+      "forms": {
+        "short": {
+          "frames": [
+            {
+              "name": "windup",
+              "ticks": 6,
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  -0.307077,
+                  0.108257,
+                  0.131652,
+                  0.936297
+                ],
+                "elbow": [
+                  0.038497,
+                  0.02051,
+                  -0.462476,
+                  0.885558
+                ],
+                "wrist": [
+                  0.026059,
+                  -0.482982,
+                  0.875242,
+                  -0.001025
+                ],
+                "twist": 0.261506,
+                "pitch": -0.048574
+              }
+            },
+            {
+              "name": "cut a",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  0.460676,
+                  -0.499869,
+                  0.174387,
+                  -0.712388
+                ],
+                "elbow": [
+                  0.077435,
+                  -0.393883,
+                  -0.395894,
+                  0.82591
+                ],
+                "wrist": [
+                  0.194835,
+                  -0.27461,
+                  0.936232,
+                  -0.100489
+                ],
+                "twist": 0.003832,
+                "pitch": 0.020905
+              }
+            },
+            {
+              "name": "cut b",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  0.827432,
+                  -0.078658,
+                  -0.133821,
+                  -0.539686
+                ],
+                "elbow": [
+                  0.001215,
+                  -0.13314,
+                  -0.006966,
+                  0.991072
+                ],
+                "wrist": [
+                  0.441873,
+                  0.095136,
+                  0.779817,
+                  0.433108
+                ],
+                "twist": -0.253843,
+                "pitch": 0.090385
+              }
+            },
+            {
+              "name": "recover",
+              "ticks": 3,
+              "from": "body",
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  0.510893,
+                  -0.388185,
+                  0.107237,
+                  -0.759474
+                ],
+                "elbow": [
+                  0.027168,
+                  0.110564,
+                  -0.199751,
+                  0.97321
+                ],
+                "wrist": [
+                  -0.218136,
+                  0.052452,
+                  0.927919,
+                  0.29771
+                ],
+                "twist": 0.017929,
+                "pitch": 0.035306
+              }
+            }
+          ],
+          "release": 3
+        }
+      }
+    },
+    {
+      "name": "diag_bl_tr",
+      "label": "Diagonal: down left to top right (rising forehand; generated: the saved diagonal reversed)",
+      "jitter": {
+        "az": 0.12,
+        "el": 0.06,
+        "tempo": 0.25
+      },
+      "player": {
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 12,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.224554,
+              -0.160822,
+              0.927626,
+              0.251437
+            ],
+            "elbow": [
+              0.031374,
+              0,
+              -0.905765,
+              0.422618
+            ],
+            "wrist": [
+              0.091003,
+              -0.149956,
+              -0.210892,
+              0.961643
+            ],
+            "twist": -0.261506,
+            "pitch": -0.048574
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 4,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.189425,
+              0.182139,
+              -0.952827,
+              0.151872
+            ],
+            "elbow": [
+              0.0935,
+              0,
+              -0.893531,
+              0.439158
+            ],
+            "wrist": [
+              0.094719,
+              -0.260759,
+              -0.718433,
+              0.637877
+            ],
+            "twist": -0.003832,
+            "pitch": 0.020905
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 3,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              0.084354,
+              0.18226,
+              -0.827526,
+              0.524277
+            ],
+            "elbow": [
+              0.155224,
+              0,
+              -0.877471,
+              0.453817
+            ],
+            "wrist": [
+              0.062943,
+              -0.273852,
+              -0.956768,
+              0.07509
+            ],
+            "twist": 0.253843,
+            "pitch": 0.090385
+          }
+        },
+        {
+          "name": "recover",
+          "ticks": 4,
+          "from": "body",
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.239048,
+              0.272666,
+              -0.929916,
+              -0.061356
+            ],
+            "elbow": [
+              -0.132937,
+              0,
+              -0.834767,
+              0.534314
+            ],
+            "wrist": [
+              0.191096,
+              -0.024423,
+              -0.766525,
+              0.612637
+            ],
+            "twist": -0.017929,
+            "pitch": 0.035306
+          }
+        }
+      ],
+      "release": 6,
+      "forms": {
+        "short": {
+          "frames": [
+            {
+              "name": "windup",
+              "ticks": 6,
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  -0.131652,
+                  -0.936297,
+                  0.307077,
+                  -0.108257
+                ],
+                "elbow": [
+                  -0.038497,
+                  -0.02051,
+                  -0.462476,
+                  0.885558
+                ],
+                "wrist": [
+                  0.001843,
+                  0.935243,
+                  -0.352788,
+                  0.029276
+                ],
+                "twist": -0.261506,
+                "pitch": -0.048574
+              }
+            },
+            {
+              "name": "cut a",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.174387,
+                  0.712388,
+                  -0.460676,
+                  0.499869
+                ],
+                "elbow": [
+                  -0.077435,
+                  0.393883,
+                  -0.395894,
+                  0.82591
+                ],
+                "wrist": [
+                  -0.120249,
+                  0.966588,
+                  -0.136578,
+                  0.180541
+                ],
+                "twist": -0.003832,
+                "pitch": 0.020905
+              }
+            },
+            {
+              "name": "cut b",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  0.133821,
+                  0.539686,
+                  -0.827432,
+                  0.078658
+                ],
+                "elbow": [
+                  -0.001215,
+                  0.13314,
+                  -0.006966,
+                  0.991072
+                ],
+                "wrist": [
+                  0.371394,
+                  0.75495,
+                  0.208879,
+                  0.498484
+                ],
+                "twist": 0.253843,
+                "pitch": 0.090385
+              }
+            },
+            {
+              "name": "recover",
+              "ticks": 3,
+              "from": "body",
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  -0.107237,
+                  0.759474,
+                  -0.510893,
+                  0.388185
+                ],
+                "elbow": [
+                  -0.027168,
+                  -0.110564,
+                  -0.199751,
+                  0.97321
+                ],
+                "wrist": [
+                  0.332786,
+                  0.908645,
+                  0.182829,
+                  -0.173758
+                ],
+                "twist": -0.017929,
+                "pitch": 0.035306
+              }
+            }
+          ],
+          "release": 3
+        }
       }
     },
     {
       "name": "thrust",
       "label": "Rear chamber, then a straight thrust",
-      "windup": { "ticks": 11, "az": 0.38, "el": 0.05, "reach": -0.45 },
-      "cut": { "ticks": 5, "az": -0.48, "el": -0.05, "reach": 0.85 },
-      "recover": { "ticks": 12, "az": 0.28, "el": 0.08, "reach": -0.20, "settle": 6, "fade": 6 },
-      "jitter": { "az": 0.08, "el": 0.04, "tempo": 0.28 },
+      "jitter": {
+        "az": 0.08,
+        "el": 0.04,
+        "tempo": 0.28
+      },
       "player": {
-        "windup": { "ticks": 6 },
-        "recover": { "ticks": 9, "settle": 3 },
-        "jitter": { "az": 0, "el": 0, "tempo": 0 }
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 11,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.523934,
+              -0.186208,
+              -0.74259,
+              0.373336
+            ],
+            "elbow": [
+              -0.776333,
+              0,
+              -0.115379,
+              0.619673
+            ],
+            "wrist": [
+              -0.539072,
+              -0.184239,
+              -0.819066,
+              0.067733
+            ],
+            "twist": 0.031465,
+            "pitch": 0.053228
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.165809,
+              -0.01933,
+              -0.984867,
+              0.046594
+            ],
+            "elbow": [
+              -0.440145,
+              0,
+              -0.529616,
+              0.725106
+            ],
+            "wrist": [
+              -0.230335,
+              -0.112412,
+              -0.911917,
+              0.320495
+            ],
+            "twist": -0.032144,
+            "pitch": 0.055285
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 3,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.246434,
+              -0.158301,
+              0.910515,
+              0.291845
+            ],
+            "elbow": [
+              0.026208,
+              0,
+              -0.78723,
+              0.616103
+            ],
+            "wrist": [
+              0.118246,
+              -0.021139,
+              -0.847017,
+              0.517816
+            ],
+            "twist": -0.095753,
+            "pitch": 0.057342
+          }
+        },
+        {
+          "name": "recover",
+          "ticks": 6,
+          "from": "body",
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.539656,
+              0.061307,
+              0.750042,
+              0.377425
+            ],
+            "elbow": [
+              -0.262287,
+              0,
+              -0.527853,
+              0.807822
+            ],
+            "wrist": [
+              -0.028048,
+              -0.046756,
+              0.978679,
+              0.198025
+            ],
+            "twist": -0.001754,
+            "pitch": 0.017736
+          }
+        }
+      ],
+      "release": 6,
+      "forms": {
+        "short": {
+          "frames": [
+            {
+              "name": "windup",
+              "ticks": 11,
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  -0.523934,
+                  -0.186208,
+                  -0.74259,
+                  0.373336
+                ],
+                "elbow": [
+                  -0.776333,
+                  0,
+                  -0.115379,
+                  0.619673
+                ],
+                "wrist": [
+                  -0.539072,
+                  -0.184239,
+                  -0.819066,
+                  0.067733
+                ],
+                "twist": 0.031465,
+                "pitch": 0.053228
+              }
+            },
+            {
+              "name": "cut a",
+              "ticks": 2,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.165809,
+                  -0.01933,
+                  -0.984867,
+                  0.046594
+                ],
+                "elbow": [
+                  -0.440145,
+                  0,
+                  -0.529616,
+                  0.725106
+                ],
+                "wrist": [
+                  -0.230335,
+                  -0.112412,
+                  -0.911917,
+                  0.320495
+                ],
+                "twist": -0.032144,
+                "pitch": 0.055285
+              }
+            },
+            {
+              "name": "cut b",
+              "ticks": 3,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.246434,
+                  -0.158301,
+                  0.910515,
+                  0.291845
+                ],
+                "elbow": [
+                  0.026208,
+                  0,
+                  -0.78723,
+                  0.616103
+                ],
+                "wrist": [
+                  0.118246,
+                  -0.021139,
+                  -0.847017,
+                  0.517816
+                ],
+                "twist": -0.095753,
+                "pitch": 0.057342
+              }
+            },
+            {
+              "name": "recover",
+              "ticks": 6,
+              "from": "body",
+              "ease": "quadInOut",
+              "pose": {
+                "shoulder": [
+                  0.539656,
+                  0.061307,
+                  0.750042,
+                  0.377425
+                ],
+                "elbow": [
+                  -0.262287,
+                  0,
+                  -0.527853,
+                  0.807822
+                ],
+                "wrist": [
+                  -0.028048,
+                  -0.046756,
+                  0.978679,
+                  0.198025
+                ],
+                "twist": -0.001754,
+                "pitch": 0.017736
+              }
+            }
+          ],
+          "release": 6
+        }
       }
     },
-
     {
       "//": "UNARMED, FROM HERE DOWN (docs/PLAN_impact_unarmed.md §5). Every one of these names a `weapon` -- a natural weapon on the creature's own rig (mob.h MobNaturalWeaponDef) rather than the default \"held\" -- and StyleUsable refuses it on a body that has not got that part, so a one-armed creature's repertoire shrinks by itself. The punches are all `fallback: true`: a duelist lists them beside its cuts, never draws one while a sword is in its fist, and throws nothing else once disarmed. The zombie's bites are NOT fallback, because biting is what it does. Numbers are starting points; the tuner's Attacks lane is where they get finished.",
-
       "name": "punch_r",
       "label": "Straight right",
       "weapon": "fist.R",
       "fallback": true,
       "reach": 0,
-      "windup": { "ticks": 8, "az": 0.35, "el": 0.07, "reach": -0.40 },
-      "cut": { "ticks": 4, "az": -0.48, "el": -0.08, "reach": 0.80 },
-      "recover": { "ticks": 9, "az": 0.20, "el": 0.08, "reach": -0.35, "settle": 3, "fade": 6 },
-      "jitter": { "az": 0.08, "el": 0.05, "tempo": 0.25 },
+      "jitter": {
+        "az": 0.08,
+        "el": 0.05,
+        "tempo": 0.25
+      },
       "clip": "punch_r",
       "player": {
-        "windup": { "ticks": 6, "az": 0.095, "reach": -0.45, "el": 0.07 },
-        "cut": { "az": -0.13, "reach": 0.90, "el": -0.08 },
-        "recover": { "ticks": 5, "fade": 5 },
-        "jitter": { "az": 0, "el": 0, "tempo": 0 }
-      }
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 6,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.180205,
+              -0.145346,
+              0.002352,
+              0.972829
+            ],
+            "elbow": [
+              -0.842304,
+              0,
+              0.095514,
+              0.530472
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": -0.061604,
+            "pitch": -0.160697
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.067703,
+              -0.15021,
+              -0.009027,
+              0.986292
+            ],
+            "elbow": [
+              -0.727046,
+              0,
+              0.121331,
+              0.675783
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": -0.080716,
+            "pitch": -0.081962
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.311503,
+              -0.147708,
+              -0.001986,
+              0.938693
+            ],
+            "elbow": [
+              -0.586293,
+              0,
+              0.142893,
+              0.797397
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": -0.099828,
+            "pitch": -0.003227
+          }
+        }
+      ],
+      "release": 5
     },
     {
       "name": "punch_l",
@@ -135,17 +2403,103 @@
       "weapon": "fist.L",
       "fallback": true,
       "reach": 0,
-      "windup": { "ticks": 9, "az": -0.35, "el": 0.07, "reach": -0.40 },
-      "cut": { "ticks": 4, "az": 0.48, "el": -0.08, "reach": 0.80 },
-      "recover": { "ticks": 10, "az": -0.20, "el": 0.08, "reach": -0.35, "settle": 4, "fade": 6 },
-      "jitter": { "az": 0.08, "el": 0.05, "tempo": 0.25 },
+      "jitter": {
+        "az": 0.08,
+        "el": 0.05,
+        "tempo": 0.25
+      },
       "clip": "punch_l",
       "player": {
-        "windup": { "ticks": 6, "az": -0.095, "reach": -0.45, "el": 0.07 },
-        "cut": { "az": 0.13, "reach": 0.90, "el": -0.08 },
-        "recover": { "ticks": 5, "fade": 5 },
-        "jitter": { "az": 0, "el": 0, "tempo": 0 }
-      }
+        "jitter": {
+          "az": 0,
+          "el": 0,
+          "tempo": 0
+        }
+      },
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 6,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.180205,
+              0.145346,
+              -0.002352,
+              0.972829
+            ],
+            "elbow": [
+              -0.842304,
+              0,
+              -0.095514,
+              0.530472
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": 0.061604,
+            "pitch": -0.160697
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.067703,
+              0.15021,
+              0.009027,
+              0.986292
+            ],
+            "elbow": [
+              -0.727046,
+              0,
+              -0.121331,
+              0.675783
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": 0.080716,
+            "pitch": -0.081962
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.311503,
+              0.147708,
+              0.001986,
+              0.938693
+            ],
+            "elbow": [
+              -0.586293,
+              0,
+              -0.142893,
+              0.797397
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": 0.099828,
+            "pitch": -0.003227
+          }
+        }
+      ],
+      "release": 5
     },
     {
       "name": "hook_r",
@@ -153,51 +2507,361 @@
       "weapon": "fist.R",
       "fallback": true,
       "reach": 0,
-      "windup": { "ticks": 10, "az": 1.30, "el": 0.14, "reach": -0.20 },
-      "cut": { "ticks": 5, "az": -1.85, "el": -0.18, "reach": 0.20 },
-      "recover": { "ticks": 11, "az": 0.45, "el": 0.10, "reach": -0.25, "settle": 5, "fade": 6 },
-      "jitter": { "az": 0.10, "el": 0.05, "tempo": 0.25 },
-      "clip": "punch_r"
+      "jitter": {
+        "az": 0.1,
+        "el": 0.05,
+        "tempo": 0.25
+      },
+      "clip": "punch_r",
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 10,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.004976,
+              -0.075982,
+              0.004085,
+              0.997088
+            ],
+            "elbow": [
+              -0.717334,
+              0,
+              -0.514163,
+              0.470179
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": 0.216383,
+            "pitch": -0.076312
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.143708,
+              -0.183674,
+              -0.124648,
+              0.964404
+            ],
+            "elbow": [
+              -0.751947,
+              0,
+              0.082329,
+              0.654063
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": 0.026216,
+            "pitch": -0.026782
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 3,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.303913,
+              -0.309453,
+              -0.138132,
+              0.890391
+            ],
+            "elbow": [
+              -0.492689,
+              0,
+              0.646646,
+              0.582329
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": -0.163951,
+            "pitch": 0.022748
+          }
+        },
+        {
+          "name": "recover",
+          "ticks": 5,
+          "from": "body",
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.37146,
+              -0.217927,
+              -0.083274,
+              0.89866
+            ],
+            "elbow": [
+              -0.542583,
+              0,
+              0.719413,
+              0.433646
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": -0.180415,
+            "pitch": 0.020422
+          }
+        }
+      ],
+      "release": 6
     },
     {
       "name": "bite",
       "label": "Bite",
       "weapon": "jaws",
       "reach": 0,
-      "windup": { "ticks": 10, "az": 0.63, "el": 0.975, "reach": -0.10 },
-      "cut": { "ticks": 4, "az": -0.94, "el": -1.45, "reach": 0.20 },
-      "recover": { "ticks": 12, "az": 0.00, "el": 0.10, "reach": 0.00, "settle": 6, "fade": 6 },
-      "jitter": { "az": 0.24, "el": 0.10, "tempo": 0.22 },
-      "target": { "arm": 0.46, "leg": 0.24, "hand": 0.16, "head": 0.07, "spine": 0.07 },
-      "targetProne": { "leg": 0.90, "hand": 0.06, "arm": 0.04 },
-      "clip": "bite"
+      "jitter": {
+        "az": 0.24,
+        "el": 0.1,
+        "tempo": 0.22
+      },
+      "target": {
+        "arm": 0.46,
+        "leg": 0.24,
+        "hand": 0.16,
+        "head": 0.07,
+        "spine": 0.07
+      },
+      "targetProne": {
+        "leg": 0.9,
+        "hand": 0.06,
+        "arm": 0.04
+      },
+      "clip": "bite",
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 10,
+          "az": 0.63,
+          "el": 0.975,
+          "reach": -0.1,
+          "ease": "chase"
+        },
+        {
+          "name": "cut",
+          "ticks": 4,
+          "az": -0.31,
+          "el": -0.475,
+          "reach": 0.1,
+          "cuts": true
+        },
+        {
+          "name": "recover",
+          "ticks": 6,
+          "az": 0,
+          "el": 0.1,
+          "reach": 0,
+          "from": "body",
+          "ease": "chase",
+          "lean": "hold"
+        }
+      ],
+      "release": 6
     },
     {
       "name": "bite_lunge",
       "label": "Lunge and bite",
       "weapon": "jaws",
       "reach": 0,
-      "lunge": { "ticks": 10, "speed": 10.0, "rise": 1.5, "at": "windup" },
-      "target": { "arm": 0.46, "leg": 0.24, "hand": 0.16, "head": 0.07, "spine": 0.07 },
-      "targetProne": { "leg": 0.90, "hand": 0.06, "arm": 0.04 },
-      "windup": { "ticks": 10, "az": 0.59, "el": 1.075, "reach": -0.10 },
-      "cut": { "ticks": 4, "az": -0.88, "el": -1.60, "reach": 0.20 },
-      "recover": { "ticks": 14, "az": 0.00, "el": 0.10, "reach": 0.00, "settle": 8, "fade": 6 },
-      "jitter": { "az": 0.22, "el": 0.10, "tempo": 0.18 },
-      "clip": "lunge"
+      "lunge": {
+        "ticks": 10,
+        "speed": 10,
+        "rise": 1.5,
+        "at": "windup"
+      },
+      "target": {
+        "arm": 0.46,
+        "leg": 0.24,
+        "hand": 0.16,
+        "head": 0.07,
+        "spine": 0.07
+      },
+      "targetProne": {
+        "leg": 0.9,
+        "hand": 0.06,
+        "arm": 0.04
+      },
+      "jitter": {
+        "az": 0.22,
+        "el": 0.1,
+        "tempo": 0.18
+      },
+      "clip": "lunge",
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 10,
+          "az": 0.59,
+          "el": 1.075,
+          "reach": -0.1,
+          "ease": "chase"
+        },
+        {
+          "name": "cut",
+          "ticks": 4,
+          "az": -0.29,
+          "el": -0.525,
+          "reach": 0.1,
+          "cuts": true
+        },
+        {
+          "name": "recover",
+          "ticks": 8,
+          "az": 0,
+          "el": 0.1,
+          "reach": 0,
+          "from": "body",
+          "ease": "chase",
+          "lean": "hold"
+        }
+      ],
+      "release": 6
     },
-
     {
       "name": "punch_thrust",
       "label": "Two-handed drive",
       "weapon": "fist.R",
       "reach": 0,
       "//": "Player-only unarmed thrust (down flick). The deepest chamber and the longest drive in the block, and almost no azimuth — it is the punch you throw with your weight behind it.",
-      "windup": { "ticks": 6, "az": 0.12, "el": 0.02, "reach": -0.50 },
-      "cut": { "ticks": 4, "az": -0.16, "el": -0.02, "reach": 0.95 },
-      "recover": { "ticks": 7, "az": 0.08, "el": 0.04, "reach": -0.45, "settle": 1, "fade": 6 },
-      "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 },
-      "clip": "punch_r"
+      "jitter": {
+        "az": 0,
+        "el": 0,
+        "tempo": 0
+      },
+      "clip": "punch_r",
+      "frames": [
+        {
+          "name": "windup",
+          "ticks": 6,
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              0.180044,
+              -0.144996,
+              0.00372,
+              0.972906
+            ],
+            "elbow": [
+              -0.843591,
+              0,
+              0.083426,
+              0.530467
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": -0.054401,
+            "pitch": -0.160697
+          }
+        },
+        {
+          "name": "cut a",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.069175,
+              -0.150165,
+              -0.010795,
+              0.986179
+            ],
+            "elbow": [
+              -0.72782,
+              0,
+              0.11554,
+              0.675965
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": -0.076554,
+            "pitch": -0.08125
+          }
+        },
+        {
+          "name": "cut b",
+          "ticks": 2,
+          "cuts": true,
+          "pose": {
+            "shoulder": [
+              -0.314315,
+              -0.147925,
+              -0.003882,
+              0.937715
+            ],
+            "elbow": [
+              -0.586135,
+              0,
+              0.14354,
+              0.797397
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": -0.098707,
+            "pitch": -0.001803
+          }
+        },
+        {
+          "name": "recover",
+          "ticks": 1,
+          "from": "body",
+          "ease": "quadInOut",
+          "pose": {
+            "shoulder": [
+              -0.476714,
+              -0.01302,
+              0.071243,
+              0.87607
+            ],
+            "elbow": [
+              -0.567433,
+              0,
+              0.133173,
+              0.812579
+            ],
+            "wrist": [
+              0,
+              0,
+              0,
+              1
+            ],
+            "twist": -0.093713,
+            "pitch": 0.013984
+          }
+        }
+      ],
+      "release": 6
     }
   ]
 }

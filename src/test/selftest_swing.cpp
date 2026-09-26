@@ -2236,6 +2236,10 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
     float cmdAzArc = 0, cmdElArc = 0, cPrevAz = 0, cPrevEl = 0;
     bool cHavePrev = false;
     float rMin = 1e9f, rMax = -1e9f;
+    // The POSED tip's distance from the shoulder: a keyed style has no
+    // commanded radius (strokes.h "A FRAME IS A POSE"), so a thrust's reach is
+    // read off the sword itself.
+    float prMin = 1e9f, prMax = -1e9f;
     int cutTicks = 0;
     float headMin = 1e9f;
     // ---- THE ONE-FRAME JUMP, ATTRIBUTED (the "hand teleports above the head
@@ -2270,7 +2274,7 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
           StepStrokeProgram(cur, &sty, melee, 0.0f, 0.0f, 0.0f, kTickDt,
                             kR, kU, kF);
       if (r == StrokeStepResult::Finished) cur.Reset();
-      avatar.SetWeaponPose(melee.Pose());
+      avatar.SetWeaponPose(StrokePoseNow(cur, &sty, melee));
       avTick();
 
       {
@@ -2342,6 +2346,8 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
           prevAz = paz;
           prevEl = pel;
           havePrev = true;
+          prMin = std::min(prMin, fs.len());
+          prMax = std::max(prMax, fs.len());
         }
         const float cr = melee.StrokeRadius();
         rMin = std::min(rMin, cr);
@@ -2391,9 +2397,18 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
     const float dr = rMax > rMin ? rMax - rMin : 0.0f;
     const std::string n = "\"" + sty.name + "\"";
     check(cutTicks >= 2, "style " + n + " spent time cutting");
-    check(azArc + elArc > minSweep,
+    // A KEYED style (strokes.h "A FRAME IS A POSE") commands no arc and states
+    // no az / el / reach, so the claims below that CLASSIFY a style by its
+    // authored travel and read the driver's commanded arc have nothing to
+    // read: the poses are the whole of it. What still applies is that the
+    // sword itself moved -- sweeping, or reaching -- and the head clearance.
+    const bool keyed = sty.Keyed();
+    const float posedDr = prMax > prMin ? prMax - prMin : 0.0f;
+    check(azArc + elArc > minSweep || (keyed && posedDr > minReach),
           "style " + n + ": the SWORD moved, not just the stroke");
-    if (wantR > wantAz && wantR > wantEl) {
+    if (keyed) {
+      // (nothing authored to classify)
+    } else if (wantR > wantAz && wantR > wantEl) {
       check(dr > minReach, "style " + n + " (thrust) extended its reach");
       // Commanded arcs, npc-styles' restated claim (see _npcStyles_about):
       // the posed sword always sweeps some arc serving a straight-line ask,
@@ -2427,8 +2442,8 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
         jumpPhase, jumpDrv, posedAboveHead);
     std::printf(
         "player-styles %-20s cmd arc az %.2f el %.2f, posed az %.2f el %.2f, "
-        "dr %.2f vox over %d cut ticks, head clearance %.2f vox\n",
-        sty.name.c_str(), cmdAzArc, cmdElArc, azArc, elArc, dr, cutTicks,
+        "dr %.2f vox (posed %.2f) over %d cut ticks, head clearance %.2f vox\n",
+        sty.name.c_str(), cmdAzArc, cmdElArc, azArc, elArc, dr, posedDr, cutTicks,
         headMin >= 1e9f ? -1.0f : headMin);
   }
   RecordObserved("playerStyles.headClearObserved",
@@ -2671,7 +2686,7 @@ Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
           StepStrokeProgram(cur, &sty, melee, 0.0f, 0.0f, 0.0f, kTickDt,
                             kR, kU, kF);
       if (r == StrokeStepResult::Finished) cur.Reset();
-      avatar.SetWeaponPose(melee.Pose());
+      avatar.SetWeaponPose(StrokePoseNow(cur, &sty, melee));
       avTick();
 
       // ONLY WHILE THE ARM IS FULLY CLAIMED. `ikMiss` is measured after a
@@ -2822,7 +2837,7 @@ Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
           const StrokeStepResult r = StepStrokeProgram(
               cur, sty, melee, az, el, dist, kTickDt, kR, kU, kF);
           if (r == StrokeStepResult::Finished) cur.Reset();
-          avatar.SetWeaponPose(melee.Pose());
+          avatar.SetWeaponPose(StrokePoseNow(cur, sty, melee));
           avTick();
           Vec3 eb, et, ef;
           float ehw = 0;
@@ -3248,6 +3263,8 @@ Status GateCutPath(Ctx& c, std::string& detail) {
                  bool legacy = true) {
     AttackStyle sty = styIn;
     if (legacy) sty.FromLegacyFrame();
+    // Hand-built in the pre-frames spelling: the runner reads frames.
+    if (sty.frames.empty()) sty.BuildFramesFromLegacy();
     MeleeState m;
     ApplyMeleeTuning(m.tuning);
     m.SetStroke(fixtureHand, fixtureTip, Vec3{0, 0, 1}, kRestReach);

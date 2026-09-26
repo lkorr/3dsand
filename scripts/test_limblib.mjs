@@ -11,6 +11,7 @@
 import { readFileSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, join } from 'path';
+import { mobFile } from './mobfiles.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 // pathToFileURL, not a bare path: on Windows an absolute path starts with a
@@ -26,10 +27,10 @@ const ok = (cond, what) => {
 };
 
 const loadMob = name => {
-  const buf = readFileSync(join(ROOT, 'assets/mobs', name + '.vox'));
+  const buf = readFileSync(mobFile(name, '.vox'));
   const parsed = VOX.readVox(buf.buffer.slice(buf.byteOffset,
                                               buf.byteOffset + buf.byteLength));
-  const side = JSON.parse(readFileSync(join(ROOT, 'assets/mobs', name + '.json'),
+  const side = JSON.parse(readFileSync(mobFile(name, '.json'),
                                        'utf8'));
   return { doc: parsed.prefab, palette: parsed.palette, limbs: side.limbs || [] };
 };

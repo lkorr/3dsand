@@ -188,6 +188,64 @@ fn fluidWander(p : ptr<function, Particle>, m : Material) {
   (*p).vz += ((i32((h >> 8u) & 0xFFu) - 128) * wand) / 128;
 }
 
+// ---- GRAIN LANDING: many grains, one cell, one tick -----------------------
+// The claim is one winner per cell per tick, which is right for a rock and a
+// bottleneck for sand: a pouch pours 16 one-eighth grains a tick into a
+// stream a few cells wide, so ~3 landed per tick and the rest queued -- and a
+// loser left inside the cell its winner just filled reads as BURIED next tick
+// and climbs a voxel per tick, building the tower the owner saw drain for
+// twenty seconds. Grains are mass (common.wgsl POWDER MASS), and a cell holds
+// eight of them, so every grain aimed at one cell can land in that one tick.
+//
+// PROPOSE (integrate): a grain aims at the air cell it backed off into, or at
+// the partial cell of its own material that stopped it (a MERGE). It adds its
+// eighths to the slot's SUM and publishes a KEY -- (cell, material, the
+// cell's mass as integrate read it) -- as max and max-of-complement, so
+// resolve can prove every proposer to the slot published the SAME key. Every
+// other proposer (a rock, a floater, a micro droplet, a grain aimed at a
+// liquid) publishes a foreign key, which breaks that proof.
+//
+// DECIDE (resolve), identically for every member of the slot and WITHOUT
+// re-reading the cell: nothing writes voxels between integrate and resolve,
+// so the cell mass in the key IS the cell as it stands, and the decision is a
+// function of (key, sum) alone. If the key is uniform and nf + sum fits in a
+// cell, the claim winner writes nf + sum eighths and every member is
+// absorbed; otherwise everyone falls back to the one-winner rule below, which
+// is what every non-grain particle still uses. No read-after-write race, no
+// order dependence: rule 1.
+const CLAIM_SUM    : u32 = CLAIM_SIZE;
+const CLAIM_HI     : u32 = CLAIM_SIZE * 2u;
+const CLAIM_HI_INV : u32 = CLAIM_SIZE * 3u;
+const CLAIM_LO     : u32 = CLAIM_SIZE * 4u;
+const CLAIM_LO_INV : u32 = CLAIM_SIZE * 5u;
+const GRAIN_KEY_FOREIGN : u32 = 0x80000000u;
+// Payload bits 16..19 carry the proposed cell mass from integrate to resolve
+// (bit 20 = "proposed as a grain"). Transient: cleared before the particle is
+// stored again, so nothing that draws or re-reads a particle ever sees them.
+const PPAY_GRAIN_NF_SHIFT : u32 = 16u;
+const PPAY_GRAIN_BIT      : u32 = 0x100000u;
+const PPAY_GRAIN_MASK     : u32 = 0x1F0000u;
+
+fn grainKey(cellIdx : u32, mat : u32, nf : u32) -> vec2<u32> {
+  return vec2<u32>((mat & 0xFFFu) | ((nf & 0xFu) << 12u) | ((cellIdx >> 20u) << 16u),
+                   cellIdx & 0xFFFFFu);
+}
+fn publishKey(slot : u32, key : vec2<u32>) {
+  atomicMax(&claim[CLAIM_HI + slot], key.x);
+  atomicMax(&claim[CLAIM_HI_INV + slot], ~key.x);
+  atomicMax(&claim[CLAIM_LO + slot], key.y);
+  atomicMax(&claim[CLAIM_LO_INV + slot], ~key.y);
+}
+fn publishForeign(slot : u32) {
+  publishKey(slot, vec2<u32>(GRAIN_KEY_FOREIGN, 0u));
+}
+fn keyUniform(slot : u32, key : vec2<u32>) -> bool {
+  return atomicLoad(&claim[CLAIM_HI + slot]) == key.x &&
+         atomicLoad(&claim[CLAIM_HI_INV + slot]) == ~key.x &&
+         atomicLoad(&claim[CLAIM_LO + slot]) == key.y &&
+         atomicLoad(&claim[CLAIM_LO_INV + slot]) == ~key.y;
+}
+
 fn settleSupported(c : vec3<i32>, myDensity : i32) -> bool {
   let b = c + vec3<i32>(0, -1, 0);
   if (!inBounds(b)) { return false; }
@@ -381,6 +439,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
       // A DRIP never claims (see the landing site below for why).
       if ((p.flags & PFLAG_DRIP) == 0u) {
         atomicMax(&claim[claimSlot(cellIndexW(startCell))], microStainPriority(p));
+        publishForeign(claimSlot(cellIndexW(startCell)));
       }
       append(p);
       return;
@@ -576,6 +635,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
         // "drips always lose": the claim is decided among real droplets only.
         if ((p.flags & PFLAG_DRIP) == 0u) {
           atomicMax(&claim[claimSlot(cellIndexW(cell))], microStainPriority(p));
+          publishForeign(claimSlot(cellIndexW(cell)));
         }
         append(p);
         return;
@@ -597,8 +657,75 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
         append(p);
         return;
       }
+      // ---- a GRAIN proposes a group landing (GRAIN LANDING above) ------
+      var landAt = tgt;
+      if (matHasPowderMass(materials[myMat])) {
+        let myMass = powderMassOfState((p.payload >> 12u) & 0xFu);
+        // WHERE THIS GRAIN LANDS, on the tick it touches. Ten candidates,
+        // walked in an order hashed from MY state (never a slot), the first
+        // open one taken:
+        //   * MERGE into the partial cell of my own material that stopped me,
+        //     if it has room for me;
+        //   * the air cell I backed into, or one of the eight around it on the
+        //     same level (SCATTER).
+        // Why a spread and not "the cell I hit": a pouch's stream is so tight
+        // that every grain of a tick hit ONE cell -- 16 eighths into a cell
+        // that holds 8, so the group could not land and one grain a tick got
+        // through (vessel-sand: ~440 grains still flying after the pour,
+        // landing ~1 a tick; with the merge always preferred, a partial pile
+        // top overflowed the same way). Spread over ten cells a tick's grains
+        // fit, and a grain placed over a drop is just a CA grain that falls.
+        let bw = voxWordAt(cell);
+        var nf = 0xFFu;
+        let canMerge = voxMat(bw) == myMat && powderIsPartial(bw) &&
+                       powderMass(bw) + myMass <= POWDER_FULL;
+        let hs = pcg(u32(sx) ^ pcg(u32(sz) ^ pcg(u32(sy) ^ p.payload)));
+        for (var j = 0u; j < 10u; j++) {
+          let k = i32((hs + j * 3u) % 10u);   // 3 is coprime to 10: a full cycle
+          if (k == 9) {
+            if (canMerge) {
+              landAt = cell;
+              nf = powderMass(bw);
+              p.px = sx; p.py = sy; p.pz = sz;
+              break;
+            }
+            continue;
+          }
+          let cand = tgt + vec3<i32>(k % 3 - 1, 0, k / 3 - 1);
+          if (!inBounds(cand)) { continue; }
+          let cw = voxWordAt(cand);
+          if (voxMat(cw) == MAT_AIR || matPassable(voxMat(cw))) {
+            landAt = cand;
+            nf = 0u;
+            // resolve reads the target cell off the particle's position. KEEP
+            // THE SUB-CELL OFFSET: the claim priority hashes the particle's
+            // state, and snapping every grain to its cell's centre made grains
+            // of one stream identical -- two equal priorities are two WINNERS,
+            // and in the one-winner fallback each wrote its own grain into the
+            // same cell and both died (vessel-sand lost 129 of 512 eighths).
+            p.px = landAt.x * PART_ONE + (sx & (PART_ONE - 1));
+            p.py = landAt.y * PART_ONE + (sy & (PART_ONE - 1));
+            p.pz = landAt.z * PART_ONE + (sz & (PART_ONE - 1));
+            break;
+          }
+        }
+        let slot = claimSlot(cellIndexW(landAt));
+        if (nf != 0xFFu) {
+          p.payload = (p.payload & ~PPAY_GRAIN_MASK) | PPAY_GRAIN_BIT |
+                      (nf << PPAY_GRAIN_NF_SHIFT);
+          publishKey(slot, grainKey(cellIndexW(landAt), myMat, nf));
+          atomicAdd(&claim[CLAIM_SUM + slot], myMass);
+        } else {
+          publishForeign(slot);
+        }
+        p.flags |= PFLAG_PENDING;
+        atomicMax(&claim[slot], particlePriority(p));
+        append(p);
+        return;
+      }
       p.flags |= PFLAG_PENDING;
       atomicMax(&claim[claimSlot(cellIndexW(tgt))], particlePriority(p));
+      publishForeign(claimSlot(cellIndexW(tgt)));
       append(p);
       return;
     }
@@ -627,6 +754,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
           (patient || settleSupported(here, myDensity))) {
         p.flags |= PFLAG_PENDING;
         atomicMax(&claim[claimSlot(cellIndexW(here))], particlePriority(p));
+        publishForeign(claimSlot(cellIndexW(here)));
         append(p);
         return;
       }
@@ -705,6 +833,35 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   }
 
   let won = atomicLoad(&claim[claimSlot(tgtSlot)]) == particlePriority(p);
+
+  // ---- GRAIN LANDING: the group decision (see the block above settleSupported)
+  if ((p.payload & PPAY_GRAIN_BIT) != 0u) {
+    let gmat = p.payload & 0xFFFu;
+    let nf = (p.payload >> PPAY_GRAIN_NF_SHIFT) & 0xFu;
+    let gslot = claimSlot(tgtSlot);
+    if (keyUniform(gslot, grainKey(tgtSlot, gmat, nf))) {
+      let total = atomicLoad(&claim[CLAIM_SUM + gslot]);
+      if (nf + total <= POWDER_FULL) {
+        if (won) {
+          // The cell is exactly what every member proposed against (no voxel
+          // write between integrate and resolve, and no other writer of this
+          // cell: the uniform key says every proposer to it is in this group).
+          // A merge keeps the grains' stain already on the cell.
+          let hw = voxWordAt(cell);
+          let keep = select(0u, hw & STAIN_BITS, nf != 0u);
+          voxStore(tgt, packVox(gmat, powderStateFor(nf + total, cell, ptSeed()),
+                                STAMP_NEVER) | keep);
+          markDirtyNext(cell);
+          flagLandedUnsupported(cell, gmat);
+        }
+        p.flags = 0u;  // absorbed: its eighths are in the cell
+        pWrite[gid.x] = p;
+        return;
+      }
+    }
+  }
+  // Not absorbed: the proposal bits never outlive this pass.
+  p.payload &= ~PPAY_GRAIN_MASK;
 
   // The cell must still be one this particle may have — re-read, because the CA
   // ran between integrate and resolve. `canOccupy` is where "or a liquid I am

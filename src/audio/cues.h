@@ -179,6 +179,24 @@ class Cues {
   // can assert that the slots resolve without opening an audio device.
   int CombatSetId(CombatCue cue) const;
 
+  // ---- vessels ------------------------------------------------------------
+  // Liquid landing in a flask (set "vessel/fill", one owner like the combat
+  // cues). `fill` is the vessel's fill fraction 0..1 after the cells landed
+  // and sets the pitch: an octave down empty, the sample's own pitch half
+  // full, an octave up full -- the rising note of a bottle filling. The top
+  // half also falls to -6 dB at full, so the last cells are thin and small.
+  //
+  // ONE VOICE PER LANDING TICK, not one per cell. A flask scoops 4 cells a
+  // tick at 30 Hz and they are paid in together, so the frame hands them over
+  // in one call; four identical voices started on the same sample would only
+  // be one louder bubble. So each call plays once, at the fill the last cell
+  // reached (30 a second; the 62 ms sample, 124 ms an octave down, overlaps
+  // at most ~4 deep in the 12-voice one-shot pool). kFlaskFillMinGap only
+  // stops two frames inside one tick doubling up. `cells` is counted, not
+  // voiced.
+  void FlaskFill(const Vec3& posVox, float fill, int cells = 1);
+  int FlaskFillSetId() const;
+
   // ---- bleeding -----------------------------------------------------------
   // A positioned wet loop for a creature losing a lot of blood, keyed by a
   // caller-chosen id (mob id, or a limb key) so several wounds can sound at
@@ -273,6 +291,9 @@ class Cues {
   struct Stats {
     uint32_t steps = 0, lands = 0, impacts = 0, breaks = 0, mobs = 0,
              bleeds = 0, dropped = 0;
+    // Cells FlaskFill was told about (requests, like `combat` below: counted
+    // before the device check), and voices it actually started.
+    uint32_t flaskCells = 0, flaskVoices = 0;
     // COMBAT IS COUNTED DIFFERENTLY FROM EVERY OTHER FIELD HERE, on purpose.
     //
     // The counters above are VOICES STARTED: each one is incremented only past
@@ -318,6 +339,8 @@ class Cues {
   // damage in one frame speaks once. Keyed by caller-supplied source id; a
   // source id of 0 opts out.
   std::map<uint64_t, double> lastMobVoice_;
+  double lastFlaskFill_ = -1e9;  // now_ of the last FlaskFill voice
+  mutable int flaskSetId_ = -2;  // memoised "vessel/fill"; -2 = not looked up
   double now_ = 0.0;
 
   // Last variant played per set, so a set never repeats a sample back to back.
