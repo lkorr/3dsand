@@ -2262,7 +2262,7 @@ bool ReloadEnvironment(GpuContext& ctx, Simulation& sim,
   ctx.WaitIdle();
   worldmap::SetCurrentWorldMap(std::move(map));
   sim.UploadEnvironment(ctx.device, ctx.queue, trees, words);
-  stamp = biomes::StampEnvironment(assetDir, mapName);
+  stamp = biomes::StampEnvironment(assetDir, mapName, CurrentTuning().world.editLayer);
   return true;
 }
 

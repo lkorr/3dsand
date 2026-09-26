@@ -268,14 +268,13 @@ const FOLIAGE_ROWS = [
    d: 'How much deep-inside-a-clump goes to the dark tier of the leaf ramp.'}
 ];
 
-// The per-biome WEIGHTS are not here any more. They are owned by the biome
-// files (assets/biomes/<biome>.json, the Environment tab's Biome page) and
-// mirrored into `placement.biomes` on save + "Sync atlas", because "which
-// trees grow in the forest" is a property of the forest, not of the oak. The
-// Placement section below shows the mirrored values read-only with a link.
+// The per-biome WEIGHTS are not here. They are owned by the biome files
+// (assets/biomes/<biome>.json, the Environment tab's Biome page), which the
+// engine reads directly, because "which trees grow in the forest" is a
+// property of the forest, not of the oak. The Placement section links there.
 const PLACEMENT_ROWS = [
   {k: 'sparsity', n: 'rarity divisor', min: 1, max: 12, step: 1, int: true,
-   d: 'Divides the weights above. 4 makes this species a quarter as common ' +
+   d: 'Divides every biome’s weight for this species. 4 makes this species a quarter as common ' +
       'everywhere without retyping four numbers.'},
   {k: 'minY', n: 'lowest ground Y', min: -1, max: 300, step: 1, int: true,
    d: 'World Y band this species tolerates. -1 for no bound.'},
@@ -603,18 +602,7 @@ function buildPanel() {
               '.svtree so that adding a tree touches one file. WHICH biomes ' +
               'it grows in, and how much, is the biome\'s decision: see below.');
   {
-    // The mirrored per-biome weights, read-only, with the way to the owner.
-    const b = (params.placement && params.placement.biomes) || {};
-    const keys = TG.BIOME_ORDER;
-    const line = el('div', {class: 'tgrow', title: 'Mirrored from assets/biomes/*.json by the biome page\'s Save + Sync atlas. Not editable here.'},
-                    el('label', {}, 'biome weights'),
-                    el('span', {class: 'tghint', style: 'margin:0'},
-                       keys.map(k => k + ' ' + (b[k] | 0)).join(' · ')));
-    s.body.append(line);
-    widgets.push(() => {
-      const bb = (params.placement && params.placement.biomes) || {};
-      line.lastChild.textContent = keys.map(k => k + ' ' + (bb[k] | 0)).join(' · ');
-    });
+    // The per-biome weights live in the biome files' tree rows: the way there.
     if (H.openPage) {
       const a = el('a', {href: '#', class: 'tghint', style: 'display:block;margin:0 0 6px;color:#5aa9e6'},
                    'edit in the biome pages →');
@@ -671,6 +659,7 @@ async function saveSpecies(asName) {
   els.save.disabled = true;
   H.toast('saved trees/' + name + '.json — bake to make the engine see it');
   await refreshList(name);
+  if (H.saved) H.saved();
 }
 
 async function bake() {
@@ -690,6 +679,7 @@ async function bake() {
             ' variants, ' + (out.meta.bytes / 1024).toFixed(0) + ' KiB, ' +
             Math.round(performance.now() - t0) + ' ms. The world hash MOVES: ' +
             'run --selftest --rebaseline.');
+    if (H.saved) H.saved();
   } catch (e) {
     H.toast('bake failed: ' + (e && e.message || e), true);
   }

@@ -17,19 +17,15 @@
  *   * a BIOME file (assets/biomes/*.json) owns WHICH species and presets appear
  *     in it, at what weight/rarity, and under what extra conditions.
  *
- * The tree atlas the engine reads bakes per-biome species weights into each
- * .svtree header (treegen.js BIOME_ORDER). Those words are now DERIVED from the
- * biome files: saving a biome in the tuner rewrites `placement.biomes.<biome>`
- * in every species file it names (and zeroes the ones it does not), and
- * `node scripts/seed_environment.mjs --sync` does the same headlessly. The
- * species file keeps the mirror because the bake reads one file per species;
- * the biome file is where you EDIT it.
+ * The per-biome species WEIGHTS live only in the biome files' tree rows: the
+ * engine builds the atlas's weight table from them at load (treeatlas.cpp),
+ * so there is no copy in the species files and no bake between a weight edit
+ * and the world.
  *
- * THE ENGINE READS THE BIOME FILES TODAY ONLY TO VALIDATE THEM (the `biomes`
- * gate: every species, preset and material a biome names must exist, indices
- * must match worldgen's B_* ids). Cover, water and cave stacks are scaffolding
- * until worldgen reads a biome table — PLAN_biomes.md §5 lists the seams and
- * which are outside the CPU-mirrored blocks. The tuner says so on the page.
+ * THE ENGINE READS THE BIOME FILES (src/sim/biomes.cpp loads and validates
+ * them; the `biomes` gate). Worldgen reads the packed biome table for skin,
+ * relief, cover, trees, caves and water; envlive.js is the per-field manifest
+ * of what is read and what is not yet, and the tuner says so on the page.
  *
  * PURE MODULE: no DOM, no fetch. The swatch composer imports treegen.js and
  * watergen.js, both pure, so `scripts/test_environment.mjs` runs all of it
@@ -98,8 +94,6 @@ export function remapToMaterials(res, matIds) {
   return missing;
 }
 
-/** worldgen.wgsl's B_* ids, in id order. treegen.js BIOME_ORDER is the same
- *  list; scripts/check_invariants.py asserts all three agree with the files. */
 // The biome ID SPACE, in id order. Since the world map's P1 this is the list
 // of assets/biomes/*.json files by `index` (0..N-1, contiguous), which the
 // engine packs into the worldMap buffer in this order; check_invariants.py
@@ -323,34 +317,6 @@ export function densityStats(tileM, pct) {
   if (!tileM) return {perHa: 0, oneIn: 0};
   const tilesPerHa = 10000 / (tileM * tileM);
   return {perHa: tilesPerHa * pct / 100, oneIn: pct > 0 ? 100 / pct : 0};
-}
-
-// =============================================================================
-// species-weight sync: biome files -> species placement.biomes
-// =============================================================================
-
-/**
- * Given every biome (normalised) and a species' params, return the
- * `placement.biomes` object the species file should carry. Only ENGINE biomes
- * (those with an index in ENGINE_BIOMES) are written, because those are the
- * words the .svtree header has room for; a biome the engine does not know yet
- * is authored but not baked, and the tab says so.
- */
-export function speciesWeightsFrom(biomes, speciesName) {
-  const out = {};
-  for (const nm of ENGINE_BIOMES) out[nm] = 0;
-  for (const b of biomes) {
-    if (!ENGINE_BIOMES.includes(b.name)) continue;
-    for (const s of b.trees.species) if (s.species === speciesName) out[b.name] = s.weight | 0;
-  }
-  return out;
-}
-
-/** True when a species file's placement.biomes already matches the biomes. */
-export function speciesWeightsMatch(biomes, speciesName, placementBiomes) {
-  const want = speciesWeightsFrom(biomes, speciesName);
-  const have = placementBiomes || {};
-  return ENGINE_BIOMES.every(nm => (have[nm] | 0) === want[nm]);
 }
 
 // =============================================================================
@@ -738,9 +704,9 @@ export function generateSwatch(biome, libs, seed, opts) {
 }
 
 // =============================================================================
-// presets — today's four engine biomes, transcribed from worldgen.wgsl and the
-// species files' placement.biomes. `node scripts/seed_environment.mjs --seed`
-// writes them to assets/biomes/.
+// presets — the first four engine biomes, as seeded. `node
+// scripts/seed_environment.mjs --seed` writes them to assets/biomes/ (never
+// over an existing file).
 // =============================================================================
 
 export const BIOME_PRESETS = {

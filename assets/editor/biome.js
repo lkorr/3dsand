@@ -29,7 +29,6 @@
  */
 
 import * as BG from './biomegen.js';
-import * as TG from './treegen.js';
 import * as UI from './envui.js';
 import * as LV from './envlive.js';
 
@@ -545,7 +544,7 @@ function buildPanel() {
   s = UI.section(el, CLS, 'Trees',
                  'LIVE: tile and density (folded into one thinning chance on the world’s finest tile, ' +
                  'WM_B_TREE_CHANCE_Q16), the species weights (the atlas biome table is built from these rows ' +
-                 'at load; "Sync atlas" refreshes the Trees page’s read-only mirror), and every per-row ' +
+                 'at load), and every per-row ' +
                  'condition (packed per biome × species into the atlas and compared in treeInfoAt on top of ' +
                  'the species file’s own band and slope).');
   UI.row(C, s.body, {k: 'tile', n: 'tile (m)', min: 1.6, max: 51.2, step: 0.8, u: 'm',
@@ -587,8 +586,6 @@ function buildPanel() {
     addLabel: '+ species',
     hint: 'A species listed nowhere is never planted; listing it here dilutes the others.'
   });
-  els.sync = el('div', {class: CLS + 'derived'});
-  s.body.append(els.sync);
   col.append(s.wrap);
 
   // ---- water ----------------------------------------------------------------------------
@@ -656,67 +653,6 @@ function buildPanel() {
   UI.row(C, s.body, {k: 'reliefM', n: 'relief (m)', min: 0, max: 8, step: 0.1, u: 'm', d: 'Ground noise amplitude in the swatch. Not the engine’s terrain.'}, 'swatch');
   UI.row(C, s.body, {k: 'reliefFreq', n: 'relief freq', min: 0.2, max: 4, step: 0.1, d: ''}, 'swatch');
   col.append(s.wrap);
-
-  paintSync();
-}
-
-/* ===========================================================================
- * atlas sync — biome weights -> species files -> re-bake
- * ======================================================================== */
-async function allBiomes() {
-  const names = await listBiomes();
-  const out = [];
-  for (const n of names) out.push(n === biomeName && biome ? biome : await readBiome(n));
-  return out;
-}
-
-async function paintSync() {
-  if (!els.sync) return;
-  try {
-    const biomes = await allBiomes();
-    const stale = Object.keys(libs.trees).filter(sp =>
-      !BG.speciesWeightsMatch(biomes, sp, libs.trees[sp].placement && libs.trees[sp].placement.biomes));
-    els.sync.innerHTML = '';
-    if (!stale.length) {
-      els.sync.append(H.el('span', {class: 'ok'}, '✓ tree atlas in sync with the biome files'));
-    } else {
-      els.sync.append(H.el('span', {class: 'warn'}, '⚠ ' + stale.length + ' species file(s) carry stale weights: ' +
-                                                    stale.join(', ') + ' — save, then Sync atlas'));
-    }
-  } catch (e) { els.sync.textContent = 'sync state unknown: ' + (e && e.message || e); }
-}
-
-async function syncAtlas() {
-  els.syncBtn.disabled = true;
-  els.syncBtn.textContent = 'syncing…';
-  await new Promise(r => setTimeout(r, 0));
-  try {
-    const biomes = await allBiomes();
-    let wrote = 0, baked = 0;
-    for (const sp of Object.keys(libs.trees)) {
-      const j = libs.trees[sp];
-      if (BG.speciesWeightsMatch(biomes, sp, j.placement && j.placement.biomes)) continue;
-      j.placement = j.placement || {};
-      j.placement.biomes = BG.speciesWeightsFrom(biomes, sp);
-      let r = await fetch('/api/model?path=trees/' + encodeURIComponent(sp + '.json'),
-                          {method: 'POST', body: JSON.stringify(j, null, 2) + '\n'});
-      if (!(await r.json()).ok) throw new Error('could not write trees/' + sp + '.json');
-      wrote++;
-      const out = TG.bakeAtlas(j, null, {vpm: vpm()});
-      r = await fetch('/api/model?path=trees/' + encodeURIComponent(sp + '.svtree'), {method: 'POST', body: out.buf});
-      if (!(await r.json()).ok) throw new Error('could not write trees/' + sp + '.svtree');
-      baked++;
-    }
-    H.toast(wrote ? 'synced ' + wrote + ' species file(s), re-baked ' + baked + ' atlas(es). The world hash MOVES: ' +
-                    'run --selftest --rebaseline.'
-                  : 'tree atlas already in sync');
-    if (H.onLibraryChanged) H.onLibraryChanged('trees');
-  } catch (e) {
-    H.toast('sync failed: ' + (e && e.message || e), true);
-  }
-  els.syncBtn.disabled = false;
-  els.syncBtn.textContent = 'Sync atlas';
-  paintSync();
 }
 
 /* ===========================================================================
@@ -765,7 +701,7 @@ async function saveBiome(asName) {
   els.title.textContent = biome.displayName + '  ·  biomes/' + clean + '.json';
   H.toast('saved biomes/' + clean + '.json — press Apply to game (or F7 in the game) to see it');
   if (H.onLibraryChanged) H.onLibraryChanged('biomes');
-  paintSync();
+  if (H.saved) H.saved();
 }
 
 /* ===========================================================================
@@ -816,7 +752,6 @@ export function attach(hooks) {
   els.title = el('div', {class: CLS + 'title'}, '—');
   els.save = el('button', {disabled: true}, 'Save');
   els.saveAs = el('button', {}, 'Save as…');
-  els.syncBtn = el('button', {title: 'Write every biome’s tree weights into the species files and re-bake the changed atlases'}, 'Sync atlas');
   els.undo = el('button', {title: 'Undo (Ctrl+Z)'}, '↶');
   els.redo = el('button', {title: 'Redo (Ctrl+Shift+Z)'}, '↷');
   els.sliders = el('div', {class: CLS + 'sliders'});
@@ -843,7 +778,6 @@ export function attach(hooks) {
     const n = prompt('Biome name (a file under assets/biomes/, [a-z0-9_]):', biomeName || biome.name);
     if (n) saveBiome(n);
   });
-  els.syncBtn.addEventListener('click', syncAtlas);
   els.undo.addEventListener('click', () => undo.undo());
   els.redo.addEventListener('click', () => undo.redo());
   els.seed.addEventListener('change', () => { seed = Math.max(0, parseInt(els.seed.value, 10) || 0); regenerate(true); });
@@ -860,7 +794,7 @@ export function attach(hooks) {
   root.append(
     el('div', {class: CLS + 'left'},
       els.title,
-      el('div', {class: CLS + 'bar'}, els.save, els.saveAs, els.syncBtn, els.undo, els.redo),
+      el('div', {class: CLS + 'bar'}, els.save, els.saveAs, els.undo, els.redo),
       els.valid,
       els.sliders),
     el('div', {class: CLS + 'right'},
@@ -893,7 +827,7 @@ export function activate() {
 /** The host tells us a library changed (a preset or species was saved). */
 export async function librariesChanged() {
   await loadLibs();
-  if (biome) { refreshWidgets(); regenerate(false); paintSync(); }
+  if (biome) { refreshWidgets(); regenerate(false); }
 }
 
 export function saveFromHost() { if (biome) saveBiome(); }

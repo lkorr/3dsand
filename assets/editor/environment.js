@@ -205,7 +205,7 @@ async function paintGameBar() {
   if (unsaved) bar.append(el('div', {class: 'st stale'}, 'unsaved edits: save first, then apply'));
   const btn = el('button', {class: stale.length ? 'stale' : '', disabled: !connected},
                  stale.length ? 'Apply to game (F7)' : 'Reload + regen in game (F7)');
-  btn.title = 'The game re-reads assets/biomes, assets/worldmap and assets/trees from disk, re-uploads the tables and regenerates the world. Same as F7 or the overlay button.';
+  btn.title = 'Exactly F7: the game re-reads tuning.json (the map and edit layer it names, and the .svedit) and rebuilds its kernels, then re-reads assets/biomes, assets/water, assets/worldmap and assets/trees, re-uploads the tables and regenerates the world.';
   btn.addEventListener('click', () => {
     if (Link.apply()) toast('applying: the game is reloading the environment and regenerating');
     else toast('no game connected', true);
@@ -258,6 +258,12 @@ export function attach(hooks) {
     isVisible: () => envActive,
     tuning: H.tuning,
     voxelsPerMetre: H.voxelsPerMetre,
+    // A page calls saved() after a successful write to disk: the previews
+    // drop what they hold (the tuner server reloads --voxserve by itself)
+    // and the game bar re-reads the disk stamp.
+    saved: () => { if (H.previewSaved) H.previewSaved(); paintGameBar(); },
+    syncTuning: () => (H.syncTuning ? H.syncTuning() : Promise.resolve()),
+    previewSeed: () => (H.previewSeed ? H.previewSeed() : 1337),
     openPage,
     onLibraryChanged: (kind) => {
       if (kind !== 'biomes') Biome.librariesChanged && Biome.librariesChanged();
@@ -294,6 +300,9 @@ export function saveFromHost() {
   if (api && api.saveFromHost) api.saveFromHost();
 }
 export function isDirty() { return Object.values(dirtyBy).some(Boolean); }
+/** A save this tab did not make (an edit layer from the voxel view, tuning's
+ *  world.editLayer / mapLayer): re-read the disk stamp so STALE says so. */
+export function refreshGameBar() { paintGameBar(); }
 
 // test seams
 export function _pages() { return pages; }

@@ -1505,18 +1505,18 @@ def check_run_word_layout():
 
 
 def check_biome_order():
-    """The engine biome list lives in FIVE places and every one indexes the
-    same .svtree header words: worldgen.wgsl's B_* constants, treeatlas.h's
-    kBiomeCount, treegen.js BIOME_ORDER (the baker), biomegen.js ENGINE_BIOMES
-    (the tuner) and biomes.cpp kEngineBiomes (the loader + gate). A biome
-    added to one and not the others bakes weights into words nobody reads, or
-    reads words nobody baked, and no gate would name it."""
+    """The engine biome list lives in three code places beside the files:
+    worldgen.wgsl's B_* constants, biomegen.js ENGINE_BIOMES (the tuner) and
+    biomes.cpp kEngineBiomes (the loader + gate); treeatlas.h's kBiomeCount
+    must stay gone (the count is data). A biome added to one and not the
+    others is an id the shader, the tuner and the loader disagree on, and no
+    gate would name it. (treegen.js BIOME_ORDER left with the .svtree weight
+    words it indexed: the atlas builds its weights from the biome files.)"""
     wgsl = read("assets/shaders/worldgen.wgsl")
-    tg = read("assets/editor/treegen.js")
     bg = read("assets/editor/biomegen.js")
     cpp = read("src/sim/biomes.cpp")
     hdr = read("src/sim/treeatlas.h")
-    if not (wgsl and tg and bg and cpp and hdr):
+    if not (wgsl and bg and cpp and hdr):
         return
     checked.append("biome order")
     # worldgen: const B_FOREST : u32 = 0u; ... -> name by id
@@ -1527,13 +1527,12 @@ def check_biome_order():
     def js_list(src, name):
         m = re.search(rf"export const {name}\s*=\s*\[([^\]]*)\]", src)
         return re.findall(r"'(\w+)'", m.group(1)) if m else None
-    tg_order = js_list(tg, "BIOME_ORDER")
     bg_order = js_list(bg, "ENGINE_BIOMES")
     m = re.search(r"kEngineBiomes\[kEngineBiomeCount\]\s*=\s*\{([^}]*)\}", cpp)
     cpp_order = re.findall(r'"(\w+)"', m.group(1)) if m else None
     m = re.search(r"constexpr int kBiomeCount = (\d+);", hdr)
     k = int(m.group(1)) if m else None
-    lists = {"worldgen.wgsl B_*": wg_order, "treegen.js BIOME_ORDER": tg_order,
+    lists = {"worldgen.wgsl B_*": wg_order,
              "biomegen.js ENGINE_BIOMES": bg_order, "biomes.cpp kEngineBiomes": cpp_order}
     for name, val in lists.items():
         if not val:
@@ -1542,9 +1541,8 @@ def check_biome_order():
     # Since the world map's P1 the id space is the FILES: assets/biomes/*.json
     # `index` values must be exactly 0..N-1, and the tree atlas / worldMap
     # record tables are laid out in that order at load. worldgen.wgsl still
-    # names the first four by id (B_* until P2 retires them) and treegen.js /
-    # biomegen.js still carry the four the .svtree bake wrote positionally, so
-    # those lists must be a PREFIX of the file order, not equal to it.
+    # names the first four by id (B_* until P2 retires them), so the code
+    # lists must be a PREFIX of the file order, not equal to it.
     import json as _json
     files = {}
     for p in (ROOT / "assets" / "biomes").glob("*.json"):

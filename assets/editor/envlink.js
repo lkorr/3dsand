@@ -9,7 +9,8 @@
  * `--telemetry`, the Play button passes it):
  *
  *   game -> page   {"v":3,"type":"environment","stamp":{map, mapHash,
- *                   biomesHash, treesHash}}   on attach and after every reload
+ *                   biomesHash, treesHash, editLayer, editsHash}}
+ *                   on attach and after every reload
  *   page -> game   {"cmd":"apply-environment"}  = F7: reload + regenerate
  *                  {"cmd":"env-stamp"}          = say it again
  *
@@ -81,7 +82,7 @@ export function apply() {
   return true;
 }
 
-/** The disk side: {map, mapHash, biomesHash, treesHash} from the tuner server. */
+/** The disk side: {map, mapHash, biomesHash, treesHash, editLayer, editsHash} from the tuner server. */
 export async function diskHashes() {
   const r = await fetch('/api/environment/hashes', {cache: 'no-store'});
   if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -96,5 +97,11 @@ export function staleParts(game, disk) {
   if (game.mapHash !== disk.mapHash) out.push('map');
   if (game.biomesHash !== disk.biomesHash) out.push('biomes');
   if (game.treesHash !== disk.treesHash) out.push('trees');
+  // An older game build sends no edits fields: say nothing rather than
+  // report a permanent false STALE.
+  if (game.editsHash !== undefined) {
+    if ((game.editLayer || '') !== (disk.editLayer || '')) out.push('edit layer name');
+    else if (game.editsHash !== disk.editsHash) out.push('edits');
+  }
   return out;
 }

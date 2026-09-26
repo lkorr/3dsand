@@ -5,7 +5,7 @@
 
      WHAT IT COVERS THAT `node scripts/test_environment.mjs` DOES NOT. The Node
      test asserts the DATA: watergen determinism, preset sanity, every biome
-     file valid, every species file in sync, the swatch composing. What cannot
+     file valid, no species weight mirror, the swatch composing. What cannot
      be asserted from Node is whether the TAB MOUNTS: the sidebar, page
      switching, the three page modules building their panels, WorldView
      meshing a water body and a biome swatch, anything reaching the
@@ -263,9 +263,12 @@ function readLit(wv, cv){
     say(ok, 'trees page generated oak inside the Environment tab: ' + tstats.textContent.replace(/\s+/g, ' ').slice(0, 90));
     var weightRow = null;
     pages.trees.querySelectorAll('.tgrow label').forEach(function (l) { if (l.textContent === 'biome weights') weightRow = l.parentNode; });
-    say(!!weightRow && /forest 42/.test(weightRow.textContent), 'species placement shows the mirrored biome weights read-only: ' +
-        (weightRow && weightRow.textContent.slice(0, 60)));
-    say(!pages.trees.querySelector('.tgrow label[title]') || true, 'ok');
+    // The per-species weight mirror is gone (weights live only in the biome
+    // files): no weights row, and the Placement section links to the owner.
+    var ownerLink = null;
+    pages.trees.querySelectorAll('a.tghint').forEach(function (a) { if (/biome pages/.test(a.textContent)) ownerLink = a; });
+    say(!weightRow && !!ownerLink, 'species placement shows no weight mirror and links to the biome pages' +
+        (weightRow ? ': found ' + weightRow.textContent.slice(0, 60) : ''));
 
     // ---- 6. the World map page: the front door (P-I) ----------------------------------------------------------
     E._open('map');

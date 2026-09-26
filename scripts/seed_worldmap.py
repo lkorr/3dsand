@@ -1,7 +1,13 @@
 #!/usr/bin/env python3
-"""Write the shipped default world map: assets/worldmap/default/{map.json,map.svmap}.
+"""Write a fresh default world map: assets/worldmap/default/{map.json,map.svmap}.
 
-This is a STARTING map for the World Map tab to repaint, not the noise it
+    python scripts/seed_worldmap.py [ROOT] [--force]
+
+REFUSES if the map already exists: the shipped map has been repainted and its
+sites moved since this script last wrote it, so running it would clobber that
+work with this file's older layout. --force overwrites anyway.
+
+This is a STARTING map for the World map page to repaint, not the noise it
 replaces: Tier A of docs/PLAN_world_map.md is seed-INDEPENDENT, so the layout
 below is drawn once, here, from a fixed constant, and every world seed then
 fills the same regions differently (the boundary warp and everything inside
@@ -25,8 +31,15 @@ Format (src/sim/worldmap.h is the authority):
 """
 import json, math, pathlib, struct, sys
 
-ROOT = pathlib.Path(sys.argv[1]) if len(sys.argv) > 1 else pathlib.Path(__file__).resolve().parent.parent
+import map_terrain   # the terrain defaults' one copy (src/sim/worldmap.h TerrainParams)
+
+ARGS = [a for a in sys.argv[1:] if a != '--force']
+FORCE = '--force' in sys.argv[1:]
+ROOT = pathlib.Path(ARGS[0]) if ARGS else pathlib.Path(__file__).resolve().parent.parent
 OUT = ROOT / 'assets' / 'worldmap' / 'default'
+if (OUT / 'map.json').exists() and not FORCE:
+    sys.exit('seed_worldmap: %s already exists -- refusing to overwrite a painted map '
+             '(pass --force to replace it with this script\'s layout)' % (OUT / 'map.json'))
 W = H = 196            # 196 cells x 102.4 m = 20 km
 CELL_LOG2 = 10
 ORIGIN = (98, 98)      # the world origin at the centre; spawn is a site (below)
@@ -102,7 +115,7 @@ for cz in range(H):
 OUT.mkdir(parents=True, exist_ok=True)
 meta = {
     "name": "default",
-    "about": "The shipped starting map (scripts/seed_worldmap.py). Repaint it in the tuner's World Map tab. Tier A: seed-independent.",
+    "about": "The shipped starting map (scripts/seed_worldmap.py). Repaint it on the tuner's Environment > World map page. Tier A: seed-independent.",
     "cellLog2": CELL_LOG2,
     "size": [W, H],
     "originCell": list(ORIGIN),
@@ -111,7 +124,8 @@ meta = {
     "warpAmpVox": 160,
     # The TERRAIN, per map (PLAN_environment_truth P-G): every number that used
     # to be a worldgen.* knob in tuning.json. src/sim/worldmap.h kHTerrain* is
-    # the packed form; scripts/seed_terrain_rows.py carries the same defaults.
+    # the packed form; the VALUES are TerrainParams' defaults, read from
+    # worldmap.h (map_terrain.terrain_defaults), never retyped here.
     "terrain": {
         "about": ("The terrain, per MAP (P-G): what used to be worldgen.* in tuning.json. Lengths in "
                   "voxels at refVoxelsPerMetre; log2 cells are shifts; fbmAtten / sedFraction / sedSlope "
@@ -120,17 +134,7 @@ meta = {
                   "ladder under the plane; homeArea is the calm ground around the spawn site; the "
                   "sediment wedge and the treeline are what they were as knobs. Per-biome relief is "
                   "each biome file's `terrain` block."),
-        "refVoxelsPerMetre": 10,
-        "baseHeight": 200,
-        "landformRangeVox": 1024,
-        "rangeAmplitude": 256, "rangeLog2": 9,
-        "hillAmplitude": 64, "hillLog2": 7,
-        "detailAmplitude": 16, "detailLog2": 5,
-        "grainAmplitude": 4, "grainLog2": 3,
-        "fbmAtten": 256,
-        "homeArea": {"y": 200, "radius": 320, "fade": 2048},
-        "sedCeil": 264, "sedFraction": 64, "sedStrip": 6, "sedSlope": 96, "sedMax": 32, "sedTopsoil": 4,
-        "treeline": 228,
+        **map_terrain.terrain_defaults(str(pathlib.Path(__file__).resolve().parent.parent)),
     },
     "biomes": BIOMES,
     "sites": [
@@ -140,12 +144,11 @@ meta = {
         # the pad refuses trees and cover, so spawn sits past its edge plus
         # the widest crown reach, still inside the forced-forest cells.
         {"id": "spawn", "kind": "spawn", "at": [900, 900],
-         "about": "Where the game starts, and the centre of the calm home area (worldgen.spawnPlain*). Outside the harness pad by more than the widest crown reach (115 vox past x/z 640), on forced forest, on land: the spawn-site gate checks all of that."},
+         "about": "Where the game starts, and the centre of the calm home area (terrain.homeArea). Must be on land, off the harness pad and off any lake: the spawn-site gate checks all of that."},
         # An AUTHORED lake (PLAN_environment_truth P-F): Tier A, the same place
-        # on every seed, wearing the spawn_lake preset's geometry. East of
-        # spawn by more than its radius + shore band.
+        # on every seed, wearing the spawn_lake preset's geometry.
         {"id": "home_lake", "kind": "water", "preset": "spawn_lake", "at": [1240, 900],
-         "about": "An AUTHORED lake (P-F): same place on every seed, the spawn_lake preset's geometry. East of spawn by more than its radius + shore band, so the spawn-site gate sees it as near-but-dry ground."},
+         "about": "An AUTHORED lake (P-F): same place on every seed, the spawn_lake preset's geometry. Placed on the map, not relative to the spawn; the spawn-site gate checks the spawn stays off it."},
         # A DECLARED landform (PLAN_environment_truth P-G): "there is always a
         # mountain to the east". Overlaid onto the landform plane at load;
         # Tier A, the same on every seed. 4.5 km east of the origin, a
@@ -153,7 +156,7 @@ meta = {
         # harness pad and the spawn.
         {"id": "east_range", "kind": "landform", "shape": "ridge", "at": [45000, 0],
          "radius": 8000, "heightVox": 600, "rotation": 90,
-         "about": "The mountain to the east (P-G): a ridge overlaid onto the landform plane at load, the same on every seed. radius is the crest's half-length in voxels (its width is a third of that), heightVox how far the plane is lifted at the crest, rotation the crest's heading in degrees."}
+         "about": "A declared ridge (P-G) overlaid onto the landform plane at load, the same on every seed. radius is the crest's half-length in voxels (its width is a third of that), heightVox how far the plane is lifted at the crest, rotation the crest's heading in degrees."}
     ],
     "rules": []
 }

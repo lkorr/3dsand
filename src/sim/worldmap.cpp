@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <sstream>
 #include <unordered_map>
@@ -852,6 +853,19 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         if (st.templateName.empty()) {
           log += at + "site \"" + id + "\" kind stamp needs a template name (assets/prefabs/<name>.vox)\n";
           return false;
+        }
+        // A template that is not THERE is a warning and a skipped site, not
+        // a refused boot: one stale stamp should not stop the whole world
+        // (the tuner's picker only offers files that exist). A template that
+        // is there and does not load is still a refusal, below.
+        {
+          std::error_code ec;
+          if (!std::filesystem::exists(assetDir + "/prefabs/" + st.templateName + ".vox", ec)) {
+            std::fprintf(stderr, "world map WARNING: %ssite \"%s\" names assets/prefabs/%s.vox, "
+                                 "which does not exist -- site skipped\n",
+                         at.c_str(), id.c_str(), st.templateName.c_str());
+            continue;
+          }
         }
         if (!loadStamp(st, id)) return false;
         if (s.contains("radius") && s["radius"].is_number()) st.radius = std::max(st.radius, s["radius"].get<int>());

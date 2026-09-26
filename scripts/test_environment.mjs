@@ -11,10 +11,9 @@
  *      declared dry), stays inside the format's caps, and names only materials
  *      that exist. Every biome file validates against the species, presets and
  *      materials it names, and carries the engine id its name implies.
- *   3. THE MIRROR. Each species file's placement.biomes equals what the biome
- *      files say. This is the one place the two authoring surfaces could
- *      disagree, and the engine reads the SPECIES copy — so a stale mirror is
- *      a biome that silently does not do what its page shows.
+ *   3. ONE OWNER FOR TREE WEIGHTS. The biome files' tree rows are the only
+ *      copy (the engine builds its weight table from them); no species file
+ *      may carry the retired `placement.biomes` mirror, which nothing reads.
  *   4. THE LIVE MANIFEST (section 7). Every editable field of a biome file, a
  *      water preset and the map is listed in assets/editor/envlive.js as read
  *      or not-read-by-package, and every manifest key names a real field. A
@@ -33,7 +32,6 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const load = rel => import(pathToFileURL(join(ROOT, rel)).href);
 const WG = await load('assets/editor/watergen.js');
 const BG = await load('assets/editor/biomegen.js');
-const TG = await load('assets/editor/treegen.js');
 const LV = await load('assets/editor/envlive.js');
 const MATS = JSON.parse(readFileSync(join(ROOT, 'assets/materials/materials.json'), 'utf8'));
 const MATNAMES = new Set(MATS.materials.map(m => m.id));
@@ -131,12 +129,6 @@ const biomeNames = list(BIOMES);
 const speciesNames = list(TREES);
 ok(biomeNames.length >= 4, 'assets/biomes/ has ' + biomeNames.length + ' biome files');
 for (const n of BG.ENGINE_BIOMES) ok(biomeNames.includes(n), 'engine biome "' + n + '" has a file');
-// Since the world map's P1 the engine's biome id space is the biome FILES
-// (ENGINE_BIOMES, 0..N-1) and the .svtree's baked weight words are not read;
-// treegen.js BIOME_ORDER is only the four positional words the bake still
-// writes, so it must be a PREFIX of the id space, not equal to it.
-ok(JSON.stringify(BG.ENGINE_BIOMES.slice(0, TG.BIOME_ORDER.length)) === JSON.stringify(TG.BIOME_ORDER),
-   'treegen.BIOME_ORDER is a prefix of biomegen.ENGINE_BIOMES (the biome id space)');
 const biomes = biomeNames.map(n => BG.normalizeBiome(readJson(join(BIOMES, n + '.json'))));
 const libs = {trees: new Set(speciesNames), water: new Set(presetNames), materials: MATNAMES};
 for (const b of biomes) {
@@ -155,20 +147,15 @@ for (const b of biomes) {
   }
 }
 
-/* ---- 4. the mirror: species placement.biomes vs biome files (informational) --- */
-// Since the world map's P1 the engine builds the tree weight table from the
-// biome files at load and never reads the .svtree's baked weight words, so
-// `placement.biomes` in a species file is a DISPLAY mirror for the Trees page,
-// not an authority. A stale mirror is reported, never failed; `node
-// scripts/seed_environment.mjs --sync` refreshes it.
-console.log('\n-- species weight mirror (informational) --');
+/* ---- 4. tree weights have one owner: the biome files ---------------------------- */
+// The engine builds the tree weight table from the biome files' tree rows at
+// load (treeatlas.cpp) and never read the species copy or the .svtree's
+// weight words (now written as zeros), so a species file that still carries
+// `placement.biomes` is a second, silently ignored copy.
+console.log('\n-- tree weights: one owner --');
 for (const sp of speciesNames) {
   const j = readJson(join(TREES, sp + '.json'));
-  const want = BG.speciesWeightsFrom(biomes, sp);
-  const have = (j.placement && j.placement.biomes) || {};
-  const same = BG.speciesWeightsMatch(biomes, sp, have);
-  ok(true, sp + ': ' + (same ? 'mirror current' : 'mirror stale (' + JSON.stringify(have) +
-     ' vs biomes ' + JSON.stringify(want) + ') -- node scripts/seed_environment.mjs --sync to refresh the Trees page'));
+  ok(!(j.placement && 'biomes' in j.placement), sp + ': no placement.biomes (weights live in the biome files)');
 }
 
 /* ---- 5. the swatch --------------------------------------------------------------- */

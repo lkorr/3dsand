@@ -162,8 +162,13 @@ console.log('\n-- committed atlases --');
 for (const name of species) {
   const path = join(DIR, name + '.svtree');
   if (!existsSync(path)) { ok(false, `${name}.svtree is missing — run scripts/bake_trees.mjs`); continue; }
-  const disk = readFileSync(path);
+  const disk = Buffer.from(readFileSync(path));
   const fresh = Buffer.from(T.bakeAtlas(paramsOf(name)).buf);
+  // Header words 12..15 (bytes 48..63) were the retired per-biome weight
+  // mirror: the bake now writes zeros, the engine never read them, and the
+  // shipped atlases keep their old values until their next re-bake. Not part
+  // of "matches its .json".
+  if (disk.length >= 64) disk.fill(0, 48, 64);
   ok(disk.length === fresh.length && disk.equals(fresh),
      `${name}.svtree matches ${name}.json (${(disk.length / 1024).toFixed(0)} KiB)`);
 }

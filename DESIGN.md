@@ -15898,8 +15898,10 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
 * **LIVE: tree species and weights, WITHOUT the bake.** `LoadTreeAtlas` takes
   the biome set and builds the per-biome weight table from each biome file's
   `trees.species[]` by name; the `.svtree`'s baked weight words (12..15) are
-  no longer read, so a weight edit reaches the world on the next launch and
-  `placement.biomes` in a species file is informational. **The biome id space
+  written as zeros and never read, so a weight edit reaches the world on the
+  next launch; species files carry no weights at all (the old
+  `placement.biomes` mirror and its Sync atlas / `seed_environment.mjs --sync`
+  are gone, 2026-09-26; `test_environment.mjs` refuses one). **The biome id space
   is the files:** `index` values must be exactly 0..N-1 (`ValidateBiomeSet`,
   `check_invariants.py biome order`); the tree atlas and the record table are
   laid out in that order and the shader reads the count from each header.
@@ -15964,11 +15966,17 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   tables and names the file. Callers: **F7**, the overlay's "reload
   environment + regen world", `--voxserve RELOAD`, and the Environment
   tab's **Apply to game** over the telemetry socket (`{"cmd":
-  "apply-environment"}`; `Telemetry` now reads client frames). Boot and
-  every reload print `environment: map <name> <hash> | biomes <hash> |
-  trees <hash>` (`biomes::StampEnvironment`, FNV-1a over the files, mirrored
-  by `tuner_server.py /api/environment/hashes`), and the tab shows whether
-  the running game is behind the disk. Gate: `env-reload`. Plan:
+  "apply-environment"}`; `Telemetry` now reads client frames). Apply is
+  EXACTLY F7 (2026-09-26): the F5 half first (tuning.json, so a changed
+  `world.mapLayer` / `editLayer` and the `.svedit` are re-read), then the
+  environment reload + regen. Boot and every reload print `environment: map
+  <name> <hash> | biomes <hash> | trees <hash> | edits <name> <hash>`
+  (`biomes::StampEnvironment`, FNV-1a over the files; `edits` is the named
+  edit layer's `.svedit`, 0 for none; mirrored by `tuner_server.py
+  /api/environment/hashes`), and the tab shows whether the running game is
+  behind the disk. The tuner's previews follow the same files: the voxel
+  server's region cache key and its auto-RELOAD are a signature over
+  tuning, materials, the named map, biomes, water and the `.svtree`s. Gate: `env-reload`. Plan:
   `docs/PLAN_environment_truth.md`.
 * **LIVE (environment truth P-C, 2026-09-04): SPAWN IS A SITE ON THE MAP.**
   The player used to start at a literal (140, 140) — inside the harness pad,

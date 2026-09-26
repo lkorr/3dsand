@@ -34,8 +34,11 @@ happens in this process rather than in the page:
   GET  /api/heightmap?...     terrain map from `sandvox --heightmap` (binary)
   GET  /api/voxregion?...     a BOX OF REAL VOXELS from `sandvox --voxserve`
   GET  /api/voxpalette        the compiled material table the viewer colours with
-  POST /api/voxreload         re-read tuning.json + shaders in the voxel server
+  POST /api/voxreload         re-read tuning.json + shaders + environment in the
+                              voxel server (a region request does it by itself
+                              when the files under _world_signature moved)
   GET  /api/worldedits        list assets/worldedits/*.svedit
+  GET  /api/worldmap/terrain-defaults   map.json terrain defaults (worldmap.h)
   GET  /api/worldedit?name=   read one edit layer (binary 'SVED')
   POST /api/worldedit?name=   write one edit layer
   POST /api/worldedit/delete  delete one edit layer
@@ -613,11 +616,19 @@ class VoxServe:
         self.proc = None
         self.lock = threading.Lock()
         self.err = None
+        # _world_signature() of the files the live process last read (boot or
+        # RELOAD). A region request under a different signature RELOADs first,
+        # so the server can never answer from tables older than the disk --
+        # whichever page saved, and whether or not it said so.
+        self.sig = None
 
     def _spawn(self):
         if not os.path.isfile(EXE):
             raise RuntimeError("build/Release/sandvox.exe not built yet — press Build")
         os.makedirs(VOXTMP, exist_ok=True)
+        # Taken BEFORE the boot reads the files: a save during the boot then
+        # shows as a mismatch and the next request reloads.
+        sig = _world_signature()
         # The boot is the expensive, GPU-heavy part, so it holds the run mutex.
         with RunLock("voxserve-boot"):
             p = subprocess.Popen(
@@ -634,6 +645,7 @@ class VoxServe:
                 if line.startswith("VOXSERVE READY"):
                     break
         self.proc = p
+        self.sig = sig
 
     def _ensure(self):
         if self.proc is not None and self.proc.poll() is None:
@@ -681,6 +693,16 @@ class VoxServe:
                 return False, ack[4:]
             return True, ack[3:]
 
+    def sync(self, sig):
+        """RELOAD a live server whose files are not `sig`. A dead one needs
+        nothing: the next command respawns it on the current files."""
+        if self.proc is None or self.proc.poll() is not None or self.sig == sig:
+            return True, ""
+        ok, msg = self.command("RELOAD")
+        if ok:
+            self.sig = sig
+        return ok, msg
+
     def stop(self):
         with self.lock:
             p, self.proc = self.proc, None
@@ -699,22 +721,64 @@ class VoxServe:
 _voxserve = VoxServe()
 
 
+_SIG_CACHE = {}
+
+
+def _file_digest(path):
+    """sha1 of one file's bytes, cached on (path, mtime, size): the .svtree
+    atlases are megabytes and every region request asks for the signature."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return b"?"
+    key = (path, st.st_mtime_ns, st.st_size)
+    hit = _SIG_CACHE.get(key)
+    if hit is None:
+        try:
+            with open(path, "rb") as f:
+                hit = hashlib.sha1(f.read()).digest()
+        except OSError:
+            return b"?"
+        _SIG_CACHE[key] = hit
+    return hit
+
+
 def _world_signature():
     """What the generated world depends on, as a short hex string.
 
-    The cache key has to move when the world does, and the world is a function
-    of tuning.json (worldgen's octave ladder, pond/tree/cave parameters — most
-    of them WGSL consts) and of materials.json (the ids the words carry). Hashed
-    by CONTENT, not mtime: a tuner restart should not throw away a cache, and an
-    edit that reverts a file should hit the entries it had before.
+    The cache key has to move when the world does, and the voxel server's
+    worldgen is a function of: tuning.json (world.mapLayer names the map, and
+    the prelude consts), materials.json (the ids the words carry), the named
+    map (map.json + map.svmap: the terrain block, sites, planes), the biome and
+    water files, and the tree atlases (.svtree; the species .json are only the
+    bake's input). Hashed by CONTENT, not mtime: a tuner restart should not
+    throw away a cache, and an edit that reverts a file should hit the entries
+    it had before.
+
+    NOT the edit layer: --voxserve regions are bare worldgen, and the viewer
+    composites the .svedit on the client (worldview.js), so a layer save must
+    not throw the region cache away.
     """
     h = hashlib.sha1()
-    for path in (WRITABLE["tuning"], WRITABLE["materials"]):
+    paths = [WRITABLE["tuning"], WRITABLE["materials"]]
+    try:
+        with open(WRITABLE["tuning"], "r", encoding="utf-8") as f:
+            name = (json.load(f).get("world") or {}).get("mapLayer") or "default"
+    except (OSError, ValueError):
+        name = "default"
+    d = _worldmap_dir(name)
+    if d:
+        paths += [os.path.join(d, "map.json"), os.path.join(d, "map.svmap")]
+    for sub, ext in (("biomes", ".json"), ("water", ".json"), ("trees", ".svtree")):
+        sd = os.path.join(ASSETS, sub)
         try:
-            with open(path, "rb") as f:
-                h.update(f.read())
+            names = sorted(n for n in os.listdir(sd) if n.endswith(ext))
         except OSError:
-            h.update(b"?")
+            names = []
+        paths += [os.path.join(sd, n) for n in names]
+    for path in paths:
+        h.update(os.path.basename(path).encode("utf-8") + b"\0")
+        h.update(_file_digest(path))
     return h.hexdigest()[:16]
 
 
@@ -785,6 +849,20 @@ def _fnv_file_set(d, exts):
         for b in data:
             h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
         _FNV_CACHE[(path, st.st_mtime_ns, st.st_size, h0)] = h
+    return h
+
+
+def _fnv_one_file(path, name):
+    """MIRRORS sandvox::HashOneFile (src/sim/tuningstamp.h): FNV-1a 32 over
+    NAME, a zero byte, then the BYTES; a missing file is 0."""
+    try:
+        with open(path, "rb") as f:
+            data = name.encode("utf-8") + b"\0" + f.read()
+    except OSError:
+        return 0
+    h = 0x811C9DC5
+    for b in data:
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
     return h
 
 
@@ -900,8 +978,10 @@ class Handler(BaseHTTPRequestHandler):
     # ---- the terrain map ---------------------------------------------------
     #
     # Runs `sandvox --heightmap` and hands the bytes straight back. That mode is
-    # a GPU-FREE EARLY EXIT — it answers before GpuContext exists, reads only
-    # tuning.json, and takes ~150 ms for a 384x384 map — which is why this route
+    # a GPU-FREE EARLY EXIT — it answers before GpuContext exists, reads
+    # tuning.json (world.mapLayer), materials.json, the biome / water / species
+    # files and the named map OFF DISK (so the page saves first: see
+    # wgSyncTuning in tuner.html), and takes ~150 ms for a 384x384 map — which is why this route
     # does NOT go through scripts/run.sh. The run mutex exists because
     # concurrent processes saturate the GPU and poison every measured number
     # (CLAUDE.md); a mode that never opens a device cannot do either, and taking
@@ -1001,8 +1081,9 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False,
                                         "error": "box origin must be a multiple of 16"})
 
+        sig = _world_signature()
         key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s" % (
-            ox, oy, oz, nx, ny, nz, lod, seed, _world_signature())
+            ox, oy, oz, nx, ny, nz, lod, seed, sig)
         ).encode()).hexdigest()
         cached = os.path.join(VOXCACHE, key + ".gz")
         want_gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
@@ -1023,6 +1104,9 @@ class Handler(BaseHTTPRequestHandler):
         cmd = "REGION %d %d %d %d %d %d %d %d %s" % (
             ox, oy, oz, nx, ny, nz, lod, seed, raw.replace("\\", "/"))
         try:
+            ok, msg = _voxserve.sync(sig)
+            if not ok:
+                return self._json(503, {"ok": False, "error": "reload: " + msg})
             ok, msg = _voxserve.command(cmd)
         except Exception as e:
             return self._json(503, {"ok": False, "error": str(e)})
@@ -1252,16 +1336,20 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/environment/hashes":
             # The disk side of the STALE badge (docs/PLAN_environment_truth.md
             # P-A): the same three FNV-1a numbers the engine prints at boot as
-            # "environment: map <name> <hash> | biomes <hash> | trees <hash>"
+            # "environment: map <name> <hash> | biomes <hash> | trees <hash> |
+            # edits <name> <hash>"
             # (biomes::StampEnvironment). The Environment tab compares these
             # with what the running game reports over telemetry.
             name = (self._query().get("name") or [""])[0]
+            try:
+                with open(WRITABLE["tuning"], "r", encoding="utf-8") as f:
+                    tworld = json.load(f).get("world") or {}
+            except (OSError, ValueError):
+                tworld = {}
             if not name:
-                try:
-                    with open(WRITABLE["tuning"], "r", encoding="utf-8") as f:
-                        name = (json.load(f).get("world") or {}).get("mapLayer") or "default"
-                except (OSError, ValueError):
-                    name = "default"
+                name = tworld.get("mapLayer") or "default"
+            edit = tworld.get("editLayer") or ""
+            ep = _worldedit_path(edit) if edit else None
             d = _worldmap_dir(name)
             return self._json(200, {
                 "ok": True,
@@ -1272,7 +1360,23 @@ class Handler(BaseHTTPRequestHandler):
                 "biomesHash": "%08x" % (_fnv_file_set(os.path.join(ASSETS, "biomes"), (".json",)) ^
                                         _fnv_file_set(os.path.join(ASSETS, "water"), (".json",))),
                 "treesHash": "%08x" % _fnv_file_set(os.path.join(ASSETS, "trees"), (".json", ".svtree")),
+                # the edit layer tuning.json names (mirrors StampEnvironment's
+                # `edits`: HashOneFile over the one .svedit, 0 if none/missing)
+                "editLayer": edit,
+                "editsHash": "%08x" % (_fnv_one_file(ep, edit + ".svedit") if ep else 0),
             })
+        if p == "/api/worldmap/terrain-defaults":
+            # The map terrain block's defaults, from the ONE copy
+            # (src/sim/worldmap.h TerrainParams, via map_terrain.py): what the
+            # World map page fills a map's missing terrain keys with.
+            try:
+                here = os.path.dirname(os.path.abspath(__file__))
+                if here not in sys.path:
+                    sys.path.insert(0, here)
+                import map_terrain
+                return self._json(200, {"ok": True, "terrain": map_terrain.terrain_defaults(ROOT)})
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"ok": False, "error": str(e)})
         if p == "/api/worldmaps":
             maps = []
             try:
@@ -1585,10 +1689,12 @@ class Handler(BaseHTTPRequestHandler):
             # until this runs. The tab sends it after every save — the same
             # save-then-render order the 2D map has always used, for the same
             # reason.
+            sig = _world_signature()
             ok, msg = _voxserve.command("RELOAD")
             if not ok:
                 return self._json(503, {"ok": False, "error": msg})
-            return self._json(200, {"ok": True, "signature": _world_signature()})
+            _voxserve.sig = sig
+            return self._json(200, {"ok": True, "signature": sig})
 
         if p == "/api/worldedit":
             name = (self._query().get("name") or [""])[0]

@@ -7,19 +7,19 @@
  * the authored spawn lake are all the same object with different numbers, the
  * way an oak and a spruce are the same object to treegen.js.
  *
- * WHY IT IS A SEPARATE MODULE FROM THE ENGINE'S POND. Today worldgen.wgsl grows
- * a pond as a parabolic disc on a tile hash (pondAt), and that formula lives
- * inside a CPU-mirrored block that check_invariants.py token-compares against
- * world.cpp. The authoring surface for ponds is therefore fourteen scalar
- * tuning rows and nothing else — one shape, world-wide. This module is the
- * authoring surface the engine does NOT yet have: a preset per KIND of water
- * body, previewable in the tuner byte-for-byte, and a biome row that says which
- * presets appear where and how often. Wiring the engine to read the preset
- * table is the follow-up (docs/PLAN_biomes.md §5 names the seams); until then
- * the tuner is the only consumer, which is the honest state of a scaffold.
+ * THE ENGINE READS THE PRESETS (since PLAN_environment_truth P-F).
+ * src/sim/biomes.cpp loads and validates assets/water/*.json and packs each
+ * preset's geometry (radius, sampled depth profile, berm, shore band, bed) and
+ * shore flora into the worldgen table; a pond is the preset a biome's water
+ * row rolled or a map `water` site placed, carved by the height mirror
+ * (worldgen.wgsl pondInfo / bowlDepth, twinned in world.cpp).
+ * worldmap::WaterGeomOf is the one metres-to-voxels conversion. This module
+ * is the TUNER's model of the same preset: the Water bodies page's 3D view,
+ * plan and section, and the biome swatch. It is a preview, not the engine's
+ * code: where the two differ, the engine is the truth.
  *
- * PURE MODULE. No DOM, no fetch, no WebGL. `scripts/test_watergen.mjs` imports it
- * under Node with nothing but `fs`, exactly like treegen.js.
+ * PURE MODULE. No DOM, no fetch, no WebGL. `scripts/test_environment.mjs`
+ * imports it under Node with nothing but `fs`, exactly like treegen.js.
  *
  * NO Math.random(), ANYWHERE. Every random number is `frand(...)` over a
  * counter-based hash keyed on the COLUMN and a salt, so nudging one slider does

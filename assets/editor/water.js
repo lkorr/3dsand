@@ -768,6 +768,7 @@ async function savePreset(asName) {
   H.toast('saved water/' + name + '.json');
   await refreshList(name);
   if (H.onLibraryChanged) H.onLibraryChanged('water');
+  if (H.saved) H.saved();
 }
 
 async function exportVox() {

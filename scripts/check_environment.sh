@@ -3,8 +3,8 @@
 #
 # WHAT THIS COVERS THAT `node scripts/test_environment.mjs` DOES NOT. The Node
 # test asserts the DATA: watergen determinism and preset sanity, every biome
-# file valid against the libraries it names, every species file's mirrored
-# weights in sync, the swatch composing deterministically. None of that says
+# file valid against the libraries it names, no species file carrying a
+# weight mirror, the swatch composing deterministically. None of that says
 # whether the TAB boots inside the tuner, whether the sidebar lists the biome
 # files, whether the three page modules build their panels, whether WorldView
 # meshes a kettle pond and a forest swatch, whether the plan/profile canvases

@@ -1,6 +1,6 @@
 {
   "name": "default",
-  "about": "The shipped starting map (scripts/seed_worldmap.py). Repaint it in the tuner's World Map tab. Tier A: seed-independent.",
+  "about": "The shipped starting map (first written by scripts/seed_worldmap.py, repainted since). Edit it on the tuner's Environment > World map page. Tier A: seed-independent.",
   "cellLog2": 10,
   "size": [
     196,
@@ -71,7 +71,7 @@
         580,
         3515
       ],
-      "about": "Where the game starts, and the centre of the calm home area (worldgen.spawnPlain*). Outside the harness pad by more than the widest crown reach (115 vox past x/z 640), on forced forest, on land: the spawn-site gate checks all of that."
+      "about": "Where the game starts, and the centre of the calm home area (terrain.homeArea). Must be on land, off the harness pad and off any lake: the spawn-site gate checks all of that."
     },
     {
       "id": "home_lake",
@@ -81,7 +81,7 @@
         1240,
         900
       ],
-      "about": "An AUTHORED lake (P-F): same place on every seed, the spawn_lake preset's geometry. East of spawn by more than its radius + shore band, so the spawn-site gate sees it as near-but-dry ground."
+      "about": "An AUTHORED lake (P-F): same place on every seed, the spawn_lake preset's geometry. Placed on the map, not relative to the spawn; the spawn-site gate checks the spawn stays off it."
     },
     {
       "id": "east_range",
@@ -93,7 +93,7 @@
       ],
       "radius": 8000,
       "heightVox": 600,
-      "about": "The mountain to the east (P-G): a ridge overlaid onto the landform plane at load, the same on every seed. radius is the crest's half-length in voxels (its width is a third of that), heightVox how far the plane is lifted at the crest, rotation the crest's heading in degrees.",
+      "about": "A declared ridge (P-G) overlaid onto the landform plane at load, the same on every seed. radius is the crest's half-length in voxels (its width is a third of that), heightVox how far the plane is lifted at the crest, rotation the crest's heading in degrees.",
       "rotation": 0
     },
     {

@@ -10,6 +10,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include "sim/tuningstamp.h" // HashOneFile: the edit layer's part of the stamp
 #include "sim/world.h"   // kVoxelsPerMetre: the tree lattice is in voxels
 #include "sim/worldmap.h" // WaterGeomOf / PondLatticeVox: the pond rows are validated in voxels
 
@@ -312,8 +313,6 @@ bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& m
     if (!ReadJsonFile(p, j, log)) { ok = false; continue; }
     SpeciesMirror s;
     s.name = p.stem().string();
-    const json& bi = Sub(Sub(j, "placement"), "biomes");
-    for (int i = 0; i < kEngineBiomeCount; i++) s.biome[i] = Get<int>(bi, kEngineBiomes[i], 0);
     std::error_code ec;
     s.hasAtlas = fs::exists(fs::path(p).replace_extension(".svtree"), ec);
     out.species.push_back(std::move(s));
@@ -389,9 +388,14 @@ uint32_t HashFileSet(const std::string& dir, const std::vector<std::string>& ext
   return h;
 }
 
-EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName) {
+EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName,
+                                  const std::string& editLayer) {
   EnvironmentStamp s;
   s.mapName = mapName;
+  s.editLayer = editLayer;
+  if (!editLayer.empty())
+    s.edits = sandvox::HashOneFile(assetDir + "/worldedits/" + editLayer + ".svedit",
+                                   editLayer + ".svedit");
   s.map = HashFileSet(assetDir + "/worldmap/" + mapName, {".json", ".svmap"});
   // The water presets are a worldgen input since P-E (their flora rows are
   // packed into the same buffer as the biome records), so they are part of
@@ -403,17 +407,19 @@ EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string
 }
 
 std::string EnvironmentStamp::Line() const {
-  char buf[256];
-  std::snprintf(buf, sizeof buf, "environment: map %s %08x | biomes %08x | trees %08x",
-                mapName.c_str(), map, biomes, trees);
+  char buf[384];
+  std::snprintf(buf, sizeof buf, "environment: map %s %08x | biomes %08x | trees %08x | edits %s %08x",
+                mapName.c_str(), map, biomes, trees,
+                editLayer.empty() ? "(none)" : editLayer.c_str(), edits);
   return buf;
 }
 
 std::string EnvironmentStamp::Json() const {
-  char buf[256];
+  char buf[384];
   std::snprintf(buf, sizeof buf,
-                "{\"map\":\"%s\",\"mapHash\":\"%08x\",\"biomesHash\":\"%08x\",\"treesHash\":\"%08x\"}",
-                mapName.c_str(), map, biomes, trees);
+                "{\"map\":\"%s\",\"mapHash\":\"%08x\",\"biomesHash\":\"%08x\",\"treesHash\":\"%08x\","
+                "\"editLayer\":\"%s\",\"editsHash\":\"%08x\"}",
+                mapName.c_str(), map, biomes, trees, editLayer.c_str(), edits);
   return buf;
 }
 
@@ -518,10 +524,10 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
       bad(at + "cover.saguaroFraction is a percent of cacti, got " + std::to_string(b.saguaroFraction));
   }
 
-  // No species-mirror check any more: since P1 of the world map the tree
-  // atlas builds its weight table from THESE files at load (treeatlas.cpp),
-  // and the .svtree's baked weight words are not read. `placement.biomes` in
-  // a species file is now informational, kept for the tree page's display.
+  // No species weight check: the tree atlas builds its weight table from
+  // THESE files at load (treeatlas.cpp). Species files carry no weights (the
+  // old `placement.biomes` mirror is gone; test_environment.mjs refuses it)
+  // and the .svtree's header words 12..15 are zeros nobody reads.
 
   for (const WaterPresetDef& w : set.water) {
     const std::string at = "water/" + w.file + ": ";

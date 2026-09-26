@@ -189,10 +189,9 @@ struct WaterPresetDef {
   std::string file;
 };
 
-/** One species file's mirrored weights, for the sync check. */
+/** One species file: that it exists, and whether its atlas does. */
 struct SpeciesMirror {
   std::string name;
-  int biome[kEngineBiomeCount] = {0, 0, 0, 0};
   bool hasAtlas = false;                 // <name>.svtree exists beside the .json
 };
 
@@ -260,14 +259,21 @@ uint32_t TreeChanceQ16(const BiomeDef& b, int latticeVox);
  * files on disk; different means "apply". Printed at boot and after every
  * reload as one line so a moved world hash can be attributed to a changed
  * input without a bisect.
+ *
+ * The EDIT LAYER (tuning.json world.editLayer, assets/worldedits/<name>.svedit)
+ * is the fourth input: `edits` is sandvox::HashOneFile over that one file (0
+ * when no layer is named or the file is missing), so saving an edit layer
+ * marks a running game stale like any other environment save.
  */
 struct EnvironmentStamp {
   std::string mapName;
-  uint32_t map = 0, biomes = 0, trees = 0;
-  std::string Line() const;   // "environment: map <name> <hash> | biomes <hash> | trees <hash>"
-  std::string Json() const;   // {"map":"<name>","mapHash":"..","biomesHash":"..","treesHash":".."}
+  std::string editLayer;      // "" = none
+  uint32_t map = 0, biomes = 0, trees = 0, edits = 0;
+  std::string Line() const;   // "environment: map <name> <hash> | biomes <hash> | trees <hash> | edits <name> <hash>"
+  std::string Json() const;   // {"map":"<name>","mapHash":"..","biomesHash":"..","treesHash":"..","editLayer":"<name>","editsHash":".."}
 };
 uint32_t HashFileSet(const std::string& dir, const std::vector<std::string>& exts);
-EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName);
+EnvironmentStamp StampEnvironment(const std::string& assetDir, const std::string& mapName,
+                                  const std::string& editLayer = {});
 
 }  // namespace biomes

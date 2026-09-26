@@ -116,12 +116,6 @@
   ],
   "autumnChance": 0,
   "placement": {
-    "biomes": {
-      "forest": 6,
-      "meadow": 14,
-      "pine": 0,
-      "desert": 0
-    },
     "minY": -1,
     "maxY": -1,
     "maxSlope": 260,

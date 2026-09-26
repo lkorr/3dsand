@@ -5381,7 +5381,8 @@ int main(int argc, char** argv) {
   // is behind an Environment save (docs/PLAN_environment_truth.md P-A).
   // Re-stamped by every environment reload (F7 / regen world / Apply).
   biomes::EnvironmentStamp envStamp =
-      biomes::StampEnvironment(assetDir, CurrentTuning().world.mapLayer);
+      biomes::StampEnvironment(assetDir, CurrentTuning().world.mapLayer,
+                                CurrentTuning().world.editLayer);
   std::printf("%s\n", envStamp.Line().c_str());
   // ...and the inputs that shape the world AFTER worldgen: tuning.json,
   // materials.json, reactions.json (src/sim/tuningstamp.h). All three
@@ -14218,6 +14219,11 @@ int main(int argc, char** argv) {
       }
       for (std::string cmd; telemetry.PopCommand(cmd);) {
         if (cmd.find("apply-environment") != std::string::npos) {
+          // EXACTLY F7: the F5 half re-reads tuning.json (world.mapLayer /
+          // editLayer, the edit layer's .svedit) and rebuilds the kernels
+          // before the regen half reloads the environment. A regen alone
+          // kept the map and edit layer the game booted with.
+          ui.reloadShaders = true;
           ui.regenWorld = true;
         } else if (cmd.find("env-stamp") != std::string::npos) {
           const std::string m = envStampMessage();

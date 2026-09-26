@@ -27,11 +27,14 @@
  * markers (P5), and `kind: "water"` AUTHORED LAKES (P-F: a water preset at a
  * fixed centre, the same on every seed).
  *
- * WHAT IT IS NOT. Not a preview of the generated world: the Worldgen tab's
- * heightmap and voxel views are. This page draws the PLANES, plainly, so you
- * see what you painted and not what noise made of it. Every save moves the
- * world hash (the map is an input beside the seed); the engine reads the map
- * at boot, so regenerate the world (or restart) to see a change.
+ * WHAT THE CANVAS IS NOT. Not a preview of the generated world: the Preview
+ * pane under it (the heightmap and voxel views, tuner.html #wgPreviewHost) and
+ * the Heights backdrop are. The canvas draws the PLANES, plainly, so you see
+ * what you painted and not what noise made of it. Every save moves the world
+ * hash (the map is an input beside the seed); a running game picks a save up
+ * on F7 / Apply to game, the previews on their next request (they render the
+ * SAVED files of the map open here: the map selector writes tuning.json
+ * world.mapLayer, and the page saves tuning before any preview request).
  *
  * Painting model: a circular brush in CELL space, left-drag paints, right- or
  * middle-drag pans, wheel zooms about the cursor, Shift+drag with the pad tool
@@ -61,17 +64,18 @@ let els = {};
 let map = null;            // {name, json, biome:Uint8Array, landform:Uint8Array, moisture:Uint8Array}
 let dirty = false;
 let tool = 'biome';        // biome | landform | pad | spawn | stamp | water | site
-// P-G: the terrain block map.json carries (src/sim/worldmap.h TerrainParams
-// is the C++ twin; scripts/seed_terrain_rows.py the seeder). A map without
-// one gets these, which are the engine's defaults too.
-const TERRAIN_DEFAULTS = {
-  refVoxelsPerMetre: 10, baseHeight: 200, landformRangeVox: 1024,
-  rangeAmplitude: 256, rangeLog2: 9, hillAmplitude: 64, hillLog2: 7,
-  detailAmplitude: 16, detailLog2: 5, grainAmplitude: 4, grainLog2: 3,
-  fbmAtten: 256, homeArea: {y: 200, radius: 320, fade: 2048},
-  sedCeil: 264, sedFraction: 64, sedStrip: 6, sedSlope: 96, sedMax: 32, sedTopsoil: 4,
-  treeline: 228
-};
+// P-G: the terrain block map.json carries. Its DEFAULTS (what a map missing a
+// key gets) have one copy, src/sim/worldmap.h TerrainParams, which the tuner
+// server reads and serves (/api/worldmap/terrain-defaults, via
+// scripts/map_terrain.py); scripts/seed_worldmap.py writes the same. null
+// until fetched: a map whose terrain block is complete does not need them.
+let TERRAIN_DEFAULTS = null;
+async function loadTerrainDefaults() {
+  const r = await fetch('/api/worldmap/terrain-defaults', {cache: 'no-store'});
+  const j = await r.json();
+  if (!j.ok) throw new Error(j.error || 'HTTP ' + r.status);
+  TERRAIN_DEFAULTS = j.terrain;
+}
 // [path, label, min, max, step, unit, description]; the path is into terrain
 const TERRAIN_ROWS = [
   ['baseHeight', 'world datum', 0, 1024, 4, 'vox', 'The MEAN ground height. The landform plane and the range octave are centred deviations around it.'],
@@ -102,6 +106,7 @@ let landDrag = null;       // {site, dx, dz}: dragging a declared landform
 let selected = null;       // the site the sites panel has selected (any kind)
 let heights = null;        // the decoded --heightmap backdrop, or null
 let showHeights = false;
+let savedGen = 0;          // bumps on every map save: heights.gen < savedGen = stale
 let mapLayerWanted = '';   // world.mapLayer / editLayer as the selectors have them
 let editLayerWanted = '';
 let tuningTouched = false;
@@ -113,6 +118,10 @@ const SPAWN_DEFAULT = [140, 140];   // worldmap.cpp's default when a map names n
 // preset's own radius; `geom` caches each preset's radius/band in voxels for
 // drawing the footprint to scale.
 let water = {preset: '', radiusM: 0, presets: [], geom: {}};
+// The stamp tool: a template picked from what EXISTS under assets/prefabs/
+// (no typed names: the engine skips a site whose .vox is missing), and the
+// quarter-turn rotation a new stamp gets.
+let stamp = {template: '', rot: 0, templates: []};
 let waterDrag = null;      // {site, dx, dz}: dragging an existing lake by its centre
 let brush = {index: 0, radius: 2, landform: 128, soft: true};
 let view = {cx: 0, cz: 0, scale: 4};   // cell-space centre + pixels per cell
@@ -122,6 +131,10 @@ let redo = [];
 let stroke = null;         // snapshot taken at pointerdown, pushed at pointerup if anything changed
 let padDrag = null;
 let img = null;            // ImageData of the planes
+let imgDirty = true;       // the planes (or the palette / shading) changed since img was built
+let palCache = {key: '', pal: []};   // biome palette -> RGB, rebuilt when map.json.biomes changes
+/** The planes changed: the next paint() rebuilds the image once. */
+function planesChanged() { imgDirty = true; }
 
 /* ---- helpers ---------------------------------------------------------------- */
 function toast(m, bad) { if (H && H.toast) H.toast(m, bad); }
@@ -145,6 +158,7 @@ function snapshot() {
 }
 function restore(s) {
   map.biome.set(s.biome); map.landform.set(s.landform);
+  planesChanged();
   map.json.sites = JSON.parse(JSON.stringify(s.sites));
   map.json.terrain = JSON.parse(JSON.stringify(s.terrain));
   if (selected && !map.json.sites.includes(selected)) selected = map.json.sites.find(x => x.id === selected.id) || null;
@@ -153,6 +167,13 @@ function restore(s) {
 /** The map's terrain block, created from the defaults if the file has none. */
 function terrainOf() {
   const j = map.json;
+  if (!TERRAIN_DEFAULTS) {
+    // Not fetched (yet, or the server refused): fill nothing rather than
+    // invent numbers; the section shows what the file has.
+    if (!j.terrain || typeof j.terrain !== 'object') j.terrain = {};
+    if (!j.terrain.homeArea || typeof j.terrain.homeArea !== 'object') j.terrain.homeArea = {};
+    return j.terrain;
+  }
   if (!j.terrain || typeof j.terrain !== 'object') j.terrain = JSON.parse(JSON.stringify(TERRAIN_DEFAULTS));
   if (!j.terrain.homeArea || typeof j.terrain.homeArea !== 'object') j.terrain.homeArea = {...TERRAIN_DEFAULTS.homeArea};
   for (const k of Object.keys(TERRAIN_DEFAULTS))
@@ -216,6 +237,7 @@ async function loadMap(name) {
   if (!rp.ok) throw new Error('map.svmap: HTTP ' + rp.status);
   const planes = parsePlanes(await rp.arrayBuffer(), json.size[0], json.size[1]);
   map = {name, json, ...planes};
+  planesChanged();
   undo = []; redo = [];
   selected = null; heights = null;
   markDirty(false);
@@ -254,6 +276,22 @@ async function loadWaterPresets() {
     els.waterPreset.value = water.preset;
   }
 }
+// The stamp templates: every .vox under assets/prefabs/ (the /api/models
+// listing the Models tab uses), so a stamp can only name a file that exists.
+async function loadStampTemplates() {
+  const r = await fetch('/api/models', {cache: 'no-store'});
+  const j = await r.json();
+  stamp.templates = [...new Set((j.files || [])
+      .filter(f => f.dir === 'prefabs' && f.name.toLowerCase().endsWith('.vox'))
+      .map(f => f.name.slice(0, -4)))].sort();
+  if (!stamp.templates.includes(stamp.template)) stamp.template = stamp.templates[0] || '';
+  if (els.stampTpl) {
+    els.stampTpl.replaceChildren(...(stamp.templates.length
+      ? stamp.templates.map(n => H.el('option', {value: n}, n))
+      : [H.el('option', {value: ''}, '(no .vox in prefabs/)')]));
+    els.stampTpl.value = stamp.template;
+  }
+}
 async function saveMap() {
   if (!map) return;
   const name = map.name;
@@ -266,20 +304,32 @@ async function saveMap() {
   j = await r.json();
   if (!j.ok) { toast('planes save failed: ' + (j.error || '?'), true); return; }
   markDirty(false);
+  savedGen++;
+  if (H.saved) H.saved();
+  // The backdrop on screen is the map before this save: redraw it.
+  if (showHeights) fetchHeights().catch(e => status('heights failed: ' + e.message));
   toast(`saved worldmap/${name} — press Apply to game (or F7 in the game) to see it; every map edit moves the world hash`);
 }
 
 /* ---- rendering --------------------------------------------------------------- */
+function palette() {
+  const key = map.json.biomes.join('\n');
+  if (palCache.key === key) return palCache.pal;
+  // CSS colour -> RGB through ONE 1x1 canvas, once per palette, not per paint.
+  const tmp = document.createElement('canvas').getContext('2d', {willReadFrequently: true});
+  const pal = map.json.biomes.map(n => {
+    tmp.clearRect(0, 0, 1, 1);
+    tmp.fillStyle = colorOf(n); tmp.fillRect(0, 0, 1, 1);
+    return Array.from(tmp.getImageData(0, 0, 1, 1).data);
+  });
+  palCache = {key, pal};
+  return pal;
+}
 function rebuildImage() {
   const [w, h] = map.json.size;
   if (!img || img.width !== w || img.height !== h) img = new ImageData(w, h);
   const d = img.data;
-  const pal = map.json.biomes.map(n => {
-    const c = colorOf(n);
-    const tmp = document.createElement('canvas').getContext('2d');
-    tmp.fillStyle = c; tmp.fillRect(0, 0, 1, 1);
-    return tmp.getImageData(0, 0, 1, 1).data;
-  });
+  const pal = palette();
   for (let i = 0; i < w * h; i++) {
     const p = pal[map.biome[i]] || pal[0];
     let k = 1;
@@ -297,13 +347,18 @@ function paint() {
   if (c.width !== W || c.height !== Hh) { c.width = W; c.height = Hh; }
   ctx.setTransform(1, 0, 0, 1, 0, 0);
   ctx.fillStyle = '#0e1219'; ctx.fillRect(0, 0, W, Hh);
-  rebuildImage();
   // planes -> screen: screen = (cell - view.c) * scale + centre
   const [w, h] = map.json.size;
   const ox = W / 2 - view.cx * view.scale, oy = Hh / 2 - view.cz * view.scale;
   const off = els.off || (els.off = document.createElement('canvas'));
-  if (off.width !== w || off.height !== h) { off.width = w; off.height = h; }
-  off.getContext('2d').putImageData(img, 0, 0);
+  if (off.width !== w || off.height !== h) { off.width = w; off.height = h; imgDirty = true; }
+  // Pan, zoom, hover and marker drags only redraw; the plane image is rebuilt
+  // when a plane actually changed (brush, undo/redo, load, shading toggle).
+  if (imgDirty) {
+    rebuildImage();
+    off.getContext('2d').putImageData(img, 0, 0);
+    imgDirty = false;
+  }
   ctx.imageSmoothingEnabled = false;
   if (showHeights && heights && heights.img) {
     // The engine's own heights (World::TerrainColumn over the whole map, the
@@ -458,6 +513,7 @@ function applyBrush(cx, cz) {
       const x = cx + dx, z = cz + dz;
       if (x < 0 || z < 0 || x >= w || z >= h) continue;
       const i = z * w + x;
+      // (changed -> the caller's paint rebuilds the plane image: see the end)
       if (tool === 'biome') {
         if (map.biome[i] !== brush.index) { map.biome[i] = brush.index; changed = true; }
       } else if (tool === 'landform') {
@@ -468,6 +524,7 @@ function applyBrush(cx, cz) {
         if (next !== cur) { map.landform[i] = next; changed = true; }
       }
     }
+  if (changed) planesChanged();
   return changed;
 }
 function wire() {
@@ -511,10 +568,11 @@ function wire() {
         sites.splice(sites.indexOf(hit), 1);
         stroke.changed = true;
       } else if (!hit) {
-        const t = prompt('Template: assets/prefabs/<name>.vox', els.lastTemplate || '');
-        if (!t) { stroke = null; return; }
-        els.lastTemplate = t;
-        const rot = parseInt(prompt('Rotation (0..3 quarter turns):', '0') || '0', 10) & 3;
+        if (!stamp.template) {
+          toast(stamp.templates.length ? 'pick a stamp template first' : 'no .vox under assets/prefabs/ to stamp', true);
+          stroke = null; return;
+        }
+        const t = stamp.template, rot = stamp.rot & 3;
         sites.push({id: t + '_' + sites.length, kind: 'stamp', template: t, x: wx, z: wz, rot, padMargin: 8, salt: sites.length});
         stroke.changed = true;
       }
@@ -846,7 +904,12 @@ async function fetchHeights() {
   const cx = ((w / 2) - map.json.originCell[0]) * cv, cz = ((h / 2) - map.json.originCell[1]) * cv;
   const res = Math.min(1024, Math.max(64, Math.max(w, h) * 2));
   status('rendering the engine\u2019s heights over the whole map (the SAVED file)\u2026');
-  const r = await fetch('/api/heightmap?cx=' + Math.round(cx) + '&cz=' + Math.round(cz) + '&span=' + span + '&res=' + res + '&seed=1337', {cache: 'no-store'});
+  // --heightmap reads tuning.json's world.mapLayer off disk: a map picked on
+  // this page and not yet saved into tuning would render the OLD map.
+  if (H.syncTuning) await H.syncTuning();
+  const gen = savedGen;
+  const seed = H.previewSeed ? H.previewSeed() : 1337;
+  const r = await fetch('/api/heightmap?cx=' + Math.round(cx) + '&cz=' + Math.round(cz) + '&span=' + span + '&res=' + res + '&seed=' + seed, {cache: 'no-store'});
   if (!r.ok) { let m = 'HTTP ' + r.status; try { m = (await r.json()).error || m; } catch (e) {} throw new Error(m); }
   const D = decodeHeightmap(await r.arrayBuffer());
   // shade: depth below sea in blues, land from the datum up in a ramp, hillshaded
@@ -867,8 +930,8 @@ async function fetchHeights() {
   // where the sampled square sits, in cells
   const cells = D.span / cv;
   heights = {res: D.res, img, cell0x: map.json.originCell[0] + (D.cx - D.span / 2) / cv, cell0z: map.json.originCell[1] + (D.cz - D.span / 2) / cv,
-             cellsW: cells, cellsH: cells, hMin: D.hMin, hMax: D.hMax};
-  status('heights: y' + D.hMin + '..y' + D.hMax + ' over ' + (D.span / 10 / 1000).toFixed(1) + ' km (the SAVED map; save, then refresh, to see an edit)');
+             cellsW: cells, cellsH: cells, hMin: D.hMin, hMax: D.hMax, gen, seed};
+  status('heights: y' + D.hMin + '..y' + D.hMax + ' over ' + (D.span / 10 / 1000).toFixed(1) + ' km, seed ' + seed + ' (the SAVED map; a save redraws it)');
   showHeights = true;
   if (els.heightsBtn) els.heightsBtn.classList.add('on');
   paint();
@@ -943,7 +1006,7 @@ export function attach(hooks) {
     landform: el('button', {title: 'paint landform 0..255 (left-drag)'}, 'Landform brush'),
     pad: el('button', {title: 'drag the harness pad box (world voxels)'}, 'Pad box'),
     spawn: el('button', {title: 'click: put the spawn site there (where the game starts; the calm home area centres on it). One per map.'}, 'Spawn'),
-    stamp: el('button', {title: 'click: place a stamp site (a .vox from assets/prefabs/); shift+click a marker: delete it'}, 'Stamp site'),
+    stamp: el('button', {title: 'click: place a stamp site (the template picked beside it, from assets/prefabs/); shift+click a marker: delete it'}, 'Stamp site'),
     water: el('button', {title: 'click: place an AUTHORED LAKE (a water preset at that column, same on every seed); drag a lake to move it; shift+click: delete it'}, 'Water'),
     landform: el('button', {title: 'click: DECLARE A LANDFORM (a peak / ridge / basin / plateau overlaid onto the landform plane at load, same on every seed); drag one to move it; shift+click: delete it'}, 'Landform'),
     site: el('button', {title: 'click a site marker of any kind to select it in the Sites panel'}, 'Select'),
@@ -956,6 +1019,11 @@ export function attach(hooks) {
   els.waterPreset.addEventListener('change', () => { water.preset = els.waterPreset.value; tool = 'water'; syncControls(); paint(); });
   els.waterRadius = el('input', {type: 'number', min: 0, step: 0.5, value: 0, style: 'width:64px', title: 'radius in metres for a NEW lake; 0 = the preset\'s own footprint radius'});
   els.waterRadius.addEventListener('change', () => { water.radiusM = Math.max(0, +els.waterRadius.value || 0); });
+  els.stampTpl = el('select', {title: 'the assets/prefabs/<name>.vox a NEW stamp site places'});
+  els.stampTpl.addEventListener('change', () => { stamp.template = els.stampTpl.value; tool = 'stamp'; syncControls(); paint(); });
+  els.stampRot = el('select', {title: 'quarter turns for a NEW stamp site'});
+  for (let i = 0; i < 4; i++) els.stampRot.append(el('option', {value: String(i)}, (i * 90) + '\u00b0'));
+  els.stampRot.addEventListener('change', () => { stamp.rot = (+els.stampRot.value) & 3; });
   // The landform tool's parameters for a NEW site (P-G); an existing one is
   // edited in the Sites panel.
   els.lfShape = el('select', {title: 'the shape a new landform takes'});
@@ -970,7 +1038,11 @@ export function attach(hooks) {
   els.lfRot.addEventListener('change', () => { landform.rotation = Math.round(+els.lfRot.value || 0); });
   els.heightsBtn = el('button', {title: 'draw the engine\u2019s own heights (World::TerrainColumn over the SAVED map, --heightmap) under the biomes; click again to hide'}, 'Heights');
   els.heightsBtn.addEventListener('click', () => {
-    if (showHeights) { showHeights = false; els.heightsBtn.classList.remove('on'); paint(); return; }
+    // Shown AND current: hide. Shown but stale (a save since, or another
+    // seed in the preview pane): refresh in the same click, not hide-then-show.
+    const seed = H.previewSeed ? H.previewSeed() : 1337;
+    const current = heights && heights.gen === savedGen && heights.seed === seed;
+    if (showHeights && current) { showHeights = false; els.heightsBtn.classList.remove('on'); paint(); return; }
     fetchHeights().catch(e => { toast('heights: ' + e.message, true); status('heights failed: ' + e.message); });
   });
   // The map and edit layer the GAME loads (tuning.json world.mapLayer /
@@ -985,7 +1057,7 @@ export function attach(hooks) {
   els.landOut = el('span', {}, String(brush.landform));
   els.land.addEventListener('input', () => { brush.landform = +els.land.value; tool = 'landform'; syncControls(); });
   const showLf = el('input', {type: 'checkbox', checked: true});
-  showLf.addEventListener('change', () => { showLandform = showLf.checked; paint(); });
+  showLf.addEventListener('change', () => { showLandform = showLf.checked; planesChanged(); paint(); });
   const fitBtn = el('button', {}, 'Fit');
   fitBtn.addEventListener('click', () => { fit(); paint(); });
   const undoBtn = el('button', {title: 'Ctrl+Z'}, 'Undo');
@@ -1000,6 +1072,7 @@ export function attach(hooks) {
     el('span', {style: 'width:10px'}),
     els.tools.site, els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water,
     el('label', {}, ' lake ', els.waterPreset, ' r ', els.waterRadius, ' m'),
+    el('label', {}, ' stamp ', els.stampTpl, ' ', els.stampRot),
     el('label', {}, ' new landform ', els.lfShape, ' r ', els.lfRadius, ' h ', els.lfHeight, ' \u00b0 ', els.lfRot),
     el('label', {}, ' brush ', els.radius, ' ', els.radiusOut),
     el('label', {}, ' landform paint ', els.land, ' ', els.landOut),
@@ -1008,7 +1081,7 @@ export function attach(hooks) {
     'Tier A: what you paint and declare here is where the biomes and the mountains ARE on every seed; the boundary warp and everything inside a region take the seed. ' +
     'Cells are 2^cellLog2 voxels (102.4 m). Right/middle-drag pans, wheel zooms, [ ] resize the brush. ' +
     'The pad box is the selftest harness region (no trunks, crowns, tarns or cover inside); the spawn diamond is where the game starts and the centre of the calm home area (Terrain \u2192 home area) -- keep it outside the pad, on land, or the spawn-site gate says so. ' +
-    'A stamp site places assets/prefabs/<name>.vox on a levelled pad at that column; the engine refuses to start if the .vox is missing. ' +
+    'A stamp site places assets/prefabs/<name>.vox (picked from the files that exist) on a levelled pad at that column; a site whose .vox has since gone is skipped with a warning at load. ' +
     'A water site is an AUTHORED LAKE: the chosen preset (Environment > Water bodies) carved at that column on every seed. ' +
     'A landform site is a DECLARED mountain: a peak, ridge, basin or plateau overlaid onto the landform plane at load. ' +
     'Saving writes assets/worldmap/<name>/ and moves the world hash; regenerate the world (F7 in the game, or Apply in the sidebar) to see it.');
@@ -1047,7 +1120,10 @@ export function attach(hooks) {
   refreshEditLayers();
   // The water presets, and each one's radius + band in voxels (the engine's
   // rounding: 10 voxels to the metre, band = max(shore.band, berm.width)).
+  loadTerrainDefaults().then(() => { if (map) { terrainOf(); syncTerrain(); publishTerrain(); } })
+    .catch(e => toast('terrain defaults: ' + e.message + ' (a map missing terrain keys shows them blank)', true));
   loadWaterPresets().then(() => paint()).catch(e => status('water presets: ' + e.message));
+  loadStampTemplates().catch(e => status('stamp templates: ' + e.message));
   listMaps().then(names => {
     els.mapSel.replaceChildren(...names.map(n => el('option', {value: n}, n)));
     const want = currentMapLayer() || names[0];

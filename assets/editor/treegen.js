@@ -358,11 +358,9 @@ export function defaultParams() {
     // a property of the species, and putting it anywhere else means adding a
     // tree touches two files. The C++ loader lifts these into the atlas
     // directory; worldgen samples them.
+    // WHICH biomes grow it and how much is not here: that is each biome
+    // file's tree row (assets/biomes/*.json), read by the engine directly.
     placement: {
-      /** Relative weight per biome. Zero means "never here". The engine
-       *  normalises across whatever species are loaded, so adding a species
-       *  dilutes the others rather than needing every table rewritten. */
-      biomes: { forest: 40, meadow: 10, pine: 0, desert: 0 },
       /** Absolute world-Y band this species tolerates. `maxY` is a per-species
        *  treeline: a spruce climbs higher than an oak. -1 = no bound. */
       minY: -1,
@@ -405,7 +403,7 @@ export function normalizeParams(src, vpm) {
       }
     } else if (k === 'placement') {
       Object.assign(a, b || {});
-      if (b && b.biomes) Object.assign(a.biomes, b.biomes);
+      delete a.biomes;   // the retired per-species weight mirror
     } else if (a && typeof a === 'object' && !Array.isArray(a)) {
       Object.assign(a, b || {});
     } else {
@@ -1369,10 +1367,6 @@ export const SVTREE_MAGIC = 0x52545653;   // 'SVTR' little-endian
 export const SVTREE_VERSION = 2;
 const HEADER_WORDS = 32;
 const VARIANT_WORDS = 12;
-/** Biome order, and it is the ENGINE's: worldgen.wgsl B_FOREST=0, B_MEADOW=1,
- *  B_PINE=2, B_DESERT=3. Written in this order so the loader can index the
- *  table by the biome id with no lookup. */
-export const BIOME_ORDER = ['forest', 'meadow', 'pine', 'desert'];
 
 // material(12) | state(4) | y0(Y0_BITS) | len(LEN_BITS). Mirrored in
 // worldgen.wgsl's treeCellFrom and asserted by scripts/check_invariants.py —
@@ -1500,9 +1494,10 @@ export function bakeAtlas(params, seeds, opts) {
   out[10] = Math.round(trees.reduce((a, t) => a + t.meta.crownY, 0) / trees.length);
   out[11] = Math.max(...trees.map(t => t.meta.crownR));
   const PL = P.placement;
-  BIOME_ORDER.forEach((b, i) => {
-    out[12 + i] = Math.max(0, Math.min(65535, Math.round(PL.biomes[b] || 0)));
-  });
+  // Words 12..15 were the per-biome weights. The engine builds that table
+  // from the biome files (treeatlas.cpp) and never read these, so they are
+  // written as zeros; the header layout (and SVTREE_VERSION) is unchanged.
+  out[12] = out[13] = out[14] = out[15] = 0;
   // The FAR-FIELD PROXY material: at cascade levels where a whole tree is
   // thinner than one cell there is no tree left to sample, so the horizon
   // paints this over the terrain skin instead. The mid entry of the leaf ramp,
@@ -1605,8 +1600,6 @@ export function readAtlas(buf) {
       reachXZ: w[o + 7], above: w[o + 8], crownY: w[o + 9], crownR: w[o + 10]
     });
   }
-  const biomes = {};
-  BIOME_ORDER.forEach((b, i) => { biomes[b] = w[12 + i]; });
   return {
     words: w, names: names, variants: variants,
     // The bake scale (v2, word 29). Every voxel figure below — reach, above,
@@ -1615,7 +1608,7 @@ export function readAtlas(buf) {
     // a file whose vpm does not match kVoxelsPerMetre.
     vpm: w[29],
     reachXZ: w[8], above: w[9], crownY: w[10], crownR: w[11],
-    placement: { biomes: biomes, minY: w[16] | 0, maxY: w[17] | 0,
+    placement: { minY: w[16] | 0, maxY: w[17] | 0,
                  maxSlope: w[18], sparsity: w[19], shade: w[21] },
     canopyMat: w[20] ? names[w[20] - 1] : null,
     autumnChance: w[22],
@@ -1659,12 +1652,7 @@ function preset(over) {
   delete over.levelsData;
   Object.assign(p, over);
   if (over.foliage) p.foliage = Object.assign(defaultParams().foliage, over.foliage);
-  if (over.placement) {
-    p.placement = Object.assign(defaultParams().placement, over.placement);
-    if (over.placement.biomes)
-      p.placement.biomes = Object.assign({ forest: 0, meadow: 0, pine: 0, desert: 0 },
-                                         over.placement.biomes);
-  }
+  if (over.placement) p.placement = Object.assign(defaultParams().placement, over.placement);
   if (lv) for (let i = 0; i < 4; i++) if (lv[i]) Object.assign(p.levelsData[i], lv[i]);
   return p;
 }
@@ -1695,8 +1683,7 @@ export const PRESETS = {
                noiseScale: 0.28, sminK: 0.22, canopyShadeMix: 0.5, depthShade: 0.8 },
     bark: ['bark_dark', 'wood', 'bark_light'],
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
-    placement: { biomes: { forest: 42, meadow: 16, pine: 4, desert: 0 },
-                 maxY: 21.4, maxSlope: 420, sparsity: 1, shade: 210 }
+    placement: { maxY: 21.4, maxSlope: 420, sparsity: 1, shade: 210 }
   }),
 
   // The ancient one. Same species, twice the mass: a thicker bole, a deeper
@@ -1722,8 +1709,7 @@ export const PRESETS = {
     foliage: { startLevel: 3, clumpsPerStem: 1.0, tipBias: 0.45, radius: 0.72,
                radiusV: 0.24, elongation: 0.70, droop: 0.22, density: 0.82,
                noiseScale: 0.3, sminK: 0.26, canopyShadeMix: 0.45, depthShade: 0.85 },
-    placement: { biomes: { forest: 12, meadow: 5, pine: 0, desert: 0 },
-                 maxY: 20.6, maxSlope: 340, sparsity: 1, shade: 255 }
+    placement: { maxY: 20.6, maxSlope: 340, sparsity: 1, shade: 255 }
   }),
 
   // Pine: a bare lower bole, WHORLED branches (the parameter vanilla
@@ -1748,8 +1734,7 @@ export const PRESETS = {
                noiseScale: 0.22, sminK: 0.2, canopyShadeMix: 0.55, depthShade: 0.7 },
     bark: ['bark_dark', 'wood', 'bark_light'],
     leaf: ['pine_dark', 'pine_needles', 'pine_lit'],
-    placement: { biomes: { forest: 14, meadow: 2, pine: 60, desert: 0 },
-                 maxY: 22.6, maxSlope: 560, sparsity: 1, shade: 230 }
+    placement: { maxY: 22.6, maxSlope: 560, sparsity: 1, shade: 230 }
   }),
 
   // Spruce: the pine's colder sibling. Narrower envelope, shorter branches,
@@ -1773,8 +1758,7 @@ export const PRESETS = {
                noiseScale: 0.2, sminK: 0.18, canopyShadeMix: 0.6, depthShade: 0.72 },
     bark: ['bark_dark', 'wood', 'bark_light'],
     leaf: ['pine_dark', 'pine_needles', 'pine_lit'],
-    placement: { biomes: { forest: 4, meadow: 0, pine: 34, desert: 0 },
-                 minY: 19, maxY: 23.6, maxSlope: 640, sparsity: 1, shade: 240 }
+    placement: { minY: 19, maxY: 23.6, maxSlope: 640, sparsity: 1, shade: 240 }
   }),
 
   // Birch: slender, flame-shaped, with drooping twig ends (the NEGATIVE
@@ -1800,8 +1784,7 @@ export const PRESETS = {
                noiseScale: 0.24, sminK: 0.16, canopyShadeMix: 0.4, depthShade: 0.7 },
     bark: ['wood', 'birch_wood', 'birch_wood'],
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
-    placement: { biomes: { forest: 18, meadow: 30, pine: 8, desert: 0 },
-                 maxY: 22, maxSlope: 460, sparsity: 1, shade: 95 }
+    placement: { maxY: 22, maxSlope: 460, sparsity: 1, shade: 95 }
   }),
 
   // Redwood: a COLUMN, not a cone. `shape 4` (tapered cylindrical) plus very
@@ -1825,8 +1808,7 @@ export const PRESETS = {
                noiseScale: 0.2, sminK: 0.16, canopyShadeMix: 0.6, depthShade: 0.75 },
     bark: ['bark_dark', 'wood', 'bark_light'],
     leaf: ['pine_dark', 'pine_needles', 'pine_lit'],
-    placement: { biomes: { forest: 3, meadow: 0, pine: 10, desert: 0 },
-                 maxY: 21.8, maxSlope: 300, sparsity: 2, shade: 235 }
+    placement: { maxY: 21.8, maxSlope: 300, sparsity: 2, shade: 235 }
   }),
 
   // Eucalypt: the GAPS are the identity. Sparse branches, foliage hanging
@@ -1851,8 +1833,7 @@ export const PRESETS = {
                noiseScale: 0.28, sminK: 0.14, canopyShadeMix: 0.35, depthShade: 0.65 },
     bark: ['wood', 'birch_wood', 'birch_wood'],
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
-    placement: { biomes: { forest: 5, meadow: 12, pine: 0, desert: 8 },
-                 maxY: 21.2, maxSlope: 500, sparsity: 1, shade: 110 }
+    placement: { maxY: 21.2, maxSlope: 500, sparsity: 1, shade: 110 }
   }),
 
   // Willow: negative attractionUp all the way down, an inverse-conical
@@ -1875,8 +1856,7 @@ export const PRESETS = {
                radiusV: 0.12, elongation: 1.6, droop: 0.6, density: 0.66,
                noiseScale: 0.24, sminK: 0.15, canopyShadeMix: 0.4, depthShade: 0.7 },
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
-    placement: { biomes: { forest: 6, meadow: 14, pine: 0, desert: 0 },
-                 maxY: 20.4, maxSlope: 260, sparsity: 1, shade: 190 }
+    placement: { maxY: 20.4, maxSlope: 260, sparsity: 1, shade: 190 }
   }),
 
   // Bush: one level, a stub of a stem, and clumps doing all the work. It is a
@@ -1903,8 +1883,7 @@ export const PRESETS = {
                radiusV: 0.08, elongation: 0.85, droop: 0.05, density: 0.7,
                noiseScale: 0.18, sminK: 0.12, canopyShadeMix: 0.5, depthShade: 0.6 },
     leaf: ['leaves_dark', 'leaves', 'leaves_lit'],
-    placement: { biomes: { forest: 16, meadow: 40, pine: 12, desert: 26 },
-                 maxY: 23.2, maxSlope: 700, sparsity: 1, shade: 0 }
+    placement: { maxY: 23.2, maxSlope: 700, sparsity: 1, shade: 0 }
   }),
 
   // Dead tree: bare structure, no foliage at all. Cheap to place, and the one
@@ -1925,8 +1904,7 @@ export const PRESETS = {
     ],
     foliage: { startLevel: 9, clumpsPerStem: 0, radius: 0.1 },
     bark: ['bark_dark', 'wood', 'bark_light'],
-    placement: { biomes: { forest: 4, meadow: 3, pine: 4, desert: 10 },
-                 maxSlope: 700, sparsity: 1, shade: 0 }
+    placement: { maxSlope: 700, sparsity: 1, shade: 0 }
   })
 };
 
