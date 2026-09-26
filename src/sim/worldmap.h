@@ -428,10 +428,24 @@ enum : uint32_t {
 
 // ---- the site table (P5) ----------------------------------------------------
 // One record per authored site at kHSiteTable (kHSiteCount of them), plus a
-// per-cell SITE INDEX plane (kHSiteIndex; four cells per word like the
-// others) holding `site id + 1`, 0 = no site touches this cell. A site marks
-// every cell its footprint + pad margin reaches, first site wins. That plane
-// is what keeps the shader's per-column cost at one read: `wmSiteAt(x, z)`.
+// per-cell SITE INDEX plane (kHSiteIndex) of ONE WORD PER CELL: 0 = no site
+// touches this cell, else the word offset of that cell's SITE LIST,
+// `[n, id_1 .. id_n]` with 1 <= n <= kSiteCellMax and id = 1 + table index,
+// ascending (table order is map.json order, then rule-placed stamps). A site
+// is listed in every cell its REACH touches (SiteIndexReach below); cells
+// with the same list share one copy. A cell more than kSiteCellMax sites
+// reach is a LOAD ERROR naming them -- until P6 (docs/PLAN_map_overhaul.md)
+// this was one byte per cell, "first site wins", capped at 254 sites, and a
+// second site in a cell silently lost its pad, its keep-out and its lake.
+// The no-site column still costs one read: `wmSiteList(x, z)` == 0.
+//
+// Every reader walks the list and tests the site's own FOOTPRINT, never the
+// cell (worldgen.wgsl siteKeepOut / siteBlocksTrunk / wmPadSiteAt /
+// wmWaterSiteAt, and their world.cpp twins):
+//   stamp  the pad: Chebyshev radius + padMargin around the centre
+//   water  the disc + its shore/berm band (Euclidean)
+//   tree   the trunk: Chebyshev kSiteTreeKeepOut; the procedural lattice
+//          additionally keeps its trunks a crown's width away (reach + reach)
 //
 // Kinds: kSitePad is the harness box and is NOT in the table (it is the
 // WM_H_HARNESS_* header words); kSiteStamp is an authored .vox placed with
@@ -449,27 +463,42 @@ enum : uint32_t {
 // there it is a Pond like any rolled one -- same bowl, same berm, same shore,
 // same flora -- with its centre from the map instead of the seed. It is not
 // padded (sitePadAt skips the kind) and its keep-out is the DISC plus the
-// band, not its cells (siteKeepOut tests the kind), so a lake does not bald
-// four whole cells of forest around it.
+// band, not its cells, so a lake does not bald a whole cell of forest around
+// it (until P6 the TRUNK test still did: treeInfo refused every trunk in the
+// lake's cells).
+// kSiteTree (P6): ONE AUTHORED TREE -- `{kind: "tree", species, at: [x, z],
+// variant?, rot?}`. A species from the atlas (resolved by name at load to the
+// atlas's index, treeatlas.h ReadTreeSpeciesHeaders), standing on the ground
+// baked at its trunk (kS_PadY), drawn by the same candidate path as the
+// lattice's trees (worldgen.wgsl siteTreesInto), so it is in the near field,
+// the far cascades' canopy and the undergrowth cover like any other tree.
+// Not grown at or above the treeline: treeMaxTop() is a world-wide bound
+// every sky skip relies on.
 enum : uint32_t {
   kSiteRecWords = 16,
-  kS_Kind = 0,          // kSiteStamp | kSiteWater
+  kS_Kind = 0,          // kSiteStamp | kSiteWater | kSiteTree
   kS_X = 1,             // world voxel centre (i32 in u32)
   kS_Z = 2,
   kS_Radius = 3,        // Chebyshev footprint radius in voxels: keep-out + pad
-                        // (a water site: the disc radius)
+                        // (a water site: the disc radius; a tree site: the
+                        // species' reach, what the lattice keeps clear)
   kS_PadMargin = 4,     // columns over which the pad ramps back to terrain
-                        // (a water site: its preset's shore/berm band)
-  kS_Rot = 5,           // 0..3, informational (baked into the stamp block)
+                        // (a water site: its preset's shore/berm band; a
+                        // tree site: 0)
+  kS_Rot = 5,           // 0..3 (a stamp: informational, baked into its block;
+                        // a tree: kSiteRotRolled = rolled from the seed)
   kS_Salt = 6,
   kS_StampOff = 7,      // word offset of the stamp block, 0 = none
   kS_Preset = 8,        // water site: 1 + index into the water preset table
-  kS_PadY = 9,          // pad / stamp site: the BARE ground at (kS_X, kS_Z) --
-                        // landColumnBare's h there, baked by LoadWorldMap for
-                        // the seed it loads with (StampSite::padY). The pad,
-                        // the stamp and its sky ceiling read it instead of
+  kS_PadY = 9,          // pad / stamp / tree site: the BARE ground at (kS_X,
+                        // kS_Z) -- landColumnBare's h there, baked by
+                        // LoadWorldMap for the seed it loads with
+                        // (StampSite::padY). The pad, the stamp and its sky
+                        // ceiling, and a tree's trunk read it instead of
                         // re-running landColumnBare per column / per voxel.
-  // 10..15 reserved
+  kS_Species = 10,      // tree site: the atlas species index
+  kS_Variant = 11,      // tree site: 1 + variant (mod the species' count), 0 = rolled
+  // 12..15 reserved
   kStampHdrWords = 4,
   kStamp_NX = 0, kStamp_NY = 1, kStamp_NZ = 2, kStamp_Columns = 3,
   // columns: nx*nz pairs of (runOff, runCount), absolute word offsets; runs:
@@ -477,6 +506,17 @@ enum : uint32_t {
   kSitePad = 0,
   kSiteStamp = 1,
   kSiteWater = 2,
+  kSiteTree = 3,
+  kSiteRotRolled = 4,   // kS_Rot of a tree site the map did not turn
+  // At most this many sites may reach one map cell (the per-cell list); more
+  // is a load error. Four is two neighbouring buildings, a lake and a tree
+  // with room to spare at a 102 m cell; the shader's list walks are bounded
+  // by it.
+  kSiteCellMax = 4,
+  // A tree site's own keep-out (siteKeepOut): the trunk and a little, in
+  // voxels. No tarn centre, cactus, tile plant or cover row inside it; the
+  // ground under the crown keeps its undergrowth like a lattice tree's does.
+  kSiteTreeKeepOut = 6,
 };
 
 }  // namespace worldmap
@@ -624,22 +664,33 @@ struct WorldMapData {
   int spawnX = 140, spawnZ = 140;
   bool spawnAuthored = false;
   std::vector<std::string> palette;       // map.json biomes[]: plane byte -> name
-  // Authored stamp sites (P5), resolved: the template loaded, rotated, and
-  // packed into columns of runs at load. `siteIndex` is the per-cell plane.
+  // Authored sites (P5, P-F, P6), resolved: a stamp's template loaded,
+  // rotated and packed into columns of runs at load; a lake's preset; a
+  // tree's species. `siteIndex` / `siteLists` are the per-cell lists.
   struct StampSite {
-    std::string id, templateName;
-    int kind = kSiteStamp;                // kSiteStamp | kSiteWater (P-F)
+    std::string id, templateName;         // templateName: stamp .vox / water preset / tree species
+    int kind = kSiteStamp;                // kSiteStamp | kSiteWater (P-F) | kSiteTree (P6)
     int x = 0, z = 0, radius = 0, padMargin = 8, rot = 0;
     uint32_t salt = 0;
     int preset = 0;                       // water site: 1 + preset index
-    // Pad / stamp site: the bare ground at the centre for the LOAD seed
-    // (kS_PadY). Position-fixed and seed-dependent, so LoadWorldMap bakes it
-    // once with World::BareGroundHeight; 0 on a water site (never read).
+    int species = 0, variant = 0;         // tree site: kS_Species / kS_Variant
+    // Pad / stamp / tree site: the bare ground at the centre for the LOAD
+    // seed (kS_PadY). Position-fixed and seed-dependent, so LoadWorldMap bakes
+    // it once with World::BareGroundHeight; 0 on a water site (never read).
     int padY = 0;
+    // How far past (x, z) the site is LISTED in the per-cell index, Chebyshev
+    // voxels: every reader's footprint test must fit inside it. Not packed.
+    int indexReach = 0;
     int nx = 0, ny = 0, nz = 0;
     std::vector<uint32_t> words;          // the packed stamp block, offsets RELATIVE to its start
   };
-  std::vector<StampSite> sites;           // stamps AND water sites, in site-id order
+  std::vector<StampSite> sites;           // stamps, water and tree sites, in site-id order
+  // LOAD WARNINGS (P6): everything the loader skipped or thinks is a mistake
+  // but will not refuse a boot over -- an unknown site kind, a stamp .vox or
+  // tree species that is not there, two footprints that overlap, a tree at
+  // the treeline, the spawn inside a site. Printed at load ("world map
+  // WARNING: ...") and surfaced on the tuner's World map page (--mapcheck).
+  std::vector<std::string> warnings;
   // The water table the height mirror's CPU twin reads (worldgen.wgsl reads
   // the kW_* / kR_* words; these are the same integers): one WaterGeom per
   // preset in loader order, each biome's packed rows by biome id, the lattice
@@ -661,9 +712,18 @@ struct WorldMapData {
   // sculptOctave) reads these words with the shader's arithmetic.
   std::vector<uint32_t> sculpt;
   int sculptTiles = 0;                    // authored non-zero tiles in the file
-  std::vector<uint8_t> siteIndex;         // width*height, site id + 1, 0 = none
-  uint8_t SiteCell(int cx, int cz) const {
-    return siteIndex.empty() ? 0 : siteIndex[static_cast<size_t>(cz) * width + cx];
+  // The per-cell site lists (see "the site table" above), CPU form: one entry
+  // per cell, 0 = no site, else an offset into `siteLists`, where the list is
+  // [n, id_1 .. id_n] (id = 1 + index into `sites`). siteLists[0] is a pad
+  // word so 0 can mean "none". PackWorldMap rebases the offsets onto the
+  // buffer; the CPU twins read these directly.
+  std::vector<uint32_t> siteIndex;        // width*height
+  std::vector<uint32_t> siteLists;
+  /** The list of cell (cx, cz): nullptr = no site, else [n, ids...]. */
+  const uint32_t* SiteList(int cx, int cz) const {
+    if (siteIndex.empty()) return nullptr;
+    const uint32_t off = siteIndex[static_cast<size_t>(cz) * width + cx];
+    return off == 0u ? nullptr : siteLists.data() + off;
   }
   std::vector<uint8_t> biome;             // RESOLVED to biome ids, width*height
   std::vector<uint8_t> landform;
@@ -687,12 +747,26 @@ struct WorldMapData {
  * Load assets/worldmap/<name>/ and resolve its palette against the biome
  * set. False, with `log`, on a missing directory, a malformed file, a
  * palette name no biome file has, or planes whose size disagrees with
- * map.json -- the caller ABORTS on false (a world with no map is not a
- * world, see the header comment).
+ * map.json, or a cell more than kSiteCellMax sites reach -- the caller ABORTS
+ * on false (a world with no map is not a world, see the header comment).
+ * What it skips or doubts without refusing is in `out.warnings` (and stderr).
+ *
+ * `mapJson`, when given, is used INSTEAD of <name>/map.json (the planes and
+ * the sculpt layer still come from <name>/): the `worldmap` gate's synthetic
+ * site cases load that way, so they touch no file.
  */
 bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                   const biomes::BiomeSet& set, size_t materialCount, uint32_t seed,
-                  WorldMapData& out, std::string& log);
+                  WorldMapData& out, std::string& log,
+                  const std::string* mapJson = nullptr);
+
+/**
+ * `--mapcheck <name>`'s answer, one line of JSON: {"ok", "map", "sites",
+ * "warnings": [...], "error"} -- what LoadWorldMap said about the map (its
+ * refusal in `error` when ok is false). The tuner's World map page shows it.
+ */
+std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m,
+                         const std::string& error);
 
 /**
  * The whole `worldMap` buffer: PackBiomeTable's words plus the map header
@@ -718,6 +792,14 @@ void SetCurrentWorldMap(WorldMapData map);
  * (StampSite::padY), which runs it with the map being loaded installed.
  */
 int BareGroundHeight(int x, int z, uint32_t seed);
+
+/**
+ * The keep-out every generated feature avoids (worldgen.wgsl siteKeepOut),
+ * against CurrentWorldMap(): the pad box plus every listed site's own
+ * footprint -- a stamp's pad, a lake's disc + band, a tree's trunk. Defined
+ * in world.cpp beside the other CPU twins of the site readers.
+ */
+bool SiteKeepOut(int x, int z);
 
 /**
  * WHICH MAP A RUN LOADS. `SANDVOX_MAP=<name>` in the environment wins (an

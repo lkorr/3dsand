@@ -26,6 +26,24 @@ void SetCurrentTreeLattice(const TreeLattice& l) { LatticeSlot() = l; }
 
 namespace {
 
+/** The .svtree files of `dir` in SPECIES ORDER. Sorted by name: the species
+ *  INDEX reaches the world through a hash roll (and, since P6, through an
+ *  authored tree site's record), so directory order would make the forest
+ *  depend on the filesystem. The one list both LoadTreeAtlas and
+ *  ReadTreeSpeciesHeaders walk. */
+std::vector<fs::path> SortedTreeFiles(const std::string& dir) {
+  std::vector<fs::path> paths;
+  std::error_code ec;
+  if (fs::is_directory(dir, ec)) {
+    for (const auto& e : fs::directory_iterator(dir, ec)) {
+      if (e.is_regular_file(ec) && e.path().extension() == ".svtree")
+        paths.push_back(e.path());
+    }
+  }
+  std::sort(paths.begin(), paths.end());
+  return paths;
+}
+
 /** One .svtree file, parsed but not yet rebased into the global buffer. */
 struct File {
   std::string name;                 // file stem
@@ -207,17 +225,7 @@ bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
   std::unordered_map<std::string, uint32_t> byName;
   for (size_t i = 0; i < mats.size(); i++) byName[mats[i].name] = static_cast<uint32_t>(i);
 
-  std::vector<fs::path> paths;
-  std::error_code ec;
-  if (fs::is_directory(dir, ec)) {
-    for (const auto& e : fs::directory_iterator(dir, ec)) {
-      if (e.is_regular_file(ec) && e.path().extension() == ".svtree")
-        paths.push_back(e.path());
-    }
-  }
-  // Sorted by name: the species INDEX reaches the world through a hash roll, so
-  // directory order would make the forest depend on the filesystem.
-  std::sort(paths.begin(), paths.end());
+  const std::vector<fs::path> paths = SortedTreeFiles(dir);
 
   std::vector<File> files;
   for (const auto& p : paths) {
@@ -467,4 +475,32 @@ uint32_t TreeAtlasCellAt(const TreeAtlas& atlas, int species, int variant,
     if (ly < y0 + len) return r & 0xFFFu;
   }
   return 0;
+}
+
+bool ReadTreeSpeciesHeaders(const std::string& dir, std::vector<TreeSpeciesHeader>& out,
+                            std::string& log) {
+  out.clear();
+  int index = 0;
+  for (const fs::path& p : SortedTreeFiles(dir)) {
+    uint32_t w[kFileHeaderWords] = {};
+    std::ifstream f(p, std::ios::binary);
+    if (!f || !f.read(reinterpret_cast<char*>(w), sizeof w)) {
+      log += "tree atlas: " + p.stem().string() + " has no readable header\n";
+      return false;
+    }
+    if (w[0] != kFileMagic || w[1] != kFileVersion ||
+        w[kFileWordBakeVpm] != static_cast<uint32_t>(kVoxelsPerMetre)) {
+      log += "tree atlas: " + p.stem().string() + " has a header the atlas would refuse "
+             "(magic / version / bake scale) -- re-bake with node scripts/bake_trees.mjs\n";
+      return false;
+    }
+    TreeSpeciesHeader h;
+    h.name = p.stem().string();
+    h.index = index++;
+    h.variants = static_cast<int>(w[3]);
+    h.reach = static_cast<int>(w[8]);
+    h.above = static_cast<int>(w[9]);
+    out.push_back(std::move(h));
+  }
+  return true;
 }

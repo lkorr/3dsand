@@ -4477,6 +4477,9 @@ int main(int argc, char** argv) {
   // dispatch below for why this is a GPU-free early exit.
   std::string heightmapArgs;
   std::string heightmapOut = "build/heightmap.bin";
+  // --mapcheck <name> — load one map exactly as the game would and print its
+  // load warnings / refusal as JSON (the World map page's warnings panel).
+  std::string mapcheckName;
   // --voxdump ox,oy,oz,nx,ny,nz,lod[,seed] / --voxserve (tools/voxregion.h)
   std::string voxdumpArgs;
   std::string voxdumpOut = "build/voxregion.bin";
@@ -5001,6 +5004,10 @@ int main(int argc, char** argv) {
       if (i + 1 >= argc) { std::fprintf(stderr, "--heightmap-out wants a path\n"); return 1; }
       heightmapOut = argv[++i];
     }
+    else if (a == "--mapcheck") {
+      if (i + 1 >= argc) { std::fprintf(stderr, "--mapcheck wants a map name\n"); return 1; }
+      mapcheckName = argv[++i];
+    }
     // --voxdump / --voxserve: REAL VOXELS for the tuner's terrain viewer.
     // Unlike --heightmap these need a GPU (genCellIn is WGSL), so they answer
     // after device init — see tools/voxregion.h for why one is a server.
@@ -5106,6 +5113,31 @@ int main(int argc, char** argv) {
       worldmap::SetCurrentWorldMap(std::move(map));
     }
     return WriteHeightmap(heightmapArgs, heightmapOut);
+  }
+  // --mapcheck <name>: the same GPU-free load --heightmap does, of the NAMED
+  // map (the page's, not world.mapLayer), answered as one `MAPCHECK {json}`
+  // line: the load warnings (unknown site kinds, missing stamps / species,
+  // overlapping footprints, ...) or the refusal. Exit 0 either way -- a
+  // refused map is an answer, not a crash; the tuner shows it.
+  if (!mapcheckName.empty()) {
+    Tuning tune;
+    LoadTuning(AssetDir() + "/materials/tuning.json", tune);
+    SetCurrentTuning(tune);
+    const std::string ad = AssetDir();
+    std::vector<MaterialDef> m;
+    std::vector<ReactionGpu> rx;
+    std::string errs;
+    biomes::BiomeSet set;
+    worldmap::WorldMapData map;
+    std::string blog;
+    bool ok = mapcheckName.find_first_of("/\\:") == std::string::npos;   // a bare name, never a path
+    if (!ok) blog = "not a bare map name";
+    ok = ok && LoadAssets(ad + "/materials/materials.json", ad + "/materials/reactions.json", m, rx, errs);
+    if (!ok && blog.empty()) blog = "asset load failed: " + errs;
+    ok = ok && biomes::LoadBiomeSet(ad, m, set, blog);
+    ok = ok && worldmap::LoadWorldMap(ad, mapcheckName, set, m.size(), kDefaultSeed, map, blog);
+    std::printf("MAPCHECK %s\n", worldmap::MapCheckJson(mapcheckName, ok, map, ok ? "" : blog).c_str());
+    return 0;
   }
 
   // --suite acceptance: one process, all measurements. The expensive part of a

@@ -25,8 +25,15 @@
  * region: no trunks, crowns, tarns or cover, coarse relief faded; the
  * `harness` map carries the selftest's over its fixtures), one `kind: "spawn"` column (where the game starts and the centre
  * of the calm home area; PLAN_environment_truth P-C), `kind: "stamp"`
- * markers (P5), and `kind: "water"` AUTHORED LAKES (P-F: a water preset at a
- * fixed centre, the same on every seed).
+ * markers (P5), `kind: "water"` AUTHORED LAKES (P-F: a water preset at a
+ * fixed centre, the same on every seed) and `kind: "tree"` AUTHORED TREES
+ * (P6 of docs/PLAN_map_overhaul.md: a species at a column). Every placed kind
+ * spells its column `at: [x, z]` (a pre-P6 stamp's x / z still loads). The
+ * engine lists each site in the map cells its reach touches (at most four a
+ * cell, or the load is refused) and every reader tests the site's own
+ * footprint; the Load check panel shows what the loader said about the SAVED
+ * files (`sandvox --mapcheck`): unknown kinds, missing stamps / species,
+ * overlapping footprints, a tree at the treeline.
  *
  * WHAT THE CANVAS IS NOT. Not a preview of the generated world: the Preview
  * pane under it (the heightmap and voxel views, tuner.html #wgPreviewHost) and
@@ -64,7 +71,7 @@ let H = null;
 let els = {};
 let map = null;            // {name, json, biome:Uint8Array, landform:Uint8Array, moisture:Uint8Array}
 let dirty = false;
-let tool = 'biome';        // biome | landform | pad | spawn | stamp | water | site
+let tool = 'biome';        // biome | landform (the plane brushes) | pad | spawn | stamp | water | lfsite | tree | site | sculpt
 // P-G: the terrain block map.json carries. Its DEFAULTS (what a map missing a
 // key gets) have one copy, src/sim/worldmap.h TerrainParams, which the tuner
 // server reads and serves (/api/worldmap/terrain-defaults, via
@@ -123,6 +130,14 @@ let water = {preset: '', radiusM: 0, presets: [], geom: {}};
 // (no typed names: the engine skips a site whose .vox is missing), and the
 // quarter-turn rotation a new stamp gets.
 let stamp = {template: '', rot: 0, templates: []};
+// The tree tool (P6): an AUTHORED TREE is `{kind: "tree", species, at: [x, z],
+// variant?, rot?}` -- a species from what EXISTS under assets/trees/*.svtree
+// (the atlas the engine loads), variant / quarter-turn for a new tree (-1 =
+// leave the key out: the seed rolls it).
+let trees = {species: '', variant: -1, rot: -1, list: []};
+// The map's LOAD WARNINGS (P6), as `sandvox --mapcheck` reports them for the
+// SAVED files: {ok, warnings[], error} or null until fetched.
+let check = null;
 let waterDrag = null;      // {site, dx, dz}: dragging an existing lake by its centre
 let brush = {index: 0, radius: 2, landform: 128, soft: true};
 let view = {cx: 0, cz: 0, scale: 4};   // cell-space centre + pixels per cell
@@ -343,6 +358,11 @@ function markDirty(d = true) {
   if (H && H.onDirty) H.onDirty(d);
   if (els.save) els.save.disabled = !d;
 }
+/** A site's column, world voxels: `at: [x, z]`, or a pre-P6 stamp's x / z. */
+function siteXZ(s) {
+  if (Array.isArray(s.at)) return s.at;
+  return [s.x | 0, s.z | 0];
+}
 function cellOfWorld(x, z) {
   const j = map.json;
   return [(x >> j.cellLog2) + j.originCell[0], (z >> j.cellLog2) + j.originCell[1]];
@@ -446,6 +466,7 @@ async function loadMap(name) {
   rebuildPalette();
   terrainOf();
   syncTerrain(); syncSites(); publishTerrain();
+  check = null; syncCheck(); fetchCheck();
   fit();
   paint();
   status(`loaded worldmap/${name}: ${json.size[0]}x${json.size[1]} cells of ${1 << json.cellLog2} vox (${(json.size[0] * (1 << json.cellLog2) / 10 / 1000).toFixed(1)} km)` +
@@ -495,6 +516,86 @@ async function loadStampTemplates() {
     els.stampTpl.value = stamp.template;
   }
 }
+// The tree species: every .svtree under assets/trees/ (what the atlas loads;
+// a species with only a .json is not in the world yet).
+async function loadTreeSpecies() {
+  const r = await fetch('/api/models', {cache: 'no-store'});
+  const j = await r.json();
+  trees.list = [...new Set((j.files || [])
+      .filter(f => f.dir === 'trees' && f.name.endsWith('.svtree'))
+      .map(f => f.name.slice(0, -7)))].sort();
+  if (!trees.list.includes(trees.species)) trees.species = trees.list.includes('oak') ? 'oak' : (trees.list[0] || '');
+  if (els.treeSp) {
+    els.treeSp.replaceChildren(...(trees.list.length
+      ? trees.list.map(n => H.el('option', {value: n}, n))
+      : [H.el('option', {value: ''}, '(no .svtree in trees/)')]));
+    els.treeSp.value = trees.species;
+  }
+}
+/* ---- the LOAD WARNINGS panel (P6) ----------------------------------------------
+ * What the engine's loader says about the SAVED map: `sandvox --mapcheck
+ * <name>` through /api/worldmap/check -- unknown site kinds, a stamp .vox or a
+ * tree species that is not there, two footprints that overlap, a tree at the
+ * treeline, the spawn inside a site; or the refusal (a map cell more than
+ * four sites reach). Fetched on load and after every save, never per edit:
+ * the answer is about the files. */
+async function fetchCheck() {
+  if (!map) return;
+  const name = map.name;
+  let j;
+  try {
+    const r = await fetch('/api/worldmap/check?name=' + encodeURIComponent(name), {cache: 'no-store'});
+    j = await r.json();
+    if (!r.ok && !j.checked) j = {unavailable: true, error: j.error || ('HTTP ' + r.status)};
+  } catch (e) { j = {unavailable: true, error: e.message}; }
+  if (!map || map.name !== name) return;
+  check = j;
+  syncCheck();
+}
+function syncCheck() {
+  if (!els.checkList) return;
+  const el = H.el;
+  els.checkList.innerHTML = '';
+  const c = check;
+  let head;
+  if (!c) head = 'not checked yet';
+  else if (c.unavailable) head = 'the engine could not check this map: ' + (c.error || '?');
+  else if (!c.ok) head = 'the engine REFUSES this map';
+  else head = (c.warnings || []).length ? (c.warnings.length + ' warning' + (c.warnings.length === 1 ? '' : 's') + ' (the saved files)') : 'no warnings (the saved files)';
+  if (els.checkSummary) {
+    els.checkSummary.textContent = 'Load check — ' + (c && !c.unavailable ? (!c.ok ? 'REFUSED' : ((c.warnings || []).length + ' warning' + ((c.warnings || []).length === 1 ? '' : 's'))) : '?');
+    els.checkSummary.classList.toggle('bad', !!(c && !c.unavailable && (!c.ok || (c.warnings || []).length)));
+  }
+  els.checkList.append(el('div', {class: 'mapnote'}, head));
+  const lines = c && !c.unavailable ? (c.ok ? (c.warnings || []) : [c.error || '?']) : [];
+  for (const w of lines) {
+    const row = el('div', {class: 'mapwarn' + (c.ok ? '' : ' err')}, w);
+    // A warning naming a site selects it (the first quoted id that is one).
+    const ids = [...String(w).matchAll(/site "([^"]+)"/g)].map(m => m[1]);
+    const hit = (map.json.sites || []).find(s => ids.includes(s.id));
+    if (hit) {
+      row.classList.add('link');
+      row.title = 'select ' + hit.id;
+      row.addEventListener('click', () => {
+        selected = hit;
+        const cv = 1 << map.json.cellLog2, [x, z] = hit.kind === 'pad' ? [0, 0] : siteXZ(hit);
+        view.cx = x / cv + map.json.originCell[0]; view.cz = z / cv + map.json.originCell[1];
+        syncSites(); paint();
+      });
+    }
+    els.checkList.append(row);
+  }
+}
+function buildCheckPanel() {
+  const el = H.el;
+  const det = el('details', {class: 'mapcheck', open: true});
+  els.checkSummary = el('summary', {}, 'Load check');
+  els.checkList = el('div', {class: 'mapcheck-list'});
+  const again = el('button', {title: 'ask the engine again (sandvox --mapcheck on the saved files)'}, 'Re-check');
+  again.addEventListener('click', () => fetchCheck());
+  det.append(els.checkSummary, els.checkList, again);
+  return det;
+}
 async function saveMap() {
   if (!map) return;
   const name = map.name;
@@ -521,6 +622,7 @@ async function saveMap() {
   }
   markDirty(false);
   savedGen++;
+  fetchCheck();   // the load warnings are about the saved files: ask again
   if (H.saved) H.saved();
   // The backdrop on screen is the map before this save: redraw it.
   if (showHeights) fetchHeights().catch(e => status('heights failed: ' + e.message));
@@ -631,7 +733,8 @@ function paint() {
   for (const s of (map.json.sites || [])) {
     if (s.kind !== 'stamp') continue;
     const l = map.json.cellLog2, cv = 1 << l;
-    const sx = ox + (s.x / cv + ocx) * view.scale, sz = oy + (s.z / cv + ocz) * view.scale;
+    const [wx, wz] = siteXZ(s);
+    const sx = ox + (wx / cv + ocx) * view.scale, sz = oy + (wz / cv + ocz) * view.scale;
     const rr = Math.max(3, ((s.radius || 16) / cv) * view.scale);
     ctx.strokeStyle = tool === 'stamp' ? '#ff7a7a' : '#7fd4ff'; ctx.lineWidth = 2;
     ctx.strokeRect(sx - rr, sz - rr, rr * 2, rr * 2);
@@ -657,6 +760,19 @@ function paint() {
     ctx.fillStyle = '#5fc8ff'; ctx.font = '11px monospace';
     ctx.fillText((s.id || 'lake') + ' (' + (s.preset || '?') + ' r' + (rv / 10).toFixed(1) + 'm)', sx + rr + 3, sz + 4);
   }
+  // authored trees (P6): a small triangle at the trunk, the species as the label
+  for (const s of (map.json.sites || [])) {
+    if (s.kind !== 'tree') continue;
+    const cv = 1 << map.json.cellLog2;
+    const [wx, wz] = siteXZ(s);
+    const sx = ox + (wx / cv + ocx) * view.scale, sz = oy + (wz / cv + ocz) * view.scale;
+    ctx.strokeStyle = tool === 'tree' ? '#ff7a7a' : '#6fe07a'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(sx, sz - 7); ctx.lineTo(sx + 5, sz + 4); ctx.lineTo(sx - 5, sz + 4); ctx.closePath(); ctx.stroke();
+    if (view.scale >= 2) {
+      ctx.fillStyle = '#6fe07a'; ctx.font = '11px monospace';
+      ctx.fillText((s.id || 'tree') + ' (' + (s.species || '?') + (Number.isInteger(s.variant) ? ' v' + s.variant : '') + ')', sx + 8, sz + 4);
+    }
+  }
   // declared landforms (P-G): a peak / basin / plateau as a disc, a ridge as
   // its ellipse turned to its heading; + for a lift, - for a basin
   for (const s of (map.json.sites || [])) {
@@ -666,7 +782,7 @@ function paint() {
     const sx = ox + (at[0] / cv + ocx) * view.scale, sz = oy + (at[1] / cv + ocz) * view.scale;
     const rr = Math.max(3, ((s.radius || 1024) / cv) * view.scale);
     const sel = selected === s;
-    ctx.strokeStyle = sel ? '#ffffff' : (tool === 'landform' ? '#ff7a7a' : (s.shape === 'basin' ? '#7fa8ff' : '#e8c477'));
+    ctx.strokeStyle = sel ? '#ffffff' : (tool === 'lfsite' ? '#ff7a7a' : (s.shape === 'basin' ? '#7fa8ff' : '#e8c477'));
     ctx.lineWidth = sel ? 3 : 2;
     ctx.beginPath();
     if (s.shape === 'ridge') ctx.ellipse(sx, sz, rr, Math.max(2, rr / 3), (s.rotation || 0) * Math.PI / 180, 0, Math.PI * 2);
@@ -679,7 +795,7 @@ function paint() {
   // the selected site of any other kind: a white ring
   if (selected && selected.kind !== 'landform') {
     const l = map.json.cellLog2, cv = 1 << l;
-    const at = Array.isArray(selected.at) ? selected.at : [selected.x || 0, selected.z || 0];
+    const at = siteXZ(selected);
     if (selected.kind !== 'pad') {
       const sx = ox + (at[0] / cv + ocx) * view.scale, sz = oy + (at[1] / cv + ocz) * view.scale;
       ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 1.5;
@@ -696,7 +812,8 @@ function paint() {
     ctx.beginPath(); ctx.arc(sx, sz, Math.max(1, sculpt.radius / cv * view.scale * 0.5), 0, Math.PI * 2); ctx.setLineDash([2, 3]); ctx.stroke(); ctx.setLineDash([]);
   }
   // brush cursor
-  if (els.hover && tool !== 'pad' && tool !== 'stamp' && tool !== 'spawn' && tool !== 'water' && tool !== 'landform' && tool !== 'site' && tool !== 'sculpt') {
+  // (the two PLANE brushes only: every other tool places or edits a site)
+  if (els.hover && (tool === 'biome' || tool === 'landform')) {
     ctx.strokeStyle = 'rgba(255,255,255,0.7)'; ctx.lineWidth = 1;
     ctx.beginPath();
     ctx.arc(ox + (els.hover[0] + 0.5) * view.scale, oy + (els.hover[1] + 0.5) * view.scale,
@@ -797,7 +914,7 @@ function wire() {
       // (seeded placement per biome) are P5b.
       const [wx, wz] = worldColumnAt(ev);
       const sites = map.json.sites || (map.json.sites = []);
-      const hit = sites.find(s => s.kind === 'stamp' && Math.abs(s.x - wx) <= (s.radius || 16) && Math.abs(s.z - wz) <= (s.radius || 16));
+      const hit = sites.find(s => s.kind === 'stamp' && Math.abs(siteXZ(s)[0] - wx) <= (s.radius || 16) && Math.abs(siteXZ(s)[1] - wz) <= (s.radius || 16));
       stroke = snapshot();
       if (ev.shiftKey && hit) {
         sites.splice(sites.indexOf(hit), 1);
@@ -808,13 +925,13 @@ function wire() {
           stroke = null; return;
         }
         const t = stamp.template, rot = stamp.rot & 3;
-        sites.push({id: t + '_' + sites.length, kind: 'stamp', template: t, x: wx, z: wz, rot, padMargin: 8, salt: sites.length});
+        sites.push({id: t + '_' + sites.length, kind: 'stamp', template: t, at: [wx, wz], rot, padMargin: 8, salt: sites.length});
         stroke.changed = true;
       }
       paint();
       return;
     }
-    if (tool === 'landform') {
+    if (tool === 'lfsite') {
       // Click on a landform: pick it up (drag moves it) and select it. Shift+
       // click: delete it. Click on open map: a new one at the cursor's world
       // column with the panel's shape / radius / height / rotation. Tier A:
@@ -859,6 +976,39 @@ function wire() {
       sculpt.target = sculpt.mode === 'flatten' ? groundAt(wx, wz) : null;
       sculpt.last = [wx, wz];
       if (sculptDab(wx, wz, stroke.sculptBefore)) { stroke.changed = true; scheduleSculptPreview(); }
+      paint();
+      return;
+    }
+    if (tool === 'tree') {
+      // THE TREE TOOL (P6): click on open map, a new authored tree of the
+      // picked species at the cursor's column (variant / turn only if the
+      // controls name one; otherwise the seed rolls them). Click a tree: pick
+      // it up (drag moves it) and select it. Shift+click: delete it.
+      const [wx, wz] = worldColumnAt(ev);
+      const sites = map.json.sites || (map.json.sites = []);
+      const grab = Math.max(6, 8 * (1 << map.json.cellLog2) / view.scale);   // ~8 px of marker
+      // (the drag below reuses the lake drag: it moves any site's `at`)
+      const hit = sites.find(s => s.kind === 'tree' && Array.isArray(s.at) &&
+                                  Math.hypot(s.at[0] - wx, s.at[1] - wz) <= grab);
+      stroke = snapshot();
+      if (ev.shiftKey && hit) {
+        sites.splice(sites.indexOf(hit), 1);
+        if (selected === hit) selected = null;
+        stroke.changed = true;
+      } else if (hit) {
+        selected = hit;
+        waterDrag = {site: hit, dx: hit.at[0] - wx, dz: hit.at[1] - wz};
+      } else {
+        if (!trees.species) { toast(trees.list.length ? 'pick a tree species first' : 'no .svtree under assets/trees/', true); stroke = null; return; }
+        const n = sites.filter(s => s.kind === 'tree').length;
+        const s = {id: trees.species + '_' + n, kind: 'tree', species: trees.species, at: [wx, wz]};
+        if (trees.variant >= 0) s.variant = trees.variant;
+        if (trees.rot >= 0) s.rot = trees.rot;
+        sites.push(s);
+        selected = s;
+        stroke.changed = true;
+      }
+      syncSites();
       paint();
       return;
     }
@@ -1037,7 +1187,7 @@ function siteAt(wx, wz) {
   let best = null, bd = Infinity;
   for (const s of (map.json.sites || [])) {
     let at = Array.isArray(s.at) ? s.at : null;
-    if (s.kind === 'stamp') at = [s.x || 0, s.z || 0];
+    if (s.kind === 'stamp') at = siteXZ(s);
     if (s.kind === 'pad' && Array.isArray(s.min) && Array.isArray(s.max)) at = [(s.min[0] + s.max[0]) / 2, (s.min[1] + s.max[1]) / 2];
     if (!at) continue;
     const d = Math.hypot(at[0] - wx, at[1] - wz);
@@ -1101,7 +1251,7 @@ function buildSitesPanel() {
 }
 function siteWhere(s) {
   if (s.kind === 'pad' && Array.isArray(s.min)) return '(' + s.min.join(',') + ')..(' + s.max.join(',') + ')';
-  if (s.kind === 'stamp') return '(' + (s.x | 0) + ',' + (s.z | 0) + ')';
+  if (s.kind === 'stamp') return '(' + siteXZ(s).join(',') + ')';
   return Array.isArray(s.at) ? '(' + s.at.join(',') + ')' : '';
 }
 function syncSites() {
@@ -1109,7 +1259,7 @@ function syncSites() {
   const el = H.el;
   const sites = map.json.sites || (map.json.sites = []);
   els.sitesList.innerHTML = '';
-  const order = {pad: 0, spawn: 1, water: 2, landform: 3, stamp: 4};
+  const order = {pad: 0, spawn: 1, water: 2, landform: 3, stamp: 4, tree: 5};
   const sorted = sites.slice().sort((a, b) => (order[a.kind] ?? 9) - (order[b.kind] ?? 9));
   for (const s of sorted) {
     const row = el('div', {class: 'mapsite' + (selected === s ? ' on' : '')});
@@ -1121,7 +1271,8 @@ function syncSites() {
       markDirty(true); syncSites(); paint();
     });
     const where = el('span', {class: 'mapwhere'}, siteWhere(s) +
-      (s.kind === 'water' ? ' ' + (s.preset || '?') : s.kind === 'landform' ? ' ' + s.shape + ' ' + ((s.heightVox || 0) / 10).toFixed(0) + ' m' : s.kind === 'stamp' ? ' ' + (s.template || '?') : ''));
+      (s.kind === 'water' ? ' ' + (s.preset || '?') : s.kind === 'landform' ? ' ' + s.shape + ' ' + ((s.heightVox || 0) / 10).toFixed(0) + ' m' :
+       s.kind === 'stamp' ? ' ' + (s.template || '?') : s.kind === 'tree' ? ' ' + (s.species || '?') : ''));
     const sel = el('button', {title: 'select on the map'}, selected === s ? 'selected' : 'select');
     sel.addEventListener('click', () => { selected = s; syncSites(); paint(); });
     const del = el('button', {title: 'delete this site'}, '\u00d7');
@@ -1173,6 +1324,31 @@ function syncSites() {
     pnl.append(el('span', {class: 'mapnote'}, 'The calm pad box: no trunks, crowns, tarns or cover inside. Drag it with the Pad box tool.'));
   } else if (s.kind === 'stamp') {
     pnl.append(el('span', {class: 'mapnote'}, 'assets/prefabs/' + (s.template || '?') + '.vox' + (s.rot ? ', rotated ' + s.rot : '') + '. Shift+click its marker with the Stamp tool to delete.'));
+  } else if (s.kind === 'tree') {
+    const sp = el('select', {});
+    for (const n of trees.list) sp.append(el('option', {value: n}, n));
+    if (!trees.list.includes(s.species)) sp.append(el('option', {value: s.species || ''}, (s.species || '?') + ' (missing)'));
+    sp.value = s.species || '';
+    sp.addEventListener('change', () => {
+      undo.push(snapshot()); if (undo.length > 40) undo.shift(); redo = [];
+      s.species = sp.value;
+      markDirty(true); syncSites(); paint();
+    });
+    // variant / turn: blank = rolled from the seed (the key is removed)
+    const opt = (label, key, max, title) => {
+      const inp = el('input', {type: 'number', min: 0, max, step: 1, value: Number.isInteger(s[key]) ? s[key] : '', placeholder: 'rolled', style: 'width:70px', title});
+      inp.addEventListener('change', () => {
+        undo.push(snapshot()); if (undo.length > 40) undo.shift(); redo = [];
+        if (inp.value === '') delete s[key]; else s[key] = Math.max(0, Math.min(max, Math.round(+inp.value || 0)));
+        markDirty(true); syncSites(); paint();
+      });
+      return el('label', {title}, label, ' ', inp);
+    };
+    pnl.append(el('label', {title: 'the species (assets/trees/<name>.svtree)'}, 'species ', sp),
+               opt('variant', 'variant', 63, 'which baked variant (wraps modulo the species’ count; the load warns); blank = rolled from the seed'),
+               opt('turn (0..3)', 'rot', 3, 'quarter turns; blank = rolled from the seed (with a mirror)'),
+               el('span', {class: 'mapnote'}, 'Stands on the generated ground at its column (sculpt and ponds included), drawn like any tree near and far. ' +
+                  'The procedural forest keeps its trunks a crown’s width away; cover and ferns still grow under it. Not grown at or above the treeline (the load warns). Drag it with the Tree tool; shift+click deletes.'));
   }
 }
 
@@ -1391,6 +1567,13 @@ export function attach(hooks) {
 #env-map .mapkind-spawn{color:#8dff9a}
 #env-map .mapkind-pad{color:#ffb454}
 #env-map .mapkind-stamp{color:#7fd4ff}
+#env-map .mapkind-tree{color:#6fe07a}
+#env-map details.mapcheck summary.bad{color:#ffb454}
+#env-map .mapcheck-list{display:flex;flex-direction:column;gap:3px;margin:6px 0}
+#env-map .mapwarn{font:10px/1.4 monospace;color:#ffcf8a;border-left:2px solid #6a4a1a;padding-left:6px;overflow-wrap:anywhere}
+#env-map .mapwarn.err{color:#ff8a8a;border-left-color:#7a2a2a}
+#env-map .mapwarn.link{cursor:pointer}
+#env-map .mapwarn.link:hover{background:#1f2a3d}
 #env-map .mapid{width:110px;font:11px monospace;background:#0e1219;border:1px solid #2a3040;color:#dbe4f0;border-radius:3px;padding:1px 4px}
 #env-map .mapwhere{flex:1;color:#8fa0b8;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 #env-map .mapsites-panel{display:flex;flex-direction:column;gap:4px;border-top:1px solid #2a3040;padding-top:6px}
@@ -1412,7 +1595,11 @@ export function attach(hooks) {
     spawn: el('button', {title: 'click: put the spawn site there (where the game starts; the calm home area centres on it). One per map.'}, 'Spawn'),
     stamp: el('button', {title: 'click: place a stamp site (the template picked beside it, from assets/prefabs/); shift+click a marker: delete it'}, 'Stamp site'),
     water: el('button', {title: 'click: place an AUTHORED LAKE (a water preset at that column, same on every seed); drag a lake to move it; shift+click: delete it'}, 'Water'),
-    landform: el('button', {title: 'click: DECLARE A LANDFORM (a peak / ridge / basin / plateau overlaid onto the landform plane at load, same on every seed); drag one to move it; shift+click: delete it'}, 'Landform'),
+    // (was a second `landform` key until P6, which silently replaced the
+    // Landform BRUSH above: the paint brush had no button and its slider
+    // switched to this tool)
+    lfsite: el('button', {title: 'click: DECLARE A LANDFORM (a peak / ridge / basin / plateau overlaid onto the landform plane at load, same on every seed); drag one to move it; shift+click: delete it'}, 'Landform site'),
+    tree: el('button', {title: 'click: place an AUTHORED TREE (the species beside it, from assets/trees/*.svtree) on the ground at that column; drag a tree to move it; shift+click: delete it. The procedural forest keeps its trunks a crown’s width away.'}, 'Tree'),
     site: el('button', {title: 'click a site marker of any kind to select it in the Sites panel'}, 'Select'),
     sculpt: el('button', {title: 'SCULPT the ground: raise / lower / smooth / flatten / erase the map\u2019s height-offset layer (sculpt.svsculpt, 0.8 m samples). Zoom in, click Heights to see the engine\u2019s ground under it live.'}, 'Sculpt'),
   };
@@ -1429,12 +1616,22 @@ export function attach(hooks) {
   els.stampRot = el('select', {title: 'quarter turns for a NEW stamp site'});
   for (let i = 0; i < 4; i++) els.stampRot.append(el('option', {value: String(i)}, (i * 90) + '\u00b0'));
   els.stampRot.addEventListener('change', () => { stamp.rot = (+els.stampRot.value) & 3; });
+  // The tree tool's species / variant / turn for a NEW tree (P6); an existing
+  // one is edited in the Sites panel.
+  els.treeSp = el('select', {title: 'the species a NEW tree site plants (assets/trees/<name>.svtree)'});
+  els.treeSp.addEventListener('change', () => { trees.species = els.treeSp.value; tool = 'tree'; syncControls(); paint(); });
+  els.treeVar = el('input', {type: 'number', min: -1, max: 63, step: 1, value: -1, style: 'width:48px', title: 'variant for a NEW tree; -1 = rolled from the seed'});
+  els.treeVar.addEventListener('change', () => { trees.variant = Math.max(-1, Math.round(+els.treeVar.value || 0)); });
+  els.treeRot = el('select', {title: 'quarter turns for a NEW tree; rolled = from the seed (with a mirror)'});
+  els.treeRot.append(el('option', {value: '-1'}, 'rolled'));
+  for (let i = 0; i < 4; i++) els.treeRot.append(el('option', {value: String(i)}, (i * 90) + '°'));
+  els.treeRot.addEventListener('change', () => { trees.rot = +els.treeRot.value; });
   // The landform tool's parameters for a NEW site (P-G); an existing one is
   // edited in the Sites panel.
   els.lfShape = el('select', {title: 'the shape a new landform takes'});
   for (const sh of LANDFORM_SHAPES) els.lfShape.append(el('option', {value: sh}, sh));
   els.lfShape.value = landform.shape;
-  els.lfShape.addEventListener('change', () => { landform.shape = els.lfShape.value; tool = 'landform'; syncControls(); paint(); });
+  els.lfShape.addEventListener('change', () => { landform.shape = els.lfShape.value; tool = 'lfsite'; syncControls(); paint(); });
   els.lfRadius = el('input', {type: 'number', min: 64, max: 1 << 20, step: 64, value: landform.radius, style: 'width:70px', title: 'radius in voxels for a NEW landform (a ridge: the crest\u2019s half-length)'});
   els.lfRadius.addEventListener('change', () => { landform.radius = Math.max(64, +els.lfRadius.value || 64); });
   els.lfHeight = el('input', {type: 'number', min: -100000, max: 100000, step: 10, value: landform.heightVox, style: 'width:70px', title: 'height in voxels for a NEW landform: 600 = 60 m'});
@@ -1488,10 +1685,11 @@ export function attach(hooks) {
     el('label', {title: 'the edit layer the game applies over worldgen (tuning.json world.editLayer)'}, ' edits ', els.editSel),
     els.save, undoBtn, redoBtn, fitBtn, els.heightsBtn,
     el('span', {style: 'width:10px'}),
-    els.tools.site, els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.sculpt,
+    els.tools.site, els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.lfsite, els.tools.tree, els.tools.sculpt,
     el('label', {}, ' sculpt ', els.scMode, ' r ', els.scRadius, ' ', els.scRadiusOut, ' str ', els.scStrength, ' ', els.scStrengthOut, ' ', scShow, ' show'),
     el('label', {}, ' lake ', els.waterPreset, ' r ', els.waterRadius, ' m'),
     el('label', {}, ' stamp ', els.stampTpl, ' ', els.stampRot),
+    el('label', {}, ' tree ', els.treeSp, ' v ', els.treeVar, ' ', els.treeRot),
     el('label', {}, ' new landform ', els.lfShape, ' r ', els.lfRadius, ' h ', els.lfHeight, ' \u00b0 ', els.lfRot),
     el('label', {}, ' brush ', els.radius, ' ', els.radiusOut),
     el('label', {}, ' landform paint ', els.land, ' ', els.landOut),
@@ -1503,10 +1701,12 @@ export function attach(hooks) {
     'A stamp site places assets/prefabs/<name>.vox (picked from the files that exist) on a levelled pad at that column; a site whose .vox has since gone is skipped with a warning at load. ' +
     'A water site is an AUTHORED LAKE: the chosen preset (Environment > Water bodies) carved at that column on every seed. ' +
     'A landform site is a DECLARED mountain: a peak, ridge, basin or plateau overlaid onto the landform plane at load. ' +
+    'A tree site is ONE AUTHORED TREE: a species (assets/trees/*.svtree) standing on the ground at that column, near and far; the procedural forest keeps its trunks a crown’s width away. ' +
+    'Sites keep out by their own footprint (a stamp’s pad, a lake’s disc + shore band, a tree’s trunk), never by the 102 m cell; at most four sites may reach one cell. The Load check panel says what the engine thinks of the saved map. ' +
     'SCULPT shapes the ground itself: a signed height offset every 0.8 m (sculpt.svsculpt, 25.6 m tiles that exist only where you sculpt), added AFTER all the seeded noise and the home-area fade, so a 12 m raise is 12 m anywhere; the sediment, ponds, sea and site pads react to it. Zoom in and click Heights: the backdrop then covers the view and follows your strokes live (exact except the sediment wedge\u2019s reaction, which the next save redraws). An erased layer saves as no file at all. ' +
     'Saving writes assets/worldmap/<name>/ and moves the world hash; regenerate the world (F7 in the game, or Apply in the sidebar) to see it.');
   const main = el('div', {class: 'mapmain'}, bar, els.palette, els.canvas, els.status, note);
-  const side = el('div', {class: 'mapside'}, buildTerrainSection(), buildSitesPanel());
+  const side = el('div', {class: 'mapside'}, buildCheckPanel(), buildTerrainSection(), buildSitesPanel());
   root.append(el('div', {class: 'mapbody'}, main, side));
   // The PREVIEW pane (P-I): the heightmap and voxel views that were the
   // Worldgen tab, re-homed under the map as previews. tuner.html keeps their
@@ -1544,6 +1744,8 @@ export function attach(hooks) {
     .catch(e => toast('terrain defaults: ' + e.message + ' (a map missing terrain keys shows them blank)', true));
   loadWaterPresets().then(() => paint()).catch(e => status('water presets: ' + e.message));
   loadStampTemplates().catch(e => status('stamp templates: ' + e.message));
+  loadTreeSpecies().then(() => { if (selected && selected.kind === 'tree') syncSites(); })
+    .catch(e => status('tree species: ' + e.message));
   listMaps().then(names => {
     els.mapSel.replaceChildren(...names.map(n => el('option', {value: n}, n)));
     const want = currentMapLayer() || names[0];
@@ -1610,3 +1812,8 @@ export function activate() { syncTerrain(); syncSites(); publishTerrain(); }
 export function _map() { return map; }
 export function _selected() { return selected; }
 export function _select(site) { selected = site; syncSites(); paint(); }
+export function _check() { return check; }
+export function _trees() { return trees; }
+export function _sculpt() { return sculpt; }
+export function _tool(t) { if (t) { tool = t; syncControls(); paint(); } return tool; }
+export function _undoDepth() { return undo.length; }

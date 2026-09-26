@@ -239,6 +239,26 @@ struct TreeAtlas {
 bool LoadTreeAtlas(const std::string& dir, const std::vector<MaterialDef>& mats,
                    const biomes::BiomeSet& set, TreeAtlas& out, std::string& log);
 
+/** One species as its .svtree HEADER states it: enough to place an authored
+ *  tree site (worldmap.cpp, P6 of docs/PLAN_map_overhaul.md) without loading
+ *  the voxels. `index` is the species index the atlas gives it. */
+struct TreeSpeciesHeader {
+  std::string name;
+  int index = 0;
+  int variants = 0;
+  int reach = 0;     // kSReach: farthest voxel from the trunk column, either axis
+  int above = 0;
+};
+/**
+ * Every assets/trees/<name>.svtree's header, in the ATLAS'S ORDER (sorted file
+ * name -- the same list LoadTreeAtlas walks, so `index` is the index the
+ * shader sees). Reads 32 words per file. False, with `log`, on a header the
+ * atlas loader would refuse (magic, version, bake scale); a missing directory
+ * is an empty list.
+ */
+bool ReadTreeSpeciesHeaders(const std::string& dir, std::vector<TreeSpeciesHeader>& out,
+                            std::string& log);
+
 /** Decode one cell of one variant on the CPU, through the same column/run path
  *  the shader takes. Exists for the `tree-atlas` selftest gate — nothing on the
  *  frame path calls it. `lx`/`ly`/`lz` are VARIANT-LOCAL grid coordinates.

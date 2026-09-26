@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 
@@ -19,6 +20,7 @@
 #include "sim/biomes.h"
 #include "sim/intmath.h"   // the landform bake's integer sine/sqrt (no libm)
 #include "sim/rng.h"
+#include "sim/treeatlas.h"   // ReadTreeSpeciesHeaders: a tree site's species index + reach
 #include "sim/tuning.h"
 #include "sim/voxload.h"
 #include "sim/world.h"
@@ -769,14 +771,24 @@ bool PackSculpt(const uint8_t* data, size_t n, std::vector<uint32_t>& block,
 
 bool LoadWorldMap(const std::string& assetDir, const std::string& name,
                   const biomes::BiomeSet& set, size_t materialCount, uint32_t seed,
-                  WorldMapData& out, std::string& log) {
+                  WorldMapData& out, std::string& log, const std::string* mapJson) {
   out = WorldMapData{};
   const std::string dir = assetDir + "/worldmap/" + name;
   const std::string at = "worldmap/" + name + ": ";
+  // What the loader skips or doubts but will not refuse a boot over: said on
+  // stderr AND kept on the map, where --mapcheck hands it to the tuner.
+  auto warn = [&](const std::string& m) {
+    std::fprintf(stderr, "world map WARNING: %s%s\n", at.c_str(), m.c_str());
+    out.warnings.push_back(m);
+  };
 
   // ---- map.json -------------------------------------------------------------
   json j;
-  {
+  if (mapJson) {
+    try { j = json::parse(*mapJson); } catch (const std::exception& e) {
+      log += at + "the supplied map.json does not parse: " + e.what() + "\n"; return false;
+    }
+  } else {
     std::ifstream f(dir + "/map.json");
     if (!f) { log += at + "map.json not found (" + dir + ")\n"; return false; }
     try { f >> j; } catch (const std::exception& e) {
@@ -891,9 +903,9 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     auto it = stampCache.find(key);
     if (it == stampCache.end()) {
       Prefab pf;
-      std::string err, warn;
+      std::string err, voxWarn;
       const std::string vox = assetDir + "/prefabs/" + st.templateName + ".vox";
-      if (!LoadVoxFile(vox, materialCount, pf, err, warn)) {
+      if (!LoadVoxFile(vox, materialCount, pf, err, voxWarn)) {
         log += at + "site \"" + id + "\": " + vox + " did not load: " + err + "\n";
         return false;
       }
@@ -907,11 +919,35 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     return true;
   };
 
-  // ---- sites: the harness pad box, the spawn site, and the stamp sites --------
+  // ---- tree species (P6): the atlas's order, header only, read on first use ----
+  // A tree site names a species; the shader needs the atlas's INDEX for it and
+  // the index plane needs its reach (and the widest reach of all, for how far
+  // the lattice's own trunks are kept away). Headers only: 32 words a file.
+  std::vector<TreeSpeciesHeader> treeSpecies;
+  bool treeSpeciesRead = false;
+  int treeMaxReach = 0;
+  auto readTreeSpecies = [&]() -> bool {
+    if (treeSpeciesRead) return true;
+    std::string tl;
+    if (!ReadTreeSpeciesHeaders(assetDir + "/trees", treeSpecies, tl)) { log += at + tl; return false; }
+    for (const TreeSpeciesHeader& h : treeSpecies) treeMaxReach = std::max(treeMaxReach, h.reach);
+    treeSpeciesRead = true;
+    return true;
+  };
+  // `at: [x, z]` in world voxels, the one spelling of a site's column. A stamp
+  // also takes the pre-P6 `x` / `z` pair so old files keep loading.
+  auto readAt = [](const json& s, int* x, int* z) -> bool {
+    if (!(s.contains("at") && s["at"].is_array() && s["at"].size() == 2 &&
+          s["at"][0].is_number() && s["at"][1].is_number())) return false;
+    *x = s["at"][0].get<int>(); *z = s["at"][1].get<int>();
+    return true;
+  };
+
+  // ---- sites: the pad box, the spawn, stamps, lakes, landforms, trees ---------
   bool havePad = false;
   if (j.contains("sites") && j["sites"].is_array()) {
     for (const json& s : j["sites"]) {
-      if (!s.is_object()) continue;
+      if (!s.is_object()) { warn("a sites[] entry that is not an object -- ignored"); continue; }
       const std::string kind = s.value("kind", "");
       const std::string id = s.value("id", "?");
       if (kind == "spawn") {
@@ -931,7 +967,10 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         out.spawnZ = s["at"][1].get<int>();
         out.spawnAuthored = true;
       } else if (kind == "pad") {
-        if (havePad) continue;   // one pad box until the pad becomes a site kind proper
+        if (havePad) {   // one pad box until the pad becomes a site kind proper
+          warn("site \"" + id + "\": a second kind pad -- ignored (a map has one pad box)");
+          continue;
+        }
         if (!(s.contains("min") && s.contains("max") && s["min"].is_array() &&
               s["max"].is_array() && s["min"].size() == 2 && s["max"].size() == 2)) {
           log += at + "site \"" + id + "\" kind pad needs min[2]/max[2] in world voxels\n";
@@ -944,7 +983,13 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         WorldMapData::StampSite st;
         st.id = id;
         st.templateName = s.value("template", "");
-        st.x = s.value("x", 0); st.z = s.value("z", 0);
+        if (!readAt(s, &st.x, &st.z)) {
+          if (!(s.contains("x") && s.contains("z") && s["x"].is_number() && s["z"].is_number())) {
+            log += at + "site \"" + id + "\" kind stamp needs at[2] in world voxels\n";
+            return false;
+          }
+          st.x = s["x"].get<int>(); st.z = s["z"].get<int>();   // the pre-P6 spelling
+        }
         st.rot = s.value("rot", 0) & 3;
         st.padMargin = std::clamp(s.value("padMargin", 8), 1, 64);
         st.salt = static_cast<uint32_t>(s.value("salt", 0));
@@ -959,15 +1004,13 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
         {
           std::error_code ec;
           if (!std::filesystem::exists(assetDir + "/prefabs/" + st.templateName + ".vox", ec)) {
-            std::fprintf(stderr, "world map WARNING: %ssite \"%s\" names assets/prefabs/%s.vox, "
-                                 "which does not exist -- site skipped\n",
-                         at.c_str(), id.c_str(), st.templateName.c_str());
+            warn("site \"" + id + "\" names assets/prefabs/" + st.templateName +
+                 ".vox, which does not exist -- site skipped");
             continue;
           }
         }
         if (!loadStamp(st, id)) return false;
         if (s.contains("radius") && s["radius"].is_number()) st.radius = std::max(st.radius, s["radius"].get<int>());
-        if (out.sites.size() >= 254) { log += at + "more than 254 stamp sites\n"; return false; }
         out.sites.push_back(std::move(st));
       } else if (kind == "landform") {
         // P-G: a DECLARED landform, Tier A. Overlaid onto the plane once the
@@ -1017,8 +1060,48 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           st.radius = std::clamp(s["radius"].get<int>(), 4, 2048);
         st.padMargin = std::max(1, g.band);                  // the index plane's reach past the disc
         st.salt = 0;
-        if (out.sites.size() >= 254) { log += at + "more than 254 sites\n"; return false; }
         out.sites.push_back(std::move(st));
+      } else if (kind == "tree") {
+        // P6: ONE AUTHORED TREE, Tier A in where (and, if the map says, which
+        // variant and which way round); a rolled variant / turn is Tier B. A
+        // species with no .svtree is skipped with a warning, like a stamp
+        // whose .vox has gone: one stale tree must not stop the world.
+        WorldMapData::StampSite st;
+        st.id = id;
+        st.kind = kSiteTree;
+        st.templateName = s.value("species", "");
+        if (!readAt(s, &st.x, &st.z)) {
+          log += at + "site \"" + id + "\" kind tree needs at[2] in world voxels\n";
+          return false;
+        }
+        if (!readTreeSpecies()) return false;
+        const TreeSpeciesHeader* sp = nullptr;
+        for (const TreeSpeciesHeader& h : treeSpecies)
+          if (h.name == st.templateName) sp = &h;
+        if (!sp) {
+          warn("site \"" + id + "\" names tree species \"" + st.templateName +
+               "\", which has no assets/trees/<name>.svtree -- site skipped");
+          continue;
+        }
+        st.species = sp->index;
+        st.radius = std::max(1, sp->reach);
+        st.padMargin = 0;
+        st.variant = 0;
+        if (s.contains("variant") && s["variant"].is_number_integer()) {
+          const int v = s["variant"].get<int>();
+          const int n = std::max(1, sp->variants);
+          if (v < 0 || v >= n)
+            warn("site \"" + id + "\": " + st.templateName + " has " + std::to_string(n) +
+                 " variants, not a variant " + std::to_string(v) + " -- using " + std::to_string(((v % n) + n) % n));
+          st.variant = 1 + ((v % n) + n) % n;
+        }
+        st.rot = (s.contains("rot") && s["rot"].is_number_integer()) ? (s["rot"].get<int>() & 3)
+                                                                     : static_cast<int>(kSiteRotRolled);
+        st.salt = 0;
+        out.sites.push_back(std::move(st));
+      } else {
+        warn("site \"" + id + "\": unknown kind \"" + kind +
+             "\" -- ignored (the loader knows spawn, pad, stamp, water, landform, tree)");
       }
     }
   }
@@ -1165,7 +1248,6 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
           st.padMargin = padMargin;
           st.salt = h;
           if (!loadStamp(st, st.id)) return false;
-          if (out.sites.size() >= 254) { log += at + "more than 254 stamp sites (rule " + rid + ")\n"; return false; }
           out.sites.push_back(std::move(st));
           placed++;
         }
@@ -1173,22 +1255,104 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
     }
   }
 
-  // ---- the site index plane: every cell a stamp's footprint + margin reaches ----
-  out.siteIndex.assign(cells, 0);
-  for (size_t si = 0; si < out.sites.size(); si++) {
-    const WorldMapData::StampSite& st = out.sites[si];
-    // A stamp reaches its footprint + pad margin; a water site its disc + the
-    // preset's shore/berm band (stored in padMargin), + 1 for the bisection's
-    // outer column.
-    const int reach = st.radius + st.padMargin + (st.kind == kSiteWater ? 1 : 0);
-    int c0x, c0z, c1x, c1z;
-    out.CellOf(st.x - reach, st.z - reach, &c0x, &c0z);
-    out.CellOf(st.x + reach, st.z + reach, &c1x, &c1z);
-    for (int cz = c0z; cz <= c1z; cz++)
-      for (int cx = c0x; cx <= c1x; cx++) {
-        if (!out.Inside(cx, cz)) continue;
-        uint8_t& slot = out.siteIndex[static_cast<size_t>(cz) * out.width + cx];
-        if (slot == 0) slot = static_cast<uint8_t>(si + 1);   // first site wins a cell
+  // ---- the site index: every cell a site's REACH touches lists the site ------
+  // The reach is the widest thing any reader tests against the site (worldmap.h
+  // "the site table"): a stamp's footprint + pad margin; a lake's disc + its
+  // shore/berm band, + 1 for the bisection's outer column; a tree's own reach
+  // + the WIDEST species' reach, because the lattice keeps its trunks a
+  // crown's width (site reach + its own) away and asks from the trunk's cell.
+  for (WorldMapData::StampSite& st : out.sites) {
+    if (st.kind == kSiteTree) st.indexReach = st.radius + treeMaxReach;
+    else st.indexReach = st.radius + st.padMargin + (st.kind == kSiteWater ? 1 : 0);
+  }
+  {
+    std::map<size_t, std::vector<uint32_t>> byCell;   // ordered: the pack is a pure function of the map
+    for (size_t si = 0; si < out.sites.size(); si++) {
+      const WorldMapData::StampSite& st = out.sites[si];
+      int c0x, c0z, c1x, c1z;
+      out.CellOf(st.x - st.indexReach, st.z - st.indexReach, &c0x, &c0z);
+      out.CellOf(st.x + st.indexReach, st.z + st.indexReach, &c1x, &c1z);
+      for (int cz = std::max(c0z, 0); cz <= std::min(c1z, out.height - 1); cz++)
+        for (int cx = std::max(c0x, 0); cx <= std::min(c1x, out.width - 1); cx++)
+          byCell[static_cast<size_t>(cz) * out.width + cx].push_back(static_cast<uint32_t>(si + 1));
+    }
+    out.siteIndex.assign(cells, 0u);
+    out.siteLists.assign(1, 0u);   // offset 0 = "no site"
+    std::map<std::vector<uint32_t>, uint32_t> shared;
+    for (const auto& kv : byCell) {
+      const std::vector<uint32_t>& ids = kv.second;
+      if (ids.size() > kSiteCellMax) {
+        const int cx = static_cast<int>(kv.first % static_cast<size_t>(out.width));
+        const int cz = static_cast<int>(kv.first / static_cast<size_t>(out.width));
+        std::string names;
+        for (uint32_t id : ids) names += (names.empty() ? "\"" : ", \"") + out.sites[id - 1].id + "\"";
+        log += at + std::to_string(ids.size()) + " sites reach map cell (" + std::to_string(cx) + "," +
+               std::to_string(cz) + ") (world x " + std::to_string((cx - out.originCellX) << out.cellLog2) +
+               ", z " + std::to_string((cz - out.originCellZ) << out.cellLog2) + ", " + std::to_string(cellVox) +
+               " vox square): " + names + "; a cell holds at most " + std::to_string(kSiteCellMax) +
+               " -- move one of them\n";
+        return false;
+      }
+      auto it = shared.find(ids);
+      if (it == shared.end()) {
+        const uint32_t off = static_cast<uint32_t>(out.siteLists.size());
+        out.siteLists.push_back(static_cast<uint32_t>(ids.size()));
+        out.siteLists.insert(out.siteLists.end(), ids.begin(), ids.end());
+        it = shared.emplace(ids, off).first;
+      }
+      out.siteIndex[kv.first] = it->second;
+    }
+  }
+
+  // ---- overlap warnings: two sites that claim the same ground ----------------
+  // Each kind's FOOTPRINT as its readers test it (a stamp's pad square, a
+  // lake's disc + band, a tree's trunk keep-out square). Where two meet the
+  // earlier site in the table wins -- the first pad, the first lake -- which
+  // is a definite answer and almost never the author's intent, so say it.
+  // Only pairs that share a map cell can meet, so the lists are the pair
+  // source. The spawn inside a footprint is said too (spawn-site asserts it
+  // for the game's map; this names it for every map, on the page).
+  {
+    struct Fp { bool disc; int64_t x, z, r; };
+    auto fpOf = [&](const WorldMapData::StampSite& s) -> Fp {
+      if (s.kind == kSiteWater) return {true, s.x, s.z, s.radius + s.padMargin};
+      if (s.kind == kSiteTree) return {false, s.x, s.z, kSiteTreeKeepOut};
+      return {false, s.x, s.z, s.radius + s.padMargin};
+    };
+    auto meets = [](const Fp& a, const Fp& b) -> bool {
+      const int64_t dx = a.x - b.x, dz = a.z - b.z;
+      if (a.disc && b.disc) return dx * dx + dz * dz < (a.r + b.r) * (a.r + b.r);
+      if (!a.disc && !b.disc) return std::llabs(dx) <= a.r + b.r && std::llabs(dz) <= a.r + b.r;
+      const Fp& d = a.disc ? a : b;
+      const Fp& q = a.disc ? b : a;
+      const int64_t ex = std::max<int64_t>(std::llabs(d.x - q.x) - q.r, 0);
+      const int64_t ez = std::max<int64_t>(std::llabs(d.z - q.z) - q.r, 0);
+      return ex * ex + ez * ez < d.r * d.r;
+    };
+    auto kindName = [](int k) { return k == kSiteWater ? "lake" : k == kSiteTree ? "tree" : "stamp"; };
+    std::set<std::pair<uint32_t, uint32_t>> seen;
+    for (size_t off = 1; off < out.siteLists.size(); off += 1 + out.siteLists[off]) {
+      const uint32_t n = out.siteLists[off];
+      for (uint32_t a = 0; a < n; a++)
+        for (uint32_t b = a + 1; b < n; b++) {
+          const uint32_t ia = out.siteLists[off + 1 + a], ib = out.siteLists[off + 1 + b];
+          if (!seen.insert({ia, ib}).second) continue;
+          const WorldMapData::StampSite& sa = out.sites[ia - 1];
+          const WorldMapData::StampSite& sb = out.sites[ib - 1];
+          if (!meets(fpOf(sa), fpOf(sb))) continue;
+          warn("site \"" + sa.id + "\" (" + kindName(sa.kind) + " at " + std::to_string(sa.x) + "," +
+               std::to_string(sa.z) + ") and site \"" + sb.id + "\" (" + kindName(sb.kind) + " at " +
+               std::to_string(sb.x) + "," + std::to_string(sb.z) + ") overlap; where they meet \"" + sa.id +
+               "\" wins");
+        }
+    }
+    if (out.spawnAuthored)
+      for (const WorldMapData::StampSite& s : out.sites) {
+        const Fp f = fpOf(s);
+        const Fp sp{false, out.spawnX, out.spawnZ, 0};
+        if (meets(f, sp))
+          warn("the spawn (" + std::to_string(out.spawnX) + "," + std::to_string(out.spawnZ) +
+               ") is inside site \"" + s.id + "\"'s footprint (" + kindName(s.kind) + ")");
       }
   }
 
@@ -1209,6 +1373,13 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
       st.padY = st.kind == kSiteWater ? 0 : BareGroundHeight(st.x, st.z, seed);
     Slot() = std::move(prev);
   }
+  // A tree at or above the treeline does not grow (worldgen.wgsl siteTree:
+  // treeMaxTop() is the world-wide bound the sky skips rely on). Said, not
+  // refused: the author may be about to lower the ground under it.
+  for (const WorldMapData::StampSite& st : out.sites)
+    if (st.kind == kSiteTree && st.padY >= out.terrain.treeline)
+      warn("site \"" + st.id + "\" (tree) stands on ground y" + std::to_string(st.padY) +
+           ", at or above the treeline y" + std::to_string(out.terrain.treeline) + ": it will not grow");
 
   uint32_t hsh = 2166136261u;
   hsh = FnvBytes(hsh, raw.data(), raw.size());
@@ -1220,6 +1391,17 @@ bool LoadWorldMap(const std::string& assetDir, const std::string& name,
   if (!sculptRaw.empty()) hsh = FnvBytes(hsh, sculptRaw.data(), sculptRaw.size());
   out.contentHash = hsh;
   return true;
+}
+
+std::string MapCheckJson(const std::string& name, bool ok, const WorldMapData& m,
+                         const std::string& error) {
+  json j;
+  j["ok"] = ok;
+  j["map"] = name;
+  j["sites"] = static_cast<int>(m.sites.size());
+  j["warnings"] = m.warnings;
+  j["error"] = error;
+  return j.dump();
 }
 
 bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
@@ -1253,9 +1435,19 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
   AppendPlane(W, map.landform);
   W[kHMoisturePlane] = U(static_cast<int>(W.size()));
   AppendPlane(W, map.moisture);
-  // ---- sites: the index plane, the records, then each stamp block -----------
-  W[kHSiteIndex] = U(static_cast<int>(W.size()));
-  AppendPlane(W, map.siteIndex);
+  // ---- sites: the index plane + lists, the records, then each stamp block ----
+  // One word per cell (the list's buffer offset, 0 = none), then the shared
+  // lists. No sites at all packs no plane: kHSiteIndex stays 0 and every
+  // reader's list walk ends at its first read.
+  if (!map.sites.empty() && map.siteIndex.size() == static_cast<size_t>(map.width) * map.height) {
+    const size_t plane0 = W.size();
+    W[kHSiteIndex] = U(static_cast<int>(plane0));
+    W.resize(plane0 + map.siteIndex.size(), 0u);
+    const uint32_t lists0 = static_cast<uint32_t>(W.size());
+    W.insert(W.end(), map.siteLists.begin(), map.siteLists.end());
+    for (size_t i = 0; i < map.siteIndex.size(); i++)
+      if (map.siteIndex[i] != 0u) W[plane0 + i] = lists0 + map.siteIndex[i];
+  }
   W[kHSiteCount] = U(static_cast<int>(map.sites.size()));
   W[kHSiteTable] = U(static_cast<int>(W.size()));
   const size_t tab0 = W.size();
@@ -1271,6 +1463,8 @@ bool PackWorldMap(const biomes::BiomeSet& set, const WorldMapData& map,
     r[kS_Salt] = s.salt;
     r[kS_Preset] = U(s.preset);
     r[kS_PadY] = U(s.padY);
+    r[kS_Species] = U(s.species);
+    r[kS_Variant] = U(s.variant);
     if (s.kind != kSiteStamp || s.words.empty()) continue;   // a water site has no block
     // The stamp block: rebase its relative offsets (column dir + run offsets)
     // onto the buffer as it is appended.

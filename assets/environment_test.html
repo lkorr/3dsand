@@ -18,7 +18,9 @@
      checks the tuner's wiring by regex against GET / — the same arrangement
      as trees_test.html, for the same reasons.
 
-     NEEDS NO BUILT EXE: nothing here calls the engine. -->
+     NEEDS NO BUILT EXE: the one engine call (the map page's Load check,
+     `sandvox --mapcheck`) is asserted only when the exe answers; without one
+     the panel says so and the line says "engine unavailable". -->
 <meta charset="utf-8">
 <title>environment harness</title>
 <body style="background:#111;color:#ddd;font:12px monospace">
@@ -286,6 +288,60 @@ function readLit(wv, cv){
       say(M._selected() && M._selected().kind === 'landform' && !!pages.map.querySelector('.mapsites-panel select'),
           'selecting it opens the shape / radius / height panel');
     }
+    // ---- 6b. the map page's TOOLS, driven with pointer events (P5 sculpt, P6 tree / load check) ----------------
+    // Nothing is saved: every change is undone, so no file moves.
+    var btns = [].slice.call(pages.map.querySelectorAll('.mapbar button')).map(function (b) { return b.textContent; });
+    say(btns.indexOf('Landform brush') >= 0 && btns.indexOf('Landform site') >= 0 && btns.indexOf('Tree') >= 0 && btns.indexOf('Sculpt') >= 0,
+        'the toolbar carries Landform brush AND Landform site, Tree and Sculpt (' + btns.length + ' buttons)');
+    var cv = pages.map.querySelector('canvas.mapcanvas');
+    cv.setPointerCapture = function () {};   // a synthetic pointer has no capture to take
+    function ptr(type, fx, fy, extra) {
+      var r = cv.getBoundingClientRect();
+      var o = {clientX: r.left + r.width * fx, clientY: r.top + r.height * fy, button: 0, buttons: type === 'pointerup' ? 0 : 1, pointerId: 7, bubbles: true};
+      for (var k in (extra || {})) o[k] = extra[k];
+      cv.dispatchEvent(new PointerEvent(type, o));
+    }
+    say(cv.clientWidth > 100 && cv.clientHeight > 100, 'map canvas laid out ' + cv.clientWidth + 'x' + cv.clientHeight);
+    // SCULPT: a raise stroke writes the layer, one undo step, Undo takes it back.
+    var S = M._sculpt(), u0 = M._undoDepth(), tiles0 = S.tiles.size;
+    M._tool('sculpt');
+    S.mode = 'raise'; S.radius = 2048; S.strength = 50;
+    ptr('pointerdown', 0.5, 0.5); ptr('pointermove', 0.55, 0.5); ptr('pointermove', 0.6, 0.52); ptr('pointerup', 0.6, 0.52);
+    var peak = 0;
+    S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) peak = Math.max(peak, t[i]); });
+    say(S.tiles.size > tiles0 && peak > 1 && S.dirty && M._undoDepth() === u0 + 1,
+        'a sculpt raise stroke wrote ' + (S.tiles.size - tiles0) + ' tiles, peak +' + peak.toFixed(1) + ' vox, ' + (M._undoDepth() - u0) + ' undo step');
+    var bytes = M.serializeSculpt(S.tiles), back2 = bytes ? M.parseSculpt(bytes.buffer) : new Map();
+    var same = bytes && back2.size <= S.tiles.size && back2.size > 0;
+    back2.forEach(function (t, k) { var a = S.tiles.get(k); if (!a) { same = false; return; } for (var i = 0; i < t.length; i++) if (t[i] !== Math.round(a[i])) same = false; });
+    say(!!same, 'the stroke serialises and parses back to the rounded layer (' + (bytes ? bytes.length : 0) + ' bytes, ' + back2.size + ' tiles)');
+    [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0].click();
+    var left = 0;
+    S.tiles.forEach(function (t) { for (var i = 0; i < t.length; i++) left = Math.max(left, Math.abs(t[i])); });
+    say(S.tiles.size === tiles0 && left === 0 && M._undoDepth() === u0, 'Undo takes the stroke back (' + S.tiles.size + ' tiles, max |offset| ' + left + ')');
+    // TREE: a click plants the picked species at the column, the Sites panel edits it; Undo removes it.
+    ok = await waitFor(function(){ return M._trees().list.length > 0; }, 10000);
+    say(ok, 'tree species listed from assets/trees/*.svtree: ' + M._trees().list.join(', '));
+    var nSites = M._map().json.sites.length;
+    M._tool('tree');
+    ptr('pointerdown', 0.3, 0.4); ptr('pointerup', 0.3, 0.4);
+    var ts = M._map().json.sites[M._map().json.sites.length - 1];
+    say(M._map().json.sites.length === nSites + 1 && ts.kind === 'tree' && ts.species === M._trees().species &&
+        Array.isArray(ts.at) && ts.variant === undefined && ts.rot === undefined,
+        'the Tree tool planted ' + JSON.stringify(ts));
+    say(M._selected() === ts && !!pages.map.querySelector('.mapsites-panel select') &&
+        [].slice.call(pages.map.querySelectorAll('.mapsite .mapkind')).some(function (k) { return k.textContent === 'tree'; }),
+        'the new tree is selected, listed, and its panel has the species select');
+    [].slice.call(pages.map.querySelectorAll('.mapbar button')).filter(function (b) { return b.textContent === 'Undo'; })[0].click();
+    say(M._map().json.sites.length === nSites, 'Undo removes it (' + M._map().json.sites.length + ' sites)');
+    // LOAD CHECK: the panel asked the engine (or says why it could not).
+    ok = await waitFor(function(){ return !!M._check(); }, 60000);
+    var ck = M._check();
+    say(ok && !!pages.map.querySelector('.mapcheck'), 'Load check panel: ' + (ck ? (ck.unavailable ? 'engine unavailable (' + String(ck.error).slice(0, 60) + ')' :
+        (ck.ok ? (ck.warnings || []).length + ' warnings' : 'REFUSED: ' + ck.error)) : 'no answer'));
+    say(!ck || ck.unavailable || ck.ok, 'the engine loads the ' + M._map().name + ' map');
+    M._tool('biome');
+
     // The preview host lives in tuner.html; this harness drives the module
     // alone, so only the wiring is checked here: tuner.html carries the host
     // and the map page's adoption code.

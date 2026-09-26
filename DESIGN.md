@@ -3975,8 +3975,8 @@ in both files — `wmWaterI`, `waterKnot`, `wmWaterRow`, `pondTile`,
 one `Pond`: the biome's `water.features[]` rows rolled on the one pond
 lattice (`kHPondTile`, the finest water tile of any biome, thinned per row
 like the trees), or a `kind: "water"` site on the map (`waterSiteAt`,
-found per column through the site index plane; its keep-out is its disc plus
-its band, never its cells, and `sitePadAt` skips it). The bowl is the
+found per column through the site index's per-cell list; its keep-out is its
+disc plus its band, never its cells, and `sitePadAt` skips it). The bowl is the
 preset's sampled profile, linear in d² between knots so the shader needs no
 sqrt; a face steeper than a voxel per column wears the preset's substrate
 instead of its powder bed (`bowlSteep`), which is what let the depth stop
@@ -16084,9 +16084,36 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   `genCellIn` (non-air replaces, air leaves the world alone) — pure
   worldgen, so the far cascades show a stamped building at any distance
   with nothing to patch, and the sky early-out / far blocker band include
-  `wmSiteTopAt`; **`siteKeepOut`** (the harness box or any site cell)
-  suppresses trunks, tarns and cover. A missing template refuses to start.
-  The World map page places/deletes stamp sites (`Stamp site` tool).
+  `wmSiteTopAt`; **`siteKeepOut`** (the harness box or a site's footprint)
+  suppresses tarns and cover. A missing template is a warning and a skipped
+  site. The World map page places/deletes stamp sites (`Stamp site` tool).
+* **LIVE (map overhaul P6, 2026-09-26): SITES YOU CAN TRUST.** The site
+  index is no longer "first site wins a 102 m cell, cap 254": each cell
+  holds a LIST `[n, ids…]` (one word per cell pointing at shared lists,
+  n ≤ `kSiteCellMax` = 4, more is a load ERROR naming the cell and the
+  sites) of every site whose REACH touches it, and every reader walks the
+  list and tests the site's own FOOTPRINT — `siteKeepOut` (a stamp's pad
+  square, a lake's disc + band, a tree's trunk), `siteBlocksTrunk` (the
+  lattice's trunk test, per tile: the same, plus a crown's width around an
+  authored tree), `wmPadSiteAt` / `wmWaterSiteAt` (the pad and the pond
+  set's one authored slot, both mirrored in `world.cpp`), `wmSiteTopAt`,
+  `wmStampsCell`. Until P6 the TRUNK test refused every tree in a site's
+  cells, so an authored lake balded a hectare of forest. New kind **`tree`**
+  (`{species, at, variant?, rot?}`): the species resolved by name to the
+  atlas's index at load (`ReadTreeSpeciesHeaders`, the atlas's sorted-file
+  order), the trunk's ground baked like a pad (`kS_PadY`); the shader's
+  `siteTree` builds a `Tree` the candidate / undergrowth / far-canopy scans
+  take after the lattice's (`siteTreesInto`, `siteUndergrowth`,
+  `treeCanopyAt`), so it is in the near field, the cascades and the forest
+  floor like any tree; not grown at or above the treeline (`treeMaxTop`
+  bounds every tree). Every placed kind reads `at: [x, z]` (a stamp's old
+  `x`/`z` still loads). What the loader skips or doubts — an unknown kind,
+  a missing `.vox` or species, overlapping footprints, a tree at the
+  treeline, the spawn inside a site — is `WorldMapData::warnings`, printed
+  at load and shown on the World map page's Load check panel
+  (`sandvox --mapcheck <name>`, GPU-free, via `/api/worldmap/check`). The
+  `worldmap` gate's D/E cases load synthetic sites through
+  `LoadWorldMap`'s in-memory `mapJson` door and grow a tree site on the GPU.
   `assets/prefabs/` ships no `.vox` yet, so the default map has none; the
   first authored one exercises the whole path. Not yet: `proc:` kinds
   (the ruin shell is gone; a generator per kind is the follow-up plan),

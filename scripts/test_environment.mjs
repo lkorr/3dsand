@@ -249,12 +249,22 @@ for (const mapName of ['default', 'harness']) {
     } else {
       ok(!pad, `${mapName}: no pad box (the harness pad lives on the harness map)`);
     }
-    // stamp sites and rules (P5): every template named must exist as a .vox,
-    // because the engine refuses to start otherwise.
+    // stamp sites and rules (P5): every template named must exist as a .vox
+    // (the engine skips one that does not, with a warning -- a shipped map
+    // should not carry one). A stamp spells its column at[2] since P6; the
+    // pre-P6 x / z pair still loads.
     const prefabs = new Set(existsSync(join(ROOT, 'assets', 'prefabs')) ? readdirSync(join(ROOT, 'assets', 'prefabs')).filter(f => f.endsWith('.vox')).map(f => f.slice(0, -4)) : []);
     const stamps = (j.sites || []).filter(s => s.kind === 'stamp');
-    ok(stamps.every(s => typeof s.template === 'string' && Number.isInteger(s.x) && Number.isInteger(s.z)), `${stamps.length} stamp site(s) carry template/x/z`);
+    const colOk = s => (Array.isArray(s.at) && s.at.length === 2 && s.at.every(Number.isInteger)) || (Number.isInteger(s.x) && Number.isInteger(s.z));
+    ok(stamps.every(s => typeof s.template === 'string' && colOk(s)), `${stamps.length} stamp site(s) carry a template and a column`);
     ok(stamps.every(s => prefabs.has(s.template)), 'every stamp site names an existing assets/prefabs/<template>.vox');
+    // P6: every site kind is one the loader knows (an unknown one is a load
+    // warning and ignored), and every tree site names a baked species.
+    const kinds = new Set(['spawn', 'pad', 'stamp', 'water', 'landform', 'tree']);
+    ok((j.sites || []).every(s => kinds.has(s.kind)), 'every site kind is known to the loader');
+    const svtree = new Set(readdirSync(join(ROOT, 'assets', 'trees')).filter(f => f.endsWith('.svtree')).map(f => f.slice(0, -7)));
+    const treeSites = (j.sites || []).filter(s => s.kind === 'tree');
+    ok(treeSites.every(s => svtree.has(s.species) && colOk(s)), `${treeSites.length} tree site(s) name a baked species (assets/trees/<name>.svtree) at a column`);
     const rules = (j.rules || []);
     ok(rules.every(r => r.kind !== 'stamp' || (typeof r.template === 'string' && j.biomes.includes(r.biome) && r.perKm2 >= 0)), `${rules.length} rule(s) name a template, a palette biome and a perKm2`);
     ok(rules.every(r => r.kind !== 'stamp' || prefabs.has(r.template)), 'every rule names an existing assets/prefabs/<template>.vox');

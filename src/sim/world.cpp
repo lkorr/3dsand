@@ -1226,15 +1226,22 @@ static constexpr uint32_t WM_S_RADIUS = worldmap::kS_Radius;
 static constexpr uint32_t WM_S_PAD_MARGIN = worldmap::kS_PadMargin;
 static constexpr uint32_t WM_S_PRESET = worldmap::kS_Preset;
 static constexpr uint32_t WM_S_PAD_Y = worldmap::kS_PadY;
+static constexpr uint32_t WM_SITE_STAMP = worldmap::kSiteStamp;
 static constexpr uint32_t WM_SITE_WATER = worldmap::kSiteWater;
-static uint32_t wmSiteAt(int x, int z) {
+static constexpr uint32_t WM_SITE_TREE = worldmap::kSiteTree;
+// The cell's site list (worldmap.h "the site table"): nullptr = no site.
+static const uint32_t* wmSiteList(int x, int z) {
   const worldmap::WorldMapData& m = worldmap::CurrentWorldMap();
-  if (!m.Loaded() || m.siteIndex.empty()) return 0u;
+  if (!m.Loaded() || m.sites.empty()) return nullptr;
   int cx, cz;
   m.CellOf(x, z, &cx, &cz);
-  if (!m.Inside(cx, cz)) return 0u;
-  return m.SiteCell(cx, cz);
+  if (!m.Inside(cx, cz)) return nullptr;
+  return m.SiteList(cx, cz);
 }
+static uint32_t wmSiteN(const uint32_t* lst) {
+  return lst == nullptr ? 0u : std::min<uint32_t>(lst[0], worldmap::kSiteCellMax);
+}
+static uint32_t wmSiteK(const uint32_t* lst, uint32_t k) { return lst[1u + k]; }
 static int wmSiteI(uint32_t sid, uint32_t w) {
   const worldmap::WorldMapData::StampSite& s = worldmap::CurrentWorldMap().sites[sid - 1];
   switch (w) {
@@ -1248,17 +1255,63 @@ static int wmSiteI(uint32_t sid, uint32_t w) {
     default: return 0;
   }
 }
-// A water site (P-F) keeps out by its DISC plus its shore/berm band, not by
-// its cells; every other kind keeps its cells. Same test as the shader's.
-static bool siteKeepOut(int x, int z) {
-  if (inPadBox(x, z)) { return true; }
-  const uint32_t sid = wmSiteAt(x, z);
-  if (sid == 0u) { return false; }
-  if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return true; }
+// Is (x, z) inside site `sid`'s own footprint? A lake (P-F): its DISC plus
+// its shore/berm band. A tree (P6): its trunk keep-out square. A stamp: its
+// pad (Chebyshev radius + margin). worldgen.wgsl siteFootprintHas, same test.
+static bool siteFootprintHas(uint32_t sid, int x, int z) {
+  const uint32_t kind = (uint32_t)(wmSiteI(sid, WM_S_KIND));
   const int dx = x - wmSiteI(sid, WM_S_X);
   const int dz = z - wmSiteI(sid, WM_S_Z);
-  const int reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
-  return dx * dx + dz * dz <= reach * reach;
+  if (kind == WM_SITE_WATER) {
+    const int reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
+    return dx * dx + dz * dz <= reach * reach;
+  }
+  const int r = kind == WM_SITE_TREE ? (int)worldmap::kSiteTreeKeepOut
+                                     : wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
+  return std::max(std::abs(dx), std::abs(dz)) <= r;
+}
+// The keep-out every feature avoids: the pad box, and every listed site's
+// footprint (never its cells, since P6). Same test as the shader's.
+static bool siteKeepOut(int x, int z) {
+  if (inPadBox(x, z)) { return true; }
+  const uint32_t* lst = wmSiteList(x, z);
+  const uint32_t n = wmSiteN(lst);
+  for (uint32_t k = 0u; k < n; k++) {
+    if (siteFootprintHas(wmSiteK(lst, k), x, z)) { return true; }
+  }
+  return false;
+}
+bool worldmap::SiteKeepOut(int x, int z) { return siteKeepOut(x, z); }
+// The authored lake a column's pond set carries (worldgen.wgsl
+// wmWaterSiteAt): the first listed lake whose reach box holds the column,
+// else the first listed lake -- which, for a cell only one lake reaches, is
+// exactly the one lake the pre-P6 index gave every column of the cell.
+static uint32_t wmWaterSiteAt(int x, int z) {
+  const uint32_t* lst = wmSiteList(x, z);
+  const uint32_t n = wmSiteN(lst);
+  uint32_t first = 0u;
+  for (uint32_t k = 0u; k < n; k++) {
+    const uint32_t sid = wmSiteK(lst, k);
+    if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { continue; }
+    const int reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN) + 1;
+    if (std::max(std::abs(x - wmSiteI(sid, WM_S_X)), std::abs(z - wmSiteI(sid, WM_S_Z))) <= reach) { return sid; }
+    if (first == 0u) { first = sid; }
+  }
+  return first;
+}
+// The stamp whose pad reaches this column (worldgen.wgsl wmPadSiteAt): the
+// first listed stamp within radius + margin, 0 = none. sitePadAt levels to it.
+static uint32_t wmPadSiteAt(int x, int z) {
+  const uint32_t* lst = wmSiteList(x, z);
+  const uint32_t n = wmSiteN(lst);
+  for (uint32_t k = 0u; k < n; k++) {
+    const uint32_t sid = wmSiteK(lst, k);
+    if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) != WM_SITE_STAMP) { continue; }
+    const int d = std::max(std::abs(x - wmSiteI(sid, WM_S_X)), std::abs(z - wmSiteI(sid, WM_S_Z))) -
+                  wmSiteI(sid, WM_S_RADIUS);
+    if (d < std::max(wmSiteI(sid, WM_S_PAD_MARGIN), 1)) { return sid; }
+  }
+  return 0u;
 }
 // The painted cell's biome, no warp and no seed (worldgen.wgsl biomeCellAt):
 // whose water rows roll at a pond tile.
@@ -1765,9 +1818,8 @@ static bool bowlSteep(Pond p, int x, int z) {
 
 static Pond waterSiteNear(int x, int z) {
   Pond p = pondNone();
-  const uint32_t sid = wmSiteAt(x, z);
+  const uint32_t sid = wmWaterSiteAt(x, z);
   if (sid == 0u) { return p; }
-  if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return p; }
   p.cx = wmSiteI(sid, WM_S_X);
   p.cz = wmSiteI(sid, WM_S_Z);
   p.r = wmSiteI(sid, WM_S_RADIUS);
@@ -2084,9 +2136,8 @@ static BareCol landColumnBare(int x, int z, uint32_t seed) {
 }
 
 static int sitePadAt(int x, int z, int h) {
-  const uint32_t sid = wmSiteAt(x, z);
+  const uint32_t sid = wmPadSiteAt(x, z);
   if (sid == 0u) { return h; }
-  if ((uint32_t)(wmSiteI(sid, WM_S_KIND)) == WM_SITE_WATER) { return h; }
   const int sx = wmSiteI(sid, WM_S_X);
   const int sz = wmSiteI(sid, WM_S_Z);
   const int r = wmSiteI(sid, WM_S_RADIUS);

@@ -909,9 +909,8 @@ fn bowlSteep(p : Pond, x : i32, z : i32) -> bool {
 // ground rather than at an authored Y.
 fn waterSiteNear(x : i32, z : i32) -> Pond {
   var p = pondNone();
-  let sid = wmSiteAt(x, z);
+  let sid = wmWaterSiteAt(x, z);
   if (sid == 0u) { return p; }
-  if (u32(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return p; }
   p.cx = wmSiteI(sid, WM_S_X);
   p.cz = wmSiteI(sid, WM_S_Z);
   p.r = wmSiteI(sid, WM_S_RADIUS);
@@ -1353,9 +1352,15 @@ const WM_S_ROT           : u32 = 5u;
 const WM_S_SALT          : u32 = 6u;
 const WM_S_STAMP_OFF     : u32 = 7u;
 const WM_S_PRESET        : u32 = 8u;    // water site: 1 + preset index
-const WM_S_PAD_Y         : u32 = 9u;    // pad / stamp site: bare ground at the centre (baked)
+const WM_S_PAD_Y         : u32 = 9u;    // pad / stamp / tree site: bare ground at the centre (baked)
+const WM_S_SPECIES       : u32 = 10u;   // tree site: atlas species index
+const WM_S_VARIANT       : u32 = 11u;   // tree site: 1 + variant, 0 = rolled
 const WM_SITE_STAMP      : u32 = 1u;
 const WM_SITE_WATER      : u32 = 2u;    // an authored lake (worldmap.h kSiteWater)
+const WM_SITE_TREE       : u32 = 3u;    // one authored tree (worldmap.h kSiteTree, P6)
+const WM_SITE_ROT_ROLLED : u32 = 4u;    // a tree site's kS_Rot when the map did not turn it
+const WM_SITE_CELL_MAX   : u32 = 4u;    // sites per cell list (the loader refuses more)
+const WM_SITE_TREE_KEEP_OUT : u32 = 6u; // a tree site's trunk keep-out, Chebyshev voxels
 const WM_STAMP_HDR_WORDS : u32 = 4u;
 const WM_STAMP_NX        : u32 = 0u;
 const WM_STAMP_NY        : u32 = 1u;
@@ -1612,22 +1617,33 @@ fn spawnCentre() -> vec2<i32> {
 }
 
 // ---- THE SITE TABLE ---------------------------------------------------------
-// `wmSiteAt` is the per-column cost: one plane read, 0 = no site. A site's
-// record gives its centre, footprint radius, pad margin and stamp block. The
-// pad (`sitePadAt`, inside the height mirror) levels the ground under the
+// `wmSiteList` is the per-column cost: one read, 0 = no site reaches this
+// map cell; else the offset of the cell's list [n, id_1 .. id_n] (worldmap.h
+// "the site table": n <= WM_SITE_CELL_MAX, ids ascending). A site's record
+// gives its centre, footprint radius, pad margin and stamp block. Every reader
+// walks the list and tests the site's own FOOTPRINT, never the cell. The pad
+// (`sitePadAt`, inside the height mirror) levels the ground under the
 // footprint to the height at the site's centre and ramps it back over the
-// margin -- Lin's "shape the terrain toward the structure". The stamp (`wmStampCell`) is a
-// per-cell overlay of the template's runs, exactly the tree atlas's shape,
-// so it is correct in `far` at any distance with nothing to patch. Keep-outs
-// (`siteKeepOut`) suppress trees, tarns and cover on the site's cells, the
-// pad box included.
-fn wmSiteAt(x : i32, z : i32) -> u32 {
+// margin -- Lin's "shape the terrain toward the structure". The stamp
+// (`wmStampCell`) is a per-cell overlay of the template's runs, exactly the
+// tree atlas's shape, so it is correct in `far` at any distance with nothing
+// to patch. A tree site (P6) joins the tree candidates (`siteTreesInto`).
+// Keep-outs (`siteKeepOut`) suppress tarns and cover on the sites'
+// footprints, the pad box included; the lattice keeps its trunks off them
+// (`siteBlocksTrunk`).
+fn wmSiteList(x : i32, z : i32) -> u32 {
   let plane = worldMap[WM_H_SITE_INDEX];
   if (plane == 0u) { return 0u; }
   let c = wmCellOf(x, z);
   if (!wmInside(c)) { return 0u; }
-  return wmPlaneAt(plane, c.x, c.y);
+  return worldMap[plane + u32(c.y) * worldMap[WM_H_WIDTH] + u32(c.x)];
 }
+fn wmSiteN(lst : u32) -> u32 {
+  if (lst == 0u) { return 0u; }
+  return min(worldMap[lst], WM_SITE_CELL_MAX);
+}
+fn wmSiteK(lst : u32, k : u32) -> u32 { return worldMap[lst + 1u + k]; }
+fn wmSiteKind(sid : u32) -> u32 { return u32(wmSiteI(sid, WM_S_KIND)); }
 fn wmSiteI(sid : u32, w : u32) -> i32 {
   return bitcast<i32>(worldMap[worldMap[WM_H_SITE_TABLE] + (sid - 1u) * WM_S_WORDS + w]);
 }
@@ -1644,19 +1660,86 @@ fn sitePadY(sid : u32) -> i32 {
   if (T.labMode != 0u) { return LAB_SLAB_Y; }
   return wmSiteI(sid, WM_S_PAD_Y);
 }
-// A water site keeps out by its DISC plus its shore/berm band, not by
-// its cells: a lake's cells are four 102 m squares and a stamp's rule would
-// bald the forest around every tarn on the map. Every other kind keeps its
-// cells, as before.
-fn siteKeepOut(x : i32, z : i32) -> bool {
-  if (inPadBox(x, z)) { return true; }
-  let sid = wmSiteAt(x, z);
-  if (sid == 0u) { return false; }
-  if (u32(wmSiteI(sid, WM_S_KIND)) != WM_SITE_WATER) { return true; }
+// Is (x, z) inside site `sid`'s own FOOTPRINT? A lake: its DISC plus its
+// shore/berm band. A tree: its trunk keep-out square. A stamp: its pad
+// (Chebyshev radius + margin). Never the cells: a cell is 102 m and "keep out
+// of the site's cells" balded a hectare of forest around every tarn and hut
+// until P6. world.cpp siteFootprintHas is the same test.
+fn siteFootprintHas(sid : u32, x : i32, z : i32) -> bool {
+  let kind = wmSiteKind(sid);
   let dx = x - wmSiteI(sid, WM_S_X);
   let dz = z - wmSiteI(sid, WM_S_Z);
-  let reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
-  return dx * dx + dz * dz <= reach * reach;
+  if (kind == WM_SITE_WATER) {
+    let reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN);
+    return dx * dx + dz * dz <= reach * reach;
+  }
+  let r = select(wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN),
+                 i32(WM_SITE_TREE_KEEP_OUT), kind == WM_SITE_TREE);
+  return max(abs(dx), abs(dz)) <= r;
+}
+// The keep-out tarns, cacti, tile plants and cover avoid: the pad box and
+// every listed site's footprint.
+fn siteKeepOut(x : i32, z : i32) -> bool {
+  if (inPadBox(x, z)) { return true; }
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    if (siteFootprintHas(wmSiteK(lst, k), x, z)) { return true; }
+  }
+  return false;
+}
+// May the LATTICE put a trunk at (wx, wz), whose species reaches `reach`? Not
+// on a stamp's pad (a building's floor), not in a lake's disc + band, and not
+// within an authored tree's crown width of it (site reach + this reach,
+// Chebyshev: the two crowns never share a column, so the site tree is never
+// a second candidate the cap has to hold). A crown reaching over a pad or a
+// shore from outside is allowed, as it was. Asked once per TILE (treeInfoBare,
+// the tile cache), never per column. The tree site's index reach is its own
+// + the atlas's widest (worldmap.cpp), so the trunk's cell lists it.
+fn siteBlocksTrunk(wx : i32, wz : i32, reach : i32) -> bool {
+  let lst = wmSiteList(wx, wz);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) == WM_SITE_TREE) {
+      let d = max(abs(wx - wmSiteI(sid, WM_S_X)), abs(wz - wmSiteI(sid, WM_S_Z)));
+      if (d <= wmSiteI(sid, WM_S_RADIUS) + reach) { return true; }
+    } else if (siteFootprintHas(sid, wx, wz)) { return true; }
+  }
+  return false;
+}
+// The authored lake a column's pond set carries: the first listed lake whose
+// reach box (disc + band + 1, what the index lists it by) holds the column,
+// else the first listed lake -- which, for a cell only one lake reaches, is
+// the one lake the pre-P6 index handed every column of the cell. The pond set
+// has ONE authored slot, so two lakes whose footprints meet are a load
+// warning. world.cpp spells the same helper.
+fn wmWaterSiteAt(x : i32, z : i32) -> u32 {
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  var first = 0u;
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_WATER) { continue; }
+    let reach = wmSiteI(sid, WM_S_RADIUS) + wmSiteI(sid, WM_S_PAD_MARGIN) + 1;
+    if (max(abs(x - wmSiteI(sid, WM_S_X)), abs(z - wmSiteI(sid, WM_S_Z))) <= reach) { return sid; }
+    if (first == 0u) { first = sid; }
+  }
+  return first;
+}
+// The stamp whose pad reaches this column: the first listed stamp within
+// radius + margin (Chebyshev), 0 = none. sitePadAt levels to it; world.cpp
+// spells the same helper.
+fn wmPadSiteAt(x : i32, z : i32) -> u32 {
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_STAMP) { continue; }
+    let d = max(abs(x - wmSiteI(sid, WM_S_X)), abs(z - wmSiteI(sid, WM_S_Z))) - wmSiteI(sid, WM_S_RADIUS);
+    if (d < max(wmSiteI(sid, WM_S_PAD_MARGIN), 1)) { return sid; }
+  }
+  return 0u;
 }
 // The template voxel this world cell would carry, MAT_AIR if none: the
 // stamp's footprint is centred on the site, its bottom row sits one above
@@ -1682,15 +1765,38 @@ fn wmStampCell(sid : u32, x : i32, y : i32, z : i32, padY : i32) -> u32 {
   }
   return MAT_AIR;
 }
-// The top of whatever a site puts above the ground at this column, for the
-// sky early-out and the far blocker band: pad height + the stamp's height.
-// -1e6 where there is no site, so max() ignores it.
+// The top of whatever a STAMP puts above the ground at this column, for the
+// sky early-out and the far blocker band: pad height + the stamp's height,
+// the highest over the listed stamps whose footprint square (radius, which
+// holds the rotated template) covers the column. -1e6 where none does, so
+// max() ignores it. A tree site's top is its candidate's (trees.top), like
+// any tree's; the far blocker deliberately has none (farColTopFrom).
 fn wmSiteTopAt(x : i32, z : i32) -> i32 {
-  let sid = wmSiteAt(x, z);
-  if (sid == 0u) { return -1048576; }
-  let blk = u32(wmSiteI(sid, WM_S_STAMP_OFF));
-  if (blk == 0u) { return -1048576; }
-  return sitePadY(sid) + 1 + i32(worldMap[blk + WM_STAMP_NY]);
+  var top = -1048576;
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    let blk = u32(wmSiteI(sid, WM_S_STAMP_OFF));
+    if (blk == 0u) { continue; }
+    if (max(abs(x - wmSiteI(sid, WM_S_X)), abs(z - wmSiteI(sid, WM_S_Z))) > wmSiteI(sid, WM_S_RADIUS)) { continue; }
+    top = max(top, sitePadY(sid) + 1 + i32(worldMap[blk + WM_STAMP_NY]));
+  }
+  return top;
+}
+// The template voxel the listed stamps put at this cell, MAT_AIR if none:
+// the first listed stamp whose template is not air here wins (a pair of
+// overlapping stamps is a load warning).
+fn wmStampsCell(x : i32, y : i32, z : i32) -> u32 {
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_STAMP) { continue; }
+    let sm = wmStampCell(sid, x, y, z, sitePadY(sid));
+    if (sm != MAT_AIR) { return sm; }
+  }
+  return MAT_AIR;
 }
 
 // ---- THE LANDFORM PLANE (P4): the map owns the continental rung -----------
@@ -2151,9 +2257,13 @@ fn treeInfoBare(s : TreeSite, land : Land, seed : u32) -> Tree {
   // Box OVERLAP, not a corner test: a crown wider than the clearing would pass
   // every corner check while covering the whole thing.
   if (crownMeetsPad(t.wx, t.wz, t.reach)) { return t; }
-  // No trunk on an authored site's cells (P5): the pad is a floor, the stamp
-  // a building. A crown reaching in from outside is allowed and wanted.
-  if (wmSiteAt(t.wx, t.wz) != 0u) { return t; }
+  // No trunk on an authored site's FOOTPRINT (siteBlocksTrunk): a stamp's pad
+  // is a floor, a lake's disc + band is water and shore, and an authored
+  // tree keeps the lattice a crown's width away. A crown reaching in from
+  // outside a pad or a shore is allowed and wanted. (Until P6 this refused
+  // every trunk in the site's 102 m CELLS, so an authored lake balded a
+  // hectare of forest around itself.)
+  if (siteBlocksTrunk(t.wx, t.wz, t.reach)) { return t; }
 
   t.sp = sp;
   t.above = i32(taSpecies(sp, TA_S_ABOVE));
@@ -2176,6 +2286,46 @@ fn treeInfoBare(s : TreeSite, land : Land, seed : u32) -> Tree {
 fn treeInfo(tx : i32, tz : i32, seed : u32, ponds : ptr<function, PondSet>) -> Tree {
   let s = treeSite(tx, tz, seed);
   return treeInfoAt(s, landAt(s.wx, s.wz, seed), seed, ponds);
+}
+
+// ---- AN AUTHORED TREE (P6: map.json kind "tree") -----------------------------
+// The site's Tree, in the lattice's own form so every scan takes it as it
+// takes a lattice tree: the species the map names (resolved to the atlas's
+// index at load), standing on the ground baked at the trunk (sitePadY), the
+// variant and quarter-turn the map names or -- when it names none -- rolled
+// from the seed the way treeInfoBare rolls them. No biome, density or
+// placement gates: the author put it there. Two gates stay, because the
+// world relies on them: VEGETATION (the dev switch), and the treeline --
+// treeMaxTop() bounds every tree in the world and the sky skips trust it.
+fn siteTree(sid : u32, seed : u32) -> Tree {
+  var t : Tree;
+  t.present = false;
+  t.sp = -1; t.varOff = 0u;
+  t.wx = wmSiteI(sid, WM_S_X); t.wz = wmSiteI(sid, WM_S_Z); t.base = sitePadY(sid);
+  t.rot = 0u; t.mir = false;
+  t.reach = 0; t.above = 0; t.crownR = 0; t.shade = 0; t.autumn = false;
+  t.nwMax = -1; t.nwMin = 0;
+  let sp = wmSiteI(sid, WM_S_SPECIES);
+  let h3 = hash3(seed ^ 0x7BEE7u, bitcast<u32>(t.wx), bitcast<u32>(t.wz));
+  t.rnd = h3;
+  if (!VEGETATION || sp < 0 || sp >= taSpeciesCount()) { return t; }
+  if (t.base >= treeline()) { return t; }
+  let vc = max(taSpecies(sp, TA_S_VARIANT_CNT), 1u);
+  let vsel = wmSiteI(sid, WM_S_VARIANT);
+  let v = select(h3 % vc, u32(max(vsel - 1, 0)) % vc, vsel > 0);
+  t.varOff = taSpecies(sp, TA_S_VARIANT_DIR) + v * TA_VARIANT_WORDS;
+  let rot = u32(wmSiteI(sid, WM_S_ROT));
+  t.rot = select(rot & 3u, (h3 >> 9u) & 3u, rot == WM_SITE_ROT_ROLLED);
+  t.mir = rot == WM_SITE_ROT_ROLLED && ((h3 >> 11u) & 1u) != 0u;
+  t.sp = sp;
+  t.reach = i32(taSpecies(sp, TA_S_REACH));
+  t.above = i32(taSpecies(sp, TA_S_ABOVE));
+  t.crownR = i32(taSpecies(sp, TA_S_CROWN_R));
+  t.shade = i32(taSpecies(sp, TA_S_SHADE));
+  let ac = taSpecies(sp, TA_S_AUTUMN);
+  t.autumn = ac != 0u && ((h3 >> 14u) % max(ac, 1u)) == 0u;
+  t.present = true;
+  return t;
 }
 
 // ---- integer geometry for the cactus arms (cactusArm / cactusCell) ----------
@@ -2322,6 +2472,23 @@ fn treeCandAdd(c : ptr<function, TreeCands>, t : ptr<function, Tree>, x : i32, z
   (*c).top = max((*c).top, e.vtop);
 }
 
+// The authored trees (P6) whose crown can cover column (x, z), offered to its
+// candidate set AFTER the lattice's: the lattice keeps its trunks a crown's
+// width from every one of them (siteBlocksTrunk), so where a site tree is a
+// candidate no lattice tree is, and the order cannot change a cell. A tree
+// site is listed in every cell its reach touches, so the column's own list
+// holds every site tree that can reach it.
+fn siteTreesInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32) {
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_TREE) { continue; }
+    var t = siteTree(sid, seed);
+    treeCandAdd(c, &t, x, z);
+  }
+}
+
 fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) {
   (*c).n = 0;
   (*c).top = -1048576;
@@ -2341,6 +2508,7 @@ fn treeCandsInto(c : ptr<function, TreeCands>, x : i32, z : i32, seed : u32, pon
       treeCandAdd(c, &t, x, z);
     }
   }
+  siteTreesInto(c, x, z, seed);
 }
 
 // ---- THE TREE TILE CACHE: a chunk's tiles, evaluated once per workgroup ------
@@ -2409,6 +2577,7 @@ fn treeCandsFromTiles(c : ptr<function, TreeCands>, x : i32, z : i32, bx : i32, 
       treeCandAdd(c, &t, x, z);
     }
   }
+  siteTreesInto(c, x, z, T.seed);
 }
 
 // The .svtree run word: material(12) | state(4) | y0(11) | len(5).
@@ -2789,7 +2958,21 @@ fn undergrowthSite(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>)
       undergrowthAdd(&u, &t, x, z);
     }
   }
+  siteUndergrowth(&u, x, z, seed);
   return u;
+}
+
+// The authored trees' share of a column's undergrowth (P6): their shade on
+// the floor and their trunks' distance, exactly as a lattice tree's.
+fn siteUndergrowth(u : ptr<function, Undergrowth>, x : i32, z : i32, seed : u32) {
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_TREE) { continue; }
+    var t = siteTree(sid, seed);
+    undergrowthAdd(u, &t, x, z);
+  }
 }
 
 // undergrowthSite's canopy cover, reading the tree tile cache of the chunk at
@@ -2807,6 +2990,7 @@ fn undergrowthCoverFromTiles(x : i32, z : i32, bx : i32, bz : i32,
       undergrowthAdd(&u, &t, x, z);
     }
   }
+  siteUndergrowth(&u, x, z, T.seed);
   return u.cover;
 }
 
@@ -3297,11 +3481,11 @@ fn landColumnBare(x : i32, z : i32, seed : u32,
 // sitePadY's baked one. Spelled identically in world.cpp; the site readers it
 // calls live outside the mirror.
 fn sitePadAt(x : i32, z : i32, h : i32) -> i32 {
-  let sid = wmSiteAt(x, z);
+  // Only a STAMP pads (wmPadSiteAt): a water site is a bowl, not a building
+  // -- the pond block above already shaped the ground under it, and
+  // levelling it here would fill the lake -- and a tree stands on the ground.
+  let sid = wmPadSiteAt(x, z);
   if (sid == 0u) { return h; }
-  // A water site is a bowl, not a building: the pond block above already
-  // shaped the ground under it, and levelling it here would fill the lake.
-  if (u32(wmSiteI(sid, WM_S_KIND)) == WM_SITE_WATER) { return h; }
   let sx = wmSiteI(sid, WM_S_X);
   let sz = wmSiteI(sid, WM_S_Z);
   let r = wmSiteI(sid, WM_S_RADIUS);
@@ -4131,16 +4315,13 @@ fn genCellIn(col : ptr<function, Col>,
   // source keeps chunks awake, and the garden is a brush stroke away.
 
   // ---- authored sites: a stamp overlays everything above its pad ----------
-  // One plane read for the common case (no site); on a site's cells, the
-  // template's column of runs. Non-air template voxels replace whatever the
+  // One read for the common case (no site); in a site's cells, each listed
+  // stamp's column of runs. Non-air template voxels replace whatever the
   // terrain and cover put here; template air leaves the world alone, so a
   // stamp is a building on the ground, not a box cut out of it.
-  {
-    let sid = wmSiteAt(x, z);
-    if (sid != 0u && y > h - 2) {
-      let sm = wmStampCell(sid, x, y, z, sitePadY(sid));
-      if (sm != MAT_AIR) { mat = sm; }
-    }
+  if (y > h - 2) {
+    let sm = wmStampsCell(x, y, z);
+    if (sm != MAT_AIR) { mat = sm; }
   }
 
   if (mat == MAT_AIR) { return 0u; }
@@ -4179,33 +4360,50 @@ fn treeCanopyAt(x : i32, z : i32, seed : u32, ponds : ptr<function, PondSet>) ->
   let tz = fdiv(z, TREE_TILE);
   for (var oz = -TREE_SCAN + unrollFence(); oz <= TREE_SCAN; oz++) {
     for (var ox = -TREE_SCAN + unrollFence(); ox <= TREE_SCAN; ox++) {
-      let t = treeInfo(tx + ox, tz + oz, seed, ponds);
-      if (!t.present) { continue; }
-      // The species' own far-field proxy material, out of the atlas: the mid
-      // step of its leaf ramp, or ZERO for a species with no foliage worth
-      // painting at kilometre range (the bush, the dead tree). Authored, not
-      // guessed from a species id.
-      let cm = taSpecies(t.sp, TA_S_CANOPY_MAT);
-      if (cm == MAT_AIR) { continue; }
-      let dx = x - t.wx; let dz = z - t.wz;
-      // The crown proxy is the MEASURED crown radius of the baked variants, so
-      // the footprint matches the tree that actually grows here.
-      if (dx * dx + dz * dz > t.crownR * t.crownR) { continue; }
-      // An airy species spreads its foliage in tufts with sky
-      // between them, so a solid disc at range would read as a denser wood than
-      // the near field shows. Punch it out in proportion to how much shade the
-      // species actually casts -- the same number the forest floor reads.
-      if (t.shade < 160) {
-        let punch = u32(clamp((160 - t.shade) / 24, 0, 5));
-        if (hash3(seed ^ 0x2B17u, bitcast<u32>(x), bitcast<u32>(z)) % 8u < punch) {
-          continue;
-        }
-      }
-      if (t.autumn) { return taSpecies(t.sp, TA_S_AUTUMN0 + 1u); }
-      return cm;
+      var t = treeInfo(tx + ox, tz + oz, seed, ponds);
+      let cm = canopyOf(&t, x, z, seed);
+      if (cm != MAT_AIR) { return cm; }
     }
   }
+  // The authored trees (P6): the far field paints their crowns as it paints
+  // the lattice's. After the lattice, whose crowns never share a column with
+  // one (siteBlocksTrunk).
+  let lst = wmSiteList(x, z);
+  let n = wmSiteN(lst);
+  for (var k = 0u; k < n; k++) {
+    let sid = wmSiteK(lst, k);
+    if (wmSiteKind(sid) != WM_SITE_TREE) { continue; }
+    var t = siteTree(sid, seed);
+    let cm = canopyOf(&t, x, z, seed);
+    if (cm != MAT_AIR) { return cm; }
+  }
   return MAT_AIR;
+}
+// One tree's far-field crown proxy over column (x, z), MAT_AIR if none.
+fn canopyOf(t : ptr<function, Tree>, x : i32, z : i32, seed : u32) -> u32 {
+  if (!(*t).present) { return MAT_AIR; }
+  // The species' own far-field proxy material, out of the atlas: the mid
+  // step of its leaf ramp, or ZERO for a species with no foliage worth
+  // painting at kilometre range (the bush, the dead tree). Authored, not
+  // guessed from a species id.
+  let cm = taSpecies((*t).sp, TA_S_CANOPY_MAT);
+  if (cm == MAT_AIR) { return MAT_AIR; }
+  let dx = x - (*t).wx; let dz = z - (*t).wz;
+  // The crown proxy is the MEASURED crown radius of the baked variants, so
+  // the footprint matches the tree that actually grows here.
+  if (dx * dx + dz * dz > (*t).crownR * (*t).crownR) { return MAT_AIR; }
+  // An airy species spreads its foliage in tufts with sky
+  // between them, so a solid disc at range would read as a denser wood than
+  // the near field shows. Punch it out in proportion to how much shade the
+  // species actually casts -- the same number the forest floor reads.
+  if ((*t).shade < 160) {
+    let punch = u32(clamp((160 - (*t).shade) / 24, 0, 5));
+    if (hash3(seed ^ 0x2B17u, bitcast<u32>(x), bitcast<u32>(z)) % 8u < punch) {
+      return MAT_AIR;
+    }
+  }
+  if ((*t).autumn) { return taSpecies((*t).sp, TA_S_AUTUMN0 + 1u); }
+  return cm;
 }
 
 // Far-field cell material rule, shared VERBATIM by the sieve (`far`, pristine

@@ -1600,7 +1600,10 @@ def check_worldmap_layout():
              "kW_MaxPlantH": "WM_W_MAX_PLANT_H",
              # P-F: the biome's water rows kR_* -> WM_R_*, the site kinds
              "kWaterRowWords": "WM_R_WORDS", "kR_ChanceQ16": "WM_R_CHANCE_Q16",
-             "kSitePad": "WM_SITE_PAD", "kSiteStamp": "WM_SITE_STAMP", "kSiteWater": "WM_SITE_WATER"}
+             "kSitePad": "WM_SITE_PAD", "kSiteStamp": "WM_SITE_STAMP", "kSiteWater": "WM_SITE_WATER",
+             # P6 (PLAN_map_overhaul): the tree site kind and the per-cell list
+             "kSiteTree": "WM_SITE_TREE", "kSiteRotRolled": "WM_SITE_ROT_ROLLED",
+             "kSiteCellMax": "WM_SITE_CELL_MAX", "kSiteTreeKeepOut": "WM_SITE_TREE_KEEP_OUT"}
     for m in re.finditer(r"\b(kBiomeRecWords|kCoverRowWords|kSiteRecWords|kStampHdrWords|kWaterRecWords|kShoreRowWords|kWaterRowWords)\s*=\s*(\d+)", hdr):
         cpp[m.group(1)] = int(m.group(2))
     for name, wgname in list(alias.items()):

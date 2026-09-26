@@ -39,6 +39,8 @@ happens in this process rather than in the page:
                               when the files under _world_signature moved)
   GET  /api/worldedits        list assets/worldedits/*.svedit
   GET  /api/worldmap/terrain-defaults   map.json terrain defaults (worldmap.h)
+  GET  /api/worldmap/check?name=    the SAVED map's load warnings / refusal
+                              (`sandvox --mapcheck`, GPU-free): {ok, warnings[], error}
   GET  /api/worldmap/sculpt?name=   the map's sculpt layer (binary 'SVSC'; 404 = none)
   POST /api/worldmap/sculpt?name=   write it (write-then-rename); an EMPTY body
                               deletes the file (no layer = the pre-P5 world)
@@ -1055,6 +1057,42 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(blob)
 
+    # ---- the map's load warnings (P6) ---------------------------------------
+    #
+    # `sandvox --mapcheck <name>` loads the SAVED map exactly as the game does
+    # (GPU-free, like --heightmap, so no run.sh) and answers one
+    # `MAPCHECK {json}` line: {ok, map, sites, warnings[], error}. The World map
+    # page's warnings panel shows it -- unknown site kinds, stamps / species
+    # that are not there, overlapping footprints, a tree at the treeline, the
+    # spawn inside a site, or the refusal (a cell too many sites reach).
+    def _mapcheck(self):
+        name = (self._query().get("name") or [""])[0]
+        if not _worldmap_dir(name):
+            return self._json(400, {"ok": False, "error": "bad map name"})
+        if not os.path.isfile(EXE):
+            return self._json(503, {"ok": False, "error": "build/Release/sandvox.exe not built yet"})
+        who = _wait_for_link(45.0)
+        if who is not None:
+            return self._json(503, {"ok": False, "error": "sandvox.exe is being linked (%s)" % who})
+        with _hm_lock:
+            try:
+                r = subprocess.run([EXE, "--mapcheck", name], cwd=ROOT, capture_output=True,
+                                   text=True, timeout=120,
+                                   creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            except Exception as e:  # noqa: BLE001
+                return self._json(500, {"ok": False, "error": str(e)})
+        for line in reversed((r.stdout or "").splitlines()):
+            if line.startswith("MAPCHECK "):
+                try:
+                    j = json.loads(line[len("MAPCHECK "):])
+                except ValueError as e:
+                    return self._json(500, {"ok": False, "error": "bad MAPCHECK line: %s" % e})
+                # `checked`: the route answered (the map itself may be refused)
+                j["checked"] = True
+                return self._json(200, j)
+        return self._json(500, {"ok": False, "error": "this sandvox.exe predates --mapcheck (rebuild): " +
+                                ((r.stderr or r.stdout or "")[-600:])})
+
     # ---- the voxel view ----------------------------------------------------
     def _send_blob(self, blob, gz=False):
         self.send_response(200)
@@ -1399,6 +1437,8 @@ class Handler(BaseHTTPRequestHandler):
             except OSError:
                 pass
             return self._json(200, {"ok": True, "maps": maps})
+        if p == "/api/worldmap/check":
+            return self._mapcheck()
         if p == "/api/worldmap/sculpt":
             # The P5 sculpt layer. 404 is the normal answer for a map nobody
             # has sculpted: the page starts from an empty layer.
