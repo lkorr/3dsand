@@ -569,20 +569,15 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         // previous tick. A strike fired from the buffer later still cuts the
         // direction that was flicked, aimed wherever the camera is THEN.
         if (ti.Pressed(TB_ATTACK) && meleeReady) {
-          const StyleLibrary& styleLib = mobs.AttackStyles();
-          // WHICH COMPASS: three maps keyed on what is in the fist.
-          // A dagger's short blade needs its own sectors, and unarmed
-          // is a different vocabulary entirely (punches vs cuts).
+          // WHICH COMPASS: three maps keyed on what is in the fist
+          // (strokes.h PlayerCompass; the HUD's compass asks the same).
           const PlayerStrikeMap& map =
-              !meleeArmed              ? styleLib.playerUnarmed
-            : (heldItem && heldItem->weaponClass == "dagger"
-                         && styleLib.playerDagger.Usable())
-                                       ? styleLib.playerDagger
-            :                            styleLib.player;
+              PlayerCompass(mobs.AttackStyles(), meleeArmed);
           float fx = 0, fy = 0;
           int si = -1;
-          if (strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy))
-            si = QuantizeStrike(map, fx, fy);
+          const bool flicked =
+              strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy);
+          if (flicked) si = QuantizeStrike(map, fx, fy);
           if (si < 0) {
             // No flick: alternate the two horizontals so plain clicking is a
             // usable L/R rhythm rather than the same cut stamped.
@@ -590,6 +585,11 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
             strikePicker.altRight = !strikePicker.altRight;
           }
           if (si >= 0) strikeQueued = si;
+          s.lastStrikePick.style = si;
+          s.lastStrikePick.fx = fx;
+          s.lastStrikePick.fy = fy;
+          s.lastStrikePick.flicked = flicked;
+          s.lastStrikePick.serial++;
         }
       }
 
@@ -1614,7 +1614,23 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               return 0;
             if (cand.count > 1 && !ContainerIsolateOne(v, n, i, spill, nSpill))
               return 0;
-            return ContainerDeposit(*d, cand, mat, units);
+            const int before = cand.fillAmt;
+            const int put = ContainerDeposit(*d, cand, mat, units);
+            // The fill cue: one per CELL that landed (a cell is up to eight
+            // eighths), each at the fill it brought the vessel to. Liquid
+            // only -- a pouch of sand does not bubble.
+            // Capped: headless runs have no frame loop to drain it.
+            if (put > 0 && mats[mat].gpu.klass == CLASS_LIQUID &&
+                d->container.capacity > 0 && s.flaskFills.size() < 256) {
+              const float cap = (float)d->container.capacity;
+              for (int e = std::min(8, put);; e = std::min(e + 8, put)) {
+                s.flaskFills.push_back((float)(before + e) / cap);
+                if (e >= put) break;
+              }
+              s.flaskFillAt = player.EyePos() + cam.Forward() * MetresToCells(0.35f) -
+                              Vec3{0, MetresToCells(0.15f), 0};
+            }
+            return put;
           };
           auto deposit = [&](uint16_t mat, int units) {
             int put = 0;
@@ -2388,8 +2404,13 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             }
             if (strikeQueued >= 0 && meleeReady && avatar.Spawned()) {
               if (!playerStrike.Active()) {
-                if (const AttackStyle* sty =
-                        mobs.AttackStyles().At(strikeQueued)) {
+                // THE WEAPON'S OWN VERSION of the stroke the flick named
+                // (strokes.h WEAPON FORMS), resolved once, here, like the
+                // NPC's MobSystem::StartStroke.
+                const int formed = mobs.AttackStyles().ResolveForm(
+                    strikeQueued,
+                    heldItem ? WeaponFormOf(heldItem->weaponClass) : -1);
+                if (const AttackStyle* sty = mobs.AttackStyles().At(formed)) {
                   // ---- POINT THE DRIVER AT THE PART THIS STYLE SWINGS -----
                   // Exactly what MobSystem::BeginStroke does, and through the
                   // same call: `player_punch_r` names `fist.R`, so the arm
@@ -2404,7 +2425,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                     // The seed is (who, when), like the NPC's; the player's
                     // styles author jitter 0, so it only matters if an author
                     // turns jitter back on — and then it still replays.
-                    BeginStrokeProgram(playerStrike, *sty, strikeQueued,
+                    BeginStrokeProgram(playerStrike, *sty, formed,
                                        rng::Hash3(0x504Cu, tick, 0x5747u));
                     // ...and the style's body animation, exactly as the NPC's
                     // BeginStroke does (strokes.h AttackStyle::clip).
@@ -2569,14 +2590,12 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // travels as ONE value — hand, blade axis, blade roll and the
             // elbow's bend pole — because the rig needs all four to put the
             // sword where the stroke says it is.
-            WeaponPose wp = melee.Pose();
-            // The live discrete strike's per-joint brakes (melee.h ArmSmooth).
-            if (playerStrike.phase != StrokeCursor::Phase::Idle &&
-                playerStrike.style >= 0)
-              if (const AttackStyle* sty =
-                      mobs.AttackStyles().At(playerStrike.style))
-                wp.smooth = sty->joints;
-            avatar.SetWeaponPose(wp);
+            // The live discrete strike's per-joint brakes (melee.h ArmSmooth)
+            // and, for a KEYED style, its frames' joints (strokes.h).
+            const AttackStyle* sty =
+                playerStrike.style >= 0 ? mobs.AttackStyles().At(playerStrike.style)
+                                        : nullptr;
+            avatar.SetWeaponPose(StrokePoseNow(playerStrike, sty, melee));
           }
         }
         // ---- ARMOUR: the body wears what the kit's equipment says -----------

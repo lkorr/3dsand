@@ -8443,7 +8443,84 @@ attributes each jump to `clampShift`). It is a true nearest-point projection
 now (never farther than the old one, up to 17 degrees nearer). The one
 irreducible discontinuity left is a bone aimed straight into the corner where
 BOTH stops are pressed: two answers are equally near there, and no clamp can
-be continuous everywhere on a sphere.
+be continuous everywhere on a sphere. (3) The lean plane (`perpL_`, which side of the tip the hand sits so it
+leads the edge) chased the settle's reversed travel half a turn round the blade
+OVER THE TOP, lifting the hand past the head while the tip stood still; a
+program's Recover now holds the lean the cut left (`SetProgramDrive(holdLean)`).
+The tuner port also gained the `leanFlipHold` / `leanMinSpeed` / `flatMinSin`
+guards it had been missing; the torso keep-out (`bodyClearM`) is still unported.
+
+**AN ATTACK IS A LIST OF FRAMES (2026-09-25; `strokes.h`).** The windup /
+cut-legs / recover triple — three rows meaning three different things (a pose
+from the target driven at a hidden capped rate, a TRAVEL added to wherever the
+windup ended, a pose from the body) — is replaced by `AttackStyle::frames`,
+every one the same kind of thing: where the TIP is when the frame ends, measured
+from the target or the body, `ticks`, pacing (`ease`: linear / a curve, both of
+which ARRIVE, or `chase` + `chaseRate`, the old capped closed loop, now visible),
+`cuts`, `lean` (follow / hold / left / right), `wrist` (0..1 alignment),
+`torsoTwist` / `torsoPitch`, and per-frame `joints` smoothing — plus `release`
+ticks of hand-back after the last frame. The PHASES the engine reads (Windup /
+Cut / Recover; aim frozen at the end of the windup) are DERIVED from the run of
+`cuts` frames, so NPC AI, parry, lunge and the sweep are unchanged. The loader
+converts the old spelling exactly (`BuildFramesFromLegacy`) and refills the old
+fields as derived views for their readers (`DeriveLegacyViews`);
+`attack_styles.json` was migrated once, bit-identical traces for all 18 styles.
+Per-frame shaping reaches the driver through `MeleeState::SetProgramDrive` and
+the rig through `StrokeJointsNow`.
+The ARM'S SHAPE is per frame too: `bladeAngle` (the blade off the
+shoulder-to-tip line; 0 = straight along the arm — replaces the
+hand-at-`melee.handExtend` rule when set), `elbow` (the elbow's direction about
+the shoulder-to-hand line, 0 = down, + = out — the arm's last free angle, so it
+fixes shoulder rotation and elbow bend plane together) and `lean: "angle"` +
+`leanAngle` (which side of the blade the hand sits). Each is BLENDED over its
+frame from the measured value at frame start (`BladeAngleNow` /
+`ElbowSwivelNow` / `LeanAngleNow`); absent = auto, the old rule. The tuner's
+MANUAL mode poses a held frame by dragging handles (tip, shoulder az/el,
+upper arm, reach, elbow, wrist); rig.js solves each drag in screen space
+against the driver's own geometry (pinned by test_melee). Still automatic and
+NOT per frame: the safety clamps (hand within `reachFraction`, not behind the
+body `handBackFrac`, blade out of the face `headClear`, torso `bodyClear`) and
+the rig's anatomy limits.
+
+**A FRAME IS A POSE (2026-09-25; `strokes.h` "A FRAME IS A POSE").** The
+tip-target frames above left the in-between to the driver's chasers (lean plane
+following the travel, flat following it, pole chasing the hand, law-of-cosines
+blade angle, IK, clamp), and on any swing whose travel turns that feedback
+system turned the blade plane with it — measured in the tuner on horizontal_r:
+single-tick hand turns of 90–165° through the cut. A frame may now carry a
+`pose` instead: the weapon chain's shoulder / elbow / wrist rotations RELATIVE
+TO THEIR PARENTS plus torso `twist`/`pitch`, stored as aimed straight ahead. A
+style whose every frame has one is KEYED: `StrokeKeyedPose` (strokes.cpp,
+melee.js `strokeKeyedPose`) hands the rig `WeaponPose::keyed` — from-pose,
+to-pose, eased t, each end's aim turn — and `Mob::SmoothWeaponArm` (rig.js
+`smoothWeaponArm`) slerps each joint and re-flattens the arm; `ApplyWeaponArm`
+solves nothing. The first frame blends from the arm the stroke took over; the
+tick the last frame ends HOLDS it (the driver has not begun its release yet);
+the release is the existing joint-space hand-back. A keyed arm is **exempt from
+the stage-6 clamp** (`ReapplyKeyedArm` / `reapplyKeyedArm` rewrite it after
+`AnimClampPoseLimits`): the clamp projecting a slerp that crosses a limit's edge
+was a second source of the same single-tick jumps. Aim: a target-measured frame
+is turned whole-arm about the shoulder by the target bearing (yaw about the
+body's up, then pitch); a `from: body` frame is not; each end of a blend carries
+its own turn so body→target frames swing over. The driver still runs underneath
+for the phase clock, cut window, sounds and AI; its arm is unused.
+`StrokePoseNow` is the one pose a stroke hands the rig — both callers and the
+hand-rolled swing gates use it. The shipped styles were BAKED
+(tuner "⤓ bake to poses", attacks.js `bakeStyle`): each frame's held pose
+captured from the old driver in the tuner, with the engine's wrist alignment
+now ported to rig.js (`steerWristToBlade`) so the preview is the game's arm, and
+every cut ≥ 4 ticks split at a middle key built BY BEARING (`bakeMidPose`) —
+two ends alone slerp by the shortest joint path, which takes a wide horizontal
+cut over the head. Measured after the bake (tuner, per tick): worst hand turn
+≤ 36°/tick on every sword style, no spikes; the engine's posed hand path matches
+the tuner's tick for tick. Known costs: a keyed cut's tip speed is its honest
+arc (~135 vox/s on horizontal_r vs ~440 when the wrist whipped), so cut damage
+fell and `npc-strike` is red until cuts are re-timed/re-posed; the reach cap
+against a close target (`toTarget`) does not apply to a keyed frame; a style is
+not mirrored for the other hand; aim (jaws) styles stay tip-targeted. Authoring:
+the ✋ manual handles on a keyed frame edit joints (hand = two-bone move keeping
+the blade's direction, tip = wrist, elbow = swivel, roll, arm = whole-arm turn),
+each solved against the stored pose, never the drawn one.
 
 **DISCRETE STRIKES (2026-09-01).** A click fires an **authored stroke program** — the same
 `attack_styles.json` entries the NPCs replay, new `player_*` rows with short
@@ -10016,6 +10093,20 @@ author a creature with claws and nothing in the frame loop changes.
 `meleeArmed` still means "a weapon is drawn" and still decides what to equip;
 `meleeReady = meleeArmed || meleeUnarmed` is what the driver, the program and
 the sweep gate on, because a fist is as live as a sword.
+
+**Weapon forms (2026-09-26): one stroke, one version per kind of weapon.** A
+style may carry `forms.short` / `forms.long` / `forms.blunt`, each with its own
+`frames` and `release`; `ItemDef::weaponClass` (items.json) names which one a
+weapon swings. The compass and every behaviour profile keep naming the stroke
+(`horizontal_r`); the form is resolved ONCE at the stroke's start — the
+player's press in `session.cpp` and `MobSystem::StartStroke` for NPCs, through
+`StyleLibrary::ResolveForm` — into a library entry the loader built
+(`horizontal_r@short`, and `@short:player` over the player copy), so every
+runner downstream sees an ordinary `AttackStyle`. An unauthored form is the
+style's own frames. This replaced a `playerDagger` compass whose sectors named
+the SAME styles as the sword's, so the two weapons could never differ. `player`
+blocks are jitter-only since the same day: NPCs and the player swing the same
+frames.
 
 The content that came with it: `punch_r` / `punch_l` / `hook_r` are
 `fallback: true`, so the armed profiles that now list them are behaviourally

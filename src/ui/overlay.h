@@ -270,6 +270,30 @@ struct UIState {
   // misjudged the cut" — main.cpp fills it, the overlay only draws it.
   std::string swingStyle;
 
+  // ---- THE STRIKE COMPASS (debug, HUD, right of the hp bar) ----------------
+  // Drawn while a weapon is in hand: the active flick map's sectors, the live
+  // flick (the picker's smoothed mouse velocity against the pick threshold),
+  // the sector a press would pick RIGHT NOW, and a readout naming the strike
+  // the last press actually resolved to and the frame the running one is on.
+  // main.cpp fills it from PlayerSession; the overlay only draws it.
+  struct StrikeSector {
+    float x = 0, y = 0;      // screen space, +y DOWN (strokes.h PlayerStrikeMap)
+    std::string name;        // base style id, ":player" stripped
+    bool neutral = false;    // one of the two a no-flick click alternates
+  };
+  bool strikeCompass = false;
+  std::vector<StrikeSector> strikeSectors;
+  float strikeFlickX = 0, strikeFlickY = 0;   // picker velocity, px/s
+  float strikePickMin = 1;                    // melee.pickMinSpeed, px/s
+  int strikeHover = -1;      // sector a press would pick now; -1 = neutral
+  int strikeLastSector = -1; // sector the last press resolved to
+  bool strikeLastFlicked = false;
+  float strikeLastX = 0, strikeLastY = 0;     // the last press's flick dir
+  std::string strikeLastText;   // "OVERHEAD  flick up" / "... no flick"
+  float strikeLastAge = 1e9f;   // seconds since that press
+  uint32_t strikeLastSerial = 0;  // main.cpp's edge detector on the press
+  std::string strikeNowText;    // running strike: name, phase, frame
+
   // Ledge-grab readout (dev panel). main.cpp composes the text from the
   // player's per-frame probe so a refused grab says WHICH latch gate refused;
   // state drives the colour: 0 = no lip in reach, 1 = in reach, 2 = hanging.

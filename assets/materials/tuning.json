@@ -401,6 +401,8 @@
     "elbowPoleCone": 1.75,
     "elbowAxisCone": 3.1400001,
     "edgeFloor": 0.349999994,
+    "sweepSpacingM": 0.05,
+    "sweepMaxSteps": 24,
     "blockGapM": 0.219999999,
     "blockItemDamage": 0.349999994,
     "blockNudgeAz": 0.300000012,

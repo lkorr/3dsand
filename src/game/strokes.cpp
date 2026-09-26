@@ -1,3 +1,4 @@
+#include <cstdlib>
 #include "game/strokes.h"
 
 #include <algorithm>
@@ -6,6 +7,15 @@
 #include <unordered_map>
 
 #include "sim/rng.h"
+
+namespace {
+// An angle ABOUT AN AXIS (a lean, an elbow swivel), brought into [-pi, pi]:
+// any number is one of these, and a blend between two must go the short way.
+float WrapPi(float a) {
+  if (!std::isfinite(a)) return 0.0f;
+  return std::remainder(a, 6.28318531f);
+}
+}  // namespace
 #include <nlohmann/json.hpp>
 
 using json = nlohmann::json;
@@ -60,6 +70,140 @@ void ReadJoints(const json& j, ArmSmooth& out) {
     js.smooth = std::clamp(q.value("smooth", js.smooth), 0.0f, 60.0f);
     js.maxDeg = std::clamp(q.value("maxDeg", js.maxDeg), 0.0f, 180.0f);
   }
+}
+
+// ---- A FRAME IS A POSE (strokes.h) ----------------------------------------
+// [x, y, z, w] -> a unit quaternion; false for anything else.
+bool ReadQuat(const json& j, Quat& q) {
+  if (!j.is_array() || j.size() != 4) return false;
+  float v[4];
+  for (int i = 0; i < 4; i++) {
+    if (!j[i].is_number()) return false;
+    v[i] = j[i].get<float>();
+    if (!std::isfinite(v[i])) return false;
+  }
+  q = QuatNormalize(Quat{v[0], v[1], v[2], v[3]});
+  return true;
+}
+// A pose needs its shoulder and elbow; the wrist is optional.
+StrokePose ReadPose(const json& j) {
+  StrokePose p;
+  if (!j.is_object()) return p;
+  static const char* kNames[kArmJoints] = {"shoulder", "elbow", "wrist"};
+  for (int k = 0; k < kArmJoints; k++)
+    if (j.contains(kNames[k]))
+      p.hasJoint[k] = ReadQuat(j[kNames[k]], p.joint[k]);
+  p.has = p.hasJoint[kArmShoulder] && p.hasJoint[kArmElbow];
+  const auto num = [&](const char* key) {
+    return j.contains(key) && j[key].is_number() ? j[key].get<float>() : 0.0f;
+  };
+  p.twist = num("twist");
+  p.pitch = num("pitch");
+  if (!std::isfinite(p.twist)) p.twist = 0.0f;
+  if (!std::isfinite(p.pitch)) p.pitch = 0.0f;
+  return p;
+}
+
+// ---- FRAMES (strokes.h "AN ATTACK IS A LIST OF FRAMES") -------------------
+//
+// One reader for every frame, because every frame is the same kind of thing.
+// `styleJoints` is the style-level `joints` block, if any: a frame that states
+// none of its own inherits it, and one that states some merges onto it field
+// by field (ReadJoints' convention).
+StrokeFrame ReadFrame(const json& j, const ArmSmooth& styleJoints,
+                      const std::string& where, std::string& log) {
+  StrokeFrame f;
+  f.joints = styleJoints;
+  if (!j.is_object()) return f;
+  f.name = j.value("name", std::string());
+  f.ticks = std::max(1, j.value("ticks", f.ticks));
+  f.az = j.value("az", 0.0f);
+  f.el = j.value("el", 0.0f);
+  f.reach = j.value("reach", 0.0f);
+  const std::string from = j.value("from", std::string("target"));
+  if (from != "target" && from != "body")
+    log += where + " has unknown \"from\": \"" + from +
+           "\" — measuring from the target\n";
+  f.fromBody = from == "body";
+  bool paced = false;
+  if (j.value("ease", std::string()) == "chase") {
+    f.chase = true;
+    f.chaseRate = std::clamp(j.value("chaseRate", f.chaseRate), 1.0f, 200.0f);
+  } else {
+    ReadEaseKey(j, paced, f.ease, where, log);
+  }
+  f.cuts = j.value("cuts", false);
+  const std::string lean = j.value("lean", std::string("follow"));
+  if (lean == "hold") f.lean = FrameLean::Hold;
+  else if (lean == "left") f.lean = FrameLean::Left;
+  else if (lean == "right") f.lean = FrameLean::Right;
+  else if (lean == "angle") {
+    f.lean = FrameLean::Angle;
+    f.leanAngle = WrapPi(j.value("leanAngle", 0.0f));
+  }
+  else {
+    if (lean != "follow")
+      log += where + " has unknown \"lean\": \"" + lean +
+             "\" — following the travel\n";
+    f.lean = FrameLean::Follow;
+  }
+  f.wristAlign = std::clamp(j.value("wrist", 1.0f), 0.0f, 1.0f);
+  if (j.contains("bladeAngle"))
+    f.bladeAngle = std::clamp(j.value("bladeAngle", 0.0f), 0.0f, 3.14159265f);
+  if (j.contains("elbow")) {
+    f.elbowSet = true;
+    f.elbow = WrapPi(j.value("elbow", 0.0f));
+  }
+  f.torsoTwist = j.contains("torsoTwist")
+                     ? std::clamp(j.value("torsoTwist", 0.0f), 0.0f, 1.0f)
+                     : -1.0f;
+  f.torsoPitch = j.contains("torsoPitch")
+                     ? std::clamp(j.value("torsoPitch", 0.0f), 0.0f, 1.0f)
+                     : -1.0f;
+  ReadJoints(j.value("joints", json::object()), f.joints);
+  f.pose = ReadPose(j.value("pose", json::object()));
+  return f;
+}
+
+void ReadFrames(const json& arr, const ArmSmooth& styleJoints,
+                const std::string& path, const std::string& name,
+                std::vector<StrokeFrame>& out, std::string& log) {
+  out.clear();
+  for (const auto& fj : arr) {
+    if ((int)out.size() >= kMaxFrames) {
+      log += path + ": style \"" + name + "\" has more than " +
+             std::to_string(kMaxFrames) + " frames — the rest are dropped\n";
+      break;
+    }
+    out.push_back(ReadFrame(fj, styleJoints,
+                            path + ": style \"" + name + "\" frame " +
+                                std::to_string(out.size() + 1),
+                            log));
+  }
+}
+
+// THE CUT FRAMES ARE ONE RUN. The phases the rest of the engine reads are
+// derived from them (strokes.h), and a gap would make "the cut" two cuts with
+// a windup in the middle. A style with none never damages anything, which is
+// a content error: the LAST frame becomes the cut and the loader says so.
+void ValidateFrames(AttackStyle& st, const std::string& path, std::string& log) {
+  if (st.frames.empty()) return;
+  int fc = st.FirstCut(), lc = st.LastCut();
+  if (fc < 0) {
+    log += path + ": style \"" + st.name +
+           "\" has no frame with \"cuts\": true — its last frame is made the "
+           "cut so it can hurt anything\n";
+    st.frames.back().cuts = true;
+    return;
+  }
+  for (int k = fc; k <= lc; k++)
+    if (!st.frames[k].cuts) {
+      log += path + ": style \"" + st.name + "\" frame " +
+             std::to_string(k + 1) +
+             " sits between two cutting frames — it cuts too (the cut is one "
+             "run)\n";
+      st.frames[k].cuts = true;
+    }
 }
 
 // ---- THE CUT PATH (strokes.h "A CUT IS A PATH") ----------------------------
@@ -173,6 +317,15 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
         log += path + ": style \"" + st.name + "\" has unknown ease \"" + en +
                "\" — using linear (the names are anim.h's: linear, instant, "
                "quadIn/Out/InOut, cubicIn/Out/InOut)\n";
+    }
+    // THE NEW SPELLING (strokes.h "AN ATTACK IS A LIST OF FRAMES"). A style
+    // with `frames` is read from them and nothing else describes its motion;
+    // one without is the pre-frames spelling, read below and converted once
+    // the player copies exist.
+    ReadJoints(s.value("joints", json::object()), st.joints);
+    if (s.contains("frames") && s["frames"].is_array()) {
+      ReadFrames(s["frames"], st.joints, path, st.name, st.frames, log);
+      st.release = std::max(1, s.value("release", st.release));
     }
     st.windup = ReadSegment(s.value("windup", json::object()),
                             StrokeSegment{12, 0.30f, 0.10f, -0.05f},
@@ -415,6 +568,12 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
         ps.recover.ticks = ps.recover.settle + ps.recover.fade;
     }
     ReadJoints(pj.value("joints", json::object()), ps.joints);
+    // A player block in the frames spelling REPLACES the list (a partial
+    // merge by index would silently re-aim frame 2 of a different path).
+    if (pj.contains("frames") && pj["frames"].is_array())
+      ReadFrames(pj["frames"], ps.joints, path, ps.name, ps.frames, log);
+    if (pj.contains("release"))
+      ps.release = std::max(1, pj.value("release", ps.release));
     if (pj.contains("jitter") && pj["jitter"].is_object()) {
       const auto& q = pj["jitter"];
       ps.jitter.az = q.value("az", ps.jitter.az);
@@ -424,10 +583,61 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
     playerDerived[lib.styles[base].name] = (int)lib.styles.size();
     lib.styles.push_back(std::move(ps));
   }
+  // ---- WEAPON FORMS (strokes.h) -------------------------------------------
+  // Over base AND player copies: a form replaces the frames (and release) and
+  // keeps everything else, the player copy's jitter included, so `forms` and
+  // `player` compose instead of one silently winning.
+  {
+    const size_t pre = lib.styles.size();
+    std::vector<std::array<int, kWeaponForms>> rows(pre, {-1, -1, -1});
+    for (size_t i = 0; i < pre; i++) {
+      std::string base = lib.styles[i].name;
+      const size_t colon = base.find(":player");
+      const bool isPlayer = colon != std::string::npos;
+      if (isPlayer) base.resize(colon);
+      auto it = rawByName.find(base);
+      if (it == rawByName.end()) continue;
+      const auto& sj = it->second;
+      if (!sj.contains("forms") || !sj["forms"].is_object()) continue;
+      const auto& fo = sj["forms"];
+      for (auto kv = fo.begin(); kv != fo.end(); ++kv)
+        if (WeaponFormOf(kv.key()) < 0 && !isPlayer)
+          log += path + ": style \"" + base + "\" has unknown form \"" +
+                 kv.key() + "\" (short / long / blunt) - ignored\n";
+      for (int f = 0; f < kWeaponForms; f++) {
+        const char* key = kWeaponFormNames[f];
+        if (!fo.contains(key) || !fo[key].is_object()) continue;
+        const auto& fj = fo[key];
+        AttackStyle fs = lib.styles[i];
+        fs.name = base + "@" + key + (isPlayer ? ":player" : "");
+        fs.form = key;
+        if (fj.contains("frames") && fj["frames"].is_array())
+          ReadFrames(fj["frames"], fs.joints, path, fs.name, fs.frames, log);
+        if (fj.contains("release"))
+          fs.release = std::max(1, fj.value("release", fs.release));
+        rows[i][f] = (int)lib.styles.size();
+        lib.styles.push_back(std::move(fs));
+      }
+    }
+    rows.resize(lib.styles.size(), {-1, -1, -1});
+    lib.forms = std::move(rows);
+  }
   // AFTER the merge, and over base and player copies alike: a player block in
   // an old file is in the old frame too, so it has to be merged in it first.
   if (legacyFrame)
-    for (AttackStyle& st : lib.styles) st.FromLegacyFrame();
+    for (AttackStyle& st : lib.styles)
+      if (st.frames.empty()) st.FromLegacyFrame();
+  // EVERY STYLE RUNS ON FRAMES. The pre-frames spelling is converted here
+  // (exactly: the targets are the old phases' own expressions); the frames
+  // spelling refills the derived windup/cut/recover views its readers use.
+  for (AttackStyle& st : lib.styles) {
+    if (st.frames.empty()) {
+      st.BuildFramesFromLegacy();
+    } else {
+      ValidateFrames(st, path, log);
+      st.DeriveLegacyViews();
+    }
+  }
 
   // ---- the player's flick compass (strokes.h PlayerStrikeMap) --------------
   // The compass references BASE style names; the resolver uses the derived
@@ -467,7 +677,6 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
   };
   readMap("player", lib.player);
   readMap("playerUnarmed", lib.playerUnarmed);
-  readMap("playerDagger", lib.playerDagger);
   out = std::move(lib);
   return true;
 }
@@ -485,6 +694,18 @@ int QuantizeStrike(const PlayerStrikeMap& map, float dx, float dy) {
     }
   }
   return best;
+}
+
+const PlayerStrikeMap& PlayerCompass(const StyleLibrary& lib, bool armed) {
+  return armed ? lib.player : lib.playerUnarmed;
+}
+
+const char* const kWeaponFormNames[kWeaponForms] = {"short", "long", "blunt"};
+
+int WeaponFormOf(const std::string& weaponClass) {
+  for (int f = 0; f < kWeaponForms; f++)
+    if (weaponClass == kWeaponFormNames[f]) return f;
+  return -1;
 }
 
 int NeutralStrike(const PlayerStrikeMap& map, bool right) {
@@ -533,46 +754,236 @@ void StrokeAimAt(const Vec3& pivot, const Vec3& target, const Vec3& right,
   outDist = r;
 }
 
+// ---- the conversions (strokes.h AttackStyle) ------------------------------
+void AttackStyle::BuildFramesFromLegacy() {
+  frames.clear();
+  StrokeFrame w;
+  w.name = "windup";
+  w.ticks = windup.ticks;
+  w.az = windup.az;
+  w.el = windup.el;
+  w.reach = windup.reach;
+  // An unpaced windup WAS the capped chase: kept, as a visible pacing.
+  w.ease = windup.paced ? windup.ease : Ease::Linear;
+  w.chase = !windup.paced;
+  w.joints = joints;
+  frames.push_back(w);
+  for (int k = 0; k < (int)cut.size() && (int)frames.size() < kMaxFrames; k++) {
+    StrokeFrame f;
+    f.name = cut.size() > 1 ? "cut " + std::to_string(k + 1) : "cut";
+    f.ticks = cut[k].ticks;
+    const StrokeSegment through = CutThrough(k);
+    f.az = windup.az + through.az;
+    f.el = windup.el + through.el;
+    f.reach = windup.reach + through.reach;
+    f.ease = LegEase(k);
+    f.cuts = true;
+    f.joints = joints;
+    frames.push_back(f);
+  }
+  const int settle = recover.posed ? std::max(0, recover.settle) : 0;
+  if (settle > 0 && (int)frames.size() < kMaxFrames) {
+    StrokeFrame r;
+    r.name = "recover";
+    r.ticks = settle;
+    r.az = recover.az;
+    r.el = recover.el;
+    r.reach = recover.reach;
+    r.fromBody = true;
+    r.ease = recover.paced ? recover.ease : Ease::Linear;
+    r.chase = !recover.paced;
+    r.lean = FrameLean::Hold;   // a return does not re-lean (melee.h)
+    r.joints = joints;
+    frames.push_back(r);
+  }
+  release = recover.fade > 0 ? recover.fade
+                             : std::max(1, recover.ticks - settle);
+}
+
+void AttackStyle::DeriveLegacyViews() {
+  const int fc = FirstCut(), lc = LastCut();
+  if (frames.empty() || fc < 0) return;
+  // The windup view is the pose the cut starts from, reached over every
+  // frame before it. With no frame before it, the first cut frame's own pose
+  // and one tick (the view has no zero-length spelling).
+  int pre = 0;
+  for (int k = 0; k < fc; k++) pre += frames[k].ticks;
+  const StrokeFrame& w = fc > 0 ? frames[fc - 1] : frames[fc];
+  windup = StrokeSegment{std::max(1, pre), w.az, w.el, w.reach};
+  windup.paced = !w.chase;
+  windup.ease = w.ease;
+  cut.clear();
+  float pAz = w.az, pEl = w.el, pR = w.reach;
+  for (int k = fc; k <= lc && (int)cut.size() < kMaxCutLegs; k++) {
+    const StrokeFrame& f = frames[k];
+    StrokeSegment leg{f.ticks, f.az - pAz, f.el - pEl, f.reach - pR};
+    leg.paced = true;
+    leg.ease = f.ease;
+    cut.push_back(leg);
+    pAz = f.az; pEl = f.el; pR = f.reach;
+  }
+  aimLeg = -1;
+  ease = Ease::Linear;
+  int post = 0;
+  for (int k = lc + 1; k < (int)frames.size(); k++) post += frames[k].ticks;
+  recover = StrokeRecover{};
+  recover.posed = lc + 1 < (int)frames.size();
+  if (recover.posed) {
+    const StrokeFrame& r = frames.back();
+    recover.az = r.az;
+    recover.el = r.el;
+    recover.reach = r.reach;
+    recover.paced = true;
+    recover.ease = r.ease;
+  }
+  recover.settle = post;
+  recover.fade = release;
+  recover.ticks = post + std::max(1, release);
+  joints = frames[fc].joints;
+}
+
+const ArmSmooth& StrokeJointsNow(const StrokeCursor& cur, const AttackStyle& sty) {
+  if (sty.frames.empty()) return sty.joints;
+  const int k = std::clamp(cur.frame, 0, (int)sty.frames.size() - 1);
+  return sty.frames[k].joints;
+}
+
+void StrokeKeyedPose(const StrokeCursor& cur, const AttackStyle& sty, WeaponPose& wp) {
+  if (!sty.Keyed()) return;
+  const int n = std::max(1, std::min((int)sty.frames.size(),
+                                     cur.frames > 0 ? cur.frames : (int)sty.frames.size()));
+  const StrokePose& last = sty.frames[n - 1].pose;
+  wp.keyed = WeaponPose::Keyed{};
+  const float bowAz = sty.jitter.az * rng::SignedUnit(rng::Hash3(cur.seed, 2, 0));
+  const float bowEl = sty.jitter.el * rng::SignedUnit(rng::Hash3(cur.seed, 3, 0));
+  // Each END of the blend carries its own aim turn, so a frame that goes from
+  // body-relative to target-relative swings over instead of jumping.
+  auto aimOf = [&](int k, float& yaw, float& pitch) {
+    const StrokeFrame& f = sty.frames[k];
+    yaw = pitch = 0.0f;
+    if (f.fromBody) return;
+    const bool preCut = cur.firstCut < 0 || k < cur.firstCut;
+    yaw = (cur.aimed ? cur.aimAz : cur.liveAz) + (preCut ? bowAz : 0.0f);
+    pitch = (cur.aimed ? cur.aimEl : cur.liveEl) + (preCut ? bowEl : 0.0f);
+  };
+  int k = cur.frame;
+  float t = 1.0f;
+  // THE TICK THE LAST FRAME ENDS the program is already releasing while the
+  // driver has not begun its hand-back (release < 0): the arm is still the
+  // stroke's, so it HOLDS the last pose -- left alone it was the driver's IK
+  // arm for one tick, a 100-degree snap.
+  const bool hold = cur.releasing && wp.release < 0.0f &&
+                    cur.phase != StrokeCursor::Phase::Idle;
+  if (!hold && (cur.releasing || cur.phase == StrokeCursor::Phase::Idle)) {
+    // The torso comes home on the same curve the arm does.
+    const float w = wp.release >= 0.0f ? 1.0f - wp.release : 0.0f;
+    wp.torsoTwist = last.twist * w;
+    wp.torsoPitch = last.pitch * w;
+    return;
+  }
+  if (hold || k >= n) {
+    k = n - 1;
+  } else {
+    const int len = std::max(1, cur.frameTicks[k]);
+    // `chase` has no meaning between two poses: it plays linear.
+    const Ease e = sty.frames[k].chase ? Ease::Linear : sty.frames[k].ease;
+    t = ApplyEase(e, std::clamp((float)cur.frameTick / (float)len, 0.0f, 1.0f));
+  }
+  const StrokePose& to = sty.frames[k].pose;
+  const StrokePose* from = k > 0 ? &sty.frames[k - 1].pose : nullptr;
+  WeaponPose::Keyed& K = wp.keyed;
+  K.on = true;
+  K.fromLive = from == nullptr;
+  K.t = t;
+  for (int j = 0; j < kArmJoints; j++) {
+    K.to[j] = to.joint[j];
+    K.from[j] = from ? from->joint[j] : to.joint[j];
+    K.hasJoint[j] = to.hasJoint[j] && (from == nullptr || from->hasJoint[j]);
+  }
+  if (from) aimOf(k - 1, K.aimFromYaw, K.aimFromPitch);
+  aimOf(k, K.aimToYaw, K.aimToPitch);
+  const float tw0 = from ? from->twist : 0.0f, pt0 = from ? from->pitch : 0.0f;
+  wp.torsoTwist = tw0 + (to.twist - tw0) * t;
+  wp.torsoPitch = pt0 + (to.pitch - pt0) * t;
+}
+
+WeaponPose StrokePoseNow(const StrokeCursor& cur, const AttackStyle* sty,
+                         const MeleeState& m) {
+  WeaponPose wp = m.Pose();
+  if (sty != nullptr && cur.phase != StrokeCursor::Phase::Idle) {
+    wp.smooth = StrokeJointsNow(cur, *sty);
+    StrokeKeyedPose(cur, *sty, wp);
+  }
+  return wp;
+}
+
+namespace {
+StrokeCursor::Phase PhaseOfFrame(const StrokeCursor& cur, int k) {
+  if (cur.firstCut < 0 || k < cur.firstCut) return StrokeCursor::Phase::Windup;
+  if (k <= cur.lastCut) return StrokeCursor::Phase::Cut;
+  return StrokeCursor::Phase::Recover;
+}
+}  // namespace
+
 void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
                         int styleIndex, uint32_t seed) {
   cur.style = styleIndex;
   cur.seed = seed;
+  cur.fromPending = false;
+  cur.fromTick = 0;
   const float tempo =
       1.0f + sty.jitter.tempo * rng::SignedUnit(rng::Hash3(seed, 1, 0));
-  cur.windupTicks = std::max(2, (int)std::lround(sty.windup.ticks * tempo));
-  // ---- THE PATH'S TICK TABLE (strokes.h StrokeCursor::legTicks) ------------
-  // PER LEG, ROUNDED ONCE. Scaling the total and splitting it would make the
-  // corner drift with the jitter; scaling each leg is what keeps "leg 1 is
-  // twice leg 2" true at every tempo, and rounding here rather than per tick
-  // is what keeps a leg boundary from moving under the drive.
-  //
-  // A leg floors at ONE tick — a leg the jitter rounded away would delete a
-  // corner from the path, and a stroke that loses its dogleg at tempo 0.9 and
-  // has it at 1.1 is the "different animations randomly" report all over
-  // again. The WHOLE cut still floors at two, exactly as it did when there was
-  // only ever one leg, so a one-leg path's tick count is unchanged.
-  cur.cutLegs = std::clamp((int)sty.cut.size(), 1, kMaxCutLegs);
-  int total = 0;
-  for (int k = 0; k < cur.cutLegs; k++) {
-    cur.legTicks[k] = std::max(1, (int)std::lround(sty.cut[k].ticks * tempo));
-    total += cur.legTicks[k];
+  cur.frames = std::min((int)sty.frames.size(), kMaxFrames);
+  cur.firstCut = std::min(sty.FirstCut(), cur.frames - 1);
+  cur.lastCut = std::min(sty.LastCut(), cur.frames - 1);
+  // THE TEMPO JITTER stretches everything up to and including the cut — the
+  // telegraph and the travel an opponent reads — and never the return
+  // (strokes.h StrokeJitter says why tempo exists at all).
+  for (int k = 0; k < cur.frames; k++) {
+    const int base = sty.frames[k].ticks;
+    const bool jittered = cur.lastCut < 0 || k <= cur.lastCut;
+    cur.frameTicks[k] =
+        std::max(1, jittered ? (int)std::lround(base * tempo) : base);
   }
-  if (total < 2) {
-    cur.legTicks[cur.cutLegs - 1] += 2 - total;
-    total = 2;
+  int windup = 0, cut = 0, post = 0;
+  for (int k = 0; k < cur.frames; k++) {
+    const StrokeCursor::Phase ph = PhaseOfFrame(cur, k);
+    if (ph == StrokeCursor::Phase::Windup) windup += cur.frameTicks[k];
+    else if (ph == StrokeCursor::Phase::Cut) cut += cur.frameTicks[k];
+    else post += cur.frameTicks[k];
   }
-  cur.cutTicks = total;
+  // A telegraph and a cut each keep at least two ticks, as they always have:
+  // a one-tick windup is an attack with no warning.
+  if (cur.firstCut > 0 && windup < 2) {
+    cur.frameTicks[cur.firstCut - 1] += 2 - windup;
+    windup = 2;
+  }
+  if (cur.lastCut >= 0 && cut < 2) {
+    cur.frameTicks[cur.lastCut] += 2 - cut;
+    cut = 2;
+  }
+  cur.windupTicks = windup;
+  cur.cutTicks = cut;
+  cur.settleTicks = post;
+  cur.recoverTicks = post + std::max(1, sty.release);
+  cur.cutLegs = cur.firstCut >= 0
+                    ? std::clamp(cur.lastCut - cur.firstCut + 1, 1, kMaxCutLegs)
+                    : 1;
+  for (int i = 0; i < kMaxCutLegs; i++)
+    cur.legTicks[i] = (cur.firstCut >= 0 && i < cur.cutLegs)
+                          ? cur.frameTicks[cur.firstCut + i]
+                          : 0;
   cur.cutLeg = 0;
-  // THE RECOVER IS NOT TEMPO-JITTERED, and that is deliberate rather than an
-  // omission. `tempo` exists so two duelists do not beat time together, and
-  // what carries that is the TELEGRAPH and the travel — the two segments an
-  // opponent reads. Scaling the return as well would make the settle and the
-  // fade drift out of the relationship the author set them in (settle + fade
-  // <= ticks, enforced at load), and buy nothing an onlooker can see.
-  cur.recoverTicks = std::max(1, sty.recover.ticks);
-  cur.settleTicks = std::clamp(sty.recover.posed ? sty.recover.settle : 0, 0,
-                               cur.recoverTicks);
-  cur.phase = StrokeCursor::Phase::Windup;
+  cur.frame = 0;
+  cur.frameTick = 0;
+  cur.releasing = false;
+  cur.releaseLeft = 0;
+  cur.aimed = false;
+  if (cur.frames <= 0) {
+    cur.StartRelease(std::max(1, sty.release));
+    return;
+  }
+  cur.phase = PhaseOfFrame(cur, 0);
   cur.phaseTick = 0;
 }
 
@@ -580,232 +991,188 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
                                    MeleeState& m, float liveAz, float liveEl,
                                    float liveDist, float dt, const Vec3& right,
                                    const Vec3& up, const Vec3& fwd) {
-  // THE POINT MAY NOT BE DRIVEN MORE THAN A LITTLE PAST THE TARGET (strokes.h
-  // says why at length). A fifth past it is the follow-through a blow needs to
-  // pass THROUGH what it hits rather than stopping on its surface; beyond that
-  // the weapon is only travelling somewhere the target is not.
+  // THE REACH A TARGET-MEASURED FRAME ASKS FOR is capped a little past the
+  // target itself, so a stroke aimed at something close does not punch
+  // through it to the far side of the band.
   auto toTarget = [&](float banded) {
     return liveDist > 0.0f ? std::min(banded, liveDist * 1.2f) : banded;
   };
-  // The start bow: a deterministic wobble on where the windup lands, so ten
-  // swings do not look stamped. Zero for a guard, which has no style behind
-  // it — and zero for the player's styles, which author `jitter` at 0 so a
-  // strike goes exactly where it was flicked.
+  cur.liveAz = liveAz;
+  cur.liveEl = liveEl;
+  // The start bow: a deterministic wobble on every frame BEFORE the cut, so
+  // ten swings do not look stamped.
   const float bowAz =
       sty ? sty->jitter.az * rng::SignedUnit(rng::Hash3(cur.seed, 2, 0)) : 0.0f;
   const float bowEl =
       sty ? sty->jitter.el * rng::SignedUnit(rng::Hash3(cur.seed, 3, 0)) : 0.0f;
-  // ---- THIS STYLE'S OWN HAND-BACK CLOCK (StrokeRecover::fade) --------------
-  //
-  // Pushed every tick rather than once at the release, and from HERE rather
-  // than from BeginStrokeProgram, because this is the only function that holds
-  // both the style and the MeleeState — the program fields live on a cursor
-  // that has never seen a driver. It is idempotent (a float assignment), it
-  // costs nothing, and pushing it unconditionally is what guarantees a style
-  // that authors no fade RESTORES the global one: a MeleeState is reused
-  // across strokes (the player's is reused for the whole session), so a
-  // previous style's override would otherwise outlive it.
-  //
-  // Zero means "the global melee.recoverTime", which is what every style
-  // authored before `fade` existed asks for.
-  // Every Step below is this program's: the wrist aligns in full (melee.h
-  // SetProgramDrive says why).
-  // Only when a Step below will actually run (an Idle cursor, or a styled
-  // phase with no style, returns without one), so the flag never leaks into
-  // somebody else's Update.
-  if (cur.phase == StrokeCursor::Phase::Guard ||
-      (sty != nullptr && cur.phase != StrokeCursor::Phase::Idle))
-    m.SetProgramDrive();
-  m.SetRecoverTime(sty != nullptr && sty->recover.fade > 0
-                       ? sty->recover.fade * dt
-                       : 0.0f);
+
+  // ---- THIS FRAME'S SHAPING, pushed to the driver every tick --------------
+  // During the release the LAST frame's settings stay in force.
+  const StrokeFrame* fr = nullptr;
+  if (sty != nullptr && !sty->frames.empty() &&
+      cur.phase != StrokeCursor::Phase::Idle &&
+      cur.phase != StrokeCursor::Phase::Guard)
+    fr = &sty->frames[std::clamp(cur.frame, 0, (int)sty->frames.size() - 1)];
+  if (cur.phase == StrokeCursor::Phase::Guard || fr != nullptr) {
+    MeleeState::ProgramDrive d;
+    if (fr != nullptr) {
+      d.lean = (int)fr->lean;
+      d.wristAlign = fr->wristAlign;
+      d.torsoTwist = fr->torsoTwist;
+      d.torsoPitch = fr->torsoPitch;
+      // THE ARM'S SHAPE, BLENDED over the frame from where it was when the
+      // frame began, on the frame's own curve (linear for a chase), so a
+      // change between frames is a motion. During the release the last
+      // frame's end values simply hold.
+      const bool live = !cur.releasing && cur.frame < cur.frames;
+      // THE TAKE-OVER TICK HAS NO SHAPE TO READ: the driver is still Idle,
+      // its "now" angles are the last swing's, and the take-over skips its
+      // rebuild. It measures the seeded arm (MeasureShapeNow); the capture is
+      // taken on the tick after it.
+      if (live && (cur.frameTick == 0 || cur.fromPending)) {
+        if (m.Phase() == SwingPhase::Idle) {
+          cur.fromPending = true;
+        } else {
+          cur.bladeFrom = m.BladeAngleNow();
+          cur.elbowFrom = m.ElbowSwivelNow();
+          cur.leanFrom = m.LeanAngleNow();
+          cur.fromPending = false;
+          cur.fromTick = cur.frameTick;
+        }
+      }
+      // Over the ticks LEFT once the shape was captured, so a capture
+      // deferred past the take-over does not spend two ticks' worth at once.
+      float p = 1.0f;
+      if (live) {
+        const int len = std::max(1, cur.frameTicks[cur.frame]);
+        const float q = (float)(cur.frameTick + 1 - cur.fromTick) /
+                        (float)std::max(1, len - cur.fromTick);
+        p = fr->chase ? q : ApplyEase(fr->ease, q);
+      }
+      if (fr->bladeAngle >= 0.0f)
+        d.bladeAngle = cur.bladeFrom + (fr->bladeAngle - cur.bladeFrom) * p;
+      // The two ANGLES ABOUT AN AXIS go the SHORT way round, decided by the
+      // captured start and the frame's end -- both fixed for the frame, so the
+      // direction round cannot change mid-frame. The angles are measured in
+      // melee.cpp AxisFrame, which has no bad point an arm can reach, so an
+      // angle blend is a smooth motion (the old projected-down reference
+      // spun at the vertical and made this jump).
+      if (fr->elbowSet) {
+        d.elbowSet = true;
+        d.elbowSwivel = cur.elbowFrom + WrapPi(fr->elbow - cur.elbowFrom) * p;
+      }
+      if (fr->lean == FrameLean::Angle)
+        d.leanAngle = cur.leanFrom + WrapPi(fr->leanAngle - cur.leanFrom) * p;
+    }
+    m.SetProgramDrive(d);
+  }
+  // THE RELEASE'S OWN CLOCK: the hand-back fade takes exactly `release`
+  // ticks. No style (a dropped guard) keeps the global melee.recoverTime.
+  m.SetRecoverTime(sty != nullptr ? std::max(1, sty->release) * dt : 0.0f);
+
   StrokeSample smp;
   smp.held = true;
-  // THE CLOSED-LOOP, CAPPED DRIVE, shared by Guard and Windup because they
-  // are the same motion: steer the stored stroke toward a stated pose at no
-  // more than 16 units/tick (480 px/s) — which is what makes a windup a
-  // readable telegraph rather than an instant snap. (It was also what kept
-  // the driver's own speed-triggered Slash from firing; that Slash is gone.)
-  auto steerTo = [&](float wantAz, float wantEl, float wantR) {
-    const MeleeTuning& t = m.tuning;
-    smp.dx = std::clamp((wantAz - m.StrokeAz()) / t.aimGainX, -16.0f, 16.0f);
-    smp.dy = std::clamp(-(wantEl - m.StrokeEl()) / t.aimGainY, -16.0f, 16.0f);
-    smp.dReach = std::clamp(
-        (wantR - m.StrokeRadius()) / std::max(t.reachGain, 1e-4f), -18.0f,
-        18.0f);
-    m.Step(smp, dt, true, right, up, fwd);
-  };
-  // THE SAME CHASE, TIMED (strokes.h "PER-SEGMENT PACING"): used by a windup
-  // or settle that states its own ease. Each tick spends the curve's share of
-  // the REMAINING gap, so the pose is reached on the segment's last tick —
-  // and the step is still clamped to steerTo's envelope, so a pacing curve
-  // can slow a windup but never make it faster than the cap.
-  auto steerPaced = [&](float wantAz, float wantEl, float wantR, Ease e,
-                        int into, int len) {
-    const MeleeTuning& t = m.tuning;
-    const float n = (float)std::max(1, len);
-    const float share =
-        StrokeEaseStep(e, (float)into / n, (float)(into + 1) / n);
-    smp.dx = std::clamp((wantAz - m.StrokeAz()) * share / t.aimGainX, -16.0f,
-                        16.0f);
-    smp.dy = std::clamp(-(wantEl - m.StrokeEl()) * share / t.aimGainY, -16.0f,
-                        16.0f);
-    smp.dReach = std::clamp((wantR - m.StrokeRadius()) * share /
-                                std::max(t.reachGain, 1e-4f),
-                            -18.0f, 18.0f);
-    m.Step(smp, dt, true, right, up, fwd);
-  };
 
   switch (cur.phase) {
     case StrokeCursor::Phase::Guard: {
-      // ABSOLUTE, not aim-relative: a guard is a pose, not a blow.
-      // `wantReach` is a BAND POSITION (0 = as drawn back as this arm goes,
-      // 1 = fully extended), resolved against the live arm so the same guard
-      // is the same guard on any rig.
+      // GUARD is a pose held indefinitely (strokes.h), driven closed-loop at
+      // a capped rate because it has no duration to arrive in.
+      const MeleeTuning& t = m.tuning;
       float lo = 0, hi = 0;
       m.ReachBand(lo, hi);
-      steerTo(cur.wantAz, cur.wantEl,
-              std::clamp(lo + cur.wantReach * (hi - lo), lo, hi));
+      const float wantR = std::clamp(lo + cur.wantReach * (hi - lo), lo, hi);
+      smp.dx = std::clamp((cur.wantAz - m.StrokeAz()) / t.aimGainX, -16.0f, 16.0f);
+      smp.dy = std::clamp(-(cur.wantEl - m.StrokeEl()) / t.aimGainY, -16.0f, 16.0f);
+      smp.dReach = std::clamp(
+          (wantR - m.StrokeRadius()) / std::max(t.reachGain, 1e-4f), -18.0f, 18.0f);
+      m.Step(smp, dt, true, right, up, fwd);
       break;
     }
-    case StrokeCursor::Phase::Windup: {
-      if (sty == nullptr) break;
-      // THE WINDUP IS MEASURED FROM THE TARGET (strokes.h "THE STROKE
-      // FRAME"): 0/0 points straight at them. Centring the cut on the target
-      // is in the authored numbers (`windup = -CutAimOffset`), not added here.
-      cur.wantAz = liveAz + sty->windup.az + bowAz;
-      cur.wantEl = liveEl + sty->windup.el + bowEl;
-      // AGAINST A NEUTRAL EXTENSION, not against the live radius. Computing
-      // this as `StrokeRadius() + offset` every windup tick is a RUNAWAY: each
-      // tick re-targets a further offset from wherever the last one landed, so
-      // a thrust's rear chamber walked the point straight into the bottom of
-      // the arm's reach band and stayed there — measured, the cut that
-      // followed then extended 1.07 voxels instead of nine and spent its
-      // travel flailing 1.13 rad of elevation instead. `kNeutralReach` is what
-      // an arm sits at when it is neither chambered nor extended, so an
-      // authored `reach` of 0 is "wherever a guard holds it" and the offsets
-      // are readable as what they are.
-      cur.wantReach = toTarget(StrokeReachIn(m, sty->windup.reach));
-      if (sty->windup.paced)
-        steerPaced(cur.wantAz, cur.wantEl, cur.wantReach, sty->windup.ease,
-                   cur.phaseTick, cur.windupTicks);
-      else
-        steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
-      if (++cur.phaseTick >= cur.windupTicks) {
-        // ---- COMMIT. The aim is frozen HERE and never refreshed: a target
-        // that steps offline after this instant is missed, which is what makes
-        // the windup a real telegraph rather than decoration.
+    case StrokeCursor::Phase::Windup:
+    case StrokeCursor::Phase::Cut:
+    case StrokeCursor::Phase::Recover: {
+      // ---- THE RELEASE: the arm is handed back ---------------------------
+      if (cur.releasing) {
+        smp.held = false;
+        m.Step(smp, dt, true, right, up, fwd);
+        cur.phaseTick++;
+        if (--cur.releaseLeft <= 0) return StrokeStepResult::Finished;
+        break;
+      }
+      if (sty == nullptr || sty->frames.empty() || cur.frame >= cur.frames) {
+        cur.StartRelease(sty != nullptr ? sty->release : 1);
+        break;
+      }
+      const int k = cur.frame;
+      const StrokeFrame& f = sty->frames[k];
+      // THE AIM IS FROZEN when the first cutting frame begins (normally at the
+      // end of the windup, below); a style that opens with a cut commits here.
+      if (!cur.aimed && cur.firstCut >= 0 && k >= cur.firstCut) {
         cur.aimAz = liveAz;
         cur.aimEl = liveEl;
         cur.aimed = true;
-        cur.phase = StrokeCursor::Phase::Cut;
-        cur.phaseTick = 0;
       }
-      break;
-    }
-    case StrokeCursor::Phase::Cut: {
-      if (sty == nullptr) break;
-      // WHICH LEG OF THE PATH (strokes.h "A CUT IS A PATH"). `phaseTick`
-      // counts the WHOLE cut — every reader outside this file measures it
-      // against `cutTicks` — so the leg is found by walking the resolved tick
-      // table, six additions at worst. Deriving it instead of latching it is
-      // what makes the phase re-entrant: a caller that steps a cursor twice in
-      // one tick (a zero-tempo lunge does) lands on the same leg both times.
-      int leg = 0, legEnd = cur.legTicks[0];
-      while (leg + 1 < cur.cutLegs && cur.phaseTick >= legEnd) {
-        leg++;
-        legEnd += cur.legTicks[leg];
+      float toAz = f.az, toEl = f.el;
+      float toR = StrokeReachIn(m, f.reach);
+      if (!f.fromBody) {
+        const bool preCut = cur.firstCut < 0 || k < cur.firstCut;
+        toAz += (cur.aimed ? cur.aimAz : liveAz) + (preCut ? bowAz : 0.0f);
+        toEl += (cur.aimed ? cur.aimEl : liveEl) + (preCut ? bowEl : 0.0f);
+        toR = toTarget(toR);
       }
-      cur.cutLeg = leg;
-      // FROM WHERE THE BLADE ACTUALLY IS, THROUGH THE AIM, TO THE END OF THIS
-      // LEG. Derived per tick from the live stroke state rather than baked at
-      // commit, so a windup that could not quite reach its pose (a clamped
-      // shoulder, a short arm) still produces a cut through the target instead
-      // of one displaced by however much the arm fell short — and so a leg
-      // that ran out of ticks short of its corner does not displace the legs
-      // after it either, because each one's target is an ABSOLUTE point on the
-      // path (`aim - offset + travel through this leg`) and not a delta from
-      // wherever the last one actually got to.
-      // The path starts at the WINDUP POSE (without its start bow, which is a
-      // per-swing wobble on where the telegraph lands, not on the blow).
-      const StrokeSegment through = sty->CutThrough(leg);
-      const float toAz = cur.aimAz + sty->windup.az + through.az;
-      const float toEl = cur.aimEl + sty->windup.el + through.el;
-      const float toR =
-          toTarget(StrokeReachIn(m, sty->windup.reach + through.reach));
-      // HOW MUCH OF THE REMAINING GAP THIS TICK SPENDS (strokes.h, above
-      // AttackStyle).
-      //
-      // The tick counts are per LEG, not per cut: that is what sets a leg's
-      // SPEED, so a short leg is a fast one, and it is the whole of how a path
-      // varies its tempo. WITHIN the leg, the split is the share the style's
-      // own ease curve advances over this tick.
-      //
-      // LINEAR KEEPS THE LITERAL OLD EXPRESSION rather than going through
-      // StrokeEaseStep, which returns exactly `1 / left` for it. The two agree
-      // algebraically and NOT to the last bit — one divides the gap once, the
-      // other multiplies it by a quotient of two divisions — and every style
-      // in the game is linear, so routing the default through the general form
-      // would move the world hash for nothing but float rounding.
+      cur.wantAz = toAz;
+      cur.wantEl = toEl;
+      cur.wantReach = toR;
+      // HOW MUCH OF THE REMAINING GAP THIS TICK SPENDS. Linear keeps the
+      // literal gap/ticks-left form the cut has always used; a curve spends
+      // its share. Either way the frame ARRIVES on its last tick.
       const MeleeTuning& t = m.tuning;
       const float rg = std::max(t.reachGain, 1e-4f);
-      // THE LEG'S OWN EASE when it states one, else the style's.
-      const Ease legEase = sty->LegEase(leg);
-      if (legEase == Ease::Linear) {
-        const int left = std::max(1, legEnd - cur.phaseTick);
-        smp.dx = ((toAz - m.StrokeAz()) / (float)left) / t.aimGainX;
-        smp.dy = -((toEl - m.StrokeEl()) / (float)left) / t.aimGainY;
-        smp.dReach = ((toR - m.StrokeRadius()) / (float)left) / rg;
+      const int len = std::max(1, cur.frameTicks[k]);
+      const int into = cur.frameTick;
+      if (f.chase) {
+        // CHASE: close on the pose at a capped rate (the frame's own).
+        const float cap = f.chaseRate, capR = f.chaseRate * (18.0f / 16.0f);
+        smp.dx = std::clamp((toAz - m.StrokeAz()) / t.aimGainX, -cap, cap);
+        smp.dy = std::clamp(-(toEl - m.StrokeEl()) / t.aimGainY, -cap, cap);
+        smp.dReach = std::clamp((toR - m.StrokeRadius()) / rg, -capR, capR);
+      } else if (f.ease == Ease::Linear) {
+        const float left = (float)std::max(1, len - into);
+        smp.dx = ((toAz - m.StrokeAz()) / left) / t.aimGainX;
+        smp.dy = -((toEl - m.StrokeEl()) / left) / t.aimGainY;
+        smp.dReach = ((toR - m.StrokeRadius()) / left) / rg;
       } else {
-        const int legLen = std::max(1, cur.legTicks[leg]);
-        const int intoLeg = std::max(0, cur.phaseTick - (legEnd - legLen));
-        const float share =
-            StrokeEaseStep(legEase, (float)intoLeg / (float)legLen,
-                           (float)(intoLeg + 1) / (float)legLen);
+        const float share = StrokeEaseStep(f.ease, (float)into / (float)len,
+                                           (float)(into + 1) / (float)len);
         smp.dx = ((toAz - m.StrokeAz()) * share) / t.aimGainX;
         smp.dy = -((toEl - m.StrokeEl()) * share) / t.aimGainY;
         smp.dReach = ((toR - m.StrokeRadius()) * share) / rg;
       }
       m.Step(smp, dt, true, right, up, fwd);
-      if (++cur.phaseTick >= cur.cutTicks) {
-        cur.phase = StrokeCursor::Phase::Recover;
-        cur.phaseTick = 0;
+      if (cur.phase == StrokeCursor::Phase::Cut) cur.cutLeg = k - cur.firstCut;
+      cur.phaseTick++;
+      if (++cur.frameTick >= len) {
+        // COMMIT at the end of the last windup frame, on that tick's aim.
+        if (k + 1 == cur.firstCut) {
+          cur.aimAz = liveAz;
+          cur.aimEl = liveEl;
+          cur.aimed = true;
+        }
+        cur.frame++;
+        cur.frameTick = 0;
+        StrokeCursor::Phase next;
+        if (cur.frame >= cur.frames) {
+          cur.releasing = true;
+          cur.releaseLeft = std::max(1, sty->release);
+          next = StrokeCursor::Phase::Recover;
+        } else {
+          next = PhaseOfFrame(cur, cur.frame);
+        }
+        if (next != cur.phase) {
+          cur.phase = next;
+          cur.phaseTick = 0;
+        }
       }
-      break;
-    }
-    case StrokeCursor::Phase::Recover: {
-      // ---- THE RETURN, IN TWO PARTS (strokes.h StrokeRecover) -------------
-      //
-      // SETTLE: the button is still DOWN and the arm is steered — closed-loop,
-      // under commitSpeed, the windup's own drive — from wherever the cut left
-      // it to the style's ABSOLUTE return stance. PoseWeight stays at 1 for
-      // every one of these ticks, so what the rig sees is an arm travelling a
-      // path an arm can travel, not a weight fading on a frozen pose.
-      //
-      // The pose is absolute for the reason the header states: a recover is a
-      // return to stance and not a second aim. `cur.wantAz`/`wantEl`/
-      // `wantReach` are written the same way the other two phases write them,
-      // so the tuner's readout and the gates report the return target in the
-      // same three fields they already read.
-      //
-      // Then RELEASE: exactly the old four lines. The driver clears
-      // `recoverHold_` and restarts its own clock at the release
-      // (melee.cpp:2430), so the fade is a full one measured from HERE rather
-      // than whatever was left of one that began back in the cut.
-      if (sty != nullptr && cur.phaseTick < cur.settleTicks) {
-        cur.wantAz = sty->recover.az;
-        cur.wantEl = sty->recover.el;
-        cur.wantReach = StrokeReachIn(m, sty->recover.reach);
-        if (sty->recover.paced)
-          steerPaced(cur.wantAz, cur.wantEl, cur.wantReach, sty->recover.ease,
-                     cur.phaseTick, cur.settleTicks);
-        else
-          steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
-      } else {
-        smp.held = false;
-        m.Step(smp, dt, true, right, up, fwd);
-      }
-      if (++cur.phaseTick >= cur.recoverTicks) return StrokeStepResult::Finished;
       break;
     }
     default:

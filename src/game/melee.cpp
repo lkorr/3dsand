@@ -597,6 +597,38 @@ Vec3 AnyPerp(const Vec3& d) {
   const Vec3 p = alt - d * d.dot(alt);
   return p.len() > 1e-5f ? p.normalized() : Vec3{1, 0, 0};
 }
+// THE REFERENCE AN ANGLE ABOUT AN ARM AXIS IS MEASURED FROM (2026-09-25):
+// `down` and `side` perpendicular to `axis`, for the elbow swivel (axis =
+// shoulder-to-hand) and the lean angle (axis = shoulder-to-tip). 0 = down,
+// + toward the weapon side.
+//
+// It used to be straight down PROJECTED across the axis, which is undefined
+// when the axis is vertical: the arm hanging at rest, the tip overhead, the
+// hand dropped low after a cut. There a hand drifting 0.2 voxels spun the
+// reference, so a held elbow angle turned the real elbow 56 degrees in one
+// tick with the hand standing still. No field of directions on a sphere can
+// be smooth everywhere, so this one is made smooth everywhere an arm can
+// POINT: it is "down" carried from B -- behind the body and across it, where
+// no arm reaches -- to the axis by the shortest rotation, and its one bad
+// point is B. For a LEVEL axis the rotation is about vertical and "down" is
+// exactly the old down, so every level pose means what it meant.
+void AxisFrame(const Vec3& axis, float handSign, Vec3& down, Vec3& side) {
+  const float k = 0.70710678f;
+  const Vec3 b{handSign >= 0.0f ? -k : k, 0.0f, -k};
+  const Vec3 d0{0.0f, -1.0f, 0.0f};
+  const float c = b.dot(axis);
+  if (c > -0.9999f) {
+    // Rodrigues for the rotation taking b to axis, w = b x axis.
+    const Vec3 w = b.cross(axis);
+    down = d0 * c + w.cross(d0) + w * (w.dot(d0) / (1.0f + c));
+  } else {
+    down = d0;
+  }
+  down = down - axis * axis.dot(down);
+  down = down.len() > 1e-6f ? down.normalized() : AnyPerp(axis);
+  side = axis.cross(down) * (handSign >= 0.0f ? 1.0f : -1.0f);
+}
+
 
 // ---- THE BODY ANSWERS, AND WHO IS DRIVING IT DECIDES HOW (2026-09-20) -------
 //
@@ -944,12 +976,23 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // Sample along the blade AND across the sweep, so a fast cut does not tunnel
   // between ticks. Both counts are bounded and scale with how far the blade
   // actually moved (CLAUDE.md rule 2): a stationary blade costs one probe, and
-  // no swing can cost more than kMaxSteps * kMaxAlong however fast it is
+  // no swing can cost more than sweepMaxSteps * kMaxAlong however fast it is
   // flicked.
+  //
+  // THE ROWS ARE SPACED BY `sweepSpacing`, NOT BY THE BLADE'S RADIUS, and the
+  // cap is a tuning knob rather than 6 (2026-09-26). Each probe is a LINE down
+  // the blade, so the gap between two rows is a slot anything thinner than it
+  // passes through untouched. Under the old hard cap of 6 a tip at the 20 m/s
+  // full-damage speed (6.7 voxels a tick at 30 Hz) left 1.1-voxel slots, and a
+  // 40 m/s flick 2.2 — wider than a human forearm or neck, so the hardest
+  // swings were the likeliest to pass clean through a limb. The tick rate is
+  // not the problem: the quad already covers the whole tick, it just has to be
+  // filled densely enough.
   const float sweepLen = travel.len();
-  const int kMaxSteps = 6, kMaxAlong = 5;
+  const int kMaxAlong = 5;
   const int steps = std::clamp(
-      (int)std::ceil(sweepLen / std::max(radius, 0.5f)), 1, kMaxSteps);
+      (int)std::ceil(sweepLen / std::max(t.sweepSpacing, 0.05f)), 1,
+      std::max(t.sweepMaxSteps, 1));
   const int along = std::clamp(
       (int)std::ceil((s.bNow - s.aNow).len() / std::max(radius, 0.5f)), 1,
       kMaxAlong);
@@ -1050,7 +1093,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       //
       // The ignore-list cast is the fix and it is the one physics.h added this
       // overload for. One list per sweep, not per probe -- a rig is a dozen
-      // bodies and this loop runs up to thirty times.
+      // bodies and this loop runs up to sweepMaxSteps * kMaxAlong times.
       float frac = 1.0f;
       uint64_t hb = phys.CastRayBody(p, dir, probe, frac, selfBodies);
       out.probesCast++;
@@ -1434,6 +1477,8 @@ void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
   dst.elbowPoleCone = m.elbowPoleCone;
   dst.elbowAxisCone = m.elbowAxisCone;
   dst.edgeFloor = m.edgeFloor;
+  dst.sweepSpacing = MetresToCells(m.sweepSpacingM);     // m -> voxels
+  dst.sweepMaxSteps = m.sweepMaxSteps;
   dst.blockGap = MetresToCells(m.blockGapM);             // m -> voxels
   dst.blockItemDamage = m.blockItemDamage;
   dst.blockNudgeAz = m.blockNudgeAz;
@@ -1517,13 +1562,21 @@ float MeleeState::PoseWeight() const {
       // RecoverTime(), not tuning.recoverTime: an authored stroke may own its
       // own hand-back clock (melee.h SetRecoverTime, strokes.h
       // StrokeRecover::fade). Unset, this IS tuning.recoverTime.
-      const float rt = RecoverTime();
-      float t = rt > 1e-4f ? phaseTime_ / rt : 1.0f;
-      return std::clamp(1.0f - t, 0.0f, 1.0f);
+      // EASED (WeaponPose::release): the torso untwists on the same curve the
+      // arm's joints turn home on, starting and ending at rest.
+      return 1.0f - ReleaseProgress();
     }
     default:
       return 1.0f;
   }
+}
+
+float MeleeState::ReleaseProgress() const {
+  if (phase_ != SwingPhase::Recover || recoverHold_) return -1.0f;
+  const float rt = RecoverTime();
+  const float t = std::clamp(rt > 1e-4f ? phaseTime_ / rt : 1.0f, 0.0f, 1.0f);
+  // smoothstep: no velocity step at either end of the hand-back.
+  return t * t * (3.0f - 2.0f * t);
 }
 
 WeaponPose MeleeState::Pose() const {
@@ -1538,6 +1591,7 @@ WeaponPose MeleeState::Pose() const {
   p.bladeFlat = wristFlat_;
   p.bendPole = bendPole_;
   p.weight = PoseWeight();
+  p.release = ReleaseProgress();
   p.wristMaxAngle = tuning.wristMaxAngle;
   // THE THROTTLE, not the ceiling. Computed here rather than in the rig
   // because the phase and the tip speed are the driver's own state, and the
@@ -1557,10 +1611,13 @@ WeaponPose MeleeState::Pose() const {
   // tuning fractions are the taste. Pitch clamps tighter downward — the arm
   // legitimately hangs at -1.5 rad in a low guard, and a chest that followed
   // it there would read as a bow, not a stance.
-  p.torsoTwist =
-      std::clamp(azLive_ * tuning.torsoShare, -0.5f, 0.5f) * p.weight;
-  p.torsoPitch =
-      std::clamp(elLive_ * tuning.torsoPitch, -0.22f, 0.35f) * p.weight;
+  // A program frame may state its own shares (SetProgramDrive); < 0 = tuning.
+  const float twistShare =
+      torsoTwistShare_ >= 0.0f ? torsoTwistShare_ : tuning.torsoShare;
+  const float pitchShare =
+      torsoPitchShare_ >= 0.0f ? torsoPitchShare_ : tuning.torsoPitch;
+  p.torsoTwist = std::clamp(azLive_ * twistShare, -0.5f, 0.5f) * p.weight;
+  p.torsoPitch = std::clamp(elLive_ * pitchShare, -0.22f, 0.35f) * p.weight;
   return p;
 }
 
@@ -1586,6 +1643,22 @@ void MeleeState::Nudge(float dAz, float dEl) {
   el_ = std::clamp(el_ + dEl, tuning.elMin, tuning.elMax);
 }
 
+void MeleeState::MeasureShapeNow(const Vec3& tipL, const Vec3& handL) {
+  // The same down / side reference RebuildFrame measures each angle against.
+  const auto downSide = [&](const Vec3& axis, Vec3& down, Vec3& side) {
+    AxisFrame(axis, handSign_, down, side);
+  };
+  const Vec3 rad = tipL.len() > 1e-5f ? tipL.normalized() : Vec3{0, 0, 1};
+  bladeAngleNow_ = std::acos(std::clamp(bladeDirL_.dot(rad), -1.0f, 1.0f));
+  Vec3 down, side;
+  downSide(rad, down, side);
+  const Vec3 handSide = perpL_ * (tuning.handLead >= 0.0f ? 1.0f : -1.0f);
+  leanAngleNow_ = std::atan2(handSide.dot(side), handSide.dot(down));
+  const Vec3 handDir = handL.len() > 1e-4f ? handL.normalized() : Vec3{0, 0, 1};
+  downSide(handDir, down, side);
+  elbowSwivelNow_ = std::atan2(poleL_.dot(side), poleL_.dot(down));
+}
+
 void MeleeState::Reset() {
   phase_ = SwingPhase::Idle;
   phaseTime_ = 0;
@@ -1606,6 +1679,7 @@ void MeleeState::Reset() {
   // is belt and braces for the callers that Reset() and then do not run a
   // program at all.
   recoverOverride_ = 0.0f;
+  torsoTwistShare_ = torsoPitchShare_ = -1.0f;
 }
 
 // ---- the derived half -------------------------------------------------------
@@ -1760,6 +1834,13 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
         -1.0f, 1.0f);
     leanSin = std::sqrt(std::max(0.0f, 1.0f - leanCos * leanCos));
   }
+  // A PROGRAM FRAME'S BLADE ANGLE replaces the solve outright (melee.h
+  // ProgramDrive::bladeAngle): the hand goes wherever tip-minus-that-blade is.
+  if (programDrive_ && drive_.bladeAngle >= 0.0f && bladeLen_ > 1e-4f) {
+    leanCos = std::cos(drive_.bladeAngle);
+    leanSin = std::sin(drive_.bladeAngle);
+  }
+  bladeAngleNow_ = std::acos(std::clamp(leanCos, -1.0f, 1.0f));
 
   // WHICH WAY THE LEAN GOES: with the travel (so the hand leads the point), or
   // against it. Rotated toward the target ABOUT THE RADIUS at a bounded rate,
@@ -1813,12 +1894,42 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
     // Small, honest tracking is untouched, which is why this costs neither
     // gate what the rate bound did.
     if (std::fabs(turn) > std::max(tuning.leanFlipHold, 0.0f)) turn = 0.0f;
+    // ...and a program frame says which side outright (melee.h
+    // SetProgramDrive): HOLD never re-leans; LEFT/RIGHT turn toward that
+    // side of the tip, reversal or not.
+    if (programDrive_ && drive_.lean == 1) turn = 0.0f;
+    if (programDrive_ && (drive_.lean == 2 || drive_.lean == 3)) {
+      // Basis +x is the wielder's right (melee.h: azimuth toward `right`).
+      Vec3 side{drive_.lean == 3 ? 1.0f : -1.0f, 0.0f, 0.0f};
+      side = side - radial * radial.dot(side);
+      if (side.len() > 1e-4f) {
+        side = side.normalized();
+        const float c2 = std::clamp(cur.dot(side), -1.0f, 1.0f);
+        const float s2 = cur.cross(side).dot(radial) < 0.0f ? -1.0f : 1.0f;
+        turn = std::acos(c2) * s2;
+      }
+    }
     const float maxTurn = std::max(tuning.leanTurnRate, 0.0f) * dt;
     turn = std::clamp(turn, -maxTurn, maxTurn);
     // Rodrigues about the radius; `cur` is already perpendicular to it, so the
     // axial term drops out.
     perpL_ = cur * std::cos(turn) + radial.cross(cur) * std::sin(turn);
     perpL_ = perpL_.len() > 1e-5f ? perpL_.normalized() : cur;
+  }
+  // ---- THE LEAN AS AN ANGLE, measured and as a frame may state it ---------
+  // (melee.h ProgramDrive::leanAngle). The HAND sits on +perpL_ * handLead's
+  // sign; the angle is that side's direction about the radius, 0 = below.
+  {
+    Vec3 down, side;
+    AxisFrame(radial, handSign_, down, side);
+    const float hs = tuning.handLead >= 0.0f ? 1.0f : -1.0f;
+    if (programDrive_ && drive_.lean == 4) {
+      const Vec3 handSide =
+          down * std::cos(drive_.leanAngle) + side * std::sin(drive_.leanAngle);
+      perpL_ = handSide * hs;
+    }
+    const Vec3 handSide = perpL_ * hs;
+    leanAngleNow_ = std::atan2(handSide.dot(side), handSide.dot(down));
   }
 
   Vec3 wantDir = radial;
@@ -2194,6 +2305,18 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
         poleL_ = poleL_.len() > 1e-5f ? poleL_.normalized() : AnyPerp(handDir);
       }
     }
+    // ---- THE ELBOW DIRECTION, as measured and as a frame may state it ------
+    // 0 = down, + toward the weapon side (melee.h ProgramDrive::elbowSwivel).
+    // The reference is AxisFrame's: down, carried to the arm from the one
+    // direction it cannot point, so it has no bad point an arm can reach.
+    Vec3 down, side;
+    AxisFrame(handDir, handSign_, down, side);
+    if (programDrive_ && drive_.elbowSet) {
+      const float sw = drive_.elbowSwivel;
+      poleL_ = down * std::cos(sw) + side * std::sin(sw);
+      poleL_ = poleL_.len() > 1e-5f ? poleL_.normalized() : AnyPerp(handDir);
+    }
+    elbowSwivelNow_ = std::atan2(poleL_.dot(side), poleL_.dot(down));
   }
 
   // ---- HOW COMMITTED THIS IS, AND THEREFORE HOW MUCH WRIST TO SPEND -------
@@ -2230,7 +2353,8 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
     // otherwise rides the grip — blade up out of the fist, which is the
     // "generally point upwards" a held sword should do. A fast authored cut
     // is fast, so it earns full alignment the same way.
-    float want = 1.0f;
+    float want = programDrive_ ? std::clamp(drive_.wristAlign, 0.0f, 1.0f)
+                               : 1.0f;
     if (!programDrive_) {
       const float floorF = std::clamp(tuning.steerFloor, 0.0f, 1.0f);
       const float lo = std::max(tuning.steerSpeedLo, 0.0f);
@@ -2376,6 +2500,7 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
           }
         }
         poleL_ = Vec3{0, 0, -1};
+        MeasureShapeNow(tipL, handL);
         // The wrist's eased frame seeds to the blade's real one for the same
         // reason everything else here does: the first driven tick must ask
         // for the pose the arm is already in.

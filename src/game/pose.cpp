@@ -743,6 +743,7 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // `ikMiss 0.00` and the clamp discards the off-plane component; that is why
   // RecordWeaponClamp sits on the same line.
   AnimClampPoseLimits(sk, st, &weaponHinge, 1);
+  ReapplyKeyedArm(sk, st);
   RecordWeaponClamp(sk, st);
 
   // ---- flipbooks: integer frame index from elapsed ms ----

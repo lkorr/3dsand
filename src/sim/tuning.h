@@ -1993,6 +1993,11 @@ struct Tuning {
     float elbowAxisCone = TPD(melee, elbowAxisCone);
     // damage floor for a flat-on slap
     float edgeFloor = TPD(melee, edgeFloor);
+    // widest gap between the sweep's rows of probe rays, metres; thinner
+    //   things can pass between them (game/melee.cpp MeleeSweepDamage)
+    float sweepSpacingM = TPD(melee, sweepSpacingM);
+    // most rows one tick's sweep may cast (cost bound: x5 rays each)
+    int sweepMaxSteps = TPD(melee, sweepMaxSteps);
     // ---- BLADE ON BLADE (game/melee.h MeleeSweepDamage's parry block) -------
     // The four knobs a parry has. They are `melee.*` rather than `combatfx.*`
     // because a block is MECHANICS — it stops a cut, it costs the blocking

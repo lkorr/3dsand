@@ -73,7 +73,16 @@ let loading = false;
 
 // ---- panel state --------------------------------------------------------
 let selected = -1;          // index into lib.styles
-let aim = { az: 0, el: 0 }; // the target's bearing about the shoulder, radians
+// THE TARGET, as the character sees it: `az`/`el` are its bearing from the
+// EYES (0/0 = straight ahead of the face, where a player's crosshair is) and
+// `dist` how far off it is, world voxels. rig.js turns that into a POINT and
+// the program gets the point's bearing and distance about the shoulder
+// (strokes.cpp StrokeAimAt), exactly as the engine aims at a real target. It
+// used to be the bearing about the shoulder itself, so 0/0 was a target
+// straight out from the RIGHT shoulder rather than in front of the character.
+let aim = { az: 0, el: 0, dist: 6 };
+// Draw the target orb (rig.js drawAimOrb).
+let orbOn = true;
 let loop = true;
 let swingNo = 0;
 let trailOn = true;
@@ -88,7 +97,7 @@ let trailOn = true;
 // deliberately, and this chip puts the old behaviour back for watching the
 // spread.
 let vary = false;
-let weaponMode = 'long'; // 'unarmed' | 'dagger' | 'long'
+let weaponMode = 'long'; // 'unarmed' | 'short' | 'long' | 'blunt'
 let flick = { x: 1, y: 0 }; // the compass pad's test flick
 const folds = { limbs: false, compass: false, help: false };
 // SOLO: which segment the preview isolates — 'all' runs the program as the
@@ -103,6 +112,11 @@ let solo = 'all';
 // exclusive — the arm is either being driven or being posed, and showing both
 // at once would mean neither number on screen was the one in the file.
 let goalKey = null;
+// MANUAL ADJUSTMENT MODE: with a frame held (goalKey), drag handles on the rig
+// (rig.js drawPoseHandles) and the frame's numbers follow. `manualBefore` is
+// the document as it was when the current drag began, for its single undo.
+let manual = false;
+let manualBefore = null;
 // The shared clip library (assets/anims/*.json), for the program card's clip
 // picker. null until fetched; [] when the server has none.
 let libClips = null;
@@ -113,24 +127,6 @@ const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const DEG = 180 / Math.PI;
 const TICK_MS = 1000 / 30;   // the sim's own rate; `ticks` in the JSON are these
 const fmt = (v, n = 2) => (Number.isFinite(v) ? v.toFixed(n) : '—');
-// THE RAW CUT, ALWAYS AS A LIST (strokes.h "A CUT IS A PATH"). The file keeps
-// both spellings — one leg is the bare object every shipped style is written
-// as, several are a list — and every reader here wants the list. The objects
-// are the RAW ones, so editing a field of one edits the document in place,
-// which is what the whole panel relies on.
-const cutLegs = (r) => {
-  if (Array.isArray(r.cut)) {
-    const legs = r.cut.filter(l => l && typeof l === 'object');
-    if (legs.length) return legs;
-  } else if (r.cut && typeof r.cut === 'object') {
-    return [r.cut];
-  }
-  r.cut = { ticks: 8, az: 0, el: 0, reach: 0 };
-  return [r.cut];
-};
-// Which leg carries the target, or -1 for "the midpoint of the whole travel".
-const aimLegOf = (r) => cutLegs(r).findIndex(l => l.aim === true);
-
 /* ==========================================================================
    the seam rig.js binds
    ========================================================================== */
@@ -141,9 +137,33 @@ export function bind(h) {
   toast = h.toast || (() => {});
 }
 
-export const library = () => lib;
+// SLOW x10: the preview's view of the library with every frame's ticks and
+// the release multiplied, so a swing plays ten times longer AND stays smooth
+// (a keyed frame is a slerp on t, so more ticks is the same path in finer
+// steps). Only the rig's preview reads through here; the panels, the saved
+// file and the game never see it. A `chase` frame arrives on its per-tick
+// rate, so it is NOT stretched the same way -- keyed frames are exact.
+const SLOW_FACTOR = 10;
+let slow = false;
+let slowSrc = null, slowLib = null;
+export const slowMotion = () => slow;
+export const library = () => {
+  if (!slow || !lib) return lib;
+  if (slowSrc !== lib) {
+    slowSrc = lib;
+    slowLib = { ...lib, styles: lib.styles.map(s => ({
+      ...s,
+      frames: s.frames.map(f => ({ ...f, ticks: f.ticks * SLOW_FACTOR })),
+      release: Math.max(1, s.release) * SLOW_FACTOR,
+    })) };
+  }
+  return slowLib;
+};
+// The document itself, for the bake harness (assets/_bake_poses.html).
+export const rawDoc = () => raw;
 export const styleIndex = () => selected;
 export const currentAim = () => aim;
+export const aimOrbEnabled = () => orbOn;
 export const looping = () => loop;
 export const trailEnabled = () => trailOn;
 export const swingNumber = () => swingNo;
@@ -155,7 +175,217 @@ export const soloSegment = () => solo;
 // (which poses the arm on it instead of stepping the program) and by
 // previewActive (a held frame has nothing live on it).
 export const goalFrame = () => goalKey;
+export const manualMode = () => manual && !!goalKey;
+/** A drag begins: remember the document for one undo entry. */
+export function manualBegin() { manualBefore = raw ? snap(raw) : null; }
+/**
+ * Mutate the HELD frame's raw object (created in this style's frame list if
+ * needed) and re-derive the library WITHOUT re-rendering the panel — this runs
+ * on every pointermove of a drag.
+ */
+export function manualEdit(fn) {
+  if (!raw || !lib || !goalKey) return;
+  const sty = lib.styles[selected];
+  const k = +goalKey.slice(1);
+  if (!sty || !(k >= 0)) return;
+  const d = framesDoc(sty, true);
+  if (!d[k]) return;
+  fn(d[k], sty.frames[k]);
+  dirty = true;
+  lib = MELEE.parseStyleLibrary(raw);
+  host?.onStylesChanged?.();
+}
+/** A drag ends: one undo entry for the whole drag, then repaint the panel. */
+export function manualEnd(label) {
+  if (!raw) return;
+  const before = manualBefore, after = snap(raw);
+  manualBefore = null;
+  if (before && JSON.stringify(before) !== JSON.stringify(after)) {
+    const apply = s => { pourInto(raw, s); afterEdit('styles'); };
+    host?.pushUndo?.(label || 'manual pose', () => apply(before), () => apply(after));
+  }
+  render();
+}
 export function nextSwing() { swingNo = (swingNo + 1) >>> 0; }
+
+/* ==========================================================================
+   BAKING A STYLE INTO POSES (melee.js "A FRAME IS A POSE")
+
+   A style still spelled as tip targets is turned into pose frames by holding
+   each of its frames the old way — the stroke driver run to the end of that
+   frame, exactly what "show" displayed — and reading the arm the rig drew
+   (rig.js captureHeldPose). Every frame is captured BEFORE any is written,
+   because the old way reaches frame k by running frames 0..k-1 from their
+   targets, and a written frame no longer has one.
+
+   The jitter is zeroed while capturing: a pose is what was authored, not one
+   draw of it, and the keyed runner adds the bow back per swing. A `chase`
+   frame becomes quadInOut — chase has no meaning between two poses.
+   ========================================================================== */
+const DRIVER_KEYS = ['az', 'el', 'reach', 'lean', 'leanAngle', 'wrist', 'bladeAngle',
+                     'elbow', 'chaseRate', 'torsoTwist', 'torsoPitch'];
+
+/** Bake style `i` (every frame must still be a target). true if it wrote. */
+export function bakeStyle(i) {
+  const sty = lib && lib.styles[i];
+  // Never a `:player` copy: the style bar hides those, so frames baked into
+  // `player.frames` silently replaced every edit the author made to the base
+  // for the player's own swings (2026-09-26).
+  if (!sty || (sty.derived && !sty.form) || !sty.frames.length || sty.frames.some(f => f.pose)) return false;
+  const keep = { selected, goalKey, manual };
+  host?.stop?.();
+  selected = i;
+  manual = false;
+  const jitter = sty.jitter;
+  sty.jitter = { az: 0, el: 0, tempo: 0 };
+  // A CUT FRAME IS SPLIT AT ITS MIDDLE. Two poses slerp by the SHORTEST joint
+  // path between them, and the old driver's cut went round the front (it
+  // interpolated the tip's bearing); from its two ends alone a horizontal cut
+  // went over the top instead and missed. The middle key puts it in front.
+  const poses = [], mids = [];
+  try {
+    for (let k = 0; k < sty.frames.length; k++) {
+      const f = sty.frames[k];
+      goalKey = 'f' + k;
+      const p = host?.captureHeldPose?.(true);
+      if (!p) return false;
+      poses.push(p);
+      // The middle is built from the two ends (rig.js bakeMidPose), NOT
+      // sampled from the old driver halfway: its wrist was mid-spin there,
+      // and baking it baked the spin back in (83 degrees a tick, measured).
+      mids.push(f.cuts && f.ticks >= 4 && k > 0
+        ? host?.bakeMidPose?.(poses[k - 1], p) || null : null);
+    }
+  } finally {
+    sty.jitter = jitter;
+    ({ selected, goalKey, manual } = keep);
+  }
+  const d = framesDoc(sty, true);
+  const out = [];
+  poses.forEach((p, k) => {
+    const fr = d[k] || {};
+    for (const key of DRIVER_KEYS) delete fr[key];
+    if (fr.ease === 'chase') fr.ease = 'quadInOut';
+    if (mids[k]) {
+      const t = Math.max(1, Math.round(+fr.ticks || sty.frames[k].ticks));
+      const half = Math.floor(t / 2);
+      const a = { ...JSON.parse(JSON.stringify(fr)), name: (fr.name || 'cut') + ' a',
+                  ticks: half, pose: MELEE.poseToJson(mids[k]) };
+      const b = { ...fr, name: (fr.name || 'cut') + ' b', ticks: t - half,
+                  pose: MELEE.poseToJson(p) };
+      out.push(a, b);
+    } else {
+      fr.pose = MELEE.poseToJson(p);
+      out.push(fr);
+    }
+  });
+  d.length = 0;
+  d.push(...out.slice(0, MELEE.MAX_FRAMES));
+  lib = MELEE.parseStyleLibrary(raw);
+  dirty = true;
+  return true;
+}
+
+/* ==========================================================================
+   DERIVING A STYLE: MIRRORED AND/OR REVERSED (the generated diagonals)
+
+   `mirror` reflects every pose across the body's midline on the SAME arm
+   (rig.js mirrorPose): a forehand becomes a backhand. `reverse` runs the
+   stroke backwards: the windup goes to where the cut ENDED, the cut keys play
+   in reverse order (each segment keeps its own ticks and ease, so the pacing
+   is the original's played backwards) and ends where the windup was; the
+   recover frames are kept. Frame slots — names, `cuts`, `from`, ticks of the
+   windup and recover — stay where they were. Both apply to the default frames
+   and to every weapon form. Keyed styles only. A starting point to tweak, not
+   a finished stroke.
+   ========================================================================== */
+function reverseFrames(frames) {
+  const cutIdx = frames.map((f, k) => (f.cuts ? k : -1)).filter(k => k >= 0);
+  if (!cutIdx.length || cutIdx[0] === 0) return frames;
+  const first = cutIdx[0], last = cutIdx[cutIdx.length - 1];
+  const keys = frames.slice(first - 1, last + 1);          // windup end + cuts
+  const out = frames.map(f => JSON.parse(JSON.stringify(f)));
+  // One windup: everything before the last windup key folds into it.
+  const wind = out.slice(0, first);
+  const w = wind[wind.length - 1];
+  w.ticks = wind.reduce((a, f) => a + (+f.ticks || 0), 0);
+  w.pose = JSON.parse(JSON.stringify(keys[keys.length - 1].pose));
+  const m = keys.length - 1;
+  for (let j = 1; j <= m; j++) {
+    const f = out[first + j - 1];
+    const seg = keys[m - j + 1];                            // segment played backwards
+    f.pose = JSON.parse(JSON.stringify(keys[m - j].pose));
+    f.ticks = seg.ticks;
+    if (seg.ease) f.ease = seg.ease; else delete f.ease;
+  }
+  // The recover keeps its slot but not its pose: the original's settled
+  // where the ORIGINAL cut ended, which is now where this one began. Going
+  // all the way back there whipped the blade at 100+ degrees a tick, and
+  // holding the new end left the whole trip to the release (~100 too, both
+  // measured with scripts/trace_attacks.sh); halfway by bearing splits it.
+  const endPose = MELEE.readPose(keys[0].pose);
+  for (let k = last + 1; k < out.length; k++) {
+    if (!out[k].pose) continue;
+    const mid = host?.bakeMidPose?.(endPose, MELEE.readPose(out[k].pose));
+    out[k].pose = mid ? MELEE.poseToJson(mid) : JSON.parse(JSON.stringify(keys[0].pose));
+  }
+  return [w, ...out.slice(first)];
+}
+
+/**
+ * New style `name` from style `srcName`, inserted after it. opts: { mirror,
+ * reverse, label }. Returns true when it wrote.
+ */
+export function deriveStyle(srcName, name, opts = {}) {
+  if (!raw || !lib || lib.styles.some(s => s.name === name)) return false;
+  const src = raw.styles.find(s => s.name === srcName);
+  if (!src || !Array.isArray(src.frames) || !src.frames.every(f => f.pose)) return false;
+  const copy = snap(src);
+  copy.name = name;
+  if (opts.label) copy.label = opts.label;
+  const conv = (frames) => {
+    let fr = frames.map(f => JSON.parse(JSON.stringify(f)));
+    if (opts.mirror) {
+      for (const f of fr) {
+        const p = host?.mirrorPose?.(MELEE.readPose(f.pose));
+        if (!p) return null;
+        f.pose = MELEE.poseToJson(p);
+      }
+    }
+    if (opts.reverse) fr = reverseFrames(fr);
+    return fr;
+  };
+  const main = conv(copy.frames);
+  if (!main) return false;
+  copy.frames = main;
+  for (const form of Object.values(copy.forms || {})) {
+    if (!form || !Array.isArray(form.frames) || !form.frames.every(f => f.pose)) continue;
+    const fr = conv(form.frames);
+    if (fr) form.frames = fr;
+  }
+  editStyles('derive "' + name + '"', () => {
+    raw.styles.splice(raw.styles.findIndex(x => x.name === srcName) + 1, 0, copy);
+  });
+  return true;
+}
+
+/** Bake every style that can be (an aim effector, the jaws, cannot). */
+export function bakeAll() {
+  if (!lib) return [];
+  const done = [];
+  const before = raw ? snap(raw) : null;
+  for (let i = 0; i < lib.styles.length; i++) {
+    const name = lib.styles[i].name;
+    if (bakeStyle(i)) done.push(name);
+  }
+  if (before && done.length) {
+    const after = snap(raw);
+    const apply = s => { pourInto(raw, s); afterEdit('styles'); };
+    host?.pushUndo?.('bake poses', () => apply(before), () => apply(after));
+  }
+  afterEdit('styles');
+  return done;
+}
 
 async function refreshLibClips() {
   try {
@@ -178,7 +408,9 @@ async function refreshLibClips() {
  * line from the start; the style chips never did.
  */
 export async function selectStyle(i) {
-  if (!lib || i < 0 || i >= lib.styles.length || i === selected) return;
+  if (!lib || i < 0 || i >= lib.styles.length) return;
+  i = formIndex(i);
+  if (i === selected) return;
   selected = i;
   // Restart on the NEW style if something is swinging, so the viewport agrees
   // with the panel. Not `nextSwing()`: switching attacks is not asking for a
@@ -205,7 +437,8 @@ export async function load(force) {
     // (strokes.h "THE STROKE FRAME"), so the boxes show the new meaning —
     // windup measured from the target — and a save writes it. The swing is
     // unchanged; only the numbers that describe it move.
-    const migrated = MELEE.migrateRawToTargetFrame(raw);
+    const migrated = MELEE.migrateRawToTargetFrame(raw) |
+                     MELEE.migrateRawToFrames(raw);
     lib = MELEE.parseStyleLibrary(raw);
     err = '';
     dirty = migrated;
@@ -214,6 +447,7 @@ export async function load(force) {
             'at the target) — the swings are unchanged; save to keep it', false);
     await refreshLibClips();
     if (selected < 0 && lib.styles.length) selected = 0;
+    selected = formIndex(selected);
   } catch (e) {
     // file:// degradation, exactly as the item list and the audio tab do it.
     raw = null; lib = null;
@@ -401,19 +635,15 @@ export function render(container) {
   renderLoaderLog();
 }
 
-/* ---- weapon mode: unarmed / dagger / long ------------------------------ */
+/* ---- weapon mode: unarmed / short / long / blunt ----------------------- */
 
 function activeCompassMap() {
   if (!lib) return null;
-  if (weaponMode === 'unarmed') return lib.playerUnarmed;
-  if (weaponMode === 'dagger') return lib.playerDagger;
-  return lib.player;
+  return weaponMode === 'unarmed' ? lib.playerUnarmed : lib.player;
 }
 
 function activeCompassKey() {
-  if (weaponMode === 'unarmed') return 'playerUnarmed';
-  if (weaponMode === 'dagger') return 'playerDagger';
-  return 'player';
+  return weaponMode === 'unarmed' ? 'playerUnarmed' : 'player';
 }
 
 function activeCompassRaw() {
@@ -424,13 +654,31 @@ function activeCompassRaw() {
   return raw[key];
 }
 
+// The weapon FORMS (strokes.h WEAPON FORMS) plus the empty fist. Picking one
+// equips a weapon of that class in the preview and switches every held-weapon
+// style to that weapon's version of it (formIndex).
 const WEAPON_MODES = [
   { id: 'unarmed', label: 'Unarmed' },
-  { id: 'dagger',  label: 'Dagger' },
-  { id: 'long',    label: 'Sword / Mace' },
+  { id: 'short',   label: 'Short' },
+  { id: 'long',    label: 'Long' },
+  { id: 'blunt',   label: 'Blunt' },
 ];
 
-const WEAPON_FOR_MODE = { unarmed: null, dagger: 'dagger', long: 'sword' };
+const WEAPON_FOR_MODE = { unarmed: null, short: 'dagger', long: 'sword', blunt: 'mace' };
+
+// The style the panel edits for style index `i` under the current weapon:
+// that weapon's form of it for a held-weapon style, else the style itself.
+function formIndex(i) {
+  const s = lib && lib.styles[i];
+  if (!s) return i;
+  const b = s.form ? s.baseIndex : i;
+  const base = lib.styles[b];
+  if (!base || base.weapon !== 'held' || !MELEE.WEAPON_FORMS.includes(weaponMode)) return b;
+  const f = lib.styles.findIndex(x => x.name === base.name + '@' + weaponMode);
+  return f >= 0 ? f : b;
+}
+// ...and back: the authored style a form belongs to.
+const baseIndexOf = (i) => { const s = lib && lib.styles[i]; return s && s.form ? s.baseIndex : i; };
 
 function renderWeaponModeBar() {
   const bar = el('div', { class: 'tagbar', style: 'margin-bottom:2px' });
@@ -438,13 +686,15 @@ function renderWeaponModeBar() {
     bar.append(chip(m.label, weaponMode === m.id, async () => {
       if (weaponMode === m.id) return;
       weaponMode = m.id;
+      selected = formIndex(selected);
       const want = WEAPON_FOR_MODE[m.id];
       if (want) await host?.equipWeapon?.(want);
       else await host?.equipWeapon?.(null, true);
       render();
     }, m.id === 'unarmed' ? 'empty hands — punches'
-     : m.id === 'dagger'  ? 'short blade — dagger compass'
-     :                       'long weapons — sword, shortsword, mace, cleaver'));
+     : m.id === 'short'   ? 'short blades — dagger, shortsword (weaponClass "short")'
+     : m.id === 'long'    ? 'long blades — sword, cleaver (weaponClass "long")'
+     :                       'blunt — mace (weaponClass "blunt")'));
   wrap.append(bar);
 }
 
@@ -456,7 +706,7 @@ function renderStyleBar() {
   // style's `player` override block; the author edits the base.
   const authored = lib.styles.map((s, i) => [s, i]).filter(([s]) => !s.derived);
   for (const [s, i] of authored)
-    bar.append(chip(s.name, i === selected,
+    bar.append(chip(s.name, i === baseIndexOf(selected),
       () => selectStyle(i), s.label));
 
   bar.append(el('span', { class: 'spacer' }));
@@ -485,7 +735,7 @@ function addStyle() {
   if (lib.styles.some(s => s.name === n)) return toast('that id exists', true);
   // Seeded from a real style rather than from zeros: an all-zero program is a
   // stroke that never moves, which reads as "the editor is broken".
-  const base = lib.styles[selected] || lib.styles[0];
+  const base = lib.styles[baseIndexOf(selected)] || lib.styles[0];
   const seed = base ? snap(base.raw) : {
     windup: { ticks: 12, az: 0.3, el: 0.05, reach: -0.05 },
     cut: { ticks: 7, az: -2.3, el: 0, reach: 0.1 },
@@ -497,12 +747,12 @@ function addStyle() {
     raw.styles = raw.styles || [];
     raw.styles.push(seed);
   });
-  selected = lib.styles.findIndex(s => s.name === n);
+  selected = formIndex(lib.styles.findIndex(s => s.name === n));
   render();
 }
 
 function renameStyle() {
-  const s = lib.styles[selected];
+  const s = lib.styles[baseIndexOf(selected)];
   const n = prompt('rename style id', s.name);
   if (!n || n === s.name) return;
   if (lib.styles.some(x => x.name === n)) return toast('that id exists', true);
@@ -515,7 +765,7 @@ function renameStyle() {
   editStyles('rename "' + old + '"', () => {
     const target = raw.styles.find(x => x.name === old);
     if (target) target.name = n;
-    for (const mapKey of ['player', 'playerDagger', 'playerUnarmed']) {
+    for (const mapKey of ['player', 'playerUnarmed']) {
       const m = raw[mapKey];
       if (!m) continue;
       for (const sec of (m.sectors || [])) if (sec.style === old) sec.style = n;
@@ -527,7 +777,7 @@ function renameStyle() {
 }
 
 function dupStyle() {
-  const s = lib.styles[selected];
+  const s = lib.styles[baseIndexOf(selected)];
   let n = s.name + '_2';
   for (let k = 2; lib.styles.some(x => x.name === n); k++) n = s.name + '_' + k;
   const copy = snap(s.raw);
@@ -535,14 +785,14 @@ function dupStyle() {
   editStyles('duplicate "' + s.name + '"', () => {
     raw.styles.splice(raw.styles.findIndex(x => x.name === s.name) + 1, 0, copy);
   });
-  selected = lib.styles.findIndex(x => x.name === n);
+  selected = formIndex(lib.styles.findIndex(x => x.name === n));
   render();
 }
 
 function deleteStyle() {
-  const s = lib.styles[selected];
+  const s = lib.styles[baseIndexOf(selected)];
   let refs = 0;
-  for (const mapKey of ['player', 'playerDagger', 'playerUnarmed']) {
+  for (const mapKey of ['player', 'playerUnarmed']) {
     const m = raw[mapKey];
     if (!m) continue;
     refs += (m.sectors || []).filter(x => x.style === s.name).length;
@@ -554,7 +804,7 @@ function deleteStyle() {
     'gets a loud skip and its first available style, never a crash.')) return;
   editStyles('delete "' + s.name + '"', () => {
     raw.styles.splice(raw.styles.findIndex(x => x.name === s.name), 1);
-    for (const mapKey of ['player', 'playerDagger', 'playerUnarmed']) {
+    for (const mapKey of ['player', 'playerUnarmed']) {
       const m = raw[mapKey];
       if (!m) continue;
       m.sectors = (m.sectors || []).filter(x => x.style !== s.name);
@@ -649,65 +899,6 @@ const JOINT_TIP = {
   wrist: 'the HAND relative to the forearm — the blade\'s lay and roll',
 };
 
-function jointsGrid(r) {
-  const wrapEl = el('div', { style: 'margin-top:8px' });
-  const on = MELEE.jointsAny(MELEE.readJoints(r.joints, null));
-  wrapEl.append(el('div', { class: 'atkrow', style: 'margin-bottom:3px' },
-    el('label', {
-      title: 'PER-JOINT BRAKES on the posed arm, applied after the IK solve ' +
-        'and before the anatomy clamp, for this style only. SMOOTH = low-pass ' +
-        'half-life in ticks (2 = the joint covers half of what is left every ' +
-        'two ticks). MAX°/TICK = the most the joint may turn in one tick — the ' +
-        'hard limit for a shoulder that spins across the windup→cut boundary. ' +
-        '0 = off. They release gradually after the stroke, so switching off ' +
-        'cannot snap. Solo a segment and watch the arm while you tune.',
-    }, 'joint smoothing'),
-    on ? el('button', { class: 'small danger', title: 'remove every brake',
-      onclick: () => editStyles('clear joint smoothing', () => { delete r.joints; }),
-    }, '✕') : el('span', { class: 'hint' }, 'off — the solve is untouched')));
-  const grid = el('div', { class: 'atkseg',
-    style: 'grid-template-columns:auto repeat(2,minmax(0,1fr)) minmax(0,1.4fr)' });
-  grid.append(el('div', {}),
-    el('div', { class: 'hdr', title: 'low-pass half-life, 30 Hz ticks. 0 = off' }, 'smooth'),
-    el('div', { class: 'hdr', title: 'max degrees the joint may turn per tick. 0 = off' }, 'max°/tick'),
-    el('div', { class: 'hdr', title: 'how far the braked joint is behind the solve RIGHT NOW (preview)' }, 'lag now'));
-  for (const name of MELEE.ARM_JOINTS) {
-    const cur = () => (r.joints && r.joints[name]) || {};
-    const write = (key, v) => editStyles(`${name} ${key}`, () => {
-      if (!r.joints || typeof r.joints !== 'object') r.joints = {};
-      const j = r.joints[name] && typeof r.joints[name] === 'object'
-        ? r.joints[name] : (r.joints[name] = {});
-      if (v > 0) j[key] = v; else delete j[key];
-      if (!Object.keys(j).length) delete r.joints[name];
-      if (!Object.keys(r.joints).length) delete r.joints;
-    });
-    grid.append(el('div', { class: 'lbl', title: JOINT_TIP[name] }, name));
-    grid.append(numCell({
-      step: 0.5, min: 0, max: 60, dflt: 0,
-      title: `${name}: low-pass half-life in ticks (0 = off). ` + JOINT_TIP[name],
-      get: () => num(cur().smooth, 0),
-      sub: num(cur().smooth, 0) > 0
-        ? fmt(num(cur().smooth, 0) * TICK_MS / 1000, 3) + ' s' : 'off',
-      set: v => write('smooth', v),
-    }));
-    grid.append(numCell({
-      step: 1, min: 0, max: 180, dflt: 0,
-      title: `${name}: most degrees it may turn in one tick (0 = off). ` +
-        JOINT_TIP[name],
-      get: () => num(cur().maxDeg, 0),
-      sub: num(cur().maxDeg, 0) > 0
-        ? Math.round(num(cur().maxDeg, 0) * 1000 / TICK_MS) + '°/s' : 'off',
-      set: v => write('maxDeg', v),
-    }));
-    const lag = el('div', { class: 'atkcell', 'data-joint-lag': name,
-      style: 'font-family:var(--mono);font-size:11px;text-align:center;color:var(--dim)' },
-      '—');
-    grid.append(lag);
-  }
-  wrapEl.append(grid);
-  return wrapEl;
-}
-
 /** Refresh the "lag now" column from the preview (called per frame by the rig). */
 export function updateJointLag(lag) {
   if (!wrap) return;
@@ -719,11 +910,699 @@ export function updateJointLag(lag) {
   }
 }
 
+/* ---- THE FRAMES (strokes.h "AN ATTACK IS A LIST OF FRAMES") -------------
+ *
+ * An attack is a list of frames, and every frame has the SAME controls: where
+ * the dagger tip is when the frame ends, what that is measured from, how long
+ * it takes, how the speed is spread, whether it cuts, which side the hand
+ * leans, how much the wrist lays the blade along the stroke, how much the
+ * torso turns with it, and the per-joint smoothing while it runs. "windup",
+ * "cut" and "recover" are only names. After the last frame, `release` ticks
+ * hand the arm back to the walk cycle.
+ * ------------------------------------------------------------------------ */
+
+// The RAW frame list this panel edits. A WEAPON FORM ("horizontal_r@short")
+// edits `forms.short.frames`, and a player copy (":player") its own
+// `player.frames` — each seeded from the style's own frames (and release) the
+// first time it is touched, so the first edit is what makes it that weapon's.
+function framesDoc(sty, create) {
+  const r = sty.raw;
+  if (sty.form) {
+    const fo = r.forms && typeof r.forms === 'object' ? r.forms : null;
+    const f = fo && fo[sty.form] && typeof fo[sty.form] === 'object' ? fo[sty.form] : null;
+    if (f && Array.isArray(f.frames)) return f.frames;
+    if (!create) return null;
+    const base = lib && lib.styles[sty.baseIndex];
+    const own = f || {};
+    own.frames = ((base && base.frames) || sty.frames || []).map(MELEE.frameToJson);
+    if (own.release === undefined) own.release = (base || sty).release;
+    r.forms = fo || {};
+    r.forms[sty.form] = own;
+    return own.frames;
+  }
+  if (sty.derived) {
+    if (!r.player || typeof r.player !== 'object') {
+      if (!create) return null;
+      r.player = {};
+    }
+    if (!Array.isArray(r.player.frames)) {
+      if (!create) return null;
+      const base = lib && lib.styles[sty.baseIndex];
+      r.player.frames = ((base && base.frames) || sty.frames || []).map(MELEE.frameToJson);
+    }
+    return r.player.frames;
+  }
+  if (!Array.isArray(r.frames)) {
+    if (!create) return null;
+    r.frames = (sty.frames || []).map(MELEE.frameToJson);
+  }
+  return r.frames;
+}
+// Where a release edit is written. A form becomes the weapon's own on its
+// first edit, frames and release together (framesDoc).
+const releaseDoc = (sty) => {
+  if (sty.form) { framesDoc(sty, true); return sty.raw.forms[sty.form]; }
+  return sty.derived ? (sty.raw.player || (sty.raw.player = {})) : sty.raw;
+};
+
+const LEAN_TIP = {
+  follow: 'the hand LEADS the tip\'s travel, so the edge leads a cut',
+  hold: 'keep the side the hand is already on — a return, a feint',
+  left: 'hand on the wielder\'s LEFT of the tip',
+  right: 'hand on the wielder\'s RIGHT of the tip',
+};
+
+// A number box that may be EMPTY, meaning "use the global value".
+function optNumCell({ get, set, placeholder, title, step = 0.05, min = 0, max = 1 }) {
+  const cell = el('div', { class: 'atkcell' });
+  const i = el('input', { class: 'atknum', type: 'number', step: String(step),
+    placeholder, title: title || '' });
+  const v = get();
+  i.value = v === undefined ? '' : String(v);
+  i.addEventListener('change', () => {
+    if (i.value.trim() === '') { if (get() !== undefined) set(undefined); return; }
+    const n = clamp(num(i.value, 0), min, max);
+    if (n === get()) { i.value = String(n); return; }
+    set(n);
+  });
+  cell.append(i, el('em', {}, v === undefined ? 'global' : ''));
+  return cell;
+}
+
+/* ---- THE CLIPBOARD: poses and frames, across frames, styles and forms ----
+ *
+ * Two slots, so copying one pose never throws away a copied run of frames:
+ *   pose   — one frame's arm + torso (shoulder / elbow / wrist, twist, pitch)
+ *   frames — one frame or a whole style's list, timing and pacing included
+ * Kept in localStorage, so a copy survives a page reload and reaches another
+ * style, another weapon form, or the same style in a second tab. Every paste
+ * is one undo step, and goes through framesDoc like every other edit, so
+ * pasting into an inherited weapon form makes that form its own.
+ * ------------------------------------------------------------------------ */
+const CLIP_POSE_KEY = 'sandvox.attacks.clipPose';
+const CLIP_FRAMES_KEY = 'sandvox.attacks.clipFrames';
+const readClip = (key) => {
+  try { return JSON.parse(localStorage.getItem(key) || 'null'); } catch { return null; }
+};
+let clipPose = readClip(CLIP_POSE_KEY);      // { pose, from } | null
+let clipFrames = readClip(CLIP_FRAMES_KEY);  // { frames, release, from } | null
+const writeClip = (key, v) => {
+  try { if (v) localStorage.setItem(key, JSON.stringify(v)); else localStorage.removeItem(key); }
+  catch { /* private mode: the clipboard lives for this page only */ }
+};
+
+// "horizontal_r [short] · windup" — where a copy came from, for the labels.
+const styleLabel = (sty) => (sty.form ? `${sty.baseName} [${sty.form}]`
+  : sty.derived ? sty.name : sty.name);
+const frameLabel = (sty, k) =>
+  `${styleLabel(sty)} · ${(sty.frames[k] && sty.frames[k].name) || 'frame ' + (k + 1)}`;
+
+function copyPose(sty, k) {
+  const f = sty.frames[k];
+  if (!f || !f.pose) return toast('this frame is not a pose — nothing to copy', true);
+  clipPose = { pose: MELEE.poseToJson(f.pose), from: frameLabel(sty, k) };
+  writeClip(CLIP_POSE_KEY, clipPose);
+  toast('copied pose: ' + clipPose.from);
+  render();
+}
+
+// part: 'all' (arm + torso) | 'arm' | 'torso'
+function pastePose(sty, k, part = 'all') {
+  if (!clipPose) return toast('no pose copied yet — ⎘ copy one first', true);
+  const src = JSON.parse(JSON.stringify(clipPose.pose));
+  editStyles(`paste ${part === 'all' ? 'pose' : part} into frame ${k + 1}`, () => {
+    const d = framesDoc(sty, true);
+    const fr = d[k] || (d[k] = {});
+    const q = fr.pose && typeof fr.pose === 'object' ? { ...fr.pose } : {};
+    if (part !== 'torso') {
+      q.shoulder = src.shoulder;
+      q.elbow = src.elbow;
+      if (src.wrist) q.wrist = src.wrist; else delete q.wrist;
+    }
+    if (part !== 'arm') {
+      if (src.twist) q.twist = src.twist; else delete q.twist;
+      if (src.pitch) q.pitch = src.pitch; else delete q.pitch;
+    }
+    // A torso-only paste onto a frame with no arm yet would be half a pose.
+    if (q.shoulder && q.elbow) fr.pose = q;
+  });
+}
+
+function copyFrames(sty, k /* undefined = all */) {
+  const list = k === undefined ? sty.frames : [sty.frames[k]];
+  if (!list.length || !list[0]) return;
+  clipFrames = {
+    frames: list.map(MELEE.frameToJson),
+    release: sty.release,
+    from: k === undefined ? `${styleLabel(sty)} (all ${list.length})` : frameLabel(sty, k),
+  };
+  writeClip(CLIP_FRAMES_KEY, clipFrames);
+  toast('copied ' + (list.length === 1 ? 'frame: ' : 'frames: ') + clipFrames.from);
+  render();
+}
+
+// at: index to insert before; replace = swap the whole list (and release).
+function pasteFrames(sty, at, replace) {
+  if (!clipFrames) return toast('no frames copied yet', true);
+  const src = JSON.parse(JSON.stringify(clipFrames.frames));
+  editStyles(replace ? 'replace frames with copied' : 'paste frames', () => {
+    const d = framesDoc(sty, true);
+    if (replace) {
+      d.length = 0;
+      d.push(...src.slice(0, MELEE.MAX_FRAMES));
+      releaseDoc(sty).release = clipFrames.release;
+    } else {
+      d.splice(at, 0, ...src.slice(0, Math.max(0, MELEE.MAX_FRAMES - d.length)));
+    }
+  });
+}
+
+// HOLD a different frame, keeping ✋ manual on if it was: step through a
+// style's poses without hunting for the next row's buttons.
+function holdFrame(k) {
+  const sty = lib && lib.styles[selected];
+  if (!sty || !sty.frames.length) return;
+  const n = sty.frames.length;
+  goalKey = 'f' + (((k % n) + n) % n);
+  host?.stop?.();
+  render();
+}
+const heldIndex = () => (goalKey && goalKey[0] === 'f' ? +goalKey.slice(1) : -1);
+
+// KEYS, while the attacks panel is up and a frame is held: Ctrl+C / Ctrl+V
+// copy and paste its POSE, Ctrl+Shift+V pastes the arm only, and , / . step
+// to the previous / next frame. Capture phase, ahead of the voxel editor's
+// own Ctrl+C / Ctrl+V, which would otherwise copy a voxel selection nobody
+// can see from this lane.
+document.addEventListener('keydown', (ev) => {
+  if (!isVisible() || !lib || heldIndex() < 0) return;
+  const tg = ev.target, tag = (tg && tg.tagName || '').toLowerCase();
+  if (tg && (tg.isContentEditable || tag === 'input' || tag === 'textarea' || tag === 'select')) return;
+  const sty = lib.styles[selected];
+  if (!sty) return;
+  const k = heldIndex(), ctrl = ev.ctrlKey || ev.metaKey, key = ev.key.toLowerCase();
+  let used = true;
+  if (ctrl && key === 'c') copyPose(sty, k);
+  else if (ctrl && key === 'v') pastePose(sty, k, ev.shiftKey ? 'arm' : 'all');
+  else if (!ctrl && !ev.altKey && key === ',') holdFrame(k - 1);
+  else if (!ctrl && !ev.altKey && key === '.') holdFrame(k + 1);
+  else used = false;
+  if (used) { ev.preventDefault(); ev.stopImmediatePropagation(); }
+}, true);
+
+// The clipboard and the held-frame stepper, over the frame list.
+// DOM append, minus the nulls a conditional control leaves behind.
+const add = (node, ...kids) => node.append(...kids.filter(k => k != null));
+function clipboardBar(sty) {
+  const frames = sty.frames || [];
+  const hk = heldIndex();
+  const bar = el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap;margin-bottom:4px;' +
+    'padding:3px 6px;border:1px dashed var(--line,#3a3a3a);border-radius:4px' });
+  add(bar, el('span', { class: 'lbl', title: 'what ⎀ paste will put down. Copies ' +
+    'survive a page reload and work across styles and weapon forms.' }, 'clipboard'),
+    el('span', { class: 'hint', title: clipPose ? 'the copied pose' : '' },
+      'pose: ' + (clipPose ? clipPose.from : '—')),
+    clipPose ? chip('✕', false, () => { clipPose = null; writeClip(CLIP_POSE_KEY, null); render(); },
+      'forget the copied pose') : null,
+    el('span', { class: 'hint', style: 'margin-left:8px' },
+      'frames: ' + (clipFrames ? clipFrames.from : '—')),
+    clipFrames ? chip('✕', false, () => { clipFrames = null; writeClip(CLIP_FRAMES_KEY, null); render(); },
+      'forget the copied frames') : null,
+    el('span', { class: 'spacer', style: 'flex:1' }),
+    chip('⎘ copy all frames', false, () => copyFrames(sty), 'copy this whole ' +
+      'animation (every frame, its timing, and the release) — then paste it ' +
+      'over another style or another weapon\'s version'),
+    chip('⎀ replace all', false, () => {
+      if (confirm(`Replace all ${frames.length} frames of ${styleLabel(sty)} with ` +
+        `the copied ${clipFrames.from}? (Ctrl+Z undoes it)`)) pasteFrames(sty, 0, true);
+    }, 'replace every frame here with the copied frames', ) );
+  if (!clipFrames) bar.lastChild.disabled = true;
+  const step = el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap;margin-bottom:4px' });
+  add(step, el('span', { class: 'lbl' }, 'holding'),
+    chip('◀', false, () => holdFrame(hk < 0 ? frames.length - 1 : hk - 1), 'hold the previous frame (key , )'),
+    el('b', {}, hk >= 0 ? `${hk + 1} / ${frames.length}  ${frames[hk]?.name || ''}` : 'nothing'),
+    chip('▶', false, () => holdFrame(hk < 0 ? 0 : hk + 1), 'hold the next frame (key . )'),
+    hk >= 0 ? chip('✋ manual', manual, () => { manual = !manual; render(); },
+      'drag handles on the held frame') : null,
+    el('span', { class: 'hint' }, hk >= 0
+      ? 'Ctrl+C / Ctrl+V copy / paste this frame\'s pose · Ctrl+Shift+V arm only · , . step'
+      : '◎ show a frame (or ◀ ▶) to hold it; then Ctrl+C / Ctrl+V work on its pose'));
+  return [bar, step];
+}
+
+// A FRAME THAT IS A POSE (melee.js "A FRAME IS A POSE"): the arm is posed with
+// the ✋ manual handles on the rig, so the row holds only what the handles do
+// not reach — the torso — and a way to start from the previous frame's arm.
+function poseRow(sty, f, k, edit, rawOf) {
+  const p = f.pose;
+  const setPose = (label, fn) => edit(label, d => {
+    const fr = rawOf(d, k);
+    fr.pose = { ...(fr.pose || {}) };
+    fn(fr.pose, d);
+  });
+  const deg = (key, label, lim, title) => numCell({
+    step: 1, min: -lim, max: lim, int: true, title,
+    get: () => Math.round((p[key] || 0) * DEG), sub: label,
+    set: v => setPose(`frame ${label}`, q => {
+      if (v) q[key] = Math.round((v / DEG) * 1e6) / 1e6; else delete q[key];
+    }) });
+  return el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap' },
+    el('span', { class: 'lbl', style: 'min-width:4.5em', title: 'This frame IS a ' +
+      'pose: the shoulder, elbow and wrist as they stand at its end. Between ' +
+      'frames every joint turns straight from one pose to the next on the ' +
+      'frame\'s pacing — nothing else steers the arm.' }, 'pose'),
+    deg('twist', 'torso twist °', 90, 'TORSO TWIST at the end of this frame, ' +
+      'degrees, + toward the wielder\'s right. Blended from the previous frame.'),
+    deg('pitch', 'torso pitch °', 45, 'TORSO PITCH at the end of this frame, ' +
+      'degrees, + = chest up. Blended from the previous frame.'),
+    ...(k > 0 ? [el('button', { class: 'small', style: 'padding:0 5px',
+      title: 'copy the PREVIOUS frame\'s arm and torso into this one (then pose it)',
+      onclick: () => setPose('copy previous pose', (q, d) => {
+        const prev = rawOf(d, k - 1).pose;
+        if (prev) Object.assign(q, JSON.parse(JSON.stringify(prev)));
+      }) }, '← previous')] : []),
+    ...(k + 1 < sty.frames.length ? [el('button', { class: 'small', style: 'padding:0 5px',
+      title: 'copy the NEXT frame\'s arm and torso into this one',
+      onclick: () => setPose('copy next pose', (q, d) => {
+        const nx = rawOf(d, k + 1).pose;
+        if (nx) Object.assign(q, JSON.parse(JSON.stringify(nx)));
+      }) }, 'next →')] : []),
+    el('button', { class: 'small', style: 'padding:0 5px',
+      title: 'FLIP THE ELBOW SOLUTION: turn the upper arm and forearm half a ' +
+        'turn each about their own bone. Elbow, hand and blade stay exactly ' +
+        'where they are; the elbow\'s bend changes sign and the shoulder\'s ' +
+        '180° twist comes off (or goes on). Use it when a frame looks right ' +
+        'but the shoulder spins going into or out of it. Click again to undo.',
+      onclick: () => {
+        const cur = p && p.joint ? p : MELEE.readPose(p);
+        const flipped = cur && host?.flipElbowPose?.(cur);
+        if (!flipped) return toast('flip elbow: no pose or no weapon arm on the rig', true);
+        const j = MELEE.poseToJson(flipped);
+        setPose('flip elbow', q => {
+          q.shoulder = j.shoulder;
+          q.elbow = j.elbow;
+          if (j.wrist) q.wrist = j.wrist; else delete q.wrist;
+        });
+      } }, '⇅ flip elbow'),
+    el('span', { class: 'spacer', style: 'width:6px' }),
+    el('button', { class: 'small', style: 'padding:0 5px', onclick: () => copyPose(sty, k),
+      title: 'copy this frame\'s pose (arm + torso) to the clipboard' }, '⎘ copy pose'),
+    el('button', { class: 'small', style: 'padding:0 5px', onclick: () => pastePose(sty, k, 'all'),
+      disabled: !clipPose || undefined,
+      title: clipPose ? 'paste the copied pose (arm + torso) from ' + clipPose.from : 'nothing copied' },
+      '⎀ paste'),
+    el('button', { class: 'small', style: 'padding:0 5px', onclick: () => pastePose(sty, k, 'arm'),
+      disabled: !clipPose || undefined,
+      title: 'paste only the ARM (shoulder, elbow, wrist) of the copied pose; keep this torso' },
+      '⎀ arm'),
+    el('button', { class: 'small', style: 'padding:0 5px', onclick: () => pastePose(sty, k, 'torso'),
+      disabled: !clipPose || undefined,
+      title: 'paste only the TORSO (twist, pitch) of the copied pose; keep this arm' },
+      '⎀ torso'));
+}
+
+function framesSection(sty) {
+  const box = el('div', { style: 'margin-top:6px' });
+  const frames = sty.frames || [];
+  const edit = (label, fn) => editStyles(label, () => fn(framesDoc(sty, true)));
+  const rawOf = (doc, k) => doc[k] || (doc[k] = {});
+
+  box.append(el('div', { class: 'atkrow', style: 'margin-bottom:4px' },
+    el('label', { title: 'Every frame has the same controls. The tip ' +
+      'position is WHERE THE DAGGER TIP IS when the frame ends.' }, 'frames'),
+    el('span', { class: 'hint' },
+      sty.form ? (sty.formInherited
+          ? `${sty.form} weapons — the style's default frames; the first edit makes them ${sty.form}'s own`
+          : `${sty.form} weapons' own ${frames.length} frames`)
+      : sty.derived ? 'player copy — edits write this style\'s player frames'
+                  : `${frames.length} frames · angles in degrees`),
+    sty.form && !sty.formInherited ? chip('⟲ back to default', false, () => {
+      editStyles(`${sty.baseName}: ${sty.form} back to default`, () => {
+        delete sty.raw.forms[sty.form];
+        if (!Object.keys(sty.raw.forms).length) delete sty.raw.forms;
+      });
+    }, `drop the ${sty.form} version: ${sty.form} weapons swing the style's default frames again`) : null));
+  box.append(...clipboardBar(sty));
+  // STILL TIP TARGETS: one click turns every frame into the pose it shows now.
+  if (frames.length && !MELEE.styleKeyed(sty)) {
+    const partly = frames.some(f => f.pose);
+    box.append(el('div', { class: 'atkrow', style: 'gap:6px;margin-bottom:4px' },
+      partly ? el('span', { class: 'hint', style: 'color:#e0a050' },
+        'some frames are poses and some are tip targets — the arm is keyed only ' +
+        'when EVERY frame is a pose') :
+      chip('⤓ bake to poses', false, () => {
+        const i = lib.styles.indexOf(sty);
+        const before = snap(raw);
+        if (!bakeStyle(i)) { toast('could not bake: no arm on this rig for the style', true); return; }
+        const after = snap(raw);
+        const apply = s => { pourInto(raw, s); afterEdit('styles'); };
+        host?.pushUndo?.('bake poses', () => apply(before), () => apply(after));
+        afterEdit('styles');
+      }, 'Turn every frame into the ARM POSE it shows now ("show"), and from then ' +
+         'on play the style by turning each joint straight from one pose to the ' +
+         'next. Tip targets, lean, blade angle and elbow direction go away; you ' +
+         'pose frames with ✋ manual instead.')));
+  }
+
+  frames.forEach((f, k) => {
+    const gk = 'f' + k;
+    const fb = el('div', { class: 'atkframe', style:
+      'border:1px solid var(--line,#3a3a3a);border-radius:4px;padding:4px 6px;' +
+      'margin-bottom:5px;' + (f.cuts ? 'border-left:3px solid #e06c5a;' : '') +
+      (goalKey === gk ? 'background:rgba(120,160,255,0.10);outline:1px solid #6d8fd6;' : '') });
+
+    // ---- row 1: name, time, pacing, cuts, measured-from, frame buttons ----
+    const nameIn = el('input', { class: 'atknum wide', type: 'text',
+      style: 'width:9em', title: 'the frame\'s name — windup, cut, recover, ' +
+        'anything: names are only labels' });
+    nameIn.value = f.name || '';
+    nameIn.addEventListener('change', () => {
+      if (nameIn.value === (f.name || '')) return;
+      edit('frame name', d => { rawOf(d, k).name = nameIn.value; });
+    });
+    const cutsChip = chip(f.cuts ? '✂ cuts' : 'no cut', f.cuts,
+      () => edit(f.cuts ? 'frame stops cutting' : 'frame cuts', d => {
+        const fr = rawOf(d, k);
+        if (f.cuts) delete fr.cuts; else fr.cuts = true;
+      }),
+      'CUTS: the damage sweep is live during this frame. The cutting frames ' +
+      'are one run; frames before it are the windup (the aim locks at its end), ' +
+      'frames after it are the return.');
+    const fromSel = el('select', { class: 'small',
+      title: 'what the tip position is measured FROM. target: 0°/0° points ' +
+        'straight at whatever is being attacked, so the frame follows the ' +
+        'enemy. body: 0°/0° is straight ahead of the wielder, whatever the ' +
+        'target — a stance.' });
+    fromSel.append(el('option', { value: 'target' }, 'from target'),
+                   el('option', { value: 'body' }, 'from body'));
+    fromSel.value = f.fromBody ? 'body' : 'target';
+    fromSel.addEventListener('change', () => edit('frame measured from', d => {
+      const fr = rawOf(d, k);
+      if (fromSel.value === 'body') fr.from = 'body'; else delete fr.from;
+    }));
+    const btn = (label, title, onclick, disabled) => el('button', {
+      class: 'small', title, onclick, ...(disabled ? { disabled: true } : {}),
+      style: 'padding:0 5px' }, label);
+    const showing = goalKey === gk;
+    fb.append(el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap' },
+      el('b', { style: 'min-width:1.4em' }, String(k + 1)), nameIn,
+      numCell({ int: true, step: 1, min: 1, max: 240, dflt: 8,
+        title: 'ticks (30 per second) the frame takes. It always ARRIVES on ' +
+          'its last tick.',
+        get: () => f.ticks, sub: fmt(f.ticks * TICK_MS / 1000, 2) + ' s',
+        set: v => edit('frame ticks', d => { rawOf(d, k).ticks = v; }) }),
+      paceCell({
+        chase: !f.pose,
+        title: 'PACING: how the travel is spread over the ticks. linear = even; ' +
+          '…In = slow start, fast finish; …Out = fast start, slow finish. ' +
+          'Every curve ARRIVES on the last tick. chase = close on the pose at ' +
+          'a capped speed (the box that appears), arriving whenever it arrives ' +
+          '— how every stock windup and return moved before frames.',
+        get: () => (f.ease === 'chase' ? '' : (f.ease || 'linear')),
+        set: v => edit('frame pacing', d => {
+          const fr = rawOf(d, k);
+          if (v === '') { fr.ease = 'chase'; return; }
+          delete fr.chaseRate;
+          if (v === 'linear') delete fr.ease; else fr.ease = v;
+        }) }),
+      ...(f.ease === 'chase' && !f.pose ? [numCell({
+        step: 1, min: 1, max: 200, dflt: 16,
+        title: 'CHASE SPEED: the most the tip may move per tick while chasing, ' +
+          'in input units (16 ≈ 4.6°/tick sideways, 6.1°/tick up/down). A ' +
+          'frame too short for the distance ends SHORT of its pose.',
+        get: () => f.chaseRate,
+        sub: `≈${fmt(f.chaseRate * 0.005 * DEG, 1)}°/t`,
+        set: v => edit('chase speed', d => {
+          const fr = rawOf(d, k);
+          if (v === 16) delete fr.chaseRate; else fr.chaseRate = v;
+        }) })] : []),
+      cutsChip, fromSel,
+      el('span', { class: 'spacer', style: 'flex:1' }),
+      chip(showing ? '◉ showing' : '◎ show', showing, () => {
+        goalKey = showing ? null : gk;
+        if (!goalKey) manual = false;
+        host?.stop?.();
+        render();
+      }, 'HOLD the arm exactly on this frame\'s end pose in the preview'),
+      // MANUAL: hold THIS frame and pose it by dragging the arm (rig.js
+      // drawPoseHandles). Clicking it on another frame moves manual there.
+      chip('✋ manual', manual && showing, () => {
+        if (manual && showing) { manual = false; }
+        else { manual = true; goalKey = gk; host?.stop?.(); }
+        render();
+      }, 'MANUAL ADJUSTMENT of this frame: holds it and puts drag handles on ' +
+         'the arm. tip = where the point goes (az + el) · shoulder = click for ' +
+         'separate az ↔ / el ↕ · upper arm = az + el · reach = extension · ' +
+         'elbow = which way the elbow points · wrist = blade angle + which side ' +
+         'the hand sits. This frame\'s numbers update as you drag; each drag is ' +
+         'one undo. Click again to stop.'),
+      btn('▲', 'move this frame earlier', () => edit('move frame', d => {
+        [d[k - 1], d[k]] = [d[k], d[k - 1]];
+      }), k === 0),
+      btn('▼', 'move this frame later', () => edit('move frame', d => {
+        [d[k + 1], d[k]] = [d[k], d[k + 1]];
+      }), k === frames.length - 1),
+      btn('⧉', 'duplicate this frame', () => edit('duplicate frame', d => {
+        d.splice(k + 1, 0, JSON.parse(JSON.stringify(rawOf(d, k))));
+      }), frames.length >= MELEE.MAX_FRAMES),
+      btn('⎘', 'copy this whole FRAME (timing, pacing, cuts, pose) to the clipboard',
+        () => copyFrames(sty, k)),
+      btn('⎀', clipFrames ? `paste the copied frame(s) AFTER this one — ${clipFrames.from}`
+        : 'nothing copied', () => pasteFrames(sty, k + 1, false),
+        !clipFrames || frames.length >= MELEE.MAX_FRAMES),
+      btn('✕', 'delete this frame', () => edit('delete frame', d => {
+        d.splice(k, 1);
+      }), frames.length <= 1)));
+
+    if (f.pose) fb.append(poseRow(sty, f, k, edit, rawOf));
+    else {
+    // ---- row 2: where the tip ends up, lean, wrist -------------------------
+    const deg = (key, label) => guideCell(numCell({
+      step: 1, min: -200, max: 200,
+      title: `${label} of the tip at the END of this frame, in degrees, ` +
+        (f.fromBody ? 'from straight ahead of the body' : 'from the target') +
+        (key === 'az' ? ' (+ = to the wielder\'s right)' : ' (+ = up)'),
+      get: () => Math.round(f[key] * DEG),
+      sub: label,
+      set: v => edit(`frame ${label}`, d => { rawOf(d, k)[key] = v / DEG; }),
+    }), gk);
+    const leanSel = el('select', { class: 'small',
+      title: 'which side of the tip the HAND is on. ' +
+        Object.entries(LEAN_TIP).map(([n, t]) => `${n}: ${t}`).join('; ') });
+    for (const n of MELEE.LEANS)
+      leanSel.append(el('option', { value: n, title: LEAN_TIP[n] }, 'lean ' + n));
+    leanSel.value = f.lean || 'follow';
+    leanSel.addEventListener('change', () => edit('frame lean', d => {
+      const fr = rawOf(d, k);
+      if (leanSel.value === 'follow') delete fr.lean; else fr.lean = leanSel.value;
+      if (leanSel.value !== 'angle') delete fr.leanAngle;
+    }));
+    // LEAN ANGLE, shown only in "angle" mode: which way the hand sits off the
+    // shoulder-to-tip line, 0° = below it, + toward the weapon side.
+    const leanAngleCell = f.lean === 'angle' ? numCell({
+      step: 5, min: -180, max: 180,
+      title: 'LEAN ANGLE, degrees about the shoulder-to-tip line: where the ' +
+        'HAND sits relative to the blade. 0° = below it, +90° = out to the ' +
+        'weapon side, −90° = in across the body, 180° = above it.',
+      get: () => Math.round((f.leanAngle || 0) * DEG), sub: 'lean °',
+      set: v => edit('frame lean angle', d => {
+        rawOf(d, k).leanAngle = Math.round((v / DEG) * 1e6) / 1e6;
+      }) }) : null;
+    fb.append(el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap' },
+      el('span', { class: 'lbl', style: 'min-width:4.5em' }, 'tip ends at'),
+      deg('az', 'azimuth'), deg('el', 'elevation'),
+      // ARM EXTENSION, in %. The file stores `reach` as an offset from the
+      // neutral 0.60 of the arm's band (strokes.cpp StrokeReachIn), which read
+      // as a mystery number whose useful range was -0.6..+0.4 and clipped
+      // silently past it. The box shows the same fact as the author thinks of
+      // it: 0% = the tip drawn in as close as this arm goes, 100% = the arm
+      // straight out. Stored unchanged: reach = % / 100 - 0.60.
+      guideCell(numCell({
+        step: 5, min: 0, max: 100, int: true,
+        title: 'ARM EXTENSION: how far from the shoulder the tip is, along the ' +
+          'direction az/el point. 0% = pulled in as close as this arm goes ' +
+          '(elbow bent), 100% = arm straight out. The line underneath is the ' +
+          'resulting distance from the shoulder on the arm being previewed.',
+        get: () => Math.round((MELEE.kNeutralReach + f.reach) * 100),
+        sub: 'extension · ' + reachSub(f.reach) + ' from shoulder',
+        set: v => edit('frame extension', d => {
+          rawOf(d, k).reach = Math.round((v / 100 - MELEE.kNeutralReach) * 1e6) / 1e6;
+        }),
+      }), gk),
+      leanSel, leanAngleCell,
+      numCell({
+        step: 0.05, min: 0, max: 1,
+        title: 'WRIST: how much the blade is laid along the stroke. 1 = ' +
+          'pointing exactly where this frame says; 0 = riding the grip angle.',
+        get: () => f.wristAlign, sub: 'wrist align',
+        set: v => edit('frame wrist', d => {
+          const fr = rawOf(d, k);
+          if (v === 1) delete fr.wrist; else fr.wrist = v;
+        }) })));
+
+    // ---- row 2b: the arm's shape — blade angle and elbow direction ---------
+    // Empty = AUTO, and the placeholder says so: auto is the old rule (hand
+    // held at melee.handExtend of the arm; elbow trailing the hand's travel),
+    // shown rather than hidden.
+    const degOpt = (key, opts) => optNumCell({
+      step: 5, min: opts.min, max: opts.max, placeholder: opts.placeholder,
+      title: opts.title,
+      get: () => (opts.isSet(f) ? Math.round(opts.read(f) * DEG) : undefined),
+      set: v => edit(opts.label, d => {
+        const fr = rawOf(d, k);
+        if (v === undefined) delete fr[key];
+        else fr[key] = Math.round((v / DEG) * 1e6) / 1e6;
+      }),
+    });
+    fb.append(el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap' },
+      el('span', { class: 'lbl', style: 'min-width:4.5em' }, 'arm shape'),
+      degOpt('bladeAngle', {
+        label: 'frame blade angle', min: 0, max: 180,
+        placeholder: 'blade ∠ auto',
+        title: 'BLADE ANGLE, degrees: how far the blade is cocked off the line ' +
+          'from the shoulder to the tip. 0° = the blade continues the arm ' +
+          'straight (point where the arm points); 90° = square to it. The hand ' +
+          'is placed from this, on the LEAN side. A tip closer to the shoulder ' +
+          'than the blade is long cannot be reached at 0° — raise the angle or ' +
+          'the extension. EMPTY = auto: the old rule, hand held at ' +
+          'melee.handExtend of the arm and the angle solved from that.',
+        isSet: fr => fr.bladeAngle >= 0, read: fr => fr.bladeAngle,
+      }),
+      degOpt('elbow', {
+        label: 'frame elbow direction', min: -180, max: 180,
+        placeholder: 'elbow auto',
+        title: 'ELBOW DIRECTION, degrees about the shoulder-to-hand line: 0° = ' +
+          'elbow points DOWN, +90° = OUT to the weapon side, −90° = IN across ' +
+          'the body, 180° = UP. With the hand placed, this is the arm\'s one ' +
+          'remaining freedom, so it sets the shoulder\'s rotation and the ' +
+          'elbow\'s bend together — use it to stop an elbow folding backwards. ' +
+          'EMPTY = auto: the old rule, the elbow trails the hand\'s travel ' +
+          'within melee.elbowPoleCone.',
+        isSet: fr => fr.elbowSet, read: fr => fr.elbow,
+      }),
+      el('span', { class: 'hint' }, 'blended from the previous frame over this one')));
+
+    // ---- row 3: torso and the joint smoothing ------------------------------
+    const tw = host?.tuning?.()?.melee || {};
+    const row3 = el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap' },
+      el('span', { class: 'lbl', style: 'min-width:4.5em' }, 'torso'),
+      optNumCell({
+        title: 'TORSO TWIST: fraction of the tip\'s azimuth the torso turns ' +
+          'with. Empty = the global melee.torsoShare.',
+        placeholder: 'twist ' + fmt(num(tw.torsoShare, 0.35), 2),
+        get: () => (f.torsoTwist >= 0 ? f.torsoTwist : undefined),
+        set: v => edit('frame torso twist', d => {
+          const fr = rawOf(d, k);
+          if (v === undefined) delete fr.torsoTwist; else fr.torsoTwist = v;
+        }) }),
+      optNumCell({
+        title: 'TORSO PITCH: fraction of the tip\'s elevation the torso ' +
+          'leans with. Empty = the global melee.torsoPitch.',
+        placeholder: 'pitch ' + fmt(num(tw.torsoPitch, 0.2), 2),
+        get: () => (f.torsoPitch >= 0 ? f.torsoPitch : undefined),
+        set: v => edit('frame torso pitch', d => {
+          const fr = rawOf(d, k);
+          if (v === undefined) delete fr.torsoPitch; else fr.torsoPitch = v;
+        }) }));
+    fb.append(row3);
+    }
+    const row4 = el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap' },
+      el('span', { class: 'lbl', style: 'min-width:4.5em',
+        title: 'PER-JOINT SMOOTHING while this frame runs, applied to the posed ' +
+          'arm after the IK. smooth = half-life in ticks (bigger = lazier). ' +
+          'max°/t = the most the joint may turn in one tick. 0 = off.' },
+        'smoothing'));
+    for (const name of MELEE.ARM_JOINTS) {
+      const js = (f.joints && f.joints[name]) || { smooth: 0, maxDeg: 0 };
+      const write = (key, v) => edit(`frame ${name} ${key}`, d => {
+        const fr = rawOf(d, k);
+        if (!fr.joints || typeof fr.joints !== 'object') fr.joints = {};
+        const j = fr.joints[name] && typeof fr.joints[name] === 'object'
+          ? fr.joints[name] : (fr.joints[name] = {});
+        if (v > 0) j[key] = v; else delete j[key];
+        if (!Object.keys(j).length) delete fr.joints[name];
+        if (!Object.keys(fr.joints).length) delete fr.joints;
+      });
+      row4.append(el('span', { class: 'hint', title: JOINT_TIP[name],
+        style: 'margin-left:4px' }, name),
+        numCell({ step: 0.5, min: 0, max: 60, dflt: 0,
+          title: `${name} smoothing half-life in ticks (0 = off). ` + JOINT_TIP[name],
+          get: () => js.smooth, sub: js.smooth > 0 ? 'smooth' : 'smooth off',
+          set: v => write('smooth', v) }),
+        numCell({ step: 1, min: 0, max: 180, dflt: 0,
+          title: `${name}: most degrees it may turn per tick (0 = off). ` + JOINT_TIP[name],
+          get: () => js.maxDeg, sub: js.maxDeg > 0 ? 'max°/t' : 'max off',
+          set: v => write('maxDeg', v) }));
+    }
+    fb.append(row4);
+    box.append(fb);
+  });
+
+  // ---- after the frames ----------------------------------------------------
+  box.append(el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap' },
+    chip('+ frame', false, () => edit('add a frame', d => {
+      const last = d[d.length - 1] ? JSON.parse(JSON.stringify(d[d.length - 1])) : {};
+      delete last.cuts;
+      last.name = `frame ${d.length + 1}`;
+      last.ticks = last.ticks || 8;
+      d.push(last);
+    }), 'append a frame (a copy of the last one, not cutting) — then set where ' +
+        'its tip ends up'),
+    el('span', { class: 'lbl', style: 'margin-left:8px' }, 'release'),
+    numCell({ int: true, step: 1, min: 1, max: 120, dflt: 6,
+      title: 'RELEASE: ticks the arm takes to hand back to the walk cycle after ' +
+        'the last frame.',
+      get: () => sty.release,
+      sub: fmt(sty.release * TICK_MS / 1000, 2) + ' s',
+      set: v => editStyles('release', () => { releaseDoc(sty).release = v; }) }),
+    MELEE.styleKeyed(sty) ? null : chip('⌖ centre on target', false, () => edit('centre the cut on the target', d => {
+      // The midpoint of the CUT (from the pose it starts at to where it ends)
+      // onto the target: every target-measured frame shifts by the same
+      // amount, so the shape of the swing is unchanged.
+      const fc = frames.findIndex(x => x.cuts);
+      let lc = -1;
+      for (let q = frames.length - 1; q >= 0; q--) if (frames[q].cuts) { lc = q; break; }
+      if (fc < 0) return;
+      const a = frames[fc > 0 ? fc - 1 : fc], b = frames[lc];
+      const mAz = (a.az + b.az) / 2, mEl = (a.el + b.el) / 2;
+      d.forEach((fr, q) => {
+        if (frames[q] && !frames[q].fromBody) {
+          fr.az = Math.round((num(fr.az, 0) - mAz) * 1e6) / 1e6;
+          fr.el = Math.round((num(fr.el, 0) - mEl) * 1e6) / 1e6;
+        }
+      });
+    }), 'shift every target-measured frame so the MIDDLE of the cut passes ' +
+        'through the target (the swing\'s shape is unchanged)')));
+
+  // Jitter (style-wide: a per-swing draw, not a frame property).
+  if (!sty.raw.jitter || typeof sty.raw.jitter !== 'object')
+    sty.raw.jitter = { az: 0, el: 0, tempo: 0 };
+  const jr = sty.raw.jitter;
+  box.append(el('div', { class: 'atkrow', style: 'gap:6px;flex-wrap:wrap' },
+    el('span', { class: 'lbl', title: 'deterministic per-swing variation: ' +
+      'tempo stretches every frame up to the cut; the bow wobbles the frames ' +
+      'before the cut. 0 = every swing identical.' }, 'jitter'),
+    numCell({ step: 0.01, min: 0, max: 0.6, get: () => num(jr.tempo, 0), sub: 'tempo',
+      set: v => editStyles('jitter tempo', () => { jr.tempo = v; }) }),
+    degCell(jr, 'az', 'bow az', 'jitter'),
+    degCell(jr, 'el', 'bow el', 'jitter')));
+
+  // The live joint lag (preview), which updateJointLag fills per frame.
+  const lagRow = el('div', { class: 'atkrow', style: 'gap:6px' },
+    el('span', { class: 'hint' }, 'smoothing lag now:'));
+  for (const name of MELEE.ARM_JOINTS)
+    lagRow.append(el('span', { class: 'hint' }, name + ' '),
+      el('span', { 'data-joint-lag': name,
+        style: 'font-family:var(--mono);font-size:11px' }, '—'));
+  box.append(lagRow);
+  return box;
+}
+
 /* ---- the program card -------------------------------------------------- */
 
 function programCard(sty) {
   const r = sty.raw;
-  const card = el('div', { class: 'atkcard' });
+  const card = el('div', { class: 'atkcard program' });
   card.append(el('h5', {}, 'program',
     el('span', { class: 'spacer' }),
     el('span', { class: 'hint', style: 'text-transform:none;letter-spacing:0' },
@@ -740,388 +1619,7 @@ function programCard(sty) {
   card.append(el('div', { class: 'atkrow' },
     el('label', {}, 'label'), lbl));
 
-  // ---- the segment table (LAYOUT RULE 1) ------------------------------
-  // SIX columns here, not the class's five: the last is each segment's own
-  // PACING (strokes.h "PER-SEGMENT PACING").
-  const seg = el('div', { class: 'atkseg',
-    style: 'grid-template-columns:auto repeat(4,minmax(0,1fr)) minmax(74px,1.1fr)' });
-  seg.append(el('div', {}),
-    el('div', { class: 'hdr', title: '30 Hz sim ticks' }, 'ticks'),
-    el('div', { class: 'hdr', title: 'azimuth: 0 straight ahead, + to the mob\'s right' }, 'az°'),
-    el('div', { class: 'hdr', title: 'elevation: 0 level' }, 'el°'),
-    el('div', { class: 'hdr', title: 'a POSITION in this arm\'s reach band, not voxels' }, 'reach'),
-    el('div', { class: 'hdr', title: 'HOW THE SEGMENT\'S TRAVEL IS SPREAD OVER ITS ' +
-      'TICKS. The ticks set how LONG it takes; this sets where in that time the ' +
-      'speed lives. One per segment: windup, each cut leg, recover.' }, 'pacing'));
-
-  // The four value cells of one segment row; the LABEL cell is the caller's,
-  // because a cut leg's label carries its own controls and a windup's does not.
-  const segFields = (s, name, tip, gk) => {
-    seg.append(numCell({
-      int: true, step: 1, min: 1, max: 120, dflt: 8, title: tip,
-      get: () => Math.max(1, Math.round(num(s.ticks, 8))),
-      sub: fmt(Math.max(1, Math.round(num(s.ticks, 8))) * TICK_MS / 1000, 2) + ' s',
-      set: v => editStyles(`${name} ticks`, () => { s.ticks = v; }),
-    }));
-    seg.append(guideCell(degCell(s, 'az', 'azimuth', name), gk));
-    seg.append(guideCell(degCell(s, 'el', 'elevation', name), gk));
-    seg.append(guideCell(numCell({
-      step: 0.01, min: -1, max: 1,
-      title: 'A BAND POSITION offset, not voxels. 0 means the neutral 0.60 of ' +
-        'this arm\'s own annulus — authored against the ARM instead, every ' +
-        'chamber and lunge in the shipped library landed outside the band and ' +
-        'was clamped (strokes.cpp:160).',
-      get: () => num(s.reach, 0),
-      sub: reachSub(s.reach),
-      subTitle: 'where that lands on the arm currently previewing',
-      set: v => editStyles(`${name} reach`, () => { s.reach = v; }),
-    }), gk));
-  };
-
-  const windupTip =
-    'WHERE THE SWING STARTS, measured FROM THE TARGET: az 0 / el 0 points ' +
-    'straight at it, + az is to the swinger\'s right, + el is up. Driven ' +
-    'closed-loop and deliberately SLOWLY (under melee.commitSpeed, so no cut ' +
-    'fires). Its length IS the whole telegraph. The cut then travels FROM ' +
-    'here — press ⌖ to put the start half a cut back, so the middle of the ' +
-    'cut passes through the target.';
-  if (!r.windup || typeof r.windup !== 'object')
-    r.windup = { ticks: 8, az: 0, el: 0, reach: 0 };
-  {
-    // THE CENTRE BUTTON: windup = -(where the target sits along the cut), i.e.
-    // half the whole travel back, or the middle of the ◎ leg. What the engine
-    // did automatically before the target frame, now one click and visible.
-    const off = MELEE.cutAimOffset(sty);
-    const r4 = v => Math.round(v * 1e4) / 1e4;
-    const cAz = r4(-off.az), cEl = r4(-off.el);
-    const centred = Math.abs(num(r.windup.az, 0) - cAz) < 5e-4 &&
-                    Math.abs(num(r.windup.el, 0) - cEl) < 5e-4;
-    seg.append(el('div', { class: 'lbl', title: windupTip,
-      style: 'display:flex;align-items:center;justify-content:flex-end;gap:3px' },
-      el('button', {
-        class: 'small' + (centred ? ' primary' : ''),
-        style: 'padding:0 4px;font-size:10px;line-height:14px',
-        title: centred
-          ? 'CENTRED: the cut passes through the target in its middle ' +
-            `(windup az ${Math.round(cAz * DEG)}°, el ${Math.round(cEl * DEG)}°)`
-          : 'CENTRE THE CUT ON THE TARGET: set windup az/el to ' +
-            `${Math.round(cAz * DEG)}° / ${Math.round(cEl * DEG)}° — half the ` +
-            'cut\'s travel back from the target' +
-            (sty.aimLeg >= 0 ? ` (the middle of cut ${sty.aimLeg + 1}, the ◎ leg)` : '') +
-            ', so the middle of the swing passes through it',
-        onclick: () => editStyles('centre the cut', () => {
-          r.windup.az = cAz;
-          r.windup.el = cEl;
-        }),
-      }, '⌖'),
-      el('span', {}, 'windup')));
-  }
-  segFields(r.windup, 'windup', windupTip, 'windup');
-  seg.append(paceCell({
-    chase: true,
-    title: 'WINDUP PACING. "chase" = the closed-loop drive it has always had ' +
-      '(close on the pose at a capped rate). A curve makes it a TIMED ' +
-      'approach that lands on the pose on the last windup tick, speed where ' +
-      'the curve puts it — still capped under melee.commitSpeed, so no curve ' +
-      'can make a windup fire the cut early.',
-    get: () => (MELEE.EASES.includes(r.windup.ease) ? r.windup.ease : ''),
-    set: v => editStyles('windup pacing', () => {
-      if (v) r.windup.ease = v; else delete r.windup.ease;
-    }),
-  }));
-
-  // ---- THE CUT, WHICH IS A PATH (strokes.h "A CUT IS A PATH") -----------
-  //
-  // One row per LEG, run back to back inside the one Cut phase. Each leg is a
-  // TRAVEL from where the last one ended, so leg 2's az is measured from the
-  // end of leg 1 — which is what lets an author lengthen the opening without
-  // re-typing everything after it.
-  //
-  // THE FILE KEEPS BOTH SPELLINGS and so does this panel: one leg stays the
-  // bare `"cut": { … }` object every style in the library is written as, and
-  // "+ leg" is what turns it into a list. Both loaders read them identically,
-  // so an author who never adds a leg never sees a diff they did not make.
-  cutLegs(r).forEach((leg, k, all) => {
-    const many = all.length > 1;
-    const name = many ? `cut ${k + 1}` : 'cut';
-    const isAim = many && aimLegOf(r) === k;
-    const tip = 'A TRAVEL, not a pose: how far the point goes and how fast. ' +
-      'The deltas are divided by this leg\'s OWN tick count and delivered per ' +
-      'tick, so a short leg is a fast one — which gives the sweep the tip ' +
-      'speed that scales the damage: SPEED IS THE DAMAGE. The arm follows ' +
-      'the path exactly, however short the leg.' + (many
-        ? ` Leg ${k + 1} of ${all.length}, measured from where leg ${k} ended.`
-        : '');
-    const lbl = el('div', { class: 'lbl', title: tip,
-      style: 'display:flex;align-items:center;justify-content:flex-end;gap:3px' });
-    if (many) {
-      // THE AIM MARKER, and it is a marker rather than a number because the
-      // thing being said is "the target is in the middle of THIS leg". Unset
-      // on every leg = the midpoint of the whole travel, which is what a
-      // one-leg cut has always done.
-      lbl.append(el('button', {
-        class: 'small' + (isAim ? ' primary' : ''),
-        style: 'padding:0 4px;font-size:9px;line-height:14px',
-        title: isAim
-          ? 'the windup\'s ⌖ centre puts the TARGET in the middle of this leg ' +
-            '— click to go back to the midpoint of the whole travel. (A marker ' +
-            'for ⌖ only: it moves nothing until you press ⌖.)'
-          : 'make the windup\'s ⌖ centre put the TARGET in the middle of this ' +
-            'leg instead of at the midpoint of the whole path — which on a ' +
-            'dogleg is usually the CORNER, where the blade is slowest.',
-        onclick: () => {
-          editStyles(isAim ? 'clear aim leg' : `aim in cut ${k + 1}`, () => {
-            const legs = cutLegs(r);
-            for (const l of legs) delete l.aim;
-            if (!isAim) legs[k].aim = true;
-          });
-          render();
-        },
-      }, '◎'));
-    }
-    lbl.append(el('span', {}, name));
-    if (many) {
-      lbl.append(el('button', {
-        class: 'small danger', style: 'padding:0 4px;font-size:9px;line-height:14px',
-        title: 'drop this leg. The legs after it keep their own numbers, which ' +
-          'are RELATIVE — so the path after this corner shifts by whatever ' +
-          'this leg travelled.',
-        onclick: () => {
-          editStyles(`drop cut ${k + 1}`, () => {
-            const legs = cutLegs(r);
-            legs.splice(k, 1);
-            r.cut = legs.length > 1 ? legs : legs[0];
-          });
-          render();
-        },
-      }, '✕'));
-    }
-    seg.append(lbl);
-    segFields(leg, name, tip, 'cut' + k);
-    // THIS LEG'S PACING. A leg with no `ease` inherits the style-wide one
-    // (the old single "pacing" row); the first edit here moves that
-    // style-wide value onto every leg that had none and drops it, so the
-    // file ends up saying per leg what each leg does.
-    const styleEase = MELEE.EASES.includes(r.ease) ? r.ease : 'linear';
-    seg.append(paceCell({
-      title: `${name.toUpperCase()} PACING: how this leg's travel is spread over ` +
-        'its ticks. The CUT IS WHERE SPEED IS DAMAGE — a back-loaded curve ' +
-        '(quadIn/cubicIn) peaks the tip speed at the leg\'s end, a ' +
-        'front-loaded one (…Out) is fastest at its start.' +
-        (MELEE.EASES.includes(leg.ease) ? ''
-          : ` Inheriting the style-wide "${styleEase}".`),
-      get: () => (MELEE.EASES.includes(leg.ease) ? leg.ease : styleEase),
-      set: v => editStyles(`${name} pacing`, () => {
-        const legs = cutLegs(r);
-        const inherited = MELEE.EASES.includes(r.ease) ? r.ease : null;
-        if (inherited)
-          for (const l of legs) if (!MELEE.EASES.includes(l.ease)) l.ease = inherited;
-        delete r.ease;
-        const target = legs[k];
-        if (v === 'linear') delete target.ease; else target.ease = v;
-        r.cut = legs.length > 1 ? legs : legs[0];
-      }),
-    }));
-  });
-  seg.append(el('div', {}));
-  seg.append(el('div', { style: 'grid-column:span 5' },
-    chip('+ leg', false, () => {
-      editStyles('add a cut leg', () => {
-        const legs = cutLegs(r);
-        // SEEDED AS A SHORT CONTINUATION of the leg before it, not as zeros
-        // and not as a copy: a new leg that travelled nowhere reads as a
-        // stall, and one that repeated the last would double the stroke. Half
-        // the previous travel, bent the other way in elevation, is a dogleg —
-        // the shape the author came here for — and every number is theirs to
-        // change.
-        const prev = legs[legs.length - 1] || {};
-        legs.push({
-          ticks: Math.max(2, Math.round(num(prev.ticks, 7) * 0.6)),
-          az: num(prev.az, 0) * 0.4,
-          el: -num(prev.el, 0) * 0.5 - 0.15,
-          reach: -num(prev.reach, 0) * 0.5,
-        });
-        r.cut = legs;
-      });
-      render();
-    }, 'add a corner to the cut: the point travels this path in ONE phase, ' +
-       'with no hand-back between the legs — a hook that comes round a guard, ' +
-       'a chop that drops and then drags, a feint that checks and re-commits'),
-    cutLegs(r).length > 1
-      ? el('span', { class: 'hint', style: 'margin-left:6px' },
-          `${cutLegs(r).length} legs · ` +
-          (aimLegOf(r) >= 0
-            ? `target in cut ${aimLegOf(r) + 1}`
-            : 'target at the midpoint of the whole travel'))
-      : el('span', { class: 'hint', style: 'margin-left:6px' },
-          'one straight travel through the target')));
-
-  // ---- THE RECOVER, WHICH IS NOW A SEGMENT LIKE THE OTHER TWO -----------
-  //
-  // It used to be one tick box, because there was nothing else to author: the
-  // runner set held=false and everything after that belonged to one global
-  // melee.recoverTime and to a rotation-space crossfade that knows no anatomy
-  // (strokes.h StrokeRecover says what that cost). It now has a POSE, and the
-  // pose is ABSOLUTE rather than aim-relative — which is why its az/el column
-  // headers mean something different from the two rows above it, and why the
-  // tooltip says so rather than leaving the author to find out.
-  if (!r.recover || typeof r.recover !== 'object') r.recover = { ticks: 10 };
-  const rv = r.recover;
-  // `posed` is DERIVED FROM KEY PRESENCE in both loaders, so the toggle
-  // adds and deletes keys rather than writing a flag. That keeps one fact in
-  // one place — and it is why the pose boxes are hidden rather than zeroed
-  // when it is off: a box that wrote 0 would silently turn the pose ON.
-  const posed = rv.az !== undefined || rv.el !== undefined ||
-                rv.reach !== undefined;
-  const rvTip = posed
-    ? 'A RETURN, driven. The arm is STEERED from wherever the cut left it to ' +
-      'the stance below — closed-loop and under melee.commitSpeed, the ' +
-      'windup\'s own drive, so no cut can fire out of a recover — and only ' +
-      'then is the claim handed back. THE POSE IS ABSOLUTE, in the mob\'s own ' +
-      'facing basis, NOT relative to the aim like the windup: a recover is a ' +
-      'return to stance, not a second aim.'
-    : 'A hold with no input: the follow-through unwinds and the arm is ' +
-      'handed back over melee.recoverTime. The arm is NOT steered anywhere — ' +
-      'the stroke freezes where the cut ended and the rig crossfades to the ' +
-      'walk pose, which is what makes a deep cut blend home through the ' +
-      'torso. Turn on "return pose" to drive it back instead.';
-  seg.append(el('div', { class: 'lbl', title: rvTip }, 'recover'));
-  seg.append(numCell({
-    int: true, step: 1, min: 1, max: 120, dflt: 10, title: rvTip,
-    get: () => Math.max(1, Math.round(num(rv.ticks, 10))),
-    sub: fmt(Math.max(1, Math.round(num(rv.ticks, 10))) * TICK_MS / 1000, 2) + ' s',
-    set: v => editStyles('recover ticks', () => { rv.ticks = v; }),
-  }));
-  if (posed) {
-    seg.append(guideCell(degCell(rv, 'az', 'return azimuth (ABSOLUTE)', 'recover'), 'recover'));
-    seg.append(guideCell(degCell(rv, 'el', 'return elevation (ABSOLUTE)', 'recover'), 'recover'));
-    seg.append(guideCell(numCell({
-      step: 0.01, min: -1, max: 1,
-      title: 'the stance\'s BAND POSITION offset, read exactly as the windup ' +
-        'and cut reach are: 0 is the neutral 0.60 of this arm\'s annulus.',
-      get: () => num(rv.reach, 0),
-      sub: reachSub(rv.reach),
-      subTitle: 'where that lands on the arm currently previewing',
-      set: v => editStyles('recover reach', () => { rv.reach = v; }),
-    }), 'recover'));
-  } else {
-    seg.append(el('div', {}), el('div', {}), el('div', {}));
-  }
-  seg.append(paceCell({
-    chase: true, disabled: !posed,
-    title: posed
-      ? 'RECOVER PACING — paces the SETTLE (the driven return to the stance). ' +
-        '"chase" = the closed-loop drive; a curve makes the arm land on the ' +
-        'return pose on the last settle tick. The fade after it is a weight ' +
-        'crossfade and is not paced.'
-      : 'Recover pacing paces the driven return, and this recover has no ' +
-        'return pose — turn on "return pose" first.',
-    get: () => (MELEE.EASES.includes(rv.ease) ? rv.ease : ''),
-    set: v => editStyles('recover pacing', () => {
-      if (v) rv.ease = v; else delete rv.ease;
-    }),
-  }));
-
-  // ---- settle / fade, the two halves of the `ticks` above ---------------
-  const settle = Math.max(0, Math.round(num(rv.settle, 0)));
-  const fade = Math.max(0, Math.round(num(rv.fade, 0)));
-  seg.append(el('div', { class: 'lbl',
-    title: 'HOW THE ' + Math.max(1, Math.round(num(rv.ticks, 10))) +
-      ' RECOVER TICKS ARE SPENT. settle = driven to the return pose with the ' +
-      'claim at full weight; fade = the hand-back. settle + fade must fit in ' +
-      'the segment or the loader extends it — a claim dropped mid-fade is a ' +
-      'PoseWeight stepping to 0 in one tick, which is the snap all of this ' +
-      'exists to remove.' },
-    el('span', { class: 'hint', style: 'text-transform:none;letter-spacing:0' },
-      '↳ split')));
-  seg.append(numCell({
-    int: true, step: 1, min: 0, max: 120, dflt: 0,
-    title: posed
-      ? 'SETTLE: ticks DRIVEN to the return pose before the button is ' +
-        'released. The button is still down for every one of them, so ' +
-        'PoseWeight stays at 1 and the arm really travels — it is not a ' +
-        'weight fading on a frozen pose. 0 = release immediately (the ' +
-        'pre-2026-09-21 recover).'
-      : 'SETTLE needs a return pose to drive to — turn "return pose" on. ' +
-        'Both loaders warn and ignore a settle without one.',
-    get: () => settle,
-    sub: settle > 0 ? fmt(settle * TICK_MS / 1000, 2) + ' s' : 'settle',
-    set: v => editStyles('recover settle', () => {
-      if (v > 0) rv.settle = v; else delete rv.settle;
-    }),
-  }));
-  seg.append(numCell({
-    int: true, step: 1, min: 0, max: 120, dflt: 0,
-    title: 'FADE: ticks the hand-back takes, overriding melee.recoverTime FOR ' +
-      'THIS STYLE (0 = the global value, ' +
-      fmt(num(host?.meleeTuning?.().recoverTime, 0.22), 2) + ' s = ' +
-      Math.round(num(host?.meleeTuning?.().recoverTime, 0.22) * 1000 / TICK_MS) +
-      ' ticks). A jab and an overhead chop have no business handing the arm ' +
-      'back on the same clock, and before this they had no choice.',
-    get: () => fade,
-    sub: fade > 0 ? fmt(fade * TICK_MS / 1000, 2) + ' s' : 'fade',
-    set: v => editStyles('recover fade', () => {
-      if (v > 0) rv.fade = v; else delete rv.fade;
-    }),
-  }));
-  seg.append(el('div', { style: 'grid-column:span 3' },
-    chip(posed ? 'return pose ✓' : '+ return pose', posed, () => {
-      editStyles(posed ? 'plain recover' : 'driven recover', () => {
-        if (posed) {
-          delete rv.az; delete rv.el; delete rv.reach; delete rv.settle;
-        } else {
-          // SEEDED FROM THE WINDUP'S OWN STANCE, not from zeros. A style's
-          // windup az/el is the side it chambers on, and coming back to that
-          // side is what "recover" means for nearly every stroke — an all-zero
-          // return would drive every attack in the game home to dead centre
-          // and read as the editor picking a pose for you.
-          const w = r.windup || {};
-          rv.az = num(w.az, 0);
-          rv.el = num(w.el, 0);
-          rv.reach = num(w.reach, 0);
-          rv.settle = Math.max(1, Math.round(num(rv.ticks, 10) * 0.6));
-        }
-        if (posed) delete rv.ease;
-      });
-      render();
-    }, posed
-      ? 'drop the return pose: the arm freezes where the cut ended and the rig ' +
-        'crossfades home (the pre-2026-09-21 recover)'
-      : 'drive the arm back to a stance instead of crossfading out of the ' +
-        'cut pose — seeded from this style\'s own windup stance')));
-
-  if (!r.jitter || typeof r.jitter !== 'object') r.jitter = { az: 0, el: 0, tempo: 0 };
-  const jTip = 'VARIATION IS DETERMINISTIC (CLAUDE.md rule 1): every draw is ' +
-    'Hash3(mobId ^ salt, tick, index), so ten swings vary and the fight ' +
-    'replays. 0 on the player_* styles is deliberate — a strike must go ' +
-    'exactly where it was flicked.';
-  seg.append(el('div', { class: 'lbl', title: jTip }, 'jitter'));
-  seg.append(numCell({
-    step: 0.01, min: 0, max: 1,
-    title: 'tempo: scales BOTH tick counts, ± — what stops two duelists ' +
-      'beating time together',
-    get: () => num(r.jitter.tempo, 0), sub: 'tempo',
-    set: v => editStyles('jitter tempo', () => { r.jitter.tempo = v; }),
-  }));
-  seg.append(degCell(r.jitter, 'az', 'start bow', 'jitter'));
-  seg.append(degCell(r.jitter, 'el', 'start bow', 'jitter'));
-  seg.append(el('div', {}), el('div', {}));
-  card.append(seg);
-
-  // (The style-wide cut "pacing" row that lived here is now the pacing column
-  // above, one per segment. A style's old top-level `ease` still loads as the
-  // default for legs that state none — and the leg dropdowns show it.)
-
-  // ---- PER-JOINT BRAKES (strokes.h AttackStyle::joints, melee.h ArmSmooth) -
-  //
-  // The driver commands a hand and an elbow pole; the joint rotations are what
-  // the IK makes of them, and a shoulder can whip round its own axis between
-  // the windup and the cut while the blade path looks fine. These brake the
-  // POSED joint (each relative to its parent) after the solve: `smooth` is a
-  // half-life in ticks, `max°/tick` a hard cap on how far it turns per tick.
-  // 0 = off. The damage sweep reads the posed blade, so a braked arm hits
-  // where it is drawn.
-  card.append(jointsGrid(r));
+  card.append(framesSection(sty));
 
   // ---- THE BODY ANIMATION (strokes.h AttackStyle::clip) -----------------
   // The program above drives the WEAPON ARM. Everything else the swing does
@@ -1481,6 +1979,12 @@ function previewCard(sty) {
       '±0.28 of tempo) every cycle was a different swing and nothing said so. ' +
       'On, you see the spread the game will actually produce. `reroll` steps ' +
       'the sequence one draw either way.'),
+    chip('slow ×10', slow, () => {
+      slow = !slow;
+      if (host?.state?.().live) host?.begin?.(selected);
+      render();
+    }, 'play every frame (and the release) ten times longer in this preview ' +
+       'only — to read a swing tick by tick. Nothing is saved.'),
     chip('trail', trailOn, () => {
       trailOn = !trailOn; host?.onTrailToggled?.(); render();
     }, 'draw the blade\'s swept edge, coloured by phase'),
@@ -1535,6 +2039,7 @@ function previewCard(sty) {
     t5.append(chip('off', !goalKey, () => {
       if (!goalKey) return;
       goalKey = null;
+      manual = false;
       host?.stop?.();
       render();
     }, 'back to the driven preview'));
@@ -1545,36 +2050,37 @@ function previewCard(sty) {
         // rather than letting the next tick fight the snap.
         host?.stop?.();
         render();
-      }, g.key === 'windup'
-        ? 'the pose the cut STARTS from: target + windup. ' +
-          'The start bow is excluded — jitter is a per-swing draw and a goal ' +
-          'is what was authored.'
-        : g.key === 'recover'
-        ? 'the ABSOLUTE return stance, in the rig\'s own facing basis — not ' +
-          'relative to the aim like the other two.'
-        : `where the point stands when ${g.label} ends: target + windup + ` +
-          'the travel through this leg. An absolute point on the path, which is ' +
-          'why a leg that fell short does not move the ones after it.'));
-    if (!sty.recover.posed)
-      t5.append(el('span', { class: 'hint' },
-        'recover has no pose to hold — turn on "return pose"'));
+      }, `hold the arm where the program ARRIVES at the end of frame ${g.frame + 1} ` +
+        `("${g.label}") — the swing run from rest and stopped on that frame's ` +
+        'last tick, exactly what a solo of it freezes on. The yellow cross is ' +
+        'the authored target; a gap to it is how far short the frame stops ' +
+        '(a chase frame out of ticks). Uses this swing\'s jitter draw.'));
     card.append(t5);
     // The resolved numbers, because "hold the windup" is only useful if you
-    // can read what it resolved TO on this arm.
+    // can read what it resolved TO on this arm — and how far the arm that
+    // actually arrives is from what the row asks for.
     if (goalKey) {
       const g = host?.goalPose?.(goalKey);
       const line = el('div', { class: 'atkderived' });
-      if (g)
+      const deg = v => String(Math.round(v * DEG)) + '°';
+      if (g) {
+        const a = g.arrived;
+        const off = a ? Math.hypot(a.az - g.az, a.el - g.el) : 0;
         line.append(el('span', {},
-          el('b', {}, 'holding '), goalKey, ' — az ',
-          el('b', {}, String(Math.round(g.az * DEG)) + '°'), ' · el ',
-          el('b', {}, String(Math.round(g.el * DEG)) + '°'), ' · reach ',
-          el('b', {}, fmt(g.reach, 1) + ' vox'),
+          el('b', {}, 'holding '),
+          (MELEE.strokeGoals(sty).find(q => q.key === goalKey) || {}).label || goalKey,
+          a ? ' — arrives az ' : ' — az ',
+          el('b', {}, deg(a ? a.az : g.az)), ' · el ',
+          el('b', {}, deg(a ? a.el : g.el)), ' · reach ',
+          el('b', {}, fmt(a ? a.reach : g.reach, 1) + ' vox'),
+          a ? el('span', { class: 'hint' },
+            `  · authored ${deg(g.az)} / ${deg(g.el)} / ${fmt(g.reach, 1)} vox` +
+            (off > 0.035 ? ` — stops ${deg(off)} short` : '')) : '',
           el('span', { class: 'hint' },
             '  (absolute, in the rig\'s facing basis)')));
-      else
+      } else
         line.append(el('span', { class: 'hint' },
-          'this style has no "' + goalKey + '" destination on this arm'));
+          'this style has no such frame any more'));
       card.append(line);
     }
   }
@@ -1623,11 +2129,13 @@ function previewCard(sty) {
     }
   }
   t2.append(el('span', { class: 'spacer' }),
-    el('label', { title: 'the target\'s BEARING about the shoulder. The windup ' +
-      'is measured from it (0/0 = pointing at it); ⌖ on the windup row centres ' +
-      'the cut on it' }, 'aim'),
-    aimSlider('az'), aimSlider('el'),
-    chip('centre', false, () => { aim = { az: 0, el: 0 }; render(); }));
+    el('label', { title: 'the TARGET: its bearing from the eyes (0/0 = straight ' +
+      'ahead of the face) and its distance in voxels. Every frame not measured ' +
+      'from the body is measured from it; ⌖ on the windup row centres the cut on it' }, 'aim'),
+    aimSlider('az'), aimSlider('el'), aimSlider('dist'),
+    chip('centre', false, () => { aim = { ...aim, az: 0, el: 0 }; render(); }),
+    chip('orb', orbOn, () => { orbOn = !orbOn; render(); },
+      'show the target as an orb in the viewport'));
   card.append(t2);
 
   if (sty) card.append(strokeBar(sty), lungeTimeline(sty));
@@ -1684,8 +2192,9 @@ function lungeText(sty, info) {
 
 function aimSlider(key) {
   const g = el('span', { style: 'display:inline-flex;gap:3px;align-items:center' });
-  const s = el('input', { type: 'range', min: key === 'az' ? '-1.4' : '-1.0',
-    max: key === 'az' ? '1.4' : '1.0', step: '0.01',
+  const [lo, hi, st] = key === 'az' ? [-1.4, 1.4, 0.01]
+    : key === 'el' ? [-1.0, 1.0, 0.01] : [2, 30, 0.5];
+  const s = el('input', { type: 'range', min: String(lo), max: String(hi), step: String(st),
     style: 'width:64px', title: key });
   s.value = String(aim[key]);
   const box = el('span', { class: 'hint',
@@ -2230,32 +2739,32 @@ function helpBody() {
     'target\'s bearing in the same frame — the sliders here; in the game it ' +
     'is the camera line for the player and the target\'s position for an ' +
     'NPC — and every windup value is an OFFSET from it.');
+  p(b('AN ATTACK IS A LIST OF FRAMES, and every frame is the same. '),
+    'Each frame says WHERE THE TIP IS when it ends (az / el / reach), what ' +
+    'that is measured from (the target, or the body), how many ticks it ' +
+    'takes, how the speed is spread (pacing), whether it CUTS (the damage ' +
+    'sweep is live), which side of the tip the hand LEANS, how much the WRIST ' +
+    'lays the blade along the stroke, how much the TORSO turns with it, and ' +
+    'the per-joint SMOOTHING while it runs. "windup", "cut", "recover" are ' +
+    'only names. After the last frame, RELEASE ticks hand the arm back.');
+  p(b('THE CUT IS THE RUN OF CUTTING FRAMES. '),
+    'Frames before it are the windup — the aim LOCKS at the end of the last ' +
+    'one, which is what makes the telegraph mean something — and frames ' +
+    'after it are the return. ⌖ centre on target shifts every ' +
+    'target-measured frame so the middle of the cut passes through the target.');
+  p(b('PACING. '),
+    'linear and the curves always ARRIVE on the frame\'s last tick. chase ' +
+    'closes on the pose at a capped speed (its box) and arrives whenever it ' +
+    'arrives — possibly never, in a short frame; the stock windups and returns ' +
+    'use it because that is how they have always moved.');
   p(b('A SWING STARTS FROM WHEREVER THE ARM IS. '),
-    'The driver seeds its stroke from the blade\'s live position, so with ' +
-    'the arm hanging the stroke opens at el ≈ −1.3 rad however the style ' +
-    'is authored, and the WINDUP is what climbs out of that. The climb is a ' +
-    'closed loop capped at 16 units × the aim gain per tick (≈ 0.1 rad/tick ' +
-    'on the shipped gains): the "fit" line says how many ticks the climb ' +
-    'needs against how many the windup has. Short, and the cut inherits ' +
-    'the leftover — which is the blade "moving around in elevation" with ' +
-    'every el authored 0. Give the windup the ticks, or set solo ▸ windup ' +
-    'and watch where it actually gets to.');
-  p(b('SOLO shows one segment. '),
-    'windup: from the seeded start to the windup pose, then hold. cut: the ' +
-    'windup is run through instantly, then the travel, then hold. recover: ' +
-    'both run through, then the hand-back. Hold is 0.8 s, then it loops.');
-  p(b('THE CUT IS CENTRED ON THE AIM. '),
-    'The windup lands at aim minus half the cut\'s own travel, so the blade ' +
-    'passes THROUGH where it was aimed rather than starting there — a stroke ' +
-    'aimed at its own start point cuts the air behind the target every time. ' +
-    'The aim is frozen at the END of the windup and never refreshed, which is ' +
-    'what makes the telegraph mean something.');
-  p(b('WINDUP is a POSE; CUT is a TRAVEL. '),
-    'The windup is driven closed-loop and deliberately slowly (capped at ' +
-    '16 units/tick) and its length is the whole telegraph. The cut\'s deltas ' +
-    'are divided by its tick count and delivered per tick, which gives the ' +
-    'sweep the tip speed that scales the damage — and the arm follows that ' +
-    'path exactly: the driver adds no motion of its own.');
+    'The first frame travels from the blade\'s live position (with the arm ' +
+    'hanging, el ≈ −1.3 rad), so give it the ticks to get where it is going.');
+  p(b('SOLO shows one phase. '),
+    'windup: the frames before the cut, then hold. cut: those run through ' +
+    'instantly, then the cutting frames, then hold. recover: both run ' +
+    'through, then the return and the release. Hold is 0.8 s, then it loops. ' +
+    '◎ show on a frame HOLDS the arm on that frame\'s end pose instead.');
   p(b('REACH IS A BAND POSITION. '),
     '0 is the neutral 0.60 of the arm\'s own annulus, not zero voxels. ' +
     'Authored against the ARM instead, every chamber and lunge in the shipped ' +
@@ -2263,9 +2772,9 @@ function helpBody() {
     'voxels moved 0.15 and read as a twitch.');
   p(b('VARIATION IS DETERMINISTIC. '),
     'Every draw is Hash3(mobId ^ salt, tick, index), so ten swings vary and the ' +
-    'fight replays. jitter.az/el bow the start pose; jitter.tempo scales both ' +
-    'tick counts. The player_* styles author 0 on purpose — a strike must go ' +
-    'exactly where it was flicked.');
+    'fight replays. jitter bow az/el wobbles the frames before the cut; ' +
+    'jitter tempo stretches every frame up to the cut. The player copies ' +
+    'author 0 on purpose — a strike must go exactly where it was flicked.');
   p(b('THE PREVIEW IS THE ENGINE\'S OWN DRIVER. '),
     'editor/melee.js is a line-cited port of melee.cpp and strokes.cpp, not a ' +
     'second implementation. Verify it with ', el('code', {}, 'node scripts/test_melee.mjs'),

@@ -261,6 +261,97 @@ void Overlay::DrawHUD(const UIState& s) {
       IM_COL32(70, 120, 230, 235), IM_COL32(150, 200, 255, 245), "mp",
       s.manaReserved > 0 ? s.manaMax : -1);
 
+  // ---- the strike compass, right of the bars (UIState::strikeCompass) -------
+  // A debug readout: the flick map's spokes, the live flick against the pick
+  // threshold (the inner ring), the spoke a press would take NOW (gold), the
+  // spoke the last press took (ember, fading), and two lines naming the last
+  // strike and where the running one is.
+  if (s.strikeCompass) {
+    const float S = 116.0f;
+    const float bx = std::floor(x + w + 14.0f);
+    const float by = std::floor(yMana + h - S);
+    const ImVec2 c(std::floor(bx + S * 0.5f), std::floor(by + S * 0.5f));
+    const float R = S * 0.5f - 6.0f;
+    const float r0 = R * 0.30f;   // the pick threshold's radius
+    d->AddRectFilled(ImVec2(bx - 2, by - 2), ImVec2(bx + S + 2, by + S + 2),
+                     IM_COL32(0, 0, 0, 110));
+    d->AddRectFilled(ImVec2(bx, by), ImVec2(bx + S, by + S), IM_COL32(18, 20, 28, 200));
+    d->AddRect(ImVec2(bx, by), ImVec2(bx + S, by + S), ui::ColBronze(), 0.0f, 0, 2.0f);
+    d->AddCircle(c, r0, IM_COL32(255, 255, 255, 50), 20, 1.0f);
+    const float lastA = std::clamp(1.0f - s.strikeLastAge / 3.0f, 0.0f, 1.0f);
+    // "horizontal_r" -> "hor_r": every word cut to three.
+    auto shortName = [](const std::string& n) {
+      std::string out;
+      size_t a = 0;
+      while (a <= n.size()) {
+        size_t b = n.find('_', a);
+        if (b == std::string::npos) b = n.size();
+        if (!out.empty()) out += '_';
+        out += n.substr(a, std::min<size_t>(3, b - a));
+        a = b + 1;
+      }
+      return out;
+    };
+    for (int k = 0; k < (int)s.strikeSectors.size(); k++) {
+      const UIState::StrikeSector& sec = s.strikeSectors[k];
+      const ImVec2 tip(std::floor(c.x + sec.x * R * 0.55f),
+                       std::floor(c.y + sec.y * R * 0.55f));
+      ImU32 col = sec.neutral ? ui::ColParchDim() : ui::ColSteel();
+      float thick = 2.0f;
+      if (k == s.strikeLastSector && lastA > 0.0f) {
+        col = ui::Mix(col, ui::ColEmber(), lastA);
+        thick = 4.0f;
+      }
+      if (k == s.strikeHover) {
+        col = ui::ColGoldHi();
+        thick = 4.0f;
+      }
+      d->AddLine(c, tip, col, thick);
+      const std::string lab = shortName(sec.name);
+      const ImVec2 ts = ImGui::CalcTextSize(lab.c_str());
+      const ImVec2 lc(c.x + sec.x * R * 0.80f, c.y + sec.y * R * 0.80f);
+      ui::ShadowText(d, ImVec2(std::floor(lc.x - ts.x * 0.5f), std::floor(lc.y - ts.y * 0.5f)),
+                     col, lab.c_str());
+    }
+    // The live flick: its length is speed / threshold x r0, so it crosses the
+    // ring exactly when a press would read as a flick.
+    const float sp = std::sqrt(s.strikeFlickX * s.strikeFlickX +
+                               s.strikeFlickY * s.strikeFlickY);
+    if (sp > 1e-3f) {
+      const float len = std::min(R, sp / s.strikePickMin * r0);
+      const ImVec2 fp(std::floor(c.x + s.strikeFlickX / sp * len),
+                      std::floor(c.y + s.strikeFlickY / sp * len));
+      const ImU32 fc = sp >= s.strikePickMin ? ui::ColGoldPale() : IM_COL32(150, 150, 160, 200);
+      d->AddLine(c, fp, fc, 2.0f);
+      d->AddRectFilled(ImVec2(fp.x - 2, fp.y - 2), ImVec2(fp.x + 2, fp.y + 2), fc);
+    }
+    // The last press's own flick direction, as a dot on the rim.
+    if (s.strikeLastFlicked && lastA > 0.0f) {
+      const ImVec2 lp(std::floor(c.x + s.strikeLastX * R), std::floor(c.y + s.strikeLastY * R));
+      d->AddRectFilled(ImVec2(lp.x - 3, lp.y - 3), ImVec2(lp.x + 3, lp.y + 3),
+                       ui::Fade(ui::ColEmber(), lastA));
+    }
+    d->AddRectFilled(ImVec2(c.x - 2, c.y - 2), ImVec2(c.x + 2, c.y + 2), ui::ColParch());
+
+    // The readout, bottom-aligned beside the box.
+    const float tx = bx + S + 10.0f;
+    const float lh = ImGui::GetTextLineHeight() + 2.0f;
+    float ty = std::floor(by + S - lh * 3.0f);
+    char buf[96];
+    std::snprintf(buf, sizeof buf, "flick %.0f px/s (pick at %.0f)", sp, s.strikePickMin);
+    ui::ShadowText(d, ImVec2(tx, ty),
+                   sp >= s.strikePickMin ? ui::ColGoldPale() : ui::ColParchDim(), buf);
+    ty += lh;
+    if (!s.strikeLastText.empty()) {
+      const std::string t = "last: " + s.strikeLastText;
+      ui::ShadowText(d, ImVec2(tx, ty),
+                     ui::Mix(ui::ColParchDim(), ui::ColEmber(), lastA), t.c_str());
+    }
+    ty += lh;
+    if (!s.strikeNowText.empty())
+      ui::ShadowText(d, ImVec2(tx, ty), ui::ColGoldHi(), s.strikeNowText.c_str());
+  }
+
   // ---- what is ON you, one line, only when there is enough of it -----------
   //
   // The bars say how you ARE; the figure's tint says which parts are coated;

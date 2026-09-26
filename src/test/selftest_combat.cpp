@@ -1837,6 +1837,13 @@ Status GateNpcStyles(Ctx& c, std::string& detail) {
       std::printf("npc-styles %-14s dominance not asserted: it LEAPS, and the "
                   "basis the claim is stated in travels with it\n",
                   sty.name.c_str());
+    } else if (sty.Keyed()) {
+      // A KEYED style (strokes.h "A FRAME IS A POSE") states no az / el /
+      // reach and commands no arc: there is nothing authored to classify it
+      // by, and the driver's arc is not what the arm does. That the effector
+      // moved is asserted above; the shape is the poses'.
+      std::printf("npc-styles %-14s dominance not asserted: KEYED (a list of "
+                  "poses, no authored travel)\n", sty.name.c_str());
     } else if (wantR > wantAz && wantR > wantEl) {
       // A THRUST. Reach-dominant: the point goes OUT, not around. Measured in
       // VOXELS (a radius) against radians, so the two are asserted separately

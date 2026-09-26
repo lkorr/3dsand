@@ -163,6 +163,7 @@ let naturalEdges = null;
 // The Attacks lane's ANGLE GUIDE (rig.js drawAngleGuide): lines in the scene,
 // labels as HTML over the canvas, re-projected every frame.
 let angleGuide = null;
+let aimOrb = null, aimLine = null;
 const guideLabels = [];   // { div, pos: [x, y, z], on }
 let resizeHandles = [];        // 6 spheres, one per bounding-box face
 let canvas = null, host = null;
@@ -1545,6 +1546,36 @@ function buildScene() {
   angleGuide.visible = false;
   scene.add(angleGuide);
 
+  // The Attacks lane's AIM ORB (rig.js drawAimOrb): what the stroke is aimed
+  // at. A solid core that the rig can occlude, a halo drawn over everything so
+  // it is never lost behind the arm, and a faint line back to the pivot.
+  {
+    const C = 0xff3b6b;
+    aimOrb = new THREE.Group();
+    const core = new THREE.Mesh(new THREE.SphereGeometry(1, 20, 14),
+      new THREE.MeshBasicMaterial({ color: C }));
+    core.renderOrder = 996;
+    const halo = new THREE.Mesh(new THREE.SphereGeometry(1.9, 20, 14),
+      new THREE.MeshBasicMaterial({ color: C, transparent: true, opacity: 0.22,
+                                    depthTest: false, depthWrite: false }));
+    halo.renderOrder = 1003;
+    const ring = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.CircleGeometry(2.4, 32)),
+      new THREE.LineBasicMaterial({ color: 0xffd0da, transparent: true,
+                                    opacity: 0.8, depthTest: false }));
+    ring.renderOrder = 1003;
+    aimOrb.add(core, halo, ring);
+    aimOrb.userData = { core, halo, ring };
+    aimOrb.visible = false;
+    scene.add(aimOrb);
+    aimLine = new THREE.Line(new THREE.BufferGeometry(),
+      new THREE.LineBasicMaterial({ color: C, transparent: true, opacity: 0.35,
+                                    depthTest: false }));
+    aimLine.renderOrder = 1003;
+    aimLine.visible = false;
+    scene.add(aimLine);
+  }
+
   // Resize handles: 6 spheres on each face of the active model's bounding box.
   const FACE_DEFS = [
     { axis: 0, sign: +1 }, { axis: 0, sign: -1 },
@@ -1759,6 +1790,7 @@ function animate(nowMs) {
   if (needsRebuild) { rebuildInstances(); needsRebuild = false; }
   controls.update();
   placeGuideLabels();
+  placePoseHandles();
   renderer.render(scene, camera);
 }
 
@@ -2510,6 +2542,26 @@ export function setHiltBox(state) {
 export function setStrokeTrail(segs) { fillSegments(strokeTrail, segs); }
 
 /**
+ * The Attacks lane's aim target: `{ pos:[x,y,z], radius, from:[x,y,z] }` puts
+ * the orb at `pos` (core `radius`, halo and ring larger) with a faint line
+ * from `from`; null hides it. The ring faces the camera.
+ */
+export function setAimOrb(state) {
+  if (!aimOrb) return;
+  if (!state) { aimOrb.visible = false; aimLine.visible = false; return; }
+  aimOrb.visible = true;
+  aimOrb.position.set(state.pos[0], state.pos[1], state.pos[2]);
+  aimOrb.scale.setScalar(Math.max(state.radius || 1, 1e-3));
+  if (camera) aimOrb.userData.ring.quaternion.copy(camera.quaternion);
+  if (state.from) {
+    aimLine.geometry.setFromPoints([
+      new THREE.Vector3(state.from[0], state.from[1], state.from[2]),
+      new THREE.Vector3(state.pos[0], state.pos[1], state.pos[2])]);
+    aimLine.visible = true;
+  } else aimLine.visible = false;
+}
+
+/**
  * The same overlay, for a natural weapon's AUTHORED edge (mob.h
  * MobNaturalWeaponDef): the segment a fist or a set of jaws sweeps, drawn
  * while its row is open so `from`/`to` can be typed against a picture instead
@@ -2544,6 +2596,93 @@ export function setAngleGuide(segs, labels) {
     g.div.style.border = '1px solid ' + (w.color || '#fff') + '66';
   }
   placeGuideLabels();
+}
+
+/* ---- POSE HANDLES (the Attacks lane's manual adjustment mode) -----------
+   Small labelled buttons pinned to 3D points on the rig — the shoulder, the
+   elbow, the wrist, the tip — that the author DRAGS. They report pixel deltas
+   to rig.js, which turns them into the held frame's numbers (az, el,
+   extension, blade angle, elbow direction, lean angle). DOM elements rather
+   than scene meshes: they must be clickable above everything and readable,
+   and the guide labels above already prove the projection.
+   `setPoseHandles(null)` hides them. The list is matched BY INDEX, so a
+   caller must keep the order stable while a drag is live. */
+const poseHandles = [];   // { div, pos, on, id }
+let poseCb = null;
+
+export function setPoseHandles(list, cb) {
+  poseCb = cb || null;
+  const want = list || [];
+  while (poseHandles.length < want.length && host) {
+    const div = document.createElement('div');
+    div.style.cssText = 'position:absolute;left:0;top:0;z-index:6;' +
+      'transform:translate(-50%,-50%);font:700 11px var(--mono,monospace);' +
+      'padding:2px 7px;border-radius:10px;cursor:grab;user-select:none;' +
+      'touch-action:none;display:none;white-space:nowrap;' +
+      'box-shadow:0 1px 3px rgba(0,0,0,.6)';
+    const h = { div, pos: [0, 0, 0], on: false, id: null };
+    div.addEventListener('pointerdown', ev => {
+      if (!poseCb || !h.id) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      try { div.setPointerCapture(ev.pointerId); } catch (_) { /* old browsers */ }
+      const id = h.id;
+      let lx = ev.clientX, ly = ev.clientY;
+      div.style.cursor = 'grabbing';
+      poseCb.down?.(id, ev);
+      const mv = e => {
+        const dx = e.clientX - lx, dy = e.clientY - ly;
+        lx = e.clientX; ly = e.clientY;
+        if (dx || dy) poseCb?.drag?.(id, dx, dy, e);
+      };
+      const up = e => {
+        div.removeEventListener('pointermove', mv);
+        div.removeEventListener('pointerup', up);
+        div.removeEventListener('pointercancel', up);
+        div.style.cursor = 'grab';
+        poseCb?.up?.(id, e);
+      };
+      div.addEventListener('pointermove', mv);
+      div.addEventListener('pointerup', up);
+      div.addEventListener('pointercancel', up);
+    });
+    host.append(div);
+    poseHandles.push(h);
+  }
+  for (let i = 0; i < poseHandles.length; i++) {
+    const h = poseHandles[i], w = want[i];
+    h.on = !!w;
+    if (!w) { h.div.style.display = 'none'; h.id = null; continue; }
+    h.id = w.id;
+    h.pos = w.pos;
+    h.div.textContent = w.text;
+    h.div.title = w.title || '';
+    h.div.style.color = '#0b0e13';
+    h.div.style.background = w.color || '#ffc857';
+    h.div.style.outline = w.active ? '2px solid #ffffff' : 'none';
+  }
+  placePoseHandles();
+}
+
+/** A scene point [x,y,z] to canvas pixels [x,y], or null behind the camera. */
+export function projectToScreen(p) {
+  if (!canvas || !camera || !p) return null;
+  _v3.set(p[0], p[1], p[2]).project(camera);
+  if (_v3.z > 1 || _v3.z < -1) return null;
+  return [(_v3.x + 1) / 2 * canvas.clientWidth, (1 - _v3.y) / 2 * canvas.clientHeight];
+}
+
+function placePoseHandles() {
+  if (!canvas || !camera) return;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  for (const p of poseHandles) {
+    if (!p.on) continue;
+    _v3.set(p.pos[0], p.pos[1], p.pos[2]).project(camera);
+    if (_v3.z > 1 || _v3.z < -1) { p.div.style.display = 'none'; continue; }
+    p.div.style.display = 'block';
+    p.div.style.left = ((_v3.x + 1) / 2 * w).toFixed(1) + 'px';
+    p.div.style.top = ((1 - _v3.y) / 2 * h).toFixed(1) + 'px';
+  }
 }
 
 function placeGuideLabels() {

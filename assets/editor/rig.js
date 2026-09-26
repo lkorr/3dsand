@@ -3235,7 +3235,7 @@ function stepPreview(dtFrame) {
   while (n-- > 0) stepPreviewFixed(kPreviewDt);
 }
 
-function stepPreviewFixed(dt) {
+function stepPreviewFixed(dt, skipWeapon = false) {
   if (!skel || !anim) return;
   dbgPreviewSteps++;
   const sidecar = ed.getSidecar() || {};
@@ -3246,7 +3246,7 @@ function stepPreviewFixed(dt) {
   // ---- the stroke driver, BEFORE the animation pass (mob.cpp:1895) -------
   // "Advance the stroke and push the pose, so the animation pass sees THIS
   // tick's pose rather than last tick's." Runs on the sim's own 30 Hz clock.
-  weaponStep(dt);
+  if (!skipWeapon) weaponStep(dt);
 
   const speed = previewCtx.defSpeed * gaitSpeedScale;
 
@@ -3359,6 +3359,7 @@ function stepPreviewFixed(dt) {
   // orders them that way: the spine share this adds rides on top of whatever
   // the swing's own torso lean already put there.
   lastAim = null;
+  lastPoseDriven = !!weaponPose();
   applyStrikeAim();
   // stage 4
   AN.animFlatten(skel, anim);
@@ -3396,6 +3397,7 @@ function stepPreviewFixed(dt) {
   // After every solve, never between them: the IK is what puts a joint out of
   // range, so clamping earlier would only clamp a pose about to be replaced.
   AN.animClampPoseLimits(skel, anim, weaponHinge ? [weaponHinge] : null);
+  reapplyKeyedArm();
   // The blade's swept edge, recorded AFTER the pose is final — the item rides
   // the hand's animated transform, so anything sampled earlier is a tick stale.
   recordStrokeTrail();
@@ -3412,7 +3414,7 @@ function stepPreviewFixed(dt) {
  * Older ticks fade so the direction of travel is readable from a still.
  */
 function pushStrokeTrail() {
-  if (!strokeTrail.length) { ed.setStrokeTrail?.(null); return; }
+  if (!strokeTrail.length) { ed.setStrokeTrail?.(goalMarkerSegs); return; }
   const n = strokeTrail.length;
   const segs = strokeTrail.map((s, i) => {
     const age = (i + 1) / n;                       // 0 oldest .. 1 newest
@@ -3424,7 +3426,7 @@ function pushStrokeTrail() {
       alpha: (cut ? 0.35 : 0.14) + age * (cut ? 0.65 : 0.3),
     };
   });
-  ed.setStrokeTrail?.(segs);
+  ed.setStrokeTrail?.(goalMarkerSegs ? segs.concat(goalMarkerSegs) : segs);
 }
 
 /**
@@ -3993,9 +3995,30 @@ function headKeepOut() {
 /** The WeaponPose the rig consumes, or null when nothing claims the arm. */
 function weaponPose() {
   if (!melee || wpChain < 0) return null;
+  // A HELD FRAME THAT IS A POSE (melee.js keyedFramePose): the frame, still,
+  // with nothing driving the stroke underneath it.
+  if (heldKeyed) {
+    return { hand: AN.v3(), bladeDir: AN.v3(0, 1, 0), bladeFlat: AN.v3(0, 0, 1),
+             bendPole: AN.v3(0, 0, -1), weight: 1, release: -1, steerBlade: false,
+             steerAmount: 0, torsoTwist: heldKeyed.twist, torsoPitch: heldKeyed.pitch,
+             keyed: heldKeyed };
+  }
   const p = melee.pose();
-  return p.weight > 0 ? p : null;
+  if (!(p.weight > 0)) return null;
+  // A KEYED STROKE (melee.js strokeKeyedPose): the joints and the torso are
+  // the frames', and the driver's arm is not used.
+  const lib = strokeLive() ? ATK.library() : null;
+  const sty = lib && strokeStyle >= 0 ? lib.styles[strokeStyle] : null;
+  const kp = sty ? MELEE.strokeKeyedPose(strokeCur, sty, p.release) : null;
+  if (kp) {
+    p.keyed = kp.on ? kp : null;
+    p.torsoTwist = kp.twist;
+    p.torsoPitch = kp.pitch;
+  }
+  return p;
 }
+// Set by weaponTick while a goal frame with a pose is held (see there).
+let heldKeyed = null;
 
 /**
  * mob.cpp:1895 — the ORDER matters and is the engine's: seed the driver from
@@ -4163,6 +4186,7 @@ function weaponTick() {
   syncEffectorToSelection();
   // ---- 1. WHERE THE BLADE IS NOW ---------------------------------------
   weaponSeedFromRig();
+  captureRestSeed();
 
   // ---- 2. the basis. Heading is 0 and the rig is authored in its own frame,
   // so this is the rig's facing basis: fwd = +Z, up = +Y, and right = fwd x up
@@ -4176,22 +4200,51 @@ function weaponTick() {
   if (!sty) dbgNoStyle++;
   // ---- 3a. THE GOAL FRAME, held still (attacks.js's goal chips) ----------
   //
-  // No program runs and no time passes: the arm is put EXACTLY on the
-  // authored destination and left there. Re-resolved every tick rather than
-  // once on the click, so nudging the aim sliders or an az/el box moves the
-  // held frame under the cursor — which is the whole authoring loop this is
-  // for. It reads the SELECTED style, not `strokeStyle`: nothing is live, so
-  // there is no live style to read.
+  // The arm is held where the PROGRAM ARRIVES at the end of that frame
+  // (melee.js runStrokeToFrame): the style run from rest, with this swing's
+  // jitter draw, stopped on the frame's last tick — the same pose a solo of
+  // that segment freezes on. It used to be the AUTHORED destination with every
+  // eased channel settled, which a chase windup never reaches and which leaned
+  // the blade the other way, so "windup" and a solo'd windup were two arms.
+  // The authored target is drawn beside it (pushGoalMarker).
+  //
+  // Re-run every tick rather than once on the click, so nudging the aim
+  // sliders or an az/el box moves the held frame under the cursor. It reads
+  // the SELECTED style, not `strokeStyle`: nothing is live.
   const goalKey = ATK.goalFrame?.();
+  heldKeyed = null;
   if (goalKey) {
-    const gsty = lib ? lib.styles[ATK.styleIndex()] : null;
-    const gaim = ATK.currentAim();
-    const g = gsty
-      ? MELEE.strokeGoalPose(gsty, melee, goalKey, gaim.az, gaim.el) : null;
-    if (g) melee.snapToPose(g.az, g.el, g.reach, right, up, fwd, g.travel);
-    else melee.update(kStrokeDt, false, !!gsty, right, up, fwd);
+    const gi = ATK.styleIndex();
+    const gsty = lib ? lib.styles[gi] : null;
+    const rest = restFor();
+    const gaim = aimAtRest();
+    // A FRAME THAT IS A POSE is simply shown: nothing to run, nothing to
+    // arrive at. The driver is let go so nothing else claims the arm.
+    const gk = typeof goalKey === 'string' && goalKey[0] === 'f' ? +goalKey.slice(1) : -1;
+    const kp = gsty ? MELEE.keyedFramePose(gsty, gk, gaim.az, gaim.el) : null;
+    if (kp) {
+      heldKeyed = kp;
+      melee.reset();
+      goalMarkerSegs = null;
+      return;
+    }
+    let arrived = null;
+    if (gsty && rest) {
+      // Take over from the REST arm a solo starts from, not the rig's current
+      // arm — which is this held frame, and would feed the run its own output.
+      melee.tuning = meleeTuning();
+      melee.setStroke(rest.hand, rest.tip, rest.flat, rest.reach);
+      arrived = MELEE.runStrokeToFrame(gsty, gi, strokeSeed(), melee, goalKey,
+                                       gaim.az, gaim.el, kStrokeDt, right, up, fwd,
+                                       gaim.dist);
+    }
+    // No rest arm for THIS effector yet (the style changed while a frame was
+    // held): let go for a tick so the rig poses at rest and the seed is taken.
+    if (!arrived) melee.reset();
+    pushGoalMarker(gsty, goalKey, gaim, rest);
     return;
   }
+  goalMarkerSegs = null;
   if (!strokeLive()) { melee.update(kStrokeDt, false, !!sty, right, up, fwd); return; }
   // SOLO HOLD: the segment under study has ended; keep the pose it ended in
   // on screen (no step, so the driver's pose is unchanged) for a beat, then
@@ -4205,7 +4258,9 @@ function weaponTick() {
     }
     return;
   }
-  const aim = ATK.currentAim();
+  // The target's bearing from WHERE THE SHOULDER IS NOW, every tick, as
+  // mob.cpp re-aims from StrokePivotWorld each tick.
+  const aim = aimLive();
   const P = MELEE.STROKE_PHASE;
   const phaseBefore = strokeCur.phase;
   // ---- 3b. THE LUNGE, fired on the FIRST TICK OF ITS NAMED PHASE and before
@@ -4234,7 +4289,7 @@ function weaponTick() {
   if (lungeArc && lungeArc.cutStart < 0 && strokeCur.phase === P.Cut)
     lungeArc.cutStart = strokeTick;
   const r = MELEE.stepStrokeProgram(strokeCur, sty, melee, aim.az, aim.el,
-                                    kStrokeDt, right, up, fwd);
+                                    kStrokeDt, right, up, fwd, aim.dist);
   strokeTick++;
   if (strokeTick === 1)
     strokeStart = { az: melee.strokeAz(), el: melee.strokeEl(), radius: melee.strokeRadius() };
@@ -4308,8 +4363,7 @@ function beginStroke(styleIndex) {
   // engine's `wielder ^ salt ^ startTick`: any injective map does, because
   // what the seed has to be is DIFFERENT PER SWING and reproducible, not any
   // particular value.
-  MELEE.beginStrokeProgram(strokeCur, sty, styleIndex,
-                           Math.imul(ATK.swingNumber() + 1, 2654435761) >>> 0);
+  MELEE.beginStrokeProgram(strokeCur, sty, styleIndex, strokeSeed());
   strokeAccum = 0;
   strokeStart = null;
   strokeCommit = null;
@@ -4348,8 +4402,142 @@ function beginStroke(styleIndex) {
   // The joint brakes' memory is per swing here for the same reason: a replay
   // must not start braking from where the LAST swing left the arm.
   armSmooth.valid = false;
+  armSmooth.keyLive = null;
 }
 let strokeBurst = null;
+
+// The swing number's seed (see beginStroke) — shared with the held goal frame
+// so a goal and a solo of the same swing draw the same jitter.
+const strokeSeed = () => Math.imul(ATK.swingNumber() + 1, 2654435761) >>> 0;
+
+/* --------------------------------------------------------------------------
+   THE REST ARM A HELD GOAL FRAME TAKES OVER FROM
+
+   runStrokeToFrame replays the program from a take-over, and the take-over
+   reads the arm (weaponArmSeed). While a frame is held the rig's arm IS that
+   frame, so seeding from it would feed the run its own output and the pose
+   would creep. Instead the seed is remembered from the last pose the rig was
+   given with NOTHING driving the arm — the pose a solo starts from — keyed by
+   the effector and the held item, because a punch's fist and a sword's point
+   are different arms. `lastPoseDriven` is set where the pose is built (stage
+   3.5b), since anim.model is the PREVIOUS frame's pose when weaponTick runs.
+   -------------------------------------------------------------------------- */
+let restSeed = null;
+let lastPoseDriven = false;
+let goalMarkerSegs = null;  // the authored target, drawn with the trail
+function restSeedKey() {
+  const e = resolveEffector();
+  return `${e.part}|${e.mode}|${e.natural}|${wpHandPart}|${heldItemId || ''}`;
+}
+function captureRestSeed() {
+  if (lastPoseDriven || !melee || melee.poseWeight() > 0) return;
+  const s = weaponArmSeed();
+  if (!s) return;
+  restSeed = { key: restSeedKey(), hand: { ...s.hand }, tip: { ...s.tip },
+               flat: { ...s.flat }, reach: s.reach,
+               // for the aim orb: where the pivot stands and the neutral
+               // reach, AT REST, so the target does not ride the swing
+               shoulder: { ...s.shoulder }, S: s.S,
+               neutral: MELEE.strokeReachIn(melee, 0),
+               head: headCenterScene() };
+}
+const restFor = () => (restSeed && restSeed.key === restSeedKey() ? restSeed : null);
+
+/** The head's centre in scene (model) space, or null on a rig with no head. */
+// `anim.model[i].pos` is the part's ANCHOR (the joint it turns about), not a
+// corner of its box: the box centre is the model's own `offset + dim/2` in
+// file voxels, carried by the part's delta from rest exactly as
+// modelTransform() carries the drawn voxels.
+function headCenterScene() {
+  if (wpHeadPart < 0 || !anim?.model?.length) return null;
+  const posed = anim.model[wpHeadPart];
+  const model = skel.parts[wpHeadPart]._model;
+  if (!posed || !model || !model.offset || !model.dim) return null;
+  const c = AN.v3(model.offset.x + model.dim.x * 0.5, model.offset.y + model.dim.y * 0.5,
+                  model.offset.z + model.dim.z * 0.5);
+  const rest = restModel?.[wpHeadPart];
+  if (!rest) return c;
+  const dq = AN.qnorm(AN.qmul(posed.rot, AN.qconj(rest.rot)));
+  return AN.vadd(posed.pos, AN.qrot(dq, AN.vsub(c, rest.pos)));
+}
+
+/* --------------------------------------------------------------------------
+   THE TARGET IS A POINT (attacks.js `aim`).
+
+   The panel states the target as the character sees it — a bearing from the
+   EYES and a distance — and it is turned into a point here, fixed in the
+   world: placed from the head AT REST, so it does not ride the swing or fly
+   with a lunge. The program is then handed that point's bearing and distance
+   about the stroke's own pivot (strokes.cpp StrokeAimAt), which is what the
+   engine does for an NPC's `targetPoint` and a player's look ray. So az/el
+   0/0 is straight ahead of the FACE, and the shoulder's aim comes out a little
+   across the body, the way a real target in front of you is.
+   -------------------------------------------------------------------------- */
+function aimEyeScene() {
+  const rest = restFor();
+  if (rest && rest.head) return rest.head;
+  const h = headCenterScene();
+  if (h) return h;
+  const live = weaponArmSeed();
+  return rest ? rest.shoulder : live ? live.shoulder : null;
+}
+function aimTargetScene() {
+  const a = ATK.currentAim();
+  const eye = aimEyeScene();
+  if (!eye) return null;
+  const S = restFor()?.S || rigScale();
+  const d = AN.v3(-Math.cos(a.el) * Math.sin(a.az), Math.sin(a.el),
+                  Math.cos(a.el) * Math.cos(a.az));
+  return AN.vadd(eye, AN.vmul(d, Math.max(0.5, a.dist ?? 6) * S));
+}
+/** The target's bearing + distance (world voxels) about a SCENE pivot. */
+function aimFrom(pivot, S) {
+  const t = aimTargetScene();
+  if (!t || !pivot) return { az: 0, el: 0, dist: 0 };
+  const to = AN.vsub(t, pivot);
+  // The rig's facing basis at heading 0: right = -X, up = +Y, fwd = +Z.
+  const x = -to.x / S, y = to.y / S, z = to.z / S;
+  const r = Math.max(Math.hypot(x, y, z), 1e-4);
+  return { az: Math.atan2(x, z), el: Math.asin(Math.max(-1, Math.min(1, y / r))), dist: r };
+}
+/** The aim the program gets from the REST pivot (a held goal, the readout). */
+function aimAtRest() {
+  const rest = restFor();
+  if (rest) return aimFrom(rest.shoulder, rest.S || rigScale());
+  const live = weaponArmSeed();
+  return live ? aimFrom(live.shoulder, live.S || rigScale()) : { az: 0, el: 0, dist: 0 };
+}
+/** ...and from the LIVE pivot, lunge included (a swing in progress). */
+function aimLive() {
+  const live = weaponArmSeed();
+  if (!live) return aimAtRest();
+  return aimFrom(AN.vadd(live.shoulder, lungeOffsetModel()), live.S || rigScale());
+}
+
+/**
+ * The AUTHORED target of the held frame, beside the arm that arrived: a cross
+ * at the target tip and a line from where the tip actually got to. A chase
+ * frame that runs out of ticks shows as a gap; a frame that arrives shows the
+ * cross on the point.
+ */
+function pushGoalMarker(sty, key, aim, rest) {
+  goalMarkerSegs = null;
+  const seed = sty && rest ? weaponArmSeed() : null;
+  const g = seed ? MELEE.strokeGoalPose(sty, melee, key, aim.az, aim.el) : null;
+  if (!g) return;
+  const S = seed.S || rigScale();
+  const sh = AN.vadd(seed.shoulder, lungeOffsetModel());
+  const sc = v => [sh.x - v.x * S, sh.y + v.y * S, sh.z + v.z * S];
+  const tgtL = AN.vmul(dirL(g.az, g.el), g.reach);
+  const t = sc(tgtL), a = sc(melee.tipL_);
+  const c = 0.45 * S, C = 0xffc857;
+  goalMarkerSegs = [
+    { a: [t[0] - c, t[1], t[2]], b: [t[0] + c, t[1], t[2]], color: C, alpha: 1 },
+    { a: [t[0], t[1] - c, t[2]], b: [t[0], t[1] + c, t[2]], color: C, alpha: 1 },
+    { a: [t[0], t[1], t[2] - c], b: [t[0], t[1], t[2] + c], color: C, alpha: 1 },
+    { a, b: t, color: 0xffffff, alpha: 0.45 },
+  ];
+}
 
 /** The solo burst beginStroke deferred (see there). */
 function runStrokeBurst(solo) {
@@ -4404,6 +4592,11 @@ function applyWeaponArm() {
   // shares the yaw with the spine above it). This stage runs after the
   // flatten, so an aim written from here would be a write nobody reads.
   if (eff.mode === 'aim') return null;
+  // mob.cpp: THE RELEASE IS NOT SOLVED -- smoothWeaponArm turns the joints
+  // from the last driven pose to the animation's (WeaponPose::release).
+  if (pose.release >= 0) return null;
+  // ...and NEITHER IS A KEYED POSE: smoothWeaponArm writes its joints.
+  if (pose.keyed) return null;
   const hand = { hand: -1 };
   const ci = eff.part >= 0 ? chainForEffector(eff.part, hand) : wpChain;
   if (ci < 0 || !skel.chains[ci]) return null;
@@ -4425,6 +4618,14 @@ function applyWeaponArm() {
   const steer = { ...ch };
   if (pose.steerBlade && AN.vlen(pose.bendPole) > 1e-4) steer.pole = pose.bendPole;
   AN.animSolveTwoBone(skel, anim, steer, targetLocal, weight);
+  // ---- THE HAND CARRIES THE BLADE (mob.cpp ApplyWeaponArm §3) -------------
+  // Ported 2026-09-25: until then this preview never turned the wrist, so the
+  // blade rode the forearm's grip angle while the game laid it along the
+  // stroke — the preview and the game were two different swings, and a pose
+  // BAKED from the preview (attacks.js bakeStyle) missed the targets the game's
+  // swing used to hit.
+  if (pose.steerBlade && eff.mode === 'held')
+    steerWristToBlade(pose, hand.hand >= 0 ? hand.hand : wpHandPart, weight);
 
   if (!pose.steerBlade) return null;
   // ---- the elbow's hinge plane follows the bend (mob.cpp:7850) ----------
@@ -4479,18 +4680,160 @@ function applyWeaponArm() {
  * off cannot snap.
  */
 let armSmooth = { valid: false, part: [-1, -1, -1], prev: [null, null, null],
-                  params: null, lag: [0, 0, 0] };
+                  params: null, lag: [0, 0, 0],
+                  // mob.h ArmSmoothState: the joint-space release's memory.
+                  lastValid: false, lastPart: [-1, -1, -1], last: [null, null, null],
+                  relActive: false, relFrom: [null, null, null],
+                  // mob.h ArmSmoothState::keyLive: the arm a keyed stroke took
+                  // over, which its first frame blends from.
+                  keyLive: null };
 function liveArmJoints() {
   if (!strokeLive() || !melee || !(melee.poseWeight() > 0)) return null;
   const lib = ATK.library();
   const sty = (lib && strokeStyle >= 0) ? lib.styles[strokeStyle] : null;
-  return sty && MELEE.jointsAny(sty.joints) ? sty.joints : null;
+  // THE CURRENT FRAME'S brakes (strokes.cpp StrokeJointsNow).
+  const js = sty ? MELEE.strokeJointsNow(strokeCur, sty) : null;
+  return MELEE.jointsAny(js) ? js : null;
 }
+/**
+ * mob.cpp ApplyWeaponArm §3 — the hand oriented so the blade points along the
+ * driver's bladeDir with its flat on bladeFlat: aim, then roll about the
+ * blade; the turn capped at wristMaxAngle (a wrist is not a ball joint) and
+ * THEN scaled by steerAmount; weighted by the arm claim. Everything hanging
+ * off the hand re-flattens rigidly.
+ */
+function steerWristToBlade(pose, handPart, weight) {
+  if (handPart < 0 || !anim.model[handPart]) return;
+  const blade = bladeSegmentModel();
+  if (!blade) return;
+  const rigid = anim.model[handPart].rot;
+  const bd = AN.vsub(blade.tip, blade.base);
+  if (AN.vlen(bd) < 1e-4) return;
+  const bladeHand = AN.qrotinv(rigid, AN.vnorm(bd));
+  let flatHand = AN.vlen(blade.flat) > 1e-4 ? AN.qrotinv(rigid, blade.flat) : AN.v3();
+  flatHand = AN.vsub(flatHand, AN.vmul(bladeHand, AN.vdot(bladeHand, flatHand)));
+  const haveFlat = AN.vlen(flatHand) > 1e-4;
+  if (haveFlat) flatHand = AN.vnorm(flatHand);
+  let wantDir = pose.bladeDir || AN.v3();
+  if (AN.vlen(wantDir) < 1e-4) return;
+  wantDir = AN.vnorm(wantDir);
+  let wantFlat = pose.bladeFlat || AN.v3();
+  wantFlat = AN.vsub(wantFlat, AN.vmul(wantDir, AN.vdot(wantDir, wantFlat)));
+  let want = AN.qfromto(bladeHand, wantDir);
+  if (haveFlat && AN.vlen(wantFlat) > 1e-4) {
+    wantFlat = AN.vnorm(wantFlat);
+    const cur = AN.qrot(want, flatHand);
+    const s = AN.vdot(AN.vcross(cur, wantFlat), wantDir);
+    const c = AN.vdot(cur, wantFlat);
+    if (Math.abs(s) > 1e-6 || Math.abs(c) > 1e-6)
+      want = AN.qmul(AN.qaxisangle(wantDir, Math.atan2(s, c)), want);
+  }
+  let delta = AN.qnorm(AN.qmul(want, AN.qconj(rigid)));
+  const ang = 2 * Math.acos(Math.min(1, Math.abs(delta.w)));
+  const lim = Math.max(pose.wristMaxAngle ?? 3.10, 0);
+  if (ang > lim && ang > 1e-4) delta = AN.qslerp(AN.qid(), delta, lim / ang);
+  const steerAmt = clamp(pose.steerAmount ?? 1, 0, 1);
+  if (steerAmt < 1) delta = AN.qslerp(AN.qid(), delta, steerAmt);
+  const handRot = AN.qnorm(AN.qmul(delta, rigid));
+  anim.model[handPart].rot = AN.qslerp(rigid, handRot, clamp(weight, 0, 1));
+  // Everything hanging off the hand follows rigidly (parents-first).
+  const n = Math.min(skel.parts.length, anim.model.length);
+  const moved = new Uint8Array(n);
+  moved[handPart] = 1;
+  for (let k = handPart + 1; k < n; k++) {
+    const par = skel.parts[k].parent;
+    if (par < 0 || !moved[par] || !anim.local[k]) continue;
+    moved[k] = 1;
+    anim.model[k].rot = AN.qnorm(AN.qmul(anim.model[par].rot, anim.local[k].rot));
+    anim.model[k].pos = AN.vadd(anim.model[par].pos, AN.qrot(anim.model[par].rot, anim.local[k].pos));
+  }
+}
+
+/** The weapon arm's [shoulder, elbow, wrist] part indices (-1 = none). */
+function weaponArmParts() {
+  const parts = [-1, -1, -1];
+  if (!skel) return parts;
+  const eff = resolveEffector();
+  if (eff.mode === 'aim') return parts;
+  const hand = { hand: -1 };
+  const ci = eff.part >= 0 ? chainForEffector(eff.part, hand) : wpChain;
+  const ch = ci >= 0 ? skel.chains[ci] : null;
+  if (!ch || (ch.parts || []).length < 2) return parts;
+  const h = eff.part >= 0 ? hand.hand : ch.effector;
+  parts[0] = ch.parts[0];
+  parts[1] = ch.parts[1];
+  parts[2] = h !== ch.parts[1] ? h : -1;
+  return parts;
+}
+
+/** Each weapon-arm joint's rotation relative to its parent, as posed now. */
+function weaponArmLocals(parts) {
+  return parts.map(i => {
+    if (i < 0 || !anim.model[i]) return null;
+    const par = skel.parts[i].parent;
+    return par >= 0 && anim.model[par]
+      ? AN.qnorm(AN.qmul(AN.qconj(anim.model[par].rot), anim.model[i].rot))
+      : anim.model[i].rot;
+  });
+}
+
+/**
+ * THE ARM ON SCREEN AS A FRAME POSE (melee.js "A FRAME IS A POSE") — the
+ * held frame's shoulder / elbow / wrist, relative to their parents, with the
+ * frame's AIM TURN TAKEN BACK OFF the shoulder (a pose is stored as authored
+ * against a target straight ahead; playback turns it onto the real one), and
+ * the torso the pose was shown with.
+ *
+ * `step` first runs one weapon tick and one preview step, so the model is the
+ * held frame and not whatever was drawn last (the bake calls it right after
+ * changing the held frame). Returns null for an aim effector (no arm).
+ */
+function captureHeldPose(step = true) {
+  if (!skel || !anim?.model?.length || !melee) return null;
+  if (step) {
+    // A few tries: a style whose effector just changed has no rest arm yet,
+    // and the goal branch lets go for a tick to take one (weaponTick).
+    for (let i = 0; i < 6; i++) {
+      weaponTick();
+      const posed = !!heldKeyed || melee.poseWeight() > 0;
+      stepPreviewFixed(kPreviewDt, true);
+      if (posed) break;
+    }
+  }
+  const parts = weaponArmParts();
+  if (parts[0] < 0 || parts[1] < 0) return null;
+  const loc = weaponArmLocals(parts);
+  const key = ATK.goalFrame?.();
+  const lib = ATK.library();
+  const sty = lib ? lib.styles[ATK.styleIndex()] : null;
+  // 'f<k>' or 'f<k>@<tick>' (a mid-frame sample): the frame it belongs to.
+  const k = typeof key === 'string' && key[0] === 'f' ? parseInt(key.slice(1), 10) : -1;
+  const f = sty && k >= 0 ? sty.frames[k] : null;
+  const a = f && !f.fromBody ? aimAtRest() : { az: 0, el: 0 };
+  const par0 = skel.parts[parts[0]].parent;
+  const P = par0 >= 0 ? anim.model[par0].rot : AN.qid();
+  const R = MELEE.aimQuat(a.az, a.el);
+  loc[0] = AN.qnorm(AN.qmul(AN.qconj(P), AN.qmul(AN.qconj(R), AN.qmul(P, loc[0]))));
+  const wp = weaponPose();
+  return { joint: loc, twist: wp ? wp.torsoTwist || 0 : 0,
+           pitch: wp ? wp.torsoPitch || 0 : 0 };
+}
+
 function smoothWeaponArm(dt) {
   const S = armSmooth;
-  const asked = liveArmJoints();
+  S.keyedGot = null;
+  // mob.cpp: THE RELEASE takes this stage over; the brakes are off for it.
+  const wp = weaponPose();
+  const weight = wp ? wp.weight : 0;
+  const releasing = !!wp && wp.release >= 0 && weight > 0;
+  const driven = weight > 0 && !releasing;
+  const keyed = driven && wp.keyed ? wp.keyed : null;
+  const asked = driven ? liveArmJoints() : null;
   if (asked) S.params = asked;
-  else if (!S.valid) return;
+  else if (!S.valid && !driven && !releasing) {
+    S.lastValid = false; S.relActive = false; S.keyLive = null;
+    return;
+  }
   if (!skel || !anim?.model?.length) { S.valid = false; return; }
   const eff = resolveEffector();
   const parts = [-1, -1, -1];
@@ -4507,7 +4850,10 @@ function smoothWeaponArm(dt) {
   }
   const n = Math.min(skel.parts.length, anim.model.length);
   for (let k = 0; k < 3; k++) if (parts[k] >= n) parts[k] = -1;
-  if (parts[0] < 0 || parts[1] < 0) { S.valid = false; return; }
+  if (parts[0] < 0 || parts[1] < 0) {
+    S.valid = false; S.lastValid = false; S.relActive = false;
+    return;
+  }
   if (S.valid && parts.some((p, k) => p !== S.part[k])) S.valid = false;
   const localOf = (i) => {
     const par = skel.parts[i].parent;
@@ -4516,17 +4862,75 @@ function smoothWeaponArm(dt) {
       : anim.model[i].rot;
   };
   const want = parts.map(i => (i >= 0 ? localOf(i) : null));
-  if (!S.valid) {
+  // ---- A KEYED POSE (melee.js "A FRAME IS A POSE"; mob.cpp) ---------------
+  // `want` becomes the frames' joints, slerped; the brakes below still see it
+  // as the pose asked for. applyWeaponArm solved nothing, so `want` is the
+  // animation's arm until this replaces it -- which is exactly the arm a
+  // stroke that starts from rest takes over from.
+  if (keyed) {
+    if (keyed.fromLive) {
+      if (!S.keyLive) {
+        const same = S.lastValid && parts.every((pp, k) => pp === S.lastPart[k]);
+        S.keyLive = same ? S.last.slice() : want.slice();
+      }
+    } else {
+      S.keyLive = null;
+    }
+    const par0 = skel.parts[parts[0]].parent;
+    const P = par0 >= 0 && par0 < n ? anim.model[par0].rot : AN.qid();
+    // The whole arm turned about the shoulder, in the BODY's frame: a
+    // rotation R of the upper arm's model rotation is conj(P) R P on its local.
+    const aimed = (q, a) => (a && (a.yaw || a.pitch))
+      ? AN.qnorm(AN.qmul(AN.qconj(P), AN.qmul(MELEE.aimQuat(a.yaw, a.pitch), AN.qmul(P, q))))
+      : q;
+    for (let k = 0; k < 3; k++) {
+      if (parts[k] < 0) continue;
+      let from = keyed.fromLive ? S.keyLive[k] : keyed.from[k];
+      let to = keyed.to[k];
+      if (!from || !to) continue;               // no key for this joint: the animation's
+      if (k === 0) { from = aimed(from, keyed.aimFrom); to = aimed(to, keyed.aimTo); }
+      want[k] = AN.qnorm(AN.qslerp(from, to, keyed.t));
+    }
+  } else {
+    S.keyLive = null;
+  }
+  let got = [null, null, null];
+  if (releasing) {
+    // mob.cpp: every joint turns from the last driven pose to the
+    // animation's (`want` -- applyWeaponArm solved nothing this tick).
+    if (!S.relActive) {
+      const same = S.lastValid && parts.every((pp, k) => pp === S.lastPart[k]);
+      if (!same) { S.valid = false; return; }
+      S.relFrom = S.last.slice();
+      S.relActive = true;
+      // A release out of a KEYED pose is not clamped either (reapplyKeyedArm):
+      // its first tick is that pose, which was never clamped.
+      S.relKeyed = !!S.lastKeyed;
+    }
+    for (let k = 0; k < 3; k++)
+      if (parts[k] >= 0) got[k] = AN.qnorm(AN.qslerp(S.relFrom[k], want[k], wp.release));
+    S.valid = false;
+    S.lastValid = false;
+  } else {
+  S.relActive = false;
+  // (A keyed pose falls through to the re-flatten below: nothing else has
+  // written it into the model.)
+  if (!asked && !S.valid) {
+    S.last = want.slice(); S.lastPart = parts.slice(); S.lastValid = driven;
+    if (!keyed) return;
+    got = want.slice();
+  } else if (!S.valid) {
     S.part = parts.slice();
     S.prev = want.slice();
     S.lag = [0, 0, 0];
+    S.last = want.slice(); S.lastPart = parts.slice(); S.lastValid = driven;
     S.valid = !!asked;
-    return;
-  }
+    if (!keyed) return;
+    got = want.slice();
+  } else {
   const ticks = Math.max(dt * 30, 0);
   const angleBetween = (a, b) =>
     2 * Math.acos(Math.min(1, Math.abs(AN.qdot(a, b))));
-  const got = [null, null, null];
   let lagMax = 0;
   for (let k = 0; k < 3; k++) {
     if (parts[k] < 0) continue;
@@ -4552,7 +4956,22 @@ function smoothWeaponArm(dt) {
     lagMax = Math.max(lagMax, S.lag[k]);
   }
   if (!asked && lagMax < 0.0035) S.valid = false;
-  // RE-FLATTEN THE ARM'S SUBTREE with the braked locals (parents-first).
+  S.last = parts.map((pp, k) => (pp >= 0 ? got[k] : want[k]));
+  S.lastPart = parts.slice(); S.lastValid = driven;
+  }
+  }
+  reflattenArm(parts, got);
+  // A KEYED arm is written again AFTER the stage-6 clamp (reapplyKeyedArm):
+  // the pose is the author's, exactly, at every tick.
+  if (driven) S.lastKeyed = !!keyed;
+  S.keyedGot = keyed || (releasing && S.relKeyed)
+    ? { parts: parts.slice(), got: got.slice() } : null;
+}
+
+// RE-FLATTEN THE ARM'S SUBTREE with the given locals (parents-first): every
+// part keeps its transform relative to its parent, so the sword rides along.
+function reflattenArm(parts, got) {
+  const n = Math.min(skel.parts.length, anim.model.length);
   const old = anim.model.slice(0, n).map(t => ({ pos: { ...t.pos }, rot: { ...t.rot } }));
   const moved = new Uint8Array(n);
   const root = parts[0];
@@ -4563,11 +4982,26 @@ function smoothWeaponArm(dt) {
     if (par < 0 || par >= n) continue;
     let rel = AN.qnorm(AN.qmul(AN.qconj(old[par].rot), old[i].rot));
     const relPos = AN.qrotinv(old[par].rot, AN.vsub(old[i].pos, old[par].pos));
-    for (let k = 0; k < 3; k++) if (parts[k] === i) rel = got[k];
+    for (let k = 0; k < 3; k++) if (parts[k] === i && got[k]) rel = got[k];
     anim.model[i].rot = AN.qnorm(AN.qmul(anim.model[par].rot, rel));
     anim.model[i].pos = AN.vadd(anim.model[par].pos,
                                 AN.qrot(anim.model[par].rot, relPos));
   }
+}
+
+/**
+ * mob.cpp Mob::ReapplyKeyedArm — A KEYED POSE IS NOT CLAMPED. The frames are
+ * the author's arm, and the stage-6 clamp projecting them onto the rig's
+ * authored hinge and ball limits changed the arm BETWEEN two frames that were
+ * each legal on their own (the slerp crosses a limit's edge and the projection
+ * jumps), which is exactly the spin a keyed stroke exists to remove. So the
+ * clamp runs for the rest of the body and the keyed arm is written again after
+ * it. Limits are the author's to respect while posing.
+ */
+function reapplyKeyedArm() {
+  const k = armSmooth.keyedGot;
+  if (!k || !skel || !anim?.model?.length) return;
+  reflattenArm(k.parts, k.got);
 }
 
 /**
@@ -4684,18 +5118,38 @@ function bindAttacks() {
     // and one they have to go and look up.
     meleeTuning,
     onStylesChanged: () => { /* a live swing keeps running on the edited data */ },
-    // ONE GOAL FRAME, RESOLVED against the arm currently previewing, for the
-    // panel's own readout. The pose itself is applied in weaponTick; this is
-    // the same call with the same arguments, so what the readout prints is by
-    // construction the pose on screen rather than a second derivation of it.
+    // ONE GOAL FRAME for the panel's readout: the AUTHORED destination, plus
+    // `arrived` — where the program really gets to by the end of the frame,
+    // which is the pose weaponTick holds. Run on a scratch driver with the
+    // same arm, tuning, seed and aim, because the panel repaints on the click,
+    // before the first held tick has run.
     goalPose: (key) => {
       const lib = ATK.library();
-      const s = lib ? lib.styles[ATK.styleIndex()] : null;
-      const a = ATK.currentAim();
-      return (s && melee) ? MELEE.strokeGoalPose(s, melee, key, a.az, a.el)
-                          : null;
+      const gi = ATK.styleIndex();
+      const s = lib ? lib.styles[gi] : null;
+      const a = aimAtRest();
+      const g = (s && melee) ? MELEE.strokeGoalPose(s, melee, key, a.az, a.el) : null;
+      if (!g) return null;
+      let arrived = null;
+      const rest = restFor();
+      if (rest) {
+        const m = new MELEE.MeleeState(meleeTuning());
+        m.setHandSign(melee.handSign_);
+        if (melee.keepR_ > 0) m.setKeepOut(melee.keepC_, melee.keepR_);
+        m.setStroke(rest.hand, rest.tip, rest.flat, rest.reach);
+        if (MELEE.runStrokeToFrame(s, gi, strokeSeed(), m, key, a.az, a.el, kStrokeDt,
+                                   AN.v3(-1, 0, 0), AN.v3(0, 1, 0), AN.v3(0, 0, 1), a.dist))
+          arrived = { az: m.azLive_, el: m.elLive_, reach: m.radLive_ };
+      }
+      return { ...g, arrived };
     },
     onTrailToggled: () => { strokeTrail.length = 0; ed.setStrokeTrail?.(null); },
+    // THE HELD FRAME'S ARM AS A POSE (captureHeldPose): the bake and the
+    // "capture" button both read the rig through this.
+    captureHeldPose: (step = true) => captureHeldPose(step),
+    bakeMidPose: (p0, p1) => bakeMidPose(p0, p1),
+    mirrorPose: (p) => mirrorPose(p),
+    flipElbowPose: (p) => flipElbowPose(p),
     rebuild: () => { rebuildSkeleton(); ed.invalidate(); },
     state: () => ({
       live: strokeLive(),
@@ -5262,19 +5716,30 @@ function keyTimes(track) {
 let libraryClips = null;          // [{name, path}] or null until fetched
 let libraryFetching = false;
 
-async function refreshLibraryClips() {
-  if (libraryFetching) return;
+// A SECOND CALLER WAITS FOR THE FETCH IN FLIGHT. It used to get an already
+// resolved promise, and libraryClipPicker's `.then(renderClipLane)` then
+// re-rendered with the list still null, called this again, and so on — a
+// microtask loop that never yields, so the fetch it was waiting for could
+// never complete: the whole tab froze whenever the clip lane rendered twice
+// during the fetch (it is why every headless Models-tab harness hung).
+let libraryFetch = null;
+function refreshLibraryClips() {
+  if (libraryFetch) return libraryFetch;
   libraryFetching = true;
-  try {
-    const r = await fetch('/api/models', { cache: 'no-store' });
-    const j = await r.json();
-    libraryClips = (j.files || []).filter(f => f.dir === 'anims' && /\.json$/i.test(f.name))
-      .map(f => ({ name: f.name.replace(/\.json$/i, ''), path: f.path }));
-  } catch {
-    libraryClips = [];
-  } finally {
-    libraryFetching = false;
-  }
+  libraryFetch = (async () => {
+    try {
+      const r = await fetch('/api/models', { cache: 'no-store' });
+      const j = await r.json();
+      libraryClips = (j.files || []).filter(f => f.dir === 'anims' && /\.json$/i.test(f.name))
+        .map(f => ({ name: f.name.replace(/\.json$/i, ''), path: f.path }));
+    } catch {
+      libraryClips = [];
+    } finally {
+      libraryFetching = false;
+      libraryFetch = null;
+    }
+  })();
+  return libraryFetch;
 }
 
 /** The clip's file form: what the engine's LoadClipLibrary reads. */
@@ -5983,7 +6448,576 @@ function tick(dt) {
   // renderClipLane().
   if (laneTab === 'attacks') ATK.tickUI();
   drawAngleGuide();
+  drawPoseHandles();
+  drawAimOrb();
 }
+
+/* --------------------------------------------------------------------------
+   THE AIM ORB — the target the stroke is aimed at (aimTargetScene), with a
+   faint line from the eyes that look at it. Toggled by the panel's `orb` chip.
+   -------------------------------------------------------------------------- */
+let aimOrbSig = '';
+function drawAimOrb() {
+  const lib = laneTab === 'attacks' && ATK.aimOrbEnabled?.() ? ATK.library() : null;
+  const sty = lib ? lib.styles[ATK.styleIndex()] : null;
+  const pos = sty && melee ? aimTargetScene() : null;
+  const eye = pos ? aimEyeScene() : null;
+  if (!pos || !eye) {
+    if (aimOrbSig) { aimOrbSig = ''; ed.setAimOrb?.(null); ed.invalidate(); }
+    return;
+  }
+  const S = restFor()?.S || rigScale();
+  const sig = [pos.x, pos.y, pos.z, S].map(v => v.toFixed(3)).join('|');
+  // Re-sent every frame for the ring's billboard; the redraw is only asked
+  // for when the orb itself moved.
+  ed.setAimOrb?.({ pos: [pos.x, pos.y, pos.z], radius: 0.35 * S,
+                   from: [eye.x, eye.y, eye.z] });
+  if (sig !== aimOrbSig) { aimOrbSig = sig; ed.invalidate(); }
+}
+
+/* --------------------------------------------------------------------------
+   MANUAL ADJUSTMENT MODE — pose the HELD frame by dragging the arm.
+
+   Handles (editor.js setPoseHandles) sit on the tip, the shoulder, the upper
+   arm, the elbow and the wrist. A drag is turned into the frame's own numbers
+   by a small SCREEN-SPACE SOLVE: for each number the handle controls, the
+   point it moves is re-evaluated a hair further along (the driver's own
+   geometry, analytically — no rig re-solve) and projected, which says how
+   many pixels one unit of that number moves the handle on THIS camera; the
+   change that best follows the mouse is then solved for. So the grabbed
+   point tracks the cursor from any view, and every number that changes is a
+   real field in the frame's row, undoable as one step per drag.
+
+     tip        az + el          (the point follows the mouse)
+     shoulder   click: shows az ↔ and el ↕, one number each
+     upper arm  az + el
+     reach      extension along the arm line
+     elbow      elbow direction (swings round the shoulder-to-hand line)
+     wrist      blade angle + lean angle (the hand swings round the tip)
+   -------------------------------------------------------------------------- */
+let poseShoulderOpen = false;
+let poseHandlesOn = false;
+function drawPoseHandles() {
+  const on = laneTab === 'attacks' && ATK.manualMode?.() && melee && anim?.model?.length;
+  const key = on ? ATK.goalFrame?.() : null;
+  const lib = key ? ATK.library() : null;
+  const sty = lib ? lib.styles[ATK.styleIndex()] : null;
+  const seed = sty ? weaponArmSeed() : null;
+  if (!key || !sty || !seed || resolveEffector().mode === 'aim') {
+    if (poseHandlesOn) { ed.setPoseHandles?.(null); poseHandlesOn = false; }
+    return;
+  }
+  poseHandlesOn = true;
+  // A FRAME THAT IS A POSE is posed by its JOINTS (drawKeyedHandles below).
+  if (heldKeyed) { drawKeyedHandles(key, sty); return; }
+  const S = seed.S || rigScale();
+  const off = lungeOffsetModel();
+  const sh = AN.vadd(seed.shoulder, off);
+  // The driver's L-space (x = the wielder's right, which is scene -X at
+  // heading 0) to a scene point.
+  const sc = v => [sh.x - v.x * S, sh.y + v.y * S, sh.z + v.z * S];
+  const P = (v) => [v.x, v.y, v.z];
+  const tipL = melee.tipL_, handL = melee.handL_;
+  // Posed joints for the elbow and wrist handles (where the arm really is).
+  const hand = { hand: -1 };
+  const eff = resolveEffector();
+  const ci = eff.part >= 0 ? chainForEffector(eff.part, hand) : wpChain;
+  const ch = ci >= 0 ? skel.chains[ci] : null;
+  const elbowPt = ch && anim.model[ch.parts[1]]
+    ? AN.vadd(anim.model[ch.parts[1]].pos, off) : null;
+  const upperMid = elbowPt ? AN.vmul(AN.vadd(sh, elbowPt), 0.5) : null;
+  const handPt = sc(handL);
+  const tipPt = sc(tipL);
+  const reachPt = sc(AN.vmul(tipL, 1.12));
+  const list = [
+    { id: 'tip', pos: tipPt, text: '✥ tip', color: '#ffc857',
+      title: 'drag: move the POINT (azimuth + elevation)' },
+    { id: 'reach', pos: reachPt, text: '↔ reach', color: '#e8a0ff',
+      title: 'drag along the arm: extension (how far out the tip is)' },
+    { id: 'shoulder', pos: P(sh), text: poseShoulderOpen ? '● shoulder ▾' : '● shoulder',
+      color: '#8fd3ff', active: poseShoulderOpen,
+      title: 'click: show the az ↔ and el ↕ buttons (one number each)' },
+  ];
+  if (poseShoulderOpen) {
+    list.push({ id: 'az', pos: [sh.x, sh.y + 1.6 * S, sh.z], text: 'az ↔', color: '#4fd1ff',
+                title: 'drag: turn the arm left / right (azimuth only)' });
+    list.push({ id: 'el', pos: [sh.x, sh.y - 1.6 * S, sh.z], text: 'el ↕', color: '#ff6bd6',
+                title: 'drag: raise / lower the arm (elevation only)' });
+  }
+  if (upperMid) list.push({ id: 'upper', pos: P(upperMid), text: 'upper arm', color: '#8fd3ff',
+    title: 'drag: move the arm (azimuth + elevation)' });
+  if (elbowPt) list.push({ id: 'elbow', pos: P(elbowPt), text: '⟲ elbow', color: '#7cf03a',
+    title: 'drag: which way the ELBOW points (swings it round the shoulder-to-hand line)' });
+  list.push({ id: 'wrist', pos: handPt, text: '⟳ wrist', color: '#ff9f5a',
+    title: 'drag: blade angle (off the arm line) + which side the hand sits' });
+  ed.setPoseHandles?.(list, poseDragCb);
+}
+
+// ---- the screen-space solve ---------------------------------------------
+const PX = (p) => ed.projectToScreen?.(p);
+// Pixels per unit of each parameter: finite difference of a scene point.
+function jac(fn, x0, eps) {
+  const a = PX(fn(x0)), b = PX(fn(x0 + eps));
+  return a && b ? [(b[0] - a[0]) / eps, (b[1] - a[1]) / eps] : null;
+}
+// ONE POINTER MOVE MAY TURN AN ANGLE THIS MUCH, at most. The solves below
+// divide by how far the point moves on screen per radian, and near a
+// degenerate pose (a blade along its own radius, an arm at the pole) that is
+// almost nothing, so a pixel became tens of radians: the saved windup had a
+// lean of -9.8 rad and its recover -571 and az -14.7, all of which the pose
+// clamps or wraps into something harmless while the NUMBER keeps growing —
+// until the program blends through it and spins the blade.
+const kDragMaxStep = 0.15;
+const capStep = v => Math.max(-kDragMaxStep, Math.min(kDragMaxStep, v || 0));
+// Best change of one parameter for a drag (dx, dy).
+function solve1(J, dx, dy) {
+  const n = J ? J[0] * J[0] + J[1] * J[1] : 0;
+  return n > 1e-6 ? (dx * J[0] + dy * J[1]) / n : 0;
+}
+// ...and of two (least squares on the 2x2).
+function solve2(J1, J2, dx, dy) {
+  if (!J1 || !J2) return [solve1(J1, dx, dy), solve1(J2, dx, dy)];
+  const a = J1[0] * J1[0] + J1[1] * J1[1], b = J1[0] * J2[0] + J1[1] * J2[1];
+  const c = J2[0] * J2[0] + J2[1] * J2[1];
+  const r1 = J1[0] * dx + J1[1] * dy, r2 = J2[0] * dx + J2[1] * dy;
+  const det = a * c - b * b;
+  if (Math.abs(det) < 1e-9) return [solve1(J1, dx, dy), solve1(J2, dx, dy)];
+  return [(c * r1 - b * r2) / det, (a * r2 - b * r1) / det];
+}
+
+// The driver's own conventions, in L-space.
+const dirL = (az, el) => AN.v3(Math.cos(el) * Math.sin(az), Math.sin(el), Math.cos(el) * Math.cos(az));
+// The driver's own reference (melee.js axisFrame), so a drag and the pose it
+// edits measure the elbow and lean angles from the same "down".
+const downSide = axis => MELEE.axisFrame(axis, melee.handSign_);
+function rotAbout(axis, d, s, a) {
+  return AN.vadd(AN.vmul(d, Math.cos(a)), AN.vmul(s, Math.sin(a)));
+}
+
+let poseDragMoved = 0;
+const poseDragCb = {
+  down: (id) => { poseDragMoved = 0; ATK.manualBegin?.(); },
+  up: (id) => {
+    if (id === 'shoulder' && poseDragMoved < 3) poseShoulderOpen = !poseShoulderOpen;
+    ATK.manualEnd?.('pose: ' + id);
+  },
+  drag: (id, dx, dy) => {
+    poseDragMoved += Math.abs(dx) + Math.abs(dy);
+    const seed = weaponArmSeed();
+    if (!seed || !melee) return;
+    const S = seed.S || rigScale();
+    const sh = AN.vadd(seed.shoulder, lungeOffsetModel());
+    const sc = v => [sh.x - v.x * S, sh.y + v.y * S, sh.z + v.z * S];
+    const tipL = melee.tipL_, handL = melee.handL_;
+    const r = Math.max(AN.vlen(tipL), 1e-3);
+    const az0 = melee.strokeAz(), el0 = melee.strokeEl();
+    const E = 1e-3;
+    if (id === 'tip' || id === 'upper' || id === 'az' || id === 'el') {
+      // THE POINT, on its sphere about the shoulder.
+      const Jaz = jac(a => sc(AN.vmul(dirL(a, el0), r)), az0, E);
+      const Jel = jac(e => sc(AN.vmul(dirL(az0, e), r)), el0, E);
+      let dAz = 0, dEl = 0;
+      if (id === 'az') dAz = solve1(Jaz, dx, dy);
+      else if (id === 'el') dEl = solve1(Jel, dx, dy);
+      else [dAz, dEl] = solve2(Jaz, Jel, dx, dy);
+      dAz = capStep(dAz); dEl = capStep(dEl);
+      // KEPT INSIDE THE ARM'S WINDOW. The driver clamps the resolved bearing
+      // to [azLo, azHi] x [elMin, elMax], so a number past it moves nothing
+      // on screen and only grows; the frame's own value is bounded by the
+      // window less whatever it is measured from.
+      const t = melee.tuning;
+      const azHi = melee.handSign_ > 0 ? t.azOut : t.azAcross;
+      const azLo = melee.handSign_ > 0 ? -t.azAcross : -t.azOut;
+      ATK.manualEdit?.((fr, parsed) => {
+        const ref = parsed && parsed.fromBody ? { az: 0, el: 0 } : aimAtRest();
+        const az = Math.max(azLo - ref.az, Math.min(azHi - ref.az, (+fr.az || 0) + dAz));
+        const el = Math.max(t.elMin - ref.el, Math.min(t.elMax - ref.el, (+fr.el || 0) + dEl));
+        fr.az = Math.round(az * 1e6) / 1e6;
+        fr.el = Math.round(el * 1e6) / 1e6;
+      });
+    } else if (id === 'reach') {
+      // EXTENSION: the point along its own line, in band units.
+      const band = melee.reachBand();
+      const span = Math.max(band.hi - band.lo, 1e-3);
+      const dirT = AN.vnorm(tipL);
+      const J = jac(x => sc(AN.vmul(dirT, r + x * span)), 0, E);
+      const d = solve1(J, dx, dy);
+      ATK.manualEdit?.(fr => {
+        const lo = -MELEE.kNeutralReach, hi = 1 - MELEE.kNeutralReach;
+        fr.reach = Math.round(Math.max(lo, Math.min(hi, (+fr.reach || 0) + d)) * 1e6) / 1e6;
+      });
+    } else if (id === 'elbow') {
+      // THE ELBOW DIRECTION about the shoulder-to-hand line (melee.h).
+      const hl = Math.max(AN.vlen(handL), 1e-3);
+      const hDir = AN.vnorm(handL);
+      const { down, side } = downSide(hDir);
+      const reachOut = hl * 0.35;
+      const at = a => sc(AN.vadd(AN.vmul(handL, 0.5),
+                                 AN.vmul(rotAbout(hDir, down, side, a), reachOut)));
+      const s0 = melee.elbowSwivelNow_;
+      const d = capStep(solve1(jac(at, s0, E), dx, dy));
+      ATK.manualEdit?.((fr, parsed) => {
+        const base = parsed && parsed.elbowSet ? parsed.elbow : s0;
+        let v = base + d;
+        while (v > Math.PI) v -= 2 * Math.PI;
+        while (v < -Math.PI) v += 2 * Math.PI;
+        fr.elbow = Math.round(v * 1e6) / 1e6;
+      });
+    } else if (id === 'wrist') {
+      // THE HAND round the tip: blade angle (off the arm line) + lean angle.
+      const L = melee.bladeLen_;
+      if (!(L > 1e-3)) return;
+      const rad = AN.vnorm(tipL);
+      const { down, side } = downSide(rad);
+      const handAt = (th, ph) => sc(AN.vadd(AN.vsub(tipL, AN.vmul(rad, L * Math.cos(th))),
+                                            AN.vmul(rotAbout(rad, down, side, ph), L * Math.sin(th))));
+      const th0 = melee.bladeAngleNow_, ph0 = melee.leanAngleNow_;
+      const Jth = jac(t => handAt(t, ph0), th0, E);
+      const Jph = jac(p => handAt(th0, p), ph0, E);
+      const [dTh, dPh] = solve2(Jth, Jph, dx, dy).map(capStep);
+      ATK.manualEdit?.((fr, parsed) => {
+        const th = (parsed && parsed.bladeAngle >= 0 ? parsed.bladeAngle : th0) + dTh;
+        const ph = (parsed && parsed.lean === 'angle' ? parsed.leanAngle : ph0) + dPh;
+        fr.bladeAngle = Math.round(Math.max(0, Math.min(Math.PI, th)) * 1e6) / 1e6;
+        fr.lean = 'angle';
+        fr.leanAngle = Math.round(MELEE.wrapPi(ph) * 1e6) / 1e6;
+      });
+    }
+  },
+};
+
+/* --------------------------------------------------------------------------
+   POSING A FRAME THAT IS A POSE (melee.js "A FRAME IS A POSE").
+
+   The frame stores joint rotations, so its handles edit JOINTS, each drag
+   solved against the STORED pose (keyedFK), never against the drawn model —
+   the model is a preview tick behind the document, and solving against it
+   would drop every pointer move that lands between two ticks.
+
+     hand     move the hand; the arm re-solves (two bones, elbow kept on its
+              side) and the BLADE KEEPS ITS DIRECTION
+     tip      swing the blade about the hand (the wrist)
+     elbow    swivel the elbow round the shoulder-to-hand line; hand and blade
+              stay put
+     roll     turn the blade about its own length (which way the edge faces)
+     arm      turn the whole arm about the shoulder, blade and all
+   -------------------------------------------------------------------------- */
+// The rigid offset of part i from its parent, in the parent's frame, off the
+// drawn model (it is a bone: it does not change with the pose).
+function relPosOf(i) {
+  const par = skel.parts[i].parent;
+  if (par < 0 || !anim.model[par] || !anim.model[i]) return AN.v3();
+  return AN.qrotinv(anim.model[par].rot, AN.vsub(anim.model[i].pos, anim.model[par].pos));
+}
+// The aim turn a held frame is shown with (keyedFramePose's rule).
+function heldAimOf(fr) {
+  if (!fr || fr.fromBody) return { yaw: 0, pitch: 0 };
+  const a = aimAtRest();
+  return { yaw: a.az, pitch: a.el };
+}
+/**
+ * FORWARD KINEMATICS of a stored pose on the live rig: the three joints'
+ * MODEL rotations (U upper arm, F forearm, W hand) and the points S shoulder,
+ * E elbow, H hand, T blade tip. `ctx` carries what does not depend on the pose.
+ */
+function keyedCtx() {
+  const parts = weaponArmParts();
+  if (parts[0] < 0 || parts[1] < 0) return null;
+  const par0 = skel.parts[parts[0]].parent;
+  const P = par0 >= 0 && anim.model[par0] ? anim.model[par0].rot : AN.qid();
+  const hp = parts[2];
+  const handIdx = hp >= 0 ? hp : parts[1];
+  // The blade tip in the HAND's frame, off the drawn model (rigid).
+  const blade = resolveEffector().mode === 'held' ? bladeSegmentModel() : null;
+  const hm = anim.model[handIdx];
+  const tipRel = blade && hm ? AN.qrotinv(hm.rot, AN.vsub(blade.tip, hm.pos)) : AN.v3();
+  const flatRel = blade && hm && blade.flat ? AN.qrotinv(hm.rot, blade.flat) : AN.v3(0, 0, 1);
+  return {
+    parts, P, S: anim.model[parts[0]].pos,
+    eOff: relPosOf(parts[1]),
+    hOff: hp >= 0 ? relPosOf(hp) : skel.parts[parts[1]].rest.pos,
+    wAnim: hp >= 0 ? weaponArmLocals(parts)[2] : null,
+    tipRel, flatRel,
+  };
+}
+function keyedFK(ctx, pose, aim) {
+  const R = MELEE.aimQuat(aim.yaw, aim.pitch);
+  const lu = AN.qnorm(AN.qmul(AN.qconj(ctx.P), AN.qmul(R, AN.qmul(ctx.P, pose.joint[0]))));
+  const U = AN.qnorm(AN.qmul(ctx.P, lu));
+  const F = AN.qnorm(AN.qmul(U, pose.joint[1]));
+  const W = ctx.parts[2] >= 0
+    ? AN.qnorm(AN.qmul(F, pose.joint[2] || ctx.wAnim || AN.qid())) : F;
+  const E = AN.vadd(ctx.S, AN.qrot(U, ctx.eOff));
+  const H = AN.vadd(E, AN.qrot(F, ctx.hOff));
+  const T = AN.vadd(H, AN.qrot(W, ctx.tipRel));
+  return { U, F, W, S: ctx.S, E, H, T };
+}
+// Model rotations back to a STORED pose: parent-relative, the aim turn taken
+// back off the shoulder.
+function keyedStore(ctx, fk, aim, base) {
+  const R = MELEE.aimQuat(aim.yaw, aim.pitch);
+  const lu = AN.qnorm(AN.qmul(AN.qconj(ctx.P), fk.U));
+  const stored = AN.qnorm(AN.qmul(AN.qconj(ctx.P),
+    AN.qmul(AN.qconj(R), AN.qmul(ctx.P, lu))));
+  return {
+    joint: [stored, AN.qnorm(AN.qmul(AN.qconj(fk.U), fk.F)),
+            ctx.parts[2] >= 0 ? AN.qnorm(AN.qmul(AN.qconj(fk.F), fk.W)) : null],
+    twist: base.twist, pitch: base.pitch,
+  };
+}
+/**
+ * THE MIDDLE OF A CUT, for the bake (attacks.js bakeStyle): halfway between
+ * two stored poses BY BEARING. Each end is turned rigidly about the shoulder
+ * to the bearing halfway between the two tips (azimuth and elevation, the way
+ * the old tip-target driver moved), and the two turned arms are then blended.
+ * Slerping the two ends directly takes the shortest joint path, which for a
+ * wide horizontal cut goes over the top of the head; a key made this way puts
+ * the middle of the cut in front, where the old swing passed the target.
+ */
+function bakeMidPose(p0, p1) {
+  const ctx = keyedCtx();
+  if (!ctx || !p0 || !p1) return null;
+  const zero = { yaw: 0, pitch: 0 };
+  const f0 = keyedFK(ctx, p0, zero), f1 = keyedFK(ctx, p1, zero);
+  const bearing = (fk) => {
+    const d = AN.vsub(fk.T, fk.S);
+    const r = Math.max(AN.vlen(d), 1e-4);
+    return { az: Math.atan2(-d.x, d.z), el: Math.asin(clamp(d.y / r, -1, 1)) };
+  };
+  const b0 = bearing(f0), b1 = bearing(f1);
+  const mid = { az: b0.az + MELEE.wrapPi(b1.az - b0.az) / 2, el: (b0.el + b1.el) / 2 };
+  const toMid = (b, s) => {
+    const R = AN.qmul(MELEE.aimQuat(mid.az, mid.el), AN.qconj(MELEE.aimQuat(b.az, b.el)));
+    return AN.qnorm(AN.qmul(AN.qconj(ctx.P), AN.qmul(R, AN.qmul(ctx.P, s))));
+  };
+  const s0 = toMid(b0, p0.joint[0]), s1 = toMid(b1, p1.joint[0]);
+  const sl = (a, b) => (a && b ? AN.qnorm(AN.qslerp(a, b, 0.5)) : (a || b || null));
+  return {
+    joint: [sl(s0, s1), sl(p0.joint[1], p1.joint[1]), sl(p0.joint[2], p1.joint[2])],
+    twist: (p0.twist + p1.twist) / 2, pitch: (p0.pitch + p1.pitch) / 2,
+  };
+}
+/**
+ * A STORED POSE MIRRORED LEFT-RIGHT, still on the SAME arm (attacks.js
+ * deriveStyle): the forehand's top-right windup becomes the backhand's
+ * top-left one. Reflected through the SHOULDER's own vertical plane, not the
+ * body's midline: a target frame's aim is measured from the shoulder, so a
+ * stroke centred on the shoulder's "ahead" stays centred on it (mirrored about
+ * the chest, the saved diagonal's whole sweep landed left of the target).
+ *
+ * A reflection S is not a rotation, so each bone's model rotation M becomes
+ * S·M·D, D a reflection in the bone's OWN frame across a plane that contains
+ * the bone (the elbow and hand stay on the reflected points, exactly, no
+ * solve). D is the same for a bone in every frame, so the turn from one frame
+ * to the next keeps its angle and the mirrored swing interpolates like the
+ * original. (Re-solving each frame's arm by the shortest turn from the
+ * original instead left the upper arm's twist un-mirrored, and the recover
+ * slerped the wrist through ~180 degrees in two ticks — measured.) For the
+ * upper arm and forearm the plane's normal is the elbow's hinge (local z, the
+ * axis every authored elbow bends about), so the elbow bends the same way it
+ * did; for the hand it is the blade's flat, so the blade keeps its line and
+ * its cutting plane (which edge leads does not matter: melee.cpp
+ * MeleeEdgeAlign takes |dot|). Torso twist flips; pitch stays. Zero aim: the
+ * mirror is about "ahead", and the runtime turns the arm to the target after.
+ */
+function mirrorPose(pose) {
+  const ctx = keyedCtx();
+  if (!ctx || !pose) return null;
+  const zero = { yaw: 0, pitch: 0 };
+  const fk = keyedFK(ctx, pose, zero);
+  // The plane's normal n: `want` made square to the bone `along`.
+  const normal = (want, along) => {
+    const t = AN.vlen(along) > 1e-4 ? AN.vnorm(along) : AN.v3(0, 1, 0);
+    const n = AN.vsub(want, AN.vmul(t, AN.vdot(want, t)));
+    return AN.vlen(n) > 1e-4 ? AN.vnorm(n) : perps(t)[0];
+  };
+  // S·M·S is (x, -y, -z, w); S times D (D across the plane of normal n) is
+  // the rotation x̂·n̂ = (x̂ × n̂, -x̂·n̂).
+  const reflect = (M, n) => AN.qnorm(AN.qmul({ x: M.x, y: -M.y, z: -M.z, w: M.w },
+                                              { x: 0, y: -n.z, z: n.y, w: -n.x }));
+  const hinge = AN.v3(0, 0, 1);
+  const out = {
+    U: reflect(fk.U, normal(hinge, ctx.eOff)),
+    F: reflect(fk.F, normal(hinge, ctx.hOff)),
+  };
+  out.W = ctx.parts[2] >= 0 ? reflect(fk.W, normal(ctx.flatRel, ctx.tipRel)) : out.F;
+  const stored = keyedStore(ctx, out, zero, pose);
+  stored.twist = -(pose.twist || 0);
+  stored.pitch = pose.pitch || 0;
+  return stored;
+}
+
+/**
+ * THE SAME ARM, THE OTHER ELBOW SOLUTION (attacks.js pose row "⇅ flip
+ * elbow"). Dragging the hand around can leave a pose whose elbow bends
+ * BACKWARDS with the upper arm twisted 180° to hide it: it reads fine as a
+ * still, but the slerp to a neighbouring frame that is not flipped spins the
+ * whole shoulder through the twist. This turns the upper arm and the forearm
+ * each half a turn about their OWN bone: the elbow, hand and blade stay on
+ * exactly the same points (no solve), the elbow's stored bend changes sign
+ * and the shoulder loses (or gains) the 180° twist. The hand's model rotation
+ * is kept, so the wrist absorbs the forearm's half turn. Applying it twice
+ * gives back the original pose.
+ */
+function flipElbowPose(pose) {
+  const ctx = keyedCtx();
+  if (!ctx || !pose) return null;
+  const zero = { yaw: 0, pitch: 0 };
+  const fk = keyedFK(ctx, pose, zero);
+  const halfTurn = (Q, along) => AN.vlen(along) > 1e-4
+    ? AN.qnorm(AN.qmul(Q, AN.qaxisangle(AN.vnorm(along), Math.PI))) : Q;
+  const out = { U: halfTurn(fk.U, ctx.eOff), F: halfTurn(fk.F, ctx.hOff), W: fk.W };
+  // No hand bone: the forearm IS the hand, and it keeps its half turn.
+  if (ctx.parts[2] < 0) out.W = out.F;
+  return keyedStore(ctx, out, zero, pose);
+}
+
+const keyedPoseOfHeld = () => {
+  const lib = ATK.library();
+  const sty = lib ? lib.styles[ATK.styleIndex()] : null;
+  const key = ATK.goalFrame?.();
+  const k = typeof key === 'string' && key[0] === 'f' ? +key.slice(1) : -1;
+  const fr = sty && k >= 0 ? sty.frames[k] : null;
+  return fr && fr.pose ? fr : null;
+};
+
+function drawKeyedHandles() {
+  const fr = keyedPoseOfHeld();
+  const ctx = fr ? keyedCtx() : null;
+  if (!ctx) { ed.setPoseHandles?.(null); return; }
+  const fk = keyedFK(ctx, fr.pose, heldAimOf(fr));
+  const P = v => [v.x, v.y, v.z];
+  const S = rigScale();
+  const list = [
+    { id: 'khand', pos: P(fk.H), text: '✥ hand', color: '#ff9f5a',
+      title: 'drag: MOVE THE HAND — the arm re-solves, the blade keeps pointing the same way' },
+    { id: 'kelbow', pos: P(fk.E), text: '⟲ elbow', color: '#7cf03a',
+      title: 'drag: swing the ELBOW round the shoulder-to-hand line (hand and blade stay put)' },
+    { id: 'karm', pos: P(AN.vmul(AN.vadd(fk.S, fk.E), 0.5)), text: 'arm', color: '#8fd3ff',
+      title: 'drag: turn the WHOLE ARM about the shoulder, blade and all' },
+  ];
+  if (AN.vlen(AN.vsub(fk.T, fk.H)) > 0.5 * S) {
+    list.push({ id: 'ktip', pos: P(fk.T), text: '✥ tip', color: '#ffc857',
+      title: 'drag: point the BLADE (the wrist turns; the hand stays put)' });
+    const mid = AN.vmul(AN.vadd(fk.H, fk.T), 0.5);
+    const flat = AN.qrot(fk.W, ctx.flatRel);
+    list.push({ id: 'kroll', pos: P(AN.vadd(mid, AN.vmul(AN.vnorm(flat), 1.5 * S))),
+      text: '⟳ roll', color: '#e8a0ff',
+      title: 'drag: ROLL the blade about its own length (which way the edge faces)' });
+  }
+  ed.setPoseHandles?.(list, keyedDragCb);
+}
+
+// Least-squares move of a 3D point for a screen drag: the minimum-norm
+// displacement whose projection is (dx, dy).
+function screenMove3(p, dx, dy) {
+  const E = 1e-2;
+  const at = d => [p.x + d.x, p.y + d.y, p.z + d.z];
+  const J = [AN.v3(1, 0, 0), AN.v3(0, 1, 0), AN.v3(0, 0, 1)].map(ax => {
+    const a = PX([p.x, p.y, p.z]), b = PX(at(AN.vmul(ax, E)));
+    return a && b ? [(b[0] - a[0]) / E, (b[1] - a[1]) / E] : [0, 0];
+  });
+  // M = J J^T (2x2), solve M y = [dx, dy], d = J^T y.
+  const m00 = J.reduce((s, j) => s + j[0] * j[0], 0);
+  const m01 = J.reduce((s, j) => s + j[0] * j[1], 0);
+  const m11 = J.reduce((s, j) => s + j[1] * j[1], 0);
+  const det = m00 * m11 - m01 * m01;
+  if (Math.abs(det) < 1e-9) return AN.v3();
+  const y0 = (m11 * dx - m01 * dy) / det, y1 = (m00 * dy - m01 * dx) / det;
+  return AN.v3(J[0][0] * y0 + J[0][1] * y1, J[1][0] * y0 + J[1][1] * y1,
+               J[2][0] * y0 + J[2][1] * y1);
+}
+// Two perpendiculars of a unit direction.
+function perps(d) {
+  const a = Math.abs(d.y) < 0.9 ? AN.v3(0, 1, 0) : AN.v3(1, 0, 0);
+  const p1 = AN.vnorm(AN.vcross(d, a));
+  return [p1, AN.vnorm(AN.vcross(d, p1))];
+}
+
+const keyedDragCb = {
+  down: () => { ATK.manualBegin?.(); },
+  up: (id) => { ATK.manualEnd?.('pose: ' + id); },
+  drag: (id, dx, dy) => {
+    const ctx = keyedCtx();
+    if (!ctx) return;
+    ATK.manualEdit?.((raw, parsed) => {
+      if (!parsed || !parsed.pose) return;
+      const aim = heldAimOf(parsed);
+      const fk = keyedFK(ctx, parsed.pose, aim);
+      const rotAboutPt = (q, pivot, pt) => AN.vadd(pivot, AN.qrot(q, AN.vsub(pt, pivot)));
+      if (id === 'ktip' || id === 'karm') {
+        // Two rotations about axes square to the pivot-to-point line.
+        const pivot = id === 'ktip' ? fk.H : fk.S;
+        const pt = id === 'ktip' ? fk.T : AN.vmul(AN.vadd(fk.S, fk.E), 0.5);
+        const dir = AN.vsub(pt, pivot);
+        if (AN.vlen(dir) < 1e-4) return;
+        const [a1, a2] = perps(AN.vnorm(dir));
+        const f = (a, b) => AN.qmul(AN.qaxisangle(a1, a), AN.qaxisangle(a2, b));
+        const J1 = jac(a => { const v = rotAboutPt(f(a, 0), pivot, pt); return [v.x, v.y, v.z]; }, 0, 1e-3);
+        const J2 = jac(b => { const v = rotAboutPt(f(0, b), pivot, pt); return [v.x, v.y, v.z]; }, 0, 1e-3);
+        const [da, db] = solve2(J1, J2, dx, dy).map(capStep);
+        const Q = f(da, db);
+        if (id === 'ktip') fk.W = AN.qnorm(AN.qmul(Q, fk.W));
+        else {
+          fk.U = AN.qnorm(AN.qmul(Q, fk.U));
+          fk.F = AN.qnorm(AN.qmul(Q, fk.F));
+          fk.W = AN.qnorm(AN.qmul(Q, fk.W));
+        }
+      } else if (id === 'kroll') {
+        const ax = AN.vsub(fk.T, fk.H);
+        if (AN.vlen(ax) < 1e-4) return;
+        const axis = AN.vnorm(ax);
+        const mid = AN.vmul(AN.vadd(fk.H, fk.T), 0.5);
+        const pt = AN.vadd(mid, AN.vmul(AN.vnorm(AN.qrot(fk.W, ctx.flatRel)), 1.5 * rigScale()));
+        const J = jac(a => { const v = rotAboutPt(AN.qaxisangle(axis, a), mid, pt); return [v.x, v.y, v.z]; }, 0, 1e-3);
+        const d = capStep(solve1(J, dx, dy));
+        fk.W = AN.qnorm(AN.qmul(AN.qaxisangle(axis, d), fk.W));
+      } else if (id === 'kelbow') {
+        // Swivel the upper arm and forearm together about S->H; the hand's
+        // orientation is held, so only the shoulder and wrist locals change.
+        const ax = AN.vsub(fk.H, fk.S);
+        if (AN.vlen(ax) < 1e-4) return;
+        const axis = AN.vnorm(ax);
+        const J = jac(a => { const v = rotAboutPt(AN.qaxisangle(axis, a), fk.S, fk.E); return [v.x, v.y, v.z]; }, 0, 1e-3);
+        const d = capStep(solve1(J, dx, dy));
+        const Q = AN.qaxisangle(axis, d);
+        fk.U = AN.qnorm(AN.qmul(Q, fk.U));
+        fk.F = AN.qnorm(AN.qmul(Q, fk.F));
+      } else if (id === 'khand') {
+        // Two-bone solve to the moved hand, the elbow kept on its side of the
+        // shoulder-to-hand line; the blade keeps its model orientation.
+        const want = AN.vadd(fk.H, screenMove3(fk.H, dx, dy));
+        const L1 = AN.vlen(ctx.eOff), L2 = AN.vlen(ctx.hOff);
+        if (L1 < 1e-4 || L2 < 1e-4) return;
+        const to = AN.vsub(want, fk.S);
+        const d0 = AN.vlen(to);
+        if (d0 < 1e-4) return;
+        const d = Math.max(Math.abs(L1 - L2) + 1e-3, Math.min(L1 + L2 - 1e-3, d0));
+        const dir = AN.vmul(to, 1 / d0);
+        const oldAxis = AN.vsub(fk.H, fk.S);
+        let pole = AN.vsub(fk.E, AN.vadd(fk.S, AN.vmul(AN.vnorm(oldAxis),
+          AN.vdot(AN.vsub(fk.E, fk.S), AN.vnorm(oldAxis)))));
+        pole = AN.vsub(pole, AN.vmul(dir, AN.vdot(pole, dir)));
+        if (AN.vlen(pole) < 1e-4) pole = perps(dir)[0];
+        pole = AN.vnorm(pole);
+        const x = (L1 * L1 - L2 * L2 + d * d) / (2 * d);
+        const h = Math.sqrt(Math.max(0, L1 * L1 - x * x));
+        const E2 = AN.vadd(fk.S, AN.vadd(AN.vmul(dir, x), AN.vmul(pole, h)));
+        const H2 = AN.vadd(fk.S, AN.vmul(dir, d));
+        // The smallest turns that carry each bone onto its new line.
+        const qU = AN.qfromto(AN.vsub(fk.E, fk.S), AN.vsub(E2, fk.S));
+        const U2 = AN.qnorm(AN.qmul(qU, fk.U));
+        const F1 = AN.qnorm(AN.qmul(U2, AN.qmul(AN.qconj(fk.U), fk.F)));
+        const lowerNow = AN.qrot(F1, ctx.hOff);
+        const qF = AN.qfromto(lowerNow, AN.vsub(H2, E2));
+        fk.U = U2;
+        fk.F = AN.qnorm(AN.qmul(qF, F1));
+        // fk.W unchanged: the blade keeps its direction.
+      } else return;
+      raw.pose = MELEE.poseToJson(keyedStore(ctx, fk, aim, parsed.pose));
+    });
+  },
+};
 
 /* --------------------------------------------------------------------------
    THE ANGLE GUIDE — what an az / el / reach box MEANS, drawn on the rig.
@@ -6009,26 +7043,17 @@ function drawAngleGuide() {
     if (guideSig) { guideSig = ''; ed.setAngleGuide?.(null, null); }
     return;
   }
-  const aim = ATK.currentAim();
+  const aim = aimFrom(AN.vadd(seed.shoulder, lungeOffsetModel()), seed.S || rigScale());
   const add = (a, b) => ({ az: a.az + b.az, el: a.el + b.el });
-  let ref, goal, refName;
-  if (key === 'windup') {
-    ref = { az: aim.az, el: aim.el };
-    goal = add(ref, sty.windup);
-    refName = 'target';
-  } else if (key === 'recover') {
-    if (!sty.recover.posed) return;
-    ref = { az: 0, el: 0 };
-    goal = { az: sty.recover.az, el: sty.recover.el };
-    refName = 'ahead';
-  } else {
-    const k = +key.slice(3);
-    if (!(k >= 0 && k < sty.cut.length)) return;
-    const start = add(add(aim, sty.windup), MELEE.cutThrough(sty, k - 1));
-    ref = start;
-    goal = add(start, sty.cut[k]);
-    refName = k === 0 ? 'windup' : `end of cut ${k}`;
-  }
+  // A FRAME'S GUIDE: from what it is measured from (the target, or the
+  // body's own "ahead"), to where its tip ends.
+  const fk = typeof key === 'string' && key[0] === 'f' ? +key.slice(1) : -1;
+  const fr = sty.frames && fk >= 0 && fk < sty.frames.length ? sty.frames[fk] : null;
+  if (!fr) return;
+  const ref = fr.fromBody ? { az: 0, el: 0 } : { az: aim.az, el: aim.el };
+  const goal = add(ref, fr);
+  const refName = fr.fromBody ? 'ahead' : 'target';
+  const frameName = fr.name || `frame ${fk + 1}`;
   const g = MELEE.strokeGoalPose(sty, melee, key, aim.az, aim.el);
   const S = seed.S || 1;
   const reachVox = g ? g.reach : 5;
@@ -6059,7 +7084,7 @@ function drawAngleGuide() {
   labels.push({ pos: arr(at(ref.az, ref.el, R * 1.32)), text: refName, color: hex(C_REF) });
   line(P, at(goal.az, goal.el, R), C_GOAL);
   labels.push({ pos: arr(at(goal.az, goal.el, R * 1.08)),
-                text: `${key.startsWith('cut') ? 'cut ' + (+key.slice(3) + 1) + ' end' : key} · ${reachVox.toFixed(1)} vox`,
+                text: `${frameName} · ${reachVox.toFixed(1)} vox`,
                 color: hex(C_GOAL) });
   // azimuth: horizontal arc at the reference's elevation
   const dAz = goal.az - ref.az, dEl = goal.el - ref.el;
@@ -6186,6 +7211,28 @@ function installTestSeam() {
                        accum: +strokeAccum.toFixed(4) }),
     autoLoco: () => autoLoco,
     styleNames: () => (ATK.library()?.styles || []).map(s => s.name),
+    // THE BAKE (attacks.js bakeAll): every target-spelled style to poses, and
+    // the document it wrote, for a harness to save.
+    bakeAll: () => ATK.bakeAll(),
+    // A NEW STYLE from an old one mirrored and/or reversed (attacks.js
+    // deriveStyle): the generated diagonals.
+    deriveStyle: (src, name, opts) => ATK.deriveStyle(src, name, opts),
+    // A POSE-HANDLE DRAG on the held keyed frame, as the pointer would make it
+    // (keyedDragCb): down, one move of (dx, dy) pixels, up.
+    dragKeyedHandle: (id, dx, dy) => {
+      keyedDragCb.down(id);
+      keyedDragCb.drag(id, dx, dy);
+      keyedDragCb.up(id);
+    },
+    heldFramePose: () => {
+      const fr = keyedPoseOfHeld();
+      return fr ? JSON.parse(JSON.stringify(fr.pose)) : null;
+    },
+    handPos: () => { const p = weaponArmParts(); const h = p[2] >= 0 ? p[2] : p[1];
+                     return h >= 0 && anim.model[h] ? { ...anim.model[h].pos } : null; },
+    tickPreview: (n = 4) => { for (let i = 0; i < n; i++) stepPreviewFixed(kPreviewDt); },
+    stylesDoc: () => JSON.stringify(ATK.rawDoc(), null, 2),
+    keyedNames: () => (ATK.library()?.styles || []).filter(MELEE.styleKeyed).map(s => s.name),
     // The SAME fields the panel's own armInfo reports, so the harness and the
     // readout cannot disagree about whether a blade is in the fist. They were
     // two different shapes for one tick and the sword assertion read undefined
@@ -6231,6 +7278,51 @@ function installTestSeam() {
         weight: melee?.poseWeight() ?? 0,
         style: strokeStyle >= 0 ? s?.styles[strokeStyle]?.name : null,
       };
+    },
+    // ONE SWING, STEPPED BY HAND and recorded per preview step (60 Hz, the
+    // rate the rig is posed at): what the viewport draws, with no rAF, no
+    // wall clock and no virtual-time budget in the way. `item` equips a held
+    // item first ('' = none, undefined = leave it). Each row: the stroke's
+    // phase / frame / weight and the posed arm joints + the weapon's edge, in
+    // model space. The question it answers is "which tick jumps, and which
+    // joint", which no driver-only probe can, because the joint brakes, the
+    // pose clamps and the body clip all live in this file.
+    traceStroke: async (styleName, steps = 90, item) => {
+      if (item !== undefined && item !== (heldItemId || '')) await loadHeldItem(item || null);
+      const lib = ATK.library();
+      const i = lib ? lib.styles.findIndex(s => s.name === styleName) : -1;
+      if (i < 0) return { error: 'no style ' + styleName };
+      stopStroke();
+      for (let k = 0; k < 8; k++) stepPreviewFixed(kPreviewDt);   // settle at rest
+      beginStroke(i);
+      const hand = { hand: -1 };
+      const eff = resolveEffector();
+      const ci = eff.part >= 0 ? chainForEffector(eff.part, hand) : wpChain;
+      const ch = ci >= 0 ? skel.chains[ci] : null;
+      const P = k => (k >= 0 && anim.model[k] ? { ...anim.model[k].pos } : null);
+      const Q = k => (k >= 0 && anim.model[k] ? { ...anim.model[k].rot } : null);
+      const rows = [];
+      for (let s = 0; s < steps; s++) {
+        const ticksBefore = dbgWeaponTicks;
+        stepPreviewFixed(kPreviewDt);
+        const edge = effectorEdgeModel();
+        rows.push({
+          step: s, ticked: dbgWeaponTicks !== ticksBefore, strokeTick,
+          live: strokeLive(),
+          phase: MELEE.STROKE_PHASE_NAME[strokeCur?.phase ?? 0],
+          frame: strokeCur?.frame ?? -1, releasing: !!strokeCur?.releasing,
+          weight: melee ? melee.poseWeight() : 0,
+          shoulder: ch ? P(ch.parts[0]) : null, elbow: ch ? P(ch.parts[1]) : null,
+          hand: P(hand.hand >= 0 ? hand.hand : wpHandPart),
+          qUpper: ch ? Q(ch.parts[0]) : null, qLower: ch ? Q(ch.parts[1]) : null,
+          qHand: Q(hand.hand >= 0 ? hand.hand : wpHandPart),
+          tip: edge ? { ...edge.tip } : null, base: edge ? { ...edge.base } : null,
+          driverHand: melee ? { ...melee.hand_ } : null,
+          lag: armSmooth.valid ? armSmooth.lag : null,
+        });
+      }
+      stopStroke();
+      return { style: styleName, item: heldItemId || '', rows };
     },
     styleTicks: name => {
       const s = ATK.library()?.styles.find(x => x.name === name);

@@ -413,9 +413,9 @@ struct ItemDef {
   // since the blade geometry is supposed to be what decides the wound.
   float carveBonus = 0.0f;
 
-  // Which player strike compass this weapon selects: "dagger" uses
-  // playerDagger, anything else (or empty) uses player. Authored in
-  // items.json; absent defaults to the armed compass.
+  // Which FORM of every attack style this weapon swings: "short", "long" or
+  // "blunt" (strokes.h WEAPON FORMS). Authored in items.json; absent or
+  // unknown swings the styles' own frames.
   std::string weaponClass;
 
   // ---- HEFT: how much weapon is behind the edge ---------------------------

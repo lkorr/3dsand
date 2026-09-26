@@ -241,6 +241,23 @@ const SOUND_SCHEMA = {
        pitch:'lower for a heavier blow'},
     ],
   },
+
+  // ---- vessels ----------------------------------------------------------
+  // Owned like the combat sets (store 'none'): one set, fixed in code.
+  vessel: {
+    store: 'none',
+    title: 'Vessels',
+    icon: '\u{1F9EA}',
+    blurb: 'A flask filling. One owner, so the set name is fixed in code.',
+    slots: [
+      {k:'fill', n:'flask fills (bubble)', prefix:'vessel',
+       d:'Liquid landing in a flask. Fires as each scooped cell is actually paid into the vessel (ContainerSettle, four ticks after the scoop, once the GPU has said what it took) — not for a pouch of sand. One bubble per tick that pays liquid in (30 a second): a held scoop lands 4 cells a tick together, and four voices started at once would only be one louder bubble. The sample is trimmed to its audible 62 ms. Each bubble is pitched by the fill it has reached, so the note climbs as the flask fills.',
+       fires:'audio::Cues::FlaskFill — main.cpp, draining PlayerSession::flaskFills',
+       fallback:'silent.',
+       gain:'0 dB up to half full, falling to -6 dB at full',
+       pitch:'an octave down empty, the sample’s own pitch half full, an octave up full'},
+    ],
+  },
 };
 
 // Every namespace a slot can bind into, for the set browser's grouping and for

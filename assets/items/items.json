@@ -5,6 +5,7 @@
     {
       "id": "sword",
       "kind": "melee",
+      "weaponClass": "long",
       "damage": 14.0,
       "carveBonus": 0.15,
       "reach": 9.0,
@@ -15,6 +16,7 @@
     {
       "id": "cleaver",
       "kind": "melee",
+      "weaponClass": "long",
       "damage": 20.0,
       "carveBonus": 0.25,
       "reach": 11.0,
@@ -25,6 +27,7 @@
     {
       "id": "shortsword",
       "kind": "melee",
+      "weaponClass": "short",
       "damage": 10.0,
       "carveBonus": 0.1,
       "reach": 7.5,
@@ -34,7 +37,7 @@
     {
       "id": "dagger",
       "kind": "melee",
-      "weaponClass": "dagger",
+      "weaponClass": "short",
       "damage": 6.5,
       "carveBonus": 0.04,
       "reach": 6.5,
@@ -44,6 +47,7 @@
     {
       "id": "mace",
       "kind": "melee",
+      "weaponClass": "blunt",
       "damage": 0,
       "blunt": 16.0,
       "bluntCarve": 0.6,

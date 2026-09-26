@@ -1856,6 +1856,14 @@ TP_F(melee, handBackFrac, NO_WGSL, 0.05f, 0.0f, 0.5f)
 TP_F(melee, elbowPoleCone, NO_WGSL, 1.75f, 0.05f, 3.14f)
 TP_F(melee, elbowAxisCone, NO_WGSL, 3.14f, 0.0f, 3.14f)
 TP_F(melee, edgeFloor, NO_WGSL, 0.35f, 0.0f, 1.0f)
+// THE SWEEP'S DENSITY (melee.cpp MeleeSweepDamage). sweepSpacingM is the
+// widest gap allowed between two rows of probe rays across one tick's swing;
+// the rays are lines, so anything thinner than it can pass between them. A
+// human forearm is ~1 voxel (0.1 m), hence 0.05. sweepMaxSteps caps the rows
+// so no flick can cost more than sweepMaxSteps * 5 rays (rule 2); at 24 the
+// spacing holds up to a tip travelling 1.2 m per tick (36 m/s at 30 Hz).
+TP_F(melee, sweepSpacingM, NO_WGSL, 0.05f, 0.01f, 0.5f)
+TP_I(melee, sweepMaxSteps, NO_WGSL, 24, 1, 64)
 // ---- THE BLOCK KNOBS, and what each clamp is protecting ------------------
 //
 //   * blockGapM is the slack in the segment-vs-segment test. NEGATIVE would

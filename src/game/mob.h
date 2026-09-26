@@ -3400,6 +3400,13 @@ class Mob {
   // braking with the last one after the stroke ends until the arm has caught
   // up, so switching off cannot snap.
   void SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt);
+  // A KEYED stroke's arm written again after the stage-6 clamp: the frames
+  // are the author's arm and are not clamped (strokes.h "A FRAME IS A POSE").
+  // Both drivers call it straight after AnimClampPoseLimits.
+  void ReapplyKeyedArm(const AnimSkeleton& sk, AnimState& st) const;
+  void ReflattenArm(const AnimSkeleton& sk, AnimState& st,
+                    const int (&parts)[kArmJoints],
+                    const Quat (&got)[kArmJoints]) const;
   // Called by both drivers straight after AnimClampPoseLimits: fills in
   // WeaponArmDiag::clampMove, the one piece of attribution that cannot be
   // collected inside ApplyWeaponArm because the clamp has not run yet.
@@ -4481,6 +4488,26 @@ class Mob {
     int part[kArmJoints] = {-1, -1, -1};
     Quat prev[kArmJoints]{};
     ArmSmooth params;
+    // THE JOINT-SPACE RELEASE (WeaponPose::release): the arm's joints as the
+    // last DRIVEN tick left them, and -- once a release begins -- the copy it
+    // turns from, so the whole hand-back runs between two fixed ends.
+    bool lastValid = false;
+    int lastPart[kArmJoints] = {-1, -1, -1};
+    Quat last[kArmJoints]{};
+    bool relActive = false;
+    Quat relFrom[kArmJoints]{};
+    // A KEYED STROKE's first frame blends FROM the arm as the stroke found it
+    // (WeaponPose::Keyed::fromLive); taken on that frame's first tick and held
+    // until a frame that blends from a stored pose begins.
+    bool keyLiveValid = false;
+    Quat keyLive[kArmJoints]{};
+    // What ReapplyKeyedArm writes back after the clamp: this tick's keyed
+    // joints (or a release out of a keyed pose), and whether there are any.
+    bool keyedNow = false;
+    int keyedPart[kArmJoints] = {-1, -1, -1};
+    Quat keyedGot[kArmJoints]{};
+    bool lastKeyed = false;   // the last DRIVEN tick was keyed
+    bool relKeyed = false;    // this release began from a keyed pose
   } armSmooth_;
   // ---- THE SELF-CLIP DETECTOR'S CACHE (game/selfclip.h) -------------------
   // Occupancy bitsets per limb and the bind pose's own pair overlaps. Both are

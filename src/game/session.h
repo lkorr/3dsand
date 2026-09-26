@@ -546,6 +546,17 @@ struct PlayerSession {
   StrokeCursor playerStrike;
   int strikeQueued = -1;    // style index latched at the press, -1 = none
   int strikeBuffered = -1;  // ONE strike banked mid-swing, fired at recover
+  // THE LAST ATTACK PRESS, as the picker read it — for the HUD's strike
+  // compass (overlay.cpp) and nothing else; the sim never reads it.
+  // `flicked` false = no flick, the neutral alternate fired. `serial` bumps
+  // per press so the HUD can age the readout without a clock of its own.
+  struct StrikePickNote {
+    int style = -1;
+    float fx = 0, fy = 0;
+    bool flicked = false;
+    uint32_t serial = 0;
+  };
+  StrikePickNote lastStrikePick;
   Vec3 lastEdgeBase{}, lastEdgeTip{};
   bool lastEdgeValid = false;
   // The STRIKE aim ray's ignore list. Its own vector rather than a share of
@@ -560,6 +571,12 @@ struct PlayerSession {
   CombatCueRequest combatWhooshCue, combatFleshCue, combatClangCue,
       combatStrikeCue, combatCutCue;
   bool combatStrikeEdged = true;
+  // LIQUID LANDING IN A VESSEL, one entry per cell paid in (ContainerSettle),
+  // each the receiving vessel's fill fraction 0..1 after that cell. Raised on
+  // the tick, drained and cleared by the frame (audio::Cues::FlaskFill), like
+  // the combat cues above. `flaskFillAt` is where the last one landed.
+  std::vector<float> flaskFills;
+  Vec3 flaskFillAt{};
 
   // ---- projectiles ----
   std::vector<Grenade> grenades;

@@ -1,0 +1,182 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>attacks trace harness</title>
+<!-- attacks_trace.html -- scripts/trace_attacks.sh drives this. The real tuner
+     in an iframe, the human rig with a sword, then per 30 Hz tick of each named
+     style: the hand's rotation step and the blade tip's speed and speed change,
+     off the drawn model (rig.js traceStroke). "Is the swing smooth" as numbers.
+       ?styles=a,b      which styles (default: the six sword/fist staples)
+       &verbose=1       every tick, not just the worst
+       &dump=<style>    hand-relative-to-shoulder per tick (compare the engine's
+                        SANDVOX_PS_TRACE=<style> --gate player-styles)
+       &drag=1          exercise the keyed-frame pose handles on horizontal_r
+       &unarmed=1       empty hand (a fist bake must not hold a blade)
+       &derive=s:n:how;.. derive styles (how = mirror | reverse | both)
+       &bake=1          bake every target-spelled style to poses first; the
+                        baked document follows =====DOC===== in the result
+     Results are POSTed to /api/testresult (build/perfview_result.txt), not
+     scraped with --dump-dom: the page runs in real time. -->
+<pre id="out">running…</pre>
+<pre id="doc"></pre>
+<iframe id="f" src="tuner.html" style="position:absolute;left:0;top:0;width:900px;height:700px;border:0"></iframe>
+<script>
+const out = document.getElementById('out');
+const log = [];
+const post = () => fetch('/api/testresult', { method: 'POST',
+  body: log.join('\n') + '\n=====DOC=====\n' + (document.getElementById('doc').textContent || '') })
+  .catch(() => {});
+const say = m => { log.push(m); out.textContent = log.join('\n'); post(); };
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+async function until(pred, ms = 30000, step = 200) {
+  const t0 = Date.now();
+  while (Date.now() - t0 < ms) { if (pred()) return true; await sleep(step); }
+  return pred();
+}
+const btn = (root, text) => [...root.querySelectorAll('button')].find(b => b.textContent.trim() === text);
+const btnLike = (root, sub) => [...root.querySelectorAll('button')].find(b => b.textContent.includes(sub));
+(async () => {
+try {
+  const f = document.getElementById('f');
+  if (!(f.contentDocument && f.contentDocument.readyState === 'complete' && f.contentWindow.location.href.includes('tuner')))
+    await new Promise(r => f.addEventListener('load', r, {once: true}));
+  const doc = f.contentDocument, win = f.contentWindow;
+  const errors = [];
+  win.addEventListener('error', e => errors.push((e.message || 'error') + ' @ ' + e.filename + ':' + e.lineno));
+  [...doc.querySelectorAll('nav.tabs button[data-tab]')].find(b => b.dataset.tab === 'models').click();
+  const view = doc.querySelector('#view-models');
+  await until(() => !!view.querySelector('.edtimeline'));
+  let picker = null, human = null;
+  await until(() => {
+    for (const s of doc.querySelectorAll('select')) {
+      const o = [...s.options].find(o => /mobs\/human\.vox$/.test(o.value));
+      if (o) { picker = s; human = o; return true; }
+    }
+    return false;
+  });
+  if (!human) { say('FAIL no human'); return; }
+  picker.value = human.value;
+  picker.dispatchEvent(new win.Event('change', {bubbles: true}));
+  await until(() => [...view.querySelectorAll('*')].some(e => e.textContent === 'armU.R'));
+  const api = win.__tunerRigForTest;
+  btn(view, 'attacks').click();
+  await until(() => !!btnLike(view, '▶ swing'));
+  const params0 = new URLSearchParams(location.search);
+  if (params0.has('unarmed')) {
+    // &unarmed=1: bake/trace a FIST with nothing in it. A held blade turns the
+    // wrist to lay the blade along the stroke, and a punch baked that way
+    // comes out a dagger stab.
+    const sel = [...view.querySelectorAll('select')].find(s => [...s.options].some(o => o.textContent === '(unarmed)'));
+    if (sel && sel.value) { sel.value = ''; sel.dispatchEvent(new win.Event('change', {bubbles: true})); }
+    const dis = btn(view, 'disarm');
+    if (dis) dis.click();
+    await until(() => !api.armInfo().item, 10000, 200);
+  } else if (!api.armInfo().item) {
+    const sw = btnLike(view, '+ sword');
+    if (sw) sw.click();
+    await until(() => (api.armInfo().bladeLen || 0) > 0.5, 20000, 200);
+  }
+  say('armed: ' + JSON.stringify(api.armInfo()).slice(0, 200));
+  await sleep(600);
+  const params = new URLSearchParams(location.search);
+  if (params.has('bake')) {
+    const done = api.bakeAll();
+    say('baked: ' + done.join(', '));
+    say('keyed: ' + api.keyedNames().join(', '));
+    document.getElementById('doc').textContent = api.stylesDoc();
+  }
+  if (params.has('derive')) {
+    // &derive=src:name:mirror|reverse|both;... — new styles from keyed ones
+    // (attacks.js deriveStyle); the document follows =====DOC=====.
+    for (const spec of params.get('derive').split(';').filter(Boolean)) {
+      const [src, name, how] = spec.split(':');
+      const ok = api.deriveStyle(src, name, { mirror: how !== 'reverse', reverse: how !== 'mirror' });
+      say('derive ' + spec + ': ' + ok);
+    }
+    document.getElementById('doc').textContent = api.stylesDoc();
+  }
+  if (params.has('drag')) {
+    const chip = [...view.querySelectorAll('.tagbar button')].find(b => b.textContent.trim() === 'horizontal_r');
+    if (chip) chip.click();
+    await sleep(100);
+    const manualBtn = [...view.querySelectorAll('button, span, .chip')].find(b => b.textContent.includes('manual'));
+    if (manualBtn) manualBtn.click();
+    await sleep(100);
+    api.tickPreview(6);
+    const before = api.heldFramePose(), h0 = api.handPos();
+    for (const [id, dx, dy] of [['khand', 25, -10], ['ktip', 0, 30], ['kelbow', 20, 0], ['kroll', 15, 0], ['karm', -20, 0]]) {
+      const p0 = api.heldFramePose();
+      api.dragKeyedHandle(id, dx, dy);
+      api.tickPreview(4);
+      const p1 = api.heldFramePose(), h1 = api.handPos();
+      const ch = p0 && p1 ? JSON.stringify(p0) !== JSON.stringify(p1) : false;
+      say('drag ' + id + ': pose changed ' + ch + ', hand now ' + (h1 ? [h1.x, h1.y, h1.z].map(v => v.toFixed(1)).join(',') : 'none'));
+    }
+    say('held pose before ' + JSON.stringify(before).slice(0, 120));
+    say('hand before ' + (h0 ? [h0.x, h0.y, h0.z].map(v => v.toFixed(1)).join(',') : 'none'));
+  }
+  if (params.has('clip')) {
+    // &clip=1: the pose clipboard on horizontal_r's live panel — hold frame 1
+    // (the stepper), Ctrl+C, hold frame 2 (the . key), Ctrl+V, and the two
+    // poses must match; then Ctrl+Z must put frame 2 back. Nothing is saved.
+    const chip = [...view.querySelectorAll('.tagbar button')].find(b => b.textContent.trim() === 'horizontal_r');
+    if (chip) chip.click();
+    await sleep(150);
+    const key = (k, o = {}) => doc.dispatchEvent(new win.KeyboardEvent('keydown', { key: k, bubbles: true, ...o }));
+    const next = [...view.querySelectorAll('button')].find(b => b.textContent.trim() === '▶' && b.title.includes('next frame'));
+    if (!next) { say('FAIL clip: no stepper'); }
+    else {
+      next.click(); await sleep(100);
+      const lib = () => api.stylesDoc && JSON.parse(api.stylesDoc());
+      const poseOf = (d, k) => { const s = d.styles.find(x => x.name === 'horizontal_r'); const fr = (s.forms && s.forms.long && s.forms.long.frames) || s.frames; return JSON.stringify(fr[k].pose); };  // the panel edits the LONG form (a sword is held)
+      const before = lib();
+      key('c', { ctrlKey: true }); await sleep(50);
+      key('.'); await sleep(100);
+      key('v', { ctrlKey: true }); await sleep(150);
+      const after = lib();
+      say('clip: frame2 == frame1 after paste: ' + (poseOf(after, 1) === poseOf(before, 0)) +
+          ', frame2 changed: ' + (poseOf(after, 1) !== poseOf(before, 1)));
+      key('z', { ctrlKey: true }); await sleep(150);
+      say('clip: undo restores frame2: ' + (poseOf(lib(), 1) === poseOf(before, 1)));
+      say('clip bar: ' + ([...view.querySelectorAll('.lbl')].find(e => e.textContent === 'clipboard')?.parentElement.textContent.slice(0, 160) || 'missing'));
+    }
+  }
+  // ---- smoothness traces, tick by tick ----
+  const names = (params.get('styles') || 'horizontal_r,horizontal_l,overhead,diag_tr_bl,thrust,punch_r').split(',');
+  for (const nm of names) {
+    const chip = [...view.querySelectorAll('.tagbar button')].find(b => b.textContent.trim() === nm);
+    if (chip) chip.click();
+    await sleep(50);
+    const res = await api.traceStroke(nm, 110);
+    const rows = (res.rows || []).filter(r => r.ticked).map(r => ({ t: r.strokeTick, phase: r.phase + r.frame, rot: r.qHand, hand: r.hand, tip: r.tip }));
+    if (!rows) { say(nm + ': no trace'); continue; }
+    let maxRot = 0, maxAcc = 0, lines = [];
+    let pv = null;
+    for (let i = 1; i < rows.length; i++) {
+      const a = rows[i - 1], b = rows[i];
+      let ang = 0;
+      if (a.rot && b.rot) {
+        const d = Math.abs(a.rot.x * b.rot.x + a.rot.y * b.rot.y + a.rot.z * b.rot.z + a.rot.w * b.rot.w);
+        ang = 2 * Math.acos(Math.min(1, d)) * 57.2958;
+      }
+      const P = r => r.tip || r.hand;
+      const v = P(a) && P(b) ? { x: P(b).x - P(a).x, y: P(b).y - P(a).y, z: P(b).z - P(a).z } : null;
+      const sp = v ? Math.hypot(v.x, v.y, v.z) : 0;
+      const acc = v && pv ? Math.hypot(v.x - pv.x, v.y - pv.y, v.z - pv.z) : 0;
+      pv = v;
+      maxRot = Math.max(maxRot, ang); maxAcc = Math.max(maxAcc, acc);
+      lines.push(b.t + ' ' + b.phase.padEnd(7) + ' rot ' + ang.toFixed(1).padStart(5) + ' tipv ' + sp.toFixed(1).padStart(5) + ' dv ' + acc.toFixed(1).padStart(5));
+    }
+    if ((params.get('dump') || '').split(',').includes(nm)) {
+      const tk = (res.rows || []).filter(r => r.ticked);
+      const r0 = tk[0];
+      const S0 = r0 && r0.hand && r0.shoulder ? Math.hypot(r0.hand.x - r0.shoulder.x, r0.hand.y - r0.shoulder.y, r0.hand.z - r0.shoulder.z) / 5 : 1;
+      say('dump ' + nm + ' S~' + S0.toFixed(3) + String.fromCharCode(10) + tk.map(r => r.strokeTick + ' ' + r.phase + r.frame + ' hand-sh (' + ['x','y','z'].map(c => ((r.hand[c] - r.shoulder[c]) / S0).toFixed(2)).join(',') + ')' + (r.tip ? ' tip-sh (' + ['x','y','z'].map(c => ((r.tip[c] - r.shoulder[c]) / S0).toFixed(1)).join(',') + ')' : '')).join(String.fromCharCode(10)));
+    }
+    say(nm + ': ' + rows.length + ' ticks, max hand rot ' + maxRot.toFixed(1) + ' deg/tick, max tip dv ' + maxAcc.toFixed(1) + ' vox/tick^2');
+    if (params.has('verbose')) say(lines.join(String.fromCharCode(10)));
+  }
+  if (errors.length) say('ERRORS:\n' + [...new Set(errors)].slice(0, 8).join('\n'));
+  say('DONE');
+} catch (e) { say('EXCEPTION ' + e.message + '\n' + e.stack); }
+})();
+</script>
