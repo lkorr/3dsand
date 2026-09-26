@@ -274,6 +274,15 @@ constexpr uint32_t kFluidOpLifeShift = 16;       // ghost life, ticks, bits 16..
 uint32_t ContainerScoopStream(IVec3 cell, uint32_t mat, Vec3 mouth, int life,
                               uint32_t seed, uint32_t tick, uint32_t room,
                               std::vector<FluidSpawnOp>& out);
+// THE SCOOP STREAM RUN BACKWARDS: the held vessel APPLYING its contents to a
+// body (apply mode, TB_APPLY). `n` ghost particles leave `mouth` and home onto
+// `target` (the skin point the brush struck) over `life` ticks. The same ghosts
+// as the scoop's, so the same promise: a picture only. The coat itself is
+// MobSystem::PourOnBody's, paid from the flask's fill by the tick. Returns the
+// particles emitted, capped by `room`.
+uint32_t ContainerApplyStream(Vec3 mouth, Vec3 target, uint32_t mat, int life,
+                              int n, uint32_t seed, uint32_t tick, uint32_t room,
+                              std::vector<FluidSpawnOp>& out);
 
 // ---- THROWING AND BREAKING (owner, 2026-09-23: "holding down a button with
 // it equipped charges up a throw ... if the flask hits something with a high

@@ -5210,16 +5210,55 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
   // second blow into an existing gash finds the space already gone and takes
   // nothing — "the wound stops getting deeper", which on a corpse reads as a
   // sword bouncing off it.
-  const float entry = KerfEntry(frame, latScale, [&](auto&& probe) {
+  auto walk = [&](auto&& probe) {
     if (fine)
       for (const PrefabVoxel& pv : b.skinVoxels)
         probe((float)pv.x, (float)pv.y, (float)pv.z);
     else
       for (const DebrisVoxel& dv : b.voxels)
         probe((float)dv.x, (float)dv.y, (float)dv.z);
-  });
+  };
+  const auto& gt = CurrentTuning().gore;
   KerfSlot slot = frame;
-  slot.c = cLocal + frame.w * entry;
+  // A blow that can pay for the whole plane comes out the other side -- the
+  // same step Mob::CutLimb takes, from the same header, so a severed arm is
+  // chopped in two the way it was chopped off. Here a through cut needs no
+  // rule after it: DamageBody's connectivity split already makes two bodies
+  // of whatever is in two pieces. A strapped garment is exempt, as a worn
+  // shell is on the living.
+  const bool garment = WornHostOf(handle) != 0ull;
+  slot.c = slot.c + slot.w * KerfEntry(slot, latScale, walk);
+  if (!garment) {
+    const float edgeHalf = cut.edgeHalf > 0.0f ? cut.edgeHalf : slot.halfL;
+    const float cleave = std::max(cut.cleave, 0.0f);
+    const float budget = slot.depth * 2.0f * slot.halfL + cleave;
+    const float ref = CurrentTuning().gear.cutHardnessRef;
+    auto costOf = [&](uint32_t m) {
+      const float h = m < matGpu_.size() ? (float)matGpu_[m].hardness : 0.0f;
+      return (h > 0.0f && ref > 0.0f) ? h / ref : 1.0f;
+    };
+    const KerfBiteResult bite = KerfBite(
+        slot, latScale, edgeHalf, budget, slot.depth, cleave,
+        [&](auto&& probe) {
+          if (fine)
+            for (const PrefabVoxel& pv : b.skinVoxels) {
+              const uint32_t m = pv.material & 0xFFFu;
+              if (m) probe((float)pv.x, (float)pv.y, (float)pv.z, costOf(m));
+            }
+          else
+            for (const DebrisVoxel& dv : b.voxels) {
+              const uint32_t m = dv.payload & 0xFFFu;
+              if (m) probe((float)dv.x, (float)dv.y, (float)dv.z, costOf(m));
+            }
+        });
+    if (bite.through) {
+      slot.through = true;
+      slot.depth = bite.exit + 1.0f / latScale;
+      slot.halfL = std::max(slot.halfL, edgeHalf);
+    } else if (bite.depth > slot.depth) {
+      slot.depth = bite.depth;
+    }
+  }
 
   // ---- AND THE HOLE GROWS INTO ITS OWN RIM (2026-09-20) -------------------
   //
@@ -5234,9 +5273,9 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
   // Centred on the cut and sized to the SLOT, not to a blast radius: the spall
   // pass is a sphere test, and one sized to the depth is the volume the edge
   // actually disturbed.
-  const auto& gt = CurrentTuning().gore;
   SpallParams spall;
-  if (gt.cutSpallRounds > 0 && gt.cutSpallStrength > 0.0f && cut.depth > 0.0f) {
+  if (!slot.through && gt.cutSpallRounds > 0 && gt.cutSpallStrength > 0.0f &&
+      cut.depth > 0.0f) {
     spall.centre = slot.c + slot.w * (cut.depth * 0.5f);   // scaled below
     spall.radius = std::max(cut.depth, slot.halfW * 2.0f);
     spall.strength = std::clamp(gt.cutSpallStrength, 0.0f, 1.0f);

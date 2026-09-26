@@ -293,6 +293,12 @@ const char* const kOrder[] = {
     // 2-wide geometry the thin-film riser step CANNOT resolve, asserted to go
     // to sleep rather than to drain.
     "ca-gutter",
+    // Oil on water: a disturbed slick must not diffuse into isolated cells.
+    // Same sealed-box fixture as ca-level.
+    "oil-slick",
+    // Passable plants hold nothing up: sand, a lone chip and a grid particle
+    // each crush the bramble they land on. Same sealed-box fixture.
+    "plant-crush",
     // ...and the same rule where it is NOT isolated: a real desert tarn's sand
     // shore, shipped tuning, seam on. Right after ca-gutter because the two are
     // one claim in two halves. It stands the window somewhere else entirely and
@@ -403,6 +409,9 @@ const char* const kOrder[] = {
     // asserts is pure CPU (the shader constant, the packing, the stacking
     // rule, the save payload) and costs nothing.
     "dye",
+    // Same standing rig and wardrobe as `dye`; spawns one pool body and
+    // Resets the mob list either side, like `dye`.
+    "hair-tuck",
     "ragdoll-joints",
     // Beside `ragdoll-joints` and for the same reason: both are pure Jolt over
     // their own fixture, 640 voxels from anything, and both remove every body
@@ -618,6 +627,7 @@ const char* const kOrder[] = {
     // because the two measure the two halves of "a creature on a hill": the
     // walker must not sink into it, the crawler must not float over it.
     "crawl-slope",
+    "crawl-still",
     // Live ragdoll: a blast knocks a creature flying and it gets back up; a
     // long fall does the same. Appended last in the group for the reason
     // above; it restores the world on its way out.
@@ -664,7 +674,7 @@ const char* const kOrder[] = {
     // long: a gate added to a suite that shares one World has to go where it
     // disturbs the fewest gates that were there first, and that is the END of
     // its group — not the middle of it, however well it reads there.
-    "wound-chip", "wound-accumulate", "wound-heft", "wound-bleed",
+    "wound-chip", "hair-rooted", "wound-accumulate", "wound-heft", "wound-bleed",
     // ---- NPCs SWINGING, AND BLADES MEETING BLADES (phase C) ---------------
     // APPENDED at the very end of the mob group, following the rule the block
     // above spells out: a new gate in a shared-World suite goes LAST in its
@@ -705,6 +715,12 @@ const char* const kOrder[] = {
     // and dead flesh reports its own gore (owner report 2026-09-20). Same
     // fixture, CPU only.
     "corpse-dismember",
+    // ...and a head comes off when a blow can PAY for the neck: a perfect
+    // sword swing cleaves a live one, a weak one or a skull blow does not, and
+    // deliberate chops at a corpse's neck slide into one groove and part it
+    // (phys/kerf.h KerfBite / KerfGroove, owner 2026-09-25). Fresh spawns on
+    // pristine ground, CPU only.
+    "head-cleave",
     // ...and a mace MARKS a corpse and leaves it crumbling, instead of boring
     // an instant sphere out of it: the same three-rung ladder the living
     // climb (owner report 2026-09-20). Ticks the debris system only.

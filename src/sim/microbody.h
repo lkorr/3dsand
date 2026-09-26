@@ -179,6 +179,15 @@ struct MicroBodySet {
   // the block stays the size it was allocated at and must be freed at that
   // size or the surplus leaks out of the pool permanently.
   std::vector<uint32_t> blockWords;
+  // model index -> a counter bumped by every write to that model's PAYLOAD
+  // (MicroBodyPoke that changed a cell, MicroBodyEdit, the clone that filled
+  // it). Never reset, not uploaded. It exists so a DERIVED edit of a brick can
+  // tell that the brick changed underneath it without every writer having to
+  // know the derived edit exists: Mob::SyncHairTuck hides hair under a hood by
+  // poking cells out of the hair's brick, and a burn or carve that rewrote
+  // those cells must be followed by a re-hide. Stain pokes do not count --
+  // a stain on a cell that is not drawn is not drawn either.
+  std::vector<uint32_t> editGen;
   // Free word ranges below the high-water mark `pool.size()`: base -> words,
   // never adjacent (PoolFree merges neighbours). Best-fit on allocation.
   std::map<uint32_t, uint32_t> freeRanges;
@@ -422,6 +431,16 @@ bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
 
 // A model's brick dimensions in micro voxels; {0,0,0} for an invalid index.
 IVec3 MicroBodyDims(const MicroBodySet& set, uint32_t model);
+
+// The model's payload write counter (MicroBodySet::editGen); 0 for a model
+// nothing has written since it was packed.
+uint32_t MicroBodyEditGen(const MicroBodySet& set, uint32_t model);
+
+// One micro voxel of a model, BRICK-LOCAL like MicroBodyPoke: the 16-bit
+// MicroVox cell (0 = empty), or 0 outside dims / for a bad index. A read, so
+// shared models answer too.
+uint16_t MicroBodyCell(const MicroBodySet& set, uint32_t model, int x, int y,
+                       int z);
 
 // dims-word flag: the block holds a stain lattice after its payload.
 constexpr uint32_t kMicroBodyDimsStainBit = 1u << 30;

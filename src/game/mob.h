@@ -1436,6 +1436,15 @@ struct MobLimb {
   // model is a copy-on-write clone this limb OWNS and must free
   // (ReleaseLimbMicro), and its flipbooks are disabled.
   bool carved = false;
+  // HAIR TUCKED UNDER HEADGEAR (Mob::SyncHairTuck). Non-zero while some of
+  // this hair limb's brick cells are poked empty because a hood or helm on the
+  // head covers them: the signature of the state the hide was computed from
+  // (this brick + its edit counter, the head shells + their voxel counts), so
+  // anything that moved under it -- a burn repainting a hidden cell, a carve
+  // re-packing the brick, the hood burning away -- is seen and re-done. 0 =
+  // the brick draws exactly its skinVoxels. RENDER-ONLY: skinVoxels/voxels,
+  // the collider, burning and saving never see a tucked cell as missing.
+  uint64_t tuckSig = 0;
   // Voxel count the limb was authored with, so damage is a FRACTION of it.
   uint32_t voxelsAtSpawn = 0;
   // Voxel count the last carve already CHARGED to hp. `voxelsAtSpawn` is the
@@ -1489,6 +1498,17 @@ struct MobLimb {
   // count — which is CONSERVATIVE (a lower denominator makes the sever harder,
   // never easier), so it fails safe.
   uint32_t neckAtSpawn = 0;
+  // ---- WHERE THE SKULL STARTS (2026-09-25) ---------------------------------
+  // A VITAL severable limb's neck is part of it (the human head model is neck
+  // + skull; the torso ends flat at the shoulders), so a blade decapitation
+  // sent whatever neck was above the cut away with the head. The owner wants
+  // just the head: Mob::Sever trims everything nearer the joint than this
+  // before a blade takes the limb. Distance along `skullAxis` (limb-local,
+  // anchor -> centroid) from `anchorLimb`, world voxels; < 0 = no neck found.
+  // Measured once, off the intact lattice, by Mob::MeasureSkullBase.
+  bool skullMeasured = false;
+  float skullBase = -1.0f;
+  Vec3 skullAxis{0, 1, 0};
   // ---- HOW MUCH FLESH THE PARENT HAS AT THIS JOINT -------------------------
   // The OTHER HALF of the same question, and the one no count taken on this
   // limb can answer: an arm is held on by the shoulder of the TORSO as much as
@@ -1750,6 +1770,14 @@ class Mob {
   Mob& operator=(const Mob&) = delete;
 
   uint64_t Id() const { return id_; }
+  // A part's MODEL-frame +Y (the pose as flattened, before the body frame);
+  // zero for a part the pose has no entry for. Tests read pose motion here.
+  Vec3 PartModelUp(int i) const {
+    if (i < 0 || i >= (int)anim_.model.size() || i >= (int)limbs_.size() ||
+        !limbs_[i].body)
+      return Vec3{};
+    return QuatRotate(anim_.model[i].rot, Vec3{0, 1, 0});
+  }
   bool Alive() const { return alive_; }
   bool Swinging() const { return swinging_; }
   void SetSwinging(bool v) { swinging_ = v; }
@@ -1944,6 +1972,37 @@ class Mob {
   // whether Jolt placed it (limp) or the pose pipeline did (everything else).
   // This is the ONLY thing that poses a shell; SubmitPose skips them.
   void DriveWornShells();
+  // ---- HAIR UNDER A HOOD --------------------------------------------------
+  //
+  // Hair is its own limb (`hair` off the head, `mane` off the torso) and a hood
+  // or helm is a shell fitted to the HEAD's box, so without this every long
+  // hairstyle pokes straight through whatever is worn over it. The fix is to
+  // not draw the hair the headgear covers. At hood height, a hair cell is
+  // hidden when the ray from the head's centre through it crosses a head-worn
+  // shell (under the cloth, or poking out through it), or when it lies in an
+  // OPENING (a cowl's face window, a helm's eye slit) further out than that
+  // opening's rim (an afro's bulk beside the face). A fringe or beard in the
+  // opening stays, and hair below the headgear's hem -- a ponytail, long hair
+  // down the back -- is always drawn. Rule and measurements beside the code.
+  //
+  // Render-only, by poking the hidden cells empty in the hair's own (owned)
+  // brick and poking them back from skinVoxels when uncovered. The lattice
+  // the sim reads is untouched, so tucked hair still burns, carves, severs and
+  // saves as hair. Idempotent and cheap when nothing changed (a signature
+  // compare per hair limb): called after wear/unwear and at the end of each
+  // tick (TickAuthority), which is after every burn and carve of that tick.
+  void SyncHairTuck();
+  // Put every tucked cell of `limbIndex` back (no-op if it is not tucked).
+  void UntuckHair(int limbIndex);
+  // For the `hair-tuck` gate: over every hair (bloodless base) limb, the cells
+  // the authoritative lattice holds and the cells the brick actually draws.
+  struct HairTuckProbe {
+    int hairLimbs = 0;
+    int latticeCells = 0;
+    int drawnCells = 0;
+    int tuckedLimbs = 0;
+  };
+  HairTuckProbe ProbeHairTuck() const;
   // The limb this slot is strapped to, or -1 if it is not a follower at all —
   // MobLimb::wornHost, for a caller outside the class. NOT a synonym for
   // IsWornSlot: that asks "is this wardrobe rather than anatomy" (by tag, true
@@ -2258,6 +2317,24 @@ class Mob {
   void BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
                 std::vector<ParticleSpawn>& spawns, uint32_t& frontBudget,
                 uint32_t& opsBudget);
+  // How much of the shared burn budgets limb `li` is owed this tick: 0 when it
+  // has no burn work of its own (nothing alight, no front, no corrosive coat),
+  // else its front size -- the burning surface, which is what both its
+  // candidate count and its flame demand scale with -- floored so a limb whose
+  // front was just dropped by a flush (rebuilt this tick) is not starved.
+  // See the FAIR SHARE note in Mob::BurnTick.
+  uint64_t LimbBurnWeight(int li) const {
+    const MobLimb& l = limbs_[li];
+    if (!l.body ||
+        !(l.burn.alight || !l.burn.front.empty() || l.coat.corrosive > 0))
+      return 0;
+    return std::max<uint64_t>(l.burn.front.size(), 64);
+  }
+  uint64_t BurnWeight() const {
+    uint64_t w = 0;
+    for (int li = 0; li < (int)limbs_.size(); li++) w += LimbBurnWeight(li);
+    return w;
+  }
 
   // ---- per-tick body upkeep (called by the driver) --------------------------
   void TickSeveredHolds(float dt);
@@ -2298,6 +2375,12 @@ class Mob {
   bool EquipItem(const ItemDef* item, const char* context = "held_right");
   const std::string& HeldItem() const { return heldItem_; }
   int HeldSlot() const { return heldSlot_; }
+  // WHERE A HELD VESSEL'S CONTENTS LEAVE IT (game/container.h): the point of
+  // the held item's own lattice farthest along `dir` (world), at the body's
+  // current pose -- the lip of a flask tipped toward what it pours on, so a
+  // stream comes out of the flask in the outstretched hand and not out of the
+  // hand's origin. False when nothing is held.
+  bool HeldMouthWorld(Vec3 dir, Vec3& out);
 
   // ---- WHAT IT IS CARRYING (MobDef::loot) ---------------------------------
   //
@@ -3226,6 +3309,20 @@ class Mob {
   bool SettleClipOwnedBody(World& world, const AnimStateRule* rule, float dt,
                            float& outTargetY);
 
+  // ---- A PRONE BODY IS A CHAIN, NOT A PLANK --------------------------------
+  // SettleClipOwnedBody lays the whole body on ONE plane fitted under it, so
+  // over a crest it is a straight segment tangent to a curve: the middle
+  // touches and both ends hang in the air (in a dip, both ends dig in). This
+  // runs after that placement, on the flattened pose, parent before child:
+  // every non-root segment long enough to have a direction (torso, head, legs,
+  // arms) probes the ground under its joint and under its far end and pitches
+  // at that joint by however much THAT stretch of ground differs from the body
+  // plane, bounded (kProneConformMaxDeg) and low-passed (`proneConform_`).
+  // Children inherit the parent's bend and add only the difference, so each
+  // segment ends up following its own ground. Presentation only; reset when
+  // the body is not prone.
+  void ConformProneSegments(World& world, float dt);
+
   // Does this cell carry a body's weight? THE definition of "solid" for
   // locomotion, shared by the ground probe, the footprint collider and the
   // navigator's `blocked` adapter, so "walkable" means one thing in this
@@ -3295,6 +3392,14 @@ class Mob {
   // Aim effector always answers.
   const IkChain* ChainForEffector(const AnimSkeleton& sk, int part,
                                   int& outHandPart) const;
+  // THE AUTHOR'S BRAKES ON THE POSED ARM (melee.h ArmSmooth): low-pass and
+  // per-tick rate cap on the shoulder / elbow / wrist rotations, each
+  // relative to its parent, straight after ApplyWeaponArm and before the
+  // stage-6 clamp. Stateful (per-tick), hence not const; `dt` is the pose
+  // step. A no-op unless the live WeaponPose states a brake, and it keeps
+  // braking with the last one after the stroke ends until the arm has caught
+  // up, so switching off cannot snap.
+  void SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt);
   // Called by both drivers straight after AnimClampPoseLimits: fills in
   // WeaponArmDiag::clampMove, the one piece of attribution that cannot be
   // collected inside ApplyWeaponArm because the clamp has not run yet.
@@ -3559,6 +3664,11 @@ class Mob {
   // THIS limb, so they have to be recorded before this limb is the one being
   // eaten.
   void EnsureJointCounts(int limbIndex);
+  // MobLimb::skullBase, taken once (EnsureJointCounts, or lazily by Sever).
+  void MeasureSkullBase(int limbIndex);
+  // A blade decapitation takes the skull only: drop the neck below
+  // MobLimb::skullBase from the lattices and rebuild. False = nothing trimmed.
+  bool TrimNeckForSever(int limbIndex);
   // Forget every joint baseline, so the next carve re-takes it off the lattice
   // the creature is actually standing there with. Called once, at the end of
   // RotAtSpawn: a body born bitten did not arrive with the pristine sockets
@@ -4103,6 +4213,9 @@ class Mob {
   // voxels, re-chosen wherever the pose is touching), so it is the chaotic
   // component of a crawl's bob and the one the eye blames on the arms.
   float proneLift_ = 0;
+  // Per part, the eased pitch (radians, + = far end up) ConformProneSegments
+  // is holding that segment at relative to the body plane.
+  std::vector<float> proneConform_;
   // ---- THE ONE-FOOTED DRAG (anim.h AnimApplyStumpDrag) --------------------
   //
   // `dragW_` is the eased commitment to the drag, 0 at a standstill and 1 at
@@ -4360,6 +4473,15 @@ class Mob {
   mutable Quat weaponHandPreClamp_{}, weaponUpPreClamp_{}, weaponLoPreClamp_{};
   mutable Vec3 weaponHandPosPreClamp_{};
   mutable int weaponHandPart_ = -1, weaponUpPart_ = -1, weaponLoPart_ = -1;
+  // SmoothWeaponArm's memory: the braked local rotation of each joint last
+  // tick, the parts they belong to, and the brakes in force. Presentation
+  // state like the rest of the pose: not saved, re-seeded from the live pose.
+  struct ArmSmoothState {
+    bool valid = false;
+    int part[kArmJoints] = {-1, -1, -1};
+    Quat prev[kArmJoints]{};
+    ArmSmooth params;
+  } armSmooth_;
   // ---- THE SELF-CLIP DETECTOR'S CACHE (game/selfclip.h) -------------------
   // Occupancy bitsets per limb and the bind pose's own pair overlaps. Both are
   // facts about the ART, so they are built on the first check and reused; a
@@ -5116,6 +5238,10 @@ class MobSystem {
                std::vector<ParticleSpawn>& spawns);
   // After Physics::Step: refresh limb transforms from Jolt.
   void PostStep();
+  // Mob::SyncHairTuck over every creature in mobs_ (the avatar is its own
+  // caller, in TickAuthority's player phase). End of the tick, after contact
+  // damage, so no burn or carve of this tick reaches the frame un-tucked.
+  void SyncHairTuck();
 
   // Damage a limb by physics body handle (laser, explosions). Returns true
   // if the handle belonged to a live mob limb. Severs / kills at 0 hp, and a
@@ -5743,6 +5869,33 @@ class MobSystem {
     worstSeverFrac_ = -1.0f;
     worstSeverLimb_.clear();
   }
+  // THE LAST BLADE CUT'S ARITHMETIC (Mob::CutLimb; phys/kerf.h KerfBite), plus running counts since the last clear. A decapitation is
+  // one bool at the end of a sum -- the plane's price against the blow's bite
+  // -- and a gate or the dev readout that only sees "the head stayed on"
+  // cannot say whether the blow was weak, the neck was dear, or the blade was
+  // too short to span it. This says which.
+  struct CutBite {
+    float planeCost = 0.0f;  // what is left in the cut plane, world vox^2
+    float budget = 0.0f;     // chip area + cleave, world vox^2
+    float cleave = 0.0f;     // the cleave part of that budget
+    float depth = 0.0f;      // slot depth the blow was given, world vox
+    bool mayPart = false;    // this slot can be parted at all
+    bool through = false;    // it was: the edge came out the other side
+    bool blocked = false;    // the plane ran past the end of the edge
+    uint32_t cuts = 0, throughs = 0;  // since ClearCutBites
+    // What CarveLimb then found (a blade carve only; last one wins): the
+    // collider's pieces, the biggest one that left, what the limb kept, and
+    // the flesh at its joint now against at spawn (the two sever rules).
+    uint32_t comps = 0, parted = 0, kept = 0, before = 0;
+    uint32_t neckNow = 0, neckSpawn = 0;
+    // A blade decapitation's neck trim (Mob::TrimNeckForSever): voxels of
+    // the authoritative lattice (skin when there is one) dropped, and where the skull base was, world voxels from the
+    // joint. 0 / -1 = no trim.
+    uint32_t neckTrimmed = 0, neckLeft = 0;  // neckLeft: refused, stayed on
+    float skullBase = -1.0f;
+  };
+  const CutBite& LastCutBite() const { return cutBite_; }
+  void ClearCutBites() { cutBite_ = CutBite{}; }
   Vec3 MobOrigin(uint64_t mobId) const;
   // THE BODY'S BOX in world voxels (min corner, max corner) - `origin_` plus
   // the def's `worldSize`. `MobOrigin` alone is the collider's MIN CORNER in
@@ -6313,6 +6466,13 @@ class MobSystem {
     uint64_t coatMatched = 0, coatFired = 0, coatCovered = 0, coatPartner = 0;
     // Clause 2c: coat firings that made a flame ON a voxel that then caught.
     uint64_t coatCaught = 0;
+    // THE BUDGETS RAN OUT: candidates left unevaluated because the front
+    // budget (the caller's share of it) was spent, and grid writes an emit or
+    // a leaving voxel wanted that the ops budget refused. Non-zero on any
+    // fully engulfed body -- that is the budget working -- but it is the
+    // number that says "the fire is budget-bound" rather than "the rule's
+    // odds are low" (see the fair share in Mob::BurnTick).
+    uint64_t frontSkipped = 0, emitRefused = 0;
   };
   const BurnStats& Burn() const { return burnStats_; }
   void ResetBurnStats() { burnStats_ = BurnStats{}; }
@@ -6794,6 +6954,7 @@ class MobSystem {
   // this is a high-water mark over a whole test, not a per-tick event queue.
   float worstSeverFrac_ = -1.0f;
   std::string worstSeverLimb_;
+  CutBite cutBite_;  // written by Mob::CutLimb, see LastCutBite
   std::vector<BleedSource> bleeds_;
   std::vector<SplatterEvent> splatters_;
   std::vector<VoiceEvent> voices_;

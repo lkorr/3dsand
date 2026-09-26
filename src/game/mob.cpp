@@ -4547,10 +4547,16 @@ bool Mob::PosedCoreLowY(Quat bodyRot, Vec3 planeDir, float& outLowY,
     const float ax = Rotate(rot, Vec3{1, 0, 0}).dot(planeDir);
     const float ay = Rotate(rot, Vec3{0, 1, 0}).dot(planeDir);
     const float az = Rotate(rot, Vec3{0, 0, 1}).dot(planeDir);
-    const float d = corner.dot(planeDir) +
-                    std::min(0.0f, ax) * (float)limb.size.x +
-                    std::min(0.0f, ay) * (float)limb.size.y +
-                    std::min(0.0f, az) * (float)limb.size.z;
+    // `limb.size` is COLLIDER extents in physScale units, not world voxels
+    // (ClampToLimbBox). Read raw, every core box was physScale times its real
+    // size (4x on the human), so its "lowest corner" sat far below the art and
+    // grounding that phantom corner held the real torso ~5 voxels off the
+    // floor — the crawl that floated over lava instead of lying in it.
+    const float inv = 1.0f / (float)PhysScaleOf(limb);
+    const Vec3 ext{(float)limb.size.x * inv, (float)limb.size.y * inv,
+                   (float)limb.size.z * inv};
+    const float d = corner.dot(planeDir) + std::min(0.0f, ax) * ext.x +
+                    std::min(0.0f, ay) * ext.y + std::min(0.0f, az) * ext.z;
     if (!have || d < low) {
       low = d;
       have = true;
@@ -4558,10 +4564,9 @@ bool Mob::PosedCoreLowY(Quat bodyRot, Vec3 planeDir, float& outLowY,
       // the functional picked. Built only when asked for — the placement path
       // wants the number, only a diagnostic wants the location.
       if (outPoint != nullptr)
-        lowAt = corner + Rotate(rot, Vec3{ax < 0.0f ? (float)limb.size.x : 0.0f,
-                                          ay < 0.0f ? (float)limb.size.y : 0.0f,
-                                          az < 0.0f ? (float)limb.size.z
-                                                    : 0.0f});
+        lowAt = corner + Rotate(rot, Vec3{ax < 0.0f ? ext.x : 0.0f,
+                                          ay < 0.0f ? ext.y : 0.0f,
+                                          az < 0.0f ? ext.z : 0.0f});
     }
   }
   if (!have) return false;
@@ -4638,7 +4643,12 @@ static constexpr float kProneLiftHalfLife = 0.10f;
 // corner on every rig. THE FEEL KNOB for "the crawl sits too high / too deep":
 // it is one number in world voxels, and the averaging above is worth roughly
 // another half of one on top of it.
-static constexpr float kProneEmbedVox = 1.5f;
+//
+// NEGATIVE since 2026-09-25, on the owner's eye ("raise him", twice): the
+// 1.5 this started at was tuned while PosedCoreLowY read collider boxes 4x
+// too big, and with the boxes right the body looked sunk. -0.5 holds the
+// lowest core corner half a voxel PROUD of the plane.
+static constexpr float kProneEmbedVox = -0.5f;
 
 // SANDVOX_PRONE_RAW=1 — the control arm: no embed, no filtering, the corner
 // grounded exactly on the plane. This is what the placement did before the
@@ -4672,27 +4682,61 @@ bool Mob::SettleClipOwnedBody(World& world, const AnimStateRule* rule, float dt,
   }
   const float w = std::clamp(rule->groundAlign, 0.0f, 1.0f);
 
-  const float cx = origin_.x + def_->worldSize.x * 0.5f;
-  const float cz = origin_.z + def_->worldSize.z * 0.5f;
-  // THE BASELINE IS THE CREATURE'S OWN LENGTH. A body that lies down covers
-  // its standing height of ground, so that is the run the grade under it is
-  // measured over — shorter and it re-aims to bumps it is merely passing,
-  // longer and it aims at terrain no part of it is touching.
-  const float spanFwd = std::max(2.0f, def_->worldSize.y);
+  const Vec3 fwd{std::sin(heading_), 0, std::cos(heading_)};
+  const Vec3 rgt{std::cos(heading_), 0, -std::sin(heading_)};
+  // THE BASELINE IS THE BODY AS IT LIES, not the creature's standing height.
+  // That used to be the run (a body lying down covers its standing height of
+  // ground), centred on the hip column — but a crawler with no legs is a third
+  // of that long and lies entirely AHEAD of its hips, so most of the ground
+  // the plane was fitted to was ground no part of it touched, and the body lay
+  // on a hill like a plank tangent to it. The forward extent of this frame's
+  // pose (every live part's joint and far end, in the model frame whose +Z is
+  // forward) gives both the run and where its middle is.
+  float zLo = 0, zHi = 0;
+  {
+    bool any = false;
+    const size_t np = std::min(limbs_.size(), anim_.model.size());
+    const float pz = def_->worldSize.z * 0.5f;
+    for (size_t i = 0; i < np; i++) {
+      const MobLimb& limb = limbs_[i];
+      if (!limb.body || limb.holdSeconds > 0 || limb.wornHost >= 0 ||
+          (int)i == heldSlot_)
+        continue;
+      if (i < anim_.partAlive.size() && !anim_.partAlive[i]) continue;
+      const float inv = 1.0f / (float)PhysScaleOf(limb);
+      const Vec3 c{(float)limb.size.x * inv * 0.5f,
+                   (float)limb.size.y * inv * 0.5f,
+                   (float)limb.size.z * inv * 0.5f};
+      const Vec3 j = anim_.model[i].pos;
+      const Vec3 t = j + Rotate(anim_.model[i].rot, c - limb.anchorLimb) * 2.0f;
+      for (float z : {j.z - pz, t.z - pz}) {
+        zLo = any ? std::min(zLo, z) : z;
+        zHi = any ? std::max(zHi, z) : z;
+        any = true;
+      }
+    }
+    if (!any) zLo = zHi = 0;
+  }
+  const float spanFwd =
+      std::clamp(zHi - zLo, std::min(6.0f, def_->worldSize.y),
+                 std::max(2.0f, def_->worldSize.y));
+  const float along = 0.5f * (zLo + zHi);
+  const float cx = origin_.x + def_->worldSize.x * 0.5f + fwd.x * along;
+  const float cz = origin_.z + def_->worldSize.z * 0.5f + fwd.z * along;
   const float spanSide =
       std::max(1.0f, std::max(def_->worldSize.x, def_->worldSize.z));
   // 5 x 3. The forward axis is the one that matters (a prone body is long and
   // narrow) and three lateral files are the fewest that can tell a side grade
   // from a single stray column.
-  const GroundPlane gp =
+  GroundPlane gp =
       FitGroundPlane(world, cx, cz, origin_.y, spanFwd, spanSide, 5, 3);
   if (!gp.valid) {
     easeUp(Vec3{0, 1, 0});
     return false;
   }
-
-  const Vec3 fwd{std::sin(heading_), 0, std::cos(heading_)};
-  const Vec3 rgt{std::cos(heading_), 0, -std::sin(heading_)};
+  // Everything below states the plane at the body's own centre COLUMN (the
+  // yaw pivot), so carry the fitted height back from the body's middle.
+  gp.height -= gp.gradeFwd * along;
   // The lean as a gradient, scaled by how much of the grade this state takes,
   // then bounded by its LENGTH — one ceiling on the total angle off vertical,
   // not one per axis, for the reason UpdateGait spells out: clamping pitch and
@@ -4821,6 +4865,152 @@ bool Mob::SettleClipOwnedBody(World& world, const AnimStateRule* rule, float dt,
                           : (wantLift - proneLift_) * std::clamp(kl, 0.0f, 1.0f);
   outTargetY += proneLift_;
   return true;
+}
+
+// How far one prone segment may bend away from the body plane to follow its
+// own ground, and how fast it gets there. The bound is what keeps a segment
+// over a cliff edge or a post from folding the body in half; the half-life is
+// short against a crawl (a crest is crossed in about a second) and long
+// against the one-voxel steps a two-column probe hands over.
+static constexpr float kProneConformMaxDeg = 30.0f;
+static constexpr float kProneConformHalfLife = 0.30f;
+// A target within this of what the segment already holds is left alone. The
+// ground is whole voxels and a shin is two of them long, so as a body turns or
+// shifts the fitted grade re-quantises by several degrees at a time; without a
+// deadband that noise IS the motion, and a still body kicks its legs.
+static constexpr float kProneConformDeadbandDeg = 4.0f;
+// A segment shorter than this along the ground (a hand, an arm pointing down
+// into the floor) has no direction along it worth bending.
+static constexpr float kProneConformMinRunVox = 1.5f;
+// The shortest run of ground a segment's grade is read over (see the probe).
+static constexpr float kProneConformBaselineVox = 5.0f;
+
+// SANDVOX_PRONE_RIGID=1 — the control arm: the whole-body plank this replaced,
+// in the same binary (`crawl-slope` reports the crest hang under both).
+static const bool kProneRigid = std::getenv("SANDVOX_PRONE_RIGID") != nullptr;
+
+void Mob::ConformProneSegments(World& world, float dt) {
+  const size_t n = std::min(limbs_.size(), anim_.model.size());
+  if (kProneRigid || def_ == nullptr || n == 0 || skel_.parts.size() < n)
+    return;
+  proneConform_.resize(n, 0.0f);
+
+  // SubmitPose's body frame, exactly: the transform every model point below
+  // is taken to the world through.
+  const Quat bodyRot = Mul(QuatFromTo(Vec3{0, 1, 0}, bodyUp_),
+                           AxisAngle(Vec3{0, 1, 0}, heading_));
+  const Quat invRot = QuatConj(bodyRot);
+  const Vec3 pivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+  const Vec3 bodyOrigin{origin_.x, bodyY_, origin_.z};
+  auto toWorld = [&](Vec3 m) {
+    return bodyOrigin + pivot + Rotate(bodyRot, m - pivot);
+  };
+  // Slope (rise per unit run) of the plane the body is drawn on, along `h`.
+  const float upY = std::max(bodyUp_.y, 0.2f);
+  auto planeSlope = [&](Vec3 h) {
+    return -(bodyUp_.x * h.x + bodyUp_.z * h.z) / upY;
+  };
+  const float kMax = kProneConformMaxDeg * 0.0174532925f;
+  const float k = std::clamp(
+      1.0f - std::pow(0.5f, std::max(dt, 0.0f) / kProneConformHalfLife), 0.0f,
+      1.0f);
+
+  // A segment's direction: joint -> the far end of its collider box (twice
+  // the joint-to-centre offset), in MODEL space. Captured for every part
+  // before anything bends, so a child can tell how much of its current slope
+  // it inherited from the bends above it.
+  auto segDir = [&](size_t i) {
+    const MobLimb& limb = limbs_[i];
+    const float inv = 1.0f / (float)PhysScaleOf(limb);
+    const Vec3 c{(float)limb.size.x * inv * 0.5f,
+                 (float)limb.size.y * inv * 0.5f,
+                 (float)limb.size.z * inv * 0.5f};
+    return Rotate(anim_.model[i].rot, c - limb.anchorLimb) * 2.0f;
+  };
+  std::vector<Vec3> dir0(n);
+  for (size_t i = 0; i < n; i++) dir0[i] = Rotate(bodyRot, segDir(i));
+  auto slopeAngle = [](Vec3 d) {
+    const float run = std::sqrt(d.x * d.x + d.z * d.z);
+    return std::atan2(d.y, std::max(run, 1e-4f));
+  };
+
+  for (size_t i = 0; i < n; i++) {
+    const MobLimb& limb = limbs_[i];
+    const int parent = skel_.parts[i].parent;
+    bool eligible = parent >= 0 && (int)i != def_->rootLimb && limb.body &&
+                    limb.holdSeconds <= 0 && limb.wornHost < 0 &&
+                    (int)i != heldSlot_ &&
+                    !(i < anim_.partAlive.size() && !anim_.partAlive[i]) &&
+                    limb.size.x > 0 && limb.size.y > 0 && limb.size.z > 0;
+    const Vec3 jointM = anim_.model[i].pos;
+    const Vec3 joint = toWorld(jointM);
+    const Vec3 d = Rotate(bodyRot, segDir(i));
+    const float run = std::sqrt(d.x * d.x + d.z * d.z);
+    if (run < kProneConformMinRunVox) eligible = false;
+    float target = 0.0f;
+    if (eligible) {
+      // The grade under THIS segment: a least-squares slope through five
+      // columns centred on its middle. Segments are short (a human torso runs
+      // about three voxels), so two whole-voxel probes at its ends would read
+      // a one-voxel step as 20 degrees; the baseline is at least
+      // kProneConformBaselineVox for the same reason FitGroundPlane's is a
+      // body length.
+      const Vec3 h{d.x / run, 0, d.z / run};
+      const Vec3 mid = joint + d * 0.5f;
+      const float base = std::max(run, kProneConformBaselineVox);
+      const int yFrom =
+          ifloor(std::max(joint.y, joint.y + d.y)) + kMobProbeLiftCells;
+      float su = 0, sg = 0, suu = 0, sug = 0;
+      int got = 0;
+      for (int s = 0; s < 5; s++) {
+        const float u = ((float)s / 4.0f - 0.5f) * base;
+        int gy = 0;
+        if (!GroundHeightAt(world, ifloor(mid.x + h.x * u),
+                            ifloor(mid.z + h.z * u), yFrom, gy))
+          continue;
+        su += u; sg += (float)gy; suu += u * u; sug += u * (float)gy;
+        got++;
+      }
+      const float den = suu - su * su / std::max(got, 1);
+      if (got >= 3 && den > 1e-3f) {
+        const float slope = (sug - su * sg / (float)got) / den;
+        const float ground = std::atan(slope);
+        const float plane = std::atan(planeSlope(h));
+        // A segment shorter than the ground it was read over bends by that
+        // fraction: a shin cannot follow a grade measured over five voxels
+        // with its whole two, and asking it to is what swings it.
+        const float reach = std::clamp(run / base, 0.0f, 1.0f);
+        target = std::clamp((ground - plane) * reach, -kMax, kMax);
+        if (std::fabs(target - proneConform_[i]) <
+            kProneConformDeadbandDeg * 0.0174532925f)
+          target = proneConform_[i];
+      } else {
+        target = proneConform_[i];   // no answer: hold what we had
+      }
+    }
+    proneConform_[i] += (target - proneConform_[i]) * k;
+    if (!eligible) continue;
+
+    // What the bends above this segment already did to it, so it adds only
+    // the difference and ends up at its OWN ground's slope.
+    const float inherited = slopeAngle(d) - slopeAngle(dir0[i]);
+    const float bend = proneConform_[i] - inherited;
+    if (std::fabs(bend) < 1e-4f) continue;
+    // + about cross(up, h) tips the far end DOWN; `bend` is + = far end up.
+    const Vec3 h{d.x / run, 0, d.z / run};
+    const Vec3 axisW = Vec3{0, 1, 0}.cross(h);
+    const Quat q = AxisAngle(Rotate(invRot, axisW).normalized(), -bend);
+    // The segment and everything hanging off it pivot about its joint.
+    for (size_t j = i; j < n; j++) {
+      bool inTree = j == i;
+      for (int a = skel_.parts[j].parent; !inTree && a >= 0;
+           a = skel_.parts[a].parent)
+        if ((size_t)a == i) inTree = true;
+      if (!inTree) continue;
+      anim_.model[j].rot = QuatNormalize(Mul(q, anim_.model[j].rot));
+      anim_.model[j].pos = jointM + Rotate(q, anim_.model[j].pos - jointM);
+    }
+  }
 }
 
 void Mob::PlayClip(const std::string& name) {
@@ -6157,7 +6347,10 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     case StrokeStepResult::Live:
       break;
   }
-  mob.SetWeaponPose(st.melee.Pose());
+  // The style's per-joint brakes ride the pose to the rig (melee.h ArmSmooth).
+  WeaponPose wp = st.melee.Pose();
+  if (sty != nullptr) wp.smooth = sty->joints;
+  mob.SetWeaponPose(wp);
 }
 
 void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
@@ -7678,6 +7871,127 @@ void Mob::SubmitPose(float dt, bool writeXf) {
     bodyOrigin.y -= drop;
   }
 
+  // ---- THE GET-UP MOVES THE BODY AS ONE PIECE, AND ROLLS FIRST ------------
+  // Every limb used to lerp its position and slerp its rotation in WORLD
+  // space from where it lay to its animated target, each on its own. Nothing
+  // made the body turn as a unit, and each limb took its own shortest path —
+  // so a creature on its back swivelled its whole length through the floor to
+  // reach a face-down pose, limbs sweeping underground on independent arcs.
+  //
+  // Two rules instead, both about the ROOT (the pelvis), with every other limb
+  // blended in the root's frame so it stays where it is on the body:
+  //   1. ROLL FIRST. The cheapest way from face-up to face-down is a half turn
+  //      about the body's own long axis — the axis a person rolls over on —
+  //      not a pivot of the whole body about some axis through the ground. So
+  //      the root first rolls about its spine axis (local +Y) until its front
+  //      (local +Z) faces as nearly as it can the way the target's front does.
+  //   2. THEN THE REST. What remains after the roll is the pitch up out of the
+  //      lying pose (and any yaw), which is now the small part of the motion,
+  //      and is slerped — overlapping the roll's tail so the two read as one
+  //      movement.
+  // The root's position eases straight to its target; limbs follow it rigidly
+  // and ease their own pose (relative to the root) from how they lay to how
+  // they will stand.
+  // SANDVOX_GETUP_LEGACY=1: the per-limb world-space blend this replaced, as
+  // a same-binary control arm (the `ragdoll` gate prints both numbers).
+  static const bool kGetUpLegacy = std::getenv("SANDVOX_GETUP_LEGACY") != nullptr;
+  const int rootI = def.rootLimb;
+  bool rootBlend = false;
+  Quat rootFromQ{}, rootToQ{}, rootNowQ{};
+  Vec3 rootFromP{}, rootToP{}, rootNowP{};
+  if (!kGetUpLegacy && ragdoll_ == RagdollPhase::GetUp && blendW < 1.0f &&
+      rootI >= 0 &&
+      rootI < (int)limbs_.size() && rootI < (int)getUpFrom_.size() &&
+      limbs_[rootI].body) {
+    const BodyTransform& f = getUpFrom_[rootI];
+    rootFromQ = QuatNormalize(Quat{f.quat[0], f.quat[1], f.quat[2], f.quat[3]});
+    rootFromP = f.pos;
+    LimbTargetFor((size_t)rootI, bodyOrigin, bodyRot, yawPivot, rootToP,
+                  rootToQ);
+    auto smooth = [](float x) {
+      x = std::clamp(x, 0.0f, 1.0f);
+      return x * x * (3.0f - 2.0f * x);
+    };
+    // The roll that best lines the lying front up with the target front,
+    // about the lying spine.
+    const Vec3 spine = Rotate(rootFromQ, Vec3{0, 1, 0});
+    const Vec3 front = Rotate(rootFromQ, Vec3{0, 0, 1});
+    Vec3 want = Rotate(rootToQ, Vec3{0, 0, 1});
+    want = want - spine * want.dot(spine);
+    float roll = 0.0f;
+    if (want.len() > 0.2f) {
+      want = want.normalized();
+      roll = std::atan2(spine.dot(front.cross(want)), front.dot(want));
+    }
+    // A small roll is not worth a separate stage: the slerp does it anyway.
+    if (std::fabs(roll) < 0.6f) roll = 0.0f;
+    const float rollW = smooth(blendW / 0.55f);
+    const Quat rolled =
+        QuatNormalize(Mul(AxisAngle(spine, roll * rollW), rootFromQ));
+    const float restW = roll != 0.0f ? smooth((blendW - 0.3f) / 0.7f) : blendW;
+    rootNowQ = QuatNormalize(QuatSlerp(rolled, rootToQ, restW));
+    // Position: the pivot the root turns about is its own centre, so ease the
+    // CENTRE and hang the box off it, or a half roll swings the box origin a
+    // body width through the ground.
+    const MobLimb& rl = limbs_[rootI];
+    const float inv = 1.0f / (float)PhysScaleOf(rl);
+    const Vec3 half{(float)rl.size.x * inv * 0.5f, (float)rl.size.y * inv * 0.5f,
+                    (float)rl.size.z * inv * 0.5f};
+    const Vec3 cFrom = rootFromP + Rotate(rootFromQ, half);
+    const Vec3 cTo = rootToP + Rotate(rootToQ, half);
+    const Vec3 cNow = cFrom + (cTo - cFrom) * blendW;
+    rootNowP = cNow - Rotate(rootNowQ, half);
+    rootBlend = true;
+  }
+  // A limb's pose during the root-frame blend: how it lay on the body and how
+  // it will sit on it, eased between, then carried by where the root is now.
+  auto rootFramePose = [&](const BodyTransform& f, Vec3& pos, Quat& rot) {
+    const Quat fq{f.quat[0], f.quat[1], f.quat[2], f.quat[3]};
+    const Quat invFrom = QuatConj(rootFromQ), invTo = QuatConj(rootToQ);
+    const Quat lFrom = QuatNormalize(Mul(invFrom, fq));
+    const Quat lTo = QuatNormalize(Mul(invTo, rot));
+    const Vec3 oFrom = Rotate(invFrom, f.pos - rootFromP);
+    const Vec3 oTo = Rotate(invTo, pos - rootToP);
+    const Quat l = QuatNormalize(QuatSlerp(lFrom, lTo, blendW));
+    const Vec3 o = oFrom + (oTo - oFrom) * blendW;
+    rot = QuatNormalize(Mul(rootNowQ, l));
+    pos = rootNowP + Rotate(rootNowQ, o);
+  };
+  // Lowest point of a limb's collider box posed at (pos, rot).
+  auto boxLowY = [&](const MobLimb& limb, Vec3 pos, Quat rot) {
+    const float inv = 1.0f / (float)PhysScaleOf(limb);
+    return pos.y +
+           std::min(0.0f, Rotate(rot, Vec3{1, 0, 0}).y) * (float)limb.size.x * inv +
+           std::min(0.0f, Rotate(rot, Vec3{0, 1, 0}).y) * (float)limb.size.y * inv +
+           std::min(0.0f, Rotate(rot, Vec3{0, 0, 1}).y) * (float)limb.size.z * inv;
+  };
+  // ---- ...AND A ROLLING BODY STAYS ON TOP OF THE FLOOR -------------------
+  // Turning about its own centre, a body lying with an arm or a hip out to
+  // the side sweeps that part through the ground on the way over. A body
+  // that really rolls rides up over it, so the whole blended pose is lifted
+  // by however far its lowest point would go under the floor — never deeper
+  // than it already lay (a settled ragdoll rests a little into the surface,
+  // and lifting that away would pop the body up on the first frame).
+  float rollLift = 0.0f;
+  if (rootBlend) {
+    float lowNow = 1e9f, lowFrom = 1e9f;
+    for (size_t i = 0; i < limbs_.size() && i < getUpFrom_.size(); i++) {
+      const MobLimb& limb = limbs_[i];
+      if (!limb.body || limb.holdSeconds > 0 || limb.wornHost >= 0) continue;
+      const BodyTransform& f = getUpFrom_[i];
+      Vec3 pos;
+      Quat rot;
+      LimbTargetFor(i, bodyOrigin, bodyRot, yawPivot, pos, rot);
+      rootFramePose(f, pos, rot);
+      lowNow = std::min(lowNow, boxLowY(limb, pos, rot));
+      lowFrom = std::min(
+          lowFrom, boxLowY(limb, f.pos, Quat{f.quat[0], f.quat[1], f.quat[2],
+                                             f.quat[3]}));
+    }
+    if (lowNow < 1e8f)
+      rollLift = std::max(0.0f, std::min(lowFrom, origin_.y) - lowNow);
+  }
+
   for (size_t i = 0; i < limbs_.size(); i++) {
     MobLimb& limb = limbs_[i];
     if (!limb.body) continue;
@@ -7704,8 +8018,13 @@ void Mob::SubmitPose(float dt, bool writeXf) {
         i < getUpFrom_.size()) {
       const BodyTransform& f = getUpFrom_[i];
       const Quat fq{f.quat[0], f.quat[1], f.quat[2], f.quat[3]};
-      pos = f.pos + (pos - f.pos) * blendW;
-      rot = QuatNormalize(QuatSlerp(fq, rot, blendW));
+      if (rootBlend) {
+        rootFramePose(f, pos, rot);
+        pos.y += rollLift;
+      } else {
+        pos = f.pos + (pos - f.pos) * blendW;
+        rot = QuatNormalize(QuatSlerp(fq, rot, blendW));
+      }
     }
     float q[4] = {rot.x, rot.y, rot.z, rot.w};
     phys_->MoveKinematicBody(limb.body, pos, q, dt);
@@ -8803,6 +9122,7 @@ bool Mob::ApplyFallDamage(Vec3 impactDeltaV, Vec3 centerWorldVoxel,
       if (!LimbAlive((int)i) || !limbs_[i].body) continue;
       const MobLimbDef& ld = limbDefs_[i];
       if ((int)i == def.rootLimb || ld.vital || !ld.severable) continue;
+      if (ld.bloodless) continue;  // hair does not fly off (rooted)
       severable.push_back((int)i);
     }
     for (size_t j = 0; j < severable.size(); j++) {
@@ -9426,6 +9746,346 @@ void Mob::DriveWornShells() {
     shell.xf.quat[2] = q.z;
     shell.xf.quat[3] = q.w;
   }
+}
+
+// ---- HAIR UNDER A HOOD (Mob::SyncHairTuck, declared with the why) ----------
+//
+// THE COVER MAP. Every head-worn shell cell is splatted into a cube map of
+// directions from the head's centre (6 faces x kTuckBins^2); a hair cell is
+// hidden when its own direction lands in a covered bin. A DIRECTION map rather
+// than a ray march through the shell lattices because a shell is one micro
+// cell thick and a stepped ray slips between two cells that only share an
+// edge; splatting each shell cell's whole angular footprint (4^3 sub-samples)
+// leaves no such gap, and it costs one pass over the shells plus one lookup
+// per hair cell instead of a march per hair cell.
+//
+// kTuckBins: a bin is ~1/32 of a cube face, ~0.03-0.06 rad -- finer than a
+// shell cell seen from the head's centre (~0.06-0.1 rad), so the edge of a
+// face opening is resolved to about one shell cell, and coarse enough that
+// the 1/4-cell sub-sampling covers every bin a cell's footprint touches.
+namespace {
+constexpr int kTuckBins = 32;
+constexpr int kTuckSub = 4;
+
+int TuckBin(const Vec3& d) {
+  const float ax = std::fabs(d.x), ay = std::fabs(d.y), az = std::fabs(d.z);
+  int axis;
+  float major, u, v;
+  if (ax >= ay && ax >= az) { axis = 0; major = d.x; u = d.y; v = d.z; }
+  else if (ay >= az)        { axis = 1; major = d.y; u = d.x; v = d.z; }
+  else                      { axis = 2; major = d.z; u = d.x; v = d.y; }
+  if (std::fabs(major) < 1e-6f) return -1;
+  const float inv = 1.0f / std::fabs(major);
+  const int face = axis * 2 + (major > 0.0f ? 1 : 0);
+  const int iu = std::clamp((int)((u * inv + 1.0f) * 0.5f * kTuckBins), 0,
+                            kTuckBins - 1);
+  const int iv = std::clamp((int)((v * inv + 1.0f) * 0.5f * kTuckBins), 0,
+                            kTuckBins - 1);
+  return (face * kTuckBins + iv) * kTuckBins + iu;
+}
+
+inline uint64_t TuckMix(uint64_t h, uint64_t v) {
+  h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+  return h;
+}
+
+inline bool IsHairDef(const MobLimbDef& ld) {
+  return ld.bloodless || ld.tag == "hair";
+}
+}  // namespace
+
+void Mob::UntuckHair(int limbIndex) {
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return;
+  MobLimb& l = limbs_[(size_t)limbIndex];
+  if (l.tuckSig == 0) return;
+  l.tuckSig = 0;
+  MicroBodySet* micro = MicroSet();
+  if (!micro || l.microModel < 0) return;
+  const uint32_t model = (uint32_t)l.microModel;
+  // Every cell back to what the lattice says: the full re-paint rather than
+  // "the cells I hid", so there is no second list to keep in step with a
+  // lattice that burns and compacts underneath it. A poke that changes
+  // nothing costs nothing (MicroBodyPoke's no-debt early out).
+  if (l.HasFineSkin()) {
+    for (const PrefabVoxel& v : l.skinVoxels) {
+      const uint32_t mat = v.material & 0xFFFu;
+      if (mat == 0 || mat > 255) continue;
+      MicroBodyPoke(*micro, model, v.x, v.y, v.z, (uint8_t)mat, v.color);
+    }
+  } else {
+    for (const DebrisVoxel& v : l.voxels) {
+      const uint32_t mat = v.payload & 0xFFFu;
+      if (mat == 0 || mat > 255) continue;
+      MicroBodyPoke(*micro, model, v.x, v.y, v.z, (uint8_t)mat, v.color);
+    }
+  }
+}
+
+void Mob::SyncHairTuck() {
+  MicroBodySet* micro = MicroSet();
+  if (micro == nullptr || rigReleased_ || limbs_.empty()) return;
+  const int nBase = std::min(baseLimbs_, (int)limbs_.size());
+  // Hair limbs first: most creatures have none, and they pay one loop.
+  bool anyHair = false;
+  for (int i = 0; i < nBase && !anyHair; i++)
+    anyHair = IsHairDef(limbDefs_[(size_t)i]);
+  if (!anyHair) return;
+
+  // THE HEAD, by name -- the same way an item's cover finds it (WearOnRig).
+  // Only shells on the head tuck hair: a robe over the torso must not hide a
+  // mane hanging down its back, and "the ray from the head's centre crosses
+  // the garment" is only the right question for a garment round the head.
+  int head = -1;
+  for (int i = 0; i < nBase; i++)
+    if (limbDefs_[(size_t)i].name == "head") { head = i; break; }
+  std::vector<int> shells;
+  if (head >= 0 && limbs_[(size_t)head].body) {
+    for (size_t k = (size_t)nBase; k < limbs_.size(); k++) {
+      const MobLimb& s = limbs_[k];
+      if (s.wornHost == head && s.body && s.holdSeconds <= 0)
+        shells.push_back((int)k);
+    }
+  }
+  uint64_t shellSig = 0x51u;
+  for (int k : shells) {
+    const MobLimb& s = limbs_[(size_t)k];
+    shellSig = TuckMix(shellSig, (uint64_t)k);
+    shellSig = TuckMix(shellSig, s.HasFineSkin() ? s.skinVoxels.size()
+                                                 : s.voxels.size());
+    shellSig = TuckMix(shellSig, (uint64_t)(uint32_t)s.microModel);
+    if (s.microModel >= 0)
+      shellSig = TuckMix(shellSig,
+                         MicroBodyEditGen(*micro, (uint32_t)s.microModel));
+  }
+  auto sigOf = [&](const MobLimb& l) -> uint64_t {
+    uint64_t h = TuckMix(shellSig, (uint64_t)(uint32_t)l.microModel);
+    h = TuckMix(h, MicroBodyEditGen(*micro, (uint32_t)l.microModel));
+    h = TuckMix(h, l.HasFineSkin() ? l.skinVoxels.size() : l.voxels.size());
+    return h == 0 ? 1u : h;   // 0 means "not tucked"
+  };
+
+  // Built on first need, shared by every hair limb this call. All of it is in
+  // the head's own frame (Y up, the rest frame every limb shares), relative to
+  // the head's centre.
+  //
+  // COVERED IS NOT THE WHOLE RULE. Rays from the centre FAN OUT, so the cone
+  // through a cowl's face window grows with distance, and an afro's bulk out
+  // beside the cheeks sits inside that cone: covered-only left a slab of it
+  // standing in front of the face (seen in `--shot-mob pool/m02:+hood`). So:
+  //   * AT HOOD HEIGHT (at or above the lowest shell cell), a covered direction
+  //     hides, and an OPEN direction (the face window, the eye slit) shows only
+  //     hair no further out than the opening's rim (`rim`: the outer radius of
+  //     the nearest covered direction) -- a fringe or a beard in the window,
+  //     not a mass of hair that would really be squashed under the cloth;
+  //   * BELOW THE HEM, nothing hides: hair hanging out from under the hood
+  //     (a ponytail, long hair down the back) is exactly what should show.
+  std::vector<uint8_t> cover;      // per bin: 1 = a shell cell lies that way
+  std::vector<float> rmax;         // per bin: the shell's outer radius
+  std::vector<float> rim;          // per bin, lazily: -1 = not asked yet
+  std::vector<int> coveredBins;
+  float hemY = 0.0f, margin = 0.0f;
+  bool coverBuilt = false;
+  Vec3 centre{};
+  const MobLimb* H = head >= 0 ? &limbs_[(size_t)head] : nullptr;
+  const Quat headQ = H ? Quat{H->xf.quat[0], H->xf.quat[1], H->xf.quat[2],
+                              H->xf.quat[3]}
+                       : Quat{0, 0, 0, 1};
+  auto binDir = [](int bin) {
+    const int face = bin / (kTuckBins * kTuckBins);
+    const int iv = (bin / kTuckBins) % kTuckBins, iu = bin % kTuckBins;
+    const float u = ((float)iu + 0.5f) / kTuckBins * 2.0f - 1.0f;
+    const float v = ((float)iv + 0.5f) / kTuckBins * 2.0f - 1.0f;
+    const float m = (face & 1) ? 1.0f : -1.0f;
+    Vec3 d = face / 2 == 0 ? Vec3{m, u, v}
+           : face / 2 == 1 ? Vec3{u, m, v}
+                           : Vec3{u, v, m};
+    return d * (1.0f / d.len());
+  };
+  auto rimOf = [&](int bin) {
+    if (rim[(size_t)bin] >= 0.0f) return rim[(size_t)bin];
+    // Nearest covered direction by angle. A brute search, but only for the
+    // few open bins that hair actually lands in, and only when the tuck is
+    // recomputed.
+    const Vec3 d = binDir(bin);
+    float best = -2.0f, r = 0.0f;
+    for (int cb : coveredBins) {
+      const Vec3 e = binDir(cb);
+      const float dot = d.x * e.x + d.y * e.y + d.z * e.z;
+      if (dot > best) { best = dot; r = rmax[(size_t)cb]; }
+    }
+    rim[(size_t)bin] = r;
+    return r;
+  };
+  auto buildCover = [&]() {
+    coverBuilt = true;
+    // The head's centre: the centroid of its lattice. It sits on the skull's
+    // axis a little low (the neck rows count), below the crown and behind the
+    // face, which is where it has to be: every radial ray to the scalp leaves
+    // through the hood and every ray to the face through the face opening.
+    const float hs = (float)std::max(1u, SkinScaleOf(*H));
+    double cx = 0, cy = 0, cz = 0;
+    size_t n = 0;
+    auto addC = [&](int x, int y, int z) { cx += x; cy += y; cz += z; n++; };
+    if (H->HasFineSkin()) {
+      for (const PrefabVoxel& v : H->skinVoxels)
+        if (v.material & 0xFFFu) addC(v.x, v.y, v.z);
+    } else {
+      for (const DebrisVoxel& v : H->voxels)
+        if (v.payload & 0xFFFu) addC(v.x, v.y, v.z);
+    }
+    if (n == 0) return;
+    centre = Vec3{(float)(cx / n + 0.5) / hs, (float)(cy / n + 0.5) / hs,
+                  (float)(cz / n + 0.5) / hs};
+    const size_t bins = (size_t)6 * kTuckBins * kTuckBins;
+    cover.assign(bins, 0);
+    rmax.assign(bins, 0.0f);
+    rim.assign(bins, -1.0f);
+    hemY = 1e30f;
+    for (int k : shells) {
+      const MobLimb& s = limbs_[(size_t)k];
+      // A shell rides its host at a rigid offset with the host's rotation
+      // (DriveWornShells), so its lattice maps into the head's frame with no
+      // rotation at all: origin at anchor(head) - anchor(shell).
+      const Vec3 org = H->anchorLimb - s.anchorLimb - centre;
+      const float ss = (float)std::max(1u, SkinScaleOf(s));
+      // A hair cell as far out as the shell's own outer skin plus a cell and
+      // a half still counts as "at the opening": the garment is cut one cell
+      // off the head, and a beard or a fringe stands a little proud of it.
+      margin = std::max(margin, 1.5f / ss);
+      auto splat = [&](int x, int y, int z) {
+        for (int a = 0; a < kTuckSub; a++)
+          for (int b = 0; b < kTuckSub; b++)
+            for (int c = 0; c < kTuckSub; c++) {
+              const Vec3 p = org + Vec3{(x + (a + 0.5f) / kTuckSub) / ss,
+                                        (y + (b + 0.5f) / kTuckSub) / ss,
+                                        (z + (c + 0.5f) / kTuckSub) / ss};
+              const int bin = TuckBin(p);
+              if (bin < 0) continue;
+              cover[(size_t)bin] = 1;
+              rmax[(size_t)bin] = std::max(rmax[(size_t)bin], p.len());
+              hemY = std::min(hemY, p.y);
+            }
+      };
+      if (s.HasFineSkin()) {
+        for (const PrefabVoxel& v : s.skinVoxels)
+          if (v.material & 0xFFFu) splat(v.x, v.y, v.z);
+      } else {
+        for (const DebrisVoxel& v : s.voxels)
+          if (v.payload & 0xFFFu) splat(v.x, v.y, v.z);
+      }
+    }
+    coveredBins.clear();
+    for (size_t b = 0; b < bins; b++)
+      if (cover[b]) coveredBins.push_back((int)b);
+    if (coveredBins.empty()) cover.clear();   // nothing to hide behind
+  };
+
+  for (int i = 0; i < nBase; i++) {
+    if (!IsHairDef(limbDefs_[(size_t)i])) continue;
+    MobLimb& l = limbs_[(size_t)i];
+    if (!l.body || l.microModel < 0) continue;
+    if (shells.empty()) { UntuckHair(i); continue; }
+    if (l.tuckSig != 0 && l.tuckSig == sigOf(l)) continue;
+    if (!coverBuilt) buildCover();
+
+    // Which cells hide. Hair -> world by its own live transform -> the head's
+    // frame. The mane swings on a spring, so a mane is tucked for the pose it
+    // had when the tuck was last computed, which is only ever off at the rim.
+    const Quat hq{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+    const float ls = (float)std::max(1u, SkinScaleOf(l));
+    const bool fine = l.HasFineSkin();
+    const size_t n = fine ? l.skinVoxels.size() : l.voxels.size();
+    std::vector<uint8_t> hide(n, 0);
+    size_t hidden = 0;
+    if (!cover.empty()) {
+      for (size_t k = 0; k < n; k++) {
+        int x, y, z;
+        if (fine) {
+          const PrefabVoxel& v = l.skinVoxels[k];
+          x = v.x; y = v.y; z = v.z;
+        } else {
+          const DebrisVoxel& v = l.voxels[k];
+          x = v.x; y = v.y; z = v.z;
+        }
+        const Vec3 w = l.xf.pos + Rotate(hq, Vec3{(x + 0.5f) / ls,
+                                                  (y + 0.5f) / ls,
+                                                  (z + 0.5f) / ls});
+        const Vec3 p = RotateInv(headQ, w - H->xf.pos) - centre;
+        if (p.y < hemY) continue;   // below the hem: hangs out, drawn
+        const int bin = TuckBin(p);
+        if (bin < 0) continue;
+        const bool hid = cover[(size_t)bin]
+                             ? true
+                             : p.len() > rimOf(bin) + margin;
+        if (hid) { hide[k] = 1; hidden++; }
+      }
+    }
+    if (hidden == 0) {
+      // Covered, but none of this hair is under the cover (a crew cut under an
+      // open cowl): put back anything an earlier cover hid, and do not own the
+      // brick for nothing.
+      UntuckHair(i);
+      l.tuckSig = sigOf(l);
+      continue;
+    }
+    // Poking needs a brick of our own, exactly as a burn does.
+    const int own = MicroBodyOwn(*micro, (uint32_t)l.microModel);
+    if (own < 0) continue;   // pool full: draw it untucked, try next tick
+    l.microModel = own;
+    l.carved = true;
+    l.flipbookModel = -1;
+    const uint32_t model = (uint32_t)own;
+    for (size_t k = 0; k < n; k++) {
+      int x, y, z;
+      uint32_t mat;
+      uint8_t art;
+      if (fine) {
+        const PrefabVoxel& v = l.skinVoxels[k];
+        x = v.x; y = v.y; z = v.z; mat = v.material & 0xFFFu; art = v.color;
+      } else {
+        const DebrisVoxel& v = l.voxels[k];
+        x = v.x; y = v.y; z = v.z; mat = v.payload & 0xFFFu; art = v.color;
+      }
+      if (mat == 0 || mat > 255) continue;   // a burn tombstone: not ours
+      if (hide[k]) MicroBodyPoke(*micro, model, x, y, z, 0, 0);
+      else         MicroBodyPoke(*micro, model, x, y, z, (uint8_t)mat, art);
+    }
+    // AFTER the pokes: they bumped the brick's edit counter, and the signature
+    // must describe the brick as this left it.
+    l.tuckSig = sigOf(l);
+  }
+}
+
+Mob::HairTuckProbe Mob::ProbeHairTuck() const {
+  HairTuckProbe p;
+  const MicroBodySet* micro = MicroSet();
+  const int nBase = std::min(baseLimbs_, (int)limbs_.size());
+  for (int i = 0; i < nBase; i++) {
+    if (!IsHairDef(limbDefs_[(size_t)i])) continue;
+    const MobLimb& l = limbs_[(size_t)i];
+    if (!l.body) continue;
+    p.hairLimbs++;
+    if (l.tuckSig) p.tuckedLimbs++;
+    auto one = [&](int x, int y, int z, uint32_t mat) {
+      if (mat == 0 || mat > 255) return;
+      p.latticeCells++;
+      if (micro && l.microModel >= 0 &&
+          MicroBodyCell(*micro, (uint32_t)l.microModel, x, y, z) != 0)
+        p.drawnCells++;
+    };
+    if (l.HasFineSkin()) {
+      for (const PrefabVoxel& v : l.skinVoxels)
+        one(v.x, v.y, v.z, v.material & 0xFFFu);
+    } else {
+      for (const DebrisVoxel& v : l.voxels)
+        one(v.x, v.y, v.z, v.payload & 0xFFFu);
+    }
+  }
+  return p;
+}
+
+void MobSystem::SyncHairTuck() {
+  for (Mob& mob : mobs_) mob.SyncHairTuck();
 }
 
 void MobSystem::PostStep() {
@@ -10113,6 +10773,9 @@ Vec3 Mob::SocketCentreInParent(const MobLimb& parent,
 
 void Mob::EnsureJointCounts(int limbIndex) {
   if (!def_) return;
+  // Before this limb's first carve, like the counts below: measured after,
+  // a groove in the neck would read as the neck.
+  MeasureSkullBase(limbIndex);
   const auto& gt = CurrentTuning().gore;
   if (gt.woundNeckRadius <= 0.0f) return;
   const int nl = std::min((int)limbs_.size(), (int)limbDefs_.size());
@@ -10144,6 +10807,132 @@ void Mob::EnsureJointCounts(int limbIndex) {
     // decides, exactly as it did before this existed.
     child.socketAtSpawn = n ? n : MobLimb::kSocketUnmeasured;
   }
+}
+
+// ---- WHERE A HEAD'S NECK ENDS AND ITS SKULL BEGINS (2026-09-25) -------------
+//
+// Read off the limb's own shape, so no sidecar has to say it: slice the
+// lattice across the joint -> centroid axis, one cell per slice, walking away
+// from the joint. The neck is the thin run at the start; the skull begins at
+// the first slice whose area is kSkullStep times the thinnest slice seen so
+// far. On the human: 56 cells a slice for the neck, 72 just under the jaw,
+// 120 at the jaw -- the base lands at the jaw. Only in the nearer half of the
+// limb (a head, not a limb that merely widens at its far end), and only for a
+// VITAL severable anatomy limb: that is the "head" this exists for. A limb
+// with no such step records "no neck" and is never trimmed.
+void Mob::MeasureSkullBase(int limbIndex) {
+  if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size() ||
+      limbIndex >= (int)limbDefs_.size())
+    return;
+  MobLimb& limb = limbs_[limbIndex];
+  if (limb.skullMeasured) return;
+  limb.skullMeasured = true;
+  const MobLimbDef& ld = limbDefs_[limbIndex];
+  if (!ld.vital || !ld.severable || ld.bloodless || limbIndex >= baseLimbs_ ||
+      limbIndex == def_->rootLimb || !limb.body)
+    return;
+  constexpr float kSkullStep = 1.6f;
+  const bool fine = limb.HasFineSkin();
+  const float sc =
+      (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+  const Vec3 a = limb.anchorLimb;
+  Vec3 sum{};
+  size_t n = 0;
+  auto each = [&](auto&& f) {
+    if (fine)
+      for (const PrefabVoxel& v : limb.skinVoxels)
+        f(Vec3{((float)v.x + 0.5f) / sc, ((float)v.y + 0.5f) / sc,
+               ((float)v.z + 0.5f) / sc});
+    else
+      for (const DebrisVoxel& v : limb.voxels)
+        f(Vec3{((float)v.x + 0.5f) / sc, ((float)v.y + 0.5f) / sc,
+               ((float)v.z + 0.5f) / sc});
+  };
+  each([&](Vec3 p) { sum += p; n++; });
+  if (n < 8) return;
+  Vec3 axis = sum * (1.0f / (float)n) - a;
+  if (axis.len() < 1e-3f) return;
+  axis = axis.normalized();
+  float tMin = 1e30f, tMax = -1e30f;
+  each([&](Vec3 p) {
+    const float t = (p - a).dot(axis);
+    tMin = std::min(tMin, t);
+    tMax = std::max(tMax, t);
+  });
+  const float cell = 1.0f / sc;
+  const size_t nb = (size_t)std::ceil((tMax - tMin) / cell) + 1;
+  if (nb < 4 || nb > 4096) return;
+  std::vector<uint32_t> area(nb, 0);
+  each([&](Vec3 p) {
+    const float t = ((p - a).dot(axis) - tMin) / cell;
+    area[std::min(nb - 1, (size_t)std::max(0.0f, std::floor(t)))]++;
+  });
+  uint32_t thinnest = 0;
+  for (size_t k = 0; k < nb / 2; k++) {
+    if (area[k] == 0) continue;
+    if (thinnest == 0 || area[k] < thinnest) thinnest = area[k];
+    if ((float)area[k] >= kSkullStep * (float)thinnest && k > 0) {
+      limb.skullBase = tMin + (float)k * cell;
+      limb.skullAxis = axis;
+      return;
+    }
+  }
+}
+
+bool Mob::TrimNeckForSever(int limbIndex) {
+  if (limbIndex < 0 || limbIndex >= (int)limbs_.size()) return false;
+  MeasureSkullBase(limbIndex);
+  MobLimb& limb = limbs_[limbIndex];
+  if (limb.skullBase <= 0.0f || !limb.body) return false;
+  const Vec3 a = limb.anchorLimb, axis = limb.skullAxis;
+  const float base = limb.skullBase;
+  auto below = [&](float x, float y, float z, float sc) {
+    return (Vec3{(x + 0.5f) / sc, (y + 0.5f) / sc, (z + 0.5f) / sc} - a)
+               .dot(axis) < base;
+  };
+  const float ps = (float)std::max(1u, PhysScaleOf(limb));
+  const float ss = (float)std::max(1u, SkinScaleOf(limb));
+  const bool fine = limb.HasFineSkin();
+  const size_t before = fine ? limb.skinVoxels.size() : limb.voxels.size();
+  // What would be left: never trim a limb down past being a body (a head
+  // already mostly neck-less from chopping keeps what it has).
+  size_t keepCol = 0;
+  for (const DebrisVoxel& v : limb.voxels)
+    if (!below((float)v.x, (float)v.y, (float)v.z, ps)) keepCol++;
+  if (sys_ != nullptr) {
+    sys_->cutBite_.skullBase = base;
+    sys_->cutBite_.neckTrimmed = 0;
+    // Refused (it would leave too little to be a body): the neck stays on.
+    sys_->cutBite_.neckLeft =
+        keepCol < kMinFragmentVoxels
+            ? (uint32_t)(limb.voxels.size() - keepCol)
+            : 0u;
+  }
+  if (keepCol < kMinFragmentVoxels || keepCol == limb.voxels.size())
+    return false;
+  limb.voxels.erase(std::remove_if(limb.voxels.begin(), limb.voxels.end(),
+                                   [&](const DebrisVoxel& v) {
+                                     return below((float)v.x, (float)v.y,
+                                                   (float)v.z, ps);
+                                   }),
+                    limb.voxels.end());
+  if (fine)
+    limb.skinVoxels.erase(
+        std::remove_if(limb.skinVoxels.begin(), limb.skinVoxels.end(),
+                       [&](const PrefabVoxel& v) {
+                         return below((float)v.x, (float)v.y, (float)v.z, ss);
+                       }),
+        limb.skinVoxels.end());
+  const size_t trimmed =
+      before - (fine ? limb.skinVoxels.size() : limb.voxels.size());
+  // Art, then collider, as CarveLimb finishes a carve; the burn index points
+  // into the old lattice.
+  if (limb.microModel >= 0)
+    ReskinLimbMicro(limb, SkinScaleOf(limb), PhysScaleOf(limb));
+  RebuildLimbBody(limbIndex);
+  DropBurnIndex(limb.burn);
+  if (sys_ != nullptr) sys_->cutBite_.neckTrimmed = (uint32_t)trimmed;
+  return true;
 }
 
 // ---- WHAT "AT SPAWN" MEANS FOR A BODY THAT ARRIVED DAMAGED -----------------
@@ -10247,6 +11036,10 @@ bool Mob::JointAttached(int limbIndex) const {
   if (limbIndex < 0 || limbIndex >= nl) return true;
   if (limbIndex == def_->rootLimb) return true;   // the root is not jointed
   if (!limbDefs_[limbIndex].severable) return true;
+  // Hair is rooted over the whole scalp, not seated in a socket: a carve
+  // round its anchor cell (either side) says nothing about whether it is
+  // still on (SeverPolicy::rooted). Only the head leaving takes it.
+  if (limbDefs_[limbIndex].bloodless) return true;
   const MobLimb& limb = limbs_[limbIndex];
   if (!limb.body) return true;
   // ---- THIS SIDE: the limb's own flesh at its anchor ----
@@ -10884,22 +11677,90 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     const uint32_t seed =
         (uint32_t)id_ * 2654435761u + (uint32_t)i * 40503u + cut.seed;
     const float jitterScale = (float)std::max(1u, SkinScaleOf(limb));
-    const KerfSlot slot =
+    KerfSlot slot =
         KerfFrame(cLocal, RotateInv(q, cut.edgeAxis), RotateInv(q, cut.cutDir),
                   depth, halfW, halfL, jitterScale, seed);
-    const Vec3 u = slot.u, v = slot.v, w = slot.w;
+    const Vec3 w = slot.w;
     const bool fineSkin = limb.HasFineSkin();
-    const float entry = KerfEntry(
-        slot, (float)std::max(1u, fineSkin ? SkinScaleOf(limb) : PhysScaleOf(limb)),
-        [&](auto&& probe) {
-          if (fineSkin)
-            for (const PrefabVoxel& pv : limb.skinVoxels)
-              probe((float)pv.x, (float)pv.y, (float)pv.z);
-          else
-            for (const DebrisVoxel& dv : limb.voxels)
-              probe((float)dv.x, (float)dv.y, (float)dv.z);
-        });
-    const Vec3 slotAt = cLocal + w * entry;
+    const float latScale =
+        (float)std::max(1u, fineSkin ? SkinScaleOf(limb) : PhysScaleOf(limb));
+    auto walk = [&](auto&& probe) {
+      if (fineSkin)
+        for (const PrefabVoxel& pv : limb.skinVoxels)
+          probe((float)pv.x, (float)pv.y, (float)pv.z);
+      else
+        for (const DebrisVoxel& dv : limb.voxels)
+          probe((float)dv.x, (float)dv.y, (float)dv.z);
+    };
+    slot.c = slot.c + w * KerfEntry(slot, latScale, walk);
+    const Vec3 slotAt = slot.c;
+
+    // ---- DID THE EDGE COME OUT THE OTHER SIDE? (phys/kerf.h KerfBite) ------
+    //
+    // The blow's bite is the chip's own area plus the swing's cleave
+    // (melee.cpp BuildStrikeParts), and the plane it is cutting along charges
+    // it by material -- hardness over gear.cutHardnessRef, the ratio the shell
+    // rule above reads, so bone costs three times skin. Covered in full within
+    // the edge's reach, the cut is THROUGH: a clean full-width parting, and the
+    // cut-through rule in CarveLimb takes the limb off through Sever(). Short
+    // of that, the cleave still buys depth.
+    //
+    // Only a slot that can leave may be parted: anatomy (not a garment, not
+    // what is in the fist), severable, not the root, and not hair, which is
+    // rooted and loses a lock at a time (SeverPolicy::rooted).
+    const bool mayPart = !IsWornSlot((int)i) && (int)i < baseLimbs_ &&
+                         (int)i < (int)limbDefs_.size() &&
+                         (!def_ || (int)i != def_->rootLimb) &&
+                         limbDefs_[i].severable && !limbDefs_[i].bloodless;
+    const float edgeHalf = cut.edgeHalf > 0.0f ? cut.edgeHalf : halfL;
+    const float cleave = std::max(cut.cleave, 0.0f);
+    const float budget = depth * 2.0f * halfL + cleave;
+    KerfBiteResult bite;
+    if (mayPart || cleave > 0.0f) {
+      // Resistance per material, relative to skin; unknown or art-palette
+      // matter (ids 128.., which are colours) is charged as skin.
+      const float ref = CurrentTuning().gear.cutHardnessRef;
+      float resist[128];
+      for (uint32_t m = 0; m < 128; m++) {
+        const float h = MaterialHardness(m);
+        resist[m] = (h > 0.0f && ref > 0.0f) ? h / ref : 1.0f;
+      }
+      auto costOf = [&](uint32_t m) { return m < 128 ? resist[m] : 1.0f; };
+      bite = KerfBite(slot, latScale, edgeHalf, mayPart ? budget : 0.0f, depth,
+                      cleave, [&](auto&& probe) {
+                        if (fineSkin)
+                          for (const PrefabVoxel& pv : limb.skinVoxels) {
+                            const uint32_t m = pv.material & 0xFFFu;
+                            if (m) probe((float)pv.x, (float)pv.y, (float)pv.z,
+                                         costOf(m));
+                          }
+                        else
+                          for (const DebrisVoxel& dv : limb.voxels) {
+                            const uint32_t m = dv.payload & 0xFFFu;
+                            if (m) probe((float)dv.x, (float)dv.y, (float)dv.z,
+                                         costOf(m));
+                          }
+                      });
+      if (mayPart && bite.through) {
+        slot.through = true;
+        slot.depth = bite.exit + 1.0f / latScale;
+        slot.halfL = std::max(slot.halfL, edgeHalf);
+      } else if (bite.depth > slot.depth) {
+        slot.depth = bite.depth;
+      }
+    }
+    if (sys_ != nullptr) {
+      MobSystem::CutBite& cb = sys_->cutBite_;
+      cb.planeCost = bite.planeCost;
+      cb.budget = budget;
+      cb.cleave = cleave;
+      cb.depth = slot.depth;
+      cb.mayPart = mayPart;
+      cb.through = slot.through;
+      cb.blocked = bite.blocked;
+      cb.cuts++;
+      if (slot.through) cb.throughs++;
+    }
 
     // A LITTLE SPALL, and only a little. This is the mechanism that makes
     // "sustained hits dismember": a second cut into an existing gash finds
@@ -10908,8 +11769,9 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     // rather than the blast's, because a blast wants two rounds of it and a
     // cut wants at most one — a kerf that spalled hard would stop being a kerf.
     Mob::CarveSpall spall{};
-    const bool wantSpall =
-        gt.cutSpallRounds > 0 && gt.cutSpallStrength > 0.0f && depth > 0.0f;
+    // A THROUGH CUT IS CLEAN: no spall, or the parting face frays.
+    const bool wantSpall = !slot.through && gt.cutSpallRounds > 0 &&
+                           gt.cutSpallStrength > 0.0f && depth > 0.0f;
     if (wantSpall) {
       // Centred on the cut and sized to the SLOT, not to a blast radius: the
       // spall pass is a sphere test, and one sized to the depth is the volume
@@ -10921,6 +11783,46 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
       spall.seed = seed;
     }
 
+    // ---- THE EDGE WENT BETWEEN THE JOINT AND THE LIMB ----------------------
+    //
+    // A through cut that leaves the joint on one side and the bulk of the limb
+    // on the other has taken the limb off, whatever the lattices say
+    // afterwards. CarveLimb's own rules cannot always see it when the cut is
+    // near the joint: the piece on the joint's side is too small to keep the
+    // limb's identity, so the far side keeps it, and the joint's flesh sample
+    // (a ball straddling the cut) still reads half full. Measured on the human
+    // neck: a clean parting 2 cm above the collar left the head "attached" to
+    // nothing. So it is asked here, of the plane, before anything moves:
+    // which side is the joint on, and which side is most of the limb on.
+    bool edgeBetween = false, dropNear = false;
+    float nearSign = 1.0f;
+    if (slot.through) {
+      const float sa = (limb.anchorLimb - slot.c).dot(slot.v);
+      const float slabW = std::max(slot.halfW, 0.51f / latScale);
+      uint32_t nearSide = 0, farSide = 0;
+      walk([&](float x, float y, float z) {
+        const Vec3 d = Vec3{(x + 0.5f) / latScale, (y + 0.5f) / latScale,
+                            (z + 0.5f) / latScale} - slot.c;
+        const float dv = d.dot(slot.v);
+        if (std::fabs(dv) <= slabW) return;  // the kerf itself
+        if ((dv > 0.0f) == (sa > 0.0f)) nearSide++;
+        else farSide++;
+      });
+      edgeBetween = farSide > 0 && farSide >= nearSide;
+      // THE STUMP'S SIDE OF THE CUT. What lies between the kerf and the joint
+      // belongs to the parent's stump, not to the piece that is leaving -- and
+      // a rig slot cannot hand voxels to its parent, so left alone it rides
+      // away under the head as a floating disc of neck, a kerf's width below
+      // it (the human head's collider is one cell across the neck, so no
+      // lattice split ever separates it). Taken with the cut, as gore, when it
+      // is the small side; a limb cut through the middle keeps both halves,
+      // as CarveLimb's cut-through rule has always left them.
+      dropNear = edgeBetween &&
+                 (float)nearSide <= kLimbCollapseFraction *
+                                        (float)(nearSide + farSide);
+      nearSign = sa > 0.0f ? 1.0f : -1.0f;
+    }
+
     // Everything the structural sever rules in CarveLimb need to know is
     // "an edge did this": DamageCause::Blade, the one row with the cut-through
     // rule (game/severpolicy.h says why the other causes do not get it). An
@@ -10928,17 +11830,24 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     const bool alive = CarveLimb(
         (int)i, DamageCtx(DamageCause::Blade, severity), world, spawns,
         /*eject=*/true,
-        [slotAt, slot](float scale) -> LimbCarveKeep {
+        [slot, dropNear, nearSign](float scale) -> LimbCarveKeep {
           // ONE world-space slot, re-expressed per lattice -- the same
           // contract CarveLimbRadial's factory has, so a fine-skinned limb
           // loses the same physical volume from both of its lattices. The
           // wedge, the ragged rim and the skin-quantized draw key all live in
-          // phys/kerf.h now, shared with the cut a corpse takes.
-          KerfSlot at = slot;
-          at.c = slotAt;  // the entry-snapped origin, not the hit point
-          const KerfKeep keep = KerfKeepAt(at, scale);
-          return [keep](int x, int y, int z) -> bool {
-            return keep((float)x, (float)y, (float)z);
+          // phys/kerf.h now, shared with the cut a corpse takes. `slot.c` is
+          // the entry-snapped origin, not the hit point.
+          const KerfKeep keep = KerfKeepAt(slot, scale);
+          if (!dropNear)
+            return [keep](int x, int y, int z) -> bool {
+              return keep((float)x, (float)y, (float)z);
+            };
+          const Vec3 c = slot.c * scale, v = slot.v;
+          return [keep, c, v, nearSign](int x, int y, int z) -> bool {
+            const Vec3 d{(float)x + 0.5f - c.x, (float)y + 0.5f - c.y,
+                         (float)z + 0.5f - c.z};
+            return keep((float)x, (float)y, (float)z) &&
+                   d.dot(v) * nearSign <= 0.0f;
           };
         },
         wantSpall ? &spall : nullptr);
@@ -10947,6 +11856,13 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     // gone. Nothing below may touch them — the same contract every other
     // CarveLimb caller honours.
     if (!alive) return true;
+    // ...and the limb is still on: the edge came out between it and its joint.
+    // The ordinary Sever(), with this blow's cause, so the gout, the cue and
+    // (for a vital limb) the death are the ones any dismemberment gets.
+    if (edgeBetween && i < limbs_.size() && limbs_[i].body) {
+      Sever((int)i, DamageCtx(DamageCause::Blade, severity));
+      return true;
+    }
 
     // The soak goes on LAST, over what survived, and centred a little way into
     // the cut so it follows the gash rather than ringing the entry point.
@@ -12355,10 +13271,14 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // The absolute kMinFragmentVoxels floor stays for every cause: that one is
   // about whether Jolt can still be handed a body, not about dismemberment.
   const bool shellStaysOn = pol.shellStaysOn;  // Shell, and not eaten
+  // HAIR (pol.rooted, severpolicy.h) skips the FRACTION too: chipped down to a
+  // quarter of itself is a bad haircut, not a limb that has stopped being one.
+  // It keeps only the Jolt floor, like a shell.
+  const bool fractionExempt = shellStaysOn || pol.rooted;
   const bool collapsed =
       pol.collapseSevers &&
       (limb.voxels.size() < kMinFragmentVoxels ||
-       (!shellStaysOn &&
+       (!fractionExempt &&
         (float)nowCount < kLimbCollapseFraction * (float)at0));
   // HP IS NO LONGER A DISMEMBERMENT RULE (except where it always was — see
   // HpZeroSevers). It was the third of the three instant severs the owner's
@@ -12465,7 +13385,17 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
       if (!anyEligible) eligible.assign(compSize.size(), 1);
       uint32_t keepComp = 0;
       float best = 1e30f;
-      for (uint32_t i = 0; i < n; i++) {
+      // HAIR KEEPS ITS BIGGEST PIECE, not the one at its anchor (pol.rooted).
+      // The anchor is ONE scalp-contact cell standing for a mass rooted all
+      // over the head, so "nearest the anchor" let a cut through the crown
+      // hand the limb to a tuft and drop the rest of the hair as one debris
+      // body -- the wig the owner saw. Ties go to the lowest component id,
+      // which is voxel order: deterministic.
+      if (pol.rooted) {
+        for (uint32_t c = 1; c < (uint32_t)compSize.size(); c++)
+          if (compSize[c] > compSize[keepComp]) keepComp = c;
+      }
+      for (uint32_t i = 0; i < n && !pol.rooted; i++) {
         const DebrisVoxel& v = limb.voxels[i];
         float d2 = (Vec3{(float)v.x, (float)v.y, (float)v.z} - aMicro).len();
         // A STRAGGLER MAY NOT INHERIT THE LIMB.
@@ -12583,6 +13513,13 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
       uint32_t partedOff = 0;
       for (uint32_t c = 0; c < (uint32_t)compSize.size(); c++)
         if (c != keepComp) partedOff = std::max(partedOff, compSize[c]);
+      if (sys_ != nullptr && ctx.cause == DamageCause::Blade) {
+        MobSystem::CutBite& cb = sys_->cutBite_;
+        cb.comps = (uint32_t)compSize.size();
+        cb.parted = partedOff;
+        cb.kept = (uint32_t)limb.voxels.size();
+        cb.before = n;
+      }
 
       uint32_t budget = kMaxCarveFragments;
       for (uint32_t c = 0; c < (uint32_t)parts.size(); c++) {
@@ -12633,7 +13570,7 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
       // and then found the remainder small is still a dent.
       if (pol.collapseSevers &&
           (limb.voxels.size() < kMinFragmentVoxels ||
-           (!shellStaysOn &&
+           (!fractionExempt &&
             (float)(fine ? limb.skinVoxels.size() : limb.voxels.size()) <
                 kLimbCollapseFraction * (float)at0))) {
         Sever(limbIndex, ctx);
@@ -12702,6 +13639,10 @@ bool Mob::CarveLimb(int limbIndex, const DamageCtx& ctx, World& world,
   // "neck" is wherever its anchor point happened to land on the panel, and a
   // few voxels carved there read as "hanging by a thread" on a plate that is
   // otherwise whole.
+  if (sys_ != nullptr && ctx.cause == DamageCause::Blade) {
+    sys_->cutBite_.neckNow = NeckCount(limb, gt.woundNeckRadius);
+    sys_->cutBite_.neckSpawn = limb.neckAtSpawn;
+  }
   if (!shellStaysOn && JointRuleApplies(limbIndex, ctx) &&
       !JointAttached(limbIndex)) {
     Sever(limbIndex, ctx);
@@ -13023,7 +13964,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   // the world is one fire voxel per adjacent air CELL, not one per sub-voxel.
   std::vector<uint32_t> emitted;
   auto emitCell = [&](IVec3 c, uint32_t mat, uint32_t state) {
-    if (opsBudget == 0 || cellOps.size() >= kMaxCellOpsPerTick) return;
+    if (opsBudget == 0 || cellOps.size() >= kMaxCellOpsPerTick) {
+      burnStats_.emitRefused++;
+      return;
+    }
     if (!world.CellInWindow(c)) return;
     const uint32_t ci = World::SlotCellIndex(c);
     for (uint32_t e : emitted)
@@ -13631,8 +14575,20 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
   };
 
   // ---- run the table over each candidate --------------------------------
-  for (uint32_t cell : cand) {
-    if (frontBudget == 0) break;
+  // FROM A ROTATING START. The list is built in a fixed order (front, then its
+  // neighbours, then world contact), so a budget that runs out part-way
+  // through always cut off the same tail: those cells burned -- and emitted --
+  // only on the ticks the budget happened to reach them. Starting at a
+  // tick-keyed offset spreads a short budget over the whole surface instead.
+  const size_t nCand = cand.size();
+  const size_t cand0 =
+      nCand ? (size_t)(Hash3(limbKey, tick, 0xCA2D0u) % (uint32_t)nCand) : 0;
+  for (size_t cj = 0; cj < nCand; cj++) {
+    const uint32_t cell = cand[(cand0 + cj) % nCand];
+    if (frontBudget == 0) {
+      burnStats_.frontSkipped += nCand - cj;
+      break;
+    }
     frontBudget--;
     const uint32_t vi0 = st.idx[cell] & ~kBurnQueued;
     if (vi0 == 0) continue;
@@ -14479,6 +15435,26 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
 // is a CarveLimb, so a limb burnt through severs and a limb burnt below the
 // collapse fraction comes off, both by the existing geometry rules rather than
 // by anything burning had to invent.
+// A part's slice of a shared burn pot (Mob::BurnTick's FAIR SHARE note): its
+// weight's fraction of the weight still to be served, its own included, with
+// flames rounded UP so a small pot still reaches every burning part. What a
+// part does not spend stays in the pot for the parts after it. A weightless
+// part (no burn work of its own yet -- catching from the world) is offered the
+// whole remainder: it is usually cheap, and it has a weight from next tick.
+static inline void BurnShareOf(uint32_t frontPot, uint32_t opsPot, uint64_t w,
+                               uint64_t& wLeft, uint32_t& front,
+                               uint32_t& ops) {
+  front = frontPot;
+  ops = opsPot;
+  if (w == 0) return;
+  if (wLeft > w) {
+    front = std::max<uint32_t>(
+        frontPot ? 1u : 0u, (uint32_t)((uint64_t)frontPot * w / wLeft));
+    ops = (uint32_t)(((uint64_t)opsPot * w + wLeft - 1) / wLeft);
+  }
+  wLeft -= w;
+}
+
 void MobSystem::BurnLimbs(uint32_t tick, World& world,
                           std::vector<CellOp>& cellOps,
                           std::vector<ParticleSpawn>& spawns) {
@@ -14491,32 +15467,41 @@ void MobSystem::BurnLimbs(uint32_t tick, World& world,
   // pass kills this tick must not be burnt a second time from the dead pot.
   std::vector<uint8_t> dead(nm, 0);
   for (size_t i = 0; i < nm; i++) dead[i] = !mobs_[i].alive_ ? 1 : 0;
-  // ---- THE LIVING ----
-  {
+  // One pot over the creatures `in` admits, split as Mob::BurnTick splits a
+  // creature's share over its limbs (its FAIR SHARE note), by each
+  // creature's burning weight. Head-of-queue spending here pulsed exactly as
+  // it did across limbs, one creature per tick, once there were two burning
+  // bodies.
+  auto burnPot = [&](auto in) {
     uint32_t frontBudget = kBurnFrontPerTick;
     uint32_t opsBudget = kBurnOpsPerTick;
+    std::vector<uint64_t> weight(nm, 0);
+    uint64_t wLeft = 0;
+    for (size_t i = 0; i < nm; i++)
+      if (in(i)) wLeft += (weight[i] = mobs_[i].BurnWeight());
     for (size_t k = 0; k < nm && frontBudget; k++) {
       const size_t i = (start + k) % nm;
-      if (dead[i]) continue;
-      mobs_[i].BurnTick(tick, world, cellOps, spawns, frontBudget, opsBudget);
+      if (!in(i)) continue;
+      uint32_t front, ops;
+      BurnShareOf(frontBudget, opsBudget, weight[i], wLeft, front, ops);
+      const uint32_t front0 = front, ops0 = ops;
+      mobs_[i].BurnTick(tick, world, cellOps, spawns, front, ops);
+      frontBudget -= front0 - front;
+      opsBudget -= ops0 - ops;
     }
-  }
+  };
+  // ---- THE LIVING ----
+  burnPot([&](size_t i) { return !dead[i]; });
   // ---- THE DEAD, FROM THEIR OWN POT ----
   // The living's numbers, as BurnDeadFlesh has always given the severed dead: a
   // battlefield of corpses must not starve the creatures still standing in
   // the fire, and the living must not starve the dead. An asleep corpse is
   // not visited at all — its burn pass had already said "nothing near me"
   // for every limb before it could fall asleep.
-  {
-    uint32_t frontBudget = kBurnFrontPerTick;
-    uint32_t opsBudget = kBurnOpsPerTick;
-    for (size_t k = 0; k < nm && frontBudget; k++) {
-      const size_t i = (start + k) % nm;
-      Mob& m = mobs_[i];
-      if (!dead[i] || m.rigReleased_ || m.deadAsleep_) continue;
-      m.BurnTick(tick, world, cellOps, spawns, frontBudget, opsBudget);
-    }
-  }
+  burnPot([&](size_t i) {
+    const Mob& m = mobs_[i];
+    return dead[i] && !m.rigReleased_ && !m.deadAsleep_;
+  });
 }
 
 void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
@@ -14566,10 +15551,35 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   BuildCrossLimbHeat(tick);
   const uint32_t crossPct =
       (uint32_t)std::clamp(CurrentTuning().combustion.crossLimbPct, 0, 100);
+  // ---- A FAIR SHARE, NOT THE HEAD OF THE QUEUE (2026-09-25) ----------------
+  // Owner report: "when corpses are burning, the fire voxels come out in
+  // rhythmic bursts". The rotation above made the budget fair ON AVERAGE and
+  // periodic in DETAIL: an engulfed body wants far more than kBurnOpsPerTick
+  // flames a tick (one per burning surface cell, ~hundreds) and more than
+  // kBurnFrontPerTick candidates, so whichever limb the rotation put first
+  // spent both pots and every other limb emitted nothing -- each limb got
+  // one tick of fire in every `nl` (15 on a human, a 2 Hz pulse), and the
+  // corpse flickered from limb to limb instead of burning.
+  //
+  // So each limb with burn work of its own is handed a share of what is left
+  // IN PROPORTION TO ITS BURNING FRONT (Mob::LimbBurnWeight, BurnShareOf),
+  // and whatever it does not spend flows on to the rest. Proportional rather
+  // than equal because an equal split wastes the pot: a big torso visited
+  // first was capped at 1/n while the small limbs after it left most of
+  // theirs unspent, and the unspent tail of the rotation cannot flow back
+  // (measured: gate garment-burn's smock fell from 50% to 28% consumed).
+  // Same totals, same rotation; the fire is spread over the body every tick
+  // at one rate per unit of burning surface, instead of taking turns.
+  std::vector<uint64_t> weight(nl, 0);
+  uint64_t wLeft = 0;
+  for (int li = 0; li < nl; li++) wLeft += (weight[li] = LimbBurnWeight(li));
   for (int k = 0; k < nl; k++) {
     const int li = (start + k) % nl;
     if (frontBudget == 0) break;
     if (!limbs_[li].body) continue;
+    uint32_t front, ops;
+    BurnShareOf(frontBudget, opsBudget, weight[li], wLeft, front, ops);
+    const uint32_t front0 = front, ops0 = ops;
     BurnLimbView v = ViewOf(limbs_[li]);
     v.corrodeCoat = limbs_[li].coat.corrosive > 0;
     TwinShadowInto(li, v);  // joint-twin cells: one copy rolls per tick
@@ -14587,7 +15597,11 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
       v.occludeCtx = &probe;
     }
     const uint32_t key = mobKey + (uint32_t)li * 2654435761u;
-    if (sys_->BurnOneLimb(v, tick, key, world, cellOps, frontBudget, opsBudget)) {
+    const bool burnt =
+        sys_->BurnOneLimb(v, tick, key, world, cellOps, front, ops);
+    frontBudget -= front0 - front;
+    opsBudget -= ops0 - ops;
+    if (burnt) {
       MarkInstancesDirty();
       burnFracDirty_ = true;
     }
@@ -19209,6 +20223,17 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
     // then does the creature die -- a dead Mob that keeps its wounds and pays
     // them out (BleedTick on the dead).
     const bool fatal = ld.vital;
+    // JUST THE HEAD (owner, 2026-09-25). The neck is part of the head limb on
+    // this rig, so a blade decapitation anywhere on it sent the rest of the
+    // neck away with the skull. A blade takes the skull only: everything
+    // nearer the joint than MobLimb::skullBase is dropped here, before the
+    // piece leaves, and the stump bleeds from the collar. The owner chose the
+    // neck going with the cut over it staying on the body, which would need
+    // the neck moved into the torso in the art. Fire, blast and the rest keep
+    // whatever they parted.
+    const bool trimmed =
+        pol.byBlade && fatal && limbIndex < baseLimbs_ &&
+        TrimNeckForSever(limbIndex);
     if (fatal && alive_)   // written once: see the root branch above
       deathCause_ = pol.deathBurnt ? "vital limb burnt/dissolved away"
                                    : "vital limb destroyed";
@@ -19289,13 +20314,17 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
           centre = centre * (1.0f / ((float)piece.voxels.size() *
                                      (float)std::max(1u, PhysScaleOf(piece))));
         }
-        Vec3 outW = Rotate(cq, piece.anchorLimb - centre);
+        // The piece's cut face: the joint, or the skull base a trim left.
+        const Vec3 face = trimmed ? piece.anchorLimb +
+                                        piece.skullAxis * piece.skullBase
+                                  : piece.anchorLimb;
+        Vec3 outW = Rotate(cq, face - centre);
         float olen = outW.len();
         outW = olen > 1e-3f ? outW * (1.0f / olen) : Vec3{0, -1, 0};
         outW.y += 0.5f;
         olen = outW.len();
-        piece.woundLocal = piece.anchorLimb;
-        piece.gushLocal = piece.anchorLimb;
+        piece.woundLocal = face;
+        piece.gushLocal = face;
         piece.gushDir = RotateInv(cq, olen > 1e-3f ? outW * (1.0f / olen)
                                                     : Vec3{0, 1, 0});
         piece.gushTicks = std::max(piece.gushTicks, gore_.severDecayTicks);
@@ -19305,7 +20334,7 @@ void Mob::Sever(int limbIndex, const DamageCtx& ctx) {
         // limb that came off (and one severed outright, by hp or by
         // --shot-mob) showed a clean cross-section of bone and muscle. Same
         // soak, centred on the joint; the stump gets its own below.
-        StainWound(limbIndex, piece.anchorLimb, gt.woundStainRadius,
+        StainWound(limbIndex, face, gt.woundStainRadius,
                    Hash3((uint32_t)id_, (uint32_t)limbIndex, 0x5EAFu));
       }
       DetachLimb(limbIndex, adopt);
@@ -19435,6 +20464,10 @@ void Mob::DetachLimb(int limbIndex, bool adopt, bool keepJoint) {
   // Sever() opens that one), and a detached limb that kept `stumpOpen` would
   // drip forever at its rest-pose anchor from a body it is no longer on.
   limb.stumpOpen = false;
+  // Hair leaving the rig leaves whole: debris never re-tucks, so a severed
+  // ponytail would otherwise be drawn with the part the hood hid missing for
+  // the rest of its life.
+  UntuckHair(limbIndex);
   // The lattice is about to leave this system for DebrisSystem::AdoptBody, and
   // a material-0 tombstone from an unflushed burn must not go with it.
   StripBurnTombstones(limb);
@@ -23115,6 +24148,41 @@ bool MobSystem::ApplyState(const ::net::MobState& st) {
 // (ItemDef::grip). Pass nullptr to unequip.
 // ============================================================================
 
+bool Mob::HeldMouthWorld(Vec3 dir, Vec3& out) {
+  if (heldSlot_ < 0 || heldSlot_ >= (int)limbs_.size()) return false;
+  MobLimb& l = limbs_[heldSlot_];
+  if (!l.body) return false;
+  const float dl = dir.len();
+  if (dl < 1e-4f) return false;
+  BurnLimbView v = ViewOf(l);
+  const Quat q{l.xf.quat[0], l.xf.quat[1], l.xf.quat[2], l.xf.quat[3]};
+  const Vec3 d = RotateInv(q, dir * (1.0f / dl));
+  const size_t n = v.Size();
+  // The extreme along `d`, then the mean of every cell within a cell of it, so
+  // a flat lip gives its middle rather than whichever corner came first.
+  float best = -1e30f;
+  for (size_t i = 0; i < n; i++) {
+    if (v.Mat(i) == 0) continue;
+    const IVec3 p = v.At(i);
+    best = std::max(best, Vec3{p.x + 0.5f, p.y + 0.5f, p.z + 0.5f}.dot(d));
+  }
+  if (best < -1e29f) return false;
+  Vec3 sum{};
+  int k = 0;
+  for (size_t i = 0; i < n; i++) {
+    if (v.Mat(i) == 0) continue;
+    const IVec3 p = v.At(i);
+    const Vec3 c{p.x + 0.5f, p.y + 0.5f, p.z + 0.5f};
+    if (c.dot(d) >= best - 1.0f) {
+      sum = sum + c;
+      k++;
+    }
+  }
+  const float s = (float)std::max(1u, v.scale);
+  out = l.xf.pos + Rotate(q, sum * (1.0f / ((float)k * s)));
+  return true;
+}
+
 bool Mob::EquipItem(const ItemDef* item, const char* context) {
   if (!def_ || !phys_) return false;
 
@@ -23830,6 +24898,7 @@ bool Mob::WearOnRig(const ItemDef* item, int equipSlot,
   if (!AppendedInvariantHolds())
     std::printf("mob: appended vectors fell out of step after WearItem\n");
   MarkInstancesDirty();
+  SyncHairTuck();   // a hood goes on over the hair, not through it
   return true;
 }
 
@@ -23853,6 +24922,7 @@ bool Mob::UnwearFromRig(int equipSlot) {
         break;
       }
     MarkInstancesDirty();
+    SyncHairTuck();   // and comes off it: the hair it covered is drawn again
     return true;
   }
   return false;
@@ -25574,6 +26644,142 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
     st.model[k].pos =
         st.model[par].pos + QuatRotate(st.model[par].rot, st.local[k].pos);
   }
+}
+
+void Mob::SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt) {
+  ArmSmoothState& S = armSmooth_;
+  // WHICH BRAKES. The live pose's while it states any; after the stroke ends
+  // (the caller pushes an empty WeaponPose) the LAST ones stay in force until
+  // the arm has caught up with the pose it is being handed back to, because
+  // dropping them with a lag outstanding is a one-tick snap of exactly the
+  // size the brake was hiding.
+  const bool asked = weaponWeight_ > 0.0f && weapon_.smooth.Any();
+  if (asked) S.params = weapon_.smooth;
+  else if (!S.valid) return;
+
+  // THE THREE JOINTS: the weapon chain's upper and lower bones, and the hand
+  // (skipped when the chain's lower bone IS the hand). The same resolution
+  // ApplyWeaponArm makes, so the two name the same arm.
+  int parts[kArmJoints] = {-1, -1, -1};
+  {
+    int effPart = -1, effNatural = -1;
+    StrikeEffectorMode mode = StrikeEffectorMode::None;
+    if (ResolveEffector(effPart, mode, effNatural) &&
+        mode != StrikeEffectorMode::Aim && !sk.chains.empty() &&
+        effPart >= 0 && (size_t)effPart < sk.parts.size()) {
+      int hand = -1;
+      const IkChain* ch = ChainForEffector(sk, effPart, hand);
+      if (ch != nullptr && ch->parts.size() >= 2) {
+        parts[kArmShoulder] = ch->parts[0];
+        parts[kArmElbow] = ch->parts[1];
+        parts[kArmWrist] = hand != ch->parts[1] ? hand : -1;
+      }
+    }
+  }
+  const size_t n = std::min(sk.parts.size(), st.model.size());
+  for (int k = 0; k < kArmJoints; k++)
+    if (parts[k] >= 0 && (size_t)parts[k] >= n) parts[k] = -1;
+  if (parts[kArmShoulder] < 0 || parts[kArmElbow] < 0) {
+    S.valid = false;
+    return;
+  }
+  // A DIFFERENT ARM (effector swapped, rig rebuilt) is a fresh start, not a
+  // lag to be braked across.
+  if (S.valid)
+    for (int k = 0; k < kArmJoints; k++)
+      if (S.part[k] != parts[k]) S.valid = false;
+
+  // Each joint's rotation RELATIVE TO ITS PARENT, as solved this tick. That
+  // is the quantity an author means by "the shoulder turned": the torso's own
+  // lean and the gait still pass straight through.
+  auto localOf = [&](int i) {
+    const int par = sk.parts[i].parent;
+    return par >= 0 && (size_t)par < n
+               ? QuatNormalize(QuatMul(QuatConj(st.model[par].rot),
+                                       st.model[i].rot))
+               : st.model[i].rot;
+  };
+  Quat want[kArmJoints]{};
+  for (int k = 0; k < kArmJoints; k++)
+    if (parts[k] >= 0) want[k] = localOf(parts[k]);
+  if (!S.valid) {
+    // SEED FROM THE LIVE POSE: the first braked tick changes nothing, so
+    // turning a brake on never jumps the arm.
+    for (int k = 0; k < kArmJoints; k++) {
+      S.part[k] = parts[k];
+      S.prev[k] = want[k];
+    }
+    S.valid = asked;
+    return;
+  }
+
+  // Frame-rate independent: the brakes are authored per 30 Hz TICK.
+  const float ticks = std::max(dt * 30.0f, 0.0f);
+  auto angleBetween = [](const Quat& a, const Quat& b) {
+    const float d = std::fabs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
+    return 2.0f * std::acos(std::min(1.0f, d));
+  };
+  Quat got[kArmJoints]{};
+  float lagMax = 0.0f;
+  for (int k = 0; k < kArmJoints; k++) {
+    if (parts[k] < 0) continue;
+    const ArmJointSmooth& p = S.params.joint[k];
+    Quat q = S.prev[k];
+    if (!p.Any()) {
+      q = want[k];
+    } else {
+      // Low-pass first, THEN the cap: the cap is a ceiling on what the joint
+      // actually does this tick, so it must see the smoothed step.
+      Quat out = want[k];
+      if (p.smooth > 0.0f)
+        out = QuatSlerp(q, want[k], 1.0f - std::exp2(-ticks / p.smooth));
+      if (p.maxDeg > 0.0f) {
+        const float ang = angleBetween(q, out);
+        const float lim = p.maxDeg * (3.14159265f / 180.0f) * ticks;
+        if (ang > lim && ang > 1e-5f) out = QuatSlerp(q, out, lim / ang);
+      }
+      q = QuatNormalize(out);
+    }
+    got[k] = q;
+    S.prev[k] = q;
+    lagMax = std::max(lagMax, angleBetween(q, want[k]));
+  }
+  // Released and caught up (under a fifth of a degree everywhere): done.
+  if (!asked && lagMax < 0.0035f) S.valid = false;
+
+  // RE-FLATTEN THE ARM'S SUBTREE with the braked locals. Parents-first
+  // storage makes it one sweep from the shoulder: every part keeps its
+  // transform RELATIVE TO ITS PARENT (so the sword and a gauntlet shell ride
+  // the hand rigidly), except the three joints, whose relative rotation is
+  // replaced.
+  static thread_local std::vector<Transform> old;
+  old.assign(st.model.begin(), st.model.begin() + (std::ptrdiff_t)n);
+  static thread_local std::vector<uint8_t> moved;
+  moved.assign(n, 0);
+  const int root = parts[kArmShoulder];
+  for (size_t i = (size_t)root; i < n; i++) {
+    const int par = sk.parts[i].parent;
+    if ((int)i != root && (par < 0 || !moved[par])) continue;
+    moved[i] = 1;
+    if (par < 0 || (size_t)par >= n) continue;
+    Quat rel = QuatNormalize(QuatMul(QuatConj(old[par].rot), old[i].rot));
+    const Vec3 relPos = QuatRotateInv(old[par].rot, old[i].pos - old[par].pos);
+    for (int k = 0; k < kArmJoints; k++)
+      if (parts[k] == (int)i) rel = got[k];
+    st.model[i].rot = QuatNormalize(QuatMul(st.model[par].rot, rel));
+    st.model[i].pos = st.model[par].pos + QuatRotate(st.model[par].rot, relPos);
+  }
+  // The clamp diagnostics compare against a PRE-CLAMP snapshot ApplyWeaponArm
+  // took before this ran; retake it so the braking is not reported as clamp
+  // movement.
+  if (weaponHandPart_ >= 0 && (size_t)weaponHandPart_ < n) {
+    weaponHandPreClamp_ = st.model[weaponHandPart_].rot;
+    weaponHandPosPreClamp_ = st.model[weaponHandPart_].pos;
+  }
+  if (weaponUpPart_ >= 0 && (size_t)weaponUpPart_ < n)
+    weaponUpPreClamp_ = st.model[weaponUpPart_].rot;
+  if (weaponLoPart_ >= 0 && (size_t)weaponLoPart_ < n)
+    weaponLoPreClamp_ = st.model[weaponLoPart_].rot;
 }
 
 void Mob::RecordWeaponClamp(const AnimSkeleton& sk, const AnimState& st) const {

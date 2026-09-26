@@ -881,7 +881,6 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
   if (group("melee", lo, hi)) {
     const Tuning::Melee& m = t.melee;
     put("commitSpeed", m.commitSpeed);
-    put("slashTime", m.slashTime);
     put("recoverTime", m.recoverTime);
     put("fullSpeedMps", m.fullSpeedMps);
     put("minSpeedMps", m.minSpeedMps);
@@ -902,9 +901,6 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("guardUpM", m.guardUpM);
     put("guardSideM", m.guardSideM);
     put("dirSmoothing", m.dirSmoothing);
-    put("swingArc", m.swingArc);
-    put("swingAnticipate", m.swingAnticipate);
-    put("swingExtend", m.swingExtend);
     put("bladeSmoothing", m.bladeSmoothing);
     put("wristMaxAngle", m.wristMaxAngle);
     put("steerSpeedLoMps", m.steerSpeedLoMps);
@@ -920,7 +916,6 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("blockItemDamage", m.blockItemDamage);
     put("blockNudgeAz", m.blockNudgeAz);
     put("blockNudgeEl", m.blockNudgeEl);
-    putI("controlMode", m.controlMode);
     put("pickMinSpeed", m.pickMinSpeed);
     put("torsoShare", m.torsoShare);
     put("torsoPitch", m.torsoPitch);

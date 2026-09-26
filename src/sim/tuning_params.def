@@ -1342,11 +1342,6 @@ TP_F(player, grabSpinDamp, NO_WGSL, 0.80f, 0.0f, 1.0f)
 TP_F(camera, mouseSensitivity, NO_WGSL, 0.0022f, 0.0002f, 0.01f)
 TP_F(camera, fovY, NO_WGSL, 1.2f, 0.5f, 2.6f)
 TP_F(camera, pitchClamp, NO_WGSL, 1.55f, 0.5f, 1.5707f)
-// A scale of 0 would freeze the view while guarding, which reads as the
-// game having locked up rather than as a feel choice; above 1 it is a
-// speed-up, which is a legitimate thing to try, so only the floor is hard.
-TP_F(camera, meleeSensitivity, NO_WGSL, 0.5f, 0.05f, 2.0f)
-TP_F(camera, meleeSensHalflife, NO_WGSL, 0.08f, 0.0f, 1.0f)
 
 
 // ==== thirdPerson ====
@@ -1631,6 +1626,9 @@ TP_F(gore, cutLength, NO_WGSL, 0.90f, 0.1f, 16.0f)
 TP_F(gore, cutWidth, NO_WGSL, 0.20f, 0.05f, 4.0f)
 TP_I(gore, cutSpallRounds, NO_WGSL, 1, 0, 4)
 TP_F(gore, cutSpallStrength, NO_WGSL, 0.30f, 0.0f, 1.0f)
+TP_F(gore, cleaveArea, NO_WGSL, 1.6f, 0.0f, 16.0f)
+// 1 would divide by zero in the power shaping (Tuning::Gore::cleaveFrom).
+TP_F(gore, cleaveFrom, NO_WGSL, 0.5f, 0.0f, 0.95f)
 TP_F(gore, woundHeftRef, NO_WGSL, 5.3f, 0.01f, 60.0f)
 TP_F(gore, woundHeftMax, NO_WGSL, 4.0f, 1.0f, 32.0f)
 TP_F(gore, woundStainRadius, NO_WGSL, 0.90f, 0.0f, 16.0f)
@@ -1772,8 +1770,8 @@ TP_F(coat, hudMinFrac, NO_WGSL, 0.02f, 0.0f, 1.0f)
 // an opinion about how it should feel, and each one is a thing a slider
 // dragged to its end can otherwise break outright:
 //
-//   * a zero or negative time divides in SlashProgress and in the phase
-//     machine's own normalisation;
+//   * a zero or negative time divides in the phase machine's own
+//     normalisation;
 //   * a zero speed BAND makes the damage ramp `(v - min) / (full - min)`
 //     singular, and the sweep's own `max(..., 1e-3f)` would then quietly
 //     turn every touch into a full-power hit;
@@ -1783,7 +1781,6 @@ TP_F(coat, hudMinFrac, NO_WGSL, 0.02f, 0.0f, 1.0f)
 //   * an aim gain of 0 disconnects the mouse, which reads as a hung game
 //     rather than as a setting.
 TP_F(melee, commitSpeed, NO_WGSL, 900.0f, 1.0f, 3000.0f)
-TP_F(melee, slashTime, NO_WGSL, 0.17f, 0.02f, 2.0f)
 TP_F(melee, recoverTime, NO_WGSL, 0.22f, 0.02f, 2.0f)
 // + a hand-written rule in LoadTuning
 TP_F(melee, fullSpeedMps, NO_WGSL, 20.0f, 0.05f, 60.0f)
@@ -1816,9 +1813,6 @@ TP_F(melee, guardForwardM, NO_WGSL, 0.22f, -2.0f, 2.0f)
 TP_F(melee, guardUpM, NO_WGSL, 0.26f, -2.0f, 2.0f)
 TP_F(melee, guardSideM, NO_WGSL, 0.16f, -2.0f, 2.0f)
 TP_F(melee, dirSmoothing, NO_WGSL, 0.06f, 0.005f, 1.0f)
-TP_F(melee, swingArc, NO_WGSL, 2.0f, 0.0f, 3.10f)
-TP_F(melee, swingAnticipate, NO_WGSL, 0.35f, 0.0f, 1.0f)
-TP_F(melee, swingExtend, NO_WGSL, 0.16f, 0.0f, 1.0f)
 TP_F(melee, bladeSmoothing, NO_WGSL, 0.055f, 0.005f, 1.0f)
 // Past ~pi the "wrist" is a ball joint and the fist can end up facing
 // backwards down its own arm (game/mob.cpp applies this as a slerp limit).
@@ -1877,9 +1871,6 @@ TP_F(melee, blockGapM, NO_WGSL, 0.22f, 0.0f, 0.5f)
 TP_F(melee, blockItemDamage, NO_WGSL, 0.35f, 0.0f, 1.0f)
 TP_F(melee, blockNudgeAz, NO_WGSL, 0.30f, 0.0f, 1.0f)
 TP_F(melee, blockNudgeEl, NO_WGSL, 0.18f, 0.0f, 1.0f)
-// An out-of-range mode is a typo, not a request: clamp to the two that
-// exist so nothing downstream needs a default arm (handLead's convention).
-TP_I(melee, controlMode, NO_WGSL, 0, 0, 1)
 TP_F(melee, pickMinSpeed, NO_WGSL, 250.0f, 1.0f, 1500.0f)
 // 180 is meaningful: the swing follows the camera wherever it looks (the
 // pre-cone behaviour). 0 pins every swing to the body's facing.

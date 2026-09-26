@@ -170,6 +170,11 @@ void WriteBrick(MicroBodySet& set, uint32_t base, IVec3 dims,
   set.MarkPool(base, base + (uint32_t)total);
 }
 
+void BumpEditGen(MicroBodySet& set, uint32_t model) {
+  if (set.editGen.size() <= model) set.editGen.resize((size_t)model + 1, 0);
+  set.editGen[model]++;
+}
+
 }  // namespace
 
 void MicroBodySet::MarkPool(uint32_t lo, uint32_t hi) {
@@ -524,6 +529,7 @@ int MicroBodyClone(MicroBodySet& set, uint32_t model) {
   set.owned[slot] = 1;
   set.blockWords[slot] = (uint32_t)words;
   set.MarkPool(base, base + (uint32_t)words);
+  BumpEditGen(set, slot);
   return (int)slot;
 }
 
@@ -573,6 +579,7 @@ bool MicroBodyEdit(MicroBodySet& set, uint32_t model,
   WriteBrick(set, m.base, dims, voxels, mn, true);  // marks the block dirty
   originShift = mn;
   set.dirty = true;
+  BumpEditGen(set, model);
   return true;
 }
 
@@ -599,7 +606,25 @@ bool MicroBodyPoke(MicroBodySet& set, uint32_t model, int x, int y, int z,
   if (word == set.pool[w]) return true;  // already that value: no upload debt
   set.pool[w] = word;
   set.MarkPool(w, w + 1);
+  BumpEditGen(set, model);
   return true;
+}
+
+uint32_t MicroBodyEditGen(const MicroBodySet& set, uint32_t model) {
+  return model < set.editGen.size() ? set.editGen[model] : 0u;
+}
+
+uint16_t MicroBodyCell(const MicroBodySet& set, uint32_t model, int x, int y,
+                       int z) {
+  if (model >= set.models.size()) return 0;
+  const MicroBodyModelGpu& m = set.models[model];
+  const int dx = (int)(m.dims & 1023), dy = (int)((m.dims >> 10) & 1023),
+            dz = (int)((m.dims >> 20) & 1023);
+  if (x < 0 || y < 0 || z < 0 || x >= dx || y >= dy || z >= dz) return 0;
+  const size_t idx = ((size_t)z * dy + y) * dx + x;
+  const uint32_t w = m.base + (uint32_t)(idx / 2);
+  if (w >= set.pool.size()) return 0;
+  return (uint16_t)(set.pool[w] >> ((idx % 2) * 16u));
 }
 
 bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,

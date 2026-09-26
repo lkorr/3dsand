@@ -542,6 +542,35 @@ uint32_t ContainerScoopStream(IVec3 cell, uint32_t mat, Vec3 mouth, int life,
   return n;
 }
 
+uint32_t ContainerApplyStream(Vec3 mouth, Vec3 target, uint32_t mat, int life,
+                              int n, uint32_t seed, uint32_t tick, uint32_t room,
+                              std::vector<FluidSpawnOp>& out) {
+  life = std::clamp(life, 2, 255);
+  const uint32_t flags = kFluidOpGhost | ((uint32_t)life << kFluidOpLifeShift);
+  auto jit = [](uint32_t h, int sh, float span) {
+    return ((float)((h >> sh) & 0xFFu) / 255.0f - 0.5f) * span;
+  };
+  uint32_t k = 0;
+  for (int s = 0; s < n && k < room; s++) {
+    const uint32_t h = rng::Hash3(seed, tick, (uint32_t)(s + 1) * 0x9E3779B9u);
+    const uint32_t g = rng::Hash3(h, tick, 0xA9917u);
+    // A tight cluster at the lip, spread a little wider where it lands: a
+    // stream leaving a flask's neck and splashing on skin.
+    const Vec3 p = mouth + Vec3{jit(h, 0, 0.3f), jit(h, 8, 0.3f), jit(h, 16, 0.3f)};
+    const Vec3 aim = target + Vec3{jit(g, 0, 0.6f), jit(g, 8, 0.6f), jit(g, 16, 0.6f)};
+    // The velocity carries the target (see ContainerScoopStream).
+    const Vec3 v = (aim - p) * (1.0f / (float)life);
+    FluidSpawnOp op{};
+    op.px = Q16(p.x); op.py = Q16(p.y); op.pz = Q16(p.z);
+    op.vx = Q16(v.x); op.vy = Q16(v.y); op.vz = Q16(v.z);
+    op.flags = flags;
+    op.mat = mat;
+    out.push_back(op);
+    k++;
+  }
+  return k;
+}
+
 float PourBrushCellsPerSec(const ItemDef& def, float radius) {
   const float k = std::max(0.0f, radius) / kPourBrushRefRadius;
   return (float)def.container.applyCells * k * k;

@@ -1175,7 +1175,10 @@ SSBO lists of chunk indices.
   and diagonal displacements are free — they strictly decrease `SUM(f*y)`. A
   LATERAL one between two liquids/gases at the same level changes neither
   Lyapunov function, so for a liquid it needs the film licence; see the
-  `DIRTY_M_DISPLACE` entry above.
+  `DIRTY_M_DISPLACE` entry above. And a liquid displaces only a GAS sideways,
+  never another liquid (2026-09-24): a same-level water/oil swap has no
+  direction, so it random-walked a disturbed oil slick into a checkerboard of
+  lone cells. Immiscible liquids separate vertically only (`--gate oil-slick`).
 
 ### Race safety (and determinism)
 Two GPU threads must never both claim the same destination cell — and the *winner*
@@ -1442,6 +1445,21 @@ Noita's "Bloody Zombies" technique, on GPU:
   keeping particles alive forever (rule 2). `lift == 0` is the opt-out and keeps
   every older behaviour: micro spray, and liquid/gas ejecta, whose landing in
   its own liquid is a MERGE and a different rule than this one.
+- **PASSABLE VEGETATION HOLDS NOTHING UP** (2026-09-25, gate `plant-crush`).
+  A `passable` plant (bramble, grass tuft, flower, ...) is one full SOLID cell
+  drawn as a small micro-model, so gore thrown off a carved body came to rest
+  ON it and floated a voxel above a plant a quarter that tall. A grid-bound
+  particle now flies through a passable cell, is never "buried" in one, does
+  not count one as support, and may reinsert INTO one — the plant is crushed.
+  Micro spray keeps the old contact rule (blood spatters the bush). The CA says
+  the same thing twice in `sim_step.wgsl`: `soloSolid` ignores passable
+  neighbours of a non-passable cell (a chip leaning on a flower is still a
+  one-voxel island; a plant is still held by the plant it grows from), and a
+  powder or lone solid whose straight fall is blocked by a passable cell takes
+  it and leaves AIR (`tryCrush` — destroyed, not swapped, or the flower would
+  ride up onto the grain). Straight down only; liquids never crush, so reeds
+  and kelp stand in water. Still open: island detection (`debris.cpp`) counts
+  plants as anchors, so a multi-voxel raft resting on a plant stays up.
 - This is what makes liquids splash instead of blob, and it's the standard
   mechanism whenever the grid must yield space (rigidbody pushes through water →
   water voxels eject as particles).
@@ -5239,6 +5257,48 @@ touch a creature with a sword, lose a limb, anywhere, every time.
   ordinary `Sever()`, so this changes WHEN a limb comes off and nothing about
   what coming off means. Neither applies to a burn (which has its own tested
   account of charring through) or to a blast (which has no "other side").
+- **A blow goes THROUGH when it can pay for the plane (2026-09-25,
+  `phys/kerf.h` `KerfBite`).** A fixed-depth, rim-thinned kerf could never come
+  out the far side of anything, so a head came off only after aligned chops
+  nobody lands by hand. Each blow now has a budget in world voxels² of
+  skin-equivalent cross-section: the chip's own area (`depth × 2·halfL`) plus
+  `gore.cleaveArea × heft × ((power − gore.cleaveFrom)/(1 − cleaveFrom))²`
+  (`BuildStrikeParts`). The one-cell-thick plane the edge travels in is priced
+  cell by cell at `hardness / gear.cutHardnessRef` (flesh 0.75, skin 1, bone
+  3), within the edge's own reach (`KerfCut::edgeHalf`, half the swung
+  segment). Budget ≥ everything left in that plane → `KerfSlot::through`: a
+  clean slab, full depth and full edge length, no wedge or ragged rim, at least
+  half a cell thick on every lattice so even a one-cell-wide collider parts.
+  Short of that, the cleave part buys extra depth. Measured on the human head:
+  neck planes 1.25–1.28, chin 1.6–1.7, jaw 2.3–3.1, skull 2.7–5; the stock
+  sword's budget is 1.90 at power 1 and 0.80 at 0.8. So a decapitation depends
+  on the blade's size, the swing's speed and edge alignment, WHERE it landed,
+  and how much of the neck is already cut, with no counter or roll. Only
+  severable anatomy may be parted (not the root, not hair, not a garment or the
+  held item). **When the edge passes between the joint and the bulk of the
+  limb, the limb is off** (`Mob::CutLimb`, asked of the plane before the
+  carve): the human head's collider is one cell across the neck, so no lattice
+  split sees the cut, and the joint's flesh ball straddles it. The stub on the
+  joint's side, if it is the small side (≤ `kLimbCollapseFraction`), goes as
+  gore with the cut rather than riding away under the head. The debris twin
+  (`DebrisSystem::CutBody`) prices and parts the same way; its connectivity
+  split does the rest. `KerfEntry`'s core probe is floored at one lattice
+  column (it was a third of a skin cell and missed the surface on ~40% of
+  blows). A groove-finding pull (slide the blow into an old cut) was built,
+  measured by the gate and removed: no effect at ±2 cm of aim wander, noise at
+  ±4 cm. Gate `head-cleave`; `MobSystem::LastCutBite` says why a blow did or did
+  not go through.
+  **A blade takes the skull, not the neck** (`Mob::TrimNeckForSever`, called by
+  `Sever()` for a blade on a vital limb). The human neck is part of the head
+  limb and the torso ends flat at the shoulders, so a decapitation anywhere on
+  the neck used to send the rest of it away with the head. `MobLimb::skullBase`
+  is read off the limb's own shape before its first carve
+  (`Mob::MeasureSkullBase`: slices across the joint→centroid axis, the first
+  one 1.6× the thinnest so far, in the nearer half; the human's lands at the
+  jaw, 0.93 vox from the joint), and everything nearer the joint is dropped
+  before the piece leaves. The owner chose the neck going with the cut over it
+  staying on the body (which needs the neck moved into the torso in the art);
+  the body bleeds from the collar.
 - **What is seated in a piece that leaves goes with it (2026-09-23).** Every
   cause but blunt and a body's birth rot: when `CarveLimb`'s split parts a limb,
   each child's socket is assigned to the nearest component big enough to be a
@@ -5317,6 +5377,19 @@ The `damage-cause` gate is the proof it changed nothing: it walks every
 `(cause, eaten, tissue)` and compares each column with the deleted flag
 expression, written out verbatim, and checks that the shipped `undead` defs
 are exactly the `rotten` ones.
+
+**Hair is ROOTED** (2026-09-25, `SeverPolicy::rooted`, gate `hair-rooted`) —
+the one deliberate departure from those old predicates, written into the gate
+as such. A hair piece is `severable` only so that losing it is not a death,
+and that flag opted it into every whole-limb sever written for an arm; a
+nick at its single anchor cell ("hanging by a thread") dropped the whole mass
+like a wig. For `Bloodless` tissue the impact-speed sever, cut-through, the
+joint rule and fire's hp-0 sever are all off; `CarveLimb` skips the collapse
+FRACTION (Jolt's `kMinFragmentVoxels` floor stays) and its connectivity split
+keeps the LARGEST component rather than the one at the anchor; `JointAttached`
+never reports hair detached from a carved head; a fall splat's random severs
+skip it. Hair is cut and burnt piece by piece, a piece a blade parts falls on
+its own, and the rest leaves only with its parent.
 
 ### One damage event, one shell response (2026-09-24, W2-H; `game/shellresponse.h`, `BlastForceOf`, `Mob::ApplyFallDamage`, gate `damage-sources`)
 
@@ -5858,6 +5931,21 @@ read as "fire does not burn legs". `Mob::BurnTick` now starts from
 `tick mod limbs` and `BurnLimbs` from `tick mod mobs`, so each limb and each
 creature takes the head of the budget in turn — deterministic, since the tick
 is the key. The budget itself is unchanged.
+
+**...and taking turns made the fire pulse (2026-09-25).** Owner report: a
+burning corpse's flames came out "in rhythmic bursts". An engulfed body wants
+far more than `kBurnOpsPerTick` (96) flames a tick and more than the front
+budget, so the limb at the head of the rotation spent both pots and every other
+limb emitted nothing: one tick of fire per limb every 15 (a human), a 2 Hz
+flicker from limb to limb. Now each pot is split by BURNING WEIGHT
+(`Mob::LimbBurnWeight`, the front size floored at 64; `BurnShareOf`): a limb,
+and in `BurnLimbs` a creature, gets its proportional share of what is left and
+what it does not spend flows on. Proportional, not equal — an equal split capped
+a torso visited first at 1/n while the small limbs after it left theirs unspent
+(garment-burn's smock fell 86% → 28%). Inside a limb the candidate list is also
+walked from a tick-keyed offset, so a short share is spread over the surface
+rather than always cutting off the same tail. `BurnStats::frontSkipped` /
+`emitRefused` say when a fire is budget-bound.
 
 **A corpse says what killed it.** Four mechanisms now end in the same ragdoll
 (a vital limb destroyed, a vital limb burnt or dissolved away, blood loss, the
@@ -8225,9 +8313,41 @@ A hotbar and a sword, built as the melee counterpart to the spell system: the
 same division of labour (main.cpp owns the player's inventory, the systems are
 player-agnostic) and the same refusal to add a parallel damage path.
 
-**DISCRETE STRIKES ARE THE DEFAULT NOW (2026-09-01; `melee.controlMode`).**
-The mouse-steer experiment below is preserved intact as `controlMode = 1`, but
-what ships is `0`: a click fires an **authored stroke program** — the same
+**THE FREEFORM MODE AND THE DRIVER'S OWN SLASH ARE GONE (2026-09-25).**
+`MeleeState` used to commit a Slash of its own whenever its input crossed
+`melee.commitSpeed`, adding a fixed two-radian arc (`swingArc`, in the SMOOTHED
+input direction) on top of whatever was driving it and folding it into the
+stroke. For the mouse-steer mode that was the cut; for an authored program it
+was a second controller — a short (dagger-length) cut crossed the threshold,
+overshot its authored end by ~1.7 rad and was dragged back, and the frozen
+direction could point up out of a downward cut. Removed with it: the freeform
+mode (`melee.controlMode`), `slashTime` / `swingArc` / `swingAnticipate` /
+`swingExtend`, and the freeform look damping (`camera.meleeSensitivity` /
+`meleeSensHalflife`). **The program's Cut phase is the only cut** — the player's
+damage sweep, whoosh and `SetSwinging` key on `playerStrike.Cutting()`, exactly
+as the NPC's do on theirs. `SwingPhase` is Idle / Guard / Wind / Recover; Wind
+is a speed label Arrest reads. The prose below about the freeform law is
+history.
+
+**Two more pieces of that fight, same day.** (1) The wrist's alignment was
+EARNED BY TIP SPEED (`steerSpeedLo/Hi`, `steerFloor` 0.15) — freeform's "a slow
+raise rides the grip". Under a program that left a slow cut at 15% alignment
+with the hand placed for 100%, so the tip ended far from the authored point and
+MORE ticks made it worse. A program step now aligns in full
+(`MeleeState::SetProgramDrive`, one-shot per step). (2) `ClampDirHalfSpaces`
+(the ball joint's reach clamp, `anim.cpp`) kept one component exactly and
+refilled the remainder into the third with the input's sign — not the nearest
+point, and discontinuous across the whole horizontal band whenever a stop was
+pressed: a shoulder at its across-the-body stop flipped the arm from above
+horizontal to below in one tick (the "hand teleports above the head for a
+frame" report; player-styles' per-tick trace, `SANDVOX_PS_TRACE=<style>`,
+attributes each jump to `clampShift`). It is a true nearest-point projection
+now (never farther than the old one, up to 17 degrees nearer). The one
+irreducible discontinuity left is a bone aimed straight into the corner where
+BOTH stops are pressed: two answers are equally near there, and no clamp can
+be continuous everywhere on a sphere.
+
+**DISCRETE STRIKES (2026-09-01).** A click fires an **authored stroke program** — the same
 `attack_styles.json` entries the NPCs replay, new `player_*` rows with short
 windups and zero jitter — through the same `MeleeState`, with the **camera as
 the basis**, so every strike's mid-travel passes
@@ -15620,6 +15740,36 @@ click-a-limb pour (`InspectApplyPicks`) is gone; `DouseLimb` stays as the
 whole-limb door for gates and tools. Vocabulary: `stanch` (the cauterise rule's
 three fields -- bleedBudget, stumpOpen, gushTicks) and `disinfect` (a bite's
 infectMat/infectStain). No material authors either yet; medicine is content.
+
+**Apply mode: the same brush on somebody else** (2026-09-25; owner: "when
+holding a flask, when mousing over another mob, you should have the ability to
+apply stains to the mob in the same way that we can in the triage/health
+menu"). F with a vessel in hand toggles it (`UIState::vesselApply`, fed as the
+HELD bit `TB_APPLY`, kTickInputVersion 3, so a replay or a peer reads LMB the
+same way; with a vessel in hand F is this, not the dev laser). While it is on,
+LMB does not pour: the tick casts the crosshair ray from the render eye
+(`FrameIntent::aimFrom`) against bodies (`CastRayBody`, own limbs ignored),
+`FindOwner` names the creature -- living or a corpse, never yourself -- and
+then it is exactly the portrait brush: `PickBody`, `PourOnBody` at
+`UIState::pourRadius`, `coat.effects`, the `PourBrushCellsPerSec` spend off its
+own accumulator (`PlayerSession::applySpendMilli`), only on ticks that meet
+skin. So water washes blood off a corpse and acid coats (and eats) a face.
+Reach is `pourRange` + 1 m from the head. The picture is the scoop stream
+backwards: `ContainerApplyStream` (ghost MPM from the mouth homing onto the hit
+point) for a liquid the seam owns, outbound `ScoopMote`s (`out`, `to`) for
+the rest. The frame repeats the pick for the HUD tag ("apply to zombie -
+head") and a green marker on the skin. The coat lands the tick the button is
+held; the ghosts arrive a few ticks later -- a picture, not the delivery.
+
+**The pour pose** (2026-09-25; owner: "right now it looks like the character is
+peeing"). LMB with a filled vessel -- pour or apply -- plays `assets/anims/pour.json`
+(looped override on the right arm: shoulder ~86 deg forward, wrist tipped) and
+nothing leaves the vessel until it has held for `kPourRaiseTicks` (4); the clip
+stops on release or when the hands stop holding a vessel. Every stream -- pour,
+apply ghosts, scoop ghosts, motes -- starts at `Mob::HeldMouthWorld(dir)`: the
+held item's own cells farthest toward where the contents go, at the current
+pose, instead of a fixed offset above the hand's origin. `--shot-mob
+human:*flask,!pour` photographs it (`*item` = hold, `!clip` = play).
 
 **Thrown, and broken** (2026-09-23; owner: "holding down a button with it
 equipped charges up a throw ... if the flask hits something with a high

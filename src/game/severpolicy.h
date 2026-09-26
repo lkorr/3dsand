@@ -149,6 +149,7 @@ struct SeverPolicy {
   JointRule joint = JointRule::Never;
   bool hpZeroSeversAny = false;
   bool shellStaysOn = false;  // this limb is a garment the structural severs skip
+  bool rooted = false;        // hair: never leaves whole, only piece by piece
   bool gore = false;
   bool adopt = true;          // a severed slot leaves as a body
   bool deathBurnt = false;
@@ -176,6 +177,24 @@ constexpr SeverPolicy SeverPolicyOf(const DamageCtx& ctx, Tissue t) {
   p.joint = r.joint;
   p.hpZeroSeversAny = r.hpZeroSeversAny;
   p.shellStaysOn = t == Tissue::Shell && r.shellHeld;
+  // HAIR IS ROOTED ALL OVER THE SCALP, NOT AT A JOINT (2026-09-25). A hair
+  // piece is `severable` only so that losing it is not a death (HpZeroSevers),
+  // and that flag used to opt it into every whole-limb sever written for an
+  // arm: the one-point "hanging by a thread" test at its anchor cell, the
+  // cut-through, the impact-speed snap and fire's "hp 0 severs". So a sword
+  // nick at the anchor, or a burn, dropped the whole mass like a wig (the
+  // owner's report). Rooted, it is cut and burnt PIECE BY PIECE: the carve
+  // chips it, a piece a blade parts from the rest falls on its own
+  // (CarveLimb's split keeps the LARGEST component for a rooted limb), and
+  // what stays keeps riding the head. Only the Jolt floor
+  // (kMinFragmentVoxels) and its parent leaving still take it off.
+  p.rooted = t == Tissue::Bloodless;
+  if (p.rooted) {
+    p.impactSevers = false;
+    p.cutThrough = false;
+    p.joint = JointRule::Never;
+    p.hpZeroSeversAny = false;
+  }
   p.gore = r.gore && blood;
   p.adopt = t != Tissue::Shell || r.shellShed;
   p.deathBurnt = r.deathBurnt;

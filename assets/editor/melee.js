@@ -24,8 +24,8 @@
      TRANSCRIBED  MeleeTuning + the tuning.json map, RadiusBand, RebuildFrame
                   (tip, blade lean, hand, hand-back plane, head keep-out,
                   wrist frame, elbow pole + cone, steer envelope), Update
-                  (take-over seed, phase machine, stroke integration, the
-                  slash arc), Pose/PoseWeight, StrokeReachIn,
+                  (take-over seed, phase machine, stroke integration),
+                  Pose/PoseWeight, StrokeReachIn,
                   BeginStrokeProgram, StepStrokeProgram, QuantizeStrike,
                   NeutralStrike, PickAttackStyle, rng::Hash3/SignedUnit.
      APPROXIMATED nothing in the driver. The CALLER (rig.js) approximates:
@@ -143,7 +143,6 @@ const metresPerSecToCells = m => m / kVoxelMeters;
 export function defaultMeleeTuning() {
   return {
     commitSpeed: 900.0,                                    // melee.h:161
-    slashTime: 0.17,                                       // :163
     recoverTime: 0.22,                                     // :164
     fullSpeed: metresPerSecToCells(3.4),                   // :168
     minSpeed: metresPerSecToCells(0.9),                    // :169
@@ -164,9 +163,6 @@ export function defaultMeleeTuning() {
     guardUp: metresToCells(0.26),
     guardSide: metresToCells(0.16),
     dirSmoothing: 0.06,                                    // :268
-    swingArc: 2.0,                                         // :274
-    swingAnticipate: 0.35,                                 // :281
-    swingExtend: 0.16,                                     // :286
     bladeSmoothing: 0.055,                                 // :291
     wristMaxAngle: 3.10,                                   // :324
     steerSpeedLo: metresPerSecToCells(0.6),                // :355
@@ -191,7 +187,7 @@ export function defaultMeleeTuning() {
 /**
  * melee.cpp:760 ApplyMeleeTuning — tuning.json's `melee` block -> MeleeTuning.
  *
- * `controlMode`/`pickMinSpeed`/`aimYaw`/`aimReleaseYaw` are DELIBERATELY not
+ * `pickMinSpeed`/`aimYaw`/`aimReleaseYaw` are DELIBERATELY not
  * copied, exactly as in the engine: they are the controller's switches and the
  * swing-basis cone, read at the one site in main.cpp,
  * and a cached copy here could disagree across an F5. The Attacks panel reads
@@ -205,7 +201,6 @@ export function meleeTuningFrom(tuningJson) {
   return {
     ...d,
     commitSpeed: n('commitSpeed', d.commitSpeed),
-    slashTime: n('slashTime', d.slashTime),
     recoverTime: n('recoverTime', d.recoverTime),
     fullSpeed: metresPerSecToCells(n('fullSpeedMps', d.fullSpeed * kVoxelMeters)),
     minSpeed: metresPerSecToCells(n('minSpeedMps', d.minSpeed * kVoxelMeters)),
@@ -226,9 +221,6 @@ export function meleeTuningFrom(tuningJson) {
     guardUp: metresToCells(n('guardUpM', d.guardUp * kVoxelMeters)),
     guardSide: metresToCells(n('guardSideM', d.guardSide * kVoxelMeters)),
     dirSmoothing: n('dirSmoothing', d.dirSmoothing),
-    swingArc: n('swingArc', d.swingArc),
-    swingAnticipate: n('swingAnticipate', d.swingAnticipate),
-    swingExtend: n('swingExtend', d.swingExtend),
     bladeSmoothing: n('bladeSmoothing', d.bladeSmoothing),
     wristMaxAngle: n('wristMaxAngle', d.wristMaxAngle),
     steerSpeedLo: metresPerSecToCells(n('steerSpeedLoMps', d.steerSpeedLo * kVoxelMeters)),
@@ -258,8 +250,11 @@ export function meleeTuningFrom(tuningJson) {
    header.
    ========================================================================== */
 
-export const PHASE = { Idle: 0, Guard: 1, Wind: 2, Slash: 3, Recover: 4 };
-export const PHASE_NAME = ['idle', 'guard', 'wind', 'slash', 'recover'];
+// melee.h SwingPhase. NO SLASH (2026-09-25): the driver's own speed-triggered
+// cut and its follow-through arc were a second controller fighting every
+// authored stroke. The PROGRAM's Cut phase is the cut.
+export const PHASE = { Idle: 0, Guard: 1, Wind: 2, Recover: 3 };
+export const PHASE_NAME = ['idle', 'guard', 'wind', 'recover'];
 
 export class MeleeState {
   constructor(tuning) {
@@ -270,11 +265,8 @@ export class MeleeState {
     this.inputAccum_ = v3();
     this.mouseVel_ = v3();
     this.mouseSpeed_ = 0;
-    this.cutDir_ = v3();
-    this.cutAz_ = 0; this.cutEl_ = 0;
     this.az_ = 0; this.el_ = 0; this.radius_ = 0;
     this.azLive_ = 0; this.elLive_ = 0; this.radLive_ = 0;
-    this.swingAz_ = 0; this.swingEl_ = 0; this.swingOut_ = 0;
     // ---- the derived frame ----
     this.tipL_ = v3(); this.tipPrev_ = v3(); this.tipVel_ = v3();
     this.tangent_ = v3();
@@ -291,6 +283,9 @@ export class MeleeState {
     // authored stroke may own its own hand-back clock (strokes.h
     // StrokeRecover::fade).
     this.recoverOverride_ = 0;
+    // melee.h SetProgramDrive: true for exactly the steps a stroke program
+    // makes; the wrist then aligns in full. Cleared at the end of update().
+    this.programDrive_ = false;
     // ---- world-frame outputs (Pose reads these) ----
     this.tip_ = v3(); this.hand_ = v3();
     this.bladeDir_ = v3(); this.bladeFlat_ = v3();
@@ -397,10 +392,9 @@ export class MeleeState {
 
   // melee.cpp:921 Arrest
   arrest() {
-    if (this.phase_ !== PHASE.Wind && this.phase_ !== PHASE.Slash) return;
+    if (this.phase_ !== PHASE.Wind) return;
     this.phase_ = PHASE.Recover;
     this.phaseTime_ = 0;
-    this.swingAz_ = 0; this.swingEl_ = 0; this.swingOut_ = 0;
     this.recoverHold_ = true;
   }
 
@@ -409,10 +403,8 @@ export class MeleeState {
     this.phase_ = PHASE.Idle;
     this.phaseTime_ = 0;
     this.inputAccum_ = v3(); this.mouseVel_ = v3(); this.mouseSpeed_ = 0;
-    this.cutDir_ = v3(); this.cutAz_ = 0; this.cutEl_ = 0;
     this.az_ = 0; this.el_ = 0; this.radius_ = 0;
     this.azLive_ = 0; this.elLive_ = 0; this.radLive_ = 0;
-    this.swingAz_ = 0; this.swingEl_ = 0; this.swingOut_ = 0;
     this.tipPrev_ = v3(); this.tipVel_ = v3(); this.tangent_ = v3();
     this.extendLive_ = 0;
     this.steerLive_ = clamp(this.tuning.steerFloor, 0, 1);
@@ -467,10 +459,20 @@ export class MeleeState {
      smoothing had got to.
 
      Phase is forced to Guard so poseWeight is 1 and the rig actually takes
-     the arm; the follow-through arc is zeroed because an arc is a motion and
-     there is no motion here.
+     the arm.
+
+     A HELD FRAME IS A PURE FUNCTION OF ITS ARGUMENTS (2026-09-25). Only the
+     TIP is az/el/radius; the hand, the blade's lean, its flat, the wrist and
+     the elbow pole are EASED state that the live driver carries from tick to
+     tick. Snapping just the tip left all of that wherever the previous
+     motion had put it, so "recover", click off, "recover" again showed the
+     same point with a different arm every time. So every piece of carried
+     state is SEEDED canonically here — from `travel`, the direction the path
+     moves through this destination (strokeGoalPose states it) — and the frame
+     is then rebuilt until the eased channels sit on their fixed point: the
+     arm a program would show if it arrived here moving that way and held.
      ---------------------------------------------------------------------- */
-  snapToPose(az, el, radius, right, up, fwd) {
+  snapToPose(az, el, radius, right, up, fwd, travel) {
     const t = this.tuning;
     const { lo: rLo, hi: rHi } = this.radiusBand();
     const azHi = this.handSign_ > 0 ? t.azOut : t.azAcross;
@@ -484,15 +486,57 @@ export class MeleeState {
     this.az_ = clamp(az, azLo, azHi);
     this.el_ = clamp(el, t.elMin, t.elMax);
     this.radius_ = clamp(radius, rLo, rHi);
-    this.swingAz_ = 0; this.swingEl_ = 0; this.swingOut_ = 0;
     this.azLive_ = this.az_;
     this.elLive_ = this.el_;
     this.radLive_ = this.radius_;
-    // Unprimed, so rebuildFrame takes alpha = 1 on every eased channel it
-    // owns internally (the wrist, the pole, the extension) instead of
-    // chasing from wherever the last live swing left them.
+
+    // ---- THE CANONICAL SEED ------------------------------------------------
+    // The tangent of the path at the tip, in BASIS coordinates: d(tip)/d(az)
+    // and d(tip)/d(el) weighted by the travel. No travel (a style with a
+    // zero leg) falls back to the horizontal the take-over seed prefers.
+    const ce = Math.cos(this.el_), se = Math.sin(this.el_);
+    const sa = Math.sin(this.az_), ca = Math.cos(this.az_);
+    const radial = v3(ce * sa, se, ce * ca);
+    const dAz = travel ? travel.az : 0, dEl = travel ? travel.el : 0;
+    let tan = vadd(vmul(v3(ca, 0, -sa), dAz * ce),
+                   vmul(v3(-se * sa, ce, -se * ca), dEl));
+    if (vlen(tan) < 1e-5) tan = vcross(radial, v3(0, 1, 0));
+    if (vlen(tan) < 1e-5) tan = anyPerp(radial);
+    tan = vnorm(tan);
+    this.tangent_ = tan;
+    this.perpL_ = tan;
+    this.tipVel_ = v3();
+    this.handVel_ = v3();
+    {
+      // extendLive_'s own fixed point, so its slow ease has nothing to chase.
+      const handReachNow =
+        (this.armValid_ ? this.armReach_ : t.fallbackReach) * t.reachFraction;
+      this.extendLive_ = clamp(handReachNow * t.handExtend, 0.05, handReachNow);
+    }
+    this.bladeFlatL_ = anyPerp(radial);
+    {
+      const f = vcross(radial, tan);
+      if (vlen(f) > 1e-5) this.bladeFlatL_ = vnorm(f);
+    }
+    this.wristDirL_ = radial;
+    this.wristFlatL_ = this.bladeFlatL_;
+    this.poleL_ = v3(0, 0, -1);
+    this.steerLive_ = 1.0;
+
+    // ---- SETTLE THE EASED CHANNELS ----------------------------------------
+    // Unprimed first (alpha 1 where the rebuild honours it), then primed with
+    // the tip standing still — which is exactly "arrived and held". Every
+    // channel here converges geometrically; two seconds of ticks is far past
+    // the slowest halflife (extendSmoothing) and far below anything visible.
     this.framePrimed_ = false;
     this.rebuildFrame(1 / 30, right, up, fwd);
+    for (let i = 0; i < 60; i++) {
+      this.tangent_ = tan;          // a still tip reads no tangent of its own
+      this.rebuildFrame(1 / 30, right, up, fwd);
+    }
+    // FULL WRIST ALIGNMENT, as every step of a stroke program has (melee.h
+    // SetProgramDrive) — so the held frame is the arm the program shows.
+    this.steerLive_ = 1.0;
   }
 
   /* ------------------------------------------------------------------------
@@ -506,12 +550,12 @@ export class MeleeState {
     const t = this.tuning;
     let { lo: rLo, hi: rHi } = this.radiusBand();
 
-    // THE TOTAL, clamped: the steered stroke plus the cut's follow-through.
+    // THE STROKE, clamped (the band can move under a stored radius).
     const azHi = this.handSign_ > 0 ? t.azOut : t.azAcross;
     const azLo = this.handSign_ > 0 ? -t.azAcross : -t.azOut;
-    const azSum = clamp(this.az_ + this.swingAz_, azLo, azHi);
-    const elSum = clamp(this.el_ + this.swingEl_, t.elMin, t.elMax);
-    const rSum = clamp(this.radius_ + this.swingOut_, rLo, rHi);
+    const azSum = clamp(this.az_, azLo, azHi);
+    const elSum = clamp(this.el_, t.elMin, t.elMax);
+    const rSum = clamp(this.radius_, rLo, rHi);
 
     // ---- THE ARM'S OWN SMOOTHING, before anything is built (:1024) --------
     {
@@ -651,7 +695,7 @@ export class MeleeState {
 
     // ---- THE WRIST CHASES THE FRAME ON ITS OWN CLOCK (:1228) --------------
     {
-      const hl = t.wristSmoothing * (this.phase_ === PHASE.Slash ? 0.35 : 1.0);
+      const hl = t.wristSmoothing;
       const aw = this.framePrimed_ ? smoothAlpha(hl, dt) : 1.0;
       this.wristDirL_ = lerp3(this.wristDirL_, this.bladeDirL_, aw);
       this.wristDirL_ = vlen(this.wristDirL_) > 1e-5
@@ -711,10 +755,10 @@ export class MeleeState {
 
     // ---- HOW COMMITTED THIS IS, AND THEREFORE HOW MUCH WRIST (:1327) ------
     {
-      // ONLY SLASH FORCES FULL ALIGNMENT. Wind and Recover used to as well,
-      // and that was the overhead-strike wrist wrench.
+      // NO PHASE FORCES FULL ALIGNMENT (melee.cpp says why); an authored
+      // PROGRAM does (melee.h SetProgramDrive), otherwise speed earns it.
       let want = 1.0;
-      if (this.phase_ !== PHASE.Slash) {
+      if (!this.programDrive_) {
         const floorF = clamp(t.steerFloor, 0, 1);
         const lo = Math.max(t.steerSpeedLo, 0);
         const hi = Math.max(t.steerSpeedHi, lo + 1e-3);
@@ -758,15 +802,6 @@ export class MeleeState {
     this.mouseSpeed_ = Math.sqrt(
       this.mouseVel_.x * this.mouseVel_.x + this.mouseVel_.y * this.mouseVel_.y);
 
-    // Screen motion -> a direction in CONTROL space. Screen +y is DOWN, so it
-    // maps to -elevation (:1400).
-    const gAz = this.mouseVel_.x * t.aimGainX;
-    const gEl = -this.mouseVel_.y * t.aimGainY;
-    const gLen = Math.sqrt(gAz * gAz + gEl * gEl);
-    const haveDir = gLen > 1e-9;
-    const dirAz = haveDir ? gAz / gLen : 0;
-    const dirEl = haveDir ? gEl / gLen : 0;
-
     if (!armed) { if (this.phase_ !== PHASE.Idle) this.reset(); }
 
     this.phaseTime_ += dt;
@@ -807,7 +842,6 @@ export class MeleeState {
           this.azLive_ = this.az_;
           this.elLive_ = this.el_;
           this.radLive_ = this.radius_;
-          this.swingAz_ = 0; this.swingEl_ = 0; this.swingOut_ = 0;
 
           // SEED THE DERIVED FRAME FROM THE BLADE ITSELF (:1480).
           const handL = toBasis(seedHand, right, up, fwd);
@@ -865,34 +899,16 @@ export class MeleeState {
           this.phaseTime_ = 0;
           break;
         }
+        // Wind is only a LABEL (what arrest() reads as a live cut). NO
+        // SPEED-TRIGGERED COMMIT (melee.cpp says why).
         this.phase_ = this.mouseSpeed_ > t.commitSpeed * 0.35
           ? PHASE.Wind : PHASE.Guard;
-        // COMMIT. The ARC's direction is frozen here (:1553).
-        if (this.mouseSpeed_ > t.commitSpeed && haveDir) {
-          this.cutAz_ = dirAz;
-          this.cutEl_ = dirEl;
-          this.cutDir_ = vnorm(vadd(vmul(right, dirAz), vmul(up, dirEl)));
-          this.phase_ = PHASE.Slash;
-          this.phaseTime_ = 0;
-        }
         break;
       }
 
-      case PHASE.Slash:
-        if (this.phaseTime_ >= t.slashTime) {
-          // FOLD THE ARC INTO THE STROKE: a cut ENDS WHERE IT WENT (:1568).
-          this.az_ = clamp(this.az_ + this.swingAz_, azLo, azHi);
-          this.el_ = clamp(this.el_ + this.swingEl_, t.elMin, t.elMax);
-          this.swingAz_ = 0; this.swingEl_ = 0;
-          this.recoverHold_ = armed && held;
-          this.phase_ = PHASE.Recover;
-          this.phaseTime_ = 0;
-        }
-        break;
-
       case PHASE.Recover:
         // ---- THE BUTTON WENT UP MID-FOLLOW-THROUGH (melee.cpp:2430) -------
-        // `recoverHold_` is latched at the Slash -> Recover transition and
+        // `recoverHold_` is latched by arrest() and
         // until 2026-09-21 there was NO PATH THAT EVER CLEARED IT, in the
         // engine or here: a stroke that committed a cut and then released held
         // poseWeight at 1 for the whole recover and dropped it to 0 on the one
@@ -907,7 +923,6 @@ export class MeleeState {
         if (this.phaseTime_ >= this.recoverTime()) {
           this.phase_ = (armed && held) ? PHASE.Guard : PHASE.Idle;
           this.phaseTime_ = 0;
-          this.swingAz_ = 0; this.swingEl_ = 0; this.swingOut_ = 0;
         }
         break;
     }
@@ -919,29 +934,6 @@ export class MeleeState {
       this.az_ = clamp(this.az_ + delta.x * t.aimGainX, azLo, azHi);
       this.el_ = clamp(this.el_ - delta.y * t.aimGainY, t.elMin, t.elMax);
       this.radius_ = clamp(this.radius_ + delta.z * t.reachGain, rLo, rHi);
-    }
-
-    switch (this.phase_) {
-      case PHASE.Slash: {
-        // THE CUT, as an arc ADDED to the stroke (:1616).
-        const tt = clamp(this.phaseTime_ / Math.max(t.slashTime, 1e-4), 0, 1);
-        const e = tt * tt * (3.0 - 2.0 * tt);         // smoothstep
-        const bow = 4.0 * e * (1.0 - e);              // 0 at the ends, 1 mid
-        const drive = e - t.swingAnticipate * bow;
-        this.swingAz_ = this.cutAz_ * t.swingArc * drive;
-        this.swingEl_ = this.cutEl_ * t.swingArc * drive;
-        this.swingOut_ = bow * t.swingExtend * tipReach;
-        break;
-      }
-      case PHASE.Recover: {
-        // Unwind only the follow-through (:1638).
-        const k = smoothAlpha(0.07, dt);
-        this.swingAz_ += (0 - this.swingAz_) * k;
-        this.swingEl_ += (0 - this.swingEl_) * k;
-        this.swingOut_ += (0 - this.swingOut_) * k;
-        break;
-      }
-      default: break;
     }
 
     if (this.phase_ === PHASE.Idle) {
@@ -959,6 +951,7 @@ export class MeleeState {
     if (vlen(this.wristDir_) < 1e-4) this.wristDir_ = this.bladeDir_;
     if (vlen(this.wristFlat_) < 1e-4) this.wristFlat_ = this.bladeFlat_;
     if (vlen(this.bendPole_) < 1e-4) this.bendPole_ = vmul(fwd, -1);
+    this.programDrive_ = false;   // one-shot, as melee.cpp
   }
 }
 
@@ -1034,7 +1027,9 @@ export function cutThrough(sty, k) {
 export const cutTravel = (sty) => cutThrough(sty, (sty.cut || []).length - 1);
 // WHERE THE TARGET SITS ALONG THE PATH, from the cut's start: the middle of
 // the leg that claims the aim, or the midpoint of the whole travel (which for
-// one leg is the historical cut/2).
+// one leg is the historical cut/2). Not read by the runner any more (strokes.h
+// "THE STROKE FRAME"): it is what the panel's "centre" writes into the windup
+// (`windup = -this`) and what the legacy conversion subtracts.
 export function cutAimOffset(sty) {
   const legs = sty.cut || [];
   const k = sty.aimLeg;
@@ -1044,6 +1039,108 @@ export function cutAimOffset(sty) {
   }
   const all = cutTravel(sty);
   return { az: 0.5 * all.az, el: 0.5 * all.el };
+}
+
+/**
+ * strokes.h AttackStyle::FromLegacyFrame — a PARSED style from the
+ * pre-2026-09-25 frame (windup measured from "half a cut short of the aim")
+ * to the target frame (windup measured from the target, the cut starting at
+ * the windup). The same program: the windup pose moves by -cutAimOffset and
+ * leg 1 absorbs the old windup offset, which the old cut ignored.
+ */
+export function fromLegacyFrame(sty) {
+  const off = cutAimOffset(sty);
+  const wAz = sty.windup.az, wEl = sty.windup.el;
+  sty.windup = { ...sty.windup, az: wAz - off.az, el: wEl - off.el };
+  if (sty.cut && sty.cut.length) {
+    sty.cut = sty.cut.map((l, i) => (i === 0
+      ? { ...l, az: l.az - wAz, el: l.el - wEl } : l));
+  }
+  return sty;
+}
+
+/**
+ * THE SAME CONVERSION ON THE RAW FILE, so the editor (and the one-off
+ * migration of assets/mobs/attack_styles.json) rewrites the numbers an author
+ * sees rather than converting them behind the panel's back. Returns true if
+ * it converted anything; stamps `strokeFrame: "target"`. Player blocks are
+ * converted as the loader would merge them: in the OLD frame first, and any
+ * block that states geometry gets its windup az/el and first leg az/el
+ * written out explicitly in the new one.
+ */
+export function migrateRawToTargetFrame(json) {
+  if (!json || typeof json !== 'object' || json.strokeFrame === 'target')
+    return false;
+  const r6 = v => Math.round(v * 1e6) / 1e6;
+  const num = (v, d) => (Number.isFinite(+v) ? +v : d);
+  const legsOf = (cut) => (Array.isArray(cut)
+    ? cut.filter(l => l && typeof l === 'object')
+    : [cut && typeof cut === 'object' ? cut : {}]);
+  const offOf = (legs) => {
+    let k = legs.findIndex(l => l.aim === true);
+    const az = legs.map(l => num(l.az, 0)), el = legs.map(l => num(l.el, 0));
+    const sum = (a, n) => a.slice(0, n).reduce((x, y) => x + y, 0);
+    if (k >= 0) return { az: sum(az, k) + 0.5 * az[k], el: sum(el, k) + 0.5 * el[k] };
+    return { az: 0.5 * sum(az, az.length), el: 0.5 * sum(el, el.length) };
+  };
+  for (const s of (Array.isArray(json.styles) ? json.styles : [])) {
+    if (!s || typeof s !== 'object') continue;
+    // strokes.cpp's default windup when a style states none: write it out, so
+    // the converted number is the one the engine was really using.
+    if (!s.windup || typeof s.windup !== 'object')
+      s.windup = { ticks: 12, az: 0.30, el: 0.10, reach: -0.05 };
+    const W = { az: num(s.windup.az, 0.30), el: num(s.windup.el, 0.10) };
+    if (s.cut === undefined) s.cut = { ticks: 7, az: -2.0, el: 0, reach: 0.10 };
+    const legs = legsOf(s.cut);
+    const off = offOf(legs);
+    // ---- the player block, in the OLD frame, BEFORE the base moves -------
+    const p = s.player && typeof s.player === 'object' ? s.player : null;
+    let pOut = null;
+    if (p) {
+      const pw = p.windup && typeof p.windup === 'object' ? p.windup : null;
+      const geomW = pw && (pw.az !== undefined || pw.el !== undefined);
+      const geomC = Array.isArray(p.cut) ||
+        (p.cut && typeof p.cut === 'object' &&
+         (p.cut.az !== undefined || p.cut.el !== undefined));
+      if (geomW || geomC) {
+        const Wp = { az: num(pw?.az, W.az), el: num(pw?.el, W.el) };
+        let legsP;
+        if (Array.isArray(p.cut)) legsP = legsOf(p.cut);
+        else {
+          legsP = legs.map(l => ({ ...l }));
+          if (p.cut && typeof p.cut === 'object')
+            legsP[0] = { ...legsP[0],
+                         ...(p.cut.az !== undefined ? { az: p.cut.az } : {}),
+                         ...(p.cut.el !== undefined ? { el: p.cut.el } : {}) };
+        }
+        const offP = offOf(legsP);
+        pOut = { wAz: r6(Wp.az - offP.az), wEl: r6(Wp.el - offP.el),
+                 l0Az: r6(num(legsP[0].az, 0) - Wp.az),
+                 l0El: r6(num(legsP[0].el, 0) - Wp.el) };
+      }
+    }
+    // ---- the base --------------------------------------------------------
+    s.windup.az = r6(W.az - off.az);
+    s.windup.el = r6(W.el - off.el);
+    legs[0].az = r6(num(legs[0].az, 0) - W.az);
+    legs[0].el = r6(num(legs[0].el, 0) - W.el);
+    if (pOut) {
+      if (!p.windup || typeof p.windup !== 'object') p.windup = {};
+      p.windup.az = pOut.wAz;
+      p.windup.el = pOut.wEl;
+      if (Array.isArray(p.cut)) {
+        const lp = legsOf(p.cut);
+        lp[0].az = pOut.l0Az;
+        lp[0].el = pOut.l0El;
+      } else {
+        if (!p.cut || typeof p.cut !== 'object') p.cut = {};
+        p.cut.az = pOut.l0Az;
+        p.cut.el = pOut.l0El;
+      }
+    }
+  }
+  json.strokeFrame = 'target';
+  return true;
 }
 
 /**
@@ -1107,12 +1204,30 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
                        -18, 18);
     m.step(smp, dt, true, right, up, fwd);
   };
+  // strokes.cpp steerPaced — THE SAME CHASE, TIMED, for a windup or settle
+  // that states its own ease: each tick spends the curve's share of the
+  // remaining gap, still clamped to steerTo's under-commit envelope.
+  const steerPaced = (wantAz, wantEl, wantR, ease, into, len) => {
+    const t = m.tuning;
+    const nn = Math.max(1, len);
+    const share = strokeEaseStep(ease, into / nn, (into + 1) / nn);
+    smp.dx = clamp((wantAz - m.strokeAz()) * share / t.aimGainX, -16, 16);
+    smp.dy = clamp(-(wantEl - m.strokeEl()) * share / t.aimGainY, -16, 16);
+    smp.dReach = clamp((wantR - m.strokeRadius()) * share /
+                       Math.max(t.reachGain, 1e-4), -18, 18);
+    m.step(smp, dt, true, right, up, fwd);
+  };
 
   // THIS STYLE'S OWN HAND-BACK CLOCK (strokes.cpp; StrokeRecover::fade).
   // Pushed every tick and unconditionally: a MeleeState is reused across
   // strokes, so a previous style's override would otherwise outlive it. Zero
   // restores the global melee.recoverTime.
   m.setRecoverTime(sty && sty.recover.fade > 0 ? sty.recover.fade * dt : 0);
+  // strokes.cpp: every step below is this program's, so the wrist aligns in
+  // full — only when a step will actually run, so the flag cannot leak.
+  if (cur.phase === STROKE_PHASE.Guard ||
+      (sty && cur.phase !== STROKE_PHASE.Idle))
+    m.programDrive_ = true;
 
   switch (cur.phase) {
     case STROKE_PHASE.Guard: {
@@ -1128,13 +1243,18 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
       // THE CUT IS CENTRED ON THE AIM, so the windup lands as far SHORT of it
       // as the target sits ALONG THE PATH — cut/2 for one leg, the middle of
       // the aiming leg for a path (strokes.h "A CUT IS A PATH").
-      const aimOff = cutAimOffset(sty);
-      cur.wantAz = liveAz - aimOff.az + sty.windup.az + bowAz;
-      cur.wantEl = liveEl - aimOff.el + sty.windup.el + bowEl;
+      // MEASURED FROM THE TARGET (strokes.h "THE STROKE FRAME"): 0/0 points
+      // straight at them; centring the cut is in the authored numbers.
+      cur.wantAz = liveAz + sty.windup.az + bowAz;
+      cur.wantEl = liveEl + sty.windup.el + bowEl;
       // AGAINST A NEUTRAL EXTENSION, not against the live radius: computing
       // it as StrokeRadius() + offset every tick is a RUNAWAY.
       cur.wantReach = strokeReachIn(m, sty.windup.reach);
-      steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
+      if (sty.windup.ease)
+        steerPaced(cur.wantAz, cur.wantEl, cur.wantReach, sty.windup.ease,
+                   cur.phaseTick, cur.windupTicks);
+      else
+        steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
       if (++cur.phaseTick >= cur.windupTicks) {
         // ---- COMMIT. The aim is frozen HERE and never refreshed.
         cur.aimAz = liveAz;
@@ -1161,10 +1281,10 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
       // pose still produces a cut through the target, and a leg that fell
       // short does not displace the legs after it (each target is an ABSOLUTE
       // point on the path).
-      const aimOff = cutAimOffset(sty);
+      // The path starts at the WINDUP POSE (without the start bow).
       const through = cutThrough(sty, leg);
-      const toAz = cur.aimAz - aimOff.az + through.az;
-      const toEl = cur.aimEl - aimOff.el + through.el;
+      const toAz = cur.aimAz + sty.windup.az + through.az;
+      const toEl = cur.aimEl + sty.windup.el + through.el;
       const toR = strokeReachIn(m, sty.windup.reach + through.reach);
       // HOW MUCH OF THE REMAINING GAP THIS TICK SPENDS (strokes.h StrokeEase).
       // The tick counts are per LEG, so a short leg is a fast one; WITHIN the
@@ -1175,7 +1295,9 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
       // style is linear.
       const t = m.tuning;
       const rg = Math.max(t.reachGain, 1e-4);
-      if ((sty.ease || 'linear') === 'linear') {
+      // THE LEG'S OWN EASE when it states one, else the style's.
+      const le = legEase(sty, leg);
+      if (le === 'linear') {
         const left = Math.max(1, legEnd - cur.phaseTick);
         smp.dx = ((toAz - m.strokeAz()) / left) / t.aimGainX;
         smp.dy = -((toEl - m.strokeEl()) / left) / t.aimGainY;
@@ -1183,7 +1305,7 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
       } else {
         const legLen = Math.max(1, cur.legTicks[leg] || cur.cutTicks);
         const intoLeg = Math.max(0, cur.phaseTick - (legEnd - legLen));
-        const share = strokeEaseStep(sty.ease, intoLeg / legLen,
+        const share = strokeEaseStep(le, intoLeg / legLen,
                                      (intoLeg + 1) / legLen);
         smp.dx = ((toAz - m.strokeAz()) * share) / t.aimGainX;
         smp.dy = -((toEl - m.strokeEl()) * share) / t.aimGainY;
@@ -1209,7 +1331,11 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
         cur.wantAz = sty.recover.az;
         cur.wantEl = sty.recover.el;
         cur.wantReach = strokeReachIn(m, sty.recover.reach);
-        steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
+        if (sty.recover.ease)
+          steerPaced(cur.wantAz, cur.wantEl, cur.wantReach, sty.recover.ease,
+                     cur.phaseTick, cur.settleTicks);
+        else
+          steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
       } else {
         smp.held = false;
         m.step(smp, dt, true, right, up, fwd);
@@ -1233,8 +1359,8 @@ export function stepStrokeProgram(cur, sty, m, liveAz, liveEl, dt, right, up, fw
    preview can put the arm ON one and hold it.
 
    THE TARGETS ARE THE SAME EXPRESSIONS THE PHASES USE, deliberately — the
-   windup's `aim - CutAimOffset + windup`, leg k's `aim - offset +
-   CutThrough(k)`, the recover's ABSOLUTE stance. If a goal pose and the pose
+   windup's `aim + windup`, leg k's `aim + windup + CutThrough(k)`, the
+   recover's ABSOLUTE stance. If a goal pose and the pose
    the program arrives at ever disagree, one of the two is wrong and the point
    of sharing the arithmetic is that it is visible.
 
@@ -1261,28 +1387,43 @@ export function strokeGoals(sty) {
 /**
  * One goal resolved against the arm currently previewing. `null` for a key
  * this style has no destination for.
+ *
+ * `travel` is the direction (az, el) the PATH moves through this destination,
+ * which is what MeleeState.snapToPose seeds the blade's lean, flat and elbow
+ * from — so a held goal is a function of the style and nothing else. A cut
+ * leg: that leg's own travel. The windup: the first leg's travel (the blade
+ * is chambered for the cut it is about to make). The recover: from the end
+ * of the cut to the stance.
  */
 export function strokeGoalPose(sty, m, key, aimAz, aimEl) {
   if (!sty || !m) return null;
-  const aimOff = cutAimOffset(sty);
-  if (key === 'windup')
-    return { az: aimAz - aimOff.az + sty.windup.az,
-             el: aimEl - aimOff.el + sty.windup.el,
-             reach: strokeReachIn(m, sty.windup.reach) };
+  const legs = sty.cut || [];
+  if (key === 'windup') {
+    const l0 = legs[0] || { az: 0, el: 0 };
+    return { az: aimAz + sty.windup.az,
+             el: aimEl + sty.windup.el,
+             reach: strokeReachIn(m, sty.windup.reach),
+             travel: { az: l0.az, el: l0.el } };
+  }
   if (key === 'recover') {
     if (!sty.recover.posed) return null;
     // ABSOLUTE, in the mob's own facing basis — NOT aim-relative like the
     // other two. A recover is a return to stance, not a second aim.
+    const all = cutTravel(sty);
+    const fromAz = aimAz + sty.windup.az + all.az;
+    const fromEl = aimEl + sty.windup.el + all.el;
     return { az: sty.recover.az, el: sty.recover.el,
-             reach: strokeReachIn(m, sty.recover.reach) };
+             reach: strokeReachIn(m, sty.recover.reach),
+             travel: { az: sty.recover.az - fromAz, el: sty.recover.el - fromEl } };
   }
   if (key.startsWith('cut')) {
     const k = +key.slice(3);
-    if (!Number.isInteger(k) || k < 0 || k >= sty.cut.length) return null;
+    if (!Number.isInteger(k) || k < 0 || k >= legs.length) return null;
     const through = cutThrough(sty, k);
-    return { az: aimAz - aimOff.az + through.az,
-             el: aimEl - aimOff.el + through.el,
-             reach: strokeReachIn(m, sty.windup.reach + through.reach) };
+    return { az: aimAz + sty.windup.az + through.az,
+             el: aimEl + sty.windup.el + through.el,
+             reach: strokeReachIn(m, sty.windup.reach + through.reach),
+             travel: { az: legs[k].az, el: legs[k].el } };
   }
   return null;
 }
@@ -1297,16 +1438,50 @@ export function strokeGoalPose(sty, m, key, aimAz, aimEl) {
    and it must preserve keys this port has never heard of.
    ========================================================================== */
 
-// strokes.cpp:20 ReadSegment
-function readSegment(j, dflt) {
+// strokes.cpp ReadEaseKey — a SEGMENT'S own pacing (strokes.h "PER-SEGMENT
+// PACING"). Absent leaves the segment unpaced (null); an unknown name is
+// reported and ignored rather than read as linear.
+function readEaseKey(j, where, log) {
+  if (!j || typeof j !== 'object' || typeof j.ease !== 'string') return null;
+  if (AN.EASES.includes(j.ease)) return j.ease;
+  if (log) log.push(`${where} has unknown ease "${j.ease}" - ignored`);
+  return null;
+}
+
+// strokes.cpp:20 ReadSegment. `ease` is null when the segment states none:
+// a cut leg then uses the style's ease, a windup keeps its closed-loop chase.
+function readSegment(j, dflt, where, log) {
   const n = (k, d) => (j && Number.isFinite(+j[k]) ? +j[k] : d);
   return {
     ticks: Math.max(1, Math.round(n('ticks', dflt.ticks))),
     az: n('az', dflt.az),
     el: n('el', dflt.el),
     reach: n('reach', dflt.reach),
+    ease: readEaseKey(j, where, log),
   };
 }
+
+// strokes.cpp ReadJoints — the per-joint brakes on the posed arm (melee.h
+// ArmSmooth). Field-wise onto `base`, so the player block merges the same way.
+export const ARM_JOINTS = ['shoulder', 'elbow', 'wrist'];
+export function readJoints(j, base) {
+  const out = {};
+  for (const k of ARM_JOINTS) {
+    const b = (base && base[k]) || { smooth: 0, maxDeg: 0 };
+    const q = j && typeof j === 'object' ? j[k] : null;
+    const n = (v, d) => (Number.isFinite(+v) ? +v : d);
+    out[k] = q && typeof q === 'object'
+      ? { smooth: clamp(n(q.smooth, b.smooth), 0, 60),
+          maxDeg: clamp(n(q.maxDeg, b.maxDeg), 0, 180) }
+      : { smooth: b.smooth, maxDeg: b.maxDeg };
+  }
+  return out;
+}
+export const jointsAny = (js) => !!js && ARM_JOINTS.some(k =>
+  js[k] && (js[k].smooth > 0 || js[k].maxDeg > 0));
+
+// strokes.h AttackStyle::LegEase — the leg's own ease, else the style's.
+export const legEase = (sty, k) => (sty.cut[k] && sty.cut[k].ease) || sty.ease || 'linear';
 
 /* ---- HOW A CUT'S TRAVEL IS PACED (strokes.h, above AttackStyle) ----------
  *
@@ -1368,7 +1543,8 @@ function readCutPath(cutJ, styleName, log) {
                    + '"aim" as well - the first marked leg keeps it');
         else aimLeg = legs.length;
       }
-      legs.push(readSegment(leg, { ticks: 4, az: 0, el: 0, reach: 0 }));
+      legs.push(readSegment(leg, { ticks: 4, az: 0, el: 0, reach: 0 },
+                            `style "${styleName}" cut leg ${legs.length + 1}`, log));
     }
     if (!legs.length)
       log.push(`style "${styleName}" has an empty cut list - falling back to `
@@ -1376,7 +1552,8 @@ function readCutPath(cutJ, styleName, log) {
   }
   if (!legs.length)
     legs.push(readSegment(cutJ && typeof cutJ === 'object' && !Array.isArray(cutJ)
-      ? cutJ : {}, { ticks: 7, az: 0, el: 0, reach: 0 }));
+      ? cutJ : {}, { ticks: 7, az: 0, el: 0, reach: 0 },
+      `style "${styleName}" cut`, log));
   return { legs, aimLeg };
 }
 
@@ -1389,7 +1566,7 @@ function readCutPath(cutJ, styleName, log) {
  */
 function readRecover(j, styleName, log) {
   const out = { ticks: 10, posed: false, az: 0, el: 0, reach: 0,
-                settle: 0, fade: 0 };
+                settle: 0, fade: 0, ease: null };
   if (!j || typeof j !== 'object') return out;
   const n = (k, d) => (Number.isFinite(+j[k]) ? +j[k] : d);
   out.ticks = Math.max(1, Math.round(n('ticks', 10)));
@@ -1399,6 +1576,7 @@ function readRecover(j, styleName, log) {
   out.reach = n('reach', 0);
   out.settle = Math.max(0, Math.round(n('settle', 0)));
   out.fade = Math.max(0, Math.round(n('fade', 0)));
+  out.ease = readEaseKey(j, `style "${styleName}" recover`, log);
   if (out.settle > 0 && !out.posed) {
     log.push(`style "${styleName}" has \`recover.settle\` but no return pose `
              + '(az/el/reach) - the arm has nowhere to be driven, so the '
@@ -1479,12 +1657,15 @@ export function parseStyleLibrary(json) {
       label: typeof s.label === 'string' ? s.label : name,
       // How the cut's travel is paced over each leg (strokes.h StrokeEase).
       ease,
-      windup: readSegment(s.windup, { ticks: 12, az: 0, el: 0, reach: 0 }),
+      windup: readSegment(s.windup, { ticks: 12, az: 0, el: 0, reach: 0 },
+                          `style "${name}" windup`, log),
       // THE CUT PATH: always a LIST, one leg or several (strokes.h "A CUT IS
       // A PATH"). Readers that want the old single segment want cutTravel().
       cut: cutPath.legs,
       aimLeg: cutPath.aimLeg,
       recover: readRecover(s.recover, name, log),
+      // Per-joint brakes on the posed arm (strokes.h AttackStyle::joints).
+      joints: readJoints(s.joints, null),
       jitter: {
         az: Number.isFinite(+jt.az) ? +jt.az : 0,
         el: Number.isFinite(+jt.el) ? +jt.el : 0,
@@ -1537,6 +1718,8 @@ export function parseStyleLibrary(json) {
         az: n(over.az, baseSeg.az),
         el: n(over.el, baseSeg.el),
         reach: n(over.reach, baseSeg.reach),
+        ease: readEaseKey(over, `style "${base.name}:player" segment`, log)
+          || baseSeg.ease || null,
       };
     };
     const mergeJitter = (baseJ, over) => {
@@ -1559,6 +1742,8 @@ export function parseStyleLibrary(json) {
         reach: posed ? n(over.reach, 0) : 0,
         settle: posed ? Math.max(0, n(over.settle, baseR.settle)) : 0,
         fade: Math.max(0, n(over.fade, baseR.fade)),
+        ease: readEaseKey(over, `style "${base.name}:player" recover`, log)
+          || baseR.ease || null,
       };
     };
     // A LIST REPLACES, AN OBJECT MERGES INTO THE FIRST LEG (strokes.cpp says
@@ -1590,6 +1775,7 @@ export function parseStyleLibrary(json) {
       cut,
       aimLeg,
       recover: mergeRecover(base.recover, p.recover),
+      joints: readJoints(p.joints, base.joints),
       jitter: mergeJitter(base.jitter, p.jitter),
       derived: true,
       baseName: base.name,
@@ -1599,6 +1785,12 @@ export function parseStyleLibrary(json) {
     playerDerived.set(base.name, styles.length);
     styles.push(derived);
   }
+
+  // THE STROKE FRAME (strokes.h): a file without `strokeFrame: "target"` is
+  // converted AFTER the player merge, over base and player copies alike,
+  // exactly where strokes.cpp does it.
+  if (!json || json.strokeFrame !== 'target')
+    for (const st of styles) fromLegacyFrame(st);
 
   // strokes.h:111 PlayerStrikeMap — INDICES, not names, resolved against the
   // library at load time; a sector naming an unknown style is skipped LOUDLY.

@@ -2,7 +2,6 @@
   "//": "A CHARACTER, not a creature: pool_m07 inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs pool_m07 --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
   "extends": "human",
   "model": "pool_m07",
-  "sidecarVoxelsPerMetre": 10,
   "anatomy": {
     "garmentsBecome": null
   },
@@ -213,179 +212,13 @@
   ],
   "clips": {
     "walk": {
-      "durationMs": 656,
-      "tracks": {
-        "armU.L": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 328,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 656,
-              "q": [
-                0.1149,
-                0,
-                0,
-                0.9934
-              ]
-            }
-          ]
-        },
-        "armU.R": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 328,
-              "q": [
-                0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 656,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ]
-            }
-          ]
-        },
-        "armL.L": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 328,
-              "q": [
-                -0.1977,
-                0,
-                0,
-                0.9803
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 656,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ]
-            }
-          ]
-        },
-        "armL.R": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                -0.1977,
-                0,
-                0,
-                0.9803
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 328,
-              "q": [
-                -0.1149,
-                0,
-                0,
-                0.9934
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 656,
-              "q": [
-                -0.1977,
-                0,
-                0,
-                0.9803
-              ]
-            }
-          ]
-        },
-        "torso": {
-          "rot": [
-            {
-              "t": 0,
-              "q": [
-                0,
-                -0.0184,
-                0,
-                0.9998
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 328,
-              "q": [
-                0,
-                0.0184,
-                0,
-                0.9998
-              ],
-              "ease": "quadInOut"
-            },
-            {
-              "t": 656,
-              "q": [
-                0,
-                -0.0184,
-                0,
-                0.9998
-              ]
-            }
-          ]
-        }
-      }
+      "durationMs": 656
     },
     "run": {
       "durationMs": 333
     }
   },
+  "sidecarVoxelsPerMetre": 10,
   "genome": {
     "archetype": "humanoid",
     "name": "pool_m07",

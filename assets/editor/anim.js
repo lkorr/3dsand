@@ -1213,35 +1213,62 @@ function clampHinge(q, axis, lo, hi) {
 }
 
 /**
- * anim.cpp:659 ClampDirHalfSpaces — clamp the unit direction `d` into the
+ * anim.cpp ClampDirHalfSpaces — clamp the unit direction `d` into the
  * intersection of up to two half-spaces `d . n[k] <= s[k]`, NEAREST legal
- * direction. The normals are mutually perpendicular (the loader enforces it),
- * so completing them to an orthonormal frame turns the projection into three
- * independent components and the unit-length identity supplies the third.
+ * direction on the sphere. A TRUE nearest-point projection since 2026-09-25:
+ * the previous form refilled the unit length into one component with the
+ * input's sign, which flipped a clamped upper arm from above horizontal to
+ * below in one tick (anim.cpp says why, at length). Candidates: the projection
+ * onto each violated plane (free components scaled together), then the two
+ * points on both planes; the legal one closest to `d` wins.
  */
-function clampDirHalfSpaces(d, n, s, count) {
+export function clampDirHalfSpaces(d, n, s, count) {
   if (count <= 0) return d;
-  const n0 = n[0];
-  let n1 = count >= 2 ? n[1] : (Math.abs(n0.x) < 0.9 ? v3(1, 0, 0) : v3(0, 1, 0));
-  n1 = vsub(n1, vmul(n0, vdot(n0, n1)));
-  if (vlen(n1) < 1e-5) return d;
-  n1 = vnorm(n1);
-  const n2 = vcross(n0, n1);
-  const c0 = vdot(d, n0), c1 = vdot(d, n1), c2 = vdot(d, n2);
-  const w0 = Math.min(c0, s[0]);
-  const w1 = count >= 2 ? Math.min(c1, s[1]) : c1;
-  if (w0 === c0 && w1 === c1) return d;      // already legal, bit-for-bit
-  const rem = 1 - w0 * w0 - w1 * w1;
-  if (rem <= 0) {
-    // Both stops pinned so hard no unit vector satisfies them: give back the
-    // closest thing that exists rather than a NaN.
-    const v = vadd(vmul(n0, w0), vmul(n1, w1));
-    return vlen(v) > 1e-5 ? vnorm(v) : d;
+  if (count > 2) count = 2;
+  let legalIn = true;
+  for (let k = 0; k < count; k++) legalIn = legalIn && vdot(d, n[k]) <= s[k];
+  if (legalIn) return d;                       // already legal, bit-for-bit
+  const legal = (v) => {
+    for (let k = 0; k < count; k++) if (vdot(v, n[k]) > s[k] + 1e-5) return false;
+    return true;
+  };
+  let best = d, bestDot = -2, have = false;
+  const consider = (v) => {
+    if (!legal(v)) return;
+    const dd = vdot(v, d);
+    if (!have || dd > bestDot) { best = v; bestDot = dd; have = true; }
+  };
+  for (let k = 0; k < count; k++) {
+    const ck = vdot(d, n[k]);
+    if (ck <= s[k]) continue;
+    let perp = vsub(d, vmul(n[k], ck));
+    let pl = vlen(perp);
+    if (pl < 1e-6) {
+      const a = Math.abs(n[k].x) < 0.9 ? v3(1, 0, 0) : v3(0, 1, 0);
+      perp = vsub(a, vmul(n[k], vdot(n[k], a)));
+      pl = vlen(perp);
+      if (pl < 1e-6) continue;
+    }
+    const sk = clamp(s[k], -1, 1);
+    consider(vadd(vmul(n[k], sk), vmul(perp, Math.sqrt(Math.max(0, 1 - sk * sk)) / pl)));
   }
-  // The third component keeps its sign — taking it from the INPUT makes the
-  // choice vary continuously everywhere except one measure-zero corner.
-  const s2 = Math.sqrt(rem) * (c2 < 0 ? -1 : 1);
-  return vnorm(vadd(vadd(vmul(n0, w0), vmul(n1, w1)), vmul(n2, s2)));
+  if (count >= 2) {
+    let m = vcross(n[0], n[1]);
+    const ml = vlen(m);
+    if (ml > 1e-5) {
+      m = vmul(m, 1 / ml);
+      const base = vadd(vmul(n[0], s[0]), vmul(n[1], s[1]));
+      const rem = 1 - vdot(base, base);
+      if (rem >= 0) {
+        const r = Math.sqrt(rem);
+        consider(vadd(base, vmul(m, r)));
+        consider(vsub(base, vmul(m, r)));
+      } else if (!have) {
+        return vlen(base) > 1e-5 ? vnorm(base) : d;
+      }
+    }
+  }
+  return have ? vnorm(best) : d;
 }
 
 /**

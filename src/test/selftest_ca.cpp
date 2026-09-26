@@ -837,6 +837,291 @@ Status GateCaLevelPond(Ctx& c, std::string& detail) {
   return s;
 }
 
+// ---------------------------------------------------------------------------
+// oil-slick — oil on water stays a slick, not a checkerboard
+// ---------------------------------------------------------------------------
+// The owner, 2026-09-24: "when oil pours on top of water it often makes weird
+// checkerboard crazy patterns instead of tending to be clumped up ... if I
+// remove some or burn some then they all go crazy crawling around and
+// separating into this pattern."
+//
+// The mechanism was stepLiquid's same-level LATERAL DISPLACE: water beside a
+// lighter fluid at the same height swapped whole cells with it, oil included.
+// That swap has no driving force (same y, same SUM(f*f)), so it is an unbiased
+// random walk of every oil cell through the water's surface layer — diffusion,
+// which is the opposite of immiscible. It only ran under FILM_LICENCE, which is
+// why a settled slick sat still and a disturbed one (a hole cut, a cell burnt)
+// dissolved into isolated cells.
+//
+// FIXTURE. A sealed stone box, two full water layers and a third at HALF
+// fullness (a real lake surface has partial cells, and the half layer is where
+// oil and water share a level). A 6x6 slab of full oil is laid IN that layer,
+// settles, then the -x half of whatever oil is left is deleted — the owner's
+// "remove some". Measured at the end:
+//   ISOLATED  oil cells with no oil face-neighbour, as a fraction of oil cells.
+//             A checkerboard is ~all isolated; a slick is ~none.
+//   LARGEST   the biggest 6-connected oil component's share of the oil cells.
+//   IDLE      the box sleeps (rule 2).
+// Thresholds live in baseline.json (oilSlick.*).
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): a sim-only CA fixture, like every
+// ca-* gate in this file — it tests the liquid rules, and nothing the rest of
+// the tick grows (mobs, bodies, the celestial clock) may touch a sealed box.
+Status GateOilSlick(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t waterId = 0, oilId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "water") waterId = (uint32_t)i;
+    if (c.mats[i].name == "oil") oilId = (uint32_t)i;
+  }
+  if (!waterId || !oilId) { detail = "no 'water' or 'oil' material"; return Status::Fail; }
+
+  // Dim dawn, as ca-level: no freezing or evaporation in the box.
+  Tuning dawn = CurrentTuning();
+  dawn.dayNight.freeze = 1;
+  dawn.dayNight.freezePhase = (int)(kDaySunrise + 1024u);
+  Tuning saved = CurrentTuning();
+  SetCurrentTuning(dawn);
+
+  const int px = 96, py = 120, pz = 96;
+  const int kHalf = 14;
+  const int floorY = py, roofY = py + 12;
+  const int x0 = px - kHalf, x1 = px + kHalf;
+  const int z0 = pz - kHalf, z1 = pz + kHalf;
+  const int surfY = floorY + 3;  // the half-full layer oil shares
+  const int kRemoveAt = 200, kTicks = 700;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  std::vector<CellOp> build, pond, slab;
+  for (int z = z0 - 1; z <= z1 + 1; z++)
+    for (int x = x0 - 1; x <= x1 + 1; x++)
+      for (int y = floorY; y <= roofY; y++) {
+        const bool wall = x < x0 || x > x1 || z < z0 || z > z1;
+        const bool solid = wall || y <= floorY || y >= roofY;
+        build.push_back({World::SlotCellIndex({x, y, z}), solid ? (uint32_t)kMatStone : 0u});
+      }
+  for (int z = z0; z <= z1; z++)
+    for (int x = x0; x <= x1; x++)
+      for (int y = floorY + 1; y <= surfY; y++)
+        pond.push_back({World::SlotCellIndex({x, y, z}),
+                        (waterId & 0xFFFu) | ((y == surfY ? 3u : 7u) << 12)});
+  for (int z = pz - 3; z < pz + 3; z++)
+    for (int x = px - 3; x < px + 3; x++)
+      slab.push_back({World::SlotCellIndex({x, surfY, z}), (oilId & 0xFFFu) | (7u << 12)});
+
+  std::vector<uint32_t> boxChunks;
+  for (int cz = (z0 - 1) >> 4; cz <= ((z1 + 1) >> 4); cz++)
+    for (int cy = floorY >> 4; cy <= (roofY >> 4); cy++)
+      for (int cx = (x0 - 1) >> 4; cx <= ((x1 + 1) >> 4); cx++)
+        boxChunks.push_back(World::SlotChunkIndex({cx, cy, cz}));
+
+  // The oil in the box, as slot cells.
+  struct Cell { int x, y, z; };
+  auto readOil = [&]() {
+    std::vector<Cell> out;
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (int cz = (z0 - 1) >> 4; cz <= ((z1 + 1) >> 4); cz++)
+      for (int cy = floorY >> 4; cy <= (roofY >> 4); cy++)
+        for (int cx = (x0 - 1) >> 4; cx <= ((x1 + 1) >> 4); cx++) {
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex({cx, cy, cz}), 1,
+                         cbuf.data(), "oilSlickVox");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            if ((cbuf[k] & 0xFFFu) != oilId) continue;
+            const int x = (int)(k % 16) + cx * 16, y = (int)((k / 16) % 16) + cy * 16,
+                      z = (int)(k / 256) + cz * 16;
+            if (x < x0 || x > x1 || z < z0 || z > z1 || y <= floorY || y >= roofY) continue;
+            out.push_back({x, y, z});
+          }
+        }
+    return out;
+  };
+
+  uint32_t t = 43000;
+  uint32_t activeInBox = 0;
+  for (int i = 0; i < kTicks; i++) {
+    std::vector<CellOp> ops = i == 0 ? build : i == 2 ? pond : i == 4 ? slab
+                                                                     : std::vector<CellOp>{};
+    if (i == kRemoveAt) {
+      ctx.WaitIdle();
+      for (const Cell& o : readOil())
+        if (o.x < px) ops.push_back({World::SlotCellIndex({o.x, o.y, o.z}), 0u});
+    }
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, ops, false, {6, 7, 6},
+               false, false);
+    if (i == kTicks - 1) {
+      ctx.WaitIdle();
+      std::vector<uint32_t> flags(kNumSlots, 0);
+      rhi::ReadbackBlocking(ctx.device, ctx.queue, sim.DirtyActive(), 0,
+                            flags.data(), kNumSlots * 4, "oilSlickActive");
+      for (uint32_t ci : boxChunks)
+        if (flags[ci] != 0) activeInBox++;
+    }
+  }
+  ctx.WaitIdle();
+  SetCurrentTuning(saved);
+
+  // Components over the box interior, 6-connected.
+  const std::vector<Cell> oil = readOil();
+  const int sx = x1 - x0 + 1, sy = roofY - floorY + 1;
+  auto key = [&](int x, int y, int z) { return ((size_t)(z - z0) * sy + (y - floorY)) * sx + (x - x0); };
+  std::vector<int> comp((size_t)sx * sy * sx, -2);  // -2 no oil, -1 unvisited
+  for (const Cell& o : oil) comp[key(o.x, o.y, o.z)] = -1;
+  const int dirs[6][3] = {{1,0,0},{-1,0,0},{0,1,0},{0,-1,0},{0,0,1},{0,0,-1}};
+  auto isOil = [&](int x, int y, int z) {
+    return x >= x0 && x <= x1 && z >= z0 && z <= z1 && y > floorY && y < roofY &&
+           comp[key(x, y, z)] != -2;
+  };
+  uint32_t isolated = 0, comps = 0, largest = 0;
+  std::vector<Cell> stack;
+  for (const Cell& o : oil) {
+    bool lone = true;
+    for (auto& d : dirs) if (isOil(o.x + d[0], o.y + d[1], o.z + d[2])) lone = false;
+    if (lone) isolated++;
+    if (comp[key(o.x, o.y, o.z)] != -1) continue;
+    uint32_t n = 0;
+    stack.push_back(o);
+    comp[key(o.x, o.y, o.z)] = (int)comps;
+    while (!stack.empty()) {
+      const Cell q = stack.back(); stack.pop_back(); n++;
+      for (auto& d : dirs) {
+        const int ax = q.x + d[0], ay = q.y + d[1], az = q.z + d[2];
+        if (!isOil(ax, ay, az) || comp[key(ax, ay, az)] != -1) continue;
+        comp[key(ax, ay, az)] = (int)comps;
+        stack.push_back({ax, ay, az});
+      }
+    }
+    comps++;
+    largest = std::max(largest, n);
+  }
+
+  const double nOil = (double)std::max<size_t>(oil.size(), 1);
+  const double isoFrac = isolated / nOil, bigFrac = largest / nOil;
+  const double isoMax = BaselineNumber("oilSlick.isolatedMax", 0.2);
+  const double bigMin = BaselineNumber("oilSlick.largestMin", 0.5);
+  RecordObserved("oilSlick.isolatedObserved", isoFrac);
+  RecordObserved("oilSlick.largestObserved", bigFrac);
+  const bool ok = !oil.empty() && isoFrac <= isoMax && bigFrac >= bigMin && activeInBox == 0;
+  detail = Format(
+      "%zu oil cells after removing the -x half at tick %d: %u isolated (%.2f, allow "
+      "%.2f), %u components, largest %u (%.2f, need %.2f), %u of %zu box chunks "
+      "awake at tick %d",
+      oil.size(), kRemoveAt, isolated, isoFrac, isoMax, comps, largest, bigFrac,
+      bigMin, activeInBox, boxChunks.size(), kTicks);
+  std::printf("oil-slick: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// plant-crush — passable vegetation holds nothing up
+// ---------------------------------------------------------------------------
+// The owner, 2026-09-25: voxels thrown off a killed mob "land on top of and
+// float above small prefab plant objects; bramble probably shouldn't be able to
+// support or hold voxels above it". A passable plant is one full SOLID cell
+// drawn as a small micro-model, so anything resting on it sat a voxel up.
+//
+// FIXTURE. A sealed stone box, four brambles on its floor, and one thing
+// dropped on each of three of them, each through a different door:
+//   A  sand          the CA powder fall (tryCrush in sim_step.wgsl)
+//   B  a lone stone  the CA one-voxel-island fall (soloSolid + tryCrush)
+//   C  a particle    grid ejecta, what a carve throws (sim_particle.wgsl)
+//   D  nothing       control: a plant with nothing on it stays a plant
+// Asserted: A, B, C each end ON THE FLOOR (the bramble under them crushed) with
+// air above; D is still a bramble.
+//
+// DIRECT PHASE CALLS ON PURPOSE (W2-O): a sim-only CA fixture in a sealed box,
+// like every ca-* gate in this file.
+Status GatePlantCrush(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+
+  uint32_t brambleId = 0, sandId = 0;
+  for (size_t i = 0; i < c.mats.size(); i++) {
+    if (c.mats[i].name == "bramble") brambleId = (uint32_t)i;
+    if (c.mats[i].name == "sand") sandId = (uint32_t)i;
+  }
+  if (!brambleId || !sandId) { detail = "no 'bramble' or 'sand' material"; return Status::Fail; }
+
+  const int px = 96, py = 120, pz = 96, kHalf = 9;
+  const int floorY = py, roofY = py + 12;
+  const int x0 = px - kHalf, x1 = px + kHalf, z0 = pz - kHalf, z1 = pz + kHalf;
+  const int plantY = floorY + 1, dropY = floorY + 5;
+  const int xA = px - 6, xB = px - 2, xC = px + 2, xD = px + 6;
+  const int kTicks = 160;
+
+  SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+  ctx.WaitIdle();
+
+  std::vector<CellOp> build, drops;
+  for (int z = z0 - 1; z <= z1 + 1; z++)
+    for (int x = x0 - 1; x <= x1 + 1; x++)
+      for (int y = floorY; y <= roofY; y++) {
+        const bool solid = x < x0 || x > x1 || z < z0 || z > z1 || y <= floorY || y >= roofY;
+        // In the same pass, never as a second op on the cell: two cell ops on
+        // one cell keep the FIRST (sim/oprecord.h), so a bramble appended
+        // after the box's air write would silently never exist.
+        const bool plant = y == plantY && z == pz &&
+                           (x == xA || x == xB || x == xC || x == xD);
+        build.push_back({World::SlotCellIndex({x, y, z}),
+                         plant ? (brambleId & 0xFFFu) : solid ? (uint32_t)kMatStone : 0u});
+      }
+  drops.push_back({World::SlotCellIndex({xA, dropY, pz}), sandId & 0xFFFu});
+  drops.push_back({World::SlotCellIndex({xB, dropY, pz}), (uint32_t)kMatStone});
+  // Cell centre in 24.8 fixed point, falling half a voxel a tick.
+  ParticleSpawn ps{};
+  ps.px = xC * 256 + 128; ps.py = (dropY + 2) * 256 + 128; ps.pz = pz * 256 + 128;
+  ps.vy = -128;
+  ps.payload = (uint32_t)kMatStone;
+
+  uint32_t t = 47000;
+  for (int i = 0; i < kTicks; i++) {
+    const std::vector<CellOp> ops = i == 0 ? build : i == 2 ? drops : std::vector<CellOp>{};
+    std::vector<ParticleSpawn> spawns;
+    if (i == 2) spawns.push_back(ps);
+    SubmitTick(ctx, world, sim, ++t, kDefaultSeed, {}, {}, ops, false,
+               {px >> 4, py >> 4, pz >> 4}, false, true, spawns);
+  }
+  ctx.WaitIdle();
+
+  std::vector<uint32_t> cbuf((size_t)kChunkVol);
+  auto matAt = [&](int x, int y, int z) -> uint32_t {
+    ReadVoxelsSync(ctx, world, World::SlotChunkIndex({x >> 4, y >> 4, z >> 4}), 1,
+                   cbuf.data(), "plantCrushVox");
+    return cbuf[(size_t)(x & 15) + (size_t)(y & 15) * 16 + (size_t)(z & 15) * 256] & 0xFFFu;
+  };
+  // Each column, floor up to the drop height: what is on the floor, and the
+  // highest non-air cell (the thing floating, if anything is).
+  struct Col { uint32_t floorMat; int top; };
+  auto column = [&](int x) {
+    Col col{matAt(x, plantY, pz), plantY - 1};
+    for (int y = plantY; y <= dropY + 3; y++)
+      if (matAt(x, y, pz) != 0) col.top = y;
+    return col;
+  };
+  const Col a = column(xA), b = column(xB), cc = column(xC), d = column(xD);
+  const bool okA = a.floorMat == sandId && a.top == plantY;
+  const bool okB = b.floorMat == (uint32_t)kMatStone && b.top == plantY;
+  const bool okC = cc.floorMat == (uint32_t)kMatStone && cc.top == plantY;
+  const bool okD = d.floorMat == brambleId && d.top == plantY;
+  const bool ok = okA && okB && okC && okD;
+  auto desc = [&](const Col& col) {
+    return Format("floor mat %u, top y+%d", col.floorMat, col.top - floorY);
+  };
+  detail = Format("sand %s [%s]; stone %s [%s]; particle %s [%s]; control %s [%s] "
+                  "(bramble %u, sand %u, stone %u)",
+                  okA ? "ok" : "FAIL", desc(a).c_str(), okB ? "ok" : "FAIL",
+                  desc(b).c_str(), okC ? "ok" : "FAIL", desc(cc).c_str(),
+                  okD ? "ok" : "FAIL", desc(d).c_str(), brambleId, sandId,
+                  (uint32_t)kMatStone);
+  std::printf("plant-crush: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 Status GateCaSlope(Ctx& c, std::string& detail) {
   const Status s = RunCaSlope(c, detail, {0, 0.90, true});
   std::printf("ca-slope: %s (%s)\n", s == Status::Pass ? "PASS" : "FAIL",
@@ -1786,6 +2071,8 @@ const std::vector<Gate>& CaGates() {
       {"ca-level", "sim", {}, false, GateCaLevel},
       {"ca-level-pond", "sim", {}, false, GateCaLevelPond},
       {"ca-gutter", "sim", {}, false, GateCaGutter},
+      {"oil-slick", "sim", {}, false, GateOilSlick},
+      {"plant-crush", "sim", {}, false, GatePlantCrush},
       // The other half of ca-gutter: the same rule at a real shoreline, with
       // nothing switched off. It moves the residency window and regenerates on
       // the way out, so it owes nothing to what ran before it.

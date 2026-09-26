@@ -353,6 +353,9 @@ Status GateDamageCause(Ctx& c, std::string& detail) {
         const bool worn = t == Tissue::Shell;
         const bool bloodless = worn || t == Tissue::Bloodless;
         const bool undead = t == Tissue::Rotten;
+        // Hair is ROOTED (2026-09-25, severpolicy.h): the four whole-limb
+        // severs an arm has are off for it, whatever the cause.
+        const bool hair = t == Tissue::Bloodless;
         // The old rate: `inBluntCarve_ ? (inUnarmedBlunt_ && unarmed >= 0 ?
         // unarmed : blunt) : 1`, as the kind of scale it picks (the >= 0
         // fallback is BleedRateScale's, and is not a property of the cause).
@@ -360,14 +363,14 @@ Status GateDamageCause(Ctx& c, std::string& detail) {
             inBluntCarve ? (inUnarmedBlunt ? BleedRate::Unarmed : BleedRate::Blunt)
                          : BleedRate::Full;
         // Mob::Damage
-        check(p.impactSevers == (!inBluntCarve && !worn), "impactSevers", cz,
+        check(p.impactSevers == (!inBluntCarve && !worn && !hair), "impactSevers", cz,
               eaten, t);
         check(p.hitBleed == (bloodless ? BleedRate::None : oldRate), "hitBleed",
               cz, eaten, t);
         check(p.vitalHpZeroDetaches == !(!inBluntCarve || !undead),
               "vitalHpZeroDetaches", cz, eaten, t);
         // Mob::HpZeroSevers
-        check(p.hpZeroSeversAny == (inBurnFlush && !inBluntCarve),
+        check(p.hpZeroSeversAny == (inBurnFlush && !inBluntCarve && !hair),
               "hpZeroSeversAny", cz, eaten, t);
         // Mob::JointRuleApplies
         const JointRule oldJoint =
@@ -375,7 +378,7 @@ Status GateDamageCause(Ctx& c, std::string& detail) {
             : inSpawnRot  ? JointRule::Never
             : !inBurnFlush ? JointRule::Always
                            : JointRule::IfInfected;
-        check(p.joint == oldJoint, "joint", cz, eaten, t);
+        check(p.joint == (hair ? JointRule::Never : oldJoint), "joint", cz, eaten, t);
         // Mob::CarveLimb
         check(p.chargesBrain == !inSpawnRot, "chargesBrain", cz, eaten, t);
         const bool oldBleeds = !inBurnFlush && !inSpawnRot && !bloodless;
@@ -386,7 +389,8 @@ Status GateDamageCause(Ctx& c, std::string& detail) {
         check(p.collapseSevers == !inBluntCarve, "collapseSevers", cz, eaten, t);
         check(p.carriesChildren == (!inBluntCarve && !inSpawnRot),
               "carriesChildren", cz, eaten, t);
-        check(p.cutThrough == inBladeCut, "cutThrough", cz, eaten, t);
+        check(p.cutThrough == (inBladeCut && !hair), "cutThrough", cz, eaten, t);
+        check(p.rooted == hair, "rooted", cz, eaten, t);
         // Mob::Sever
         check(p.deathBurnt == inBurnFlush, "deathBurnt", cz, eaten, t);
         check(p.gore == (!bloodless && !inBurnFlush), "gore", cz, eaten, t);
@@ -2729,44 +2733,32 @@ bool mobOk = false;
         const float runErr3 = std::fabs(wrapDeg(degOf(h3) - 90.0f));
         bool facesRun = runErr3 < 5.0f;
 
-        // 2. FIRST PERSON RECENTRES WHILE WALKING. Start the body 60 deg off
-        //    the view — inside the 70 deg cone, so the old code zeroed the
-        //    turn and the facing froze here forever, taking the arms with it.
-        //    Walking must converge it back toward the view.
+        // 2. FIRST PERSON FACES THE VIEW, ALWAYS. The walk basis is the
+        //    camera, so any body/view slack reads as walking crabwise. From
+        //    60 deg off (inside the old neck cone, where the facing used to
+        //    hold) and 140 deg off (past it, where it used to stop at the
+        //    cone edge), standing, walking W, strafing D and backpedalling S
+        //    must all square the body to the view.
         const float camF = 0.0f;
-        float hFroze = 60.0f / 57.29578f;
-        for (int i = 0; i < 400; i++)
-          hFroze = ResolveAvatarHeading(CameraMode::First, camF, hFroze,
-                                        Vec3{kWalk, 0, 0}, kDt);
-        const float driftErr = std::fabs(wrapDeg(degOf(hFroze)));
-        bool recentres = driftErr < 15.0f;
+        const Vec3 kVels[4] = {Vec3{}, Vec3{0, 0, kWalk}, Vec3{kWalk, 0, 0},
+                               Vec3{0, 0, -kWalk}};
+        const float kStarts[2] = {60.0f, 140.0f};
+        float fpWorst = 0.0f;
+        for (const Vec3& v : kVels)
+          for (float startDeg : kStarts) {
+            float h = startDeg / 57.29578f;
+            for (int i = 0; i < 400; i++)
+              h = ResolveAvatarHeading(CameraMode::First, camF, h, v, kDt);
+            fpWorst = std::max(fpWorst, std::fabs(wrapDeg(degOf(h))));
+          }
+        bool facesView = fpWorst < 2.0f;
 
-        // 3. STANDING STILL IT DOES NOT. That is the glance, and it is the
-        //    whole feature — a body that squares up while you stand there
-        //    would make every look a turn again.
-        float hStand = 60.0f / 57.29578f;
-        for (int i = 0; i < 400; i++)
-          hStand = ResolveAvatarHeading(CameraMode::First, camF, hStand,
-                                        Vec3{}, kDt);
-        const float standDeg = std::fabs(wrapDeg(degOf(hStand)));
-        bool holdsGlance = standDeg > 45.0f;
-
-        // 4. PAST THE CONE THE BODY IS DRAGGED even standing still, so the
-        //    neck is never asked for more than it has. 140 deg is well beyond
-        //    the 70 deg cone; the body must close to about the cone and stop.
-        float hFar = 140.0f / 57.29578f;
-        for (int i = 0; i < 400; i++)
-          hFar = ResolveAvatarHeading(CameraMode::First, camF, hFar, Vec3{},
-                                      kDt);
-        const float farDeg = std::fabs(wrapDeg(degOf(hFar)));
-        bool draggedToCone = farDeg > 55.0f && farDeg < 85.0f;
-
-        bool faceOk = facesRun && recentres && holdsGlance && draggedToCone;
+        bool faceOk = facesRun && facesView;
         std::printf(
             "avatar body facing: %s (3rd person run +X -> %.1f deg off; 1st "
-            "person 60 deg off recentres to %.1f walking, holds %.1f standing; "
-            "140 deg dragged to %.1f (cone 70))\n",
-            faceOk ? "PASS" : "FAIL", runErr3, driftErr, standDeg, farDeg);
+            "person worst %.1f deg off the view over standing/W/D/S from "
+            "60 and 140 deg off)\n",
+            faceOk ? "PASS" : "FAIL", runErr3, fpWorst);
         mobOk = mobOk && faceOk;
 
         // ---- swing aim policy (ResolveSwingYaw / ResolveSwingBasis) ----
@@ -8719,6 +8711,11 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
   int onRamp = 0, graded = 0, placed = 0;
   float prevTwo = 0, prevFoot = 0;
   bool everTargeted = false;
+  double breakAbs = 0, breakSpread = 0;
+  int breakTicks = 0, breakSegs = 0;
+  std::vector<int> spineParts;
+  for (const char* nm : {"hips", "torso"})
+    if (partIndex(nm) >= 0) spineParts.push_back(partIndex(nm));
   for (int i = 0; i < budget; i++) {
     tick();
     const Vec3 o = c.mobs.MobOrigin(id);
@@ -8768,6 +8765,45 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
           worstFloatAt = cz - (float)rampZ0;
         }
         sinkMax = std::max(sinkMax, surf - lowY);
+      }
+    }
+
+    // ---- the BREAKS: does the body wrap them, or bridge them like a plank? -
+    // The concave break at the foot of the ramp and the convex one at its
+    // crest, within half a body of either. Per segment of the lying body
+    // (hips, torso -- the head is held UP by the clip, on purpose), its
+    // CLOSEST APPROACH to the ground under it: the minimum over its drawn
+    // voxels of (voxel y - fixture surface under that voxel). A rigid body
+    // laid on one plane across a break touches in one place and hangs (or
+    // digs) everywhere else, so its segments disagree; a body that bends at
+    // its joints (Mob::ConformProneSegments) keeps each near its own ground.
+    // Reported: the mean |approach| over segments and ticks, and the mean
+    // per-tick SPREAD between the segments. SANDVOX_PRONE_RIGID=1 is the
+    // control arm in the same binary.
+    {
+      const float footZ = (float)rampZ0, crestZ = (float)(rampZ0 + kRampLen);
+      if (std::fabs(cz - footZ) <= half || std::fabs(cz - crestZ) <= half) {
+        float hi = -1e9f, lo = 1e9f;
+        int segs = 0;
+        for (int li : spineParts) {
+          if (!c.mobs.LimbBody(id, li)) continue;
+          const uint32_t nv = c.mobs.LimbVoxelCount(id, li);
+          if (nv == 0) continue;
+          float gap = 1e9f;
+          for (uint32_t v = 0; v < nv; v++) {
+            const Vec3 p = c.mobs.LimbVoxelPos(id, li, v);
+            gap = std::min(gap, p.y - fixtureSurface(ifloor(p.x), ifloor(p.z)));
+          }
+          breakAbs += std::fabs(gap);
+          breakSegs++;
+          hi = std::max(hi, gap);
+          lo = std::min(lo, gap);
+          segs++;
+        }
+        if (segs >= 2) {
+          breakSpread += hi - lo;
+          breakTicks++;
+        }
       }
     }
 
@@ -8849,7 +8885,16 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
   // the estimator under comparison, so that is a failure OF THE FIXTURE and is
   // reported as one rather than passing trivially.
   const bool steady = sdFoot > 0.03f && sdFit <= sdFoot * sdRatio;
-  const bool ok = moved && grounded && lying && steady && stateNow >= 0;
+  // THE BODY WRAPS THE BREAKS (Mob::ConformProneSegments): the lying
+  // segments agree about how near the ground they are. Measured 2026-09-25:
+  // 0.28 bending, 0.79 under SANDVOX_PRONE_RIGID=1.
+  const float breakSpreadAllowed =
+      (float)BaselineNumber("crawlSlopeBreakSpreadVox", 0.5);
+  const float breakSpreadMean =
+      breakTicks > 0 ? (float)(breakSpread / breakTicks) : 0.0f;
+  const bool wraps = breakTicks > 0 && breakSpreadMean <= breakSpreadAllowed;
+  const bool ok =
+      moved && grounded && lying && steady && wraps && stateNow >= 0;
 
   detail = Format(
       "ramp %d/%d cols in mirror, rises 0/1/2 per col, true mean grade %.3f "
@@ -8859,13 +8904,16 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
       "tilt avg %.1f vs %.1f deg (err max %.1f), range %.1f (max %.1f); grade "
       "sd fit %.4f vs footprint-probe %.4f = %.2fx (max %.2f), body-length "
       "two-probe %.4f; fit residual %.2f vox; body-height sd %.2f vox about "
-      "its own column, posed-clearance sd %.2f",
+      "its own column, posed-clearance sd %.2f; breaks: segment |gap| %.2f vox, "
+      "hips-torso spread %.2f vox (max %.2f), over %d ticks",
       rampSeen, kRampLen, meanGrade, wantTilt, stateNow, everTargeted ? 1 : 0,
       crawled, minCrawl,
       onRamp, graded, floatMax, floatAllowed, worstFloatAt, sinkMax,
       sinkAllowed, floatAny, tiltAvg, wantTilt, tiltErr, tiltRange, tiltSpan, sdFit,
       sdFoot, sdFoot > 0 ? sdFit / sdFoot : 0.0f, sdRatio, sdTwo, rough,
-      sdHeave, sdPose);
+      sdHeave, sdPose,
+      breakSegs > 0 ? (float)(breakAbs / breakSegs) : 0.0f,
+      breakSpreadMean, breakSpreadAllowed, breakTicks);
 
   SetCurrentTuning(savedGore);
   c.mobs.ClearPlayerActor();
@@ -8875,6 +8923,216 @@ Status GateCrawlSlope(Ctx& c, std::string& detail) {
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
   return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- crawl-still: a crawler that is NOT GOING ANYWHERE lies still ------------
+//
+// Owner report 2026-09-25: "stationary body crawling still is kicking its
+// legs out". A footless human (crawl.feet: both feet off, the legs kept) on
+// the flat under the immobile `dummy` profile, so nothing but the pose
+// pipeline can move it. Per tick, every leg bone's MODEL-frame direction is
+// compared with the tick before; `legMove` is the largest angle any leg bone
+// turned in one tick, `legSpan` the widest angle a bone wandered over the
+// whole window. A body lying still has both near zero. The origin's own drift
+// is reported beside them, because a leg that moves on a body that is
+// sliding is a different bug from one that moves on a body at rest.
+// Thresholds: tests/baseline.json crawlStill*.
+Status GateCrawlStill(Ctx& c, std::string& detail) {
+  c.debris.Reset();
+  c.mobs.Reset();
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const int defIndex = AiHumanoidDef(c.mobs);
+  if (defIndex < 0 || c.mobs.Behaviors().Find("dummy") < 0) {
+    detail = "no humanoid def / no \"dummy\" profile";
+    return Status::Fail;
+  }
+  const MobDef& def = c.mobs.Defs()[defIndex];
+  std::vector<int> legs;
+  int footL = -1, footR = -1;
+  for (size_t i = 0; i < def.limbs.size(); i++) {
+    const std::string& nm = def.limbs[i].name;
+    if (nm.rfind("leg", 0) == 0) legs.push_back((int)i);
+    if (nm == "foot.L") footL = (int)i;
+    if (nm == "foot.R") footR = (int)i;
+  }
+  if (legs.empty() || footL < 0 || footR < 0) {
+    detail = Format("%s has no legs / feet", def.name.c_str());
+    return Status::Fail;
+  }
+  int relief = 0;
+  const IVec3 anchor = AiFixtureCentre(c.world);
+  const IVec3 spot = AiFlatSpot(anchor.x, anchor.z, 96, 30, kDefaultSeed, relief);
+  AiTicker tick{c, 7700, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+  const Tuning savedGore = CurrentTuning();
+  {
+    Tuning tt = savedGore;
+    tt.gore.bleedHpPerVoxel = 0.0f;   // it must still be alive to crawl
+    SetCurrentTuning(tt);
+  }
+  std::string why;
+  const uint64_t id =
+      AiSpawn(c, defIndex,
+              {spot.x - (int)(def.worldSize.x * 0.5f), spot.y + 1,
+               spot.z - (int)(def.worldSize.z * 0.5f)},
+              "dummy", why);
+  auto done = [&](Status s) {
+    SetCurrentTuning(savedGore);
+    c.debris.Reset();
+    c.mobs.Reset();
+    SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+    c.ctx.WaitIdle();
+    return s;
+  };
+  if (id == 0) {
+    detail = why;
+    return done(Status::Fail);
+  }
+  for (int i = 0; i < 8; i++) tick();
+  c.mobs.Sever(id, footL);
+  c.mobs.Sever(id, footR);
+  for (int i = 0; i < 90; i++) tick();   // fall into the state, settle
+  const int state = c.mobs.LocoState(id);
+
+  const int ticks = (int)BaselineNumber("crawlStillTicks", 150.0);
+  std::vector<Vec3> prev(legs.size()), first(legs.size());
+  float legMove = 0.0f, legSpan = 0.0f, drift = 0.0f;
+  const Vec3 o0 = c.mobs.MobOrigin(id);
+  auto angle = [](Vec3 a, Vec3 b) {
+    return std::acos(std::clamp(a.dot(b), -1.0f, 1.0f)) * 57.29578f;
+  };
+  int live = 0;
+  for (int t = 0; t <= ticks; t++) {
+    if (t > 0) tick();
+    live = 0;
+    for (size_t k = 0; k < legs.size(); k++) {
+      if (!c.mobs.LimbBody(id, legs[k])) continue;
+      live++;
+      const Vec3 u = c.mobs.LimbModelUp(id, legs[k]).normalized();
+      if (t == 0) {
+        first[k] = u;
+      } else {
+        legMove = std::max(legMove, angle(u, prev[k]));
+        legSpan = std::max(legSpan, angle(u, first[k]));
+      }
+      prev[k] = u;
+    }
+    const Vec3 o = c.mobs.MobOrigin(id);
+    drift = std::max(drift, Vec3{o.x - o0.x, 0, o.z - o0.z}.len());
+  }
+
+  // ---- the PLAYER's body, which is what the owner was looking at -----------
+  // The same claim on a PlayerAvatar driven by a Player standing still
+  // (grounded, zero velocity), because the avatar takes its speed and its
+  // footing from the controller rather than from its own drive.
+  float avMove = 0.0f, avSpan = 0.0f, avLookMove = 0.0f, avTurnMove = 0.0f;
+  float avHeading = 0.0f;
+  int avState = -1, avLive = 0;
+  {
+    const std::string avDefName = kAvatarDefName;
+    PlayerAvatar avatar;
+    avatar.Init(&c.phys, &c.world, &c.debris, c.mats, &c.mobs);
+    avatar.SetDefs(&c.mobs.Defs(), avDefName);
+    Player pl;
+    pl.fly = false;
+    pl.grounded = true;
+    pl.pos = Vec3{(float)spot.x + 0.5f, (float)(spot.y + 1) + Player::kHalfY,
+                  (float)spot.z + 0.5f};
+    pl.vel = Vec3{};
+    uint32_t t = 7900;
+    auto avTick = [&]() {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> spawns;
+      std::vector<CellOp> cellOps;
+      // DIRECT PHASE CALLS ON PURPOSE (W2-O): the gate is this avatar's
+      // controller (a scripted Player), which the rig has no seam for yet.
+      avatar.PreTick(t + 1, pl, avHeading, kTickDt, c.world, ops, cellOps, spawns);
+      c.debris.QueueSupportEvents(c.world.Snap());
+      c.debris.PreTick(t + 1, c.world, cellOps, spawns);
+      ++t;
+      const IVec3 pc{ifloor(pl.pos.x) >> 4, ifloor(pl.pos.y) >> 4,
+                     ifloor(pl.pos.z) >> 4};
+      SubmitTick(c.ctx, c.world, c.sim, t, kDefaultSeed, ops, {}, cellOps,
+                 false, pc, true, false, spawns);
+      c.ctx.WaitIdle();
+      c.ctx.ProcessEvents();
+      c.phys.Step(kTickDt);
+      c.debris.PostStep();
+      avatar.PostStep();
+    };
+    if (avatar.Spawn(pl, 0.0f)) {
+      for (int i = 0; i < 20; i++) avTick();
+      avatar.SeverByName("foot.L");
+      avatar.SeverByName("foot.R");
+      for (int i = 0; i < 90; i++) avTick();
+      avState = avatar.Locomotion().stateIndex;
+      std::vector<Vec3> prevA(legs.size()), firstA(legs.size());
+      for (int tt = 0; tt <= ticks; tt++) {
+        if (tt > 0) avTick();
+        avLive = 0;
+        for (size_t k = 0; k < legs.size(); k++) {
+          const Vec3 u = avatar.PartModelUp(legs[k]).normalized();
+          if (u.len() < 0.5f) continue;
+          avLive++;
+          if (tt == 0) {
+            firstA[k] = u;
+          } else {
+            avMove = std::max(avMove, angle(u, prevA[k]));
+            avSpan = std::max(avSpan, angle(u, firstA[k]));
+          }
+          prevA[k] = u;
+        }
+      }
+      // ...then the two things a player does while "standing still": look
+      // around (the head-look turns the spine toward the camera) and turn
+      // the body (the heading follows the camera out of the neck's cone).
+      auto legSweep = [&](auto&& step, int n) {
+        std::vector<Vec3> pv(legs.size());
+        float mv = 0.0f;
+        for (int tt = 0; tt <= n; tt++) {
+          if (tt > 0) {
+            step(tt);
+            avTick();
+          }
+          for (size_t k = 0; k < legs.size(); k++) {
+            const Vec3 u = avatar.PartModelUp(legs[k]).normalized();
+            if (u.len() < 0.5f) continue;
+            if (tt > 0) mv = std::max(mv, angle(u, pv[k]));
+            pv[k] = u;
+          }
+        }
+        return mv;
+      };
+      avLookMove = legSweep(
+          [&](int tt) {
+            avatar.SetLook(1.0f * std::sin((float)tt * 0.08f),
+                           0.4f * std::sin((float)tt * 0.05f));
+          },
+          150);
+      avatar.SetLook(0.0f, 0.0f);
+      for (int i = 0; i < 30; i++) avTick();
+      avTurnMove = legSweep(
+          [&](int tt) { avHeading = 0.03f * (float)tt; }, 100);
+      avatar.Despawn();
+    }
+  }
+  const float moveMax = (float)BaselineNumber("crawlStillLegMoveDeg", 1.0);
+  const float spanMax = (float)BaselineNumber("crawlStillLegSpanDeg", 3.0);
+  const bool ok = state >= 0 && live > 0 && drift < 1.0f &&
+                  legMove <= moveMax && legSpan <= spanMax && avState >= 0 &&
+                  avLive > 0 && avMove <= moveMax && avSpan <= spanMax;
+  detail = Format("state %d (%s), %d leg bones, origin drift %.2f vox over %d "
+                  "ticks; leg bone per-tick turn max %.2f deg (max %.2f), "
+                  "wander %.2f deg (max %.2f); PLAYER avatar state %d, %d leg "
+                  "bones, turn max %.2f deg, wander %.2f deg; looking around "
+                  "%.2f deg/tick, turning in place %.2f deg/tick (reported)",
+                  state,
+                  state >= 0 && state < (int)def.skel.states.size()
+                      ? def.skel.states[state].name.c_str()
+                      : "-",
+                  live, drift, ticks, legMove, moveMax, legSpan, spanMax,
+                  avState, avLive, avMove, avSpan, avLookMove, avTurnMove);
+  return done(ok ? Status::Pass : Status::Fail);
 }
 
 // ---- LIVE RAGDOLL (DESIGN.md "A creature knocked down gets back up") --------
@@ -8983,14 +9241,45 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
   ok = ok && blastOk;
 
   // ---- B. the get-up -------------------------------------------------------
+  // WHILE it gets up (phase 2), how the body gets there: `getUpDig` is the
+  // deepest any limb voxel goes below the flat fixture's surface, `getUpPath`
+  // the mean distance a limb voxel travels over the whole get-up. A body
+  // that swivels through the floor to reach its pose scores badly on both;
+  // one that rolls over and rises (Mob::SubmitPose's get-up) does not.
+  // SANDVOX_GETUP_LEGACY=1 is the per-limb blend it replaced.
   int upAt = -1;
+  float getUpDig = 0.0f;
+  double getUpPath = 0.0;
+  int getUpTicks = 0;
+  std::vector<Vec3> prevVox;
   for (int i = 0; i < getUpMaxTicks; i++) {
     tickOnce();
+    if (mobs.RagdollPhaseOf(id) == 2) {
+      std::vector<Vec3> vox;
+      for (int li = 0; li < nLimbs; li++) {
+        if (!mobs.LimbBody(id, li)) continue;
+        const uint32_t nv = mobs.LimbVoxelCount(id, li);
+        for (uint32_t v = 0; v < nv; v += 4) vox.push_back(mobs.LimbVoxelPos(id, li, v));
+      }
+      for (const Vec3& p : vox)
+        getUpDig = std::max(getUpDig, (float)(h + 1) - p.y);
+      if (prevVox.size() == vox.size() && !vox.empty()) {
+        double step = 0.0;
+        for (size_t k = 0; k < vox.size(); k++) step += (vox[k] - prevVox[k]).len();
+        getUpPath += step / (double)vox.size();
+      }
+      prevVox = vox;
+      getUpTicks++;
+    }
     if (mobs.RagdollPhaseOf(id) == 0) {
       upAt = i + 1;
       break;
     }
   }
+  std::printf("  ragdoll get-up motion: deepest limb voxel %.2f vox under the "
+              "surface, mean voxel path %.1f vox over %d get-up ticks%s\n",
+              getUpDig, getUpPath, getUpTicks,
+              std::getenv("SANDVOX_GETUP_LEGACY") ? " (LEGACY blend)" : "");
   const Vec3 up = mobs.MobOrigin(id);
   const int gh = World::TerrainHeight(ifloor(up.x + 1.5f), ifloor(up.z + 1.5f),
                                       kDefaultSeed);
@@ -9399,6 +9688,79 @@ Status GateRagdoll(Ctx& c, std::string& detail) {
                 rgt.blastMaxSpin, ratio[0], ratio[1], maxRatio, upX[0], upX[1],
                 upX[1] - upX[0], minTiltGap, knockedF[0], knockedF[1]);
     ok = ok && spinOk;
+  }
+
+  // ---- G. the ROLL-OVER: a human knocked onto its BACK gets up without ------
+  // swivelling through the floor. A charge in front of the chest puts the
+  // body down face-up, the case the old per-limb world-space blend handled
+  // worst: every limb slerped on its own shortest arc to a face-down crouch,
+  // sweeping the body's length underground. Mob::SubmitPose's get-up now rolls
+  // the pelvis over about its own spine first and carries the limbs with it.
+  // REPORTED, with SANDVOX_GETUP_LEGACY=1 as the same-binary control arm:
+  // `faceUp` says whether the fixture produced the case at all.
+  {
+    mobs.Reset();
+    debris.Reset();
+    SubmitWorldgen(ctx, world, sim, kDefaultSeed);
+    ctx.WaitIdle();
+    const int nWiz = (int)mobs.Defs()[wizDef].limbs.size();
+    const int rootLimb = mobs.Defs()[wizDef].rootLimb;
+    const uint64_t wid = mobs.Spawn(wizDef, {spot.x, h + 1, spot.z});
+    if (wid != 0) {
+      for (int i = 0; i < 45; i++) tickOnce();
+      const Vec3 w0 = mobs.MobRootPos(wid);
+      const Vec3 face = mobs.MobFacing(wid);
+      const float probeY = w0.y + 0.4f / kVoxelMeters;
+      const Vec3 ec3{w0.x + face.x * 6.0f, probeY + 6.0f, w0.z + face.z * 6.0f};
+      const int knockedG = mobs.BlastMobsRadial(ec3, reach, impulse);
+      float faceUpY = 0.0f, dig = 0.0f;
+      double path = 0.0;
+      int ticks = 0, upAt = -1;
+      bool sawGetUp = false;
+      std::vector<Vec3> prev;
+      for (int i = 0; i < getUpMaxTicks * 2; i++) {
+        tickOnce();
+        const int ph = mobs.RagdollPhaseOf(wid);
+        if (ph == 2) {
+          if (!sawGetUp) {
+            // How the pelvis lay when the get-up began: its front's height.
+            // (GetTransform reads the kinematic body where the ragdoll left it.)
+            BodyTransform xf{};
+            if (rootLimb >= 0 &&
+                phys.GetTransform(mobs.LimbBody(wid, rootLimb), xf)) {
+              const Quat q{xf.quat[0], xf.quat[1], xf.quat[2], xf.quat[3]};
+              faceUpY = QuatRotate(q, Vec3{0, 0, 1}).y;
+            }
+            sawGetUp = true;
+          }
+          std::vector<Vec3> vox;
+          for (int li = 0; li < nWiz; li++) {
+            if (!mobs.LimbBody(wid, li)) continue;
+            const uint32_t nv = mobs.LimbVoxelCount(wid, li);
+            for (uint32_t v = 0; v < nv; v += 4)
+              vox.push_back(mobs.LimbVoxelPos(wid, li, v));
+          }
+          for (const Vec3& p : vox) dig = std::max(dig, (float)(h + 1) - p.y);
+          if (prev.size() == vox.size() && !vox.empty()) {
+            double step = 0.0;
+            for (size_t k = 0; k < vox.size(); k++) step += (vox[k] - prev[k]).len();
+            path += step / (double)vox.size();
+          }
+          prev = vox;
+          ticks++;
+        }
+        if (sawGetUp && ph == 0) {
+          upAt = i + 1;
+          break;
+        }
+      }
+      std::printf("  ragdoll roll-over: knocked %d, get-up began with the pelvis "
+                  "front at y %.2f (%s), deepest limb voxel %.2f vox under the "
+                  "surface, mean voxel path %.1f vox over %d ticks, up at %d%s\n",
+                  knockedG, faceUpY, faceUpY > 0.5f ? "FACE UP" : "not face up",
+                  dig, path, ticks, upAt,
+                  std::getenv("SANDVOX_GETUP_LEGACY") ? " (LEGACY blend)" : "");
+    }
   }
 
   mobs.Reset();
@@ -14317,6 +14679,7 @@ const std::vector<Gate>& MobGates() {
       {"ai-rules", "mob", {}, false, GateAiRules, /*needsRender=*/false},
       // A body with no legs lies ON the slope and stops re-aiming every voxel.
       {"crawl-slope", "mob", {}, false, GateCrawlSlope, /*needsRender=*/false},
+      {"crawl-still", "mob", {}, false, GateCrawlStill, /*needsRender=*/false},
       // Live ragdoll: blast knockdown, get-up, NPC gravity. Counts only.
       {"ragdoll", "mob", {}, false, GateRagdoll, /*needsRender=*/false},
       // ...and what a limp landing COSTS. Its own gate rather than another

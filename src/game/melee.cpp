@@ -677,6 +677,18 @@ StrikeParts BuildStrikeParts(const EdgeSweep& s, const Vec3& at,
   // so how deep the wound goes is: how fast, how well-angled, how much sword.
   p.cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
   p.cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
+  // ...AND HOW FAR IT COULD GO (phys/kerf.h KerfBite). The edge's reach is the
+  // blade that was swung -- `seg` is the whole edge at this sub-step -- and the
+  // cleave is what a committed swing of this much sword has past the chip.
+  // Squared in the excess power, so it is the top of the range or nothing:
+  // a square, fast blow of a heavy blade across a neck goes through; a lazy
+  // one, a glancing one, or a light one chips it like any other.
+  p.cut.edgeHalf = seg.len() * 0.5f;
+  {
+    const float from = std::clamp(goreT.cleaveFrom, 0.0f, 0.95f);
+    const float x = std::clamp((power - from) / (1.0f - from), 0.0f, 1.0f);
+    p.cut.cleave = std::max(goreT.cleaveArea, 0.0f) * s.heft * x * x;
+  }
   p.cut.power = power;
   p.cut.seed = hitSeed;
   // ---- THE BLUNT PART -----------------------------------------------------
@@ -822,8 +834,6 @@ constexpr float kCoverReach = 6.0f;
 //                            nothing pulls it toward a pose, and the clamps act
 //                            on the STORED value so pushing into one banks
 //                            nothing that has to be wound back.
-//   swingAz_/El_/Out_        the committed cut's follow-through, ADDED to the
-//                            above. This is the only thing that decays.
 //   bladeDirL_/FlatL_/poleL_ derived, smoothed, in the basis frame.
 //
 // Azimuth is measured from +z (`fwd`) toward +x (`right`), so 0 is straight
@@ -1390,7 +1400,6 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
 void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
   const Tuning::Melee& m = t.melee;
   dst.commitSpeed = m.commitSpeed;
-  dst.slashTime = m.slashTime;
   dst.recoverTime = m.recoverTime;
   dst.fullSpeed = MetresPerSecToCells(m.fullSpeedMps);   // m/s -> voxels/s
   dst.minSpeed = MetresPerSecToCells(m.minSpeedMps);
@@ -1411,9 +1420,6 @@ void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
   dst.guardUp = MetresToCells(m.guardUpM);
   dst.guardSide = MetresToCells(m.guardSideM);
   dst.dirSmoothing = m.dirSmoothing;
-  dst.swingArc = m.swingArc;
-  dst.swingAnticipate = m.swingAnticipate;
-  dst.swingExtend = m.swingExtend;
   dst.bladeSmoothing = m.bladeSmoothing;
   dst.wristMaxAngle = m.wristMaxAngle;
   dst.steerSpeedLo = MetresPerSecToCells(m.steerSpeedLoMps);
@@ -1436,9 +1442,9 @@ void ApplyMeleeTuning(MeleeTuning& dst, const Tuning& t) {
   dst.leanFlipHold = m.leanFlipHold;
   dst.leanMinSpeed = MetresPerSecToCells(m.leanMinSpeed);  // m/s -> voxels/s
   dst.flatMinSin = m.flatMinSin;
-  // `controlMode`/`pickMinSpeed` are DELIBERATELY not copied: they are the
-  // controller's switch, read off CurrentTuning() at the one site in main.cpp,
-  // and a cached copy here could disagree with it across an F5 (tuning.h).
+  // `pickMinSpeed` is DELIBERATELY not copied: it is the strike picker's,
+  // read off CurrentTuning() at the one site in session.cpp, and a cached copy
+  // here could disagree with it across an F5 (tuning.h).
 }
 
 void ApplyMeleeTuning(MeleeTuning& dst) { ApplyMeleeTuning(dst, CurrentTuning()); }
@@ -1560,15 +1566,9 @@ void MeleeState::Arrest() {
   // a stroke already recovering must not have its recover restarted — a caller
   // that sees a parry on three consecutive ticks would otherwise hold the arm
   // in Recover forever.
-  if (phase_ != SwingPhase::Wind && phase_ != SwingPhase::Slash) return;
+  if (phase_ != SwingPhase::Wind) return;
   phase_ = SwingPhase::Recover;
   phaseTime_ = 0;
-  // The follow-through the cut had left does NOT happen: the arc decays from
-  // wherever the blade was stopped, which is what makes a parry read as the
-  // blow being checked rather than as the animation finishing anyway.
-  swingAz_ = 0;
-  swingEl_ = 0;
-  swingOut_ = 0;
   // The button is still down (that is what a parry mid-swing means), so the
   // arm is kept rather than handed back — see PoseWeight.
   recoverHold_ = true;
@@ -1589,11 +1589,8 @@ void MeleeState::Reset() {
   inputAccum_ = Vec3{};
   mouseVel_ = Vec3{};
   mouseSpeed_ = 0;
-  cutDir_ = Vec3{};
-  cutAz_ = cutEl_ = 0;
   az_ = el_ = radius_ = 0;
   azLive_ = elLive_ = radLive_ = 0;
-  swingAz_ = swingEl_ = swingOut_ = 0;
   tipPrev_ = Vec3{};
   tipVel_ = Vec3{};
   tangent_ = Vec3{};
@@ -1647,15 +1644,15 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   float rLo = 0, rHi = 0, rHand = 0;
   RadiusBand(rLo, rHi, rHand);
 
-  // THE TOTAL, clamped: the steered stroke plus the cut's follow-through. az_
-  // and el_ were already clamped as they were integrated (that is what banks
-  // nothing); this second clamp is on the SUM, because a follow-through must
-  // not carry the point past vertical or through the far shoulder either.
+  // THE STROKE, clamped. az_ and el_ were already clamped as they were
+  // integrated (that is what banks nothing); the radius band can move under a
+  // stored radius (the arm's reach is re-read every tick), so it is clamped
+  // again here.
   const float azHi = handSign_ > 0 ? tuning.azOut : tuning.azAcross;
   const float azLo = handSign_ > 0 ? -tuning.azAcross : -tuning.azOut;
-  const float azSum = std::clamp(az_ + swingAz_, azLo, azHi);
-  const float elSum = std::clamp(el_ + swingEl_, tuning.elMin, tuning.elMax);
-  const float rSum = std::clamp(radius_ + swingOut_, rLo, rHi);
+  const float azSum = std::clamp(az_, azLo, azHi);
+  const float elSum = std::clamp(el_, tuning.elMin, tuning.elMax);
+  const float rSum = std::clamp(radius_, rLo, rHi);
 
   // ---- THE ARM'S OWN SMOOTHING, before anything is built ------------------
   // Eased HERE, on the clamped sums, so the whole derived assembly — tip,
@@ -2109,11 +2106,9 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   // what the rig's wrist is asked to align the blade to (Pose()). Separate on
   // purpose — "unique smoothing per joint": a whipping tip may re-aim the
   // exact frame in a couple of ticks, and passing that straight to the wrist
-  // is the reported fist-twitch. Chasing 3x faster through a Slash keeps a
-  // committed cut's edge crisp (edge alignment is damage, MeleeEdgeAlign).
+  // is the reported fist-twitch.
   {
-    const float hl =
-        tuning.wristSmoothing * (phase_ == SwingPhase::Slash ? 0.35f : 1.0f);
+    const float hl = tuning.wristSmoothing;
     const float aw = framePrimed_ ? SmoothAlpha(hl, dt) : 1.0f;
     wristDirL_ = Lerp(wristDirL_, bladeDirL_, aw);
     wristDirL_ =
@@ -2225,14 +2220,15 @@ void MeleeState::RebuildFrame(float dt, const Vec3& right, const Vec3& up,
   // frame's, and a pair that could be set to disagree with it would only ever
   // be set wrong. Attack is half that halflife, release four times it.
   {
-    // ONLY SLASH FORCES FULL ALIGNMENT. Wind and Recover used to as well,
-    // and that was the overhead-strike wrist wrench: raising the sword IS
-    // Wind, so the raise itself laid the blade onto the radius. Everywhere
-    // outside a committed cut the wrist earns alignment from tip speed alone
-    // and otherwise rides the grip — blade up out of the fist, which is the
-    // "generally point upwards" a held sword should do.
+    // NO PHASE FORCES FULL ALIGNMENT. Wind and Recover used to, and that was
+    // the overhead-strike wrist wrench: raising the sword IS Wind, so the
+    // raise itself laid the blade onto the radius. (The removed Slash phase
+    // forced it too.) The wrist earns alignment from tip speed alone and
+    // otherwise rides the grip — blade up out of the fist, which is the
+    // "generally point upwards" a held sword should do. A fast authored cut
+    // is fast, so it earns full alignment the same way.
     float want = 1.0f;
-    if (phase_ != SwingPhase::Slash) {
+    if (!programDrive_) {
       const float floorF = std::clamp(tuning.steerFloor, 0.0f, 1.0f);
       const float lo = std::max(tuning.steerSpeedLo, 0.0f);
       const float hi = std::max(tuning.steerSpeedHi, lo + 1e-3f);
@@ -2271,22 +2267,6 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
   inputAccum_ = Vec3{};
   mouseVel_ = Lerp(mouseVel_, instant, SmoothAlpha(tuning.dirSmoothing, dt));
   mouseSpeed_ = std::sqrt(mouseVel_.x * mouseVel_.x + mouseVel_.y * mouseVel_.y);
-
-  // Screen motion -> a direction in CONTROL space (azimuth, elevation). Screen
-  // +y is DOWN, so it maps to -elevation: a downward flick must cut downward,
-  // and getting this sign wrong produces a weapon that mirrors the player's
-  // hand, which reads as broken long before anyone works out why.
-  //
-  // THE SAME MAPPING THE STROKE MOVES BY, gains included, so the cut direction
-  // is by construction the direction the point is already travelling. Built
-  // from the smoothed VELOCITY rather than this tick's raw delta because one
-  // tick is far too noisy to steer a cut with.
-  const float gAz = mouseVel_.x * tuning.aimGainX;
-  const float gEl = -mouseVel_.y * tuning.aimGainY;
-  const float gLen = std::sqrt(gAz * gAz + gEl * gEl);
-  const bool haveDir = gLen > 1e-9f;
-  const float dirAz = haveDir ? gAz / gLen : 0.0f;
-  const float dirEl = haveDir ? gEl / gLen : 0.0f;
 
   if (!armed) {
     // Unarmed: collapse to idle and forget any half-built swing, so picking a
@@ -2354,7 +2334,6 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
         azLive_ = az_;
         elLive_ = el_;
         radLive_ = radius_;
-        swingAz_ = swingEl_ = swingOut_ = 0;
 
         // SEED THE DERIVED FRAME FROM THE BLADE ITSELF, and skip this tick's
         // rebuild entirely. One tick of smoothing toward the commanded frame
@@ -2429,62 +2408,28 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
         phaseTime_ = 0;
         break;
       }
+      // Wind is only a LABEL now (the input is moving briskly); Arrest reads
+      // it as "a live cut". THERE IS NO SPEED-TRIGGERED COMMIT (removed
+      // 2026-09-25): every stroke is an authored program (game/strokes.h) and
+      // the program's own Cut phase is the cut. A driver that ALSO fired its
+      // own Slash above `commitSpeed` added a fixed two-radian arc, in the
+      // smoothed input direction, on top of the program's path — two
+      // controllers on one arm, and the "a short cut tweaks out / the dagger
+      // teleports above the head" report.
       phase_ = mouseSpeed_ > tuning.commitSpeed * 0.35f ? SwingPhase::Wind
                                                         : SwingPhase::Guard;
-      // COMMIT. The ARC's direction is frozen here and not touched again until
-      // the slash ends: a cut whose own arc keeps re-steering mid-swing feels
-      // like dragging the blade through treacle. (The player's steering is NOT
-      // frozen — az_/el_ keep integrating underneath, which is the
-      // follow-through melee.h promises.) commitSpeed is measured on TRUE input
-      // speed, so it means the same thing at every value of the aim gains.
-      if (mouseSpeed_ > tuning.commitSpeed && haveDir) {
-        cutAz_ = dirAz;
-        cutEl_ = dirEl;
-        cutDir_ = (right * dirAz + up * dirEl).normalized();
-        phase_ = SwingPhase::Slash;
-        phaseTime_ = 0;
-      }
       break;
     }
 
-    case SwingPhase::Slash:
-      if (phaseTime_ >= tuning.slashTime) {
-        // FOLD THE ARC INTO THE STROKE. A cut ENDS WHERE IT WENT: after a full
-        // sweep the sword really is across your body, and the player steers it
-        // back from there. Unwinding the arc over the recover instead — which
-        // the previous law did, because its arc was centred on the hand and
-        // only half of it was follow-through — would drag the blade two
-        // radians backwards through the target it had just passed through.
-        //
-        // Continuous by construction: at e = 1 the arc is exactly `swingAz_`,
-        // so moving it from one accumulator to the other changes no geometry.
-        // `swingOut_` is deliberately NOT folded — the mid-stroke bulge is a
-        // shape, not a destination, and it belongs back at the steered radius.
-        az_ = std::clamp(az_ + swingAz_, azLo, azHi);
-        el_ = std::clamp(el_ + swingEl_, tuning.elMin, tuning.elMax);
-        swingAz_ = swingEl_ = 0;
-        recoverHold_ = armed && held;
-        phase_ = SwingPhase::Recover;
-        phaseTime_ = 0;
-      }
-      break;
-
     case SwingPhase::Recover:
-      // ---- THE BUTTON WENT UP MID-FOLLOW-THROUGH (2026-09-21) ------------
+      // ---- THE BUTTON WENT UP MID-RECOVER (2026-09-21) -------------------
       //
-      // `recoverHold_` is latched at the Slash -> Recover transition — "the
-      // button is still down, so the arm is kept rather than handed back" —
-      // and until now there was NO PATH THAT EVER CLEARED IT. Every stroke
-      // that committed a cut and then released therefore held PoseWeight at a
-      // full 1.0 for the whole recover and dropped it to 0 on the single tick
-      // this phase ended, because the exit goes to Idle and Idle's weight is
-      // zero. The rig blends the ENTIRE two-bone solve and the wrist by that
-      // number (Mob::ApplyWeaponArm's `weight`), so a one-tick 1 -> 0 step is
-      // the arm snapping from the end of the swing to the walk pose in one
-      // frame. That is the reported "looks good for 60% of the animation and
-      // then the sword teleports", and it fired on every authored style:
-      // slashTime is 0.17 s and every cut phase is longer than that, so the
-      // driver was always in Recover-while-held when the program released.
+      // `recoverHold_` is latched by Arrest — "the button is still down, so
+      // the arm is kept rather than handed back". If nothing cleared it, a
+      // release would hold PoseWeight at 1.0 for the whole recover and drop it
+      // to 0 on the single tick this phase ended (the exit goes to Idle), and
+      // the rig blends the ENTIRE two-bone solve by that number — the arm
+      // snapping to the walk pose in one frame ("the sword teleports").
       //
       // Clearing the latch hands the fade back to PoseWeight's ramp, and
       // restarting the clock is what makes it a FULL recoverTime from the
@@ -2496,7 +2441,6 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
       if (phaseTime_ >= RecoverTime()) {
         phase_ = (armed && held) ? SwingPhase::Guard : SwingPhase::Idle;
         phaseTime_ = 0;
-        swingAz_ = swingEl_ = swingOut_ = 0;
       }
       break;
   }
@@ -2507,11 +2451,6 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
   // which is what makes the blade aimable — you can put it high on the right
   // and leave it there, and the next push starts from there.
   //
-  // Integration continues THROUGH the slash on purpose: the mouse is still
-  // moving during those 170 ms and the arc below is added on top, so a cut is
-  // the player's own travel plus a follow-through rather than a canned stroke
-  // that ignores the second half of the flick.
-  //
   // THE CLAMPS ARE ON THE STORED VALUE, not on a target derived from it. That
   // is what stops a sustained push into a stop from banking travel that has to
   // be wound back before the blade moves again.
@@ -2520,74 +2459,6 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
     el_ =
         std::clamp(el_ - delta.y * tuning.aimGainY, tuning.elMin, tuning.elMax);
     radius_ = std::clamp(radius_ + delta.z * tuning.reachGain, rLo, rHi);
-  }
-
-  switch (phase_) {
-    case SwingPhase::Slash: {
-      // THE CUT, as an arc ADDED to the stroke the player is steering: the
-      // point travels from the near side of the cut direction, through where
-      // the player has it aimed, out to the far side — so the blade passes
-      // ACROSS the wielder's front rather than poking outward. `t` is eased so
-      // the middle of the stroke is the fast part, which is both how a real cut
-      // works and what makes the speed-scaled damage land at the middle of the
-      // arc where the player aimed.
-      //
-      // The arc BOWS OUTWARD (swingOut_) instead of holding one radius: an arm
-      // swings about a shoulder and is furthest from the body at mid-stroke.
-      // That bulge is also what carries the blade through a target rather than
-      // past it, and it is the radial channel earning its keep.
-      const float t =
-          std::clamp(phaseTime_ / std::max(tuning.slashTime, 1e-4f), 0.0f, 1.0f);
-      const float e = t * t * (3.0f - 2.0f * t);   // smoothstep
-      const float bow = 4.0f * e * (1.0f - e);     // 0 at the ends, 1 mid
-      // The anticipation rides on the same bow, so it is zero at both ends:
-      // no pop on the tick that commits, and the arc still finishes at exactly
-      // one `swingArc` for the fold above to absorb.
-      const float drive = e - tuning.swingAnticipate * bow;
-      // ---- AND THE ARC IS THE BLADE'S, NOT A CONSTANT (2026-09-15) --------
-      //
-      // `cutAz_`/`cutEl_` are a UNIT direction and `swingArc` is a flat 2.0
-      // radians, so every committed cut got the same two radians of
-      // follow-through whatever it had asked for. For a sword that IS the law
-      // -- the blade's own momentum carries it across your body and the player
-      // steers back from there, which is what the fold above is about. For a
-      // FIST it is a defect with no defence: `player_punch_r` authors 0.24 rad
-      // of azimuth and commanded 2.45, and `npc-styles` reported the thrust
-      // turning into a swing on a 10.75-voxel hooking knuckle path.
-      //
-      // THE FOLLOW-THROUGH IS THE WEAPON'S MOMENTUM, so it scales with how
-      // much weapon there is past the hand. `bladeLen_` is the length the
-      // driver already holds and already builds the whole lean geometry from,
-      // and it is ZERO for a bladeless weapon by construction (a chain
-      // effector reports its tip at its hand -- mob.cpp says why), so a punch
-      // ends where it was driven and a sword is untouched.
-      //
-      // The reference is half a metre of blade, in METRES so it follows
-      // kVoxelMeters like every other length here: a sword (5.5 voxels at
-      // 10 cm) saturates at the full authored arc, a mace (4.5) keeps 0.9, a
-      // set of jaws (1.65) gets a third of one, a fist none.
-      const float kArcBladeRef = MetresToCells(0.50f);
-      const float arcScale =
-          std::clamp(bladeLen_ / std::max(kArcBladeRef, 1e-3f), 0.0f, 1.0f);
-      swingAz_ = cutAz_ * tuning.swingArc * arcScale * drive;
-      swingEl_ = cutEl_ * tuning.swingArc * arcScale * drive;
-      swingOut_ = bow * tuning.swingExtend * tipReach;
-      break;
-    }
-
-    case SwingPhase::Recover: {
-      // Unwind only the follow-through. The steered stroke is untouched, so a
-      // cut ENDS where the mouse ended — the blade does not spring back to a
-      // guard the player never asked for.
-      const float k = SmoothAlpha(0.07f, dt);
-      swingAz_ += (0.0f - swingAz_) * k;
-      swingEl_ += (0.0f - swingEl_) * k;
-      swingOut_ += (0.0f - swingOut_) * k;
-      break;
-    }
-
-    default:
-      break;
   }
 
   if (phase_ == SwingPhase::Idle) {
@@ -2606,5 +2477,6 @@ void MeleeState::Update(float dt, bool held, bool armed, const Vec3& right,
   if (wristDir_.len() < 1e-4f) wristDir_ = bladeDir_;
   if (wristFlat_.len() < 1e-4f) wristFlat_ = bladeFlat_;
   if (bendPole_.len() < 1e-4f) bendPole_ = fwd * -1.0f;
+  programDrive_ = false;   // one-shot: the NEXT step must ask again
 }
 

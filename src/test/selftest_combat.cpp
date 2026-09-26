@@ -33,7 +33,7 @@
 //
 // AND WHY IT ASSERTS THE CLAMPS. The clamps are not taste (see the long note in
 // LoadTuning's melee block): each one protects a structural property that a
-// slider dragged to its end otherwise breaks outright — a zero slashTime
+// slider dragged to its end otherwise breaks outright — a zero recoverTime
 // divides, a zero speed BAND makes the damage ramp singular, a zero smoothing
 // halflife is a step function into the degenerate lean. A clamp that silently
 // stopped clamping would surface as a division by zero in a swing, weeks later.
@@ -149,7 +149,6 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
   };
   static const Probe kProbes[] = {
       {"melee", "commitSpeed", 1234.0f, [](const Tuning& t) { return t.melee.commitSpeed; }},
-      {"melee", "slashTime", 0.29f, [](const Tuning& t) { return t.melee.slashTime; }},
       {"melee", "recoverTime", 0.31f, [](const Tuning& t) { return t.melee.recoverTime; }},
       {"melee", "fullSpeedMps", 5.25f, [](const Tuning& t) { return t.melee.fullSpeedMps; }},
       {"melee", "minSpeedMps", 1.75f, [](const Tuning& t) { return t.melee.minSpeedMps; }},
@@ -170,9 +169,6 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
       {"melee", "guardUpM", 0.42f, [](const Tuning& t) { return t.melee.guardUpM; }},
       {"melee", "guardSideM", 0.43f, [](const Tuning& t) { return t.melee.guardSideM; }},
       {"melee", "dirSmoothing", 0.11f, [](const Tuning& t) { return t.melee.dirSmoothing; }},
-      {"melee", "swingArc", 1.61f, [](const Tuning& t) { return t.melee.swingArc; }},
-      {"melee", "swingAnticipate", 0.51f, [](const Tuning& t) { return t.melee.swingAnticipate; }},
-      {"melee", "swingExtend", 0.31f, [](const Tuning& t) { return t.melee.swingExtend; }},
       {"melee", "bladeSmoothing", 0.081f, [](const Tuning& t) { return t.melee.bladeSmoothing; }},
       {"melee", "wristMaxAngle", 1.11f, [](const Tuning& t) { return t.melee.wristMaxAngle; }},
       {"melee", "edgeFloor", 0.51f, [](const Tuning& t) { return t.melee.edgeFloor; }},
@@ -180,9 +176,6 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
       {"melee", "blockItemDamage", 0.61f, [](const Tuning& t) { return t.melee.blockItemDamage; }},
       {"melee", "blockNudgeAz", 0.41f, [](const Tuning& t) { return t.melee.blockNudgeAz; }},
       {"melee", "blockNudgeEl", 0.31f, [](const Tuning& t) { return t.melee.blockNudgeEl; }},
-      // controlMode is an int read by ReadI; 1.0f streams as the literal `1`,
-      // which is the only non-default value the [0,1] clamp band has.
-      {"melee", "controlMode", 1.0f, [](const Tuning& t) { return (float)t.melee.controlMode; }},
       {"melee", "pickMinSpeed", 333.0f, [](const Tuning& t) { return t.melee.pickMinSpeed; }},
       {"melee", "torsoShare", 0.51f, [](const Tuning& t) { return t.melee.torsoShare; }},
       {"melee", "torsoPitch", 0.31f, [](const Tuning& t) { return t.melee.torsoPitch; }},
@@ -321,7 +314,7 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
       std::ofstream f(badPath);
       f << R"({
   "melee": {
-    "slashTime": 0.0, "recoverTime": -5.0, "dirSmoothing": 0.0,
+    "recoverTime": -5.0, "dirSmoothing": 0.0,
     "bladeSmoothing": 0.0, "extendSmoothing": 0.0,
     "aimGainX": 0.0, "aimGainY": 900.0,
     "fullSpeedMps": 2.0, "minSpeedMps": 8.0,
@@ -371,7 +364,6 @@ Status GateCombatTuning(Ctx& c, std::string& detail) {
     check(bad.combatfx.hitReactPushFrac <= 0.5f, "hit-react shove stays a shove");
 
     // Divisions and degenerate smoothing.
-    check(bad.melee.slashTime > 0.0f, "slash time > 0");
     check(bad.melee.recoverTime > 0.0f, "recover time > 0");
     check(bad.melee.dirSmoothing > 0.0f, "direction smoothing > 0");
     check(bad.melee.bladeSmoothing > 0.0f, "blade smoothing > 0");

@@ -114,15 +114,29 @@ fn withFloatTicks(flags : u32, t : u32) -> u32 {
          ((min(t, PMICRO_LIFE_MASK)) << PMICRO_LIFE_SHIFT);
 }
 
+// PASSABLE VEGETATION HOLDS NOTHING UP (2026-09-25). A bramble, a grass tuft,
+// a flower is one full CA cell drawn as a small micro-model, and it is a SOLID
+// to the grid -- so a chunk thrown off a carved body used to come to rest ON
+// that cell and sit a whole voxel up, floating over a plant a quarter its
+// height (the owner's report). A grid-bound particle now flies through such a
+// cell as it flies through air, and may come to rest IN it: the chunk that
+// lands where a flower was has crushed the flower (canOccupy). A micro droplet
+// is not grid-bound and keeps its old contact rule: blood spatters the bush.
+fn matPassable(mat : u32) -> bool {
+  return (materials[mat].flags & MATF_PASSABLE) != 0u;
+}
+
 // Blocks flight: solids and powders always; liquids only for a particle that
-// does not interact with them (lift 0 — see above).
-fn blocksParticle(c : vec3<i32>, passLiquid : bool) -> bool {
+// does not interact with them (lift 0 — see above); passable vegetation only
+// for a micro droplet (see matPassable).
+fn blocksParticle(c : vec3<i32>, passLiquid : bool, micro : bool) -> bool {
   let w = voxWordAt(c);
   let mat = voxMat(w);
   if (mat == MAT_AIR) { return false; }
   let k = materials[mat].klass;
   if (k == CLASS_GAS) { return false; }
   if (passLiquid && k == CLASS_LIQUID) { return false; }
+  if (!micro && matPassable(mat)) { return false; }
   return true;
 }
 
@@ -143,6 +157,8 @@ fn blocksParticle(c : vec3<i32>, passLiquid : bool) -> bool {
 fn canOccupy(w : u32, myDensity : i32, patient : bool) -> bool {
   let m = voxMat(w);
   if (m == MAT_AIR) { return true; }
+  // Passable vegetation is crushed by what lands in it (see matPassable).
+  if (matPassable(m)) { return true; }
   let mm = materials[m];
   if (mm.klass != CLASS_LIQUID) { return false; }
   return patient || myDensity > mm.density;
@@ -176,7 +192,7 @@ fn settleSupported(c : vec3<i32>, myDensity : i32) -> bool {
   let b = c + vec3<i32>(0, -1, 0);
   if (!inBounds(b)) { return false; }
   let bm = voxMat(voxWordAt(b));
-  if (bm == MAT_AIR) { return false; }
+  if (bm == MAT_AIR || matPassable(bm)) { return false; }
   let m = materials[bm];
   if (m.klass == CLASS_SOLID || m.klass == CLASS_POWDER) { return true; }
   if (m.klass == CLASS_LIQUID) { return m.density > myDensity; }
@@ -353,8 +369,10 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
   // buried (CA moved material onto us): rise one voxel per tick until free.
   // Water flowing over a sinking rock is not burial, which is why a liquid
   // counts as blocking only for something that does not interact with liquids.
+  // Nor is a plant cell: a chunk passing through a bush is not buried in it.
   if (startMat != MAT_AIR && startKlass != CLASS_GAS &&
-      !(inFluid && startKlass == CLASS_LIQUID)) {
+      !(inFluid && startKlass == CLASS_LIQUID) &&
+      !(!isMicro(p) && matPassable(startMat))) {
     // A micro particle has no voxel to dig out to. Being buried means the CA
     // flowed over it, so it is inside something now — stain that something and
     // be gone, rather than tunnelling upward through solid rock.
@@ -537,7 +555,7 @@ fn integrate(@builtin(global_invocation_id) gid : vec3<u32>) {
     let sz = p.pz + p.vz * k / n;
     let cell = vec3<i32>(sx >> 8u, sy >> 8u, sz >> 8u);
     if (!inBounds(cell)) { return; }  // left the world: particle dies
-    if (blocksParticle(cell, inFluid)) {
+    if (blocksParticle(cell, inFluid, isMicro(p))) {
       // ---- micro: land ON the surface, stain it, and stop existing ----
       // The droplet is parked at the CONTACT point (first blocked sample), not
       // backed off to the last air cell the way a reinserting particle is. The

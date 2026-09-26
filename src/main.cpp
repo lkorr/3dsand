@@ -3063,9 +3063,9 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     std::sscanf(limbCsv.c_str() + at + 1, "%d,%d", &spawnX, &spawnZ);
     limbCsv = limbCsv.substr(0, at);
   }
-  int defIndex = -1;
-  for (size_t i = 0; i < mobs.Defs().size(); i++)
-    if (mobs.Defs()[i].name == defName) defIndex = (int)i;
+  // FindOrComposeDef, so a generated pool body (`pool/m02`) or a composed
+  // def is shot exactly as the game would spawn it.
+  const int defIndex = mobs.FindOrComposeDef(defName);
   if (defIndex < 0) {
     std::fprintf(stderr, "--shot-mob: no mob def named \"%s\"\n",
                  defName.c_str());
@@ -3103,6 +3103,23 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     if (end == std::string::npos) end = limbCsv.size();
     std::string nm = limbCsv.substr(start, end - start);
     start = end + 1;
+    // "*name" puts an item IN THE HAND (Mob::EquipItem, held_right) and
+    // "!clip" plays a clip on it, so a held pose -- the `pour` clip with a
+    // flask -- is a screenshot rather than a live session.
+    if (!nm.empty() && nm[0] == '*') {
+      const ItemDef* it = items.At(items.Find(nm.substr(1)));
+      Mob* hm = mobs.FindCreature(id);
+      if (!it || !hm || !hm->EquipItem(it))
+        std::fprintf(stderr, "--shot-mob: could not hold \"%s\"\n", nm.c_str() + 1);
+      else
+        std::printf("--shot-mob: holding %s\n", nm.c_str() + 1);
+      continue;
+    }
+    if (!nm.empty() && nm[0] == '!') {
+      if (!mobs.PlayClip(id, nm.substr(1)))
+        std::fprintf(stderr, "--shot-mob: no clip \"%s\"\n", nm.c_str() + 1);
+      continue;
+    }
     // "+name" DRESSES rather than dismembers. Worn geometry is the one thing
     // about a rig that no headless mode could see: the shells only exist on a
     // body somebody put clothes on, and the only place that happened was the
@@ -3223,6 +3240,25 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       std::printf("--shot-mob: foot clearance %.2f voxels (lowest limb voxel "
                   "y=%.2f, terrain y=%d; ~0 = standing)\n",
                   lowest - (float)(gy + 1), lowest, gy);
+    }
+    // ...and PER LIMB, against the terrain under THAT limb: one whole-body
+    // minimum says nothing about a prone body, whose hands can be on the floor
+    // while its chest hangs a forearm above it.
+    std::printf("--shot-mob: per-limb clearance (lowest voxel - terrain under "
+                "it; + = above ground):\n");
+    for (size_t i = 0; i < def.limbs.size(); i++) {
+      if (!mobs.LimbBody(id, (int)i)) continue;
+      const uint32_t n = mobs.LimbVoxelCount(id, (int)i);
+      float lo = 0;
+      Vec3 at{};
+      bool have = false;
+      for (uint32_t v = 0; v < n; v++) {
+        const Vec3 p = mobs.LimbVoxelPos(id, (int)i, v);
+        if (!have || p.y < lo) { lo = p.y; at = p; have = true; }
+      }
+      if (!have) continue;
+      const int tg = World::TerrainHeight(ifloor(at.x), ifloor(at.z), kDefaultSeed);
+      std::printf("    %-8s %6.2f\n", def.limbs[i].name.c_str(), lo - (float)(tg + 1));
     }
   }
 
@@ -6354,9 +6390,6 @@ int main(int argc, char** argv) {
   glfwSetInputMode(window, GLFW_CURSOR, GLFW_CURSOR_DISABLED);
   double mx0 = 0, my0 = 0;
   glfwGetCursorPos(window, &mx0, &my0);
-  // Look sensitivity scale while a melee weapon is up, eased rather than
-  // switched (camera.meleeSensHalflife). See the note at the ApplyMouse call.
-  float lookSensNow = 1.0f;
 
   KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
       eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
@@ -6451,7 +6484,7 @@ int main(int argc, char** argv) {
   // re-applied in the F5 block, which is the whole point of the migration: the
   // stroke's feel is a JSON edit and a keypress rather than a rebuild.
   ApplyMeleeTuning(melee.tuning);
-  // ---- DISCRETE STRIKES (melee.controlMode 0, the default) -----------------
+  // ---- DISCRETE STRIKES (the player's only melee control) -----------------
   // The player's authored-attack state: a bare StrokeCursor stepped by the
   // same StepStrokeProgram the NPCs use (game/strokes.h), driving the SAME
   // `melee` above — so the sweep, the whoosh, the Arrest and the Nudge blocks
@@ -6731,11 +6764,6 @@ int main(int argc, char** argv) {
   // moved. Handle from Cues::Combat; self-invalidating, so nothing here has to
   // know when the sample ended (audio/world.h PlayOneShotTracked).
   int combatWhooshVoice = -1;
-  // The swing whoosh fires on the EDGE into Slash, not while Slash is held:
-  // committing is a moment, and a per-tick test would play the sample five
-  // times over one cut. Remembered across frames, so the edge survives a frame
-  // that ran no ticks at all.
-  SwingPhase& meleePhasePrev = session.meleePhasePrev;
   // ---- THE BLOCK HOOK (game/melee.h BlockEvent) ----------------------------
   //
   // `clang` is "a cut stopped by something that is not flesh". Two things
@@ -9277,33 +9305,6 @@ int main(int argc, char** argv) {
     }
     double mx, my;
     glfwGetCursorPos(window, &mx, &my);
-    // THE VIEW SLOWS WHILE THE BLADE IS UP; THE BLADE DOES NOT.
-    //
-    // The same delta drives both the camera and the swing, which is what makes
-    // the weapon feel attached to the hand — but at equal gain a cut you want
-    // to WATCH also whips the view off the target, so the swing you just made
-    // leaves the screen before you see it land. Scaling only the look leaves
-    // the mouse stroke buying mostly arm instead of mostly yaw, which is the
-    // whole point: you are steering a blade, not aiming a gun.
-    //
-    // Eased on a half-life rather than switched, because clicking mid-stroke
-    // would otherwise step the view. Keyed off the swing PHASE rather than the
-    // button so the slowdown covers the recover tail too and hands the view
-    // back as the weapon settles. One frame latent (the phase is advanced in
-    // the tick loop below) and imperceptibly so.
-    {
-      const auto& ct = CurrentTuning().camera;
-      // FREEFORM ONLY (controlMode 1): the damping exists because the mouse
-      // steers the blade and the view at once. A discrete strike never reads
-      // the mouse mid-stroke, so damping the look there would just make the
-      // camera feel sticky for the length of every swing.
-      const bool bladeUp = CurrentTuning().melee.controlMode == 1 &&
-                           melee.Phase() != SwingPhase::Idle;
-      const float want = bladeUp ? ct.meleeSensitivity : 1.0f;
-      const float hl = ct.meleeSensHalflife;
-      const float k = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
-      lookSensNow += (want - lookSensNow) * k;
-    }
     // --fell-tree with a site OWNS the camera: the first frame's cursor delta
     // (wherever the mouse happened to be when the window opened) turned the
     // view 88 degrees and planted the oak in the wrong place with 0 cells,
@@ -9317,48 +9318,12 @@ int main(int argc, char** argv) {
     // one binary produced different op records.
     const bool harnessInput = HarnessTicksPerFrame() > 0;
     if (captured && !g_fellSiteSet && !harnessInput)
-      cam.ApplyMouse((float)(mx - mx0) * lookSensNow,
-                     (float)(my - my0) * lookSensNow);
-    // The swing gets the RAW delta — deliberately not scaled with the view
-    // above. MeleeTuning::commitSpeed is calibrated in true mouse pixels per
-    // second, so damping the input here would move the commit threshold every
-    // time somebody retunes the camera, and it would also shrink the cut the
-    // player physically made. ACCUMULATED into the tick command rather than
-    // delivered to a consumer here (N2): the mouse is sampled per frame, but
-    // both consumers — the swing driver and the strike picker — now integrate
-    // one whole tick's pixels at kTickDt inside the loop below. Total pixels
-    // are preserved either way, which is the property the `swing` gate states
-    // ("a displacement, not a rate").
-    //
-    // UNDER HIT-STOP THE STROKE INTEGRATES IN SIM TIME, and that is the
-    // decision rather than an oversight. During a dip the tick loop runs less
-    // often, so the same frame's pixels sit in MeleeState's accumulator across
-    // more frames and are delivered to fewer Update() calls. Two consequences,
-    // and they pull opposite ways:
-    //
-    //   * THE TIP DISPLACEMENT IS EXACT. az/el are integrated from the raw
-    //     delta at a fixed radians-per-pixel gain, so total pixels -> total
-    //     arc is preserved bit for bit however the ticks are spaced. This is
-    //     the property the `swing` gate states ("a displacement, not a rate")
-    //     and the one the player actually feels; nothing here may perturb it,
-    //     which rules out scaling the fed pixels.
-    //   * THE DERIVED SPEED READS HIGH, by 1/scale, because Update divides by
-    //     kTickDt and a tick now covers more real time than that. It is
-    //     bounded and it is nearly unreachable: `commitSpeed` is only
-    //     consulted in Guard, and a dip can only have been caused by a hit,
-    //     which can only happen in Slash. By the time the longest dip (140 ms)
-    //     has run out, a 170 ms slash is into its follow-through.
-    //
-    // Fixing the second would mean giving Update a second dt (real vs sim),
-    // widening a signature three callers and the NPC driver share, to correct
-    // a number that is not read in the window where it is wrong.
-    //
-    // MODE SPLIT (D10 of the discrete-strikes plan): in discrete mode the
-    // driver is fed by the stroke program in the tick loop, so raw pixels go
-    // to the PICKER instead — feeding both would double-integrate the same
-    // motion into the accumulator and bend every authored cut. The SPLIT now
-    // happens at the tick, not here: one look delta goes into the command and
-    // the tick body routes it by mode.
+      cam.ApplyMouse((float)(mx - mx0), (float)(my - my0));
+    // The look delta is ACCUMULATED into the tick command (N2) rather than
+    // delivered to a consumer here: the mouse is sampled per frame, and the
+    // strike picker integrates one whole tick's pixels at kTickDt inside the
+    // tick loop. It is the only swing consumer — the driver is fed by the
+    // stroke program, never by the mouse (the freeform mode that was is gone).
     if (captured && !harnessInput)
       feeder.Look((float)(mx - mx0), (float)(my - my0));
     mx0 = mx;
@@ -9555,6 +9520,11 @@ int main(int argc, char** argv) {
     // While something is held the prompt is what is IN YOUR HANDS, not what
     // is behind it: the reach ray is still running (it has to, for the frame
     // after you let go) but the weight you are carrying is the useful readout.
+    // ...and when the hold ended by itself (not by E), say why, once.
+    if (std::string n = grab.TakeDropNote(); !n.empty()) {
+      ui.kitMessage = n;
+      ui.kitMessageAge = 0.0f;
+    }
     if (grab.Active()) {
       char buf[96];
       std::snprintf(buf, sizeof buf, "release E  -  carrying %.0f kg",
@@ -10568,9 +10538,32 @@ int main(int argc, char** argv) {
     // (game/container.h). Only a throwable vessel in hand reads it.
     feeder.Hold(TB_THROW, captured && gameKeys &&
                               glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS);
+    // F WITH A VESSEL IN HAND toggles APPLY MODE (TB_APPLY): LMB brushes the
+    // contents onto the body under the crosshair instead of pouring. The same
+    // hands test as `vesselSlot` below (the melee tool up, magic off, a
+    // container selected); while it holds, F is this and not the dev laser.
+    const bool vesselInHand = [&] {
+      if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
+      const ItemDef* d = items.Of(hotbar.Selected());
+      return d && d->IsContainer();
+    }();
+    {
+      static bool fPrev = false;
+      const bool fDown = captured && gameKeys &&
+                         glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS;
+      if (vesselInHand && fDown && !fPrev) {
+        ui.vesselApply = !ui.vesselApply;
+        ui.kitMessage = ui.vesselApply ? "apply mode: LMB puts it on whoever you aim at"
+                                       : "pour mode";
+        ui.kitMessageAge = 0.0f;
+      }
+      fPrev = fDown;
+    }
+    ui.applyShown = vesselInHand && ui.vesselApply;
+    feeder.Hold(TB_APPLY, ui.applyShown);
     feeder.Hold(TB_LASER,
                 captured && ui.devControls &&
-                    (glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS ||
+                    ((!vesselInHand && glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS) ||
                      (ui.tool == UIState::kToolLaser && mouseL)));
     // The RENDER layer draws the beam sprites and has no TickInput (it runs on
     // frames the tick loop did not). It reads the same bit off the pending
@@ -10980,7 +10973,8 @@ int main(int argc, char** argv) {
 
       TickAuthority(tickCtx, session,
                     FrameIntent{brushActive, meleeArmed, meleeReady, heldItem,
-                                vesselSlot, pourAimValid, pourAim},
+                                vesselSlot, pourAimValid, pourAim,
+                                ui.pourRadius, pourFromValid, pourFrom},
                     ti, tick, opBatch);
 
       // ---- S5b: NPCs OUTLIVE THE WINDOW (game/persist.h MobParking) --------
@@ -11941,9 +11935,10 @@ int main(int argc, char** argv) {
         case SwingPhase::Idle:    ui.swingPhase = meleeReady ? "ready" : ""; break;
         case SwingPhase::Guard:   ui.swingPhase = "guard"; break;
         case SwingPhase::Wind:    ui.swingPhase = "winding"; break;
-        case SwingPhase::Slash:   ui.swingPhase = "SLASH"; break;
         case SwingPhase::Recover: ui.swingPhase = "recover"; break;
       }
+      // THE CUT IS THE PROGRAM'S, not a driver phase (melee.h SwingPhase).
+      if (session.playerStrike.Cutting()) ui.swingPhase = "CUT";
       ui.swingSpeed = melee.MouseSpeed();
       // Which authored strike is running (discrete mode): the label, so the
       // flick's read-back is on screen while the swing is. A banked follow-up
@@ -13372,8 +13367,13 @@ int main(int argc, char** argv) {
           Vec3 hp;
           Quat hq;
           const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
-          if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq))
+          if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq)) {
             mouth = hp + Vec3{0, MetresToCells(0.08f), 0};
+            // The vessel's own lip on the look side (Mob::HeldMouthWorld),
+            // the point the tick streams from.
+            Vec3 lip;
+            if (avatar.HeldMouthWorld(cam.Forward(), lip)) mouth = lip;
+          }
         }
         auto shade = [](uint32_t c, float k) -> uint32_t {
           auto ch = [&](int sh) {
@@ -13383,6 +13383,22 @@ int main(int argc, char** argv) {
           return 0xFF000000u | ch(0) | ch(8) | ch(16);
         };
         auto at = [&](const ScoopMote& m, float t, float phase) {
+          // APPLY MODE (ScoopMote::out) flies the same path backwards: mouth
+          // to skin, so a slow lift out of the neck and a fast landing.
+          if (m.out) {
+            const Vec3 d = m.to - mouth;
+            const float len = std::max(d.len(), 1e-3f);
+            const Vec3 axis = d * (1.0f / len);
+            const Vec3 ref = std::fabs(axis.y) < 0.9f ? Vec3{0, 1, 0} : Vec3{1, 0, 0};
+            const Vec3 u = ref.cross(axis).normalized();
+            const Vec3 v = axis.cross(u);
+            const float push = t * t;
+            const float arc = std::sin(3.14159265f * t);
+            const float ang = phase + t * 9.0f;
+            const float r = std::min(0.8f, 0.08f * len) * arc;
+            return mouth + d * push + Vec3{0, 0.6f, 0} * arc * (1.0f - push) +
+                   (u * std::cos(ang) + v * std::sin(ang)) * r;
+          }
           const Vec3 d = mouth - m.from;
           const float len = std::max(d.len(), 1e-3f);
           const Vec3 axis = d * (1.0f / len);
@@ -13406,7 +13422,9 @@ int main(int argc, char** argv) {
           const Vec3 p = at(m, t, phase);
           Sprite s{};
           s.pos[0] = p.x; s.pos[1] = p.y; s.pos[2] = p.z;
-          s.halfSize = size * (1.0f - 0.8f * t * t);
+          // Inbound shrinks into the mouth; outbound grows out of it.
+          s.halfSize = m.out ? size * (0.25f + 0.75f * t)
+                             : size * (1.0f - 0.8f * t * t);
           s.color = shade(m.color, bright);
           s.emission = 0.0f;
           sprv.push_back(s);
@@ -13607,7 +13625,48 @@ int main(int argc, char** argv) {
       const ItemStack* vsM =
           pourAimValid ? &hotbar.slots[vesselSlot] : nullptr;
       const ItemDef* vdefM = vsM ? items.Of(*vsM) : nullptr;
-      if (vdefM && vdefM->IsContainer() && vsM->Filled() &&
+      // APPLY MODE (TB_APPLY): no stream, so no pour point. The marker sits
+      // on the SKIN the brush would take -- the tick's own pick
+      // (session.cpp: CastRayBody -> FindOwner -> PickBody) from this frame's
+      // eye -- and the HUD names whose it is.
+      ui.applyTarget.clear();
+      bool applyMarked = false;
+      if (ui.applyShown && vesselSlot >= 0) {
+        const ItemDef* adef = items.Of(hotbar.slots[vesselSlot]);
+        if (adef && adef->IsContainer()) {
+          static std::vector<uint64_t> ownA;
+          ownA.clear();
+          avatar.AppendLiveLimbBodies(ownA);
+          const Vec3 rd = cam.Forward().normalized();
+          const float maxT = std::max(0.0f, (player.EyePos() - eye).dot(rd)) +
+                             adef->container.pourRange + MetresToCells(1.0f);
+          float frac = 1.0f;
+          const uint64_t body = phys.CastRayBody(eye, rd, maxT, frac, ownA);
+          Mob* tm = body ? mobs.FindOwner(body) : nullptr;
+          if (tm && avatar.Spawned() && tm->Id() == avatar.Id()) tm = nullptr;
+          const MobSystem::BodyRayHit hit =
+              tm ? mobs.PickBody(tm->Id(), eye, rd, maxT) : MobSystem::BodyRayHit{};
+          if (hit.hit) {
+            const MobDef* md = tm->Def();
+            ui.applyTarget = std::string(tm->Alive() ? "" : "dead ") +
+                             (md ? md->name : std::string("creature"));
+            if (md && hit.limb >= 0 && hit.limb < (int)md->limbs.size())
+              ui.applyTarget += " - " + md->limbs[hit.limb].name;
+            if (dbg.size() < kMaxDebugBoxes) {
+              DebugBox b{};
+              b.pos[0] = hit.pos.x; b.pos[1] = hit.pos.y; b.pos[2] = hit.pos.z;
+              b.half[0] = b.half[1] = b.half[2] =
+                  std::max(MetresToCells(0.02f), ui.pourRadius);
+              b.quat[3] = 1.0f;
+              b.color = 0x6060FFA0u;  // pale green, mostly clear (0xAABBGGRR)
+              pourMarkerAt = (uint32_t)dbg.size();
+              dbg.push_back(b);
+            }
+          }
+        }
+        applyMarked = true;
+      }
+      if (!applyMarked && vdefM && vdefM->IsContainer() && vsM->Filled() &&
           dbg.size() < kMaxDebugBoxes) {
         static std::vector<uint64_t> ownM;
         ownM.clear();

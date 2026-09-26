@@ -52,6 +52,7 @@
 // the gate about the control law and not about whatever human.json's arm is
 // this week.
 
+#include <cstdlib>
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -234,10 +235,6 @@ Status GateSwing(Ctx& c, std::string& detail) {
           "the same pixels reach the same azimuth fast or slow");
     check(Dist(fast.HandOffset(), slow.HandOffset()) < 0.01f,
           "...and therefore the same place");
-    check(fast.Phase() != SwingPhase::Slash &&
-              slow.Phase() != SwingPhase::Slash,
-          "neither arm of the rate test committed a cut (which would make it "
-          "measure the arc instead of the mapping)");
 
     // ...and the azimuth is the seed plus pixels x gain. Radians now, not
     // voxels: the point rides a sphere about the shoulder, so a sideways drag
@@ -281,7 +278,6 @@ Status GateSwing(Ctx& c, std::string& detail) {
     // several turns round — at a speed that never commits, so what is measured
     // is the stroke and not the arc a cut would add on top of it.
     for (int i = 0; i < 400; i++) Step(m, kNoCommitPx, 0);
-    check(m.Phase() != SwingPhase::Slash, "the sustained push did not commit");
     check(m.StrokeAz() <= t.azOut + 1e-3f,
           "the stroke never leaves the weapon-side azimuth stop");
     check(m.StrokeAz() > t.azOut - 1e-3f,
@@ -329,38 +325,10 @@ Status GateSwing(Ctx& c, std::string& detail) {
     check(m.PoseWeight() <= 0.001f, "the arm is fully handed back at Idle");
   }
 
-  // ---- 6. a committed cut still fires, and still ends where the mouse did ---
-  {
-    MeleeState m = MakeSeeded();
-    Step(m, 0, 0);
-    const float azSeed = m.StrokeAz(), elSeed = m.StrokeEl();
-    // Fast enough to clear commitSpeed, in a direction with both axes so the
-    // "a diagonal flick is a diagonal cut" property is what is measured.
-    for (int i = 0; i < 6; i++) Step(m, 40.0f, -40.0f);
-    check(m.Phase() == SwingPhase::Slash, "a fast flick commits a cut");
-    const Vec3 cut = m.CutDir();
-    check(cut.x < -0.3f && cut.y > 0.3f,
-          "the cut goes the way the mouse went (right and up; screen right "
-          "is world -x)");
-    // NO POP ON THE COMMITTING TICK. The previous law's arc was centred on the
-    // hand, so it jumped half a swing backwards the instant it fired; this one
-    // anticipates on a bow that is zero at both ends.
-    const Vec3 atCommit = m.TipOffset();
-    Step(m, 40.0f, -40.0f);
-    check(Dist(m.TipOffset(), atCommit) < kRestReach * 0.5f,
-          "committing does not teleport the point");
-    // Let the slash and its follow-through run out with the mouse now still.
-    for (int i = 0; i < 40; i++) Step(m, 0, 0);
-    check(m.Phase() == SwingPhase::Guard,
-          "the cut returns to guard while the button is held");
-    // The cut ENDS WHERE IT WENT: up and to the right of where the blade
-    // started, not back at the seed. STATED ON THE STROKE, because the hanging
-    // fixture's azimuth is already near its stop and a diagonal flick from
-    // there finishes nearly overhead — where the world-space x of a raised
-    // point is small for a reason that has nothing to do with the mapping.
-    check(m.StrokeEl() > elSeed + 0.5f && m.StrokeAz() >= azSeed - 1e-4f,
-          "the cut ends where the mouse took it, not back at the start");
-  }
+  // ---- 6. (removed 2026-09-25) the driver's own speed-triggered cut --------
+  // MeleeState no longer commits a Slash of its own: every stroke is an
+  // authored program and the program's Cut phase is the cut (melee.h
+  // SwingPhase). A fast input is now just a fast move, which block 2 covers.
 
   // ---- 7. right-to-left is a horizontal arc IN FRONT ------------------------
   //
@@ -376,7 +344,6 @@ Status GateSwing(Ctx& c, std::string& detail) {
     // cut fires — but it IS over the wind threshold, and Wind is a guard that
     // has noticed the mouse moving, not a committed stroke.
     for (int i = 0; i < 20; i++) Step(m, kNoCommitPx, 0);
-    check(m.Phase() != SwingPhase::Slash, "the ready did not fire a cut");
     const float azReady = m.StrokeAz();
     check(azReady > az0 + 0.5f, "the ready really did load the blade right");
 
@@ -385,10 +352,8 @@ Status GateSwing(Ctx& c, std::string& detail) {
     float radMin = 1e9f, radMax = -1e9f;
     float prevAz = azReady;
     int backSteps = 0;
-    bool fired = false;
     for (int i = 0; i < 24; i++) {
       Step(m, -25.0f, 0);
-      fired = fired || m.Phase() == SwingPhase::Slash;
       const Vec3 tip = m.TipOffset();
       const float az = std::atan2(-tip.x, tip.z);   // basis az (right=-X)
       const float el = std::asin(std::clamp(tip.y / std::max(tip.len(), 1e-4f),
@@ -403,7 +368,6 @@ Status GateSwing(Ctx& c, std::string& detail) {
       if (az > prevAz + 1e-4f) backSteps++;
       prevAz = az;
     }
-    check(fired, "a fast leftward flick commits a cut");
     check(azMax - azMin > 1.4f,
           "the point sweeps most of a right-to-left arc (>80 degrees)");
     check(elDev < 0.35f,
@@ -1066,7 +1030,6 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
       float dx = std::clamp(dAz / melee.tuning.aimGainX, -18.0f, 18.0f);
       float dy = std::clamp(-dEl / melee.tuning.aimGainY, -18.0f, 18.0f);
       drive(dx, dy, true);
-      if (melee.Phase() == SwingPhase::Slash) return false;   // never, by cap
     }
     return std::fabs(wantAz - melee.StrokeAz()) < 0.15f &&
            std::fabs(wantEl - melee.StrokeEl()) < 0.15f;
@@ -1570,7 +1533,7 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
     // by the SHOULDER'S authored reach rather than by taste. human.json bounds
     // the right upper arm to 30 degrees past the midline
     // (`poseLimit.reach normal [1,0,0] max 30`), and a committed cut carries
-    // ~2.0 rad of arc on its own (`MeleeTuning::swingArc`) whatever the mouse
+    // ~2.0 rad of arc on its own (the since-removed `swingArc`) whatever the mouse
     // does afterwards. So the last third of any committed horizontal cut is
     // spent ON that stop: the ball limit clamps the shoulder by ~0.93 rad and
     // drags the posed sword out of the plane the driver commanded (measured:
@@ -1856,7 +1819,10 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
         if (!b.valid) continue;
         tipPath.push_back(b.tip);
         basePath.push_back(b.base);
-        if (prev.valid && melee.Cutting()) {
+        // Every tick of the drive IS the cut: the driver has no Slash of its
+        // own to gate on any more (melee.h SwingPhase), and a stroke program
+        // sweeps on its own Cut phase, which this drive stands in for.
+        if (prev.valid) {
           EdgeSweep sw;
           sw.aPrev = prev.base;
           sw.bPrev = prev.tip;
@@ -2104,14 +2070,12 @@ Status GateSwingPlane(Ctx& c, std::string& detail) {
 // ============================================================================
 // player-styles — THE DISCRETE STRIKES, each authored style replayed through
 // the PLAYER'S OWN PATH (StepStrokeProgram driving a MeleeState with the
-// camera basis, exactly main.cpp's melee.controlMode 0 tick) on the real
+// camera basis, exactly session.cpp's strike tick) on the real
 // avatar rig, and asserted AGAINST ITS OWN AUTHORED NUMBERS — the npc-styles
 // contract, so a new style entry inherits every check without naming one.
 //
-// Per style: it spent real ticks cutting; the POSED sword moved; the driver
-// COMMITTED a Slash at least once (the whoosh's and the damage sweep's shared
-// precondition — a style whose cut drive never crosses commitSpeed swings and
-// can never hurt anything); the commanded arcs are dominant in the authored
+// Per style: it spent real ticks cutting; the POSED sword moved; the commanded
+// arcs are dominant in the authored
 // channel (stated on the COMMAND, not the posed sword — human.json's shoulder
 // serves a vertical chop by going round; npc-styles says why at length); and
 // THE BLADE NEVER ENTERS THE WIELDER'S OWN HEAD — measured INDEPENDENTLY of
@@ -2154,7 +2118,11 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   const ItemLibrary& items = c.items;
 
-  const int swordDef = items.Find("sword");
+  // SANDVOX_PS_ITEM names the held item (default the sword): the reported
+  // "hand teleports for one frame" was on the DAGGER, whose short blade puts
+  // the hand where the sword's never goes.
+  const char* psItem = std::getenv("SANDVOX_PS_ITEM");
+  const int swordDef = items.Find(psItem && *psItem ? psItem : "sword");
   const ItemDef* sword = items.At(swordDef);
   int avDef = -1;
   for (size_t i = 0; i < mobs.Defs().size(); i++)
@@ -2269,8 +2237,17 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
     bool cHavePrev = false;
     float rMin = 1e9f, rMax = -1e9f;
     int cutTicks = 0;
-    bool sawSlash = false;
     float headMin = 1e9f;
+    // ---- THE ONE-FRAME JUMP, ATTRIBUTED (the "hand teleports above the head
+    // for one frame" report). The POSED hand (the rig's hand.R joint) and the
+    // COMMANDED hand (melee.HandOffset about the shoulder) are recorded side
+    // by side: a posed jump with a smooth command is the rig (IK / hinge /
+    // pose limits), a jump in both is the driver.
+    const int handPart = avatar.PartIndex("hand.R");
+    Vec3 prevPosed{}, prevCmd{};
+    bool havePosed = false;
+    float jumpPosed = 0, jumpCmdAtPosed = 0, jumpCmd = 0, posedAboveHead = -1e9f;
+    int jumpTick = -1, jumpPhase = -1, jumpDrv = -1;
 
     for (int i = 0; i < 90 && cur.Active(); i++) {
       // main.cpp's discrete tick, in its order: seed the driver from the rig,
@@ -2296,7 +2273,55 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
       avatar.SetWeaponPose(melee.Pose());
       avTick();
 
-      if (melee.Phase() == SwingPhase::Slash) sawSlash = true;
+      {
+        Vec3 hp, headJ;
+        const Vec3 cmd = melee.HandOffset();
+        if (handPart >= 0 && avatar.PartJointWorld(handPart, hp) &&
+            melee.PoseWeight() > 0.05f) {
+          if (havePosed) {
+            const float dp = (hp - prevPosed).len();
+            const float dc = (cmd - prevCmd).len();
+            jumpCmd = std::max(jumpCmd, dc);
+            if (dp > jumpPosed) {
+              jumpPosed = dp;
+              jumpCmdAtPosed = dc;
+              jumpTick = i;
+              jumpPhase = (int)cur.phase;
+              jumpDrv = (int)melee.Phase();
+            }
+          }
+          if (headPart >= 0 && avatar.PartJointWorld(headPart, headJ))
+            posedAboveHead = std::max(posedAboveHead, hp.y - headJ.y);
+          // SANDVOX_PS_TRACE=<style name>: one line per tick for that style —
+          // posed hand RELATIVE TO THE SHOULDER beside the commanded one, the
+          // pose weight and wrist alignment, so a one-tick jump names its tick.
+          if (const char* tr = std::getenv("SANDVOX_PS_TRACE");
+              tr != nullptr && sty.name == tr) {
+            const Vec3 sh = shoulderWorld();
+            const Vec3 rel = hp - sh;
+            const WeaponPose wp = melee.Pose();
+            // ...and WHICH STAGE of the rig moved it (mob.h WeaponArmDiag):
+            // the IK's miss, then what the anatomy clamp took back.
+            const Mob::WeaponArmDiag& wd = avatar.WeaponArmDiagnostics();
+            std::printf(
+                "ps-trace %s t%02d prog %d drv %d w %.2f steer %.2f posed "
+                "(%.2f,%.2f,%.2f) cmd (%.2f,%.2f,%.2f) d %.2f | ikMiss %.2f "
+                "clampShift %.2f shoulderClamp %.2f elbowClamp %.2f "
+                "elbowAxisTurn %.2f\n",
+                sty.name.c_str(), i, (int)cur.phase, (int)melee.Phase(),
+                wp.weight, wp.steerAmount, rel.x, rel.y, rel.z, cmd.x, cmd.y,
+                cmd.z, havePosed ? (hp - prevPosed).len() : 0.0f, wd.ikMiss,
+                wd.clampShift, wd.shoulderClamp, wd.elbowClamp,
+                wd.elbowAxisTurn);
+          }
+          prevPosed = hp;
+          prevCmd = cmd;
+          havePosed = true;
+        } else {
+          havePosed = false;
+        }
+      }
+
       if (cur.Cutting()) {
         cutTicks++;
         // Posed sword, wrapped-arc accumulation (npc-styles' law: |dAz| is
@@ -2366,21 +2391,6 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
     const float dr = rMax > rMin ? rMax - rMin : 0.0f;
     const std::string n = "\"" + sty.name + "\"";
     check(cutTicks >= 2, "style " + n + " spent time cutting");
-    // THE COMMIT IS DEMANDED ONLY WHERE THE AUTHORED NUMBERS DEMAND IT. The
-    // damage sweep keys on the CURSOR's cut (main.cpp mirrors MobSystem), so
-    // Slash is not the damage precondition any more — what it still buys is
-    // full wrist alignment, i.e. edge crispness, i.e. damage through
-    // MeleeEdgeAlign. A style whose cut drives the angular channels well past
-    // commitSpeed must therefore still commit; a thrust rides the radial
-    // channel, which the commit test never sees, and is exempt by its own
-    // arithmetic rather than by name.
-    const float cutPx = (wantAz / melee.tuning.aimGainX +
-                         wantEl / melee.tuning.aimGainY) /
-                        (float)std::max(cutAll.ticks, 1) / kTickDt;
-    if (cutPx > melee.tuning.commitSpeed * 1.5f)
-      check(sawSlash, "style " + n +
-                          " committed Slash (its authored cut speed demands "
-                          "it; edge alignment rides on the commit)");
     check(azArc + elArc > minSweep,
           "style " + n + ": the SWORD moved, not just the stroke");
     if (wantR > wantAz && wantR > wantEl) {
@@ -2410,10 +2420,16 @@ Status GatePlayerStyles(Ctx& c, std::string& detail) {
           "style " + n + " kept the blade clear of the wielder's own head");
     headMinOverall = std::min(headMinOverall, headMin);
     std::printf(
+        "player-styles %-20s hand jump: posed %.2f vox (commanded %.2f that "
+        "tick, worst commanded %.2f) at tick %d, program phase %d, driver "
+        "phase %d; hand peaked %.2f vox above the head joint\n",
+        sty.name.c_str(), jumpPosed, jumpCmdAtPosed, jumpCmd, jumpTick,
+        jumpPhase, jumpDrv, posedAboveHead);
+    std::printf(
         "player-styles %-20s cmd arc az %.2f el %.2f, posed az %.2f el %.2f, "
-        "dr %.2f vox over %d cut ticks, slash %d, head clearance %.2f vox\n",
+        "dr %.2f vox over %d cut ticks, head clearance %.2f vox\n",
         sty.name.c_str(), cmdAzArc, cmdElArc, azArc, elArc, dr, cutTicks,
-        (int)sawSlash, headMin >= 1e9f ? -1.0f : headMin);
+        headMin >= 1e9f ? -1.0f : headMin);
   }
   RecordObserved("playerStyles.headClearObserved",
                  headMinOverall >= 1e9f ? -1.0 : (double)headMinOverall);
@@ -3224,7 +3240,14 @@ Status GateCutPath(Ctx& c, std::string& detail) {
   // One style, run to completion against a fresh driver, sampled every tick.
   // The phase is read BEFORE the step for the reason test_melee.mjs states:
   // StepStrokeProgram advances and transitions inside the one call.
-  auto run = [&](const AttackStyle& sty, std::vector<Sample>& out) {
+  // `legacy`: the hand-built styles below are authored in the PRE-2026-09-25
+  // stroke frame (strokes.h "THE STROKE FRAME") and are converted exactly as
+  // the loader converts an old file, so every number this gate asserts keeps
+  // its meaning. Styles that came through the loader are already converted.
+  auto run = [&](const AttackStyle& styIn, std::vector<Sample>& out,
+                 bool legacy = true) {
+    AttackStyle sty = styIn;
+    if (legacy) sty.FromLegacyFrame();
     MeleeState m;
     ApplyMeleeTuning(m.tuning);
     m.SetStroke(fixtureHand, fixtureTip, Vec3{0, 0, 1}, kRestReach);
@@ -3291,8 +3314,11 @@ Status GateCutPath(Ctx& c, std::string& detail) {
 
   // ---- THE CORNER, MEASURED WHERE THE DRIVER IS NOT IN THE WAY -----------
   //
+  // (HISTORY: the driver's own Slash and its folded arc were removed
+  // 2026-09-25, so the fast pair below now ends where it is authored too; the
+  // slow pair is kept because it is the cleaner measurement.)
   // The obvious assertion — "the dogleg ends where the straight cut of the
-  // same travel ends" — IS FALSE, and it is worth saying why rather than
+  // same travel ends" — WAS FALSE, and it is worth saying why rather than
   // quietly not testing it. A cut that commits the driver's own Slash gets
   // its follow-through ARC FOLDED BACK INTO THE STROKE when the Slash ends
   // (melee.cpp, "a cut ENDS WHERE IT WENT"), and how much arc that is depends
@@ -3486,8 +3512,8 @@ Status GateCutPath(Ctx& c, std::string& detail) {
             "both cut spellings parse to exactly one leg");
       if (a != nullptr && b != nullptr) {
         std::vector<Sample> ta, tb;
-        run(*a, ta);
-        run(*b, tb);
+        run(*a, ta, false);
+        run(*b, tb, false);
         bool same = ta.size() == tb.size();
         for (size_t i = 0; same && i < ta.size(); i++)
           same = ta[i].az == tb[i].az && ta[i].el == tb[i].el &&
@@ -3519,7 +3545,7 @@ Status GateCutPath(Ctx& c, std::string& detail) {
             "...but a motionless leg INSIDE a path is a legal hitch");
       if (h != nullptr) {
         std::vector<Sample> th;
-        run(*h, th);
+        run(*h, th, false);
         const std::vector<Sample> dh = cutOnly(th);
         // The hitch has to be visible as a hitch: the middle three ticks move
         // the point far less than the legs either side of them. Measured on

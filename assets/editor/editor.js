@@ -160,6 +160,10 @@ let strokeTrail = null;
 // stroke runs, this one persists while a row is selected — and because a
 // standing rig must be able to show an edge with no swing in progress.
 let naturalEdges = null;
+// The Attacks lane's ANGLE GUIDE (rig.js drawAngleGuide): lines in the scene,
+// labels as HTML over the canvas, re-projected every frame.
+let angleGuide = null;
+const guideLabels = [];   // { div, pos: [x, y, z], on }
 let resizeHandles = [];        // 6 spheres, one per bounding-box face
 let canvas = null, host = null;
 let initialised = false, initFailed = false;
@@ -1532,6 +1536,15 @@ function buildScene() {
   naturalEdges.visible = false;
   scene.add(naturalEdges);
 
+  // The angle guide: same kind of overlay, drawn over everything.
+  angleGuide = new THREE.LineSegments(
+    new THREE.BufferGeometry(),
+    new THREE.LineBasicMaterial({ vertexColors: true, transparent: true,
+                                  opacity: 0.95, depthTest: false }));
+  angleGuide.renderOrder = 1002;
+  angleGuide.visible = false;
+  scene.add(angleGuide);
+
   // Resize handles: 6 spheres on each face of the active model's bounding box.
   const FACE_DEFS = [
     { axis: 0, sign: +1 }, { axis: 0, sign: -1 },
@@ -1745,6 +1758,7 @@ function animate(nowMs) {
   // would be pointless work on a model that is not being edited.
   if (needsRebuild) { rebuildInstances(); needsRebuild = false; }
   controls.update();
+  placeGuideLabels();
   renderer.render(scene, camera);
 }
 
@@ -2502,6 +2516,48 @@ export function setStrokeTrail(segs) { fillSegments(strokeTrail, segs); }
  * of against a running game. Same contract as setStrokeTrail; null hides it.
  */
 export function setNaturalEdges(segs) { fillSegments(naturalEdges, segs); }
+
+/**
+ * The Attacks lane's angle guide: `segs` as setStrokeTrail takes them, plus
+ * `labels` = [{ pos: [x, y, z], text, color: '#rrggbb' }] drawn as HTML over
+ * the canvas at the projected point. null / [] hides both.
+ */
+export function setAngleGuide(segs, labels) {
+  fillSegments(angleGuide, segs);
+  const want = labels || [];
+  while (guideLabels.length < want.length && host) {
+    const div = document.createElement('div');
+    div.style.cssText = 'position:absolute;left:0;top:0;pointer-events:none;' +
+      'font:600 11px var(--mono,monospace);padding:1px 5px;border-radius:3px;' +
+      'background:rgba(8,10,14,.78);white-space:nowrap;z-index:5;' +
+      'transform:translate(-50%,-50%);display:none';
+    host.append(div);
+    guideLabels.push({ div, pos: [0, 0, 0], on: false });
+  }
+  for (let i = 0; i < guideLabels.length; i++) {
+    const g = guideLabels[i], w = want[i];
+    g.on = !!w;
+    if (!w) { g.div.style.display = 'none'; continue; }
+    g.pos = w.pos;
+    g.div.textContent = w.text;
+    g.div.style.color = w.color || '#fff';
+    g.div.style.border = '1px solid ' + (w.color || '#fff') + '66';
+  }
+  placeGuideLabels();
+}
+
+function placeGuideLabels() {
+  if (!canvas || !camera) return;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  for (const g of guideLabels) {
+    if (!g.on) continue;
+    _v3.set(g.pos[0], g.pos[1], g.pos[2]).project(camera);
+    if (_v3.z > 1 || _v3.z < -1) { g.div.style.display = 'none'; continue; }
+    g.div.style.display = 'block';
+    g.div.style.left = ((_v3.x + 1) / 2 * w).toFixed(1) + 'px';
+    g.div.style.top = ((1 - _v3.y) / 2 * h).toFixed(1) + 'px';
+  }
+}
 
 function fillSegments(mesh, segs) {
   const strokeTrail = mesh;

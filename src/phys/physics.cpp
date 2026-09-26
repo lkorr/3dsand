@@ -1952,6 +1952,32 @@ void Physics::CarryLayer(uint64_t from, uint64_t to) {
     toPending |= h == to;
   }
   if (fromPending && !toPending) AddPending(to);
+  rebuilt_[rebuiltHead_] = {from, to};
+  rebuiltHead_ = (rebuiltHead_ + 1) % (uint32_t)rebuilt_.size();
+}
+
+uint64_t Physics::Successor(uint64_t handle) const {
+  if (!system_ || handle == 0) return 0;
+  const JPH::BodyInterface& bi = system_->GetBodyInterface();
+  // A successor that is itself already gone is still the answer: one sword
+  // hit rebuilds a limb TWICE in a tick (the Damage carve, then CutLimb's
+  // kerf), A -> B -> C, and the caller walks the chain. Skipping dead B here
+  // was "handle gone, no successor after 1 hop". A live successor wins over a
+  // dead one (the heaviest, for a split); among dead ones, the newest record.
+  uint64_t best = 0, newestDead = 0;
+  float bestMass = -1.0f;
+  const uint32_t n = (uint32_t)rebuilt_.size();
+  for (uint32_t k = 1; k <= n; k++) {           // newest first
+    const Rebuilt& r = rebuilt_[(rebuiltHead_ + n - k) % n];
+    if (r.from != handle || r.to == 0) continue;
+    if (!bi.IsAdded(ToBodyID(r.to))) {
+      if (!newestDead) newestDead = r.to;
+      continue;
+    }
+    const float m = BodyMass(r.to);
+    if (m > bestMass) { best = r.to; bestMass = m; }
+  }
+  return best ? best : newestDead;
 }
 
 uint32_t Physics::JointCount(uint64_t handle) const {

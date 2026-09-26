@@ -1195,6 +1195,12 @@ struct UIState {
   // hand, -1 otherwise (game/container.h ContainerThrowCharge). Written by the
   // tick; the HUD draws the meter under the crosshair, shaking at full.
   float throwCharge = -1.0f;
+  // APPLY MODE (sim/tickinput.h TB_APPLY): F toggles it with a vessel in
+  // hand. `applyShown` = on AND a vessel is in hand this frame (the HUD tag);
+  // `applyTarget` names who LMB would brush right now, "" for nobody.
+  bool vesselApply = false;
+  bool applyShown = false;
+  std::string applyTarget;
 
   // What the last refused action said, and how long ago. Flashed under the
   // panel rather than swallowed: a slot that silently declines is the failure

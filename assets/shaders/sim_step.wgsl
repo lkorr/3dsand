@@ -411,7 +411,7 @@ fn liquidSubmerged(c : vec3<i32>, mat : u32) -> bool {
 // style choice: this runs for every awake solid cell, and essentially every
 // solid cell in a terrain chunk has ground directly beneath it, so the common
 // case exits after ONE extra load instead of six.
-fn soloSolid(c : vec3<i32>) -> bool {
+fn soloSolid(c : vec3<i32>, selfPassable : bool) -> bool {
   // below, the four laterals, then above: cheapest rejection first
   var off = array<vec3<i32>, 6>(
       vec3<i32>(0, -1, 0), vec3<i32>(1, 0, 0), vec3<i32>(-1, 0, 0),
@@ -424,7 +424,14 @@ fn soloSolid(c : vec3<i32>) -> bool {
     let nm = voxMat(voxWordAt(n));
     if (nm == MAT_AIR) { continue; }
     let k = materials[nm].klass;
-    if (k == CLASS_SOLID) { return false; }
+    // PASSABLE VEGETATION HOLDS NOTHING UP (see tryCrush): a chip resting on,
+    // or leaning on, a flower is still a component of one. A plant's own
+    // attachment to plants is untouched (selfPassable), so a vine or a grass
+    // head is still held by the stem it grows from.
+    if (k == CLASS_SOLID &&
+        (selfPassable || (materials[nm].flags & MATF_PASSABLE) == 0u)) {
+      return false;
+    }
     // Powder only counts BELOW (i == 0): sand beside a voxel does not hold it
     // up, and RunIslandDetection's anchor rule already says the same (resting
     // ON powder anchors; powder alongside does not). Counting every face let a
@@ -475,6 +482,43 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   // a powder sliding out from under a solid may leave it floating
   let myKlass = materials[voxMat(myWord)].klass;
   if (myKlass == CLASS_POWDER) { flagSupportLoss(src, myKlass, voxMat(tw)); }
+  return true;
+}
+
+// A FALLING GRAIN OR LOOSE CHIP CRUSHES THE PLANT UNDER IT (2026-09-25).
+// Passable vegetation (materials.json "passable": grass tufts, flowers,
+// bramble, ...) is a full SOLID cell drawn as a small micro-model, so matter
+// that came down on one rested a whole voxel up, floating over a plant a
+// quarter its height (the owner's report, flesh thrown off a carved body).
+// A body walks through these cells; what falls should not stand on them.
+//
+// So a straight fall into a passable cell takes it and leaves AIR behind: the
+// plant is destroyed, not displaced upward (a swap would lift a flower onto
+// the grain that crushed it). Straight down only, and only for a mover that is
+// not itself passable -- a liquid never reaches here (reeds and kelp stand in
+// water) and plants do not crush plants. Write reach is the same 1 cell as
+// tryMove's, and the outcome depends on nothing a same-colour neighbour
+// writes. Plants are not conserved matter, so dropping one conserves nothing
+// that anything counts. Subcritical: each crush consumes a plant cell and the
+// mover lands one cell lower, so it cannot recur without new matter falling.
+fn tryCrush(src : vec3<i32>, dst : vec3<i32>, myWord : u32) -> bool {
+  if (!inBounds(dst)) { return false; }
+  let dt = voxIndexAndWord(dst);
+  let tmat = voxMat(dt.y);
+  if (tmat == MAT_AIR || (materials[tmat].flags & MATF_PASSABLE) == 0u) { return false; }
+  let myMat = voxMat(myWord);
+  if ((materials[myMat].flags & MATF_PASSABLE) != 0u) { return false; }
+  let stamp = stampFor(T.tick, P.substep);
+  voxStore(dt.x, packVoxKeepStain(myMat, voxState(myWord), stamp, myWord));
+  markVoxActive(dt.x);
+  var si = gSelfIdx;
+  if (any(src != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(src); }
+  voxStore(si, packVox(MAT_AIR, 0u, stamp));
+  markVoxActive(si);
+  markDirtyR(src, DIRTY_R_MOVE);
+  markDirtyR(dst, DIRTY_R_MOVE);
+  let myKlass = materials[myMat].klass;
+  if (myKlass == CLASS_POWDER) { flagSupportLoss(src, myKlass, MAT_AIR); }
   return true;
 }
 
@@ -2313,8 +2357,9 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
       if (f >= LIQ_SPLIT_MIN) { return true; }
       if ((pressed || filmStepAllowed(c, d)) &&
           canDisplace(m.density, false, nw)) { return true; }
-    } else if (gFilmLicence && canDisplace(m.density, false, nw)) {
-      // Mirrors stepLiquid's licensed lateral displace. The two MUST agree —
+    } else if (gFilmLicence && materials[nmat].klass == CLASS_GAS &&
+               canDisplace(m.density, false, nw)) {
+      // Mirrors stepLiquid's licensed lateral displace (gas targets only). The two MUST agree —
       // loose here pins a chunk awake forever, tight lets a cell sleep with work
       // left — and the licence is a workgroup-uniform bool, so testing it first
       // keeps the non-uniform load off the common path exactly as the film
@@ -2501,7 +2546,18 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
                       select(0u, DIRTY_M_FILMPRESS, pressed) | sub);
         return true;
       }
-    } else if (gFilmLicence && tryMove(c, n, w, m.density, false)) {
+    } else if (gFilmLicence && materials[nmat].klass == CLASS_GAS &&
+               tryMove(c, n, w, m.density, false)) {
+      // GAS TARGETS ONLY: A LIQUID NEVER SWAPS SIDEWAYS WITH ANOTHER LIQUID
+      // (2026-09-24, `--gate oil-slick`). Water beside oil at the same level
+      // traded whole cells with it, and a sideways trade has no direction to
+      // it, so every oil cell took a random walk through the water's surface
+      // layer: a disturbed slick diffused into a checkerboard of lone cells
+      // (the owner's report; measured 16 pieces from one slab, 31% isolated).
+      // Immiscible liquids separate VERTICALLY, and stages 1-2 already do that
+      // (water descending through oil strictly lowers SUM(f*y)); a same-level
+      // swap adds only mixing. A gas beside a liquid still yields, as air does.
+      //
       // THE LATERAL DISPLACE IS A NEUTRAL MOVE AND NEEDS THE SAME LICENCE THE
       // FILM STEPS DO. See the FILM_LICENCE block: this swaps two whole fluid
       // cells at the SAME level, so SUM(f*y) is unchanged and SUM(f*f) is
@@ -2963,13 +3019,15 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // AN UNSEEN NEIGHBOUR COUNTS AS ATTACHED, the same conservative direction
   // RunIslandDetection's `solidOutside` takes at the residency edge: refuse to
   // move matter on a guess.
-  if (!skip && m.klass == CLASS_SOLID && soloSolid(c)) {
+  if (!skip && m.klass == CLASS_SOLID &&
+      soloSolid(c, (m.flags & MATF_PASSABLE) != 0u)) {
     // Straight down, and only down. Displacement rules still apply, so a chip
     // resting on lava it cannot sink into simply stays — which is support, and
     // reads as such. Failure does NOT markDirty: nothing here may keep a chunk
     // awake forever (CLAUDE.md rule 2), and any change around it re-dirties the
     // chunk through the ordinary paths.
-    if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false)) {
+    if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false) ||
+        tryCrush(c, c + vec3<i32>(0, -1, 0), w)) {
       markDirtyR(c, DIRTY_M_SOLO);
       return;
     }
@@ -3107,8 +3165,10 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // and liquids returned above, gases into stepGas.
   let cls = DIRTY_M_POWDER;
 
-  // 1) straight fall
-  if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false)) {
+  // 1) straight fall -- through air or a lighter fluid, or onto a plant it
+  //    crushes (tryCrush)
+  if (tryMove(c, c + vec3<i32>(0, -1, 0), w, m.density, false) ||
+      tryCrush(c, c + vec3<i32>(0, -1, 0), w)) {
     markDirtyR(c, cls);
     return;
   }

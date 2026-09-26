@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <vector>
 
 #include "math3d.h"
 #include "sim/rng.h"
@@ -56,6 +57,16 @@ struct KerfCut {
   float power = 1.0f;       // 0..1 swing commitment, for the audio severity
   uint32_t seed = 0;        // ragged-rim / stain draw key. NOT a tick: the
                             // same stroke replayed must tear the same way.
+  // ---- HOW FAR THE BLOW COULD GO (KerfBite below) --------------------------
+  // `edgeHalf` is half the length of the edge that was swung, world voxels:
+  // how wide a cross-section this blade can part in one pass. 0 = `length`
+  // (a hand-built cut that did not say). `cleave` is the blow's bite PAST the
+  // ordinary chip, in world voxels^2 of skin-equivalent cross-section: what a
+  // committed swing of a heavy blade has left over once the chip is paid for.
+  // 0 = an ordinary blow, which can still part what the chip's own area
+  // covers (the last strip of a neck grooved almost through).
+  float edgeHalf = 0.0f;
+  float cleave = 0.0f;
 };
 
 // ---- THE SAME BLOW, IN THE STRUCK THING'S FRAME -----------------------------
@@ -70,6 +81,10 @@ struct KerfSlot {
   float back = 0.0f;   // how far BEHIND the entry the slot starts
   float jitterScale = 1.0f;  // lattice the ragged rim is quantized onto
   uint32_t seed = 0;
+  // The edge came out the other side (KerfBite): a CLEAN parting, full depth
+  // and full width with no wedge and no ragged rim, so the lattice really is
+  // in two pieces afterwards (KerfKeepAt floors its thickness per lattice).
+  bool through = false;
 };
 
 // Build the slot's orthonormal frame. `cLocal`, `uLocal` and `wLocal` are
@@ -137,7 +152,15 @@ inline float KerfEntry(const KerfSlot& s, float latScale, ForEach forEach) {
   // one surviving rim voxel pin the entry plane at the original surface, so
   // the groove stops advancing while the blade goes on shaving its own rim —
   // measured at 31 blows to part a thigh instead of four.
-  const float hw = s.halfW * sc * 0.35f, hl = s.halfL * sc * 0.35f;
+  //
+  // ...BUT NEVER THINNER THAN ONE LATTICE COLUMN (2026-09-25). A stock edge's
+  // core is a third of a skin cell across, so whenever the slot's plane sat
+  // between two layers of cell centres the probe caught nothing, the snap
+  // returned 0, and the slot started wherever the hit point was -- measured
+  // as ~40% of blows on a fine-skinned neck, each of them boring from the
+  // middle of the limb instead of from its surface.
+  const float hw = std::max(s.halfW * sc * 0.35f, 0.5f);
+  const float hl = std::max(s.halfL * sc * 0.35f, 0.5f);
   float best = 1e30f;
   forEach([&](float x, float y, float z) {
     const Vec3 d{x + 0.5f - c.x, y + 0.5f - c.y, z + 0.5f - c.z};
@@ -154,6 +177,101 @@ inline float KerfEntry(const KerfSlot& s, float latScale, ForEach forEach) {
   return (e > -lim && e < lim) ? e : 0.0f;
 }
 
+// ---- WHAT THE BLOW CAN PAY FOR (2026-09-25) ----------------------------------
+//
+// THE BITE IS PAID FOR IN MATERIAL. A blow has a budget — an area of
+// cross-section, in world voxels^2 of skin-equivalent matter — and the plane it
+// is cutting along charges it cell by cell: flesh cheaply, bone at three times
+// skin (materials.json `hardness` over gear.cutHardnessRef, the ratio the
+// shell rule already uses). If the budget covers EVERYTHING left in that plane
+// within the edge's reach, the edge comes out the other side and the cut is
+// THROUGH: a clean parting, and CarveLimb's cut-through rule does the rest.
+//
+// This is what makes a decapitation depend on the right things, and nothing
+// else: the SIZE of the blade (the budget scales with heft), HOW WELL IT HIT
+// (speed x edge alignment — the budget is `power`-shaped — and a plane across a
+// 10-cm neck costs a fraction of one through a skull, or of one running along
+// the neck), and WHAT IS ALREADY CUT (a notch is cells no longer in the
+// plane, so a neck chopped half through is half the price). There is no
+// counter and no roll: the same blow on the same flesh always does the same
+// thing, and a blow that falls a little short cuts deep instead.
+//
+// `forEach` walks the authoritative lattice calling back probe(x, y, z,
+// cost), cost being the voxel's resistance relative to skin. `startDepth` is
+// where the ordinary chip ends (world voxels from the entry-snapped origin);
+// `extra` is marched from there, so a blow with no cleave in it keeps exactly
+// the chip it always had.
+struct KerfBiteResult {
+  bool through = false;  // the whole plane within reach was paid for
+  float exit = 0.0f;     // far side of the matter, world voxels along w
+  float depth = 0.0f;    // where `extra` ran out, world voxels along w
+  float planeCost = 0.0f;  // the whole plane's price, world voxels^2
+  bool blocked = false;  // matter in the plane lies past the edge's reach
+};
+
+template <class ForEach>
+inline KerfBiteResult KerfBite(const KerfSlot& s, float latScale,
+                               float edgeHalf, float budget, float startDepth,
+                               float extra, ForEach forEach) {
+  KerfBiteResult r;
+  const float sc = std::max(latScale, 1e-3f);
+  const Vec3 c = s.c * sc;
+  const float back = s.back * sc;
+  const float eh = std::max(edgeHalf, s.halfL) * sc;
+  // ONE CELL THICK: the plane the edge travels in. |dv| <= 0.5 holds on
+  // average exactly one cell per (u, w) column at any orientation, so the
+  // cell count is the plane's area in cells whichever way the blade was held.
+  std::vector<float> bins;
+  bins.reserve(64);
+  forEach([&](float x, float y, float z, float cost) {
+    const Vec3 d{x + 0.5f - c.x, y + 0.5f - c.y, z + 0.5f - c.z};
+    if (std::fabs(d.dot(s.v)) > 0.5f) return;
+    const float dw = d.dot(s.w);
+    if (dw < -back) return;
+    if (std::fabs(d.dot(s.u)) > eh) {
+      // Past the end of the edge: this pass cannot part the plane, whatever
+      // the budget. It can still cut as deep as it pays for.
+      r.blocked = true;
+      return;
+    }
+    const size_t k = (size_t)std::floor(dw + back);
+    if (k >= 4096) return;  // a bent limb folded far down the travel axis
+    if (k >= bins.size()) bins.resize(k + 1, 0.0f);
+    bins[k] += std::max(cost, 0.0f);
+  });
+  const float cellArea = 1.0f / (sc * sc);
+  float total = 0.0f;
+  size_t last = 0;
+  for (size_t k = 0; k < bins.size(); k++)
+    if (bins[k] > 0.0f) {
+      total += bins[k];
+      last = k + 1;
+    }
+  r.planeCost = total * cellArea;
+  r.exit = ((float)last - back) / sc;
+  r.through = !r.blocked && last > 0 && budget > 0.0f && r.planeCost <= budget;
+  // How far `extra` reaches past the chip, charged bin by bin.
+  r.depth = startDepth;
+  float left = std::max(extra, 0.0f) / cellArea;
+  size_t k = (size_t)std::max(0.0f, std::floor(startDepth * sc + back));
+  float at = startDepth * sc + back;
+  while (left > 0.0f && k < bins.size()) {
+    const float frac = std::clamp((float)(k + 1) - at, 0.0f, 1.0f);
+    const float price = bins[k] * frac;
+    if (price > left) {
+      at += frac * (left / price);
+      left = 0.0f;
+      break;
+    }
+    left -= price;
+    at = (float)(k + 1);
+    k++;
+  }
+  // Out of matter with budget to spare: the depth is the far side.
+  r.depth = std::max(startDepth, (at - back) / sc);
+  return r;
+}
+
 // ---- THE SLOT ITSELF, AT ONE LATTICE'S RESOLUTION ---------------------------
 //
 // A functor rather than a lambda so both carve families can hold it: the limb
@@ -163,6 +281,7 @@ struct KerfKeep {
   Vec3 c, u, v, w;
   float dep, hw, hl, bk, toSkin;
   uint32_t seed;
+  bool through = false;
   // true = KEEP this voxel.
   bool operator()(float x, float y, float z) const {
     const Vec3 p{x + 0.5f, y + 0.5f, z + 0.5f};
@@ -170,6 +289,9 @@ struct KerfKeep {
     const float dw = d.dot(w);
     if (dw < -bk || dw > dep) return true;
     const float du = d.dot(u), dv = d.dot(v);
+    // A CLEAN PARTING: the edge went all the way, so there is no wedge bottom
+    // and no ragged rim to leave a bridge of flesh across the cut.
+    if (through) return std::fabs(du) > hl || std::fabs(dv) > hw;
     // A BLADE IS A WEDGE. The slot narrows toward its bottom, in both of the
     // axes that are not the travel direction: that is what makes a shallow
     // contact a chip and a deep one a gash, from one shape, with no second
@@ -216,5 +338,12 @@ inline KerfKeep KerfKeepAt(const KerfSlot& s, float scale) {
   k.bk = s.back * scale;
   k.toSkin = s.jitterScale / scale;
   k.seed = s.seed;
+  // A THROUGH CUT MUST PART EVERY LATTICE IT IS TESTED ON. A blade is a
+  // tenth of a voxel thick and a collider cell can be half a voxel, so the
+  // real kerf falls between the coarse lattice's cell centres and physics
+  // would go on holding the head on by a slab the art shows cut. Half a cell
+  // plus a hair is the thinnest slab no 6-connected path can step across.
+  k.through = s.through;
+  if (s.through) k.hw = std::max(k.hw, 0.51f);
   return k;
 }

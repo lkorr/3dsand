@@ -1251,6 +1251,11 @@ function tweakPane() {
                                 'are off the preset, which is fine' }, 'hair'),
             hairStyleControl()),
           el('div', { class: 'brow' },
+            el('span', { title: 'a starting point for every facial-hair ' +
+                                'setting further down, clean-shaven to ' +
+                                'wizard' }, 'beard'),
+            beardStyleControl()),
+          el('div', { class: 'brow' },
             el('span', { title: 'stock hair colours, darkest to lightest. ' +
                                 'The hair swatch further down still takes ' +
                                 'any colour.' }, 'hair colour'),
@@ -1355,6 +1360,37 @@ function hairStyleControl() {
                          'and use the arrow keys',
                   oninput: e => pickStyle(order[Number(e.target.value)]) }),
     el('span', { class: 'hs-name gv' }, (i + 1) + '/' + order.length));
+}
+
+// The beard's twin of the two above: a style is a preset of every beard
+// gene, stepped by name or by slider without rebuilding the page.
+function pickBeard(style) {
+  mg.applyBeardStyle(S.genome, style);
+  setDirty(true);
+  const i = mg.BEARD_STYLE_ORDER.indexOf(style);
+  root.querySelectorAll('.bs-sel').forEach(e => { e.value = style; });
+  root.querySelectorAll('.bs-rng').forEach(e => { e.value = String(i); });
+  root.querySelectorAll('.bs-name').forEach(e => {
+    e.textContent = (i + 1) + '/' + mg.BEARD_STYLE_ORDER.length; });
+  syncRows(p => p.startsWith('face.beard'));
+  renderPreviewOnly();
+}
+
+function beardStyleControl() {
+  const order = mg.BEARD_STYLE_ORDER;
+  const i = Math.max(0, order.indexOf(S.genome.face.beardStyle));
+  return el('span', { class: 'hsctl' },
+    el('select', { class: 'bs-sel', title: 'pick a beard style by name',
+                   onchange: e => pickBeard(e.target.value) },
+       order.map(k => el('option', { value: k,
+                                     selected: S.genome.face.beardStyle === k },
+                         k))),
+    el('input', { type: 'range', class: 'bs-rng', min: 0, max: order.length - 1,
+                  step: 1, value: i,
+                  title: 'step through every beard style, clean-shaven to ' +
+                         'wizard -- drag, or click it and use the arrow keys',
+                  oninput: e => pickBeard(order[Number(e.target.value)]) }),
+    el('span', { class: 'bs-name gv' }, (i + 1) + '/' + order.length));
 }
 
 /** The stock entry whose colours the genome holds exactly, or -1 (custom). */
@@ -1501,6 +1537,8 @@ function geneRow(spec) {
     // The dropdown AND a slider that steps through every style, the same
     // control as the one under the preview (the two stay in step).
     input = hairStyleControl();
+  } else if (spec.path === 'face.beardStyle') {
+    input = beardStyleControl();
   } else if (spec.kind === 'enum') {
     input = el('select', {
       onchange: e => { gset(spec.path, e.target.value);
@@ -1508,6 +1546,8 @@ function geneRow(spec) {
                          mg.applyHairStyle(S.genome, e.target.value);
                        render(); },
     }, spec.choices.map(c => el('option', { value: c, selected: c === v }, c)));
+    // A style pick (beard tone, say) must reach this select too.
+    rowSync.set(spec.path, () => { input.value = mg.getPath(S.genome, spec.path); });
   } else {
     // `uiMax` narrows the TRACK without narrowing the gene. hair.back and
     // hair.front run to 99 because that is how `bald` is spelled -- a hairline

@@ -389,6 +389,104 @@ Status GateDye(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- hair-tuck: HAIR UNDER A HOOD (Mob::SyncHairTuck) -----------------------
+//
+// Lives beside `dye` because it dresses the same kind of rig in the same
+// shipped wardrobe. A generated character's hair is its own limb, so a hood
+// fitted to the head box used to have every long hairstyle poking through it.
+// What is pinned, on a real pool body through the real WearItem:
+//   - a hood hides some hair, and hides it ONLY from the brick: the lattice
+//     the sim reads (burning, carving, saving) keeps every cell;
+//   - a close helm (one eye slit) hides at least as much as an open cowl --
+//     the face opening is the thing that keeps a fringe or a beard drawn;
+//   - a second sync with nothing changed changes nothing;
+//   - taking the headgear off draws every cell again.
+// What it does not pin is the PICTURE; `--shot-mob pool/<stem>:+hood` is that.
+Status GateHairTuck(Ctx& c, std::string& detail) {
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("hair-tuck: FAILED %s\n", what.c_str());
+    }
+  };
+  MobSystem& mobs = c.mobs;
+  // The first pool body whose def has a hair limb on its head. Pool bodies
+  // are generated, so which one that is may change; that there is one is the
+  // premise of the gate, and a pool without hair is reported, not failed.
+  int def = -1;
+  std::string stem;
+  for (const std::string& name : mobs.PoolNames()) {
+    const int d = mobs.PoolDef(name);
+    if (d < 0) continue;
+    for (const MobLimbDef& ld : mobs.Defs()[(size_t)d].limbs)
+      if (ld.bloodless && ld.parent == "head") { def = d; stem = name; break; }
+    if (def >= 0) break;
+  }
+  const int hoodIx = c.items.Find("hood"), helmIx = c.items.Find("iron_helm");
+  if (def < 0 || hoodIx < 0 || helmIx < 0) {
+    detail = "no pool body with head hair, or no hood/iron_helm item";
+    std::printf("hair-tuck: PASS (%s)\n", detail.c_str());
+    return Status::Pass;
+  }
+  const ItemDef* hood = &c.items.items[(size_t)hoodIx];
+  const ItemDef* helm = &c.items.items[(size_t)helmIx];
+  int slot = -1;
+  for (int s = 0; s < kEquipSlotCount && slot < 0; s++)
+    if (EquipSlotIsWorn(s) && EquipSlotAccepts(s, hood->kind)) slot = s;
+  check(slot >= 0, "the hood has a slot on the body");
+
+  mobs.Reset();
+  const IVec3 wOrg = c.world.WindowOrigin();
+  const int sx = wOrg.x * (int)kChunk + 150, sz = wOrg.z * (int)kChunk + 150;
+  const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+  const uint64_t id = mobs.Spawn(def, {sx, h + 1, sz});
+  Mob* m = mobs.FindMobById(id);
+  int hiddenHood = -1, hiddenHelm = -1, lattice = 0;
+  if (m == nullptr || slot < 0) {
+    check(m != nullptr, "the pool body '" + stem + "' spawns");
+  } else {
+    const Mob::HairTuckProbe bare = m->ProbeHairTuck();
+    lattice = bare.latticeCells;
+    check(bare.hairLimbs > 0 && bare.latticeCells > 0, "the body has hair");
+    check(bare.drawnCells == bare.latticeCells && bare.tuckedLimbs == 0,
+          Format("bare, every hair cell is drawn (%d of %d)", bare.drawnCells,
+                 bare.latticeCells));
+
+    check(m->WearItem(hood, slot), "the hood goes on");
+    const Mob::HairTuckProbe hooded = m->ProbeHairTuck();
+    hiddenHood = hooded.latticeCells - hooded.drawnCells;
+    check(hooded.latticeCells == bare.latticeCells,
+          "the hood hides hair from the brick only, not from the lattice");
+    check(hiddenHood > 0 && hooded.tuckedLimbs > 0,
+          Format("the hood hides some hair (%d of %d cells)", hiddenHood,
+                 hooded.latticeCells));
+    m->SyncHairTuck();
+    check(m->ProbeHairTuck().drawnCells == hooded.drawnCells,
+          "a second sync with nothing changed changes nothing");
+
+    check(m->WearItem(helm, slot), "the helm replaces it");
+    const Mob::HairTuckProbe helmed = m->ProbeHairTuck();
+    hiddenHelm = helmed.latticeCells - helmed.drawnCells;
+    check(hiddenHelm >= hiddenHood,
+          Format("a closed helm hides at least what an open cowl does "
+                 "(%d vs %d)", hiddenHelm, hiddenHood));
+
+    m->UnwearItem(slot);
+    const Mob::HairTuckProbe after = m->ProbeHairTuck();
+    check(after.drawnCells == after.latticeCells && after.tuckedLimbs == 0,
+          Format("headgear off, every cell is drawn again (%d of %d)",
+                 after.drawnCells, after.latticeCells));
+  }
+  mobs.Reset();
+  detail = Format("%d checks, %s: %d hair cells, hood hides %d, helm %d",
+                  checks, stem.c_str(), lattice, hiddenHood, hiddenHelm);
+  std::printf("hair-tuck: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& DyeGates() {
@@ -397,6 +495,7 @@ const std::vector<Gate>& DyeGates() {
       // declares the same dependency the other wearing gates do rather than
       // assuming whatever the previous gate left standing.
       {"dye", "equipment", {"prefab"}, false, GateDye},
+      {"hair-tuck", "equipment", {"prefab"}, false, GateHairTuck},
   };
   return g;
 }

@@ -217,6 +217,11 @@ struct ScoopMote {
   int delay;       // ticks until it takes off
   int age;         // ticks in flight
   int life;        // ticks from take-off to the mouth
+  // APPLY MODE flies it the other way (TB_APPLY): out of the mouth onto `to`,
+  // the skin point the brush struck, for what the MPM ghosts cannot carry
+  // (lava, a pouch's powder). `from` is unused then.
+  bool out = false;
+  Vec3 to{};
 };
 
 // A combat cue raised inside the tick loop cannot be played there: audio
@@ -509,12 +514,23 @@ struct PlayerSession {
   // depends on the brush size (PourBrushCellsPerSec), so it is paid off an
   // accumulator rather than a fixed per-tick clock.
   int64_t pourSpendMilli = 0;
+  // APPLY MODE (TB_APPLY): the same brush, on whatever body the crosshair is
+  // on -- another creature, a corpse -- with the vessel in the HAND. Its own
+  // accumulator and stroke, so the portrait brush and this never pay for each
+  // other. `applyMob` is who the stroke is on, so the message names a new
+  // creature once rather than every tick.
+  int64_t applySpendMilli = 0;
+  uint32_t applyTicks = 0;
+  uint64_t applyMob = 0;
   // What this player's scoop has taken that the snapshot cannot see yet.
   ContainerScoopMemo scoopMemo;
   std::vector<ScoopMote> scoopMotes;  // render-only, see ScoopMote
   // THE THROW'S WIND-UP (game/container.h ContainerThrowSpeed): ticks Q has
   // been held with a throwable vessel in hand, 0 when it is not. Counted on
   // the tick, released on the tick; cancelled when the hand changes.
+  // Ticks the `pour` clip has held the arm out (0 = not pouring); the
+  // stream waits for the arm (session.cpp kPourRaiseTicks).
+  int pourPoseTicks = 0;
   int throwTicks = 0;
   int throwSlot = -1;
   // THE RELEASE: Q let go starts the `throw` clip and the vessel leaves the
@@ -526,7 +542,6 @@ struct PlayerSession {
 
   // ---- melee ----
   MeleeState melee;
-  SwingPhase meleePhasePrev = SwingPhase::Idle;
   StrikePicker strikePicker;
   StrokeCursor playerStrike;
   int strikeQueued = -1;    // style index latched at the press, -1 = none
@@ -622,6 +637,13 @@ struct FrameIntent {
   // out from the head (headless harnesses have no camera).
   bool pourAimValid = false;
   Vec3 pourAim{};
+  // APPLY MODE's brush disc, world voxels: the portrait brush's size
+  // (UIState::pourRadius), so one setting governs both. And the crosshair ray
+  // it picks along -- from the RENDER eye, as pourAim is -- so the body the
+  // HUD names is the body that is brushed. Invalid = from the head.
+  float applyRadius = 0.5f;
+  bool aimFromValid = false;
+  Vec3 aimFrom{};
 };
 
 // ---- the world a tick runs in ---------------------------------------------

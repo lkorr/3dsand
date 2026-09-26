@@ -251,6 +251,26 @@ function canonical(o) {
   return o;
 }
 
+/** Equal as documents (notes ignored, key order ignored), except that a key
+ *  time `t` under a clip's `tracks` may differ by up to 1 ms. That is the
+ *  rounding slack between the retime rule and a generator's own key layout,
+ *  and the ONLY slack the diff grants: every other number is exact. */
+function sameUpToKeyTimes(a, b, key = '', inTracks = false) {
+  if (typeof a === 'number' && typeof b === 'number')
+    return a === b || (inTracks && key === 't' && Math.abs(a - b) <= 1);
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((x, i) => sameUpToKeyTimes(x, b[i], key, inTracks));
+  }
+  if (a && b && typeof a === 'object' && typeof b === 'object') {
+    const ka = Object.keys(a).filter(k => !k.startsWith('//')).sort();
+    const kb = Object.keys(b).filter(k => !k.startsWith('//')).sort();
+    if (ka.join('\0') !== kb.join('\0')) return false;
+    return ka.every(k => sameUpToKeyTimes(a[k], b[k], k, inTracks || k === 'tracks'));
+  }
+  return a === b;
+}
+
 function diffNamedArray(base, target, path) {
   const baseNames = base.map(e => e.name);
   const targetNames = target.map(e => e.name);
@@ -298,12 +318,19 @@ export function diffAgainst(base, target, path = '') {
     // instead of five kilobytes. Tried first, and only accepted if the retime
     // actually reproduces this clip key for key — a clip whose shape changed
     // as well is emitted in full.
+    //
+    // "Key for key" is to the MILLISECOND, not exactly: the retime rounds
+    // old*new/old to the nearest ms while a generator lays its own keys at
+    // floor(period/2), and those disagree by 1 ms for about half of all
+    // periods (human 647 -> yorg 656: 323 retimes to 327, the generator wrote
+    // 328). Demanding exactness there wrote yorg's whole arm swing out and
+    // cut it off from every later edit to the human's walk, for a 1 ms key.
     if (isClipSlot(sub) && typeof target[k].durationMs === 'number' &&
         typeof base[k].durationMs === 'number') {
       const trial = retimeClip(clone(base[k]), base[k].durationMs,
                                target[k].durationMs);
       trial.durationMs = target[k].durationMs;
-      if (deepEqual(trial, target[k])) {
+      if (sameUpToKeyTimes(trial, target[k])) {
         patch[k] = { durationMs: target[k].durationMs };
         continue;
       }
@@ -321,10 +348,11 @@ export function diffAgainst(base, target, path = '') {
     if (!k.startsWith('//') && !(k in target)) patch[k] = null;
   if (!Object.keys(patch).length) return undefined;
   // SELF-CHECK. The diff is only worth writing if re-applying it reproduces
-  // the body exactly, and at the root that is a claim about the whole file.
+  // the body exactly, and at the root that is a claim about the whole file —
+  // exactly except a clip key time, which the retime above may move by 1 ms.
   if (path === '') {
     const back = mergePatch(clone(base), clone(patch), '');
-    if (!deepEqual(noNotes(back), noNotes(target)))
+    if (!sameUpToKeyTimes(back, target))
       throw new Error('the diff does not resolve back to the body it came ' +
                       'from — refusing to write a thin sidecar that would ' +
                       'load as a different creature');

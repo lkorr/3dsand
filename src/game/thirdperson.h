@@ -40,12 +40,10 @@ const char* CameraModeName(CameraMode m);
 //   - Third person: face the TRAVEL DIRECTION. Holding W squares the character
 //     to where they run, with no slack. Below `turnMinSpeed` the facing holds
 //     rather than chasing a near-zero velocity vector.
-//   - First person: face the CAMERA, but let the neck absorb the first
-//     `headLookYaw` degrees so a glance does not pivot the feet. Past the cone
-//     the body is dragged by the excess only. Inside it, the body still eases
-//     back to the view WHILE WALKING (headLookRecenterHalflife) — without that
-//     restoring term the dead zone is a drift trap and the facing freezes
-//     wherever the last turn left it, taking the arms with it.
+//   - First person: face the CAMERA, always — standing or moving, no neck
+//     dead zone — eased only by `firstPersonTurnHalflife`. The walk basis is
+//     the camera, so any body/view slack read as walking crabwise; A/D is a
+//     true strafe with the body square to the view.
 //
 // `camHeading` and `heading` are in the rig's heading convention (forward is
 // (sin h, ., cos h)); `planarVel` is the player's world-voxel velocity with y

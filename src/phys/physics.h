@@ -233,6 +233,15 @@ class Physics {
   // back on the plain MOVING layer and shoved them — a burning gobbet that
   // shrinks (DebrisSystem's burn rebuild) did exactly that, every rebuild.
   void CarryLayer(uint64_t from, uint64_t to);
+  // WHERE A REBUILT COLLIDER WENT. Every rebuild (ReplaceBody, a limb's carve
+  // rebuild, a split's pieces) passes through CarryLayer, which records
+  // from -> to in a small ring. Something holding a handle across a hit — the
+  // physics grab (game/grab.h) — asks this when its handle dies instead of
+  // letting go. Several successors (a split) answer the heaviest one still
+  // alive. A successor that was itself rebuilt again is still returned, so the
+  // caller can walk the chain; 0 when the record has aged out of the ring.
+  // Read by nothing that is hashed: the grab is player input.
+  uint64_t Successor(uint64_t handle) const;
   // Joints currently attached to one body / alive in the whole system.
   uint32_t JointCount(uint64_t handle) const;
   uint32_t JointCount() const;
@@ -675,6 +684,12 @@ class Physics {
   // proxies (selftest_phys/selftest_mob do) does not grow this without bound.
   std::vector<uint64_t> playerBodies_;
   std::vector<uint64_t> pendingRelease_;
+  // CarryLayer's from -> to record (Successor). A ring, so it never grows:
+  // 1024 rebuilds is far more than can happen between two grab servo ticks,
+  // even with a forest fire rebuilding burning bodies.
+  struct Rebuilt { uint64_t from = 0, to = 0; };
+  std::vector<Rebuilt> rebuilt_ = std::vector<Rebuilt>(1024);
+  uint32_t rebuiltHead_ = 0;
   // World-space AABB of a live body, metres. False for a dead handle.
   bool WorldBounds(uint64_t handle, float outMin[3], float outMax[3]) const;
   void TickPendingReleases();

@@ -346,7 +346,6 @@ struct TickScratch {
   auto& spellFlashes = s.spellFlashes;                     \
   int& castAtPartQueued = s.castAtPartQueued;              \
   MeleeState& melee = s.melee;                             \
-  SwingPhase& meleePhasePrev = s.meleePhasePrev;           \
   StrikePicker& strikePicker = s.strikePicker;             \
   StrokeCursor& playerStrike = s.playerStrike;             \
   int& strikeQueued = s.strikeQueued;                      \
@@ -557,15 +556,12 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
       // calling this would overwrite the first. The format that carries one
       // command per player is M9.2's wire, not this file's record.
       if (s.index == 0) sandvox::opstream::NoteTickInput(tick, ti);
-      // ---- THE LOOK DELTA, ROUTED BY MODE, ONCE PER TICK ------------------
-      // Both consumers integrate a whole tick's raw pixels at kTickDt now.
-      // Feeding both would double-integrate the same motion into the swing
-      // accumulator and bend every authored cut (D10 of the discrete-strikes
-      // plan), so this is still an either/or — it simply happens on the tick
-      // clock instead of the frame clock.
-      if (CurrentTuning().melee.controlMode == 1) {
-        melee.Feed(ti.lookDx, ti.lookDy);
-      } else {
+      // ---- THE LOOK DELTA, ONCE PER TICK, TO THE STRIKE PICKER --------------
+      // The picker integrates a whole tick's raw pixels at kTickDt. It is the
+      // ONLY consumer: the swing driver is fed by the stroke program, and
+      // feeding it the mouse as well would bend every authored cut (D10 of the
+      // discrete-strikes plan — the freeform mode that did is gone).
+      {
         strikePicker.Feed(ti.lookDx, ti.lookDy, kTickDt);
         // DISCRETE STRIKES: the click is the whole input, and the flick is
         // read at the tick that consumes the press edge — the freshest read
@@ -1755,8 +1751,16 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                              ? ContainerThrowCharge(*tdef, s.throwTicks)
                              : -1.0f;
       }
-      if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots &&
-          s.throwTicks == 0 && s.throwLaunchIn == 0) {
+      const bool vesselHands = st.intent.vesselSlot >= 0 &&
+                               st.intent.vesselSlot < kItemSlots &&
+                               s.throwTicks == 0 && s.throwLaunchIn == 0;
+      // The pour pose ends with the hands: a flask put away (or thrown)
+      // mid-pour must not leave the arm out.
+      if (!vesselHands && s.pourPoseTicks > 0) {
+        if (avatar.Spawned()) avatar.StopClip("pour");
+        s.pourPoseTicks = 0;
+      }
+      if (vesselHands) {
         ItemStack& vs = hotbar.slots[st.intent.vesselSlot];
         const ItemDef* vdef = items.Of(vs);
         const WorldSnapshot& vsnap = world.Snap();
@@ -1770,16 +1774,38 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         // THE MOUTH: the held rig part when there is one, so the water
         // visibly leaves (and enters) the thing in your hand; else just in
         // front of and below the eye (fly mode, no body).
-        auto vesselMouth = [&]() {
+        // `toward` is where the contents are going (or coming from): the
+        // mouth is the vessel's own lip on that side (Mob::HeldMouthWorld),
+        // so with the arm out in the `pour` clip the stream leaves the flask.
+        auto vesselMouth = [&](Vec3 toward) {
           Vec3 mouth = eye + fwd * MetresToCells(0.35f) -
                        Vec3{0, MetresToCells(0.15f), 0};
           Vec3 hp;
           Quat hq;
           const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
-          if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq))
+          if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq)) {
             mouth = hp + Vec3{0, MetresToCells(0.08f), 0};
+            Vec3 lip;
+            if (avatar.HeldMouthWorld(toward - hp, lip)) mouth = lip;
+          }
           return mouth;
         };
+        // THE POUR POSE (assets/anims/pour.json): the arm comes up and out
+        // while LMB pours or applies from a filled vessel, and nothing leaves
+        // the flask until it is up (kPourRaiseTicks), so the stream starts at
+        // the outstretched hand rather than at the hip. No body = no wait.
+        constexpr int kPourRaiseTicks = 4;
+        const bool pourPose = vdef && vdef->IsContainer() && vs.Filled() &&
+                              ti.Held(TB_ATTACK) && !ti.Held(TB_ALT) &&
+                              avatar.Spawned();
+        if (pourPose) {
+          if (s.pourPoseTicks == 0) avatar.PlayClip("pour");
+          s.pourPoseTicks = std::min(s.pourPoseTicks + 1, 1 << 20);
+        } else if (s.pourPoseTicks > 0) {
+          avatar.StopClip("pour");
+          s.pourPoseTicks = 0;
+        }
+        const bool armUp = !avatar.Spawned() || s.pourPoseTicks > kPourRaiseTicks;
         // Particles the MPM pool can still take this tick (rule 2: charged
         // BEFORE emission, against the cap and the spawn stream both).
         auto fluidRoom = [&]() -> uint32_t {
@@ -1823,7 +1849,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               const uint16_t mmat = s.scoopMemo.PendingMat();
               const bool asFluid =
                   mmat < mats.size() && ContainerPoursAsFluid(mats[mmat]);
-              const Vec3 smouth = vesselMouth();
+              const Vec3 smouth = vesselMouth(Vec3{hit.x + 0.5f, hit.y + 0.5f, hit.z + 0.5f});
               int k = 0;
               for (const ContainerScoopMemo::Taken& t : s.scoopMemo.cells) {
                 if (t.tick != landing) continue;  // claimed on an earlier tick
@@ -1859,7 +1885,119 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           }
           if (ti.Pressed(TB_ALT)) say(why);
         }
-        if (vdef && vdef->IsContainer() && ti.Held(TB_ATTACK) && !ti.Held(TB_ALT)) {
+        // ---- APPLY MODE (TB_APPLY, F with a vessel in hand) ----------------
+        //
+        // LMB is the health panel's pour brush turned outward: the crosshair
+        // ray meets a creature's collider (Physics::CastRayBody -> FindOwner,
+        // living or a corpse, never your own limbs), then its skin cells
+        // (MobSystem::PickBody), and the disc round the hit takes coat every
+        // tick the button is held (PourOnBody) -- water WASHES blood off, acid
+        // coats and eats, a salve runs its `coat.effects`. The spend is the
+        // portrait brush's (PourBrushCellsPerSec, off its own accumulator) and
+        // only on ticks the ray meets skin. The picture is the scoop stream
+        // backwards: ghosts (or motes) from the flask's mouth onto the spot.
+        if (vdef && vdef->IsContainer() && ti.Held(TB_ATTACK) && !ti.Held(TB_ALT) &&
+            ti.Held(TB_APPLY)) {
+          bool applied = false;
+          if (!vs.Filled()) {
+            if (ti.Pressed(TB_ATTACK)) say("it is empty");
+          } else if (!ContainerIsolateOne(hotbar.slots, kItemSlots,
+                                          st.intent.vesselSlot, kit.bag.slots,
+                                          Bag::kSlots)) {
+            if (ti.Pressed(TB_ATTACK)) say("no room to set the others down");
+          } else {
+            const Vec3 ro = st.intent.aimFromValid ? st.intent.aimFrom : eye;
+            const Vec3 rd = fwd.normalized();
+            // Reach is measured from the CHARACTER, not the camera boom: the
+            // part of the ray behind the head is free.
+            const float maxT = std::max(0.0f, (eye - ro).dot(rd)) +
+                               vdef->container.pourRange + MetresToCells(1.0f);
+            std::vector<uint64_t> own;
+            avatar.AppendLiveLimbBodies(own);
+            float frac = 1.0f;
+            const uint64_t body = phys.CastRayBody(ro, rd, maxT, frac, own);
+            Mob* target = body ? mobs.FindOwner(body) : nullptr;
+            if (target && avatar.Spawned() && target->Id() == avatar.Id())
+              target = nullptr;
+            MobSystem::BodyRayHit hit;
+            if (target) hit = mobs.PickBody(target->Id(), ro, rd, maxT);
+            if (hit.hit && !armUp) {
+              applied = true;  // the arm is still coming up: aimed, not yet pouring
+            } else if (hit.hit) {
+              applied = true;
+              const uint32_t mat = vs.fillMat;
+              const float radius = std::max(0.1f, st.intent.applyRadius);
+              s.applySpendMilli += (int64_t)std::llround(
+                  PourBrushCellsPerSec(*vdef, radius) * kContainerUnitsPerCell *
+                  1000.0f / 30.0f);
+              const int units = (int)(s.applySpendMilli / 1000);
+              s.applySpendMilli -= (int64_t)units * 1000;
+              if (units > 0) {
+                vs.fillAmt = (uint16_t)(vs.fillAmt - std::min<int>(units, vs.fillAmt));
+                if (vs.fillAmt == 0) vs.fillMat = 0;
+              }
+              uint32_t marked = 0;
+              // +3 a tick, as the portrait brush: five ticks on one spot soak it.
+              const uint32_t did = mobs.PourOnBody(target->Id(), hit, rd, radius,
+                                                   mat, 3u, tick, &marked);
+              if (s.applyTicks == 0 || s.applyMob != target->Id() || did) {
+                const MobDef* md = target->Def();
+                const std::string who =
+                    std::string(target->Alive() ? "the " : "the dead ") +
+                    (md ? md->name : std::string("creature"));
+                std::string part;
+                if (md && hit.limb >= 0 && hit.limb < (int)md->limbs.size())
+                  part = "'s " + md->limbs[hit.limb].name;
+                std::string msg = "you apply " +
+                                  (mat < mats.size() ? mats[mat].name : std::string("it")) +
+                                  " to " + who + part;
+                if (did & MobSystem::kRemedyStanch) msg += "; the bleeding stops";
+                if (did & MobSystem::kRemedyDisinfect) msg += "; the rot stops spreading";
+                ui.kitMessage = msg;
+                ui.kitMessageAge = 0.0f;
+              }
+              s.applyMob = target->Id();
+              s.applyTicks++;
+              // THE PICTURE: out of the mouth onto the spot. Liquids the
+              // solver can carry go as ghost MPM water, anything else as
+              // sprite motes (ScoopMote::out). Flight time grows with the
+              // distance, as the scoop's does.
+              const Vec3 amouth = vesselMouth(hit.pos);
+              const float d = (hit.pos - amouth).len();
+              const int life = 4 + (int)(d / MetresToCells(0.5f));
+              if (mat < mats.size() && ContainerPoursAsFluid(mats[mat])) {
+                ContainerApplyStream(amouth, hit.pos, mat, life, 4,
+                                     0xA991Eu ^ (uint32_t)st.intent.vesselSlot,
+                                     tick, fluidRoom(), fluidSpawns);
+              } else if (s.scoopMotes.size() < 96) {
+                for (int k = 0; k < 2; k++) {
+                  uint32_t h = rng::Hash3(0xA991Eu, tick, (uint32_t)k + 1u);
+                  ScoopMote m;
+                  m.out = true;
+                  m.from = amouth;
+                  m.to = hit.pos;
+                  m.color = mat < mats.size() ? mats[mat].gpu.color0 : 0xFFFFFFFFu;
+                  m.seed = h;
+                  m.delay = k;
+                  m.age = 0;
+                  m.life = life + (int)(h % 3u);
+                  s.scoopMotes.push_back(m);
+                }
+              }
+            } else if (ti.Pressed(TB_ATTACK)) {
+              say("there is nobody there to apply it to");
+            }
+          }
+          if (!applied) {
+            s.applyTicks = 0;
+            s.applySpendMilli = 0;
+          }
+        } else {
+          s.applyTicks = 0;
+          s.applySpendMilli = 0;
+        }
+        if (vdef && vdef->IsContainer() && ti.Held(TB_ATTACK) && !ti.Held(TB_ALT) &&
+            !ti.Held(TB_APPLY)) {
           if (!vs.Filled()) {
             if (ti.Pressed(TB_ATTACK)) say("it is empty");
           } else if (!ContainerIsolateOne(hotbar.slots, kItemSlots,
@@ -1869,8 +2007,6 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             // one fill is one flask's, so only one of them may pour it.
             if (ti.Pressed(TB_ATTACK)) say("no room to set the others down");
           } else {
-            // OUT OF THE FLASK, from its mouth.
-            const Vec3 mouth = vesselMouth();
             // AIMED, always, at the pour point (ContainerPourPoint): a metre
             // along the look, or the first thing in the way -- the point
             // main.cpp draws the marker sphere on. The stream is solved to pass
@@ -1882,7 +2018,10 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               avatar.AppendLiveLimbBodies(own);
               target = ContainerPourPoint(*vdef, eye, eye, fwd, s.kindAt, phys, own);
             }
-            if (world.CellInWindow({ifloor(mouth.x), ifloor(mouth.y),
+            // OUT OF THE FLASK, from its lip on the target's side -- once the
+            // arm is up (the pour pose above).
+            const Vec3 mouth = vesselMouth(target);
+            if (armUp && world.CellInWindow({ifloor(mouth.x), ifloor(mouth.y),
                                     ifloor(mouth.z)})) {
               // Water leaves as MLS-MPM fluid (ContainerPourFluid) when the
               // solver can hold it; lava, blood and the pouch's powders keep
@@ -2217,23 +2356,13 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           } else {
             melee.ClearArm();
           }
-          // ---- WHICH MODE FEEDS THE DRIVER (melee.controlMode; tuning.h) ---
-          // Read HERE and nowhere else. Downstream, the pose push, Arrest and
-          // Nudge are mode-blind; the sweep and the whoosh key on
-          // `melee.Cutting() || playerStrike.Cutting()`, which needs no mode
-          // read because a freeform tick keeps the cursor Idle.
-          const int meleeMode = CurrentTuning().melee.controlMode;
-          // The program entered its cut THIS tick (the discrete whoosh edge —
-          // see the whoosh block below for why Slash cannot be the trigger).
+          // ---- THE STROKE PROGRAM FEEDS THE DRIVER --------------------------
+          // The sweep and the whoosh key on `playerStrike.Cutting()` — the
+          // PROGRAM's cut, the NPC's own contract. The driver has no cut of its
+          // own (melee.h SwingPhase).
+          // The program entered its cut THIS tick (the whoosh edge).
           bool strikeCutEdge = false;
-          if (meleeMode == 1) {
-            // FREEFORM: the original law, untouched. A mode flip mid-swing
-            // (F5) drops any live program rather than leaving it half-run.
-            playerStrike.Reset();
-            strikeQueued = strikeBuffered = -1;
-            melee.Update(kTickDt, meleeReady && ti.Held(TB_ATTACK),
-                         meleeReady, swRight, swUp, swFwd);
-          } else {
+          {
             // DISCRETE: consume the press latch, then step the program. Begin
             // and first step land on the SAME tick, exactly as the NPC's
             // BeginStroke/StepStroke pair does.
@@ -2378,7 +2507,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               melee.Update(kTickDt, false, meleeReady, swRight, swUp, swFwd);
             }
           }
-          // ---- THE SWING WHOOSH, on the EDGE into Slash --------------------
+          // ---- THE SWING WHOOSH, on the EDGE into the program's cut --------
           // A commit is a moment, so this fires once per cut rather than on
           // every tick the slash is live. Latched (not played here) because
           // this is inside the tick loop and audio drains once per frame.
@@ -2389,17 +2518,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           // number the damage curve used, and a lazy wave under
           // combatfx.whooshMinSpeed makes no sound at all rather than a quiet
           // one — which is the honest report that it was not a cut.
-          //
-          // TWO TRIGGERS, ONE PER MODE, never both: freeform commits Slash by
-          // mouse speed, but an authored THRUST drives mostly the radial
-          // channel, which commitSpeed never sees — it can finish its whole
-          // cut without ever entering Slash (the player-styles gate found
-          // exactly this), so in discrete mode the cue keys on the PROGRAM's
-          // own cut edge instead. OR-ing the two would whoosh a committed
-          // discrete cut twice, one tick apart.
-          const bool slashEdge = melee.Phase() == SwingPhase::Slash &&
-                                 meleePhasePrev != SwingPhase::Slash;
-          if (meleeMode == 0 ? strikeCutEdge : slashEdge) {
+          if (strikeCutEdge) {
             const Tuning::CombatFx& fx = CurrentTuning().combatfx;
             const float lo = fx.whooshMinSpeed;
             const float hi = std::max(melee.tuning.commitSpeed, lo + 1.0f);
@@ -2421,7 +2540,6 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                       : player.pos;
             }
           }
-          meleePhasePrev = melee.Phase();
           if (avatar.Spawned()) {
             // Weight rises while the weapon is up and FADES over the releasing
             // recover, so the arm is handed back to the walk cycle across a
@@ -2430,7 +2548,14 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // travels as ONE value — hand, blade axis, blade roll and the
             // elbow's bend pole — because the rig needs all four to put the
             // sword where the stroke says it is.
-            avatar.SetWeaponPose(melee.Pose());
+            WeaponPose wp = melee.Pose();
+            // The live discrete strike's per-joint brakes (melee.h ArmSmooth).
+            if (playerStrike.phase != StrokeCursor::Phase::Idle &&
+                playerStrike.style >= 0)
+              if (const AttackStyle* sty =
+                      mobs.AttackStyles().At(playerStrike.style))
+                wp.smooth = sty->joints;
+            avatar.SetWeaponPose(wp);
           }
         }
         // ---- ARMOUR: the body wears what the kit's equipment says -----------
@@ -3185,28 +3310,23 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
       //
       // Deferred to this point for the same reason the laser kerf is: a carve
       // needs the `spawns` list debris.PreTick fills just above.
-      avatar.SetSwinging(melee.Cutting() || playerStrike.Cutting());
+      avatar.SetSwinging(playerStrike.Cutting());
       if (avatar.Spawned() && meleeReady) {
         Vec3 eb, et, ef;
         float ehw = 0;
         if (avatar.WeaponEdge(eb, et, ehw, &ef)) {
-          // EITHER cut counts, and no mode read is needed: a freeform tick
-          // keeps the cursor Idle, and a discrete one may cut without ever
-          // committing Slash — an authored THRUST drives mostly the radial
-          // channel, which commitSpeed never sees, so gating on the driver
-          // alone made thrusts free actions (the player-styles gate caught
-          // it). This is the NPC's own contract: MobSystem::StepStroke sweeps
-          // on the CURSOR's cut, and tip speed still scales the damage.
+          // THE PROGRAM'S CUT is the cut — the NPC's own contract:
+          // MobSystem::StepStroke sweeps on the CURSOR's cut, and tip speed
+          // still scales the damage.
           // ONE STROKE, ONE IMPULSE PER SLOT (melee.h EdgeSweep::struck). The
-          // set is cleared on the first tick neither cut state is live, which
-          // is the same "is a cut happening" test the sweep gates on -- so a
-          // freeform wave and a discrete program both get exactly one blunt
-          // hit per body per swing with no mode read of their own.
-          if (!(melee.Cutting() || playerStrike.Cutting())) {
+          // set is cleared on the first tick the program is not cutting, the
+          // same test the sweep gates on, so a strike gets exactly one blunt
+          // hit per body per swing.
+          if (!playerStrike.Cutting()) {
             playerStruck.clear();
             playerBitten = false;
           }
-          if (lastEdgeValid && (melee.Cutting() || playerStrike.Cutting())) {
+          if (lastEdgeValid && playerStrike.Cutting()) {
             EdgeSweep sw;
             sw.aPrev = lastEdgeBase;
             sw.bPrev = lastEdgeTip;
@@ -3241,10 +3361,8 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
             }
             sw.tick = tick;
             // BLUNT AND BITE ARE IMPULSES (melee.h EdgeSweep::struck). The
-            // player has TWO cut states -- the discrete program's cursor and
-            // the freeform driver's own Slash -- so the set is owned here and
-            // cleared on the tick neither is cutting, which is mode-blind and
-            // is the same line the sweep gate below already reads.
+            // set is owned here and cleared on the tick the program is not
+            // cutting, the same line the sweep gate above reads.
             sw.struck = &playerStruck;
             sw.bitten = &playerBitten;
             // A FIST IS PART OF THE ARM THAT THROWS IT (melee.h selfMounted).
@@ -3875,6 +3993,9 @@ static void PhaseN(TickAuthorityCtx& w, WorldScratch& ws,
         std::vector<ParticleSpawn> contactGore;
         mobs.ApplyContactDamage(phys, world, contactGore);
       }
+      // LAST: after every burn and carve of the tick, so the frame never draws
+      // a hooded head with hair a hit just re-packed poking through the hood.
+      mobs.SyncHairTuck();
   }
 }
 
@@ -3891,6 +4012,7 @@ static void PhaseO(TickAuthorityCtx& w, WorldScratch& ws,
   SV_SEAM_REFS_PLAYER
   {
       avatar.PostStep();
+      avatar.SyncHairTuck();   // the player's hair under their own hood
       // ---- the player follows a ragdolled body ----
       // Limp: the capsule rides the pelvis wherever Jolt threw it, so the
       // camera goes with the body. Getting up: it sits on the standing spot

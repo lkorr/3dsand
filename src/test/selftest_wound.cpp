@@ -266,6 +266,92 @@ void PrepareWorld(Ctx& c) {
 }
 
 // ---------------------------------------------------------------------------
+// hair-rooted: a blade cuts hair, it does not take it off whole
+// ---------------------------------------------------------------------------
+// The owner, 2026-09-25: "when in combat entire hair pieces fall off; hair
+// shouldn't come off of mobs entirely as if it's an independent limb / wig".
+// A hair piece is `severable` only so that losing it is no death, and that
+// flag opted it into the arm's whole-limb severs -- the one-cell joint test at
+// its anchor above all, which a single nick at the scalp tripped.
+// SeverPolicy::rooted takes those away (severpolicy.h).
+//
+// FIXTURE. The biggest hair piece on any loaded def, cut hard and repeatedly,
+// half the strokes AT THE ANCHOR (the joint test's whole subject) and half
+// through the mass. Asserted: the cuts took hair (it is a wound, not armour)
+// and the piece is still on the creature at the end.
+Status GateHairRooted(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  // The biggest bloodless (hair) limb, measured by spawning -- ChooseTarget's
+  // method, with its hair exclusion inverted. Hair lives on the random-human
+  // POOL bodies (MobSystem::PoolDef), which no startup load lists, so the
+  // candidates are the loaded defs plus the first pool body that has any.
+  auto hasHair = [&](int d) {
+    for (const MobLimbDef& ld : mobs.Defs()[d].limbs)
+      if (ld.bloodless) return true;
+    return false;
+  };
+  std::vector<int> cands;
+  for (size_t d = 0; d < mobs.Defs().size(); d++)
+    if (hasHair((int)d)) cands.push_back((int)d);
+  for (const std::string& n : mobs.PoolNames()) {
+    if (!cands.empty()) break;
+    const int d = mobs.PoolDef(n, nullptr);
+    if (d >= 0 && hasHair(d)) cands.push_back(d);
+  }
+  Target t;
+  const IVec3 site = FixtureSite(c.world, 170);
+  for (int d : cands) {
+    const MobDef& def = mobs.Defs()[d];
+    mobs.Reset();
+    const uint64_t id = mobs.Spawn(d, site);
+    if (!id) continue;
+    for (size_t li = 0; li < def.limbs.size(); li++) {
+      if (!def.limbs[li].bloodless || !mobs.LimbBody(id, (int)li)) continue;
+      const uint32_t n = mobs.LimbVoxelsAtSpawn(id, (int)li);
+      if (n <= t.atSpawn) continue;
+      t.defIndex = d;
+      t.limb = (int)li;
+      t.atSpawn = n;
+      t.defName = def.name;
+      t.limbName = def.limbs[li].name;
+    }
+  }
+  mobs.Reset();
+  if (!t.valid()) {
+    detail = "no loaded or pool mob def has a hair (bloodless) limb with a body";
+    return Status::Fail;
+  }
+  IVec3 pchunk{};
+  const uint64_t id = SpawnTarget(c, t, 170, pchunk);
+  if (!id) { detail = "spawn refused"; return Status::Fail; }
+
+  const uint32_t before = mobs.LimbArtVoxelCount(id, t.limb);
+  std::vector<ParticleSpawn> spawns;
+  const int kCuts = 16;
+  int landed = 0, cutsMade = 0;
+  for (int k = 0; k < kCuts && mobs.LimbBody(id, t.limb); k++) {
+    const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+    const float along = (k & 1) ? ax.reach * (0.25f + 0.1f * (float)(k % 5))
+                                : ax.reach * 0.05f;
+    cutsMade++;
+    if (CutOnce(mobs, c.world, id, t.limb, ax, along, 1.0f, 1.5f,
+                0xA1Au + (uint32_t)k, spawns))
+      landed++;
+  }
+  const bool attached = mobs.LimbBody(id, t.limb) != 0;
+  const uint32_t after = attached ? mobs.LimbArtVoxelCount(id, t.limb) : 0;
+  const bool cut = landed > 0 && after < before;
+  const bool ok = attached && cut;
+  detail = Format("%s/%s: %d/%d cuts landed, %u -> %u voxels, %s",
+                  t.defName.c_str(), t.limbName.c_str(), landed, cutsMade,
+                  before, after, attached ? "still on" : "CAME OFF WHOLE");
+  std::printf("hair-rooted: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
 // wound-chip: one cut is a wound
 // ---------------------------------------------------------------------------
 Status GateWoundChip(Ctx& c, std::string& detail) {
@@ -7459,9 +7545,331 @@ Status GateCorpseCap(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// head-cleave: a blade takes a head when the blow can PAY for the neck
+// ---------------------------------------------------------------------------
+// The owner, 2026-09-25: "some sword hits [should] be able to just sever a head
+// entirely upon killing a mob, but it has to depend on the size of the sword,
+// how many voxels it chips, how well it hits the head ... and also give
+// players the ability to deliberately sever heads with corpses by positioning
+// the body around and purposefully striking the head/neck". Neither happened:
+// a fixed-depth kerf could never come out the far side of a neck, and
+// hand-aimed chops each opened their own slit beside the last one.
+//
+// phys/kerf.h now prices the plane a blow cuts along (KerfBite). The claims:
+//
+//   A. PRICE. The neck is the cheapest plane on the head, and a plane through
+//      the skull costs several times more (bone at 3x skin). Measured with
+//      no-cleave chips on fresh spawns; the neck's along-axis offset found
+//      here is where B and C aim.
+//   B. COMBAT. A perfect swing of the stock sword across a live neck goes
+//      THROUGH: the head comes off by a blade and the creature dies of it. A
+//      swing at headCleaveWeakPower does not, and a perfect swing into the
+//      skull does not.
+//   C. DELIBERATE. On a corpse, committed (not perfect) chops with hand-aim
+//      jitter along the neck take the head off within headCorpseMaxChops on
+//      average, and slow chops with no cleave in them still do within
+//      headCorpseSlowMaxChops: patience pays, because every chip is cells no
+//      longer in the plane.
+namespace {
+
+struct CleaveBlow {
+  float along = 0.5f;   // world voxels from the head's anchor, along its axis
+  float power = 1.0f;
+  float heft = 1.0f;
+  float edgeHalf = 2.0f;
+  float halfWidth = 0.1f;
+  float spin = 0.0f;    // radians about the head's axis (approach side)
+  float tilt = 0.0f;    // radians the cut plane leans off square
+  uint32_t seed = 0;
+};
+
+Vec3 RotateAbout(Vec3 p, Vec3 axis, float ang) {
+  const float c = std::cos(ang), s = std::sin(ang);
+  return p * c + axis.cross(p) * s + axis * (axis.dot(p) * (1.0f - c));
+}
+
+// One blade blow on the head, built by the same lines melee.cpp's
+// BuildStrikeParts builds one with (the cleave included), so retuning moves
+// the gate and the game together.
+bool LandCleave(MobSystem& mobs, World& world, uint64_t id, int head,
+                const CleaveBlow& b, std::vector<ParticleSpawn>& spawns) {
+  const LimbAxis ax = MeasureLimb(mobs, id, head);
+  const uint64_t body = mobs.LimbBody(id, head);
+  if (!body || !ax.valid) return false;
+  const auto& g = CurrentTuning().gore;
+  Vec3 edge = RotateAbout(ax.edge, ax.along, b.spin);
+  Vec3 travel = RotateAbout(ax.travel, ax.along, b.spin);
+  travel = RotateAbout(travel, edge, b.tilt);
+  BladeCut cut;
+  cut.at = ax.anchor + ax.along * b.along;
+  cut.edgeAxis = edge;
+  cut.cutDir = travel;
+  cut.halfWidth = b.halfWidth;
+  cut.depth = (g.cutDepth + g.cutDepthPower * b.power) * b.heft;
+  cut.length = g.cutLength * (0.4f + 0.6f * b.power) * b.heft;
+  cut.edgeHalf = b.edgeHalf;
+  const float from = std::clamp(g.cleaveFrom, 0.0f, 0.95f);
+  const float x = std::clamp((b.power - from) / (1.0f - from), 0.0f, 1.0f);
+  cut.cleave = std::max(g.cleaveArea, 0.0f) * b.heft * x * x;
+  cut.power = b.power;
+  cut.seed = b.seed;
+  return mobs.CutLimb(body, cut, world, spawns, b.power);
+}
+
+}  // namespace
+
+Status GateHeadCleave(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 260;
+  // THE HUMAN, by name: the claim is about a man's neck, and the fallback of
+  // "the first def with a vital severable limb" could land on anything.
+  Target t;
+  for (size_t d = 0; d < mobs.Defs().size() && !t.valid(); d++) {
+    const MobDef& def = mobs.Defs()[d];
+    if (def.name != "human") continue;
+    for (size_t li = 0; li < def.limbs.size(); li++)
+      if (def.limbs[li].vital && def.limbs[li].severable &&
+          (int)li != def.rootLimb) {
+        t.defIndex = (int)d;
+        t.limb = (int)li;
+        t.defName = def.name;
+        t.limbName = def.limbs[li].name;
+        break;
+      }
+  }
+  if (!t.valid()) {
+    detail = "no 'human' def with a vital severable head";
+    return Status::Skip;
+  }
+  const int head = t.limb;
+  // The stock sword's own numbers: heft off its art, the edge it swings.
+  const auto& g = CurrentTuning().gore;
+  const ItemDef* sword = c.items.At(c.items.Find("sword"));
+  const float heft =
+      sword ? sword->HeftFactor(g.woundHeftRef, g.woundHeftMax) : 1.0f;
+  const float edgeHalf =
+      sword && sword->hasEdge ? (sword->edgeTo - sword->edgeFrom).len() * 0.5f
+                              : 2.0f;
+  const float halfWidth =
+      std::max((sword ? sword->edgeHalfWidth : 0.5f) * g.cutWidth, 0.08f);
+  std::vector<ParticleSpawn> spawns;
+  IVec3 chunk{};
+  auto fresh = [&]() -> uint64_t {
+    const uint64_t id = SpawnTarget(c, t, kInset, chunk);
+    mobs.ClearCutBites();
+    return id;
+  };
+  auto headOn = [&](uint64_t id) { return mobs.LimbBody(id, head) != 0; };
+
+  // ---- A. the price of every plane up the head ---------------------------
+  float neckAlong = 0.5f, neckCost = 1e30f, reach = 1.0f;
+  std::string prices;
+  for (int k = 1; k <= 12; k++) {
+    const uint64_t id = fresh();
+    if (!id) {
+      detail = "spawn refused";
+      return Status::Fail;
+    }
+    reach = MeasureLimb(mobs, id, head).reach;
+    const float along = 0.1f * (float)k;
+    CleaveBlow b;
+    b.along = along;
+    b.power = 0.0f;  // a chip, no cleave: only the price is wanted
+    b.heft = heft;
+    b.edgeHalf = edgeHalf;
+    b.halfWidth = halfWidth;
+    b.seed = 0xC1EAu + (uint32_t)k;
+    LandCleave(mobs, c.world, id, head, b, spawns);
+    spawns.clear();
+    const MobSystem::CutBite& cb = mobs.LastCutBite();
+    prices += Format("%s%.1f:%.2f%s", k > 1 ? " " : "", (double)along,
+                     (double)cb.planeCost, cb.blocked ? "!" : "");
+    if (cb.planeCost > 0.0f && !cb.blocked && cb.planeCost < neckCost) {
+      neckCost = cb.planeCost;
+      neckAlong = along;
+    }
+  }
+  const float skullAlong = std::max(neckAlong + 1.0f, reach * 0.6f);
+  float skullCost = 0.0f;
+  {
+    const uint64_t id = fresh();
+    CleaveBlow b;
+    b.along = skullAlong;
+    b.power = 0.0f;
+    b.heft = heft;
+    b.edgeHalf = edgeHalf;
+    b.halfWidth = halfWidth;
+    b.seed = 0x5C11u;
+    LandCleave(mobs, c.world, id, head, b, spawns);
+    spawns.clear();
+    skullCost = mobs.LastCutBite().planeCost;
+  }
+  const double skullRatio =
+      (double)BaselineNumber("headCleaveSkullRatio", 2.0);
+  const bool priceOk = neckCost < 1e29f && skullCost >= skullRatio * neckCost;
+
+  // ---- B. one swing on a live neck ----------------------------------------
+  std::string why;
+  bool lastTrim = false;
+  auto oneBlow = [&](float along, float power, bool& died, float& budget,
+                     float& cost, bool& byBlade) {
+    const uint64_t id = fresh();
+    mobs.ClearSeverEvents();
+    mobs.ClearCutBites();
+    CleaveBlow b;
+    b.along = along;
+    b.power = power;
+    b.heft = heft;
+    b.edgeHalf = edgeHalf;
+    b.halfWidth = halfWidth;
+    b.seed = 0xB10Bu;
+    LandCleave(mobs, c.world, id, head, b, spawns);
+    spawns.clear();
+    budget = mobs.LastCutBite().budget;
+    cost = mobs.LastCutBite().planeCost;
+    const MobSystem::CutBite& cb = mobs.LastCutBite();
+    why += Format(" [through=%d blocked=%d depth %.2f; %u pieces, %u of %u "
+                  "left, kept %u; neck %u/%u; trimmed %u below %.2f]",
+                  cb.through ? 1 : 0, cb.blocked ? 1 : 0, (double)cb.depth,
+                  cb.comps, cb.parted, cb.before, cb.kept, cb.neckNow,
+                  cb.neckSpawn, cb.neckTrimmed, (double)cb.skullBase);
+    // The trim was ASKED (a skull base was found) and left no neck behind on
+    // the head -- 0 trimmed is right when the cut was already at the base.
+    lastTrim = cb.skullBase > 0.0f && cb.neckLeft == 0;
+    died = !mobs.IsAlive(id);
+    byBlade = false;
+    for (const MobSystem::SeverEvent& se : mobs.SeverEvents())
+      if (se.mobId == id && se.limbIndex == head && se.byBlade) byBlade = true;
+    return !headOn(id);
+  };
+  const float weakPower = (float)BaselineNumber("headCleaveWeakPower", 0.8);
+  bool diedP = false, diedW = false, diedS = false;
+  bool bladeP = false, bladeW = false, bladeS = false;
+  float budP = 0, costP = 0, budW = 0, costW = 0, budS = 0, costS = 0;
+  // EVERY PLANE OF THE NECK, not only the cheapest: the cheapest is the
+  // skin cap at the very bottom of the model, inside the collar, and a claim
+  // about "a swing across the neck" must hold wherever on the neck it lands.
+  const float bandLo = (float)BaselineNumber("headCleaveNeckFrom", 0.3);
+  const float bandHi = (float)BaselineNumber("headCleaveNeckTo", 0.9);
+  bool offPerfect = true, offWeak = false;
+  for (float a = bandLo; a <= bandHi + 1e-3f; a += 0.2f) {
+    bool d = false, bl = false;
+    float bu = 0, co = 0;
+    const bool off = oneBlow(a, 1.0f, d, bu, co, bl);
+    // ...and it took the SKULL, not the neck with it (Mob::TrimNeckForSever).
+    offPerfect = offPerfect && off && d && bl && lastTrim;
+    budP = bu;
+    costP = std::max(costP, co);
+    diedP = d;
+    bladeP = bl;
+    offWeak = oneBlow(a, weakPower, d, budW, co, bl) || offWeak;
+    costW = std::max(costW, co);
+  }
+  const bool offSkull = oneBlow(skullAlong, 1.0f, diedS, budS, costS, bladeS);
+  const bool combatOk = offPerfect && diedP && bladeP && !offWeak && !offSkull;
+
+  // ---- C. deliberate chops at a corpse's neck -----------------------------
+  const int cap = (int)BaselineNumber("headCorpseMaxChops", 8);
+  const float chopPower = (float)BaselineNumber("headCorpseChopPower", 0.75);
+  const float jitAlong = (float)BaselineNumber("headCorpseJitter", 0.2);
+  const float jitSpin = 0.35f, jitTilt = 0.15f;  // radians: ~20 and ~9 deg
+  auto chopRun = [&](uint32_t run, float power, int limit, int& chops,
+                     std::string& trace) {
+    const uint64_t id = fresh();
+    const MobDef& def = mobs.Defs()[t.defIndex];
+    const uint64_t torso =
+        def.rootLimb >= 0 ? mobs.LimbBody(id, def.rootLimb) : 0;
+    // Killed the way corpse-dismember kills: the rig stays the corpse's.
+    if (torso)
+      mobs.Damage(torso, 1.0e6f, mobs.LimbAnchorPos(id, head), 45.0f,
+                  DamageCtx(DamageCause::Blade, 1.0f));
+    const bool dead = !mobs.IsAlive(id) && headOn(id);
+    mobs.ClearCutBites();
+    chops = 0;
+    for (int i = 0; i < limit && dead && headOn(id); i++) {
+      auto r = [&](uint32_t salt) {
+        const uint32_t h = rng::Hash3(0xDECAu + run, (uint32_t)i, salt);
+        return (float)(h & 0xFFFFu) / 65535.0f * 2.0f - 1.0f;
+      };
+      CleaveBlow b;
+      b.along = neckAlong + r(1) * jitAlong;
+      b.power = power;
+      b.heft = heft;
+      b.edgeHalf = edgeHalf;
+      b.halfWidth = halfWidth;
+      b.spin = r(2) * jitSpin;
+      b.tilt = r(3) * jitTilt;
+      b.seed = 0xC4A0u + run * 7919u + (uint32_t)i * 40503u;
+      LandCleave(mobs, c.world, id, head, b, spawns);
+      spawns.clear();
+      chops++;
+      trace += Format(" %.2f", (double)mobs.LastCutBite().planeCost);
+    }
+    return dead && !headOn(id);
+  };
+  // POOLED OVER SEVERAL WANDERS. One run is a lottery: the ragged rim is keyed
+  // on the creature's id, so the same aim parts a neck in 9 chops at one
+  // fixture and 18 at another. So: every wander must part the neck, and the
+  // MEAN is held under a cap, at two chop powers -- a committed chop (the cleave
+  // does most of it) and a slow one (chip after chip, no cleave at all).
+  const int runs = std::max(1, (int)BaselineNumber("headCorpseRuns", 6));
+  // A wander that never parts the neck counts its whole allowance (3x cap).
+  auto pooled = [&](float power, int armCap, int& parted,
+                    std::string& trace) {
+    int total = 0;
+    parted = 0;
+    for (int r = 0; r < runs; r++) {
+      int ch = 0;
+      std::string tr;
+      if (chopRun((uint32_t)r, power, armCap * 3, ch, tr)) parted++;
+      total += ch;
+      trace += Format(" %d", ch);
+    }
+    return (double)total / runs;
+  };
+  const float slowPower = (float)BaselineNumber("headCorpseSlowPower", 0.5);
+  const int slowCap = (int)BaselineNumber("headCorpseSlowMaxChops", 30);
+  int partedG = 0, partedS = 0;
+  std::string traceG, traceS;
+  const double meanG = pooled(chopPower, cap, partedG, traceG);
+  const double meanS = pooled(slowPower, slowCap, partedS, traceS);
+  const bool corpseOk = partedG == runs && partedS == runs && meanG >= 2.0 &&
+                        meanG <= (double)cap && meanS <= (double)slowCap;
+  RecordObserved("headCleaveNeckCost", (double)neckCost);
+  RecordObserved("headCleaveSkullCost", (double)skullCost);
+  RecordObserved("headCorpseChops", meanG);
+  RecordObserved("headCorpseSlowChops", meanS);
+  mobs.Reset();
+  c.debris.Reset();
+
+  const bool ok = priceOk && combatOk && corpseOk;
+  detail = Format(
+      "sword heft %.2f edge +-%.2f vox. A price [along:cost] %s -> neck %.2f "
+      "at %.1f, skull %.2f at %.1f (need >= %.1fx). B perfect swing: budget "
+      "%.2f vs %.2f -> head %s, died=%d byBlade=%d; power %.2f: budget %.2f vs "
+      "%.2f -> head %s; skull: budget %.2f vs %.2f -> head %s. C corpse, "
+      "jitter +-%.2f vox, %d wanders: power %.2f %d/%d parted, mean %.1f chops "
+      "(cap %d); power %.2f %d/%d parted, mean %.1f (cap %d)",
+      (double)heft, (double)edgeHalf, prices.c_str(), (double)neckCost,
+      (double)neckAlong, (double)skullCost, (double)skullAlong, skullRatio,
+      (double)budP, (double)costP, offPerfect ? "OFF" : "on", diedP ? 1 : 0,
+      bladeP ? 1 : 0, (double)weakPower, (double)budW, (double)costW,
+      offWeak ? "OFF" : "on", (double)budS, (double)costS,
+      offSkull ? "OFF" : "on", (double)jitAlong, runs, (double)chopPower,
+      partedG, runs, meanG, cap, (double)slowPower, partedS, runs, meanS,
+      slowCap);
+  detail += " | B attribution:" + why + " | C chops per wander:" + traceG +
+            " | slow:" + traceS;
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
+      {"hair-rooted", "mob", {}, false, GateHairRooted, /*needsRender=*/false},
       {"wound-accumulate", "mob", {}, false, GateWoundAccumulate, false},
       {"wound-heft", "mob", {}, false, GateWoundHeft, false},
       {"wound-bleed", "mob", {}, false, GateWoundBleed, false},
@@ -7472,6 +7880,7 @@ const std::vector<Gate>& WoundGates() {
       {"corpse-cut", "mob", {}, false, GateCorpseCut, false},
       {"hit-drive", "mob", {}, false, GateHitDrive, false},
       {"corpse-dismember", "mob", {}, false, GateCorpseDismember, false},
+      {"head-cleave", "mob", {}, false, GateHeadCleave, false},
       {"corpse-blunt", "mob", {}, false, GateCorpseBlunt, false},
       {"corpse-armor", "mob", {}, false, GateCorpseArmor, false},
       {"corpse-bleed", "mob", {}, false, GateCorpseBleed, false},

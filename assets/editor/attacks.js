@@ -201,9 +201,17 @@ export async function load(force) {
                           { cache: 'no-store' });
     if (!r.ok) throw new Error(STYLES_PATH + ' ' + r.status);
     raw = JSON.parse(await r.text());
+    // AN OLD-FRAME FILE IS CONVERTED HERE, in the document the panel edits
+    // (strokes.h "THE STROKE FRAME"), so the boxes show the new meaning —
+    // windup measured from the target — and a save writes it. The swing is
+    // unchanged; only the numbers that describe it move.
+    const migrated = MELEE.migrateRawToTargetFrame(raw);
     lib = MELEE.parseStyleLibrary(raw);
     err = '';
-    dirty = false;
+    dirty = migrated;
+    if (migrated)
+      toast('attack_styles.json converted to the target frame (windup 0/0 = ' +
+            'at the target) — the swings are unchanged; save to keep it', false);
     await refreshLibClips();
     if (selected < 0 && lib.styles.length) selected = 0;
   } catch (e) {
@@ -555,6 +563,162 @@ function deleteStyle() {
   });
 }
 
+/* ---- PER-SEGMENT PACING (strokes.h "PER-SEGMENT PACING") ----------------
+ *
+ * One dropdown at the end of every segment row. The names are anim.h's ease
+ * curves (the same eight a clip keyframe interpolates with), so a name means
+ * one thing across the project. What each reads as, because "cubicInOut" is a
+ * formula and not a description of a sword:
+ * ------------------------------------------------------------------------ */
+const EASE_FEEL = {
+  linear: 'even speed throughout',
+  instant: 'holds, then arrives on the last tick',
+  quadIn: 'back-loaded: fastest at the END of the segment',
+  quadOut: 'front-loaded: snaps, then settles',
+  quadInOut: 'slow at both ends, fast through the middle',
+  cubicIn: 'back-loaded, harder',
+  cubicOut: 'front-loaded, harder',
+  cubicInOut: 'slow ends, very fast middle',
+};
+
+/**
+ * A pacing <select>. `chase` adds the "chase" option (the windup's and the
+ * settle's historical closed-loop drive, which is what an absent key means for
+ * those two); `get` returns the stored name or '' for absent.
+ */
+function paceCell({ get, set, chase, title, disabled }) {
+  const sel = el('select', {
+    class: 'small', title: title || '',
+    style: 'width:100%;min-width:74px;font-family:var(--mono);font-size:11px',
+  });
+  if (chase)
+    sel.append(el('option', {
+      value: '', title: 'the closed-loop chase: close on the pose at a capped ' +
+        'rate, arriving whenever it arrives — the behaviour before per-segment ' +
+        'pacing',
+    }, 'chase'));
+  for (const k of MELEE.EASES)
+    sel.append(el('option', { value: k, title: EASE_FEEL[k] || '' }, k));
+  const cur = get();
+  sel.value = cur;
+  if (disabled) sel.disabled = true;
+  sel.addEventListener('change', () => {
+    if (sel.value === cur) return;
+    set(sel.value);
+  });
+  return el('div', { class: 'atkcell' }, sel,
+    el('em', { title: 'what this curve does to the segment\'s speed' },
+      cur ? (EASE_FEEL[cur] || '').split(':')[0] : (chase ? 'closed loop' : '')));
+}
+
+/* ---- THE ANGLE GUIDE: which segment row the author is working on --------
+ *
+ * The rig viewport draws the target line, the segment's az and el as arcs
+ * and their values as labels (rig.js drawAngleGuide) while the pointer or
+ * the keyboard focus is on a row's az / el / reach box, and for a couple of
+ * seconds after, so an edit — which re-renders the panel and drops focus —
+ * does not blink the picture away.
+ * ------------------------------------------------------------------------ */
+let guide = { key: null, until: 0 };
+export function guideKey() {
+  return guide.key && performance.now() < guide.until ? guide.key : null;
+}
+function guideCell(cell, key) {
+  cell.dataset.guide = key;
+  const hold = () => { guide = { key, until: Infinity }; };
+  const linger = () => {
+    if (guide.key === key) guide = { key, until: performance.now() + 2500 };
+  };
+  cell.addEventListener('mouseenter', hold);
+  cell.addEventListener('focusin', hold);
+  cell.addEventListener('input', hold);
+  cell.addEventListener('mouseleave', () => {
+    if (!cell.contains(document.activeElement)) linger();
+  });
+  cell.addEventListener('focusout', linger);
+  cell.addEventListener('change', linger);
+  return cell;
+}
+
+/* ---- the joint brakes --------------------------------------------------- */
+
+const JOINT_TIP = {
+  shoulder: 'the UPPER ARM relative to the torso — the one that spins when ' +
+    'the elbow pole swings round between windup and cut',
+  elbow: 'the FOREARM relative to the upper arm — the bend',
+  wrist: 'the HAND relative to the forearm — the blade\'s lay and roll',
+};
+
+function jointsGrid(r) {
+  const wrapEl = el('div', { style: 'margin-top:8px' });
+  const on = MELEE.jointsAny(MELEE.readJoints(r.joints, null));
+  wrapEl.append(el('div', { class: 'atkrow', style: 'margin-bottom:3px' },
+    el('label', {
+      title: 'PER-JOINT BRAKES on the posed arm, applied after the IK solve ' +
+        'and before the anatomy clamp, for this style only. SMOOTH = low-pass ' +
+        'half-life in ticks (2 = the joint covers half of what is left every ' +
+        'two ticks). MAX°/TICK = the most the joint may turn in one tick — the ' +
+        'hard limit for a shoulder that spins across the windup→cut boundary. ' +
+        '0 = off. They release gradually after the stroke, so switching off ' +
+        'cannot snap. Solo a segment and watch the arm while you tune.',
+    }, 'joint smoothing'),
+    on ? el('button', { class: 'small danger', title: 'remove every brake',
+      onclick: () => editStyles('clear joint smoothing', () => { delete r.joints; }),
+    }, '✕') : el('span', { class: 'hint' }, 'off — the solve is untouched')));
+  const grid = el('div', { class: 'atkseg',
+    style: 'grid-template-columns:auto repeat(2,minmax(0,1fr)) minmax(0,1.4fr)' });
+  grid.append(el('div', {}),
+    el('div', { class: 'hdr', title: 'low-pass half-life, 30 Hz ticks. 0 = off' }, 'smooth'),
+    el('div', { class: 'hdr', title: 'max degrees the joint may turn per tick. 0 = off' }, 'max°/tick'),
+    el('div', { class: 'hdr', title: 'how far the braked joint is behind the solve RIGHT NOW (preview)' }, 'lag now'));
+  for (const name of MELEE.ARM_JOINTS) {
+    const cur = () => (r.joints && r.joints[name]) || {};
+    const write = (key, v) => editStyles(`${name} ${key}`, () => {
+      if (!r.joints || typeof r.joints !== 'object') r.joints = {};
+      const j = r.joints[name] && typeof r.joints[name] === 'object'
+        ? r.joints[name] : (r.joints[name] = {});
+      if (v > 0) j[key] = v; else delete j[key];
+      if (!Object.keys(j).length) delete r.joints[name];
+      if (!Object.keys(r.joints).length) delete r.joints;
+    });
+    grid.append(el('div', { class: 'lbl', title: JOINT_TIP[name] }, name));
+    grid.append(numCell({
+      step: 0.5, min: 0, max: 60, dflt: 0,
+      title: `${name}: low-pass half-life in ticks (0 = off). ` + JOINT_TIP[name],
+      get: () => num(cur().smooth, 0),
+      sub: num(cur().smooth, 0) > 0
+        ? fmt(num(cur().smooth, 0) * TICK_MS / 1000, 3) + ' s' : 'off',
+      set: v => write('smooth', v),
+    }));
+    grid.append(numCell({
+      step: 1, min: 0, max: 180, dflt: 0,
+      title: `${name}: most degrees it may turn in one tick (0 = off). ` +
+        JOINT_TIP[name],
+      get: () => num(cur().maxDeg, 0),
+      sub: num(cur().maxDeg, 0) > 0
+        ? Math.round(num(cur().maxDeg, 0) * 1000 / TICK_MS) + '°/s' : 'off',
+      set: v => write('maxDeg', v),
+    }));
+    const lag = el('div', { class: 'atkcell', 'data-joint-lag': name,
+      style: 'font-family:var(--mono);font-size:11px;text-align:center;color:var(--dim)' },
+      '—');
+    grid.append(lag);
+  }
+  wrapEl.append(grid);
+  return wrapEl;
+}
+
+/** Refresh the "lag now" column from the preview (called per frame by the rig). */
+export function updateJointLag(lag) {
+  if (!wrap) return;
+  for (let k = 0; k < MELEE.ARM_JOINTS.length; k++) {
+    const c = wrap.querySelector(`[data-joint-lag="${MELEE.ARM_JOINTS[k]}"]`);
+    if (!c) continue;
+    const v = lag ? lag[k] : null;
+    c.textContent = v === null || v === undefined ? '—' : (v * DEG).toFixed(1) + '°';
+  }
+}
+
 /* ---- the program card -------------------------------------------------- */
 
 function programCard(sty) {
@@ -577,25 +741,31 @@ function programCard(sty) {
     el('label', {}, 'label'), lbl));
 
   // ---- the segment table (LAYOUT RULE 1) ------------------------------
-  const seg = el('div', { class: 'atkseg' });
+  // SIX columns here, not the class's five: the last is each segment's own
+  // PACING (strokes.h "PER-SEGMENT PACING").
+  const seg = el('div', { class: 'atkseg',
+    style: 'grid-template-columns:auto repeat(4,minmax(0,1fr)) minmax(74px,1.1fr)' });
   seg.append(el('div', {}),
     el('div', { class: 'hdr', title: '30 Hz sim ticks' }, 'ticks'),
     el('div', { class: 'hdr', title: 'azimuth: 0 straight ahead, + to the mob\'s right' }, 'az°'),
     el('div', { class: 'hdr', title: 'elevation: 0 level' }, 'el°'),
-    el('div', { class: 'hdr', title: 'a POSITION in this arm\'s reach band, not voxels' }, 'reach'));
+    el('div', { class: 'hdr', title: 'a POSITION in this arm\'s reach band, not voxels' }, 'reach'),
+    el('div', { class: 'hdr', title: 'HOW THE SEGMENT\'S TRAVEL IS SPREAD OVER ITS ' +
+      'TICKS. The ticks set how LONG it takes; this sets where in that time the ' +
+      'speed lives. One per segment: windup, each cut leg, recover.' }, 'pacing'));
 
   // The four value cells of one segment row; the LABEL cell is the caller's,
   // because a cut leg's label carries its own controls and a windup's does not.
-  const segFields = (s, name, tip) => {
+  const segFields = (s, name, tip, gk) => {
     seg.append(numCell({
       int: true, step: 1, min: 1, max: 120, dflt: 8, title: tip,
       get: () => Math.max(1, Math.round(num(s.ticks, 8))),
       sub: fmt(Math.max(1, Math.round(num(s.ticks, 8))) * TICK_MS / 1000, 2) + ' s',
       set: v => editStyles(`${name} ticks`, () => { s.ticks = v; }),
     }));
-    seg.append(degCell(s, 'az', 'azimuth', name));
-    seg.append(degCell(s, 'el', 'elevation', name));
-    seg.append(numCell({
+    seg.append(guideCell(degCell(s, 'az', 'azimuth', name), gk));
+    seg.append(guideCell(degCell(s, 'el', 'elevation', name), gk));
+    seg.append(guideCell(numCell({
       step: 0.01, min: -1, max: 1,
       title: 'A BAND POSITION offset, not voxels. 0 means the neutral 0.60 of ' +
         'this arm\'s own annulus — authored against the ARM instead, every ' +
@@ -605,17 +775,60 @@ function programCard(sty) {
       sub: reachSub(s.reach),
       subTitle: 'where that lands on the arm currently previewing',
       set: v => editStyles(`${name} reach`, () => { s.reach = v; }),
-    }));
+    }), gk));
   };
 
   const windupTip =
-    'A POSE, relative to the aim, driven closed-loop and deliberately SLOWLY ' +
-    '(under melee.commitSpeed, so the driver stays in Guard and no cut fires). ' +
-    'Its length IS the whole telegraph — there is no UI indicator by design.';
+    'WHERE THE SWING STARTS, measured FROM THE TARGET: az 0 / el 0 points ' +
+    'straight at it, + az is to the swinger\'s right, + el is up. Driven ' +
+    'closed-loop and deliberately SLOWLY (under melee.commitSpeed, so no cut ' +
+    'fires). Its length IS the whole telegraph. The cut then travels FROM ' +
+    'here — press ⌖ to put the start half a cut back, so the middle of the ' +
+    'cut passes through the target.';
   if (!r.windup || typeof r.windup !== 'object')
     r.windup = { ticks: 8, az: 0, el: 0, reach: 0 };
-  seg.append(el('div', { class: 'lbl', title: windupTip }, 'windup'));
-  segFields(r.windup, 'windup', windupTip);
+  {
+    // THE CENTRE BUTTON: windup = -(where the target sits along the cut), i.e.
+    // half the whole travel back, or the middle of the ◎ leg. What the engine
+    // did automatically before the target frame, now one click and visible.
+    const off = MELEE.cutAimOffset(sty);
+    const r4 = v => Math.round(v * 1e4) / 1e4;
+    const cAz = r4(-off.az), cEl = r4(-off.el);
+    const centred = Math.abs(num(r.windup.az, 0) - cAz) < 5e-4 &&
+                    Math.abs(num(r.windup.el, 0) - cEl) < 5e-4;
+    seg.append(el('div', { class: 'lbl', title: windupTip,
+      style: 'display:flex;align-items:center;justify-content:flex-end;gap:3px' },
+      el('button', {
+        class: 'small' + (centred ? ' primary' : ''),
+        style: 'padding:0 4px;font-size:10px;line-height:14px',
+        title: centred
+          ? 'CENTRED: the cut passes through the target in its middle ' +
+            `(windup az ${Math.round(cAz * DEG)}°, el ${Math.round(cEl * DEG)}°)`
+          : 'CENTRE THE CUT ON THE TARGET: set windup az/el to ' +
+            `${Math.round(cAz * DEG)}° / ${Math.round(cEl * DEG)}° — half the ` +
+            'cut\'s travel back from the target' +
+            (sty.aimLeg >= 0 ? ` (the middle of cut ${sty.aimLeg + 1}, the ◎ leg)` : '') +
+            ', so the middle of the swing passes through it',
+        onclick: () => editStyles('centre the cut', () => {
+          r.windup.az = cAz;
+          r.windup.el = cEl;
+        }),
+      }, '⌖'),
+      el('span', {}, 'windup')));
+  }
+  segFields(r.windup, 'windup', windupTip, 'windup');
+  seg.append(paceCell({
+    chase: true,
+    title: 'WINDUP PACING. "chase" = the closed-loop drive it has always had ' +
+      '(close on the pose at a capped rate). A curve makes it a TIMED ' +
+      'approach that lands on the pose on the last windup tick, speed where ' +
+      'the curve puts it — still capped under melee.commitSpeed, so no curve ' +
+      'can make a windup fire the cut early.',
+    get: () => (MELEE.EASES.includes(r.windup.ease) ? r.windup.ease : ''),
+    set: v => editStyles('windup pacing', () => {
+      if (v) r.windup.ease = v; else delete r.windup.ease;
+    }),
+  }));
 
   // ---- THE CUT, WHICH IS A PATH (strokes.h "A CUT IS A PATH") -----------
   //
@@ -634,9 +847,9 @@ function programCard(sty) {
     const isAim = many && aimLegOf(r) === k;
     const tip = 'A TRAVEL, not a pose: how far the point goes and how fast. ' +
       'The deltas are divided by this leg\'s OWN tick count and delivered per ' +
-      'tick, so a short leg is a fast one — which is what commits the ' +
-      'driver\'s Slash and gives the sweep the tip speed that scales the ' +
-      'damage: SPEED IS THE DAMAGE.' + (many
+      'tick, so a short leg is a fast one — which gives the sweep the tip ' +
+      'speed that scales the damage: SPEED IS THE DAMAGE. The arm follows ' +
+      'the path exactly, however short the leg.' + (many
         ? ` Leg ${k + 1} of ${all.length}, measured from where leg ${k} ended.`
         : '');
     const lbl = el('div', { class: 'lbl', title: tip,
@@ -650,11 +863,12 @@ function programCard(sty) {
         class: 'small' + (isAim ? ' primary' : ''),
         style: 'padding:0 4px;font-size:9px;line-height:14px',
         title: isAim
-          ? 'the TARGET sits in the middle of this leg — click to clear it and ' +
-            'go back to the midpoint of the whole travel'
-          : 'put the TARGET in the middle of this leg. Unset, the aim sits at ' +
-            'the midpoint of the whole path — which on a dogleg is usually the ' +
-            'CORNER, the one point where the blade is slowest and turning.',
+          ? 'the windup\'s ⌖ centre puts the TARGET in the middle of this leg ' +
+            '— click to go back to the midpoint of the whole travel. (A marker ' +
+            'for ⌖ only: it moves nothing until you press ⌖.)'
+          : 'make the windup\'s ⌖ centre put the TARGET in the middle of this ' +
+            'leg instead of at the midpoint of the whole path — which on a ' +
+            'dogleg is usually the CORNER, where the blade is slowest.',
         onclick: () => {
           editStyles(isAim ? 'clear aim leg' : `aim in cut ${k + 1}`, () => {
             const legs = cutLegs(r);
@@ -683,10 +897,34 @@ function programCard(sty) {
       }, '✕'));
     }
     seg.append(lbl);
-    segFields(leg, name, tip);
+    segFields(leg, name, tip, 'cut' + k);
+    // THIS LEG'S PACING. A leg with no `ease` inherits the style-wide one
+    // (the old single "pacing" row); the first edit here moves that
+    // style-wide value onto every leg that had none and drops it, so the
+    // file ends up saying per leg what each leg does.
+    const styleEase = MELEE.EASES.includes(r.ease) ? r.ease : 'linear';
+    seg.append(paceCell({
+      title: `${name.toUpperCase()} PACING: how this leg's travel is spread over ` +
+        'its ticks. The CUT IS WHERE SPEED IS DAMAGE — a back-loaded curve ' +
+        '(quadIn/cubicIn) peaks the tip speed at the leg\'s end, a ' +
+        'front-loaded one (…Out) is fastest at its start.' +
+        (MELEE.EASES.includes(leg.ease) ? ''
+          : ` Inheriting the style-wide "${styleEase}".`),
+      get: () => (MELEE.EASES.includes(leg.ease) ? leg.ease : styleEase),
+      set: v => editStyles(`${name} pacing`, () => {
+        const legs = cutLegs(r);
+        const inherited = MELEE.EASES.includes(r.ease) ? r.ease : null;
+        if (inherited)
+          for (const l of legs) if (!MELEE.EASES.includes(l.ease)) l.ease = inherited;
+        delete r.ease;
+        const target = legs[k];
+        if (v === 'linear') delete target.ease; else target.ease = v;
+        r.cut = legs.length > 1 ? legs : legs[0];
+      }),
+    }));
   });
   seg.append(el('div', {}));
-  seg.append(el('div', { style: 'grid-column:span 4' },
+  seg.append(el('div', { style: 'grid-column:span 5' },
     chip('+ leg', false, () => {
       editStyles('add a cut leg', () => {
         const legs = cutLegs(r);
@@ -755,9 +993,9 @@ function programCard(sty) {
     set: v => editStyles('recover ticks', () => { rv.ticks = v; }),
   }));
   if (posed) {
-    seg.append(degCell(rv, 'az', 'return azimuth (ABSOLUTE)', 'recover'));
-    seg.append(degCell(rv, 'el', 'return elevation (ABSOLUTE)', 'recover'));
-    seg.append(numCell({
+    seg.append(guideCell(degCell(rv, 'az', 'return azimuth (ABSOLUTE)', 'recover'), 'recover'));
+    seg.append(guideCell(degCell(rv, 'el', 'return elevation (ABSOLUTE)', 'recover'), 'recover'));
+    seg.append(guideCell(numCell({
       step: 0.01, min: -1, max: 1,
       title: 'the stance\'s BAND POSITION offset, read exactly as the windup ' +
         'and cut reach are: 0 is the neutral 0.60 of this arm\'s annulus.',
@@ -765,10 +1003,24 @@ function programCard(sty) {
       sub: reachSub(rv.reach),
       subTitle: 'where that lands on the arm currently previewing',
       set: v => editStyles('recover reach', () => { rv.reach = v; }),
-    }));
+    }), 'recover'));
   } else {
     seg.append(el('div', {}), el('div', {}), el('div', {}));
   }
+  seg.append(paceCell({
+    chase: true, disabled: !posed,
+    title: posed
+      ? 'RECOVER PACING — paces the SETTLE (the driven return to the stance). ' +
+        '"chase" = the closed-loop drive; a curve makes the arm land on the ' +
+        'return pose on the last settle tick. The fade after it is a weight ' +
+        'crossfade and is not paced.'
+      : 'Recover pacing paces the driven return, and this recover has no ' +
+        'return pose — turn on "return pose" first.',
+    get: () => (MELEE.EASES.includes(rv.ease) ? rv.ease : ''),
+    set: v => editStyles('recover pacing', () => {
+      if (v) rv.ease = v; else delete rv.ease;
+    }),
+  }));
 
   // ---- settle / fade, the two halves of the `ticks` above ---------------
   const settle = Math.max(0, Math.round(num(rv.settle, 0)));
@@ -812,7 +1064,7 @@ function programCard(sty) {
       if (v > 0) rv.fade = v; else delete rv.fade;
     }),
   }));
-  seg.append(el('div', { style: 'grid-column:span 2' },
+  seg.append(el('div', { style: 'grid-column:span 3' },
     chip(posed ? 'return pose ✓' : '+ return pose', posed, () => {
       editStyles(posed ? 'plain recover' : 'driven recover', () => {
         if (posed) {
@@ -829,6 +1081,7 @@ function programCard(sty) {
           rv.reach = num(w.reach, 0);
           rv.settle = Math.max(1, Math.round(num(rv.ticks, 10) * 0.6));
         }
+        if (posed) delete rv.ease;
       });
       render();
     }, posed
@@ -852,65 +1105,23 @@ function programCard(sty) {
   }));
   seg.append(degCell(r.jitter, 'az', 'start bow', 'jitter'));
   seg.append(degCell(r.jitter, 'el', 'start bow', 'jitter'));
-  seg.append(el('div', {}));
+  seg.append(el('div', {}), el('div', {}));
   card.append(seg);
 
-  // ---- HOW THE CUT'S TRAVEL IS PACED (strokes.h StrokeEase) -------------
+  // (The style-wide cut "pacing" row that lived here is now the pacing column
+  // above, one per segment. A style's old top-level `ease` still loads as the
+  // default for legs that state none — and the leg dropdowns show it.)
+
+  // ---- PER-JOINT BRAKES (strokes.h AttackStyle::joints, melee.h ArmSmooth) -
   //
-  // The tick counts above set each leg's DURATION; this sets the shape of the
-  // rate WITHIN a leg. It is a separate control because the two answer
-  // different questions — "how long does this take" and "where in that time
-  // does the speed live" — and before this the second had only one answer.
-  {
-    const row = el('div', { class: 'atkrow' });
-    const EASES = MELEE.EASES;
-    const cur = EASES.includes(r.ease) ? r.ease : 'linear';
-    // WHAT EACH CURVE READS AS, because "cubicInOut" is a formula and not a
-    // description of a sword. Only the shapes worth reaching for are
-    // annotated; the rest are the same idea, harder.
-    const feel = {
-      linear: 'even speed throughout — the shipped pacing',
-      instant: 'holds, then arrives on the last tick',
-      quadIn: 'back-loaded: fastest AT the target',
-      quadOut: 'front-loaded: snaps, then settles',
-      quadInOut: 'slow at both ends, fast through the middle',
-      cubicIn: 'back-loaded, harder',
-      cubicOut: 'front-loaded, harder',
-      cubicInOut: 'slow ends, very fast middle',
-    };
-    row.append(el('label', {
-      title: 'HOW THE CUT\'S TRAVEL IS PACED over each leg. The leg\'s ticks ' +
-        'set how LONG it takes; this sets where in that time the speed lives. ' +
-        'These are anim.h\'s ease curves — the same eight a clip keyframe ' +
-        'interpolates with, so the name means one thing across the project.\n\n' +
-        'THE CUT ONLY: the windup and the settle are a closed-loop chase to a ' +
-        'pose under melee.commitSpeed, a different control law with no ' +
-        'authored travel to distribute.',
-    }, 'pacing'));
-    const sel = el('select', { class: 'small' });
-    for (const k of EASES)
-      sel.append(el('option', { value: k }, k + ' — ' + (feel[k] || '')));
-    sel.value = cur;
-    sel.addEventListener('change', () => {
-      const v = sel.value;
-      if (v === cur) return;
-      // Absent means linear, so the default writes no key — the same rule
-      // `settle`, `fade` and `weapon` follow in this panel.
-      editStyles('cut pacing', () => {
-        if (v === 'linear') delete r.ease; else r.ease = v;
-      });
-    });
-    row.append(sel);
-    // SPEED IS THE DAMAGE (melee.h), so which half of the cut is fast is not
-    // only a look — it decides whether the fast part is where the aim is.
-    if (cur === 'quadIn' || cur === 'cubicIn')
-      row.append(el('span', { class: 'hint' },
-        'tip speed peaks at the target — SPEED IS THE DAMAGE'));
-    else if (cur === 'quadOut' || cur === 'cubicOut')
-      row.append(el('span', { class: 'hint' },
-        'tip is slowest at the target — expect weaker hits'));
-    card.append(row);
-  }
+  // The driver commands a hand and an elbow pole; the joint rotations are what
+  // the IK makes of them, and a shoulder can whip round its own axis between
+  // the windup and the cut while the blade path looks fine. These brake the
+  // POSED joint (each relative to its parent) after the solve: `smooth` is a
+  // half-life in ticks, `max°/tick` a hard cap on how far it turns per tick.
+  // 0 = off. The damage sweep reads the posed blade, so a braked arm hits
+  // where it is drawn.
+  card.append(jointsGrid(r));
 
   // ---- THE BODY ANIMATION (strokes.h AttackStyle::clip) -----------------
   // The program above drives the WEAPON ARM. Everything else the swing does
@@ -1287,12 +1498,11 @@ function previewCard(sty) {
   const soloTips = {
     all: 'the whole program, as the game runs it',
     windup: 'ONLY the windup: from wherever the arm hangs, steer to the windup ' +
-      'pose (aim − ½cut + windup) and HOLD there. This is the pose the cut ' +
+      'pose (target + windup) and HOLD there. This is the pose the cut ' +
       'starts from — if the readout\'s "commit" residual is not ~0, the ' +
       'windup ran out of ticks before it got there.',
     cut: 'ONLY the cut: the windup is run through instantly, then the travel ' +
-      'from the pose it reached, through the aim, to ½cut past it, then HOLD ' +
-      'at the end.',
+      'from the pose it reached, along the authored path, then HOLD at the end.',
     recover: 'ONLY the recover: windup and cut run through instantly, then the ' +
       'hand-back — no input, the driver\'s follow-through unwinds and the arm ' +
       'claim fades over melee.recoverTime.',
@@ -1336,14 +1546,14 @@ function previewCard(sty) {
         host?.stop?.();
         render();
       }, g.key === 'windup'
-        ? 'the pose the cut STARTS from: aim − ½the cut\'s travel + windup. ' +
+        ? 'the pose the cut STARTS from: target + windup. ' +
           'The start bow is excluded — jitter is a per-swing draw and a goal ' +
           'is what was authored.'
         : g.key === 'recover'
         ? 'the ABSOLUTE return stance, in the rig\'s own facing basis — not ' +
           'relative to the aim like the other two.'
-        : `where the point stands when ${g.label} ends: aim − offset + the ` +
-          'travel through this leg. An absolute point on the path, which is ' +
+        : `where the point stands when ${g.label} ends: target + windup + ` +
+          'the travel through this leg. An absolute point on the path, which is ' +
           'why a leg that fell short does not move the ones after it.'));
     if (!sty.recover.posed)
       t5.append(el('span', { class: 'hint' },
@@ -1413,9 +1623,9 @@ function previewCard(sty) {
     }
   }
   t2.append(el('span', { class: 'spacer' }),
-    el('label', { title: 'the target\'s BEARING about the shoulder; the cut is ' +
-      'CENTRED on it, so the windup lands half a cut short and the blade passes ' +
-      'THROUGH where it was aimed' }, 'aim'),
+    el('label', { title: 'the target\'s BEARING about the shoulder. The windup ' +
+      'is measured from it (0/0 = pointing at it); ⌖ on the windup row centres ' +
+      'the cut on it' }, 'aim'),
     aimSlider('az'), aimSlider('el'),
     chip('centre', false, () => { aim = { az: 0, el: 0 }; render(); }));
   card.append(t2);
@@ -1524,7 +1734,7 @@ function strokeBar(sty) {
       leg.ticks, k % 2 ? '#e8b464' : '#ffd08a',
       `the travel, leg ${k + 1} of ${sty.cut.length}: ` +
       `${Math.round(Math.hypot(leg.az, leg.el) * DEG)}° in ${leg.ticks} ticks` +
-      (isAim ? ' — the TARGET is in the middle of this leg' : '')));
+      (isAim ? ' — the ◎ leg ⌖ centres on' : '')));
   });
   bar.append(
     s(`recover ${rc}`, rc, '#3d4756', 'hand-back: PoseWeight ramps down'));
@@ -1568,8 +1778,8 @@ function readout() {
       'the stroke. An aim effector shows the yaw/pitch it was commanded, which ' +
       'is the number a bite that does not snap is missing.'),
     line('driver', st.meleePhase || 'idle',
-      'MeleeState: guard / wind / slash / recover. A windup deliberately stays ' +
-      'in GUARD — that is what "under commitSpeed" means.'),
+      'MeleeState: guard / wind / recover. The driver has no cut of its ' +
+      'own — the PROGRAM\'s cut phase is the cut.'),
     line('az/el', `${fmt(st.az)} / ${fmt(st.el)}`, 'the live stroke, radians'),
     line('start', startText(st),
       'WHERE THE SWING BEGAN: the driver seeds its stroke from wherever the ' +
@@ -1577,7 +1787,7 @@ function readout() {
       'a swing at el ≈ −1.3 whatever the style says. The windup has to climb ' +
       'from here.'),
     line('target', targetText(st),
-      'what the windup is steering TO: aim − ½cut + windup (az / el, radians) ' +
+      'what the windup is steering TO: target + windup (az / el, radians) ' +
       'and the band position; then, once committed, the frozen aim'),
     line('commit', commitText(st),
       'target minus reached, at the instant the aim froze. Not ~0 means the ' +
@@ -1770,9 +1980,10 @@ function limbsBody() {
     { step: 0.01, min: 0, max: 2.5, dflt: 1.4 });
   knob('elMin', 'el min', 'radians', { step: 0.01, min: -1.6, max: 0, dflt: -1.5 });
   knob('elMax', 'el max', 'radians', { step: 0.01, min: 0, max: 1.6, dflt: 1.48 });
-  knob('commitSpeed', 'commit spd', 'input units/s above which a Wind becomes a ' +
-    'Slash. A windup drives at 480 against this, which is why it stays a ' +
-    'telegraph however far it has to travel.', { step: 10, min: 1, dflt: 900 });
+  knob('commitSpeed', 'ref spd', 'reference drive speed, input units/s: 35% ' +
+    'of it reads as Wind (what a parry can arrest), and the whoosh volume ' +
+    'scales against it. Nothing commits on it — the driver has no cut of ' +
+    'its own.', { step: 10, min: 1, dflt: 900 });
   wrapEl.append(grid);
   return wrapEl;
 }
@@ -2040,11 +2251,11 @@ function helpBody() {
     'The aim is frozen at the END of the windup and never refreshed, which is ' +
     'what makes the telegraph mean something.');
   p(b('WINDUP is a POSE; CUT is a TRAVEL. '),
-    'The windup is driven closed-loop and deliberately slowly — under ' +
-    'melee.commitSpeed, so the driver stays in Guard and no cut fires — and ' +
-    'its length is the whole telegraph. The cut\'s deltas are divided by its ' +
-    'tick count and delivered per tick, which is what commits the driver\'s ' +
-    'own Slash and gives the sweep the tip speed that scales the damage.');
+    'The windup is driven closed-loop and deliberately slowly (capped at ' +
+    '16 units/tick) and its length is the whole telegraph. The cut\'s deltas ' +
+    'are divided by its tick count and delivered per tick, which gives the ' +
+    'sweep the tip speed that scales the damage — and the arm follows that ' +
+    'path exactly: the driver adds no motion of its own.');
   p(b('REACH IS A BAND POSITION. '),
     '0 is the neutral 0.60 of the arm\'s own annulus, not zero voxels. ' +
     'Authored against the ARM instead, every chamber and lunge in the shipped ' +

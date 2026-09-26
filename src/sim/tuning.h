@@ -352,17 +352,6 @@ struct Tuning {
     float mouseSensitivity = TPD(camera, mouseSensitivity);
     float fovY = TPD(camera, fovY);                 // radians (~69 deg)
     float pitchClamp = TPD(camera, pitchClamp);
-    // Multiplier on look sensitivity while a melee weapon is up (any swing
-    // phase but Idle). The same mouse motion both turns the view and steers
-    // the blade (game/melee.h), so at 1.0 a cut you want to watch also whips
-    // the camera off the target. Slowing the VIEW while leaving the blade on
-    // full gain is what makes a swing readable: the mouse travel buys mostly
-    // arm, not mostly yaw. The melee state machine never sees this scale —
-    // it is fed the raw delta, so commitSpeed still means true mouse pixels.
-    float meleeSensitivity = TPD(camera, meleeSensitivity);
-    // Half-life (seconds) of the scale easing in and out. Stepping the gain
-    // on the click edge is a visible jolt in a mid-turn mouse stroke.
-    float meleeSensHalflife = TPD(camera, meleeSensHalflife);
   } camera;
 
   // ---- third-person camera rig ----
@@ -547,14 +536,12 @@ struct Tuning {
     // half-life keeps them attached to the view without visible lag. 0 restores
     // the old hard snap.
     float firstPersonTurnHalflife = TPD(avatar, firstPersonTurnHalflife);
-    // ---- head look (the body does not turn until the neck runs out) --------
-    // How far the HEAD may yaw away from the body's facing before the BODY
-    // has to start turning, in degrees. Inside this cone a mouse turn is a
-    // glance: only the head (and a fraction of the spine) rotates, the feet
-    // stay planted and the arms stay where they were. Past it the body is
-    // dragged along so that the offset never exceeds this angle — which is
-    // why there is no separate "recenter" rate and no hysteresis to chatter
-    // on: the constraint is geometric, not a state machine.
+    // ---- head look ---------------------------------------------------------
+    // How far the HEAD may yaw toward the camera away from the body's facing,
+    // in degrees (PlayerAvatar::SetLook clamps to it). It does NOT drive the
+    // body: since 2026-09-25 the first-person body always faces the view
+    // (ResolveAvatarHeading), so this only matters in third person, where the
+    // body faces its run and the head looks round at the camera.
     float headLookYaw = TPD(avatar, headLookYaw);
     // THE LOOK LETS GO WHEN THE CAMERA COMES ROUND TO THE FRONT. Width, in
     // degrees measured inward from straight-behind (180), of the band where
@@ -582,14 +569,12 @@ struct Tuning {
     // keeps the head from stepping with the raw mouse; the body's own
     // firstPersonTurnHalflife sits behind it.
     float headLookHalflife = TPD(avatar, headLookHalflife);
-    // Half-life (seconds) of the FIRST-PERSON body squaring back up to the
-    // view while the player WALKS. Without this the head-look cone is a drift
-    // trap: inside the cone the body's turn is dropped to zero, so its facing
-    // is never driven back to anything and it freezes wherever the last big
-    // turn left it — with the arms welded to the torso, they end up stuck
-    // pointing off-view while you walk somewhere else. Standing still there is
-    // deliberately no recentring; that is the glance. Longer feels looser;
-    // 0 squares the body up immediately whenever you move.
+    // UNUSED since 2026-09-25. Was the half-life of the first-person body
+    // easing back to the view while walking; ResolveAvatarHeading now faces
+    // the travel direction directly (clamped to the head-look cone), so there
+    // is no dead zone to recentre out of. The row stays because deleting a
+    // tuning_params.def row misses the SPIR-V cache for every shader; remove
+    // it alongside the next change that pays that anyway.
     float headLookRecenterHalflife = TPD(avatar, headLookRecenterHalflife);
     // Half-life (seconds) of the leg IK fading in and out as the gait starts
     // and stops. `grounded` is genuinely ragged crossing bumpy ground — the
@@ -1245,6 +1230,16 @@ struct Tuning {
     // tears an arm off. Zero makes every cut a clean bore.
     int cutSpallRounds = TPD(gore, cutSpallRounds);
     float cutSpallStrength = TPD(gore, cutSpallStrength);
+    // ---- E1b. the cleave (phys/kerf.h KerfBite, 2026-09-25) ----------------
+    // THE CLEAVE: a committed blow's bite past the ordinary chip, in world
+    // voxels^2 of skin-equivalent cross-section at heft 1 and power 1
+    // (KerfBite). A blow whose bite covers everything left in the plane it is
+    // cutting -- within its edge's reach, bone at three times skin -- comes
+    // out the other side and parts the limb. Scaled by heft and by
+    // ((power - cleaveFrom) / (1 - cleaveFrom))^2, so only a fast, square,
+    // heavy blow has any, and a neck already notched costs less to finish.
+    float cleaveArea = TPD(gore, cleaveArea);
+    float cleaveFrom = TPD(gore, cleaveFrom);
 
     // ---- E2. heft: how much weapon is behind the edge -----------------------
     // The item's own voxel volume in WORLD voxels that reads as heft 1.0.
@@ -1871,10 +1866,8 @@ struct Tuning {
   // seconds are unitless-in-voxels and carry their MeleeTuning name unchanged.
   struct Melee {
     // ---- the control law ----------------------------------------------------
-    // mouse px/s that commits a guard to a cut
+    // reference drive speed, px/s: the Wind label, the steer cap, the whoosh
     float commitSpeed = TPD(melee, commitSpeed);
-    // seconds the committed slash takes
-    float slashTime = TPD(melee, slashTime);
     // seconds of follow-through
     float recoverTime = TPD(melee, recoverTime);
     // tip speed for full damage
@@ -1914,13 +1907,6 @@ struct Tuning {
     float guardSideM = TPD(melee, guardSideM);
     // seconds of mouse history
     float dirSmoothing = TPD(melee, dirSmoothing);
-    // ---- the committed arc --------------------------------------------------
-    // radians the cut carries the point
-    float swingArc = TPD(melee, swingArc);
-    // fraction of the arc pulled back first
-    float swingAnticipate = TPD(melee, swingAnticipate);
-    // fraction of reach the arc bows out by
-    float swingExtend = TPD(melee, swingExtend);
     // seconds halflife on the blade frame
     float bladeSmoothing = TPD(melee, bladeSmoothing);
     // HOW FAR THE WRIST MAY TAKE THE BLADE from what the solved forearm gives
@@ -2020,17 +2006,10 @@ struct Tuning {
     float blockNudgeAz = TPD(melee, blockNudgeAz);
     //   open, azimuth and elevation, at power 1
     float blockNudgeEl = TPD(melee, blockNudgeEl);
-    // ---- DISCRETE STRIKES (the player's default control, 2026-09-01) --------
-    // 0 = discrete: a click fires an AUTHORED stroke program (the same
-    //     attack_styles.json entries the NPCs replay), direction picked by the
-    //     mouse flick at the press. THE DEFAULT.
-    // 1 = freeform: the original mouse-steers-the-tip experiment, kept live as
-    //     the one-JSON-edit A/B. Everything below the input layer is shared,
-    //     so flipping this changes what FEEDS MeleeState and nothing else.
-    // Read in ONE place — main.cpp's controller, straight off CurrentTuning()
-    // — and deliberately NOT copied into MeleeTuning: the driver's feel is
-    // mode-blind, and a cached copy would let the two disagree across an F5.
-    int controlMode = TPD(melee, controlMode);
+    // ---- DISCRETE STRIKES (the player's ONLY control since 2026-09-25) ------
+    // A click fires an AUTHORED stroke program (the same attack_styles.json
+    // entries the NPCs replay), direction picked by the mouse flick at the
+    // press. The freeform mouse-steers-the-tip mode (`controlMode` 1) is gone.
     // Mouse px/s at the press below which a click has no direction: the strike
     // alternates horizontal L/R instead. Same unit as commitSpeed, far lower —
     // a flick is a read of intent, not a commitment gesture.

@@ -378,6 +378,12 @@ void Overlay::DrawHUD(const UIState& s) {
     }
     py += ph + 14.0f;
   }
+  // APPLY MODE (TB_APPLY): say it is on, and whose skin LMB would brush.
+  if (s.applyShown) {
+    const std::string t = s.applyTarget.empty() ? std::string("apply - aim at a body")
+                                                : "apply to " + s.applyTarget;
+    py += tab(t.c_str(), py, ui::ColBronze(), ui::ColGoldPale(), 0.95f);
+  }
   if (!s.lookPrompt.empty())
     py += tab(s.lookPrompt.c_str(), py, ui::ColGoldDim(), ui::ColParch(), 0.95f);
   if (!s.kitMessage.empty() && s.kitMessageAge < 2.5f) {
@@ -1988,19 +1994,6 @@ void Overlay::Draw(UIState& s) {
           Tuning::Melee& m = t.melee;
           if (ImGui::CollapsingHeader("Discrete strikes",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {
-            // Two modes exist, so this is a choice and not a slider —
-            // handLead's convention below.
-            bool freeform = m.controlMode == 1;
-            if (ImGui::Checkbox("freeform mouse melee (the A/B)", &freeform)) {
-              m.controlMode = freeform ? 1 : 0;
-              moved = true;
-            }
-            if (ImGui::IsItemHovered())
-              ImGui::SetTooltip(
-                  "OFF = discrete (default): a click fires an authored strike\n"
-                  "from attack_styles.json, direction read from the flick at\n"
-                  "the press. ON = the original hold-and-steer mouse melee.\n"
-                  "Everything below the input layer is shared.");
             f("flick threshold (px/s)", &m.pickMinSpeed, 1.0f, 1500.0f, "%.0f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
@@ -2031,40 +2024,24 @@ void Overlay::Draw(UIState& s) {
             f("aim gain y", &m.aimGainY, 0.0005f, 0.02f, "%.4f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip("Radians of tip elevation per mouse pixel.");
-            f("commit speed (px/s)", &m.commitSpeed, 100.0f, 3000.0f, "%.0f");
+            f("reference speed (px/s)", &m.commitSpeed, 100.0f, 3000.0f, "%.0f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
-                  "Mouse px/s that commits a guard to a cut. Below this\n"
-                  "the blade is held; above it the stroke fires.");
-            f("direction smoothing (s)", &m.dirSmoothing, 0.005f, 0.4f);
+                  "Reference drive speed: 35%% of it reads as Wind (what a\n"
+                  "parry can arrest); the whoosh volume scales against it.\n"
+                  "Nothing commits on it any more.");
+            f("speed smoothing (s)", &m.dirSmoothing, 0.005f, 0.4f);
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
-                  "Seconds of mouse history averaged to pick the stroke\n"
-                  "direction. Higher = less twitchy, slower to respond.");
+                  "Seconds of drive history the speed is averaged over.");
             f("reach gain (m/unit)", &m.reachGainM, 0.0f, 0.02f, "%.4f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip("Metres of tip reach per dReach unit.");
           }
-          if (ImGui::CollapsingHeader("Arc", ImGuiTreeNodeFlags_DefaultOpen)) {
-            f("swing arc (rad)", &m.swingArc, 0.0f, 3.1f, "%.2f");
-            if (ImGui::IsItemHovered())
-              ImGui::SetTooltip("Radians the committed cut carries the point.");
-            f("anticipation", &m.swingAnticipate, 0.0f, 1.0f, "%.2f");
-            if (ImGui::IsItemHovered())
-              ImGui::SetTooltip(
-                  "Fraction of the arc pulled back before the cut. Higher\n"
-                  "= bigger wind-up; 0 = the cut starts where you are.");
-            f("mid-stroke bow", &m.swingExtend, 0.0f, 0.6f, "%.2f");
-            if (ImGui::IsItemHovered())
-              ImGui::SetTooltip(
-                  "Fraction of reach the arc bows outward by at mid-\n"
-                  "stroke, widening the sweep. 0 = straight-line cut.");
-            f("slash time (s)", &m.slashTime, 0.03f, 0.6f);
-            if (ImGui::IsItemHovered())
-              ImGui::SetTooltip("Seconds the committed slash takes.");
+          if (ImGui::CollapsingHeader("Recover", ImGuiTreeNodeFlags_DefaultOpen)) {
             f("recover time (s)", &m.recoverTime, 0.03f, 0.8f);
             if (ImGui::IsItemHovered())
-              ImGui::SetTooltip("Seconds of follow-through after the cut.");
+              ImGui::SetTooltip("Seconds over which the arm is handed back.");
           }
           if (ImGui::CollapsingHeader("Where the point may go",
                                       ImGuiTreeNodeFlags_DefaultOpen)) {

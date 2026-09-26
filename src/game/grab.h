@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdio>
+#include <string>
+#include <vector>
 
 #include "game/mob.h"
 #include "math3d.h"
@@ -49,6 +52,14 @@ class GrabHold {
   // True when the last Begin() was refused for weight. Consumed by the caller
   // for its one-line message; there is nothing else to report.
   bool RefusedTooHeavy() const { return refusedHeavy_; }
+  // WHY THE LAST HOLD ENDED, when it was Tick that ended it and not the
+  // player. Empty otherwise. The frame loop shows it once and clears it —
+  // "it keeps dropping" is a bare symptom, and this names the door it left by.
+  std::string TakeDropNote() {
+    std::string n;
+    n.swap(dropNote_);
+    return n;
+  }
 
   // ---- WHAT CAN BE PICKED UP -------------------------------------------
   //
@@ -103,8 +114,10 @@ class GrabHold {
     // the difference between lifting a crate and having it teleport into your
     // face — and a thing grabbed at arm's length while you are bent over a
     // table has to stay on the table.
+    // ...then drawn in by kCarryPull: a held thing rides closer than where it
+    // was picked up, so it reads as in your hands rather than out at the reach.
     const float reach = tp.grabDistance / kVoxelMeters;
-    dist_ = std::clamp((com - handVoxel).len(), 0.35f * reach, reach);
+    dist_ = kCarryPull * std::clamp((com - handVoxel).len(), 0.35f * reach, reach);
     prevRole_ = phys.BodyRoleOf(body_);
     phys.SetBodyRole(body_, Physics::BodyRole::Carried, owner);
     phys.ActivateBody(body_);
@@ -126,9 +139,9 @@ class GrabHold {
     massKg_ = 0.0f;
   }
 
-  // The body vanished under us (burnt away, culled, or its collider rebuilt
-  // under a new handle — phys/debris.h BodyHandle). No layer restore: there is
-  // nothing left to restore it on.
+  // The body vanished under us (burnt away, culled — a collider merely rebuilt
+  // under a new handle is followed instead, see Tick). No layer restore: there
+  // is nothing left to restore it on.
   void Forget() {
     body_ = 0;
     massKg_ = 0.0f;
@@ -142,13 +155,72 @@ class GrabHold {
     // Still a body something holds: debris, or a dead Mob's limb (a carve
     // rebuilds a limb's collider under a NEW handle, and then this one is
     // simply gone, exactly like a debris body re-made by a shatter).
-    if (!debris.HasBody(body_) &&
-        !(mobs != nullptr && mobs->GrabbableDeadLimb(body_) == body_)) {
+    //
+    // ...BUT A REBUILT BODY IS STILL THE THING IN YOUR HANDS. A sword across a
+    // held corpse carves the limb, the carve re-makes its collider, and the
+    // corpse fell out of your arms on every hit. Physics::Successor names the
+    // collider the old handle was rebuilt as (the Carried role already rode
+    // across with it, in CarryLayer), so the hold follows it — through several
+    // rebuilds in one tick if a burn and a cut both landed.
+    auto holdable = [&](uint64_t h) {
+      return debris.HasBody(h) ||
+             (mobs != nullptr && mobs->GrabbableDeadLimb(h) == h);
+    };
+    const uint64_t held0 = body_;
+    uint64_t last = body_;
+    int hops = 0;
+    // The walk, hop by hop, for the drop note: handle, then A(live in Jolt)
+    // D(debris owns it) M(a mob owns it). A repeated handle is a cycle through
+    // a recycled handle value and ends the walk.
+    std::string chain;
+    auto describe = [&](uint64_t h) {
+      Vec3 c;
+      int li = -1;
+      const bool live = phys.BodyCenterOfMass(h, c);
+      const bool mob = mobs && const_cast<MobSystem*>(mobs)->FindOwner(h, &li);
+      char b[64];
+      std::snprintf(b, sizeof b, "%llx[%s%s%s]", (unsigned long long)h,
+                    live ? "A" : "-", debris.HasBody(h) ? "D" : "-",
+                    mob ? "M" : "-");
+      if (!chain.empty()) chain += ">";
+      chain += b;
+    };
+    std::vector<uint64_t> seen;
+    for (; hops < 32 && body_ && !holdable(body_); hops++) {
+      describe(body_);
+      seen.push_back(body_);
+      last = body_;
+      body_ = phys.Successor(body_);
+      if (std::find(seen.begin(), seen.end(), body_) != seen.end()) {
+        chain += ">CYCLE";
+        body_ = 0;
+        break;
+      }
+    }
+    if (!body_ || !holdable(body_)) {
+      if (body_) describe(body_);
+      const uint64_t h = body_ ? body_ : last;
+      int li = -1;
+      const Mob* owner =
+          mobs ? const_cast<MobSystem*>(mobs)->FindOwner(h, &li) : nullptr;
+      char buf[160];
+      std::snprintf(buf, sizeof buf,
+                    "grab lost: %s after %d hop(s) | mob=%s limb=%d alive=%d "
+                    "released=%d | ",
+                    body_ ? "successor not holdable" : "handle gone, no successor",
+                    hops, owner ? "yes" : "no", li,
+                    owner ? (int)owner->Alive() : -1,
+                    owner ? (int)owner->RigReleased() : -1);
+      dropNote_ = std::string(buf) + chain;
+      std::fprintf(stderr, "%s (held %llx)\n", dropNote_.c_str(),
+                   (unsigned long long)held0);
       Forget();
       return;
     }
     Vec3 com;
     if (!phys.BodyCenterOfMass(body_, com)) {
+      dropNote_ = "grab lost: no centre of mass";
+      std::fprintf(stderr, "%s\n", dropNote_.c_str());
       Forget();
       return;
     }
@@ -161,6 +233,12 @@ class GrabHold {
     // wall on the next servo step.
     const float breakVox = tp.grabBreakDistance / kVoxelMeters;
     if (err.len() > breakVox) {
+      char buf[120];
+      std::snprintf(buf, sizeof buf, "grab lost: pulled %.2f m from the hands "
+                    "(break %.2f m)", err.len() * kVoxelMeters,
+                    tp.grabBreakDistance);
+      dropNote_ = buf;
+      std::fprintf(stderr, "%s\n", buf);
       Release(phys);
       return;
     }
@@ -207,9 +285,13 @@ class GrabHold {
   // Without it the heaviest liftable thing is servo'd at a speed indis-
   // tinguishable from zero and reads as a bug rather than as weight.
   static constexpr float kMinCarryFrac = 0.12f;
+  // Carry distance as a fraction of the latched grab distance (0.56 = 44%
+  // closer: 0.7, then a further 20% in on the owner's call, 2026-09-25).
+  static constexpr float kCarryPull = 0.56f;
 
   uint64_t body_ = 0;
   float massKg_ = 0.0f;
+  std::string dropNote_;
   // What the body was before it was Carried, so Release can say what it is
   // again (a corpse limb stays a corpse's).
   Physics::BodyRole prevRole_ = Physics::BodyRole::Debris;

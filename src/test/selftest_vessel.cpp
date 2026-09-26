@@ -729,6 +729,29 @@ Status GateVessel(Ctx& c, std::string& detail) {
     c.debris.Reset();
   }
 
+  // ---- APPLY MODE's picture (ContainerApplyStream): the scoop stream run
+  // backwards. Every op is a ghost, starts at the lip, homes onto the skin
+  // point, and the particle budget caps it.
+  {
+    const Vec3 mouth{10.0f, 20.0f, 10.0f}, skin{30.0f, 18.0f, 12.0f};
+    std::vector<FluidSpawnOp> out;
+    const uint32_t n = ContainerApplyStream(mouth, skin, mWater, 8, 6, 0xA9u, 77,
+                                            4096, out);
+    bool ghosts = n == 6 && out.size() == 6;
+    for (const FluidSpawnOp& op : out) {
+      const Vec3 p{op.px / 65536.0f, op.py / 65536.0f, op.pz / 65536.0f};
+      const Vec3 home{p.x + op.vx / 65536.0f * 8.0f, p.y + op.vy / 65536.0f * 8.0f,
+                      p.z + op.vz / 65536.0f * 8.0f};
+      ghosts = ghosts && (op.flags & kFluidOpGhost) && op.mat == mWater &&
+               (p - mouth).len() < 0.5f && (home - skin).len() < 1.0f;
+    }
+    check(ghosts, "apply stream: ghosts leave the mouth and home onto the skin");
+    std::vector<FluidSpawnOp> capped;
+    check(ContainerApplyStream(mouth, skin, mWater, 8, 6, 0xA9u, 77, 2, capped) == 2 &&
+              capped.size() == 2,
+          "apply stream: charged against the particle room");
+  }
+
   const bool ok = failed == 0;
   detail = ok ? Format("%d checks", checks)
               : Format("%d/%d checks failed; first: %s", failed, checks, first.c_str());

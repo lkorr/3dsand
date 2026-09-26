@@ -351,6 +351,25 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
       st.locoState >= 0 ? &sk.states[st.locoState] : nullptr;
   const bool clipOwnsPose = loco && loco->disableGait;
 
+  // ---- A CRAWLER THAT IS NOT GOING ANYWHERE IS NOT CRAWLING ----------------
+  // The prone clip is a locomotion cycle, and it used to loop at full rate
+  // whatever the body was doing, so a legless creature lying still stroked the
+  // ground forever. Its playhead now advances with the body's own speed
+  // against the speed the state is authored for: a stop freezes the stroke
+  // where it is (the body just lies there), creeping plays it slowly, and a
+  // full crawl plays it as authored. `speedNow_` is already low-passed
+  // (avatar.velocityHalflife), which is what makes the stop an ease and not a
+  // snap. Only the playhead is scaled (ClipInstance::rate), never the blend.
+  if (loco != nullptr && loco->groundAlign > 0.0f && !loco->clip.empty()) {
+    const int ci = sk.FindClip(loco->clip);
+    const float ref =
+        std::max(def.speed * std::max(loco->speedScale, 0.05f), 0.5f);
+    float rate = std::clamp(speedNow_ / ref, 0.0f, 1.5f);
+    if (rate < 0.05f) rate = 0.0f;
+    for (ClipInstance& inst : st.clips)
+      if (inst.clip == ci && !inst.stopping) inst.rate = rate;
+  }
+
   // ---- the chase pose: arms out while the dead come for you ----------------
   // `MobDef::chaseClip` (zombie.json names `reach`). Held while the driver
   // says the creature is engaged (PoseInputs::chaseWant — the NPC brain's
@@ -614,7 +633,15 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
     else
       MobSystem::EaseBodyY(*this, targetY, dt);
     footInit_ = true;
+    // ...and then each segment follows ITS stretch of ground rather than the
+    // one plane (Mob::ConformProneSegments). After the height is final, since
+    // the probes are taken from where the joints are actually drawn.
+    if (loco != nullptr && loco->groundAlign > 0.0f)
+      ConformProneSegments(world, dt);
+    else
+      proneConform_.clear();
   }
+  if (!clipOwnsPose) proneConform_.clear();
   pose_.bodyPlaced = true;
 
   // ---- stage 5: leg IK, strictly a POST-PROCESS on the flattened pose -------
@@ -695,6 +722,9 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   // the flatten live in Mob::ApplyWeaponArm.
   PoseAxisOverride weaponHinge;
   ApplyWeaponArm(sk, st, weaponHinge);
+  // ...and the style's per-joint brakes on what it solved (melee.h ArmSmooth).
+  // Before the clamp, like every other solver on this path.
+  SmoothWeaponArm(sk, st, dt);
 
   // ---- ledge-hang palms (a DRIVER EXTRA) ----
   ApplyHangArms(in, dt, sk, st);

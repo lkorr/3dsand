@@ -444,8 +444,14 @@ export function defaultGenome() {
        *  which with the archetype's 7 micro of joint overlap is 68 micro =
        *  17 world voxels. */
       stack: { foot: 4, shin: 13, thigh: 14, hips: 10, torso: 18, head: 16 },
-      /** Shoulder to fingertip, same idea: weights over the arm's own span. */
+      /** Shoulder to fingertip: segment LENGTHS, whose sum against the stock
+       *  27 sets how far the arm reaches (see limbTable). */
       armStack: { upper: 11, fore: 11, hand: 5 },
+      /** Marks a genome written since armStack became lengths. A stored
+       *  genome without it had WEIGHTS there -- the arm always spanned
+       *  shoulder to pelvis -- and normalizeGenome rescales it to the stock
+       *  sum, which keeps its ratios and so rebuilds it cell-identical. */
+      armLengths: 1,
     },
 
     /** Silhouette multipliers on the authored radius profiles. 1.0 is the
@@ -460,6 +466,14 @@ export function defaultGenome() {
       seat: 1.0,         // hips
       armGirth: 1.0,
       legGirth: 1.0,
+      // THE ARM'S MUSCLE (armSection). Unlike armGirth these may WIDEN the
+      // arm's boxes, which is the only way a 4-wide limb can show a shape at
+      // all. At these defaults the arm is cell-identical to the stock figure.
+      upperArm: 1.0,     // upper arm thickness
+      bicep: 0,          // front bulge, mid upper arm
+      deltoid: 0,        // shoulder cap, top of the upper arm
+      foreArm: 1.0,      // forearm thickness
+      forearmMuscle: 0,  // mass under the elbow, tapering to the wrist
     },
 
     /** The face, as three regions of the skull sweep. Read as a face: the
@@ -482,6 +496,52 @@ export function defaultGenome() {
       mouthDrop: 3,     // micro below the eye row
       brow: false,      // an eyebrow row, off by default
       beard: 0,         // painted facial hair: stubble .. moustache .. full
+      // ---- 2026-09-25: the finer face. EVERY DEFAULT IS THE FACE AS IT WAS
+      // DRAWN BEFORE THESE EXISTED, so a genome written earlier builds the
+      // same head cell for cell. Units are authored micro (one painted cell
+      // ships as a 2x2 block) unless a comment says otherwise.
+      // Eyebrows (only drawn when `brow` is on).
+      browHeight: 0,    // rows above the default brow row
+      browInner: 1,     // cells past the eye toward the nose (3 meets: unibrow)
+      browOuter: 0,     // cells past the eye toward the ear
+      browThick: 1,     // rows
+      browTilt: 0,      // -1 inner ends down (stern) .. 1 inner ends up (worried)
+      browArch: 0,      // lifts the middle of each brow
+      browSparse: 0,    // share of brow cells left bare
+      browTone: 'shade',
+      browProud: false, // a brow ridge one cell proud of the face
+      // Mouth.
+      mouthCurve: 0,    // -1 frown .. 1 smile: corners turn down or up
+      mouthSkew: 0,     // -1..1 lifts one corner: a smirk
+      mouthShift: 0,    // cells sideways
+      mouthOpen: 0,     // rows of open mouth under the line
+      mouthTone: 'shade',
+      lips: 0,          // 0 none, 1 a lit lower lip, 2 both lips
+      // Other features.
+      nose: 0,          // rows of nose standing one cell proud, below the eyes
+      noseWidth: 1,     // half-width: 1 is two cells, 2 is four
+      earSize: 1,       // 0 small, 1 the drawn ear, 2 large
+      earPoint: false,  // an elf point on top of each ear
+      eyeWhites: false, // a lit cell outward of each pupil
+      eyeBags: 0,       // shade under the eyes
+      cheeks: 0,        // -1 hollow (shade) .. 1 high cheekbones (lit)
+      freckles: 0,      // speckle across the nose and cheeks
+      wrinkles: 0,      // crow's feet, then a forehead line, then smile lines
+      scar: 0,          // -1..1: a slash over the left/right eye, this long
+      // Beard, around `beard` (its reach). Every modifier is 0 = as drawn.
+      beardStyle: 'clean',
+      beardLip: 0,      // moustache: -1 shaved .. 1 wide, drooping (horseshoe)
+      beardChin: 0,     // chin under the mouth: -1 shaved .. 1 wide
+      beardJaw: 0,      // rows added to (or taken off) the jaw line
+      beardCheek: 0,    // -1 bare cheeks .. 1 cheeks filled to the cheekbone
+      beardSide: 0,     // sideburns: 0 none .. 1 down to the jaw
+      beardWidth: 0,    // -1..1 scales how far round the face it spreads
+      beardDensity: 1,  // below 1 the beard goes patchy (stubble, shadow)
+      beardRagged: 0.45, // share of edge cells left bare (0 = razor-neat)
+      beardTone: 'shade',
+      beardLen: 0,      // real hair hanging off the chin: 1 reaches the waist
+      beardPoint: 0,    // the hanging beard tapers to a point
+      beardFork: false, // ...to two points
     },
 
     /** HAIR IS A FUNCTION, not a texture: `back`/`front` are the z at or above
@@ -523,6 +583,17 @@ export function defaultGenome() {
       sideThin: 0,      // temples and the sides of the head and curtain
       topThin: 0,       // the crown
       fluff: 0,         // the outer surface of any mass breaks into wisps
+      // ---- THE SHORT HAIR LAYER (2026-09-25): a coat of very short,
+      // see-through hair over the skull -- over bare skin as well as over the
+      // cap -- so an undercut's shaved sides can carry a fade, a bald head a
+      // buzz. NOT PART OF ANY STYLE: HAIR_NONE leaves these out, so picking a
+      // style keeps the layer you built. Lengths are shipped voxels.
+      fuzz: 0,          // 0 off .. 1 densest (still see-through)
+      fuzzTop: 1,       // length on top of the head
+      fuzzSide: 1,      // length over the sides and temples
+      fuzzBack: 1,      // length at the back
+      fuzzLow: 0.5,     // how far down it reaches: 0 the eye row, 1 the nape
+      fuzzFray: 0.5,    // how uneven the lengths are
     },
 
     colors: {
@@ -594,6 +665,85 @@ export const HAIR_STYLES = {
 };
 export const HAIR_STYLE_ORDER = Object.keys(HAIR_STYLES);
 
+/** Facial hair, as PRESETS of the beard genes -- the same contract as
+ *  HAIR_STYLES: a style is data, not a code path, and every style states
+ *  every beard gene through BEARD_NONE so a pick never inherits half of the
+ *  previous one. Ordered light to heavy, so stepping the slider walks from
+ *  clean-shaven through the moustaches and chin styles to the long beards. */
+const BEARD_NONE = { beard: 0, beardLip: 0, beardChin: 0, beardJaw: 0,
+                     beardCheek: 0, beardSide: 0, beardWidth: 0,
+                     beardDensity: 1, beardRagged: 0.45, beardTone: 'shade',
+                     beardLen: 0, beardPoint: 0, beardFork: false };
+const bs = o => ({ ...BEARD_NONE, ...o });
+// No moustache, no chin, no jaw: the building blocks the styles combine.
+const NO_JAW = { beardJaw: -4 };
+export const BEARD_STYLES = {
+  clean:      bs({}),
+  shadow:     bs({ beard: 1, beardDensity: 0.2, beardRagged: 0.8,
+                   beardTone: 'hair' }),
+  stubble:    bs({ beard: 1, beardDensity: 0.45, beardRagged: 0.7 }),
+  pencil:     bs({ beard: 0.1, beardLip: -0.2, beardChin: -1, ...NO_JAW,
+                   beardRagged: 0 }),
+  moustache:  bs({ beard: 0.15, beardChin: -1, ...NO_JAW, beardRagged: 0.15 }),
+  walrus:     bs({ beard: 0.2, beardLip: 0.5, beardChin: -1, ...NO_JAW,
+                   beardRagged: 0.7 }),
+  handlebar:  bs({ beard: 0.15, beardLip: 0.7, beardChin: -1, ...NO_JAW,
+                   beardRagged: 0.1 }),
+  horseshoe:  bs({ beard: 0.2, beardLip: 1, beardChin: -1, ...NO_JAW }),
+  soulpatch:  bs({ beard: 0.1, beardLip: -1, beardChin: -0.55, ...NO_JAW,
+                   beardRagged: 0 }),
+  goatee:     bs({ beard: 0.2, beardLip: -1, ...NO_JAW, beardRagged: 0.1 }),
+  circle:     bs({ beard: 0.2, ...NO_JAW, beardRagged: 0.2 }),
+  vandyke:    bs({ beard: 0.2, beardLip: 0.3, beardChin: -0.3, ...NO_JAW,
+                   beardLen: 0.08, beardPoint: 1 }),
+  chinstrap:  bs({ beard: 0.6, beardLip: -1, beardJaw: -1, beardRagged: 0.1 }),
+  curtain:    bs({ beard: 0.8, beardLip: -1, beardCheek: -1 }),
+  jawline:    bs({ beard: 0.5 }),
+  // Trimmed: a row lower up the sides than a full beard. At a ten-cell face
+  // every amount past ~0.7 already covers the lower face, so `short` has to
+  // differ in shape, not in amount.
+  short:      bs({ beard: 0.7, beardJaw: -1, beardRagged: 0.1 }),
+  full:       bs({ beard: 1 }),
+  bushy:      bs({ beard: 1, beardWidth: 0.6, beardRagged: 0.8, beardCheek: 1,
+                   beardSide: 0.8, beardLen: 0.1 }),
+  muttonchops: bs({ beard: 0.9, beardLip: -1, beardChin: -1, beardCheek: 1,
+                    beardSide: 1 }),
+  friendly:   bs({ beard: 0.9, beardLip: 0.3, beardChin: -1, beardCheek: 1,
+                   beardSide: 1 }),
+  sideburns:  bs({ beardSide: 0.6 }),
+  long:       bs({ beard: 1, beardLen: 0.35, beardPoint: 0.3 }),
+  forked:     bs({ beard: 1, beardLen: 0.45, beardPoint: 0.8, beardFork: true }),
+  wizard:     bs({ beard: 1, beardSide: 1, beardLen: 0.85, beardPoint: 0.7,
+                   beardRagged: 0.6 }),
+};
+export const BEARD_STYLE_ORDER = Object.keys(BEARD_STYLES);
+const BEARD_KEYS = Object.keys(BEARD_NONE);
+
+function weightedPick(weights, r) {
+  const ks = Object.keys(weights);
+  let t = r() * ks.reduce((a, k) => a + weights[k], 0);
+  for (const k of ks) { t -= weights[k]; if (t < 0) return k; }
+  return ks[ks.length - 1];
+}
+
+/** Snap the beard genes to a named style (see applyHairStyle). */
+export function applyBeardStyle(genome, style) {
+  const s = BEARD_STYLES[style];
+  if (!s) return genome;
+  genome.face.beardStyle = style;
+  Object.assign(genome.face, s);
+  return genome;
+}
+
+/** Which beard styles a random male roll picks from, and how often. Clean-
+ *  shaven is the most common single choice; the long ones are rare. */
+const BEARD_ROLL = { clean: 10, shadow: 3, stubble: 4, moustache: 2,
+                     walrus: 1, handlebar: 0.5, horseshoe: 1, goatee: 2,
+                     circle: 2, vandyke: 1, soulpatch: 0.5, chinstrap: 1,
+                     curtain: 0.5, jawline: 2, short: 3, full: 3, bushy: 1,
+                     muttonchops: 0.7, friendly: 0.5, sideburns: 1, long: 1,
+                     forked: 0.4, wizard: 0.3, pencil: 0.5 };
+
 /**
  * THE GENE GROUPS, in the order the Characters page stacks them. `note` is the
  * one line under the heading that says what the whole group does — the thing
@@ -611,14 +761,40 @@ export const GENE_GROUPS = [
   { key: 'shape', title: 'silhouette',
     note: 'Multipliers on the drawn outline. 1.00 is the stock figure; below ' +
           '1 pinches it in, above 1 fills it out.' },
+  { key: 'arms', title: 'arms and muscle',
+    note: 'The three lengths ADD UP to the arm (the stock arm hangs to the ' +
+          'hip line; longer reaches down the thigh). Size and muscle widen ' +
+          'the arm itself, so a big arm hangs a little further out.' },
   { key: 'face', title: 'head and face',
     note: 'A face here is about twenty voxels across, so small moves read ' +
           'large. The side view is where the skull shape shows.' },
+  { key: 'brows', title: 'eyebrows',
+    note: 'Painted over the eyes in the hair colour (or the tone picked ' +
+          'here). Every row below needs the eyebrows box ticked; one cell ' +
+          'here ships as a 2x2 block, so a brow is two or three cells long.' },
+  { key: 'mouth', title: 'mouth',
+    note: 'A line of paint a couple of cells long, so expression is corners: ' +
+          'curve turns both ends, skew lifts one. Opening it paints dark rows ' +
+          'under the line.' },
+  { key: 'details', title: 'face details',
+    note: 'Nose and ears are real geometry (a cell standing proud of the ' +
+          'face); the rest is paint in the skin tones -- shade for hollows, ' +
+          'lines and freckles, the lit tone for highlights and scars.' },
+  { key: 'beard', title: 'facial hair',
+    note: 'Pick a style to set everything below, then drag. The beard is ' +
+          'paint on the lower face built from regions -- moustache, chin, ' +
+          'jaw, cheeks, sideburns -- and the hanging length is real hair ' +
+          'off the chin that thins to wisps at the end.' },
   { key: 'hair', title: 'hair',
     note: 'Two layers. The CAP is paint on the skull: how far down the back ' +
           'and the forehead it reaches. The MASS is real hair off the scalp ' +
           '-- volume, crests, buns, and anything that hangs, which thins to ' +
           'see-through wisps at the ends.' },
+  { key: 'fuzz', title: 'short hair layer',
+    note: 'A coat of very short see-through hair over the whole skull, bare ' +
+          'skin included -- a fade on shaved sides, a buzz on a bald head, ' +
+          'stubble growing back. Separate from the style above: picking a ' +
+          'style keeps it. Lengths are in voxels.' },
   { key: 'colour', title: 'colours',
     note: 'Nine art slots. Each surface picks base, shadow or highlight by ' +
           'which way it faces, so the three skin tones want to be the same ' +
@@ -733,17 +909,6 @@ export const GENE_SPECS = [
   { path: 'body.stack.foot', label: 'foot height', group: 'proportion',
     hint: 'Sole to ankle. Tall feet read as thick-soled boots.',
     min: 3, max: 6, step: 0.5, sigma: 0.3 },
-  { path: 'body.armStack.upper', label: 'upper arm', group: 'proportion',
-    hint: 'Shoulder to elbow. This one shares out the ARM’s length, not ' +
-          'the body’s.',
-    min: 8, max: 15, step: 0.5, sigma: 0.8 },
-  { path: 'body.armStack.fore', label: 'forearm', group: 'proportion',
-    hint: 'Elbow to wrist.',
-    min: 8, max: 15, step: 0.5, sigma: 0.8 },
-  { path: 'body.armStack.hand', label: 'hand', group: 'proportion',
-    hint: 'Wrist to fingertip. This is also where a held weapon’s grip ' +
-          'sits, so a tiny hand holds a sword close in.',
-    min: 4, max: 8, step: 0.5, sigma: 0.4 },
 
   { path: 'shape.waist', label: 'waist', group: 'shape',
     hint: 'The torso at the belly. Low pinches it in, high barrels it out.',
@@ -768,6 +933,41 @@ export const GENE_SPECS = [
   { path: 'shape.legGirth', label: 'leg girth', group: 'shape',
     hint: 'Thickens or thins both legs over the limb thickness set above.',
     min: 0.8, max: 1.25, step: 0.01, sigma: 0.05 },
+
+  { path: 'body.armStack.upper', label: 'upper arm', group: 'arms',
+    hint: 'Shoulder to elbow. A LENGTH: raising it moves the elbow and the ' +
+          'hand down together, the forearm keeps its own length.',
+    min: 8, max: 15, step: 0.5, sigma: 0.8 },
+  { path: 'body.armStack.fore', label: 'forearm', group: 'arms',
+    hint: 'Elbow to wrist. A length, like the upper arm.',
+    min: 8, max: 15, step: 0.5, sigma: 0.8 },
+  { path: 'body.armStack.hand', label: 'hand', group: 'arms',
+    hint: 'Wrist to fingertip. This is also where a held weapon’s grip ' +
+          'sits, so a tiny hand holds a sword close in.',
+    // 3, not 4: a pre-lengths genome is rescaled to the stock sum on load
+    // (normalizeGenome), and a long-armed one's 4-micro hand lands at ~3.4.
+    // Clamping it back to 4 would change the arm it rebuilds.
+    min: 3, max: 8, step: 0.5, sigma: 0.4 },
+  { path: 'shape.upperArm', label: 'upper arm size', group: 'arms',
+    hint: 'How thick the upper arm is, on top of arm girth. Past about 1.25 ' +
+          'the arm gets a wider box and starts to show real shape.',
+    min: 0.8, max: 2.0, step: 0.05, sigma: 0.06 },
+  { path: 'shape.bicep', label: 'bicep', group: 'arms',
+    hint: 'A bulge on the front of the upper arm, peaking a little above ' +
+          'the elbow, with a smaller triceps swell behind it.',
+    min: 0, max: 1, step: 0.05, sigma: 0.1 },
+  { path: 'shape.deltoid', label: 'deltoid', group: 'arms',
+    hint: 'The cap of muscle over the top of the upper arm. Broadens the ' +
+          'shoulder line outward without widening the torso.',
+    min: 0, max: 1, step: 0.05, sigma: 0.1 },
+  { path: 'shape.foreArm', label: 'forearm size', group: 'arms',
+    hint: 'How thick the forearm is, on top of arm girth, independent of ' +
+          'the upper arm.',
+    min: 0.8, max: 2.0, step: 0.05, sigma: 0.06 },
+  { path: 'shape.forearmMuscle', label: 'forearm muscle', group: 'arms',
+    hint: 'Mass just under the elbow that tapers toward the wrist -- the ' +
+          'Popeye forearm at the top of the range.',
+    min: 0, max: 1, step: 0.05, sigma: 0.1 },
 
   { path: 'head.jaw', label: 'jaw', group: 'face',
     hint: 'The lower skull. Low tapers to a pointed chin, high squares it ' +
@@ -796,20 +996,180 @@ export const GENE_SPECS = [
   { path: 'face.eyeCols', label: 'eye size', group: 'face',
     hint: 'Columns painted per eye. 1 is a dot, 2 is a wide stare.',
     min: 1, max: 2, step: 1, int: true, sigma: 0.4 },
-  { path: 'face.mouthWidth', label: 'mouth width', group: 'face',
+  { path: 'face.eyeWhites', label: 'eye whites', group: 'face', kind: 'bool',
+    hint: 'A lit cell outward of each pupil, so the eye reads as an eye ' +
+          'rather than a dot.',
+    roll: 0.3, sigma: 0.1 },
+  { path: 'face.eyeBags', label: 'under-eyes', group: 'face',
+    hint: 'Shade under the eyes: tired, old, or hard-living. Past halfway ' +
+          'it spreads to the outer corner.',
+    min: 0, max: 1, step: 0.05, roll: 0.2, sigma: 0.1 },
+
+  // ---- eyebrows ----
+  { path: 'face.brow', label: 'eyebrows', group: 'brows', kind: 'bool',
+    hint: 'Paints a brow over each eye. Everything else in this group ' +
+          'shapes it.',
+    sigma: 0.25 },
+  { path: 'face.browHeight', label: 'height', group: 'brows',
+    hint: 'Rows above where the brow normally sits. Down is a heavy, ' +
+          'hooded look; up is surprise.',
+    min: -1, max: 2, step: 1, int: true, sigma: 0.4 },
+  { path: 'face.browThick', label: 'thickness', group: 'brows',
+    hint: 'Rows of brow. 1 is a line, 3 is bushy.',
+    min: 1, max: 3, step: 1, int: true, sigma: 0.4 },
+  { path: 'face.browInner', label: 'inner reach', group: 'brows',
+    hint: 'Cells past the eye toward the nose. At 3 the two brows meet in ' +
+          'the middle: a unibrow.',
+    min: 0, max: 3, step: 1, int: true, sigma: 0.4 },
+  { path: 'face.browOuter', label: 'outer reach', group: 'brows',
+    hint: 'Cells past the eye toward the temple.',
+    min: 0, max: 2, step: 1, int: true, sigma: 0.4 },
+  { path: 'face.browTilt', label: 'tilt', group: 'brows',
+    hint: 'Below 0 the inner ends drop into a frown (stern, angry); above ' +
+          '0 they lift (worried, sad). A cell of slope needs a brow at ' +
+          'least two cells long.',
+    min: -1, max: 1, step: 0.1, sigma: 0.25 },
+  { path: 'face.browArch', label: 'arch', group: 'brows',
+    hint: 'Lifts the middle of each brow over the ends. Needs three or ' +
+          'more cells of brow to show.',
+    min: 0, max: 1, step: 0.05, sigma: 0.2 },
+  { path: 'face.browSparse', label: 'sparseness', group: 'brows',
+    hint: 'Leaves brow cells bare at random: thin, plucked or greying ' +
+          'brows.',
+    min: 0, max: 1, step: 0.05, sigma: 0.1 },
+  { path: 'face.browTone', label: 'colour', group: 'brows', kind: 'enum',
+    hint: 'Which paint the brow uses: the hair shade (default), the hair ' +
+          'itself, the eye colour (darkest), or the lit skin tone (pale or ' +
+          'white brows).',
+    choices: ['shade', 'hair', 'dark', 'light'], sigma: 0.1 },
+  { path: 'face.browProud', label: 'brow ridge', group: 'brows', kind: 'bool',
+    hint: 'The brow stands one cell proud of the face: a heavy ridge that ' +
+          'shadows the eyes. Side view.',
+    roll: 0.3, sigma: 0.1 },
+
+  // ---- mouth ----
+  { path: 'face.mouthWidth', label: 'width', group: 'mouth',
     hint: 'How far the mouth line runs. 1 is a dot, 4 spans the face.',
     min: 1, max: 4, step: 1, int: true, sigma: 0.6 },
-  { path: 'face.mouthDrop', label: 'mouth height', group: 'face',
+  { path: 'face.mouthDrop', label: 'height', group: 'mouth',
     hint: 'How far below the eyes the mouth sits. Bigger drops lengthen the ' +
           'face and shorten the chin under it.',
     min: 2, max: 5, step: 1, int: true, sigma: 0.6 },
-  { path: 'face.beard', label: 'beard', group: 'face',
-    hint: 'Facial hair in the hair shade: a little is a moustache and ' +
-          'goatee, the middle runs along the jaw, the top is a full beard.',
+  { path: 'face.mouthShift', label: 'offset', group: 'mouth',
+    hint: 'Moves the mouth a cell to one side. Off-centre reads as a ' +
+          'crooked, lived-in face.',
+    min: -1, max: 1, step: 1, int: true, roll: 0.25, sigma: 0.2 },
+  { path: 'face.mouthCurve', label: 'smile', group: 'mouth',
+    hint: 'Above 0 a corner cell turns up past each end of the mouth (a ' +
+          'smile); below 0 it turns down (a frown). Past 0.7 on a wide ' +
+          'mouth the ends themselves lift too.',
+    min: -1, max: 1, step: 0.1, sigma: 0.25 },
+  { path: 'face.mouthSkew', label: 'smirk', group: 'mouth',
+    hint: 'Lifts one end of the mouth line: below 0 the left, above 0 the ' +
+          'right.',
+    min: -1, max: 1, step: 0.1, roll: 0.4, sigma: 0.25 },
+  { path: 'face.mouthOpen', label: 'open', group: 'mouth',
+    hint: 'Rows of open mouth under the line, painted dark.',
+    min: 0, max: 2, step: 1, int: true, roll: 0.2, sigma: 0.3 },
+  { path: 'face.mouthTone', label: 'line colour', group: 'mouth',
+    kind: 'enum',
+    hint: 'The mouth line in the skin shade (soft) or the eye colour (a ' +
+          'hard dark line).',
+    choices: ['shade', 'dark'], sigma: 0.1 },
+  { path: 'face.lips', label: 'lips', group: 'mouth',
+    hint: 'A lit row under the mouth for the lower lip; 2 lights the upper ' +
+          'lip too. Hidden under a moustache.',
+    min: 0, max: 2, step: 1, int: true, sigma: 0.3 },
+
+  // ---- other features ----
+  { path: 'face.nose', label: 'nose length', group: 'details',
+    hint: 'Rows of nose standing a cell proud of the face, down from the ' +
+          'eye row. It stops above the mouth however long you ask for.',
+    min: 0, max: 3, step: 1, int: true, sigma: 0.4 },
+  { path: 'face.noseWidth', label: 'nose width', group: 'details',
+    hint: '1 is a narrow two-cell nose, 2 a broad four-cell one.',
+    min: 1, max: 2, step: 1, int: true, sigma: 0.3 },
+  { path: 'face.earSize', label: 'ears', group: 'details',
+    hint: 'Rows of ear: 0 small, 1 as drawn, 2 large.',
+    min: 0, max: 2, step: 1, int: true, sigma: 0.3 },
+  { path: 'face.earPoint', label: 'pointed ears', group: 'details',
+    kind: 'bool',
+    hint: 'A point on top of each ear -- elf, goblin.',
+    roll: 0.1, sigma: 0.05 },
+  { path: 'face.cheeks', label: 'cheeks', group: 'details',
+    hint: 'Below 0 shades a hollow under the cheekbones (gaunt); above 0 ' +
+          'lights them (high cheekbones, a flush). Past 0.6 it takes two rows.',
+    min: -1, max: 1, step: 0.05, roll: 0.3, sigma: 0.2 },
+  { path: 'face.freckles', label: 'freckles', group: 'details',
+    hint: 'Speckle of the skin shade across the nose and cheeks.',
+    min: 0, max: 1, step: 0.05, roll: 0.15, sigma: 0.1 },
+  { path: 'face.wrinkles', label: 'age lines', group: 'details',
+    hint: 'Adds in steps: crow’s feet at the eyes, then a line across ' +
+          'the forehead, then lines from the nose to the mouth corners.',
+    min: 0, max: 1, step: 0.05, roll: 0.2, sigma: 0.1 },
+  { path: 'face.scar', label: 'scar', group: 'details',
+    hint: 'A pale slash down through one eye and brow: below 0 the left, ' +
+          'above 0 the right, longer further out.',
+    min: -1, max: 1, step: 0.05, roll: 0.08, sigma: 0.1 },
+
+  // ---- facial hair ----
+  { path: 'face.beardStyle', label: 'style', group: 'beard', kind: 'enum',
+    hint: 'A preset of every setting below. Picking one overwrites them; ' +
+          'drag them afterwards and you are off the preset, which is fine.',
+    choices: BEARD_STYLE_ORDER, sigma: 0.2 },
+  { path: 'face.beard', label: 'amount', group: 'beard',
+    hint: 'How far the beard reaches: a little is a moustache and goatee, ' +
+          'the middle runs along the jaw, the top is a full beard. 0 is ' +
+          'none (sideburns are separate).',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
-  { path: 'face.brow', label: 'eyebrows', group: 'face', kind: 'bool',
-    hint: 'Paints a brow row above the eyes in the hair colour.',
-    sigma: 0.25 },
+  { path: 'face.beardLip', label: 'moustache', group: 'beard',
+    hint: 'The upper lip. -1 shaves it (chin beards without a moustache); ' +
+          'above 0 it widens past the mouth, and from 0.75 droops down both ' +
+          'sides of the chin (horseshoe).',
+    min: -1, max: 1, step: 0.05, sigma: 0.2 },
+  { path: 'face.beardChin', label: 'chin', group: 'beard',
+    hint: 'The patch under the mouth. -1 shaves it (moustache only, mutton ' +
+          'chops); about -0.5 leaves a narrow soul patch; above 0 widens it.',
+    min: -1, max: 1, step: 0.05, sigma: 0.2 },
+  { path: 'face.beardJaw', label: 'jaw line', group: 'beard',
+    hint: 'Rows of beard along the jaw, added to or taken from what the ' +
+          'amount gives. -4 clears the jaw: goatees and circle beards.',
+    min: -4, max: 3, step: 1, int: true, sigma: 0.6 },
+  { path: 'face.beardCheek', label: 'cheeks', group: 'beard',
+    hint: 'How far up the cheeks it grows. 0 follows the amount (cheeks ' +
+          'fill only on a full beard); 1 always fills to the cheekbone; -1 ' +
+          'keeps them bare.',
+    min: -1, max: 1, step: 0.05, sigma: 0.2 },
+  { path: 'face.beardSide', label: 'sideburns', group: 'beard',
+    hint: 'Hair down the side of the face in front of the ears, from the ' +
+          'hairline: 1 reaches the jaw. Works with no beard at all.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.beardWidth', label: 'spread', group: 'beard',
+    hint: 'Narrows or widens how far round the face the beard reaches, at ' +
+          'the same amount.',
+    min: -1, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.beardDensity', label: 'density', group: 'beard',
+    hint: 'Below 1 cells go bare at random: 0.2 is a five-o’clock ' +
+          'shadow, 0.5 stubble or a patchy young beard.',
+    min: 0.05, max: 1, step: 0.05, sigma: 0.1 },
+  { path: 'face.beardRagged', label: 'ragged edge', group: 'beard',
+    hint: 'Share of the cells along the beard’s edge left bare. 0 is ' +
+          'razor-trimmed.',
+    min: 0, max: 1, step: 0.05, sigma: 0.1 },
+  { path: 'face.beardTone', label: 'colour', group: 'beard', kind: 'enum',
+    hint: 'The hair shade (default, darker) or the hair colour itself.',
+    choices: ['shade', 'hair'], sigma: 0.1 },
+  { path: 'face.beardLen', label: 'length', group: 'beard',
+    hint: 'Real hair hanging from the chin, on the same scale as hair ' +
+          'length: 0.25 is a hand below the chin, 1 the waist. Needs some ' +
+          'beard on the chin to hang from.',
+    min: 0, max: 1, step: 0.05, sigma: 0.1 },
+  { path: 'face.beardPoint', label: 'taper', group: 'beard',
+    hint: 'How much the hanging beard narrows to a point. 0 is cut square.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'face.beardFork', label: 'forked', group: 'beard', kind: 'bool',
+    hint: 'The taper goes to two points instead of one.',
+    sigma: 0.1 },
 
   { path: 'hair.style', label: 'style', group: 'hair',
     hint: 'A preset of every setting below. Picking one overwrites them; ' +
@@ -901,6 +1261,30 @@ export const GENE_SPECS = [
           'hanging into loose see-through wisps, all over.',
     min: 0, max: 1, step: 0.05, sigma: 0.15 },
 
+  // ---- the short hair layer ----
+  { path: 'hair.fuzz', label: 'amount', group: 'fuzz',
+    hint: 'Turns the layer on and sets how thick it is: low is a faint ' +
+          'shadow of regrowth, 1 the densest it goes (still see-through).',
+    min: 0, max: 1, step: 0.05, roll: 0.15, sigma: 0.1 },
+  { path: 'hair.fuzzTop', label: 'length on top', group: 'fuzz',
+    hint: 'Voxels of length over the crown. 0 leaves the top bare.',
+    min: 0, max: 4, step: 0.5, sigma: 0.4 },
+  { path: 'hair.fuzzSide', label: 'length at sides', group: 'fuzz',
+    hint: 'Voxels of length over the temples and the sides. Shorter than ' +
+          'the top is a fade.',
+    min: 0, max: 4, step: 0.5, sigma: 0.4 },
+  { path: 'hair.fuzzBack', label: 'length at back', group: 'fuzz',
+    hint: 'Voxels of length at the back of the head.',
+    min: 0, max: 4, step: 0.5, sigma: 0.4 },
+  { path: 'hair.fuzzLow', label: 'reaches down to', group: 'fuzz',
+    hint: 'How low it grows: 0 stops level with the eyes, 1 goes down to ' +
+          'the nape. The forehead stays clear either way.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+  { path: 'hair.fuzzFray', label: 'fray', group: 'fuzz',
+    hint: 'How uneven it is: tufts of different lengths and gaps. 0 is a ' +
+          'clipper-even coat.',
+    min: 0, max: 1, step: 0.05, sigma: 0.15 },
+
   // BASE FIRST, THEN ITS TONES. COLOR_SLOTS is keyed for the palette writer
   // and puts `nail` last; on screen it belongs under the skin it follows, or
   // the indent says "a tone of the thing above" while pointing at the cloth.
@@ -975,6 +1359,17 @@ export function normalizeGenome(src) {
         }
       }
     }
+    // A PRE-LENGTHS GENOME (body.armLengths's note): its armStack was
+    // weights over a fixed span, so rescale to the stock sum -- same ratios,
+    // same arm -- before anything reads it as lengths.
+    if (src.body && typeof src.body === 'object' && src.body.armStack &&
+        !('armLengths' in src.body)) {
+      const a = g.body.armStack;
+      const sum = a.upper + a.fore + a.hand;
+      if (sum > 0 && Number.isFinite(sum))
+        for (const k of ['upper', 'fore', 'hand'])
+          a[k] = a[k] * ARM_STOCK_SUM / sum;
+    }
   }
   const def = defaultGenome();
   for (const spec of GENE_SPECS)
@@ -1023,7 +1418,12 @@ export function applySex(genome, sex, locks) {
     if (spec) v = clamp(v, spec.min, spec.max);
     setPath(genome, path, v);
   }
-  if (sex === 'female' && !isLocked(locks, 'face.beard')) genome.face.beard = 0;
+  if (sex === 'female' && !isLocked(locks, 'face.beard') &&
+      !isLocked(locks, 'face.beardStyle')) {
+    // The whole beard, not just its amount: sideburns and a hanging length
+    // do not read `beard`, so zeroing that alone left them on.
+    applyBeardStyle(genome, 'clean');
+  }
   return genome;
 }
 
@@ -1181,6 +1581,9 @@ export function mutate(genome, sigma, rng, locks) {
   // body does not — the one place the style/number duality can bite.
   if (!isLocked(locks, 'hair.style') && g.hair.style !== genome?.hair?.style)
     applyHairStyle(g, g.hair.style);
+  if (!isLocked(locks, 'face.beardStyle') &&
+      g.face.beardStyle !== (genome?.face?.beardStyle ?? 'clean'))
+    applyBeardStyle(g, g.face.beardStyle);
   // ...and so does a sex flip (sigma 0 on the gene: mutation never flips it
   // today, but a genome edited to flip must still move the body).
   const sexWas = genome?.body?.sex === 'female' ? 'female' : 'male';
@@ -1267,6 +1670,11 @@ export function cross(parents, rng, opts = {}) {
   if (!isLocked(opts.locks, 'hair.style'))
     Object.assign(g.hair, { back: donor.hair.back, front: donor.hair.front,
                             length: donor.hair.length, knot: donor.hair.knot });
+  // ...and the beard genes from whichever parent supplied the beard style.
+  const bdonor = ps.find(p => p.face.beardStyle === g.face.beardStyle) || ps[0];
+  if (!isLocked(opts.locks, 'face.beardStyle'))
+    for (const k of BEARD_KEYS)
+      if (!isLocked(opts.locks, 'face.' + k)) g.face[k] = bdonor.face[k];
   // Each family's tones come from the parent its BASE came mostly from, so the
   // child gets one person's relationship between a skin and its shade rather
   // than an average of two.
@@ -1288,6 +1696,9 @@ export function randomGenome(rng, locks) {
   const was = { ...g.colors };
   for (const spec of GENE_SPECS) {
     if (isLocked(locks, spec.path)) continue;
+    // A RARE FEATURE stays at its default unless its own draw comes up: a
+    // scar, freckles or pointed ears on every other roll is not variety.
+    if (spec.roll !== undefined && r() >= spec.roll) continue;
     if (spec.kind === 'color') {
       if (COLOR_BASE_OF[spec.path.slice(7)]) continue;      // carried, below
       setPath(g, spec.path, jitterColor(getPath(g, spec.path), 0.30, r));
@@ -1315,8 +1726,14 @@ export function randomGenome(rng, locks) {
     g.body.sex = 'male';
     applySex(g, sex, locks);
     if (!isLocked(locks, 'hair.style')) g.hair.style = biasedStyle(sex, r);
-    if (!isLocked(locks, 'face.beard'))
-      g.face.beard = sex === 'male' && r() < 0.45 ? 0.15 + r() * 0.85 : 0;
+    // A BEARD IS A STYLE, then a jitter of its amount: independent draws of
+    // a dozen beard genes are a scribble, not facial hair.
+    if (!isLocked(locks, 'face.beardStyle')) {
+      applyBeardStyle(g, sex === 'male' ? weightedPick(BEARD_ROLL, r)
+                                        : 'clean');
+      if (g.face.beard > 0 && !isLocked(locks, 'face.beard'))
+        g.face.beard = clamp(g.face.beard * (0.8 + r() * 0.4), 0.05, 1);
+    }
     if (!isLocked(locks, 'body.bust') && sex === 'female')
       g.body.bust = clamp(0.25 + r() * 0.6, 0, 1);
   }
@@ -1527,6 +1944,96 @@ function spendBudget(weights, budget) {
  *  AWAY from the face, which is where the heel is. */
 const mnY = sy => -Math.round(sy / 2);
 
+// =============================================================================
+// the arm's cross-section -- ONE function, read twice
+//
+// limbTable asks it how big a box the arm needs, the voxel builders ask it
+// which cells to fill, so the box always fits what is drawn in it.
+//
+// WHY THE BOX HAS TO GROW. On the stock 4-wide arm (limbTube's note) every
+// radius from ~1.6 up is the same rounded square, so no multiplier on the
+// radius can show a muscle -- arm girth across its whole range moves four
+// corner cells. The muscle genes therefore widen the box: a section whose
+// radius needs a third cell either side gets a 6-wide box, and there a bicep
+// is a visible bulge. The cross-section is an ellipse with its FRONT and BACK
+// half-depths set apart (ryF / ryB; front is +y in the authored frame), which
+// is what lets a bicep swell forward instead of the whole tube inflating.
+//
+// At the stock genes every term below is the old limbTube call exactly --
+// upper arm 2.0 -> 2.2, forearm 1.8 -> 2.0, times armGirth x limbWidth / 4 --
+// so an arm nobody touched is cell-identical.
+// =============================================================================
+
+/** Sum of the stock `armStack` (11 + 11 + 5): the arm length the fixed
+ *  shoulder-to-pelvis span means. See the LENGTHS note in limbTable. */
+const ARM_STOCK_SUM = 27;
+/** The stock figure's limbWidth, which the drawn radii are authored against. */
+const ARM_REF_WIDTH = 4;
+
+/** A raised-cosine bump: 1 at `c`, 0 beyond `w` either side. */
+function bump(t, c, w) {
+  const d = Math.abs(t - c) / w;
+  return d >= 1 ? 0 : 0.5 * (1 + Math.cos(Math.PI * d));
+}
+function smooth01(a, b, t) {
+  const u = Math.min(1, Math.max(0, (t - a) / (b - a)));
+  return u * u * (3 - 2 * u);
+}
+
+/** The section of arm segment `seg` ('upper' | 'fore') at height t (0 = its
+ *  bottom, 1 = its top), in authored micro: { rx, ryF, ryB }. */
+function armSection(g, seg, t) {
+  const s = g.shape.armGirth * g.body.limbWidth / ARM_REF_WIDTH;
+  const sh = g.shape;
+  if (seg === 'upper') {
+    const r = s * sh.upperArm * (2.0 + 0.2 * t);
+    // Biceps peak a little below the middle; a smaller triceps swell behind.
+    const bi = s * sh.bicep * 1.6 * bump(t, 0.42, 0.38);
+    // The deltoid caps the top 40%, mostly OUTWARD: it is what broadens a
+    // shoulder line seen from the front.
+    const de = s * sh.deltoid * 1.3 * smooth01(0.55, 0.9, t);
+    return { rx: r + de + 0.3 * bi, ryF: r + 0.6 * de + bi,
+             ryB: r + 0.6 * de + 0.45 * bi };
+  }
+  const r = s * sh.foreArm * (1.8 + 0.2 * t);
+  // Forearm mass sits just under the elbow and is gone by the wrist.
+  const fm = s * sh.forearmMuscle * 1.4 * bump(t, 0.75, 0.45);
+  return { rx: r + 0.8 * fm, ryF: r + fm, ryB: r + 0.7 * fm };
+}
+
+/** [sx, sy] for arm segment `seg` of height `sz`: the stock limbWidth square,
+ *  or bigger where the section needs it. Always even (the mirror contract). */
+function armBox(g, seg, sz) {
+  // A cell centred k + 0.5 off the axis is inside radius r when k + 0.5 <= r,
+  // so a half-width of floor(r + 0.5) cells holds every filled one.
+  let hx = g.body.limbWidth / 2, hy = hx;
+  for (let z = 0; z < sz; z++) {
+    const q = armSection(g, seg, z / Math.max(sz - 1, 1));
+    hx = Math.max(hx, Math.floor(q.rx + 0.5));
+    hy = Math.max(hy, Math.floor(Math.max(q.ryF, q.ryB) + 0.5));
+  }
+  return [2 * hx, 2 * hy];
+}
+
+/** The arm segment's cells: limbTube with armSection's egg-shaped section. */
+function armTube(g, seg, size, colFor) {
+  const [sx, sy, sz] = size;
+  const cx = sx * 0.5, cy = sy * 0.5;
+  const out = [];
+  for (let z = 0; z < sz; z++) {
+    const q = armSection(g, seg, z / Math.max(sz - 1, 1));
+    for (let y = 0; y < sy; y++)
+      for (let x = 0; x < sx; x++) {
+        const dx = (x + 0.5 - cx) / q.rx;
+        const dyr = y + 0.5 - cy;
+        const dy = dyr / (dyr >= 0 ? q.ryF : q.ryB);
+        if (dx * dx + dy * dy <= 1.0)
+          out.push([x, y, z, colFor(x, y, z, sx, sy, sz)]);
+      }
+  }
+  return out;
+}
+
 /**
  * Build the authored limb table for a genome.
  * Returns { limbs: {name: {size:[x,y,z], mn:[x,y,z]}}, microH, worldH, eyeZ,
@@ -1582,9 +2089,25 @@ export function limbTable(genome) {
   // span PLUS them. Getting this backwards shortened every arm segment by 8%
   // and left a one-micro gap at the elbow, which the "does it touch its
   // parent" assert caught and a thumbnail never would have.
+  //
+  // THE SEGMENT GENES ARE LENGTHS (2026-09-25). They used to be WEIGHTS over
+  // that fixed span, so "upper arm" and "forearm" could only trade rows: a
+  // longer upper arm was a shorter forearm, the hand never moved, and both
+  // sliders read as "moves the elbow a bit". Now the span scales with their
+  // SUM against the stock arm's, so at the stock sum (27, which is also the
+  // stock budget in micro) nothing moves and every existing proportion is
+  // kept; only the total is new.
   const armOverlap = ARCHETYPE.armStack.reduce((s, e) => s + e.overlap, 0);
   const armSpan = rows.torso.top - rows.hips.base;
-  const armH = spendBudget(b.armStack, armSpan + armOverlap);
+  const armSum = Object.values(b.armStack).reduce((s, v) => s + v, 0);
+  // Floored so no segment vanishes; capped so the fingertips stop at the
+  // ground (a long arm on short legs would otherwise break the z = 0
+  // contract generateMob asserts).
+  const armBudget = Math.min(
+      rows.torso.top + armOverlap,
+      Math.max(armOverlap + ARCHETYPE.armStack.length,
+               Math.round((armSpan + armOverlap) * armSum / ARM_STOCK_SUM)));
+  const armH = spendBudget(b.armStack, armBudget);
   let armTop = rows.torso.top;
   const armRows = {};
   for (const e of ARCHETYPE.armStack) {
@@ -1599,14 +2122,26 @@ export function limbTable(genome) {
   // inner edge at all (see limbTube) — a skirt hides that and a bare body
   // does not.
   const legX = Math.max(0, b.hipWidth / 2 - lw);
+  // THE ARM'S BOXES FIT ITS MUSCLE (armSection). Every segment is centred on
+  // ONE axis, so the shoulder, elbow and wrist anchors (box centres) stay in
+  // line, and the axis sits where the WIDEST segment's inner edge touches the
+  // shoulder -- a big arm hangs further out rather than into the ribs.
+  const boxU = armBox(g, 'upper', armRows.upper.h);
+  const boxF = armBox(g, 'fore', armRows.fore.h);
+  const armAxis = armX + Math.max(lw, boxU[0], boxF[0]) / 2;
   for (const side of ARCHETYPE.sides) {
     const put = (name, x, sy, sz, z) => {
       limbs[name] = { size: [lw, sy, sz],
                       mn: [side === 'L' ? x : -x - lw, mnY(sy), z] };
     };
-    put(`armU.${side}`, armX, lw, armRows.upper.h, armRows.upper.base);
-    put(`armL.${side}`, armX, lw, armRows.fore.h, armRows.fore.base);
-    put(`hand.${side}`, armX, lw, armRows.hand.h, armRows.hand.base);
+    const putArm = (name, [sx, sy], sz, z) => {
+      limbs[name] = { size: [sx, sy, sz],
+                      mn: [side === 'L' ? armAxis - sx / 2 : -armAxis - sx / 2,
+                           mnY(sy), z] };
+    };
+    putArm(`armU.${side}`, boxU, armRows.upper.h, armRows.upper.base);
+    putArm(`armL.${side}`, boxF, armRows.fore.h, armRows.fore.base);
+    putArm(`hand.${side}`, [lw, lw], armRows.hand.h, armRows.hand.base);
     put(`legU.${side}`, legX, lw, rows.thigh.h, rows.thigh.base);
     put(`legL.${side}`, legX, lw, rows.shin.h, rows.shin.base);
     limbs[`foot.${side}`] = {
@@ -1929,13 +2464,177 @@ function headVox(g, size, ctx) {
   // voxels on the `lanky` preset before this, which the "one connected piece"
   // assert caught and the preview did not.
   const earY = pyRound(hcy) - 1;
-  for (const z of [eyeZ - 1, eyeZ]) {
+  const f = g.face;
+  const earSet = new Set();                   // out indices: ears and points
+  const earRows = f.earSize <= 0 ? [eyeZ]
+                : f.earSize >= 2 ? [eyeZ - 2, eyeZ - 1, eyeZ] : [eyeZ - 1, eyeZ];
+  const earTop = [];                          // [x, z] of each ear's top cell
+  for (const z of earRows) {
+    if (z < 0) continue;
     let loX = -1, hiX = -1;
     for (let x = 0; x < sx; x++)
       if (has.has(x + ',' + earY + ',' + z)) { if (loX < 0) loX = x; hiX = x; }
     if (loX < 0) continue;                    // no skull on this row: no ears
-    if (loX - 1 >= 0) out.push([loX - 1, earY, z, ART.SKIN_SHADE]);
-    if (hiX + 1 < sx) out.push([hiX + 1, earY, z, ART.SKIN_SHADE]);
+    if (loX - 1 >= 0) {
+      earSet.add(out.length); out.push([loX - 1, earY, z, ART.SKIN_SHADE]);
+      earTop[0] = [loX - 1, z];
+    }
+    if (hiX + 1 < sx) {
+      earSet.add(out.length); out.push([hiX + 1, earY, z, ART.SKIN_SHADE]);
+      earTop[1] = [hiX + 1, z];
+    }
+  }
+  // AN ELF POINT: two cells straight up off the top of each ear, only where
+  // the skull left the space empty -- stacked on the ear, so it is connected
+  // by construction (the note above is why that matters).
+  if (f.earPoint)
+    for (const t of earTop) {
+      if (!t) continue;
+      for (let dz = 1; dz <= 2; dz++) {
+        const z = t[1] + dz, k = t[0] + ',' + earY + ',' + z;
+        if (z >= sz || has.has(k)) break;
+        has.add(k);
+        earSet.add(out.length);
+        out.push([t[0], earY, z, ART.SKIN_SHADE]);
+      }
+    }
+
+  // ---- the face's own paint helpers ----------------------------------------
+  // The FRONTMOST cell of column x on row z, by index, or -1. A scan rather
+  // than a cached map because the nose and brow ridge below add geometry
+  // between paints; a head is ~1000 cells, so it costs nothing.
+  const frontAt = (x, z) => {
+    let best = -1;
+    for (let i = 0; i < out.length; i++) {
+      const c = out[i];
+      if (c[0] === x && c[2] === z && (best < 0 || c[1] > out[best][1])) best = i;
+    }
+    return best;
+  };
+  const SKIN = new Set([ART.SKIN_BASE, ART.SKIN_SHADE, ART.SKIN_LIGHT]);
+  // Paint the front of (x, z). `skinOnly` leaves hair, eyes and beard alone,
+  // which is how a mark ends at a hairline and hides under a moustache.
+  const paintAt = (x, z, col, skinOnly) => {
+    if (x < 0 || x >= sx || z < 0 || z >= sz) return false;
+    const i = frontAt(x, z);
+    if (i < 0 || (skinOnly && !SKIN.has(out[i][3]))) return false;
+    out[i] = [out[i][0], out[i][1], out[i][2], col];
+    return true;
+  };
+  // Stand a new cell one proud of the front of (x, z), if the box has room.
+  const proud = (x, z, col) => {
+    const i = frontAt(x, z);
+    if (i < 0) return -1;
+    const y = out[i][1] + 1, k = x + ',' + y + ',' + z;
+    if (y >= sy || has.has(k)) return -1;
+    has.add(k);
+    out.push([x, y, z, col]);
+    return out.length - 1;
+  };
+  // Symmetric rounding: Math.round takes -0.5 to 0 but 0.5 to 1, which would
+  // make every mirrored left/right gene lopsided by a cell.
+  const sround = v => Math.sign(v) * Math.floor(Math.abs(v) + 0.5);
+  const rnd01 = (...v) => hashN(...v) / 4294967296;
+
+  // The eyes' columns, needed by everything placed relative to them.
+  const eyeDx = g.face.eyeDx * (sx / DEF.head.size[0]);
+  const eyeCols = new Set();
+  for (let k = 0; k < g.face.eyeCols; k++) {
+    eyeCols.add(Math.trunc(cx - eyeDx) + k);
+    eyeCols.add(Math.trunc(cx + eyeDx) - k);
+  }
+  // Per side: dir is the way OUT (toward the ear); outer/inner are the eye's
+  // outermost and innermost columns.
+  const eyeSides = [-1, 1].map(dir => {
+    const E = [...eyeCols].filter(c => (dir < 0 ? c < cx : c >= cx));
+    if (!E.length) return null;
+    const outer = dir < 0 ? Math.min(...E) : Math.max(...E);
+    const inner = dir < 0 ? Math.max(...E) : Math.min(...E);
+    return { dir, outer, inner, E };
+  }).filter(Boolean);
+
+  // ---- nose: geometry, one cell proud, stopping above the mouth ------------
+  // One cell is all the box allows: at the eye row the face already sits a
+  // cell short of the head's front face, so a bulbous tip has nowhere to go.
+  const mouthZ = eyeZ - g.face.mouthDrop;
+  const noseSet = new Set();
+  const noseRows = Math.min(f.nose, g.face.mouthDrop - 1);
+  const noseCols = [];
+  for (let k = 0; k < 2 * f.noseWidth; k++)
+    noseCols.push(Math.trunc(cx) - f.noseWidth + k);
+  for (let r = 1; r <= noseRows; r++)
+    for (const x of noseCols) {
+      const i = proud(x, eyeZ - r, r === noseRows ? ART.SKIN_LIGHT
+                                                  : ART.SKIN_BASE);
+      if (i >= 0) noseSet.add(i);
+    }
+
+  // ---- eyebrow cells: computed now (the ridge is geometry), painted last ----
+  const browCells = [];                       // [x, z, lowestRow]
+  if (f.brow) {
+    const base = eyeZ + 2 + f.browHeight;
+    for (const s of eyeSides) {
+      // Outer to inner. The inner reach is NOT clamped at the midline: the
+      // drawn brow already stepped one cell in from each eye column, and
+      // brows meeting in the middle is the unibrow the slider promises.
+      const cols = [];
+      for (let c = s.outer + s.dir * f.browOuter; ; c -= s.dir) {
+        cols.push(c);
+        if (c === s.inner - s.dir * f.browInner) break;
+      }
+      cols.forEach((x, n) => {
+        const t = cols.length > 1 ? n / (cols.length - 1) : 0.5;
+        const off = sround(f.browTilt * t * 1.5) +
+                    sround(f.browArch * (1 - Math.abs(2 * t - 1)) * 1.5);
+        const z0 = Math.min(sz - 1, Math.max(eyeZ + 1, base + off));
+        for (let r = 0; r < f.browThick; r++)
+          if (z0 + r < sz) browCells.push([x, z0 + r, r === 0]);
+      });
+    }
+    if (f.browProud)
+      for (const [x, z, low] of browCells) if (low) proud(x, z, ART.SKIN_BASE);
+  }
+
+  // ---- skin marks: painted first, so beard, eyes, mouth and brows lie over
+  const scarKeys = new Set();
+  const shade = (x, z) => paintAt(x, z, ART.SKIN_SHADE, true);
+  const light = (x, z) => paintAt(x, z, ART.SKIN_LIGHT, true);
+  if (Math.abs(f.cheeks) >= 0.25) {
+    const two = Math.abs(f.cheeks) >= 0.6;
+    const rows = f.cheeks > 0 ? [eyeZ - 1, eyeZ - 2] : [eyeZ - 2, eyeZ - 3];
+    for (const s of eyeSides)
+      for (const x of [s.outer, s.outer + s.dir])
+        for (const z of two ? rows : [rows[0]])
+          (f.cheeks > 0 ? light : shade)(x, z);
+  }
+  if (f.freckles > 0)
+    for (let z = eyeZ - 2; z <= eyeZ - 1; z++)
+      for (let x = 0; x < sx; x++)
+        if (Math.abs(x + 0.5 - cx) < 3.6 &&
+            rnd01(x, z, 151) < f.freckles * 0.55) shade(x, z);
+  if (noseRows > 0) {                         // nostril shadow beside the tip
+    shade(noseCols[0] - 1, eyeZ - noseRows);
+    shade(noseCols[noseCols.length - 1] + 1, eyeZ - noseRows);
+  }
+  if (f.wrinkles >= 0.2)                      // crow's feet
+    for (const s of eyeSides)
+      shade(s.outer + s.dir * (f.eyeWhites ? 2 : 1), eyeZ - 1);
+  if (f.wrinkles >= 0.45)                     // a forehead line
+    for (let x = Math.trunc(cx) - 2; x <= Math.trunc(cx) + 1; x++)
+      shade(x, eyeZ + 3 + Math.max(0, f.browHeight) +
+               (f.brow ? f.browThick - 1 : 0));
+  if (f.scar !== 0) {
+    const s = eyeSides.find(e => e.dir === Math.sign(f.scar));
+    if (s) {
+      const n = Math.max(2, Math.round(Math.abs(f.scar) * 6));
+      const z0 = eyeZ + 2 + (n >= 4 ? 1 : 0);
+      for (let i = 0; i < n; i++) {
+        // Through hair too: a scar is a bald line in a brow or a cap. The
+        // eye it crosses is painted after, so the eye survives it.
+        const x = s.inner + s.dir * (Math.floor(i / 2) - 1), z = z0 - i;
+        if (paintAt(x, z, ART.SKIN_LIGHT)) scarKeys.add(x + ',' + z);
+      }
+    }
   }
 
   // THE BEARD: paint on the lower face in the hair shade, laid down before the
@@ -1945,24 +2644,80 @@ function headVox(g, size, ctx) {
   // A density ramp (stubble) was tried first and read as random blotches --
   // one painted cell is a 2x2 block once shipped, which is not a stubble grain.
   // Front half only, and never above the cheekbone row.
-  if (g.face.beard > 0) {
-    const bd = g.face.beard;
+  //
+  // REGIONS (2026-09-25), so the styles can be built from parts: the CENTRE
+  // strip is the moustache at and above the mouth row and the chin below it,
+  // each with its own width; the SIDES (past 2.2 cells out) are the jaw up to
+  // `jawTop` and the cheeks up to `cheekTop`. With every modifier at 0 the
+  // union is exactly the old rule -- dx <= reach and (centre, jaw row or a
+  // full beard) -- so no existing face moved. `beardDensity` brings the
+  // stubble back as a choice for the styles that want it, not as a default.
+  const beardTone = f.beardTone === 'hair' ? ART.HAIR : ART.HAIR_SHADE;
+  if (f.beard > 0) {
+    const bd = f.beard;
     const topZ = eyeZ - 2;
-    const reach = 1.5 + bd * (sx * 0.5);     // half-width it spreads to
+    const reach = 1.5 + bd * (sx * 0.5) * (1 + f.beardWidth * 0.6);
+    const jawTop = skullLo + 1 + Math.round(bd * 3) + f.beardJaw;
+    const auto = bd >= 0.75 ? 1 : 0;
+    const cheekF = f.beardCheek >= 0 ? Math.max(auto, f.beardCheek)
+                                     : auto * (1 + f.beardCheek);
+    const cheekTop = jawTop + (topZ - jawTop) * cheekF;
+    const lipHalf = f.beardLip >= 0 ? 2.2 + f.beardLip * 2
+                                    : 2.2 * (1 + f.beardLip);
+    const chinHalf = f.beardChin >= 0 ? 2.2 + f.beardChin * 1.5
+                                      : 2.2 * (1 + f.beardChin);
+    const lipW = f.beardLip > 0 ? Math.max(reach, lipHalf)
+                                : Math.min(reach, lipHalf);
+    const chinW = f.beardChin > 0 ? Math.max(reach, chinHalf)
+                                  : Math.min(reach, chinHalf);
+    const mouthHalf = g.face.mouthWidth / 2;
+    const droop = f.beardLip >= 0.75;
+    const keep = 1 - f.beardRagged;
     for (let i = 0; i < out.length; i++) {
       const [x, y, z, c] = out[i];
       if (z > topZ || z < skullLo) continue;
       if (c === ART.EYE) continue;
       if (y + 0.5 < hcy - 0.5) continue;        // the back of the head
+      if (noseSet.has(i) || earSet.has(i)) continue;
       const dx = Math.abs(x + 0.5 - cx);
-      // The cheek above the jaw stays bare until the beard is full.
-      const jawRow = z <= skullLo + 1 + Math.round(bd * 3);
-      if (dx > reach || (dx > 2.2 && !jawRow && bd < 0.75)) continue;
-      const edge = dx > reach - 1 || (!jawRow && dx > 1.2);
-      if (!edge || hashN(x, y, z, 97) / 4294967296 < 0.55)
-        out[i] = [x, y, z, ART.HAIR_SHADE];
+      const jawRow = z <= jawTop;
+      const lipRow = z >= mouthZ;
+      const cW = lipRow ? lipW : chinW;
+      const centre = dx <= cW;
+      const side = dx > 2.2 && dx <= reach && (jawRow || z <= cheekTop);
+      const hang = droop && !lipRow && dx > mouthHalf && dx <= lipW;
+      if (!centre && !side && !hang) continue;
+      let edge = dx > reach - 1 || (!jawRow && dx > 1.2);
+      if (centre && !side && (lipRow ? f.beardLip : f.beardChin) !== 0 &&
+          dx > cW - 1) edge = true;
+      if (f.beardDensity < 1 && rnd01(x, y, z, 131) >= f.beardDensity) continue;
+      if (!edge || hashN(x, y, z, 97) / 4294967296 < keep)
+        out[i] = [x, y, z, beardTone];
     }
   }
+  // SIDEBURNS: the outermost two columns just in front of the ear, from the
+  // hairline down toward the jaw. Independent of `beard`, so they exist on a
+  // clean-shaven face.
+  if (f.beardSide > 0) {
+    const zTop = eyeZ + 1;
+    const zBot = Math.round(zTop - f.beardSide * (zTop - skullLo));
+    const band = (i, y) => !earSet.has(i) && y >= earY && y <= earY + 2;
+    for (let z = zBot; z <= zTop; z++) {
+      let maxDx = -1;
+      for (let i = 0; i < out.length; i++)
+        if (out[i][2] === z && band(i, out[i][1]))
+          maxDx = Math.max(maxDx, Math.abs(out[i][0] + 0.5 - cx));
+      if (maxDx < 0) continue;
+      for (let i = 0; i < out.length; i++) {
+        const [x, y, zz, c] = out[i];
+        if (zz !== z || !band(i, y) || !SKIN.has(c)) continue;
+        if (Math.abs(x + 0.5 - cx) < maxDx - 1) continue;
+        if (f.beardDensity < 1 && rnd01(x, y, z, 131) >= f.beardDensity) continue;
+        out[i] = [x, y, z, beardTone];
+      }
+    }
+  }
+
   // Eyes and mouth are repaints of the FRONTMOST existing cell in their
   // column, so they can never float in front of the face or sink into it.
   const paintFront = (cols, z, col) => {
@@ -1974,34 +2729,67 @@ function headVox(g, size, ctx) {
     }
     for (const i of front.values()) out[i] = [out[i][0], out[i][1], out[i][2], col];
   };
-  const eyeDx = g.face.eyeDx * (sx / DEF.head.size[0]);
-  const eyeCols = new Set();
-  for (let k = 0; k < g.face.eyeCols; k++) {
-    eyeCols.add(Math.trunc(cx - eyeDx) + k);
-    eyeCols.add(Math.trunc(cx + eyeDx) - k);
-  }
   paintFront(eyeCols, eyeZ, ART.EYE);
+  if (f.eyeWhites)
+    for (const s of eyeSides) light(s.outer + s.dir, eyeZ);
+  if (f.eyeBags > 0.2)
+    for (const s of eyeSides) {
+      for (const x of s.E) shade(x, eyeZ - 1);
+      if (f.eyeBags > 0.6) shade(s.outer + s.dir, eyeZ - 1);
+    }
+
+  // ---- the mouth ------------------------------------------------------------
   const mw = g.face.mouthWidth;
-  const mouthCols = new Set();
-  for (let k = 0; k < mw; k++) mouthCols.add(Math.trunc(cx) - 1 + k - ((mw - 2) >> 1));
-  paintFront(mouthCols, eyeZ - g.face.mouthDrop, ART.SKIN_SHADE);
-  if (g.face.brow) {
-    const browCols = new Set();
-    for (const c of eyeCols) { browCols.add(c); browCols.add(c + (c < cx ? 1 : -1)); }
-    paintFront(browCols, Math.min(sz - 1, eyeZ + 2), ART.HAIR_SHADE);
+  const mcols = [];
+  for (let k = 0; k < mw; k++)
+    mcols.push(Math.trunc(cx) - 1 + k - ((mw - 2) >> 1) + f.mouthShift);
+  const mtone = f.mouthTone === 'dark' ? ART.EYE : ART.SKIN_SHADE;
+  const mz = mouthZ;
+  const curveUp = Math.sign(f.mouthCurve);
+  const moff = mcols.map((_, n) => {
+    const t = mw > 1 ? n / (mw - 1) : 0.5;
+    let off = mw > 1 ? sround(Math.abs(f.mouthSkew) *
+                              (f.mouthSkew > 0 ? t : 1 - t)) : 0;
+    if (Math.abs(f.mouthCurve) >= 0.7 && mw >= 3 && (n === 0 || n === mw - 1))
+      off += curveUp;
+    return off;
+  });
+  mcols.forEach((x, n) => paintAt(x, mz + moff[n], mtone));
+  if (Math.abs(f.mouthCurve) >= 0.3) {
+    paintAt(mcols[0] - 1, mz + moff[0] + curveUp, mtone);
+    paintAt(mcols[mw - 1] + 1, mz + moff[mw - 1] + curveUp, mtone);
+  }
+  for (let r = 1; r <= f.mouthOpen; r++)
+    mcols.forEach((x, n) => paintAt(x, mz + moff[n] - r, ART.EYE));
+  if (f.lips >= 1)
+    for (const x of mcols) light(x, mz + Math.min(...moff) - f.mouthOpen - 1);
+  if (f.lips >= 2)
+    for (const x of mcols) light(x, mz + Math.max(...moff) + 1);
+  if (f.wrinkles >= 0.7) {                    // nose-to-mouth lines
+    shade(mcols[0] - 1, mz + moff[0] + 1);
+    shade(mcols[mw - 1] + 1, mz + moff[mw - 1] + 1);
+  }
+
+  // ---- brows, last: over the hair cap and any mark except the scar ---------
+  if (browCells.length) {
+    const tone = { hair: ART.HAIR, dark: ART.EYE, light: ART.SKIN_LIGHT }[
+      f.browTone] ?? ART.HAIR_SHADE;
+    for (const [x, z] of browCells) {
+      if (scarKeys.has(x + ',' + z)) continue;
+      if (f.browSparse > 0 && rnd01(x, z, 163) < f.browSparse) continue;
+      paintAt(x, z, tone);
+    }
   }
   return flipY(size, out);
 }
 
 function upperArmVox(g, size) {
-  const r = g.shape.armGirth * (size[0] / DEF['armU.L'].size[0]);
-  return flipY(size, limbTube(size, 2.0 * r, 2.2 * r,
+  return flipY(size, armTube(g, 'upper', size,
     (x, y, z, sx, sy) => shadeBack(y, sy * 0.5, ART.SKIN_BASE, ART.SKIN_SHADE)));
 }
 
 function foreArmVox(g, size) {
-  const r = g.shape.armGirth * (size[0] / DEF['armL.L'].size[0]);
-  return flipY(size, limbTube(size, 1.8 * r, 2.0 * r,
+  return flipY(size, armTube(g, 'fore', size,
     (x, y, z, sx, sy) => shadeBack(y, sy * 0.5, ART.SKIN_BASE, ART.SKIN_SHADE)));
 }
 
@@ -2131,7 +2919,14 @@ export function hairWants(h) {
 
 function hairMass(g, parts) {
   const h = g.hair;
-  if (!hairWants(h)) return [];
+  // THREE REASONS TO BUILD: the mass proper, the short-hair layer and a
+  // hanging beard. The last two root on skin as well as scalp, so a bald
+  // head can carry either; only the first grows the shell over the cap.
+  const massOn = hairWants(h);
+  const fuzzOn = h.fuzz > 0 &&
+                 (h.fuzzTop > 0 || h.fuzzSide > 0 || h.fuzzBack > 0);
+  const beardOn = g.face.beardLen > 0 && g.face.beard > 0;
+  if (!massOn && !fuzzOn && !beardOn) return [];
   const U = SKIN_UPSCALE;
   const K = (x, y, z) => ((z + 512) * 2048 + (y + 1024)) * 2048 + (x + 1024);
   const P = {};
@@ -2160,7 +2955,7 @@ function hairMass(g, parts) {
       scalp.push([X, Y, Z]);
     else skin.add(K(X, Y, Z));
   }
-  if (!scalp.length) return [];                 // bald: nothing to root on
+  if (!scalp.length && !fuzzOn && !beardOn) return [];  // bald: no roots
   const C = [(c0[0] + c1[0] + 1) / 2, (c0[1] + c1[1] + 1) / 2,
              (c0[2] + c1[2] + 1) / 2];
   const halfW = (c1[0] - c0[0] + 1) / 2, halfD = (c1[1] - c0[1] + 1) / 2;
@@ -2207,7 +3002,7 @@ function hairMass(g, parts) {
   // seed, or the fringe grows a visor over the eyes.
   const V = Math.max(1, h.volume * U);
   const shell = [];
-  {
+  if (massOn) {
     const seen = new Set(scalp.map(([X, Y, Z]) => K(X, Y, Z)));
     const q = scalp.map(([X, Y, Z]) => [X, Y, Z, X, Y, Z]);
     for (let qi = 0; qi < q.length; qi++) {
@@ -2566,6 +3361,145 @@ function hairMass(g, parts) {
     }
   }
 
+  // The eye rows in scene coords: the line the beard hangs below and the
+  // forehead the short-hair layer stays above.
+  let eyeZlo = 1e9, eyeZhi = -1e9;
+  for (const [, , z, c] of head.cells)
+    if (c === ART.EYE) {
+      eyeZlo = Math.min(eyeZlo, head.mn[2] + z);
+      eyeZhi = Math.max(eyeZhi, head.mn[2] + z);
+    }
+  if (eyeZhi < -1e8) { eyeZlo = eyeZhi = Math.round(C[2] - skullH * 0.2); }
+
+  // ---- a hanging beard ------------------------------------------------------
+  // Strands fall from the UNDERSIDE of the painted beard: per (x, y) column,
+  // the lowest beard-coloured cell below the eyes with nothing of the head
+  // under it -- so the chin hangs, the jaw's edges hang, and the columns over
+  // the neck stub do not. A beard with its chin shaved has no such cell and
+  // hangs nothing, which is what a moustache should do. It falls straight;
+  // where it meets the chest it slides FORWARD over it (front is -Y), the
+  // curtain's rule mirrored. Every cell rides the head, like a tail.
+  const beardCells = new Set();
+  if (beardOn) {
+    const fc = g.face;
+    const tone = fc.beardTone === 'hair' ? ART.HAIR : ART.HAIR_SHADE;
+    const low = new Map(), root = new Map();
+    for (const [x, y, z, c] of head.cells) {
+      const X = head.mn[0] + x, Y = head.mn[1] + y, Z = head.mn[2] + z;
+      const k = X * 4096 + Y;
+      if (!low.has(k) || Z < low.get(k)) low.set(k, Z);
+      if ((c !== ART.HAIR && c !== ART.HAIR_SHADE) || Z >= eyeZlo - U ||
+          Y >= C[1]) continue;
+      if (!root.has(k) || Z < root.get(k)[2]) root.set(k, [X, Y, Z]);
+    }
+    const roots = [...root.entries()]
+      .filter(([k, r]) => !(low.get(k) < r[2])).map(([, r]) => r);
+    if (roots.length) {
+      const z0 = Math.min(...roots.map(r => r[2]));
+      const len0 = z0 - reach(z0, fc.beardLen);
+      const bx = Math.max(1, ...roots.map(r => Math.abs(r[0] + 0.5 - C[0])));
+      for (const [X, Y, rz] of roots) {
+        const ax = Math.abs(X + 0.5 - C[0]) / bx;
+        // One point on the midline, or two either side of it.
+        const a = fc.beardFork ? Math.abs(ax - 0.45) / 0.55 : ax;
+        const len = Math.round(len0 * (1 - fc.beardPoint * Math.min(1, a) * 0.9) *
+                               (1 - fc.beardRagged * 0.3 * rnd(X, Y, 181)));
+        const zEnd = z0 - len;
+        if (zEnd >= rz) continue;
+        const n = rz - zEnd, wl = Math.round(0.25 * n);
+        const streak = rnd(X, Y, 187) < 0.2;
+        let y = Y;
+        for (let z = rz - 1; z >= zEnd; z--) {
+          if (!free(X, y, z)) {
+            let j = 0;
+            while (j < 16 && !free(X, y - j, z)) j++;
+            if (j >= 16) break;
+            // Lay it over what it met so the strand stays one piece.
+            for (let i = 1; i <= j; i++)
+              if (add(X, y - i, z + 1, tone)) {
+                beardCells.add(K(X, y - i, z + 1));
+                tailCells.add(K(X, y - i, z + 1));
+              }
+            y -= j;
+          }
+          const fromEnd = z - zEnd;
+          let tier = 0;
+          if (wl >= 1 && fromEnd < wl) {
+            const f = fromEnd / wl;
+            tier = f < 1 / 3 ? 3 : f < 2 / 3 ? 2 : 1;
+          }
+          if (add(X, y, z, tier ? WISP[tier]
+                                : streak ? (tone === ART.HAIR ? ART.HAIR_SHADE
+                                                              : ART.HAIR)
+                                         : tone)) {
+            beardCells.add(K(X, y, z));
+            tailCells.add(K(X, y, z));
+          }
+        }
+      }
+    }
+  }
+
+  // ---- the short hair layer ---------------------------------------------------
+  // A coat grown off every skull cell above a line -- skin or scalp alike --
+  // except the face: in front of the ears and inside the temples it starts
+  // only above the brows. The BASE is every free face-neighbour of a rooted
+  // cell that points outward, which is what makes it one continuous coat (a
+  // tuft per root with gaps between would be dozens of specks, and the piece
+  // filter below drops specks); longer tufts then run out along the radius
+  // from the skull centre. All of it is wisp-tier: the densest setting is
+  // still see-through, which is what makes it read as short hair over skin
+  // rather than a helmet.
+  //
+  // THE LENGTH IS BLENDED BY REGION: top (by height on the skull) over a mix
+  // of back and sides (by which way the cell faces), so dragging the side
+  // length below the top one is a fade and the seams between them are soft.
+  if (fuzzOn) {
+    const zLow = eyeZhi + 1 - h.fuzzLow * (eyeZhi + 1 - c0[2]);
+    const foreZ = eyeZhi + 3 * U;
+    const beardZ = eyeZlo;                      // beard paint lives below this
+    const D6 = [[1, 0, 0], [-1, 0, 0], [0, 1, 0], [0, -1, 0], [0, 0, 1],
+                [0, 0, -1]];
+    const put = (x, y, z, tier) => {
+      if (add(x, y, z, WISP[tier])) tailCells.add(K(x, y, z));
+    };
+    for (const [x, y, z, c] of head.cells) {
+      const X = head.mn[0] + x, Y = head.mn[1] + y, Z = head.mn[2] + z;
+      if (Z < c0[2] || c === ART.EYE) continue;
+      if ((c === ART.HAIR || c === ART.HAIR_SHADE) && Z < beardZ) continue;
+      const nx = (X + 0.5 - C[0]) / Math.max(halfW, 1);
+      const ny = (Y + 0.5 - C[1]) / Math.max(halfD, 1);
+      const face = ny < -0.35 && Math.abs(nx) < 0.75;
+      if (Z < (face ? foreZ : zLow)) continue;
+      const wt = clamp((Z - (C[2] + skullH * 0.1)) / (skullH * 0.3), 0, 1);
+      const bk = Math.max(0, ny), sd = Math.abs(nx);
+      const wb = bk / (bk + sd + 1e-6);
+      const Lreg = wt * h.fuzzTop +
+                   (1 - wt) * (wb * h.fuzzBack + (1 - wb) * h.fuzzSide);
+      if (Lreg < 0.5) continue;
+      const r = [X + 0.5 - C[0], Y + 0.5 - C[1], Z + 0.5 - C[2]];
+      const rn = Math.hypot(...r) || 1;
+      const tier0 = clamp(3 - Math.floor(h.fuzz * 3 + rnd(X, Y, Z, 171)), 1, 3);
+      let base = false;
+      for (const [dx, dy, dz] of D6) {
+        if (dx * r[0] + dy * r[1] + dz * r[2] <= 0) continue;
+        if (!free(X + dx, Y + dy, Z + dz)) continue;
+        put(X + dx, Y + dy, Z + dz, tier0);
+        base = true;
+      }
+      if (!base) continue;                      // buried: not a surface cell
+      const L = Math.max(1, Math.round(Lreg * (1 - h.fuzzFray * 0.7 *
+                                                   rnd(X, Y, Z, 173))));
+      for (let t = 2; t <= L; t++) {
+        const px = Math.floor(X + 0.5 + r[0] / rn * t);
+        const py = Math.floor(Y + 0.5 + r[1] / rn * t);
+        const pz = Math.floor(Z + 0.5 + r[2] / rn * t);
+        if (!free(px, py, pz)) break;
+        put(px, py, pz, Math.min(3, tier0 + (t === L ? 1 : 0)));
+      }
+    }
+  }
+
   // ---- regional thinning ------------------------------------------------------
   // `wisp` thins the ENDS of what hangs; these thin by WHERE a cell is. Each
   // region gives a score 0..1, the largest wins, and the score picks a wisp
@@ -2612,6 +3546,7 @@ function hairMass(g, parts) {
       const [X, Y, Z, slot] = v;
       const cur = TIER_OF[slot] || 0;
       if (!cur && slot !== ART.HAIR && slot !== ART.HAIR_SHADE) continue;
+      if (beardCells.has(k)) continue;          // face thinning is for bangs
       let s = 0;
       if (h.faceThin > 0 && !bangsCells.has(k)) {
         // Forward of the ears and below the crown: the hair that frames the

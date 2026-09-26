@@ -1,0 +1,305 @@
+{
+  "//": "A CHARACTER, not a creature: ferdruk inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs ferdruk --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "human",
+  "model": "ferdruk",
+  "sidecarVoxelsPerMetre": 10,
+  "anatomy": {
+    "limbs": {
+      "hair": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    },
+    "garmentsBecome": null
+  },
+  "gait": {
+    "rideHeight": 1.202
+  },
+  "limbs": [
+    {
+      "name": "hips",
+      "hp": 122
+    },
+    {
+      "name": "torso",
+      "hp": 128,
+      "anchor": [
+        18,
+        66,
+        12
+      ]
+    },
+    {
+      "name": "head",
+      "hp": 105,
+      "anchor": [
+        18,
+        96,
+        12
+      ]
+    },
+    {
+      "name": "armU.L",
+      "hp": 44,
+      "anchor": [
+        32,
+        98,
+        12
+      ]
+    },
+    {
+      "name": "armL.L",
+      "hp": 35,
+      "anchor": [
+        32,
+        80,
+        12
+      ]
+    },
+    {
+      "name": "hand.L",
+      "anchor": [
+        32,
+        62,
+        12
+      ]
+    },
+    {
+      "name": "armU.R",
+      "hp": 44,
+      "anchor": [
+        4,
+        98,
+        12
+      ]
+    },
+    {
+      "name": "armL.R",
+      "hp": 35,
+      "anchor": [
+        4,
+        80,
+        12
+      ]
+    },
+    {
+      "name": "hand.R",
+      "anchor": [
+        4,
+        62,
+        12
+      ]
+    },
+    {
+      "name": "legU.L",
+      "anchor": [
+        24,
+        56,
+        12
+      ]
+    },
+    {
+      "name": "legL.L",
+      "hp": 50,
+      "anchor": [
+        24,
+        30,
+        12
+      ]
+    },
+    {
+      "name": "foot.L",
+      "hp": 27,
+      "anchor": [
+        24,
+        6,
+        16
+      ]
+    },
+    {
+      "name": "legU.R",
+      "anchor": [
+        12,
+        56,
+        12
+      ]
+    },
+    {
+      "name": "legL.R",
+      "hp": 50,
+      "anchor": [
+        12,
+        30,
+        12
+      ]
+    },
+    {
+      "name": "foot.R",
+      "hp": 27,
+      "anchor": [
+        12,
+        6,
+        16
+      ]
+    },
+    {
+      "name": "hair",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 40,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        22.5,
+        104,
+        11.5
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        4,
+        57,
+        12
+      ]
+    }
+  ],
+  "natural": [
+    {
+      "name": "jaws",
+      "edge": {
+        "from": [
+          8,
+          9.9,
+          9.6
+        ],
+        "to": [
+          8,
+          7.3,
+          40.8
+        ],
+        "halfWidth": 15.2
+      }
+    }
+  ],
+  "states": [
+    {
+      "name": "squirm",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl.shins",
+      "bodyYOffset": null
+    }
+  ],
+  "clips": {
+    "walk": {
+      "durationMs": 628
+    },
+    "run": {
+      "durationMs": 319
+    }
+  },
+  "genome": {
+    "archetype": "humanoid",
+    "name": "Ferdruk",
+    "displayName": "Untitled",
+    "body": {
+      "sex": "male",
+      "bust": 0.43464596235012265,
+      "heightM": 1.53,
+      "hipWidth": 10,
+      "shoulderWidth": 12,
+      "bodyDepth": 6,
+      "headWidth": 8,
+      "headDepth": 12,
+      "limbWidth": 4,
+      "footDepth": 7,
+      "stack": {
+        "foot": 3.874271915918104,
+        "shin": 14.076276157274469,
+        "thigh": 16.81214878463652,
+        "hips": 9.996341189444253,
+        "torso": 19.167768930242207,
+        "head": 15.135228042338492
+      },
+      "armStack": {
+        "upper": 8.686788017114251,
+        "fore": 9.682065274437964,
+        "hand": 4.248073840832711
+      }
+    },
+    "shape": {
+      "waist": 1.08,
+      "chest": 1.0568538860824108,
+      "shoulder": 1.0282701116117368,
+      "chestDepth": 1.131758898453325,
+      "seat": 1.1261876772938297,
+      "armGirth": 1.0033863542915509,
+      "legGirth": 1.0549638687058072
+    },
+    "head": {
+      "jaw": 1.2008228551813718,
+      "cheek": 1.1392244052772336,
+      "crown": 0.9123603152401969,
+      "skullBack": 0
+    },
+    "face": {
+      "eyeDx": 3.0493590900281258,
+      "eyeRow": 0,
+      "eyeCols": 2,
+      "mouthWidth": 3,
+      "mouthDrop": 3,
+      "brow": false,
+      "beard": 0.4091442675986141
+    },
+    "hair": {
+      "style": "buns",
+      "back": 6.843292462348938,
+      "front": 10.640998682929203,
+      "length": 0,
+      "knot": true,
+      "side": 0.6441400191564113,
+      "band": 0.8214764817238785,
+      "volume": 2,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0.26402775656366717,
+      "braid": true,
+      "twin": true,
+      "wisp": 0.4279824681084603,
+      "ragged": 0.6882918308143504,
+      "bangs": 0.37912594261988997,
+      "faceThin": 0.659563815489225,
+      "hairlineSoft": 0.039168036468420174,
+      "sideThin": 0,
+      "topThin": 0.49090905857915057,
+      "fluff": 0.09897304390920326
+    },
+    "colors": {
+      "skin": "#da967c",
+      "skinShade": "#ad755f",
+      "skinLight": "#f5bcaa",
+      "hair": "#603b27",
+      "hairShade": "#43281a",
+      "eye": "#2b1820",
+      "cloth": "#7f6e49",
+      "clothShade": "#605336",
+      "nail": "#ebb9b5"
+    }
+  }
+}

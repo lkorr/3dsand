@@ -61,11 +61,15 @@ enum TickButton : uint32_t {
   TB_DROP = 1u << 8,    // drop the newest status effect
   TB_LASER = 1u << 9,   // the laser is firing (F, or LMB with the laser tool)
   TB_THROW = 1u << 10,  // Q: winding up a throw of the held vessel; release throws
+  // F toggles it with a vessel in hand: LMB APPLIES the contents to the body
+  // under the crosshair (a brush on its skin) instead of pouring a stream.
+  // HELD while the mode is on, so a replay or a peer reads LMB the same way.
+  TB_APPLY = 1u << 11,
 };
 
 // Bumped whenever a field is added, removed or changes meaning. Carried in the
 // op record's frame header (sim/oprecord.h) and refused on mismatch.
-constexpr uint32_t kTickInputVersion = 2;   // 2: TB_THROW
+constexpr uint32_t kTickInputVersion = 3;   // 2: TB_THROW, 3: TB_APPLY
 
 struct TickInput {
   uint32_t version = kTickInputVersion;

@@ -618,7 +618,7 @@
       ]
     },
     {
-      "comment": "Blood. The `stain` block is what marks what it touches: at 90 per-mille a splash grabs the surfaces around it within a second or so, and `consume` 6 means roughly one stained voxel in 160 is eaten away per stain event, so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl. The palette is LINEAR light like every material (the frame is tonemapped and gamma-encoded at the end), so these hexes look near-black in a colour picker and render as a dark blood red once lit; anything paler reads as pink paint next to the stain it leaves. The `coat` block is what blood does once it is ON A BODY rather than on the ground: a level of it dries off a voxel every 20 seconds (it never comes off entirely on its own — that takes water), and a bloodied foot tracks prints on 400 per-mille of its footfalls.",
+      "comment": "Blood. The `stain` block is what marks what it touches: at 300 per-mille a pool soaks into absorbent ground (dirt, grass, sand) one level per contact, paid in its own mass, up to `amount` 12 or the ground’s capacity — so a spilled flask DRINKS INTO the ground and leaves a dark patch, instead of drying away first (it decays at 8 per-mille, a ~3 s half-life, which at the old 90 / amount 5 left grass at 3-5 of 15: scattered flecks). Stone (capacity 0) still takes only the free one-level mark by design (stainStep). `consume` 3 means roughly one stained voxel in 330 is eaten away per stain event (halved when the depth went 5 -> 12, so the pitting under a pool stays where it was), so blood slowly pits what it soaks without ever running away with itself (CLAUDE.md rule 2 — see DESIGN.md §6). The renderer picks blood's viscous shading (no ripple bands, a wet sheen, a smooth field normal so it does not read as gelatin cubes) off the authored moveEvery + opacity pair, not off a material ID — see isViscousLiquid in common.wgsl. The palette is LINEAR light like every material (the frame is tonemapped and gamma-encoded at the end), so these hexes look near-black in a colour picker and render as a dark blood red once lit; anything paler reads as pink paint next to the stain it leaves. The `coat` block is what blood does once it is ON A BODY rather than on the ground (`contact` 90 pins the body’s wading rate where it was before the ground chance went to 300): a level of it dries off a voxel every 20 seconds (it never comes off entirely on its own — that takes water), and a bloodied foot tracks prints on 400 per-mille of its footfalls.",
       "id": "blood",
       "arcane": 3,
       "class": "liquid",
@@ -635,11 +635,12 @@
       "stain": {
         "type": "blood",
         "color": "#4a0f0f",
-        "amount": 5,
-        "chance": 90,
-        "consume": 6
+        "amount": 12,
+        "chance": 300,
+        "consume": 3
       },
       "coat": {
+        "contact": 90,
         "decay": 20,
         "decayFloor": 1,
         "shed": 400,

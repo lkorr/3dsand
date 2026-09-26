@@ -490,6 +490,37 @@ section('F. every rolled body is STRUCTURALLY SOUND');
                 mg.cross([mg.randomGenome(mg.makeRng(s)),
                           mg.randomGenome(mg.makeRng(s + 100))],
                          mg.makeRng(500 + s), { sigma: 0.5 })]);
+  // EVERY BEARD STYLE, on a cap-only head, a bald one and a mane: the hanging
+  // beard and the short-hair layer root on skin, so bald is where a root can
+  // go missing, and a mane is where they meet other hair.
+  const faceRig = (hs, bs, o = {}) => {
+    const g = mg.applyBeardStyle(mg.applyHairStyle(mg.defaultGenome(), hs), bs);
+    for (const [k, v] of Object.entries(o)) mg.setPath(g, k, v);
+    return g;
+  };
+  for (const bs of mg.BEARD_STYLE_ORDER)
+    for (const hs of ['cropped', 'bald', 'mane'])
+      rolls.push([`beard ${bs} on ${hs}`, faceRig(hs, bs)]);
+  // The short-hair layer and every face lever at its extremes.
+  const fuzzMax = { 'hair.fuzz': 1, 'hair.fuzzTop': 4, 'hair.fuzzSide': 4,
+                    'hair.fuzzBack': 4, 'hair.fuzzLow': 1, 'hair.fuzzFray': 1 };
+  for (const hs of ['bald', 'undercut', 'mohawk', 'long', 'pigtails'])
+    rolls.push([`short-hair layer on ${hs}`, faceRig(hs, 'wizard', fuzzMax)]);
+  rolls.push(['every face lever high', faceRig('swept', 'bushy', {
+    'face.brow': true, 'face.browHeight': 2, 'face.browThick': 3,
+    'face.browInner': 3, 'face.browOuter': 2, 'face.browTilt': 1,
+    'face.browArch': 1, 'face.browProud': true, 'face.mouthWidth': 4,
+    'face.mouthCurve': 1, 'face.mouthSkew': 1, 'face.mouthShift': 1,
+    'face.mouthOpen': 2, 'face.lips': 2, 'face.nose': 3, 'face.noseWidth': 2,
+    'face.earSize': 2, 'face.earPoint': true, 'face.eyeWhites': true,
+    'face.eyeBags': 1, 'face.cheeks': 1, 'face.freckles': 1,
+    'face.wrinkles': 1, 'face.scar': 1, ...fuzzMax })]);
+  rolls.push(['every face lever low', faceRig('bald', 'clean', {
+    'face.brow': true, 'face.browHeight': -1, 'face.browInner': 0,
+    'face.browTilt': -1, 'face.browSparse': 1, 'face.mouthWidth': 1,
+    'face.mouthCurve': -1, 'face.mouthSkew': -1, 'face.mouthShift': -1,
+    'face.mouthDrop': 2, 'face.nose': 3, 'face.earSize': 0,
+    'face.cheeks': -1, 'face.scar': -1, 'face.eyeRow': -1 })]);
   let built2 = 0;
   for (const [label, genome] of rolls) {
     let b;
@@ -640,6 +671,55 @@ section('H. visual distinctness is actually reachable');
   ok(headOf(mg.applyHairStyle(mg.defaultGenome(), 'mane')).shape !== base.shape,
      'a mane adds GEOMETRY, not just paint');
 
+  // FACES (2026-09-25): the same promise for facial hair and the face levers.
+  const seenBeards = new Set();
+  for (const style of mg.BEARD_STYLE_ORDER)
+    seenBeards.add(headOf(mg.applyBeardStyle(mg.defaultGenome(), style)).paint);
+  ok(seenBeards.size === mg.BEARD_STYLE_ORDER.length,
+     'every beard style renders differently from every other',
+     `${seenBeards.size} distinct of ${mg.BEARD_STYLE_ORDER.length}`);
+  ok(headOf(mg.applyBeardStyle(mg.defaultGenome(), 'long')).shape !== base.shape,
+     'a long beard adds GEOMETRY, not just paint');
+  // Each lever against the default face -- brows switched on for the brow
+  // levers, since they shape a brow that is otherwise not drawn.
+  const browOn = mg.normalizeGenome({ face: { brow: true } });
+  const browBase = headOf(browOn);
+  const LEVERS = [
+    ['face.browHeight', 1], ['face.browThick', 2], ['face.browInner', 3],
+    ['face.browOuter', 2], ['face.browTilt', -1],
+    ['face.browSparse', 1], ['face.browTone', 'dark'], ['face.browProud', true],
+    ['face.mouthCurve', 0.5], ['face.mouthSkew', 1], ['face.mouthShift', 1],
+    ['face.mouthOpen', 1], ['face.mouthTone', 'dark'], ['face.lips', 1],
+    ['face.nose', 2], ['face.noseWidth', 2], ['face.earSize', 2],
+    ['face.earPoint', true], ['face.eyeWhites', true], ['face.eyeBags', 0.5],
+    ['face.cheeks', -1], ['face.cheeks', 1], ['face.freckles', 1],
+    ['face.wrinkles', 0.3], ['face.scar', 1], ['face.beardSide', 0.6],
+    ['hair.fuzz', 0.5],
+  ];
+  for (const [path, v] of LEVERS) {
+    const brow = path.startsWith('face.brow');
+    const g = mg.normalizeGenome(brow ? browOn : mg.defaultGenome());
+    mg.setPath(g, path, v);
+    if (path === 'face.nose' || path === 'face.noseWidth') g.face.nose = 2;
+    const ref = path === 'face.noseWidth'
+      ? headOf(mg.normalizeGenome({ face: { nose: 2 } })) : brow ? browBase : base;
+    ok(headOf(g).paint !== ref.paint, `face lever ${path} = ${v} moves a cell`);
+  }
+  // An arch lifts the MIDDLE of a brow, and the drawn brow is two cells: it
+  // needs a third before there is a middle to lift.
+  const three = mg.normalizeGenome({ face: { brow: true, browOuter: 1 } });
+  ok(headOf(mg.normalizeGenome({ face: { ...three.face, browArch: 1 } })).paint !==
+     headOf(three).paint, 'face lever face.browArch = 1 moves a cell (3-cell brow)');
+  // THE DEFAULTS ARE THE OLD FACE. Every existing character on disk has none
+  // of these genes; normalisation fills in the defaults, and those must draw
+  // exactly the head the character had.
+  ok(headOf(mg.normalizeGenome({ face: { brow: true, beard: 0.5 } })).paint ===
+     headOf(mg.normalizeGenome({ face: { brow: true, beard: 0.5,
+       beardStyle: 'clean', beardLip: 0, beardChin: 0, beardRagged: 0.45,
+       browInner: 1, browThick: 1, mouthCurve: 0, nose: 0, earSize: 1 },
+       hair: { fuzz: 0 } })).paint,
+     'the new face genes at their defaults draw the old face');
+
   // COLOUR IS PALETTE-ONLY. A colour variant must leave the geometry AND the
   // art SLOT of every cell alone, and change only the RGBA table — that is
   // exactly what lets it ship as a 30-line sidecar with a `model` reference
@@ -724,6 +804,38 @@ section('I. derived quantities FOLLOW the shape');
   const hpOf = (x, n) => x.sidecar.limbs.find(l => l.name === n).hp;
   ok(hpOf(thick, 'armU.L') > hpOf(a, 'armU.L'),
      'a thicker arm has more hp', `${hpOf(thick, 'armU.L')} vs ${hpOf(a, 'armU.L')}`);
+  // THE ARM GENES DO WHAT THEIR LABELS SAY (2026-09-25). The segment genes
+  // were weights over a fixed span, so "upper arm" only traded rows with the
+  // forearm and the hand never moved; the girth sliders could not change a
+  // 4-wide box at all.
+  {
+    const T = gn => mg.limbTable(mg.normalizeGenome(gn)).limbs;
+    const stock = T({});
+    const longU = T({ body: { armLengths: 1,
+                              armStack: { upper: 15, fore: 11, hand: 5 } } });
+    ok(longU['armU.L'].size[2] > stock['armU.L'].size[2] &&
+       longU['hand.L'].mn[2] < stock['hand.L'].mn[2] &&
+       Math.abs(longU['armL.L'].size[2] - stock['armL.L'].size[2]) <= 1,
+       'a longer upper arm lowers the hand and keeps the forearm',
+       `${JSON.stringify(stock['armL.L'])} -> ${JSON.stringify(longU['armL.L'])}`);
+    const buff = T({ shape: { upperArm: 1.4, bicep: 1, deltoid: 1,
+                              foreArm: 1.3, forearmMuscle: 1 } });
+    ok(buff['armU.L'].size[0] > stock['armU.L'].size[0] &&
+       buff['armU.L'].size[1] > stock['armU.L'].size[1] &&
+       buff['armL.L'].size[0] > stock['armL.L'].size[0],
+       'muscle genes widen the arm boxes',
+       `${JSON.stringify(buff['armU.L'])} ${JSON.stringify(buff['armL.L'])}`);
+    const cx = l => l.mn[0] + l.size[0] / 2;
+    ok(cx(buff['armU.L']) === cx(buff['armL.L']) &&
+       cx(buff['armL.L']) === cx(buff['hand.L']),
+       'shoulder, elbow and wrist stay on one axis however wide the arm');
+    // A stored genome from before (no body.armLengths): weights, rescaled on
+    // load so it rebuilds the arm it always had.
+    const legacy = T({ body: { armStack: { upper: 9, fore: 9.5, hand: 5 } } });
+    ok(legacy['hand.L'].mn[2] === stock['hand.L'].mn[2],
+       'a pre-lengths genome keeps its arm span',
+       `${legacy['hand.L'].mn[2]} vs ${stock['hand.L'].mn[2]}`);
+  }
   ok(a.sidecar.speed === mg.pyRound(tuning.player.sprintSpeed * 10, 4),
      'speed is the live player sprint speed, not a transcription',
      `${a.sidecar.speed}`);

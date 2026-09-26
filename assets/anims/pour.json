@@ -1,0 +1,37 @@
+{
+  "//": "POURING FROM A HELD VESSEL (session.cpp: LMB with a filled flask or pouch, pour or apply mode). The right arm comes up straight out in front, near horizontal, and the wrist tips the vessel over so its neck points forward and down; the stream leaves from the vessel's own voxels (Mob::HeldMouthWorld), not from the hip. Rotations are pure X, positive = backward/down (anim.cpp's convention, as reach.json). A slow small drift so the arm is not a statue. Looped while the button is held; the session stops it on release.",
+  "name": "pour",
+  "sidecarVoxelsPerMetre": 10,
+  "durationMs": 1600,
+  "loop": true,
+  "mode": "override",
+  "blendInMs": 140,
+  "blendOutMs": 200,
+  "mask": [
+    "armU.R",
+    "armL.R",
+    "hand.R"
+  ],
+  "tracks": {
+    "armU.R": {
+      "rot": [
+        { "t": 0, "q": [-0.6820, 0, 0, 0.7314] },
+        { "t": 800, "q": [-0.6626, 0, 0, 0.7490] },
+        { "t": 1600, "q": [-0.6820, 0, 0, 0.7314] }
+      ]
+    },
+    "armL.R": {
+      "rot": [
+        { "t": 0, "q": [-0.0872, 0, 0, 0.9962] },
+        { "t": 1600, "q": [-0.0872, 0, 0, 0.9962] }
+      ]
+    },
+    "hand.R": {
+      "rot": [
+        { "t": 0, "q": [0.5000, 0, 0, 0.8660] },
+        { "t": 800, "q": [0.5373, 0, 0, 0.8434] },
+        { "t": 1600, "q": [0.5000, 0, 0, 0.8660] }
+      ]
+    }
+  }
+}

@@ -33,6 +33,10 @@ float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
   const float sp = planarVel.len() * kVoxelMeters;   // voxels/s -> m/s
   const bool moving = sp > av.turnMinSpeed;
 
+  // FIRST PERSON: THE BODY FACES THE VIEW, ALWAYS — standing or moving, with
+  // no neck dead zone. The walk basis is the camera, so any slack between
+  // body and view (the old head-look cone, then a travel-facing rule) read as
+  // walking crabwise. A/D is therefore a true strafe, body square to the view.
   float wantHeading = camHeading;
   if (mode != CameraMode::First) {
     // Face where you RUN. Below the threshold hold the current facing rather
@@ -43,25 +47,6 @@ float ResolveAvatarHeading(CameraMode mode, float camHeading, float heading,
   float d = wantHeading - heading;
   while (d > 3.14159265f) d -= 6.2831853f;
   while (d < -3.14159265f) d += 6.2831853f;
-
-  // THE NECK ABSORBS THE FIRST headLookYaw DEGREES (first person only).
-  //
-  // The cone kills the SNAP, not the convergence. Zeroing `d` inside it
-  // outright makes the facing a value nothing ever drives back, so it freezes
-  // wherever the last big turn left it — and the arms, welded to the torso,
-  // freeze with it. Hence the recentre term while walking.
-  const float headCone = av.headLookYaw * (3.14159265f / 180.0f);
-  if (mode == CameraMode::First && headCone > 1e-3f) {
-    const float excess = std::max(0.0f, std::fabs(d) - headCone);
-    const float sign = d < 0 ? -1.0f : 1.0f;
-    float want = sign * excess;      // past the cone: dragged by the excess
-    if (moving) {                    // inside it: square up while walking
-      const float hl = av.headLookRecenterHalflife;
-      const float rk = hl > 1e-4f ? 1.0f - std::pow(0.5f, dt / hl) : 1.0f;
-      want += (d - sign * excess) * rk;
-    }
-    d = want;
-  }
 
   // First person eases on a short half-life; third person is rate-limited so
   // the body visibly pivots on its feet instead of snapping.

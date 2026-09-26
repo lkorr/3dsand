@@ -18,14 +18,48 @@ namespace {
 constexpr uint32_t kSaltStyle = 0x51E1Eu;
 constexpr uint32_t kSaltBow = 0x8014Du;
 
-StrokeSegment ReadSegment(const json& j, StrokeSegment dflt) {
+// A SEGMENT'S OWN PACING (strokes.h "PER-SEGMENT PACING"). Leaves `paced`
+// alone when the key is absent, so a merge (the player block) inherits; an
+// unknown name is REPORTED rather than silently read as linear, for the
+// reason the style-wide ease is (ParseEase cannot tell a typo from "linear").
+void ReadEaseKey(const json& j, bool& paced, Ease& ease,
+                 const std::string& where, std::string& log) {
+  if (!j.is_object() || !j.contains("ease") || !j["ease"].is_string()) return;
+  const std::string en = j["ease"].get<std::string>();
+  const Ease e = ParseEase(en);
+  if (e == Ease::Linear && en != "linear") {
+    log += where + " has unknown ease \"" + en + "\" — ignored\n";
+    return;
+  }
+  paced = true;
+  ease = e;
+}
+
+StrokeSegment ReadSegment(const json& j, StrokeSegment dflt,
+                          const std::string& where, std::string& log) {
   StrokeSegment s = dflt;
   if (!j.is_object()) return s;
   s.ticks = std::max(1, j.value("ticks", s.ticks));
   s.az = j.value("az", s.az);
   s.el = j.value("el", s.el);
   s.reach = j.value("reach", s.reach);
+  ReadEaseKey(j, s.paced, s.ease, where, log);
   return s;
+}
+
+// THE PER-JOINT BRAKES (strokes.h AttackStyle::joints, melee.h ArmSmooth).
+// Field-wise onto `out`, so the player block merges the same way the
+// segments do: an unstated field inherits. Negative is clamped to 0 (off).
+void ReadJoints(const json& j, ArmSmooth& out) {
+  if (!j.is_object()) return;
+  static const char* kNames[kArmJoints] = {"shoulder", "elbow", "wrist"};
+  for (int k = 0; k < kArmJoints; k++) {
+    if (!j.contains(kNames[k]) || !j[kNames[k]].is_object()) continue;
+    const json& q = j[kNames[k]];
+    ArmJointSmooth& js = out.joint[k];
+    js.smooth = std::clamp(q.value("smooth", js.smooth), 0.0f, 60.0f);
+    js.maxDeg = std::clamp(q.value("maxDeg", js.maxDeg), 0.0f, 180.0f);
+  }
 }
 
 // ---- THE CUT PATH (strokes.h "A CUT IS A PATH") ----------------------------
@@ -72,7 +106,11 @@ void ReadCutPath(const json& cutJ, const std::string& path,
         else
           aimLeg = (int)out.size();
       }
-      out.push_back(ReadSegment(leg, StrokeSegment{4, 0.0f, 0.0f, 0.0f}));
+      out.push_back(ReadSegment(
+          leg, StrokeSegment{4, 0.0f, 0.0f, 0.0f},
+          path + ": style \"" + name + "\" cut leg " +
+              std::to_string(out.size() + 1),
+          log));
     }
     if (out.empty())
       log += path + ": style \"" + name +
@@ -84,7 +122,8 @@ void ReadCutPath(const json& cutJ, const std::string& path,
   // with an absent object.
   if (out.empty())
     out.push_back(ReadSegment(cutJ.is_object() ? cutJ : json::object(),
-                              StrokeSegment{7, -2.0f, 0.0f, 0.10f}));
+                              StrokeSegment{7, -2.0f, 0.0f, 0.10f},
+                              path + ": style \"" + name + "\" cut", log));
 }
 
 }  // namespace
@@ -105,6 +144,9 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
   }
 
   StyleLibrary lib;
+  // WHICH FRAME THE NUMBERS ARE IN (strokes.h "THE STROKE FRAME"). Absent =
+  // the pre-2026-09-25 frame, converted below once the player copies exist.
+  const bool legacyFrame = j.value("strokeFrame", std::string()) != "target";
   const auto stylesJson = j.value("styles", json::array());
   std::unordered_map<std::string, json> rawByName;
   for (const auto& s : stylesJson) {
@@ -133,7 +175,8 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
                "quadIn/Out/InOut, cubicIn/Out/InOut)\n";
     }
     st.windup = ReadSegment(s.value("windup", json::object()),
-                            StrokeSegment{12, 0.30f, 0.10f, -0.05f});
+                            StrokeSegment{12, 0.30f, 0.10f, -0.05f},
+                            path + ": style \"" + st.name + "\" windup", log);
     ReadCutPath(s.contains("cut") ? s["cut"] : json(), path, st.name, st.cut,
                 st.aimLeg, log);
     // ---- THE RETURN (strokes.h StrokeRecover) ------------------------------
@@ -152,6 +195,8 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
       st.recover.reach = rv.value("reach", 0.0f);
       st.recover.settle = std::max(0, rv.value("settle", 0));
       st.recover.fade = std::max(0, rv.value("fade", 0));
+      ReadEaseKey(rv, st.recover.paced, st.recover.ease,
+                  path + ": style \"" + st.name + "\" recover", log);
       // A SETTLE WITH NOTHING TO SETTLE TO holds the arm at the end of the cut
       // with the button still down and then drops it, which is the crossfade
       // this whole block exists to remove, arrived at the long way round.
@@ -188,6 +233,7 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
         st.recover.ticks = want;
       }
     }
+    ReadJoints(s.value("joints", json::object()), st.joints);
     if (s.contains("jitter") && s["jitter"].is_object()) {
       const auto& q = s["jitter"];
       st.jitter.az = q.value("az", 0.0f);
@@ -320,6 +366,8 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
       ps.windup.az = w.value("az", ps.windup.az);
       ps.windup.el = w.value("el", ps.windup.el);
       ps.windup.reach = w.value("reach", ps.windup.reach);
+      ReadEaseKey(w, ps.windup.paced, ps.windup.ease,
+                  path + ": style \"" + ps.name + "\" windup", log);
     }
     // ---- THE CUT, WHICH MAY NOW BE A PATH ON EITHER SIDE ------------------
     // A LIST REPLACES, AN OBJECT MERGES INTO THE FIRST LEG. Merging a list
@@ -338,6 +386,8 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
       leg0.az = c.value("az", leg0.az);
       leg0.el = c.value("el", leg0.el);
       leg0.reach = c.value("reach", leg0.reach);
+      ReadEaseKey(c, leg0.paced, leg0.ease,
+                  path + ": style \"" + ps.name + "\" cut", log);
     }
     if (pj.contains("recover") && pj["recover"].is_object()) {
       const auto& rv = pj["recover"];
@@ -354,6 +404,8 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
       }
       ps.recover.settle = std::max(0, rv.value("settle", ps.recover.settle));
       ps.recover.fade = std::max(0, rv.value("fade", ps.recover.fade));
+      ReadEaseKey(rv, ps.recover.paced, ps.recover.ease,
+                  path + ": style \"" + ps.name + "\" recover", log);
       if (ps.recover.settle > 0 && !ps.recover.posed)
         ps.recover.settle = 0;
       if (ps.recover.settle > ps.recover.ticks)
@@ -362,6 +414,7 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
           ps.recover.settle + ps.recover.fade > ps.recover.ticks)
         ps.recover.ticks = ps.recover.settle + ps.recover.fade;
     }
+    ReadJoints(pj.value("joints", json::object()), ps.joints);
     if (pj.contains("jitter") && pj["jitter"].is_object()) {
       const auto& q = pj["jitter"];
       ps.jitter.az = q.value("az", ps.jitter.az);
@@ -371,6 +424,10 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
     playerDerived[lib.styles[base].name] = (int)lib.styles.size();
     lib.styles.push_back(std::move(ps));
   }
+  // AFTER the merge, and over base and player copies alike: a player block in
+  // an old file is in the old frame too, so it has to be merged in it first.
+  if (legacyFrame)
+    for (AttackStyle& st : lib.styles) st.FromLegacyFrame();
 
   // ---- the player's flick compass (strokes.h PlayerStrikeMap) --------------
   // The compass references BASE style names; the resolver uses the derived
@@ -551,17 +608,24 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
   //
   // Zero means "the global melee.recoverTime", which is what every style
   // authored before `fade` existed asks for.
+  // Every Step below is this program's: the wrist aligns in full (melee.h
+  // SetProgramDrive says why).
+  // Only when a Step below will actually run (an Idle cursor, or a styled
+  // phase with no style, returns without one), so the flag never leaks into
+  // somebody else's Update.
+  if (cur.phase == StrokeCursor::Phase::Guard ||
+      (sty != nullptr && cur.phase != StrokeCursor::Phase::Idle))
+    m.SetProgramDrive();
   m.SetRecoverTime(sty != nullptr && sty->recover.fade > 0
                        ? sty->recover.fade * dt
                        : 0.0f);
   StrokeSample smp;
   smp.held = true;
-  // THE CLOSED-LOOP, UNDER-COMMIT DRIVE, shared by Guard and Windup because
-  // they are the same motion: steer the stored stroke toward a stated pose
-  // slowly enough that `commitSpeed` never fires. 16 units/tick is 480 px/s
-  // against a 900 px/s threshold, so the driver stays in Guard however far it
-  // has to travel — which is what makes a windup a readable telegraph rather
-  // than an instant snap.
+  // THE CLOSED-LOOP, CAPPED DRIVE, shared by Guard and Windup because they
+  // are the same motion: steer the stored stroke toward a stated pose at no
+  // more than 16 units/tick (480 px/s) — which is what makes a windup a
+  // readable telegraph rather than an instant snap. (It was also what kept
+  // the driver's own speed-triggered Slash from firing; that Slash is gone.)
   auto steerTo = [&](float wantAz, float wantEl, float wantR) {
     const MeleeTuning& t = m.tuning;
     smp.dx = std::clamp((wantAz - m.StrokeAz()) / t.aimGainX, -16.0f, 16.0f);
@@ -569,6 +633,26 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
     smp.dReach = std::clamp(
         (wantR - m.StrokeRadius()) / std::max(t.reachGain, 1e-4f), -18.0f,
         18.0f);
+    m.Step(smp, dt, true, right, up, fwd);
+  };
+  // THE SAME CHASE, TIMED (strokes.h "PER-SEGMENT PACING"): used by a windup
+  // or settle that states its own ease. Each tick spends the curve's share of
+  // the REMAINING gap, so the pose is reached on the segment's last tick —
+  // and the step is still clamped to steerTo's envelope, so a pacing curve
+  // can slow a windup but never make it faster than the cap.
+  auto steerPaced = [&](float wantAz, float wantEl, float wantR, Ease e,
+                        int into, int len) {
+    const MeleeTuning& t = m.tuning;
+    const float n = (float)std::max(1, len);
+    const float share =
+        StrokeEaseStep(e, (float)into / n, (float)(into + 1) / n);
+    smp.dx = std::clamp((wantAz - m.StrokeAz()) * share / t.aimGainX, -16.0f,
+                        16.0f);
+    smp.dy = std::clamp(-(wantEl - m.StrokeEl()) * share / t.aimGainY, -16.0f,
+                        16.0f);
+    smp.dReach = std::clamp((wantR - m.StrokeRadius()) * share /
+                                std::max(t.reachGain, 1e-4f),
+                            -18.0f, 18.0f);
     m.Step(smp, dt, true, right, up, fwd);
   };
 
@@ -586,17 +670,11 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
     }
     case StrokeCursor::Phase::Windup: {
       if (sty == nullptr) break;
-      // THE CUT IS CENTRED ON THE AIM, so the windup lands as far SHORT of it
-      // as the target sits ALONG THE PATH: `aim - CutAimOffset + windup`. For
-      // a one-leg cut that offset is `cut/2` and this is the line it always
-      // was; for a path it is the middle of the leg that carries the aim
-      // (strokes.h). A stroke that started at the aim would cut the air behind
-      // the target every time — the blade only ever travels away from where it
-      // began.
-      float aimOffAz = 0, aimOffEl = 0;
-      sty->CutAimOffset(aimOffAz, aimOffEl);
-      cur.wantAz = liveAz - aimOffAz + sty->windup.az + bowAz;
-      cur.wantEl = liveEl - aimOffEl + sty->windup.el + bowEl;
+      // THE WINDUP IS MEASURED FROM THE TARGET (strokes.h "THE STROKE
+      // FRAME"): 0/0 points straight at them. Centring the cut on the target
+      // is in the authored numbers (`windup = -CutAimOffset`), not added here.
+      cur.wantAz = liveAz + sty->windup.az + bowAz;
+      cur.wantEl = liveEl + sty->windup.el + bowEl;
       // AGAINST A NEUTRAL EXTENSION, not against the live radius. Computing
       // this as `StrokeRadius() + offset` every windup tick is a RUNAWAY: each
       // tick re-targets a further offset from wherever the last one landed, so
@@ -608,7 +686,11 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       // authored `reach` of 0 is "wherever a guard holds it" and the offsets
       // are readable as what they are.
       cur.wantReach = toTarget(StrokeReachIn(m, sty->windup.reach));
-      steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
+      if (sty->windup.paced)
+        steerPaced(cur.wantAz, cur.wantEl, cur.wantReach, sty->windup.ease,
+                   cur.phaseTick, cur.windupTicks);
+      else
+        steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
       if (++cur.phaseTick >= cur.windupTicks) {
         // ---- COMMIT. The aim is frozen HERE and never refreshed: a target
         // that steps offline after this instant is missed, which is what makes
@@ -644,11 +726,11 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       // after it either, because each one's target is an ABSOLUTE point on the
       // path (`aim - offset + travel through this leg`) and not a delta from
       // wherever the last one actually got to.
-      float aimOffAz = 0, aimOffEl = 0;
-      sty->CutAimOffset(aimOffAz, aimOffEl);
+      // The path starts at the WINDUP POSE (without its start bow, which is a
+      // per-swing wobble on where the telegraph lands, not on the blow).
       const StrokeSegment through = sty->CutThrough(leg);
-      const float toAz = cur.aimAz - aimOffAz + through.az;
-      const float toEl = cur.aimEl - aimOffEl + through.el;
+      const float toAz = cur.aimAz + sty->windup.az + through.az;
+      const float toEl = cur.aimEl + sty->windup.el + through.el;
       const float toR =
           toTarget(StrokeReachIn(m, sty->windup.reach + through.reach));
       // HOW MUCH OF THE REMAINING GAP THIS TICK SPENDS (strokes.h, above
@@ -667,7 +749,9 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
       // would move the world hash for nothing but float rounding.
       const MeleeTuning& t = m.tuning;
       const float rg = std::max(t.reachGain, 1e-4f);
-      if (sty->ease == Ease::Linear) {
+      // THE LEG'S OWN EASE when it states one, else the style's.
+      const Ease legEase = sty->LegEase(leg);
+      if (legEase == Ease::Linear) {
         const int left = std::max(1, legEnd - cur.phaseTick);
         smp.dx = ((toAz - m.StrokeAz()) / (float)left) / t.aimGainX;
         smp.dy = -((toEl - m.StrokeEl()) / (float)left) / t.aimGainY;
@@ -676,7 +760,7 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
         const int legLen = std::max(1, cur.legTicks[leg]);
         const int intoLeg = std::max(0, cur.phaseTick - (legEnd - legLen));
         const float share =
-            StrokeEaseStep(sty->ease, (float)intoLeg / (float)legLen,
+            StrokeEaseStep(legEase, (float)intoLeg / (float)legLen,
                            (float)(intoLeg + 1) / (float)legLen);
         smp.dx = ((toAz - m.StrokeAz()) * share) / t.aimGainX;
         smp.dy = -((toEl - m.StrokeEl()) * share) / t.aimGainY;
@@ -712,7 +796,11 @@ StrokeStepResult StepStrokeProgram(StrokeCursor& cur, const AttackStyle* sty,
         cur.wantAz = sty->recover.az;
         cur.wantEl = sty->recover.el;
         cur.wantReach = StrokeReachIn(m, sty->recover.reach);
-        steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
+        if (sty->recover.paced)
+          steerPaced(cur.wantAz, cur.wantEl, cur.wantReach, sty->recover.ease,
+                     cur.phaseTick, cur.settleTicks);
+        else
+          steerTo(cur.wantAz, cur.wantEl, cur.wantReach);
       } else {
         smp.held = false;
         m.Step(smp, dt, true, right, up, fwd);

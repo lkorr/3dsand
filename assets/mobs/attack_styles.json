@@ -1,13 +1,15 @@
 {
   "comment": "ATTACK STYLES. A style is a named STROKE PROGRAM: a windup that raises the blade into a stance, then a cut that drives it through the target line. It is fed to the SAME driver the player's mouse feeds (game/melee.h MeleeState, via StrokeSample), so an NPC swing is a motion a person could make and a fix to the feel is a fix to both. Hot-reloads on R alongside materials, behaviours, glyphs and items. The full schema, and the reasoning behind every field, is at the top of src/game/strokes.h.",
 
+  "strokeFrame": "target",
+
   "player_notes": "PLAYER OVERRIDES. Each style's optional `player` block states only the fields that differ from the base when the player swings it: shorter windups (a click must feel owned), zero jitter (a strike must go exactly where it was flicked), and sometimes different recover timing. The player compass references the BASE style by name; the loader creates a derived copy with overrides merged. Fields not mentioned in the override are inherited from the base. For `recover`, if the override is present but states no az/el/reach, the result has no posed return even if the base did (a player jab that hands back instantly does not need to be driven home). For `windup`, `cut`, and `jitter`, merge is per-field: stated fields override, unstated fields inherit.",
 
   "recover_notes": "THE RECOVER IS A RETURN, AND IT IS DRIVEN (2026-09-21). Until now it was four lines in the runner and none of them was a motion: the program set held=false, the STORED stroke froze wherever the cut ended, and PoseWeight ramped 1 -> 0 over the ONE global `melee.recoverTime` shared by every attack in the game -- a number Mob::ApplyWeaponArm hands to AnimSolveTwoBone as a BLEND WEIGHT. So the path home from a cut was a rotation-space crossfade with nothing in it that knows about anatomy, and a stroke that ends with the blade across the body (horizontal_r finishes at az -2.00) blended THROUGH the torso to get back. That is the 'limbs move in impossible ways' report, and nothing in the windup or the cut could reach it because the recover was not being authored at all. Now: `az`/`el`/`reach` are a RETURN STANCE, `settle` is how many of the `ticks` are spent being STEERED to it with the claim still at full weight, and `fade` is the hand-back, overriding melee.recoverTime for this style alone. THE POSE IS ABSOLUTE, in the mob's own facing basis -- NOT relative to the aim like the windup. A recover is a return to stance, not a second aim: an arm that recovered relative to the target would finish every swing pointed back at whatever it just hit, which reads as re-chambering rather than as finishing. Stating no az/el/reach gets the old behaviour back exactly, which is what a style written before this loads as.",
 
-  "ease_notes": "CUT PACING (optional `\"ease\"` on a style). The `ticks` on each cut leg set how LONG that leg takes; `ease` sets where in that time the speed lives. THE NAMES ARE anim.h's -- the SAME eight curves a clip keyframe interpolates with (linear, instant, quadIn/Out/InOut, cubicIn/Out/InOut), because a cut's pacing and a keyframe's easing are one concept and the project keeps one vocabulary for it. \"linear\" is the default and what every style here is: the gap closes by the same amount every tick. \"quadIn\" is back-loaded, so the blade creeps out of the windup and is fastest as it passes the target -- which puts the tip speed (and SPEED IS THE DAMAGE) where the aim is. \"quadOut\" is front-loaded: it snaps and then settles, so the tip is SLOWEST at the target and hits weaker. Every curve arrives exactly on the leg's end (the last tick always spends the whole remaining gap, which is also what keeps `instant` a shape rather than a stall), so pacing never displaces a corner. IT PACES THE CUT ONLY: the windup and the settle are a closed-loop chase to a pose under melee.commitSpeed, a different control law with no authored travel to distribute -- and because that chase is CLAMPED (16 units/tick), a windup with too few ticks stops short of its pose no matter what this says. ONE INTERACTION TO KNOW: a SHORT cut (about 8 ticks or fewer) moves fast enough per tick to cross melee.commitSpeed, which puts the DRIVER into its own Slash and hands the endpoint to its follow-through arc -- so on short cuts the pacing is partly overridden and the blade ends where the arc puts it. Long cuts stay in Guard and land exactly on the authored point, which is where this knob does what it says. The Attacks lane's `goal` chips hold each destination still so both of those are visible rather than inferred.",
+  "ease_notes": "CUT PACING (optional `\"ease\"` on a style). The `ticks` on each cut leg set how LONG that leg takes; `ease` sets where in that time the speed lives. THE NAMES ARE anim.h's -- the SAME eight curves a clip keyframe interpolates with (linear, instant, quadIn/Out/InOut, cubicIn/Out/InOut), because a cut's pacing and a keyframe's easing are one concept and the project keeps one vocabulary for it. \"linear\" is the default and what every style here is: the gap closes by the same amount every tick. \"quadIn\" is back-loaded, so the blade creeps out of the windup and is fastest as it passes the target -- which puts the tip speed (and SPEED IS THE DAMAGE) where the aim is. \"quadOut\" is front-loaded: it snaps and then settles, so the tip is SLOWEST at the target and hits weaker. Every curve arrives exactly on the leg's end (the last tick always spends the whole remaining gap, which is also what keeps `instant` a shape rather than a stall), so pacing never displaces a corner. IT PACES THE CUT ONLY: the windup and the settle are a closed-loop chase to a pose under melee.commitSpeed, a different control law with no authored travel to distribute -- and because that chase is CLAMPED (16 units/tick), a windup with too few ticks stops short of its pose no matter what this says. Every cut, short or long, lands exactly on its authored point (until 2026-09-25 a short cut crossed melee.commitSpeed and the driver's own Slash arc took over the endpoint; that Slash is gone). The Attacks lane's `goal` chips hold each destination still so both of those are visible rather than inferred.",
 
-  "notes": "ANGLES ARE RADIANS in the mob's own facing basis: azimuth 0 is straight ahead and positive is the mob's right; elevation 0 is level. REACH is a fraction of the arm's own reach band, so a thrust is the same lunge on a long arm and a short one. TICKS are 30 Hz sim ticks -- a windup of 12 is 0.40 s of visible blade raise, which IS the telegraph (there is no UI indicator). The cut is CENTRED on the aim point: the windup lands at aim minus half the cut's own travel, so the blade passes through where it was aimed rather than starting there.",
+  "notes": "ANGLES ARE RADIANS in the mob's own facing basis: azimuth 0 is straight ahead and positive is the mob's right; elevation 0 is level. REACH is a fraction of the arm's own reach band, so a thrust is the same lunge on a long arm and a short one. TICKS are 30 Hz sim ticks -- a windup of 12 is 0.40 s of visible blade raise, which IS the telegraph (there is no UI indicator). THE WINDUP IS MEASURED FROM THE TARGET (\"strokeFrame\": \"target\", 2026-09-25): windup az 0 / el 0 points straight at the target, and the cut TRAVELS from wherever the windup put the arm. To make the cut pass through the target in its middle, the windup sits half a cut back: windup = -(cut travel / 2), or the middle of the leg marked \"aim\": true -- the Attacks lane's centre button writes exactly that. Files without \"strokeFrame\" are in the old frame (windup measured from half a cut short of the aim) and are converted at load; see src/game/strokes.h \"THE STROKE FRAME\".",
 
   "player": {
     "sectors": [
@@ -44,8 +46,8 @@
     {
       "name": "horizontal_r",
       "label": "Horizontal cut, weapon side across",
-      "windup": { "ticks": 12, "az": 0.30, "el": 0.05, "reach": -0.05 },
-      "cut": { "ticks": 7, "az": -2.30, "el": 0.00, "reach": 0.10 },
+      "windup": { "ticks": 12, "az": 1.45, "el": 0.05, "reach": -0.05 },
+      "cut": { "ticks": 7, "az": -2.60, "el": -0.05, "reach": 0.10 },
       "recover": { "ticks": 10, "az": 0.30, "el": 0.10, "reach": -0.10, "settle": 4, "fade": 6 },
       "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 },
       "player": {
@@ -57,8 +59,8 @@
     {
       "name": "horizontal_l",
       "label": "Backhand cut, across to weapon side",
-      "windup": { "ticks": 13, "az": -0.25, "el": 0.04, "reach": -0.05 },
-      "cut": { "ticks": 7, "az": 2.10, "el": 0.00, "reach": 0.10 },
+      "windup": { "ticks": 13, "az": -1.30, "el": 0.04, "reach": -0.05 },
+      "cut": { "ticks": 7, "az": 2.35, "el": -0.04, "reach": 0.10 },
       "recover": { "ticks": 11, "az": 0.30, "el": 0.10, "reach": -0.10, "settle": 5, "fade": 6 },
       "jitter": { "az": 0.10, "el": 0.04, "tempo": 0.25 },
       "player": {
@@ -70,8 +72,8 @@
     {
       "name": "overhead",
       "label": "Overhead chop from a high guard",
-      "windup": { "ticks": 14, "az": 0.06, "el": 0.55, "reach": -0.10 },
-      "cut": { "ticks": 6, "az": -0.15, "el": -1.90, "reach": 0.14 },
+      "windup": { "ticks": 14, "az": 0.135, "el": 1.50, "reach": -0.10 },
+      "cut": { "ticks": 6, "az": -0.21, "el": -2.45, "reach": 0.14 },
       "recover": { "ticks": 12, "az": 0.25, "el": 0.15, "reach": -0.10, "settle": 6, "fade": 6 },
       "jitter": { "az": 0.08, "el": 0.06, "tempo": 0.22 },
       "player": {
@@ -83,8 +85,8 @@
     {
       "name": "diagonal",
       "label": "Descending diagonal, shoulder to hip",
-      "windup": { "ticks": 12, "az": 0.35, "el": 0.45, "reach": -0.08 },
-      "cut": { "ticks": 7, "az": -1.60, "el": -1.40, "reach": 0.12 },
+      "windup": { "ticks": 12, "az": 1.15, "el": 1.15, "reach": -0.08 },
+      "cut": { "ticks": 7, "az": -1.95, "el": -1.85, "reach": 0.12 },
       "recover": { "ticks": 10, "az": 0.30, "el": 0.12, "reach": -0.10, "settle": 4, "fade": 6 },
       "jitter": { "az": 0.12, "el": 0.06, "tempo": 0.25 },
       "player": {
@@ -96,8 +98,8 @@
     {
       "name": "thrust",
       "label": "Rear chamber, then a straight thrust",
-      "windup": { "ticks": 11, "az": 0.28, "el": 0.05, "reach": -0.45 },
-      "cut": { "ticks": 5, "az": -0.20, "el": 0.00, "reach": 0.85 },
+      "windup": { "ticks": 11, "az": 0.38, "el": 0.05, "reach": -0.45 },
+      "cut": { "ticks": 5, "az": -0.48, "el": -0.05, "reach": 0.85 },
       "recover": { "ticks": 12, "az": 0.28, "el": 0.08, "reach": -0.20, "settle": 6, "fade": 6 },
       "jitter": { "az": 0.08, "el": 0.04, "tempo": 0.28 },
       "player": {
@@ -115,14 +117,14 @@
       "weapon": "fist.R",
       "fallback": true,
       "reach": 0,
-      "windup": { "ticks": 8, "az": 0.22, "el": 0.06, "reach": -0.40 },
-      "cut": { "ticks": 4, "az": -0.26, "el": -0.02, "reach": 0.80 },
+      "windup": { "ticks": 8, "az": 0.35, "el": 0.07, "reach": -0.40 },
+      "cut": { "ticks": 4, "az": -0.48, "el": -0.08, "reach": 0.80 },
       "recover": { "ticks": 9, "az": 0.20, "el": 0.08, "reach": -0.35, "settle": 3, "fade": 6 },
       "jitter": { "az": 0.08, "el": 0.05, "tempo": 0.25 },
       "clip": "punch_r",
       "player": {
-        "windup": { "ticks": 6, "az": 0.06, "reach": -0.45 },
-        "cut": { "az": -0.07, "reach": 0.90 },
+        "windup": { "ticks": 6, "az": 0.095, "reach": -0.45, "el": 0.07 },
+        "cut": { "az": -0.13, "reach": 0.90, "el": -0.08 },
         "recover": { "ticks": 5, "fade": 5 },
         "jitter": { "az": 0, "el": 0, "tempo": 0 }
       }
@@ -133,14 +135,14 @@
       "weapon": "fist.L",
       "fallback": true,
       "reach": 0,
-      "windup": { "ticks": 9, "az": -0.22, "el": 0.06, "reach": -0.40 },
-      "cut": { "ticks": 4, "az": 0.26, "el": -0.02, "reach": 0.80 },
+      "windup": { "ticks": 9, "az": -0.35, "el": 0.07, "reach": -0.40 },
+      "cut": { "ticks": 4, "az": 0.48, "el": -0.08, "reach": 0.80 },
       "recover": { "ticks": 10, "az": -0.20, "el": 0.08, "reach": -0.35, "settle": 4, "fade": 6 },
       "jitter": { "az": 0.08, "el": 0.05, "tempo": 0.25 },
       "clip": "punch_l",
       "player": {
-        "windup": { "ticks": 6, "az": -0.06, "reach": -0.45 },
-        "cut": { "az": 0.07, "reach": 0.90 },
+        "windup": { "ticks": 6, "az": -0.095, "reach": -0.45, "el": 0.07 },
+        "cut": { "az": 0.13, "reach": 0.90, "el": -0.08 },
         "recover": { "ticks": 5, "fade": 5 },
         "jitter": { "az": 0, "el": 0, "tempo": 0 }
       }
@@ -151,8 +153,8 @@
       "weapon": "fist.R",
       "fallback": true,
       "reach": 0,
-      "windup": { "ticks": 10, "az": 0.75, "el": 0.10, "reach": -0.20 },
-      "cut": { "ticks": 5, "az": -1.10, "el": -0.08, "reach": 0.20 },
+      "windup": { "ticks": 10, "az": 1.30, "el": 0.14, "reach": -0.20 },
+      "cut": { "ticks": 5, "az": -1.85, "el": -0.18, "reach": 0.20 },
       "recover": { "ticks": 11, "az": 0.45, "el": 0.10, "reach": -0.25, "settle": 5, "fade": 6 },
       "jitter": { "az": 0.10, "el": 0.05, "tempo": 0.25 },
       "clip": "punch_r"
@@ -162,8 +164,8 @@
       "label": "Bite",
       "weapon": "jaws",
       "reach": 0,
-      "windup": { "ticks": 10, "az": 0.32, "el": 0.50, "reach": -0.10 },
-      "cut": { "ticks": 4, "az": -0.62, "el": -0.95, "reach": 0.20 },
+      "windup": { "ticks": 10, "az": 0.63, "el": 0.975, "reach": -0.10 },
+      "cut": { "ticks": 4, "az": -0.94, "el": -1.45, "reach": 0.20 },
       "recover": { "ticks": 12, "az": 0.00, "el": 0.10, "reach": 0.00, "settle": 6, "fade": 6 },
       "jitter": { "az": 0.24, "el": 0.10, "tempo": 0.22 },
       "target": { "arm": 0.46, "leg": 0.24, "hand": 0.16, "head": 0.07, "spine": 0.07 },
@@ -178,8 +180,8 @@
       "lunge": { "ticks": 10, "speed": 10.0, "rise": 1.5, "at": "windup" },
       "target": { "arm": 0.46, "leg": 0.24, "hand": 0.16, "head": 0.07, "spine": 0.07 },
       "targetProne": { "leg": 0.90, "hand": 0.06, "arm": 0.04 },
-      "windup": { "ticks": 10, "az": 0.30, "el": 0.55, "reach": -0.10 },
-      "cut": { "ticks": 4, "az": -0.58, "el": -1.05, "reach": 0.20 },
+      "windup": { "ticks": 10, "az": 0.59, "el": 1.075, "reach": -0.10 },
+      "cut": { "ticks": 4, "az": -0.88, "el": -1.60, "reach": 0.20 },
       "recover": { "ticks": 14, "az": 0.00, "el": 0.10, "reach": 0.00, "settle": 8, "fade": 6 },
       "jitter": { "az": 0.22, "el": 0.10, "tempo": 0.18 },
       "clip": "lunge"
@@ -191,8 +193,8 @@
       "weapon": "fist.R",
       "reach": 0,
       "//": "Player-only unarmed thrust (down flick). The deepest chamber and the longest drive in the block, and almost no azimuth — it is the punch you throw with your weight behind it.",
-      "windup": { "ticks": 6, "az": 0.08, "el": 0.02, "reach": -0.50 },
-      "cut": { "ticks": 4, "az": -0.08, "el": 0.00, "reach": 0.95 },
+      "windup": { "ticks": 6, "az": 0.12, "el": 0.02, "reach": -0.50 },
+      "cut": { "ticks": 4, "az": -0.16, "el": -0.02, "reach": 0.95 },
       "recover": { "ticks": 7, "az": 0.08, "el": 0.04, "reach": -0.45, "settle": 1, "fade": 6 },
       "jitter": { "az": 0.0, "el": 0.0, "tempo": 0.0 },
       "clip": "punch_r"

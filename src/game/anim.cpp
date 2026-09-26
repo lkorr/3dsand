@@ -840,40 +840,85 @@ Quat ClampHinge(const Quat& q, Vec3 axis, float lo, float hi) {
 }
 
 // Clamp the direction `d` (unit) into the intersection of up to two half-spaces
-// `d . n[k] <= s[k]`, returning the NEAREST legal direction. The normals are
-// mutually perpendicular (the loader enforces it), so completing them to an
-// orthonormal frame turns the projection into three independent components and
-// the unit-length identity supplies the third.
+// `d . n[k] <= s[k]`, returning the NEAREST legal direction on the sphere. The
+// normals are mutually perpendicular (the loader enforces it).
+//
+// A TRUE NEAREST-POINT PROJECTION (2026-09-25). The previous form kept the
+// second component EXACTLY and refilled the whole remainder of the unit length
+// into the third, with the third's sign copied from the input. That is neither
+// nearest nor continuous: with one stop active, crossing `c2 == 0` flipped the
+// bone between +sqrt(rem) and -sqrt(rem) — an upper arm clamped at its
+// across-the-body stop jumping from well above horizontal to well below in one
+// tick. It was the reported "the hand teleports above the head for one frame"
+// on low dagger strokes (player-styles' per-tick trace: a 4.8-voxel posed jump
+// against a 0.3-voxel command, all of it `clampShift`).
+//
+// The nearest point is one of: the projection onto ONE violated plane (the
+// free components SCALED together, not refilled into one), or, when that
+// breaks the other stop, one of the two points on BOTH planes. Every candidate
+// is tested for legality and the one closest to `d` (largest dot) wins, so the
+// answer moves continuously with `d` everywhere except the genuine cut locus.
 Vec3 ClampDirHalfSpaces(Vec3 d, const Vec3* n, const float* s, int count) {
   if (count <= 0) return d;
-  const Vec3 n0 = n[0];
-  // A second axis is needed to complete the frame even when only one plane is
-  // authored; any perpendicular one will do because its component is preserved.
-  Vec3 n1 = count >= 2 ? n[1]
-                       : (std::fabs(n0.x) < 0.9f ? Vec3{1, 0, 0} : Vec3{0, 1, 0});
-  n1 = (n1 - n0 * n0.dot(n1));
-  if (n1.len() < 1e-5f) return d;
-  n1 = n1.normalized();
-  const Vec3 n2 = n0.cross(n1);
-  const float c0 = d.dot(n0), c1 = d.dot(n1), c2 = d.dot(n2);
-  const float w0 = std::min(c0, s[0]);
-  const float w1 = count >= 2 ? std::min(c1, s[1]) : c1;
-  if (w0 == c0 && w1 == c1) return d;   // already legal, bit-for-bit unchanged
-  float rem = 1.0f - w0 * w0 - w1 * w1;
-  // Both stops pinned so hard that no unit vector satisfies them: the authored
-  // limits leave an empty set in this corner. Give back the closest thing that
-  // exists rather than a NaN.
-  if (rem <= 0.0f) {
-    const Vec3 v = n0 * w0 + n1 * w1;
-    return v.len() > 1e-5f ? v.normalized() : d;
+  if (count > 2) count = 2;
+  bool legalIn = true;
+  for (int k = 0; k < count; k++) legalIn = legalIn && d.dot(n[k]) <= s[k];
+  if (legalIn) return d;   // already legal, bit-for-bit unchanged
+  auto legal = [&](const Vec3& v) {
+    for (int k = 0; k < count; k++)
+      if (v.dot(n[k]) > s[k] + 1e-5f) return false;
+    return true;
+  };
+  Vec3 best = d;
+  float bestDot = -2.0f;
+  bool have = false;
+  auto consider = [&](const Vec3& v) {
+    if (!legal(v)) return;
+    const float dd = v.dot(d);
+    if (!have || dd > bestDot) {
+      best = v;
+      bestDot = dd;
+      have = true;
+    }
+  };
+  // ONE PLANE: pin the violated component to its stop and scale everything
+  // perpendicular to that normal to fill the unit length.
+  for (int k = 0; k < count; k++) {
+    const float ck = d.dot(n[k]);
+    if (ck <= s[k]) continue;
+    Vec3 perp = d - n[k] * ck;
+    float pl = perp.len();
+    if (pl < 1e-6f) {
+      // d IS the forbidden normal: every direction round it is equally near.
+      // Deterministic choice, the loader's own fallback axis.
+      const Vec3 a = std::fabs(n[k].x) < 0.9f ? Vec3{1, 0, 0} : Vec3{0, 1, 0};
+      perp = a - n[k] * n[k].dot(a);
+      pl = perp.len();
+      if (pl < 1e-6f) continue;
+    }
+    const float sk = std::clamp(s[k], -1.0f, 1.0f);
+    consider(n[k] * sk + perp * (std::sqrt(std::max(0.0f, 1.0f - sk * sk)) / pl));
   }
-  // The third component keeps its sign. At c2 == 0 the two answers are exactly
-  // equidistant, so the nearest-point projection is genuinely two-valued there;
-  // taking the sign from the INPUT makes the choice vary continuously with the
-  // pose everywhere except that measure-zero corner (bone aimed exactly into
-  // the intersection of both forbidden regions).
-  const float s2 = std::sqrt(rem) * (c2 < 0.0f ? -1.0f : 1.0f);
-  return (n0 * w0 + n1 * w1 + n2 * s2).normalized();
+  // BOTH PLANES: the two points where the stops' circles cross.
+  if (count >= 2) {
+    Vec3 m = n[0].cross(n[1]);
+    const float ml = m.len();
+    if (ml > 1e-5f) {
+      m = m * (1.0f / ml);
+      const Vec3 base = n[0] * s[0] + n[1] * s[1];
+      const float rem = 1.0f - base.dot(base);
+      if (rem >= 0.0f) {
+        const float r = std::sqrt(rem);
+        consider(base + m * r);
+        consider(base - m * r);
+      } else if (!have) {
+        // The authored stops leave an empty set in this corner: give back
+        // the closest thing that exists rather than a NaN.
+        return base.len() > 1e-5f ? base.normalized() : d;
+      }
+    }
+  }
+  return have ? best.normalized() : d;
 }
 
 // Swing-twist clamp for a ball joint: bound where the bone POINTS, then bound

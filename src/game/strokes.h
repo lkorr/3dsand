@@ -47,21 +47,20 @@
 // target. One segment and a one-leg list are the same program.
 //
 // WINDUP is a POSE, in the mob's own facing basis, expressed RELATIVE TO THE
-// AIM (see below): azimuth 0 straight ahead and positive to the mob's right,
-// elevation 0 level, `reach` a fraction of the arm's own reach band so a lunge
+// TARGET: az 0 / el 0 points STRAIGHT AT IT (see "THE STROKE FRAME" below),
+// azimuth positive to the mob's right, elevation positive up, `reach` a fraction of the arm's own reach band so a lunge
 // is the same lunge on a long arm and a short one. It is driven closed-loop and
-// deliberately SLOWLY — under `MeleeTuning::commitSpeed`, so the driver stays in
-// Guard and no cut fires. Its length is the whole telegraph: 12 ticks is 0.40 s
+// deliberately SLOWLY — capped at 16 input units/tick (about half
+// `MeleeTuning::commitSpeed`). Its length is the whole telegraph: 12 ticks is 0.40 s
 // of visible blade raise, and there is no UI indicator by design.
 //
-// CUT is a TRAVEL, not a pose: how far the point goes and how fast. The deltas
-// are divided by `cut.ticks` and delivered per tick at whatever pixel rate that
-// implies, which is what commits the driver's own Slash and gives the sweep the
-// tip speed that scales the damage (melee.h note 2, "SPEED IS THE DAMAGE").
+// CUT is a TRAVEL, not a pose: how far the point goes FROM THE WINDUP POSE and
+// how fast. The deltas are divided by `cut.ticks` and delivered per tick at whatever pixel rate that
+// implies, which gives the sweep the tip speed that scales the damage (melee.h note 2, "SPEED IS THE DAMAGE").
 //
 // RECOVER is a RETURN, and it is an absolute pose rather than an aim-relative
 // one: the arm is DRIVEN back to a stance over `settle` ticks (closed-loop and
-// under commitSpeed, the windup's own drive, so no cut can fire out of one) and
+// capped, the windup's own drive) and
 // only then is the claim handed back over `fade`. A style that authors no pose
 // gets the historical behaviour — release on the first tick, freeze wherever
 // the cut ended, crossfade. See `StrokeRecover` below for why that was not good
@@ -117,6 +116,34 @@
 // its edge.
 //
 // ---------------------------------------------------------------------------
+// THE STROKE FRAME (2026-09-25): THE WINDUP IS MEASURED FROM THE TARGET
+//
+// Until 2026-09-25 the windup was measured from "half a cut short of the aim"
+// (`aim - CutAimOffset + windup`) and every cut leg's target was
+// `aim - CutAimOffset + CutThrough(k)`, which kept the middle of the cut on the
+// target automatically but made the windup numbers unreadable: 0/0/0 was not
+// "at the target", it was half a cut away from it, and the panel's goal
+// readout never matched the boxes.
+//
+// NOW, WHAT THE NUMBERS SAY IS WHERE THE ARM GOES:
+//
+//   windup pose     = aim + windup                (0/0 = pointing at them)
+//   end of leg k    = aim + windup + CutThrough(k)
+//
+// so the cut starts where the windup put the arm and travels what it says.
+// Centring the cut on the target is now the AUTHOR's choice: the classic
+// through-the-middle stroke is `windup = -CutAimOffset()` (the tuner's
+// "centre" button), and the `"aim": true` leg marker says which leg that
+// centring aims at. It no longer moves anything at runtime.
+//
+// OLD FILES STILL LOAD AS THEY PLAYED. A file without `"strokeFrame":
+// "target"` is in the old frame, and `AttackStyle::FromLegacyFrame` converts
+// each style after the player overrides are merged — algebraically the same
+// program: the windup pose moves by -CutAimOffset and leg 1 absorbs the old
+// windup offset (the old cut ignored it and started from `aim - offset`), so
+// every leg ends on the same absolute point it always did.
+//
+// ---------------------------------------------------------------------------
 // VARIATION IS DETERMINISTIC (CLAUDE.md rule 1)
 //
 // Ten swings must not look stamped, and they must still replay. Every draw is
@@ -140,6 +167,13 @@ struct StrokeSegment {
   float az = 0;      // windup: pose, relative to the aim. cut: travel.
   float el = 0;
   float reach = 0;
+  // THIS SEGMENT'S OWN PACING ("ease" on the segment; 2026-09-25). False =
+  // unstated: a cut leg then uses the style-wide `AttackStyle::ease`, and the
+  // windup keeps its closed-loop under-commit chase (`steerTo`). True = the
+  // segment's travel is spread over its ticks by this curve — see "PER-SEGMENT
+  // PACING" below AttackStyle's ease note.
+  bool paced = false;
+  Ease ease = Ease::Linear;
 };
 
 // HOW MANY LEGS ONE CUT MAY HAVE. A ceiling because the live cursor carries
@@ -255,6 +289,10 @@ struct StrokeRecover {
   int settle = 0;
   // Ticks the hand-back fade takes, overriding melee.recoverTime; 0 = global.
   int fade = 0;
+  // The SETTLE's pacing ("ease" on the recover). Unstated = the closed-loop
+  // chase, exactly as before; meaningless without a pose.
+  bool paced = false;
+  Ease ease = Ease::Linear;
 };
 
 // ---- HOW A CUT'S TRAVEL IS PACED (AttackStyle::ease; 2026-09-22) ----------
@@ -293,9 +331,21 @@ struct StrokeRecover {
 // leg's target is an ABSOLUTE point on the path, so a leg that ran out of
 // ticks short of its corner does not displace the legs after it.
 //
-// THIS PACES THE CUT ONLY. The windup and the settle are a closed-loop chase
-// to a POSE under `commitSpeed` (`steerTo`), which is a different control law
-// with its own feel and no authored travel to distribute.
+// PER-SEGMENT PACING (2026-09-25). The style-wide `ease` is now only the
+// DEFAULT for cut legs that state none: every segment may carry its own
+// `"ease"` — the windup, each cut leg, and the recover (its settle). A cut leg
+// with its own ease uses it instead of the style's.
+//
+// The windup and the settle are different: unstated, they stay the
+// closed-loop chase to a POSE under `commitSpeed` (`steerTo`) they have always
+// been, which has no authored travel to distribute and just closes at a capped
+// rate. STATING an ease turns them into a TIMED approach: each tick spends
+// `StrokeEaseStep`'s share of the remaining gap to the pose, so the arm
+// arrives on the segment's last tick with the speed where the curve puts it.
+// The per-tick step is STILL clamped to steerTo's envelope — a pacing curve
+// that asked for more than that is slowed. (The clamp used to be what kept a
+// windup from firing the driver's own Slash; the driver has no Slash since
+// 2026-09-25, so it is now purely the telegraph's rate cap.)
 
 // The share of the REMAINING gap to spend on the tick carrying progress
 // p0 -> p1.
@@ -338,6 +388,16 @@ struct AttackStyle {
   int aimLeg = -1;
   StrokeRecover recover;
   StrokeJitter jitter;
+  // PER-JOINT BRAKES ON THE POSED ARM (melee.h ArmSmooth), authored as
+  //   "joints": { "shoulder": { "smooth": 2, "maxDeg": 20 },
+  //               "elbow": { ... }, "wrist": { ... } }
+  // Absent = all zero = the solve untouched. Carried to the rig on the
+  // WeaponPose by whoever runs the program.
+  ArmSmooth joints;
+  // The ease a cut leg with no `ease` of its own is paced by.
+  Ease LegEase(int k) const {
+    return (k >= 0 && k < (int)cut.size() && cut[k].paced) ? cut[k].ease : ease;
+  }
 
   // ---- THE PATH, READ THREE WAYS ------------------------------------------
   // Here rather than at the call sites because a gate, the dev readout and the
@@ -370,9 +430,10 @@ struct AttackStyle {
     }
     return t;
   }
-  // WHERE THE TARGET SITS ALONG THE PATH, measured from the cut's start. The
-  // windup lands at `aim - this`, and leg k therefore ends at
-  // `aim - this + CutThrough(k)`.
+  // WHERE THE TARGET SITS ALONG THE PATH, measured from the cut's start: the
+  // middle of the `aim` leg, else of the whole travel. No longer used by the
+  // runner (see "THE STROKE FRAME"); it is what "centre" writes into the
+  // windup (`windup = -this`) and what the legacy conversion subtracts.
   void CutAimOffset(float& az, float& el) const {
     if (aimLeg >= 0 && aimLeg < (int)cut.size()) {
       const StrokeSegment before = CutThrough(aimLeg - 1);
@@ -383,6 +444,20 @@ struct AttackStyle {
     const StrokeSegment all = CutTravel();
     az = 0.5f * all.az;
     el = 0.5f * all.el;
+  }
+  // OLD STROKE FRAME -> TARGET FRAME ("THE STROKE FRAME" above). The same
+  // program, re-expressed: called by the loader on a file without
+  // `"strokeFrame": "target"`, after the player overrides are merged.
+  void FromLegacyFrame() {
+    float offAz = 0, offEl = 0;
+    CutAimOffset(offAz, offEl);
+    const float wAz = windup.az, wEl = windup.el;
+    windup.az = wAz - offAz;
+    windup.el = wEl - offEl;
+    if (!cut.empty()) {
+      cut[0].az -= wAz;
+      cut[0].el -= wEl;
+    }
   }
   // ---- WHAT SWINGS IT (plan §4/§5) ---------------------------------------
   // "held" (the default, and every style authored before this existed) or the
@@ -493,8 +568,7 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
 // ---------------------------------------------------------------------------
 // THE PROGRAM STATE of one live stroke, split from the NPC's swing (below)
 // because TWO callers now replay authored programs through a MeleeState: a
-// Mob's NpcStroke, and main.cpp's discrete player attacks (melee.controlMode
-// 0), which own a bare cursor beside the player's own MeleeState. The split is
+// Mob's NpcStroke, and the player's discrete attacks (session.cpp), which own a bare cursor beside the player's own MeleeState. The split is
 // exactly "what the stroke runner needs" — targets, edge memory and damage
 // bookkeeping stay on NpcStroke, because the player's caller already owns
 // those concerns its own way (main.cpp's sweep block and lastEdge* memory).
@@ -673,7 +747,7 @@ int PickAttackStyle(const StyleLibrary& lib,
 //
 // The phase machine that turns an authored AttackStyle into per-tick
 // StrokeSamples, extracted from MobSystem::StepStroke so the player's discrete
-// attacks (main.cpp, melee.controlMode 0) replay the same programs through
+// attacks (session.cpp) replay the same programs through
 // their own MeleeState. Neither caller owns a copy of the feel: this is the
 // only place a windup, a cut or a recover is stepped, exactly as melee.cpp is
 // the only place a stroke is integrated.

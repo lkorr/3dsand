@@ -8,8 +8,9 @@
 
 // THE STROKE DRIVER — one control law, three feeders (2026-09-01).
 //
-// The prose below describes the FREEFORM mouse-steer experiment, which is now
-// the `melee.controlMode = 1` path (tuning.h): the SHIPPED default is 0,
+// The prose below describes the FREEFORM mouse-steer experiment the driver was
+// built for. THAT MODE IS GONE (2026-09-25, with the driver's own
+// speed-triggered Slash and follow-through arc): the player's only control is
 // DISCRETE STRIKES — a click fires an authored stroke program from
 // attack_styles.json, direction picked by the flick at the press
 // (game/strike_pick.h), replayed through this same driver by the same
@@ -17,7 +18,7 @@
 // layer — the tip-on-a-reach-sphere control law, the derived blade frame, the
 // damage sweep, parry, block — is shared by all three feeders and unchanged.
 //
-// MOUSE-DIRECTED MELEE (the "half sword" experiment; controlMode = 1).
+// MOUSE-DIRECTED MELEE (the "half sword" experiment; REMOVED — history).
 //
 // THE IDEA. A swing is not an animation you trigger, it is a motion you make.
 // Hold the attack button and you TAKE OVER THE BLADE: the sword stays exactly
@@ -131,14 +132,16 @@ struct StrokeSample {
   bool held = true;       // the attack button; false releases the stroke
 };
 
-// The swing state machine. Small enough to reason about; the interesting
-// behaviour is in how Wind reads the mouse, not in the graph.
+// The driver's state machine. It has NO CUT OF ITS OWN (2026-09-25): the
+// speed-triggered Slash and its follow-through arc were the freeform mouse
+// melee's, and on an authored stroke they were a second controller fighting
+// the program. Whether a swing is cutting is the PROGRAM's phase
+// (StrokeCursor::Cutting, game/strokes.h), never this.
 enum class SwingPhase : uint8_t {
   Idle = 0,   // weapon at rest, following the walk cycle
-  Guard,      // button held: the mouse owns the hand, moving it 1:1
-  Wind,       // mouse moving fast, building the cut direction (still owning it)
-  Slash,      // committed: the blade drives along the chosen direction, cutting
-  Recover,    // the cut's follow-through unwinds; the arm is handed back
+  Guard,      // driven: the input owns the tip, moving it 1:1
+  Wind,       // driven and moving briskly (what Arrest reads as a live cut)
+  Recover,    // released or arrested; the arm is handed back
 };
 
 // Tunable feel.
@@ -155,12 +158,11 @@ enum class SwingPhase : uint8_t {
 // The one number that DID move is `wristMaxAngle` (2.80 -> 1.50), and it moved
 // because the grip it was compensating for was re-authored — see its own note.
 struct MeleeTuning {
-  // Mouse pixels per second past which a guarded blade commits to a cut. Low
-  // enough that an intentional flick always fires, high enough that aiming
-  // while guarding does not.
+  // A REFERENCE DRIVE SPEED, input units per second. Nothing commits on it any
+  // more (the driver's own Slash is gone): 35% of it is where Guard reads as
+  // Wind, the stroke programs' closed-loop steer stays under it, and the swing
+  // whoosh maps speed to volume against it.
   float commitSpeed = 900.0f;
-  // Seconds the committed slash takes. Short: a cut is a snap, not a wind-up.
-  float slashTime = 0.17f;
   float recoverTime = 0.22f;
   // Blade tip speed (world voxels/sec) at and above which a hit does full
   // damage; below it damage falls off linearly to zero. This is what makes a
@@ -173,9 +175,7 @@ struct MeleeTuning {
   // pixels/sec and not voxels. This is the whole control law now: the delta is
   // a displacement of the point on its reach sphere, integrated, so 200 px of
   // mouse is the same arc whether you took a tenth of a second or two seconds
-  // over it. `commitSpeed` below is still measured on true pixel SPEED, so
-  // raising these makes the blade cover more ground without making a twitch
-  // fire a cut.
+  // over it.
   //
   // The defaults preserve the previous law's sensitivity exactly: it moved the
   // hand 3.0 mm/px horizontally at a 0.60 m arm, which is 0.0050 rad/px, and
@@ -269,23 +269,6 @@ struct MeleeTuning {
   // raw delta is far too noisy to steer a cut with.
   float dirSmoothing = 0.06f;
   // ---- the derived half: blade, plane, arm --------------------------------
-  // How far the committed cut carries the point on its own, in radians of arc
-  // about the shoulder, ADDED to whatever the player is still steering. ~115
-  // degrees is a cut; a canned stroke longer than that outruns the mouse and
-  // stops reading as the player's own motion.
-  float swingArc = 2.0f;
-  // ANTICIPATION, as a fraction of the arc's own bow: how far the point pulls
-  // BACK against the cut before driving through it. The previous law expressed
-  // the same idea as a symmetric arc centred on the hand — which jumped half a
-  // swing backwards on the tick it committed, a 57-degree pop in tip space. An
-  // anticipation term is zero at both ends of the stroke by construction, so it
-  // buys the wind-up without buying the discontinuity.
-  float swingAnticipate = 0.35f;
-  // Fraction of the tip reach the arc bows OUT by at mid-stroke. An arm swings
-  // about a shoulder and is furthest from the body halfway through; that bulge
-  // is also what carries the blade THROUGH a target rather than past it. This
-  // is the radial channel doing the job the old law did with a forward offset.
-  float swingExtend = 0.16f;
   // Seconds of halflife on the blade frame and on the arm's bend plane. This
   // is what makes a take-over continuous — control starts at the blade's ACTUAL
   // orientation and eases to the commanded one — and what stops the flat of the
@@ -352,8 +335,7 @@ struct MeleeTuning {
   // it ride the grip (up out of the fist). The band is also wider now
   // (0.6..3.0 m/s, up from 0.25..1.10) for the same reason: a deliberate
   // raise moves the tip at 1-2 m/s and should mostly keep the grip pose;
-  // only near-cut speeds earn full alignment, and a committed Slash gets it
-  // regardless.
+  // only near-cut speeds earn full alignment.
   float steerSpeedLo = MetresPerSecToCells(0.6f);    // below: grip pose
   float steerSpeedHi = MetresPerSecToCells(3.0f);    // above: full alignment
   // What is applied at and below `steerSpeedLo`. Not zero: a guard that shares
@@ -376,8 +358,7 @@ struct MeleeTuning {
   // `wristSmoothing` owns BOTH halves of the wrist's motion: the commitment
   // envelope (attack = half this, release = four times it — the asymmetry is
   // measured, see RebuildFrame) and the chase of the commanded blade
-  // orientation itself. The orientation chase runs 3x faster through a Slash
-  // so a cut still lays the edge in crisply. Replaces the old derivation from
+  // orientation itself. Replaces the old derivation from
   // bladeSmoothing, which conflated the wrist's feel with the internal frame
   // continuity mechanism.
   float wristSmoothing = 0.10f;
@@ -876,6 +857,39 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& sweep, const MeleeTuning& t,
 
 // The whole pose the driver commands, in one value. Passed to Mob::
 // SetWeaponPose; see the note there for what each channel does to the rig.
+// ---- PER-JOINT SMOOTHING OF THE WEAPON ARM (AttackStyle::joints) ----------
+//
+// The driver commands a HAND and a POLE; the shoulder, elbow and wrist
+// rotations are whatever the two-bone solve and the wrist steer make of them,
+// and on some strokes that is a shoulder that whips round its own axis between
+// the windup and the cut while the blade itself travels fine. These are the
+// author's brakes on the RESULT, one per joint, applied after the solve by
+// Mob::SmoothWeaponArm (and rig.js smoothWeaponArm for the tuner's preview):
+//
+//   smooth   low-pass half-life in TICKS on the joint's rotation relative to
+//            its parent. 0 = off. 2 = the joint covers half the remaining
+//            distance to the solved pose every two ticks.
+//   maxDeg   cap on how far the joint may turn in ONE tick, degrees. 0 = off.
+//            This is the "limit": a shoulder capped at 20 deg/tick cannot
+//            spin 120 degrees across the windup->cut boundary.
+//
+// PRESENTATION ONLY, and the damage stays honest: the sweep reads the POSED
+// blade (Mob::WeaponEdge reads the live limb bodies), so a lagging arm hits
+// where it is drawn, not where the driver asked. Everything defaults to 0 =
+// the solve untouched, which is every style authored before this.
+struct ArmJointSmooth {
+  float smooth = 0;   // half-life, ticks
+  float maxDeg = 0;   // degrees per tick
+  bool Any() const { return smooth > 0.0f || maxDeg > 0.0f; }
+};
+enum ArmJointIndex { kArmShoulder = 0, kArmElbow = 1, kArmWrist = 2, kArmJoints = 3 };
+struct ArmSmooth {
+  ArmJointSmooth joint[kArmJoints];
+  bool Any() const {
+    return joint[0].Any() || joint[1].Any() || joint[2].Any();
+  }
+};
+
 struct WeaponPose {
   Vec3 hand{};              // hand offset from the shoulder, world voxels
   Vec3 bladeDir{0, 1, 0};   // along the blade, hilt -> point, world
@@ -918,6 +932,10 @@ struct WeaponPose {
   // hand is ORIENTED so the blade points along bladeDir with its flat facing
   // bladeFlat, and the elbow's bend plane follows bendPole.
   bool steerBlade = false;
+  // The live style's per-joint brakes (ArmSmooth above). MeleeState::Pose()
+  // never fills it — the driver has no style — so the stroke callers
+  // (MobSystem::StepStroke, the player's discrete strike) copy it in.
+  ArmSmooth smooth;
 };
 
 // The player's melee state. One instance, owned by main.cpp beside the caster.
@@ -1081,6 +1099,15 @@ class MeleeState {
   void SetRecoverTime(float seconds) {
     recoverOverride_ = seconds > 1e-4f ? seconds : 0.0f;
   }
+  // THIS STEP IS AN AUTHORED PROGRAM'S (2026-09-25). StepStrokeProgram sets it
+  // before every Step and Update clears it after, so it is true for exactly
+  // the ticks a program drives. While it is, the wrist aligns the blade in
+  // FULL: the program states where the TIP goes, the hand is placed on the
+  // assumption that the blade points there, and the speed-earned alignment
+  // (steerSpeedLo/Hi, steerFloor — the freeform mode's "a slow raise rides
+  // the grip") left a slow cut's blade at 15% alignment, its tip nowhere near
+  // the authored point. More ticks made that WORSE, which is backwards.
+  void SetProgramDrive() { programDrive_ = true; }
   float RecoverTime() const {
     return recoverOverride_ > 1e-4f ? recoverOverride_ : tuning.recoverTime;
   }
@@ -1092,16 +1119,6 @@ class MeleeState {
   float SteerAmount() const { return steerLive_; }
 
   SwingPhase Phase() const { return phase_; }
-  bool Cutting() const { return phase_ == SwingPhase::Slash; }
-  // 0..1 through the current slash; drives nothing but the HUD and audio.
-  float SlashProgress() const {
-    return tuning.slashTime > 0 ? phaseTime_ / tuning.slashTime : 0.0f;
-  }
-  // The direction the player actually flicked, in camera-plane terms. Exposed
-  // so the HUD can show the cut the game read off the mouse — the player
-  // needs to be able to tell "the game misread my flick" from "I misjudged
-  // the distance", and without this that is unfalsifiable.
-  Vec3 CutDir() const { return cutDir_; }
   float MouseSpeed() const { return mouseSpeed_; }
 
   void Reset();
@@ -1141,13 +1158,6 @@ class MeleeState {
   Vec3 inputAccum_{};     // x = dx, y = dy, z = dReach
   Vec3 mouseVel_{};       // smoothed units/sec
   float mouseSpeed_ = 0;
-  // The committed cut direction in WORLD space, fixed at commit time so the
-  // cut does not curve when the player keeps moving the mouse mid-slash.
-  Vec3 cutDir_{};
-  // ...and the same direction in CONTROL space (unit, x = azimuth, y =
-  // elevation), which is what the follow-through arc is actually integrated in.
-  // A world vector cannot be: the arc lives on the reach sphere.
-  float cutAz_ = 0, cutEl_ = 0;
   Vec3 tip_{}, hand_{}, bladeDir_{0, 1, 0}, bladeFlat_{0, 0, 1},
       bendPole_{0, 0, -1};
   // The wrist's eased blade frame in world space (see wristDirL_ below);
@@ -1161,17 +1171,12 @@ class MeleeState {
   // plane — the difference between a sweep and a jab.
   float az_ = 0, el_ = 0, radius_ = 0;
   // THE SMOOTHED STROKE the frame is actually built from — az/el/radius eased
-  // toward the clamped (steered + follow-through) sums on the armSmoothing
+  // toward the clamped stroke on the armSmoothing
   // halflife. Kept beside az_/el_/radius_ rather than replacing them because
   // the RAW integral is what the clamps bank against and what a take-over
   // seeds; the eased copy is presentation. At armSmoothing 0 these equal the
   // sums every tick and nothing changes.
   float azLive_ = 0, elLive_ = 0, radLive_ = 0;
-  // The cut's own follow-through, ADDED to az_/el_ rather than replacing them:
-  // the player keeps steering through the slash and the arc rides on top of
-  // wherever they have steered to. Decays over Recover, which is what makes a
-  // cut end where the mouse ended rather than snapping back to a pose.
-  float swingAz_ = 0, swingEl_ = 0, swingOut_ = 0;
   // Smoothed tip velocity in the basis frame (voxels/sec), and the tangent
   // derived from it. The blade frame and the bend pole are both built off this,
   // which is why they are smoothed and the tip is not.
@@ -1219,8 +1224,8 @@ class MeleeState {
 
  public:
   // The rig's own hand-to-point distance, as the driver last received it. The
-  // follow-through arc scales with it (melee.cpp, Slash), so a diagnostic that
-  // cannot see it cannot tell a bladeless weapon from a mis-seeded one.
+  // lean geometry is built from it, so a diagnostic that cannot see it cannot
+  // tell a bladeless weapon from a mis-seeded one.
   float BladeLength() const { return bladeLen_; }
 
  private:
@@ -1242,4 +1247,6 @@ class MeleeState {
   bool recoverHold_ = false;
   // Seconds, 0 = use tuning.recoverTime. See SetRecoverTime.
   float recoverOverride_ = 0.0f;
+  // See SetProgramDrive. One-shot: cleared at the end of every Update.
+  bool programDrive_ = false;
 };

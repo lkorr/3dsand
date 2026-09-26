@@ -3388,6 +3388,10 @@ function stepPreviewFixed(dt) {
   // for the clamp below, exactly as Mob::ApplyWeaponArm fills a
   // PoseAxisOverride for AnimClampPoseLimits.
   const weaponHinge = applyWeaponArm();
+  // ...and the style's per-joint brakes on what it solved (pose.cpp, right
+  // after ApplyWeaponArm; melee.h ArmSmooth).
+  smoothWeaponArm(dt);
+  ATK.updateJointLag(armSmooth.valid ? armSmooth.lag : null);
   // ---- stage 6: the pose has to be anatomically possible ---------------
   // After every solve, never between them: the IK is what puts a joint out of
   // range, so clamping earlier would only clamp a pose about to be replaced.
@@ -4147,6 +4151,14 @@ function syncEffectorToSelection() {
 }
 
 function weaponTick() {
+  // A solo burst beginStroke deferred to this tick, now that the rig has been
+  // posed at rest once (see beginStroke).
+  if (strokeBurst) {
+    const solo = strokeBurst;
+    strokeBurst = null;
+    runStrokeBurst(solo);
+    return;
+  }
   dbgWeaponTicks++;
   syncEffectorToSelection();
   // ---- 1. WHERE THE BLADE IS NOW ---------------------------------------
@@ -4176,7 +4188,7 @@ function weaponTick() {
     const gaim = ATK.currentAim();
     const g = gsty
       ? MELEE.strokeGoalPose(gsty, melee, goalKey, gaim.az, gaim.el) : null;
-    if (g) melee.snapToPose(g.az, g.el, g.reach, right, up, fwd);
+    if (g) melee.snapToPose(g.az, g.el, g.reach, right, up, fwd, g.travel);
     else melee.update(kStrokeDt, false, !!gsty, right, up, fwd);
     return;
   }
@@ -4321,18 +4333,36 @@ function beginStroke(styleIndex) {
   // it just does not wait a frame between them, so the rig pose the seed
   // reads is one frame stale for the burst's duration, which is the engine's
   // own one-tick latency and not a different swing.
+  //
+  // DEFERRED ONE TICK, so every replay starts from the SAME pose. The driver
+  // seeds from wherever the rig's arm is (the take-over), and a loop replay
+  // is begun from inside the solo HOLD, where the rig is still frozen at the
+  // end of the last segment. Bursting right here seeded replay 2+ from the
+  // end of the previous cut while the first swing (clicked from rest) seeded
+  // from rest, and a windup that does not quite reach its pose then gives
+  // two different cuts in alternation — "two different strikes with jitter
+  // at 0". One preview step at weight 0 (melee.reset above) puts the arm back
+  // at rest, and the burst runs from there on the next tick.
   const solo = ATK.soloSegment?.() || 'all';
-  if (solo === 'cut' || solo === 'recover') {
-    const P = MELEE.STROKE_PHASE;
-    const want = solo === 'cut' ? P.Cut : P.Recover;
-    for (let guard = 0; guard < 400 && strokeLive() && strokeCur.phase < want &&
-                        strokeHoldTicks === 0; guard++)
-      weaponTick();
-  }
+  strokeBurst = (solo === 'cut' || solo === 'recover') ? solo : null;
+  // The joint brakes' memory is per swing here for the same reason: a replay
+  // must not start braking from where the LAST swing left the arm.
+  armSmooth.valid = false;
+}
+let strokeBurst = null;
+
+/** The solo burst beginStroke deferred (see there). */
+function runStrokeBurst(solo) {
+  const P = MELEE.STROKE_PHASE;
+  const want = solo === 'cut' ? P.Cut : P.Recover;
+  for (let guard = 0; guard < 400 && strokeLive() && strokeCur.phase < want &&
+                      strokeHoldTicks === 0; guard++)
+    weaponTick();
 }
 
 function stopStroke() {
   strokeCur = MELEE.newStrokeCursor();
+  strokeBurst = null;
   // mob.cpp:14542 ClearStrikeEffector — DROPS THE OVERRIDE, and that is all:
   // a rig that finishes a punch while still holding a sword goes back to
   // carrying the sword through resolveEffector's fall-through, not through a
@@ -4435,6 +4465,109 @@ function applyWeaponArm() {
   }
   lastElbowOverride = { part: i1, axis, blend: clamp(pose.steerAmount, 0, 1) };
   return lastElbowOverride;
+}
+
+/**
+ * mob.cpp Mob::SmoothWeaponArm — THE AUTHOR'S BRAKES ON THE POSED ARM
+ * (melee.h ArmSmooth, strokes.h AttackStyle::joints). Per joint (shoulder =
+ * the chain's upper bone, elbow = its lower bone, wrist = the hand), the
+ * rotation RELATIVE TO ITS PARENT is low-passed (`smooth`, a half-life in
+ * ticks) and then capped (`maxDeg` per tick) against last tick's braked
+ * value, and the arm's subtree is re-flattened so the sword rides the braked
+ * hand. The brakes in force are the LIVE program's style's; after the stroke
+ * ends the last ones stay on until the arm has caught up, so turning them
+ * off cannot snap.
+ */
+let armSmooth = { valid: false, part: [-1, -1, -1], prev: [null, null, null],
+                  params: null, lag: [0, 0, 0] };
+function liveArmJoints() {
+  if (!strokeLive() || !melee || !(melee.poseWeight() > 0)) return null;
+  const lib = ATK.library();
+  const sty = (lib && strokeStyle >= 0) ? lib.styles[strokeStyle] : null;
+  return sty && MELEE.jointsAny(sty.joints) ? sty.joints : null;
+}
+function smoothWeaponArm(dt) {
+  const S = armSmooth;
+  const asked = liveArmJoints();
+  if (asked) S.params = asked;
+  else if (!S.valid) return;
+  if (!skel || !anim?.model?.length) { S.valid = false; return; }
+  const eff = resolveEffector();
+  const parts = [-1, -1, -1];
+  if (eff.mode !== 'aim') {
+    const hand = { hand: -1 };
+    const ci = eff.part >= 0 ? chainForEffector(eff.part, hand) : wpChain;
+    const ch = ci >= 0 ? skel.chains[ci] : null;
+    if (ch && (ch.parts || []).length >= 2) {
+      const h = eff.part >= 0 ? hand.hand : ch.effector;
+      parts[0] = ch.parts[0];
+      parts[1] = ch.parts[1];
+      parts[2] = h !== ch.parts[1] ? h : -1;
+    }
+  }
+  const n = Math.min(skel.parts.length, anim.model.length);
+  for (let k = 0; k < 3; k++) if (parts[k] >= n) parts[k] = -1;
+  if (parts[0] < 0 || parts[1] < 0) { S.valid = false; return; }
+  if (S.valid && parts.some((p, k) => p !== S.part[k])) S.valid = false;
+  const localOf = (i) => {
+    const par = skel.parts[i].parent;
+    return par >= 0 && par < n
+      ? AN.qnorm(AN.qmul(AN.qconj(anim.model[par].rot), anim.model[i].rot))
+      : anim.model[i].rot;
+  };
+  const want = parts.map(i => (i >= 0 ? localOf(i) : null));
+  if (!S.valid) {
+    S.part = parts.slice();
+    S.prev = want.slice();
+    S.lag = [0, 0, 0];
+    S.valid = !!asked;
+    return;
+  }
+  const ticks = Math.max(dt * 30, 0);
+  const angleBetween = (a, b) =>
+    2 * Math.acos(Math.min(1, Math.abs(AN.qdot(a, b))));
+  const got = [null, null, null];
+  let lagMax = 0;
+  for (let k = 0; k < 3; k++) {
+    if (parts[k] < 0) continue;
+    const p = S.params[MELEE.ARM_JOINTS[k]] || { smooth: 0, maxDeg: 0 };
+    let q = S.prev[k];
+    if (!(p.smooth > 0 || p.maxDeg > 0)) {
+      q = want[k];
+    } else {
+      // Low-pass first, THEN the cap: the cap is a ceiling on what the joint
+      // actually does this tick, so it must see the smoothed step.
+      let out = want[k];
+      if (p.smooth > 0) out = AN.qslerp(q, want[k], 1 - Math.pow(2, -ticks / p.smooth));
+      if (p.maxDeg > 0) {
+        const ang = angleBetween(q, out);
+        const lim = p.maxDeg * Math.PI / 180 * ticks;
+        if (ang > lim && ang > 1e-5) out = AN.qslerp(q, out, lim / ang);
+      }
+      q = AN.qnorm(out);
+    }
+    got[k] = q;
+    S.prev[k] = q;
+    S.lag[k] = angleBetween(q, want[k]);
+    lagMax = Math.max(lagMax, S.lag[k]);
+  }
+  if (!asked && lagMax < 0.0035) S.valid = false;
+  // RE-FLATTEN THE ARM'S SUBTREE with the braked locals (parents-first).
+  const old = anim.model.slice(0, n).map(t => ({ pos: { ...t.pos }, rot: { ...t.rot } }));
+  const moved = new Uint8Array(n);
+  const root = parts[0];
+  for (let i = root; i < n; i++) {
+    const par = skel.parts[i].parent;
+    if (i !== root && (par < 0 || !moved[par])) continue;
+    moved[i] = 1;
+    if (par < 0 || par >= n) continue;
+    let rel = AN.qnorm(AN.qmul(AN.qconj(old[par].rot), old[i].rot));
+    const relPos = AN.qrotinv(old[par].rot, AN.vsub(old[i].pos, old[par].pos));
+    for (let k = 0; k < 3; k++) if (parts[k] === i) rel = got[k];
+    anim.model[i].rot = AN.qnorm(AN.qmul(anim.model[par].rot, rel));
+    anim.model[i].pos = AN.vadd(anim.model[par].pos,
+                                AN.qrot(anim.model[par].rot, relPos));
+  }
 }
 
 /**
@@ -5849,6 +5982,107 @@ function tick(dt) {
   // the same split the clip lane makes between updateClipCursorUI() and a full
   // renderClipLane().
   if (laneTab === 'attacks') ATK.tickUI();
+  drawAngleGuide();
+}
+
+/* --------------------------------------------------------------------------
+   THE ANGLE GUIDE — what an az / el / reach box MEANS, drawn on the rig.
+
+   While the pointer or focus is on a program row's az / el / reach box
+   (attacks.js guideKey), this draws from the weapon arm's pivot:
+     * the REFERENCE the row is measured from — the target line for the
+       windup, where the previous leg ended for a cut leg, straight ahead for
+       the recover (which is absolute);
+     * the row's GOAL line, out to its resolved reach;
+     * the AZIMUTH as a horizontal arc and the ELEVATION as a vertical arc
+       between the two, each labelled with its signed angle.
+   Same arithmetic as the runner (melee.js strokeGoalPose), so the picture is
+   the pose the program steers to, not a second opinion about it.
+   -------------------------------------------------------------------------- */
+let guideSig = '';
+function drawAngleGuide() {
+  const key = laneTab === 'attacks' ? ATK.guideKey?.() : null;
+  const lib = key ? ATK.library() : null;
+  const sty = lib ? lib.styles[ATK.styleIndex()] : null;
+  const seed = sty && melee ? weaponArmSeed() : null;
+  if (!key || !sty || !seed) {
+    if (guideSig) { guideSig = ''; ed.setAngleGuide?.(null, null); }
+    return;
+  }
+  const aim = ATK.currentAim();
+  const add = (a, b) => ({ az: a.az + b.az, el: a.el + b.el });
+  let ref, goal, refName;
+  if (key === 'windup') {
+    ref = { az: aim.az, el: aim.el };
+    goal = add(ref, sty.windup);
+    refName = 'target';
+  } else if (key === 'recover') {
+    if (!sty.recover.posed) return;
+    ref = { az: 0, el: 0 };
+    goal = { az: sty.recover.az, el: sty.recover.el };
+    refName = 'ahead';
+  } else {
+    const k = +key.slice(3);
+    if (!(k >= 0 && k < sty.cut.length)) return;
+    const start = add(add(aim, sty.windup), MELEE.cutThrough(sty, k - 1));
+    ref = start;
+    goal = add(start, sty.cut[k]);
+    refName = k === 0 ? 'windup' : `end of cut ${k}`;
+  }
+  const g = MELEE.strokeGoalPose(sty, melee, key, aim.az, aim.el);
+  const S = seed.S || 1;
+  const reachVox = g ? g.reach : 5;
+  const R = Math.max(2, reachVox) * S;
+  const sig = [key, aim.az, aim.el, ref.az, ref.el, goal.az, goal.el, reachVox,
+               seed.shoulder.x, seed.shoulder.y, seed.shoulder.z]
+    .map(v => (typeof v === 'number' ? v.toFixed(3) : v)).join('|');
+  if (sig === guideSig) return;
+  guideSig = sig;
+
+  // The rig's facing basis at heading 0 (weaponTick states it): right = -X.
+  const dir = (az, el) => AN.v3(-Math.cos(el) * Math.sin(az), Math.sin(el),
+                                Math.cos(el) * Math.cos(az));
+  const P = AN.vadd(seed.shoulder, lungeOffsetModel());
+  const at = (az, el, r) => AN.vadd(P, AN.vmul(dir(az, el), r));
+  const arr = v => [v.x, v.y, v.z];
+  const segs = [], labels = [];
+  const line = (a, b, color, alpha = 1) => segs.push({ a: arr(a), b: arr(b), color, alpha });
+  const arc = (fn, n, color) => {
+    let prev = fn(0);
+    for (let i = 1; i <= n; i++) { const p = fn(i / n); line(prev, p, color); prev = p; }
+  };
+  const C_REF = 0xdfe6ee, C_GOAL = 0xffc857, C_AZ = 0x4fd1ff, C_EL = 0xff6bd6;
+  const hex = c => '#' + c.toString(16).padStart(6, '0');
+  const deg = v => (v >= 0 ? '+' : '−') + Math.abs(Math.round(v * 180 / Math.PI)) + '°';
+  // reference and goal lines
+  line(P, at(ref.az, ref.el, R * 1.25), C_REF, 0.8);
+  labels.push({ pos: arr(at(ref.az, ref.el, R * 1.32)), text: refName, color: hex(C_REF) });
+  line(P, at(goal.az, goal.el, R), C_GOAL);
+  labels.push({ pos: arr(at(goal.az, goal.el, R * 1.08)),
+                text: `${key.startsWith('cut') ? 'cut ' + (+key.slice(3) + 1) + ' end' : key} · ${reachVox.toFixed(1)} vox`,
+                color: hex(C_GOAL) });
+  // azimuth: horizontal arc at the reference's elevation
+  const dAz = goal.az - ref.az, dEl = goal.el - ref.el;
+  const rAz = R * 0.55, rEl = R * 0.8;
+  const nAz = Math.max(4, Math.ceil(Math.abs(dAz) / 0.08));
+  if (Math.abs(dAz) > 1e-3) {
+    arc(t => at(ref.az + dAz * t, ref.el, rAz), nAz, C_AZ);
+    line(P, at(ref.az, ref.el, rAz), C_AZ);
+    line(P, at(goal.az, ref.el, rAz), C_AZ);
+  }
+  labels.push({ pos: arr(at(ref.az + dAz * 0.5, ref.el, rAz * 1.12)),
+                text: `az ${deg(dAz)}` + (Math.abs(dAz) > 1e-3 ? (dAz > 0 ? ' right' : ' left') : ''),
+                color: hex(C_AZ) });
+  // elevation: vertical arc at the goal's azimuth
+  const nEl = Math.max(4, Math.ceil(Math.abs(dEl) / 0.08));
+  if (Math.abs(dEl) > 1e-3) {
+    arc(t => at(goal.az, ref.el + dEl * t, rEl), nEl, C_EL);
+    line(P, at(goal.az, ref.el, rEl), C_EL, 0.6);
+  }
+  labels.push({ pos: arr(at(goal.az, ref.el + dEl * 0.5, rEl * 1.1)),
+                text: `el ${deg(dEl)}` + (Math.abs(dEl) > 1e-3 ? (dEl > 0 ? ' up' : ' down') : ''),
+                color: hex(C_EL) });
+  ed.setAngleGuide?.(segs, labels);
 }
 
 function renderAllPanels() {
