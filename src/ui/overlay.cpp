@@ -2232,19 +2232,12 @@ void Overlay::Draw(UIState& s) {
                   "Metres to the weapon side the guard rests at.");
           }
           if (ImGui::CollapsingHeader("Aim body binding")) {
-            f("aim yaw (deg)", &m.aimYaw, 0.0f, 180.0f, "%.0f");
+            f("aim yaw (deg)", &m.aimYaw, 0.0f, 90.0f, "%.0f");
             if (ImGui::IsItemHovered())
               ImGui::SetTooltip(
                   "Degrees the camera may lead the body's facing before\n"
-                  "the swing pins at the cone edge. 180 = camera IS the\n"
-                  "basis wherever it looks (old behaviour).");
-            f("aim release yaw (deg)", &m.aimReleaseYaw, 0.0f, 180.0f, "%.0f");
-            if (ImGui::IsItemHovered())
-              ImGui::SetTooltip(
-                  "Degrees before straight-behind over which the swing\n"
-                  "fades to the body's own forward — so a camera orbited\n"
-                  "to the character's face gets a swing that goes the\n"
-                  "way the character faces, not at the lens.");
+                  "the swing pins at the cone edge. A look behind the\n"
+                  "body is reflected to the front first.");
           }
           ImGui::EndChild();
           ImGui::EndTabItem();

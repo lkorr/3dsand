@@ -482,9 +482,6 @@ bool LoadTuning(const std::string& path, Tuning& out) {
     // group is generated from the .def by ReadDefRows(), which ran first.
     auto& e = out.melee;
     const std::string at = "melee";
-    // Same ceiling law as avatar.headLookReleaseYaw: a band wider than the
-    // reach past the cone would fade a swing that never reached its stop.
-    e.aimReleaseYaw = std::clamp(e.aimReleaseYaw, 0.0f, 180.0f - e.aimYaw);
     if (e.minSpeedMps >= e.fullSpeedMps) {
       out.warnings.push_back(at +
                              ".minSpeedMps >= fullSpeedMps; the damage ramp "
@@ -925,7 +922,6 @@ bool SaveCombatTuning(const std::string& path, const Tuning& t,
     put("leanMinSpeed", m.leanMinSpeed);
     put("flatMinSin", m.flatMinSin);
     put("aimYaw", m.aimYaw);
-    put("aimReleaseYaw", m.aimReleaseYaw);
   }
   if (group("combatfx", lo, hi)) {
     const Tuning::CombatFx& f = t.combatfx;

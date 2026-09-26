@@ -2015,17 +2015,14 @@ struct Tuning {
     // a flick is a read of intent, not a commitment gesture.
     float pickMinSpeed = TPD(melee, pickMinSpeed);
     // ---- the swing is bound to the BODY, like the head ---------------------
-    // The stroke basis handed to the driver is the camera's, yawed back toward
-    // the body's facing by the same law the neck uses (avatar.headLookYaw /
-    // headLookReleaseYaw): the camera may lead the body by `aimYaw` degrees;
-    // past that the swing stays pinned at the cone's edge; and across the last
-    // `aimReleaseYaw` degrees before straight-behind it fades to the body's own
-    // forward, so a camera orbited round to the character's face gets a swing
-    // that goes the way the character faces rather than at the lens. Pitch is
-    // never touched. Applied in game/thirdperson.h ResolveSwingBasis; a cone of
-    // 180 is the old behaviour (the camera IS the basis, wherever it looks).
+    // The camera's yaw relative to the body is folded before it aims a
+    // strike: a look BEHIND is reflected to the front across the body's
+    // left-right axis (150 deg right swings 30 deg right; straight behind
+    // swings straight ahead), then the camera may lead the body by `aimYaw`
+    // degrees and past that the swing pins at the cone's edge. Pitch is never
+    // touched. Applied in game/thirdperson.h ResolveSwingYaw; a cone of 90+
+    // leaves only the reflection.
     float aimYaw = TPD(melee, aimYaw);
-    float aimReleaseYaw = TPD(melee, aimReleaseYaw);
     // ---- the body serves the swing (game/melee.h WeaponPose torso fields) --
     // Fractions of the stroke's own azimuth/elevation the torso carries, the
     // way `avatar.headLookSpine` shares the look yaw into the chest. 0 = arm

@@ -407,7 +407,6 @@
     "blockNudgeEl": 0.180000007,
     "pickMinSpeed": 250,
     "aimYaw": 70,
-    "aimReleaseYaw": 50,
     "torsoShare": 0.349999994,
     "torsoPitch": 0.200000003,
     "headClearM": 0.0599999987,

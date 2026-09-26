@@ -187,7 +187,7 @@ export function defaultMeleeTuning() {
 /**
  * melee.cpp:760 ApplyMeleeTuning — tuning.json's `melee` block -> MeleeTuning.
  *
- * `pickMinSpeed`/`aimYaw`/`aimReleaseYaw` are DELIBERATELY not
+ * `pickMinSpeed`/`aimYaw` are DELIBERATELY not
  * copied, exactly as in the engine: they are the controller's switches and the
  * swing-basis cone, read at the one site in main.cpp,
  * and a cached copy here could disagree across an F5. The Attacks panel reads
