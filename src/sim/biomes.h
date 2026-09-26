@@ -210,6 +210,15 @@ struct BiomeSet {
  */
 bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& mats,
                   BiomeSet& out, std::string& log);
+/**
+ * The same, with ONE biome file read from `overridePath` instead of
+ * assets/biomes/<overrideStem>.json (appended if no such file exists). The
+ * biome page's swatch (voxserve SWATCH, map-overhaul P7) renders the biome
+ * being edited before it is saved.
+ */
+bool LoadBiomeSet(const std::string& assetDir, const std::vector<MaterialDef>& mats,
+                  BiomeSet& out, std::string& log, const std::string& overrideStem,
+                  const std::string& overridePath);
 
 /**
  * Every check the tuner's `biomes` page makes, on the engine's side of the
@@ -261,7 +270,7 @@ uint32_t TreeChanceQ16(const BiomeDef& b, int latticeVox);
  * reload as one line so a moved world hash can be attributed to a changed
  * input without a bisect.
  *
- * The EDIT LAYER (tuning.json world.editLayer, assets/worldedits/<name>.svedit)
+ * The EDIT LAYER (map.json `editLayer` since P7, assets/worldedits/<name>.svedit)
  * is the fourth input: `edits` is sandvox::HashOneFile over that one file (0
  * when no layer is named or the file is missing), so saving an edit layer
  * marks a running game stale like any other environment save.

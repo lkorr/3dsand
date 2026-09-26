@@ -908,6 +908,5 @@ const TUNING_PARAMS = {
   'render.presentMode':{t:'i',def:1,min:0,max:2},
   'render.fpsCap':{t:'f',def:0,min:0,max:240},
   'world.mapLayer':{t:'s',def:"default"},
-  'world.editLayer':{t:'s',def:""},
 };
 if (typeof module !== 'undefined') module.exports = { TUNING_PARAMS };

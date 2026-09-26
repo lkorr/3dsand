@@ -916,6 +916,10 @@ const char* const kOrder[] = {
     // returns, but running it early would make any bug in that restore look
     // like a failure somewhere else (CLAUDE.md rule 7).
     "voxregion",
+    // Right after it and for the same reason: it regenerates the window with
+    // an edit layer installed and ticks it, then clears the layer and
+    // regenerates again before returning (selftest_voxregion.cpp).
+    "worldedit",
     "perf",
 };
 

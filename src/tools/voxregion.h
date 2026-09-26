@@ -93,6 +93,10 @@ struct VoxRegionReq {
   uint32_t nx = 64, ny = 64, nz = 64;
   uint32_t lod = 1;
   uint32_t seed = 1337;
+  // Patch the generated words with the process's edit layer (WorldEditLayer,
+  // map-overhaul P7) — what the game does to every chunk it generates. Off
+  // only for the biome swatch, whose synthetic map has no layer.
+  bool applyEdits = true;
 };
 
 // Generates the region and writes the 'SVVX' binary into `out`. False + `err`
@@ -130,10 +134,60 @@ int RunVoxDump(GpuContext& ctx, World& world, Simulation& sim,
 //   PING                       -> "OK 0 0"
 //   QUIT                       -> exits 0
 //
+// Map-overhaul P7 (the edit layer as worldgen, and the engine's biome swatch).
+// Commands that name two paths separate them with '|' (a path may contain
+// spaces, never a pipe):
+//
+//   LAYER <@map | - | name>    which edit layer REGION applies: the map's
+//                              (map.json editLayer, the default), none, or
+//                              assets/worldedits/<name>.svedit. Sticky; the
+//                              file is re-read whenever it changes on disk.
+//   EDITS RESOLVE <seed> <in>|<out>   any .svedit -> v1 ABSOLUTE at <seed>
+//                                     (what the viewer edits)
+//   EDITS RELATIVE <seed> <in>|<out>  any .svedit -> v2 GROUND-RELATIVE, the
+//                                     offsets taken against <seed>'s ground
+//   EXPORT <seed> <saveDir>|<out>     a save's stored chunks, diffed against
+//                                     the generator -> a v2 .svedit
+//   SWATCH <biome> <seed> <sizeVox> <biomeJson>|<out>
+//                              the biome as the ENGINE makes it: a synthetic
+//                              one-biome map, sizeVox square, as an 'SVSW'
+//                              bundle of SVVX regions (BuildBiomeSwatch)
+//
 // RELOAD is what makes a slider move the world: worldgen reads tuning through
 // CurrentTuning(), so a live server would otherwise answer forever with the
 // parameters it booted on. The tuner sends it after every save.
 int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
                 const std::vector<MaterialDef>& mats);
+
+// ---- the edit-layer export (map-overhaul P7) ------------------------------
+// Every chunk a save stores (ChunkStore at `saveDir`), diffed against what
+// genChunk makes of it at `seed`, written as a ground-relative .svedit to
+// `outPath`. Stamp/excite scratch bits are ignored and GAS cells are skipped
+// (smoke drifting through is not an edit). `report` says what was found.
+// Needs the GPU (genChunk is WGSL); the window and page table are clobbered.
+bool ExportSaveEdits(GpuContext& ctx, World& world, Simulation& sim,
+                     const std::vector<MaterialDef>& mats, const std::string& saveDir,
+                     uint32_t seed, const std::string& outPath, std::string& report);
+// `--export-edits <saveDir>,<layerName>[,seed]`: ExportSaveEdits into
+// assets/worldedits/<layerName>.svedit, then exit. The in-game half is F9 (save).
+int RunExportEdits(GpuContext& ctx, World& world, Simulation& sim,
+                   const std::vector<MaterialDef>& mats, const std::string& spec);
+
+// ---- the biome swatch (map-overhaul P7) ---------------------------------
+// A square of ONE biome as the engine generates it: the loaded map with every
+// cell painted `biomeName` (flat landform, mid moisture, no sites — the
+// synthetic map the env-truth gate measures), the biome file optionally read
+// from `biomeJson` (the page's unsaved copy), `sizeVox` wide around the real
+// map's spawn. Written as:
+//
+//   0 'SVSW'  4 u32 version (1)  8 u32 regionCount  12 i32 x0  16 i32 y0
+//   20 i32 z0  24 u32 sizeVox  28 u32 lod, then per region: u32 bytes, SVVX blob
+//
+// The real environment is restored afterwards (ReloadEnvironment).
+bool BuildBiomeSwatch(GpuContext& ctx, World& world, Simulation& sim,
+                      const std::vector<MaterialDef>& mats, const std::string& biomeName,
+                      const std::string& biomeJson, uint32_t seed, uint32_t sizeVox,
+                      std::vector<uint8_t>& out, std::string& err);
+constexpr uint32_t kBiomeSwatchMagic = 0x57535653u;  // 'SVSW'
 
 }  // namespace sandvox

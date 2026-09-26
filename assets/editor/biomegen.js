@@ -1,4 +1,4 @@
-/* biomegen.js — the biome DATA MODEL and the swatch that shows it.
+/* biomegen.js — the biome DATA MODEL.
  *
  * WHAT A BIOME IS HERE. A named region type that owns FEATURE STACKS: which
  * ground cover it wears, which tree species grow in it and how densely, which
@@ -27,73 +27,20 @@
  * relief, cover, trees, caves and water; envlive.js is the per-field manifest
  * of what is read and what is not yet, and the tuner says so on the page.
  *
- * PURE MODULE: no DOM, no fetch. The swatch composer imports treegen.js and
- * watergen.js, both pure, so `scripts/test_environment.mjs` runs all of it
- * under Node.
+ * PURE MODULE: no DOM, no fetch, so `scripts/test_environment.mjs` runs all
+ * of it under Node.
+ *
+ * THE SWATCH IS THE ENGINE'S (map-overhaul P7). This file used to compose the
+ * biome page's swatch itself — its own ground noise, its own tree stamping,
+ * its own cover — which was a picture the engine never makes. The page now
+ * asks the voxel server for the real thing (tuner_server.py /api/biomeswatch
+ * -> --voxserve SWATCH: a synthetic one-biome map through genChunk), and that
+ * composer and its noise are gone.
  */
 
 'use strict';
 
-import * as TG from './treegen.js';
-import * as WG from './watergen.js';
-
 export const DEFAULT_VOX_PER_M = 10;
-export const MAX_SWATCH = 384;      // cells per side
-export const MAX_SWATCH_H = 320;     // a great oak is ~270 cells tall at 10 vpm
-
-/** The swatch sizes the biome page offers, metres. Up to 32 m the swatch is
- *  1:1 with the engine (10 vpm); past that it bakes COARSER — see
- *  swatchScale — so a whole biome fits the cell budget. */
-export const SWATCH_SIZES_M = [16, 24, 32, 48, 64, 96, 128];
-
-/** The bake scale (voxels per metre) for a swatch `sizeM` metres on a side:
- *  the finest INTEGER vpm that keeps the side within MAX_SWATCH cells.
- *
- *  WHY A SCALE LADDER AND NOT A BIGGER GRID. The swatch is one dense
- *  nx*ny*nz Uint16 volume, copied twice more on the way to the screen (the
- *  viewer's own cells and the mesher's lent copy) and once into a 3D texture.
- *  At 10 vpm a 24 m forest swatch is 240x280x240 = 16M cells = 32 MB per copy;
- *  the 96 m view the tab exists to give would be 16x that per copy, over
- *  2 GB in flight, before the mesher touched it. Baking at 4 vpm instead puts
- *  96 m into 384 cells and the same ~30M-cell budget as the old 32 m
- *  swatch. INTEGER because treegen bakes at integer vpm only (it rounds), so
- *  every species goes through the real generator at the same scale the
- *  ground does and the composition stays exact rather than resampled. The
- *  viewer draws the region with lod = 10 / vpm, so it lands in world metres.
- *
- *  10 vpm: 16, 24, 32 m; 8: 48 m; 6: 64 m; 4: 96 m; 3: 128 m. */
-export function swatchScale(sizeM, vpmFull) {
-  const full = Math.max(1, Math.round(vpmFull || DEFAULT_VOX_PER_M));
-  let v = full;
-  while (v > 1 && Math.round(sizeM * v) > MAX_SWATCH) v--;
-  return v;
-}
-
-/** Rewrite a swatch's cells IN PLACE from its local palette to engine
- *  material ids, by NAME, as the C++ loaders do (`matIds` = materials.json
- *  ids in order; air is 0, the first material is 1). Unknown names become
- *  air and are returned. After this `res.names` no longer describes
- *  `res.cells`; `res.remapped` says so. Lives here rather than in envui.js so
- *  the swatch worker, which has no DOM, can do it before the transfer. */
-export function remapToMaterials(res, matIds) {
-  const idOf = new Map();
-  (matIds || []).forEach((id, i) => idOf.set(id, i + 1));
-  const missing = [];
-  const remap = new Uint16Array(res.names.length + 1);
-  res.names.forEach((n, i) => {
-    const id = idOf.get(n);
-    if (id === undefined) missing.push(n);
-    remap[i + 1] = id || 0;
-  });
-  const cells = res.cells;
-  for (let i = 0; i < cells.length; i++) {
-    const w = cells[i];
-    if (w) cells[i] = (remap[w & 0xFFF] & 0xFFF) | (w & 0xF000);
-  }
-  res.remapped = true;
-  return missing;
-}
-
 // The biome ID SPACE, in id order. Since the world map's P1 this is the list
 // of assets/biomes/*.json files by `index` (0..N-1, contiguous), which the
 // engine packs into the worldMap buffer in this order; check_invariants.py
@@ -103,37 +50,6 @@ export function remapToMaterials(res, matIds) {
 // start (ids must be contiguous). Add a biome HERE and as a file together.
 export const ENGINE_BIOMES = ['forest', 'meadow', 'pine', 'desert',
                               'tundra', 'swamp', 'alpine', 'ocean'];
-
-// =============================================================================
-// hashing (lowbias32, as treegen/watergen)
-// =============================================================================
-function mix32(x) {
-  x = (x ^ (x >>> 16)) >>> 0; x = Math.imul(x, 0x7feb352d) >>> 0;
-  x = (x ^ (x >>> 15)) >>> 0; x = Math.imul(x, 0x846ca68b) >>> 0;
-  return (x ^ (x >>> 16)) >>> 0;
-}
-export function hashN(...vals) {
-  let h = 0x51ed270b;
-  for (const v of vals) h = mix32((h ^ ((v | 0) >>> 0)) >>> 0) ^ 0x85ebca6b;
-  return mix32(h);
-}
-const frand = (...v) => hashN(...v) / 4294967296;
-function smooth(t) { return t * t * (3 - 2 * t); }
-function vnoise2(x, z, seed) {
-  const xi = Math.floor(x), zi = Math.floor(z);
-  const fx = smooth(x - xi), fz = smooth(z - zi);
-  const a = frand(seed, xi, zi), b = frand(seed, xi + 1, zi);
-  const c = frand(seed, xi, zi + 1), d = frand(seed, xi + 1, zi + 1);
-  return (a + (b - a) * fx) * (1 - fz) + (c + (d - c) * fx) * fz;
-}
-function fbm2(x, z, oct, seed) {
-  let sum = 0, amp = 1, norm = 0;
-  for (let o = 0; o < oct; o++) {
-    sum += (vnoise2(x, z, seed + o * 131) * 2 - 1) * amp;
-    norm += amp; amp *= 0.5; x = x * 2 + 17.3; z = z * 2 - 9.1;
-  }
-  return sum / norm;
-}
 
 // =============================================================================
 // the data model
@@ -214,10 +130,11 @@ export function defaultBiome() {
     caves: {
       features: []                   // [{preset, threshold, rarity, conditions}]  (scaffold)
     },
+    // The page's preview size. Kept so existing files round-trip; the swatch
+    // is the engine's since P7 and reads only sizeM (the relief keys fed the
+    // deleted JS composer).
     swatch: {
-      sizeM: 24,                     // preview square, metres
-      reliefM: 1.6,                  // preview ground relief amplitude
-      reliefFreq: 1.0
+      sizeM: 24                      // preview square, metres
     }
   };
 }
@@ -352,355 +269,6 @@ export function validateBiome(biome, libs) {
     seen.add(s.species);
   }
   return bad;
-}
-
-// =============================================================================
-// the swatch — one biome composed into one voxel region
-// =============================================================================
-
-/** Compact nonzero-cell list of a generated tree, so stamping costs the tree's
- *  voxels rather than its bounding box (a great oak's box is 8M cells of which
- *  ~300k are tree). */
-function compactTree(res) {
-  const {x: nx, y: ny, z: nz} = res.dim;
-  const xs = [], ys = [], zs = [], ws = [];
-  for (let z = 0; z < nz; z++)
-    for (let y = 0; y < ny; y++) {
-      const row = (z * ny + y) * nx;
-      for (let x = 0; x < nx; x++) {
-        const w = res.cells[row + x];
-        if (w) { xs.push(x - res.anchor.x); ys.push(y); zs.push(z - res.anchor.z); ws.push(w); }
-      }
-    }
-  return {xs: Int16Array.from(xs), ys: Int16Array.from(ys), zs: Int16Array.from(zs),
-          ws: Uint16Array.from(ws), names: res.names, dim: res.dim, anchor: res.anchor};
-}
-
-/**
- * Compose a biome swatch.
- *
- * @param biome  normalised biome
- * @param libs   {water: {name: presetParams}, trees: {name: speciesParams}}
- * @param seed   integer
- * @param opts   {vpm, treeCache: Map, sizeM, noTrees, noWater, noCover, onTreeBake}
- *               `vpm` is the BAKE SCALE (see swatchScale); the caller draws the
- *               result at lod = engine vpm / opts.vpm. `onTreeBake(species,
- *               variant, vpm)` is called before each tree the cache does not
- *               have — the first swatch at a new scale bakes every species it
- *               places, seconds of work the page wants to name.
- * @returns {dim, cells, names, anchor, meta, vpm, plan}
- */
-export function generateSwatch(biome, libs, seed, opts) {
-  opts = opts || {};
-  const B = normalizeBiome(biome);
-  const vpm = opts.vpm || DEFAULT_VOX_PER_M;
-  const cellM = 1 / vpm;
-  const m2v = (m) => Math.round(m * vpm);
-  const sizeM = opts.sizeM || B.swatch.sizeM;
-  let N = Math.min(MAX_SWATCH, Math.max(16, m2v(sizeM)));
-  const names = [];
-  const idx = new Map();
-  const nameId = (nm) => {
-    if (!nm || nm === 'none') return 0;
-    let i = idx.get(nm);
-    if (i === undefined) { names.push(nm); i = names.length; idx.set(nm, i); }
-    return i;
-  };
-  const meta = {trees: {}, water: {}, cover: {}, skipped: {trees: 0, water: 0},
-                sizeM, dim: null, clipped: false, treesPlaced: 0, waterBodies: 0};
-
-  // ---- ground --------------------------------------------------------------
-  const rockV = 2;
-  const soilV = 8;
-  const reliefV = m2v(B.swatch.reliefM);
-  const base = rockV + soilV + reliefV + 26;      // headroom under the surface for basins
-  const h = new Int32Array(N * N);
-  const slope = new Uint16Array(N * N);
-  for (let z = 0; z < N; z++)
-    for (let x = 0; x < N; x++) {
-      const f = fbm2(x * cellM * B.swatch.reliefFreq / 6 + 4.2, z * cellM * B.swatch.reliefFreq / 6 - 1.7,
-                     4, seed ^ 0x2a);
-      h[z * N + x] = base + Math.round(f * reliefV);
-    }
-  for (let z = 0; z < N; z++)
-    for (let x = 0; x < N; x++) {
-      const x0 = Math.max(0, x - 1), x1 = Math.min(N - 1, x + 1);
-      const z0 = Math.max(0, z - 1), z1 = Math.min(N - 1, z + 1);
-      const gx = (h[z * N + x1] - h[z * N + x0]) / (x1 - x0);
-      const gz = (h[z1 * N + x] - h[z0 * N + x]) / (z1 - z0);
-      slope[z * N + x] = Math.min(4095, Math.round((Math.abs(gx) + Math.abs(gz)) * 256));
-    }
-  let hmax = 0;
-  for (let i = 0; i < N * N; i++) if (h[i] > hmax) hmax = h[i];
-
-  // ---- water bodies: decide instances first -----------------------------------
-  const bodies = [];
-  const waterPresets = libs.water || {};
-  if (!opts.noWater && opts.showcase) {
-    // SHOWCASE: one instance of every water row, regardless of rarity, the
-    // first centred and the rest spaced around it. A 24 m swatch at a real
-    // 1-in-4 x 44.8 m tile shows a pond one time in twenty, which is the
-    // truth about rarity and useless for judging a shoreline. The tab's
-    // "true rarity" toggle turns this off.
-    const rows = B.water.features.filter(f => waterPresets[f.preset] && f.rarity > 0);
-    rows.forEach((f, fi) => {
-      const P = WG.normalizeParams(waterPresets[f.preset], vpm);
-      const rh = hashN(seed, 0xb0a7 + fi, 0, 0);
-      const inst = WG.instanceOf(P, (rh >>> 3) ^ seed);
-      const reachV = Math.ceil(inst.reach * vpm);
-      let cx = N >> 1, cz = N >> 1;
-      if (fi > 0) {
-        const ang = (fi - 1) * 2.4 + 0.7;
-        const d = Math.min(N * 0.42, (bodies[0].reachV + reachV) * 1.1 + 2);
-        cx = Math.round(N / 2 + Math.cos(ang) * d); cz = Math.round(N / 2 + Math.sin(ang) * d);
-      }
-      const kx = Math.min(N - 1, Math.max(0, cx)), kz = Math.min(N - 1, Math.max(0, cz));
-      if (bodies.some(b => Math.hypot(b.cx - cx, b.cz - cz) < (b.reachV + reachV) * 1.02)) {
-        meta.skipped.water++; return;
-      }
-      bodies.push({P, I: inst, M: WG.paletteOf(P, names, idx), cx, cz, reachV, surf: h[kz * N + kx],
-                   seed: (rh >>> 3) ^ seed, preset: f.preset});
-    });
-  } else if (!opts.noWater) {
-    B.water.features.forEach((f, fi) => {
-      const src = waterPresets[f.preset];
-      if (!src || !f.rarity || f.tile <= 0) return;
-      const P = WG.normalizeParams(src, vpm);
-      const T = Math.max(8, m2v(f.tile));
-      const t0 = -1, t1 = Math.ceil(N / T);
-      for (let tz = t0; tz <= t1; tz++)
-        for (let tx = t0; tx <= t1; tx++) {
-          const rh = hashN(seed, 0xb0a7 + fi, tx, tz);
-          if (rh % f.rarity !== 0) continue;
-          const inst = WG.instanceOf(P, (rh >>> 3) ^ seed);
-          const reachV = Math.ceil(inst.reach * vpm);
-          // Jitter inside the tile, keeping the body inside it (Minecraft's
-          // in_square, with the inset the engine's pondInfo uses).
-          const room = Math.max(0, T - 2 * reachV - 2);
-          const cx = tx * T + reachV + 1 + (room ? (hashN(rh, 1) % room) : 0);
-          const cz = tz * T + reachV + 1 + (room ? (hashN(rh, 2) % room) : 0);
-          if (cx + reachV < 0 || cz + reachV < 0 || cx - reachV >= N || cz - reachV >= N) continue;
-          const kx = Math.min(N - 1, Math.max(0, cx)), kz = Math.min(N - 1, Math.max(0, cz));
-          const c = normalizeConditions(f.conditions);
-          if (slope[kz * N + kx] > c.maxSlope) { meta.skipped.water++; continue; }
-          const surf = h[kz * N + kx];
-          if (bodies.some(b => Math.hypot(b.cx - cx, b.cz - cz) < (b.reachV + reachV) * 1.05)) {
-            meta.skipped.water++; continue;
-          }
-          bodies.push({P, I: inst, M: WG.paletteOf(P, names, idx), cx, cz, reachV, surf,
-                       seed: (rh >>> 3) ^ seed, preset: f.preset});
-        }
-    });
-  }
-
-  // ---- allocate --------------------------------------------------------------
-  const treeLib = libs.trees || {};
-  let treeTop = 0;
-  const treeCache = opts.treeCache || new Map();
-  const speciesRows = opts.noTrees ? [] : B.trees.species.filter(s => s.weight > 0 && treeLib[s.species]);
-  const totalW = speciesRows.reduce((a, s) => a + s.weight, 0);
-  const treeOf = (species, variant) => {
-    const key = species + '#' + variant + '@' + vpm;
-    let t = treeCache.get(key);
-    if (!t) {
-      if (opts.onTreeBake) opts.onTreeBake(species, variant, vpm);
-      const res = TG.generateTree(treeLib[species], variant, {vpm});
-      t = compactTree(res);
-      treeCache.set(key, t);
-    }
-    return t;
-  };
-  if (totalW > 0)
-    for (const s of speciesRows) treeTop = Math.max(treeTop, treeOf(s.species, 0).dim.y);
-  let ny = hmax + Math.max(treeTop, 24) + 6;
-  if (ny > MAX_SWATCH_H) { ny = MAX_SWATCH_H; meta.clipped = true; }
-  const cells = new Uint16Array(N * ny * N);
-  const at = (x, y, z) => (z * ny + y) * N + x;
-  const put = (x, y, z, w) => { if (y >= 0 && y < ny && x >= 0 && x < N && z >= 0 && z < N) cells[at(x, y, z)] = w; };
-  const jitterOf = (x, z) => (hashN(seed, x, z, 0x33) % 3) << 12;
-  const solid = (id, x, z) => id ? (id | jitterOf(x, z)) : 0;
-  // The ground fill is most of the swatch's cells and the jitter depends on
-  // the column alone, so a column is one hash and one strided run of stores
-  // rather than one bounds-checked put() and one hash per cell — that was
-  // 313 ms of a 360 ms swatch. Same words in the same cells as solid()+put().
-  const fillCol = (x, z, y0, y1, id, jit) => {
-    const w = id ? id | jit : 0;   // an unresolved name writes AIR, exactly as solid() does
-    y0 = Math.max(0, y0); y1 = Math.min(ny - 1, y1);
-    for (let i = (z * ny + y0) * N + x, y = y0; y <= y1; y++, i += N) cells[i] = w;
-  };
-
-  const skin = nameId(B.cover.skin), subsoil = nameId(B.cover.subsoil), rock = nameId('stone');
-  const skinDepth = Math.max(1, B.cover.skinDepth | 0);
-  const zone = new Uint8Array(N * N);           // WG.ZONE values; 0 = plain land
-  const nearWater = new Float32Array(N * N).fill(1e9);   // metres to the nearest shoreline
-  const top = new Int32Array(N * N);            // topmost ground cell per column
-
-  // ---- ground + water columns -------------------------------------------------
-  for (let z = 0; z < N; z++)
-    for (let x = 0; x < N; x++) {
-      const pi = z * N + x;
-      const natural = h[pi];
-      let col = null, body = null;
-      for (const b of bodies) {
-        if (Math.abs(x - b.cx) > b.reachV + 60 || Math.abs(z - b.cz) > b.reachV + 60) continue;
-        const c = WG.columnAt(b.P, b.I, b.M, (x - b.cx) * cellM, (z - b.cz) * cellM, natural, b.surf, x, z, b.seed);
-        if (c) { col = c; body = b; break; }
-      }
-      const jit = jitterOf(x, z);
-      const rockTo = (yTop) => fillCol(x, z, 0, Math.min(rockV, yTop + 1) - 1, rock, jit);
-      // rock from rockV up to yEnd (exclusive), with the top soilV cells below
-      // `ref` as subsoil — the band hangs off the SURFACE, not off the skin's
-      // underside, which differs whenever skinDepth > 1 (the desert's sand).
-      const groundTo = (yEnd, ref) => {
-        fillCol(x, z, rockV, Math.min(yEnd, ref - soilV) - 1, rock, jit);
-        fillCol(x, z, Math.max(rockV, ref - soilV), yEnd - 1, subsoil, jit);
-      };
-      if (!col) {
-        rockTo(natural);
-        groundTo(natural - skinDepth + 1, natural);
-        fillCol(x, z, Math.max(rockV, natural - skinDepth + 1), natural, skin, jit);
-        top[pi] = natural;
-        continue;
-      }
-      zone[pi] = col.zone || 1;
-      if (col.floor >= 0) {
-        rockTo(col.bedBottom);
-        fillCol(x, z, rockV, col.bedBottom - 1, body.M.substrate, jit);
-        fillCol(x, z, Math.max(rockV, col.bedBottom), col.floor, col.bed, jit);
-        if (col.waterTop >= 0) {
-          fillCol(x, z, col.floor + 1, col.waterTop, body.M.fill, WG.LIQ_FULL << 12);
-          if (col.surfSkin) put(x, col.waterTop, z, solid(col.surfSkin, x, z));
-          nearWater[pi] = 0;
-        }
-        top[pi] = col.waterTop >= 0 ? col.waterTop : col.floor;
-        meta.water[body.preset] = (meta.water[body.preset] || 0) + (col.waterTop >= 0 ? 1 : 0);
-      } else {
-        rockTo(col.top);
-        groundTo(col.top, col.top);
-        // The body's own skin (mud, moss) wins on its fringe; plain land keeps the biome skin.
-        const sk = (col.skin && col.skin !== body.M.skin) ? col.skin : skin;
-        put(x, col.top, z, solid(sk, x, z));
-        top[pi] = col.top;
-        nearWater[pi] = Math.max(0, (col.u - 1) * body.I.R);
-      }
-      for (const pl of col.plants) {
-        fillCol(x, z, pl.y0, pl.y1, pl.id, jit);
-        if (pl.y1 >= pl.y0) meta.cover[pl.name] = (meta.cover[pl.name] || 0) + 1;
-      }
-    }
-  meta.waterBodies = bodies.length;
-  for (const b of bodies) meta.water[b.preset + ' (bodies)'] = (meta.water[b.preset + ' (bodies)'] || 0) + 1;
-
-  // Distance to water for the conditions: a cheap two-pass chamfer over the
-  // shoreline seeds (exact enough for a 1-in-N gate at metre resolution).
-  {
-    const INF = 1e9;
-    for (let z = 0; z < N; z++)
-      for (let x = 0; x < N; x++) {
-        const pi = z * N + x;
-        let d = nearWater[pi];
-        if (x > 0) d = Math.min(d, nearWater[pi - 1] + cellM);
-        if (z > 0) d = Math.min(d, nearWater[pi - N] + cellM);
-        if (x > 0 && z > 0) d = Math.min(d, nearWater[pi - N - 1] + cellM * 1.414);
-        nearWater[pi] = d;
-      }
-    for (let z = N - 1; z >= 0; z--)
-      for (let x = N - 1; x >= 0; x--) {
-        const pi = z * N + x;
-        let d = nearWater[pi];
-        if (x < N - 1) d = Math.min(d, nearWater[pi + 1] + cellM);
-        if (z < N - 1) d = Math.min(d, nearWater[pi + N] + cellM);
-        if (x < N - 1 && z < N - 1) d = Math.min(d, nearWater[pi + N + 1] + cellM * 1.414);
-        nearWater[pi] = d >= INF ? INF : d;
-      }
-  }
-
-  const passes = (c, pi, yTop) => {
-    if (c.minY >= 0 && yTop < c.minY) return false;
-    if (c.maxY >= 0 && yTop > c.maxY) return false;
-    if (slope[pi] > c.maxSlope) return false;
-    if (c.nearWaterMax >= 0 && nearWater[pi] > c.nearWaterMax) return false;
-    if (c.nearWaterMin > 0 && nearWater[pi] < c.nearWaterMin) return false;
-    return true;
-  };
-
-  // ---- ground cover plants -------------------------------------------------------
-  if (!opts.noCover) {
-    const patch = B.cover.patch;
-    const pcell = 1 << Math.max(1, Math.min(10, patch.cellLog2 | 0));
-    B.cover.plants.forEach((pl, k) => {
-      const id = nameId(pl.material), head = nameId(pl.head);
-      if (!id || pl.chance <= 0) return;
-      const hV = Math.max(1, m2v(pl.height));
-      for (let z = 0; z < N; z++)
-        for (let x = 0; x < N; x++) {
-          const pi = z * N + x;
-          if (zone[pi]) continue;                       // a water body's fringe owns its plants
-          if (hashN(seed, 0xc0 + k, x, z) % pl.chance !== 0) continue;
-          const thr = Math.max(patch.threshold | 0, pl.conditions.patchThreshold | 0);
-          if (thr > 0) {
-            const nz = vnoise2(x / pcell + k * 7.3, z / pcell - k * 2.1, seed ^ (0x300 + k)) * 255;
-            if (nz <= thr) continue;
-          }
-          if (!passes(pl.conditions, pi, top[pi])) continue;
-          const y0 = top[pi] + 1;
-          for (let y = y0; y < y0 + hV; y++) put(x, y, z, solid(id, x, z));
-          if (head) put(x, y0 + hV, z, solid(head, x, z));
-          meta.cover[pl.material] = (meta.cover[pl.material] || 0) + 1;
-        }
-    });
-  }
-
-  // ---- trees ---------------------------------------------------------------------
-  if (totalW > 0 && B.trees.density > 0) {
-    const T = Math.max(4, m2v(B.trees.tile));
-    const remap = new Map();   // species -> Uint16Array(local palette -> swatch palette)
-    for (let tz = 0; tz * T < N; tz++)
-      for (let tx = 0; tx * T < N; tx++) {
-        const rh = hashN(seed, 0x7bee, tx, tz);
-        if (rh % 100 >= B.trees.density) continue;
-        // Weighted draw, then the species' own conditions gate — a gated-out
-        // pick grows NOTHING rather than re-rolling, exactly as the engine does.
-        let roll = hashN(rh, 5) % totalW, row = speciesRows[0];
-        for (const s of speciesRows) { if (roll < s.weight) { row = s; break; } roll -= s.weight; }
-        const x = tx * T + (hashN(rh, 6) % T), z = tz * T + (hashN(rh, 7) % T);
-        if (x >= N || z >= N) continue;
-        const pi = z * N + x;
-        if (zone[pi]) { meta.skipped.trees++; continue; }   // not in water or on its fringe
-        if (!passes(row.conditions, pi, top[pi])) { meta.skipped.trees++; continue; }
-        const sp = treeLib[row.species];
-        const c = sp.placement || {};
-        if ((c.maxSlope | 0) > 0 && c.maxSlope < 1024 && slope[pi] > c.maxSlope) { meta.skipped.trees++; continue; }
-        const variant = hashN(rh, 8) % Math.max(1, Math.min(3, sp.variants | 0 || 1));
-        const t = treeOf(row.species, variant);
-        let rm = remap.get(row.species + variant);
-        if (!rm) {
-          rm = new Uint16Array(t.names.length + 1);
-          t.names.forEach((nm, i) => { rm[i + 1] = nameId(nm); });
-          remap.set(row.species + variant, rm);
-        }
-        const y0 = top[pi] + 1;
-        // Rotation: 4 yaw steps from the hash, as the engine's tree sampler does.
-        const rot = hashN(rh, 9) & 3;
-        for (let i = 0; i < t.ws.length; i++) {
-          let dx = t.xs[i], dz = t.zs[i];
-          if (rot === 1) { const q = dx; dx = -dz; dz = q; }
-          else if (rot === 2) { dx = -dx; dz = -dz; }
-          else if (rot === 3) { const q = dx; dx = dz; dz = -q; }
-          const w = t.ws[i];
-          put(x + dx, y0 + t.ys[i], z + dz, rm[w & 0xFFF] | (w & 0xF000));
-        }
-        meta.trees[row.species] = (meta.trees[row.species] || 0) + 1;
-        meta.treesPlaced++;
-      }
-  }
-
-  let voxels = 0;
-  for (let i = 0; i < cells.length; i++) if (cells[i]) voxels++;
-  meta.voxels = voxels;
-  meta.dim = {x: N, y: ny, z: N};
-  return {dim: {x: N, y: ny, z: N}, cells, names, anchor: {x: N >> 1, y: base, z: N >> 1}, meta, vpm,
-          plan: {zone, top, nearWater, slope, N}};
 }
 
 // =============================================================================

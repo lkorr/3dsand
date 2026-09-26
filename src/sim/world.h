@@ -3658,7 +3658,17 @@ struct WorldSnapshot {
   // path proves "every tick since the window was filled had its dirty flags
   // folded" by walking these (Stream::FoldSnapshot, PLAN_save_system.md S1).
   uint32_t submitSeq = 0;
-  std::vector<uint8_t> dirtyFlags;    // per-chunk next-tick dirty (kNumChunks)
+  // Per-chunk next-tick dirty (kNumChunks). Nonzero = dirty; the VALUE says
+  // one more thing: World::kDirtyMutateOnly when the only reason bit set was
+  // DIRTY_R_MUTATE (an op landed, the CA did nothing else there that tick),
+  // 1 otherwise. Every consumer but Stream's modified fold only tests != 0;
+  // the fold uses the distinction to keep the authored edit layer's own ops
+  // from marking a chunk modified (sim/worldedit.h, map-overhaul P7).
+  std::vector<uint8_t> dirtyFlags;
+  // The raw DIRTY_R_* word of ONE slot, World::SetDirtyWatch's (0 unset). An
+  // attribution instrument (CLAUDE.md rule 6): dirtyFlags keeps one bit of
+  // the reason, and "why is THIS chunk awake" needs all of them.
+  uint32_t watchReason = 0;
   // Per-chunk support-loss flags (kNumChunks): the sim saw a supporting voxel
   // (solid/powder) vacate next to a solid there since the last readback.
   // One-shot: the GPU buffer is cleared after each copy. Feeds island checks.
@@ -4053,6 +4063,12 @@ class World {
   // materialization set and not a latency knob. K must stay <= that gap; both
   // are 4 today.
   static constexpr uint32_t kSnapshotLatency = 4;
+  // WorldSnapshot::dirtyFlags value for "dirty, and DIRTY_R_MUTATE (common.wgsl,
+  // 256) was the only reason". The mirror of that WGSL constant is here and
+  // only here; the `worldedit` gate fails if a MUTATE-only chunk is not
+  // reported with it.
+  static constexpr uint32_t kDirtyReasonMutate = 256u;
+  static constexpr uint8_t kDirtyMutateOnly = 2;
 
   // The fixed-latency pipeline, counted. `waits` is the kill criterion of N1:
   // a tick that had to BLOCK for the snapshot it is contractually owed. Never
@@ -4198,6 +4214,8 @@ class World {
   // (the readback is unconditional since N1), counted BEFORE the ring can
   // decline — so a tick with no snapshot is a visible hole in submitSeq.
   uint32_t TicksEncoded() const { return ticksEncoded_; }
+  // Which slot WorldSnapshot::watchReason reports (UINT32_MAX = none).
+  void SetDirtyWatch(uint32_t slot) { dirtyWatch_ = slot; }
   uint32_t SnapshotEpoch() const { return snapEpoch_; }
   const std::deque<WorldSnapshot>& DeliveredUnpublished() const { return ready_; }
   const SnapshotPipeStats& SnapshotPipe() const { return snapPipe_; }
@@ -4792,6 +4810,7 @@ class World {
   // the future".
   uint32_t snapEpoch_ = 0;
   uint32_t ticksEncoded_ = 0;  // see TicksEncoded(); monotonic, never reset
+  uint32_t dirtyWatch_ = 0xFFFFFFFFu;  // SetDirtyWatch
   uint32_t lastEncodeTick_ = 0;
   bool haveEncodeTick_ = false;
   SnapshotPipeStats snapPipe_;

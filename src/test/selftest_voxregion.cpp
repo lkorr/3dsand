@@ -31,10 +31,13 @@
 #include <string>
 #include <vector>
 
+#include "sim/faredits.h"
 #include "sim/pagetable.h"
+#include "sim/stream.h"
 #include "sim/worldedit.h"
 #include "test/selftest.h"
 #include "test/support.h"
+#include "test/tickrig.h"
 #include "tools/voxregion.h"
 
 using namespace sandvox;
@@ -280,6 +283,7 @@ Status GateVoxRegion(Ctx& c, std::string& detail) {
     WorldEdits layer;
     std::string e;
     check(layer.Load(p.string(), e), "layer load: " + e);
+    layer.Resolve(kDefaultSeed);   // v1 is absolute: the seed changes nothing
     check(layer.VoxelCount() == 1 && layer.ChunkCount() == 1,
           "layer holds " + std::to_string(layer.VoxelCount()) + " voxels in " +
           std::to_string(layer.ChunkCount()) + " chunks");
@@ -353,7 +357,7 @@ Status GateVoxRegion(Ctx& c, std::string& detail) {
     // into whatever now owns that slot.
     WorldEdits far;
     far.Load(p.string(), e);
-    far.QueueChunk({wc.x + (int)kNChunk * 4, wc.y, wc.z});
+    far.QueueChunk({wc.x + (int)kNChunk * 4, wc.y, wc.z}, kDefaultSeed);
     std::vector<CellOp> none;
     check(far.Drain(world, none, 64) == 0 && none.empty(),
           "an out-of-window chunk emitted ops");
@@ -391,11 +395,256 @@ Status GateVoxRegion(Ctx& c, std::string& detail) {
   return failures ? Status::Fail : Status::Pass;
 }
 
+// ============================ worldedit =====================================
+//
+// The edit layer AS WORLDGEN (map-overhaul P7, sim/worldedit.h). Four claims,
+// each one a thing the layer did not do before P7:
+//
+//   A. GROUND-RELATIVE. A v2 file's cells land at TerrainHeight + dy for the
+//      seed they are resolved at — and follow the ground to another seed —
+//      while a v1 file's cells stay where they were written.
+//   B. THE VOXEL SERVER APPLIES IT. A region dump holds the layer's word at
+//      the layer's cell; with applyEdits off it does not.
+//   C. THE FAR FIELD SEES IT. A layer cell that is a cascade sample center is
+//      in FarEdits' patch for that level chunk as the BASE, and the base
+//      survives the Clear a load or regen makes.
+//   D. IT IS NOT A MODIFICATION. The window regenerated with the layer
+//      installed, ticked through THE tick: the layer's word is in the grid,
+//      and the chunk it went into is NOT in the stream's modified set, so a
+//      save does not bake it and an eviction lets genChunk + the layer
+//      re-derive it. The fold's exemption is counted, so a pass that never
+//      exercised it cannot pass.
+//
+// The layer is installed in the PROCESS layer (WorldEditLayer) for B and D
+// and cleared, with the window regenerated, before returning: no later gate
+// may see a layer (a layer moves the world hash by construction).
+Status GateWorldEdit(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const IVec3 origin = world.WindowOrigin();
+  const uint32_t seed = kDefaultSeed;
+  int failures = 0;
+  std::string notes;
+  auto check = [&](bool ok, const std::string& msg) {
+    if (!ok) { failures++; notes += (notes.empty() ? "" : "; ") + msg; }
+  };
+
+  // The column: the window's middle, off the chunk grid's faces so the layer
+  // chunk's neighbours are all resident.
+  const int x = origin.x * (int)kChunk + (int)kWorldN / 2 + 5;
+  const int z = origin.z * (int)kChunk + (int)kWorldN / 2 + 9;
+  const int h = World::TerrainHeight(x, z, seed);
+  const int y0 = origin.y * (int)kChunk;
+  // BURIED: 12 cells into the ground, so the layer's wood has rock all round
+  // it and nothing in the CA has a reason to touch the chunk after the op.
+  const int dyBuried = -12;
+  const uint32_t wood = PackVoxNew(2, 1);
+  if (h + dyBuried - 2 < y0 || h + 2 >= y0 + (int)kWorldN) {
+    detail = Format("fixture column (%d,%d) ground %d is outside the window's y range", x, z, h);
+    std::printf("worldedit: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  // A cascade sample center at level 1 near the same ground, for C.
+  const int shift1 = (int)(1 + kFarShiftBase);
+  const int step1 = 1 << shift1, half1 = step1 >> 1;
+  const int cx1 = ((x >> shift1) << shift1) + half1;
+  const int cz1 = ((z >> shift1) << shift1) + half1;
+  const int cy1 = (((h - 4) >> shift1) << shift1) + half1;
+
+  // ---- A: the writers and the resolve ---------------------------------------
+  const std::string relPath = "selftest_worldedit_rel.svedit";
+  const std::string absPath = "selftest_worldedit_abs.svedit";
+  std::vector<WorldEdits::AbsCell> cells = {
+      {x, h + dyBuried, z, wood},
+      {cx1, cy1, cz1, wood},
+  };
+  std::string e;
+  check(WorldEdits::WriteRelative(relPath, cells, seed, e), "WriteRelative: " + e);
+  check(WorldEdits::WriteAbsolute(absPath, cells, seed, e), "WriteAbsolute: " + e);
+  {
+    WorldEdits rel;
+    check(rel.Load(relPath, e) && rel.Relative(), "v2 load: " + e);
+    rel.Resolve(seed);
+    std::vector<WorldEdits::AbsCell> got;
+    rel.ResolvedCells(got);
+    bool found = false;
+    for (const auto& g : got) found |= (g.x == x && g.y == h + dyBuried && g.z == z && g.word == wood);
+    check(found, Format("v2 cell did not resolve to (%d,%d,%d) at seed %u", x, h + dyBuried, z, seed));
+    // Another seed: the cell follows ITS ground.
+    const uint32_t seed2 = seed + 7919u;
+    const int h2 = World::TerrainHeight(x, z, seed2);
+    rel.Resolve(seed2);
+    rel.ResolvedCells(got);
+    found = false;
+    for (const auto& g : got) found |= (g.x == x && g.y == h2 + dyBuried && g.z == z);
+    check(found, Format("v2 cell did not follow the ground to seed %u (ground %d -> %d)", seed2, h, h2));
+    WorldEdits abs;
+    check(abs.Load(absPath, e) && !abs.Relative(), "v1 load: " + e);
+    abs.Resolve(seed2);
+    abs.ResolvedCells(got);
+    found = false;
+    for (const auto& g : got) found |= (g.x == x && g.y == h + dyBuried && g.z == z);
+    check(found, "a v1 (absolute) cell moved with the seed");
+  }
+
+  // ---- B: the voxel server applies the layer --------------------------------
+  WorldEditLayer().Clear();
+  check(WorldEditLayer().Load(relPath, e), "process layer load: " + e);
+  auto dumpCell = [&](bool apply, uint32_t& word) {
+    VoxRegionReq req;
+    req.ox = (x >> 4) << 4;
+    req.oy = ((h + dyBuried) >> 4) << 4;
+    req.oz = (z >> 4) << 4;
+    req.nx = req.ny = req.nz = 16;
+    req.lod = 1;
+    req.seed = seed;
+    req.applyEdits = apply;
+    std::vector<uint8_t> blob;
+    std::string err, why;
+    if (!BuildVoxRegion(ctx, world, sim, req, blob, err)) { check(false, "region: " + err); return false; }
+    std::vector<uint32_t> grid;
+    VoxRegionReq head{};
+    if (!DecodeRegion(blob, head, grid, why)) { check(false, "region decode: " + why); return false; }
+    const int lx = x - req.ox, ly = h + dyBuried - req.oy, lz = z - req.oz;
+    word = grid[((size_t)lz * 16 + ly) * 16 + lx] & ~kStampBits;
+    return true;
+  };
+  uint32_t withLayer = 0, without = 0;
+  if (dumpCell(true, withLayer) && dumpCell(false, without)) {
+    check(withLayer == wood, Format("region with the layer holds 0x%08x at the layer cell, want 0x%08x", withLayer, wood));
+    check(without != wood, "the bare-worldgen region already holds the layer's word: the fixture proves nothing");
+  }
+
+  // ---- C: the far field's base ----------------------------------------------
+  {
+    FarEdits fe;
+    WorldEditLayer().Resolve(seed);
+    WorldEditLayer().SeedFarField(fe);
+    const IVec3 lc{cx1 >> (shift1 + 4), cy1 >> (shift1 + 4), cz1 >> (shift1 + 4)};
+    const uint32_t ci = (uint32_t)((((cz1 >> shift1) & 15) * 16 + ((cy1 >> shift1) & 15)) * 16 +
+                                   ((cx1 >> shift1) & 15));
+    auto hasPatch = [&]() {
+      const std::vector<uint32_t>* p = fe.Lookup(1, lc);
+      if (!p) return false;
+      for (uint32_t w : *p)
+        if ((w & FarEdits::kCellMask) == ci && (w >> FarEdits::kCellBits) == (wood & 0xFFFu)) return true;
+      return false;
+    };
+    check(hasPatch(), "the layer's sample-center cell is not in the far field's level-1 patch");
+    fe.Clear();   // what a load / regen does
+    check(hasPatch(), "the far-field base did not survive Clear()");
+  }
+
+  // ---- D: applied as worldgen, not as a modification -------------------------
+  //
+  // The claim is about the LAYER, so the fixture chunk must be one the world
+  // leaves alone WITHOUT it: a freshly generated window still has settling and
+  // staining chunks (measured: a buried chunk near wet soil reported
+  // DIRTY_R_STAINW every tick), and those are modified whatever the layer
+  // does. So each candidate column is first run as a CONTROL arm — regen with
+  // no layer, the same ticks — and the first whose buried chunk stays
+  // unmodified is the fixture. Then the same regen and ticks WITH a layer
+  // that puts wood in that chunk.
+  uint64_t ignored = 0;
+  {
+    const int nTicks = (int)World::kSnapshotLatency + 8;
+    // Regenerate the window, tick it, and return the slot's modified flag plus
+    // a "seq:reason:modified" trace (reason = the raw DIRTY_R_* word, hex).
+    auto arm = [&](IVec3 wc, std::string& trace) {
+      c.stream.OnRegen();
+      world.SetWindowOrigin(origin);
+      SubmitWorldgen(ctx, world, sim, seed);   // queues the layer, if any (QueueWindow)
+      ctx.WaitIdle();
+      const uint32_t slot = World::SlotChunkIndex(wc);
+      support::TickRig rig(c, 90000u, wc);
+      world.SetDirtyWatch(slot);
+      trace.clear();
+      for (int i = 0; i < nTicks; i++) {
+        support::RunTicks(rig, 1);
+        const WorldSnapshot& sn = world.Snap();
+        trace += Format("%s%u:%x:%u", trace.empty() ? "" : " ", sn.valid ? sn.submitSeq : 0u,
+                        sn.valid ? sn.watchReason : 0xFFFFu,
+                        (uint32_t)c.stream.ModifiedFlags()[slot]);
+      }
+      world.SetDirtyWatch(0xFFFFFFFFu);
+      ctx.WaitIdle();
+      return c.stream.ModifiedFlags()[slot] != 0;
+    };
+    const int cand[][2] = {{5, 9}, {-70, 41}, {93, -60}, {-121, -110}, {141, 133}, {29, -150},
+                           {-150, 150}, {150, -150}};
+    int xD = 0, zD = 0, hD = 0;
+    bool found = false;
+    std::string controls;
+    WorldEditLayer().Clear();
+    for (const auto& cd : cand) {
+      const int cx = origin.x * (int)kChunk + (int)kWorldN / 2 + cd[0];
+      const int cz = origin.z * (int)kChunk + (int)kWorldN / 2 + cd[1];
+      const int ch = World::TerrainHeight(cx, cz, seed);
+      if (ch + dyBuried - 2 < y0 || ch + 2 >= y0 + (int)kWorldN) continue;
+      std::string tr;
+      const bool mod = arm({cx >> 4, (ch + dyBuried) >> 4, cz >> 4}, tr);
+      controls += Format("%s(%d,%d):%s", controls.empty() ? "" : " ", cx, cz, mod ? "busy" : "quiet");
+      if (!mod) { xD = cx; zD = cz; hD = ch; found = true; break; }
+    }
+    std::printf("worldedit: D control arms (no layer): %s\n", controls.c_str());
+    check(found, "no candidate column had a quiet buried chunk without the layer: " + controls);
+    if (found) {
+      const std::string dPath = "selftest_worldedit_d.svedit";
+      check(WorldEdits::WriteRelative(dPath, {{xD, hD + dyBuried, zD, wood}}, seed, e),
+            "D layer write: " + e);
+      WorldEditLayer().Clear();
+      check(WorldEditLayer().Load(dPath, e), "D layer load: " + e);
+      const IVec3 wc{xD >> 4, (hD + dyBuried) >> 4, zD >> 4};
+      const uint32_t slot = World::SlotChunkIndex(wc);
+      const uint64_t ignored0 = c.stream.LayerWakesIgnored();
+      std::string trace;
+      const bool mod = arm(wc, trace);
+      ignored = c.stream.LayerWakesIgnored() - ignored0;
+      std::string seqs;
+      for (uint32_t s : WorldEditLayer().AppliedSeqs()) seqs += Format("%s%u", seqs.empty() ? "" : ",", s);
+      std::printf("worldedit: D layer arm at (%d,%d): trace (snapSeq:reason:modified) %s | layer "
+                  "applied at seqs [%s]\n",
+                  xD, zD, trace.c_str(), seqs.c_str());
+      std::vector<uint32_t> words(kChunkVol);
+      ReadVoxelsSync(ctx, world, slot, 1, words.data(), "worldeditD");
+      const uint32_t li = (uint32_t)(xD & 15) + (uint32_t)((hD + dyBuried) & 15) * kChunk +
+                          (uint32_t)(zD & 15) * kChunk * kChunk;
+      check((words[li] & 0xFFFu) == (wood & 0xFFFu),
+            Format("after the ticks the layer cell holds material %u, not the layer's %u",
+                   words[li] & 0xFFFu, wood & 0xFFFu));
+      check(ignored > 0, "the modified fold never saw the layer's own wake (nothing exempted)");
+      check(!mod, "the layer's chunk is in the stream's modified set (its control arm was not): "
+                  "a save would bake the layer into it");
+      std::error_code ec;
+      std::filesystem::remove(dPath, ec);
+    }
+  }
+
+
+  // ---- restore: no layer, a pristine window ----------------------------------
+  WorldEditLayer().Clear();
+  c.stream.OnRegen();
+  world.SetWindowOrigin(origin);
+  SubmitWorldgen(ctx, world, sim, seed);
+  ctx.WaitIdle();
+  std::error_code ec;
+  std::filesystem::remove(relPath, ec);
+  std::filesystem::remove(absPath, ec);
+
+  detail = Format("column (%d,%d) ground %d; layer wakes exempted %llu; %d checks failed%s%s",
+                  x, z, h, (unsigned long long)ignored, failures, failures ? " — " : "",
+                  notes.c_str());
+  std::printf("worldedit: %s (%s)\n", failures ? "FAIL" : "PASS", detail.c_str());
+  return failures ? Status::Fail : Status::Pass;
+}
+
 }  // namespace
 
 const std::vector<Gate>& VoxRegionGates() {
   static const std::vector<Gate> g = {
       {"voxregion", "tools", {}, false, GateVoxRegion},
+      {"worldedit", "tools", {}, false, GateWorldEdit},
   };
   return g;
 }

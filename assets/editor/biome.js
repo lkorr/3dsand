@@ -4,9 +4,12 @@
  * (assets/biomes/<name>.json) as sections — climate & identity, the relief
  * (the height curve and the hill / detail / grain multipliers), ground cover,
  * trees, water, caves — and the right column is a SWATCH: a square of the
- * biome composed by biomegen.js from the same files the engine will read
- * (tree species from assets/trees/, water presets from assets/water/), drawn
- * through WorldView.
+ * biome AS THE ENGINE GENERATES IT (map-overhaul P7) — the page's biome JSON,
+ * saved or not, posted to the tuner server, which has --voxserve paint a
+ * synthetic one-biome copy of the map and run the real genChunk over it
+ * (tools/voxregion.h BuildBiomeSwatch). It used to be composed by
+ * biomegen.js with its own noise, trees and cover: a picture the engine never
+ * made. Drawn through WorldView.
  *
  * WHAT IS LIVE AND WHAT IS NOT is one table, assets/editor/envlive.js, and
  * every field on this page goes through envui.liveMark with its JSON path:
@@ -47,15 +50,16 @@ let genTimer = 0;
 let seed = 1;
 let framed = false;
 let libs = {water: {}, trees: {}};
-let treeCache = new Map();
-let view = {trees: true, water: true, cover: true, showcase: true, sizeM: 96};
+let view = {sizeM: 96};
 let lastSwatch = null;
-// The swatch is composed in swatch_worker.js (see there for why). One request
-// in flight; a request made while one is running waits as `queued` and
-// replaces any earlier waiter, so a slider drag costs at most one extra
-// compose. `null` = not tried yet, `false` = the worker could not be built and
-// the page composes inline as it did before.
-let swatchWorker = null, swatchReq = 0, swatchBusy = false, swatchQueued = null;
+// One swatch request in flight; a request made while one is running waits as
+// `queued` and replaces any earlier waiter, so a slider drag costs at most one
+// extra render.
+let swatchReq = 0, swatchBusy = false, swatchQueued = null;
+// The swatch sizes offered, metres. The engine picks the sample lod from the
+// size (BuildBiomeSwatch: the side stays within 384 samples), shown per size.
+const SWATCH_SIZES_M = [16, 24, 32, 48, 64, 96, 128];
+const swatchLod = (m) => { let l = 1; while (Math.round(m * vpm() / 16) * 16 / l > 384 && l < 16) l *= 2; return l; };
 
 const vpm = () => (H.voxelsPerMetre && H.voxelsPerMetre()) || BG.DEFAULT_VOX_PER_M;
 
@@ -80,8 +84,6 @@ async function loadLibs() {
     }
   }
   libs = out;
-  treeCache = new Map();
-  if (swatchWorker) swatchWorker.postMessage({cmd: 'libs', libs});
   return libs;
 }
 
@@ -113,95 +115,84 @@ async function readBiome(name) {
 /* ===========================================================================
  * the swatch
  * ======================================================================== */
-function ensureWorker() {
-  if (swatchWorker !== null) return swatchWorker;
-  try {
-    const w = new Worker(new URL('./swatch_worker.js', import.meta.url), {type: 'module'});
-    w.onmessage = (e) => onSwatch(e.data);
-    // A module worker that fails to LOAD reports here, not in the constructor;
-    // fall back to composing inline and answer the request that was waiting.
-    w.onerror = (e) => {
-      console.error('biome: swatch worker failed, composing inline', e && e.message);
-      if (swatchWorker === w) { swatchWorker = false; swatchBusy = false; }
-      const q = swatchQueued; swatchQueued = null;
-      if (q) composeInline(q);
-    };
-    w.postMessage({cmd: 'libs', libs});
-    swatchWorker = w;
-  } catch (e) {
-    console.error('biome: no swatch worker, composing inline', e);
-    swatchWorker = false;
-  }
-  return swatchWorker;
-}
-
-function composeInline(req) {
-  // Yield a frame so the status paints before a multi-second tree bake.
-  setTimeout(() => {
-    const t0 = performance.now();
-    try {
-      const res = BG.generateSwatch(req.biome, libs, req.seed, Object.assign({treeCache}, req.opts));
-      const missing = BG.remapToMaterials(res, req.matIds);
-      onSwatch({cmd: 'swatch', id: req.id, res, missing, ms: performance.now() - t0});
-    } catch (e) {
-      onSwatch({cmd: 'error', id: req.id, error: String(e && e.stack || e)});
+// 'SVSW' (tools/voxregion.h): u32 magic, version, count, i32 x0, y0, z0,
+// u32 sizeVox, lod; then per region u32 bytes + an 'SVVX' blob, decoded here
+// to the (material | state << 12) Uint16 cells WorldView draws.
+function decodeSwatch(buf) {
+  const d = new DataView(buf);
+  if (d.getUint32(0, true) !== 0x57535653) throw new Error('not an SVSW swatch');
+  const count = d.getUint32(8, true);
+  const x0 = d.getInt32(12, true), y0 = d.getInt32(16, true), z0 = d.getInt32(20, true);
+  const size = d.getUint32(24, true), lod = d.getUint32(28, true);
+  const regions = [], hist = new Map();
+  let p = 32;
+  for (let r = 0; r < count; r++) {
+    const bytes = d.getUint32(p, true); p += 4;
+    const q = p;
+    if (d.getUint32(q, true) !== 0x58565653) throw new Error('region ' + r + ' is not SVVX');
+    const ox = d.getInt32(q + 8, true), oy = d.getInt32(q + 12, true), oz = d.getInt32(q + 16, true);
+    const nx = d.getUint32(q + 20, true), ny = d.getUint32(q + 24, true), nz = d.getUint32(q + 28, true);
+    const runs = d.getUint32(q + 48, true);
+    const cells = new Uint16Array(nx * ny * nz);
+    let o = 0;
+    for (let i = 0; i < runs; i++) {
+      const w = d.getUint32(q + 64 + i * 8, true), n = d.getUint32(q + 68 + i * 8, true);
+      const c = (w & 0xFFF) | (((w >>> 12) & 15) << 12);
+      if (w & 0xFFF) hist.set(w & 0xFFF, (hist.get(w & 0xFFF) || 0) + n);
+      cells.fill(c, o, o + n);
+      o += n;
     }
-  }, 0);
+    regions.push({cells, nx, ny, nz, lod, origin: [ox - x0, oy - y0, oz - z0]});
+    p = q + bytes;
+  }
+  return {regions, size, lod, origin: [x0, y0, z0], hist};
 }
 
-function requestSwatch() {
+async function requestSwatch() {
   if (!biome) return;
-  const req = {
-    cmd: 'swatch', id: ++swatchReq, biome, seed,
-    matIds: (H.materials() || []).map(m => m.id),
-    opts: {vpm: BG.swatchScale(view.sizeM, vpm()), sizeM: view.sizeM, showcase: view.showcase,
-           noTrees: !view.trees, noWater: !view.water, noCover: !view.cover}
-  };
-  els.stats.innerHTML = '<span class="warn">composing…</span>';
-  const w = ensureWorker();
-  if (!w) { composeInline(req); return; }
-  if (swatchBusy) { swatchQueued = req; return; }
+  if (swatchBusy) { swatchQueued = true; return; }
   swatchBusy = true;
-  w.postMessage(req);
+  const id = ++swatchReq;
+  els.stats.innerHTML = '<span class="warn">rendering in the engine…</span>';
+  const t0 = performance.now();
+  const sizeVox = Math.round(view.sizeM * vpm() / 16) * 16;
+  try {
+    const r = await fetch('/api/biomeswatch?name=' + encodeURIComponent(biome.name) + '&seed=' + seed +
+                          '&size=' + sizeVox, {method: 'POST', body: JSON.stringify(biome)});
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.error || ('HTTP ' + r.status));
+    }
+    const res = decodeSwatch(await r.arrayBuffer());
+    if (id === swatchReq) onSwatch(res, performance.now() - t0);
+  } catch (e) {
+    if (id === swatchReq) els.stats.textContent = 'swatch failed: ' + (e && e.message || e);
+  } finally {
+    swatchBusy = false;
+    if (swatchQueued) { swatchQueued = false; requestSwatch(); }
+  }
 }
 
-function onSwatch(m) {
-  if (m.cmd === 'progress') {
-    if (m.id === swatchReq) els.stats.innerHTML = '<span class="warn">composing… ' + m.text + '</span>';
-    return;
-  }
-  swatchBusy = false;
-  const q = swatchQueued; swatchQueued = null;
-  if (q && swatchWorker) { swatchBusy = true; swatchWorker.postMessage(q); }
-  if (m.id !== swatchReq) return;            // superseded while it ran
-  if (m.cmd === 'error') {
-    els.stats.textContent = 'swatch failed: ' + m.error;
-    console.error(m.error);
-    return;
-  }
-  const res = m.res;
+function onSwatch(res, ms) {
   lastSwatch = res;
-  const full = vpm();
-  const lod = full / res.vpm;                // bake cells -> world voxels
   if (wv) {
-    wv.setLocalRegions([{cells: res.cells, nx: res.dim.x, ny: res.dim.y, nz: res.dim.z,
-                         origin: [0, 0, 0], lod}]);
+    wv.setLocalRegions(res.regions);
     if (!framed) {
-      UI.frame(wv, {x: res.dim.x * lod, y: res.dim.y * lod, z: res.dim.z * lod}, [0, 0, 0], 0.3);
+      let ymax = 0;
+      for (const g of res.regions) ymax = Math.max(ymax, g.origin[1] + g.ny * g.lod);
+      UI.frame(wv, {x: res.size, y: ymax, z: res.size}, [0, 0, 0], 0.3);
       wv.cam.pitch = -0.6; framed = true;
     }
   }
-  const mt = res.meta;
-  const fmt = (o) => Object.entries(o).map(([k, v]) => k + ' ' + v).join(', ') || '—';
-  const scale = res.vpm === full ? '1:1' : `1:${(full / res.vpm).toFixed(full % res.vpm ? 1 : 0)}`;
+  const mats = H.materials() || [];
+  const nameOf = (id) => (mats[id - 1] && mats[id - 1].id) || ('#' + id);
+  const top = [...res.hist.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10)
+      .map(([m, n]) => nameOf(m) + ' ' + n.toLocaleString()).join(', ');
+  const scale = res.lod === 1 ? '1:1' : `1:${res.lod} (${Math.round(10 * res.lod)} cm samples)`;
   els.stats.innerHTML =
-    `<b>${res.dim.x}×${res.dim.y}×${res.dim.z}</b> cells · ${view.sizeM} m at ${res.vpm} vpm (${scale}, ` +
-    `${Math.round(100 / res.vpm)} cm cells) · ${mt.voxels.toLocaleString()} voxels · ${Math.round(m.ms)} ms` +
-    (mt.clipped ? ' · <span class="warn">HEIGHT CLIPPED</span>' : '') +
-    `<br>trees: ${fmt(mt.trees)}` + (mt.skipped.trees ? ` <span class="warn">(${mt.skipped.trees} gated out)</span>` : '') +
-    `<br>water: ${fmt(mt.water)}` + (view.showcase && mt.waterBodies ? ' <span class="warn">(showcase — one of each, not true rarity)</span>' : '') +
-    `<br>cover: ${fmt(mt.cover)}` +
-    (m.missing.length ? '<br><span class="warn">materials.json has no ' + m.missing.join(', ') + '</span>' : '');
+    `<b>${view.sizeM} m</b> of ${biome.name} as the ENGINE generates it (a one-biome copy of the map, ` +
+    `at the map's spawn, seed ${seed}) · ${scale} · ${res.regions.length} region(s) · ${Math.round(ms)} ms` +
+    `<br>samples: ${top || '—'}`;
   validateInto(els.valid);
 }
 
@@ -647,12 +638,6 @@ function buildPanel() {
     addLabel: '+ cave band'
   });
   col.append(s.wrap);
-
-  // ---- swatch settings -----------------------------------------------------------------------
-  s = UI.section(el, CLS, 'Swatch', 'Preview-only: the ground the swatch stands on.', {closed: true});
-  UI.row(C, s.body, {k: 'reliefM', n: 'relief (m)', min: 0, max: 8, step: 0.1, u: 'm', d: 'Ground noise amplitude in the swatch. Not the engine’s terrain.'}, 'swatch');
-  UI.row(C, s.body, {k: 'reliefFreq', n: 'relief freq', min: 0.2, max: 4, step: 0.1, d: ''}, 'swatch');
-  col.append(s.wrap);
 }
 
 /* ===========================================================================
@@ -759,18 +744,13 @@ export function attach(hooks) {
   els.valid = el('div', {class: CLS + 'valid'});
   els.seed = el('input', {type: 'number', class: CLS + 'num', value: '1', style: 'width:56px', min: '0', max: '9999'});
   els.size = el('select', {class: CLS + 'num', style: 'width:110px',
-                            title: 'Swatch side. Up to 32 m the swatch is 1:1 with the engine; bigger swatches bake ' +
-                                   'coarser (the cell size shown) so a whole biome fits — see biomegen.swatchScale.'});
-  BG.SWATCH_SIZES_M.forEach(m => {
-    const v = BG.swatchScale(m, vpm());
-    els.size.append(el('option', {value: m}, m + ' m · ' + (v === vpm() ? '1:1' : Math.round(100 / v) + ' cm')));
+                            title: 'Swatch side. The engine renders it; past 38 m it samples coarser ' +
+                                   '(a majority per block, the voxel view\'s lod) so a whole biome fits.'});
+  SWATCH_SIZES_M.forEach(m => {
+    const l = swatchLod(m);
+    els.size.append(el('option', {value: m}, m + ' m · ' + (l === 1 ? '1:1' : (10 * l) + ' cm')));
   });
   els.size.value = String(view.sizeM);
-  const tog = (key, label, title) => {
-    const b = el('button', {class: view[key] ? 'on' : '', title}, label);
-    b.addEventListener('click', () => { view[key] = !view[key]; b.classList.toggle('on', view[key]); regenerate(true); });
-    return b;
-  };
   const cv = el('canvas', {class: CLS + 'view'});
 
   els.save.addEventListener('click', () => saveBiome());
@@ -800,11 +780,7 @@ export function attach(hooks) {
     el('div', {class: CLS + 'right'},
       el('div', {class: CLS + 'bar'},
          el('span', {class: 'hint'}, 'swatch'), els.size,
-         el('span', {class: 'hint'}, 'seed'), els.seed,
-         tog('trees', 'trees', 'compose the tree stack'),
-         tog('water', 'water', 'compose the water stack'),
-         tog('cover', 'cover', 'compose the ground cover'),
-         tog('showcase', 'showcase water', 'ON: one of every water row, centred — judge the shoreline. OFF: true tile + rarity — on a 24 m swatch usually nothing, on a 96–128 m swatch the real picture.')),
+         el('span', {class: 'hint'}, 'seed'), els.seed),
       cv, els.stats));
 
   wv = UI.makeView(cv, H.materials() || [], () => root.classList.contains('active') && H.isVisible(),

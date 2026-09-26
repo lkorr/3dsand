@@ -5,12 +5,23 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
+#include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
+#include "sim/biomes.h"
+#include "sim/chunkstore.h"
+#include "sim/mattable.h"
 #include "sim/pagetable.h"
+#include "sim/stream.h"      // RleDecodeChunk
+#include "sim/treeatlas.h"
 #include "sim/tuning.h"
+#include "sim/worldedit.h"
+#include "sim/worldgen_run.h"
+#include "sim/worldmap.h"
 #include "test/support.h"
 
 namespace sandvox {
@@ -186,6 +197,18 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
                  cdz = (uint32_t)(ez / kChunk);
   const IVec3 cmin{FloorDiv16(req.ox), FloorDiv16(req.oy), FloorDiv16(req.oz)};
 
+  // ---- THE EDIT LAYER (sim/worldedit.h, map-overhaul P7). The region is what
+  // the game spawns into, and the game patches every generated chunk with the
+  // layer, so the dump does too — per chunk, on the words as they are read
+  // back, before the downsample. (The viewer used to composite the layer on
+  // the client, which could not see a ground-relative layer's resolution and
+  // drew edits the game would put somewhere else.)
+  WorldEdits* edits = nullptr;
+  if (req.applyEdits && !WorldEditLayer().Empty()) {
+    WorldEditLayer().Resolve(req.seed);
+    edits = &WorldEditLayer();
+  }
+
   // ---- place the window and reset the pool.
   //
   // The origin is the box's own min chunk, so every chunk of the box is
@@ -283,8 +306,14 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
     verdict.resize(n);
     rhi::ReadbackBlocking(ctx.device, ctx.queue, world.genAct, 0, verdict.data(),
                           (size_t)n * 4, "voxVerdict");
+    auto boxChunk = [&](uint32_t boxIdx) {
+      return IVec3{cmin.x + (int)(boxIdx % cdx), cmin.y + (int)((boxIdx / cdx) % cdy),
+                   cmin.z + (int)(boxIdx / (cdx * cdy))};
+    };
     auto skyChunk = [&](uint32_t i) {
       const uint32_t v = verdict[i];
+      // A sky chunk the edit layer builds into is not sky any more.
+      if (edits && edits->HasChunk(boxChunk(order[base + i]))) return false;
       return (v & kGenVerdictValid) != 0u &&
              ((v >> kGenVerdictClassShift) & kGenVerdictClassMask) == kGenVerdictEmpty;
     };
@@ -306,7 +335,8 @@ bool BuildVoxRegion(GpuContext& ctx, World& world, Simulation& sim,
         const uint32_t boxIdx = order[base + k + r];
         const uint32_t cx = boxIdx % cdx, cy = (boxIdx / cdx) % cdy,
                        cz = boxIdx / (cdx * cdy);
-        const uint32_t* src = scratch.data() + (size_t)r * kChunkVol;
+        uint32_t* src = scratch.data() + (size_t)r * kChunkVol;
+        if (edits) edits->ApplyToChunk(boxChunk(boxIdx), src);
         // Sample origin of this chunk inside the grid.
         const uint32_t sx0 = cx * spc, sy0 = cy * spc, sz0 = cz * spc;
         for (uint32_t sk = 0; sk < spc; sk++)
@@ -445,6 +475,280 @@ bool ParseReq(const std::vector<long long>& v, VoxRegionReq& req) {
 
 }  // namespace
 
+// ---------------------------------------------------------------------------
+// map-overhaul P7: the export, the swatch, and the helpers they share.
+
+namespace {
+
+// Generate `chunks` — all inside the residency window whose min chunk is
+// `origin`, so every one has its own slot — and hand each chunk's words to
+// `fn`. Pages are recycled batch by batch exactly as BuildVoxRegion does; this
+// is the same genChunk the game fills its window with.
+void GenerateChunks(GpuContext& ctx, World& world, Simulation& sim, uint32_t seed,
+                    IVec3 origin, const std::vector<IVec3>& chunks,
+                    const std::function<void(IVec3, const uint32_t*)>& fn) {
+  world.SetWindowOrigin(origin);
+  world.pages->SetWorldSeed(seed);
+  world.InvalidateSnapshot();
+  {
+    TickParams tp{0, seed, 0, 0};
+    tp.origin[0] = origin.x;
+    tp.origin[1] = origin.y;
+    tp.origin[2] = origin.z;
+    tp.labMode = World::LabWorld() ? 1u : 0u;
+    ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
+  }
+  world.pages->ResetAllEmpty(ctx.queue);
+  {
+    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+    sim.EncodeWorldgen(enc, /*denseGen=*/false);
+    ctx.queue.Submit(enc.Finish());
+  }
+  const uint32_t kBatch = std::min(2048u, std::max(64u, world.pages->PoolPages() / 2u));
+  std::vector<uint32_t> words(kChunkVol);
+  for (size_t base = 0; base < chunks.size(); base += kBatch) {
+    const uint32_t n = (uint32_t)std::min<size_t>(kBatch, chunks.size() - base);
+    std::vector<uint32_t> slots(n);
+    for (uint32_t k = 0; k < n; k++) {
+      slots[k] = World::SlotChunkIndex(chunks[base + k]);
+      world.pages->EnsurePageForOverwrite(slots[k]);
+    }
+    world.pages->FlushTableWrites(ctx.queue);
+    sim.WriteGenList(ctx.queue, slots);
+    TickParams gp{};
+    gp.seed = seed;
+    gp.genCount = n;
+    gp.origin[0] = origin.x;
+    gp.origin[1] = origin.y;
+    gp.origin[2] = origin.z;
+    gp.labMode = World::LabWorld() ? 1u : 0u;
+    ctx.queue.WriteBuffer(world.tickUBO, 0, &gp, sizeof(gp));
+    {
+      rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+      sim.EncodeGenList(enc, n);
+      ctx.queue.Submit(enc.Finish());
+    }
+    for (uint32_t k = 0; k < n; k++) {
+      ReadVoxelsSync(ctx, world, slots[k], 1, words.data(), "exportGen");
+      fn(chunks[base + k], words.data());
+    }
+    if (base + n < chunks.size()) world.pages->ResetAllEmpty(ctx.queue);
+  }
+}
+
+// Bits that are per-tick scratch (stamp 16..18, excite 19..23) or a transient
+// CPU flag (31): a stored chunk and a generated one may differ there without
+// the world differing.
+constexpr uint32_t kDurableBits = ~(0x00FF0000u | kCellOpIfAir);
+
+// "a|b" -> {a, b}. The two-path commands' separator (voxregion.h).
+bool SplitPaths(const std::string& s, std::string& a, std::string& b) {
+  const size_t bar = s.find('|');
+  if (bar == std::string::npos) return false;
+  a = s.substr(0, bar);
+  b = s.substr(bar + 1);
+  while (!b.empty() && b.back() == ' ') b.pop_back();
+  return !a.empty() && !b.empty();
+}
+
+}  // namespace
+
+bool ExportSaveEdits(GpuContext& ctx, World& world, Simulation& sim,
+                     const std::vector<MaterialDef>& mats, const std::string& saveDir,
+                     uint32_t seed, const std::string& outPath, std::string& report) {
+  if (!world.pages) { report = "export needs paged residency"; return false; }
+  ChunkStore store;
+  store.Tables().SetRunning(MaterialNameTableOf(mats));
+  if (!store.BindLoad(saveDir)) { report = "cannot open save " + saveDir; return false; }
+  // Grouped by 32-chunk window block (std::map: deterministic order), so each
+  // group generates inside one window without two chunks sharing a slot.
+  std::map<std::tuple<int, int, int>, std::vector<std::pair<IVec3, std::vector<uint32_t>>>> groups;
+  size_t stored = 0;
+  store.ForEachStored([&](IVec3 wc, const uint32_t* rle, size_t pairs) {
+    const int s = 5;   // log2 kNChunk
+    static_assert(kNChunk == 32, "ExportSaveEdits groups by 32-chunk blocks");
+    groups[{wc.x >> s, wc.y >> s, wc.z >> s}].push_back(
+        {wc, std::vector<uint32_t>(rle, rle + pairs * 2)});
+    stored++;
+  });
+  std::vector<WorldEdits::AbsCell> cells;
+  size_t chunksDiffer = 0, gasSkipped = 0, badRle = 0;
+  std::vector<uint32_t> cur(kChunkVol);
+  for (const auto& g : groups) {
+    const IVec3 origin{std::get<0>(g.first) * (int)kNChunk, std::get<1>(g.first) * (int)kNChunk,
+                       std::get<2>(g.first) * (int)kNChunk};
+    std::vector<IVec3> list;
+    for (const auto& e : g.second) list.push_back(e.first);
+    size_t idx = 0;
+    GenerateChunks(ctx, world, sim, seed, origin, list, [&](IVec3 wc, const uint32_t* gen) {
+      const auto& e = g.second[idx++];
+      if (!RleDecodeChunk(e.second.data(), e.second.size() / 2, cur.data())) { badRle++; return; }
+      bool any = false;
+      for (uint32_t i = 0; i < kChunkVol; i++) {
+        const uint32_t a = cur[i] & kDurableBits, b = gen[i] & kDurableBits;
+        if (a == b) continue;
+        const uint32_t m = a & 0xFFFu;
+        if (m < mats.size() && mats[m].gpu.klass == CLASS_GAS) { gasSkipped++; continue; }
+        cells.push_back({wc.x * (int)kChunk + (int)(i % kChunk),
+                         wc.y * (int)kChunk + (int)((i / kChunk) % kChunk),
+                         wc.z * (int)kChunk + (int)(i / (kChunk * kChunk)), a});
+        any = true;
+      }
+      if (any) chunksDiffer++;
+    });
+  }
+  char buf[256];
+  std::snprintf(buf, sizeof buf,
+                "%zu stored chunks, %zu differ from the generator: %zu cells exported "
+                "(%zu gas cells skipped, %zu undecodable chunks)",
+                stored, chunksDiffer, cells.size(), gasSkipped, badRle);
+  report = buf;
+  // The diff is against the generator AS IT IS NOW (this process's map, seed
+  // `seed`). A save made under another map or generator differs wherever the
+  // two disagree, and all of that lands in the layer; say which map it was.
+  report += " against map '" + worldmap::CurrentWorldMap().name + "' seed " + std::to_string(seed);
+  std::string err;
+  if (!WorldEdits::WriteRelative(outPath, cells, seed, err)) { report += "; " + err; return false; }
+  return true;
+}
+
+int RunExportEdits(GpuContext& ctx, World& world, Simulation& sim,
+                   const std::vector<MaterialDef>& mats, const std::string& spec) {
+  // <saveDir>,<layerName>[,seed]
+  std::vector<std::string> parts;
+  {
+    size_t p = 0;
+    while (p <= spec.size()) {
+      const size_t q = spec.find(',', p);
+      parts.push_back(spec.substr(p, q == std::string::npos ? std::string::npos : q - p));
+      if (q == std::string::npos) break;
+      p = q + 1;
+    }
+  }
+  if (parts.size() < 2 || parts[0].empty() || parts[1].empty() ||
+      parts[1].find_first_of("/\\:.") != std::string::npos) {
+    std::fprintf(stderr, "--export-edits wants <saveDir>,<layerName>[,seed] (a bare layer name)\n");
+    return 1;
+  }
+  const uint32_t seed = parts.size() >= 3 ? (uint32_t)std::strtoul(parts[2].c_str(), nullptr, 10)
+                                          : (uint32_t)kDefaultSeed;
+  const std::string out = AssetDir() + "/worldedits/" + parts[1] + ".svedit";
+  std::string report;
+  const bool ok = ExportSaveEdits(ctx, world, sim, mats, parts[0], seed, out, report);
+  std::printf("export-edits: %s -> %s: %s\n", parts[0].c_str(), ok ? out.c_str() : "(nothing written)",
+              report.c_str());
+  return ok ? 0 : 1;
+}
+
+bool BuildBiomeSwatch(GpuContext& ctx, World& world, Simulation& sim,
+                      const std::vector<MaterialDef>& mats, const std::string& biomeName,
+                      const std::string& biomeJson, uint32_t seed, uint32_t sizeVox,
+                      std::vector<uint8_t>& out, std::string& err) {
+  const std::string dir = AssetDir();
+  sizeVox = std::clamp<uint32_t>((sizeVox + 15u) & ~15u, 64u, 2048u);
+  biomes::BiomeSet set;
+  std::string log;
+  const bool loaded = biomeJson.empty() || biomeJson == "-"
+                          ? biomes::LoadBiomeSet(dir, mats, set, log)
+                          : biomes::LoadBiomeSet(dir, mats, set, log, biomeName, biomeJson);
+  if (!loaded) { err = "biome files did not load: " + log; return false; }
+  const biomes::BiomeDef* bd = nullptr;
+  for (const biomes::BiomeDef& b : set.biomes)
+    if (b.name == biomeName) bd = &b;
+  if (!bd) { err = "no biome named '" + biomeName + "'"; return false; }
+  if (bd->index < 0) {
+    err = "'" + biomeName + "' is not an engine biome (index -1): worldgen has no slot for it";
+    return false;
+  }
+  TreeAtlas atlas;
+  if (!LoadTreeAtlas(dir + "/trees", mats, set, atlas, log)) {
+    err = "tree atlas did not load: " + log;
+    return false;
+  }
+  const worldmap::WorldMapData real = worldmap::CurrentWorldMap();   // a COPY
+  if (!real.Loaded()) { err = "no world map loaded"; return false; }
+
+  // ---- the synthetic one-biome map: the env-truth gate's recipe ------------
+  worldmap::WorldMapData syn = real;
+  std::fill(syn.biome.begin(), syn.biome.end(), static_cast<uint8_t>(bd->index));
+  std::fill(syn.landform.begin(), syn.landform.end(), static_cast<uint8_t>(128));   // "flat"
+  std::fill(syn.moisture.begin(), syn.moisture.end(), static_cast<uint8_t>(128));
+  syn.sites.clear();
+  syn.siteIndex.assign(syn.siteIndex.size(), 0);
+  syn.padX0 = syn.padZ0 = 0;
+  syn.padX1 = syn.padZ1 = -1;
+  syn.name = "swatch:" + biomeName;
+  syn.contentHash = 0x9E3779B9u * static_cast<uint32_t>(bd->index + 1);
+  std::vector<uint32_t> words;
+  if (!worldmap::PackWorldMap(set, syn, words, log)) { err = "swatch map did not pack: " + log; return false; }
+  worldmap::SetCurrentWorldMap(syn);   // the CPU twin (TerrainHeight) sees it too
+  ctx.WaitIdle();
+  sim.UploadEnvironment(ctx.device, ctx.queue, atlas, words);
+
+  // ---- the box: sizeVox square around the real spawn, the ground's band ----
+  const int x0 = (real.spawnX - (int)sizeVox / 2) & ~15;
+  const int z0 = (real.spawnZ - (int)sizeVox / 2) & ~15;
+  int hmin = 1 << 30, hmax = -(1 << 30);
+  for (uint32_t dz = 0; dz <= sizeVox; dz += 8)
+    for (uint32_t dx = 0; dx <= sizeVox; dx += 8) {
+      const int h = World::TerrainHeight(x0 + (int)dx, z0 + (int)dz, seed);
+      hmin = std::min(hmin, h);
+      hmax = std::max(hmax, h);
+    }
+  // Down past the skin and the sediment wedge; up past the tallest crown the
+  // atlas holds (a great oak is ~270 cells at 10 vpm).
+  const int y0 = (hmin - 48) & ~15;
+  const int y1 = ((hmax + 320) + 15) & ~15;
+  const uint32_t height = (uint32_t)std::min(y1 - y0, 1024);
+  uint32_t lod = 1;
+  while (std::max(sizeVox, height) / lod > 384u && lod < kVoxRegionMaxLod) lod *= 2;
+  const uint32_t tile = std::min(kVoxRegionMaxSamples * lod, kWorldN);
+
+  out.assign(32, 0);
+  uint32_t count = 0;
+  bool ok = true;
+  for (uint32_t ty = 0; ty < height && ok; ty += tile)
+    for (uint32_t tz = 0; tz < sizeVox && ok; tz += tile)
+      for (uint32_t tx = 0; tx < sizeVox && ok; tx += tile) {
+        VoxRegionReq req;
+        req.ox = x0 + (int)tx;
+        req.oy = y0 + (int)ty;
+        req.oz = z0 + (int)tz;
+        req.nx = std::min(tile, sizeVox - tx) / lod;
+        req.ny = std::min(tile, height - ty) / lod;
+        req.nz = std::min(tile, sizeVox - tz) / lod;
+        req.lod = lod;
+        req.seed = seed;
+        req.applyEdits = false;
+        std::vector<uint8_t> blob;
+        if (!BuildVoxRegion(ctx, world, sim, req, blob, err)) { ok = false; break; }
+        Push32(out, (uint32_t)blob.size());
+        out.insert(out.end(), blob.begin(), blob.end());
+        count++;
+      }
+
+  // ---- restore the real environment, whatever happened above ----------------
+  {
+    biomes::EnvironmentStamp stamp;
+    std::string elog;
+    if (!ReloadEnvironment(ctx, sim, mats, stamp, elog)) {
+      worldmap::SetCurrentWorldMap(real);
+      err += (err.empty() ? "" : "; ") + std::string("environment restore failed: ") + elog;
+      return false;
+    }
+  }
+  if (!ok) return false;
+  Put32(out, 0, kBiomeSwatchMagic);
+  Put32(out, 4, 1);
+  Put32(out, 8, count);
+  Put32(out, 12, (uint32_t)x0);
+  Put32(out, 16, (uint32_t)y0);
+  Put32(out, 20, (uint32_t)z0);
+  Put32(out, 24, sizeVox);
+  Put32(out, 28, lod);
+  return true;
+}
+
 int RunVoxDump(GpuContext& ctx, World& world, Simulation& sim,
                const std::vector<MaterialDef>& mats, const std::string& spec,
                const std::string& outPath) {
@@ -501,6 +805,15 @@ int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
   std::fflush(stdout);
 
   std::vector<MaterialDef> live = mats;
+  // LAYER's selection (voxregion.h): "@map" = the map's editLayer, "-" = none,
+  // else a layer name. Re-applied before every REGION: the load is stat-cached,
+  // and a RELOAD or SWATCH (both re-read the environment, which re-reads the
+  // map's layer) must not silently change which layer the viewer is shown.
+  std::string layerSel = "@map";
+  auto applyLayer = [&]() {
+    if (layerSel == "@map") LoadWorldEditLayerForMap(AssetDir());
+    else LoadWorldEditLayerNamed(AssetDir(), layerSel == "-" ? std::string() : layerSel);
+  };
   std::string line;
   while (std::getline(std::cin, line)) {
     while (!line.empty() && (line.back() == '\r' || line.back() == '\n'))
@@ -600,6 +913,7 @@ int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
       std::vector<long long> v;
       for (int i = 1; i <= 8; i++) v.push_back(std::strtoll(tok[i].c_str(), nullptr, 10));
       ParseReq(v, req);
+      applyLayer();
       std::vector<uint8_t> buf;
       std::string err;
       if (!BuildVoxRegion(ctx, world, sim, req, buf, err)) { fail(err); continue; }
@@ -607,6 +921,66 @@ int RunVoxServe(GpuContext& ctx, World& world, Simulation& sim,
         fail(err);
         continue;
       }
+      ok(buf.size());
+      continue;
+    }
+    if (cmd == "LAYER") {
+      if (tok.size() < 2) { fail("LAYER wants @map, - or a layer name"); continue; }
+      layerSel = tok[1];
+      applyLayer();
+      ok(WorldEditLayer().VoxelCount());
+      continue;
+    }
+    if (cmd == "EDITS") {
+      // EDITS <RESOLVE|RELATIVE> <seed> <in>|<out>
+      std::string in, outp;
+      if (tok.size() < 4 || !SplitPaths(tail(3), in, outp)) {
+        fail("EDITS wants RESOLVE|RELATIVE <seed> <in>|<out>");
+        continue;
+      }
+      const uint32_t seed = (uint32_t)std::strtoul(tok[2].c_str(), nullptr, 10);
+      WorldEdits layer;
+      std::string err;
+      if (!layer.Load(in, err)) { fail(err); continue; }
+      layer.Resolve(seed);
+      std::vector<WorldEdits::AbsCell> cells;
+      layer.ResolvedCells(cells);
+      bool wrote = false;
+      if (tok[1] == "RESOLVE") wrote = WorldEdits::WriteAbsolute(outp, cells, seed, err);
+      else if (tok[1] == "RELATIVE") wrote = WorldEdits::WriteRelative(outp, cells, seed, err);
+      else err = "EDITS wants RESOLVE or RELATIVE, got '" + tok[1] + "'";
+      if (!wrote) { fail(err); continue; }
+      ok(cells.size());
+      continue;
+    }
+    if (cmd == "EXPORT") {
+      std::string dir, outp;
+      if (tok.size() < 3 || !SplitPaths(tail(2), dir, outp)) {
+        fail("EXPORT wants <seed> <saveDir>|<out>");
+        continue;
+      }
+      std::string report;
+      const uint32_t seed = (uint32_t)std::strtoul(tok[1].c_str(), nullptr, 10);
+      if (!ExportSaveEdits(ctx, world, sim, live, dir, seed, outp, report)) { fail(report); continue; }
+      std::fprintf(stderr, "export: %s\n", report.c_str());
+      ok(0);
+      continue;
+    }
+    if (cmd == "SWATCH") {
+      std::string json, outp;
+      if (tok.size() < 5 || !SplitPaths(tail(4), json, outp)) {
+        fail("SWATCH wants <biome> <seed> <sizeVox> <biomeJson|->|<out>");
+        continue;
+      }
+      std::vector<uint8_t> buf;
+      std::string err;
+      if (!BuildBiomeSwatch(ctx, world, sim, live, tok[1], json,
+                            (uint32_t)std::strtoul(tok[2].c_str(), nullptr, 10),
+                            (uint32_t)std::strtoul(tok[3].c_str(), nullptr, 10), buf, err)) {
+        fail(err);
+        continue;
+      }
+      if (!WriteFileBytes(outp, buf.data(), buf.size(), err)) { fail(err); continue; }
       ok(buf.size());
       continue;
     }

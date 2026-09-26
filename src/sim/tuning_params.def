@@ -2142,11 +2142,10 @@ TP_F(render, fpsCap, NO_WGSL, 0.0f, 0.0f, 240.0f)
 
 
 // ==== world ====
-// A NAME, never a path: worldedit.cpp joins it under assets/worldedits/,
+// A NAME, never a path: worldmap.cpp joins it under assets/worldmap/,
 // and a value with a separator in it would reach outside that directory.
+// (world.editLayer moved to the map's map.json in map-overhaul P7.)
 // + a hand-written rule in LoadTuning
 TP_S(world, mapLayer, NO_WGSL, "default")
-// + a hand-written rule in LoadTuning
-TP_S(world, editLayer, NO_WGSL, "")
 
 // clang-format on

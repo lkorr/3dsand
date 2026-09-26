@@ -3742,9 +3742,15 @@ static void PhaseL(TickAuthorityCtx& w, WorldScratch& ws,
       // per-tick cap everything else on that stream respects. Rule 3: this is
       // the ONLY place the layer touches the world, and it touches it through
       // the queue.
+      //
+      // The submit these ops ride is TicksEncoded() + 1 (SubmitTick encodes
+      // this tick's readback after the kernels). The layer records which slots
+      // it woke on that submit so Stream's modified fold can tell the layer's
+      // own wake from a modification (sim/worldedit.h, map-overhaul P7).
       if (WorldEditLayer().HasPending() && cellOps.size() < kMaxCellOpsPerTick)
         WorldEditLayer().Drain(world, cellOps,
-                               kMaxCellOpsPerTick - (uint32_t)cellOps.size());
+                               kMaxCellOpsPerTick - (uint32_t)cellOps.size(),
+                               world.TicksEncoded() + 1u);
   }
 }
 

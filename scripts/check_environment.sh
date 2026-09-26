@@ -21,8 +21,8 @@
 #   bash scripts/check_environment.sh              # verdict only
 #   bash scripts/check_environment.sh --shot out.png
 #
-# NEEDS NO BUILT EXE, like check_trees.sh: nothing in this tab calls the
-# engine, and the server is started with no --voxserve behind it.
+# NEEDS THE BUILT EXE since map-overhaul P7: the biome swatch is rendered by
+# the engine (--voxserve SWATCH), which the tuner server spawns on demand.
 set -eu
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

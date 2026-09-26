@@ -746,10 +746,13 @@ bool LoadTuning(const std::string& path, Tuning& out) {
       out.warnings.push_back("world.mapLayer must be a bare map name; using \"default\"");
       w.mapLayer = "default";
     }
-    if (w.editLayer.find_first_of("/\\:") != std::string::npos) {
-      out.warnings.push_back("world.editLayer must be a bare layer name; ignored");
-      w.editLayer.clear();
-    }
+    // MIGRATION (map-overhaul P7): the edit layer is the map's now. A
+    // tuning.json that still names one says so instead of being silently
+    // ignored; the tuner's map page writes map.json `editLayer`.
+    if (g->contains("editLayer") && (*g)["editLayer"].is_string() &&
+        !(*g)["editLayer"].get<std::string>().empty())
+      out.warnings.push_back("world.editLayer is no longer read: the edit layer moved to the "
+                             "map (assets/worldmap/<map>/map.json \"editLayer\")");
   }
   if (const json* g = Find(j, "debug")) {
     // HAND-WRITTEN: the rules a tuning_params.def row cannot state (a

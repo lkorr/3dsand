@@ -79,6 +79,7 @@ void FarEdits::NoteUniformChunk(IVec3 wc, uint32_t mat) {
 
 void FarEdits::Append(const LKey& key, const std::vector<uint32_t>& add) {
   if (add.empty()) return;
+  merged_.erase(key);
   auto it = byChunk_.find(key);
   if (it == byChunk_.end()) {
     // The cap refuses only NEW level chunks (see kMaxCells): one already
@@ -127,11 +128,70 @@ void FarEdits::Compact(Chunk& c) {
 
 const std::vector<uint32_t>* FarEdits::Lookup(uint32_t level,
                                               IVec3 levelChunk) {
-  auto it = byChunk_.find({levelChunk.x, levelChunk.y, levelChunk.z, level});
-  if (it == byChunk_.end()) return nullptr;
+  const LKey key{levelChunk.x, levelChunk.y, levelChunk.z, level};
+  auto bit = base_.find(key);
+  auto it = byChunk_.find(key);
+  if (it == byChunk_.end())
+    return bit == base_.end() ? nullptr : &bit->second;
   Chunk& c = it->second;
   if (!c.sorted) Compact(c);
-  return &c.words;
+  if (bit == base_.end()) return &c.words;
+  // Both: merge once, noted words winning per cell. Two ColumnKey-sorted
+  // lists with one word per cell, so a linear merge keeps the order Lookup
+  // promises.
+  auto mit = merged_.find(key);
+  if (mit != merged_.end()) return &mit->second;
+  std::vector<uint32_t>& m = merged_[key];
+  const std::vector<uint32_t>& a = bit->second;
+  const std::vector<uint32_t>& b = c.words;
+  m.reserve(a.size() + b.size());
+  size_t i = 0, j = 0;
+  while (i < a.size() || j < b.size()) {
+    if (j >= b.size() || (i < a.size() && ColumnKey(a[i]) < ColumnKey(b[j]))) {
+      m.push_back(a[i++]);
+    } else if (i >= a.size() || ColumnKey(b[j]) < ColumnKey(a[i])) {
+      m.push_back(b[j++]);
+    } else {
+      m.push_back(b[j++]);   // the same cell: the noted edit is newer
+      i++;
+    }
+  }
+  return &m;
+}
+
+void FarEdits::SetBase(const std::vector<BaseCell>& cells) {
+  base_.clear();
+  merged_.clear();
+  for (const BaseCell& c : cells) {
+    for (uint32_t level = 1; level <= kFarLevels; level++) {
+      const int shift = (int)(level + kFarShiftBase);
+      const int step = 1 << shift;
+      const int half = 1 << (shift - 1);
+      // A cell speaks for a cascade sample only if it IS that sample's center
+      // voxel (Sweep's rule): c = m*step + half on every axis. Two's-complement
+      // masking makes this right for negative coordinates too.
+      if (((c.x - half) & (step - 1)) != 0 || ((c.y - half) & (step - 1)) != 0 ||
+          ((c.z - half) & (step - 1)) != 0)
+        continue;
+      const uint32_t cx = (uint32_t)((c.x >> shift) & 15);
+      const uint32_t cy = (uint32_t)((c.y >> shift) & 15);
+      const uint32_t cz = (uint32_t)((c.z >> shift) & 15);
+      const uint32_t ci = (cz * kChunk + cy) * kChunk + cx;
+      const LKey key{c.x >> (shift + 4), c.y >> (shift + 4), c.z >> (shift + 4), level};
+      base_[key].push_back(((c.mat & 0xFFFu) << kCellBits) | ci);
+    }
+  }
+  for (auto& kv : base_) {
+    // Compact's sort + last-wins dedupe, without touching the noted-cell
+    // counter it maintains (the base is not part of the cap).
+    Chunk tmp;
+    tmp.words = std::move(kv.second);
+    const size_t before = cells_;
+    cells_ += tmp.words.size();
+    Compact(tmp);
+    cells_ = before;
+    kv.second = std::move(tmp.words);
+  }
 }
 
 size_t FarEdits::RebuildFromStore(ChunkStore& store) {

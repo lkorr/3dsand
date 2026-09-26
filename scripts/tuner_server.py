@@ -44,8 +44,17 @@ happens in this process rather than in the page:
   GET  /api/worldmap/sculpt?name=   the map's sculpt layer (binary 'SVSC'; 404 = none)
   POST /api/worldmap/sculpt?name=   write it (write-then-rename); an EMPTY body
                               deletes the file (no layer = the pre-P5 world)
-  GET  /api/worldedit?name=   read one edit layer (binary 'SVED')
-  POST /api/worldedit?name=   write one edit layer
+  GET  /api/worldedit?name=[&seed=]  read one edit layer (binary 'SVED'); with
+                              seed, RESOLVED to v1 absolute cells at that seed
+                              through --voxserve (what the viewer edits)
+  POST /api/worldedit?name=[&seed=]  write one edit layer; with seed, the v1
+                              body is stored GROUND-RELATIVE (v2) against that
+                              seed's ground through --voxserve (P7)
+  POST /api/worldedit/export  {save, name, seed}: a save's edits vs the
+                              generator -> assets/worldedits/<name>.svedit (P7)
+  POST /api/biomeswatch?name=&seed=&size=  body = the biome JSON (unsaved
+                              copy): the biome as the ENGINE makes it, an 'SVSW'
+                              bundle of SVVX regions from --voxserve SWATCH (P7)
   POST /api/worldedit/delete  delete one edit layer
   GET  /api/status            build state + whether the exe is running
 
@@ -92,6 +101,7 @@ import hashlib
 import json
 import os
 import shutil
+import struct
 import subprocess
 import sys
 import threading
@@ -666,9 +676,16 @@ class VoxServe:
         `hold_lock=False` is for commands that touch no GPU (PING), so a
         liveness check does not queue behind somebody's build.
         """
+        return self.commands([line], hold_lock)
+
+    def commands(self, lines, hold_lock=True):
+        """Send several commands as ONE uninterrupted sequence and return the
+        last one's (ok, message); the first failure stops the sequence. For
+        state a later command depends on (LAYER before REGION, P7): another
+        request thread must not get in between."""
         with self.lock:
             self._ensure()
-            def _round_trip():
+            def _round_trip(line):
                 self.proc.stdin.write(line + "\n")
                 self.proc.stdin.flush()
                 while True:
@@ -681,12 +698,19 @@ class VoxServe:
                     # Anything else is engine chatter; the protocol tolerates it
                     # rather than breaking, because a stray printf in a shader
                     # reload path should not take the viewer down.
+            def _all():
+                ack = "OK 0 0"
+                for line in lines:
+                    ack = _round_trip(line)
+                    if ack.startswith("ERR "):
+                        break
+                return ack
             try:
                 if hold_lock:
                     with RunLock("voxserve"):
-                        ack = _round_trip()
+                        ack = _all()
                 else:
-                    ack = _round_trip()
+                    ack = _all()
             except Exception as e:
                 # A dead server is recoverable: the next request respawns it.
                 try:
@@ -763,9 +787,11 @@ def _world_signature():
     throw away a cache, and an edit that reverts a file should hit the entries
     it had before.
 
-    NOT the edit layer: --voxserve regions are bare worldgen, and the viewer
-    composites the .svedit on the client (worldview.js), so a layer save must
-    not throw the region cache away.
+    NOT the edit layer. Since P7 --voxserve applies the layer to the region
+    it dumps (the viewer no longer composites it), but a layer save must not
+    throw the WHOLE cache away: _voxregion folds the layer name and a digest
+    of only the layer records inside the region's footprint into that
+    region's key (_layer_region_digest).
     """
     h = hashlib.sha1()
     paths = [WRITABLE["tuning"], WRITABLE["materials"]]
@@ -793,6 +819,87 @@ def _world_signature():
         h.update(os.path.basename(path).encode("utf-8") + b"\0")
         h.update(_file_digest(path))
     return h.hexdigest()[:16]
+
+
+def _map_edit_layer(name=None):
+    """map.json `editLayer` of the named map (default: tuning's mapLayer) --
+    where the edit layer lives since map-overhaul P7 (it was tuning.json
+    world.editLayer). "" when none."""
+    if not name:
+        try:
+            with open(WRITABLE["tuning"], "r", encoding="utf-8") as f:
+                name = (json.load(f).get("world") or {}).get("mapLayer") or "default"
+        except (OSError, ValueError):
+            name = "default"
+    d = _worldmap_dir(name)
+    if not d:
+        return ""
+    try:
+        with open(os.path.join(d, "map.json"), "r", encoding="utf-8") as f:
+            v = json.load(f).get("editLayer") or ""
+    except (OSError, ValueError):
+        return ""
+    return v if isinstance(v, str) and _worldedit_path(v) else ""
+
+
+_LAYER_INDEX = {}
+
+
+def _layer_index(path):
+    """The .svedit's records as [(x0, z0, x1, z1, y0, y1, bytes)], cached on
+    (path, mtime, size). v1 records are chunks (a known y range); v2 records
+    are ground-relative COLUMNS, whose y depends on the ground and is left
+    open (the ground itself is in the world signature)."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return []
+    key = (path, st.st_mtime_ns, st.st_size)
+    hit = _LAYER_INDEX.get(key)
+    if hit is not None:
+        return hit
+    out = []
+    try:
+        with open(path, "rb") as f:
+            b = f.read()
+        if len(b) >= 32 and b[:4] == b"SVED":
+            ver, count = struct.unpack_from("<II", b, 4)
+            p = 32
+            for _ in range(count):
+                if ver == 1:
+                    cx, cy, cz, n = struct.unpack_from("<iiiI", b, p)
+                    end = p + 16 + n * 8
+                    out.append((cx * 16, cz * 16, cx * 16 + 16, cz * 16 + 16,
+                                cy * 16, cy * 16 + 16, b[p:end]))
+                else:
+                    x, z, n = struct.unpack_from("<iiI", b, p)
+                    end = p + 12 + n * 8
+                    out.append((x, z, x + 1, z + 1, None, None, b[p:end]))
+                p = end
+    except (OSError, struct.error):
+        out = []
+    _LAYER_INDEX.clear()          # one layer is live at a time; keep it small
+    _LAYER_INDEX[key] = out
+    return out
+
+
+def _layer_region_digest(layer, ox, oy, oz, ext_x, ext_y, ext_z):
+    """What of `layer` can land in the box, as a short hex string ("" = none).
+    Only the records whose footprint meets the box, so saving an edit on one
+    hill does not invalidate the cached regions of every other."""
+    path = _worldedit_path(layer) if layer else None
+    if not path or not os.path.isfile(path):
+        return ""
+    h = hashlib.sha1()
+    any_rec = False
+    for (x0, z0, x1, z1, y0, y1, rec) in _layer_index(path):
+        if x1 <= ox or x0 >= ox + ext_x or z1 <= oz or z0 >= oz + ext_z:
+            continue
+        if y0 is not None and (y1 <= oy or y0 >= oy + ext_y):
+            continue
+        h.update(rec)
+        any_rec = True
+    return h.hexdigest()[:12] if any_rec else ""
 
 
 def _voxcache_sweep():
@@ -1131,8 +1238,18 @@ class Handler(BaseHTTPRequestHandler):
                                         "error": "box origin must be a multiple of 16"})
 
         sig = _world_signature()
-        key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s" % (
-            ox, oy, oz, nx, ny, nz, lod, seed, sig)
+        # WHICH EDIT LAYER the region carries (P7: --voxserve applies it).
+        # `layer=@map` (the default) is the one map.json names -- what the game
+        # spawns into; `-` is bare worldgen; a name is the layer the viewer is
+        # editing. The effective NAME and a digest of that layer's records in
+        # this box's footprint are part of the key.
+        sel = (q.get("layer") or ["@map"])[0] or "@map"
+        if sel not in ("@map", "-") and not _worldedit_path(sel):
+            return self._json(400, {"ok": False, "error": "bad layer name"})
+        layer = _map_edit_layer() if sel == "@map" else ("" if sel == "-" else sel)
+        ldig = _layer_region_digest(layer, ox, oy, oz, nx * lod, ny * lod, nz * lod)
+        key = hashlib.sha1(("%d,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s" % (
+            ox, oy, oz, nx, ny, nz, lod, seed, sig, layer, ldig)
         ).encode()).hexdigest()
         cached = os.path.join(VOXCACHE, key + ".gz")
         want_gz = "gzip" in (self.headers.get("Accept-Encoding") or "")
@@ -1156,7 +1273,7 @@ class Handler(BaseHTTPRequestHandler):
             ok, msg = _voxserve.sync(sig)
             if not ok:
                 return self._json(503, {"ok": False, "error": "reload: " + msg})
-            ok, msg = _voxserve.command(cmd)
+            ok, msg = _voxserve.commands(["LAYER " + (layer or "-"), cmd])
         except Exception as e:
             return self._json(503, {"ok": False, "error": str(e)})
         if not ok:
@@ -1379,8 +1496,30 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "error": "bad layer name"})
             if not os.path.isfile(path):
                 return self._json(404, {"ok": False, "error": "no such layer"})
-            with open(path, "rb") as f:
-                return self._send(200, f.read(), "application/octet-stream")
+            seed = (self._query().get("seed") or [""])[0]
+            if not seed:
+                with open(path, "rb") as f:
+                    return self._send(200, f.read(), "application/octet-stream")
+            # P7: the file may be ground-relative (v2); the viewer edits
+            # ABSOLUTE cells, so resolve it at the view's seed. Only the
+            # engine knows the ground (World::TerrainHeight), hence voxserve.
+            try:
+                seed = int(seed)
+            except ValueError:
+                return self._json(400, {"ok": False, "error": "bad seed"})
+            os.makedirs(VOXTMP, exist_ok=True)
+            out = os.path.join(VOXTMP, "resolved_%d.svedit" % threading.get_ident())
+            ok, msg = _voxserve.command("EDITS RESOLVE %d %s|%s" % (
+                seed, path.replace("\\", "/"), out.replace("\\", "/")), hold_lock=False)
+            if not ok:
+                return self._json(503, {"ok": False, "error": msg})
+            try:
+                with open(out, "rb") as f:
+                    blob = f.read()
+                os.remove(out)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            return self._send(200, blob, "application/octet-stream")
 
         if p == "/api/environment/hashes":
             # The disk side of the STALE badge (docs/PLAN_environment_truth.md
@@ -1397,7 +1536,8 @@ class Handler(BaseHTTPRequestHandler):
                 tworld = {}
             if not name:
                 name = tworld.get("mapLayer") or "default"
-            edit = tworld.get("editLayer") or ""
+            # P7: the edit layer is the map's (map.json `editLayer`).
+            edit = _map_edit_layer(name)
             ep = _worldedit_path(edit) if edit else None
             d = _worldmap_dir(name)
             return self._json(200, {
@@ -1410,7 +1550,7 @@ class Handler(BaseHTTPRequestHandler):
                 "biomesHash": "%08x" % (_fnv_file_set(os.path.join(ASSETS, "biomes"), (".json",)) ^
                                         _fnv_file_set(os.path.join(ASSETS, "water"), (".json",))),
                 "treesHash": "%08x" % _fnv_file_set(os.path.join(ASSETS, "trees"), (".json", ".svtree")),
-                # the edit layer tuning.json names (mirrors StampEnvironment's
+                # the edit layer the map names (mirrors StampEnvironment's
                 # `edits`: HashOneFile over the one .svedit, 0 if none/missing)
                 "editLayer": edit,
                 "editsHash": "%08x" % (_fnv_one_file(ep, edit + ".svedit") if ep else 0),
@@ -1768,6 +1908,7 @@ class Handler(BaseHTTPRequestHandler):
             blob = self._raw()
             if len(blob) < 32 or blob[:4] != b"SVED":
                 return self._json(400, {"ok": False, "error": "not an SVED layer"})
+            seed = (self._query().get("seed") or [""])[0]
             try:
                 os.makedirs(WORLDEDIT_DIR, exist_ok=True)
                 # Write-then-rename: a half-written edit layer is a world the
@@ -1775,10 +1916,103 @@ class Handler(BaseHTTPRequestHandler):
                 tmp = path + ".tmp"
                 with open(tmp, "wb") as f:
                     f.write(blob)
+                if seed:
+                    # P7: stored GROUND-RELATIVE (SVED v2), the offsets taken
+                    # against the ground of the seed the edits were made over,
+                    # so the layer follows a re-sculpt or another seed. The
+                    # engine writes it (the ground is World::TerrainHeight).
+                    rel = path + ".rel.tmp"
+                    ok, msg = _voxserve.command("EDITS RELATIVE %d %s|%s" % (
+                        int(seed), tmp.replace("\\", "/"), rel.replace("\\", "/")),
+                        hold_lock=False)
+                    os.remove(tmp)
+                    if not ok:
+                        return self._json(503, {"ok": False, "error": "relativize: " + msg})
+                    tmp = rel
+                size = os.path.getsize(tmp)
+                os.replace(tmp, path)
+            except (OSError, ValueError) as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            return self._json(200, {"ok": True, "bytes": size, "relative": bool(seed)})
+
+        if p == "/api/worldedit/export":
+            # P7: a SAVE's edits -> an edit layer. The in-game half is F9 (save
+            # the world); this diffs every chunk the save stores against the
+            # generator (voxserve EXPORT, tools/voxregion.h) and writes the
+            # difference ground-relative.
+            body = self._body()
+            name = body.get("name") or ""
+            path = _worldedit_path(name)
+            if not path:
+                return self._json(400, {"ok": False, "error": "bad layer name"})
+            save = body.get("save") or "build/world.svd"
+            save_abs = os.path.normpath(os.path.join(ROOT, save))
+            if not save_abs.startswith(os.path.normpath(ROOT)) or not os.path.isdir(save_abs):
+                return self._json(400, {"ok": False, "error": "no save directory " + save})
+            try:
+                seed = int(body.get("seed") or 1337)
+            except (TypeError, ValueError):
+                return self._json(400, {"ok": False, "error": "bad seed"})
+            os.makedirs(WORLDEDIT_DIR, exist_ok=True)
+            tmp = path + ".export.tmp"
+            ok, msg = _voxserve.command("EXPORT %d %s|%s" % (
+                seed, save_abs.replace("\\", "/"), tmp.replace("\\", "/")))
+            if not ok:
+                return self._json(500, {"ok": False, "error": msg})
+            try:
+                size = os.path.getsize(tmp)
                 os.replace(tmp, path)
             except OSError as e:
                 return self._json(500, {"ok": False, "error": str(e)})
-            return self._json(200, {"ok": True, "bytes": len(blob)})
+            return self._json(200, {"ok": True, "bytes": size})
+
+        if p == "/api/biomeswatch":
+            # P7: the biome page's swatch is the ENGINE's picture (it used to
+            # be biomegen.js's own noise, trees and cover): a synthetic
+            # one-biome map through the real genChunk (voxserve SWATCH). The
+            # body is the page's biome JSON, saved or not.
+            q = self._query()
+            name = (q.get("name") or [""])[0]
+            if not name or not all(ch.isalnum() or ch == "_" for ch in name):
+                return self._json(400, {"ok": False, "error": "bad biome name"})
+            try:
+                seed = int((q.get("seed") or ["1337"])[0])
+                size = int((q.get("size") or ["960"])[0])
+            except ValueError:
+                return self._json(400, {"ok": False, "error": "bad seed/size"})
+            blob = self._raw()
+            os.makedirs(VOXTMP, exist_ok=True)
+            tid = threading.get_ident()
+            jpath = os.path.join(VOXTMP, "swatch_%d.json" % tid)
+            out = os.path.join(VOXTMP, "swatch_%d.svsw" % tid)
+            try:
+                if blob:
+                    json.loads(blob.decode("utf-8"))     # refuse junk before the GPU sees it
+                    with open(jpath, "wb") as f:
+                        f.write(blob)
+            except (OSError, ValueError) as e:
+                return self._json(400, {"ok": False, "error": "biome JSON: %s" % e})
+            sig = _world_signature()
+            ok, msg = _voxserve.sync(sig)
+            if ok:
+                ok, msg = _voxserve.command("SWATCH %s %d %d %s|%s" % (
+                    name, seed, size, jpath.replace("\\", "/") if blob else "-",
+                    out.replace("\\", "/")))
+            if not ok:
+                return self._json(500, {"ok": False, "error": msg})
+            try:
+                with open(out, "rb") as f:
+                    data = f.read()
+                os.remove(out)
+                if blob:
+                    os.remove(jpath)
+            except OSError as e:
+                return self._json(500, {"ok": False, "error": str(e)})
+            # Tens of MB of mostly-jittered words (the state nibble defeats the
+            # RLE); level 1 gzip is the cheap 5-10x.
+            if "gzip" in (self.headers.get("Accept-Encoding") or ""):
+                return self._send_blob(gzip.compress(data, 1), gz=True)
+            return self._send_blob(data)
 
         if p == "/api/worldmap/sculpt":
             # The P5 sculpt layer (src/sim/worldmap.h: 'SVSC', v1, 32-byte

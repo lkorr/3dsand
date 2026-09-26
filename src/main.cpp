@@ -4484,6 +4484,8 @@ int main(int argc, char** argv) {
   std::string voxdumpArgs;
   std::string voxdumpOut = "build/voxregion.bin";
   bool voxserve = false;
+  // --export-edits <saveDir>,<layerName>[,seed] (tools/voxregion.h, map-overhaul P7)
+  std::string exportEdits;
   // ---- THE OP RECORD, ON THE COMMAND LINE (PLAN_multiplayer_now N3/N5) ----
   //
   // N3 built the recorder but could not wire these two flags: main.cpp was
@@ -5023,6 +5025,13 @@ int main(int argc, char** argv) {
       voxdumpOut = argv[++i];
     }
     else if (a == "--voxserve") voxserve = true;
+    else if (a == "--export-edits") {
+      if (i + 1 >= argc) {
+        std::fprintf(stderr, "--export-edits wants <saveDir>,<layerName>[,seed]\n");
+        return 1;
+      }
+      exportEdits = argv[++i];
+    }
     else if (a == "--record-ops") {
       if (i + 1 >= argc) { std::fprintf(stderr, "--record-ops requires a path\n"); return 1; }
       recordOpsPath = argv[++i];
@@ -5294,11 +5303,6 @@ int main(int argc, char** argv) {
     }
     SetCurrentTuning(tune);
   }
-  // The authored edit layer named by world.editLayer. Read here, before any
-  // world exists, so the very first SubmitWorldgen already queues it — a layer
-  // loaded after worldgen would not appear until something happened to
-  // regenerate the chunks it lives in.
-  LoadWorldEditLayerFromTuning(assetDir);
   std::vector<MaterialDef> mats;
   std::vector<ReactionGpu> reactions;
   std::string errors;
@@ -5412,6 +5416,12 @@ int main(int argc, char** argv) {
       return 1;
     }
     worldmap::SetCurrentWorldMap(std::move(map));
+    // The authored edit layer the MAP names (map.json `editLayer`, P7). Read
+    // here, before any world exists, so the very first SubmitWorldgen already
+    // queues it — a layer loaded after worldgen would not appear until
+    // something happened to regenerate the chunks it lives in. After the map,
+    // because a v2 layer resolves against the map's ground.
+    LoadWorldEditLayerForMap(assetDir);
   }
   TreeAtlas treeAtlas;
   {
@@ -5430,7 +5440,7 @@ int main(int argc, char** argv) {
   // Re-stamped by every environment reload (F7 / regen world / Apply).
   biomes::EnvironmentStamp envStamp =
       biomes::StampEnvironment(assetDir, worldmap::ActiveMapName(CurrentTuning().world.mapLayer),
-                                CurrentTuning().world.editLayer);
+                                worldmap::CurrentWorldMap().editLayer);
   std::printf("%s\n", envStamp.Line().c_str());
   // ...and the inputs that shape the world AFTER worldgen: tuning.json,
   // materials.json, reactions.json (src/sim/tuningstamp.h). All three
@@ -5447,7 +5457,7 @@ int main(int argc, char** argv) {
   GLFWwindow* window = nullptr;
   if (!selftest && !shot && !shotWaterfall && !shotDebrisPond && !measure && !perf &&
       !fluidBench && !shaderStats &&
-      shotMob.empty() && voxdumpArgs.empty() && !voxserve) {
+      shotMob.empty() && voxdumpArgs.empty() && !voxserve && exportEdits.empty()) {
     if (!glfwInit()) return 1;
     glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
     window = glfwCreateWindow(1600, 900, "sandvox", nullptr, nullptr);
@@ -5501,7 +5511,7 @@ int main(int argc, char** argv) {
   // for them when it asks (Simulation::EnsureFarPipelines) instead of the
   // whole run paying at exit for a horizon nobody looked at.
   {
-    const bool voxelTool = voxserve || !voxdumpArgs.empty();
+    const bool voxelTool = voxserve || !voxdumpArgs.empty() || !exportEdits.empty();
     const bool checkedOutput =
         selftest || verify || measure || perf || renderBudget || budgetArms ||
         shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
@@ -5711,7 +5721,7 @@ int main(int argc, char** argv) {
         shot || shotFrames || shotWaterfall || shotDebrisPond || shotFluid ||
         shotFluidPond ||
         fluidBench || shaderStats || !shotMob.empty() || !sweepParam.empty();
-    const bool voxelTool = voxserve || !voxdumpArgs.empty();
+    const bool voxelTool = voxserve || !voxdumpArgs.empty() || !exportEdits.empty();
     sim.AllowDeferredFar(!checkedOutput || voxelTool);
     // The specialized raymarch variant follows the same rule and for the same
     // reason (Simulation::AllowDeferredRaymarchVariant): the interactive game
@@ -5753,6 +5763,7 @@ int main(int argc, char** argv) {
   if (!voxdumpArgs.empty())
     return RunVoxDump(ctx, world, sim, mats, voxdumpArgs, voxdumpOut);
   if (voxserve) return RunVoxServe(ctx, world, sim, mats);
+  if (!exportEdits.empty()) return RunExportEdits(ctx, world, sim, mats, exportEdits);
   if (shot) return RunShots(ctx, world, sim);
   if (shotWaterfall) return RunWaterfallShot(ctx, world, sim);
   if (shotDebrisPond) return RunDebrisPondShot(ctx, world, sim, mats);
@@ -10045,11 +10056,9 @@ int main(int argc, char** argv) {
         // tuning.json. The materials block is the next statement, so this
         // lands in the right order: tuning is live before LoadAssets reads it.
         ui.reloadMaterials = true;
-        // F5 re-reads tuning, so it re-reads which layer is named and what is
-        // in it. Re-queued against the CURRENT window, so an edit saved from
-        // the tuner appears on the next keypress instead of the next restart.
-        LoadWorldEditLayerFromTuning(assetDir);
-        WorldEditLayer().QueueWindow(world);
+        // The edit layer is NOT re-read here any more: it belongs to the map
+        // (map.json `editLayer`, P7) and is re-read by ReloadEnvironment, i.e.
+        // by F7, which also regenerates the window it applies to.
       }
       std::printf("reloading shaders... %s\n",
                   sim.ReloadShaders(ctx.device) ? "ok" : "FAILED (kept old)");
@@ -14267,10 +14276,10 @@ int main(int argc, char** argv) {
       }
       for (std::string cmd; telemetry.PopCommand(cmd);) {
         if (cmd.find("apply-environment") != std::string::npos) {
-          // EXACTLY F7: the F5 half re-reads tuning.json (world.mapLayer /
-          // editLayer, the edit layer's .svedit) and rebuilds the kernels
-          // before the regen half reloads the environment. A regen alone
-          // kept the map and edit layer the game booted with.
+          // EXACTLY F7: the F5 half re-reads tuning.json (world.mapLayer)
+          // and rebuilds the kernels before the regen half reloads the
+          // environment (the map, and the edit layer map.json names). A
+          // regen alone kept the map the game booted with.
           ui.reloadShaders = true;
           ui.regenWorld = true;
         } else if (cmd.find("env-stamp") != std::string::npos) {

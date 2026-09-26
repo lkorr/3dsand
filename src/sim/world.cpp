@@ -774,8 +774,11 @@ void World::KickReadback() {
         uint32_t reasonOr = 0;
         uint64_t total = 0;
         for (uint32_t i = 0; i < kNumSlots; i++) {
-          out.dirtyFlags[i] = dirtyW[i] != 0 ? 1 : 0;
-          active += out.dirtyFlags[i];
+          // See WorldSnapshot::dirtyFlags: MUTATE-only is its own value.
+          out.dirtyFlags[i] = dirtyW[i] == 0 ? 0
+                              : dirtyW[i] == kDirtyReasonMutate ? kDirtyMutateOnly
+                                                                : 1;
+          active += dirtyW[i] != 0 ? 1u : 0u;
           reasonOr |= dirtyW[i];
           // GPU word packs [31] anyStain | [30..16] blockers | [15..0]
           // nonAir (packOccStain, common.wgsl). Existing CPU consumers
@@ -795,6 +798,7 @@ void World::KickReadback() {
         }
         out.activeChunks = active;
         out.dirtyReasonOr = reasonOr;
+        out.watchReason = dirtyWatch_ < kNumSlots ? dirtyW[dirtyWatch_] : 0u;
         out.voxelTotal = total;
         // ---- SANDVOX_DIRTY_REASONS=<n>: WHY are these chunks awake? ----
         //

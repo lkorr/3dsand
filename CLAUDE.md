@@ -379,7 +379,7 @@ hashes are identical, the parameter doesn't reach the kernel at those values.
 | `src/tools/` | `voxregion.*` = `--voxdump`/`--voxserve`, real voxels for the tuner's terrain view |
 | `assets/tuner.html`+`tuner_schema.js` | browser editor for JSONs, Wiki, Audio, Notes tabs |
 | `assets/worldview.js` | the World map page's preview pane: voxel terrain viewer + editor (WebGL2, worker mesher, LOD) |
-| `assets/worldedits/` | authored `.svedit` layers, applied by `world.editLayer` (the map page's edits selector) |
+| `assets/worldedits/` | authored `.svedit` layers (v2 = ground-relative per column), named by the map's `map.json editLayer` (the map page's edits selector) and applied AS WORLDGEN: op-stream patch after genChunk, not marked modified, far-field base, applied by `--voxserve` (DESIGN.md §9c.4). `--export-edits <save>,<layer>` turns a save's edits into one |
 | `assets/worldmap/<name>/` | THE MAP IS THE ENVIRONMENT: `map.json` (`terrain` = every number that shapes the ground, the sites: pad / spawn / water / landform / stamp) + `map.svmap` (biome / landform planes). Edited only on Environment → World map. `tuning.json` holds no worldgen knobs (`world.mapLayer` names the map; `debug.vegetation` is a dev switch). `harness/` is the SELFTEST's map (pad box, fixture lake, its own planes + sea): gates, smokes, fluid benches and `--shot` load it, never `default` (`worldmap::ActiveMapName`; `SANDVOX_MAP=<name>` overrides) |
 | `assets/sound_schema.js` | only list of sound slots; must match `Cues::kSlotPrefix` in `audio/cues.cpp` |
 | `assets/spells/glyphs.json` | glyph content, materials by name, hot-reloads with R |

@@ -115,8 +115,7 @@ let selected = null;       // the site the sites panel has selected (any kind)
 let heights = null;        // the decoded --heightmap backdrop, or null
 let showHeights = false;
 let savedGen = 0;          // bumps on every map save: heights.gen < savedGen = stale
-let mapLayerWanted = '';   // world.mapLayer / editLayer as the selectors have them
-let editLayerWanted = '';
+let mapLayerWanted = '';   // world.mapLayer as the selector has it
 let tuningTouched = false;
 const SPAWN_DEFAULT = [140, 140];   // worldmap.cpp's default when a map names no spawn
 // The water tool (P-F): an AUTHORED LAKE is `{kind: "water", preset, at: [x, z],
@@ -463,6 +462,8 @@ async function loadMap(name) {
   undo = []; redo = [];
   selected = null; heights = null;
   markDirty(false);
+  syncEditSel();
+  migrateEditLayer();
   rebuildPalette();
   terrainOf();
   syncTerrain(); syncSites(); publishTerrain();
@@ -1660,11 +1661,17 @@ export function attach(hooks) {
     if (showHeights && current) { showHeights = false; els.heightsBtn.classList.remove('on'); paint(); return; }
     fetchHeights().catch(e => { toast('heights: ' + e.message, true); status('heights failed: ' + e.message); });
   });
-  // The map and edit layer the GAME loads (tuning.json world.mapLayer /
-  // editLayer): the selectors write tuning through the host, saved with
-  // Ctrl+S or the tuner's Save.
-  els.editSel = el('select', {title: 'assets/worldedits/<name>.svedit, applied over worldgen (tuning.json world.editLayer); blank = none'});
-  els.editSel.addEventListener('change', () => { editLayerWanted = els.editSel.value; pushTuning(); });
+  // The map the GAME loads is tuning.json world.mapLayer (the map selector
+  // writes tuning through the host). The EDIT LAYER is the map's own
+  // (map.json `editLayer`, map-overhaul P7): this selector edits the loaded
+  // map and is saved with it.
+  els.editSel = el('select', {title: 'assets/worldedits/<name>.svedit, applied over this map’s worldgen (map.json editLayer); blank = none'});
+  els.editSel.addEventListener('change', () => {
+    if (!map) return;
+    if (els.editSel.value) map.json.editLayer = els.editSel.value; else delete map.json.editLayer;
+    markDirty();
+    toast('map.json editLayer = ' + (els.editSel.value || '(none)') + ' — save the map and press F7 in the game');
+  });
   els.radius = el('input', {type: 'range', min: 0, max: 24, value: brush.radius, style: 'width:110px'});
   els.radiusOut = el('span', {}, String(brush.radius));
   els.radius.addEventListener('input', () => { brush.radius = +els.radius.value; syncControls(); paint(); });
@@ -1682,7 +1689,7 @@ export function attach(hooks) {
 
   const bar = el('div', {class: 'mapbar'},
     el('label', {title: 'the map the GAME loads (tuning.json world.mapLayer)'}, 'map ', els.mapSel),
-    el('label', {title: 'the edit layer the game applies over worldgen (tuning.json world.editLayer)'}, ' edits ', els.editSel),
+    el('label', {title: 'the edit layer this map applies over its worldgen (map.json editLayer)'}, ' edits ', els.editSel),
     els.save, undoBtn, redoBtn, fitBtn, els.heightsBtn,
     el('span', {style: 'width:10px'}),
     els.tools.site, els.tools.biome, els.tools.landform, els.tools.pad, els.tools.spawn, els.tools.stamp, els.tools.water, els.tools.lfsite, els.tools.tree, els.tools.sculpt,
@@ -1761,7 +1768,7 @@ export function isDirty() { return dirty; }
 function tuningWorld() {
   const T = H.tuning && H.tuning();
   if (!T || !T.tune) return null;
-  if (!T.tune.world || typeof T.tune.world !== 'object') T.tune.world = {mapLayer: 'default', editLayer: ''};
+  if (!T.tune.world || typeof T.tune.world !== 'object') T.tune.world = {mapLayer: 'default'};
   return T;
 }
 function currentMapLayer() {
@@ -1770,26 +1777,45 @@ function currentMapLayer() {
 }
 function pushTuning() {
   const T = tuningWorld();
-  if (!T) { toast('tuning.json is not loaded: the game keeps its current map / edit layer', true); return; }
-  let changed = false;
-  if (mapLayerWanted && T.tune.world.mapLayer !== mapLayerWanted) { T.tune.world.mapLayer = mapLayerWanted; changed = true; }
-  if (editLayerWanted !== T.tune.world.editLayer && (editLayerWanted || T.tune.world.editLayer)) { T.tune.world.editLayer = editLayerWanted; changed = true; }
-  if (changed) {
+  if (!T) { toast('tuning.json is not loaded: the game keeps its current map', true); return; }
+  if (mapLayerWanted && T.tune.world.mapLayer !== mapLayerWanted) {
+    T.tune.world.mapLayer = mapLayerWanted;
     tuningTouched = true;
     if (T.touchTune) T.touchTune();
-    toast('tuning.json world.mapLayer = ' + T.tune.world.mapLayer + (T.tune.world.editLayer ? ', editLayer = ' + T.tune.world.editLayer : '') + ' \u2014 save (Ctrl+S) and press F7 in the game');
+    toast('tuning.json world.mapLayer = ' + T.tune.world.mapLayer + ' \u2014 save (Ctrl+S) and press F7 in the game');
   }
+}
+// MIGRATION (P7): a tuning.json that still names world.editLayer hands it to
+// the loaded map (if the map names none) and drops the retired key.
+function migrateEditLayer() {
+  const T = tuningWorld();
+  if (!T || !map || !('editLayer' in T.tune.world)) return;
+  const old = T.tune.world.editLayer || '';
+  delete T.tune.world.editLayer;
+  tuningTouched = true;
+  if (T.touchTune) T.touchTune();
+  if (old && !map.json.editLayer) {
+    map.json.editLayer = old;
+    markDirty();
+    toast('the edit layer moved to the map: map.json editLayer = ' + old + ' (was tuning.json world.editLayer) \u2014 save both');
+  }
+  syncEditSel();
+}
+function syncEditSel() {
+  if (!els.editSel) return;
+  const cur = (map && map.json.editLayer) || '';
+  if (cur && ![...els.editSel.options].some(o => o.value === cur))
+    els.editSel.append(H.el('option', {value: cur}, cur + ' (missing)'));
+  els.editSel.value = cur;
 }
 async function refreshEditLayers() {
   if (!els.editSel) return;
-  const cur = (tuningWorld() && tuningWorld().tune.world.editLayer) || '';
   try {
     const r = await fetch('/api/worldedits', {cache: 'no-store'});
     const j = r.ok ? await r.json() : {layers: []};
     els.editSel.replaceChildren(H.el('option', {value: ''}, '(none)'), ...(j.layers || []).map(L => H.el('option', {value: L.name}, L.name)));
   } catch (e) { els.editSel.replaceChildren(H.el('option', {value: ''}, '(none)')); }
-  els.editSel.value = cur;
-  editLayerWanted = cur;
+  syncEditSel();
 }
 /** tuning.json arrived (or changed): the selectors follow it. */
 export function tuningAvailable() {
