@@ -31,6 +31,7 @@ import { fileURLToPath } from 'url';
 import { readVox } from '../assets/editor/vox.js';
 import * as mg from '../assets/editor/mobgen.js';
 import * as sc from '../assets/editor/sidecar.js';
+import { listMobFiles, mobFile } from './mobfiles.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -1207,15 +1208,15 @@ section('M. every character on disk RESOLVES to the body its genome describes');
   //   2. RESOLVING the file on disk reproduces the generator's whole body,
   //      field for field — the claim the thin file cannot make by inspection.
   const mobsDir = path.join(ROOT, 'assets/mobs');
-  const readStem = stem => readJson(path.join(mobsDir, stem + '.json'));
+  const readStem = stem => readJson(mobFile(stem, '.json'));
   const readEffect = name => {
     const p = path.join(mobsDir, 'effects', name + '.json');
     return fs.existsSync(p) ? readJson(p) : null;
   };
   const base = sc.resolveSidecar(readStem, mg.BASE_MOB, readEffect);
 
-  const pool = fs.readdirSync(mobsDir).filter(f => f.endsWith('.json'))
-    .map(f => [f.replace(/\.json$/, ''), readJson(path.join(mobsDir, f))])
+  const pool = listMobFiles('.json')
+    .map(f => [f.stem, readJson(f.path)])
     .filter(([, d]) => d && d.genome);
   ok(pool.length > 0, 'there is at least one generated character to check',
      'none found in assets/mobs — has the pool moved?');
@@ -1374,15 +1375,13 @@ section('N. the sidecar resolver, and both languages running it the same way');
 
   // ---- and the pool, resolved the same way in both languages ---------------
   const mobsDir = path.join(ROOT, 'assets/mobs');
-  const readStem = stem => readJson(path.join(mobsDir, stem + '.json'));
+  const readStem = stem => readJson(mobFile(stem, '.json'));
   const readEffect = name => {
     const p = path.join(mobsDir, 'effects', name + '.json');
     return fs.existsSync(p) ? readJson(p) : null;
   };
   const mine = {};
-  for (const f of fs.readdirSync(mobsDir).sort()) {
-    if (!f.endsWith('.json')) continue;
-    const stem = f.replace(/\.json$/, '');
+  for (const { stem } of listMobFiles('.json')) {
     try {
       mine[stem] = sc.resolveSidecar(readStem, stem, readEffect);
     } catch (e) {

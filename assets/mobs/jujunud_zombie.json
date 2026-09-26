@@ -1,7 +1,0 @@
-{
-  "//": "A ZOMBIE OF JUJUNUD, and the whole point of making zombification an effect: it is jujunud's body, jujunud's proportions, jujunud's anchors and clip periods, with the same rot, palette, bite, behaviour and gait the stock zombie gets. Three lines, no art, nothing to go stale. The same two lines under any other character's name give a zombie of that person.",
-  "extends": "jujunud",
-  "effects": [
-    "zombie"
-  ]
-}

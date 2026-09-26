@@ -18,6 +18,7 @@
 import { readFileSync, writeFileSync } from 'fs';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { dirname, join } from 'path';
+import { mobFile } from './mobfiles.mjs';
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), '..');
 const load = rel => import(pathToFileURL(join(ROOT, rel)).href);
@@ -32,8 +33,8 @@ if (!name) {
   process.exit(2);
 }
 
-const voxPath = join(ROOT, 'assets/mobs', name + '.vox');
-const jsonPath = join(ROOT, 'assets/mobs', name + '.json');
+const voxPath = mobFile(name, '.vox');
+const jsonPath = mobFile(name, '.json');
 const side = JSON.parse(readFileSync(jsonPath, 'utf8'));
 if (!side.anatomy) {
   console.error(`${name}.json has no "anatomy" block — nothing to bake. ` +

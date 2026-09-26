@@ -4040,6 +4040,14 @@ function buildUI(section) {
 
   // --- toolbar row 2: file ops ---
   ui.fileSel = el('select', { class: 'sortsel', onchange: () => openPath(ui.fileSel.value) });
+  // The variants of the open prototype (assets/mobs/<proto>/). Picking the
+  // first entry goes back to the prototype itself.
+  ui.variantSel = el('select', {
+    class: 'sortsel', style: 'display:none',
+    title: 'variants of this prototype, filed under assets/mobs/<prototype>/',
+    onchange: () => openPath(ui.variantSel.value ||
+                             mobPathOf('mobs', openProto()) + '.vox'),
+  });
   const presets = el('select', {
     class: 'sortsel',
     onchange: (e) => { applyPreset(e.target.value); e.target.value = ''; },
@@ -4077,7 +4085,7 @@ function buildUI(section) {
   }, 'colour');
 
   const bar2 = el('div', { class: 'toolbar edbar' },
-    el('span', { class: 'hint' }, 'open'), ui.fileSel,
+    el('span', { class: 'hint' }, 'open'), ui.fileSel, ui.variantSel,
     mkBtn('↻', { title: 'refresh list', onclick: refreshFileList }),
     presets,
     mkBtn('Save', { class: 'small primary', onclick: () => save(false) }),
@@ -4360,7 +4368,7 @@ async function resolveSidecarChain(dir, stem, depth = 0) {
     if (d > SIDECAR.MAX_EXTENDS)
       throw new Error('`extends` nested more than 8 deep (a cycle?)');
     if (docs.has(s)) return;
-    const j = await readJson(dir + '/' + s + '.json');
+    const j = await readJson(mobPathOf(dir, s) + '.json');
     docs.set(s, j);
     for (const name of Array.isArray(j.effects) ? j.effects : [])
       if (typeof name === 'string' && !fx.has(name)) {
@@ -4410,16 +4418,93 @@ async function scanDerived(files) {
   return derivedScan;
 }
 
+/* ---- PROTOTYPES AND VARIANTS ---------------------------------------------
+ *
+ * assets/mobs/<proto>.vox is a PROTOTYPE; assets/mobs/<proto>/<name>.* is a
+ * VARIANT of it (a generated character, a recolour, a zombie of somebody).
+ * The main picker lists prototypes only; opening one fills the second picker
+ * with its variants. A def is still named for its STEM wherever it is filed
+ * (src/game/sidecar.h "PROTOTYPES AND VARIANTS"), so `extends`/`model` name
+ * stems and mobPathOf is where a stem becomes a path.
+ * ------------------------------------------------------------------------ */
+
+// stem -> server path without extension ("mobs/human/zeus"), for mobs/ files.
+let mobStemPath = new Map();
+// prototype stem -> [{ value, label }] for the variant picker.
+let variantsOf = new Map();
+// server path -> the prototype it is a variant of.
+let variantProto = new Map();
+
+const mobPathOf = (dir, stem) =>
+  (dir === 'mobs' && mobStemPath.get(stem)) || (dir + '/' + stem);
+
+/** The prototype stem the open document belongs to ('' for none): itself if
+ *  it has variants, else the folder it is filed in. */
+function openProto() {
+  const p = derivedFrom ? derivedFrom.sidecarPath : docPath;
+  if (!p) return '';
+  if (variantProto.has(p)) return variantProto.get(p);
+  const m = /^mobs\/([^/]+)\.vox$/i.exec(p);
+  return m && variantsOf.has(m[1]) ? m[1] : '';
+}
+
+/** Point both pickers at what is open. */
+function syncPickers() {
+  if (!ui.fileSel) return;
+  const open = (derivedFrom ? derivedFrom.sidecarPath : docPath) || '';
+  const proto = openProto();
+  const isVariant = variantProto.has(open);
+  ui.fileSel.value = isVariant ? mobPathOf('mobs', proto) + '.vox' : open;
+  if (!ui.variantSel) return;
+  const list = proto ? (variantsOf.get(proto) || []) : [];
+  ui.variantSel.innerHTML = '';
+  ui.variantSel.append(el('option', { value: '' },
+    list.length ? `${proto} (prototype) — ${list.length} variant` +
+                  (list.length === 1 ? '' : 's') : 'no variants'));
+  for (const v of list) ui.variantSel.append(el('option', { value: v.value }, v.label));
+  ui.variantSel.value = isVariant ? open : '';
+  ui.variantSel.disabled = !list.length;
+  ui.variantSel.style.display = proto ? '' : 'none';
+}
+
 async function refreshFileList() {
   if (!ui.fileSel) return;
   try {
     const j = await (await fetch('/api/models', { cache: 'no-store' })).json();
-    const derived = await scanDerived(j.files || []);
+    const files = j.files || [];
+    derivedScan = null;   // a variant saved elsewhere (Characters page) shows up
+    const derived = await scanDerived(files);
+    mobStemPath = new Map();
+    variantsOf = new Map();
+    variantProto = new Map();
+    for (const f of files) {
+      if (f.dir !== 'mobs') continue;
+      const stem = f.name.replace(/\.(vox|json)$/i, '');
+      if (!mobStemPath.has(stem)) mobStemPath.set(stem, f.path.replace(/\.(vox|json)$/i, ''));
+    }
+    // A variant is listed once: by its .vox when it has art, else by the
+    // derived sidecar that wears somebody else's.
+    for (const f of files) {
+      if (!f.variantOf) continue;
+      const stem = f.name.replace(/\.(vox|json)$/i, '');
+      const own = /\.vox$/i.test(f.path);
+      if (!own && !derived.has(f.path)) continue;
+      if (!variantsOf.has(f.variantOf)) variantsOf.set(f.variantOf, []);
+      variantsOf.get(f.variantOf).push({
+        value: f.path, label: own ? stem : stem + '  (overrides, art read-only)' });
+      variantProto.set(f.path, f.variantOf);
+    }
+    for (const list of variantsOf.values())
+      list.sort((a, b) => a.label.localeCompare(b.label));
     ui.fileSel.innerHTML = '';
     ui.fileSel.append(el('option', { value: '' }, '— open a model —'));
-    for (const f of (j.files || [])) {
+    for (const f of files) {
+      if (f.variantOf) continue;          // in the variant picker instead
+      const stem = f.name.replace(/\.(vox|json)$/i, '');
+      const n = f.dir === 'mobs' ? (variantsOf.get(stem) || []).length : 0;
+      const more = n ? `  (+${n} variant${n === 1 ? '' : 's'})` : '';
       if (f.path.endsWith('.vox')) {
-        ui.fileSel.append(el('option', { value: f.path }, f.path));
+        ui.fileSel.append(el('option', { value: f.path }, f.path + more));
         continue;
       }
       // ...and the sidecars that wear somebody else's art, marked as what they
@@ -4428,8 +4513,7 @@ async function refreshFileList() {
         ui.fileSel.append(el('option', { value: f.path },
           f.path + '  (overrides, art read-only)'));
     }
-    const want = derivedFrom ? derivedFrom.sidecarPath : docPath;
-    if (want) ui.fileSel.value = want;
+    syncPickers();
   } catch {
     ui.fileSel.innerHTML = '';
     ui.fileSel.append(el('option', { value: '' }, '(server not available)'));
@@ -4439,7 +4523,7 @@ async function refreshFileList() {
 async function openPath(path) {
   if (!path) return;
   if (docDirty && !confirm('Discard unsaved model changes?')) {
-    ui.fileSel.value = (derivedFrom ? derivedFrom.sidecarPath : docPath) || '';
+    syncPickers();
     return;
   }
   // A DERIVED SIDECAR: resolve the chain first, then open the art it wears and
@@ -4454,7 +4538,7 @@ async function openPath(path) {
     try {
       const res = await resolveSidecarChain(entry.dir, entry.stem);
       derivedWant = { sidecarPath: path, doc: res.doc,
-                      name: entry.stem, vox: entry.dir + '/' + res.vox + '.vox' };
+                      name: entry.stem, vox: mobPathOf(entry.dir, res.vox) + '.vox' };
       path = derivedWant.vox;
     } catch (e) {
       hooks.toast('could not resolve ' + path + ': ' + (e.message || e), true);
@@ -4483,6 +4567,15 @@ async function openPath(path) {
     docName = path.split('/').pop().replace(/\.vox$/i, '');
     clearUndo();             // also resets any open structural transaction
     setSelection(null);
+    // A multi-model file (a mob: one model per limb) opens in WHOLE mode, so
+    // the first thing on screen is the creature rather than its first limb.
+    // Quietly, not through setWholeMode — its toast would bury the "opened"
+    // one. The select brush is one-model-only, so it drops back to voxel.
+    wholeMode = doc.models.length > 1;
+    drag = null;
+    if (wholeMode && brush === 'select') brush = 'voxel';
+    if (!wholeMode && brush === 'move') brush = 'voxel';
+    renderToolbar();
     // Recover the document's art colours from its own RGBA chunk. This has to
     // happen before anything renders: the grids came back holding art INDICES,
     // and an index means nothing without the palette that issued it.
@@ -4513,9 +4606,11 @@ async function openPath(path) {
     hooks.onModelsChanged?.();
     hooks.onSelectionChanged?.(null);
     hooks.onSidecarChanged?.();
-    hooks.toast(`opened ${path} (${doc.models.length} model` +
-      (doc.models.length === 1 ? '' : 's') + ')');
+    syncPickers();
+    hooks.toast(`opened ${derivedWant ? derivedWant.sidecarPath : path} (` +
+      `${doc.models.length} model` + (doc.models.length === 1 ? '' : 's') + ')');
   } catch (e) {
+    syncPickers();
     hooks.toast('open failed: ' + (e.message || e), true);
   }
 }

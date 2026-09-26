@@ -469,7 +469,7 @@ constexpr int kMaxSidecarExtends = sidecar::kMaxExtends;
 static std::string ModelStemFor(const std::string& dir, const std::string& stem,
                                 int depth) {
   if (depth > kMaxSidecarExtends) return stem;
-  const std::string jp = (std::filesystem::path(dir) / (stem + ".json")).string();
+  const std::string jp = sidecar::StemPath(dir, stem, ".json");
   std::ifstream f(jp);
   if (!f) return stem;
   json j;
@@ -509,18 +509,56 @@ static std::vector<MobSource> CollectMobSources(const std::string& dir,
                                                 std::error_code& ec) {
   std::vector<MobSource> src;
   std::vector<std::string> voxStems, jsonStems;
-  for (auto& e : std::filesystem::directory_iterator(dir, ec)) {
-    if (!e.is_regular_file()) continue;
-    const std::string ext = e.path().extension().string();
-    if (ext == ".vox") voxStems.push_back(e.path().stem().string());
-    else if (ext == ".json") jsonStems.push_back(e.path().stem().string());
-  }
+  // WHERE each stem lives: the root (a prototype) or one variant folder
+  // (sidecar.h "PROTOTYPES AND VARIANTS"). Keyed by stem because a def is
+  // named for its stem wherever it is filed, which is also why a stem filed
+  // twice is refused rather than numbered: `extends: "zeus"` has to mean one
+  // file. The root is scanned first, so a root file wins a collision.
+  std::map<std::string, std::filesystem::path> voxAt, jsonAt;
+  auto scan = [&](const std::filesystem::path& d) {
+    std::error_code sec;
+    for (auto& e : std::filesystem::directory_iterator(d, sec)) {
+      if (!e.is_regular_file()) continue;
+      const std::string ext = e.path().extension().string();
+      if (ext != ".vox" && ext != ".json") continue;
+      const std::string stem = e.path().stem().string();
+      auto& at = ext == ".vox" ? voxAt : jsonAt;
+      auto [it, fresh] = at.emplace(stem, e.path());
+      if (!fresh)
+        log += e.path().string() + ": a mob named \"" + stem +
+               "\" is already filed at " + it->second.string() +
+               " — ignored. A def is named for its stem wherever it is filed, "
+               "so stems must be unique across mobs/ and its variant "
+               "folders.\n";
+    }
+    return sec;
+  };
+  ec = scan(dir);
   if (ec) return src;
+  {
+    std::vector<std::filesystem::path> subs;
+    std::error_code sec;
+    for (auto& e : std::filesystem::directory_iterator(dir, sec))
+      if (e.is_directory() &&
+          sidecar::IsVariantDir(e.path().filename().string()))
+        subs.push_back(e.path());
+    std::sort(subs.begin(), subs.end());
+    for (const auto& d : subs) scan(d);
+  }
+  for (auto& kv : voxAt) voxStems.push_back(kv.first);
+  for (auto& kv : jsonAt) jsonStems.push_back(kv.first);
   // Sorted for a stable hot-reload order, which is also a stable def INDEX
   // order — the spawn UI and every save file address defs by index.
   std::sort(voxStems.begin(), voxStems.end());
   std::sort(jsonStems.begin(), jsonStems.end());
   auto path = [&](const std::string& stem, const char* ext) {
+    const bool vox = std::string(ext) == ".vox";
+    const auto& at = vox ? voxAt : jsonAt;
+    if (auto it = at.find(stem); it != at.end()) return it->second.string();
+    // Unpaired: the partner would sit beside the file that does exist.
+    const auto& other = vox ? jsonAt : voxAt;
+    if (auto ot = other.find(stem); ot != other.end())
+      return (ot->second.parent_path() / (stem + ext)).string();
     return (std::filesystem::path(dir) / (stem + ext)).string();
   };
   auto hasVox = [&](const std::string& s) {
@@ -562,7 +600,8 @@ static std::vector<MobSource> CollectMobSources(const std::string& dir,
     if (model == s) continue;  // no `model`, no `extends`: a shared table
     if (!hasVox(model)) {
       log += path(s, ".json") + ": wears model \"" + model +
-             "\", and there is no " + model + ".vox in this directory\n";
+             "\", and there is no " + model +
+             ".vox in mobs/ or its variant folders\n";
       continue;
     }
     src.push_back({s, path(model, ".vox"), path(s, ".json")});

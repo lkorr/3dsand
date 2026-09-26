@@ -637,7 +637,7 @@ async function loadPool() {
     const stem = f.name.slice(0, -5);
     let j = null;
     try {
-      j = await (await fetch('/api/model?path=mobs/' + f.name)).json();
+      j = await (await fetch('/api/model?path=' + encodeURIComponent(f.path))).json();
     } catch { continue; }
     // behaviors.json and attack_styles.json live here too and are not mobs.
     if (!j || (!j.limbs && !j.extends)) continue;
@@ -647,6 +647,9 @@ async function loadPool() {
       extendsName: j.extends || '',
       hasPalette: !!j.palette,
       bytes: f.size,
+      // Which folder it is filed in: '' for a prototype (assets/mobs/), else
+      // the prototype it is a variant of (assets/mobs/<proto>/).
+      folder: f.variantOf || '',
     });
   }
   S.pool.sort((a, b) => (b.genome ? 1 : 0) - (a.genome ? 1 : 0) ||
@@ -658,6 +661,21 @@ async function loadPool() {
 // =============================================================================
 
 const NAME_OK = /^[a-z0-9_]{1,40}$/;
+
+/**
+ * Where a character or variant is FILED: assets/mobs/<proto>/<name>, the
+ * prototype being the root of what it extends (a variant of zeus is a variant
+ * of human, and lands beside zeus). A name already on disk keeps its folder, so
+ * an overwrite replaces the file rather than leaving a second copy of the stem
+ * for the loader to refuse. src/game/sidecar.h "PROTOTYPES AND VARIANTS".
+ */
+function mobDirFor(name, base) {
+  const have = S.pool.find(p => p.name === name);
+  if (have) return have.folder ? 'mobs/' + have.folder : 'mobs';
+  const b = S.pool.find(p => p.name === base);
+  const proto = b ? (b.folder || b.name) : base;
+  return 'mobs/' + proto;
+}
 
 /** The base every character extends, resolved off the server. Fetched fresh on
  *  each save rather than cached for the session: the Models tab may have edited
@@ -709,7 +727,8 @@ async function saveCharacter() {
   if (b.complaints.length)
     return toast('refused: ' + b.complaints[0], true);
   const existing = S.pool.find(p => p.name === name);
-  if (existing && !confirm(`assets/mobs/${name}.{vox,json} already exists. ` +
+  const dir = mobDirFor(name, mg.BASE_MOB);
+  if (existing && !confirm(`assets/${dir}/${name}.{vox,json} already exists. ` +
                            'Overwrite?')) return;
   // THE ANATOMY IS BAKED HERE, not left to a command line. A body straight out
   // of the generator is solid `skin` at every depth: no flesh, no muscle, no
@@ -739,15 +758,15 @@ async function saveCharacter() {
     return toast('refused: ' + e.message, true);
   }
   try {
-    await postModel('mobs/' + name + '.vox', b.vox, false);
-    await postModel('mobs/' + name + '.json',
+    await postModel(dir + '/' + name + '.vox', b.vox, false);
+    await postModel(dir + '/' + name + '.json',
                     JSON.stringify(doc, null, 2) + '\n', true);
   } catch (e) {
     return toast('save failed: ' + e.message, true);
   }
   const census = Object.entries(baked.census).sort((x, y) => y[1] - x[1])
     .map(([m, n]) => `${m} ${n}`).join(', ');
-  toast(`saved ${name}.vox + ${name}.json, anatomy baked (${census})`);
+  toast(`saved ${dir}/${name}.vox + .json, anatomy baked (${census})`);
   S.status = `saved ${name}: ${b.vox.length} bytes of art, anatomy baked — ` +
              census;
   // The build cache holds the object we just mutated, so the next save would
@@ -790,13 +809,14 @@ async function saveVariant() {
                  'skin" — for that, save a character instead.',
     palette: pal,
   };
+  const dir = mobDirFor(name, base);
   try {
-    await postModel('mobs/' + name + '.json',
+    await postModel(dir + '/' + name + '.json',
                     JSON.stringify(doc, null, 2) + '\n', true);
   } catch (e) {
     return toast('save failed: ' + e.message, true);
   }
-  toast(`saved ${name}.json — a ${Object.keys(pal).join('/')} variant of ` +
+  toast(`saved ${dir}/${name}.json — a ${Object.keys(pal).join('/')} variant of ` +
         `${base}, no art`);
   setDirty(false);
   await loadPool();
@@ -1236,7 +1256,7 @@ function tweakPane() {
           el('div', { class: 'brow' },
             el('input', { value: S.name, size: 12, placeholder: 'name',
                           title: 'the filename this saves as: ' +
-                                 'assets/mobs/<name>.vox and .json. Lowercase ' +
+                                 'assets/mobs/human/<name>.vox and .json. Lowercase ' +
                                  'letters, digits and underscores.',
                           oninput: e => { S.name = e.target.value; } }),
             presetSel),
@@ -1273,7 +1293,7 @@ function tweakPane() {
             }, 'roll colours')),
           el('div', { class: 'bstats' }, statLines(b)),
           el('div', { class: 'brow' },
-            el('button', { title: 'writes assets/mobs/<name>.vox and .json, ' +
+            el('button', { title: 'writes assets/mobs/human/<name>.vox and .json, ' +
                                   'with the anatomy baked in — a finished ' +
                                   'character the game will spawn as it is',
                            onclick: saveCharacter },
@@ -1673,7 +1693,7 @@ function variantRow() {
       num('wash', 'tintAmount', 0, 1, 0.05,
           'how far towards that colour. 0 leaves it alone; the shipped zombie ' +
           'is a small push towards a sick green.'),
-      el('button', { title: 'writes assets/mobs/<name>.json only — no art',
+      el('button', { title: 'writes assets/mobs/<proto>/<name>.json only — no art',
                      onclick: saveVariant }, 'save recolour (.json only)')));
 }
 

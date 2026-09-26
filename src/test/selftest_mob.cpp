@@ -71,14 +71,9 @@ Status GateSidecarResolve(Ctx& c, std::string& detail) {
   int resolved = 0, failed = 0;
   std::string failedNames;
   std::error_code ec;
-  std::vector<std::string> stems;
-  for (auto& e : std::filesystem::directory_iterator(dir, ec))
-    if (e.is_regular_file() && e.path().extension() == ".json")
-      stems.push_back(e.path().stem().string());
-  std::sort(stems.begin(), stems.end());
-  for (const std::string& stem : stems) {
+  // The root and every variant folder (sidecar.h "PROTOTYPES AND VARIANTS").
+  for (const auto& [stem, jp] : sidecar::ListStems(dir, ".json")) {
     nlohmann::json j;
-    const std::string jp = (std::filesystem::path(dir) / (stem + ".json")).string();
     if (!sidecar::Load(dir, jp, j, log)) {
       // attack_styles.json and behaviors.json are shared tables, not mobs, and
       // they parse fine — a failure here is a real one.
@@ -190,20 +185,16 @@ Status GateAnatomyParity(Ctx& c, std::string& detail) {
   int checked = 0, staleVox = 0, mismatch = 0, rebuilt = 0;
   std::string worst;
   std::error_code ec;
-  std::vector<std::string> stems;
-  for (auto& e : std::filesystem::directory_iterator(dir, ec))
-    if (e.is_regular_file() && e.path().extension() == ".vox")
-      stems.push_back(e.path().stem().string());
-  std::sort(stems.begin(), stems.end());
-
-  for (const std::string& stem : stems) {
-    const std::string jp = (std::filesystem::path(dir) / (stem + ".json")).string();
+  // The root and every variant folder (sidecar.h "PROTOTYPES AND VARIANTS").
+  for (const auto& [stem, vp] : sidecar::ListStems(dir, ".vox")) {
+    const std::string jp =
+        (std::filesystem::path(vp).parent_path() / (stem + ".json")).string();
     nlohmann::json j;
     if (!sidecar::Load(dir, jp, j, log)) continue;
     if (!j.contains("anatomy")) continue;   // critter, dummy: no recipe, no claim
     Prefab disk;
     std::string err, warn;
-    if (!LoadVoxFile((std::filesystem::path(dir) / (stem + ".vox")).string(),
+    if (!LoadVoxFile(vp,
                      c.mats.size(), disk, err, warn))
       continue;
     checked++;
@@ -5660,10 +5651,10 @@ Status GateUndead(Ctx& c, std::string& detail) {
   //
   // Everything above is one creature, and a variant of one specific body is
   // what `zombie` used to be — so none of it can tell whether zombification is
-  // a property of the undead or a property of human.vox. `jujunud_zombie.json`
-  // is three lines (`extends: jujunud`, `effects: ["zombie"]`), and this arm is
-  // the claim those three lines make: the rot, the palette, the behaviour and
-  // the gait arrive, AND jujunud's own derived numbers survive them.
+  // a property of the undead or a property of human.vox. So this arm composes
+  // jujunud + [zombie] at runtime (there is no file for it — the effect is
+  // the whole recipe) and claims: the rot, the palette, the behaviour and the
+  // gait arrive, AND jujunud's own derived numbers survive them.
   //
   // The second half is the one worth stating twice. An effect that flattened
   // the body onto the human's proportions would pass every claim above — same
@@ -5671,13 +5662,11 @@ Status GateUndead(Ctx& c, std::string& detail) {
   // character on a 1.7 m character's rideHeight and clock. So the assertions
   // are that the effect's numbers are the human zombie's and the BODY's
   // numbers are jujunud's, in one breath.
-  int ji = -1, jzi = -1;
-  for (int i = 0; i < (int)c.mobs.Defs().size(); i++) {
-    if (c.mobs.Defs()[i].name == "jujunud") ji = i;
-    if (c.mobs.Defs()[i].name == "jujunud_zombie") jzi = i;
-  }
+  const int ji = c.mobs.FindDef("jujunud");
+  const int jzi =
+      ji >= 0 ? c.mobs.DefWithEffects("jujunud", {"zombie"}, nullptr) : -1;
   bool composes = ji >= 0 && jzi >= 0;
-  std::string composeWhy = composes ? "" : "no jujunud/jujunud_zombie def";
+  std::string composeWhy = composes ? "" : "no jujunud def, or jujunud+zombie did not compose";
   float jSpeed = 0.0f, jzSpeed = 0.0f;
   double jzChroma = 0.0, jChroma = 0.0;
   float lossJZ = 0.0f;
@@ -5744,7 +5733,7 @@ Status GateUndead(Ctx& c, std::string& detail) {
       "(blood lost %.1f vox), spurs/lost %.3f <= %.3f "
       "(%d), varies %d, blood: wound %.3f (>= %.3f and >= %.1fx anatomy "
       "%.3f) stain %.3f (>= %.3f), human wound/stain %u/%u (%d), dry hole "
-      "walls %u/%u = %.3f (%.2f..%.2f, %d); jujunud_zombie composes %d%s "
+      "walls %u/%u = %.3f (%.2f..%.2f, %d); jujunud+zombie composes %d%s "
       "(speed %.2f vs jujunud %.2f, chroma %.1f -> %.1f, lost %.3f)",
       sameArt ? 1 : 0, overrides ? 1 : 0, hChroma, zChroma, hLuma, zLuma,
       paler ? 1 : 0, hNow, hAt0, humanWhole ? 1 : 0, aNow, aAt0, lossA, lossMin,
@@ -5820,7 +5809,6 @@ Status GateZombify(Ctx& c, std::string& detail) {
 
   const int hi = c.mobs.FindDef("human"), zi = c.mobs.FindDef("zombie");
   const int ji = c.mobs.FindDef("jujunud");
-  const int jzi = c.mobs.FindDef("jujunud_zombie");
   const int ni = c.mobs.FindDef("newcomer");
   if (hi < 0 || zi < 0 || ni < 0) {
     detail = "need human, zombie and newcomer defs";
@@ -5830,8 +5818,10 @@ Status GateZombify(Ctx& c, std::string& detail) {
 
   // ---- A: the file wins ----------------------------------------------------
   const int humanZ = c.mobs.DefWithEffects("human", fx, nullptr);
+  // jujunud + zombie has no file (the effect is the whole recipe), so it is
+  // COMPOSED: a def of its own, never the human's zombie.
   const int jujuZ = ji >= 0 ? c.mobs.DefWithEffects("jujunud", fx, nullptr) : -1;
-  const bool authored = humanZ == zi && (ji < 0 || jujuZ == jzi);
+  const bool authored = humanZ == zi && (ji < 0 || (jujuZ >= 0 && jujuZ != zi));
   // ...and a zombie asked to become a zombie is already one.
   const bool idempotentZ = c.mobs.DefWithEffects("zombie", fx, nullptr) == zi;
 
@@ -6177,11 +6167,11 @@ Status GateZombify(Ctx& c, std::string& detail) {
   const bool ok = authored && idempotentZ && composed && cached && turned &&
                   rose && saved && kept;
   detail = Format(
-      "authored human+zombie=%d (def %d vs %d) jujunud=%d/%d, already-undead "
+      "authored human+zombie=%d (def %d vs %d) jujunud+zombie=%d (not %d), already-undead "
       "%d; composed %d%s (chroma %.1f -> %.1f, speed %.2f -> %.2f, defs %zu -> "
       "%zu), cached %d; turned %d%s; rose %d%s; saved %d%s; kept %d%s (armR "
       "%u -> %u carved, rose with %u, control %u, wearing %s holding %s)",
-      authored ? 1 : 0, humanZ, zi, jujuZ, jzi, idempotentZ ? 1 : 0,
+      authored ? 1 : 0, humanZ, zi, jujuZ, zi, idempotentZ ? 1 : 0,
       composed ? 1 : 0,
       composeWhy.empty() ? "" : (" [" + composeWhy + "]").c_str(), baseChroma,
       newChroma, baseSpeed, newSpeed, defsBefore, afterFirst, cached ? 1 : 0,

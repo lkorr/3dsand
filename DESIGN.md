@@ -6479,6 +6479,20 @@ happens before `model` is read, which is exactly the shape a generated
 character wants (inherit the rig, keep the body) and is now said out loud in
 the log when a `model` key is thereby ignored.
 
+**Prototypes and variants are FILED apart (2026-09-26).** `assets/mobs/<proto>.{vox,json}`
+is a prototype (human, critter, dummy); `assets/mobs/<proto>/<name>.{vox,json}`
+is a variant of it — every generated character, recolour and zombie of the
+human lives in `assets/mobs/human/`. The folder is filing, not semantics: a def
+is still named for its STEM wherever it is filed, `extends`/`model` still name
+stems, and a stem filed twice is refused with a log line (root wins). Stems stay
+globally sorted, so moving a file between folders does not renumber defs.
+`effects/` and `pool/` are not variant folders. One rule, four readers:
+`sidecar::IsVariantDir`/`StemPath`/`ListStems` (C++), `scripts/mobfiles.mjs`
+(Node), `tuner_server.py`'s `/api/models` (`variantOf` on each variant file),
+and the Models tab, which lists prototypes in its main picker and the open
+prototype's variants in a second one. The Characters page and `gen_mobs.mjs`
+write new characters into the folder of the prototype they extend.
+
 **The merge is three rules, and they live in `src/game/sidecar.cpp` with a
 line-for-line mirror in `assets/editor/sidecar.js`** (the Models tab, the
 Characters page, `gen_mobs.mjs` and `test_mobgen.mjs` all resolve through the
