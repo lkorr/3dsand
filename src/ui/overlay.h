@@ -161,8 +161,9 @@ struct UIState {
   int windFanKind = 0;            // 0 cone, 1 burst, 2 vortex
   bool windFanEntrain = true;     // may it pull SETTLED powder loose
   int brushRadius = 4;
-  // Powder brush grain size, eighths of a cell (8 = whole cells).
-  int brushGrain = 8;
+  // Powder brush grain size, eighths of a cell: 0 = mixed grains (default),
+  // 8 = whole cells.
+  int brushGrain = 0;
   int brushMaterial = 3;     // sand
   bool reloadShaders = false;
   bool reloadMaterials = false;

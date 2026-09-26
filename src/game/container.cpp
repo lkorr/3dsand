@@ -673,7 +673,10 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
     uint32_t made = 0;
     while (sp.units > 0 && parts.size() < kMaxParticleSpawnsPerTick &&
            made < partRoom) {
-      const int spend = std::min(kContainerUnitsPerCell, sp.units);
+      // A powder spills as one-eighth GRAINS (world.h POWDER ENTERS THE WORLD
+      // AS GRAINS): matter conserved, split, and whatever the budget cannot
+      // take this tick waits for the next.
+      const int spend = std::min(liquid ? kContainerUnitsPerCell : 1, sp.units);
       Vec3 p, v;
       sample((uint32_t)sp.units, p, v);
       ParticleSpawn ps{};

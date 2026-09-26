@@ -1558,6 +1558,10 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
         }
         uint32_t rub = mat < rubbleOf_.size() ? rubbleOf_[mat] : 0;
         uint32_t state = ((cellIdx * 2654435761u) >> 8) % 3u;
+        // Powder rubble crumbles (world.h POWDER ENTERS THE WORLD AS GRAINS).
+        if (rub < matGpu_.size() && matGpu_[rub].klass == CLASS_POWDER &&
+            (matGpu_[rub].flags & kMatFlagWander) == 0u)
+          state = PowderCrumbleState((cellIdx * 2654435761u) >> 5);
         if (rub < matGpu_.size() && matGpu_[rub].klass == CLASS_LIQUID) {
           state = 7u;  // LIQ_FULL_STATE: the nibble is fullness for liquids
         } else if (rub < matGpu_.size() &&
@@ -1712,7 +1716,10 @@ void DebrisSystem::RunIslandDetection(const Event& e, uint32_t tick, World& worl
           }
           const uint32_t rub = mat < rubbleOf_.size() ? rubbleOf_[mat] : 0;
           const bool frozen = rub < matGpu_.size() && matGpu_[rub].klass == CLASS_SOLID;
-          const uint32_t state = ((cellIdx * 2654435761u) >> 8) % 3u;
+          const bool crumbles = rub < matGpu_.size() && matGpu_[rub].klass == CLASS_POWDER &&
+                                (matGpu_[rub].flags & kMatFlagWander) == 0u;
+          const uint32_t state = crumbles ? PowderCrumbleState((cellIdx * 2654435761u) >> 5)
+                                          : ((cellIdx * 2654435761u) >> 8) % 3u;
           if (frozen) {
             if (spawns.size() >= kMaxParticleSpawnsPerTick) {
               floaters_.deferredSpawnRing++;

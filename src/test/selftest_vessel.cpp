@@ -564,7 +564,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
     sp.units = 20;
     fl.clear();
     got = ContainerSpillStep(sp, c.mats, 100, 4096, fl, pa, &ev);
-    bool pOk = pa.size() == 3;
+    bool pOk = pa.size() == 20;   // one-eighth grains (POWDER ENTERS THE WORLD AS GRAINS)
     uint32_t sandEighths = 0;
     for (const ParticleSpawn& p : pa) {
       pOk = pOk && (p.payload & 0xFFFu) == mSand && !(p.flags & kPFlagMicro) &&
@@ -572,7 +572,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
       sandEighths += PowderMassOfState((p.payload >> 12) & 0xFu);
     }
     check(got == 20 && sp.units == 0 && fl.empty() && pOk && sandEighths == 20,
-          "a broken pouch of sand lands exactly its 20 eighths (8 + 8 + 4)");
+          "a broken pouch of sand spills exactly its 20 eighths, as 20 grains");
     // A liquid the seam cannot hold (lava/blood-like: grid particles) lands
     // at EXACTLY what it held: 20 eighths = 8 + 8 + 4, the last MEASURED at
     // fullness code 3 -- not three full cells.

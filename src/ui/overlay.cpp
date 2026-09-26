@@ -1178,7 +1178,7 @@ void Overlay::Draw(UIState& s) {
   }
 
   ImGui::SliderInt("brush radius [ ]", &s.brushRadius, 1, 7);
-  ImGui::SliderInt("powder grain (eighths)", &s.brushGrain, 1, 8);
+  ImGui::SliderInt("powder grain (eighths, 0 = mixed)", &s.brushGrain, 0, 8);
 
   auto swatch = [&](int i) {
     if (i >= (int)s.materialColors.size()) return;

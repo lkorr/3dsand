@@ -14956,7 +14956,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
           worldOf(vp) + Rotate(q, Vec3{(float)d.x * inv, (float)d.y * inv,
                                        (float)d.z * inv});
       emitCell({ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, prod & 0xFFFu,
-               (rr >> 8u) % 3u);
+               (prod & 0xFFFu) < matGpu_.size() &&
+                       matGpu_[prod & 0xFFFu].klass == CLASS_POWDER
+                   ? PowderCrumbleState(rr >> 4u)
+                   : (rr >> 8u) % 3u);
     };
     // A HELD coat (the substrate absorbs: materials.json `absorb`) is liquid
     // in the voxel and leaves with any rewrite of it, as on the ground; a FILM
@@ -15288,7 +15291,10 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         for (int k = 0; k < nc2; k++) {
           const IVec3 t{ifloor(wv.x) + cnd[k].x, ifloor(wv.y) + cnd[k].y,
                         ifloor(wv.z) + cnd[k].z};
-          emitCell(t, r.prodNbr, (rr >> 8u) % 3u);
+          emitCell(t, r.prodNbr,
+                   r.prodNbr < matGpu_.size() && matGpu_[r.prodNbr].klass == CLASS_POWDER
+                       ? PowderCrumbleState(rr >> 4u)
+                       : (rr >> 8u) % 3u);
           fired = true;  // the rule is consumed even if the budget refused
           break;
         }

@@ -5114,6 +5114,30 @@ const POWDER_BLOCK_MIN   : u32 = 5u;
 fn matHasPowderMass(m : Material) -> bool {
   return m.klass == CLASS_POWDER && (m.flags & MATF_WANDER) == 0u;
 }
+// POWDER ENTERS THE WORLD AS GRAINS (2026-09-26, owner: "every instance that
+// introduces powder-like voxels needs to use grains"). A whole cell of sand on
+// flat ground is exactly at its 45-degree repose, so a heap made of whole
+// cells stays a heap of cubes forever; the grains have to be there from the
+// moment the powder appears. Two spellings, and every creator uses one:
+//
+//   GRAIN   exactly one eighth. For flows that must CONSERVE matter and so
+//           SPLIT it: wind lifting sand off a dune, a pouch pouring or
+//           spilling (they emit many one-eighth cells instead of one whole).
+//   CRUMBLE a hashed 1..8 eighths. For powder CREATED or CONVERTED from
+//           something that was not powder: ash from a burning solid, a
+//           reaction or gas-decay product, a fountain's emission, island
+//           rubble, a blast's ejecta, a spell's spray, the brush's default.
+//           None of those conserved matter before (ash from wood, a blast that
+//           vaporizes most of what it breaks), so a mix of clump sizes costs
+//           nothing that was counted, and the mix is what reads as grains.
+//
+// Worldgen bulk, authored prefabs and in-place powder<->powder/liquid
+// conversions keep their mass (carriedState). world.h mirrors both.
+const POWDER_GRAIN_STATE : u32 = 3u;   // one eighth
+fn powderCrumbleState(h : u32) -> u32 {
+  let m = 1u + (h % 8u);
+  return select(m + 2u, (h >> 3u) % 3u, m == POWDER_FULL);
+}
 fn powderStateIsPartial(s : u32) -> bool {
   return s >= POWDER_PARTIAL_LO && s <= POWDER_PARTIAL_HI;
 }

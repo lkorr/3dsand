@@ -881,6 +881,17 @@ SSBO lists of chunk indices.
   table records classes (`MaterialNameTable::classes`, 'CLS1'), so a material
   that changed class converts its nibble (`MatRemap::State`: fullness <->
   mass, eighths kept).
+- **POWDER ENTERS THE WORLD AS GRAINS (2026-09-26).** A whole cell of sand on
+  flat ground is exactly at its 45-degree repose, so a heap built of whole
+  cells stays a heap of cubes; the grains must be there when the powder
+  appears. Every creator uses one of two spellings (common.wgsl / world.h):
+  GRAIN (one eighth) where matter is conserved and SPLIT -- wind lifting sand
+  (`windGrain`), a pouch pouring (`pourGrainEighths`) or spilling; CRUMBLE (a
+  hashed 1..8 eighths) where powder is created or converted from something
+  that was not powder -- reaction and gas-decay products, fountain emissions,
+  ash off burning limbs, island rubble, blast ejecta, spell sprays and the
+  brush's default "mixed" grain. Worldgen bulk, prefabs and in-place
+  powder/liquid conversions keep their mass (`carriedState`).
 - **PER-MATERIAL ANGLE OF REPOSE (2026-09-13).** One down, one across is 45°,
   and for years that was the angle of *every* powder in the engine — dry sand,
   angular gravel, snow, ash and dust all built the same cone. One optional

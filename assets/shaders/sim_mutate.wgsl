@@ -155,10 +155,12 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // A powder brush with a GRAIN size (world.h BrushOp.pad1 bits 4..7, 1..7
   // eighths; 0 = whole cells) paints partial cells: a fine brush lays a
   // dusting instead of a block (common.wgsl POWDER MASS).
+  // 15 = MIXED: each painted cell a crumble (POWDER ENTERS THE WORLD AS
+  // GRAINS), the brush's default.
   let grain = (op._p1 >> 4u) & 0xFu;
-  if (grain >= 1u && grain < POWDER_FULL && mat != MAT_AIR &&
-      matHasPowderMass(materials[mat])) {
-    state = grain + 2u;
+  if (mat != MAT_AIR && matHasPowderMass(materials[mat])) {
+    if (grain >= 1u && grain < POWDER_FULL) { state = grain + 2u; }
+    else if (grain == 15u) { state = powderCrumbleState(rnd >> 2u); }
   }
   voxStore(idx, packVox(mat, state, STAMP_NEVER));
   markBoth(c);

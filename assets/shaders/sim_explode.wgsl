@@ -218,6 +218,13 @@ fn apply(@builtin(workgroup_id) wg : vec3<u32>,
   p.vy = local.y * speed / dist + (i32((rnd >> 15u) & 0x7Fu) - 32);  // bias up
   p.vz = local.z * speed / dist + (i32((rnd >> 22u) & 0x7Fu) - 64);
   p.payload = w & 0xFFFFu;
+  // A POWDER cell a blast throws flies as a CRUMBLE, not as a brick (common.wgsl
+  // POWDER ENTERS THE WORLD AS GRAINS): the blast vaporizes most of what it
+  // breaks anyway, and what lands is a scatter of grains.
+  let em = materials[w & 0xFFFu];
+  if (matHasPowderMass(em)) {
+    p.payload = (w & 0xFFFu) | (powderCrumbleState(hash3(rnd, 0xC4u, slotIdx)) << 12u);
+  }
   p.flags = PFLAG_ALIVE;
   pReadBuf[slot] = p;
 }

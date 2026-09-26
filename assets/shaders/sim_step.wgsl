@@ -1135,6 +1135,10 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
 // nibble is fullness, not a palette variant).
 fn productState(mat : u32, r : u32) -> u32 {
   if (mat != MAT_AIR && materials[mat].klass == CLASS_LIQUID) { return LIQ_FULL_STATE; }
+  // A powder CREATED from something that was not powder (ash off a burning
+  // solid, a fountain's emission, a product in an empty face) is born as a
+  // CRUMBLE -- see POWDER ENTERS THE WORLD AS GRAINS in common.wgsl.
+  if (mat != MAT_AIR && matHasPowderMass(materials[mat])) { return powderCrumbleState(r); }
   return r % 3u;
 }
 
@@ -1144,24 +1148,27 @@ fn productState(mat : u32, r : u32) -> u32 {
 // 1/8 of sand. Before powder carried mass every product was born full, which
 // minted matter from any partial liquid; that is what this retires.
 //
-// The eighths the cell word `sw` holds: a liquid's fullness, a powder's mass,
-// and 8 for everything else (a solid, or a whole cell of anything).
+// The eighths the cell word `sw` holds if it is MATTER THAT HAS EIGHTHS: a
+// liquid's fullness or a powder's mass (1..8). 0 for everything else -- a
+// solid, a gas, air -- which is "no mass to carry".
 fn cellEighths(sw : u32) -> u32 {
   let sm = materials[voxMat(sw)];
   if (sm.klass == CLASS_LIQUID) { return voxState(sw) + 1u; }
   if (matHasPowderMass(sm)) { return powderMass(sw); }
-  return 8u;
+  return 0u;
 }
-// The product's state nibble when the cell it replaces held `e` eighths. A
-// liquid or powder product keeps the mass; anything else (and anything made
-// from a whole cell) is born exactly as productState always made it. Solid
-// products from a partial POWDER never get here -- doReactions refuses the
-// rule (selfPartialPowder) -- and gas ones are thinned in reactWriteSelf.
+// The product's state nibble when the cell it replaces held `e` eighths
+// (cellEighths). A powder or liquid source hands its eighths on: 3/8 of snow
+// melts to 3/8 of water, a whole cell of gravel etched by acid is a whole
+// cell of sand. A source with no eighths (e == 0: wood burning to ash) gets
+// productState -- a crumble for a powder product. Solid products from a
+// partial POWDER never get here (doReactions refuses the rule) and gas ones
+// are thinned in reactWriteSelf.
 fn carriedState(prod : u32, e : u32, r : u32) -> u32 {
-  if (e < 8u && prod != MAT_AIR) {
+  if (e != 0u && prod != MAT_AIR) {
     let pm = materials[prod];
-    if (pm.klass == CLASS_LIQUID) { return e - 1u; }
-    if (matHasPowderMass(pm)) { return e + 2u; }
+    if (pm.klass == CLASS_LIQUID) { return min(e, 8u) - 1u; }
+    if (matHasPowderMass(pm)) { return select(e + 2u, r % 3u, e >= POWDER_FULL); }
   }
   return productState(prod, r);
 }
@@ -1355,7 +1362,7 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
   }
   // Self's eighths (8 for a synthesized self: that cell is air). Read before
   // the store below; nothing on the reaction paths writes self before this.
-  var e = 8u;
+  var e = 0u;
   var selfPowder = false;
   if (!synthSelf) {
     let sw = voxWordAt(c);
@@ -1366,7 +1373,7 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
   // gas cell with probability e/8 and otherwise just goes: a dusting burns
   // like 1/8 of a pile, not like a pile. Gas has no eighths to carry, and the
   // roll keeps expected mass exact without one.
-  let thinned = selfPowder && e < 8u && prod != 0u &&
+  let thinned = selfPowder && e < POWDER_FULL && prod != 0u &&
                 materials[prod].klass == CLASS_GAS && ((rnd >> 5u) & 7u) >= e;
   if (prod == 0u || thinned) { voxStore(idx, 0u); }
   else { voxStore(idx, packVox(prod, carriedState(prod, e, rnd), stamp)); }
@@ -1967,7 +1974,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             if (rule.prodNbr == 0u) { voxStore(ni, 0u); }
             else {
               // A partial neighbour keeps its eighths (carriedState).
-              let ne = select(cellEighths(niw.y), 8u, synthFluid);
+              let ne = select(cellEighths(niw.y), 0u, synthFluid);
               voxStore(ni, packVox(rule.prodNbr, carriedState(rule.prodNbr, ne, rr >> 4u), stamp));
             }
             markVoxActive(ni);
@@ -3119,10 +3126,39 @@ fn windEntrain(c : vec3<i32>, w32 : u32, m : Material, slotIdx : u32) -> bool {
   if (i32((windRnd(slotIdx) >> 10u) & 1023u) >= WIND_ENTRAIN_CHANCE) {
     return false;
   }
-  if (tryMove(c, c + vec3<i32>(d.x, 0, d.y), w32, m.density, false)) {
+  // A GRAIN, not a cell (POWDER ENTERS THE WORLD AS GRAINS): a wind that
+  // beats the friction lifts ONE EIGHTH off the surface into open air, and
+  // the rest of the cell stays. Matter is conserved exactly, a dune smokes
+  // grains instead of launching bricks, and each grain then falls and merges
+  // like any other. Into anything but air (a lighter fluid) it is the old
+  // whole-cell move. Mites are not grains and move whole.
+  if (windGrain(c, c + vec3<i32>(d.x, 0, d.y), w32, m) ||
+      tryMove(c, c + vec3<i32>(d.x, 0, d.y), w32, m.density, false)) {
     return true;
   }
-  return tryMove(c, c + vec3<i32>(d.x, 1, d.y), w32, m.density, false);
+  return windGrain(c, c + vec3<i32>(d.x, 1, d.y), w32, m) ||
+         tryMove(c, c + vec3<i32>(d.x, 1, d.y), w32, m.density, false);
+}
+
+// One eighth from c into the AIR cell dst (reach 1). A one-eighth cell has
+// nothing left to split and simply moves (tryMove), as before.
+fn windGrain(c : vec3<i32>, dst : vec3<i32>, w : u32, m : Material) -> bool {
+  if (!matHasPowderMass(m) || !inBounds(dst)) { return false; }
+  let f = powderMass(w);
+  if (f <= 1u) { return false; }
+  let dv = voxIndexAndWord(dst);
+  if (voxMat(dv.y) != MAT_AIR) { return false; }
+  let myMat = voxMat(w);
+  let stamp = stampFor(T.tick, P.substep);
+  voxStore(dv.x, packVox(myMat, POWDER_GRAIN_STATE, stamp));
+  var si = gSelfIdx;
+  if (any(c != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(c); }
+  voxStore(si, packVoxKeepStain(myMat, powderStateFor(f - 1u, c, ptSeed()), stamp, w));
+  markVoxActive(dv.x);
+  markVoxActive(si);
+  markDirtyR(c, DIRTY_R_MOVE);
+  markDirtyR(dst, DIRTY_R_MOVE);
+  return true;
 }
 
 // ---- THE STAMP GATE MUST NOT EAT A KEEP-AWAKE MARK (rule-unification W2-R) --

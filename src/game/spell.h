@@ -458,6 +458,13 @@ struct GlyphLibrary {
   int32_t Arcane(uint32_t mat) const {
     return mat < arcane.size() ? arcane[mat] : 0;
   }
+  // 1 where the material is a powder with MASS (not a critter): a spray of it
+  // lands as a crumble (world.h POWDER ENTERS THE WORLD AS GRAINS). Copied at
+  // load beside `arcane`, for the same reason.
+  std::vector<uint8_t> crumbles;
+  bool Crumbles(uint32_t mat) const {
+    return mat < crumbles.size() && crumbles[mat] != 0;
+  }
   // The implicit delivery (R5). Not in `glyphs`, so it cannot be spoken; its
   // record fields come from the "hand" block.
   GlyphDef hand;

@@ -372,7 +372,8 @@ struct BrushOp {
   uint32_t mode;  // 0 = paint into air, 1 = overwrite
   // pad0: a transmute's FROM filter; pad1 bit 0: its wildcard-matches-matter
   // flag; pad1 bits 4..7: a powder brush's GRAIN size in eighths (0 = whole
-  // cells) -- sim_mutate.wgsl reads all three by the names _p0/_p1.
+  // cells, 15 = MIXED: each cell a crumble) -- sim_mutate.wgsl reads all three
+// by the names _p0/_p1.
   uint32_t pad0 = 0, pad1 = 0;
 };
 constexpr uint32_t kBrushGrainShift = 4;
@@ -1823,6 +1824,15 @@ inline bool PowderStateIsPartial(uint32_t s) {
 }
 inline uint32_t PowderMassOfState(uint32_t s) {
   return PowderStateIsPartial(s) ? s - 2u : kPowderFull;
+}
+// POWDER ENTERS THE WORLD AS GRAINS -- the C++ twin of common.wgsl's block of
+// that name (read it for which creator uses which). GRAIN = one eighth, for
+// flows that split conserved matter; CRUMBLE = a hashed 1..8 eighths, for
+// powder created or converted from something that was not powder.
+constexpr uint32_t kPowderGrainState = 3u;
+inline uint32_t PowderCrumbleState(uint32_t h) {
+  const uint32_t m = 1u + (h % 8u);
+  return m == kPowderFull ? (h >> 3) % 3u : m + 2u;
 }
 // State nibble for `mass` eighths (1..8) at world (x,y,z); full takes the
 // positional variant, as common.wgsl powderStateFor does.
