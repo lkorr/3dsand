@@ -4,8 +4,8 @@
 // (x,z)" for a grid of columns, and the Worldgen tab drew that. A column map
 // cannot show a cave, an overhang, a tree, a pond's floor, the sediment wedge
 // as anything but a number, or a single voxel — because none of those are
-// functions of (x,z). The world's actual content is `genCell` in
-// worldgen.wgsl, and genCell runs on the GPU.
+// functions of (x,z). The world's actual content is `genCellIn` in
+// worldgen.wgsl, and genCellIn runs on the GPU.
 //
 // So this module boots the engine's real GPU worldgen and reads a box of it
 // back. There is no second copy of the terrain here: the box is filled by the

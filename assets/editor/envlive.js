@@ -60,7 +60,7 @@ function conditions(base, readSet, pkg, why) {
 
 const COND_TREE = 'P-D: the row’s conditions are packed per (biome, species) into the tree atlas (TA_C_*) and compared in treeInfoAt; a gated-out pick grows nothing.';
 const COND_COVER = 'P-D: enforced in the cover block (WM_C_MIN_Y/MAX_Y/MAX_SLOPE/PATCH_THRESH, nearWater via waterDistAt); P-G: canopyMin/Max against the column canopy cover (WM_C_CANOPY_MIN/MAX), the condition the old undergrowth/flower chain became.';
-const COND_WATER = 'P-F: packed per row (WM_R_MIN_Y / MAX_Y / MAX_SLOPE) and tested at the pond centre in pondInfo; the water distance gates mean nothing for a body of water and the patch gate has no package yet.';
+const COND_WATER = 'P-F: packed per row (WM_R_MIN_Y / MAX_Y / MAX_SLOPE) and tested at the pond centre in pondGate; the water distance gates mean nothing for a body of water, and the pond roll has no patch gate (patchThreshold is not packed).';
 const COND_CAVE = 'cave rows are read for their threshold only; per-row conditions have no package yet.';
 
 export const LIVE = {

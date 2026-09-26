@@ -1,5 +1,13 @@
 # Biomes, water bodies and the Environment tab — plan of record
 
+> **SUPERSEDED (2026-09-26).** The worldgen consumer this plan scheduled in
+> §5 was built by `docs/PLAN_environment_truth.md` (P-D trees, P-E flora, P-F
+> water presets + the pond table, P-G terrain) and the world map
+> (`docs/PLAN_world_map.md`); follow-through is `docs/PLAN_map_overhaul.md`.
+> The status lines below are the 2026-09-01 state and are kept as history.
+> Code truth: `assets/shaders/worldgen.wgsl`, `src/sim/biomes.*`,
+> `src/sim/worldmap.*`.
+
 Status 2026-09-01: **the authoring layer and its validation are BUILT; the
 worldgen consumer is NOT.** §1–§4 are what shipped and why; §5 is the wiring
 plan, ordered by risk; §6 is the research this was built on, with sources.

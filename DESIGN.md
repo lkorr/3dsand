@@ -550,8 +550,7 @@ are deduplicated across mob defs, so 128 slots cover a whole cast.
   demotes on the verdict when `cpuDirty`, the snapshot dirty flags and the
   write-reach clock (`ReachTick < genTick`) all prove nothing wrote it since
   generation; otherwise it takes the word copy as before.
-  `SANDVOX_GEN_VERDICT_CHECK=1` classifies every worldgen batch both ways and
-  counts disagreements. Between T and T+K the plane is resident and drawn but
+  Between T and T+K the plane is resident and drawn but
   nothing dispatches it; a neighbour that writes into it lands on a real page
   (every gen slot has one) and marks it dirty through the ordinary path.
 
@@ -3946,7 +3945,7 @@ TerrainHeight's ~30 callers is asking where the ground is so it can stand
 something on it.
 
 **The pond half of the contract reads a table since P-F** (environment truth,
-2026-09-06). `pondInfo` / `bowlDepth` / `bermLift` / `pondNear` stay inside
+2026-09-06). `pondRoll` / `bowlDepth` / `bermLift` / `pondNear` stay inside
 `MIRROR-BEGIN height` and token-identical on both sides, but every number
 they use is a water PRESET's (`assets/water/<name>.json`, packed by
 `worldmap::WaterGeomOf` into the worldMap buffer's `kW_*` record and kept on
@@ -14839,8 +14838,8 @@ read as a single continuous sheet: it had exactly the information a column field
 has. A cave, an overhang, a tree, the floor of a pond and a single voxel are all
 things that are *not* functions of (x, z), so none of them could ever appear.
 
-The world's real content is `genCell` in `worldgen.wgsl`, and genCell runs on the
-GPU. So the viewer needs actual voxels off the actual device.
+The world's real content is `genColumn` + `genCellIn` in `worldgen.wgsl`, and
+they run on the GPU. So the viewer needs actual voxels off the actual device.
 
 ### 9c.2 The region server (`src/tools/voxregion.h`)
 
@@ -15878,7 +15877,10 @@ the one model modders already read (PLAN_biomes.md §2 has the survey).
   `density × (T/tile)²` in Q16 — `kB_TreeChanceQ16` — so trees per hectare
   are the page's number by construction; `TREE_TILE`/`TREE_SCAN`/
   `TREE_CAND_MAX` are load-time prelude constants from `treeatlas.h
-  TreeLatticeFor`, `worldgen.treeTile` is gone, and `LoadTreeAtlas` refuses a
+  TreeLatticeFor` (emitted for `worldgen.wgsl` alone, with `POND_TILE` and
+  `REF_VOXELS_PER_METRE`, by `resources.cpp WorldgenPrelude`, so an
+  environment edit that moves them misses the SPIR-V cache for one shader,
+  not all of them), `worldgen.treeTile` is gone, and `LoadTreeAtlas` refuses a
   crown wider than the 5x5 candidate cap on that lattice), the per-row
   `conditions` on tree and cover rows (`minY`/`maxY`/`maxSlope`/
   `nearWaterMax`/`nearWaterMin`/`patchThreshold`, packed per (biome, species)
@@ -16076,11 +16078,12 @@ all fringe — which is what limnology says and what keeps the parameter count
 sane. `columnAt()` is the one answer to "what is at (x, z) of this body"; the
 standalone preview and the biome swatch both call it.
 
-The engine's pond today is still `pondAt`'s parabolic disc, inside the
-CPU-mirrored `height` block. PLAN_biomes.md §5 orders the wiring seams by
-risk: cover blocks and `treeInfoAt` chances first (outside every mirror), then
-`biomeAt` reading a table, then pond geometry last (it needs a C++ twin of the
-table under the mirror's token compare).
+The engine's pond is a DISC wearing a water preset (`pondRoll` / `pondGate` /
+`bowlDepth` / `bermLift` / `pondNear`, inside the CPU-mirrored `height`
+block): the preset's radius band, sampled depth profile, berm, bed and shore
+band are packed into the worldMap buffer (`kW_*`) and read by both sides of
+the mirror through the same accessors. The shaped footprint (lobes, islands)
+and floor noise above are preview-only.
 
 ### The swatch is a scale ladder, composed off the main thread (2026-09-01)
 

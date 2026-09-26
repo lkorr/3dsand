@@ -180,14 +180,11 @@ bool RenderStatsEnabled() { return g_renderStatsEnabled; }
 // these load-time inputs; ShaderConstantPrelude memoizes on them so the build
 // pool's 23 LoadShader calls format it once instead of 23 times. ADD AN INPUT
 // HERE when the prelude grows a non-constant line, or a reload that moves it
-// will keep serving the old text.
+// will keep serving the old text. (The asset-derived worldgen constants are
+// NOT in this prelude -- see WorldgenPrelude.)
 static std::string PreludeInputsKey() {
-  const treeatlas::TreeLattice& l = treeatlas::CurrentTreeLattice();
   return std::to_string((int)g_fragmentStoresAvailable) + "," +
-         std::to_string((int)g_renderStatsEnabled) + "," + std::to_string(l.tile) +
-         "," + std::to_string(l.scan) + "," + std::to_string(l.candMax) + "," +
-         std::to_string(worldmap::CurrentWorldMap().pondTile) + "," +
-         std::to_string(worldmap::CurrentTerrain().refVoxelsPerMetre);
+         std::to_string((int)g_renderStatsEnabled);
 }
 static std::string BuildShaderConstantPrelude();
 std::string ShaderConstantPrelude() {
@@ -411,34 +408,6 @@ static std::string BuildShaderConstantPrelude() {
   // scale-free. Emitted at full precision so it round-trips the f32 exactly.
   o.precision(9);
   o << "const VOXEL_METERS : f32 = " << kVoxelMeters << ";\n";
-  // The tree lattice (sim/treeatlas.h TreeLattice; docs/PLAN_environment_truth
-  // P-D): the finest authored biome tile, and the scan / candidate cap derived
-  // from it and the atlas's widest reach. LOAD-TIME ASSET DATA rather than a
-  // world.h constant -- Simulation::Init sets it from the atlas it uploads
-  // before the first LoadShader. Mirrored by scripts/tree_lattice.py for
-  // check_shaders.sh, which derives the same three numbers from the assets.
-  {
-    const treeatlas::TreeLattice& l = treeatlas::CurrentTreeLattice();
-    o << "const TREE_TILE : i32 = " << l.tile << ";\n";
-    o << "const TREE_SCAN : i32 = " << l.scan << ";\n";
-    o << "const TREE_CAND_MAX : i32 = " << l.candMax << ";\n";
-  }
-  // The pond lattice (worldmap.h kHPondTile; docs/PLAN_environment_truth P-F):
-  // the finest live water tile of any biome, as LOAD-TIME ASSET DATA like the
-  // tree lattice -- and a CONSTANT rather than the header word the buffer
-  // also carries, because worldgen divides by it in ~1000 inlined places
-  // (fdiv/fmodp per pond tile, per tree candidate) and a division by a
-  // runtime value there is what took the driver's worldgen compile from
-  // minutes to never. Simulation::UploadEnvironment recompiles when a reload
-  // moves it. Mirrored by scripts/pond_lattice.py for check_shaders.sh.
-  o << "const POND_TILE : i32 = " << worldmap::CurrentWorldMap().pondTile << ";\n";
-  // The scale the map's terrain is authored at (map.json terrain
-  // .refVoxelsPerMetre, P-G): worldgen.wgsl's vlen() divides its hardcoded
-  // lengths by it in module-scope consts, so it has to be a constant. LOAD-TIME
-  // ASSET DATA like the two lattices above; Simulation::UploadEnvironment
-  // recompiles when a reload moves it. Mirrored by scripts/map_terrain.py for
-  // check_shaders.sh.
-  o << "const REF_VOXELS_PER_METRE : i32 = " << worldmap::CurrentTerrain().refVoxelsPerMetre << ";\n";
   // The same number as an INTEGER reciprocal, for the sim/worldgen side. It has
   // to be integer and it has to come from here: everything worldgen authors in
   // metres (the whole tree and cactus size table) converts through it, and the
@@ -617,6 +586,36 @@ std::string ReferencedTuningBlock(const std::string& block, const std::string& t
   return out;
 }
 
+// THE WORLDGEN-ONLY PRELUDE: load-time ASSET DATA that only worldgen.wgsl
+// reads, emitted for that one shader so an edit to a biome's tree tile, a
+// water tile or the map's reference scale changes one shader's source (one
+// SPIR-V cache miss) instead of every shader's. They are constants rather
+// than buffer words because worldgen divides by them in ~1000 inlined places
+// and sizes an array by TREE_CAND_MAX; a runtime divisor there took the
+// driver's compile from minutes to never. Simulation::Init / UploadEnvironment
+// set the inputs before the first LoadShader and recompile when a reload
+// moves them. scripts/check_shaders.sh appends the same block to worldgen.wgsl
+// only, derived from the assets by tree_lattice.py / pond_lattice.py /
+// map_terrain.py.
+static std::string WorldgenPrelude() {
+  std::ostringstream o;
+  // The tree lattice (sim/treeatlas.h TreeLattice): the finest authored biome
+  // tile, and the scan / candidate cap derived from it and the atlas's widest
+  // reach.
+  const treeatlas::TreeLattice& l = treeatlas::CurrentTreeLattice();
+  o << "const TREE_TILE : i32 = " << l.tile << ";\n";
+  o << "const TREE_SCAN : i32 = " << l.scan << ";\n";
+  o << "const TREE_CAND_MAX : i32 = " << l.candMax << ";\n";
+  // The pond lattice (worldmap.h kHPondTile): the finest live water tile of
+  // any biome.
+  o << "const POND_TILE : i32 = " << worldmap::CurrentWorldMap().pondTile << ";\n";
+  // The scale the map's terrain is authored at (map.json
+  // terrain.refVoxelsPerMetre): vlen() divides the kernel's hardcoded lengths
+  // by it in module-scope consts.
+  o << "const REF_VOXELS_PER_METRE : i32 = " << worldmap::CurrentTerrain().refVoxelsPerMetre << ";\n";
+  return o.str();
+}
+
 bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
                           std::string& out) {
   std::string common, body;
@@ -663,7 +662,8 @@ bool AssembleShaderSource(const std::string& shaderDir, const std::string& name,
   // the rest would only make the cache key move when they do.
   const std::string tuningBlock =
       ReferencedTuningBlock(TuningWgslBlock(CurrentTuning()), ptSeed + common + body);
-  out = ShaderConstantPrelude() + "\n" + tuningBlock + "\n" + ptSeed + common +
+  const std::string wgPrelude = name == "worldgen.wgsl" ? WorldgenPrelude() : std::string();
+  out = ShaderConstantPrelude() + "\n" + tuningBlock + "\n" + ptSeed + wgPrelude + common +
         "\n" + body;
   return true;
 }

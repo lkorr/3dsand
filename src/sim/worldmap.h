@@ -5,8 +5,8 @@
 // diffable half -- cell size, extent, the biome roster that DEFINES the id
 // space, hand-placed sites, seeded placement rules) beside `map.svmap` (the
 // painted half -- three u8 planes: biome, landform, moisture). It is authored
-// in the tuner's World Map tab and named by `worldgen.mapLayer` in
-// tuning.json, exactly as `worldgen.editLayer` names a `.svedit`.
+// on the tuner's Environment -> World map page and named by `world.mapLayer`
+// in tuning.json, exactly as `world.editLayer` names a `.svedit`.
 //
 // WHY A MAP AND NOT MORE NOISE. docs/RESEARCH_worldgen.md §8 asked the
 // question and answered it: a falling-sand sandbox's replay value is in the
@@ -25,7 +25,7 @@
 //   Tier A  the MAP        seed-INDEPENDENT. Where the mountains are, where
 //                          the ocean is, which region is which. Same on every
 //                          seed. Read from the planes here.
-//   Tier B  the REGION     seeded. The boundary warp, which lake, which ruin,
+//   Tier B  the REGION     seeded. The boundary warp, which pond rolls,
 //                          which sub-variant. hash3(seed ^ salt, ...).
 //   Tier C  the LOCAL      seeded. Trees, cover, caves, boulders.
 //
@@ -39,17 +39,17 @@
 //
 // DETERMINISM (rule 1). The map is a new INPUT beside the seed, not a source
 // of runtime state: every read is a pure function of (world coords, map
-// content), integer throughout, so `genCell` stays reproducible. Because it is
+// content), integer throughout, so worldgen stays reproducible. Because it is
 // an input, changing a painted cell moves the world hash the same way a
 // material or a re-baked tree does -- that is a rebaseline, not a regression.
 // The map's content hash is reported at boot so a moved hash can be attributed
 // to "the map changed" without a bisect.
 //
-// STATUS. P0 (this commit) defines the GPU header layout and binds an empty
-// buffer at binding 31 in both sim layouts, with no reader, so the plumbing --
-// bind groups, pass table rows, check_pass_table sets -- lands with the world
-// hash provably unmoved. The loader, the samplers and the editor arrive in
-// P1/P2/P3. See docs/PLAN_world_map.md.
+// STATUS. Live: the buffer at binding 31 in both sim layouts carries the
+// header, the painted planes, the biome / cover / water-row records, the water
+// presets and the site table; worldgen.wgsl reads all of it (WM_* consts,
+// held to the enums below by check_invariants.py). History:
+// docs/PLAN_world_map.md, docs/PLAN_map_overhaul.md.
 #pragma once
 
 #include <cstdint>
@@ -187,7 +187,8 @@ enum : uint32_t {
   kB_CoverOff = 8,        // word offset of this biome's first cover row
   kB_CaveThreshold1 = 9,  // near-surface cave band gate (0..255)
   kB_CaveThreshold2 = 10, // deep cave band gate
-  kB_SedMax = 11,         // reserved for P4 (0 = use the global knob)
+  // 11 unused (was kB_SedMax, never read: the wedge's cap is the map's
+  // terrain.sedMax, kHTerrainSedMax)
   kB_Flags = 12,          // kBF_* below
   kB_MaxCoverH = 13,      // tallest cover row (voxels, jitter included): the
                           // sky-skip and far-blocker ceilings MUST include it,
@@ -269,12 +270,11 @@ enum : uint32_t {
   kR_MinY = 2,            // -1 = unbounded (i32 in u32)
   kR_MaxY = 3,
   kR_MaxSlope = 4,        // Q8; 0 or >= 1024 = unbounded
-  kR_PatchThreshold = 5,  // 0..255 gate on the biome patch field at the centre
-  // 6..7 reserved
+  // 5..7 reserved (a water row's conditions.patchThreshold is not packed:
+  // the pond roll has no patch gate)
 };
-// kB_Flags bits. These replace the `biome == B_DESERT` / `== B_PINE` tests
-// that used to gate whole blocks of genCellIn on a hard-coded id.
-inline constexpr uint32_t kBF_GroundFlora = 1u << 0;  // the canopy-inverted undergrowth + flower layer
+// kB_Flags bits: which of genCellIn's fixed-function blocks a biome gets.
+inline constexpr uint32_t kBF_GroundFlora = 1u << 0;  // the tile plants (fern banks, big toadstools)
 inline constexpr uint32_t kBF_Cacti = 1u << 1;        // the cactus proc shape
 inline constexpr uint32_t kBF_SandCap = 1u << 2;      // loose sand cap under the skin (the old desert rule)
 inline constexpr uint32_t kBF_CanopyRows = 1u << 3;   // some cover row bounds the canopy cover (P-G): scan the trees once per column
@@ -347,9 +347,9 @@ enum : uint32_t {
   kW_BedShallowDepth = 34,     // water shallower than this wears bed.shallow
   kW_BedThickness = 35,        // cells of bed on the floor, >= 1
   kW_BedSubstrate = 36,        // bed.substrate id: the SOLID a face too steep for a powder bed wears
-  kW_MaxSlope = 37,            // placement.maxSlope, Q8 (the biome row's own gate is what rolls)
-  kW_MinY = 38,                // placement.minY (i32; informational)
-  kW_MaxY = 39,                // placement.maxY (i32; informational)
+  // 37..39 unused: a preset's placement.maxSlope / minY / maxY are the
+  // DEFAULTS the biome page seeds a new water row with; what rolls is the
+  // biome row's own conditions (kR_*), so they are not packed
   kW_Band = 40,                // max(kW_ShoreBand, kW_BermW): pondNear's per-disc reach
   kW_Knots = 41,               // 17 Q8 knots, two per word (low half first): words 41..49
   // 50..63 reserved
@@ -473,7 +473,6 @@ struct WaterGeom {
   int bermH = 0, bermW = 1;
   int shoreBand = 0, shoreLift = 0, mudWidth = 0;
   int bedShallowDepth = 0, bedThickness = 1;
-  int maxSlope = 1024, minY = -1, maxY = -1;
   int band = 1;                          // max(shoreBand, bermW)
   uint32_t fill = 0, mudMat = 0, bedShallow = 0, bedDeep = 0, bedSubstrate = 0;
   int knots[17] = {};                    // Q8 depth fractions at u_k = sqrt(k/16), non-increasing

@@ -1467,7 +1467,7 @@ static_assert(kShadowSubdivMax <= 8, "shadowPackSub gives each axis 3 bits");
 // state nibble is exactly the worldgen palette variant for that cell's WORLD
 // position". That is representable because the variant is not random: it is
 // `hash3(seed ^ 0xC0FFEE, x ^ (z << 12), y) % 3`, a pure function of position
-// and seed (worldgen.wgsl genCell). So the chunk's 4,096 words are describable
+// and seed (worldgen.wgsl genCellIn). So the chunk's 4,096 words are describable
 // by 4 bytes plus a formula, and readers, the hash and materialization all
 // reconstruct them on demand.
 //
@@ -1777,7 +1777,7 @@ inline uint32_t SynthWord(uint32_t entry) {
 }
 
 // ---- the JITTER synthesis rule: the SECOND half of the hash contract -------
-// EXACT mirror of genCell's variant assignment (worldgen.wgsl) and of
+// EXACT mirror of genCellIn's variant assignment (worldgen.wgsl) and of
 // synthJitterState / synthWordAt in common.wgsl. Four copies of one formula is
 // three too many, but the alternatives are worse: worldgen is a shader, the
 // hash path is a shader, and the CPU needs it for eviction and the mirror. The
@@ -1790,7 +1790,7 @@ inline uint32_t SynthWord(uint32_t entry) {
 // copy, for exactly the reason rng.h's header comment gives.
 //
 // The palette variant worldgen gives the cell at world position (x,y,z).
-// Mirrors worldgen.wgsl genCell: rnd = hash3(seed ^ 0xC0FFEE,
+// Mirrors worldgen.wgsl genCellIn: rnd = hash3(seed ^ 0xC0FFEE,
 // x ^ (z << 12), y), state = rnd % 3. The bitcast to u32 of a negative
 // coordinate is two's complement in both languages (the documented WGSL
 // bitcast trap) — C++ gets it from the same (uint32_t) cast.
@@ -3750,8 +3750,8 @@ struct CachedChunk {
 // back to the CPU — the worldgen read was 16 x 32 MiB synchronous, 512 MiB per
 // regen. The class is PageTable::Classify's answer to the same words, in the
 // same order (EMPTY, then whole-word UNIFORM, then JITTER) — see
-// PageTable::ClassifyGenVerdict for the one CPU decoder and
-// SANDVOX_GEN_VERDICT_CHECK=1 for the cross-check against Classify.
+// PageTable::ClassifyGenVerdict for the one CPU decoder (an unpublished
+// verdict falls back to Classify over the read-back words).
 //
 // EXACT MIRROR of the GEN_V_* consts in worldgen.wgsl (its only writer).
 constexpr uint32_t kGenVerdictAct = 1u << 0;     // a cell can act (deferred wake)

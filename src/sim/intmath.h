@@ -19,20 +19,8 @@
 // integer arithmetic on integer inputs, so it produces the same bits on every
 // machine that has a 64-bit integer multiply.
 //
-// WHY NOT REUSE worldgen's `isin16`. There is already an integer sine in this
-// codebase — `isin16` in world.cpp, a token mirror of the one in
-// worldgen.wgsl. It is deliberately NOT used here. Two reasons, both hard:
-//   1. Accuracy. isin16 is a parabola with one correction term; its worst-case
-//      error is ~0.2% of full scale. That is invisible in a ridge flank (what
-//      it was written for) and far too coarse for a Q16.16 wind vector or a
-//      landform accumulator, where 0.2% is thousands of low bits.
-//   2. It is a MIRROR. isin16 must stay byte-identical to the WGSL kernel's
-//      copy (check_invariants.py's worldgen mirror compares the two token for
-//      token); improving it would move every voxel of terrain in the world.
-//      That is a different change with a different owner.
-// So this is a second, more accurate integer sine with a different job, and
-// the two are not required to agree. Nothing in this header is mirrored in
-// WGSL — it runs CPU-side only, on values that then cross as integers.
+// Nothing in this header is mirrored in WGSL -- it runs CPU-side only, on
+// values that then cross as integers.
 namespace imath {
 
 // pi/2 in Q30. The ONE irrational constant in this header, written as an

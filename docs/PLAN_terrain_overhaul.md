@@ -1,5 +1,13 @@
 # Terrain overhaul: from a 5.4 m tabletop to a 200 m world with an ocean
 
+> **STATUS (2026-09-26): COMPLETE / historical.** Packages A-D landed; the
+> terrain numbers have since moved into the map (`assets/worldmap/<name>/
+> map.json` `terrain`, PLAN_environment_truth P-G) and the per-biome relief
+> curve. Current architecture: DESIGN.md and the header of
+> `assets/shaders/worldgen.wgsl`; follow-through: `docs/PLAN_map_overhaul.md`.
+> Names below (`pondAt`, `pondInfo`, `surfHeightAt`, ruins, the arena) are the
+> code as it was.
+
 > **Status.** Package **A** landed `9c42a3c` (the `terrain` gate + baseline-value
 > plumbing). Package **B** landed `3fdcf5c` (foundations: Q14 log2-cell noise with
 > an enforced C++ mirror, the three column hoists, the height contract, perched

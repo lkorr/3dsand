@@ -429,8 +429,7 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
   // THE ID SPACE IS THE FILES. `index` is the biome's id everywhere -- the
   // record slot in the worldMap buffer, the row in the tree atlas's weight
   // table, the value `Col.biome` carries -- so the indices must be exactly
-  // 0..N-1 with no gap and no duplicate. The four the shader still names by
-  // id (B_FOREST..B_DESERT, until P2 retires them) must keep those ids.
+  // 0..N-1 with no gap and no duplicate.
   {
     const int n = static_cast<int>(set.biomes.size());
     std::vector<int> seen(static_cast<size_t>(n), 0);
@@ -440,12 +439,6 @@ int ValidateBiomeSet(const BiomeSet& set, std::vector<std::string>& out) {
             " -- ids must be contiguous, one per file");
       else if (seen[b.index]++)
         bad("biomes/" + b.file + ": index " + std::to_string(b.index) + " is used by another biome file");
-    }
-    for (int i = 0; i < kEngineBiomeCount; i++) {
-      const BiomeDef* b = BiomeById(set, i);
-      if (!b) bad(std::string("biome id ") + std::to_string(i) + " must be \"" + kEngineBiomes[i] + "\" (worldgen.wgsl still names it) and has no file");
-      else if (b->name != kEngineBiomes[i])
-        bad("biomes/" + b->file + ": index " + std::to_string(i) + " belongs to \"" + kEngineBiomes[i] + "\" while worldgen.wgsl names it by id");
     }
   }
 

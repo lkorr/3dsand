@@ -4997,7 +4997,7 @@ int main(int argc, char** argv) {
       heightmapOut = argv[++i];
     }
     // --voxdump / --voxserve: REAL VOXELS for the tuner's terrain viewer.
-    // Unlike --heightmap these need a GPU (genCell is WGSL), so they answer
+    // Unlike --heightmap these need a GPU (genCellIn is WGSL), so they answer
     // after device init — see tools/voxregion.h for why one is a server.
     else if (a == "--voxdump") {
       if (i + 1 >= argc) {
@@ -5246,7 +5246,7 @@ int main(int argc, char** argv) {
     }
     SetCurrentTuning(tune);
   }
-  // The authored edit layer named by worldgen.editLayer. Read here, before any
+  // The authored edit layer named by world.editLayer. Read here, before any
   // world exists, so the very first SubmitWorldgen already queues it — a layer
   // loaded after worldgen would not appear until something happened to
   // regenerate the chunks it lives in.
@@ -5698,7 +5698,7 @@ int main(int argc, char** argv) {
     return sandvox::RunRenderBudget(ctx, world, sim, mats, perfOpt);
   if (perf) return sandvox::RunPerf(ctx, world, sim, mats, perfOpt);
   // The voxel-region modes answer here: after the device, shaders and material
-  // table exist (genCell is WGSL and the palette is the COMPILED table), and
+  // table exist (genCellIn is WGSL and the palette is the COMPILED table), and
   // before anything spawns a player, a mob or a physics world — none of which a
   // terrain dump has any use for.
   if (!voxdumpArgs.empty())

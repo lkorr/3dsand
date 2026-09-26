@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Generate the SHORELINE micro-detail set into assets/microvox/.
 
-The wet fringe around a pond (worldgen.wgsl, shoreAt + the shore-cover block in
-genCell). The pond INTERIOR already had lilypads, reeds and kelp; this is the
+The wet fringe around a pond (worldgen.wgsl, pondNear + the shore-cover block in
+genCellIn). The pond INTERIOR already had lilypads, reeds and kelp; this is the
 band OUTSIDE the disc, which until now went straight from water to the same
 plain grass as a hillside a kilometre inland.
 

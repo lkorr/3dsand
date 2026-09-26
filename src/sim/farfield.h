@@ -257,7 +257,7 @@ class FarField {
   // minus the plane; a reset-incomplete one only to the level inside it).
   uint32_t bulkPending_[kFarLevels] = {};
   // THE PLAY CAP (2026-09-09). A far entry is a 16^3-cell sieve — 4,096
-  // genCell evaluations plus the surface skin — and measured ~0.2 ms of GPU
+  // genCellIn evaluations plus the surface skin — and measured ~0.2 ms of GPU
   // each on an RTX 3060 Ti: a level's incoming plane is 1,024 of them, so
   // walking across a level-1 chunk boundary (every 32 voxels) put 180-240 ms
   // of GPU into ONE tick. `--frames 900 --autowalk`: farField p50 0.002 ms,
