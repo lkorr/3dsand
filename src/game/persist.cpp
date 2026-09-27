@@ -276,7 +276,8 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   // so a renumbering content change no longer repaints either.
   auto putFills = [&](const ItemStack* v, int n) {
     PutU32(out, (uint32_t)n);
-    for (int i = 0; i < n; i++) PutU32(out, v[i].Empty() ? 0u : v[i].Fill());
+    for (int i = 0; i < n; i++)
+      PutU32(out, v[i].Empty() ? 0u : LegacyFillWordOf(v[i].contents));
   };
   putFills(kit.hotbar.slots, kItemSlots);
   putFills(kit.bag.slots, Bag::kSlots);
@@ -299,6 +300,32 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   putDamage(kit.hotbar.slots, kItemSlots);
   putDamage(kit.bag.slots, Bag::kSlots);
   putDamage(kit.equip.slots, kEquipSlotCount);
+  if (version < 8) return;
+
+  // ---- v8: MIXED vessel contents (game/composition.h) -----------------------
+  //
+  //   u32 hotbarCount  then per slot: u32 n, then n x (u32 mat, u32 eighths)
+  //   u32 bagCount     then per slot: the same
+  //   u32 equipCount   then per slot: the same
+  //
+  // The v6 section above still carries each vessel's MAIN portion as the old
+  // word, so an older reader keeps what it can say; a v8 reader replaces it
+  // with this. Ids remapped by name on load, like the v6 word.
+  auto putContents = [&](const ItemStack* v, int n) {
+    PutU32(out, (uint32_t)n);
+    for (int i = 0; i < n; i++) {
+      const alchemy::Composition& c = v[i].contents;
+      const int k = v[i].Empty() ? 0 : c.n;
+      PutU32(out, (uint32_t)k);
+      for (int j = 0; j < k; j++) {
+        PutU32(out, c.p[j].mat);
+        PutU32(out, c.p[j].eighths);
+      }
+    }
+  };
+  putContents(kit.hotbar.slots, kItemSlots);
+  putContents(kit.bag.slots, Bag::kSlots);
+  putContents(kit.equip.slots, kEquipSlotCount);
 }
 
 bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
@@ -437,12 +464,11 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
         if (!rd.ok || (int)i >= n || v[i].Empty()) continue;
         const ItemDef* d = r.items->Of(v[i]);
         if (!d || !d->IsContainer()) continue;
-        v[i].fillMat = ItemFillMat(f);
-        if (const MatRemap* mr = ActiveLoadRemap())
-          v[i].fillMat = (uint16_t)mr->Mat(v[i].fillMat);
-        v[i].fillAmt = (uint16_t)std::min<int>(ItemFillAmt(f),
-                                               d->container.capacity);
-        if (v[i].fillAmt == 0) v[i].fillMat = 0;
+        alchemy::Composition c = ContentsFromLegacyFill(f);
+        if (c.n && c.p[0].eighths > (uint32_t)d->container.capacity)
+          c.p[0].eighths = (uint32_t)d->container.capacity;
+        v[i].contents = c;
+        if (const MatRemap* mr = ActiveLoadRemap()) RemapItemInstance(v[i], *mr);
       }
     };
     getFills(kit.hotbar.slots, kItemSlots);
@@ -463,6 +489,37 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
     getDamage(kit.hotbar.slots, kItemSlots);
     getDamage(kit.bag.slots, Bag::kSlots);
     getDamage(kit.equip.slots, kEquipSlotCount);
+  }
+  // ---- v8: mixed vessel contents (replaces the v6 word) -----------------------
+  // Bounded like any count from a file: a slot claiming more portions than a
+  // vessel can hold is a corrupt record. Clamped to the vessel's capacity in
+  // total, taking from the last portions first.
+  if (version >= 8) {
+    auto getContents = [&](ItemStack* v, int n) {
+      const uint32_t count = rd.U32();
+      for (uint32_t i = 0; i < count && rd.ok; i++) {
+        const uint32_t k = rd.U32();
+        if (k > (uint32_t)alchemy::kMaxSubstances) { rd.ok = false; return; }
+        alchemy::Composition c;
+        for (uint32_t j = 0; j < k && rd.ok; j++) {
+          const uint32_t m = rd.U32(), e = rd.U32();
+          if (rd.ok && m != 0 && m < 4096 && e != 0) c.Add((uint16_t)m, e);
+        }
+        if (!rd.ok || (int)i >= n || v[i].Empty()) continue;
+        const ItemDef* d = r.items->Of(v[i]);
+        if (!d || !d->IsContainer()) { v[i].ClearFill(); continue; }
+        v[i].contents = c;
+        if (const MatRemap* mr = ActiveLoadRemap()) RemapItemInstance(v[i], *mr);
+        while ((int)v[i].FillTotal() > d->container.capacity && v[i].Filled()) {
+          const int last = v[i].contents.n - 1;
+          const uint32_t over = v[i].FillTotal() - (uint32_t)d->container.capacity;
+          v[i].contents.Take(v[i].contents.p[last].mat, over);
+        }
+      }
+    };
+    getContents(kit.hotbar.slots, kItemSlots);
+    getContents(kit.bag.slots, Bag::kSlots);
+    getContents(kit.equip.slots, kEquipSlotCount);
   }
   if (dropped > 0)
     std::fprintf(stderr,
@@ -507,8 +564,9 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
     // a dropped blue one share a name and a lattice, and the word is not
     // recoverable from either.
     PutU32(out, w.dye);
-    // v3: what a dropped vessel holds (the ItemInstance's fill).
-    PutU32(out, w.Fill());
+    // v3: what a dropped vessel holds, as the one-material word (its main
+    // portion); v5 appends the whole mixture after the damage.
+    PutU32(out, LegacyFillWordOf(w.contents));
     BodyTransform xf{};
     r.phys->GetTransform(w.body, xf);
     if (posOut) *posOut = xf.pos;
@@ -540,6 +598,12 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
     // above is only its largest panel. A cut-loose cuirass picked up after a
     // reload goes back on with the holes it came off with.
     PutDamage(out, w.damage);
+    // v5: the mixture (game/composition.h), which replaces the v3 word.
+    PutU32(out, (uint32_t)w.contents.n);
+    for (int j = 0; j < w.contents.n; j++) {
+      PutU32(out, w.contents.p[j].mat);
+      PutU32(out, w.contents.p[j].eighths);
+    }
   }
 }
 
@@ -594,14 +658,24 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
     }
     // v4: the piece's damage (GetDamage remaps its own lattice ids).
     if (version >= 4 && !GetDamage(rd, inst.damage)) break;
+    inst.contents = ContentsFromLegacyFill(fill);
+    if (version >= 5) {
+      const uint32_t k = rd.U32();
+      if (!rd.ok || k > (uint32_t)alchemy::kMaxSubstances) { rd.ok = false; break; }
+      alchemy::Composition c;
+      for (uint32_t j = 0; j < k && rd.ok; j++) {
+        const uint32_t m = rd.U32(), e = rd.U32();
+        if (rd.ok && m != 0 && m < 4096 && e != 0) c.Add((uint16_t)m, e);
+      }
+      if (!rd.ok) break;
+      inst.contents = c;
+    }
     // The lattice and the vessel's contents are ids in the table this record
     // was written under; running ids from here on (sim/mattable.h).
     if (const MatRemap* mr = ActiveLoadRemap()) {
       RemapPrefabVoxels(lat, *mr);
-      if (fill != 0)
-        fill = PackItemFill((uint16_t)mr->Mat(ItemFillMat(fill)), ItemFillAmt(fill));
+      RemapItemInstance(inst, *mr);
     }
-    inst.SetFill(fill);
     const ItemDef* d = r.items->Named(name);
     // Content legitimately disappears between saves. The item is dropped with
     // a log line rather than restored as something else, which is the same

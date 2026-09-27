@@ -182,7 +182,8 @@ int ContainerSettle(ContainerScoopMemo& memo, uint32_t snapTick, uint32_t ledger
 // Put up to `units` eighths of `mat` into ONE vessel. Refuses (returns 0) a
 // stack of more than one -- a fill is one object's (ItemInstance::StacksWith) and
 // paying a stack of three would triple it -- and a vessel that already holds
-// something else. Returns what fit, capped by its room.
+// kMaxSubstances OTHER things. Returns what fit, capped by its room. A vessel
+// holding something else takes it as another portion: contents mix.
 int ContainerDeposit(const ItemDef& def, ItemStack& st, uint16_t mat, int units);
 
 // POUR: up to `spec.pourPerTick` cells out of `mouth` (the vessel in the hand),
@@ -261,7 +262,23 @@ bool ContainerPoursAsFluid(const MaterialDef& m);
 int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                        const Vec3* target, uint32_t tick, uint32_t seed,
                        uint32_t room, std::vector<FluidSpawnOp>& out,
-                       SplatterEvent* splat);
+                       SplatterEvent* splat,
+                       const std::vector<MaterialDef>* mats = nullptr);
+
+// A fill written as text, for the capture tools (--shot-mob): "water:0.5"
+// or a mixture "water:0.4+oil:0.2", each fraction of `capacity`; a bare name
+// is a full vessel. Unknown names are skipped; the total is capped at
+// `capacity`.
+alchemy::Composition ContainerParseFillSpec(const std::string& spec, int capacity,
+                                            const std::vector<MaterialDef>& mats);
+
+// WHAT COMES OUT FIRST from a mixed vessel: the portion at the MOUTH, which is
+// the top layer -- the lowest density (the 3D sim's order, the same one the
+// alchemy bench settles by). Oil over water pours oil; sand in lava floats and
+// pours before the lava. Ties go to the first portion. Without a material
+// table, the first portion. 0 for an empty vessel. Every pour, apply and
+// scoop-stream path takes its material from here, one substance per tick.
+uint16_t ContainerTopMat(const ItemInstance& st, const std::vector<MaterialDef>* mats);
 
 // THE SCOOP STREAM: what a scooped cell looks like on its way into the flask.
 // GHOST MPM particles (FluidSpawnOp::flags kFluidOpGhost, FP_GHOST in
@@ -328,10 +345,16 @@ struct ContainerSpill {
   Vec3 at{};       // where the vessel was, world voxels (its centre of mass)
   Vec3 vel{};      // its velocity before the blow, voxels/s
   Vec3 away{};     // unit, off the surface it struck; zero when unknown
+  // The portion coming out now, and the rest queued behind it: a mixed
+  // vessel bursts one substance at a time, all on the same tick while the
+  // spawn budgets allow. ContainerSpillStep draws `mat`/`units` from `rest`
+  // when the current portion runs out.
   uint16_t mat = 0;
-  int units = 0;   // eighths still to come out
+  int units = 0;   // eighths of `mat` still to come out
+  alchemy::Composition rest;
   uint32_t seed = 0;
   bool splatted = false;  // the SplatterEvent goes out once, with the burst
+  bool Done() const { return units <= 0 && rest.Empty(); }
 };
 // One tick of a spill. Returns the eighths emitted; `splat`, on the first
 // tick anything leaves, is filled with the burst's SplatterEvent (the caller
@@ -400,8 +423,8 @@ bool ContainerIsolateOne(ItemStack* slots, int nSlots, int slot,
 // represented by the % volume") -------------------------------------------
 //
 // The contents' colour as an ImGui/unpackColor swatch (0xAABBGGRR, alpha
-// forced opaque), 0 for an empty vessel. The icon's liquid, the gauges and
-// the held flask all read this one colour.
+// forced opaque), 0 for an empty vessel: the MAIN portion's (ContainerMainMat).
+// The gauges read this one colour; the icon draws each portion as a band.
 uint32_t ContainerFillSwatch(const ItemStack& st,
                              const std::vector<MaterialDef>& mats);
 // WHAT A VESSEL SHOWS in a hand or on the ground (phys/fillview.h, which owns
@@ -409,9 +432,13 @@ uint32_t ContainerFillSwatch(const ItemStack& st,
 // what is in it; the holders recompute the word from their rotation.
 using ContainerHeldFill = BodyFillView;
 ContainerHeldFill ContainerHeldFillOf(const ItemDef& def, const ItemInstance& st);
-// The same from a packed fill (ItemInstance::Fill) -- for a holder that keeps
-// the contents beside a def rather than in a stack (Mob::HeldContents).
-ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, uint32_t fill);
+// The same from bare contents -- for a holder that keeps them beside a def
+// rather than in a stack (Mob::HeldContents). The 3D view shows ONE material
+// (the fill word has room for one id): the portion with the most eighths, at
+// the level of the whole fill. Layers show in the icon and on the bench.
+ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, const alchemy::Composition& c);
+// The portion with the most eighths (ties: the first), 0 when empty.
+uint16_t ContainerMainMat(const alchemy::Composition& c);
 // How brightly the contents glow, 0..1: the material's own `emission`, the
 // one number the held and grounded flask glow by (microbody.wgsl) -- the UI
 // reads it too, so the icon glows exactly when the flask does.

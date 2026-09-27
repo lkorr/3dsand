@@ -3138,22 +3138,13 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       }
       std::printf("--shot-mob: holding %s\n", itemName.c_str());
       if (!fillSpec.empty() && it->IsContainer()) {
-        const size_t colon = fillSpec.find(':');
-        const std::string matName = fillSpec.substr(0, colon);
-        const float frac = colon == std::string::npos
-                               ? 1.0f
-                               : (float)std::atof(fillSpec.c_str() + colon + 1);
         ItemStack st = StackOf(items, items.Find(itemName));
-        for (size_t m = 1; m < mats.size(); m++)
-          if (mats[m].name == matName) st.fillMat = (uint16_t)m;
-        st.fillAmt = (uint16_t)std::clamp(
-            (int)std::lround(frac * it->container.capacity), 0,
-            it->container.capacity);
+        st.contents = ContainerParseFillSpec(fillSpec, it->container.capacity, mats);
         // Through the CONTENTS, as a rising or a peer's announce would:
         // MobSystem::RefreshHeldFills turns them into the view each tick.
-        hm->SetHeldContents(st.Fill(), Hand::Right);
+        hm->SetHeldContents(st.contents, Hand::Right);
         std::printf("--shot-mob: %s holds %s %d/%d eighths\n",
-                    itemName.c_str(), matName.c_str(), (int)st.fillAmt,
+                    itemName.c_str(), fillSpec.c_str(), (int)st.FillTotal(),
                     it->container.capacity);
       }
       continue;
@@ -3333,16 +3324,7 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
       }
       ItemStack st = StackOf(items, items.Find(itemName));
       if (!fillSpec.empty() && it->IsContainer()) {
-        const size_t colon = fillSpec.find(':');
-        const std::string matName = fillSpec.substr(0, colon);
-        const float frac = colon == std::string::npos
-                               ? 1.0f
-                               : (float)std::atof(fillSpec.c_str() + colon + 1);
-        for (size_t m = 1; m < mats.size(); m++)
-          if (mats[m].name == matName) st.fillMat = (uint16_t)m;
-        st.fillAmt = (uint16_t)std::clamp(
-            (int)std::lround(frac * it->container.capacity), 0,
-            it->container.capacity);
+        st.contents = ContainerParseFillSpec(fillSpec, it->container.capacity, mats);
       }
       // A little in front and to the side, just above the ground there.
       const Vec3 xz = c + fwdNow * 5.0f + rightNow * (3.0f + 3.0f * (float)k);
@@ -3355,7 +3337,7 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
         droppedBodies.push_back(body);
       }
       std::printf("--shot-mob: dropped %s (%d/%d eighths)\n", itemName.c_str(),
-                  (int)st.fillAmt, it->container.capacity);
+                  (int)st.FillTotal(), it->container.capacity);
     }
     for (int i = 0; i < 45; i++) mobTick();   // let it fall and settle
   }
@@ -9066,8 +9048,8 @@ int main(int argc, char** argv) {
         for (int i = 0; i < kItemSlots; i++) {
           const ItemDef* d = items.Of(hotbar.slots[i]);
           if (d && d->IsContainer() && water) {
-            hotbar.slots[i].fillMat = water;
-            hotbar.slots[i].fillAmt = (uint16_t)(d->container.capacity * 2 / 3);
+            hotbar.slots[i].ClearFill();
+            hotbar.slots[i].contents.Add(water, (uint32_t)(d->container.capacity * 2 / 3));
             hotbar.Select(i);
             break;
           }
@@ -12216,11 +12198,13 @@ int main(int argc, char** argv) {
         if (!hd || !hd->IsContainer()) ui.activeVessel = KitRef{};
         ui.applyText.clear();
         ui.applyColor = 0;
-        if (hd && hd->IsContainer() && hp->Filled() && hp->fillMat < mats.size()) {
+        const uint16_t topMat = hp ? ContainerTopMat(*hp, &mats) : 0;
+        if (hd && hd->IsContainer() && hp->Filled() && topMat < mats.size()) {
           const ItemStack& hs = *hp;
           ui.applyText = ContainerFillText(*hd, hs, mats);
           ui.pourDrainPerSec = PourBrushCellsPerSec(*hd, ui.pourRadius);
-          const uint32_t c = mats[hs.fillMat].gpu.color0;
+          // The brush paints with what comes out: the top layer.
+          const uint32_t c = mats[topMat].gpu.color0;
           ui.applyColor = 0xFF000000u | (c & 0x00FFFFFFu);
         }
       }
@@ -12715,7 +12699,7 @@ int main(int argc, char** argv) {
             // went with the dropped one (a filled stack of more than one is
             // only ever an old save's): what stays is empty, not a copy.
             avatar.KitTake(ui.dropItem.from, 1);
-            if (!src->Empty()) src->fillMat = src->fillAmt = 0;
+            if (!src->Empty()) src->ClearFill();
             ui.kitMessage = "dropped";
           } else {
             ui.kitMessage = "there is nowhere to put that";
@@ -13075,7 +13059,7 @@ int main(int argc, char** argv) {
             // What is in it, and the two buttons -- the vessel has no other
             // stat, and nothing else on screen says how to use one.
             u.fill = d->container.capacity > 0
-                         ? std::clamp((float)st.fillAmt / (float)d->container.capacity,
+                         ? std::clamp((float)st.FillTotal() / (float)d->container.capacity,
                                       0.0f, 1.0f)
                          : 0.0f;
             u.fillSwatch = ContainerFillSwatch(st, mats);

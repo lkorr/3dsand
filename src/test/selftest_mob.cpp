@@ -6269,15 +6269,16 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
   auto flaskFill = [](const Mob* m) {
     if (m != nullptr)
       for (const ItemInstance& ci : m->Carried())
-        if (ci.name == "flask") return (int)ci.fillAmt;
+        if (ci.name == "flask") return (int)ci.FillTotal();
     return -1;
   };
   uint16_t waterMat = 0;
   for (size_t mi = 1; mi < c.mats.size() && !waterMat; mi++)
     if (c.mats[mi].name == "water") waterMat = (uint16_t)mi;
   ItemInstance kFlask{"flask", 1};
-  kFlask.fillMat = waterMat;
-  kFlask.fillAmt = 37;
+  kFlask.ClearFill();
+  if ((waterMat) != 0 && (37) != 0)
+    kFlask.contents.Add((uint16_t)(waterMat), (uint32_t)(37));
 
   // ---- A: IT ROLLS, AND THE ROLL IS A FUNCTION OF THE CREATURE ------------
   //
@@ -6468,11 +6469,11 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
           c.mobs.Spawn(zid, {spot.x + 4 * step, spot.y + 1, spot.z});
       const int ctlN = countOf(c.mobs.FindMobById(ctl), kSure);
       carried = risen != 0 && roseN == want && ctlN == 0 &&
-                (!haveFlask || roseFill == kFlask.fillAmt);
+                (!haveFlask || roseFill == (int)kFlask.FillTotal());
       if (!carried)
         carryWhy = Format("risen=%llu carried=%d/%d control=%d flask=%d/%d",
                           (unsigned long long)risen, roseN, want, ctlN,
-                          roseFill, (int)kFlask.fillAmt);
+                          roseFill, (int)kFlask.FillTotal());
     } else {
       carryWhy = m == nullptr ? "could not spawn a human"
                               : (rotMat == 0 ? "no bite.infectMat"
@@ -6517,7 +6518,7 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
         fillBack = flaskFill(c.mobs.FindMobById(back[0]));
       }
       saved = read && back.size() == 2 && backN == wantA && backN2 == wantB &&
-              wantA > 0 && (!haveFlask || fillBack == kFlask.fillAmt);
+              wantA > 0 && (!haveFlask || fillBack == (int)kFlask.FillTotal());
       if (!saved)
         saveWhy = Format("read=%d mobs=%zu packs=%d/%d vs %d/%d flask=%d",
                          read ? 1 : 0, back.size(), backN, backN2, wantA,
@@ -6611,10 +6612,10 @@ Status GateMobLoot(Ctx& c, std::string& detail) {
       kitN = runOne(true);
       kitCtl = runOne(false);
       kitRode = kitN == 3 && kitCtl == 0 &&
-                (!haveFlask || kitFill == kFlask.fillAmt);
+                (!haveFlask || kitFill == (int)kFlask.FillTotal());
       if (!kitRode)
         kitWhy = Format("carried=%d (want 3) control=%d (want 0) flask=%d/%d",
-                        kitN, kitCtl, kitFill, (int)kFlask.fillAmt);
+                        kitN, kitCtl, kitFill, (int)kFlask.FillTotal());
     } else {
       kitWhy = avDef < 0 ? "no avatar def" : "no bite.infectMat";
     }

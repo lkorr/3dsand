@@ -2446,8 +2446,8 @@ class Mob {
   // up with a corpse that rises, onto the wire, into the loot list. Cleared
   // whenever that hand changes what it holds. The player's are the kit hand
   // stacks', set by the session every tick.
-  void SetHeldContents(uint32_t fill, Hand h) { held_[HandIndex(h)].contents = fill; }
-  uint32_t HeldContents(Hand h) const { return held_[HandIndex(h)].contents; }
+  void SetHeldContents(const alchemy::Composition& c, Hand h) { held_[HandIndex(h)].contents = c; }
+  const alchemy::Composition& HeldContents(Hand h) const { return held_[HandIndex(h)].contents; }
   // ...AND WHAT IT SHOWS (phys/fillview.h): drawn level against the held
   // body's rotation every frame in place of the slot's dye word
   // (AppendMicroInsts). Render-only and kept OFF the limb, so no path that
@@ -4575,7 +4575,7 @@ class Mob {
     std::string item;
     std::string part;
     Vec3 gripBody{};         // grip point in the item's BODY frame
-    uint32_t contents = 0;   // SetHeldContents
+    alchemy::Composition contents;   // SetHeldContents
     ContainerHeldFill fill;  // SetHeldFill; render-only
     void Clear() { *this = HeldHand{}; }
   };
@@ -5635,7 +5635,12 @@ class MobSystem {
   // bytes, same layout -- it took what was the padding byte after `color` --
   // but that byte was uninitialised padding in every older file, so a v7 or
   // older skin lattice has it ZEROED on read rather than trusted.
-  static constexpr uint32_t kSaveVersion = 8;
+  //
+  // 9 (2026-09-26): MIXED VESSEL CONTENTS. Every ItemInstance (pack and gear)
+  // carries a Composition -- up to 16 (material, eighths) portions -- where
+  // it carried one packed word (iteminstance.h WriteItemInstance `mixed`). A
+  // v7/v8 record's flask loads as the one portion its word named.
+  static constexpr uint32_t kSaveVersion = 9;
   static constexpr uint32_t kSaveVersionMin = 3;
   // Record limb kinds (v4).
   static constexpr uint32_t kLimbSevered = 0;

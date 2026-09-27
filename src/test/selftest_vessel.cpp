@@ -52,8 +52,7 @@ namespace {
 ItemStack Vs(const ItemLibrary& lib, int def, int count, uint16_t mat = 0,
              uint16_t amt = 0) {
   ItemStack s = StackOf(lib, def, count);
-  s.fillMat = mat;
-  s.fillAmt = amt;
+  if (mat != 0 && amt != 0) s.contents.Add(mat, amt);
   return s;
 }
 
@@ -90,8 +89,11 @@ Status GateVessel(Ctx& c, std::string& detail) {
   }
 
   // ---- the content ---------------------------------------------------------
-  check(flask->IsContainer() && flask->container.holds == (1u << CLASS_LIQUID),
-        "flask is a container that holds liquid");
+  // A flask takes powder too since the alchemy bench (a pouch's sand stirred
+  // into a potion); a pouch still refuses liquid.
+  check(flask->IsContainer() &&
+            flask->container.holds == ((1u << CLASS_LIQUID) | (1u << CLASS_POWDER)),
+        "flask is a container that holds liquid and powder");
   check(pouch->IsContainer() && pouch->container.holds == (1u << CLASS_POWDER),
         "pouch is a container that holds powder");
   check(flask->container.capacity == 128 * kContainerUnitsPerCell,
@@ -141,7 +143,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
           "and says it is a liquid");
     const int m = ContainerScoop(*pouch, st, {base.x + 3, base.y, base.z}, wordAt,
                                  c.world, c.mats, ops, &why);
-    check(m > 0 && st.fillMat == mSand, "but takes sand");
+    check(m > 0 && ContainerMainMat(st.contents) == mSand, "but takes sand");
   }
   {
     ItemStack st = Vs(c.items, flaskI, 1);
@@ -149,11 +151,13 @@ Status GateVessel(Ctx& c, std::string& detail) {
     const char* why = nullptr;
     ContainerScoop(*flask, st, {base.x + 3, base.y, base.z}, wordAt, c.world,
                    c.mats, ops, &why);
-    check(!st.Filled() && ops.empty(), "a flask will not take sand");
+    // Since the alchemy bench a flask takes powder, and a filled one takes a
+    // second substance as another portion (game/composition.h).
+    check(!ops.empty(), "a flask takes sand");
     ItemStack blood = Vs(c.items, flaskI, 1, (uint16_t)mBlood, 8);
     const char* why2 = nullptr;
-    check(!ContainerAccepts(*flask, blood, mWater, c.mats, &why2),
-          "a flask of blood will not take water");
+    check(ContainerAccepts(*flask, blood, mWater, c.mats, &why2),
+          "a flask of blood takes water too (it mixes)");
   }
 
   // ---- matter is not minted ------------------------------------------------
@@ -239,7 +243,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
       issue(t, more);
     }
     ContainerSettle(memo, 200, ledger, flask, &st);   // pay the tail
-    check(st.fillAmt == poolUnits && memo.claims.empty(),
+    check((int)st.FillTotal() == poolUnits && memo.claims.empty(),
           "a held scoop drains the pool and is credited exactly its eighths");
     // A claim the GPU REFUSED (the cell went to something else) pays nothing.
     {
@@ -250,7 +254,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
       m2.claims.push_back({300, (uint16_t)mWater, 32});
       ItemStack f2 = Vs(c.items, flaskI, 1);
       ContainerSettle(m2, 300, 1000 + 8, flask, &f2);
-      check(f2.fillAmt == 8, "a claim is paid what the GPU took, not what it asked");
+      check((int)f2.FillTotal() == 8, "a claim is paid what the GPU took, not what it asked");
     }
     // ...and capacity stops it.
     ItemStack nearlyFull = Vs(c.items, flaskI, 1, (uint16_t)mWater, (uint16_t)(flask->container.capacity - 4));
@@ -258,7 +262,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
     ContainerScoopMemo memo3;
     ContainerScoop(*flask, nearlyFull, hit, wordAt, c.world, c.mats, ops3, &why,
                    &memo3, 200);
-    check(nearlyFull.fillAmt <= flask->container.capacity,
+    check((int)nearlyFull.FillTotal() <= flask->container.capacity,
           "a scoop never overfills the flask");
   }
 
@@ -276,7 +280,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
                                 0x1234u, spawns, &ev);
     check(n == flask->container.pourPerTick && (int)spawns.size() == n,
           "a pour throws pourPerTick particles");
-    check(st.fillAmt == 1024 - n * kContainerUnitsPerCell, "and charges a cell each");
+    check((int)st.FillTotal() == 1024 - n * kContainerUnitsPerCell, "and charges a cell each");
     // Ten more ticks of stream, so the landing is a distribution and not two
     // samples of it.
     for (uint32_t t = 501; t < 511; t++)
@@ -370,13 +374,13 @@ Status GateVessel(Ctx& c, std::string& detail) {
     for (const ItemStack& s : hb.slots)
       if (!s.Empty() && s.name == "flask" && !s.Filled()) rest += s.count;
     check(rest == 4, "and none of them is lost");
-    // TWO IDENTICAL FILLS DO NOT STACK: a count-2 stack has ONE fillAmt, so a
+    // TWO IDENTICAL FILLS DO NOT STACK: a count-2 stack has ONE fill, so a
     // merge would destroy a flask's worth on the first pour.
     Inventory h2;
     h2.slots[0] = Vs(c.items, flaskI, 1, (uint16_t)mWater, 40);
     const int w2 = h2.Add(Vs(c.items, flaskI, 1, (uint16_t)mWater, 40));
     check(w2 > 0 && h2.slots[0].count == 1 && h2.slots[w2].count == 1 &&
-              h2.slots[w2].fillAmt == 40,
+              (int)h2.slots[w2].FillTotal() == 40,
           "two flasks of the same fill stay two stacks");
     Bag b2;
     b2.slots[0] = Vs(c.items, flaskI, 1, (uint16_t)mWater, 40);
@@ -397,7 +401,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
                         CurrentTuning().sim.partGravity, 1, 1u, none, nullptr) == 0 &&
               ContainerPourFluid(*flask, pair, m0, Vec3{1, 0, 0}, nullptr, 1, 1u,
                                  4096, noneF, nullptr) == 0 &&
-              ContainerSpend(pair, 1) == 0 && pair.fillAmt == 64,
+              ContainerSpend(pair, 1) == 0 && (int)pair.FillTotal() == 64,
           "a filled stack does not pour until one is set apart");
   }
 
@@ -442,7 +446,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
     const int got = ContainerPour(*flask, big, m0, Vec3{1, 0, 0}, nullptr,
                                   CurrentTuning().sim.partGravity, 702, 3u, sp,
                                   nullptr, 1u, &c.mats);
-    check(got == 1 && sp.size() == 1 && big.fillAmt == 56,
+    check(got == 1 && sp.size() == 1 && (int)big.FillTotal() == 56,
           "a pour with room for one particle is charged for one");
     check(ContainerParticleRoom(false, 0, 0) == 0 &&
               ContainerParticleRoom(true, kParticleCap, 0) == 0 &&
@@ -472,9 +476,9 @@ Status GateVessel(Ctx& c, std::string& detail) {
     ContainerSettle(L, b, 300,
                     [&](uint16_t m, int u) { return ContainerDeposit(fd, fb, m, u); },
                     nullptr);
-    check(fa.fillAmt + fb.fillAmt == 40 && fa.fillAmt == 32,
+    check((int)fa.FillTotal() + (int)fb.FillTotal() == 40 && (int)fa.FillTotal() == 32,
           Format("two scoops on one tick are paid what the GPU removed, together "
-                 "(%d + %d of 40)", fa.fillAmt, fb.fillAmt).c_str());
+                 "(%d + %d of 40)", (int)fa.FillTotal(), (int)fb.FillTotal()).c_str());
   }
 
   // ---- a scoop in flight when the flask leaves the hand --------------------
@@ -499,7 +503,7 @@ Status GateVessel(Ctx& c, std::string& detail) {
     ItemStack nearly = Vs(c.items, flaskI, 1, (uint16_t)mWater, (uint16_t)(flask->container.capacity - 10));
     unpaid.clear();
     const int p2 = ContainerSettle(m2, 401, 48, flask, &nearly, &unpaid);
-    check(p2 == 10 && nearly.fillAmt == flask->container.capacity &&
+    check(p2 == 10 && (int)nearly.FillTotal() == flask->container.capacity &&
               unpaid.size() == 1 && unpaid[0].units == 14,
           "what a vessel has no room for is returned as unpaid");
   }
@@ -573,6 +577,85 @@ Status GateVessel(Ctx& c, std::string& detail) {
     }
     check(got == 20 && sp.units == 0 && fl.empty() && pOk && sandEighths == 20,
           "a broken pouch of sand spills exactly its 20 eighths, as 20 grains");
+
+    // ---- MIXTURES (game/composition.h): a vessel holds up to 16 portions ----
+    const uint32_t mOil = matId("oil");
+    if (mOil) {
+      ItemStack mix = Vs(c.items, flaskI, 1, (uint16_t)mWater, 64);
+      check(ContainerAccepts(*flask, mix, mOil, c.mats, nullptr) &&
+                ContainerDeposit(*flask, mix, (uint16_t)mOil, 16) == 16 &&
+                mix.contents.n == 2 && mix.FillTotal() == 80,
+            "a flask of water takes oil as a second portion");
+      check(ContainerTopMat(mix, &c.mats) == mOil,
+            "and the top of it -- what pours first -- is the lighter oil");
+      // A pour takes the top layer only, and leaves the water alone.
+      std::vector<ParticleSpawn> ps;
+      const Vec3 mouthM{0, 50, 0}, targetM{3, 48, 0};
+      ItemStack pm = mix;
+      ContainerPour(*flask, pm, mouthM, Vec3{1, 0, 0}, &targetM, 8, 700, 0x5u, ps,
+                    nullptr, 0xFFFFFFFFu, &c.mats);
+      bool allOil = !ps.empty();
+      for (const ParticleSpawn& q : ps) allOil = allOil && (q.payload & 0xFFFu) == mOil;
+      check(allOil && pm.contents.AmountOf((uint16_t)mWater) == 64 &&
+                pm.contents.AmountOf((uint16_t)mOil) < 16,
+            "pouring a mixture takes the top layer and leaves the rest");
+      // A 17th substance is refused, and says why.
+      ItemStack many = Vs(c.items, flaskI, 1);
+      for (int k = 0; k < alchemy::kMaxSubstances; k++) many.contents.Add((uint16_t)(1000 + k), 1);
+      const char* why = nullptr;
+      check(!ContainerAccepts(*flask, many, mWater, c.mats, &why) && why &&
+                std::string(why).find("too many") != std::string::npos,
+            "a vessel with 16 substances refuses a 17th");
+      // A break spills EVERY portion, each exactly.
+      ContainerSpill ms;
+      ms.at = Vec3{10, 20, 30};
+      ms.rest = mix.contents;
+      ms.seed = 9;
+      std::vector<FluidSpawnOp> mf;
+      std::vector<ParticleSpawn> mp;
+      int out = 0;
+      for (int t = 0; t < 8 && !ms.Done(); t++)
+        out += ContainerSpillStep(ms, c.mats, 200 + t, 4096, mf, mp, &ev);
+      uint32_t oilOut = 0, waterOut = 0;
+      for (const FluidSpawnOp& f : mf) waterOut += f.mat == mWater, oilOut += f.mat == mOil;
+      for (const ParticleSpawn& q : mp) {
+        const uint32_t pm2 = q.payload & 0xFFFu;
+        const uint32_t e = (q.flags & kPFlagMeasured) ? ((q.payload >> 12) & 7u) + 1u : 8u;
+        if (pm2 == mWater) waterOut += e;
+        if (pm2 == mOil) oilOut += e;
+      }
+      check(ms.Done() && out == 80 && waterOut == 64 && oilOut == 16,
+            "a broken mixed flask spills every portion, each exactly");
+      // The byte shape: the whole mixture round-trips; an OLD reader gets the
+      // main portion as the one word it understands.
+      {
+        std::vector<uint8_t> wb;
+        ByteWriter w{wb};
+        WriteItemInstance(w, mix, true);
+        ByteReader r{wb.data(), wb.size()};
+        ItemInstance back;
+        ReadItemInstance(r, back, true);
+        check(r.ok && back.contents.n == 2 &&
+                  back.contents.AmountOf((uint16_t)mWater) == 64 &&
+                  back.contents.AmountOf((uint16_t)mOil) == 16,
+              "a mixture round-trips through the item byte shape");
+        std::vector<uint8_t> wb1;
+        ByteWriter w1{wb1};
+        WriteItemInstance(w1, mix, false);
+        ByteReader r1{wb1.data(), wb1.size()};
+        ItemInstance old;
+        ReadItemInstance(r1, old, false);
+        check(r1.ok && old.contents.n == 1 && old.contents.AmountOf((uint16_t)mWater) == 64,
+              "the legacy word carries the main portion");
+      }
+      // Spending a salve spends the MIX, in proportion.
+      ItemStack sv = Vs(c.items, flaskI, 1, (uint16_t)mWater, 48);
+      sv.contents.Add((uint16_t)mOil, 16);
+      const int spent = ContainerSpend(sv, 4);   // 32 eighths
+      check(spent == 32 && sv.contents.AmountOf((uint16_t)mWater) == 24 &&
+                sv.contents.AmountOf((uint16_t)mOil) == 8,
+            "applying a mixture spends every portion in proportion");
+    }
     // A liquid the seam cannot hold (lava/blood-like: grid particles) lands
     // at EXACTLY what it held: 20 eighths = 8 + 8 + 4, the last MEASURED at
     // fullness code 3 -- not three full cells.
@@ -623,9 +706,9 @@ Status GateVessel(Ctx& c, std::string& detail) {
       plyr->reset();
       check(plyr->load(bytes.data(), bytes.size(), kPlayerKitSaveVersion),
             "the kit loads back");
-      check(hb.slots[4].fillMat == mBlood && hb.slots[4].fillAmt == 77,
+      check(ContainerMainMat(hb.slots[4].contents) == mBlood && (int)hb.slots[4].FillTotal() == 77,
             "a hotbar flask keeps its blood across a save");
-      check(kit.bag.At(2).fillMat == mSand && kit.bag.At(2).fillAmt == 16,
+      check(ContainerMainMat(kit.bag.At(2).contents) == mSand && (int)kit.bag.At(2).FillTotal() == 16,
             "a pouch in the pack keeps its sand");
       std::vector<uint8_t> v5;
       SavePlayerKit(refs, v5, 5);
@@ -967,7 +1050,7 @@ Status VesselRoundTrip(Ctx& c, std::string& detail, bool mpm) {
   const long taken = w0 - w1;
 
   // THE POUR: from ten cells above the basin's middle, onto it.
-  const int held = st.fillAmt;
+  const int held = (int)st.FillTotal();
   const Vec3 target{base.x + 0.5f, base.y + 0.5f, base.z + 0.5f};
   for (int i = 0; i < 200 && st.Filled(); i++) {
     std::vector<ParticleSpawn> spawns;
@@ -1096,7 +1179,7 @@ Status GateVesselSand(Ctx& c, std::string& detail) {
   const long s0 = sandOnGrid();
 
   ItemStack st = Vs(c.items, pouchI, 1, (uint16_t)mSand, 512);   // 64 cells of sand
-  const int held = st.fillAmt;
+  const int held = (int)st.FillTotal();
   const Vec3 mouth{base.x + 0.5f, base.y + 10.5f, base.z + 0.5f};
   const Vec3 target{base.x + 0.5f, base.y + 0.5f, base.z + 0.5f};
   int pourTicks = 0;
@@ -1234,8 +1317,7 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
   for (int i = 0; i < 24; i++) tick({});
 
   ItemInstance full1024{flask->name};
-  full1024.fillMat = (uint16_t)mWater;
-  full1024.fillAmt = 1024;
+  full1024.contents.Add((uint16_t)mWater, 1024);
   auto drop = [&](Vec3 at, Vec3 vel) {
     return DropItemToWorld(*flask, full1024, at, vel, phys, debris, nullptr,
                            ground);
@@ -1258,7 +1340,7 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
   const WorldItem* wa = ground.Find(a);
   if (!a) fail("A: the flask did not become a body");
   else if (brokeA || !wa) fail("A: a flask SET DOWN from two voxels broke");
-  else if (wa->fillAmt != 1024) fail("A: the set-down flask lost its water");
+  else if ((int)wa->FillTotal() != 1024) fail("A: the set-down flask lost its water");
 
   // ---- B: thrown down hard ---------------------------------------------------
   spills.clear();
@@ -1269,8 +1351,10 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
   for (int i = 0; i < 40 && brokeB < 0; i++)
     if (tick({}) > 0 && !ground.Find(b)) brokeB = i;
   int spilledB = 0;
+  // A spill carries its portions queued (ContainerSpill::rest) until the
+  // step draws them; count both.
   for (const ContainerSpill& sp : spills)
-    if (sp.mat == mWater) spilledB += sp.units;
+    spilledB += (sp.mat == mWater ? sp.units : 0) + (int)sp.rest.AmountOf((uint16_t)mWater);
   if (!b) fail("B: the flask did not become a body");
   else if (brokeB < 0) fail("B: a flask thrown down at full draw did not break");
   else if (spilledB != 1024) fail("B: the broken flask did not spill all 1024 eighths");

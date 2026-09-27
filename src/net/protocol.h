@@ -92,7 +92,9 @@ enum class MsgType : uint16_t {
 // Bumped when any message's layout or meaning changes. It is the FIRST field
 // Hello compares, so a version skew is reported as "protocolVersion" rather
 // than as whichever struct happened to move.
-constexpr uint16_t kProtocolVersion = 1;
+// 2 (2026-09-26): an item's vessel contents are a Composition (up to 16
+// portions, iteminstance.h WriteContents) where they were one packed word.
+constexpr uint16_t kProtocolVersion = 2;
 
 // D, the lockstep delay, in ticks. Fixed rather than adaptive: §4 finding 5
 // takes "no deadlock" from a constant that both sides agree on before they

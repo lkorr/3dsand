@@ -1592,8 +1592,9 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
     a.dead = 1;
     a.item.name = "iron sword";
     a.item.dye = 3;
-    a.item.fillMat = 7;    // W2-M: the whole ItemInstance travels
-    a.item.fillAmt = 41;
+    a.item.ClearFill();
+    if ((7) != 0 && (41) != 0)
+      a.item.contents.Add((uint16_t)(7), (uint32_t)(41));
     a.item.damage.shells.resize(1);
     a.item.damage.shells[0].hp = 2.5f;
     std::vector<uint8_t> buf;
@@ -1619,8 +1620,8 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
               a2.dye == a.dye && a2.hadMicro == a.hadMicro &&
               a2.bleedMat == a.bleedMat && a2.dead == a.dead &&
               a2.item.name == a.item.name && a2.item.dye == a.item.dye &&
-              a2.item.fillMat == a.item.fillMat &&
-              a2.item.fillAmt == a.item.fillAmt &&
+              a2.item.contents.AmountOf(7) == a.item.contents.AmountOf(7) &&
+              a2.item.contents.n == a.item.contents.n &&
               a2.item.damage.shells.size() == 1 &&
               a2.item.damage.shells[0].hp == 2.5f &&
               std::memcmp(a2.voxels.data(), a.voxels.data(),
@@ -1933,8 +1934,9 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
       if (bh != ghostH) return false;
       it.name = "iron sword";
       it.dye = 5;
-      it.fillMat = 9;
-      it.fillAmt = 12;
+      it.ClearFill();
+      if ((9) != 0 && (12) != 0)
+        it.contents.Add((uint16_t)(9), (uint32_t)(12));
       it.damage.shells.resize(1);
       it.damage.shells[0].hp = 12.0f;
       return true;
@@ -1981,7 +1983,7 @@ Status GateDebrisGhost(Ctx& c, std::string& detail) {
     const bool wired = net::Decode(gr, gw) && gr.off == gbuf.size();
     itemOk = queued && noEarlyGrant && sent && gotGrant && g.granted == 1 &&
              wired && gw.item.name == "iron sword" && gw.item.dye == 5 &&
-             gw.item.fillMat == 9 && gw.item.fillAmt == 12 &&
+             gw.item.contents.AmountOf(9) == 12 &&
              gw.item.damage.shells.size() == 1 &&
              gw.item.damage.shells[0].hp == 12.0f && gw.globalId == ghostId;
     // A REFUSAL IS A REPLY, and it has to be distinguishable. Asking again for

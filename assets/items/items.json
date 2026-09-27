@@ -155,7 +155,7 @@
       "id": "flask",
       "kind": "container",
       "container": {
-        "holds": ["liquid"],
+        "holds": ["liquid", "powder"],
         "capacity": 128,
         "scoopPerTick": 4,
         "pourPerTick": 2,

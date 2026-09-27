@@ -1,8 +1,10 @@
 #pragma once
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
 
+#include "game/composition.h"  // a vessel's contents: up to 16 portions
 #include "sim/bytestream.h"
 #include "sim/mattable.h"  // MatRemap: saved material ids -> running ids
 #include "sim/voxload.h"   // PrefabVoxel: a damaged shell's lattice
@@ -82,13 +84,53 @@ struct WornDamage {
   }
 };
 
-// Vessel contents <-> the one word the older records (and the PLYR/ITMS fill
-// sections) carry: material id | eighths << 16.
-inline uint32_t PackItemFill(uint16_t mat, uint16_t amt) {
-  return (uint32_t)mat | ((uint32_t)amt << 16);
+// THE LEGACY FILL WORD: material id | eighths << 16, ONE material. What PLYR
+// v6/v7, ITMS v3/v4, MOBS v7/v8 and net protocol 1 carried before a vessel
+// could hold a mixture (2026-09-26). Read-only now: an old record's word
+// becomes a one-portion Composition, and nothing writes the word again.
+inline alchemy::Composition ContentsFromLegacyFill(uint32_t f) {
+  alchemy::Composition c;
+  const uint16_t mat = (uint16_t)(f & 0xFFFFu), amt = (uint16_t)(f >> 16);
+  if (mat != 0 && amt != 0) c.Add(mat, amt);
+  return c;
 }
-inline uint16_t ItemFillMat(uint32_t f) { return (uint16_t)(f & 0xFFFFu); }
-inline uint16_t ItemFillAmt(uint32_t f) { return (uint16_t)(f >> 16); }
+
+// ...and the word an OLDER format gets written, which can say one material:
+// the portion with the most eighths, at its own amount.
+inline uint32_t LegacyFillWordOf(const alchemy::Composition& c) {
+  uint32_t best = 0, mat = 0;
+  for (int i = 0; i < c.n; i++)
+    if (c.p[i].eighths > best) { best = c.p[i].eighths; mat = c.p[i].mat; }
+  return best ? (mat | (std::min<uint32_t>(best, 0xFFFFu) << 16)) : 0u;
+}
+
+// THE CONTENTS' BYTE SHAPE, written once: a portion count, then (material id,
+// eighths) per portion. Bounded on read -- a count past kMaxSubstances is a
+// corrupt record -- and a zero portion is dropped rather than kept as an
+// empty slot, so `n` always counts real substances.
+inline void WriteContents(ByteWriter& w, const alchemy::Composition& c) {
+  w.U32(c.n);
+  for (int i = 0; i < c.n; i++) {
+    w.U32(c.p[i].mat);
+    w.U32(c.p[i].eighths);
+  }
+}
+inline bool ReadContents(ByteReader& r, alchemy::Composition& c) {
+  c = alchemy::Composition{};
+  uint32_t n = 0;
+  if (!r.U32(n)) return false;
+  if (n > (uint32_t)alchemy::kMaxSubstances) {
+    r.ok = false;
+    return false;
+  }
+  for (uint32_t i = 0; i < n && r.ok; i++) {
+    uint32_t mat = 0, amt = 0;
+    r.U32(mat);
+    r.U32(amt);
+    if (r.ok && mat != 0 && mat < 4096 && amt != 0) c.Add((uint16_t)mat, amt);
+  }
+  return r.ok;
+}
 
 struct ItemInstance {
   std::string name;     // ItemDef::name; "" = nothing here
@@ -96,25 +138,22 @@ struct ItemInstance {
   // WHAT COLOUR THIS PARTICULAR ONE IS (game/dye.h). 0 = undyed. On the
   // instance, not on the def: the def is the PATTERN.
   uint32_t dye = 0;
-  // WHAT IS IN IT, for a vessel (ItemKind::Container, game/container.h):
-  // material id + eighths of a cell, the fill of ONE vessel. 0/0 on
-  // everything that is not a filled vessel.
-  uint16_t fillMat = 0;
-  uint16_t fillAmt = 0;
+  // WHAT IS IN IT, for a vessel (ItemKind::Container, game/container.h): up
+  // to 16 (material id, eighths of a cell) portions -- a flask can hold water
+  // AND oil (game/composition.h; the alchemy bench, game/flasksim.h, is where
+  // they are mixed). Empty on everything that is not a filled vessel.
+  alchemy::Composition contents;
   // WHAT IT HAS BEEN THROUGH (worn pieces). Empty = as authored.
   WornDamage damage;
 
   bool Empty() const { return name.empty() || count <= 0; }
-  bool Filled() const { return fillMat != 0 && fillAmt != 0; }
-  uint32_t Fill() const { return PackItemFill(fillMat, fillAmt); }
-  void SetFill(uint32_t f) {
-    fillMat = ItemFillMat(f);
-    fillAmt = ItemFillAmt(f);
-    if (fillAmt == 0) fillMat = 0;
-  }
+  bool Filled() const { return !contents.Empty(); }
+  // Eighths in it, every portion together.
+  uint32_t FillTotal() const { return contents.Total(); }
+  void ClearFill() { contents = alchemy::Composition{}; }
   // A PRISTINE instance: nothing about it but its name and colour. Only these
   // merge into a stack — see StacksWith.
-  bool Plain() const { return fillAmt == 0 && damage.Empty(); }
+  bool Plain() const { return contents.Empty() && damage.Empty(); }
   // DO TWO OF THESE MERGE INTO ONE STACK? Same item, same colour, and BOTH
   // plain. A filled vessel never stacks (a fill is per-object state: two
   // flasks of 40 eighths merged into one count-2 stack with ONE fill, and
@@ -137,7 +176,16 @@ struct ItemInstance {
 // piece's damaged lattice — and both are ids in the table that file was
 // written under. One call puts them into the running table's ids.
 inline void RemapItemInstance(ItemInstance& it, const MatRemap& r) {
-  if (it.fillMat != 0) it.fillMat = (uint16_t)r.Mat(it.fillMat);
+  // Rebuilt through Add, so two saved materials that map to one running id
+  // merge into one portion instead of standing as two.
+  if (!it.contents.Empty()) {
+    alchemy::Composition c;
+    for (int i = 0; i < it.contents.n; i++) {
+      const uint32_t m = r.Mat(it.contents.p[i].mat);
+      if (m != 0) c.Add((uint16_t)m, it.contents.p[i].eighths);
+    }
+    it.contents = c;
+  }
   for (WornShellDamage& s : it.damage.shells) RemapPrefabVoxels(s.lattice, r);
 }
 
@@ -183,21 +231,33 @@ inline bool ReadWornDamage(ByteReader& r, WornDamage& d,
   return r.ok;
 }
 
-inline void WriteItemInstance(ByteWriter& w, const ItemInstance& it) {
+// `mixed` = the contents are a Composition (MOBS v9+, net protocol 2+); a
+// record from before that carries the one-material legacy word. Callers pass
+// their format's answer; there is no default, so no reader guesses.
+inline void WriteItemInstance(ByteWriter& w, const ItemInstance& it, bool mixed) {
   w.Str(it.name);
   w.U32((uint32_t)(it.count < 0 ? 0 : it.count));
   w.U32(it.dye);
-  w.U32(it.Fill());
+  if (mixed) {
+    WriteContents(w, it.contents);
+  } else {
+    w.U32(LegacyFillWordOf(it.contents));
+  }
   WriteWornDamage(w, it.damage);
 }
 
-inline bool ReadItemInstance(ByteReader& r, ItemInstance& it) {
-  uint32_t count = 0, fill = 0;
+inline bool ReadItemInstance(ByteReader& r, ItemInstance& it, bool mixed) {
+  uint32_t count = 0;
   r.Str(it.name);
   r.U32(count);
   r.U32(it.dye);
-  r.U32(fill);
+  if (mixed) {
+    ReadContents(r, it.contents);
+  } else {
+    uint32_t fill = 0;
+    r.U32(fill);
+    it.contents = ContentsFromLegacyFill(fill);
+  }
   it.count = (int)count;
-  it.SetFill(fill);
   return ReadWornDamage(r, it.damage) && r.ok;
 }

@@ -432,9 +432,13 @@ struct Kit {
         return;
       }
       if (!d->IsContainer()) {
-        s.fillMat = s.fillAmt = 0;
-      } else if (s.fillAmt > d->container.capacity) {
-        s.fillAmt = (uint16_t)d->container.capacity;
+        s.ClearFill();
+      } else {
+        // Over capacity (a def that shrank): the last portions give way.
+        while ((int)s.FillTotal() > d->container.capacity && s.Filled()) {
+          const uint32_t over = s.FillTotal() - (uint32_t)d->container.capacity;
+          s.contents.Take(s.contents.p[s.contents.n - 1].mat, over);
+        }
       }
     });
     return dropped;

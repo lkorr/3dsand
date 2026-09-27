@@ -2198,8 +2198,8 @@ void MobSystem::RefreshHeldFills() {
     for (int hk = 0; hk < kHands; hk++) {
       const Hand h = HandAt(hk);
       ContainerHeldFill f;
-      const uint32_t fill = m.HeldContents(h);
-      if (items_ && fill && !m.HeldItem(h).empty())
+      const alchemy::Composition& fill = m.HeldContents(h);
+      if (items_ && !fill.Empty() && !m.HeldItem(h).empty())
         if (const ItemDef* d = items_->At(items_->Find(m.HeldItem(h))))
           f = ContainerHeldFillFrom(*d, fill);
       m.SetHeldFill(f, h);
@@ -2943,7 +2943,7 @@ bool MobSystem::ServiceRising(size_t ri) {
     bool held = false;
     Hand hand = Hand::Right;
     uint32_t dye = 0;
-    uint32_t fill = 0;   // a held vessel's contents (Mob::HeldContents)
+    alchemy::Composition fill;   // a held vessel's contents (Mob::HeldContents)
     WornDamage damage;
   };
   std::vector<RiseGear> gear;
@@ -8169,7 +8169,7 @@ ItemInstance Mob::ShedGearBeforeDetach(int limbIndex) {
     if (limbIndex >= 0 && limbIndex < (int)limbs_.size())
       shed.dye = limbs_[limbIndex].dye;
     // A flask knocked from the hand still holds what it held.
-    shed.SetFill(hh.contents);
+    shed.contents = hh.contents;
     // ...AND THE KIT'S HAND SLOT GIVES IT UP (dual wielding). The hand is a
     // kit slot now (EquipSlotId::HandR/HandL), and the player's rig is
     // dressed FROM it every tick: left holding the name, the next tick
@@ -8179,7 +8179,7 @@ ItemInstance Mob::ShedGearBeforeDetach(int limbIndex) {
     {
       ItemStack& ks = kit_.equip.InHand(lostHand);
       if (!ks.Empty() && ks.name == hh.item) {
-        if (hh.contents == 0) shed.SetFill(ks.Fill());
+        if (hh.contents.Empty()) shed.contents = ks.contents;
         if (--ks.count <= 0) ks = ItemStack{};
       }
     }
@@ -21732,7 +21732,7 @@ void Mob::LootPieces(std::vector<LootPiece>& out) const {
     piece.kind = LootPiece::Kind::Held;
     piece.name = hh.item;
     piece.hand = HandAt(hk);
-    piece.SetFill(hh.contents);
+    piece.contents = hh.contents;
     out.push_back(std::move(piece));
   }
   // The pack last, so the worn and held entries keep the indices the loot
@@ -23154,7 +23154,7 @@ static void WriteRecordGear(ByteWriter& w,
   w.U32((uint32_t)gear.size());
   for (const ::net::WireGear& g : gear) {
     if (version >= 7) {
-      WriteItemInstance(w, g);
+      WriteItemInstance(w, g, version >= 9);
       w.Pod(g.equipSlot);
       w.U32(g.held);
       continue;
@@ -23183,7 +23183,7 @@ static bool ReadRecordGear(ByteReader& r, std::vector<::net::WireGear>& gear,
   for (uint32_t i = 0; i < n && r.ok; i++) {
     ::net::WireGear g;
     if (version >= 7) {
-      ReadItemInstance(r, g);
+      ReadItemInstance(r, g, version >= 9);
       r.Pod(g.equipSlot);
       r.U32(g.held);
     } else {
@@ -23252,7 +23252,7 @@ void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
     ::net::WireGear g;
     g.name = hh.item;
     g.held = 1u + (uint32_t)hk;
-    g.SetFill(hh.contents);
+    g.contents = hh.contents;
     bySlot.emplace_back(hh.slot, std::move(g));
   }
   std::stable_sort(bySlot.begin(), bySlot.end(),
@@ -23347,7 +23347,7 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
     w.U32((uint32_t)pack.size());
     for (const ItemInstance& c : pack) {
       if (version >= 7) {
-        WriteItemInstance(w, c);
+        WriteItemInstance(w, c, version >= 9);
         continue;
       }
       w.Str(c.name);
@@ -23580,7 +23580,7 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
   for (uint32_t i = 0; i < nCarried && r.ok; i++) {
     ItemInstance c;
     if (version >= 7) {
-      ReadItemInstance(r, c);
+      ReadItemInstance(r, c, version >= 9);
     } else {
       uint32_t count = 0;
       r.Str(c.name);
@@ -24346,7 +24346,7 @@ void MobSystem::ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear) 
     if (item == nullptr) continue;   // retired item: it arrives without it
     if (g.held) {
       const Hand h = g.held == 2u ? Hand::Left : Hand::Right;
-      if (m.EquipItem(item, h)) m.SetHeldContents(g.Fill(), h);
+      if (m.EquipItem(item, h)) m.SetHeldContents(g.contents, h);
     } else
       m.WearItem(item, g.equipSlot, g.damage.Empty() ? nullptr : &g.damage,
                  g.dye);
@@ -24646,7 +24646,11 @@ uint64_t MobSystem::StateKey(uint64_t mobId) const {
     mixStr(c.name);
     mix((uint64_t)(int64_t)c.count);
     mix(c.dye);
-    mix(c.Fill());
+    mix(c.contents.n);
+    for (int i = 0; i < c.contents.n; i++) {
+      mix(c.contents.p[i].mat);
+      mix(c.contents.p[i].eighths);
+    }
   }
   return h == 0 ? 1 : h;   // 0 is "unknown id"
 }

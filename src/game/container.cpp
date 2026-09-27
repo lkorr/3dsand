@@ -1,5 +1,7 @@
 #include "game/container.h"
 
+#include <cstdlib>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -62,11 +64,12 @@ bool ContainerAccepts(const ItemDef& def, const ItemStack& st, uint32_t mat,
                                 : "you cannot scoop that";
     return false;
   }
-  if (st.Filled() && st.fillMat != mat) {
-    w = "it already holds something else";
+  if (st.contents.AmountOf((uint16_t)mat) == 0 &&
+      st.contents.n >= alchemy::kMaxSubstances) {
+    w = "it already holds too many things";
     return false;
   }
-  if (st.fillAmt >= def.container.capacity) {
+  if ((int)st.FillTotal() >= def.container.capacity) {
     w = "it is full";
     return false;
   }
@@ -86,18 +89,12 @@ int ContainerScoop(const ItemDef& def, ItemStack& st, IVec3 hit,
     w = "too far away";
     return 0;
   }
-  // The struck cell decides the material when the vessel is empty; a vessel
-  // that already holds something -- or has a scoop of it still in flight --
-  // only ever takes more of the same.
+  // The struck cell decides the material. A vessel that already holds
+  // something takes it as another portion (contents mix, up to
+  // kMaxSubstances); each claim in flight carries its own material.
   const int pending = memo ? memo->Pending() : 0;
-  const uint32_t mat = st.Filled()   ? st.fillMat
-                       : pending > 0 ? memo->PendingMat()
-                                     : (hitWord & 0xFFFu);
-  if (!ContainerAccepts(def, st, hitWord & 0xFFFu, mats, &w)) return 0;
-  if ((hitWord & 0xFFFu) != mat) {
-    w = "it already holds something else";
-    return 0;
-  }
+  const uint32_t mat = hitWord & 0xFFFu;
+  if (!ContainerAccepts(def, st, mat, mats, &w)) return 0;
 
   // Candidates: every cell of `mat` within a small ball of the struck one.
   // Radius 2 is a cupped hand's worth: enough that a held button empties a
@@ -140,7 +137,7 @@ int ContainerScoop(const ItemDef& def, ItemStack& st, IVec3 hit,
     // unconditional write of the remainder, which is the overwrite the
     // conditional clear exists to avoid. What is still in flight counts
     // against the room, or four ticks of claims could overfill it.
-    if (st.fillAmt + pending + asked + units > cap) continue;
+    if ((int)st.FillTotal() + pending + asked + units > cap) continue;
     ops.push_back({World::SlotCellIndex(cd.c), CellOpClearIfMat(mat)});
     asked += units;
     if (memo) memo->cells.push_back({cd.c, tick});
@@ -152,12 +149,11 @@ int ContainerScoop(const ItemDef& def, ItemStack& st, IVec3 hit,
       memo->claims.push_back({tick, (uint16_t)mat, asked});
     } else {
       // No ledger to settle against (the pure gate): pay the ask.
-      st.fillMat = (uint16_t)mat;
-      st.fillAmt = (uint16_t)(st.fillAmt + asked);
+      st.contents.Add((uint16_t)mat, (uint32_t)asked);
     }
   }
   if (taken == 0)
-    w = st.fillAmt + pending >= cap ? "it is full"
+    w = (int)st.FillTotal() + pending >= cap ? "it is full"
                                     : "there is not enough left to fill it";
   return taken;
 }
@@ -180,12 +176,10 @@ void ContainerLedgerObserve(ContainerScoopLedger& L, uint32_t snapTick,
 int ContainerDeposit(const ItemDef& def, ItemStack& st, uint16_t mat, int units) {
   if (units <= 0 || mat == 0 || st.Empty() || !def.IsContainer()) return 0;
   if (st.count != 1) return 0;   // one object's fill, never a stack's
-  if (st.Filled() && st.fillMat != mat) return 0;
-  const int room = std::max(0, def.container.capacity - (int)st.fillAmt);
+  const int room = std::max(0, def.container.capacity - (int)st.FillTotal());
   const int put = std::min(units, room);
   if (put <= 0) return 0;
-  st.fillMat = mat;
-  st.fillAmt = (uint16_t)(st.fillAmt + put);
+  if (!st.contents.Add(mat, (uint32_t)put)) return 0;   // a 17th substance
   return put;
 }
 
@@ -315,7 +309,9 @@ namespace {
 bool ContainerContentIsLiquid(const ItemDef& def, uint32_t mat,
                               const std::vector<MaterialDef>* mats) {
   if (mats) return mat < mats->size() && (*mats)[mat].gpu.klass == CLASS_LIQUID;
-  return def.container.holds == (1u << CLASS_LIQUID);
+  // No table to ask: a vessel that can hold liquid is taken to (the gates
+  // that pour without one pour water).
+  return (def.container.holds & (1u << CLASS_LIQUID)) != 0;
 }
 }  // namespace
 
@@ -350,16 +346,17 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
   }
 
   int poured = 0;
-  const uint32_t mat = st.fillMat;
+  // One portion per tick: the top layer (ContainerTopMat).
+  const uint32_t mat = ContainerTopMat(st, mats);
   const bool liquid = ContainerContentIsLiquid(def, mat, mats);
-  for (int k = 0; k < def.container.pourPerTick && st.Filled(); k++) {
+  for (int k = 0; k < def.container.pourPerTick && st.contents.AmountOf((uint16_t)mat) > 0; k++) {
     if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
     if ((uint32_t)k >= partRoom) break;   // charged only for what the ring takes
     // A powder leaves in GRAINS of def.container.pourGrain eighths each (a
     // pouch: 1/8-voxel grains that merge into partial cells where they land);
     // a liquid in whole cells plus its measured remainder, as before.
     const int unit = liquid ? kContainerUnitsPerCell : def.container.pourGrain;
-    const int spend = std::min<int>(unit, st.fillAmt);
+    const int spend = std::min<int>(unit, (int)st.contents.AmountOf((uint16_t)mat));
     // A little spread so the stream is a stream and not one voxel column:
     // +-4% of the launch velocity and +-0.3 cell at the lip, both hashed from
     // (seed, tick, k) so a replayed pour lands the same cells.
@@ -387,8 +384,7 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     // CALM: a stream, not spray -- the wind does not carry it off.
     s.flags = kPFlagAlive | kPFlagCalm | (liquid ? kPFlagMeasured : 0u);
     spawns.push_back(s);
-    st.fillAmt = (uint16_t)(st.fillAmt - spend);
-    if (st.fillAmt == 0) st.fillMat = 0;
+    st.contents.Take((uint16_t)mat, (uint32_t)spend);
     poured++;
   }
   if (poured > 0 && splat) {
@@ -424,7 +420,7 @@ int32_t Q16(float v) { return (int32_t)std::lround(v * 65536.0f); }
 int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                        const Vec3* target, uint32_t tick, uint32_t seed,
                        uint32_t room, std::vector<FluidSpawnOp>& out,
-                       SplatterEvent* splat) {
+                       SplatterEvent* splat, const std::vector<MaterialDef>* mats) {
   // One vessel's fill: a stack does not pour (isolate one first).
   if (!def.IsContainer() || !st.Filled() || st.count != 1) return 0;
   const Tuning& tune = CurrentTuning();
@@ -469,9 +465,10 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     n = 30;
   }
 
-  const uint32_t mat = st.fillMat;
+  const uint32_t mat = ContainerTopMat(st, mats);
   const int want = std::min<int>(
-      {def.container.pourPerTick * kContainerUnitsPerCell, (int)st.fillAmt,
+      {def.container.pourPerTick * kContainerUnitsPerCell,
+       (int)st.contents.AmountOf((uint16_t)mat),
        (int)std::min<uint32_t>(room, (uint32_t)kMaxFluidSpawnsPerTick)});
   const float vl = v0.len();
   int poured = 0;
@@ -497,8 +494,7 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     out.push_back(op);
     poured++;
   }
-  st.fillAmt = (uint16_t)(st.fillAmt - poured);
-  if (st.fillAmt == 0) st.fillMat = 0;
+  st.contents.Take((uint16_t)mat, (uint32_t)poured);
   if (poured > 0 && splat) {
     SplatterEvent& e = *splat;
     e = SplatterEvent{};
@@ -612,6 +608,13 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
                        std::vector<FluidSpawnOp>& fluid,
                        std::vector<ParticleSpawn>& parts, SplatterEvent* splat,
                        uint32_t partRoom) {
+  // The next portion when this one is out (a mixed vessel spills them in
+  // turn). A portion whose material is gone from the table is dropped.
+  while (sp.units <= 0 && !sp.rest.Empty()) {
+    sp.mat = sp.rest.p[0].mat;
+    sp.units = (int)sp.rest.Take(sp.mat, sp.rest.p[0].eighths);
+    if (sp.mat == 0 || sp.mat >= mats.size()) sp.units = 0;
+  }
   if (sp.units <= 0 || sp.mat == 0 || sp.mat >= mats.size()) {
     sp.units = 0;
     return 0;
@@ -771,8 +774,7 @@ int ContainerBreakPass(WorldItems& ground, const ItemLibrary& items,
     const WorldItem* wi = ground.Find(b.body);
     if (!wi) continue;
     ContainerSpill sp;
-    sp.mat = wi->fillMat;
-    sp.units = wi->fillAmt;
+    sp.rest = wi->contents;
     sp.vel = b.prevVel;
     sp.away = b.away;
     sp.seed = (uint32_t)(b.body ^ (b.body >> 32)) ^ 0xF1A5Bu;
@@ -784,18 +786,31 @@ int ContainerBreakPass(WorldItems& ground, const ItemLibrary& items,
     // AFTER every read of the entry: OnBodyGone erases it.
     debris.DestroyBody(b.body);
     n++;
-    if (sp.units > 0 && sp.mat != 0) spills.push_back(sp);
+    if (!sp.Done()) spills.push_back(sp);
   }
   return n;
 }
 
 int ContainerSpend(ItemStack& st, int cells) {
   if (!st.Filled() || cells <= 0 || st.count != 1) return 0;
+  // What is spent is the MIX: every portion in proportion, so a salve of two
+  // parts honey to one of ash stays two to one as the flask empties.
+  // Remainders go to the largest portions first, which keeps the total exact.
   const int want = cells * kContainerUnitsPerCell;
-  const int spend = std::min<int>(want, st.fillAmt);
-  st.fillAmt = (uint16_t)(st.fillAmt - spend);
-  if (st.fillAmt == 0) st.fillMat = 0;
-  return spend;
+  const uint32_t total = st.FillTotal();
+  const int spend = std::min<int>(want, (int)total);
+  if (spend <= 0) return 0;
+  alchemy::Composition before = st.contents;
+  uint32_t taken = 0;
+  for (int i = 0; i < before.n; i++) {
+    const uint32_t part = (uint32_t)((uint64_t)before.p[i].eighths * (uint32_t)spend / total);
+    taken += st.contents.Take(before.p[i].mat, part);
+  }
+  while (taken < (uint32_t)spend && st.Filled()) {
+    uint16_t m = ContainerMainMat(st.contents);
+    taken += st.contents.Take(m, 1);
+  }
+  return (int)taken;
 }
 
 bool ContainerIsolateOne(ItemStack* slots, int nSlots, int slot,
@@ -827,24 +842,81 @@ std::string ContainerFillText(const ItemDef& def, const ItemStack& st,
     std::snprintf(b, sizeof b, "empty (holds %d)", capCells);
     return b;
   }
-  const std::string name =
-      st.fillMat < mats.size() ? mats[st.fillMat].name : std::string("?");
   // Whole cells, rounded UP: a flask with one eighth left is not "0 water".
-  const int cells = (st.fillAmt + kContainerUnitsPerCell - 1) / kContainerUnitsPerCell;
+  auto cellsOf = [](uint32_t e) {
+    return (int)((e + kContainerUnitsPerCell - 1) / kContainerUnitsPerCell);
+  };
+  auto nameOf = [&](uint16_t m) {
+    return m < mats.size() ? mats[m].name : std::string("?");
+  };
   char b[96];
-  std::snprintf(b, sizeof b, "%s %d/%d", name.c_str(), cells, capCells);
+  if (st.contents.n == 1) {
+    std::snprintf(b, sizeof b, "%s %d/%d", nameOf(st.contents.p[0].mat).c_str(),
+                  cellsOf(st.contents.p[0].eighths), capCells);
+    return b;
+  }
+  // A mixture: the main portion by name, the count of the others, the total.
+  std::snprintf(b, sizeof b, "%s +%d more %d/%d",
+                nameOf(ContainerMainMat(st.contents)).c_str(), st.contents.n - 1,
+                cellsOf(st.FillTotal()), capCells);
   return b;
 }
 
 uint32_t ContainerFillSwatch(const ItemStack& st,
                              const std::vector<MaterialDef>& mats) {
-  if (!st.Filled() || st.fillMat >= mats.size()) return 0;
-  return 0xFF000000u | (mats[st.fillMat].gpu.color0 & 0x00FFFFFFu);
+  const uint16_t m = ContainerMainMat(st.contents);
+  if (m == 0 || m >= mats.size()) return 0;
+  return 0xFF000000u | (mats[m].gpu.color0 & 0x00FFFFFFu);
 }
 
-ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, uint32_t fill) {
+alchemy::Composition ContainerParseFillSpec(const std::string& spec, int capacity,
+                                            const std::vector<MaterialDef>& mats) {
+  alchemy::Composition out;
+  size_t at = 0;
+  while (at <= spec.size()) {
+    const size_t plus = spec.find('+', at);
+    const std::string part = spec.substr(at, plus == std::string::npos ? std::string::npos : plus - at);
+    at = plus == std::string::npos ? spec.size() + 1 : plus + 1;
+    if (part.empty()) continue;
+    const size_t colon = part.find(':');
+    const std::string name = part.substr(0, colon);
+    const float frac = colon == std::string::npos ? 1.0f : (float)std::atof(part.c_str() + colon + 1);
+    uint16_t mat = 0;
+    for (size_t m = 1; m < mats.size(); m++)
+      if (mats[m].name == name) mat = (uint16_t)m;
+    const int room = capacity - (int)out.Total();
+    const int amt = std::clamp((int)std::lround(frac * (float)capacity), 0, std::max(0, room));
+    if (mat && amt > 0) out.Add(mat, (uint32_t)amt);
+  }
+  return out;
+}
+
+uint16_t ContainerMainMat(const alchemy::Composition& c) {
+  uint32_t best = 0;
+  uint16_t m = 0;
+  for (int i = 0; i < c.n; i++)
+    if (c.p[i].eighths > best) { best = c.p[i].eighths; m = c.p[i].mat; }
+  return m;
+}
+
+uint16_t ContainerTopMat(const ItemInstance& st, const std::vector<MaterialDef>* mats) {
+  const alchemy::Composition& c = st.contents;
+  if (c.Empty()) return 0;
+  if (!mats) return c.p[0].mat;
+  int best = -1;
+  int32_t bestD = 0;
+  for (int i = 0; i < c.n; i++) {
+    const uint16_t m = c.p[i].mat;
+    const int32_t d = m < mats->size() ? (*mats)[m].gpu.density : 0;
+    if (best < 0 || d < bestD) { best = i; bestD = d; }
+  }
+  return c.p[best].mat;
+}
+
+ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, const alchemy::Composition& c) {
   ContainerHeldFill f;
-  const uint16_t mat = ItemFillMat(fill), amt = ItemFillAmt(fill);
+  const uint16_t mat = ContainerMainMat(c);
+  const uint32_t amt = c.Total();
   if (!def.IsContainer() || mat == 0 || amt == 0) return f;
   f.mat = mat;
   f.slices = def.container.fillSlices;
@@ -856,11 +928,16 @@ ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, uint32_t fill) {
 }
 
 ContainerHeldFill ContainerHeldFillOf(const ItemDef& def, const ItemInstance& st) {
-  return ContainerHeldFillFrom(def, st.Fill());
+  return ContainerHeldFillFrom(def, st.contents);
 }
 
 float ContainerFillGlow(const ItemInstance& st,
                         const std::vector<MaterialDef>& mats) {
-  if (!st.Filled() || st.fillMat >= mats.size()) return 0.0f;
-  return (float)mats[st.fillMat].gpu.emission / 255.0f;
+  // The brightest portion: a drop of lava in water still glows.
+  uint32_t e = 0;
+  for (int i = 0; i < st.contents.n; i++) {
+    const uint16_t m = st.contents.p[i].mat;
+    if (m < mats.size()) e = std::max(e, mats[m].gpu.emission);
+  }
+  return (float)e / 255.0f;
 }

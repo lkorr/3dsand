@@ -1303,8 +1303,8 @@ static void PhaseE(TickAuthorityCtx& w, WorldScratch& ws,
           ui.giveVesselStatus = why ? why : "refused";
         } else {
           ItemStack full = StackOf(items, di);
-          full.fillMat = (uint16_t)mat;
-          full.fillAmt = (uint16_t)std::min(d->container.capacity, 0xFFFF);
+          full.ClearFill();
+          full.contents.Add((uint16_t)mat, (uint32_t)d->container.capacity);
           const bool ok = hotbar.Add(full) >= 0 || kit.bag.Add(full) >= 0;
           ui.giveVesselStatus = ok ? vname + " of " + mname + " — in your pack"
                                    : "no room in the hotbar or the bag";
@@ -1634,14 +1634,18 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             ItemStack& cand = v[i];
             if (cand.Empty()) return 0;
             const ItemDef* d = items.Of(cand);
-            if (!d || !d->IsContainer() || (cand.Filled() && cand.fillMat != mat))
+            // Another substance is fine (contents mix) until the vessel holds
+            // kMaxSubstances of them.
+            if (!d || !d->IsContainer() ||
+                (cand.contents.AmountOf(mat) == 0 &&
+                 cand.contents.n >= alchemy::kMaxSubstances))
               return 0;
             if (mat >= mats.size() || mats[mat].gpu.klass > 31 ||
                 ((d->container.holds >> mats[mat].gpu.klass) & 1u) == 0)
               return 0;
             if (cand.count > 1 && !ContainerIsolateOne(v, n, i, spill, nSpill))
               return 0;
-            const int before = cand.fillAmt;
+            const int before = (int)cand.FillTotal();
             const int put = ContainerDeposit(*d, cand, mat, units);
             // The fill cue: one per CELL that landed (a cell is up to eight
             // eighths), each at the fill it brought the vessel to. Liquid
@@ -1798,8 +1802,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             } else {
               // The fill was ONE flask's (ItemInstance::StacksWith) and it just left
               // in the thrown one; what stays behind is empty, not a copy.
-              vs.fillMat = 0;
-              vs.fillAmt = 0;
+              vs.ClearFill();
             }
           } else {
             ui.kitMessage = "there is nowhere to throw that";
@@ -2002,7 +2005,8 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               applied = true;  // the arm is still coming up: aimed, not yet pouring
             } else if (hit.hit) {
               applied = true;
-              const uint32_t mat = vs.fillMat;
+              // What reaches the skin is what is at the mouth: the top layer.
+              const uint32_t mat = ContainerTopMat(vs, &mats);
               const float radius = std::max(0.1f, st.intent.applyRadius);
               s.applySpendMilli += (int64_t)std::llround(
                   PourBrushCellsPerSec(*vdef, radius) * kContainerUnitsPerCell *
@@ -2010,8 +2014,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               const int units = (int)(s.applySpendMilli / 1000);
               s.applySpendMilli -= (int64_t)units * 1000;
               if (units > 0) {
-                vs.fillAmt = (uint16_t)(vs.fillAmt - std::min<int>(units, vs.fillAmt));
-                if (vs.fillAmt == 0) vs.fillMat = 0;
+                vs.contents.Take((uint16_t)mat, (uint32_t)units);
               }
               uint32_t marked = 0;
               // +3 a tick, as the portrait brush: five ticks on one spot soak it.
@@ -2105,9 +2108,11 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               SplatterEvent splat;
               const uint32_t pseed = 0x0F1A5Cu ^ (uint32_t)vSlot;
               const int poured =
-                  vs.fillMat < mats.size() && ContainerPoursAsFluid(mats[vs.fillMat])
+                  ContainerTopMat(vs, &mats) < mats.size() &&
+                          ContainerPoursAsFluid(mats[ContainerTopMat(vs, &mats)])
                       ? ContainerPourFluid(*vdef, vs, mouth, fwd, &target, tick,
-                                           pseed, fluidRoom(), fluidSpawns, &splat)
+                                           pseed, fluidRoom(), fluidSpawns, &splat,
+                                           &mats)
                       : ContainerPour(*vdef, vs, mouth, fwd, &target,
                                       CurrentTuning().sim.partGravity, tick,
                                       pseed, spawns, &splat,
@@ -2242,7 +2247,7 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
           if (first && sp.splatted) mobs.QueueSplatter(splat);
         }
         std::erase_if(w.vesselSpills,
-                      [](const ContainerSpill& sp) { return sp.units <= 0; });
+                      [](const ContainerSpill& sp) { return sp.Done(); });
       }
 
       // WHO THE NPCs ARE FIGHTING, pushed once per TICK rather than per frame.
@@ -2469,7 +2474,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               const ItemDef* vd = hands.hand[hk].vessel ? hands.hand[hk].item : nullptr;
               const ItemStack& hs = kit.equip.InHand(h);
               const bool held = vd != nullptr && !hs.Empty();
-              avatar.SetHeldContents(held ? hs.Fill() : 0u, h);
+              avatar.SetHeldContents(held ? hs.contents : alchemy::Composition{}, h);
               avatar.SetHeldFill(held ? ContainerHeldFillOf(*vd, hs) : ContainerHeldFill{}, h);
             }
             // WHERE THE BLADE IS, so taking control of it is not a teleport:
@@ -3202,7 +3207,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             const MobSystem::BodyRayHit hit =
                 mobs.PickBody(avatar.Id(), ps.ro, ps.rd, 4096.0f);
             if (hit.hit) {
-              const uint32_t mat = vp->fillMat;
+              const uint32_t mat = ContainerTopMat(*vp, &mats);
               // milli-eighths per tick at 30 Hz
               s.pourSpendMilli += (int64_t)std::llround(
                   PourBrushCellsPerSec(*vdef, ps.radius) * kContainerUnitsPerCell *
@@ -3210,8 +3215,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               const int units = (int)(s.pourSpendMilli / 1000);
               s.pourSpendMilli -= (int64_t)units * 1000;
               if (units > 0) {
-                vp->fillAmt = (uint16_t)(vp->fillAmt - std::min<int>(units, vp->fillAmt));
-                if (vp->fillAmt == 0) vp->fillMat = 0;
+                vp->contents.Take((uint16_t)mat, (uint32_t)units);
               }
               uint32_t marked = 0;
               // +3 a tick: a spot held under the brush for five ticks is

@@ -104,7 +104,11 @@ struct PlayerKitRefs {
 // and a per-slot damage array is appended in the dyes' shape, so two robes in
 // one pack keep two sets of holes. A v2..v6 kit loads its by-name damage onto
 // every stack of that name, which is what those files meant.
-constexpr uint32_t kPlayerKitSaveVersion = 7;
+// Version 8 (2026-09-26) appends MIXED vessel contents per slot
+// (game/composition.h): up to 16 (material, eighths) portions. The v6 word is
+// still written (the main portion) and a v8 reader replaces it; a v7 kit
+// loads each vessel as the one portion its word named.
+constexpr uint32_t kPlayerKitSaveVersion = 8;
 constexpr uint32_t kPlayerKitOldestLoadable = 3;
 
 // ITEMS ON THE GROUND ('ITMS'): what is lying around, by name and pose.
@@ -140,7 +144,9 @@ struct WorldItemRefs {
 // v4 (W2-M) appends each entry's worn DAMAGE after its lattice (every shell of
 // the piece; the body is only its largest panel). A v3 item loads as
 // authored-under-its-lattice, which is what it was.
-constexpr uint32_t kWorldItemSaveVersion = 4;
+// v5 (2026-09-26) appends each entry's MIXED contents after its damage and
+// a v5 reader replaces the v3 word with it; a v4 flask loads as one portion.
+constexpr uint32_t kWorldItemSaveVersion = 5;
 
 // The 'PLYR' serializer, exposed so the grimoire gate can write an OLDER
 // version's payload (everything up to that version's last block) and prove
