@@ -15578,7 +15578,8 @@ is the substrate either would read.
 ### One item instance, one kit (rule-unification W2-M, 2026-09-24)
 
 **One item is one `ItemInstance`** (`game/iteminstance.h`): `{name, count, dye,
-fillMat/fillAmt, damage}`. Every record that says "there is an item here"
+contents, damage}` (`contents` was `fillMat/fillAmt` until vessels held
+mixtures, 2026-09-26 -- see "Alchemy bench"). Every record that says "there is an item here"
 embeds it, and a crossing between two of them copies it whole: the slot
 (`ItemStack` IS `ItemInstance`, no library index), a creature's pack (its
 Kit's bag), a ground item (`WorldItem`), a piece of gear on the wire and in the
@@ -16080,10 +16081,10 @@ ONE ITEM KIND, `container`, and what it takes up is DATA: items.json's
 `container.holds` names material CLASSES (`liquid`, `powder`), so the flask and
 the pouch are two rows and a bucket would be a third. Amounts are EIGHTHS of a
 cell, the grid's own liquid unit, so a half-drained puddle cell is taken for
-exactly what it held. The contents ride the stack (`ItemStack::fillMat/
-fillAmt`), are part of the merge key (a flask of blood must not fold into a
-stack of empties), and persist through `PLYR` v6, `ITMS` v3, a drop and an R
-reload.
+exactly what it held. The contents ride the stack (`ItemStack::contents`, up
+to 16 portions since 2026-09-26), are part of the merge key (a flask of blood
+must not fold into a stack of empties), and persist through `PLYR` v6 (v8 for a
+mixture), `ITMS` v3 (v5), a drop and an R reload.
 
 **Hands up, a vessel selected in the hotbar, nothing drawn** (`FrameIntent::
 vesselSlot`): RMB scoops, LMB pours, the flask is held in the rig slot a sword
@@ -16377,17 +16378,83 @@ search through the pile that shifts every grain on the path. The first
 version carried grains rigidly, which made tilting sand ride along as a block
 and leak through the glass when packed.
 
-Shapes are an authored profile (half-widths at heights); `FlaskShape` is the
-only one today. A cauldron is a bigger profile and a larger
-`unitsPerParticle`, which keeps the particle count bounded.
+The sweep's search may pass through a few pixels of glass (a grain the wall
+landed on is IN the glass) but only a free pixel off it, on the grain's side,
+ends it; each grain remembers the vessel it was last clearly inside (`home`),
+because judged from inside the glass it can read as outside. A vessel also
+CARRIES its grains by its own rigid motion at each grain -- whole for a
+translation, only the upward part while it rotates -- so lifting a flask lifts
+its sand (left to the glass, liquid under a sand bed rode up with the bottom
+and blew through the bed) while tipped sand still slides out. A liquid particle
+trapped between rising glass and a bed it cannot pass shoves the grain along
+its pile instead: that is how pressure lifts a bed. A grain rises into
+heavier liquid ABOVE it (not only liquid in its own pixel, which a packed pile
+never has), so a sand bed under lava inverts. A move that would put glass
+through glass slides (rotation alone, translation alone, half of each) rather
+than freezing.
+
+Shapes are an authored profile (half-widths at heights): `FlaskShape` (glass)
+and `PouchShape` (a sack), each rescaled so its INSIDE AREA is capacity x
+`unitsPerEighth` pixels (`ShapeWithArea`) -- a full flask is drawn full. A
+cauldron is a bigger profile and a larger `unitsPerParticle`, which keeps the
+particle count bounded.
 
 Cost (gate `alchemy-cost`, advisory): a nearly full flask (450 particles, 720
-grains) is ~2 ms per frame at three substeps plus ~0.4 ms to render 224x288.
+grains) is ~2 ms per frame at three substeps plus ~0.4 ms to render. Lifting a
+full pouch's pile (2,455 grains) peaks at ~6 ms.
+
+**Mixtures in vessels.** `ItemInstance::contents` is a `Composition`, up to 16
+`(material, eighths)` portions. Scoop and deposit add a portion (a 17th is
+refused: "it already holds too many things"); a flask holds liquid AND powder
+now (a pouch's sand stirred into a potion). What comes OUT -- pour, apply, the
+brush -- is the TOP layer, the lowest-density portion (`ContainerTopMat`, the
+same order the bench settles by): oil over water pours oil. `ContainerSpend`
+(a salve) spends every portion in proportion. A break spills every portion
+(`ContainerSpill::rest`). The 3D view of a held or grounded flask shows ONE
+material, the main portion, at the whole fill's level -- the fill word
+(phys/fillview.h) has room for one id; the inventory icon draws the layers.
+Formats: `PLYR` v8 appends per-slot contents after v7 (the v6 word still
+carries the main portion for older readers); `ITMS` v5 appends each entry's
+contents after its damage; MOBS v9 and net protocol 2 write the Composition in
+`WriteItemInstance` (`mixed`). An older record's one-material word loads as
+one portion.
+
+**The panel** (`game/alchemy_bench.*`, `ui/inventory_ui.cpp` AlchemyPanel).
+Double-click a vessel slot on the character screen: the bench takes the
+spellbook's column (the character stays on the left), its picture drawn at the
+largest INTEGER scale that fits (pixel art). `stir` puts the stick in through
+the neck while the button is held; `pour` lists every other filled vessel you
+carry -- click one and it stands beside the target; drag it (held by its
+pouring lip corner) and tilt it with the wheel or Q / E. Glass stops glass, and
+the requested tilt may not lead the vessel by more than 0.35 rad. `done`, Esc,
+or the screen shutting ends the session: what is in flight lands (capped at
+360 substeps, in that frame), `ValidateBench` proves every material conserved
+and caps each vessel at its capacity (overflow goes to the spill, top layer
+first), every vessel on the bench must still be exactly what came on (a stack
+moved, emptied or swapped meanwhile voids the session: "nothing changed"), and
+only then are the contents written. What spilled goes into the world at your
+feet through the vessel-spill queue (`TickAuthorityCtx::vesselSpills`), so it
+is ordinary matter through the MutationQueue. The picture is drawn on the CPU
+and copied to a texture each frame (`rhi::CommandEncoder::CopyBufferToTexture`,
+Recorder::CopyBufferToImage: staging buffer written by the queue BEFORE the
+copy's encoder exists, submitted ahead of the UI so Finish() leaves it in the
+sampled layout; sync validation clean). Look-iterate with `--shot-bench`
+(`SANDVOX_BENCH_A` / `SANDVOX_BENCH_B` fill specs, `SANDVOX_BENCH_B_ITEM`,
+five `screenshot_bench*.bmp`).
+
+**Not yet:** reactions, powders dissolving, the cauldron, a held/grounded
+flask drawing its layers, refraction. Reactions must run on the vessel's
+`contents` in the game's tick, not on the bench's particles -- the bench is a
+UI device.
 
 Gates: `alchemy-layers` (lava, sand, acid, water and oil stirred through the
 mouth, then left: exactly conserved, nothing spilled, mean heights in density
 order), `alchemy-pour` (oil and sand poured from a tilting flask into water:
-conserved, most of it arrives, little spills).
+conserved, 80%+ of the oil arrives, under 5% of it splashes; the sand is
+reported -- in a round flask it wedges below its pile angle), `vessel` (the
+mixture checks: second portion, top layer pours first, 17th refused, a mixed
+break spills every portion, byte round-trip and the legacy word, a salve spends
+in proportion).
 
 
 ## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)

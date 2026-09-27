@@ -245,7 +245,9 @@ BenchResult AlchemyBench::Finish() {
   BenchResult r;
   if (!open_) return r;
   sim_.SetStick(false);
-  sim_.Settle(900);
+  // What is in flight lands first (a stream over the mouth is not a spill).
+  // Capped: this runs inside one frame, and a calm bench exits at once.
+  sim_.Settle(360);
   const Tally t = sim_.Count();
   for (size_t i = 0; i < entries_.size(); i++) {
     // A source taken off earlier already has its `after`.

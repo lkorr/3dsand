@@ -1022,7 +1022,7 @@ bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn) {
   bfsSeen_[start] = bfsStamp_;
   int found = -1;
   static const int kD[4][2] = {{0, 1}, {1, 0}, {-1, 0}, {0, -1}};
-  for (size_t h = 0; h < q.size() && q.size() < 2048 && found < 0; h++) {
+  for (size_t h = 0; h < q.size() && q.size() < 24576 && found < 0; h++) {
     int cur = q[h], cx = cur % W, cy = cur / W;
     for (auto& d : kD) {
       int x = cx + d[0], y = cy + d[1];
@@ -1158,7 +1158,7 @@ void FlaskSim::Settle(int maxSteps) {
   stickOn_ = false;
   for (int s = 0; s < maxSteps; s++) {
     Step(1);
-    if ((s & 15) == 15 && MovingCount(cfg_.gravity * 6) == 0) break;
+    if ((s & 7) == 7 && MovingCount(cfg_.gravity * 6) == 0) break;
   }
   stickOn_ = on;
 }

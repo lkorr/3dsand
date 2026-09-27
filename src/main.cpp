@@ -9074,9 +9074,14 @@ int main(int argc, char** argv) {
           ItemStack a = StackOf(items, fi);
           a.contents = ContainerParseFillSpec(ea ? ea : "water:0.3+oil:0.22+sand:0.08",
                                               fd->container.capacity, mats);
-          ItemStack b = StackOf(items, fi);
+          // The source may be another kind of vessel (SANDVOX_BENCH_B_ITEM,
+          // e.g. "pouch").
+          const char* ebi = std::getenv("SANDVOX_BENCH_B_ITEM");
+          const int bi = ebi ? items.Find(ebi) : fi;
+          const ItemDef* bd = bi >= 0 ? items.At(bi) : nullptr;
+          ItemStack b = StackOf(items, bd ? bi : fi);
           b.contents = ContainerParseFillSpec(eb ? eb : "lava:0.25+sand:0.1",
-                                              fd->container.capacity, mats);
+                                              (bd ? bd : fd)->container.capacity, mats);
           hotbar.slots[8] = a;
           benchA = 8;
           benchB = kit.bag.FirstFree();
