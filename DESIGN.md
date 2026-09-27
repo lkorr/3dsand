@@ -17040,8 +17040,12 @@ no glass under the floor, no glass or cork above the top), so nothing a held
 vessel holds can leave through the grid's top -- only through a mouth, and
 what falls is still what falls off the table. While the button is held the
 pointer keeps driving the hand anywhere on screen (ImGui's active item), the
-wheel tilts while dragging, and the tilt runs to `kMaxTilt` (3.3 rad, a little
-past upside down; it was 2.9). The character's carry-follow clamps on the ARM
+wheel tilts while dragging (Q / E at 2.1 rad/s), and the tilt has NO LIMIT: a
+vessel turns round and round either way (owner, 2026-09-27; it stopped at
+3.3 rad). The held angle is kept in [-pi, pi] by taking the same whole turn
+off it and off the glass's pose, previous pose and target together
+(`FlaskSim::UnwindAngle`), so nothing sees a jump and a vessel let go after
+three turns rights itself the short way. The character's carry-follow clamps on the ARM
 side only: the flask's 3D lift follows the bench up to 1.4 flask lengths and
 holds there, about the face, rather than straightening the arm overhead. Cost:
 the grid's per-pixel arrays grow with its height (800 x 800 at most, the
@@ -17092,9 +17096,13 @@ kept while the pair is the same pair. The bench is the portrait's MIRROR IMAGE
 a CCW tilt on screen turns the flask toward the body's right. Each held vessel
 plays `assets/anims/bench_hold.json` (forearm level before the belly; the left
 hand its derived mirror) and is turned to the bench's angle by
-`Mob::SetHeldAim` -- a turn of the hand about the GRIP, after every solver and
-the clamp, so the flask's long axis (its lattice +X) matches the bench whatever
-the clip's wrist does. The vessel being CARRIED on the bench has its arm
+`Mob::SetHeldAim` -- after every solver and the clamp, the hand is turned about
+the WRIST so the flask's WHOLE orientation is set: its long axis (lattice +X)
+along the bench's, its lattice +Y toward the body's back. It was a minimal
+turn of the long axis about the grip, which kept the fist's roll from the
+forearm; with the arm raised that roll swung with every small change of the
+solve and the flask (and, through the closed loop below, the arm) flipped
+tick to tick. The vessel being CARRIED on the bench has its arm
 FOLLOW IT (owner, 2026-09-27: "just raising a bottle up would only raise an
 arm"; the first version snapped the flask over the other's mouth the moment it
 was lifted, merging the hands, and contorted when tipped away). At pickup the
@@ -17104,12 +17112,18 @@ flask's bench height is its length in the hand), across at the scale that
 makes the gap between the two flasks on the bench the gap between the hands,
 and in depth toward the other flask as that gap closes -- so lifting only
 raises the arm and the hands meet only when the bottles do. The strike
-driver's arm claim (`SetWeaponPose`, legacy no-blade form) is taken for that
-hand and CLOSED ON THE FLASK: the command starts where the arm is and each
+driver's arm claim (`SetWeaponPose`, no blade, but `usePole` with the elbow
+DOWN and the hinge-axis cone off -- the rig's elbow-back pole is antiparallel
+to a hand held out in front at shoulder height, where the bend plane is noise)
+is taken for that hand and CLOSED ON THE FLASK: the command starts where the arm is and each
 tick moves by how far the flask's middle (halfway between its base and lip,
 `HeldMouthWorld` both ways along its axis) is from the goal. An open-loop hand
-target landed 2.5 voxels off, because the point the IK places (the wrist) and
-the grip the aim turns about are not the same point. The other hand stays in
+target landed 2.5 voxels off, because the point the IK places (the wrist) is
+not the flask's middle. The command is on a LEASH: never more than 0.6 voxel
+from where the hand actually is, so what a limit refuses it rests against
+instead of winding past (the three together took the raised-and-swept flask
+from 7.9-voxel tick-to-tick jumps to 0.3; `SANDVOX_BENCH_HIGH=1
+SANDVOX_BENCH_DEBUG=2 --shot-bench` is that repro). The other hand stays in
 `bench_hold`. `--shot-bench` also writes `screenshot_bench_lift.bmp` (lifted,
 not yet moved); `SANDVOX_BENCH_AWAY=1` tips it away from the other flask
 instead of carrying it over.

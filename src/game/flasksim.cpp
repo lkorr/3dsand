@@ -393,6 +393,13 @@ void FlaskSim::AdoptSettled(int vi, const FlaskSim& from) {
 
 void FlaskSim::SetVesselXform(int vi, const Xform& x) { vessels_[vi].target = x; }
 
+void FlaskSim::UnwindAngle(int vi, float turn) {
+  Vessel& v = vessels_[vi];
+  v.x.angle -= turn;
+  v.prevX.angle -= turn;
+  v.target.angle -= turn;
+}
+
 void FlaskSim::TeleportVessel(int vi, const Xform& x) {
   Vessel& v = vessels_[vi];
   v.x = v.prevX = v.target = x;

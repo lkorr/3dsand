@@ -2246,8 +2246,8 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     A.pressed = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
     if (hov || act) A.tiltReq += ImGui::GetIO().MouseWheel * 0.10f;
     const float dt = ImGui::GetIO().DeltaTime;
-    if (ImGui::IsKeyDown(ImGuiKey_Q)) A.tiltReq += 1.4f * dt;
-    if (ImGui::IsKeyDown(ImGuiKey_E)) A.tiltReq -= 1.4f * dt;
+    if (ImGui::IsKeyDown(ImGuiKey_Q)) A.tiltReq += 2.1f * dt;
+    if (ImGui::IsKeyDown(ImGuiKey_E)) A.tiltReq -= 2.1f * dt;
     bool any = false;
     for (const auto& r : A.rows) any |= r.onTable;
     if (!any) {

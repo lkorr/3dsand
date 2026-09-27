@@ -207,8 +207,6 @@ class AlchemyBench {
   // `alchemy-lift` pours at exactly this height, so a shape that outgrows it
   // fails there, not in the hand.
   static constexpr int kLiftH = 400;
-  // How far the hand turns a vessel either way: a little past upside down.
-  static constexpr float kMaxTilt = 3.3f;
   // Vessels on the table at once: the character's two hands.
   static constexpr int kMaxOnTable = 2;
 

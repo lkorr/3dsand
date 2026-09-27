@@ -99,6 +99,30 @@ Quat QuatFromTo(Vec3 from, Vec3 to) {
   return QuatNormalize({c.x, c.y, c.z, 1.0f + d});
 }
 
+Quat QuatFromBasis(Vec3 bx, Vec3 by, Vec3 bz) {
+  // The rotation whose matrix has columns bx, by, bz (Shepperd: branch on the
+  // largest of w, x, y, z so the square root is never of a small number).
+  const float m00 = bx.x, m10 = bx.y, m20 = bx.z;
+  const float m01 = by.x, m11 = by.y, m21 = by.z;
+  const float m02 = bz.x, m12 = bz.y, m22 = bz.z;
+  const float tr = m00 + m11 + m22;
+  Quat q;
+  if (tr > 0.0f) {
+    const float s = std::sqrt(tr + 1.0f) * 2.0f;
+    q = {(m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25f * s};
+  } else if (m00 > m11 && m00 > m22) {
+    const float s = std::sqrt(1.0f + m00 - m11 - m22) * 2.0f;
+    q = {0.25f * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s};
+  } else if (m11 > m22) {
+    const float s = std::sqrt(1.0f + m11 - m00 - m22) * 2.0f;
+    q = {(m01 + m10) / s, 0.25f * s, (m12 + m21) / s, (m02 - m20) / s};
+  } else {
+    const float s = std::sqrt(1.0f + m22 - m00 - m11) * 2.0f;
+    q = {(m02 + m20) / s, (m12 + m21) / s, 0.25f * s, (m10 - m01) / s};
+  }
+  return QuatNormalize(q);
+}
+
 // ---- easing -----------------------------------------------------------------
 
 Ease ParseEase(const std::string& s) {

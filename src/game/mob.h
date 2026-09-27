@@ -2461,9 +2461,10 @@ class Mob {
   // The session sets the player's; MobSystem::RefreshHeldFills every NPC's.
   void SetHeldFill(const ContainerHeldFill& f, Hand h) { held_[HandIndex(h)].fill = f; }
   // HOW A HELD VESSEL IS TILTED (the alchemy bench, session.cpp BenchHold):
-  // the hand is turned about the grip, after every solver and the clamp, so
+  // the hand is turned about the wrist, after every solver and the clamp, so
   // the held item's own long axis (its lattice +X: base -> mouth, the way
-  // every held item is authored) lies along `axisModel` -- MODEL space,
+  // every held item is authored) lies along `axisModel`, its lattice +Y toward
+  // the body's back (the whole orientation is set: Mob::ApplyHeldAim) -- MODEL space,
   // +Y up, +Z the way the body faces, +X the body's LEFT. `weight` 0..1 fades
   // it in and out; 0 = off. Presentation only, never saved.
   void SetHeldAim(Hand h, float weight, Vec3 axisModel) {

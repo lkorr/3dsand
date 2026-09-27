@@ -386,6 +386,9 @@ const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
 // SANDVOX_BENCH_INVERT=1: B is lifted high, carried over A and turned fully
 // UPSIDE DOWN with its mouth over A's, into the headroom above the table's
 // box (pictures _invlift, _invturn, _inverted, _invpoured).
+// SANDVOX_BENCH_HIGH=1: B is lifted as high as the bench allows and swept
+// side to side, untilted (the raised-arm repro); with SANDVOX_BENCH_DEBUG=2
+// the carried arm prints every tick (session.cpp PoseBenchHands).
 bool g_shotBench = false;
 constexpr uint64_t kShotBenchLast = 425;
 float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
@@ -9247,7 +9250,15 @@ int main(int argc, char** argv) {
         const alchemy::V2 over{mouth.x - (r.x * c - r.y * sn), mouth.y + 14.0f - (r.x * sn + r.y * c)};
         const alchemy::V2 lifted{start.x, std::max(start.y, mouth.y + hb * 0.7f)};
         alchemy::V2 at = lifted;
-        if (fl < 290) {
+        // SANDVOX_BENCH_HIGH=1: lift it as high as the bench lets it go and
+        // sweep it side to side up there, no tilt (the raised-arm repro).
+        static const bool high = std::getenv("SANDVOX_BENCH_HIGH") != nullptr;
+        if (high) {
+          want = 0.0f;
+          const float t = ease((fl - 260) / 30);
+          const float sweep = fl < 290 ? 0.0f : std::sin((fl - 290) * 0.05f) * wb * 1.5f;
+          at = {start.x + sweep, start.y + (2000.0f - start.y) * t};
+        } else if (fl < 290) {
           const float t = ease((fl - 260) / 30);
           at = {start.x + (lifted.x - start.x) * t, start.y + (lifted.y - start.y) * t};
         } else if (!away) {

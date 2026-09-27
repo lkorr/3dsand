@@ -665,9 +665,17 @@ void AlchemyBench::Tick(const BenchInput& in, bool pressed, float tilt, BenchToo
   }
   if (held_ >= 0) {
     Slot& s = slots_[held_];
-    // A little past upside down either way: a flask held over another's
-    // mouth can be emptied into it.
-    heldAngle_ = std::clamp(heldAngle_ + tilt, -kMaxTilt, kMaxTilt);
+    // Turns without limit, round and round either way. The angle is kept in
+    // [-pi, pi] by moving it AND the glass by the same whole turn
+    // (FlaskSim::UnwindAngle), so nothing sees a jump, and a vessel let go
+    // after three turns goes back upright the short way, not three turns back.
+    heldAngle_ += tilt;
+    constexpr float kTurn = 6.28318531f;
+    if (std::fabs(heldAngle_) > kTurn * 0.5f && s.sim >= 0) {
+      const float k = std::round(heldAngle_ / kTurn) * kTurn;
+      heldAngle_ -= k;
+      sim_.UnwindAngle(s.sim, k);
+    }
     // Clamped to the GRID, which runs above the visible table (kLiftH): the
     // pointer may leave the box while the button is held (`over` stays up
     // for a drag) and the vessel follows until its glass meets the top.

@@ -27756,7 +27756,7 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   const Vec3 targetLocal = shoulder + toRig(weapon_.hand);
 
   IkChain steer = *chain;
-  if (weapon_.steerBlade && weapon_.bendPole.len() > 1e-4f) {
+  if ((weapon_.steerBlade || weapon_.usePole) && weapon_.bendPole.len() > 1e-4f) {
     const Vec3 p = toRig(weapon_.bendPole);
     if (p.len() > 1e-4f) steer.pole = p;
   }
@@ -27765,7 +27765,20 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   if (chain->effector >= 0 && (size_t)chain->effector < st.model.size())
     weaponDiag_.ikMiss = (st.model[chain->effector].pos - targetLocal).len();
 
-  if (!weapon_.steerBlade) return;
+  // The clamp diagnostics for the plain arm too (the bench's carried flask):
+  // without the pre-clamp snapshot RecordWeaponClamp reports a refused reach
+  // as `elbowClamp 0`.
+  auto snapshotPlain = [&] {
+    if ((size_t)i0 >= st.model.size() || (size_t)i1 >= st.model.size()) return;
+    weaponHandPreClamp_ = st.model[handPart].rot;
+    weaponHandPosPreClamp_ = st.model[handPart].pos;
+    weaponUpPreClamp_ = st.model[i0].rot;
+    weaponLoPreClamp_ = st.model[i1].rot;
+    weaponHandPart_ = handPart;
+    weaponUpPart_ = i0;
+    weaponLoPart_ = i1;
+  };
+  if (!weapon_.steerBlade && !weapon_.usePole) { snapshotPlain(); return; }
   if ((size_t)i0 >= st.model.size() || (size_t)i1 >= st.model.size()) return;
 
   // ---- 2. the elbow's hinge plane follows the bend --------------------------
@@ -27907,6 +27920,13 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
       }
     }
   }
+
+  // A POLE WITHOUT A BLADE (WeaponPose::usePole) stops here: its elbow plane
+  // is the pole's, so the hinge clamp needs the override above exactly as a
+  // stroke's does — without it the clamp threw away the off-plane bend and
+  // held the bench's raised flask a hand short — but there is no blade for
+  // the wrist to carry.
+  if (!weapon_.steerBlade) { snapshotPlain(); return; }
 
   // ---- 3. the hand carries the blade ---------------------------------------
   //

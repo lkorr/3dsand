@@ -36,6 +36,8 @@ Quat QuatNlerp(const Quat& a, const Quat& b, float t);
 Quat QuatSlerp(const Quat& a, const Quat& b, float t);
 // Minimal rotation taking `from` to `to` (both need not be normalized).
 Quat QuatFromTo(Vec3 from, Vec3 to);
+// The rotation taking +X, +Y, +Z to the orthonormal right-handed bx, by, bz.
+Quat QuatFromBasis(Vec3 bx, Vec3 by, Vec3 bz);
 // Euler DEGREES -> quat, applied X then Y then Z. The order is stated here
 // once and shared by everything that authors a rotation as three numbers in
 // JSON (rig sockets, item grips), because "which order were those Euler

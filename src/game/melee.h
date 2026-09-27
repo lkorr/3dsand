@@ -939,6 +939,13 @@ struct WeaponPose {
   // hand is ORIENTED so the blade points along bladeDir with its flat facing
   // bladeFlat, and the elbow's bend plane follows bendPole.
   bool steerBlade = false;
+  // Honour `bendPole` WITHOUT steering the blade (the alchemy bench's carried
+  // flask). The rig's own arm pole is straight back, which is exactly
+  // antiparallel to a hand held straight out in front at shoulder height —
+  // the two-bone solve's bend plane is noise there and the elbow flips from
+  // tick to tick. A caller whose hand goes there hands in a pole that is
+  // well-conditioned over its whole range instead.
+  bool usePole = false;
   // The live style's per-joint brakes (ArmSmooth above). MeleeState::Pose()
   // never fills it — the driver has no style — so the stroke callers
   // (MobSystem::StepStroke, the player's discrete strike) copy it in.

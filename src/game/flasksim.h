@@ -316,6 +316,11 @@ class FlaskSim {
   // Moves a vessel's glass (and pose target) straight to `x` with no motion
   // profile: for placing, not carrying.
   void TeleportVessel(int v, const Xform& x);
+  // Takes `turn` (a whole number of turns, radians) off the vessel's angle,
+  // its previous angle and its target alike: the same pose, the same motion,
+  // just counted from a nearer zero, so a vessel turned round and round never
+  // has to unwind the turns to stand upright again.
+  void UnwindAngle(int v, float turn);
   // Would vessel `v` at `x` keep its glass clear of every other vessel's?
   // Step() refuses moves that fail this; the panel asks it to steer.
   bool PoseClear(int v, const Xform& x) const;

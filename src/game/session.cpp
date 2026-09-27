@@ -460,7 +460,7 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
   // it moves on the bench: up on the bench is up in the hand, toward the
   // other flask on the bench is toward the other hand -- so lifting a bottle
   // only raises that arm, and the hands meet only when the bottles do. Its
-  // tilt is SetHeldAim's (above), about the grip, so turning it never moves
+  // tilt is SetHeldAim's (above), about the wrist, so turning it never moves
   // the arm.
   const bool carry = pourHand >= 0;
   if (carry) s.benchPourHand = pourHand;
@@ -478,7 +478,7 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
   float reach = 0;
   if (!avatar.WeaponArmPose(handFromShoulder, reach)) return;
   // THE COMMAND IS CLOSED ON THE FLASK ITSELF. The point the arm's IK places
-  // (the wrist) is not the flask (SetHeldAim turns the hand about the grip),
+  // (the wrist) is not the flask (it hangs off the wrist at the bench's angle),
   // so no open-loop hand target lands. The command -- an offset from the
   // shoulder, in the frame WeaponArmPose reads -- starts where the arm is and
   // is nudged each tick by how far the flask's middle is from its goal.
@@ -547,6 +547,21 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
       goal = goal + fwd * ((bc.o3 - bc.c0).dot(fwd) * t);
     }
     s.benchPourCmd = s.benchPourCmd + (goal - c3) * 0.35f;
+    // ON A LEASH TO THE HAND (anti-windup). Whatever the arm cannot serve --
+    // a pose limit, the reach -- the command used to keep integrating past,
+    // and the clamps' answers out there jump with small changes of the ask;
+    // that was half of the arm "tweaking out" with a flask held high (the
+    // other half was the pole and the fist's roll: below, Mob::ApplyHeldAim).
+    // Held within a step of where the hand actually is, the command rests on
+    // a limit instead of winding past it. Only once the claim is whole: while
+    // it eases in, the hand is still partly the hold clip's and the gap is
+    // not a refusal. `SANDVOX_BENCH_HIGH=1 SANDVOX_BENCH_DEBUG=2 --shot-bench`
+    // is the repro: a flask lifted to the top and swept, every tick printed.
+    if (s.benchPourW > 0.95f) {
+      const Vec3 lead = s.benchPourCmd - handFromShoulder;
+      const float ll = lead.len(), kLeash = 0.6f;
+      if (ll > kLeash) s.benchPourCmd = handFromShoulder + lead * (kLeash / ll);
+    }
   }
   const float l = s.benchPourCmd.len();
   if (reach > 0 && l > reach * 0.98f) s.benchPourCmd = s.benchPourCmd * (reach * 0.98f / l);
@@ -554,13 +569,29 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
   wp.hand = s.benchPourCmd;
   wp.weight = s.benchPourW;
   wp.steerBlade = false;
+  // ELBOW DOWN, not the rig's elbow-back. Lifting the flask puts the hand
+  // straight out in front at shoulder height, where a back pole is
+  // antiparallel to the reach and the elbow flipped every tick (the arm
+  // "tweaking out" high up); down is well-conditioned everywhere the bench
+  // can take the hand, and for a low reach it names the same bend plane.
+  wp.usePole = true;
+  wp.bendPole = Vec3{0, -1, 0};
+  // The elbow's hinge follows that plane (the axis cone off, as the melee
+  // tuning ships it): penned near the authored axis, the clamp refuses the
+  // bend the down pole asks for.
+  wp.elbowAxisCone = 3.14159265f;
   avatar.SetWeaponPose(wp);
   if (std::getenv("SANDVOX_BENCH_DEBUG")) {
     static int n = 0;
-    if ((n++ % 15) == 0)
-      std::printf("benchcarry: w %.2f flask (%.1f %.1f %.1f) goal (%.1f %.1f %.1f) cmd (%.1f %.1f %.1f) sx %.4f sy %.4f other %d reach %.1f\n",
+    static const bool every = std::getenv("SANDVOX_BENCH_DEBUG")[0] == '2';
+    const Mob::WeaponArmDiag& dg = avatar.WeaponArmDiagnostics();
+    if (every || (n++ % 15) == 0)
+      std::printf("benchcarry: w %.2f flask (%.1f %.1f %.1f) goal (%.1f %.1f %.1f) cmd (%.1f %.1f %.1f) sx %.4f sy %.4f other %d reach %.1f"
+                  " | hand (%.2f %.2f %.2f) ikMiss %.2f shClamp %.2f elClamp %.2f clShift %.2f\n",
                   s.benchPourW, c3.x, c3.y, c3.z, goal.x, goal.y, goal.z, s.benchPourCmd.x,
-                  s.benchPourCmd.y, s.benchPourCmd.z, bc.sx, bc.sy, (int)bc.other, reach);
+                  s.benchPourCmd.y, s.benchPourCmd.z, bc.sx, bc.sy, (int)bc.other, reach,
+                  handFromShoulder.x, handFromShoulder.y, handFromShoulder.z, dg.ikMiss,
+                  dg.shoulderClamp, dg.elbowClamp, dg.clampShift);
   }
 }
 

@@ -795,15 +795,27 @@ void Mob::ApplyHeldAim(const AnimSkeleton& sk, AnimState& st) const {
     if (hand < 0 || (size_t)hand >= n) continue;
     const float al = hh.aimAxis.len();
     if (al < 1e-4f) continue;
-    // model.rot takes the item's lattice into model space (LimbTargetFor), so
-    // its long axis now is model.rot * +X.
-    const Vec3 now = QuatRotate(st.model[hh.slot].rot, Vec3{1, 0, 0});
-    const Quat full = QuatFromTo(now, hh.aimAxis * (1.0f / al));
+    // THE WHOLE ORIENTATION, NOT JUST THE LONG AXIS. model.rot takes the
+    // item's lattice into model space (LimbTargetFor), so its long axis is
+    // model.rot * +X. This used to be QuatFromTo(that axis now, aim): the
+    // minimal turn, which keeps whatever ROLL the forearm happened to give
+    // the fist. With the arm raised that roll swings with every small change
+    // of the solve, and the hand, the flask and (through the bench's closed
+    // loop on the flask) the arm with it flipped from tick to tick. So the
+    // item's frame is set outright: lattice +X along the aim and lattice +Y
+    // toward the body's back (-Z, where the hold clip already has it for both
+    // hands), taken off the aim — a function of the aim alone.
+    const Vec3 ax = hh.aimAxis * (1.0f / al);
+    Vec3 by = Vec3{0, 0, -1} - ax * (-ax.z);
+    if (by.len() < 0.2f) by = Vec3{0, -1, 0} - ax * (-ax.y);   // aim along Z
+    by = by.normalized();
+    const Quat want = QuatFromBasis(ax, by, ax.cross(by));
+    const Quat full = QuatMul(want, QuatConj(st.model[hh.slot].rot));
     const Quat q = QuatNormalize(QuatSlerp(Quat{}, full, w));
-    // The hand and everything on it, turned about the GRIP (the held part's
-    // joint): the vessel turns in the fist rather than swinging round the
-    // wrist, and the point the arm's IK placed stays where it was put.
-    const Vec3 pivot = st.model[hh.slot].pos;
+    // The hand and everything on it, turned about the WRIST — the point the
+    // arm's IK placed — so the hand stays on the forearm and where the flask
+    // ends up is a smooth function of the arm's command.
+    const Vec3 pivot = st.model[hand].pos;
     static thread_local std::vector<uint8_t> moved;
     moved.assign(n, 0);
     for (size_t i = (size_t)hand; i < n; i++) {
