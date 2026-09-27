@@ -242,11 +242,19 @@ int ContainerDeposit(const ItemDef& def, ItemStack& st, uint16_t mat, int units)
 // this tick (ContainerParticleRoom); the pour is charged only for particles
 // that fit under it (rule 2, charged BEFORE emission). A stack of more than
 // one vessel does not pour (returns 0): isolate one first.
+//
+// A SOLUTION POURS AS ONE (contract 2.5, package G): what is dissolved in the
+// liquid that left (ContainerTakeDissolvedShare) goes with it -- into `sol`,
+// as solute pours landing where the stream lands, on the tick it lands
+// (ContainerSolutePour). Without `sol`, or with the solute layer off, it
+// falls back to its powder in grains.
+struct ContainerSolutePour;
 int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                   const Vec3* target, int partGravity, uint32_t tick,
                   uint32_t seed, std::vector<ParticleSpawn>& spawns,
                   SplatterEvent* splat, uint32_t partRoom = 0xFFFFFFFFu,
-                  const std::vector<MaterialDef>* mats = nullptr);
+                  const std::vector<MaterialDef>* mats = nullptr,
+                  std::vector<ContainerSolutePour>* sol = nullptr);
 
 // PFLAG_MEASURED in sim_particle.wgsl, its only reader (check_invariants.py
 // keeps the two equal): a whole-voxel liquid particle with this bit lands at
@@ -282,12 +290,37 @@ uint32_t ContainerParticleRoom(bool snapValid, uint32_t snapParticleCount,
 // The particles carry the flask's material and nothing else, so a poured
 // stream and the pond it lands in are the same colour because they are the
 // same material. Returns eighths poured; `splat` as ContainerPour.
+//
+// ITS DISSOLVED SHARE LEAVES WITH IT (contract 2.5 item 2, package G): into
+// `sol`, landing where the stream is aimed on the tick it arrives, exactly as
+// ContainerPour's does. It does NOT ride the fluid particles, and cannot
+// without an MPM change this seam does not own -- precisely:
+//   * FluidParticle's reserved words (_r0.., common.wgsl) could carry a
+//     {species, mass} payload for free, and P2G/G2P would keep it, but the
+//     particle leaves the solver through sim_fluid_seam's SETTLE, which merges
+//     up to eight particles into one grid cell. Their masses would have to be
+//     summed into the cell's solute value with the species cap applied, and
+//     "which particle's mass is refused at the cap" is decided by atomic
+//     order there -- a scheduling-dependent outcome (rule 1) unless the settle
+//     grows a second deterministic reduction pass;
+//   * the settle writes cells the solute allocator never saw asked for (a
+//     page for them is decided before the CA from the dirty set; the settle's
+//     targets are GPU-chosen), so every solute store it made could fault;
+//   * a particle killed by the cap, the window edge or a consume path would
+//     delete its mass silently -- the seam already REFUSES to excite a cell
+//     carrying solute (SOLM_SEAM_REFUSED) for exactly this reason.
+// So the fluid carries the water and the solute pour carries the salt, both
+// aimed at the same place: the same end state (brine where the stream lands)
+// by a route that is deterministic and conserving. Without `sol` (or with the
+// layer off) the old fallback stands: the share goes back into the vessel as
+// its powder and pours as grains after the liquid.
 bool ContainerPoursAsFluid(const MaterialDef& m);
 int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                        const Vec3* target, uint32_t tick, uint32_t seed,
                        uint32_t room, std::vector<FluidSpawnOp>& out,
                        SplatterEvent* splat,
-                       const std::vector<MaterialDef>* mats = nullptr);
+                       const std::vector<MaterialDef>* mats = nullptr,
+                       std::vector<ContainerSolutePour>* sol = nullptr);
 
 // A fill written as text, for the capture tools (--shot-mob): "water:0.5"
 // or a mixture "water:0.4+oil:0.2", each fraction of `capacity`; a bare name
@@ -399,23 +432,71 @@ struct ContainerSpill {
 // a voxel, the last partial voxel rounded by a hash (the one rounding, like
 // a pour's last partial cell); without a `gas` vector a gas portion waits.
 // A DISSOLVED portion goes through ContainerDissolvedToWorld.
+// With `sol`, a dissolved portion goes into it as solute pours landing under
+// the spill (ContainerDissolvedToWorld); without, as its powder.
 int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
                        uint32_t tick, uint32_t fluidRoom,
                        std::vector<FluidSpawnOp>& fluid,
                        std::vector<ParticleSpawn>& parts, SplatterEvent* splat,
                        uint32_t partRoom = 0xFFFFFFFFu,
-                       std::vector<GasSpawnOp>* gas = nullptr, uint32_t gasRoom = 0);
+                       std::vector<GasSpawnOp>* gas = nullptr, uint32_t gasRoom = 0,
+                       std::vector<ContainerSolutePour>* sol = nullptr);
+
+// THE SOLUTE POUR (contract 2.5, package G): dissolved matter leaving a vessel
+// enters the world IN SOLUTION. A pour is queued with the tick its stream
+// lands and the cell it lands on; ContainerSolutePoursDue sends it then as a
+// CellOpSolute op (world.h) through the MutationQueue, and sim_mutate.wgsl
+// solPour finds the surface under the cell and lays the mass into the liquid
+// there -- or, where there is no solvent (dry ground, oil, a saturated
+// puddle), precipitates it as its powder, which dissolves again when water
+// covers it. Both counted on the GPU (kSolMPoured / kSolMPourPowder), so a
+// gate balances the ledger rather than trusting it.
+//
+// Units are the WORLD'S (contract 2.4): one dissolved eighth is
+// SoluteDef::yieldPerVoxel / 8 units, always whole eighths on an op.
+struct ContainerSolutePour {
+  uint32_t tick = 0;     // the tick its op goes out (when the stream lands)
+  IVec3 cell{};          // where it lands; the GPU finds the surface under it
+  uint16_t species = 0;  // 1-based (solutes.json)
+  uint32_t units = 0;    // world solute units, whole eighths
+};
+// Ops a tick sends at most (sim_mutate.wgsl SOL_POUR_MAX_OPS is the GPU's own
+// bound, above this); the rest wait a tick. Eighths one op carries at most, so
+// that the powder a pour with no solvent leaves fits in the air cells solPour
+// searches (SOL_POUR_CLIMB + 4 cells of eight eighths).
+constexpr uint32_t kMaxSolutePoursPerTick = 64;
+constexpr uint32_t kSolutePourMaxEighths = 48;
+// A spill's (a break, a bench stream, an unpaid scoop) dissolved share lands
+// this many ticks after it leaves: about the fall of a burst from hand height.
+constexpr uint32_t kSolutePourSpillTicks = 8;
+// Queue `eighths` of dissolved `mat` (kDissolvedBit set) to land at `cell` on
+// `landTick`. Returns the eighths queued: all of them, or 0 when the solute
+// layer is off (sim.soluteMode 0) or the powder has no species -- the caller
+// then takes the powder fallback.
+int ContainerDissolvedToSolution(uint16_t mat, int eighths, IVec3 cell, uint32_t landTick,
+                                 std::vector<ContainerSolutePour>& out);
+// Send every pour due by `tick` (in queue order, up to kMaxSolutePoursPerTick
+// ops, merged by cell and species) as CellOpSolute ops into `cells`. A pour
+// whose cell has left the residency window is dropped and counted
+// (ContainerSolutePoursDropped) -- it would have to be seven hundred metres
+// from the vessel that poured it. Returns the ops sent.
+int ContainerSolutePoursDue(std::vector<ContainerSolutePour>& pending, uint32_t tick,
+                            const World& world, std::vector<CellOp>& cells);
+uint64_t ContainerSolutePoursDropped();
 
 // THE VESSEL HALF OF THE SOLUTE SEAM (contract 2.5): `eighths` of DISSOLVED
 // `mat` (kDissolvedBit set) leaving a vessel at `at` moving `vel` (cells per
-// tick). Package B (the world solute layer) replaces this body with liquid
-// cells carrying solute mass; until then the dissolved matter comes out as
-// ITS POWDER, one-eighth grains (world.h POWDER ENTERS THE WORLD AS GRAINS)
-// -- conserved, just not in solution. Returns the eighths emitted (all of
-// them unless the spawn budget ran out; the caller keeps the rest).
+// tick). With `sol` (and the layer on) it is queued as a solute pour landing
+// at `land` on `landTick` (ContainerDissolvedToSolution). Otherwise -- the
+// FALLBACK -- it comes out as ITS POWDER, one-eighth grains (world.h POWDER
+// ENTERS THE WORLD AS GRAINS): conserved, just not in solution. Returns the
+// eighths emitted (all of them unless the spawn budget ran out; the caller
+// keeps the rest).
 int ContainerDissolvedToWorld(uint16_t mat, int eighths, Vec3 at, Vec3 vel, uint32_t seed,
                               uint32_t tick, const std::vector<MaterialDef>& mats,
-                              std::vector<ParticleSpawn>& parts, uint32_t partRoom);
+                              std::vector<ParticleSpawn>& parts, uint32_t partRoom,
+                              std::vector<ContainerSolutePour>* sol = nullptr,
+                              IVec3 land = {}, uint32_t landTick = 0);
 
 // What leaves WITH `eighths` of a liquid: every dissolved portion's share of
 // the liquid in the vessel, taken out of `c` (all of it with the last of the

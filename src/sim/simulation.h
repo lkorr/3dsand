@@ -725,7 +725,7 @@ class Simulation {
   rhi::Buffer solSpecBuf_;
   std::vector<SoluteDef> solutes_;
   // The solute layer's pipelines (sim_solute.wgsl).
-  rhi::ComputePipeline solWant_, solArgs_, solAlloc_, solDiffuse_, solCompact_, solScoop_, solHash_,
+  rhi::ComputePipeline solWant_, solArgs_, solAlloc_, solDiffuse_, solCompact_, solScoop_, solPour_, solHash_,
       solEvict_, solRestore_;
   uint32_t genColCount_ = 0;
   std::vector<uint32_t> genColScratch_;

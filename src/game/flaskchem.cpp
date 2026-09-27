@@ -810,6 +810,18 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
   };
   for (const ChemRule& r : rules) {
     if (!ChemGateOpen(r.cond, chem_.daylight)) continue;
+    // THE CONCENTRATION CONDITION (benchchem.h ChemRule::soluteSpecies), the
+    // world's solRuleAllows on a particle: only a LIQUID self (a particle)
+    // carrying that species, at a concentration inside the rule's range.
+    // Brine under the Electrify button splits; fresh water does not.
+    if (r.soluteSpecies != 0) {
+      if (selfType != NbParticle || r.soluteSpecies == kChemSoluteNever) continue;
+      if (psol_[selfIdx] != r.soluteSpecies) continue;
+      const ChemSolute* sp = chem_.Species(r.soluteSpecies);
+      if (!sp) continue;
+      const uint32_t c = ChemConcentration(pmass_[selfIdx], (uint32_t)pw_[selfIdx], sp->yieldPerVoxel);
+      if (c < r.soluteMin || c > r.soluteMax) continue;
+    }
     // A GAS FADING TO NOTHING is the world's way of saying it dispersed into
     // the open air (smoke, steam, noxious fumes all "decay to air"). Inside a
     // STOPPERED vessel there is nowhere for it to go: that rule does not

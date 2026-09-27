@@ -1015,6 +1015,30 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
         opstream::CanonicalizeCells(cellsIn, cellsCanon, &dupeCell);
     if (dropped) opstream::NoteCellDupes(tick, dropped, dupeCell);
   }
+  // SOLUTE POURS TO THE TAIL (world.h CellOpSolute). sim_mutate's solPour is
+  // ONE invocation that walks the stream backwards from its end while the ops
+  // are pours, so they must be contiguous there. A stable partition: voxel ops
+  // keep their push order among themselves (the dedupe above already ran, and
+  // the `cells` dispatch has no order), pours keep theirs (solPour applies them
+  // in it). A tick with no pour -- nearly every tick -- is untouched.
+  {
+    const std::vector<CellOp>& src = cellsCanon.empty() ? cellsIn : cellsCanon;
+    bool seenPour = false, needMove = false;
+    for (const CellOp& op : src) {
+      const bool pour = IsSoluteCellOp(op.word);
+      if (!pour && seenPour) { needMove = true; break; }
+      seenPour |= pour;
+    }
+    if (needMove) {
+      std::vector<CellOp> part;
+      part.reserve(src.size());
+      for (const CellOp& op : src)
+        if (!IsSoluteCellOp(op.word)) part.push_back(op);
+      for (const CellOp& op : src)
+        if (IsSoluteCellOp(op.word)) part.push_back(op);
+      cellsCanon.swap(part);
+    }
+  }
   const std::vector<BrushOp>& ops = brushTrunc ? opsClamp : opsIn;
   const std::vector<ExplosionOp>& exps = expTrunc ? expsClamp : expsIn;
   const std::vector<CellOp>& cells = cellsCanon.empty() ? cellsIn : cellsCanon;
@@ -1839,8 +1863,21 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     pt.AddOpSphere({o.x, o.y, o.z}, o.radius, world);
   for (const ExplosionOp& e : exps)
     pt.AddOpBox({e.x, e.y, e.z}, kMaxExplosionRadius, world);  // EXP_BOX
-  for (uint32_t i = 0; i < cellCount; i++)
+  for (uint32_t i = 0; i < cellCount; i++) {
     pt.AddOpTarget(cells[i].cellIdx / kChunkVol);  // already a slot chunk index
+    // A SOLUTE POUR (world.h CellOpSolute) may precipitate its powder up to
+    // 16 cells BELOW its cell or a few above it (sim_mutate.wgsl solPour
+    // walks to the surface), so the chunks over and under it are written too.
+    if (IsSoluteCellOp(cells[i].word)) {
+      const uint32_t slot = cells[i].cellIdx / kChunkVol;
+      if (slot < kNumSlots) {
+        const IVec3 wc = world.SlotToWorldChunk(slot);
+        for (int dy : {-1, 1})
+          if (world.ChunkInWindow({wc.x, wc.y + dy, wc.z}))
+            pt.AddOpTarget(World::SlotChunkIndex({wc.x, wc.y + dy, wc.z}));
+      }
+    }
+  }
   // THE WHOLE POINT OF THE FOOTPRINT WAKE (docs/RESEARCH_wind.md §10). The
   // chunks a wind primitive is about to dirty-mark are declared as OP TARGETS,
   // in the same breath and from the same list, so they are materialized with

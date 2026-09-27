@@ -12,6 +12,7 @@
 #include "phys/physics.h"
 #include "sim/reactcpu.h"
 #include "sim/rng.h"
+#include "sim/solutes.h"
 #include "sim/tuning.h"
 
 bool ContainerSnapWord(const World& world, IVec3 c, uint32_t& word) {
@@ -343,7 +344,8 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                   const Vec3* target, int partGravity, uint32_t tick,
                   uint32_t seed, std::vector<ParticleSpawn>& spawns,
                   SplatterEvent* splat, uint32_t partRoom,
-                  const std::vector<MaterialDef>* mats) {
+                  const std::vector<MaterialDef>* mats,
+                  std::vector<ContainerSolutePour>* sol) {
   // A stoppered vessel pours nothing (ContainerTopMat is 0 for it too).
   if (!def.IsContainer() || !st.Filled() || st.count != 1 || st.stoppered) return 0;
   const float speed = std::max(1.0f, def.container.pourSpeed);   // vox/s
@@ -415,12 +417,21 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     if (liquid) liquidOut += (uint32_t)spend;
     poured++;
   }
-  // What was dissolved in the liquid that left goes with it (contract 2.5).
+  // What was dissolved in the liquid that left goes with it (contract 2.5):
+  // in solution, landing where the stream lands, when it lands -- the arc
+  // above is solved to reach the target in `n` ticks (a tipped pour's
+  // landing is the same arc's point after `n`, a guess the GPU's surface
+  // search forgives).
   if (liquidOut && mats) {
     const alchemy::Composition d = ContainerTakeDissolvedShare(st.contents, liquidOut, liquidBefore);
+    Vec3 land = mouth + v0 * (float)n;
+    land.y -= gTick * (float)n * (float)(n + 1) * 0.5f;
+    if (target && ContainerInReach(def, mouth, *target)) land = *target;
+    const IVec3 lc{(int)std::floor(land.x), (int)std::floor(land.y), (int)std::floor(land.z)};
     for (int i = 0; i < d.n; i++) {
       const int out = ContainerDissolvedToWorld(d.p[i].mat, (int)d.p[i].eighths, mouth, v0,
-                                                seed ^ 0xD155u, tick, *mats, spawns, 0xFFFFFFFFu);
+                                                seed ^ 0xD155u, tick, *mats, spawns, 0xFFFFFFFFu,
+                                                sol, lc, tick + (uint32_t)n);
       if (out < (int)d.p[i].eighths) st.contents.Add(d.p[i].mat, d.p[i].eighths - (uint32_t)out);
     }
   }
@@ -457,7 +468,8 @@ int32_t Q16(float v) { return (int32_t)std::lround(v * 65536.0f); }
 int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                        const Vec3* target, uint32_t tick, uint32_t seed,
                        uint32_t room, std::vector<FluidSpawnOp>& out,
-                       SplatterEvent* splat, const std::vector<MaterialDef>* mats) {
+                       SplatterEvent* splat, const std::vector<MaterialDef>* mats,
+                       std::vector<ContainerSolutePour>* sol) {
   // One vessel's fill: a stack does not pour (isolate one first); a stoppered
   // one pours nothing.
   if (!def.IsContainer() || !st.Filled() || st.count != 1 || st.stoppered) return 0;
@@ -534,13 +546,25 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     poured++;
   }
   st.contents.Take((uint16_t)mat, (uint32_t)poured);
-  // The dissolved share of what left. The fluid road has no grid-particle
-  // stream to put the fallback powder in, so the share goes back into the
-  // vessel as UNDISSOLVED powder there and pours as grains after the liquid
-  // (contract 2.5's fallback; package B makes it ride the fluid instead).
+  // The dissolved share of what left GOES WITH IT (container.h: as a solute
+  // pour aimed where the fluid is aimed, landing when it lands -- not on the
+  // particles, and why not). Only the FALLBACK (no `sol`, or the layer off)
+  // keeps the old answer: the fluid road has no grid-particle stream to put
+  // powder in, so the share goes back into the vessel as UNDISSOLVED powder
+  // there and pours as grains after the liquid.
   if (poured > 0) {
     const alchemy::Composition d = ContainerTakeDissolvedShare(st.contents, (uint32_t)poured, liquidBefore);
-    for (int i = 0; i < d.n; i++) st.contents.Add(alchemy::BaseMat(d.p[i].mat), d.p[i].eighths);
+    Vec3 land = mouth + v0 * (float)n;
+    land.y -= g * (float)n * (float)n * 0.5f;
+    if (target && ContainerInReach(def, mouth, *target)) land = *target;
+    const IVec3 lc{(int)std::floor(land.x), (int)std::floor(land.y), (int)std::floor(land.z)};
+    for (int i = 0; i < d.n; i++) {
+      const int q = sol ? ContainerDissolvedToSolution(d.p[i].mat, (int)d.p[i].eighths, lc,
+                                                       tick + (uint32_t)n, *sol)
+                        : 0;
+      if (q < (int)d.p[i].eighths)
+        st.contents.Add(alchemy::BaseMat(d.p[i].mat), d.p[i].eighths - (uint32_t)q);
+    }
   }
   if (poured > 0 && splat) {
     SplatterEvent& e = *splat;
@@ -654,7 +678,8 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
                        uint32_t tick, uint32_t fluidRoom,
                        std::vector<FluidSpawnOp>& fluid,
                        std::vector<ParticleSpawn>& parts, SplatterEvent* splat,
-                       uint32_t partRoom, std::vector<GasSpawnOp>* gas, uint32_t gasRoom) {
+                       uint32_t partRoom, std::vector<GasSpawnOp>* gas, uint32_t gasRoom,
+                       std::vector<ContainerSolutePour>* sol) {
   // The next portion when this one is out (a mixed vessel spills them in
   // turn). A portion whose material is gone from the table is dropped.
   while (sp.units <= 0 && !sp.rest.Empty()) {
@@ -666,11 +691,15 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
     sp.units = 0;
     return 0;
   }
-  // DISSOLVED: the solute seam (package B's to replace).
+  // DISSOLVED: the solute seam. In solution, into whatever the spill's liquid
+  // lands in under the vessel, a few ticks on (the burst ball's fall; the
+  // GPU's surface search finds the ground or the water under the cell).
   if (alchemy::IsDissolved(sp.mat)) {
     const uint32_t room = partRoom == 0xFFFFFFFFu ? 0xFFFFFFFFu : partRoom;
+    const IVec3 lc{(int)std::floor(sp.at.x), (int)std::floor(sp.at.y), (int)std::floor(sp.at.z)};
     const int out = ContainerDissolvedToWorld(sp.mat, sp.units, sp.at, sp.vel * (1.0f / 30.0f),
-                                              sp.seed, tick, mats, parts, room);
+                                              sp.seed, tick, mats, parts, room, sol, lc,
+                                              tick + kSolutePourSpillTicks);
     sp.units -= out;
     return out;
   }
@@ -1078,10 +1107,78 @@ alchemy::Composition ContainerTakeDissolvedShare(alchemy::Composition& c, uint32
   return out;
 }
 
+namespace {
+uint64_t g_solutePoursDropped = 0;
+}  // namespace
+
+int ContainerDissolvedToSolution(uint16_t mat, int eighths, IVec3 cell, uint32_t landTick,
+                                 std::vector<ContainerSolutePour>& out) {
+  if (eighths <= 0 || !alchemy::IsDissolved(mat)) return 0;
+  if (CurrentTuning().sim.soluteMode == 0) return 0;
+  const SoluteDef* sd = SoluteFromPowder(CurrentSolutes(), alchemy::BaseMat(mat));
+  if (!sd || sd->species == 0 || sd->species > kCellOpSoluteSpeciesMax) return 0;
+  const uint32_t y8 = std::max<uint32_t>(1u, sd->yieldPerVoxel / 8u);
+  // One op's worth at most per entry: the GPU's unit field and the powder a
+  // pour with nowhere to dissolve leaves both bound it.
+  const uint32_t per = std::max<uint32_t>(
+      1u, std::min<uint32_t>(kSolutePourMaxEighths, kCellOpSoluteUnitsMax / y8));
+  for (uint32_t left = (uint32_t)eighths; left > 0;) {
+    const uint32_t e = std::min(left, per);
+    out.push_back({landTick, cell, sd->species, e * y8});
+    left -= e;
+  }
+  return eighths;
+}
+
+int ContainerSolutePoursDue(std::vector<ContainerSolutePour>& pending, uint32_t tick,
+                            const World& world, std::vector<CellOp>& cells) {
+  int sent = 0;
+  size_t w = 0;
+  for (size_t i = 0; i < pending.size(); i++) {
+    ContainerSolutePour& p = pending[i];
+    if (p.units == 0) continue;   // merged into an earlier one below
+    if (p.tick > tick || sent >= (int)kMaxSolutePoursPerTick) {
+      pending[w++] = p;   // not landed yet, or the tick is full: next tick
+      continue;
+    }
+    if (!world.CellInWindow(p.cell)) {
+      g_solutePoursDropped += p.units;
+      std::fprintf(stderr, "solute pour: %u units of species %u landed outside the window at "
+                   "(%d,%d,%d) and are lost\n", p.units, (unsigned)p.species, p.cell.x,
+                   p.cell.y, p.cell.z);
+      continue;
+    }
+    // Merge every later due pour of the same cell and species into this op
+    // (a stream lands on one cell tick after tick), up to the op's field.
+    uint32_t units = p.units;
+    for (size_t j = i + 1; j < pending.size(); j++) {
+      ContainerSolutePour& q = pending[j];
+      if (q.units == 0 || q.tick > tick || q.species != p.species || q.cell.x != p.cell.x ||
+          q.cell.y != p.cell.y || q.cell.z != p.cell.z || units + q.units > kCellOpSoluteUnitsMax)
+        continue;
+      units += q.units;
+      q.units = 0;
+    }
+    cells.push_back({World::SlotCellIndex(p.cell), CellOpSolute(p.species, units)});
+    sent++;
+  }
+  pending.resize(w);
+  return sent;
+}
+
+uint64_t ContainerSolutePoursDropped() { return g_solutePoursDropped; }
+
 int ContainerDissolvedToWorld(uint16_t mat, int eighths, Vec3 at, Vec3 vel, uint32_t seed,
                               uint32_t tick, const std::vector<MaterialDef>& mats,
-                              std::vector<ParticleSpawn>& parts, uint32_t partRoom) {
-  // ---- THE FALLBACK (until package B's solute layer): its powder. -----------
+                              std::vector<ParticleSpawn>& parts, uint32_t partRoom,
+                              std::vector<ContainerSolutePour>* sol, IVec3 land,
+                              uint32_t landTick) {
+  // ---- IN SOLUTION, when there is a pour queue and a solute layer. --------
+  if (sol && eighths > 0) {
+    const int q = ContainerDissolvedToSolution(mat, eighths, land, std::max(landTick, tick), *sol);
+    if (q >= eighths) return q;
+  }
+  // ---- THE FALLBACK: its powder. ------------------------------------------
   const uint16_t powder = alchemy::BaseMat(mat);
   if (powder == 0 || powder >= mats.size() || eighths <= 0) return 0;
   const bool liquid = mats[powder].gpu.klass == CLASS_LIQUID;

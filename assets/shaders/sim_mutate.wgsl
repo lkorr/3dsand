@@ -67,6 +67,179 @@ struct CellOp {
 // a fault that reports as "unknown".
 const PT_KERNEL : u32 = PT_K_MUTATE;
 
+// THE SOLUTE LAYER (docs/PLAN_solutes.md; world.h kSol*). Bound here for the
+// solute POUR (world.h CellOpSolute): `cells` asks the allocator for pages
+// under a pour op, and `solPour` lays the pour's mass into the solvent there.
+@group(0) @binding(40) var<storage, read_write> solTable : array<u32>;
+@group(0) @binding(41) var<storage, read_write> solPool : array<atomic<u32>>;
+@group(0) @binding(42) var<storage, read_write> solMeta : array<atomic<u32>>;
+@group(0) @binding(43) var<storage, read> solSpec : array<u32>;
+
+// MIRROR-BEGIN solute
+// ---- THE SOLUTE LAYER'S SHARED ACCESSORS (docs/PLAN_solutes.md) -------------
+// ONE block, pasted verbatim into every shader that touches dissolved mass
+// (sim_step.wgsl, sim_solute.wgsl, sim_mutate.wgsl, sim_fluid_seam.wgsl) and
+// held identical by scripts/check_invariants.py `solute`. Not in common.wgsl on
+// purpose: common.wgsl is prepended to every shader, so an edit there misses the
+// SPIR-V cache for all of them (CLAUDE.md, "What needs a rebuild"); this block
+// only reaches the four modules that bind the layer.
+//
+// The layout is world.h's kSol* block, mirrored constant for constant:
+//   solTable[slot]  0 = SOL_EMPTY | SOL_UNIFORM_BIT | value16 | SOL_PAGE_BIT | page
+//   solPool         16-bit cells (species << 8 | mass), two per word, the EVEN
+//                   chunk-local index in the low half
+//   solMeta         SOLM_* header, free stack, want list/flags, request flags,
+//                   stall counters, per-chunk aggregates
+//   solSpec         species params (SOLS_*) + one word per material
+//
+// POOL WORDS ARE WRITTEN WITH TWO ATOMICS (and, then or) because two cells share
+// a word and the colour lattice lets two acting threads write neighbouring
+// cells: a plain read-modify-write of the word would lose one of them. Atomic
+// ops on DISJOINT bits commute, so the result does not depend on their order.
+const SOL_UNIFORM_BIT : u32 = 0x80000000u;
+const SOL_PAGE_BIT : u32 = 0x40000000u;
+const SOL_PAGE_MASK : u32 = 0x3FFFFFFFu;
+const SOL_WORDS_PER_PAGE : u32 = 2048u;
+const SOL_POOL_PAGES : u32 = 4096u;
+const SOLM_FREE : u32 = 0u;
+const SOLM_WANT_COUNT : u32 = 1u;
+const SOLM_FAULTS : u32 = 2u;
+const SOLM_EXHAUSTED : u32 = 3u;
+const SOLM_HIGH_WATER : u32 = 4u;
+const SOLM_DISSOLVED : u32 = 5u;
+const SOLM_PRECIP : u32 = 6u;
+const SOLM_DISCARDED : u32 = 7u;
+const SOLM_CONVERTED : u32 = 8u;
+const SOLM_FAULT_SLOT : u32 = 9u;
+const SOLM_FAULT_TICK : u32 = 10u;
+const SOLM_POURED : u32 = 11u;
+const SOLM_SCOOPED : u32 = 12u;
+const SOLM_SEAM_REFUSED : u32 = 13u;
+const SOLM_ARGS : u32 = 16u;
+const SOLM_STACK : u32 = 64u;
+const SOLM_WANT_LIST : u32 = SOLM_STACK + SOL_POOL_PAGES;
+const SOLM_WANT_FLAG : u32 = SOLM_WANT_LIST + NUM_SLOTS;
+const SOLM_REQ_FLAG : u32 = SOLM_WANT_FLAG + NUM_SLOTS;
+const SOLM_STALL : u32 = SOLM_REQ_FLAG + NUM_SLOTS;
+const SOLM_AGG : u32 = SOLM_STALL + NUM_SLOTS;
+const SOLS_BASE : u32 = 16u;
+const SOLS_STRIDE : u32 = 16u;
+const SOLS_MAT_BASE : u32 = 4112u;
+const SOLS_RULE_BASE : u32 = 8208u;
+// Bit 26 of the dirty word (world.h kDirtyReasonName "solute"): dissolved mass
+// still moving. Deliberately NOT in sim_step's FILM_LICENCE.
+const DIRTY_R_SOLUTE : u32 = 67108864u;
+// Bit 27 ("solute-back"): a chunk's diffusion found work across its -axis face
+// in a pair its -axis neighbour OWNS. The owner, woken by it, keeps itself
+// awake for a whole phase cycle (it cannot know which of the 24 phases the
+// pair lives in, and waking it for one tick lands on the wrong one).
+const DIRTY_R_SOLBACK : u32 = 134217728u;
+// A chunk whose diffusion found nothing to do for this many CONSECUTIVE
+// dispatches has seen every axis, parity and stride (3 x 2 x 4 = 24 phases,
+// eight ticks) idle: it is STALLED, the dilution floor applies and it stops
+// keeping itself awake.
+const SOL_STALL_TICKS : u32 = 24u;
+
+fn solSpeciesOf(v : u32) -> u32 { return v >> 8u; }
+fn solMassOf(v : u32) -> u32 { return v & 0xFFu; }
+fn solPack(species : u32, mass : u32) -> u32 {
+  if (mass == 0u || species == 0u) { return 0u; }
+  return (species << 8u) | min(mass, 255u);
+}
+fn solLocalOf(c : vec3<i32>) -> u32 {
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  return (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+}
+// The cell value a table entry implies for chunk-local cell `local`.
+fn solCellValue(e : u32, local : u32) -> u32 {
+  if (e == 0u) { return 0u; }
+  if ((e & SOL_UNIFORM_BIT) != 0u) { return e & 0xFFFFu; }
+  let wv = atomicLoad(&solPool[(e & SOL_PAGE_MASK) * SOL_WORDS_PER_PAGE + (local >> 1u)]);
+  return (wv >> ((local & 1u) * 16u)) & 0xFFFFu;
+}
+// The STORED value at world cell c. A caller that wants the value a cell
+// carries must also ask whether the cell is a liquid (solCarried): a value
+// left behind on a cell something turned into air is stale until solCompact
+// clears it, and must read as nothing.
+fn solValueAt(c : vec3<i32>) -> u32 {
+  return solCellValue(solTable[voxSlotOfCell(c)], solLocalOf(c));
+}
+fn solWritable(c : vec3<i32>) -> bool {
+  return (solTable[voxSlotOfCell(c)] & SOL_PAGE_BIT) != 0u;
+}
+// A write into a chunk with no page is REFUSED and counted -- the allocator
+// promises a page to every chunk a tick can write, so a refusal is a bug, and
+// the count is what says so (Simulation::CheckSoluteFaults aborts on it). A
+// write of the value the sentinel already implies is not a write at all.
+fn solFault(slot : u32) {
+  let prev = atomicAdd(&solMeta[SOLM_FAULTS], 1u);
+  if (prev == 0u) {
+    atomicStore(&solMeta[SOLM_FAULT_SLOT], slot + 1u);
+    atomicStore(&solMeta[SOLM_FAULT_TICK], T.tick);
+  }
+}
+fn solStoreAt(c : vec3<i32>, v : u32) -> bool {
+  let slot = voxSlotOfCell(c);
+  let e = solTable[slot];
+  let local = solLocalOf(c);
+  if ((e & SOL_PAGE_BIT) == 0u) {
+    if (solCellValue(e, local) == v) { return true; }
+    solFault(slot);
+    return false;
+  }
+  let wi = (e & SOL_PAGE_MASK) * SOL_WORDS_PER_PAGE + (local >> 1u);
+  let sh = (local & 1u) * 16u;
+  let old = (atomicLoad(&solPool[wi]) >> sh) & 0xFFFFu;
+  if (old == v) { return true; }
+  atomicAnd(&solPool[wi], ~(0xFFFFu << sh));
+  atomicOr(&solPool[wi], (v & 0xFFFFu) << sh);
+  return true;
+}
+// ---- the species table (world.h kSolSpec*, Simulation::UploadSolutes) ----
+fn solYield8(s : u32) -> u32 { return max(solSpec[SOLS_BASE + s * SOLS_STRIDE], 1u); }
+fn solSaturation(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 1u]; }
+fn solDissolveChance(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 2u]; }
+fn solDiffusivity(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 3u]; }
+fn solFloor(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u]; }
+fn solDensityPerUnit(s : u32) -> i32 { return bitcast<i32>(solSpec[SOLS_BASE + s * SOLS_STRIDE + 5u]); }
+fn solPrecipitate(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 9u]; }
+fn solConvertCount(s : u32) -> u32 { return min(solSpec[SOLS_BASE + s * SOLS_STRIDE + 10u], 4u); }
+fn solConvertRow(s : u32, k : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 11u + k]; }
+fn solMatWord(m : u32) -> u32 { return solSpec[SOLS_MAT_BASE + (m & 0xFFFu)]; }
+// The species powder `m` dissolves AS, or 0.
+fn solFromSpecies(m : u32) -> u32 { return solMatWord(m) & 0xFFu; }
+// Is liquid `m` a solvent of species `s`?
+fn solIsSolvent(m : u32, s : u32) -> bool {
+  if (s == 0u || s > 24u) { return false; }
+  return (solMatWord(m) & (1u << (7u + s))) != 0u;
+}
+// The most mass a cell of `f` eighths of a solvent holds of species `s`.
+fn solCap(s : u32, f : u32) -> u32 { return (solSaturation(s) * f) / 8u; }
+fn solIsLiquidMat(m : u32) -> bool {
+  return m != MAT_AIR && materials[m].klass == CLASS_LIQUID;
+}
+// The value cell c CARRIES given its word `w`: the stored value if the cell is
+// a liquid, else nothing (see solValueAt).
+fn solCarried(c : vec3<i32>, w : u32) -> u32 {
+  if (!solIsLiquidMat(voxMat(w))) { return 0u; }
+  return solValueAt(c);
+}
+// A CONCENTRATION CONDITION on a reaction rule (PLAN_solutes §4.1; the side
+// array at SOLS_RULE_BASE, indexed by the rule's GPU index): may rule `ri`
+// fire for the self cell c whose word is w? An unconditioned rule (word 0)
+// always may; a conditioned one needs a liquid self carrying that species at
+// a concentration (mass * 8 / fullness) inside [cMin, cMax].
+fn solRuleAllows(ri : u32, c : vec3<i32>, w : u32) -> bool {
+  let cond = solSpec[SOLS_RULE_BASE + ri];
+  if (cond == 0u) { return true; }
+  if (!solIsLiquidMat(voxMat(w))) { return false; }
+  let v = solValueAt(c);
+  if (solSpeciesOf(v) != (cond & 0xFFu)) { return false; }
+  let conc = (solMassOf(v) * 8u) / (voxState(w) + 1u);
+  return conc >= ((cond >> 8u) & 0xFFu) && conc <= ((cond >> 16u) & 0xFFu);
+}
+// MIRROR-END solute
+
 fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 
 // c's own chunk plus every chunk it borders (common.wgsl's dirtyFanSlot).
@@ -209,6 +382,18 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   // rubble handoff take matter out of the grid, and those are precisely the
   // writes that can leave something above them unsupported.
   let prevMat = voxMat(iw.y);
+  // A SOLUTE POUR (world.h CellOpSolute) writes no voxel here. It wakes its
+  // chunk and asks the solute allocator for pages round it (the request flag
+  // solWant reads for a dirty chunk -- this one, now), so that `solPour`,
+  // after solAlloc, finds every cell it may deposit into paged. Tested FIRST:
+  // its word is also an IF_AIR word on AIR, which below would read as a
+  // conditional clear of the material in bits 12..23.
+  if (cellOpIsSolutePour(word)) {
+    let lp = vec3<i32>(vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK)));
+    markBoth(slotWorldChunk(ci, T.origin) * i32(CHUNK) + lp);
+    atomicStore(&solMeta[SOLM_REQ_FLAG + ci], 1u);
+    return;
+  }
   if ((word & CELLOP_IF_AIR) != 0u) {
     if ((word & 0xFFFu) == MAT_AIR) {
       // CONDITIONAL CLEAR (world.h CellOpClearIfMat): the flag on an AIR word
@@ -250,6 +435,185 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   // what keeps DESIGN.md §7's "burn ops must not starve island detection"
   // property intact without a special case here.
   flagSupportLoss(wc, materials[prevMat].klass, voxMat(word));
+}
+
+// ---- THE SOLUTE POUR (docs/PLAN_alchemy_chemistry.md contract 2.5) --------
+//
+// A vessel pouring a SOLUTION (a flask of brine) sends its dissolved share as
+// CellOpSolute ops (world.h): "this many units of species S into the liquid
+// at or under this cell". The CPU aims them where the stream lands and sends
+// them when it lands (game/container.h ContainerSolutePour); this kernel
+// finds the solvent and lays the mass into it. Recorded after solAlloc (the
+// op's chunk asked for pages in `cells` above, so N27 of it is paged) and
+// after solScoop (which empties AIR cells' stale mass; this pass writes only
+// LIQUID cells' mass and AIR cells' voxels, and its RW(Voxels) use orders it
+// after solScoop's reads), before the CA.
+//
+// ONE INVOCATION, THE OPS IN PUSH ORDER. SubmitTick moves every pour to the
+// tail of the cell-op stream, so the thread walks back from the end while the
+// ops are pours and then applies them forward. Two pours onto one cell, or
+// two whose patches overlap, are applied one after the other -- no atomics
+// deciding who got the room, so the outcome is a function of the op list
+// (rule 1). A tick carries a handful of pours (the CPU caps them), so a
+// single thread is the cheap answer, not a compromise.
+//
+// PER OP:
+//   1. FIND THE SURFACE: out of the ground if the cell is in it (a pour point
+//      on a surface floors into it; up to SOL_POUR_CLIMB), then down through
+//      air and gas (up to SOL_POUR_DOWN) to the first thing that is not.
+//   2. INTO SOLUTION: if that is a liquid SOLVENT of the species, the mass
+//      goes into it and the cells round it (a 5 x 5 patch, SOL_POUR_LAYERS
+//      deep: the surface a stream lands on), each up to the species
+//      saturation for its fullness -- the same cap a dissolving grain meets
+//      (solCap). A cell carrying another species is skipped (two species do
+//      not share a cell). The total put in is WHOLE EIGHTHS unless it is all
+//      of it, so what is left over is whole eighths too.
+//   3. THE REST PRECIPITATES: what found no room -- dry ground, a saturated
+//      puddle, oil -- is laid down as the species powder (`from`, the powder
+//      it dissolved from) in the first AIR cell at the surface, one cell per
+//      eight eighths, as a partial cell where it is less. That is what the
+//      old CPU fallback did, minus the flight: the salt a dry basin gets is a
+//      salt crust, and it dissolves again when water arrives (sim_step
+//      solTryDissolve). Nothing is rounded away: a sub-eighth remainder or a
+//      pour into solid rock with no air in reach is COUNTED lost
+//      (SOLM_POUR_LOST), which the solute-pour gate asserts stays zero.
+// Every unit is counted: SOLM_POURED (into solution) + SOLM_POUR_POWDER (as
+// powder) + SOLM_POUR_LOST == every unit the ops carried.
+const SOLM_POUR_POWDER : u32 = 14u;   // world.h kSolMPourPowder
+const SOLM_POUR_LOST : u32 = 15u;     // world.h kSolMPourLost
+const SOL_POUR_CLIMB : i32 = 3;
+const SOL_POUR_DOWN : i32 = 16;
+const SOL_POUR_RADIUS : i32 = 2;
+const SOL_POUR_LAYERS : i32 = 3;
+const SOL_POUR_MAX_OPS : u32 = 256u;   // container.h kMaxSolutePoursPerTick
+
+fn cellOpIsSolutePour(w : u32) -> bool {
+  return (w & CELLOP_IF_AIR) != 0u && (w & 0xFFFu) == MAT_AIR && ((w >> 24u) & 0x7Fu) != 0u;
+}
+fn solPourOpen(m : u32) -> bool {
+  return m == MAT_AIR || materials[m].klass == CLASS_GAS;
+}
+// Room for species `s` in the cell at `c`, or 0 when it cannot take any (not
+// a solvent of s, carries another species, not paged).
+fn solPourRoom(c : vec3<i32>, s : u32) -> u32 {
+  if (!inBounds(c)) { return 0u; }
+  let w = voxWordAt(c);
+  let m = voxMat(w);
+  if (!solIsLiquidMat(m) || !solIsSolvent(m, s) || !solWritable(c)) { return 0u; }
+  let v = solValueAt(c);
+  if (v != 0u && solSpeciesOf(v) != s) { return 0u; }
+  let cap = min(solCap(s, voxState(w) + 1u), 255u);
+  return cap - min(cap, solMassOf(v));
+}
+// The k-th cell of the patch under surface cell p: the centre first, then
+// the rest of its layer, then the layers below.
+fn solPourPatch(p : vec3<i32>, k : i32) -> vec3<i32> {
+  let side = 2 * SOL_POUR_RADIUS + 1;
+  let per = side * side;
+  let dy = k / per;
+  let r = k % per;
+  var q = r;
+  if (r == 0) { q = per / 2; } else if (r <= per / 2) { q = r - 1; }
+  return p + vec3<i32>(q % side - SOL_POUR_RADIUS, -dy, q / side - SOL_POUR_RADIUS);
+}
+
+fn solPourOne(op : CellOp) {
+  let s = (op.word >> 24u) & 0x7Fu;
+  let units = (op.word >> 12u) & 0xFFFu;
+  if (units == 0u) { return; }
+  let ci = op.cellIdx / CHUNK_VOL;
+  let lo = op.cellIdx % CHUNK_VOL;
+  let lp = vec3<i32>(vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK)));
+  var p = slotWorldChunk(ci, T.origin) * i32(CHUNK) + lp;
+  if (!inBounds(p)) {
+    atomicAdd(&solMeta[SOLM_POUR_LOST], units);
+    return;
+  }
+  // 1. The surface.
+  for (var k = 0; k < SOL_POUR_CLIMB; k++) {
+    let m = voxMat(voxWordAt(p));
+    if (solPourOpen(m) || solIsLiquidMat(m)) { break; }
+    let up = p + vec3<i32>(0, 1, 0);
+    if (!inBounds(up)) { break; }
+    p = up;
+  }
+  for (var k = 0; k < SOL_POUR_DOWN; k++) {
+    if (!solPourOpen(voxMat(voxWordAt(p)))) { break; }
+    let dn = p - vec3<i32>(0, 1, 0);
+    if (!inBounds(dn)) { break; }
+    p = dn;
+  }
+  var left = units;
+  let y8 = solYield8(s);
+  // 2. Into solution.
+  let side = 2 * SOL_POUR_RADIUS + 1;
+  let n = side * side * SOL_POUR_LAYERS;
+  let pm = voxMat(voxWordAt(p));
+  if (solIsLiquidMat(pm) && solIsSolvent(pm, s)) {
+    var room = 0u;
+    for (var k = 0; k < n; k++) { room += solPourRoom(solPourPatch(p, k), s); }
+    var put = min(left, room);
+    if (put < left) { put = (put / y8) * y8; }
+    var given = 0u;
+    for (var k = 0; k < n && given < put; k++) {
+      let c = solPourPatch(p, k);
+      let r = solPourRoom(c, s);
+      if (r == 0u) { continue; }
+      let g = min(r, put - given);
+      _ = solStoreAt(c, solPack(s, solMassOf(solValueAt(c)) + g));
+      given += g;
+      // Awake next tick: the diffusion spreads it, the CA carries it.
+      let own = dirtyFanSlot(c, T.origin, 0u);
+      if (own != SLOT_NONE) { atomicOr(&dirtyOut[own], DIRTY_R_SOLUTE); }
+    }
+    if (given != 0u) { atomicAdd(&solMeta[SOLM_POURED], given); }
+    left -= given;
+  }
+  if (left == 0u) { return; }
+  // 3. The rest precipitates, as the powder it dissolved from.
+  let powder = solSpec[SOLS_BASE + s * SOLS_STRIDE + 15u] & 0xFFFu;
+  var eighths = left / y8;
+  var lost = left % y8;
+  if (powder == MAT_AIR || !matHasPowderMass(materials[powder])) {
+    atomicAdd(&solMeta[SOLM_POUR_LOST], left);
+    return;
+  }
+  var q = p;
+  var tries = SOL_POUR_CLIMB + 4;
+  loop {
+    if (eighths == 0u || tries <= 0) { break; }
+    tries -= 1;
+    let idx = voxWordIndex(q);
+    if (idx != PT_NO_WORD && voxMat(voxWordAt(q)) == MAT_AIR) {
+      let e = min(eighths, POWDER_FULL);
+      var state = e + 2u;
+      if (e == POWDER_FULL) { state = hash3(T.seed ^ 0x5017B0u, T.tick, cellIndexW(q)) % 3u; }
+      voxStore(idx, packVox(powder, state, STAMP_NEVER));
+      // Next tick, not this one: the CA's list is already compacted.
+      for (var f = 0u; f < 8u; f++) {
+        let fs = dirtyFanSlot(q, T.origin, f);
+        if (fs != SLOT_NONE) { atomicOr(&dirtyOut[fs], DIRTY_R_MUTATE); }
+      }
+      atomicAdd(&solMeta[SOLM_POUR_POWDER], e * y8);
+      eighths -= e;
+    }
+    let up = q + vec3<i32>(0, 1, 0);
+    if (!inBounds(up)) { break; }
+    q = up;
+  }
+  lost += eighths * y8;
+  if (lost != 0u) { atomicAdd(&solMeta[SOLM_POUR_LOST], lost); }
+}
+
+@compute @workgroup_size(1)
+fn solPour() {
+  var first = T.cellCount;
+  loop {
+    if (first == 0u || T.cellCount - first >= SOL_POUR_MAX_OPS) { break; }
+    if (!cellOpIsSolutePour(cellOps[first - 1u].word)) { break; }
+    first -= 1u;
+  }
+  for (var i = first; i < T.cellCount; i++) { solPourOne(cellOps[i]); }
 }
 
 // ---- WIND PRIMITIVE FOOTPRINT WAKE (docs/RESEARCH_wind.md §4.3, §10) -------

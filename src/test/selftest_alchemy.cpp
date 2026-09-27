@@ -856,6 +856,75 @@ Status GateAlchemyElectrolysis(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// BRINE ELECTROLYSIS AT THE BENCH (the chlor-alkali cell; package G). The
+// world's two water rules gated on DISSOLVED salt (reactions.json "solute":
+// "salt", "cMin": 24) are compiled onto the bench with their condition
+// (flasksim_mats.h BuildBenchChemistry; benchchem.h ChemRule::soluteSpecies)
+// and evaluated against each water particle's own dissolved mass, in the
+// world's concentration units (ChemConcentration). A flask of brine under the
+// Electrify button gives off chlorine and hydrogen and turns caustic (lye); a
+// flask of FRESH water under the same shocks gives off nothing -- the
+// condition, not the spark, is what decides. NO fixture rules: if the table
+// lacks the conditioned rules the gate fails rather than supplying them.
+Status GateAlchemyBrineElectrolysis(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int water = SlotOfName(b, c, "water"), salt = SlotOfName(b, c, "salt"),
+            lye = SlotOfName(b, c, "lye"), cl = SlotOfName(b, c, "chlorine"),
+            h2 = SlotOfName(b, c, "hydrogen");
+  if (water < 0 || salt < 0 || lye < 0 || cl < 0 || h2 < 0) { detail = "missing materials"; return Status::Fail; }
+  if (!b.chem.spark.on || !b.chem.SoluteFrom(salt)) {
+    detail = "no tag:electric in the table, or no salt species";
+    return Status::Fail;
+  }
+  // The conditioned rules made it into the bench's table.
+  int conditioned = 0;
+  uint32_t cMin = 0;
+  for (const alchemy::ChemRule& r : b.chem.rules[water])
+    if (r.soluteSpecies != 0 && r.soluteSpecies == b.chem.SoluteFrom(salt)->species) {
+      conditioned++;
+      cMin = r.soluteMin;
+    }
+  const uint16_t dSalt = (uint16_t)(b.subs[salt].mat | alchemy::kDissolvedBit);
+  auto run = [&](uint32_t dissolved, int64_t& lyeU, int64_t& clU, int64_t& h2U, uint32_t& conc,
+                 std::string& why, const char* shot) {
+    Composition in;
+    in.Add(b.subs[water].mat, 300);
+    if (dissolved) in.Add(dSalt, dissolved);
+    alchemy::FlaskSim s(ChemConfig());
+    s.SetSubstances(b.subs);
+    s.SetChemistry(b.chem);
+    const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in);
+    for (int f = 0; f < 60; f++) s.Step(4);   // settle
+    conc = alchemy::ChemConcentration((uint32_t)s.DissolvedUnits(salt), 300u * 12u,
+                                      b.chem.SoluteFrom(salt)->yieldPerVoxel);
+    // Electrify every half second for six seconds.
+    for (int f = 0; f < 60 * 6; f++) {
+      if (f % 30 == 0) s.Shock(v);
+      s.Step(4);
+      if (f == 8 && shot) Shot(s, shot);
+    }
+    lyeU = s.Produced()[lye];
+    clU = s.Produced()[cl];
+    h2U = s.Produced()[h2];
+    return s.AuditUnits(&why);
+  };
+  int64_t lyeB = 0, clB = 0, h2B = 0, lyeF = 0, clF = 0, h2F = 0;
+  uint32_t concB = 0, concF = 0;
+  std::string whyB, whyF;
+  const bool auditB = run(60, lyeB, clB, h2B, concB, whyB, "alchemy_brine_electrify.bmp");
+  const bool auditF = run(0, lyeF, clF, h2F, concF, whyF, nullptr);
+  const bool ok = conditioned >= 1 && concB >= cMin && clB > 0 && (lyeB > 0 || h2B > 0) &&
+                  clF == 0 && lyeF == 0 && h2F == 0 && auditB && auditF;
+  detail = Format("%d salt-conditioned water rule(s) on the bench (cMin %u); brine (60 dissolved "
+                  "eighths in 300 water, c %u): %lld units chlorine, %lld lye, %lld hydrogen, audit %s; "
+                  "fresh water (c %u): %lld chlorine, %lld lye, %lld hydrogen (all must be 0), audit %s",
+                  conditioned, cMin, concB, (long long)clB, (long long)lyeB, (long long)h2B,
+                  auditB ? "exact" : whyB.c_str(), concF, (long long)clF, (long long)lyeF,
+                  (long long)h2F, auditF ? "exact" : whyF.c_str());
+  std::printf("alchemy-brine-electrolysis: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // SODIUM IN WATER EXPLODES -- ON THE BENCH TOO. A flask of water with a
 // pinch of sodium: the world's explode-rule fires on the bench and raises an
 // `explode` BenchEvent. Its registered handler ejects the player, breaks the
@@ -1088,6 +1157,7 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-stopper", "player", {}, false, GateAlchemyStopper},
       {"alchemy-dissolve", "player", {}, false, GateAlchemyDissolve},
       {"alchemy-electrolysis", "player", {}, false, GateAlchemyElectrolysis},
+      {"alchemy-brine-electrolysis", "player", {}, false, GateAlchemyBrineElectrolysis},
       {"alchemy-explode", "player", {}, false, GateAlchemyExplode},
       // Package E: the creative expansion's recipes on the bench.
       {"chem-bench", "player", {}, false, GateChemBench},

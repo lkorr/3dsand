@@ -638,6 +638,10 @@ fn solScoop(@builtin(global_invocation_id) gid : vec3<u32>) {
   let op = cellOps[gid.x];
   if (op.cellIdx >= WORLD_N * WORLD_N * WORLD_N) { return; }
   if ((op.word & CELLOP_IF_AIR) == 0u || (op.word & 0xFFFu) != MAT_AIR) { return; }
+  // A SOLUTE POUR (world.h CellOpSolute) shares the IF_AIR-on-AIR spelling
+  // with a clear; its species in bits 24..30 is what tells them apart (a
+  // clear's are always 0). sim_mutate.wgsl solPour is its reader.
+  if (((op.word >> 24u) & 0x7Fu) != 0u) { return; }
   let tmat = (op.word >> 12u) & 0xFFFu;
   if (!solIsLiquidMat(tmat)) { return; }
   let ci = op.cellIdx / CHUNK_VOL;

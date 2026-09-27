@@ -353,7 +353,7 @@ enum class Pipe : uint8_t {
   GlowSrc, GlowField, GlowRefresh,
   // The solute layer (sim_solute.wgsl). BEFORE ShadowResolve: RecordTable
   // hands the recorder pipelines up to that enumerator only.
-  SolWant, SolArgsP, SolAlloc, SolDiffuse, SolCompact, SolScoop, SolHash, SolEvict, SolRestore,
+  SolWant, SolArgsP, SolAlloc, SolDiffuse, SolCompact, SolScoop, SolPour, SolHash, SolEvict, SolRestore,
   // The clouds (cloud.wgsl): the one-shot noise bake, then the per-frame
   // weather map, shadow map, env map, march and temporal resolve. BEFORE
   // ShadowPrepare for the pipeline-copy bound's reason stated above.

@@ -926,6 +926,33 @@ constexpr uint32_t kCellOpIfAir = 0x80000000u;
 inline uint32_t CellOpClearIfMat(uint32_t mat) {
   return kCellOpIfAir | ((mat & 0xFFFu) << 12);
 }
+// THE SOLUTE POUR (docs/PLAN_alchemy_chemistry.md contract 2.5, package G):
+// "put `units` of dissolved species `species` into the liquid at or under this
+// cell". A conditional clear always has bits 24..30 clear (CellOpClearIfMat),
+// so kCellOpIfAir + material AIR + a NONZERO species in bits 24..30 is a third
+// meaning of the same flag, with the units in bits 12..23 (<= 4095, whole
+// eighths of the powder: SoluteDef::yieldPerVoxel / 8 each). It writes NO
+// voxel of its own: sim_mutate.wgsl `cells` only wakes the chunk and asks the
+// solute allocator for pages (the request flag), and `solPour` -- after
+// solAlloc, ONE invocation walking these ops in push order -- lays the mass
+// into the solvent under the cell, spreading it over the cells round it up to
+// the species' saturation, and whatever finds no solvent (dry ground, oil, a
+// layer switched off) PRECIPITATES there as its powder, which re-dissolves
+// the moment water covers it. Conserved either way, counted either way
+// (kSolMPoured / kSolMPourPowder).
+//
+// Exempt from the keep-first dedupe (oprecord.cpp CanonicalizeCells): two
+// pours onto one cell are two deposits, not a race -- solPour applies them one
+// after the other. SubmitTick moves them to the TAIL of the stream so that
+// single invocation reads only them.
+constexpr uint32_t kCellOpSoluteSpeciesMax = 127;
+constexpr uint32_t kCellOpSoluteUnitsMax = 0xFFF;
+inline uint32_t CellOpSolute(uint32_t species, uint32_t units) {
+  return kCellOpIfAir | ((units & 0xFFFu) << 12) | ((species & 0x7Fu) << 24);
+}
+inline bool IsSoluteCellOp(uint32_t word) {
+  return (word & kCellOpIfAir) != 0 && (word & 0xFFFu) == 0 && ((word >> 24) & 0x7Fu) != 0;
+}
 
 // ---- the voxel word ----
 // bits 0..11 material, 12..15 state, 16..18 tick-stamp, 19..23 excite scratch,
@@ -1873,6 +1900,14 @@ constexpr uint32_t kSolMFaultTick = 10;  // first fault: tick
 constexpr uint32_t kSolMPoured = 11;     // units added by solute cell ops (pours)
 constexpr uint32_t kSolMScooped = 12;    // units removed by scoop clears, monotonic
 constexpr uint32_t kSolMSeamRefused = 13; // MPM excites refused: the cell carried solute
+// Units a solute POUR op (CellOpSolute) found no solvent for and laid down as
+// its powder instead (sim_mutate.wgsl solPour), monotonic. kSolMPoured counts
+// the units that went into solution; the two together are every unit poured.
+constexpr uint32_t kSolMPourPowder = 14;
+// Units a pour op could put NOWHERE (no solvent, and no air cell within reach
+// to precipitate into -- a pour aimed into solid rock), monotonic. Lost and
+// counted; a gate asserts it stays 0.
+constexpr uint32_t kSolMPourLost = 15;
 // THE SOLUTE SCOOP LEDGER (docs/PLAN_alchemy_chemistry.md contract 2.5): units
 // of each species a vessel's conditional clears took out of the world, one
 // monotonic word per species 1..kSolScoopSpecies at [20 .. 20 + N), written by

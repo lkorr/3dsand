@@ -177,6 +177,7 @@ PIPE_TO_MEMBER = {
     "PIPE_SOL_DIFFUSE": "solDiffuse_",
     "PIPE_SOL_COMPACT": "solCompact_",
     "PIPE_SOL_SCOOP": "solScoop_",
+    "PIPE_SOL_POUR": "solPour_",
     "PIPE_SOL_HASH": "solHash_",
     "PIPE_SOL_EVICT": "solEvict_",
     "PIPE_SOL_RESTORE": "solRestore_",

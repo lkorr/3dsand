@@ -773,6 +773,7 @@ const char* const kOrder[] = {
     "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-spawn", "alchemy-sand-carry",
     // Bench chemistry (package C): CPU-only FlaskSims over the world's tables.
     "alchemy-react", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode",
+    "alchemy-brine-electrolysis",
     // Package E on the bench: every headline recipe through the world's table.
     "chem-bench",
     // World chemistry (docs/PLAN_alchemy_chemistry.md A): each builds its own
@@ -946,6 +947,7 @@ const char* const kOrder[] = {
     // The solute layer (docs/PLAN_solutes.md). Each regenerates worldgen and
     // builds a sealed stone box of its own; nothing after them reads solute.
     "solute", "solute-dilute", "solute-evap", "solute-seam", "solute-electrolysis", "solute-vessel",
+    "solute-pour", "solute-payout",
     "snapshot-latency",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
