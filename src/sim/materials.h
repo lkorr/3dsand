@@ -696,6 +696,25 @@ static_assert(sizeof(ReactionGpu) == 32, "must match common.wgsl Reaction");
 
 constexpr uint32_t kMaxReactions = 4096;
 
+// ONE AUTHORED SIDE EFFECT OF A REACTION FIRING (reactions.json "effects").
+// `kind` is resolved BY NAME by each consumer's own registry -- the world
+// (explode -> an ExplosionOp at the cell), the alchemy bench (explode -> eject
+// the player and blow up both held vessels), a body -- so a new kind is a JSON
+// edit plus a handler, never an enum plus a JSON edit plus a handler
+// (guideline 4). A consumer that does not know a kind ignores it; the loader
+// warns once about a kind no consumer registered (materials.cpp
+// kKnownEffectKinds). docs/PLAN_alchemy_chemistry.md "Reaction effects".
+struct ReactionEffect {
+  std::string kind;     // "explode", "flash", "shock", "eject", ...
+  int32_t radius = 0;   // voxels (explode: <= kMaxExplosionRadius)
+  int32_t power = 0;    // explode: hardness budget at the centre (ExplosionOp::power)
+  float amount = 0;     // generic magnitude for kinds that want one
+  std::string what;     // generic name argument (a material, a sound, a status)
+};
+struct RuleFx {
+  std::vector<ReactionEffect> effects;
+};
+
 struct MaterialDef {
   std::string name;
   MaterialGpu gpu{};
@@ -921,6 +940,17 @@ struct MaterialDef {
     auto it = sounds.find(slot);
     return it == sounds.end() ? kNone : it->second;
   }
+  // ---- WHAT A RULE DOES BESIDES REWRITING CELLS (2026-09-27) ---------------
+  //
+  // reactions.json `"effects": [ {"kind": "explode", "radius": 4, "power": 60},
+  // ... ]` on any rule. Parallel to THIS material's bucket: ruleFx[k] belongs
+  // to the rule at reactOffset + k. Empty (the common case) = no rule of this
+  // material has effects; a shorter vector than reactCount means the rules
+  // past its end have none. CPU-side and unhashed here -- whichever consumer
+  // acts on an effect (the world's reaction-effect pass, the alchemy bench's
+  // event registry, a body's inbound pass) is responsible for its own
+  // determinism. docs/PLAN_alchemy_chemistry.md "Reaction effects".
+  std::vector<RuleFx> ruleFx;
 };
 
 // Loads materials.json + reactions.json and compiles them into GPU tables:

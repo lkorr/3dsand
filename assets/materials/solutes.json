@@ -1,0 +1,38 @@
+{
+  "comment": "DISSOLVED SUBSTANCES (src/sim/solutes.h, docs/PLAN_solutes.md, docs/PLAN_alchemy_chemistry.md). A powder named in `from` dissolves into any liquid in `solvents` at `dissolveChance` per-mille per tick per contact, becoming MASS in that liquid (`yieldPerVoxel` units per voxel; a full cell holds 0..255 units = its concentration). Up to `saturation` concentration; past it the powder stays powder. Mass spreads through the liquid by pair exchange at `diffusivity`/256 and is DISCARDED below `floor` (the dilution floor -- a pinch in a lake disperses and is gone). `densityPerUnit` makes the liquid heavier with concentration (brine sinks under fresh water). `tint`/`tintStrength`/`glow` shift how the liquid looks at saturation. `precipitatesTo` is what a solvent leaves when it evaporates or boils off. `converts`: once a solvent cell reaches `cMin`, it BECOMES `into` and its solute mass is spent in it (fairy dust concentrated in water is enchanted water). The world's solute layer and the alchemy bench (and a vessel's dissolved portions) read this same table; one eighth of a dissolved portion = yieldPerVoxel/8 units of world mass.",
+  "species": [
+    {
+      "name": "salt",
+      "from": "salt",
+      "yieldPerVoxel": 256,
+      "saturation": 90,
+      "dissolveChance": 40,
+      "diffusivity": 12,
+      "floor": 1,
+      "densityPerUnit": 50,
+      "tint": "#cfe3ee",
+      "tintStrength": 40,
+      "precipitatesTo": "salt",
+      "solvents": ["water", "blood", "enchanted_water", "enchanted_blood", "lye"]
+    },
+    {
+      "name": "fairy",
+      "from": "fairy_dust",
+      "yieldPerVoxel": 256,
+      "saturation": 255,
+      "dissolveChance": 80,
+      "diffusivity": 24,
+      "floor": 2,
+      "densityPerUnit": 0,
+      "tint": "#c79cff",
+      "tintStrength": 120,
+      "glow": 70,
+      "precipitatesTo": "fairy_dust",
+      "solvents": ["water", "blood"],
+      "converts": [
+        { "solvent": "water", "into": "enchanted_water", "cMin": 48 },
+        { "solvent": "blood", "into": "enchanted_blood", "cMin": 48 }
+      ]
+    }
+  ]
+}

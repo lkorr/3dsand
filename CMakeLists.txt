@@ -472,6 +472,7 @@ add_library(sandvox_core OBJECT
   src/sim/simulation.cpp
   src/sim/pass_table.cpp
   src/sim/materials.cpp
+  src/sim/solutes.cpp
   src/sim/tuning.cpp
   src/sim/celestial.cpp
   # Wind primitives: fans / spell gusts / vortices as op-stream parametric

@@ -14,6 +14,18 @@ namespace alchemy {
 
 constexpr int kMaxSubstances = 16;
 
+// DISSOLVED MATTER (docs/PLAN_alchemy_chemistry.md contract 2.4). A portion
+// whose `mat` carries this bit is powder DISSOLVED in the vessel's liquid:
+// `mat & kMatIdMask` is the powder (salt, fairy dust), `eighths` how much of
+// it, in eighths of a voxel. It has no layer of its own -- it rides the
+// solvent portions -- and conservation counts it as its powder. One
+// dissolved eighth is SoluteDef::yieldPerVoxel / 8 units of world solute
+// mass (sim/solutes.h). Material ids are 12-bit, so the bit is free.
+constexpr uint16_t kDissolvedBit = 0x8000;
+constexpr uint16_t kMatIdMask = 0x0FFF;
+inline bool IsDissolved(uint16_t mat) { return (mat & kDissolvedBit) != 0; }
+inline uint16_t BaseMat(uint16_t mat) { return (uint16_t)(mat & kMatIdMask); }
+
 struct Portion {
   uint16_t mat = 0;
   uint32_t eighths = 0;

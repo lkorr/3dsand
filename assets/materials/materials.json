@@ -3431,6 +3431,210 @@
         "dissolvable"
       ],
       "molten": "fire"
+    },
+    {
+      "//": "ALCHEMY CHEMISTRY (2026-09-27, docs/PLAN_alchemy_chemistry.md). Table salt. Dissolves into water as the `salt` solute (assets/materials/solutes.json) rather than turning it into another material; melts to molten_salt over heat, which is what electrolysis wants.",
+      "id": "salt",
+      "arcane": 4,
+      "far": "snow",
+      "class": "powder",
+      "repose": 34,
+      "density": 2170,
+      "hardness": 10,
+      "colors": [
+        "#d9dcdc",
+        "#c9cdce",
+        "#e6e8e8"
+      ],
+      "tags": [
+        "mineral",
+        "salt",
+        "dissolvable"
+      ],
+      "molten": "molten_salt"
+    },
+    {
+      "//": "Salt above 801 C. Real molten NaCl is ~1.55 g/cm3 and glows orange-white; electrolysed (tag:electric) it splits into sodium and chlorine -- the Downs cell, the one real way sodium is made.",
+      "id": "molten_salt",
+      "class": "liquid",
+      "density": 1550,
+      "hardness": 6,
+      "emission": 210,
+      "opaque": true,
+      "far": "molten_glass",
+      "colors": [
+        "#ffc87a",
+        "#ffb45a",
+        "#ffdc9c"
+      ],
+      "tags": [
+        "hot",
+        "salt"
+      ]
+    },
+    {
+      "//": "Metallic sodium. Soft, silvery and LIGHTER THAN WATER (0.97), so a lump floats on the water it is reacting with -- which is why it skates and bursts rather than sinking. Reacts violently with water (reactions.json: explode effect).",
+      "id": "sodium",
+      "arcane": 12,
+      "far": "steel",
+      "class": "powder",
+      "repose": 40,
+      "density": 970,
+      "hardness": 8,
+      "colors": [
+        "#b9bec4",
+        "#a6abb2",
+        "#cfd3d8"
+      ],
+      "tags": [
+        "metal",
+        "alkali"
+      ]
+    },
+    {
+      "//": "Chlorine gas. Yellow-green and toxic: eats the skin it touches (reactions.json, the mob inbound pass). Real chlorine is 2.5x denser than air and pools in low ground.",
+      "id": "chlorine",
+      "far": "smoke",
+      "class": "gas",
+      "density": 6,
+      "opacity": 95,
+      "colors": [
+        "#9fb82a",
+        "#8aa320",
+        "#b4cc3c"
+      ],
+      "tags": [
+        "toxic",
+        "gas_heavy"
+      ]
+    },
+    {
+      "//": "What acid gives off while it dissolves something: a dark green, choking fume. Rises and fades like smoke; mildly toxic.",
+      "id": "noxious_gas",
+      "far": "smoke",
+      "class": "gas",
+      "density": 3,
+      "opacity": 85,
+      "colors": [
+        "#243c14",
+        "#1b300f",
+        "#2e4a1a"
+      ],
+      "tags": [
+        "toxic"
+      ]
+    },
+    {
+      "//": "Hydrogen: sodium+water and brine electrolysis give it off. Nearly invisible, the lightest gas, and it goes off with a bang near a flame.",
+      "id": "hydrogen",
+      "far": "steam",
+      "class": "gas",
+      "density": 1,
+      "opacity": 8,
+      "colors": [
+        "#e4ebf5",
+        "#dbe3ee",
+        "#eef3fa"
+      ],
+      "tags": [
+        "explosive"
+      ]
+    },
+    {
+      "//": "Lye (sodium hydroxide in water): what is left in the water after sodium burns in it. Caustic, slippery, clear with a faint blue.",
+      "id": "lye",
+      "class": "liquid",
+      "density": 1100,
+      "hardness": 4,
+      "opacity": 40,
+      "far": "water",
+      "colors": [
+        "#a9c6d6",
+        "#9dbccd",
+        "#b8d2e0"
+      ],
+      "tags": [
+        "caustic",
+        "wet"
+      ]
+    },
+    {
+      "//": "Fairy dust. Glittering, light, faintly glowing. Dissolves into water and blood as the `fairy` solute; concentrated enough, the liquid becomes enchanted (enchanted_water / enchanted_blood).",
+      "id": "fairy_dust",
+      "arcane": 60,
+      "far": "crystal",
+      "class": "powder",
+      "repose": 28,
+      "density": 700,
+      "hardness": 4,
+      "emission": 150,
+      "colors": [
+        "#f0a8f4",
+        "#c890ff",
+        "#ffd6a0"
+      ],
+      "tags": [
+        "magic",
+        "dissolvable"
+      ]
+    },
+    {
+      "//": "Water saturated with dissolved fairy dust. Glows softly; a gentle restorative.",
+      "id": "enchanted_water",
+      "arcane": 30,
+      "class": "liquid",
+      "density": 1000,
+      "hardness": 4,
+      "emission": 70,
+      "opacity": 55,
+      "far": "water",
+      "colors": [
+        "#7fd8f0",
+        "#9ab8ff",
+        "#b8f0ff"
+      ],
+      "tags": [
+        "wet",
+        "magic"
+      ]
+    },
+    {
+      "//": "Blood saturated with dissolved fairy dust. Laid on a wound it heals it and regrows what was lost.",
+      "id": "enchanted_blood",
+      "arcane": 45,
+      "class": "liquid",
+      "density": 1060,
+      "hardness": 4,
+      "moveEvery": 2,
+      "emission": 80,
+      "opacity": 190,
+      "far": "blood",
+      "colors": [
+        "#8a1250",
+        "#6e0c40",
+        "#a8206a"
+      ],
+      "tags": [
+        "organic",
+        "magic"
+      ]
+    },
+    {
+      "//": "An electric discharge: a transient, brilliant gas that lives a tick or two (reactions.json decay). The bench's electrify button makes it at a vessel's contents; a lightning spell can make it in the world. tag:electric is what electrolysis rules match.",
+      "id": "spark",
+      "far": "fire",
+      "class": "gas",
+      "density": 1,
+      "emission": 255,
+      "opacity": 120,
+      "colors": [
+        "#cfe6ff",
+        "#a8d0ff",
+        "#ffffff"
+      ],
+      "tags": [
+        "electric"
+      ]
     }
   ]
 }
