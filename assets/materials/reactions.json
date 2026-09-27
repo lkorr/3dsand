@@ -1857,7 +1857,7 @@
       "neighborBecomes": "slime"
     },
     {
-      "note": "-------- GUNPOWDER: saltpeter + charcoal + sulfur --------\nMixing is contact: two powders poured together meet at every grain boundary, and each rule turns BOTH grains into the mix (one-for-one, conserving). Saltpeter + charcoal is black_mix (sulfurless powder: it burns fast and fizzes, no bang); black_mix + sulfur is gunpowder. The mix rules are 120 per-mille, so a stirred flask turns in a second or two and a pile poured on a pile turns only where they touch.\n\nGunpowder + heat: selfBecomes fire and an EXPLODE effect, radius 3 power 90 (a grenade is 13/380). Authored 1000 and scaled by combustion.spreadPct (gunpowder is flammable and the neighbour is hot) to ~290 per-mille a hot face; a drifting flame at half of that (neighborChance -- a flame is how a fuse works). The blast's own aftermath lays fire in the crater, which lights the next grains: a pile goes off as a short string of bangs, bounded by the 4-a-tick cap, the merge radius and the powder itself. A spark lights it through spark's own `tag:flammable` rule. WET POWDER will not fire: water washes the saltpeter out and leaves charcoal."
+      "note": "-------- GUNPOWDER: saltpeter + charcoal + sulfur --------\nMixing is contact: two powders poured together meet at every grain boundary, and each rule turns BOTH grains into the mix (one-for-one, conserving). Saltpeter + charcoal is black_mix (sulfurless powder: it burns fast and fizzes, no bang); black_mix + sulfur is gunpowder. The mix rules are 120 per-mille, so a stirred flask turns in a second or two and a pile poured on a pile turns only where they touch.\n\nGunpowder + heat: selfBecomes fire and an EXPLODE effect, radius 3 power 130 (a grenade is 13/380; stone is hardness 90, and at 90 a bed of 162 grains set off 16 blasts and cut no crater at all). Authored 1000 and scaled by combustion.spreadPct (gunpowder is flammable and the neighbour is hot) to ~290 per-mille a hot face; a drifting flame at half of that (neighborChance -- a flame is how a fuse works). The blast's own aftermath lays fire in the crater, which lights the next grains: a pile goes off as a short string of bangs, bounded by the 4-a-tick cap, the merge radius and the powder itself. A spark lights it through spark's own `tag:flammable` rule. WET POWDER will not fire: water washes the saltpeter out and leaves charcoal."
     },
     {
       "self": "saltpeter",
@@ -1909,7 +1909,7 @@
         {
           "kind": "explode",
           "radius": 3,
-          "power": 90
+          "power": 130
         }
       ]
     },
@@ -2306,13 +2306,17 @@
       "selfBecomes": "air"
     },
     {
-      "note": "-------- PHOSPHORUS: lights itself in air --------\n`phosphorus + air -> fire`: a pair rule whose partner is AIR (an exact nbrMat 0), so a grain with an open face catches on its own (40 authored, ~12 per-mille scaled: a pile in the open smokes for a few seconds and flares) and a grain under water, with no air beside it, NEVER does -- which is exactly why it is stored under water. Each flare flashes (the glare burst). A burning neighbour lights it at the usual rate."
+      "note": "-------- PHOSPHORUS: lights itself in air --------\nA DECAY rule gated on its AIR faces (scaleByNeighbors over `air`: no air face, no chance -- the ramp's count-0 gate), so a grain with an open face catches on its own (40 authored, ~12 per-mille scaled, up to twice that fully exposed: a pile in the open smokes for a few seconds and flares) and a grain under water, with no air beside it, NEVER does -- which is exactly why it is stored under water. Not a pair rule with neighbour `air`: the grid's pair loop skips air faces (sim_step.wgsl), so such a rule only ever fired on the bench. Each flare flashes (the glare burst). A burning neighbour lights it at the usual rate."
     },
     {
       "self": "phosphorus",
-      "neighbor": "air",
+      "decay": true,
       "chance": 40,
-      "selfBecomes": "fire",
+      "becomes": "fire",
+      "scaleByNeighbors": {
+        "neighbor": "air",
+        "scaleMax": 2
+      },
       "effects": [
         {
           "kind": "flash",
@@ -2322,9 +2326,13 @@
     },
     {
       "self": "phosphorus",
-      "neighbor": "air",
+      "decay": true,
       "chance": 10,
-      "selfBecomes": "smoke"
+      "becomes": "smoke",
+      "scaleByNeighbors": {
+        "neighbor": "air",
+        "scaleMax": 2
+      }
     },
     {
       "self": "phosphorus",
@@ -2337,7 +2345,7 @@
       }
     },
     {
-      "note": "-------- SPIRITS and ETHER --------\nSpirits burn readily (400 authored, ~116 scaled; a drifting flame a quarter). Spirits touching acid become ETHER (20; the acid is the catalyst and is not spent -- the spirits are). Ether is the most volatile thing here: every cell with an air face EVAPORATES (25 per-mille) into ether_vapour, which is HEAVY (gas_heavy: it sinks and creeps, sim_step.wgsl stepHeavyGas) and EXPLODES near a flame or a spark (radius 2 power 40 -- a whoomph, not a grenade). A vapour cloud goes off as a chain bounded by the blast cap and the vapour itself; left alone it disperses (5 per-mille)."
+      "note": "-------- SPIRITS and ETHER --------\nSpirits burn readily (400 authored, ~116 scaled; a drifting flame a quarter). Spirits touching acid become ETHER (20; the acid is the catalyst and is not spent -- the spirits are). Ether is the most volatile thing here: every cell with an air face EVAPORATES (25 per-mille, a decay gated and scaled on its air faces -- the phosphorus rule's form) into ether_vapour, which is HEAVY (gas_heavy: it sinks and creeps, sim_step.wgsl stepHeavyGas) and EXPLODES near a flame or a spark (radius 2 power 40 -- a whoomph, not a grenade). A vapour cloud goes off as a chain bounded by the blast cap and the vapour itself; left alone it disperses (5 per-mille)."
     },
     {
       "self": "spirits",
@@ -2367,9 +2375,13 @@
     },
     {
       "self": "ether",
-      "neighbor": "air",
+      "decay": true,
       "chance": 25,
-      "selfBecomes": "ether_vapour"
+      "becomes": "ether_vapour",
+      "scaleByNeighbors": {
+        "neighbor": "air",
+        "scaleMax": 2
+      }
     },
     {
       "self": "ether_vapour",

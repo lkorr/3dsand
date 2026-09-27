@@ -3749,7 +3749,7 @@
       "molten": "fire"
     },
     {
-      "//": "REAL. Gunpowder (black powder): saltpeter + charcoal + sulfur. A spark or a flame and it goes off -- a real ExplosionOp through the explode effect (radius 3, power 90: a third of a grenade, per grain that catches first; a pile is several bangs, the per-tick cap of 4 and the merge radius bound it). Flammable, so a spark's own rule lights it too.",
+      "//": "REAL. Gunpowder (black powder): saltpeter + charcoal + sulfur. A spark or a flame and it goes off -- a real ExplosionOp through the explode effect (radius 3, power 130 -- enough to crack stone, hardness 90 -- per grain that catches first; a pile is several bangs, the per-tick cap of 4 and the merge radius bound it). Flammable, so a spark's own rule lights it too.",
       "id": "gunpowder",
       "arcane": 10,
       "far": "gravel",

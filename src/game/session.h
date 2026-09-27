@@ -822,6 +822,11 @@ struct TickAuthorityCtx {
       IVec3 c{};
       int radius = 0;
       uint32_t tick = 0;  // the tick the blast went off on
+      // 0 = a blast's aftermath (fire in the crater, smoke over it). Nonzero
+      // = a FLASH (reactions.json `"kind": "flash"`, package E): a ball of
+      // this material (the effect's `what`, default `glare`) laid IfAir
+      // round the cell the tick after, and nothing else.
+      uint32_t mat = 0;
     };
     std::vector<Aftermath> aftermath;
     // Telemetry, monotonic; the chem-* gates read these.
@@ -830,6 +835,8 @@ struct TickAuthorityCtx {
     uint64_t blasts = 0;    // ExplosionOps issued
     uint64_t refused = 0;   // explode effects refused (per-tick cap / merged)
     uint64_t aftermathCells = 0;  // fire + smoke cell ops laid
+    uint64_t flashes = 0;         // flash effects issued (package E)
+    uint64_t flashCells = 0;      // flash material cell ops laid
     std::vector<ExplosionOp> recent;  // the last kRecent blasts issued
     static constexpr size_t kRecent = 16;
   } reactFx;
