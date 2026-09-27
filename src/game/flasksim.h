@@ -37,6 +37,7 @@
 // an ELECTRIFY discharge (a virtual spark neighbour), DISSOLVING by
 // solutes.json (per-particle solute mass), a units LEDGER of every conversion
 // and EVENTS for rules with effects (explode, and the pressure pop/burst).
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -181,7 +182,21 @@ struct SimConfig {
   int chemMaxFires = 600;        // rule firings per chemistry step (bounded)
   int gasEvery = 2;              // one gas CA step every this many substeps
   int gasVentSteps = 70;         // gas steps a cloud lingers outside every vessel before it is in the world
-  int gasPixelCap = 400;         // units one gas pixel holds
+  // GAS IS VOLUMINOUS (owner, 2026-09-27: "the volume of liquid to gas
+  // conversion should generally always make more gas"). The gas grid counts
+  // in GAS UNITS, `gasExpand` to one unit of matter: one liquid unit (one
+  // pixel of liquid) becomes gasExpand gas units, and a cloud at rest holds
+  // ONE gas unit a pixel -- so vapour takes gasExpand times the room its
+  // liquid did. Every boundary where gas meets matter converts exactly: into
+  // the grid x gasExpand; out of it (a reaction, the vent, a vessel taken off)
+  // through a per-(vessel, gas) BANK that pays whole matter units and keeps
+  // the remainder (under one matter unit) as live gas -- nothing is rounded
+  // away (AuditUnits).
+  int gasExpand = 8;
+  int gasPixelCap = 3200;        // GAS units one pixel holds
+  // Hops a single-unit wisp of HEAVY vapour takes a gas step inside a vessel
+  // (StepGas): how fast a vapour fills its headspace.
+  int gasWanderHops = 4;
   // THE BURNER. Heat 0..1 rises while it is on and the vessel stands on the
   // table (its base within burnerReach px of tableY), and falls off after.
   float heatRiseSec = 2.5f;
@@ -189,14 +204,15 @@ struct SimConfig {
   float tableY = 0.0f;
   float burnerReach = 18.0f;
   int shockSteps = 36;           // chemistry steps one Electrify lasts (0.6 s)
-  // PRESSURE: mean gas units per free inside pixel of a stoppered vessel at
-  // which the stopper pops -- or, over a lit burner or hot glass (heat > 0.25) or past
-  // passes burstAt, the vessel BURSTS. A gas unit is the matter of a liquid
-  // unit (the ledger counts them alike), so a flask of water boiled wholly to
-  // steam holds ~1 unit per free pixel; real steam would be 1600x the volume.
-  // Hence a pop well under 1: a stoppered flask on the burner goes.
-  float popAt = 0.6f;
-  float burstAt = 3.0f;
+  // PRESSURE, in ATMOSPHERES: gas units per free inside pixel of a stoppered
+  // vessel, x (1 + 3 heat). A cloud at its natural volume holds one gas unit
+  // a pixel (gasExpand above), so a headspace exactly full of vapour at room
+  // temperature is 1 -- a stoppered flask of ether that has filled its
+  // headspace with vapour holds (~1.1). Past popAt the stopper POPS; over a
+  // lit burner or hot glass (heat > 0.25), or past burstAt, the vessel
+  // BURSTS. Heat multiplies it by up to 4, so a full headspace heated goes.
+  float popAt = 3.0f;
+  float burstAt = 24.0f;
 };
 
 // Something the chemistry did that the game must answer (alchemy_bench.h
@@ -256,9 +272,22 @@ class FlaskSim {
   // Electrify: its liquid sees a spark neighbour for cfg.shockSteps steps.
   void Shock(int v);
   bool Shocked(int v) const { return VesselAlive(v) && vessels_[v].shock > 0; }
-  // Gas inside a vessel, units; its pressure (units per free inside pixel).
+  // Gas inside a vessel, in GAS units (SimConfig::gasExpand to a unit of
+  // matter); its pressure (gas units per free inside pixel, x heat: 1 = a
+  // headspace full at the gas's natural volume) and that pressure as a
+  // fraction of where the stopper pops.
   int GasUnits(int v) const;
   float Pressure(int v) const;
+  float PressureFraction(int v) const { return Pressure(v) / std::max(1e-6f, cfg_.popAt); }
+  int GasExpand() const { return GasE(); }
+  // For gates: inside pixels of vessel v holding gas, and inside pixels that
+  // are AIR (no glass, grain, gas or liquid) -- what a surface can evaporate into.
+  int GasPixelsIn(int v) const;
+  int AirPixelsIn(int v) const;
+  // For gates: evaporations (a particle decaying into a gas by a rule scaled
+  // by its AIR neighbours) and how many of them had liquid right above them.
+  int Evaporations() const { return evapFires_; }
+  int BuriedEvaporations() const { return evapBuried_; }
   // A vessel whose glass broke (a burst): gone, its contents loose.
   bool Broken(int v) const { return v >= 0 && v < (int)vessels_.size() && vessels_[v].broken; }
   // Breaks a vessel's glass now (a rule-authored "burst" effect).
@@ -442,7 +471,18 @@ class FlaskSim {
   void Deposit(int sub, uint32_t q, V2 at, int hv);
   // `within`: -2 = anywhere; else the vessel whose inside the gas must stay
   // in (-1 = outside every vessel). A product never lands across the glass.
-  bool AddGasAt(int sub, uint32_t& q, int x, int y, int within = -2);
+  // `reach`: how far (Chebyshev px) it looks for room round (x, y).
+  bool AddGasAt(int sub, uint32_t& q, int x, int y, int within = -2, int reach = 3);
+  // THE GAS BANK (SimConfig::gasExpand). Gas units leaving the grid for a
+  // form counted in matter units go in here, per (bin, gas slot) -- bin 0 =
+  // outside every vessel, v + 1 = vessel v -- and come out as the WHOLE
+  // matter units they make; the remainder (< gasExpand) stays banked, live
+  // gas of that slot in that bin (Count, AuditUnits, RemoveVessel read it).
+  uint32_t BankGas(int bin, int slot, uint32_t gasUnits);
+  int GasBin(int hv) const { return hv >= 0 && hv < (int)vessels_.size() ? hv + 1 : 0; }
+  int GasE() const { return std::max(1, cfg_.gasExpand); }
+  // An entity's matter in GAS units (a particle or grain x gasExpand).
+  int64_t FineOf(uint8_t type, int idx) const;
   void ReleaseSolute(int i, int hv);
   void AddPool(int vessel, int sub, uint32_t q, V2 at);
   void FlushPools();
@@ -601,7 +641,9 @@ class FlaskSim {
   std::vector<uint8_t> gasAge_;
   std::vector<int> gasList_;            // pixels holding gas (may hold stale zeros)
   std::vector<uint8_t> gasListed_;
-  std::vector<Pool> pools_;             // units waiting to become a particle / grain / gas
+  std::vector<Pool> pools_;             // units waiting to become a particle / grain (matter units) / gas (GAS units)
+  std::vector<uint32_t> gasBank_;       // (vessels + 1) x slots, gas units (BankGas)
+  int evapFires_ = 0, evapBuried_ = 0;
   std::vector<int> chemHead_, chemNext_, chemTouched_;   // particles by pixel
   std::vector<uint8_t> present_, activeSlot_;
   std::vector<uint8_t> grainDead_;      // grains a chemistry step removed (compacted at its end)

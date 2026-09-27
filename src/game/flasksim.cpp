@@ -188,6 +188,7 @@ void FlaskSim::SetSubstances(const std::vector<Substance>& subs) {
   }
   produced_.assign(subs.size(), 0);
   consumed_.assign(subs.size(), 0);
+  gasBank_.assign((vessels_.size() + 1) * subs.size(), 0);
   seeded_.assign(subs.size(), 0);
   removed_.assign(subs.size(), 0);
   drained_.assign(subs.size(), 0);
@@ -293,6 +294,7 @@ int FlaskSim::AddVessel(const VesselShape& shape, const Xform& x, const Composit
   v.stoppered = stoppered;
   BuildOutline(v);
   vessels_.push_back(std::move(v));
+  gasBank_.resize((vessels_.size() + 1) * subs_.size(), 0);
   RebuildWalls();
   const int vi = (int)vessels_.size() - 1;
   wakeAll_ = true;
@@ -351,16 +353,22 @@ void FlaskSim::AdoptSettled(int vi, const FlaskSim& from) {
     pmass_.push_back(from.pmass_[i]);
   }
   // The gas it settled with: the same table, the same pose, pixel for pixel.
+  // (GAS units both sides; what cannot sit on its pixel -- another gas is
+  // there -- goes in beside it, inside the new vessel, or waits in its pool.)
   for (int k : from.gasList_) {
     if (!from.gasAmt_[k]) continue;
-    if (gasAmt_[k] && gasSub_[k] != from.gasSub_[k]) {
-      spilledUnits_[from.gasSub_[k]] += from.gasAmt_[k];   // never on a table this empty
-      continue;
+    uint32_t q = from.gasAmt_[k];
+    const int within = from.inside_[k] == 1 ? vi : -2;
+    if (!AddGasAt(from.gasSub_[k], q, k % cfg_.gridW, k / cfg_.gridW, within, 10))
+      AddPool(within >= 0 ? vi : -1, from.gasSub_[k], q, {(k % cfg_.gridW) + 0.5f, (k / cfg_.gridW) + 0.5f});
+  }
+  // ...and its bank: the scratch's vessel 0 is this vessel, its outside ours.
+  {
+    const size_t S = subs_.size();
+    for (size_t s = 0; s < S && s < from.subs_.size(); s++) {
+      if (from.gasBank_.size() >= S) gasBank_[s] += from.gasBank_[s];
+      if (from.gasBank_.size() >= 2 * S) gasBank_[((size_t)vi + 1) * S + s] += from.gasBank_[S + s];
     }
-    gasSub_[k] = from.gasSub_[k];
-    gasAmt_[k] = (uint16_t)std::min<uint32_t>(65535u, (uint32_t)gasAmt_[k] + from.gasAmt_[k]);
-    gasAge_[k] = 0;
-    AddGasPixel(k);
   }
   for (const Pool& p0 : from.pools_) {
     Pool p = p0;
@@ -2011,24 +2019,41 @@ Composition FlaskSim::RemoveVessel(int vi) {
   px_.resize(w); pv_.resize(w); pprev_.resize(w); psub_.resize(w); pw_.resize(w); mbar_.resize(w);
   calm_.resize(w); phome_.resize(w); pvar_.resize(w); panc_.resize(w); pheat_.resize(w);
   psol_.resize(w); pmass_.resize(w);
-  // Its gas: a STOPPERED vessel takes it with it; an open one lets it go
-  // (into the spill, which the bench streams out at the lip).
+  // Its gas, in GAS units: the grid inside it, its gas pools and its bank.
+  // A STOPPERED vessel takes it with it (whole units of matter; the part of
+  // a unit left over stays on the table, banked outside, so the count is
+  // exact); an open one lets it go (into the spill, which the bench streams
+  // out at the lip).
+  std::vector<uint64_t> gasF(S, 0);
   for (int k : gasList_) {
     if (!gasAmt_[k] || inside_[k] != (uint8_t)(vi + 1)) continue;
-    if (v.stoppered) units[gasSub_[k]] += gasAmt_[k];
-    else {
-      spilledUnits_[gasSub_[k]] += gasAmt_[k];
-      NoteExit((float)(k % cfg_.gridW) + 0.5f, gasAmt_[k]);
-    }
+    gasF[gasSub_[k]] += gasAmt_[k];
+    if (!v.stoppered) NoteExit((float)(k % cfg_.gridW) + 0.5f, gasAmt_[k]);
     gasAmt_[k] = 0;
     gasSub_[k] = 0xFF;
   }
-  // ...and whatever was waiting in it to become a particle or a grain.
+  // ...and whatever was waiting in it to become a particle, a grain or gas.
   for (Pool& p : pools_)
     if (p.vessel == vi && p.units) {
-      units[p.sub] += p.units;
+      if (subs_[p.sub].gas) gasF[p.sub] += p.units;
+      else units[p.sub] += p.units;
       p.units = 0;
     }
+  if (gasBank_.size() >= ((size_t)vi + 2) * S)
+    for (size_t s = 0; s < S; s++) {
+      gasF[s] += gasBank_[((size_t)vi + 1) * S + s];
+      gasBank_[((size_t)vi + 1) * S + s] = 0;
+    }
+  for (size_t s = 0; s < S; s++) {
+    if (!gasF[s]) continue;
+    if (v.stoppered) {
+      const uint64_t E = (uint64_t)GasE();
+      units[s] += gasF[s] / E;
+      gasBank_[s] += (uint32_t)(gasF[s] % E);
+    } else {
+      spilledUnits_[s] += BankGas(0, (int)s, (uint32_t)gasF[s]);
+    }
+  }
   // ...and so do the grains.
   const int W = cfg_.gridW;
   size_t gw = 0;
@@ -2105,6 +2130,12 @@ Tally FlaskSim::Count() const {
     if (vi < 0 || vi >= (int)vessels_.size() || vessels_[vi].outline.empty()) vi = (int)B - 1;
     units[(size_t)vi * S + g.sub] += 1;
   }
+  // Everything above is in matter units; from here the count is in GAS
+  // units (SimConfig::gasExpand to one), so the gas -- the grid, gas pools,
+  // and the bank's parts of a unit -- counts exactly where it is.
+  const uint64_t E = (uint64_t)GasE();
+  for (uint64_t& u : units) u *= E;
+  for (uint64_t& u : dis) u *= E;
   // Gas by the inside mask; a cloud over the table is not in any vessel.
   for (int k : gasList_) {
     if (!gasAmt_[k]) continue;
@@ -2116,20 +2147,26 @@ Tally FlaskSim::Count() const {
     if (!p.units) continue;
     const int vi = p.vessel >= 0 && p.vessel < (int)vessels_.size() && !vessels_[p.vessel].outline.empty()
                        ? p.vessel : (int)B - 1;
-    units[(size_t)vi * S + p.sub] += p.units;
+    units[(size_t)vi * S + p.sub] += subs_[p.sub].gas ? p.units : p.units * E;
   }
-  for (size_t s = 0; s < S; s++) units[(B - 1) * S + s] += spilledUnits_[s];
+  for (size_t b = 0; b < gasBank_.size(); b++) {
+    if (!gasBank_[b]) continue;
+    const int v = (int)(b / S) - 1;   // bank bin 0 = outside
+    const size_t bin = v >= 0 && v < (int)vessels_.size() && !vessels_[v].outline.empty() ? (size_t)v : B - 1;
+    units[bin * S + b % S] += gasBank_[b];
+  }
+  for (size_t s = 0; s < S; s++) units[(B - 1) * S + s] += (uint64_t)spilledUnits_[s] * E;
 
   // Units -> eighths, per substance, by largest remainder: the bins' eighths
   // sum to exactly the substance's total, which is a whole number of eighths
   // because it went in as one.
   Tally t;
   t.vessel.resize(vessels_.size());
-  const uint64_t upe = (uint64_t)cfg_.unitsPerEighth;
+  const uint64_t upe = (uint64_t)cfg_.unitsPerEighth * E;
   for (size_t s = 0; s < S; s++) {
     uint64_t total = 0;
     for (size_t b = 0; b < B; b++) total += units[b * S + s] + dis[b * S + s];
-    t.totalUnits += (uint32_t)total;
+    t.totalUnits += (uint32_t)(total / E);
     if (!total) continue;
     uint64_t eighths = (total + upe / 2) / upe;
     // Bins x forms: [0, B) undissolved, [B, 2B) dissolved.

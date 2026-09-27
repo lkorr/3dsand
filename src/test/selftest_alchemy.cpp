@@ -567,48 +567,250 @@ Status GateAlchemyReact(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
-// NOTHING VANISHES INSIDE GLASS (owner report 2026-09-27: blood and ether
-// disappeared from open flasks at the bench). The world's `blood -> air`
-// (a pool drying) and `ether_vapour -> air` (a vapour dispersing) must not
-// fire inside a vessel: matter leaves a flask only through its mouth. An open
-// flask of blood and an open flask of ether left on the bench for 20 s: the
-// blood is all still there, and the ether is all still there as ether or
-// ether vapour (in the flask, spilled, or vented through the mouth), with the
-// units audit exact and the ledger validating.
+// WHAT TURNS TO AIR INSIDE GLASS (owner, 2026-09-27: "matter + air = deletes
+// should still take place except for things that are purposefully to 'dry
+// them up' like blood ... [and] should NOT occur if the stopper is on").
+// (1) An open flask of blood for 20 s: all of it is still there -- blood's
+// `blood -> air` is a DRYING rule (reactions.json "drying"), which never fires
+// inside a vessel. (2) An open flask of noxious gas: it vents and/or fades --
+// a decay to air still fires in an open vessel. (3) The same gas stoppered:
+// none of it fades. Every run: the units audit exact, the ledger validating.
 Status GateAlchemyKeeps(Ctx& c, std::string& detail) {
   ChemBench b = MakeChemBench(c);
-  const int blood = SlotOfName(b, c, "blood"), ether = SlotOfName(b, c, "ether"),
-            vap = SlotOfName(b, c, "ether_vapour");
-  if (blood < 0 || ether < 0 || vap < 0) { detail = "missing blood/ether/ether_vapour"; return Status::Fail; }
-  auto run = [&](int slot, uint32_t amount, uint32_t& kept, std::string& why) {
+  const int blood = SlotOfName(b, c, "blood"), nox = SlotOfName(b, c, "noxious_gas");
+  if (blood < 0 || nox < 0) { detail = "missing blood/noxious_gas"; return Status::Fail; }
+  bool drying = false, noxFades = false;
+  for (const alchemy::ChemRule& r : b.chem.rules[blood]) drying |= r.drying && r.prodSelf == alchemy::kChemAir;
+  for (const alchemy::ChemRule& r : b.chem.rules[nox])
+    noxFades |= r.kind == alchemy::kChemDecay && r.prodSelf == alchemy::kChemAir;
+  struct Run { uint32_t inVessel = 0, out = 0; int64_t faded = 0; bool ok = false; std::string why; };
+  auto run = [&](int slot, uint32_t amount, bool stoppered, int secs) {
+    Run o;
     Composition in;
     in.Add(b.subs[slot].mat, amount);
     alchemy::FlaskSim s(ChemConfig());
     s.SetSubstances(b.subs);
     s.SetChemistry(b.chem);
-    const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in);
+    const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in, stoppered);
     Composition drained;
-    for (int f = 0; f < 60 * 20; f++) {
+    for (int f = 0; f < 60 * secs; f++) {
       s.Step(4);
       Drain(s, drained);
     }
     const alchemy::Tally t = s.Count();
-    kept = 0;
-    for (int m : {b.subs[slot].mat, b.subs[vap].mat})
-      kept += t.vessel[v].AmountOf((uint16_t)m) + t.spilled.AmountOf((uint16_t)m) + drained.AmountOf((uint16_t)m);
+    const uint16_t m = b.subs[slot].mat;
+    o.inVessel = t.vessel[v].AmountOf(m);
+    o.out = t.spilled.AmountOf(m) + drained.AmountOf(m);
+    o.faded = s.Consumed()[slot];
     std::string a, l;
     const bool audit = s.AuditUnits(&a), ledger = BenchLedgerHolds(c, s, in, v, drained, l);
-    why = std::string(audit ? "" : " audit: " + a) + (ledger ? "" : " ledger: " + l);
-    return audit && ledger;
+    o.why = std::string(audit ? "" : " audit: " + a) + (ledger ? "" : " ledger: " + l);
+    o.ok = audit && ledger;
+    return o;
   };
-  uint32_t keptBlood = 0, keptEther = 0;
-  std::string wb, we;
-  const bool okB = run(blood, 200, keptBlood, wb), okE = run(ether, 200, keptEther, we);
-  // One eighth of slack each for the tally's largest-remainder rounding.
-  const bool ok = okB && okE && keptBlood + 1 >= 200 && keptEther + 1 >= 200;
-  detail = Format("open flask 20 s: blood 200 -> %u eighths%s; ether 200 -> %u eighths as ether + vapour%s",
-                  keptBlood, wb.c_str(), keptEther, we.c_str());
+  const Run rb = run(blood, 200, false, 20), rn = run(nox, 40, false, 20), rs = run(nox, 40, true, 10);
+  // One eighth of slack for the tally's largest-remainder rounding.
+  const bool bloodKept = rb.inVessel + rb.out + 1 >= 200 && rb.faded == 0;
+  const bool noxGone = rn.inVessel * 4 <= 40 && (rn.faded > 0 || rn.out > 0);
+  const bool sealedKept = rs.inVessel + 1 >= 40 && rs.faded == 0;
+  const bool ok = rb.ok && rn.ok && rs.ok && drying && bloodKept && noxGone && sealedKept && noxFades;
+  detail = Format("blood rule %s; open flask 20 s: blood 200 -> %u eighths in it (+%u out, %lld units dried)%s; "
+                  "noxious gas 40 -> %u in it, %u vented, %lld units faded%s; stoppered 10 s: 40 -> %u in it, "
+                  "%lld units faded%s",
+                  drying ? "is a drying rule" : "NOT MARKED drying", rb.inVessel, rb.out, (long long)rb.faded,
+                  rb.why.c_str(), rn.inVessel, rn.out, (long long)rn.faded, rn.why.c_str(), rs.inVessel,
+                  (long long)rs.faded, rs.why.c_str());
   std::printf("alchemy-keeps: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ETHER EVAPORATES AT AIR, AND ITS VAPOUR FILLS THE BOTTLE (owner,
+// 2026-09-27: "ether SHOULD turn into ether vapor, but it should produce far
+// more vapor, and it also should only do that when touching air; the bottle
+// should be full of both ether and ether vapor, which should fill up and
+// replace all of the air"). Gas is VOLUMINOUS on the bench (SimConfig::
+// gasExpand gas units to a unit of matter, one a pixel at rest).
+// (1) STOPPERED: the vapour fills the headspace, its air goes to ~0, the
+//     evaporation then STOPS (no evaporation over the last 6 s), no pop at
+//     room temperature, the audit exact and the ledger validating. Then the
+//     burner: the heated bottle goes (pop, burst or the vapour's explosion).
+// (2) OPEN: it evaporates -- only at its surface (liquid right above an
+//     evaporating particle at most `alchemy.evaporateMaxBuriedFraction` of
+//     the time) -- and the vapour leaves through the mouth or fades.
+// (3) VOLUME: one eighth of ether, evaporated wholly in a small stoppered
+//     flask, is vapour on at least gasExpand x the pixels it had as liquid.
+Status GateAlchemyEvaporate(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int ether = SlotOfName(b, c, "ether"), vap = SlotOfName(b, c, "ether_vapour");
+  if (ether < 0 || vap < 0) { detail = "missing ether/ether_vapour"; return Status::Fail; }
+  const uint16_t mE = b.subs[ether].mat, mV = b.subs[vap].mat;
+  const alchemy::SimConfig cfg = ChemConfig();
+  const int E = std::max(1, cfg.gasExpand);
+
+  // (1) stoppered
+  Composition in;
+  in.Add(mE, 200);
+  alchemy::FlaskSim s(cfg);
+  s.SetSubstances(b.subs);
+  s.SetChemistry(b.chem);
+  const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in, true);
+  Composition drained;
+  std::string events;
+  const int secs = (int)BaselineNumber("alchemy.evaporateSealedSec", 36.0);
+  int evapAt = 0;
+  float peakP = 0;
+  for (int f = 0; f < 60 * secs; f++) {
+    s.Step(4);
+    Drain(s, drained);
+    peakP = std::max(peakP, s.Pressure(v));
+    for (const alchemy::SimEvent& e : s.TakeEvents()) events += e.kind + " ";
+    if (f == 60 * (secs - 6)) evapAt = s.Evaporations();
+    if (f == 60 * 8) Shot(s, "alchemy_evaporate_8s.bmp");
+  }
+  Shot(s, "alchemy_evaporate.bmp");
+  const alchemy::Tally t1 = s.Count();
+  const int air = s.AirPixelsIn(v), gasPx = s.GasPixelsIn(v), lateEvap = s.Evaporations() - evapAt;
+  const float p1 = s.Pressure(v);
+  std::string why1, lwhy1;
+  const bool audit1 = s.AuditUnits(&why1), ledger1 = BenchLedgerHolds(c, s, in, v, drained, lwhy1);
+  const int maxAir = (int)BaselineNumber("alchemy.evaporateMaxAirPixels", 20);
+  const bool filled = air <= maxAir && gasPx > 0 && t1.vessel[v].AmountOf(mV) > 0;
+  const bool stopped = lateEvap == 0;
+  const bool held = events.empty() && s.Stoppered(v) && p1 < cfg.popAt && drained.Total() == 0;
+  // ...then heated, it goes.
+  std::string hotEvents;
+  for (int f = 0; f < 60 * 10 && hotEvents.empty(); f++) {
+    if (f == 0) s.SetBurner(v, true);
+    s.Step(4);
+    Drain(s, drained);
+    for (const alchemy::SimEvent& e : s.TakeEvents()) hotEvents += e.kind + " ";
+  }
+  const bool goes = hotEvents.find("pop") != std::string::npos || hotEvents.find("burst") != std::string::npos ||
+                    hotEvents.find("explode") != std::string::npos;
+
+  // (2) open
+  alchemy::FlaskSim s2(cfg);
+  s2.SetSubstances(b.subs);
+  s2.SetChemistry(b.chem);
+  const int v2 = s2.AddVessel(BenchFlask(512), {{240, 4}, 0}, in);
+  Composition drained2;
+  for (int f = 0; f < 60 * 20; f++) {
+    s2.Step(4);
+    Drain(s2, drained2);
+  }
+  const alchemy::Tally t2 = s2.Count();
+  const int evap2 = s2.Evaporations(), buried2 = s2.BuriedEvaporations();
+  const int64_t faded2 = s2.Consumed()[vap];
+  const uint32_t vented2 = drained2.AmountOf(mV) + t2.spilled.AmountOf(mV);
+  std::string why2, lwhy2;
+  const bool audit2 = s2.AuditUnits(&why2), ledger2 = BenchLedgerHolds(c, s2, in, v2, drained2, lwhy2);
+  const double maxBuried = BaselineNumber("alchemy.evaporateMaxBuriedFraction", 0.15);
+  const bool surface = evap2 > 0 && buried2 <= maxBuried * evap2;
+  const bool leaves = t2.vessel[v2].AmountOf(mE) < 200 && (faded2 > 0 || vented2 > 0);
+
+  // (3) volume
+  Composition one;
+  one.Add(mE, 1);
+  alchemy::FlaskSim s3(cfg);
+  s3.SetSubstances(b.subs);
+  s3.SetChemistry(b.chem);
+  const int v3 = s3.AddVessel(BenchFlask(16), {{240, 4}, 0}, one, true);
+  for (int f = 0; f < 60 * 12 && s3.ParticleCount() > 0; f++) s3.Step(4);
+  for (int f = 0; f < 60 * 3; f++) s3.Step(4);
+  const int liquidPx = cfg.unitsPerEighth;   // one eighth of liquid covers this many pixels
+  const int vapPx = s3.GasPixelsIn(v3);
+  std::string why3;
+  const bool audit3 = s3.AuditUnits(&why3);
+  const bool voluminous = s3.ParticleCount() == 0 && vapPx >= E * liquidPx;
+
+  RecordObserved("alchemy.evaporateAirPixels", air);
+  RecordObserved("alchemy.evaporatePressure", p1);
+  const bool ok = audit1 && ledger1 && filled && stopped && held && goes && audit2 && ledger2 && surface && leaves &&
+                  audit3 && voluminous;
+  detail = Format("stoppered %d s: ether 200 -> %u + vapour %u eighths, headspace %d vapour px / %d air px, "
+                  "%d evaporations (%d in the last 6 s), pressure %.2f (peak %.2f, pops at %.1f)%s, audit %s, ledger %s; "
+                  "heated: %s; open 20 s: ether -> %u, %d evaporations (%d with liquid above), vapour %lld units "
+                  "faded, %u eighths out of the mouth, audit %s, ledger %s; volume: 1 eighth (%d px of liquid) -> "
+                  "%d px of vapour (E %d)%s",
+                  secs, t1.vessel[v].AmountOf(mE), t1.vessel[v].AmountOf(mV), gasPx, air, s.Evaporations(), lateEvap,
+                  p1, peakP, cfg.popAt, events.empty() ? "" : (" EVENTS: " + events).c_str(),
+                  audit1 ? "exact" : why1.c_str(), ledger1 ? "validates" : lwhy1.c_str(),
+                  hotEvents.empty() ? "NOTHING" : hotEvents.c_str(), t2.vessel[v2].AmountOf(mE), evap2, buried2,
+                  (long long)faded2, vented2, audit2 ? "exact" : why2.c_str(), ledger2 ? "validates" : lwhy2.c_str(),
+                  liquidPx, vapPx, E, audit3 ? "" : (", audit " + why3).c_str());
+  std::printf("alchemy-evaporate: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// A HEAVY VAPOUR STAYS IN A FLASK THAT IS ONLY MOVED (owner, 2026-09-27:
+// "gases that are heavier than air are also falling out of the glass when it
+// gets moved at all, and need to stay in the glass, in the case of ether").
+// An open flask of ether with ether vapour over it, chemistry paused (pure
+// transport: no evaporation, no fading), carried like alchemy-shake -- lifted,
+// swung side to side at 1.5 Hz, set down: it loses ~0 vapour
+// (`alchemy.gasCarryMaxLostUnits` gas units) and the count is exact. Then
+// lifted and tipped past level: the vapour POURS out (at least
+// `alchemy.gasCarryMinPouredFraction` of it within 6 s).
+Status GateAlchemyGasCarry(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int ether = SlotOfName(b, c, "ether"), vap = SlotOfName(b, c, "ether_vapour");
+  if (ether < 0 || vap < 0) { detail = "missing ether/ether_vapour"; return Status::Fail; }
+  if (!b.subs[vap].heavy) { detail = "ether_vapour is not a heavy gas"; return Status::Fail; }
+  const uint16_t mE = b.subs[ether].mat, mV = b.subs[vap].mat;
+  Composition in;
+  in.Add(mE, 60);
+  in.Add(mV, 20);
+  alchemy::FlaskSim s(ChemConfig());
+  s.SetSubstances(b.subs);
+  s.SetChemistry(b.chem);
+  s.PauseChemistry(true);
+  const int v = s.AddVessel(BenchFlask(256), {{240, 4}, 0}, in);
+  const int gas0 = s.GasUnits(v);
+  Composition drained;
+  const int stopAt = 150;
+  for (int f = 0; f < 60 * 4; f++) {
+    const float t = f / 60.0f;
+    const float dx = f < stopAt ? 70.0f * std::sin(6.2832f * 1.5f * t) : 0.0f;
+    const float y = f < 20 ? 4.0f + 1.5f * f : f < stopAt ? 34.0f : 4.0f;
+    s.SetVesselXform(v, {{240 + dx, y}, 0});
+    s.Step(4);
+    Drain(s, drained);
+    if (f == 75) Shot(s, "alchemy_gas_carry.bmp");
+  }
+  const int gas1 = s.GasUnits(v);
+  const alchemy::Tally t1 = s.Count();
+  const uint32_t lostEighths = drained.AmountOf(mV) + t1.spilled.AmountOf(mV);
+  std::string why1;
+  const bool audit1 = s.AuditUnits(&why1);
+  Composition both;
+  both.Add(mE, 60);
+  both.Add(mV, 20);
+  std::string cwhy;
+  alchemy::Tally tc = t1;
+  for (int i = 0; i < drained.n; i++) tc.spilled.Add(drained.p[i].mat, drained.p[i].eighths);
+  const bool cons = Conserved(both, tc, cwhy);
+  const int maxLost = (int)BaselineNumber("alchemy.gasCarryMaxLostUnits", 16);
+  const bool kept = gas0 > 0 && gas0 - gas1 <= maxLost && lostEighths == 0;
+  // Tipped past level.
+  for (int f = 0; f < 60 * 9; f++) {
+    const float a = f < 30 ? 0.0f : std::min(2.8f, (f - 30) / 60.0f);
+    s.SetVesselXform(v, {{240, 200}, a});
+    s.Step(4);
+    Drain(s, drained);
+    if (f == 60 * 5) Shot(s, "alchemy_gas_pour.bmp");
+  }
+  const int gas2 = s.GasUnits(v);
+  std::string why2;
+  const bool audit2 = s.AuditUnits(&why2);
+  const double minPoured = BaselineNumber("alchemy.gasCarryMinPouredFraction", 0.5);
+  const bool pours = gas1 > 0 && (double)(gas1 - gas2) >= minPoured * gas1;
+  RecordObserved("alchemy.gasCarryLostUnits", gas0 - gas1);
+  const bool ok = audit1 && cons && kept && audit2 && pours;
+  detail = Format("carried: vapour %d -> %d gas units inside, %u eighths out; %s, audit %s; tipped past level: "
+                  "%d -> %d gas units inside (%.0f%% poured), audit %s",
+                  gas0, gas1, lostEighths, cons ? "conserved" : cwhy.c_str(), audit1 ? "exact" : why1.c_str(), gas1,
+                  gas2, gas1 > 0 ? 100.0 * (gas1 - gas2) / gas1 : 0.0, audit2 ? "exact" : why2.c_str());
+  std::printf("alchemy-gas-carry: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -1202,6 +1404,8 @@ const std::vector<Gate>& AlchemyGates() {
       // Bench chemistry (package C): the world's rules on the bench.
       {"alchemy-react", "player", {}, false, GateAlchemyReact},
       {"alchemy-keeps", "player", {}, false, GateAlchemyKeeps},
+      {"alchemy-evaporate", "player", {}, false, GateAlchemyEvaporate},
+      {"alchemy-gas-carry", "player", {}, false, GateAlchemyGasCarry},
       {"alchemy-stopper", "player", {}, false, GateAlchemyStopper},
       {"alchemy-dissolve", "player", {}, false, GateAlchemyDissolve},
       {"alchemy-electrolysis", "player", {}, false, GateAlchemyElectrolysis},

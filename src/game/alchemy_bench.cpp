@@ -755,7 +755,7 @@ void AlchemyBench::Run() {
         poses[i].stoppered = sim_.Stoppered(sv);
         poses[i].burner = sim_.Burner(sv);
         poses[i].heat = sim_.Heat(sv);
-        poses[i].pressure = sim_.Stoppered(sv) && (ticks_ % 6) == 0 ? sim_.Pressure(sv) : 0.0f;
+        poses[i].pressure = sim_.Stoppered(sv) && (ticks_ % 6) == 0 ? sim_.PressureFraction(sv) : 0.0f;
       }
     }
     if (held_ >= 0 && held_ < (int)broken.size() && broken[held_]) held_ = -1;

@@ -28,6 +28,12 @@
 // grains, a liquid into a POOL that becomes a particle once it holds a
 // particle's worth -- and until then is counted where it is (Count, the
 // audit). Nothing is ever rounded away.
+//
+// GAS IS VOLUMINOUS (SimConfig::gasExpand, 2026-09-27). The gas grid counts
+// GAS units, gasExpand to a unit of matter, one a pixel at rest: a liquid
+// unit becomes gasExpand pixels of vapour. Matter goes in x gasExpand; gas
+// comes out through BankGas, which pays whole matter units and keeps the
+// remainder as live gas. Pair quanta are measured in gas units (the finest).
 #include <algorithm>
 #include <array>
 #include <climits>
@@ -155,9 +161,10 @@ void FlaskSim::SeedExtras(int vi, const Composition& c) {
     }
     const int sl = SlotOf(mat);
     if (sl < 0 || !subs_[sl].gas) continue;
-    // GAS: into the vessel's free inside pixels, top down, a little at a time
-    // round and round so it starts as a cloud rather than a slab.
-    uint32_t left = c.p[i].eighths * upe;
+    // GAS: into the vessel's free inside pixels, top down, an even share a
+    // pixel round and round so it starts as a cloud rather than a slab -- in
+    // GAS units, gasExpand to a unit of matter (SimConfig::gasExpand).
+    uint32_t left = c.p[i].eighths * upe * (uint32_t)GasE();
     const int W = cfg_.gridW, H = cfg_.gridH;
     float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
     for (V2 o : v.outline) {
@@ -173,11 +180,12 @@ void FlaskSim::SeedExtras(int vi, const Composition& c) {
         px.push_back(k);
       }
     const uint32_t cap = (uint32_t)cfg_.gasPixelCap;
+    const uint32_t share = px.empty() ? 1u : std::max<uint32_t>(1u, left / (uint32_t)px.size());
     for (int pass = 0; left && !px.empty() && pass < 64; pass++)
       for (int k : px) {
         if (!left) break;
         const uint32_t room = cap - std::min<uint32_t>(cap, gasAmt_[k]);
-        const uint32_t put = std::min({left, room, 6u});
+        const uint32_t put = std::min({left, room, share});
         if (!put) continue;
         gasSub_[k] = (uint8_t)sl;
         gasAmt_[k] = (uint16_t)(gasAmt_[k] + put);
@@ -237,6 +245,31 @@ int FlaskSim::GasUnits(int vi) const {
   int n = 0;
   for (int k : gasList_)
     if (gasAmt_[k] && inside_[k] == (uint8_t)(vi + 1)) n += gasAmt_[k];
+  return n;
+}
+
+int FlaskSim::GasPixelsIn(int vi) const {
+  if (!VesselAlive(vi)) return 0;
+  int n = 0;
+  for (int k : gasList_)
+    if (gasAmt_[k] && inside_[k] == (uint8_t)(vi + 1)) n++;
+  return n;
+}
+
+int FlaskSim::AirPixelsIn(int vi) const {
+  if (!VesselAlive(vi)) return 0;
+  const int W = cfg_.gridW;
+  int n = 0;
+  for (size_t k = 0; k < inside_.size(); k++) {
+    if (inside_[k] != (uint8_t)(vi + 1) || wall_[k] || grid_[k] || gasAmt_[k]) continue;
+    const int x = (int)k % W, y = (int)k / W;
+    // Liquid, and the gaps in its packing (a particle's width round each
+    // particle: no gas reaches those, they are not headspace): the
+    // particles' pixel buckets (BucketChem, rebuilt every gas and chemistry
+    // step).
+    if (chemHead_.size() == inside_.size() && NearestParticle(x + 0.5f, y + 0.5f, spacing_) >= 0) continue;
+    n++;
+  }
   return n;
 }
 
@@ -390,6 +423,15 @@ void FlaskSim::ShatterVessel(int vi) {
       p.sy = (double)w.y * p.w;
       p.vessel = -1;
     }
+  // Its banked gas (under a unit of matter a gas) is loose now too.
+  {
+    const size_t S = subs_.size();
+    if (gasBank_.size() >= ((size_t)vi + 2) * S)
+      for (size_t s = 0; s < S; s++) {
+        gasBank_[s] += gasBank_[((size_t)vi + 1) * S + s];
+        gasBank_[((size_t)vi + 1) * S + s] = 0;
+      }
+  }
   v.outline.clear();
   v.broken = true;
   v.stoppered = false;
@@ -413,9 +455,14 @@ int64_t FlaskSim::DissolvedUnits(int slot) const {
   return n;
 }
 
+// Exact in GAS units (SimConfig::gasExpand to a matter unit): every matter
+// count x E, plus the gas grid, gas pools and the bank as they are. A gas
+// unit that left the grid without the bank paying for it -- or a bank that
+// paid a matter unit it did not hold -- is a gap here.
 bool FlaskSim::AuditUnits(std::string* why) const {
   const size_t S = subs_.size();
-  std::vector<int64_t> live(S, 0);
+  const int64_t E = GasE();
+  std::vector<int64_t> live(S, 0), gas(S, 0);
   for (size_t i = 0; i < px_.size(); i++) {
     live[psub_[i]] += pw_[i];
     if (pmass_[i]) {
@@ -425,19 +472,20 @@ bool FlaskSim::AuditUnits(std::string* why) const {
   }
   for (const Grain& g : grains_) live[g.sub] += 1;
   for (int k : gasList_)
-    if (gasAmt_[k]) live[gasSub_[k]] += gasAmt_[k];
-  for (const Pool& p : pools_) live[p.sub] += p.units;
+    if (gasAmt_[k]) gas[gasSub_[k]] += gasAmt_[k];
+  for (const Pool& p : pools_) (subs_[p.sub].gas ? gas : live)[p.sub] += p.units;
+  for (size_t b = 0; b < gasBank_.size(); b++) gas[b % S] += gasBank_[b];
   bool ok = true;
   for (size_t s = 0; s < S; s++) {
-    const int64_t have = live[s] + spilledUnits_[s] + removed_[s] + drained_[s];
-    const int64_t want = seeded_[s] + produced_[s] - consumed_[s];
+    const int64_t have = (live[s] + spilledUnits_[s] + removed_[s] + drained_[s]) * E + gas[s];
+    const int64_t want = (seeded_[s] + produced_[s] - consumed_[s]) * E;
     if (have != want) {
       ok = false;
       if (why) {
-        char b[160];
-        std::snprintf(b, sizeof b, "mat %u: have %lld units (live %lld spill %u off %lld drained %lld), ledger says %lld; ",
-                      (unsigned)subs_[s].mat, (long long)have, (long long)live[s], spilledUnits_[s],
-                      (long long)removed_[s], (long long)drained_[s], (long long)want);
+        char b[200];
+        std::snprintf(b, sizeof b, "mat %u: have %lld/%lld units (live %lld + %lld gas units, spill %u off %lld drained %lld), ledger says %lld; ",
+                      (unsigned)subs_[s].mat, (long long)have, (long long)E, (long long)live[s], (long long)gas[s],
+                      spilledUnits_[s], (long long)removed_[s], (long long)drained_[s], (long long)want / E);
         *why += b;
       }
     }
@@ -484,10 +532,10 @@ void FlaskSim::AddPool(int vessel, int sub, uint32_t q, V2 at) {
   pools_.push_back({vessel, sub, q, (double)at.x * q, (double)at.y * q, (double)q});
 }
 
-bool FlaskSim::AddGasAt(int sub, uint32_t& q, int x, int y, int within) {
+bool FlaskSim::AddGasAt(int sub, uint32_t& q, int x, int y, int within, int reach) {
   const int W = cfg_.gridW, H = cfg_.gridH;
   const uint32_t cap = (uint32_t)cfg_.gasPixelCap;
-  for (int r = 0; r <= 3 && q; r++)
+  for (int r = 0; r <= reach && q; r++)
     for (int dy = -r; dy <= r && q; dy++)
       for (int dx = -r; dx <= r && q; dx++) {
         if (std::max(std::abs(dx), std::abs(dy)) != r) continue;
@@ -515,7 +563,9 @@ void FlaskSim::Deposit(int sub, uint32_t q, V2 at, int hv) {
   const int x = std::clamp((int)std::floor(at.x), 0, cfg_.gridW - 1);
   const int y = std::clamp((int)std::floor(at.y), 0, cfg_.gridH - 1);
   if (S.gas) {
-    if (!AddGasAt(sub, q, x, y, hv)) AddPool(hv, sub, q, at);
+    // Matter units in, GAS units on the grid: it expands.
+    uint32_t g = q * (uint32_t)GasE();
+    if (!AddGasAt(sub, g, x, y, hv)) AddPool(hv, sub, g, at);
     return;
   }
   if (S.powder) {
@@ -599,6 +649,29 @@ void FlaskSim::ReleaseSolute(int i, int hv) {
   Deposit(to, excess, px_[i], hv);
 }
 
+uint32_t FlaskSim::BankGas(int bin, int slot, uint32_t gasUnits) {
+  const size_t S = subs_.size();
+  const size_t need = (vessels_.size() + 1) * S;
+  if (gasBank_.size() < need) gasBank_.resize(need, 0);
+  uint32_t& b = gasBank_[(size_t)bin * S + (size_t)slot];
+  b += gasUnits;
+  const uint32_t E = (uint32_t)GasE();
+  const uint32_t whole = b / E;
+  b -= whole * E;
+  return whole;
+}
+
+int64_t FlaskSim::FineOf(uint8_t type, int idx) const {
+  switch (type) {
+    case NbParticle: return (int64_t)pw_[idx] * GasE();
+    case NbGrain: return GasE();
+    case NbGas: return gasAmt_[idx];
+    default: return INT64_MAX;
+  }
+}
+
+// An entity's amount in ITS OWN units: matter units for a particle or a
+// grain, GAS units for a gas pixel.
 int FlaskSim::UnitsOf(uint8_t type, int idx) const {
   switch (type) {
     case NbParticle: return pw_[idx];
@@ -639,6 +712,22 @@ void FlaskSim::ConvertEnt(uint8_t type, int idx, int q, int to, int hv) {
   else if (type == NbGrain) { from = grains_[idx].sub; at = {grains_[idx].x + 0.5f, grains_[idx].y + 0.5f}; }
   else if (type == NbGas) { from = gasSub_[idx]; at = {(idx % cfg_.gridW) + 0.5f, (idx / cfg_.gridW) + 0.5f}; }
   if (from < 0 || from == to) return;
+  if (type == NbGas) {
+    // `q` is in GAS units. They leave the grid through the bank, which pays
+    // the whole matter units they make (the ledger is in matter units) and
+    // keeps the remainder as live gas of `from` -- so a wisp of one gas unit
+    // that fades is not rounded away, and a pixel that turns into another
+    // gas re-expands exactly the matter the bank paid.
+    q = std::min<int>(q, gasAmt_[idx]);
+    TakeFromEnt(type, idx, q, hv);
+    const uint32_t m = BankGas(GasBin(hv), from, (uint32_t)q);
+    consumed_[from] += m;
+    if (to >= 0 && m) {
+      produced_[to] += m;
+      Deposit(to, m, at, hv);
+    }
+    return;
+  }
   consumed_[from] += q;
   if (to >= 0) produced_[to] += q;
   const bool toLiquid = to >= 0 && !subs_[to].powder && !subs_[to].gas;
@@ -659,10 +748,6 @@ void FlaskSim::ConvertEnt(uint8_t type, int idx, int q, int to, int hv) {
     Wake(g.x, g.y);
     const uint8_t in = inside_[(size_t)g.y * cfg_.gridW + g.x];
     if (in && in <= vessels_.size()) vessels_[in - 1].grainBusy = true;
-    return;
-  }
-  if (type == NbGas && to >= 0 && subs_[to].gas && q >= gasAmt_[idx]) {
-    gasSub_[idx] = (uint8_t)to;
     return;
   }
   TakeFromEnt(type, idx, q, hv);
@@ -734,14 +819,28 @@ void FlaskSim::GatherParticleNbrs(int i, int hv, std::vector<ChemNb>& out) {
         }
       }
     // AIR: a free pixel a particle's width off in one of the four
-    // directions -- no glass, no grain, no gas, no other liquid there.
+    // directions -- no glass, no grain, no GAS (a vapour is not air: a
+    // surface under a headspace full of vapour stops evaporating), no other
+    // liquid there -- and no particle of the list in that direction's 60-degree
+    // cone. The cone is what keeps a particle INSIDE the liquid from seeing
+    // air in a gap of the packing (the probe pixel alone did, and ether
+    // boiled from inside its own bulk).
     static const int kD[4][2] = {{0, 1}, {1, 0}, {-1, 0}, {0, -1}};
+    const size_t nPart = out.size();
     for (auto& d : kD) {
       const float qx = p.x + d[0] * spacing_ * 0.9f, qy = p.y + d[1] * spacing_ * 0.9f;
       const int xx = (int)std::floor(qx), yy = (int)std::floor(qy);
       if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
       const int k = yy * W + xx;
       if (wall_[k] || grid_[k] || gasAmt_[k]) continue;
+      bool covered = false;
+      for (size_t a = 0; a < nPart && !covered; a++) {
+        if (out[a].type != NbParticle) continue;
+        const V2 e = VSub(out[a].at, p);
+        const float along = e.x * d[0] + e.y * d[1];
+        covered = along > 0 && along * along > 0.25f * Dot2(e, e);
+      }
+      if (covered) continue;
       if (NearestParticle(xx + 0.5f, yy + 0.5f, spacing_ * 0.6f) >= 0) continue;
       out.push_back({NbAir, k, -1, DirOf((float)d[0], (float)d[1]), {xx + 0.5f, yy + 0.5f}});
     }
@@ -801,6 +900,12 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
                         V2 at, double scale) {
   const auto& rules = chem_.rules[slot];
   const double den = (double)chem_.chanceDen;
+  const bool inVessel = hv >= 0 && hv < (int)vessels_.size() && !vessels_[hv].outline.empty();
+  const bool sealed = inVessel && vessels_[hv].stoppered;
+  const int64_t E = GasE();
+  // Matter units for a side of a pair that converts `qf` GAS units' worth
+  // (a gas side converts its gas units as they are).
+  auto matterOf = [&](int64_t qf) { return (int)std::max<int64_t>(1, (qf + E - 1) / E); };
   const int nn = (int)nb.size();
   auto matches = [&](const ChemRule& r, const ChemNb& n) {
     switch (n.type) {
@@ -832,33 +937,28 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
       const uint32_t c = ChemConcentration(pmass_[selfIdx], (uint32_t)pw_[selfIdx], sp->yieldPerVoxel);
       if (c < r.soluteMin || c > r.soluteMax) continue;
     }
-    // A GAS FADING TO NOTHING is the world's way of saying it dispersed into
-    // the open air (smoke, steam, noxious fumes all "decay to air"). Inside a
-    // STOPPERED vessel there is nowhere for it to go: that rule does not
-    // fire there -- which is what lets gas build pressure in a sealed flask.
-    // A decay into MATTER (steam condensing to water) still does.
-    if (r.kind == kChemDecay && selfType == NbGas && r.prodSelf == kChemAir && hv >= 0 &&
-        hv < (int)vessels_.size() && vessels_[hv].stoppered)
-      continue;
-    // NOTHING VANISHES INSIDE GLASS (owner report 2026-09-27: "blood is just
-    // disappearing in its flask while I'm in the alchemy menu. Same with
-    // ether"). A decay to AIR in the world is an abstraction of matter
-    // leaving into the open: a pool of blood drying into the ground
-    // (`blood -> air`, 8 per-mille), a vapour dispersing into the sky
-    // (`ether_vapour -> air`). Inside a vessel there is no ground to soak
-    // into and no sky to disperse in -- matter leaves only through the mouth
-    // (venting, pouring, spilling), and once it is out in the world the
-    // world's own rule takes over. So inside a vessel, open or stoppered, a
-    // decay to air does not fire for a liquid or a powder at all, nor for a
-    // gas that decays SLOWLY (a dispersal rule: smoke, chlorine, ether
-    // vapour). A FAST decay (at least a tenth of the chance scale a tick,
-    // a life of a few ticks) is a transient, not matter -- a spark, a glare
-    // -- and still burns out where it is. A decay into matter (ether ->
-    // ether_vapour, steam -> water) is chemistry and still fires, so an open
-    // flask of ether still evaporates -- into vapour that stays in the
-    // bottle until it spills over the lip.
-    if (r.kind == kChemDecay && r.prodSelf == kChemAir && hv >= 0 &&
-        (selfType != NbGas || r.chance * 10u < chem_.chanceDen))
+    // WHAT TURNS TO AIR INSIDE GLASS (owner, 2026-09-27: "matter + air =
+    // deletes should still take place except for things that are purposefully
+    // to 'dry them up' like blood ... [and] should NOT occur if the stopper is
+    // on"). A world rule whose SELF becomes air is the world's abstraction of
+    // matter leaving into the open. Two cases differ in a vessel:
+    //  - A DRYING rule (reactions.json "drying": blood -> air, a pool soaking
+    //    into the ground) never fires on anything inside a vessel, open or
+    //    stoppered: a flask has no ground.
+    //  - A STOPPERED vessel has no open air at all: no decay to air fires in
+    //    it, of any class (smoke, a vapour, an ember) -- which is also what
+    //    lets gas build pressure there. EXCEPT a fast transient (at least a
+    //    tenth of the chance scale a tick, a life of a few ticks: spark,
+    //    glare), which is energy, not matter, and burns out where it is.
+    //    A self that meets AIR and becomes air is the same abstraction: a
+    //    sealed vessel's inside pixels are not open air (the pair scan below
+    //    skips an air neighbour for such a rule).
+    // In an OPEN vessel every other decay to air fires as in the world:
+    // smoke fades, ether vapour disperses. A decay into MATTER (ether ->
+    // ether vapour, steam -> water) is chemistry and fires anywhere; so do
+    // pair rules that spend their self on another substance (acid on sand).
+    if (r.drying && inVessel) continue;
+    if (sealed && r.kind == kChemDecay && r.prodSelf == kChemAir && r.chance * 10u < chem_.chanceDen)
       continue;
     if (r.kind == kChemDecay) {
       uint32_t chance = r.chance;
@@ -870,6 +970,16 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
       }
       if (!chance || Rand01() * den >= chance * scale) continue;
       RaiseEvents(hv, at, subs_[slot].mat, 0, r);
+      // EVAPORATION (a liquid decaying into a gas by a rule scaled by its
+      // AIR neighbours: ether -> ether vapour) must happen at the surface.
+      // Counted, and whether liquid lay right above it, for the gates.
+      if (selfType == NbParticle && r.prodSelf >= 0 && subs_[r.prodSelf].gas && ChemScaleArmed(r.cond) &&
+          r.nbrMat == 0) {
+        evapFires_++;
+        const V2 p = px_[selfIdx];
+        for (int dy = 1; dy <= 2; dy++)
+          if (NearestParticle(p.x, p.y + dy * spacing_ * 0.9f, spacing_ * 0.45f) >= 0) { evapBuried_++; break; }
+      }
       ConvertEnt(selfType, selfIdx, UnitsOf(selfType, selfIdx), r.prodSelf, hv);
       firedThisStep_++;
       firedTotal_++;
@@ -887,7 +997,7 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
       }
       if (hit < 0) continue;
       if (Rand01() * den >= r.chance * scale) continue;
-      const int q = std::min(UnitsOf(selfType, selfIdx), cfg_.unitsPerParticle);
+      const int q = std::min(matterOf(FineOf(selfType, selfIdx)), cfg_.unitsPerParticle);
       if (r.prodNbr >= 0) {
         produced_[r.prodNbr] += q;
         Deposit(r.prodNbr, (uint32_t)q, nb[hit].at, hv);
@@ -903,6 +1013,7 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
     for (int k = 0; k < nn; k++) {
       const ChemNb& n = nb[(k + rot) % nn];
       if ((n.dir & r.dirs) == 0 || !matches(r, n)) continue;
+      if (sealed && n.type == NbAir && r.prodSelf == kChemAir) continue;
       // A pair that would rewrite the neighbour into what it already is and
       // leave self alone is not a match (sim_step.wgsl, the grass-on-soil case).
       if (r.prodSelf == kChemKeep && n.slot >= 0 && r.prodNbr == n.slot) continue;
@@ -915,22 +1026,31 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
     const double factor = n.type == NbHeat ? std::max(0.0f, vessels_[n.idx].heat) : 1.0;
     if (Rand01() * den >= r.chance * scale * factor) continue;
     const bool virt = n.type == NbAir || n.type == NbHeat || n.type == NbSpark;
-    const int uS = UnitsOf(selfType, selfIdx);
-    const int uN = virt ? INT_MAX : UnitsOf(n.type, n.idx);
-    const int q = std::max(1, std::min(uS, uN));
+    // THE QUANTUM: the smaller side, in GAS units (the finest there is), so
+    // a pixel of thin gas meets a particle as the little matter it is. Each
+    // side converts that much in its own units -- a gas pixel exactly, a
+    // particle or grain the whole matter units it takes (at least one).
+    const int64_t fS = FineOf(selfType, selfIdx);
+    const int64_t fN = virt ? INT64_MAX : FineOf(n.type, n.idx);
+    const int64_t qf = std::max<int64_t>(1, std::min(fS, fN));
+    auto sideQ = [&](uint8_t type, int idx) {
+      if (type == NbGas) return (int)std::min<int64_t>(qf, gasAmt_[idx]);
+      return std::min(matterOf(qf), UnitsOf(type, idx));
+    };
     const uint16_t nm = nbMat(n);
     RaiseEvents(hv, at, subs_[slot].mat, nm, r);
     if (r.prodNbr != kChemKeep) {
       if (!virt) {
-        ConvertEnt(n.type, n.idx, q, r.prodNbr, hv);
+        ConvertEnt(n.type, n.idx, sideQ(n.type, n.idx), r.prodNbr, hv);
       } else if (r.prodNbr >= 0) {
         // A virtual neighbour's product is MATERIALISED where it touched
         // (the world's spark voxel becomes chlorine; ours leaves chlorine).
+        const int q = matterOf(qf);
         produced_[r.prodNbr] += q;
         Deposit(r.prodNbr, (uint32_t)q, n.at, hv);
       }
     }
-    if (r.prodSelf != kChemKeep) ConvertEnt(selfType, selfIdx, q, r.prodSelf, hv);
+    if (r.prodSelf != kChemKeep) ConvertEnt(selfType, selfIdx, sideQ(selfType, selfIdx), r.prodSelf, hv);
     firedThisStep_++;
     firedTotal_++;
     return true;
@@ -982,11 +1102,27 @@ void FlaskSim::StepChemistry() {
         can = ChemNbrMatches(r, chem_.spark.mat, chem_.spark.tags, chem_.spark.klass, false);
       for (size_t t = 0; t < subs_.size() && !can; t++)
         can = present_[t] && ChemNbrMatches(r, subs_[t].mat, subs_[t].tagMask, subs_[t].klass, false);
-      if (can) { activeSlot_[s] = 1; break; }
+      if (!can) continue;
+      // Bit 1: it can fire somewhere. Bit 2: it can fire inside a STOPPERED
+      // vessel too -- a slow decay to air or a drying rule cannot (TryRules),
+      // and a flask full of vapour whose only rule is its dispersal need not
+      // gather a neighbour per pixel per step to find that out.
+      // Bit 4: it can fire inside an OPEN vessel (a drying rule cannot).
+      activeSlot_[s] |= 1;
+      if (!r.drying) activeSlot_[s] |= 4;
+      const bool blockedSealed =
+          r.drying || (r.kind == kChemDecay && r.prodSelf == kChemAir && r.chance * 10u < chem_.chanceDen);
+      if (!blockedSealed) { activeSlot_[s] |= 2 | 4; break; }
     }
     anyActive |= activeSlot_[s] != 0;
   }
   const bool anySolute = !chem_.solutes.empty();
+  // Can a rule of slot s fire where vessel hv (-1: none) is? (activeSlot_'s bits.)
+  auto canFire = [&](int s, int hv) {
+    const uint8_t a = activeSlot_[s];
+    if (hv < 0) return a != 0;
+    return (a & (vessels_[hv].stoppered ? 2 : 4)) != 0;
+  };
 
   // PARTICLES: their rules, then what is dissolved in them.
   const int n0 = (int)px_.size();
@@ -997,8 +1133,10 @@ void FlaskSim::StepChemistry() {
     if (!activeSlot_[s] && !sol) continue;
     int hv = phome_[i];
     if (hv >= (int)vessels_.size() || (hv >= 0 && vessels_[hv].outline.empty())) hv = -1;
+    const bool fire = canFire(s, hv);
+    if (!fire && !sol) continue;
     GatherParticleNbrs(i, hv, nbScratch_);
-    if (activeSlot_[s] && TryRules(NbParticle, i, s, nbScratch_, hv, px_[i], scale)) continue;
+    if (fire && TryRules(NbParticle, i, s, nbScratch_, hv, px_[i], scale)) continue;
     if (!sol || !pw_[i]) continue;
     const ChemSolute* sp = chem_.Species(psol_[i]);
     if (!sp) continue;
@@ -1070,7 +1208,7 @@ void FlaskSim::StepChemistry() {
       }
       if (gone) continue;
     }
-    if (activeSlot_[s]) TryRules(NbGrain, gi, s, nbScratch_, hv, {g.x + 0.5f, g.y + 0.5f}, scale);
+    if (canFire(s, hv)) TryRules(NbGrain, gi, s, nbScratch_, hv, {g.x + 0.5f, g.y + 0.5f}, scale);
   }
 
   // GAS: its rules (smoke fades, a spark dies, hydrogen meets the flame).
@@ -1084,6 +1222,7 @@ void FlaskSim::StepChemistry() {
       const int x = k % W, y = k / W;
       int hv = (int)inside_[k] - 1;
       if (hv >= (int)vessels_.size() || (hv >= 0 && vessels_[hv].outline.empty())) hv = -1;
+      if (!canFire(s, hv)) continue;
       GatherPixelNbrs(x, y, hv, true, nbScratch_);
       TryRules(NbGas, k, s, nbScratch_, hv, {x + 0.5f, y + 0.5f}, scale);
     }
@@ -1139,16 +1278,24 @@ void FlaskSim::CompactDead() {
 
 // ---- the gas phase -----------------------------------------------------------
 //
-// A pixel CA of clouds. Each gas pixel holds up to gasPixelCap units of ONE
-// gas. A step, every cloud pixel tries to move along its buoyancy -- up for a
-// gas lighter than air, down for a heavy one (the world's density: chlorine
-// 6 pools, hydrogen 1 races up) -- then diagonally, then sideways, and
-// SPREADS as it goes (half of it moves, half stays), so a puff becomes a
-// cloud that fills the headspace. Glass and a stopper stop it; a grain
-// mostly does; liquid does not (gas under liquid rises through it as
-// bubbles). Outside every vessel it lingers `gasVentSteps` and is then IN THE
-// WORLD: counted as spilled, which the bench streams out at the lip of the
-// flask in the hand.
+// A pixel CA of clouds, in GAS units (SimConfig::gasExpand to a unit of
+// matter). Each gas pixel holds up to gasPixelCap units of ONE gas; a cloud
+// at rest holds ONE unit a pixel, so vapour takes gasExpand times the room
+// its liquid did. A step, every cloud pixel tries to move along its buoyancy
+// -- up for a gas lighter than air, down for a heavy one (the world's
+// density: chlorine and ether vapour pool, hydrogen races up) -- then
+// diagonally, then sideways, then AGAINST its buoyancy, and SPREADS as it
+// goes: a pixel of more than one unit shares half into a free pixel and
+// always keeps one, a single unit wanders. So a gas FILLS what holds it --
+// a heavy vapour pooled on its liquid still climbs to fill a stoppered
+// flask's headspace, denser at the bottom -- and a pixel that has gas is
+// never emptied by the spreading itself: once a sealed headspace holds as
+// many units as it has pixels, its AIR (free pixels) only ever gets fewer.
+// Glass and a stopper stop it; a grain mostly does; liquid does not (gas
+// under liquid rises through it as bubbles, heavy or not). Outside every
+// vessel it lingers `gasVentSteps` and is then IN THE WORLD: through the
+// bank (BankGas) into the spill, which the bench streams out at the lip of
+// the flask in the hand.
 void FlaskSim::StepGas() {
   if (gasList_.empty()) return;
   const int W = cfg_.gridW, H = cfg_.gridH;
@@ -1173,6 +1320,13 @@ void FlaskSim::StepGas() {
   });
   BucketChem();
   const uint32_t cap = (uint32_t)cfg_.gasPixelCap;
+  auto vent = [&](int k, int x) {
+    const int s = gasSub_[k];
+    spilledUnits_[s] += BankGas(0, s, gasAmt_[k]);
+    NoteExit(x + 0.5f, gasAmt_[k]);
+    gasAmt_[k] = 0;
+    gasSub_[k] = 0xFF;
+  };
   for (int k : gasOrder_) {
     if (!gasAmt_[k] || gasMark_[k] == mark) continue;
     const int x = k % W, y = k / W;
@@ -1181,41 +1335,85 @@ void FlaskSim::StepGas() {
     if (outside) {
       if (gasAge_[k] < 255) gasAge_[k]++;
       if (gasAge_[k] > cfg_.gasVentSteps || y >= H - 2) {
-        spilledUnits_[s] += gasAmt_[k];
-        NoteExit(x + 0.5f, gasAmt_[k]);
-        gasAmt_[k] = 0;
-        gasSub_[k] = 0xFF;
+        vent(k, x);
         continue;
       }
     } else {
       gasAge_[k] = 0;
     }
     const Substance& S = subs_[s];
-    // A HEAVY gas (chlorine: materials.h kMatFlagHeavyGas) sinks and pools
-    // in the bottom of a flask instead of venting.
-    const bool heavy = S.heavy;
+    const bool inLiquid = NearestParticle(x + 0.5f, y + 0.5f, spacing_ * 0.6f) >= 0;
+    // A HEAVY gas (chlorine, ether vapour: materials.h kMatFlagHeavyGas)
+    // sinks and pools in the bottom of a flask instead of venting -- but
+    // never through a liquid: in liquid every gas is a bubble, and rises.
+    const bool heavy = S.heavy && !inLiquid;
     const int vdir = heavy ? -1 : 1;
     const float pRise = heavy ? 0.3f : std::clamp((6.0f - (float)S.density) / 5.0f, 0.3f, 1.0f);
-    const bool inLiquid = NearestParticle(x + 0.5f, y + 0.5f, spacing_ * 0.6f) >= 0;
-    // Candidate moves, in order.
-    int cand[6][2];
+    // Candidate moves, in order; the third number is the move's bias along
+    // the buoyancy (+1 with it, 0 across, -1 against).
+    int cand[6][3];
     int nc = 0;
     const int side = (Rand() & 1) ? 1 : -1;
-    if (Rand01() < pRise) cand[nc][0] = 0, cand[nc][1] = vdir, nc++;
-    cand[nc][0] = side, cand[nc][1] = vdir, nc++;
-    cand[nc][0] = -side, cand[nc][1] = vdir, nc++;
+    // A WISP OF HEAVY VAPOUR INSIDE A VESSEL (one gas unit, the cloud at its
+    // natural volume) wanders with no preferred direction: at a flask's scale
+    // a vapour is not stratified, it FILLS what holds it (the owner's ether:
+    // the bottle ends full of liquid and vapour, the air replaced) -- a
+    // biased walk left a layer of vapour on the liquid and the air above it,
+    // and evaporation stopped at the first layer. It never climbs OUT of the
+    // vessel: a single unit may leave only across or down through the mouth
+    // (a tipped flask pours), and only a pixel fuller than the natural
+    // volume overflows the lip. Outside every vessel, and while dense (fresh
+    // from a reaction), a heavy gas sinks as before.
+    // It hops gasWanderHops times a gas step: the mixing time of a random
+    // walk goes with the square of the room, and at one hop a step a flask's
+    // headspace took minutes to fill.
+    // TIPPED PAST LEVEL (its mouth below the middle of its inside) the mouth
+    // is where down leads, and the vapour POURS: the walk leans down, three
+    // hops in eight, one up.
+    if (heavy && gasAmt_[k] == 1 && inside_[k] != 0) {
+      static const int kW[8][2] = {{0, -1}, {0, 1}, {1, 0}, {-1, 0}, {0, -1}, {0, -1}, {1, 0}, {-1, 0}};
+      const int hv = (int)inside_[k] - 1;
+      bool tipped = false;
+      if (hv < (int)vessels_.size() && !vessels_[hv].outline.empty()) {
+        const Vessel& v = vessels_[hv];
+        tipped = ToWorld(v.x, {0.0f, v.shape.height}).y < ToWorld(v.x, {0.0f, v.shape.height * 0.5f}).y;
+      }
+      int cur = k;
+      for (int hop = 0; hop < std::max(1, cfg_.gasWanderHops); hop++) {
+        const int cx = cur % W, cy = cur / W;
+        const int d = tipped ? (int)(Rand() & 7) : (int)(Rand() & 3);
+        const int nx = cx + kW[d][0], ny = cy + kW[d][1];
+        if (nx < 0 || nx >= W || ny < 0 || ny >= H) continue;
+        const int nk = ny * W + nx;
+        if (wall_[nk] || grid_[nk] || gasAmt_[nk]) continue;
+        if (inside_[nk] != inside_[cur] && ny > cy) continue;   // no climbing out
+        if (NearestParticle(nx + 0.5f, ny + 0.5f, spacing_ * 0.6f) >= 0) continue;
+        gasSub_[nk] = (uint8_t)s;
+        gasAmt_[nk] = 1;
+        gasAge_[nk] = gasAge_[cur];
+        gasMark_[nk] = mark;
+        AddGasPixel(nk);
+        gasAmt_[cur] = 0;
+        gasSub_[cur] = 0xFF;
+        cur = nk;
+        if (!inside_[nk]) break;   // out of the mouth: it falls from here
+      }
+      continue;
+    }
+    if (Rand01() < pRise) cand[nc][0] = 0, cand[nc][1] = vdir, cand[nc][2] = 1, nc++;
+    cand[nc][0] = side, cand[nc][1] = vdir, cand[nc][2] = 1, nc++;
+    cand[nc][0] = -side, cand[nc][1] = vdir, cand[nc][2] = 1, nc++;
     if (!inLiquid) {
-      cand[nc][0] = side, cand[nc][1] = 0, nc++;
-      cand[nc][0] = -side, cand[nc][1] = 0, nc++;
+      cand[nc][0] = side, cand[nc][1] = 0, cand[nc][2] = 0, nc++;
+      cand[nc][0] = -side, cand[nc][1] = 0, cand[nc][2] = 0, nc++;
+      cand[nc][0] = 0, cand[nc][1] = -vdir, cand[nc][2] = -1, nc++;
     }
     for (int c = 0; c < nc; c++) {
       const int nx = x + cand[c][0], ny = y + cand[c][1];
+      const int bias = cand[c][2];
       if (nx < 0 || nx >= W || ny < 0) continue;
       if (ny >= H) {   // off the top of the table: in the world
-        spilledUnits_[s] += gasAmt_[k];
-        NoteExit(x + 0.5f, gasAmt_[k]);
-        gasAmt_[k] = 0;
-        gasSub_[k] = 0xFF;
+        vent(k, x);
         break;
       }
       const int nk = ny * W + nx;
@@ -1223,13 +1421,22 @@ void FlaskSim::StepGas() {
       // Grains stop gas, except that a rising bubble can work its way up
       // through a bed now and then; a heavy gas never sinks into one.
       if (grid_[nk] && (heavy || cand[c][1] <= 0 || (Rand() & 7))) continue;
-      const bool vertical = cand[c][1] != 0;
+      const uint32_t a = gasAmt_[k];
+      // Liquid is a floor (or a ceiling) to a gas that is not in it: only a
+      // bubble moves through liquid. (A heavy vapour stepping down into its
+      // own liquid became a bubble there and rose again, for ever.)
+      if (!inLiquid && !gasAmt_[nk] && NearestParticle(nx + 0.5f, ny + 0.5f, spacing_ * 0.6f) >= 0) continue;
       if (!gasAmt_[nk]) {
-        // Into a free pixel. A PUFF rises whole (a bubble always does), so a
-        // wisp climbs as a wisp; a dense one leaves half behind as it goes,
-        // and sideways a cloud only bleeds a third -- it spreads, slowly.
-        const uint32_t a = gasAmt_[k];
-        const uint32_t mv = inLiquid ? a : vertical ? (a > 24 ? (a + 1) / 2 : a) : (a >= 3 ? a / 3 : 0);
+        // Into a free pixel. A bubble moves whole. Along the buoyancy a
+        // single unit moves whole (a wisp climbs as a wisp) and more than one
+        // sends half ahead; across or against it, more than one shares half
+        // (a gas expands into the room it has) and a single unit wanders
+        // now and then (diffusion). Every share leaves at least one behind.
+        uint32_t mv;
+        if (inLiquid) mv = a;
+        else if (bias > 0) mv = a == 1 ? 1 : (a + 1) / 2;
+        else if (a >= 2) mv = a / 2;
+        else mv = Rand01() < (bias == 0 ? 0.5 : 0.2) ? 1 : 0;
         if (!mv) continue;
         gasSub_[nk] = (uint8_t)s;
         gasAmt_[nk] = (uint16_t)mv;
@@ -1241,11 +1448,20 @@ void FlaskSim::StepGas() {
         break;
       }
       if (gasSub_[nk] == s) {
-        // Into its own cloud: even out (with the buoyant side favoured).
-        const uint32_t a = gasAmt_[k], b = gasAmt_[nk];
-        uint32_t mv = a > b ? (a - b + (vertical ? 1 : 0)) / 2 : 0;
+        // Into its own cloud: even out (the buoyant side favoured), and a
+        // pixel one unit fuller than its neighbour hands that unit on half
+        // the time -- the EXCESS DIFFUSES through the cloud until it reaches
+        // a free pixel at the cloud's edge and is shared out there, so a
+        // cloud with room comes to rest at one unit a pixel (gasExpand times
+        // its liquid's room) instead of stacking where it was made. Never
+        // to empty: evening two pixels that both hold gas leaves both some.
+        const uint32_t b = gasAmt_[nk];
+        const int64_t d = (int64_t)a - (int64_t)b;
+        uint32_t mv = 0;
         if (inLiquid) mv = a;
-        mv = std::min(mv, cap - std::min(cap, b));
+        else if (d >= 2) mv = (uint32_t)((d + (bias > 0 ? 1 : 0)) / 2);
+        else if (d == 1 && a >= 2 && (Rand() & 1)) mv = 1;
+        mv = std::min({mv, cap - std::min(cap, b), inLiquid ? a : a - 1});
         if (!mv) continue;
         gasAmt_[nk] = (uint16_t)(b + mv);
         gasAmt_[k] = (uint16_t)(a - mv);
@@ -1254,8 +1470,9 @@ void FlaskSim::StepGas() {
         break;
       }
       // Another gas: the lighter rises through the heavier (they trade places).
-      if (vertical && ((vdir > 0 && subs_[gasSub_[nk]].density > S.density) ||
-                       (vdir < 0 && subs_[gasSub_[nk]].density < S.density))) {
+      if (cand[c][1] != 0 && bias > 0 &&
+          ((vdir > 0 && subs_[gasSub_[nk]].density > S.density) ||
+           (vdir < 0 && subs_[gasSub_[nk]].density < S.density))) {
         std::swap(gasSub_[k], gasSub_[nk]);
         std::swap(gasAmt_[k], gasAmt_[nk]);
         std::swap(gasAge_[k], gasAge_[nk]);
@@ -1266,14 +1483,20 @@ void FlaskSim::StepGas() {
   }
 }
 
-// A MOVING VESSEL CARRIES ITS GAS: every cloud pixel inside it (judged in its
-// previous pose) goes where the same point of the vessel is now. Without
-// this the glass swept through a carried flask's headspace and a stoppered
-// flask leaked its gas at every step.
+// A MOVING VESSEL CARRIES ITS GAS, as it carries its liquid: every cloud
+// pixel inside it (judged in its previous pose) goes where the same point of
+// the vessel is now -- and lands INSIDE it, never in the glass or outside
+// (owner, 2026-09-27: heavy vapour fell out of a flask that was only moved).
+// The old fallback put what did not fit on the nearest pixel anywhere --
+// often across the glass -- or in a pool on the table; now it searches the
+// vessel's own inside wider, and what still finds no room waits in a pool IN
+// THE VESSEL (its frame; FlushPools puts it back inside). Gas leaves a moving
+// vessel only the way liquid does: through the mouth, when the mouth is where
+// the gas goes (tipped past level, a heavy vapour pours).
 void FlaskSim::CarryGas() {
   if (gasList_.empty()) return;
   const int W = cfg_.gridW, H = cfg_.gridH;
-  struct Mv { int from, to; };
+  struct Mv { int from, to, vessel; };
   std::vector<Mv> moves;
   for (size_t vi = 0; vi < vessels_.size(); vi++) {
     const Vessel& v = vessels_[vi];
@@ -1285,27 +1508,29 @@ void FlaskSim::CarryGas() {
       const V2 l = ToLocal(v.prevX, p);
       if (!InsideLocal(v, l)) continue;
       const V2 w = ToWorld(v.x, l);
-      const int nx = (int)std::floor(w.x), ny = (int)std::floor(w.y);
-      if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
+      const int nx = std::clamp((int)std::floor(w.x), 0, W - 1), ny = std::clamp((int)std::floor(w.y), 0, H - 1);
       const int nk = ny * W + nx;
-      if (nk != k) moves.push_back({k, nk});
+      // A pixel that stays put and stays inside needs no move.
+      if (nk != k || inside_[k] != (uint8_t)(vi + 1) || wall_[k]) moves.push_back({k, nk, (int)vi});
     }
   }
   if (moves.empty()) return;
   // Lift every moving pixel off the grid first, then set it down: a pixel
   // moving into one that is itself moving must not merge with it.
-  struct Held { int to; uint8_t sub; uint16_t amt; uint8_t age; };
+  struct Held { int to; uint8_t sub; uint16_t amt; uint8_t age; int vessel; };
   std::vector<Held> held;
   held.reserve(moves.size());
   for (const Mv& m : moves) {
     if (!gasAmt_[m.from]) continue;
-    held.push_back({m.to, gasSub_[m.from], gasAmt_[m.from], gasAge_[m.from]});
+    held.push_back({m.to, gasSub_[m.from], gasAmt_[m.from], gasAge_[m.from], m.vessel});
     gasAmt_[m.from] = 0;
     gasSub_[m.from] = 0xFF;
   }
   for (const Held& h : held) {
     uint32_t q = h.amt;
-    if (!AddGasAt(h.sub, q, h.to % W, h.to / W)) AddPool(-1, h.sub, q, {(h.to % W) + 0.5f, (h.to / W) + 0.5f});
+    const int x = h.to % W, y = h.to / W;
+    if (!AddGasAt(h.sub, q, x, y, h.vessel) && !AddGasAt(h.sub, q, x, y, h.vessel, 10))
+      AddPool(h.vessel, h.sub, q, {x + 0.5f, y + 0.5f});
     gasAge_[h.to] = h.age;
   }
 }
@@ -1443,7 +1668,9 @@ void FlaskSim::RenderChem(std::vector<uint32_t>& out) const {
       for (int k : gasList_) {
         if (!gasAmt_[k]) continue;
         const int x = k % W - x0, y = k / W - y0;
-        const float a = (float)gasAmt_[k];
+        // Matter, not gas units: a cloud at its natural volume (one gas unit
+        // a pixel) is a haze, as much matter as 1/gasExpand of a liquid.
+        const float a = (float)gasAmt_[k] / (float)GasE();
         for (int dy = -kR; dy <= kR; dy++)
           for (int dx = -kR; dx <= kR; dx++) {
             const int xx = x + dx, yy = y + dy;

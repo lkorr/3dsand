@@ -17146,16 +17146,21 @@ what keeps ValidateBench a proof.
   minute). At most `chemMaxFires` firings a step, and a slot with no rule a
   present substance, the air or a live virtual neighbour could satisfy is
   skipped without gathering neighbours.
-- **Quanta.** A pair converts `min(units)` of each side (a grain of sand eats
-  one unit of an acid particle, not six); decay and emit the whole entity. Units
-  that change PHASE go where that phase lives: gas to the gas grid, powder to
-  grains, liquid to a POOL (per vessel and substance, in the vessel's frame)
-  that becomes a particle once it holds a particle's worth. Nothing is rounded
-  away: `AuditUnits` proves live + spilled + taken-off + drained == seeded +
-  produced - consumed per slot.
+- **Quanta.** A pair converts the smaller side of each (a grain of sand eats
+  one unit of an acid particle, not six), measured in GAS units, the finest
+  there is: a gas pixel converts exactly that, a particle or grain the whole
+  matter units it takes (at least one). Decay and emit take the whole entity.
+  Units that change PHASE go where that phase lives: gas to the gas grid,
+  powder to grains, liquid to a POOL (per vessel and substance, in the
+  vessel's frame) that becomes a particle once it holds a particle's worth.
+  Nothing is rounded away: `AuditUnits` proves, in gas units, live + spilled +
+  taken-off + drained == seeded + produced - consumed per slot.
 - **Neighbours.** A particle: particles within 1.2 spacings, grains in its 3x3,
-  gas at its pixel and faces, AIR where a particle-width off is free. A grain
-  or gas pixel: its four faces. The glass is inert (it is what vials are made
+  gas at its pixel and faces, AIR where a particle-width off is free and no
+  particle of its list lies in that direction's 60-degree cone (the probe pixel
+  alone saw air in the gaps of the packing, and ether boiled inside its own
+  bulk). A gas pixel is never air: a surface under a headspace of vapour does
+  not evaporate. A grain or gas pixel: its four faces. The glass is inert (it is what vials are made
   of). Two VIRTUAL neighbours: the burner's heat, seen by whatever is near the
   hot glass (the vessel's near-glass raster), with the rule's chance scaled by
   how hot it is -- it answers to `tag:hot` plus every synthetic bit a
@@ -17165,26 +17170,65 @@ what keeps ValidateBench a proof.
   tagged `electric` (the contract's `spark`). A rule that rewrites a virtual
   neighbour MATERIALISES its product where it touched: the world's spark voxel
   becomes chlorine, so ours leaves chlorine.
-- **The gas phase.** A pixel CA, one gas per pixel, up to `gasPixelCap` units:
-  a puff rises whole (a heavy gas, `kMatFlagHeavyGas`, sinks and pools), a
-  dense cloud leaves half behind, sideways a third bleeds -- so it fills a
-  headspace; glass and a stopper stop it, grains mostly do, liquid does not
-  (it rises through as bubbles). A moving vessel carries its gas. Out of every
-  vessel it lingers `gasVentSteps` and is then IN THE WORLD: it joins the spill
-  the bench streams out at the lip of the flask in hand, as gas parcels.
-  Drawn as smoke: each unit a soft radius-3 puff, the material's palette lifted
-  a third toward a pale grey so a dark gas still reads as a haze of its hue,
-  alpha from how much is there and its opacity, wisped by drifting noise.
+- **Gas is voluminous** (2026-09-27, owner: "the volume of liquid to gas
+  conversion should generally always make more gas since gas becomes more
+  voluminous"). The gas grid counts in GAS UNITS, `SimConfig::gasExpand` (8)
+  to a unit of matter, and a cloud at rest holds ONE a pixel -- so a liquid
+  unit (one pixel of liquid) boiled or evaporated takes eight pixels as
+  vapour. Every boundary converts exactly: matter into the grid x8 (`Deposit`,
+  seeding a vessel's gas portions); out of it -- a reaction on a gas pixel,
+  the vent, a vessel taken off -- through a per-(vessel, gas) BANK
+  (`FlaskSim::BankGas`) that pays the whole matter units the gas units make
+  and keeps the remainder (< one matter unit) as live gas of that vessel.
+  Gas pools count gas units. `Count` and `AuditUnits` work in gas units (every
+  matter count x8), so the bank's part-units are counted where they are and
+  every material still comes out in whole eighths; the ledger, the spill, the
+  drain and `ValidateBench` stay in matter units. What leaves the table into
+  the world is matter (eighths, as before).
+- **The gas phase.** A pixel CA, one gas per pixel, up to `gasPixelCap` gas
+  units. A pixel of more than one unit moves half ahead along its buoyancy
+  (up, or down for a heavy gas, `kMatFlagHeavyGas`), else shares half into a
+  free pixel across or against it, always keeping one; into its own cloud it
+  evens out, and a pixel one unit fuller than its neighbour hands that unit on
+  half the time, so the EXCESS DIFFUSES to the cloud's edge and a cloud with
+  room comes to rest at one unit a pixel. A single-unit wisp of a LIGHT gas
+  climbs (whole) as before. A single-unit wisp of a HEAVY vapour inside a
+  vessel WANDERS with no preferred direction, `gasWanderHops` (4) hops a step:
+  at a flask's scale a vapour fills what holds it (a biased walk left a layer
+  of vapour on the ether and the air above it, and evaporation stopped at the
+  first layer). It never climbs OUT of its vessel -- a single unit leaves only
+  across or down through the mouth; only a pixel fuller than the natural
+  volume overflows the lip -- and when the vessel is TIPPED past level (its
+  mouth below the middle of its inside) the walk leans down (3 hops in 8, 1
+  up) and the vapour POURS. Outside every vessel, and while dense, a heavy gas
+  sinks. Liquid is a floor to gas that is not in it; gas IN liquid is a
+  bubble and rises, heavy or not (a heavy gas used to sink through its own
+  liquid). Glass and a stopper stop it, grains mostly do. A MOVING VESSEL
+  CARRIES ITS GAS as it carries liquid (`CarryGas`): every cloud pixel inside
+  it goes to the same point of the vessel in its new pose and lands INSIDE it
+  (a wider search of its own inside, then a pool in the vessel's frame); the
+  old fallback put what did not fit on the nearest pixel anywhere, often
+  across the glass, and heavy vapour fell out of a flask that was only moved
+  (owner, same day). Gate `alchemy-gas-carry`. Out of every vessel it lingers
+  `gasVentSteps` and is then IN THE WORLD: it joins the spill the bench
+  streams out at the lip of the flask in hand, as gas parcels. Drawn as smoke:
+  each unit of MATTER (eight gas units) a soft radius-3 puff, the material's
+  palette lifted a third toward a pale grey so a dark gas still reads as a
+  haze of its hue, alpha from how much is there and its opacity, wisped by
+  drifting noise -- a headspace full of vapour at its natural volume is a
+  visible haze.
 - **Stopper, pressure.** A stoppered mouth is one more glass segment (raster,
-  particle contact, the crossing test). A gas fading to NOTHING is the world's
-  way of saying it dispersed into open air; in a sealed flask it cannot, so that
-  rule does not fire there (a decay into matter -- steam condensing -- still
-  does). Pressure is gas units per free inside pixel times (1 + 3 x heat); past
-  `popAt` (0.6) the stopper POPS (a `pop` event), or over a lit burner, hot
-  glass or past `burstAt` the glass BURSTS (`burst`: shards fly, the contents
-  are loose on the table and fall into the world, the item is gone at "done").
-  A gas unit is the matter of a liquid unit, which is why the thresholds are
-  well under one: boiled wholly to steam, a flask of water is ~1 unit a pixel.
+  particle contact, the crossing test). Nothing turns to air in a sealed flask
+  (below). Pressure is in ATMOSPHERES: gas units per free inside pixel times
+  (1 + 3 x heat), so a headspace exactly full of vapour at its natural volume
+  and room temperature is 1 -- a stoppered bottle of ether that has filled its
+  headspace sits at ~1.05 and holds. Past `popAt` (3) the stopper POPS (a
+  `pop` event), or over a lit burner, hot glass (heat > 0.25) or past
+  `burstAt` (24) the glass BURSTS (`burst`: shards fly, the contents are loose
+  on the table and fall into the world, the item is gone at "done"). Heat
+  multiplies it by up to 4, so a full headspace heated goes; a stoppered flask
+  of water on the burner bursts within a second of steam (real steam is 1600x
+  its water). The panel's pressure bar is `PressureFraction` (1 = popAt).
 - **Dissolving** (`solutes.json`, the table the world's solute layer reads): a
   powder grain of a species touching a particle of one of its solvents
   dissolves at `dissolveChance` up to `saturation` (`mass x yield <= sat x
@@ -17220,7 +17264,41 @@ what keeps ValidateBench a proof.
   in the standalone g++ lab: flaskchem.cpp, like flasksim.cpp, has no engine
   dependency.
 
-**Nothing vanishes inside glass** (2026-09-27, owner: blood and ether disappeared from open flasks). A world decay to AIR is matter leaving into the open (a blood pool drying, a vapour dispersing); inside a vessel it does not fire for liquids and powders, nor for slow gas decays -- matter leaves a flask only through its mouth, and the world rule takes over once it is out. Fast decays (>= a tenth of the chance scale: spark, glare) are transients and still burn out; decays into matter (ether -> ether vapour) still fire. Gate `alchemy-keeps`.
+**What turns to air inside glass** (2026-09-27, owner: "matter + air =
+deletes should still take place except for things that are purposefully to
+'dry them up' like blood ... [and] should NOT occur if the stopper is on").
+A world rule whose SELF becomes air is the world's abstraction of matter
+leaving into the open. On the bench:
+- A **DRYING** rule -- reactions.json `"drying": true`, the world's
+  abstraction of matter soaking into the ground or drying in the open; today
+  only `blood -> air` -- never fires on matter inside a vessel, open or
+  stoppered. `MaterialDef::ruleFx[k].drying` (CPU-only: no fx id, no GPU
+  field, so the world hash cannot see it) -> `ChemRule::drying`
+  (`BuildBenchChemistry`). The world is unchanged: blood still dries on the
+  ground.
+- In a **STOPPERED** vessel no decay to air fires, of any class (smoke, a
+  vapour, an ember), and a rule that turns its self to air against an AIR
+  neighbour does not take one there -- a sealed flask has no open air, which
+  is also what lets gas build pressure in it. The exception is a fast
+  TRANSIENT (decay chance at least a tenth of the chance scale a tick, a life
+  of a few ticks: spark, glare) -- energy, not matter -- which burns out
+  where it is.
+- In an **OPEN** vessel every other decay to air fires as in the world: smoke
+  fades, ether vapour disperses. Decays into MATTER (ether -> ether vapour,
+  steam -> water) and pair rules that spend their self on another substance
+  (acid on sand) are chemistry and fire anywhere.
+- **Evaporation only at air.** Ether's `ether -> ether_vapour` is a decay
+  scaled by its AIR neighbours (minCount 1): with none it cannot fire, and a
+  gas pixel is not air (above). So the vapour fills the headspace and
+  displaces the air, and the evaporation stops by itself: a stoppered bottle
+  of 200 eighths of ether in a 512-eighth flask evaporates ~49 eighths, its
+  headspace is full of vapour with no air left in ~18 s, and it sits at
+  pressure ~1.05 with no pop. Heated, it goes. Open, it evaporates from its
+  surface only and the vapour fades or leaves by the mouth.
+Gates `alchemy-keeps` (open blood kept, open noxious gas vents and fades,
+stoppered it does not fade) and `alchemy-evaporate` (the stoppered bottle
+fills and holds, then goes when heated; open evaporation at the surface;
+one eighth of ether as vapour takes >= gasExpand x its liquid's pixels).
 
 **Not yet:** the cauldron, a held/grounded flask drawing its layers, refraction; a stream off the table leaves from the nearest hand's lip,
 not from where on the table it fell; dissolved matter that streams off the

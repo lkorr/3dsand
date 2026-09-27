@@ -2127,8 +2127,9 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
       y += lineH + 4;
     }
     if (A.focusStoppered) {
-      // Pressure against where the stopper gives (SimConfig::popAt 0.6).
-      const float f = std::clamp(A.focusPressure / 0.6f, 0.0f, 1.0f);
+      // Pressure as a fraction of where the stopper gives
+      // (FlaskSim::PressureFraction: 1 = SimConfig::popAt).
+      const float f = std::clamp(A.focusPressure, 0.0f, 1.0f);
       const float bh = 8;
       dl->AddRectFilled(ImVec2(colX, y), ImVec2(colX + colW, y + bh), IM_COL32(30, 24, 20, 255));
       dl->AddRectFilled(ImVec2(colX, y), ImVec2(colX + colW * f, y + bh),
