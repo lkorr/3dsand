@@ -157,6 +157,10 @@ struct VSOut {
   @location(12) @interpolate(flat) fillMat : u32,
   @location(13) @interpolate(flat) fillSlices : i32,
   @location(14) @interpolate(flat) fillPlane : vec4f,
+  // A VESSEL WITH ITS STOPPER OUT (fillview.h, the word's bits 12..15): cells
+  // at x >= `openX` are the model's cork and are air to the march. dims.x
+  // (nothing hidden) for everything else.
+  @location(15) @interpolate(flat) openX : i32,
 };
 
 // ---- THE DYE REFERENCE TONE (src/game/dye.h kDyeRef) ------------------------
@@ -266,6 +270,7 @@ fn vs(@builtin(vertex_index) vi : u32,
   let isFill = (dyeBits & 0x1000000u) == 0u && dyeBits != 0u;
   out.fillSlices = select(0, i32((dyeBits >> 16u) & 0x7Fu), isFill);
   out.fillMat = select(0u, dyeBits & 0xFFFu, isFill);
+  out.openX = dims.x - select(0, i32((dyeBits >> 12u) & 0xFu), isFill);
   // The CPU quantized the surface over +-half the brick's diagonal, 0..127.
   let halfDiag = 0.5 * length(vec3f(dims));
   out.fillPlane = vec4f(quatRotateInv(xf.quat, vec3f(0.0, 1.0, 0.0)),
@@ -612,7 +617,7 @@ fn fs(in : VSOut) -> FSOut {
     if (c.x < 0 || c.y < 0 || c.z < 0 ||
         c.x >= dims.x || c.y >= dims.y || c.z >= dims.z) { break; }
     let v = poolVoxAt(in.base, dims, c);
-    if ((v & 0xFFu) != 0u) {
+    if ((v & 0xFFu) != 0u && c.x < in.openX) {
       let art = (v >> 8u) & 0xFFu;
       // A see-through art voxel this pixel misses is empty to the march
       // (artCovers, above): step on to whatever lies behind it.

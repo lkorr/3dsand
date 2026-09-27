@@ -488,7 +488,10 @@ ContainerHeldFill ContainerHeldFillOf(const ItemDef& def, const ItemInstance& st
 // rather than in a stack (Mob::HeldContents). The 3D view shows ONE material
 // (the fill word has room for one id): the portion with the most eighths, at
 // the level of the whole fill. Layers show in the icon and on the bench.
-ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, const alchemy::Composition& c);
+// `stoppered` is the item's (ItemInstance::stoppered): false hides the model's
+// stopper slices (ItemDef::container.stopperSlices, phys/fillview.h `open`).
+ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, const alchemy::Composition& c,
+                                        bool stoppered);
 // The portion with the most eighths (ties: the first), 0 when empty.
 uint16_t ContainerMainMat(const alchemy::Composition& c);
 // How brightly the contents glow, 0..1: the material's own `emission`, the

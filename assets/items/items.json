@@ -166,7 +166,8 @@
         "throwMinSpeedMps": 4.0,
         "throwChargeSec": 0.9,
         "breakSpeedMps": 6.5,
-        "fillSlices": 8
+        "fillSlices": 8,
+        "stopperSlices": 2
       },
       "desc": "A stoppered glass flask. Hold the right button over any liquid to fill it, the left to pour it where you are looking. With the character screen open, hold the left button on your portrait to pour it exactly where the cursor is -- over a wound, or a burn, or yourself. Hold Q to wind up a throw and let go to hurl it; it is glass, and whatever it hits hard enough -- or whatever hits it -- breaks it and lets everything inside out at once."
     },

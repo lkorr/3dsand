@@ -2199,9 +2199,11 @@ void MobSystem::RefreshHeldFills() {
       const Hand h = HandAt(hk);
       ContainerHeldFill f;
       const alchemy::Composition& fill = m.HeldContents(h);
+      // An NPC's vessel has no item record to carry a stopper, so it is drawn
+      // as authored -- stoppered (the model's own cork) -- empty or full.
       if (items_ && !fill.Empty() && !m.HeldItem(h).empty())
         if (const ItemDef* d = items_->At(items_->Find(m.HeldItem(h))))
-          f = ContainerHeldFillFrom(*d, fill);
+          f = ContainerHeldFillFrom(*d, fill, true);
       m.SetHeldFill(f, h);
     }
 }
@@ -22657,7 +22659,7 @@ uint32_t Mob::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
       // so nothing is displaced.
       uint32_t word = limb.dye;
       Hand fillHand = Hand::Right;
-      if (IsHeldSlot((int)i, &fillHand) && held_[HandIndex(fillHand)].fill.On())
+      if (IsHeldSlot((int)i, &fillHand) && held_[HandIndex(fillHand)].fill.Drawn())
         word = BodyFillWord(held_[HandIndex(fillHand)].fill, limb.xf.quat);
       out.push_back({slot, (uint32_t)limb.microModel, bits, word});
     }

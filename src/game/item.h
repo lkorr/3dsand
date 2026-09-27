@@ -505,6 +505,10 @@ struct ItemDef {
     // vessel tints them in its contents' colour up to the level its fill
     // reaches. 0 = the contents are not visible (a leather pouch).
     int fillSlices = 0;
+    // THE STOPPER: the model's last `stopperSlices` x-slices are its cork,
+    // drawn only while the item is stoppered (phys/fillview.h `open`). 0 = no
+    // stopper in the model. Capped at 15 (4 bits of the instance word).
+    int stopperSlices = 0;
     // ...and those cells of the model, in brick coordinates, with the brick
     // they are in: computed once at load (LoadItems), shared by every view.
     std::shared_ptr<const std::vector<FillCell>> fillCells;

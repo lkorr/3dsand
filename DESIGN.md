@@ -16629,6 +16629,15 @@ of its own, counted as its powder by every conservation check, taking no room
 every reader (`ValidPortionMat`, `RemapItemInstance` remaps the powder and
 keeps the bit). A vessel holds GAS only when stoppered: an open one's gas vents
 on the bench (off the table or at "done").
+The 3D vessel SHOWS its stopper only while it has one: the model is authored
+corked (the flask's last two x-slices, `items.json` `stopperSlices`), and an
+unstoppered item hides those slices -- `BodyFillView::open`, bits 12..15 of the
+fill word (phys/fillview.h), cells at `x >= dims.x - open` are air to
+microbody.wgsl's march. Re-stated from the item record every tick by the
+holders (hand stack, ground item, the bench's `BenchHold::HandView::stoppered`
+while the bench is open), so a bench toggle and a loaded save show with no
+hook. Render-only: the collider keeps the cells. An NPC's vessel
+has no stopper record and is drawn corked.
 
 **The one vessel->world door** (contract 2.5): `ContainerSpillStep` takes every
 Composition out (a break, the bench's stream and vents, an unpaid scoop, a bench
@@ -16908,8 +16917,8 @@ what keeps ValidateBench a proof.
   in the standalone g++ lab: flaskchem.cpp, like flasksim.cpp, has no engine
   dependency.
 
-**Not yet:** the cauldron, a held/grounded flask drawing its layers or its
-stopper, refraction; a stream off the table leaves from the nearest hand's lip,
+**Not yet:** the cauldron, a held/grounded flask drawing its layers,
+refraction; a stream off the table leaves from the nearest hand's lip,
 not from where on the table it fell; brine electrolysis (waits on the world
 solute layer's concentration condition); only the first effect of a rule is
 raised on the bench.

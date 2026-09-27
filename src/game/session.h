@@ -552,6 +552,7 @@ struct PlayerSession {
       // tall it is there: the carried one's arm follows its bench motion.
       float cx = 0, cy = 0, height = 0;
       bool carried = false;            // in the bench's hand right now
+      bool stoppered = false;          // the bench's stopper, drawn in 3D
     } hand[kHands];
   } benchHold;
   // Ticks the bench hold has been live (the arm-claim ramp), and which clip

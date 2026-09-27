@@ -50,25 +50,41 @@ struct BodyFillView {
   // load (ItemDef::container.fillCells) and shared, so a view outlives an R
   // reload of the item library that would free a raw pointer.
   std::shared_ptr<const std::vector<FillCell>> cells;
+  // THE STOPPER THAT IS NOT IN. A vessel's model is authored WITH its stopper
+  // in its mouth (the flask's last two x-slices are the cork). When the item
+  // is unstoppered (ItemInstance::stoppered false) the model's last `open`
+  // x-slices are drawn as air: microbody.wgsl skips them in the march. 0 =
+  // draw the model whole (stoppered, or a vessel with no stopper). Set from
+  // the item record every tick by the holders, so a bench toggle and a loaded
+  // save both show without a hook. Render-only: the collider keeps the cells.
+  int open = 0;
   bool On() const {
     return mat != 0 && mat < 4096 && slices > 0 && frac > 0.0f && cells &&
            !cells->empty();
   }
+  // Does this view change the instance word at all (a fill, or a hidden
+  // stopper)? The holders put BodyFillWord in place of the dye when it does.
+  bool Drawn() const { return On() || open > 0; }
 };
 
 // THE WORD (sim/microbody.h MicroBodyInstGpu's fourth word, the one the dye
 // rides; microbody.wgsl decodes it and check_invariants.py pins the shift):
 //   bits  0..11  contents MATERIAL id (the shader reads its row)
-//   bits 12..15  zero
+//   bits 12..15  OPEN: the model's last this-many x-slices (its stopper) are
+//                not drawn, 0 = the whole model (BodyFillView::open)
 //   bits 16..22  see-through slices (x < this)
 //   bit  24      CLEAR -- the dye flag, so a fill word is never read as a dye
 //   bits 25..31  the surface height along world up rotated into the brick,
 //                0..127 across +-half the brick's diagonal about its centre
-// `q` is the body's rotation (x,y,z,w). 0 when there is nothing to draw.
+// `q` is the body's rotation (x,y,z,w). 0 when there is nothing to draw. An
+// EMPTY unstoppered vessel is the open bits alone: nonzero with the dye flag
+// clear and zero slices, which the shader reads as "no contents, mouth open".
 constexpr uint32_t kHeldFillLevelShift = 25;
+constexpr uint32_t kHeldFillOpenShift = 12;
 
 inline uint32_t BodyFillWord(const BodyFillView& f, const float q[4]) {
-  if (!f.On() || f.dims.x <= 0 || f.dims.y <= 0 || f.dims.z <= 0) return 0;
+  const uint32_t open = (uint32_t)std::clamp(f.open, 0, 15) << kHeldFillOpenShift;
+  if (!f.On() || f.dims.x <= 0 || f.dims.y <= 0 || f.dims.z <= 0) return open;
   // World up in the brick's frame: rotate (0,1,0) by the CONJUGATE of q.
   // v' = v + 2w(u x v) + 2 u x (u x v), with u = -q.xyz.
   const Vec3 u{-q[0], -q[1], -q[2]};
@@ -94,6 +110,7 @@ inline uint32_t BodyFillWord(const BodyFillView& f, const float q[4]) {
                                             f.dims.z * f.dims.z));
   const int lvl = std::clamp(
       (int)std::ceil((thr / hd * 0.5f + 0.5f) * 127.0f + 1e-3f), 0, 127);
-  return ((uint32_t)f.mat & 0xFFFu) | ((uint32_t)std::min(f.slices, 127) << 16) |
+  return ((uint32_t)f.mat & 0xFFFu) | open |
+         ((uint32_t)std::min(f.slices, 127) << 16) |
          ((uint32_t)lvl << kHeldFillLevelShift);
 }

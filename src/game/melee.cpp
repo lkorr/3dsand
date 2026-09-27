@@ -553,6 +553,7 @@ bool LoadItems(const std::string& dir, size_t materialCount,
       d.container.breakSpeed = MetresToCells(std::max(0.0f, c.value("breakSpeedMps", 0.0f)));
       // Capped at 127: the level rides 7 bits of the micro-body instance word.
       d.container.fillSlices = std::clamp(c.value("fillSlices", 0), 0, 127);
+      d.container.stopperSlices = std::clamp(c.value("stopperSlices", 0), 0, 15);
       if (d.container.holds == 0 || d.container.capacity == 0) {
         errors += "items: \"" + d.name +
                   "\" is a container with no `holds` or no `capacity` -- skipped\n";

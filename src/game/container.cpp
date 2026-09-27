@@ -1088,11 +1088,14 @@ int ContainerDissolvedToWorld(uint16_t mat, int eighths, Vec3 at, Vec3 vel, uint
   return emitted;
 }
 
-ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, const alchemy::Composition& c) {
+ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, const alchemy::Composition& c,
+                                        bool stoppered) {
   ContainerHeldFill f;
+  if (!def.IsContainer()) return f;
+  if (!stoppered) f.open = def.container.stopperSlices;
   const uint16_t mat = ContainerMainMat(c);
   const uint32_t amt = c.Total();
-  if (!def.IsContainer() || mat == 0 || amt == 0) return f;
+  if (mat == 0 || amt == 0) return f;
   f.mat = mat;
   f.slices = def.container.fillSlices;
   f.frac = std::clamp((float)amt / (float)std::max(1, def.container.capacity),
@@ -1103,7 +1106,7 @@ ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, const alchemy::Compo
 }
 
 ContainerHeldFill ContainerHeldFillOf(const ItemDef& def, const ItemInstance& st) {
-  return ContainerHeldFillFrom(def, st.contents);
+  return ContainerHeldFillFrom(def, st.contents, st.stoppered);
 }
 
 float ContainerFillGlow(const ItemInstance& st,

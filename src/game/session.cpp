@@ -2665,7 +2665,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                 const ItemDef* bd = items.Named(bv.item);
                 const bool bheld = bd && avatar.HeldItem(h) == bv.item;
                 avatar.SetHeldContents(bheld ? bv.contents : alchemy::Composition{}, h);
-                avatar.SetHeldFill(bheld ? ContainerHeldFillFrom(*bd, bv.contents)
+                avatar.SetHeldFill(bheld ? ContainerHeldFillFrom(*bd, bv.contents, bv.stoppered)
                                          : ContainerHeldFill{}, h);
                 continue;
               }

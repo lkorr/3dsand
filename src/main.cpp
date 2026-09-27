@@ -13106,6 +13106,7 @@ int main(int argc, char** argv) {
               hv.cy = v.pose.pos.y + std::cos(ca) * hh;
               hv.height = v.height;
               hv.carried = v.held;
+              hv.stoppered = v.stoppered;
             }
           }
           bh.active = !bh.hand[0].item.empty() || !bh.hand[1].item.empty();
