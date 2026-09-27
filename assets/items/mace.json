@@ -1,24 +1,24 @@
 {
-  "comment": "The mace: a morning star, a plain wood stick socketed into a steel ball. A standalone item, held by BORROWING a rig slot exactly as the sword is. Its whole reason to exist is the BLUNT half of the impact model (src/game/impact.h) \u2014 it goes through plate a sword skates off, and it dents flesh instead of opening it. Two art facts are mechanical and are emitted from the same constants that build the mesh: `edge` is the BALL's span only (the stick must not cut), and there is deliberately NO `flat` \u2014 a mace has no edge to align, so MeleeEdgeAlign returns 1 and a badly-rolled swing does full damage. Regenerate with scripts/gen_mace_item.py.",
+  "comment": "The mace: a morning star, a plain wood stick socketed into a steel ball. A standalone item, held by BORROWING a rig slot exactly as the sword is. Its whole reason to exist is the BLUNT half of the impact model (src/game/impact.h) — it goes through plate a sword skates off, and it dents flesh instead of opening it. Two art facts are mechanical and are emitted from the same constants that build the mesh: `edge` is the BALL's span only (the stick must not cut), and there is deliberately NO `flat` — a mace has no edge to align, so MeleeEdgeAlign returns 1 and a badly-rolled swing does full damage. Regenerate with scripts/gen_mace_item.py.",
   "name": "mace",
   "model": "mace",
   "artVoxelsPerMetre": 80,
   "hp": 40,
   "severable": true,
-  "severImpactSpeed": 9.0,
+  "severImpactSpeed": 9,
   "grip": {
     "held_right": {
       "translation": [
-        0,
-        0,
-        0
+        2,
+        1,
+        2
       ],
       "rotation": [
         0,
         -90,
         0
       ],
-      "scale": 1.0
+      "scale": 1
     }
   },
   "hilt": {
