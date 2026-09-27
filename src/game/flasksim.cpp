@@ -94,6 +94,7 @@ VesselShape PouchShape(float width, float height) {
   s.width = width;
   s.height = height;
   s.wall = 1.5f;
+  s.glass = false;
   s.profile = {{0.55f, 0.00f}, {0.86f, 0.06f}, {0.98f, 0.22f}, {0.96f, 0.45f},
                {0.80f, 0.64f}, {0.46f, 0.78f}, {0.34f, 0.84f}, {0.42f, 0.92f},
                {0.52f, 1.00f}};
@@ -2499,11 +2500,19 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
       if (wall_[k]) {
         // Glass: pale, mostly transparent, a highlight on the left faces;
         // lit by whatever glows beside it.
-        bool lit = (x > 0 && !wall_[k - 1]) && ((y / 3) & 1);
+        // A sack's edge is its leather, darker than its face and opaque.
+        const int wv = wall_[k] - 1;
+        const bool sack = wv < (int)vessels_.size() && !vessels_[wv].shape.glass;
+        // Glass is lit along its whole left face (a continuous line; a dash
+        // every 3 rows read as a seam in the glass). Leather keeps the dash:
+        // it reads as stitching.
+        bool lit = (x > 0 && !wall_[k - 1]) && (!sack || ((y / 3) & 1));
         if (highlight_ >= 0 && wall_[k] == highlight_ + 1)
           c = lit ? PackRGBA(255, 244, 196, 240) : PackRGBA(232, 208, 140, 200);
+        else if (sack)
+          c = lit ? PackRGBA(112, 76, 46, 255) : PackRGBA(62, 40, 24, 255);
         else
-          c = lit ? PackRGBA(236, 246, 255, 210) : PackRGBA(170, 205, 230, 120);
+          c = lit ? PackRGBA(222, 238, 252, 170) : PackRGBA(190, 216, 238, 130);
         if (glowI > 1) c = AddRGB(c, gl[0] * 0.7f, gl[1] * 0.7f, gl[2] * 0.7f, std::min(255, (int)(c >> 24) + (int)glowI));
       }
       out[(size_t)row * W + x] = c;
@@ -2551,6 +2560,84 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
       }
   }
   RenderChem(out);
+
+  // 6. THE GLASS BODY. The sim is a cross-section; a bottle is round. Its
+  // whole inside wears a faint pale tint that thickens toward the sides (the
+  // eye looks through more glass there), and whatever is in it -- liquid,
+  // grains, gas, the stick -- is seen THROUGH that front wall: veiled a
+  // little, and darker toward the sides as it curves away. A highlight
+  // stripe runs up the left of the belly and neck, a fainter one on the
+  // right. All of it a CONTINUOUS function of the position across the
+  // width (u, -1..1): stepped bands read as vertical seams in the glass.
+  // Over everything else, so it goes last.
+  // A SACK (a pouch, VesselShape::glass unset) is the same pass with the
+  // glass swapped for LEATHER: opaque, so what it holds is hidden, shaded
+  // round in the same bands, with a grain that rides with the sack.
+  for (int vi = 0; vi < (int)vessels_.size(); vi++) {
+    if (!VesselAlive(vi)) continue;
+    const Vessel& v = vessels_[vi];
+    if (v.broken || v.shape.profile.size() < 2) continue;
+    const bool sack = !v.shape.glass;
+    float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+    for (V2 o : v.outline) {
+      const V2 w = ToWorld(v.x, o);
+      x0 = std::min(x0, w.x); x1 = std::max(x1, w.x); y0 = std::min(y0, w.y); y1 = std::max(y1, w.y);
+    }
+    const int ix0 = std::max(0, (int)std::floor(x0)), ix1 = std::min(W - 1, (int)std::ceil(x1));
+    const int iy0 = std::max(0, (int)std::floor(y0)), iy1 = std::min(H - 1, (int)std::ceil(y1));
+    const float ca = std::cos(-v.x.angle), sa = std::sin(-v.x.angle);
+    const auto& pr = v.shape.profile;
+    const float hw = v.shape.width * 0.5f, VH = v.shape.height;
+    for (int y = iy0; y <= iy1; y++)
+      for (int x = ix0; x <= ix1; x++) {
+        const size_t k = (size_t)y * W + x;
+        if (wall_[k]) continue;
+        const float dx = x + 0.5f - v.x.pos.x, dy = y + 0.5f - v.x.pos.y;
+        const V2 l{dx * ca - dy * sa, dx * sa + dy * ca};
+        if (!InsideLocal(v, l)) continue;
+        // The inside's half-width at this height, from the profile.
+        const float hy = std::clamp(l.y / VH, pr.front().y, pr.back().y);
+        size_t j = 1;
+        while (j + 1 < pr.size() && pr[j].y < hy) j++;
+        const float span = std::max(1e-4f, pr[j].y - pr[j - 1].y);
+        const float fw = pr[j - 1].x + (pr[j].x - pr[j - 1].x) * std::clamp((hy - pr[j - 1].y) / span, 0.f, 1.f);
+        const float u = std::clamp(l.x / std::max(1.0f, fw * hw - v.shape.wall), -1.f, 1.f);
+        const float e = std::fabs(u), e2 = e * e;
+        // The two highlights: soft gaussian stripes, left strong, right faint.
+        const float qL = (u + 0.56f) / 0.10f, qR = (u - 0.76f) / 0.055f;
+        const float hiL = std::exp(-qL * qL), hiR = std::exp(-qR * qR);
+        uint32_t& o = out[(size_t)(H - 1 - y) * W + x];
+        if (sack) {
+          float f = 1.0f - 0.32f * e2 + 0.07f * hiL;
+          // Grain: a hash of the pixel in the sack's own frame.
+          const uint32_t gx = (uint32_t)(int)std::floor(l.x + 512.f), gy = (uint32_t)(int)std::floor(l.y + 512.f);
+          uint32_t hsh = gx * 73856093u ^ gy * 19349663u;
+          hsh ^= hsh >> 13; hsh *= 0x5bd1e995u; hsh ^= hsh >> 15;
+          if ((hsh & 7u) == 0) f -= 0.06f;
+          o = PackRGBA((int)(138 * f), (int)(96 * f), (int)(60 * f), 255);
+          continue;
+        }
+        // Thicker toward the sides, steeply only near the edge (Fresnel-ish):
+        // ~10 of 255 in the middle, ~75 at the wall.
+        const float glassA = 10.0f + 65.0f * e2 * e2;
+        const float h = (46.0f * hiL + 22.0f * hiR) / 255.0f;
+        const int a = (int)(o >> 24);
+        float r, g, b, oa;
+        if (a == 0) {
+          r = 205; g = 228; b = 245; oa = glassA;
+        } else {
+          // Contents: darker toward the sides, then the glass laid over them.
+          const float f = 1.0f - 0.16f * e2;
+          const float veil = glassA / 255.0f * 0.8f;
+          r = ChR(o) * f; g = ChG(o) * f; b = ChB(o) * f;
+          r += (205 - r) * veil; g += (228 - g) * veil; b += (245 - b) * veil;
+          oa = a + (255 - a) * glassA / 255.0f;
+        }
+        r += (255 - r) * h; g += (255 - g) * h; b += (255 - b) * h;
+        if (a == 0) oa = std::max(oa, h * 255.0f);
+        o = PackRGBA((int)std::lround(r), (int)std::lround(g), (int)std::lround(b), (int)std::lround(oa));
+      }
+  }
 }
 
 }  // namespace alchemy

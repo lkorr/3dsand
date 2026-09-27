@@ -85,6 +85,10 @@ struct VesselShape {
   std::vector<V2> profile;  // (halfWidth, height) pairs, height ascending
   float width = 80, height = 110;  // interior box in pixels
   float wall = 1.5f;               // glass half-thickness, pixels
+  // A glass body is drawn as a round bottle, not a slice: its inside wears a
+  // faint glass tint shaded across its width, over whatever it holds
+  // (Render, "the glass body"). A sack (PouchShape) is not glass.
+  bool glass = true;
 };
 
 // The shapes the game authors today. Data later (items.json `profile`).
