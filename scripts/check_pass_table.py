@@ -170,6 +170,15 @@ PIPE_TO_MEMBER = {
     "PIPE_FLUID_CONSUME_APPLY": "fluidConsumeApply_",
     "PIPE_FLUID_STAIN_APPLY": "fluidStainApply_",
     "PIPE_FLUID_MIRROR_FOLD": "fluidMirrorFold_",
+    # The solute layer (sim_solute.wgsl, docs/PLAN_solutes.md).
+    "PIPE_SOL_WANT": "solWant_",
+    "PIPE_SOL_ARGS": "solArgs_",
+    "PIPE_SOL_ALLOC": "solAlloc_",
+    "PIPE_SOL_DIFFUSE": "solDiffuse_",
+    "PIPE_SOL_COMPACT": "solCompact_",
+    "PIPE_SOL_HASH": "solHash_",
+    "PIPE_SOL_EVICT": "solEvict_",
+    "PIPE_SOL_RESTORE": "solRestore_",
 }
 
 # Table buffer id -> the WGSL identifier(s) it is bound as. One id can appear
@@ -316,6 +325,14 @@ BUF_TO_WGSL = {
     "DrawArgs": set(),
     "FluidDispatchArgs": set(),
     "FluidPDispatchArgs": set(),
+    # The solute layer, bindings 40..43 of simBGL_ (world.h kSol*). SolArgs is
+    # indirect-only, like DispatchArgs.
+    "SolTable": {"solTable"},
+    "SolPool": {"solPool"},
+    "SolMeta": {"solMeta"},
+    "SolSpec": {"solSpec"},
+    "SolArgs": set(),
+    "SolStage": {"solStage"},
 }
 
 READ_ACCS = {"R", "U", "I", "TR"}
@@ -374,6 +391,8 @@ _SIM_GROUP0 = {
     "reposeSnap",
     # W2's per-column surface-momentum store, binding 36.
     "waterFlux",
+    # The solute layer, bindings 40..43 (docs/PLAN_solutes.md).
+    "solTable", "solPool", "solMeta", "solSpec", "solStage",
 }
 # The slim group is 0..4 PLUS the two page buffers at 17/18 — not a dense
 # prefix any more. One WGSL identifier cannot carry two binding numbers
@@ -432,7 +451,10 @@ _FLUID_SEAM_GROUP1 = {"fluidSrc", "fluidParticles", "fluidSpawnOps",
                       "fluidBlockMapR", "fluidGridR", "fluidArgs", "dirtyList",
                       "exciteScratch", "fluidCalm", "settleScratch",
                       "compactScratch", "fluidCellScratch", "fluidBlockList",
-                      "fluidMirror"}
+                      "fluidMirror",
+                      # The solute layer, bindings 14..17 (docs/PLAN_solutes.md):
+                      # exciteDetect refuses a solute-carrying cell.
+                      "solTable", "solPool", "solMeta", "solSpec"}
 
 LAYOUT_BINDINGS = {
     "simPL_": _SIM_GROUP0,

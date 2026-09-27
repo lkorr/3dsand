@@ -753,6 +753,14 @@ TP_U(sim, liquidMinFilm, TUNE_LIQUID_MIN_FILM, 1, 1, 4)
 // The CA and worldgen read the same row, so they cannot disagree.
 TP_U(sim, powderFineRepose, TUNE_POWDER_FINE_REPOSE, 1, 0, 1)
 TP_U(sim, wanderHopMask, TUNE_WANDER_HOP_MASK, 7, 0, 255)
+// THE SOLUTE LAYER (docs/PLAN_solutes.md, DESIGN.md "Solutes"). soluteMode
+// 0 is the off switch the CA reads: no powder dissolves (the aux layer then
+// stays empty and every solute pass dispatches over nothing). 1 = on.
+TP_U(sim, soluteMode, TUNE_SOLUTE_MODE, 1, 0, 1)
+// A percentage scale on every species' authored `diffusivity` (solutes.json),
+// so one --sweep proves the pair exchange reaches the kernel. 0 freezes
+// dissolved mass where the current left it; 100 is the authored rate.
+TP_U(sim, soluteDiffusion, TUNE_SOLUTE_DIFFUSION, 100, 0, 400)
 TP_U(sim, expMicroPerMille, TUNE_EXP_MICRO_PERMILLE, 900, 0, 1000)
 // Both of these are packed into bit fields in Particle.flags; an
 // out-of-range value would wrap into the neighbouring field rather than

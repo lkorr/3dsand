@@ -490,6 +490,8 @@
     "liquidMinFilm": 1,
     "powderFineRepose": 1,
     "wanderHopMask": 7,
+    "soluteMode": 1,
+    "soluteDiffusion": 100,
     "expMicroPerMille": 900,
     "expMicroLifeTicks": 40,
     "expMicroScaleIdx": 2,

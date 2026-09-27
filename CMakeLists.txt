@@ -589,6 +589,7 @@ add_library(sandvox_core OBJECT
   src/test/selftest_alchemy.cpp
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
+  src/test/selftest_solute.cpp
   src/test/selftest_impact.cpp
   src/test/selftest_audio.cpp
   src/test/selftest_net.cpp

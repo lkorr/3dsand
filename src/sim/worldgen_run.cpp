@@ -34,6 +34,11 @@ void SubmitWorldgen(GpuContext& ctx, World& world, Simulation& sim, uint32_t see
   // reconstructible and DISPOSABLE (plan section 3.1) — so dispose of it, on
   // both sides: the CPU registry and the GPU record.
   WaterBodies().Reset();
+  // THE SOLUTE LAYER DESCRIBES THE OLD WORLD TOO, and unlike the water-body
+  // ledger it is AUTHORITATIVE: left alone, a regenerated lake would inherit
+  // the salt of whatever water used to occupy its cells. A fresh world has no
+  // dissolved matter until something dissolves.
+  world.ResetSolutes(ctx.queue);
   {
     static const std::vector<int32_t> kZero((size_t)kWaterBodyStateTotalWords,
                                             0);

@@ -2656,7 +2656,90 @@ def check_stain_prec():
                        "assets/shaders/common.wgsl", _STAINPREC_NAMES)
 
 
+# ------------------------------------------------------- the solute layer
+# assets/shaders/*.wgsl (MIRROR-BEGIN solute)  <->  each other + src/sim/world.h
+# (docs/PLAN_solutes.md). The layer's accessors are pasted into every shader
+# that binds it rather than living in common.wgsl (an edit there recompiles
+# every shader), so the copies must be TEXT-IDENTICAL -- a drift is two
+# kernels disagreeing about which half of a word a cell lives in, i.e. mass
+# silently moving between cells. And the constants must match world.h's kSol*
+# block, which the CPU uses to size, reset, save and read the same buffers.
+_SOLUTE_CONSTS = {
+    "SOL_UNIFORM_BIT": "kSolUniformBit", "SOL_PAGE_BIT": "kSolPageBit",
+    "SOL_PAGE_MASK": "kSolPageMask", "SOL_WORDS_PER_PAGE": "kSolWordsPerPage",
+    "SOL_POOL_PAGES": "kSolutePoolPages",
+    "SOLM_FREE": "kSolMFree", "SOLM_WANT_COUNT": "kSolMWantCount",
+    "SOLM_FAULTS": "kSolMFaults", "SOLM_EXHAUSTED": "kSolMExhausted",
+    "SOLM_HIGH_WATER": "kSolMHighWater", "SOLM_DISSOLVED": "kSolMDissolved",
+    "SOLM_PRECIP": "kSolMPrecip", "SOLM_DISCARDED": "kSolMDiscarded",
+    "SOLM_CONVERTED": "kSolMConverted", "SOLM_FAULT_SLOT": "kSolMFaultSlot",
+    "SOLM_FAULT_TICK": "kSolMFaultTick", "SOLM_POURED": "kSolMPoured",
+    "SOLM_SCOOPED": "kSolMScooped", "SOLM_SEAM_REFUSED": "kSolMSeamRefused",
+    "SOLM_ARGS": "kSolMArgs",
+    "SOLM_STACK": "kSolMStackBase", "SOLS_BASE": "kSolSpecBase",
+    "SOLS_STRIDE": "kSolSpecStride", "SOLS_MAT_BASE": "kSolSpecMatBase",
+}
+
+
+def check_solute_mirror():
+    import glob
+    blocks = {}
+    for f in sorted(glob.glob(str(ROOT / "assets" / "shaders" / "*.wgsl"))):
+        txt = Path(f).read_text(encoding="utf-8", errors="replace")
+        b = _mirror_blocks(txt, "solute")
+        if b:
+            blocks[Path(f).name] = b
+    if not blocks:
+        return
+    checked.append("solute")
+    for name, b in blocks.items():
+        if len(b) != 1:
+            problems.append(f"solute: {name} has {len(b)} `MIRROR-BEGIN solute` "
+                            "blocks; expected exactly one")
+    ref_name = "sim_solute.wgsl" if "sim_solute.wgsl" in blocks else sorted(blocks)[0]
+    ref = blocks[ref_name][0]
+    for name, b in blocks.items():
+        if b[0] != ref:
+            a, c = ref.splitlines(), b[0].splitlines()
+            i = 0
+            while i < min(len(a), len(c)) and a[i] == c[i]:
+                i += 1
+            problems.append(
+                f"solute: {name}'s solute block differs from {ref_name}'s at line "
+                f"{i + 1} of the block -- the copies must be identical.\n"
+                f"      {ref_name}: {a[i] if i < len(a) else '<end>'}\n"
+                f"      {name}: {c[i] if i < len(c) else '<end>'}")
+    wh = read("src/sim/world.h")
+
+    def cpp_value(name, depth=0):
+        m = re.search(r"constexpr\s+uint32_t\s+" + name + r"\s*=\s*([^;]+);", wh)
+        if not m or depth > 4:
+            return None
+        expr = m.group(1).strip()
+        expr = re.sub(r"(0x[0-9A-Fa-f]+|\d+)u\b", r"\1", expr)
+
+        def sub(mm):
+            v = cpp_value(mm.group(0), depth + 1)
+            return str(v) if v is not None else mm.group(0)
+        expr = re.sub(r"\bk[A-Za-z0-9_]+\b", sub, expr).replace("/", "//")
+        try:
+            return int(eval(expr, {"__builtins__": {}}, {}))
+        except Exception:
+            return None
+
+    for w, c in _SOLUTE_CONSTS.items():
+        mw = re.search(r"const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u\s*;", ref)
+        cv = cpp_value(c)
+        if not mw or cv is None:
+            problems.append(f"solute: cannot read {w} (the solute block) or {c} (world.h)")
+            continue
+        if int(mw.group(1), 0) != cv:
+            problems.append(f"solute: {w} = {mw.group(1)} in the WGSL block but "
+                            f"{c} = {cv} in world.h")
+
+
 ALL = {
+    "solute": check_solute_mirror,
     "coatrule": check_coat_rule,
     "stainprec": check_stain_prec,
     "coatflame": check_coat_flame,

@@ -21,6 +21,8 @@
 #include "gpu/rhi_record.h"  // the Vulkan table-recording bridge (phase 4a)
 #include "gpu/rhi_vk.h"      // rhi::vkr::SavePipelineCache (EnsureRenderPipelines)
 #include "sim/worldmap.h"    // CurrentWorldMap().pondTile: the POND_TILE prelude const (P-F)
+#include "sim/solutes.h"     // LoadSolutes: the species table UploadTables packs
+#include "test/support.h"    // AssetDir(): the one asset-path chokepoint (solutes.json)
 
 // The pond lattice the live shaders were compiled with (POND_TILE), so an
 // environment reload that moves it recompiles them (UploadEnvironment).
@@ -121,7 +123,16 @@ bool Simulation::Init(const rhi::Device& device, World& world,
   reactionBuf_ = CreateBuffer(device, sizeof(ReactionGpu) * kMaxReactions,
                               rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
                               "reactions");
+  // The solute species table (world.h kSolSpec*): fixed size, filled by the
+  // UploadTables below and by every materials reload after it.
+  solSpecBuf_ = CreateBuffer(device, (uint64_t)kSolSpecWords * 4,
+                             rhi::BufferUsage::Storage | rhi::BufferUsage::CopyDst,
+                             "solSpec");
   UploadTables(queue, mats, reactions);
+  // The solute layer's free stack and empty table, before any tick can
+  // allocate (a zeroed meta record would read as an EMPTY STACK, and the first
+  // dissolve would be a fatal exhaustion). Worldgen and loads reset it again.
+  world_->ResetSolutes(queue);
 
   // Static micro-detail (render-only — sim/microvox.h). Both buffers are bound
   // ONLY to the raymarch pipeline: they are render data, and a sim shader that
@@ -333,6 +344,18 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         // simSlimBGL_: `far`/`fardown` never reach genChunk or `cols`.
         entry(38, T::ReadOnlyStorage), // genCols (list position -> chunk-column)
         entry(39, T::Storage),         // colCache (per-(x, z) column records)
+        // The solute layer (world.h kSol* block, docs/PLAN_solutes.md). The
+        // table and the meta record are Storage because sim_solute.wgsl's
+        // allocator writes them; the CA reads the table and writes the pool
+        // (atomically -- two 16-bit cells share a word) and the meta record
+        // (requests, the ledger counters). simBGL_ only: no slim-group
+        // pipeline names them. 40..43, the first free slots of this dense
+        // 0..39 layout.
+        entry(40, T::Storage),         // solTable (per-slot sentinel / page)
+        entry(41, T::Storage),         // solPool (16-bit cells, 2 per word)
+        entry(42, T::Storage),         // solMeta (free stack, lists, ledger)
+        entry(43, T::ReadOnlyStorage), // solSpec (solutes.json, per material)
+        entry(44, T::Storage),         // solStage (eviction / restore records)
     };
     simBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -456,6 +479,13 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(11, T::Storage),         // fluidCellScratch (intents + flags)
         entry(12, T::Storage),         // fluidBlockList (stainApply's slots)
         entry(13, T::Storage),         // fluidMirror (swimming fold)
+        // The solute layer (world.h kSol*): exciteDetect REFUSES a cell that
+        // carries dissolved mass (a particle has no solute payload yet, so
+        // exciting it would delete the mass) and counts the refusal.
+        entry(14, T::Storage),         // solTable
+        entry(15, T::Storage),         // solPool
+        entry(16, T::Storage),         // solMeta
+        entry(17, T::ReadOnlyStorage), // solSpec
     };
     fluidSeamBGL_ = device.CreateBindGroupLayout(sfentries, std::size(sfentries));
   }
@@ -940,6 +970,10 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         b(11, world_->fluidCellScratch),
         b(12, world_->fluidBlockList),
         b(13, world_->fluidMirror),
+        b(14, world_->solTable),
+        b(15, world_->solPool),
+        b(16, world_->solMeta),
+        b(17, solSpecBuf_),
     };
     fluidSeamBG_[page] = device.CreateBindGroup(fluidSeamBGL_, sentries,
                                                 std::size(sentries), "fluidSeamBG");
@@ -1044,6 +1078,11 @@ void Simulation::BuildSimBindGroups(const rhi::Device& device) {
         b(37, world_->chunkHash),
         b(38, genColsBuf_),
         b(39, colCacheBuf_),
+        b(40, world_->solTable),
+        b(41, world_->solPool),
+        b(42, world_->solMeta),
+        b(43, solSpecBuf_),
+        b(44, world_->solStage),
     };
     simBG_[page] = device.CreateBindGroup(simBGL_, entries, std::size(entries), "simBG");
 
@@ -1254,6 +1293,73 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   for (size_t i = 0; i < reactions.size() && i < kMaxReactions; i++)
     rtable[i] = reactions[i];
   queue.WriteBuffer(reactionBuf_, 0, rtable.data(), rtable.size() * sizeof(ReactionGpu));
+
+  // THE SOLUTE SPECIES (docs/PLAN_solutes.md §2.3). Re-read here, on every
+  // table upload, because the species name their powders and solvents BY
+  // MATERIAL NAME: a materials reload that moves an id must re-resolve them,
+  // and this is the one function every reload path already comes through.
+  // A table that fails to load is reported and uploaded EMPTY -- nothing
+  // dissolves, which is a world rather than a crash.
+  {
+    std::vector<SoluteDef> defs;
+    std::string err;
+    if (!LoadSolutes(sandvox::AssetDir() + "/materials/solutes.json", mats, defs, err)) {
+      std::fprintf(stderr, "solutes.json: %s", err.c_str());
+      defs.clear();
+    }
+    UploadSolutes(queue, defs, mats);
+  }
+}
+
+void Simulation::UploadSolutes(const rhi::Queue& queue, const std::vector<SoluteDef>& defs,
+                               const std::vector<MaterialDef>& mats) {
+  std::vector<uint32_t> w(kSolSpecWords, 0u);
+  uint32_t count = 0;
+  for (const SoluteDef& d : defs) {
+    if (d.species == 0 || d.species > kSolSpeciesMax) continue;
+    count = std::max<uint32_t>(count, d.species);
+    uint32_t* r = &w[kSolSpecBase + d.species * kSolSpecStride];
+    // Units per EIGHTH of a powder voxel -- the granularity mass enters and
+    // leaves the world at (a powder cell holds eighths), and the contract's
+    // unit bridge: one dissolved eighth is yieldPerVoxel / 8 units.
+    r[0] = std::max<uint32_t>(1u, d.yieldPerVoxel / 8u);
+    r[1] = std::min<uint32_t>(255u, d.saturation);
+    // Per mille in the file, units of 1/kReactChanceDen on the GPU: the CA
+    // rolls it against the same counter-hash the reaction rules do.
+    r[2] = std::min<uint32_t>(1000u, d.dissolveChance) * kReactChanceScale;
+    r[3] = std::min<uint32_t>(256u, d.diffusivity);
+    r[4] = d.floor;
+    r[5] = (uint32_t)d.densityPerUnit;
+    r[6] = d.tint;
+    r[7] = d.tintStrength;
+    r[8] = d.glow;
+    r[9] = d.precipitatesTo;
+    const uint32_t nc = std::min<uint32_t>((uint32_t)d.converts.size(), kSolConvertsMax);
+    r[10] = nc;
+    for (uint32_t k = 0; k < nc; k++) {
+      const SoluteConvert& c = d.converts[k];
+      r[11 + k] = (c.solvent & 0xFFFu) | ((uint32_t)(c.into & 0xFFFu) << 12) |
+                  (std::min<uint32_t>(c.cMin, 255u) << 24);
+    }
+    r[15] = d.from;
+    // Per material: which species a powder dissolves AS, and which species a
+    // liquid is a SOLVENT of. The mask is kSolSolventSpeciesMax wide; a
+    // species past it simply has no solvent on the GPU (reported once).
+    if (d.from < 4096) w[kSolSpecMatBase + d.from] |= d.species & 0xFFu;
+    if (d.species <= kSolSolventSpeciesMax) {
+      for (uint16_t sv : d.solvents)
+        if (sv < 4096) w[kSolSpecMatBase + sv] |= 1u << (7 + d.species);
+    } else {
+      std::fprintf(stderr, "solutes.json: species \"%s\" (%u) is past the %u the GPU "
+                   "solvent mask holds; it dissolves into nothing\n",
+                   d.name.c_str(), d.species, kSolSolventSpeciesMax);
+    }
+  }
+  w[0] = count;
+  (void)mats;
+  queue.WriteBuffer(solSpecBuf_, 0, w.data(), w.size() * 4);
+  solutes_ = defs;
+  SetCurrentSolutes(defs);
 }
 
 void Simulation::UploadMicro(const rhi::Queue& queue, const MicroSet& micro) {
@@ -1535,6 +1641,10 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // function was entered (the tuning, the tree lattice, the world map) and
   // writes only its own handle.
   rhi::ShaderModule mWorldgen, mMutate, mCompact, mStep, mOcc, mPick;
+  // The solute layer's allocator, diffusion, compaction and hash
+  // (docs/PLAN_solutes.md). Its own module: the CA carries mass through its
+  // liquid moves and this file does everything else.
+  rhi::ShaderModule mSolute;
   // The openness grid's writer (docs/PLAN_gi.md §2). A RENDER-path module among
   // the sim ones for shadow_resolve.wgsl's reason: BuildPipelines is the single
   // place F5 recompiles, and the pass and the raymarch's reader must be
@@ -1570,6 +1680,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mMutate, "sim_mutate.wgsl");
     mod(&mCompact, "sim_compact.wgsl");
     mod(&mStep, "sim_step.wgsl");
+    mod(&mSolute, "sim_solute.wgsl");
     mod(&mOcc, "sim_occupancy.wgsl");
     mod(&mPick, "sim_pick.wgsl");
     mod(&mOpenness, "sim_openness.wgsl");
@@ -1592,7 +1703,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
     mod(&mDenoise, "denoise.wgsl");
     loads.Run(buildThreads);
   }
-  if (!mWorldgen || !mMutate || !mCompact || !mStep || !mOcc || !mPick ||
+  if (!mWorldgen || !mMutate || !mCompact || !mStep || !mSolute || !mOcc || !mPick ||
       !mOpenness || !mGlow ||
       !mExplode || !mParticle || !mGas || !mFluid || !mFluidSeam || !mWaterBody ||
       !mRay || !mDebris ||
@@ -1675,6 +1786,16 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { glowField_ = MakeComputePipeline(device, simPL_, mGlow, "field", "glowField"); });
   pool.Add([&] { glowRefresh_ = MakeComputePipeline(device, simPL_, mGlow, "refresh", "glowRefresh"); });
   pool.Add([&] { pick_ = MakeComputePipeline(device, simPL_, mPick, "main", "pick"); });
+  // The solute layer (docs/PLAN_solutes.md). On simPL_ like the CA it rides
+  // beside: the table, pool, meta and species table are bindings 40..43.
+  pool.Add([&] { solWant_ = MakeComputePipeline(device, simPL_, mSolute, "solWant", "solWant"); });
+  pool.Add([&] { solArgs_ = MakeComputePipeline(device, simPL_, mSolute, "solArgs", "solArgs"); });
+  pool.Add([&] { solAlloc_ = MakeComputePipeline(device, simPL_, mSolute, "solAlloc", "solAlloc"); });
+  pool.Add([&] { solDiffuse_ = MakeComputePipeline(device, simPL_, mSolute, "solDiffuse", "solDiffuse"); });
+  pool.Add([&] { solCompact_ = MakeComputePipeline(device, simPL_, mSolute, "solCompact", "solCompact"); });
+  pool.Add([&] { solHash_ = MakeComputePipeline(device, simPL_, mSolute, "solHash", "solHash"); });
+  pool.Add([&] { solEvict_ = MakeComputePipeline(device, simPL_, mSolute, "solEvict", "solEvict"); });
+  pool.Add([&] { solRestore_ = MakeComputePipeline(device, simPL_, mSolute, "solRestore", "solRestore"); });
 
   pool.Add([&] { explodeMark_ = MakeComputePipeline(device, simPL2_, mExplode, "mark", "explodeMark"); });
   pool.Add([&] { explodeApply_ = MakeComputePipeline(device, simPL2_, mExplode, "apply", "explodeApply"); });
@@ -1795,6 +1916,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   if (!worldgen_ || !worldgenList_ || !worldgenCols_ || !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !rainFall_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
+      !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
       !fluidSpawn_ ||
@@ -2076,6 +2198,12 @@ const rhi::Buffer& Simulation::PassBuffer(pass::Buf b) const {
     case B::WorldMap:            return worldMapBuf_;
     case B::GenCols:             return genColsBuf_;
     case B::ColCache:            return colCacheBuf_;
+    case B::SolTable:            return world_->solTable;
+    case B::SolPool:             return world_->solPool;
+    case B::SolMeta:             return world_->solMeta;
+    case B::SolSpec:             return solSpecBuf_;
+    case B::SolArgs:             return world_->solArgs;
+    case B::SolStage:            return world_->solStage;
     case B::GasParticlesRead:    return world_->gasParticles[page_];
     case B::GasParticlesWrite:   return world_->gasParticles[1 - page_];
     case B::GasCounts:           return world_->gasCounts;
@@ -2182,6 +2310,14 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::FluidStainApply:     return fluidStainApply_;
     case P::FluidMirrorFold:     return fluidMirrorFold_;
     case P::FluidCellClear:      return fluidCellClear_;
+    case P::SolWant:        return solWant_;
+    case P::SolArgsP:       return solArgs_;
+    case P::SolAlloc:       return solAlloc_;
+    case P::SolDiffuse:     return solDiffuse_;
+    case P::SolCompact:     return solCompact_;
+    case P::SolHash:        return solHash_;
+    case P::SolEvict:       return solEvict_;
+    case P::SolRestore:     return solRestore_;
     default:                return step_;
   }
 }
@@ -2393,6 +2529,20 @@ void Simulation::EncodeLoadReset(const rhi::CommandEncoder& enc) {
 void Simulation::EncodeHashOnly(const rhi::CommandEncoder& enc) {
   RecordCtx cx{};
   RecordTable(enc, pass::Table::HashOnly, &cx);
+}
+
+void Simulation::EncodeSoluteEvict(const rhi::CommandEncoder& enc, uint32_t count) {
+  if (count == 0) return;
+  RecordCtx cx{};
+  cx.genCount = count;
+  RecordTable(enc, pass::Table::SolEvict, &cx);
+}
+
+void Simulation::EncodeSoluteRestore(const rhi::CommandEncoder& enc, uint32_t count) {
+  if (count == 0) return;
+  RecordCtx cx{};
+  cx.genCount = count;
+  RecordTable(enc, pass::Table::SolRestore, &cx);
 }
 
 void Simulation::EncodeWakeAll(const rhi::Queue& queue) {

@@ -10,6 +10,7 @@
 
 #include "gpu/resources.h"   // AssembleShaderSource: the fingerprint's WGSL
 #include "sim/biomes.h"      // EnvironmentStamp: map / biomes / trees
+#include "sim/solutes.h"     // CurrentSolutes: the species name table of solutes.svs
 #include "sim/worldmap.h"    // ActiveMapName
 #include "sim/tuning.h"      // CurrentTuning().world.mapLayer
 #include "sim/tuningstamp.h" // HashOneFile, the same FNV the stamps use
@@ -39,6 +40,26 @@ constexpr uint32_t kEntMagicV1 = 0x31455653;  // 'SVE1' - still loads (untagged)
 constexpr uint32_t kEntMagic = 0x32455653;    // 'SVE2'
 
 std::string MetaPath(const std::string& dir) { return dir + "/meta.svm"; }
+
+// ---- solutes.svs: THE SOLUTE LAYER'S FILE (docs/PLAN_solutes.md §7.1) -------
+//
+// Dissolved mass is authoritative world state (hashed), and it is NOT in the
+// voxel word, so it cannot ride the region files: it has its own file beside
+// them, holding every chunk's solute the save knows -- the resident window's
+// (captured at save time) and every chunk the window has evicted (the
+// stream's kept map). One file rather than per-region records because the
+// layer is sparse by design: a settled world holds a handful of entries.
+//
+//   u32 'SVS1', u32 speciesCount, then per species (u32 id, str name) -- the
+//   NAME TABLE the cell values were written under, so a load remaps species
+//   ids by name exactly as region files remap material ids; then u32 count,
+//   then per chunk: u64 PackChunkKey(wc), u32 entry, u32 stall, and for a
+//   page entry its kSolWordsPerPage u32 words.
+//
+// A save with no solute writes no file (and removes a stale one); a world dir
+// without the file loads with an empty layer.
+constexpr uint32_t kSolFileMagic = 0x31535653;  // 'SVS1'
+std::string SolPath(const std::string& dir) { return dir + "/solutes.svs"; }
 // The pre-S4 monolithic file: read (legacy load), never written, deleted by
 // the first S4 save.
 std::string EntPath(const std::string& dir) { return dir + "/entities.sve"; }
@@ -346,6 +367,111 @@ uint32_t VoxelMetersBits() {
   return bits;
 }
 
+// solutes.svs (the layout is at SolPath). Returns false only on a write error.
+bool WriteSoluteFile(const std::string& dir, const Stream::SoluteMap& m) {
+  if (m.empty()) {
+    std::error_code ec;
+    std::filesystem::remove(SolPath(dir), ec);
+    return true;
+  }
+  std::vector<uint8_t> buf;
+  ByteWriter w{buf};
+  w.U32(kSolFileMagic);
+  const std::vector<SoluteDef>& sp = CurrentSolutes();
+  w.U32((uint32_t)sp.size());
+  for (const SoluteDef& d : sp) {
+    w.U32(d.species);
+    w.Str(d.name);
+  }
+  w.U32((uint32_t)m.size());
+  for (const auto& [key, sc] : m) {
+    w.Pod(key);
+    const bool page = (sc.entry & kSolPageBit) != 0 && sc.words.size() == kSolWordsPerPage;
+    w.U32(page ? kSolPageBit : (sc.entry & ~kSolPageBit));
+    w.U32(sc.stall);
+    if (page) w.Bytes(sc.words.data(), kSolWordsPerPage * 4);
+  }
+  return WriteFileAtomic(SolPath(dir), buf);
+}
+
+// A 16-bit cell value with its species re-keyed through `remap` (old id ->
+// new id; a species the running table no longer has maps to 0 and the cell
+// is dropped, counted in `lost`).
+uint32_t RemapSoluteValue(uint32_t v, const std::vector<uint32_t>& remap, uint64_t& lost) {
+  if (v == 0) return 0;
+  const uint32_t s = v >> 8;
+  const uint32_t ns = s < remap.size() ? remap[s] : 0u;
+  if (ns == 0) {
+    lost += v & 0xFFu;
+    return 0;
+  }
+  return (ns << 8) | (v & 0xFFu);
+}
+
+// Read solutes.svs into `m` (cleared first). An absent file is an empty layer
+// and true; a malformed one is reported and loads nothing.
+bool ReadSoluteFile(const std::string& dir, Stream::SoluteMap& m) {
+  m.clear();
+  std::vector<uint8_t> bytes;
+  if (!ReadFileBytes(SolPath(dir), bytes)) return true;
+  ByteReader r{bytes.data(), bytes.size()};
+  uint32_t magic = 0, nsp = 0;
+  r.U32(magic);
+  r.U32(nsp);
+  if (!r.ok || magic != kSolFileMagic || nsp > kSolSpeciesMax) {
+    std::fprintf(stderr, "load: %s is not a solute file (magic %08x)\n",
+                 SolPath(dir).c_str(), magic);
+    return false;
+  }
+  // BY NAME, like the material table: solutes.json may have been reordered or
+  // extended since the save.
+  std::vector<uint32_t> remap(kSolSpeciesMax + 1, 0u);
+  bool identity = true;
+  for (uint32_t i = 0; i < nsp && r.ok; i++) {
+    uint32_t id = 0;
+    std::string name;
+    r.U32(id);
+    r.Str(name);
+    const SoluteDef* d = CurrentSoluteNamed(name.c_str());
+    if (id <= kSolSpeciesMax) remap[id] = d ? d->species : 0u;
+    if (!d || d->species != id) identity = false;
+  }
+  uint32_t count = 0;
+  r.U32(count);
+  uint64_t lost = 0;
+  for (uint32_t i = 0; i < count && r.ok; i++) {
+    uint64_t key = 0;
+    Stream::SoluteChunk sc;
+    r.Pod(key);
+    r.U32(sc.entry);
+    r.U32(sc.stall);
+    if (sc.entry & kSolPageBit) {
+      sc.words.resize(kSolWordsPerPage);
+      r.Bytes(sc.words.data(), kSolWordsPerPage * 4);
+      if (!identity)
+        for (uint32_t& wd : sc.words)
+          wd = RemapSoluteValue(wd & 0xFFFFu, remap, lost) |
+               (RemapSoluteValue(wd >> 16, remap, lost) << 16);
+    } else if (!identity) {
+      const uint32_t v = RemapSoluteValue(sc.entry & 0xFFFFu, remap, lost);
+      sc.entry = v ? (kSolUniformBit | v) : 0u;
+    }
+    if (!r.ok) break;
+    if (sc.entry != 0) m[key] = std::move(sc);
+  }
+  if (!r.ok) {
+    std::fprintf(stderr, "load: %s is truncated; its solute was not loaded\n",
+                 SolPath(dir).c_str());
+    m.clear();
+    return false;
+  }
+  if (lost)
+    std::printf("load: %llu units of dissolved mass belonged to species the "
+                "running solutes.json no longer has; dropped\n",
+                (unsigned long long)lost);
+  return true;
+}
+
 }  // namespace
 
 const char* WorldgenFingerprintPartName(uint32_t i) {
@@ -586,6 +712,22 @@ bool SaveWorld(GpuContext& ctx, World& world, Stream& stream,
   if (!store.Flush(&regions, &bytes)) return false;
   rep.regions = regions;
   rep.bytes = bytes;
+  // THE SOLUTE LAYER (solutes.svs): every chunk the stream has kept plus the
+  // resident window, captured now. Capture first -- it completes any eviction
+  // still in flight, which is what makes the kept map complete.
+  {
+    Stream::SoluteMap resident;
+    stream.CaptureResidentSolutes(resident);
+    Stream::SoluteMap sol = stream.Solutes();
+    for (auto& kv : resident) sol[kv.first] = std::move(kv.second);
+    if (!WriteSoluteFile(path, sol)) {
+      std::fprintf(stderr, "save: failed to write %s\n", SolPath(path).c_str());
+      return false;
+    }
+    if (!sol.empty())
+      std::printf("save: solute layer -- %zu chunks carry dissolved mass (%zu "
+                  "resident)\n", sol.size(), resident.size());
+  }
   rep.fingerprint = ComputeWorldgenFingerprint(sandvox::AssetDir(), mats);
 
   // Entities BEFORE meta, for the same reason meta comes last at all: meta's
@@ -858,6 +1000,13 @@ bool LoadWorld(GpuContext& ctx, World& world, Simulation& sim, Stream& stream,
   // Before the window refill reads a single region: the table untagged files
   // decode under (see the material-table block above).
   store.Tables().AdoptLegacy(metaTable);
+
+  // The saved solute layer (solutes.svs) becomes the stream's kept map; the
+  // GPU layer is emptied first so the refill below restores ONLY the saved
+  // one (ReloadWindow's capture then finds nothing of the replaced world).
+  stream.DiscardSoluteState();
+  world.ResetSolutes(ctx.queue);
+  ReadSoluteFile(path, stream.Solutes());
 
   {
     // Snapshot restore (worldgen-equivalent), not a live mutation: the direct

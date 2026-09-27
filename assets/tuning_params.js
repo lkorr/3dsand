@@ -289,6 +289,8 @@ const TUNING_PARAMS = {
   'sim.liquidMinFilm':{t:'u',def:1,min:1,max:4,wgsl:'TUNE_LIQUID_MIN_FILM'},
   'sim.powderFineRepose':{t:'u',def:1,min:0,max:1,wgsl:'TUNE_POWDER_FINE_REPOSE'},
   'sim.wanderHopMask':{t:'u',def:7,min:0,max:255,wgsl:'TUNE_WANDER_HOP_MASK'},
+  'sim.soluteMode':{t:'u',def:1,min:0,max:1,wgsl:'TUNE_SOLUTE_MODE'},
+  'sim.soluteDiffusion':{t:'u',def:100,min:0,max:400,wgsl:'TUNE_SOLUTE_DIFFUSION'},
   'sim.expMicroPerMille':{t:'u',def:900,min:0,max:1000,wgsl:'TUNE_EXP_MICRO_PERMILLE'},
   'sim.expMicroLifeTicks':{t:'u',def:40,min:1,max:255,wgsl:'TUNE_EXP_MICRO_LIFE'},
   'sim.expMicroScaleIdx':{t:'u',def:2,min:0,max:3,wgsl:'TUNE_EXP_MICRO_SCALE_IDX'},

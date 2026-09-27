@@ -30,6 +30,7 @@
 #include "sim/windprim.h"
 #include "sim/currentprim.h"
 #include "sim/trample.h"
+#include "sim/solutes.h"
 
 namespace sandvox {
 
@@ -1978,6 +1979,23 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
     // the CPU never chose, so activeChunks alone does not mean settled.
     const WorldSnapshot& sn = world.Snap();
     if (sn.valid) {
+      // SOLUTE POOL EXHAUSTION IS FATAL (world.h kSolutePoolPages, the
+      // kPoolPages policy): the GPU allocator refused a page, so which slots
+      // lost is scheduling-dependent and the writes they would have taken are
+      // gone. Aborting at detection names the moment; continuing would be a
+      // world that differs between machines with nothing to say why.
+      if (sn.solExhausted != 0) {
+        std::fprintf(stderr,
+                     "FATAL: solute page pool exhausted at tick %u (%u refused "
+                     "pops): pool %u pages, high water %u, free %u. Mass in "
+                     "flight: dissolved %u, discarded %u, precipitated %u. The "
+                     "pool is sized in world.h (kSolutePoolPages = kNumSlots / "
+                     "kSolPoolDivisor); this is genuine demand past it.\n",
+                     sn.tick, sn.solExhausted, kSolutePoolPages, sn.solHighWater,
+                     sn.solFree, sn.solDissolved, sn.solDiscarded, sn.solPrecip);
+        std::fflush(stderr);
+        std::abort();
+      }
       sim.NoteSnapshot(sn.tick, sn.activeChunks, sn.particleCount);
       // The C_GAS latch's disarming input. Latent by design — see the block in
       // Simulation::EncodeTick for why a stale zero cannot turn gas off.
@@ -2390,6 +2408,15 @@ std::vector<BrushOp> SelftestOps(uint32_t tick, uint32_t seed) {
   // under the sand source, so it cuts the column rather than its origin.
   if (tick >= 70 && tick < 100) {
     ops.push_back({100, ground(100, 100) + 106, 100, 3, 0, 2u, 0, 0});
+  }
+  // SOLUTE COVERAGE (docs/PLAN_solutes.md): salt rains into the water pour, so
+  // the determinism hash covers dissolving, mass riding every liquid move,
+  // diffusion, the page allocator and -- where the lava reaches the pool --
+  // brine boiling off into precipitate. Resolved BY NAME through the table the
+  // GPU holds (no id pinned for it); a table without salt simply skips it.
+  if (tick >= 20 && tick < 70) {
+    if (const SoluteDef* salt = CurrentSoluteNamed("salt"))
+      ops.push_back({176, ground(176, 176) + 96, 176, 2, salt->from, 0, 0, 0});
   }
   return ops;
 }
