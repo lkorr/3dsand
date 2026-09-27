@@ -3712,6 +3712,113 @@ static void PhaseJ(TickAuthorityCtx& w, WorldScratch& ws,
 
 // ---- PHASE K (PLAYER) - laser kerf, the sword bite, prefab drain, explosions
 // Verbatim from the single-body TickAuthority, lines 2034-2334 at 54fe241.
+// ---- REACTION EFFECTS -> EXPLOSIONS (docs/PLAN_alchemy_chemistry.md A) ----
+//
+// The world's handler registry for reactions.json "effects", keyed by kind
+// NAME. Only `explode` has a world handler today; every other kind is the
+// bench's (package C) or nobody's yet, and is ignored here by design
+// (materials.h ReactionEffect: "a consumer that does not know a kind ignores
+// it"). A new world kind is one more `if (fx.kind == ...)` below plus JSON.
+//
+// WHAT IT READS is fixed-latency and ordered: the grid's firings come from
+// World::TakeReactFx (published snapshots, slot order within a tick, tick
+// order across), the bodies' from MobSystem::TakeBodyReactFx (this tick's
+// burn pass, creature order). Everything below is a pure function of those
+// lists and the tick, so two runs author the same ExplosionOps (rule 1), and
+// every blast is an ExplosionOp through SubmitTick (rule 3).
+//
+// BOUNDED (rule 2): at most kReactBlastsPerTick blasts a tick from reactions
+// (inside the engine's kMaxExplosionsPerTick), and a firing within an
+// already-issued blast's radius this tick is merged into it rather than
+// blasted again -- a lump of sodium in a lake fires hundreds of rules a
+// tick, and what reads right is a few bangs, not a hundred.
+static constexpr uint32_t kReactBlastsPerTick = 4;
+
+static void ReactFxAftermath(TickAuthorityCtx& w, uint32_t tick,
+                             std::vector<CellOp>& cellOps) {
+  auto& rf = w.reactFx;
+  if (rf.aftermath.empty()) return;
+  // Resolved by name, never a hardcoded id (CLAUDE.md conventions).
+  uint32_t fireId = 0, smokeId = 0;
+  for (size_t i = 1; i < w.mats.size(); i++) {
+    if (w.mats[i].name == "fire") fireId = (uint32_t)i;
+    if (w.mats[i].name == "smoke") smokeId = (uint32_t)i;
+  }
+  std::vector<TickAuthorityCtx::ReactFxWorld::Aftermath> keep;
+  for (const auto& a : rf.aftermath) {
+    // One tick AFTER the blast, so the crater exists and the IfAir ops land
+    // in the hole it opened instead of on the rock it was about to remove.
+    if (a.tick >= tick) { keep.push_back(a); continue; }
+    const uint32_t key = (uint32_t)a.c.x * 73856093u ^ (uint32_t)a.c.y * 19349663u ^
+                         (uint32_t)a.c.z * 83492791u;
+    const int r = std::max(1, a.radius);
+    const int rf3 = std::max(1, (3 * r) / 4);
+    // A brief flash of flame inside the crater and a puff of smoke over it.
+    // Fire decays in a few ticks and smoke in a few seconds (reactions.json),
+    // so this is the whole of the aftermath; nothing here grows.
+    const int nFire = std::min(4 + 2 * r, 20);
+    const int nSmoke = std::min(3 + r, 12);
+    for (int k = 0; k < nFire + nSmoke; k++) {
+      if (cellOps.size() >= kMaxCellOpsPerTick) break;
+      const uint32_t h = rng::Hash3(key, a.tick, 0xAF7E0000u + (uint32_t)k);
+      const bool fire = k < nFire;
+      const int span = fire ? rf3 : r;
+      const int dx = (int)(h % (uint32_t)(2 * span + 1)) - span;
+      const int dz = (int)((h >> 10) % (uint32_t)(2 * span + 1)) - span;
+      const int dy = fire ? (int)((h >> 20) % (uint32_t)(2 * span + 1)) - span
+                          : (int)((h >> 20) % (uint32_t)(r + 1)) + r / 2;
+      const IVec3 c{a.c.x + dx, a.c.y + dy, a.c.z + dz};
+      if (!w.world.CellInWindow(c)) continue;
+      const uint32_t mat = fire ? fireId : smokeId;
+      if (!mat) continue;
+      cellOps.push_back({World::SlotCellIndex(c),
+                         PackVoxNew(mat, (h >> 28) % 3u) | kCellOpIfAir});
+      rf.aftermathCells++;
+    }
+  }
+  rf.aftermath.swap(keep);
+}
+
+static void ReactFxToBlasts(TickAuthorityCtx& w, uint32_t tick,
+                            std::vector<ExplosionOp>& exps) {
+  auto& rf = w.reactFx;
+  std::vector<ReactFxEvent> evs = w.world.TakeReactFx();
+  std::vector<ReactFxEvent> body = w.mobs.TakeBodyReactFx();
+  rf.bodyEvents += body.size();
+  evs.insert(evs.end(), body.begin(), body.end());
+  rf.events += evs.size();
+  uint32_t issued = 0;
+  const size_t first = exps.size();
+  for (const ReactFxEvent& e : evs) {
+    const RuleFx* fx = FindRuleFx(w.mats, e.fxId);
+    if (!fx) continue;
+    for (const ReactionEffect& eff : fx->effects) {
+      if (eff.kind != "explode") continue;  // not a world kind (yet)
+      bool merged = false;
+      for (size_t i = first; i < exps.size() && !merged; i++) {
+        const ExplosionOp& o = exps[i];
+        merged = std::max({std::abs(o.x - e.cell.x), std::abs(o.y - e.cell.y),
+                           std::abs(o.z - e.cell.z)}) <= std::max(o.radius, 1);
+      }
+      if (merged || issued >= kReactBlastsPerTick ||
+          exps.size() >= kMaxExplosionsPerTick) {
+        rf.refused++;
+        continue;
+      }
+      const int radius = std::clamp(eff.radius, 1, kMaxExplosionRadius);
+      const ExplosionOp op{e.cell.x, e.cell.y, e.cell.z, radius,
+                           std::max(1, eff.power), 0, 0, 0};
+      exps.push_back(op);
+      issued++;
+      rf.blasts++;
+      rf.recent.push_back(op);
+      if (rf.recent.size() > TickAuthorityCtx::ReactFxWorld::kRecent)
+        rf.recent.erase(rf.recent.begin());
+      rf.aftermath.push_back({e.cell, radius, tick});
+    }
+  }
+}
+
 static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
                     SessionTick& st, PlayerScratch& ps, uint32_t tick,
                     OpBatch& out) {
@@ -3989,6 +4096,14 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
         } else {
           i++;
         }
+      }
+      // REACTIONS THAT EXPLODE (sodium + water, hydrogen + fire, ...). The
+      // world's, so the primary's slot, like a gate's blast; after the
+      // player's own blasts so a grenade is never refused for a reaction.
+      // Last tick's blasts get their fire and smoke first.
+      if (s.index == 0) {
+        ReactFxAftermath(w, tick, cellOps);
+        ReactFxToBlasts(w, tick, exps);
       }
       if (exps.size() > expBegin) {
         everExploded = true;

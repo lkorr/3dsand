@@ -5990,6 +5990,13 @@ class MobSystem {
     float intensity = 0;   // 0..1 of the bleed budget cap
   };
   const std::vector<BleedSource>& BleedSources() const { return bleeds_; }
+  // Reaction effects that fired on a body this tick (docs/PLAN_alchemy_
+  // chemistry.md A): drained once per tick by game/session.cpp.
+  std::vector<ReactFxEvent> TakeBodyReactFx() {
+    std::vector<ReactFxEvent> out;
+    out.swap(bodyFx_);
+    return out;
+  }
 
   // ---- hit flash ----------------------------------------------------------
   // Age every limb's hit flash. Called from PreTick, so it runs wherever the
@@ -6953,6 +6960,12 @@ class MobSystem {
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
   WornStats wornStats_{};
   BurnStats burnStats_{};
+  // Reaction effects that fired ON a body this tick (BurnOneLimb's
+  // noteBodyFx), drained by game/session.cpp's reaction-effect pass through
+  // TakeBodyReactFx. Capped per tick (a body standing in a sodium spill
+  // should not queue hundreds); the session merges and caps again.
+  std::vector<ReactFxEvent> bodyFx_;
+  static constexpr size_t kBodyFxPerTick = 16;
   std::vector<uint8_t> matHot_;         // carries tag:hot
   std::vector<uint8_t> matInfectious_; // carries tag:infectious
   // Material has a pair rule that REWRITES ITS NEIGHBOUR. This is the inbound

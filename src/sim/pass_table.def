@@ -116,6 +116,18 @@ PASS(fill_hash, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, 
      USES(TW(Hash)))
 PASS(fill_actVoxViz, nullptr, PT_TICK, PIPE_NONE, K_FILL, 0,0,0, GRP_NONE, DYN_NONE, C_VIZACTIVE, 1,
      USES(TW(ActVoxViz)))
+// THE REACTION-EFFECT RECORD (world.h kPageFaultReactFx*): pageFaults words
+// 40..63, byte offset 160, 96 bytes. Per tick, unlike the rest of that record
+// (which is monotonic and never cleared): the CA's reactFxNote (sim_step.wgsl)
+// writes "which rules with effects fired where THIS tick", and the snapshot
+// ring copies it at the end of the tick. C_ALWAYS rather than C_CAACTIVE: a
+// tick whose CA does not run must still publish an EMPTY record, or the
+// snapshot would carry the last active tick's blasts a second time. 96 bytes
+// a tick is the whole cost. Literal offset/size for the gasSpawn header's
+// reason (pass_table.cpp does not see world.h); world.h static_asserts the
+// layout it describes.
+PASS(fill_reactFx, nullptr, PT_TICK, PIPE_NONE, K_FILL, 160,96,0, GRP_NONE, DYN_NONE, C_ALWAYS, 1,
+     USES(TW(PageFaults)))
 // ---- gas particles (docs/PLAN_gas_particles.md stage 1) -------------------
 // Three fills, all under C_GAS, so a world with no plume and a settled CA
 // records none of them.

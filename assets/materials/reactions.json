@@ -1430,6 +1430,325 @@
       "chance": 1,
       "infectSpread": true,
       "neighborBecomes": "rotflesh"
+    },
+    {
+      "note": "======== ALCHEMY CHEMISTRY, IN THE WORLD (2026-09-27, docs/PLAN_alchemy_chemistry.md package A) ========\nEverything below is APPENDED at the end of the file, so each rule lands at the END of its material's bucket: rule index is part of the reaction RNG stream (hash3(rnd, ri, slot)), and appending re-rolls nothing that was already authored -- including the new rules on OLD materials (acid, lye's neutralization) that sit after acid's iron rule.\n\nEFFECTS. A rule may carry \"effects\": [ {\"kind\": \"explode\", \"radius\": r, \"power\": p} ]. The rule still writes its products exactly as any rule does; the effect is what ELSE happens. The CA cannot run a blast, so it reports the firing (sim_step.wgsl reactFxNote -> the pageFaults record's per-tick block -> the snapshot ring, fixed latency) and game/session.cpp turns it into a real ExplosionOp through the grenade path: crater, body carve, debris impulse, rig launch, plus a short flash of fire and a puff of smoke laid into the crater the tick after. A body the rule fires ON (mob.cpp's inbound pass: sodium beside a bleeding wound) blasts at the body voxel. BOUNDED: at most 4 reaction blasts a tick, a firing inside a blast already issued this tick is merged into it, and the GPU record keeps 16 candidates a tick chosen order-free -- so a lump of sodium in a lake is a few bangs, not a hundred. radius <= 20 (kMaxExplosionRadius); a grenade is radius 13 power 380 for scale. Kinds the world does not handle (flash, eject, shock, burst -- the alchemy bench's) are ignored here.\n\nIGNITION SCALING, AGAIN. A rule whose selfBecomes is a heat source is an ignition to the loader and is multiplied by combustion.spreadPct (29% as shipped) -- sodium and hydrogen catching fire below are, and their authored chances are written knowing it. Salt MELTING is too (molten_salt is hot), which is why its authored 30 reads as ~9 per-mille."
+    },
+    {
+      "note": "-------- sodium: explodes in water --------\nReal: 2Na + 2H2O -> 2NaOH + H2 + heat, violently. So the sodium cell becomes HYDROGEN (which the blast's own fire may then pop -- a second, smaller bang is right) and the water beside it becomes LYE. Weaker blasts in the other wet things. No fire as a direct product on purpose: that would make these ignitions to the loader (x spreadPct); the flame comes from the explosion's aftermath instead. The pile is consumed as it reacts, so a lump in a lake burns out in a few seconds."
+    },
+    {
+      "self": "sodium",
+      "neighbor": "water",
+      "chance": 300,
+      "selfBecomes": "hydrogen",
+      "neighborBecomes": "lye",
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 5,
+          "power": 150
+        }
+      ]
+    },
+    {
+      "self": "sodium",
+      "neighbor": "enchanted_water",
+      "chance": 250,
+      "selfBecomes": "hydrogen",
+      "neighborBecomes": "lye",
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 4,
+          "power": 110
+        }
+      ]
+    },
+    {
+      "self": "sodium",
+      "neighbor": "blood",
+      "chance": 150,
+      "selfBecomes": "hydrogen",
+      "neighborBecomes": "lye",
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 3,
+          "power": 80
+        }
+      ]
+    },
+    {
+      "self": "sodium",
+      "neighbor": "enchanted_blood",
+      "chance": 150,
+      "selfBecomes": "hydrogen",
+      "neighborBecomes": "lye",
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 3,
+          "power": 80
+        }
+      ]
+    },
+    {
+      "note": "Steam only fizzes: a sodium grain in a cloud of steam turns to hydrogen without a bang. Then heat: sodium burns (a real alkali-metal fire)."
+    },
+    {
+      "self": "sodium",
+      "neighbor": "steam",
+      "chance": 20,
+      "selfBecomes": "hydrogen"
+    },
+    {
+      "self": "sodium",
+      "neighbor": "tag:hot",
+      "chance": 40,
+      "rainDamped": true,
+      "selfBecomes": "fire"
+    },
+    {
+      "note": "-------- hydrogen: the lightest gas; pops near a flame or a spark --------\nThe ignition is authored at 400 and compiled at x spreadPct (~116 per-mille): a hydrogen cloud touching a flame goes off within a few ticks, and each pop is fire that lights the next shell -- a chain the blast cap (4 a tick, merged by radius) and the fuel itself bound. A spark lights it too (tag:electric; not hot, so it is its own rule). Hydrogen and chlorine in daylight make hydrochloric acid with a small bang (the real photochemical H2 + Cl2 reaction). Left alone it simply escapes."
+    },
+    {
+      "self": "hydrogen",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "fire",
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 3,
+          "power": 60
+        }
+      ]
+    },
+    {
+      "self": "hydrogen",
+      "neighbor": "tag:electric",
+      "chance": 600,
+      "selfBecomes": "fire",
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 3,
+          "power": 60
+        }
+      ]
+    },
+    {
+      "self": "hydrogen",
+      "neighbor": "chlorine",
+      "chance": 30,
+      "minLight": 128,
+      "selfBecomes": "acid",
+      "neighborBecomes": "air",
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 2,
+          "power": 40
+        }
+      ]
+    },
+    {
+      "self": "hydrogen",
+      "decay": true,
+      "chance": 4,
+      "becomes": "air"
+    },
+    {
+      "note": "-------- salt melts; molten salt cools; electrolysis --------\nSalt melts over heat. molten_salt is itself hot, so without an exception a single hot spot would melt a whole pile through molten salt alone and the pile would then oscillate against its own cooling (rule 2: it would never sleep). The neighborChance exception makes molten salt a very weak melter of salt (2%), fire the usual weak one. Molten salt COOLS back to salt at a rate that rises with how much of its surroundings is NOT hot (an inverted ramp over tag:hot): a pool freezes from its skin inward once the heat is gone, and a vessel on a burner (the alchemy bench's virtual hot neighbour) keeps it molten.\n\nELECTROLYSIS (the Downs cell, the one real way sodium is made): molten salt touching a spark (tag:electric) splits -- the salt cell becomes sodium, the spark becomes chlorine. Brine electrolysis (chlorine + hydrogen + lye from salt WATER) needs the solute layer's concentration condition and is package B/C's. Salt + water has NO rule here on purpose: salt dissolves into the solute layer once package B lands; until then it sinks like sand."
+    },
+    {
+      "self": "salt",
+      "neighbor": "tag:hot",
+      "chance": 30,
+      "selfBecomes": "molten_salt",
+      "neighborChance": {
+        "fire": 0.0625,
+        "molten_salt": 0.02
+      }
+    },
+    {
+      "self": "molten_salt",
+      "neighbor": "tag:electric",
+      "chance": 500,
+      "selfBecomes": "sodium",
+      "neighborBecomes": "chlorine"
+    },
+    {
+      "self": "molten_salt",
+      "neighbor": "water",
+      "chance": 400,
+      "selfBecomes": "salt",
+      "neighborBecomes": "steam"
+    },
+    {
+      "self": "molten_salt",
+      "decay": true,
+      "chance": 5,
+      "becomes": "salt",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "invert": true,
+        "scaleMax": 3
+      }
+    },
+    {
+      "note": "-------- spark: a discharge that lives a tick or two --------\nDecays at 450 per-mille (mean ~2 ticks). Lights what burns beside it WEAKLY -- authored from the spark's side (neighborBecomes fire), so it is not an ignition to the loader's spread knob. Its real job is tag:electric: electrolysis above and hydrogen's pop."
+    },
+    {
+      "self": "spark",
+      "neighbor": "tag:flammable",
+      "chance": 40,
+      "neighborBecomes": "fire"
+    },
+    {
+      "self": "spark",
+      "decay": true,
+      "chance": 450,
+      "becomes": "air"
+    },
+    {
+      "note": "-------- chlorine and noxious gas: toxic --------\nBoth HURT BODIES through mob.cpp's inbound pass, which runs a world cell's pair rules onto the body voxels it touches (the way acid dissolves a limb): chlorine blisters skin and exposed flesh to flesh_cooked -- a chemical burn, which is a burn stage, so it counts into the burnt fraction that caps a creature's (and the player's) health (DESIGN.md \"Blood is health, and burns cap it\"). Noxious gas does the same, far more weakly. Neither touches anything a body is not made of.\n\nChlorine is gas_heavy (materials.h kMatFlagHeavyGas): it SINKS and creeps along the ground, pooling in hollows, instead of rising (sim_step.wgsl stepHeavyGas). It fades slowly (4 per-mille, ~8 s), and bleaches into water very slowly as a weak acid. Noxious gas rises like smoke and fades faster than it (12)."
+    },
+    {
+      "self": "chlorine",
+      "neighbor": "skin",
+      "chance": 30,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "chlorine",
+      "neighbor": "skin_bruised",
+      "chance": 30,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "chlorine",
+      "neighbor": "flesh",
+      "chance": 30,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "chlorine",
+      "neighbor": "muscle",
+      "chance": 30,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "chlorine",
+      "neighbor": "water",
+      "chance": 2,
+      "selfBecomes": "air",
+      "neighborBecomes": "acid"
+    },
+    {
+      "self": "chlorine",
+      "decay": true,
+      "chance": 4,
+      "becomes": "air"
+    },
+    {
+      "self": "noxious_gas",
+      "neighbor": "skin",
+      "chance": 5,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "noxious_gas",
+      "neighbor": "flesh",
+      "chance": 5,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "noxious_gas",
+      "decay": true,
+      "chance": 12,
+      "becomes": "air"
+    },
+    {
+      "note": "-------- acid: dissolves most things, and FUMES --------\nAppended after acid's iron rule (rule index is the RNG stream). What acid did not eat before and eats now: crystal (slowly). What it still does not: glass (vials are made of it), steel (armor-react's claim: a sword and plate hold), gold (aqua regia is a later recipe), bone (as authored above), gem_arcane.\n\nEVERY DISSOLUTION FUMES: a share of the voxels acid eats become noxious_gas instead of vanishing -- the dissolvable rule at 5 per-mille against the eating rules' 25-125 is roughly one fuming voxel in ten, which reads as a pool that smokes green while it works rather than as a gas flood. Iron and crystal fume at their own slow rates. On a BODY (the inbound pass and an acid coat) the same rule sends the fume up off the limb.\n\nNEUTRALIZATION: acid meeting lye becomes water (or steam -- the heat of it) and the lye becomes salt; acid meeting sodium (tag:alkali) gives hydrogen and salt."
+    },
+    {
+      "self": "acid",
+      "neighbor": "tag:dissolvable",
+      "chance": 5,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "acid",
+      "neighbor": "iron",
+      "chance": 3,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "acid",
+      "neighbor": "crystal",
+      "chance": 6,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "acid",
+      "neighbor": "crystal",
+      "chance": 2,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "acid",
+      "neighbor": "lye",
+      "chance": 200,
+      "selfBecomes": "water",
+      "neighborBecomes": "salt"
+    },
+    {
+      "self": "acid",
+      "neighbor": "lye",
+      "chance": 100,
+      "selfBecomes": "steam",
+      "neighborBecomes": "salt"
+    },
+    {
+      "self": "acid",
+      "neighbor": "tag:alkali",
+      "chance": 300,
+      "selfBecomes": "hydrogen",
+      "neighborBecomes": "salt"
+    },
+    {
+      "note": "-------- lye: caustic --------\nEats organic matter a tenth as fast as acid eats flesh, and is spent doing it (it weakens to water), so a spill scars the grass under it and stops. Reaches bodies through the inbound pass like acid. Neutralized by acid (acid's rules above)."
+    },
+    {
+      "self": "lye",
+      "neighbor": "tag:organic",
+      "chance": 12,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "lye",
+      "neighbor": "tag:organic",
+      "chance": 3,
+      "selfBecomes": "water"
+    },
+    {
+      "note": "-------- fairy dust enchants water and blood --------\nA simple PAIR RULE for now: one grain turns the liquid cell it touches. Package B's solute layer is meant to REPLACE these with concentration (solutes.json `fairy`: dissolve, diffuse, convert at cMin) -- delete these two when it does."
+    },
+    {
+      "self": "fairy_dust",
+      "neighbor": "water",
+      "chance": 60,
+      "selfBecomes": "air",
+      "neighborBecomes": "enchanted_water"
+    },
+    {
+      "self": "fairy_dust",
+      "neighbor": "blood",
+      "chance": 60,
+      "selfBecomes": "air",
+      "neighborBecomes": "enchanted_blood"
     }
   ]
 }

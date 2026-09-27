@@ -1389,6 +1389,10 @@ Each dirty voxel rolls against its reaction table entries: probability is expres
 Chained rules produce emergent behavior for free: acid → stone → gravel → sand is
 an erosion system nobody explicitly wrote.
 
+A rule may also carry **effects** (2026-09-27) — sodium + water explodes. The CA
+only REPORTS the firing; the blast is an ExplosionOp authored on the CPU a fixed
+number of ticks later. See §6 "Reaction effects".
+
 ### Day/night, and sunlight as a sim input (2026-08-20)
 
 The world runs a day/night cycle, and sunlight is a real input to the CA:
@@ -3545,6 +3549,86 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
   liquid: every firing spends at least one level (a deep coat its price), a
   body coat is only what was poured or splashed, and `coat.decay` dries what
   does not react.
+
+### Reaction effects: a rule that does more than rewrite cells (2026-09-27; `MaterialDef::ruleFx`, `sim_step.wgsl` `reactFxNote`, `session.cpp` `ReactFxToBlasts`, gates `chem-*`)
+
+docs/PLAN_alchemy_chemistry.md (package A). Any rule in reactions.json may add
+```json
+{ "self": "sodium", "neighbor": "water", "chance": 300,
+  "selfBecomes": "hydrogen", "neighborBecomes": "lye",
+  "effects": [ { "kind": "explode", "radius": 5, "power": 150 } ] }
+```
+The rule writes its products exactly as before; the effect is what ELSE happens.
+`kind` is resolved BY NAME by each consumer's own handler registry, so a new kind
+is JSON plus one handler, never an enum. `materials.cpp` parses the list into
+`MaterialDef::ruleFx` (parallel to the material's bucket, `ruleFx[k]` ↔ rule
+`reactOffset + k`, synthesized neighborChance tails included — they inherit their
+parent's effects), validates `explode` (radius 1..`kMaxExplosionRadius`, power
+1..5000) and warns once about a kind outside `kKnownEffectKinds` (explode, flash,
+eject, shock, burst). Consumers: the WORLD (below: `explode`), the alchemy bench
+(package C: `explode`/`burst`/… as bench events), bodies (below).
+
+**The world's `explode` is a real explosion through the normal path.** The CA
+cannot run a blast, and must not decide one from append order:
+1. Every rule with effects gets a 5-bit **fx id** (1..31, file order) packed into
+   `ReactionGpu.cond` bits 24..28 (`kCondFxShift`), which nothing else reads —
+   gates, ramps and rolls are untouched.
+2. When such a rule fires, `sim_step.wgsl`'s `reactFxNote` records it into the
+   `pageFaults` record's **per-tick block** `[40..63]` (world.h
+   `kPageFaultReactFx*`; cleared every tick by pass_table's `fill_reactFx`):
+   an `atomicAdd` count and **16 slots**, each an `atomicMax` of
+   `(fxId << 27) | scramble(window cell)`, the slot chosen by
+   `hash3(seed, tick, cell)`. The survivors are a pure function of the SET of
+   firings — order-free, never an append cursor (rule 1). The scramble is an odd
+   multiply mod 2^27 so a slot's winner is spatially scattered, and it inverts
+   exactly (`ReactFxDecodeCell`).
+3. The record rides the snapshot ring (no new binding, no new readback — the scoop
+   ledger's trick) and is parsed per snapshot; `PublishSnapshotsUpTo` queues each
+   published snapshot's winners, so `World::TakeReactFx` at tick T returns the
+   firings of tick T − `kSnapshotLatency` − 1, exactly, on every machine.
+4. The primary session's explosion slot (phase K) drains them
+   (`ReactFxToBlasts`) and pushes an **ExplosionOp** per `explode` effect — the
+   grenade path: crater, `ExplosionHitsBodies` (body carve, debris impulse, rig
+   launch), island scan. The tick AFTER, `ReactFxAftermath` lays a brief ring of
+   fire in the crater and a puff of smoke over it as `IfAir` cell ops (rule 3;
+   fire dies in a few ticks, smoke in a few seconds).
+5. **Bounded** (rule 2): ≤ 4 reaction blasts a tick (`kReactBlastsPerTick`,
+   inside `kMaxExplosionsPerTick`), a firing inside a blast already issued this
+   tick is merged into it, and the GPU keeps 16 candidates a tick. A lump of
+   sodium in a lake is a few bangs; hydrogen chains are bounded by the cap and
+   by their fuel.
+
+**Bodies.** `MobSystem::BurnOneLimb`'s self and inbound passes evaluate the same
+rules on body voxels; a fired rule with an fx id is reported at that voxel's
+world cell (`noteBodyFx`, ≤ 16 a tick) and drained into the same handler — a
+body blasts where the reaction happened on it. (DebrisSystem's bodies do not
+report yet.) Out-of-window (ticket) cells are not reported: the key holds a
+window-relative cell; their products still apply.
+
+**Toxic gas** is plain rules through the same inbound pass: `chlorine` (30‰) and
+`noxious_gas` (5‰) turn skin / exposed flesh they touch into `flesh_cooked` — a
+chemical burn, which is a burn stage, so it feeds the burnt fraction that caps
+health for creatures and the player alike (the avatar runs the same
+`BurnTick`). **Heavy gas**: a gas tagged `gas_heavy` gets `kMatFlagHeavyGas`
+(derived at load) and `sim_step.wgsl`'s `stepHeavyGas` — down half the time,
+flat otherwise, NEVER up, and only into air or a lighter gas — so chlorine
+pools in hollows and creeps until its decay fades it. Gas parcels outside the
+window (sim_gas) do not know the flag.
+
+**The world chemistry** authored with this (reactions.json, the ALCHEMY
+CHEMISTRY section at the end of the file, every rule appended to its bucket):
+sodium + water / enchanted water / blood / enchanted blood → hydrogen + lye +
+explode; sodium + steam fizzes, + heat burns; hydrogen + heat or spark →
+explode, + chlorine in daylight → acid + small blast, decays (escapes); salt +
+heat → molten salt (molten salt itself a 2% melter, so a pile cannot melt
+itself), molten salt cools on an inverted hot ramp, + water quenches, + spark
+(tag:electric) → sodium + chlorine (electrolysis); spark ignites flammables
+weakly and lives ~2 ticks; acid dissolves crystal now and FUMES noxious gas
+from every dissolution (~1 in 10 eaten voxels), is neutralized by lye (→ water/
+steam + salt) and sodium (→ hydrogen + salt), and still spares glass, steel,
+gold, bone; lye eats organics at a tenth of acid and spends itself; fairy dust
++ water / blood → enchanted water / blood as a pair rule (package B's solute
+layer replaces it). Salt + water has no rule: it becomes the solute layer's.
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.

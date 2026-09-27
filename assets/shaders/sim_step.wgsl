@@ -1841,6 +1841,63 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
 // the six faces; covered hides the faces from pairs, emits and ramps. A rule
 // fired through the coat also returns true: the word changed (a level spent)
 // even where the material did not, and the caller must not move the stale one.
+// ---- REACTION EFFECTS: "this rule fired HERE" (docs/PLAN_alchemy_chemistry.md A)
+//
+// A rule authored with `"effects"` in reactions.json (sodium + water ->
+// explode) carries a 5-bit fx id in Reaction.cond bits 24..28
+// (materials.h kCondFxShift). The CA cannot run an explosion -- a blast is
+// an ExplosionOp through sim_explode.wgsl, authored on the CPU and pushed
+// through the op queue like a grenade (rule 3) -- so all it does is REPORT:
+// it records the firing into the pageFaults record's per-tick block
+// (world.h kPageFaultReactFx*), the snapshot ring carries that back at the
+// fixed World::kSnapshotLatency, and game/session.cpp turns the survivors
+// into ExplosionOps. The rule's own products are written here as always.
+//
+// ORDER-FREE, which is the whole design (rule 1). A busy tick (a lump of
+// sodium in a lake) fires hundreds of these; the record keeps RFX_SLOTS of
+// them, and WHICH ones must not depend on thread scheduling. So there is no
+// append cursor: each firing picks a slot by hash3 of (seed, tick, cell) and
+// atomicMax's a key that is unique per (fx id, cell) into it. The survivors
+// are the per-slot maxima of the SET of firings -- the same set, the same
+// maxima, on every machine. The key's cell half is scrambled by an odd
+// multiply (a bijection mod 2^27, world.h kReactFxScramble) so a slot's winner
+// is not always the cell nearest the window's far corner. The count and the
+// origin/tick words are an atomicAdd and identical stores: order-free too.
+//
+// Out-of-window cells (a ticket chunk; TICKET_SLOTS) are not reported: the
+// key holds a window-relative cell. Their products still apply; only the
+// effect is skipped, and a ticket chunk is a peer's, whose own window
+// reports it.
+//
+// Constants mirror world.h (check_invariants `pairs`); declared HERE, not in
+// common.wgsl, because only this shader writes the record (CLAUDE.md: a
+// common.wgsl edit misses the SPIR-V cache for every shader).
+const RFX_FIRES     : u32 = 40u;   // kPageFaultReactFxFires
+const RFX_ORIGIN    : u32 = 41u;   // kPageFaultReactFxOrigin (41..43)
+const RFX_TICK      : u32 = 44u;   // kPageFaultReactFxTick
+const RFX_SLOT0     : u32 = 48u;   // kPageFaultReactFxSlot0
+const RFX_SLOTS     : u32 = 16u;   // kPageFaultReactFxSlots
+const RFX_COND_SHIFT: u32 = 24u;   // kCondFxShift
+const RFX_COND_MASK : u32 = 31u;   // kCondFxMask
+const RFX_CELL_BITS : u32 = 27u;   // kReactFxCellBits
+const RFX_SCRAMBLE  : u32 = 0x0B5AD4EBu;  // kReactFxScramble
+
+fn reactFxNote(rule : Reaction, c : vec3<i32>) {
+  let fx = (rule.cond >> RFX_COND_SHIFT) & RFX_COND_MASK;
+  if (fx == 0u) { return; }
+  if (!inWindow(c, T.origin)) { return; }
+  let rel = vec3<u32>(c - T.origin * i32(CHUNK));
+  let lin = (rel.z * WORLD_N + rel.y) * WORLD_N + rel.x;
+  atomicAdd(&pageFaults[RFX_FIRES], 1u);
+  atomicStore(&pageFaults[RFX_ORIGIN + 0u], bitcast<u32>(T.origin.x));
+  atomicStore(&pageFaults[RFX_ORIGIN + 1u], bitcast<u32>(T.origin.y));
+  atomicStore(&pageFaults[RFX_ORIGIN + 2u], bitcast<u32>(T.origin.z));
+  atomicStore(&pageFaults[RFX_TICK], T.tick + 1u);
+  let slot = hash3(T.seed ^ 0xFE7C0DEu, T.tick, lin) % RFX_SLOTS;
+  let key = (fx << RFX_CELL_BITS) | ((lin * RFX_SCRAMBLE) & ((1u << RFX_CELL_BITS) - 1u));
+  atomicMax(&pageFaults[RFX_SLOT0 + slot], key);
+}
+
 fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
                m : Material, rnd : u32, synthSelf : bool, coat : u32,
                covered : bool, probe : bool) -> bool {
@@ -1899,6 +1956,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
       if (chance == 0u) { continue; }
       keepAwake = keepAwake || !lightGated;
       if (!probe && (rr % REACT_CHANCE_DEN) < chance) {
+        reactFxNote(rule, c);
         reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
         return true;
       }
@@ -1913,6 +1971,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if (voxMat(voxWordAt(n)) != MAT_AIR) { continue; }
         keepAwake = keepAwake || !lightGated;
         if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
+          reactFxNote(rule, c);
           let ni = voxWordIndex(n);  // resolved only for the cell that is written
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
           markVoxActive(ni);
@@ -1966,6 +2025,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         // Weather scale here, after the neighbour matched, so a dry-sky tick
         // and a wood cell with nothing hot beside it never pay the probe.
         if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
+          reactFxNote(rule, c);
           if (rule.prodNbr != PROD_KEEP) {
             if (synthFluid) { flagFluidConsume(n); }
             // For a synthesized neighbour ni is the air cell: a product
@@ -2007,6 +2067,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
         if ((coatRuleVerdict(flame, rf < 6u) & COAT_VERDICT_MATCH) != 0u) {
           keepAwake = keepAwake || !lightGated;
           if (!probe && (rr % REACT_CHANCE_DEN) < rainChance(rule, c, rule.chance)) {
+            reactFxNote(rule, c);
             if (rf < 6u) { coatRelease(c, rf, rule.prodNbr, rr, stamp); }
             if (rule.prodSelf != PROD_KEEP) {
               reactWriteSelf(c, idx, synthSelf, m.klass, rule.prodSelf, rnd, stamp);
@@ -3048,8 +3109,63 @@ fn gasLeave(c : vec3<i32>, idx : u32, w : u32, dst : vec3<i32>) -> bool {
 // saltation) both test CLASS_POWDER, so a gas falling through them was always
 // a no-op. Naming that here rather than letting it fall out is the difference
 // between "gas is done" and "gas happens to do nothing next".
+// ---- A HEAVY GAS SINKS AND CREEPS (materials.h kMatFlagHeavyGas) -----------
+// Chlorine is 2.5x denser than air: released, it rolls DOWN and spreads along
+// the ground, pooling in hollows, instead of rising like smoke. The CA's gas
+// ladder is all buoyancy (every fallback past the flat ring goes UP), so a
+// heavy gas takes its own short ladder: the primary is straight down half the
+// time and a flat step the other half, then the four flat laterals, and
+// NEVER an upward candidate -- a pooled cloud boxed in on all sides simply
+// waits. Wind is ignored (it only ever lifts or leans a buoyant parcel).
+//
+// It moves only into AIR or a LIGHTER gas: a heavy gas does not sink into a
+// pond or displace a solid. The pre-check is here because tryMove's density
+// test is a buoyancy test (rising = "the target is denser than me"), which
+// would let a gas moving DOWN swap under water. With the target vetted,
+// tryMove is called with density -1 so its own test always passes.
+//
+// Rule 2: a pool of heavy gas on flat ground random-walks until its authored
+// decay fades it (chlorine: reactions.json), so the chunk sleeps within that
+// lifetime; the walk itself creates nothing. Rule 1: every roll is from
+// `rnd`, the cell's own hash3 stream. Mirrored bit: check_invariants
+// `heavygas` holds MATF_HEAVY_GAS == kMatFlagHeavyGas.
+const MATF_HEAVY_GAS : u32 = 128u;
+
+fn heavyGasTarget(n : vec3<i32>, myDensity : i32) -> bool {
+  if (!inBounds(n)) { return false; }
+  let tm = voxMat(voxWordAt(n));
+  if (tm == MAT_AIR) { return true; }
+  let t = materials[tm];
+  return t.klass == CLASS_GAS && t.density < myDensity;
+}
+
+fn stepHeavyGas(c : vec3<i32>, w : u32, m : Material, rnd : u32) -> bool {
+  let rot = rnd >> 12u;
+  var cand : array<vec3<i32>, 5>;
+  let lat0 = lateralDir(rot);
+  if (((rnd >> 9u) & 1u) == 0u) {
+    cand[0] = vec3<i32>(0, -1, 0);
+  } else {
+    cand[0] = vec3<i32>(lat0.x, 0, lat0.y);
+  }
+  for (var i = 1u; i < 5u; i++) {
+    let d = lateralDir(rot + i);
+    cand[i] = vec3<i32>(d.x, 0, d.y);
+  }
+  for (var i = 0u; i < 5u; i++) {
+    let n = c + cand[i];
+    if (!heavyGasTarget(n, m.density)) { continue; }
+    if (tryMove(c, n, w, -1, true)) {
+      markDirtyR(c, select(DIRTY_M_GASLAT, DIRTY_M_GAS, cand[i].y != 0));
+      return true;
+    }
+  }
+  return false;
+}
+
 fn stepGas(c : vec3<i32>, idx : u32, w : u32, m : Material, slotIdx : u32,
            rnd : u32) -> bool {
+  if ((m.flags & MATF_HEAVY_GAS) != 0u) { return stepHeavyGas(c, w, m, rnd); }
   let g = gasIntent(c, m, slotIdx, rnd >> 10u);
 
   // Indices 0..5 need no lateral rotation. Split from the loop below so the

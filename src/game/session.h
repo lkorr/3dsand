@@ -807,6 +807,32 @@ struct TickAuthorityCtx {
   // GPU's scoop counter is world-wide, so every session's claims draw on one
   // per-tick pot here instead of each reading the whole delta for itself.
   ContainerScoopLedger scoopLedger;
+  // ---- REACTION EFFECTS IN THE WORLD (docs/PLAN_alchemy_chemistry.md A) ----
+  // The world consumer of reactions.json "effects" (materials.h RuleFx). The
+  // GPU reports which rules-with-effects fired where (sim_step.wgsl
+  // reactFxNote -> World::TakeReactFx, fixed latency), bodies report the same
+  // from the burn pass (MobSystem::TakeBodyReactFx), and the primary session's
+  // explosion slot (phase K) turns each `explode` effect into an ExplosionOp
+  // -- the grenade path: crater, body carve, debris impulse, rig launch --
+  // plus a brief ring of fire and smoke laid into the crater the NEXT tick
+  // (IfAir cell ops, so it fills only what the blast opened). Bounded:
+  // kReactBlastsPerTick per tick, one blast per `radius` neighbourhood.
+  struct ReactFxWorld {
+    struct Aftermath {
+      IVec3 c{};
+      int radius = 0;
+      uint32_t tick = 0;  // the tick the blast went off on
+    };
+    std::vector<Aftermath> aftermath;
+    // Telemetry, monotonic; the chem-* gates read these.
+    uint64_t events = 0;    // effect firings drained (grid slot winners + bodies)
+    uint64_t bodyEvents = 0;
+    uint64_t blasts = 0;    // ExplosionOps issued
+    uint64_t refused = 0;   // explode effects refused (per-tick cap / merged)
+    uint64_t aftermathCells = 0;  // fire + smoke cell ops laid
+    std::vector<ExplosionOp> recent;  // the last kRecent blasts issued
+    static constexpr size_t kRecent = 16;
+  } reactFx;
   // Each vessel body's velocity last tick, for the break test's "velocity
   // jump" witness. One entry per vessel lying or flying in the world.
   std::vector<std::pair<uint64_t, Vec3>> vesselVel;
