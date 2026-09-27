@@ -8058,6 +8058,338 @@ Status GateBruiseIsSkin(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---------------------------------------------------------------------------
+// heal-restore / heal-wound: A COAT THAT HEALS (alchemy package D, 2026-09-27)
+// ---------------------------------------------------------------------------
+//
+// Enchanted blood and enchanted water carry `coat.restore` (materials.json):
+// while a limb wears one, Mob::HealTick rebuilds it toward its authored recipe
+// (missing cells grow back, cells that are not the recipe's are put back, then
+// hp up to the burn cap) and PAYS for every cell out of the coat. Both gates
+// are the largest severable non-vital limb (ChooseTarget), a dummy creature,
+// THE tick (support::TickCursor).
+namespace {
+struct HealMats {
+  uint32_t eBlood = 0, eWater = 0, blood = 0, water = 0, skin = 0, cooked = 0;
+  bool ok() const { return eBlood && eWater && blood && water && skin && cooked; }
+};
+HealMats FindHealMats(const std::vector<MaterialDef>& mats) {
+  HealMats h;
+  for (size_t i = 0; i < mats.size(); i++) {
+    const std::string& n = mats[i].name;
+    if (n == "enchanted_blood") h.eBlood = (uint32_t)i;
+    if (n == "enchanted_water") h.eWater = (uint32_t)i;
+    if (n == "blood") h.blood = (uint32_t)i;
+    if (n == "water") h.water = (uint32_t)i;
+    if (n == "skin") h.skin = (uint32_t)i;
+    if (n == "flesh_cooked") h.cooked = (uint32_t)i;
+  }
+  return h;
+}
+// Coat levels of `mat` on one limb, off a freshly forced ledger.
+uint32_t HealCoatLevels(MobSystem& mobs, uint64_t id, int limb, uint32_t mat,
+                        uint32_t tick) {
+  mobs.RecountCoatOn(id, tick);
+  const LimbCoat* lc = mobs.LimbCoatOf(id, limb);
+  if (!lc) return 0;
+  for (const CoatEntry& e : lc->top)
+    if (e.mat == mat) return e.sumAmt;
+  return 0;
+}
+// Lattice cells one coat level of `m` buys on this def's authoritative lattice.
+double HealCellsPerLevel(const MobDef& def, const MaterialDef& m) {
+  const double s = (double)std::max(def.skinScale, def.physScale);
+  return (double)m.coatRestore * s * s * s;
+}
+}  // namespace
+
+// heal-restore. Claims:
+//   * WIRED: both enchanted liquids heal, blood and water do not, and each
+//     rides the stain slot of the liquid it is made from (the palette is full).
+//   * BOUNDED: a crater carved in the side of the limb, then a SMALL pour of
+//     enchanted blood (a 0.3-voxel disc, +1): cells rebuilt > 0 and never more
+//     than the poured levels buy (levels x restore x scale^3, +1 for the
+//     carried change); the coat is spent; once it is, 60 more ticks rebuild
+//     nothing (rule 2: healing cannot feed itself); and if the pour could not
+//     pay for the whole hole (the fixture asserts it cannot), the hole is NOT whole.
+//   * RESTORED: the same wound on a fresh creature, the limb soaked (+8,
+//     surface): it comes back to its recipe -- 0 missing, 0 changed cells --
+//     and the limb's hp is back to at least what it was before the carve.
+Status GateHealRestore(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
+  const HealMats hm = FindHealMats(c.mats);
+  if (!t.valid() || !hm.ok()) {
+    detail = "no fixture limb, or a heal material missing";
+    return Status::Fail;
+  }
+  const MaterialDef& eb = c.mats[hm.eBlood];
+  const MaterialDef& ew = c.mats[hm.eWater];
+  const bool wired = eb.coatRestore > 0.0f && ew.coatRestore > 0.0f &&
+                     c.mats[hm.blood].coatRestore == 0.0f &&
+                     c.mats[hm.water].coatRestore == 0.0f &&
+                     eb.stainSlot != 0 && eb.stainSlot == c.mats[hm.blood].stainSlot &&
+                     ew.stainSlot != 0 && ew.stainSlot == c.mats[hm.water].stainSlot &&
+                     mobs.StainTypeOf(hm.eBlood) != 0;
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const double cpl = HealCellsPerLevel(def, eb);
+
+  const IVec3 site = FixtureSite(c.world, kInset);
+  IVec3 pchunk{site.x >> 4, site.y >> 4, site.z >> 4};
+  uint32_t simTick = 36000;
+  support::TickCursor ticker{c, simTick, pchunk};
+  auto poseTick = [&]() {
+    ticker.chunk = pchunk;
+    ticker();
+  };
+  // A round crater in the SIDE of the limb at mid-length, where a ray across
+  // it first meets skin; `ro`/`rd` are that ray, for the pour.
+  Vec3 ro{}, rd{};
+  auto spawnWounded = [&](uint64_t& id) -> bool {
+    id = SpawnTarget(c, t, kInset, pchunk);
+    if (!id) return false;
+    mobs.SetMobBehavior(id, "dummy");
+    for (int i = 0; i < 10; i++) poseTick();
+    const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+    const Vec3 mid = ax.anchor + ax.along * (0.5f * ax.reach);
+    // The first of four sides from which the ray meets THIS limb first (an
+    // arm hangs against the torso on one side of it).
+    const Vec3 sides[4] = {ax.travel, ax.travel * -1.0f, ax.edge, ax.edge * -1.0f};
+    MobSystem::BodyRayHit hit;
+    for (const Vec3& s : sides) {
+      ro = mid + s * 20.0f;
+      rd = s * -1.0f;
+      hit = mobs.PickBody(id, ro, rd, 40.0f);
+      if (hit.hit && hit.limb == t.limb) break;
+    }
+    if (!hit.hit || hit.limb != t.limb) return false;
+    std::vector<ParticleSpawn> spawns;
+    mobs.CarveLimbRadial(mobs.LimbBody(id, t.limb), hit.pos, 1.0f, true, false,
+                         c.world, spawns);
+    for (int i = 0; i < 5; i++) poseTick();
+    return mobs.LimbBody(id, t.limb) != 0;
+  };
+
+  // ---- A: a small pour, bounded ---------------------------------------------
+  uint64_t idA = 0;
+  if (!spawnWounded(idA)) {
+    detail = t.defName + "." + t.limbName + ": fixture (spawn / ray / carve) failed";
+    return Status::Fail;
+  }
+  uint32_t missA0 = 0, diffA0 = 0;
+  mobs.LimbRecipeDiff(idA, t.limb, missA0, diffA0);
+  const MobSystem::BodyRayHit hA = mobs.PickBody(idA, ro, rd, 40.0f);
+  uint32_t markedA = 0;
+  const uint32_t didA =
+      hA.hit ? mobs.PourOnBody(idA, hA, rd, 0.3f, hm.eBlood, 1, simTick, &markedA) : 0u;
+  const uint32_t levelsA = HealCoatLevels(mobs, idA, hA.limb, hm.eBlood, simTick);
+  const double purseA = (double)levelsA * cpl;
+  uint32_t spentAt = 0;
+  for (int i = 0; i < 900; i++) {
+    poseTick();
+    if (mobs.LimbCoatMatCount(idA, hA.limb, hm.eBlood, 1) == 0) {
+      spentAt = (uint32_t)i + 1;
+      break;
+    }
+  }
+  const Mob::HealStats sA = mobs.HealStatsOf(idA);
+  for (int i = 0; i < 60; i++) poseTick();
+  const Mob::HealStats sA2 = mobs.HealStatsOf(idA);
+  uint32_t missA1 = 0, diffA1 = 0;
+  mobs.LimbRecipeDiff(idA, t.limb, missA1, diffA1);
+  const uint32_t rebuiltA = sA.grown + sA.mended;
+  const bool boundedOk =
+      hA.hit && hA.limb == t.limb && markedA > 0 &&
+      (didA & MobSystem::kRemedyRestore) && rebuiltA > 0 &&
+      (double)rebuiltA <= purseA + 1.0 && sA.levelsSpent <= levelsA &&
+      spentAt != 0 && sA2.grown == sA.grown && sA2.mended == sA.mended &&
+      sA2.levelsSpent == sA.levelsSpent && missA1 < missA0 &&
+      purseA < (double)(missA0 + diffA0) && missA1 + diffA1 > 0;
+
+  // ---- B: a soak, the limb comes back ---------------------------------------
+  uint64_t idB = 0;
+  const float hpPre = [&]() {
+    // The limb's hp BEFORE the carve, off an identical fresh spawn.
+    uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+    return id ? mobs.LimbHp(id, t.limb) : -1.0f;
+  }();
+  bool restoredOk = false;
+  uint32_t missB0 = 0, diffB0 = 0, missB1 = 0, diffB1 = 0, levelsB = 0,
+           doneAt = 0;
+  float hpB0 = 0.0f, hpB1 = 0.0f;
+  Mob::HealStats sB;
+  if (spawnWounded(idB)) {
+    mobs.LimbRecipeDiff(idB, t.limb, missB0, diffB0);
+    hpB0 = mobs.LimbHp(idB, t.limb);
+    mobs.SoakLimb(idB, t.limb, hm.eBlood, 8, simTick);
+    levelsB = HealCoatLevels(mobs, idB, t.limb, hm.eBlood, simTick);
+    for (int i = 0; i < 1500 && mobs.LimbBody(idB, t.limb); i++) {
+      poseTick();
+      if (i % 10 != 9) continue;
+      mobs.LimbRecipeDiff(idB, t.limb, missB1, diffB1);
+      if (missB1 == 0 && diffB1 == 0) {
+        doneAt = (uint32_t)i + 1;
+        break;
+      }
+    }
+    mobs.LimbRecipeDiff(idB, t.limb, missB1, diffB1);
+    // ...and the hp the rest of the coat buys once the shape is whole.
+    for (int i = 0; i < 30; i++) poseTick();
+    hpB1 = mobs.LimbHp(idB, t.limb);
+    sB = mobs.HealStatsOf(idB);
+    restoredOk = missB0 >= 30 && missB1 == 0 && diffB1 == 0 &&
+                 hpB1 + 1e-3f >= std::min(hpPre, def.limbs[t.limb].hp);
+  }
+  mobs.Reset();
+  c.debris.Reset();
+
+  detail = Format(
+      "%s.%s: wired %d, %.2f cells/level | A pour: %u marked, %u levels (purse "
+      "%.0f cells) on a hole of %u missing + %u changed -> rebuilt %u (%u grown, "
+      "%u mended, %u levels spent), coat spent after %u ticks, +60 ticks: %u "
+      "more; left %u missing | B soak: %u levels on %u missing + %u changed -> "
+      "%u missing + %u changed (whole at tick %u), %u grown, %u mended, hp "
+      "%.1f -> %.1f (pre-carve %.1f)",
+      t.defName.c_str(), t.limbName.c_str(), wired ? 1 : 0, cpl, markedA,
+      levelsA, purseA, missA0, diffA0, rebuiltA, sA.grown, sA.mended,
+      sA.levelsSpent, spentAt, (sA2.grown + sA2.mended) - rebuiltA, missA1,
+      levelsB, missB0, diffB0, missB1, diffB1, doneAt, sB.grown, sB.mended,
+      hpB0, hpB1, hpPre);
+  return wired && boundedOk && restoredOk ? Status::Pass : Status::Fail;
+}
+
+// heal-wound. Claims, on a limb CUT (a blade kerf: it bleeds, the soak
+// rewrites the flesh round it) and then BURNT (surface skin rewritten to
+// flesh_cooked, the way chlorine or a fire leaves it -- the burn cap drops):
+//   * DOUSED in enchanted blood (the health panel's Apply): the remedy bits
+//     say it stanches and restores; the wound closes; every cooked and soaked
+//     cell returns to the recipe; the burnt fraction falls and the cap rises;
+//     the limb's hp rises -- and on NO tick is it above hp x the burn cap.
+//   * ENCHANTED WATER, the gentle one, on a fresh cooked limb: it mends
+//     (> 0 cells), does not claim to stanch, and never rebuilds more than its
+//     levels buy.
+Status GateHealWound(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  constexpr int kInset = 300;
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, kInset));
+  const HealMats hm = FindHealMats(c.mats);
+  if (!t.valid() || !hm.ok()) {
+    detail = "no fixture limb, or a heal material missing";
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[t.defIndex];
+  const float hpMax = def.limbs[t.limb].hp;
+  const IVec3 site = FixtureSite(c.world, kInset);
+  IVec3 pchunk{site.x >> 4, site.y >> 4, site.z >> 4};
+  uint32_t simTick = 37000;
+  support::TickCursor ticker{c, simTick, pchunk};
+  auto poseTick = [&]() {
+    ticker.chunk = pchunk;
+    ticker();
+  };
+
+  // ---- enchanted blood on a cut, burnt limb ----------------------------------
+  const uint64_t id = SpawnTarget(c, t, kInset, pchunk);
+  if (!id) {
+    detail = "spawn refused";
+    return Status::Fail;
+  }
+  mobs.SetMobBehavior(id, "dummy");
+  for (int i = 0; i < 10; i++) poseTick();
+  const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+  std::vector<ParticleSpawn> spawns;
+  CutOnce(mobs, c.world, id, t.limb, ax, 0.5f * ax.reach, 1.0f, 1.0f, 0x4EA1u,
+          spawns);
+  for (int i = 0; i < 3; i++) poseTick();
+  const bool open0 = mobs.LimbWoundOpen(id, t.limb);
+  const uint32_t cooked =
+      mobs.RewriteLimbSurface(id, t.limb, hm.skin, hm.cooked, 2000, simTick);
+  poseTick();
+  const float cap0 = mobs.BurnHealthCap(id), frac0 = mobs.BurnFraction(id);
+  const float hp0 = mobs.LimbHp(id, t.limb);
+  uint32_t miss0 = 0, diff0 = 0;
+  mobs.LimbRecipeDiff(id, t.limb, miss0, diff0);
+  const uint32_t did = mobs.DouseLimb(id, t.limb, hm.eBlood, 6, simTick);
+  uint32_t overCap = 0, wholeAt = 0;
+  float worst = 0.0f;
+  std::string trace;
+  for (int i = 0; i < 1200 && mobs.LimbBody(id, t.limb); i++) {
+    poseTick();
+    const float hp = mobs.LimbHp(id, t.limb);
+    const float lim = hpMax * mobs.BurnHealthCap(id);
+    if (hp > lim + 1e-3f) {
+      overCap++;
+      worst = std::max(worst, hp - lim);
+    }
+    if (i % 10 != 9) continue;
+    uint32_t m = 0, d = 0;
+    mobs.LimbRecipeDiff(id, t.limb, m, d);
+    // The shape of the recovery, every 60 ticks: missing / changed / coated
+    // cells / cells grown so far (attribution for a limb that will not close).
+    if (i % 60 == 59)
+      trace += Format(" %u/%u/%u/%u", m, d,
+                      mobs.LimbCoatMatCount(id, t.limb, hm.eBlood, 1),
+                      mobs.HealStatsOf(id).grown);
+    if (m == 0 && d == 0 && hp >= lim - 1e-3f) {
+      wholeAt = (uint32_t)i + 1;
+      break;
+    }
+  }
+  const bool open1 = mobs.LimbWoundOpen(id, t.limb);
+  const float cap1 = mobs.BurnHealthCap(id), frac1 = mobs.BurnFraction(id);
+  const float hp1 = mobs.LimbHp(id, t.limb);
+  uint32_t miss1 = 0, diff1 = 0;
+  std::string why1;
+  mobs.LimbRecipeDiff(id, t.limb, miss1, diff1, &why1);
+  const Mob::HealStats sb = mobs.HealStatsOf(id);
+  const bool bloodOk = open0 && cooked >= 100 && cap0 < 1.0f &&
+                       (did & MobSystem::kRemedyStanch) &&
+                       (did & MobSystem::kRemedyRestore) && !open1 &&
+                       miss1 == 0 && diff1 == 0 && cap1 > cap0 && frac1 < frac0 &&
+                       hp1 > hp0 && overCap == 0;
+
+  // ---- enchanted water, the gentle one --------------------------------------
+  const MaterialDef& ew = c.mats[hm.eWater];
+  const double cplW = HealCellsPerLevel(def, ew);
+  bool waterOk = false;
+  uint32_t cookedW = 0, didW = 0, levelsW = 0;
+  Mob::HealStats sw;
+  if (const uint64_t idW = SpawnTarget(c, t, kInset, pchunk)) {
+    mobs.SetMobBehavior(idW, "dummy");
+    for (int i = 0; i < 10; i++) poseTick();
+    cookedW = mobs.RewriteLimbSurface(idW, t.limb, hm.skin, hm.cooked, 2000, simTick);
+    didW = mobs.DouseLimb(idW, t.limb, hm.eWater, 2, simTick);
+    levelsW = HealCoatLevels(mobs, idW, t.limb, hm.eWater, simTick);
+    for (int i = 0; i < 300; i++) poseTick();
+    sw = mobs.HealStatsOf(idW);
+    waterOk = cookedW >= 100 && (didW & MobSystem::kRemedyRestore) &&
+              !(didW & MobSystem::kRemedyStanch) && sw.mended > 0 &&
+              (double)(sw.grown + sw.mended) <= (double)levelsW * cplW + 1.0;
+  }
+  mobs.Reset();
+  c.debris.Reset();
+
+  detail = Format(
+      "%s.%s: cut (open %d), %u skin cooked -> cap %.3f frac %.3f, hp %.2f, %u "
+      "missing + %u changed | enchanted blood: did 0x%x, whole at tick %u: open "
+      "%d, %u missing + %u changed, cap %.3f frac %.3f, hp %.2f (max %.1f), "
+      "%u ticks over the cap (worst +%.3f), %u grown %u mended %u levels | "
+      "enchanted water: %u cooked, did 0x%x, %u levels (%.2f cells each) -> "
+      "%u mended %u grown",
+      t.defName.c_str(), t.limbName.c_str(), open0 ? 1 : 0, cooked, cap0, frac0,
+      hp0, miss0, diff0, did, wholeAt, open1 ? 1 : 0, miss1, diff1, cap1, frac1,
+      hp1, hpMax, overCap, worst, sb.grown, sb.mended, sb.levelsSpent, cookedW,
+      didW, levelsW, cplW, sw.mended, sw.grown);
+  detail += " | blood trace (missing/changed/coated/grown per 60 ticks):" + trace +
+            " " + why1;
+  return bloodOk && waterOk ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -8095,6 +8427,10 @@ const std::vector<Gate>& WoundGates() {
       {"acid-coat", "mob", {}, false, GateAcidCoat, false},
       {"corpse-acid", "mob", {}, false, GateCorpseAcid, false},
       {"lava-oil-coat", "mob", {}, false, GateLavaOilCoat, false},
+      // A HEALING coat (alchemy package D): enchanted blood / water rebuild
+      // the limb toward its recipe, bounded by what was poured.
+      {"heal-restore", "mob", {}, false, GateHealRestore, false},
+      {"heal-wound", "mob", {}, false, GateHealWound, false},
       {"severed-hand", "mob", {}, false, GateSeveredHand, false},
       {"corpse-sleep", "mob", {}, false, GateCorpseSleep, false},
       {"corpse-cap", "mob", {}, false, GateCorpseCap, false},

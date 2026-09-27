@@ -2236,6 +2236,8 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   matCoatFuel_.clear();
   flashForm_.clear();
   coatDepth_.clear();
+  coatRestore_.clear();
+  coatRestoreRate_.clear();
   matBareBlood_.clear();
   coatContact_.clear();
   for (uint32_t& m : matOfStainType_) m = 0;
@@ -2314,6 +2316,9 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     matCorrodes_.push_back(slot != 0 && (attacks || coatHot) ? 1 : 0);
     if (matCorrodes_.back()) corrosiveMats_.push_back((uint32_t)(matCorrodes_.size() - 1));
     coatDepth_.push_back(m.coatDepth);
+    // A HEALING coat needs a slot too: without one nothing can wear it.
+    coatRestore_.push_back(slot != 0 ? m.coatRestore : 0.0f);
+    coatRestoreRate_.push_back(slot != 0 ? m.coatRestoreRate : 0.0f);
     matBareBlood_.push_back(m.bareBlood);
     coatContact_.push_back(m.coatContact);
   }
@@ -13105,6 +13110,612 @@ uint32_t MobSystem::MissingVoxelCount(uint64_t mobId, int limbIndex) const {
   return 0;
 }
 
+// ============================================================================
+// A COAT THAT HEALS (alchemy package D, 2026-09-27; mob.h Mob::HealTick)
+//
+// Enchanted blood and enchanted water (materials.json `coat.restore`) rebuild
+// the body they are on. The design is the mend spell's (RestoreVoxels) turned
+// into a coat: the anatomy .vox IS the recipe of what should be there, so
+// "missing" and "damaged" are both well-defined against it, and the only new
+// question is who PAYS -- the coat does, one level at a time.
+//
+// WHAT A STEP DOES, on one limb, every kHealPeriod ticks while it wears one:
+//   1. THE PURSE. Every voxel wearing a restorative coat contributes
+//      amount x coat.restore world voxels of tissue (x scale^3 lattice cells),
+//      plus the limb's `healCredit` change from last time. The step may use
+//      at most coat.restoreRate world voxels a second of it (the strongest
+//      rate present; at least one cell a step, so a coarse creature whose
+//      rate rounds below a cell still heals).
+//   2. GROW. Recipe cells that are absent and FACE-ADJACENT to flesh that is
+//      there come back as exactly what the recipe says (material, the
+//      positional variant BuildAuthoredLattice gives it, the art slot), nearest
+//      the joint anchor first -- a hole fills from its walls, a stump grows
+//      outward, one layer a step. A cell adjacent only to other missing cells
+//      waits for the layer under it, so nothing is ever grown floating.
+//   3. MEND. Present cells whose material is not the recipe's (cooked,
+//      charred, alight, soaked to the wound material, rotted, blistered by
+//      chlorine) are rewritten to the recipe word, art slot included. Their
+//      coat stays on them: a mend is not a wash.
+//   4. HP. Grown volume is credited as hp exactly as a carve charged it
+//      (RestoreVoxels' formula). A step that found nothing to grow or mend
+//      spends the purse on hp instead, up to the limb's authored hp times the
+//      creature's BURN CAP -- healing never buys past what the burns allow;
+//      it lifts the cap only by mending the burnt tissue first.
+//   5. PAY. The cells used are paid for out of the coat, one level per coated
+//      voxel per round (so a coat thins evenly rather than vanishing in
+//      lattice-order patches), and any fraction of a level left over is the
+//      change carried in `healCredit`. A step that used nothing spends
+//      nothing: an idle healing coat simply dries on its own authored clock.
+//   6. The coat's own `coat.effects` then run on the limb (CoatEffectsOn:
+//      "stanch" closes the wound, "disinfect" stops a bite's rot), which is
+//      what makes bathing in it or being splashed with it do what applying it
+//      from the health panel does.
+//
+// BOUNDED (rule 2): every cell grown, mended or turned into hp is paid for by
+// a coat level that is then gone, and a grown cell arrives CLEAN, so healing
+// cannot feed itself. The purse is what was poured; the rate caps the work
+// per tick; a spent coat stops the pass at the ledger gate. A pool of
+// enchanted water heals whoever stands in it for as long as they stand in it
+// -- that is the pool's matter, not the body's, exactly as standing in acid
+// keeps eating.
+//
+// DETERMINISTIC (rule 1): driven from BurnTick on the tick, keyed by creature
+// and limb, every walk in lattice or recipe order, candidates sorted with a
+// full tie-break, integer cell counts, and the purse arithmetic in doubles
+// done in one fixed order. No float physics state is read.
+//
+// CPU body state throughout, like every other gore mechanic: not hashed, and
+// the save's content-proven pristine test (LimbIsPristine) sees a fully
+// healed limb as the def's own, because a grown cell is the recipe's word.
+// ============================================================================
+namespace {
+struct HealGrow {
+  float d2;
+  int x, y, z;
+  uint16_t word;
+  uint8_t color;
+  int32_t tomb;  // lattice index of a tombstone to revive, or -1 (a new voxel)
+};
+struct HealMend {
+  uint32_t idx;
+  uint16_t word;
+  uint8_t color;
+};
+}  // namespace
+
+bool Mob::IsHealExempt(uint32_t mat) const {
+  return sys_ && mat < sys_->matSelfActive_.size() && sys_->matSelfActive_[mat] != 0;
+}
+
+void Mob::HealTick(uint32_t tick) {
+  if (!alive_ || !def_ || !sys_ || sys_->coatRestore_.empty()) return;
+  const int n = std::min(baseLimbs_, (int)limbs_.size());
+  bool any = false;
+  for (int li = 0; li < n; li++) {
+    MobLimb& l = limbs_[li];
+    if (!l.body) continue;
+    // THE LEDGER GATE: a limb with no healing coat among its heaviest four
+    // substances pays four compares. (A thin film under four heavier coats
+    // waits for them to dry; it is not lost.)
+    bool wears = false;
+    for (const CoatEntry& en : l.coat.top)
+      if (en.mat != 0 && en.mat < sys_->coatRestore_.size() &&
+          sys_->coatRestore_[en.mat] > 0.0f)
+        wears = true;
+    if (!wears) continue;
+    // Staggered per creature and limb, so a party healing at once does not
+    // re-pack every brick on one tick.
+    const uint32_t key = (uint32_t)id_ * 0x9E3779B9u + (uint32_t)li * 2654435761u;
+    if ((tick + key) % kHealPeriod != 0) continue;
+    if (HealLimbStep(li, tick) > 0) any = true;
+  }
+  // The burnt fraction moved if any cooked cell was mended: recount now, so
+  // the cap rises this tick and the hp-only path reads the new one.
+  if (any && burnFracDirty_) RecountBurn(tick, /*force=*/true);
+}
+
+uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
+  (void)tick;
+  if (!def_ || li < 0 || li >= (int)limbs_.size() || li >= (int)def_->limbs.size())
+    return 0;
+  MobLimb& limb = limbs_[li];
+  if (!limb.body) return 0;
+  const MobDef& def = *def_;
+  const int mi = FindModel(def.prefab, def.limbs[li].name);
+  if (mi < 0) return 0;
+  const PrefabModel& model = def.prefab.models[mi];
+  const bool fine = limb.HasFineSkin();
+  const uint32_t skinScale = std::max(1u, SkinScaleOf(limb));
+  const uint32_t physScale = std::max(1u, PhysScaleOf(limb));
+  const uint32_t scale = fine ? skinScale : physScale;
+  const double cellsPerWv = (double)scale * scale * scale;
+  const std::vector<float>& restoreOf = sys_->coatRestore_;
+  const std::vector<float>& rateOf = sys_->coatRestoreRate_;
+
+  // ---- 1. THE PURSE -------------------------------------------------------
+  BurnLimbView v = ViewOf(limb);
+  const size_t nv = v.Size();
+  std::vector<uint32_t> payers;
+  double purse = limb.healCredit;
+  float rate = 0.0f, strongestR = 0.0f;
+  uint32_t strongest = 0;
+  for (size_t i = 0; i < nv; i++) {
+    if (v.Mat(i) == 0) continue;  // tombstone
+    const uint16_t s = v.Stain(i);
+    const uint32_t amt = BodyStainAmt(s);
+    if (amt == 0) continue;
+    const uint32_t m = BodyStainMat(s);
+    const float r = m < restoreOf.size() ? restoreOf[m] : 0.0f;
+    if (r <= 0.0f) continue;
+    payers.push_back((uint32_t)i);
+    purse += (double)amt * (double)r * cellsPerWv;
+    rate = std::max(rate, rateOf[m]);
+    if (r > strongestR) {
+      strongestR = r;
+      strongest = m;
+    }
+  }
+  if (payers.empty()) {
+    limb.healCredit = 0.0f;  // the coat is gone; its change goes with it
+    return 0;
+  }
+  const double stepCap =
+      std::max(1.0, (double)rate * cellsPerWv * (double)kHealPeriod / 30.0);
+  const uint32_t budget = (uint32_t)std::floor(std::min(stepCap, purse));
+  if (budget == 0) return 0;
+
+  // ---- 2. WHAT IS THERE ---------------------------------------------------
+  std::vector<std::pair<uint64_t, uint32_t>> have;
+  have.reserve(nv);
+  for (size_t i = 0; i < nv; i++) {
+    const IVec3 p = v.At(i);
+    have.push_back({CellKey(p.x, p.y, p.z), (uint32_t)i});
+  }
+  std::sort(have.begin(), have.end());
+  auto find = [&](int x, int y, int z) -> int {
+    const uint64_t k = CellKey(x, y, z);
+    const auto it = std::lower_bound(have.begin(), have.end(),
+                                     std::make_pair(k, (uint32_t)0));
+    return it != have.end() && it->first == k ? (int)it->second : -1;
+  };
+
+  // ---- 3. THE RECIPE, AGAINST IT --------------------------------------------
+  const float inv = 1.0f / (float)std::max(1u, def.skinScale);
+  const IVec3 rebase = RecipeRebase(limb, model, inv, scale);
+  // The coarse lattice folds several recipe cells into one; only an unfolded
+  // lattice (fine skin, or skin == collider) takes the recipe word verbatim.
+  const bool folded = !fine && def.skinScale > physScale;
+  const int fold = folded ? (int)(def.skinScale / physScale) : 1;
+  std::unordered_set<uint64_t> foldSeen;
+  const Vec3 root = limb.anchorLimb * (float)scale;
+  std::vector<HealGrow> grow;
+  std::vector<HealMend> mend;
+  const std::vector<uint64_t>* shadow =
+      li < (int)twinShadow_.size() && !twinShadow_[li].empty() ? &twinShadow_[li]
+                                                               : nullptr;
+  const IVec3 twinO = shadow ? TwinOrigin(limb, scale) : IVec3{};
+  static const int kD6[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+  for (const PrefabVoxel& rv : model.voxels) {
+    int x = rv.x, y = rv.y, z = rv.z;
+    if (folded) {
+      x /= fold;
+      y /= fold;
+      z /= fold;
+    }
+    x -= rebase.x;
+    y -= rebase.y;
+    z -= rebase.z;
+    if (!fine && (x < -127 || x > 127 || y < -127 || y > 127 || z < -127 || z > 127))
+      continue;
+    if (folded && !foldSeen.insert(CellKey(x, y, z)).second) continue;
+    const uint32_t rmat = rv.material & 0xFFFu;
+    // A recipe cell of a SELF-ACTIVE material (one with an ungated decay:
+    // the anatomy's blood speckles in muscle) is not tissue the coat rebuilds.
+    // It decays on its own whenever the burn pass is awake on the limb (the
+    // torso's anatomy blood "decays to air over ~900 ticks", BurnOneLimb), and
+    // every heal step re-wakes that pass: regrowing it fed a loop -- decay,
+    // regrow, re-index, decay -- that spent ~40% of a coat on the same cells
+    // (measured, heal-wound). The blood a body lost comes back as hp instead.
+    if (IsHealExempt(rmat)) continue;
+    // BuildAuthoredLattice's variant, from the AUTHORED coordinate, so a grown
+    // cell is byte-for-byte the cell the creature spawned with.
+    const uint32_t variant = ((uint32_t)(rv.x * 7 + rv.y * 13 + rv.z * 29)) % 3u;
+    const uint16_t word = (uint16_t)(rmat | (variant << 12));
+    const int at = find(x, y, z);
+    // A TOMBSTONE (material 0: removed by a body pass, its compaction batched
+    // until FlushBurn's threshold) is missing matter that still holds a slot:
+    // it is grown by reviving it in place, below, rather than by a second
+    // voxel at the same cell. Measured: exposed blood speckles in a cut
+    // muscle decay to tombstones under a coat and sat there, un-growable, for
+    // the rest of the run (49 on zeus's upper arm).
+    const bool tomb = at >= 0 && v.Mat((size_t)at) == 0;
+    if (at >= 0 && !tomb) {
+      const uint32_t cur = v.Mat((size_t)at);
+      if (cur == rmat) continue;  // whole
+      // A JOINT TWIN's CHILD copy is the parent's to mend: the sync copies a
+      // changed material across, and the two copies are authored differently
+      // (the torso's rim is skin where the hip's copy is muscle), so each side
+      // mending to its own recipe would hand the cell back and forth every
+      // step, paid for out of the coat each time.
+      if (shadow && std::binary_search(shadow->begin(), shadow->end(),
+                                       TwinRestKey(x + twinO.x, y + twinO.y,
+                                                   z + twinO.z)))
+        continue;
+      if (folded) {
+        // Material only on a folded lattice: the cell's variant and art are
+        // the collider's own, and the recipe's first voxel is not "the" cell.
+        mend.push_back({(uint32_t)at,
+                        (uint16_t)(rmat | (v.Word((size_t)at) & 0x3000u)),
+                        (uint8_t)v.Art((size_t)at)});
+      } else {
+        mend.push_back({(uint32_t)at, word, rv.color});
+      }
+      continue;
+    }
+    bool touches = false;
+    for (const auto& d : kD6) {
+      const int nb = find(x + d[0], y + d[1], z + d[2]);
+      if (nb >= 0 && v.Mat((size_t)nb) != 0) {
+        touches = true;
+        break;
+      }
+    }
+    if (!touches) continue;
+    const float dx = (float)x + 0.5f - root.x, dy = (float)y + 0.5f - root.y,
+                dz = (float)z + 0.5f - root.z;
+    grow.push_back({dx * dx + dy * dy + dz * dz, x, y, z, word,
+                    folded ? (uint8_t)0 : rv.color, tomb ? at : -1});
+  }
+  std::sort(grow.begin(), grow.end(), [](const HealGrow& a, const HealGrow& b) {
+    if (a.d2 != b.d2) return a.d2 < b.d2;
+    if (a.y != b.y) return a.y < b.y;
+    if (a.x != b.x) return a.x < b.x;
+    return a.z < b.z;
+  });
+
+  // ---- 4. SPEND IT: grow, then mend, then hp --------------------------------
+  uint32_t grown = 0, mended = 0;
+  // Of `grown`, the tombstones revived in place. They were never charged (a
+  // removal is charged when FlushBurn compacts it), so they are neither hp
+  // nor a count the carve accounting has seen; they take one pending removal
+  // off the flush's counter, and the flush's own tombstone scan finds the
+  // cell whole.
+  uint32_t revived = 0;
+  std::vector<uint64_t> touched;  // cells whose wound-revert entry is now moot
+  IVec3 sparkA{}, sparkB{};       // the first and last cell this step rebuilt
+  for (const HealGrow& g : grow) {
+    if (grown >= budget) break;
+    if (g.tomb >= 0) {
+      v.SetWord((size_t)g.tomb, g.word, g.color);
+      v.SetStain((size_t)g.tomb, 0);
+      revived++;
+      if (limb.burn.removed > 0) limb.burn.removed--;
+    } else if (fine) {
+      limb.skinVoxels.push_back(
+          {(int16_t)g.x, (int16_t)g.y, (int16_t)g.z, g.word, g.color});
+    } else {
+      limb.voxels.push_back(
+          {(int8_t)g.x, (int8_t)g.y, (int8_t)g.z, g.color, g.word});
+    }
+    touched.push_back(WoundWasKey(g.x, g.y, g.z));
+    if (grown == 0) sparkA = IVec3{g.x, g.y, g.z};
+    sparkB = IVec3{g.x, g.y, g.z};
+    grown++;
+  }
+  for (const HealMend& m : mend) {
+    if (grown + mended >= budget) break;
+    if (sys_->BurnStageOf(v.Mat(m.idx)) != 0) burnFracDirty_ = true;
+    v.SetWord(m.idx, m.word, m.color);
+    const IVec3 p = v.At(m.idx);
+    touched.push_back(WoundWasKey(p.x, p.y, p.z));
+    if (grown + mended == 0) sparkA = p;
+    sparkB = p;
+    mended++;
+  }
+  uint32_t used = grown + mended;
+  // THE LOOK, and it costs two particles: a mote of the coat itself lifts off
+  // the first and the last cell this step knit, drifts up and falls away
+  // without marking anything (kPFlagDrip, as a wet body's drips). The
+  // enchanted liquids are emissive, so a healing wound glitters in their
+  // colour while it works and stops when it is done. Positions are taken
+  // BEFORE the re-skin below, which may rebase the lattice. CPU-authored
+  // spawns on the tick, like every other body particle.
+  if (used > 0 && strongest != 0 && v.xf) {
+    const Quat q{v.xf->quat[0], v.xf->quat[1], v.xf->quat[2], v.xf->quat[3]};
+    const float cinv = 1.0f / (float)scale;
+    const IVec3 cells[2] = {sparkA, sparkB};
+    for (int k = 0; k < (used > 1 ? 2 : 1); k++) {
+      if (pendingSpawns_.size() >= kMaxParticleSpawnsPerTick) break;
+      const IVec3 c = cells[k];
+      const Vec3 at = v.xf->pos + Rotate(q, Vec3{((float)c.x + 0.5f) * cinv,
+                                                 ((float)c.y + 0.5f) * cinv,
+                                                 ((float)c.z + 0.5f) * cinv});
+      ParticleSpawn d = MakeDroplet(at, Vec3{0.0f, 2.5f, 0.0f}, strongest,
+                                    /*micro=*/true, /*lifeTicks=*/40,
+                                    /*microScale=*/6);
+      d.flags |= kPFlagCalm | kPFlagDrip;
+      pendingSpawns_.push_back(d);
+    }
+  }
+  const float hpMax = def.limbs[li].hp;
+  float hpGain = 0.0f;
+  // THE BURN CAP bounds every hp credit here: the cap is the creature's
+  // (RecountBurn) and healing never lifts hp above it -- it lifts the CAP only
+  // by mending the burnt tissue, and HealTick recounts as soon as it has.
+  const float cap = hpMax * std::clamp(burnCap_, 0.0f, 1.0f);
+  if (grown > revived && limb.voxelsAtSpawn > 0 && limb.hp < cap) {
+    // What a carve charged per voxel, a graft refunds per voxel (RestoreVoxels).
+    const float before = limb.hp;
+    limb.hp = std::min(cap, limb.hp + hpMax * (float)(grown - revived) / (float)limb.voxelsAtSpawn);
+    hpGain += limb.hp - before;
+  }
+  if (used == 0 && limb.voxelsAtSpawn > 0) {
+    // THE SHAPE IS WHOLE: what is left buys hp, up to the cap.
+    if (limb.hp < cap) {
+      const float perCell = hpMax / (float)limb.voxelsAtSpawn;
+      const uint32_t need = (uint32_t)std::ceil((cap - limb.hp) / perCell);
+      used = std::min(budget, std::max(1u, need));
+      const float before = limb.hp;
+      limb.hp = std::min(cap, limb.hp + perCell * (float)used);
+      hpGain += limb.hp - before;
+    }
+  }
+  if (used == 0) return 0;  // nothing to heal: the coat is not spent
+
+  // ---- 5. PAY FOR IT --------------------------------------------------------
+  double owe = (double)used - (double)limb.healCredit;
+  uint32_t levels = 0;
+  std::vector<uint32_t> paid;
+  if (owe <= 0.0) {
+    limb.healCredit -= (float)used;
+  } else {
+    bool any = true;
+    while (owe > 1e-9 && any) {
+      any = false;
+      for (uint32_t i : payers) {
+        if (owe <= 1e-9) break;
+        const uint16_t s = v.Stain(i);
+        const uint32_t amt = BodyStainAmt(s);
+        if (amt == 0) continue;
+        any = true;
+        const uint32_t m = BodyStainMat(s);
+        v.SetStain(i, PackBodyStain(m, amt - 1u));
+        paid.push_back(i);
+        levels++;
+        owe -= (double)restoreOf[m] * cellsPerWv;
+      }
+    }
+    limb.healCredit = owe < 0.0 ? (float)-owe : 0.0f;
+  }
+  coatDirty_ = twinDirty_ = true;
+
+  // ---- 6. THE LATTICE, THE BRICK, THE BODY ---------------------------------
+  if (grown > 0 || mended > 0) {
+    if (fine) {
+      bool overflow = false;
+      limb.voxels = DownsampleSkin(limb.skinVoxels,
+                                   std::max(1u, skinScale / physScale), &overflow);
+    }
+    // A cell put back is no longer a soak waiting to revert.
+    if (!limb.woundWas.empty() && !touched.empty()) {
+      std::sort(touched.begin(), touched.end());
+      limb.woundWas.erase(
+          std::remove_if(limb.woundWas.begin(), limb.woundWas.end(),
+                         [&](const MobLimb::WoundWas& e) {
+                           return std::binary_search(touched.begin(), touched.end(),
+                                                     WoundWasKey(e.x, e.y, e.z));
+                         }),
+          limb.woundWas.end());
+    }
+    if (grown > 0) {
+      limb.voxelsCharged += grown - revived;
+      // Fire's lifetime tally is the matter that is no longer there: what
+      // grows back is no longer missing, so it stops counting as burnt.
+      const uint32_t back = std::min(limb.burn.burntAway, grown);
+      if (back) {
+        limb.burn.burntAway -= back;
+        burnFracDirty_ = true;
+      }
+    }
+    LimbWoundTotals(limb, limb.weightCharged, limb.brainCharged);
+    // Art, then collider, the order the carve uses; the burn index points at
+    // the old lattice now.
+    if (limb.microModel >= 0) ReskinLimbMicro(limb, skinScale, physScale);
+    if (grown > 0) RebuildLimbBody(li);
+    DropBurnIndex(limb.burn);
+    limb.carved = true;
+    MarkInstancesDirty();
+  } else if (!paid.empty()) {
+    // Only the coat moved (the hp-only path): poke it into an owned brick.
+    MicroBodySet* micro = MicroSet();
+    if (micro && limb.microModel >= 0 &&
+        (size_t)limb.microModel < micro->owned.size() &&
+        micro->owned[(size_t)limb.microModel]) {
+      for (uint32_t i : paid) {
+        const IVec3 p = v.At(i);
+        MicroBodyPokeStain(*micro, (uint32_t)limb.microModel, p.x, p.y, p.z,
+                           v.Stain(i));
+      }
+    }
+  }
+  // ...and what the substance does besides (stanch, disinfect).
+  if (strongest != 0) sys_->CoatEffectsOn(*this, li, strongest, /*report=*/false);
+
+  healStats_.grown += grown;
+  healStats_.mended += mended;
+  healStats_.levelsSpent += levels;
+  healStats_.steps++;
+  healStats_.hpHealed += hpGain;
+  return grown + mended;
+}
+
+bool Mob::RecipeDiff(int li, uint32_t& missing, uint32_t& differ,
+                     std::string* why) const {
+  missing = differ = 0;
+  // Attribution for a limb that will not come back (`why`): of the missing,
+  // how many are tombstones, joint-twin child copies, touching present flesh
+  // (i.e. growable), and the recipe materials they should be.
+  uint32_t mTomb = 0, mShadow = 0, mTouch = 0;
+  std::map<uint32_t, uint32_t> mMat;
+  IVec3 mLo{INT_MAX, INT_MAX, INT_MAX}, mHi{INT_MIN, INT_MIN, INT_MIN};
+  if (!def_ || li < 0 || li >= (int)limbs_.size() || li >= (int)def_->limbs.size())
+    return false;
+  const MobLimb& limb = limbs_[li];
+  if (!limb.body) return false;
+  const MobDef& def = *def_;
+  const int mi = FindModel(def.prefab, def.limbs[li].name);
+  if (mi < 0) return false;
+  const PrefabModel& model = def.prefab.models[mi];
+  const bool fine = limb.HasFineSkin();
+  const uint32_t physScale = std::max(1u, PhysScaleOf(limb));
+  const uint32_t scale = fine ? std::max(1u, SkinScaleOf(limb)) : physScale;
+  std::vector<std::pair<uint64_t, uint32_t>> have;
+  const size_t nv = fine ? limb.skinVoxels.size() : limb.voxels.size();
+  have.reserve(nv);
+  for (size_t i = 0; i < nv; i++) {
+    const uint32_t m = fine ? (limb.skinVoxels[i].material & 0xFFFu)
+                            : (limb.voxels[i].payload & 0xFFFu);
+    const int x = fine ? limb.skinVoxels[i].x : limb.voxels[i].x;
+    const int y = fine ? limb.skinVoxels[i].y : limb.voxels[i].y;
+    const int z = fine ? limb.skinVoxels[i].z : limb.voxels[i].z;
+    have.push_back({CellKey(x, y, z), m});
+  }
+  std::sort(have.begin(), have.end());
+  const IVec3 rebase =
+      RecipeRebase(limb, model, 1.0f / (float)std::max(1u, def.skinScale), scale);
+  const bool folded = !fine && def.skinScale > physScale;
+  const int fold = folded ? (int)(def.skinScale / physScale) : 1;
+  std::unordered_set<uint64_t> foldSeen;
+  // The child copies of joint twins are the parent's (HealLimbStep's note).
+  const std::vector<uint64_t>* shadow =
+      li < (int)twinShadow_.size() && !twinShadow_[li].empty() ? &twinShadow_[li]
+                                                               : nullptr;
+  const IVec3 twinO = shadow ? TwinOrigin(limb, scale) : IVec3{};
+  for (const PrefabVoxel& rv : model.voxels) {
+    int x = rv.x, y = rv.y, z = rv.z;
+    if (folded) {
+      x /= fold;
+      y /= fold;
+      z /= fold;
+    }
+    x -= rebase.x;
+    y -= rebase.y;
+    z -= rebase.z;
+    const uint64_t k = CellKey(x, y, z);
+    if (folded && !foldSeen.insert(k).second) continue;
+    if (IsHealExempt(rv.material & 0xFFFu)) continue;  // HealLimbStep's note
+    const auto it = std::lower_bound(have.begin(), have.end(),
+                                     std::make_pair(k, (uint32_t)0));
+    if (it == have.end() || it->first != k || it->second == 0) {
+      missing++;
+      if (why) {
+        if (it != have.end() && it->first == k) mTomb++;
+        if (shadow && std::binary_search(shadow->begin(), shadow->end(),
+                                         TwinRestKey(x + twinO.x, y + twinO.y,
+                                                     z + twinO.z)))
+          mShadow++;
+        static const int kN6[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                      {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+        for (const auto& d : kN6) {
+          const uint64_t nk = CellKey(x + d[0], y + d[1], z + d[2]);
+          const auto nt = std::lower_bound(have.begin(), have.end(),
+                                           std::make_pair(nk, (uint32_t)0));
+          if (nt != have.end() && nt->first == nk && nt->second != 0) {
+            mTouch++;
+            break;
+          }
+        }
+        mMat[rv.material & 0xFFFu]++;
+        mLo = IVec3{std::min(mLo.x, x), std::min(mLo.y, y), std::min(mLo.z, z)};
+        mHi = IVec3{std::max(mHi.x, x), std::max(mHi.y, y), std::max(mHi.z, z)};
+      }
+    } else if (it->second != (rv.material & 0xFFFu) &&
+               !(shadow && std::binary_search(
+                               shadow->begin(), shadow->end(),
+                               TwinRestKey(x + twinO.x, y + twinO.y, z + twinO.z)))) {
+      differ++;
+    }
+  }
+  if (why && missing) {
+    char b[256];
+    std::snprintf(b, sizeof b,
+                  "[%u missing: %u tomb, %u twin-child, %u touching flesh; box "
+                  "(%d,%d,%d)..(%d,%d,%d); anchor (%.0f,%.0f,%.0f); mats",
+                  missing, mTomb, mShadow, mTouch, mLo.x, mLo.y, mLo.z, mHi.x,
+                  mHi.y, mHi.z, limb.anchorLimb.x * scale,
+                  limb.anchorLimb.y * scale, limb.anchorLimb.z * scale);
+    *why = b;
+    for (const auto& kv : mMat)
+      *why += " " + std::to_string(kv.first) + ":" + std::to_string(kv.second);
+    *why += "]";
+  }
+  return true;
+}
+
+Mob::HealStats MobSystem::HealStatsOf(uint64_t mobId) const {
+  const Mob* m = FindMob(mobId);
+  return m ? m->Healed() : Mob::HealStats{};
+}
+
+bool MobSystem::LimbRecipeDiff(uint64_t mobId, int limb, uint32_t& missing,
+                               uint32_t& differ, std::string* why) const {
+  missing = differ = 0;
+  const Mob* m = FindMob(mobId);
+  return m ? m->RecipeDiff(limb, missing, differ, why) : false;
+}
+
+uint32_t MobSystem::RewriteLimbSurface(uint64_t mobId, int limb, uint32_t fromMat,
+                                       uint32_t toMat, uint32_t count,
+                                       uint32_t tick) {
+  Mob* mob = FindCreature(mobId);
+  if (!mob || !mob->def_ || toMat == 0 || count == 0) return 0;
+  if (limb < 0 || limb >= (int)mob->limbs_.size()) return 0;
+  MobLimb& l = mob->limbs_[limb];
+  if (!l.body) return 0;
+  BurnLimbView v = mob->ViewOf(l);
+  const size_t n = v.Size();
+  std::vector<uint64_t> occ;
+  occ.reserve(n);
+  for (size_t i = 0; i < n; i++) {
+    if (v.Mat(i) == 0) continue;
+    const IVec3 p = v.At(i);
+    occ.push_back(CellKey(p.x, p.y, p.z));
+  }
+  std::sort(occ.begin(), occ.end());
+  static const int kD6[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
+  uint32_t done = 0;
+  for (size_t i = 0; i < n && done < count; i++) {
+    const uint32_t m = v.Mat(i);
+    if (m == 0 || m == toMat || (fromMat != 0 && m != fromMat)) continue;
+    const IVec3 p = v.At(i);
+    bool open = false;
+    for (const auto& d : kD6)
+      if (!std::binary_search(occ.begin(), occ.end(),
+                              CellKey(p.x + d[0], p.y + d[1], p.z + d[2]))) {
+        open = true;
+        break;
+      }
+    if (!open) continue;
+    v.Set(i, toMat, (v.Word(i) >> 12) & 3u);
+    done++;
+  }
+  if (!done) return 0;
+  const uint32_t skin = std::max(1u, mob->SkinScaleOf(l));
+  const uint32_t phys = std::max(1u, mob->PhysScaleOf(l));
+  if (l.HasFineSkin()) {
+    bool overflow = false;
+    l.voxels = DownsampleSkin(l.skinVoxels, std::max(1u, skin / phys), &overflow);
+  }
+  if (l.microModel >= 0) mob->ReskinLimbMicro(l, skin, phys);
+  Mob::DropBurnIndex(l.burn);
+  mob->MarkInstancesDirty();
+  mob->burnFracDirty_ = true;
+  mob->RecountBurn(tick, /*force=*/true);
+  return done;
+}
+
 bool Mob::RebuildLimbBody(int limbIndex) {
   MobLimb& limb = limbs_[limbIndex];
   if (!limb.body || limb.voxels.empty()) return false;
@@ -16128,6 +16739,10 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   if (!BluntPulpTick(tick, world, spawns)) return;
   // ...and a living creature's bruises fade (never reshapes limbs_).
   HealBruises(tick);
+  // ...and a HEALING coat rebuilds what it is on (alchemy package D; never
+  // reshapes limbs_, never kills). Before the twin sync so a mended joint
+  // cell reaches its other copy this tick, and before the burn recount.
+  HealTick(tick);
   if (!SyncJointTwins(world, spawns)) return;
   // The burn cap (Gore §G). Recounted at a bounded cadence while the lattice
   // is changing and not at all while it is not; may kill the creature, and is
@@ -22655,9 +23270,13 @@ uint32_t MobSystem::SoakLimb(uint64_t mobId, int limb, uint32_t mat,
   // outside (BurnOneLimb section 0, clause 7, carries it inward as it eats).
   // A FUEL coat (oil) too: soaked through, a whole limb would flash over from
   // the inside the moment one voxel caught.
+  // A HEALING coat too (coat.restore): it is paid out per level, so a soak
+  // through the interior -- which no pour reaches -- would be a purse many
+  // times what the flask held.
   const bool surfaceOnly =
       (mat < matCorrodes_.size() && matCorrodes_[mat]) ||
-      (mat < matCoatFuel_.size() && matCoatFuel_[mat]);
+      (mat < matCoatFuel_.size() && matCoatFuel_[mat]) ||
+      (mat < coatRestore_.size() && coatRestore_[mat] > 0.0f);
   BodyBurnState* st = surfaceOnly ? v.burn : nullptr;
   if (st && st->idx.empty()) BuildBurnIndex(v);
   if (st && st->idx.empty()) return 0;  // refused: absurd bounding box
@@ -22709,7 +23328,8 @@ uint32_t MobSystem::DouseLimb(uint64_t mobId, int limb, uint32_t mat,
   return CoatEffectsOn(*mob, limb, mat);
 }
 
-uint32_t MobSystem::CoatEffectsOn(Mob& mob, int limb, uint32_t mat) {
+uint32_t MobSystem::CoatEffectsOn(Mob& mob, int limb, uint32_t mat,
+                                  bool report) {
   if (limb < 0 || limb >= (int)mob.limbs_.size()) return 0;
   if (mat >= coatEffects_.size()) return 0;
   MobLimb& l = mob.limbs_[limb];
@@ -22725,6 +23345,17 @@ uint32_t MobSystem::CoatEffectsOn(Mob& mob, int limb, uint32_t mat) {
       if (l.infectMat != 0 || l.infectStain != 0) did |= kRemedyDisinfect;
       l.infectMat = 0;
       l.infectStain = 0;
+    } else if (fx == "restore") {
+      // The work is Mob::HealTick's, paid out of the coat over the following
+      // seconds; here only the answer to "will it do anything": the limb is
+      // missing recipe cells, wears cells that are not the recipe's, or is
+      // below its hp. A living body only -- the dead do not heal.
+      if (report && mob.alive_ && l.body && limb < (int)mob.limbDefs_.size()) {
+        uint32_t missing = 0, differ = 0;
+        mob.RecipeDiff(limb, missing, differ);
+        if (missing || differ || l.hp < mob.limbDefs_[limb].hp)
+          did |= kRemedyRestore;
+      }
     }
   }
   return did;

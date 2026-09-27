@@ -1619,6 +1619,12 @@ struct MobLimb {
   // skin whole again. The whole cost of healing for a limb nobody has hit is
   // this bool.
   bool bruised = false;
+  // RESTORATION CHANGE (Mob::HealTick): cells of healing already paid for out
+  // of a restorative coat and not yet spent -- the fraction of a level left
+  // over when a level buys more cells than the step used. Always < one
+  // level's worth, so it can never outlive the coat that paid for it by more
+  // than one level (rule 2). Not saved: a load forfeits a fraction of a level.
+  float healCredit = 0.0f;
   // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
   // Index-parallel by construction because it rides the limb itself, which is
   // what RemoveAppendedSlots moves wholesale.
@@ -4082,6 +4088,42 @@ class Mob {
   // eats it), and the dead do not heal at all. Never touches the coat, so
   // blood over a bruise dries on its own clock and the bruise on its own.
   void HealBruises(uint32_t tick);
+  // ---- A COAT THAT HEALS (alchemy package D, 2026-09-27) --------------------
+  // Every living base limb wearing a RESTORATIVE coat (MaterialDef::
+  // coatRestore: enchanted blood, enchanted water) is rebuilt toward its
+  // authored recipe once per kHealPeriod ticks, paid for out of that coat:
+  // missing cells grow back from the flesh beside them (nearest the joint
+  // first), cells that are not what the recipe says (cooked, charred, soaked
+  // to the wound material, rotted) are put back, and when the shape is whole
+  // the rest of the coat buys hp up to the burn cap. The coat's own
+  // `coat.effects` (stanch, disinfect) run on a limb it healed. Never
+  // reshapes limbs_ (no sever, no death). See the long note at the definition.
+  void HealTick(uint32_t tick);
+  // One limb's step of it. Returns the recipe cells rebuilt (grown + mended).
+  uint32_t HealLimbStep(int limbIndex, uint32_t tick);
+  // A recipe material the healing neither regrows nor counts as missing: a
+  // SELF-ACTIVE one (MobSystem::matSelfActive_ -- the anatomy's blood
+  // speckles), which decays by itself whenever the limb's burn pass is awake.
+  bool IsHealExempt(uint32_t mat) const;
+  static constexpr uint32_t kHealPeriod = 6;
+ public:
+  // What HealTick has done to this creature, ever. Diagnostic (the heal-*
+  // gates); never saved, never hashed.
+  struct HealStats {
+    uint32_t grown = 0;        // missing recipe cells put back
+    uint32_t mended = 0;       // present cells rewritten to the recipe
+    uint32_t levelsSpent = 0;  // coat levels the healing consumed
+    uint32_t steps = 0;        // limb steps that did anything
+    float hpHealed = 0.0f;     // hp credited (volume back + the hp-only path)
+  };
+  const HealStats& Healed() const { return healStats_; }
+  // The limb against its recipe, on the authoritative lattice: recipe cells
+  // that are absent, and present cells whose material is not the recipe's.
+  // False when the limb has no body or no recipe model.
+  bool RecipeDiff(int limbIndex, uint32_t& missing, uint32_t& differ,
+                  std::string* why = nullptr) const;
+ protected:
+  HealStats healStats_;
   // One limb, on a tick whose dice came up non-zero. Same return contract.
   bool InfectStep(int limbIndex, uint32_t tick, uint32_t nSpread,
                   uint32_t nRot, World& world,
@@ -6386,7 +6428,10 @@ class MobSystem {
   // An unknown tag does nothing, so content can name remedies ahead of the
   // code. Returns a bit per effect that CHANGED something (kRemedy*), so the
   // caller can say "the bleeding stops" only when it did.
-  static constexpr uint32_t kRemedyStanch = 1u, kRemedyDisinfect = 2u;
+  // kRemedyRestore: the substance heals (coat.restore) and the limb has
+  // something to heal -- recipe cells missing or changed, or hp below its cap.
+  static constexpr uint32_t kRemedyStanch = 1u, kRemedyDisinfect = 2u,
+                            kRemedyRestore = 4u;
   uint32_t DouseLimb(uint64_t mobId, int limb, uint32_t mat, uint32_t amount,
                      uint32_t tick, uint32_t* marked = nullptr);
   // ---- THE POUR BRUSH (the health panel's portrait, game/container.h) -------
@@ -6426,7 +6471,7 @@ class MobSystem {
                       uint32_t* drawn = nullptr);
   // The material's authored `coat.effects` run once on one limb: the half of
   // DouseLimb that is not the coat, shared with PourOnBody.
-  uint32_t CoatEffectsOn(Mob& mob, int limb, uint32_t mat);
+  uint32_t CoatEffectsOn(Mob& mob, int limb, uint32_t mat, bool report = true);
   // Force the ledger's cadence (Mob::RecountCoat) for one creature, so a
   // caller that has just changed a coat can read the answer this instant
   // instead of waiting out tune.coat.recountTicks.
@@ -6776,6 +6821,18 @@ class MobSystem {
   std::string LimbCoatResidue(uint64_t mobId, int limb, uint32_t coatMat);
   bool SetLimbCellAt(uint64_t mobId, int limb, IVec3 rest, uint32_t mat,
                      uint16_t stain);
+  // ---- healing (Mob::HealTick), for the heal-* gates ----------------------
+  // Mob::Healed by id (all zeroes for an unknown creature), Mob::RecipeDiff by
+  // id, and a fixture writer: rewrite up to `count` EXPOSED voxels of one limb
+  // (an open 6-face on the authoritative lattice, lattice order) whose
+  // material is `fromMat` (0 = any) to `toMat`, the way a burn or a chemical
+  // blister leaves them, poking the brick and marking the burn fraction for a
+  // recount. Returns the voxels rewritten.
+  Mob::HealStats HealStatsOf(uint64_t mobId) const;
+  bool LimbRecipeDiff(uint64_t mobId, int limb, uint32_t& missing,
+                      uint32_t& differ, std::string* why = nullptr) const;
+  uint32_t RewriteLimbSurface(uint64_t mobId, int limb, uint32_t fromMat,
+                              uint32_t toMat, uint32_t count, uint32_t tick);
 
  private:
   // ---- per-voxel burning / dissolution (docs/PLAN_body_reactivity.md) --------
@@ -7030,6 +7087,9 @@ class MobSystem {
   // jumps the voxel under it to this form (W2-J2).
   std::vector<uint32_t> flashForm_;
   std::vector<float> coatDepth_;      // MaterialDef::coatDepth
+  // MaterialDef::coatRestore / coatRestoreRate (world voxels per level, per
+  // second); 0 = not restorative. Read by Mob::HealTick and SoakLimb.
+  std::vector<float> coatRestore_, coatRestoreRate_;
   std::vector<float> matBareBlood_;   // MaterialDef::bareBlood
   std::vector<int32_t> coatContact_;  // MaterialDef::coatContact (-1 = stain chance)
   // (MobSystem::CoatBeneath -- "a corrosive coat displaces one that is not;

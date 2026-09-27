@@ -337,6 +337,27 @@ static void ParseCoat(const json& m, const std::string& path, MaterialDef& d,
   } else {
     d.coatDepth = depth;
   }
+  // RESTORATION (materials.h coatRestore): the `restore` EFFECT is the switch
+  // and the two numbers are how much and how fast. Both halves are required
+  // of each other, so a coat cannot claim to heal and heal nothing, or heal
+  // without saying so in the tag list other readers (CoatTagFraction) see.
+  bool restoreTag = false;
+  for (const std::string& fx : d.coatEffects) restoreTag |= fx == "restore";
+  const float restore = co.value("restore", 0.0f);
+  const float restoreRate = co.value("restoreRate", 1.0f);
+  if (restore < 0.0f || restore > 16.0f) {
+    errors += path + ": material \"" + d.name +
+              "\": coat restore must be 0..16 world voxels per level\n";
+  } else if (restoreRate <= 0.0f || restoreRate > 64.0f) {
+    errors += path + ": material \"" + d.name +
+              "\": coat restoreRate must be > 0 and <= 64 world voxels/s\n";
+  } else if (restoreTag != (restore > 0.0f)) {
+    errors += path + ": material \"" + d.name +
+              "\": coat \"restore\" effect and coat restore > 0 go together\n";
+  } else if (restoreTag) {
+    d.coatRestore = restore;
+    d.coatRestoreRate = restoreRate;
+  }
 }
 
 // Parses "absorb": { capacity } into the top nibble of stainPack. Authored on

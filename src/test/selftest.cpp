@@ -837,6 +837,10 @@ const char* const kOrder[] = {
     // ...and a HOT coat (lava) sets the limb alight and eats it, a FUEL coat
     // (oil) is inert until heat reaches it and then flashes. Pose ticks only.
     "lava-oil-coat",
+    // ...and a HEALING coat (enchanted blood / water, alchemy package D)
+    // rebuilds a carved, cut and cooked limb toward its recipe, paid for out
+    // of the coat and no further. Pose ticks; resets mobs on the way out.
+    "heal-restore", "heal-wound",
     // ...and a part that comes off keeps its hand: a split forearm drops the
     // hand with the wrist end, a severed arm stays jointed. Pose ticks only.
     "severed-hand",
