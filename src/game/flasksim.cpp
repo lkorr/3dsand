@@ -2187,8 +2187,19 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
     for (size_t b = 0; b < bubbles_.size(); b++) {
       Bubble bb = bubbles_[b];
       if (bb.age >= 200) continue;   // burst last frame
+      const bool held = bb.vessel >= 0 && VesselAlive(bb.vessel);
+      if (held) {
+        const V2 w = ToWorld(vessels_[bb.vessel].x, {bb.lx, bb.ly});
+        bb.x = w.x;
+        bb.y = w.y;
+      }
       bb.y += bb.vy * elapsed;
       bb.x += ((int)(rnd() % 3) - 1) * 0.35f;
+      if (held) {
+        const V2 l = ToLocal(vessels_[bb.vessel].x, {bb.x, bb.y});
+        bb.lx = l.x;
+        bb.ly = l.y;
+      }
       const int x = (int)bb.x, y = (int)bb.y;
       bool alive = x >= 0 && y >= 0 && x < W && y < H;
       if (alive) {
@@ -2217,7 +2228,10 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
           const size_t i = rnd() % px_.size();
           if (psub_[i] != s) continue;
           const float vy = L.kind == kLookMolten ? 0.05f + (rnd() & 63) / 2000.f : 0.12f + (rnd() & 63) / 400.f;
-          bubbles_.push_back({px_[i].x, px_[i].y, vy, (uint8_t)s, 0});
+          const int hv = phome_[i];
+          const bool in = hv >= 0 && VesselAlive(hv);
+          const V2 l = in ? ToLocal(vessels_[hv].x, px_[i]) : px_[i];
+          bubbles_.push_back({px_[i].x, px_[i].y, vy, (uint8_t)s, 0, (int8_t)(in ? hv : -1), l.x, l.y});
           break;
         }
     }
@@ -2280,8 +2294,6 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
           } else if (!viscous && sp > 0.5f) {
             // Moving water carries light: brighter the faster it runs.
             c = Lift(c, std::min(7, (int)(sp * 4)), std::max(alpha, 200));
-          } else if (!viscous && rBest_[k] > 0.85f && ((var * 37 + (int)(t / 6)) % 211) == 0) {
-            c = Lift(base, 11, 245);   // a glint, riding its particle
           }
           if (L.glow > 0.05f) {
             // Its own light, breathing.

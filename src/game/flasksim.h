@@ -417,7 +417,9 @@ class FlaskSim {
     uint8_t alpha[256];  // by depth below the surface
   };
   std::vector<Look> look_;
-  struct Bubble { float x, y, vy; uint8_t sub; uint8_t age; };
+  // x, y: world pixels, re-derived each picture from lx, ly in the frame of
+  // the vessel it rose in (-1: none), so a carried flask carries its bubbles.
+  struct Bubble { float x, y, vy; uint8_t sub; uint8_t age; int8_t vessel; float lx, ly; };
   mutable std::vector<Bubble> bubbles_;
   mutable uint32_t lookRng_ = 0x9e3779b9u;
   mutable uint32_t lastRenderStep_ = 0;

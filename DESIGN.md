@@ -16577,8 +16577,10 @@ heat wells up, and slow bubbles that burst at the top. A VISCOUS one (the
 world's `isViscousLiquid`: `moveEvery` > 1 and `opacity` >= 150 -- oil, blood,
 ichor) is smooth, darker and glossy with a sheen under its surface. Anything
 else is a translucent medium whose alpha thickens with depth by its
-`opacity`, with a lit surface line, light where it runs fast, and glints
-that ride their particles. `emission` lights a blurred quarter-resolution
+`opacity`, with a lit surface line and light where it runs fast (random
+per-particle glints read as white noise and were removed). Bubbles keep their
+position in the frame of the vessel they rose in, so a carried flask carries
+them. `emission` lights a blurred quarter-resolution
 glow field thrown on the glass, the sand and the air (a halo), and makes a
 translucent liquid breathe and fizz (acid). Wet sand is darker. Every pattern
 belongs to a PARTICLE (its palette entry, its phase), so it flows with the
