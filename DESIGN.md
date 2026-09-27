@@ -16315,6 +16315,81 @@ colour, `ContainerFillSwatch` (the contents material's `color0`), everywhere:
   `--shot-mob "human:*flask=lava:0.5,_flask=water:0.6"` (`*` holds, `_` drops
   one on the ground and adds `screenshot_mob_drop.bmp`).
 
+### Alchemy bench: a flask's cross-section, simulated (2026-09-26; `game/flasksim.*`)
+
+Opening a vessel in the inventory shows a 2D cross-section of it with its
+contents simulated: liquids as particles, powders as pixels. A second vessel
+can be brought in and tilted to pour into the first; a stirring stick mixes.
+It is a UI device, NOT world state -- floats, no hash, no MutationQueue. What
+it produces is a TALLY (`FlaskSim::Count`), which the panel hands to the game
+as a transfer intent; the game checks conservation and applies it. Contents
+change only through that intent.
+
+**Contents** (`game/composition.h`): up to 16 `(material, eighths)` portions
+per vessel. No layer state is persisted: whenever the bench opens, each vessel
+is seeded ALREADY SETTLED (heaviest at the bottom), which is what a flask that
+sat in a bag would look like. A stirred emulsion does not survive closing.
+
+**Liquids**: Clavet et al. 2005 double-density relaxation, the method behind
+grantkot.com/ll -- not MLS-MPM, which is heavier and buys nothing at this scale.
+- Each substance has a particle MASS from its 3D-sim density,
+  `exp(ceil * atan(gain/ceil * ln(d/1000)))`. It is strictly monotonic, so
+  the 3D sim's ORDER is kept exactly; it stretches small gaps (oil 900 vs
+  water 1000) so they separate; and it is bounded, so lava and sand do not
+  collide at a clamp.
+- Relaxation splits each pair's displacement by inverse mass. A particle
+  among other substances relaxes toward a lower rest density (`crossRest`),
+  so interfaces push and stay sharp.
+- Buoyancy is an explicit Boussinesq-style term. Without it, a lone droplet
+  inside another liquid is squeezed to the NEAREST free surface, not to the
+  one its density says.
+- Viscosity comes from `moveEvery`.
+- One neighbour list per step serves viscosity and relaxation.
+
+**Powders**: a falling-sand CA, one grain per pixel.
+- A grain reads the smoothed liquid field (the same splat the renderer
+  draws) to decide whether it sinks, how fast (mass gap, viscosity), or
+  floats.
+- Moving into liquid shoves that pixel's particles into the pixel the grain
+  left.
+- Grains are walls to the liquid. A particle that ends a step in a grain's
+  pixel is pulled back along its own path, not teleported; teleporting
+  pumped energy into every liquid above a sand bed.
+- The stirring stick FLINGS the grains it touches. They move ballistically,
+  dragged by the liquid, until they slow.
+
+**Units, and why the tally is exact**: one grain is one pixel of area and one
+unit; `unitsPerEighth` units make an eighth; a particle carries
+`unitsPerParticle` units and is seeded on a hex lattice of exactly that cell
+area, with the rest density measured from that lattice (so a settled liquid
+covers the area its units say). `Count()` sums units per (vessel | spilled,
+material) and converts to eighths by largest remainder per material, so every
+material's eighths out equal its eighths in. Anything that leaves the panel is
+counted as spilled, never dropped.
+
+**Vessels are kinematic**: the panel sets a TARGET pose; the vessel moves
+toward it at most `maxVesselStep` px per substep and refuses any move that
+would bring its glass into another vessel's (`PoseClear`). The glass pushes
+liquid (collision in the vessel's own frame at both ends of the step, so a
+moving wall is relative motion) and SWEEPS grains: a grain the wall lands on
+goes to the nearest free pixel on the side it was on, by a breadth-first
+search through the pile that shifts every grain on the path. The first
+version carried grains rigidly, which made tilting sand ride along as a block
+and leak through the glass when packed.
+
+Shapes are an authored profile (half-widths at heights); `FlaskShape` is the
+only one today. A cauldron is a bigger profile and a larger
+`unitsPerParticle`, which keeps the particle count bounded.
+
+Cost (gate `alchemy-cost`, advisory): a nearly full flask (450 particles, 720
+grains) is ~2 ms per frame at three substeps plus ~0.4 ms to render 224x288.
+
+Gates: `alchemy-layers` (lava, sand, acid, water and oil stirred through the
+mouth, then left: exactly conserved, nothing spilled, mean heights in density
+order), `alchemy-pour` (oil and sand poured from a tilting flask into water:
+conserved, most of it arrives, little spills).
+
+
 ## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
 
 > **A biome SELECTS from component libraries and says how often and where.

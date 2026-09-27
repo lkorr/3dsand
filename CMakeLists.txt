@@ -530,6 +530,7 @@ add_library(sandvox_core OBJECT
   src/game/caster.cpp
   src/game/melee.cpp
   src/game/container.cpp
+  src/game/flasksim.cpp
   src/game/strokes.cpp
   # Is this pose inside itself? (game/selfclip.h) — voxel-level limb
   # interpenetration, differenced against the bind pose.
@@ -583,6 +584,7 @@ add_library(sandvox_core OBJECT
   # One pose pipeline, whoever drives the body (W2-L): pose-parity.
   src/test/selftest_pose.cpp
   src/test/selftest_equipment.cpp
+  src/test/selftest_alchemy.cpp
   src/test/selftest_dye.cpp
   src/test/selftest_wound.cpp
   src/test/selftest_impact.cpp
