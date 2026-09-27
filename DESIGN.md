@@ -16467,6 +16467,48 @@ and two thirds of the table. The kit is written only at "done" (Esc,
 or the screen shutting): every vessel that was ever on the table is re-checked
 against what came on and `ValidateBench` proves conservation, as before.
 
+**What falls off the table falls into the world AS IT FALLS** (2026-09-27, the
+owner's "it needs to happen in real time, not all at once when exiting").
+Every bench step drains the sim's spill in WHOLE eighths (`FlaskSim::
+DrainSpilled`; the fraction of an eighth stays in the sim until more joins it,
+so `Count()` still adds up) along with the mean x it left the table at; the
+frame takes it (`AlchemyBench::TakeSpill`) and queues a `ContainerSpill` with
+`pour` set -- a small ball, no outward burst, no splatter -- at the lip of the
+flask in the character's hand nearest that x (at your feet for one not in a
+hand). What was taken is reported in `BenchResult::streamed` and is part of
+`ValidateBench`'s sum (before == after + spilled + streamed); "done" spills
+only what is left. A session voided because a stack moved still takes the
+streamed matter out of the vessels that are unchanged, so voiding is never a
+way to pour a flask out and keep it full. Lava poured carelessly at the bench
+burns you: it lands at your feet.
+
+**The character holds what is on the table** (same day). While the bench has
+vessels on it the hands hold THEM instead of the kit's items (the kit is
+untouched; `PlayerSession::BenchHold`, written by main.cpp each frame from
+`AlchemyBench::Vessels()`, carries item NAMES -- a def pointer went stale
+across an R reload between the frame and the tick and crashed). One vessel:
+the right hand (the left if the right is ruined). Two or more: the one in the
+bench's hand (or the one last touched) and its nearest neighbour, one per hand,
+kept while the pair is the same pair. The bench is the portrait's MIRROR IMAGE
+(the character faces you), so the bench's left vessel is in the right hand and
+a CCW tilt on screen turns the flask toward the body's right. Each held vessel
+plays `assets/anims/bench_hold.json` (forearm level before the belly; the left
+hand its derived mirror) and is turned to the bench's angle by
+`Mob::SetHeldAim` -- a turn of the hand about the GRIP, after every solver and
+the clamp, so the flask's long axis (its lattice +X) matches the bench whatever
+the clip's wrist does. The vessel being carried on the bench, with another in
+the other hand, is POURED: the strike driver's arm claim (`SetWeaponPose`,
+legacy no-blade form) is taken for that hand and CLOSED ON THE LIP -- the
+command starts where the arm is and each tick moves by how far the flask's lip
+(`HeldMouthWorld` along its axis) is from just over the other flask's mouth. An
+open-loop "hand = target - (lip - hand)" landed 2.5 voxels high, because the
+point the IK places and the grip the aim turns about are not the same point.
+Everything eases in and out. Presentation only; nothing reaches the sim.
+Look-iterate with `--shot-bench` (`SANDVOX_BENCH_PORTRAIT_YAW=1.3` for a side
+view: the front view foreshortens a flask held out toward you;
+`SANDVOX_BENCH_DEBUG=1` prints the pour arm's lip, target and command and every
+live spill).
+
 The sim runs on its OWN THREAD at 60 steps a second (four substeps each): the
 frame thread hands in the pointer and gets back the newest picture, live
 contents and poses under one mutex, and uploads the picture only when a new one
@@ -16550,7 +16592,8 @@ per-grain rigid motion stood the sand up in the air while turning, and grains
 in the air are falling, not held.
 
 **Not yet:** reactions, powders dissolving, the cauldron, a held/grounded
-flask drawing its layers, refraction. Reactions must run on the vessel's
+flask drawing its layers, refraction; a stream off the table leaves from the
+nearest hand's lip, not from where on the table it fell. Reactions must run on the vessel's
 `contents` in the game's tick, not on the bench's particles -- the bench is a
 UI device.
 
@@ -16565,7 +16608,9 @@ it back where it had been: sand that snapped up into the air), `alchemy-layers` 
 mouth, then left: exactly conserved, nothing spilled, mean heights in density
 order), `alchemy-pour` (oil and sand poured from a tilting flask into water:
 conserved, 80%+ of the oil arrives, under 5% of it splashes; the sand is
-reported -- in a round flask it wedges below its pile angle), `vessel` (the
+reported -- in a round flask it wedges below its pile angle; then the target is
+turned over and emptied off the table with the spill DRAINED LIVE every step,
+which must carry matter and still conserve exactly), `vessel` (the
 mixture checks: second portion, top layer pours first, 17th refused, a mixed
 break spills every portion, byte round-trip and the legacy word, a salve spends
 in proportion).

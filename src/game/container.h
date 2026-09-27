@@ -354,6 +354,11 @@ struct ContainerSpill {
   alchemy::Composition rest;
   uint32_t seed = 0;
   bool splatted = false;  // the SplatterEvent goes out once, with the burst
+  // A POUR, not a burst (the alchemy bench's stream off the table): born in
+  // a small ball at `at` moving with `vel` and no outward kick, and no
+  // splatter (the caller sets `splatted` too) -- it falls, it does not
+  // break over anyone.
+  bool pour = false;
   bool Done() const { return units <= 0 && rest.Empty(); }
 };
 // One tick of a spill. Returns the eighths emitted; `splat`, on the first

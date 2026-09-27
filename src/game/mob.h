@@ -2454,6 +2454,16 @@ class Mob {
   // turns the held part into an item can mistake it for the item's colour.
   // The session sets the player's; MobSystem::RefreshHeldFills every NPC's.
   void SetHeldFill(const ContainerHeldFill& f, Hand h) { held_[HandIndex(h)].fill = f; }
+  // HOW A HELD VESSEL IS TILTED (the alchemy bench, session.cpp BenchHold):
+  // the hand is turned about the grip, after every solver and the clamp, so
+  // the held item's own long axis (its lattice +X: base -> mouth, the way
+  // every held item is authored) lies along `axisModel` -- MODEL space,
+  // +Y up, +Z the way the body faces, +X the body's LEFT. `weight` 0..1 fades
+  // it in and out; 0 = off. Presentation only, never saved.
+  void SetHeldAim(Hand h, float weight, Vec3 axisModel) {
+    held_[HandIndex(h)].aimWeight = weight;
+    held_[HandIndex(h)].aimAxis = axisModel;
+  }
   // WHERE A HELD VESSEL'S CONTENTS LEAVE IT (game/container.h): the point of
   // the held item's own lattice farthest along `dir` (world), at the body's
   // current pose -- the lip of a flask tipped toward what it pours on, so a
@@ -3518,6 +3528,8 @@ class Mob {
   // are the author's arm and are not clamped (strokes.h "A FRAME IS A POSE").
   // Both drivers call it straight after AnimClampPoseLimits.
   void ReapplyKeyedArm(const AnimSkeleton& sk, AnimState& st) const;
+  // SetHeldAim's turn of each hand, last in the pose pipeline.
+  void ApplyHeldAim(const AnimSkeleton& sk, AnimState& st) const;
   void ReflattenArm(const AnimSkeleton& sk, AnimState& st,
                     const int (&parts)[kArmJoints],
                     const Quat (&got)[kArmJoints]) const;
@@ -4577,6 +4589,8 @@ class Mob {
     Vec3 gripBody{};         // grip point in the item's BODY frame
     alchemy::Composition contents;   // SetHeldContents
     ContainerHeldFill fill;  // SetHeldFill; render-only
+    float aimWeight = 0;     // SetHeldAim
+    Vec3 aimAxis{0, 1, 0};
     void Clear() { *this = HeldHand{}; }
   };
   HeldHand held_[kHands];

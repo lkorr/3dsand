@@ -805,6 +805,7 @@ void FlaskSim::StepLiquid() {
       bool out = p.x < -4 || p.x > cfg_.gridW + 4 || p.y < 0 || p.y > cfg_.gridH + 64;
       if (out) {
         spilledUnits_[psub_[i]] += pw_[i];
+        NoteExit(p.x, pw_[i]);
         continue;
       }
     }
@@ -1265,6 +1266,7 @@ void FlaskSim::StepGrains() {
       float nx = g.fx + g.vx, ny = g.fy + g.vy;
       if (nx < 0 || nx >= W || ny < 0) {
         spilledUnits_[g.sub] += 1;
+        NoteExit((float)g.x + 0.5f, 1);
         grid_[(size_t)g.y * W + g.x] = 0;
         dead.push_back(gi);
         Wake(g.x, g.y);
@@ -1309,6 +1311,7 @@ void FlaskSim::StepGrains() {
       // Falls out of the panel.
       if (!wall_[(size_t)g.x]) {
         spilledUnits_[g.sub] += 1;
+        NoteExit((float)g.x + 0.5f, 1);
         grid_[(size_t)g.y * W + g.x] = 0;
         dead.push_back(gi);
         Wake(g.x, g.y);
@@ -2009,6 +2012,22 @@ Tally FlaskSim::Count() const {
     }
   }
   return t;
+}
+
+Composition FlaskSim::DrainSpilled(float* exitX) {
+  // Whole eighths only: the fraction stays in spilledUnits_, so Count() still
+  // sees every unit and its per-substance totals stay whole eighths.
+  Composition out;
+  const uint32_t upe = (uint32_t)cfg_.unitsPerEighth;
+  for (size_t s = 0; s < spilledUnits_.size(); s++) {
+    const uint32_t e = spilledUnits_[s] / upe;
+    if (!e) continue;
+    if (!out.Add(subs_[s].mat, e)) continue;   // a 17th substance waits a step
+    spilledUnits_[s] -= e * upe;
+  }
+  if (exitX) *exitX = exitW_ > 0 ? (float)(exitSum_ / exitW_) : -1.0f;
+  if (!out.Empty()) exitSum_ = exitW_ = 0;
+  return out;
 }
 
 std::vector<float> FlaskSim::MeanHeights() const {

@@ -626,14 +626,16 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
   // solver's pressure would fire them off like a charge). Nudged off the
   // surface it broke on so none of it is born inside the wall.
   const float cells = (float)sp.units / (float)kContainerUnitsPerCell;
-  const float r = std::clamp(std::cbrt(cells * 3.0f / (4.0f * 3.14159265f)),
-                             0.5f, 3.5f);
+  const float r = sp.pour ? 0.35f
+                         : std::clamp(std::cbrt(cells * 3.0f / (4.0f * 3.14159265f)),
+                                      0.5f, 3.5f);
   const Vec3 c = sp.at + sp.away * (r * 0.6f);
   // Outward at a couple of metres a second, plus a third of what the vessel
   // was carrying: a flask smashed against a wall splashes along it rather than
   // stopping dead, and one dropped on its base splashes round its feet.
-  const float burst = MetresToCells(2.5f) / 30.0f;  // cells/tick
-  const Vec3 carry = sp.vel * (0.3f / 30.0f);
+  const float burst = sp.pour ? MetresToCells(0.15f) / 30.0f
+                              : MetresToCells(2.5f) / 30.0f;  // cells/tick
+  const Vec3 carry = sp.vel * ((sp.pour ? 1.0f : 0.3f) / 30.0f);
   const float S = (float)std::max(1, tune.sim.fluidSubsteps);
   const float vmax = 0.45f * S * 0.9f;  // FLUID_VMAX, as ContainerPourFluid
   auto sample = [&](uint32_t k, Vec3& p, Vec3& v) {
@@ -649,7 +651,7 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
     const float rr = std::cbrt(0.5f * (u(0x44u) + 1.0f));
     p = c + d * (r * rr);
     v = carry + d * (burst * (0.6f + 0.4f * (u(0x55u) * 0.5f + 0.5f)));
-    v.y += burst * 0.35f;
+    if (!sp.pour) v.y += burst * 0.35f;
   };
 
   int emitted = 0;

@@ -212,6 +212,12 @@ class FlaskSim {
 
   Tally Count() const;
 
+  // What has left the bench since the last call, in WHOLE eighths, taken out
+  // of the spill (the fraction of an eighth stays until more joins it, so
+  // Count() keeps adding up). The bench streams it into the world as it
+  // falls. `exitX` = the mean x (sim pixels) it left at, -1 if unknown.
+  Composition DrainSpilled(float* exitX = nullptr);
+
   // RGBA8 (0xAABBGGRR), gridW x gridH, row 0 = TOP (image order). Alpha 0
   // where there is nothing, so the panel's own backdrop shows through.
   void Render(std::vector<uint32_t>& out) const;
@@ -397,6 +403,10 @@ class FlaskSim {
   float stickR_ = 3;
 
   std::vector<uint32_t> spilledUnits_;  // per substance slot
+  // Where spilled matter left the table since the last DrainSpilled, as a
+  // unit-weighted sum of x.
+  double exitSum_ = 0, exitW_ = 0;
+  void NoteExit(float x, uint32_t units) { exitSum_ += (double)x * units; exitW_ += units; }
   int highlight_ = -1;
   // ---- the look (Render): derived per substance at SetSubstances ----------
   struct Look {

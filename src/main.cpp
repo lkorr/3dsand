@@ -9102,6 +9102,10 @@ int main(int argc, char** argv) {
         ui.alchemy.toggleRef = refB;
       }
       if (f == 175) g_shotJumpPath = "screenshot_bench.bmp";
+      // SANDVOX_BENCH_PORTRAIT_YAW turns the portrait (radians; 1.3 = from the
+      // side): the front view foreshortens a flask held out toward you.
+      if (const char* py = std::getenv("SANDVOX_BENCH_PORTRAIT_YAW"))
+        ui.portraitYaw = (float)std::atof(py);
       alchemy::Xform pa, pb;
       float wa = 0, ha = 0, wb = 0, hb = 0;
       const bool haveA = bench.IsOpen() && bench.PoseOf(refA, pa, wa, ha);
@@ -12846,6 +12850,19 @@ int main(int argc, char** argv) {
         for (const alchemy::BenchEntry& e : r.vessels) {
           const ItemStack* st = kit.Resolve(e.ref);
           if (!st || st->name != e.item || st->count != 1 || !st->contents.SameAs(e.before)) {
+            // What already fell into the world while the bench was up is
+            // gone whatever happens here: it comes out of the vessels that
+            // are still what they were, so voiding the session is never a
+            // way to pour a flask out and keep it full.
+            for (size_t m = 0; m < r.streamed.size(); m++) {
+              uint32_t owe = r.streamed[m];
+              for (const alchemy::BenchEntry& o : r.vessels) {
+                if (!owe) break;
+                ItemStack* os = kit.Resolve(o.ref);
+                if (os && os->name == o.item && os->count == 1 && os->contents.SameAs(o.before))
+                  owe -= os->contents.Take((uint16_t)m, owe);
+              }
+            }
             ui.kitMessage = "something moved while you worked; nothing changed";
             ui.kitMessageAge = 0.0f;
             return;
@@ -12906,6 +12923,108 @@ int main(int argc, char** argv) {
       if (ui.alchemy.wantClose || (bench.IsOpen() && !ui.inventoryOpen)) {
         ui.alchemy.wantClose = false;
         if (bench.IsOpen()) finishBench();
+      }
+      // ---- THE BENCH IN THE CHARACTER'S HANDS (session.h BenchHold) --------
+      // One vessel on the table: held in one hand. Two or more: the one in
+      // the bench's hand (or the one last touched) and its nearest
+      // neighbour, one per hand -- the bench is the portrait's mirror image,
+      // so the one on the bench's LEFT is in the character's RIGHT hand. The
+      // hands are kept while the pair is the same pair, so carrying one flask
+      // across the other does not swap them between the fists.
+      {
+        static KitRef benchInHand[kHands] = {};
+        PlayerSession::BenchHold bh{};
+        std::vector<alchemy::BenchVesselView> views;
+        if (bench.IsOpen()) views = bench.Vessels();
+        if (!views.empty()) {
+          int a = -1, b = -1;
+          for (size_t i = 0; i < views.size(); i++)
+            if (views[i].held) a = (int)i;
+          if (a < 0) {
+            const KitRef fr = bench.Focus();
+            for (size_t i = 0; i < views.size(); i++)
+              if (views[i].ref == fr) a = (int)i;
+          }
+          if (a < 0) a = (int)views.size() - 1;
+          for (size_t i = 0; i < views.size(); i++) {
+            if ((int)i == a) continue;
+            if (b < 0 || std::fabs(views[i].pose.pos.x - views[a].pose.pos.x) <
+                             std::fabs(views[b].pose.pos.x - views[a].pose.pos.x))
+              b = (int)i;
+          }
+          auto isIn = [&](int v) {
+            return v >= 0 && (views[v].ref == benchInHand[0] || views[v].ref == benchInHand[1]);
+          };
+          const int want = b >= 0 ? 2 : 1;
+          const int have = (benchInHand[0].Valid() ? 1 : 0) + (benchInHand[1].Valid() ? 1 : 0);
+          if (have != want || !isIn(a) || (b >= 0 && !isIn(b))) {
+            benchInHand[0] = benchInHand[1] = KitRef{};
+            if (b < 0) {
+              const int hk = avatar.HandUsable(Hand::Right) ? 0 : 1;
+              benchInHand[hk] = views[a].ref;
+            } else {
+              const bool aLeft = views[a].pose.pos.x < views[b].pose.pos.x;
+              benchInHand[HandIndex(Hand::Right)] = views[aLeft ? a : b].ref;
+              benchInHand[HandIndex(Hand::Left)] = views[aLeft ? b : a].ref;
+            }
+          }
+          for (int hk = 0; hk < kHands; hk++) {
+            for (const alchemy::BenchVesselView& v : views) {
+              if (!benchInHand[hk].Valid() || !(v.ref == benchInHand[hk])) continue;
+              const ItemStack* st = kit.Resolve(v.ref);
+              const ItemDef* d = st ? items.Of(*st) : nullptr;
+              if (!d) continue;
+              PlayerSession::BenchHold::HandView& hv = bh.hand[hk];
+              hv.item = d->name;
+              if (!bench.Contents(v.ref, hv.contents)) hv.contents = st->contents;
+              hv.angle = v.pose.angle;
+              hv.pouring = v.held && b >= 0;
+            }
+          }
+          bh.active = !bh.hand[0].item.empty() || !bh.hand[1].item.empty();
+        } else {
+          benchInHand[0] = benchInHand[1] = KitRef{};
+        }
+        session.benchHold = bh;
+
+        // ---- WHAT FALLS OFF THE TABLE FALLS INTO THE WORLD, NOW -----------
+        // Whole eighths as the bench drains them (AlchemyBench::TakeSpill),
+        // poured -- not burst -- from the lip of the flask in the hand
+        // nearest where it fell off the table, or at your feet for one not
+        // in a hand.
+        alchemy::Composition fell;
+        float exitX = -1.0f;
+        if (bench.IsOpen() && bench.TakeSpill(fell, exitX)) {
+          ContainerSpill sp;
+          const Vec3 fwd = cam.Forward();
+          sp.at = player.EyePos() + fwd * MetresToCells(0.35f) -
+                  Vec3{0, MetresToCells(0.6f), 0};
+          int nearest = -1;
+          for (size_t i = 0; i < views.size(); i++)
+            if (nearest < 0 || std::fabs(views[i].pose.pos.x - exitX) <
+                                std::fabs(views[nearest].pose.pos.x - exitX))
+              nearest = (int)i;
+          if (nearest >= 0 && avatar.Spawned()) {
+            for (int hk = 0; hk < kHands; hk++) {
+              if (!(views[nearest].ref == benchInHand[hk])) continue;
+              const Hand h = HandAt(hk);
+              const float ang = views[nearest].pose.angle;
+              const Quat yaw = QuatAxisAngle({0, 1, 0}, avatar.Heading());
+              const Vec3 axisW = QuatRotate(yaw, Vec3{-std::sin(ang), std::cos(ang), 0.0f});
+              Vec3 lip;
+              if (avatar.HeldMouthWorld(axisW, lip, h)) sp.at = lip;
+            }
+          }
+          sp.vel = player.vel;
+          sp.pour = true;
+          sp.splatted = true;
+          sp.rest = fell;
+          sp.seed = rng::Hash3(0xA1C4E5u, (uint32_t)frameCounter, fell.Total());
+          tickCtx.vesselSpills.push_back(sp);
+          if (std::getenv("SANDVOX_BENCH_DEBUG"))
+            std::printf("bench spill: frame %llu, %u eighths off the table at x %.0f\n",
+                        (unsigned long long)frameCounter, fell.Total(), exitX);
+        }
       }
 
       if (ui.dropItem.pending) {

@@ -70,6 +70,10 @@ bool AlchemyBench::Open(int w, int h, const std::vector<MaterialDef>& mats) {
   front_.assign((size_t)w_ * h_, 0u);
   back_.clear();
   backReady_ = false;
+  streamOut_.assign(mats.size(), 0u);
+  streamed_.assign(mats.size(), 0u);
+  streamXSum_ = streamXW_ = 0;
+  heldPub_ = -1;
   fresh_ = true;
   open_ = true;
   thread_ = std::thread([this] { Run(); });
@@ -169,6 +173,39 @@ bool AlchemyBench::PoseOf(KitRef ref, Xform& pose, float& width, float& height) 
   return false;
 }
 
+std::vector<BenchVesselView> AlchemyBench::Vessels() const {
+  std::vector<BenchVesselView> out;
+  std::lock_guard<std::mutex> lk(mu_);
+  for (size_t i = 0; i < entries_.size() && i < poses_.size(); i++) {
+    if (!entries_[i].onTable || !poses_[i].on) continue;
+    BenchVesselView v;
+    v.ref = entries_[i].ref;
+    v.pose = poses_[i].x;
+    v.width = poses_[i].w;
+    v.height = poses_[i].h;
+    v.held = heldPub_ == (int)i;
+    out.push_back(v);
+  }
+  return out;
+}
+
+bool AlchemyBench::TakeSpill(Composition& out, float& exitX) {
+  out = Composition{};
+  exitX = -1.0f;
+  if (!open_) return false;
+  std::lock_guard<std::mutex> lk(mu_);
+  for (size_t m = 0; m < streamOut_.size(); m++) {
+    if (!streamOut_[m]) continue;
+    if (!out.Add((uint16_t)m, streamOut_[m])) break;
+    if (m < streamed_.size()) streamed_[m] += streamOut_[m];
+    streamOut_[m] = 0;
+  }
+  if (out.Empty()) return false;
+  exitX = streamXW_ > 0 ? (float)(streamXSum_ / streamXW_) : -1.0f;
+  streamXSum_ = streamXW_ = 0;
+  return true;
+}
+
 KitRef AlchemyBench::Focus() const {
   std::lock_guard<std::mutex> lk(mu_);
   return focus_ >= 0 && focus_ < (int)entries_.size() ? entries_[focus_].ref : KitRef{};
@@ -215,12 +252,20 @@ BenchResult AlchemyBench::Finish() {
   for (Slot& s : slots_)
     if (s.sim >= 0) sim_.TeleportVessel(s.sim, sim_.VesselXform(s.sim));
   sim_.Settle(360);
+  // Count() includes what is still in the sim's spill (whole eighths and the
+  // fractions): it is the rest of `spilled`, below.
   const Tally t = sim_.Count();
   for (size_t i = 0; i < entries_.size(); i++) {
     if (i < slots_.size() && slots_[i].sim >= 0) entries_[i].after = t.vessel[slots_[i].sim];
     r.vessels.push_back(entries_[i]);
   }
   r.spilled = t.spilled;
+  // Anything that fell off the table and the frame never took goes out with
+  // the rest at the end.
+  for (size_t m = 0; m < streamOut_.size(); m++)
+    if (streamOut_[m]) r.spilled.Add((uint16_t)m, streamOut_[m]);
+  streamOut_.clear();
+  r.streamed = streamed_;
   open_ = false;
   entries_.clear();
   slots_.clear();
@@ -400,6 +445,8 @@ void AlchemyBench::Run() {
     Tick(in, pressed, tilt, tool, 1.0f / 60.0f);
     sim_.Step(4);
     ticks_++;
+    float exitX = -1.0f;
+    const Composition fell = sim_.DrainSpilled(&exitX);
 
     // Redrawn every step while anything moves, and at 30 a second while the
     // table only LOOKS alive (glow, fizz, the light on water: FlaskSim::
@@ -431,6 +478,19 @@ void AlchemyBench::Run() {
       if (tally) live_.swap(live);
       poses_.swap(poses);
       focus_ = simFocus_;
+      heldPub_ = held_;
+      if (!fell.Empty()) {
+        uint32_t units = 0;
+        for (int i = 0; i < fell.n; i++) {
+          if (fell.p[i].mat >= streamOut_.size()) streamOut_.resize(fell.p[i].mat + 1, 0u);
+          streamOut_[fell.p[i].mat] += fell.p[i].eighths;
+          units += fell.p[i].eighths;
+        }
+        if (exitX >= 0) {
+          streamXSum_ += (double)exitX * units;
+          streamXW_ += units;
+        }
+      }
     }
     next += period;
     const auto now = clock::now();
@@ -451,6 +511,8 @@ bool ValidateBench(BenchResult& r, const std::vector<MaterialDef>& mats, std::st
     acc(e.after, -1);
   }
   acc(r.spilled, -1);
+  for (size_t m = 0; m < r.streamed.size() && m < diff.size(); m++)
+    diff[m] -= (int64_t)r.streamed[m];
   for (size_t m = 0; m < diff.size(); m++)
     if (diff[m] != 0) {
       why = "the bench did not conserve " + (m < mats.size() ? mats[m].name : std::string("?")) +

@@ -56,6 +56,19 @@ struct BenchEntry {
 struct BenchResult {
   std::vector<BenchEntry> vessels;
   Composition spilled;               // left the bench: goes to the world
+  // What already WENT to the world while the bench was up (TakeSpill), per
+  // material id, eighths. Part of the conservation sum: before == after +
+  // spilled + streamed.
+  std::vector<uint32_t> streamed;
+};
+
+// A vessel on the table as the character holds it (main.cpp poses the
+// avatar's hands off this, game/session.h BenchHold).
+struct BenchVesselView {
+  KitRef ref;
+  Xform pose;            // sim pixels, y up; angle radians CCW
+  float width = 0, height = 0;
+  bool held = false;     // in the bench's hand right now
 };
 
 // Does `r` conserve every material (sum of before == sum of after + spilled)?
@@ -108,9 +121,19 @@ class AlchemyBench {
   // the last published step. For scripted captures.
   bool PoseOf(KitRef ref, Xform& pose, float& width, float& height) const;
 
+  // Every vessel on the table as of the last published step, in the order
+  // they came on.
+  std::vector<BenchVesselView> Vessels() const;
+
   // One frame: the pointer and tool go to the sim thread, the newest picture
   // comes back into Pixels().
   void Frame(const BenchInput& in, BenchTool tool);
+
+  // WHAT FELL OFF THE TABLE SINCE THE LAST CALL, whole eighths, for the
+  // caller to put into the world NOW (up to 16 substances a call; more waits
+  // for the next). `exitX` = where on the table it fell, sim pixels. Once
+  // taken it is the world's: Finish reports it in BenchResult::streamed.
+  bool TakeSpill(Composition& out, float& exitX);
 
   // Stops the sim, lets whatever is in flight land, tallies, closes.
   BenchResult Finish();
@@ -146,6 +169,7 @@ class AlchemyBench {
   std::vector<uint32_t> front_;
   bool fresh_ = false;
   std::string refusal_;
+  std::vector<uint32_t> streamed_;   // per mat id, taken by TakeSpill
 
   // ---- shared, under mu_ ----
   mutable std::mutex mu_;
@@ -157,6 +181,9 @@ class AlchemyBench {
   std::vector<uint32_t> back_;
   bool backReady_ = false;
   std::vector<Composition> live_;                      // per entry
+  std::vector<uint32_t> streamOut_;                    // per mat id, not yet taken
+  double streamXSum_ = 0, streamXW_ = 0;
+  int heldPub_ = -1;                                   // entry in the hand
   std::vector<std::pair<int, Composition>> removed_;   // entry, what left with it
   int focus_ = -1;                                     // entry
   struct PoseView { Xform x; float w = 0, h = 0; bool on = false; };
