@@ -54,6 +54,10 @@ struct ChemRule {
   // does not have (the rule can never fire, as in the world).
   uint8_t soluteSpecies = 0;
   uint8_t soluteMin = 0, soluteMax = 255;
+  // A DRYING rule (reactions.json "drying": true; materials.h
+  // RuleFx::drying): matter soaking into the ground or drying in the open
+  // (blood -> air). FlaskSim never fires it on anything inside a vessel.
+  bool drying = false;
 };
 constexpr uint8_t kChemSoluteNever = 255;
 // The concentration, in the world's units, of `mass` dissolved units in a

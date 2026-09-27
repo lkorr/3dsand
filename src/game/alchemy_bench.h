@@ -263,6 +263,7 @@ class AlchemyBench {
   // THE CHEMISTRY'S EVENTS since the last call (DispatchBenchEvent each).
   std::vector<BenchEvent> TakeEvents();
   // The devices of a vessel on the table, as of the last published step.
+  // `pressure` is a fraction of where its stopper pops (FlaskSim::PressureFraction).
   bool Devices(KitRef ref, bool& stoppered, bool& burner, float& heat, float& pressure) const;
   // For scripted captures (--shot-bench) and gates: act on a vessel directly.
   void SetStopper(KitRef ref, bool on);

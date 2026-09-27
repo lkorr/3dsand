@@ -171,6 +171,7 @@ inline Chemistry BuildBenchChemistry(const std::vector<MaterialDef>& mats,
       r.chance = g.chance;
       r.cond = g.cond;
       r.worldIndex = m.gpu.reactOffset + k;
+      r.drying = k < m.ruleFx.size() && m.ruleFx[k].drying;
       bool ok = true;
       r.prodSelf = prod(g.prodSelf, ok);
       r.prodNbr = prod(g.prodNbr, ok);

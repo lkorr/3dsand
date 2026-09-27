@@ -4091,10 +4091,13 @@ class Mob {
   // ---- A COAT THAT HEALS (alchemy package D, 2026-09-27) --------------------
   // Every living base limb wearing a RESTORATIVE coat (MaterialDef::
   // coatRestore: enchanted blood, enchanted water) is rebuilt toward its
-  // authored recipe once per kHealPeriod ticks, paid for out of that coat:
-  // missing cells grow back from the flesh beside them (nearest the joint
-  // first), cells that are not what the recipe says (cooked, charred, soaked
-  // to the wound material, rotted) are put back, and when the shape is whole
+  // authored recipe a few cells every kHealPeriod ticks (coat.restoreRate
+  // world voxels a second: a heavy wound takes ~30 s), paid for out of that
+  // coat: missing cells grow back from the flesh beside them and cells that
+  // are not what the recipe says (cooked, charred, soaked to the wound
+  // material, rotted) are put back, the step's few picked from that whole
+  // frontier by a hash of (tick, creature, limb, cell) so the wound fills
+  // NOISILY rather than as a front from the joint; and when the shape is whole
   // the rest of the coat buys hp up to the burn cap. The coat's own
   // `coat.effects` (stanch, disinfect) run on a limb it healed. Never
   // reshapes limbs_ (no sever, no death). See the long note at the definition.
@@ -4105,7 +4108,9 @@ class Mob {
   // SELF-ACTIVE one (MobSystem::matSelfActive_ -- the anatomy's blood
   // speckles), which decays by itself whenever the limb's burn pass is awake.
   bool IsHealExempt(uint32_t mat) const;
-  static constexpr uint32_t kHealPeriod = 6;
+  // Short, so the rebuild looks alive (a few cells ten times a second rather
+  // than a batch five times a second); the rate, not the period, sets the pace.
+  static constexpr uint32_t kHealPeriod = 3;
  public:
   // What HealTick has done to this creature, ever. Diagnostic (the heal-*
   // gates); never saved, never hashed.
@@ -4115,8 +4120,22 @@ class Mob {
     uint32_t levelsSpent = 0;  // coat levels the healing consumed
     uint32_t steps = 0;        // limb steps that did anything
     float hpHealed = 0.0f;     // hp credited (volume back + the hp-only path)
+    uint32_t bodyRebuilds = 0; // steps that rebuilt the Jolt collider
+    // Wall-clock cost of the steps that walked the recipe (diagnostic only:
+    // read by the gates, never by anything the tick decides).
+    uint32_t timedSteps = 0;
+    double stepUs = 0.0, stepUsMax = 0.0;
+    // THE ORDER cells grew back in, when a gate asks (LogHealOrder): each
+    // grown cell's squared distance to the joint anchor in world voxels^2,
+    // in the order it was grown. Capped; off (empty) for every creature else.
+    bool logOrder = false;
+    std::vector<float> orderD2;
   };
   const HealStats& Healed() const { return healStats_; }
+  void LogHealOrder(bool on) {
+    healStats_.logOrder = on;
+    if (!on) healStats_.orderD2.clear();
+  }
   // The limb against its recipe, on the authoritative lattice: recipe cells
   // that are absent, and present cells whose material is not the recipe's.
   // False when the limb has no body or no recipe model.
@@ -6829,6 +6848,7 @@ class MobSystem {
   // blister leaves them, poking the brick and marking the burn fraction for a
   // recount. Returns the voxels rewritten.
   Mob::HealStats HealStatsOf(uint64_t mobId) const;
+  void LogHealOrder(uint64_t mobId, bool on);
   bool LimbRecipeDiff(uint64_t mobId, int limb, uint32_t& missing,
                       uint32_t& differ, std::string* why = nullptr) const;
   uint32_t RewriteLimbSurface(uint64_t mobId, int limb, uint32_t fromMat,

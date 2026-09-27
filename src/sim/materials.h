@@ -743,6 +743,13 @@ struct RuleFx {
   std::string solute;
   uint32_t soluteMin = 0;
   uint32_t soluteMax = 255;
+  // ---- A DRYING RULE (reactions.json `"drying": true`, 2026-09-27) --------
+  // This rule is the world's abstraction of matter SOAKING INTO THE GROUND
+  // or DRYING IN THE OPEN (blood's `blood -> air`), not chemistry. The world
+  // runs it as authored; the alchemy bench never fires it on matter inside a
+  // vessel (there is no ground in a flask). CPU-side only: it takes no fx id
+  // and nothing of it reaches the GPU, so the world hash cannot see it.
+  bool drying = false;
 };
 // Does rule k of `m` (its bucket, reactOffset + k) carry a solute condition?
 // Declared here so a CPU rule evaluator can skip such a rule in one line.

@@ -67,6 +67,8 @@
 #include "game/mob.h"
 #include "game/melee.h"  // hit-drive swings the real sweep
 #include "game/anim.h"   // QuatRotate: a joint anchor is body-local
+#include "game/bodyreg.h"  // heal-restore's optional picture sequence
+#include "gpu/resources.h"  // CreateBuffer, ditto
 #include "sim/microbody.h"
 #include "phys/bodystain.h"   // bruise-is-skin: SoakBruise and the coat rules
 #include "sim/tuning.h"
@@ -8101,6 +8103,99 @@ double HealCellsPerLevel(const MobDef& def, const MaterialDef& m) {
   const double s = (double)std::max(def.skinScale, def.physScale);
   return (double)m.coatRestore * s * s * s;
 }
+// HOW SCATTERED the regrowth was (Mob::HealStats::orderD2: each grown cell's
+// squared distance to the joint, in the order it grew). The FIRST 20% of the
+// cells to grow back, each ranked by that distance among ALL the cells that
+// grew (0 = the nearest the joint, 1 = the farthest): `meanRank` is their
+// mean rank and `nearFrac` the fraction of them that are also among the
+// nearest 20%. A front marching out from the joint reads ~0.1 and ~1.0; a
+// wound filling everywhere at once reads ~0.5 and ~0.2.
+struct HealScatter {
+  uint32_t n = 0, first = 0;
+  double meanRank = 0.0, nearFrac = 0.0;
+};
+// A PICTURE of one limb, for looking at a heal (SANDVOX_HEAL_SHOTS=1 on
+// heal-restore: build/heal_<tag>.bmp). The --shot-mob recipe (main.cpp
+// RunMobShot's `shoot`): bodies + micro bricks uploaded, a noon camera `dist`
+// voxels out along `dir` from `target`, the world and the bodies drawn, read
+// back. Diagnostic only; off by default because a gate should not write files
+// nobody asked for.
+void HealShot(Ctx& c, Vec3 target, Vec3 dir, float dist, const char* path) {
+  if (MicroBodySet* mbs = c.debris.MicroSet(); mbs != nullptr && mbs->dirty)
+    c.sim.UploadMicroBodies(c.ctx.queue, *mbs);
+  BodyRegistry reg(c.debris, c.mobs, nullptr);
+  std::vector<BodyXformGpu> xf;
+  reg.BuildXforms(xf);
+  if (!xf.empty())
+    c.ctx.queue.WriteBuffer(c.world.bodyXforms, 0, xf.data(),
+                            xf.size() * sizeof(BodyXformGpu));
+  std::vector<MicroBodyInstGpu> microInsts;
+  reg.BuildMicroInsts(microInsts);
+  std::vector<BodyVoxInst> inst;
+  reg.BuildInstances(inst);
+  if (!inst.empty())
+    c.ctx.queue.WriteBuffer(c.world.bodyInstances, 0, inst.data(),
+                            inst.size() * sizeof(BodyVoxInst));
+  const uint32_t W = 960, H = 720;
+  const Vec3 eye = target + dir.normalized() * dist;
+  const Vec3 look = (target - eye).normalized();
+  Camera cam;
+  cam.yaw = std::atan2(look.z, look.x);
+  cam.pitch = std::asin(std::clamp(look.y, -1.0f, 1.0f));
+  WriteRenderParams(c.ctx.queue, c.world, eye, cam, (float)W / H, true, 0.0f,
+                    kFarFogDensity, (float)H, TicksPerDay(CurrentTuning()) / 2);
+  rhi::Texture tex = c.ctx.device.CreateTexture(
+      {W, H, 1}, rhi::TextureFormat::RGBA8Unorm,
+      rhi::TextureUsage::RenderAttachment | rhi::TextureUsage::CopySrc,
+      "healShot");
+  const uint32_t microCount = c.sim.UploadMicroBodyInsts(c.ctx.queue, microInsts);
+  rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+  c.sim.EncodeShadowResolve(enc);
+  rhi::RenderPass rp = c.sim.BeginRenderPass(enc, tex.CreateView(),
+                                             rhi::TextureFormat::RGBA8Unorm, W, H);
+  c.sim.DrawWorld(rp);
+  c.sim.DrawBodies(rp, (uint32_t)inst.size());
+  c.sim.DrawMicroBodies(rp, microCount);
+  rp.End();
+  rhi::Buffer buf = CreateBuffer(c.ctx.device, (uint64_t)W * H * 4,
+                                 rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                 "healShotRead");
+  rhi::TexelCopyTexture srcT{};
+  srcT.texture = tex;
+  rhi::TexelCopyBuffer dstB{};
+  dstB.buffer = buf;
+  dstB.bytesPerRow = W * 4;
+  dstB.rowsPerImage = H;
+  enc.CopyTextureToBuffer(srcT, dstB, rhi::Extent3D{W, H, 1});
+  c.ctx.queue.Submit(enc.Finish());
+  std::vector<uint8_t> px((size_t)W * H * 4, 0);
+  if (rhi::ReadBufferBlocking(c.ctx.device, buf, 0, px.data(), px.size()) &&
+      WriteBmpFile(path, px, W, H))
+    std::printf("wrote %s\n", path);
+}
+HealScatter HealOrderScatter(const std::vector<float>& d2) {
+  HealScatter r;
+  r.n = (uint32_t)d2.size();
+  if (r.n < 10) return r;
+  std::vector<float> sorted = d2;
+  std::sort(sorted.begin(), sorted.end());
+  r.first = std::max(1u, r.n / 5);
+  const float nearCut = sorted[r.first - 1];
+  double sum = 0.0;
+  uint32_t near = 0;
+  for (uint32_t i = 0; i < r.first; i++) {
+    // Mid-rank among equal distances, so a tie does not bias the statistic.
+    const auto lo = std::lower_bound(sorted.begin(), sorted.end(), d2[i]);
+    const auto hi = std::upper_bound(sorted.begin(), sorted.end(), d2[i]);
+    const double rank =
+        0.5 * (double)((lo - sorted.begin()) + (hi - sorted.begin()) - 1);
+    sum += rank / (double)(r.n - 1);
+    if (d2[i] <= nearCut) near++;
+  }
+  r.meanRank = sum / (double)r.first;
+  r.nearFrac = (double)near / (double)r.first;
+  return r;
+}
 }  // namespace
 
 // heal-restore. Claims:
@@ -8112,9 +8207,17 @@ double HealCellsPerLevel(const MobDef& def, const MaterialDef& m) {
 //     carried change); the coat is spent; once it is, 60 more ticks rebuild
 //     nothing (rule 2: healing cannot feed itself); and if the pour could not
 //     pay for the whole hole (the fixture asserts it cannot), the hole is NOT whole.
-//   * RESTORED: the same wound on a fresh creature, the limb soaked (+8,
-//     surface): it comes back to its recipe -- 0 missing, 0 changed cells --
-//     and the limb's hp is back to at least what it was before the carve.
+//   * RESTORED, SLOWLY AND NOISILY: a HEAVY wound (a crater on every side of
+//     the limb that a ray reaches, at two heights) on a fresh creature, the
+//     limb soaked (+8, surface). At 5 s (150 ticks) at least
+//     heal.minLeftAt5s of the wound is still there (it is not an instant
+//     heal); at 35 s at most heal.maxLeftAt35s is; it ends back at its recipe
+//     -- 0 missing, 0 changed -- with hp at least what it was before the
+//     carve, and the coat is still on it when it does (it did not dry off
+//     first); every cell rebuilt is paid for by a level spent; and the FIRST
+//     20% of the cells to grow back are scattered along the wound, not the
+//     ones nearest the joint (HealOrderScatter's mean rank >=
+//     heal.minScatterRank). Thresholds: tests/baseline.json heal.*.
 Status GateHealRestore(Ctx& c, std::string& detail) {
   MobSystem& mobs = c.mobs;
   IdCounterScope idScope(mobs);
@@ -8209,39 +8312,103 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
       sA2.levelsSpent == sA.levelsSpent && missA1 < missA0 &&
       purseA < (double)(missA0 + diffA0) && missA1 + diffA1 > 0;
 
-  // ---- B: a soak, the limb comes back ---------------------------------------
+  // ---- B: a heavy wound, soaked: it comes back, slowly and noisily ----------
   uint64_t idB = 0;
   const float hpPre = [&]() {
     // The limb's hp BEFORE the carve, off an identical fresh spawn.
     uint64_t id = SpawnTarget(c, t, kInset, pchunk);
     return id ? mobs.LimbHp(id, t.limb) : -1.0f;
   }();
+  const double minLeft5 = BaselineNumber("heal.minLeftAt5s", 0.5);
+  const double maxLeft35 = BaselineNumber("heal.maxLeftAt35s", 0.15);
+  const double minScatter = BaselineNumber("heal.minScatterRank", 0.3);
+  const double minWound = BaselineNumber("heal.minHeavyWoundCells", 600);
   bool restoredOk = false;
   uint32_t missB0 = 0, diffB0 = 0, missB1 = 0, diffB1 = 0, levelsB = 0,
-           doneAt = 0;
+           doneAt = 0, craters = 0, coatAtDone = 0;
+  uint32_t left5 = 0, left35 = 0;
   float hpB0 = 0.0f, hpB1 = 0.0f;
   Mob::HealStats sB;
+  HealScatter scat;
+  bool fixtureB = false;
+  const float hpGoal = std::min(hpPre, def.limbs[t.limb].hp);
   if (spawnWounded(idB)) {
+    // ...and more craters: every side a ray reaches this limb from, at two
+    // heights, so the wound is a few world voxels of tissue -- a heavy one.
+    const LimbAxis ax = MeasureLimb(mobs, idB, t.limb);
+    const Vec3 sides[4] = {ax.travel, ax.travel * -1.0f, ax.edge, ax.edge * -1.0f};
+    const float heights[2] = {0.3f, 0.7f};
+    for (float hf : heights)
+      for (const Vec3& sd : sides) {
+        const Vec3 at = ax.anchor + ax.along * (hf * ax.reach);
+        const Vec3 o = at + sd * 20.0f;
+        const MobSystem::BodyRayHit h = mobs.PickBody(idB, o, sd * -1.0f, 40.0f);
+        if (!h.hit || h.limb != t.limb) continue;
+        std::vector<ParticleSpawn> sp;
+        mobs.CarveLimbRadial(mobs.LimbBody(idB, t.limb), h.pos, 1.0f, true, false,
+                             c.world, sp);
+        craters++;
+        if (!mobs.LimbBody(idB, t.limb)) break;
+      }
+    for (int i = 0; i < 5; i++) poseTick();
+    fixtureB = mobs.LimbBody(idB, t.limb) != 0;
+  }
+  if (fixtureB) {
     mobs.LimbRecipeDiff(idB, t.limb, missB0, diffB0);
     hpB0 = mobs.LimbHp(idB, t.limb);
+    mobs.LogHealOrder(idB, true);
     mobs.SoakLimb(idB, t.limb, hm.eBlood, 8, simTick);
     levelsB = HealCoatLevels(mobs, idB, t.limb, hm.eBlood, simTick);
-    for (int i = 0; i < 1500 && mobs.LimbBody(idB, t.limb); i++) {
+    left5 = left35 = missB0 + diffB0;
+    // SANDVOX_HEAL_SHOTS=1: a picture of the limb at 0, 5, 10, 15, 20, 30 s
+    // and when it is whole, from the first side a crater was carved from.
+    const char* shotsEnv = std::getenv("SANDVOX_HEAL_SHOTS");
+    const bool shots = shotsEnv && *shotsEnv && *shotsEnv != '0';
+    auto shotAt = [&](const char* tag) {
+      if (!shots) return;
+      const LimbAxis a = MeasureLimb(mobs, idB, t.limb);
+      const Vec3 mid = a.anchor + a.along * (0.5f * a.reach);
+      // From the side the first crater was carved from (the ray that met
+      // this limb before anything else: the outside of the arm).
+      const Vec3 dir = rd * -1.0f + Vec3{0.0f, 0.25f, 0.0f};
+      HealShot(c, mid, dir, std::max(10.0f, 2.5f * a.reach),
+               (std::string("build/heal_") + tag + ".bmp").c_str());
+    };
+    shotAt("00s");
+    for (int i = 0; i < 3600 && mobs.LimbBody(idB, t.limb); i++) {
       poseTick();
-      if (i % 10 != 9) continue;
-      mobs.LimbRecipeDiff(idB, t.limb, missB1, diffB1);
-      if (missB1 == 0 && diffB1 == 0) {
-        doneAt = (uint32_t)i + 1;
+      const uint32_t tk = (uint32_t)i + 1;
+      if (tk == 150) shotAt("05s");
+      if (tk == 300) shotAt("10s");
+      if (tk == 450) shotAt("15s");
+      if (tk == 600) shotAt("20s");
+      if (tk == 900) shotAt("30s");
+      if (tk == 150 || tk == 1050 || tk % 10 == 0) {
+        mobs.LimbRecipeDiff(idB, t.limb, missB1, diffB1);
+        if (tk <= 150) left5 = missB1 + diffB1;
+        if (tk <= 1050) left35 = missB1 + diffB1;
+      }
+      if (tk % 10 != 0) continue;
+      if (missB1 == 0 && diffB1 == 0 &&
+          mobs.LimbHp(idB, t.limb) + 1e-3f >= hpGoal) {
+        doneAt = tk;
+        coatAtDone = mobs.LimbCoatMatCount(idB, t.limb, hm.eBlood, 1);
+        shotAt("whole");
         break;
       }
     }
     mobs.LimbRecipeDiff(idB, t.limb, missB1, diffB1);
-    // ...and the hp the rest of the coat buys once the shape is whole.
-    for (int i = 0; i < 30; i++) poseTick();
     hpB1 = mobs.LimbHp(idB, t.limb);
     sB = mobs.HealStatsOf(idB);
-    restoredOk = missB0 >= 30 && missB1 == 0 && diffB1 == 0 &&
-                 hpB1 + 1e-3f >= std::min(hpPre, def.limbs[t.limb].hp);
+    scat = HealOrderScatter(sB.orderD2);
+    const double total0 = (double)(missB0 + diffB0);
+    restoredOk = total0 >= minWound && missB1 == 0 && diffB1 == 0 &&
+                 hpB1 + 1e-3f >= hpGoal && doneAt != 0 && coatAtDone > 0 &&
+                 (double)left5 >= minLeft5 * total0 &&
+                 (double)left35 <= maxLeft35 * total0 &&
+                 sB.levelsSpent <= levelsB &&
+                 (double)(sB.grown + sB.mended) <= (double)sB.levelsSpent * cpl + 1.0 &&
+                 scat.n >= 10 && scat.meanRank >= minScatter;
   }
   mobs.Reset();
   c.debris.Reset();
@@ -8250,14 +8417,23 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
       "%s.%s: wired %d, %.2f cells/level | A pour: %u marked, %u levels (purse "
       "%.0f cells) on a hole of %u missing + %u changed -> rebuilt %u (%u grown, "
       "%u mended, %u levels spent), coat spent after %u ticks, +60 ticks: %u "
-      "more; left %u missing | B soak: %u levels on %u missing + %u changed -> "
-      "%u missing + %u changed (whole at tick %u), %u grown, %u mended, hp "
-      "%.1f -> %.1f (pre-carve %.1f)",
+      "more; left %u missing | B heavy (%u craters), soak: %u levels on %u "
+      "missing + %u changed; left %u at 5 s (>= %.2f), %u at 35 s (<= %.2f) -> "
+      "%u missing + %u changed, whole+hp at tick %u (%.1f s) with %u voxels "
+      "still coated, %u grown, %u mended, %u levels spent (%.0f cells), hp "
+      "%.1f -> %.1f (pre-carve %.1f) | scatter: first %u of %u grown, mean "
+      "joint-distance rank %.2f (>= %.2f; joint-first ~0.1), %.0f%% among the "
+      "nearest 20%% | cost: %u steps, %.0f us mean, %.0f us max, %u collider "
+      "rebuilds",
       t.defName.c_str(), t.limbName.c_str(), wired ? 1 : 0, cpl, markedA,
       levelsA, purseA, missA0, diffA0, rebuiltA, sA.grown, sA.mended,
       sA.levelsSpent, spentAt, (sA2.grown + sA2.mended) - rebuiltA, missA1,
-      levelsB, missB0, diffB0, missB1, diffB1, doneAt, sB.grown, sB.mended,
-      hpB0, hpB1, hpPre);
+      craters, levelsB, missB0, diffB0, left5, minLeft5, left35, maxLeft35,
+      missB1, diffB1, doneAt, doneAt / 30.0, coatAtDone, sB.grown, sB.mended,
+      sB.levelsSpent, sB.levelsSpent * cpl, hpB0, hpB1, hpPre, scat.first,
+      scat.n, scat.meanRank, minScatter, 100.0 * scat.nearFrac, sB.timedSteps,
+      sB.timedSteps ? sB.stepUs / sB.timedSteps : 0.0, sB.stepUsMax,
+      sB.bodyRebuilds);
   return wired && boundedOk && restoredOk ? Status::Pass : Status::Fail;
 }
 
@@ -8268,6 +8444,9 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
 //     say it stanches and restores; the wound closes; every cooked and soaked
 //     cell returns to the recipe; the burnt fraction falls and the cap rises;
 //     the limb's hp rises -- and on NO tick is it above hp x the burn cap.
+//     PACED: the ~1600 cooked cells are not back at 5 s (heal.minLeftAt5s of
+//     them remain), are mostly back at 35 s (heal.maxLeftAt35s), and the
+//     coat is still on the limb when it is whole.
 //   * ENCHANTED WATER, the gentle one, on a fresh cooked limb: it mends
 //     (> 0 cells), does not claim to stanch, and never rebuilds more than its
 //     levels buy.
@@ -8315,11 +8494,20 @@ Status GateHealWound(Ctx& c, std::string& detail) {
   uint32_t miss0 = 0, diff0 = 0;
   mobs.LimbRecipeDiff(id, t.limb, miss0, diff0);
   const uint32_t did = mobs.DouseLimb(id, t.limb, hm.eBlood, 6, simTick);
-  uint32_t overCap = 0, wholeAt = 0;
+  const double minLeft5 = BaselineNumber("heal.minLeftAt5s", 0.5);
+  const double maxLeft35 = BaselineNumber("heal.maxLeftAt35s", 0.15);
+  uint32_t overCap = 0, wholeAt = 0, left5 = miss0 + diff0, left35 = miss0 + diff0,
+           coatAtWhole = 0;
   float worst = 0.0f;
   std::string trace;
-  for (int i = 0; i < 1200 && mobs.LimbBody(id, t.limb); i++) {
+  for (int i = 0; i < 3600 && mobs.LimbBody(id, t.limb); i++) {
     poseTick();
+    if (i + 1 == 150 || i + 1 == 1050) {
+      uint32_t m = 0, d = 0;
+      mobs.LimbRecipeDiff(id, t.limb, m, d);
+      if (i + 1 == 150) left5 = m + d;
+      left35 = m + d;
+    }
     const float hp = mobs.LimbHp(id, t.limb);
     const float lim = hpMax * mobs.BurnHealthCap(id);
     if (hp > lim + 1e-3f) {
@@ -8329,14 +8517,18 @@ Status GateHealWound(Ctx& c, std::string& detail) {
     if (i % 10 != 9) continue;
     uint32_t m = 0, d = 0;
     mobs.LimbRecipeDiff(id, t.limb, m, d);
-    // The shape of the recovery, every 60 ticks: missing / changed / coated
-    // cells / cells grown so far (attribution for a limb that will not close).
-    if (i % 60 == 59)
+    // The shape of the recovery, every 150 ticks (5 s): missing / changed /
+    // coated cells / cells grown so far (attribution for a limb that will not
+    // close).
+    if (i % 150 == 149)
       trace += Format(" %u/%u/%u/%u", m, d,
                       mobs.LimbCoatMatCount(id, t.limb, hm.eBlood, 1),
                       mobs.HealStatsOf(id).grown);
     if (m == 0 && d == 0 && hp >= lim - 1e-3f) {
       wholeAt = (uint32_t)i + 1;
+      coatAtWhole = mobs.LimbCoatMatCount(id, t.limb, hm.eBlood, 1);
+      if (wholeAt < 150) left5 = 0;
+      if (wholeAt < 1050) left35 = 0;
       break;
     }
   }
@@ -8351,7 +8543,10 @@ Status GateHealWound(Ctx& c, std::string& detail) {
                        (did & MobSystem::kRemedyStanch) &&
                        (did & MobSystem::kRemedyRestore) && !open1 &&
                        miss1 == 0 && diff1 == 0 && cap1 > cap0 && frac1 < frac0 &&
-                       hp1 > hp0 && overCap == 0;
+                       hp1 > hp0 && overCap == 0 && wholeAt != 0 &&
+                       coatAtWhole > 0 &&
+                       (double)left5 >= minLeft5 * (double)(miss0 + diff0) &&
+                       (double)left35 <= maxLeft35 * (double)(miss0 + diff0);
 
   // ---- enchanted water, the gentle one --------------------------------------
   const MaterialDef& ew = c.mats[hm.eWater];
@@ -8376,16 +8571,20 @@ Status GateHealWound(Ctx& c, std::string& detail) {
 
   detail = Format(
       "%s.%s: cut (open %d), %u skin cooked -> cap %.3f frac %.3f, hp %.2f, %u "
-      "missing + %u changed | enchanted blood: did 0x%x, whole at tick %u: open "
-      "%d, %u missing + %u changed, cap %.3f frac %.3f, hp %.2f (max %.1f), "
-      "%u ticks over the cap (worst +%.3f), %u grown %u mended %u levels | "
-      "enchanted water: %u cooked, did 0x%x, %u levels (%.2f cells each) -> "
-      "%u mended %u grown",
+      "missing + %u changed | enchanted blood: did 0x%x, left %u at 5 s (>= "
+      "%.2f), %u at 35 s (<= %.2f), whole at tick %u (%.1f s, %u voxels still "
+      "coated): open %d, %u missing + %u changed, cap %.3f frac %.3f, hp %.2f "
+      "(max %.1f), %u ticks over the cap (worst +%.3f), %u grown %u mended %u "
+      "levels, %u steps at %.0f us mean / %.0f us max | enchanted water: %u "
+      "cooked, did 0x%x, %u levels (%.2f cells each) -> %u mended %u grown in "
+      "10 s",
       t.defName.c_str(), t.limbName.c_str(), open0 ? 1 : 0, cooked, cap0, frac0,
-      hp0, miss0, diff0, did, wholeAt, open1 ? 1 : 0, miss1, diff1, cap1, frac1,
-      hp1, hpMax, overCap, worst, sb.grown, sb.mended, sb.levelsSpent, cookedW,
+      hp0, miss0, diff0, did, left5, minLeft5, left35, maxLeft35, wholeAt,
+      wholeAt / 30.0, coatAtWhole, open1 ? 1 : 0, miss1, diff1, cap1, frac1, hp1,
+      hpMax, overCap, worst, sb.grown, sb.mended, sb.levelsSpent, sb.timedSteps,
+      sb.timedSteps ? sb.stepUs / sb.timedSteps : 0.0, sb.stepUsMax, cookedW,
       didW, levelsW, cplW, sw.mended, sw.grown);
-  detail += " | blood trace (missing/changed/coated/grown per 60 ticks):" + trace +
+  detail += " | blood trace (missing/changed/coated/grown per 5 s):" + trace +
             " " + why1;
   return bloodOk && waterOk ? Status::Pass : Status::Fail;
 }

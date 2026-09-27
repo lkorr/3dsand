@@ -1,5 +1,5 @@
 {
-  "comment": "Compiled to per-material GPU buckets at load (hot-reload with R). chance is per-mille per 30 Hz tick. Rules for the same self are tried in file order and at most ONE fires per cell per tick \u2014 put specific rules (acid+stone) before generic tag rules (acid+tag:dissolvable). Three shapes: pair {self,neighbor,...}, decay {self,decay:true,becomes}, emit {self,emit,dir}. neighbor accepts a material id, tag:xxx, or any (optionally filtered by neighborClass). dir: any|up|down|side. Products: selfBecomes/neighborBecomes/becomes; 'air' deletes.",
+  "comment": "Compiled to per-material GPU buckets at load (hot-reload with R). chance is per-mille per 30 Hz tick. Rules for the same self are tried in file order and at most ONE fires per cell per tick \u2014 put specific rules (acid+stone) before generic tag rules (acid+tag:dissolvable). Three shapes: pair {self,neighbor,...}, decay {self,decay:true,becomes}, emit {self,emit,dir}. neighbor accepts a material id, tag:xxx, or any (optionally filtered by neighborClass). dir: any|up|down|side. Products: selfBecomes/neighborBecomes/becomes; 'air' deletes. \"drying\": true marks a rule as the world's abstraction of matter soaking into the ground or drying in the open (blood -> air), not chemistry: the world runs it as authored, the alchemy bench never fires it on matter inside a vessel. CPU-only (MaterialDef::ruleFx drying), it touches no GPU data and cannot move the world hash. Every other rule that turns its self into air still runs on the bench in an OPEN vessel (smoke fades, a vapour disperses); in a STOPPERED vessel no decay to air fires except a fast transient (spark, glare: at least a tenth of the chance scale a tick).",
   "reactions": [
     {
       "note": "-------- fire: short-lived rising flame; doused by water --------"
@@ -809,11 +809,12 @@
       "neighborBecomes": "air"
     },
     {
-      "note": "blood dries away so pools go back to sleep (PLAN #B5, rule 2)",
+      "note": "blood dries away so pools go back to sleep (PLAN #B5, rule 2). DRYING: it soaks into the ground / dries in the open, which a flask has neither of -- the alchemy bench never fires it inside a vessel.",
       "self": "blood",
       "decay": true,
       "becomes": "air",
-      "chance": 8
+      "chance": 8,
+      "drying": true
     },
     {
       "note": "======== DAY/NIGHT INTERACTIONS ========================================\nThese carry the light conditions added with the day/night cycle:\n  \"needsSky\": true   the cell must have open sky above it (bounded probe up)\n  \"when\": \"day\"      only while the sun is up  |  \"night\" only while it is down\n  \"minLight\": 0-255  a floor on daylight strength (255 = only at high noon)\n\nAll three are integer and derived from the tick-based day phase, so they are\nas deterministic as every other rule (CLAUDE.md rule 1).\n\nSLEEP DISCIPLINE (rule 2): a rule whose light condition is UNMET does not hold\nits chunk awake, so a pond sleeps all night instead of spinning. The engine\nwakes every chunk on the tick daylight switches on or off (Simulation::\nEncodeWakeAll), which is a few ticks per in-game day. Chances are kept low so\nthese are a slow background weathering, not a strobe."
