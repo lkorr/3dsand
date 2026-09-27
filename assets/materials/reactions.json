@@ -1653,6 +1653,15 @@
       "becomes": "air"
     },
     {
+      "note": "Package D gap-fill (2026-09-27), appended after the decay so no earlier rule's RNG stream moves: the human's shorts are `undercloth`, flesh in everything but look (materials.json), and chlorine passed over them -- they blister to undercloth_seared, flesh_cooked's twin, at chlorine's own rate."
+    },
+    {
+      "self": "chlorine",
+      "neighbor": "undercloth",
+      "chance": 30,
+      "neighborBecomes": "undercloth_seared"
+    },
+    {
       "self": "noxious_gas",
       "neighbor": "skin",
       "chance": 5,
@@ -1669,6 +1678,27 @@
       "decay": true,
       "chance": 12,
       "becomes": "air"
+    },
+    {
+      "note": "Package D gap-fill (2026-09-27), appended after the decay: noxious gas now reaches everything chlorine does -- bruised skin, muscle bared by a wound, and the undercloth -- at its own weak rate."
+    },
+    {
+      "self": "noxious_gas",
+      "neighbor": "skin_bruised",
+      "chance": 5,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "noxious_gas",
+      "neighbor": "muscle",
+      "chance": 5,
+      "neighborBecomes": "flesh_cooked"
+    },
+    {
+      "self": "noxious_gas",
+      "neighbor": "undercloth",
+      "chance": 5,
+      "neighborBecomes": "undercloth_seared"
     },
     {
       "note": "-------- acid: dissolves most things, and FUMES --------\nAppended after acid's iron rule (rule index is the RNG stream). What acid did not eat before and eats now: crystal (slowly). What it still does not: glass (vials are made of it), steel (armor-react's claim: a sword and plate hold), gold (aqua regia is a later recipe), bone (as authored above), gem_arcane.\n\nEVERY DISSOLUTION FUMES: a share of the voxels acid eats become noxious_gas instead of vanishing -- the dissolvable rule at 5 per-mille against the eating rules' 25-125 is roughly one fuming voxel in ten, which reads as a pool that smokes green while it works rather than as a gas flood. Iron and crystal fume at their own slow rates. On a BODY (the inbound pass and an acid coat) the same rule sends the fume up off the limb.\n\nNEUTRALIZATION: acid meeting lye becomes water (or steam -- the heat of it) and the lye becomes salt; acid meeting sodium (tag:alkali) gives hydrogen and salt."
