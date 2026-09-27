@@ -1579,6 +1579,15 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
         fx.soluteMax = (uint32_t)std::clamp(hi, 0, 255);
       }
     }
+    // ---- a DRYING rule (materials.h RuleFx::drying) -----------------------
+    // CPU-side only: no fx id, no GPU field. Inherited by any neighborChance
+    // tail below with the rest of the RuleFx.
+    if (r.contains("drying")) {
+      if (!r["drying"].is_boolean())
+        errors += path + ": reaction self=\"" + self + "\": \"drying\" must be true or false\n";
+      else
+        fx.drying = r["drying"].get<bool>();
+    }
     // A per-member exception splits this rule in two (see ExpandNeighborChance).
     // The base rule keeps its place; the exact-neighbour rules go to the tail
     // of the bucket, so a voxel touching both an ember and a flame rolls the
@@ -1605,7 +1614,7 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     // Empty (the common case) unless some rule of this material has effects;
     // otherwise exactly reactCount long, ruleFx[k] <-> rule reactOffset + k.
     bool any = false;
-    for (const RuleFx& f : bucketFx[i]) any |= f.fxId != 0 || !f.solute.empty();
+    for (const RuleFx& f : bucketFx[i]) any |= f.fxId != 0 || !f.solute.empty() || f.drying;
     mats[i].ruleFx.clear();
     if (any) mats[i].ruleFx = std::move(bucketFx[i]);
   }
