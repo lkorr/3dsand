@@ -128,6 +128,17 @@ B lands, a dissolved portion leaving a vessel is emitted as its POWDER
 and extends the scoop ledger so scooping brine yields water + a dissolved
 salt portion. B owns the world half of this seam; C owns the vessel half.
 
+**As built (package G, 2026-09-27):** the powder fallback is replaced. A
+dissolved share becomes `ContainerSolutePour` entries (landing tick + cell,
+container.h) queued on `TickAuthorityCtx::solutePours`; phase H sends the due
+ones as `CellOpSolute` cell ops (world.h); sim_mutate.wgsl `solPour` lays the
+mass into the solvent at the surface under the cell, or precipitates it as
+powder where there is none. The MPM fluid pour's share travels beside the
+particles, not in them (container.h ContainerPourFluid: why). The fallback to
+grains remains for `sim.soluteMode` 0 and for a caller with no pour queue.
+The bench evaluates `RuleFx::solute`/`soluteMin`/`soluteMax` itself
+(benchchem.h ChemRule::soluteSpecies).
+
 ## 3. Packages
 
 | P | Name | Wave | Owns (primary files) |

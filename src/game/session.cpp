@@ -2320,14 +2320,14 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                           ContainerPoursAsFluid(mats[ContainerTopMat(vs, &mats)])
                       ? ContainerPourFluid(*vdef, vs, mouth, fwd, &target, tick,
                                            pseed, fluidRoom(), fluidSpawns, &splat,
-                                           &mats)
+                                           &mats, &w.solutePours)
                       : ContainerPour(*vdef, vs, mouth, fwd, &target,
                                       CurrentTuning().sim.partGravity, tick,
                                       pseed, spawns, &splat,
                                       ContainerParticleRoom(vsnap.valid,
                                                             vsnap.particleCount,
                                                             spawns.size()),
-                                      &mats);
+                                      &mats, &w.solutePours);
               if (poured > 0) {
                 splat.sourceMob = avatar.Spawned() ? avatar.Id() : 0;
                 mobs.QueueSplatter(splat);
@@ -2456,12 +2456,17 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
           ContainerSpillStep(sp, mats, tick, room, fluidSpawns, spawns, &splat,
                              ContainerParticleRoom(psnap.valid, psnap.particleCount,
                                                    spawns.size()),
-                             &gasOut, gasRoom);
+                             &gasOut, gasRoom, &w.solutePours);
           if (!gasOut.empty()) world.QueueGasSpawns(gasOut.data(), (uint32_t)gasOut.size());
           if (first && sp.splatted) mobs.QueueSplatter(splat);
         }
         std::erase_if(w.vesselSpills,
                       [](const ContainerSpill& sp) { return sp.Done(); });
+        // THE SOLUTE POURS THAT LAND THIS TICK (container.h): every pour's
+        // and spill's dissolved share, sent as CellOpSolute ops on the tick
+        // its stream arrives. After the spills above, so a flask that broke
+        // this tick queues its salt before the queue is read.
+        ContainerSolutePoursDue(w.solutePours, tick, world, cellOps);
       }
 
       // WHO THE NPCs ARE FIGHTING, pushed once per TICK rather than per frame.

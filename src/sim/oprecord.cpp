@@ -171,8 +171,15 @@ uint32_t CanonicalizeCells(const std::vector<CellOp>& in,
   static std::vector<uint64_t> keys;  // reused: this runs on the frame path
   keys.clear();
   keys.reserve(n);
+  // A SOLUTE POUR (world.h CellOpSolute) is not a write of the cell: it is a
+  // deposit sim_mutate's solPour applies IN ORDER, so two of them on one cell
+  // (or one beside a voxel op there) are not a race and must both survive.
+  // Its key is its own push index with the top bit set -- unique, and above
+  // every real cell index, so it can never shadow a voxel op or be shadowed.
   for (size_t i = 0; i < n; i++)
-    keys.push_back(((uint64_t)in[i].cellIdx << 32) | (uint32_t)i);
+    keys.push_back(IsSoluteCellOp(in[i].word)
+                       ? ((uint64_t)(0x80000000u | (uint32_t)i) << 32) | (uint32_t)i
+                       : ((uint64_t)in[i].cellIdx << 32) | (uint32_t)i);
   std::sort(keys.begin(), keys.end());
   uint32_t dupes = 0, firstCell = 0xFFFFFFFFu;
   static std::vector<uint8_t> drop;

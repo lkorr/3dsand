@@ -181,9 +181,11 @@ PASS(mutate, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE,      K_COMPUT
 // class to decide whether a support vanished, which is a real read of the
 // table — check_pass_table.py is what holds the two in step, and it caught the
 // original mistake in this row the same way.
+// A(SolMeta): a SOLUTE POUR op (world.h CellOpSolute) writes no voxel; it
+// raises its chunk's solute request flag so solWant pages N27 of it this tick.
 PASS(mutateCells, "prep(mutate+explode+compact)", PT_TICK, PIPE_MUTATE_CELLS,K_COMPUTE, D_CELLS,1,1, GRP_SIM,       DYN_ZERO, C_CELLS, 1,
      USES(R(Materials) U(TickUBO) R(CellOps) RW(Voxels) A(DirtyIn) A(DirtyOut)
-          A(Support) R(PageTable) A(PageFaults)))
+          A(Support) R(PageTable) A(PageFaults) A(SolMeta)))
 // WIND PRIMITIVE FOOTPRINT WAKE (docs/RESEARCH_wind.md §4.3, §10). Sets the
 // dirty flag on the chunks a fan/gust/tornado declared this tick, so a SETTLED
 // dune under one of them is simulated at all. It writes no voxel and reads no
@@ -306,6 +308,20 @@ PASS(solAlloc, "solute(want+alloc)", PT_TICK, PIPE_SOL_ALLOC, K_INDIRECT, IND_SO
 PASS(solScoop, "solute(want+alloc)", PT_TICK, PIPE_SOL_SCOOP, K_COMPUTE, D_CELLS,1,1,
      GRP_SIM, DYN_ZERO, C_CELLS, 1,
      USES(U(TickUBO) R(Materials) R(CellOps) R(Voxels) R(PageTable) R(SolTable) A(SolPool) A(SolMeta)))
+// solPour (sim_mutate.wgsl): THE WORLD HALF OF A VESSEL'S POUR (contract 2.5).
+// ONE invocation applies the tick's solute pour ops (world.h CellOpSolute,
+// moved to the tail of the cell stream by SubmitTick) in push order: each
+// finds the surface under its cell and lays its mass into the solvent there,
+// or precipitates it as powder where there is none. After solAlloc (the op's
+// chunk requested pages in mutateCells) and after solScoop (RW(Voxels) orders
+// it behind solScoop's R(Voxels)); before the CA. C_CELLS: no cell ops, no
+// row; cell ops with no pour cost one read of the last op.
+// read-only in practice: solTable is read_write for the module declaration
+// (the solute block); solPour only resolves pages through it.
+PASS(solPour, "solute(want+alloc)", PT_TICK, PIPE_SOL_POUR, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_CELLS, 1,
+     USES(U(TickUBO) R(Materials) R(CellOps) RW(Voxels) A(DirtyOut) R(PageTable) A(PageFaults)
+          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec)))
 
 // ---- phase 2b: the ANGLE-OF-REPOSE OCCUPANCY SNAPSHOT --------------------
 //

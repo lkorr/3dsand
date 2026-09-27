@@ -1048,6 +1048,315 @@ Status GateSoluteLook(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- solute-pour ----------------------------------------------------------------
+// THE WORLD HALF OF THE VESSEL SEAM, pour direction (contract 2.5, package G).
+// A flask of BRINE poured into a basin of fresh water: the salt leaves the
+// flask with the water (ContainerTakeDissolvedShare), is queued as solute
+// pours landing where the stream lands (ContainerSolutePour), goes out as
+// CellOpSolute ops through the real MutationQueue and the real tick, and
+// sim_mutate.wgsl solPour lays it into the water. Asserted:
+//   A. every unit that left the flask is IN SOLUTION in the basin (the census
+//      of the box == the units poured, exactly), the GPU's own ledger agrees
+//      (poured + as-powder == sent, nothing lost), none of it came down as
+//      powder (the basin had water to take it), the flask kept none;
+//   B. THE FALLBACK: a pour op onto DRY stone precipitates its powder there
+//      (the counted SOLM_POUR_POWDER), and when water arrives the crust
+//      dissolves -- conserved across both;
+//   C. the CPU fallbacks: with sim.soluteMode 0 the share comes out as grains
+//      (nothing queued), and the MPM fluid road sends its share to the pour
+//      queue instead of back into the flask as powder (contract 2.5 item 2).
+Status GateSolutePour(Ctx& c, std::string& detail) {
+  const uint32_t water = MatNamed(c, "water"), salt = MatNamed(c, "salt");
+  const SoluteDef* sd = CurrentSoluteNamed("salt");
+  const int flaskI = c.items.Find("flask");
+  const ItemDef* flask = c.items.At(flaskI);
+  if (!water || !salt || !sd || !flask) {
+    detail = "needs water, salt, a `salt` species and the flask item";
+    return Status::Fail;
+  }
+  FixtureTuning tune;
+  const uint32_t y8 = std::max<uint32_t>(1, sd->yieldPerVoxel / 8);
+  const uint16_t dSalt = (uint16_t)(alchemy::kDissolvedBit | salt);
+  const int px = 96, py = 120, pz = 96;
+  const Box basin{px - 3, px + 2, pz - 3, pz + 2, py, py + 8, false};
+  // In chunks of its own (x 120..123 is chunk 7; the basin's walls end at 99),
+  // so neither census counts the other's mass.
+  const Box dry{px + 24, px + 27, pz - 2, pz + 1, py, py + 8, false};
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  std::vector<CellOp> build = basin.Build((uint32_t)kMatStone);
+  {
+    const std::vector<CellOp> b2 = dry.Build((uint32_t)kMatStone);
+    build.insert(build.end(), b2.begin(), b2.end());
+  }
+  const std::vector<CellOp> pond = basin.Layers(water, py + 1, 2, 7u);
+
+  uint32_t t = 60000;
+  support::TickCursor ticker{c, t, {px >> 4, py >> 4, pz >> 4}};
+  for (int i = 0; i < 40; i++)
+    ticker({}, i == 0 ? build : i == 2 ? pond : std::vector<CellOp>{});
+  SoluteLayer L;
+  ReadSoluteLayer(c, L);
+  const uint32_t poured0 = L.hdr[kSolMPoured], powder0 = L.hdr[kSolMPourPowder],
+                 lost0 = L.hdr[kSolMPourLost], disc0 = L.hdr[kSolMDiscarded];
+  const BoxCensus k0 = Census(c, basin, L, salt);
+
+  // ---- A: pour a flask of brine into the basin -----------------------------
+  ItemStack st = StackOf(c.items, flaskI, 1);
+  st.contents.Add((uint16_t)water, 64);
+  st.contents.Add(dSalt, 16);
+  const Vec3 target{px + 0.0f, py + 2.5f, pz + 0.0f};
+  const Vec3 mouth{target.x, target.y + 6.0f, target.z};
+  std::vector<ContainerSolutePour> pours;
+  int pourTicks = 0, opsSent = 0;
+  uint32_t left = 0;
+  for (int i = 0; i < 120; i++) {
+    const uint32_t now = t + 1;
+    std::vector<ParticleSpawn> spawns;
+    std::vector<CellOp> cells;
+    if (st.Filled() && st.contents.AmountOf((uint16_t)water) > 0) {
+      const WorldSnapshot& sn = c.world.Snap();
+      if (ContainerPour(*flask, st, mouth, Vec3{0, -1, 0}, &target,
+                        CurrentTuning().sim.partGravity, now, 0x5017u, spawns, nullptr,
+                        ContainerParticleRoom(sn.valid, sn.particleCount, 0), &c.mats,
+                        &pours) > 0)
+        pourTicks++;
+    }
+    opsSent += ContainerSolutePoursDue(pours, now, c.world, cells);
+    support::TickOps ops;
+    ops.cells = cells;
+    ops.spawns = spawns;
+    ticker(ops);
+    if (i > 40 && pours.empty() && st.contents.AmountOf((uint16_t)water) == 0) break;
+  }
+  left = st.contents.AmountOf(dSalt);
+  for (int i = 0; i < 240; i++) ticker({}, {});
+  ReadSoluteLayer(c, L);
+  const BoxCensus kA = Census(c, basin, L, salt);
+  const uint32_t sent = 16u * y8;
+  const uint32_t pouredA = L.hdr[kSolMPoured] - poured0, powderA = L.hdr[kSolMPourPowder] - powder0,
+                 lostA = L.hdr[kSolMPourLost] - lost0, discA = L.hdr[kSolMDiscarded] - disc0;
+  const uint64_t inBox = kA.mass + kA.powderEighths * y8 - (k0.mass + k0.powderEighths * y8);
+  const bool okA = left == 0 && pours.empty() && pouredA + powderA == sent && lostA == 0 &&
+                   powderA == 0 && inBox == sent && discA == 0 && kA.strayMass == 0 &&
+                   kA.mass > 0;
+
+  // ---- B: a pour onto dry stone precipitates, and water dissolves it -------
+  ReadSoluteLayer(c, L);
+  const uint32_t powderB0 = L.hdr[kSolMPourPowder], lostB0 = L.hdr[kSolMPourLost];
+  const uint32_t eB = 5;
+  {
+    std::vector<CellOp> op{{World::SlotCellIndex({px + 25, py + 4, pz - 1}),
+                            CellOpSolute(sd->species, eB * y8)}};
+    ticker({}, op);
+  }
+  for (int i = 0; i < 6; i++) ticker({}, {});
+  ReadSoluteLayer(c, L);
+  const BoxCensus kB0 = Census(c, dry, L, salt);
+  const uint32_t powderB = L.hdr[kSolMPourPowder] - powderB0, lostB = L.hdr[kSolMPourLost] - lostB0;
+  {
+    std::vector<CellOp> flood;
+    for (int z = dry.z0; z <= dry.z1; z++)
+      for (int x = dry.x0; x <= dry.x1; x++)
+        flood.push_back({World::SlotCellIndex({x, py + 3, z}),
+                         (water & 0xFFFu) | (7u << 12) | kCellOpIfAir});
+    ticker({}, flood);
+  }
+  for (int i = 0; i < 400; i++) ticker({}, {});
+  ReadSoluteLayer(c, L);
+  const BoxCensus kB1 = Census(c, dry, L, salt);
+  const bool okB = powderB == eB * y8 && lostB == 0 && kB0.powderEighths == eB && kB0.mass == 0 &&
+                   kB1.mass + kB1.powderEighths * y8 == (uint64_t)eB * y8 && kB1.powderEighths == 0;
+
+  // ---- C: the CPU fallbacks ---------------------------------------------------
+  bool okC1 = false, okC2 = false;
+  std::string noteC;
+  {
+    Tuning off = CurrentTuning();
+    off.sim.soluteMode = 0;
+    const Tuning keep = CurrentTuning();
+    SetCurrentTuning(off);
+    std::vector<ContainerSolutePour> q;
+    std::vector<ParticleSpawn> parts;
+    const int out = ContainerDissolvedToWorld(dSalt, 6, {0, 0, 0}, {0, 0, 0}, 1u, 1u, c.mats, parts,
+                                              0xFFFFFFFFu, &q, {0, 0, 0}, 5u);
+    SetCurrentTuning(keep);
+    okC1 = out == 6 && q.empty() && parts.size() == 6;
+    // The fluid road: its share goes to the queue, not back into the flask.
+    ItemStack f = StackOf(c.items, flaskI, 1);
+    f.contents.Add((uint16_t)water, 32);
+    f.contents.Add(dSalt, 8);
+    std::vector<FluidSpawnOp> fl;
+    std::vector<ContainerSolutePour> q2;
+    const Vec3 tgt{0, 0, 0}, mo{0, 5, 0};
+    const int n = ContainerPourFluid(*flask, f, mo, Vec3{0, -1, 0}, &tgt, 7u, 3u, 4096, fl, nullptr,
+                                     &c.mats, &q2);
+    uint32_t queued = 0;
+    for (const ContainerSolutePour& p : q2) queued += p.units;
+    const uint32_t shareE = (uint32_t)((uint64_t)8 * (uint32_t)n / 32u);
+    okC2 = n > 0 && f.contents.AmountOf((uint16_t)salt) == 0 &&
+           f.contents.AmountOf(dSalt) + queued / y8 == 8 && queued == shareE * y8 && queued > 0;
+    noteC = Format("layer off: %d eighths as %zu grains, %zu queued; fluid road: %d eighths of "
+                   "water poured, %u units queued (%u eighths of salt, flask keeps %u dissolved, "
+                   "%u as powder)",
+                   out, parts.size(), q.size(), n, queued, queued / y8, f.contents.AmountOf(dSalt),
+                   f.contents.AmountOf((uint16_t)salt));
+  }
+
+  std::string latch;
+  const bool latchOk = LatchesClean(L, latch);
+  const bool ok = okA && okB && okC1 && okC2 && latchOk;
+  RecordObserved("solute-pour.units", (double)pouredA);
+  detail = Format(
+      "A (brine into a basin of water): %u units in %d pour ticks, %d ops; GPU: %u into "
+      "solution + %u as powder + %u lost (want %u + 0 + 0); basin gained %llu units (%llu "
+      "dissolved, %llu as powder), %u discarded, stray %u, flask keeps %u dissolved -> %s; "
+      "B (onto dry stone): %u units as powder (%llu eighths in the box, want %u), %u lost; "
+      "flooded: %llu units dissolved + %llu eighths powder -> %s; C: %s -> %s%s%s",
+      sent, pourTicks, opsSent, pouredA, powderA, lostA, sent, (unsigned long long)inBox,
+      (unsigned long long)(kA.mass - k0.mass), (unsigned long long)kA.powderEighths, discA,
+      kA.strayMass, left, okA ? "OK" : "FAIL", powderB, (unsigned long long)kB0.powderEighths, eB,
+      lostB, (unsigned long long)kB1.mass, (unsigned long long)kB1.powderEighths,
+      okB ? "OK" : "FAIL", noteC.c_str(), okC1 && okC2 ? "OK" : "FAIL", latchOk ? "" : ", ",
+      latch.c_str());
+  std::printf("solute-pour: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---- solute-payout ------------------------------------------------------------
+// THE SESSION'S PAYOUT of scooped dissolved salt (session.cpp PhaseG, after
+// ContainerSettle), through THE tick: the gate scoops brine with the rig
+// session's own memo, and TickAuthority pays the water into the session's
+// vessels (hands, then hotbar, then pack) and the salt into the first of
+// them that HOLDS A LIQUID. The kit: the right hand holds a flask with room
+// for under two scoops' worth, the hotbar's first slot a pouch of sand (a vessel
+// that must never be paid salt: it holds no liquid), its second an empty
+// flask (where the overflow goes). Asserted: the hand flask is filled and
+// salted, the overflow flask gets water AND salt, the pouch is untouched,
+// and the salt is conserved exactly: what the pond lost == what the vessels
+// hold as dissolved eighths + the ledger's sub-eighth remainder.
+Status GateSolutePayout(Ctx& c, std::string& detail) {
+  const uint32_t water = MatNamed(c, "water"), salt = MatNamed(c, "salt"),
+                 sand = MatNamed(c, "sand");
+  const SoluteDef* sd = CurrentSoluteNamed("salt");
+  const int flaskI = c.items.Find("flask"), pouchI = c.items.Find("pouch");
+  const ItemDef* flask = c.items.At(flaskI);
+  if (!water || !salt || !sand || !sd || !flask || pouchI < 0) {
+    detail = "needs water, salt, sand, a `salt` species, the flask and the pouch";
+    return Status::Fail;
+  }
+  FixtureTuning tune;
+  const uint32_t y8 = std::max<uint32_t>(1, sd->yieldPerVoxel / 8);
+  const uint16_t dSalt = (uint16_t)(alchemy::kDissolvedBit | salt);
+  const int px = 96, py = 120, pz = 96;
+  const Box box{px - 4, px + 3, pz - 4, pz + 3, py, py + 6, false};
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const std::vector<CellOp> build = box.Build((uint32_t)kMatStone);
+  const std::vector<CellOp> pond = box.Layers(water, py + 1, 2, 7u);
+  std::vector<CellOp> grains;
+  for (int z = pz - 3; z < pz + 3; z++)
+    for (int x = px - 2; x < px + 2; x++)
+      grains.push_back({World::SlotCellIndex({x, py + 3, z}), salt & 0xFFFu});
+
+  uint32_t t = 62000;
+  support::TickCursor ticker{c, t, {px >> 4, py >> 4, pz >> 4}};
+  SoluteLayer L;
+  BoxCensus k0;
+  int dissolvedAt = -1;
+  for (int i = 0; i < 900 && dissolvedAt < 0; i++) {
+    ticker({}, i == 0 ? build : i == 2 ? pond : i == 4 ? grains : std::vector<CellOp>{});
+    if (i >= 100 && i % 50 == 0) {
+      ReadSoluteLayer(c, L);
+      k0 = Census(c, box, L, salt);
+      if (k0.powderCells == 0 && k0.mass > 0) dissolvedAt = i;
+    }
+  }
+  if (dissolvedAt < 0) {
+    detail = Format("the salt never finished dissolving (%u powder cells, mass %llu)",
+                    k0.powderCells, (unsigned long long)k0.mass);
+    return Status::Fail;
+  }
+
+  // THE KIT, on the rig's session (the body TickAuthority pays).
+  PlayerSession& s = ticker.Rig().Session();
+  TickAuthorityCtx& w = ticker.Rig().Authority();
+  Kit& kit = s.kit();
+  ItemStack& hand = kit.equip.InHand(Hand::Right);
+  const ItemStack handWas = hand, slot0Was = kit.hotbar.slots[0], slot1Was = kit.hotbar.slots[1];
+  hand = StackOf(c.items, flaskI, 1);
+  hand.contents.Add((uint16_t)water, (uint32_t)flask->container.capacity - 56u);
+  kit.hotbar.slots[0] = StackOf(c.items, pouchI, 1);
+  kit.hotbar.slots[0].contents.Add((uint16_t)sand, 8);
+  kit.hotbar.slots[1] = StackOf(c.items, flaskI, 1);
+  const uint32_t handWater0 = hand.contents.AmountOf((uint16_t)water);
+  const uint32_t pot0 = w.soluteLedger.pot[sd->species - 1];
+
+  // THE SCOOP, filed on the session's memo (what PhaseG settles): sized by a
+  // scratch flask so the request never depends on where the payout lands.
+  ItemStack sizer = StackOf(c.items, flaskI, 1);
+  int scoopTicks = 0;
+  for (int i = 0; i < 40 && sizer.FillTotal() < 96u; i++) {
+    IVec3 aim{0, 0, 0};
+    bool found = false;
+    for (int y = py + 3; y > py && !found; y--)
+      for (int z = box.z0; z <= box.z1 && !found; z++)
+        for (int x = box.x0; x <= box.x1 && !found; x++) {
+          uint32_t wd = 0;
+          if (ContainerSnapWord(c.world, {x, y, z}, wd) && (wd & 0xFFFu) == water) {
+            aim = {x, y, z};
+            found = true;
+          }
+        }
+    std::vector<CellOp> cells;
+    if (found) {
+      ContainerScoop(*flask, sizer, aim,
+                     [&](IVec3 p, uint32_t& wd) { return ContainerSnapWord(c.world, p, wd); },
+                     c.world, c.mats, cells, nullptr, &s.scoopMemo, t + 1);
+      scoopTicks++;
+    }
+    ticker({}, cells);
+  }
+  for (int i = 0; i < 16; i++) ticker({}, {});   // the last claims' snapshots
+  ReadSoluteLayer(c, L);
+  const BoxCensus k1 = Census(c, box, L, salt);
+  const uint32_t handSalt = hand.contents.AmountOf(dSalt),
+                 handWater = hand.contents.AmountOf((uint16_t)water);
+  const ItemStack& pouch = kit.hotbar.slots[0];
+  const ItemStack& over = kit.hotbar.slots[1];
+  const uint32_t overSalt = over.contents.AmountOf(dSalt),
+                 overWater = over.contents.AmountOf((uint16_t)water);
+  const bool pouchClean = pouch.contents.AmountOf(dSalt) == 0 &&
+                          pouch.contents.AmountOf((uint16_t)water) == 0 &&
+                          pouch.contents.AmountOf((uint16_t)sand) == 8;
+  const uint32_t pot = w.soluteLedger.pot[sd->species - 1];
+  const uint64_t lost = k0.mass - std::min(k0.mass, k1.mass);
+  // The pot may have held a remainder from before; what it holds now minus
+  // that is what this scoop left in it (negative when it paid an old one out).
+  const int64_t paid = (int64_t)(handSalt + overSalt) * y8 + (int64_t)pot - (int64_t)pot0;
+  std::string latch;
+  const bool latchOk = LatchesClean(L, latch);
+  const bool exact = k1.mass <= k0.mass && (int64_t)lost == paid && lost > 0;
+  const bool ok = exact && handWater > handWater0 && handSalt > 0 && overWater > 0 &&
+                  overSalt > 0 && pouchClean && s.scoopMemo.claims.empty() &&
+                  w.vesselSpills.empty() && latchOk;
+  detail = Format(
+      "pond mass %llu -> %llu after %d scoop ticks: lost %llu; paid: hand flask %u -> %u "
+      "water + %u dissolved eighths, overflow flask (hotbar 1) %u water + %u dissolved, "
+      "pouch of sand (hotbar 0) %s; %u units in the pot (was %u) = %lld (%s); open claims %zu, "
+      "spills %zu%s%s",
+      (unsigned long long)k0.mass, (unsigned long long)k1.mass, scoopTicks,
+      (unsigned long long)lost, handWater0, handWater, handSalt, overWater, overSalt,
+      pouchClean ? "untouched" : "WAS PAID", pot, pot0, (long long)paid,
+      exact ? "EXACT" : "LEAK", s.scoopMemo.claims.size(), w.vesselSpills.size(),
+      latchOk ? "" : ", ", latch.c_str());
+  hand = handWas;
+  kit.hotbar.slots[0] = slot0Was;
+  kit.hotbar.slots[1] = slot1Was;
+  std::printf("solute-payout: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SoluteGates() {
@@ -1059,6 +1368,8 @@ const std::vector<Gate>& SoluteGates() {
       {"solute-electrolysis", "sim", {}, false, GateSoluteElectrolysis, false},
       {"solute-vessel", "sim", {}, false, GateSoluteVessel, false},
       {"solute-look", "render", {}, false, GateSoluteLook, true},
+      {"solute-pour", "sim", {}, false, GateSolutePour, false},
+      {"solute-payout", "sim", {}, false, GateSolutePayout, false},
   };
   return g;
 }

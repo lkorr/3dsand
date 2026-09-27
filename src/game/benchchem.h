@@ -13,6 +13,7 @@
 // first matching neighbour in a rotated scan, an emit against the first free
 // neighbour), and the first that fires wins. Chances are per WORLD TICK
 // (30 Hz) in units of 1/chanceDen; FlaskSim scales them to its own step.
+#include <algorithm>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -41,7 +42,24 @@ struct ChemRule {
   int prodNbr = kChemKeep;   // pair: the neighbour's product; emit: what is emitted
   int fx = -1;               // index into Chemistry::effects, -1 = none
   uint32_t worldIndex = 0;   // the rule's index in the world table (diagnostics)
+  // A CONCENTRATION CONDITION (reactions.json "solute"/"cMin"/"cMax";
+  // materials.h RuleFx::solute): the rule fires only for a LIQUID self
+  // carrying species `soluteSpecies` at a concentration in [soluteMin,
+  // soluteMax] -- the world's units, 0..255 per full cell (sim_solute.wgsl
+  // solRuleAllows). 0 = no condition; kChemSoluteNever = a species the table
+  // does not have (the rule can never fire, as in the world).
+  uint8_t soluteSpecies = 0;
+  uint8_t soluteMin = 0, soluteMax = 255;
 };
+constexpr uint8_t kChemSoluteNever = 255;
+// The concentration, in the world's units, of `mass` dissolved units in a
+// particle of `weight` units of liquid (both in bench units: the world's
+// c = mass * 8 / fullness is powder-per-liquid times yieldPerVoxel, and the
+// bench keeps both sides in the same units, so the ratio carries over).
+inline uint32_t ChemConcentration(uint32_t mass, uint32_t weight, uint32_t yieldPerVoxel) {
+  if (!weight) return 0;
+  return (uint32_t)std::min<uint64_t>(255u, (uint64_t)mass * yieldPerVoxel / weight);
+}
 
 // ReactionEffect (sim/materials.h), copied so this header stays engine-free.
 struct ChemEffect {

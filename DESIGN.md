@@ -1438,7 +1438,12 @@ the integer fixpoint flat (stride 1 alone stalls in a ramp: spread 13 measured,
 parity and stride) is STALLED: the dilution floor (`floor`) discards what is
 below it and the chunk stops keeping itself awake. Dirty reasons 26 `solute`
 and 27 `solute-back` (a pair owned by the -axis neighbour, which must be woken
-for a whole phase cycle).
+for a whole phase cycle). The partner reads those face pairs ONLY when their
+owner is not writing them in the same dispatch (owner off the dirty list, or
+carrying nothing): a read racing the owner's exchange decided the partner's
+stall clock by scheduling, and with it whether the floor discarded mass -- the
+2026-09-27 `determinism` twice-run failure. A running owner instead restarts
+its partner's clock itself, through the same `solute-back` bit.
 
 **Conditions.** A reactions.json rule may carry `"solute": "<species>", "cMin",
 "cMax"`: it fires only when its (LIQUID -- refused on any other class) self
@@ -1463,9 +1468,47 @@ per-species monotonic ledger (`kSolMScoopBySpecies`) the snapshot carries, and
 the session whose water claims were paid that tick draws it as whole dissolved
 eighths (`ContainerSoluteLedger`; one eighth = `yieldPerVoxel / 8` units; the
 sub-eighth remainder waits in the pot). What does not fit in a vessel spills.
-POUR: not yet -- a dissolved portion leaving a vessel still enters the world as
-powder grains (`ContainerDissolvedToWorld`), which then dissolve again where
-they land in liquid. Conserved, one step removed.
+POUR (package G, 2026-09-27): a dissolved portion leaving a vessel enters the
+world IN SOLUTION. Every vessel->world road (`ContainerPour`,
+`ContainerPourFluid`, `ContainerSpillStep`: a break, the bench stream, an
+unpaid scoop) takes the dissolved share of the liquid that left
+(`ContainerTakeDissolvedShare`) and queues it as a `ContainerSolutePour`
+{landing tick, landing cell, species, units} -- the tick the stream arrives
+(the aimed arc's flight time; a spill's ~8-tick fall) and the cell it arrives
+at. Phase H sends the due ones as **`CellOpSolute`** ops (world.h: the
+IF_AIR-on-AIR spelling with a species in bits 24..30, units in 12..23),
+through the MutationQueue like every other write. sim_mutate `cells` raises the
+op's chunk's solute REQUEST flag (so solWant pages N27 of it this tick) and
+writes no voxel; **`solPour`** (sim_mutate.wgsl, one invocation, after
+solAlloc and solScoop) walks the pours -- which SubmitTick moves to the tail of
+the cell stream and the keep-first dedupe exempts -- in push order: it finds
+the surface under the cell (up out of the ground, down through air), lays the
+mass into the solvent there and the 5 x 5 x 3 patch under it up to the
+species' saturation (whole eighths unless it all fits), and PRECIPITATES the
+rest as the species' powder in the air above the surface -- a dry basin gets a
+salt crust that dissolves again when the water arrives. Every unit is counted
+(`kSolMPoured` in solution, `kSolMPourPowder` as powder, `kSolMPourLost` for a
+pour aimed into solid rock with no air in reach -- gated to stay 0). With
+`sim.soluteMode` 0, or a powder with no species, the old fallback stands: the
+powder in one-eighth grains. The MPM fluid pour's share travels BESIDE its
+particles, not in them: the particles' spare words could carry it, but the
+settle merges up to eight particles into a cell and which one's mass the
+species cap refuses would be decided by atomic order, the settle's cells are
+not ones the allocator paged, and a killed particle would drop its mass
+silently (container.h ContainerPourFluid has the full argument). Gates
+`solute-pour` (brine into a basin: exact, all in solution; dry stone:
+precipitates, then dissolves; the CPU fallbacks) and `solute-payout` (the
+session pays scooped salt into the hand / hotbar vessel that holds a liquid,
+never into a pouch of sand; exact).
+
+**The bench's concentration conditions** (package G): `BuildBenchChemistry`
+compiles a solute-conditioned rule instead of skipping it -- `ChemRule::
+soluteSpecies/soluteMin/soluteMax`, resolved by name as UploadSolutes does --
+and `FlaskSim::TryRules` evaluates it against the self particle's own
+dissolved mass in the world's units (`ChemConcentration`: mass x yieldPerVoxel
+/ weight, the bench's twin of `mass * 8 / fullness`). Brine under Electrify
+gives chlorine, hydrogen and lye; fresh water nothing (gate
+`alchemy-brine-electrolysis`).
 
 **Cost.** Measured `--perf` forestfire (~5,000 awake chunks, no solute
 anywhere, identical world hash before and after): the layer's own passes 0.17
@@ -16793,7 +16836,8 @@ ends every `WriteItemInstance`). A portion may be DISSOLVED
 of its own, counted as its powder by every conservation check, taking no room
 (`ContainerVolume`), skipped by `ContainerTopMat`/`ContainerMainMat`, carried by
 every reader (`ValidPortionMat`, `RemapItemInstance` remaps the powder and
-keeps the bit). A vessel holds GAS only when stoppered: an open one's gas vents
+keeps the bit). It leaves the vessel WITH the liquid it is in, and lands in
+the world in solution (a solute pour, "Solutes" -> POUR). A vessel holds GAS only when stoppered: an open one's gas vents
 on the bench (off the table or at "done").
 The 3D vessel SHOWS its stopper only while it has one: the model is authored
 corked (the flask's last two x-slices, `items.json` `stopperSlices`), and an
@@ -17085,10 +17129,10 @@ what keeps ValidateBench a proof.
   dependency.
 
 **Not yet:** the cauldron, a held/grounded flask drawing its layers, refraction; a stream off the table leaves from the nearest hand's lip,
-not from where on the table it fell; brine electrolysis ON THE BENCH (the
-world rule exists; `BuildBenchChemistry` skips concentration-conditioned rules,
-`RuleNeedsSolute`, until the bench evaluates the condition); only the first
-effect of a rule is raised on the bench.
+not from where on the table it fell; only the first effect of a rule is
+raised on the bench. (Brine electrolysis ON THE BENCH landed with package G:
+the bench evaluates concentration conditions -- see "Solutes", gate
+`alchemy-brine-electrolysis`.)
 
 Gates: `alchemy-shake` (a 60%-full flask carried side to side: nothing spills,
 still sloshing half a second after the hand stops, asleep within 6 s),

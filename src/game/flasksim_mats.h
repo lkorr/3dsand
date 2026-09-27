@@ -145,14 +145,24 @@ inline Chemistry BuildBenchChemistry(const std::vector<MaterialDef>& mats,
     const MaterialDef& m = mats[subs[s].mat];
     for (uint32_t k = 0; k < m.gpu.reactCount && m.gpu.reactOffset + k < reactions.size(); k++) {
       const ReactionGpu& g = reactions[m.gpu.reactOffset + k];
-      // A CONCENTRATION-CONDITIONED rule (reactions.json "solute"/"cMin",
-      // package B: brine electrolysis) needs the self particle's dissolved
-      // concentration, which this compiler does not carry into ChemRule yet.
-      // Unmet until it does -- the safe direction: firing it unconditionally
-      // would electrolyse FRESH water. (Package B, minimal edit; the bench's
-      // own solute model is where the condition belongs.)
-      if (RuleNeedsSolute(m, k)) continue;
       ChemRule r;
+      // A CONCENTRATION-CONDITIONED rule (reactions.json "solute"/"cMin"/
+      // "cMax": brine electrolysis). Resolved BY NAME against the species
+      // table the world uploads (Simulation::UploadSolutes does the same),
+      // and evaluated by FlaskSim::TryRules against the self particle's own
+      // dissolved mass (psol_/pmass_), in the world's concentration units
+      // (benchchem.h ChemConcentration). A name the table lacks can never be
+      // met -- never fired unconditionally, which would electrolyse FRESH
+      // water.
+      if (RuleNeedsSolute(m, k)) {
+        const RuleFx& f = m.ruleFx[k];
+        r.soluteSpecies = kChemSoluteNever;
+        for (const SoluteDef& d : solutes)
+          if (d.name == f.solute && d.species > 0 && d.species < kChemSoluteNever)
+            r.soluteSpecies = (uint8_t)d.species;
+        r.soluteMin = (uint8_t)std::min<uint32_t>(f.soluteMin, 255u);
+        r.soluteMax = (uint8_t)std::min<uint32_t>(f.soluteMax, 255u);
+      }
       r.kind = (uint8_t)(g.packed & 3u);
       r.dirs = (uint8_t)((g.packed >> 2) & 7u);
       r.nbrMat = g.nbrMat;

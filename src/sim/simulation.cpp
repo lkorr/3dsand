@@ -1814,6 +1814,9 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // binds, so a fan costs no new binding and no new layout.
   pool.Add([&] { windWake_ = MakeComputePipeline(device, simPL_, mMutate, "windWake", "windWake"); });
   pool.Add([&] { rainFall_ = MakeComputePipeline(device, simPL_, mMutate, "rainFall", "rainFall"); });
+  // The solute POUR (world.h CellOpSolute): in the mutate module because it
+  // writes voxels (the powder a pour with no solvent leaves).
+  pool.Add([&] { solPour_ = MakeComputePipeline(device, simPL_, mMutate, "solPour", "solPour"); });
   pool.Add([&] { compact_ = MakeComputePipeline(device, simPL_, mCompact, "main", "compact"); });
   pool.Add([&] { compactNext_ = MakeComputePipeline(device, simPL_, mCompact, "mainNext", "compactNext"); });
   pool.Add([&] { step_ = MakeComputePipeline(device, simPL_, mStep, "main", "step"); });
@@ -1962,7 +1965,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   if (!worldgen_ || !worldgenList_ || !worldgenCols_ || !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !rainFall_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
-      !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solHash_ || !solEvict_ || !solRestore_ ||
+      !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solPour_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
       !fluidSpawn_ ||
@@ -2362,6 +2365,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::SolDiffuse:     return solDiffuse_;
     case P::SolCompact:     return solCompact_;
     case P::SolScoop:       return solScoop_;
+    case P::SolPour:        return solPour_;
     case P::SolHash:        return solHash_;
     case P::SolEvict:       return solEvict_;
     case P::SolRestore:     return solRestore_;

@@ -810,6 +810,11 @@ struct TickAuthorityCtx {
   ContainerScoopLedger scoopLedger;
   // ...and its dissolved half (container.h ContainerSoluteLedger).
   ContainerSoluteLedger soluteLedger;
+  // SOLUTE POURS IN FLIGHT (container.h ContainerSolutePour): the dissolved
+  // share of every pour and spill, waiting for its stream to land; phase H
+  // sends the due ones as CellOpSolute ops. Not saved -- like the stream's
+  // particles, a pour in the air when the game is saved is not in the save.
+  std::vector<ContainerSolutePour> solutePours;
   // ---- REACTION EFFECTS IN THE WORLD (docs/PLAN_alchemy_chemistry.md A) ----
   // The world consumer of reactions.json "effects" (materials.h RuleFx). The
   // GPU reports which rules-with-effects fired where (sim_step.wgsl

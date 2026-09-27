@@ -347,6 +347,7 @@ fn solAlloc(@builtin(workgroup_id) wg : vec3<u32>,
 var<workgroup> difWork : atomic<u32>;
 var<workgroup> difCross : atomic<u32>;
 var<workgroup> difBack : atomic<u32>;
+var<workgroup> difFront : atomic<u32>;
 
 // 0 = nothing to do, 1 = work pending (d != 0) but nothing written, 3 = wrote.
 // `k` is the stride: cA + k * step == cB.
@@ -421,6 +422,7 @@ fn solDiffuse(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&difWork, 0u);
     atomicStore(&difCross, 0u);
     atomicStore(&difBack, 0u);
+    atomicStore(&difFront, 0u);
   }
   // WOKEN BY A NEIGHBOUR'S BACK-CHECK (DIRTY_R_SOLBACK): this chunk owns a
   // pending pair across its +axis face in a phase nobody can name from here,
@@ -450,11 +452,30 @@ fn solDiffuse(@builtin(workgroup_id) wg : vec3<u32>,
       let r = solPairExchange(cA, cA + reach, step, k, true);
       work = work | r;
       if (r == 3u && a + k >= CHUNK) { atomicOr(&difCross, 1u); }
+      // A face pair with work restarts the PARTNER's stall clock (next tick,
+      // through DIRTY_R_SOLBACK): the partner no longer reads this pair itself
+      // while this group is writing it -- see the back-check below.
+      if (r != 0u && a + k >= CHUNK) { atomicOr(&difFront, 1u); }
     }
     // The face this chunk is the PARTNER of: parity-1 pairs owned by the -axis
     // neighbour (their upper cells are this chunk's first k layers). Read
     // only; a pending one wakes its owner.
-    if (parity == 1u) {
+    //
+    // ONLY WHILE THE OWNER IS NOT WRITING THEM IN THIS SAME DISPATCH (rule 1).
+    // An owner that is on this tick's dirty list and carries solute evaluates
+    // and WRITES exactly these pairs, from another workgroup, concurrently: a
+    // read here then sees the pair before or after the exchange depending on
+    // scheduling, and its answer (work / no work) decided this chunk's stall
+    // counter -- so whether the dilution floor discarded a unit in solCompact.
+    // Measured 2026-09-27: `determinism` diverged between its two runs at tick
+    // 85 (parity 1, stride 4) on exactly one slot, stall 78 vs 0, 2 units
+    // floored in one run and kept in the other. A running owner needs no
+    // wake-up, and it restarts this chunk's clock itself (difFront above);
+    // an owner that is asleep, or carries nothing, writes nothing here, so
+    // the read is stable and the back-check stays as it was.
+    let os = chunkSlotOf(wc - step, T.origin);
+    let ownerWrites = os != SLOT_NONE && dirtyIn[os] != 0u && solTable[os] != 0u;
+    if (parity == 1u && !ownerWrites) {
       for (var j = 0u; j < k; j = j + 1u) {
         let cB = base + solAxisCell(axis, j, li & 15u, li >> 4u);
         let cA = cB - reach;
@@ -485,6 +506,10 @@ fn solDiffuse(@builtin(workgroup_id) wg : vec3<u32>,
   if (atomicLoad(&difBack) != 0u) {
     let os = chunkSlotOf(wc - step, T.origin);
     if (os != SLOT_NONE) { atomicOr(&dirtyOut[os], DIRTY_R_SOLBACK); }
+  }
+  if (atomicLoad(&difFront) != 0u) {
+    let ps = chunkSlotOf(wc + step, T.origin);
+    if (ps != SLOT_NONE) { atomicOr(&dirtyOut[ps], DIRTY_R_SOLBACK); }
   }
 }
 
@@ -541,6 +566,8 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
       var agg = 0u;
       if (e != 0u) { agg = (solSpeciesOf(e & 0xFFFFu) << 24u) | (solMassOf(e & 0xFFFFu) * CHUNK_VOL); }
       atomicStore(&solMeta[SOLM_AGG + slot], agg);
+      // An EMPTY slot has no diffusion history: see the demotion below.
+      if (e == 0u) { atomicStore(&solMeta[SOLM_STALL + slot], 0u); }
     }
     return;
   }
@@ -598,6 +625,13 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
   var ne = 0u;
   if (v0 != 0u) { ne = SOL_UNIFORM_BIT | v0; }
   solTable[slot] = ne;
+  // A chunk that is EMPTY again forgets its stall clock. solDiffuse only
+  // touches the counter of a slot that carries solute, so without this the
+  // count a finished plume left (e.g. 78) was still there when the next mass
+  // arrived, and the dilution floor discarded it on its first compaction --
+  // before it had diffused at all. Safe here: solDiffuse (the only other
+  // writer during a tick) ran earlier in this tick, and this group owns slot.
+  if (ne == 0u) { atomicStore(&solMeta[SOLM_STALL + slot], 0u); }
   let at = atomicAdd(&solMeta[SOLM_FREE], 1u);
   atomicStore(&solMeta[SOLM_STACK + at], page);
 }
@@ -638,6 +672,10 @@ fn solScoop(@builtin(global_invocation_id) gid : vec3<u32>) {
   let op = cellOps[gid.x];
   if (op.cellIdx >= WORLD_N * WORLD_N * WORLD_N) { return; }
   if ((op.word & CELLOP_IF_AIR) == 0u || (op.word & 0xFFFu) != MAT_AIR) { return; }
+  // A SOLUTE POUR (world.h CellOpSolute) shares the IF_AIR-on-AIR spelling
+  // with a clear; its species in bits 24..30 is what tells them apart (a
+  // clear's are always 0). sim_mutate.wgsl solPour is its reader.
+  if (((op.word >> 24u) & 0x7Fu) != 0u) { return; }
   let tmat = (op.word >> 12u) & 0xFFFu;
   if (!solIsLiquidMat(tmat)) { return; }
   let ci = op.cellIdx / CHUNK_VOL;
