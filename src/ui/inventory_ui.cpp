@@ -125,8 +125,14 @@ void DrawVesselGlow(ImDrawList* dl, ImVec2 mid, float fill, ImU32 col,
   }
 }
 
+// A MIXTURE draws as bands (`bandCol`/`bandFrac`, bottom to top, fractions
+// of the contents): each row of the belly takes the colour of the band its
+// pixels fall in, so oil on water reads as two layers in the icon exactly as
+// it settles on the alchemy bench. Only the top row is lifted to a surface.
 void DrawVesselContents(ImDrawList* dl, ImVec2 mid, float fill, ImU32 col,
-                        float glow = 0.0f) {
+                        float glow = 0.0f,
+                        const std::vector<uint32_t>* bandCol = nullptr,
+                        const std::vector<float>* bandFrac = nullptr) {
   if (fill <= 0.0f || !col || !ui::Chrome("item_container")) return;
   static constexpr int kRows[][3] = {   // bottom -> top
       {13, 6, 9}, {12, 5, 10}, {11, 4, 11}, {10, 4, 11}, {9, 4, 11},
@@ -146,12 +152,30 @@ void DrawVesselContents(ImDrawList* dl, ImVec2 mid, float fill, ImU32 col,
   // Emissive contents are lit from inside: lifted toward white by their glow.
   if (glow > 0.0f)
     col = ui::Mix(col, IM_COL32(255, 245, 200, 255), 0.35f * std::min(glow, 1.0f));
-  const ImU32 surface = ui::Mix(col, IM_COL32(255, 255, 255, 255), 0.35f);
+  const bool banded = bandCol && bandFrac && bandCol->size() > 1 &&
+                      bandFrac->size() == bandCol->size();
+  int below = 0;   // filled pixels under this row
   for (int i = 0; i <= top; i++) {
     const auto& r = kRows[i];
+    ImU32 rc = col;
+    if (banded) {
+      // The band this row's middle pixel falls in, by share of the fill.
+      const int w = r[2] - r[1] + 1;
+      const float at = ((float)below + w * 0.5f) / (float)std::max(1, done);
+      float acc = 0.0f;
+      rc = (*bandCol)[bandCol->size() - 1];
+      for (size_t b = 0; b < bandCol->size(); b++) {
+        acc += (*bandFrac)[b];
+        if (at <= acc) { rc = (*bandCol)[b]; break; }
+      }
+      if (glow > 0.0f)
+        rc = ui::Mix(rc, IM_COL32(255, 245, 200, 255), 0.35f * std::min(glow, 1.0f));
+      below += w;
+    }
+    const ImU32 surface = ui::Mix(rc, IM_COL32(255, 255, 255, 255), 0.35f);
     dl->AddRectFilled(ImVec2(o.x + r[1] * px, o.y + r[0] * px),
                       ImVec2(o.x + (r[2] + 1) * px, o.y + (r[0] + 1) * px),
-                      i == top ? surface : col);
+                      i == top ? surface : rc);
   }
 }
 
@@ -302,7 +326,8 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
     // before.
     ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid,
                            item.dyeSwatch ? item.dyeSwatch : IM_COL32_WHITE);
-    DrawVesselContents(dl, mid, item.fill, item.fillSwatch, item.fillGlow);
+    DrawVesselContents(dl, mid, item.fill, item.fillSwatch, item.fillGlow,
+                       &item.fillBandColor, &item.fillBandFrac);
     if (item.dyeSwatch) {
       // ...and a hard 4 px chip in the corner, because a tinted pixel-art icon
       // at this size reads as a lighting change rather than as a colour. The
@@ -357,6 +382,15 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
   //
   // Guarded on the drag payload being absent so that releasing a right button
   // mid-drag cannot fire it as well.
+  // DOUBLE-CLICK A VESSEL: open it on the alchemy bench. Right-click already
+  // means "take it in hand", and a double-click on a flask has no other
+  // meaning, so the bench does not steal a gesture from anything.
+  if (hovered && filled && item.fill >= 0.0f && ref.space != KitSpace::Loot &&
+      !ImGui::GetDragDropPayload() &&
+      ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+    s.alchemy.wantOpen = true;
+    s.alchemy.openRef = ref;
+  }
   if (hovered && filled && !ImGui::GetDragDropPayload() &&
       ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
     if (ref.space == KitSpace::Loot) {
@@ -1962,6 +1996,197 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
 // along one short line. Take-only - every slot here is a drag SOURCE and a
 // right-click TAKE, and a drag INTO one is refused by main.cpp with the
 // reason (a thing put on a corpse would have no body in the world).
+// ---- THE ALCHEMY BENCH -------------------------------------------------------
+//
+// The spellbook's column while a vessel is open on the bench: tools and
+// readouts down the left, the bench's picture (game/alchemy_bench.h, drawn by
+// main.cpp into s.alchemy.tex) at the largest INTEGER scale the rest of the
+// column fits -- the picture is pixel art and a fractional scale would smear
+// it. The pointer over the picture goes back as sim pixels (y up).
+namespace {
+void BenchParts(ImDrawList* dl, ImVec2 at, float w,
+                const std::vector<UIState::AlchemyUI::Portion>& parts, int cap,
+                float& y) {
+  const float lineH = ImGui::GetTextLineHeight();
+  int total = 0;
+  for (const auto& p : parts) total += p.eighths;
+  if (parts.empty()) {
+    dl->AddText(ImVec2(at.x, y), Fade(ui::ColParch(), 0.6f), "empty");
+    y += lineH + 4;
+  }
+  // Listed TOP LAYER FIRST, the way the flask reads (parts come heaviest
+  // first, the order they settle in).
+  for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+    const auto& p = *it;
+    // A hard colour chip and the name, the amount in whole cells (rounded up:
+    // a trace is not "0").
+    dl->AddRectFilled(ImVec2(at.x, y + 2), ImVec2(at.x + 12, y + 14), p.color | 0xFF000000u);
+    dl->AddRect(ImVec2(at.x, y + 2), ImVec2(at.x + 12, y + 14), ui::ColInk());
+    char b[96];
+    std::snprintf(b, sizeof b, "%s", p.name.c_str());
+    dl->AddText(ImVec2(at.x + 20, y), ui::ColParch(), b);
+    std::snprintf(b, sizeof b, "%d", (p.eighths + 7) / 8);
+    const ImVec2 ts = ImGui::CalcTextSize(b);
+    dl->AddText(ImVec2(at.x + w - ts.x, y), ui::ColGoldPale(), b);
+    y += lineH + 4;
+  }
+  // The whole fill as a bar in its layers, bottom = left.
+  const float bh = 8;
+  dl->AddRectFilled(ImVec2(at.x, y), ImVec2(at.x + w, y + bh), ui::ColInk());
+  float x = at.x;
+  for (const auto& p : parts) {
+    const float pw = cap > 0 ? w * (float)p.eighths / (float)cap : 0.0f;
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + pw, y + bh), p.color | 0xFF000000u);
+    x += pw;
+  }
+  dl->AddRect(ImVec2(at.x, y), ImVec2(at.x + w, y + bh), ui::ColBronze());
+  char b[64];
+  std::snprintf(b, sizeof b, "%d / %d", (total + 7) / 8, cap / 8);
+  y += bh + 4;
+  dl->AddText(ImVec2(at.x, y), Fade(ui::ColParch(), 0.7f), b);
+  y += lineH + 10;
+}
+}  // namespace
+
+void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
+                  ImGuiWindowFlags flags) {
+  UIState::AlchemyUI& A = s.alchemy;
+  ImGui::SetNextWindowPos(pos);
+  ImGui::SetNextWindowSize(size);
+  ImGui::Begin("##alchemy", nullptr, flags);
+  ImDrawList* dl = ImGui::GetWindowDrawList();
+  const ImVec2 wp = ImGui::GetWindowPos();
+  const ImVec2 ws = ImGui::GetWindowSize();
+  const std::string title = "ALCHEMY: " + A.title;
+  float y = PanelChrome(dl, wp, ws, title.c_str(), nullptr, st);
+  const float contentTop = y;
+  const float lineH = ImGui::GetTextLineHeight();
+  {
+    const ImVec2 ts = ImGui::CalcTextSize("done");
+    const float bw = std::max(96.0f, ts.x + 24);
+    const float by = wp.y + kFrame + std::floor((ui::kHeaderH - ts.y - 8) * 0.5f);
+    if (ui::Button("##benchdone", ImVec2(wp.x + ws.x - kFrame - 10 - bw, by), "done", false, bw))
+      A.wantClose = true;
+    if (ImGui::IsItemHovered())
+      Tip("Put it all back: whatever is in each vessel stays in it, and whatever "
+          "was spilled lands at your feet.");
+  }
+
+  // ---- the left column: tools, what is in what, what to pour from --------
+  const float colX = wp.x + kFrame + kPad;
+  const float colW = 280.0f;
+  {
+    const float bw = (colW - 8) * 0.5f;
+    if (ui::Button("##benchstir", ImVec2(colX, y), "stir", A.tool == 0, bw)) A.tool = 0;
+    if (ImGui::IsItemHovered()) Tip("Hold the button over the flask: the stick goes in through the neck and follows you.");
+    if (ui::Button("##benchpour", ImVec2(colX + bw + 8, y), "pour", A.tool == 1, bw)) A.tool = 1;
+    if (ImGui::IsItemHovered()) Tip("Drag the vessel you are pouring from; the wheel (or Q / E) tilts it.");
+    y += 44;
+  }
+  dl->AddText(ImVec2(colX, y), ui::ColGold(), "IN IT");
+  y += lineH + 6;
+  BenchParts(dl, ImVec2(colX, y), colW, A.targetParts, A.targetCap, y);
+
+  dl->AddText(ImVec2(colX, y), ui::ColGold(), "POUR FROM");
+  y += lineH + 6;
+  if (A.source.Valid()) {
+    BenchParts(dl, ImVec2(colX, y), colW, A.sourceParts, A.sourceCap, y);
+    char b[64];
+    std::snprintf(b, sizeof b, "tilt %d deg", (int)std::lround(A.tilt * 57.2958f));
+    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.7f), b);
+    y += lineH + 8;
+    if (ui::Button("##benchputback", ImVec2(colX, y), "put it back", false, colW)) {
+      A.wantSource = true;
+      A.sourceRef = KitRef{};
+    }
+    y += 44;
+  }
+  // Every other vessel you carry, as a row: its icon (layers and all) and
+  // what is in it. Click one to bring it on to the bench.
+  for (size_t i = 0; i < A.candidates.size(); i++) {
+    const auto& c = A.candidates[i];
+    if (c.ref == A.source) continue;
+    if (y + kSlot > wp.y + ws.y - kFrame - 60) break;
+    ImGui::SetCursorScreenPos(ImVec2(colX, y));
+    ImGui::PushID((int)i);
+    const bool hit = ImGui::InvisibleButton("##cand", ImVec2(colW, kSlot));
+    const bool hov = ImGui::IsItemHovered();
+    ImGui::PopID();
+    ui::SlotSurface(dl, ImVec2(colX, y), kSlot,
+                    hov ? ui::SlotLook::Hover : ui::SlotLook::Filled, false);
+    const ImVec2 mid(colX + kSlot * 0.5f, y + kSlot * 0.5f);
+    ui::DrawSpriteCentered(dl, ItemIcon(c.slot.kind), mid, IM_COL32_WHITE);
+    DrawVesselContents(dl, mid, c.slot.fill, c.slot.fillSwatch, c.slot.fillGlow,
+                       &c.slot.fillBandColor, &c.slot.fillBandFrac);
+    dl->PushClipRect(ImVec2(colX, y), ImVec2(colX + colW, y + kSlot), true);
+    dl->AddText(ImVec2(colX + kSlot + 10, y + (kSlot - lineH) * 0.5f),
+                hov ? ui::ColGoldPale() : ui::ColParch(), c.label.c_str());
+    dl->PopClipRect();
+    if (hov) Tip(c.label.c_str());
+    if (hit) {
+      A.wantSource = true;
+      A.sourceRef = c.ref;
+    }
+    y += kSlot + 6;
+  }
+  if (A.candidates.empty() && !A.source.Valid()) {
+    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.6f), "no other vessel to pour from");
+    y += lineH + 6;
+  }
+  if (!A.message.empty()) {
+    ImGui::SetCursorScreenPos(ImVec2(colX, wp.y + ws.y - kFrame - 3 * lineH));
+    ImGui::PushTextWrapPos(colX + colW);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColEmber()));
+    ImGui::TextUnformatted(A.message.c_str());
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+  }
+
+  // ---- the bench's picture -----------------------------------------------
+  const float ax0 = colX + colW + kColGap, ax1 = wp.x + ws.x - kFrame - kPad;
+  const float ay0 = contentTop;
+  const float ay1 = wp.y + ws.y - kFrame - kPad;
+  A.over = A.down = A.pressed = false;
+  A.tiltReq = 0.0f;
+  if (A.texW > 0 && A.texH > 0 && ax1 > ax0 && ay1 > ay0) {
+    const int sc = std::max(1, (int)std::floor(std::min((ax1 - ax0) / A.texW, (ay1 - ay0) / A.texH)));
+    const float iw = (float)(A.texW * sc), ih = (float)(A.texH * sc);
+    const ImVec2 p0((float)(int)(ax0 + (ax1 - ax0 - iw) * 0.5f), (float)(int)(ay1 - ih));
+    const ImVec2 p1(p0.x + iw, p0.y + ih);
+    // The desk behind the glass: a dark field in stepped bands, a lit rule
+    // for the table top the vessels stand on.
+    for (int b = 0; b < 8; b++) {
+      const float t0 = p0.y + ih * b / 8.0f, t1 = p0.y + ih * (b + 1) / 8.0f;
+      dl->AddRectFilled(ImVec2(p0.x, t0), ImVec2(p1.x, t1),
+                        ui::Mix(IM_COL32(18, 15, 26, 255), IM_COL32(34, 28, 44, 255), b / 7.0f));
+    }
+    dl->AddRectFilled(ImVec2(p0.x, p1.y - 4 * sc), ImVec2(p1.x, p1.y), IM_COL32(58, 44, 34, 255));
+    dl->AddRectFilled(ImVec2(p0.x, p1.y - 4 * sc), ImVec2(p1.x, p1.y - 3 * sc), IM_COL32(92, 70, 50, 255));
+    if (A.texReady && A.tex) dl->AddImage((ImTextureID)A.tex, p0, p1);
+    dl->AddRect(ImVec2(p0.x - 1, p0.y - 1), ImVec2(p1.x + 1, p1.y + 1), ui::ColBronze());
+
+    ImGui::SetCursorScreenPos(p0);
+    ImGui::InvisibleButton("##benchimg", ImVec2(iw, ih));
+    const bool hov = ImGui::IsItemHovered(), act = ImGui::IsItemActive();
+    const ImVec2 m = ImGui::GetIO().MousePos;
+    A.over = hov || act;
+    A.atX = (m.x - p0.x) / sc;
+    A.atY = (float)A.texH - (m.y - p0.y) / sc;
+    A.down = act && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    A.pressed = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
+    if (hov) A.tiltReq += ImGui::GetIO().MouseWheel * 0.10f;
+    const float dt = ImGui::GetIO().DeltaTime;
+    if (ImGui::IsKeyDown(ImGuiKey_Q)) A.tiltReq += 1.4f * dt;
+    if (ImGui::IsKeyDown(ImGuiKey_E)) A.tiltReq -= 1.4f * dt;
+    if (A.tool == 1 && !A.source.Valid()) {
+      const char* t = "pick a vessel on the left to pour from";
+      const ImVec2 ts = ImGui::CalcTextSize(t);
+      dl->AddText(ImVec2(p0.x + (iw - ts.x) * 0.5f, p0.y + 16), Fade(ui::ColParch(), 0.8f), t);
+    }
+  }
+  ImGui::End();
+}
+
 void LootPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
                ImGuiWindowFlags flags) {
   ImGui::SetNextWindowPos(pos);
@@ -2920,7 +3145,11 @@ void DrawInventoryScreen(UIState& s) {
   // and the pack takes the rest. (`packShown` is the one flag the pack block
   // reads - a panel that is not drawn has no slots, which is exactly what
   // "the book covers the desk" means.)
-  const bool packShown = !s.spellbookOpen;
+  // THE BENCH TAKES THE WHOLE COLUMN (game/alchemy_bench.h): no loot, no
+  // book, no pack while a vessel is open on it -- the vessels you could pour
+  // from are listed on the bench itself.
+  const bool bench = s.alchemy.open;
+  const bool packShown = !s.spellbookOpen && !bench;
   const float bookH =
       s.spellbookOpen
           ? (bottom - top)
@@ -3280,7 +3509,14 @@ void DrawInventoryScreen(UIState& s) {
   // one), so the pack has to be placed under whatever that stack came to or it
   // is drawn straight through the spine.
   float colBottom = top + bookH;
-  if (s.lootOpen) {
+  if (bench) {
+    ui::PanelStyle stBench;
+    stBench.darkMix = 0.34f;
+    stBench.sheenPeak = 0.40f;
+    AlchemyPanel(s, ImVec2(bookX, top), ImVec2(std::max(360.0f, bookRoom), bottom - top),
+                 stBench, kPanelFlags);
+    bookTall = 0.0f;
+  } else if (s.lootOpen) {
     const int lootCols =
         std::max(1, (int)((bookW - kPad * 2 + kSlotGap) / (kSlot + kSlotGap)));
     const int lootRows =
@@ -3712,7 +3948,8 @@ void DrawHudHotbar(const UIState& s, ImDrawList* dl) {
                              Fade(ui::ColInk(), 0.7f));
       ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid,
                              item.dyeSwatch ? item.dyeSwatch : IM_COL32_WHITE);
-      DrawVesselContents(dl, mid, item.fill, item.fillSwatch, item.fillGlow);
+      DrawVesselContents(dl, mid, item.fill, item.fillSwatch, item.fillGlow,
+                         &item.fillBandColor, &item.fillBandFrac);
       if (item.dyeSwatch) {
         dl->AddRectFilled(ImVec2(at.x + kSlot - 9, at.y + 3),
                           ImVec2(at.x + kSlot - 3, at.y + 9), item.dyeSwatch);

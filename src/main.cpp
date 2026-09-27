@@ -29,6 +29,7 @@
 #include "game/persist.h"
 #include "game/camera.h"
 #include "game/caster.h"
+#include "game/alchemy_bench.h"
 #include "game/container.h"
 #include "game/equipment.h"
 #include "game/worlditems.h"
@@ -370,6 +371,13 @@ constexpr uint64_t kShotJumpLastFrame = 420;
 enum class JumpShot { Rise, Apex, Fall, Land, Done };
 JumpShot g_shotJumpWant = JumpShot::Rise;
 const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
+// `--shot-bench`: the alchemy bench's look-iteration harness. Fills a flask
+// (SANDVOX_BENCH_A, a ContainerParseFillSpec, default water+oil+sand) and a
+// second one (SANDVOX_BENCH_B, default lava+sand), opens the first on the
+// bench, stirs it, brings the second in, carries it over the mouth and tilts
+// it to pour, then closes -- a picture at each step through g_shotJumpPath.
+bool g_shotBench = false;
+constexpr uint64_t kShotBenchLast = 425;
 float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
@@ -4808,6 +4816,10 @@ int main(int argc, char** argv) {
     // the windowed game, spawn and damage the avatar on a fixed schedule, open
     // the screen, and write ONE frame out as a BMP. See the note at
     // g_shotInventory.
+    else if (a == "--shot-bench") {
+      g_shotBench = true;
+      g_harnessFrames = kShotBenchLast;
+    }
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
       g_harnessFrames = kShotInvDeathTurnShot;
@@ -6179,6 +6191,24 @@ int main(int argc, char** argv) {
       "avatarPortrait");
   rhi::TextureView portraitView = portraitTexture.CreateView();
   ui.portraitTex = overlay.RegisterTexture(portraitView);
+  // ---- THE ALCHEMY BENCH'S PICTURE (game/alchemy_bench.h) -----------------
+  // Drawn on the CPU by the bench's sim and copied in each frame it is open
+  // (rhi CopyBufferToTexture, from a staging buffer the queue writes). RGBA8
+  // like ImGui's own atlas; nearest-sampled through the portrait's sampler,
+  // so the integer scale the panel draws it at stays pixel-crisp.
+  alchemy::AlchemyBench bench;
+  constexpr uint32_t kBenchW = (uint32_t)alchemy::AlchemyBench::kGridW;
+  constexpr uint32_t kBenchH = (uint32_t)alchemy::AlchemyBench::kGridH;
+  rhi::Texture benchTexture = ctx.device.CreateTexture(
+      {kBenchW, kBenchH, 1}, rhi::TextureFormat::RGBA8Unorm,
+      rhi::TextureUsage::CopyDst | rhi::TextureUsage::TextureBinding, "alchemyBench");
+  rhi::TextureView benchView = benchTexture.CreateView();
+  rhi::Buffer benchStaging = ctx.device.CreateBuffer(
+      (uint64_t)kBenchW * kBenchH * 4, rhi::BufferUsage::CopySrc | rhi::BufferUsage::CopyDst,
+      "alchemyBenchStaging");
+  ui.alchemy.tex = overlay.RegisterTexture(benchView);
+  ui.alchemy.texW = (int)kBenchW;
+  ui.alchemy.texH = (int)kBenchH;
   // ---- internal render scale (render.renderScale) --------------------------
   // The world's offscreen colour target when the scale is below 1, cached on
   // its size like the depth targets; the blit up to the swapchain and the
@@ -9027,6 +9057,80 @@ int main(int argc, char** argv) {
                     (int)pg.words.size());
       }
     }
+    // --shot-bench's script (see g_shotBench). Frame-counted like the rest.
+    if (g_shotBench) {
+      const uint64_t f = frameCounter;
+      if (f == 1) {
+        ui.fly = false;
+        player.fly = false;
+      }
+      static int benchA = -1, benchB = -1;
+      if (f == 140) {
+        const int fi = items.Find("flask");
+        const ItemDef* fd = fi >= 0 ? items.At(fi) : nullptr;
+        if (fd) {
+          const char* ea = std::getenv("SANDVOX_BENCH_A");
+          const char* eb = std::getenv("SANDVOX_BENCH_B");
+          ItemStack a = StackOf(items, fi);
+          a.contents = ContainerParseFillSpec(ea ? ea : "water:0.3+oil:0.22+sand:0.08",
+                                              fd->container.capacity, mats);
+          ItemStack b = StackOf(items, fi);
+          b.contents = ContainerParseFillSpec(eb ? eb : "lava:0.25+sand:0.1",
+                                              fd->container.capacity, mats);
+          hotbar.slots[8] = a;
+          benchA = 8;
+          benchB = kit.bag.FirstFree();
+          if (benchB >= 0) kit.bag.slots[benchB] = b;
+        }
+        ui.inventoryOpen = true;
+        ui.visible = false;   // the dev panel, not the game UI
+        captured = false;
+      }
+      if (f == 150 && benchA >= 0) {
+        ui.alchemy.wantOpen = true;
+        ui.alchemy.openRef = KitRef{KitSpace::Hotbar, benchA};
+      }
+      if (f == 175) g_shotJumpPath = "screenshot_bench.bmp";
+      // Stir: the stick sweeps side to side through the neck.
+      if (f > 180 && f < 240 && bench.IsOpen()) {
+        const alchemy::V2 m0 = bench.TargetMouth();
+        ui.alchemy.tool = 0;
+        ui.alchemy.over = true;
+        ui.alchemy.down = true;
+        ui.alchemy.atX = m0.x + 40.0f * std::sin((float)f * 0.15f);
+        ui.alchemy.atY = 30.0f;
+      }
+      if (f == 238) g_shotJumpPath = "screenshot_bench_stir.bmp";
+      if (f == 250 && benchB >= 0) {
+        ui.alchemy.wantSource = true;
+        ui.alchemy.sourceRef = KitRef{KitSpace::Bag, benchB};
+      }
+      // Pour, the way a hand does it: lift the source clear, tip it over
+      // on its side while carrying it across, then bring its lip down to
+      // the mouth and tip it further.
+      if (f >= 260 && f < 400 && bench.IsOpen() && bench.Source().Valid()) {
+        static alchemy::V2 from;
+        if (f == 260) from = bench.SourcePivot();
+        const alchemy::V2 m0 = bench.TargetMouth();
+        auto ease = [](float t) { t = std::clamp(t, 0.0f, 1.0f); return t * t * (3 - 2 * t); };
+        const float lift = ease(((float)f - 260.0f) / 18.0f);
+        const float over = ease(((float)f - 276.0f) / 24.0f);
+        const float down = ease(((float)f - 300.0f) / 14.0f);
+        const float hi = std::min(m0.y + 110.0f, (float)alchemy::AlchemyBench::kGridH - 6.0f);
+        ui.alchemy.tool = 1;
+        ui.alchemy.over = true;
+        ui.alchemy.pressed = f == 260;
+        ui.alchemy.down = true;
+        ui.alchemy.atX = from.x + (m0.x + 6.0f - from.x) * over;
+        ui.alchemy.atY = from.y + (hi - from.y) * lift + (m0.y + 50.0f - hi) * down;
+        const float want = f < 276 ? 0.0f : f < 300 ? 1.7f * over : 1.7f + 0.9f * down;
+        ui.alchemy.tiltReq = std::clamp(want - bench.RequestedTilt(), -0.06f, 0.06f);
+      }
+      if (f == 300) g_shotJumpPath = "screenshot_bench_pour.bmp";
+      if (f == 398) g_shotJumpPath = "screenshot_bench_poured.bmp";
+      if (f == 405) ui.alchemy.wantClose = true;
+      if (f == 420) g_shotJumpPath = "screenshot_bench_closed.bmp";
+    }
     // --shot-inventory's scripted schedule. Frame-counted rather than
     // wall-clocked so the same picture comes out on any machine.
     if (g_shotInventory) {
@@ -9431,7 +9535,10 @@ int main(int argc, char** argv) {
     // means "let go of the mouse" is the order every game uses, and it is the
     // one that does not strand a player with a menu they cannot dismiss.
     if (devKeys && eEsc.Pressed(key(GLFW_KEY_ESCAPE))) {
-      if (ui.inventoryOpen) {
+      // The bench first: Esc puts the vessels back and leaves the screen up.
+      if (ui.alchemy.open) {
+        ui.alchemy.wantClose = true;
+      } else if (ui.inventoryOpen) {
         ui.inventoryOpen = false;
         captured = captureBeforeUi;
         ui.portraitYaw = 0.0f;  ui.portraitPitch = -0.08f;
@@ -12679,6 +12786,98 @@ int main(int argc, char** argv) {
       // same reason: the panel's view of a slot is never authoritative, so the
       // intent is executed against the real container here and the mirror is
       // rebuilt below.
+      // ---- THE ALCHEMY BENCH (game/alchemy_bench.h) ----------------------
+      //
+      // Opened by a double-click on a vessel slot; closed by "done", Esc, or
+      // the screen shutting. Closing is the ONE place the bench's tally
+      // reaches the kit: ValidateBench proves every material conserved, each
+      // vessel must still be exactly what came on to the bench (a stack that
+      // moved, emptied or was swapped while the panel was up voids the
+      // session rather than being written over), and what was spilled goes
+      // into the world at your feet through the vessel-spill queue.
+      auto finishBench = [&]() {
+        alchemy::BenchResult r = bench.Finish();
+        ui.alchemy.open = false;
+        ui.alchemy.texReady = false;
+        ui.alchemy.source = KitRef{};
+        std::string why;
+        if (!alchemy::ValidateBench(r, mats, why)) {
+          std::fprintf(stderr, "alchemy bench: %s -- nothing changed\n", why.c_str());
+          ui.kitMessage = "the bench lost track of something; nothing changed";
+          ui.kitMessageAge = 0.0f;
+          return;
+        }
+        for (const alchemy::BenchEntry& e : r.vessels) {
+          const ItemStack* st = kit.Resolve(e.ref);
+          if (!st || st->name != e.item || st->count != 1 || !st->contents.SameAs(e.before)) {
+            ui.kitMessage = "something moved while you worked; nothing changed";
+            ui.kitMessageAge = 0.0f;
+            return;
+          }
+        }
+        for (const alchemy::BenchEntry& e : r.vessels)
+          if (ItemStack* st = kit.Resolve(e.ref)) st->contents = e.after;
+        if (!r.spilled.Empty()) {
+          ContainerSpill sp;
+          const Vec3 fwd = cam.Forward();
+          sp.at = player.EyePos() + fwd * MetresToCells(0.35f) -
+                  Vec3{0, MetresToCells(0.6f), 0};
+          sp.vel = player.vel;
+          sp.away = Vec3{0, 1, 0};
+          sp.rest = r.spilled;
+          sp.seed = rng::Hash3(0xA1C4E3u, (uint32_t)frameCounter, r.spilled.Total());
+          tickCtx.vesselSpills.push_back(sp);
+          ui.kitMessage = "some of it spilled at your feet";
+          ui.kitMessageAge = 0.0f;
+        }
+      };
+      if (ui.alchemy.wantOpen) {
+        ui.alchemy.wantOpen = false;
+        if (bench.IsOpen()) finishBench();
+        ItemStack* st = kit.Resolve(ui.alchemy.openRef);
+        const ItemDef* d = st ? items.Of(*st) : nullptr;
+        if (!d || !d->IsContainer()) {
+          // not a vessel: nothing to open
+        } else if (st->count != 1) {
+          ui.kitMessage = "take one out of the stack to work on it";
+          ui.kitMessageAge = 0.0f;
+        } else if (!bench.Open(ui.alchemy.openRef, *d, *st, mats)) {
+          ui.kitMessage = "that will not go on the bench";
+          ui.kitMessageAge = 0.0f;
+        } else {
+          ui.alchemy.open = true;
+          ui.alchemy.texReady = false;
+          ui.alchemy.title = d->name;
+          ui.alchemy.message.clear();
+          ui.alchemy.tool = 0;
+        }
+      }
+      if (ui.alchemy.wantSource) {
+        ui.alchemy.wantSource = false;
+        if (bench.IsOpen()) {
+          if (!ui.alchemy.sourceRef.Valid()) {
+            bench.ClearSource();
+          } else {
+            ItemStack* st = kit.Resolve(ui.alchemy.sourceRef);
+            const ItemDef* d = st ? items.Of(*st) : nullptr;
+            if (!d || !d->IsContainer() || st->count != 1)
+              ui.alchemy.message = "take one out of the stack to pour from it";
+            else if (bench.Uses(ui.alchemy.sourceRef))
+              ui.alchemy.message = "that one has already been on the bench this time";
+            else if (!bench.SetSource(ui.alchemy.sourceRef, *d, *st))
+              ui.alchemy.message = "that will not go on the bench";
+            else {
+              ui.alchemy.message.clear();
+              ui.alchemy.tool = 1;
+            }
+          }
+        }
+      }
+      if (ui.alchemy.wantClose || (bench.IsOpen() && !ui.inventoryOpen)) {
+        ui.alchemy.wantClose = false;
+        if (bench.IsOpen()) finishBench();
+      }
+
       if (ui.dropItem.pending) {
         ui.dropItem.pending = false;
         ItemStack* src = kit.Resolve(ui.dropItem.from);
@@ -13064,7 +13263,23 @@ int main(int argc, char** argv) {
                          : 0.0f;
             u.fillSwatch = ContainerFillSwatch(st, mats);
             u.fillGlow = ContainerFillGlow(st, mats);
+            // A mixture's layers, heaviest at the bottom (the order the bench
+            // settles them in).
+            if (st.contents.n > 1) {
+              std::vector<alchemy::Portion> ps(st.contents.p, st.contents.p + st.contents.n);
+              std::stable_sort(ps.begin(), ps.end(), [&](const alchemy::Portion& a, const alchemy::Portion& b) {
+                const int32_t da = a.mat < mats.size() ? mats[a.mat].gpu.density : 0;
+                const int32_t db = b.mat < mats.size() ? mats[b.mat].gpu.density : 0;
+                return da > db;
+              });
+              const float tot = (float)std::max<uint32_t>(1, st.FillTotal());
+              for (const alchemy::Portion& p : ps) {
+                u.fillBandColor.push_back(0xFF000000u | (p.mat < mats.size() ? (mats[p.mat].gpu.color0 & 0x00FFFFFFu) : 0u));
+                u.fillBandFrac.push_back((float)p.eighths / tot);
+              }
+            }
             u.tip = ContainerFillText(*d, st, mats) +
+                    "\ndouble-click: open it on the alchemy bench" +
                     "\nQ / E puts it in your left / right hand;"
                     "\nthat hand's button (RMB / LMB) uses it,"
                     "\nF cycles pour / scoop / apply, hold G throws"
@@ -13092,6 +13307,72 @@ int main(int argc, char** argv) {
         // were and rebuilt on the first frame it is open again — the open key
         // is handled above this block, so that frame is never stale.
         if (ui.inventoryOpen) {
+        // ---- THE BENCH, one frame of it (game/alchemy_bench.h) ---------
+        // Stepped here, in the frame, not the tick: it is a UI device (a
+        // float sim with no bearing on world state until "done"), and the
+        // world keeps running under it exactly as it does under the rest of
+        // the screen. Its input is what the panel reported last frame.
+        if (bench.IsOpen()) {
+          alchemy::BenchInput in;
+          in.over = ui.alchemy.over;
+          in.at = {ui.alchemy.atX, ui.alchemy.atY};
+          in.down = ui.alchemy.down;
+          in.pressed = ui.alchemy.pressed;
+          in.tilt = ui.alchemy.tiltReq;
+          bench.Frame(dt, in, (alchemy::BenchTool)ui.alchemy.tool);
+          ui.alchemy.tilt = bench.SourceTilt();
+          ui.alchemy.target = bench.Target();
+          ui.alchemy.source = bench.Source();
+          auto partsOf = [&](const alchemy::Composition& c) {
+            std::vector<UIState::AlchemyUI::Portion> out;
+            for (int i = 0; i < c.n; i++) {
+              UIState::AlchemyUI::Portion p;
+              const uint16_t mid = c.p[i].mat;
+              p.name = mid < mats.size() ? mats[mid].name : std::string("?");
+              p.color = mid < mats.size() ? (0xFF000000u | (mats[mid].gpu.color0 & 0x00FFFFFFu)) : 0u;
+              p.eighths = (int)c.p[i].eighths;
+              out.push_back(p);
+            }
+            // Heaviest first: the list reads bottom layer to top.
+            std::stable_sort(out.begin(), out.end(), [&](const auto& a, const auto& b) {
+              int32_t da = 0, db = 0;
+              for (size_t k = 1; k < mats.size(); k++) {
+                if (mats[k].name == a.name) da = mats[k].gpu.density;
+                if (mats[k].name == b.name) db = mats[k].gpu.density;
+              }
+              return da > db;
+            });
+            return out;
+          };
+          ui.alchemy.targetParts = partsOf(bench.LiveTarget());
+          ui.alchemy.sourceParts = partsOf(bench.LiveSource());
+          auto capOf = [&](KitRef r) {
+            const ItemStack* st = kit.Resolve(r);
+            const ItemDef* d = st ? items.Of(*st) : nullptr;
+            return d && d->IsContainer() ? d->container.capacity : 0;
+          };
+          ui.alchemy.targetCap = capOf(ui.alchemy.target);
+          ui.alchemy.sourceCap = capOf(ui.alchemy.source);
+          // Every single vessel you carry that is not on the bench.
+          ui.alchemy.candidates.clear();
+          auto offer = [&](KitSpace space, int idx, const ItemStack& st, int equipSlot) {
+            const KitRef r{space, idx};
+            if (st.Empty() || st.count != 1 || bench.Uses(r)) return;
+            const ItemDef* d = items.Of(st);
+            if (!d || !d->IsContainer() || !st.Filled()) return;
+            UIState::AlchemyUI::Candidate cd;
+            cd.ref = r;
+            cd.label = d->name + ": " + ContainerFillText(*d, st, mats);
+            cd.slot = mirror(st, equipSlot);
+            ui.alchemy.candidates.push_back(std::move(cd));
+          };
+          for (int i = 0; i < kItemSlots; i++) offer(KitSpace::Hotbar, i, hotbar.slots[i], -1);
+          for (int hk = 0; hk < kHands; hk++) {
+            const int hs = EquipSlotOfHand(HandAt(hk));
+            offer(KitSpace::Equip, hs, kit.equip.slots[hs], hs);
+          }
+          for (int i = 0; i < Bag::kSlots; i++) offer(KitSpace::Bag, i, kit.bag.slots[i], -1);
+        }
         ui.bagSlots.clear();
         for (int i = 0; i < Bag::kSlots; i++)
           ui.bagSlots.push_back(mirror(kit.bag.slots[i]));
@@ -14153,6 +14434,26 @@ int main(int argc, char** argv) {
       // Matched by PHYSICS HANDLE, because the move into mobs_ (and a sever's
       // AdoptBody) carries each handle unchanged and a slot index does not
       // survive the next population change.
+      // THE BENCH'S PICTURE: queue-written into the staging buffer BEFORE the
+      // encoder that copies it exists (the write drains at the head of the
+      // next command buffer), and submitted on its own ahead of the frame's
+      // UI so Finish() has left the texture in its sampled layout by then.
+      // `texReady` goes up only after the first copy, so the panel never
+      // samples an image that has not been written.
+      if (bench.IsOpen() && bench.Pixels().size() == (size_t)kBenchW * kBenchH) {
+        ctx.queue.WriteBuffer(benchStaging, 0, bench.Pixels().data(),
+                              (size_t)kBenchW * kBenchH * 4);
+        rhi::CommandEncoder bEnc = ctx.device.CreateCommandEncoder();
+        rhi::TexelCopyBuffer src;
+        src.buffer = benchStaging;
+        src.bytesPerRow = kBenchW * 4;
+        src.rowsPerImage = kBenchH;
+        rhi::TexelCopyTexture dst;
+        dst.texture = benchTexture;
+        bEnc.CopyBufferToTexture(src, dst, {kBenchW, kBenchH, 1});
+        ctx.queue.Submit(bEnc.Finish());
+        ui.alchemy.texReady = true;
+      }
       if (ui.inventoryOpen && portraitCam.valid && portraitView) {
         avatar.SetHiddenParts({});               // the WHOLE body, always
         std::vector<BodyVoxInst> pInst;

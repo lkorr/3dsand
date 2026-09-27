@@ -61,6 +61,14 @@ struct VesselShape {
 
 // The shapes the game authors today. Data later (items.json `profile`).
 VesselShape FlaskShape(float width, float height);
+// A drawstring sack: wide belly, pinched neck, a short open ruff.
+VesselShape PouchShape(float width, float height);
+// The inside area of a shape, pixels (its profile at its box, closed across
+// the mouth).
+float ShapeArea(const VesselShape& s);
+// Rescale a shape (keeping its proportions) so its inside is `area` pixels --
+// a vessel's CAPACITY in units -- so a full flask is drawn full.
+VesselShape ShapeWithArea(VesselShape s, float area);
 
 struct Xform {
   V2 pos;         // world position of the vessel's bottom-centre
@@ -86,7 +94,7 @@ struct SimConfig {
   float buoyancy = 2.0f;
   float maxSpeedFrac = 0.4f;
   float listSlack = 1.15f;
-  float maxVesselStep = 1.0f;  // px a vessel's outline may move per substep     // neighbour-list radius / h   // velocity cap as a fraction of h per step
+  float maxVesselStep = 2.0f;  // px a vessel's outline may move per substep (< the glass)     // neighbour-list radius / h   // velocity cap as a fraction of h per step
   uint32_t seed = 0x5eed;
 };
 
@@ -130,6 +138,16 @@ class FlaskSim {
   // that is mid-air at close lands where it was going.
   void Settle(int maxSteps);
 
+  // Takes a vessel off the bench: what is INSIDE it goes with it (returned,
+  // exact, in eighths by largest remainder over its own units); anything in
+  // flight stays in the sim and lands wherever it lands. The index stays
+  // valid and the vessel is inert from here on (no glass, no contents).
+  Composition RemoveVessel(int v);
+  bool VesselAlive(int v) const { return v >= 0 && v < (int)vessels_.size() && !vessels_[v].outline.empty(); }
+  // The vessel's outline in world pixels (for the panel's hit tests).
+  std::vector<V2> VesselOutline(int v) const;
+  const VesselShape& Shape(int v) const { return vessels_[v].shape; }
+
   Tally Count() const;
 
   // RGBA8 (0xAABBGGRR), gridW x gridH, row 0 = TOP (image order). Alpha 0
@@ -159,6 +177,10 @@ class FlaskSim {
     float fx = 0, fy = 0;  // sub-pixel position while flung
     float vx = 0, vy = 0;  // non-zero = flung
     uint8_t moved = 0;     // step parity it last moved on
+    // The vessel it was last seen clearly INSIDE (not in glass), -1 for
+    // none. The glass sweep pushes a grain back to this side: judged from
+    // where a grain already in the glass is, it can read as outside.
+    int8_t home = -1;
   };
 
   void BuildOutline(Vessel& v) const;
@@ -173,6 +195,7 @@ class FlaskSim {
   void CollideLiquid();
   void StepGrains();
   void CarryGrains();
+  void UpdateGrainHomes();
   bool SweepChain(int gi, const Vessel& v, bool wantIn);
   bool PoseClear(const Vessel& v, const Xform& x) const;
   bool GrainFree(int x, int y) const;

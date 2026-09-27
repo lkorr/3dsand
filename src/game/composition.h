@@ -46,6 +46,13 @@ struct Composition {
     n++;
     return true;
   }
+  // The same portions, in any order.
+  bool SameAs(const Composition& o) const {
+    if (n != o.n) return false;
+    for (int i = 0; i < n; i++)
+      if (o.AmountOf(p[i].mat) != p[i].eighths) return false;
+    return true;
+  }
   // Removes up to `eighths` of `mat`; returns what was actually removed.
   // A portion that reaches zero is closed so `n` counts real substances.
   uint32_t Take(uint16_t mat, uint32_t eighths) {

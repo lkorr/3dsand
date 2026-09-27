@@ -1251,6 +1251,47 @@ void Recorder::CopyImageToBuffer(Image* src, Buffer* dst, uint64_t dstOffset,
   if (dst->mapped) hostWritten_.push_back(dst);
 }
 
+void Recorder::CopyBufferToImage(Buffer* src, uint64_t srcOffset, uint32_t bytesPerRow,
+                                 Image* dst, uint32_t w, uint32_t h) {
+  if (!dst || dst->img == VK_NULL_HANDLE || !src || !src->buf || renderOpen_) return;
+
+  // Source hazard: the staging buffer's queue write (drained at the head of
+  // this command buffer) against this read -- the same tracked path
+  // CopyImageToBuffer's destination takes.
+  bool srcTable = false;
+  for (int i = 0; i < (int)pass::Buf::kCount; i++)
+    if (bind_.buffers[i] == src) {
+      TouchBuffer((pass::Buf)i, pass::Acc::TransferRead);
+      srcTable = true;
+    }
+  if (!srcTable) TouchExtra(src, pass::Acc::TransferRead);
+  if (mode_ == BarrierMode::Sledgehammer) {
+    pending_.clear();
+    Sledgehammer();
+  } else {
+    FlushPending(/*global=*/false);
+  }
+
+  // Destination: whatever it was (UNDEFINED the first time, SHADER_READ_ONLY
+  // after a frame of being drawn) to TRANSFER_DST. The whole image is
+  // overwritten, so its old contents need not survive the transition.
+  TransitionImage(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                  VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT);
+  FlushPendingImages();
+
+  const uint32_t texelBytes = TexelBytes(dst->format);
+  if (texelBytes == 0) return;
+  VkBufferImageCopy region{};
+  region.bufferOffset = srcOffset;
+  region.bufferRowLength = bytesPerRow / texelBytes;
+  region.bufferImageHeight = h;
+  region.imageSubresource = {dst->aspect, 0, 0, 1};
+  region.imageExtent = {w, h, 1};
+  be_.Fns().CmdCopyBufferToImage(cmd_, src->buf, dst->img,
+                                 VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &region);
+  stats_.copies++;
+}
+
 // ---------------------------------------------------------------------------
 // barrier_graph §2.4 phase 7b: the host-visibility barrier is emitted at
 // Finish() time, as the LAST command, after every writer of every host-visible

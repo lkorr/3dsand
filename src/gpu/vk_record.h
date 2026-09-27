@@ -308,6 +308,11 @@ class Recorder {
   // host barrier when mapped). `bytesPerRow` is converted to texels here.
   void CopyImageToBuffer(Image* src, Buffer* dst, uint64_t dstOffset,
                          uint32_t bytesPerRow, uint32_t w, uint32_t h);
+  // The reverse, for CPU-drawn UI pictures: `src` (a staging buffer the queue
+  // wrote) into `dst`, which is transitioned to TRANSFER_DST first and left
+  // for Finish() to move to its sampled layout.
+  void CopyBufferToImage(Buffer* src, uint64_t srcOffset, uint32_t bytesPerRow,
+                         Image* dst, uint32_t w, uint32_t h);
   // The upscale path (render.renderScale): whole-image blit from `src` to
   // `dst`, both transitioned by the same derived path CopyImageToBuffer
   // uses (src from its tracked attachment write; dst from whatever it was

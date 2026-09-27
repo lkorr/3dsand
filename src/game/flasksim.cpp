@@ -59,6 +59,37 @@ VesselShape FlaskShape(float width, float height) {
   return s;
 }
 
+VesselShape PouchShape(float width, float height) {
+  VesselShape s;
+  s.width = width;
+  s.height = height;
+  s.wall = 1.5f;
+  s.profile = {{0.55f, 0.00f}, {0.86f, 0.06f}, {0.98f, 0.22f}, {0.96f, 0.45f},
+               {0.80f, 0.64f}, {0.46f, 0.78f}, {0.34f, 0.84f}, {0.42f, 0.92f},
+               {0.52f, 1.00f}};
+  return s;
+}
+
+float ShapeArea(const VesselShape& s) {
+  // Trapezoids between consecutive profile rows, both sides.
+  float a = 0;
+  for (size_t i = 0; i + 1 < s.profile.size(); i++) {
+    const V2 p = s.profile[i], q = s.profile[i + 1];
+    a += (p.x + q.x) * (q.y - p.y);   // (hw0 + hw1)/2 * dh, times 2 sides
+  }
+  return a * (s.width * 0.5f) * s.height;
+}
+
+VesselShape ShapeWithArea(VesselShape s, float area) {
+  const float now = ShapeArea(s);
+  if (now > 1e-3f && area > 0) {
+    const float k = std::sqrt(area / now);
+    s.width *= k;
+    s.height *= k;
+  }
+  return s;
+}
+
 FlaskSim::FlaskSim(const SimConfig& cfg) : cfg_(cfg), rng_(cfg.seed | 1u) {
   // The lattice a settled liquid sits on: hexagonal, cell area =
   // unitsPerParticle pixels, so particle count x unitsPerParticle is the
@@ -225,6 +256,7 @@ void FlaskSim::SeedVessel(int vi, const Composition& c) {
           Grain g{};
           g.sub = (uint8_t)L.sub;
           g.variant = (uint8_t)(Rand() % 3);
+          g.home = (int8_t)vi;
           if (PlaceGrain(g, (int)std::floor(w.x), (int)std::floor(w.y))) left--;
           else spilledUnits_[L.sub]++;  // no room at all: never silently lost
         }
@@ -540,14 +572,21 @@ void FlaskSim::CollideLiquid() {
   // if it started inside one too (the grain moved onto it) does it hop to
   // the nearest free neighbour.
   const int W = cfg_.gridW, H = cfg_.gridH;
+  auto grainAt = [&](int x, int y) {
+    if (x < 0 || y < 0 || x >= W || y >= H) return false;
+    return grid_[(size_t)y * W + x] != 0;
+  };
+  // Glass counts as solid for the pull-back: the glass may have moved onto
+  // where the particle came from (a rising bottom), and pulling it back there
+  // would put it through the wall.
   auto solid = [&](int x, int y) {
     if (x < 0 || y < 0 || x >= W || y >= H) return false;
     size_t k = (size_t)y * W + x;
-    return grid_[k] != 0;
+    return grid_[k] != 0 || wall_[k] != 0;
   };
   for (int i = 0; i < n; i++) {
     int x = (int)std::floor(px_[i].x), y = (int)std::floor(px_[i].y);
-    if (!solid(x, y)) continue;
+    if (!grainAt(x, y)) continue;
     V2 a = pprev_[i], b = px_[i];
     if (!solid((int)std::floor(a.x), (int)std::floor(a.y))) {
       // Bisect for the last free point on a..b.
@@ -576,7 +615,17 @@ void FlaskSim::CollideLiquid() {
       V2 d{(float)(bx - x), (float)(by - y)};
       px_[i] = px_[i] + d;
       pprev_[i] = pprev_[i] + d;  // carried, not launched
+      continue;
     }
+    // TRAPPED: grains and glass all round (liquid squeezed between a rising
+    // bottom and a sand bed it cannot push). The liquid wins: the GRAIN is
+    // shoved along its pile to the nearest free pixel on its side, which is
+    // how pressure lifts a bed. Without this the particle stayed inside the
+    // grain and the next pull-back put it through the glass.
+    const int gi = grid_[(size_t)y * W + x] - 1;
+    const int home = grains_[gi].home;
+    if (home >= 0 && home < (int)vessels_.size() && !vessels_[home].outline.empty())
+      SweepChain(gi, vessels_[home], true);
   }
 }
 
@@ -791,16 +840,19 @@ void FlaskSim::StepGrains() {
       }
       continue;
     }
-    int cntHere;
-    float mHere = LiquidMassAt(g.x, g.y, &cntHere, nullptr);
-    // Lighter than the liquid it sits in: it floats up through it.
-    if (cntHere && mHere > mg) {
-      if (GrainFree(g.x, g.y + 1) && (Rand() & 3) == 0) {
-        int cu;
-        LiquidMassAt(g.x, g.y + 1, &cu, nullptr);
-        if (cu) MoveGrain(gi, g.x, g.y + 1);
+    // Lighter than the liquid ABOVE it: it rises into that pixel and the
+    // liquid takes its place (MoveGrain shoves it down). Asking the pixel
+    // above rather than its own is what lets a buried bed invert: liquid
+    // never gets INTO a packed pile, so a grain that waited to find liquid
+    // in its own pixel would stay under lava forever. The top grain goes
+    // first, the liquid fills in behind it, and the next one sees it.
+    {
+      int cu;
+      const float mUp = LiquidMassAt(g.x, g.y + 1, &cu, nullptr);
+      if (cu && mUp > mg) {
+        if (GrainFree(g.x, g.y + 1) && (Rand() & 3) == 0) MoveGrain(gi, g.x, g.y + 1);
+        continue;
       }
-      continue;
     }
     // Sinking. In liquid it settles at a rate set by how much heavier the
     // grain is and how thick the liquid is.
@@ -874,6 +926,19 @@ bool FlaskSim::PoseClear(const Vessel& v, const Xform& x) const {
 
 bool FlaskSim::PoseClear(int vi, const Xform& x) const { return PoseClear(vessels_[vi], x); }
 
+void FlaskSim::UpdateGrainHomes() {
+  const int W = cfg_.gridW;
+  for (Grain& g : grains_) {
+    if (wall_[(size_t)g.y * W + g.x]) continue;   // in glass: keep the last
+    g.home = -1;
+    for (size_t vi = 0; vi < vessels_.size(); vi++)
+      if (!vessels_[vi].outline.empty() && InsideVessel(vessels_[vi], {g.x + 0.5f, g.y + 0.5f})) {
+        g.home = (int8_t)vi;
+        break;
+      }
+  }
+}
+
 void FlaskSim::CarryGrains() {
   // The glass SWEEPS grains; it does not carry them. A grain the new walls
   // landed on moves to the nearest free pixel on the side of that vessel it
@@ -885,12 +950,55 @@ void FlaskSim::CarryGrains() {
   for (size_t vi = 0; vi < vessels_.size(); vi++) {
     const Vessel& v = vessels_[vi];
     if (v.x.pos.x == v.prevX.pos.x && v.x.pos.y == v.prevX.pos.y && v.x.angle == v.prevX.angle) continue;
+    // THE VESSEL CARRIES ITS GRAINS by its own motion AT EACH GRAIN: lifting
+    // a flask lifts the sand in it (left to the glass alone, liquid under a
+    // sand bed rode up with the bottom and blew through the bed). A pure
+    // translation carries a grain whole. While the vessel ROTATES only the
+    // upward part is carried -- the glass under a grain pushing it up -- and
+    // falling is left to gravity, so tipped sand slides and pours instead of
+    // turning with the glass as a block.
+    const bool turning = v.x.angle != v.prevX.angle;
+    {
+      std::vector<int> mine;
+      std::vector<V2> move;
+      for (size_t i = 0; i < grains_.size(); i++) {
+        const Grain& g = grains_[i];
+        if (g.home != (int)vi || g.vx != 0 || g.vy != 0) continue;
+        const V2 c{g.fx, g.fy};
+        V2 d = ToWorld(v.x, ToLocal(v.prevX, c)) - c;
+        if (turning) d = {0.0f, std::max(0.0f, d.y)};
+        if (d.x == 0 && d.y == 0) continue;
+        mine.push_back((int)i);
+        move.push_back(d);
+      }
+      // Leading edge first, so a grain moves into space its neighbour left.
+      std::vector<int> order(mine.size());
+      for (size_t k = 0; k < order.size(); k++) order[k] = (int)k;
+      std::sort(order.begin(), order.end(), [&](int a, int b) {
+        const float pa = grains_[mine[a]].fx * move[a].x + grains_[mine[a]].fy * move[a].y;
+        const float pb = grains_[mine[b]].fx * move[b].x + grains_[mine[b]].fy * move[b].y;
+        return pa > pb;
+      });
+      for (int k : order) {
+        Grain& g = grains_[mine[k]];
+        const V2 d = move[k];
+        const float fx = g.fx + d.x, fy = g.fy + d.y;
+        const int nx = (int)std::floor(fx), ny = (int)std::floor(fy);
+        if (nx == g.x && ny == g.y) { g.fx = fx; g.fy = fy; continue; }
+        if (!GrainFree(nx, ny)) continue;   // blocked: the sweep deals with it
+        grid_[(size_t)g.y * W + g.x] = 0;
+        g.x = (int16_t)nx;
+        g.y = (int16_t)ny;
+        g.fx = fx;
+        g.fy = fy;
+        grid_[(size_t)ny * W + nx] = mine[k] + 1;
+      }
+    }
     for (size_t i = 0; i < grains_.size(); i++) {
       Grain& g = grains_[i];
       size_t k = (size_t)g.y * W + g.x;
       if (!wall_[k]) continue;
-      V2 c{g.x + 0.5f, g.y + 0.5f};
-      bool wasIn = InsideLocal(v, ToLocal(v.prevX, c));
+      const bool wasIn = g.home == (int)vi;
       // Breadth-first through pixels on the grain's side of the glass,
       // occupied or not, to the nearest FREE one; then every grain on the
       // path shifts one pixel along it. In a packed pile the glass pushes
@@ -904,6 +1012,7 @@ bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn) {
   const int W = cfg_.gridW, H = cfg_.gridH;
   const Grain& g0 = grains_[gi];
   const int start = g0.y * W + g0.x;
+  const int g0x = g0.x, g0y = g0.y;
   bfsParent_.resize((size_t)W * H);
   bfsSeen_.resize((size_t)W * H, 0);
   if (++bfsStamp_ == 0) { std::fill(bfsSeen_.begin(), bfsSeen_.end(), 0); bfsStamp_ = 1; }
@@ -919,19 +1028,31 @@ bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn) {
       int x = cx + d[0], y = cy + d[1];
       if (x < 0 || y < 0 || x >= W || y >= H) continue;
       int k = y * W + x;
-      if (bfsSeen_[k] == bfsStamp_ || wall_[k]) continue;
-      if (InsideVessel(v, {x + 0.5f, y + 0.5f}) != wantIn) continue;
+      if (bfsSeen_[k] == bfsStamp_) continue;
+      // Through the glass is allowed (a grain the wall landed on is IN the
+      // glass, often with nothing but glass around it); the far side of it
+      // is not, and only a free pixel off the glass on the grain's own side
+      // ends the search.
+      const bool glass = wall_[k] != 0;
+      // ...but only a few pixels of it: the band runs round the whole vessel,
+      // and a search let loose along it spends its budget there instead of
+      // reaching the inside.
+      if (glass && std::abs(x - g0x) + std::abs(y - g0y) > 5) continue;
+      if (!glass && InsideVessel(v, {x + 0.5f, y + 0.5f}) != wantIn) continue;
       bfsSeen_[k] = bfsStamp_;
       bfsParent_[k] = cur;
-      if (!grid_[k]) { found = k; break; }
+      if (!glass && !grid_[k]) { found = k; break; }
       q.push_back(k);
     }
   }
   if (found < 0) return false;
-  // Walk back from the free pixel: each grain moves into its child's slot.
+  // Walk back from the free pixel: each grain on the path moves into the
+  // nearest free slot ahead of it. Empty glass pixels on the path are
+  // stepped over (the next grain back jumps them).
   int to = found;
   while (to != start) {
     int from = bfsParent_[to];
+    while (from != start && !grid_[from]) from = bfsParent_[from];
     int idx = grid_[from] - 1;
     Grain& g = grains_[idx];
     g.x = (int16_t)(to % W);
@@ -971,10 +1092,22 @@ void FlaskSim::Step(int substeps) {
       Xform next = v.x;
       next.pos = next.pos + dp;
       next.angle += da;
-      // Glass never passes through glass: a move that would bring this
-      // vessel's walls into another's is refused, and the vessel waits
-      // where it is (the panel's hand is blocked, like a real one).
-      if (!PoseClear(v, next)) continue;
+      // Glass never passes through glass. A move that would bring this
+      // vessel's walls into another's SLIDES instead of freezing: the
+      // rotation alone, the translation alone, then half of each -- so a
+      // flask swung toward another's neck rides round it the way a hand
+      // would steer, rather than stopping dead at the first touch.
+      if (!PoseClear(v, next)) {
+        Xform rotOnly = v.x, movOnly = v.x, half = v.x;
+        rotOnly.angle += da;
+        movOnly.pos = movOnly.pos + dp;
+        half.pos = half.pos + dp * 0.5f;
+        half.angle += da * 0.5f;
+        if (PoseClear(v, rotOnly)) next = rotOnly;
+        else if (PoseClear(v, movOnly)) next = movOnly;
+        else if (PoseClear(v, half)) next = half;
+        else continue;
+      }
       v.x = next;
       anyMoved |= v.x.pos.x != v.prevX.pos.x || v.x.pos.y != v.prevX.pos.y || v.x.angle != v.prevX.angle;
     }
@@ -1006,6 +1139,7 @@ void FlaskSim::Step(int substeps) {
 
     StepLiquid();
     StepGrains();
+    if (!grains_.empty()) UpdateGrainHomes();
     stickPrevA_ = stickA_;
     stickPrevB_ = stickB_;
     step_++;
@@ -1027,6 +1161,64 @@ void FlaskSim::Settle(int maxSteps) {
     if ((s & 15) == 15 && MovingCount(cfg_.gravity * 6) == 0) break;
   }
   stickOn_ = on;
+}
+
+// ---- removing a vessel -------------------------------------------------------
+
+std::vector<V2> FlaskSim::VesselOutline(int vi) const {
+  std::vector<V2> out;
+  if (!VesselAlive(vi)) return out;
+  const Vessel& v = vessels_[vi];
+  for (V2 p : v.outline) out.push_back(ToWorld(v.x, p));
+  return out;
+}
+
+Composition FlaskSim::RemoveVessel(int vi) {
+  Composition out;
+  if (!VesselAlive(vi)) return out;
+  Vessel& v = vessels_[vi];
+  const size_t S = subs_.size();
+  std::vector<uint64_t> units(S, 0);
+  // Liquid inside it leaves with it.
+  size_t w = 0;
+  for (size_t i = 0; i < px_.size(); i++) {
+    if (InsideVessel(v, px_[i])) {
+      units[psub_[i]] += pw_[i];
+      continue;
+    }
+    px_[w] = px_[i]; pv_[w] = pv_[i]; pprev_[w] = pprev_[i];
+    psub_[w] = psub_[i]; pw_[w] = pw_[i]; mbar_[w] = mbar_[i];
+    w++;
+  }
+  px_.resize(w); pv_.resize(w); pprev_.resize(w); psub_.resize(w); pw_.resize(w); mbar_.resize(w);
+  // ...and so do the grains.
+  const int W = cfg_.gridW;
+  size_t gw = 0;
+  for (size_t i = 0; i < grains_.size(); i++) {
+    const Grain& g = grains_[i];
+    grid_[(size_t)g.y * W + g.x] = 0;
+    if (InsideVessel(v, {g.x + 0.5f, g.y + 0.5f})) {
+      units[g.sub] += 1;
+      continue;
+    }
+    grains_[gw++] = g;
+  }
+  grains_.resize(gw);
+  for (size_t i = 0; i < grains_.size(); i++)
+    grid_[(size_t)grains_[i].y * W + grains_[i].x] = (int)i + 1;
+  // Units to eighths. A vessel's units are whole eighths plus the fraction
+  // of an eighth the grains in it make; the fraction is carried by the
+  // spill so the sum over the session stays exact (Count's rule).
+  const uint64_t upe = (uint64_t)cfg_.unitsPerEighth;
+  for (size_t s = 0; s < S; s++) {
+    if (!units[s]) continue;
+    const uint64_t e = units[s] / upe, r = units[s] % upe;
+    if (e) out.Add(subs_[s].mat, (uint32_t)e);
+    spilledUnits_[s] += (uint32_t)r;
+  }
+  v.outline.clear();
+  RebuildWalls();
+  return out;
 }
 
 // ---- counting --------------------------------------------------------------
@@ -1069,7 +1261,10 @@ Tally FlaskSim::Count() const {
     for (size_t b = 0; b < B; b++) {
       if (!e[b]) continue;
       Composition& c = b + 1 == B ? t.spilled : t.vessel[b];
-      c.Add(subs_[s].mat, (uint32_t)e[b]);
+      // A vessel that would hold a 17th substance cannot: that portion is
+      // counted as spilled (it would not fit through the lip either).
+      if (!c.Add(subs_[s].mat, (uint32_t)e[b]) && &c != &t.spilled)
+        t.spilled.Add(subs_[s].mat, (uint32_t)e[b]);
     }
   }
   return t;

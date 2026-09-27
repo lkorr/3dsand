@@ -883,6 +883,11 @@ struct UIState {
     // (game/container.h ContainerFillGlow), so the icon glows exactly when the
     // flask in the world does. 0 for anything that does not.
     float fillGlow = 0.0f;
+    // A MIXTURE's layers, bottom to top (heaviest first, the order they
+    // settle in): each band's colour and the fraction of the CONTENTS it
+    // is. Empty for an unmixed vessel -- the icon then pours `fillSwatch`.
+    std::vector<uint32_t> fillBandColor;
+    std::vector<float> fillBandFrac;
   };
   std::vector<KitSlotUI> bagSlots;      // Bag::kSlots, row-major
   std::vector<KitSlotUI> hotbarSlots;   // kItemSlots
@@ -1235,6 +1240,52 @@ struct UIState {
   // row's button. The panel owns the choice; main.cpp clears it when the slot
   // it names stops holding a vessel (moved, dropped, swapped for a sword).
   KitRef activeVessel{};
+  // ---- THE ALCHEMY BENCH (game/alchemy_bench.h) ----------------------------
+  // A 2D cross-section of one vessel with its contents simulated; another
+  // vessel can be brought in and tilted to pour, and a stick stirs. It takes
+  // the spellbook's column while it is open (the character stays on the
+  // left). Mirror in, intent out, like the rest of the screen: main.cpp owns
+  // the bench and draws its picture into `alchemy.tex`; the panel draws it,
+  // reports the pointer over it in SIM pixels, and raises the latches.
+  struct AlchemyUI {
+    // ---- mirror ----
+    bool open = false;
+    uint64_t tex = 0;            // ImTextureID of the bench picture
+    int texW = 0, texH = 0;      // its size, sim pixels
+    bool texReady = false;       // copied at least once (safe to sample)
+    std::string title;           // the opened vessel's name
+    KitRef target{};
+    KitRef source{};             // the vessel being poured from, if any
+    float tilt = 0.0f;           // the source's tilt, radians
+    struct Portion {
+      std::string name;
+      uint32_t color = 0;        // 0xAABBGGRR
+      int eighths = 0;
+    };
+    std::vector<Portion> targetParts, sourceParts;
+    int targetCap = 0, sourceCap = 0;   // eighths
+    // Vessels you carry that could be poured from (not the opened one).
+    struct Candidate {
+      KitRef ref;
+      std::string label;         // "flask: water 12, oil 3"
+      KitSlotUI slot;            // for the icon
+    };
+    std::vector<Candidate> candidates;
+    std::string message;         // the last thing the bench said
+    // ---- panel-owned ----
+    int tool = 0;                // 0 = stir, 1 = pour
+    // ---- input, written by the panel every frame ----
+    bool over = false;
+    float atX = 0.0f, atY = 0.0f;   // sim pixels, y up
+    bool down = false, pressed = false;
+    float tiltReq = 0.0f;           // radians requested this frame
+    // ---- latches ----
+    bool wantOpen = false;       // double-click on a vessel slot
+    KitRef openRef{};
+    bool wantClose = false;      // "done", Esc, or the screen closing
+    bool wantSource = false;     // pick (or, with an invalid ref, put back)
+    KitRef sourceRef{};
+  } alchemy;
   // THE THROW'S WIND-UP, 0..1 while Q is held with a throwable vessel in
   // hand, -1 otherwise (game/container.h ContainerThrowCharge). Written by the
   // tick; the HUD draws the meter under the crosshair, shaking at full.

@@ -336,6 +336,14 @@ struct VkrEncoder final : CommandEncoderImpl {
     rec->CopyImageToBuffer(im, NB(dst.buffer), dst.offset, dst.bytesPerRow,
                            extent.width, extent.height);
   }
+  void CopyBufferToTexture(const TexelCopyBuffer& src, const TexelCopyTexture& dst,
+                           const Extent3D& extent) override {
+    vk::Image* im = dst.texture
+                        ? static_cast<VkrTexture*>(dst.texture.Get())->img
+                        : nullptr;
+    rec->CopyBufferToImage(NB(src.buffer), src.offset, src.bytesPerRow, im,
+                           extent.width, extent.height);
+  }
   void BlitTexture(const TextureView& src, const TextureView& dst,
                    bool linear) override {
     vk::Image* d = NI(dst);

@@ -81,6 +81,12 @@ void CommandEncoder::CopyTextureToBuffer(const TexelCopyTexture& src,
   p_->CopyTextureToBuffer(src, dst, extent);
 }
 
+void CommandEncoder::CopyBufferToTexture(const TexelCopyBuffer& src,
+                                         const TexelCopyTexture& dst,
+                                         const Extent3D& extent) const {
+  p_->CopyBufferToTexture(src, dst, extent);
+}
+
 void CommandEncoder::BlitTexture(const TextureView& src, const TextureView& dst,
                                  bool linear) const {
   p_->BlitTexture(src, dst, linear);

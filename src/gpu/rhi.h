@@ -411,6 +411,13 @@ class CommandEncoder {
 
   void CopyTextureToBuffer(const TexelCopyTexture& src, const TexelCopyBuffer& dst,
                            const Extent3D& extent) const;
+  // The reverse: CPU pixels (already in `src`, by a Queue::WriteBuffer made
+  // BEFORE this encoder was created -- the write drains at the head of the
+  // next command buffer) into a CopyDst|TextureBinding texture. The texture is
+  // left in the sampled layout by Finish(), so submit this encoder before the
+  // one whose UI samples it (the alchemy bench's picture, main.cpp).
+  void CopyBufferToTexture(const TexelCopyBuffer& src, const TexelCopyTexture& dst,
+                           const Extent3D& extent) const;
   // Whole-image scaled copy, `src` -> `dst`, sizes taken from the images.
   // The internal-resolution frame's upscale to the swapchain
   // (render.renderScale): NEAREST by default so a scaled frame stays pixel
