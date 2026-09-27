@@ -452,16 +452,22 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
     // screen swings the mouth toward the body's right (model -X).
     const float a = v.angle;
     avatar.SetHeldAim(h, s.benchAimW[hk], Vec3{-std::sin(a), std::cos(a), 0.0f});
-    if (holds && v.pouring) pourHand = hk;
+    if (holds && v.carried) pourHand = hk;
   }
-  // ---- the pour: the tilted flask's mouth over the other's -------------------
-  const int other = pourHand >= 0 ? 1 - pourHand : -1;
-  const bool pour = pourHand >= 0 && s.benchClip[other];
-  if (pour) s.benchPourHand = pourHand;
-  s.benchPourW += ((pour ? 1.0f : 0.0f) - s.benchPourW) * ease;
-  if (!pour && s.benchPourW < 0.02f) s.benchPourW = 0.0f;
+  // ---- the carried flask: its arm follows it ---------------------------------
+  // The vessel in the bench's hand is moved in the character's hand the way
+  // it moves on the bench: up on the bench is up in the hand, toward the
+  // other flask on the bench is toward the other hand -- so lifting a bottle
+  // only raises that arm, and the hands meet only when the bottles do. Its
+  // tilt is SetHeldAim's (above), about the grip, so turning it never moves
+  // the arm.
+  const bool carry = pourHand >= 0;
+  if (carry) s.benchPourHand = pourHand;
+  s.benchPourW += ((carry ? 1.0f : 0.0f) - s.benchPourW) * ease;
+  if (!carry && s.benchPourW < 0.02f) s.benchPourW = 0.0f;
   if (s.benchPourW <= 0.0f || s.benchPourHand < 0) {
     s.benchPourCmdValid = false;
+    s.benchCarry.anchored = false;
     return;
   }
   const Hand ph = HandAt(s.benchPourHand), oh = OtherHand(ph);
@@ -470,28 +476,71 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
   Vec3 handFromShoulder;
   float reach = 0;
   if (!avatar.WeaponArmPose(handFromShoulder, reach)) return;
-  // THE COMMAND IS CLOSED ON THE LIP ITSELF. Which point the arm's IK
-  // places (the wrist, before SetHeldAim turns the hand about the grip) and
-  // where the lip then ends up are two different things, so no open-loop
-  // "hand = target - (lip - hand)" lands: it was measured 2.5 voxels high.
-  // Instead the command -- an offset from the shoulder, in the frame
-  // WeaponArmPose reads -- starts where the arm is and is nudged each tick by
-  // how far the flask's lip is from where it must be. It converges whatever
-  // the offset between the two points, and follows the bench as it moves.
+  // THE COMMAND IS CLOSED ON THE FLASK ITSELF. The point the arm's IK places
+  // (the wrist) is not the flask (SetHeldAim turns the hand about the grip),
+  // so no open-loop hand target lands. The command -- an offset from the
+  // shoulder, in the frame WeaponArmPose reads -- starts where the arm is and
+  // is nudged each tick by how far the flask's middle is from its goal.
   if (fresh) {
     s.benchPourCmd = handFromShoulder;
     s.benchPourCmdValid = true;
+    s.benchCarry.anchored = false;
   }
-  // Where the lip must be: just over the other flask's mouth. The moment
-  // the other flask is gone the command simply holds while the claim fades.
-  Vec3 dst, lip;
-  const float a = s.benchHold.hand[s.benchPourHand].angle;
   const Quat yaw = QuatAxisAngle({0, 1, 0}, avatar.Heading());
-  const Vec3 axisW = QuatRotate(yaw, Vec3{-std::sin(a), std::cos(a), 0.0f});
-  if (pour && avatar.HeldMouthWorld(Vec3{0, 1, 0}, dst, oh) &&
-      avatar.HeldMouthWorld(axisW, lip, ph)) {
-    dst.y += MetresToCells(0.06f);
-    s.benchPourCmd = s.benchPourCmd + (dst - lip) * 0.35f;
+  const Vec3 left = QuatRotate(yaw, Vec3{1, 0, 0});    // bench +x (the mirror)
+  const Vec3 fwd = QuatRotate(yaw, Vec3{0, 0, 1});
+  // A held flask's middle and length: halfway between its base and its lip
+  // along its own axis (the bench's angle).
+  auto middle = [&](Hand h, float ang, Vec3& c, float& len) {
+    const Vec3 ax = QuatRotate(yaw, Vec3{-std::sin(ang), std::cos(ang), 0.0f});
+    Vec3 lip, base;
+    if (!avatar.HeldMouthWorld(ax, lip, h) || !avatar.HeldMouthWorld(ax * -1.0f, base, h))
+      return false;
+    c = (lip + base) * 0.5f;
+    len = (lip - base).len();
+    return true;
+  };
+  const PlayerSession::BenchHold::HandView& pv = bh.hand[s.benchPourHand];
+  PlayerSession::BenchCarry& bc = s.benchCarry;
+  Vec3 c3{}, goal{};
+  float len = 0;
+  if (carry && middle(ph, pv.angle, c3, len)) {
+    if (!bc.anchored) {
+      // At pickup the flask is where the hold clip has it: that is the zero.
+      bc = PlayerSession::BenchCarry{};
+      bc.anchored = true;
+      bc.c0 = c3;
+      bc.bx = pv.cx;
+      bc.by = pv.cy;
+      // Up: the bench's own scale (a flask's height on the bench is its
+      // length in the hand), so lifting it over the other clears it there too.
+      bc.sy = len / std::max(pv.height, 1.0f);
+      bc.sx = bc.sy;
+      // Across: the gap between the two flasks on the bench is the gap
+      // between the hands, so arriving at the other bottle on the bench
+      // arrives at it here.
+      const PlayerSession::BenchHold::HandView& ov = bh.hand[HandIndex(oh)];
+      Vec3 o3;
+      float olen = 0;
+      if (s.benchClip[HandIndex(oh)] && middle(oh, ov.angle, o3, olen)) {
+        const float sepB = ov.cx - pv.cx, sep3 = (o3 - c3).dot(left);
+        if (std::fabs(sepB) > 4.0f && sep3 * sepB > 0.0f) {
+          bc.other = true;
+          bc.o3 = o3;
+          bc.sepB = sepB;
+          bc.sx = std::clamp(sep3 / sepB, bc.sy * 0.25f, bc.sy * 2.0f);
+        }
+      }
+    }
+    const float dx = pv.cx - bc.bx, dy = pv.cy - bc.by;
+    goal = bc.c0 + left * (dx * bc.sx) + Vec3{0, dy * bc.sy, 0};
+    // ...and in depth, toward the other flask as it is approached, so the
+    // two meet rather than pass one in front of the other.
+    if (bc.other) {
+      const float t = std::clamp(dx / bc.sepB, 0.0f, 1.0f);
+      goal = goal + fwd * ((bc.o3 - bc.c0).dot(fwd) * t);
+    }
+    s.benchPourCmd = s.benchPourCmd + (goal - c3) * 0.35f;
   }
   const float l = s.benchPourCmd.len();
   if (reach > 0 && l > reach * 0.98f) s.benchPourCmd = s.benchPourCmd * (reach * 0.98f / l);
@@ -503,9 +552,9 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
   if (std::getenv("SANDVOX_BENCH_DEBUG")) {
     static int n = 0;
     if ((n++ % 15) == 0)
-      std::printf("benchpour: w %.2f lip (%.1f %.1f %.1f) dst (%.1f %.1f %.1f) cmd (%.1f %.1f %.1f) reach %.1f%s",
-                  s.benchPourW, lip.x, lip.y, lip.z, dst.x, dst.y, dst.z, s.benchPourCmd.x,
-                  s.benchPourCmd.y, s.benchPourCmd.z, reach, "\n");
+      std::printf("benchcarry: w %.2f flask (%.1f %.1f %.1f) goal (%.1f %.1f %.1f) cmd (%.1f %.1f %.1f) sx %.4f sy %.4f other %d reach %.1f\n",
+                  s.benchPourW, c3.x, c3.y, c3.z, goal.x, goal.y, goal.z, s.benchPourCmd.x,
+                  s.benchPourCmd.y, s.benchPourCmd.z, bc.sx, bc.sy, (int)bc.other, reach);
   }
 }
 

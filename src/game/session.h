@@ -548,7 +548,10 @@ struct PlayerSession {
       std::string item;
       alchemy::Composition contents;   // the bench's live contents
       float angle = 0;                 // bench tilt, radians, CCW on screen
-      bool pouring = false;            // tilted over the other hand's
+      // Where the vessel's middle is on the bench (sim pixels, y up) and how
+      // tall it is there: the carried one's arm follows its bench motion.
+      float cx = 0, cy = 0, height = 0;
+      bool carried = false;            // in the bench's hand right now
     } hand[kHands];
   } benchHold;
   // Ticks the bench hold has been live (the arm-claim ramp), and which clip
@@ -560,6 +563,19 @@ struct PlayerSession {
   int benchPourHand = -1;
   Vec3 benchPourCmd{};          // the pour arm's command (PoseBenchHands)
   bool benchPourCmdValid = false;
+  // THE CARRY'S ANCHOR, taken the tick the bench hand picks the vessel up:
+  // its bench middle and its 3D middle then, the scales that turn bench
+  // pixels into voxels, and the other flask's place (bench and 3D) so moving
+  // toward it on the bench moves toward it in the hands.
+  struct BenchCarry {
+    bool anchored = false;
+    Vec3 c0{};                 // the carried flask's 3D middle at pickup
+    float bx = 0, by = 0;      // ...and its bench middle
+    float sx = 0, sy = 0;      // voxels per bench pixel: across, up
+    bool other = false;
+    Vec3 o3{};                 // the other flask's 3D middle at pickup
+    float sepB = 0;            // bench x from the carried one to the other
+  } benchCarry;
   int throwTicks = 0;
   // The HAND the throw is drawn in (Hand as an int), -1 = none. It used to
   // be a hotbar slot; the vessel is now in a kit hand slot (dual wielding).

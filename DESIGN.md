@@ -16496,18 +16496,30 @@ plays `assets/anims/bench_hold.json` (forearm level before the belly; the left
 hand its derived mirror) and is turned to the bench's angle by
 `Mob::SetHeldAim` -- a turn of the hand about the GRIP, after every solver and
 the clamp, so the flask's long axis (its lattice +X) matches the bench whatever
-the clip's wrist does. The vessel being carried on the bench, with another in
-the other hand, is POURED: the strike driver's arm claim (`SetWeaponPose`,
-legacy no-blade form) is taken for that hand and CLOSED ON THE LIP -- the
-command starts where the arm is and each tick moves by how far the flask's lip
-(`HeldMouthWorld` along its axis) is from just over the other flask's mouth. An
-open-loop "hand = target - (lip - hand)" landed 2.5 voxels high, because the
-point the IK places and the grip the aim turns about are not the same point.
+the clip's wrist does. The vessel being CARRIED on the bench has its arm
+FOLLOW IT (owner, 2026-09-27: "just raising a bottle up would only raise an
+arm"; the first version snapped the flask over the other's mouth the moment it
+was lifted, merging the hands, and contorted when tipped away). At pickup the
+flask's 3D middle and its bench middle are taken as the zero; after that its
+3D goal is that zero plus the bench motion -- up at the bench's own scale (a
+flask's bench height is its length in the hand), across at the scale that
+makes the gap between the two flasks on the bench the gap between the hands,
+and in depth toward the other flask as that gap closes -- so lifting only
+raises the arm and the hands meet only when the bottles do. The strike
+driver's arm claim (`SetWeaponPose`, legacy no-blade form) is taken for that
+hand and CLOSED ON THE FLASK: the command starts where the arm is and each
+tick moves by how far the flask's middle (halfway between its base and lip,
+`HeldMouthWorld` both ways along its axis) is from the goal. An open-loop hand
+target landed 2.5 voxels off, because the point the IK places (the wrist) and
+the grip the aim turns about are not the same point. The other hand stays in
+`bench_hold`. `--shot-bench` also writes `screenshot_bench_lift.bmp` (lifted,
+not yet moved); `SANDVOX_BENCH_AWAY=1` tips it away from the other flask
+instead of carrying it over.
 Everything eases in and out. Presentation only; nothing reaches the sim.
 Look-iterate with `--shot-bench` (`SANDVOX_BENCH_PORTRAIT_YAW=1.3` for a side
 view: the front view foreshortens a flask held out toward you;
-`SANDVOX_BENCH_DEBUG=1` prints the pour arm's lip, target and command and every
-live spill).
+`SANDVOX_BENCH_DEBUG=1` prints the carried flask's middle, goal and command and
+every live spill).
 
 The sim runs on its OWN THREAD at 60 steps a second (four substeps each): the
 frame thread hands in the pointer and gets back the newest picture, live

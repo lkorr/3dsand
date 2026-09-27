@@ -9138,7 +9138,10 @@ int main(int argc, char** argv) {
         // Tip toward A: counter-clockwise off the left lip when A is to the
         // left, clockwise off the right lip when it is to the right.
         const float side = pa.pos.x < pb.pos.x ? 1.0f : -1.0f;
-        want *= side;
+        // SANDVOX_BENCH_AWAY=1: lift it and tip it AWAY from A, never
+        // carrying it over (the arm must only rise and the flask turn).
+        static const bool away = std::getenv("SANDVOX_BENCH_AWAY") != nullptr;
+        want *= away ? -side : side;
         const alchemy::V2 lipL{-side * 0.30f * wb * 0.5f, hb};
         const alchemy::V2 r{lipL.x - grabL.x, lipL.y - grabL.y};
         const float c = std::cos(want), sn = std::sin(want);
@@ -9148,7 +9151,7 @@ int main(int argc, char** argv) {
         if (fl < 290) {
           const float t = ease((fl - 260) / 30);
           at = {start.x + (lifted.x - start.x) * t, start.y + (lifted.y - start.y) * t};
-        } else {
+        } else if (!away) {
           const float t = ease((fl - 290) / 40);
           at = {lifted.x + (over.x - lifted.x) * t, lifted.y + (over.y - lifted.y) * t};
         }
@@ -9161,6 +9164,7 @@ int main(int argc, char** argv) {
         ui.alchemy.tiltReq = want - reqd;
         reqd = want;
       }
+      if (f == 289) g_shotJumpPath = "screenshot_bench_lift.bmp";
       if (f == 300) g_shotJumpPath = "screenshot_bench_pour.bmp";
       if (f == 398) g_shotJumpPath = "screenshot_bench_poured.bmp";
       if (f == 405) ui.alchemy.wantClose = true;
@@ -12978,7 +12982,11 @@ int main(int argc, char** argv) {
               hv.item = d->name;
               if (!bench.Contents(v.ref, hv.contents)) hv.contents = st->contents;
               hv.angle = v.pose.angle;
-              hv.pouring = v.held && b >= 0;
+              const float ca = v.pose.angle, hh = v.height * 0.5f;
+              hv.cx = v.pose.pos.x - std::sin(ca) * hh;
+              hv.cy = v.pose.pos.y + std::cos(ca) * hh;
+              hv.height = v.height;
+              hv.carried = v.held;
             }
           }
           bh.active = !bh.hand[0].item.empty() || !bh.hand[1].item.empty();
