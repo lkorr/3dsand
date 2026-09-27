@@ -6612,6 +6612,89 @@ control limb loses 0, the acid is spent and the limb then holds. NOT covered:
 corpse contact does not ask a worn probe (corpses have no occlusion on the stain
 pass); the cube-path renderer (`debris.wgsl`) draws no coat at all.
 
+### A coat that heals (2026-09-27, alchemy package D; `Mob::HealTick` / `HealLimbStep`, `MaterialDef::coatRestore`, gates `heal-restore` + `heal-wound`)
+
+Enchanted blood (strong) and enchanted water (gentle) HEAL the body they are
+on. It is the `mend` spell (`Mob::RestoreVoxels`: the anatomy .vox IS the
+recipe of what should be there) turned into a coat, and the one new question
+is who pays -- the coat does, level by level.
+
+- **Authoring**: `"coat": {"restore": r, "restoreRate": s, "effects":
+  ["restore", ...]}`. `restore` is WORLD voxels of tissue one coat level
+  rebuilds (x scale^3 lattice cells, so the same splash heals the same volume
+  of any creature -- the argument `coat.depth` makes); `restoreRate` the most
+  a limb rebuilds per second. The tag and the number are required of each
+  other (materials.cpp `ParseCoat`). Enchanted blood 0.005 / 1.0 (2.56 skin cells a level on a human) plus `stanch`
+  and `disinfect`; enchanted water 0.0015 / 0.3, no stanch.
+- **Delivery is every coat door**: the health panel / Apply mode
+  (`PourOnBody`, `DouseLimb`), a splash or a thrown flask (splatter), a limb
+  bathed in it (contact, `coat.contact`). A healing coat lands on the SURFACE
+  only (`SoakLimb`, as corrosive and fuel coats do): it is paid out per level,
+  and an interior soak would be a purse many times what the flask held.
+- **A step** (`BurnTick` -> `HealTick`, every `kHealPeriod` = 6 ticks per
+  limb, staggered by creature and limb, gated by the coat ledger): (1) the
+  purse = sum of amount x restore over the healing-coated voxels + the limb's
+  `healCredit`; the step uses at most `restoreRate` of it (>= 1 cell). (2)
+  GROW recipe cells that are absent and face-adjacent to present flesh,
+  nearest the joint anchor first, as the recipe's exact word (material, the
+  `BuildAuthoredLattice` variant from the authored coordinate, art slot) --
+  holes fill from their walls, stumps grow outward, nothing floats. (3) MEND
+  present cells whose material is not the recipe's (cooked, charred, alight,
+  wound-soaked, rotted, chlorine-blistered) to the recipe word. (4) hp: grown
+  volume is credited as a carve charged it; a step with nothing to grow or
+  mend buys hp instead; EVERY credit stops at `hp x BurnHealthCap` -- healing
+  raises the cap only by mending burnt tissue (and un-counting `burntAway` as
+  it regrows), and `HealTick` recounts the burn at once when it has. (5) PAY:
+  one level off each coated voxel per round until the cells are covered, the
+  fraction left over carried as `healCredit` (< one level, forfeited when the
+  coat is gone). A step that used nothing spends nothing: an idle healing
+  coat dries on its own `coat.decay`. (6) the coat's `coat.effects` run on the
+  healed limb (`CoatEffectsOn`, report off), so a bath stanches as an Apply
+  does. Brick: `ReskinLimbMicro` + `RebuildLimbBody` (grown) the way a carve
+  re-uploads; coat-only steps poke the stain lattice. Wound-revert entries
+  (`woundWas`) at rebuilt cells are dropped.
+- **Tombstones and speckles**: a recipe cell held by a TOMBSTONE (removed by a
+  body pass, compaction batched until `FlushBurn`'s threshold) is grown by
+  reviving it in place (one pending removal off `burn.removed`, never charged
+  so never refunded). A recipe cell of a SELF-ACTIVE material (the anatomy's
+  blood speckles in muscle; `Mob::IsHealExempt`) is neither regrown nor
+  counted missing: it decays by itself whenever the limb's burn pass is awake,
+  and every heal step re-wakes it, so regrowing it was a loop that spent ~40%
+  of a coat on the same cells (measured, heal-wound). Blood comes back as hp.
+- **Joint twins**: the CHILD copy of a twin cell (`twinShadow_`) is never
+  mended -- the parent's copy is, and the sync carries it across. Mending both
+  to their own (differently authored) recipes would hand the cell back and
+  forth every step, paid out of the coat each time.
+- **Bounded (rule 2)**: every cell is paid for by a level that is then gone,
+  and a grown cell arrives clean, so healing cannot feed itself. A pool of
+  enchanted water heals whoever stands in it while they stand in it -- the
+  pool's matter, as an acid bath keeps eating. The living only; the dead do
+  not heal. Severed limbs are not regrown (no lattice to fill).
+- **The stain palette is FULL, so the enchanted liquids SHARE a slot**:
+  enchanted blood takes `blood`'s, enchanted water `wet`'s. On the ground a
+  stain is only a slot, and its look, drying clock and coat material are the
+  FIRST claimant's (`Simulation::UploadTables` -- colour and glow were
+  "last wins" until this change, which would have repainted every bloodstain
+  pink; `_r3` and `matOfStainType_` were already first-wins), so an enchanted
+  puddle soaks in as an ordinary blood / wet stain. On a body the coat word
+  names the MATERIAL (`PrefabVoxel::stain`), so every gameplay reader tells
+  them apart; only the renderer sees the shared slot. Enchanted water is NOT a
+  washer: a washer wicks into its neighbours at half depth (`WetOneLimb`),
+  which would mint healing levels from nothing. The clean way to give them a
+  look of their own is a second 8-entry body-only palette (the micro brick's
+  coat byte already has four slot bits; world.h has no room reserved) --
+  not done.
+- **The look**: a healing step lifts two micro motes of the coat material
+  (emissive) off the first and last cell it rebuilt, flagged `kPFlagDrip` so
+  they fall away without marking the ground. The session's Apply message adds
+  "the flesh begins to knit" (`kRemedyRestore`).
+Gates: `heal-restore` (a crater, a small pour rebuilds <= what its levels buy
+and then stops; a soak brings the limb back to 0 missing / 0 changed and its
+pre-carve hp) and `heal-wound` (a cut + cooked limb doused in enchanted blood:
+the wound closes, cooked cells return, the burn cap rises, hp rises and is
+never above the cap on any tick; enchanted water mends, does not stanch, and
+stays within its levels).
+
 ### A creature is a variant of another creature (2026-09-15, inheritance + becoming one at runtime 2026-09-20; `src/game/sidecar.*` + `assets/editor/sidecar.js`, sidecar `extends`/`model`/`effects`/`palette`/`turn`, `assets/mobs/effects/`, `BuildMobDef` + `MobDefFactory`, `MobSystem::DefWithEffects`/`TurnMob`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gates `sidecar-resolve` + `undead` + `zombify`)
 
 A zombie is a human who walks slower, is paler, does not heal, and arrives
@@ -16271,7 +16354,8 @@ write a live limb's `xf`. The old
 click-a-limb pour (`InspectApplyPicks`) is gone; `DouseLimb` stays as the
 whole-limb door for gates and tools. Vocabulary: `stanch` (the cauterise rule's
 three fields -- bleedBudget, stumpOpen, gushTicks) and `disinfect` (a bite's
-infectMat/infectStain). No material authors either yet; medicine is content.
+infectMat/infectStain). `enchanted_blood` authors both (2026-09-27), plus the
+third word, `restore` -- see "A coat that heals".
 
 **Apply mode: the same brush on somebody else** (2026-09-25; owner: "when
 holding a flask, when mousing over another mob, you should have the ability to

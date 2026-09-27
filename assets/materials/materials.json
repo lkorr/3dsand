@@ -3596,7 +3596,25 @@
       "tags": [
         "wet",
         "magic"
-      ]
+      ],
+      "//stain": "SHARES WATER'S `wet` SLOT (alchemy package D, 2026-09-27). The stain palette is FULL (seven slots, three bits in the voxel word), so this is the clean way in: on the GROUND a stain is only a slot, and the first claimant (water, earlier in this file) owns that slot's look, drying clock and coat material -- enchanted water soaks in as ordinary wet and dries as it does. On a BODY the coat word names the MATERIAL (voxload.h PrefabVoxel::stain), so every gameplay reader tells this apart from water: it heals, water does not. It does NOT wash (`washes` false): a washer's coat wicks into its neighbours at half depth (WetOneLimb), which for a coat that pays for healing per level would mint levels from nothing.",
+      "stain": {
+        "type": "wet",
+        "color": "#6d6f73",
+        "amount": 10,
+        "chance": 200,
+        "consume": 0
+      },
+      "//coat": "A GENTLE RESTORATIVE (Mob::HealTick). Each coat level rebuilds `restore` 0.0015 world voxels of tissue (0.77 skin cells of a human at skinScale 8: a world voxel is 512 of them) from the limb's authored recipe -- missing cells grown back, cooked or soaked cells put back -- at most `restoreRate` 0.3 world voxels a second per limb, and whatever is left once the shape is whole buys hp up to the burn cap. Paid for level by level, so a splash heals a splash's worth and is then spent (rule 2). Surface only (SoakLimb). decay 3 s/level: it dries off like water if there is nothing to heal. contact 120: bathing in a pool of it coats you steadily -- a healing spring heals whoever stands in it. No `stanch`: water does not close a cut, it only knits it slowly.",
+      "coat": {
+        "contact": 120,
+        "decay": 3,
+        "shed": 0,
+        "opacity": 0.35,
+        "restore": 0.0015,
+        "restoreRate": 0.3,
+        "effects": ["restore"]
+      }
     },
     {
       "//": "Blood saturated with dissolved fairy dust. Laid on a wound it heals it and regrows what was lost.",
@@ -3617,7 +3635,24 @@
       "tags": [
         "organic",
         "magic"
-      ]
+      ],
+      "//stain": "SHARES BLOOD'S SLOT (alchemy package D, 2026-09-27) for the reason enchanted_water shares wet's: the palette is full. On the ground it soaks in as a bloodstain (blood, first in this file, owns the slot's look and its coat material); on a body the coat word names enchanted_blood and it heals. consume 0: unlike blood it does not pit what it soaks.",
+      "stain": {
+        "type": "blood",
+        "color": "#8a1250",
+        "amount": 10,
+        "chance": 200,
+        "consume": 0
+      },
+      "//coat": "THE STRONG RESTORATIVE (Mob::HealTick). Laid on a wound it closes it (`stanch`), stops a bite's rot (`disinfect`) and REGROWS what was lost: each coat level rebuilds `restore` 0.005 world voxels of tissue (2.56 skin cells of a human at skinScale 8, where a world voxel is 512 of them: the Apply brush held on one spot, ~50 cells at 15, regrows a crater about a world voxel across) from the limb's authored recipe -- carved holes fill from their walls, a stump grows outward, cooked / charred / soaked / rotted cells return to what the recipe says -- at up to `restoreRate` 1 world voxel a second per limb, and once the shape is whole the rest buys hp up to the burn cap. Paid for level by level out of the coat, so a small pour heals a small wound and is spent (rule 2). Surface only (SoakLimb). decay 6 s/level: an unused coat dries off in about a minute. contact 90 (blood's): wading in it coats you.",
+      "coat": {
+        "contact": 90,
+        "decay": 6,
+        "shed": 200,
+        "restore": 0.005,
+        "restoreRate": 1.0,
+        "effects": ["restore", "stanch", "disinfect"]
+      }
     },
     {
       "//": "An electric discharge: a transient, brilliant gas that lives a tick or two (reactions.json decay). The bench's electrify button makes it at a vessel's contents; a lightning spell can make it in the world. tag:electric is what electrolysis rules match.",

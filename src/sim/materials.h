@@ -855,6 +855,21 @@ struct MaterialDef {
   // into a finely-skinned arm. A coat of A reaches A/15 of it. > 0, default 1.
   // Meaningless on a coat that attacks nothing.
   float coatDepth = 1.0f;
+  // RESTORATION (alchemy package D, 2026-09-27). A coat that HEALS the body
+  // it is on (materials.json `"coat": {"restore": r, "restoreRate": s,
+  // "effects": ["restore", ...]}` -- enchanted blood, enchanted water):
+  // Mob::HealTick rebuilds the limb toward its AUTHORED recipe (the def's
+  // anatomy .vox) -- missing cells grown back from the flesh that is there,
+  // cooked / charred / soaked / rotted cells put back to what the recipe says,
+  // and then hp up to the burn cap -- and PAYS for every cell out of the coat.
+  // `restore` is how much a coat level buys, in WORLD voxels of tissue (a
+  // limb's lattice pitch is per creature, so the same splash heals the same
+  // volume of any body -- the argument coatDepth makes); `restoreRate` is the
+  // most it can rebuild per second on one limb, also in world voxels. A coat
+  // that is spent heals nothing more: the budget is exactly what was poured
+  // (CLAUDE.md rule 2). 0 = does not heal. CPU-only, unhashed.
+  float coatRestore = 0.0f;
+  float coatRestoreRate = 0.0f;
   // GRID colours for a MATF_TINTED material (materials.json "tints"), packed
   // 0x00RRGGBB, at most kMatTintsMax. Entry i is what a voxel of this material
   // with state nibble i renders as; entry 0 is the natural colour by

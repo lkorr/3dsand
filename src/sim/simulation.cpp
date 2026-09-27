@@ -1170,14 +1170,15 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   // materials.h): the renderer maps a voxel's 3-bit stain TYPE to a colour by
   // indexing there, which avoids a dedicated buffer + bind slot for what is at
   // most eight RGBA values. Every staining material writes its own slot; two
-  // materials sharing a stain name share a slot and the last one wins, which
-  // is correct — they are by definition the same stain.
+  // materials sharing a stain name share a slot and the FIRST one wins (see
+  // below) -- they are by definition drawn as the same stain.
+  bool claimed[8] = {};
   for (size_t mi = 0; mi < mats.size() && mi < kStainPaletteBase; mi++) {
     const MaterialDef& d = mats[mi];
     // stainSlot, not the pack's type bits: a `bodyOnly` stain has a palette
     // slot (bodies draw it) but no GPU type (the ground never gets it).
     uint32_t type = d.stainSlot;
-    if (type == 0) continue;
+    if (type == 0 || type >= 8u) continue;
     // WHAT THE STAIN IS MADE OF, in the entry's spare `_r3`: the material id
     // behind a GROUND stain type, which is how sim_step.wgsl's coat rules find
     // the coat's reaction bucket (DESIGN.md §6 "A coat is a co-located virtual
@@ -1197,6 +1198,16 @@ void Simulation::UploadTables(const rhi::Queue& queue,
     // (sim_mutate.wgsl rainFall). A ground stainer only; the first one wins.
     if (groundType != 0 && d.stainIsRain && (table[kStainPaletteBase]._r3 & kStainPalMatMask) == 0)
       table[kStainPaletteBase]._r3 = (uint32_t)mi & kStainPalMatMask;
+    // THE LOOK IS THE FIRST CLAIMANT'S TOO (2026-09-27, alchemy package D).
+    // It was "last one wins", which was harmless while no two materials
+    // shared a stain name. The enchanted liquids now ride blood's and wet's
+    // slots (the palette is full; their coat word still names THEM, so every
+    // gameplay reader tells them apart), and they are appended after the
+    // originals -- last-wins would have repainted every bloodstain in the
+    // world pink. First-wins is the rule `_r3` above and MobSystem's
+    // matOfStainType_ already follow, so a slot now has ONE owner everywhere.
+    if (claimed[type]) continue;
+    claimed[type] = true;
     table[kStainPaletteBase + type].stainColor = d.gpu.stainColor;
     // ...and the body coat's glow + pulse in the palette entry's spare word
     // (materials.h kCoatGlow*). Only microbody.wgsl reads it.

@@ -2171,6 +2171,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                                   " to " + who + part;
                 if (did & MobSystem::kRemedyStanch) msg += "; the bleeding stops";
                 if (did & MobSystem::kRemedyDisinfect) msg += "; the rot stops spreading";
+                if (did & MobSystem::kRemedyRestore) msg += "; the flesh begins to knit";
                 ui.kitMessage = msg;
                 ui.kitMessageAge = 0.0f;
               }
@@ -3385,6 +3386,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                                   " over your " + avatar.PartName(hit.limb);
                 if (did & MobSystem::kRemedyStanch) msg += "; the bleeding stops";
                 if (did & MobSystem::kRemedyDisinfect) msg += "; the rot stops spreading";
+                if (did & MobSystem::kRemedyRestore) msg += "; the flesh begins to knit";
                 ui.kitMessage = msg;
                 ui.kitMessageAge = 0.0f;
               }
