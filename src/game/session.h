@@ -644,6 +644,11 @@ struct PlayerSession {
 
   // ---- projectiles ----
   std::vector<Grenade> grenades;
+  // EXPLOSIONS AUTHORED OUTSIDE THE TICK, for its next grenade slot: the
+  // alchemy bench's (a reaction that blew up in the character's hands,
+  // alchemy_bench.h BenchOutcome), written by the frame, drained by the tick
+  // into `exps` beside the grenades so they carve and shove the same way.
+  std::vector<ExplosionOp> pendingBlasts;
 
   // ---- the frame layer's command accumulator (package N2) ----
   // The frame layer WRITES held state and the axes wholesale every frame, ORs

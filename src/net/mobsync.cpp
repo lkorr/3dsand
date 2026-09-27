@@ -24,7 +24,7 @@ namespace {
 void WriteGear(ByteWriter& w, const std::vector<WireGear>& gear) {
   w.U32((uint32_t)gear.size());
   for (const WireGear& g : gear) {
-    WriteItemInstance(w, g, true);
+    WriteItemInstance(w, g, kItemFmtStopper);
     w.Pod(g.equipSlot);
     w.U32(g.held);
   }
@@ -36,7 +36,7 @@ bool ReadGear(ByteReader& r, std::vector<WireGear>& gear) {
   gear.clear();
   for (uint32_t i = 0; i < n && r.ok; i++) {
     WireGear g;
-    if (!ReadItemInstance(r, g, true)) break;
+    if (!ReadItemInstance(r, g, kItemFmtStopper)) break;
     r.Pod(g.equipSlot);
     r.U32(g.held);
     if (!r.ok) break;

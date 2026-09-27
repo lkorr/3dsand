@@ -23154,7 +23154,7 @@ static void WriteRecordGear(ByteWriter& w,
   w.U32((uint32_t)gear.size());
   for (const ::net::WireGear& g : gear) {
     if (version >= 7) {
-      WriteItemInstance(w, g, version >= 9);
+      WriteItemInstance(w, g, ItemFmtOfMobs(version));
       w.Pod(g.equipSlot);
       w.U32(g.held);
       continue;
@@ -23183,7 +23183,7 @@ static bool ReadRecordGear(ByteReader& r, std::vector<::net::WireGear>& gear,
   for (uint32_t i = 0; i < n && r.ok; i++) {
     ::net::WireGear g;
     if (version >= 7) {
-      ReadItemInstance(r, g, version >= 9);
+      ReadItemInstance(r, g, ItemFmtOfMobs(version));
       r.Pod(g.equipSlot);
       r.U32(g.held);
     } else {
@@ -23347,7 +23347,7 @@ void Mob::SaveOne(ByteWriter& w, uint32_t version) const {
     w.U32((uint32_t)pack.size());
     for (const ItemInstance& c : pack) {
       if (version >= 7) {
-        WriteItemInstance(w, c, version >= 9);
+        WriteItemInstance(w, c, ItemFmtOfMobs(version));
         continue;
       }
       w.Str(c.name);
@@ -23580,7 +23580,7 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
   for (uint32_t i = 0; i < nCarried && r.ok; i++) {
     ItemInstance c;
     if (version >= 7) {
-      ReadItemInstance(r, c, version >= 9);
+      ReadItemInstance(r, c, ItemFmtOfMobs(version));
     } else {
       uint32_t count = 0;
       r.Str(c.name);

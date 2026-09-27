@@ -127,7 +127,7 @@ inline bool ReadContents(ByteReader& r, alchemy::Composition& c) {
     uint32_t mat = 0, amt = 0;
     r.U32(mat);
     r.U32(amt);
-    if (r.ok && mat != 0 && mat < 4096 && amt != 0) c.Add((uint16_t)mat, amt);
+    if (r.ok && alchemy::ValidPortionMat(mat) && amt != 0) c.Add((uint16_t)mat, amt);
   }
   return r.ok;
 }
@@ -145,6 +145,12 @@ struct ItemInstance {
   alchemy::Composition contents;
   // WHAT IT HAS BEEN THROUGH (worn pieces). Empty = as authored.
   WornDamage damage;
+  // A VESSEL'S STOPPER (the alchemy bench's Stopper tool, 2026-09-27): the
+  // mouth is closed, so nothing -- gas, liquid, powder -- comes out of it: it
+  // pours nothing, scoops nothing, and a gas in it stays in it. Persisted:
+  // PLYR v9, ITMS v6, MOBS v10, net protocol 3 (kItemFmtStopper). A break
+  // still spills everything; the glass is gone.
+  bool stoppered = false;
 
   bool Empty() const { return name.empty() || count <= 0; }
   bool Filled() const { return !contents.Empty(); }
@@ -153,7 +159,7 @@ struct ItemInstance {
   void ClearFill() { contents = alchemy::Composition{}; }
   // A PRISTINE instance: nothing about it but its name and colour. Only these
   // merge into a stack — see StacksWith.
-  bool Plain() const { return contents.Empty() && damage.Empty(); }
+  bool Plain() const { return contents.Empty() && damage.Empty() && !stoppered; }
   // DO TWO OF THESE MERGE INTO ONE STACK? Same item, same colour, and BOTH
   // plain. A filled vessel never stacks (a fill is per-object state: two
   // flasks of 40 eighths merged into one count-2 stack with ONE fill, and
@@ -181,8 +187,11 @@ inline void RemapItemInstance(ItemInstance& it, const MatRemap& r) {
   if (!it.contents.Empty()) {
     alchemy::Composition c;
     for (int i = 0; i < it.contents.n; i++) {
-      const uint32_t m = r.Mat(it.contents.p[i].mat);
-      if (m != 0) c.Add((uint16_t)m, it.contents.p[i].eighths);
+      // A dissolved portion remaps its powder and keeps the bit.
+      const uint16_t p = it.contents.p[i].mat;
+      const uint32_t m = r.Mat(alchemy::BaseMat(p));
+      if (m != 0)
+        c.Add((uint16_t)(m | (alchemy::IsDissolved(p) ? alchemy::kDissolvedBit : 0)), it.contents.p[i].eighths);
     }
     it.contents = c;
   }
@@ -231,27 +240,36 @@ inline bool ReadWornDamage(ByteReader& r, WornDamage& d,
   return r.ok;
 }
 
-// `mixed` = the contents are a Composition (MOBS v9+, net protocol 2+); a
-// record from before that carries the one-material legacy word. Callers pass
-// their format's answer; there is no default, so no reader guesses.
-inline void WriteItemInstance(ByteWriter& w, const ItemInstance& it, bool mixed) {
+// THE ITEM RECORD'S FORMAT. `fmt` is what the caller's format carries:
+//   kItemFmtLegacy  -- the one-material legacy fill word (MOBS < 9, net 1);
+//   kItemFmtMixed   -- the contents as a Composition (MOBS v9, net protocol 2);
+//   kItemFmtStopper -- that, then the stopper word (MOBS v10+, net 3+).
+// Callers pass their format's answer; there is no default, so no reader
+// guesses. (A `bool` still converts: true is kItemFmtMixed.)
+constexpr int kItemFmtLegacy = 0, kItemFmtMixed = 1, kItemFmtStopper = 2;
+// The MOBS section's answer (game/mob.h MobSystem::kSaveVersion's history).
+inline int ItemFmtOfMobs(uint32_t version) {
+  return version >= 10 ? kItemFmtStopper : version >= 9 ? kItemFmtMixed : kItemFmtLegacy;
+}
+inline void WriteItemInstance(ByteWriter& w, const ItemInstance& it, int fmt) {
   w.Str(it.name);
   w.U32((uint32_t)(it.count < 0 ? 0 : it.count));
   w.U32(it.dye);
-  if (mixed) {
+  if (fmt >= kItemFmtMixed) {
     WriteContents(w, it.contents);
   } else {
     w.U32(LegacyFillWordOf(it.contents));
   }
   WriteWornDamage(w, it.damage);
+  if (fmt >= kItemFmtStopper) w.U32(it.stoppered ? 1u : 0u);
 }
 
-inline bool ReadItemInstance(ByteReader& r, ItemInstance& it, bool mixed) {
+inline bool ReadItemInstance(ByteReader& r, ItemInstance& it, int fmt) {
   uint32_t count = 0;
   r.Str(it.name);
   r.U32(count);
   r.U32(it.dye);
-  if (mixed) {
+  if (fmt >= kItemFmtMixed) {
     ReadContents(r, it.contents);
   } else {
     uint32_t fill = 0;
@@ -259,5 +277,12 @@ inline bool ReadItemInstance(ByteReader& r, ItemInstance& it, bool mixed) {
     it.contents = ContentsFromLegacyFill(fill);
   }
   it.count = (int)count;
-  return ReadWornDamage(r, it.damage) && r.ok;
+  const bool ok = ReadWornDamage(r, it.damage) && r.ok;
+  it.stoppered = false;
+  if (ok && fmt >= kItemFmtStopper) {
+    uint32_t s = 0;
+    r.U32(s);
+    it.stoppered = s != 0;
+  }
+  return ok && r.ok;
 }

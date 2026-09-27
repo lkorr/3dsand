@@ -63,7 +63,7 @@ void WriteAnnounce(ByteWriter& w, const BodyAnnounce& a) {
   w.U32(a.hadMicro);
   w.U32(a.bleedMat);
   w.U32(a.dead);
-  WriteItemInstance(w, a.item, true);
+  WriteItemInstance(w, a.item, kItemFmtStopper);
 }
 bool ReadAnnounce(ByteReader& r, BodyAnnounce& a) {
   r.Pod(a.globalId);
@@ -77,7 +77,7 @@ bool ReadAnnounce(ByteReader& r, BodyAnnounce& a) {
   r.U32(a.hadMicro);
   r.U32(a.bleedMat);
   r.U32(a.dead);
-  ReadItemInstance(r, a.item, true);
+  ReadItemInstance(r, a.item, kItemFmtStopper);
   // A zero pitch would divide by zero in every world-space conversion the
   // receiving side makes off this lattice. Clamped here rather than asserted
   // because a hostile or corrupt payload is a thing to survive, not to crash
@@ -175,14 +175,14 @@ void Encode(std::vector<uint8_t>& out, const ItemGrant& rec) {
   w.U32(kDebrisWireVersion);
   w.Pod(rec.globalId);
   w.U32(rec.toPlayer);
-  WriteItemInstance(w, rec.item, true);
+  WriteItemInstance(w, rec.item, kItemFmtStopper);
   w.U32(rec.granted);
 }
 bool Decode(ByteReader& r, ItemGrant& out) {
   if (!CheckVersion(r)) return false;
   r.Pod(out.globalId);
   r.U32(out.toPlayer);
-  ReadItemInstance(r, out.item, true);
+  ReadItemInstance(r, out.item, kItemFmtStopper);
   r.U32(out.granted);
   return r.ok;
 }

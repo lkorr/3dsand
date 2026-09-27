@@ -532,6 +532,7 @@ add_library(sandvox_core OBJECT
   src/game/melee.cpp
   src/game/container.cpp
   src/game/flasksim.cpp
+  src/game/flaskchem.cpp
   src/game/alchemy_bench.cpp
   src/game/strokes.cpp
   # Is this pose inside itself? (game/selfclip.h) — voxel-level limb

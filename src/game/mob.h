@@ -5654,7 +5654,11 @@ class MobSystem {
   // carries a Composition -- up to 16 (material, eighths) portions -- where
   // it carried one packed word (iteminstance.h WriteItemInstance `mixed`). A
   // v7/v8 record's flask loads as the one portion its word named.
-  static constexpr uint32_t kSaveVersion = 9;
+  //
+  // 10 (2026-09-27): A VESSEL'S STOPPER. Every ItemInstance ends with its
+  // stopper word (iteminstance.h kItemFmtStopper); a v9 record's vessels
+  // load unstoppered.
+  static constexpr uint32_t kSaveVersion = 10;
   static constexpr uint32_t kSaveVersionMin = 3;
   // Record limb kinds (v4).
   static constexpr uint32_t kLimbSevered = 0;

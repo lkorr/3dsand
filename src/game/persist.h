@@ -108,7 +108,10 @@ struct PlayerKitRefs {
 // (game/composition.h): up to 16 (material, eighths) portions. The v6 word is
 // still written (the main portion) and a v8 reader replaces it; a v7 kit
 // loads each vessel as the one portion its word named.
-constexpr uint32_t kPlayerKitSaveVersion = 8;
+// Version 9 (2026-09-27) appends each slot's vessel STOPPER (one word per
+// slot, the dyes' shape) and lets a portion carry the DISSOLVED bit
+// (composition.h kDissolvedBit); a v8 kit loads every vessel unstoppered.
+constexpr uint32_t kPlayerKitSaveVersion = 9;
 constexpr uint32_t kPlayerKitOldestLoadable = 3;
 
 // ITEMS ON THE GROUND ('ITMS'): what is lying around, by name and pose.
@@ -146,7 +149,9 @@ struct WorldItemRefs {
 // authored-under-its-lattice, which is what it was.
 // v5 (2026-09-26) appends each entry's MIXED contents after its damage and
 // a v5 reader replaces the v3 word with it; a v4 flask loads as one portion.
-constexpr uint32_t kWorldItemSaveVersion = 5;
+// v6 (2026-09-27) appends each entry's vessel STOPPER word after its
+// contents; a v5 ground flask loads unstoppered.
+constexpr uint32_t kWorldItemSaveVersion = 6;
 
 // The 'PLYR' serializer, exposed so the grimoire gate can write an OLDER
 // version's payload (everything up to that version's last block) and prove

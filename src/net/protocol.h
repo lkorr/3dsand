@@ -94,7 +94,9 @@ enum class MsgType : uint16_t {
 // than as whichever struct happened to move.
 // 2 (2026-09-26): an item's vessel contents are a Composition (up to 16
 // portions, iteminstance.h WriteContents) where they were one packed word.
-constexpr uint16_t kProtocolVersion = 2;
+// 3 (2026-09-27): an item record ends with its vessel's stopper word
+// (iteminstance.h kItemFmtStopper).
+constexpr uint16_t kProtocolVersion = 3;
 
 // D, the lockstep delay, in ticks. Fixed rather than adaptive: §4 finding 5
 // takes "no deadlock" from a constant that both sides agree on before they

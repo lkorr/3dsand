@@ -2118,8 +2118,8 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         if (vdef && vdef->IsContainer() && ti.Held(useBit) && !ti.Held(scoopBit) &&
             ti.Held(applyBit)) {
           bool applied = false;
-          if (!vs.Filled()) {
-            if (ti.Pressed(useBit)) say("it is empty");
+          if (!vs.Filled() || vs.stoppered) {
+            if (ti.Pressed(useBit)) say(vs.stoppered ? "it is stoppered" : "it is empty");
           } else if (!ContainerIsolateOne(kit.equip.slots, kEquipSlotCount,
                                           vSlot, kit.bag.slots, Bag::kSlots)) {
             if (ti.Pressed(useBit)) say("no room to set the others down");
@@ -2379,9 +2379,15 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
           splat.count = 0;
           const bool first = !sp.splatted;
           const WorldSnapshot& psnap = world.Snap();
+          // Gas (a bench's fumes, a stoppered flask of chlorine that broke)
+          // leaves on the CPU gas stream, charged against its room first.
+          std::vector<GasSpawnOp> gasOut;
+          const uint32_t gasRoom = kGasCpuSpawnPerTick - std::min(kGasCpuSpawnPerTick, world.PendingGasSpawns());
           ContainerSpillStep(sp, mats, tick, room, fluidSpawns, spawns, &splat,
                              ContainerParticleRoom(psnap.valid, psnap.particleCount,
-                                                   spawns.size()));
+                                                   spawns.size()),
+                             &gasOut, gasRoom);
+          if (!gasOut.empty()) world.QueueGasSpawns(gasOut.data(), (uint32_t)gasOut.size());
           if (first && sp.splatted) mobs.QueueSplatter(splat);
         }
         std::erase_if(w.vesselSpills,
@@ -3357,7 +3363,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           }
           const ItemDef* vdef = vp ? items.Of(*vp) : nullptr;
           if (!ps.active || !avatar.Spawned() || !vdef || !vdef->IsContainer() ||
-              !vp->Filled()) {
+              !vp->Filled() || vp->stoppered) {
             s.pourStrokeTicks = 0;
             s.pourSpendMilli = 0;
           } else {
@@ -3963,6 +3969,13 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
                           CurrentTuning().tools.detonatePower, 0, 0, 0});
         }
       }
+      // THE ALCHEMY BENCH'S EXPLOSIONS (alchemy_bench.h BenchOutcome): a
+      // reaction that blew up in the character's hands goes off here, in the
+      // grenade's slot, so it craters, carves the hands and arms that held
+      // it and shoves exactly as a grenade at the hands would.
+      for (const ExplosionOp& e : s.pendingBlasts)
+        if (exps.size() < kMaxExplosionsPerTick) exps.push_back(e);
+      s.pendingBlasts.clear();
       for (size_t i = 0; i < grenades.size();) {
         if (UpdateGrenade(grenades[i], kTickDt, kindAt)) {
           if (exps.size() < kMaxExplosionsPerTick) {

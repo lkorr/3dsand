@@ -365,11 +365,45 @@ struct ContainerSpill {
 // tick anything leaves, is filled with the burst's SplatterEvent (the caller
 // queues it), so whoever it breaks over is wet with it.
 // Grid particles are MEASURED (see ContainerPour) and limited by `partRoom`.
+//
+// THE ONE DOOR FROM A VESSEL'S COMPOSITION TO THE WORLD (docs/
+// PLAN_alchemy_chemistry.md contract 2.5): a break, a bench stream, a bench
+// vent, an unpaid scoop, a bench explosion's burst all come through here, and
+// so do the pours' dissolved share (ContainerDissolvedToWorld). A GAS portion
+// (a stoppered flask of chlorine, the fumes off the bench) leaves as gas
+// parcels (`gas`, World::QueueGasSpawns: the CPU gas stream) -- eight eighths
+// a voxel, the last partial voxel rounded by a hash (the one rounding, like
+// a pour's last partial cell); without a `gas` vector a gas portion waits.
+// A DISSOLVED portion goes through ContainerDissolvedToWorld.
 int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
                        uint32_t tick, uint32_t fluidRoom,
                        std::vector<FluidSpawnOp>& fluid,
                        std::vector<ParticleSpawn>& parts, SplatterEvent* splat,
-                       uint32_t partRoom = 0xFFFFFFFFu);
+                       uint32_t partRoom = 0xFFFFFFFFu,
+                       std::vector<GasSpawnOp>* gas = nullptr, uint32_t gasRoom = 0);
+
+// THE VESSEL HALF OF THE SOLUTE SEAM (contract 2.5): `eighths` of DISSOLVED
+// `mat` (kDissolvedBit set) leaving a vessel at `at` moving `vel` (cells per
+// tick). Package B (the world solute layer) replaces this body with liquid
+// cells carrying solute mass; until then the dissolved matter comes out as
+// ITS POWDER, one-eighth grains (world.h POWDER ENTERS THE WORLD AS GRAINS)
+// -- conserved, just not in solution. Returns the eighths emitted (all of
+// them unless the spawn budget ran out; the caller keeps the rest).
+int ContainerDissolvedToWorld(uint16_t mat, int eighths, Vec3 at, Vec3 vel, uint32_t seed,
+                              uint32_t tick, const std::vector<MaterialDef>& mats,
+                              std::vector<ParticleSpawn>& parts, uint32_t partRoom);
+
+// What leaves WITH `eighths` of a liquid: every dissolved portion's share of
+// the liquid in the vessel, taken out of `c` (all of it with the last of the
+// liquid). The pours call this and send it through ContainerDissolvedToWorld.
+alchemy::Composition ContainerTakeDissolvedShare(alchemy::Composition& c, uint32_t eighths,
+                                                 uint32_t liquidBefore);
+
+// A VESSEL'S VOLUME in eighths: what takes room in it. Dissolved matter and
+// gas (a stoppered flask's headspace) do not; everything else does.
+uint32_t ContainerVolume(const alchemy::Composition& c, const std::vector<MaterialDef>& mats);
+// The eighths of LIQUID in it (what dissolved matter rides).
+uint32_t ContainerLiquidEighths(const alchemy::Composition& c, const std::vector<MaterialDef>* mats);
 
 // THE BREAK PASS, once per tick (session.cpp phase H, and the vessel-break
 // gate): every vessel in `ground` against both witnesses -- the NEW contacts

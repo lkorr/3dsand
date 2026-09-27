@@ -326,6 +326,20 @@ void SavePlayerKitBytes(const PlayerKitRefs& r, std::vector<uint8_t>& out, uint3
   putContents(kit.hotbar.slots, kItemSlots);
   putContents(kit.bag.slots, Bag::kSlots);
   putContents(kit.equip.slots, kEquipSlotCount);
+  if (version < 9) return;
+
+  // ---- v9: vessel STOPPERS (the alchemy bench's Stopper tool) ---------------
+  //
+  //   u32 hotbarCount  then per slot: u32 stoppered
+  //   u32 bagCount     then per slot: the same
+  //   u32 equipCount   then per slot: the same
+  auto putStoppers = [&](const ItemStack* v, int n) {
+    PutU32(out, (uint32_t)n);
+    for (int i = 0; i < n; i++) PutU32(out, !v[i].Empty() && v[i].stoppered ? 1u : 0u);
+  };
+  putStoppers(kit.hotbar.slots, kItemSlots);
+  putStoppers(kit.bag.slots, Bag::kSlots);
+  putStoppers(kit.equip.slots, kEquipSlotCount);
 }
 
 bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
@@ -503,7 +517,7 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
         alchemy::Composition c;
         for (uint32_t j = 0; j < k && rd.ok; j++) {
           const uint32_t m = rd.U32(), e = rd.U32();
-          if (rd.ok && m != 0 && m < 4096 && e != 0) c.Add((uint16_t)m, e);
+          if (rd.ok && alchemy::ValidPortionMat(m) && e != 0) c.Add((uint16_t)m, e);
         }
         if (!rd.ok || (int)i >= n || v[i].Empty()) continue;
         const ItemDef* d = r.items->Of(v[i]);
@@ -520,6 +534,19 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
     getContents(kit.hotbar.slots, kItemSlots);
     getContents(kit.bag.slots, Bag::kSlots);
     getContents(kit.equip.slots, kEquipSlotCount);
+  }
+  // ---- v9: stoppers ----------------------------------------------------------
+  if (version >= 9) {
+    auto getStoppers = [&](ItemStack* v, int n) {
+      const uint32_t count = rd.U32();
+      for (uint32_t i = 0; i < count && rd.ok; i++) {
+        const uint32_t s = rd.U32();
+        if (rd.ok && (int)i < n && !v[i].Empty()) v[i].stoppered = s != 0;
+      }
+    };
+    getStoppers(kit.hotbar.slots, kItemSlots);
+    getStoppers(kit.bag.slots, Bag::kSlots);
+    getStoppers(kit.equip.slots, kEquipSlotCount);
   }
   if (dropped > 0)
     std::fprintf(stderr,
@@ -604,6 +631,8 @@ void SaveOneWorldItem(const WorldItemRefs& r, const WorldItem& w,
       PutU32(out, w.contents.p[j].mat);
       PutU32(out, w.contents.p[j].eighths);
     }
+    // v6: its stopper.
+    PutU32(out, w.stoppered ? 1u : 0u);
   }
 }
 
@@ -665,10 +694,14 @@ bool LoadWorldItems(const WorldItemRefs& r, const uint8_t* data, size_t len,
       alchemy::Composition c;
       for (uint32_t j = 0; j < k && rd.ok; j++) {
         const uint32_t m = rd.U32(), e = rd.U32();
-        if (rd.ok && m != 0 && m < 4096 && e != 0) c.Add((uint16_t)m, e);
+        if (rd.ok && alchemy::ValidPortionMat(m) && e != 0) c.Add((uint16_t)m, e);
       }
       if (!rd.ok) break;
       inst.contents = c;
+    }
+    if (version >= 6) {
+      inst.stoppered = rd.U32() != 0;
+      if (!rd.ok) break;
     }
     // The lattice and the vessel's contents are ids in the table this record
     // was written under; running ids from here on (sim/mattable.h).
