@@ -551,6 +551,8 @@ bool LoadItems(const std::string& dir, size_t materialCount,
           MetresToCells(std::max(0.0f, c.value("throwMinSpeedMps", 0.0f))));
       d.container.throwChargeSec = std::max(0.05f, c.value("throwChargeSec", 1.0f));
       d.container.breakSpeed = MetresToCells(std::max(0.0f, c.value("breakSpeedMps", 0.0f)));
+      // Capped at 127: the level rides 7 bits of the micro-body instance word.
+      d.container.fillSlices = std::clamp(c.value("fillSlices", 0), 0, 127);
       if (d.container.holds == 0 || d.container.capacity == 0) {
         errors += "items: \"" + d.name +
                   "\" is a container with no `holds` or no `capacity` -- skipped\n";
@@ -560,6 +562,17 @@ bool LoadItems(const std::string& dir, size_t materialCount,
     // A broken item is skipped, never fatal: one bad asset must not cost the
     // player their whole hotbar (DESIGN.md §6, the same rule mob defs follow).
     if (!LoadItemAsset(dir, materialCount, micro, d, errors)) continue;
+    // The see-through cells a vessel's contents are drawn in
+    // (phys/fillview.h), off the model it is drawn with.
+    if (d.kind == ItemKind::Container && d.container.fillSlices > 0) {
+      auto cells = std::make_shared<std::vector<FillCell>>();
+      for (const PrefabVoxel& v : d.voxels)
+        if (v.x >= 0 && v.x < d.container.fillSlices && v.y >= 0 && v.z >= 0 &&
+            v.x < 128 && v.y < 128 && v.z < 128)
+          cells->push_back({(int8_t)v.x, (int8_t)v.y, (int8_t)v.z});
+      d.container.fillCells = std::move(cells);
+      d.container.fillDims = d.size;
+    }
     out.items.push_back(std::move(d));
   }
   if (out.items.empty()) errors += "items: no usable items in " + path + "\n";

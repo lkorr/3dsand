@@ -289,7 +289,10 @@ def engraving(kind, size=16):
         fill([(3, 7, 8), (4, 7, 8), (5, 7, 8)])            # neck
         fill([(6, 5, 10), (7, 4, 11), (8, 3, 12), (9, 3, 12), (10, 3, 12),
               (11, 3, 12), (12, 4, 11), (13, 5, 10)])      # belly
-        fill([(10, 4, 11), (11, 4, 11), (12, 5, 10)], GOLD_DIM)  # contents
+        # NO baked contents: the flask is drawn EMPTY and the UI pours the
+        # real contents in over it, in their own colour and at their own
+        # level (inventory_ui.cpp DrawVesselContents, whose pixel mask is
+        # this belly's inside -- change one, change both).
         stroke(im, [(4, 8), (4, 9), (3, 10), (3, 11)], h)  # glint
     elif kind == "bag":           # the general storage mark
         fill([(4, 6, 9), (5, 4, 11), (6, 3, 12), (7, 3, 12), (8, 3, 12),

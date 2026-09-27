@@ -835,3 +835,32 @@ std::string ContainerFillText(const ItemDef& def, const ItemStack& st,
   std::snprintf(b, sizeof b, "%s %d/%d", name.c_str(), cells, capCells);
   return b;
 }
+
+uint32_t ContainerFillSwatch(const ItemStack& st,
+                             const std::vector<MaterialDef>& mats) {
+  if (!st.Filled() || st.fillMat >= mats.size()) return 0;
+  return 0xFF000000u | (mats[st.fillMat].gpu.color0 & 0x00FFFFFFu);
+}
+
+ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, uint32_t fill) {
+  ContainerHeldFill f;
+  const uint16_t mat = ItemFillMat(fill), amt = ItemFillAmt(fill);
+  if (!def.IsContainer() || mat == 0 || amt == 0) return f;
+  f.mat = mat;
+  f.slices = def.container.fillSlices;
+  f.frac = std::clamp((float)amt / (float)std::max(1, def.container.capacity),
+                      0.0f, 1.0f);
+  f.dims = def.container.fillDims;
+  f.cells = def.container.fillCells;
+  return f;
+}
+
+ContainerHeldFill ContainerHeldFillOf(const ItemDef& def, const ItemInstance& st) {
+  return ContainerHeldFillFrom(def, st.Fill());
+}
+
+float ContainerFillGlow(const ItemInstance& st,
+                        const std::vector<MaterialDef>& mats) {
+  if (!st.Filled() || st.fillMat >= mats.size()) return 0.0f;
+  return (float)mats[st.fillMat].gpu.emission / 255.0f;
+}

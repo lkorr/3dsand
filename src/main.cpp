@@ -3103,6 +3103,8 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   };
 
   for (int i = 0; i < 20; i++) mobTick();  // healthy walk first: live gait pose
+  std::vector<uint64_t> droppedBodies;       // "_item" drops, logged at the shot
+  std::vector<std::string> pendingDrops;     // "_item=mat:frac", dropped later
   for (size_t start = 0; start < limbCsv.size();) {
     size_t end = limbCsv.find(',', start);
     if (end == std::string::npos) end = limbCsv.size();
@@ -3111,13 +3113,49 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     // "*name" puts an item IN THE HAND (Mob::EquipItem, held_right) and
     // "!clip" plays a clip on it, so a held pose -- the `pour` clip with a
     // flask -- is a screenshot rather than a live session.
+    // "*flask=lava:0.4" also FILLS a held vessel (material, fraction of its
+    // capacity), so what the contents look like in the hand is a screenshot
+    // too (game/container.h ContainerHeldFillWord).
+    // "_flask=lava:0.4" DROPS a filled vessel on the ground in front of the
+    // creature, so what the contents look like on a body lying on its side is
+    // a screenshot too (phys/fillview.h). Recorded here and dropped after the
+    // creature has settled, beside where the camera will look.
+    if (!nm.empty() && nm[0] == '_') {
+      pendingDrops.push_back(nm.substr(1));
+      continue;
+    }
     if (!nm.empty() && nm[0] == '*') {
-      const ItemDef* it = items.At(items.Find(nm.substr(1)));
+      std::string itemName = nm.substr(1), fillSpec;
+      if (size_t eq = itemName.find('='); eq != std::string::npos) {
+        fillSpec = itemName.substr(eq + 1);
+        itemName.resize(eq);
+      }
+      const ItemDef* it = items.At(items.Find(itemName));
       Mob* hm = mobs.FindCreature(id);
-      if (!it || !hm || !hm->EquipItem(it))
-        std::fprintf(stderr, "--shot-mob: could not hold \"%s\"\n", nm.c_str() + 1);
-      else
-        std::printf("--shot-mob: holding %s\n", nm.c_str() + 1);
+      if (!it || !hm || !hm->EquipItem(it)) {
+        std::fprintf(stderr, "--shot-mob: could not hold \"%s\"\n", itemName.c_str());
+        continue;
+      }
+      std::printf("--shot-mob: holding %s\n", itemName.c_str());
+      if (!fillSpec.empty() && it->IsContainer()) {
+        const size_t colon = fillSpec.find(':');
+        const std::string matName = fillSpec.substr(0, colon);
+        const float frac = colon == std::string::npos
+                               ? 1.0f
+                               : (float)std::atof(fillSpec.c_str() + colon + 1);
+        ItemStack st = StackOf(items, items.Find(itemName));
+        for (size_t m = 1; m < mats.size(); m++)
+          if (mats[m].name == matName) st.fillMat = (uint16_t)m;
+        st.fillAmt = (uint16_t)std::clamp(
+            (int)std::lround(frac * it->container.capacity), 0,
+            it->container.capacity);
+        // Through the CONTENTS, as a rising or a peer's announce would:
+        // MobSystem::RefreshHeldFills turns them into the view each tick.
+        hm->SetHeldContents(st.Fill(), Hand::Right);
+        std::printf("--shot-mob: %s holds %s %d/%d eighths\n",
+                    itemName.c_str(), matName.c_str(), (int)st.fillAmt,
+                    it->container.capacity);
+      }
       continue;
     }
     if (!nm.empty() && nm[0] == '!') {
@@ -3267,6 +3305,61 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
     }
   }
 
+  // ---- "_item" DROPS: beside the creature as it stands NOW --------------
+  // The live-limb centroid is where the camera will look (below); MobOrigin
+  // is not, and the harness spawn column is on a slope a flask rolls off.
+  if (!pendingDrops.empty()) {
+    static WorldItems shotGround;   // the shot is one process; bodies outlive it
+    std::vector<BodyXformGpu> mt;
+    mobs.AppendXforms(mt);
+    Vec3 c = mobs.MobOrigin(id);
+    if (!mt.empty()) {
+      Vec3 sum{};
+      for (const BodyXformGpu& m : mt) sum += Vec3{m.pos[0], m.pos[1], m.pos[2]};
+      c = sum * (1.0f / (float)mt.size());
+    }
+    const Vec3 fwdNow = mobs.MobFacing(id);
+    const Vec3 rightNow{fwdNow.z, 0, -fwdNow.x};
+    for (size_t k = 0; k < pendingDrops.size(); k++) {
+      std::string itemName = pendingDrops[k], fillSpec;
+      if (size_t eq = itemName.find('='); eq != std::string::npos) {
+        fillSpec = itemName.substr(eq + 1);
+        itemName.resize(eq);
+      }
+      const ItemDef* it = items.At(items.Find(itemName));
+      if (!it) {
+        std::fprintf(stderr, "--shot-mob: no item \"%s\" to drop\n", itemName.c_str());
+        continue;
+      }
+      ItemStack st = StackOf(items, items.Find(itemName));
+      if (!fillSpec.empty() && it->IsContainer()) {
+        const size_t colon = fillSpec.find(':');
+        const std::string matName = fillSpec.substr(0, colon);
+        const float frac = colon == std::string::npos
+                               ? 1.0f
+                               : (float)std::atof(fillSpec.c_str() + colon + 1);
+        for (size_t m = 1; m < mats.size(); m++)
+          if (mats[m].name == matName) st.fillMat = (uint16_t)m;
+        st.fillAmt = (uint16_t)std::clamp(
+            (int)std::lround(frac * it->container.capacity), 0,
+            it->container.capacity);
+      }
+      // A little in front and to the side, just above the ground there.
+      const Vec3 xz = c + fwdNow * 5.0f + rightNow * (3.0f + 3.0f * (float)k);
+      const int gy = World::TerrainHeight(ifloor(xz.x), ifloor(xz.z), kDefaultSeed);
+      const Vec3 at{xz.x, (float)gy + 2.0f, xz.z};
+      const uint64_t body = DropItemToWorld(*it, st, at, Vec3{0, 0, 0}, phys,
+                                            debris, debris.MicroSet(), shotGround);
+      if (body) {
+        debris.SetBodyFill(body, ContainerHeldFillOf(*it, st));
+        droppedBodies.push_back(body);
+      }
+      std::printf("--shot-mob: dropped %s (%d/%d eighths)\n", itemName.c_str(),
+                  (int)st.fillAmt, it->container.capacity);
+    }
+    for (int i = 0; i < 45; i++) mobTick();   // let it fall and settle
+  }
+
   // Body upload through the ONE slot walk (game/bodyreg.h). This harness has
   // no avatar, which the registry represents explicitly (nullptr) — all three
   // arrays still agree with each other by construction, which is the property
@@ -3400,10 +3493,27 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
           : std::max(18.0f, 2.4f * std::max(def.worldSize.y,
                                             std::max(def.worldSize.x,
                                                      def.worldSize.z)));
+  for (uint64_t b : droppedBodies) {
+    BodyTransform bx{};
+    const bool live = phys.GetTransform(b, bx);
+    std::printf("--shot-mob: dropped body %llu %s at (%.1f, %.1f, %.1f), camera "
+                "target (%.1f, %.1f, %.1f)\n",
+                (unsigned long long)b, live ? "is" : "is GONE", bx.pos.x,
+                bx.pos.y, bx.pos.z, target.x, target.y, target.z);
+  }
   shoot(right + Vec3{0, 0.15f, 0}, shotDist, "screenshot_mob_side.bmp");
   shoot((fwd + right) * 0.7071f + Vec3{0, 0.3f, 0}, shotDist,
         "screenshot_mob_quarter.bmp");
   shoot(fwd + Vec3{0, 0.15f, 0}, shotDist, "screenshot_mob_front.bmp");
+  // ...and a close-up of what was dropped: the creature keeps walking while
+  // the drop settles, so the three above cannot be trusted to frame it.
+  if (!droppedBodies.empty()) {
+    BodyTransform bx{};
+    if (phys.GetTransform(droppedBodies[0], bx)) {
+      target = bx.pos;
+      shoot(Vec3{0.6f, 0.8f, 1.0f}, 12.0f, "screenshot_mob_drop.bmp");
+    }
+  }
   return ctx.ReportVkValidation("--shot-mob") > 0 ? 1 : 0;
 }
 
@@ -12968,6 +13078,8 @@ int main(int argc, char** argv) {
                          ? std::clamp((float)st.fillAmt / (float)d->container.capacity,
                                       0.0f, 1.0f)
                          : 0.0f;
+            u.fillSwatch = ContainerFillSwatch(st, mats);
+            u.fillGlow = ContainerFillGlow(st, mats);
             u.tip = ContainerFillText(*d, st, mats) +
                     "\nQ / E puts it in your left / right hand;"
                     "\nthat hand's button (RMB / LMB) uses it,"

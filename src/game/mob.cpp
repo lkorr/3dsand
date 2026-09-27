@@ -2192,6 +2192,20 @@ void MobSystem::ReleaseDebrisHooks() {
   prevBodyReactor_ = DebrisSystem::BodyReactor{};
 }
 
+void MobSystem::RefreshHeldFills() {
+  // A few mobs, of which a handful hold anything: one name lookup each.
+  for (Mob& m : mobs_)
+    for (int hk = 0; hk < kHands; hk++) {
+      const Hand h = HandAt(hk);
+      ContainerHeldFill f;
+      const uint32_t fill = m.HeldContents(h);
+      if (items_ && fill && !m.HeldItem(h).empty())
+        if (const ItemDef* d = items_->At(items_->Find(m.HeldItem(h))))
+          f = ContainerHeldFillFrom(*d, fill);
+      m.SetHeldFill(f, h);
+    }
+}
+
 void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
                                     const std::vector<ReactionGpu>& reactions) {
   // A reload can change what a corpse is made of reacting to: every sleeping
@@ -2929,6 +2943,7 @@ bool MobSystem::ServiceRising(size_t ri) {
     bool held = false;
     Hand hand = Hand::Right;
     uint32_t dye = 0;
+    uint32_t fill = 0;   // a held vessel's contents (Mob::HeldContents)
     WornDamage damage;
   };
   std::vector<RiseGear> gear;
@@ -2955,6 +2970,7 @@ bool MobSystem::ServiceRising(size_t ri) {
     g.item = hh.item;
     g.held = true;
     g.hand = HandAt(hk);
+    g.fill = hh.contents;
     gear.push_back(std::move(g));
   }
   // ---- AND ITS PACK --------------------------------------------------------
@@ -3162,6 +3178,7 @@ bool MobSystem::ServiceRising(size_t ri) {
         g.held ? now.EquipItem(item, g.hand)
                : now.WearItem(item, g.equipSlot,
                               g.damage.Empty() ? nullptr : &g.damage, g.dye);
+    if (ok && g.held) now.SetHeldContents(g.fill, g.hand);
     if (ok) dressed++;
   }
   // ---- AND WITH THE PACK IT FELL WITH --------------------------------------
@@ -7496,6 +7513,7 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
   // The clock a rising is booked against (Mob::Die runs from inside a damage
   // path, which has no tick to hand).
   tick_ = tick;
+  RefreshHeldFills();
   // WHO OWNS WHAT, ONCE, BEFORE ANYTHING STEPS (M9.4-B). A creature's owner
   // may not change halfway through its own tick: burning is a pre-pass, the
   // drive is mid-loop and staining is a post-pass, and an ownership answer
@@ -8150,6 +8168,8 @@ ItemInstance Mob::ShedGearBeforeDetach(int limbIndex) {
     shed.name = hh.item;
     if (limbIndex >= 0 && limbIndex < (int)limbs_.size())
       shed.dye = limbs_[limbIndex].dye;
+    // A flask knocked from the hand still holds what it held.
+    shed.SetFill(hh.contents);
     // ...AND THE KIT'S HAND SLOT GIVES IT UP (dual wielding). The hand is a
     // kit slot now (EquipSlotId::HandR/HandL), and the player's rig is
     // dressed FROM it every tick: left holding the name, the next tick
@@ -8159,8 +8179,7 @@ ItemInstance Mob::ShedGearBeforeDetach(int limbIndex) {
     {
       ItemStack& ks = kit_.equip.InHand(lostHand);
       if (!ks.Empty() && ks.name == hh.item) {
-        shed.fillMat = ks.fillMat;
-        shed.fillAmt = ks.fillAmt;
+        if (hh.contents == 0) shed.SetFill(ks.Fill());
         if (--ks.count <= 0) ks = ItemStack{};
       }
     }
@@ -21713,6 +21732,7 @@ void Mob::LootPieces(std::vector<LootPiece>& out) const {
     piece.kind = LootPiece::Kind::Held;
     piece.name = hh.item;
     piece.hand = HandAt(hk);
+    piece.SetFill(hh.contents);
     out.push_back(std::move(piece));
   }
   // The pack last, so the worn and held entries keep the indices the loot
@@ -22000,7 +22020,14 @@ uint32_t Mob::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out,
       // word this struct had. 0 for every body limb and every undyed piece,
       // and 0 is what the shader reads as "no dye" — so nothing that is not a
       // coloured garment costs anything here or on the GPU.
-      out.push_back({slot, (uint32_t)limb.microModel, bits, limb.dye});
+      // A held vessel's contents ride the same word instead, levelled
+      // against this frame's rotation (SetHeldFill); a vessel is never dyed,
+      // so nothing is displaced.
+      uint32_t word = limb.dye;
+      Hand fillHand = Hand::Right;
+      if (IsHeldSlot((int)i, &fillHand) && held_[HandIndex(fillHand)].fill.On())
+        word = BodyFillWord(held_[HandIndex(fillHand)].fill, limb.xf.quat);
+      out.push_back({slot, (uint32_t)limb.microModel, bits, word});
     }
     slot++;
   }
@@ -23225,6 +23252,7 @@ void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
     ::net::WireGear g;
     g.name = hh.item;
     g.held = 1u + (uint32_t)hk;
+    g.SetFill(hh.contents);
     bySlot.emplace_back(hh.slot, std::move(g));
   }
   std::stable_sort(bySlot.begin(), bySlot.end(),
@@ -24316,9 +24344,10 @@ void MobSystem::ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear) 
   for (const ::net::WireGear& g : gear) {
     const ItemDef* item = items_->Of(g);
     if (item == nullptr) continue;   // retired item: it arrives without it
-    if (g.held)
-      m.EquipItem(item, g.held == 2u ? Hand::Left : Hand::Right);
-    else
+    if (g.held) {
+      const Hand h = g.held == 2u ? Hand::Left : Hand::Right;
+      if (m.EquipItem(item, h)) m.SetHeldContents(g.Fill(), h);
+    } else
       m.WearItem(item, g.equipSlot, g.damage.Empty() ? nullptr : &g.damage,
                  g.dye);
   }

@@ -11,6 +11,7 @@
 #include <utility>
 #include <vector>
 
+#include "phys/fillview.h"
 #include "math3d.h"
 #include "phys/bodystain.h"  // BodyStainMat/Amt: coats a blow leaves
 #include "phys/damagecause.h"  // DamageCause: shared with Mob
@@ -794,6 +795,11 @@ class DebrisSystem {
   // per-slot array to filter afterwards) is what makes a world with no micro
   // bodies cost one loop and no allocation — sim/microbody.h.
   void AppendMicroInsts(std::vector<MicroBodyInstGpu>& out) const;
+  // What a body that is a vessel shows of its contents (Body::fill). The
+  // ground registry's owner calls it every tick for every item it holds, so
+  // a flask dropped, thrown, loaded or announced by a peer is tinted without
+  // any of those paths knowing. False for an unknown handle.
+  bool SetBodyFill(uint64_t handle, const BodyFillView& f);
   // Every brick record this system holds, drawn or not (sim/microbody.h
   // MicroHolder). Used by the aliasing audit, never by the frame path.
   void AppendMicroHolders(std::vector<MicroHolder>& out) const;
@@ -1403,6 +1409,10 @@ class DebrisSystem {
     // from then on — so a severed micro limb keeps its detail as ordinary
     // debris, and the description cannot outlive the body it describes.
     MicroBodyRef micro{};
+    // A VESSEL'S CONTENTS (phys/fillview.h): drawn level in the brick every
+    // frame in place of the dye. Render-only, set by whoever knows the body is
+    // a filled item (SetBodyFill); a default view draws the body plainly.
+    BodyFillView fill;
     // Collider voxels per world voxel: the units of `voxels`, the pitch the
     // Jolt collider is built at, and the divisor for every world-space
     // quantity derived from a body-local coordinate (radius, particle

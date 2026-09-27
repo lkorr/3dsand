@@ -875,6 +875,14 @@ struct UIState {
     // a vessel. The HUD hotbar draws it as a gauge under the icon, the one
     // number you need while pouring.
     float fill = -1.0f;
+    // ...and what it holds, as the contents' own colour (0xAABBGGRR, opaque),
+    // 0 when empty: the icon pours it into the flask and the gauges draw in it
+    // (game/container.h ContainerFillSwatch).
+    uint32_t fillSwatch = 0;
+    // ...and how brightly they glow, 0..1: the material's own `emission`
+    // (game/container.h ContainerFillGlow), so the icon glows exactly when the
+    // flask in the world does. 0 for anything that does not.
+    float fillGlow = 0.0f;
   };
   std::vector<KitSlotUI> bagSlots;      // Bag::kSlots, row-major
   std::vector<KitSlotUI> hotbarSlots;   // kItemSlots

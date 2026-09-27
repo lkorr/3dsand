@@ -16257,6 +16257,64 @@ into MPM particles for a while, which a grid-only count reads as a loss), and
 survives the whole fixture, one thrown down at full draw breaks and spills all
 1024 eighths, one lying still breaks when a flying stone hits it).
 
+
+**What is in it, visibly** (2026-09-26; owner: "flasks are tinted / contain the
+color of the thing that they contain ... and the volume of it represented by
+the % volume ... both in the inventory icon as well as the held item"). One
+colour, `ContainerFillSwatch` (the contents material's `color0`), everywhere:
+- **The icon.** `item_container` is drawn EMPTY (`gen_ui_chrome.py` no longer
+  bakes a gold band into it) and `DrawVesselContents` (inventory_ui.cpp) pours
+  the contents in over it: the belly's inside, row by row from the bottom, as
+  many sprite pixels as the fill is of the whole inside, top row lifted toward
+  white as a surface line. Every slot that draws an item (pack, hotbar, flasks
+  row, loot) and the HUD hotbar; the fill gauges take the same colour.
+- **The held flask**, LEVEL against gravity. `container.fillSlices` (items.json;
+  flask 8, pouch 0) names the see-through part of the model: its first N
+  x-slices from the base. `Mob::SetHeldFill` takes colour + fraction once a
+  tick (the session, from the selected hotbar vessel); every frame
+  `Mob::AppendMicroInsts` hands `ContainerHeldFillWord` the held body's
+  rotation, which ranks the see-through cells by height along world up and
+  puts the surface plane through the one the fill fraction reaches -- by
+  VOLUME, so the wide belly fills slowly and the neck fast, and a tipped flask
+  runs into its shoulder. The plane rides the micro-body instance's dye word
+  (the contents' MATERIAL id, slices, a 7-bit height; the dye flag stays
+  clear) and `microbody.wgsl` shades every see-through cell at or under it AS
+  THAT MATERIAL, 80% over the glass: its palette, and its `emission`, burn
+  tint and ember flicker through the same functions every voxel goes through.
+  Render-only: never hashed, never saved, never on the limb (a dropped or
+  severed flask cannot inherit it as a dye).
+- **Glow is the substance's, and there is no other switch.** Lava in a flask
+  glows because lava's materials.json row has `emission` 215; water does not
+  because its row has none. A future glowing liquid glows in every flask, in a
+  hand, on the ground and in the pack icon with no code, and setting a
+  material's `emission` to 0 turns it off everywhere at once (the icon reads
+  the same number, `ContainerFillGlow`, for its lifted colour and stepped
+  halo). Deliberately NOT a per-vessel or per-contents flag: a second switch
+  would be a second truth about whether a substance glows.
+- **On the ground and in flight**, the same: `DebrisSystem::SetBodyFill` puts
+  a `BodyFillView` (phys/fillview.h, which owns the view and the word) on the
+  body, and `AppendMicroInsts` levels it against the body's rotation every
+  frame -- a flask on its side shows a puddle along its flank and its neck.
+  The session re-states it every tick for every container in the ground
+  registry, so a drop, a throw, a load and a peer's announce need no hook.
+- **In an NPC's hand.** The held slot is a def, not a stack, so its contents
+  ride beside it as `Mob::HeldContents` (a packed fill) and go wherever the
+  held item goes: out of a hand that is cut off or disarmed (the shed item
+  carries them -- before this a flask knocked from ANY hand, the player's
+  included, arrived on the ground empty), up with a corpse that rises, onto
+  the wire (`WireGear`'s fill, documented but never set until now), into the
+  loot list. `MobSystem::RefreshHeldFills` turns them into the view each tick.
+  Nothing yet GIVES an NPC a filled flask in play (the spawn panel equips an
+  empty one); the path is there for whatever does.
+- **Not yet:** a glowing flask lights ITSELF, not its surroundings. The glow
+  field (common.wgsl THE GLOW FIELD) is baked from grid voxels only, so no
+  body -- a burning limb, a burning branch, this flask -- casts light on the
+  ground around it; that is one fix for all of them (body emitters feeding
+  `sim_glow.wgsl`), not a flask feature. Contents are not refracted. Look-
+  iterate with
+  `--shot-mob "human:*flask=lava:0.5,_flask=water:0.6"` (`*` holds, `_` drops
+  one on the ground and adds `screenshot_mob_drop.bmp`).
+
 ## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
 
 > **A biome SELECTS from component libraries and says how often and where.

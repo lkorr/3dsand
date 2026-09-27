@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <iterator>
 #include <cstdarg>
 #include <cstdio>
 #include <cstring>
@@ -90,6 +91,68 @@ const char* ItemIcon(const std::string& kind) {
   if (kind == "trinket") return "slot_trinket";
   if (kind == "container") return "item_container";
   return "item_unknown";
+}
+
+// WHAT IS IN A VESSEL, poured into its icon. The item_container sprite is an
+// EMPTY flask (scripts/gen_ui_chrome.py), and this paints the inside of its
+// belly and neck in the contents' own colour, from the bottom row up, as many
+// pixels as the fill is of the whole inside -- so a half-full flask shows half
+// its INSIDE (the wide belly fills slowly, the neck fast), not half its height.
+// Whole sprite pixels at the sprite's own scale, snapped exactly as
+// DrawSpriteCentered snaps, so the liquid sits in the glass rather than beside
+// it. The top row is lifted toward white: that line is what reads as a liquid
+// SURFACE instead of a painted band.
+//
+// THE MASK IS THE SPRITE'S BELLY, row by row (sprite y, first x, last x), one
+// pixel inside the silhouette so the glass keeps its rim. gen_ui_chrome.py's
+// "container" engraving is the other half; change one, change both.
+//
+// A GLOWING SUBSTANCE (`glow` = its material's emission, 0..1) is drawn lit:
+// the liquid lifted toward white and a soft pool of its own colour under the
+// flask, drawn by DrawVesselGlow BEFORE the sprite so the glass sits in it.
+// Nothing here names lava -- anything with emission glows, anything without
+// does not.
+void DrawVesselGlow(ImDrawList* dl, ImVec2 mid, float fill, ImU32 col,
+                    float glow) {
+  if (fill <= 0.0f || !col || glow <= 0.0f) return;
+  const float a = std::clamp(glow, 0.0f, 1.0f);
+  // Stepped squares, not a gradient: the UI is pixel art.
+  for (int r = 3; r >= 1; r--) {
+    const float h = 5.0f + 4.0f * (float)r;
+    dl->AddRectFilled(ImVec2(mid.x - h, mid.y + 6.0f - h),
+                      ImVec2(mid.x + h, mid.y + 6.0f + h),
+                      Fade(col, a * 0.10f * (float)(4 - r)));
+  }
+}
+
+void DrawVesselContents(ImDrawList* dl, ImVec2 mid, float fill, ImU32 col,
+                        float glow = 0.0f) {
+  if (fill <= 0.0f || !col || !ui::Chrome("item_container")) return;
+  static constexpr int kRows[][3] = {   // bottom -> top
+      {13, 6, 9}, {12, 5, 10}, {11, 4, 11}, {10, 4, 11}, {9, 4, 11},
+      {8, 4, 11}, {7, 5, 10},  {6, 6, 9},   {5, 7, 8},   {4, 7, 8}};
+  int total = 0;
+  for (const auto& r : kRows) total += r[2] - r[1] + 1;
+  const float px = ui::kChromeScale;
+  const float half = 16.0f * px * 0.5f;
+  const ImVec2 o((float)(int)(mid.x - half), (float)(int)(mid.y - half));
+  // Pixels to fill, never 0 while anything is in it.
+  const int want = std::max(1, (int)std::lround(std::min(fill, 1.0f) * total));
+  int done = 0, top = -1;
+  for (int i = 0; i < (int)std::size(kRows) && done < want; i++) {
+    done += kRows[i][2] - kRows[i][1] + 1;
+    top = i;
+  }
+  // Emissive contents are lit from inside: lifted toward white by their glow.
+  if (glow > 0.0f)
+    col = ui::Mix(col, IM_COL32(255, 245, 200, 255), 0.35f * std::min(glow, 1.0f));
+  const ImU32 surface = ui::Mix(col, IM_COL32(255, 255, 255, 255), 0.35f);
+  for (int i = 0; i <= top; i++) {
+    const auto& r = kRows[i];
+    dl->AddRectFilled(ImVec2(o.x + r[1] * px, o.y + r[0] * px),
+                      ImVec2(o.x + (r[2] + 1) * px, o.y + (r[0] + 1) * px),
+                      i == top ? surface : col);
+  }
 }
 
 // The kind of whatever a KitRef names, off the panel's own mirrors. Used while
@@ -229,6 +292,7 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
                       Fade(ui::ColGold(), 0.08f));
     dl->AddRectFilled(ImVec2(mid.x - 8, mid.y - 4), ImVec2(mid.x + 8, mid.y + 12),
                       Fade(ui::ColGold(), 0.08f));
+    DrawVesselGlow(dl, mid, item.fill, item.fillSwatch, item.fillGlow);
     ui::DrawSpriteCentered(dl, ItemIcon(item.kind), ImVec2(mid.x + 1, mid.y + 1),
                            Fade(ui::ColInk(), 0.7f));   // pixel drop shadow
     // THE ICON TAKES THE DYE. The atlas is keyed on kind, so three tunics in
@@ -238,6 +302,7 @@ void ItemSlot(UIState& s, const char* id, ImVec2 at,
     // before.
     ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid,
                            item.dyeSwatch ? item.dyeSwatch : IM_COL32_WHITE);
+    DrawVesselContents(dl, mid, item.fill, item.fillSwatch, item.fillGlow);
     if (item.dyeSwatch) {
       // ...and a hard 4 px chip in the corner, because a tinted pixel-art icon
       // at this size reads as a lighting change rather than as a colour. The
@@ -3067,7 +3132,7 @@ void DrawInventoryScreen(UIState& s) {
           dl->AddRectFilled(g0, g1, Fade(ui::ColInk(), 0.8f));
           if (it.fill > 0.0f)
             dl->AddRectFilled(g0, ImVec2(std::floor(g0.x + (g1.x - g0.x) * it.fill), g1.y),
-                              on && s.applyColor ? s.applyColor : ui::ColGoldDim());
+                              it.fillSwatch ? it.fillSwatch : ui::ColGoldDim());
         }
       }
       if (flasks.empty()) {
@@ -3642,10 +3707,12 @@ void DrawHudHotbar(const UIState& s, ImDrawList* dl) {
     SlotRim(dl, at, look);
     const ImVec2 mid(at.x + kSlot * 0.5f, at.y + kSlot * 0.5f);
     if (filled) {
+      DrawVesselGlow(dl, mid, item.fill, item.fillSwatch, item.fillGlow);
       ui::DrawSpriteCentered(dl, ItemIcon(item.kind), ImVec2(mid.x + 1, mid.y + 1),
                              Fade(ui::ColInk(), 0.7f));
       ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid,
                              item.dyeSwatch ? item.dyeSwatch : IM_COL32_WHITE);
+      DrawVesselContents(dl, mid, item.fill, item.fillSwatch, item.fillGlow);
       if (item.dyeSwatch) {
         dl->AddRectFilled(ImVec2(at.x + kSlot - 9, at.y + 3),
                           ImVec2(at.x + kSlot - 3, at.y + 9), item.dyeSwatch);
@@ -3661,7 +3728,8 @@ void DrawHudHotbar(const UIState& s, ImDrawList* dl) {
         dl->AddRectFilled(ImVec2(gx0, gy), ImVec2(gx1, gy + 4), IM_COL32(10, 10, 14, 220));
         const float fx = std::floor(gx0 + (gx1 - gx0) * item.fill);
         if (fx > gx0)
-          dl->AddRectFilled(ImVec2(gx0, gy), ImVec2(fx, gy + 4), IM_COL32(90, 160, 235, 255));
+          dl->AddRectFilled(ImVec2(gx0, gy), ImVec2(fx, gy + 4),
+                            item.fillSwatch ? item.fillSwatch : IM_COL32(90, 160, 235, 255));
       }
     }
     // The key: 1..9 then 0, the number row as it lies under the fingers.

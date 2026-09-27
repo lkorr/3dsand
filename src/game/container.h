@@ -41,6 +41,7 @@
 
 #include "game/item.h"
 #include "math3d.h"
+#include "phys/fillview.h"
 #include "sim/materials.h"
 #include "sim/world.h"
 
@@ -393,6 +394,29 @@ Vec3 ContainerPourPoint(const ItemDef& def, Vec3 from, Vec3 head, Vec3 fwd,
 // there is nowhere to put them.
 bool ContainerIsolateOne(ItemStack* slots, int nSlots, int slot,
                          ItemStack* spill, int nSpill);
+
+// ---- WHAT IS IN IT, VISIBLY (owner, 2026-09-26: "flasks are tinted / contain
+// the color of the thing that they contain ... and the volume of it
+// represented by the % volume") -------------------------------------------
+//
+// The contents' colour as an ImGui/unpackColor swatch (0xAABBGGRR, alpha
+// forced opaque), 0 for an empty vessel. The icon's liquid, the gauges and
+// the held flask all read this one colour.
+uint32_t ContainerFillSwatch(const ItemStack& st,
+                             const std::vector<MaterialDef>& mats);
+// WHAT A VESSEL SHOWS in a hand or on the ground (phys/fillview.h, which owns
+// the view, the word and why the surface is level). Built from the item and
+// what is in it; the holders recompute the word from their rotation.
+using ContainerHeldFill = BodyFillView;
+ContainerHeldFill ContainerHeldFillOf(const ItemDef& def, const ItemInstance& st);
+// The same from a packed fill (ItemInstance::Fill) -- for a holder that keeps
+// the contents beside a def rather than in a stack (Mob::HeldContents).
+ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, uint32_t fill);
+// How brightly the contents glow, 0..1: the material's own `emission`, the
+// one number the held and grounded flask glow by (microbody.wgsl) -- the UI
+// reads it too, so the icon glows exactly when the flask does.
+float ContainerFillGlow(const ItemInstance& st,
+                        const std::vector<MaterialDef>& mats);
 
 // "water 64/128", "empty", for tooltips and the HUD.
 std::string ContainerFillText(const ItemDef& def, const ItemStack& st,

@@ -6818,8 +6818,19 @@ void DebrisSystem::AppendMicroInsts(std::vector<MicroBodyInstGpu>& out) const {
       // No hit flash on debris (it is not a limb anybody can strike into a
       // flash), but the DYE travels: a sleeve cut off a red shirt is still red
       // on the ground. game/dye.h, sim/microbody.h MicroBodyRef::dye.
+      // A vessel's contents ride the same word, levelled against the body's
+      // rotation this frame (phys/fillview.h); a vessel is never dyed.
       out.push_back({(uint32_t)i, bodies_[i].micro.model, 0,
-                     bodies_[i].micro.dye});
+                     bodies_[i].fill.On()
+                         ? BodyFillWord(bodies_[i].fill, bodies_[i].xf.quat)
+                         : bodies_[i].micro.dye});
+}
+
+bool DebrisSystem::SetBodyFill(uint64_t handle, const BodyFillView& f) {
+  const int i = IndexOfHandle(handle);
+  if (i < 0) return false;
+  bodies_[i].fill = f;
+  return true;
 }
 
 void DebrisSystem::AppendMicroHolders(std::vector<MicroHolder>& out) const {

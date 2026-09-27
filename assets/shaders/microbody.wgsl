@@ -148,6 +148,15 @@ struct VSOut {
   // still costs the divergent path on some drivers, and mix() cannot.
   @location(10) @interpolate(flat) dye : vec3f,
   @location(11) @interpolate(flat) dyeOn : f32,
+  // A VESSEL'S CONTENTS (src/phys/fillview.h, which documents the word). A
+  // word with the dye flag CLEAR but not zero is a fill: `fillMat` the
+  // contents' MATERIAL, `fillSlices` the see-through x-slices (0 = no fill,
+  // which is every limb, garment and body that is not a filled flask), and a
+  // cell is under the surface when its centre's height along
+  // `fillPlane.xyz` (world up, in the brick's frame) is at most `fillPlane.w`.
+  @location(12) @interpolate(flat) fillMat : u32,
+  @location(13) @interpolate(flat) fillSlices : i32,
+  @location(14) @interpolate(flat) fillPlane : vec4f,
 };
 
 // ---- THE DYE REFERENCE TONE (src/game/dye.h kDyeRef) ------------------------
@@ -171,6 +180,14 @@ struct VSOut {
 // the engine — measured at 536 s of pipeline compile for eight constants
 // (CLAUDE.md, "What needs a rebuild").
 const DYE_REF : f32 = 0.70;
+
+// game/container.h kHeldFillLevelShift. Here and not in common.wgsl for the
+// same reason DYE_REF is: this is its only reader.
+const HELD_FILL_LEVEL_SHIFT : u32 = 25u;
+// How far a filled cell's glass gives way to the colour of what is in it. Not
+// 1.0: the vessel's own tone (its jitter, a stopper's shadow) still reads
+// through, which is what makes it liquid IN glass rather than a painted band.
+const HELD_FILL_MIX : f32 = 0.8;
 
 // vi in 0..35 -> a corner of the unit box. Every face must wind the SAME way
 // around its own outward normal, or `cullMode: Front` keeps a different subset
@@ -246,6 +263,14 @@ fn vs(@builtin(vertex_index) vi : u32,
   // the CPU packs the dye in that byte order (src/game/dye.h).
   out.dye = unpackColor(dyeBits & 0xFFFFFFu);
   out.dyeOn = select(0.0, 1.0, (dyeBits & 0x1000000u) != 0u);
+  let isFill = (dyeBits & 0x1000000u) == 0u && dyeBits != 0u;
+  out.fillSlices = select(0, i32((dyeBits >> 16u) & 0x7Fu), isFill);
+  out.fillMat = select(0u, dyeBits & 0xFFFu, isFill);
+  // The CPU quantized the surface over +-half the brick's diagonal, 0..127.
+  let halfDiag = 0.5 * length(vec3f(dims));
+  out.fillPlane = vec4f(quatRotateInv(xf.quat, vec3f(0.0, 1.0, 0.0)),
+                        (f32(dyeBits >> HELD_FILL_LEVEL_SHIFT) / 127.0 * 2.0 - 1.0) *
+                            halfDiag);
   out.cut = microBodyCutFaces(m);
   // Payload is 2 voxels per word; the stain lattice sits right after it.
   let cells = u32(dims.x * dims.y * dims.z);
@@ -671,6 +696,25 @@ fn fs(in : VSOut) -> FSOut {
                in.dye * (dot(albedo, vec3f(0.2126, 0.7152, 0.0722)) /
                          DYE_REF),
                in.dyeOn);
+  // A vessel's contents, up to their surface: every see-through cell whose
+  // centre lies at or under the level plane is shaded AS THE CONTENTS'
+  // MATERIAL -- its palette here, and below its emission, burn tint and ember
+  // flicker, through the very functions the hit material goes through. So
+  // lava in a flask glows because lava glows, and whatever glows next will
+  // too; nothing here names a substance. The plane is normal to WORLD up, so
+  // the liquid stays level as the flask tips. fillSlices is 0 for everything
+  // else, so this is one compare there.
+  var shadeMat = mat;
+  var shadeWeight = 1.0;   // how much of this cell's emission is the shade material's
+  let fillH = dot(vec3f(c) + vec3f(0.5) - vec3f(dims) * 0.5, in.fillPlane.xyz);
+  if (c.x < in.fillSlices && fillH <= in.fillPlane.w + 1e-3) {
+    shadeMat = materials[in.fillMat];
+    albedo = mix(albedo, paletteJitter(shadeMat, u32(c.x * 7 + c.y * 13 + c.z * 29)),
+                 HELD_FILL_MIX);
+    // Seen through the glass: the contents' light by the share of the cell
+    // they are, the same share their colour got.
+    shadeWeight = HELD_FILL_MIX;
+  }
 
   // Blood (or whatever else soaked in) OVER the art, before lighting, exactly
   // where the ground applies its own stain: a stain is a change to what the
@@ -702,7 +746,7 @@ fn fs(in : VSOut) -> FSOut {
   // ...and burn-tinted matter breathes toward the flame colour on the same key
   // (burnTint, common.wgsl) before it flickers. No mob material carries the
   // flag today; the rule is that no path may shade emission without it.
-  let bt = burnTint(mat, albedo, f32(mat.emission) / 255.0,
+  let bt = burnTint(shadeMat, albedo, f32(shadeMat.emission) / 255.0 * shadeWeight,
                     burnTintWeightH(fh, R.time));
   albedo = bt.albedo;
   // ...plus a glowing coat's own light (acid), which breathes on its pulse

@@ -1,4 +1,5 @@
 #pragma once
+#include "phys/fillview.h"  // FillCell: a vessel's see-through cells
 #include "sim/scale.h"  // MetresToCells
 #include <cstdint>
 #include <cstring>
@@ -499,6 +500,15 @@ struct ItemDef {
     // anything at this closing speed, or whose velocity jumps by it in one
     // tick, shatters and spills everything it held. 0 = never breaks.
     float breakSpeed = 0.0f;     // world voxels/s
+    // WHERE THE CONTENTS SHOW (ContainerHeldFillWord). The model's first
+    // `fillSlices` x-slices, base (x = 0) up, are the see-through body: a held
+    // vessel tints them in its contents' colour up to the level its fill
+    // reaches. 0 = the contents are not visible (a leather pouch).
+    int fillSlices = 0;
+    // ...and those cells of the model, in brick coordinates, with the brick
+    // they are in: computed once at load (LoadItems), shared by every view.
+    std::shared_ptr<const std::vector<FillCell>> fillCells;
+    IVec3 fillDims{};
   } container;
   bool IsContainer() const {
     return kind == ItemKind::Container && container.capacity > 0;

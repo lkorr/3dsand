@@ -2216,6 +2216,14 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
         if (w.ground)
           ContainerBreakPass(*w.ground, items, phys, debris, w.vesselVel,
                              w.vesselSpills);
+        // ...and every vessel still on the ground or in the air shows what
+        // it holds (render-only, phys/fillview.h). Re-stated every tick, so a
+        // drop, a throw, a load and a peer's announce need no hook of their
+        // own.
+        if (w.ground)
+          for (const WorldItem& wi : w.ground->All())
+            if (const ItemDef* d = items.Of(wi); d && d->IsContainer())
+              debris.SetBodyFill(wi.body, ContainerHeldFillOf(*d, wi));
         for (ContainerSpill& sp : w.vesselSpills) {
           const size_t used = (size_t)fluidCount + fluidSpawns.size();
           const uint32_t room =
@@ -2450,6 +2458,19 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                 s.strikeMirrored = mirror;
                 melee.Reset();
               }
+            }
+            // ...and what each vessel in a hand is showing: its contents'
+            // colour up to their level (render-only, container.h). The
+            // CONTENTS are the kit hand stack's (so a flask knocked from the
+            // hand leaves with them, Mob::ShedGearBeforeDetach), and what they
+            // look like is derived from it.
+            for (int hk = 0; hk < kHands; hk++) {
+              const Hand h = HandAt(hk);
+              const ItemDef* vd = hands.hand[hk].vessel ? hands.hand[hk].item : nullptr;
+              const ItemStack& hs = kit.equip.InHand(h);
+              const bool held = vd != nullptr && !hs.Empty();
+              avatar.SetHeldContents(held ? hs.Fill() : 0u, h);
+              avatar.SetHeldFill(held ? ContainerHeldFillOf(*vd, hs) : ContainerHeldFill{}, h);
             }
             // WHERE THE BLADE IS, so taking control of it is not a teleport:
             // the stroke seeds itself from the live point AND the live hand,

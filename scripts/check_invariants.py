@@ -2457,6 +2457,16 @@ def check_scoop_ledger():
     elif a.group(1) != b.group(1):
         problems.append(f"particle flag: container.h kPFlagMeasured = {a.group(1)} "
                         f"but sim_particle.wgsl PFLAG_MEASURED = {b.group(1)}")
+    # The held vessel's fill level rides the micro-body instance word above
+    # the dye flag; the CPU packs it and microbody.wgsl unpacks it.
+    mb = read("assets/shaders/microbody.wgsl")
+    a = re.search(r"constexpr\s+uint32_t\s+kHeldFillLevelShift\s*=\s*(\d+)", read("src/phys/fillview.h") or "")
+    b = re.search(r"const\s+HELD_FILL_LEVEL_SHIFT\s*:\s*u32\s*=\s*(\d+)u", mb or "")
+    if not a or not b:
+        problems.append("held fill: kHeldFillLevelShift / HELD_FILL_LEVEL_SHIFT not found")
+    elif a.group(1) != b.group(1):
+        problems.append(f"held fill: fillview.h kHeldFillLevelShift = {a.group(1)} "
+                        f"but microbody.wgsl HELD_FILL_LEVEL_SHIFT = {b.group(1)}")
     w = re.search(r"constexpr\s+uint32_t\s+kPageFaultWords\s*=\s*(\d+)", wh)
     e = re.search(r"constexpr\s+uint32_t\s+kPageFaultScoopRefused\s*=\s*(\d+)", wh)
     if w and e and int(e.group(1)) >= int(w.group(1)):

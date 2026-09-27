@@ -10,6 +10,7 @@
 
 #include "game/ai_behavior.h"
 #include "game/anim.h"
+#include "game/container.h"  // ContainerHeldFill: a held vessel's contents
 #include "game/pose.h"     // PoseInputs / PoseDrive: the one pose pipeline (W2-L)
 #include "game/equipment.h"
 #include "game/impact.h"    // StrikeProfile / StrikeEffectorMode: what a blow IS
@@ -2438,6 +2439,21 @@ class Mob {
   float HandCondition(Hand h) const;
   // Can this hand grip anything at all: its part alive, its chain whole.
   bool HandUsable(Hand h) const { return HandCondition(h) > 0.0f; }
+  // WHAT IS IN A HELD VESSEL, PER HAND: its fill (ItemInstance::Fill,
+  // material | eighths << 16), 0 for anything else. The held slot is a def,
+  // not a stack, so the contents ride beside it and go wherever the held item
+  // goes -- out of a hand that is cut off or disarmed (ShedGearBeforeDetach),
+  // up with a corpse that rises, onto the wire, into the loot list. Cleared
+  // whenever that hand changes what it holds. The player's are the kit hand
+  // stacks', set by the session every tick.
+  void SetHeldContents(uint32_t fill, Hand h) { held_[HandIndex(h)].contents = fill; }
+  uint32_t HeldContents(Hand h) const { return held_[HandIndex(h)].contents; }
+  // ...AND WHAT IT SHOWS (phys/fillview.h): drawn level against the held
+  // body's rotation every frame in place of the slot's dye word
+  // (AppendMicroInsts). Render-only and kept OFF the limb, so no path that
+  // turns the held part into an item can mistake it for the item's colour.
+  // The session sets the player's; MobSystem::RefreshHeldFills every NPC's.
+  void SetHeldFill(const ContainerHeldFill& f, Hand h) { held_[HandIndex(h)].fill = f; }
   // WHERE A HELD VESSEL'S CONTENTS LEAVE IT (game/container.h): the point of
   // the held item's own lattice farthest along `dir` (world), at the body's
   // current pose -- the lip of a flask tipped toward what it pours on, so a
@@ -4559,6 +4575,8 @@ class Mob {
     std::string item;
     std::string part;
     Vec3 gripBody{};         // grip point in the item's BODY frame
+    uint32_t contents = 0;   // SetHeldContents
+    ContainerHeldFill fill;  // SetHeldFill; render-only
     void Clear() { *this = HeldHand{}; }
   };
   HeldHand held_[kHands];
@@ -4768,6 +4786,10 @@ class MobSystem {
   }
   void OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
                            const std::vector<ReactionGpu>& reactions);
+  // Every NPC's held vessel shows what it holds (Mob::SetHeldFill), off its
+  // HeldContents and the item library; once a tick from PreTick, so an R
+  // reload of items or materials is picked up the tick after.
+  void RefreshHeldFills();
   // This tick's integer day phase, so a day/night-gated reaction behaves the
   // same on a limb as it does in the grid. Unset means night; see the same
   // setter on DebrisSystem.
