@@ -1,6 +1,7 @@
 #include "game/mob.h"
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
 #include <cmath>
 #include <cstdlib>
@@ -13122,22 +13123,34 @@ uint32_t MobSystem::MissingVoxelCount(uint64_t mobId, int limbIndex) const {
 // question is who PAYS -- the coat does, one level at a time.
 //
 // WHAT A STEP DOES, on one limb, every kHealPeriod ticks while it wears one:
-//   1. THE PURSE. Every voxel wearing a restorative coat contributes
-//      amount x coat.restore world voxels of tissue (x scale^3 lattice cells),
-//      plus the limb's `healCredit` change from last time. The step may use
-//      at most coat.restoreRate world voxels a second of it (the strongest
-//      rate present; at least one cell a step, so a coarse creature whose
-//      rate rounds below a cell still heals).
-//   2. GROW. Recipe cells that are absent and FACE-ADJACENT to flesh that is
-//      there come back as exactly what the recipe says (material, the
-//      positional variant BuildAuthoredLattice gives it, the art slot), nearest
-//      the joint anchor first -- a hole fills from its walls, a stump grows
-//      outward, one layer a step. A cell adjacent only to other missing cells
-//      waits for the layer under it, so nothing is ever grown floating.
-//   3. MEND. Present cells whose material is not the recipe's (cooked,
-//      charred, alight, soaked to the wound material, rotted, blistered by
-//      chlorine) are rewritten to the recipe word, art slot included. Their
-//      coat stays on them: a mend is not a wash.
+//   1. THE PURSE AND THE PACE. Every voxel wearing a restorative coat
+//      contributes amount x coat.restore world voxels of tissue (x scale^3
+//      lattice cells), plus the limb's `healCredit` change from last time.
+//      The step may use coat.restoreRate world voxels a SECOND of it (the
+//      strongest rate present), integrated over the tick count --
+//      floor(r x tick) - floor(r x (tick - period)) cells -- so a rate that
+//      is a fraction of a cell a step still arrives on time, a coarse
+//      creature heals the same VOLUME a second as a fine one, and nothing is
+//      carried between steps. Enchanted blood's 0.1 wv/s is ~51 skin cells a
+//      second on a human: a heavy wound (~3 world voxels: a cooked limb, a
+//      cluster of craters) takes about 30 s, which is the point -- you watch
+//      it knit (the owner, 2026-09-27; it was 1 wv/s and done in 4 s).
+//   2. THE FRONTIER. Two kinds of cell may be rebuilt. GROW: recipe cells
+//      that are absent and FACE-ADJACENT to flesh that is there come back as
+//      exactly what the recipe says (material, the positional variant
+//      BuildAuthoredLattice gives it, the art slot); a cell adjacent only to
+//      other missing cells waits for the layer under it, so nothing is ever
+//      grown floating. MEND: present cells whose material is not the
+//      recipe's (cooked, charred, alight, soaked to the wound material,
+//      rotted, blistered by chlorine) are rewritten to the recipe word, art
+//      slot included; their coat stays on them (a mend is not a wash).
+//   3. THE PICK IS NOISE. The step's few cells are the ones with the lowest
+//      Hash3(creature+limb, tick, cell) among the whole frontier, grow and
+//      mend alike, ties broken by coordinate -- so cells pop back in scattered
+//      across the wound surface and the burnt skin, not as a front marching
+//      out from the joint (which is what the old "nearest the joint first"
+//      drew). Holes still fill from their walls, because only a wall cell is
+//      ever on the frontier.
 //   4. HP. Grown volume is credited as hp exactly as a carve charged it
 //      (RestoreVoxels' formula). A step that found nothing to grow or mend
 //      spends the purse on hp instead, up to the limb's authored hp times the
@@ -13162,9 +13175,15 @@ uint32_t MobSystem::MissingVoxelCount(uint64_t mobId, int limbIndex) const {
 // keeps eating.
 //
 // DETERMINISTIC (rule 1): driven from BurnTick on the tick, keyed by creature
-// and limb, every walk in lattice or recipe order, candidates sorted with a
-// full tie-break, integer cell counts, and the purse arithmetic in doubles
-// done in one fixed order. No float physics state is read.
+// and limb, every walk in lattice or recipe order, the pick an integer hash
+// with a full coordinate tie-break (no float feeds a choice), integer cell
+// counts, and the purse / pace arithmetic in doubles done in one fixed order.
+// No float physics state is read.
+//
+// CHEAP ENOUGH TO RUN TEN TIMES A SECOND: the collider (RebuildLimbBody, a
+// new Jolt body and its joints) is rebuilt only when the step changed the
+// COLLIDER lattice -- on a fine limb a few skin cells rarely flip a majority
+// block, so most steps are a brick re-pack and no physics at all.
 //
 // CPU body state throughout, like every other gore mechanic: not hashed, and
 // the save's content-proven pristine test (LimbIsPristine) sees a fully
@@ -13183,6 +13202,25 @@ struct HealMend {
   uint16_t word;
   uint8_t color;
 };
+// One frontier cell in the pick: its hash, its coordinate (the tie-break; a
+// recipe cell is either absent or present, so (x,y,z) is unique across both
+// lists), and which list it indexes.
+struct HealPick {
+  uint32_t h;
+  int x, y, z;
+  uint32_t mend;  // 0 = grow[i], 1 = mend[i]
+  uint32_t i;
+};
+// Collider-lattice positions, sorted: did a step change the Jolt shape?
+std::vector<uint32_t> HealColliderKeys(const std::vector<DebrisVoxel>& vs) {
+  std::vector<uint32_t> k;
+  k.reserve(vs.size());
+  for (const DebrisVoxel& d : vs)
+    k.push_back(((uint32_t)(uint8_t)d.x << 16) | ((uint32_t)(uint8_t)d.y << 8) |
+                (uint32_t)(uint8_t)d.z);
+  std::sort(k.begin(), k.end());
+  return k;
+}
 }  // namespace
 
 bool Mob::IsHealExempt(uint32_t mat) const {
@@ -13217,7 +13255,6 @@ void Mob::HealTick(uint32_t tick) {
 }
 
 uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
-  (void)tick;
   if (!def_ || li < 0 || li >= (int)limbs_.size() || li >= (int)def_->limbs.size())
     return 0;
   MobLimb& limb = limbs_[li];
@@ -13261,10 +13298,27 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
     limb.healCredit = 0.0f;  // the coat is gone; its change goes with it
     return 0;
   }
-  const double stepCap =
-      std::max(1.0, (double)rate * cellsPerWv * (double)kHealPeriod / 30.0);
-  const uint32_t budget = (uint32_t)std::floor(std::min(stepCap, purse));
+  // THE PACE: restoreRate world voxels a second, integrated over ticks (the
+  // note at the top), so it needs no state and loses no fraction.
+  const double perTick = (double)rate * cellsPerWv / 30.0;
+  const double paced = std::floor(perTick * (double)tick) -
+                       std::floor(perTick * ((double)tick - (double)kHealPeriod));
+  const uint32_t budget = (uint32_t)std::floor(std::min(paced, purse));
   if (budget == 0) return 0;
+  // Diagnostic cost of the step from here (HealStats::stepUs; never read by
+  // anything the tick decides).
+  struct StepClock {
+    HealStats& s;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~StepClock() {
+      const double us = std::chrono::duration<double, std::micro>(
+                            std::chrono::steady_clock::now() - t0)
+                            .count();
+      s.timedSteps++;
+      s.stepUs += us;
+      s.stepUsMax = std::max(s.stepUsMax, us);
+    }
+  } clock{healStats_};
 
   // ---- 2. WHAT IS THERE ---------------------------------------------------
   std::vector<std::pair<uint64_t, uint32_t>> have;
@@ -13364,19 +13418,45 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
       }
     }
     if (!touches) continue;
+    // d2 is carried for the gate's order log only; it decides nothing.
     const float dx = (float)x + 0.5f - root.x, dy = (float)y + 0.5f - root.y,
                 dz = (float)z + 0.5f - root.z;
     grow.push_back({dx * dx + dy * dy + dz * dz, x, y, z, word,
                     folded ? (uint8_t)0 : rv.color, tomb ? at : -1});
   }
-  std::sort(grow.begin(), grow.end(), [](const HealGrow& a, const HealGrow& b) {
-    if (a.d2 != b.d2) return a.d2 < b.d2;
-    if (a.y != b.y) return a.y < b.y;
-    if (a.x != b.x) return a.x < b.x;
-    return a.z < b.z;
-  });
 
-  // ---- 4. SPEND IT: grow, then mend, then hp --------------------------------
+  // ---- 3b. THE PICK: the lowest hashes of the whole frontier ----------------
+  // Keyed by creature and limb, the tick, and the cell's own lattice
+  // coordinate: a fresh scatter every step, the same scatter on every run.
+  const uint32_t seed =
+      ((uint32_t)id_ * 0x9E3779B9u) ^ ((uint32_t)li * 0x85EBCA6Bu) ^ 0x4EA15EEDu;
+  auto cellHash = [&](int x, int y, int z) {
+    return rng::Hash3(rng::Hash3(seed, tick, (uint32_t)x), (uint32_t)y,
+                      (uint32_t)z);
+  };
+  std::vector<HealPick> pick;
+  pick.reserve(grow.size() + mend.size());
+  for (uint32_t i = 0; i < (uint32_t)grow.size(); i++) {
+    const HealGrow& g = grow[i];
+    pick.push_back({cellHash(g.x, g.y, g.z), g.x, g.y, g.z, 0u, i});
+  }
+  for (uint32_t i = 0; i < (uint32_t)mend.size(); i++) {
+    const IVec3 p = v.At(mend[i].idx);
+    pick.push_back({cellHash(p.x, p.y, p.z), p.x, p.y, p.z, 1u, i});
+  }
+  auto pickLess = [](const HealPick& a, const HealPick& b) {
+    if (a.h != b.h) return a.h < b.h;
+    if (a.x != b.x) return a.x < b.x;
+    if (a.y != b.y) return a.y < b.y;
+    if (a.z != b.z) return a.z < b.z;
+    return a.mend < b.mend;
+  };
+  const size_t nPick = std::min<size_t>(budget, pick.size());
+  std::partial_sort(pick.begin(), pick.begin() + (ptrdiff_t)nPick, pick.end(),
+                    pickLess);
+  pick.resize(nPick);
+
+  // ---- 4. SPEND IT: the picked cells, then hp -------------------------------
   uint32_t grown = 0, mended = 0;
   // Of `grown`, the tombstones revived in place. They were never charged (a
   // removal is charged when FlushBurn compacts it), so they are neither hp
@@ -13385,9 +13465,18 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   // cell whole.
   uint32_t revived = 0;
   std::vector<uint64_t> touched;  // cells whose wound-revert entry is now moot
-  IVec3 sparkA{}, sparkB{};       // the first and last cell this step rebuilt
-  for (const HealGrow& g : grow) {
-    if (grown >= budget) break;
+  IVec3 spark{};                  // the first cell this step rebuilt
+  for (const HealPick& pk : pick) {
+    if (pk.mend) {
+      const HealMend& m = mend[pk.i];
+      if (sys_->BurnStageOf(v.Mat(m.idx)) != 0) burnFracDirty_ = true;
+      v.SetWord(m.idx, m.word, m.color);
+      touched.push_back(WoundWasKey(pk.x, pk.y, pk.z));
+      if (grown + mended == 0) spark = IVec3{pk.x, pk.y, pk.z};
+      mended++;
+      continue;
+    }
+    const HealGrow& g = grow[pk.i];
     if (g.tomb >= 0) {
       v.SetWord((size_t)g.tomb, g.word, g.color);
       v.SetStain((size_t)g.tomb, 0);
@@ -13401,24 +13490,17 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
           {(int8_t)g.x, (int8_t)g.y, (int8_t)g.z, g.color, g.word});
     }
     touched.push_back(WoundWasKey(g.x, g.y, g.z));
-    if (grown == 0) sparkA = IVec3{g.x, g.y, g.z};
-    sparkB = IVec3{g.x, g.y, g.z};
+    if (grown + mended == 0) spark = IVec3{g.x, g.y, g.z};
+    if (healStats_.logOrder && healStats_.orderD2.size() < 65536)
+      healStats_.orderD2.push_back(g.d2 / (float)(scale * scale));
     grown++;
   }
-  for (const HealMend& m : mend) {
-    if (grown + mended >= budget) break;
-    if (sys_->BurnStageOf(v.Mat(m.idx)) != 0) burnFracDirty_ = true;
-    v.SetWord(m.idx, m.word, m.color);
-    const IVec3 p = v.At(m.idx);
-    touched.push_back(WoundWasKey(p.x, p.y, p.z));
-    if (grown + mended == 0) sparkA = p;
-    sparkB = p;
-    mended++;
-  }
   uint32_t used = grown + mended;
-  // THE LOOK, and it costs two particles: a mote of the coat itself lifts off
-  // the first and the last cell this step knit, drifts up and falls away
-  // without marking anything (kPFlagDrip, as a wet body's drips). The
+  // THE LOOK, and it costs one particle a step: a mote of the coat itself
+  // lifts off a cell this step knit (the lowest-hash one, so the motes are as
+  // scattered as the cells), drifts up and falls away without marking
+  // anything (kPFlagDrip, as a wet body's drips) -- ten a second while it
+  // works, the rate the old two-a-step at a six-tick period came to. The
   // enchanted liquids are emissive, so a healing wound glitters in their
   // colour while it works and stops when it is done. Positions are taken
   // BEFORE the re-skin below, which may rebase the lattice. CPU-authored
@@ -13426,10 +13508,8 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
   if (used > 0 && strongest != 0 && v.xf) {
     const Quat q{v.xf->quat[0], v.xf->quat[1], v.xf->quat[2], v.xf->quat[3]};
     const float cinv = 1.0f / (float)scale;
-    const IVec3 cells[2] = {sparkA, sparkB};
-    for (int k = 0; k < (used > 1 ? 2 : 1); k++) {
-      if (pendingSpawns_.size() >= kMaxParticleSpawnsPerTick) break;
-      const IVec3 c = cells[k];
+    if (pendingSpawns_.size() < kMaxParticleSpawnsPerTick) {
+      const IVec3 c = spark;
       const Vec3 at = v.xf->pos + Rotate(q, Vec3{((float)c.x + 0.5f) * cinv,
                                                  ((float)c.y + 0.5f) * cinv,
                                                  ((float)c.z + 0.5f) * cinv});
@@ -13494,10 +13574,17 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
 
   // ---- 6. THE LATTICE, THE BRICK, THE BODY ---------------------------------
   if (grown > 0 || mended > 0) {
+    // THE COLLIDER only when its shape moved (the note at the top): a coarse
+    // lattice grew cells into it directly; a fine one re-derives it and asks.
+    bool rebuild = grown > 0 && !fine;
+    const Vec3 restBefore = limb.restOffset;
     if (fine) {
+      std::vector<uint32_t> keysBefore;
+      if (grown > 0) keysBefore = HealColliderKeys(limb.voxels);
       bool overflow = false;
       limb.voxels = DownsampleSkin(limb.skinVoxels,
                                    std::max(1u, skinScale / physScale), &overflow);
+      if (grown > 0 && HealColliderKeys(limb.voxels) != keysBefore) rebuild = true;
     }
     // A cell put back is no longer a soak waiting to revert.
     if (!limb.woundWas.empty() && !touched.empty()) {
@@ -13524,7 +13611,16 @@ uint32_t Mob::HealLimbStep(int li, uint32_t tick) {
     // Art, then collider, the order the carve uses; the burn index points at
     // the old lattice now.
     if (limb.microModel >= 0) ReskinLimbMicro(limb, skinScale, physScale);
-    if (grown > 0) RebuildLimbBody(li);
+    // A brick rebase (growth past its min corner) moved the limb frame: the
+    // collider must follow it even when its own lattice did not change.
+    if (grown > 0 && (limb.restOffset.x != restBefore.x ||
+                      limb.restOffset.y != restBefore.y ||
+                      limb.restOffset.z != restBefore.z))
+      rebuild = true;
+    if (rebuild) {
+      RebuildLimbBody(li);
+      healStats_.bodyRebuilds++;
+    }
     DropBurnIndex(limb.burn);
     limb.carved = true;
     MarkInstancesDirty();
@@ -13658,6 +13754,10 @@ bool Mob::RecipeDiff(int li, uint32_t& missing, uint32_t& differ,
 Mob::HealStats MobSystem::HealStatsOf(uint64_t mobId) const {
   const Mob* m = FindMob(mobId);
   return m ? m->Healed() : Mob::HealStats{};
+}
+
+void MobSystem::LogHealOrder(uint64_t mobId, bool on) {
+  if (Mob* m = const_cast<Mob*>(FindMob(mobId))) m->LogHealOrder(on);
 }
 
 bool MobSystem::LimbRecipeDiff(uint64_t mobId, int limb, uint32_t& missing,

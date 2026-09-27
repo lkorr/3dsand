@@ -6917,25 +6917,50 @@ is who pays -- the coat does, level by level.
 - **Authoring**: `"coat": {"restore": r, "restoreRate": s, "effects":
   ["restore", ...]}`. `restore` is WORLD voxels of tissue one coat level
   rebuilds (x scale^3 lattice cells, so the same splash heals the same volume
-  of any creature -- the argument `coat.depth` makes); `restoreRate` the most
-  a limb rebuilds per second. The tag and the number are required of each
-  other (materials.cpp `ParseCoat`). Enchanted blood 0.005 / 1.0 (2.56 skin cells a level on a human) plus `stanch`
-  and `disinfect`; enchanted water 0.0015 / 0.3, no stanch.
+  of any creature -- the argument `coat.depth` makes); `restoreRate` the
+  WORLD voxels a limb rebuilds per second -- the pace, the same volume a
+  second whatever the creature's skinScale. The tag and the number are
+  required of each other (materials.cpp `ParseCoat`). Enchanted blood 0.005 /
+  0.1 (2.56 skin cells a level, ~51 cells a second on a human) plus `stanch`
+  and `disinfect`, coat.decay 6 s; enchanted water 0.0015 / 0.03, no stanch,
+  coat.decay 8 s.
+- **The pace is slow ON PURPOSE (2026-09-27, the owner: "heal slowly, not
+  instantaneously, so I can watch the voxels noisily rebuild over ~30
+  seconds")**. It was 1 wv/s at a 6-tick period: a crater was whole in
+  20 ticks, a cooked arm in 4 s. At 0.1 wv/s a heavy wound (~3 world voxels:
+  a cluster of craters, a limb's burnt skin) takes ~30 s plus the hp top-up
+  after it (heal-wound: whole in ~35 s). The coat outlasts it: `decay` takes a
+  level off half the coated voxels per period, so a +8 soak lasts ~1.5 min
+  and a +6 douse ~1.2 min (both gates assert the coat is still on the limb
+  when it is whole). Enchanted water's slower heal got a slower dry (3 -> 8 s)
+  for the same reason. A thin splash (1-2 levels) can still dry before it has
+  paid out -- a splash is a splash.
 - **Delivery is every coat door**: the health panel / Apply mode
   (`PourOnBody`, `DouseLimb`), a splash or a thrown flask (splatter), a limb
   bathed in it (contact, `coat.contact`). A healing coat lands on the SURFACE
   only (`SoakLimb`, as corrosive and fuel coats do): it is paid out per level,
   and an interior soak would be a purse many times what the flask held.
-- **A step** (`BurnTick` -> `HealTick`, every `kHealPeriod` = 6 ticks per
+- **A step** (`BurnTick` -> `HealTick`, every `kHealPeriod` = 3 ticks per
   limb, staggered by creature and limb, gated by the coat ledger): (1) the
   purse = sum of amount x restore over the healing-coated voxels + the limb's
-  `healCredit`; the step uses at most `restoreRate` of it (>= 1 cell). (2)
-  GROW recipe cells that are absent and face-adjacent to present flesh,
-  nearest the joint anchor first, as the recipe's exact word (material, the
-  `BuildAuthoredLattice` variant from the authored coordinate, art slot) --
-  holes fill from their walls, stumps grow outward, nothing floats. (3) MEND
-  present cells whose material is not the recipe's (cooked, charred, alight,
-  wound-soaked, rotted, chlorine-blistered) to the recipe word. (4) hp: grown
+  `healCredit`; the PACE is `restoreRate` integrated over ticks,
+  floor(r x tick) - floor(r x (tick - period)) cells (r = rate x scale^3 /
+  30), so a fraction of a cell a step still arrives on time, a coarse creature
+  heals the same volume a second, and no state carries between steps; the
+  step uses min(pace, purse) -- ~5 cells on a human. (2) THE FRONTIER: GROW
+  candidates are recipe cells that are absent and face-adjacent to present
+  flesh (holes fill from their walls, stumps grow outward, nothing floats),
+  rebuilt as the recipe's exact word (material, the `BuildAuthoredLattice`
+  variant from the authored coordinate, art slot); MEND candidates are present
+  cells whose material is not the recipe's (cooked, charred, alight,
+  wound-soaked, rotted, chlorine-blistered). (3) THE PICK IS NOISE: the step
+  takes the candidates -- grow and mend in one pool -- with the lowest
+  `Hash3(creature+limb, tick, cell)`, ties by coordinate, so cells pop back in
+  scattered over the whole wound surface and burnt skin instead of a front
+  from the joint (which "nearest the joint first" drew until 2026-09-27). The
+  heal-restore gate measures it: the first 20% of cells to regrow, ranked by
+  distance to the joint among all that regrew, average ~0.5 (a joint-first
+  front reads ~0.1). (4) hp: grown
   volume is credited as a carve charged it; a step with nothing to grow or
   mend buys hp instead; EVERY credit stops at `hp x BurnHealthCap` -- healing
   raises the cap only by mending burnt tissue (and un-counting `burntAway` as
@@ -6945,9 +6970,15 @@ is who pays -- the coat does, level by level.
   coat is gone). A step that used nothing spends nothing: an idle healing
   coat dries on its own `coat.decay`. (6) the coat's `coat.effects` run on the
   healed limb (`CoatEffectsOn`, report off), so a bath stanches as an Apply
-  does. Brick: `ReskinLimbMicro` + `RebuildLimbBody` (grown) the way a carve
-  re-uploads; coat-only steps poke the stain lattice. Wound-revert entries
-  (`woundWas`) at rebuilt cells are dropped.
+  does. Brick: `ReskinLimbMicro` every step that rebuilt a cell; the Jolt
+  collider (`RebuildLimbBody`) ONLY when the step changed the collider lattice
+  (a coarse limb grew; a fine limb's `DownsampleSkin` flipped a majority
+  block) or the brick rebased (growth past its min corner moves the limb
+  frame) -- a few skin cells rarely flip a block, so most of the ten steps a
+  second are a brick re-pack and no physics. Coat-only steps poke the stain
+  lattice. Wound-revert entries (`woundWas`) at rebuilt cells are dropped.
+  `HealStats` carries the step's wall-clock cost and collider rebuild count
+  (diagnostic; the gates print them).
 - **Tombstones and speckles**: a recipe cell held by a TOMBSTONE (removed by a
   body pass, compaction batched until `FlushBurn`'s threshold) is grown by
   reviving it in place (one pending removal off `burn.removed`, never charged
@@ -6979,16 +7010,21 @@ is who pays -- the coat does, level by level.
   look of their own is a second 8-entry body-only palette (the micro brick's
   coat byte already has four slot bits; world.h has no room reserved) --
   not done.
-- **The look**: a healing step lifts two micro motes of the coat material
-  (emissive) off the first and last cell it rebuilt, flagged `kPFlagDrip` so
-  they fall away without marking the ground. The session's Apply message adds
+- **The look**: a healing step lifts one micro mote of the coat material
+  (emissive) off the first (lowest-hash) cell it rebuilt -- as scattered as
+  the cells, ten a second while it works -- flagged `kPFlagDrip` so it falls
+  away without marking the ground. The session's Apply message adds
   "the flesh begins to knit" (`kRemedyRestore`).
 Gates: `heal-restore` (a crater, a small pour rebuilds <= what its levels buy
-and then stops; a soak brings the limb back to 0 missing / 0 changed and its
-pre-carve hp) and `heal-wound` (a cut + cooked limb doused in enchanted blood:
-the wound closes, cooked cells return, the burn cap rises, hp rises and is
-never above the cap on any tick; enchanted water mends, does not stanch, and
-stays within its levels).
+and then stops; a HEAVY wound -- craters on every side a ray reaches, at two
+heights -- soaked +8 is NOT whole at 5 s, mostly back at 35 s, ends at 0
+missing / 0 changed and its pre-carve hp with the coat still on, every cell
+paid by a level, and its regrowth order scattered) and `heal-wound` (a cut +
+cooked limb doused in enchanted blood: the same 5 s / 35 s pace, the wound
+closes, cooked cells return, the burn cap rises, hp rises and is never above
+the cap on any tick; enchanted water mends, does not stanch, and stays within
+its levels). The pace and scatter thresholds are `heal.*` in
+`tests/baseline.json`.
 
 ### A creature is a variant of another creature (2026-09-15, inheritance + becoming one at runtime 2026-09-20; `src/game/sidecar.*` + `assets/editor/sidecar.js`, sidecar `extends`/`model`/`effects`/`palette`/`turn`, `assets/mobs/effects/`, `BuildMobDef` + `MobDefFactory`, `MobSystem::DefWithEffects`/`TurnMob`, `MobDef::undead`, `MobRotDef`, `Mob::RotAtSpawn`, gates `sidecar-resolve` + `undead` + `zombify`)
 
