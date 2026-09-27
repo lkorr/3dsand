@@ -38,6 +38,7 @@
 // solutes.json (per-particle solute mass), a units LEDGER of every conversion
 // and EVENTS for rules with effects (explode, and the pressure pop/burst).
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <string>
@@ -135,8 +136,55 @@ struct SimConfig {
   // Rest density a particle wants among OTHER substances, as a fraction of
   // its own-substance rest density. < 1 = immiscible (the interface pushes).
   float crossRest = 0.5f;
+  // ...but a particle with almost none of its own kind round it (a stray
+  // drop, same-kind share under this) is not held apart: its rest density
+  // goes back toward its own as the share falls to zero. The repulsion
+  // cleared a cavity twice a lone drop's size, and water plus its cavity
+  // is lighter than oil -- so a shaken drop of water FLOATED in oil, and sat
+  // on top of it, for ever. A body of liquid keeps its sharp edge.
+  float crossLone = 0.25f;
   // Strength of the explicit buoyancy term (see StepLiquid).
   float buoyancy = 2.0f;
+  // THE SORT DRIVE (x gravity): two particles of different liquids with the
+  // heavier ABOVE the lighter are pushed apart vertically -- the heavy one
+  // down, the light one up. Buoyancy against the neighbourhood's mean mass
+  // moves only a pocket's rim (its inside sees its own kind), and a shaken
+  // mix left water jammed between oil for ever; this acts at every inverted
+  // interface, so a trapped pocket always works its way to its layer.
+  // 5: a shaken flask is still jumbled when the hand stops and in its
+  // layers within about ten seconds (lab, 2026-09-27: 1 left ~200 pairs out
+  // of order after 35 s; 8 sorted it while it was still being shaken).
+  float sortDrive = 5.0f;
+  // A vessel whose liquids are still out of order does not sleep (more than
+  // sortAwakePairs inverted pairs, or 1 in 200 of its particles) WHILE THE
+  // COUNT IS STILL FALLING: once it has not improved for sortStallSteps (240
+  // substeps a second: two seconds) what is left is pinned -- a film on the
+  // glass, a ragged edge -- and the vessel may sleep.
+  int sortAwakePairs = 3;
+  int sortStallSteps = 480;
+  // A powder lighter than the liquid under it SPREADS over the surface into
+  // a skin instead of keeping its pile (StepGrains, "floating powder").
+  bool floatSpread = true;
+  // POWDER FLOWS (StepGrains). A grain that slides keeps going (Grain::slide):
+  // down a 1:2 slope and, with way on, a pixel or two across the flat, so a
+  // tipped vessel's surface runs off as an avalanche rather than one grain
+  // at a time down a 45-degree face. A grain with air under it FALLS --
+  // ballistic from grainFallStart px/step, accelerating to grainMaxFall,
+  // carrying its slide sideways as grainSlideSpeed px/step each unit of it
+  // (up to 3), plus up to grainFallJitter either way -- so what runs off a
+  // lip arcs out and spreads instead of dropping as a CA column, a one-pixel
+  // hourglass thread (every grain 1 px behind the last, none ever free); landing
+  // turns grainSplash of its fall into sideways run; one that runs into a
+  // grain still falling follows it instead. A still grain steps down a 1:2
+  // slope with grainSlumpChance a step, so a heap creeps to ~27 degrees
+  // instead of standing at the CA's 45 -- and a neck tipped past that runs.
+  bool grainFlow = true;
+  float grainSlideSpeed = 0.25f;
+  float grainFallJitter = 0.04f;
+  float grainFallStart = 1.0f;
+  float grainSplash = 0.15f;
+  float grainMaxFall = 1.5f;   // px/step: a falling grain's terminal speed
+  float grainSlumpChance = 0.25f;
   float maxSpeedFrac = 0.4f;
   float listSlack = 1.15f;
   float maxVesselStep = 2.0f;  // px a vessel's outline may move per substep (< the glass)
@@ -184,23 +232,57 @@ struct SimConfig {
   int chemEvery = 4;
   float chemRate = 1.0f;
   int chemMaxFires = 600;        // rule firings per chemistry step (bounded)
-  int gasEvery = 2;              // one gas CA step every this many substeps
-  int gasVentSteps = 70;         // gas steps a cloud lingers outside every vessel before it is in the world
+  int gasEvery = 2;              // one gas step every this many substeps
+  // Gas steps a cloud lingers outside every vessel before it starts to thin
+  // into the room (gasFadeLight / gasFadeHeavy of it a step, stochastic):
+  // what spills over a lip is SEEN to pour and creep, then goes into the
+  // world gradually -- never a pixel blinking out.
+  int gasVentSteps = 70;
+  float gasFadeLight = 0.03f;
+  float gasFadeHeavy = 0.015f;
   // GAS IS VOLUMINOUS (owner, 2026-09-27: "the volume of liquid to gas
   // conversion should generally always make more gas"). The gas grid counts
   // in GAS UNITS, `gasExpand` to one unit of matter: one liquid unit (one
-  // pixel of liquid) becomes gasExpand gas units, and a cloud at rest holds
-  // ONE gas unit a pixel -- so vapour takes gasExpand times the room its
-  // liquid did. Every boundary where gas meets matter converts exactly: into
-  // the grid x gasExpand; out of it (a reaction, the vent, a vessel taken off)
-  // through a per-(vessel, gas) BANK that pays whole matter units and keeps
-  // the remainder (under one matter unit) as live gas -- nothing is rounded
-  // away (AuditUnits).
-  int gasExpand = 8;
-  int gasPixelCap = 3200;        // GAS units one pixel holds
-  // Hops a single-unit wisp of HEAVY vapour takes a gas step inside a vessel
-  // (StepGas): how fast a vapour fills its headspace.
-  int gasWanderHops = 4;
+  // pixel of liquid) becomes gasExpand gas units, and a cloud at its NATURAL
+  // VOLUME (pure vapour at one atmosphere) holds `gasRest` units a pixel --
+  // so vapour takes gasExpand / gasRest times the room its liquid did (8).
+  // gasRest is the resolution of a concentration: a haze of vapour mixed
+  // with air is a pixel holding fewer. Every boundary where gas meets matter
+  // converts exactly: into the grid x gasExpand; out of it (a reaction, the
+  // vent, a vessel taken off) through a per-(vessel, gas) BANK that pays
+  // whole matter units and keeps the remainder (under one matter unit) as
+  // live gas -- nothing is rounded away (AuditUnits).
+  int gasExpand = 128;
+  int gasRest = 16;
+  int gasPixelCap = 51200;       // GAS units one pixel holds (3200 natural volumes)
+  // ---- THE GAS FLOW (flaskchem.cpp StepGas) --------------------------------
+  // A grid fluid (Stam 1999 "Stable Fluids"; Bridson, "Fluid Simulation for
+  // Computer Graphics"; the method of Sebastian Lague's "Simulating Smoke"):
+  // a MAC velocity grid of 2x2-pixel cells over the air round the gas, one
+  // air -- the gas is carried in it. Per gas step: buoyancy (a heavy vapour's
+  // concentration pulls its air down, a light gas's lifts it; hot glass
+  // lifts), vorticity confinement, semi-Lagrangian self-advection, and a
+  // pressure projection (red-black SOR) with glass, grains and liquid as
+  // walls. Gas BORN (evaporation, a reaction) is a volume source: fresh
+  // vapour pushes the air out of the mouth and itself follows. The gas units ride the velocity by upwind face fluxes
+  // (integer, stochastically rounded: exact), so a flask fills from its
+  // liquid up, brims, and a heavy vapour pours over the lip and down the glass.
+  // Velocities are px per gas step.
+  float gasBuoyancy = 0.3f;      // px/step^2 at one natural volume (x the gas's own weight)
+  float gasHeatLift = 0.02f;     // px/step^2 by hot glass (x heat), near the glass
+  float gasVorticity = 0.25f;    // vorticity confinement strength
+  float gasDamping = 0.005f;     // velocity lost a step
+  float gasExpandRate = 1.0f;    // share of a new gas's volume that pushes the air (1: all of it)
+  float gasExcessDiffuse = 0.2f; // share of a pixel's excess over its natural volume passed on a step
+  float gasMaxSpeed = 0.9f;      // px per gas step, any face (the transport's CFL)
+  float gasDiffuse = 0.04f;      // molecular diffusion (a share of a difference a step)
+  // EVAPORATION SATURATES out of glass: a liquid surface sees AIR only where
+  // the vapour over it is thinner than this fraction of its natural volume
+  // (GatherParticleNbrs; in a vessel the vessel-wide count decides).
+  float gasSaturate = 0.9f;
+  int gasPressureIters = 30;
+  float gasSor = 1.7f;
+  float gasJitter = 0.02f;       // random push a step where gas is, px/step (turbulence)
   // THE BURNER. Heat 0..1 rises while it is on and the vessel stands on the
   // table (its base within burnerReach px of tableY), and falls off after.
   float heatRiseSec = 2.5f;
@@ -284,6 +366,8 @@ class FlaskSim {
   float Pressure(int v) const;
   float PressureFraction(int v) const { return Pressure(v) / std::max(1e-6f, cfg_.popAt); }
   int GasExpand() const { return GasE(); }
+  // Gas units a pixel holds at the gas's natural volume (SimConfig::gasRest).
+  int GasRest() const { return GasR(); }
   // For gates: inside pixels of vessel v holding gas, and inside pixels that
   // are AIR (no glass, grain, gas or liquid) -- what a surface can evaporate into.
   int GasPixelsIn(int v) const;
@@ -381,6 +465,24 @@ class FlaskSim {
   std::vector<float> MeanHeights() const;
   // For gates: how many particles/grains are moving faster than `speed`.
   int MovingCount(float speed) const;
+  // For gates: a vessel's out-of-order liquid pairs at the last liquid step
+  // (a heavier liquid over a lighter one), what keeps it awake to re-sort.
+  int InvertedPairs(int v) const { return vessels_[v].inverted; }
+  // For gates: the box the grains of slot `sub` occupy, {x0, x1, y0, y1}
+  // in grid pixels ({-1,-1,-1,-1} for none): a floating heap is narrow and
+  // tall, a skin wide and flat.
+  std::array<int, 4> GrainBox(int sub) const {
+    std::array<int, 4> r{-1, -1, -1, -1};
+    for (const Grain& g : grains_)
+      if (g.sub == sub) {
+        const bool first = r[0] < 0;
+        r[0] = first ? g.x : std::min(r[0], (int)g.x);
+        r[1] = std::max(r[1], (int)g.x);
+        r[2] = first ? g.y : std::min(r[2], (int)g.y);
+        r[3] = std::max(r[3], (int)g.y);
+      }
+    return r;
+  }
   // The vessel under a point: inside its outline or within `slack` px of its
   // glass; the most recently added wins (it is drawn on top). -1 for none.
   int HitVessel(V2 p, float slack = 6.0f) const;
@@ -412,6 +514,9 @@ class FlaskSim {
     // its own enters its box.
     bool asleep = false;
     int quiet = 0;
+    int inverted = 0;         // out-of-order liquid pairs, last liquid step (StepLiquid)
+    int invBest = INT32_MAX;  // fewest seen since it was last disturbed (UpdateSleep)
+    int sortStall = 0;        // steps since `inverted` last beat invBest
     bool grainBusy = false;   // a grain inside it moved this step
     // ---- chemistry devices (flaskchem.cpp) ----
     bool stoppered = false;
@@ -420,6 +525,7 @@ class FlaskSim {
     int shock = 0;            // chemistry steps of discharge left
     bool broken = false;      // burst: gone, its contents loose
     V2 vel;                   // px / step (the motion profile, Step)
+    V2 carryRem;              // the grain carry's sub-pixel remainder (CarryGrains)
     float angVel = 0;         // rad / step
     float reach = 1;          // farthest outline point from the pose origin
     std::vector<V2> outline;  // local, left lip -> bottom -> right lip
@@ -445,6 +551,10 @@ class FlaskSim {
     // where a grain already in the glass is, it can read as outside.
     int8_t home = -1;
     uint8_t chem = 0;      // chemistry step it last changed on (low byte)
+    // Way on a resting grain (SimConfig::grainFlow): the sign is the way it
+    // is sliding, the size (1..3) how many steps it has kept sliding. A step
+    // it does not move clears it.
+    int8_t slide = 0;
   };
 
   void BuildOutline(Vessel& v, bool raster = true) const;
@@ -490,6 +600,7 @@ class FlaskSim {
   uint32_t BankGas(int bin, int slot, uint32_t gasUnits);
   int GasBin(int hv) const { return hv >= 0 && hv < (int)vessels_.size() ? hv + 1 : 0; }
   int GasE() const { return std::max(1, cfg_.gasExpand); }
+  int GasR() const { return std::max(1, cfg_.gasRest); }
   // An entity's matter in GAS units (a particle or grain x gasExpand).
   int64_t FineOf(uint8_t type, int idx) const;
   void ReleaseSolute(int i, int hv);
@@ -517,12 +628,19 @@ class FlaskSim {
   void UpdateGrainHomes();
   void UpdateSleep();
   void Partition();
-  bool SweepChain(int gi, const Vessel& v, bool wantIn);
+  // `glassReach`: how far (Manhattan px from the grain) the search may run
+  // through glass; the wider retry is for a grain deep in the band.
+  bool SweepChain(int gi, const Vessel& v, bool wantIn, int glassReach = 2);
   bool PoseClear(const Vessel& v, const Xform& x) const;
   bool GrainFree(int x, int y) const;
   // `within` as AddGasAt's: a reaction's product is placed only on its own
   // side of the glass (the ring search reaches 4 px, the wall is ~3.5).
   bool PlaceGrain(Grain g, int nearX, int nearY, int within = -2);
+  // PlaceGrain, then -- for a DEPOSIT (a reaction's powder, a pool
+  // flushing), which lands where its source was, often buried in a pile --
+  // the nearest free pixel on the same side of the glass out to
+  // kDepositReach.
+  bool PlaceDeposit(Grain g, int nearX, int nearY, int within);
   void BuildCells();
   void BucketPixels();
   float LiquidMassAt(int x, int y, int* count, V2* vel) const;
@@ -655,7 +773,55 @@ class FlaskSim {
   int evapFires_ = 0, evapBuried_ = 0;
   std::vector<int> chemHead_, chemNext_, chemTouched_;   // particles by pixel
   std::vector<uint8_t> present_, activeSlot_;
+  // Per vessel, its gas in per-mille of an atmosphere as of this chemistry
+  // step's start: from 970 (stoppered; 1100 open) it evaporates nothing (GatherParticleNbrs), from
+  // 900 a heavy vapour spills over its lip (StepGas).
+  std::vector<int> vesselAir_;
   std::vector<uint8_t> grainDead_;      // grains a chemistry step removed (compacted at its end)
+  // THE GAS FLOW (StepGas): a MAC grid of kGasCell-pixel cells, velocities
+  // in px per gas step. Only the cells in the ACTIVE BOX (round the gas, and
+  // every vessel holding some) are stepped; everything outside it is still
+  // air at zero pressure.
+  static constexpr int kGasCell = 1;
+  int gcW_ = 0, gcH_ = 0;
+  std::vector<float> gu_, gv_;          // (gcW+1) x gcH, gcW x (gcH+1)
+  std::vector<float> gu2_, gv2_;        // advection scratch
+  std::vector<float> gp_;               // pressure, warm-started
+  std::vector<float> gRhs_;             // over the padded box
+  std::vector<V2> gcSolidV_;            // a solid cell's velocity (world frame)
+  std::vector<uint8_t> gcFrame_;        // the vessel (index + 1) a cell's air is inside, 0 none
+  std::vector<float> gcDen_;            // natural volumes of gas per free pixel
+  std::vector<float> gcBirth_;          // gas units born in the cell since the last gas step (Deposit)
+  std::vector<float> gcBuoy_;           // buoyant acceleration, px/step^2 (+ up)
+  std::vector<int> gcComp_, gcQueue_;   // over the padded box
+  std::vector<uint8_t> gLf_;            // the padded box: 0 air, 1 solid, 2 open
+  std::vector<float> gLp_, gInv_;       // padded-box pressure; 1 / neighbour count per air cell
+  std::vector<int> gRed_;               // air cells, red then black
+  std::vector<V2> gConf_;               // vorticity confinement force per box cell
+  std::vector<float> gcCurl_;
+  // THE LOOK's advected texture (Neyret 2003, "Advected Textures"): two
+  // layers of texture coordinates per cell (x, y each), carried by the
+  // velocity and reset to the cell's own position in turn, half a period
+  // apart -- the wisps move WITH the gas and stand still when it does.
+  static constexpr int kTexCell = 4;
+  int gtW_ = 0, gtH_ = 0;
+  std::vector<float> gtc_;              // 5 per texel: layer A (x, y), layer B (x, y), phase
+  std::vector<float> gtcOld_;
+  uint32_t gtcStep_ = 0;
+  std::vector<uint8_t> liqPx_;          // pixels liquid holds (the gas's walls)
+  std::vector<V2> liqCellV_;            // mean liquid velocity per cell (world)
+  std::vector<float> liqCellN_;
+  std::vector<V2> gasPrevVel_;          // per vessel: its velocity at the last gas step
+  std::vector<Xform> gasPrevPose_;      // per vessel: its pose at the last gas step
+  int gbx0_ = 0, gby0_ = 0, gbx1_ = -1, gby1_ = -1;   // the active box, cells
+  struct GasMove { int from, to; uint16_t n; uint8_t sub, age; };
+  std::vector<GasMove> gasMoves_;
+  void EnsureGasFlow();
+  void StepGasFlow(int bx0, int by0, int bx1, int by1);
+  // A face velocity at a point (px), bilinear; `from` another field of the same shape.
+  float SampleGu(float x, float y, const float* from = nullptr) const;
+  float SampleGv(float x, float y, const float* from = nullptr) const;
+  void RenderGas(std::vector<uint32_t>& out) const;
   std::vector<uint32_t> gasMark_;       // gas pixels a gas step already moved into (its stamp)
   uint32_t gasStamp_ = 0;
   std::vector<int> gasOrder_;
@@ -666,6 +832,7 @@ class FlaskSim {
   mutable uint32_t shardStep_ = 0;
   mutable std::vector<float> rGas_;
   mutable std::vector<uint8_t> rGasSub_;
+  mutable std::vector<float> rGasTmp_;
   void BucketChem();
   std::vector<ChemNb> nbScratch_;
   uint32_t chemStep_ = 0;

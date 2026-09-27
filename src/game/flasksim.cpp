@@ -721,12 +721,36 @@ void FlaskSim::StepLiquid() {
     float mi = mass_[psub_[i]];
     pv_[i].y -= g * (1.f + buoy * (mi - mbar_[i]) / mi);
   }
+  // The sort drive (SimConfig::sortDrive) rides the same pair loop, and
+  // counts each vessel's inverted pairs for UpdateSleep.
+  for (Vessel& v : vessels_) v.inverted = 0;
+  const float sortF = cfg_.sortDrive * g;
+  const float invDy = spacing_ * 0.5f;
   for (const auto& pr : pairs_) {
     {
       const int i = pr.first, j = pr.second;
       V2 d = px_[j] - px_[i];
       float r = Len(d);
       if (r <= 1e-5f || r >= h) continue;
+      if (psub_[i] != psub_[j] && !subs_[psub_[i]].powder && !subs_[psub_[j]].powder) {
+        const float mi = mass_[psub_[i]], mj = mass_[psub_[j]];
+        if (std::fabs(mi - mj) > 0.01f * std::min(mi, mj)) {
+          // Heavy above light? `up` is how far the heavy one sits above.
+          const bool iHeavy = mi > mj;
+          const float up = iHeavy ? -d.y : d.y;
+          if (up > 0) {
+            const float f = sortF * (1 - r / h) * (up / r);
+            const float mh = iHeavy ? mi : mj, ml = iHeavy ? mj : mi;
+            const float dvh = f * ml / (mh + ml), dvl = f * mh / (mh + ml);
+            pv_[iHeavy ? i : j].y -= dvh;
+            pv_[iHeavy ? j : i].y += dvl;
+            if (up > invDy) {
+              const int hv = phome_[i];
+              if (hv >= 0 && hv < (int)vessels_.size() && hv == phome_[j]) vessels_[hv].inverted++;
+            }
+          }
+        }
+      }
       V2 rn = d * (1.f / r);
       float u = Dot(pv_[i] - pv_[j], rn);
       if (u <= 0) continue;
@@ -786,7 +810,10 @@ void FlaskSim::StepLiquid() {
     // A particle whose neighbours are other substances wants fewer of them:
     // its rest density drops toward crossRest, so the interface pushes.
     float same = rho > 1e-6f ? rhoSame / rho : 1.f;
-    float rest = rho0_ * (same + crossRest * (1 - same));
+    const float cross = cfg_.crossLone > 0 && same < cfg_.crossLone
+                            ? 1.0f + (crossRest - 1.0f) * (same / cfg_.crossLone)
+                            : crossRest;
+    float rest = rho0_ * (same + cross * (1 - same));
     float P = k * (rho - rest);
     // Only the first pass PULLS (a negative P is Clavet's cohesion). The
     // second is there to hold up the bottom of a deep column, which is all
@@ -1160,6 +1187,43 @@ bool FlaskSim::PlaceGrain(Grain g, int nx, int ny, int within) {
   return false;
 }
 
+// A powder PRODUCT appears where what made it was: salt refreezing out of
+// molten salt at the bottom of a pile over the burner. That spot is buried,
+// PlaceGrain's 4-px ring is full, and the units went to a pool whose centroid
+// stayed buried -- counted in the tally, drawn nowhere, retried every step
+// (half a flask of salt vanished that way, 2026-09-27). Past the ring, the
+// nearest free pixel inside the same vessel: the grain surfaces at the edge
+// or top of the pile and falls from there. Ring perimeters only, so a vessel
+// that is genuinely full costs ~8*R^2/2 probes, once per flush.
+bool FlaskSim::PlaceDeposit(Grain g, int nx, int ny, int within) {
+  if (PlaceGrain(g, nx, ny, within)) return true;
+  constexpr int kDepositReach = 64;
+  const int W = cfg_.gridW;
+  auto tryAt = [&](int x, int y) {
+    if (!GrainFree(x, y)) return false;
+    if (within >= -1 && inside_[(size_t)y * W + x] != (uint8_t)(within + 1)) return false;
+    g.x = (int16_t)x;
+    g.y = (int16_t)y;
+    g.fx = x + 0.5f;
+    g.fy = y + 0.5f;
+    g.vx = g.vy = 0;
+    grains_.push_back(g);
+    grid_[(size_t)y * W + x] = (int)grains_.size();
+    if (!awake_.empty()) Wake(x, y);
+    return true;
+  };
+  for (int r = 5; r <= kDepositReach; r++) {
+    // Top row first (a pile surfaces upward), then the sides, then the bottom.
+    for (int dx = -r; dx <= r; dx++)
+      if (tryAt(nx + dx, ny + r)) return true;
+    for (int dy = r - 1; dy > -r; dy--)
+      if (tryAt(nx - r, ny + dy) || tryAt(nx + r, ny + dy)) return true;
+    for (int dx = -r; dx <= r; dx++)
+      if (tryAt(nx + dx, ny - r)) return true;
+  }
+  return false;
+}
+
 int FlaskSim::EmitGrains(int sub, V2 at, int units, V2 vel) {
   int placed = 0;
   for (int k = 0; k < units; k++) {
@@ -1346,7 +1410,11 @@ void FlaskSim::StepGrains() {
       int cnt;
       V2 lv;
       LiquidMassAt(g.x, g.y, &cnt, &lv);
+      // Gravity takes it to grainMaxFall and no further; a grain already
+      // going faster (it left a vessel moving down faster) keeps its speed.
+      const float vy0 = g.vy;
       g.vy -= cfg_.gravity;
+      if (cfg_.grainFlow) g.vy = std::max(g.vy, std::min(vy0, -cfg_.grainMaxFall));
       if (cnt) {
         float drag = 0.25f;
         g.vx += (lv.x - g.vx) * drag;
@@ -1364,16 +1432,52 @@ void FlaskSim::StepGrains() {
       // Walk pixel by pixel toward the target; stop at the first blocked one.
       int steps = (int)std::ceil(std::max(std::fabs(g.vx), std::fabs(g.vy)));
       bool blocked = false;
+      int blocker = -1;   // the grain it ran into, if one
       for (int s = 1; s <= steps; s++) {
         float t = (float)s / steps;
         int tx = (int)std::floor(g.fx + g.vx * t), ty = (int)std::floor(g.fy + g.vy * t);
         if (ty >= H) ty = H - 1;
         if (tx == g.x && ty == g.y) continue;
-        if (!GrainFree(tx, ty)) { blocked = true; break; }
+        if (!GrainFree(tx, ty)) {
+          blocked = true;
+          if (tx >= 0 && ty >= 0 && tx < W) blocker = grid_[(size_t)ty * W + tx] - 1;
+          break;
+        }
         MoveGrain(gi, tx, ty);
+      }
+      // IN A STREAM: it ran into a grain that is itself falling. That is not
+      // a landing -- it follows it, taking on its speed. Landed on (and
+      // splashed off, below), the grains of one pour kicked each other out
+      // sideways in mid-air and the stream smoked into a spray.
+      if (blocked && cfg_.grainFlow && blocker >= 0) {
+        const Grain& b = grains_[blocker];
+        // (A resting grain with air under it is falling too, by the CA.)
+        // Air under it, not liquid: a grain floating in the water's top pixel
+        // has nothing but grain-free liquid under it and is not falling --
+        // taken for falling, the grain on it followed it for ever and the
+        // vessel never slept.
+        int cbl = 0;
+        if (b.vx == 0 && b.vy == 0) LiquidMassAt(b.x, b.y - 1, &cbl, nullptr);
+        const bool bFalls = b.vx == 0 && b.vy == 0 && !cbl && GrainFree(b.x, b.y - 1);
+        if (b.vx != 0 || b.vy != 0 || bFalls) {
+          g.vx = 0.5f * (g.vx + b.vx);
+          g.vy = std::max(g.vy, bFalls ? -1.0f : b.vy);
+          if (g.vx == 0 && g.vy == 0) g.vy = -cfg_.gravity;
+          g.fx = g.x + 0.5f;
+          g.fy = g.y + 0.5f;
+          continue;
+        }
       }
       if (blocked) {
         g.vx *= 0.3f;
+        // LANDING: a falling grain that hits something turns part of its
+        // fall into a run sideways -- its own way, or either at random if it
+        // came straight down -- so a stream builds a spreading heap that
+        // cascades, not a spike.
+        if (cfg_.grainFlow && g.vy < -0.3f) {
+          const float side = std::fabs(g.vx) > 0.05f ? (g.vx > 0 ? 1.f : -1.f) : ((Rand() & 1) ? 1.f : -1.f);
+          g.vx += side * -g.vy * cfg_.grainSplash;
+        }
         g.vy = 0;
         g.fx = g.x + 0.5f;
         g.fy = g.y + 0.5f;
@@ -1382,6 +1486,8 @@ void FlaskSim::StepGrains() {
         g.fy = std::min(ny, H - 0.5f);
       }
       if (std::fabs(g.vx) + std::fabs(g.vy) < 0.35f && (blocked || !GrainFree(g.x, g.y - 1))) {
+        // Comes to rest still sliding the way it was going.
+        g.slide = (int8_t)(std::fabs(g.vx) > 0.08f ? (g.vx > 0 ? 2 : -2) : 0);
         g.vx = g.vy = 0;
         g.fx = g.x + 0.5f;
         g.fy = g.y + 0.5f;
@@ -1407,6 +1513,31 @@ void FlaskSim::StepGrains() {
       }
       continue;
     }
+    // (One pass through the rules; each `continue` below ends it, and the
+    // grain's way is booked after.)
+    const int ox = g.x, oy = g.y, s0 = g.slide;
+    g.slide = 0;
+    do {
+    // FREE FALL: air under it and around it, and it drops -- ballistic
+    // (the flung branch), carrying its slide sideways, so a stream leaving a
+    // lip spreads and accelerates as poured powder does. In liquid it
+    // settles by the CA below instead.
+    if (cfg_.grainFlow && GrainFree(g.x, g.y - 1)) {
+      int cb, cs;
+      LiquidMassAt(g.x, g.y - 1, &cb, nullptr);
+      LiquidMassAt(g.x, g.y, &cs, nullptr);
+      if (!cb && !cs) {
+        // (Relative to its vessel, if it is in one: CarryGrains moves it with
+        // the vessel as well.)
+        const float jit = ((float)(Rand() & 1023) / 511.5f - 1.f) * cfg_.grainFallJitter;
+        g.vx = (float)s0 * cfg_.grainSlideSpeed + jit;
+        g.vy = -cfg_.grainFallStart;
+        g.fx = g.x + 0.5f;
+        g.fy = g.y + 0.5f;
+        Wake(g.x, g.y);
+        continue;
+      }
+    }
     // Lighter than the liquid ABOVE it: it rises into that pixel and the
     // liquid takes its place (MoveGrain shoves it down). Asking the pixel
     // above rather than its own is what lets a buried bed invert: liquid
@@ -1428,7 +1559,33 @@ void FlaskSim::StepGrains() {
       int c;
       float ml = LiquidMassAt(tx, ty, &c, nullptr);
       if (c) {
-        if (ml >= mg) return false;  // floats on it
+        if (ml >= mg) {
+          // FLOATING POWDER SPREADS. It floats on this liquid -- but a grain
+          // coming DOWN A SLOPE (diagonally, from air) may settle into the
+          // liquid's TOP pixel (air over it), as powder poured on water
+          // spreads into a skin instead of standing as a 45-degree heap.
+          // Never deeper than the top row: a grain already in the liquid, or
+          // a pixel with liquid over it, is refused. Half the steps wait (a
+          // skin creeping out, not a splash), keeping the tile awake.
+          if (!cfg_.floatSpread || tx == g.x) return false;
+          // How far under the liquid's top the target is: liquid pixels
+          // over it in its column, up to air. The field is a smoothed splat,
+          // so its top reaches a pixel or so over the particles; the top two
+          // rows count as the surface. A grain over it is not open surface
+          // (a skin grain slipping under its neighbour churned for ever).
+          int depth = 0;
+          for (int yy = ty + 1; yy < H && depth <= 2; yy++) {
+            if (grid_[(size_t)yy * W + tx]) { depth = 99; break; }
+            int cl;
+            LiquidMassAt(tx, yy, &cl, nullptr);
+            if (!cl) break;
+            depth++;
+          }
+          if (depth > 1) return false;
+          if (Rand() & 1) { Wake(g.x, g.y); return true; }
+          MoveGrain(gi, tx, ty);
+          return true;
+        }
         float p = std::clamp(1.f - ml / mg, 0.05f, 1.f) * 0.6f;
         // viscosity of the liquid below: the heaviest-weighted guess is
         // the pixel's first particle, good enough for a settling rate.
@@ -1440,10 +1597,88 @@ void FlaskSim::StepGrains() {
       return true;
     };
     if (trySink(g.x, g.y - 1)) continue;
-    int d = (Rand() & 1) ? 1 : -1;
+    // A sliding grain tries its own way first.
+    int d = s0 ? (s0 > 0 ? 1 : -1) : ((Rand() & 1) ? 1 : -1);
+    // A FLOATING PILE SLUMPS. A heap on water has no friction under it, so
+    // its slope lies at 1:2, not the 1:1 of a heap on the ground: a grain in
+    // a floating pile (its column reaches, through grains, a liquid heavier
+    // than it) steps sideways into open air when the slope goes on down
+    // two pixels out -- and the diagonal fall carries it from there. Air to
+    // air, so it shoves no liquid; it stops once every slope is 1:2, so the
+    // pile settles and sleeps.
+    if (cfg_.floatSpread) {
+      bool floating = false;
+      for (int yy = g.y - 1, n = 0; yy >= 0 && n < 12; yy--, n++) {
+        if (grid_[(size_t)yy * W + g.x]) continue;
+        int cl;
+        const float ml = LiquidMassAt(g.x, yy, &cl, nullptr);
+        floating = cl && ml > mg;
+        break;
+      }
+      if (floating) {
+        int to = INT32_MIN;
+        for (int t = 0; t < 2 && to == INT32_MIN; t++) {
+          const int dd = t ? -d : d, tx = g.x + dd;
+          if (!GrainFree(tx, g.y) || !GrainFree(tx + dd, g.y - 1)) continue;
+          int ch, cf, ca;
+          LiquidMassAt(tx, g.y, &ch, nullptr);
+          if (ch) continue;   // the step is into air, never along under the surface
+          // Two out and one down: air, or the liquid's top (air over it).
+          LiquidMassAt(tx + dd, g.y - 1, &cf, nullptr);
+          LiquidMassAt(tx + dd, g.y, &ca, nullptr);
+          if (cf && ca) continue;
+          to = tx;
+        }
+        if (to != INT32_MIN) {
+          if ((Rand() & 3) == 0) { MoveGrain(gi, to, g.y); continue; }
+          Wake(g.x, g.y);   // waiting, not settled: keep the tile awake
+        }
+      }
+    }
     if (!GrainFree(g.x + d, g.y) && !GrainFree(g.x - d, g.y)) continue;
     if (GrainFree(g.x + d, g.y) && trySink(g.x + d, g.y - 1)) continue;
-    if (GrainFree(g.x - d, g.y)) trySink(g.x - d, g.y - 1);
+    if (GrainFree(g.x - d, g.y) && trySink(g.x - d, g.y - 1)) continue;
+    // SLUMP AND SLIDE (air only; the floating pile has its own rule above).
+    // No diagonal is open: step sideways where the slope goes on down one in
+    // two -- always when already sliding that way, else with
+    // grainSlumpChance -- or, with way on (2+), across the flat.
+    if (cfg_.grainFlow && g.x == ox && g.y == oy) {
+      for (int t = 0; t < 2; t++) {
+        const int dd = t ? -d : d, tx = g.x + dd;
+        if (!GrainFree(tx, g.y)) continue;
+        int ch;
+        LiquidMassAt(tx, g.y, &ch, nullptr);
+        if (ch) continue;
+        // The slope goes on down into AIR: over liquid the floating rules
+        // above own what a grain does (a slump onto the water walked a skin
+        // grain about the surface for ever and it never slept).
+        int cd;
+        LiquidMassAt(tx + dd, g.y - 1, &cd, nullptr);
+        const bool slope = GrainFree(tx + dd, g.y - 1) && !cd;
+        const bool way = s0 * dd > 0;
+        const bool go = slope ? (way || (float)(Rand() & 1023) < cfg_.grainSlumpChance * 1024.f)
+                              : s0 * dd >= 2;
+        if (!go) {
+          if (slope) Wake(g.x, g.y);   // may go next step: keep the tile awake
+          continue;
+        }
+        MoveGrain(gi, tx, g.y);
+        break;
+      }
+    }
+    } while (false);
+    // THE GRAIN'S WAY: a sideways or diagonal move builds it (to 3), a step
+    // across the level or straight down spends one, standing
+    // still loses it.
+    if (cfg_.grainFlow && g.vx == 0 && g.vy == 0) {
+      if (g.x != ox) {
+        const int dir = g.x > ox ? 1 : -1;
+        const int mag = s0 * dir > 0 ? std::abs(s0) : 0;
+        g.slide = (int8_t)(dir * (g.y < oy ? std::min(3, mag + 1) : std::max(1, mag - 1)));
+      } else if (g.y != oy) {
+        g.slide = (int8_t)(s0 - (s0 > 0) + (s0 < 0));
+      }
+    }
   }
 
   if (!dead.empty()) {
@@ -1590,6 +1825,8 @@ void FlaskSim::UpdateSleep() {
     }
     if (disturbed) {
       v.quiet = 0;
+      v.invBest = INT32_MAX;   // a fresh shake starts the count again
+      v.sortStall = 0;
       continue;
     }
     // Awake and undisturbed: has its liquid STOPPED CHANGING THE PICTURE?
@@ -1607,6 +1844,24 @@ void FlaskSim::UpdateSleep() {
     if (grainsBusy) {
       v.quiet = 0;
       continue;
+    }
+    // LIQUIDS OUT OF ORDER: a heavier one still over a lighter one. However
+    // still the picture is, it is not settled while the sort drive is still
+    // bringing it toward its layers -- so it stays awake while the count of
+    // inverted pairs keeps falling (sortStallSteps without a new low = done).
+    if (v.inverted < v.invBest) {
+      v.invBest = v.inverted;
+      v.sortStall = 0;
+    } else {
+      v.sortStall++;
+    }
+    if (v.inverted > cfg_.sortAwakePairs && v.sortStall < cfg_.sortStallSteps) {
+      int cnt = 0;
+      for (int i = 0; i < nAct_; i++) cnt += phome_[i] == (int)vi;
+      if (v.inverted * 200 > cnt) {
+        v.quiet = 0;
+        continue;
+      }
     }
     if (v.quiet++ == 0) {
       for (int i = 0; i < nAct_; i++)
@@ -1643,9 +1898,19 @@ void FlaskSim::UpdateSleep() {
 
 void FlaskSim::UpdateGrainHomes() {
   const int W = cfg_.gridW;
+  const int nv = (int)vessels_.size();
   for (Grain& g : grains_) {
     if (wall_[(size_t)g.y * W + g.x]) continue;   // in glass: keep the last
-    g.home = (int8_t)((int)inside_[(size_t)g.y * W + g.x] - 1);
+    const int8_t nh = (int8_t)((int)inside_[(size_t)g.y * W + g.x] - 1);
+    // A flung grain's velocity is in its home vessel's frame (CarryGrains
+    // moves it with the vessel): changing home, it changes frame -- out of a
+    // swung vessel it leaves with the vessel's velocity added.
+    if (cfg_.grainFlow && nh != g.home && (g.vx != 0 || g.vy != 0)) {
+      if (g.home >= 0 && g.home < nv) { g.vx += vessels_[g.home].vel.x; g.vy += vessels_[g.home].vel.y; }
+      if (nh >= 0 && nh < nv) { g.vx -= vessels_[nh].vel.x; g.vy -= vessels_[nh].vel.y; }
+      if (g.vx == 0 && g.vy == 0) g.vy = -cfg_.gravity;
+    }
+    g.home = nh;
   }
 }
 
@@ -1674,13 +1939,19 @@ void FlaskSim::CarryGrains() {
     {
       const V2 cL{0.0f, v.shape.height * 0.4f};
       const V2 d = ToWorld(v.x, cL) - ToWorld(v.prevX, cL);
-      // Only a SUPPORTED grain is carried -- one resting on a grain, the
-      // glass or liquid. A grain in the air is falling, not held, and a
-      // vessel carrying its falling grains along held a cloud of sand up
-      // inside a tipped flask.
+      // EVERY GRAIN OF THE VESSEL is carried, in flight or not: a grain
+      // inside it lives in its frame (a flung grain's velocity is relative to
+      // it; UpdateGrainHomes converts at the glass). Carried only when
+      // resting on something, the grains in the air over a pile -- and with
+      // grainFlow any grain with air under it is in the air -- were left
+      // where they were while the pile moved, and blocked the rows over
+      // them: a pouch carried down dropped out from under its own sand.
+      // Without grainFlow a resting grain is carried only when SUPPORTED --
+      // on a grain, the glass or liquid: carried in the air, a tipped
+      // flask held a cloud of sand up.
       const size_t NF = fieldW_.size();
       auto supported = [&](const Grain& g) {
-        if (g.y == 0) return true;
+        if (cfg_.grainFlow || g.y == 0) return true;
         const size_t k = (size_t)(g.y - 1) * W + g.x;
         return grid_[k] != 0 || wall_[k] != 0 || (k < NF && fieldW_[k] > kLiquidThresh);
       };
@@ -1688,25 +1959,36 @@ void FlaskSim::CarryGrains() {
       if (d.x != 0 || d.y != 0)
         for (size_t i = 0; i < grains_.size(); i++) {
           const Grain& g = grains_[i];
-          if (g.home == (int)vi && g.vx == 0 && g.vy == 0 && supported(g)) {
+          const bool flung = g.vx != 0 || g.vy != 0;
+          if (g.home == (int)vi && (flung ? cfg_.grainFlow : supported(g))) {
             Grain& gm = grains_[i];
-            if ((int)std::floor(gm.fx) != gm.x || (int)std::floor(gm.fy) != gm.y) { gm.fx = gm.x + 0.5f; gm.fy = gm.y + 0.5f; }
+            if (!flung && ((int)std::floor(gm.fx) != gm.x || (int)std::floor(gm.fy) != gm.y)) { gm.fx = gm.x + 0.5f; gm.fy = gm.y + 0.5f; }
             mine.push_back((int)i);
           }
         }
-      // A counting sort on the whole-pixel projection onto the move,
-      // descending (leading edge first, so a grain moves into space its
-      // neighbour left): O(n) where a comparison sort was most of a lift.
-      std::vector<int> order(mine.size());
-      if (!mine.empty()) {
-        const float l = Len(d);
-        const V2 dir = d * (1.f / l);
-        const int span = W + cfg_.gridH + 2;
+      // THE PILE MOVES AS ONE: every carried grain takes the same whole-pixel
+      // shift, the vessel's sub-pixel remainder kept for its next move.
+      // Rounded per grain (each from its own fx), neighbours took different
+      // shifts -- one pixel against two -- and blocked each other, so a
+      // packed pile barely moved with its vessel and the trailing glass had
+      // to bulldoze it through its own band.
+      V2& rem = vessels_[vi].carryRem;
+      rem = rem + d;
+      const int ix = (int)std::lround(rem.x), iy = (int)std::lround(rem.y);
+      rem.x -= (float)ix;
+      rem.y -= (float)iy;
+      // Leading edge first (a grain moves into space its neighbour left): a
+      // counting sort on the integer projection onto the shift, descending,
+      // O(n) where a comparison sort was most of a lift.
+      std::vector<int> order;
+      if (!mine.empty() && (ix || iy)) {
+        order.resize(mine.size());
+        const int span = (W + cfg_.gridH) * (std::abs(ix) + std::abs(iy)) + 1;
         const int NB = 2 * span;
         std::vector<int> cnt(NB + 1, 0), key(mine.size());
         for (size_t k = 0; k < mine.size(); k++) {
-          const float pr = grains_[mine[k]].fx * dir.x + grains_[mine[k]].fy * dir.y;
-          key[k] = std::clamp(span - 1 - (int)std::floor(pr), 0, NB - 1);
+          const Grain& g = grains_[mine[k]];
+          key[k] = std::clamp(span - 1 - (g.x * ix + g.y * iy), 0, NB - 1);
           cnt[key[k] + 1]++;
         }
         for (int bk = 0; bk < NB; bk++) cnt[bk + 1] += cnt[bk];
@@ -1714,10 +1996,9 @@ void FlaskSim::CarryGrains() {
       }
       for (int k : order) {
         Grain& g = grains_[mine[k]];
-        if ((int)std::floor(g.fx) != g.x || (int)std::floor(g.fy) != g.y) { g.fx = g.x + 0.5f; g.fy = g.y + 0.5f; }
-        const float fx = g.fx + d.x, fy = g.fy + d.y;
-        const int nx = (int)std::floor(fx), ny = (int)std::floor(fy);
-        if (nx == g.x && ny == g.y) { g.fx = fx; g.fy = fy; continue; }
+        const int nx = g.x + ix, ny = g.y + iy;
+        const bool flung = g.vx != 0 || g.vy != 0;
+        const float fx = flung ? g.fx + ix : nx + 0.5f, fy = flung ? g.fy + iy : ny + 0.5f;
         if (!GrainFree(nx, ny)) continue;   // blocked: the sweep deals with it
         // Never carried OUT: the target must be inside its own vessel (glass
         // is refused by GrainFree). A grain leaves a vessel only through
@@ -1741,18 +2022,33 @@ void FlaskSim::CarryGrains() {
       // occupied or not, to the nearest FREE one; then every grain on the
       // path shifts one pixel along it. In a packed pile the glass pushes
       // the whole column rather than squeezing a grain out the other side.
-      if (!SweepChain((int)i, v, wasIn)) wedged_.push_back((int)i);
+      //
+      // UNTIL IT IS OUT OF THE GLASS. A path through glass pixels that hold
+      // grains of their own moves this grain only to the next of them --
+      // still glass, and a success. Left there, the next step's glass moved
+      // on past it and dropped it OUTSIDE: the sand that fell through the
+      // bottom of a lifted pouch. A narrow search that cannot reach the
+      // inside (a grain deep in the band) gets one wider one before the
+      // grain is given up as wedged.
+      for (int tries = 0; tries < 4 && wall_[(size_t)g.y * W + g.x]; tries++)
+        if (!SweepChain((int)i, v, wasIn) && !SweepChain((int)i, v, wasIn, 6)) {
+          wedged_.push_back((int)i);
+          break;
+        }
     }
   }
 }
 
-bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn) {
+bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn, int glassReach) {
   const int W = cfg_.gridW, H = cfg_.gridH;
   const Grain& g0 = grains_[gi];
   const int start = g0.y * W + g0.x;
   const int g0x = g0.x, g0y = g0.y;
   const int vi = (int)(&v - vessels_.data());
   const uint32_t deadKey = deadEpoch_ * 2 + (wantIn ? 1u : 0u);
+  // The memo records what the NARROW search could not reach; a wider one
+  // may, so it neither reads nor writes it.
+  const bool memo = glassReach <= 2;
   if (bfsDead_.size() != (size_t)W * H) bfsDead_.assign((size_t)W * H, 0);
   bfsParent_.resize((size_t)W * H);
   bfsSeen_.resize((size_t)W * H, 0);
@@ -1780,9 +2076,10 @@ bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn) {
       // reaching the inside. Two, not five: a path along the band is a grain
       // hopping sideways through the glass, and at five a turning flask
       // shuffled the grains against its wall 3-5 px a step (twice as often).
-      if (glass && std::abs(x - g0x) + std::abs(y - g0y) > 2) continue;
+      // (glassReach: 2 unless the narrow search has already failed.)
+      if (glass && std::abs(x - g0x) + std::abs(y - g0y) > glassReach) continue;
       if (!glass && (inside_[k] == (uint8_t)(vi + 1)) != wantIn) continue;
-      if (!glass && bfsDead_[k] == deadKey) continue;
+      if (!glass && memo && bfsDead_[k] == deadKey) continue;
       bfsSeen_[k] = bfsStamp_;
       bfsParent_[k] = cur;
       if (!glass && !grid_[k]) { found = k; break; }
@@ -1790,8 +2087,9 @@ bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn) {
     }
   }
   if (found < 0) {
-    for (int k : q)
-      if (!wall_[k]) bfsDead_[k] = deadKey;
+    if (memo)
+      for (int k : q)
+        if (!wall_[k]) bfsDead_[k] = deadKey;
     return false;
   }
   // Walk back from the free pixel: each grain on the path moves into the
