@@ -162,6 +162,25 @@ const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
 @group(0) @binding(26) var<storage, read> cloudMaps : array<u32>;
 @group(0) @binding(27) var<uniform> CL : CloudParams;
 
+// ---- THE SOLUTE LAYER (DESIGN.md §4 "Solutes"; read by solLookAt) -----------
+// The CA's own buffers (sim_step.wgsl binds them at 40/41/43), read-only here.
+// Written only on the TICK command buffer; the global barrier every command
+// buffer opens with covers the compute -> fragment hop (waterFlux's standing).
+// Render-only: what a pixel does with them is never hashed.
+@group(0) @binding(28) var<storage, read> solTable : array<u32>;
+@group(0) @binding(29) var<storage, read> solPool : array<u32>;
+@group(0) @binding(30) var<storage, read> solSpec : array<u32>;
+// world.h's kSol* values (scripts/check_invariants.py `solute` checks these
+// against world.h too -- they are NOT the sim's MIRROR block, which needs
+// atomics and solMeta that a fragment stage must not bind).
+const SOL_UNIFORM_BIT : u32 = 0x80000000u;
+const SOL_PAGE_BIT : u32 = 0x40000000u;
+const SOL_PAGE_MASK : u32 = 0x3FFFFFFFu;
+const SOL_WORDS_PER_PAGE : u32 = 2048u;
+const SOLS_BASE : u32 = 16u;
+const SOLS_STRIDE : u32 = 16u;
+const SOLS_MAT_BASE : u32 = 4112u;
+
 // What the liquid shades (shadeWater / shadeSubmerged / shadeMpmFluid) leave
 // for fs() to write into the veil. Private globals rather than a returned
 // struct for gRsTraceSteps' reason: those functions are inlined into fs() and
@@ -7639,6 +7658,84 @@ fn shadeTranslucent(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   return color;
 }
 
+// ============================================================================
+// DISSOLVED MATTER TINTS AND LIGHTS ITS LIQUID (DESIGN.md §4 "Solutes")
+// ============================================================================
+// solutes.json gives every species a `tint` (#rrggbb), a `tintStrength` and a
+// `glow`, each "at saturation". A liquid cell carrying that species at
+// concentration c looks that much of the way toward the tint: brine goes a
+// faint milky cyan, vitriol blue, ink black, fairy water violet, and lumen
+// water glows.
+//
+// WHERE, and why only there. The look is resolved ONCE per liquid-surface
+// pixel, at the cell the primary ray entered the liquid through (h.liqCell),
+// inside the shade that already turns the liquid's palette into absorption and
+// in-scatter -- NOT per march step. The march loop is the raymarch fragment's
+// register cliff (memory: a few extra live values across the DDA loop cost
+// every camera), and a per-step solute fetch would be one more dependent load
+// per liquid cell for a colour the entry cell already tells us. Everything
+// computed here dies before the shade's reflection trace.
+//
+// Cost on a pixel with no solute nearby: one table load (EMPTY -> return).
+// A UNIFORM sentinel needs no pool fetch; only a real page reads a pool word.
+//
+// "At saturation" is the most this LIQUID can hold of the species: the
+// saturation, or the lowest `converts` cMin for this solvent if lower (fairy
+// dust in water becomes enchanted water at 48, so a fairy solution never gets
+// past 48 and would otherwise never show more than a fifth of its colour).
+struct SolLook {
+  tint : vec3f,   // the species colour, 0..1 per channel
+  a    : f32,     // how far toward it: tintStrength/255 x c/ref
+  g    : f32,     // emission: glow/255 x c/ref
+}
+
+// How hard a full-strength solute colours the liquid body. Absorption of the
+// tint's COMPLEMENT per metre (the same rule liquidOptics applies to a
+// palette: a blue liquid absorbs red and green), and the level the body's
+// in-scatter moves to. Render-only look constants, declared here and not in
+// common.wgsl or tuning (either would miss the SPIR-V cache of every shader).
+const SOL_LOOK_ABSORB : f32 = 2.5;
+const SOL_LOOK_SCATTER : f32 = 0.45;
+const SOL_LOOK_GLOW : f32 = 1.6;
+
+fn solLookAt(cell : vec3<i32>, mat : u32) -> SolLook {
+  var o : SolLook;
+  o.a = 0.0;
+  o.g = 0.0;
+  o.tint = vec3f(0.0);
+  let e = solTable[voxSlotOfCell(cell)];
+  if (e == 0u) { return o; }
+  let lo = vec3<u32>(cell & vec3<i32>(CHUNK_MASK));
+  let local = (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+  var v = e & 0xFFFFu;
+  if ((e & SOL_UNIFORM_BIT) == 0u) {
+    let wv = solPool[(e & SOL_PAGE_MASK) * SOL_WORDS_PER_PAGE + (local >> 1u)];
+    v = (wv >> ((local & 1u) * 16u)) & 0xFFFFu;
+  }
+  let s = v >> 8u;
+  let mass = v & 0xFFu;
+  // A value on a cell that is not a solvent of its species is mass a
+  // destroyed solvent left behind (solCompact clears it at the end of the
+  // tick): it is not in this liquid.
+  if (s == 0u || mass == 0u || s > 24u ||
+      (solSpec[SOLS_MAT_BASE + (mat & 0xFFFu)] & (1u << (7u + s))) == 0u) { return o; }
+  let rb = SOLS_BASE + s * SOLS_STRIDE;
+  var refc = max(solSpec[rb + 1u], 1u);
+  let nc = min(solSpec[rb + 10u], 4u);
+  for (var k = 0u; k < nc; k = k + 1u) {
+    let row = solSpec[rb + 11u + k];
+    if ((row & 0xFFFu) == mat) { refc = max(min(refc, row >> 24u), 1u); }
+  }
+  // Concentration = mass per full cell (mass x 8 / fullness), as the CA reads it.
+  let full = voxState(voxWordAt(cell)) + 1u;
+  let c = min(f32(mass * 8u) / f32(full * refc), 1.0);
+  let t = solSpec[rb + 6u];   // 0x00RRGGBB
+  o.tint = vec3f(f32((t >> 16u) & 0xFFu), f32((t >> 8u) & 0xFFu), f32(t & 0xFFu)) / 255.0;
+  o.a = c * f32(solSpec[rb + 7u]) / 255.0;
+  o.g = c * f32(solSpec[rb + 8u]) / 255.0;
+  return o;
+}
+
 fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
               axis : i32, sgn : f32, pathVox : f32, surfFull : f32,
               sceneBehind : vec3f, tSurf : f32, underwater : bool) -> vec3f {
@@ -7679,9 +7776,8 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
   // Clear water takes the surface's hand-tuned TUNE_WATER_ABSORB/SCATTER; murkier
   // liquids their palette+opacity derivation, so oil stays black-brown and
   // acid stays acid-green without a material id anywhere (liquidOptics).
-  let absorbK = optics.absorbK;
-  let scatter = optics.scatter;
-  let trans = exp(-absorbK * depthM);
+  // (The coefficients themselves are resolved after the caustics below, which
+  // need only depthM -- so the solute look is not live across that call.)
 
   // ---- caustics ----
   // Sunlight refracting through the wave surface focuses into the bright
@@ -7705,10 +7801,29 @@ fn shadeWater(hitP : vec3f, rd : vec3f, mat : u32, cell : vec3<i32>,
     lit *= veilCaustic(gVCurv, depthM);
   }
 
+  var absorbK = optics.absorbK;
+  var scatter = optics.scatter;
+  // Dissolved matter (solLookAt): the body absorbs the tint's complement and
+  // scatters toward the tint, by concentration, and a glowing species adds
+  // its own light to what comes up through the surface. Resolved here, where
+  // the body coefficients are, and dead before the reflection trace below.
+  // The veil (gVScatter / gVAbsorb) inherits the tinted body, so a body under
+  // brine or ink is seen through the same colour.
+  let sol = solLookAt(cell, mat);
+  if (sol.a > 0.0) {
+    absorbK += (vec3f(1.0) - sol.tint) * (sol.a * SOL_LOOK_ABSORB);
+    scatter = mix(scatter, sol.tint * SOL_LOOK_SCATTER, sol.a);
+  }
+  let trans = exp(-absorbK * depthM);
+
   // What comes back up: the bed (plus its caustics), filtered by the water
   // column, plus the column's own in-scattered light (which is what keeps
   // deep water blue rather than black).
   var refracted = lit * trans + scatter * (vec3f(1.0) - trans);
+  // A glowing solution's emission, seen through the interface like the rest
+  // of the body (the Fresnel mix below takes the reflected share off it).
+  // More liquid under the surface emits more, saturating with the column.
+  refracted += sol.tint * (sol.g * SOL_LOOK_GLOW * (0.35 + 0.65 * (1.0 - trans.g)));
   // The water veil's half of this equation (see the gV* globals): a raster
   // body under the surface replaces the bed term at its own depth.
   gVScatter = scatter;
@@ -11063,6 +11178,17 @@ fn fs(in : VSOut) -> FSOut {
         color = shadeViscous(hitP, rd, lm, h.liqCell, h.liqAxis, h.liqSgn,
                              h.liqPath, max(h.mediaSurf, 0.125), color,
                              h.liqT, underwater);
+        // Dissolved matter in a viscous solvent (fairy dust or salt in
+        // blood). Blood is near-opaque, so there is no body to re-derive:
+        // the shaded surface is pulled toward the tint at its own brightness,
+        // plus the species' glow. After the shade, so nothing is live across
+        // its reflection work.
+        let vsol = solLookAt(h.liqCell, lm);
+        if (vsol.a > 0.0 || vsol.g > 0.0) {
+          let lum = dot(color, vec3f(0.2126, 0.7152, 0.0722));
+          color = mix(color, vsol.tint * (lum * 2.2), vsol.a * 0.7) +
+                  vsol.tint * (vsol.g * SOL_LOOK_GLOW * 0.6);
+        }
         color = applyAerial(color, rd, h.liqT);
         caShadedLiquid = true;
       } else if (!mpmOwned) {

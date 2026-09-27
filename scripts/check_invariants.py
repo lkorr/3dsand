@@ -2736,6 +2736,19 @@ def check_solute_mirror():
         if int(mw.group(1), 0) != cv:
             problems.append(f"solute: {w} = {mw.group(1)} in the WGSL block but "
                             f"{c} = {cv} in world.h")
+    # The RENDER reader (raymarch.wgsl solLookAt) declares its own subset of
+    # these constants -- it cannot paste the MIRROR block, which binds solMeta
+    # and uses atomics a fragment stage must not. Every one it declares must
+    # still match world.h.
+    rm = read("assets/shaders/raymarch.wgsl") or ""
+    for w, c in _SOLUTE_CONSTS.items():
+        mw = re.search(r"^const\s+" + w + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u\s*;", rm, re.M)
+        if not mw:
+            continue
+        cv = cpp_value(c)
+        if cv is None or int(mw.group(1), 0) != cv:
+            problems.append(f"solute: raymarch.wgsl {w} = {mw.group(1)} but "
+                            f"{c} = {cv} in world.h")
 
 
 def check_react_fx():

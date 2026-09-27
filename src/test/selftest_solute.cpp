@@ -31,9 +31,14 @@
 #include <string>
 #include <vector>
 
+#include <cmath>
+
+#include "game/camera.h"
 #include "game/composition.h"
 #include "game/container.h"
 #include "game/item.h"
+#include "gpu/resources.h"
+#include "sim/celestial.h"
 #include "sim/solutes.h"
 #include "sim/tuning.h"
 #include "test/selftest.h"
@@ -868,6 +873,181 @@ Status GateSoluteVessel(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- solute-look ------------------------------------------------------------
+// The RENDER half (package H; raymarch.wgsl solLookAt): six stone pools of
+// water side by side on the ground at noon -- plain, brine, fairy, vitriol,
+// lumen and ink -- each seeded with enough of its powder to sit near the
+// concentration its colour is authored "at saturation" for, left to dissolve,
+// then drawn from above into build/solute_look.bmp.
+//
+// Asserted: every seeded pool carries dissolved mass (the fixture did what it
+// says, so a pixel verdict is about the shader and not an empty layer), the
+// latches are clean, and at the projected centre of each pool the frame moved
+// the way the authored tint says it must against the plain-water pool: ink
+// darker, vitriol bluer, fairy more violet, lumen brighter (its glow). Brine is
+// only reported: it is authored FAINT (tintStrength 40). Thresholds in
+// tests/baseline.json (soluteLook.*). Render-only: the world hash does not see
+// any of it.
+Status GateSoluteLook(Ctx& c, std::string& detail) {
+  struct PoolDef { const char* powder; int grains; };
+  // Grains per pool: pool volume 6 x 6 x 3 = 108 cells, 256 units a voxel, so
+  // grains = 108 x target / 256 for a target concentration a bit under each
+  // species' reference (salt 90, fairy 48 in water, vitriol 200, lumen 96,
+  // ink 80 -- the lowest of saturation and the water `converts` cMin).
+  const PoolDef defs[6] = {{nullptr, 0},        {"salt", 30},
+                           {"fairy_dust", 15},  {"blue_vitriol", 63},
+                           {"luminous_spores", 30}, {"charcoal", 25}};
+  const char* names[6] = {"water", "brine", "fairy", "vitriol", "lumen", "ink"};
+  const uint32_t water = MatNamed(c, "water");
+  uint32_t powder[6] = {0, 0, 0, 0, 0, 0};
+  for (int i = 1; i < 6; i++) {
+    powder[i] = MatNamed(c, defs[i].powder);
+    if (!powder[i]) {
+      detail = Format("needs material %s", defs[i].powder);
+      return Status::Fail;
+    }
+  }
+  if (!water) { detail = "needs water"; return Status::Fail; }
+  FixtureTuning tune;
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+
+  // 3 x 2 pools, 6 x 6 inside, walls one cell thick (two between pools).
+  const int bx = 160, bz = 160;
+  const int fy = FixtureYOver(bx - 1, bz - 1, bx + 22, bz + 14, kDefaultSeed, 1);
+  std::vector<Box> pools;
+  for (int i = 0; i < 6; i++) {
+    const int x0 = bx + (i % 3) * 8, z0 = bz + (i / 3) * 8;
+    pools.push_back(Box{x0, x0 + 5, z0, z0 + 5, fy, fy + 4, false});
+  }
+  std::vector<CellOp> build, fill, grains;
+  for (const Box& b : pools) {
+    const std::vector<CellOp> v = b.Build((uint32_t)kMatStone);
+    build.insert(build.end(), v.begin(), v.end());
+    const std::vector<CellOp> w = b.Layers(water, fy + 1, 3, 7u);
+    fill.insert(fill.end(), w.begin(), w.end());
+  }
+  for (int i = 1; i < 6; i++) {
+    const Box& b = pools[i];
+    for (int g = 0; g < defs[i].grains; g++) {
+      const int x = b.x0 + g % 6, z = b.z0 + (g / 6) % 6, y = fy + 4 + g / 36;
+      grains.push_back({World::SlotCellIndex({x, y, z}), powder[i] & 0xFFFu});
+    }
+  }
+  const int kTicks = (int)BaselineNumber("soluteLook.ticks", 700);
+  uint32_t t = 61000;
+  support::TickCursor ticker{c, t, {(bx + 11) >> 4, fy >> 4, (bz + 7) >> 4}};
+  for (int i = 0; i < kTicks; i++)
+    ticker({}, i == 0 ? build : i == 2 ? fill : i == 4 ? grains : std::vector<CellOp>{});
+
+  SoluteLayer L;
+  ReadSoluteLayer(c, L);
+  std::string latch;
+  const bool latchOk = LatchesClean(L, latch);
+  uint64_t mass[6] = {0, 0, 0, 0, 0, 0};
+  bool massOk = true;
+  for (int i = 0; i < 6; i++) {
+    mass[i] = Census(c, pools[i], L, powder[i] ? powder[i] : water).mass;
+    if (i > 0 && mass[i] == 0) massOk = false;
+  }
+
+  // ---- the frame: noon, from the south, looking down into the pools ----
+  const Tuning base = CurrentTuning();
+  uint32_t noonTick = 0;
+  {
+    float bestUp = -2.0f;
+    for (uint32_t s = 0; s < 200000u; s += 64u) {
+      const float up = ComputeSky(base, (double)s).sunDir[1];
+      if (up > bestUp) { bestUp = up; noonTick = s; }
+    }
+  }
+  const uint32_t W = c.width, H = c.height;
+  const Vec3 eye{(float)bx + 10.5f, (float)fy + 24.0f, (float)bz - 9.0f};
+  Camera cam;
+  cam.yaw = 1.5707963f;   // +Z
+  cam.pitch = -0.95f;
+  rhi::Buffer shot = CreateBuffer(c.ctx.device, (uint64_t)W * H * 4,
+                                  rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                                  "soluteLookShot");
+  const int kFrames = 8;
+  for (int f = 0; f < kFrames; f++) {
+    WriteRenderParams(c.ctx.queue, c.world, eye, cam, (float)W / H, true, 0.0f,
+                      kFarFogDensity, (float)H, noonTick);
+    rhi::CommandEncoder enc = c.ctx.device.CreateCommandEncoder();
+    c.sim.EncodeShadowResolve(enc);
+    rhi::RenderPass rp = c.sim.BeginRenderPass(enc, c.view, rhi::TextureFormat::RGBA8Unorm, W, H);
+    c.sim.DrawWorld(rp);
+    rp.End();
+    if (f + 1 == kFrames) {
+      rhi::TexelCopyTexture srcT{};
+      srcT.texture = c.offscreen;
+      rhi::TexelCopyBuffer dstB{};
+      dstB.buffer = shot;
+      dstB.bytesPerRow = W * 4;
+      dstB.rowsPerImage = H;
+      rhi::Extent3D ext{W, H, 1};
+      enc.CopyTextureToBuffer(srcT, dstB, ext);
+    }
+    c.ctx.queue.Submit(enc.Finish());
+  }
+  std::vector<uint8_t> px((size_t)W * H * 4, 0);
+  const bool got = rhi::ReadBufferBlocking(c.ctx.device, shot, 0, px.data(), px.size());
+  if (got) WriteBmpFile("build/solute_look.bmp", px, W, H);
+
+  // Each pool's mean colour over a small window at its projected centre (the
+  // water surface, fy + 3.9). Pinhole projection with the camera's own basis.
+  const Vec3 F = cam.Forward(), R = cam.Right(), U = cam.Up();
+  const float th = std::tan(cam.fovY * 0.5f), aspect = (float)W / H;
+  double rgb[6][3] = {};
+  bool projOk = got;
+  for (int i = 0; i < 6 && got; i++) {
+    const Box& b = pools[i];
+    const Vec3 p{(b.x0 + b.x1 + 1) * 0.5f, (float)fy + 3.9f, (b.z0 + b.z1 + 1) * 0.5f};
+    const Vec3 d{p.x - eye.x, p.y - eye.y, p.z - eye.z};
+    const float zf = d.dot(F);
+    const float sx = d.dot(R) / (zf * th * aspect), sy = d.dot(U) / (zf * th);
+    const int cx = (int)((sx * 0.5f + 0.5f) * W), cy = (int)((0.5f - sy * 0.5f) * H);
+    int n = 0;
+    for (int y = cy - 6; y <= cy + 6; y++)
+      for (int x = cx - 6; x <= cx + 6; x++) {
+        if (x < 0 || y < 0 || x >= (int)W || y >= (int)H) continue;
+        const size_t k = ((size_t)y * W + x) * 4;
+        for (int ch = 0; ch < 3; ch++) rgb[i][ch] += px[k + ch];
+        n++;
+      }
+    if (n == 0) { projOk = false; continue; }
+    for (int ch = 0; ch < 3; ch++) rgb[i][ch] /= n;
+  }
+  auto lum = [&](int i) { return 0.2126 * rgb[i][0] + 0.7152 * rgb[i][1] + 0.0722 * rgb[i][2]; };
+  const double inkDark = lum(0) - lum(5);
+  const double vitBlue = (rgb[3][2] - rgb[3][0]) - (rgb[0][2] - rgb[0][0]);
+  const double fairyViolet = ((rgb[2][0] + rgb[2][2]) * 0.5 - rgb[2][1]) -
+                             ((rgb[0][0] + rgb[0][2]) * 0.5 - rgb[0][1]);
+  const double lumenBright = lum(4) - lum(0);
+  const bool lookOk = projOk &&
+                      inkDark >= BaselineNumber("soluteLook.minInkDark", 20) &&
+                      vitBlue >= BaselineNumber("soluteLook.minVitriolBlue", 15) &&
+                      fairyViolet >= BaselineNumber("soluteLook.minFairyViolet", 8) &&
+                      lumenBright >= BaselineNumber("soluteLook.minLumenBright", 8);
+  RecordObserved("soluteLook.inkDark", inkDark);
+  RecordObserved("soluteLook.vitriolBlue", vitBlue);
+  RecordObserved("soluteLook.fairyViolet", fairyViolet);
+  RecordObserved("soluteLook.lumenBright", lumenBright);
+
+  std::string pools6;
+  for (int i = 0; i < 6; i++)
+    pools6 += Format("%s%s mass %llu rgb (%.0f,%.0f,%.0f)", i ? "; " : "", names[i],
+                     (unsigned long long)mass[i], rgb[i][0], rgb[i][1], rgb[i][2]);
+  const bool ok = massOk && latchOk && lookOk;
+  detail = Format("%s | vs water: ink darker by %.1f, vitriol bluer by %.1f, fairy more "
+                  "violet by %.1f, lumen brighter by %.1f; frame %s%s%s",
+                  pools6.c_str(), inkDark, vitBlue, fairyViolet, lumenBright,
+                  got ? "build/solute_look.bmp" : "NOT READ", latchOk ? "" : ", ",
+                  latch.c_str());
+  std::printf("solute-look: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SoluteGates() {
@@ -878,6 +1058,7 @@ const std::vector<Gate>& SoluteGates() {
       {"solute-seam", "sim", {}, false, GateSoluteSeam, false},
       {"solute-electrolysis", "sim", {}, false, GateSoluteElectrolysis, false},
       {"solute-vessel", "sim", {}, false, GateSoluteVessel, false},
+      {"solute-look", "render", {}, false, GateSoluteLook, true},
   };
   return g;
 }

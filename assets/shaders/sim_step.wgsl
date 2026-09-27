@@ -571,6 +571,35 @@ const FILM_LICENCE : u32 =
 // sleeps with work left.
 var<private> gFilmLicence : bool = false;
 
+// ---- NO SOLUTE WITHIN REACH: the solute hooks are skipped wholesale ----------
+// Set once per workgroup at the top of main: this chunk's solute table entry is
+// SOL_EMPTY. Workgroup-uniform (one scalar load, every thread is in chunk ci),
+// so every `if (!gSolNone)` below is a uniform branch and a solute-free chunk
+// never fetches or executes the hooks' code. Measured (package H, --perf
+// forestfire, no solute anywhere): the hooks cost +7% on the CA row until they
+// were gated here.
+//
+// WHY THIS IS EXACT, not a heuristic. The CA runs only over the compacted dirty
+// list, and solWant ran over that same list earlier this tick: for every dirty
+// chunk D whose N27 held ANY non-EMPTY entry (a page, even an all-zero one, or
+// a UNIFORM value) -- or which asked for a page last tick -- all of N27(D),
+// D included, went on the want list, and solAlloc gave each a page before this
+// pass. So a dirty chunk that is still EMPTY here had an all-EMPTY N27 at
+// solWant. Pages are made nowhere else in the tick, so the only way mass can
+// reach a cell this chunk's threads read (their own cells and a one-cell halo)
+// is by MOVING there during the CA from a chunk two or more chunks away --
+// sixteen cells or more, against a write reach of one cell a substep. Every
+// hook therefore reads zeros on both sides and is a no-op: solSwap/solTransfer
+// return on (0, 0), solCarried is 0 so solOnReplace never runs, solClearStale,
+// solTrySink and solTryConvert all return on v == 0. The world hash is
+// bit-identical with and without this gate (pinned by `--gate determinism`).
+//
+// NOT gated: solTryDissolve (a powder beside a solvent must still ASK for a
+// page -- that request is how an EMPTY neighbourhood gets its first one) and
+// solRuleAllows (a conditioned rule must still read its condition word to
+// refuse). Default false so an entry point that never sets it runs every hook.
+var<private> gSolNone : bool = false;
+
 // The acting cell and its physical word index, set once at the top of main.
 // tryMove's source is always this cell, and re-resolving it through the page
 // table on every move was a second lookup of an answer main already had.
@@ -741,63 +770,69 @@ fn solOnReplace(c : vec3<i32>, v : u32, prod : u32, push : bool, rot : u32) -> v
   let s = solSpeciesOf(v);
   var m = solMassOf(v);
   if (solIsLiquidMat(prod) && solIsSolvent(prod, s)) { return vec2<u32>(prod, 0u); }
-  if (push) {
-    for (var i = 0u; i < 6u && m > 0u; i = i + 1u) {
-      let n = c + faceDir((i + rot) % 6u);
-      if (!inBounds(n)) { continue; }
-      let nw = voxWordAt(n);
-      let nmat = voxMat(nw);
-      if (!solIsLiquidMat(nmat) || !solIsSolvent(nmat, s) || !solWritable(n)) { continue; }
-      let nv = solValueAt(n);
-      if (solSpeciesOf(nv) != 0u && solSpeciesOf(nv) != s) { continue; }
-      let cap = solCap(s, voxState(nw) + 1u);
-      let have = solMassOf(nv);
-      if (have >= cap) { continue; }
-      let k = min(m, cap - have);
-      _ = solStoreAt(n, solPack(s, have + k));
-      m -= k;
-      markDirty(n);
-    }
-  }
-  _ = solStoreAt(c, 0u);
   var out = vec2<u32>(prod, 0u);
-  if (m != 0u) {
-    let y8 = solYield8(s);
-    let p = solPrecipitate(s);
-    var e = min(m / y8, POWDER_FULL);
-    // A precipitate that cannot hold eighths is whole cells or nothing.
-    if (p != MAT_AIR && !matHasPowderMass(materials[p]) && e < POWDER_FULL) { e = 0u; }
-    if (e != 0u && p != MAT_AIR) {
-      out = vec2<u32>(p, e);
-      atomicAdd(&solMeta[SOLM_PRECIP], e * y8);
-      m -= e * y8;
-    }
-    // What is left is less than an eighth of a grain (or has no precipitate):
-    // it cannot leave as powder, so it stays in the liquid -- the brine beside
-    // this cell takes it past saturation (a supersaturated film, which is what
-    // a drying pan really holds). Only mass with no liquid of its kind to go
-    // to is discarded, counted.
-    if (push) {
-      for (var i = 0u; i < 6u && m > 0u; i = i + 1u) {
-        let n = c + faceDir((i + rot) % 6u);
-        if (!inBounds(n)) { continue; }
+  // ONE loop body for both pushes (steps 0..5 under saturation, 7..12 past
+  // it) with the clear-and-precipitate at step 6 between them. Written as two
+  // loops it was two bodies, each unrolled six times, in every one of the
+  // places this is inlined -- a large share of what the solute hooks added to
+  // the `step` binary (package H). Without `push` only step 6 runs.
+  //
+  // `solNoUnroll()` is a runtime ZERO (solSpec[0] is the species count, < 2^16)
+  // that the compiler cannot prove: it keeps the trip count dynamic, so the
+  // body stays one copy instead of being unrolled thirteen times.
+  var i = select(6u, 0u, push);
+  let end = select(7u, 13u, push) + solNoUnroll();
+  loop {
+    if (i >= end) { break; }
+    if (i == 6u) {
+      _ = solStoreAt(c, 0u);
+      if (m != 0u) {
+        let y8 = solYield8(s);
+        let p = solPrecipitate(s);
+        var e = min(m / y8, POWDER_FULL);
+        // A precipitate that cannot hold eighths is whole cells or nothing.
+        if (p != MAT_AIR && !matHasPowderMass(materials[p]) && e < POWDER_FULL) { e = 0u; }
+        if (e != 0u && p != MAT_AIR) {
+          out = vec2<u32>(p, e);
+          atomicAdd(&solMeta[SOLM_PRECIP], e * y8);
+          m -= e * y8;
+        }
+      }
+    } else if (m > 0u) {
+      // Step 0..5: into face neighbours with room UNDER saturation -- a pond
+      // that evaporates from the top CONCENTRATES rather than losing its salt.
+      // Step 7..12: what could not leave as powder (less than an eighth of a
+      // grain, or no precipitate) goes into the brine beside it PAST
+      // saturation (a supersaturated film, which is what a drying pan really
+      // holds). Only mass with no liquid of its kind to go to is discarded.
+      let under = i < 6u;
+      let n = c + faceDir((select(i - 7u, i, under) + rot) % 6u);
+      if (inBounds(n)) {
         let nw = voxWordAt(n);
         let nmat = voxMat(nw);
-        if (!solIsLiquidMat(nmat) || !solIsSolvent(nmat, s) || !solWritable(n)) { continue; }
-        let nv = solValueAt(n);
-        if (solSpeciesOf(nv) != 0u && solSpeciesOf(nv) != s) { continue; }
-        let have = solMassOf(nv);
-        let k = min(m, 255u - have);
-        if (k == 0u) { continue; }
-        _ = solStoreAt(n, solPack(s, have + k));
-        m -= k;
-        markDirty(n);
+        if (solIsLiquidMat(nmat) && solIsSolvent(nmat, s) && solWritable(n)) {
+          let nv = solValueAt(n);
+          if (solSpeciesOf(nv) == 0u || solSpeciesOf(nv) == s) {
+            let cap = select(255u, solCap(s, voxState(nw) + 1u), under);
+            let have = solMassOf(nv);
+            if (have < cap) {
+              let k = min(m, cap - have);
+              _ = solStoreAt(n, solPack(s, have + k));
+              m -= k;
+              markDirty(n);
+            }
+          }
+        }
       }
     }
-    solDiscard(m);
+    i = i + 1u;
   }
+  solDiscard(m);
   return out;
 }
+
+// A runtime zero the compiler cannot fold (see solOnReplace).
+fn solNoUnroll() -> u32 { return solSpec[0] >> 16u; }
 
 // The state nibble for a precipitate of `e` eighths at cell c.
 fn solPrecipState(p : u32, e : u32, c : vec3<i32>) -> u32 {
@@ -966,7 +1001,8 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   if (any(src != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(src); }
   voxStore(si, packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw));
   markVoxActive(si);
-  solSwap(src, dst, myWord, tw);
+  // The solute half runs ONCE, at the end of main (solFlushPending).
+  if (!gSolNone) { solSwap(src, dst, myWord, tw); }
   markDirtyR(src, DIRTY_R_MOVE);
   markDirtyR(dst, DIRTY_R_MOVE);
   // a powder sliding out from under a solid may leave it floating
@@ -1613,7 +1649,8 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   markVoxActive(si);
   voxStore(di, packVoxKeepStain(mat, df + t - 1u, stamp, dw));
   markVoxActive(di);
-  solTransfer(src, dst, sf, df, t);
+  // The solute half runs ONCE, at the end of main (solFlushPending).
+  if (!gSolNone) { solTransfer(src, dst, sf, df, t); }
   markDirtyR(src, DIRTY_R_MOVE);
   markDirtyR(dst, DIRTY_R_MOVE);
 }
@@ -1861,7 +1898,7 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
     let sw = voxWordAt(c);
     e = cellEighths(sw);
     selfPowder = matHasPowderMass(materials[voxMat(sw)]);
-    sv = solCarried(c, sw);
+    if (!gSolNone) { sv = solCarried(c, sw); }
   }
   // A solvent turning into something else: its mass moves on or precipitates
   // (evaporating brine concentrates, then leaves salt).
@@ -2490,7 +2527,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
           // Only a LIQUID product can carry a value, so only one can inherit a
           // stale one (solCarried): smoke and fire emits skip the table read.
-          if (solIsLiquidMat(rule.prodNbr)) { solClearStale(n); }
+          if (!gSolNone && solIsLiquidMat(rule.prodNbr)) { solClearStale(n); }
           markVoxActive(ni);
           markDirtyR(n, DIRTY_R_REACTW);
           markDirtyR(c, DIRTY_R_REACTW);
@@ -2553,7 +2590,7 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             // place (it cannot move on -- a neighbour's neighbour is past the
             // lattice's write reach). Boiling brine leaves its salt.
             var nsv = 0u;
-            if (!synthFluid) { nsv = solCarried(n, niw.y); }
+            if (!synthFluid && !gSolNone) { nsv = solCarried(n, niw.y); }
             var rep = vec2<u32>(rule.prodNbr, 0u);
             if (nsv != 0u) { rep = solOnReplace(n, nsv, rule.prodNbr, false, 0u); }
             if (rep.y != 0u) {
@@ -3179,7 +3216,7 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
   // 1) down: a partial same-liquid cell to top up, or anything displaceable.
   if (canDescend(c, c + vec3<i32>(0, -1, 0), mat, m.density)) { return true; }
   // 1b) brine above lighter liquid of its own kind (solTrySink, read only).
-  if (solTrySink(c, w, mat, false)) { return true; }
+  if (!gSolNone && solTrySink(c, w, mat, false)) { return true; }
 
   // 2a) the four axis down-diagonals.
   for (var i = 0u; i < 4u; i++) {
@@ -3294,7 +3331,7 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
   //     same fullness, so only the mass moves -- a halocline out of one
   //     comparison. Strictly decreases SUM(solute density * y) (a bounded
   //     integer), so it terminates on its own; not a film licence.
-  if (solTrySink(c, w, mat, true)) { return true; }
+  if (!gSolNone && solTrySink(c, w, mat, true)) { return true; }
 
   // 2a) the four AXIS down-diagonals, RNG order.
   let r = rnd >> 10u;
@@ -3891,6 +3928,8 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // FILM_LICENCE block — this is what stops a neutral rule from keeping a
   // shoreline puddle awake forever.
   gFilmLicence = (dirtyIn[ci] & FILM_LICENCE) != 0u;
+  // No solute anywhere this chunk's threads can reach (see gSolNone).
+  gSolNone = solTable[ci] == 0u;
   let wc = slotWorldChunk(ci, T.origin);
   let base = wc * i32(CHUNK);  // world cell of the chunk corner (may be < 0)
   // The color lattice is GLOBAL in WORLD coords: cell ≡ colorPhase (mod 3).
@@ -3957,7 +3996,7 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
     let sp = solFromSpecies(mat);
     if (sp != 0u && TUNE_SOLUTE_MODE != 0u &&
         solTryDissolve(c, idx, w, mat, m, sp, slotIdx, skip)) { return; }
-    if (!skip && m.klass == CLASS_LIQUID && solTryConvert(c, idx, w, mat)) { return; }
+    if (!skip && !gSolNone && m.klass == CLASS_LIQUID && solTryConvert(c, idx, w, mat)) { return; }
   }
 
   // ---- A SOLID WITH NOTHING TOUCHING IT IS A ONE-VOXEL ISLAND -------------

@@ -634,6 +634,18 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(25, T::ReadOnlyStorage, S::Fragment),               // cloudHist
         entry(26, T::ReadOnlyStorage, S::Fragment | S::Vertex),   // cloudMaps
         entry(27, T::Uniform, S::Fragment | S::Vertex),           // CloudParams
+        // THE SOLUTE LAYER, read by the water surface shade (DESIGN.md §4
+        // "Solutes", raymarch.wgsl `solLookAt`): brine, fairy water, ink and
+        // vitriol tint the liquid by concentration, lumen glows. The table
+        // (28), the pool (29) and the species table (30) -- the same buffers
+        // the CA binds at 40/41/43. Same standing and arrow as waterFlux (22):
+        // written on the TICK command buffer only, read in the FRAGMENT stage,
+        // covered by the global barrier every command buffer opens with.
+        // Render-only: nothing here is hashed, and the read is ONE table load
+        // per liquid-surface pixel (EMPTY -> no pool fetch at all).
+        entry(28, T::ReadOnlyStorage, S::Fragment),               // solTable
+        entry(29, T::ReadOnlyStorage, S::Fragment),               // solPool
+        entry(30, T::ReadOnlyStorage, S::Fragment),               // solSpec
     };
     renderBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -3080,6 +3092,9 @@ void Simulation::BuildRenderBindGroup(rhi::BindGroup& out,
         b(25, cloudHistBuf_),
         b(26, cloudMapsBuf_),
         b(27, world_->cloudUBO),
+        b(28, world_->solTable),
+        b(29, world_->solPool),
+        b(30, solSpecBuf_),
     };
     out = device_.CreateBindGroup(renderBGL_, entries, std::size(entries),
                                   "renderBG");
