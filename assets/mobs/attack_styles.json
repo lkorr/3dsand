@@ -5013,7 +5013,7 @@
           "frames": [
             {
               "name": "windup",
-              "ticks": 6,
+              "ticks": 8,
               "ease": "quadInOut",
               "pose": {
                 "shoulder": [
@@ -5067,7 +5067,7 @@
             },
             {
               "name": "cut b",
-              "ticks": 3,
+              "ticks": 6,
               "cuts": true,
               "pose": {
                 "shoulder": [
