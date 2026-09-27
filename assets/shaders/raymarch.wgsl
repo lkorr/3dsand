@@ -7694,7 +7694,7 @@ struct SolLook {
 // palette: a blue liquid absorbs red and green), and the level the body's
 // in-scatter moves to. Render-only look constants, declared here and not in
 // common.wgsl or tuning (either would miss the SPIR-V cache of every shader).
-const SOL_LOOK_ABSORB : f32 = 2.5;
+const SOL_LOOK_ABSORB : f32 = 12.0;
 const SOL_LOOK_SCATTER : f32 = 0.45;
 const SOL_LOOK_GLOW : f32 = 1.6;
 

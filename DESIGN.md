@@ -1501,6 +1501,33 @@ precipitates, then dissolves; the CPU fallbacks) and `solute-payout` (the
 session pays scooped salt into the hand / hotbar vessel that holds a liquid,
 never into a pouch of sand; exact).
 
+**How a solution looks** (package H, 2026-09-27; raymarch.wgsl `solLookAt`,
+render BGL bindings 28-30 = the CA's own `solTable` / `solPool` / `solSpec`,
+read-only; gate `solute-look`). solutes.json's `tint`, `tintStrength` and
+`glow` are "at saturation", and "saturation" for the LOOK is the most this
+liquid can hold of the species: the species' saturation, or its lowest
+`converts` cMin for this solvent if that is lower (fairy dust converts water at
+48, so a fairy solution is at most 48 and would otherwise never show a fifth of
+its colour). With `c` = concentration / that reference (0..1): `a =
+c x tintStrength/255`, `g = c x glow/255`. The lookup is ONCE per liquid-surface
+pixel, at `h.liqCell` (the cell the primary ray entered the liquid through),
+inside `shadeWater` where the palette already becomes absorption and
+in-scatter -- never per march step, because the DDA loop is the fragment
+shader's register cliff. The body then absorbs the tint's COMPLEMENT (`+ (1 -
+tint) x a x 12` per metre -- a blue solution kills red and green, the rule
+liquidOptics applies to a palette) and its in-scatter moves toward `tint x
+0.45` by `a`; the glow is added to the refracted light as `tint x g x 1.6`,
+more with more liquid under the surface, so the Fresnel mix takes the
+reflected share off it. The veil inherits the tinted body. Viscous solvents
+(blood) get a post-shade pull toward the tint at the pixel's own brightness
+plus the glow. Cost: one table load on a pixel whose chunk has no solute
+(EMPTY returns), a pool word only for a real page; `raymarch` fragment stays at
+128 registers / 112 B local (binary 1,832,704 -> 1,839,872 B). Render-only,
+never hashed. Not done: the submerged view (`shadeSubmerged`) and the MPM
+surface (which refuses solute cells anyway) do not read it, the glow lights
+nothing but its own pixels (it is not a glow-field source), and a brine whose
+top cell is fresher than its bottom shows the top.
+
 **The bench's concentration conditions** (package G): `BuildBenchChemistry`
 compiles a solute-conditioned rule instead of skipping it -- `ChemRule::
 soluteSpecies/soluteMin/soluteMax`, resolved by name as UploadSolutes does --
@@ -1519,6 +1546,39 @@ table reads are already gated on material class (that gate took it from +9%);
 shrinking the inlined code (one call site for `solOnReplace`'s push loops, the
 dissolve out of line) is the next lever. Other scenes: idle, flythrough,
 explosion within noise; sim cost is zero where nothing is awake.
+
+**What was tried to win it back, and why none of it landed** (package H,
+2026-09-27; `--perf --scenario forestfire`, `SANDVOX_RUN_EXCLUSIVE=1`, CA row
+= the `ca` pass, every arm at world hash b74950d7; run-to-run noise measured
+~0.6 ms, so read one-run differences under ~0.7 ms as nothing):
+
+| arm | `step` regs / binary / local | CA ms |
+|---|---|---|
+| integration branch (hooks inline) | 56 / 2.23 MB / 64 B | 21.77, 21.63 |
+| hooks COMPILED OUT (the floor; not shippable) | 56 / 1.74 MB / 64 B | 20.48, 21.13 |
+| runtime gate `gSolNone` (chunk's solTable entry EMPTY) skipping every hook | 56 / 2.23 MB / 64 B | 22.18, 22.49 |
+| two copies of the cell body specialised on that gate | 56 / 4.00 MB / 96 B | 22.16 |
+| two IDENTICAL hook-free copies behind the same branch | ~3.5 MB | 22.04 |
+| move/transfer/self-write DEFERRED to one commit at the end of main | 72 / 1.79 MB / 32 B | 23.77 |
+| same, payload in workgroup memory | 72 / 1.76 MB | (not run: 72 regs) |
+| same, deferral with `solOnReplace` as one non-unrolled loop | 56 / 1.83 MB / 128 B | 25.92 |
+| `solOnReplace`'s two push loops as one loop body | 56 / 2.19 MB | (38 KB; not worth a run) |
+
+What the table says. The cost is real (~1 ms, the floor against the
+branch) and it is NOT executed work: a gate that skips every hook in a
+solute-free chunk does not help, and the dissolve read is not it either (its
+own arm, compiled out, 22.13). It tracks the SIZE of the pipeline: a second,
+never-executed copy of the hook-free body costs about as much as the hooks do.
+The only thing that shrank the binary -- recording the three hook-carrying acts
+(tryMove, transferLiquid, reactWriteSelf) where they happen and committing them
+once after the cell's turn, which is exact because each is the last thing a
+cell does -- made the NVIDIA compiler take `step` from 56 to 72 registers (one
+workgroup fewer per SM: 216 threads x 56 fits five, x 72 four) or, with the loop
+kept rolled, to 128 B of local memory, and both are far slower than the code
+they saved. The CA is therefore unchanged. The next real lever is structural
+rather than a WGSL trick: fewer call SITES of tryMove / reactWriteSelf in the
+CA itself (a step function that picks a target and moves once), which would
+shrink the pipeline with or without solutes.
 
 ### Day/night, and sunlight as a sim input (2026-08-20)
 

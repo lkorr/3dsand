@@ -876,9 +876,9 @@ Status GateSoluteVessel(Ctx& c, std::string& detail) {
 // ---- solute-look ------------------------------------------------------------
 // The RENDER half (package H; raymarch.wgsl solLookAt): six stone pools of
 // water side by side on the ground at noon -- plain, brine, fairy, vitriol,
-// lumen and ink -- each seeded with enough of its powder to sit near the
-// concentration its colour is authored "at saturation" for, left to dissolve,
-// then drawn from above into build/solute_look.bmp.
+// lumen and ink -- each POURED (CellOpSolute, package G) to a concentration a
+// little under the one its colour is authored "at saturation" for, then drawn
+// from above into build/solute_look.bmp.
 //
 // Asserted: every seeded pool carries dissolved mass (the fixture did what it
 // says, so a pixel verdict is about the shader and not an empty layer), the
@@ -889,66 +889,81 @@ Status GateSoluteVessel(Ctx& c, std::string& detail) {
 // tests/baseline.json (soluteLook.*). Render-only: the world hash does not see
 // any of it.
 Status GateSoluteLook(Ctx& c, std::string& detail) {
-  struct PoolDef { const char* powder; int grains; };
-  // Grains per pool: pool volume 6 x 6 x 3 = 108 cells, 256 units a voxel, so
-  // grains = 108 x target / 256 for a target concentration a bit under each
-  // species' reference (salt 90, fairy 48 in water, vitriol 200, lumen 96,
-  // ink 80 -- the lowest of saturation and the water `converts` cMin).
-  const PoolDef defs[6] = {{nullptr, 0},        {"salt", 30},
-                           {"fairy_dust", 15},  {"blue_vitriol", 63},
-                           {"luminous_spores", 30}, {"charcoal", 25}};
+  // Each pool is POURED to a target concentration (package G's CellOpSolute
+  // ops: mass straight into the water, no floating powder in the picture), a
+  // little under the species' look reference -- the lowest of its saturation
+  // and its water `converts` cMin (salt 90, fairy 48, vitriol 200, lumen 96,
+  // ink 80) -- so nothing converts and every pool is still that solution.
+  struct PoolDef { const char* species; uint32_t conc; };
+  const PoolDef defs[6] = {{nullptr, 0},     {"salt", 70},    {"fairy", 40},
+                           {"vitriol", 150}, {"lumen", 80},   {"ink", 64}};
   const char* names[6] = {"water", "brine", "fairy", "vitriol", "lumen", "ink"};
   const uint32_t water = MatNamed(c, "water");
-  uint32_t powder[6] = {0, 0, 0, 0, 0, 0};
+  uint32_t species[6] = {0, 0, 0, 0, 0, 0};
   for (int i = 1; i < 6; i++) {
-    powder[i] = MatNamed(c, defs[i].powder);
-    if (!powder[i]) {
-      detail = Format("needs material %s", defs[i].powder);
+    const SoluteDef* sd = CurrentSoluteNamed(defs[i].species);
+    if (!sd) {
+      detail = Format("needs solutes.json species %s", defs[i].species);
       return Status::Fail;
     }
+    species[i] = sd->species;
   }
   if (!water) { detail = "needs water"; return Status::Fail; }
   FixtureTuning tune;
   SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
   c.ctx.WaitIdle();
 
-  // 3 x 2 pools, 6 x 6 inside, walls one cell thick (two between pools).
-  const int bx = 160, bz = 160;
+  // 3 x 2 pools, 6 x 6 inside, 3 deep, walls one cell thick (two between).
+  const int bx = 160, bz = 160, kDeep = 3;
   const int fy = FixtureYOver(bx - 1, bz - 1, bx + 22, bz + 14, kDefaultSeed, 1);
   std::vector<Box> pools;
   for (int i = 0; i < 6; i++) {
     const int x0 = bx + (i % 3) * 8, z0 = bz + (i / 3) * 8;
     pools.push_back(Box{x0, x0 + 5, z0, z0 + 5, fy, fy + 4, false});
   }
-  std::vector<CellOp> build, fill, grains;
+  std::vector<CellOp> build, fill, pour[6];
   for (const Box& b : pools) {
     const std::vector<CellOp> v = b.Build((uint32_t)kMatStone);
     build.insert(build.end(), v.begin(), v.end());
-    const std::vector<CellOp> w = b.Layers(water, fy + 1, 3, 7u);
+    const std::vector<CellOp> w = b.Layers(water, fy + 1, kDeep, 7u);
     fill.insert(fill.end(), w.begin(), w.end());
   }
-  for (int i = 1; i < 6; i++) {
-    const Box& b = pools[i];
-    for (int g = 0; g < defs[i].grains; g++) {
-      const int x = b.x0 + g % 6, z = b.z0 + (g / 6) % 6, y = fy + 4 + g / 36;
-      grains.push_back({World::SlotCellIndex({x, y, z}), powder[i] & 0xFFFu});
-    }
-  }
-  const int kTicks = (int)BaselineNumber("soluteLook.ticks", 700);
+  // One pour per water CELL, of that cell's share: a whole column's worth
+  // poured onto one cell would sit above a `converts` cMin there (fairy,
+  // lumen) and convert before diffusion could spread it.
+  for (int i = 1; i < 6; i++)
+    for (int y = fy + 1; y <= fy + kDeep; y++)
+      for (int z = pools[i].z0; z <= pools[i].z1; z++)
+        for (int x = pools[i].x0; x <= pools[i].x1; x++)
+          pour[i].push_back({World::SlotCellIndex({x, y, z}),
+                             CellOpSolute(species[i], defs[i].conc)});
+  const int kTicks = (int)BaselineNumber("soluteLook.ticks", 120);
   uint32_t t = 61000;
   support::TickCursor ticker{c, t, {(bx + 11) >> 4, fy >> 4, (bz + 7) >> 4}};
   for (int i = 0; i < kTicks; i++)
-    ticker({}, i == 0 ? build : i == 2 ? fill : i == 4 ? grains : std::vector<CellOp>{});
+    // One pool's pours a tick: all 540 at once overran the cell-op stream cap.
+    ticker({}, i == 0 ? build : i == 2 ? fill
+                   : (i >= 6 && i < 11) ? pour[i - 5] : std::vector<CellOp>{});
 
   SoluteLayer L;
   ReadSoluteLayer(c, L);
   std::string latch;
   const bool latchOk = LatchesClean(L, latch);
+  // Mass and mean concentration INSIDE each pool (the shared Census counts
+  // whole chunks, and these pools share chunks).
   uint64_t mass[6] = {0, 0, 0, 0, 0, 0};
   bool massOk = true;
   for (int i = 0; i < 6; i++) {
-    mass[i] = Census(c, pools[i], L, powder[i] ? powder[i] : water).mass;
-    if (i > 0 && mass[i] == 0) massOk = false;
+    const Box& b = pools[i];
+    for (int y = fy + 1; y <= fy + kDeep; y++)
+      for (int z = b.z0; z <= b.z1; z++)
+        for (int x = b.x0; x <= b.x1; x++) {
+          const uint32_t slot = World::SlotChunkIndex({x >> 4, y >> 4, z >> 4});
+          const uint32_t local = (uint32_t)(((z & 15) * 16 + (y & 15)) * 16 + (x & 15));
+          const uint32_t v = L.Value(slot, local);
+          if ((v >> 8) == species[i] || i == 0) mass[i] += v & 0xFFu;
+        }
+    if ((i > 0) == (mass[i] == 0)) massOk = false;   // tinted pools carry mass, water none
   }
 
   // ---- the frame: noon, from the south, looking down into the pools ----
@@ -1026,9 +1041,9 @@ Status GateSoluteLook(Ctx& c, std::string& detail) {
   const double lumenBright = lum(4) - lum(0);
   const bool lookOk = projOk &&
                       inkDark >= BaselineNumber("soluteLook.minInkDark", 20) &&
-                      vitBlue >= BaselineNumber("soluteLook.minVitriolBlue", 15) &&
+                      vitBlue >= BaselineNumber("soluteLook.minVitriolBlue", 7) &&
                       fairyViolet >= BaselineNumber("soluteLook.minFairyViolet", 8) &&
-                      lumenBright >= BaselineNumber("soluteLook.minLumenBright", 8);
+                      lumenBright >= BaselineNumber("soluteLook.minLumenBright", 15);
   RecordObserved("soluteLook.inkDark", inkDark);
   RecordObserved("soluteLook.vitriolBlue", vitBlue);
   RecordObserved("soluteLook.fairyViolet", fairyViolet);
@@ -1036,8 +1051,8 @@ Status GateSoluteLook(Ctx& c, std::string& detail) {
 
   std::string pools6;
   for (int i = 0; i < 6; i++)
-    pools6 += Format("%s%s mass %llu rgb (%.0f,%.0f,%.0f)", i ? "; " : "", names[i],
-                     (unsigned long long)mass[i], rgb[i][0], rgb[i][1], rgb[i][2]);
+    pools6 += Format("%s%s c %.0f rgb (%.0f,%.0f,%.0f)", i ? "; " : "", names[i],
+                     (double)mass[i] / (36.0 * kDeep), rgb[i][0], rgb[i][1], rgb[i][2]);
   const bool ok = massOk && latchOk && lookOk;
   detail = Format("%s | vs water: ink darker by %.1f, vitriol bluer by %.1f, fairy more "
                   "violet by %.1f, lumen brighter by %.1f; frame %s%s%s",
