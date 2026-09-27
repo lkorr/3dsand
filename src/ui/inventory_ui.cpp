@@ -2082,7 +2082,7 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     if (ImGui::IsItemHovered())
       Tip("Pick up any vessel on the bench and carry it; the wheel (or Q / E) tilts it. "
           "Let go and it is set down upright. Click a vessel in the list to put it on "
-          "the bench or take it off.");
+          "the bench or take it off - two at a time, one for each hand.");
     if (ui::Button("##benchstick", ImVec2(colX + bw + 8, y), "stick", A.tool == 1, bw)) A.tool = 1;
     if (ImGui::IsItemHovered())
       Tip("Hold the button inside a vessel: the stick goes in through its neck and follows you.");

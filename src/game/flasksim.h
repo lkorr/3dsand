@@ -28,7 +28,9 @@
 // Not the 3D sim: floats, no hashing, no MutationQueue. The panel turns what
 // Tally() reports into an intent the game validates (conservation), which is
 // the only way contents change. See DESIGN.md "Alchemy bench".
+#include <cmath>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "game/composition.h"
@@ -48,6 +50,12 @@ struct Substance {
   int32_t density = 1000;  // the 3D sim's integer density: the ORDER is truth
   uint32_t moveEvery = 1;  // the 3D sim's viscosity
   uint32_t color[3]{};     // 0xAABBGGRR, the material's three palette entries
+  // HOW IT LOOKS, from the same authored fields the world's renderer reads
+  // (materials.h MaterialGpu): glow, media opacity, and the opaque flag that
+  // makes lava a surface rather than a medium. See Render.
+  uint8_t emission = 0;    // 0..255
+  uint8_t opacity = 255;   // 0..255 media absorbance (liquids)
+  bool opaque = false;     // kMatFlagOpaque
 };
 
 // A vessel's inside, as an authored profile: half-widths at heights, both in
@@ -89,6 +97,13 @@ struct SimConfig {
   float stiffness = 0.1f;      // Clavet k, per h
   float stiffnessNear = 0.4f;  // Clavet k_near, per h
   float kernelScale = 2.1f;    // h / lattice spacing
+  // Relaxation passes a step, alternating direction (a symmetric
+  // Gauss-Seidel). One pass in index order -- seeded bottom-up, so always
+  // bottom first -- left the bottom 40 px of a deep flask boiling for ever
+  // (RMS 0.1, peaks 0.9 px a step); two alternating passes hold it to a
+  // sub-pixel shimmer. The second pass only PUSHES (see StepLiquid).
+  int relaxIters = 2;
+  bool relaxAlternate = true;
   // mass = exp(ceil * atan(gain/ceil * ln(density/1000))): near water it is
   // (density/1000)^gain, and it never exceeds exp(ceil*pi/2).
   float massGain = 5.0f, massCeil = 1.6f;
@@ -101,12 +116,25 @@ struct SimConfig {
   float maxSpeedFrac = 0.4f;
   float listSlack = 1.15f;
   float maxVesselStep = 2.0f;  // px a vessel's outline may move per substep (< the glass)
+  // A vessel is a HELD THING, not a cursor: it reaches its target pose with
+  // at most this acceleration (x gravity) sideways or up, and this much
+  // downward (more would leave its liquid weightless). The liquid feels the
+  // vessel's acceleration as a tilt of gravity, tan = a/g, so these bound
+  // how far a shake can throw it up the glass.
+  float vesselAccel = 1.1f;
+  float vesselDropAccel = 0.6f;
   // ---- where the energy goes (without these a stirred mix churns forever) --
-  // Velocity kept per step, 1 - drag: a plain linear drag on every particle.
-  float damping = 0.02f;
+  // Velocity kept per step, 1 - drag, RELATIVE TO THE VESSEL the particle is
+  // in (its rigid motion at that point). A world-frame drag acted on a moving
+  // flask's liquid as a sideways gravity and ran it up the trailing wall and
+  // out; relative to the glass it only calms the slosh.
+  float damping = 0.004f;
+  float airDamping = 0.002f;   // in flight, outside every vessel
   // XSPH smoothing: each particle's velocity pulled this far toward its
   // neighbours' weighted mean. Eddies die; bulk flow is untouched.
-  float xsph = 0.12f;
+  // 0.2: at 0.12 a pour left the lip in globs that splashed off the rim of
+  // the vessel under it (alchemy-pour).
+  float xsph = 0.2f;
   // Glass contact: the part of a particle's motion ALONG the glass (relative
   // to the glass) lost per step; the part INTO or OFF it is set to the
   // glass's own -- no bounce, and a moving wall never gives a particle more
@@ -115,10 +143,15 @@ struct SimConfig {
   // Steps a freshly seeded particle is heavily damped for, so a vessel opens
   // calm instead of relaxing its lattice with a bang.
   int calmSteps = 90;
-  // A vessel sleeps once none of its liquid has moved faster than this (px
-  // per step) for this many steps in a row.
-  float sleepSpeed = 0.12f;
-  int sleepSteps = 45;     // neighbour-list radius / h   // velocity cap as a fraction of h per step
+  // A vessel sleeps once, over a window of sleepSteps undisturbed steps,
+  // its liquid has drifted less than sleepDrift px RMS (at most 1% more
+  // than 3x that) and no grain in it has moved: once the picture has stopped
+  // changing, so the freeze is invisible (UpdateSleep).
+  float sleepDrift = 0.6f;
+  int sleepSteps = 64;
+  // AddVessel runs the new vessel's contents to rest (in a scratch sim)
+  // before it appears: it arrives settled, and asleep.
+  bool settleOnAdd = true;
   uint32_t seed = 0x5eed;
 };
 
@@ -145,6 +178,9 @@ class FlaskSim {
   // sweeps grains; contents are never carried rigidly.
   void SetVesselXform(int v, const Xform& x);
   const Xform& VesselXform(int v) const { return vessels_[v].x; }
+  // Moves a vessel's glass (and pose target) straight to `x` with no motion
+  // profile: for placing, not carrying.
+  void TeleportVessel(int v, const Xform& x);
   // Would vessel `v` at `x` keep its glass clear of every other vessel's?
   // Step() refuses moves that fail this; the panel asks it to steer.
   bool PoseClear(int v, const Xform& x) const;
@@ -200,9 +236,18 @@ class FlaskSim {
   // Did the last Step change anything visible? (Awake liquid, a grain that
   // moved, a vessel that moved, the stick.) A quiet table need not be redrawn.
   bool Active() const { return active_; }
+  // Does the picture move on its own even when nothing is simulated (glow,
+  // fizz, the light on water)? The panel keeps redrawing it, slower.
+  bool Animated() const { return !px_.empty(); }
   // Read-only views for gates and the lab.
   const std::vector<V2>& Positions() const { return px_; }
   const std::vector<V2>& Velocities() const { return pv_; }
+  // Grain pixels in grain order (stable across a step unless a grain left
+  // the table), for gates.
+  void GrainPositions(std::vector<V2>& out) const {
+    out.resize(grains_.size());
+    for (size_t i = 0; i < grains_.size(); i++) out[i] = {(float)grains_[i].x, (float)grains_[i].y};
+  }
 
  private:
   struct Vessel {
@@ -214,7 +259,21 @@ class FlaskSim {
     // its own enters its box.
     bool asleep = false;
     int quiet = 0;
+    bool grainBusy = false;   // a grain inside it moved this step
+    V2 vel;                   // px / step (the motion profile, Step)
+    float angVel = 0;         // rad / step
+    float reach = 1;          // farthest outline point from the pose origin
     std::vector<V2> outline;  // local, left lip -> bottom -> right lip
+    // Near-glass raster in the vessel's frame (BuildOutline).
+    enum : uint8_t { kNear = 0, kFarIn = 1, kFarOut = 2 };
+    std::vector<uint8_t> near;
+    float nx0 = 0, ny0 = 0;
+    int nw = 0, nh = 0;
+    uint8_t Near(V2 l) const {
+      const int x = (int)std::floor(l.x - nx0), y = (int)std::floor(l.y - ny0);
+      if (x < 0 || y < 0 || x >= nw || y >= nh) return kFarOut;
+      return near[(size_t)y * nw + x];
+    }
   };
   struct Grain {
     int16_t x, y;
@@ -228,13 +287,16 @@ class FlaskSim {
     int8_t home = -1;
   };
 
-  void BuildOutline(Vessel& v) const;
+  void BuildOutline(Vessel& v, bool raster = true) const;
   bool InsideLocal(const Vessel& v, V2 local) const;
   bool InsideVessel(const Vessel& v, V2 world) const;
   V2 ToLocal(const Xform& x, V2 w) const;
   V2 ToWorld(const Xform& x, V2 l) const;
 
   void SeedVessel(int vi, const Composition& c);
+  static uint8_t SeedHeat(V2 p);
+  void AdoptSettled(int vi, const FlaskSim& from);
+  void MoveVessels();
   void RebuildWalls();
   void StepLiquid();
   void CollideLiquid();
@@ -248,8 +310,6 @@ class FlaskSim {
   bool GrainFree(int x, int y) const;
   bool PlaceGrain(Grain g, int nearX, int nearY);
   void BuildCells();
-  template <class F>
-  void ForNeighbours(int i, F&& f) const;
   void BucketPixels();
   float LiquidMassAt(int x, int y, int* count, V2* vel) const;
   void ShoveLiquid(int fromX, int fromY, int toX, int toY);
@@ -270,13 +330,23 @@ class FlaskSim {
   std::vector<float> mbar_;   // neighbourhood mean mass, last step
   std::vector<uint8_t> calm_; // steps of calm-in left
   std::vector<int8_t> phome_; // vessel a particle was last inside, -1 none
+  std::vector<uint8_t> pvar_; // look: which palette entry + a phase, fixed per particle
+  std::vector<V2> panc_;      // where it was when its vessel's quiet window began
+  std::vector<uint8_t> pheat_; // look: molten matter's heat phase (SeedHeat)
   // Particles [0, nAct_) are awake; [nAct_, size) belong to sleeping vessels.
   int nAct_ = 0;
-  std::vector<int> nbrStart_, nbr_;
+  std::vector<int> nbrStart_, nbr_, nbrFill_;
+  std::vector<std::pair<int, int>> pairs_;   // each neighbour pair once
+  std::vector<int> rcJ_;      // relaxation scratch: i's pairs inside h
+  std::vector<float> rcQ_;
+  std::vector<V2> rcN_;
   std::vector<V2> xs_;        // XSPH scratch
+  std::vector<float> xw_;
+  std::vector<int> orderScratch_;
 
   // hash grid over h-sized cells
   int cellsW_ = 0, cellsH_ = 0;
+  float cellSize_ = 6;
   std::vector<int> cellStart_, cellIdx_, cellOf_;
 
   // per-pixel particle buckets (coupling)
@@ -304,6 +374,7 @@ class FlaskSim {
   // pixel of it has changed. Every writer of grid_ wakes the tiles round
   // what it wrote (Wake), a moving vessel wakes everything.
   std::vector<uint8_t> awake_, awakeNext_;
+  std::vector<uint8_t> sandTile_;   // tiles holding any grain, this step
   int tilesW_ = 0, tilesH_ = 0;
   bool wakeAll_ = true;
   void Wake(int x, int y) {
@@ -327,6 +398,24 @@ class FlaskSim {
 
   std::vector<uint32_t> spilledUnits_;  // per substance slot
   int highlight_ = -1;
+  // ---- the look (Render): derived per substance at SetSubstances ----------
+  struct Look {
+    uint32_t col[3];   // display colours (the palette is linear light)
+    uint8_t kind;      // LookKind
+    float film, absorb;  // alpha = 1 - (1 - film) e^(-absorb * depth)
+    float glow;        // 0..1
+    uint8_t alpha[256];  // by depth below the surface
+  };
+  std::vector<Look> look_;
+  struct Bubble { float x, y, vy; uint8_t sub; uint8_t age; };
+  mutable std::vector<Bubble> bubbles_;
+  mutable uint32_t lookRng_ = 0x9e3779b9u;
+  mutable uint32_t lastRenderStep_ = 0;
+  mutable std::vector<float> rTotal_, rBest_, rGlow_;
+  mutable std::vector<int> rOwner_;
+  mutable std::vector<uint8_t> rDepth_;
+  mutable std::vector<float> rHeat_;
+  mutable std::vector<uint8_t> rGlowOn_;
   bool active_ = true;
   int grainMoves_ = 0;   // grains moved in the current step
   uint32_t rng_;

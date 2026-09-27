@@ -230,6 +230,152 @@ Status GateAlchemyCost(Ctx& c, std::string& detail) {
   return Status::Pass;
 }
 
+// The bench's own table (game/alchemy_bench.h: 12 units an eighth, a
+// particle half of one) and a flask of the item's capacity, 1024 eighths.
+alchemy::SimConfig BenchConfig() {
+  alchemy::SimConfig cfg;
+  cfg.gridW = 480;
+  cfg.gridH = 380;
+  cfg.unitsPerEighth = 12;
+  cfg.unitsPerParticle = 6;
+  return cfg;
+}
+alchemy::VesselShape BenchFlask(float capEighths) {
+  return alchemy::ShapeWithArea(alchemy::FlaskShape(110, 150), capEighths * 12);
+}
+
+// SHAKING A FLASK KEEPS ITS LIQUID IN, AND IT SLOSHES FOR A WHILE AFTER.
+// Carried side to side the way a hand would, a 60%-full flask used to throw
+// a fifth to a third of its water out of the mouth (a world-frame drag on
+// the liquid was a sideways gravity), and a flask set down froze solid in a
+// fifth of a second (a sleep test on speed, set loose enough to sleep at
+// all). Asserted: nothing spills; half a second after the hand stops the
+// liquid is still moving; it sleeps within a few seconds (cost).
+Status GateAlchemyShake(Ctx& c, std::string& detail) {
+  const int water = MatId(c, "water");
+  if (water < 0) { detail = "no water"; return Status::Fail; }
+  Composition in;
+  in.Add((uint16_t)water, 600);
+  auto subs = alchemy::SubstancesFor(c.mats, {&in});
+  FlaskSim s(BenchConfig());
+  s.SetSubstances(subs);
+  const int v = s.AddVessel(BenchFlask(1024), {{240, 4}, 0}, in);
+  const int stopAt = 150, frames = 60 * 9;
+  int sleptAt = -1;
+  bool movingAfterStop = false;
+  for (int f = 0; f < frames; f++) {
+    const float t = f / 60.0f;
+    const float dx = f < stopAt ? 70.0f * std::sin(6.2832f * 1.5f * t) : 0.0f;
+    s.SetVesselXform(v, {{240 + dx, 34}, 0});
+    s.Step(4);
+    if (f == stopAt + 30) movingAfterStop = !s.VesselAsleep(v) && s.MovingCount(0.3f) > 0;
+    if (f > stopAt && sleptAt < 0 && s.VesselAsleep(v)) sleptAt = f;
+  }
+  Shot(s, "alchemy_shake.bmp");
+  const auto t = s.Count();
+  std::string why;
+  const bool cons = Conserved(in, t, why);
+  const uint32_t spilled = t.spilled.Total();
+  const double maxSleep = BaselineNumber("alchemy.shakeSleepWithinSec", 6.0);
+  const bool slept = sleptAt >= 0 && (sleptAt - stopAt) / 60.0 <= maxSleep;
+  RecordObserved("alchemy.shakeSleepSec", sleptAt < 0 ? -1.0 : (sleptAt - stopAt) / 60.0);
+  detail = Format("%s; spilled %u eighths; still sloshing 0.5 s after: %s; asleep %.2f s after the hand stopped",
+                  cons ? "conserved" : why.c_str(), spilled, movingAfterStop ? "yes" : "NO",
+                  sleptAt < 0 ? -1.0 : (sleptAt - stopAt) / 60.0);
+  const bool ok = cons && spilled == 0 && movingAfterStop && slept;
+  std::printf("alchemy-shake: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// A VESSEL ARRIVES SETTLED. It used to appear seeded -- a lattice filled to
+// the neck, with the particles that had no lattice point dropped in a heap by
+// the mouth -- and visibly sag, spray and settle in its first second.
+// Asserted on a brim-full flask of three substances: nothing outside it,
+// asleep on arrival, and nothing moving in its first frame.
+Status GateAlchemySpawn(Ctx& c, std::string& detail) {
+  const int water = MatId(c, "water"), oil = MatId(c, "oil"), sand = MatId(c, "sand");
+  if (water < 0 || oil < 0 || sand < 0) { detail = "missing water/oil/sand"; return Status::Fail; }
+  Composition in;
+  in.Add((uint16_t)water, 600);
+  in.Add((uint16_t)oil, 300);
+  in.Add((uint16_t)sand, 100);
+  auto subs = alchemy::SubstancesFor(c.mats, {&in});
+  FlaskSim s(BenchConfig());
+  s.SetSubstances(subs);
+  const auto t0 = std::chrono::steady_clock::now();
+  const int v = s.AddVessel(BenchFlask(1024), {{240, 4}, 0}, in);
+  const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  Shot(s, "alchemy_spawn.bmp");
+  const auto t = s.Count();
+  const bool asleep = s.VesselAsleep(v);
+  s.Step(4);
+  const int moving = s.MovingCount(0.1f);
+  std::string why;
+  const bool cons = Conserved(in, t, why);
+  RecordObserved("alchemy.spawnSettleMs", ms);
+  detail = Format("%s; outside %u eighths; asleep on arrival %s; moving after a frame %d; settled in %.0f ms",
+                  cons ? "conserved" : why.c_str(), t.spilled.Total(), asleep ? "yes" : "NO", moving, ms);
+  const bool ok = cons && t.spilled.Total() == 0 && asleep && moving == 0;
+  std::printf("alchemy-spawn: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// SAND IN A CARRIED VESSEL STAYS PUT. A grain's sub-pixel position went
+// stale whenever the CA moved it, and the next carry put it back where it
+// had been: sand that snapped up into the air and poured down again every
+// time the vessel moved. Asserted over a vial of sand and water swung,
+// lifted, turned and set down: no grain leaves it, almost no grain moves
+// more than 3 px in a step (the glass shoving a packed pile moves some), none
+// more than 8, and the whole of it sleeps once set down.
+Status GateAlchemySandCarry(Ctx& c, std::string& detail) {
+  const int water = MatId(c, "water"), sand = MatId(c, "sand");
+  if (water < 0 || sand < 0) { detail = "missing water/sand"; return Status::Fail; }
+  Composition in;
+  in.Add((uint16_t)sand, 90);
+  in.Add((uint16_t)water, 80);
+  auto subs = alchemy::SubstancesFor(c.mats, {&in});
+  FlaskSim s(BenchConfig());
+  s.SetSubstances(subs);
+  const int v = s.AddVessel(BenchFlask(256), {{200, 4}, 0}, in);
+  std::vector<V2> before, after;
+  long moves = 0, big = 0;
+  int worst = 0, sleptAt = -1;
+  const int setDown = 240;
+  for (int f = 0; f < 600; f++) {
+    const float t = f / 60.0f;
+    if (f < setDown)
+      s.SetVesselXform(v, {{200 + 60 * std::sin(t * 2.1f), 60 + 40 * std::sin(t * 1.3f)}, 0.9f * std::sin(t * 1.7f)});
+    else
+      s.SetVesselXform(v, {{260, 4}, 0});
+    for (int k = 0; k < 4; k++) {
+      s.GrainPositions(before);
+      s.Step(1);
+      s.GrainPositions(after);
+      if (before.size() != after.size()) continue;
+      for (size_t i = 0; i < after.size(); i++) {
+        const int j = (int)std::max(std::fabs(after[i].x - before[i].x), std::fabs(after[i].y - before[i].y));
+        moves += j > 0;
+        big += j > 3;
+        worst = std::max(worst, j);
+      }
+    }
+    if (f > setDown && sleptAt < 0 && s.VesselAsleep(v)) sleptAt = f;
+  }
+  Shot(s, "alchemy_sandcarry.bmp");
+  const auto t = s.Count();
+  std::string why;
+  const bool cons = Conserved(in, t, why);
+  const double bigFrac = moves ? (double)big / moves : 0.0;
+  RecordObserved("alchemy.sandBigMoveFrac", bigFrac);
+  const double maxBig = BaselineNumber("alchemy.sandBigMoveFracMax", 0.005);
+  detail = Format("%s; spilled %u; grain moves %ld, >3 px %ld (%.3f%%), worst %d px; asleep %.2f s after set-down",
+                  cons ? "conserved" : why.c_str(), t.spilled.Total(), moves, big, 100 * bigFrac, worst,
+                  sleptAt < 0 ? -1.0 : (sleptAt - setDown) / 60.0);
+  const bool ok = cons && t.spilled.Total() == 0 && bigFrac <= maxBig && worst <= 8 && sleptAt >= 0;
+  std::printf("alchemy-sand-carry: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AlchemyGates() {
@@ -238,6 +384,9 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-layers", "player", {}, false, GateAlchemyLayers},
       {"alchemy-pour", "player", {}, false, GateAlchemyPour},
       {"alchemy-cost", "player", {}, true, GateAlchemyCost},
+      {"alchemy-shake", "player", {}, false, GateAlchemyShake},
+      {"alchemy-spawn", "player", {}, false, GateAlchemySpawn},
+      {"alchemy-sand-carry", "player", {}, false, GateAlchemySandCarry},
   };
   return g;
 }

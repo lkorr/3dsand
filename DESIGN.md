@@ -16345,7 +16345,15 @@ grantkot.com/ll -- not MLS-MPM, which is heavier and buys nothing at this scale.
   inside another liquid is squeezed to the NEAREST free surface, not to the
   one its density says.
 - Viscosity comes from `moveEvery`.
-- One neighbour list per step serves viscosity and relaxation.
+- One neighbour list per step serves viscosity, relaxation and XSPH. Each pair
+  is found once (a half-stencil scan over cells as wide as the list's reach)
+  and mirrored into both particles' lists; the cells used to be `h` wide
+  against a `1.15 h` reach, which silently missed pairs straddling two cells.
+- TWO relaxation passes a step, in alternating directions (a symmetric
+  Gauss-Seidel, `relaxIters`). One pass in index order -- seeded bottom-up, so
+  always bottom first -- left the bottom 40 px of a deep flask boiling for
+  ever (RMS 0.1 px/step, peaks 0.9); the old sleep test hid it by freezing at
+  a speed you could see. Two alternating passes leave a sub-pixel shimmer.
 
 **Powders**: a falling-sand CA, one grain per pixel.
 - A grain reads the smoothed liquid field (the same splat the renderer
@@ -16368,18 +16376,32 @@ material) and converts to eighths by largest remainder per material, so every
 material's eighths out equal its eighths in. Anything that leaves the panel is
 counted as spilled, never dropped.
 
-**Vessels are kinematic**: the panel sets a TARGET pose; the vessel moves
-toward it at most `maxVesselStep` px per substep and refuses any move that
-would bring its glass into another vessel's (`PoseClear`). The glass pushes
-liquid (collision in the vessel's own frame at both ends of the step, so a
-moving wall is relative motion) and SWEEPS grains: a grain the wall lands on
+**Vessels are kinematic, with a motion profile** (`MoveVessels`, 2026-09-27):
+the panel sets a TARGET pose and the vessel chases it with a velocity of its
+own, changed by at most `vesselAccel` x gravity a step sideways or up and
+`vesselDropAccel` x gravity downward (more would leave its liquid weightless),
+braking in time to stop on it; no outline point moves more than
+`maxVesselStep` px a substep. The liquid feels a vessel's acceleration as a
+tilt of gravity, tan = a/g, so this is what bounds how hard a flick of the
+pointer can throw it: a hand carrying a flask, not a cursor. A move that would
+bring its glass into another vessel's (`PoseClear`) slides, and loses the
+refused part of its velocity. The glass keeps each particle on its SIDE --
+inside or outside the outline closed across the mouth, by the polygon test at
+both ends of the step, each in the vessel's frame at its own time -- and a
+particle that changed side without crossing the mouth went through the glass
+and is put back through the nearest segment. (The old per-segment sign test
+missed a crossing at a vertex and then pushed along the vector from the glass,
+further out: a carried flask seeped. A per-vessel near-glass raster in the
+vessel's own frame skips the particles nowhere near it.) The glass SWEEPS
+grains: a grain the wall lands on
 goes to the nearest free pixel on the side it was on, by a breadth-first
 search through the pile that shifts every grain on the path. The first
 version carried grains rigidly, which made tilting sand ride along as a block
 and leak through the glass when packed.
 
-The sweep's search may pass through a few pixels of glass (a grain the wall
-landed on is IN the glass) but only a free pixel off it, on the grain's side,
+The sweep's search may pass through two pixels of glass (a grain the wall
+landed on is IN the glass; at five, a path along the band made turning flasks
+shuffle the grains on their wall 3-5 px a step) but only a free pixel off it, on the grain's side,
 ends it; each grain remembers the vessel it was last clearly inside (`home`),
 because judged from inside the glass it can read as outside. A vessel also
 CARRIES its grains by its own rigid motion at each grain -- whole for a
@@ -16401,7 +16423,12 @@ particle count bounded.
 
 Cost (gate `alchemy-cost`, advisory): a nearly full flask (450 particles, 720
 grains) is ~2 ms per frame at three substeps plus ~0.4 ms to render. Lifting a
-full pouch's pile (2,455 grains) peaks at ~6 ms.
+full pouch's pile (2,455 grains) peaks at ~6 ms. At the bench's own particle
+size, a brim-full flask of water, oil and sand (1,800 particles, 960 grains)
+kept swaying is ~7 ms a frame at four substeps, ~1.6 ms to render; settled, it
+sleeps and costs nothing. The liquid is splatted into the pixel field only
+within a 16 px tile of sand (nothing else reads it), and the awake particles
+are re-sorted into cell order every 16 steps.
 
 **Mixtures in vessels.** `ItemInstance::contents` is a `Composition`, up to 16
 `(material, eighths)` portions. Scoop and deposit add a portion (a 17th is
@@ -16432,9 +16459,11 @@ holds what it left with). Two tools: the HAND picks any vessel up where you
 click it, carries it and tilts it (wheel, Q / E) about that grab point, and sets
 it down upright in the nearest free spot when you let go; the STICK's tip
 follows the pointer inside whichever vessel it is in, through that vessel's
-neck. Vessels follow the hand by an exponential approach and never more than
-10 px / 0.3 rad ahead of the glass, so a vessel held against another does not
-wind up a lead it releases in one jerk. The kit is written only at "done" (Esc,
+neck. The hand's goal goes straight to the sim's motion profile (above); the
+bench used to smooth it too, which was lag on top of the jerk. TWO VESSELS AT A
+TIME (`kMaxOnTable`): the character works the bench with their own two hands,
+one vessel in each; a third is refused with the reason. They stand at a third
+and two thirds of the table. The kit is written only at "done" (Esc,
 or the screen shutting): every vessel that was ever on the table is re-checked
 against what came on and `ValidateBench` proves conservation, as before.
 
@@ -16447,7 +16476,13 @@ game's frame rate. Particles are half an eighth (`kUnitsPerParticle` 6 at
 owner could see as blobs.
 
 **Where the energy goes.** Without these a stirred water+acid flask churned for
-ever and a fresh flask burst open: a linear drag (`damping`), XSPH velocity
+ever and a fresh flask burst open: a linear drag (`damping`) RELATIVE TO THE
+VESSEL the particle is in -- the glass's own rigid motion at that point; in the
+world frame a carried flask's liquid was dragged back at 1.6 g, a sideways
+gravity that ran it up the trailing wall and out of the mouth on every shake,
+and at 0.02 a step it also killed any slosh in a fifth of a second (now 0.004:
+a shaken flask sloshes for a second or two) -- plus extra damping of motion
+slower than `restSpeed`, the relaxation's noise rather than flow, XSPH velocity
 smoothing (`xsph`), a glass contact that zeroes the relative velocity into or
 off the wall and bleeds `wallFriction` along it (a moving wall never gives a
 particle more than its own speed -- the old position push launched liquid), a
@@ -16457,12 +16492,45 @@ liquid behind and the glass pushed it through), and gravity lowered to 0.025
 px/step^2 -- with finer particles a column is more particles deep, and past
 that the bottom of a full flask shimmered for ever.
 
-**Sleep.** A vessel whose liquid has an RMS speed under `sleepSpeed` with under
-2% visibly moving, for `sleepSteps` steps, SLEEPS: its particles are kept after
-the awake ones (`nAct_`) and skipped by the whole liquid step. Moving, the
-stick near it, or anything moving that is not its own entering its box wakes
-it. A settled full flask: 7.6 -> 0.1 ms. Sand sleeps separately in 16x16 tiles
-(below).
+**Sleep.** A vessel whose liquid has DRIFTED under `sleepDrift` px RMS (no
+particle more than 3x that) over a window of `sleepSteps` undisturbed steps,
+with no grain in it moving, SLEEPS: its particles are kept after the awake
+ones (`nAct_`) and skipped by the whole liquid step. Judged on drift, not
+speed: the residue of the relaxation is an oscillation in place, and a speed
+test either never sleeps through it or, set loose enough to (the old 0.12
+px/step for 45 steps), froze a slosh mid-motion -- the "everything suddenly
+freezes" the owner saw. The freeze is now invisible. Moving, the stick near
+it, a grain moving inside it, or anything moving that is not its own entering
+its box wakes it. A settled full flask: 7.6 -> 0.1 ms. Sand sleeps separately
+in 16x16 tiles (below).
+
+**Arrives settled.** `AddVessel` seeds the contents into a scratch table
+holding only that vessel, runs them to rest there (heavily damped, nothing to
+look at) and adopts the result: the vessel appears at rest, asleep. Seeded
+straight onto the table, a flask appeared brim-full, sagged, and sprayed the
+particles that had no lattice point (all dropped at one spot by the neck) out
+over the glass. A brim-full flask takes ~160 steps, ~250 ms, on the bench's
+thread.
+
+**The look** (`Render`, 2026-09-27). Derived per substance from the fields the
+world's renderer reads (`flasksim_mats.h` carries `emission`, `opacity` and
+the opaque flag): the palette is LINEAR light and is encoded for the screen
+(1/1.5 -- raw, blood read black; a full 1/2.2 washed water grey and oil
+khaki). An OPAQUE liquid (lava, molten glass) is a glowing surface: a heat
+phase per particle from smooth noise of where it was seeded, so the blobs it
+makes are carried and torn by the flow, a dark cooling skin broken where the
+heat wells up, and slow bubbles that burst at the top. A VISCOUS one (the
+world's `isViscousLiquid`: `moveEvery` > 1 and `opacity` >= 150 -- oil, blood,
+ichor) is smooth, darker and glossy with a sheen under its surface. Anything
+else is a translucent medium whose alpha thickens with depth by its
+`opacity`, with a lit surface line, light where it runs fast, and glints
+that ride their particles. `emission` lights a blurred quarter-resolution
+glow field thrown on the glass, the sand and the air (a halo), and makes a
+translucent liquid breathe and fizz (acid). Wet sand is darker. Every pattern
+belongs to a PARTICLE (its palette entry, its phase), so it flows with the
+liquid: the old pattern was fixed in screen space and read as a static
+checkerboard the liquid was a window onto. The panel redraws at 30 a second
+while the table only looks alive.
 
 **Sand performance** (measured by an Opus review of the CA, 2026-09-27): a
 per-pixel INSIDE mask rasterized with the glass (grain homes, the sweep and the
@@ -16486,7 +16554,14 @@ flask drawing its layers, refraction. Reactions must run on the vessel's
 `contents` in the game's tick, not on the bench's particles -- the bench is a
 UI device.
 
-Gates: `alchemy-layers` (lava, sand, acid, water and oil stirred through the
+Gates: `alchemy-shake` (a 60%-full flask carried side to side: nothing spills,
+still sloshing half a second after the hand stops, asleep within 6 s),
+`alchemy-spawn` (a brim-full flask of three substances arrives asleep, nothing
+outside it, nothing moving in its first frame), `alchemy-sand-carry` (a vial of
+sand and water swung, lifted, turned and set down: nothing leaves it, under
+0.5% of grain moves exceed 3 px in a step, none 8, and it sleeps -- a grain's
+sub-pixel position went stale whenever the CA moved it, and the next carry put
+it back where it had been: sand that snapped up into the air), `alchemy-layers` (lava, sand, acid, water and oil stirred through the
 mouth, then left: exactly conserved, nothing spilled, mean heights in density
 order), `alchemy-pour` (oil and sand poured from a tilting flask into water:
 conserved, 80%+ of the oil arrives, under 5% of it splashes; the sand is

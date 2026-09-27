@@ -1,8 +1,11 @@
 #include "game/flasksim.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
 
 namespace alchemy {
 
@@ -44,6 +47,33 @@ inline uint32_t Lift(uint32_t c, int amount, int alpha) {
                   ChG(c) + (255 - ChG(c)) * amount / 16,
                   ChB(c) + (255 - ChB(c)) * amount / 16, alpha);
 }
+inline uint32_t MixRGB(uint32_t a, uint32_t b, float t, int alpha) {
+  return PackRGBA((int)(ChR(a) + (ChR(b) - ChR(a)) * t), (int)(ChG(a) + (ChG(b) - ChG(a)) * t),
+                  (int)(ChB(a) + (ChB(b) - ChB(a)) * t), alpha);
+}
+inline uint32_t AddRGB(uint32_t c, float r, float g, float b, int alpha) {
+  return PackRGBA(ChR(c) + (int)r, ChG(c) + (int)g, ChB(c) + (int)b, alpha);
+}
+
+// The material palette is LINEAR light (the world's frame is lit, tonemapped
+// and gamma-encoded at the end); the bench draws straight to the screen, so
+// it encodes it here. Raw, blood (#5a0606) read as black; a full 1/2.2
+// encode (an albedo under full sun) washed water grey and oil khaki. 1/1.5
+// sits where the world's daylight puts them.
+inline uint32_t ToDisplay(uint32_t c) {
+  static const auto lut = [] {
+    std::array<uint8_t, 256> t{};
+    for (int i = 0; i < 256; i++) t[i] = (uint8_t)std::lround(255.0 * std::pow(i / 255.0, 1.0 / 1.5));
+    return t;
+  }();
+  return PackRGBA(lut[ChR(c)], lut[ChG(c)], lut[ChB(c)], 255);
+}
+
+// What a liquid LOOKS like, from the authored fields the world's renderer
+// reads (common.wgsl): the opaque flag (lava is a surface, not a medium),
+// isViscousLiquid (moveEvery > 1 and opacity >= 150: a smooth wet sheen, no
+// ripples), and media opacity for everything else (how fast depth darkens).
+enum LookKind : uint8_t { kLookClear = 0, kLookViscous = 1, kLookMolten = 2 };
 
 }  // namespace
 
@@ -132,8 +162,12 @@ FlaskSim::FlaskSim(const SimConfig& cfg) : cfg_(cfg), rng_(cfg.seed | 1u) {
     }
   rho0_ = rho + (cfg_.stiffnessNear / cfg_.stiffness) * rhoN * (1 - q1);
 
-  cellsW_ = (int)std::ceil(cfg_.gridW / h_) + 1;
-  cellsH_ = (int)std::ceil(cfg_.gridH / h_) + 1;
+  // Cells as wide as the neighbour list's reach, so a 3x3 scan finds every
+  // pair inside it. (They were h wide against a 1.15 h reach, and the pairs
+  // in between were missed whenever they straddled two cells.)
+  cellSize_ = h_ * cfg_.listSlack;
+  cellsW_ = (int)std::ceil(cfg_.gridW / cellSize_) + 1;
+  cellsH_ = (int)std::ceil(cfg_.gridH / cellSize_) + 1;
   grid_.assign((size_t)cfg_.gridW * cfg_.gridH, 0);
   wall_.assign((size_t)cfg_.gridW * cfg_.gridH, 0);
 }
@@ -156,6 +190,22 @@ void FlaskSim::SetSubstances(const std::vector<Substance>& subs) {
     float me = (float)std::max<uint32_t>(1, subs[i].moveEvery);
     visc_[i] = cfg_.viscosity * me * me;
   }
+  look_.resize(subs.size());
+  for (size_t i = 0; i < subs.size(); i++) {
+    const Substance& s = subs[i];
+    Look& L = look_[i];
+    for (int k = 0; k < 3; k++) L.col[k] = ToDisplay(s.color[k]);
+    const float op = s.opacity / 255.0f;
+    L.kind = s.opaque ? kLookMolten : (s.moveEvery > 1 && s.opacity >= 150) ? kLookViscous : kLookClear;
+    L.film = s.opaque ? 1.0f : 0.55f + 0.35f * op;
+    L.absorb = 0.02f + 0.10f * op;
+    L.glow = s.emission / 255.0f;
+    // Alpha by depth below the surface: the film at the top, thickening
+    // toward what the opacity allows.
+    const float maxA = s.opaque || L.kind == kLookViscous ? 1.0f : 0.72f + 0.28f * op;
+    for (int d = 0; d < 256; d++)
+      L.alpha[d] = (uint8_t)std::lround(255.0f * (L.film + (maxA - L.film) * (1.0f - std::exp(-L.absorb * d))));
+  }
 }
 
 V2 FlaskSim::ToLocal(const Xform& x, V2 w) const {
@@ -168,12 +218,39 @@ V2 FlaskSim::ToWorld(const Xform& x, V2 l) const {
   return {x.pos.x + l.x * c - l.y * s, x.pos.y + l.x * s + l.y * c};
 }
 
-void FlaskSim::BuildOutline(Vessel& v) const {
+void FlaskSim::BuildOutline(Vessel& v, bool raster) const {
   const auto& pr = v.shape.profile;
   float hw = v.shape.width * 0.5f, H = v.shape.height;
   v.outline.clear();
   for (int i = (int)pr.size() - 1; i >= 0; i--) v.outline.push_back({-pr[i].x * hw, pr[i].y * H});
   for (size_t i = 0; i < pr.size(); i++) v.outline.push_back({pr[i].x * hw, pr[i].y * H});
+  v.reach = 1;
+  for (V2 o : v.outline) v.reach = std::max(v.reach, Len(o));
+  if (!raster) return;
+  // The near-glass raster, in the vessel's own frame (its shape never
+  // changes): each 1 px cell is far-inside, far-outside, or near the glass.
+  // "Far" is past the contact radius plus a step's worth of relative motion
+  // (a particle's speed cap plus the glass's), plus a cell's diagonal.
+  const float R = v.shape.wall + spacing_ * 0.45f;
+  const float far = R + cfg_.maxSpeedFrac * h_ + cfg_.maxVesselStep + 1.5f;
+  float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+  for (V2 o : v.outline) { x0 = std::min(x0, o.x); x1 = std::max(x1, o.x); y0 = std::min(y0, o.y); y1 = std::max(y1, o.y); }
+  v.nx0 = std::floor(x0 - far - 2);
+  v.ny0 = std::floor(y0 - far - 2);
+  v.nw = (int)std::ceil(x1 + far + 2 - v.nx0);
+  v.nh = (int)std::ceil(y1 + far + 2 - v.ny0);
+  v.near.assign((size_t)v.nw * v.nh, Vessel::kNear);
+  for (int yy = 0; yy < v.nh; yy++)
+    for (int xx = 0; xx < v.nw; xx++) {
+      const V2 p{v.nx0 + xx + 0.5f, v.ny0 + yy + 0.5f};
+      float dmin = 1e9f;
+      for (size_t k = 0; k + 1 < v.outline.size(); k++)
+        dmin = std::min(dmin, Len(p - ClosestOnSeg(p, v.outline[k], v.outline[k + 1], nullptr)));
+      // The mouth is not glass, but a particle crossing it changes side:
+      // near the mouth line counts as near.
+      dmin = std::min(dmin, Len(p - ClosestOnSeg(p, v.outline.front(), v.outline.back(), nullptr)));
+      if (dmin > far) v.near[(size_t)yy * v.nw + xx] = InsideLocal(v, p) ? Vessel::kFarIn : Vessel::kFarOut;
+    }
 }
 
 bool FlaskSim::InsideLocal(const Vessel& v, V2 p) const {
@@ -199,13 +276,76 @@ int FlaskSim::AddVessel(const VesselShape& shape, const Xform& x, const Composit
   BuildOutline(v);
   vessels_.push_back(std::move(v));
   RebuildWalls();
-  for (Vessel& o : vessels_) o.asleep = false, o.quiet = 0;
-  SeedVessel((int)vessels_.size() - 1, c);
-  nAct_ = (int)px_.size();
-  return (int)vessels_.size() - 1;
+  const int vi = (int)vessels_.size() - 1;
+  wakeAll_ = true;
+  if (!cfg_.settleOnAdd) {
+    SeedVessel(vi, c);
+    Partition();
+    return vi;
+  }
+  // SETTLED ON ARRIVAL. The seed is a lattice, not a resting liquid: shown
+  // as seeded, a flask appeared brim-full, sagged, and shed the particles
+  // that had no lattice point over its lip. So the contents are run to rest
+  // in a scratch table holding only this vessel, heavily damped (nothing to
+  // look at there), and adopted from it: the vessel appears at rest, asleep.
+  SimConfig sc = cfg_;
+  sc.settleOnAdd = false;
+  sc.calmSteps = 0;
+  sc.damping = 0.03f;
+  sc.xsph = 0.2f;
+  sc.sleepDrift = 0.4f;
+  sc.sleepSteps = 24;
+  FlaskSim tmp(sc);
+  tmp.SetSubstances(subs_);
+  tmp.AddVessel(shape, x, c);
+  for (int s = 0; s < 1500; s++) {
+    tmp.Step(1);
+    if (s > 30 && tmp.VesselAsleep(0) && tmp.grainMoves_ == 0 && tmp.MovingCount(0.25f) == 0) break;
+  }
+  AdoptSettled(vi, tmp);
+  return vi;
+}
+
+void FlaskSim::AdoptSettled(int vi, const FlaskSim& from) {
+  for (size_t i = 0; i < from.px_.size(); i++) {
+    px_.push_back(from.px_[i]);
+    pprev_.push_back(from.px_[i]);
+    pv_.push_back({0, 0});
+    psub_.push_back(from.psub_[i]);
+    pw_.push_back(from.pw_[i]);
+    mbar_.push_back(from.mbar_[i]);
+    calm_.push_back(0);
+    phome_.push_back(from.phome_[i] == 0 ? (int8_t)vi : (int8_t)-1);
+    pvar_.push_back(from.pvar_[i]);
+    panc_.push_back(from.px_[i]);
+    pheat_.push_back(from.pheat_[i]);
+  }
+  for (const Grain& g0 : from.grains_) {
+    Grain g = g0;
+    g.home = g0.home == 0 ? (int8_t)vi : (int8_t)-1;
+    g.vx = g.vy = 0;
+    if (!PlaceGrain(g, g.x, g.y)) spilledUnits_[g.sub]++;
+  }
+  for (size_t s = 0; s < spilledUnits_.size() && s < from.spilledUnits_.size(); s++)
+    spilledUnits_[s] += from.spilledUnits_[s];
+  // Anything that did not come to rest (it could not, in 1500 steps) is left
+  // awake; a resting vessel starts asleep and costs nothing until touched.
+  Vessel& v = vessels_[vi];
+  v.asleep = from.vessels_[0].asleep;
+  v.quiet = 0;
+  Partition();
 }
 
 void FlaskSim::SetVesselXform(int vi, const Xform& x) { vessels_[vi].target = x; }
+
+void FlaskSim::TeleportVessel(int vi, const Xform& x) {
+  Vessel& v = vessels_[vi];
+  v.x = v.prevX = v.target = x;
+  v.vel = {0, 0};
+  v.angVel = 0;
+  RebuildWalls();
+  wakeAll_ = true;
+}
 
 void FlaskSim::SetStick(bool on, V2 a, V2 b, float r) {
   if (on && !stickOn_) { stickPrevA_ = a; stickPrevB_ = b; }
@@ -223,6 +363,28 @@ uint32_t FlaskSim::Rand() {
 }
 
 // ---- seeding ---------------------------------------------------------------
+
+// A particle's HEAT PHASE (the look of molten matter): smooth value noise of
+// where it was seeded, so neighbours start alike and the blobs they make are
+// carried and torn by the flow. Random per particle it was salt and pepper.
+uint8_t FlaskSim::SeedHeat(V2 p) {
+  auto hash = [](int x, int y) {
+    uint32_t h = (uint32_t)x * 374761393u + (uint32_t)y * 668265263u;
+    h = (h ^ (h >> 13)) * 1274126177u;
+    return ((h ^ (h >> 16)) & 1023) / 1023.0f;
+  };
+  float v = 0, amp = 0.65f, f = 1.0f / 14.0f;
+  for (int o = 0; o < 2; o++, amp *= 0.35f, f *= 2.3f) {
+    const float x = p.x * f, y = p.y * f;
+    const int x0 = (int)std::floor(x), y0 = (int)std::floor(y);
+    float ax = x - x0, ay = y - y0;
+    ax = ax * ax * (3 - 2 * ax);
+    ay = ay * ay * (3 - 2 * ay);
+    const float a = hash(x0, y0), b = hash(x0 + 1, y0), c = hash(x0, y0 + 1), d = hash(x0 + 1, y0 + 1);
+    v += amp * ((a + (b - a) * ax) * (1 - ay) + (c + (d - c) * ax) * ay);
+  }
+  return (uint8_t)std::clamp((int)(v / 0.8775f * 255.0f), 0, 255);
+}
 
 void FlaskSim::SeedVessel(int vi, const Composition& c) {
   Vessel& v = vessels_[vi];
@@ -294,7 +456,7 @@ void FlaskSim::SeedVessel(int vi, const Composition& c) {
         float x0 = -half + ((j & 1) ? spacing_ * 0.5f : 0.f);
         for (float x = x0; x <= half; x += spacing_) {
           V2 p{x, y};
-          if (InsideLocal(v, p) && clearOfGlass(p, clear + spacing_ * 0.35f)) pts.push_back(p);
+          if (InsideLocal(v, p) && clearOfGlass(p, clear + spacing_ * 0.1f)) pts.push_back(p);
         }
       }
       // A partial top row keeps its middle: among the points on the last
@@ -308,8 +470,20 @@ void FlaskSim::SeedVessel(int vi, const Composition& c) {
         std::sort(pts.begin() + a, pts.begin() + b,
                   [](V2 p, V2 q) { return std::fabs(p.x) < std::fabs(q.x); });
       }
+      // Not enough lattice inside (a brim-full vessel): the rest is stacked
+      // on the same lattice in a column over the mouth, and pours in while
+      // AddVessel settles it. It used to be dropped at one point by the neck,
+      // all on top of each other, which blew droplets out over the glass.
+      if (pts.size() < count) {
+        const float mouth = std::max(spacing_, v.shape.profile.back().x * half - clear - spacing_);
+        float yy = std::max(y, H + rowH);
+        for (int j = 0; pts.size() < count && j < 4096; j++, yy += rowH)
+          for (float xx = -mouth + ((j & 1) ? spacing_ * 0.5f : 0.f); xx <= mouth && pts.size() < count;
+               xx += spacing_)
+            pts.push_back({xx, yy});
+      }
       for (uint32_t k = 0; k < count; k++) {
-        V2 lp = k < pts.size() ? pts[k] : V2{0, H * 0.9f + (float)(k % 7)};
+        V2 lp = pts[k];
         V2 w = ToWorld(v.x, lp);
         px_.push_back(w);
         pprev_.push_back(w);
@@ -319,8 +493,11 @@ void FlaskSim::SeedVessel(int vi, const Composition& c) {
         mbar_.push_back(mass_[L.sub]);
         calm_.push_back((uint8_t)std::clamp(cfg_.calmSteps, 0, 255));
         phome_.push_back((int8_t)vi);
+        pvar_.push_back((uint8_t)(Rand() >> 7));
+        panc_.push_back(w);
+        pheat_.push_back(SeedHeat(lp));
       }
-      float top = count ? (count <= pts.size() ? pts[count - 1].y : H) : yCursor;
+      float top = count ? pts[count - 1].y : yCursor;
       yCursor = top + rowH * 0.5f;
     }
   }
@@ -391,33 +568,14 @@ void FlaskSim::BuildCells() {
   cellIdx_.resize(n);
   cellOf_.resize(n);
   for (int i = 0; i < n; i++) {
-    int cx = std::clamp((int)(px_[i].x / h_), 0, cellsW_ - 1);
-    int cy = std::clamp((int)(px_[i].y / h_), 0, cellsH_ - 1);
+    int cx = std::clamp((int)(px_[i].x / cellSize_), 0, cellsW_ - 1);
+    int cy = std::clamp((int)(px_[i].y / cellSize_), 0, cellsH_ - 1);
     cellOf_[i] = cy * cellsW_ + cx;
     cellStart_[cellOf_[i] + 1]++;
   }
   for (int c = 0; c < nc; c++) cellStart_[c + 1] += cellStart_[c];
   std::vector<int> fill(cellStart_.begin(), cellStart_.end() - 1);
   for (int i = 0; i < n; i++) cellIdx_[fill[cellOf_[i]]++] = i;
-}
-
-template <class F>
-void FlaskSim::ForNeighbours(int i, F&& f) const {
-  int c = cellOf_[i];
-  int cx = c % cellsW_, cy = c / cellsW_;
-  for (int dy = -1; dy <= 1; dy++) {
-    int yy = cy + dy;
-    if (yy < 0 || yy >= cellsH_) continue;
-    for (int dx = -1; dx <= 1; dx++) {
-      int xx = cx + dx;
-      if (xx < 0 || xx >= cellsW_) continue;
-      int cc = yy * cellsW_ + xx;
-      for (int k = cellStart_[cc]; k < cellStart_[cc + 1]; k++) {
-        int j = cellIdx_[k];
-        if (j != i) f(j);
-      }
-    }
-  }
 }
 
 void FlaskSim::StepLiquid() {
@@ -436,14 +594,44 @@ void FlaskSim::StepLiquid() {
   BuildCells();
   const float reach = h * cfg_.listSlack;
   const float reach2 = reach * reach;
+  // Each pair is found ONCE (a half stencil: this cell's later entries, and
+  // the cells right, up-left, up and up-right) and written into both
+  // particles' lists.
+  pairs_.clear();
   nbrStart_.assign(n + 1, 0);
-  nbr_.clear();
-  for (int i = 0; i < n; i++) {
-    ForNeighbours(i, [&](int j) {
-      V2 d = px_[j] - px_[i];
-      if (Dot(d, d) < reach2) nbr_.push_back(j);
-    });
-    nbrStart_[i + 1] = (int)nbr_.size();
+  for (int cy = 0; cy < cellsH_; cy++)
+    for (int cx = 0; cx < cellsW_; cx++) {
+      const int c = cy * cellsW_ + cx;
+      const int a0 = cellStart_[c], a1 = cellStart_[c + 1];
+      if (a0 == a1) continue;
+      static const int kHalf[4][2] = {{1, 0}, {-1, 1}, {0, 1}, {1, 1}};
+      for (int a = a0; a < a1; a++) {
+        const int i = cellIdx_[a];
+        const V2 pi = px_[i];
+        for (int b = a + 1; b < a1; b++) {
+          const int j = cellIdx_[b];
+          const V2 d = px_[j] - pi;
+          if (Dot(d, d) < reach2) pairs_.push_back({i, j});
+        }
+        for (auto& o : kHalf) {
+          const int xx = cx + o[0], yy = cy + o[1];
+          if (xx < 0 || xx >= cellsW_ || yy >= cellsH_) continue;
+          const int cc = yy * cellsW_ + xx;
+          for (int b = cellStart_[cc]; b < cellStart_[cc + 1]; b++) {
+            const int j = cellIdx_[b];
+            const V2 d = px_[j] - pi;
+            if (Dot(d, d) < reach2) pairs_.push_back({i, j});
+          }
+        }
+      }
+    }
+  for (const auto& pr : pairs_) { nbrStart_[pr.first + 1]++; nbrStart_[pr.second + 1]++; }
+  for (int i = 0; i < n; i++) nbrStart_[i + 1] += nbrStart_[i];
+  nbr_.resize(nbrStart_[n]);
+  {
+    std::vector<int>& fill = nbrFill_;
+    fill.assign(nbrStart_.begin(), nbrStart_.end() - 1);
+    for (const auto& pr : pairs_) { nbr_[fill[pr.first]++] = pr.second; nbr_[fill[pr.second]++] = pr.first; }
   }
 
   // 1. gravity + buoyancy + pairwise viscosity.
@@ -459,10 +647,9 @@ void FlaskSim::StepLiquid() {
     float mi = mass_[psub_[i]];
     pv_[i].y -= g * (1.f + buoy * (mi - mbar_[i]) / mi);
   }
-  for (int i = 0; i < n; i++) {
-    for (int e = nbrStart_[i]; e < nbrStart_[i + 1]; e++) {
-      int j = nbr_[e];
-      if (j < i) continue;
+  for (const auto& pr : pairs_) {
+    {
+      const int i = pr.first, j = pr.second;
       V2 d = px_[j] - px_[i];
       float r = Len(d);
       if (r <= 1e-5f || r >= h) continue;
@@ -493,17 +680,28 @@ void FlaskSim::StepLiquid() {
   const float k = cfg_.stiffness, kn = cfg_.stiffnessNear;
   const float crossRest = cfg_.crossRest;
   const float h2 = h * h;
-  for (int i = 0; i < n; i++) {
+  for (int it = 0; it < cfg_.relaxIters; it++)
+  for (int ii = 0; ii < n; ii++) {
+    const int i = ((step_ + it) & 1) && cfg_.relaxAlternate ? n - 1 - ii : ii;
     const int e0 = nbrStart_[i], e1 = nbrStart_[i + 1];
     const float mi = mass_[psub_[i]];
     float rho = 0, rhoN = 0, rhoSame = 0, sw = 1.f, sm = mi;
+    // i's pairs inside h, with their distance: the push below reuses them
+    // (nothing moves between the two loops but the j already pushed).
+    int nc = 0;
+    if ((int)rcJ_.size() < e1 - e0) { rcJ_.resize(e1 - e0); rcQ_.resize(e1 - e0); rcN_.resize(e1 - e0); }
     for (int e = e0; e < e1; e++) {
       int j = nbr_[e];
       V2 d = px_[j] - px_[i];
       float r2 = Dot(d, d);
-      if (r2 >= h2) continue;
-      float q = std::sqrt(r2) * invH;
+      if (r2 >= h2 || r2 < 1e-10f) continue;
+      const float r = std::sqrt(r2);
+      float q = r * invH;
       float w = (1 - q) * (1 - q);
+      rcJ_[nc] = j;
+      rcQ_[nc] = q;
+      rcN_[nc] = d * (1.f / r);
+      nc++;
       rho += w;
       rhoN += w * (1 - q);
       if (psub_[j] == psub_[i]) rhoSame += w;
@@ -516,17 +714,19 @@ void FlaskSim::StepLiquid() {
     float same = rho > 1e-6f ? rhoSame / rho : 1.f;
     float rest = rho0_ * (same + crossRest * (1 - same));
     float P = k * (rho - rest);
+    // Only the first pass PULLS (a negative P is Clavet's cohesion). The
+    // second is there to hold up the bottom of a deep column, which is all
+    // push; letting it pull too doubled the cohesion, and a pour left the lip
+    // as a sticky glob wider than the mouth under it (alchemy-pour: 96 of 200
+    // oil arrived).
+    if (it > 0) P = std::max(P, 0.0f);
     float PN = kn * rhoN;
     V2 dx{0, 0};
-    for (int e = e0; e < e1; e++) {
-      int j = nbr_[e];
-      V2 d = px_[j] - px_[i];
-      float r2 = Dot(d, d);
-      if (r2 >= h2 || r2 < 1e-10f) continue;
-      float r = std::sqrt(r2);
-      float q = r * invH;
+    for (int c = 0; c < nc; c++) {
+      const int j = rcJ_[c];
+      const float q = rcQ_[c];
       float D = (P * (1 - q) + PN * (1 - q) * (1 - q)) * h * 0.5f;
-      V2 rn = d * (1.f / r);
+      const V2 rn = rcN_[c];
       float mj = mass_[psub_[j]];
       float wj = mi / (mi + mj);  // j gives way in proportion to i's mass
       px_[j] = px_[j] + rn * (D * wj);
@@ -541,41 +741,60 @@ void FlaskSim::StepLiquid() {
   // linear drag, the calm-in of fresh particles, and XSPH smoothing over the
   // step's neighbours (a velocity pulled toward its neighbourhood's), which
   // is what stops a stirred mix from swirling for ever.
-  const float keep = 1.0f - cfg_.damping;
+  // THE DRAG IS RELATIVE TO THE VESSEL the particle is in: `vv` is the
+  // glass's own rigid motion at that point this step. Measured in the world
+  // instead, a flask carried at 2 px a step had its liquid dragged back at
+  // 1.6 g -- a sideways gravity that ran it up the trailing wall and out of
+  // the mouth on every shake. Liquid in flight takes a plain air drag.
+  struct Frame { bool moved; float c0, s0, c1, s1; V2 p0, p1; };
+  std::vector<Frame> fr(vessels_.size());
+  for (size_t k = 0; k < vessels_.size(); k++) {
+    const Vessel& v = vessels_[k];
+    fr[k].moved = !v.outline.empty() && (v.x.pos.x != v.prevX.pos.x || v.x.pos.y != v.prevX.pos.y ||
+                                         v.x.angle != v.prevX.angle);
+    fr[k].c0 = std::cos(-v.prevX.angle); fr[k].s0 = std::sin(-v.prevX.angle);
+    fr[k].c1 = std::cos(v.x.angle); fr[k].s1 = std::sin(v.x.angle);
+    fr[k].p0 = v.prevX.pos; fr[k].p1 = v.x.pos;
+  }
+  const float keep = 1.0f - cfg_.damping, keepAir = 1.0f - cfg_.airDamping;
   for (int i = 0; i < n; i++) {
-    pv_[i] = (px_[i] - pprev_[i]) * keep;
+    const V2 vel = px_[i] - pprev_[i];
+    const int hv = phome_[i];
+    if (hv < 0 || hv >= (int)vessels_.size() || vessels_[hv].outline.empty()) {
+      pv_[i] = vel * keepAir;
+      continue;
+    }
+    V2 vv{0, 0};
+    if (fr[hv].moved) {
+      const Frame& f = fr[hv];
+      const V2 d = px_[i] - f.p0;
+      const V2 l{d.x * f.c0 - d.y * f.s0, d.x * f.s0 + d.y * f.c0};
+      vv = V2{f.p1.x + l.x * f.c1 - l.y * f.s1, f.p1.y + l.x * f.s1 + l.y * f.c1} - px_[i];
+    }
+    pv_[i] = vv + (vel - vv) * keep;
     if (calm_[i]) {
-      // Damped RELATIVE TO ITS VESSEL: halving the velocity in the world
-      // froze the liquid of a flask picked up in its first second and a half
-      // in place, and the rising glass pushed it through.
-      V2 vv{0, 0};
-      const int hv = phome_[i];
-      if (hv >= 0 && hv < (int)vessels_.size() && !vessels_[hv].outline.empty()) {
-        const Vessel& v = vessels_[hv];
-        vv = ToWorld(v.x, ToLocal(v.prevX, px_[i])) - px_[i];
-      }
       pv_[i] = vv + (pv_[i] - vv) * 0.5f;
       calm_[i]--;
     }
   }
   if (cfg_.xsph > 0) {
     xs_.assign(n, V2{});
-    for (int i = 0; i < n; i++) {
-      V2 acc{0, 0};
-      float ws = 0;
-      for (int e = nbrStart_[i]; e < nbrStart_[i + 1]; e++) {
-        const int j = nbr_[e];
-        const V2 d = px_[j] - px_[i];
-        const float r2 = Dot(d, d);
-        if (r2 >= h2) continue;
-        const float q = std::sqrt(r2) * invH;
-        const float w = (1 - q) * (1 - q);
-        acc = acc + (pv_[j] - pv_[i]) * w;
-        ws += w;
-      }
-      if (ws > 1e-6f) xs_[i] = acc * (cfg_.xsph / std::max(ws, 1.0f));
+    xw_.assign(n, 0.f);
+    for (const auto& pr : pairs_) {
+      const int i = pr.first, j = pr.second;
+      const V2 d = px_[j] - px_[i];
+      const float r2 = Dot(d, d);
+      if (r2 >= h2) continue;
+      const float q = std::sqrt(r2) * invH;
+      const float w = (1 - q) * (1 - q);
+      const V2 dv = (pv_[j] - pv_[i]) * w;
+      xs_[i] = xs_[i] + dv;
+      xs_[j] = xs_[j] - dv;
+      xw_[i] += w;
+      xw_[j] += w;
     }
-    for (int i = 0; i < n; i++) pv_[i] = pv_[i] + xs_[i];
+    for (int i = 0; i < n; i++)
+      if (xw_[i] > 1e-6f) pv_[i] = pv_[i] + xs_[i] * (cfg_.xsph / std::max(xw_[i], 1.0f));
   }
   int w = 0;
   const int total = (int)px_.size();
@@ -592,13 +811,13 @@ void FlaskSim::StepLiquid() {
     if (w != i) {
       px_[w] = px_[i]; pv_[w] = pv_[i]; pprev_[w] = pprev_[i];
       psub_[w] = psub_[i]; pw_[w] = pw_[i]; mbar_[w] = mbar_[i]; calm_[w] = calm_[i];
-      phome_[w] = phome_[i];
+      phome_[w] = phome_[i]; pvar_[w] = pvar_[i]; panc_[w] = panc_[i]; pheat_[w] = pheat_[i];
     }
     w++;
   }
   nAct_ -= total - w;
   px_.resize(w); pv_.resize(w); pprev_.resize(w); psub_.resize(w); pw_.resize(w); mbar_.resize(w);
-  calm_.resize(w); phome_.resize(w);
+  calm_.resize(w); phome_.resize(w); pvar_.resize(w); panc_.resize(w); pheat_.resize(w);
 }
 
 void FlaskSim::CollideLiquid() {
@@ -616,74 +835,6 @@ void FlaskSim::CollideLiquid() {
       if (dist >= R) continue;
       V2 nrm = dist > 1e-5f ? d * (1.f / dist) : V2{0, 1};
       px_[i] = c + nrm * R;
-    }
-  }
-
-  for (const Vessel& v : vessels_) {
-    const float R = v.shape.wall + pr;
-    const auto& o = v.outline;
-    const float c0 = std::cos(-v.x.angle), s0 = std::sin(-v.x.angle);
-    const float c1 = std::cos(-v.prevX.angle), s1 = std::sin(-v.prevX.angle);
-    const float cw = std::cos(v.x.angle), sw = std::sin(v.x.angle);
-    // The outline's local bounding box grown by R: most particles are far
-    // from most of the glass.
-    float bx0 = 1e9f, bx1 = -1e9f, by0 = 1e9f, by1 = -1e9f;
-    for (V2 p : o) { bx0 = std::min(bx0, p.x); bx1 = std::max(bx1, p.x); by0 = std::min(by0, p.y); by1 = std::max(by1, p.y); }
-    bx0 -= R + 1; bx1 += R + 1; by0 -= R + 1; by1 += R + 1;
-    for (int i = 0; i < n; i++) {
-      // Both ends in the vessel's frame at their own time: the wall's motion
-      // is then the particle's relative motion, and a crossing is a sign
-      // flip of the cross product along a segment.
-      V2 d0 = px_[i] - v.x.pos, d1 = pprev_[i] - v.prevX.pos;
-      V2 cur{d0.x * c0 - d0.y * s0, d0.x * s0 + d0.y * c0};
-      V2 prv{d1.x * c1 - d1.y * s1, d1.x * s1 + d1.y * c1};
-      if ((cur.x < bx0 || cur.x > bx1 || cur.y < by0 || cur.y > by1) &&
-          (prv.x < bx0 || prv.x > bx1 || prv.y < by0 || prv.y > by1))
-        continue;
-      bool moved = false;
-      V2 hitN{0, 0}, hitC{0, 0};
-      for (size_t s = 0; s + 1 < o.size(); s++) {
-        V2 a = o[s], b = o[s + 1];
-        float t;
-        V2 c = ClosestOnSeg(cur, a, b, &t);
-        V2 d = cur - c;
-        float dist = Len(d);
-        V2 ab = b - a;
-        float sPrev = Cross(ab, prv - a), sCur = Cross(ab, cur - a);
-        bool crossed = (sPrev > 0) != (sCur > 0) && t > 0 && t < 1;
-        if (!crossed && dist >= R) continue;
-        V2 nrm;
-        if (crossed || dist < 1e-5f) {
-          // Back to the side it came from.
-          float l = Len(ab);
-          V2 perp{-ab.y / l, ab.x / l};
-          nrm = sPrev > 0 ? perp : perp * -1.f;
-          c = ClosestOnSeg(cur, a, b, nullptr);
-        } else {
-          nrm = d * (1.f / dist);
-        }
-        cur = c + nrm * R;
-        hitN = nrm;
-        hitC = c;
-        moved = true;
-      }
-      if (moved) {
-        px_[i] = {v.x.pos.x + cur.x * cw - cur.y * sw, v.x.pos.y + cur.x * sw + cur.y * cw};
-        // THE CONTACT'S VELOCITY. The push above is a position correction,
-        // and a position-based step turns every correction into velocity: a
-        // wall that moved 2 px launched the particle at the overlap it had
-        // to undo, not at the wall's speed. Relative to the glass at the
-        // contact, the part into or off the wall is zeroed (no bounce) and
-        // the part along it loses `wallFriction`.
-        const V2 cw1 = ToWorld(v.x, hitC), cw0 = ToWorld(v.prevX, hitC);
-        const V2 vw = cw1 - cw0;
-        const V2 nw{hitN.x * cw - hitN.y * sw, hitN.x * sw + hitN.y * cw};
-        V2 rel = (px_[i] - pprev_[i]) - vw;
-        const float vn = Dot(rel, nw);
-        rel = rel - nw * vn;
-        rel = rel * (1.0f - cfg_.wallFriction);
-        pprev_[i] = px_[i] - (vw + rel);
-      }
     }
   }
 
@@ -745,11 +896,152 @@ void FlaskSim::CollideLiquid() {
     // shoved along its pile to the nearest free pixel on its side, which is
     // how pressure lifts a bed. Without this the particle stayed inside the
     // grain and the next pull-back put it through the glass.
+    //
+    // ...but only while that vessel MOVES. At rest there is no glass
+    // squeezing anything, only the relaxation's shimmer nudging a particle
+    // into the bed, and shoving grains for it churned the sand for ever (and
+    // kept the vessel awake): the particle looks a little further for room,
+    // or waits a step.
     const int gi = grid_[(size_t)y * W + x] - 1;
     const int home = grains_[gi].home;
-    if (home >= 0 && home < (int)vessels_.size() && !vessels_[home].outline.empty())
+    const bool live = home >= 0 && home < (int)vessels_.size() && !vessels_[home].outline.empty();
+    const bool moving = live && (vessels_[home].x.pos.x != vessels_[home].prevX.pos.x ||
+                                 vessels_[home].x.pos.y != vessels_[home].prevX.pos.y ||
+                                 vessels_[home].x.angle != vessels_[home].prevX.angle);
+    if (moving) {
       SweepChain(gi, vessels_[home], true);
+      continue;
+    }
+    bool placed = false;
+    for (int dy = 2; dy >= -2 && !placed; dy--)
+      for (int dx = -2; dx <= 2 && !placed; dx++) {
+        const int xx = x + dx, yy = y + dy;
+        if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
+        const size_t k = (size_t)yy * W + xx;
+        if (grid_[k] || wall_[k]) continue;
+        const V2 d{(float)dx, (float)dy};
+        px_[i] = px_[i] + d;
+        pprev_[i] = pprev_[i] + d;
+        placed = true;
+      }
   }
+
+  // (The glass goes LAST, after the grains: it rewrites pprev_ into the
+  // velocity the contact leaves, and the grains' pull-back walks a particle
+  // back toward pprev_ as if it were where the step began -- which, for a
+  // particle on the glass, could be the far side of it. Oil under a sand bed
+  // dripped out through the bottom of a flask that way.)
+
+  // THE GLASS. Each particle is on one SIDE of each vessel's glass -- inside
+  // or outside the outline closed across the mouth -- and the glass keeps it
+  // there. The side is decided by the polygon test at both ends of the step
+  // (each in the vessel's frame at its own time, so the wall's motion is the
+  // particle's relative motion): a particle that changed side without going
+  // through the mouth went through the glass, and goes back to the side it
+  // came from. The old per-segment sign test missed a crossing at a vertex
+  // (t clamped to an end) and then pushed the particle out along the vector
+  // from the glass -- further out -- which is how a carried flask seeped.
+  for (const Vessel& v : vessels_) {
+    if (v.outline.empty()) continue;
+    const float R = v.shape.wall + pr;
+    const auto& o = v.outline;
+    const size_t ns = std::min<size_t>(o.size() - 1, 64);
+    // Inward normals: the outline runs left lip -> bottom -> right lip, so
+    // the inside is on the left of every segment.
+    V2 nIn[64];
+    for (size_t k = 0; k < ns; k++) {
+      const V2 ab = o[k + 1] - o[k];
+      const float l = std::max(1e-6f, Len(ab));
+      nIn[k] = {-ab.y / l, ab.x / l};
+    }
+    const V2 mouthA = o.front(), mouthB = o.back();
+    const float c0 = std::cos(-v.x.angle), s0 = std::sin(-v.x.angle);
+    const float c1 = std::cos(-v.prevX.angle), s1 = std::sin(-v.prevX.angle);
+    const float cw = std::cos(v.x.angle), sw = std::sin(v.x.angle);
+    float bx0 = 1e9f, bx1 = -1e9f, by0 = 1e9f, by1 = -1e9f;
+    for (V2 p : o) { bx0 = std::min(bx0, p.x); bx1 = std::max(bx1, p.x); by0 = std::min(by0, p.y); by1 = std::max(by1, p.y); }
+    bx0 -= R + 1; bx1 += R + 1; by0 -= R + 1; by1 += R + 1;
+    auto segCross = [](V2 p1, V2 q1, V2 p2, V2 q2) {
+      const float d1 = Cross(q2 - p2, p1 - p2), d2 = Cross(q2 - p2, q1 - p2);
+      const float d3 = Cross(q1 - p1, p2 - p1), d4 = Cross(q1 - p1, q2 - p1);
+      return ((d1 > 0) != (d2 > 0)) && ((d3 > 0) != (d4 > 0));
+    };
+    for (int i = 0; i < n; i++) {
+      V2 d0 = px_[i] - v.x.pos, d1 = pprev_[i] - v.prevX.pos;
+      V2 cur{d0.x * c0 - d0.y * s0, d0.x * s0 + d0.y * c0};
+      const V2 prv{d1.x * c1 - d1.y * s1, d1.x * s1 + d1.y * c1};
+      if ((cur.x < bx0 || cur.x > bx1 || cur.y < by0 || cur.y > by1) &&
+          (prv.x < bx0 || prv.x > bx1 || prv.y < by0 || prv.y > by1))
+        continue;
+      // Far from the glass at both ends, and on the same side: nothing to
+      // do (a step moves a particle less than the margin, relative to the
+      // glass). Most of a vessel's liquid is in here.
+      const uint8_t mc = v.Near(cur), mp = v.Near(prv);
+      if (mc == mp && (mc == Vessel::kFarIn || mc == Vessel::kFarOut)) continue;
+      const bool inPrev = InsideLocal(v, prv), inCur = InsideLocal(v, cur);
+      // Which side it belongs on: where it came from, unless it came through
+      // the mouth (then it is simply somewhere new).
+      const bool crossed = inPrev != inCur && !segCross(prv, cur, mouthA, mouthB);
+      const bool side = crossed ? inPrev : inCur;
+      const float sg = side ? 1.0f : -1.0f;
+      bool moved = false;
+      V2 hitN{0, 0}, hitC{0, 0};
+      if (crossed) {
+        // Back through the nearest glass, to its own side of it.
+        float best = 1e30f;
+        size_t bs = 0;
+        V2 bc{};
+        for (size_t k = 0; k < ns; k++) {
+          const V2 c = ClosestOnSeg(cur, o[k], o[k + 1], nullptr);
+          const float dd = Dot(cur - c, cur - c);
+          if (dd < best) { best = dd; bs = k; bc = c; }
+        }
+        hitN = nIn[bs] * sg;
+        hitC = bc;
+        cur = bc + hitN * R;
+        moved = true;
+      }
+      // Kept a glass-thickness off every segment, on its side.
+      for (size_t k = 0; k < ns; k++) {
+        float t;
+        const V2 c = ClosestOnSeg(cur, o[k], o[k + 1], &t);
+        const V2 d = cur - c;
+        const float dist = Len(d);
+        if (dist >= R) continue;
+        V2 nrm;
+        // Off the end of a segment (a vertex, a lip) the way out is straight
+        // away from it; along its middle, the segment's own normal to the
+        // particle's side -- never the vector from the glass, which points to
+        // the wrong side for a particle already past the line.
+        const bool end = t <= 0.0f || t >= 1.0f;
+        if (dist > 1e-5f && (end || Dot(d, nIn[k]) * sg > 0)) nrm = d * (1.f / dist);
+        else nrm = nIn[k] * sg;
+        cur = c + nrm * R;
+        hitN = nrm;
+        hitC = c;
+        moved = true;
+      }
+      if (!moved) continue;
+      // Last word: still on its side, or back where it was (relative to the
+      // glass) -- a push at a narrow neck must not become a crossing.
+      if (InsideLocal(v, cur) != side && InsideLocal(v, prv) == side) cur = prv;
+      px_[i] = {v.x.pos.x + cur.x * cw - cur.y * sw, v.x.pos.y + cur.x * sw + cur.y * cw};
+      // THE CONTACT'S VELOCITY. The push above is a position correction,
+      // and a position-based step turns every correction into velocity: a
+      // wall that moved 2 px launched the particle at the overlap it had
+      // to undo, not at the wall's speed. Relative to the glass at the
+      // contact, the part into or off the wall is zeroed (no bounce) and
+      // the part along it loses `wallFriction`.
+      const V2 cw1 = ToWorld(v.x, hitC), cw0 = ToWorld(v.prevX, hitC);
+      const V2 vw = cw1 - cw0;
+      const V2 nw{hitN.x * cw - hitN.y * sw, hitN.x * sw + hitN.y * cw};
+      V2 rel = (px_[i] - pprev_[i]) - vw;
+      rel = rel - nw * Dot(rel, nw);
+      rel = rel * (1.0f - cfg_.wallFriction);
+      pprev_[i] = px_[i] - (vw + rel);
+    }
+  }
+
 }
 
 // ---- powder ----------------------------------------------------------------
@@ -827,16 +1119,29 @@ void FlaskSim::BucketPixels() {
   pixNext_.resize(n);
   for (int i = 0; i < n; i++) {
     int cx = (int)std::floor(px_[i].x), cy = (int)std::floor(px_[i].y);
-    fbx0_ = std::min(fbx0_, std::max(0, cx - ri));
-    fbx1_ = std::max(fbx1_, std::min(W - 1, cx + ri));
-    fby0_ = std::min(fby0_, std::max(0, cy - ri));
-    fby1_ = std::max(fby1_, std::min(H - 1, cy + ri));
+    if (cx < -ri || cy < -ri || cx >= W + ri || cy >= H + ri) continue;
     // Moving liquid keeps the sand round it awake (a grain reads it to sink
     // or float); a sleeping vessel's liquid does not.
     if (i < nAct_ && cx >= 0 && cy >= 0 && cx < W && cy < H) {
       Wake(cx - 4, cy - 4);
       Wake(cx + 4, cy + 4);
     }
+    // Only liquid within a tile of sand is read by the sand (and by the
+    // carry's support test); the rest is not splatted.
+    {
+      const int tx = cx >> 4, ty = cy >> 4;
+      bool near = false;
+      for (int oy = -1; oy <= 1 && !near; oy++)
+        for (int ox = -1; ox <= 1 && !near; ox++) {
+          const int ax = tx + ox, ay = ty + oy;
+          near = ax >= 0 && ay >= 0 && ax < tilesW_ && ay < tilesH_ && sandTile_[ay * tilesW_ + ax];
+        }
+      if (!near) continue;
+    }
+    fbx0_ = std::min(fbx0_, std::max(0, cx - ri));
+    fbx1_ = std::max(fbx1_, std::min(W - 1, cx + ri));
+    fby0_ = std::min(fby0_, std::max(0, cy - ri));
+    fby1_ = std::max(fby1_, std::min(H - 1, cy + ri));
     float m = mass_[psub_[i]], vi = visc_[psub_[i]];
     for (int dy = -ri; dy <= ri; dy++)
       for (int dx = -ri; dx <= ri; dx++) {
@@ -898,7 +1203,15 @@ void FlaskSim::MoveGrain(int gi, int x, int y) {
   ShoveLiquid(g.x, g.y, x, y);
   g.x = (int16_t)x;
   g.y = (int16_t)y;
+  // A resting grain's sub-pixel position is its pixel's centre. Left as it
+  // was, the carry (CarryGrains, which moves fx/fy) put every grain that had
+  // fallen since the last carry back where it had been: sand that snapped
+  // up into the air and poured down again whenever the vessel moved.
+  if (g.vx == 0 && g.vy == 0) { g.fx = x + 0.5f; g.fy = y + 0.5f; }
   grid_[(size_t)y * W + x] = gi + 1;
+  // It moved inside a vessel: that vessel's liquid must not sleep through it.
+  const uint8_t in = inside_.empty() ? 0 : inside_[(size_t)y * W + x];
+  if (in && in <= vessels_.size()) vessels_[in - 1].grainBusy = true;
 }
 
 void FlaskSim::StepGrains() {
@@ -915,6 +1228,8 @@ void FlaskSim::StepGrains() {
   wakeAll_ = false;
   awake_.swap(awakeNext_);
   std::fill(awakeNext_.begin(), awakeNext_.end(), 0);
+  sandTile_.assign((size_t)tilesW_ * tilesH_, 0);
+  for (const Grain& g : grains_) sandTile_[(g.y >> 4) * tilesW_ + (g.x >> 4)] = 1;
   BucketPixels();
 
   // Bottom rows first, alternating sweep direction per step, so a pile
@@ -1089,23 +1404,43 @@ bool FlaskSim::PoseClear(int vi, const Xform& x) const { return PoseClear(vessel
 bool FlaskSim::ShapeClear(const VesselShape& shape, const Xform& x) const {
   Vessel tmp;
   tmp.shape = shape;
-  BuildOutline(tmp);
+  BuildOutline(tmp, false);
   return PoseClear(tmp, x);
 }
 
 // ---- sleep ------------------------------------------------------------------
 
 void FlaskSim::Partition() {
-  // Awake particles first. A stable partition by index so neighbours stay
-  // near each other in memory.
+  // Awake particles first, IN CELL ORDER: particles that are neighbours in
+  // the liquid are neighbours in memory, so the pair scan and the
+  // relaxation walk the arrays instead of jumping about them (Step re-sorts
+  // every 16 steps as the liquid mixes). The sleeping tail keeps its order.
   const int total = (int)px_.size();
-  std::vector<int> order;
+  std::vector<int>& order = orderScratch_;
+  order.clear();
   order.reserve(total);
   auto awake = [&](int i) {
     const int h = phome_[i];
     return h < 0 || h >= (int)vessels_.size() || !vessels_[h].asleep;
   };
-  for (int i = 0; i < total; i++) if (awake(i)) order.push_back(i);
+  {
+    const int nc = cellsW_ * cellsH_;
+    std::vector<int> start(nc + 1, 0), key;
+    key.reserve(total);
+    std::vector<int> aw;
+    aw.reserve(total);
+    for (int i = 0; i < total; i++) {
+      if (!awake(i)) continue;
+      const int cx = std::clamp((int)(px_[i].x / cellSize_), 0, cellsW_ - 1);
+      const int cy = std::clamp((int)(px_[i].y / cellSize_), 0, cellsH_ - 1);
+      aw.push_back(i);
+      key.push_back(cy * cellsW_ + cx);
+      start[key.back() + 1]++;
+    }
+    for (int c = 0; c < nc; c++) start[c + 1] += start[c];
+    order.resize(aw.size());
+    for (size_t k = 0; k < aw.size(); k++) order[start[key[k]]++] = aw[k];
+  }
   const int na = (int)order.size();
   for (int i = 0; i < total; i++) if (!awake(i)) order.push_back(i);
   auto perm = [&](auto& v) {
@@ -1113,6 +1448,7 @@ void FlaskSim::Partition() {
     for (int k = 0; k < total; k++) v[k] = c[order[k]];
   };
   perm(px_); perm(pv_); perm(pprev_); perm(psub_); perm(pw_); perm(mbar_); perm(calm_); perm(phome_);
+  perm(pvar_); perm(panc_); perm(pheat_);
   nAct_ = na;
 }
 
@@ -1143,7 +1479,8 @@ void FlaskSim::UpdateSleep() {
     const bool moving = v.x.pos.x != v.target.pos.x || v.x.pos.y != v.target.pos.y ||
                         v.x.angle != v.target.angle || v.x.pos.x != v.prevX.pos.x ||
                         v.x.pos.y != v.prevX.pos.y || v.x.angle != v.prevX.angle;
-    bool disturbed = moving;
+    bool disturbed = moving || v.grainBusy;
+    v.grainBusy = false;
     if (stickOn_ && (inBox(stickA_) || inBox(stickB_))) disturbed = true;
     if (!disturbed)
       for (int i = 0; i < nAct_ && !disturbed; i++)
@@ -1163,32 +1500,47 @@ void FlaskSim::UpdateSleep() {
       v.quiet = 0;
       continue;
     }
-    // Awake and undisturbed: is its liquid at rest? Judged on the RMS speed
-    // and on how many are visibly moving, not on the fastest one: a settled
-    // column never goes perfectly still (the relaxation leaves a ~0.1 px
-    // shimmer in its deepest particles), and a max test never sleeps.
-    double sum = 0;
-    int cnt = 0, fast = 0;
-    const float fast2 = 0.3f * 0.3f;
-    for (int i = 0; i < nAct_; i++)
-      if (phome_[i] == (int)vi) {
-        const float v2 = Dot(pv_[i], pv_[i]);
-        sum += v2;
-        cnt++;
-        fast += v2 > fast2;
-      }
+    // Awake and undisturbed: has its liquid STOPPED CHANGING THE PICTURE?
+    // Judged on how far each particle has drifted over a window of
+    // sleepSteps, not on its speed: the relaxation never quite solves a deep
+    // column, and the residue is a sub-pixel oscillation in place (RMS speed
+    // 0.03..0.06 px a step, but no drift) that a speed test either never
+    // sleeps through or, set loose enough to, freezes a slosh mid-motion --
+    // which is what the old 0.12 px/step test did.
     const bool grainsBusy = [&] {
       for (const Grain& g : grains_)
         if (g.home == (int)vi && (g.vx != 0 || g.vy != 0)) return true;
       return false;
     }();
-    if (!grainsBusy && (cnt == 0 || (sum / cnt < cfg_.sleepSpeed * cfg_.sleepSpeed && fast * 50 <= cnt))) {
-      if (++v.quiet >= cfg_.sleepSteps) {
-        v.asleep = true;
-        changed = true;
-        for (int i = 0; i < nAct_; i++)
-          if (phome_[i] == (int)vi) { pv_[i] = {0, 0}; pprev_[i] = px_[i]; }
+    if (grainsBusy) {
+      v.quiet = 0;
+      continue;
+    }
+    if (v.quiet++ == 0) {
+      for (int i = 0; i < nAct_; i++)
+        if (phome_[i] == (int)vi) panc_[i] = px_[i];
+      continue;
+    }
+    if (v.quiet < cfg_.sleepSteps) continue;
+    // Asleep when the RMS drift is under the line and at most 1% of the
+    // particles are over three times it (a straggler or two at the surface
+    // must not keep a whole flask awake; a visible stream would be many).
+    const float lim = cfg_.sleepDrift;
+    double sum = 0;
+    int cnt = 0, far = 0;
+    for (int i = 0; i < nAct_; i++)
+      if (phome_[i] == (int)vi) {
+        const V2 d = px_[i] - panc_[i];
+        const float d2 = Dot(d, d);
+        sum += d2;
+        far += d2 > 9.0f * lim * lim;
+        cnt++;
       }
+    if (cnt == 0 || (sum / cnt < lim * lim && far * 100 <= cnt)) {
+      v.asleep = true;
+      changed = true;
+      for (int i = 0; i < nAct_; i++)
+        if (phome_[i] == (int)vi) { pv_[i] = {0, 0}; pprev_[i] = px_[i]; }
     } else {
       v.quiet = 0;
     }
@@ -1244,7 +1596,11 @@ void FlaskSim::CarryGrains() {
       if (d.x != 0 || d.y != 0)
         for (size_t i = 0; i < grains_.size(); i++) {
           const Grain& g = grains_[i];
-          if (g.home == (int)vi && g.vx == 0 && g.vy == 0 && supported(g)) mine.push_back((int)i);
+          if (g.home == (int)vi && g.vx == 0 && g.vy == 0 && supported(g)) {
+            Grain& gm = grains_[i];
+            if ((int)std::floor(gm.fx) != gm.x || (int)std::floor(gm.fy) != gm.y) { gm.fx = gm.x + 0.5f; gm.fy = gm.y + 0.5f; }
+            mine.push_back((int)i);
+          }
         }
       // A counting sort on the whole-pixel projection onto the move,
       // descending (leading edge first, so a grain moves into space its
@@ -1266,6 +1622,7 @@ void FlaskSim::CarryGrains() {
       }
       for (int k : order) {
         Grain& g = grains_[mine[k]];
+        if ((int)std::floor(g.fx) != g.x || (int)std::floor(g.fy) != g.y) { g.fx = g.x + 0.5f; g.fy = g.y + 0.5f; }
         const float fx = g.fx + d.x, fy = g.fy + d.y;
         const int nx = (int)std::floor(fx), ny = (int)std::floor(fy);
         if (nx == g.x && ny == g.y) { g.fx = fx; g.fy = fy; continue; }
@@ -1328,8 +1685,10 @@ bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn) {
       const bool glass = wall_[k] != 0;
       // ...but only a few pixels of it: the band runs round the whole vessel,
       // and a search let loose along it spends its budget there instead of
-      // reaching the inside.
-      if (glass && std::abs(x - g0x) + std::abs(y - g0y) > 5) continue;
+      // reaching the inside. Two, not five: a path along the band is a grain
+      // hopping sideways through the glass, and at five a turning flask
+      // shuffled the grains against its wall 3-5 px a step (twice as often).
+      if (glass && std::abs(x - g0x) + std::abs(y - g0y) > 2) continue;
       if (!glass && (inside_[k] == (uint8_t)(vi + 1)) != wantIn) continue;
       if (!glass && bfsDead_[k] == deadKey) continue;
       bfsSeen_[k] = bfsStamp_;
@@ -1358,6 +1717,7 @@ bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn) {
     g.fy = g.y + 0.5f;
     grid_[to] = idx + 1;
     grid_[from] = 0;
+    if (inside_[to] && inside_[to] <= vessels_.size()) vessels_[inside_[to] - 1].grainBusy = true;
     Wake(to % W, to / W);
     Wake(from % W, from / W);
     to = from;
@@ -1367,50 +1727,86 @@ bool FlaskSim::SweepChain(int gi, const Vessel& v, bool wantIn) {
 
 // ---- stepping --------------------------------------------------------------
 
+void FlaskSim::MoveVessels() {
+  // THE MOTION PROFILE. Each vessel chases its target with a velocity of its
+  // own, changed by at most vesselAccel x gravity a step (vesselDropAccel
+  // downward), and braking in time to stop on it: the time-optimal approach
+  // under that limit. The liquid feels the vessel's acceleration as a tilt
+  // of gravity, so this is what bounds how hard a flick can throw it. A
+  // target that jumps (the cursor) no longer becomes a jerk of the glass.
+  const float g = cfg_.gravity;
+  const float aSide = g * cfg_.vesselAccel;
+  const float aDown = g * cfg_.vesselDropAccel;
+  const float aBrake = std::min(aSide, aDown) * 0.8f;
+  const float vmax = cfg_.maxVesselStep;
+  for (Vessel& v : vessels_) {
+    v.prevX = v.x;
+    if (v.outline.empty()) continue;
+    const V2 e = v.target.pos - v.x.pos;
+    const float el = Len(e);
+    V2 want{0, 0};
+    if (el > 1e-4f) {
+      float sp = std::min(vmax, std::sqrt(2.0f * aBrake * el));
+      sp = std::min(sp, el);
+      want = e * (sp / el);
+    }
+    V2 dv = want - v.vel;
+    dv.x = std::clamp(dv.x, -aSide, aSide);
+    dv.y = std::clamp(dv.y, -aDown, aSide);
+    v.vel = v.vel + dv;
+    // Turning: the same limit at the vessel's far edge.
+    const float alpha = aSide * 1.5f / v.reach, wmax = vmax / v.reach;
+    const float ea = v.target.angle - v.x.angle;
+    float wantW = 0;
+    if (std::fabs(ea) > 1e-6f) {
+      wantW = std::min({wmax, std::sqrt(2.0f * alpha * 0.8f * std::fabs(ea)), std::fabs(ea)});
+      if (ea < 0) wantW = -wantW;
+    }
+    v.angVel += std::clamp(wantW - v.angVel, -alpha, alpha);
+    // Capped: no outline point moves more than maxVesselStep px, so the
+    // glass sweeps grains and liquid instead of jumping them.
+    const float move = Len(v.vel) + std::fabs(v.angVel) * v.reach;
+    if (move > vmax) {
+      v.vel = v.vel * (vmax / move);
+      v.angVel *= vmax / move;
+    }
+    Xform next = v.x;
+    if (el < 0.02f && std::fabs(ea) < 1e-4f && Len(v.vel) < 0.02f && std::fabs(v.angVel) * v.reach < 0.02f) {
+      next = v.target;   // arrived: exactly on it, at rest
+      v.vel = {0, 0};
+      v.angVel = 0;
+    } else {
+      next.pos = next.pos + v.vel;
+      next.angle += v.angVel;
+    }
+    if (next.pos.x == v.x.pos.x && next.pos.y == v.x.pos.y && next.angle == v.x.angle) continue;
+    // Glass never passes through glass. A move that would bring this
+    // vessel's walls into another's SLIDES instead of freezing: the
+    // rotation alone, the translation alone, then half of each -- so a
+    // flask swung toward another's neck rides round it the way a hand
+    // would steer, rather than stopping dead at the first touch. What is
+    // refused is lost from the velocity (it hit something).
+    if (!PoseClear(v, next)) {
+      Xform rotOnly = v.x, movOnly = v.x, half = v.x;
+      rotOnly.angle = next.angle;
+      movOnly.pos = next.pos;
+      half.pos = (v.x.pos + next.pos) * 0.5f;
+      half.angle = (v.x.angle + next.angle) * 0.5f;
+      if (PoseClear(v, rotOnly)) { next = rotOnly; v.vel = {0, 0}; }
+      else if (PoseClear(v, movOnly)) { next = movOnly; v.angVel = 0; }
+      else if (PoseClear(v, half)) { next = half; v.vel = v.vel * 0.5f; v.angVel *= 0.5f; }
+      else { v.vel = {0, 0}; v.angVel = 0; continue; }
+    }
+    v.x = next;
+  }
+}
+
 void FlaskSim::Step(int substeps) {
   for (int s = 0; s < substeps; s++) {
-    // Kinematic vessels close the remaining distance to their target
-    // evenly over the frame's substeps.
-    float f = 1.f / (float)(substeps - s);
+    MoveVessels();
     bool anyMoved = false;
-    for (Vessel& v : vessels_) {
-      v.prevX = v.x;
-      // Capped: no outline point moves more than maxVesselStep px, so the
-      // glass sweeps grains and liquid instead of jumping them. A vessel
-      // dragged faster than that lags its target and catches up.
-      V2 dp = (v.target.pos - v.x.pos) * f;
-      float da = (v.target.angle - v.x.angle) * f;
-      if (dp.x == 0 && dp.y == 0 && da == 0) continue;
-      float reach = 0;
-      for (V2 o : v.outline) reach = std::max(reach, Len(o));
-      float move = Len(dp) + std::fabs(da) * reach;
-      if (move > cfg_.maxVesselStep) {
-        float sc = cfg_.maxVesselStep / move;
-        dp = dp * sc;
-        da *= sc;
-      }
-      Xform next = v.x;
-      next.pos = next.pos + dp;
-      next.angle += da;
-      // Glass never passes through glass. A move that would bring this
-      // vessel's walls into another's SLIDES instead of freezing: the
-      // rotation alone, the translation alone, then half of each -- so a
-      // flask swung toward another's neck rides round it the way a hand
-      // would steer, rather than stopping dead at the first touch.
-      if (!PoseClear(v, next)) {
-        Xform rotOnly = v.x, movOnly = v.x, half = v.x;
-        rotOnly.angle += da;
-        movOnly.pos = movOnly.pos + dp;
-        half.pos = half.pos + dp * 0.5f;
-        half.angle += da * 0.5f;
-        if (PoseClear(v, rotOnly)) next = rotOnly;
-        else if (PoseClear(v, movOnly)) next = movOnly;
-        else if (PoseClear(v, half)) next = half;
-        else continue;
-      }
-      v.x = next;
+    for (const Vessel& v : vessels_)
       anyMoved |= v.x.pos.x != v.prevX.pos.x || v.x.pos.y != v.prevX.pos.y || v.x.angle != v.prevX.angle;
-    }
     if (anyMoved) {
       RebuildWalls();
       wedged_.clear();
@@ -1439,6 +1835,7 @@ void FlaskSim::Step(int substeps) {
     }
 
     UpdateSleep();
+    if ((step_ & 15) == 0 && nAct_ > 64) Partition();
     grainMoves_ = 0;
     StepLiquid();
     StepGrains();
@@ -1462,9 +1859,19 @@ int FlaskSim::MovingCount(float speed) const {
 void FlaskSim::Settle(int maxSteps) {
   bool on = stickOn_;
   stickOn_ = false;
+  // Done when nothing is IN FLIGHT: no liquid outside every vessel still
+  // moving, no grain flung. Liquid sloshing inside a vessel stays in it; a
+  // test on every particle's speed waited out the relaxation's sub-pixel
+  // shimmer, and Finish runs this on the frame thread.
   for (int s = 0; s < maxSteps; s++) {
     Step(1);
-    if ((s & 7) == 7 && MovingCount(cfg_.gravity * 6) == 0) break;
+    if ((s & 7) != 7) continue;
+    bool flying = false;
+    for (int i = 0; i < nAct_ && !flying; i++)
+      flying = phome_[i] < 0 && Dot(pv_[i], pv_[i]) > 0.0025f;
+    for (size_t g = 0; g < grains_.size() && !flying; g++)
+      flying = grains_[g].vx != 0 || grains_[g].vy != 0;
+    if (!flying) break;
   }
   stickOn_ = on;
 }
@@ -1508,12 +1915,12 @@ Composition FlaskSim::RemoveVessel(int vi) {
     if ((int)i < nAct_) act++;
     px_[w] = px_[i]; pv_[w] = pv_[i]; pprev_[w] = pprev_[i];
     psub_[w] = psub_[i]; pw_[w] = pw_[i]; mbar_[w] = mbar_[i]; calm_[w] = calm_[i];
-    phome_[w] = phome_[i];
+    phome_[w] = phome_[i]; pvar_[w] = pvar_[i]; panc_[w] = panc_[i]; pheat_[w] = pheat_[i];
     w++;
   }
   nAct_ = act;
   px_.resize(w); pv_.resize(w); pprev_.resize(w); psub_.resize(w); pw_.resize(w); mbar_.resize(w);
-  calm_.resize(w); phome_.resize(w);
+  calm_.resize(w); phome_.resize(w); pvar_.resize(w); panc_.resize(w); pheat_.resize(w);
   // ...and so do the grains.
   const int W = cfg_.gridW;
   size_t gw = 0;
@@ -1617,68 +2024,298 @@ std::vector<float> FlaskSim::MeanHeights() const {
 // ---- drawing ---------------------------------------------------------------
 
 void FlaskSim::Render(std::vector<uint32_t>& out) const {
+  // THE LOOK. Everything here is derived from what the world's renderer
+  // reads for the same material (Look, from SetSubstances): the opaque flag
+  // (a molten surface that glows and churns), isViscousLiquid's pair (a dark
+  // glossy sheen, no glints), media opacity (how much of the desk shows
+  // through and how fast depth darkens it), and emission (the light it
+  // throws on the glass, the sand and the air round it). The texture is
+  // carried BY THE PARTICLES -- each has its own palette entry and phase --
+  // so it flows with the liquid; a pattern in screen space read as a static
+  // backdrop the liquid was a window onto.
   const int W = cfg_.gridW, H = cfg_.gridH;
-  out.assign((size_t)W * H, 0);
-  // Liquid: splat each particle into a field; a pixel's colour is the
-  // substance that contributed most to it.
-  std::vector<float> total((size_t)W * H, 0.f), best((size_t)W * H, 0.f);
-  std::vector<uint8_t> who((size_t)W * H, 0);
+  const size_t N = (size_t)W * H;
+  out.assign(N, 0);
+  const float t = (float)step_;
+  const uint32_t elapsed = std::min<uint32_t>(16, step_ - lastRenderStep_);
+  lastRenderStep_ = step_;
+
+  // 1. Splat: total footprint per pixel, and the particle that covers it
+  // most (its OWNER: the pixel wears that particle's look).
+  rTotal_.assign(N, 0.f);
+  rBest_.assign(N, 0.f);
+  rOwner_.assign(N, -1);
   const float R = spacing_ * 1.05f;
   const float R2 = R * R;
   const int ri = (int)std::ceil(R);
+  std::vector<int> perSub(subs_.size(), 0);
   for (size_t i = 0; i < px_.size(); i++) {
-    int cx = (int)std::floor(px_[i].x), cy = (int)std::floor(px_[i].y);
-    for (int dy = -ri; dy <= ri; dy++)
+    const int cx = (int)std::floor(px_[i].x), cy = (int)std::floor(px_[i].y);
+    if (cx < -ri || cy < -ri || cx >= W + ri || cy >= H + ri) continue;
+    perSub[psub_[i]]++;
+    for (int dy = -ri; dy <= ri; dy++) {
+      const int y = cy + dy;
+      if (y < 0 || y >= H) continue;
       for (int dx = -ri; dx <= ri; dx++) {
-        int x = cx + dx, y = cy + dy;
-        if (x < 0 || y < 0 || x >= W || y >= H) continue;
-        float ex = x + 0.5f - px_[i].x, ey = y + 0.5f - px_[i].y;
-        float d2 = ex * ex + ey * ey;
+        const int x = cx + dx;
+        if (x < 0 || x >= W) continue;
+        const float ex = x + 0.5f - px_[i].x, ey = y + 0.5f - px_[i].y;
+        const float d2 = ex * ex + ey * ey;
         if (d2 >= R2) continue;
         float w = 1.f - d2 / R2;
         w *= w;
-        size_t k = (size_t)y * W + x;
-        total[k] += w;
-        if (w > best[k]) { best[k] = w; who[k] = psub_[i]; }
+        const size_t k = (size_t)y * W + x;
+        rTotal_[k] += w;
+        if (w > rBest_[k]) { rBest_[k] = w; rOwner_[k] = (int)i; }
       }
+    }
   }
   const float thresh = kLiquidThresh;
-  auto liquidAt = [&](int x, int y) {
-    return x >= 0 && y >= 0 && x < W && y < H && total[(size_t)y * W + x] > thresh &&
-           !grid_[(size_t)y * W + x];
+  auto liquid = [&](size_t k) { return rTotal_[k] > thresh && !grid_[k]; };
+
+  // 2. Depth below the liquid's surface, per column (1 = the surface pixel).
+  rDepth_.assign(N, 0);
+  for (int x = 0; x < W; x++) {
+    int d = 0;
+    for (int y = H - 1; y >= 0; y--) {
+      const size_t k = (size_t)y * W + x;
+      d = liquid(k) ? std::min(d + 1, 255) : 0;
+      rDepth_[k] = (uint8_t)d;
+    }
+  }
+
+  // Molten matter's heat, per particle: bands travelling through the blobs
+  // its seed noise made (neighbours agree, so it reads as flow, not grain).
+  rHeat_.resize(px_.size());
+  for (size_t i = 0; i < px_.size(); i++)
+    rHeat_[i] = look_[psub_[i]].kind == kLookMolten
+                    ? 0.5f + 0.5f * std::sin(pheat_[i] * (12.566f / 255.0f) + t * 0.03f)
+                    : 0.0f;
+  auto heatOf = [&](int i) { return rHeat_[i]; };
+
+  // 3. The glow field, at quarter resolution, blurred: what emissive liquid
+  // throws on everything round it.
+  const int gw = (W + 3) / 4, gh = (H + 3) / 4;
+  bool anyGlow = false;
+  for (const Look& L : look_) anyGlow |= L.glow > 0.05f;
+  rGlow_.assign(anyGlow ? (size_t)gw * gh * 3 : 0, 0.f);
+  if (anyGlow) {
+    for (int y = 0; y < H; y++)
+      for (int x = 0; x < W; x++) {
+        const size_t k = (size_t)y * W + x;
+        if (!liquid(k)) continue;
+        const int o = rOwner_[k];
+        const Look& L = look_[psub_[o]];
+        if (L.glow <= 0.05f) continue;
+        const float pulse = L.kind == kLookMolten ? 0.6f + 0.4f * heatOf(o)
+                                                  : 0.75f + 0.25f * std::sin(t * 0.02f + pvar_[o] * 0.01f);
+        const float s = L.glow * pulse / 16.0f;
+        float* g = &rGlow_[((size_t)(y >> 2) * gw + (x >> 2)) * 3];
+        const uint32_t c = L.col[2];
+        g[0] += ChR(c) * s; g[1] += ChG(c) * s; g[2] += ChB(c) * s;
+      }
+    std::vector<float> tmp(rGlow_.size());
+    for (int pass = 0; pass < 2; pass++) {
+      for (int y = 0; y < gh; y++)
+        for (int x = 0; x < gw; x++)
+          for (int c = 0; c < 3; c++) {
+            float a = 0;
+            for (int o = -2; o <= 2; o++) a += rGlow_[((size_t)y * gw + std::clamp(x + o, 0, gw - 1)) * 3 + c];
+            tmp[((size_t)y * gw + x) * 3 + c] = a * 0.2f;
+          }
+      for (int y = 0; y < gh; y++)
+        for (int x = 0; x < gw; x++)
+          for (int c = 0; c < 3; c++) {
+            float a = 0;
+            for (int o = -2; o <= 2; o++) a += tmp[((size_t)std::clamp(y + o, 0, gh - 1) * gw + x) * 3 + c];
+            rGlow_[((size_t)y * gw + x) * 3 + c] = a * 0.2f;
+          }
+    }
+  }
+  // Which quarter cells have any glow worth sampling (with a cell's margin
+  // for the bilinear reach): most of the table does not.
+  rGlowOn_.assign(anyGlow ? (size_t)gw * gh : 0, 0);
+  if (anyGlow)
+    for (int y = 0; y < gh; y++)
+      for (int x = 0; x < gw; x++) {
+        const float* g = &rGlow_[((size_t)y * gw + x) * 3];
+        if (g[0] + g[1] + g[2] < 0.3f) continue;
+        for (int oy = -1; oy <= 1; oy++)
+          for (int ox = -1; ox <= 1; ox++) {
+            const int ax = x + ox, ay = y + oy;
+            if (ax >= 0 && ay >= 0 && ax < gw && ay < gh) rGlowOn_[(size_t)ay * gw + ax] = 1;
+          }
+      }
+  auto glowAt = [&](int x, int y, float* o) {
+    // Bilinear over the quarter-resolution field.
+    const float fx = (x + 0.5f) / 4.0f - 0.5f, fy = (y + 0.5f) / 4.0f - 0.5f;
+    const int x0 = std::clamp((int)std::floor(fx), 0, gw - 1), y0 = std::clamp((int)std::floor(fy), 0, gh - 1);
+    const int x1 = std::min(x0 + 1, gw - 1), y1 = std::min(y0 + 1, gh - 1);
+    const float ax = std::clamp(fx - x0, 0.f, 1.f), ay = std::clamp(fy - y0, 0.f, 1.f);
+    for (int c = 0; c < 3; c++) {
+      const float a = rGlow_[((size_t)y0 * gw + x0) * 3 + c], b = rGlow_[((size_t)y0 * gw + x1) * 3 + c];
+      const float d = rGlow_[((size_t)y1 * gw + x0) * 3 + c], e = rGlow_[((size_t)y1 * gw + x1) * 3 + c];
+      o[c] = (a + (b - a) * ax) * (1 - ay) + (d + (e - d) * ax) * ay;
+    }
   };
+
+  // 4. Bubbles (look only): acid fizzes, molten matter blurps. Each rises
+  // through its own liquid and bursts where that liquid ends.
+  {
+    uint32_t& r = lookRng_;
+    auto rnd = [&r] { r ^= r << 13; r ^= r >> 17; r ^= r << 5; return r; };
+    size_t w = 0;
+    for (size_t b = 0; b < bubbles_.size(); b++) {
+      Bubble bb = bubbles_[b];
+      if (bb.age >= 200) continue;   // burst last frame
+      bb.y += bb.vy * elapsed;
+      bb.x += ((int)(rnd() % 3) - 1) * 0.35f;
+      const int x = (int)bb.x, y = (int)bb.y;
+      bool alive = x >= 0 && y >= 0 && x < W && y < H;
+      if (alive) {
+        const size_t k = (size_t)y * W + x;
+        alive = liquid(k) && psub_[rOwner_[k]] == bb.sub;
+      }
+      if (!alive) {
+        if (look_[bb.sub].kind == kLookMolten) { bb.age = 200; bb.y -= 1; bubbles_[w++] = bb; }
+        continue;
+      }
+      bb.age = (uint8_t)std::min(199, bb.age + 1);
+      bubbles_[w++] = bb;
+    }
+    bubbles_.resize(w);
+    for (size_t s = 0; s < subs_.size() && bubbles_.size() < 240; s++) {
+      if (!perSub[s] || subs_[s].powder) continue;
+      const Look& L = look_[s];
+      float rate = 0;
+      if (L.kind == kLookMolten) rate = 0.00012f;
+      else if (L.glow > 0.05f) rate = 0.0012f * std::min(1.0f, L.glow * 4.0f);
+      if (rate <= 0) continue;
+      const float expect = rate * perSub[s] * elapsed;
+      int spawn = (int)expect + ((rnd() & 1023) < (uint32_t)((expect - (int)expect) * 1024) ? 1 : 0);
+      for (int k = 0; k < spawn && !px_.empty(); k++)
+        for (int tries = 0; tries < 12; tries++) {
+          const size_t i = rnd() % px_.size();
+          if (psub_[i] != s) continue;
+          const float vy = L.kind == kLookMolten ? 0.05f + (rnd() & 63) / 2000.f : 0.12f + (rnd() & 63) / 400.f;
+          bubbles_.push_back({px_[i].x, px_[i].y, vy, (uint8_t)s, 0});
+          break;
+        }
+    }
+  }
+
+  // 5. Compose.
   for (int y = 0; y < H; y++) {
     const int row = H - 1 - y;  // image rows top-down
     for (int x = 0; x < W; x++) {
-      size_t k = (size_t)y * W + x;
+      const size_t k = (size_t)y * W + x;
       uint32_t c = 0;
+      float gl[3] = {0, 0, 0};
+      if (anyGlow && rGlowOn_[(size_t)(y >> 2) * gw + (x >> 2)]) glowAt(x, y, gl);
+      const float glowI = gl[0] + gl[1] + gl[2];
       if (grid_[k]) {
         const Grain& g = grains_[grid_[k] - 1];
-        c = subs_[g.sub].color[g.variant % 3] | 0xFF000000u;
-        // A grain with open space above catches the light.
-        if (y + 1 < H && !grid_[k + W] && !liquidAt(x, y + 1)) c = Lift(c, 3, 255);
-      } else if (total[k] > thresh) {
-        const Substance& s = subs_[who[k]];
-        bool surface = !liquidAt(x, y + 1);
-        bool edge = who[k] != (y + 1 < H ? who[k + W] : who[k]) && liquidAt(x, y + 1);
-        // Depth banding: every 6 px under the surface one step darker.
-        int depth = 0;
-        for (int yy = y + 1; yy < H && yy <= y + 24 && liquidAt(x, yy); yy++) depth++;
-        int f = 16 - std::min(4, depth / 6);
-        uint32_t base = s.color[((x / 3) + (y / 2)) % 3 == 0 ? 1 : 0];
-        c = surface ? Lift(base, 5, 235) : edge ? Lift(base, 2, 225) : Shade(base, f, 215);
+        c = ToDisplay(subs_[g.sub].color[g.variant % 3]);
+        // WET sand is darker (the world's water darkens what it soaks), and
+        // a grain with open space above catches the light.
+        const bool wet = rTotal_[k] > thresh * 0.6f;
+        if (wet) c = Shade(c, 12, 255);
+        else if (y + 1 < H && !grid_[k + W] && !liquid(k + W)) c = Lift(c, 3, 255);
+        if (glowI > 1) c = AddRGB(c, gl[0] * 0.5f, gl[1] * 0.5f, gl[2] * 0.5f, 255);
+      } else if (liquid(k)) {
+        const int o = rOwner_[k];
+        const int s = psub_[o];
+        const Look& L = look_[s];
+        const int var = pvar_[o];
+        const int d = rDepth_[k];
+        // A viscous liquid is smooth (the world gives it a smoothed normal so
+        // it does not read as gelatin cubes): its palette entries are pulled
+        // halfway to the first, and its body sits a shade darker.
+        const uint32_t base = L.kind == kLookViscous ? Shade(MixRGB(L.col[0], L.col[var % 3], 0.5f, 255), 13, 255)
+                                                     : L.col[var % 3];
+        // The pixel above is another liquid: this is an interface.
+        const bool iface = y + 1 < H && liquid(k + W) && psub_[rOwner_[k + W]] != s;
+        const float sp = std::sqrt(Dot(pv_[o], pv_[o]));
+        if (L.kind == kLookMolten) {
+          const float h = heatOf(o);
+          const float deep = std::min(1.0f, d / 18.0f);
+          if (d <= 2) {
+            // The cooling skin: dark, broken where the heat under it wells up.
+            c = h > 0.78f ? Lift(L.col[2], 5, 255) : Shade(L.col[1], d == 1 ? 8 : 11, 255);
+          } else {
+            c = MixRGB(L.col[1], L.col[2], std::clamp(h * 0.8f + deep * 0.35f, 0.f, 1.f), 255);
+            c = Lift(c, (int)(L.glow * 4 * (0.4f + 0.6f * h)), 255);
+          }
+        } else {
+          const bool viscous = L.kind == kLookViscous;
+          // Deeper is darker and richer; posterised in steps of 5 px.
+          const int f = 16 - std::min(viscous ? 4 : 5, d / 6);
+          const int alpha = L.alpha[d];
+          c = Shade(base, f, alpha);
+          if (d == 1) {
+            c = Lift(base, viscous ? 5 : 8, std::max(alpha, 235));   // the surface line
+          } else if (viscous && d == 3) {
+            c = Lift(base, 5, alpha);   // the wet sheen under a thick surface
+          } else if (iface) {
+            c = Shade(base, 11, std::max(alpha, 220));
+          } else if (!viscous && sp > 0.5f) {
+            // Moving water carries light: brighter the faster it runs.
+            c = Lift(c, std::min(7, (int)(sp * 4)), std::max(alpha, 200));
+          } else if (!viscous && rBest_[k] > 0.85f && ((var * 37 + (int)(t / 6)) % 211) == 0) {
+            c = Lift(base, 11, 245);   // a glint, riding its particle
+          }
+          if (L.glow > 0.05f) {
+            // Its own light, breathing.
+            const float br = L.glow * (0.75f + 0.25f * std::sin(t * 0.02f + var * 0.01f));
+            c = Lift(c, (int)(br * 5), std::min(255, (int)(c >> 24) + (int)(br * 60)));
+          }
+        }
+        if (glowI > 1 && L.glow <= 0.05f) c = AddRGB(c, gl[0] * 0.35f, gl[1] * 0.35f, gl[2] * 0.35f, (int)(c >> 24));
+      } else if (glowI > 1.5f) {
+        // Air round glowing matter: a halo in its colour.
+        const float m = std::max({gl[0], gl[1], gl[2]});
+        const float a = std::min(150.f, glowI * 0.9f);
+        c = PackRGBA((int)(gl[0] * 255 / m), (int)(gl[1] * 255 / m), (int)(gl[2] * 255 / m), (int)a);
       }
       if (wall_[k]) {
-        // Glass: pale, mostly transparent, a highlight on the left faces.
+        // Glass: pale, mostly transparent, a highlight on the left faces;
+        // lit by whatever glows beside it.
         bool lit = (x > 0 && !wall_[k - 1]) && ((y / 3) & 1);
         if (highlight_ >= 0 && wall_[k] == highlight_ + 1)
           c = lit ? PackRGBA(255, 244, 196, 240) : PackRGBA(232, 208, 140, 200);
         else
           c = lit ? PackRGBA(236, 246, 255, 210) : PackRGBA(170, 205, 230, 120);
+        if (glowI > 1) c = AddRGB(c, gl[0] * 0.7f, gl[1] * 0.7f, gl[2] * 0.7f, std::min(255, (int)(c >> 24) + (int)glowI));
       }
       out[(size_t)row * W + x] = c;
     }
   }
+
+  // Bubbles over it all.
+  for (const Bubble& b : bubbles_) {
+    const int x = (int)b.x, y = (int)b.y;
+    if (x < 0 || y < 0 || x >= W || y >= H) continue;
+    const Look& L = look_[b.sub];
+    auto put = [&](int xx, int yy, uint32_t c) {
+      if (xx < 0 || yy < 0 || xx >= W || yy >= H || wall_[(size_t)yy * W + xx]) return;
+      out[(size_t)(H - 1 - yy) * W + xx] = c;
+    };
+    if (L.kind == kLookMolten) {
+      if (b.age >= 200) {
+        // Burst at the surface: a spit of bright matter.
+        put(x, y + 1, Lift(L.col[2], 12, 255));
+        put(x - 1, y + 2, Lift(L.col[2], 8, 220));
+        put(x + 1, y + 2, Lift(L.col[2], 8, 220));
+      } else {
+        const uint32_t rim = Lift(L.col[2], 9, 255);
+        put(x, y, Shade(L.col[1], 10, 255));
+        put(x - 1, y, rim); put(x + 1, y, rim); put(x, y + 1, rim); put(x, y - 1, rim);
+      }
+    } else {
+      put(x, y, Lift(L.col[2], 12, 250));
+    }
+  }
+
   if (stickOn_) {
     int x0 = (int)std::floor(std::min(stickA_.x, stickB_.x) - stickR_ - 1);
     int x1 = (int)std::ceil(std::max(stickA_.x, stickB_.x) + stickR_ + 1);
@@ -1687,8 +2324,8 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
     for (int y = std::max(0, y0); y <= std::min(H - 1, y1); y++)
       for (int x = std::max(0, x0); x <= std::min(W - 1, x1); x++) {
         V2 p{x + 0.5f, y + 0.5f};
-        float t;
-        float d = Len(p - ClosestOnSeg(p, stickA_, stickB_, &t));
+        float tt;
+        float d = Len(p - ClosestOnSeg(p, stickA_, stickB_, &tt));
         if (d > stickR_) continue;
         bool rim = d > stickR_ - 1.f;
         out[(size_t)(H - 1 - y) * W + x] = rim ? PackRGBA(92, 60, 34, 255) : PackRGBA(150, 104, 62, 255);

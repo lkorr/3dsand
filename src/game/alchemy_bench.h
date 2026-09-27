@@ -78,6 +78,8 @@ class AlchemyBench {
   static constexpr int kMaxH = 480;
   // The table top: vessels stand with their base this high.
   static constexpr float kTableY = 4.0f;
+  // Vessels on the table at once: the character's two hands.
+  static constexpr int kMaxOnTable = 2;
 
   AlchemyBench() = default;
   ~AlchemyBench() { Abandon(); }
@@ -92,6 +94,8 @@ class AlchemyBench {
   // leaves with what is inside it). A vessel taken off and put back holds
   // what it left with; the kit is only written at Finish.
   bool Place(KitRef ref, const ItemDef& def, const ItemInstance& inst);
+  // Why the last Place said no, for the panel ("" = no reason to show).
+  const std::string& Refusal() const { return refusal_; }
   void Remove(KitRef ref);
   bool OnTable(KitRef ref) const;
   bool Uses(KitRef ref) const;
@@ -127,7 +131,6 @@ class AlchemyBench {
   };
   struct Slot {                // per entry, sim-thread side
     int sim = -1;              // FlaskSim vessel index, -1 when off the table
-    Xform cmd;                 // the smoothed pose sent to the sim
     Xform goal;                // where the hand (or the table) wants it
   };
   void Run();
@@ -142,6 +145,7 @@ class AlchemyBench {
   std::vector<BenchEntry> entries_;
   std::vector<uint32_t> front_;
   bool fresh_ = false;
+  std::string refusal_;
 
   // ---- shared, under mu_ ----
   mutable std::mutex mu_;

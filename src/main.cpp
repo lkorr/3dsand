@@ -12890,7 +12890,9 @@ int main(int argc, char** argv) {
           ui.alchemy.tool = 0;
         }
         if (!bench.Place(ref, *d, *st))
-          ui.alchemy.message = "that will not go on the bench";
+          ui.alchemy.message = bench.Refusal().empty() ? "that will not go on the bench" : bench.Refusal();
+        else
+          ui.alchemy.message.clear();
       };
       if (ui.alchemy.wantOpen) {
         ui.alchemy.wantOpen = false;

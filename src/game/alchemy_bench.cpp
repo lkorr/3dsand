@@ -103,13 +103,25 @@ bool AlchemyBench::OnTable(KitRef ref) const {
 }
 
 bool AlchemyBench::Place(KitRef ref, const ItemDef& def, const ItemInstance& inst) {
+  refusal_.clear();
   if (!open_ || !mats_ || !def.IsContainer() || inst.count != 1) return false;
   int ei = -1;
   for (size_t i = 0; i < entries_.size(); i++)
     if (entries_[i].ref == ref) ei = (int)i;
   if (ei >= 0 && entries_[ei].onTable) return false;
+  // TWO VESSELS AT A TIME: the character works the bench with their own two
+  // hands (game/session.h BenchHold), one vessel in each.
+  int onTable = 0;
+  for (const BenchEntry& e : entries_) onTable += e.onTable;
+  if (onTable >= kMaxOnTable) {
+    refusal_ = "the bench takes two vessels at a time - take one off first";
+    return false;
+  }
   if (ei < 0) {
-    if (!AllOnBench(inst.contents, *mats_)) return false;
+    if (!AllOnBench(inst.contents, *mats_)) {
+      refusal_ = "something in it cannot go on the bench";
+      return false;
+    }
     BenchEntry e;
     e.ref = ref;
     e.item = inst.name;
@@ -201,7 +213,7 @@ BenchResult AlchemyBench::Finish() {
   // stream over a mouth is not a spill). Capped: this runs in one frame,
   // and a calm table exits at once.
   for (Slot& s : slots_)
-    if (s.sim >= 0) sim_.SetVesselXform(s.sim, sim_.VesselXform(s.sim));
+    if (s.sim >= 0) sim_.TeleportVessel(s.sim, sim_.VesselXform(s.sim));
   sim_.Settle(360);
   const Tally t = sim_.Count();
   for (size_t i = 0; i < entries_.size(); i++) {
@@ -243,20 +255,27 @@ void AlchemyBench::Apply(Cmd& c) {
   Slot& s = slots_[c.entry];
   if (c.kind == Cmd::kPlace) {
     if (s.sim >= 0) return;
-    // Stood at the first spot clear of the others' glass, from the right.
+    // Stood upright at the free spot nearest one of the table's two places
+    // (a third and two thirds of the way across), the one not taken first.
     const float half = c.shape.width * 0.5f + c.shape.wall + 2;
     Xform pose{{(float)w_ - half - 4, kTableY}, 0.0f};
-    for (int k = 0; k < 4 * w_; k++) {
-      const float x = (float)w_ - half - 4 - (float)k * 3.0f;
-      if (x - half < 0) break;
-      const Xform p{{x, kTableY}, 0.0f};
-      if (sim_.ShapeClear(c.shape, p)) {
-        pose = p;
-        break;
+    bool found = false;
+    for (float frac : {0.66f, 0.33f}) {
+      const float want = std::clamp((float)w_ * frac, half + 2, (float)w_ - half - 2);
+      for (int k = 0; k < 2 * w_ && !found; k++) {
+        const float x = want + (float)((k + 1) / 2) * 3.0f * ((k & 1) ? 1.0f : -1.0f);
+        if (x - half < 0 || x + half > (float)w_) continue;
+        const Xform p{{x, kTableY}, 0.0f};
+        if (sim_.ShapeClear(c.shape, p)) {
+          pose = p;
+          found = true;
+        }
       }
+      if (found) break;
     }
+    // Settled before it is shown (FlaskSim::AddVessel): it arrives at rest.
     s.sim = sim_.AddVessel(c.shape, pose, c.contents);
-    s.cmd = s.goal = pose;
+    s.goal = pose;
   } else {
     if (s.sim < 0) return;
     Composition out = sim_.RemoveVessel(s.sim);
@@ -304,24 +323,14 @@ void AlchemyBench::Tick(const BenchInput& in, bool pressed, float tilt, BenchToo
     s.goal.angle = heldAngle_;
   }
 
-  // ---- every vessel follows its goal SMOOTHLY -----------------------------
-  // An exponential approach (fast when far, gentle as it arrives), and never
-  // more than a little ahead of where the glass actually is: a vessel held
-  // against another does not wind up a lead it then releases in one jerk.
-  // The jerk is what threw liquid out of a flask that was only picked up.
-  const float aPos = 1.0f - std::exp(-dt * 9.0f), aAng = 1.0f - std::exp(-dt * 7.0f);
-  for (Slot& s : slots_) {
-    if (s.sim < 0) continue;
-    const Xform actual = sim_.VesselXform(s.sim);
-    s.cmd.pos.x += (s.goal.pos.x - s.cmd.pos.x) * aPos;
-    s.cmd.pos.y += (s.goal.pos.y - s.cmd.pos.y) * aPos;
-    s.cmd.angle += (s.goal.angle - s.cmd.angle) * aAng;
-    const V2 lead{s.cmd.pos.x - actual.pos.x, s.cmd.pos.y - actual.pos.y};
-    const float ll = std::sqrt(lead.x * lead.x + lead.y * lead.y);
-    if (ll > 10.0f) s.cmd.pos = {actual.pos.x + lead.x * 10.0f / ll, actual.pos.y + lead.y * 10.0f / ll};
-    s.cmd.angle = std::clamp(s.cmd.angle, actual.angle - 0.3f, actual.angle + 0.3f);
-    sim_.SetVesselXform(s.sim, s.cmd);
-  }
+  // ---- every vessel goes to its goal ---------------------------------------
+  // How it gets there is the sim's (FlaskSim::MoveVessels): an acceleration
+  // limit and a braking approach, so a flick of the pointer is a firm move
+  // of the glass, never a jerk that throws the liquid out. The bench used to
+  // smooth the goal itself and then the sim capped the step, which was lag
+  // on top of jerk.
+  for (Slot& s : slots_)
+    if (s.sim >= 0) sim_.SetVesselXform(s.sim, s.goal);
 
   // ---- the stick ------------------------------------------------------------
   // Its tip follows the pointer inside whichever vessel the pointer is in,
@@ -392,7 +401,11 @@ void AlchemyBench::Run() {
     sim_.Step(4);
     ticks_++;
 
-    const bool draw = hadCmds || sim_.Active() || simFocus_ != lastFocus || (ticks_ % 30) == 0;
+    // Redrawn every step while anything moves, and at 30 a second while the
+    // table only LOOKS alive (glow, fizz, the light on water: FlaskSim::
+    // Animated); a table with nothing on it every half second.
+    const bool draw = hadCmds || sim_.Active() || simFocus_ != lastFocus ||
+                      (sim_.Animated() ? (ticks_ & 1) == 0 : (ticks_ % 30) == 0);
     lastFocus = simFocus_;
     if (draw) sim_.Render(pic);
     std::vector<Composition> live;

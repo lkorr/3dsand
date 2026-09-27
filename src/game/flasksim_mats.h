@@ -4,6 +4,7 @@
 // through here, so "a liquid behaves in the flask the way it behaves in the
 // world" has one place to be true: class, density (the ORDER of who sinks),
 // moveEvery (thickness) and the three palette colours.
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -25,6 +26,10 @@ inline Substance SubstanceFromMaterial(const MaterialDef& m, uint16_t id) {
   s.color[0] = m.gpu.color0 | 0xFF000000u;
   s.color[1] = m.gpu.color1 | 0xFF000000u;
   s.color[2] = m.gpu.color2 | 0xFF000000u;
+  // The look, from the fields the world's renderer reads for it.
+  s.emission = (uint8_t)std::min<uint32_t>(m.gpu.emission, 255);
+  s.opacity = (uint8_t)std::min<uint32_t>(m.gpu.opacity, 255);
+  s.opaque = (m.gpu.flags & kMatFlagOpaque) != 0;
   return s;
 }
 
