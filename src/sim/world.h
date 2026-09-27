@@ -1570,11 +1570,42 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 // gas kernel's counter would have been word 32 — one past the end — which the
 // GPU would have written into whatever followed the buffer without a word of
 // complaint. Sized with headroom for the same reason kMaxUses is.
-constexpr uint32_t kPageFaultWords = 40;
+//
+// [40..63] THE REACTION-EFFECT RECORD (docs/PLAN_alchemy_chemistry.md package
+//          A): which rules WITH EFFECTS fired where, THIS tick. Not a fault
+//          either; it lives here for the scoop ledger's reason (sim_step
+//          already binds the record atomically and the snapshot ring already
+//          copies it every tick, at the fixed latency World::Snap() owns). But
+//          unlike the rest of the record it is PER TICK: pass_table.def's
+//          fill_reactFx zeroes [40..63] before the CA, every tick.
+//   [40]   rule-with-effects firings this tick (atomicAdd: an order-free sum)
+//   [41..43] T.origin (chunks) the cells below are relative to (stored by
+//          every firing thread; all store the same value)
+//   [44]   T.tick + 1 (0 = nothing fired; the parse checks it)
+//   [45..47] reserved
+//   [48..63] kPageFaultReactFxSlots SLOTS, each an atomicMax of
+//          (fxId << 27) | scramble(window-relative cell). A firing picks its
+//          slot by hash3(seed, tick, cell), so WHICH firings survive a busy
+//          tick is a pure function of the set of firings -- never of the
+//          order threads ran in (rule 1: an order-free reduction, not an
+//          append cursor). ReactFxDecodeCell inverts the scramble.
+constexpr uint32_t kPageFaultWords = 64;
 constexpr uint32_t kPageFaultBytes = kPageFaultWords * 4;
 constexpr uint32_t kPageFaultScoopEighths = 36;
 constexpr uint32_t kPageFaultScoopApplied = 37;
 constexpr uint32_t kPageFaultScoopRefused = 38;
+constexpr uint32_t kPageFaultReactFxBase = 40;    // the fill starts here
+constexpr uint32_t kPageFaultReactFxFires = 40;
+constexpr uint32_t kPageFaultReactFxOrigin = 41;  // 41..43
+constexpr uint32_t kPageFaultReactFxTick = 44;
+constexpr uint32_t kPageFaultReactFxSlot0 = 48;
+constexpr uint32_t kPageFaultReactFxSlots = 16;
+static_assert(kPageFaultReactFxSlot0 + kPageFaultReactFxSlots == kPageFaultWords,
+              "the reaction-effect slots end the pageFaults record; fill_reactFx "
+              "(pass_table.def, 160,96) clears [40..63]");
+// The snapshot ring gives this record a 256-byte slot (world.cpp
+// kPageFaultOff .. kFluidArgsOff).
+static_assert(kPageFaultBytes <= 256, "pageFaults outgrew its snapshot slot");
 
 // ---- fluidArgsStage: the FA_* word map -------------------------------------
 // The seam's counter block (common.wgsl's FA_* names, plus the two refusal-site
@@ -3640,6 +3671,44 @@ struct FarParams {
 
 enum class CellKind { Unknown, Air, Solid, Liquid, Gas };
 
+// ---- ONE REACTION WITH EFFECTS THAT FIRED IN THE GRID ----------------------
+// Decoded from the pageFaults record's [40..63] (kPageFaultReactFx*) by the
+// snapshot parse. `fxId` names the effect list (materials.h FindRuleFx),
+// `cell` is the WORLD cell of the reacting (self) voxel, `tick` the tick it
+// fired on. docs/PLAN_alchemy_chemistry.md package A; consumed by
+// game/session.cpp's reaction-effect pass.
+struct ReactFxEvent {
+  uint32_t fxId = 0;
+  IVec3 cell{};
+  uint32_t tick = 0;
+};
+// The slot key's cell half: the window-relative linear cell (z-major, x
+// fastest; 27 bits at kWorldN 512) times an odd constant mod 2^27. The
+// multiply is a bijection, so the key is still unique per cell and decodes
+// exactly, but a slot's atomicMax then picks a spatially SCATTERED winner
+// instead of always the cell in the window's high corner. MIRRORED in
+// sim_step.wgsl (RFX_SCRAMBLE), check_invariants `pairs`.
+constexpr uint32_t kReactFxCellBits = 27;
+constexpr uint32_t kReactFxCellMask = (1u << kReactFxCellBits) - 1u;
+constexpr uint32_t kReactFxScramble = 0x0B5AD4EBu;  // odd
+static_assert(kWorldN * kWorldN * kWorldN <= (1ull << kReactFxCellBits),
+              "the reaction-effect key holds a window cell in 27 bits; a "
+              "bigger window needs a wider key (world.h kPageFaultReactFx*)");
+constexpr uint32_t ReactFxScrambleInverse() {
+  uint32_t inv = kReactFxScramble;  // Newton: each step doubles the good bits
+  for (int i = 0; i < 5; i++) inv *= 2u - kReactFxScramble * inv;
+  return inv;
+}
+static_assert((kReactFxScramble * ReactFxScrambleInverse()) == 1u,
+              "kReactFxScramble must be odd");
+inline IVec3 ReactFxDecodeCell(uint32_t key, IVec3 originChunks) {
+  const uint32_t lin = (key * ReactFxScrambleInverse()) & kReactFxCellMask;
+  const int x = (int)(lin % kWorldN), y = (int)((lin / kWorldN) % kWorldN),
+            z = (int)(lin / (kWorldN * kWorldN));
+  return {originChunks.x * (int)kChunk + x, originChunks.y * (int)kChunk + y,
+          originChunks.z * (int)kChunk + z};
+}
+
 // CPU-visible snapshot of GPU state, exactly World::kSnapshotLatency ticks
 // latent by design (DESIGN.md §2) — a FIXED age, not a readback-timing one.
 struct WorldSnapshot {
@@ -3728,6 +3797,14 @@ struct WorldSnapshot {
   uint32_t scoopEighths = 0;
   uint32_t scoopApplied = 0;
   uint32_t scoopRefused = 0;
+  // ---- reaction effects (pageFaults [40..63], kPageFaultReactFx*) ----
+  // THIS snapshot's tick only (the record is cleared every tick). `reactFx`
+  // is the surviving slot winners in SLOT order -- a fixed order, so the
+  // consumer's "first N" is deterministic; `reactFxFires` counts every firing
+  // of a rule with effects, winners or not (the attribution for "why only N
+  // blasts": N slots, M firings).
+  std::vector<ReactFxEvent> reactFx;
+  uint32_t reactFxFires = 0;
   // ---- MLS-MPM fluid (seam) ----
   // The GPU-owned live particle count and the fluidArgsStage event counters
   // (the FA_* map in common.wgsl) as of this snapshot's tick. fluidLive is
@@ -4111,6 +4188,20 @@ class World {
   // it fall behind. `valid` is false only for the first kSnapshotLatency ticks
   // after a world reset, which is itself a constant.
   const WorldSnapshot& Snap() const { return snap_; }
+
+  // ---- REACTION EFFECTS, EXACTLY ONCE (docs/PLAN_alchemy_chemistry.md A) --
+  // The reaction-effect winners of every snapshot published since the last
+  // call, in tick order. On the fixed-latency path (published, never
+  // LatestDelivered), so what a tick drains is a pure function of the tick:
+  // at tick T it is the firings of tick T - kSnapshotLatency - 1 (the publish
+  // runs inside SubmitTick, after the tick body that drains). The one
+  // consumer is game/session.cpp's reaction-effect pass.
+  static constexpr size_t kReactFxPendingMax = 256;
+  std::vector<ReactFxEvent> TakeReactFx() {
+    std::vector<ReactFxEvent> out;
+    out.swap(reactFxPending_);
+    return out;
+  }
 
   // ---- the per-chunk digest and the quiet counter (M9.3-A) ---------------
   //
@@ -4829,6 +4920,12 @@ class World {
   // state is kSnapshotLatency + 1 WorldSnapshots, not kReadbackSlots.
   std::deque<WorldSnapshot> ready_;
   std::vector<WorldSnapshot> snapPool_;
+  // Every published snapshot's reaction-effect winners, in publish (= tick)
+  // order, until TakeReactFx drains them. Appended in PublishSnapshotsUpTo, so
+  // a publish that walks two snapshots at once loses neither; capped at
+  // kReactFxPendingMax (oldest dropped) so a harness that never drains cannot
+  // grow it; cleared by InvalidateSnapshot (a dead world's blasts).
+  std::vector<ReactFxEvent> reactFxPending_;
   // Bumped by InvalidateSnapshot and by a TICK REWIND (a harness scene
   // restarting its counter — see kOrder in test/selftest.cpp). Everything from
   // an older epoch is dropped rather than compared against the new tick base,

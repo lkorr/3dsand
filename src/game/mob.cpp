@@ -3476,6 +3476,7 @@ void MobSystem::SetPlayerActors(std::span<const PlayerActorDesc> players) {
 void MobSystem::Reset(bool rewindIds) {
   for (Mob& m : mobs_) m.ReleaseRig();
   mobs_.clear();
+  bodyFx_.clear();
   // ...and the corpses that were going to get up do not, because the world
   // they were lying in is gone: a booked rising names a place and a handful of
   // debris handles, and both belong to the world that is being torn down.
@@ -14479,6 +14480,18 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
                                       ((float)vp.y + 0.5f) * inv,
                                       ((float)vp.z + 0.5f) * inv});
   };
+  // A rule WITH EFFECTS fired on this body (materials.h RuleFx, fx id in
+  // cond bits 24..28): report it at the body voxel's world cell, where
+  // game/session.cpp's reaction-effect pass turns an `explode` into a real
+  // ExplosionOp next to the body (docs/PLAN_alchemy_chemistry.md A). The cell
+  // comes from the limb's pose -- the same float-to-cell step every product
+  // this pass lands in the grid takes (emitCell below), never an RNG key.
+  auto noteBodyFx = [&](const ReactionGpu& r, IVec3 vp) {
+    const uint32_t fx = ReactFxIdOf(r.cond);
+    if (fx == 0 || bodyFx_.size() >= kBodyFxPerTick) return;
+    const Vec3 wv = worldOf(vp);
+    bodyFx_.push_back({fx, {ifloor(wv.x), ifloor(wv.y), ifloor(wv.z)}, tick});
+  };
 
   // ---- the cheap gate: walk the WORLD side, not the body side -----------
   // A mina limb's world AABB is order 4x4x8 = 128 cells; its surface is
@@ -15687,6 +15700,7 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
       // and damps its catching exactly as it does a grid cell (reactcpu.h).
       chance = RainScaledChance(r.cond, chance, weatherRain_, true);
       if (rr % kReactChanceDen >= chance) continue;
+      noteBodyFx(r, vp);
       const uint32_t kind = r.packed & 3u;
       if (kind == kReactDecay) {
         applyTo(cell, r.prodSelf, rr);
@@ -15788,6 +15802,9 @@ bool MobSystem::BurnOneLimb(BurnLimbView& v, uint32_t tick, uint32_t rngKey,
         if (rr % kReactChanceDen >=
             RainScaledChance(r.cond, r.chance, weatherRain_, true))
           continue;
+        // A world cell's rule with effects (sodium + blood -> explode) fired
+        // ONTO this body: the blast is at the body voxel it fired on.
+        noteBodyFx(r, vp);
         applyTo(cell, r.prodNbr, rr);
         fired = true;
         break;

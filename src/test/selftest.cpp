@@ -58,6 +58,9 @@ const std::vector<Gate>& PlayerKitGates();
 const std::vector<Gate>& VesselGates();
 // The alchemy bench (game/flasksim.*): CPU-only over the material table.
 const std::vector<Gate>& AlchemyGates();
+// World chemistry (docs/PLAN_alchemy_chemistry.md package A): reaction
+// effects (explode), the new materials in the grid, toxic gas on bodies.
+const std::vector<Gate>& ChemGates();
 const std::vector<Gate>& GrimoireGates();
 // The spell GRAPH (PLAN_spell_graph phase 2): layout, the linearizer, the tree
 // edit ops. CPU-only over glyphs.json and the generated oracle.
@@ -765,6 +768,10 @@ const char* const kOrder[] = {
     // regenerates it on the way out.
     "corpse-crossheat", "garment-burn", "corpse-worn", "corpse-splatter", "vessel-grid", "vessel-sand", "vessel-mpm", "vessel-break",
     "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-spawn", "alchemy-sand-carry",
+    // World chemistry (docs/PLAN_alchemy_chemistry.md A): each builds its own
+    // sealed fixture, ticks THE tick, and regenerates the world on the way
+    // out; chem-toxic spawns under an IdCounterScope and resets the mobs.
+    "chem-sodium", "chem-acid-fumes", "chem-electrolysis", "chem-toxic",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto
@@ -947,7 +954,7 @@ const std::vector<Gate>& Registry() {
                           &MobGates(), &BodyGates(), &FloaterGates(),
                           &WorldIoGates(), &AudioGates(),
                           &VoxRegionGates(),
-                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &GrimoireGates(), &SpellGraphGates(),
+                          &SpellGates(), &PlayerKitGates(), &VesselGates(), &AlchemyGates(), &ChemGates(), &GrimoireGates(), &SpellGraphGates(),
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
@@ -1595,7 +1602,9 @@ int Run(Ctx& c, const Options& opt) {
     // The per-kernel tally is the rule-6 line: it answers "which writer" in one
     // run instead of one writer switched off per run.
     std::string byK;
-    for (uint32_t i = 0; i < kPageFaultWords - kPageFaultKernelBase; i++) {
+    // Up to the scoop ledger, not the end of the record: [36..63] are the
+    // scoop ledger and the reaction-effect record, not kernel tallies.
+    for (uint32_t i = 0; i < kPageFaultScoopEighths - kPageFaultKernelBase; i++) {
       const uint32_t n = pageFaults[kPageFaultKernelBase + i];
       if (!n) continue;
       byK += Format("%s%s %u", byK.empty() ? "" : ", ", kname(i + 1), n);

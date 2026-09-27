@@ -103,6 +103,13 @@ constexpr uint32_t kMatFlagBurnTint = 32;
 // through wet ground, would breed water via steam). DESIGN.md §6 "A coat is a
 // co-located virtual neighbour".
 constexpr uint32_t kMatFlagFlame = 64;
+// A HEAVY GAS: a gas tagged `gas_heavy` (chlorine). Derived at load from the
+// class and the tag, never authored as a flag. Read by exactly one consumer,
+// sim_step.wgsl's stepGas (MATF_HEAVY_GAS there, mirrored by check_invariants
+// `heavygas`): a heavy gas never takes the buoyant rise -- it sinks through
+// air and spreads flat, so it pools in low ground and creeps along it until
+// its authored decay fades it. docs/PLAN_alchemy_chemistry.md package A.
+constexpr uint32_t kMatFlagHeavyGas = 128;
 // Where this material's tint run starts inside the shared tint palette, packed
 // into the free high half of `flags` (bits 16..23) rather than added as a
 // field, for the reason the wind nibbles give below: every reader tests `flags`
@@ -713,7 +720,40 @@ struct ReactionEffect {
 };
 struct RuleFx {
   std::vector<ReactionEffect> effects;
+  // The rule's WORLD FX ID (1..kMaxReactFx; 0 = the rule has no effects), as
+  // also packed into its ReactionGpu.cond bits 24..28 (kCondFxShift). Assigned
+  // in file order at load, one per AUTHORED rule with effects; a synthesized
+  // neighborChance tail rule copies its parent's cond and so carries the SAME
+  // id -- the id names the effect list, not the bucket slot. The GPU records
+  // "fx id N fired at cell C" (sim_step.wgsl reactFxNote); the world consumer
+  // (game/session.cpp, ReactFxWorld) maps the id back through FindRuleFx.
+  // Added by package A (docs/PLAN_alchemy_chemistry.md 2.2), additive.
+  uint32_t fxId = 0;
 };
+
+// ---- the reaction-effect id in ReactionGpu.cond (bits 24..28) --------------
+// cond bits 0..7 are the light/weather gates, 8..15 minLight, 16..23 the
+// neighbour ramp (see ReactionGpu below); 24..31 were unused. Five bits: the
+// GPU's per-tick record keys a slot on (fxId << 27 | window cell), and the
+// window cell is 27 bits at kWorldN 512 (world.h kPageFaultReactFx*). Every
+// reader of `cond` masks the field it wants, so a rule with an fx id gates,
+// ramps and rolls exactly as it would without one.
+constexpr uint32_t kCondFxShift = 24, kCondFxMask = 0x1Fu;
+constexpr uint32_t kMaxReactFx = 31;
+// The effect kinds some consumer registers (the world: explode; the alchemy
+// bench, package C: explode, flash, eject, shock, burst). A kind outside this
+// list still loads -- consumers ignore kinds they do not know -- but the
+// loader warns once so a typo is visible. materials.cpp owns the list.
+extern const char* const kKnownEffectKinds[];
+extern const size_t kKnownEffectKindCount;
+inline uint32_t ReactFxIdOf(uint32_t cond) {
+  return (cond >> kCondFxShift) & kCondFxMask;
+}
+// The authored effect list behind a world fx id, and the material whose rule
+// carries it (`selfMat`, may be null). Null for 0 or an id no rule carries.
+struct MaterialDef;
+const RuleFx* FindRuleFx(const std::vector<MaterialDef>& mats, uint32_t fxId,
+                         uint32_t* selfMat = nullptr);
 
 struct MaterialDef {
   std::string name;

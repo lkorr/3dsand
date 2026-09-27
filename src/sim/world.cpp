@@ -853,6 +853,32 @@ void World::KickReadback() {
         std::memcpy(&out.scoopEighths, p + kPageFaultOff + kPageFaultScoopEighths * 4, 4);
         std::memcpy(&out.scoopApplied, p + kPageFaultOff + kPageFaultScoopApplied * 4, 4);
         std::memcpy(&out.scoopRefused, p + kPageFaultOff + kPageFaultScoopRefused * 4, 4);
+        {
+          // THE REACTION-EFFECT RECORD (world.h kPageFaultReactFx*): this
+          // tick's firings of rules with effects, one winner per slot. The
+          // record's tick word guards against a copy that raced nothing but
+          // is still worth checking -- a stale record would be a blast twice.
+          uint32_t rec[kPageFaultWords - kPageFaultReactFxBase];
+          std::memcpy(rec, p + kPageFaultOff + kPageFaultReactFxBase * 4, sizeof(rec));
+          auto at = [&](uint32_t w) { return rec[w - kPageFaultReactFxBase]; };
+          out.reactFx.clear();
+          out.reactFxFires = at(kPageFaultReactFxFires);
+          const uint32_t recTick = at(kPageFaultReactFxTick);
+          if (out.reactFxFires != 0 && recTick != 0) {
+            const IVec3 org{(int32_t)at(kPageFaultReactFxOrigin),
+                            (int32_t)at(kPageFaultReactFxOrigin + 1),
+                            (int32_t)at(kPageFaultReactFxOrigin + 2)};
+            for (uint32_t s = 0; s < kPageFaultReactFxSlots; s++) {
+              const uint32_t key = at(kPageFaultReactFxSlot0 + s);
+              if (key == 0) continue;
+              ReactFxEvent e;
+              e.fxId = key >> kReactFxCellBits;
+              e.cell = ReactFxDecodeCell(key & kReactFxCellMask, org);
+              e.tick = recTick - 1u;
+              out.reactFx.push_back(e);
+            }
+          }
+        }
         std::memcpy(out.pick, b + kPickOff, 32);
         uint32_t pcounts[2];
         std::memcpy(pcounts, b + kPCountOff, 8);
@@ -963,6 +989,8 @@ void World::InvalidateSnapshot() {
   // would read as "settled, safe to compare" for a chunk that has not been
   // simulated once.
   std::fill(quietTicks_.begin(), quietTicks_.end(), (uint16_t)0);
+  // Reaction effects the dead world published and nobody consumed yet.
+  reactFxPending_.clear();
   // A regenerated window makes every cached chunk stale too: the fetch path's
   // version guard (`cc.version <= sl.tick`) would otherwise keep dead-world
   // contents for any later reader whose tick numbers are LOWER than the gate
@@ -1017,6 +1045,15 @@ bool World::PublishSnapshotsUpTo(uint32_t target) {
     snapPool_.push_back(std::move(ready_.front()));
     ready_.pop_front();
     got = true;
+    // Reaction effects ride the publish, one snapshot at a time, so a publish
+    // that walks two snapshots delivers both ticks' firings (World::TakeReactFx).
+    if (snap_.valid && !snap_.reactFx.empty()) {
+      reactFxPending_.insert(reactFxPending_.end(), snap_.reactFx.begin(),
+                             snap_.reactFx.end());
+      if (reactFxPending_.size() > kReactFxPendingMax)
+        reactFxPending_.erase(reactFxPending_.begin(),
+                              reactFxPending_.end() - kReactFxPendingMax);
+    }
     // ---- the quiet streak (M9.3-A) -------------------------------------
     // Here and not in the readback callback, because "quiet for N ticks" has
     // to count the ticks the CPU world view actually advanced through. The
