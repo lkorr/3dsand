@@ -532,6 +532,34 @@ struct PlayerSession {
   // stream waits for the arm (session.cpp kPourRaiseTicks).
   int pourPoseTicks = 0;
   int pourPoseHand = 0;   // which arm the `pour` clip is on (HandClip)
+  // ---- THE ALCHEMY BENCH IN THE HANDS (game/alchemy_bench.h) ----
+  // While the bench has vessels on its table the character holds them: one
+  // flask in one hand, two in both, and the one being tilted on the bench
+  // tilted over the other's mouth. Written by main.cpp every frame from the
+  // bench's published poses (an input, like the pour stroke); the tick
+  // equips the hands with these instead of the kit's and poses them.
+  // Presentation only: nothing here reaches the sim.
+  struct BenchHold {
+    bool active = false;
+    struct HandView {
+      // The vessel's item NAME, not a def pointer: this is written by the
+      // frame and read by the next tick, and an R reload between the two
+      // rebuilds the item library. Empty = this hand holds nothing extra.
+      std::string item;
+      alchemy::Composition contents;   // the bench's live contents
+      float angle = 0;                 // bench tilt, radians, CCW on screen
+      bool pouring = false;            // tilted over the other hand's
+    } hand[kHands];
+  } benchHold;
+  // Ticks the bench hold has been live (the arm-claim ramp), and which clip
+  // each hand is playing for it.
+  int benchHoldTicks = 0;
+  bool benchClip[kHands] = {false, false};
+  float benchAimW[kHands] = {0.0f, 0.0f};
+  float benchPourW = 0.0f;
+  int benchPourHand = -1;
+  Vec3 benchPourCmd{};          // the pour arm's command (PoseBenchHands)
+  bool benchPourCmdValid = false;
   int throwTicks = 0;
   // The HAND the throw is drawn in (Hand as an int), -1 = none. It used to
   // be a hotbar slot; the vessel is now in a kit hand slot (dual wielding).

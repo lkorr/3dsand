@@ -153,22 +153,34 @@ Status GateAlchemyPour(Ctx& c, std::string& detail) {
   // out of the lip (sand trickles long after the liquid is gone), then swing
   // back. Swinging back mid-trickle drops the tail of it outside -- a real
   // spill, and what the panel counts as one, but not what this gate measures.
+  // WHAT FALLS OFF THE TABLE IS DRAINED AS IT FALLS, the way the bench
+  // streams it into the world (AlchemyBench::Run -> TakeSpill), and the sum
+  // must still come out exact: drained + what is left == what went in.
+  Composition drained;
+  auto drain = [&]() {
+    const Composition d = s.DrainSpilled();
+    for (int i = 0; i < d.n; i++) drained.Add(d.p[i].mat, d.p[i].eighths);
+  };
   int f = 0;
   for (; f < 320; f++) {
     s.SetVesselXform(B, pose(std::clamp((f - 20) / 300.f, 0.f, 1.f)));
     s.Step(3);
+    drain();
   }
   for (int hold = 0; hold < 900; hold++, f++) {
     s.Step(3);
+    drain();
     if (hold > 120 && (hold % 30) == 0 && s.MovingCount(0.3f) == 0) break;
   }
   for (int k = 0; k <= 80; k++, f++) {
     s.SetVesselXform(B, pose(1.0f - k / 80.0f));
     s.Step(3);
+    drain();
   }
   s.Settle(1200);
   Shot(s, "alchemy_pour.bmp");
   auto t = s.Count();
+  for (int i = 0; i < drained.n; i++) t.spilled.Add(drained.p[i].mat, drained.p[i].eighths);
   std::string why;
   bool cons = Conserved(all, t, why);
   const Composition& ta = t.vessel[A];
@@ -191,10 +203,24 @@ Status GateAlchemyPour(Ctx& c, std::string& detail) {
   (void)mh;
   RecordObserved("alchemy.pourPoured", (double)poured);
   RecordObserved("alchemy.pourSpilled", (double)spilled);
-  detail = Format("%s; into A: oil %u/%u sand %u/%u; spilled oil %u, all %u; order %s",
+  detail = Format("%s; into A: oil %u/%u sand %u/%u; spilled oil %u, all %u (%u drained live); order %s",
                   cons ? "conserved" : why.c_str(), oilIn, b.AmountOf((uint16_t)oil), sandIn,
-                  b.AmountOf((uint16_t)sand), oilSpilled, spilled, order.c_str());
-  bool ok = cons && moved && tidy;
+                  b.AmountOf((uint16_t)sand), oilSpilled, spilled, drained.Total(), order.c_str());
+  // ...then A is turned over and emptied off the table, drained as it
+  // falls: the live stream must carry real matter and still add up.
+  for (int k = 0; k < 360; k++) {
+    s.SetVesselXform(A, Xform{{96, 60}, std::min(3.0f, 3.0f * k / 60.0f)});
+    s.Step(3);
+    drain();
+  }
+  auto t2 = s.Count();
+  for (int i = 0; i < drained.n; i++) t2.spilled.Add(drained.p[i].mat, drained.p[i].eighths);
+  std::string why2;
+  const bool cons2 = Conserved(all, t2, why2);
+  const bool streamed = drained.Total() > 0;
+  detail += Format("; dumped: %u eighths drained live, %s", drained.Total(),
+                   cons2 ? "conserved" : why2.c_str());
+  bool ok = cons && moved && tidy && cons2 && streamed;
   (void)ord;  // mixed across two vessels: reported, not asserted
   std::printf("alchemy-pour: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;

@@ -420,6 +420,95 @@ struct TickScratch {
 // feeds `particlesActive`'s 400-tick keep-awake window, where four ticks of
 // slack is inside the noise and shifting it would keep the particle passes
 // awake five ticks longer for no observable gain.
+// ---- THE ALCHEMY BENCH IN THE HANDS (session.h BenchHold) -----------------
+// Runs after the melee pose, so a pour's arm claim wins over the idle one.
+// Each hand holding a bench vessel plays `bench_hold` (its mirror on the
+// left) and its flask is turned to the bench's tilt (Mob::SetHeldAim); the
+// one tilted over the other is IK'd so its mouth is above the other's.
+// Everything eases in and out, so opening the bench, lifting a flask and
+// setting it down never snaps an arm.
+static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
+  const PlayerSession::BenchHold& bh = s.benchHold;
+  const float ease = 1.0f - std::exp(-kTickDt * 8.0f);
+  int pourHand = -1;
+  for (int hk = 0; hk < kHands; hk++) {
+    const Hand h = HandAt(hk);
+    const PlayerSession::BenchHold::HandView& v = bh.hand[hk];
+    const bool holds = bh.active && !v.item.empty() && avatar.HeldItem(h) == v.item &&
+                       avatar.HeldSlot(h) >= 0;
+    const std::string clip = avatar.HandClip("bench_hold", h);
+    // Re-played if it is gone while it should be up: an R/F5 reload rebuilds
+    // the rig's clip state under a hold that is still live.
+    const bool lost = holds && s.benchClip[hk] && avatar.ClipWeight(clip.c_str()) <= 0.0f;
+    if ((holds != s.benchClip[hk] || lost) && !clip.empty()) {
+      if (holds) avatar.PlayClip(clip);
+      else avatar.StopClip(clip);
+    }
+    s.benchClip[hk] = holds;
+    s.benchAimW[hk] += ((holds ? 1.0f : 0.0f) - s.benchAimW[hk]) * ease;
+    if (s.benchAimW[hk] < 0.01f && !holds) s.benchAimW[hk] = 0.0f;
+    // The bench is the portrait's mirror image: the character faces you, so
+    // the bench's right is the body's left (model +X), and a CCW tilt on the
+    // screen swings the mouth toward the body's right (model -X).
+    const float a = v.angle;
+    avatar.SetHeldAim(h, s.benchAimW[hk], Vec3{-std::sin(a), std::cos(a), 0.0f});
+    if (holds && v.pouring) pourHand = hk;
+  }
+  // ---- the pour: the tilted flask's mouth over the other's -------------------
+  const int other = pourHand >= 0 ? 1 - pourHand : -1;
+  const bool pour = pourHand >= 0 && s.benchClip[other];
+  if (pour) s.benchPourHand = pourHand;
+  s.benchPourW += ((pour ? 1.0f : 0.0f) - s.benchPourW) * ease;
+  if (!pour && s.benchPourW < 0.02f) s.benchPourW = 0.0f;
+  if (s.benchPourW <= 0.0f || s.benchPourHand < 0) {
+    s.benchPourCmdValid = false;
+    return;
+  }
+  const Hand ph = HandAt(s.benchPourHand), oh = OtherHand(ph);
+  const bool fresh = avatar.StrikeHand() != ph || !s.benchPourCmdValid;
+  avatar.SetStrikeHand(ph);
+  Vec3 handFromShoulder;
+  float reach = 0;
+  if (!avatar.WeaponArmPose(handFromShoulder, reach)) return;
+  // THE COMMAND IS CLOSED ON THE LIP ITSELF. Which point the arm's IK
+  // places (the wrist, before SetHeldAim turns the hand about the grip) and
+  // where the lip then ends up are two different things, so no open-loop
+  // "hand = target - (lip - hand)" lands: it was measured 2.5 voxels high.
+  // Instead the command -- an offset from the shoulder, in the frame
+  // WeaponArmPose reads -- starts where the arm is and is nudged each tick by
+  // how far the flask's lip is from where it must be. It converges whatever
+  // the offset between the two points, and follows the bench as it moves.
+  if (fresh) {
+    s.benchPourCmd = handFromShoulder;
+    s.benchPourCmdValid = true;
+  }
+  // Where the lip must be: just over the other flask's mouth. The moment
+  // the other flask is gone the command simply holds while the claim fades.
+  Vec3 dst, lip;
+  const float a = s.benchHold.hand[s.benchPourHand].angle;
+  const Quat yaw = QuatAxisAngle({0, 1, 0}, avatar.Heading());
+  const Vec3 axisW = QuatRotate(yaw, Vec3{-std::sin(a), std::cos(a), 0.0f});
+  if (pour && avatar.HeldMouthWorld(Vec3{0, 1, 0}, dst, oh) &&
+      avatar.HeldMouthWorld(axisW, lip, ph)) {
+    dst.y += MetresToCells(0.06f);
+    s.benchPourCmd = s.benchPourCmd + (dst - lip) * 0.35f;
+  }
+  const float l = s.benchPourCmd.len();
+  if (reach > 0 && l > reach * 0.98f) s.benchPourCmd = s.benchPourCmd * (reach * 0.98f / l);
+  WeaponPose wp;
+  wp.hand = s.benchPourCmd;
+  wp.weight = s.benchPourW;
+  wp.steerBlade = false;
+  avatar.SetWeaponPose(wp);
+  if (std::getenv("SANDVOX_BENCH_DEBUG")) {
+    static int n = 0;
+    if ((n++ % 15) == 0)
+      std::printf("benchpour: w %.2f lip (%.1f %.1f %.1f) dst (%.1f %.1f %.1f) cmd (%.1f %.1f %.1f) reach %.1f%s",
+                  s.benchPourW, lip.x, lip.y, lip.z, dst.x, dst.y, dst.z, s.benchPourCmd.x,
+                  s.benchPourCmd.y, s.benchPourCmd.z, reach, "\n");
+  }
+}
+
 static inline uint32_t OpLandingTick(const TickAuthorityCtx& w, uint32_t tick) {
   return tick + (w.opsync ? w.opsync->Delay() : 0u);
 }
@@ -2436,6 +2525,10 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               ui.kitMessage = "your grip fails";
               ui.kitMessageAge = 0.0f;
             }
+            // AT THE ALCHEMY BENCH the hands hold the bench's vessels instead
+            // (session.h BenchHold): the kit is untouched, and the fists go
+            // back to it the tick the bench's table is empty or shut.
+            const PlayerSession::BenchHold& bench = s.benchHold;
             for (int hk = 0; hk < kHands; hk++) {
               const Hand h = HandAt(hk);
               // Re-read: GripFails may have just emptied it.
@@ -2443,6 +2536,8 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                   hands.hand[hk].item != nullptr && !kit.equip.InHand(h).Empty()
                       ? hands.hand[hk].item
                       : nullptr;
+              if (bench.active)
+                want = avatar.HandUsable(h) ? items.Named(bench.hand[hk].item) : nullptr;
               const std::string wantName = want ? want->name : std::string();
               if (avatar.HeldItem(h) != wantName) avatar.EquipItem(want, h);
             }
@@ -2453,7 +2548,10 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // arm's live pose, so nothing jumps. A hand that cannot swing (a
             // flask, a ruined arm) never gets the ready pose, which is what
             // leaves the pour clip the arm.
-            if (!playerStrike.Active() && melee.Phase() == SwingPhase::Idle) {
+            // (Not while the bench's pour owns an arm: it sets the strike
+            // hand itself, below, and this would hand it straight back.)
+            if (!playerStrike.Active() && melee.Phase() == SwingPhase::Idle &&
+                s.benchPourW <= 0.0f) {
               Hand idle = s.lastHand;
               if (!hands[idle].ready && hands[OtherHand(idle)].ready)
                 idle = OtherHand(idle);
@@ -2473,6 +2571,15 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               const Hand h = HandAt(hk);
               const ItemDef* vd = hands.hand[hk].vessel ? hands.hand[hk].item : nullptr;
               const ItemStack& hs = kit.equip.InHand(h);
+              if (bench.active) {
+                const PlayerSession::BenchHold::HandView& bv = bench.hand[hk];
+                const ItemDef* bd = items.Named(bv.item);
+                const bool bheld = bd && avatar.HeldItem(h) == bv.item;
+                avatar.SetHeldContents(bheld ? bv.contents : alchemy::Composition{}, h);
+                avatar.SetHeldFill(bheld ? ContainerHeldFillFrom(*bd, bv.contents)
+                                         : ContainerHeldFill{}, h);
+                continue;
+              }
               const bool held = vd != nullptr && !hs.Empty();
               avatar.SetHeldContents(held ? hs.contents : alchemy::Composition{}, h);
               avatar.SetHeldFill(held ? ContainerHeldFillOf(*vd, hs) : ContainerHeldFill{}, h);
@@ -2825,6 +2932,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // could not (strokes.h MirrorWeaponPose).
             if (s.strikeMirrored) MirrorWeaponPose(wp);
             avatar.SetWeaponPose(wp);
+            PoseBenchHands(s, avatar);
           }
         }
         // ---- ARMOUR: the body wears what the kit's equipment says -----------

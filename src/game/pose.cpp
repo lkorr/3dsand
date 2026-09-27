@@ -745,6 +745,9 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
   AnimClampPoseLimits(sk, st, &weaponHinge, 1);
   ReapplyKeyedArm(sk, st);
   RecordWeaponClamp(sk, st);
+  // A held vessel tilted to what the alchemy bench shows (SetHeldAim): after
+  // the clamp, because the tilt is the bench's fact, not the wrist's choice.
+  ApplyHeldAim(sk, st);
 
   // ---- flipbooks: integer frame index from elapsed ms ----
   // Data-gated like the chase clip: a def with no live flipbook pays one test.
@@ -782,6 +785,37 @@ void Mob::PosePipeline(const PoseInputs& in, float dt, World& world,
 // legacy-rig leg fallback (IsLegChain), and — because it is forced by who owns
 // the body, not by taste — the feet-derived height with its ground authority
 // and the four-probe ground tilt, selected by PoseInputs.
+void Mob::ApplyHeldAim(const AnimSkeleton& sk, AnimState& st) const {
+  const size_t n = std::min(sk.parts.size(), st.model.size());
+  for (int k = 0; k < kHands; k++) {
+    const HeldHand& hh = held_[k];
+    const float w = std::clamp(hh.aimWeight, 0.0f, 1.0f);
+    if (w <= 0.0f || hh.slot < 0 || (size_t)hh.slot >= n) continue;
+    const int hand = sk.parts[hh.slot].parent;
+    if (hand < 0 || (size_t)hand >= n) continue;
+    const float al = hh.aimAxis.len();
+    if (al < 1e-4f) continue;
+    // model.rot takes the item's lattice into model space (LimbTargetFor), so
+    // its long axis now is model.rot * +X.
+    const Vec3 now = QuatRotate(st.model[hh.slot].rot, Vec3{1, 0, 0});
+    const Quat full = QuatFromTo(now, hh.aimAxis * (1.0f / al));
+    const Quat q = QuatNormalize(QuatSlerp(Quat{}, full, w));
+    // The hand and everything on it, turned about the GRIP (the held part's
+    // joint): the vessel turns in the fist rather than swinging round the
+    // wrist, and the point the arm's IK placed stays where it was put.
+    const Vec3 pivot = st.model[hh.slot].pos;
+    static thread_local std::vector<uint8_t> moved;
+    moved.assign(n, 0);
+    for (size_t i = (size_t)hand; i < n; i++) {
+      const int par = sk.parts[i].parent;
+      if ((int)i != hand && (par < 0 || !moved[par])) continue;
+      moved[i] = 1;
+      st.model[i].pos = pivot + QuatRotate(q, st.model[i].pos - pivot);
+      st.model[i].rot = QuatNormalize(QuatMul(q, st.model[i].rot));
+    }
+  }
+}
+
 void Mob::StepGait(const PoseInputs& in, float dt, World& world, uint32_t tick) {
   const AnimSkeleton& sk = skel_;
   const GaitDef& g = sk.gait;
