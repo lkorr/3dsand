@@ -539,6 +539,94 @@ Status GateSoluteEvap(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- solute-seam -------------------------------------------------------------
+// THE MPM SEAM IS REFUSED, and asserted (PLAN_solutes §7.2). A FluidParticle
+// has no solute payload yet, so exciting a brine cell into the MPM solver
+// would turn the liquid into particles and leave its mass behind on an air
+// cell -- deleted. sim_fluid_seam.wgsl exciteDetect therefore refuses any cell
+// carrying solute (counted, SOLM_SEAM_REFUSED) and the CA carries it instead.
+//
+// Fixture: brine made on a stone shelf (salt dissolved in 3 layers of water),
+// then a hole opened in the shelf so the pond DRAINS into the chamber below --
+// the seam's by-fall excitation fires on exactly this -- with the shipped
+// excite mode on. Asserted: the seam refused solute cells (it saw them and
+// kept its hands off), and the dissolved mass is EXACTLY what went in (nothing
+// discarded: a seam that took a brine cell would show up as mass lost).
+Status GateSoluteSeam(Ctx& c, std::string& detail) {
+  const uint32_t water = MatNamed(c, "water"), salt = MatNamed(c, "salt");
+  const SoluteDef* sd = CurrentSoluteNamed("salt");
+  if (!water || !salt || !sd) {
+    detail = "needs materials water + salt and a `salt` species in solutes.json";
+    return Status::Fail;
+  }
+  FixtureTuning tune(/*exciteMode=*/std::max(1, CurrentTuning().sim.fluidExciteMode));
+  const int px = 96, py = 120, pz = 96;
+  const Box box{px - 5, px + 4, pz - 5, pz + 4, py, py + 16, true};
+  const int shelfY = py + 6;
+  const int kTicks = (int)BaselineNumber("solute-seam.ticks", 900);
+  const int openAt = 400;
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  std::vector<CellOp> build = box.Build((uint32_t)kMatStone);
+  for (int z = box.z0; z <= box.z1; z++)
+    for (int x = box.x0; x <= box.x1; x++)
+      build.push_back({World::SlotCellIndex({x, shelfY, z}), (uint32_t)kMatStone});
+  const std::vector<CellOp> pond = box.Layers(water, shelfY + 1, 3, 7u);
+  std::vector<CellOp> grains;
+  for (int z = pz - 1; z <= pz + 1; z++)
+    for (int x = px - 1; x <= px + 1; x++)
+      grains.push_back({World::SlotCellIndex({x, shelfY + 4, z}), salt & 0xFFFu});
+  const uint64_t y8 = sd->yieldPerVoxel / 8u;
+  const uint64_t placedUnits = (uint64_t)grains.size() * 8u * y8;
+  std::vector<CellOp> hole;
+  for (int z = pz - 2; z <= pz + 1; z++)
+    for (int x = px - 2; x <= px + 1; x++)
+      hole.push_back({World::SlotCellIndex({x, shelfY, z}), 0u});
+
+  uint32_t t = 55000;
+  support::TickCursor ticker{c, t, {px >> 4, py >> 4, pz >> 4}};
+  uint32_t refusedBefore = 0;
+  for (int i = 0; i < kTicks; i++) {
+    if (i == openAt) {
+      SoluteLayer L0;
+      ReadSoluteLayer(c, L0);
+      refusedBefore = L0.hdr[kSolMSeamRefused];
+    }
+    ticker({}, i == 0   ? build
+               : i == 2 ? pond
+               : i == 4 ? grains
+               : i == openAt ? hole
+                        : std::vector<CellOp>{});
+  }
+  SoluteLayer L;
+  ReadSoluteLayer(c, L);
+  const BoxCensus k = Census(c, box, L, salt);
+  std::string latch;
+  const bool latchOk = LatchesClean(L, latch);
+  const uint32_t refused = L.hdr[kSolMSeamRefused];
+  // Over the whole run: the salt landing in the pond disturbs the surface
+  // (excite candidates beside fresh brine) and the drain does again. Either
+  // is the seam SEEING a solute cell; the mass line is what says it kept its
+  // hands off every one of them.
+  const bool refusedOk = refused > 0;
+  const bool massOk = k.mass + k.powderEighths * y8 == placedUnits && L.hdr[kSolMDiscarded] == 0;
+  const bool strayOk = k.strayMass == 0;
+  RecordObserved("solute-seam.refused", (double)refused);
+  detail = Format(
+      "%zu salt voxels (%llu units) dissolved on a shelf, drained through a hole "
+      "at tick %d with fluidExciteMode %d: the seam refused %u solute cells "
+      "(%u before the hole), mass %s (%llu dissolved + %llu units still powder, "
+      "ledger discarded %u), %u solvent cells in the box, stray %u%s%s",
+      grains.size(), (unsigned long long)placedUnits, openAt,
+      CurrentTuning().sim.fluidExciteMode, refused - refusedBefore, refusedBefore,
+      massOk ? "EXACT" : "LOST", (unsigned long long)k.mass,
+      (unsigned long long)(k.powderEighths * y8), L.hdr[kSolMDiscarded], k.solventCells,
+      k.strayMass, latchOk ? "" : ", ", latch.c_str());
+  const bool ok = refusedOk && massOk && strayOk && latchOk;
+  std::printf("solute-seam: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SoluteGates() {
@@ -546,6 +634,7 @@ const std::vector<Gate>& SoluteGates() {
       {"solute", "sim", {}, false, GateSolute, false},
       {"solute-dilute", "sim", {}, false, GateSoluteDilute, false},
       {"solute-evap", "sim", {}, false, GateSoluteEvap, false},
+      {"solute-seam", "sim", {}, false, GateSoluteSeam, false},
   };
   return g;
 }

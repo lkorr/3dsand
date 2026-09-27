@@ -1734,21 +1734,7 @@
       "selfBecomes": "water"
     },
     {
-      "note": "-------- fairy dust enchants water and blood --------\nA simple PAIR RULE for now: one grain turns the liquid cell it touches. Package B's solute layer is meant to REPLACE these with concentration (solutes.json `fairy`: dissolve, diffuse, convert at cMin) -- delete these two when it does."
-    },
-    {
-      "self": "fairy_dust",
-      "neighbor": "water",
-      "chance": 60,
-      "selfBecomes": "air",
-      "neighborBecomes": "enchanted_water"
-    },
-    {
-      "self": "fairy_dust",
-      "neighbor": "blood",
-      "chance": 60,
-      "selfBecomes": "air",
-      "neighborBecomes": "enchanted_blood"
+      "note": "-------- fairy dust enchants water and blood: NO PAIR RULE --------\nThe solute layer owns this (package B, docs/PLAN_solutes.md): fairy dust DISSOLVES into water or blood (solutes.json `fairy`), the mass spreads through the liquid, and a cell concentrated past the species' `converts` cMin BECOMES enchanted_water / enchanted_blood (sim_step.wgsl solTryConvert). A pinch in a lake disperses below cMin and enchants nothing; a handful in a basin enchants it. The two placeholder pair rules package A authored here (one grain turned the cell it touched) were removed when the layer landed."
     }
   ]
 }
