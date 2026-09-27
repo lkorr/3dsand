@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "sim/rng.h"
+#include "sim/tuning.h"
 
 namespace {
 // An angle ABOUT AN AXIS (a lean, an elbow swivel), brought into [-pi, pi]:
@@ -953,6 +954,57 @@ WeaponPose StrokePoseNow(const StrokeCursor& cur, const AttackStyle* sty,
   return wp;
 }
 
+// ---- THE LEFT HAND IS THE RIGHT, MIRRORED (strokes.h) ----------------------
+StyleSide StyleSideOf(const AttackStyle& sty) {
+  // Every held style is authored for the right arm (the player's compass and
+  // every NPC weapon style); a natural weapon says its side in its name.
+  if (sty.weapon.empty() || sty.weapon == "held") return StyleSide::Right;
+  const std::string& w = sty.weapon;
+  const size_t n = w.size();
+  if (n >= 2 && w[n - 2] == '.') {
+    if (w[n - 1] == 'R') return StyleSide::Right;
+    if (w[n - 1] == 'L') return StyleSide::Left;
+  }
+  return StyleSide::None;
+}
+
+bool StrokeMirrored(const AttackStyle& sty, Hand hand) {
+  const StyleSide side = StyleSideOf(sty);
+  return side != StyleSide::None && side != StyleSideOfHand(hand);
+}
+
+void MirrorWeaponPose(WeaponPose& wp) {
+  wp.bladeFlat = wp.bladeFlat * -1.0f;
+  wp.torsoTwist = -wp.torsoTwist;
+  auto m = [](const Quat& q) { return Quat{q.x, -q.y, -q.z, q.w}; };
+  WeaponPose::Keyed& K = wp.keyed;
+  if (K.on) {
+    for (int j = 0; j < kArmJoints; j++) {
+      K.from[j] = m(K.from[j]);
+      K.to[j] = m(K.to[j]);
+    }
+    K.aimFromYaw = -K.aimFromYaw;
+    K.aimToYaw = -K.aimToYaw;
+  }
+}
+
+float InjuredArmSlow(float condition) {
+  const Tuning::Melee& t = CurrentTuning().melee;
+  if (t.injuredArmFrom <= 0.0f || condition >= t.injuredArmFrom) return 1.0f;
+  const float hurt =
+      std::clamp((t.injuredArmFrom - condition) / t.injuredArmFrom, 0.0f, 1.0f);
+  return 1.0f + t.injuredArmSlow * hurt;
+}
+
+std::string MirroredClipName(const std::string& clip) {
+  const size_t n = clip.size();
+  if (n < 2 || clip[n - 2] != '_') return clip;
+  std::string out = clip;
+  if (out[n - 1] == 'r') out[n - 1] = 'l';
+  else if (out[n - 1] == 'l') out[n - 1] = 'r';
+  return out;
+}
+
 namespace {
 StrokeCursor::Phase PhaseOfFrame(const StrokeCursor& cur, int k) {
   if (cur.firstCut < 0 || k < cur.firstCut) return StrokeCursor::Phase::Windup;
@@ -962,7 +1014,8 @@ StrokeCursor::Phase PhaseOfFrame(const StrokeCursor& cur, int k) {
 }  // namespace
 
 void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
-                        int styleIndex, uint32_t seed, float windupRate) {
+                        int styleIndex, uint32_t seed, float windupRate,
+                        float slow) {
   cur.style = styleIndex;
   cur.seed = seed;
   cur.fromPending = false;
@@ -985,6 +1038,9 @@ void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
     if (windupRate > 1.0f && (cur.firstCut < 0 || k < cur.firstCut))
       cur.frameTicks[k] =
           std::max(1, (int)std::lround(cur.frameTicks[k] / windupRate));
+    // AN INJURED ARM is slower through the whole stroke, return included.
+    if (slow > 1.0f)
+      cur.frameTicks[k] = std::max(1, (int)std::lround(cur.frameTicks[k] * slow));
   }
   int windup = 0, cut = 0, post = 0;
   for (int k = 0; k < cur.frames; k++) {

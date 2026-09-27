@@ -15417,16 +15417,109 @@ wide short one". A resampled shell packs its own copy-on-write brick and frees
 it on unwear; at ratio 1 (the stock set on the stock human) nothing is
 resampled and the def's brick is shared, exactly as a body limb shares its.
 
-### The hotbar is the hand
+### Two hands (dual wielding, 2026-09-27)
 
-What is in your hand is the SELECTED HOTBAR SLOT, with the melee tool up and
-magic off: a sword there is drawn (a real rig part in the fist), a flask there
-is held for pouring, an empty slot is your fists. The number row and the wheel
-pick the slot; there is no draw key (Q drew from the sheath until 2026-09-23,
-when the owner asked for weapons to be held like flasks). A weapon dragged out
-of the selected slot is simply no longer in the hand -- there is no drawn flag
-to keep in step with the kit. The ten slots are always on the HUD, bottom
-centre (`DrawHudHotbar`, `ui/inventory_ui.cpp`).
+Each hand is a KIT SLOT (`EquipSlotId::HandR` / `HandL`, `game/equipment.h`;
+the vocabulary is `game/hand.h`), not "whichever hotbar slot is selected".
+Select a hotbar slot and press **Q** for the left hand or **E** for the right:
+a `Kit` move, so a SWAP — the hand's old item goes back into that hotbar slot,
+and the same key on an empty hotbar slot puts the hand's item away. A hand
+takes a weapon or a vessel and refuses armour, with the reason. With the melee
+tool up and magic off, **LMB** is the right hand's button and **RMB** the
+left's: a strike with a weapon or an empty fist, or the use of a vessel. **G**
+took over pickup (tap) and the physics drag (hold); with a throwable vessel in
+either hand the hold is the throw instead. The dev grenade moved to J.
+
+**The kit is the truth; the rig is dressed from it.** `ResolveHands`
+(`session.cpp`) reads both hand slots once per tick into `SessionTick::hands`
+(`HandsNow`: item, weapon/vessel, and whether that hand may strike), and the
+equip seam puts each on the rig through `Mob::EquipItem(item, hand)`, whatever
+tool is up — the tool decides what the buttons do, not what you carry. The rig
+holds one borrowed slot PER HAND (`Mob::held_[kHands]`); equipping one hand
+leaves the other alone, and removing either renumbers the other
+(`RemoveAppendedSlots`' shift). A held item that leaves by force
+(`ShedGearBeforeDetach`) empties its kit hand slot at that instant and reports
+the hand in `LostGear::hand`, so the next tick's equip cannot draw a second
+sword while the first lies on the floor — and the dropped vessel keeps its
+fill. Loot (`LootPiece::hand`), the rising, the handoff, the save and the wire
+all carry the hand; the wire and save reuse `WireGear::held` as `1 + hand`, so
+old records (always 1) read as the right hand with no format bump.
+
+**The left socket and grip are DERIVED.** Every rig authors `held_right`
+only; `MirrorHeldSockets` (`mob.cpp`, at def load) reflects it through the
+sagittal plane about the two hands' joints onto the `.L` part, rotation as
+(x, -y, -z, w). An authored `held_left` wins. `ItemDef::Grip("held_left")`
+falls back to the right grip: where an item's hilt sits is the item's fact,
+which side of the body the socket's.
+
+**ONE ARM SWINGS AT A TIME; THE OTHER CHAINS.** The pose pipeline has one
+weapon-arm claim (one `WeaponPose`, one elbow override, one wrist-smoothing
+state), and the strike driver serves the STRIKE HAND (`Mob::strikeHand_`,
+set by `ArmForStyle(sty, hand)`; `HeldSlot()`/`HeldItem()` with no argument
+answer for it, which is what every one-handed caller meant). Two simultaneous
+strokes would mean doubling all of that and re-pinning the swing gates; what
+the player gets instead is that the OTHER hand's press always chains: it may
+start in the recover (and banks even during the windup), at its own windup
+rate, so left-right-left is the dual wielder's fast rhythm. The arm that
+loses the claim is handed back to the animation over its own short release
+(`Mob::ReleaseOffArm`, 0.22 s smoothstep from its last driven joints), not
+dropped in one tick. Between strokes the ready pose sits on the hand last
+used if it can swing, else the other; a vessel hand never gets it, so the
+pour clip keeps the arm.
+
+**THE LEFT HAND IS THE RIGHT, MIRRORED** (`strokes.h`). Held styles are
+authored for the right arm; a style swung with the other arm from its
+author's (`StrokeMirrored`: a style's side is `held` = right, a natural
+weapon's `.R`/`.L`, jaws none) runs the authored program in a MIRRORED BASIS
+(`right` negated) — the driver keeps everything in basis coordinates, so its
+azimuths, keep-outs, seed and aim all reflect with it and its hand sign is
+the authored side's. What the basis cannot carry is reflected on the way to
+the rig (`MirrorWeaponPose`): the blade flat (a pseudovector: negated, or a
+single edge would trail), the torso twist, and a keyed pose's joint
+rotations and aim yaws. The natural weapon a style names swaps side
+(`fist.R` -> `fist.L`) and so does its clip, if the rig has the mirror. The
+player's driver remembers its frame across strokes (`PlayerSession::
+strikeMirrored`), changed only when a stroke begins or the idle hand changes
+— with a re-seed from the new arm's live pose, never a flip under a recover.
+An authored-left style (`punch_l`) is not mirrored twice.
+
+**MIRRORED CLIPS ARE DERIVED.** `pour`, `throw`, `throw_windup` are
+right-arm clips; `LoadClipLibrary` adds `<name>.mirror` for every library
+clip that names a sided part (names swapped, rotations (x, -y, -z, w),
+positions (-x, y, z)). `Mob::MirrorClip` prefers an authored mirror
+(`punch_r` <-> `punch_l`), then the derived one, then nothing; `HandClip`
+is what a hand plays.
+
+**A vessel uses its own hand's button**, and what that button does is the
+hand's MODE, cycled by F: pour, scoop, apply (`TB_SCOOP`/`TB_APPLY` and
+their `_L` twins, `kTickInputVersion` 4). So a flask in either fist has all
+three uses on one button and the other fist stays free to swing. The HUD
+draws a hand slot either side of the hotbar with its key, its button and a
+vessel's mode, and frames the hand last used (the one F cycles).
+
+**AN INJURED ARM** (`Mob::HandCondition`: the weakest hp fraction of the arm
+chain ending at the hand, 0 when any of it is gone). Below
+`melee.injuredArmFrom` a stroke that arm throws is stretched in tempo, up to
+`1 + melee.injuredArmSlow` times as long (`InjuredArmSlow` -> the `slow`
+multiplier of `BeginStrokeProgram`), and since speed is the damage a slower
+cut is a weaker one with no second rule. Below `melee.injuredArmDrop` the
+fist lets go (`Mob::GripFails`, the knock-out path), for the player and every
+NPC. A hand whose arm reads 0 cannot strike at all (`HandsNow::ready`).
+
+**NPCs** hold two items the same way (`EquipItem(item, Hand::Left)`); a held
+style goes to a fist that holds something and can swing it — the only one,
+or with two, one of the two by a (mob, tick) coin (`Mob::StrokeHandFor`), so
+a dual wielder alternates and a replay alternates the same way. A one-handed
+NPC answers Right, unchanged. `ForceAttack` takes an optional hand.
+
+Gate `dual-wield`: the slot table and Q/E's swap, the derived socket as the
+reflection itself, two held slots each riding its own hand, a held style
+forced on the left running mirrored with the LEFT blade's edge, the mirror
+algebra (sides, names, the pose reflection as an involution, the derived
+clips), and the arm behind the hand (a hurt forearm lowers only its hand's
+condition, the grip fails below the threshold, the item falls as itself, the
+LostGear names the hand and the kit slot empties at once), plus the wire's
+`held = 2`.
 
 The Sheath and Quick equipment slots remain as places a blade rides on your
 person, and nothing draws from them. Showing a stowed blade on the avatar's
@@ -15441,7 +15534,7 @@ dissolves and can be blown apart, none of it written twice. The only thing
 debris cannot carry is IDENTITY, and that is the whole of `WorldItems`
 (`game/worlditems.h`) — body handle to item name, by name because library
 indices die on every R reload. Dropping is a drag out of the character screen;
-picking up is `E` and a short camera ray filtered through the registry, so a
+picking up is `G` (it was `E` until dual wielding took E for the right hand) and a short camera ray filtered through the registry, so a
 body the registry does not know is scenery and is left alone.
 
 The registry MUST NOT outlive the body: Jolt reuses handles, so a stale entry
@@ -15527,8 +15620,9 @@ or risen flask keeps its fill.
 
 **Since W2-K** an NPC's worn gear goes through its kit too (`WearItem` is a
 kit write for every creature; "One creature list"); the readers still walk the
-rig, and the held item is rig state for everyone. A held item knocked from the player's hand goes to the ground without its fill
-(the shed hook does not know which hotbar slot filled the hand). Gate
+rig. Since dual wielding (2026-09-27) the hands are kit slots too, and a
+held item knocked from either hand empties its kit slot at the instant it
+leaves and goes to the ground WITH its fill (see *Two hands*). Gate
 `kit-instance` (identical robes, per-instance damage through dress / swap /
 recolour / take-off); `player-kit`, `item-ground`, `mob-loot`, `debris-ghost`
 and `vessel` carry the round trips.
@@ -15768,9 +15862,9 @@ seams would faithfully pull a second sword out of the sheath and put the
 cuirass back on — clears the equip slot, and files the damage by name, so a
 piece picked back up and re-worn has exactly the holes it had. A sleeve alone
 is still a rag, and the piece goes on being worn without it. A sword knocked
-from the hand takes the same road and the creature is unarmed from that
-instant (`heldSlot_` clears in `ShedGearBeforeDetach`, not at a later
-`EquipItem`). A shell consumed by fire registers nothing: there is no body.
+from the hand takes the same road and THAT HAND is empty from that instant
+(its `held_` entry and its kit hand slot clear in `ShedGearBeforeDetach`, not
+at a later `EquipItem`; `LostGear::hand` says which). A shell consumed by fire registers nothing: there is no body.
 The dead slots are swept out of the appended tail once the severed hold is
 over, so `LimbCount` is not a history of what was worn. `armor-wear` 3d.
 

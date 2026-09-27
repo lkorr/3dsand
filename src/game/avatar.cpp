@@ -134,8 +134,7 @@ void PlayerAvatar::ResolveParts() {
   // matches the current def" true no matter which entry point ran last.
   skel_ = def_->skel;
   limbDefs_ = def_->limbs;
-  heldSlot_ = -1;
-  heldItem_.clear();
+  for (HeldHand& hh : held_) hh.Clear();
   const AnimSkeleton& sk = skel_;
   parts_.head = sk.FindPart("head");
   parts_.torso = sk.FindPart("torso");
@@ -158,10 +157,9 @@ void PlayerAvatar::ResolveParts() {
   locoClips_.run = sk.FindClip("run");
   locoClips_.fall = sk.FindClip("fall");
   locoClips_.hang = sk.FindClip("hang");
-  // Re-resolve the held prop against the new def: a hot reload replaces the
-  // skeleton, so a cached part index from the old one would point at whatever
-  // limb happens to sit there now.
-  heldPartIndex_ = heldPart_.empty() ? -1 : sk.FindPart(heldPart_);
+  // The held props were cleared above: a re-seeded rig has no borrowed slots
+  // (the def's skeleton carries none), and the session re-equips both hands
+  // from the kit on its next tick.
 }
 
 // ---- holding an item --------------------------------------------------------

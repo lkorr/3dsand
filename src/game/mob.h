@@ -1766,6 +1766,7 @@ struct LootPiece : ItemInstance {
   int equipSlot = -1;             // worn only
   // Which ItemCover entry the identity shell is (worn only), -1 otherwise.
   int identityCover = -1;
+  Hand hand = Hand::Right;        // held only: which fist it was in
 };
 
 class Mob {
@@ -2380,15 +2381,69 @@ class Mob {
   // parented to the socket's limb — animated, severable, droppable, carvable,
   // with no "is this an item" branch downstream. Lives on the BASE class so a
   // mob can hold a sword exactly as the player does (mob combat scaffolding).
+  //
+  // TWO HANDS (dual wielding, 2026-09-27). `context` names the hand:
+  // "held_right" or "held_left" (game/hand.h HandContext), and equipping one
+  // hand leaves the other alone. Each hand is its own borrowed slot with its
+  // own grip point, so a sword and a flask ride two fists at once.
+  //
+  // THE STRIKE HAND is the one the stroke driver serves (StrikeHand): the
+  // effector falls back to ITS held slot, WeaponEdge reads ITS blade, and the
+  // no-argument HeldItem()/HeldSlot() answer for it — which is what every
+  // one-handed caller written before this meant by "the held item". A
+  // creature with one weapon has its strike hand on that weapon's side
+  // (EquipItem moves it there when the old strike hand is empty), so an NPC
+  // armed only in the left fist swings with the left.
   bool EquipItem(const ItemDef* item, const char* context = "held_right");
-  const std::string& HeldItem() const { return heldItem_; }
-  int HeldSlot() const { return heldSlot_; }
+  bool EquipItem(const ItemDef* item, Hand hand) {
+    return EquipItem(item, HandContext(hand));
+  }
+  const std::string& HeldItem(Hand h) const { return held_[HandIndex(h)].item; }
+  int HeldSlot(Hand h) const { return held_[HandIndex(h)].slot; }
+  const std::string& HeldItem() const { return HeldItem(strikeHand_); }
+  int HeldSlot() const { return HeldSlot(strikeHand_); }
+  // Is rig slot `slot` an item held in EITHER hand (and which)? The question
+  // "is this part a weapon rather than anatomy" — a carve skips it, the ground
+  // probe ignores it — is about both fists, never only the striking one.
+  bool IsHeldSlot(int slot, Hand* out = nullptr) const {
+    for (int k = 0; k < kHands; k++)
+      if (slot >= 0 && held_[k].slot == slot) {
+        if (out) *out = HandAt(k);
+        return true;
+      }
+    return false;
+  }
+  bool HoldingAnything() const {
+    return held_[0].slot >= 0 || held_[1].slot >= 0;
+  }
+  Hand StrikeHand() const { return strikeHand_; }
+  // Point the driver's fall-back at this hand's held item. A stroke's
+  // ArmForStyle sets it; a caller that only wants the ready pose on the other
+  // fist (the player's last-used hand) sets it directly.
+  void SetStrikeHand(Hand h) { strikeHand_ = h; }
+
+  // ---- WHAT A HAND CAN DO: THE ARM BEHIND IT (dual wielding) -------------
+  //
+  // The rig part a hand's socket rides (hand.R / hand.L), -1 when the rig
+  // publishes no socket for it. By the SOCKET, not by name, so a left-handed
+  // def that puts `held_right` on hand.L answers for that hand.
+  int HandPart(Hand h) const;
+  // HOW WELL THIS ARM WORKS, 0..1: the weakest of the parts that serve the
+  // hand (the arm chain ending at it, and the hand itself), each as hp over
+  // the hp it was authored with. 0 when any of them is severed or dead — a
+  // hand with no forearm holds nothing. 1 on a rig with no chain for it.
+  // What an injury DOES with this number is the caller's (session.cpp scales
+  // a strike's tempo by it, melee.injuredArm*), so the rig reports a fact and
+  // the feel lives in tuning.
+  float HandCondition(Hand h) const;
+  // Can this hand grip anything at all: its part alive, its chain whole.
+  bool HandUsable(Hand h) const { return HandCondition(h) > 0.0f; }
   // WHERE A HELD VESSEL'S CONTENTS LEAVE IT (game/container.h): the point of
   // the held item's own lattice farthest along `dir` (world), at the body's
   // current pose -- the lip of a flask tipped toward what it pours on, so a
   // stream comes out of the flask in the outstretched hand and not out of the
   // hand's origin. False when nothing is held.
-  bool HeldMouthWorld(Vec3 dir, Vec3& out);
+  bool HeldMouthWorld(Vec3 dir, Vec3& out, Hand h = Hand::Right);
 
   // ---- WHAT IT IS CARRYING (MobDef::loot) ---------------------------------
   //
@@ -2587,6 +2642,7 @@ class Mob {
     int equipSlot = -1;     // -1 for the held item
     std::string item;
     bool held = false;
+    Hand hand = Hand::Right;  // held only: which fist lost it
     WornDamage damage;      // empty for the held item
     uint32_t dye = 0;       // the colour it was (game/dye.h), 0 for undyed
   };
@@ -2690,7 +2746,41 @@ class Mob {
   // False when the style names something this body has not got — which the
   // callers (MobSystem::BeginStroke, main.cpp's player strike) turn into "do
   // not start a stroke", never into a stroke with no weapon on the end of it.
+  //
+  // `hand` is the fist the stroke is swung WITH (dual wielding). A "held"
+  // style arms that hand's held item; a natural weapon authored on the other
+  // side is taken on this one by name (fist.R -> fist.L, game/hand.h
+  // MirrorSideName) — the stroke itself is mirrored by its runner
+  // (strokes.h StrokeMirrored). A style with no side (jaws) ignores it.
+  bool ArmForStyle(const AttackStyle& sty, Hand hand);
+  // ...and with NO hand named: the style's OWN side (a punch_l on the left,
+  // a held style on the right, a jaw on the strike hand) — never mirrored.
+  // What every caller written before dual wielding means.
   bool ArmForStyle(const AttackStyle& sty);
+  // WHICH HAND A CREATURE THROWS THIS STYLE WITH. A sided natural weapon is
+  // its own side (a punch_l is a left punch). A held style goes to a fist
+  // that holds something and can swing it: the only one, or — holding two —
+  // one of the two by a (mob, tick) coin, so a dual wielder alternates and a
+  // replay alternates the same way. A creature holding one weapon in the
+  // right hand always answers Right, which is every NPC authored before
+  // dual wielding, unchanged.
+  Hand StrokeHandFor(const AttackStyle& sty, uint32_t tick) const;
+  // The body clip a stroke plays: the style's own, or — mirrored — its
+  // mirror's if this rig has one (strokes.h MirroredClipName), else none.
+  std::string StrokeClip(const AttackStyle& sty, bool mirrored) const;
+  // A clip's other-side copy on this rig ("" when it has none): the
+  // authored mirror (`punch_r` -> `punch_l`) or the library's derived
+  // `<name>.mirror` (LoadClipLibrary). HandClip is the right-authored clip a
+  // hand plays — itself for the right, its mirror for the left — which is
+  // how a flask pours and a throw winds up with whichever hand holds it.
+  std::string MirrorClip(const std::string& clip) const;
+  std::string HandClip(const std::string& clip, Hand h) const;
+  // A HAND THAT CANNOT HOLD ON (melee.injuredArmDrop): each fist whose arm
+  // condition has fallen below `dropBelow` lets go of what it holds, through
+  // the same DetachLimb path a knock-out takes — the item falls as itself
+  // and a LostGear names the hand, so the kit follows. Returns how many
+  // items fell. 0 turns it off.
+  int GripFails(float dropBelow);
   // THE EFFECTIVE EFFECTOR, DERIVED rather than mirrored: the explicit one a
   // stroke set, else the held item as `Held`, else none. Five call sites
   // clear or renumber `heldPartIndex_` (spawn, rig rebuild, disarm, shed on
@@ -4459,11 +4549,41 @@ class Mob {
   // (name, dye, damage; empty name = not an item).
   ItemInstance ShedGearBeforeDetach(int limbIndex);
 
-  // Held item state — ONE piece of entity<->slot sync, kept only in EquipItem.
-  int heldSlot_ = -1;
-  std::string heldItem_;
-  std::string heldPart_;
-  int heldPartIndex_ = -1;
+  // Held item state — ONE piece of entity<->slot sync, kept only in EquipItem,
+  // ONE PER HAND (game/hand.h; index 0 = right). `slot` is the borrowed rig
+  // slot and IS the part index (the two were separate fields that every site
+  // kept equal). `part` is the slot's part name, kept so a def hot reload can
+  // re-resolve the index (Avatar::SetDef).
+  struct HeldHand {
+    int slot = -1;
+    std::string item;
+    std::string part;
+    Vec3 gripBody{};         // grip point in the item's BODY frame
+    void Clear() { *this = HeldHand{}; }
+  };
+  HeldHand held_[kHands];
+  // Which hand the stroke driver serves (SetStrikeHand / ArmForStyle).
+  Hand strikeHand_ = Hand::Right;
+  // THE OTHER ARM'S HAND-BACK. One arm is driven at a time; when the driven
+  // arm changes (a left strike chained onto a right recover) the arm that
+  // lost the claim would otherwise drop from its stroke pose to the walk
+  // cycle in one tick. SmoothWeaponArm captures its joints as they last stood
+  // and turns them back to the animation over `ticks`, exactly like the
+  // release a stroke's own end runs (WeaponPose::release).
+  struct OffArmRelease {
+    bool active = false;
+    int part[kArmJoints] = {-1, -1, -1};
+    Quat from[kArmJoints]{};
+    float t = 0.0f;          // seconds into the hand-back
+  } offArm_;
+  // How long that hand-back takes. A constant rather than a knob: it only
+  // has to hide a one-tick pop, and a stroke's own release is already the
+  // tunable one (MeleeTuning::recoverTime).
+  static constexpr float kOffArmReleaseSec = 0.22f;
+  // SmoothWeaponArm's first act: notice the driven arm changed, and turn the
+  // arm that lost the claim back to the animation (offArm_).
+  void ReleaseOffArm(const AnimSkeleton& sk, AnimState& st,
+                     const int (&driven)[kArmJoints], float dt);
   // THE PART THE STROKE DRIVER IS MOVING (see SetStrikeEffector). Kept beside
   // the held slot rather than derived from it because they are different
   // facts: a zombie holding a sword and biting has both, and the sword must
@@ -4471,7 +4591,6 @@ class Mob {
   int strikeEffector_ = -1;
   StrikeEffectorMode strikeMode_ = StrikeEffectorMode::None;
   int strikeNatural_ = -1;     // index into def_->natural, -1 = the held item
-  Vec3 gripBody_{};            // grip point in the item's BODY frame
   // Swing pose pushed in by the driver (SetWeaponPose). Pure presentation.
   WeaponPose weapon_{};
   // The authored attack this creature is executing, if any (game/strokes.h).
@@ -5113,8 +5232,11 @@ class MobSystem {
   // scripted swing draw the style's `target` limb (MobSystem::PickTargetLimb).
   // Zero aims at the point alone and takes today's chest, which is what a
   // caller with no victim in mind wants.
+  // `hand` 0 = right, 1 = left, -1 = let the creature choose (StrokeHandFor)
+  // — a gate that wants the mirrored stroke asks for the other hand.
   bool ForceAttack(uint64_t mobId, const std::string& style, Vec3 targetPoint,
-                   uint32_t tick, uint32_t seed = 0, uint64_t targetId = 0);
+                   uint32_t tick, uint32_t seed = 0, uint64_t targetId = 0,
+                   int hand = -1);
   // SetGuard: hold the blade at a stated azimuth/elevation in the creature's
   // OWN facing basis, with the point pushed out to `reachFrac` of the arm's
   // reach. Held until ClearGuard or until an attack replaces it. This is how a

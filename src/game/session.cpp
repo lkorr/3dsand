@@ -366,9 +366,9 @@ struct TickScratch {
   auto& grenades = s.grenades;                             \
   bool& captured = s.captured;                             \
   const bool brushActive = st.intent.brushActive;          \
-  const bool meleeArmed = st.intent.meleeArmed;            \
-  const bool meleeReady = st.intent.meleeReady;            \
-  const ItemDef* heldItem = st.intent.heldItem;            \
+  const HandsNow& hands = st.hands;                        \
+  const bool meleeArmed = hands.AnyWeapon();               \
+  const bool meleeReady = hands.AnyReady();                \
   LaserCut& laserCut = ps.laserCut;                        \
   std::vector<ExplosionOp>& spellExps = ps.spellExps;
 
@@ -569,11 +569,21 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
         // available, since the delta above is every pixel moved since the
         // previous tick. A strike fired from the buffer later still cuts the
         // direction that was flicked, aimed wherever the camera is THEN.
-        if (ti.Pressed(TB_ATTACK) && meleeReady) {
-          // WHICH COMPASS: three maps keyed on what is in the fist
+        // TWO BUTTONS, TWO HANDS (dual wielding): LMB is the right hand's,
+        // RMB the left's. A hand that holds a vessel is not here — its
+        // button is the vessel's (the VESSELS block) — and one that cannot
+        // swing (no weapon, no usable fist, a ruined arm) is not ready.
+        // Both on one tick: the right is read first and the left banks
+        // behind it, through the same latch a mid-swing click uses.
+        int pressHand = -1;
+        if (ti.Pressed(TB_ATTACK) && hands[Hand::Right].ready) pressHand = 0;
+        else if (ti.Pressed(TB_ALT) && hands[Hand::Left].ready) pressHand = 1;
+        if (pressHand >= 0) {
+          const Hand ph = HandAt(pressHand);
+          // WHICH COMPASS: three maps keyed on what is in THIS fist
           // (strokes.h PlayerCompass; the HUD's compass asks the same).
           const PlayerStrikeMap& map =
-              PlayerCompass(mobs.AttackStyles(), meleeArmed);
+              PlayerCompass(mobs.AttackStyles(), hands[ph].weapon);
           float fx = 0, fy = 0;
           int si = -1;
           const bool flicked =
@@ -585,7 +595,11 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
             si = NeutralStrike(map, strikePicker.altRight);
             strikePicker.altRight = !strikePicker.altRight;
           }
-          if (si >= 0) strikeQueued = si;
+          if (si >= 0) {
+            strikeQueued = si;
+            s.strikeQueuedHand = ph;
+            s.lastHand = ph;
+          }
           s.lastStrikePick.style = si;
           s.lastStrikePick.fx = fx;
           s.lastStrikePick.fy = fy;
@@ -1581,10 +1595,15 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             }
       }
 
-      // ---- VESSELS (game/container.h): RMB scoops, LMB pours ----------------
+      // ---- VESSELS (game/container.h): the hand's button uses it ------------
       //
-      // The hands are up with a flask or a pouch in them (FrameIntent::
-      // vesselSlot). Both halves go out through the MutationQueue: a scoop is
+      // The hands are up with a flask or a pouch in one of them (the kit's
+      // HandR/HandL, session.h HandsNow). DUAL WIELDING: the vessel is used
+      // with ITS hand's button — LMB for the right, RMB for the left — and
+      // what that button does is the hand's MODE (F cycles it: pour, scoop,
+      // apply; TB_SCOOP/TB_APPLY and their _L twins), so a flask in either
+      // fist has all three uses on one button and the other fist stays free
+      // to swing. Both halves go out through the MutationQueue: a scoop is
       // conditional clears, a pour is grid particles plus the SplatterEvent
       // that lets whoever is standing in the stream be wet by it.
       // PAY WHAT THE GPU TOOK (ContainerSettle): every tick, held or not, so
@@ -1642,9 +1661,11 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           };
           auto deposit = [&](uint16_t mat, int units) {
             int put = 0;
-            const int held = st.intent.vesselSlot;
-            if (held >= 0 && held < kItemSlots)
-              put += depositInto(hotbar.slots, kItemSlots, held, kit.bag.slots,
+            // The vessels IN HAND first (either fist), then the hotbar, then
+            // the pack.
+            for (int hk = 0; hk < kHands && put < units; hk++)
+              put += depositInto(kit.equip.slots, kEquipSlotCount,
+                                 EquipSlotOfHand(HandAt(hk)), kit.bag.slots,
                                  Bag::kSlots, mat, units - put);
             for (int i = 0; i < kItemSlots && put < units; i++)
               put += depositInto(hotbar.slots, kItemSlots, i, kit.bag.slots,
@@ -1674,22 +1695,34 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           }
         }
       }
-      // ---- THE THROW (game/container.h ContainerThrowSpeed): Q held winds it
-      // up, Q released lets go. Off whenever the hand stops holding a
-      // throwable vessel, so switching slots mid-draw cancels the draw.
+      // ---- THE THROW (game/container.h ContainerThrowSpeed): G held winds it
+      // up, G released lets go. Off whenever the hand stops holding a
+      // throwable vessel, so changing what is in hand mid-draw cancels it.
+      // WHICH HAND: the right's vessel if it can be thrown, else the left's.
       {
-        const int tslot = st.intent.vesselSlot;
+        int tslot = -1;   // the throwing HAND (as an int), -1 = none
+        if (st.intent.handsUp)
+          for (int hk = 0; hk < kHands && tslot < 0; hk++)
+            if (hands.hand[hk].vessel && ContainerThrowable(*hands.hand[hk].item))
+              tslot = hk;
         const ItemStack* ts =
-            tslot >= 0 && tslot < kItemSlots ? &hotbar.slots[tslot] : nullptr;
+            tslot >= 0 ? &kit.equip.InHand(HandAt(tslot)) : nullptr;
         const ItemDef* tdef = ts ? items.Of(*ts) : nullptr;
+        // The throw's clips are authored on the right arm; the left plays
+        // their mirror (Mob::HandClip).
         if (!tdef || !ContainerThrowable(*tdef) || tslot != s.throwSlot) {
-          if (s.throwTicks > 0 && avatar.Spawned())
-            avatar.StopClip("throw_windup");
+          // The draw being cancelled is on the hand it was STARTED in.
+          const std::string wasClip = avatar.HandClip(
+              "throw_windup", HandAt(s.throwSlot >= 0 ? s.throwSlot : 0));
+          if (s.throwTicks > 0 && avatar.Spawned() && !wasClip.empty())
+            avatar.StopClip(wasClip);
           s.throwTicks = 0;
           s.throwLaunchIn = 0;  // the hand changed mid-swing: nothing leaves it
           s.throwSlot = tdef && ContainerThrowable(*tdef) ? tslot : -1;
         }
-        // The arm draws back while Q is held (a looping hold, eased in by the
+        const Hand throwHand = HandAt(s.throwSlot >= 0 ? s.throwSlot : 0);
+        const std::string windupClip = avatar.HandClip("throw_windup", throwHand);
+        // The arm draws back while G is held (a looping hold, eased in by the
         // clip's blend) and whips through on the release; the vessel leaves
         // the hand kThrowLaunchTicks later, at the front of the swing (the
         // `throw` clip's release key, assets/anims/throw.json).
@@ -1698,22 +1731,23 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         if (s.throwLaunchIn > 0) {
           launch = --s.throwLaunchIn == 0;
         } else if (s.throwSlot >= 0 && ti.Held(TB_THROW)) {
-          if (s.throwTicks == 0 && avatar.Spawned())
-            avatar.PlayClip("throw_windup");
+          if (s.throwTicks == 0 && avatar.Spawned() && !windupClip.empty())
+            avatar.PlayClip(windupClip);
           s.throwTicks = std::min(s.throwTicks + 1, 1 << 20);
         } else if (s.throwSlot >= 0 && s.throwTicks > 0) {
           s.throwLaunchSpeed = ContainerThrowSpeed(*tdef, s.throwTicks);
           s.throwTicks = 0;
           if (avatar.Spawned()) {
-            avatar.StopClip("throw_windup");
-            avatar.PlayClip("throw");
+            if (!windupClip.empty()) avatar.StopClip(windupClip);
+            const std::string throwClip = avatar.HandClip("throw", throwHand);
+            if (!throwClip.empty()) avatar.PlayClip(throwClip);
             s.throwLaunchIn = kThrowLaunchTicks;
           } else {
             launch = true;  // no body to swing (fly mode): straight away
           }
         }
         if (launch && s.throwSlot >= 0) {
-          ItemStack& vs = hotbar.slots[s.throwSlot];
+          ItemStack& vs = kit.equip.InHand(throwHand);
           const float speed = s.throwLaunchSpeed;
           const Vec3 fwd = cam.Forward();
           // A few degrees of lift, because a throw aimed AT the crosshair is
@@ -1733,7 +1767,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           {
             Vec3 hp;
             Quat hq;
-            const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
+            const int hs = avatar.Spawned() ? avatar.HeldSlot(throwHand) : -1;
             uint32_t gscale = 1;
             const std::vector<PrefabVoxel>* gv = ItemGroundVoxels(*tdef, gscale);
             if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq)) {
@@ -1776,17 +1810,35 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                              ? ContainerThrowCharge(*tdef, s.throwTicks)
                              : -1.0f;
       }
-      const bool vesselHands = st.intent.vesselSlot >= 0 &&
-                               st.intent.vesselSlot < kItemSlots &&
-                               s.throwTicks == 0 && s.throwLaunchIn == 0;
+      // WHICH VESSEL ACTS THIS TICK: the one whose hand's button is down
+      // (the right's first), else the last-used hand's, else the only one.
+      int vh = -1;
+      if (st.intent.handsUp && s.throwTicks == 0 && s.throwLaunchIn == 0) {
+        const bool r = hands[Hand::Right].vessel, l = hands[Hand::Left].vessel;
+        if (r && ti.Held(TB_ATTACK)) vh = 0;
+        else if (l && ti.Held(TB_ALT)) vh = 1;
+        else if (r && l) vh = HandIndex(s.lastHand);
+        else if (r) vh = 0;
+        else if (l) vh = 1;
+      }
+      const bool vesselHands = vh >= 0;
+      const Hand vHand = HandAt(vh >= 0 ? vh : 0);
+      // The hand's button and its mode bits (tickinput.h).
+      const uint32_t useBit = vHand == Hand::Left ? TB_ALT : TB_ATTACK;
+      const uint32_t scoopBit = vHand == Hand::Left ? TB_SCOOP_L : TB_SCOOP;
+      const uint32_t applyBit = vHand == Hand::Left ? TB_APPLY_L : TB_APPLY;
+      const int vSlot = EquipSlotOfHand(vHand);
+      if (vesselHands && ti.Pressed(useBit)) s.lastHand = vHand;
       // The pour pose ends with the hands: a flask put away (or thrown)
-      // mid-pour must not leave the arm out.
-      if (!vesselHands && s.pourPoseTicks > 0) {
-        if (avatar.Spawned()) avatar.StopClip("pour");
+      // mid-pour must not leave the arm out — and moves with the hand.
+      const std::string pourClipWas =
+          avatar.HandClip("pour", HandAt(s.pourPoseHand));
+      if ((!vesselHands || s.pourPoseHand != vh) && s.pourPoseTicks > 0) {
+        if (avatar.Spawned() && !pourClipWas.empty()) avatar.StopClip(pourClipWas);
         s.pourPoseTicks = 0;
       }
       if (vesselHands) {
-        ItemStack& vs = hotbar.slots[st.intent.vesselSlot];
+        ItemStack& vs = kit.equip.InHand(vHand);
         const ItemDef* vdef = items.Of(vs);
         const WorldSnapshot& vsnap = world.Snap();
         const Vec3 eye = player.EyePos();
@@ -1807,11 +1859,11 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                        Vec3{0, MetresToCells(0.15f), 0};
           Vec3 hp;
           Quat hq;
-          const int hs = avatar.Spawned() ? avatar.HeldSlot() : -1;
+          const int hs = avatar.Spawned() ? avatar.HeldSlot(vHand) : -1;
           if (hs >= 0 && avatar.PartWorldTransform(hs, hp, hq)) {
             mouth = hp + Vec3{0, MetresToCells(0.08f), 0};
             Vec3 lip;
-            if (avatar.HeldMouthWorld(toward - hp, lip)) mouth = lip;
+            if (avatar.HeldMouthWorld(toward - hp, lip, vHand)) mouth = lip;
           }
           return mouth;
         };
@@ -1821,13 +1873,15 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         // the outstretched hand rather than at the hip. No body = no wait.
         constexpr int kPourRaiseTicks = 4;
         const bool pourPose = vdef && vdef->IsContainer() && vs.Filled() &&
-                              ti.Held(TB_ATTACK) && !ti.Held(TB_ALT) &&
+                              ti.Held(useBit) && !ti.Held(scoopBit) &&
                               avatar.Spawned();
+        const std::string pourClip = avatar.HandClip("pour", vHand);
         if (pourPose) {
-          if (s.pourPoseTicks == 0) avatar.PlayClip("pour");
+          if (s.pourPoseTicks == 0 && !pourClip.empty()) avatar.PlayClip(pourClip);
+          s.pourPoseHand = vh;
           s.pourPoseTicks = std::min(s.pourPoseTicks + 1, 1 << 20);
         } else if (s.pourPoseTicks > 0) {
-          avatar.StopClip("pour");
+          if (!pourClip.empty()) avatar.StopClip(pourClip);
           s.pourPoseTicks = 0;
         }
         const bool armUp = !avatar.Spawned() || s.pourPoseTicks > kPourRaiseTicks;
@@ -1840,7 +1894,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           return (uint32_t)std::min<size_t>(kFluidCap - used,
                                             kMaxFluidSpawnsPerTick - fluidSpawns.size());
         };
-        if (vdef && vdef->IsContainer() && ti.Held(TB_ALT)) {
+        if (vdef && vdef->IsContainer() && ti.Held(useBit) && ti.Held(scoopBit)) {
           const char* why = nullptr;
           if (!vsnap.valid || vsnap.pick[0] == 0) {
             why = "there is nothing there to scoop";
@@ -1852,9 +1906,8 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             // you could pour, and no further.
             if ((hc - eye).len() > vdef->container.pourRange + MetresToCells(1.0f)) {
               why = "too far away";
-            } else if (!ContainerIsolateOne(hotbar.slots, kItemSlots,
-                                            st.intent.vesselSlot, kit.bag.slots,
-                                            Bag::kSlots)) {
+            } else if (!ContainerIsolateOne(kit.equip.slots, kEquipSlotCount,
+                                            vSlot, kit.bag.slots, Bag::kSlots)) {
               why = "no room to set the others down";
             } else {
               const uint32_t landing = OpLandingTick(w, tick);
@@ -1905,10 +1958,10 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                 m.life = 7 + (int)(h % 4u);
                 s.scoopMotes.push_back(m);
               }
-              if (!ti.Pressed(TB_ALT)) why = nullptr;
+              if (!ti.Pressed(useBit)) why = nullptr;
             }
           }
-          if (ti.Pressed(TB_ALT)) say(why);
+          if (ti.Pressed(useBit)) say(why);
         }
         // ---- APPLY MODE (TB_APPLY, F with a vessel in hand) ----------------
         //
@@ -1921,15 +1974,14 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
         // portrait brush's (PourBrushCellsPerSec, off its own accumulator) and
         // only on ticks the ray meets skin. The picture is the scoop stream
         // backwards: ghosts (or motes) from the flask's mouth onto the spot.
-        if (vdef && vdef->IsContainer() && ti.Held(TB_ATTACK) && !ti.Held(TB_ALT) &&
-            ti.Held(TB_APPLY)) {
+        if (vdef && vdef->IsContainer() && ti.Held(useBit) && !ti.Held(scoopBit) &&
+            ti.Held(applyBit)) {
           bool applied = false;
           if (!vs.Filled()) {
-            if (ti.Pressed(TB_ATTACK)) say("it is empty");
-          } else if (!ContainerIsolateOne(hotbar.slots, kItemSlots,
-                                          st.intent.vesselSlot, kit.bag.slots,
-                                          Bag::kSlots)) {
-            if (ti.Pressed(TB_ATTACK)) say("no room to set the others down");
+            if (ti.Pressed(useBit)) say("it is empty");
+          } else if (!ContainerIsolateOne(kit.equip.slots, kEquipSlotCount,
+                                          vSlot, kit.bag.slots, Bag::kSlots)) {
+            if (ti.Pressed(useBit)) say("no room to set the others down");
           } else {
             const Vec3 ro = st.intent.aimFromValid ? st.intent.aimFrom : eye;
             const Vec3 rd = fwd.normalized();
@@ -1992,7 +2044,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               const int life = 4 + (int)(d / MetresToCells(0.5f));
               if (mat < mats.size() && ContainerPoursAsFluid(mats[mat])) {
                 ContainerApplyStream(amouth, hit.pos, mat, life, 4,
-                                     0xA991Eu ^ (uint32_t)st.intent.vesselSlot,
+                                     0xA991Eu ^ (uint32_t)vSlot,
                                      tick, fluidRoom(), fluidSpawns);
               } else if (s.scoopMotes.size() < 96) {
                 for (int k = 0; k < 2; k++) {
@@ -2009,7 +2061,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                   s.scoopMotes.push_back(m);
                 }
               }
-            } else if (ti.Pressed(TB_ATTACK)) {
+            } else if (ti.Pressed(useBit)) {
               say("there is nobody there to apply it to");
             }
           }
@@ -2021,16 +2073,15 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           s.applyTicks = 0;
           s.applySpendMilli = 0;
         }
-        if (vdef && vdef->IsContainer() && ti.Held(TB_ATTACK) && !ti.Held(TB_ALT) &&
-            !ti.Held(TB_APPLY)) {
+        if (vdef && vdef->IsContainer() && ti.Held(useBit) && !ti.Held(scoopBit) &&
+            !ti.Held(applyBit)) {
           if (!vs.Filled()) {
-            if (ti.Pressed(TB_ATTACK)) say("it is empty");
-          } else if (!ContainerIsolateOne(hotbar.slots, kItemSlots,
-                                          st.intent.vesselSlot, kit.bag.slots,
-                                          Bag::kSlots)) {
+            if (ti.Pressed(useBit)) say("it is empty");
+          } else if (!ContainerIsolateOne(kit.equip.slots, kEquipSlotCount,
+                                          vSlot, kit.bag.slots, Bag::kSlots)) {
             // A filled stack (a save from before fills stopped stacking): its
             // one fill is one flask's, so only one of them may pour it.
-            if (ti.Pressed(TB_ATTACK)) say("no room to set the others down");
+            if (ti.Pressed(useBit)) say("no room to set the others down");
           } else {
             // AIMED, always, at the pour point (ContainerPourPoint): a metre
             // along the look, or the first thing in the way -- the point
@@ -2052,7 +2103,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               // solver can hold it; lava, blood and the pouch's powders keep
               // the grid particles.
               SplatterEvent splat;
-              const uint32_t pseed = 0x0F1A5Cu ^ (uint32_t)st.intent.vesselSlot;
+              const uint32_t pseed = 0x0F1A5Cu ^ (uint32_t)vSlot;
               const int poured =
                   vs.fillMat < mats.size() && ContainerPoursAsFluid(mats[vs.fillMat])
                       ? ContainerPourFluid(*vdef, vs, mouth, fwd, &target, tick,
@@ -2360,20 +2411,58 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // A VESSEL in the hands is held the same way, through the same
             // borrowed rig slot: the flask is a real part of the arm while
             // you hold it (game/container.h).
-            const ItemDef* vesselDef = nullptr;
-            if (st.intent.vesselSlot >= 0 && st.intent.vesselSlot < kItemSlots)
-              vesselDef = items.Of(hotbar.slots[st.intent.vesselSlot]);
-            const ItemDef* want = meleeArmed ? heldItem : vesselDef;
-            const std::string wantName = want ? want->name : std::string();
-            if (avatar.HeldItem() != wantName) avatar.EquipItem(want);
+            //
+            // BOTH HANDS, FROM THE KIT (dual wielding): each fist holds what
+            // its kit slot says (session.h HandsNow), whatever tool is up —
+            // an item in your hand is in your hand. The tool and magic mode
+            // decide what the BUTTONS do, not what you are carrying.
+            // A HAND TOO HURT TO HOLD ON lets go first (melee.injuredArmDrop;
+            // Mob::GripFails): the item falls as itself and leaves the kit's
+            // hand slot, so the equip below finds the fist empty.
+            if (avatar.GripFails(CurrentTuning().melee.injuredArmDrop) > 0) {
+              ui.kitMessage = "your grip fails";
+              ui.kitMessageAge = 0.0f;
+            }
+            for (int hk = 0; hk < kHands; hk++) {
+              const Hand h = HandAt(hk);
+              // Re-read: GripFails may have just emptied it.
+              const ItemDef* want =
+                  hands.hand[hk].item != nullptr && !kit.equip.InHand(h).Empty()
+                      ? hands.hand[hk].item
+                      : nullptr;
+              const std::string wantName = want ? want->name : std::string();
+              if (avatar.HeldItem(h) != wantName) avatar.EquipItem(want, h);
+            }
+            // THE IDLE STRIKE HAND: between strokes the driver's ready pose
+            // is on the hand last used, if it can swing, else on the other.
+            // Changed only while the driver is IDLE (its whole memory is one
+            // arm's, in one basis), and a change re-seeds it from the new
+            // arm's live pose, so nothing jumps. A hand that cannot swing (a
+            // flask, a ruined arm) never gets the ready pose, which is what
+            // leaves the pour clip the arm.
+            if (!playerStrike.Active() && melee.Phase() == SwingPhase::Idle) {
+              Hand idle = s.lastHand;
+              if (!hands[idle].ready && hands[OtherHand(idle)].ready)
+                idle = OtherHand(idle);
+              const bool mirror = idle == Hand::Left;
+              if (idle != avatar.StrikeHand() || mirror != s.strikeMirrored) {
+                avatar.SetStrikeHand(idle);
+                s.strikeMirrored = mirror;
+                melee.Reset();
+              }
+            }
             // WHERE THE BLADE IS, so taking control of it is not a teleport:
             // the stroke seeds itself from the live point AND the live hand,
             // takes its blade length from the pair, and bounds itself by the
             // rig's own reach (game/melee.h SetStroke).
             Vec3 handNow, tipNow, flatNow;
             float reachNow = 0;
+            // A MIRRORED driver reads the live blade's flat reflected, the
+            // same pseudovector flip its pose goes out with (strokes.h).
             if (avatar.WeaponStrokePose(handNow, tipNow, flatNow, reachNow))
-              melee.SetStroke(handNow, tipNow, flatNow, reachNow);
+              melee.SetStroke(handNow, tipNow,
+                              s.strikeMirrored ? flatNow * -1.0f : flatNow,
+                              reachNow);
             else
               melee.ClearArm();
             // ...and where the avatar's own head is, so neither an authored
@@ -2400,7 +2489,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // The NPC driver always did this and the player's never had —
             // without it the asymmetric azimuth window (azOut on the weapon
             // side) assumes a right-handed rig whatever the avatar holds.
-            melee.SetHandSign(avatar.HandSign());
+            // Mirrored, the driver lives in the AUTHORED arm's frame, whose
+            // weapon side is the right (strokes.h).
+            melee.SetHandSign(s.strikeMirrored ? 1.0f : avatar.HandSign());
           } else {
             melee.ClearArm();
           }
@@ -2410,15 +2501,26 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           // own (melee.h SwingPhase).
           // The program entered its cut THIS tick (the whoosh edge).
           bool strikeCutEdge = false;
+          // THE DRIVER'S BASIS: the body's, reflected when the driver serves
+          // the other arm from its stroke's author (s.strikeMirrored).
+          // READ AT EACH USE: a stroke that begins below may change it.
+          auto strikeRightNow = [&] {
+            return s.strikeMirrored ? bodyRight * -1.0f : bodyRight;
+          };
           {
             // DISCRETE: consume the press latch, then step the program. Begin
             // and first step land on the SAME tick, exactly as the NPC's
             // BeginStroke/StepStroke pair does.
-            if (!meleeReady || !avatar.Spawned()) {
+            // THE STRIKE'S OWN HAND, not "any hand": a swing whose fist
+            // stops being able to swing (the sword dropped, the arm ruined,
+            // the hands lowered) ends, whatever the other fist is doing.
+            const bool strokeHandLive =
+                !playerStrike.Active() || hands[playerStrike.hand].ready;
+            if (!meleeReady || !avatar.Spawned() || !strokeHandLive) {
               // Weapon stowed (or body gone) mid-swing: drop the claim the
               // same way MobSystem's teardown guard does.
               playerStrike.Reset();
-              strikeBuffered = -1;
+              if (!meleeReady || !avatar.Spawned()) strikeBuffered = -1;
               if (avatar.Spawned()) avatar.ClearStrikeEffector();
             }
             // ---- STRIKE CHAINING (strokes.h StrikeChains) --------------------
@@ -2430,37 +2532,47 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             // forth is the fast rhythm. A strike from any other side waits
             // the recover out through the bank below, as it always did.
             const Tuning::Melee& chainT = CurrentTuning().melee;
-            const PlayerStrikeMap& chainCompass =
-                PlayerCompass(mobs.AttackStyles(), meleeArmed);
-            auto chainsNow = [&](int next) {
-              return playerStrike.phase == StrokeCursor::Phase::Recover &&
-                     StrikeChains(chainCompass, strikeBase, next,
-                                  chainT.chainSectorLeeway);
+            // ...AND THE OTHER HAND ALWAYS CHAINS (dual wielding). Its weapon
+            // is not the one that just swung, so "already on that side" does
+            // not apply: it may start in the recover, at its own windup rate.
+            // Left, right, left is the dual wielder's fast rhythm.
+            auto chainsNow = [&](int next, Hand nextHand) {
+              if (playerStrike.phase != StrokeCursor::Phase::Recover) return false;
+              if (nextHand != playerStrike.hand) return true;
+              return StrikeChains(
+                  PlayerCompass(mobs.AttackStyles(), hands[nextHand].weapon),
+                  strikeBase, next, chainT.chainSectorLeeway);
             };
             // A chaining strike clicked during the CUT was banked; it goes
             // the moment the recover begins rather than at its end.
             if (strikeQueued < 0 && strikeBuffered >= 0 &&
-                chainsNow(strikeBuffered)) {
+                chainsNow(strikeBuffered, s.strikeBufferedHand)) {
               strikeQueued = strikeBuffered;
+              s.strikeQueuedHand = s.strikeBufferedHand;
               strikeBuffered = -1;
             }
-            if (strikeQueued >= 0 && meleeReady && avatar.Spawned()) {
+            const Hand qHand = s.strikeQueuedHand;
+            if (strikeQueued >= 0 && hands[qHand].ready && avatar.Spawned()) {
               const bool chained =
-                  playerStrike.Active() && chainsNow(strikeQueued);
+                  playerStrike.Active() && chainsNow(strikeQueued, qHand);
+              const bool otherHand = chained && qHand != playerStrike.hand;
               if (chained) {
                 // The recover is abandoned where it stands: the new stroke's
                 // first keyed frame blends from the live arm (mob.cpp
-                // keyLive), so there is no snap.
+                // keyLive), so there is no snap. The OTHER hand's chain hands
+                // the old arm back on its own short release (Mob::
+                // ReleaseOffArm).
                 playerStrike.Reset();
                 avatar.ClearStrikeEffector();
               }
               if (!playerStrike.Active()) {
                 // THE WEAPON'S OWN VERSION of the stroke the flick named
                 // (strokes.h WEAPON FORMS), resolved once, here, like the
-                // NPC's MobSystem::StartStroke.
+                // NPC's MobSystem::StartStroke — for the item in THIS hand.
+                const ItemDef* qItem = hands[qHand].weapon ? hands[qHand].item : nullptr;
                 const int formed = mobs.AttackStyles().ResolveForm(
                     strikeQueued,
-                    heldItem ? WeaponFormOf(heldItem->weaponClass) : -1);
+                    qItem ? WeaponFormOf(qItem->weaponClass) : -1);
                 if (const AttackStyle* sty = mobs.AttackStyles().At(formed)) {
                   // ---- POINT THE DRIVER AT THE PART THIS STYLE SWINGS -----
                   // Exactly what MobSystem::BeginStroke does, and through the
@@ -2469,28 +2581,58 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                   // reports the knuckles. A style whose weapon this body has
                   // not got refuses HERE, before the program begins, so a
                   // strike never runs with no edge on the end of it.
-                  if (avatar.ArmForStyle(*sty)) {
+                  if (avatar.ArmForStyle(*sty, qHand)) {
+                    // THE ARM, AND WHETHER IT IS THE AUTHORED ONE (strokes.h
+                    // "THE LEFT HAND IS THE RIGHT, MIRRORED"). A change of
+                    // hand or of frame re-seeds the driver from the new arm's
+                    // live pose: its memory is the old arm's, in the old
+                    // basis, and carrying it across is a teleport.
+                    const bool mirror = StrokeMirrored(*sty, qHand);
+                    if (mirror != s.strikeMirrored || otherHand) melee.Reset();
+                    s.strikeMirrored = mirror;
                     // Fresh sliders per swing — MobSystem::BeginStroke says
                     // why (MeleeTuning is a copy; F5 must reach the next cut).
                     ApplyMeleeTuning(melee.tuning);
+                    // AN INJURED ARM SWINGS SLOWER (melee.injuredArm*): the
+                    // same stroke, stretched, and so a weaker cut.
+                    const float slow =
+                        StyleSideOf(*sty) != StyleSide::None
+                            ? InjuredArmSlow(avatar.HandCondition(qHand))
+                            : 1.0f;
                     // The seed is (who, when), like the NPC's; the player's
                     // styles author jitter 0, so it only matters if an author
                     // turns jitter back on — and then it still replays.
                     BeginStrokeProgram(playerStrike, *sty, formed,
                                        rng::Hash3(0x504Cu, tick, 0x5747u),
-                                       chained ? chainT.chainWindupRate : 1.0f);
+                                       chained && !otherHand
+                                           ? chainT.chainWindupRate
+                                           : 1.0f,
+                                       slow);
+                    playerStrike.hand = qHand;
+                    playerStrike.mirrored = mirror;
                     strikeBase = strikeQueued;
                     // ...and the style's body animation, exactly as the NPC's
-                    // BeginStroke does (strokes.h AttackStyle::clip).
-                    if (!sty->clip.empty()) avatar.PlayClip(sty->clip);
+                    // BeginStroke does (strokes.h AttackStyle::clip) — its
+                    // mirror, swung with the other arm (Mob::StrokeClip).
+                    if (const std::string clip = avatar.StrokeClip(*sty, mirror);
+                        !clip.empty())
+                      avatar.PlayClip(clip);
                   }
                 }
               } else if (playerStrike.phase == StrokeCursor::Phase::Cut ||
-                         playerStrike.phase == StrokeCursor::Phase::Recover) {
+                         playerStrike.phase == StrokeCursor::Phase::Recover ||
+                         qHand != playerStrike.hand) {
                 // ONE strike banks mid-swing (last click wins); a click during
-                // the windup is dropped — the windup IS the commitment.
+                // the windup is dropped — the windup IS the commitment. The
+                // OTHER hand's click banks even then: that arm has committed
+                // to nothing yet.
                 strikeBuffered = strikeQueued;
+                s.strikeBufferedHand = qHand;
               }
+              strikeQueued = -1;
+            } else if (strikeQueued >= 0) {
+              // Pressed with a hand that cannot swing any more (it dropped
+              // its sword between the press and this tick): gone, not banked.
               strikeQueued = -1;
             }
             bool stepped = false;
@@ -2566,13 +2708,13 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                         break;
                       }
                     }
-                    StrokeAimAt(pivot, eye + look * hitDist, bodyRight,
+                    StrokeAimAt(pivot, eye + look * hitDist, strikeRightNow(),
                                 bodyUp, bodyFwd, aimAz, aimEl, aimDist);
                   }
                 }
                 const StrokeStepResult r = StepStrokeProgram(
                     playerStrike, sty, melee, aimAz, aimEl, aimDist, kTickDt,
-                    bodyRight, bodyUp, bodyFwd);
+                    strikeRightNow(), bodyUp, bodyFwd);
                 stepped = r != StrokeStepResult::Idle;
                 strikeCutEdge = playerStrike.Cutting() && !wasCutting;
                 if (r == StrokeStepResult::Finished) {
@@ -2587,6 +2729,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                   // click (one tick of gap, invisible at 30 Hz).
                   if (strikeBuffered >= 0) {
                     strikeQueued = strikeBuffered;
+                    s.strikeQueuedHand = s.strikeBufferedHand;
                     strikeBuffered = -1;
                   }
                 }
@@ -2598,8 +2741,11 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
               // back over the usual ramp. ONE advance per tick either way.
               // The body basis, like the program's: a recover the program
               // began in it must unwind in it, not jump into the camera's.
-              melee.Update(kTickDt, false, meleeReady, bodyRight, bodyUp,
-                           bodyFwd);
+              // ARMED = the idle strike hand can swing (a flask gets no ready
+              // pose), in the frame the driver is in.
+              melee.Update(kTickDt, false,
+                           avatar.Spawned() && hands[avatar.StrikeHand()].ready,
+                           strikeRightNow(), bodyUp, bodyFwd);
             }
           }
           // ---- THE SWING WHOOSH, on the EDGE into the program's cut --------
@@ -2648,7 +2794,11 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             const AttackStyle* sty =
                 playerStrike.style >= 0 ? mobs.AttackStyles().At(playerStrike.style)
                                         : nullptr;
-            avatar.SetWeaponPose(StrokePoseNow(playerStrike, sty, melee));
+            WeaponPose wp = StrokePoseNow(playerStrike, sty, melee);
+            // The other arm from the style's author: reflect what the basis
+            // could not (strokes.h MirrorWeaponPose).
+            if (s.strikeMirrored) MirrorWeaponPose(wp);
+            avatar.SetWeaponPose(wp);
           }
         }
         // ---- ARMOUR: the body wears what the kit's equipment says -----------
@@ -3006,6 +3156,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           if (vp && !vp->Empty() && vp->count > 1) {
             const bool inHot = vp >= hotbar.slots && vp < hotbar.slots + kItemSlots;
             const bool inBag = vp >= kit.bag.slots && vp < kit.bag.slots + Bag::kSlots;
+            // ...or a HAND (dual wielding: a held flask is a kit hand slot).
+            const bool inEquip =
+                vp >= kit.equip.slots && vp < kit.equip.slots + kEquipSlotCount;
             const bool split =
                 inHot ? ContainerIsolateOne(hotbar.slots, kItemSlots,
                                             (int)(vp - hotbar.slots), kit.bag.slots,
@@ -3013,6 +3166,9 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                 : inBag ? ContainerIsolateOne(kit.bag.slots, Bag::kSlots,
                                               (int)(vp - kit.bag.slots),
                                               hotbar.slots, kItemSlots)
+                : inEquip ? ContainerIsolateOne(kit.equip.slots, kEquipSlotCount,
+                                                (int)(vp - kit.equip.slots),
+                                                kit.bag.slots, Bag::kSlots)
                         : false;
             if (!split) vp = nullptr;
           }
@@ -3405,6 +3561,10 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
       // needs the `spawns` list debris.PreTick fills just above.
       avatar.SetSwinging(playerStrike.Cutting());
       if (avatar.Spawned() && meleeReady) {
+        // THE STRIKING HAND's item (dual wielding) — the one WeaponEdge below
+        // reads the blade of. The other fist's is carried, not swung.
+        const HandNow& strikeHn = hands[avatar.StrikeHand()];
+        const ItemDef* heldItem = strikeHn.weapon ? strikeHn.item : nullptr;
         Vec3 eb, et, ef;
         float ehw = 0;
         if (avatar.WeaponEdge(eb, et, ehw, &ef)) {
@@ -4185,6 +4345,56 @@ static void PhaseP(TickAuthorityCtx& w, WorldScratch& ws,
 //
 // The alternation, and nothing else. Read it beside the phase comments above:
 // a starred line is per session, in index order; an unstarred one runs once.
+// ---- THE HANDS THIS TICK (session.h HandsNow) --------------------------------
+//
+// Can this arm throw an UNARMED style right now? The compass's styles, each
+// taken on THIS arm (a style authored on the other side names its mirror's
+// weapon, fist.R -> fist.L — Mob::ArmForStyle's rule, asked here without
+// arming anything), is any one of them usable. A CONTENT question: author a
+// creature with claws instead of fists and nothing here changes.
+static bool UnarmedUsable(const Mob& body, const StyleLibrary& lib, Hand h) {
+  if (!lib.playerUnarmed.Usable()) return false;
+  auto usable = [&](int si) {
+    const AttackStyle* sty = lib.At(si);
+    if (sty == nullptr) return false;
+    if (sty->weapon.empty() || sty->weapon == "held") return false;
+    const std::string name = StrokeMirrored(*sty, h) ? MirrorSideName(sty->weapon)
+                                                     : sty->weapon;
+    const MobNaturalWeaponDef* nw = body.NaturalWeaponNamed(name);
+    return nw != nullptr && body.NaturalWeaponUsable(*nw);
+  };
+  for (const PlayerStrikeMap::Sector& sec : lib.playerUnarmed.sectors)
+    if (usable(sec.style)) return true;
+  for (int k = 0; k < 2; k++)
+    if (usable(lib.playerUnarmed.neutral[k])) return true;
+  return false;
+}
+
+static void ResolveHands(TickAuthorityCtx& w, SessionTick& st) {
+  PlayerSession& s = *st.s;
+  const Kit& kit = s.avatar.GetKit();
+  const bool body = s.avatar.Spawned();
+  for (int k = 0; k < kHands; k++) {
+    const Hand h = HandAt(k);
+    HandNow& hn = st.hands.hand[k];
+    hn = HandNow{};
+    const ItemDef* d = w.items.Of(kit.equip.InHand(h));
+    // Only what a hand can grip rides it (EquipSlotAccepts' own rule, asked
+    // again because a save or a script can put anything in a slot).
+    if (d != nullptr && EquipSlotAccepts(EquipSlotOfHand(h), d->kind)) {
+      hn.item = d;
+      hn.weapon = d->kind == ItemKind::Melee;
+      hn.vessel = d->IsContainer();
+    }
+    // No body (fly mode, dead) swings nothing; an arm that is gone or
+    // useless (Mob::HandCondition 0) swings nothing either.
+    if (!st.intent.handsUp || !body || !s.avatar.HandUsable(h)) continue;
+    if (hn.weapon) hn.ready = true;
+    else if (hn.item == nullptr)
+      hn.ready = UnarmedUsable(s.avatar, w.mobs.AttackStyles(), h);
+  }
+}
+
 void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
                    uint32_t tick, OpBatch& out) {
   // A tick with nobody in it is not a tick. Every world phase below reads the
@@ -4210,6 +4420,7 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
     if (!p.s->localView && !p.s->sink)
       p.s->sink = std::make_unique<PresentationSink>();
 
+  for (SessionTick& p : players) ResolveHands(w, p);
   for (size_t i = 0; i < players.size(); i++)
     PhaseA(w, ws, players[i], scratch[i], tick, out);
   PhaseB(w, ws, players, scratch, tick, out);

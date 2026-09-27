@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "game/anim.h"    // Ease / ApplyEase — a cut's pacing IS a clip's easing
+#include "game/hand.h"
 #include "game/melee.h"
 #include "math3d.h"
 
@@ -840,10 +841,67 @@ struct StrokeCursor {
   // Reset() with everything else.
   bool bitten = false;
 
+  // ---- WHICH ARM, AND WHETHER IT IS THE AUTHORED ONE (dual wielding) -----
+  // The hand this swing is thrown with, and whether that is the mirror of
+  // the side its style was authored for (StrokeMirrored). Set by the caller
+  // beside BeginStrokeProgram; a mirrored program runs in a MIRRORED BASIS
+  // and its pose is reflected on the way to the rig (MirrorWeaponPose).
+  Hand hand = Hand::Right;
+  bool mirrored = false;
+
   bool Active() const { return phase != Phase::Idle; }
   bool Cutting() const { return phase == Phase::Cut; }
   void Reset() { *this = StrokeCursor{}; }
 };
+
+// ---------------------------------------------------------------------------
+// THE LEFT HAND IS THE RIGHT, MIRRORED (dual wielding, 2026-09-27).
+//
+// Every held style is authored for the right arm, and the unarmed compass
+// authors one punch per side. Re-authoring the whole library for the left
+// hand would be a second copy of every stroke that drifts from the first the
+// day either is tuned, so a stroke swung with the OTHER arm than its author's
+// is the authored stroke REFLECTED through the body's sagittal plane:
+//
+//   * THE DRIVER runs in a mirrored basis — `right` negated. MeleeState keeps
+//     everything in basis coordinates (melee.cpp ToWorld/ToBasis are the only
+//     place the frames meet), so the authored azimuths, the keep-outs, the
+//     seed read off the live blade and the aim bearing all reflect with it
+//     and the driver never learns it is serving the other arm. Its hand sign
+//     is the AUTHORED side's (+1), for the same reason.
+//   * THE POSE the driver hands the rig is already reflected in position and
+//     direction. What is not is what the basis cannot carry: the blade's
+//     FLAT, a pseudovector (a reflection turns a right-handed edge frame into
+//     a left-handed one, so the edge would trail — negated here), the torso
+//     twist (a turn toward the wielder's right becomes one toward the left),
+//     and a KEYED pose's joint rotations, which are rig-local (reflected as
+//     (x, -y, -z, w), the quaternion of M R M with M = diag(-1, 1, 1)) along
+//     with their aim yaws.
+//   * THE WEAPON a natural style names swaps side (fist.R -> fist.L,
+//     Mob::ArmForStyle), and so does its body clip if the library has the
+//     mirror (`punch_r` -> `punch_l`, MirroredClipName); a clip with no
+//     mirror is not played, because a right punch's body motion under a
+//     left punch is worse than none.
+//
+// A style with no side (jaws) is never mirrored.
+enum class StyleSide : uint8_t { None = 0, Right, Left };
+struct AttackStyle;
+StyleSide StyleSideOf(const AttackStyle& sty);
+inline StyleSide StyleSideOfHand(Hand h) {
+  return h == Hand::Left ? StyleSide::Left : StyleSide::Right;
+}
+bool StrokeMirrored(const AttackStyle& sty, Hand hand);
+// Reflect what the basis could not (see above). Idempotent only in pairs:
+// call it exactly once per pose, on the way to SetWeaponPose.
+void MirrorWeaponPose(WeaponPose& wp);
+// "punch_r" <-> "punch_l" (a trailing _r/_l); the name unchanged when it has
+// no side suffix. The caller checks the library has the result.
+std::string MirroredClipName(const std::string& clip);
+// How much longer an arm in `condition` (Mob::HandCondition, 0..1) takes over
+// a stroke: 1 at or above `melee.injuredArmFrom`, rising linearly to
+// 1 + `melee.injuredArmSlow` as the condition nears 0. The multiplier
+// BeginStrokeProgram's `slow` takes.
+float InjuredArmSlow(float condition);
 
 // ---------------------------------------------------------------------------
 // THE RUNTIME: one live NPC swing.
@@ -976,9 +1034,14 @@ int PickAttackStyle(const StyleLibrary& lib,
 // `windupRate` > 1 plays the WINDUP frames that many times faster (a chained
 // strike, StrikeChains): each windup frame's ticks are divided by it before
 // the two-tick telegraph floor, so a chain is quicker but never instant.
+//
+// `slow` >= 1 stretches EVERY frame by that factor — an injured arm
+// (Mob::HandCondition, melee.injuredArm*) swings the same stroke at a
+// slower tempo, and since speed is the damage (melee.h note 2) a slower cut
+// is a weaker one with no second damage rule to keep in step.
 void BeginStrokeProgram(StrokeCursor& cur, const AttackStyle& sty,
                         int styleIndex, uint32_t seed,
-                        float windupRate = 1.0f);
+                        float windupRate = 1.0f, float slow = 1.0f);
 
 // What one tick of the program did, so the caller knows whether to push a
 // pose. Split three ways rather than a bool because the two "no pose" cases

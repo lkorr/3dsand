@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "game/hand.h"
 #include "game/item.h"
 #include "game/kitref.h"
 
@@ -71,6 +72,17 @@ enum class EquipSlotId : uint8_t {
   Quick1,
   Quick2,
   Quick3,
+  // THE HANDS (dual wielding, 2026-09-27). What is IN each hand, as a real
+  // kit slot rather than "whichever hotbar slot is selected": Q moves the
+  // selected hotbar stack into the left hand and E into the right (a swap, so
+  // what was held goes back into that hotbar slot), and the rig holds
+  // exactly these two (Mob::HoldFromKit). Being kit slots is the point — the
+  // save, the loot list, a knock-out, the character screen and an NPC all
+  // name the thing in a hand by the one address they already use for a helm.
+  // Not WORN (EquipSlotIsWorn stops at Trinket): a held item is the borrowed
+  // rig slot Mob::EquipItem makes, not a set of shells.
+  HandR,
+  HandL,
   Count,
 };
 
@@ -139,6 +151,12 @@ inline const EquipSlotDef* EquipSlots() {
        "requires: a carryable item"},
       {EquipSlotId::Quick3, "Quick IV", "slot_quick", {ItemKind::Melee},
        "requires: a carryable item"},
+      // What a hand can hold is what the rig can grip: a weapon or a vessel.
+      // Armour is worn, not held, and a trinket is worn round the neck.
+      {EquipSlotId::HandR, "Right hand", "slot_hands",
+       {ItemKind::Melee, ItemKind::Container}, "requires: something to hold"},
+      {EquipSlotId::HandL, "Left hand", "slot_hands",
+       {ItemKind::Melee, ItemKind::Container}, "requires: something to hold"},
   };
   return k;
 }
@@ -160,6 +178,16 @@ inline const EquipSlotDef& EquipSlotAt(int i) {
 inline bool EquipSlotIsWorn(int slot) {
   if (slot < 0 || slot >= kEquipSlotCount) return false;
   return EquipSlotAt(slot).id <= EquipSlotId::Trinket;
+}
+
+// The kit slot that IS a hand, and back. -1 / false for every other slot.
+inline int EquipSlotOfHand(Hand h) {
+  return h == Hand::Left ? (int)EquipSlotId::HandL : (int)EquipSlotId::HandR;
+}
+inline bool EquipSlotIsHand(int slot, Hand* out = nullptr) {
+  if (slot == (int)EquipSlotId::HandR) { if (out) *out = Hand::Right; return true; }
+  if (slot == (int)EquipSlotId::HandL) { if (out) *out = Hand::Left; return true; }
+  return false;
 }
 
 inline bool EquipSlotAccepts(int slot, ItemKind kind) {
@@ -233,6 +261,9 @@ struct Equipment {
     static const ItemStack kEmpty{};
     return (i >= 0 && i < kEquipSlotCount) ? slots[i] : kEmpty;
   }
+  // What is in a hand (EquipSlotId::HandR/HandL).
+  ItemStack& InHand(Hand h) { return slots[EquipSlotOfHand(h)]; }
+  const ItemStack& InHand(Hand h) const { return slots[EquipSlotOfHand(h)]; }
   bool Empty() const {
     for (const ItemStack& s : slots)
       if (!s.Empty()) return false;
@@ -244,6 +275,10 @@ inline int EquipSlotFor(ItemKind kind, const Equipment& eq) {
   int first = -1;
   for (int s = 0; s < kEquipSlotCount; s++) {
     if (!EquipSlotAccepts(s, kind)) continue;
+    // The hands are filled by Q/E (or a drag), never by "put this on": a
+    // right-click on a sword means stow it, and a flask right-clicked into
+    // your fist would be a grab nobody asked for.
+    if (EquipSlotIsHand(s)) continue;
     if (eq.At(s).Empty()) return s;
     if (first < 0) first = s;
   }

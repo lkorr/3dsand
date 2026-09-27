@@ -6451,9 +6451,14 @@ int main(int argc, char** argv) {
   glfwGetCursorPos(window, &mx0, &my0);
 
   KeyEdge eP, eN, eV, eF1, eF2, eF3, eF4, eF5, eF6, eF7, eF9, eF10, eR, eEsc, eLBracket, eRBracket, eJump,
-      eG, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
-  // (E has no KeyEdge: it is a hold-aware binding now — see the tap/hold
-  // block by `takeE` — and an edge tracker would only be half of it.)
+      eJ, eX, eB, eT, eO, eM, eK, eTab, eC, eH, eZ, eBack, eDel, eU, eL, eI;
+  // THE HANDS (dual wielding, 2026-09-27): Q puts the selected hotbar stack
+  // in the LEFT hand, E in the RIGHT (a swap: what was held goes back into
+  // that hotbar slot; an empty selected slot takes the hand's item back).
+  KeyEdge eQ, eE;
+  // (G has no KeyEdge: it is a hold-aware binding — tap to take, hold to
+  // drag or, with a throwable vessel in hand, to throw — see the block by
+  // `takeE` — and an edge tracker would only be half of it.)
   KeyEdge eGlyph[kGlyphSlots];
   bool prevMouseL = false;
   bool prevMouseR = false;
@@ -6496,6 +6501,9 @@ int main(int argc, char** argv) {
   // dropping one) so letting go does not also pick something up.
   GrabHold& grab = session.grab;
   float& eHeld = session.eHeld;
+  // G held past the hold time with a throwable vessel in hand: the throw's
+  // wind-up (fed to TB_THROW below). Frame-side like `eHeld`.
+  bool gThrowHold = false;
   bool& eGrabbed = session.eGrabbed;
   bool& ePrevDown = session.ePrevDown;
   std::vector<uint64_t>& lookIgnore = session.lookIgnore;  // own limbs, per frame
@@ -6573,17 +6581,14 @@ int main(int argc, char** argv) {
   // is settled before this frame's eye exists.
   Vec3 pourFrom{};
   bool pourFromValid = false;
-  // The hotbar slot `heldItem` was read from on the last frame that had one
-  // (-1 = nothing drawn). The knocked-from-hand handler clears THIS slot,
-  // not whatever is selected by the time it runs.
-  int heldItemSlot = -1;
-  // ---- THE HOTBAR IS THE HAND ---------------------------------------------
+  // ---- THE HANDS ARE KIT SLOTS (dual wielding, 2026-09-27) ----------------
   //
-  // A weapon is drawn the way a flask is: put it in a hotbar slot and select
-  // that slot (number row / wheel) with the melee tool up. There is no draw
-  // key any more -- the owner's call (2026-09-23), replacing Q-draws-from-the-
-  // sheath. The Sheath and Quick equipment slots are still there as places a
-  // blade rides on your person; they just are not where the hand reaches.
+  // It used to be "the hotbar is the hand": the selected slot was drawn.
+  // Now each hand is its own equipment slot (game/equipment.h HandR/HandL):
+  // select a hotbar slot, press Q for the left hand or E for the right, and
+  // it is in that fist until you put it away (the same key on an empty
+  // hotbar slot). LMB swings or uses the right hand, RMB the left. The Sheath
+  // and Quick slots are still places a blade rides on your person.
   {
     // ---- THE STARTING KIT, AND IT IS STILL A STUB ------------------------
     //
@@ -6602,8 +6607,14 @@ int main(int argc, char** argv) {
       int home = -1;
       for (int s = 0; s < kEquipSlotCount && home < 0; s++)
         if (it.kind != ItemKind::Melee && !EquipSlotIsWorn(s) &&
+            !EquipSlotIsHand(s) &&
             EquipSlotAccepts(s, it.kind) && kit.equip.At(s).Empty())
           home = s;
+      // THE FIRST WEAPON STARTS IN THE RIGHT HAND, so the stub kit spawns
+      // armed as it did when the selected hotbar slot was the hand.
+      if (home < 0 && it.kind == ItemKind::Melee &&
+          kit.equip.InHand(Hand::Right).Empty())
+        home = EquipSlotOfHand(Hand::Right);
       if (home >= 0)
         kit.equip.slots[home] = StackOf(items, i);
       else if (ItemKindIsWorn(it.kind))
@@ -6634,6 +6645,8 @@ int main(int argc, char** argv) {
     }
     ui.bagCols = Bag::kCols;
     ui.bagRows = Bag::kRows;
+    ui.handEquipSlot[0] = EquipSlotOfHand(Hand::Right);
+    ui.handEquipSlot[1] = EquipSlotOfHand(Hand::Left);
   }
   // Burn-material ids for the inspector's charred readout, resolved ONCE here
   // and again after every materials reload — never per frame (see ResolveBurnMats).
@@ -9481,7 +9494,9 @@ int main(int argc, char** argv) {
     // universal "undo what I just typed" key and the left hand is on WASD.
     if (captured && eBack.Pressed(key(GLFW_KEY_BACKSPACE))) caster.Clear(glyphs);
 
-    if (captured && ui.devControls && eG.Pressed(key(GLFW_KEY_G))) {
+    // The dev grenade moved off G to J when G became take/throw (dual
+    // wielding, 2026-09-27).
+    if (captured && ui.devControls && eJ.Pressed(key(GLFW_KEY_J))) {
       Grenade g;
       g.pos = player.EyePos() + cam.Forward() * 2.0f;
       g.vel = cam.Forward() * (CurrentTuning().grenade.throwSpeed / kVoxelMeters) +
@@ -9555,14 +9570,14 @@ int main(int argc, char** argv) {
       // Then a DEAD MOB under the crosshair — any of its limbs, shells or the
       // sword in its hand answers as the corpse (MobSystem::FindOwner).
       if (const WorldItem* w = lookBody ? ground.Find(lookBody) : nullptr) {
-        ui.lookPrompt = "E  pick up " + w->name;
+        ui.lookPrompt = "G  pick up " + w->name;
       } else if (const Mob* c = lookBody ? mobs.FindOwner(lookBody) : nullptr;
                  c != nullptr && c->Lootable()) {
         std::vector<LootPiece> pieces;
         c->LootPieces(pieces);
         const std::string name = c->Def() ? c->Def()->name : std::string();
         ui.lookPrompt = pieces.empty() ? name + "  -  nothing left on it"
-                                       : "E  loot " + name;
+                                       : "G  loot " + name;
       }
       // ...and the second half of the same prompt: anything the grab would
       // accept says so, whether or not it is also an item. The prompt is how
@@ -9575,7 +9590,7 @@ int main(int argc, char** argv) {
           if (cap > 0.0f && kg > cap)
             std::snprintf(buf, sizeof buf, "too heavy to lift  (%.0f kg)", kg);
           else
-            std::snprintf(buf, sizeof buf, "hold E  move  (%.0f kg)", kg);
+            std::snprintf(buf, sizeof buf, "hold G  move  (%.0f kg)", kg);
           if (!ui.lookPrompt.empty()) ui.lookPrompt += "   -   ";
           ui.lookPrompt += buf;
         }
@@ -9591,7 +9606,7 @@ int main(int argc, char** argv) {
     }
     if (grab.Active()) {
       char buf[96];
-      std::snprintf(buf, sizeof buf, "release E  -  carrying %.0f kg",
+      std::snprintf(buf, sizeof buf, "release G  -  carrying %.0f kg",
                     grab.MassKg());
       ui.lookPrompt = buf;
     }
@@ -9713,15 +9728,37 @@ int main(int argc, char** argv) {
     // Losing the mouse (Esc, the character screen) drops what is carried
     // rather than freezing it in mid-air — the key-up that would have released
     // it is never going to arrive.
+    //
+    // G IS THE KEY NOW (dual wielding moved E to the right hand). And with a
+    // THROWABLE VESSEL in either hand the hold means THROW, not drag: past
+    // the same hold time the press latches as a throw, TB_THROW is held from
+    // there until the key comes up, and the tick winds up and lets go
+    // (session.cpp THE THROW). A tap is still a take, so a flask in hand
+    // does not stop you picking a sword up.
     {
       const Tuning::Player& tp = CurrentTuning().player;
-      const bool eDown = captured && key(GLFW_KEY_E);
+      const bool eDown = captured && key(GLFW_KEY_G);
+      const bool throwable = [&] {
+        if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
+        for (int hk = 0; hk < kHands; hk++) {
+          const ItemDef* d = items.Of(kit.equip.InHand(HandAt(hk)));
+          if (d && d->IsContainer() && ContainerThrowable(*d)) return true;
+        }
+        return false;
+      }();
       if (eDown && !ePrevDown) {
         eHeld = 0.0f;
         eGrabbed = false;
+        gThrowHold = false;
       }
       if (eDown) eHeld += dt;
       if (!captured && grab.Active()) grab.Release(phys);
+      if (eDown && !eGrabbed && throwable && !grab.Active() &&
+          eHeld >= std::max(tp.grabHoldTime, 0.05f)) {
+        gThrowHold = true;
+        eGrabbed = true;   // the press is spent on the throw, not a take
+      }
+      if (!eDown || !throwable) gThrowHold = false;
       // `> 0` and not `>= 0`: at a hold time of zero the grab would latch on
       // the first frame the key is down and the TAP could never fire, so zero
       // is the off switch (tuning.h says so) rather than a hair trigger.
@@ -10596,36 +10633,70 @@ int main(int argc, char** argv) {
     // between two ticks reads as released on the second one.
     feeder.Hold(TB_ATTACK, mouseL);
     feeder.Hold(TB_ALT, mouseR);
-    // Q winds up a throw of the held vessel; letting go throws it
-    // (game/container.h). Only a throwable vessel in hand reads it.
-    feeder.Hold(TB_THROW, captured && gameKeys &&
-                              glfwGetKey(window, GLFW_KEY_Q) == GLFW_PRESS);
-    // F WITH A VESSEL IN HAND toggles APPLY MODE (TB_APPLY): LMB brushes the
-    // contents onto the body under the crosshair instead of pouring. The same
-    // hands test as `vesselSlot` below (the melee tool up, magic off, a
-    // container selected); while it holds, F is this and not the dev laser.
-    const bool vesselInHand = [&] {
-      if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
-      const ItemDef* d = items.Of(hotbar.Selected());
-      return d && d->IsContainer();
+    // G held winds up a throw of a held vessel; letting go throws it
+    // (game/container.h). Only a throwable vessel in hand reads it; the hold
+    // is decided with the take/drag above (`gThrowHold`).
+    feeder.Hold(TB_THROW, captured && gameKeys && gThrowHold);
+    // ---- THE HANDS, AS THE FRAME SEES THEM (dual wielding) ----------------
+    //
+    // `handsUp`: the melee tool is up and magic is off, so LMB and RMB belong
+    // to the hands. What each hand HOLDS is the kit's HandR/HandL — the tick
+    // reads the same slots itself (session.h HandsNow); these copies are for
+    // the frame's own questions: which button a vessel is on, where its pour
+    // marker goes, what the HUD says.
+    const bool handsUp = ui.tool == UIState::kToolMelee && !ui.magicMode;
+    auto handDef = [&](Hand h) -> const ItemDef* {
+      const ItemDef* d = items.Of(kit.equip.InHand(h));
+      return d && EquipSlotAccepts(EquipSlotOfHand(h), d->kind) ? d : nullptr;
+    };
+    auto handVessel = [&](Hand h) {
+      const ItemDef* d = handDef(h);
+      return handsUp && d && d->IsContainer();
+    };
+    // THE VESSEL THE FRAME TALKS ABOUT: the one whose button is down, else
+    // the last-used hand's, else the only one (the tick's own rule).
+    const int vesselHand = [&] {
+      const bool r = handVessel(Hand::Right), l = handVessel(Hand::Left);
+      if (r && mouseL) return 0;
+      if (l && mouseR) return 1;
+      if (r && l) return HandIndex(session.lastHand);
+      return r ? 0 : l ? 1 : -1;
     }();
+    // F WITH A VESSEL IN HAND cycles THAT HAND'S MODE: pour -> scoop ->
+    // apply (sim/tickinput.h TB_SCOOP/TB_APPLY and their _L twins). The
+    // hand's own button then does it — LMB for a right-hand flask, RMB for a
+    // left — so one button per vessel carries all three uses and the other
+    // fist stays free to swing. Holding two vessels, F cycles the one in
+    // the hand last used. While a vessel is in hand, F is this and not the
+    // dev laser.
+    static const char* const kVesselModeName[3] = {"pour", "scoop", "apply"};
     {
       static bool fPrev = false;
       const bool fDown = captured && gameKeys &&
                          glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS;
-      if (vesselInHand && fDown && !fPrev) {
-        ui.vesselApply = !ui.vesselApply;
-        ui.kitMessage = ui.vesselApply ? "apply mode: LMB puts it on whoever you aim at"
-                                       : "pour mode";
+      if (vesselHand >= 0 && fDown && !fPrev) {
+        int& m = ui.vesselMode[vesselHand];
+        m = (m + 1) % 3;
+        const char* btn = vesselHand == 0 ? "LMB" : "RMB";
+        static const char* const kWhat[3] = {"pours it out", "scoops loose matter in",
+                                             "puts it on whoever you aim at"};
+        ui.kitMessage = std::string(HandName(HandAt(vesselHand))) + " hand " +
+                        kVesselModeName[m] + ": " + btn + " " + kWhat[m];
         ui.kitMessageAge = 0.0f;
       }
       fPrev = fDown;
     }
-    ui.applyShown = vesselInHand && ui.vesselApply;
-    feeder.Hold(TB_APPLY, ui.applyShown);
+    for (int hk = 0; hk < kHands; hk++)
+      ui.vesselModeShown[hk] = handVessel(HandAt(hk)) ? ui.vesselMode[hk] : -1;
+    ui.lastHand = HandIndex(session.lastHand);
+    ui.applyShown = vesselHand >= 0 && ui.vesselMode[vesselHand] == 2;
+    feeder.Hold(TB_SCOOP, handVessel(Hand::Right) && ui.vesselMode[0] == 1);
+    feeder.Hold(TB_APPLY, handVessel(Hand::Right) && ui.vesselMode[0] == 2);
+    feeder.Hold(TB_SCOOP_L, handVessel(Hand::Left) && ui.vesselMode[1] == 1);
+    feeder.Hold(TB_APPLY_L, handVessel(Hand::Left) && ui.vesselMode[1] == 2);
     feeder.Hold(TB_LASER,
                 captured && ui.devControls &&
-                    ((!vesselInHand && glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS) ||
+                    ((vesselHand < 0 && glfwGetKey(window, GLFW_KEY_F) == GLFW_PRESS) ||
                      (ui.tool == UIState::kToolLaser && mouseL)));
     // The RENDER layer draws the beam sprites and has no TickInput (it runs on
     // frames the tick loop did not). It reads the same bit off the pending
@@ -10695,30 +10766,31 @@ int main(int argc, char** argv) {
     // hotbar slot filled it.
     for (const Mob::LostGear& lg : avatar.LostGearEvents()) {
       if (lg.held) {
-        // The slot the hand was FILLED FROM when the ticks ran, not the one
-        // selected now: the number row below changes `hotbar.selected` after
-        // `heldItem` is read, so by the frame this event is seen the
-        // selection may already point at another slot -- and clearing THAT
-        // one (or nothing, on a name mismatch) left the knocked weapon both
-        // on the ground and still in its slot.
-        const int from = heldItemSlot >= 0 ? heldItemSlot : hotbar.selected;
-        ItemStack& sh = hotbar.slots[std::clamp(from, 0, kItemSlots - 1)];
-        if (!sh.Empty() && sh.name == lg.item) sh = ItemStack{};
-        ui.kitMessage = "your " + lg.item + " was knocked from your hand";
+        // THE KIT ALREADY KNOWS (dual wielding): the hand is a kit slot, and
+        // Mob::ShedGearBeforeDetach emptied it at the instant the item left
+        // the fist — the rig owns the kit it is dressed from. All that is
+        // left for the frame is to say which hand.
+        ui.kitMessage = "your " + lg.item + " was knocked from your " +
+                        HandName(lg.hand) + " hand";
       } else {
         ui.kitMessage = "your " + lg.item + " was cut loose";
       }
       ui.kitMessageAge = 0.0f;
     }
     avatar.ClearLostGear();
+    // THE WEAPON THE HUD TALKS ABOUT: the last-used hand's, else the other's.
+    // The tick decides what actually swings (session.h HandsNow); this is the
+    // frame's readout of the same kit slots.
     const ItemDef* heldItem = [&]() -> const ItemDef* {
-      if (ui.tool != UIState::kToolMelee || ui.magicMode) return nullptr;
-      const ItemDef* d = items.Of(hotbar.Selected());
-      return d && d->kind == ItemKind::Melee ? d : nullptr;
+      if (!handsUp) return nullptr;
+      const Hand first = session.lastHand;
+      for (Hand h : {first, OtherHand(first)}) {
+        const ItemDef* d = handDef(h);
+        if (d && d->kind == ItemKind::Melee) return d;
+      }
+      return nullptr;
     }();
-    heldItemSlot = heldItem ? hotbar.selected : -1;
-    const bool meleeArmed = ui.tool == UIState::kToolMelee && !ui.magicMode &&
-                            heldItem && heldItem->kind == ItemKind::Melee;
+    const bool meleeArmed = handsUp && heldItem != nullptr;
     // ---- ...AND WITH NOTHING IN YOUR HANDS (plan §6) -----------------------
     //
     // "The melee tool is up, nothing is drawn, and this body can punch." The
@@ -10737,11 +10809,7 @@ int main(int argc, char** argv) {
     // selected in the hotbar, the hands hold THAT: RMB scoops, LMB pours, and
     // the unarmed compass below stays off -- a fist round a flask does not
     // punch.
-    const int vesselSlot = [&] {
-      if (ui.tool != UIState::kToolMelee || ui.magicMode || heldItem) return -1;
-      const ItemDef* d = items.Of(hotbar.Selected());
-      return d && d->IsContainer() ? hotbar.selected : -1;
-    }();
+    // (THE VESSEL is `vesselHand` above: a kit hand slot, not a hotbar one.)
     // WHERE A FILLED VESSEL POURS (game/container.h ContainerPourPoint): on
     // the crosshair ray from the RENDER eye. The tick pours at this one, cast
     // from LAST frame's eye (this frame's is set after the ticks); the marker
@@ -10749,8 +10817,8 @@ int main(int argc, char** argv) {
     // the crosshair exactly. The two differ by one frame of motion.
     bool pourAimValid = false;
     Vec3 pourAim{};
-    if (vesselSlot >= 0) {
-      const ItemStack& vs = hotbar.slots[vesselSlot];
+    if (vesselHand >= 0) {
+      const ItemStack& vs = kit.equip.InHand(HandAt(vesselHand));
       const ItemDef* vdef = items.Of(vs);
       if (vdef && vdef->IsContainer() && vs.Filled()) {
         static std::vector<uint64_t> own;
@@ -10765,8 +10833,9 @@ int main(int argc, char** argv) {
       }
     }
     const bool meleeUnarmed = [&] {
-      if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
-      if (vesselSlot >= 0) return false;
+      if (!handsUp) return false;
+      // A FIST needs an EMPTY hand: both holding something, no punch.
+      if (handDef(Hand::Right) && handDef(Hand::Left)) return false;
       if (heldItem != nullptr || !avatar.Spawned()) return false;
       const StyleLibrary& lib = mobs.AttackStyles();
       if (!lib.playerUnarmed.Usable()) return false;
@@ -10798,6 +10867,45 @@ int main(int argc, char** argv) {
       for (int i = 0; i < kItemSlots; i++) {
         int k = (i == 9) ? GLFW_KEY_0 : (GLFW_KEY_1 + i);
         if (captured && eGlyph[i].Pressed(key(k))) hotbar.Select(i);
+      }
+    }
+    // ---- Q / E: THE SELECTED HOTBAR STACK INTO THE LEFT / RIGHT HAND --------
+    //
+    // A kit move (Mob::KitMove), so it is a SWAP and nothing can be lost: the
+    // hand's old item goes into the hotbar slot the new one came out of. On
+    // an EMPTY hotbar slot the key puts the hand's item away into it. What a
+    // hand refuses (armour: it is worn, not held) says why, as a drag does.
+    // Frame-side like the number row and every other kit transaction: the
+    // tick reads the result from the kit (session.h HandsNow).
+    {
+      const bool qDown = captured && gameKeys && key(GLFW_KEY_Q);
+      const bool eDown = captured && gameKeys && key(GLFW_KEY_E);
+      const bool qPress = eQ.Pressed(qDown), ePress = eE.Pressed(eDown);
+      for (int pass = 0; pass < 2; pass++) {
+        const bool press = pass == 0 ? ePress : qPress;
+        if (!press) continue;
+        const Hand h = pass == 0 ? Hand::Right : Hand::Left;
+        const KitRef hot{KitSpace::Hotbar, hotbar.selected};
+        const KitRef hand{KitSpace::Equip, EquipSlotOfHand(h)};
+        const bool hotEmpty = hotbar.Selected().Empty();
+        const bool handEmpty = kit.equip.InHand(h).Empty();
+        std::string msg;
+        if (hotEmpty && handEmpty) {
+          msg = std::string("nothing to put in your ") + HandName(h) + " hand";
+        } else {
+          const std::string what =
+              hotEmpty ? kit.equip.InHand(h).name : hotbar.Selected().name;
+          const MoveResult r = hotEmpty ? avatar.KitMove(hand, hot, items)
+                                        : avatar.KitMove(hot, hand, items);
+          if (r == MoveResult::Ok)
+            msg = hotEmpty ? "you put away the " + what
+                           : what + " in your " + HandName(h) + " hand";
+          else
+            msg = MoveResultText(r, hand);
+          if (r == MoveResult::Ok && !hotEmpty) session.lastHand = h;
+        }
+        ui.kitMessage = msg;
+        ui.kitMessageAge = 0.0f;
       }
     }
     feeder.SetSelection(ui.tool, hotbar.selected);
@@ -11034,8 +11142,7 @@ int main(int argc, char** argv) {
       }
 
       TickAuthority(tickCtx, session,
-                    FrameIntent{brushActive, meleeArmed, meleeReady, heldItem,
-                                vesselSlot, pourAimValid, pourAim,
+                    FrameIntent{brushActive, handsUp, pourAimValid, pourAim,
                                 ui.pourRadius, pourFromValid, pourFrom},
                     ti, tick, opBatch);
 
@@ -12862,8 +12969,9 @@ int main(int argc, char** argv) {
                                       0.0f, 1.0f)
                          : 0.0f;
             u.tip = ContainerFillText(*d, st, mats) +
-                    "\nhands up (melee tool), selected in the hotbar:"
-                    "\nRMB scoops, LMB pours where you look"
+                    "\nQ / E puts it in your left / right hand;"
+                    "\nthat hand's button (RMB / LMB) uses it,"
+                    "\nF cycles pour / scoop / apply, hold G throws"
                     "\ncharacter screen: click it under FLASKS, then"
                     "\nhold LMB on the portrait to pour it on yourself";
           }
@@ -12874,6 +12982,15 @@ int main(int argc, char** argv) {
         ui.hotbarSlots.clear();
         for (int i = 0; i < kItemSlots; i++)
           ui.hotbarSlots.push_back(mirror(hotbar.slots[i]));
+        // ...and THE TWO HANDS, which the HUD draws beside the strip (dual
+        // wielding): the equipment mirror below is only rebuilt with the
+        // screen open, so the hand entries are refreshed here every frame.
+        if ((int)ui.equipSlots.size() != kEquipSlotCount)
+          ui.equipSlots.assign(kEquipSlotCount, UIState::KitSlotUI{});
+        for (int hk = 0; hk < kHands; hk++) {
+          const int hs = EquipSlotOfHand(HandAt(hk));
+          ui.equipSlots[hs] = mirror(kit.equip.slots[hs], hs);
+        }
         // EVERYTHING BELOW IS THE CHARACTER SCREEN'S, and only it reads these
         // (inventory_ui.cpp, spellgraph_ui.cpp). Shut, they are left as they
         // were and rebuilt on the first frame it is open again — the open key
@@ -13800,7 +13917,9 @@ int main(int argc, char** argv) {
       // `pourAimValid` was decided BEFORE the ticks, and a tick can empty the
       // slot since (a throw, a pour to the last drop), so re-read it here.
       const ItemStack* vsM =
-          pourAimValid ? &hotbar.slots[vesselSlot] : nullptr;
+          pourAimValid && vesselHand >= 0
+              ? &kit.equip.InHand(HandAt(vesselHand))
+              : nullptr;
       const ItemDef* vdefM = vsM ? items.Of(*vsM) : nullptr;
       // APPLY MODE (TB_APPLY): no stream, so no pour point. The marker sits
       // on the SKIN the brush would take -- the tick's own pick
@@ -13808,8 +13927,8 @@ int main(int argc, char** argv) {
       // eye -- and the HUD names whose it is.
       ui.applyTarget.clear();
       bool applyMarked = false;
-      if (ui.applyShown && vesselSlot >= 0) {
-        const ItemDef* adef = items.Of(hotbar.slots[vesselSlot]);
+      if (ui.applyShown && vesselHand >= 0) {
+        const ItemDef* adef = items.Of(kit.equip.InHand(HandAt(vesselHand)));
         if (adef && adef->IsContainer()) {
           static std::vector<uint64_t> ownA;
           ownA.clear();

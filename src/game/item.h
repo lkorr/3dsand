@@ -1,6 +1,7 @@
 #pragma once
 #include "sim/scale.h"  // MetresToCells
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -320,8 +321,17 @@ struct ItemDef {
   // glitch rather than the missing JSON key it is.
   std::map<std::string, ItemGrip> grip;
 
+  // THE LEFT HAND FALLS BACK TO THE RIGHT (dual wielding, 2026-09-27). Not a
+  // "missing key tolerated": an item's grip is where ITS OWN hilt sits and
+  // which way ITS blade leaves the fist, and that is the same whichever hand
+  // closes on it -- the hand's side is the socket's business, and the rig
+  // mirrors its own `held_right` socket onto the other hand
+  // (MobDef::MirrorHeldSockets). An item that genuinely sits differently in
+  // the left hand authors a `held_left` row and it wins.
   const ItemGrip* Grip(const char* context) const {
     auto it = grip.find(context);
+    if (it == grip.end() && std::strcmp(context, "held_left") == 0)
+      it = grip.find("held_right");
     return it == grip.end() ? nullptr : &it->second;
   }
 

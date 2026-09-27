@@ -879,6 +879,12 @@ struct UIState {
   std::vector<KitSlotUI> bagSlots;      // Bag::kSlots, row-major
   std::vector<KitSlotUI> hotbarSlots;   // kItemSlots
   std::vector<KitSlotUI> equipSlots;    // kEquipSlotCount
+  // THE TWO HANDS (dual wielding): which equipSlots entries they are
+  // (game/equipment.h EquipSlotOfHand; [0] right, [1] left), filled by
+  // main.cpp from the table so this layer names no EquipSlotId. And the
+  // hand last used, which the HUD frames: F cycles its vessel.
+  int handEquipSlot[2] = {-1, -1};
+  int lastHand = 0;
   // Per equipment slot, from the authored table in game/equipment.h. Mirrored
   // rather than re-declared here on purpose: the accepted-kinds table is where
   // future armour lands, and a second copy in the UI would be the thing that
@@ -1225,10 +1231,15 @@ struct UIState {
   // hand, -1 otherwise (game/container.h ContainerThrowCharge). Written by the
   // tick; the HUD draws the meter under the crosshair, shaking at full.
   float throwCharge = -1.0f;
-  // APPLY MODE (sim/tickinput.h TB_APPLY): F toggles it with a vessel in
-  // hand. `applyShown` = on AND a vessel is in hand this frame (the HUD tag);
-  // `applyTarget` names who LMB would brush right now, "" for nobody.
-  bool vesselApply = false;
+  // A HELD VESSEL'S MODE, PER HAND (dual wielding; sim/tickinput.h
+  // TB_SCOOP/TB_APPLY and their _L twins): 0 pour, 1 scoop, 2 apply. F
+  // cycles the vessel in the hand last used; the hand's own button (LMB
+  // right, RMB left) then does it. `vesselModeShown` is the mode of a vessel
+  // actually in that hand with the hands up this frame, -1 for none (the HUD
+  // hand slots). `applyShown` = the acting vessel is in apply mode (the HUD
+  // tag); `applyTarget` names who it would brush right now, "" for nobody.
+  int vesselMode[2] = {0, 0};
+  int vesselModeShown[2] = {-1, -1};
   bool applyShown = false;
   std::string applyTarget;
 

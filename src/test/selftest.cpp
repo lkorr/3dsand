@@ -407,6 +407,9 @@ const char* const kOrder[] = {
     // worn piece and swaps it with its identical twin. Spawns, resets and puts
     // the id counter back, beside `loot` for the same standing world.
     "kit-instance",
+    // Two hands (dual wielding): one fixture, reset and id counter restored on
+    // the way out, beside `kit-instance` for the same standing world.
+    "dual-wield",
     "armor-fit",
     // Pure anim over its own five-part fixture — it touches no shared World and
     // so is order-independent; it sits here to keep the armour gates together.

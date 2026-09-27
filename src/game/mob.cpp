@@ -379,6 +379,44 @@ struct ClipLibraryEntry {
   float worldLen = 1.0f;
 };
 
+// A clip reflected onto the other side of the body (see LoadClipLibrary's
+// mirror pass). False when the clip names no sided part: its mirror would be
+// itself.
+static bool MirrorClipDoc(const json& in, json& out) {
+  bool sided = false;
+  auto swapName = [&](const std::string& n) {
+    const std::string m = MirrorSideName(n);
+    if (m != n) sided = true;
+    return m;
+  };
+  out = in;
+  if (in.contains("mask") && in["mask"].is_array()) {
+    json mask = json::array();
+    for (const auto& nm : in["mask"])
+      mask.push_back(nm.is_string() ? json(swapName(nm.get<std::string>())) : nm);
+    out["mask"] = std::move(mask);
+  }
+  if (in.contains("tracks") && in["tracks"].is_object()) {
+    json tracks = json::object();
+    for (auto t = in["tracks"].begin(); t != in["tracks"].end(); ++t) {
+      json tr = t.value();
+      if (tr.contains("rot") && tr["rot"].is_array())
+        for (auto& k : tr["rot"])
+          if (k.contains("q") && k["q"].is_array() && k["q"].size() == 4) {
+            k["q"][1] = -k["q"][1].get<double>();
+            k["q"][2] = -k["q"][2].get<double>();
+          }
+      if (tr.contains("pos") && tr["pos"].is_array())
+        for (auto& k : tr["pos"])
+          if (k.contains("v") && k["v"].is_array() && k["v"].size() == 3)
+            k["v"][0] = -k["v"][0].get<double>();
+      tracks[swapName(t.key())] = std::move(tr);
+    }
+    out["tracks"] = std::move(tracks);
+  }
+  return sided;
+}
+
 static std::vector<ClipLibraryEntry> LoadClipLibrary(const std::string& dir,
                                                      std::string& log) {
   std::vector<ClipLibraryEntry> lib;
@@ -418,6 +456,29 @@ static std::vector<ClipLibraryEntry> LoadClipLibrary(const std::string& dir,
         log += p + ": duplicate library clip \"" + le.name + "\" (also " +
                o.path + ") — last wins\n";
     lib.push_back(std::move(le));
+  }
+  // ---- THE OTHER ARM'S COPY OF EVERY SIDED CLIP (dual wielding) -----------
+  //
+  // `pour`, `throw`, `throw_windup` are authored on the right arm, because
+  // that was the only arm that held anything. A left-hand flask needs the
+  // same motion on the other side, and a hand-authored copy is a second file
+  // that drifts from the first the day either is tuned — so it is DERIVED,
+  // here, as `<name>.mirror`: every .R/.L part name swapped, every rotation
+  // reflected through the sagittal plane as (x, -y, -z, w) and every position
+  // key as (-x, y, z) — the same reflection a mirrored stroke's keyed pose
+  // takes (strokes.h MirrorWeaponPose). A clip with no sided part (a jump, a
+  // bite) gets no mirror, and nothing asks for one (Mob::MirrorClip).
+  const size_t authored = lib.size();
+  for (size_t i = 0; i < authored; i++) {
+    json m;
+    if (!MirrorClipDoc(lib[i].doc, m)) continue;
+    ClipLibraryEntry me;
+    me.name = lib[i].name + ".mirror";
+    me.path = lib[i].path + " (mirrored)";
+    me.worldLen = lib[i].worldLen;
+    m["name"] = me.name;
+    me.doc = std::move(m);
+    lib.push_back(std::move(me));
   }
   return lib;
 }
@@ -704,6 +765,42 @@ struct MobDefFactory {
   std::vector<ClipLibraryEntry> clipLib;  // assets/anims, compiled per rig
   std::vector<MobSource> sources;         // which art each name wears
 };
+
+// THE LEFT HAND'S GRIP, DERIVED (dual wielding, 2026-09-27).
+//
+// Every rig in the repo authors ONE held socket, `held_right` on hand.R, and
+// thirty-odd generated characters inherit it. A left-hand socket authored by
+// hand would be thirty edits that drift the day someone moves the right one,
+// so it is DERIVED instead: the right socket's offset reflected through the
+// body's sagittal plane about the two hands' own joints, onto the part whose
+// name is the right hand's with its side swapped. The rigs are built mirror
+// images (.R limbs at low model x, .L at high), and a reflection through the
+// plane x = const maps a point p on the right hand to
+//   anchorL + M(p - anchorR),   M = diag(-1, 1, 1),
+// which is exact for a symmetric rig and the only sensible guess for one
+// that is not. The frame's rotation reflects as (x, -y, -z, w) -- the
+// quaternion of M R M. An authored `held_left` always wins.
+static void MirrorHeldSockets(MobDef& def, const AnimSkeleton& sk) {
+  if (def.FindSocket("held_left") >= 0) return;
+  const int ri = def.FindSocket("held_right");
+  if (ri < 0) return;
+  const MobSocketDef right = def.sockets[(size_t)ri];
+  const std::string leftPart = MirrorSideName(right.part);
+  if (leftPart == right.part) return;          // not a sided part: no mirror
+  const int li = sk.FindPart(leftPart);
+  if (li < 0 || right.partIndex < 0) return;   // one-armed rig: nothing to hold with
+  const Vec3 aR = sk.parts[(size_t)right.partIndex].anchorLocal;
+  const Vec3 aL = sk.parts[(size_t)li].anchorLocal;
+  const Vec3 d = right.offset - aR;
+  MobSocketDef left;
+  left.name = "held_left";
+  left.part = leftPart;
+  left.partIndex = li;
+  left.offset = aL + Vec3{-d.x, d.y, d.z};
+  left.rotation = Quat{right.rotation.x, -right.rotation.y, -right.rotation.z,
+                       right.rotation.w};
+  def.sockets.push_back(std::move(left));
+}
 
 bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
                  MicroBodySet& micro, MobDef& defOut, std::string& log) {
@@ -1620,6 +1717,7 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
                                           s["rotation"][2].get<float>()});
         def.sockets.push_back(std::move(sd));
       }
+      MirrorHeldSockets(def, sk);
     }
 
     // ---- NATURAL WEAPONS: the parts that ARE weapons (mob.h; plan §3) ----
@@ -2829,6 +2927,7 @@ bool MobSystem::ServiceRising(size_t ri) {
     std::string item;
     int equipSlot = -1;
     bool held = false;
+    Hand hand = Hand::Right;
     uint32_t dye = 0;
     WornDamage damage;
   };
@@ -2846,11 +2945,16 @@ bool MobSystem::ServiceRising(size_t ri) {
     src->CaptureWorn(p.equipSlot, g.damage);
     gear.push_back(std::move(g));
   }
-  if (src->heldSlot_ >= 0 && src->heldSlot_ < (int)src->limbs_.size() &&
-      src->limbs_[src->heldSlot_].body && !src->heldItem_.empty()) {
+  // Both fists: what rises holds what fell, in the hand it fell holding it.
+  for (int hk = 0; hk < kHands; hk++) {
+    const Mob::HeldHand& hh = src->held_[hk];
+    if (hh.slot < 0 || hh.slot >= (int)src->limbs_.size() ||
+        !src->limbs_[hh.slot].body || hh.item.empty())
+      continue;
     RiseGear g;
-    g.item = src->heldItem_;
+    g.item = hh.item;
     g.held = true;
+    g.hand = HandAt(hk);
     gear.push_back(std::move(g));
   }
   // ---- AND ITS PACK --------------------------------------------------------
@@ -3055,7 +3159,7 @@ bool MobSystem::ServiceRising(size_t ri) {
         items_ != nullptr ? items_->At(items_->Find(g.item)) : nullptr;
     if (item == nullptr) continue;   // retired item: it rises without it
     const bool ok =
-        g.held ? now.EquipItem(item)
+        g.held ? now.EquipItem(item, g.hand)
                : now.WearItem(item, g.equipSlot,
                               g.damage.Empty() ? nullptr : &g.damage, g.dye);
     if (ok) dressed++;
@@ -3207,8 +3311,10 @@ uint64_t MobSystem::AdoptDeadAvatar(Mob& av) {
   av.limbDefs_ = corpse.limbDefs_;
   av.hidden_ = std::vector<uint8_t>(nLimbs, 0);
   av.worn_ = corpse.worn_;
-  av.heldItem_ = corpse.heldItem_;
-  av.heldPart_ = corpse.heldPart_;
+  for (int hk = 0; hk < kHands; hk++) {
+    av.held_[hk].item = corpse.held_[hk].item;
+    av.held_[hk].part = corpse.held_[hk].part;
+  }
   av.getUpFrom_.clear();
   av.MarkInstancesDirty();
 
@@ -4028,10 +4134,8 @@ bool Mob::BuildRig(const MobDef& def, Vec3 origin) {
   skel_ = def.skel;
   limbDefs_ = def.limbs;
   hidden_.assign(def.limbs.size(), 0);
-  heldSlot_ = -1;
-  heldItem_.clear();
-  heldPartIndex_ = -1;
-  heldPart_.clear();
+  for (HeldHand& hh : held_) hh.Clear();
+  offArm_ = OffArmRelease{};
   // Same rule as the weapon, and for the same reason: a respawn must not
   // inherit the last life's coat. The armour itself is not lost — it lives in
   // the wearer's Kit (kit_), which a rig rebuild does not touch — but the
@@ -4588,7 +4692,7 @@ bool Mob::PosedCoreLowY(Quat bodyRot, Vec3 planeDir, float& outLowY,
     if (!limb.body) continue;                  // severed or never spawned
     if (limb.holdSeconds > 0) continue;        // a piece coming off, not us
     if (limb.wornHost >= 0) continue;          // a garment follows its host
-    if ((int)i == heldSlot_) continue;         // a dangling sword is not ground
+    if (IsHeldSlot((int)i)) continue;          // a dangling sword is not ground
     if (i < anim_.partAlive.size() && !anim_.partAlive[i]) continue;
     if (anyChain && inChain[i]) continue;
     if (limb.size.x <= 0 || limb.size.y <= 0 || limb.size.z <= 0) continue;
@@ -4762,7 +4866,7 @@ bool Mob::SettleClipOwnedBody(World& world, const AnimStateRule* rule, float dt,
     for (size_t i = 0; i < np; i++) {
       const MobLimb& limb = limbs_[i];
       if (!limb.body || limb.holdSeconds > 0 || limb.wornHost >= 0 ||
-          (int)i == heldSlot_)
+          IsHeldSlot((int)i))
         continue;
       if (i < anim_.partAlive.size() && !anim_.partAlive[i]) continue;
       const float inv = 1.0f / (float)PhysScaleOf(limb);
@@ -5001,7 +5105,7 @@ void Mob::ConformProneSegments(World& world, float dt) {
     const int parent = skel_.parts[i].parent;
     bool eligible = parent >= 0 && (int)i != def_->rootLimb && limb.body &&
                     limb.holdSeconds <= 0 && limb.wornHost < 0 &&
-                    (int)i != heldSlot_ &&
+                    !IsHeldSlot((int)i) &&
                     !(i < anim_.partAlive.size() && !anim_.partAlive[i]) &&
                     limb.size.x > 0 && limb.size.y > 0 && limb.size.z > 0;
     const Vec3 jointM = anim_.model[i].pos;
@@ -5487,13 +5591,34 @@ int MobSystem::PickTargetLimb(const AttackStyle& sty, const Mob& victim,
 // rule instead of an authored mode field, and it means a creature whose rig
 // later grows a neck chain starts biting through the IK with no content edit.
 bool Mob::ArmForStyle(const AttackStyle& sty) {
+  const StyleSide side = StyleSideOf(sty);
+  return ArmForStyle(sty, side == StyleSide::Left    ? Hand::Left
+                          : side == StyleSide::Right ? Hand::Right
+                                                     : strikeHand_);
+}
+
+bool Mob::ArmForStyle(const AttackStyle& sty, Hand hand) {
   if (sty.weapon.empty() || sty.weapon == "held") {
     ClearStrikeEffector();     // falls through to the held item
-    return HeldSlot() >= 0;
+    // THIS hand's item, and only if this hand can hold it: a stroke asked of
+    // an empty fist, or of an arm whose chain is broken, does not begin.
+    if (HeldSlot(hand) < 0 || !HandUsable(hand)) return false;
+    strikeHand_ = hand;
+    return true;
   }
-  const MobNaturalWeaponDef* nw = NaturalWeaponNamed(sty.weapon);
+  // A SIDED natural weapon is taken on the asked hand: the style authored on
+  // `fist.R` swung with the left names `fist.L` (its stroke is mirrored by
+  // the runner). A weapon with no side — jaws — is itself whatever `hand`
+  // says, and does not move the strike hand.
+  const StyleSide side = StyleSideOf(sty);
+  const std::string name = side != StyleSide::None &&
+                                   side != StyleSideOfHand(hand)
+                               ? MirrorSideName(sty.weapon)
+                               : sty.weapon;
+  const MobNaturalWeaponDef* nw = NaturalWeaponNamed(name);
   if (nw == nullptr || !NaturalWeaponUsable(*nw)) return false;
-  const int idx = def_ != nullptr ? def_->FindNatural(sty.weapon) : -1;
+  if (side != StyleSide::None) strikeHand_ = hand;
+  const int idx = def_ != nullptr ? def_->FindNatural(name) : -1;
   int handPart = -1;
   const bool chained =
       ChainForEffector(skel_, nw->partIndex, handPart) != nullptr;
@@ -5502,6 +5627,93 @@ bool Mob::ArmForStyle(const AttackStyle& sty) {
                             : StrikeEffectorMode::Aim,
                     idx);
   return true;
+}
+
+std::string Mob::MirrorClip(const std::string& clip) const {
+  // An AUTHORED mirror first (punch_r <-> punch_l: somebody drew it), else
+  // the library's derived one (LoadClipLibrary), else nothing — a clip with
+  // no sided part has no mirror, and playing the original on the wrong side
+  // would be worse than playing none.
+  const std::string named = MirroredClipName(clip);
+  if (named != clip && skel_.FindClip(named) >= 0) return named;
+  const std::string derived = clip + ".mirror";
+  if (skel_.FindClip(derived) >= 0) return derived;
+  return std::string();
+}
+
+std::string Mob::HandClip(const std::string& clip, Hand h) const {
+  return h == Hand::Left ? MirrorClip(clip) : clip;
+}
+
+std::string Mob::StrokeClip(const AttackStyle& sty, bool mirrored) const {
+  if (sty.clip.empty()) return std::string();
+  return mirrored ? MirrorClip(sty.clip) : sty.clip;
+}
+
+int Mob::GripFails(float dropBelow) {
+  if (dropBelow <= 0.0f || !alive_ || def_ == nullptr) return 0;
+  int fell = 0;
+  for (int hk = 0; hk < kHands; hk++) {
+    const int slot = held_[hk].slot;
+    if (slot < 0 || (size_t)slot >= limbs_.size() || !limbs_[slot].body)
+      continue;
+    // A SEVERED arm is already handled (the item left with the limb); this is
+    // the arm that is still there and too hurt to grip.
+    const float c = HandCondition(HandAt(hk));
+    if (c <= 0.0f || c >= dropBelow) continue;
+    DetachLimb(slot, /*adopt=*/true);
+    fell++;
+  }
+  return fell;
+}
+
+Hand Mob::StrokeHandFor(const AttackStyle& sty, uint32_t tick) const {
+  const StyleSide side = StyleSideOf(sty);
+  if (!(sty.weapon.empty() || sty.weapon == "held"))
+    return side == StyleSide::Left ? Hand::Left
+           : side == StyleSide::Right ? Hand::Right
+                                      : strikeHand_;
+  const bool r = HeldSlot(Hand::Right) >= 0 && HandUsable(Hand::Right);
+  const bool l = HeldSlot(Hand::Left) >= 0 && HandUsable(Hand::Left);
+  if (r && l)
+    return (rng::Hash3((uint32_t)id_, tick, 0x4A4Du) & 1u) ? Hand::Left
+                                                          : Hand::Right;
+  if (l) return Hand::Left;
+  return Hand::Right;
+}
+
+// ---- THE ARM BEHIND A HAND (dual wielding) ----------------------------------
+int Mob::HandPart(Hand h) const {
+  if (def_ == nullptr) return -1;
+  const int si = def_->FindSocket(HandContext(h));
+  if (si < 0) return -1;
+  return def_->sockets[(size_t)si].partIndex;
+}
+
+float Mob::HandCondition(Hand h) const {
+  const int hand = HandPart(h);
+  if (hand < 0 || (size_t)hand >= limbs_.size()) return 0.0f;
+  // The parts that serve the hand: the arm chain ending at it (upper arm,
+  // forearm) and the hand. The same chain resolution the weapon arm uses, so
+  // "the arm that swings" and "the arm that is hurt" can never be two arms.
+  int parts[4] = {hand, -1, -1, -1};
+  int n = 1;
+  int effHand = -1;
+  if (const IkChain* ch = ChainForEffector(skel_, hand, effHand))
+    for (int p : ch->parts)
+      if (n < 4 && p != hand) parts[n++] = p;
+  float worst = 1.0f;
+  for (int k = 0; k < n; k++) {
+    const int p = parts[k];
+    if (p < 0 || (size_t)p >= limbs_.size() || (size_t)p >= limbDefs_.size())
+      return 0.0f;
+    if (!LimbAlive(p)) return 0.0f;           // severed, burnt away, dead
+    const float full = (float)limbDefs_[(size_t)p].hp;
+    if (full <= 0.0f) continue;               // authored with no hp: no say
+    worst = std::min(worst, std::clamp((float)limbs_[(size_t)p].hp / full,
+                                       0.0f, 1.0f));
+  }
+  return worst;
 }
 
 void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
@@ -5626,7 +5838,7 @@ void MobSystem::BeginStroke(Mob& mob, const ai::AttackRequest& req,
                   req.distance, styleReach, slack);
     return;   // not a content error: this style is simply the wrong one now
   }
-  if (!mob.ArmForStyle(sty)) {
+  if (!mob.ArmForStyle(sty, mob.StrokeHandFor(sty, tick))) {
     ReportNoStroke(mob, pr, 3, sty.weapon.c_str());
     return;
   }
@@ -5702,11 +5914,23 @@ void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
   // off it, so the whole stroke — its style, its start bow, its tempo —
   // replays from the same (mob, tick) and nothing reads a clock. A caller that
   // needs the SAME swing in any scope passes its own (mob.h ForceAttack).
+  // WHICH ARM (dual wielding): the one ArmForStyle just armed. Swung with the
+  // other side from its author's, the program runs mirrored (strokes.h "THE
+  // LEFT HAND IS THE RIGHT, MIRRORED") and the driver lives in the authored
+  // side's frame, so its hand sign is the authored one.
+  st.hand = mob.StrikeHand();
+  st.mirrored = StrokeMirrored(sty, st.hand);
+  // AN INJURED ARM SWINGS SLOWER (melee.injuredArmSlow): a sided stroke is
+  // thrown by that arm, whatever is in it.
+  float slow = 1.0f;
+  if (StyleSideOf(sty) != StyleSide::None)
+    slow = InjuredArmSlow(mob.HandCondition(st.hand));
   BeginStrokeProgram(st, sty, styleIndex,
                      seed != 0 ? seed
-                               : rng::Hash3((uint32_t)mob.id_, tick, 0x5747u));
+                               : rng::Hash3((uint32_t)mob.id_, tick, 0x5747u),
+                     1.0f, slow);
   st.melee.Reset();
-  st.melee.SetHandSign(mob.HandSign());
+  st.melee.SetHandSign(st.mirrored ? 1.0f : mob.HandSign());
   // THE NPC'S BLADE OBEYS THE SAME SLIDERS AS THE PLAYER'S. Applied at every
   // stroke start rather than held once, because tuning.json hot-reloads on F5
   // and a MeleeTuning is a COPY (see selftest_combat.cpp's header): without
@@ -5721,12 +5945,14 @@ void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
   // The style's body animation, if it names one (strokes.h AttackStyle::clip).
   // Same clip layer as a flinch or a jump; the arm claim still wins on the
   // weapon arm, so the clip is the rest of the body joining the swing.
-  if (!sty.clip.empty()) mob.PlayClip(sty.clip);
+  // Mirrored, it is the clip's own mirror or nothing (MirroredClipName).
+  if (const std::string clip = mob.StrokeClip(sty, st.mirrored); !clip.empty())
+    mob.PlayClip(clip);
 }
 
 bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
                             Vec3 targetPoint, uint32_t tick, uint32_t seed,
-                            uint64_t targetId) {
+                            uint64_t targetId, int hand) {
   Mob* m = FindMobById(mobId);
   if (m == nullptr) return false;
   const int si = styles_.Find(style);
@@ -5740,7 +5966,8 @@ bool MobSystem::ForceAttack(uint64_t mobId, const std::string& style,
   // the effector generalisation must never let happen. A gate that forces a
   // punch on a handless body gets `false`, which is an answer it can assert on.
   if (!StyleUsable(*m, sty)) return false;
-  if (!m->ArmForStyle(sty)) return false;
+  const Hand h = hand < 0 ? m->StrokeHandFor(sty, tick) : HandAt(hand);
+  if (!m->ArmForStyle(sty, h)) return false;
   // ...AND THEN THE SAME DOOR (MobSystem::StartStroke). A scripted swing that
   // skipped the limb draw and the clip was a different move from the AI's, and
   // a harness that photographs a different move is worse than no harness.
@@ -6193,6 +6420,10 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
 
   Vec3 right, up, fwd;
   MobBasis(mob, right, up, fwd);
+  // A MIRRORED STROKE (the other arm from its author's) runs in the
+  // reflected basis, so every bearing below — the aim, the band, the
+  // driver's whole memory — is the authored stroke's (strokes.h).
+  if (st.mirrored) right = right * -1.0f;
 
   // ---- 1. THE SWEEP, from the blade's own two most recent world positions --
   Vec3 base, tip, flat;
@@ -6452,7 +6683,9 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   }
   // The style's per-joint brakes ride the pose to the rig (melee.h ArmSmooth).
   // ...with a KEYED style's joints and torso (strokes.h "A FRAME IS A POSE").
-  mob.SetWeaponPose(StrokePoseNow(st, sty, st.melee));
+  WeaponPose wp = StrokePoseNow(st, sty, st.melee);
+  if (st.mirrored) MirrorWeaponPose(wp);
+  mob.SetWeaponPose(wp);
 }
 
 // ---- THE AI'S WEAPON ARM, WHEN IT IS NOT ATTACKING (2026-09-27) ------------
@@ -7650,6 +7883,10 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       mob.SubmitPose(dt, /*writeXf=*/false);
     }
 
+    // ---- a hand too hurt to hold on (melee.injuredArmDrop) ----
+    // After the pose, so what falls leaves from where the fist is this tick.
+    mob.GripFails(CurrentTuning().melee.injuredArmDrop);
+
     // ---- bleeding (PLAN §B5): decaying wound budget, bounded ops ----
     mob.BleedTick(tick, world, ops, spawns, bleedOps);
     mi++;
@@ -7740,7 +7977,7 @@ void Mob::TickSeveredHolds(float dt) {
   for (int i = (int)limbs_.size() - 1; i >= baseLimbs_; i--) {
     const MobLimb& L = limbs_[i];
     if (L.body || L.holdBody) continue;
-    if (i == heldSlot_ || WornPieceOfSlot(i) >= 0) continue;
+    if (IsHeldSlot(i) || WornPieceOfSlot(i) >= 0) continue;
     RemoveAppendedSlots(i, 1);
   }
 }
@@ -7823,7 +8060,7 @@ Physics::BodyRole Mob::LimbRole(size_t i) const {
   const bool limp = ragdoll_ == RagdollPhase::Limp;
   // A weapon is CARRIED only while a living hand is posing it; under a
   // ragdoll it is solved for like every other limb and needs the floor.
-  if ((int)i == heldSlot_ && !limp) return R::HeldProp;
+  if (IsHeldSlot((int)i) && !limp) return R::HeldProp;
   // An NPC's limp limbs are solver-owned bodies that may be lying inside the
   // player (a blast at sword's reach): loose, so they clear first. The
   // avatar's own stay its own — exempt from its capsule, limp or not.
@@ -7900,18 +8137,35 @@ ItemInstance Mob::ShedGearBeforeDetach(int limbIndex) {
   // cleared NOW rather than by a later EquipItem, so an NPC's swing driver
   // sees no blade and the player's re-equip seam does not pull a second sword
   // out of the sheath while the first is lying on the floor.
-  if (limbIndex == heldSlot_ && !heldItem_.empty()) {
+  // EITHER FIST: the LostGear names which, so the driver clears the kit's
+  // hand slot the item actually came out of (session.cpp / main.cpp).
+  Hand lostHand = Hand::Right;
+  if (IsHeldSlot(limbIndex, &lostHand) &&
+      !held_[HandIndex(lostHand)].item.empty()) {
+    HeldHand& hh = held_[HandIndex(lostHand)];
     LostGear lg;
-    lg.item = heldItem_;
+    lg.item = hh.item;
     lg.held = true;
-    shed.name = heldItem_;
+    lg.hand = lostHand;
+    shed.name = hh.item;
     if (limbIndex >= 0 && limbIndex < (int)limbs_.size())
       shed.dye = limbs_[limbIndex].dye;
+    // ...AND THE KIT'S HAND SLOT GIVES IT UP (dual wielding). The hand is a
+    // kit slot now (EquipSlotId::HandR/HandL), and the player's rig is
+    // dressed FROM it every tick: left holding the name, the next tick
+    // would put a second sword in the fist while the first lies on the
+    // floor. One of the stack leaves — the one that was in the fist, with
+    // its own fill (a thrown-open flask spills what it held with it).
+    {
+      ItemStack& ks = kit_.equip.InHand(lostHand);
+      if (!ks.Empty() && ks.name == hh.item) {
+        shed.fillMat = ks.fillMat;
+        shed.fillAmt = ks.fillAmt;
+        if (--ks.count <= 0) ks = ItemStack{};
+      }
+    }
     report(std::move(lg));
-    heldSlot_ = -1;
-    heldPartIndex_ = -1;
-    heldItem_.clear();
-    heldPart_.clear();
+    hh.Clear();
     return shed;
   }
   if (!IsWornSlot(limbIndex)) return shed;
@@ -8225,9 +8479,12 @@ void Mob::SubmitPose(float dt, bool writeXf) {
   // that point of the hand" (see the long note in game/avatar.h history and
   // EquipItem below). Shared here so a mob wielding a sword places it exactly
   // as the player does.
-  if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size()) {
-    MobLimb& item = limbs_[heldSlot_];
-    const int handIdx = skel_.parts[heldSlot_].parent;
+  // Both fists, by the one expression (dual wielding).
+  for (const HeldHand& hh : held_) {
+    const int heldSlot = hh.slot;
+    if (heldSlot < 0 || heldSlot >= (int)limbs_.size()) continue;
+    MobLimb& item = limbs_[heldSlot];
+    const int handIdx = skel_.parts[heldSlot].parent;
     if (item.body && item.holdSeconds <= 0 && handIdx >= 0 &&
         handIdx < (int)limbs_.size() && limbs_[handIdx].body) {
       const MobLimb& hand = limbs_[handIdx];
@@ -8236,15 +8493,15 @@ void Mob::SubmitPose(float dt, bool writeXf) {
       // The socket, in world space: a point in the hand's own frame, carried
       // by whatever pose the hand is in this tick.
       const Vec3 socketW =
-          hand.xf.pos + Rotate(handQ, skel_.parts[heldSlot_].rest.pos);
+          hand.xf.pos + Rotate(handQ, skel_.parts[heldSlot].rest.pos);
       // The item's orientation is the hand's, composed with the authored
       // grip rotation — the blade keeps its angle in the fist through a
       // swing instead of being re-aimed (melee.h's rule).
       const Quat itemQ =
-          QuatNormalize(Mul(handQ, skel_.parts[heldSlot_].rest.rot));
-      // Put the grip point on the socket. gripBody_ is already in the item's
+          QuatNormalize(Mul(handQ, skel_.parts[heldSlot].rest.rot));
+      // Put the grip point on the socket. gripBody is already in the item's
       // BODY frame, so this needs no corner or recentring correction.
-      const Vec3 pos = socketW - Rotate(itemQ, gripBody_);
+      const Vec3 pos = socketW - Rotate(itemQ, hh.gripBody);
       float q[4] = {itemQ.x, itemQ.y, itemQ.z, itemQ.w};
       phys_->MoveKinematicBody(item.body, pos, q, dt);
       if (writeXf) {
@@ -21446,11 +21703,16 @@ void Mob::LootPieces(std::vector<LootPiece>& out) const {
     CaptureWorn(p.equipSlot, piece.damage);
     out.push_back(std::move(piece));
   }
-  if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
-      limbs_[heldSlot_].body && !heldItem_.empty()) {
+  // Right fist then left: a one-handed corpse lists exactly what it did.
+  for (int hk = 0; hk < kHands; hk++) {
+    const HeldHand& hh = held_[hk];
+    if (hh.slot < 0 || hh.slot >= (int)limbs_.size() ||
+        !limbs_[hh.slot].body || hh.item.empty())
+      continue;
     LootPiece piece;
     piece.kind = LootPiece::Kind::Held;
-    piece.name = heldItem_;
+    piece.name = hh.item;
+    piece.hand = HandAt(hk);
     out.push_back(std::move(piece));
   }
   // The pack last, so the worn and held entries keep the indices the loot
@@ -21480,7 +21742,8 @@ bool Mob::TakeLootPiece(int index, LootPiece* out, int count) {
       if (!UnwearItem(piece.equipSlot)) return false;
       break;
     case LootPiece::Kind::Held:
-      EquipItem(nullptr);   // unequip: the borrowed slot leaves with the item
+      // unequip: the borrowed slot leaves with the item
+      EquipItem(nullptr, piece.hand);
       break;
     case LootPiece::Kind::Carried: {
       // The carried entries are the tail of the list, in pack order.
@@ -21510,7 +21773,7 @@ bool Mob::ShedLootPiece(int index, std::string* outItem) {
       if (worn_[pi].equipSlot == piece.equipSlot)
         slot = IdentityShellOf((int)pi);
   } else if (piece.kind == LootPiece::Kind::Held) {
-    slot = heldSlot_;
+    slot = HeldSlot(piece.hand);
   }
   // A CARRIED STACK HAS NO BODY TO CUT LOOSE (the caller drops it through the
   // bag's own drop path instead of this silently deleting it).
@@ -21536,10 +21799,10 @@ uint64_t Mob::LootPieceBody(int index) const {
   LootPieces(list);
   if (index >= (int)list.size()) return 0;
   const LootPiece& piece = list[(size_t)index];
-  if (piece.kind == LootPiece::Kind::Held)
-    return heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size()
-               ? limbs_[heldSlot_].body
-               : 0ull;
+  if (piece.kind == LootPiece::Kind::Held) {
+    const int hs = HeldSlot(piece.hand);
+    return hs >= 0 && hs < (int)limbs_.size() ? limbs_[hs].body : 0ull;
+  }
   if (piece.kind != LootPiece::Kind::Worn) return 0;
   for (size_t pi = 0; pi < worn_.size(); pi++) {
     if (worn_[pi].equipSlot != piece.equipSlot) continue;
@@ -22951,12 +23214,18 @@ void Mob::CaptureGear(std::vector<::net::WireGear>& out) const {
     CaptureWorn(p.equipSlot, g.damage);
     bySlot.emplace_back(idSlot, std::move(g));
   }
-  if (heldSlot_ >= 0 && heldSlot_ < (int)limbs_.size() &&
-      limbs_[heldSlot_].body && !heldItem_.empty()) {
+  // `held` carries the hand as 1 + index (1 = right, 2 = left), so a wire
+  // or save record written before dual wielding (always 1) still reads as
+  // the right fist and no format bump was needed (net/mobsync.h WireGear).
+  for (int hk = 0; hk < kHands; hk++) {
+    const HeldHand& hh = held_[hk];
+    if (hh.slot < 0 || hh.slot >= (int)limbs_.size() ||
+        !limbs_[hh.slot].body || hh.item.empty())
+      continue;
     ::net::WireGear g;
-    g.name = heldItem_;
-    g.held = 1;
-    bySlot.emplace_back(heldSlot_, std::move(g));
+    g.name = hh.item;
+    g.held = 1u + (uint32_t)hk;
+    bySlot.emplace_back(hh.slot, std::move(g));
   }
   std::stable_sort(bySlot.begin(), bySlot.end(),
                    [](const auto& a, const auto& b) { return a.first < b.first; });
@@ -24048,7 +24317,7 @@ void MobSystem::ApplyWireGear(Mob& m, const std::vector<::net::WireGear>& gear) 
     const ItemDef* item = items_->Of(g);
     if (item == nullptr) continue;   // retired item: it arrives without it
     if (g.held)
-      m.EquipItem(item);
+      m.EquipItem(item, g.held == 2u ? Hand::Left : Hand::Right);
     else
       m.WearItem(item, g.equipSlot, g.damage.Empty() ? nullptr : &g.damage,
                  g.dye);
@@ -24341,7 +24610,7 @@ uint64_t MobSystem::StateKey(uint64_t mobId) const {
     mix((uint64_t)(int64_t)p.equipSlot);
     mixStr(p.item);
   }
-  mixStr(m->heldItem_);
+  for (const Mob::HeldHand& hh : m->held_) mixStr(hh.item);
   const std::vector<ItemInstance> pack = m->Carried();
   mix(pack.size());
   for (const ItemInstance& c : pack) {
@@ -24407,7 +24676,8 @@ bool MobSystem::ApplyState(const ::net::MobState& st) {
     std::vector<int> slots;
     for (const Mob::WornPiece& p : m->worn_) slots.push_back(p.equipSlot);
     for (int es : slots) m->UnwearItem(es);
-    if (!m->heldItem_.empty()) m->EquipItem(nullptr);
+    for (int hk = 0; hk < kHands; hk++)
+      if (!m->held_[hk].item.empty()) m->EquipItem(nullptr, HandAt(hk));
     ApplyWireGear(*m, st.announce.gear);
     m = FindMobById(st.announce.id);   // dressing may re-enter this system
     if (m == nullptr) return false;
@@ -24441,9 +24711,10 @@ bool MobSystem::ApplyState(const ::net::MobState& st) {
 // (ItemDef::grip). Pass nullptr to unequip.
 // ============================================================================
 
-bool Mob::HeldMouthWorld(Vec3 dir, Vec3& out) {
-  if (heldSlot_ < 0 || heldSlot_ >= (int)limbs_.size()) return false;
-  MobLimb& l = limbs_[heldSlot_];
+bool Mob::HeldMouthWorld(Vec3 dir, Vec3& out, Hand h) {
+  const int hs = HeldSlot(h);
+  if (hs < 0 || hs >= (int)limbs_.size()) return false;
+  MobLimb& l = limbs_[hs];
   if (!l.body) return false;
   const float dl = dir.len();
   if (dl < 1e-4f) return false;
@@ -24478,6 +24749,12 @@ bool Mob::HeldMouthWorld(Vec3 dir, Vec3& out) {
 
 bool Mob::EquipItem(const ItemDef* item, const char* context) {
   if (!def_ || !phys_) return false;
+  // WHICH HAND the context names. A context that is not a hand ("held_right"
+  // and "held_left" are the only two today) is refused rather than guessed:
+  // the held slots are per hand and there is nowhere else to put it.
+  Hand whichHand = Hand::Right;
+  if (!HandFromContext(context, whichHand)) return false;
+  HeldHand& hh = held_[HandIndex(whichHand)];
 
   // Unequip first, always — including on a re-equip, so swapping weapons goes
   // through exactly one code path instead of a "replace in place" variant that
@@ -24488,15 +24765,19 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // puts on a hood has the blade in the middle. RemoveAppendedSlots owns that
   // (mob.h); this used to be a `pop_back` and the assumption behind it is the
   // one thing armour genuinely broke.
-  if (heldSlot_ >= 0) {
-    RemoveAppendedSlots(heldSlot_, 1);
-    heldSlot_ = -1;
-    heldItem_.clear();
-    heldPartIndex_ = -1;
-    heldPart_.clear();
+  if (hh.slot >= 0) {
+    RemoveAppendedSlots(hh.slot, 1);   // also renumbers the OTHER hand's slot
+    hh.Clear();
     MarkInstancesDirty();
   }
-  if (!item) return true;
+  if (!item) {
+    // The strike hand follows what is left: emptying the fist the driver
+    // served while the other still holds something hands the driver over.
+    if (whichHand == strikeHand_ &&
+        held_[HandIndex(OtherHand(whichHand))].slot >= 0)
+      strikeHand_ = OtherHand(whichHand);
+    return true;
+  }
   if (limbs_.empty()) return false;  // no rig yet (unspawned): nothing to hold
 
   const int si = def_->FindSocket(context);
@@ -24665,13 +24946,13 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   // Jolt's recentring here (which would be a second source of truth for it).
   {
     Vec3 clo, chi;
-    if (phys_->GetLocalBounds(p.body, clo, chi)) gripBody_ = clo + gripLocal;
-    else gripBody_ = gripLocal;
+    if (phys_->GetLocalBounds(p.body, clo, chi)) hh.gripBody = clo + gripLocal;
+    else hh.gripBody = gripLocal;
     // Place it once, right now, by the SAME expression the drive loop uses —
     // so the equip frame and every frame after it agree and the sword does not
     // pop into position on the first tick.
     const Vec3 socketW = hand.xf.pos + QuatRotate(handQ, ap.rest.pos);
-    bxf.pos = socketW - QuatRotate(worldQ, gripBody_);
+    bxf.pos = socketW - QuatRotate(worldQ, hh.gripBody);
     float bq[4] = {q.x, q.y, q.z, q.w};
     phys_->MoveKinematicBody(p.body, bxf.pos, bq, 0.0f);
   }
@@ -24687,12 +24968,14 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
 
   anim_.partAlive.resize(skel_.parts.size(), 1);
   anim_.springs.resize(skel_.parts.size(), SpringState{});
-  heldSlot_ = slot;
-  heldItem_ = item->name;
-  // The weapon-arm IK derives the arm from the held part's parent, so these
-  // stay in step with the slot rather than being a second source of truth.
-  heldPartIndex_ = slot;
-  heldPart_ = ld.name;
+  hh.slot = slot;
+  hh.item = item->name;
+  // The weapon-arm IK derives the arm from the held part's parent, so the
+  // slot is the whole of it; the NAME is kept for a def reload's re-resolve.
+  hh.part = ld.name;
+  // A fist that was empty hands the driver to the one that now holds
+  // something, so a creature armed in one hand swings with that hand.
+  if (held_[HandIndex(strikeHand_)].slot < 0) strikeHand_ = whichHand;
   // A weapon lattice is the ITEM's, at the ITEM's scale — not the wearer's
   // skin. Recorded so every scale-taking operation on this slot (burn, carve,
   // re-skin, drop) converts by the right divisor; before shells existed this
@@ -24797,13 +25080,10 @@ void Mob::RemoveAppendedSlots(int first, int count) {
           skel_.parts[i].name.c_str(), par);
   }
 
-  if (heldSlot_ >= 0) {
-    heldSlot_ = shift(heldSlot_);
-    heldPartIndex_ = heldSlot_;
-    if (heldSlot_ < 0) {
-      heldItem_.clear();
-      heldPart_.clear();
-    }
+  for (HeldHand& hh : held_) {
+    if (hh.slot < 0) continue;
+    hh.slot = shift(hh.slot);
+    if (hh.slot < 0) hh.Clear();
   }
   for (size_t w = 0; w < worn_.size();) {
     WornPiece& p = worn_[w];
@@ -25629,8 +25909,11 @@ bool Mob::ResolveEffector(int& outPart, StrikeEffectorMode& outMode,
     outNatural = strikeNatural_;
     return true;
   }
-  if (heldPartIndex_ >= 0 && (size_t)heldPartIndex_ < skel_.parts.size()) {
-    outPart = heldPartIndex_;
+  // THE STRIKE HAND's held item (dual wielding): the other fist's is carried,
+  // not swung, until a stroke arms that hand (ArmForStyle).
+  const int heldPart = HeldSlot();
+  if (heldPart >= 0 && (size_t)heldPart < skel_.parts.size()) {
+    outPart = heldPart;
     outMode = StrikeEffectorMode::Held;
     outNatural = -1;
     return true;
@@ -26547,7 +26830,11 @@ float Mob::LocoGroundAlign() const {
 // THE STYLE VOCABULARY'S ONE RIG QUESTION (game/strokes.h says why it is
 // declared there and defined here).
 bool StyleUsable(const Mob& who, const AttackStyle& sty) {
-  if (sty.weapon.empty() || sty.weapon == "held") return who.HeldSlot() >= 0;
+  // "held": SOMETHING in either fist (dual wielding). Which hand then swings
+  // it is the stroke's to choose (MobSystem::StartStroke / the player's
+  // button); the style vocabulary only asks whether it can be swung at all.
+  if (sty.weapon.empty() || sty.weapon == "held")
+    return who.HeldSlot(Hand::Right) >= 0 || who.HeldSlot(Hand::Left) >= 0;
   const MobNaturalWeaponDef* nw = who.NaturalWeaponNamed(sty.weapon);
   return nw != nullptr && who.NaturalWeaponUsable(*nw);
 }
@@ -26857,10 +27144,11 @@ void Mob::ApplyWeaponArm(const AnimSkeleton& sk, AnimState& st,
   // the fist travels with it.
   const bool steerHand = effMode == StrikeEffectorMode::Held;
   if (steerHand) [&] {
-  if (heldPartIndex_ >= (int)limbDefs_.size()) return;
-  const MobLimbDef& ld = limbDefs_[heldPartIndex_];
+  const int heldPart = effPart;   // Held mode: the strike hand's item slot
+  if (heldPart < 0 || heldPart >= (int)limbDefs_.size()) return;
+  const MobLimbDef& ld = limbDefs_[heldPart];
   if (!ld.hasEdge) return;
-  const Quat gripRot = sk.parts[heldPartIndex_].rest.rot;
+  const Quat gripRot = sk.parts[heldPart].rest.rot;
   Vec3 bladeHand = QuatRotate(gripRot, (ld.edgeTo - ld.edgeFrom));
   if (bladeHand.len() < 1e-4f) return;
   bladeHand = bladeHand.normalized();
@@ -26988,6 +27276,58 @@ void Mob::ReapplyKeyedArm(const AnimSkeleton& sk, AnimState& st) const {
   ReflattenArm(sk, st, S.keyedPart, S.keyedGot);
 }
 
+void Mob::ReleaseOffArm(const AnimSkeleton& sk, AnimState& st,
+                        const int (&driven)[kArmJoints], float dt) {
+  ArmSmoothState& S = armSmooth_;
+  const size_t n = std::min(sk.parts.size(), st.model.size());
+  // ---- the switch: the last DRIVEN arm is not the one driven now ----------
+  if (S.lastValid && S.lastPart[kArmShoulder] >= 0) {
+    bool same = true;
+    for (int k = 0; k < kArmJoints; k++) same = same && S.lastPart[k] == driven[k];
+    if (!same) {
+      offArm_ = OffArmRelease{};
+      offArm_.active = true;
+      for (int k = 0; k < kArmJoints; k++) {
+        offArm_.part[k] = S.lastPart[k];
+        offArm_.from[k] = S.last[k];
+      }
+      // What the new arm's own machinery would otherwise read as ITS last
+      // pose (a keyed first frame's `fromLive`, a release) is the old arm's.
+      S.lastValid = false;
+      S.valid = false;
+      S.relActive = false;
+    }
+  }
+  if (!offArm_.active) return;
+  // The released arm must not be the driven one (a switch straight back):
+  // the driver owns it again, and its own smoothing takes over.
+  for (int k = 0; k < kArmJoints; k++)
+    if (offArm_.part[k] >= 0 && offArm_.part[k] == driven[k]) {
+      offArm_.active = false;
+      return;
+    }
+  offArm_.t += std::max(dt, 0.0f);
+  const float u = std::clamp(offArm_.t / kOffArmReleaseSec, 0.0f, 1.0f);
+  const float e = u * u * (3.0f - 2.0f * u);   // smoothstep: no velocity step
+  int parts[kArmJoints];
+  Quat got[kArmJoints]{};
+  for (int k = 0; k < kArmJoints; k++) {
+    const int i = offArm_.part[k];
+    parts[k] = (i >= 0 && (size_t)i < n) ? i : -1;
+    if (parts[k] < 0) continue;
+    // The animation's arm, as the flatten left it (nothing solved it).
+    const int par = sk.parts[i].parent;
+    const Quat anim = par >= 0 && (size_t)par < n
+                          ? QuatNormalize(QuatMul(QuatConj(st.model[par].rot),
+                                                  st.model[i].rot))
+                          : st.model[i].rot;
+    got[k] = QuatNormalize(QuatSlerp(offArm_.from[k], anim, e));
+  }
+  if (parts[kArmShoulder] >= 0 && parts[kArmElbow] >= 0)
+    ReflattenArm(sk, st, parts, got);
+  if (u >= 1.0f) offArm_.active = false;
+}
+
 void Mob::SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt) {
   ArmSmoothState& S = armSmooth_;
   S.keyedNow = false;
@@ -27004,6 +27344,11 @@ void Mob::SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt) {
   const bool asked = driven && weapon_.smooth.Any();
   if (asked) S.params = weapon_.smooth;
   else if (!S.valid && !driven && !releasing) {
+    // Nothing driven: an off arm still mid hand-back finishes it.
+    if (offArm_.active) {
+      const int none[kArmJoints] = {-1, -1, -1};
+      ReleaseOffArm(sk, st, none, dt);
+    }
     S.lastValid = false;
     S.relActive = false;
     S.keyLiveValid = false;
@@ -27032,6 +27377,10 @@ void Mob::SmoothWeaponArm(const AnimSkeleton& sk, AnimState& st, float dt) {
   const size_t n = std::min(sk.parts.size(), st.model.size());
   for (int k = 0; k < kArmJoints; k++)
     if (parts[k] >= 0 && (size_t)parts[k] >= n) parts[k] = -1;
+  // THE ARM THAT JUST LOST THE CLAIM (dual wielding): handed back to the
+  // animation over a short release of its own, before anything below
+  // forgets where it was.
+  ReleaseOffArm(sk, st, parts, dt);
   if (parts[kArmShoulder] < 0 || parts[kArmElbow] < 0) {
     S.valid = false;
     S.lastValid = false;
@@ -27276,9 +27625,10 @@ float Mob::HandSign() const {
   // sit at low model x, which the plain-yaw submit path puts on the side the
   // camera renders screen-right when viewed from behind. See ApplyWeaponArm's
   // toRig note for the mirror that used to confuse this.)
-  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)skel_.parts.size())
+  const int heldPart = HeldSlot();   // the strike hand's (dual wielding)
+  if (heldPart < 0 || heldPart >= (int)skel_.parts.size())
     return 1.0f;
-  const int hand = skel_.parts[heldPartIndex_].parent;
+  const int hand = skel_.parts[heldPart].parent;
   if (hand < 0 || hand >= (int)limbDefs_.size()) return 1.0f;
   const std::string& n = limbDefs_[hand].name;
   return n.size() >= 2 && n.compare(n.size() - 2, 2, ".L") == 0 ? -1.0f : 1.0f;
@@ -27510,12 +27860,14 @@ bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
     return true;
   }
 
-  if (heldPartIndex_ < 0 || heldPartIndex_ >= (int)limbDefs_.size())
+  const int heldPart = HeldSlot();   // the strike hand's (dual wielding)
+  const Vec3 gripBody = held_[HandIndex(strikeHand_)].gripBody;
+  if (heldPart < 0 || heldPart >= (int)limbDefs_.size())
     return true;   // an empty fist still has an arm to steer
-  const MobLimbDef& ld = limbDefs_[heldPartIndex_];
+  const MobLimbDef& ld = limbDefs_[heldPart];
   if (!ld.hasEdge) return true;
-  if ((size_t)heldPartIndex_ >= anim_.model.size()) return true;
-  const int handPart = skel_.parts[heldPartIndex_].parent;
+  if ((size_t)heldPart >= anim_.model.size()) return true;
+  const int handPart = skel_.parts[heldPart].parent;
   if (handPart < 0 || (size_t)handPart >= anim_.model.size()) return true;
 
   // THE ITEM'S BODY ORIGIN IN MODEL SPACE. The submit path places the item at
@@ -27524,9 +27876,9 @@ bool Mob::WeaponStrokePose(Vec3& outHandFromShoulder, Vec3& outTipFromShoulder,
   //     model[item].pos + model[item].rot * (edgeTo - gripBody_)
   // and nothing needs rebasing. Deriving it rather than reading limb.xf is
   // what keeps this one tick fresher than the physics body.
-  const Quat iq = anim_.model[heldPartIndex_].rot;
-  const Vec3 itemPos = anim_.model[heldPartIndex_].pos;
-  const Vec3 tipModel = itemPos + QuatRotate(iq, ld.edgeTo - gripBody_);
+  const Quat iq = anim_.model[heldPart].rot;
+  const Vec3 itemPos = anim_.model[heldPart].pos;
+  const Vec3 tipModel = itemPos + QuatRotate(iq, ld.edgeTo - gripBody);
   const Vec3 handModel = anim_.model[handPart].pos;
 
   // Into the frame SetWeaponPose speaks: the tip is expressed RELATIVE TO THE
@@ -27858,12 +28210,13 @@ bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
     return true;
   }
 
-  if (heldPartIndex_ < 0) return false;
-  if (heldPartIndex_ >= (int)limbDefs_.size()) return false;
-  const MobLimbDef& ld = limbDefs_[heldPartIndex_];
+  const int heldPart = HeldSlot();   // the strike hand's (dual wielding)
+  if (heldPart < 0) return false;
+  if (heldPart >= (int)limbDefs_.size()) return false;
+  const MobLimbDef& ld = limbDefs_[heldPart];
   if (!ld.hasEdge) return false;
-  if (!LimbAlive(heldPartIndex_)) return false;   // severed: nothing to cut with
-  const MobLimb& p = limbs_[heldPartIndex_];
+  if (!LimbAlive(heldPart)) return false;   // severed: nothing to cut with
+  const MobLimb& p = limbs_[heldPart];
   if (!p.body) return false;
   // The part's body transform sits at the model's MIN CORNER, and the authored
   // edge is measured from that same corner — so the composition is direct,

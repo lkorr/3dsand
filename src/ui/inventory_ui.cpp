@@ -2987,6 +2987,29 @@ void DrawInventoryScreen(UIState& s) {
                  d.acceptsAnything, d.why.c_str(), covers, &d.accepts);
       }
     }
+    // THE HANDS (dual wielding), at the foot of the two columns: the right
+    // hand under the left column and the left under the right, the way the
+    // figure faces you. Real kit slots (game/equipment.h HandR/HandL), so a
+    // drag in or out is the same move Q and E make.
+    for (int side = 0; side < 2; side++) {
+      const int idx = s.handEquipSlot[side];
+      if (idx < 0) continue;
+      const float sy = portY + kPortraitH - kSlot;
+      const float sx = side ? colR : colL;
+      const UIState::EquipSlotUI& d =
+          idx < (int)s.equipDefs.size() ? s.equipDefs[idx] : UIState::EquipSlotUI{};
+      char id[32];
+      std::snprintf(id, sizeof id, "eq%d", idx);
+      ItemSlot(s, id, ImVec2(sx, sy), SlotOr(s.equipSlots, idx),
+               KitRef{KitSpace::Equip, idx}, d.icon.c_str(), d.acceptsAnything,
+               d.why.c_str(), false, &d.accepts);
+      ImGui::PushFont(ui::FontSmall());
+      const char* tag = side ? "L hand  (Q)" : "R hand  (E)";
+      const ImVec2 ts = ImGui::CalcTextSize(tag);
+      ui::ShadowText(dl, ImVec2(std::floor(sx + (kSlot - ts.x) * 0.5f), sy - ts.y - 2),
+                     Fade(ui::ColParch(), 0.8f), tag);
+      ImGui::PopFont();
+    }
     y = portY + kPortraitH + 16;
 
     // FLASKS: every vessel you carry, pack first, then hotbar - the same
@@ -3647,9 +3670,64 @@ void DrawHudHotbar(const UIState& s, ImDrawList* dl) {
     ui::ShadowText(dl, ImVec2(at.x + 4, at.y + 2),
                    isSel ? ui::ColGoldHi() : Fade(ui::ColParch(), 0.7f), key);
   }
+  // ---- THE HANDS (dual wielding): one slot either side of the strip --------
+  //
+  // The LEFT hand's slot left of the hotbar, the RIGHT's right of it, as the
+  // player's own hands lie. Each says the key that fills it (Q / E), the
+  // button that uses it (RMB / LMB) and — holding a vessel — what that button
+  // does right now (pour / scoop / apply; F cycles it). The hand last used is
+  // framed: it is the one F talks to.
+  static const char* const kModeName[3] = {"pour", "scoop", "apply"};
+  for (int side = 0; side < 2; side++) {
+    const int hk = side == 0 ? 1 : 0;   // screen-left is the LEFT hand
+    const int idx = s.handEquipSlot[hk];
+    if (idx < 0 || idx >= (int)s.equipSlots.size()) continue;
+    const UIState::KitSlotUI& item = s.equipSlots[idx];
+    const float hx = side == 0 ? x0 - 18 - kSlot : x0 + w + 18;
+    const ImVec2 at(hx, y0);
+    const bool filled = !item.name.empty();
+    const ui::SlotLook look = filled ? ui::SlotLook::Filled : ui::SlotLook::Empty;
+    dl->AddRectFilled(ImVec2(at.x - 6, at.y - 6), ImVec2(at.x + kSlot + 6, at.y + kSlot + 6),
+                      IM_COL32(0, 0, 0, 90));
+    ui::SlotSurface(dl, at, kSlot, look, false);
+    SlotRim(dl, at, look);
+    const ImVec2 mid(at.x + kSlot * 0.5f, at.y + kSlot * 0.5f);
+    if (filled) {
+      ui::DrawSpriteCentered(dl, ItemIcon(item.kind), ImVec2(mid.x + 1, mid.y + 1),
+                             Fade(ui::ColInk(), 0.7f));
+      ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid,
+                             item.dyeSwatch ? item.dyeSwatch : IM_COL32_WHITE);
+      if (item.fill >= 0.0f) {
+        const float gx0 = at.x + 6, gx1 = at.x + kSlot - 6, gy = at.y + kSlot - 8;
+        dl->AddRectFilled(ImVec2(gx0, gy), ImVec2(gx1, gy + 4), IM_COL32(10, 10, 14, 220));
+        const float fx = std::floor(gx0 + (gx1 - gx0) * item.fill);
+        if (fx > gx0)
+          dl->AddRectFilled(ImVec2(gx0, gy), ImVec2(fx, gy + 4), IM_COL32(90, 160, 235, 255));
+      }
+    } else {
+      ui::DrawSpriteCentered(dl, "slot_hands", mid, Fade(ui::ColParch(), 0.35f));
+    }
+    const bool framed = live && s.lastHand == hk;
+    if (framed)
+      dl->AddRect(ImVec2(at.x - 3, at.y - 3), ImVec2(at.x + kSlot + 3, at.y + kSlot + 3),
+                  ui::ColGoldHi(), 0.0f, 0, 2.0f);
+    ui::ShadowText(dl, ImVec2(at.x + 4, at.y + 2),
+                   framed ? ui::ColGoldHi() : Fade(ui::ColParch(), 0.7f),
+                   hk == 1 ? "Q" : "E");
+    // Under the slot: the button, and a vessel's mode.
+    char cap[32];
+    const int mode = s.vesselModeShown[hk];
+    if (mode >= 0 && mode < 3)
+      std::snprintf(cap, sizeof cap, "%s %s", hk == 1 ? "RMB" : "LMB", kModeName[mode]);
+    else
+      std::snprintf(cap, sizeof cap, "%s", hk == 1 ? "RMB" : "LMB");
+    const ImVec2 cs = ImGui::CalcTextSize(cap);
+    ui::ShadowText(dl, ImVec2(std::floor(at.x + (kSlot - cs.x) * 0.5f), at.y - cs.y - 4),
+                   Fade(ui::ColParch(), live ? 0.85f : 0.4f), cap);
+  }
   if (live && sel >= 0 && sel < n) {
-    // A gold frame round the hand, 2 px, outside the rim so it never covers
-    // the icon.
+    // A gold frame round the selection, 2 px, outside the rim so it never
+    // covers the icon — the stack Q and E would put in a hand.
     const ImVec2 at(x0 + sel * (kSlot + kGap), y0);
     dl->AddRect(ImVec2(at.x - 3, at.y - 3), ImVec2(at.x + kSlot + 3, at.y + kSlot + 3),
                 ui::ColGoldHi(), 0.0f, 0, 2.0f);

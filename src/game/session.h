@@ -531,7 +531,10 @@ struct PlayerSession {
   // Ticks the `pour` clip has held the arm out (0 = not pouring); the
   // stream waits for the arm (session.cpp kPourRaiseTicks).
   int pourPoseTicks = 0;
+  int pourPoseHand = 0;   // which arm the `pour` clip is on (HandClip)
   int throwTicks = 0;
+  // The HAND the throw is drawn in (Hand as an int), -1 = none. It used to
+  // be a hotbar slot; the vessel is now in a kit hand slot (dual wielding).
   int throwSlot = -1;
   // THE RELEASE: Q let go starts the `throw` clip and the vessel leaves the
   // hand `throwLaunchIn` ticks later, where the arm has swung it to — not
@@ -546,6 +549,20 @@ struct PlayerSession {
   StrokeCursor playerStrike;
   int strikeQueued = -1;    // style index latched at the press, -1 = none
   int strikeBuffered = -1;  // ONE strike banked mid-swing, fired at recover
+  // ...and WHICH HAND each was pressed with (dual wielding: LMB the right,
+  // RMB the left). Carried beside the style rather than folded into it,
+  // because the same compass style is thrown by either arm.
+  Hand strikeQueuedHand = Hand::Right;
+  Hand strikeBufferedHand = Hand::Right;
+  // THE DRIVER'S FRAME. `melee` lives across strokes (its recover and idle
+  // unwind outlast the cursor), so whether it runs in the MIRRORED basis
+  // (strokes.h "THE LEFT HAND IS THE RIGHT, MIRRORED") is the session's to
+  // remember, changed only when a stroke begins. A cursor-held flag would
+  // flip the basis under a recover the moment the cursor resets.
+  bool strikeMirrored = false;
+  // The hand the player last used (a strike or a vessel): F cycles ITS
+  // vessel's mode, and the idle ready pose stays on it.
+  Hand lastHand = Hand::Right;
   // The BASE style (the compass's index, before ResolveForm) of the stroke in
   // playerStrike, -1 = none: what StrikeChains asks "the opposite side of".
   int strikeBase = -1;
@@ -638,18 +655,13 @@ inline PlayerKitRefs PlayerKitOf(PlayerSession& s, const GlyphLibrary& glyphs,
 // two reads of one fact stop agreeing.
 struct FrameIntent {
   bool brushActive = false;
-  // `meleeArmed` means "a weapon is drawn" and is what decides whether to
-  // equip one; `meleeReady` is the one the driver, the program and the sweep
-  // gate on, because a fist is as live as a sword (it folds in the unarmed
-  // compass, which is a CONTENT question the frame layer already resolved).
-  bool meleeArmed = false;
-  bool meleeReady = false;
-  const ItemDef* heldItem = nullptr;
-  // THE HANDS HOLD A VESSEL: the melee tool is up, nothing is drawn, and the
-  // selected hotbar slot is an ItemKind::Container. The hotbar slot, or -1.
-  // LMB pours and RMB scoops (game/container.h); the unarmed compass is off,
-  // because a hand round a flask is not a fist.
-  int vesselSlot = -1;
+  // THE HANDS ARE UP: the melee tool is selected and magic mode is off, so
+  // the mouse buttons belong to the hands (LMB the right, RMB the left).
+  // WHAT the hands hold is not the frame's to say any more (dual wielding,
+  // 2026-09-27): it is the kit's HandR/HandL, which the tick reads itself
+  // (ResolveHands -> SessionTick::hands), so a gate that puts a sword in a
+  // kit hand has put it in the rig's hand with no frame at all.
+  bool handsUp = false;
   // ...and WHERE IT POURS (game/container.h ContainerPourPoint): the point on
   // the crosshair ray the frame drew the marker sphere on. The crosshair ray
   // starts at the RENDER eye, which only the frame knows; handing the point
@@ -952,10 +964,35 @@ struct TickAuthorityCtx {
 // ONE PLAYER'S INPUT TO ONE TICK. The session, what the frame layer settled
 // for it, and the command it consumes. By pointer rather than reference so the
 // span is assignable and a caller can build it in a vector.
+// ---- THE HANDS THIS TICK (dual wielding) -----------------------------------
+//
+// Resolved once per tick per player from the kit's two hand slots, the frame's
+// `handsUp` and the rig (TickAuthority -> ResolveHands), and read by every
+// phase that asks "what is in which fist and may it swing". One resolution,
+// because the equip seam, the strike press, the stroke's weapon form, the
+// sweep's item and the vessel block each used to re-derive "the held item"
+// from the hotbar selection on their own.
+struct HandNow {
+  const ItemDef* item = nullptr;   // what the kit's hand slot holds, or null
+  bool weapon = false;             // ItemKind::Melee
+  bool vessel = false;             // a container (flask, pouch)
+  // THIS hand may begin a strike: the hands are up, the arm is whole, and it
+  // holds a weapon — or is EMPTY and one of the unarmed compass's styles can
+  // be thrown with it (a fist round a flask does not punch).
+  bool ready = false;
+};
+struct HandsNow {
+  HandNow hand[kHands];
+  bool AnyWeapon() const { return hand[0].weapon || hand[1].weapon; }
+  bool AnyReady() const { return hand[0].ready || hand[1].ready; }
+  const HandNow& operator[](Hand h) const { return hand[HandIndex(h)]; }
+};
+
 struct SessionTick {
   PlayerSession* s;
   FrameIntent intent;
   TickInput ti;
+  HandsNow hands{};   // filled by TickAuthority; never by the caller
 };
 
 void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,

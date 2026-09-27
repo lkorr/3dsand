@@ -1871,6 +1871,15 @@ TP_I(melee, sweepMaxSteps, NO_WGSL, 24, 1, 64)
 // early start with no speed-up; leeway 0 allows exactly opposite only.
 TP_F(melee, chainWindupRate, NO_WGSL, 2.0f, 1.0f, 8.0f)
 TP_I(melee, chainSectorLeeway, NO_WGSL, 1, 0, 4)
+// AN INJURED ARM (dual wielding; Mob::HandCondition, the weakest hp fraction
+// of the arm chain and hand). Below injuredArmFrom a stroke that arm throws
+// is stretched in tempo, up to 1 + injuredArmSlow times as long as the arm
+// nears zero (strokes.h InjuredArmSlow) -- and since speed is the damage, a
+// slower cut is a weaker one. Below injuredArmDrop the fist cannot hold on:
+// what it holds falls (Mob::GripFails). 0 turns either effect off.
+TP_F(melee, injuredArmFrom, NO_WGSL, 0.75f, 0.0f, 1.0f)
+TP_F(melee, injuredArmSlow, NO_WGSL, 1.0f, 0.0f, 4.0f)
+TP_F(melee, injuredArmDrop, NO_WGSL, 0.15f, 0.0f, 1.0f)
 // ---- THE BLOCK KNOBS, and what each clamp is protecting ------------------
 //
 //   * blockGapM is the slack in the segment-vs-segment test. NEGATIVE would

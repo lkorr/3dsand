@@ -41,6 +41,8 @@
 #include "game/item.h"
 #include "game/mob.h"
 #include "game/persist.h"
+#include "game/strokes.h"
+#include "sim/tuning.h"
 #include "game/worlditems.h"
 #include "sim/microbody.h"
 #include "test/selftest.h"
@@ -2677,6 +2679,313 @@ Status GateKitInstance(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ============================================================================
+// dual-wield: TWO HANDS, EACH A KIT SLOT AND A RIG SLOT (2026-09-27)
+//
+// What it protects, cheapest first:
+//   1. THE SLOT TABLE. HandR/HandL take a weapon or a vessel and refuse
+//      armour; they are not WORN; the "just put this on" gesture never picks
+//      a hand; Q/E's move is a kit swap that loses nothing.
+//   2. THE DERIVED LEFT SOCKET. Every rig authors `held_right` only; the left
+//      one is reflected onto hand.L at load (MirrorHeldSockets). Asserted as
+//      the reflection itself, so a rig that moves its right socket moves its
+//      left one with it.
+//   3. TWO HELD SLOTS. A sword in each fist is two borrowed rig slots on two
+//      hands, each placed at its own socket, both carried, and equipping one
+//      hand leaves the other alone.
+//   4. THE STRIKE HAND. One weapon in the left fist makes the left the strike
+//      hand; a held style forced on the left runs MIRRORED on the left arm
+//      and its edge is the LEFT blade's; an authored-left punch is not
+//      mirrored twice.
+//   5. THE MIRROR ALGEBRA. Style sides, clip names, the pose reflection
+//      being an involution, and the library's derived `.mirror` clips.
+//   6. THE ARM BEHIND THE HAND. A hurt forearm lowers that hand's condition
+//      and only that hand's; the stroke slows below the threshold; below the
+//      grip threshold the fist lets go — the item falls as itself, the
+//      LostGear names the hand, and the kit's hand slot is emptied at once.
+//   7. LOOT AND WIRE carry the hand (the wire's `held` = 1 + hand).
+// ============================================================================
+Status GateDualWield(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  // Spawns one fixture; the next gate's first mob id must not depend on it.
+  IdCounterScope idScope(mobs);
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const char* what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("dual-wield: FAILED %s\n", what);
+    }
+  };
+  const int handR = EquipSlotOfHand(Hand::Right);
+  const int handL = EquipSlotOfHand(Hand::Left);
+
+  // ---- 1. the slot table --------------------------------------------------
+  check(handR != handL && handR >= 0 && handL >= 0 && handR < kEquipSlotCount &&
+            handL < kEquipSlotCount,
+        "the two hands are two distinct equipment slots");
+  check(EquipSlotAccepts(handR, ItemKind::Melee) &&
+            EquipSlotAccepts(handL, ItemKind::Container),
+        "a hand takes a weapon and a vessel");
+  check(!EquipSlotAccepts(handL, ItemKind::ArmorHead) &&
+            !EquipSlotAccepts(handR, ItemKind::None),
+        "and refuses armour and nothing-at-all");
+  check(!EquipSlotIsWorn(handR) && !EquipSlotIsWorn(handL),
+        "a hand is not a WORN slot (no shells, no wear sync)");
+  {
+    Equipment eq;
+    for (int k = 1; k <= (int)ItemKind::Container; k++) {
+      const int s = EquipSlotFor((ItemKind)k, eq);
+      check(!EquipSlotIsHand(s), "the right-click 'put it on' never picks a hand");
+    }
+  }
+
+  const ItemDef* sword = nullptr;
+  const ItemDef* flask = nullptr;
+  for (const ItemDef& it : c.items.items) {
+    if (!sword && it.kind == ItemKind::Melee && it.hasEdge) sword = &it;
+    if (!flask && it.IsContainer()) flask = &it;
+  }
+  if (!sword) {
+    detail = "no melee item with an edge in the library";
+    std::printf("dual-wield: SKIP (%s)\n", detail.c_str());
+    return Status::Skip;
+  }
+  {
+    Kit kit;
+    kit.hotbar.slots[2] = StackOf(c.items, c.items.Find(sword->name), 1);
+    check(kit.Move(KitRef{KitSpace::Hotbar, 2}, KitRef{KitSpace::Equip, handL},
+                   c.items) == MoveResult::Ok &&
+              kit.equip.InHand(Hand::Left).name == sword->name &&
+              kit.hotbar.slots[2].Empty(),
+          "Q's move puts the hotbar stack in the left hand");
+    if (flask) {
+      kit.hotbar.slots[2] = StackOf(c.items, c.items.Find(flask->name), 1);
+      check(kit.Move(KitRef{KitSpace::Hotbar, 2}, KitRef{KitSpace::Equip, handL},
+                     c.items) == MoveResult::Ok &&
+                kit.equip.InHand(Hand::Left).name == flask->name &&
+                kit.hotbar.slots[2].name == sword->name,
+            "and into an occupied hand it SWAPS: the sword comes back out");
+    }
+  }
+
+  // ---- the rig fixture -----------------------------------------------------
+  int avDef = -1;
+  for (size_t i = 0; i < mobs.Defs().size(); i++)
+    if (mobs.Defs()[i].name == kAvatarDefName) avDef = (int)i;
+  if (avDef < 0) {
+    detail = Format("no '%s' def", kAvatarDefName);
+    std::printf("dual-wield: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  const MobDef& def = mobs.Defs()[avDef];
+
+  // ---- 2. the derived left socket ------------------------------------------
+  const int sr = def.FindSocket("held_right"), sl = def.FindSocket("held_left");
+  check(sr >= 0 && sl >= 0, "the rig has a right socket and a DERIVED left one");
+  if (sr >= 0 && sl >= 0) {
+    const MobSocketDef& R = def.sockets[(size_t)sr];
+    const MobSocketDef& L = def.sockets[(size_t)sl];
+    check(L.part == MirrorSideName(R.part) && L.partIndex >= 0 &&
+              L.partIndex != R.partIndex,
+          "on the mirrored hand part");
+    if (L.partIndex >= 0 && R.partIndex >= 0) {
+      const Vec3 aR = def.skel.parts[(size_t)R.partIndex].anchorLocal;
+      const Vec3 aL = def.skel.parts[(size_t)L.partIndex].anchorLocal;
+      const Vec3 dR = R.offset - aR, dL = L.offset - aL;
+      check(std::fabs(dL.x + dR.x) < 1e-4f && std::fabs(dL.y - dR.y) < 1e-4f &&
+                std::fabs(dL.z - dR.z) < 1e-4f,
+            "at the right socket's offset reflected through the sagittal plane");
+    }
+  }
+  check(sword->Grip("held_left") == sword->Grip("held_right"),
+        "an item with only a right grip is held the same way in the left");
+
+  // ---- 5 (pure). the mirror algebra ------------------------------------------
+  {
+    const StyleLibrary& lib = mobs.AttackStyles();
+    const AttackStyle* hr = lib.At(lib.Find("horizontal_r"));
+    const AttackStyle* pr = lib.At(lib.Find("punch_r"));
+    const AttackStyle* pl = lib.At(lib.Find("punch_l"));
+    if (hr) {
+      check(StyleSideOf(*hr) == StyleSide::Right && !StrokeMirrored(*hr, Hand::Right) &&
+                StrokeMirrored(*hr, Hand::Left),
+            "a held style is authored right and mirrors for the left hand");
+    }
+    if (pr && pl) {
+      check(StyleSideOf(*pl) == StyleSide::Left && !StrokeMirrored(*pl, Hand::Left) &&
+                StrokeMirrored(*pr, Hand::Left),
+            "an authored-left punch is NOT mirrored again; the right one is");
+    }
+    check(MirroredClipName("punch_r") == "punch_l" &&
+              MirroredClipName("pour") == "pour" &&
+              MirrorSideName("fist.R") == "fist.L" && MirrorSideName("jaws") == "jaws",
+          "clip and part names swap their side suffix and nothing else");
+    WeaponPose wp;
+    wp.bladeFlat = Vec3{0.2f, 0.3f, 0.9f};
+    wp.torsoTwist = 0.4f;
+    wp.keyed.on = true;
+    wp.keyed.to[0] = QuatNormalize(Quat{0.1f, 0.2f, 0.3f, 0.9f});
+    wp.keyed.aimToYaw = 0.25f;
+    WeaponPose m = wp;
+    MirrorWeaponPose(m);
+    check(m.torsoTwist == -wp.torsoTwist && m.keyed.aimToYaw == -wp.keyed.aimToYaw &&
+              m.keyed.to[0].y == -wp.keyed.to[0].y && m.keyed.to[0].x == wp.keyed.to[0].x,
+          "the pose reflection flips twist, aim yaw and the quaternion's y/z");
+    MirrorWeaponPose(m);
+    check(m.bladeFlat.x == wp.bladeFlat.x && m.bladeFlat.z == wp.bladeFlat.z &&
+              m.torsoTwist == wp.torsoTwist && m.keyed.to[0].z == wp.keyed.to[0].z,
+          "and it is an involution");
+    check(InjuredArmSlow(1.0f) == 1.0f, "a whole arm swings at full tempo");
+    const Tuning::Melee& mt = CurrentTuning().melee;
+    if (mt.injuredArmFrom > 0.0f && mt.injuredArmSlow > 0.0f)
+      check(InjuredArmSlow(mt.injuredArmFrom * 0.2f) > 1.0f,
+            "and a badly hurt one slower");
+  }
+
+  mobs.Reset();
+  const IVec3 wOrg = c.world.WindowOrigin();
+  const int sx = wOrg.x * (int)kChunk + 150, sz = wOrg.z * (int)kChunk + 150;
+  const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+  const uint64_t id = mobs.Spawn(avDef, {sx, h + 1, sz});
+  Mob* mob = mobs.FindMobById(id);
+  if (!mob) {
+    detail = "spawn failed";
+    std::printf("dual-wield: FAIL (%s)\n", detail.c_str());
+    return Status::Fail;
+  }
+  const int baseLimbs = mob->LimbCount();
+  check(!mob->MirrorClip("pour").empty(),
+        "the library derived a left-arm copy of the right-arm pour clip");
+
+  // ---- 3. two held slots -----------------------------------------------------
+  check(mob->EquipItem(sword, Hand::Left), "a sword goes in the LEFT fist");
+  check(mob->HeldSlot(Hand::Left) >= 0 && mob->HeldSlot(Hand::Right) < 0,
+        "only the left hand holds it");
+  check(mob->StrikeHand() == Hand::Left,
+        "and with the right fist empty the left becomes the strike hand");
+  const ItemDef* second = flask ? flask : sword;
+  check(mob->EquipItem(second, Hand::Right), "and something in the right");
+  const int hsL = mob->HeldSlot(Hand::Left), hsR = mob->HeldSlot(Hand::Right);
+  check(hsL >= 0 && hsR >= 0 && hsL != hsR && mob->LimbCount() == baseLimbs + 2,
+        "two fists, two borrowed rig slots");
+  check(mob->IsHeldSlot(hsL) && mob->IsHeldSlot(hsR) && !mob->IsHeldSlot(0),
+        "both answer as held, anatomy does not");
+  if (sl >= 0 && sr >= 0) {
+    check(mob->HandPart(Hand::Left) == def.sockets[(size_t)sl].partIndex &&
+              mob->HandPart(Hand::Right) == def.sockets[(size_t)sr].partIndex,
+          "each hand is the part its socket rides");
+  }
+  {
+    // Each item sits nearer its own hand than the other one.
+    auto posOf = [&](int part) {
+      const uint64_t b = mobs.LimbBody(id, part);
+      Vec3 p{};
+      if (b) c.phys.BodyCenterOfMass(b, p);
+      return p;
+    };
+    const Vec3 pl = posOf(hsL), pr = posOf(hsR);
+    const Vec3 hl = posOf(mob->HandPart(Hand::Left));
+    const Vec3 hr = posOf(mob->HandPart(Hand::Right));
+    check((pl - hl).len() < (pl - hr).len() && (pr - hr).len() < (pr - hl).len(),
+          "each item rides its own hand");
+  }
+  check(mob->EquipItem(nullptr, Hand::Right) && mob->HeldSlot(Hand::Right) < 0 &&
+            mob->HeldSlot(Hand::Left) >= 0 && mob->HeldItem(Hand::Left) == sword->name,
+        "emptying the right fist leaves the left alone (its slot renumbered, "
+        "not lost)");
+
+  // ---- 4. the strike hand and the mirrored stroke ------------------------------
+  {
+    const Vec3 at = Vec3{(float)sx, (float)h + 10.0f, (float)sz + 12.0f};
+    const bool began = mobs.ForceAttack(id, "horizontal_r", at, 10, 1234, 0, 1);
+    check(began, "a held style forced on the left hand begins");
+    if (began) {
+      check(mob->Stroke().hand == Hand::Left && mob->Stroke().mirrored,
+            "on the left arm, MIRRORED");
+      check(mob->StrikeEffectorPart() == mob->HeldSlot(Hand::Left),
+            "and the effector is the left fist's blade");
+      Vec3 eb, et;
+      float hw = 0;
+      const Vec3 hl = [&] {
+        Vec3 p{};
+        const uint64_t b = mobs.LimbBody(id, mob->HandPart(Hand::Left));
+        if (b) c.phys.BodyCenterOfMass(b, p);
+        return p;
+      }();
+      const Vec3 hr = [&] {
+        Vec3 p{};
+        const uint64_t b = mobs.LimbBody(id, mob->HandPart(Hand::Right));
+        if (b) c.phys.BodyCenterOfMass(b, p);
+        return p;
+      }();
+      check(mob->WeaponEdge(eb, et, hw) && (eb - hl).len() < (eb - hr).len(),
+            "whose edge starts at the LEFT hand");
+    }
+    mobs.ClearGuard(id);
+    mob->Stroke().Reset();
+    mob->ClearStrikeEffector();
+  }
+
+  // ---- 7. loot and wire carry the hand --------------------------------------
+  {
+    std::vector<::net::WireGear> wire;
+    mob->CaptureGear(wire);
+    bool leftOnWire = false;
+    for (const ::net::WireGear& g : wire)
+      if (g.held == 2u && g.name == sword->name) leftOnWire = true;
+    check(leftOnWire, "the wire says the sword is in the LEFT fist (held = 2)");
+  }
+
+  // ---- 6. the arm behind the hand ---------------------------------------------
+  {
+    check(mob->HandCondition(Hand::Left) > 0.99f &&
+              mob->HandCondition(Hand::Right) > 0.99f,
+          "a fresh body's hands are whole");
+    // The left forearm: the hand part's parent.
+    const int handPart = mob->HandPart(Hand::Left);
+    const int fore = handPart >= 0 ? def.skel.parts[(size_t)handPart].parent : -1;
+    const float full = fore >= 0 ? def.limbs[(size_t)fore].hp : 0.0f;
+    const uint64_t foreBody = fore >= 0 ? mobs.LimbBody(id, fore) : 0;
+    if (foreBody != 0 && full > 0.0f) {
+      Vec3 at{};
+      c.phys.BodyCenterOfMass(foreBody, at);
+      mob->KitMut().equip.InHand(Hand::Left) =
+          StackOf(c.items, c.items.Find(sword->name), 1);
+      mob->Damage(foreBody, full * 0.92f, at);
+      const float cond = mob->HandCondition(Hand::Left);
+      check(cond > 0.0f && cond < 0.15f, "a hurt forearm lowers its hand's condition");
+      check(mob->HandCondition(Hand::Right) > 0.99f, "and only that hand's");
+      std::vector<std::pair<uint64_t, std::string>> shed;
+      mobs.SetOnItemShed([&shed](uint64_t hb, const ItemInstance& it) {
+        shed.push_back({hb, it.name});
+      });
+      mob->ClearLostGear();
+      const int fell = mob->GripFails(0.15f);
+      check(fell == 1 && mob->HeldSlot(Hand::Left) < 0,
+            "below the grip threshold the left fist lets go");
+      check(shed.size() == 1 && shed[0].second == sword->name,
+            "and the sword falls as the sword");
+      check(!mob->LostGearEvents().empty() && mob->LostGearEvents().back().held &&
+                mob->LostGearEvents().back().hand == Hand::Left,
+            "the owner is told it was the LEFT hand");
+      check(mob->GetKit().equip.InHand(Hand::Left).Empty(),
+            "and the kit's hand slot is emptied at once, so no second sword is "
+            "drawn from it");
+      mobs.SetOnItemShed(nullptr);
+      mob->ClearLostGear();
+    } else {
+      check(false, "the left forearm has a body and authored hp to hurt");
+    }
+  }
+
+  mobs.Reset();
+  detail = Format("%d checks", checks);
+  std::printf("dual-wield: %s (%d checks)\n", ok ? "PASS" : "FAIL", checks);
+  return ok ? Status::Pass : Status::Fail;
+}
 }  // namespace
 
 const std::vector<Gate>& EquipmentGates() {
@@ -2712,6 +3021,10 @@ const std::vector<Gate>& EquipmentGates() {
       // The one gate here that reads the SHIPPED wardrobe, so it needs the same
       // standing world the other rig gates do.
       {"armor-stock", "equipment", {"prefab"}, false, GateArmorStock},
+      // Two hands (dual wielding): the slot table, the derived left socket,
+      // two held slots, the mirrored stroke, the arm behind the hand. Spawns
+      // one fixture and resets on the way out, like `kit-instance`.
+      {"dual-wield", "equipment", {"prefab"}, false, GateDualWield},
   };
   return g;
 }

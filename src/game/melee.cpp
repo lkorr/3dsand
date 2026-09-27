@@ -1123,7 +1123,9 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // Mob::StainWound draws when it refuses to bleed a sword.
       int li = -1;
       Mob* owner = mobs.FindOwner(hb, &li);
-      if (owner != nullptr && li >= 0 && li == owner->HeldSlot()) continue;
+      // EITHER fist's item (dual wielding): the off hand's blade is no more
+      // flesh than the striking one's.
+      if (owner != nullptr && li >= 0 && owner->IsHeldSlot(li)) continue;
 
       // ---- WHAT WAS STRUCK, ASKED ONCE (game/impact.h StruckKind) ----------
       //

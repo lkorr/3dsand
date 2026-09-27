@@ -2003,6 +2003,13 @@ struct Tuning {
     float chainWindupRate = TPD(melee, chainWindupRate);
     // compass steps either side of dead opposite that still chain
     int chainSectorLeeway = TPD(melee, chainSectorLeeway);
+    // AN INJURED ARM (Mob::HandCondition: the arm chain's weakest hp
+    //   fraction). Below `injuredArmFrom` its strokes slow, up to
+    //   1 + `injuredArmSlow` times as long; below `injuredArmDrop` the
+    //   hand lets go of what it holds.
+    float injuredArmFrom = TPD(melee, injuredArmFrom);
+    float injuredArmSlow = TPD(melee, injuredArmSlow);
+    float injuredArmDrop = TPD(melee, injuredArmDrop);
     // ---- BLADE ON BLADE (game/melee.h MeleeSweepDamage's parry block) -------
     // The four knobs a parry has. They are `melee.*` rather than `combatfx.*`
     // because a block is MECHANICS — it stops a cut, it costs the blocking
