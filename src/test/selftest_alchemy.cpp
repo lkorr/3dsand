@@ -19,8 +19,16 @@
 #include <string>
 #include <vector>
 
+#include "game/alchemy_bench.h"
+#include "game/container.h"
 #include "game/flasksim.h"
 #include "game/flasksim_mats.h"
+#include "game/item.h"
+#include "game/iteminstance.h"
+#include "game/mob.h"
+#include "sim/bytestream.h"
+#include "sim/solutes.h"
+#include "sim/world.h"
 #include "test/selftest.h"
 #include "test/support.h"
 
@@ -402,6 +410,570 @@ Status GateAlchemySandCarry(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+
+// ---- BENCH CHEMISTRY (docs/PLAN_alchemy_chemistry.md package C) -------------
+//
+// The bench runs the WORLD'S compiled rules (flasksim_mats.h
+// BuildBenchChemistry over c.mats / c.reactions, plus solutes.json). A gate
+// whose rule the table does not carry (a table from before package A, or a
+// rule later retuned away) appends a FIXTURE rule so the mechanism is still
+// tested -- and says so in its detail line, so a gate that is only testing its
+// own fixture is visible as such.
+namespace {
+
+struct ChemBench {
+  std::vector<alchemy::Substance> subs;
+  alchemy::Chemistry chem;
+  std::vector<SoluteDef> solutes;
+  std::string fixtures;   // what the gate had to author itself
+};
+
+ChemBench MakeChemBench(Ctx& c) {
+  ChemBench b;
+  std::string err;
+  LoadSolutes(AssetDir() + "/materials/solutes.json", c.mats, b.solutes, err);
+  b.subs = alchemy::BenchSubstances(c.mats, c.reactions);
+  b.chem = alchemy::BuildBenchChemistry(c.mats, c.reactions, b.solutes, b.subs);
+  return b;
+}
+
+int SlotOfName(const ChemBench& b, Ctx& c, const char* n) {
+  const int m = MatId(c, n);
+  for (size_t i = 0; i < b.subs.size(); i++)
+    if ((int)b.subs[i].mat == m) return (int)i;
+  return -1;
+}
+
+// Does the table carry a pair rule of `self` whose neighbour predicate
+// matches `nbr` and that turns something into `product` (self or neighbour)?
+bool HasPairRule(const ChemBench& b, int self, int nbr, int product) {
+  if (self < 0 || nbr < 0) return false;
+  const alchemy::Substance& n = b.subs[nbr];
+  for (const alchemy::ChemRule& r : b.chem.rules[self])
+    if (r.kind == alchemy::kChemPair && alchemy::ChemNbrMatches(r, n.mat, n.tagMask, n.klass, false) &&
+        (product < 0 || r.prodSelf == product || r.prodNbr == product))
+      return true;
+  return false;
+}
+bool HasVirtualRule(const ChemBench& b, int self, const alchemy::ChemVirtual& v, int product) {
+  if (self < 0) return false;
+  for (const alchemy::ChemRule& r : b.chem.rules[self])
+    if (r.kind == alchemy::kChemPair && alchemy::ChemNbrMatches(r, v.mat, v.tags, v.klass, false) &&
+        (product < 0 || r.prodSelf == product || r.prodNbr == product))
+      return true;
+  return false;
+}
+// A fixture rule, FIRST in the bucket (first-match: it is the one tried).
+void AddFixtureRule(ChemBench& b, int self, alchemy::ChemRule r, const char* what) {
+  b.chem.rules[self].insert(b.chem.rules[self].begin(), r);
+  b.fixtures += std::string(b.fixtures.empty() ? "" : ", ") + what;
+}
+
+alchemy::SimConfig ChemConfig() {
+  alchemy::SimConfig cfg = BenchConfig();
+  cfg.chemRate = 2.0f;   // AlchemyBench::Open's
+  cfg.tableY = 4.0f;
+  return cfg;
+}
+
+// The ValidateBench a session of this sim would get: `in` came on (one
+// vessel), `drained` went out live (the gas in it vented), the ledger is the
+// sim's. True = before + produced - consumed == after + spilled + streamed +
+// vented for every material.
+bool BenchLedgerHolds(Ctx& c, const alchemy::FlaskSim& s, const Composition& in, int vessel,
+                      const Composition& drained, std::string& why) {
+  alchemy::BenchResult r;
+  const alchemy::Tally t = s.Count();
+  alchemy::BenchEntry e;
+  e.before = in;
+  e.after = vessel >= 0 && vessel < (int)t.vessel.size() ? t.vessel[vessel] : Composition{};
+  e.capacity = 1 << 20;
+  r.vessels.push_back(e);
+  r.spilled = t.spilled;
+  r.streamed.assign(c.mats.size(), 0);
+  r.vented.assign(c.mats.size(), 0);
+  for (int i = 0; i < drained.n; i++) {
+    const uint16_t m = drained.p[i].mat;
+    if (m >= c.mats.size()) continue;
+    (c.mats[m].gpu.klass == CLASS_GAS ? r.vented : r.streamed)[m] += drained.p[i].eighths;
+  }
+  r.unitsPerEighth = 12;
+  r.produced.assign(c.mats.size(), 0);
+  r.consumed.assign(c.mats.size(), 0);
+  for (size_t sl = 0; sl < s.Produced().size(); sl++) {
+    const uint16_t m = s.Sub((int)sl).mat;
+    r.produced[m] += s.Produced()[sl];
+    r.consumed[m] += s.Consumed()[sl];
+  }
+  return alchemy::ValidateBench(r, c.mats, why);
+}
+
+void Drain(alchemy::FlaskSim& s, Composition& drained) {
+  const Composition d = s.DrainSpilled();
+  for (int i = 0; i < d.n; i++) drained.Add(d.p[i].mat, d.p[i].eighths);
+}
+
+}  // namespace
+
+// ACID EATS SAND, AND THE FUMES LEAVE THROUGH THE MOUTH. A flask of acid over
+// a bed of sand, left on the bench: the world's own acid rules eat the sand,
+// some of it goes up as noxious gas, the gas rises out of the neck and is
+// DRAINED -- in the game that is the live stream that puts it into the world
+// at the hand's lip. Asserted: sand eaten, gas made and vented, the units
+// audit exact and the ledger's ValidateBench passing.
+Status GateAlchemyReact(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int acid = SlotOfName(b, c, "acid"), sand = SlotOfName(b, c, "sand"),
+            nox = SlotOfName(b, c, "noxious_gas");
+  if (acid < 0 || sand < 0 || nox < 0) { detail = "missing acid/sand/noxious_gas"; return Status::Fail; }
+  if (!HasPairRule(b, acid, sand, nox)) {
+    alchemy::ChemRule r;
+    r.nbrMat = b.subs[sand].mat;
+    r.chance = 40 * 2000;
+    r.prodNbr = nox;
+    AddFixtureRule(b, acid, r, "acid+sand->noxious_gas");
+  }
+  Composition in;
+  in.Add(b.subs[acid].mat, 200);
+  in.Add(b.subs[sand].mat, 60);
+  alchemy::FlaskSim s(ChemConfig());
+  s.SetSubstances(b.subs);
+  s.SetChemistry(b.chem);
+  const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in);
+  Composition drained;
+  int maxGas = 0;
+  for (int f = 0; f < 60 * 18; f++) {
+    s.Step(4);
+    Drain(s, drained);
+    maxGas = std::max(maxGas, s.GasPixelCount());
+    if (f == 240) Shot(s, "alchemy_react.bmp");
+  }
+  const alchemy::Tally t = s.Count();
+  const uint32_t sandLeft = t.vessel[v].AmountOf(b.subs[sand].mat) + t.spilled.AmountOf(b.subs[sand].mat);
+  const int64_t gasMade = s.Produced()[nox];
+  const uint32_t vented = drained.AmountOf(b.subs[nox].mat);
+  std::string why, lwhy;
+  const bool audit = s.AuditUnits(&why);
+  const bool ledger = BenchLedgerHolds(c, s, in, v, drained, lwhy);
+  const bool eaten = sandLeft + 10 <= 60;
+  const bool ok = audit && ledger && eaten && gasMade > 0 && vented > 0;
+  RecordObserved("alchemy.reactVentedEighths", vented);
+  detail = Format("sand 60 -> %u eighths; noxious gas made %lld units, %u eighths vented out of the mouth "
+                  "(peak %d gas pixels); %d firings; audit %s; ledger %s%s%s",
+                  sandLeft, (long long)gasMade, vented, maxGas, s.ReactionsFired(), audit ? "exact" : why.c_str(),
+                  ledger ? "validates" : lwhy.c_str(), b.fixtures.empty() ? "" : "; FIXTURE rules: ",
+                  b.fixtures.c_str());
+  std::printf("alchemy-react: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// A STOPPERED FLASK KEEPS ITS GAS -- AND PRESSURE POPS OR BURSTS IT. (1) The
+// acid and sand of alchemy-react, stoppered: nothing vents, the gas is in the
+// flask. (2) A stoppered flask packed with gas past its headspace: the
+// stopper POPS (a "pop" event, the flask is open after it). (3) A stoppered
+// flask of water on the burner: the steam builds against hot glass and the
+// flask BURSTS (a "burst" event, the vessel gone, its contents loose -- and
+// still every unit accounted for).
+Status GateAlchemyStopper(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int acid = SlotOfName(b, c, "acid"), sand = SlotOfName(b, c, "sand"),
+            nox = SlotOfName(b, c, "noxious_gas"), water = SlotOfName(b, c, "water"),
+            steam = SlotOfName(b, c, "steam"), chl = SlotOfName(b, c, "chlorine");
+  if (acid < 0 || sand < 0 || nox < 0 || water < 0 || steam < 0 || chl < 0) {
+    detail = "missing materials";
+    return Status::Fail;
+  }
+  if (!HasPairRule(b, acid, sand, nox)) {
+    alchemy::ChemRule r;
+    r.nbrMat = b.subs[sand].mat;
+    r.chance = 40 * 2000;
+    r.prodNbr = nox;
+    AddFixtureRule(b, acid, r, "acid+sand->noxious_gas");
+  }
+  if (!HasVirtualRule(b, water, b.chem.heat, steam)) {
+    alchemy::ChemRule r;
+    r.nbrTags = b.chem.heat.tags;
+    r.chance = 180 * 2000;
+    r.prodSelf = steam;
+    AddFixtureRule(b, water, r, "water+tag:hot->steam");
+  }
+  // (1) held
+  Composition in;
+  in.Add(b.subs[acid].mat, 200);
+  in.Add(b.subs[sand].mat, 60);
+  alchemy::FlaskSim s(ChemConfig());
+  s.SetSubstances(b.subs);
+  s.SetChemistry(b.chem);
+  const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in, true);
+  Composition drained;
+  int maxGas = 0;
+  bool popped = false;
+  for (int f = 0; f < 60 * 12; f++) {
+    s.Step(4);
+    Drain(s, drained);
+    maxGas = std::max(maxGas, s.GasUnits(v));
+    for (const alchemy::SimEvent& e : s.TakeEvents()) popped |= e.kind == "pop" || e.kind == "burst";
+  }
+  Shot(s, "alchemy_stopper.bmp");
+  const uint32_t vented = drained.AmountOf(b.subs[nox].mat);
+  std::string why, lwhy;
+  const bool audit1 = s.AuditUnits(&why);
+  const bool ledger1 = BenchLedgerHolds(c, s, in, v, drained, lwhy);
+  const bool held = (vented == 0 || popped) && maxGas > 0 && s.Stoppered(v) != popped;
+
+  // (2) pop: a small flask of water with far more chlorine than its headspace.
+  Composition gasIn;
+  gasIn.Add(b.subs[water].mat, 60);
+  gasIn.Add(b.subs[chl].mat, 400);
+  alchemy::FlaskSim s2(ChemConfig());
+  s2.SetSubstances(b.subs);
+  s2.SetChemistry(b.chem);
+  const int v2 = s2.AddVessel(BenchFlask(256), {{240, 4}, 0}, gasIn, true);
+  int popAt = -1;
+  std::string kinds2;
+  Composition drained2;
+  for (int f = 0; f < 240 && popAt < 0; f++) {
+    s2.Step(4);
+    Drain(s2, drained2);
+    for (const alchemy::SimEvent& e : s2.TakeEvents()) {
+      kinds2 += e.kind + " ";
+      if (e.kind == "pop") popAt = f;
+    }
+  }
+  const bool pop = popAt >= 0 && !s2.Stoppered(v2) && s2.VesselAlive(v2);
+  std::string why2;
+  const bool audit2 = s2.AuditUnits(&why2);
+
+  // (3) burst: water, stoppered, on the burner.
+  Composition wIn;
+  wIn.Add(b.subs[water].mat, 140);
+  alchemy::FlaskSim s3(ChemConfig());
+  s3.SetSubstances(b.subs);
+  s3.SetChemistry(b.chem);
+  const int v3 = s3.AddVessel(BenchFlask(256), {{240, 4}, 0}, wIn, true);
+  s3.SetBurner(v3, true);
+  int burstAt = -1;
+  Composition drained3;
+  for (int f = 0; f < 60 * 30 && burstAt < 0; f++) {
+    s3.Step(4);
+    Drain(s3, drained3);
+    for (const alchemy::SimEvent& e : s3.TakeEvents())
+      if (e.kind == "burst") burstAt = f;
+  }
+  for (int f = 0; f < 120; f++) {
+    s3.Step(4);
+    Drain(s3, drained3);
+  }
+  Shot(s3, "alchemy_burst.bmp");
+  const bool burst = burstAt >= 0 && s3.Broken(v3) && !s3.VesselAlive(v3);
+  std::string why3;
+  const bool audit3 = s3.AuditUnits(&why3);
+
+  // THE STOPPER ON THE ITEM: a stoppered flask pours nothing, scoops
+  // nothing, and keeps its stopper -- and a dissolved portion -- through the
+  // item record (iteminstance.h kItemFmtStopper); an older format drops the
+  // stopper, never the record.
+  bool itemOk = false;
+  std::string itemNote = "no flask item";
+  if (const int fi = c.items.Find("flask"); fi >= 0) {
+    const ItemDef* fd = c.items.At(fi);
+    ItemInstance st;
+    st.name = fd->name;
+    st.count = 1;
+    st.contents.Add(b.subs[water].mat, 64);
+    st.contents.Add((uint16_t)(MatId(c, "salt") | alchemy::kDissolvedBit), 5);
+    st.stoppered = true;
+    const char* w = nullptr;
+    const bool refuses = !ContainerAccepts(*fd, st, b.subs[water].mat, c.mats, &w);
+    std::vector<ParticleSpawn> ps;
+    ItemInstance pour = st;
+    const int poured = ContainerPour(*fd, pour, Vec3{0, 50, 0}, Vec3{1, 0, 0}, nullptr, 8, 1, 1u, ps, nullptr,
+                                     0xFFFFFFFFu, &c.mats);
+    std::vector<uint8_t> buf, buf1;
+    ByteWriter bw{buf};
+    WriteItemInstance(bw, st, kItemFmtStopper);
+    ByteReader br{buf.data(), buf.size()};
+    ItemInstance back;
+    const bool read = ReadItemInstance(br, back, kItemFmtStopper);
+    ByteWriter bw1{buf1};
+    WriteItemInstance(bw1, st, kItemFmtMixed);
+    ByteReader br1{buf1.data(), buf1.size()};
+    ItemInstance old;
+    ReadItemInstance(br1, old, kItemFmtMixed);
+    const bool trip = read && back.stoppered && back.contents.SameAs(st.contents);
+    itemOk = refuses && poured == 0 && ps.empty() && trip && !old.stoppered && old.contents.SameAs(st.contents);
+    itemNote = Format("item: scoop %s (%s), pour %d, record %s, older format %s", refuses ? "refused" : "ALLOWED",
+                      w ? w : "", poured, trip ? "keeps stopper + dissolved salt" : "LOSES IT",
+                      old.stoppered ? "KEPT A STOPPER" : "unstoppered");
+  }
+  const bool ok = held && audit1 && ledger1 && pop && audit2 && burst && audit3 && itemOk;
+  detail = Format("held: peak %d gas units inside, %u eighths vented%s, audit %s, ledger %s; "
+                  "pop: %s (frame %d; events %s) audit %s; burst: %s (frame %d, heat %.2f) audit %s%s%s",
+                  maxGas, vented, popped ? " (after it popped)" : "", audit1 ? "exact" : why.c_str(),
+                  ledger1 ? "validates" : lwhy.c_str(), pop ? "yes" : "NO", popAt, kinds2.c_str(),
+                  audit2 ? "exact" : why2.c_str(), burst ? "yes" : "NO", burstAt, s3.Heat(v3),
+                  audit3 ? "exact" : why3.c_str(), b.fixtures.empty() ? "" : "; FIXTURE rules: ",
+                  b.fixtures.c_str());
+  detail += "; " + itemNote;
+  std::printf("alchemy-stopper: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// DISSOLVING (solutes.json). Salt in water: grains vanish into the liquid,
+// the tally reports a DISSOLVED portion (contract 2.4) equal to what
+// dissolved, salt conserved across both forms; taken off the bench and put
+// back, the dissolved portion goes back into the water. Fairy dust in water:
+// enchanted water appears.
+Status GateAlchemyDissolve(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int water = SlotOfName(b, c, "water"), salt = SlotOfName(b, c, "salt"),
+            fairy = SlotOfName(b, c, "fairy_dust"), ench = SlotOfName(b, c, "enchanted_water");
+  if (water < 0 || salt < 0 || fairy < 0 || ench < 0) { detail = "missing materials"; return Status::Fail; }
+  if (!b.chem.SoluteFrom(salt) || !b.chem.SoluteFrom(fairy)) {
+    detail = "solutes.json has no salt / fairy species";
+    return Status::Fail;
+  }
+  const uint16_t mSalt = b.subs[salt].mat, dSalt = (uint16_t)(mSalt | alchemy::kDissolvedBit);
+  Composition in;
+  in.Add(b.subs[water].mat, 300);
+  in.Add(mSalt, 20);
+  alchemy::FlaskSim s(ChemConfig());
+  s.SetSubstances(b.subs);
+  s.SetChemistry(b.chem);
+  const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in);
+  for (int f = 0; f < 60 * 15; f++) {
+    // Stirred for the first half: it dissolves where it touches.
+    const bool on = f >= 30 && f < 450;
+    const float ph = f * 0.08f;
+    s.SetStick(on, {240 + 5 * std::sin(ph), 170}, {240 + 34 * std::sin(ph + 0.4f), 16}, 2.5f);
+    s.Step(4);
+  }
+  s.SetStick(false);
+  for (int f = 0; f < 120; f++) s.Step(4);
+  Shot(s, "alchemy_dissolve.bmp");
+  const alchemy::Tally t = s.Count();
+  const uint32_t grains = t.vessel[v].AmountOf(mSalt), dis = t.vessel[v].AmountOf(dSalt);
+  const int64_t disUnits = s.DissolvedUnits(salt);
+  const bool tallyMatches = (int64_t)dis * 12 <= disUnits + 12 && disUnits <= (int64_t)dis * 12 + 12;
+  const bool conserved = grains + dis + t.spilled.AmountOf(mSalt) + t.spilled.AmountOf(dSalt) == 20;
+  std::string why;
+  const bool audit = s.AuditUnits(&why);
+  // Round trip: take it off, put it back.
+  const Composition off = s.RemoveVessel(v);
+  alchemy::FlaskSim s2(ChemConfig());
+  s2.SetSubstances(b.subs);
+  s2.SetChemistry(b.chem);
+  s2.AddVessel(BenchFlask(512), {{240, 4}, 0}, off);
+  const int64_t back = s2.DissolvedUnits(salt);
+  const bool trip = off.AmountOf(dSalt) > 0 && back == (int64_t)off.AmountOf(dSalt) * 12;
+  // Fairy dust.
+  Composition fin;
+  fin.Add(b.subs[water].mat, 200);
+  fin.Add(b.subs[fairy].mat, 40);
+  alchemy::FlaskSim s3(ChemConfig());
+  s3.SetSubstances(b.subs);
+  s3.SetChemistry(b.chem);
+  const int v3 = s3.AddVessel(BenchFlask(512), {{240, 4}, 0}, fin);
+  for (int f = 0; f < 60 * 12; f++) {
+    const bool on = f >= 30 && f < 400;
+    const float ph = f * 0.08f;
+    s3.SetStick(on, {240 + 5 * std::sin(ph), 170}, {240 + 34 * std::sin(ph + 0.4f), 16}, 2.5f);
+    s3.Step(4);
+  }
+  s3.SetStick(false);
+  Shot(s3, "alchemy_fairy.bmp");
+  const alchemy::Tally t3 = s3.Count();
+  const uint32_t enchanted = t3.vessel[v3].AmountOf(b.subs[ench].mat);
+  std::string why3;
+  const bool audit3 = s3.AuditUnits(&why3);
+  const bool ok = dis > 0 && grains < 20 && tallyMatches && conserved && audit && trip && enchanted > 0 && audit3;
+  detail = Format("salt 20 -> %u grains + %u dissolved (%lld units in the water; tally %s), %s, audit %s; "
+                  "off and on again: %u dissolved eighths -> %lld units %s; fairy dust 40 + water 200 -> "
+                  "%u enchanted water, audit %s",
+                  grains, dis, (long long)disUnits, tallyMatches ? "matches" : "DIFFERS",
+                  conserved ? "conserved" : "NOT CONSERVED", audit ? "exact" : why.c_str(), off.AmountOf(dSalt),
+                  (long long)back, trip ? "(back in solution)" : "(LOST)", enchanted,
+                  audit3 ? "exact" : why3.c_str());
+  std::printf("alchemy-dissolve: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ELECTROLYSIS, THE WORLD'S WAY: salt over the burner melts (salt + tag:hot
+// -> molten_salt, the heat a VIRTUAL neighbour through the glass); electrify
+// it and the discharge (a virtual spark neighbour) splits it -- molten_salt +
+// tag:electric -> sodium + chlorine, the chlorine MATERIALISED where the
+// spark touched, as the world's spark voxel becomes chlorine.
+Status GateAlchemyElectrolysis(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int salt = SlotOfName(b, c, "salt"), ms = SlotOfName(b, c, "molten_salt"),
+            na = SlotOfName(b, c, "sodium"), cl = SlotOfName(b, c, "chlorine");
+  if (salt < 0 || ms < 0 || na < 0 || cl < 0) { detail = "missing materials"; return Status::Fail; }
+  if (!b.chem.heat.on || !b.chem.spark.on) { detail = "no tag:hot / tag:electric in the table"; return Status::Fail; }
+  if (!HasVirtualRule(b, salt, b.chem.heat, ms)) {
+    alchemy::ChemRule r;
+    r.nbrTags = b.chem.heat.tags;
+    r.chance = 60 * 2000;
+    r.prodSelf = ms;
+    AddFixtureRule(b, salt, r, "salt+tag:hot->molten_salt");
+  }
+  if (!HasVirtualRule(b, ms, b.chem.spark, na)) {
+    alchemy::ChemRule r;
+    r.nbrTags = b.chem.spark.tags;
+    r.chance = 500 * 2000;
+    r.prodSelf = na;
+    r.prodNbr = cl;
+    AddFixtureRule(b, ms, r, "molten_salt+tag:electric->sodium+chlorine");
+  }
+  Composition in;
+  in.Add(b.subs[salt].mat, 60);
+  alchemy::FlaskSim s(ChemConfig());
+  s.SetSubstances(b.subs);
+  s.SetChemistry(b.chem);
+  const int v = s.AddVessel(BenchFlask(256), {{240, 4}, 0}, in);
+  s.SetBurner(v, true);
+  int meltAt = -1;
+  for (int f = 0; f < 60 * 20 && meltAt < 0; f++) {
+    s.Step(4);
+    if (s.Produced()[ms] >= 12 * 6) meltAt = f;
+  }
+  Shot(s, "alchemy_molten.bmp");
+  const int64_t molten = s.Produced()[ms];
+  // Electrify, every half second, for a few seconds; the burner stays on.
+  for (int f = 0; f < 60 * 6; f++) {
+    if (f % 30 == 0) s.Shock(v);
+    s.Step(4);
+    if (f == 8) Shot(s, "alchemy_electrify.bmp");
+  }
+  const int64_t sodium = s.Produced()[na], chlorine = s.Produced()[cl];
+  std::string why;
+  const bool audit = s.AuditUnits(&why);
+  const bool ok = meltAt >= 0 && sodium > 0 && chlorine > 0 && audit;
+  detail = Format("burner: %lld units of molten salt by frame %d (heat %.2f); electrify: %lld units sodium, "
+                  "%lld units chlorine; audit %s%s%s",
+                  (long long)molten, meltAt, s.Heat(v), (long long)sodium, (long long)chlorine,
+                  audit ? "exact" : why.c_str(), b.fixtures.empty() ? "" : "; FIXTURE rules: ", b.fixtures.c_str());
+  std::printf("alchemy-electrolysis: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// SODIUM IN WATER EXPLODES -- ON THE BENCH TOO. A flask of water with a
+// pinch of sodium: the world's explode-rule fires on the bench and raises an
+// `explode` BenchEvent. Its registered handler ejects the player, breaks the
+// held vessels and asks for a REAL blast at the hands; the pure half of the
+// game's answer (BenchOutcomeWorldOps) is an ExplosionOp at the hands of the
+// authored size and a puff of the reaction's gases. The vessel's remains go
+// to the world as a BURST spill through the one vessel->world door
+// (ContainerSpillStep), which must emit every eighth -- and the session's
+// ledger still validates though it ended mid-reaction.
+Status GateAlchemyExplode(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int water = SlotOfName(b, c, "water"), na = SlotOfName(b, c, "sodium"),
+            lye = SlotOfName(b, c, "lye"), h2 = SlotOfName(b, c, "hydrogen");
+  if (water < 0 || na < 0 || lye < 0 || h2 < 0) { detail = "missing materials"; return Status::Fail; }
+  bool authored = false;
+  for (const alchemy::ChemRule& r : b.chem.rules[na])
+    authored |= r.fx >= 0 && b.chem.effects[r.fx].kind == "explode" && r.kind == alchemy::kChemPair &&
+                alchemy::ChemNbrMatches(r, b.subs[water].mat, b.subs[water].tagMask, b.subs[water].klass, false);
+  if (!authored) {
+    alchemy::ChemRule r;
+    r.nbrMat = b.subs[water].mat;
+    r.chance = 300 * 2000;
+    r.prodSelf = h2;
+    r.prodNbr = lye;
+    r.fx = (int)b.chem.effects.size();
+    alchemy::ChemEffect e;
+    e.kind = "explode";
+    e.radius = 5;
+    e.power = 150;
+    b.chem.effects.push_back(e);
+    AddFixtureRule(b, na, r, "sodium+water->explode");
+  }
+  Composition in;
+  in.Add(b.subs[water].mat, 200);
+  in.Add(b.subs[na].mat, 10);
+  alchemy::FlaskSim s(ChemConfig());
+  s.SetSubstances(b.subs);
+  s.SetChemistry(b.chem);
+  const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in);
+  alchemy::SimEvent ev;
+  int at = -1;
+  for (int f = 0; f < 240 && at < 0; f++) {
+    s.Step(4);
+    for (const alchemy::SimEvent& e : s.TakeEvents())
+      if (e.kind == "explode" && at < 0) { ev = e; at = f; }
+  }
+  Shot(s, "alchemy_explode.bmp");
+  // The handler, through the registry.
+  alchemy::BenchEvent be;
+  be.kind = ev.kind;
+  be.entry = 0;
+  be.radius = ev.radius;
+  be.power = ev.power;
+  be.count = ev.count;
+  be.products = ev.products;
+  alchemy::BenchOutcome out;
+  const bool handled = at >= 0 && alchemy::DispatchBenchEvent(be, out);
+  const Vec3 hands{100.5f, 60.5f, 100.5f};
+  std::vector<ExplosionOp> exps;
+  std::vector<GasSpawnOp> gas;
+  alchemy::BenchOutcomeWorldOps(out, hands, 0x5EEDu, c.mats, exps, gas);
+  const bool blastOk = exps.size() == 1 && exps[0].x == 100 && exps[0].y == 60 && exps[0].z == 100 &&
+                       exps[0].radius >= ev.radius && exps[0].power == ev.power;
+  bool puffOk = !gas.empty();
+  for (const GasSpawnOp& g : gas) puffOk &= (g.payload & 0xFFFu) < c.mats.size() &&
+                                              c.mats[g.payload & 0xFFFu].gpu.klass == CLASS_GAS;
+  // Ejected mid-reaction: the tally where it stands, the ledger, then the
+  // vessel's remains out through the spill door.
+  std::string lwhy;
+  const bool ledger = BenchLedgerHolds(c, s, in, v, Composition{}, lwhy);
+  const alchemy::Tally t = s.Count();
+  ContainerSpill sp;
+  sp.at = hands;
+  sp.away = Vec3{0, 1, 0};
+  sp.rest = t.vessel[v];
+  sp.seed = 0x5117u;
+  int emitted = 0;
+  std::vector<FluidSpawnOp> fl;
+  std::vector<ParticleSpawn> pa;
+  std::vector<GasSpawnOp> gs;
+  SplatterEvent splat;
+  for (int k = 0; k < 64 && !sp.Done(); k++) {
+    fl.clear();
+    pa.clear();
+    emitted += ContainerSpillStep(sp, c.mats, 1000 + k, 4096, fl, pa, &splat, 0xFFFFFFFFu, &gs, 1024);
+  }
+  const bool spillOk = sp.Done() && emitted == (int)t.vessel[v].Total();
+  // POCKET CHEMISTRY (ContainerPocketExplosion): off the bench, a flask that
+  // has sodium and water meet in it goes off too -- by the authored rule.
+  std::string pocketNote = "pocket: not authored (fixture rule has no ruleFx)";
+  bool pocketOk = true;
+  if (authored) {
+    ReactionEffect pfx, nfx;
+    Composition both, alone;
+    both.Add(b.subs[na].mat, 8);
+    both.Add(b.subs[water].mat, 40);
+    alone.Add(b.subs[na].mat, 8);
+    const bool boom = ContainerPocketExplosion(both, c.mats, c.reactions, pfx) && pfx.kind == "explode";
+    const bool calm = !ContainerPocketExplosion(alone, c.mats, c.reactions, nfx);
+    pocketOk = boom && calm;
+    pocketNote = Format("pocket: sodium+water %s (r%d p%d), sodium alone %s", boom ? "explodes" : "DOES NOT",
+                        pfx.radius, pfx.power, calm ? "calm" : "EXPLODES");
+  }
+  const bool ok = at >= 0 && handled && out.eject && out.breakHeld && blastOk && puffOk && ledger && spillOk &&
+                  pocketOk;
+  detail = Format("explode event at frame %d (x%d, radius %d power %d); handler: eject %s, break %s, blast %s "
+                  "(r%d p%d at the hands), puff %zu gas parcels %s; ledger %s; the broken flask's %u eighths "
+                  "-> %d emitted through the spill door (%zu gas parcels) %s%s%s",
+                  at, ev.count, ev.radius, ev.power, out.eject ? "yes" : "NO", out.breakHeld ? "yes" : "NO",
+                  blastOk ? "ok" : "WRONG", exps.empty() ? 0 : exps[0].radius, exps.empty() ? 0 : exps[0].power,
+                  gas.size(), puffOk ? "ok" : "WRONG", ledger ? "validates" : lwhy.c_str(), t.vessel[v].Total(),
+                  emitted, gs.size(), spillOk ? "ok" : "SHORT", b.fixtures.empty() ? "" : "; FIXTURE rules: ",
+                  b.fixtures.c_str());
+  detail += "; " + pocketNote;
+  std::printf("alchemy-explode: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AlchemyGates() {
@@ -413,6 +985,12 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-shake", "player", {}, false, GateAlchemyShake},
       {"alchemy-spawn", "player", {}, false, GateAlchemySpawn},
       {"alchemy-sand-carry", "player", {}, false, GateAlchemySandCarry},
+      // Bench chemistry (package C): the world's rules on the bench.
+      {"alchemy-react", "player", {}, false, GateAlchemyReact},
+      {"alchemy-stopper", "player", {}, false, GateAlchemyStopper},
+      {"alchemy-dissolve", "player", {}, false, GateAlchemyDissolve},
+      {"alchemy-electrolysis", "player", {}, false, GateAlchemyElectrolysis},
+      {"alchemy-explode", "player", {}, false, GateAlchemyExplode},
   };
   return g;
 }

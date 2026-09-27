@@ -5654,7 +5654,11 @@ class MobSystem {
   // carries a Composition -- up to 16 (material, eighths) portions -- where
   // it carried one packed word (iteminstance.h WriteItemInstance `mixed`). A
   // v7/v8 record's flask loads as the one portion its word named.
-  static constexpr uint32_t kSaveVersion = 9;
+  //
+  // 10 (2026-09-27): A VESSEL'S STOPPER. Every ItemInstance ends with its
+  // stopper word (iteminstance.h kItemFmtStopper); a v9 record's vessels
+  // load unstoppered.
+  static constexpr uint32_t kSaveVersion = 10;
   static constexpr uint32_t kSaveVersionMin = 3;
   // Record limb kinds (v4).
   static constexpr uint32_t kLimbSevered = 0;
@@ -5986,6 +5990,13 @@ class MobSystem {
     float intensity = 0;   // 0..1 of the bleed budget cap
   };
   const std::vector<BleedSource>& BleedSources() const { return bleeds_; }
+  // Reaction effects that fired on a body this tick (docs/PLAN_alchemy_
+  // chemistry.md A): drained once per tick by game/session.cpp.
+  std::vector<ReactFxEvent> TakeBodyReactFx() {
+    std::vector<ReactFxEvent> out;
+    out.swap(bodyFx_);
+    return out;
+  }
 
   // ---- hit flash ----------------------------------------------------------
   // Age every limb's hit flash. Called from PreTick, so it runs wherever the
@@ -6728,6 +6739,9 @@ class MobSystem {
   // True once the reaction mirror has been built. A caller with no tables must
   // not burn: it would silently do nothing rather than fail.
   bool BurnTablesReady() const { return !reactions_.empty() && !matGpu_.empty(); }
+  // The compiled reaction table this system was given (the vessels' pocket
+  // chemistry reads it: container.h ContainerPocketExplosion).
+  const std::vector<ReactionGpu>& Reactions() const { return reactions_; }
   // World position of one of a limb's SURVIVING voxels — the `n`th, wrapped.
   // Deliberately not the centroid: once a carve has hollowed a limb, its
   // centroid is in the cavity, and a tool aimed there eats nothing. Anything
@@ -6949,6 +6963,12 @@ class MobSystem {
   std::vector<uint8_t> matHasPair_;     // has pair rules — i.e. is ignitable
   WornStats wornStats_{};
   BurnStats burnStats_{};
+  // Reaction effects that fired ON a body this tick (BurnOneLimb's
+  // noteBodyFx), drained by game/session.cpp's reaction-effect pass through
+  // TakeBodyReactFx. Capped per tick (a body standing in a sodium spill
+  // should not queue hundreds); the session merges and caps again.
+  std::vector<ReactFxEvent> bodyFx_;
+  static constexpr size_t kBodyFxPerTick = 16;
   std::vector<uint8_t> matHot_;         // carries tag:hot
   std::vector<uint8_t> matInfectious_; // carries tag:infectious
   // Material has a pair rule that REWRITES ITS NEIGHBOUR. This is the inbound

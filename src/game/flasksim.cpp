@@ -170,6 +170,10 @@ FlaskSim::FlaskSim(const SimConfig& cfg) : cfg_(cfg), rng_(cfg.seed | 1u) {
   cellsH_ = (int)std::ceil(cfg_.gridH / cellSize_) + 1;
   grid_.assign((size_t)cfg_.gridW * cfg_.gridH, 0);
   wall_.assign((size_t)cfg_.gridW * cfg_.gridH, 0);
+  gasSub_.assign((size_t)cfg_.gridW * cfg_.gridH, 0xFF);
+  gasAmt_.assign((size_t)cfg_.gridW * cfg_.gridH, 0);
+  gasAge_.assign((size_t)cfg_.gridW * cfg_.gridH, 0);
+  gasListed_.assign((size_t)cfg_.gridW * cfg_.gridH, 0);
 }
 
 void FlaskSim::SetSubstances(const std::vector<Substance>& subs) {
@@ -177,6 +181,18 @@ void FlaskSim::SetSubstances(const std::vector<Substance>& subs) {
   mass_.resize(subs.size());
   visc_.resize(subs.size());
   spilledUnits_.assign(subs.size(), 0);
+  slotOf_.clear();
+  for (size_t i = 0; i < subs.size(); i++) {
+    if (subs[i].mat >= slotOf_.size()) slotOf_.resize((size_t)subs[i].mat + 1, -1);
+    slotOf_[subs[i].mat] = (int)i;
+  }
+  produced_.assign(subs.size(), 0);
+  consumed_.assign(subs.size(), 0);
+  seeded_.assign(subs.size(), 0);
+  removed_.assign(subs.size(), 0);
+  drained_.assign(subs.size(), 0);
+  present_.assign(subs.size(), 0);
+  activeSlot_.assign(subs.size(), 0);
   for (size_t i = 0; i < subs.size(); i++) {
     // The 3D sim's density decides the ORDER; the exponent stretches the
     // gaps (water 1000 vs oil 900 is 10%, which relaxes into a mushy
@@ -269,15 +285,23 @@ bool FlaskSim::InsideLocal(const Vessel& v, V2 p) const {
 
 bool FlaskSim::InsideVessel(const Vessel& v, V2 w) const { return InsideLocal(v, ToLocal(v.x, w)); }
 
-int FlaskSim::AddVessel(const VesselShape& shape, const Xform& x, const Composition& c) {
+int FlaskSim::AddVessel(const VesselShape& shape, const Xform& x, const Composition& c,
+                        bool stoppered) {
   Vessel v;
   v.shape = shape;
   v.x = v.prevX = v.target = x;
+  v.stoppered = stoppered;
   BuildOutline(v);
   vessels_.push_back(std::move(v));
   RebuildWalls();
   const int vi = (int)vessels_.size() - 1;
   wakeAll_ = true;
+  // THE LEDGER'S OPENING BALANCE: what came on, in units, by the slot of its
+  // BASE material (a dissolved portion is its powder).
+  for (int i = 0; i < c.n; i++) {
+    const int sl = SlotOf(BaseMat(c.p[i].mat));
+    if (sl >= 0) seeded_[sl] += (int64_t)c.p[i].eighths * cfg_.unitsPerEighth;
+  }
   if (!cfg_.settleOnAdd) {
     SeedVessel(vi, c);
     Partition();
@@ -297,7 +321,11 @@ int FlaskSim::AddVessel(const VesselShape& shape, const Xform& x, const Composit
   sc.sleepSteps = 24;
   FlaskSim tmp(sc);
   tmp.SetSubstances(subs_);
-  tmp.AddVessel(shape, x, c);
+  // The solute table only (which liquids dissolve what, and how much they
+  // hold); no rule fires while a vessel is being settled.
+  tmp.SetChemistry(chem_);
+  tmp.PauseChemistry(true);
+  tmp.AddVessel(shape, x, c, stoppered);
   for (int s = 0; s < 1500; s++) {
     tmp.Step(1);
     if (s > 30 && tmp.VesselAsleep(0) && tmp.grainMoves_ == 0 && tmp.MovingCount(0.25f) == 0) break;
@@ -319,6 +347,25 @@ void FlaskSim::AdoptSettled(int vi, const FlaskSim& from) {
     pvar_.push_back(from.pvar_[i]);
     panc_.push_back(from.px_[i]);
     pheat_.push_back(from.pheat_[i]);
+    psol_.push_back(from.psol_[i]);
+    pmass_.push_back(from.pmass_[i]);
+  }
+  // The gas it settled with: the same table, the same pose, pixel for pixel.
+  for (int k : from.gasList_) {
+    if (!from.gasAmt_[k]) continue;
+    if (gasAmt_[k] && gasSub_[k] != from.gasSub_[k]) {
+      spilledUnits_[from.gasSub_[k]] += from.gasAmt_[k];   // never on a table this empty
+      continue;
+    }
+    gasSub_[k] = from.gasSub_[k];
+    gasAmt_[k] = (uint16_t)std::min<uint32_t>(65535u, (uint32_t)gasAmt_[k] + from.gasAmt_[k]);
+    gasAge_[k] = 0;
+    AddGasPixel(k);
+  }
+  for (const Pool& p0 : from.pools_) {
+    Pool p = p0;
+    p.vessel = p0.vessel == 0 ? vi : -1;
+    pools_.push_back(p);
   }
   for (const Grain& g0 : from.grains_) {
     Grain g = g0;
@@ -392,10 +439,11 @@ void FlaskSim::SeedVessel(int vi, const Composition& c) {
   struct Layer { int sub; uint32_t units; };
   std::vector<Layer> layers;
   for (int i = 0; i < c.n; i++) {
-    int sub = -1;
-    for (size_t s = 0; s < subs_.size(); s++)
-      if (subs_[s].mat == c.p[i].mat) sub = (int)s;
-    if (sub < 0 || c.p[i].eighths == 0) continue;
+    // Dissolved matter and gas have no layer: SeedExtras puts them into the
+    // solvent and the headspace once the layers are down.
+    if (IsDissolved(c.p[i].mat)) continue;
+    const int sub = SlotOf(c.p[i].mat);
+    if (sub < 0 || c.p[i].eighths == 0 || subs_[sub].gas) continue;
     layers.push_back({sub, c.p[i].eighths * (uint32_t)cfg_.unitsPerEighth});
   }
   std::stable_sort(layers.begin(), layers.end(), [&](const Layer& a, const Layer& b) {
@@ -496,11 +544,14 @@ void FlaskSim::SeedVessel(int vi, const Composition& c) {
         pvar_.push_back((uint8_t)(Rand() >> 7));
         panc_.push_back(w);
         pheat_.push_back(SeedHeat(lp));
+        psol_.push_back(0);
+        pmass_.push_back(0);
       }
       float top = count ? pts[count - 1].y : yCursor;
       yCursor = top + rowH * 0.5f;
     }
   }
+  SeedExtras(vi, c);
 }
 
 // ---- walls -----------------------------------------------------------------
@@ -513,8 +564,14 @@ void FlaskSim::RebuildWalls() {
   for (size_t vIdx = 0; vIdx < vessels_.size(); vIdx++) {
     const Vessel& v = vessels_[vIdx];
     float r = v.shape.wall + 0.25f;
-    for (size_t i = 0; i + 1 < v.outline.size(); i++) {
-      V2 a = ToWorld(v.x, v.outline[i]), b = ToWorld(v.x, v.outline[i + 1]);
+    // A STOPPERED vessel's mouth is glass too (the closing segment, a little
+    // thicker: a cork, not a pane), so nothing leaves it.
+    const size_t nseg = v.outline.empty() ? 0 : v.outline.size() - 1 + (v.stoppered ? 1 : 0);
+    for (size_t i = 0; i < nseg; i++) {
+      const bool mouth = i + 1 >= v.outline.size();
+      V2 a = ToWorld(v.x, v.outline[i]), b = ToWorld(v.x, mouth ? v.outline.front() : v.outline[i + 1]);
+      const float r0 = r;
+      r = mouth ? r0 + 1.0f : r0;
       int x0 = std::max(0, (int)std::floor(std::min(a.x, b.x) - r - 1));
       int x1 = std::min(W - 1, (int)std::ceil(std::max(a.x, b.x) + r + 1));
       int y0 = std::max(0, (int)std::floor(std::min(a.y, b.y) - r - 1));
@@ -524,6 +581,7 @@ void FlaskSim::RebuildWalls() {
           V2 p{x + 0.5f, y + 0.5f};
           if (Len(p - ClosestOnSeg(p, a, b, nullptr)) <= r) wall_[(size_t)y * W + x] = (uint8_t)std::min<size_t>(vIdx + 1, 255);
         }
+      r = r0;
     }
   }
   // The inside mask: each vessel's outline scanline-filled (even-odd over the
@@ -806,6 +864,11 @@ void FlaskSim::StepLiquid() {
       if (out) {
         spilledUnits_[psub_[i]] += pw_[i];
         NoteExit(p.x, pw_[i]);
+        // What was dissolved in it leaves with it, as its powder.
+        if (pmass_[i]) {
+          const ChemSolute* sp = chem_.Species(psol_[i]);
+          if (sp && sp->from >= 0) spilledUnits_[sp->from] += pmass_[i];
+        }
         continue;
       }
     }
@@ -813,12 +876,14 @@ void FlaskSim::StepLiquid() {
       px_[w] = px_[i]; pv_[w] = pv_[i]; pprev_[w] = pprev_[i];
       psub_[w] = psub_[i]; pw_[w] = pw_[i]; mbar_[w] = mbar_[i]; calm_[w] = calm_[i];
       phome_[w] = phome_[i]; pvar_[w] = pvar_[i]; panc_[w] = panc_[i]; pheat_[w] = pheat_[i];
+      psol_[w] = psol_[i]; pmass_[w] = pmass_[i];
     }
     w++;
   }
   nAct_ -= total - w;
   px_.resize(w); pv_.resize(w); pprev_.resize(w); psub_.resize(w); pw_.resize(w); mbar_.resize(w);
   calm_.resize(w); phome_.resize(w); pvar_.resize(w); panc_.resize(w); pheat_.resize(w);
+  psol_.resize(w); pmass_.resize(w);
 }
 
 void FlaskSim::CollideLiquid() {
@@ -946,12 +1011,18 @@ void FlaskSim::CollideLiquid() {
     if (v.outline.empty()) continue;
     const float R = v.shape.wall + pr;
     const auto& o = v.outline;
-    const size_t ns = std::min<size_t>(o.size() - 1, 64);
+    // A STOPPERED mouth is one more segment (right lip -> left lip, which
+    // continues the loop, so its inside is on its left like the rest).
+    const size_t nGlass = std::min<size_t>(o.size() - 1, 64);
+    const size_t ns = nGlass + (v.stoppered ? 1 : 0);
+    V2 sa[65], sb[65];
+    for (size_t k = 0; k < nGlass; k++) { sa[k] = o[k]; sb[k] = o[k + 1]; }
+    if (v.stoppered) { sa[nGlass] = o.back(); sb[nGlass] = o.front(); }
     // Inward normals: the outline runs left lip -> bottom -> right lip, so
     // the inside is on the left of every segment.
-    V2 nIn[64];
+    V2 nIn[65];
     for (size_t k = 0; k < ns; k++) {
-      const V2 ab = o[k + 1] - o[k];
+      const V2 ab = sb[k] - sa[k];
       const float l = std::max(1e-6f, Len(ab));
       nIn[k] = {-ab.y / l, ab.x / l};
     }
@@ -982,7 +1053,7 @@ void FlaskSim::CollideLiquid() {
       const bool inPrev = InsideLocal(v, prv), inCur = InsideLocal(v, cur);
       // Which side it belongs on: where it came from, unless it came through
       // the mouth (then it is simply somewhere new).
-      const bool crossed = inPrev != inCur && !segCross(prv, cur, mouthA, mouthB);
+      const bool crossed = inPrev != inCur && (v.stoppered || !segCross(prv, cur, mouthA, mouthB));
       const bool side = crossed ? inPrev : inCur;
       const float sg = side ? 1.0f : -1.0f;
       bool moved = false;
@@ -993,7 +1064,7 @@ void FlaskSim::CollideLiquid() {
         size_t bs = 0;
         V2 bc{};
         for (size_t k = 0; k < ns; k++) {
-          const V2 c = ClosestOnSeg(cur, o[k], o[k + 1], nullptr);
+          const V2 c = ClosestOnSeg(cur, sa[k], sb[k], nullptr);
           const float dd = Dot(cur - c, cur - c);
           if (dd < best) { best = dd; bs = k; bc = c; }
         }
@@ -1005,7 +1076,7 @@ void FlaskSim::CollideLiquid() {
       // Kept a glass-thickness off every segment, on its side.
       for (size_t k = 0; k < ns; k++) {
         float t;
-        const V2 c = ClosestOnSeg(cur, o[k], o[k + 1], &t);
+        const V2 c = ClosestOnSeg(cur, sa[k], sb[k], &t);
         const V2 d = cur - c;
         const float dist = Len(d);
         if (dist >= R) continue;
@@ -1085,6 +1156,7 @@ int FlaskSim::EmitGrains(int sub, V2 at, int units, V2 vel) {
     g.vy = vel.y == 0 && vel.x == 0 ? -0.01f : vel.y;
     if (PlaceGrain(g, (int)std::floor(g.fx), (int)std::floor(g.fy))) placed++;
   }
+  if (sub >= 0 && sub < (int)seeded_.size()) seeded_[sub] += placed;
   return placed;
 }
 
@@ -1451,7 +1523,7 @@ void FlaskSim::Partition() {
     for (int k = 0; k < total; k++) v[k] = c[order[k]];
   };
   perm(px_); perm(pv_); perm(pprev_); perm(psub_); perm(pw_); perm(mbar_); perm(calm_); perm(phome_);
-  perm(pvar_); perm(panc_); perm(pheat_);
+  perm(pvar_); perm(panc_); perm(pheat_); perm(psol_); perm(pmass_);
   nAct_ = na;
 }
 
@@ -1814,6 +1886,7 @@ void FlaskSim::Step(int substeps) {
       RebuildWalls();
       wedged_.clear();
       CarryGrains();
+      CarryGas();
     }
 
     // The stick flings the grains it passes through.
@@ -1842,7 +1915,13 @@ void FlaskSim::Step(int substeps) {
     grainMoves_ = 0;
     StepLiquid();
     StepGrains();
-    active_ = anyMoved || stickOn_ || nAct_ > 0 || grainMoves_ > 0;
+    // THE CHEMISTRY and THE GAS (flaskchem.cpp): after the matter has moved,
+    // so a rule reads this step's neighbours.
+    const int fired0 = firedTotal_;
+    if (cfg_.gasEvery > 0 && (step_ % (uint32_t)cfg_.gasEvery) == 0) StepGas();
+    if (cfg_.chemEvery > 0 && (step_ % (uint32_t)cfg_.chemEvery) == 0) StepChemistry();
+    active_ = anyMoved || stickOn_ || nAct_ > 0 || grainMoves_ > 0 || !gasList_.empty() ||
+              firedTotal_ != fired0 || anyDevice_;
     for (const Grain& g : grains_)
       if (g.vx != 0 || g.vy != 0) { active_ = true; break; }
     if (!grains_.empty()) UpdateGrainHomes();
@@ -1910,20 +1989,45 @@ Composition FlaskSim::RemoveVessel(int vi) {
   // Liquid inside it leaves with it.
   size_t w = 0;
   int act = 0;
+  std::vector<uint64_t> dissolved(S, 0);   // by the powder's slot
   for (size_t i = 0; i < px_.size(); i++) {
     if (InsideVessel(v, px_[i])) {
       units[psub_[i]] += pw_[i];
+      if (pmass_[i]) {
+        const ChemSolute* sp = chem_.Species(psol_[i]);
+        if (sp && sp->from >= 0) dissolved[sp->from] += pmass_[i];
+      }
       continue;
     }
     if ((int)i < nAct_) act++;
     px_[w] = px_[i]; pv_[w] = pv_[i]; pprev_[w] = pprev_[i];
     psub_[w] = psub_[i]; pw_[w] = pw_[i]; mbar_[w] = mbar_[i]; calm_[w] = calm_[i];
     phome_[w] = phome_[i]; pvar_[w] = pvar_[i]; panc_[w] = panc_[i]; pheat_[w] = pheat_[i];
+    psol_[w] = psol_[i]; pmass_[w] = pmass_[i];
     w++;
   }
   nAct_ = act;
   px_.resize(w); pv_.resize(w); pprev_.resize(w); psub_.resize(w); pw_.resize(w); mbar_.resize(w);
   calm_.resize(w); phome_.resize(w); pvar_.resize(w); panc_.resize(w); pheat_.resize(w);
+  psol_.resize(w); pmass_.resize(w);
+  // Its gas: a STOPPERED vessel takes it with it; an open one lets it go
+  // (into the spill, which the bench streams out at the lip).
+  for (int k : gasList_) {
+    if (!gasAmt_[k] || inside_[k] != (uint8_t)(vi + 1)) continue;
+    if (v.stoppered) units[gasSub_[k]] += gasAmt_[k];
+    else {
+      spilledUnits_[gasSub_[k]] += gasAmt_[k];
+      NoteExit((float)(k % cfg_.gridW) + 0.5f, gasAmt_[k]);
+    }
+    gasAmt_[k] = 0;
+    gasSub_[k] = 0xFF;
+  }
+  // ...and whatever was waiting in it to become a particle or a grain.
+  for (Pool& p : pools_)
+    if (p.vessel == vi && p.units) {
+      units[p.sub] += p.units;
+      p.units = 0;
+    }
   // ...and so do the grains.
   const int W = cfg_.gridW;
   size_t gw = 0;
@@ -1949,10 +2053,21 @@ Composition FlaskSim::RemoveVessel(int vi) {
   for (size_t s = 0; s < S; s++) {
     if (!units[s]) continue;
     const uint64_t e = units[s] / upe, r = units[s] % upe;
-    if (e) out.Add(subs_[s].mat, (uint32_t)e);
+    if (e && out.Add(subs_[s].mat, (uint32_t)e)) removed_[s] += (int64_t)(e * upe);
+    else spilledUnits_[s] += (uint32_t)(e * upe);
+    spilledUnits_[s] += (uint32_t)r;
+  }
+  // Dissolved: the same, as a DISSOLVED portion of the powder (contract 2.4).
+  for (size_t s = 0; s < S; s++) {
+    if (!dissolved[s]) continue;
+    const uint64_t e = dissolved[s] / upe, r = dissolved[s] % upe;
+    if (e && out.Add((uint16_t)(subs_[s].mat | kDissolvedBit), (uint32_t)e)) removed_[s] += (int64_t)(e * upe);
+    else spilledUnits_[s] += (uint32_t)(e * upe);
     spilledUnits_[s] += (uint32_t)r;
   }
   v.outline.clear();
+  v.burner = false;
+  v.shock = 0;
   RebuildWalls();
   return out;
 }
@@ -1968,7 +2083,18 @@ Tally FlaskSim::Count() const {
       if (InsideVessel(vessels_[v], w)) return v;
     return B - 1;
   };
-  for (size_t i = 0; i < px_.size(); i++) units[binOf(px_[i]) * S + psub_[i]] += pw_[i];
+  // A second form per slot: DISSOLVED in a particle (contract 2.4). Rounded
+  // together with the undissolved form, so a material's eighths out still
+  // equal its eighths in whichever form it ended in.
+  std::vector<uint64_t> dis(B * S, 0);
+  for (size_t i = 0; i < px_.size(); i++) {
+    const size_t b = binOf(px_[i]);
+    units[b * S + psub_[i]] += pw_[i];
+    if (pmass_[i]) {
+      const ChemSolute* sp = chem_.Species(psol_[i]);
+      if (sp && sp->from >= 0) dis[b * S + (size_t)sp->from] += pmass_[i];
+    }
+  }
   // Grains by the inside mask (the same answer UpdateGrainHomes and the
   // sweep use); one in the glass band belongs to its home vessel.
   const int GW = cfg_.gridW;
@@ -1977,6 +2103,19 @@ Tally FlaskSim::Count() const {
     int vi = wall_[k] ? g.home : (int)inside_[k] - 1;
     if (vi < 0 || vi >= (int)vessels_.size() || vessels_[vi].outline.empty()) vi = (int)B - 1;
     units[(size_t)vi * S + g.sub] += 1;
+  }
+  // Gas by the inside mask; a cloud over the table is not in any vessel.
+  for (int k : gasList_) {
+    if (!gasAmt_[k]) continue;
+    int vi = (int)inside_[k] - 1;
+    if (vi < 0 || vi >= (int)vessels_.size() || vessels_[vi].outline.empty()) vi = (int)B - 1;
+    units[(size_t)vi * S + gasSub_[k]] += gasAmt_[k];
+  }
+  for (const Pool& p : pools_) {
+    if (!p.units) continue;
+    const int vi = p.vessel >= 0 && p.vessel < (int)vessels_.size() && !vessels_[p.vessel].outline.empty()
+                       ? p.vessel : (int)B - 1;
+    units[(size_t)vi * S + p.sub] += p.units;
   }
   for (size_t s = 0; s < S; s++) units[(B - 1) * S + s] += spilledUnits_[s];
 
@@ -1988,27 +2127,30 @@ Tally FlaskSim::Count() const {
   const uint64_t upe = (uint64_t)cfg_.unitsPerEighth;
   for (size_t s = 0; s < S; s++) {
     uint64_t total = 0;
-    for (size_t b = 0; b < B; b++) total += units[b * S + s];
+    for (size_t b = 0; b < B; b++) total += units[b * S + s] + dis[b * S + s];
     t.totalUnits += (uint32_t)total;
     if (!total) continue;
     uint64_t eighths = (total + upe / 2) / upe;
-    std::vector<uint64_t> e(B);
+    // Bins x forms: [0, B) undissolved, [B, 2B) dissolved.
+    std::vector<uint64_t> e(2 * B);
     std::vector<std::pair<uint64_t, size_t>> rem;
     uint64_t given = 0;
-    for (size_t b = 0; b < B; b++) {
-      e[b] = units[b * S + s] / upe;
+    for (size_t b = 0; b < 2 * B; b++) {
+      const uint64_t u = b < B ? units[b * S + s] : dis[(b - B) * S + s];
+      e[b] = u / upe;
       given += e[b];
-      rem.push_back({units[b * S + s] % upe, b});
+      rem.push_back({u % upe, b});
     }
     std::stable_sort(rem.begin(), rem.end(), [](auto& a, auto& b) { return a.first > b.first; });
     for (size_t r = 0; given < eighths && r < rem.size(); r++, given++) e[rem[r].second]++;
-    for (size_t b = 0; b < B; b++) {
+    for (size_t b = 0; b < 2 * B; b++) {
       if (!e[b]) continue;
-      Composition& c = b + 1 == B ? t.spilled : t.vessel[b];
+      const size_t bin = b < B ? b : b - B;
+      const uint16_t mat = (uint16_t)(b < B ? subs_[s].mat : (subs_[s].mat | kDissolvedBit));
+      Composition& c = bin + 1 == B ? t.spilled : t.vessel[bin];
       // A vessel that would hold a 17th substance cannot: that portion is
       // counted as spilled (it would not fit through the lip either).
-      if (!c.Add(subs_[s].mat, (uint32_t)e[b]) && &c != &t.spilled)
-        t.spilled.Add(subs_[s].mat, (uint32_t)e[b]);
+      if (!c.Add(mat, (uint32_t)e[b]) && &c != &t.spilled) t.spilled.Add(mat, (uint32_t)e[b]);
     }
   }
   return t;
@@ -2024,6 +2166,7 @@ Composition FlaskSim::DrainSpilled(float* exitX) {
     if (!e) continue;
     if (!out.Add(subs_[s].mat, e)) continue;   // a 17th substance waits a step
     spilledUnits_[s] -= e * upe;
+    drained_[s] += (int64_t)e * upe;
   }
   if (exitX) *exitX = exitW_ > 0 ? (float)(exitSum_ / exitW_) : -1.0f;
   if (!out.Empty()) exitSum_ = exitW_ = 0;
@@ -2362,6 +2505,7 @@ void FlaskSim::Render(std::vector<uint32_t>& out) const {
         out[(size_t)(H - 1 - y) * W + x] = rim ? PackRGBA(92, 60, 34, 255) : PackRGBA(150, 104, 62, 255);
       }
   }
+  RenderChem(out);
 }
 
 }  // namespace alchemy

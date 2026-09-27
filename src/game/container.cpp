@@ -10,6 +10,7 @@
 #include "game/worlditems.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
+#include "sim/reactcpu.h"
 #include "sim/rng.h"
 #include "sim/tuning.h"
 
@@ -51,6 +52,10 @@ bool ContainerAccepts(const ItemDef& def, const ItemStack& st, uint32_t mat,
   const char*& w = why ? *why : dummy;
   if (!def.IsContainer()) {
     w = "that is not a vessel";
+    return false;
+  }
+  if (st.stoppered) {
+    w = "it is stoppered";
     return false;
   }
   if (mat == 0 || mat >= mats.size()) {
@@ -320,7 +325,8 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                   uint32_t seed, std::vector<ParticleSpawn>& spawns,
                   SplatterEvent* splat, uint32_t partRoom,
                   const std::vector<MaterialDef>* mats) {
-  if (!def.IsContainer() || !st.Filled() || st.count != 1) return 0;
+  // A stoppered vessel pours nothing (ContainerTopMat is 0 for it too).
+  if (!def.IsContainer() || !st.Filled() || st.count != 1 || st.stoppered) return 0;
   const float speed = std::max(1.0f, def.container.pourSpeed);   // vox/s
   const float gTick = (float)std::max(0, partGravity) / 256.0f;
   Vec3 v0;
@@ -349,6 +355,8 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
   // One portion per tick: the top layer (ContainerTopMat).
   const uint32_t mat = ContainerTopMat(st, mats);
   const bool liquid = ContainerContentIsLiquid(def, mat, mats);
+  const uint32_t liquidBefore = ContainerLiquidEighths(st.contents, mats);
+  uint32_t liquidOut = 0;
   for (int k = 0; k < def.container.pourPerTick && st.contents.AmountOf((uint16_t)mat) > 0; k++) {
     if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
     if ((uint32_t)k >= partRoom) break;   // charged only for what the ring takes
@@ -385,7 +393,17 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     s.flags = kPFlagAlive | kPFlagCalm | (liquid ? kPFlagMeasured : 0u);
     spawns.push_back(s);
     st.contents.Take((uint16_t)mat, (uint32_t)spend);
+    if (liquid) liquidOut += (uint32_t)spend;
     poured++;
+  }
+  // What was dissolved in the liquid that left goes with it (contract 2.5).
+  if (liquidOut && mats) {
+    const alchemy::Composition d = ContainerTakeDissolvedShare(st.contents, liquidOut, liquidBefore);
+    for (int i = 0; i < d.n; i++) {
+      const int out = ContainerDissolvedToWorld(d.p[i].mat, (int)d.p[i].eighths, mouth, v0,
+                                                seed ^ 0xD155u, tick, *mats, spawns, 0xFFFFFFFFu);
+      if (out < (int)d.p[i].eighths) st.contents.Add(d.p[i].mat, d.p[i].eighths - (uint32_t)out);
+    }
   }
   if (poured > 0 && splat) {
     const Tuning& tune = CurrentTuning();
@@ -421,8 +439,9 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
                        const Vec3* target, uint32_t tick, uint32_t seed,
                        uint32_t room, std::vector<FluidSpawnOp>& out,
                        SplatterEvent* splat, const std::vector<MaterialDef>* mats) {
-  // One vessel's fill: a stack does not pour (isolate one first).
-  if (!def.IsContainer() || !st.Filled() || st.count != 1) return 0;
+  // One vessel's fill: a stack does not pour (isolate one first); a stoppered
+  // one pours nothing.
+  if (!def.IsContainer() || !st.Filled() || st.count != 1 || st.stoppered) return 0;
   const Tuning& tune = CurrentTuning();
   const float speed = std::max(1.0f, def.container.pourSpeed);   // vox/s
   // The solver's own integration: per substep v.y -= g/S, then p += v/S. After
@@ -466,6 +485,7 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
   }
 
   const uint32_t mat = ContainerTopMat(st, mats);
+  const uint32_t liquidBefore = ContainerLiquidEighths(st.contents, mats);
   const int want = std::min<int>(
       {def.container.pourPerTick * kContainerUnitsPerCell,
        (int)st.contents.AmountOf((uint16_t)mat),
@@ -495,6 +515,14 @@ int ContainerPourFluid(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     poured++;
   }
   st.contents.Take((uint16_t)mat, (uint32_t)poured);
+  // The dissolved share of what left. The fluid road has no grid-particle
+  // stream to put the fallback powder in, so the share goes back into the
+  // vessel as UNDISSOLVED powder there and pours as grains after the liquid
+  // (contract 2.5's fallback; package B makes it ride the fluid instead).
+  if (poured > 0) {
+    const alchemy::Composition d = ContainerTakeDissolvedShare(st.contents, (uint32_t)poured, liquidBefore);
+    for (int i = 0; i < d.n; i++) st.contents.Add(alchemy::BaseMat(d.p[i].mat), d.p[i].eighths);
+  }
   if (poured > 0 && splat) {
     SplatterEvent& e = *splat;
     e = SplatterEvent{};
@@ -607,17 +635,50 @@ int ContainerSpillStep(ContainerSpill& sp, const std::vector<MaterialDef>& mats,
                        uint32_t tick, uint32_t fluidRoom,
                        std::vector<FluidSpawnOp>& fluid,
                        std::vector<ParticleSpawn>& parts, SplatterEvent* splat,
-                       uint32_t partRoom) {
+                       uint32_t partRoom, std::vector<GasSpawnOp>* gas, uint32_t gasRoom) {
   // The next portion when this one is out (a mixed vessel spills them in
   // turn). A portion whose material is gone from the table is dropped.
   while (sp.units <= 0 && !sp.rest.Empty()) {
     sp.mat = sp.rest.p[0].mat;
     sp.units = (int)sp.rest.Take(sp.mat, sp.rest.p[0].eighths);
-    if (sp.mat == 0 || sp.mat >= mats.size()) sp.units = 0;
+    if (alchemy::BaseMat(sp.mat) == 0 || alchemy::BaseMat(sp.mat) >= mats.size()) sp.units = 0;
   }
-  if (sp.units <= 0 || sp.mat == 0 || sp.mat >= mats.size()) {
+  if (sp.units <= 0 || alchemy::BaseMat(sp.mat) == 0 || alchemy::BaseMat(sp.mat) >= mats.size()) {
     sp.units = 0;
     return 0;
+  }
+  // DISSOLVED: the solute seam (package B's to replace).
+  if (alchemy::IsDissolved(sp.mat)) {
+    const uint32_t room = partRoom == 0xFFFFFFFFu ? 0xFFFFFFFFu : partRoom;
+    const int out = ContainerDissolvedToWorld(sp.mat, sp.units, sp.at, sp.vel * (1.0f / 30.0f),
+                                              sp.seed, tick, mats, parts, room);
+    sp.units -= out;
+    return out;
+  }
+  // GAS: parcels on the CPU gas stream, eight eighths a voxel.
+  if (mats[sp.mat].gpu.klass == CLASS_GAS) {
+    if (!gas) return 0;   // no gas stream this call: it waits
+    int emitted = 0;
+    uint32_t made = 0;
+    while (sp.units > 0 && made < gasRoom) {
+      const int spend = std::min(sp.units, kContainerUnitsPerCell);
+      // A partial last voxel: whole with the chance its eighths say (the
+      // hash is the tick's and the spill's, so a replay rounds the same).
+      const uint32_t h = rng::Hash3(sp.seed, tick, (uint32_t)sp.units * 0x9E3779B9u + 3u);
+      const bool whole = spend >= kContainerUnitsPerCell ||
+                         (rng::Pcg(h) % (uint32_t)kContainerUnitsPerCell) < (uint32_t)spend;
+      if (whole) {
+        auto u = [&](uint32_t salt) { return ((float)(rng::Pcg(h ^ salt) & 0xFFFFu) / 65535.0f) * 2.0f - 1.0f; };
+        const float r = sp.pour ? 0.6f : 1.5f;
+        gas->push_back(MakeGasSpawn((int32_t)std::floor(sp.at.x + u(0x11u) * r),
+                                    (int32_t)std::floor(sp.at.y + std::fabs(u(0x22u)) * r),
+                                    (int32_t)std::floor(sp.at.z + u(0x33u) * r), sp.mat));
+        made++;
+      }
+      sp.units -= spend;
+      emitted += spend;
+    }
+    return emitted;
   }
   const Tuning& tune = CurrentTuning();
   const bool asFluid = ContainerPoursAsFluid(mats[sp.mat]);
@@ -794,7 +855,7 @@ int ContainerBreakPass(WorldItems& ground, const ItemLibrary& items,
 }
 
 int ContainerSpend(ItemStack& st, int cells) {
-  if (!st.Filled() || cells <= 0 || st.count != 1) return 0;
+  if (!st.Filled() || cells <= 0 || st.count != 1 || st.stoppered) return 0;
   // What is spent is the MIX: every portion in proportion, so a salve of two
   // parts honey to one of ash stays two to one as the flask empties.
   // Remainders go to the largest portions first, which keeps the total exact.
@@ -849,18 +910,21 @@ std::string ContainerFillText(const ItemDef& def, const ItemStack& st,
     return (int)((e + kContainerUnitsPerCell - 1) / kContainerUnitsPerCell);
   };
   auto nameOf = [&](uint16_t m) {
-    return m < mats.size() ? mats[m].name : std::string("?");
+    const uint16_t b = alchemy::BaseMat(m);
+    if (b >= mats.size()) return std::string("?");
+    return alchemy::IsDissolved(m) ? mats[b].name + " (dissolved)" : mats[b].name;
   };
   char b[96];
+  const char* cork = st.stoppered ? " (stoppered)" : "";
   if (st.contents.n == 1) {
-    std::snprintf(b, sizeof b, "%s %d/%d", nameOf(st.contents.p[0].mat).c_str(),
-                  cellsOf(st.contents.p[0].eighths), capCells);
+    std::snprintf(b, sizeof b, "%s %d/%d%s", nameOf(st.contents.p[0].mat).c_str(),
+                  cellsOf(st.contents.p[0].eighths), capCells, cork);
     return b;
   }
   // A mixture: the main portion by name, the count of the others, the total.
-  std::snprintf(b, sizeof b, "%s +%d more %d/%d",
+  std::snprintf(b, sizeof b, "%s +%d more %d/%d%s",
                 nameOf(ContainerMainMat(st.contents)).c_str(), st.contents.n - 1,
-                cellsOf(st.FillTotal()), capCells);
+                cellsOf(st.FillTotal()), capCells, cork);
   return b;
 }
 
@@ -894,25 +958,134 @@ alchemy::Composition ContainerParseFillSpec(const std::string& spec, int capacit
 }
 
 uint16_t ContainerMainMat(const alchemy::Composition& c) {
+  // A dissolved portion is not a material a flask can show (it has no layer).
   uint32_t best = 0;
   uint16_t m = 0;
   for (int i = 0; i < c.n; i++)
-    if (c.p[i].eighths > best) { best = c.p[i].eighths; m = c.p[i].mat; }
+    if (!alchemy::IsDissolved(c.p[i].mat) && c.p[i].eighths > best) { best = c.p[i].eighths; m = c.p[i].mat; }
   return m;
 }
 
 uint16_t ContainerTopMat(const ItemInstance& st, const std::vector<MaterialDef>* mats) {
   const alchemy::Composition& c = st.contents;
-  if (c.Empty()) return 0;
-  if (!mats) return c.p[0].mat;
+  // A stoppered vessel has nothing at its mouth: every road out (pour, apply,
+  // the brush) reads this and finds nothing.
+  if (c.Empty() || st.stoppered) return 0;
+  // Dissolved matter has no layer (it rides the liquid, ContainerTakeDissolvedShare)
+  // and gas is not poured (an open vessel's gas vented on the bench).
   int best = -1;
   int32_t bestD = 0;
   for (int i = 0; i < c.n; i++) {
     const uint16_t m = c.p[i].mat;
+    if (alchemy::IsDissolved(m)) continue;
+    if (!mats) { if (best < 0) best = i; continue; }
+    if (m < mats->size() && (*mats)[m].gpu.klass == CLASS_GAS) continue;
     const int32_t d = m < mats->size() ? (*mats)[m].gpu.density : 0;
     if (best < 0 || d < bestD) { best = i; bestD = d; }
   }
-  return c.p[best].mat;
+  return best < 0 ? 0 : c.p[best].mat;
+}
+
+bool ContainerPocketExplosion(const alchemy::Composition& c, const std::vector<MaterialDef>& mats,
+                              const std::vector<ReactionGpu>& reactions, ReactionEffect& out) {
+  std::vector<MaterialGpu> gpu;   // ReactNbrMatches reads the gpu rows
+  for (int a = 0; a < c.n; a++) {
+    const uint16_t ma = c.p[a].mat;
+    if (alchemy::IsDissolved(ma) || ma == 0 || ma >= mats.size()) continue;
+    const MaterialDef& A = mats[ma];
+    if (A.ruleFx.empty()) continue;
+    for (uint32_t k = 0; k < A.gpu.reactCount && A.gpu.reactOffset + k < reactions.size(); k++) {
+      if (k >= A.ruleFx.size() || A.ruleFx[k].effects.empty()) continue;
+      const ReactionGpu& r = reactions[A.gpu.reactOffset + k];
+      if ((r.packed & 3u) != kReactPair) continue;
+      const ReactionEffect* ex = nullptr;
+      for (const ReactionEffect& e : A.ruleFx[k].effects)
+        if (e.kind == "explode") { ex = &e; break; }
+      if (!ex) continue;
+      if (gpu.empty()) {
+        gpu.reserve(mats.size());
+        for (const MaterialDef& m : mats) gpu.push_back(m.gpu);
+      }
+      for (int b = 0; b < c.n; b++) {
+        const uint16_t mb = c.p[b].mat;
+        if (b == a || alchemy::IsDissolved(mb) || mb == 0 || mb >= mats.size()) continue;
+        if (ReactNbrMatches(r, mb, gpu)) {
+          out = *ex;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+uint32_t ContainerVolume(const alchemy::Composition& c, const std::vector<MaterialDef>& mats) {
+  uint32_t v = 0;
+  for (int i = 0; i < c.n; i++) {
+    const uint16_t m = c.p[i].mat;
+    if (alchemy::IsDissolved(m) || (m < mats.size() && mats[m].gpu.klass == CLASS_GAS)) continue;
+    v += c.p[i].eighths;
+  }
+  return v;
+}
+
+uint32_t ContainerLiquidEighths(const alchemy::Composition& c, const std::vector<MaterialDef>* mats) {
+  uint32_t v = 0;
+  for (int i = 0; i < c.n; i++) {
+    const uint16_t m = c.p[i].mat;
+    if (alchemy::IsDissolved(m)) continue;
+    if (mats && (m >= mats->size() || (*mats)[m].gpu.klass != CLASS_LIQUID)) continue;
+    v += c.p[i].eighths;
+  }
+  return v;
+}
+
+alchemy::Composition ContainerTakeDissolvedShare(alchemy::Composition& c, uint32_t eighths,
+                                                 uint32_t liquidBefore) {
+  alchemy::Composition out;
+  if (!eighths) return out;
+  alchemy::Composition before = c;
+  for (int i = 0; i < before.n; i++) {
+    const uint16_t m = before.p[i].mat;
+    if (!alchemy::IsDissolved(m)) continue;
+    // With the last of the liquid, all of it; else its share, rounded down
+    // (the remainder leaves with a later pour).
+    const uint32_t share = eighths >= liquidBefore
+                               ? before.p[i].eighths
+                               : (uint32_t)((uint64_t)before.p[i].eighths * eighths / std::max(1u, liquidBefore));
+    const uint32_t got = c.Take(m, share);
+    if (got) out.Add(m, got);
+  }
+  return out;
+}
+
+int ContainerDissolvedToWorld(uint16_t mat, int eighths, Vec3 at, Vec3 vel, uint32_t seed,
+                              uint32_t tick, const std::vector<MaterialDef>& mats,
+                              std::vector<ParticleSpawn>& parts, uint32_t partRoom) {
+  // ---- THE FALLBACK (until package B's solute layer): its powder. -----------
+  const uint16_t powder = alchemy::BaseMat(mat);
+  if (powder == 0 || powder >= mats.size() || eighths <= 0) return 0;
+  const bool liquid = mats[powder].gpu.klass == CLASS_LIQUID;
+  int emitted = 0;
+  uint32_t made = 0;
+  while (emitted < eighths && parts.size() < kMaxParticleSpawnsPerTick && made < partRoom) {
+    const int spend = liquid ? std::min(kContainerUnitsPerCell, eighths - emitted) : 1;
+    const uint32_t h = rng::Hash3(seed, tick, (uint32_t)(eighths - emitted) * 0x9E3779B9u + 5u);
+    auto u = [&](uint32_t salt) { return ((float)(rng::Pcg(h ^ salt) & 0xFFFFu) / 65535.0f) * 2.0f - 1.0f; };
+    ParticleSpawn ps{};
+    ps.px = (int32_t)std::lround((at.x + u(0x11u) * 0.3f) * 256.0f);
+    ps.py = (int32_t)std::lround((at.y + u(0x22u) * 0.3f) * 256.0f);
+    ps.pz = (int32_t)std::lround((at.z + u(0x33u) * 0.3f) * 256.0f);
+    ps.vx = (int32_t)std::lround((vel.x * (1.0f + u(0x44u) * 0.05f)) * 256.0f);
+    ps.vy = (int32_t)std::lround(vel.y * 256.0f);
+    ps.vz = (int32_t)std::lround((vel.z * (1.0f + u(0x55u) * 0.05f)) * 256.0f);
+    ps.payload = ((uint32_t)powder & 0xFFFu) | (PouredState(liquid, spend) << 12);
+    ps.flags = kPFlagAlive | kPFlagCalm | (liquid ? kPFlagMeasured : 0u);
+    parts.push_back(ps);
+    made++;
+    emitted += spend;
+  }
+  return emitted;
 }
 
 ContainerHeldFill ContainerHeldFillFrom(const ItemDef& def, const alchemy::Composition& c) {

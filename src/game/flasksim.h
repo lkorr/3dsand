@@ -28,11 +28,22 @@
 // Not the 3D sim: floats, no hashing, no MutationQueue. The panel turns what
 // Tally() reports into an intent the game validates (conservation), which is
 // the only way contents change. See DESIGN.md "Alchemy bench".
+//
+// CHEMISTRY (2026-09-27, docs/PLAN_alchemy_chemistry.md package C). The bench
+// runs THE WORLD'S OWN RULES on its particles, grains and gas pixels
+// (benchchem.h; flaskchem.cpp): a GAS phase (a pixel CA that rises, spreads,
+// fades by the world's decay rules and leaves through the mouth into the
+// world), STOPPERS, a BURNER (a virtual tag:hot neighbour through the glass),
+// an ELECTRIFY discharge (a virtual spark neighbour), DISSOLVING by
+// solutes.json (per-particle solute mass), a units LEDGER of every conversion
+// and EVENTS for rules with effects (explode, and the pressure pop/burst).
 #include <cmath>
 #include <cstdint>
+#include <string>
 #include <utility>
 #include <vector>
 
+#include "game/benchchem.h"
 #include "game/composition.h"
 
 namespace alchemy {
@@ -56,6 +67,14 @@ struct Substance {
   uint8_t emission = 0;    // 0..255
   uint8_t opacity = 255;   // 0..255 media absorbance (liquids)
   bool opaque = false;     // kMatFlagOpaque
+  // CHEMISTRY: what a rule's neighbour predicate reads (materials.h
+  // MaterialGpu klass / tagMask), and the phase the bench keeps it in. A
+  // GAS is a pixel-CA cloud, never a particle or a grain; a SOLID (a rule's
+  // product -- lava and water make stone) is kept as grains (`powder` set).
+  uint8_t klass = 2;       // 0 solid, 1 powder, 2 liquid, 3 gas
+  uint32_t tagMask = 0;
+  bool gas = false;
+  bool heavy = false;      // a HEAVY gas (materials.h kMatFlagHeavyGas): it sinks and pools
 };
 
 // A vessel's inside, as an authored profile: half-widths at heights, both in
@@ -153,6 +172,48 @@ struct SimConfig {
   // before it appears: it arrives settled, and asleep.
   bool settleOnAdd = true;
   uint32_t seed = 0x5eed;
+  // ---- chemistry (flaskchem.cpp) --------------------------------------------
+  // One chemistry step every `chemEvery` substeps. The bench steps 240
+  // substeps a second, so 4 is 60 Hz = half a WORLD tick (30 Hz): a rule's
+  // world chance is scaled by chemEvery / 8 x chemRate per step.
+  int chemEvery = 4;
+  float chemRate = 1.0f;
+  int chemMaxFires = 600;        // rule firings per chemistry step (bounded)
+  int gasEvery = 2;              // one gas CA step every this many substeps
+  int gasVentSteps = 70;         // gas steps a cloud lingers outside every vessel before it is in the world
+  int gasPixelCap = 400;         // units one gas pixel holds
+  // THE BURNER. Heat 0..1 rises while it is on and the vessel stands on the
+  // table (its base within burnerReach px of tableY), and falls off after.
+  float heatRiseSec = 2.5f;
+  float heatFallSec = 8.0f;
+  float tableY = 0.0f;
+  float burnerReach = 18.0f;
+  int shockSteps = 36;           // chemistry steps one Electrify lasts (0.6 s)
+  // PRESSURE: mean gas units per free inside pixel of a stoppered vessel at
+  // which the stopper pops -- or, over a lit burner or hot glass (heat > 0.25) or past
+  // passes burstAt, the vessel BURSTS. A gas unit is the matter of a liquid
+  // unit (the ledger counts them alike), so a flask of water boiled wholly to
+  // steam holds ~1 unit per free pixel; real steam would be 1600x the volume.
+  // Hence a pop well under 1: a stoppered flask on the burner goes.
+  float popAt = 0.6f;
+  float burstAt = 3.0f;
+};
+
+// Something the chemistry did that the game must answer (alchemy_bench.h
+// BenchEvent): a rule with an effect fired (`kind` = the effect's kind), or a
+// stoppered vessel's pressure popped the stopper ("pop") or broke the glass
+// ("burst"). Several firings of one kind in one vessel in one step are one
+// event with `count` firings.
+struct SimEvent {
+  std::string kind;
+  int vessel = -1;           // AddVessel index, -1 = none
+  V2 at;                     // sim pixels
+  int32_t radius = 0, power = 0;
+  float amount = 0;
+  std::string what;
+  uint16_t selfMat = 0, nbrMat = 0;   // the reacting materials (0 = none / virtual)
+  std::vector<uint16_t> products;     // what the rule makes (material ids)
+  int count = 1;
 };
 
 struct Tally {
@@ -168,10 +229,55 @@ class FlaskSim {
   // Every substance the panel may see this session. Index = substance slot.
   void SetSubstances(const std::vector<Substance>& subs);
 
+  // The world's rules and solutes in this sim's substance slots (benchchem.h,
+  // built by flasksim_mats.h BuildBenchChemistry). Empty = no chemistry.
+  void SetChemistry(const Chemistry& c);
+  const Chemistry& Chem() const { return chem_; }
+  // Pauses the rules (gas still moves and vents). AddVessel's settling runs
+  // paused: a vessel arrives as it was put away, not half-reacted.
+  void PauseChemistry(bool p) { chemPaused_ = p; }
+
   // Adds a vessel at `x` holding `c`, seeded ALREADY SETTLED: substances
   // layered by density, heaviest at the bottom, liquids on a rest lattice,
-  // powders packed. Returns the vessel index.
-  int AddVessel(const VesselShape& shape, const Xform& x, const Composition& c);
+  // powders packed, gas in the headspace, dissolved portions spread through
+  // their solvent. `stoppered` closes the mouth. Returns the vessel index.
+  int AddVessel(const VesselShape& shape, const Xform& x, const Composition& c,
+                bool stoppered = false);
+
+  // ---- the vessel's devices (flaskchem.cpp) ----------------------------------
+  // A stopper closes the mouth: nothing -- gas, liquid, powder -- leaves.
+  void SetStopper(int v, bool on);
+  bool Stoppered(int v) const { return VesselAlive(v) && vessels_[v].stoppered; }
+  // The burner under a vessel, and how hot its glass is now (0..1).
+  void SetBurner(int v, bool on);
+  bool Burner(int v) const { return VesselAlive(v) && vessels_[v].burner; }
+  float Heat(int v) const { return VesselAlive(v) ? vessels_[v].heat : 0.0f; }
+  bool Burning(int v) const;   // the flame is lit under it right now
+  // Electrify: its liquid sees a spark neighbour for cfg.shockSteps steps.
+  void Shock(int v);
+  bool Shocked(int v) const { return VesselAlive(v) && vessels_[v].shock > 0; }
+  // Gas inside a vessel, units; its pressure (units per free inside pixel).
+  int GasUnits(int v) const;
+  float Pressure(int v) const;
+  // A vessel whose glass broke (a burst): gone, its contents loose.
+  bool Broken(int v) const { return v >= 0 && v < (int)vessels_.size() && vessels_[v].broken; }
+  // Breaks a vessel's glass now (a rule-authored "burst" effect).
+  void Burst(int v) { ShatterVessel(v); }
+  // The chemistry's events since the last call.
+  std::vector<SimEvent> TakeEvents();
+  // THE LEDGER, in units per substance slot: what reactions made and
+  // unmade. Matter never appears from nothing on the bench: every unit in it
+  // was seeded, emitted, or is in `produced`, and AuditUnits proves it.
+  const std::vector<int64_t>& Produced() const { return produced_; }
+  const std::vector<int64_t>& Consumed() const { return consumed_; }
+  // Live units per slot (every form: particle, grain, gas, dissolved, a
+  // pending pool, the spill, what was taken off with a vessel or drained)
+  // against seeded + produced - consumed. False (with `why`) on any gap.
+  bool AuditUnits(std::string* why) const;
+  int ReactionsFired() const { return firedTotal_; }
+  // Units of `slot` dissolved anywhere (gates).
+  int64_t DissolvedUnits(int slot) const;
+  int GasPixelCount() const { return (int)gasList_.size(); }
 
   // Kinematic: the UI owns a vessel's TARGET pose; the vessel moves toward
   // it at most maxVesselStep px per substep. The glass pushes liquid and
@@ -193,6 +299,9 @@ class FlaskSim {
   // Pours `units` grains of powder substance slot `sub` at `at`, moving `vel`.
   // Returns how many were placed (a full pixel refuses).
   int EmitGrains(int sub, V2 at, int units, V2 vel);
+  // The substance slot of a material id, -1 if the sim has none.
+  int SlotOf(uint16_t mat) const { return mat < slotOf_.size() ? slotOf_[mat] : -1; }
+  const Substance& Sub(int slot) const { return subs_[slot]; }
 
   void Step(int substeps = 1);
 
@@ -244,7 +353,7 @@ class FlaskSim {
   bool Active() const { return active_; }
   // Does the picture move on its own even when nothing is simulated (glow,
   // fizz, the light on water)? The panel keeps redrawing it, slower.
-  bool Animated() const { return !px_.empty(); }
+  bool Animated() const { return !px_.empty() || !gasList_.empty() || anyDevice_ || !shards_.empty(); }
   // Read-only views for gates and the lab.
   const std::vector<V2>& Positions() const { return px_; }
   const std::vector<V2>& Velocities() const { return pv_; }
@@ -266,6 +375,12 @@ class FlaskSim {
     bool asleep = false;
     int quiet = 0;
     bool grainBusy = false;   // a grain inside it moved this step
+    // ---- chemistry devices (flaskchem.cpp) ----
+    bool stoppered = false;
+    bool burner = false;
+    float heat = 0;           // 0..1, the glass
+    int shock = 0;            // chemistry steps of discharge left
+    bool broken = false;      // burst: gone, its contents loose
     V2 vel;                   // px / step (the motion profile, Step)
     float angVel = 0;         // rad / step
     float reach = 1;          // farthest outline point from the pose origin
@@ -291,6 +406,7 @@ class FlaskSim {
     // none. The glass sweep pushes a grain back to this side: judged from
     // where a grain already in the glass is, it can read as outside.
     int8_t home = -1;
+    uint8_t chem = 0;      // chemistry step it last changed on (low byte)
   };
 
   void BuildOutline(Vessel& v, bool raster = true) const;
@@ -300,6 +416,43 @@ class FlaskSim {
   V2 ToWorld(const Xform& x, V2 l) const;
 
   void SeedVessel(int vi, const Composition& c);
+  // ---- chemistry (flaskchem.cpp) ----
+  struct ChemNb {
+    uint8_t type;    // NbParticle / NbGrain / NbGas / NbAir / NbHeat / NbSpark
+    int idx;         // particle, grain, pixel (gas, air)
+    int slot;        // substance slot, -1 for air and virtual
+    uint8_t dir;     // kChemDown / kChemUp / kChemSide
+    V2 at;
+  };
+  enum : uint8_t { NbParticle = 0, NbGrain = 1, NbGas = 2, NbAir = 3, NbHeat = 4, NbSpark = 5 };
+  struct Pool { int vessel; int sub; uint32_t units; double sx, sy, w; };
+  void StepChemistry();
+  void StepGas();
+  void CarryGas();
+  void UpdateDevices();
+  void CheckPressure();
+  bool TryRules(uint8_t selfType, int selfIdx, int slot, const std::vector<ChemNb>& nb, int hv, V2 at,
+                double scale);
+  void GatherParticleNbrs(int i, int hv, std::vector<ChemNb>& out);
+  void GatherPixelNbrs(int x, int y, int hv, bool isGas, std::vector<ChemNb>& out);
+  int NearestParticle(float x, float y, float r) const;
+  int UnitsOf(uint8_t type, int idx) const;
+  void ConvertEnt(uint8_t type, int idx, int q, int to, int hv);
+  void TakeFromEnt(uint8_t type, int idx, int q, int hv);
+  void Deposit(int sub, uint32_t q, V2 at, int hv);
+  bool AddGasAt(int sub, uint32_t& q, int x, int y);
+  void ReleaseSolute(int i, int hv);
+  void AddPool(int vessel, int sub, uint32_t q, V2 at);
+  void FlushPools();
+  void CompactDead();
+  int SpawnParticle(V2 p, int sub, int units, int home);
+  void RaiseEvent(const ChemEffect& fx, int hv, V2 at, uint16_t selfMat, uint16_t nbrMat,
+                  const ChemRule& r);
+  void RaisePressureEvent(const char* kind, int v, float pressure);
+  void ShatterVessel(int v);
+  void SeedExtras(int vi, const Composition& c);
+  void RenderChem(std::vector<uint32_t>& out) const;
+  double Rand01() { return (Rand() & 0xFFFFFF) / 16777216.0; }
   static uint8_t SeedHeat(V2 p);
   void AdoptSettled(int vi, const FlaskSim& from);
   void MoveVessels();
@@ -339,6 +492,8 @@ class FlaskSim {
   std::vector<uint8_t> pvar_; // look: which palette entry + a phase, fixed per particle
   std::vector<V2> panc_;      // where it was when its vessel's quiet window began
   std::vector<uint8_t> pheat_; // look: molten matter's heat phase (SeedHeat)
+  std::vector<uint8_t> psol_;  // solute species dissolved in it (0 = none)
+  std::vector<uint16_t> pmass_; // units of that species' powder dissolved in it
   // Particles [0, nAct_) are awake; [nAct_, size) belong to sleeping vessels.
   int nAct_ = 0;
   std::vector<int> nbrStart_, nbr_, nbrFill_;
@@ -428,6 +583,40 @@ class FlaskSim {
   mutable std::vector<uint8_t> rDepth_;
   mutable std::vector<float> rHeat_;
   mutable std::vector<uint8_t> rGlowOn_;
+  // ---- chemistry state (flaskchem.cpp) ----
+  Chemistry chem_;
+  bool chemOn_ = false, chemPaused_ = false;
+  std::vector<int> slotOf_;             // material id -> substance slot
+  std::vector<int64_t> produced_, consumed_, seeded_, removed_, drained_;
+  // THE GAS PHASE: per pixel, which gas (slot, 0xFF none), how many units,
+  // and how many gas steps it has spent outside every vessel.
+  std::vector<uint8_t> gasSub_;
+  std::vector<uint16_t> gasAmt_;
+  std::vector<uint8_t> gasAge_;
+  std::vector<int> gasList_;            // pixels holding gas (may hold stale zeros)
+  std::vector<uint8_t> gasListed_;
+  std::vector<Pool> pools_;             // units waiting to become a particle / grain / gas
+  std::vector<int> chemHead_, chemNext_, chemTouched_;   // particles by pixel
+  std::vector<uint8_t> present_, activeSlot_;
+  std::vector<uint8_t> grainDead_;      // grains a chemistry step removed (compacted at its end)
+  std::vector<uint32_t> gasMark_;       // gas pixels a gas step already moved into (its stamp)
+  uint32_t gasStamp_ = 0;
+  std::vector<int> gasOrder_;
+  std::vector<SimEvent> events_;
+  // Glass flying from a burst (look only), advanced by the picture.
+  struct Shard { float x, y, vx, vy; int life; };
+  mutable std::vector<Shard> shards_;
+  mutable uint32_t shardStep_ = 0;
+  mutable std::vector<float> rGas_;
+  mutable std::vector<uint8_t> rGasSub_;
+  void BucketChem();
+  std::vector<ChemNb> nbScratch_;
+  uint32_t chemStep_ = 0;
+  int firedThisStep_ = 0, firedTotal_ = 0;
+  bool needPartition_ = false, anyDevice_ = false;
+  void AddGasPixel(int k) {
+    if (!gasListed_[k]) { gasListed_[k] = 1; gasList_.push_back(k); }
+  }
   bool active_ = true;
   int grainMoves_ = 0;   // grains moved in the current step
   uint32_t rng_;

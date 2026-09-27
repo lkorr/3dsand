@@ -2010,7 +2010,7 @@ void BenchParts(ImDrawList* dl, ImVec2 at, float w,
                 float& y) {
   const float lineH = ImGui::GetTextLineHeight();
   int total = 0;
-  for (const auto& p : parts) total += p.eighths;
+  for (const auto& p : parts) total += p.dissolved ? 0 : p.eighths;   // in solution takes no room
   if (parts.empty()) {
     dl->AddText(ImVec2(at.x, y), Fade(ui::ColParch(), 0.6f), "empty");
     y += lineH + 4;
@@ -2036,6 +2036,7 @@ void BenchParts(ImDrawList* dl, ImVec2 at, float w,
   dl->AddRectFilled(ImVec2(at.x, y), ImVec2(at.x + w, y + bh), ui::ColInk());
   float x = at.x;
   for (const auto& p : parts) {
+    if (p.dissolved) continue;
     const float pw = cap > 0 ? w * (float)p.eighths / (float)cap : 0.0f;
     dl->AddRectFilled(ImVec2(x, y), ImVec2(x + pw, y + bh), p.color | 0xFF000000u);
     x += pw;
@@ -2087,12 +2088,56 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     if (ImGui::IsItemHovered())
       Tip("Hold the button inside a vessel: the stick goes in through its neck and follows you.");
     y += 44;
+    // THE CHEMISTRY TOOLS (docs/PLAN_alchemy_chemistry.md package C).
+    if (ui::Button("##benchstopper", ImVec2(colX, y), "stopper", A.tool == 2, bw)) A.tool = 2;
+    if (ImGui::IsItemHovered())
+      Tip("Click a vessel to put a stopper in its mouth, or take it out. Stoppered, nothing "
+          "leaves it - not liquid, not powder, not gas - and it keeps its stopper in your "
+          "pack. Gas building up inside will pop the stopper, or burst hot glass.");
+    if (ui::Button("##benchburner", ImVec2(colX + bw + 8, y), "burner", A.tool == 3, bw)) A.tool = 3;
+    if (ImGui::IsItemHovered())
+      Tip("Click a vessel standing on the bench to light a flame under it, or put it out. "
+          "The glass heats up and whatever touches it feels the heat: water boils, salt "
+          "melts, a flammable catches.");
+    y += 44;
+    if (ui::Button("##benchshock", ImVec2(colX, y), "electrify", false, colW)) A.shockReq = true;
+    if (ImGui::IsItemHovered())
+      Tip("A jolt of lightning through the vessel in your hand (or under the pointer, or the "
+          "last one you touched): what is molten or in solution may split. Molten salt "
+          "gives up sodium and chlorine.");
+    y += 44;
   }
   // The vessel in hand (or last touched).
   if (!A.focusName.empty()) {
     dl->AddText(ImVec2(colX, y), ui::ColGold(), A.focusName.c_str());
     y += lineH + 6;
     BenchParts(dl, ImVec2(colX, y), colW, A.focusParts, A.focusCap, y);
+    // Its devices, in words, and the pressure when it is stoppered.
+    std::string dev;
+    if (A.focusStoppered) dev += "stoppered";
+    if (A.focusBurner) dev += std::string(dev.empty() ? "" : ", ") + "over a flame";
+    if (A.focusHeat > 0.05f) {
+      char hb[48];
+      std::snprintf(hb, sizeof hb, "%sglass %s", dev.empty() ? "" : ", ",
+                    A.focusHeat > 0.75f ? "very hot" : A.focusHeat > 0.35f ? "hot" : "warm");
+      dev += hb;
+    }
+    if (!dev.empty()) {
+      dl->AddText(ImVec2(colX, y), A.focusHeat > 0.35f ? ui::ColEmber() : Fade(ui::ColParch(), 0.8f), dev.c_str());
+      y += lineH + 4;
+    }
+    if (A.focusStoppered) {
+      // Pressure against where the stopper gives (SimConfig::popAt 0.6).
+      const float f = std::clamp(A.focusPressure / 0.6f, 0.0f, 1.0f);
+      const float bh = 8;
+      dl->AddRectFilled(ImVec2(colX, y), ImVec2(colX + colW, y + bh), IM_COL32(30, 24, 20, 255));
+      dl->AddRectFilled(ImVec2(colX, y), ImVec2(colX + colW * f, y + bh),
+                        f > 0.8f ? ui::ColEmber() : ui::ColBronze());
+      dl->AddRect(ImVec2(colX, y), ImVec2(colX + colW, y + bh), ui::ColBronze());
+      y += bh + 4;
+      dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.7f), "pressure");
+      y += lineH + 8;
+    }
   } else {
     dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.6f), "point at a vessel to see inside it");
     y += lineH + 12;

@@ -75,6 +75,7 @@
 #include "sim/farfield.h"
 #include "sim/celestial.h"
 #include "sim/materials.h"
+#include "sim/solutes.h"
 #include "sim/oprecord.h"  // the op record carries the tick command (N2/N3)
 #include "sim/microbody.h"
 #include "sim/microvox.h"
@@ -376,6 +377,12 @@ const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
 // second one (SANDVOX_BENCH_B, default lava+sand), opens the first on the
 // bench, stirs it, brings the second in, carries it over the mouth and tilts
 // it to pour, then closes -- a picture at each step through g_shotJumpPath.
+// THE CHEMISTRY (package C), by env: SANDVOX_BENCH_BURNER=1 lights the flame
+// under A, SANDVOX_BENCH_STOPPER=1 stoppers A, SANDVOX_BENCH_SHOCK=<frame>
+// electrifies A every 20 frames from that frame, SANDVOX_BENCH_NOPOUR=1 skips
+// the stir and the pour and just watches (extra pictures _chem1.._chem3).
+// e.g. SANDVOX_BENCH_A=acid:0.3+sand:0.08 (fumes), =salt:0.1 with BURNER=1 and
+// SHOCK=300 (electrolysis), =water:0.3+sodium:0.01 (it blows up in your hands).
 bool g_shotBench = false;
 constexpr uint64_t kShotBenchLast = 425;
 float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
@@ -5415,6 +5422,15 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::printf("loaded %zu materials, %zu reactions\n", mats.size(), reactions.size());
+  // THE SOLUTE TABLE (solutes.json) the alchemy bench dissolves by (package
+  // C); reloaded with the materials (R). A bad table is reported and the
+  // bench simply dissolves nothing.
+  std::vector<SoluteDef> benchSolutes;
+  {
+    std::string serr;
+    if (!LoadSolutes(assetDir + "/materials/solutes.json", mats, benchSolutes, serr))
+      std::fprintf(stderr, "solutes: %s", serr.c_str());
+  }
 
   // glyphs (assets/spells/glyphs.json — DESIGN.md §8 "The spell system").
   // Content like materials.json, so it loads here and hot-reloads on the same
@@ -9102,6 +9118,22 @@ int main(int argc, char** argv) {
         ui.alchemy.toggleRef = refB;
       }
       if (f == 175) g_shotJumpPath = "screenshot_bench.bmp";
+      static const bool chemBurner = std::getenv("SANDVOX_BENCH_BURNER") != nullptr;
+      static const bool chemStopper = std::getenv("SANDVOX_BENCH_STOPPER") != nullptr;
+      static const bool chemNoPour = std::getenv("SANDVOX_BENCH_NOPOUR") != nullptr;
+      static const int chemShock = std::getenv("SANDVOX_BENCH_SHOCK") ? std::atoi(std::getenv("SANDVOX_BENCH_SHOCK")) : -1;
+      if (f == 178 && bench.IsOpen()) {
+        if (chemBurner) bench.SetBurner(refA, true);
+        if (chemStopper) bench.SetStopper(refA, true);
+      }
+      if (chemShock > 0 && (int)f >= chemShock && ((int)f - chemShock) % 20 == 0 && bench.IsOpen())
+        bench.Shock(refA);
+      if (chemNoPour) {
+        if (f == 240) g_shotJumpPath = "screenshot_bench_chem1.bmp";
+        if (f == 320) g_shotJumpPath = "screenshot_bench_chem2.bmp";
+        if (chemShock > 0 && (int)f == chemShock + 2) g_shotJumpPath = "screenshot_bench_arc.bmp";
+        if (f == 398) g_shotJumpPath = "screenshot_bench_chem3.bmp";
+      }
       // SANDVOX_BENCH_PORTRAIT_YAW turns the portrait (radians; 1.3 = from the
       // side): the front view foreshortens a flask held out toward you.
       if (const char* py = std::getenv("SANDVOX_BENCH_PORTRAIT_YAW"))
@@ -9111,19 +9143,19 @@ int main(int argc, char** argv) {
       const bool haveA = bench.IsOpen() && bench.PoseOf(refA, pa, wa, ha);
       const bool haveB = bench.IsOpen() && bench.PoseOf(refB, pb, wb, hb);
       // Stir A: the stick sweeps side to side in its belly.
-      if (f > 180 && f < 240 && haveA) {
+      if (f > 180 && f < 240 && haveA && !chemNoPour) {
         ui.alchemy.tool = 1;
         ui.alchemy.over = true;
         ui.alchemy.down = true;
         ui.alchemy.atX = pa.pos.x + wa * 0.3f * std::sin((float)f * 0.15f);
         ui.alchemy.atY = pa.pos.y + ha * 0.15f;
       }
-      if (f == 238) g_shotJumpPath = "screenshot_bench_stir.bmp";
+      if (f == 238 && !chemNoPour) g_shotJumpPath = "screenshot_bench_stir.bmp";
       // Pour B into A with the hand: grab B by its belly, lift it clear,
       // then carry and tip it so its left lip corner hangs over A's mouth.
       static float want = 0.0f, reqd = 0.0f;
       static alchemy::V2 grabAt, start;
-      if (f >= 260 && f < 400 && haveA && haveB) {
+      if (f >= 260 && f < 400 && haveA && haveB && !chemNoPour) {
         const alchemy::V2 grabL{0.0f, hb * 0.35f};
         if (f == 260) {
           grabAt = {pb.pos.x + grabL.x, pb.pos.y + grabL.y};
@@ -9164,9 +9196,9 @@ int main(int argc, char** argv) {
         ui.alchemy.tiltReq = want - reqd;
         reqd = want;
       }
-      if (f == 289) g_shotJumpPath = "screenshot_bench_lift.bmp";
-      if (f == 300) g_shotJumpPath = "screenshot_bench_pour.bmp";
-      if (f == 398) g_shotJumpPath = "screenshot_bench_poured.bmp";
+      if (f == 289 && !chemNoPour) g_shotJumpPath = "screenshot_bench_lift.bmp";
+      if (f == 300 && !chemNoPour) g_shotJumpPath = "screenshot_bench_pour.bmp";
+      if (f == 398 && !chemNoPour) g_shotJumpPath = "screenshot_bench_poured.bmp";
       if (f == 405) ui.alchemy.wantClose = true;
       if (f == 420) g_shotJumpPath = "screenshot_bench_closed.bmp";
     }
@@ -10355,6 +10387,12 @@ int main(int argc, char** argv) {
                      errors)) {
         mats = std::move(newMats);
         reactions = std::move(newReactions);
+        {
+          std::string serr;
+          std::vector<SoluteDef> ns;
+          if (LoadSolutes(assetDir + "/materials/solutes.json", mats, ns, serr)) benchSolutes = std::move(ns);
+          else std::fprintf(stderr, "solutes: %s", serr.c_str());
+        }
         // Micro bricks BEFORE the table upload: LoadMicroVox sets MATF_MICRO on
         // `mats`, and the flag has to be in the buffer the raymarcher reads or
         // an edited "micro" block would silently do nothing until a restart.
@@ -12839,8 +12877,28 @@ int main(int argc, char** argv) {
       // moved, emptied or was swapped while the panel was up voids the
       // session rather than being written over), and what was spilled goes
       // into the world at your feet through the vessel-spill queue.
-      auto finishBench = [&]() {
-        alchemy::BenchResult r = bench.Finish();
+      // WHERE THE HANDS ARE (world voxels): between the lips of the vessels
+      // the character holds for the bench, else a little in front of the
+      // chest. The bench's explosions go off here, its broken glass spills
+      // here.
+      auto benchHands = [&]() -> Vec3 {
+        const Vec3 fwd = cam.Forward();
+        Vec3 at = player.EyePos() + fwd * MetresToCells(0.4f) - Vec3{0, MetresToCells(0.45f), 0};
+        if (!avatar.Spawned()) return at;
+        Vec3 sum{};
+        int n = 0;
+        for (int hk = 0; hk < kHands; hk++) {
+          if (session.benchHold.hand[hk].item.empty()) continue;
+          const float ang = session.benchHold.hand[hk].angle;
+          const Quat yaw = QuatAxisAngle({0, 1, 0}, avatar.Heading());
+          const Vec3 axisW = QuatRotate(yaw, Vec3{-std::sin(ang), std::cos(ang), 0.0f});
+          Vec3 lip;
+          if (avatar.HeldMouthWorld(axisW, lip, HandAt(hk))) { sum = sum + lip; n++; }
+        }
+        return n ? sum * (1.0f / (float)n) : at;
+      };
+      auto finishBench = [&](bool abrupt = false, bool breakHeld = false) {
+        alchemy::BenchResult r = bench.Finish(abrupt);
         ui.alchemy.open = false;
         ui.alchemy.texReady = false;
         ui.alchemy.rows.clear();
@@ -12872,8 +12930,32 @@ int main(int argc, char** argv) {
             return;
           }
         }
-        for (const alchemy::BenchEntry& e : r.vessels)
-          if (ItemStack* st = kit.Resolve(e.ref)) st->contents = e.after;
+        // THE GLASS THAT BROKE: a vessel whose pressure burst it on the bench,
+        // and -- when an event blew up in the character's hands -- the ones
+        // they were holding. The item is gone; what was in it BURSTS out at
+        // the hands (a break's spill, not a pour).
+        for (const alchemy::BenchEntry& e : r.vessels) {
+          ItemStack* st = kit.Resolve(e.ref);
+          if (!st) continue;
+          st->contents = e.after;
+          st->stoppered = e.stoppered;
+          const bool breaks = e.broken || (breakHeld && e.onTable);
+          if (!breaks) continue;
+          if (!st->contents.Empty()) {
+            ContainerSpill sp;
+            sp.at = benchHands();
+            sp.vel = player.vel;
+            sp.away = Vec3{0, 1, 0};
+            sp.rest = st->contents;
+            sp.seed = rng::Hash3(0xB0B5Eu, (uint32_t)frameCounter, st->contents.Total());
+            tickCtx.vesselSpills.push_back(sp);
+          }
+          avatar.KitTake(e.ref, 1);
+          if (ItemStack* left = kit.Resolve(e.ref); left && !left->Empty()) {
+            left->ClearFill();
+            left->stoppered = false;
+          }
+        }
         if (!r.spilled.Empty()) {
           ContainerSpill sp;
           const Vec3 fwd = cam.Forward();
@@ -12883,9 +12965,12 @@ int main(int argc, char** argv) {
           sp.away = Vec3{0, 1, 0};
           sp.rest = r.spilled;
           sp.seed = rng::Hash3(0xA1C4E3u, (uint32_t)frameCounter, r.spilled.Total());
+          if (r.ejected) sp.at = benchHands();
           tickCtx.vesselSpills.push_back(sp);
-          ui.kitMessage = "some of it spilled at your feet";
-          ui.kitMessageAge = 0.0f;
+          if (!r.ejected) {
+            ui.kitMessage = "some of it spilled at your feet";
+            ui.kitMessageAge = 0.0f;
+          }
         }
       };
       // Put a vessel on the bench (opening the bench if it is not up yet, sized
@@ -12902,7 +12987,7 @@ int main(int argc, char** argv) {
           const int sc = std::max(1, ui.alchemy.scale);
           const float aw = ui.alchemy.areaW > 0 ? ui.alchemy.areaW : 1000.0f;
           const float ah = ui.alchemy.areaH > 0 ? ui.alchemy.areaH : 780.0f;
-          bench.Open((int)(aw / sc), (int)(ah / sc), mats);
+          bench.Open((int)(aw / sc), (int)(ah / sc), mats, reactions, benchSolutes);
           ui.alchemy.open = true;
           ui.alchemy.texReady = false;
           ui.alchemy.tableW = bench.W();
@@ -12927,6 +13012,40 @@ int main(int argc, char** argv) {
       if (ui.alchemy.wantClose || (bench.IsOpen() && !ui.inventoryOpen)) {
         ui.alchemy.wantClose = false;
         if (bench.IsOpen()) finishBench();
+      }
+      // ---- THE BENCH'S EVENTS (alchemy_bench.h: the registry by effect kind) --
+      // Each goes through its handler into one BenchOutcome, applied here
+      // generically: a message, an EJECT (the bench shuts mid-motion, the
+      // vessels in hand break), real EXPLOSIONS at the hands through the
+      // grenade slot (PlayerSession::pendingBlasts) and a PUFF of the
+      // reaction's gases round them on the CPU gas stream.
+      if (bench.IsOpen()) {
+        alchemy::BenchOutcome out;
+        bool any = false;
+        for (const alchemy::BenchEvent& ev : bench.TakeEvents()) {
+          any |= alchemy::DispatchBenchEvent(ev, out);
+          if (std::getenv("SANDVOX_BENCH_DEBUG"))
+            std::printf("bench event: %s x%d (entry %d)\n", ev.kind.c_str(), ev.count, ev.entry);
+        }
+        if (any) {
+          if (!out.message.empty()) {
+            ui.alchemy.message = out.message;
+            ui.kitMessage = out.message;
+            ui.kitMessageAge = 0.0f;
+          }
+          const Vec3 hands = benchHands();
+          std::vector<ExplosionOp> exps;
+          std::vector<GasSpawnOp> gas;
+          alchemy::BenchOutcomeWorldOps(out, hands, rng::Hash3(0xB1A57u, (uint32_t)frameCounter, 1u), mats,
+                                        exps, gas);
+          for (const ExplosionOp& e : exps) session.pendingBlasts.push_back(e);
+          for (int be : out.burst) bench.BurstEntry(be);
+          if (!gas.empty()) world.QueueGasSpawns(gas.data(), (uint32_t)gas.size());
+          if (out.eject) {
+            finishBench(true, out.breakHeld);
+            ui.inventoryOpen = false;   // thrown out of the bench AND the screen
+          }
+        }
       }
       // ---- THE BENCH IN THE CHARACTER'S HANDS (session.h BenchHold) --------
       // One vessel on the table: held in one hand. Two or more: the one in
@@ -13475,6 +13594,8 @@ int main(int argc, char** argv) {
           in.down = ui.alchemy.down;
           in.pressed = ui.alchemy.pressed;
           in.tilt = ui.alchemy.tiltReq;
+          in.shock = ui.alchemy.shockReq;
+          ui.alchemy.shockReq = false;
           bench.Frame(in, (alchemy::BenchTool)ui.alchemy.tool);
           auto densityOf = [&](const std::string& name) {
             for (size_t k = 1; k < mats.size(); k++)
@@ -13485,10 +13606,12 @@ int main(int argc, char** argv) {
             std::vector<UIState::AlchemyUI::Portion> out;
             for (int i = 0; i < c.n; i++) {
               UIState::AlchemyUI::Portion p;
-              const uint16_t mid = c.p[i].mat;
-              p.name = mid < mats.size() ? mats[mid].name : std::string("?");
+              const uint16_t mid = alchemy::BaseMat(c.p[i].mat);
+              const bool dis = alchemy::IsDissolved(c.p[i].mat);
+              p.name = mid < mats.size() ? mats[mid].name + (dis ? " (dissolved)" : "") : std::string("?");
               p.color = mid < mats.size() ? (0xFF000000u | (mats[mid].gpu.color0 & 0x00FFFFFFu)) : 0u;
               p.eighths = (int)c.p[i].eighths;
+              p.dissolved = dis;
               out.push_back(p);
             }
             // Heaviest first: the list reads bottom layer to top.
@@ -13534,6 +13657,14 @@ int main(int argc, char** argv) {
               ui.alchemy.focusName = d->name;
               ui.alchemy.focusParts = partsOf(c);
               ui.alchemy.focusCap = d->container.capacity;
+              bool stop = false, burn = false;
+              float heat = 0, press = 0;
+              if (bench.Devices(fr, stop, burn, heat, press)) {
+                ui.alchemy.focusStoppered = stop;
+                ui.alchemy.focusBurner = burn;
+                ui.alchemy.focusHeat = heat;
+                ui.alchemy.focusPressure = press;
+              }
             }
           }
         }

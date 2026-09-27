@@ -1258,6 +1258,7 @@ struct UIState {
       std::string name;
       uint32_t color = 0;        // 0xAABBGGRR
       int eighths = 0;
+      bool dissolved = false;    // in solution: rides the liquid, takes no room
     };
     // Every vessel you carry, and whether it is on the table. Click one to
     // put it on / take it off.
@@ -1273,9 +1274,14 @@ struct UIState {
     std::string focusName;
     std::vector<Portion> focusParts;
     int focusCap = 0;
+    // Its devices (the chemistry tools): stopper in, burner lit, how hot the
+    // glass is (0..1) and, stoppered, the gas pressure (FlaskSim::Pressure).
+    bool focusStoppered = false, focusBurner = false;
+    float focusHeat = 0.0f, focusPressure = 0.0f;
     std::string message;         // the last thing the bench said
     // ---- panel-owned ----
-    int tool = 0;                // 0 = hand, 1 = stirring stick
+    int tool = 0;                // 0 hand, 1 stirring stick, 2 stopper, 3 burner
+    bool shockReq = false;       // Electrify pressed (consumed by main.cpp)
     // What the panel measured last frame, for sizing the next table: the
     // picture's room in screen pixels and the integer scale it draws at.
     float areaW = 0.0f, areaH = 0.0f;

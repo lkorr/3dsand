@@ -18,6 +18,7 @@
 // thread sees is a snapshot published under one mutex.
 #include <atomic>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -30,10 +31,19 @@
 
 struct ItemDef;
 struct MaterialDef;
+struct ReactionGpu;
+struct SoluteDef;
+struct ExplosionOp;
+struct GasSpawnOp;
+struct Vec3;
 
 namespace alchemy {
 
-enum class BenchTool : uint8_t { Hand = 0, Stick = 1 };
+// The tools (docs/PLAN_alchemy_chemistry.md package C): the hand carries and
+// tilts, the stick stirs, the STOPPER tool puts a stopper in a vessel's mouth
+// or takes it out, the BURNER tool lights or puts out the flame under one.
+// Electrify is a button, not a tool (BenchInput::shock).
+enum class BenchTool : uint8_t { Hand = 0, Stick = 1, Stopper = 2, Burner = 3 };
 
 // One frame of the pointer over the bench, in SIM pixels (y up, 0..W/H).
 struct BenchInput {
@@ -42,6 +52,7 @@ struct BenchInput {
   bool down = false;     // primary button held
   bool pressed = false;  // primary button went down this frame
   float tilt = 0;        // tilt request this frame, radians (+ = CCW)
+  bool shock = false;    // Electrify pressed this frame: shocks the vessel in focus
 };
 
 struct BenchEntry {
@@ -51,15 +62,70 @@ struct BenchEntry {
   Composition before;     // what it held when it first came on
   Composition after;      // what it holds now (taken off, or at Finish)
   bool onTable = false;
+  bool stoppered = false;  // now (ItemInstance::stoppered is written from this)
+  bool broken = false;     // its glass burst on the bench: the item is gone
+  bool inHand = false;     // one of the two the character is holding (main.cpp)
 };
+
+// WHAT A BENCH EVENT IS (a FlaskSim SimEvent in entry terms). `kind` is the
+// reaction effect's kind (reactions.json "effects", MaterialDef::ruleFx) or a
+// pressure event of the sim's own ("pop", "burst").
+struct BenchEvent {
+  std::string kind;
+  int entry = -1;               // the vessel it happened in (BenchResult::vessels index), -1 = none
+  V2 at;                        // sim pixels
+  int32_t radius = 0, power = 0;
+  float amount = 0;
+  std::string what;
+  uint16_t selfMat = 0, nbrMat = 0;
+  std::vector<uint16_t> products;
+  int count = 1;
+};
+
+// WHAT THE GAME DOES ABOUT ONE. A handler fills this; main.cpp applies it
+// generically (BenchOutcomeWorldOps turns the world half into ops), so a new
+// event kind is one handler and a line of JSON -- never a new branch in the
+// frame loop.
+struct BenchOutcome {
+  bool eject = false;       // the bench closes NOW, mid-motion
+  bool breakHeld = false;   // the vessels in the character's hands break; their contents burst out
+  std::vector<int> burst;   // entries whose glass breaks on the bench (their contents loose on it)
+  struct Blast { int32_t radius = 0, power = 0; };
+  std::vector<Blast> blasts;           // REAL explosions at the hands (ExplosionOp, the grenade slot)
+  std::vector<uint16_t> puff;          // gases puffed round the hands (only gas materials are used)
+  int puffCells = 0;                   // how many gas voxels, all of them together
+  std::string message;
+};
+using BenchEventHandler = std::function<void(const BenchEvent&, BenchOutcome&)>;
+// The registry, keyed by kind. Built-ins: "explode", "burst", "pop".
+void RegisterBenchEvent(const std::string& kind, BenchEventHandler h);
+// Runs the handler for e.kind into `out`; false (and no change) for a kind
+// nobody registered -- ignored, as every consumer ignores an unknown effect.
+bool DispatchBenchEvent(const BenchEvent& e, BenchOutcome& out);
+// The world half of an outcome at `hands` (world voxels): its blasts as
+// ExplosionOps and its puff as GasSpawnOps in a small ball round the hands.
+// Pure, so the gate checks exactly what the game submits.
+void BenchOutcomeWorldOps(const BenchOutcome& o, const Vec3& hands, uint32_t seed,
+                          const std::vector<MaterialDef>& mats, std::vector<ExplosionOp>& exps,
+                          std::vector<GasSpawnOp>& gas);
 
 struct BenchResult {
   std::vector<BenchEntry> vessels;
   Composition spilled;               // left the bench: goes to the world
   // What already WENT to the world while the bench was up (TakeSpill), per
-  // material id, eighths. Part of the conservation sum: before == after +
-  // spilled + streamed.
+  // material id, eighths: liquid and powder that fell off the table, and
+  // gas that VENTED out of a mouth. Part of the conservation sum.
   std::vector<uint32_t> streamed;
+  std::vector<uint32_t> vented;
+  // THE REACTION LEDGER, per material id, in bench UNITS (unitsPerEighth to
+  // an eighth): what the bench's reactions made and unmade. Every conversion
+  // is in here, so ValidateBench proves
+  //   before + produced - consumed == after + spilled + streamed + vented
+  // per material, with a dissolved portion counted as its powder.
+  std::vector<int64_t> produced, consumed;
+  int unitsPerEighth = 12;
+  // The bench ended in an event that ejected the player (nothing settled).
+  bool ejected = false;
 };
 
 // A vessel on the table as the character holds it (main.cpp poses the
@@ -69,6 +135,9 @@ struct BenchVesselView {
   Xform pose;            // sim pixels, y up; angle radians CCW
   float width = 0, height = 0;
   bool held = false;     // in the bench's hand right now
+  bool stoppered = false;
+  bool burner = false;
+  float heat = 0;
 };
 
 // Does `r` conserve every material (sum of before == sum of after + spilled)?
@@ -77,6 +146,13 @@ struct BenchVesselView {
 // applicable. False (with `why`) only for a result that created or destroyed
 // matter, which is a bug, never a player action.
 bool ValidateBench(BenchResult& r, const std::vector<MaterialDef>& mats, std::string& why);
+
+// Units -> eighths the way FlaskSim::Count rounds a material's total (half
+// up, floor division): the ledger's net in eighths.
+inline int64_t LedgerEighths(int64_t units, int upe) {
+  const int64_t x = units + upe / 2;
+  return x >= 0 ? x / upe : -((-x + upe - 1) / upe);
+}
 
 class AlchemyBench {
  public:
@@ -99,8 +175,11 @@ class AlchemyBench {
   AlchemyBench(const AlchemyBench&) = delete;
   AlchemyBench& operator=(const AlchemyBench&) = delete;
 
-  // An empty table of `w` x `h` sim pixels.
-  bool Open(int w, int h, const std::vector<MaterialDef>& mats);
+  // An empty table of `w` x `h` sim pixels. `reactions` and `solutes` are the
+  // world's tables: the bench runs the same rules (flasksim_mats.h
+  // BuildBenchChemistry); empty ones make a bench without chemistry.
+  bool Open(int w, int h, const std::vector<MaterialDef>& mats,
+            const std::vector<ReactionGpu>& reactions, const std::vector<SoluteDef>& solutes);
   bool IsOpen() const { return open_; }
 
   // Put a vessel on the table (a free spot, upright) / take it off (it
@@ -135,8 +214,21 @@ class AlchemyBench {
   // taken it is the world's: Finish reports it in BenchResult::streamed.
   bool TakeSpill(Composition& out, float& exitX);
 
+  // THE CHEMISTRY'S EVENTS since the last call (DispatchBenchEvent each).
+  std::vector<BenchEvent> TakeEvents();
+  // The devices of a vessel on the table, as of the last published step.
+  bool Devices(KitRef ref, bool& stoppered, bool& burner, float& heat, float& pressure) const;
+  // For scripted captures (--shot-bench) and gates: act on a vessel directly.
+  void SetStopper(KitRef ref, bool on);
+  void SetBurner(KitRef ref, bool on);
+  void Shock(KitRef ref);
+  // Breaks a vessel's glass on the bench (a BenchOutcome's `burst`), by entry.
+  void BurstEntry(int entry);
+
   // Stops the sim, lets whatever is in flight land, tallies, closes.
-  BenchResult Finish();
+  // `abrupt` (an event ejected the player): nothing settles, the table is
+  // tallied where it stands.
+  BenchResult Finish(bool abrupt = false);
   void Abandon();
 
   const std::vector<uint32_t>& Pixels() const { return front_; }
@@ -147,10 +239,11 @@ class AlchemyBench {
 
  private:
   struct Cmd {
-    enum Kind { kPlace, kRemove } kind;
+    enum Kind { kPlace, kRemove, kStopper, kBurner, kShock, kBurst } kind;
     int entry;
     VesselShape shape;
     Composition contents;
+    bool on = false;
   };
   struct Slot {                // per entry, sim-thread side
     int sim = -1;              // FlaskSim vessel index, -1 when off the table
@@ -170,6 +263,7 @@ class AlchemyBench {
   bool fresh_ = false;
   std::string refusal_;
   std::vector<uint32_t> streamed_;   // per mat id, taken by TakeSpill
+  std::vector<uint32_t> vented_;     // per mat id, gas taken by TakeSpill
 
   // ---- shared, under mu_ ----
   mutable std::mutex mu_;
@@ -184,9 +278,15 @@ class AlchemyBench {
   std::vector<uint32_t> streamOut_;                    // per mat id, not yet taken
   double streamXSum_ = 0, streamXW_ = 0;
   int heldPub_ = -1;                                   // entry in the hand
-  std::vector<std::pair<int, Composition>> removed_;   // entry, what left with it
+  struct Removed { int entry; Composition c; bool stoppered; };
+  std::vector<Removed> removed_;                       // what left with each vessel taken off
+  std::vector<BenchEvent> events_;                     // not yet taken
+  std::vector<uint8_t> brokenPub_;                     // per entry: burst
   int focus_ = -1;                                     // entry
-  struct PoseView { Xform x; float w = 0, h = 0; bool on = false; };
+  struct PoseView {
+    Xform x; float w = 0, h = 0; bool on = false;
+    bool stoppered = false, burner = false; float heat = 0, pressure = 0;
+  };
   std::vector<PoseView> poses_;                        // per entry
   bool quit_ = false;
 

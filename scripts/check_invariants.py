@@ -2738,8 +2738,57 @@ def check_solute_mirror():
                             f"{c} = {cv} in world.h")
 
 
+def check_react_fx():
+    """The reaction-effect record (docs/PLAN_alchemy_chemistry.md A): sim_step's
+    RFX_* constants <-> world.h kPageFaultReactFx* / kReactFx* and materials.h
+    kCondFx*, plus MATF_HEAVY_GAS <-> kMatFlagHeavyGas (and not a bit any
+    common.wgsl MATF_* claims). A drifted slot base writes the scoop ledger; a
+    drifted scramble decodes every blast into the wrong cell; a drifted flag
+    bit makes some other material sink like chlorine. None of those fails loud
+    on the GPU."""
+    step = read("assets/shaders/sim_step.wgsl")
+    wh = read("src/sim/world.h")
+    hpp = read("src/sim/materials.h")
+    common = read("assets/shaders/common.wgsl")
+    if not step or not wh or not hpp:
+        return
+    checked.append("reaction-effect record")
+
+    def num(txt, pat):
+        m = re.search(pat, txt)
+        return int(m.group(1), 0) if m else None
+
+    pairs = [
+        ("RFX_FIRES", wh, r"kPageFaultReactFxFires\s*=\s*(\w+?)u?;"),
+        ("RFX_ORIGIN", wh, r"kPageFaultReactFxOrigin\s*=\s*(\w+?)u?;"),
+        ("RFX_TICK", wh, r"kPageFaultReactFxTick\s*=\s*(\w+?)u?;"),
+        ("RFX_SLOT0", wh, r"kPageFaultReactFxSlot0\s*=\s*(\w+?)u?;"),
+        ("RFX_SLOTS", wh, r"kPageFaultReactFxSlots\s*=\s*(\w+?)u?;"),
+        ("RFX_CELL_BITS", wh, r"kReactFxCellBits\s*=\s*(\w+?)u?;"),
+        ("RFX_SCRAMBLE", wh, r"kReactFxScramble\s*=\s*(0x[0-9A-Fa-f]+|\d+)u?;"),
+        ("RFX_COND_SHIFT", hpp, r"kCondFxShift\s*=\s*(\w+?)u?,"),
+        ("RFX_COND_MASK", hpp, r"kCondFxMask\s*=\s*(0x[0-9A-Fa-f]+|\d+)u?;"),
+        ("MATF_HEAVY_GAS", hpp, r"kMatFlagHeavyGas\s*=\s*(\d+);"),
+    ]
+    for wname, src, pat in pairs:
+        want = num(src, pat)
+        got = num(step, r"const\s+" + wname + r"\s*:\s*u32\s*=\s*(0x[0-9A-Fa-f]+|\d+)u")
+        if want is None or got is None:
+            problems.append(f"reaction-effect record: cannot read {wname} "
+                            "(sim_step.wgsl) or its C++ twin")
+        elif want != got:
+            problems.append(f"reaction-effect record: sim_step.wgsl {wname} = "
+                            f"{got} but the C++ side says {want}")
+    hg = num(hpp, r"kMatFlagHeavyGas\s*=\s*(\d+);")
+    for m in re.finditer(r"const\s+(MATF_\w+)\s*:\s*u32\s*=\s*(\d+)u", common):
+        if hg is not None and int(m.group(2)) == hg:
+            problems.append(f"heavy gas flag: bit {hg} is also common.wgsl's "
+                            f"{m.group(1)}")
+
+
 ALL = {
     "solute": check_solute_mirror,
+    "reactfx": check_react_fx,
     "coatrule": check_coat_rule,
     "stainprec": check_stain_prec,
     "coatflame": check_coat_flame,
@@ -2807,7 +2856,7 @@ RELEVANT = {
     "assets/shaders/sim_mutate.wgsl": ["scoop"],
     "assets/shaders/sim_particle.wgsl": ["scoop"],
     "src/sim/world.h": ["scoop", "world", "params", "substeps", "windprim",
-                        "curprim", "waterledger", "ringdepth", "matids"],
+                        "curprim", "waterledger", "ringdepth", "matids", "reactfx"],
     "src/test/selftest_water.cpp": ["waterledger"],
     "src/sim/world.cpp": ["worldgen"],
     "assets/shaders/worldgen.wgsl": ["worldgen", "treeatlas"],
@@ -2825,8 +2874,8 @@ RELEVANT = {
     "assets/shaders/raymarch.wgsl": ["gas"],
     "tests/env_predictions.json": ["envpred"],
     "scripts/test_environment.mjs": ["envpred"],
-    "src/sim/materials.h": ["reactgate", "coatflame"],
-    "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule"],
+    "src/sim/materials.h": ["reactgate", "coatflame", "reactfx"],
+    "assets/shaders/sim_step.wgsl": ["coatflame", "coatrule", "reactfx"],
     "assets/shaders/common.wgsl": ["stainprec", "powdermass"],
     "src/sim/coatrule.h": ["coatrule", "stainprec"],
     "src/sim/reactcpu.h": ["reactgate"],

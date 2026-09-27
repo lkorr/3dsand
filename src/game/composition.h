@@ -25,6 +25,13 @@ constexpr uint16_t kDissolvedBit = 0x8000;
 constexpr uint16_t kMatIdMask = 0x0FFF;
 inline bool IsDissolved(uint16_t mat) { return (mat & kDissolvedBit) != 0; }
 inline uint16_t BaseMat(uint16_t mat) { return (uint16_t)(mat & kMatIdMask); }
+// A portion id a record may carry: a material id, or one with the dissolved
+// bit and nothing else set. Every reader of a saved or received Composition
+// (iteminstance.h ReadContents, persist.cpp) asks this, so a dissolved
+// portion survives a save instead of being dropped as "an id past 4096".
+inline bool ValidPortionMat(uint32_t mat) {
+  return (mat & ~(uint32_t)(kDissolvedBit | kMatIdMask)) == 0 && (mat & kMatIdMask) != 0;
+}
 
 struct Portion {
   uint16_t mat = 0;

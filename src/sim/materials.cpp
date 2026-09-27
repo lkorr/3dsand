@@ -709,6 +709,9 @@ static bool LoadMaterialsJson(const std::string& path, std::vector<MaterialDef>&
       // A hot GAS is a flame (materials.h kMatFlagFlame): the one thing a
       // reacting coat may release into the world.
       if (t == "hot" && d.gpu.klass == CLASS_GAS) d.gpu.flags |= kMatFlagFlame;
+      // A gas_heavy GAS sinks and creeps instead of rising (kMatFlagHeavyGas,
+      // sim_step.wgsl stepGas). The tag on a non-gas means nothing.
+      if (t == "gas_heavy" && d.gpu.klass == CLASS_GAS) d.gpu.flags |= kMatFlagHeavyGas;
     }
     mats.push_back(d);
   }
@@ -1146,6 +1149,82 @@ static bool ExpandNeighborChance(const json& r, std::vector<MaterialDef>& mats,
   return true;
 }
 
+// ---- "effects": what a rule does besides rewriting cells (2026-09-27) -------
+//
+// docs/PLAN_alchemy_chemistry.md 2.2. Parsed here into MaterialDef::ruleFx;
+// ACTED ON by each consumer's own registry, by kind name (the world:
+// game/session.cpp's reaction-effect pass; the alchemy bench: package C's
+// event handlers). This list is only the loader's spell-checker: a kind
+// outside it still loads (a consumer that does not know a kind ignores it)
+// but is warned about once, so "exlpode" is visible instead of silent.
+const char* const kKnownEffectKinds[] = {"explode", "flash", "eject", "shock",
+                                         "burst"};
+const size_t kKnownEffectKindCount =
+    sizeof(kKnownEffectKinds) / sizeof(kKnownEffectKinds[0]);
+
+const RuleFx* FindRuleFx(const std::vector<MaterialDef>& mats, uint32_t fxId,
+                         uint32_t* selfMat) {
+  if (fxId == 0) return nullptr;
+  for (size_t i = 0; i < mats.size(); i++)
+    for (const RuleFx& f : mats[i].ruleFx)
+      if (f.fxId == fxId) {
+        if (selfMat) *selfMat = (uint32_t)i;
+        return &f;
+      }
+  return nullptr;
+}
+
+// One rule's "effects" array. Ranges are checked per kind where the kind has
+// a meaning the engine enforces (explode: radius <= kMaxExplosionRadius, the
+// blast box sim_explode.wgsl is dispatched over; power > 0). Returns false
+// with `errors` filled on a malformed entry.
+static bool ParseEffects(const json& r, const std::string& path,
+                         const std::string& self, RuleFx& out,
+                         std::string& errors) {
+  const json& e = r["effects"];
+  if (!e.is_array()) {
+    errors += path + ": reaction self=\"" + self + "\": effects must be an array\n";
+    return false;
+  }
+  for (const json& x : e) {
+    if (!x.is_object() || !x.contains("kind") || !x["kind"].is_string()) {
+      errors += path + ": reaction self=\"" + self +
+                "\": each effect needs a string \"kind\"\n";
+      return false;
+    }
+    ReactionEffect fx;
+    fx.kind = x["kind"].get<std::string>();
+    fx.radius = x.value("radius", 0);
+    fx.power = x.value("power", 0);
+    fx.amount = x.value("amount", 0.0f);
+    fx.what = x.value("what", std::string());
+    bool known = false;
+    for (size_t k = 0; k < kKnownEffectKindCount; k++)
+      known |= fx.kind == kKnownEffectKinds[k];
+    if (!known) {
+      static std::vector<std::string> warned;
+      if (std::find(warned.begin(), warned.end(), fx.kind) == warned.end()) {
+        warned.push_back(fx.kind);
+        std::fprintf(stderr,
+                     "%s: reaction self=\"%s\": effect kind \"%s\" is not one "
+                     "any consumer registers (materials.cpp kKnownEffectKinds); "
+                     "it will be ignored\n",
+                     path.c_str(), self.c_str(), fx.kind.c_str());
+      }
+    }
+    if (fx.kind == "explode" &&
+        (fx.radius < 1 || fx.radius > kMaxExplosionRadius || fx.power < 1 ||
+         fx.power > 5000)) {
+      errors += path + ": reaction self=\"" + self +
+                "\": explode needs radius 1.." +
+                std::to_string(kMaxExplosionRadius) + " and power 1..5000\n";
+      return false;
+    }
+    out.effects.push_back(std::move(fx));
+  }
+  return true;
+}
+
 static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>& mats,
                               TagRegistry& tagReg, std::vector<ReactionGpu>& out,
                               std::string& errors) {
@@ -1173,6 +1252,13 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
   // every authored rule of their material so no authored rule's bucket index
   // -- and therefore its RNG stream -- moves. See ExpandNeighborChance.
   std::vector<std::vector<ReactionGpu>> tails(mats.size());
+  // MaterialDef::ruleFx, built IN STEP with buckets/tails so the parallel
+  // index (ruleFx[k] <-> rule reactOffset + k) cannot drift: every push to a
+  // bucket or a tail pushes its RuleFx here in the same statement block.
+  // Weather-dropped and infectSpread-dropped rules `continue` before either
+  // push, so they vanish from both.
+  std::vector<std::vector<RuleFx>> bucketFx(mats.size()), tailFx(mats.size());
+  uint32_t nextFxId = 1;
 
   for (auto& r : j["reactions"]) {
     if (r.contains("note") && !r.contains("self")) continue;  // section comment
@@ -1427,23 +1513,53 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     // fields are already spoken for.
     ParseNeighborScale(r, mats, tagReg, path, self, kind, g, errors);
     g.packed = (kind & 3u) | ((dirMask & 7u) << 2u);
+    // ---- effects (docs/PLAN_alchemy_chemistry.md 2.2) ----------------------
+    // Parsed BEFORE the neighborChance split so the fx id rides g.cond into
+    // the synthesized tail rules: the floating-flame exception of an
+    // exploding rule still explodes (the tail is the same reaction at a
+    // different rate, and the id names the effect list, not the slot).
+    RuleFx fx;
+    if (r.contains("effects") && ParseEffects(r, path, self, fx, errors) &&
+        !fx.effects.empty()) {
+      if (nextFxId > kMaxReactFx) {
+        errors += path + ": reaction self=\"" + self + "\": more than " +
+                  std::to_string(kMaxReactFx) +
+                  " rules with effects (the GPU fx record keys on 5 bits; "
+                  "world.h kPageFaultReactFx*)\n";
+      } else {
+        fx.fxId = nextFxId++;
+        g.cond |= (fx.fxId & kCondFxMask) << kCondFxShift;
+      }
+    }
     // A per-member exception splits this rule in two (see ExpandNeighborChance).
     // The base rule keeps its place; the exact-neighbour rules go to the tail
     // of the bucket, so a voxel touching both an ember and a flame rolls the
     // full rate first and nothing authored changes its index.
-    if (r.contains("neighborChance"))
+    if (r.contains("neighborChance")) {
+      const size_t t0 = tails[selfId].size();
       ExpandNeighborChance(r, mats, tagReg, path, self, kind, chanceMille, g,
                            tails[selfId], errors);
+      for (size_t k = t0; k < tails[selfId].size(); k++) tailFx[selfId].push_back(fx);
+    }
     buckets[selfId].push_back(g);
+    bucketFx[selfId].push_back(std::move(fx));
   }
-  for (size_t i = 0; i < mats.size(); i++)
+  for (size_t i = 0; i < mats.size(); i++) {
     buckets[i].insert(buckets[i].end(), tails[i].begin(), tails[i].end());
+    bucketFx[i].insert(bucketFx[i].end(), tailFx[i].begin(), tailFx[i].end());
+  }
 
   out.clear();
   for (size_t i = 0; i < mats.size(); i++) {
     mats[i].gpu.reactOffset = (uint32_t)out.size();
     mats[i].gpu.reactCount = (uint32_t)buckets[i].size();
     out.insert(out.end(), buckets[i].begin(), buckets[i].end());
+    // Empty (the common case) unless some rule of this material has effects;
+    // otherwise exactly reactCount long, ruleFx[k] <-> rule reactOffset + k.
+    bool any = false;
+    for (const RuleFx& f : bucketFx[i]) any |= f.fxId != 0;
+    mats[i].ruleFx.clear();
+    if (any) mats[i].ruleFx = std::move(bucketFx[i]);
   }
   if (out.size() > kMaxReactions)
     errors += path + ": more than " + std::to_string(kMaxReactions) + " reactions\n";
