@@ -159,6 +159,167 @@
         { "note": "hurt in the last three seconds: run hard", "when": { "sinceHurt": "<90" }, "weight": { "flee": 2.0 } },
         { "note": "on fire: run", "when": { "burning": ">0" }, "weight": { "flee": 3.0 } }
       ]
+    },
+    {
+      "comment": "THE FIGHTING STYLES (2026-09-27). Five humans who fight a PERSON rather than a dummy: each reads its own body (hp, limbs, just-hurt), its own weapon (armed, myReach) and its opponent (targetArmed, reachAdv, targetAttacking / targetRecovering / targetGuarding, targetHp) and changes HOW it fights through rule `tune`s, and each answers your swings with the `guard` / `dodge` verbs gated by `defense` (a per-blow skill roll plus a reaction delay, so a quick blow beats a slow reader). `feintChance` fakes a swing and pulls out; `riposteTicks` is the counter after a blow it saw through; `flank` + the pressRank rule make several of them surround you and take turns instead of queueing in a line. Every one is written to work with ANY weapon or none: an unarmed rule is part of each. The AI panel's 'fighting styles' buttons and the random human spawn these.",
+      "//swordsman": "THE ALL-ROUNDER. Trades when its own blow is ready (attack 3.0 beats guard 2.6), guards when it is not, ripostes 4 ticks after a blow it covered. Reads the matchup: out-reached it closes fast past your point; out-reaching you it kites (keepOut); against an empty-handed target it presses; a guarding target gets feints and an angle. Hurt, it stands off and covers more; badly hurt and losing, it breaks and runs for a few seconds after each wound.",
+      "name": "swordsman",
+      "label": "Swordsman",
+      "color": 3225419775,
+      "faction": "monster",
+      "hysteresis": 0.28,
+      "perception": { "sightRange": 50, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 200, "keepRangeScale": 1.45, "stickiness": 6, "preferWeak": 4 },
+      "movement": { "mobile": true, "rangeMin": 7, "rangeMax": 11, "bandSlack": 1.4, "approachSpeed": 1.0, "strafeSpeed": 0.55, "retreatSpeed": 0.8, "fleeSpeed": 1.1, "circleTendency": 0.75, "circleHoldTicks": 30, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.35, "flank": 0.75, "keepOut": -1 },
+      "attack": { "styles": ["horizontal_r", "horizontal_l", "overhead", "diag_tr_bl", "diag_tl_br", "diag_br_tl", "diag_bl_tr", "thrust", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 34, "jitterTicks": 20, "commitTicks": 10, "disengageTicks": 22, "pursueSpeed": 0.7, "leadTicks": 15, "feintChance": 0.12, "feintTicks": 6, "feintFollowTicks": 10, "riposteTicks": 4 },
+      "defense": { "skill": 0.55, "reactTicks": 7, "reactJitter": 6, "margin": 2.5, "guardStance": 0.25, "guardReach": 0.85, "holdTicks": 4 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.05, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "circle": { "weight": 0.9, "cooldownTicks": 18, "minDwellTicks": 24 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "flee": { "weight": 0, "cooldownTicks": 0, "minDwellTicks": 30 },
+        "guard": { "weight": 2.6, "cooldownTicks": 0, "minDwellTicks": 6 },
+        "dodge": { "weight": 1.2, "cooldownTicks": 10, "minDwellTicks": 8 }
+      },
+      "rules": [
+        { "note": "empty-handed: get inside and brawl, weave instead of blocking", "when": { "armed": 0 }, "weight": { "dodge": 2.4 }, "tune": { "band": -3, "cadence": 0.85 } },
+        { "note": "out-reached: close past the point quickly and stay close", "when": { "reachAdv": "<-2", "targetArmed": 1 }, "tune": { "speed": 1.2, "disengage": 0.3, "band": -2 } },
+        { "note": "out-reaching it: make it come onto my point", "when": { "reachAdv": ">2" }, "tune": { "keepOut": 1.0 } },
+        { "note": "it has nothing in its hands: press", "when": { "hasTarget": 1, "targetArmed": 0 }, "scale": { "guard": 0.4 }, "tune": { "disengage": 0.4, "cadence": 0.85 } },
+        { "note": "it just swung: punish the recovery", "when": { "targetRecovering": 1 }, "weight": { "attack": 3.5 }, "tune": { "cadence": 0.45 } },
+        { "note": "it is covering: bait it and find an angle", "when": { "targetGuarding": 1 }, "tune": { "feint": 3.0, "circle": 1.5 } },
+        { "note": "hurt: fight from further out, cover more", "when": { "hp": "<0.5" }, "weight": { "guard": 3.2 }, "tune": { "band": 2, "cadence": 1.25, "skill": 1.3 } },
+        { "note": "a limb gone: slower, sloppier", "when": { "limbsLost": ">=1" }, "tune": { "speed": 0.8, "skill": 0.7 } },
+        { "note": "just took a wound: step off", "when": { "sinceHurt": "<12" }, "tune": { "band": 2 } },
+        { "note": "badly hurt and losing: break off after every wound", "when": { "hp": "<0.25", "hpAdv": "<-0.25", "sinceHurt": "<120" }, "weight": { "flee": 3.5 } },
+        { "note": "two of us already on it: circle and wait my turn", "when": { "pressRank": ">=2" }, "weight": { "circle": 1.3 }, "scale": { "attack": 0.2 }, "tune": { "band": 7 } }
+      ]
+    },
+    {
+      "//fencer": "THE KITER. Thrusts from the edge of its reach and stands just outside yours (base keepOut 1.5), circles a lot, and answers a blow with a quick DODGE rather than a block (dodge 2.8 vs guard 1.4). Feints often and ripostes fast. When YOU out-reach IT, kiting is impossible, so it switches: drops the keep-out and darts in. Hurt, it reads you better and stands further off.",
+      "name": "fencer",
+      "label": "Fencer",
+      "color": 3238068480,
+      "faction": "monster",
+      "hysteresis": 0.26,
+      "perception": { "sightRange": 50, "fovDegrees": 300, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 200, "keepRangeScale": 1.45, "stickiness": 6, "preferWeak": 2 },
+      "movement": { "mobile": true, "rangeMin": 8, "rangeMax": 12, "bandSlack": 1.2, "approachSpeed": 1.05, "strafeSpeed": 0.65, "retreatSpeed": 0.95, "fleeSpeed": 1.2, "circleTendency": 0.85, "circleHoldTicks": 24, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.55, "flank": 0.85, "keepOut": 1.5 },
+      "attack": { "styles": ["thrust", "thrust", "horizontal_r", "horizontal_l", "diag_tr_bl", "diag_tl_br", "punch_r", "punch_l"], "reach": 10, "aimTolerance": 0.35, "cadenceTicks": 30, "jitterTicks": 18, "commitTicks": 9, "disengageTicks": 26, "pursueSpeed": 0.75, "leadTicks": 14, "feintChance": 0.22, "feintTicks": 5, "feintFollowTicks": 9, "riposteTicks": 3 },
+      "defense": { "skill": 0.65, "reactTicks": 6, "reactJitter": 5, "margin": 3.0, "guardStance": 0, "guardReach": 0.85, "holdTicks": 3 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.15, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.1, "cooldownTicks": 0, "minDwellTicks": 6 },
+        "circle": { "weight": 1.0, "cooldownTicks": 12, "minDwellTicks": 20 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "flee": { "weight": 0, "cooldownTicks": 0, "minDwellTicks": 30 },
+        "guard": { "weight": 1.4, "cooldownTicks": 0, "minDwellTicks": 5 },
+        "dodge": { "weight": 2.8, "cooldownTicks": 6, "minDwellTicks": 8 }
+      },
+      "rules": [
+        { "note": "empty-handed: dart in and out", "when": { "armed": 0 }, "tune": { "band": -4, "keepOut": -1, "speed": 1.1 } },
+        { "note": "out-reached: kiting is impossible, get inside", "when": { "reachAdv": "<-1", "targetArmed": 1 }, "tune": { "keepOut": -1, "speed": 1.25, "band": -3, "disengage": 0.5 } },
+        { "note": "it just swung: lunge into the gap", "when": { "targetRecovering": 1 }, "weight": { "attack": 3.6 }, "tune": { "cadence": 0.4 } },
+        { "note": "it is covering: feint it open", "when": { "targetGuarding": 1 }, "tune": { "feint": 2.5, "circle": 1.4 } },
+        { "note": "it is weak: close the distance", "when": { "targetHp": "<0.3", "hasTarget": 1 }, "tune": { "cadence": 0.8, "keepOut": 0.5 } },
+        { "note": "hurt: sharper, further off", "when": { "hp": "<0.5" }, "tune": { "skill": 1.3, "band": 2, "cadence": 1.15 } },
+        { "note": "badly hurt and losing: disengage and run", "when": { "hp": "<0.25", "hpAdv": "<-0.2", "sinceHurt": "<150" }, "weight": { "flee": 3.5 } },
+        { "note": "the front is crowded: work the flank", "when": { "pressRank": ">=2" }, "weight": { "circle": 1.4 }, "scale": { "attack": 0.3 }, "tune": { "band": 6 } }
+      ]
+    },
+    {
+      "//brawler": "THE CLOSE FIGHTER. Lives inside your reach: a tight band, a fast cadence, a short step-off and a lot of pursuit. Blocks little and weaves a lot. With a weapon it stands a little further out; out-reached, it charges straight in. Punishes a whiff hard. Getting hit makes it ANGRIER (faster cadence), and badly hurt it gets sloppy rather than careful.",
+      "name": "brawler",
+      "label": "Brawler",
+      "color": 3234093772,
+      "faction": "monster",
+      "hysteresis": 0.3,
+      "perception": { "sightRange": 46, "fovDegrees": 320, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 240, "keepRangeScale": 1.5, "stickiness": 8, "preferWeak": 0 },
+      "movement": { "mobile": true, "rangeMin": 3, "rangeMax": 7, "bandSlack": 1.4, "approachSpeed": 1.15, "strafeSpeed": 0.5, "retreatSpeed": 0.6, "fleeSpeed": 1.0, "circleTendency": 0.4, "circleHoldTicks": 26, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.45, "flank": 0.5, "keepOut": -1 },
+      "attack": { "styles": ["punch_r", "punch_l", "hook_r", "horizontal_r", "horizontal_l", "overhead", "thrust"], "reach": 7, "aimTolerance": 0.5, "cadenceTicks": 26, "jitterTicks": 14, "commitTicks": 8, "disengageTicks": 8, "pursueSpeed": 0.9, "leadTicks": 12, "feintChance": 0.15, "feintTicks": 5, "feintFollowTicks": 8, "riposteTicks": 2 },
+      "defense": { "skill": 0.5, "reactTicks": 5, "reactJitter": 6, "margin": 2.0, "guardStance": 0, "guardReach": 0.8, "holdTicks": 3 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.3, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 0.95, "cooldownTicks": 0, "minDwellTicks": 6 },
+        "circle": { "weight": 0.8, "cooldownTicks": 20, "minDwellTicks": 18 },
+        "attack": { "weight": 3.2, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "guard": { "weight": 0.9, "cooldownTicks": 0, "minDwellTicks": 5 },
+        "dodge": { "weight": 2.4, "cooldownTicks": 8, "minDwellTicks": 7 }
+      },
+      "rules": [
+        { "note": "holding a weapon: stand where it lands", "when": { "armed": 1 }, "tune": { "band": 2 } },
+        { "note": "out-reached: charge straight in", "when": { "reachAdv": "<-2", "targetArmed": 1 }, "tune": { "speed": 1.3, "disengage": 0, "band": -2 } },
+        { "note": "it just swung: pile in", "when": { "targetRecovering": 1 }, "weight": { "attack": 3.8 }, "tune": { "cadence": 0.35 } },
+        { "note": "it is covering: batter it", "when": { "targetGuarding": 1 }, "tune": { "cadence": 0.8, "feint": 1.5 } },
+        { "note": "just got hit: angry", "when": { "sinceHurt": "<20" }, "tune": { "cadence": 0.8, "speed": 1.1 } },
+        { "note": "badly hurt: sloppy and wild", "when": { "hp": "<0.3" }, "tune": { "skill": 0.5, "aim": 1.4, "cadence": 0.85 } },
+        { "note": "someone else is in its face: wait for an opening", "when": { "pressRank": ">=2" }, "weight": { "circle": 1.2 }, "scale": { "attack": 0.3 }, "tune": { "band": 6 } }
+      ]
+    },
+    {
+      "//berserker": "RELENTLESS. Almost no defence, no retreat, no step-off, a short cadence and full pursuit. It does not get careful when hurt -- it gets FASTER: under half life it swings more often and moves quicker and stops defending at all. It goes for the kill on a weakened target. Never flees and ignores the press queue: it does not wait its turn.",
+      "name": "berserker",
+      "label": "Berserker",
+      "color": 3221225727,
+      "faction": "monster",
+      "hysteresis": 0.35,
+      "perception": { "sightRange": 44, "fovDegrees": 360, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 300, "keepRangeScale": 1.6, "stickiness": 10, "preferWeak": 8 },
+      "movement": { "mobile": true, "rangeMin": 2, "rangeMax": 7, "bandSlack": 1.6, "approachSpeed": 1.2, "strafeSpeed": 0.3, "retreatSpeed": 0.2, "fleeSpeed": 1.0, "circleTendency": 0.1, "circleHoldTicks": 40, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.2, "flank": 0.3, "keepOut": -1 },
+      "attack": { "styles": ["overhead", "horizontal_r", "horizontal_l", "diag_tr_bl", "diag_tl_br", "punch_r", "punch_l", "hook_r"], "reach": 9, "aimTolerance": 0.6, "cadenceTicks": 28, "jitterTicks": 12, "commitTicks": 10, "disengageTicks": 0, "pursueSpeed": 1.0, "leadTicks": 14, "feintChance": 0, "feintTicks": 6, "feintFollowTicks": 10, "riposteTicks": 2 },
+      "defense": { "skill": 0.15, "reactTicks": 9, "reactJitter": 6, "margin": 2.0, "guardStance": 0, "guardReach": 0.85, "holdTicks": 3 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.5, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.45, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 0.7, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "circle": { "weight": 0.4, "cooldownTicks": 30, "minDwellTicks": 16 },
+        "attack": { "weight": 3.5, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "guard": { "weight": 1.0, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "dodge": { "weight": 0.6, "cooldownTicks": 20, "minDwellTicks": 6 }
+      },
+      "rules": [
+        { "note": "blood rage: faster, reckless, no defence", "when": { "hp": "<0.5" }, "tune": { "cadence": 0.7, "speed": 1.25, "skill": 0, "aim": 1.4 } },
+        { "note": "nearly dead: everything into the next blow", "when": { "hp": "<0.25" }, "tune": { "cadence": 0.8, "speed": 1.1 } },
+        { "note": "it is weak: finish it", "when": { "targetHp": "<0.3", "hasTarget": 1 }, "tune": { "cadence": 0.8 } },
+        { "note": "it just swung: straight through it", "when": { "targetRecovering": 1 }, "tune": { "cadence": 0.5 } },
+        { "note": "it is covering: batter the guard", "when": { "targetGuarding": 1 }, "tune": { "cadence": 0.8 } }
+      ]
+    },
+    {
+      "//guardian": "THE TURTLE. Keeps its guard up whenever it stands in reach of an armed enemy (guardStance 0.6), reads blows well (skill 0.65, 6 ticks: a wall, not an unbeatable one -- at 0.8 / 5 it lost 4 hp to a duelist that lost 300), always prefers to block (guard 3.4 over attack 3.0), and counters: a covered blow earns a 2-tick riposte and a whiff is punished at a third of the cadence. Slow to commit otherwise. Empty-handed it cannot block, so it dodges and closes. Hurt, it turtles harder. Beside allies it holds its ground rather than circling.",
+      "name": "guardian",
+      "label": "Guardian",
+      "color": 3238002687,
+      "faction": "monster",
+      "hysteresis": 0.3,
+      "perception": { "sightRange": 44, "fovDegrees": 280, "requireLos": true, "aggro": "hostile", "alertDecayTicks": 200, "keepRangeScale": 1.45, "stickiness": 10, "preferWeak": 0 },
+      "movement": { "mobile": true, "rangeMin": 6, "rangeMax": 10, "bandSlack": 1.4, "approachSpeed": 0.85, "strafeSpeed": 0.45, "retreatSpeed": 0.7, "fleeSpeed": 1.0, "circleTendency": 0.35, "circleHoldTicks": 40, "repathTicks": 10, "navRadius": 30, "dodgeSpeed": 1.2, "flank": 0.6, "keepOut": -1 },
+      "attack": { "styles": ["thrust", "overhead", "horizontal_r", "horizontal_l", "diag_tr_bl", "punch_r", "punch_l", "hook_r"], "reach": 10, "aimTolerance": 0.4, "cadenceTicks": 44, "jitterTicks": 18, "commitTicks": 10, "disengageTicks": 20, "pursueSpeed": 0.55, "leadTicks": 15, "feintChance": 0.05, "feintTicks": 6, "feintFollowTicks": 10, "riposteTicks": 2 },
+      "defense": { "skill": 0.65, "reactTicks": 6, "reactJitter": 5, "margin": 3.0, "guardStance": 0.6, "guardReach": 0.9, "holdTicks": 5 },
+      "intents": {
+        "idle": { "weight": 0.05, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "face": { "weight": 0.45, "cooldownTicks": 0, "minDwellTicks": 4 },
+        "approach": { "weight": 1.1, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "holdRange": { "weight": 1.05, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "circle": { "weight": 0.7, "cooldownTicks": 24, "minDwellTicks": 24 },
+        "attack": { "weight": 3.0, "cooldownTicks": 0, "minDwellTicks": 0 },
+        "guard": { "weight": 3.4, "cooldownTicks": 0, "minDwellTicks": 8 },
+        "dodge": { "weight": 0.9, "cooldownTicks": 12, "minDwellTicks": 8 }
+      },
+      "rules": [
+        { "note": "empty-handed: cannot block, so weave and close", "when": { "armed": 0 }, "weight": { "dodge": 2.6 }, "tune": { "band": -3 } },
+        { "note": "it just swung: counter", "when": { "targetRecovering": 1 }, "weight": { "attack": 4.0 }, "tune": { "cadence": 0.3 } },
+        { "note": "it has nothing in its hands: stop covering, press", "when": { "hasTarget": 1, "targetArmed": 0 }, "scale": { "guard": 0.4 }, "tune": { "cadence": 0.75, "band": -1 } },
+        { "note": "out-reached: shuffle inside behind the guard", "when": { "reachAdv": "<-2", "targetArmed": 1 }, "tune": { "band": -2, "speed": 1.1 } },
+        { "note": "hurt: turtle", "when": { "hp": "<0.5" }, "weight": { "guard": 4.0 }, "tune": { "band": 1.5, "cadence": 1.3, "skill": 1.15 } },
+        { "note": "with allies: hold the line", "when": { "allies": ">=1" }, "tune": { "circle": 0.5 } },
+        { "note": "not my turn: shield up at the edge", "when": { "pressRank": ">=2" }, "scale": { "attack": 0.3 }, "tune": { "band": 5 } }
+      ]
     }
   ]
 }

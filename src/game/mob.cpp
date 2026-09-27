@@ -3343,6 +3343,9 @@ void MobSystem::SetPlayerActors(std::span<const PlayerActorDesc> players) {
     a.height = players[i].height;
     a.faction = ai::FactionId("player");
     a.alive = players[i].alive;
+    a.action = players[i].action <= (uint8_t)ai::Action::Recover
+                   ? (ai::Action)players[i].action
+                   : ai::Action::None;
     playerActors_.push_back(a);
   }
 }
@@ -6037,6 +6040,43 @@ float MobSystem::StrikeReachOf(const Mob& mob) const {
   return haveReal ? reach : fallbackReach;
 }
 
+float MobSystem::ThreatReachOf(const Mob& mob) const {
+  // A creature with a profile already knows the answer for itself, drawn
+  // over exactly the styles it will throw — prefer that.
+  if (const float s = StrikeReachOf(mob); s > 0.0f) return s;
+  // Anybody else holding something (the player, above all): the same two
+  // terms StyleReachOn sums for a held weapon — a quarter of the arm plus the
+  // live edge — so a watcher reads a sword at the distance a sword lands.
+  if (!mob.HeldItem().empty()) {
+    Vec3 hand{};
+    float armR = 0.0f, reach = 0.0f;
+    if (mob.WeaponArmPose(hand, armR)) reach = armR * 0.25f;
+    Vec3 eb{}, et{};
+    float ehw = 0.0f;
+    if (mob.WeaponEdge(eb, et, ehw)) return reach + (et - eb).len();
+    if (items_ != nullptr)
+      if (const ItemDef* it = items_->At(items_->Find(mob.HeldItem())))
+        return std::max(reach, it->reach);
+  }
+  // Bare hands: an arm's length (StyleReachOn's fist is the arm's bones).
+  return MetresToCells(0.5f);
+}
+
+void MobSystem::PublishCombatant(const Mob& m, ai::Actor& a) const {
+  a.reach = ThreatReachOf(m);
+  a.armed = !m.HeldItem().empty();
+  float burn = 0.0f;
+  int lost = 0;
+  m.BodyFacts(a.hpFrac, burn, lost);
+  a.heading = m.heading_;
+  // The POINT, last tick's pose: what a defender puts its guard on. Only a
+  // held weapon has one worth meeting — a guard on a fist is not a parry.
+  Vec3 eb{}, et{};
+  float hw = 0.0f;
+  a.haveTip = a.armed && m.WeaponEdge(eb, et, hw);
+  if (a.haveTip) a.tip = et;
+}
+
 float MobSystem::AttackReachOf(const Mob& mob) const {
   const ai::Profile* pr = behaviors_.At(mob.ai_.profile);
   if (pr == nullptr) return 0.0f;
@@ -6415,6 +6455,54 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
   mob.SetWeaponPose(StrokePoseNow(st, sty, st.melee));
 }
 
+// ---- THE AI'S WEAPON ARM, WHEN IT IS NOT ATTACKING (2026-09-27) ------------
+//
+// Two requests the behaviour layer can make of the stroke besides "swing":
+// hold a GUARD on a point, and pull a FEINT out of its own windup. Both go
+// through the same seams a gate or a script uses (SetGuard / ClearGuard, and
+// the release a dropped guard already takes), so the AI adds no second way to
+// pose an arm. The guard point is world voxels; it is turned into the
+// azimuth/elevation SetGuard takes in THE STROKE'S OWN BASIS (MobBasis:
+// azimuth from forward toward right, elevation above the forward/right plane)
+// about a shoulder-height pivot.
+//
+// The AI only ever lowers a guard IT raised (`Brain::guardRaised`), so a gate
+// or a script that sets one on an AI creature is not overruled next tick.
+void MobSystem::ApplyAiArm(Mob& mob, const MobDef& def,
+                           const ai::IntentOut& out) {
+  NpcStroke& st = mob.stroke_;
+  if (out.cancelSwing && st.phase == NpcStroke::Phase::Windup) {
+    // The bluff ends where a dropped guard does: released, faded, no return
+    // pose (a feint has no follow-through to settle out of).
+    st.StartRelease(8);
+    st.settleTicks = 0;
+  }
+  if (out.guard && !out.attack) {
+    if (st.Active() && st.phase != NpcStroke::Phase::Guard) return;
+    // The HELD blade, not whatever effector the last punch armed: a guard is
+    // a weapon across a line.
+    if (st.phase != NpcStroke::Phase::Guard) mob.ClearStrikeEffector();
+    Vec3 right{}, up{}, fwd{};
+    MobBasis(mob, right, up, fwd);
+    const Vec3 pivot{mob.origin_.x + def.worldSize.x * 0.5f,
+                     mob.origin_.y + def.worldSize.y * 0.75f,
+                     mob.origin_.z + def.worldSize.z * 0.5f};
+    const Vec3 dv = out.guardPoint - pivot;
+    const float x = dv.dot(right), y = dv.dot(up), z = dv.dot(fwd);
+    // In FRONT, always: a point behind the shoulder plane (the attacker
+    // circling, a stale tip) would drive the arm into its own back stop.
+    const float az = std::clamp(std::atan2(x, std::max(z, 0.5f)), -1.2f, 1.2f);
+    const float el = std::clamp(std::atan2(y, std::sqrt(x * x + z * z)),
+                                -0.35f, 1.0f);
+    if (SetGuard(mob.id_, az, el, out.guardReach)) mob.ai_.guardRaised = true;
+  } else if (mob.ai_.guardRaised) {
+    mob.ai_.guardRaised = false;
+    // An attack REPLACES the guard (BeginStroke takes over a Guard phase), so
+    // only a guard being lowered for nothing is released here.
+    if (!out.attack && st.phase == NpcStroke::Phase::Guard) ClearGuard(mob.id_);
+  }
+}
+
 void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
                              const GroundSense& sense, uint32_t tick,
                              float dt) {
@@ -6461,6 +6549,10 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
     // ...and what state the body is in, for the profile's rules
     // (ai_behavior.h "RULES"): the facts a creature's character can hinge on.
     mob.BodyFacts(self.hpFrac, self.burningFrac, self.limbsLost);
+    // What is in its hand: a held item arms it AND lets it guard (the parry
+    // test is blade on blade — MobSystem::FindParry skips anything unarmed).
+    self.armed = !mob.HeldItem().empty();
+    self.canGuard = self.armed && mob.HeldSlot() >= 0;
 
     ai::GroundView gv;
     gv.haveGround = sense.haveGround;
@@ -6496,6 +6588,7 @@ void MobSystem::DecideIntent(Mob& mob, const MobDef& def,
       mob.driveStrafe_ = out.driveStrafe;
       if (out.attack && attacks_.size() < kMaxMobs * 2)
         attacks_.push_back(std::move(out.request));
+      ApplyAiArm(mob, def, out);
       return;
     }
   }
@@ -7260,7 +7353,26 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // default: a wandering critter should be huntable without being authored.
     a.faction = pr != nullptr ? ai::FactionId(pr->faction) : ~0u;
     a.alive = true;
+    PublishCombatant(m, a);
+    a.targetId = m.ai_.hasTarget ? m.ai_.targetId : 0;
+    switch (m.stroke_.phase) {
+      case NpcStroke::Phase::Guard: a.action = ai::Action::Guard; break;
+      case NpcStroke::Phase::Windup: a.action = ai::Action::Windup; break;
+      case NpcStroke::Phase::Cut: a.action = ai::Action::Cut; break;
+      case NpcStroke::Phase::Recover: a.action = ai::Action::Recover; break;
+      default: a.action = ai::Action::None; break;
+    }
     actors_.push_back(std::move(a));
+  }
+  // THE PLAYERS, AS A WATCHER SEES THEM. The session published position and
+  // what the weapon is doing; the body itself — what is in its hand, how
+  // hurt it is, which way it faces, where the point is — is read off the
+  // avatar, which is actor i's body by the band (FindCombatantById).
+  for (size_t i = 0; i < playerActors_.size() && i < actors_.size(); i++) {
+    if (i >= avatars_.size() || avatars_[i] == nullptr) continue;
+    const Mob& av = *avatars_[i];
+    if (!av.alive_ || av.def_ == nullptr) continue;
+    PublishCombatant(av, actors_[i]);
   }
 
   // THE DEAD CAP, before anybody steps: a corpse released here is a husk
@@ -7519,7 +7631,12 @@ void MobSystem::PreTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
       // way to get here is a profile authored with a cadence shorter than its
       // own swing, and queueing would turn that into an unbounded backlog
       // (rule 2) rather than into the visible content error it is.
-      if (attacks_.size() > attacksBefore && !mob.stroke_.Active())
+      // A GUARD is not a stroke in flight: an attack decided while the blade
+      // is held across a line swings FROM the guard (the same take-over
+      // ForceAttack has always allowed).
+      if (attacks_.size() > attacksBefore &&
+          (!mob.stroke_.Active() ||
+           mob.stroke_.phase == NpcStroke::Phase::Guard))
         BeginStroke(mob, attacks_.back(), tick);
       StepStroke(mob, tick, world, spawns);
       mob.swinging_ = mob.stroke_.Cutting();
@@ -10239,7 +10356,17 @@ bool MobSystem::FindParry(const Mob& wielder, const Vec3& aPrev,
   outBody = 0;
   float best = gap;
   auto test = [&](Mob& m) {
-    if (&m == &wielder || !m.alive_ || !m.swinging_ || m.HeldSlot() < 0) return;
+    // A BLADE IN THE WAY IS ONE THAT IS CUTTING, OR ONE HELD THERE ON PURPOSE.
+    // `swinging_` alone meant a guard could never parry — SetGuard's whole
+    // stated purpose ("how a defender comes to have its sword across a line
+    // without attacking") — and the AI's `guard` verb measured it: 124 ticks
+    // of guard across seven blows, zero parries. A blade merely carried
+    // (walking, idle) still does not block; only a stroke's Guard phase does.
+    const bool guarding = !m.PlayerControlled() &&
+                          m.stroke_.phase == NpcStroke::Phase::Guard;
+    if (&m == &wielder || !m.alive_ || !(m.swinging_ || guarding) ||
+        m.HeldSlot() < 0)
+      return;
     Vec3 db, dt, dflat;
     float dhw = 0;
     if (!m.WeaponEdge(db, dt, dhw, &dflat)) return;

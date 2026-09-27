@@ -120,7 +120,26 @@ enum class Intent : uint8_t {
   CircleStrafe,  // sidestep around the target at the current radius
   RequestAttack, // emit an AttackRequest and hold the facing through the commit
   Flee,          // run from the threat (the target, else the nearest enemy seen)
+  // ---- DEFENCE (2026-09-27) -----------------------------------------------
+  // Both score only while the TARGET IS SWINGING AT US (Actor::action) and
+  // only after this creature has REACTED to it (Defense: a per-blow roll
+  // against `skill`, then `reactTicks` of delay). That is what keeps them fair:
+  // a fast blow beats a slow reader, and an unskilled creature mostly eats it.
+  Guard,         // raise the held weapon onto the incoming blade (the parry is
+                 // the existing blade-on-blade test; this only puts one there)
+  Dodge,         // step back and aside, out of the reach of the blow
   Count,
+};
+
+// What a combatant is doing with its weapon right now, as others see it.
+// Published per actor (Actor::action) from the NPC stroke phase or the player's
+// strike cursor; the defence verbs and the `target*` facts read it.
+enum class Action : uint8_t {
+  None = 0,   // weapon at rest / walking
+  Guard,      // holding a guard (a blade raised, not swinging)
+  Windup,     // a blow is coming: the telegraph
+  Cut,        // the blow is live
+  Recover,    // just swung (or was parried): the punish window
 };
 
 const char* IntentName(Intent i);
@@ -152,6 +171,17 @@ struct Perception {
   // hysteresis on perception itself: without it a target standing exactly at
   // the range boundary flickers in and out of existence every tick.
   float keepRangeScale = 1.4f;
+  // ---- WHO TO FIGHT, not just who is nearest (2026-09-27) ------------------
+  // Target choice scores every perceived enemy by distance MINUS these, in
+  // world voxels. Both default 0, which is plain "nearest" — the behaviour
+  // every profile had before.
+  //   stickiness — the current target counts as this much closer. Stops a
+  //                creature swapping between two enemies a voxel apart,
+  //                which reads as it having no idea who it is fighting.
+  //   preferWeak — an enemy at 0 hp counts as this much closer (linear in
+  //                missing life). A predator finishes the wounded one.
+  float stickiness = 0.0f;
+  float preferWeak = 0.0f;
 };
 
 struct Movement {
@@ -199,6 +229,49 @@ struct Movement {
   // `false` forces driveScale to 0 no matter which intent wins, so a profile
   // author cannot accidentally give a training dummy a shuffle.
   bool mobile = false;
+  // ---- TACTICAL FOOTWORK (2026-09-27) --------------------------------------
+  // Dodge's drive, as a multiplier on walk speed (split between a back-step
+  // and a side-step). Above 1 is a burst — a dodge at walking pace is not one.
+  float dodgeSpeed = 1.3f;
+  // 0..1. While circling, how strongly to orbit AWAY from the nearest ally
+  // fighting the same target, so a pack spreads around its quarry instead of
+  // queueing in a line. 0 = the orbit direction is a coin flip, as before.
+  float flank = 0.0f;
+  // KITING. < 0 = off. When this creature out-reaches its target, the band's
+  // floor is lifted to (target's reach + half a body + keepOut): it stands
+  // where it can hit and the target cannot. Ignored when it does NOT out-reach
+  // (a floor above the ceiling is not a band). Rules may set it (`tune`).
+  float keepOut = -1.0f;
+};
+
+// ---- HOW A CREATURE DEFENDS ITSELF (2026-09-27) ---------------------------
+//
+// The Guard and Dodge verbs above only become available once the creature has
+// REACTED to a blow, and this block is the reaction. Per incoming blow (keyed
+// on the tick the target's windup began) one counter-based roll decides
+// whether it reacts at all (`skill`), and when (`reactTicks` + a jitter). The
+// guard/dodge WEIGHTS then decide which answer it picks; a creature that
+// cannot guard (nothing in its hand) can only dodge.
+//
+// Defaults are a creature that never reacts, so an old profile is unchanged.
+struct Defense {
+  float skill = 0.0f;           // 0..1: chance of reacting to a given blow
+  uint32_t reactTicks = 8;      // delay from the windup's first tick
+  uint32_t reactJitter = 6;     // + [0, jitter) per blow
+  // World voxels past the attacker's reach that still count as threatened.
+  // The stand-off test is centre-to-centre against a reach that is itself an
+  // estimate, so a zero margin leaves a creature ignoring a blow that lands.
+  float margin = 2.5f;
+  // Raw score Guard holds with NO blow incoming, while standing inside an
+  // ARMED target's reach and not ready to attack: the "keep your guard up"
+  // stance. 0 = only ever guard a real blow. A rule can raise the WEIGHT to
+  // make a hurt creature turtle.
+  float guardStance = 0.0f;
+  // How far out along the arm the guard holds the blade, 0..1.
+  float guardReach = 0.85f;
+  // Ticks a defence is held after the blow ends, so a guard does not drop in
+  // the very tick the edge passes and eat the recoil.
+  uint32_t holdTicks = 4;
 };
 
 struct AttackTuning {
@@ -307,7 +380,48 @@ struct AttackTuning {
   // about 15; the punches and the bite are about 12). Tempo jitter moves it, so
   // it is an estimate and is authored as one.
   int32_t leadTicks = -1;
+
+  // ---- MIND GAMES (2026-09-27) ---------------------------------------------
+  //
+  // FEINT: chance (0..1) that a committed swing is a bluff. The stroke starts
+  // exactly as a real one does — same windup, same telegraph — and is pulled
+  // out `feintTicks` into the commit, before the cut. The real blow then comes
+  // `feintFollowTicks` later, while the target is still answering the fake. A
+  // creature that never feints is one the player learns to read in a minute.
+  float feintChance = 0.0f;
+  uint32_t feintTicks = 6;
+  uint32_t feintFollowTicks = 10;
+  // RIPOSTE: after a guard or dodge that saw a blow through, the next attack
+  // may come this many ticks later, whatever the cadence says. -1 = off (the
+  // cadence rules as before). The punish for a swing that was answered.
+  int32_t riposteTicks = -1;
 };
+
+// ---- TUNE: what a holding RULE may do to the fighter, besides weights -------
+//
+// Intent weights say WHAT a creature does; these say HOW. A rule's `tune` map
+// names any of them, so "wounded: fight from further out, swing less, guard
+// more" is one rule and not a second profile. Scales multiply across every
+// holding rule, adds sum, `keepOut` is last-wins. Names are the lower-case
+// keys used in JSON (TuneName).
+enum class Tune : uint8_t {
+  Cadence = 0,  // scale on the time between attacks (< 1 = swings more often)
+  Speed,        // scale on approach / strafe / retreat / pursuit / dodge
+  Band,         // ADD (voxels) to both edges of the footwork band, after the
+                // weapon has placed it: + stands further out, - crowds in
+  KeepOut,      // SET Movement::keepOut (kite outside their reach)
+  Disengage,    // scale on the post-swing step-off
+  Circle,       // scale on circleTendency
+  Skill,        // scale on Defense::skill
+  React,        // scale on Defense::reactTicks (> 1 = slower to answer)
+  Feint,        // scale on AttackTuning::feintChance
+  Aim,          // scale on aimTolerance (> 1 = swings from a sloppier angle)
+  Count,
+};
+const char* TuneName(Tune t);
+Tune TuneFromName(const std::string& s);
+enum class TuneMode : uint8_t { Scale, Add, Set };
+TuneMode TuneModeOf(Tune t);
 
 // Per-intent authored knobs. An intent absent from the JSON keeps weight 0 and
 // is therefore disabled — that is the enable flag, deliberately not a separate
@@ -353,6 +467,24 @@ enum class Fact : uint8_t {
   TargetDist,   // centre-to-centre, world voxels; 1e9 with no target
   Allies,       // live actors of OUR faction within sightRange (self excluded)
   Enemies,      // live actors of another faction within sightRange
+  // ---- WHAT I AM HOLDING, AND WHAT I AM UP AGAINST (2026-09-27) -----------
+  // All of the `target*` facts read the TARGET's published Actor, and are 0
+  // with no target (reach/hp 0 too, so "targetHp < 0.3" needs hasTarget).
+  Armed,            // 0/1: something in MY hand (not fists or teeth)
+  MyReach,          // what my usable styles land at, world voxels
+  TargetReach,      // what the target's weapon lands at
+  ReachAdv,         // MyReach - TargetReach: + = I out-reach it
+  TargetArmed,      // 0/1
+  TargetHp,         // 0..1
+  HpAdv,            // Hp - TargetHp: + = I am the healthier one
+  TargetAttacking,  // 0/1: it is winding up or cutting RIGHT NOW
+  TargetRecovering, // 0/1: it just swung — the punish window
+  TargetGuarding,   // 0/1: it is holding a guard
+  InTheirReach,     // 0/1: I stand inside what its weapon lands at
+  TargetFacingMe,   // -1..1: cos of its facing off the line to me (1 = square)
+  EngagedAllies,    // allies of mine fighting the same target
+  PressRank,        // how many of those are NEARER it than me (0 = I am the
+                    // front of the queue). The press-limit rule reads this.
   Count,
 };
 const char* FactName(Fact f);
@@ -371,10 +503,17 @@ struct Rule {
   std::vector<Condition> when;      // ALL must hold; empty = always
   float setWeight[(int)Intent::Count];   // < 0 = leave the weight alone
   float scale[(int)Intent::Count];       // 1 = leave it alone
+  // The `tune` map (see Tune). `tuneSet[k]` false = the rule does not name it.
+  float tune[(int)Tune::Count];
+  bool tuneSet[(int)Tune::Count];
   Rule() {
     for (int i = 0; i < (int)Intent::Count; i++) {
       setWeight[i] = -1.0f;
       scale[i] = 1.0f;
+    }
+    for (int k = 0; k < (int)Tune::Count; k++) {
+      tune[k] = 0.0f;
+      tuneSet[k] = false;
     }
   }
 };
@@ -389,6 +528,7 @@ struct Profile {
   Perception perception;
   Movement movement;
   AttackTuning attack;
+  Defense defense;
   IntentTuning intents[(int)Intent::Count];
   // Flat score bonus the current intent keeps. See the arbiter note above.
   float hysteresis = 0.22f;
@@ -468,6 +608,21 @@ struct Actor {
   float height = 2.0f;
   uint32_t faction = 0;
   bool alive = true;
+  // ---- WHAT IT IS FIGHTING WITH, AS OTHERS CAN SEE IT (2026-09-27) --------
+  // Everything a watching creature could read off the body: what is in its
+  // hand and how far that lands, how hurt it is, which way it faces, what its
+  // weapon is doing and where the point is. Filled by MobSystem::PreTick from
+  // the rig (and, for a player, the strike cursor the session publishes).
+  // Defaults are "unknown and harmless", which is what a gate that builds its
+  // own actor list gets.
+  float reach = 0.0f;       // world voxels, centre-to-centre; 0 = unknown
+  bool armed = false;       // a held weapon, not fists or teeth
+  float hpFrac = 1.0f;
+  float heading = 0.0f;     // 0 = +Z, like everything else
+  Action action = Action::None;
+  bool haveTip = false;     // weapon point known this tick
+  Vec3 tip{};               // world voxels
+  uint64_t targetId = 0;    // who IT is fighting (NPCs; 0 = nobody/unknown)
 };
 
 // Everything Think() may read about the outside world.
@@ -558,6 +713,11 @@ struct SelfView {
   float hpFrac = 1.0f;
   float burningFrac = 0.0f;
   int limbsLost = 0;
+  // Something is in this body's hand (Fact::Armed), and it can hold a guard
+  // with it — a guard is a BLADE across a line, which is what the parry test
+  // meets, so fists and teeth cannot.
+  bool armed = false;
+  bool canGuard = false;
   Vec3 Centre() const {
     return Vec3{origin.x + size.x * 0.5f, origin.y + size.y * 0.5f,
                 origin.z + size.z * 0.5f};
@@ -671,6 +831,37 @@ struct Brain {
   uint32_t rulesHeld = 0;        // bit r = rule r held (the first 32 rules)
   bool hasThreat = false;        // what Flee runs from, when it runs
   Vec3 threatPos{};
+  // This tick's `tune` values after every holding rule (identity when none).
+  float tune[(int)Tune::Count] = {};
+
+  // ---- READING THE TARGET'S BLOWS (Defense) --------------------------------
+  // One incoming blow = one windup onset. The roll and the delay are taken
+  // ONCE per onset, so a creature does not get a fresh chance to react every
+  // tick of the same swing (which would make skill 0.1 a near-certainty).
+  Action targetAction = Action::None;
+  uint32_t blowOnset = 0;        // tick the current blow's windup was first seen
+  uint64_t blowTarget = 0;       // whose blow it is (a target switch drops it)
+  bool blowLive = false;         // a blow from the target is in the air
+  uint32_t blowEndTick = 0;      // tick it stopped (for Defense::holdTicks)
+  bool reacts = false;           // this blow's roll came up
+  uint32_t reactAt = 0;          // ...and from when
+  uint32_t defendedOnset = ~0u;  // the blow a guard/dodge actually answered
+  int dodgeSign = 0;             // -1 / +1 sidestep, fixed for one dodge
+  bool guardRaised = false;      // the AI owns the stroke's Guard phase
+  // Target facts cached for the panel and the gates.
+  float targetReach = 0, targetHp = 0;
+  bool targetArmed = false;
+  int pressRank = 0, engagedAllies = 0;
+
+  // ---- attack pacing, with live `cadence` tuning ----
+  uint32_t attackInterval = 0;   // cadence + jitter drawn at the last attack
+  uint32_t riposteAt = 0;        // a riposte / feint follow-up may fire from here
+  bool riposteArmed = false;
+  uint32_t feintAt = 0;          // pull the live swing out at this tick
+  bool feinting = false;
+
+  // ---- counters (diagnostics; the gates assert on them) ----
+  uint32_t guards = 0, dodges = 0, feints = 0, ripostes = 0;
 
   // ---- footwork ----
   int circleSign = 0;            // -1 / +1, redrawn on a cadence
@@ -717,6 +908,15 @@ struct IntentOut {
   float driveStrafe = 0;   // lateral, + = the mob's own right
   bool attack = false;
   AttackRequest request;
+  // ---- the weapon arm, when not attacking (2026-09-27) ----
+  // `guard`: hold the blade between us and `guardPoint` (world voxels — the
+  // incoming weapon's point when it is known). The caller turns that into a
+  // stroke Guard pose; false while `guardRaised` was set means lower it.
+  bool guard = false;
+  Vec3 guardPoint{};
+  float guardReach = 0.85f;
+  // A FEINT pulling out: abandon the live swing if it is still winding up.
+  bool cancelSwing = false;
 };
 
 // One tick of AI for one creature. Returns false when the mob has no profile,

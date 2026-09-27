@@ -365,6 +365,9 @@ struct UIState {
   bool aiSpawnDummy = false;      // one-shot: spawn ahead of the crosshair
   bool aiSpawnStatic = false;
   bool aiSpawnDuelist = false;
+  // One-shot: spawn with THIS behaviors.json profile (the fighting-style
+  // buttons: swordsman, fencer, brawler, berserker, guardian). Empty = none.
+  std::string aiSpawnProfile;
   // ---- ...AND THE CREATURE'S OWN (2026-09-16) -----------------------------
   //
   // The three above are BEHAVIOUR PRESETS and they silently overrode whatever
@@ -503,7 +506,7 @@ struct UIState {
       aiDisengageTicks = 22;
   float aiHysteresis = 0.22f;
   // One per ai::Intent, in enum order (main.cpp static_asserts the count).
-  static constexpr int kAiIntents = 7;
+  static constexpr int kAiIntents = 9;
   float aiIntentWeight[kAiIntents] = {};
   int aiIntentCooldown[kAiIntents] = {};
   int aiIntentDwell[kAiIntents] = {};

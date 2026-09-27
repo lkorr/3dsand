@@ -894,6 +894,11 @@ const char* const kOrder[] = {
     // arms touch no world at all, and its one live arm spawns a creature,
     // hurts it, lets it run and resets mobs + debris on the way out.
     "ai-rules",
+    // ...and the fighting layer, by the same append rule: pure arbiter arms,
+    // then one live pair (regenerates worldgen, spawns two armed humans,
+    // resets mobs + debris and removes its two scratch profiles on the way
+    // out).
+    "ai-tactics",
     // ...and one pose pipeline, whoever drives the body (W2-L), by the same
     // append rule: it spawns an NPC and an avatar, poses both through
     // Mob::PosePipeline only (no PreTick, no Jolt step), and resets mobs +

@@ -22,6 +22,9 @@ constexpr float kTau = 6.2831853f;
 // keys hash3 on a stream id (sim/wind.h's salt note).
 constexpr uint32_t kSaltAttack = 0xA77Au;
 constexpr uint32_t kSaltCircle = 0xC141u;
+constexpr uint32_t kSaltReact = 0x8EAC7u;
+constexpr uint32_t kSaltFeint = 0xFE17u;
+constexpr uint32_t kSaltDodge = 0xD0D6u;
 
 float WrapPi(float a) { return std::remainder(a, kTau); }
 
@@ -114,6 +117,8 @@ const char* IntentName(Intent i) {
     case Intent::CircleStrafe: return "circle";
     case Intent::RequestAttack: return "attack";
     case Intent::Flee: return "flee";
+    case Intent::Guard: return "guard";
+    case Intent::Dodge: return "dodge";
     default: return "?";
   }
 }
@@ -135,6 +140,20 @@ const char* FactName(Fact f) {
     case Fact::TargetDist: return "targetDist";
     case Fact::Allies: return "allies";
     case Fact::Enemies: return "enemies";
+    case Fact::Armed: return "armed";
+    case Fact::MyReach: return "myReach";
+    case Fact::TargetReach: return "targetReach";
+    case Fact::ReachAdv: return "reachAdv";
+    case Fact::TargetArmed: return "targetArmed";
+    case Fact::TargetHp: return "targetHp";
+    case Fact::HpAdv: return "hpAdv";
+    case Fact::TargetAttacking: return "targetAttacking";
+    case Fact::TargetRecovering: return "targetRecovering";
+    case Fact::TargetGuarding: return "targetGuarding";
+    case Fact::InTheirReach: return "inTheirReach";
+    case Fact::TargetFacingMe: return "targetFacingMe";
+    case Fact::EngagedAllies: return "engagedAllies";
+    case Fact::PressRank: return "pressRank";
     default: return "?";
   }
 }
@@ -143,6 +162,34 @@ Fact FactFromName(const std::string& s) {
   for (int i = 0; i < (int)Fact::Count; i++)
     if (s == FactName((Fact)i)) return (Fact)i;
   return Fact::Count;
+}
+
+const char* TuneName(Tune t) {
+  switch (t) {
+    case Tune::Cadence: return "cadence";
+    case Tune::Speed: return "speed";
+    case Tune::Band: return "band";
+    case Tune::KeepOut: return "keepOut";
+    case Tune::Disengage: return "disengage";
+    case Tune::Circle: return "circle";
+    case Tune::Skill: return "skill";
+    case Tune::React: return "react";
+    case Tune::Feint: return "feint";
+    case Tune::Aim: return "aim";
+    default: return "?";
+  }
+}
+
+Tune TuneFromName(const std::string& s) {
+  for (int i = 0; i < (int)Tune::Count; i++)
+    if (s == TuneName((Tune)i)) return (Tune)i;
+  return Tune::Count;
+}
+
+TuneMode TuneModeOf(Tune t) {
+  if (t == Tune::Band) return TuneMode::Add;
+  if (t == Tune::KeepOut) return TuneMode::Set;
+  return TuneMode::Scale;
 }
 
 // ---------------------------------------------------------------------------
@@ -187,8 +234,23 @@ Fact FactFromName(const std::string& s) {
 //       "approach":  { "weight": 1.0, "minDwellTicks": 8 },
 //       "holdRange": { "weight": 1.1, "minDwellTicks": 6 },
 //       "circle":    { "weight": 0.9, "minDwellTicks": 20, "cooldownTicks": 14 },
-//       "attack":    { "weight": 2.0 }
-//     }
+//       "attack":    { "weight": 2.0 },
+//       "guard":     { "weight": 2.5, "minDwellTicks": 6 },   // Defense below
+//       "dodge":     { "weight": 1.5, "minDwellTicks": 8 }
+//     },
+//
+//     // ---- the fighting layer (2026-09-27); every key optional -------------
+//     // perception: "stickiness", "preferWeak"          (target choice)
+//     // movement:   "dodgeSpeed", "flank", "keepOut"    (see Movement)
+//     // attack:     "feintChance", "feintTicks", "feintFollowTicks",
+//     //             "riposteTicks"                       (see AttackTuning)
+//     "defense": { "skill": 0.5, "reactTicks": 8, "reactJitter": 6,
+//                  "margin": 2.5, "guardStance": 0.3, "guardReach": 0.85,
+//                  "holdTicks": 4 },
+//     // rules may also carry "tune": { "cadence": 0.7, "band": 3, ... } --
+//     // HOW it fights while the rule holds. Names in TuneName.
+//     "rules": [ { "when": { "hp": "<0.35" }, "weight": { "guard": 3 },
+//                  "tune": { "band": 3, "cadence": 1.4 } } ]
 //   }]
 // }
 //
@@ -342,6 +404,8 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.perception.aggro = AggroFromName(q.value("aggro", "passive"));
       pr.perception.alertDecayTicks = q.value("alertDecayTicks", 90u);
       pr.perception.keepRangeScale = q.value("keepRangeScale", 1.4f);
+      pr.perception.stickiness = q.value("stickiness", 0.0f);
+      pr.perception.preferWeak = q.value("preferWeak", 0.0f);
     }
     if (p.contains("movement")) {
       const auto& q = p["movement"];
@@ -361,6 +425,9 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       pr.movement.maxStepUp = q.value("maxStepUp", 0);
       pr.movement.maxStepDown = q.value("maxStepDown", 0);
       pr.movement.headroom = q.value("headroom", 0);
+      pr.movement.dodgeSpeed = q.value("dodgeSpeed", 1.3f);
+      pr.movement.flank = std::clamp(q.value("flank", 0.0f), 0.0f, 1.0f);
+      pr.movement.keepOut = q.value("keepOut", -1.0f);
     }
     if (p.contains("attack")) {
       const auto& q = p["attack"];
@@ -391,6 +458,22 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
       // second one has to remain sayable because it is the behaviour this
       // engine had until 2026-09-16 and the `ai-pursue` gate keeps an arm on it.
       pr.attack.leadTicks = q.value("leadTicks", -1);
+      pr.attack.feintChance =
+          std::clamp(q.value("feintChance", 0.0f), 0.0f, 1.0f);
+      pr.attack.feintTicks = q.value("feintTicks", 6u);
+      pr.attack.feintFollowTicks = q.value("feintFollowTicks", 10u);
+      pr.attack.riposteTicks = q.value("riposteTicks", -1);
+    }
+    if (p.contains("defense")) {
+      const auto& q = p["defense"];
+      pr.defense.skill = std::clamp(q.value("skill", 0.0f), 0.0f, 1.0f);
+      pr.defense.reactTicks = q.value("reactTicks", 8u);
+      pr.defense.reactJitter = q.value("reactJitter", 6u);
+      pr.defense.margin = q.value("margin", 2.5f);
+      pr.defense.guardStance = q.value("guardStance", 0.0f);
+      pr.defense.guardReach =
+          std::clamp(q.value("guardReach", 0.85f), 0.2f, 1.0f);
+      pr.defense.holdTicks = q.value("holdTicks", 4u);
     }
     if (p.contains("intents") && p["intents"].is_object()) {
       for (auto& [k, v] : p["intents"].items()) {
@@ -440,6 +523,21 @@ bool LoadBehaviors(const std::string& path, Library& out, std::string& log) {
           ok = ParseIntentMap(r["weight"], rule.setWeight, where, log);
         if (ok && r.contains("scale"))
           ok = ParseIntentMap(r["scale"], rule.scale, where, log);
+        // `tune`: HOW the creature fights while the rule holds (ai_behavior.h
+        // Tune). Same drop-whole-and-say policy as an unknown intent.
+        if (ok && r.contains("tune") && r["tune"].is_object()) {
+          for (auto& [k, v] : r["tune"].items()) {
+            const Tune t = TuneFromName(k);
+            if (t == Tune::Count || !v.is_number()) {
+              log += where + ": unknown tune or non-number \"" + k +
+                     "\" -- rule dropped\n";
+              ok = false;
+              break;
+            }
+            rule.tune[(int)t] = v.get<float>();
+            rule.tuneSet[(int)t] = true;
+          }
+        }
         if (ok) pr.rules.push_back(std::move(rule));
       }
     }
@@ -485,7 +583,9 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"requireLos\": " << (p.perception.requireLos ? "true" : "false")
       << ", \"aggro\": \"" << AggroName(p.perception.aggro)
       << "\", \"alertDecayTicks\": " << p.perception.alertDecayTicks
-      << ", \"keepRangeScale\": " << num(p.perception.keepRangeScale) << " },\n";
+      << ", \"keepRangeScale\": " << num(p.perception.keepRangeScale)
+      << ", \"stickiness\": " << num(p.perception.stickiness)
+      << ", \"preferWeak\": " << num(p.perception.preferWeak) << " },\n";
     o << "      \"movement\": { \"mobile\": "
       << (p.movement.mobile ? "true" : "false")
       << ", \"rangeMin\": " << num(p.movement.rangeMin)
@@ -501,7 +601,10 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"navRadius\": " << num(p.movement.navRadius)
       << ", \"maxStepUp\": " << p.movement.maxStepUp
       << ", \"maxStepDown\": " << p.movement.maxStepDown
-      << ", \"headroom\": " << p.movement.headroom << " },\n";
+      << ", \"headroom\": " << p.movement.headroom
+      << ", \"dodgeSpeed\": " << num(p.movement.dodgeSpeed)
+      << ", \"flank\": " << num(p.movement.flank)
+      << ", \"keepOut\": " << num(p.movement.keepOut) << " },\n";
     o << "      \"attack\": { \"styles\": [";
   for (size_t i = 0; i < p.attack.styles.size(); i++)
     o << (i ? ", " : "") << "\"" << p.attack.styles[i] << "\"";
@@ -514,7 +617,18 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
       << ", \"disengageTicks\": " << p.attack.disengageTicks
       << ", \"pursueSpeed\": " << num(p.attack.pursueSpeed)
       << ", \"holdGroundFrac\": " << num(p.attack.holdGroundFrac)
-      << ", \"leadTicks\": " << p.attack.leadTicks << " },\n";
+      << ", \"leadTicks\": " << p.attack.leadTicks
+      << ", \"feintChance\": " << num(p.attack.feintChance)
+      << ", \"feintTicks\": " << p.attack.feintTicks
+      << ", \"feintFollowTicks\": " << p.attack.feintFollowTicks
+      << ", \"riposteTicks\": " << p.attack.riposteTicks << " },\n";
+    o << "      \"defense\": { \"skill\": " << num(p.defense.skill)
+      << ", \"reactTicks\": " << p.defense.reactTicks
+      << ", \"reactJitter\": " << p.defense.reactJitter
+      << ", \"margin\": " << num(p.defense.margin)
+      << ", \"guardStance\": " << num(p.defense.guardStance)
+      << ", \"guardReach\": " << num(p.defense.guardReach)
+      << ", \"holdTicks\": " << p.defense.holdTicks << " },\n";
     o << "      \"intents\": {\n";
     bool first = true;
     for (int k = 0; k < (int)Intent::Count; k++) {
@@ -554,6 +668,16 @@ bool SaveBehaviors(const std::string& path, const Library& lib,
         };
         intentMap("weight", rl.setWeight, true);
         intentMap("scale", rl.scale, false);
+        {
+          bool any = false;
+          for (int k = 0; k < (int)Tune::Count; k++) {
+            if (!rl.tuneSet[k]) continue;
+            o << (any ? std::string(", ") : std::string(", \"tune\": { "))
+              << "\"" << TuneName((Tune)k) << "\": " << num(rl.tune[k]);
+            any = true;
+          }
+          if (any) o << " }";
+        }
         o << " }" << (r + 1 < p.rules.size() ? "," : "") << "\n";
       }
       o << "      ]";
@@ -628,15 +752,25 @@ void Perceive(Brain& b, const Profile& pr, const SelfView& self,
   const float acquire = pr.perception.sightRange;
   const float keep = acquire * std::max(1.0f, pr.perception.keepRangeScale);
 
+  // NEAREST, ADJUSTED (Perception::stickiness / preferWeak). Both are 0 on a
+  // profile that does not author them, and then `score == d` exactly — the
+  // plain nearest-enemy pick every profile had before.
   const Actor* best = nullptr;
   float bestDist = 1e30f;
+  float bestScore = 1e30f;
   for (const Actor& a : *v.actors) {
     if (!a.alive || a.id == self.id) continue;
     if (a.faction == self.faction) continue;
     float d = 0;
-    const float range = (b.hasTarget && a.id == b.targetId) ? keep : acquire;
+    const bool current = b.hasTarget && a.id == b.targetId;
+    const float range = current ? keep : acquire;
     if (!Perceives(self, pr, v, a, range, d)) continue;
-    if (d < bestDist) {
+    float score = d;
+    if (current) score -= pr.perception.stickiness;
+    score -= pr.perception.preferWeak *
+             (1.0f - std::clamp(a.hpFrac, 0.0f, 1.0f));
+    if (score < bestScore) {
+      bestScore = score;
       bestDist = d;
       best = &a;
     }
@@ -927,6 +1061,65 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
   f[(int)Fact::Allies] = (float)allies;
   f[(int)Fact::Enemies] = (float)enemies;
 
+  // ---- WHAT I HOLD AND WHAT I FACE (2026-09-27) ---------------------------
+  // The target's side is read off its published Actor: what a watching
+  // creature could see of it. A target that is not in the list (a gate's
+  // bare fixture, a despawn this tick) reads as unknown-and-harmless.
+  const Actor* tgt = b.hasTarget ? FindActor(view, b.targetId) : nullptr;
+  const float myReach = std::max(0.0f, self.strikeReach);
+  b.targetReach = tgt != nullptr ? std::max(0.0f, tgt->reach) : 0.0f;
+  b.targetHp = tgt != nullptr ? std::clamp(tgt->hpFrac, 0.0f, 1.0f) : 0.0f;
+  b.targetArmed = tgt != nullptr && tgt->armed;
+  b.targetAction = tgt != nullptr ? tgt->action : Action::None;
+  f[(int)Fact::Armed] = self.armed ? 1.0f : 0.0f;
+  f[(int)Fact::MyReach] = myReach;
+  f[(int)Fact::TargetReach] = b.targetReach;
+  f[(int)Fact::ReachAdv] = tgt != nullptr ? myReach - b.targetReach : 0.0f;
+  f[(int)Fact::TargetArmed] = b.targetArmed ? 1.0f : 0.0f;
+  f[(int)Fact::TargetHp] = b.targetHp;
+  f[(int)Fact::HpAdv] = tgt != nullptr ? self.hpFrac - b.targetHp : 0.0f;
+  f[(int)Fact::TargetAttacking] =
+      (b.targetAction == Action::Windup || b.targetAction == Action::Cut)
+          ? 1.0f : 0.0f;
+  f[(int)Fact::TargetRecovering] =
+      b.targetAction == Action::Recover ? 1.0f : 0.0f;
+  f[(int)Fact::TargetGuarding] = b.targetAction == Action::Guard ? 1.0f : 0.0f;
+  // "Inside its reach" carries the same half-a-body slack the stroke system
+  // forgives on the attacking side (BeginStroke): the reach is an estimate of
+  // a centre-to-centre distance for a surface-to-surface event.
+  f[(int)Fact::InTheirReach] =
+      tgt != nullptr && b.targetReach > 0.0f &&
+              b.targetDist <= b.targetReach + self.size.z * 0.5f
+          ? 1.0f : 0.0f;
+  float facing = 0.0f;
+  if (tgt != nullptr) {
+    const float dx = c.x - tgt->centre.x, dz = c.z - tgt->centre.z;
+    const float len = std::sqrt(dx * dx + dz * dz);
+    if (len > 1e-3f)
+      facing = (std::sin(tgt->heading) * dx + std::cos(tgt->heading) * dz) / len;
+  }
+  f[(int)Fact::TargetFacingMe] = facing;
+
+  // THE QUEUE AROUND ONE TARGET. Allies are anyone of our faction who has
+  // named the same target (Actor::targetId); rank is how many of them stand
+  // nearer it than we do, ties to the lower id so two equidistant creatures
+  // cannot both believe they are first. Not range-limited: this is about the
+  // fight, and a creature out of sight of its friend is still in the queue.
+  b.engagedAllies = 0;
+  b.pressRank = 0;
+  if (tgt != nullptr && view.actors != nullptr) {
+    const float mine = PlanarDist(c, b.targetPos);
+    for (const Actor& a : *view.actors) {
+      if (!a.alive || a.id == self.id || a.faction != self.faction) continue;
+      if (a.targetId != b.targetId) continue;
+      b.engagedAllies++;
+      const float theirs = PlanarDist(a.centre, b.targetPos);
+      if (theirs < mine || (theirs == mine && a.id < self.id)) b.pressRank++;
+    }
+  }
+  f[(int)Fact::EngagedAllies] = (float)b.engagedAllies;
+  f[(int)Fact::PressRank] = (float)b.pressRank;
+
   b.rulesHeld = 0;
   for (size_t r = 0; r < pr.rules.size() && r < 32; r++) {
     bool all = true;
@@ -936,6 +1129,28 @@ void EvaluateRules(Brain& b, const Profile& pr, const SelfView& self,
         break;
       }
     if (all) b.rulesHeld |= 1u << r;
+  }
+
+  // ---- THE TUNE, after every holding rule ---------------------------------
+  // Identity first (scale 1, add 0, keepOut = the profile's own), so a
+  // profile with no `tune` anywhere fights exactly as authored.
+  for (int k = 0; k < (int)Tune::Count; k++) {
+    const TuneMode m = TuneModeOf((Tune)k);
+    b.tune[k] = m == TuneMode::Scale ? 1.0f
+              : m == TuneMode::Add   ? 0.0f
+                                     : pr.movement.keepOut;
+  }
+  for (size_t r = 0; r < pr.rules.size() && r < 32; r++) {
+    if (!(b.rulesHeld & (1u << r))) continue;
+    const Rule& rl = pr.rules[r];
+    for (int k = 0; k < (int)Tune::Count; k++) {
+      if (!rl.tuneSet[k]) continue;
+      switch (TuneModeOf((Tune)k)) {
+        case TuneMode::Scale: b.tune[k] *= std::max(0.0f, rl.tune[k]); break;
+        case TuneMode::Add: b.tune[k] += rl.tune[k]; break;
+        case TuneMode::Set: b.tune[k] = rl.tune[k]; break;
+      }
+    }
   }
 }
 
@@ -966,9 +1181,77 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   out.driveStrafe = 0;
   out.attack = false;
 
+  out.guard = false;
+  out.cancelSwing = false;
+
   Perceive(brain, pr, self, view, tick);
   TrackTargetMotion(brain, self, tick, dt);
   EvaluateRules(brain, pr, self, view, tick);
+  const float* tn = brain.tune;
+  const float spd = tn[(int)Tune::Speed];
+  const Actor* tgtActor =
+      brain.hasTarget ? FindActor(view, brain.targetId) : nullptr;
+
+  // ---- READING THE TARGET'S BLOW (Defense) --------------------------------
+  //
+  // One blow = one windup onset, and the reaction to it is decided ONCE, at
+  // the onset: a skill roll (does this creature read it at all) and a delay
+  // (how long until it can answer). Re-rolling per tick would turn a 10%
+  // skill into a near-certain parry over a fifteen-tick windup, and a delay
+  // counted from "now" would never elapse. Counter-based on (id, onset), so
+  // a replayed fight reads the same blows the same way.
+  //
+  // Only a VISIBLE target's blows are read: a creature does not parry what
+  // it cannot see, which is also what makes attacking from behind worth it.
+  {
+    const bool blowNow =
+        brain.hasTarget && brain.visible &&
+        (brain.targetAction == Action::Windup ||
+         brain.targetAction == Action::Cut);
+    if (brain.blowLive && brain.blowTarget != brain.targetId) {
+      brain.blowLive = false;
+      brain.blowEndTick = 0;
+      brain.reacts = false;
+    }
+    if (blowNow && !brain.blowLive) {
+      brain.blowLive = true;
+      brain.blowTarget = brain.targetId;
+      brain.blowOnset = tick;
+      const float skill =
+          std::clamp(pr.defense.skill * tn[(int)Tune::Skill], 0.0f, 1.0f);
+      const uint32_t h =
+          rng::Hash3((uint32_t)self.id ^ kSaltReact, tick, 2);
+      brain.reacts =
+          skill > 0.0f && (float)(h & 0xFFFFu) * (1.0f / 65536.0f) < skill;
+      const uint32_t jit =
+          pr.defense.reactJitter > 0 ? (h >> 16) % pr.defense.reactJitter : 0;
+      brain.reactAt =
+          tick +
+          (uint32_t)std::lround((float)pr.defense.reactTicks *
+                                std::max(0.0f, tn[(int)Tune::React])) +
+          jit;
+    } else if (!blowNow && brain.blowLive) {
+      brain.blowLive = false;
+      brain.blowEndTick = tick;
+    }
+  }
+
+  // ---- A FEINT PULLS OUT ---------------------------------------------------
+  // Before the arbiter, so the facing lock it releases is released THIS tick.
+  // The real blow is booked through the riposte clock: same seam, same
+  // "whatever the cadence says" meaning.
+  if (brain.feinting && tick >= brain.feintAt) {
+    brain.feinting = false;
+    out.cancelSwing = true;
+    brain.feints++;
+    brain.commitUntil = std::min(brain.commitUntil, tick);
+    brain.disengageUntil = std::min(brain.disengageUntil, tick);
+    brain.riposteArmed = true;
+    brain.riposteAt = tick + pr.attack.feintFollowTicks;
+  }
+  // A booked riposte that never fired (the target left, the creature was
+  // busy) must not linger as a standing licence to ignore the cadence.
+  if (brain.riposteArmed && tick > brain.riposteAt + 20) brain.riposteArmed = false;
 
   const Vec3 centre = self.Centre();
   const float bearing =
@@ -1033,6 +1316,25 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       lo = std::max(0.0f, lo - shift);
       hi = std::max(lo + 0.5f, hi - shift);
     }
+  }
+
+  // ---- ...THEN THE RULES MOVE IT (Tune::Band, Tune::KeepOut) --------------
+  // After the weapon has placed the band, so "wounded: stand three voxels
+  // further out" means three voxels further out than THIS weapon wants —
+  // and it may push the ceiling past strike reach on purpose: a creature
+  // hanging back is one that has stopped offering blows.
+  const float bandAdd = tn[(int)Tune::Band];
+  if (bandAdd != 0.0f && hi > 0.0f) {
+    lo = std::max(0.0f, lo + bandAdd);
+    hi = std::max(lo + 0.5f, hi + bandAdd);
+  }
+  // KITING: stand where I land and it does not. Only when that place EXISTS
+  // (my ceiling is past its reach), otherwise there is no such band and the
+  // creature fights where its weapon says.
+  const float keepOut = tn[(int)Tune::KeepOut];
+  if (keepOut >= 0.0f && brain.targetReach > 0.0f && hi > 0.0f) {
+    const float floor = brain.targetReach + self.size.z * 0.5f + keepOut;
+    if (floor < hi - 0.5f) lo = std::max(lo, floor);
   }
 
   // ---- ...AND THE STEP-OFF IS SUSPENDED AGAINST A TARGET THAT IS LEAVING ---
@@ -1118,7 +1420,9 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // actually arrives (`brain.leadDist`). See AttackTuning::pursueSpeed for the
   // measured failure both of them answer.
   const float pursueCap =
-      pr.movement.mobile ? std::clamp(pr.attack.pursueSpeed, 0.0f, 1.0f) : 0.0f;
+      pr.movement.mobile
+          ? std::clamp(pr.attack.pursueSpeed * spd, 0.0f, std::max(1.0f, spd))
+          : 0.0f;
   float pursue = 0;
   if (pursueCap > 0.0f && brain.hasTarget && hi > 0) {
     // Aim to stand a slack INSIDE the far edge of what this body can strike
@@ -1203,10 +1507,38 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // committed to later or not at all, which saves the cadence for a turn the
   // creature can actually win instead of spending it on a swing `BeginStroke`
   // will drop.
+  //
+  // ...AND THE CADENCE IS READ LIVE (Tune::Cadence). The interval drawn at the
+  // last swing is re-scaled every tick by whatever rules hold NOW, which is
+  // what lets "it just whiffed: hit it" (a punish rule on targetRecovering)
+  // bring a swing forward that was booked before the whiff. At a scale of
+  // exactly 1 the booked tick is used untouched.
+  uint32_t readyAt = brain.nextAttackTick;
+  if (brain.attacksIssued > 0 && tn[(int)Tune::Cadence] != 1.0f)
+    readyAt = brain.lastAttackTick +
+              (uint32_t)std::lround((float)brain.attackInterval *
+                                    std::max(0.0f, tn[(int)Tune::Cadence]));
+  // A booked riposte / feint follow-up overrides the cadence either way.
+  const bool riposteNow = brain.riposteArmed && tick >= brain.riposteAt;
   const bool attackReady =
-      brain.hasTarget && brain.visible && tick >= brain.nextAttackTick &&
+      brain.hasTarget && brain.visible &&
+      (tick >= readyAt || riposteNow) &&
       !disengaging && brain.leadDist <= reach &&
-      aimErr <= pr.attack.aimTolerance;
+      aimErr <= pr.attack.aimTolerance * tn[(int)Tune::Aim];
+
+  // ---- IS A BLOW COMING AT ME, AND HAVE I READ IT? ------------------------
+  // "In range of it" is its reach (or a generous guess when unknown) plus
+  // the defence margin; see Defense::margin for why that is not zero.
+  const float threatReach =
+      (brain.targetReach > 0.0f ? brain.targetReach : 8.0f) +
+      self.size.z * 0.5f + std::max(0.0f, pr.defense.margin);
+  const bool blowWindow =
+      brain.blowLive ||
+      (brain.blowEndTick > 0 && tick < brain.blowEndTick + pr.defense.holdTicks);
+  const bool responding = brain.hasTarget && blowWindow && brain.reacts &&
+                          tick >= brain.reactAt && d <= threatReach;
+  const bool inTheirReach =
+      brain.facts[(int)Fact::InTheirReach] > 0.0f;
 
   // ---- score every enabled intent ----------------------------------------
   float raw[(int)Intent::Count] = {};
@@ -1235,8 +1567,8 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       // Circle: only when content. A mob that circles while out of position is
       // a mob that never closes.
       if (bandErr == 0.0f && brain.visible)
-        raw[(int)Intent::CircleStrafe] =
-            std::clamp(pr.movement.circleTendency, 0.0f, 1.0f);
+        raw[(int)Intent::CircleStrafe] = std::clamp(
+            pr.movement.circleTendency * tn[(int)Tune::Circle], 0.0f, 1.0f);
     }
   }
   if (attackReady) raw[(int)Intent::RequestAttack] = 1.0f;
@@ -1244,6 +1576,18 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
   // weight, which is 0 unless the profile or a holding rule says otherwise --
   // so a creature runs exactly when its JSON says it does, and never else.
   if (pr.movement.mobile) raw[(int)Intent::Flee] = 1.0f;
+  // DEFENCE. Full score only for a blow this creature has read; the guard
+  // STANCE (Defense::guardStance) is the weaker standing offer inside an
+  // armed target's reach, for a creature not about to swing itself. Which
+  // of guard / dodge wins is the weights' call — character, not code.
+  if (responding) {
+    if (self.canGuard) raw[(int)Intent::Guard] = 1.0f;
+    if (pr.movement.mobile) raw[(int)Intent::Dodge] = 1.0f;
+  } else if (self.canGuard && pr.defense.guardStance > 0.0f &&
+             brain.targetArmed && inTheirReach && !attackReady &&
+             brain.visible) {
+    raw[(int)Intent::Guard] = std::clamp(pr.defense.guardStance, 0.0f, 1.0f);
+  }
 
   // ---- arbitrate ----------------------------------------------------------
   // Weight, then the three dampers (see the header). The incumbent's bonus is
@@ -1278,7 +1622,15 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     }
   }
 
-  if (locked) winner = brain.intent;
+  // ...EXCEPT FOR WHAT CANNOT WAIT. A dwell is there to stop footwork
+  // twitching; it must not hold a creature mid-circle while a blow it has read
+  // lands on it, or make it sit out the one riposte window a defence earned.
+  // Only the defence verbs against a READ blow and a booked riposte get
+  // through — so a profile that uses neither is arbitrated exactly as before.
+  const bool urgent =
+      (responding && (winner == Intent::Guard || winner == Intent::Dodge)) ||
+      (riposteNow && winner == Intent::RequestAttack);
+  if (locked && !urgent) winner = brain.intent;
 
   // THE COMMIT WINDOW OVERRIDES EVERYTHING. Once an attack request has gone out
   // the body has promised the stroke system it will hold its facing, so no
@@ -1290,9 +1642,29 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
     // entry so a long circle is not punished by its own duration.
     brain.cooldownUntil[(int)brain.intent] =
         tick + pr.intents[(int)brain.intent].cooldownTicks;
+    // ---- A DEFENCE THAT SAW A BLOW THROUGH EARNS A RIPOSTE ----------------
+    // Only when the blow it answered is actually over: dropping a guard to
+    // swing into a cut still in the air is not a riposte, it is a trade.
+    const bool wasDefending =
+        brain.intent == Intent::Guard || brain.intent == Intent::Dodge;
+    if (wasDefending && pr.attack.riposteTicks >= 0 && !brain.blowLive &&
+        brain.defendedOnset == brain.blowOnset) {
+      brain.riposteArmed = true;
+      brain.riposteAt = tick + (uint32_t)pr.attack.riposteTicks;
+      brain.defendedOnset = ~0u;   // one blow, one riposte
+    }
+    if (winner == Intent::Guard) brain.guards++;
+    if (winner == Intent::Dodge) brain.dodges++;
+    brain.dodgeSign = 0;
     brain.intent = winner;
     brain.intentSince = tick;
   }
+  // Which blow the defence is answering: any tick of guard or dodge spent
+  // while a READ blow is in the window (a guard stance that was already up
+  // when the blow came counts — it met it).
+  if ((brain.intent == Intent::Guard || brain.intent == Intent::Dodge) &&
+      responding)
+    brain.defendedOnset = brain.blowOnset;
 
   // ---- actuate ------------------------------------------------------------
   // The ONLY thing any branch below may produce is a desired heading and a
@@ -1333,7 +1705,7 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       // this used to cause was never the fan: it was the path being thrown away
       // every ten ticks (see UpdatePath).
       out.desiredHeading = Deflect(want, self.heading, ground);
-      out.driveScale = sp * pr.movement.approachSpeed;
+      out.driveScale = sp * pr.movement.approachSpeed * spd;
       // Only ease off when walking straight AT the target — a waypoint is not
       // the goal, and slowing into every corner of a path is a shuffle.
       if (brain.path.Done())
@@ -1345,14 +1717,14 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       out.desiredHeading = bearing;   // never turn your back to give ground
       if (bandErr < 0) {
         out.driveScale =
-            -sp * std::min(pr.movement.retreatSpeed, arrive(bandErr));
+            -sp * std::min(pr.movement.retreatSpeed * spd, arrive(bandErr));
       } else if (bandErr > 0) {
         // Small closing correction. Deliberately NOT routed through the
         // navigator: inside a couple of voxels of the band there is nothing to
         // route around, and replanning here would cost a search per tick for a
         // step the mob takes anyway.
-        out.driveScale =
-            sp * std::min(pr.movement.approachSpeed * 0.55f, arrive(bandErr));
+        out.driveScale = sp * std::min(pr.movement.approachSpeed * spd * 0.55f,
+                                       arrive(bandErr));
         const int p = ProbeFor(bearing, self.heading);
         if (ground.haveGround && !ground.clear[p]) out.driveScale = 0;
       }
@@ -1366,6 +1738,30 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
         // duelist does not orbit forever in the same direction.
         const uint32_t h = rng::Hash3((uint32_t)self.id ^ kSaltCircle, tick, 0);
         brain.circleSign = (h & 1u) ? 1 : -1;
+        // ---- FLANKING (Movement::flank) --------------------------------
+        // Orbit AWAY from the ally nearest us around the same target, so a
+        // pack opens out around its quarry instead of lining up in front of
+        // it. Angles are positions around the TARGET (bearing target->body);
+        // strafing to our own right, while facing it, DEcreases ours.
+        // Drawn with probability `flank`, so a pack still shuffles.
+        if (pr.movement.flank > 0.0f && brain.hasTarget &&
+            view.actors != nullptr &&
+            (float)((h >> 8) & 0xFFFFu) * (1.0f / 65536.0f) <
+                pr.movement.flank) {
+          const float mine = BearingTo(brain.targetPos, centre);
+          float bestAbs = 1e9f, bestDelta = 0.0f;
+          for (const Actor& a : *view.actors) {
+            if (!a.alive || a.id == self.id || a.faction != self.faction ||
+                a.targetId != brain.targetId)
+              continue;
+            const float dl = WrapPi(BearingTo(brain.targetPos, a.centre) - mine);
+            if (std::abs(dl) < bestAbs) {
+              bestAbs = std::abs(dl);
+              bestDelta = dl;
+            }
+          }
+          if (bestAbs < 1e8f) brain.circleSign = bestDelta > 0.0f ? 1 : -1;
+        }
         brain.circleUntil = tick + std::max(6u, pr.movement.circleHoldTicks);
       }
       out.desiredHeading = bearing;
@@ -1377,8 +1773,8 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
       // tracking it, and because the target moves too.
       const float orbitR = std::max(1.0f, d);
       const float maxTangential = self.turnRate * 0.7f * orbitR;
-      const float strafeCap =
-          std::min(pr.movement.strafeSpeed, maxTangential / std::max(1.0f, self.speed));
+      const float strafeCap = std::min(pr.movement.strafeSpeed * spd,
+                                       maxTangential / std::max(1.0f, self.speed));
       out.driveStrafe = sp * strafeCap * (float)brain.circleSign;
       // Hold the radius while orbiting: a pure tangential step walks a polygon
       // outward, and the band would be lost within a couple of seconds.
@@ -1410,8 +1806,32 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
               : rng::Hash3((uint32_t)self.id ^ kSaltAttack, tick, 1) %
                     pr.attack.jitterTicks;
       brain.nextAttackTick = tick + pr.attack.cadenceTicks + jit;
+      brain.attackInterval = pr.attack.cadenceTicks + jit;
       brain.commitUntil = tick + pr.attack.commitTicks;
-      brain.disengageUntil = brain.commitUntil + pr.attack.disengageTicks;
+      brain.disengageUntil =
+          brain.commitUntil +
+          (uint32_t)std::lround((float)pr.attack.disengageTicks *
+                                std::max(0.0f, tn[(int)Tune::Disengage]));
+      // A swing the cadence would not yet have allowed is a riposte (or a
+      // feint's real blow): counted, and the booking is spent either way.
+      if (brain.riposteArmed && riposteNow && tick < readyAt) brain.ripostes++;
+      brain.riposteArmed = false;
+      // ---- IS THIS ONE A BLUFF? (AttackTuning::feintChance) ---------------
+      // Drawn per swing, keyed on the swing's own tick. The stroke is started
+      // exactly as a real one; only the pull-out is booked here.
+      {
+        const float fc = std::clamp(
+            pr.attack.feintChance * tn[(int)Tune::Feint], 0.0f, 1.0f);
+        brain.feinting = false;
+        if (fc > 0.0f) {
+          const uint32_t hf =
+              rng::Hash3((uint32_t)self.id ^ kSaltFeint, tick, 3);
+          if ((float)(hf & 0xFFFFu) * (1.0f / 65536.0f) < fc) {
+            brain.feinting = true;
+            brain.feintAt = tick + std::max(1u, pr.attack.feintTicks);
+          }
+        }
+      }
       brain.lastAttackTick = tick;
       brain.attacksIssued++;
       out.attack = true;
@@ -1469,7 +1889,74 @@ bool Think(Brain& brain, const Library& lib, const SelfView& self,
                              ? BearingTo(brain.threatPos, centre)
                              : self.heading;
       out.desiredHeading = Deflect(away, self.heading, ground);
-      out.driveScale = sp * std::max(0.0f, pr.movement.fleeSpeed);
+      out.driveScale = sp * std::max(0.0f, pr.movement.fleeSpeed) * spd;
+      break;
+    }
+
+    case Intent::Guard: {
+      // ---- BLADE ACROSS THE LINE --------------------------------------------
+      // Face it and put the weapon where ITS weapon is: the point it is
+      // swinging is the thing that has to be met, and a guard held on the
+      // live point tracks the cut as it comes round. With no point known,
+      // the attacker's upper chest — where a blow starts from. The PARRY
+      // itself is not decided here: MeleeSweepDamage's blade-on-blade test
+      // decides whether this guard was in the way.
+      out.desiredHeading = bearing;
+      out.guard = true;
+      out.guardReach = pr.defense.guardReach;
+      if (tgtActor != nullptr && tgtActor->haveTip) {
+        out.guardPoint = tgtActor->tip;
+      } else {
+        out.guardPoint = brain.targetPos;
+        out.guardPoint.y += (tgtActor != nullptr ? tgtActor->height : self.size.y) * 0.25f;
+      }
+      // Give a little ground while covering, inside its reach: a guard that
+      // walks into the blade is a guard that takes the tip anyway.
+      if (inTheirReach) {
+        out.driveScale = -sp * std::max(0.0f, pr.movement.retreatSpeed) * spd * 0.35f;
+        if (ground.haveGround && !ground.clear[4]) out.driveScale = 0;
+      }
+      break;
+    }
+
+    case Intent::Dodge: {
+      // ---- OUT OF THE ARC ---------------------------------------------------
+      // Back and to one side, facing it throughout (a creature that turns its
+      // back to dodge is fleeing). The side is chosen ONCE per dodge: away
+      // from the blade when its point is known, else a coin flip.
+      out.desiredHeading = bearing;
+      if (brain.dodgeSign == 0) {
+        int sign = (rng::Hash3((uint32_t)self.id ^ kSaltDodge, tick, 4) & 1u) ? 1 : -1;
+        if (tgtActor != nullptr && tgtActor->haveTip) {
+          // Drive right is (cos h, 0, -sin h) (MobSystem::DriveLocomotion).
+          const float rx = std::cos(self.heading), rz = -std::sin(self.heading);
+          const float side = (tgtActor->tip.x - centre.x) * rx +
+                             (tgtActor->tip.z - centre.z) * rz;
+          if (std::abs(side) > 0.5f) sign = side > 0.0f ? -1 : 1;
+        }
+        brain.dodgeSign = sign;
+      }
+      const float burst = sp * std::max(0.0f, pr.movement.dodgeSpeed) * spd;
+      float back = burst * 0.8f, lat = burst * 0.6f * (float)brain.dodgeSign;
+      // The fan: 4 is dead astern, 2 / 6 are the right / left flanks.
+      if (ground.haveGround) {
+        if (!ground.clear[4]) {
+          back = 0.0f;
+          lat *= 1.4f;
+        }
+        const int sideProbe = lat > 0.0f ? 2 : 6;
+        if (lat != 0.0f && !ground.clear[sideProbe]) {
+          const int other = sideProbe == 2 ? 6 : 2;
+          if (ground.clear[other]) {
+            lat = -lat;
+            brain.dodgeSign = -brain.dodgeSign;
+          } else {
+            lat = 0.0f;
+          }
+        }
+      }
+      out.driveScale = -back;
+      out.driveStrafe = lat;
       break;
     }
 

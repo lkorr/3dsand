@@ -4837,6 +4837,12 @@ class MobSystem {
     float radius = 0;
     float height = 0;
     bool alive = false;
+    // What the player's weapon is doing (ai::Action), from the session's
+    // strike cursor and MeleeState: the one thing about a player an NPC can
+    // read that the avatar Mob does not itself carry. Everything else a
+    // watcher sees (reach, hp, facing, the point) is read off the avatar in
+    // PreTick. 0 = None, which is also what a remote ghost publishes.
+    uint8_t action = 0;
   };
   void SetPlayerActors(std::span<const PlayerActorDesc> players);
   void ClearPlayerActors() { playerActors_.clear(); }
@@ -5129,6 +5135,15 @@ class MobSystem {
   // body can actually hit with right now, 0 for "no opinion". The footwork band
   // is placed on it (ai_behavior.h SelfView::strikeReach).
   float StrikeReachOf(const Mob& mob) const;
+  // ...and the same question asked by a WATCHER about anybody, player
+  // included (ai::Actor::reach): the held weapon's landing distance when there
+  // is one (StyleReachOn's held-item sum), the profile's strike reach for an
+  // unarmed NPC, else an arm's length.
+  float ThreatReachOf(const Mob& mob) const;
+  // Fill the watcher-visible half of an ai::Actor from a body: reach, armed,
+  // hp, facing, weapon point. Shared by NPCs and avatars so a player and a
+  // creature are read by the same rule.
+  void PublishCombatant(const Mob& mob, ai::Actor& a) const;
   // ---- HOW FAR THIS STYLE CAN ACTUALLY LAND (2026-09-15) -----------------
   //
   // World voxels, centre-to-centre, DERIVED FROM THE BODY: the effector's own
@@ -6670,6 +6685,8 @@ class MobSystem {
   // mob.desiredHeading / mob.driveScale.
   void DecideIntent(Mob& mob, const MobDef& def, const GroundSense& sense,
                     uint32_t tick, float dt);
+  // The AI's guard / feint requests, applied to the stroke (mob.cpp says how).
+  void ApplyAiArm(Mob& mob, const MobDef& def, const ai::IntentOut& out);
 
   // Close the gap between heading and desiredHeading at a bounded rate, and
   // report how well aligned the body now is (1 = facing the target, 0 = past

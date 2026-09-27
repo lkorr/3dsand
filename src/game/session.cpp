@@ -966,8 +966,9 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
         ui.aiSpawnOwn = ui.aiSpawnRandom = false;
         ui.aiKillSpawned = false;
       }
+      if (labScene >= 0) ui.aiSpawnProfile.clear();
       if (ui.aiSpawnDummy || ui.aiSpawnStatic || ui.aiSpawnDuelist ||
-          ui.aiSpawnOwn || ui.aiSpawnRandom) {
+          ui.aiSpawnOwn || ui.aiSpawnRandom || !ui.aiSpawnProfile.empty()) {
         // A RANDOM HUMAN (UIState::aiSpawnRandom): every pick below that the
         // panel would have made -- body, weapon, outfit, behaviour -- is rolled
         // instead, off the tick and this panel's spawn count, the way the dye
@@ -982,13 +983,19 @@ static void PhaseD(TickAuthorityCtx& w, WorldScratch& ws,
         };
         // EMPTY MEANS "THE CREATURE'S OWN", resolved once the def is known --
         // see UIState::aiSpawnOwn for what the override was costing.
-        // The profiles a random human may get: the ones that fight a person
-        // in different ways. Not `dummy` / `training_dummy` (they do nothing)
-        // and not `zombie` (a living human that bites is not a trait).
+        // The profiles a random human may get: the FIGHTING STYLES
+        // (behaviors.json, 2026-09-27), which read their own wounds, your
+        // weapon and your swings. Not the gate fixtures (`crowder` never
+        // swings, `retreater` only backs away), not `dummy` /
+        // `training_dummy` (they do nothing) and not `zombie` (a living human
+        // that bites is not a trait).
         static const char* const kRandomProfiles[] = {
-            "duelist", "duelist_blue", "crowder", "retreater"};
+            "swordsman", "fencer", "brawler", "berserker", "guardian"};
+        const std::string pickedProfile = ui.aiSpawnProfile;
+        ui.aiSpawnProfile.clear();
         const char* profile =
-            rnd ? kRandomProfiles[rpick(4, 4)]
+            rnd ? kRandomProfiles[rpick(4, 5)]
+            : !pickedProfile.empty() ? pickedProfile.c_str()
             : ui.aiSpawnOwn    ? ""
             : ui.aiSpawnDummy  ? "dummy"
             : ui.aiSpawnStatic ? "swordsman_static"
@@ -2197,8 +2204,19 @@ static void PhaseH(TickAuthorityCtx& w, WorldScratch& ws,
         const bool alive = pl.localView
                                ? ui.playerAlive
                                : (!pl.avatar.Spawned() || pl.avatar.IsAlive());
+        // WHAT THE WEAPON IS DOING, for the NPCs that read blows (ai::Action):
+        // the discrete strike's own phase while one runs, else a held guard.
+        ai::Action act = ai::Action::None;
+        switch (pl.playerStrike.phase) {
+          case StrokeCursor::Phase::Windup: act = ai::Action::Windup; break;
+          case StrokeCursor::Phase::Cut: act = ai::Action::Cut; break;
+          case StrokeCursor::Phase::Recover: act = ai::Action::Recover; break;
+          default:
+            if (pl.melee.Phase() == SwingPhase::Guard) act = ai::Action::Guard;
+            break;
+        }
         ws.actors.push_back({pl.player.pos, Player::kHalfXZ,
-                             Player::kHalfY * 2.0f, alive});
+                             Player::kHalfY * 2.0f, alive, (uint8_t)act});
       }
       // THE PEERS' BODIES ARE TARGETS TOO (M9.2 package B). Appended AFTER
       // every local session because the actor id band is POSITIONAL: entry i

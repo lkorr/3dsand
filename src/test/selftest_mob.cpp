@@ -14558,6 +14558,526 @@ Status GateAiRules(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- ai-tactics ------------------------------------------------------------
+//
+// THE FIGHTING LAYER (2026-09-27): what a creature does about WHO it is
+// fighting. Every arm is the pure arbiter -- no world, no GPU, no rig -- driven
+// with a scripted opponent Actor whose published `action` is the only thing
+// that swings, so each claim is about the decision and nothing downstream:
+//   A. the five fighting-style profiles load with nothing dropped, and their
+//      `defense` / `tune` survive SaveBehaviors;
+//   B. a blow it has READ is guarded (canGuard) and then riposted before the
+//      cadence would allow; the guard point is the attacker's weapon point;
+//   C. the same blow with nothing to guard with is DODGED (back + aside);
+//   D. skill 0 answers nothing;
+//   E. a feint pulls the swing out (cancelSwing) and the real one follows;
+//   F. `tune` composes across holding rules (adds sum, scales multiply);
+//   G. keepOut kites: a creature that out-reaches its target backs off to
+//      where it lands and the target does not; the same creature without it
+//      stays put;
+//   H. the press queue: third in line around one target does not swing;
+//   I. preferWeak picks the wounded enemy over the nearer healthy one;
+//   J. LIVE: a real duelist swings at a real armed defender; the blows reach
+//      it through the published actor and its guard reaches the stroke.
+namespace {
+
+struct TacArm {
+  int attacks = 0, cancels = 0, guardTicks = 0, dodgeTicks = 0, guardOuts = 0;
+  int firstGuard = -1, firstDodge = -1;
+  std::vector<int> attackAt;
+  float minDrive = 0.0f, maxStrafe = 0.0f;
+  Vec3 guardPoint{};
+  ai::Brain brain;
+};
+
+ai::Actor TacOpponent(Vec3 c) {
+  ai::Actor a;
+  a.id = ai::kPlayerActorId;
+  a.centre = c;
+  a.radius = 2.0f;
+  a.height = 17.0f;
+  a.faction = ai::FactionId("player");
+  a.alive = true;
+  a.reach = 10.0f;
+  a.armed = true;
+  a.heading = 3.14159265f;   // facing the creature at the origin
+  a.haveTip = true;
+  a.tip = Vec3{c.x + 1.5f, c.y + 3.5f, c.z - 3.0f};
+  return a;
+}
+
+// `script(t, actors)` edits the opponent (and any extras) before each think.
+template <class Script>
+TacArm RunTactics(const ai::Library& lib, int prof, std::vector<ai::Actor> actors,
+                  int ticks, bool armed, float strikeReach, Script script,
+                  float hp = 1.0f) {
+  TacArm r;
+  r.brain = ai::Brain(prof);
+  ai::SelfView self;
+  self.id = 77;
+  self.origin = Vec3{-2.0f, 0.0f, -2.0f};
+  self.size = Vec3{4.0f, 17.0f, 4.0f};
+  self.heading = 0.0f;   // square on to +Z, where every opponent stands
+  self.speed = 30.0f;
+  self.faction = ai::FactionId(lib.At(prof)->faction);
+  self.armed = armed;
+  self.canGuard = armed;
+  self.strikeReach = strikeReach;
+  self.attackReach = std::max(strikeReach, lib.At(prof)->attack.reach);
+  self.hpFrac = hp;
+  ai::GroundView g;   // no ground: nothing vetoes a step
+  ai::WorldView v;
+  v.actors = &actors;
+  for (int t = 0; t < ticks; t++) {
+    script(t, actors);
+    ai::IntentOut out;
+    ai::Think(r.brain, lib, self, g, v, 9000u + (uint32_t)t, 1.0f / 30.0f, out);
+    if (out.attack) {
+      r.attacks++;
+      r.attackAt.push_back(t);
+    }
+    if (out.cancelSwing) r.cancels++;
+    if (r.brain.intent == ai::Intent::Guard) {
+      r.guardTicks++;
+      if (r.firstGuard < 0) r.firstGuard = t;
+    }
+    if (r.brain.intent == ai::Intent::Dodge) {
+      r.dodgeTicks++;
+      if (r.firstDodge < 0) r.firstDodge = t;
+      r.maxStrafe = std::max(r.maxStrafe, std::abs(out.driveStrafe));
+    }
+    if (out.guard) {
+      r.guardOuts++;
+      r.guardPoint = out.guardPoint;
+    }
+    r.minDrive = std::min(r.minDrive, out.driveScale);
+  }
+  return r;
+}
+
+// A clone of `base` renamed, with its rules stripped unless asked: an arm
+// about one mechanism must not be steered by a rule about another.
+int CloneProfile(ai::Library& lib, const std::string& base,
+                 const std::string& name, bool keepRules = false) {
+  const ai::Profile* b = lib.At(lib.Find(base));
+  if (b == nullptr) return -1;
+  ai::Profile p = *b;
+  p.name = name;
+  if (!keepRules) p.rules.clear();
+  lib.profiles.push_back(p);
+  return (int)lib.profiles.size() - 1;
+}
+
+}  // namespace
+
+Status GateAiTactics(Ctx& c, std::string& detail) {
+  std::string why;
+  bool ok = true;
+  auto fail = [&](const std::string& s) {
+    ok = false;
+    if (!why.empty()) why += "; ";
+    why += s;
+  };
+
+  // ---- A: the shipped styles, and a round trip ----------------------------
+  ai::Library lib;
+  std::string log;
+  if (!ai::LoadBehaviors(AssetDir() + "/mobs/behaviors.json", lib, log)) {
+    detail = "behaviors.json did not load: " + log;
+    return Status::Fail;
+  }
+  if (log.find("rule") != std::string::npos) fail("shipped rules dropped: " + log);
+  static const char* const kStyles[] = {"swordsman", "fencer", "brawler",
+                                        "berserker", "guardian"};
+  int stylesFound = 0;
+  for (const char* n : kStyles)
+    if (lib.Find(n) >= 0) stylesFound++;
+  if (stylesFound != 5) fail(Format("%d of 5 fighting styles present", stylesFound));
+  bool tripOk = false;
+  {
+    const std::string tripPath = "build/ai_tactics_roundtrip.json";
+    std::string serr, tlog;
+    ai::Library trip;
+    const bool saved = ai::SaveBehaviors(tripPath, lib, serr);
+    const bool reloaded = saved && ai::LoadBehaviors(tripPath, trip, tlog);
+    std::filesystem::remove(tripPath);
+    const ai::Profile* a = lib.At(lib.Find("swordsman"));
+    const ai::Profile* b = trip.At(trip.Find("swordsman"));
+    tripOk = reloaded && a && b && tlog.find("rule") == std::string::npos &&
+             a->defense.skill == b->defense.skill &&
+             a->defense.guardStance == b->defense.guardStance &&
+             a->attack.feintChance == b->attack.feintChance &&
+             a->attack.riposteTicks == b->attack.riposteTicks &&
+             a->movement.flank == b->movement.flank &&
+             a->perception.preferWeak == b->perception.preferWeak &&
+             a->rules.size() == b->rules.size();
+    for (size_t r = 0; tripOk && r < a->rules.size(); r++)
+      for (int k = 0; k < (int)ai::Tune::Count; k++)
+        if (a->rules[r].tuneSet[k] != b->rules[r].tuneSet[k] ||
+            (a->rules[r].tuneSet[k] &&
+             std::abs(a->rules[r].tune[k] - b->rules[r].tune[k]) > 1e-4f))
+          tripOk = false;
+    if (!tripOk) fail("defense / tune did not survive SaveBehaviors");
+  }
+  if (lib.Find("swordsman") < 0 || lib.Find("fencer") < 0) {
+    detail = "fighting styles missing: " + why;
+    return Status::Fail;
+  }
+
+  // The defender: a swordsman that reads every blow in 4 ticks, whose own
+  // cadence is far too long to swing twice unaided -- so a second swing IS
+  // the riposte.
+  const int def = CloneProfile(lib, "swordsman", "t_defender");
+  {
+    ai::Profile& p = *lib.At(def);
+    p.defense.skill = 1.0f;
+    p.defense.reactTicks = 4;
+    p.defense.reactJitter = 0;
+    p.defense.guardStance = 0.0f;
+    p.attack.cadenceTicks = 200;
+    p.attack.jitterTicks = 0;
+    p.attack.feintChance = 0.0f;
+    p.attack.riposteTicks = 2;
+  }
+  const Vec3 opp{0.0f, 8.5f, 8.0f};
+  // One blow: windup 40..51, cut 52..57, recover 58..69.
+  auto oneBlow = [](int t, std::vector<ai::Actor>& a) {
+    a[0].action = t < 40   ? ai::Action::None
+                  : t < 52 ? ai::Action::Windup
+                  : t < 58 ? ai::Action::Cut
+                  : t < 70 ? ai::Action::Recover
+                           : ai::Action::None;
+  };
+
+  // ---- B: guard, then riposte ---------------------------------------------
+  const TacArm guard =
+      RunTactics(lib, def, {TacOpponent(opp)}, 100, true, 9.0f, oneBlow);
+  const ai::Actor oppA = TacOpponent(opp);
+  const float gpErr = (guard.guardPoint - oppA.tip).len();
+  if (guard.firstGuard < 44 || guard.firstGuard > 47 || guard.guardOuts == 0)
+    fail(Format("guard: first at t%d (want 44..47), %d guard outputs",
+                guard.firstGuard, guard.guardOuts));
+  if (gpErr > 1e-3f) fail(Format("guard point %.2f vox off the weapon point", gpErr));
+  if (guard.attacks != 2 || guard.brain.ripostes != 1 || guard.attackAt.size() < 2 ||
+      guard.attackAt[1] < 58 || guard.attackAt[1] > 75)
+    fail(Format("riposte: %d attacks (%s), %u ripostes -- want 2, the second "
+                "in 58..75", guard.attacks,
+                guard.attackAt.size() > 1 ? std::to_string(guard.attackAt[1]).c_str()
+                                          : "-",
+                guard.brain.ripostes));
+
+  // ---- C: nothing to guard with -> dodge ----------------------------------
+  const TacArm dodge =
+      RunTactics(lib, def, {TacOpponent(opp)}, 100, false, 5.0f, oneBlow);
+  if (dodge.guardTicks != 0 || dodge.dodgeTicks == 0 || dodge.minDrive > -0.3f ||
+      dodge.maxStrafe < 0.3f)
+    fail(Format("dodge: guard %d ticks, dodge %d ticks, back %.2f, aside %.2f",
+                dodge.guardTicks, dodge.dodgeTicks, dodge.minDrive,
+                dodge.maxStrafe));
+
+  // ---- D: skill 0 answers nothing -----------------------------------------
+  const int dull = CloneProfile(lib, "t_defender", "t_dull");
+  lib.At(dull)->defense.skill = 0.0f;
+  const TacArm numb =
+      RunTactics(lib, dull, {TacOpponent(opp)}, 100, true, 9.0f, oneBlow);
+  if (numb.guardTicks != 0 || numb.dodgeTicks != 0 || numb.attacks != 1)
+    fail(Format("skill 0: guard %d, dodge %d ticks, %d attacks (want 0, 0, 1)",
+                numb.guardTicks, numb.dodgeTicks, numb.attacks));
+
+  // ---- E: feint -----------------------------------------------------------
+  const int bluff = CloneProfile(lib, "t_defender", "t_bluff");
+  lib.At(bluff)->attack.feintChance = 1.0f;
+  lib.At(bluff)->attack.feintTicks = 5;
+  lib.At(bluff)->attack.feintFollowTicks = 10;
+  auto idle = [](int, std::vector<ai::Actor>& a) { a[0].action = ai::Action::None; };
+  const TacArm feint =
+      RunTactics(lib, bluff, {TacOpponent(opp)}, 40, true, 9.0f, idle);
+  const TacArm honest =
+      RunTactics(lib, def, {TacOpponent(opp)}, 40, true, 9.0f, idle);
+  if (feint.cancels < 1 || feint.brain.feints < 1 || feint.attacks < 2 ||
+      honest.attacks != 1 || honest.cancels != 0)
+    fail(Format("feint: %d cancels / %u feints / %d swings vs honest %d swings",
+                feint.cancels, feint.brain.feints, feint.attacks, honest.attacks));
+
+  // ---- F: tune composes ---------------------------------------------------
+  // Shipped swordsman, empty-handed (band -3, cadence x0.85), hurt (band +2,
+  // cadence x1.25, skill x1.3) and out-reached by an armed target (band -2,
+  // speed x1.2, disengage x0.3): band -3, cadence 1.0625, speed 1.2.
+  const TacArm composed =
+      RunTactics(lib, lib.Find("swordsman"), {TacOpponent(opp)}, 2, false, 5.0f,
+                 idle, 0.3f);
+  const float* tn = composed.brain.tune;
+  const float band = tn[(int)ai::Tune::Band], cad = tn[(int)ai::Tune::Cadence],
+              speed = tn[(int)ai::Tune::Speed];
+  if (std::abs(band + 3.0f) > 1e-4f || std::abs(cad - 1.0625f) > 1e-4f ||
+      std::abs(speed - 1.2f) > 1e-4f)
+    fail(Format("tune: band %.3f (want -3), cadence %.4f (1.0625), speed %.3f "
+                "(1.2)", band, cad, speed));
+
+  // ---- G: kiting ----------------------------------------------------------
+  // A fencer out-reaching a 7-voxel weapon (floor 7 + 2 + 1.5 = 10.5 inside a
+  // 8..12 band) standing at 10 backs off; with keepOut off it stays put. Both
+  // with the attack switched off, so the post-swing step-off cannot pass for
+  // kiting.
+  const int kite = CloneProfile(lib, "fencer", "t_kite");
+  lib.At(kite)->intents[(int)ai::Intent::RequestAttack].weight = 0.0f;
+  const int plant = CloneProfile(lib, "t_kite", "t_plant");
+  lib.At(plant)->movement.keepOut = -1.0f;
+  auto shortBlade = [](int, std::vector<ai::Actor>& a) {
+    a[0].action = ai::Action::None;
+    a[0].reach = 7.0f;
+  };
+  const Vec3 near9{0.0f, 8.5f, 10.0f};
+  const TacArm kiting =
+      RunTactics(lib, kite, {TacOpponent(near9)}, 30, true, 10.0f, shortBlade);
+  const TacArm planted =
+      RunTactics(lib, plant, {TacOpponent(near9)}, 30, true, 10.0f, shortBlade);
+  if (kiting.minDrive > -0.1f || planted.minDrive < -0.01f)
+    fail(Format("kite: keepOut drive %.2f (want < -0.1), without %.2f (want 0)",
+                kiting.minDrive, planted.minDrive));
+
+  // ---- H: the press queue -------------------------------------------------
+  // Two allies already nearer the same target: third in line circles out and
+  // does not swing. The same creature alone swings at once.
+  std::vector<ai::Actor> crowd = {TacOpponent(opp)};
+  for (int k = 0; k < 2; k++) {
+    ai::Actor al;
+    al.id = 500 + (uint64_t)k;
+    al.centre = Vec3{k ? -4.0f : 4.0f, 8.5f, 8.0f};
+    al.radius = 2.0f;
+    al.height = 17.0f;
+    al.faction = ai::FactionId("monster");
+    al.targetId = ai::kPlayerActorId;
+    crowd.push_back(al);
+  }
+  const TacArm queued =
+      RunTactics(lib, lib.Find("swordsman"), crowd, 30, true, 9.0f, idle);
+  const TacArm alone =
+      RunTactics(lib, lib.Find("swordsman"), {TacOpponent(opp)}, 30, true, 9.0f,
+                 idle);
+  if (queued.brain.pressRank != 2 || queued.attacks != 0 || alone.attacks < 1)
+    fail(Format("press: rank %d with %d swings (want 2, 0); alone %d swings",
+                queued.brain.pressRank, queued.attacks, alone.attacks));
+
+  // ---- I: target choice ---------------------------------------------------
+  std::vector<ai::Actor> two = {TacOpponent(Vec3{0.0f, 8.5f, 10.0f}),
+                                TacOpponent(Vec3{0.0f, 8.5f, 13.0f})};
+  two[0].id = ai::kPlayerActorBase + 0;
+  two[1].id = ai::kPlayerActorBase + 1;
+  two[1].hpFrac = 0.2f;
+  const int nearest = CloneProfile(lib, "swordsman", "t_nearest");
+  lib.At(nearest)->perception.preferWeak = 0.0f;
+  const TacArm weak = RunTactics(lib, lib.Find("swordsman"), two, 1, true, 9.0f,
+                                 [](int, std::vector<ai::Actor>&) {});
+  const TacArm nearPick = RunTactics(lib, nearest, two, 1, true, 9.0f,
+                                 [](int, std::vector<ai::Actor>&) {});
+  if (weak.brain.targetId != two[1].id || nearPick.brain.targetId != two[0].id)
+    fail("preferWeak: did not pick the wounded enemy (or the control did)");
+
+  // ---- J: THE LIVE SEAM ---------------------------------------------------
+  // Everything above is the decision. This is the body: a real sword duelist
+  // (`duelist_blue`, faction quarry) swinging at a real armed defender that
+  // reads every blow and never attacks, against the same defender with skill
+  // 0. What is asserted is the part that is this change's: the attacker's
+  // stroke phase reaches the defender through the PUBLISHED actor, the
+  // defender's AI raises a guard, the guard reaches the STROKE (Guard phase
+  // ticks), and a held guard PARRIES (MobSystem::FindParry counts a Guard-
+  // phase blade as a blocker). Hp lost is recorded against the skill-0 arm.
+  struct LiveArm {
+    int requests = 0, guardPhase = 0, blocks = 0;
+    uint32_t guards = 0, dodges = 0;
+    float hpLost = 0.0f;
+  };
+  LiveArm liveRead, liveNumb;
+  LiveArm styleArms[5];
+  bool liveOk = true;
+  {
+    const int defIndex = AiHumanoidDef(c.mobs);
+    const ItemDef* sword = c.items.At(c.items.Find("sword"));
+    ai::Library& mlib = c.mobs.BehaviorsMut();
+    const size_t libSize = mlib.profiles.size();
+    for (int k = 0; k < 2; k++) {
+      const ai::Profile* g = mlib.At(mlib.Find("guardian"));
+      if (g == nullptr) break;
+      ai::Profile p = *g;
+      p.name = k == 0 ? "t_live_reader" : "t_live_numb";
+      p.rules.clear();
+      p.defense.skill = k == 0 ? 1.0f : 0.0f;
+      p.defense.reactTicks = 3;
+      p.defense.reactJitter = 0;
+      p.defense.guardStance = 0.0f;
+      p.intents[(int)ai::Intent::RequestAttack].weight = 0.0f;
+      p.intents[(int)ai::Intent::Guard].weight = 5.0f;
+      p.intents[(int)ai::Intent::Dodge].weight = 0.0f;
+      p.intents[(int)ai::Intent::CircleStrafe].weight = 0.0f;
+      mlib.profiles.push_back(p);
+    }
+    if (defIndex < 0 || sword == nullptr ||
+        mlib.profiles.size() != libSize + 2 || mlib.Find("duelist_blue") < 0) {
+      fail("live: no humanoid / sword / guardian / duelist_blue to build it from");
+      liveOk = false;
+    }
+    const int ticks = (int)BaselineNumber("aiTacticsLiveTicks", 300);
+    if (liveOk) {
+      SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+      c.ctx.WaitIdle();
+      c.mobs.ClearPlayerActor();
+      const MobDef& def = c.mobs.Defs()[defIndex];
+      int relief = 0;
+      const IVec3 anchor = AiFixtureCentre(c.world);
+      const IVec3 spot =
+          AiFlatSpot(anchor.x, anchor.z, 96, 22, kDefaultSeed, relief);
+      AiTicker tick{c, 8600, {spot.x >> 4, spot.y >> 4, spot.z >> 4}};
+      for (int k = 0; k < 2; k++) {
+        LiveArm& arm = k == 0 ? liveRead : liveNumb;
+        c.mobs.Reset();
+        c.debris.Reset();
+        auto place = [&](int z, const char* prof, float heading) -> uint64_t {
+          const int h = World::TerrainHeight(spot.x, z, kDefaultSeed);
+          const uint64_t id = c.mobs.Spawn(
+              defIndex, {spot.x - (int)(def.worldSize.x * 0.5f), h + 1,
+                         z - (int)(def.worldSize.z * 0.5f)});
+          if (id == 0 || !c.mobs.SetMobBehavior(id, prof) ||
+              !c.mobs.EquipItem(id, sword))
+            return 0;
+          c.mobs.SetHeading(id, heading);
+          return id;
+        };
+        const uint64_t dfd =
+            place(spot.z, k == 0 ? "t_live_reader" : "t_live_numb", 0.0f);
+        const uint64_t att = place(spot.z + 9, "duelist_blue", 3.14159265f);
+        if (dfd == 0 || att == 0) {
+          fail("live: could not place the pair");
+          liveOk = false;
+          break;
+        }
+        for (int i = 0; i < 4; i++) tick();
+        const float hp0 = c.mobs.TotalHp(dfd);
+        c.mobs.ClearBlockEvents();
+        for (int i = 0; i < ticks && c.mobs.IsAlive(dfd); i++) {
+          tick();
+          for (const ai::AttackRequest& r : c.mobs.AttackRequests())
+            if (r.mobId == att) arm.requests++;
+          c.mobs.ClearAttackRequests();
+          for (const BlockEvent& ev : c.mobs.BlockEvents())
+            if (ev.blockerId == dfd && ev.attackerId == att) arm.blocks++;
+          c.mobs.ClearBlockEvents();
+          if (const NpcStroke* s = c.mobs.MobStroke(dfd))
+            if (s->phase == NpcStroke::Phase::Guard) arm.guardPhase++;
+        }
+        if (const ai::Brain* b = c.mobs.MobBrain(dfd)) {
+          arm.guards = b->guards;
+          arm.dodges = b->dodges;
+        }
+        arm.hpLost = hp0 - (c.mobs.IsAlive(dfd) ? c.mobs.TotalHp(dfd) : 0.0f);
+      }
+
+      // ---- K: EVERY SHIPPED STYLE FIGHTS ------------------------------------
+      // Each fighting style, sword in hand, against the same duelist. The
+      // failure a weight-tuned profile is most prone to is PASSIVITY — a guard
+      // or a band that out-scores the attack forever — so the claim is that it
+      // swings, and the rest is recorded for tuning.
+      for (int k = 0; liveOk && k < 5; k++) {
+        LiveArm& arm = styleArms[k];
+        c.mobs.Reset();
+        c.debris.Reset();
+        auto place = [&](int z, const char* prof, float heading) -> uint64_t {
+          const int h = World::TerrainHeight(spot.x, z, kDefaultSeed);
+          const uint64_t id = c.mobs.Spawn(
+              defIndex, {spot.x - (int)(def.worldSize.x * 0.5f), h + 1,
+                         z - (int)(def.worldSize.z * 0.5f)});
+          if (id == 0 || !c.mobs.SetMobBehavior(id, prof) ||
+              !c.mobs.EquipItem(id, sword))
+            return 0;
+          c.mobs.SetHeading(id, heading);
+          return id;
+        };
+        const uint64_t me = place(spot.z, kStyles[k], 0.0f);
+        const uint64_t foe = place(spot.z + 14, "duelist_blue", 3.14159265f);
+        if (me == 0 || foe == 0) {
+          fail(Format("live: could not place %s", kStyles[k]));
+          break;
+        }
+        for (int i = 0; i < 4; i++) tick();
+        const float hp0 = c.mobs.TotalHp(me);
+        c.mobs.ClearBlockEvents();
+        for (int i = 0; i < ticks && c.mobs.IsAlive(me) && c.mobs.IsAlive(foe);
+             i++) {
+          tick();
+          for (const ai::AttackRequest& r : c.mobs.AttackRequests())
+            if (r.mobId == me) arm.requests++;
+          c.mobs.ClearAttackRequests();
+          for (const BlockEvent& ev : c.mobs.BlockEvents())
+            if (ev.blockerId == me) arm.blocks++;
+          c.mobs.ClearBlockEvents();
+          if (const NpcStroke* s = c.mobs.MobStroke(me))
+            if (s->phase == NpcStroke::Phase::Guard) arm.guardPhase++;
+        }
+        if (const ai::Brain* b = c.mobs.MobBrain(me)) {
+          arm.guards = b->guards;
+          arm.dodges = b->dodges;
+        }
+        arm.hpLost = hp0 - (c.mobs.IsAlive(me) ? c.mobs.TotalHp(me) : 0.0f);
+      }
+    }
+    c.mobs.ClearAttackRequests();
+    c.mobs.ClearBlockEvents();
+    c.debris.Reset();
+    c.mobs.Reset();
+    mlib.profiles.resize(std::min(mlib.profiles.size(), libSize));
+    if (liveOk) {
+      if (liveRead.requests < 3 || liveRead.guards < 1 || liveRead.guardPhase < 1)
+        fail(Format("live reader: %d swings at it, %u guards decided, %d Guard "
+                    "stroke ticks (want >= 3, >= 1, >= 1)",
+                    liveRead.requests, liveRead.guards, liveRead.guardPhase));
+      // ...AND THE GUARD STOPS BLADES (FindParry's Guard-phase blocker).
+      // Measured 8 parries over 6 swings when this landed; the floor is 1
+      // because how often a guard meets the edge is geometry, not this gate.
+      const int minParries = (int)BaselineNumber("aiTacticsLiveMinParries", 1);
+      if (liveRead.blocks < minParries)
+        fail(Format("live reader: %d parries (want >= %d)", liveRead.blocks,
+                    minParries));
+      if (liveNumb.guards != 0 || liveNumb.guardPhase != 0)
+        fail(Format("live numb: %u guards, %d Guard ticks (want 0, 0)",
+                    liveNumb.guards, liveNumb.guardPhase));
+      const int minSwings = (int)BaselineNumber("aiTacticsStyleMinSwings", 2);
+      for (int k = 0; k < 5; k++)
+        if (styleArms[k].requests < minSwings)
+          fail(Format("style %s swung %d times in the live duel (want >= %d)",
+                      kStyles[k], styleArms[k].requests, minSwings));
+      RecordObserved("aiTacticsLiveBlocks", (double)liveRead.blocks);
+      RecordObserved("aiTacticsLiveHpLostRead", (double)liveRead.hpLost);
+      RecordObserved("aiTacticsLiveHpLostNumb", (double)liveNumb.hpLost);
+    }
+  }
+
+  detail = Format(
+      "A styles %d/5 trip %d | B guard@%d pt %.2f, atk %d, riposte %u | C dodge "
+      "%d t back %.2f aside %.2f | D skill0 g%d d%d | E feint %d cancels %d "
+      "swings (honest %d) | F band %.2f cad %.3f spd %.2f | G kite %.2f / "
+      "plant %.2f | H rank %d swings %d (alone %d) | I weak pick %d",
+      stylesFound, tripOk ? 1 : 0, guard.firstGuard, gpErr, guard.attacks,
+      guard.brain.ripostes, dodge.dodgeTicks, dodge.minDrive, dodge.maxStrafe,
+      numb.guardTicks, numb.dodgeTicks, feint.cancels, feint.attacks,
+      honest.attacks, band, cad, speed, kiting.minDrive, planted.minDrive,
+      queued.brain.pressRank, queued.attacks, alone.attacks,
+      weak.brain.targetId == two[1].id ? 1 : 0);
+  detail += Format(
+      " | J live read: %d swings, %u guards, %d guard ticks, %d parries, "
+      "-%.0f hp; numb: %d swings, %d guard ticks, %d parries, -%.0f hp",
+      liveRead.requests, liveRead.guards, liveRead.guardPhase, liveRead.blocks,
+      liveRead.hpLost, liveNumb.requests, liveNumb.guardPhase, liveNumb.blocks,
+      liveNumb.hpLost);
+  detail += " | K vs duelist:";
+  for (int k = 0; k < 5; k++)
+    detail += Format(" %s %d swings g%u d%u %d parries -%.0f hp;", kStyles[k],
+                     styleArms[k].requests, styleArms[k].guards,
+                     styleArms[k].dodges, styleArms[k].blocks,
+                     styleArms[k].hpLost);
+  if (!ok) detail += " || FAIL: " + why;
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& MobGates() {
@@ -14666,6 +15186,10 @@ const std::vector<Gate>& MobGates() {
       // `flee` verb they switch on: parse, drop-and-say, round trip, pure
       // arbiter arms, and one live creature that is hurt and runs.
       {"ai-rules", "mob", {}, false, GateAiRules, /*needsRender=*/false},
+      // The fighting layer: reading the opponent's blows (guard / dodge /
+      // riposte), feints, rule `tune`, kiting, the press queue, target
+      // choice. Pure arbiter arms only.
+      {"ai-tactics", "mob", {}, false, GateAiTactics, /*needsRender=*/false},
       // A body with no legs lies ON the slope and stops re-aiming every voxel.
       {"crawl-slope", "mob", {}, false, GateCrawlSlope, /*needsRender=*/false},
       {"crawl-still", "mob", {}, false, GateCrawlStill, /*needsRender=*/false},

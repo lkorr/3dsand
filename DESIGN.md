@@ -9955,6 +9955,59 @@ not walk through, then arrival *and residence* inside the band, no occupation of
 the target's space, and swings actually issued. Thresholds are in
 `tests/baseline.json`.
 
+#### The fighting layer: reading the opponent (2026-09-27; gate `ai-tactics`)
+
+Until this, an NPC fought a *position*: `ai::Actor` carried a centre, a radius
+and a faction, so nothing could tell a sword from a fist, a swing from a stroll,
+or a dying enemy from a fresh one. **An actor now publishes what a watcher could
+see of it** — `reach`, `armed`, `hpFrac`, `heading`, the weapon `tip`, its
+`action` (`ai::Action`: none / guard / windup / cut / recover) and the
+`targetId` it is fighting — filled by `MobSystem::PublishCombatant` from the rig
+for NPCs and avatars alike (`ThreatReachOf` is the watcher's reach), plus the
+player's strike-cursor phase from the session (`PlayerActorDesc::action`).
+
+Three things are built on it, and all three are data:
+
+* **Facts** for `rules`: `armed`, `myReach`, `targetReach`, `reachAdv`,
+  `targetArmed`, `targetHp`, `hpAdv`, `targetAttacking`, `targetRecovering`,
+  `targetGuarding`, `inTheirReach`, `targetFacingMe`, `engagedAllies`,
+  `pressRank`. These are what make a creature fight *differently* against a
+  dagger, a spear, an empty hand or a guard.
+* **`tune`** on a rule: HOW it fights while the rule holds, not just what —
+  `cadence`, `speed`, `disengage`, `circle`, `skill`, `react`, `feint`, `aim`
+  scale; `band` adds voxels to the footwork band after the weapon placed it;
+  `keepOut` kites (the band floor lifts to the target's reach + a margin, only
+  when that leaves a band). Identity when nothing holds, so a profile with no
+  `tune` fights exactly as before.
+* **Two verbs, `guard` and `dodge`**, which score only against a blow the
+  creature has READ: one counter-based roll per windup onset against
+  `defense.skill`, then `defense.reactTicks` (+ jitter) of delay. Per blow, not
+  per tick — re-rolling every tick of a fifteen-tick windup would make any skill
+  a certainty. A guard is `MobSystem::SetGuard` on the attacker's weapon point
+  (`ApplyAiArm`), and **a stroke's Guard phase now counts as a blocker in
+  `FindParry`** — before, only a blade mid-CUT blocked, so a held guard could
+  never parry (measured: 124 guard ticks, 0 parries). A defence that saw a blow
+  through books a **riposte** (`attack.riposteTicks`, overriding the cadence);
+  `attack.feintChance` starts a real windup and pulls it out
+  (`IntentOut::cancelSwing`), with the true blow booked on the same clock. A
+  footwork dwell cannot hold a creature through a read blow or a riposte
+  (the `urgent` bypass); nothing else gets through a dwell.
+
+Target choice gained `perception.stickiness` / `preferWeak` (both 0 = plain
+nearest), and circling gained `movement.flank` (orbit away from the ally
+nearest you around the same target) — with the `pressRank` fact, a pack
+surrounds its quarry and takes turns instead of queueing.
+
+The shipped fighting styles — `swordsman`, `fencer`, `brawler`, `berserker`,
+`guardian` — are five profiles over this, each with an empty-handed rule, and
+are what the AI panel's style buttons and the random human spawn. The old
+profiles (`duelist`, `zombie`, the fixtures) are untouched and the world hash
+did not move. `ai-tactics` asserts every mechanism on the pure arbiter, then a
+live pair (a reading defender parries a real duelist; the skill-0 control takes
+twice the damage) and that every shipped style actually swings in a live duel.
+**Not yet:** a player's held guard still only blocks while cutting (its avatar
+never enters an NPC Guard phase), and nothing reads `targetFacingMe` yet.
+
 ### NPCs swinging, and blades meeting blades (2026-08-31; `game/strokes.*`, `assets/mobs/attack_styles.json`)
 
 The AI decides *when* and *where*; this is what turns that into a sword moving
@@ -10208,7 +10261,9 @@ Two things about it are load-bearing and were both learned the hard way:
   two edges passing within 0.28 voxels, seven sweeps, zero hits — and a ray
   fired deliberately down the defender's own edge came back empty too. So
   `MobSystem::FindParry` asks the question of the two **edge segments**, which
-  are the authoritative hitboxes anyway.
+  are the authoritative hitboxes anyway. The defender's blade counts when it is
+  cutting OR held in an NPC stroke's Guard phase (2026-09-27, the fighting
+  layer, under NPC behaviour above); a blade merely carried does not block.
 * **Armour is not a parry.** The three-way classification is the rig's own: a
   slot below `AppendedBase()` is flesh, one at or above it tagged `worn` is a
   garment, and the one at `HeldSlot()` is a weapon. A shell is strapped to the

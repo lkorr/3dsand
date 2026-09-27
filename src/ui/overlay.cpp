@@ -1849,6 +1849,21 @@ void Overlay::Draw(UIState& s) {
           if (ImGui::Button("duelist##ai")) s.aiSpawnDuelist = true;
           ImGui::SameLine();
           ImGui::TextDisabled("paths in, holds range, circles");
+          // THE FIGHTING STYLES (behaviors.json): each reads its own wounds,
+          // your weapon and your swings, and guards / dodges / feints.
+          ImGui::TextDisabled("fighting styles (read you, defend, adapt):");
+          static const char* const kStyles[][2] = {
+              {"swordsman", "all-rounder: guards, ripostes, adapts"},
+              {"fencer", "kites at the edge of your reach, dodges"},
+              {"brawler", "rushes inside, weaves, punishes whiffs"},
+              {"berserker", "relentless; worse when hurt"},
+              {"guardian", "turtles, parries, counters"}};
+          for (const auto& st : kStyles) {
+            if (ImGui::Button((std::string(st[0]) + "##aistyle").c_str()))
+              s.aiSpawnProfile = st[0];
+            ImGui::SameLine();
+            ImGui::TextDisabled("%s", st[1]);
+          }
           ImGui::Separator();
           if (ImGui::Button("kill all spawned##ai")) s.aiKillSpawned = true;
           ImGui::SameLine();
@@ -2004,7 +2019,8 @@ void Overlay::Draw(UIState& s) {
               static const char* kIntent[] = {"idle",     "face",
                                               "approach", "holdRange",
                                               "circle",   "attack",
-                                              "flee"};
+                                              "flee",     "guard",
+                                              "dodge"};
               static_assert(sizeof(kIntent) / sizeof(kIntent[0]) ==
                             (size_t)UIState::kAiIntents);
               for (int k = 0; k < UIState::kAiIntents; k++) {

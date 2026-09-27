@@ -11726,8 +11726,11 @@ int main(int argc, char** argv) {
         const ai::Brain* br = mobs.MobBrain(mid);
         const ai::Profile* pf =
             br != nullptr ? mobs.Behaviors().At(br->profile) : nullptr;
-        char line[192];
-        std::snprintf(line, sizeof line, "#%llu  %-16s %-10s %s d=%.1f%s",
+        char line[256];
+        // ...and the fight as it reads it: blows answered (guard / dodge),
+        // feints thrown, ripostes landed, rules holding.
+        std::snprintf(line, sizeof line,
+                      "#%llu  %-16s %-10s %s d=%.1f%s  g%u d%u f%u r%u rules %x",
                       (unsigned long long)mid,
                       pf != nullptr ? pf->name.c_str() : "(no ai)",
                       br != nullptr ? ai::IntentName(br->intent) : "-",
@@ -11735,7 +11738,12 @@ int main(int argc, char** argv) {
                           ? (br->visible ? "seen" : "lost")
                           : "----",
                       br != nullptr ? br->targetDist : 0.0f,
-                      br != nullptr && br->path.valid ? "  [path]" : "");
+                      br != nullptr && br->path.valid ? "  [path]" : "",
+                      br != nullptr ? br->guards : 0u,
+                      br != nullptr ? br->dodges : 0u,
+                      br != nullptr ? br->feints : 0u,
+                      br != nullptr ? br->ripostes : 0u,
+                      br != nullptr ? br->rulesHeld : 0u);
         ui.aiMobIds.push_back(mid);
         ui.aiMobLabels.push_back(line);
       }
