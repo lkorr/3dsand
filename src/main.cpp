@@ -391,6 +391,12 @@ const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
 // the carried arm prints every tick (session.cpp PoseBenchHands).
 bool g_shotBench = false;
 constexpr uint64_t kShotBenchLast = 425;
+// `--shot-devpanel`: the F1 sidebar's look-iteration harness. One picture per
+// page (screenshot_devpanel_<page>.bmp), through g_shotJumpPath, plus the
+// Spawn page with a flask picked so the vessel picker's columns are in shot.
+bool g_shotDevPanel = false;
+constexpr uint64_t kShotDevFirst = 90, kShotDevStep = 12;
+constexpr uint64_t kShotDevLast = kShotDevFirst + kShotDevStep * 7;
 float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
 
 // --frames N (phase 4b D3): windowed verification harness. 0 = play normally.
@@ -1107,6 +1113,27 @@ void CopyCoatLabel(const std::vector<MaterialDef>& mats, uint32_t mat,
   out[0] = '\0';
   if (mat == 0 || mat >= mats.size()) return;
   std::snprintf(out, n, "%s", mats[mat].name.c_str());
+}
+
+// The F1 panel's material mirror: names, swatch colours, class and tags, all
+// index == material id. Rebuilt at load and on every R.
+void FillUiMaterials(const std::vector<MaterialDef>& mats, UIState& ui) {
+  ui.materialNames.clear();
+  ui.materialColors.clear();
+  ui.materialColors1.clear();
+  ui.materialColors2.clear();
+  ui.materialClass.clear();
+  ui.materialTags.clear();
+  for (const MaterialDef& m : mats) {
+    ui.materialNames.push_back(m.name);
+    ui.materialColors.push_back(m.gpu.color0);
+    ui.materialColors1.push_back(m.gpu.color1);
+    ui.materialColors2.push_back(m.gpu.color2);
+    ui.materialClass.push_back((uint8_t)m.gpu.klass);
+    std::string tags;
+    for (const std::string& t : m.tags) tags += (tags.empty() ? "" : ",") + t;
+    ui.materialTags.push_back(std::move(tags));
+  }
 }
 
 // One figure slot's coat, folded from the limbs drawn as that segment.
@@ -4696,6 +4723,7 @@ int main(int argc, char** argv) {
           "                        counted per rig slot. Each creature is\n"
           "                        <def>[@gap][:limb,...][+item,...], e.g.\n"
           "                        --shot-strike zombie bite_lunge human+iron_cuirass\n"
+          "  --shot-devpanel       One BMP per F1 sidebar page\n"
           "  --shot-inventory      Character screen (I) with a damaged avatar,\n"
           "                        one frame to screenshot_inventory.bmp\n"
           "  --shot-spellpage      The spell page, one BMP per word list:\n"
@@ -4833,6 +4861,10 @@ int main(int argc, char** argv) {
       g_shotBench = true;
       // SANDVOX_BENCH_INVERT runs a longer script (the lift, the turn, the pour).
       g_harnessFrames = kShotBenchLast + (std::getenv("SANDVOX_BENCH_INVERT") ? 160 : 0);
+    }
+    else if (a == "--shot-devpanel") {
+      g_shotDevPanel = true;
+      g_harnessFrames = kShotDevLast + 2;
     }
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
@@ -6185,10 +6217,7 @@ int main(int argc, char** argv) {
     ui.fStretch      = fr.fluidStretch;
     ui.fDensityShade = fr.fluidDensityShade;
   }
-  for (auto& m : mats) {
-    ui.materialNames.push_back(m.name);
-    ui.materialColors.push_back(m.gpu.color0);
-  }
+  FillUiMaterials(mats, ui);
 
   // ---- the character panel's portrait target -------------------------------
   // Created ONCE at a fixed size, never resized with the window: the image is
@@ -9282,6 +9311,25 @@ int main(int argc, char** argv) {
         if (f == 420) g_shotJumpPath = "screenshot_bench_closed.bmp";
       }
     }
+    // --shot-devpanel: page k is selected at kShotDevFirst + k*step and shot
+    // step-2 frames later (a page's first frame lays out before it settles).
+    if (g_shotDevPanel && frameCounter >= kShotDevFirst) {
+      static const char* const kPages[] = {
+          "screenshot_devpanel_paint.bmp", "screenshot_devpanel_spawn.bmp",
+          "screenshot_devpanel_world.bmp", "screenshot_devpanel_view.bmp",
+          "screenshot_devpanel_magic.bmp", "screenshot_devpanel_debug.bmp",
+          "screenshot_devpanel_spawn_pouch.bmp"};
+      const uint64_t k = (frameCounter - kShotDevFirst) / kShotDevStep;
+      const uint64_t r = (frameCounter - kShotDevFirst) % kShotDevStep;
+      if (k < 7) {
+        ui.visible = true;
+        ui.devTab = k == 6 ? 1 : (int)k;
+        if (k == 6 && r == 0)
+          for (int i = 0; i < (int)ui.giveVesselNames.size(); i++)
+            if (ui.giveVesselNames[i] == "pouch") ui.giveVesselPick = i;
+        if (r == kShotDevStep - 2) g_shotJumpPath = kPages[k];
+      }
+    }
     // --shot-inventory's scripted schedule. Frame-counted rather than
     // wall-clocked so the same picture comes out on any machine.
     if (g_shotInventory) {
@@ -10688,12 +10736,7 @@ int main(int argc, char** argv) {
         // inspector's charred readout counts the wrong material.
         burnMats = ResolveBurnMats(mats);
         tissueMats = ResolveTissueMats(mobs, mats);
-        ui.materialNames.clear();
-        ui.materialColors.clear();
-        for (auto& m : mats) {
-          ui.materialNames.push_back(m.name);
-          ui.materialColors.push_back(m.gpu.color0);
-        }
+        FillUiMaterials(mats, ui);
         std::printf("materials reloaded (%zu, %zu reactions)\n", mats.size(),
                     reactions.size());
       } else if (!ui.reloadMaterials) {   // (deferred for the bench: not a failure)

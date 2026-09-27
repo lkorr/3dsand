@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
+#include <cfloat>
 #include <cstdio>
+#include <cstring>
 
 #include <imgui.h>
 #include <backends/imgui_impl_glfw.h>
@@ -117,6 +120,13 @@ uint64_t Overlay::RegisterTexture(const rhi::TextureView& view) {
 void Overlay::UnregisterTexture(uint64_t id) {
   if (id) ImGui_ImplVulkan_RemoveTexture((VkDescriptorSet)id);
 }
+
+// The F1 sidebar's width last frame (the popout windows open right of it),
+// and the top of the HUD's bottom-left block last frame (the sidebar stops
+// above it, so the bars and the body figure stay where the player expects
+// them and never land on top of the panel).
+static float sPanelW = 480.0f;
+static float sHudTop = -1.0f;
 
 // Double-click any slider to type a precise value (one at a time).
 static ImGuiID sManualInputId    = 0;
@@ -397,6 +407,7 @@ void Overlay::DrawHUD(const UIState& s) {
   // ---- body condition, sitting directly above the hp bar -------------------
   const float figureH = DrawBodyFigure(s, x, yStack);
   const float yTop = yStack - figureH;
+  sHudTop = yTop - (s.playerAlive ? 8.0f : 30.0f);
 
   if (!s.playerAlive) {
     // Nothing respawns you on a timer any more (UIState::deathScreen), so the
@@ -634,6 +645,1165 @@ float Overlay::DrawBodyFigure(const UIState& s, float x, float yBottom) {
   return height;
 }
 
+// ============================================================================
+// THE F1 DEV PANEL: a full-height sidebar on the left edge
+// ============================================================================
+//
+// It used to be one floating window with everything in it, top to bottom, in
+// the order the features were written. It is now a map-editor-style sidebar:
+// a fixed header (the numbers you glance at, pause/step, play/dev), a strip of
+// PAGES, and one scrolling body per page, each cut into titled sections.
+//
+//   Paint  - the tool, the brush, and WHAT it paints (the material picker)
+//   Spawn  - everything that puts a thing in the world or in your hands:
+//            filled vessels, creatures, clothes, objects, and the cleanup
+//   World  - time, sky, weather, wind, and the world file
+//   View   - render and debug-draw switches, the player's movement
+//   Magic  - the mana/health crossover and the spell being held
+//   Debug  - the full stat block, the NPC log, the tuning windows, the keys
+//
+// THE OVERLAY STILL OWNS NO GAME STATE. Every control here writes a UIState
+// field or raises a one-shot bool that main.cpp / session.cpp consume, exactly
+// as before; only the arrangement moved.
+
+namespace {
+
+ImVec4 V4(ImU32 c) { return ImGui::ColorConvertU32ToFloat4(c); }
+
+// 0xAABBGGRR (a material's gpu colour) is ImU32's own byte order, so the only
+// conversion is forcing it opaque: a gas's authored alpha is for the renderer.
+ImU32 Opaque(uint32_t c) { return (c & 0x00FFFFFFu) | 0xFF000000u; }
+
+// A titled, collapsible section. Bronze band, gold title, so the sections read
+// as sections at a glance rather than as one more line of text.
+bool Section(const char* title, bool defaultOpen = true) {
+  ImGui::PushStyleColor(ImGuiCol_Header, V4(ui::ColMid()));
+  ImGui::PushStyleColor(ImGuiCol_HeaderHovered, V4(ui::ColHi()));
+  ImGui::PushStyleColor(ImGuiCol_HeaderActive, V4(ui::ColHi()));
+  ImGui::PushStyleColor(ImGuiCol_Text, V4(ui::ColGoldPale()));
+  const bool open = ImGui::CollapsingHeader(
+      title, defaultOpen ? ImGuiTreeNodeFlags_DefaultOpen : 0);
+  ImGui::PopStyleColor(4);
+  if (open) ImGui::Spacing();
+  return open;
+}
+
+// A small gold caption inside a section.
+void Caption(const char* text) {
+  ImGui::TextColored(V4(ui::ColGoldDim()), "%s", text);
+}
+
+// A toggle-look button: gold when `on`. Width 0 = fit the label.
+bool ToggleButton(const char* label, bool on, float w = 0.0f, float h = 0.0f) {
+  if (on) {
+    ImGui::PushStyleColor(ImGuiCol_Button, V4(ui::ColGold()));
+    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, V4(ui::ColGoldHi()));
+    ImGui::PushStyleColor(ImGuiCol_ButtonActive, V4(ui::ColGoldPale()));
+    ImGui::PushStyleColor(ImGuiCol_Text, V4(ui::ColInk()));
+  }
+  const bool hit = ImGui::Button(label, ImVec2(w, h));
+  if (on) ImGui::PopStyleColor(4);
+  return hit;
+}
+
+// Width of one cell when `n` buttons share the current row.
+float CellWidth(int n) {
+  const float sp = ImGui::GetStyle().ItemSpacing.x;
+  return std::floor((ImGui::GetContentRegionAvail().x - sp * (n - 1)) / n);
+}
+
+// ---- material icons and the picker -----------------------------------------
+
+// The icon: a 2x2 of the material's three palette variants — the same jitter
+// the world draws it with — in a dark rim, on whole pixels.
+void MatIcon(ImDrawList* d, ImVec2 p, float size, const UIState& s, int id) {
+  p = ImVec2(std::floor(p.x), std::floor(p.y));
+  const float h = std::floor(size * 0.5f);
+  auto col = [&](const std::vector<uint32_t>& v) {
+    return id >= 0 && id < (int)v.size() ? Opaque(v[id]) : ui::ColMid();
+  };
+  const ImU32 c0 = col(s.materialColors);
+  const ImU32 c1 = s.materialColors1.empty() ? c0 : col(s.materialColors1);
+  const ImU32 c2 = s.materialColors2.empty() ? c0 : col(s.materialColors2);
+  d->AddRectFilled(ImVec2(p.x - 1, p.y - 1), ImVec2(p.x + 2 * h + 1, p.y + 2 * h + 1),
+                   ui::ColInk());
+  d->AddRectFilled(p, ImVec2(p.x + h, p.y + h), c0);
+  d->AddRectFilled(ImVec2(p.x + h, p.y), ImVec2(p.x + 2 * h, p.y + h), c1);
+  d->AddRectFilled(ImVec2(p.x, p.y + h), ImVec2(p.x + h, p.y + 2 * h), c2);
+  d->AddRectFilled(ImVec2(p.x + h, p.y + h), ImVec2(p.x + 2 * h, p.y + 2 * h), c0);
+}
+
+int MatClass(const UIState& s, int id) {
+  return id >= 0 && id < (int)s.materialClass.size() ? s.materialClass[id] : 0;
+}
+
+bool HasTag(const std::string& tags, const char* t) {
+  const size_t n = std::strlen(t);
+  for (size_t a = 0; a <= tags.size();) {
+    size_t b = tags.find(',', a);
+    if (b == std::string::npos) b = tags.size();
+    if (b - a == n && tags.compare(a, n, t) == 0) return true;
+    a = b + 1;
+  }
+  return false;
+}
+
+const std::string& MatTags(const UIState& s, int id) {
+  static const std::string kNone;
+  return id >= 0 && id < (int)s.materialTags.size() ? s.materialTags[id] : kNone;
+}
+
+// "pine_needles" -> "pine needles": the picker shows words, not identifiers.
+std::string MatLabel(const UIState& s, int id) {
+  if (id < 0 || id >= (int)s.materialNames.size()) return "?";
+  std::string n = s.materialNames[id];
+  std::replace(n.begin(), n.end(), '_', ' ');
+  return n;
+}
+
+const char* const kClassName[4] = {"Solids", "Powders", "Liquids", "Gases"};
+const char* const kClassWord[4] = {"solid", "powder", "liquid", "gas"};
+ImU32 ClassColor(int c) {
+  switch (c) {
+    case 1: return ui::ColGold();
+    case 2: return IM_COL32(110, 160, 230, 255);
+    case 3: return IM_COL32(170, 170, 190, 255);
+    default: return ui::ColSteel();
+  }
+}
+
+// The solids column is 120 long, so it is cut by tag into groups. Order is
+// the order drawn; the ground-building materials first.
+const char* const kSolidGroup[5] = {"stone & metal", "plants", "organic", "hot",
+                                    "other"};
+int SolidGroup(const std::string& tags) {
+  if (HasTag(tags, "hot")) return 3;
+  if (HasTag(tags, "mineral") || HasTag(tags, "metal")) return 0;
+  if (HasTag(tags, "foliage")) return 1;
+  if (HasTag(tags, "organic")) return 2;
+  return 4;
+}
+
+void MatTooltip(const UIState& s, int id) {
+  if (!ImGui::BeginTooltip()) return;
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  MatIcon(ImGui::GetWindowDrawList(), p, 32.0f, s, id);
+  ImGui::Dummy(ImVec2(34, 34));
+  ImGui::SameLine();
+  ImGui::BeginGroup();
+  ImGui::TextColored(V4(ui::ColGoldPale()), "%s", MatLabel(s, id).c_str());
+  ImGui::TextColored(V4(ClassColor(MatClass(s, id))), "%s", kClassWord[MatClass(s, id) & 3]);
+  ImGui::SameLine();
+  ImGui::TextDisabled("id %d", id);
+  const std::string& tags = MatTags(s, id);
+  if (!tags.empty()) ImGui::TextDisabled("%s", tags.c_str());
+  ImGui::EndGroup();
+  ImGui::EndTooltip();
+}
+
+// One row of a picker column: [icon] name. Returns true on click.
+bool MatRow(const UIState& s, int id, bool selected, float rowH) {
+  ImGui::PushID(id);
+  const bool hit = ImGui::Selectable("##m", selected, 0, ImVec2(0, rowH));
+  const ImVec2 a = ImGui::GetItemRectMin(), b = ImGui::GetItemRectMax();
+  ImDrawList* d = ImGui::GetWindowDrawList();
+  const float icon = 12.0f;
+  MatIcon(d, ImVec2(a.x + 3, a.y + std::floor((rowH - icon) * 0.5f)), icon, s, id);
+  const std::string lab = MatLabel(s, id);
+  const float ty = a.y + std::floor((rowH - ImGui::GetTextLineHeight()) * 0.5f);
+  d->PushClipRect(ImVec2(a.x + icon + 7, a.y), b, true);
+  d->AddText(ImVec2(a.x + icon + 8, ty),
+             selected ? ui::ColGoldPale() : ui::ColParch(), lab.c_str());
+  d->PopClipRect();
+  if (selected) d->AddRect(a, b, ui::ColGold());
+  if (ImGui::IsItemHovered(ImGuiHoveredFlags_DelayShort)) MatTooltip(s, id);
+  ImGui::PopID();
+  return hit;
+}
+
+// THE MATERIAL PICKER. `ids` is the candidate list (every material for the
+// brush; only what the vessel holds for a flask or a pouch). One column per
+// class present — solids / powders / liquids / gases — each scrolling on its
+// own, with a search box over all of them. Returns true when `selected`
+// changed.
+bool MaterialPicker(const UIState& s, const char* id, const std::vector<int>& ids,
+                    int& selected, char* search, size_t searchN,
+                    float maxH = 300.0f) {
+  bool changed = false;
+  ImGui::PushID(id);
+  ImGui::SetNextItemWidth(-FLT_MIN);
+  ImGui::InputTextWithHint("##search", "search...", search, searchN);
+  std::string q = search;
+  for (char& c : q) c = (char)std::tolower((unsigned char)c);
+  std::replace(q.begin(), q.end(), '_', ' ');
+
+  std::vector<int> cols[4];
+  for (int m : ids) {
+    if (m <= 0 || m >= (int)s.materialNames.size()) continue;
+    if (!q.empty()) {
+      std::string l = MatLabel(s, m);
+      for (char& c : l) c = (char)std::tolower((unsigned char)c);
+      if (l.find(q) == std::string::npos) continue;
+    }
+    cols[MatClass(s, m) & 3].push_back(m);
+  }
+  // Solids by group, then id (id order is roughly "most basic first").
+  std::stable_sort(cols[0].begin(), cols[0].end(), [&](int a, int b) {
+    return SolidGroup(MatTags(s, a)) < SolidGroup(MatTags(s, b));
+  });
+
+  int nCols = 0, maxRows = 0;
+  for (int c = 0; c < 4; c++) {
+    if (cols[c].empty()) continue;
+    nCols++;
+    int rows = (int)cols[c].size();
+    if (c == 0 && q.empty()) {
+      int last = -1;
+      for (int m : cols[0]) {
+        const int g = SolidGroup(MatTags(s, m));
+        if (g != last) rows++;
+        last = g;
+      }
+    }
+    maxRows = std::max(maxRows, rows);
+  }
+  if (nCols == 0) {
+    ImGui::TextDisabled(ids.empty() ? "nothing to pick" : "nothing matches");
+    ImGui::PopID();
+    return false;
+  }
+  const float rowH = ImGui::GetTextLineHeight() + 4.0f;
+  const float rowStep = rowH + ImGui::GetStyle().ItemSpacing.y;
+  const float h = std::min(maxH, maxRows * rowStep + 10.0f);
+
+  ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(4, 1));
+  if (ImGui::BeginTable("##cols", nCols,
+                        ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchSame)) {
+    for (int c = 0; c < 4; c++) {
+      if (cols[c].empty()) continue;
+      ImGui::TableNextColumn();
+      ImGui::TextColored(V4(ClassColor(c)), "%s", kClassName[c]);
+      ImGui::SameLine();
+      ImGui::TextDisabled("%d", (int)cols[c].size());
+      const ImVec2 a = ImGui::GetCursorScreenPos();
+      ImGui::GetWindowDrawList()->AddLine(
+          a, ImVec2(a.x + ImGui::GetContentRegionAvail().x, a.y), ClassColor(c), 2.0f);
+      ImGui::Dummy(ImVec2(0, 2));
+    }
+    ImGui::TableNextRow();
+    for (int c = 0; c < 4; c++) {
+      if (cols[c].empty()) continue;
+      ImGui::TableNextColumn();
+      ImGui::PushID(c);
+      ImGui::BeginChild("##col", ImVec2(0, h));
+      int last = -1;
+      for (int m : cols[c]) {
+        if (c == 0 && q.empty()) {
+          const int g = SolidGroup(MatTags(s, m));
+          if (g != last) {
+            if (last != -1) ImGui::Dummy(ImVec2(0, 3));
+            ImGui::TextDisabled("%s", kSolidGroup[g]);
+            last = g;
+          }
+        }
+        if (MatRow(s, m, m == selected, rowH) && m != selected) {
+          selected = m;
+          changed = true;
+        }
+      }
+      ImGui::EndChild();
+      ImGui::PopID();
+    }
+    ImGui::EndTable();
+  }
+  ImGui::PopStyleVar();
+  ImGui::PopID();
+  return changed;
+}
+
+// The "this is what you have" line over a picker: a big icon and the name.
+void CurrentMaterial(const UIState& s, int id, const char* what) {
+  const ImVec2 p = ImGui::GetCursorScreenPos();
+  MatIcon(ImGui::GetWindowDrawList(), ImVec2(p.x + 1, p.y + 1), 26.0f, s, id);
+  ImGui::Dummy(ImVec2(28, 28));
+  ImGui::SameLine();
+  ImGui::BeginGroup();
+  ImGui::TextDisabled("%s", what);
+  ImGui::TextColored(V4(ui::ColGoldPale()), "%s", MatLabel(s, id).c_str());
+  ImGui::SameLine();
+  ImGui::TextColored(V4(ClassColor(MatClass(s, id))), "%s", kClassWord[MatClass(s, id) & 3]);
+  ImGui::EndGroup();
+}
+
+int MatIdByName(const UIState& s, const std::string& name) {
+  for (int i = 0; i < (int)s.materialNames.size(); i++)
+    if (s.materialNames[i] == name) return i;
+  return -1;
+}
+
+// A list of names as a short scrolling list of selectables (a combo hides
+// what the choices are until clicked; a list shows them).
+bool PickList(const char* id, const std::vector<std::string>& names, int& pick,
+              int visibleRows = 6) {
+  bool changed = false;
+  const float rowH = ImGui::GetTextLineHeightWithSpacing();
+  const int rows = std::min((int)names.size(), visibleRows);
+  ImGui::BeginChild(id, ImVec2(0, rows * rowH + 8), ImGuiChildFlags_Borders);
+  for (int i = 0; i < (int)names.size(); i++) {
+    ImGui::PushID(i);
+    if (ImGui::Selectable(names[i].c_str(), i == pick)) {
+      changed = i != pick;
+      pick = i;
+    }
+    ImGui::PopID();
+  }
+  ImGui::EndChild();
+  return changed;
+}
+
+bool NameCombo(const char* label, const std::vector<std::string>& names, int& pick) {
+  if (names.empty()) return false;
+  if (pick < 0 || pick >= (int)names.size()) pick = 0;
+  bool changed = false;
+  if (ImGui::BeginCombo(label, names[pick].c_str(), ImGuiComboFlags_HeightLarge)) {
+    for (int i = 0; i < (int)names.size(); i++) {
+      ImGui::PushID(i);
+      if (ImGui::Selectable(names[i].c_str(), i == pick)) {
+        changed = i != pick;
+        pick = i;
+      }
+      ImGui::PopID();
+    }
+    ImGui::EndCombo();
+  }
+  return changed;
+}
+
+// Right-aligned grey key hint on the current line.
+void KeyHint(const char* text) {
+  const float w = ImGui::CalcTextSize(text).x;
+  ImGui::SameLine();
+  const float avail = ImGui::GetContentRegionAvail().x;
+  if (avail > w) ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - w);
+  ImGui::TextDisabled("%s", text);
+}
+
+}  // namespace
+
+// ---- page: Paint -----------------------------------------------------------
+void Overlay::DrawDevPaint(UIState& s) {
+  if (!s.devControls) {
+    ImGui::TextColored(V4(ui::ColEmber()), "Play mode: tools are inactive.");
+    if (ImGui::Button("switch to dev controls (F2)")) s.devControls = true;
+    ImGui::Spacing();
+  }
+  if (Section("Tool")) {
+    struct T { const char* label; int tool; const char* tip; };
+    static const T kTools[] = {
+        {"Brush", UIState::kToolBrush, "LMB paints the material below, RMB erases"},
+        {"Laser", UIState::kToolLaser, "hold LMB (or F): melts what it hits, cuts bodies"},
+        {"Prefab", UIState::kToolPrefab, "LMB places the prefab below; T rotates, O cycles"},
+        {"MPM fluid", UIState::kToolFluid, "hold LMB: pour particle fluid; U clears"},
+        {"Mob", UIState::kToolMob, "LMB (or M) places the mob def picked on the Spawn page"},
+        {"Hands", UIState::kToolMelee, "your hands / the held item: guard, then flick to cut"},
+    };
+    const float w = CellWidth(3);
+    for (int i = 0; i < 6; i++) {
+      if (i % 3) ImGui::SameLine();
+      // "##tool": "Brush" / "Prefab" / "MPM fluid" are also section titles.
+      if (ToggleButton((std::string(kTools[i].label) + "##tool").c_str(),
+                       s.tool == kTools[i].tool, w, 26))
+        s.tool = kTools[i].tool;
+      ImGui::SetItemTooltip("%s", kTools[i].tip);
+    }
+    ImGui::TextDisabled("Tab cycles tools");
+  }
+
+  if (s.tool == UIState::kToolBrush || s.tool == UIState::kToolLaser ||
+      s.tool == UIState::kToolMelee || s.tool == UIState::kToolMob) {
+    if (Section("Brush")) {
+      ImGui::SetNextItemWidth(-90);
+      ImGui::SliderInt("radius", &s.brushRadius, 1, 7);
+      KeyHint("[ ]");
+      ImGui::SetNextItemWidth(-90);
+      ImGui::SliderInt("grain", &s.brushGrain, 0, 8, s.brushGrain == 0 ? "mixed" : "%d/8");
+      ImGui::SetItemTooltip("Powder grain size in eighths of a cell. 0 = mixed grains.");
+    }
+    if (Section("Material")) {
+      CurrentMaterial(s, s.brushMaterial, "painting with");
+      // Keys 1-8 and the last few picks, as one-click icons.
+      static int recent[8] = {};
+      auto remember = [&](int id) {
+        int k = 0;
+        while (k < 7 && recent[k] != id) k++;
+        for (; k > 0; k--) recent[k] = recent[k - 1];
+        recent[0] = id;
+      };
+      auto iconRow = [&](const char* label, const int* ids, int n, bool numbered) {
+        ImGui::TextDisabled("%s", label);
+        for (int i = 0; i < n; i++) {
+          const int m = ids[i];
+          if (m <= 0 || m >= (int)s.materialNames.size()) continue;
+          ImGui::SameLine();
+          ImGui::PushID(i);
+          ImGui::PushID(label);
+          const ImVec2 p = ImGui::GetCursorScreenPos();
+          if (ImGui::InvisibleButton("##q", ImVec2(22, 22))) {
+            s.brushMaterial = m;
+            remember(m);
+          }
+          ImDrawList* d = ImGui::GetWindowDrawList();
+          MatIcon(d, ImVec2(p.x + 2, p.y + 2), 18.0f, s, m);
+          if (m == s.brushMaterial)
+            d->AddRect(p, ImVec2(p.x + 22, p.y + 22), ui::ColGold(), 0, 0, 2.0f);
+          if (numbered) {
+            char k[4];
+            std::snprintf(k, sizeof k, "%d", i + 1);
+            ui::ShadowText(d, ImVec2(p.x + 13, p.y + 9), ui::ColParch(), k);
+          }
+          if (ImGui::IsItemHovered()) MatTooltip(s, m);
+          ImGui::PopID();
+          ImGui::PopID();
+        }
+      };
+      static const int kKeys[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+      iconRow("keys ", kKeys, 8, true);
+      if (recent[0] > 0) iconRow("recent", recent, 8, false);
+      ImGui::Spacing();
+      std::vector<int> all;
+      for (int i = 1; i < (int)s.materialNames.size(); i++) all.push_back(i);
+      static char search[64] = "";
+      if (MaterialPicker(s, "brushmat", all, s.brushMaterial, search, sizeof search, 340.0f))
+        remember(s.brushMaterial);
+    }
+  }
+
+  if (s.tool == UIState::kToolPrefab && Section("Prefab")) {
+    if (s.prefabNames.empty()) {
+      ImGui::TextDisabled("no prefabs (assets/prefabs/*.vox)");
+    } else {
+      if (s.prefabSelected >= (int)s.prefabNames.size()) s.prefabSelected = 0;
+      PickList("##prefabs", s.prefabNames, s.prefabSelected, 10);
+      ImGui::Text("rotation %d\xc2\xb0", s.prefabRot * 90);
+      ImGui::SameLine();
+      if (ImGui::Button("rotate (T)")) s.prefabRot = (s.prefabRot + 1) & 3;
+      ImGui::SameLine();
+      ImGui::Checkbox("overwrite", &s.prefabOverwrite);
+      ImGui::SetItemTooltip("off = fill air only");
+      if (s.prefabPending > 0)
+        ImGui::Text("placing... %u voxels pending", s.prefabPending);
+      ImGui::TextDisabled("LMB place  T rotate  O cycle");
+    }
+  }
+
+  if (s.tool == UIState::kToolFluid && Section("MPM fluid")) {
+    static const char* kPour[4] = {"water", "oil", "acid", "blood"};
+    const float w = CellWidth(4);
+    for (int k = 0; k < 4; k++) {
+      if (k) ImGui::SameLine();
+      ImGui::PushID(k);
+      const ImVec2 p = ImGui::GetCursorScreenPos();
+      if (ToggleButton("##pour", s.fluidPour == k, w, 26)) s.fluidPour = k;
+      const int m = MatIdByName(s, kPour[k]);
+      ImDrawList* d = ImGui::GetWindowDrawList();
+      if (m > 0) MatIcon(d, ImVec2(p.x + 6, p.y + 6), 14.0f, s, m);
+      d->AddText(ImVec2(p.x + 26, p.y + 6),
+                 s.fluidPour == k ? ui::ColInk() : ui::ColParch(), kPour[k]);
+      ImGui::SetItemTooltip("key %d", k + 1);
+      ImGui::PopID();
+    }
+    ImGui::Text("particles %u / 262144", s.fluidCount);
+    ImGui::SameLine();
+    if (ImGui::Button("clear (U)")) s.clearFluid = true;
+    if (ImGui::Button("fluid tuning window...")) s.fluidWindowOpen = !s.fluidWindowOpen;
+  }
+  if (s.tool == UIState::kToolMelee) {
+    ImGui::TextDisabled("hold LMB to guard, then FLICK the mouse to cut");
+  }
+}
+
+// ---- page: Spawn -----------------------------------------------------------
+void Overlay::DrawDevSpawn(UIState& s) {
+  // ---- a filled vessel, into your own inventory ----
+  // Pickers mirrored by main.cpp (UIState::giveVesselNames); the material
+  // columns are only what THIS vessel can hold, so a pouch never offers water
+  // and a flask never offers sand.
+  if (!s.giveVesselNames.empty() && Section("Filled vessel -> your pack")) {
+    if (s.giveVesselPick < 0 || s.giveVesselPick >= (int)s.giveVesselNames.size())
+      s.giveVesselPick = 0;
+    const int n = (int)s.giveVesselNames.size();
+    const int perRow = std::min(n, 4);
+    const float w = CellWidth(perRow);
+    for (int i = 0; i < n; i++) {
+      if (i % perRow) ImGui::SameLine();
+      ImGui::PushID(i);
+      if (ToggleButton(s.giveVesselNames[i].c_str(), i == s.giveVesselPick, w, 24) &&
+          i != s.giveVesselPick) {
+        s.giveVesselPick = i;
+        s.giveMatPick = 0;
+      }
+      ImGui::PopID();
+    }
+    const std::vector<std::string>* names =
+        s.giveVesselPick < (int)s.giveVesselMats.size()
+            ? &s.giveVesselMats[s.giveVesselPick] : nullptr;
+    if (names && !names->empty()) {
+      if (s.giveMatPick < 0 || s.giveMatPick >= (int)names->size()) s.giveMatPick = 0;
+      std::vector<int> ids;
+      ids.reserve(names->size());
+      for (const std::string& nm : *names) ids.push_back(MatIdByName(s, nm));
+      int sel = ids[s.giveMatPick];
+      CurrentMaterial(s, sel, "filled with");
+      ImGui::SameLine();
+      ImGui::SetCursorPosX(ImGui::GetCursorPosX() +
+                           std::max(0.0f, ImGui::GetContentRegionAvail().x - 110));
+      if (ToggleButton("GIVE (full)", true, 110, 28)) s.giveVessel = true;
+      static char search[64] = "";
+      if (MaterialPicker(s, "vesselmat", ids, sel, search, sizeof search, 240.0f))
+        for (int i = 0; i < (int)ids.size(); i++)
+          if (ids[i] == sel) s.giveMatPick = i;
+      if (!s.giveVesselStatus.empty()) ImGui::TextDisabled("%s", s.giveVesselStatus.c_str());
+    } else {
+      ImGui::TextDisabled("this vessel holds no loaded material");
+    }
+  }
+
+  // ---- creatures (the old NPC AI window's Spawn tab) ----
+  if (Section("Creatures")) {
+    ImGui::TextDisabled("spawn a few metres ahead (or at the crosshair)");
+    if (!s.aiCreatureNames.empty()) {
+      if (s.aiCreaturePick >= (int)s.aiCreatureNames.size()) s.aiCreaturePick = 0;
+      Caption("body");
+      PickList("##creatures", s.aiCreatureNames, s.aiCreaturePick, 5);
+    }
+    // One box per published effect: MobSystem::DefWithEffects prefers an
+    // authored combination and composes one when there is none.
+    if (!s.aiEffectNames.empty()) {
+      Caption("afflicted with");
+      const float colW = CellWidth(2) + ImGui::GetStyle().ItemSpacing.x;
+      for (int i = 0; i < (int)s.aiEffectNames.size() && i < (int)s.aiEffectOn.size(); i++) {
+        if (i & 1) ImGui::SameLine(ImGui::GetCursorStartPos().x + colW);
+        ImGui::PushID(i);
+        bool on = s.aiEffectOn[i] != 0;
+        if (ImGui::Checkbox(s.aiEffectNames[i].c_str(), &on)) s.aiEffectOn[i] = on ? 1 : 0;
+        if (s.aiEffectNames[i] == "zombie")
+          ImGui::SetItemTooltip("walks slower, comes apart when cut,\nspawns already bitten, bites back");
+        ImGui::PopID();
+      }
+    }
+    ImGui::SetNextItemWidth(-90);
+    NameCombo("weapon##ai", s.aiWeaponNames, s.aiWeaponPick);
+    ImGui::SetItemTooltip(
+        "The blade decides the wound: reach, cut depth and heft all come off\n"
+        "its own art. \"fists\" is a weapon: a bare hand bruises and never\n"
+        "severs, and a mace beats plate in where a sword skates off it.");
+    {
+      static const char* kOutfits[] = {"nothing", "random clothes", "full plate",
+                                       "custom pieces"};
+      ImGui::SetNextItemWidth(-90);
+      ImGui::Combo("outfit##ai", &s.aiOutfit, kOutfits, 4);
+      ImGui::SetItemTooltip(
+          "random clothes: shirt, legs and shoes from the dyeable set\n"
+          "full plate: every slot's iron_* piece\n"
+          "A blade wears through armour in holes; it leaves with the limb.");
+      if (s.aiOutfit == 3) {
+        const int n = (int)std::min(s.aiWearNames.size(), s.aiWearSlotLabels.size());
+        if ((int)s.aiWearPick.size() < n) s.aiWearPick.resize(n, 0);
+        for (int i = 0; i < n; i++) {
+          if (s.aiWearNames[i].size() <= 1) continue;   // nothing fits this slot
+          ImGui::PushID(i);
+          ImGui::SetNextItemWidth(-90);
+          NameCombo((s.aiWearSlotLabels[i] + "##aiwear").c_str(), s.aiWearNames[i],
+                    s.aiWearPick[i]);
+          ImGui::PopID();
+        }
+      }
+    }
+    ImGui::Spacing();
+    Caption("spawn");
+    {
+      const float w = CellWidth(2);
+      if (ToggleButton("random human##ai", true, w, 26)) s.aiSpawnRandom = true;
+      ImGui::SetItemTooltip("any sex, build, face, hair, colouring, weapon,\n"
+                            "outfit and fighting style (only the affliction\n"
+                            "boxes above are used)");
+      ImGui::SameLine();
+      if (ToggleButton("as authored##ai", true, w, 26)) s.aiSpawnOwn = true;
+      ImGui::SetItemTooltip("the picked body with its own JSON behaviour\n(zombie -> bites)");
+    }
+    ImGui::TextDisabled("...or override the behaviour with a preset:");
+    {
+      struct P { const char* label; const char* profile; const char* tip; bool* flag; };
+      const P kPresets[] = {
+          {"dummy", nullptr, "blind, never moves, never turns", &s.aiSpawnDummy},
+          {"static", nullptr, "static swordsman: turns to face, swings in reach",
+           &s.aiSpawnStatic},
+          {"duelist", nullptr, "paths in, holds range, circles", &s.aiSpawnDuelist},
+          {"swordsman", "swordsman", "all-rounder: guards, ripostes, adapts", nullptr},
+          {"fencer", "fencer", "kites at the edge of your reach, dodges", nullptr},
+          {"brawler", "brawler", "rushes inside, weaves, punishes whiffs", nullptr},
+          {"berserker", "berserker", "relentless; worse when hurt", nullptr},
+          {"guardian", "guardian", "turtles, parries, counters", nullptr},
+      };
+      const float w = CellWidth(4);
+      int k = 0;
+      for (const P& p : kPresets) {
+        if (k++ % 4) ImGui::SameLine();
+        if (ImGui::Button((std::string(p.label) + "##aipreset").c_str(), ImVec2(w, 0))) {
+          if (p.flag) *p.flag = true;
+          else s.aiSpawnProfile = p.profile;
+        }
+        ImGui::SetItemTooltip("%s", p.tip);
+      }
+    }
+    ImGui::Spacing();
+    if (ImGui::TreeNode("place any mob def with the Mob tool")) {
+      if (s.mobNames.empty()) {
+        ImGui::TextDisabled("no mobs (assets/mobs/*.vox + .json)");
+      } else {
+        if (s.mobSelected >= (int)s.mobNames.size()) s.mobSelected = 0;
+        if (PickList("##mobdefs", s.mobNames, s.mobSelected, 6)) s.tool = UIState::kToolMob;
+        if (ToggleButton("use Mob tool", s.tool == UIState::kToolMob))
+          s.tool = UIState::kToolMob;
+        ImGui::SameLine();
+        ImGui::TextDisabled("LMB (or M) at crosshair");
+      }
+      ImGui::TreePop();
+    }
+  }
+
+  // ---- clothes (game/dye.h) ----
+  // The art is a greyscale weave; the colour is applied at shade time, so a
+  // dye is PAINT, not a material — dyed linen burns and tears like undyed.
+  if (Section("Clothes (dyed)", false)) {
+    auto combo = [&](const char* label, const std::vector<std::string>& names, int& pick) {
+      if (names.empty()) {
+        ImGui::TextDisabled("%s: no dyeable pieces in items.json", label);
+        return;
+      }
+      ImGui::SetNextItemWidth(-90);
+      NameCombo((std::string(label) + "##wardrobe").c_str(), names, pick);
+    };
+    combo("shirt", s.wardrobeShirts, s.wardrobeShirtPick);
+    combo("legs", s.wardrobeLegs, s.wardrobeLegsPick);
+    combo("feet", s.wardrobeFeet, s.wardrobeFeetPick);
+    ImGui::SetNextItemWidth(std::min(200.0f, ImGui::GetContentRegionAvail().x));
+    ImGui::ColorPicker3("##wardrobedye", s.wardrobeColor,
+                        ImGuiColorEditFlags_PickerHueWheel |
+                            ImGuiColorEditFlags_NoSidePreview |
+                            ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel);
+    ImGui::ColorButton("##wardrobeswatch",
+                       ImVec4(s.wardrobeColor[0], s.wardrobeColor[1], s.wardrobeColor[2], 1.0f),
+                       0, ImVec2(24, 24));
+    ImGui::SameLine();
+    ImGui::TextUnformatted(s.wardrobeColorName.empty() ? "(undyed)"
+                                                       : s.wardrobeColorName.c_str());
+    ImGui::SameLine();
+    if (ImGui::Button("random##wardrobe")) s.wardrobeRandomColor = true;
+    const float w = CellWidth(3);
+    if (ImGui::Button("into pack##wardrobe", ImVec2(w, 0))) s.wardrobeSpawnSet = true;
+    ImGui::SetItemTooltip("hotbar, else the bag");
+    ImGui::SameLine();
+    if (ImGui::Button("put it on##wardrobe", ImVec2(w, 0))) s.wardrobeWearSet = true;
+    ImGui::SetItemTooltip("straight into the equip slots");
+    ImGui::SameLine();
+    if (ImGui::Button("re-dye worn##wardrobe", ImVec2(w, 0))) s.wardrobeDyeWorn = true;
+    ImGui::SetItemTooltip("every dyeable piece on the body");
+    if (!s.wardrobeStatus.empty()) ImGui::TextWrapped("%s", s.wardrobeStatus.c_str());
+  }
+
+  // ---- objects and effects ----
+  if (Section("Objects & effects")) {
+    const float w = CellWidth(2);
+    if (ImGui::Button("rolling sphere (K)", ImVec2(w, 0))) s.spawnSphere = true;
+    ImGui::SetItemTooltip("a rigidbody ball of the Paint page's material: its mass\n"
+                          "(and how far you can shove it) comes from that material");
+    ImGui::SameLine();
+    if (ImGui::Button("detonate at crosshair (X)", ImVec2(w, 0))) s.pendingDetonate = true;
+    ImGui::TextDisabled("G throws a grenade");
+
+    // The same parametric object a `gust` spell emits, on the same list,
+    // through the same budget — there is no dev-only wind path.
+    ImGui::Spacing();
+    Caption("wind primitive");
+    ImGui::SameLine();
+    ImGui::TextDisabled("%d live, waking %d chunks", s.windPrims, s.windWakeChunks);
+    static const char* kinds[] = {"cone (fan / jet)", "burst (blast or vacuum)",
+                                  "vortex (tornado)"};
+    ImGui::SetNextItemWidth(-90);
+    ImGui::Combo("kind", &s.windFanKind, kinds, 3);
+    ImGui::SetNextItemWidth(-90);
+    EditableSliderFloat("speed", &s.windFanSpeed, -40.0f, 40.0f, "%.0f m/s");
+    ImGui::SetItemTooltip("Core speed at the mouth. NEGATIVE turns a burst into a\n"
+                          "vacuum and a cone into a draw.");
+    ImGui::SetNextItemWidth(-90);
+    EditableSliderInt("radius", &s.windFanRadius, 1, 64);
+    ImGui::SetNextItemWidth(-90);
+    EditableSliderInt("reach", &s.windFanReach, 1, 128);
+    ImGui::Checkbox("may move SETTLED powder", &s.windFanEntrain);
+    ImGui::SetItemTooltip(
+        "OFF: a fan only steers what is already moving and costs nothing\n"
+        "when the world around it is asleep. ON: it may pull RESTING powder\n"
+        "loose in its footprint (blows a dune flat); its chunks are charged\n"
+        "against sim.windWakeChunks.");
+    if (ImGui::Button("place where I'm looking", ImVec2(w, 0))) s.placeWindFan = true;
+    ImGui::SameLine();
+    if (ImGui::Button("clear all##fans", ImVec2(w, 0))) s.clearWindFans = true;
+    if (s.windPrimsDropped > 0)
+      ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "%d refused (world cap is %d)",
+                         s.windPrimsDropped, (int)kWindPrimCap);
+  }
+
+  if (Section("Cleanup")) {
+    const float w = CellWidth(2);
+    if (ImGui::Button("kill all spawned##ai", ImVec2(w, 0))) s.aiKillSpawned = true;
+    ImGui::SameLine();
+    if (ImGui::Button("ragdoll all spawned##ai", ImVec2(w, 0))) s.aiRagdollSpawned = true;
+    if (ImGui::Button("clear MPM fluid (U)", ImVec2(w, 0))) s.clearFluid = true;
+    ImGui::SameLine();
+    if (ImGui::Button("clear wind fans", ImVec2(w, 0))) s.clearWindFans = true;
+  }
+}
+
+// ---- page: World -----------------------------------------------------------
+void Overlay::DrawDevWorld(UIState& s) {
+  if (Section("Time")) {
+    // Scales the CELESTIAL clock (sim/world.h CelestialClock); the sim still
+    // ticks at 30 Hz. Anything but 1x changes the world hash.
+    float t = std::cbrt(s.timeScale / 100.0f);
+    ImGui::SetNextItemWidth(-90);
+    if (ImGui::SliderFloat("sky speed", &t, -1.0f, 1.0f, "")) {
+      s.timeScale = t * t * t * 100.0f;
+      if (std::abs(s.timeScale) < 0.05f) s.timeScale = 0.0f;
+    }
+    ImGui::SetItemTooltip(
+        "Speed of the CELESTIAL clock: the sun, both moons, the seasons, and\n"
+        "the daylight-gated reactions all run at this multiple. The simulation\n"
+        "itself still ticks at 30 Hz - sand does not fall faster.\n"
+        "0 freezes the sky, negative runs it backwards.\n"
+        "Anything but 1x changes the world hash on purpose.");
+    ImGui::SameLine();
+    ImGui::Text("%.2fx", s.timeScale);
+    struct B { const char* l; float v; };
+    static const B kB[] = {{"1x", 1.0f}, {"10x", 10.0f}, {"100x", 100.0f},
+                           {"freeze", 0.0f}, {"reverse", -1.0f}};
+    const float w = CellWidth(5);
+    for (int i = 0; i < 5; i++) {
+      if (i) ImGui::SameLine();
+      if (ToggleButton(kB[i].l, s.timeScale == kB[i].v, w)) s.timeScale = kB[i].v;
+    }
+    auto phaseName = [](float p) {
+      if (p < 0.06f || p > 0.94f) return "new";
+      if (p < 0.19f) return "cresc";
+      if (p < 0.31f) return "quarter";
+      if (p < 0.44f) return "gibbous";
+      if (p < 0.56f) return "FULL";
+      if (p < 0.69f) return "gibbous";
+      if (p < 0.81f) return "quarter";
+      return "cresc";
+    };
+    const int hh = (int)(s.skyDayT * 24.0f) % 24;
+    const int mm = (int)(s.skyDayT * 1440.0f) % 60;
+    ImGui::TextDisabled("%02d:%02d  sun %+.0f\xc2\xb0  year %.0f%%", hh, mm,
+                        s.skySunElevDeg, s.skyYearT * 100.0f);
+    ImGui::TextDisabled("moon A %s (%.2f)   moon B %s (%.2f)", phaseName(s.skyMoonPhase),
+                        s.skyMoonPhase, phaseName(s.skyMoon2Phase), s.skyMoon2Phase);
+    if (s.skySolarEclipse > 0.995f)
+      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "*** TOTAL SOLAR ECLIPSE ***");
+    else if (s.skySolarEclipse > 0.0f)
+      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f), "solar eclipse: %.0f%% covered",
+                         s.skySolarEclipse * 100.0f);
+  }
+
+  // ---- the sky's weather (src/sim/weather.h) ----
+  // Render-only: the world hash never sees the weather (except "rain touches
+  // world"), so nothing here needs a shader reload.
+  if (Section("Weather")) {
+    const std::vector<weather::Preset>& ps = weather::Presets().Presets();
+    const std::string cur = weather::Override();
+    const weather::State& w = weather::Last();
+    {
+      const float bw = CellWidth(4);
+      if (ToggleButton("auto##wx", cur.empty(), bw)) weather::SetOverride("");
+      ImGui::SetItemTooltip("hand the sky back to the automatic cycle\n"
+                            "(or weather.preset when that is off)");
+      int n = 1;
+      for (const weather::Preset& p : ps) {
+        if (n++ % 4 != 0) ImGui::SameLine();
+        const bool on = cur == p.name;
+        if (ToggleButton((p.label + "##wxb" + p.name).c_str(), on, bw))
+          weather::SetOverride(on ? "" : p.name);
+      }
+    }
+    if (w.fromName == w.toName)
+      ImGui::Text("now: %s", w.fromName.c_str());
+    else
+      ImGui::Text("now: %s -> %s (%.0f%%)", w.fromName.c_str(), w.toName.c_str(),
+                  w.blend * 100.0f);
+    ImGui::TextDisabled("cover %.2f  rain %.2f  wet %.2f  overcast %.2f%s", w.mix.coverage,
+                        w.mix.precip, w.wetness, w.overcast, w.flash > 0.05f ? "  *flash*" : "");
+
+    Tuning t = CurrentTuning();
+    Tuning::Weather& wt = t.weather;
+    bool changed = false;
+    changed |= ImGui::Checkbox("clouds##wx", &wt.clouds);
+    ImGui::SetItemTooltip("Master switch. Off records no cloud pass at all.");
+    ImGui::SameLine();
+    changed |= ImGui::Checkbox("automatic cycle##wx", &wt.autoCycle);
+    ImGui::SetItemTooltip("On: the sky walks the preset ladder by moisture on its own.\n"
+                          "Off: it holds weather.preset. A pin above overrides both.");
+    if (ImGui::TreeNode("weather knobs")) {
+      changed |= EditableSliderFloat("cycle speed##wx", &wt.cycleSpeed, 0.0f, 50.0f, "%.1fx");
+      changed |= EditableSliderFloat("coverage bias##wx", &wt.coverageBias, -1.0f, 1.0f, "%+.2f");
+      ImGui::SetItemTooltip("Added to every preset's coverage: cloudier / clearer.");
+      changed |= EditableSliderFloat("raininess x##wx", &wt.precipScale, 0.0f, 4.0f, "%.2fx");
+      changed |= ImGui::Checkbox("rain touches world##wx", &wt.rainTouchesWorld);
+      ImGui::SetItemTooltip("Rain douses exposed fire and damps ignition (moves the world hash).");
+      changed |= EditableSliderFloat("rain ignition damp##wx", &wt.rainIgniteDamp, 0.0f, 1.0f, "%.2f");
+      {
+        const uint32_t rw = weather::LastSimRainWord();
+        ImGui::TextDisabled("sim: rain %u  wet %u /255", rw & 0xFFu, (rw >> 16) & 0xFFu);
+      }
+      changed |= EditableSliderFloat("ease (s)##wx", &wt.transitionSeconds, 0.0f, 60.0f, "%.0f s");
+      if (ImGui::SmallButton("reroll weather##wx")) {
+        wt.seedOffset = (wt.seedOffset + 1) % 1000;
+        changed = true;
+      }
+      ImGui::TreePop();
+    }
+    if (changed) SetCurrentTuning(t);
+  }
+
+  // ---- wind force multipliers, one per tier ----
+  // Live: these ride TickParams. Split by tier because that is how the engine
+  // is split — the CA steers what is already moving, particles carry the
+  // violence — and pinning one to 0 shows which tier an effect comes from.
+  if (Section("Wind")) {
+    ImGui::SetNextItemWidth(-110);
+    if (EditableSliderFloat("x voxels", &s.windGasScale, 0.0f, 16.0f, "%.2fx"))
+      s.windTuningDirty = true;
+    ImGui::SetItemTooltip(
+        "How hard the wind pushes CA VOXELS - smoke, steam, fire, falling\n"
+        "powder. Scales the drift-bias PROBABILITY. SETTLED voxels are\n"
+        "untouched. 0 pins the CA tier still. Changes the world hash.");
+    ImGui::SetNextItemWidth(-110);
+    if (EditableSliderFloat("x particles", &s.windPartScale, 0.0f, 16.0f, "%.2fx"))
+      s.windTuningDirty = true;
+    ImGui::SetItemTooltip(
+        "How hard the wind pushes the PARTICLE tier - debris, spray, MPM\n"
+        "surface nodes. Scales the wind VELOCITY they are dragged toward.\n"
+        "0 pins the particle tier still. Changes the world hash.");
+    ImGui::SetNextItemWidth(-110);
+    if (EditableSliderFloat("fall onset", &s.windDragRef, 1.0f, 120.0f, "%.0f m/s"))
+      s.windTuningDirty = true;
+    ImGui::SetItemTooltip(
+        "The wind speed at which sim.windDrag counts in full; below it the\n"
+        "drag ramps down, so calm air is ballistic. LOW makes ordinary\n"
+        "weather floaty; HIGH means only a storm is felt.\n"
+        "Terminal fall at the default 6 m/s weather: 120 -> 6.0,\n"
+        "40 -> 5.7, 20 -> 2.9, 6 -> 0.86 vox/tick.");
+    ImGui::TextDisabled("wind primitives (fans, vortices): Spawn page");
+  }
+
+  if (Section("World file & reload")) {
+    const float w = CellWidth(2);
+    if (ImGui::Button("save world (F9)", ImVec2(w, 0))) s.saveWorld = true;
+    ImGui::SameLine();
+    if (ImGui::Button("load world (F10)", ImVec2(w, 0))) s.loadWorld = true;
+    if (ImGui::Button("reload shaders (F5)", ImVec2(w, 0))) s.reloadShaders = true;
+    ImGui::SameLine();
+    if (ImGui::Button("reload materials (R)", ImVec2(w, 0))) s.reloadMaterials = true;
+    if (ImGui::Button("reload environment + regen world (F7)", ImVec2(-FLT_MIN, 0)))
+      s.regenWorld = true;
+  }
+}
+
+// ---- page: View ------------------------------------------------------------
+void Overlay::DrawDevView(UIState& s) {
+  if (Section("Rendering")) {
+    ImGui::Checkbox("shadows", &s.shadows);
+    // Three radios: the arms are mutually exclusive. The metres come from
+    // tuning so the labels track the sliders the moment F5 lands.
+    const auto& rt = CurrentTuning().render;
+    char nearLbl[24], farLbl[24];
+    std::snprintf(nearLbl, sizeof nearLbl, "%.0f m", rt.shortRangeNearDist);
+    std::snprintf(farLbl, sizeof farLbl, "%.0f m", rt.shortRangeDist);
+    ImGui::TextUnformatted("short range");
+    ImGui::SameLine();
+    if (ImGui::RadioButton("off##sr", !s.shortRange)) s.shortRange = false;
+    ImGui::SameLine();
+    if (ImGui::RadioButton(nearLbl, s.shortRange && s.shortRangeNear)) {
+      s.shortRange = true;
+      s.shortRangeNear = true;
+    }
+    ImGui::SameLine();
+    if (ImGui::RadioButton(farLbl, s.shortRange && !s.shortRangeNear)) {
+      s.shortRange = true;
+      s.shortRangeNear = false;
+    }
+    ImGui::TextDisabled("draw distance %.0f m", s.renderRangeM);
+    ImGui::SetItemTooltip(
+        "Normally the far cascade's FILLED radius, so it dips while the\n"
+        "cascade refills after a teleport and climbs back when every level\n"
+        "has landed. On a short-range arm it is that arm's hard ceiling on\n"
+        "every ray - a PERF mode, not a fog filter. Shape it under Rendering:\n"
+        "shortRangeDist, shortRangeNearDist, shortRangeFogStart/Density.");
+  }
+  if (Section("Debug draw")) {
+    ImGui::Checkbox("collision boxes (F3)", &s.showCollisionBoxes);
+    ImGui::SetItemTooltip(
+        "Wireframes around every physics collider, from the actual Jolt shape:\n"
+        "green = avatar parts (a held item too), cyan = mob limbs,\n"
+        "yellow = loose debris. Drawn THROUGH walls on purpose.");
+    ImGui::Checkbox("active voxels", &s.showDirtyVoxels);
+    ImGui::SetItemTooltip("Red wireframe on every voxel the CA wrote this tick.\n"
+                          "Combine with F6 (dirty chunks) to see cause and effect.");
+    static constexpr const char* kFieldVizTip =
+        "An arrow per lattice point around you, coloured by speed.\n"
+        "WIND samples the same windAt() the grass sway does (full scale 24 m/s).\n"
+        "CURRENT samples the same currentAt() waves and floating debris use\n"
+        "(full scale 4 m/s); still water is honestly empty.\n"
+        "Spacing and radius: Wind tab and render.dbgCurrent* (F5).\n"
+        "F5 re-seeds this from wind.dbgWindField / render.dbgCurrentField.";
+    ImGui::TextUnformatted("vector field (F4)");
+    ImGui::SetItemTooltip("%s", kFieldVizTip);
+    ImGui::SameLine();
+    ImGui::RadioButton("off##fieldviz", &s.fieldViz, UIState::kFieldVizOff);
+    ImGui::SameLine();
+    ImGui::RadioButton("wind##fieldviz", &s.fieldViz, UIState::kFieldVizWind);
+    ImGui::SameLine();
+    ImGui::RadioButton("current##fieldviz", &s.fieldViz, UIState::kFieldVizCurrent);
+    ImGui::Checkbox("NPC AI viz (path / target / band)", &s.showAiDebug);
+    ImGui::Indent();
+    ImGui::Checkbox("...include the range-band ring", &s.showAiRing);
+    ImGui::Unindent();
+  }
+  if (Section("Player")) {
+    ImGui::Checkbox("fly (V)", &s.fly);
+    ImGui::SameLine();
+    if (ImGui::Button("ragdoll me")) s.ragdollMe = true;
+    ImGui::SetItemTooltip("go limp for ragdoll.devSeconds, then get back up");
+    ImGui::Text("pos %.0f %.0f %.0f  (%s)", s.playerPos[0], s.playerPos[1], s.playerPos[2],
+                s.fly ? "fly" : "walk");
+    const ImVec4 c = s.ledgeState == 2   ? ImVec4(0.35f, 1.0f, 0.45f, 1.0f)
+                     : s.ledgeState == 1 ? ImVec4(1.0f, 0.85f, 0.30f, 1.0f)
+                                         : ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
+    ImGui::TextColored(c, "ledge: %s", s.ledgeText.c_str());
+  }
+}
+
+// ---- page: Magic -----------------------------------------------------------
+void Overlay::DrawDevMagic(UIState& s) {
+  if (Section("Mana & health")) {
+    // The CROSSOVER: where the running cost stops coming out of mana and
+    // starts coming out of health, on one shared axis.
+    ImGui::Text("magic %s", s.magicMode ? "ON" : "off");
+    KeyHint("Z toggles");
+    {
+      const float w = ImGui::GetContentRegionAvail().x;
+      const float h = 14.0f;
+      ImVec2 p = ImGui::GetCursorScreenPos();
+      ImDrawList* d = ImGui::GetWindowDrawList();
+      const int32_t poolMax = s.manaMax > 0 ? s.manaMax : 1;
+      const int32_t span = poolMax + (s.health > 0 ? s.health : 0);
+      auto frac = [&](int32_t v) { return span > 0 ? (float)v / (float)span : 0.0f; };
+      d->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(28, 32, 46, 255));
+      const float manaEdge = p.x + w * frac(poolMax);
+      d->AddRectFilled(ImVec2(manaEdge, p.y), ImVec2(p.x + w, p.y + h), IM_COL32(52, 22, 24, 255));
+      d->AddRectFilled(p, ImVec2(p.x + w * frac(s.mana), p.y + h), IM_COL32(70, 130, 235, 255));
+      d->AddRectFilled(ImVec2(manaEdge, p.y), ImVec2(manaEdge + w * frac(s.health), p.y + h),
+                       IM_COL32(190, 60, 60, 255));
+      if (s.spellCost > 0) {
+        const int32_t fromMana = s.spellCost < s.mana ? s.spellCost : s.mana;
+        const int32_t fromHealth = s.spellCost - fromMana;
+        const float x0 = p.x + w * frac(s.mana - fromMana);
+        d->AddRectFilled(ImVec2(x0, p.y), ImVec2(p.x + w * frac(s.mana), p.y + h),
+                         IM_COL32(150, 200, 255, 255));
+        if (fromHealth > 0) {
+          const float hx = manaEdge + w * frac(fromHealth < s.health ? fromHealth : s.health);
+          d->AddRectFilled(ImVec2(manaEdge, p.y), ImVec2(hx, p.y + h), IM_COL32(255, 140, 60, 255));
+        }
+        d->AddLine(ImVec2(manaEdge, p.y - 2), ImVec2(manaEdge, p.y + h + 2),
+                   IM_COL32(255, 255, 255, 220), 2.0f);
+      }
+      ImGui::Dummy(ImVec2(w, h + 4));
+    }
+    ImGui::Text("mana %d/%d   health %d   cost %d%s", s.mana, s.manaMax, s.health, s.spellCost,
+                s.spellPriceUnknown ? " + ?" : "");
+    if (s.spellCost > 0 || s.spellPriceUnknown)
+      ImGui::TextDisabled("  word %d + tariff %d + carry %d%s", s.spellWord, s.spellTariff,
+                          s.spellCarry,
+                          s.spellPriceUnknown ? "   (anything: priced when it lands)" : "");
+    if (s.spellLastBillAge < 2.5f && s.spellLastBill > 0)
+      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "billed %d on resolve", s.spellLastBill);
+    if (s.spellCost > s.mana + s.health)
+      ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f), "FATAL - this will kill you");
+    else if (s.spellCost > s.mana)
+      ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f), "unstable - %d from your body",
+                         s.spellCost - s.mana);
+  }
+  // Requests only; main.cpp applies. ResolveCast adds mana + health in an
+  // int32, so the ceiling stays below overflow.
+  if (Section("Dev: mana pool", false)) {
+    constexpr int32_t kDevManaCeiling = 1 << 30;
+    if (s.devManaMaxEdit <= 0) s.devManaMaxEdit = s.manaPoolMax > 0 ? s.manaPoolMax : 100;
+    ImGui::SetNextItemWidth(140.0f);
+    int edit = s.devManaMaxEdit;
+    if (ImGui::InputInt("max", &edit, 100, 10000)) s.devManaMaxEdit = edit;
+    s.devManaMaxEdit = std::clamp(s.devManaMaxEdit, 1, kDevManaCeiling);
+    ImGui::SameLine();
+    if (ImGui::Button("apply max")) s.devManaMaxRequest = s.devManaMaxEdit;
+    ImGui::SameLine();
+    if (ImGui::Button("fill")) s.devManaFill = true;
+    // Presets apply AND fill: nobody sets 1e9 and then waits for regen.
+    struct Preset { const char* label; int32_t value; };
+    const Preset presets[] = {{"100", 100},      {"1k", 1000},        {"100k", 100000},
+                              {"10M", 10000000}, {"1G", 1000000000}, {"2^30", kDevManaCeiling}};
+    const float w = CellWidth(6);
+    for (size_t i = 0; i < sizeof(presets) / sizeof(presets[0]); i++) {
+      if (i > 0) ImGui::SameLine();
+      if (ImGui::Button(presets[i].label, ImVec2(w, 0))) {
+        s.devManaMaxEdit = presets[i].value;
+        s.devManaMaxRequest = presets[i].value;
+        s.devManaFill = true;
+      }
+    }
+    ImGui::Checkbox("infinite (refill to max every tick)", &s.devManaInfinite);
+  }
+  if (Section("Spell")) {
+    // THE BRACKET TEXT STAYS: it is what the oracle compares and what a tree
+    // is read off; the player-facing surface is the grimoire page's canvas.
+    if (!s.spellText.empty()) {
+      ImGui::TextWrapped("held: %s", s.spellText.c_str());
+      ImGui::TextDisabled("%s", s.spellVerdict.c_str());
+    } else {
+      ImGui::TextDisabled("held: (nothing)");
+      ImGui::TextDisabled("a number selects a bound spell, RMB casts it,");
+      ImGui::TextDisabled("Backspace clears");
+    }
+    if (!s.glyphSlots.empty()) {
+      for (int bank = 0; bank < 2; bank++) {
+        std::string strip = bank == 0 ? "1-0:   " : "S+1-0: ";
+        bool any = false;
+        for (size_t i = (size_t)bank * 10; i < s.glyphSlots.size() && i < (size_t)(bank + 1) * 10; i++) {
+          if (s.glyphSlots[i].empty()) continue;
+          any = true;
+          const bool page = i < s.glyphSlotKinds.size() && s.glyphSlotKinds[i] == 2;
+          const bool sel = (int)i == s.glyphSelected;
+          strip += (sel ? "*" : "") + std::to_string((i + 1) % 10) + ":" +
+                   (page ? "[" : "") + s.glyphSlots[i] + (page ? "]" : "") + "  ";
+        }
+        if (!any) continue;
+        if (s.glyphBankB == (bank == 1)) ImGui::TextWrapped("%s", strip.c_str());
+        else {
+          ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+          ImGui::TextWrapped("%s", strip.c_str());
+          ImGui::PopStyleColor();
+        }
+      }
+    }
+    if (s.spellNoteAge < 3.0f && !s.spellNote.empty())
+      ImGui::TextColored(ImVec4(0.9f, 0.85f, 0.5f, 1.0f), "%s", s.spellNote.c_str());
+  }
+  if (Section("Live effects")) {
+    if (!s.spellStatuses.empty()) {
+      ImGui::Text("sustaining (%d reserved, Delete drops the newest):", s.manaReserved);
+      for (const std::string& st : s.spellStatuses) ImGui::TextDisabled("  %s", st.c_str());
+    }
+    if (s.spellRefused > 0)
+      ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "ward refused %d", s.spellRefused);
+    ImGui::Text("projectiles %d", s.liveProjectiles);
+    if (s.spellOpsDropped > 0) {
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "  %d ops dropped", s.spellOpsDropped);
+    }
+    // `wake` is the rule-2 number: chunks held awake against sim.windWakeChunks.
+    ImGui::Text("wind primitives %d (wake %d chunks)", s.windPrims, s.windWakeChunks);
+    if (s.windPrimsDropped > 0) {
+      ImGui::SameLine();
+      ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "  %d refused (cap)", s.windPrimsDropped);
+    }
+  }
+}
+
+// ---- page: Debug -----------------------------------------------------------
+void Overlay::DrawDevDebug(UIState& s) {
+  if (Section("Stats")) {
+    ImGui::Text("%.0f fps  (%.1f ms avg, %.2f ms tick cpu)", s.fps, s.frameMs, s.tickCpuMs);
+    // `worst` is ONE frame of the last half second; p95/p99 are over ~512
+    // frames and say whether a stutter is systematic.
+    ImGui::Text("frame ms   p95 %.0f   p99 %.0f   worst %.0f", s.frameMsP95, s.frameMsP99,
+                s.frameMsWorst);
+    ImGui::Text("tick %u   active chunks %u / %u", s.tick, s.activeChunks, s.totalChunks);
+    ImGui::Text("voxels %.2f M   particles %u", s.voxelTotal / 1e6, s.particleCount);
+    ImGui::Text("hash %08x %s", s.worldHash, s.mirrorValid ? "" : "(mirror pending)");
+    ImGui::Text("debris bodies %u (%u awake)   mobs %u", s.bodyCount, s.activeBodyCount,
+                s.mobCount);
+  }
+  // The swing readout makes the input FALSIFIABLE: "the game misread my flick"
+  // vs "I misjudged the distance" is answered by the phase and the speed the
+  // state machine actually measured.
+  if (Section("Hotbar & swing")) {
+    std::string strip;
+    for (size_t i = 0; i < s.itemNames.size(); i++) {
+      if (s.itemNames[i].empty()) continue;
+      const bool sel = (int)i == s.itemSelected;
+      strip += (sel ? "[" : " ") + std::to_string((i + 1) % 10) + ":" + s.itemNames[i] +
+               (sel ? "] " : "  ");
+    }
+    if (!strip.empty()) ImGui::TextWrapped("%s", strip.c_str());
+    if (s.swingPhase && s.swingPhase[0]) {
+      ImGui::Text("swing %s", s.swingPhase);
+      ImGui::SameLine();
+      ImGui::TextDisabled("  mouse %.0f px/s", s.swingSpeed);
+      if (!s.swingStyle.empty()) ImGui::TextDisabled("%s", s.swingStyle.c_str());
+    } else {
+      ImGui::TextDisabled("no swing");
+    }
+  }
+  if (Section("NPC log", false)) {
+    ImGui::Text("attack requests: %d", s.aiAttackCount);
+    ImGui::TextWrapped("last: %s", s.aiLastAttack.empty() ? "(none yet)" : s.aiLastAttack.c_str());
+    ImGui::Text("parries: %d", s.aiBlockCount);
+    ImGui::TextWrapped("last: %s", s.aiLastBlock.empty() ? "(none yet)" : s.aiLastBlock.c_str());
+    ImGui::TextDisabled("blocking is EMERGENT: a blade in the path stops the blow");
+  }
+  if (Section("Tuning windows")) {
+    const float w = CellWidth(3);
+    if (ToggleButton("Combat", s.combatWindowOpen, w)) s.combatWindowOpen = !s.combatWindowOpen;
+    ImGui::SetItemTooltip("stroke, damage and feel tuning (live)");
+    ImGui::SameLine();
+    if (ToggleButton("NPC AI", s.aiWindowOpen, w)) s.aiWindowOpen = !s.aiWindowOpen;
+    ImGui::SetItemTooltip("live mobs (apply a behaviour) + profile editor");
+    ImGui::SameLine();
+    if (ToggleButton("MPM fluid", s.fluidWindowOpen, w)) s.fluidWindowOpen = !s.fluidWindowOpen;
+  }
+  if (Section("Keys")) {
+    static const char* const kKeys[][2] = {
+        {"F1", "this panel"},        {"F2", "play / dev controls"},
+        {"Tab", "cycle tool"},       {"1-8", "brush material"},
+        {"[ ]", "brush radius"},     {"Esc", "free cursor"},
+        {"P / N", "pause / step"},   {"V", "fly"},
+        {"G", "grenade"},            {"X", "detonate at crosshair"},
+        {"F", "laser"},              {"M", "spawn mob"},
+        {"K", "rolling sphere"},     {"B", "place"},
+        {"Z", "magic mode"},         {"F3", "collision boxes"},
+        {"F4", "vector field"},      {"F5", "reload shaders + tuning"},
+        {"R", "reload materials"},   {"F7", "regen world"},
+        {"F9 / F10", "save / load"},
+    };
+    if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_SizingFixedFit)) {
+      for (const auto& k : kKeys) {
+        ImGui::TableNextColumn();
+        ImGui::TextColored(V4(ui::ColGold()), "%s", k[0]);
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", k[1]);
+      }
+      ImGui::EndTable();
+    }
+  }
+}
+
 void Overlay::Draw(UIState& s) {
   // The character screen owns the frame while it is open: no crosshair (the
   // cursor is free), and it is drawn BEFORE the dev panel so the dev panel
@@ -655,830 +1825,89 @@ void Overlay::Draw(UIState& s) {
 
   ImGui::PushFont(ui::FontSmall());
 
-  ImGui::SetNextWindowPos(ImVec2(12, 12), ImGuiCond_FirstUseEver);
-  ImGui::SetNextWindowSize(ImVec2(340, 0), ImGuiCond_FirstUseEver);
-  ImGui::Begin("sandvox", nullptr, ImGuiWindowFlags_NoFocusOnAppearing);
+  // Pinned to the left edge, top to just above the HUD; only the width is the
+  // user's (drag the right edge).
+  const ImVec2 disp = ImGui::GetIO().DisplaySize;
+  const float panelH = std::floor(
+      sHudTop > disp.y * 0.5f && sHudTop < disp.y ? sHudTop : disp.y);
+  ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+  ImGui::SetNextWindowSize(ImVec2(480, panelH), ImGuiCond_FirstUseEver);
+  ImGui::SetNextWindowSizeConstraints(ImVec2(380, panelH),
+                                      ImVec2(std::max(380.0f, disp.x * 0.6f), panelH));
+  ImGui::Begin("##devpanel", nullptr,
+               ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove |
+                   ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoFocusOnAppearing |
+                   ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  sPanelW = ImGui::GetWindowWidth();
 
-  ImGui::Text("%.0f fps  (%.1f ms avg, %.2f ms tick cpu)",
-              s.fps, s.frameMs, s.tickCpuMs);
-  // The tail gets its own line: four numbers do not fit beside the fps at this
-  // panel width, and when you are chasing a stutter this line is the one you
-  // watch. `worst` is a SINGLE frame out of the last half second, so it reacts
-  // to any one-off hiccup; p95/p99 are over ~512 frames and are what say
-  // whether the stutter is systematic. A high fps beside a high p99 is the
-  // reading that matters — it means the average is being carried by cheap
-  // frames while one in a hundred is visibly long.
-  ImGui::Text("frame ms   p95 %.0f   p99 %.0f   worst %.0f",
-              s.frameMsP95, s.frameMsP99, s.frameMsWorst);
-  ImGui::Text("tick %u   active chunks %u / %u", s.tick, s.activeChunks,
-              s.totalChunks);
-  ImGui::Text("voxels %.2f M   particles %u   hash %08x %s", s.voxelTotal / 1e6,
-              s.particleCount, s.worldHash, s.mirrorValid ? "" : "(mirror pending)");
-  ImGui::Text("debris bodies %u (%u awake)   mobs %u", s.bodyCount,
-              s.activeBodyCount, s.mobCount);
-  ImGui::Text("pos %.0f %.0f %.0f  (%s)", s.playerPos[0], s.playerPos[1],
-              s.playerPos[2], s.fly ? "fly" : "walk");
-  // Ledge-grab state: green while hanging, yellow when a lip is in reach,
-  // dim otherwise — with the latch gate flags spelled out (see UIState).
+  // ---- the fixed header: what you glance at, and the two switches ----------
   {
-    const ImVec4 c = s.ledgeState == 2   ? ImVec4(0.35f, 1.0f, 0.45f, 1.0f)
-                     : s.ledgeState == 1 ? ImVec4(1.0f, 0.85f, 0.30f, 1.0f)
-                                         : ImVec4(0.55f, 0.55f, 0.55f, 1.0f);
-    ImGui::TextColored(c, "ledge: %s", s.ledgeText.c_str());
-  }
-
-  // crosshair readout: what material the centre ray landed on. The swatch is
-  // the same gpu color0 the material combo uses, so eyeballing "is that ice or
-  // glass?" doesn't need the name to be read.
-  if (s.hoverMat > 0 && s.hoverMat < (int)s.materialNames.size()) {
-    if (s.hoverMat < (int)s.materialColors.size()) {
-      uint32_t c = s.materialColors[s.hoverMat];  // 0xAABBGGRR
-      ImVec4 col(((c) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
-                 ((c >> 16) & 0xFF) / 255.0f, 1.0f);
-      ImGui::ColorButton("##hoversw", col,
-                         ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoPicker,
-                         ImVec2(14, 14));
+    ImGui::TextColored(V4(ui::ColGoldPale()), "SANDVOX");
+    ImGui::SameLine();
+    ImGui::TextDisabled("dev");
+    char fps[64];
+    std::snprintf(fps, sizeof fps, "%.0f fps  %.1f ms  p99 %.0f", s.fps, s.frameMs,
+                  s.frameMsP99);
+    KeyHint(fps);
+    ImGui::TextDisabled("tick %u   chunks %u   mobs %u", s.tick, s.activeChunks, s.mobCount);
+    // Crosshair readout with the material's own icon.
+    if (s.hoverMat > 0 && s.hoverMat < (int)s.materialNames.size()) {
+      const ImVec2 p = ImGui::GetCursorScreenPos();
+      MatIcon(ImGui::GetWindowDrawList(), ImVec2(p.x + 1, p.y + 2), 12.0f, s, s.hoverMat);
+      ImGui::Dummy(ImVec2(14, 14));
+      if (ImGui::IsItemHovered()) MatTooltip(s, s.hoverMat);
       ImGui::SameLine();
-    }
-    ImGui::Text("looking at %s  [%d %d %d]  %.1fm",
-                s.materialNames[s.hoverMat].c_str(), s.hoverCell[0],
-                s.hoverCell[1], s.hoverCell[2], s.hoverDist);
-  } else {
-    ImGui::TextDisabled("looking at ---");
-  }
-  ImGui::Separator();
-
-  // ---- magic (game/spell.h) -------------------------------------------------
-  // The whole point of this readout is the CROSSOVER: the exact point where
-  // the running cost stops coming out of mana and starts coming out of health.
-  // It is drawn as one continuous bar with a hard break at that point, because
-  // a pair of numbers does not communicate "this next glyph will cost you an
-  // arm" the way a bar segment eating into red does.
-  ImGui::Text("magic %s   (Z toggles; a number SELECTS a bound spell, RMB casts it)",
-              s.magicMode ? "ON" : "off");
-  {
-    const float w = ImGui::GetContentRegionAvail().x;
-    const float h = 14.0f;
-    ImVec2 p = ImGui::GetCursorScreenPos();
-    ImDrawList* d = ImGui::GetWindowDrawList();
-    const int32_t poolMax = s.manaMax > 0 ? s.manaMax : 1;
-    // The bar spans mana + health so both costs are measured on ONE axis;
-    // otherwise the crossover has no visual meaning.
-    const int32_t span = poolMax + (s.health > 0 ? s.health : 0);
-    auto frac = [&](int32_t v) {
-      return span > 0 ? (float)v / (float)span : 0.0f;
-    };
-    // backdrop: mana region then health region
-    d->AddRectFilled(p, ImVec2(p.x + w, p.y + h), IM_COL32(28, 32, 46, 255));
-    const float manaEdge = p.x + w * frac(poolMax);
-    d->AddRectFilled(ImVec2(manaEdge, p.y), ImVec2(p.x + w, p.y + h),
-                     IM_COL32(52, 22, 24, 255));
-    // filled mana
-    d->AddRectFilled(p, ImVec2(p.x + w * frac(s.mana), p.y + h),
-                     IM_COL32(70, 130, 235, 255));
-    // filled health, starting at the mana edge
-    d->AddRectFilled(ImVec2(manaEdge, p.y),
-                     ImVec2(manaEdge + w * frac(s.health), p.y + h),
-                     IM_COL32(190, 60, 60, 255));
-    // THE CROSSOVER. The spoken cost is drawn as a bright overlay eating
-    // right-to-left out of mana; the part of it past the mana edge is drawn in
-    // warning colour because that part is coming out of the body.
-    if (s.spellCost > 0) {
-      const int32_t fromMana = s.spellCost < s.mana ? s.spellCost : s.mana;
-      const int32_t fromHealth = s.spellCost - fromMana;
-      const float x0 = p.x + w * frac(s.mana - fromMana);
-      d->AddRectFilled(ImVec2(x0, p.y), ImVec2(p.x + w * frac(s.mana), p.y + h),
-                       IM_COL32(150, 200, 255, 255));
-      if (fromHealth > 0) {
-        const float hx = manaEdge + w * frac(fromHealth < s.health ? fromHealth
-                                                                   : s.health);
-        d->AddRectFilled(ImVec2(manaEdge, p.y), ImVec2(hx, p.y + h),
-                         IM_COL32(255, 140, 60, 255));
-      }
-      // the hard break itself
-      d->AddLine(ImVec2(manaEdge, p.y - 2), ImVec2(manaEdge, p.y + h + 2),
-                 IM_COL32(255, 255, 255, 220), 2.0f);
-    }
-    ImGui::Dummy(ImVec2(w, h + 4));
-  }
-  ImGui::Text("mana %d/%d   health %d   cost %d%s", s.mana, s.manaMax, s.health,
-              s.spellCost, s.spellPriceUnknown ? " + ?" : "");
-  if (s.spellCost > 0 || s.spellPriceUnknown)
-    ImGui::TextDisabled("  word %d + tariff %d + carry %d%s", s.spellWord, s.spellTariff,
-                        s.spellCarry,
-                        s.spellPriceUnknown ? "   (anything: priced when it lands)" : "");
-  if (s.spellLastBillAge < 2.5f && s.spellLastBill > 0)
-    ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "billed %d on resolve",
-                       s.spellLastBill);
-  // Dev control of the pool: set the max to anything up to 2^30 (ResolveCast
-  // adds mana + health in an int32, so the ceiling stays below overflow),
-  // fill it once, or pin it full every tick. Requests only; main.cpp applies.
-  if (ImGui::TreeNode("dev: mana pool")) {
-    constexpr int32_t kDevManaCeiling = 1 << 30;
-    if (s.devManaMaxEdit <= 0) s.devManaMaxEdit = s.manaPoolMax > 0 ? s.manaPoolMax : 100;
-    ImGui::SetNextItemWidth(140.0f);
-    int edit = s.devManaMaxEdit;
-    if (ImGui::InputInt("max", &edit, 100, 10000)) s.devManaMaxEdit = edit;
-    if (s.devManaMaxEdit < 1) s.devManaMaxEdit = 1;
-    if (s.devManaMaxEdit > kDevManaCeiling) s.devManaMaxEdit = kDevManaCeiling;
-    ImGui::SameLine();
-    if (ImGui::Button("apply max")) s.devManaMaxRequest = s.devManaMaxEdit;
-    ImGui::SameLine();
-    if (ImGui::Button("fill")) s.devManaFill = true;
-    // Presets apply immediately AND fill, which is what "ridiculous" means in
-    // practice — nobody sets 1e9 and then wants to wait for regen.
-    struct Preset {
-      const char* label;
-      int32_t value;
-    };
-    const Preset presets[] = {{"100", 100},      {"1k", 1000},        {"100k", 100000},
-                              {"10M", 10000000}, {"1G", 1000000000}, {"2^30", kDevManaCeiling}};
-    for (size_t i = 0; i < sizeof(presets) / sizeof(presets[0]); i++) {
-      if (i > 0) ImGui::SameLine();
-      if (ImGui::SmallButton(presets[i].label)) {
-        s.devManaMaxEdit = presets[i].value;
-        s.devManaMaxRequest = presets[i].value;
-        s.devManaFill = true;
-      }
-    }
-    ImGui::Checkbox("infinite (refill to max every tick)", &s.devManaInfinite);
-    ImGui::TreePop();
-  }
-  if (s.spellCost > s.mana + s.health) {
-    ImGui::TextColored(ImVec4(1.0f, 0.35f, 0.3f, 1.0f),
-                       "FATAL - this will kill you");
-  } else if (s.spellCost > s.mana) {
-    ImGui::TextColored(ImVec4(1.0f, 0.65f, 0.25f, 1.0f),
-                       "unstable - %d from your body", s.spellCost - s.mana);
-  }
-  if (!s.spellText.empty()) {
-    // THE BRACKET TEXT STAYS. It is what the oracle compares and what the dev
-    // panel reads a tree off; the player-facing surface is the grimoire page's
-    // canvas. "held" rather than "speaking" because the stack is now the
-    // SELECTED spell, not a half-spoken one.
-    ImGui::Text("held: %s", s.spellText.c_str());
-    ImGui::TextDisabled("%s", s.spellVerdict.c_str());
-  } else {
-    ImGui::TextDisabled("held: (nothing)   a number selects a bound spell, "
-                        "RMB casts it, Backspace clears");
-  }
-  if (!s.spellStatuses.empty()) {
-    ImGui::Text("sustaining (%d reserved, Delete drops the newest):", s.manaReserved);
-    for (const std::string& st : s.spellStatuses) ImGui::TextDisabled("  %s", st.c_str());
-  }
-  if (s.spellRefused > 0)
-    ImGui::TextColored(ImVec4(0.6f, 0.9f, 1.0f, 1.0f), "ward refused %d", s.spellRefused);
-  if (!s.glyphSlots.empty()) {
-    // Two rows: bank A on the number row, bank B on Shift. The bank Shift is
-    // holding is drawn bright; a page shows as its name with a page mark.
-    for (int bank = 0; bank < 2; bank++) {
-      std::string strip = bank == 0 ? "1-0:   " : "S+1-0: ";
-      bool any = false;
-      for (size_t i = (size_t)bank * 10; i < s.glyphSlots.size() && i < (size_t)(bank + 1) * 10; i++) {
-        if (s.glyphSlots[i].empty()) continue;
-        any = true;
-        const bool page = i < s.glyphSlotKinds.size() && s.glyphSlotKinds[i] == 2;
-        // The SELECTED key is starred: the stack is its spell, and right-click
-        // will fire that one until another key takes its place.
-        const bool sel = (int)i == s.glyphSelected;
-        strip += (sel ? "*" : "") + std::to_string((i + 1) % 10) + ":" +
-                 (page ? "[" : "") + s.glyphSlots[i] + (page ? "]" : "") + "  ";
-      }
-      if (!any) continue;
-      if (s.glyphBankB == (bank == 1)) ImGui::Text("%s", strip.c_str());
-      else ImGui::TextDisabled("%s", strip.c_str());
-    }
-  }
-  if (s.spellNoteAge < 3.0f && !s.spellNote.empty())
-    ImGui::TextColored(ImVec4(0.9f, 0.85f, 0.5f, 1.0f), "%s", s.spellNote.c_str());
-  ImGui::Text("projectiles %d", s.liveProjectiles);
-  if (s.spellOpsDropped > 0) {
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "  %d ops dropped",
-                       s.spellOpsDropped);
-  }
-  // Wind primitives. Shown next to the projectile count because they are the
-  // same kind of thing: a bounded population of live effects the player made,
-  // each one costing until it expires. `wake` is the rule-2 number — the chunks
-  // those primitives are holding awake so they can move settled matter, against
-  // the sim.windWakeChunks budget.
-  if (s.windPrims > 0 || s.windPrimsDropped > 0) {
-    ImGui::Text("wind primitives %d (wake %d chunks)", s.windPrims,
-                s.windWakeChunks);
-    if (s.windPrimsDropped > 0) {
+      ImGui::Text("%s", MatLabel(s, s.hoverMat).c_str());
       ImGui::SameLine();
-      ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "  %d refused (cap)",
-                         s.windPrimsDropped);
-    }
-  }
-  ImGui::Separator();
-
-  // ---- hotbar + melee (game/item.h, game/melee.h) ---------------------------
-  // The swing readout exists to make the input FALSIFIABLE. A cut is directed
-  // by mouse motion, so when it goes wrong the player needs to tell "the game
-  // misread my flick" from "I misjudged the distance" — showing the phase and
-  // the speed the state machine actually measured is what makes that
-  // answerable instead of a matter of opinion.
-  if (!s.itemNames.empty()) {
-    std::string strip;
-    for (size_t i = 0; i < s.itemNames.size(); i++) {
-      if (s.itemNames[i].empty()) continue;
-      const bool sel = (int)i == s.itemSelected;
-      strip += (sel ? "[" : " ") + std::to_string((i + 1) % 10) + ":" +
-               s.itemNames[i] + (sel ? "] " : "  ");
-    }
-    if (!strip.empty()) ImGui::TextDisabled("%s", strip.c_str());
-  }
-  if (s.swingPhase && s.swingPhase[0]) {
-    ImGui::Text("swing %s", s.swingPhase);
-    ImGui::SameLine();
-    ImGui::TextDisabled("  mouse %.0f px/s", s.swingSpeed);
-    if (!s.swingStyle.empty()) ImGui::TextDisabled("%s", s.swingStyle.c_str());
-  }
-  ImGui::Separator();
-
-  if (ImGui::Button(s.paused ? "resume (P)" : "pause (P)")) s.paused = !s.paused;
-  ImGui::SameLine();
-  if (ImGui::Button("step (N)")) s.stepOnce = true;
-  ImGui::SameLine();
-  ImGui::Checkbox("shadows", &s.shadows);
-
-  // ---- short range: the two ceiling + fog comparison arms -------------------
-  // Next to `shadows` because it is the same kind of switch: session state
-  // that reaches the shader as a RenderParams flag, not a tuning value (see
-  // State::shortRange for why that distinction is load-bearing here).
-  //
-  // THREE radios rather than two checkboxes: the arms are mutually exclusive
-  // and "short range + near" as two independent ticks would let the user set a
-  // near arm that does nothing. The metres come from tuning and not from
-  // literals, so the labels track the sliders the moment F5 lands — a button
-  // that says "50 m" while the shader ceilings at 80 is worse than no label.
-  {
-    const auto& rt = CurrentTuning().render;
-    char nearLbl[24], farLbl[24];
-    std::snprintf(nearLbl, sizeof nearLbl, "%.0f m", rt.shortRangeNearDist);
-    std::snprintf(farLbl, sizeof farLbl, "%.0f m", rt.shortRangeDist);
-    ImGui::TextUnformatted("short range");
-    ImGui::SameLine();
-    if (ImGui::RadioButton("off", !s.shortRange)) s.shortRange = false;
-    ImGui::SameLine();
-    if (ImGui::RadioButton(nearLbl, s.shortRange && s.shortRangeNear)) {
-      s.shortRange = true;
-      s.shortRangeNear = true;
-    }
-    ImGui::SameLine();
-    if (ImGui::RadioButton(farLbl, s.shortRange && !s.shortRangeNear)) {
-      s.shortRange = true;
-      s.shortRangeNear = false;
-    }
-  }
-  ImGui::SameLine();
-  // The metres readout is the whole reason the row carries one more widget:
-  // "short range" is a claim, and the effective draw distance dropping from
-  // four digits to the ceiling the instant it is picked is the evidence for
-  // it. It also shows the cascade REFILLING after a teleport, since the normal
-  // value is the filled radius rather than the theoretical horizon.
-  ImGui::TextDisabled("draw %.0f m", s.renderRangeM);
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip(
-        "Effective draw distance, in metres.\n\n"
-        "Normally this is the far cascade's FILLED radius, so it dips while\n"
-        "the cascade refills after a teleport or a fast sprint and climbs\n"
-        "back to the full horizon when every level has landed.\n\n"
-        "On either short-range arm it is that arm's ceiling, and that is a\n"
-        "hard ceiling on every ray: the fine march and all eight cascade\n"
-        "levels stop there. This is a PERF mode - the frame stops paying for\n"
-        "the horizon - not a fog filter over a full-range image.\n\n"
-        "Shape it under Rendering: shortRangeDist (the far arm),\n"
-        "shortRangeNearDist (the near one), shortRangeFogStart,\n"
-        "shortRangeFogDensity. Both arms share the fog ramp's shape, so only\n"
-        "the wall moves between them. The choice itself is session state and\n"
-        "is not saved to tuning.json.");
-
-  // ---- celestial time -------------------------------------------------
-  // Scales the clock the SKY and the daylight-gated reactions both run on
-  // (sim/world.h CelestialClock). The sim tick rate is untouched — sand still
-  // falls at 30 Hz — but the sun, both moons, the seasons and every
-  // sun-driven reaction run at this multiple. Anything but 1x changes the
-  // world hash, which the tooltip says out loud.
-  {
-    float t = std::cbrt(s.timeScale / 100.0f);
-    if (ImGui::SliderFloat("time speed", &t, -1.0f, 1.0f, "")) {
-      s.timeScale = t * t * t * 100.0f;
-      if (std::abs(s.timeScale) < 0.05f) s.timeScale = 0.0f;
-    }
-    ImGui::SameLine();
-    ImGui::Text("%.2fx", s.timeScale);
-  }
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip(
-        "Speed of the CELESTIAL clock: the sun, both moons, the seasons, and\n"
-        "the daylight-gated reactions (water freezing at night, snow melting\n"
-        "in the sun) all run at this multiple. The simulation itself still\n"
-        "ticks at 30 Hz - sand does not fall faster.\n\n"
-        "0 freezes the sky, negative runs it backwards.\n\n"
-        "Anything but 1x changes the world hash on purpose. --selftest never\n"
-        "engages this clock, so the pinned hash is unaffected.");
-  if (ImGui::Button("1x")) s.timeScale = 1.0f;
-  ImGui::SameLine();
-  if (ImGui::Button("10x")) s.timeScale = 10.0f;
-  ImGui::SameLine();
-  if (ImGui::Button("100x")) s.timeScale = 100.0f;
-  ImGui::SameLine();
-  if (ImGui::Button("freeze")) s.timeScale = 0.0f;
-  ImGui::SameLine();
-  if (ImGui::Button("rev")) s.timeScale = -1.0f;
-  // Readout of what the orbital solve actually produced. Phases are shown as
-  // named quarters because "0.73" tells you nothing about what is in the sky.
-  {
-    auto phaseName = [](float p) {
-      if (p < 0.06f || p > 0.94f) return "new";
-      if (p < 0.19f) return "cresc";
-      if (p < 0.31f) return "quarter";
-      if (p < 0.44f) return "gibbous";
-      if (p < 0.56f) return "FULL";
-      if (p < 0.69f) return "gibbous";
-      if (p < 0.81f) return "quarter";
-      return "cresc";
-    };
-    const int hh = (int)(s.skyDayT * 24.0f) % 24;
-    const int mm = (int)(s.skyDayT * 1440.0f) % 60;
-    ImGui::TextDisabled("sky %02d:%02d  sun %+.0f\xc2\xb0  year %.0f%%",
-                        hh, mm, s.skySunElevDeg, s.skyYearT * 100.0f);
-    ImGui::TextDisabled("moon A %s (%.2f)   moon B %s (%.2f)",
-                        phaseName(s.skyMoonPhase), s.skyMoonPhase,
-                        phaseName(s.skyMoon2Phase), s.skyMoon2Phase);
-    if (s.skySolarEclipse > 0.995f) {
-      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
-                         "*** TOTAL SOLAR ECLIPSE ***");
-    } else if (s.skySolarEclipse > 0.0f) {
-      ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.25f, 1.0f),
-                         "solar eclipse: %.0f%% covered",
-                         s.skySolarEclipse * 100.0f);
-    }
-  }
-
-  ImGui::Checkbox("fly (V)", &s.fly);
-  ImGui::Checkbox("collision boxes (F3)", &s.showCollisionBoxes);
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip(
-        "Wireframes around every physics collider, read from the actual Jolt\n"
-        "shape rather than the art: green = avatar parts (a held item too),\n"
-        "cyan = mob limbs, yellow = loose debris.\n"
-        "Drawn THROUGH walls on purpose - the reason to look at a collider is\n"
-        "usually that something is on top of it.");
-  ImGui::Checkbox("active voxels", &s.showDirtyVoxels);
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip(
-        "Red wireframe on every voxel the CA wrote this tick. Filled\n"
-        "GPU-side so there is no snapshot lag or stamp aliasing.\n"
-        "Combine with F6 (dirty chunks) to see cause and effect.");
-  // One radio row rather than two checkboxes, because the underlying state is
-  // one integer: F4 cycles off -> wind -> current and the panel is the same
-  // control by another route, so a pair of boxes would have to forbid the
-  // both-on combination that its own shape advertises.
-  //
-  // The tooltip describes all three states, so it hangs off EVERY widget in the
-  // row rather than off the last one — the reason to hover "off" is usually to
-  // find out what the other two would show.
-  static constexpr const char* kFieldVizTip =
-      "An arrow per lattice point around you, coloured by speed, cool to\n"
-      "hot. F4 cycles off -> wind -> current; only one is ever drawn,\n"
-      "because two overlapping lattices in one frame read as noise.\n"
-      "\n"
-      "WIND samples the SAME windAt() the grass sway does, so the arrows\n"
-      "show what the foliage is standing in - turn the Wind tab's direction\n"
-      "knob and both must swing together. Full scale is 24 m/s.\n"
-      "CURRENT samples the SAME currentAt() the waves advect with and\n"
-      "floating debris is dragged by, so the arrows show what is pushing a\n"
-      "raft. Full scale is 4 m/s - at a wind scale every current in the\n"
-      "world is one shade of blue.\n"
-      "\n"
-      "The current arrows do NOT need sim.currentMode: the render arm of the\n"
-      "field is always live (a renderer cannot write a voxel), so they show\n"
-      "the resolved primitives whether or not the sim is being pushed by\n"
-      "them. What they cannot show is a field with nothing in it - streams\n"
-      "and drains are seeded every tick, so a river has arrows and still\n"
-      "water is honestly empty.\n"
-      "\n"
-      "Arrows pointing at or away from you fade out: one aimed down the view\n"
-      "ray cannot show its direction anyway, so the hole is honest.\n"
-      "Spacing and radius are per field - Wind tab and render.dbgCurrent*\n"
-      "(F5 to apply).\n"
-      "NOTE: F5 re-seeds this from wind.dbgWindField / render.dbgCurrentField,\n"
-      "so a reload turns it back off unless the tuning file asks for it.";
-  const auto fieldVizTip = [&] {
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("%s", kFieldVizTip);
-  };
-  ImGui::TextUnformatted("vector field (F4)");
-  fieldVizTip();
-  ImGui::SameLine();
-  ImGui::RadioButton("off##fieldviz", &s.fieldViz, UIState::kFieldVizOff);
-  fieldVizTip();
-  ImGui::SameLine();
-  ImGui::RadioButton("wind##fieldviz", &s.fieldViz, UIState::kFieldVizWind);
-  fieldVizTip();
-  ImGui::SameLine();
-  ImGui::RadioButton("current##fieldviz", &s.fieldViz, UIState::kFieldVizCurrent);
-  fieldVizTip();
-
-  // ---- the sky's weather (src/sim/weather.h) -------------------------------
-  // Its own section of the F1 panel, open by default: the preset pin (a
-  // render-only override that eases the sky over weather.transitionSeconds
-  // without touching tuning.json — the running game writes that file, and a
-  // look switch must not clobber saved defaults), and live edits of the
-  // CPU-only weather knobs. Every one of them is render-only: the world hash
-  // never sees the weather, so nothing here needs a shader reload or moves a
-  // pinned number.
-  ImGui::Separator();
-  if (ImGui::CollapsingHeader("Weather", ImGuiTreeNodeFlags_DefaultOpen)) {
-    const std::vector<weather::Preset>& ps = weather::Presets().Presets();
-    const std::string cur = weather::Override();
-    const weather::State& w = weather::Last();
-    const char* shown = cur.empty() ? "(automatic / tuning)" : cur.c_str();
-    if (ImGui::BeginCombo("sky##wxcombo", shown)) {
-      if (ImGui::Selectable("(automatic / tuning)", cur.empty())) weather::SetOverride("");
-      for (const weather::Preset& p : ps) {
-        std::string lab = p.label + "##wx" + p.name;
-        if (ImGui::Selectable(lab.c_str(), cur == p.name)) weather::SetOverride(p.name);
-      }
-      ImGui::EndCombo();
-    }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip(
-          "Pin the sky to one assets/weather preset; it eases in over\n"
-          "weather.transitionSeconds. (automatic / tuning) hands it back to\n"
-          "the automatic cycle, or to weather.preset when that is off.\n"
-          "Render-only: the world hash never sees it. R reloads the files.");
-    // One-click row: the presets as small buttons, so switching the sky
-    // while looking at it is a single click rather than a dropdown.
-    {
-      int n = 0;
-      for (const weather::Preset& p : ps) {
-        if (n++ % 4 != 0) ImGui::SameLine();
-        const bool on = cur == p.name;
-        if (on) ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_ButtonActive));
-        std::string lab = p.label + "##wxb" + p.name;
-        if (ImGui::SmallButton(lab.c_str())) weather::SetOverride(on ? "" : p.name);
-        if (on) ImGui::PopStyleColor();
-      }
-    }
-    if (w.fromName == w.toName)
-      ImGui::Text("now: %s", w.fromName.c_str());
-    else
-      ImGui::Text("now: %s -> %s (%.0f%%)", w.fromName.c_str(), w.toName.c_str(),
-                  w.blend * 100.0f);
-    ImGui::Text("cover %.2f  rain %.2f  wet %.2f  overcast %.2f%s", w.mix.coverage,
-                w.mix.precip, w.wetness, w.overcast, w.flash > 0.05f ? "  *flash*" : "");
-
-    Tuning t = CurrentTuning();
-    Tuning::Weather& wt = t.weather;
-    bool changed = false;
-    changed |= ImGui::Checkbox("clouds##wx", &wt.clouds);
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Master switch. Off records no cloud pass at all.");
-    ImGui::SameLine();
-    changed |= ImGui::Checkbox("automatic cycle##wx", &wt.autoCycle);
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip(
-          "On: the sky walks the preset ladder by moisture on its own\n"
-          "(clear -> fair -> scattered -> overcast -> rain -> storm and back).\n"
-          "Off: it holds weather.preset. A pin above overrides both.");
-    changed |= EditableSliderFloat("cycle speed##wx", &wt.cycleSpeed, 0.0f, 50.0f, "%.1fx");
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip(
-          "How fast the automatic weather runs. 0 freezes it; 20x shows a\n"
-          "whole afternoon of weather in a few minutes.");
-    changed |= EditableSliderFloat("coverage bias##wx", &wt.coverageBias, -1.0f, 1.0f, "%+.2f");
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Added to every preset's coverage: cloudier / clearer.");
-    changed |= EditableSliderFloat("raininess x##wx", &wt.precipScale, 0.0f, 4.0f, "%.2fx");
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Multiplies every preset's raininess: wetter / drier.");
-    changed |= ImGui::Checkbox("rain touches world##wx", &wt.rainTouchesWorld);
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Rain douses exposed fire and damps ignition (moves the world hash).");
-    changed |= EditableSliderFloat("rain ignition damp##wx", &wt.rainIgniteDamp, 0.0f, 1.0f, "%.2f");
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("Share of an exposed ignition chance that full rain / soaked ground removes.");
-    {
-      const uint32_t rw = weather::LastSimRainWord();
-      ImGui::Text("sim: rain %u  wet %u /255", rw & 0xFFu, (rw >> 16) & 0xFFu);
-    }
-    changed |= EditableSliderFloat("ease (s)##wx", &wt.transitionSeconds, 0.0f, 60.0f, "%.0f s");
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("How long a pinned change takes to blend in.");
-    if (ImGui::SmallButton("reroll weather##wx")) {
-      wt.seedOffset = (wt.seedOffset + 1) % 1000;
-      changed = true;
-    }
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip("A different automatic weather sequence (weather.seedOffset).");
-    if (changed) SetCurrentTuning(t);
-  }
-  ImGui::Separator();
-
-  // ---- wind force multipliers, one per tier -------------------------------
-  // Live: these ride TickParams, so a drag lands on the next tick with no
-  // shader reload. Split by TIER because that is how the engine is split
-  // (research doc §4.6) — the CA steers what is already moving, the particle
-  // system carries the violence — and because they are the two things you want
-  // to A/B against each other. Pinning one to 0 while pushing the other is the
-  // fastest way to see which tier a given effect is actually coming from.
-  if (EditableSliderFloat("wind x voxels", &s.windGasScale, 0.0f, 16.0f, "%.2fx"))
-    s.windTuningDirty = true;
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip(
-        "Multiplies how hard the wind pushes CA VOXELS - smoke, steam, fire,\n"
-        "and falling powder. It scales the drift-bias PROBABILITY, not the\n"
-        "wind speed, and it is allowed past the sim.windDriftMax cap: at the\n"
-        "top of the range every moving gas voxel goes downwind first and smoke\n"
-        "stops looking like smoke and starts looking like a conveyor belt.\n"
-        "Scaling the speed instead would go dead at about 2x, because the bias\n"
-        "ramp already saturates near the default weather.\n"
-        "SETTLED voxels are untouched at any value - that is entrainment,\n"
-        "which is sim.windMode 2 and off. 0 pins the CA tier still.\n"
-        "Changes the world hash. Deterministic, just a different world.");
-  if (EditableSliderFloat("wind x particles", &s.windPartScale, 0.0f, 16.0f, "%.2fx"))
-    s.windTuningDirty = true;
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip(
-        "Multiplies how hard the wind pushes the PARTICLE tier - explosion\n"
-        "debris, blood and water spray, and MPM fluid surface nodes.\n"
-        "It scales the wind VELOCITY they are dragged toward, which is what\n"
-        "actually throws them further: the drag law means a particle can never\n"
-        "outrun the air, so a faster air is the only way past that ceiling.\n"
-        "Per-material response still applies, so heavy debris moves less than\n"
-        "spray at the same multiplier. 0 pins the particle tier still.\n"
-        "Changes the world hash. Deterministic, just a different world.");
-  if (EditableSliderFloat("wind fall onset", &s.windDragRef, 1.0f, 120.0f,
-                          "%.0f m/s"))
-    s.windTuningDirty = true;
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip(
-        "How hard a wind it takes before falling debris feels the air.\n"
-        "Drag on a particle pulls its velocity toward the local wind on EVERY\n"
-        "axis, so a horizontal field drags the VERTICAL toward zero - that is\n"
-        "air resistance, and at a fixed rate it applies just as hard on a calm\n"
-        "day as in a gale. This is the wind speed at which sim.windDrag counts\n"
-        "in full; below it the RATE ramps down with the wind, so calm air is\n"
-        "ballistic and gravity is left alone.\n"
-        "Terminal fall against the 6 vox/tick ballistic cap, at the default\n"
-        "6 m/s weather: 120 -> 6.0 (no change), 40 -> 5.7, 20 -> 2.9,\n"
-        "6 -> 0.86 (debris drifts down like ash).\n"
-        "LOW makes ordinary weather floaty; HIGH means only a storm is felt.\n"
-        "Changes the world hash. Deterministic, just a different world.");
-
-  // ---- place a wind primitive (docs/RESEARCH_wind.md §4.3) ---------------
-  // The button that turns wind from weather into a tool you can point at
-  // something. It emits the SAME parametric object a `gust` spell emits, on
-  // the same list, through the same budget — there is no dev-only wind path.
-  if (ImGui::TreeNode("wind primitives (fans / gusts / vortices)")) {
-    ImGui::TextDisabled("%d live, waking %d chunks", s.windPrims,
-                        s.windWakeChunks);
-    const char* kinds[] = {"cone (fan / jet)", "burst (blast or vacuum)",
-                           "vortex (tornado)"};
-    ImGui::Combo("kind", &s.windFanKind, kinds, 3);
-    EditableSliderFloat("speed", &s.windFanSpeed, -40.0f, 40.0f, "%.0f m/s");
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip(
-          "Core speed at the mouth. NEGATIVE is legal and useful: it turns a\n"
-          "burst into a vacuum and a cone into a draw.");
-    EditableSliderInt("radius", &s.windFanRadius, 1, 64);
-    EditableSliderInt("reach", &s.windFanReach, 1, 128);
-    ImGui::Checkbox("may move SETTLED powder", &s.windFanEntrain);
-    if (ImGui::IsItemHovered())
-      ImGui::SetTooltip(
-          "The entrainment licence. OFF, a fan only steers what is already\n"
-          "moving - smoke, spray, falling sand - and costs nothing when the\n"
-          "world around it is asleep.\n"
-          "ON, it may pull RESTING powder loose inside its footprint, which is\n"
-          "what blows a dune flat. That costs: the primitive dirty-marks its\n"
-          "own footprint every tick so those chunks are simulated at all, and\n"
-          "the chunks are charged against sim.windWakeChunks. It is per\n"
-          "primitive rather than global because the global version is not\n"
-          "page-table safe - see sim.windMode 2.");
-    if (ImGui::Button("place where I'm looking")) s.placeWindFan = true;
-    ImGui::SameLine();
-    if (ImGui::Button("clear all")) s.clearWindFans = true;
-    if (s.windPrimsDropped > 0)
-      ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f),
-                         "%d refused (world cap is %d)", s.windPrimsDropped,
-                         (int)kWindPrimCap);
-    ImGui::TreePop();
-  }
-
-  ImGui::SliderInt("brush radius [ ]", &s.brushRadius, 1, 7);
-  ImGui::SliderInt("powder grain (eighths, 0 = mixed)", &s.brushGrain, 0, 8);
-
-  auto swatch = [&](int i) {
-    if (i >= (int)s.materialColors.size()) return;
-    uint32_t c = s.materialColors[i];  // 0xAABBGGRR
-    ImVec4 col(((c) & 0xFF) / 255.0f, ((c >> 8) & 0xFF) / 255.0f,
-               ((c >> 16) & 0xFF) / 255.0f, 1.0f);
-    ImGui::ColorButton(("##sw" + std::to_string(i)).c_str(), col,
-                       ImGuiColorEditFlags_NoTooltip | ImGuiColorEditFlags_NoPicker,
-                       ImVec2(14, 14));
-    ImGui::SameLine();
-  };
-  if (ImGui::BeginCombo("material",
-                        s.brushMaterial < (int)s.materialNames.size()
-                            ? s.materialNames[s.brushMaterial].c_str()
-                            : "?")) {
-    for (int i = 1; i < (int)s.materialNames.size(); i++) {
-      swatch(i);
-      if (ImGui::Selectable(s.materialNames[i].c_str(), i == s.brushMaterial))
-        s.brushMaterial = i;
-    }
-    ImGui::EndCombo();
-  }
-
-  ImGui::Separator();
-  ImGui::Checkbox("dev controls (F2)", &s.devControls);
-  if (ImGui::IsItemHovered())
-    ImGui::SetTooltip("off = play mode: hands only, number row picks the hotbar,\n"
-                      "no brush / spawn / fly / tool keys");
-  ImGui::Text("tool (Tab):");
-  ImGui::SameLine();
-  ImGui::RadioButton("brush", &s.tool, UIState::kToolBrush);
-  ImGui::SameLine();
-  ImGui::RadioButton("laser", &s.tool, UIState::kToolLaser);
-  ImGui::SameLine();
-  ImGui::RadioButton("prefab", &s.tool, UIState::kToolPrefab);
-  ImGui::SameLine();
-  ImGui::RadioButton("mob", &s.tool, UIState::kToolMob);
-  ImGui::SameLine();
-  ImGui::RadioButton("sword", &s.tool, UIState::kToolMelee);
-  ImGui::SameLine();
-  ImGui::RadioButton("mpm", &s.tool, UIState::kToolFluid);
-
-  if (ImGui::Button("Combat")) s.combatWindowOpen = !s.combatWindowOpen;
-  ImGui::SameLine();
-  if (ImGui::Button("NPC AI")) s.aiWindowOpen = !s.aiWindowOpen;
-  ImGui::SameLine();
-  if (ImGui::Button("Fluid")) s.fluidWindowOpen = !s.fluidWindowOpen;
-  ImGui::SameLine();
-  if (ImGui::Button("Wardrobe")) s.wardrobeWindowOpen = !s.wardrobeWindowOpen;
-
-  // ---- a filled vessel, into your own inventory ------------------
-  // In the MAIN F1 panel (it first shipped inside the NPC AI window, where
-  // nobody looked). Pickers mirrored by main.cpp (UIState::giveVesselNames); the
-  // material list is only what THIS vessel can hold, so a pouch never
-  // offers water and a flask never offers sand.
-  if (!s.giveVesselNames.empty() &&
-      ImGui::CollapsingHeader("Give me a filled vessel",
-                              ImGuiTreeNodeFlags_DefaultOpen)) {
-    if (s.giveVesselPick < 0 ||
-        s.giveVesselPick >= (int)s.giveVesselNames.size())
-      s.giveVesselPick = 0;
-    ImGui::SetNextItemWidth(160);
-    if (ImGui::BeginCombo("vessel##give",
-                          s.giveVesselNames[s.giveVesselPick].c_str())) {
-      for (int i = 0; i < (int)s.giveVesselNames.size(); i++) {
-        ImGui::PushID(i);
-        if (ImGui::Selectable(s.giveVesselNames[i].c_str(),
-                              i == s.giveVesselPick)) {
-          if (i != s.giveVesselPick) s.giveMatPick = 0;
-          s.giveVesselPick = i;
-        }
-        ImGui::PopID();
-      }
-      ImGui::EndCombo();
-    }
-    const std::vector<std::string>* matNames =
-        s.giveVesselPick < (int)s.giveVesselMats.size()
-            ? &s.giveVesselMats[s.giveVesselPick]
-            : nullptr;
-    if (matNames && !matNames->empty()) {
-      if (s.giveMatPick < 0 || s.giveMatPick >= (int)matNames->size())
-        s.giveMatPick = 0;
-      ImGui::SetNextItemWidth(160);
-      if (ImGui::BeginCombo("filled with##give",
-                            (*matNames)[s.giveMatPick].c_str(),
-                            ImGuiComboFlags_HeightLarge)) {
-        for (int i = 0; i < (int)matNames->size(); i++) {
-          ImGui::PushID(i);
-          if (ImGui::Selectable((*matNames)[i].c_str(),
-                                i == s.giveMatPick))
-            s.giveMatPick = i;
-          ImGui::PopID();
-        }
-        ImGui::EndCombo();
-      }
-      if (ImGui::Button("give (full)##give")) s.giveVessel = true;
-      if (!s.giveVesselStatus.empty()) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", s.giveVesselStatus.c_str());
-      }
+      ImGui::TextDisabled("[%d %d %d]  %.1fm", s.hoverCell[0], s.hoverCell[1],
+                          s.hoverCell[2], s.hoverDist);
     } else {
-      ImGui::TextDisabled("this vessel holds no loaded material");
+      ImGui::TextDisabled("looking at ---");
     }
-    ImGui::Separator();
-  }
-
-  if (s.tool == UIState::kToolMelee) {
-    ImGui::TextDisabled("hold LMB to guard, then FLICK the mouse to cut");
-  }
-  if (s.tool == UIState::kToolFluid) {
-    ImGui::TextDisabled("hold LMB: pour  1-4 water/oil/acid/blood  U clear");
-    ImGui::Text("mpm particles: %u / 262144", s.fluidCount);
+    const float w = CellWidth(3);
+    if (ToggleButton(s.paused ? "resume (P)" : "pause (P)", s.paused, w)) s.paused = !s.paused;
     ImGui::SameLine();
-    if (ImGui::Button("clear (U)")) s.clearFluid = true;
+    if (ImGui::Button("step (N)", ImVec2(w, 0))) s.stepOnce = true;
+    ImGui::SameLine();
+    if (ToggleButton(s.devControls ? "dev mode (F2)" : "play mode (F2)", s.devControls, w))
+      s.devControls = !s.devControls;
+    ImGui::SetItemTooltip("play = hands only, number row picks the hotbar,\n"
+                          "no brush / spawn / fly / tool keys");
   }
-  if (s.tool == UIState::kToolBrush) {
-    ImGui::TextDisabled("LMB paint  RMB erase  1-8 / combo below");
-  } else if (s.tool == UIState::kToolLaser) {
-    ImGui::TextDisabled("hold LMB (or F): melts what it hits, cuts bodies");
-  } else if (s.tool == UIState::kToolPrefab) {
-    if (!s.prefabNames.empty()) {
-      if (s.prefabSelected >= (int)s.prefabNames.size()) s.prefabSelected = 0;
-      ImGui::TextUnformatted("prefab");
-      ImGui::SameLine();
-      // "##prefab" not "prefab": the label text would otherwise hash to the
-      // same ID as the RadioButton("prefab") above it — same window, same ID
-      // stack level — and ImGui resolves both to one widget, so the dropdown
-      // stops responding. The visible caption is drawn separately.
-      if (ImGui::BeginCombo("##prefab", s.prefabNames[s.prefabSelected].c_str())) {
-        // PushID(i) makes each row's ID its INDEX, not its label. Two assets
-        // that happen to share a display name (or an empty one) would otherwise
-        // hash to the same ImGui ID: they draw as "2 items with conflicting
-        // id!" and — worse — every click resolves to whichever row won the ID,
-        // so the selection cannot be changed. Keying on the index is correct
-        // for ANY future name collision rather than only the ones we have.
-        for (int i = 0; i < (int)s.prefabNames.size(); i++) {
-          ImGui::PushID(i);
-          if (ImGui::Selectable(s.prefabNames[i].c_str(), i == s.prefabSelected))
-            s.prefabSelected = i;
-          ImGui::PopID();
-        }
-        ImGui::EndCombo();
-      }
-      ImGui::Text("rotation %d°", s.prefabRot * 90);
-      ImGui::SameLine();
-      if (ImGui::Button("rotate (T)")) s.prefabRot = (s.prefabRot + 1) & 3;
-      ImGui::SameLine();
-      ImGui::Checkbox("overwrite", &s.prefabOverwrite);
-      if (s.prefabPending > 0)
-        ImGui::Text("placing... %u voxels pending", s.prefabPending);
-      ImGui::TextDisabled("LMB place  T rotate  O cycle");
-    } else {
-      ImGui::TextDisabled("no prefabs (assets/prefabs/*.vox)");
-    }
-  } else if (s.tool == UIState::kToolMob) {
-    if (!s.mobNames.empty()) {
-      if (s.mobSelected >= (int)s.mobNames.size()) s.mobSelected = 0;
-      ImGui::TextUnformatted("mob");
-      ImGui::SameLine();
-      // "##mob" —collides with RadioButton("mob") otherwise; see the prefab
-      // combo above.
-      if (ImGui::BeginCombo("##mob", s.mobNames[s.mobSelected].c_str())) {
-        // Index-keyed IDs — see the prefab combo above for why. A mob def's
-        // name comes from the .vox filename stem, so two mob files in different
-        // states of a rename, or a def whose sidecar failed to load, can put
-        // the same string in this list twice.
-        for (int i = 0; i < (int)s.mobNames.size(); i++) {
-          ImGui::PushID(i);
-          if (ImGui::Selectable(s.mobNames[i].c_str(), i == s.mobSelected))
-            s.mobSelected = i;
-          ImGui::PopID();
-        }
-        ImGui::EndCombo();
-      }
-      ImGui::TextDisabled("LMB (or M) spawn at crosshair");
-    } else {
-      ImGui::TextDisabled("no mobs (assets/mobs/*.vox + .json)");
+
+  // ---- the page strip --------------------------------------------------------
+  static const char* const kDevTabs[] = {"Paint", "Spawn", "World", "View", "Magic", "Debug"};
+  constexpr int kTabs = 6;
+  ImGui::Spacing();
+  {
+    const ImVec2 a = ImGui::GetCursorScreenPos();
+    ImGui::GetWindowDrawList()->AddLine(
+        ImVec2(a.x, a.y - 3), ImVec2(a.x + ImGui::GetContentRegionAvail().x, a.y - 3),
+        ui::ColBronze(), 2.0f);
+    const float w = CellWidth(kTabs);
+    if (s.devTab < 0 || s.devTab >= kTabs) s.devTab = 0;
+    for (int i = 0; i < kTabs; i++) {
+      if (i) ImGui::SameLine();
+      if (ToggleButton(kDevTabs[i], s.devTab == i, w, 26)) s.devTab = i;
     }
   }
-  ImGui::Separator();
 
-  if (ImGui::Button("reload shaders (F5)")) s.reloadShaders = true;
-  ImGui::SameLine();
-  if (ImGui::Button("reload materials (R)")) s.reloadMaterials = true;
-  ImGui::SameLine();
-  if (ImGui::Button("reload environment + regen world (F7)")) s.regenWorld = true;
-
-  if (ImGui::Button("save world (F9)")) s.saveWorld = true;
-  ImGui::SameLine();
-  if (ImGui::Button("load world (F10)")) s.loadWorld = true;
-  ImGui::SameLine();
-
-  if (ImGui::Button("detonate at crosshair (X)")) s.pendingDetonate = true;
-  ImGui::SameLine();
-  // The player's body goes limp for ragdoll.devSeconds, then gets back up:
-  // the whole live-ragdoll path (Mob::StartRagdoll -> BeginGetUp) on demand.
-  if (ImGui::Button("ragdoll me")) s.ragdollMe = true;
-
-  // rolling sphere: rigidbody ball of the current brush material, so its
-  // mass — and how far the player can shove it — comes from the material
-  if (ImGui::Button("spawn sphere (K)")) s.spawnSphere = true;
-
-  ImGui::TextDisabled("Tab switch tool  1-8 material  Esc cursor  F1 UI");
-  ImGui::TextDisabled("G grenade  X detonate  F laser  M spawn mob  B place");
+  // ---- the page body: the only part that scrolls ----------------------------
+  ImGui::BeginChild("##devbody", ImVec2(0, 0), ImGuiChildFlags_Borders);
+  switch (s.devTab) {
+    case 0: DrawDevPaint(s); break;
+    case 1: DrawDevSpawn(s); break;
+    case 2: DrawDevWorld(s); break;
+    case 3: DrawDevView(s); break;
+    case 4: DrawDevMagic(s); break;
+    default: DrawDevDebug(s); break;
+  }
+  ImGui::EndChild();
   ImGui::End();
 
   // ---- separate MPM fluid tuning window ----
   if (s.fluidWindowOpen) {
-    ImGui::SetNextWindowPos(ImVec2(370, 12), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(sPanelW + 12, 12), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(340, 600), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("MPM Fluid Tuning", &s.fluidWindowOpen)) {
       if (ImGui::Button("Apply")) s.fluidTuningDirty = true;
@@ -1598,99 +2027,6 @@ void Overlay::Draw(UIState& s) {
     ImGui::End();
   }
 
-  // ---- WARDROBE window (game/dye.h) ---------------------------------------
-  //
-  // THREE PATTERNS AND A COLOUR WHEEL. The clothes in assets/items are painted
-  // in greyscale — every cell a multiplier rather than a pigment
-  // (scripts/gen_peasant_clothes.py) — so what comes out of this window is a
-  // pattern index and one packed RGB word, and the same nine .vox files dress
-  // an entire village in nine hundred different outfits.
-  //
-  // Same shape as the AI window below: the overlay owns no game state, the
-  // combos are mirrors main.cpp rebuilds off the live item library, and every
-  // button is a one-shot bool main.cpp consumes. That is also what makes the
-  // picker survive an R hot-reload — see UIState's wardrobe block.
-  if (s.wardrobeWindowOpen) {
-    ImGui::SetNextWindowPos(ImVec2(300, 60), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(360, 560), ImGuiCond_FirstUseEver);
-    if (ImGui::Begin("Wardrobe", &s.wardrobeWindowOpen)) {
-      ImGui::TextDisabled("three patterns per slot, any colour:");
-      ImGui::TextDisabled("the art is a greyscale weave and the");
-      ImGui::TextDisabled("colour is applied at shade time, so the");
-      ImGui::TextDisabled("seams, hems and mends survive the dye");
-      ImGui::Separator();
-
-      auto combo = [&](const char* label, const std::vector<std::string>& names,
-                       int& pick) {
-        if (names.empty()) {
-          ImGui::TextDisabled("%s: no dyeable pieces in items.json", label);
-          return;
-        }
-        if (pick >= (int)names.size()) pick = 0;
-        ImGui::SetNextItemWidth(150);
-        // "##" so three combos of the same shape cannot hash together.
-        const std::string id = std::string(label) + "##wardrobe";
-        if (ImGui::BeginCombo(id.c_str(), names[pick].c_str())) {
-          for (int i = 0; i < (int)names.size(); i++) {
-            ImGui::PushID(i);
-            if (ImGui::Selectable(names[i].c_str(), i == pick)) pick = i;
-            ImGui::PopID();
-          }
-          ImGui::EndCombo();
-        }
-      };
-      combo("shirt", s.wardrobeShirts, s.wardrobeShirtPick);
-      combo("legs", s.wardrobeLegs, s.wardrobeLegsPick);
-      combo("feet", s.wardrobeFeet, s.wardrobeFeetPick);
-
-      ImGui::Separator();
-      // THE COLOUR WHEEL. PickerHueWheel rather than the bar-and-square: a
-      // wheel is the one picker where "somewhere over there in the greens" is a
-      // single gesture, which is what choosing a villager's shirt actually is.
-      // No alpha, no input boxes — a dye has neither.
-      ImGui::ColorPicker3("##wardrobedye", s.wardrobeColor,
-                          ImGuiColorEditFlags_PickerHueWheel |
-                              ImGuiColorEditFlags_NoSidePreview |
-                              ImGuiColorEditFlags_NoInputs |
-                              ImGuiColorEditFlags_NoLabel);
-      // The name main.cpp mirrored for this colour, beside a swatch of it. The
-      // name is what ends up in the item's tooltip, so showing it here is how
-      // you find out that the thing you picked is going to be called "rust".
-      ImGui::ColorButton("##wardrobeswatch",
-                         ImVec4(s.wardrobeColor[0], s.wardrobeColor[1],
-                                s.wardrobeColor[2], 1.0f),
-                         0, ImVec2(28, 28));
-      ImGui::SameLine();
-      ImGui::TextUnformatted(s.wardrobeColorName.empty()
-                                 ? "(undyed)"
-                                 : s.wardrobeColorName.c_str());
-      ImGui::SameLine();
-      if (ImGui::Button("random##wardrobe")) s.wardrobeRandomColor = true;
-
-      ImGui::Separator();
-      if (ImGui::Button("into the pack##wardrobe")) s.wardrobeSpawnSet = true;
-      ImGui::SameLine();
-      ImGui::TextDisabled("hotbar, else the bag");
-      if (ImGui::Button("...and put it on##wardrobe")) s.wardrobeWearSet = true;
-      ImGui::SameLine();
-      ImGui::TextDisabled("straight into the equip slots");
-      if (ImGui::Button("re-dye what I'm wearing##wardrobe"))
-        s.wardrobeDyeWorn = true;
-      ImGui::SameLine();
-      ImGui::TextDisabled("every dyeable piece on the body");
-      if (!s.wardrobeStatus.empty()) {
-        ImGui::Separator();
-        ImGui::TextWrapped("%s", s.wardrobeStatus.c_str());
-      }
-      ImGui::Separator();
-      ImGui::TextDisabled("a dye is PAINT, not a material: dyed linen");
-      ImGui::TextDisabled("burns, tears and soaks blood exactly as");
-      ImGui::TextDisabled("undyed linen does, and a sleeve cut off");
-      ImGui::TextDisabled("keeps its colour on the ground");
-    }
-    ImGui::End();
-  }
-
   // ---- NPC AI window (game/ai_behavior.h) ---------------------------------
   //
   // Same shape as the fluid window above, for the same reason: the overlay owns
@@ -1699,195 +2035,10 @@ void Overlay::Draw(UIState& s) {
   // library. Scrolling is ImGui's own — see the note in overlay.h about why
   // installing a GLFW scroll callback here would freeze the wheel everywhere.
   if (s.aiWindowOpen) {
-    ImGui::SetNextWindowPos(ImVec2(720, 12), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(sPanelW + 12, 12), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(400, 720), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("NPC AI", &s.aiWindowOpen)) {
       if (ImGui::BeginTabBar("##aitabs")) {
-        // ---- Spawn -------------------------------------------------------
-        if (ImGui::BeginTabItem("Spawn")) {
-          ImGui::TextDisabled("spawns a creature, a few metres ahead of you");
-          ImGui::TextDisabled("(or at the crosshair hit):");
-          // WHICH BODY. Every mob def that can hold a weapon and is not itself
-          // a variant of one, mirrored by main.cpp off the live defs — so a new
-          // creature appears here on the next R with no list to keep in step by
-          // hand. What is WRONG with the body is the checkbox row below.
-          if (!s.aiCreatureNames.empty()) {
-            if (s.aiCreaturePick >= (int)s.aiCreatureNames.size())
-              s.aiCreaturePick = 0;
-            ImGui::SetNextItemWidth(160);
-            if (ImGui::BeginCombo("creature##ai",
-                                  s.aiCreatureNames[s.aiCreaturePick].c_str())) {
-              for (int i = 0; i < (int)s.aiCreatureNames.size(); i++) {
-                ImGui::PushID(i);
-                if (ImGui::Selectable(s.aiCreatureNames[i].c_str(),
-                                      i == s.aiCreaturePick))
-                  s.aiCreaturePick = i;
-                ImGui::PopID();
-              }
-              ImGui::EndCombo();
-            }
-          }
-          // WHAT IS WRONG WITH IT. One box per published effect
-          // (UIState::aiEffectNames): the panel no longer has a creature called
-          // "zombie" in it, it has a body and a tick. Ticking one hands it to
-          // MobSystem::DefWithEffects, which prefers an authored combination
-          // (jujunud_zombie.json) and composes one when there is none — so
-          // `jujunud` + zombie and `human` + zombie are both one click and
-          // neither needs a def of its own.
-          if (!s.aiEffectNames.empty()) {
-            ImGui::TextDisabled("...and what is wrong with it:");
-            for (int i = 0; i < (int)s.aiEffectNames.size(); i++) {
-              if (i >= (int)s.aiEffectOn.size()) break;
-              // Two per row: the list is short and a column of lone checkboxes
-              // wastes the panel's height on the tab that has the most in it.
-              if (i > 0 && (i & 1) != 0) ImGui::SameLine(190);
-              ImGui::PushID(i);
-              bool on = s.aiEffectOn[i] != 0;
-              if (ImGui::Checkbox(s.aiEffectNames[i].c_str(), &on))
-                s.aiEffectOn[i] = on ? 1 : 0;
-              ImGui::PopID();
-            }
-            ImGui::TextDisabled("zombie: walks slower, comes apart when cut,");
-            ImGui::TextDisabled("spawns already bitten, bites back");
-          }
-          ImGui::TextDisabled("armed with:");
-          // WHICH WEAPON. Every melee item in the library plus "(unarmed)",
-          // mirrored by main.cpp — so a blade added to items.json appears here
-          // on the next R, with no list to keep in step by hand.
-          if (!s.aiWeaponNames.empty()) {
-            if (s.aiWeaponPick >= (int)s.aiWeaponNames.size())
-              s.aiWeaponPick = 0;
-            ImGui::SetNextItemWidth(160);
-            // "##" so this cannot hash to the same id as the behaviour combo
-            // on the Mobs tab.
-            if (ImGui::BeginCombo("weapon##ai",
-                                  s.aiWeaponNames[s.aiWeaponPick].c_str())) {
-              for (int i = 0; i < (int)s.aiWeaponNames.size(); i++) {
-                ImGui::PushID(i);
-                if (ImGui::Selectable(s.aiWeaponNames[i].c_str(),
-                                      i == s.aiWeaponPick))
-                  s.aiWeaponPick = i;
-                ImGui::PopID();
-              }
-              ImGui::EndCombo();
-            }
-            ImGui::TextDisabled("the blade decides the wound: reach, cut");
-            ImGui::TextDisabled("depth and heft all come off its own art");
-            ImGui::TextDisabled("\"fists\" is a weapon now, not the absence of");
-            ImGui::TextDisabled("one: a bare hand bruises and never severs,");
-            ImGui::TextDisabled("and a mace beats plate in where a sword");
-            ImGui::TextDisabled("skates off it");
-          }
-          // WHAT IT WEARS. A mode combo, and under "custom" one picker per
-          // worn equip slot — mirrors main.cpp rebuilds off the item library
-          // (UIState::aiOutfit), so a new piece in assets/items appears here on
-          // the next R with no list to keep in step by hand.
-          ImGui::TextDisabled("wearing:");
-          {
-            static const char* kOutfits[] = {"nothing", "random clothes",
-                                             "full plate", "custom pieces"};
-            ImGui::SetNextItemWidth(160);
-            ImGui::Combo("outfit##ai", &s.aiOutfit, kOutfits, 4);
-            if (s.aiOutfit == 1) {
-              ImGui::TextDisabled("a shirt, legs and shoes drawn from the");
-              ImGui::TextDisabled("dyeable commoner set, each its own colour");
-            } else if (s.aiOutfit == 2) {
-              ImGui::TextDisabled("every slot's iron_* piece: helm, cuirass,");
-              ImGui::TextDisabled("greaves, sabatons, gauntlets");
-            } else if (s.aiOutfit == 3) {
-              ImGui::TextDisabled("(none) leaves that slot bare");
-              const int n = (int)std::min(s.aiWearNames.size(),
-                                          s.aiWearSlotLabels.size());
-              if ((int)s.aiWearPick.size() < n) s.aiWearPick.resize(n, 0);
-              for (int i = 0; i < n; i++) {
-                const std::vector<std::string>& names = s.aiWearNames[i];
-                if (names.size() <= 1) continue;   // nothing fits this slot
-                int& pick = s.aiWearPick[i];
-                if (pick < 0 || pick >= (int)names.size()) pick = 0;
-                ImGui::PushID(i);
-                ImGui::SetNextItemWidth(160);
-                // The label is the slot's own name from the equip table, so
-                // this reads "Head", "Chest", ... exactly as the character
-                // screen does.
-                if (ImGui::BeginCombo((s.aiWearSlotLabels[i] + "##aiwear").c_str(),
-                                      names[pick].c_str())) {
-                  for (int k = 0; k < (int)names.size(); k++) {
-                    ImGui::PushID(k);
-                    if (ImGui::Selectable(names[k].c_str(), k == pick)) pick = k;
-                    ImGui::PopID();
-                  }
-                  ImGui::EndCombo();
-                }
-                ImGui::PopID();
-              }
-            }
-            ImGui::TextDisabled("a blade no longer cuts armour OFF: it wears");
-            ImGui::TextDisabled("through in holes, and leaves with the limb");
-          }
-          // FIRST, because it is the one that spawns the creature you PICKED
-          // rather than a behaviour preset wearing its body. The three below
-          // override the sidecar's own `behavior`, which is right when you
-          // want a duelist and wrong every other time -- a zombie on the
-          // `duelist` profile has no bite in its style list and can only
-          // punch.
-          // THE STRANGER: nothing picked above is used but the effect boxes.
-          if (ImGui::Button("random human##ai")) s.aiSpawnRandom = true;
-          ImGui::SameLine();
-          ImGui::TextDisabled("any sex, build, face, hair, colouring,");
-          ImGui::TextDisabled("  weapon, outfit and fighting style");
-          ImGui::Separator();
-          if (ImGui::Button("as authored##ai")) s.aiSpawnOwn = true;
-          ImGui::SameLine();
-          ImGui::TextDisabled("its own JSON behaviour (zombie -> bites)");
-          ImGui::TextDisabled("...or override that with a preset:");
-          if (ImGui::Button("dummy##ai")) s.aiSpawnDummy = true;
-          ImGui::SameLine();
-          ImGui::TextDisabled("blind, never moves, never turns");
-          if (ImGui::Button("static swordsman##ai")) s.aiSpawnStatic = true;
-          ImGui::SameLine();
-          ImGui::TextDisabled("turns to face, swings in reach");
-          if (ImGui::Button("duelist##ai")) s.aiSpawnDuelist = true;
-          ImGui::SameLine();
-          ImGui::TextDisabled("paths in, holds range, circles");
-          // THE FIGHTING STYLES (behaviors.json): each reads its own wounds,
-          // your weapon and your swings, and guards / dodges / feints.
-          ImGui::TextDisabled("fighting styles (read you, defend, adapt):");
-          static const char* const kStyles[][2] = {
-              {"swordsman", "all-rounder: guards, ripostes, adapts"},
-              {"fencer", "kites at the edge of your reach, dodges"},
-              {"brawler", "rushes inside, weaves, punishes whiffs"},
-              {"berserker", "relentless; worse when hurt"},
-              {"guardian", "turtles, parries, counters"}};
-          for (const auto& st : kStyles) {
-            if (ImGui::Button((std::string(st[0]) + "##aistyle").c_str()))
-              s.aiSpawnProfile = st[0];
-            ImGui::SameLine();
-            ImGui::TextDisabled("%s", st[1]);
-          }
-          ImGui::Separator();
-          if (ImGui::Button("kill all spawned##ai")) s.aiKillSpawned = true;
-          ImGui::SameLine();
-          if (ImGui::Button("ragdoll all spawned##ai")) s.aiRagdollSpawned = true;
-          ImGui::Separator();
-          ImGui::Checkbox("debug viz (path / target / band)", &s.showAiDebug);
-          ImGui::Checkbox("...include the range-band ring", &s.showAiRing);
-          ImGui::Separator();
-          ImGui::Text("attack requests: %d", s.aiAttackCount);
-          ImGui::TextWrapped("last: %s", s.aiLastAttack.empty()
-                                             ? "(none yet)"
-                                             : s.aiLastAttack.c_str());
-          ImGui::TextDisabled("the AI decides WHEN and WHERE; the stroke");
-          ImGui::TextDisabled("program (game/strokes.h) swings them");
-          ImGui::Separator();
-          ImGui::Text("parries: %d", s.aiBlockCount);
-          ImGui::TextWrapped("last: %s", s.aiLastBlock.empty()
-                                             ? "(none yet)"
-                                             : s.aiLastBlock.c_str());
-          ImGui::TextDisabled("blocking is EMERGENT: a blade in the path");
-          ImGui::TextDisabled("stops the blow. There is no block button.");
-          ImGui::EndTabItem();
-        }
-
         // ---- Mobs --------------------------------------------------------
         if (ImGui::BeginTabItem("Mobs")) {
           if (s.aiMobIds.empty()) {
@@ -2065,7 +2216,7 @@ void Overlay::Draw(UIState& s) {
   // why installing a GLFW scroll callback here would freeze the wheel
   // everywhere.
   if (s.combatWindowOpen) {
-    ImGui::SetNextWindowPos(ImVec2(1130, 12), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowPos(ImVec2(sPanelW + 12, 40), ImGuiCond_FirstUseEver);
     ImGui::SetNextWindowSize(ImVec2(420, 720), ImGuiCond_FirstUseEver);
     if (ImGui::Begin("Combat", &s.combatWindowOpen)) {
       Tuning t = CurrentTuning();

@@ -534,7 +534,7 @@ struct UIState {
   // re-found BY NAME afterwards — so adding a tenth pattern to
   // gen_peasant_clothes.py and hitting R puts it in the combo without
   // disturbing what is already picked.
-  bool wardrobeWindowOpen = false;
+  // (Drawn in the F1 sidebar's Spawn page, "Clothes"; no window of its own.)
   // The dye, as the picker's own 0..1 RGB. Packed by main.cpp when it spawns,
   // never here — UIState is a POD the overlay may only read and write, and
   // packing it here would put game/dye.h in the UI's dependency set for no
@@ -556,7 +556,17 @@ struct UIState {
 
   std::vector<std::string> materialNames;  // index == material id
   std::vector<uint32_t> materialColors;    // 0xAABBGGRR swatch (gpu color0)
+  // The F1 material picker's columns and icons, parallel to materialNames and
+  // rebuilt with it (main.cpp FillUiMaterials): the class (0 solid, 1 powder,
+  // 2 liquid, 3 gas — materials.h CLASS_*), the two other palette variants so
+  // the icon is a 2x2 of the real jitter colours, and the tags comma-joined
+  // (the solids column sub-groups on them and the tooltip lists them).
+  std::vector<uint8_t> materialClass;
+  std::vector<uint32_t> materialColors1, materialColors2;
+  std::vector<std::string> materialTags;
   bool visible = true;
+  // Which page of the F1 sidebar is showing (Overlay::Draw's kDevTabs).
+  int devTab = 0;
 
   // ---- magic (game/spell.h, game/caster.h) --------------------------------
   // The crossover readout — where the running cost stops coming out of mana
@@ -1371,6 +1381,13 @@ class Overlay {
   // `yBottom` and returns the height it reserved, so DrawHUD stacks the "DEAD"
   // banner above it without duplicating the figure's proportions.
   float DrawBodyFigure(const UIState& s, float x, float yBottom);
+  // The F1 sidebar's pages (Draw() owns the frame, header and page strip).
+  void DrawDevPaint(UIState& s);
+  void DrawDevSpawn(UIState& s);
+  void DrawDevWorld(UIState& s);
+  void DrawDevView(UIState& s);
+  void DrawDevMagic(UIState& s);
+  void DrawDevDebug(UIState& s);
   // One VkSampler for every registered texture (nearest + clamp: the portrait
   // is displayed at an integer multiple and must stay pixel-crisp). Held as
   // uint64_t so the header names no Vulkan type — the handle itself is only
