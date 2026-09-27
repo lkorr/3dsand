@@ -1400,7 +1400,11 @@ material id would need one id per (solvent, solute, concentration). A liquid
 cell instead carries an optional 16-bit value in a **sparse auxiliary layer**
 beside the page pool: `species << 8 | mass`, mass 0..255 units per cell
 (concentration = `mass * 8 / fullness`, derived, never stored). One species a
-cell; two species meeting do not mix (the second stays undissolved / is refused).
+cell; two species meeting do not mix (the second stays undissolved / is refused:
+a liquid flowing into a cell of another species leaves its mass behind in what is
+left of it, and only a source that empties entirely has it discarded, counted --
+`solTransfer`; fixed 2026-09-27 by the chemistry audit, it used to discard every
+transfer's mass).
 
 **Storage.** `solTable[slot]` is `0` (EMPTY), `UNIFORM | value16` or
 `PAGE | page`; `solPool` is `kSolutePoolPages` (= `kNumSlots / 8`, 4,096 at a
@@ -1415,8 +1419,9 @@ mass off non-solvents, applies the dilution floor, collapses a uniform page back
 to a sentinel and returns empty pages the same tick. WHETHER a slot is a page is
 a function of the dirty set and the solute state (deterministic); WHICH page it
 got depends on atomic order and nothing keys on it. A store into a non-page is a
-counted fault; pool exhaustion is a fatal abort in `SubmitTick` (like the voxel
-pool).
+fault and, like pool exhaustion, a FATAL abort in `SubmitTick` with the first
+faulting slot and tick (support.cpp; the check every solute shader's `solFault`
+comment names -- it existed only in the comments until the 2026-09-27 audit).
 
 **The CA moves it** (sim_step.wgsl, hooks commented at each site): `tryMove`
 swaps mass with the matter (`solSwap`), `transferLiquid` moves it in proportion
@@ -1457,7 +1462,13 @@ chlorine) is the first user.
 brine surface stays on the CA.
 
 **Streaming and saves.** `solEvict` / `solRestore` run between ticks around a
-window shift; `Stream` keeps evicted chunks' values keyed by world chunk.
+window shift; `Stream` keeps evicted chunks' values keyed by world chunk. A
+shift evicts a plane of up to 1,024 slots and the staging holds
+`kSolEvictRecords` (256) records, so `Stream::EvictSolutes` runs in batches of
+256 slots, one pass and staging each: a batch can never overflow, and which
+slots got a record can never depend on `solEvict`'s atomic order (it could,
+before the 2026-09-27 audit -- a large salted body leaving the window lost a
+scheduling-dependent subset of its chunks).
 Saves write `solutes.svs` (species by NAME, remapped on load). The layer is
 hashed (`solHash`, slot-keyed like the voxels).
 
@@ -1478,8 +1489,18 @@ unpaid scoop) takes the dissolved share of the liquid that left
 at. Phase H sends the due ones as **`CellOpSolute`** ops (world.h: the
 IF_AIR-on-AIR spelling with a species in bits 24..30, units in 12..23),
 through the MutationQueue like every other write. sim_mutate `cells` raises the
-op's chunk's solute REQUEST flag (so solWant pages N27 of it this tick) and
-writes no voxel; **`solPour`** (sim_mutate.wgsl, one invocation, after
+solute REQUEST flag of the op's chunk AND of the chunks above and below it (so
+solWant pages N27 of each this tick: the surface search can deposit a chunk up
+or down, and the CA may carry that mass on into ITS neighbours in the same
+tick) and writes no voxel; solPour deposits only within one chunk of the op's,
+vertically (a longer fall precipitates instead). At most
+`kMaxSolutePourOpsPerTick` (256) pours a tick: SubmitTick clamps the stream to
+it keep-first, cuts voxel ops before pours when the whole cell stream is over
+`kMaxCellOpsPerTick`, and counts refused pours and their units into
+last_run.json's `opstream` block (`solPourTrunc`, `solPourUnitsTrunc`). The
+producer (`ContainerSolutePoursDue`) sends at most 64 and merges same-cell pours
+only up to one entry's worth (`kSolutePourMaxEighths`), so the powder fallback
+always has room; **`solPour`** (sim_mutate.wgsl, one invocation, after
 solAlloc and solScoop) walks the pours -- which SubmitTick moves to the tail of
 the cell stream and the keep-first dedupe exempts -- in push order: it finds
 the surface under the cell (up out of the ground, down through air), lays the
@@ -3752,8 +3773,11 @@ is JSON plus one handler, never an enum. `materials.cpp` parses the list into
 `reactOffset + k`, synthesized neighborChance tails included — they inherit their
 parent's effects), validates `explode` (radius 1..`kMaxExplosionRadius`, power
 1..5000) and warns once about a kind outside `kKnownEffectKinds` (explode, flash,
-eject, shock, burst). Consumers: the WORLD (below: `explode`), the alchemy bench
-(package C: `explode`/`burst`/… as bench events), bodies (below).
+eject, shock, burst, pop). Consumers: the WORLD (below: `explode`, `flash`, and
+`shock` -- a flash whose default `what` is `spark`), the alchemy bench (package C:
+every kind, as bench events; a rule's EVERY effect is raised, not only its
+first), bodies (below). `eject`, `burst` and `pop` act on a vessel or a player at
+the bench and have no world counterpart: the world ignores them by design.
 
 **The world's `explode` is a real explosion through the normal path.** The CA
 cannot run a blast, and must not decide one from append order:
@@ -3764,8 +3788,10 @@ cannot run a blast, and must not decide one from append order:
    `pageFaults` record's **per-tick block** `[40..63]` (world.h
    `kPageFaultReactFx*`; cleared every tick by pass_table's `fill_reactFx`):
    an `atomicAdd` count and **16 slots**, each an `atomicMax` of
-   `(fxId << 27) | scramble(window cell)`, the slot chosen by
-   `hash3(seed, tick, cell)`. The survivors are a pure function of the SET of
+   `(fxId << 27) | scramble(slot cell)`, the slot chosen by
+   `hash3(seed, tick, slot cell)` -- the SLOT cell (world cell mod `kWorldN`),
+   so neither depends on where the window sits; the origin stored beside the
+   slots decodes it back to the one window cell it names. The survivors are a pure function of the SET of
    firings — order-free, never an append cursor (rule 1). The scramble is an odd
    multiply mod 2^27 so a slot's winner is spatially scattered, and it inverts
    exactly (`ReactFxDecodeCell`).
@@ -3790,7 +3816,7 @@ rules on body voxels; a fired rule with an fx id is reported at that voxel's
 world cell (`noteBodyFx`, ≤ 16 a tick) and drained into the same handler — a
 body blasts where the reaction happened on it. (DebrisSystem's bodies do not
 report yet.) Out-of-window (ticket) cells are not reported: the key holds a
-window-relative cell; their products still apply.
+window cell; their products still apply.
 
 **Toxic gas** is plain rules through the same inbound pass: `chlorine` (30‰) and
 `noxious_gas` (5‰) turn skin / exposed flesh they touch into `flesh_cooked` — a
@@ -16927,7 +16953,13 @@ together in a flask whose world rule carries an `explode` effect
 (`ContainerPocketExplosion`, over `MobSystem::Reactions()` and `ruleFx`) goes off:
 the flask is gone, its contents burst out at the hands and a real blast goes
 off there through `PlayerSession::pendingBlasts`. Only `explode` is answered;
-the rest of a carried vessel's chemistry happens on the bench.
+the rest of a carried vessel's chemistry happens on the bench. Only a pair that
+includes what just ARRIVED is asked (a flask that left the bench holding sodium
+over water that had not met yet is not set off by a scoop of sand), and a pocket
+is dark and cannot read a concentration: a light/sky/rain-gated or
+solute-conditioned rule never fires there. A vessel in a hand leaves through
+`Mob::KitTake`, as the bench's break does. A blast `kMaxExplosionsPerTick`
+refuses waits in `pendingBlasts` for the next tick instead of vanishing.
 
 **The workstation** (`game/alchemy_bench.*`, `ui/inventory_ui.cpp` AlchemyPanel,
 reworked 2026-09-27 from the owner's "this should be a work station"). Double-
@@ -17189,8 +17221,23 @@ what keeps ValidateBench a proof.
   dependency.
 
 **Not yet:** the cauldron, a held/grounded flask drawing its layers, refraction; a stream off the table leaves from the nearest hand's lip,
-not from where on the table it fell; only the first effect of a rule is
-raised on the bench. (Brine electrolysis ON THE BENCH landed with package G:
+not from where on the table it fell; dissolved matter that streams off the
+table enters the world as its POWDER (conserved; the vessel door's in-solution
+seam is not used for it).
+
+**Fixed by the 2026-09-27 audit** (docs/AUDIT_alchemy_chemistry.md): an EJECT
+(`explode`) applies its blast and puff only if the session was written back --
+a voided session (the ledger failed, or a vessel moved) used to blast AND
+return both flasks full; both void paths now take what already streamed into
+the world out of the vessels. The bench's events are handled before a close in
+the same frame, so they are not dropped with it. Every effect of a rule is
+raised (merged per kind and vessel at the biggest radius/power). A reaction's
+product lands only on its own side of the glass (`AddGasAt`/`PlaceGrain`
+`within`). The stirring stick cannot enter a stoppered vessel: it rests on the
+cork. A materials reload that MOVES ids closes the bench first (a same-ids
+reload, e.g. F5, leaves it running on the rules it copied). The readout shows
+gas as headspace (not fill) and clears a vessel's devices when the focus has
+none. (Brine electrolysis ON THE BENCH landed with package G:
 the bench evaluates concentration conditions -- see "Solutes", gate
 `alchemy-brine-electrolysis`.)
 

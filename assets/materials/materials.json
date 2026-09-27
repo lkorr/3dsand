@@ -3492,7 +3492,7 @@
       ]
     },
     {
-      "//": "Chlorine gas. Yellow-green and toxic: eats the skin it touches (reactions.json, the mob inbound pass). Real chlorine is 2.5x denser than air and pools in low ground.",
+      "//": "Chlorine gas. Yellow-green and toxic: eats the skin it touches (reactions.json, the mob inbound pass). Real chlorine is 2.5x denser than air and pools in low ground: here that is the `gas_heavy` tag (sim_step.wgsl stepHeavyGas: down or flat, never up), not `density`, which only orders it against other gases.",
       "id": "chlorine",
       "far": "smoke",
       "class": "gas",
@@ -3972,7 +3972,7 @@
       ]
     },
     {
-      "//": "REAL. Quicksilver (mercury). A liquid metal at 13,540 kg/m3 -- EVERYTHING but gold sinks in water and floats on this, lead included, exactly as it does in life. Flows freely (moveEvery 1). With sulfur it makes cinnabar; heated it gives off a poisonous vapour (noxious_gas).",
+      "//": "REAL. Quicksilver (mercury). A liquid metal at 13,540 kg/m3 -- In life everything but gold floats on it, lead included. Here gold_dust floats on it too: it is a loose powder at 9,000, and a powder only sinks into a liquid less dense than itself (canDisplace). Flows freely (moveEvery 1). With sulfur it makes cinnabar; heated it gives off a poisonous vapour (noxious_gas).",
       "id": "quicksilver",
       "arcane": 20,
       "far": "steel",
@@ -4042,7 +4042,7 @@
       "tags": []
     },
     {
-      "//": "REAL. White phosphorus: waxy, pale, and it GLOWS faintly green in the air (real chemiluminescence -- the 'light-bearer' of its name). It catches fire BY ITSELF in air (reactions.json phosphorus + air -> fire), and that is why it is kept under water: a grain with no air beside it never lights. A pile in the open smokes and then flares.",
+      "//": "REAL. White phosphorus: waxy, pale, and it GLOWS faintly green in the air (real chemiluminescence -- the 'light-bearer' of its name). It catches fire BY ITSELF in air (reactions.json: a decay to fire scaled by the air faces round it, `scaleByNeighbors` over air -- a pair rule naming air would never fire, the grid skips air faces), and that is why it is kept under water: a grain with no air beside it never lights. A pile in the open smokes and then flares.",
       "id": "phosphorus",
       "arcane": 12,
       "far": "sand",
