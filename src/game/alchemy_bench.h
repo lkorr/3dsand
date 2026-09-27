@@ -89,6 +89,7 @@ struct BenchEvent {
 struct BenchOutcome {
   bool eject = false;       // the bench closes NOW, mid-motion
   bool breakHeld = false;   // the vessels in the character's hands break; their contents burst out
+  std::vector<int> burst;   // entries whose glass breaks on the bench (their contents loose on it)
   struct Blast { int32_t radius = 0, power = 0; };
   std::vector<Blast> blasts;           // REAL explosions at the hands (ExplosionOp, the grenade slot)
   std::vector<uint16_t> puff;          // gases puffed round the hands (only gas materials are used)
@@ -221,6 +222,8 @@ class AlchemyBench {
   void SetStopper(KitRef ref, bool on);
   void SetBurner(KitRef ref, bool on);
   void Shock(KitRef ref);
+  // Breaks a vessel's glass on the bench (a BenchOutcome's `burst`), by entry.
+  void BurstEntry(int entry);
 
   // Stops the sim, lets whatever is in flight land, tallies, closes.
   // `abrupt` (an event ejected the player): nothing settles, the table is
@@ -236,7 +239,7 @@ class AlchemyBench {
 
  private:
   struct Cmd {
-    enum Kind { kPlace, kRemove, kStopper, kBurner, kShock } kind;
+    enum Kind { kPlace, kRemove, kStopper, kBurner, kShock, kBurst } kind;
     int entry;
     VesselShape shape;
     Composition contents;

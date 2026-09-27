@@ -377,6 +377,12 @@ const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
 // second one (SANDVOX_BENCH_B, default lava+sand), opens the first on the
 // bench, stirs it, brings the second in, carries it over the mouth and tilts
 // it to pour, then closes -- a picture at each step through g_shotJumpPath.
+// THE CHEMISTRY (package C), by env: SANDVOX_BENCH_BURNER=1 lights the flame
+// under A, SANDVOX_BENCH_STOPPER=1 stoppers A, SANDVOX_BENCH_SHOCK=<frame>
+// electrifies A every 20 frames from that frame, SANDVOX_BENCH_NOPOUR=1 skips
+// the stir and the pour and just watches (extra pictures _chem1.._chem3).
+// e.g. SANDVOX_BENCH_A=acid:0.3+sand:0.08 (fumes), =salt:0.1 with BURNER=1 and
+// SHOCK=300 (electrolysis), =water:0.3+sodium:0.01 (it blows up in your hands).
 bool g_shotBench = false;
 constexpr uint64_t kShotBenchLast = 425;
 float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
@@ -9112,6 +9118,22 @@ int main(int argc, char** argv) {
         ui.alchemy.toggleRef = refB;
       }
       if (f == 175) g_shotJumpPath = "screenshot_bench.bmp";
+      static const bool chemBurner = std::getenv("SANDVOX_BENCH_BURNER") != nullptr;
+      static const bool chemStopper = std::getenv("SANDVOX_BENCH_STOPPER") != nullptr;
+      static const bool chemNoPour = std::getenv("SANDVOX_BENCH_NOPOUR") != nullptr;
+      static const int chemShock = std::getenv("SANDVOX_BENCH_SHOCK") ? std::atoi(std::getenv("SANDVOX_BENCH_SHOCK")) : -1;
+      if (f == 178 && bench.IsOpen()) {
+        if (chemBurner) bench.SetBurner(refA, true);
+        if (chemStopper) bench.SetStopper(refA, true);
+      }
+      if (chemShock > 0 && (int)f >= chemShock && ((int)f - chemShock) % 20 == 0 && bench.IsOpen())
+        bench.Shock(refA);
+      if (chemNoPour) {
+        if (f == 240) g_shotJumpPath = "screenshot_bench_chem1.bmp";
+        if (f == 320) g_shotJumpPath = "screenshot_bench_chem2.bmp";
+        if (chemShock > 0 && (int)f == chemShock + 2) g_shotJumpPath = "screenshot_bench_arc.bmp";
+        if (f == 398) g_shotJumpPath = "screenshot_bench_chem3.bmp";
+      }
       // SANDVOX_BENCH_PORTRAIT_YAW turns the portrait (radians; 1.3 = from the
       // side): the front view foreshortens a flask held out toward you.
       if (const char* py = std::getenv("SANDVOX_BENCH_PORTRAIT_YAW"))
@@ -9121,19 +9143,19 @@ int main(int argc, char** argv) {
       const bool haveA = bench.IsOpen() && bench.PoseOf(refA, pa, wa, ha);
       const bool haveB = bench.IsOpen() && bench.PoseOf(refB, pb, wb, hb);
       // Stir A: the stick sweeps side to side in its belly.
-      if (f > 180 && f < 240 && haveA) {
+      if (f > 180 && f < 240 && haveA && !chemNoPour) {
         ui.alchemy.tool = 1;
         ui.alchemy.over = true;
         ui.alchemy.down = true;
         ui.alchemy.atX = pa.pos.x + wa * 0.3f * std::sin((float)f * 0.15f);
         ui.alchemy.atY = pa.pos.y + ha * 0.15f;
       }
-      if (f == 238) g_shotJumpPath = "screenshot_bench_stir.bmp";
+      if (f == 238 && !chemNoPour) g_shotJumpPath = "screenshot_bench_stir.bmp";
       // Pour B into A with the hand: grab B by its belly, lift it clear,
       // then carry and tip it so its left lip corner hangs over A's mouth.
       static float want = 0.0f, reqd = 0.0f;
       static alchemy::V2 grabAt, start;
-      if (f >= 260 && f < 400 && haveA && haveB) {
+      if (f >= 260 && f < 400 && haveA && haveB && !chemNoPour) {
         const alchemy::V2 grabL{0.0f, hb * 0.35f};
         if (f == 260) {
           grabAt = {pb.pos.x + grabL.x, pb.pos.y + grabL.y};
@@ -9174,9 +9196,9 @@ int main(int argc, char** argv) {
         ui.alchemy.tiltReq = want - reqd;
         reqd = want;
       }
-      if (f == 289) g_shotJumpPath = "screenshot_bench_lift.bmp";
-      if (f == 300) g_shotJumpPath = "screenshot_bench_pour.bmp";
-      if (f == 398) g_shotJumpPath = "screenshot_bench_poured.bmp";
+      if (f == 289 && !chemNoPour) g_shotJumpPath = "screenshot_bench_lift.bmp";
+      if (f == 300 && !chemNoPour) g_shotJumpPath = "screenshot_bench_pour.bmp";
+      if (f == 398 && !chemNoPour) g_shotJumpPath = "screenshot_bench_poured.bmp";
       if (f == 405) ui.alchemy.wantClose = true;
       if (f == 420) g_shotJumpPath = "screenshot_bench_closed.bmp";
     }
@@ -13017,6 +13039,7 @@ int main(int argc, char** argv) {
           alchemy::BenchOutcomeWorldOps(out, hands, rng::Hash3(0xB1A57u, (uint32_t)frameCounter, 1u), mats,
                                         exps, gas);
           for (const ExplosionOp& e : exps) session.pendingBlasts.push_back(e);
+          for (int be : out.burst) bench.BurstEntry(be);
           if (!gas.empty()) world.QueueGasSpawns(gas.data(), (uint32_t)gas.size());
           if (out.eject) {
             finishBench(true, out.breakHeld);

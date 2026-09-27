@@ -261,7 +261,8 @@ float FlaskSim::Pressure(int vi) const {
   for (size_t i = 0; i < px_.size(); i++)
     if (phome_[i] == vi) liquid += pw_[i];
   const float free = std::max(2.0f + 0.03f * area, (float)(area - grains - liquid));
-  return (float)GasUnits(vi) / free;
+  // Hot gas pushes harder (P ~ nT): the glass's heat scales it up to 4x.
+  return (float)GasUnits(vi) / free * (1.0f + 3.0f * v.heat);
 }
 
 // ---- events ----------------------------------------------------------------
@@ -325,7 +326,7 @@ void FlaskSim::CheckPressure() {
     if (v.outline.empty() || !v.stoppered) continue;
     const float p = Pressure((int)vi);
     if (p < cfg_.popAt) continue;
-    if (p >= cfg_.burstAt || v.heat > 0.5f) {
+    if (p >= cfg_.burstAt || v.heat > 0.25f || Burning((int)vi)) {
       RaisePressureEvent("burst", (int)vi, p);
       ShatterVessel((int)vi);
     } else {
@@ -360,6 +361,19 @@ void FlaskSim::ShatterVessel(int vi) {
     g.vx = dx / l * 1.4f;
     g.vy = dy / l * 1.4f + 0.8f;
   }
+  // The glass flies: shards off every stretch of the outline (look only).
+  shardStep_ = step_;
+  for (size_t k = 0; k + 1 < v.outline.size(); k++)
+    for (int j = 0; j < 3; j++) {
+      const float t = (j + 0.5f) / 3.0f;
+      const V2 l{v.outline[k].x + (v.outline[k + 1].x - v.outline[k].x) * t,
+                 v.outline[k].y + (v.outline[k + 1].y - v.outline[k].y) * t};
+      const V2 w = ToWorld(v.x, l);
+      V2 d = VSub(w, c);
+      const float dl = std::max(1.0f, std::sqrt(Dot2(d, d)));
+      const float sp = 0.6f + (Rand() % 100) / 100.0f;
+      shards_.push_back({w.x, w.y, d.x / dl * sp, d.y / dl * sp + 0.5f, 90 + (int)(Rand() % 60)});
+    }
   for (Pool& p : pools_)
     if (p.vessel == vi) {
       const V2 w = ToWorld(v.x, {(float)(p.sx / std::max(1e-9, p.w)), (float)(p.sy / std::max(1e-9, p.w))});
@@ -796,6 +810,14 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
   };
   for (const ChemRule& r : rules) {
     if (!ChemGateOpen(r.cond, chem_.daylight)) continue;
+    // A GAS FADING TO NOTHING is the world's way of saying it dispersed into
+    // the open air (smoke, steam, noxious fumes all "decay to air"). Inside a
+    // STOPPERED vessel there is nowhere for it to go: that rule does not
+    // fire there -- which is what lets gas build pressure in a sealed flask.
+    // A decay into MATTER (steam condensing to water) still does.
+    if (r.kind == kChemDecay && selfType == NbGas && r.prodSelf == kChemAir && hv >= 0 &&
+        hv < (int)vessels_.size() && vessels_[hv].stoppered)
+      continue;
     if (r.kind == kChemDecay) {
       uint32_t chance = r.chance;
       if (ChemScaleArmed(r.cond)) {
@@ -1127,7 +1149,9 @@ void FlaskSim::StepGas() {
       gasAge_[k] = 0;
     }
     const Substance& S = subs_[s];
-    const bool heavy = S.density >= 5;
+    // A HEAVY gas (chlorine: materials.h kMatFlagHeavyGas) sinks and pools
+    // in the bottom of a flask instead of venting.
+    const bool heavy = S.heavy;
     const int vdir = heavy ? -1 : 1;
     const float pRise = heavy ? 0.3f : std::clamp((6.0f - (float)S.density) / 5.0f, 0.3f, 1.0f);
     const bool inLiquid = NearestParticle(x + 0.5f, y + 0.5f, spacing_ * 0.6f) >= 0;
@@ -1461,7 +1485,28 @@ void FlaskSim::RenderChem(std::vector<uint32_t>& out) const {
     }
   }
 
-  // 5. THE STOPPER: a cork in the mouth, turned with the vessel.
+  // 5. SHARDS of burst glass, falling.
+  if (!shards_.empty()) {
+    const int el = (int)std::min<uint32_t>(64, step_ - shardStep_);
+    shardStep_ = step_;
+    size_t w = 0;
+    for (Shard s : shards_) {
+      for (int k = 0; k < el; k++) {
+        s.vy -= cfg_.gravity * 2.0f;
+        s.x += s.vx * 0.5f;
+        s.y += s.vy * 0.5f;
+        s.life--;
+      }
+      if (s.life <= 0 || s.y < -2 || s.x < -2 || s.x > W + 2) continue;
+      shards_[w++] = s;
+      const int a = std::min(230, 60 + s.life * 2);
+      put((int)s.x, (int)s.y, 225, 240, 255, a);
+      put((int)s.x + (s.vx > 0 ? 1 : -1), (int)s.y, 160, 200, 230, a / 2);
+    }
+    shards_.resize(w);
+  }
+
+  // 6. THE STOPPER: a cork in the mouth, turned with the vessel.
   for (size_t vi = 0; vi < vessels_.size(); vi++) {
     const Vessel& v = vessels_[vi];
     if (v.outline.empty() || !v.stoppered) continue;

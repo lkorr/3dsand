@@ -768,6 +768,8 @@ const char* const kOrder[] = {
     // regenerates it on the way out.
     "corpse-crossheat", "garment-burn", "corpse-worn", "corpse-splatter", "vessel-grid", "vessel-sand", "vessel-mpm", "vessel-break",
     "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-spawn", "alchemy-sand-carry",
+    // Bench chemistry (package C): CPU-only FlaskSims over the world's tables.
+    "alchemy-react", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode",
     // World chemistry (docs/PLAN_alchemy_chemistry.md A): each builds its own
     // sealed fixture, ticks THE tick, and regenerates the world on the way
     // out; chem-toxic spawns under an IdCounterScope and resets the mobs.

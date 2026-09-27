@@ -74,6 +74,7 @@ struct Substance {
   uint8_t klass = 2;       // 0 solid, 1 powder, 2 liquid, 3 gas
   uint32_t tagMask = 0;
   bool gas = false;
+  bool heavy = false;      // a HEAVY gas (materials.h kMatFlagHeavyGas): it sinks and pools
 };
 
 // A vessel's inside, as an authored profile: half-widths at heights, both in
@@ -189,10 +190,13 @@ struct SimConfig {
   float burnerReach = 18.0f;
   int shockSteps = 36;           // chemistry steps one Electrify lasts (0.6 s)
   // PRESSURE: mean gas units per free inside pixel of a stoppered vessel at
-  // which the stopper pops -- or, when the glass is hot (heat > 0.5) or it
-  // passes burstAt, the vessel BURSTS.
-  float popAt = 2.5f;
-  float burstAt = 7.0f;
+  // which the stopper pops -- or, over a lit burner or hot glass (heat > 0.25) or past
+  // passes burstAt, the vessel BURSTS. A gas unit is the matter of a liquid
+  // unit (the ledger counts them alike), so a flask of water boiled wholly to
+  // steam holds ~1 unit per free pixel; real steam would be 1600x the volume.
+  // Hence a pop well under 1: a stoppered flask on the burner goes.
+  float popAt = 0.6f;
+  float burstAt = 3.0f;
 };
 
 // Something the chemistry did that the game must answer (alchemy_bench.h
@@ -257,6 +261,8 @@ class FlaskSim {
   float Pressure(int v) const;
   // A vessel whose glass broke (a burst): gone, its contents loose.
   bool Broken(int v) const { return v >= 0 && v < (int)vessels_.size() && vessels_[v].broken; }
+  // Breaks a vessel's glass now (a rule-authored "burst" effect).
+  void Burst(int v) { ShatterVessel(v); }
   // The chemistry's events since the last call.
   std::vector<SimEvent> TakeEvents();
   // THE LEDGER, in units per substance slot: what reactions made and
@@ -347,7 +353,7 @@ class FlaskSim {
   bool Active() const { return active_; }
   // Does the picture move on its own even when nothing is simulated (glow,
   // fizz, the light on water)? The panel keeps redrawing it, slower.
-  bool Animated() const { return !px_.empty() || !gasList_.empty() || anyDevice_; }
+  bool Animated() const { return !px_.empty() || !gasList_.empty() || anyDevice_ || !shards_.empty(); }
   // Read-only views for gates and the lab.
   const std::vector<V2>& Positions() const { return px_; }
   const std::vector<V2>& Velocities() const { return pv_; }
@@ -597,6 +603,10 @@ class FlaskSim {
   uint32_t gasStamp_ = 0;
   std::vector<int> gasOrder_;
   std::vector<SimEvent> events_;
+  // Glass flying from a burst (look only), advanced by the picture.
+  struct Shard { float x, y, vx, vy; int life; };
+  mutable std::vector<Shard> shards_;
+  mutable uint32_t shardStep_ = 0;
   mutable std::vector<float> rGas_;
   mutable std::vector<uint8_t> rGasSub_;
   void BucketChem();

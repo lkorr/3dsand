@@ -33,6 +33,7 @@ inline Substance SubstanceFromMaterial(const MaterialDef& m, uint16_t id) {
   // is kept as grains.
   s.powder = m.gpu.klass == CLASS_POWDER || m.gpu.klass == CLASS_SOLID;
   s.gas = m.gpu.klass == CLASS_GAS;
+  s.heavy = s.gas && (m.gpu.flags & kMatFlagHeavyGas) != 0;
   s.tagMask = m.gpu.tagMask;
   s.density = m.gpu.density;
   s.moveEvery = m.gpu.moveEvery ? m.gpu.moveEvery : 1;
@@ -175,7 +176,22 @@ inline Chemistry BuildBenchChemistry(const std::vector<MaterialDef>& mats,
   }
   if (const uint32_t hot = TagBitByName(mats, "hot")) {
     c.heat.on = true;
-    c.heat.tags = hot;
+    // "tag:hot" plus every SYNTHETIC bit a `neighborChance` rule made of it
+    // (materials.cpp ExpandNeighborChance: "hot-except-fire" is carried by
+    // every hot material but fire, and the ignition rules match on it) -- a
+    // bit only hot materials carry. The glass is hot, and not fire.
+    uint32_t tags = hot;
+    for (int b = 0; b < 32; b++) {
+      const uint32_t bit = 1u << b;
+      bool any = false, onlyHot = true;
+      for (size_t i = 1; i < mats.size() && onlyHot; i++)
+        if (mats[i].gpu.tagMask & bit) {
+          any = true;
+          onlyHot = (mats[i].gpu.tagMask & hot) != 0;
+        }
+      if (any && onlyHot) tags |= bit;
+    }
+    c.heat.tags = tags;
     c.heat.klass = CLASS_GAS;
   }
   if (const uint32_t el = TagBitByName(mats, "electric")) {

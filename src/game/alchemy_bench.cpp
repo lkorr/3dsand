@@ -50,10 +50,25 @@ std::map<std::string, BenchEventHandler>& Registry() {
       o.puffCells = std::max(o.puffCells, b.radius * 10);
       o.message = "it explodes in your hands!";
     };
-    // BURST: a stoppered vessel's pressure broke its glass (FlaskSim has
-    // already let its contents loose on the table; the item is gone at done).
-    m["burst"] = [](const BenchEvent&, BenchOutcome& o) {
-      if (o.message.empty()) o.message = "the pressure bursts the glass!";
+    // BURST: the glass breaks. A stoppered vessel's pressure does it in the
+    // sim itself (its contents are already loose on the table); a RULE that
+    // authors "burst" breaks the vessel it fired in. Either way the item is
+    // gone at "done".
+    m["burst"] = [](const BenchEvent& e, BenchOutcome& o) {
+      o.burst.push_back(e.entry);   // already broken (pressure): a no-op
+      if (o.message.empty()) o.message = "the glass bursts!";
+    };
+    // EJECT: thrown back from the bench, nothing broken.
+    m["eject"] = [](const BenchEvent&, BenchOutcome& o) {
+      o.eject = true;
+      if (o.message.empty()) o.message = "you recoil from the bench";
+    };
+    // FLASH and SHOCK: a word for now; the bench shows its own light and arc.
+    m["flash"] = [](const BenchEvent&, BenchOutcome& o) {
+      if (o.message.empty()) o.message = "a blinding flash!";
+    };
+    m["shock"] = [](const BenchEvent&, BenchOutcome& o) {
+      if (o.message.empty()) o.message = "it crackles and bites your fingers";
     };
     // POP: the stopper flew out and the gas is free.
     m["pop"] = [](const BenchEvent&, BenchOutcome& o) {
@@ -264,6 +279,12 @@ void AlchemyBench::SetBurner(KitRef ref, bool on) {
       cmds_.push_back(c);
     }
 }
+void AlchemyBench::BurstEntry(int entry) {
+  if (entry < 0 || entry >= (int)entries_.size() || !entries_[entry].onTable) return;
+  std::lock_guard<std::mutex> lk(mu_);
+  cmds_.push_back({Cmd::kBurst, entry, {}, {}});
+}
+
 void AlchemyBench::Shock(KitRef ref) {
   for (size_t i = 0; i < entries_.size(); i++)
     if (entries_[i].ref == ref && entries_[i].onTable) {
@@ -535,6 +556,7 @@ void AlchemyBench::Apply(Cmd& c) {
     if (c.kind == Cmd::kStopper) sim_.SetStopper(s.sim, c.on);
     else if (c.kind == Cmd::kBurner) sim_.SetBurner(s.sim, c.on);
     else if (c.kind == Cmd::kShock) sim_.Shock(s.sim);
+    else if (c.kind == Cmd::kBurst) sim_.Burst(s.sim);
   }
 }
 
