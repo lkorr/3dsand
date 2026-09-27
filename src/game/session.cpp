@@ -3750,7 +3750,8 @@ static void PhaseJ(TickAuthorityCtx& w, WorldScratch& ws,
 // ---- REACTION EFFECTS -> EXPLOSIONS (docs/PLAN_alchemy_chemistry.md A) ----
 //
 // The world's handler registry for reactions.json "effects", keyed by kind
-// NAME. Only `explode` has a world handler today; every other kind is the
+// NAME. The world handles `explode` (package A) and `flash` (package E: a
+// burst of `glare` round the cell); every other kind is the
 // bench's (package C) or nobody's yet, and is ignored here by design
 // (materials.h ReactionEffect: "a consumer that does not know a kind ignores
 // it"). A new world kind is one more `if (fx.kind == ...)` below plus JSON.
@@ -3768,6 +3769,11 @@ static void PhaseJ(TickAuthorityCtx& w, WorldScratch& ws,
 // blasted again -- a lump of sodium in a lake fires hundreds of rules a
 // tick, and what reads right is a few bangs, not a hundred.
 static constexpr uint32_t kReactBlastsPerTick = 4;
+// FLASH (package E: thermite, phosphorus, the chemical wedding, a
+// transmutation) -- the world's second kind. A ball of light-only gas laid
+// round the cell the tick after (ReactFxAftermath), at most this many a tick,
+// a firing inside one already laid this tick merged into it.
+static constexpr size_t kReactFlashesPerTick = 4;
 
 static void ReactFxAftermath(TickAuthorityCtx& w, uint32_t tick,
                              std::vector<CellOp>& cellOps) {
@@ -3787,6 +3793,27 @@ static void ReactFxAftermath(TickAuthorityCtx& w, uint32_t tick,
     const uint32_t key = (uint32_t)a.c.x * 73856093u ^ (uint32_t)a.c.y * 19349663u ^
                          (uint32_t)a.c.z * 83492791u;
     const int r = std::max(1, a.radius);
+    if (a.mat != 0) {
+      // A FLASH (package E): a ball of the flash material -- `glare`, pure
+      // light that decays in two or three ticks and reacts with nothing --
+      // laid IfAir round the cell. Positions are a hash of (cell, tick, k),
+      // so the ops are a pure function of the firing (rule 1); the count is
+      // bounded here and the flashes a tick in ReactFxToBlasts (rule 2).
+      const int n = std::min(6 + 3 * r, 30);
+      for (int k = 0; k < n; k++) {
+        if (cellOps.size() >= kMaxCellOpsPerTick) break;
+        const uint32_t h = rng::Hash3(key, a.tick, 0xF1A50000u + (uint32_t)k);
+        const int dx = (int)(h % (uint32_t)(2 * r + 1)) - r;
+        const int dy = (int)((h >> 10) % (uint32_t)(2 * r + 1)) - r;
+        const int dz = (int)((h >> 20) % (uint32_t)(2 * r + 1)) - r;
+        const IVec3 c{a.c.x + dx, a.c.y + dy, a.c.z + dz};
+        if (!w.world.CellInWindow(c)) continue;
+        cellOps.push_back({World::SlotCellIndex(c),
+                           PackVoxNew(a.mat, (h >> 28) % 3u) | kCellOpIfAir});
+        rf.flashCells++;
+      }
+      continue;
+    }
     const int rf3 = std::max(1, (3 * r) / 4);
     // A brief flash of flame inside the crater and a puff of smoke over it.
     // Fire decays in a few ticks and smoke in a few seconds (reactions.json),
@@ -3824,10 +3851,42 @@ static void ReactFxToBlasts(TickAuthorityCtx& w, uint32_t tick,
   rf.events += evs.size();
   uint32_t issued = 0;
   const size_t first = exps.size();
+  // FLASHES (package E): merged and capped exactly as blasts are, into their
+  // own list -- a flash is light, so it neither consumes nor is merged into
+  // a blast slot.
+  struct Flash { IVec3 c; int r; };
+  std::vector<Flash> flashes;
+  auto matByName = [&](const std::string& n) -> uint32_t {
+    for (size_t i = 1; i < w.mats.size(); i++)
+      if (w.mats[i].name == n) return (uint32_t)i;
+    return 0;
+  };
   for (const ReactFxEvent& e : evs) {
     const RuleFx* fx = FindRuleFx(w.mats, e.fxId);
     if (!fx) continue;
     for (const ReactionEffect& eff : fx->effects) {
+      if (eff.kind == "flash") {
+        const int r = std::clamp(eff.radius > 0 ? eff.radius : 2, 1, 6);
+        bool merged = false;
+        for (const Flash& f : flashes)
+          merged = merged || std::max({std::abs(f.c.x - e.cell.x), std::abs(f.c.y - e.cell.y),
+                                       std::abs(f.c.z - e.cell.z)}) <= f.r;
+        if (merged || flashes.size() >= kReactFlashesPerTick) {
+          rf.refused++;
+          continue;
+        }
+        const uint32_t mat = matByName(eff.what.empty() ? std::string("glare") : eff.what);
+        if (!mat) continue;
+        flashes.push_back({e.cell, r});
+        rf.flashes++;
+        TickAuthorityCtx::ReactFxWorld::Aftermath a;
+        a.c = e.cell;
+        a.radius = r;
+        a.tick = tick;
+        a.mat = mat;
+        rf.aftermath.push_back(a);
+        continue;
+      }
       if (eff.kind != "explode") continue;  // not a world kind (yet)
       bool merged = false;
       for (size_t i = first; i < exps.size() && !merged; i++) {

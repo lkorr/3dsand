@@ -13,7 +13,11 @@
       "tint": "#cfe3ee",
       "tintStrength": 40,
       "precipitatesTo": "salt",
-      "solvents": ["water", "blood", "enchanted_water", "enchanted_blood", "lye"]
+      "solvents": ["water", "blood", "enchanted_water", "enchanted_blood", "lye"],
+      "//converts": "PACKAGE E: salt concentrated in ENCHANTED water makes holy water (blessed water with salt in it). reactions.json has the same as a salt + enchanted_water pair rule for the world until the solute layer carries it.",
+      "converts": [
+        { "solvent": "enchanted_water", "into": "holy_water", "cMin": 32 }
+      ]
     },
     {
       "name": "fairy",
@@ -33,6 +37,89 @@
         { "solvent": "water", "into": "enchanted_water", "cMin": 48 },
         { "solvent": "blood", "into": "enchanted_blood", "cMin": 48 }
       ]
+    },
+    {
+      "//": "PACKAGE E. REAL. Sugar dissolves readily and a lot of it (saturation 255); concentrated past 160 a water cell BECOMES syrup. Sweet water is a little heavier. Evaporated, it leaves sugar.",
+      "name": "sugar",
+      "from": "sugar",
+      "yieldPerVoxel": 256,
+      "saturation": 255,
+      "dissolveChance": 60,
+      "diffusivity": 16,
+      "floor": 2,
+      "densityPerUnit": 60,
+      "tint": "#c8904a",
+      "tintStrength": 60,
+      "precipitatesTo": "sugar",
+      "solvents": ["water"],
+      "converts": [
+        { "solvent": "water", "into": "syrup", "cMin": 160 }
+      ]
+    },
+    {
+      "//": "PACKAGE E. REAL-ish. Ink: charcoal ground fine hangs in water (and in spirits) as a black suspension -- lampblack ink, the oldest there is. It barely goes in (10 per-mille, saturation 80: most of a charcoal pile stays charcoal), but a little blackens a lot (tintStrength 220). No convert: ink is a tint.",
+      "name": "ink",
+      "from": "charcoal",
+      "yieldPerVoxel": 256,
+      "saturation": 80,
+      "dissolveChance": 10,
+      "diffusivity": 8,
+      "floor": 2,
+      "densityPerUnit": 0,
+      "tint": "#101014",
+      "tintStrength": 220,
+      "precipitatesTo": "charcoal",
+      "solvents": ["water", "spirits"]
+    },
+    {
+      "//": "PACKAGE E. REAL. Copper sulfate: blue vitriol dissolves into water and turns it the blue every chemistry set knows (tint strength 200). A saturated solution is denser than water. Evaporated, it leaves the crystals.",
+      "name": "vitriol",
+      "from": "blue_vitriol",
+      "yieldPerVoxel": 256,
+      "saturation": 200,
+      "dissolveChance": 50,
+      "diffusivity": 14,
+      "floor": 1,
+      "densityPerUnit": 40,
+      "tint": "#1a5cf0",
+      "tintStrength": 200,
+      "precipitatesTo": "blue_vitriol",
+      "solvents": ["water"]
+    },
+    {
+      "//": "PACKAGE E. Foxfire in water: luminous spores dissolved make the water GLOW (glow 160 at saturation), and past 96 a cell becomes a potion of light (glow_potion). Evaporated, the spores come back.",
+      "name": "lumen",
+      "from": "luminous_spores",
+      "yieldPerVoxel": 256,
+      "saturation": 255,
+      "dissolveChance": 40,
+      "diffusivity": 20,
+      "floor": 2,
+      "densityPerUnit": 0,
+      "tint": "#7af0c8",
+      "tintStrength": 120,
+      "glow": 160,
+      "precipitatesTo": "luminous_spores",
+      "solvents": ["water"],
+      "converts": [
+        { "solvent": "water", "into": "glow_potion", "cMin": 96 }
+      ]
+    },
+    {
+      "//": "PACKAGE E. REAL. Gold in aqua regia (chloroauric acid): the only solvent gold has. The acid turns gold-orange and faintly bright with it. Evaporated, the gold is left behind as dust -- how gold is refined.",
+      "name": "aurum",
+      "from": "gold_dust",
+      "yieldPerVoxel": 256,
+      "saturation": 200,
+      "dissolveChance": 30,
+      "diffusivity": 12,
+      "floor": 1,
+      "densityPerUnit": 80,
+      "tint": "#f0b030",
+      "tintStrength": 200,
+      "glow": 30,
+      "precipitatesTo": "gold_dust",
+      "solvents": ["aqua_regia"]
     }
   ]
 }

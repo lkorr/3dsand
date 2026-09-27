@@ -477,6 +477,584 @@ Status GateChemToxic(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ===========================================================================
+// PACKAGE E (docs/PLAN_alchemy_chemistry.md, the creative expansion): the
+// headline recipes in the world. Same discipline as package A's gates above:
+// a sealed fixture over the harness terrain, THE tick, a regenerated world on
+// the way out. Thresholds live in tests/baseline.json (chemGunpowder.*,
+// chemThermite.*, chemFrost.*, chemHoly.*).
+// ===========================================================================
+
+// The state nibble a freshly placed cell of `m` wants: a liquid is placed
+// full-ish (7, as package A's gates do), anything else as variant 0.
+uint32_t PlaceState(Ctx& c, int m) {
+  return m > 0 && c.mats[(size_t)m].gpu.klass == CLASS_LIQUID ? 7u : 0u;
+}
+
+int ResolveAll(Ctx& c, std::initializer_list<std::pair<int*, const char*>> want,
+               std::string& missing) {
+  int bad = 0;
+  for (const auto& w : want) {
+    *w.first = MatId(c, w.second);
+    if (*w.first < 0) {
+      missing += std::string(missing.empty() ? "" : ", ") + w.second;
+      bad++;
+    }
+  }
+  return bad;
+}
+
+// ---------------------------------------------------------------------------
+// chem-gunpowder: a bed of gunpowder in a stone basin, one ember laid on it.
+// It must GO OFF (a real ExplosionOp inside the basin, soon), cut a crater,
+// burn through most of the powder, and stay a handful of bangs (the cap).
+// ---------------------------------------------------------------------------
+Status GateChemGunpowder(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  int mStone, mGp, mEmber, mFire;
+  std::string missing;
+  if (ResolveAll(c, {{&mStone, "stone"}, {&mGp, "gunpowder"}, {&mEmber, "ember"}, {&mFire, "fire"}},
+                 missing)) {
+    detail = "missing " + missing;
+    return Status::Fail;
+  }
+  Regenerate(c);
+  const int half = 4;
+  const IVec3 s = Site(c, 230, half, 3);
+  const Box inner{{s.x - half, s.y + 1, s.z - half}, {s.x + half, s.y + 6, s.z + half}};
+  const Box watch{{inner.lo.x - 1, s.y - 2, inner.lo.z - 1},
+                  {inner.hi.x + 1, inner.hi.y + 12, inner.hi.z + 1}};
+  std::vector<CellOp> build, powder, match;
+  Vessel(build, inner, inner.hi.y, (uint32_t)mStone, (uint32_t)mStone);
+  Fill(build, Box{{inner.lo.x - 1, s.y - 2, inner.lo.z - 1}, {inner.hi.x + 1, s.y - 1, inner.hi.z + 1}},
+       (uint32_t)mStone, 0);
+  Fill(powder, Box{inner.lo, {inner.hi.x, inner.lo.y + 1, inner.hi.z}}, (uint32_t)mGp, 0);
+  match.push_back({World::SlotCellIndex({s.x, inner.lo.y + 2, s.z}),
+                   PackVoxNew((uint32_t)mEmber, 0) | kCellOpIfAir});
+  uint32_t t = 75000;
+  support::TickCursor tick{c, t, IVec3{s.x >> 4, s.y >> 4, s.z >> 4}};
+  tick(std::vector<BrushOp>{}, build);
+  tick(std::vector<BrushOp>{}, powder);
+  for (int i = 0; i < 8; i++) tick();
+  const std::vector<uint32_t> h0 = Census(c, watch);
+  auto& rf = tick.Rig().Authority().reactFx;
+  const uint64_t b0 = rf.blasts, r0 = rf.refused;
+  tick(std::vector<BrushOp>{}, match);
+  const int kTicks = 120;
+  uint32_t firstBlast = 0, fireMax = 0;
+  std::vector<ExplosionOp> blasts;
+  for (int i = 1; i <= kTicks; i++) {
+    const uint64_t before = rf.blasts;
+    tick();
+    if (rf.blasts > before) {
+      if (!firstBlast) firstBlast = (uint32_t)i;
+      for (uint64_t k = before; k < rf.blasts; k++)
+        blasts.push_back(rf.recent[rf.recent.size() - (size_t)std::min<uint64_t>(rf.blasts - k, rf.recent.size())]);
+    }
+    if (i % 3 == 0) fireMax = std::max(fireMax, Census(c, watch)[mFire]);
+  }
+  const std::vector<uint32_t> h1 = Census(c, watch);
+  const uint64_t nBlasts = rf.blasts - b0, refused = rf.refused - r0;
+  Regenerate(c);
+  // The FIRST blast must be in the basin (that is the ember lighting the
+  // bed). Later ones may not be: the bed blows its own basin open and flings
+  // burning powder out, which then goes off where it lands -- counted, not
+  // failed.
+  const bool inBasin = !blasts.empty() && watch.Has(blasts[0].x, blasts[0].y, blasts[0].z);
+  size_t outside = 0;
+  for (const ExplosionOp& e : blasts) outside += watch.Has(e.x, e.y, e.z) ? 0u : 1u;
+  const uint32_t maxWait = (uint32_t)BaselineNumber("chemGunpowder.firstBlastTicksMax", 40);
+  const double leftMax = BaselineNumber("chemGunpowder.leftFracMax", 0.5);
+  const bool quick = firstBlast != 0 && firstBlast <= maxWait;
+  const bool crater = h1[mStone] < h0[mStone];
+  const bool burnt = (double)h1[mGp] <= leftMax * (double)h0[mGp];
+  // Rule 2: the per-tick cap is 4 reaction blasts; a bed of powder must read
+  // as a string of bangs, never as a blast per grain.
+  const bool bounded = nBlasts <= (uint64_t)BaselineNumber("chemGunpowder.blastsMax", 60);
+  RecordObserved("chemGunpowder.blasts", (double)nBlasts);
+  RecordObserved("chemGunpowder.firstBlastTick", (double)firstBlast);
+  const bool ok = quick && inBasin && crater && burnt && bounded;
+  detail = Format(
+      "%llu blast(s) (allow %.0f), first %u ticks after the ember (allow %u), %s, %zu of the "
+      "%zu recorded outside it (flung powder); %llu "
+      "merged/refused; gunpowder %u -> %u (allow %.0f%% left); crater: stone %u -> %u; fire seen %u",
+      (unsigned long long)nBlasts, BaselineNumber("chemGunpowder.blastsMax", 60), firstBlast, maxWait,
+      inBasin ? "the first in the basin" : "THE FIRST NOT IN THE BASIN", outside, blasts.size(),
+      (unsigned long long)refused, h0[mGp],
+      h1[mGp], 100 * leftMax, h0[mStone], h1[mStone], fireMax);
+  std::printf("chem-gunpowder: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// chem-thermite: thermite on an iron plate, lit by a drop of lava. It must
+// burn to molten iron (and mostly be gone), FLASH (the world's flash effect
+// laid glare), leave iron behind as the melt freezes -- and do all of it bit
+// for bit twice (the flash path is new C++ in the tick).
+// ---------------------------------------------------------------------------
+struct ThermiteRun {
+  uint32_t th0 = 0, thEnd = 0, moltenMax = 0, iron0 = 0, ironEnd = 0, glareMax = 0;
+  uint64_t flashes = 0, flashCells = 0;
+  uint32_t hash = 0;
+};
+
+bool RunThermite(Ctx& c, ThermiteRun& R, std::string& why) {
+  int mStone, mTh, mIron, mMolten, mLava, mGlare;
+  std::string missing;
+  if (ResolveAll(c, {{&mStone, "stone"}, {&mTh, "thermite"}, {&mIron, "iron"}, {&mMolten, "molten_iron"},
+                     {&mLava, "lava"}, {&mGlare, "glare"}},
+                 missing)) {
+    why = "missing " + missing;
+    return false;
+  }
+  Regenerate(c);
+  const int half = 3;
+  const IVec3 s = Site(c, 290, half, 3);
+  const Box inner{{s.x - half, s.y + 1, s.z - half}, {s.x + half, s.y + 7, s.z + half}};
+  const Box watch{{inner.lo.x - 1, s.y - 1, inner.lo.z - 1},
+                  {inner.hi.x + 1, inner.hi.y + 10, inner.hi.z + 1}};
+  std::vector<CellOp> build, fill, light;
+  Vessel(build, inner, inner.hi.y, (uint32_t)mStone, (uint32_t)mStone);
+  Fill(fill, Box{inner.lo, {inner.hi.x, inner.lo.y, inner.hi.z}}, (uint32_t)mIron, 0);
+  Fill(fill, Box{{inner.lo.x, inner.lo.y + 1, inner.lo.z}, {inner.hi.x, inner.lo.y + 2, inner.hi.z}},
+       (uint32_t)mTh, 0);
+  light.push_back({World::SlotCellIndex({s.x, inner.lo.y + 3, s.z}),
+                   PackVoxNew((uint32_t)mLava, 7u) | kCellOpIfAir});
+  uint32_t t = 76000;
+  support::TickCursor tick{c, t, IVec3{s.x >> 4, s.y >> 4, s.z >> 4}};
+  tick(std::vector<BrushOp>{}, build);
+  tick(std::vector<BrushOp>{}, fill);
+  for (int i = 0; i < 6; i++) tick();
+  {
+    const std::vector<uint32_t> h = Census(c, watch);
+    R.th0 = h[mTh];
+    R.iron0 = h[mIron];
+  }
+  auto& rf = tick.Rig().Authority().reactFx;
+  const uint64_t f0 = rf.flashes, fc0 = rf.flashCells;
+  tick(std::vector<BrushOp>{}, light);
+  for (int i = 1; i <= 240; i++) {
+    tick();
+    if (i % 2 == 0) {
+      const std::vector<uint32_t> h = Census(c, watch);
+      R.moltenMax = std::max(R.moltenMax, h[mMolten]);
+      R.glareMax = std::max(R.glareMax, h[mGlare]);
+    }
+  }
+  const std::vector<uint32_t> end = Census(c, watch, &R.hash);
+  R.thEnd = end[mTh];
+  R.ironEnd = end[mIron];
+  R.flashes = rf.flashes - f0;
+  R.flashCells = rf.flashCells - fc0;
+  return true;
+}
+
+Status GateChemThermite(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  ThermiteRun A, B;
+  std::string why;
+  if (!RunThermite(c, A, why) || !RunThermite(c, B, why)) {
+    Regenerate(c);
+    detail = why;
+    return Status::Fail;
+  }
+  Regenerate(c);
+  const double leftMax = BaselineNumber("chemThermite.leftFracMax", 0.5);
+  const bool burns = A.moltenMax > 0 && (double)A.thEnd <= leftMax * (double)A.th0;
+  const bool flashes = A.flashes > 0 && A.flashCells > 0;
+  const bool freezes = A.ironEnd >= A.iron0;
+  const bool same = A.hash == B.hash && A.flashes == B.flashes && A.flashCells == B.flashCells;
+  RecordObserved("chemThermite.moltenMax", (double)A.moltenMax);
+  RecordObserved("chemThermite.flashes", (double)A.flashes);
+  const bool ok = burns && flashes && freezes && same;
+  detail = Format(
+      "thermite %u -> %u (allow %.0f%% left), molten iron peak %u; %llu flash(es), %llu glare "
+      "cells laid, glare seen %u; iron %u -> %u (%s); run twice: %s (hash %08x vs %08x)",
+      A.th0, A.thEnd, 100 * leftMax, A.moltenMax, (unsigned long long)A.flashes,
+      (unsigned long long)A.flashCells, A.glareMax, A.iron0, A.ironEnd,
+      freezes ? "the melt froze to iron" : "IRON LOST", same ? "IDENTICAL" : "DIVERGED", A.hash, B.hash);
+  std::printf("chem-thermite: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// chem-frost: frost salt sprinkled on a pool FREEZES it (several voxels of ice
+// a grain, the salt spent doing it) and, on a pool of lava, quenches it to
+// stone.
+// ---------------------------------------------------------------------------
+Status GateChemFrost(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  int mStone, mGlass, mWater, mIce, mLava, mFrost;
+  std::string missing;
+  if (ResolveAll(c, {{&mStone, "stone"}, {&mGlass, "glass"}, {&mWater, "water"}, {&mIce, "ice"},
+                     {&mLava, "lava"}, {&mFrost, "frost_salt"}},
+                 missing)) {
+    detail = "missing " + missing;
+    return Status::Fail;
+  }
+  Regenerate(c);
+  const int half = 3;
+  const IVec3 s = Site(c, 330, 11, 3);
+  const Box aIn{{s.x - 6 - half, s.y + 1, s.z - half}, {s.x - 6 + half, s.y + 5, s.z + half}};
+  const Box bIn{{s.x + 6 - half, s.y + 1, s.z - half}, {s.x + 6 + half, s.y + 5, s.z + half}};
+  const Box aWatch{{aIn.lo.x - 1, aIn.lo.y - 1, aIn.lo.z - 1}, {aIn.hi.x + 1, aIn.hi.y + 4, aIn.hi.z + 1}};
+  std::vector<CellOp> build, fill, salt;
+  Vessel(build, aIn, aIn.hi.y, (uint32_t)mStone, (uint32_t)mStone);
+  Vessel(build, bIn, bIn.hi.y, (uint32_t)mGlass, (uint32_t)mStone);
+  Fill(fill, Box{aIn.lo, {aIn.hi.x, aIn.lo.y + 2, aIn.hi.z}}, (uint32_t)mWater, 7u);
+  Fill(fill, Box{bIn.lo, {bIn.hi.x, bIn.lo.y, bIn.hi.z}}, (uint32_t)mLava, 7u);
+  for (int dz = -1; dz <= 1; dz++)
+    for (int dx = -1; dx <= 1; dx++) {
+      salt.push_back({World::SlotCellIndex({s.x - 6 + dx, aIn.lo.y + 4, s.z + dz}),
+                      PackVoxNew((uint32_t)mFrost, 0) | kCellOpIfAir});
+      salt.push_back({World::SlotCellIndex({s.x + 6 + dx, bIn.lo.y + 2, s.z + dz}),
+                      PackVoxNew((uint32_t)mFrost, 0) | kCellOpIfAir});
+    }
+  uint32_t t = 77000;
+  support::TickCursor tick{c, t, IVec3{s.x >> 4, s.y >> 4, s.z >> 4}};
+  tick(std::vector<BrushOp>{}, build);
+  tick(std::vector<BrushOp>{}, fill);
+  for (int i = 0; i < 12; i++) tick();
+  const uint32_t ice0 = Census(c, aWatch)[mIce];
+  tick(std::vector<BrushOp>{}, salt);
+  uint32_t iceMax = 0, stoneB = 0;
+  for (int i = 1; i <= 150; i++) {
+    tick();
+    if (i % 3 == 0) {
+      iceMax = std::max(iceMax, Census(c, aWatch)[mIce]);
+      stoneB = std::max(stoneB, Census(c, bIn)[mStone]);  // inside the GLASS box: only a quench makes stone
+    }
+  }
+  const std::vector<uint32_t> ha = Census(c, aWatch);
+  Regenerate(c);
+  const uint32_t iceMin = (uint32_t)BaselineNumber("chemFrost.iceMin", 12);
+  const bool freezes = iceMax >= ice0 + iceMin;
+  const bool spent = ha[mFrost] < 9;
+  const bool quench = stoneB > 0;
+  RecordObserved("chemFrost.ice", (double)(iceMax - std::min(iceMax, ice0)));
+  const bool ok = freezes && spent && quench;
+  detail = Format(
+      "9 grains on a pool: ice %u -> peak %u (want +%u), frost salt left %u of 9 (%s); 9 grains on "
+      "lava: stone %u in the glass box (%s)",
+      ice0, iceMax, iceMin, ha[mFrost], spent ? "spent" : "NOT SPENT", stoneB,
+      quench ? "quenched" : "NO QUENCH");
+  std::printf("chem-frost: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// chem-holy-water: (grid) salt in enchanted water makes holy water; holy
+// water on rotflesh chars it where plain water does nothing; (body) a zombie
+// standing in holy water has its rot SEARED -- rotflesh down, flesh_charred up
+// -- while a zombie standing in plain water beside it is not.
+// ---------------------------------------------------------------------------
+Status GateChemHolyWater(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  int mStone, mGlass, mEw, mSalt, mHoly, mWater, mRot, mChar;
+  std::string missing;
+  if (ResolveAll(c, {{&mStone, "stone"}, {&mGlass, "glass"}, {&mEw, "enchanted_water"}, {&mSalt, "salt"},
+                     {&mHoly, "holy_water"}, {&mWater, "water"}, {&mRot, "rotflesh"},
+                     {&mChar, "flesh_charred"}},
+                 missing)) {
+    detail = "missing " + missing;
+    return Status::Fail;
+  }
+  int zdef = -1;
+  for (size_t i = 0; i < c.mobs.Defs().size(); i++)
+    if (c.mobs.Defs()[i].name == "zombie") zdef = (int)i;
+  if (zdef < 0) {
+    detail = "no zombie def";
+    return Status::Fail;
+  }
+  // ---- grid ----
+  Regenerate(c);
+  const int half = 2;
+  const IVec3 s = Site(c, 250, 16, 3);
+  Box in[3];
+  for (int k = 0; k < 3; k++)
+    in[k] = Box{{s.x - 12 + 12 * k - half, s.y + 1, s.z - half}, {s.x - 12 + 12 * k + half, s.y + 5, s.z + half}};
+  auto grow = [](const Box& b) {
+    return Box{{b.lo.x - 1, b.lo.y - 1, b.lo.z - 1}, {b.hi.x + 1, b.hi.y + 4, b.hi.z + 1}};
+  };
+  std::vector<CellOp> build, fill, salt;
+  for (int k = 0; k < 3; k++) Vessel(build, in[k], in[k].hi.y, (uint32_t)mGlass, (uint32_t)mStone);
+  // A: enchanted water, salt sprinkled on. B: a rotflesh floor under holy
+  // water. C: the same floor under plain water (the control).
+  Fill(fill, Box{in[0].lo, {in[0].hi.x, in[0].lo.y + 1, in[0].hi.z}}, (uint32_t)mEw, 7u);
+  Fill(fill, Box{in[1].lo, {in[1].hi.x, in[1].lo.y, in[1].hi.z}}, (uint32_t)mRot, 0);
+  Fill(fill, Box{in[2].lo, {in[2].hi.x, in[2].lo.y, in[2].hi.z}}, (uint32_t)mRot, 0);
+  std::vector<CellOp> pour;
+  Fill(pour, Box{{in[1].lo.x, in[1].lo.y + 1, in[1].lo.z}, {in[1].hi.x, in[1].lo.y + 2, in[1].hi.z}},
+       (uint32_t)mHoly, 7u);
+  Fill(pour, Box{{in[2].lo.x, in[2].lo.y + 1, in[2].lo.z}, {in[2].hi.x, in[2].lo.y + 2, in[2].hi.z}},
+       (uint32_t)mWater, 7u);
+  for (int dz = -1; dz <= 1; dz++)
+    for (int dx = -1; dx <= 1; dx++)
+      salt.push_back({World::SlotCellIndex({s.x - 12 + dx, in[0].lo.y + 3, s.z + dz}),
+                      PackVoxNew((uint32_t)mSalt, 0) | kCellOpIfAir});
+  uint32_t t = 78000;
+  uint32_t holyMade = 0, rotB0 = 0, rotC0 = 0, rotB1 = 0, rotC1 = 0, charB = 0, charC = 0;
+  {
+    support::TickCursor tick{c, t, IVec3{s.x >> 4, s.y >> 4, s.z >> 4}};
+    tick(std::vector<BrushOp>{}, build);
+    tick(std::vector<BrushOp>{}, fill);
+    for (int i = 0; i < 4; i++) tick();
+    rotB0 = Census(c, in[1])[mRot];
+    rotC0 = Census(c, in[2])[mRot];
+    tick(std::vector<BrushOp>{}, pour);
+    tick(std::vector<BrushOp>{}, salt);
+    for (int i = 1; i <= 120; i++) {
+      tick();
+      if (i % 4 == 0) holyMade = std::max(holyMade, Census(c, grow(in[0]))[mHoly]);
+    }
+    const std::vector<uint32_t> hb = Census(c, grow(in[1])), hc = Census(c, grow(in[2]));
+    rotB1 = hb[mRot];
+    rotC1 = hc[mRot];
+    charB = hb[mChar];
+    charC = hc[mChar];
+  }
+  const bool makes = holyMade > 0;
+  const bool sears = rotB1 < rotB0 && charB > 0;
+  const bool control = rotC1 == rotC0 && charC == 0;
+
+  // ---- bodies ----
+  Regenerate(c);
+  const int ph = 4;
+  const IVec3 p = Site(c, 200, 18, 3);
+  const Box pit[2] = {
+      Box{{p.x - 11 - ph, p.y + 1, p.z - ph}, {p.x - 11 + ph, p.y + 16, p.z + ph}},
+      Box{{p.x + 11 - ph, p.y + 1, p.z - ph}, {p.x + 11 + ph, p.y + 16, p.z + ph}}};
+  std::vector<CellOp> pits, pools;
+  for (int k = 0; k < 2; k++) {
+    Vessel(pits, pit[k], pit[k].hi.y, (uint32_t)mStone, (uint32_t)mStone);
+    Fill(pools, Box{pit[k].lo, {pit[k].hi.x, pit[k].lo.y + 7, pit[k].hi.z}},
+         (uint32_t)(k == 0 ? mHoly : mWater), 7u);
+  }
+  support::TickCursor tick{c, t, IVec3{p.x >> 4, p.y >> 4, p.z >> 4}};
+  tick(std::vector<BrushOp>{}, pits);
+  const uint64_t zA = c.mobs.Spawn(zdef, {p.x - 11, pit[0].lo.y, p.z});
+  const uint64_t zB = c.mobs.Spawn(zdef, {p.x + 11, pit[1].lo.y, p.z});
+  if (!zA || !zB) {
+    Regenerate(c);
+    detail = "zombie spawn refused";
+    return Status::Fail;
+  }
+  const int nLimbs = (int)c.mobs.Defs()[zdef].limbs.size();
+  auto census = [&](uint64_t id, int mat) {
+    uint32_t n = 0;
+    for (int li = 0; li < nLimbs; li++) n += c.mobs.LimbMaterialCount(id, li, (uint32_t)mat);
+    return n;
+  };
+  for (int i = 0; i < 6; i++) tick();
+  // A ZOMBIE IS NOT MADE OF ROT: its body is the human's tissue under a
+  // palette filter, and rotflesh is what its BITE leaves in a victim (the
+  // sidecar's bite.infect) -- the rot a turned corpse carries. So both are
+  // bitten with it first, identically (same limbs, same points, same seed):
+  // every limb whose centre is below the waterline, which is what the pool
+  // will reach.
+  std::vector<ParticleSpawn> spawns;
+  int bitten = 0;
+  for (int li = 0; li < nLimbs; li++) {
+    for (int k = 0; k < 2; k++) {
+      const uint64_t id = k == 0 ? zA : zB;
+      const Vec3 at = c.mobs.LimbVoxelPos(id, li, 0);
+      if (at.y > (float)(pit[k].lo.y + 6)) continue;
+      const uint64_t lb = c.mobs.LimbBody(id, li);
+      if (!lb) continue;
+      ::BiteHit bt;
+      bt.at = c.mobs.LimbVoxelPos(id, li, 4441u);
+      bt.hp = 1.0f;
+      bt.power = 0.7f;
+      bt.infectMat = (uint16_t)mRot;
+      bt.infectStain = c.mobs.Defs()[zdef].bite.infectStain;
+      bt.seed = 0x40E7u + (uint32_t)li;
+      if (c.mobs.BiteHit(lb, bt, c.world, spawns) && k == 0) bitten++;
+    }
+  }
+  tick();
+  const uint32_t aRot0 = census(zA, mRot), aChar0 = census(zA, mChar);
+  const uint32_t bRot0 = census(zB, mRot), bChar0 = census(zB, mChar);
+  tick(std::vector<BrushOp>{}, pools);
+  for (int i = 0; i < 200; i++) tick();
+  const uint32_t aRot1 = census(zA, mRot), aChar1 = census(zA, mChar);
+  const uint32_t bRot1 = census(zB, mRot), bChar1 = census(zB, mChar);
+  Regenerate(c);
+  const bool bodySears = aChar1 > aChar0 && aRot1 < aRot0;
+  const bool bodyControl = bChar1 <= bChar0;
+  RecordObserved("chemHoly.zombieCharred", (double)(aChar1 - std::min(aChar1, aChar0)));
+  const bool ok = makes && sears && control && bodySears && bodyControl;
+  detail = Format(
+      "salt in enchanted water: holy water peak %u (%s); rotflesh floor under holy water %u -> %u, "
+      "charred %u (%s); under plain water %u -> %u, charred %u (%s); %d submerged limb(s) bitten with rot; ZOMBIE in holy water: rotflesh "
+      "%u -> %u, flesh_charred %u -> %u (%s); zombie in plain water: rotflesh %u -> %u, charred %u -> %u (%s)",
+      holyMade, makes ? "made" : "NONE", rotB0, rotB1, charB, sears ? "seared" : "NOT SEARED", rotC0,
+      rotC1, charC, control ? "untouched" : "TOUCHED", bitten, aRot0, aRot1, aChar0, aChar1,
+      bodySears ? "seared" : "NOT SEARED", bRot0, bRot1, bChar0, bChar1,
+      bodyControl ? "not charred" : "CHARRED");
+  std::printf("chem-holy-water: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// chem-recipes: EVERY pair recipe package E authored, in the world, at once.
+// A grid of small glass boxes, each holding two reagents (checkered where both
+// flow; a solid as the floor with the other on it), ticked together; each
+// box must show its product. One row per rule family, so a renamed material
+// or a rule that stopped matching is named, not averaged away. The explosive
+// recipes are NOT here (a blast would wreck its neighbours): chem-gunpowder
+// has gunpowder, and the fire-making rows sit at the far corner from the
+// flammable ones.
+// ---------------------------------------------------------------------------
+struct Recipe {
+  const char* a;
+  const char* b;  // "air" = the other half of the checker is empty
+  const char* product;
+};
+// Order is LAYOUT: index 0 is one corner of the grid and the last the far
+// corner. Powders that burn or go off (black_mix, gunpowder, smoke powder,
+// ether, hydrogen) are first; everything that makes fire or heat is last.
+const Recipe kRecipes[] = {
+    {"saltpeter", "charcoal", "black_mix"},
+    {"black_mix", "sulfur", "gunpowder"},
+    {"saltpeter", "sugar", "smoke_powder"},
+    {"gunpowder", "water", "charcoal"},
+    {"spirits", "acid", "ether"},
+    {"ether", "air", "ether_vapour"},
+    {"acid", "aluminium", "hydrogen"},
+    {"rust", "aluminium", "thermite"},
+    {"acid", "copper", "blue_vitriol"},
+    {"acid", "saltpeter", "aqua_fortis"},
+    {"aqua_fortis", "salt", "aqua_regia"},
+    {"aqua_regia", "gold", "noxious_gas"},
+    {"acid", "chalk", "choke_damp"},
+    {"acid", "sugar", "charcoal"},
+    {"slaked_lime", "choke_damp", "chalk"},
+    {"quicklime", "water", "slaked_lime"},
+    {"quicksilver", "sulfur", "cinnabar"},
+    {"blue_vitriol", "iron", "copper"},
+    {"salt", "enchanted_water", "holy_water"},
+    {"holy_water", "rotflesh", "flesh_charred"},
+    {"fairy_dust", "ichor", "slime"},
+    {"slime", "salt", "water"},
+    {"sunwater", "moonwater", "philosophers_stone"},
+    {"philosophers_stone", "lead", "gold_dust"},
+    {"luminous_spores", "moonwater", "glowcap"},
+    {"syrup", "fungus", "spirits"},
+    {"dragons_blood", "skin", "dragonhide"},
+    {"frost_salt", "water", "ice"},
+    {"molten_iron", "water", "iron"},
+    {"chalk", "lava", "quicklime"},
+    {"cinnabar", "lava", "quicksilver"},
+    {"glowcap", "lava", "luminous_spores"},
+    {"smoke_powder", "lava", "thick_smoke"},
+    {"thermite", "lava", "molten_iron"},
+    {"sulfur", "lava", "noxious_gas"},
+    {"phosphorus", "air", "smoke"},
+};
+
+Status GateChemRecipes(Ctx& c, std::string& detail) {
+  IdCounterScope ids(c.mobs);
+  const int n = (int)(sizeof(kRecipes) / sizeof(kRecipes[0]));
+  const int mGlass = MatId(c, "glass"), mStone = MatId(c, "stone");
+  std::vector<int> A(n), B(n), P(n);
+  std::string missing;
+  for (int i = 0; i < n; i++) {
+    A[i] = MatId(c, kRecipes[i].a);
+    B[i] = std::strcmp(kRecipes[i].b, "air") == 0 ? 0 : MatId(c, kRecipes[i].b);
+    P[i] = MatId(c, kRecipes[i].product);
+    if (A[i] < 0 || B[i] < 0 || P[i] < 0)
+      missing += Format("%s%s+%s->%s", missing.empty() ? "" : ", ", kRecipes[i].a, kRecipes[i].b,
+                        kRecipes[i].product);
+  }
+  if (mGlass < 0 || mStone < 0 || !missing.empty()) {
+    detail = "unresolved: " + missing;
+    return Status::Fail;
+  }
+  Regenerate(c);
+  const int cols = 6, pitch = 10, w = 4;  // inner 4x3x4, 6 walls-to-walls apart
+  const int rows = (n + cols - 1) / cols;
+  const int span = cols * pitch;
+  const IVec3 s = Site(c, 330, span / 2 + 2, 3);
+  const int x0 = s.x - span / 2, z0 = s.z - (rows * pitch) / 2;
+  const int y0 = s.y + 1;
+  auto boxOf = [&](int i) {
+    const int bx = x0 + (i % cols) * pitch + 2, bz = z0 + (i / cols) * pitch + 2;
+    return Box{{bx, y0, bz}, {bx + w - 1, y0 + 2, bz + w - 1}};
+  };
+  std::vector<CellOp> build, fill;
+  for (int i = 0; i < n; i++) {
+    const Box b = boxOf(i);
+    Vessel(build, b, b.hi.y + 1, (uint32_t)mGlass, (uint32_t)mStone);
+    const bool aSolid = c.mats[(size_t)A[i]].gpu.klass == CLASS_SOLID;
+    const bool bSolid = B[i] > 0 && c.mats[(size_t)B[i]].gpu.klass == CLASS_SOLID;
+    for (int z = b.lo.z; z <= b.hi.z; z++)
+      for (int y = b.lo.y; y <= b.lo.y + 1; y++)
+        for (int x = b.lo.x; x <= b.hi.x; x++) {
+          int m;
+          if (aSolid || bSolid) {
+            // The solid is the FLOOR (a floating solid cell is an island the
+            // scan would cut loose); the other reagent lies on it.
+            const int floorMat = aSolid ? A[i] : B[i], topMat = aSolid ? B[i] : A[i];
+            m = y == b.lo.y ? floorMat : topMat;
+          } else {
+            m = ((x + y + z) & 1) ? A[i] : B[i];
+          }
+          fill.push_back({World::SlotCellIndex({x, y, z}),
+                          m ? PackVoxNew((uint32_t)m, PlaceState(c, m)) : 0u});
+        }
+  }
+  uint32_t t = 79000;
+  support::TickCursor tick{c, t, IVec3{s.x >> 4, s.y >> 4, s.z >> 4}};
+  tick(std::vector<BrushOp>{}, build);
+  tick(std::vector<BrushOp>{}, fill);
+  // One census of the whole grid a sample, bucketed per box (the box and 4
+  // cells of air over it, inside its walls).
+  std::vector<uint32_t> peak(n, 0);
+  std::vector<uint32_t> buf(kChunkVol);
+  const Box area{{x0, y0, z0}, {x0 + span - 1, y0 + 6, z0 + rows * pitch - 1}};
+  auto sample = [&] {
+    std::vector<uint32_t> cnt(n, 0);
+    for (int cz = area.lo.z >> 4; cz <= (area.hi.z >> 4); cz++)
+      for (int cy = area.lo.y >> 4; cy <= (area.hi.y >> 4); cy++)
+        for (int cx = area.lo.x >> 4; cx <= (area.hi.x >> 4); cx++) {
+          ReadVoxelsSync(c.ctx, c.world, World::SlotChunkIndex({cx, cy, cz}), 1, buf.data(),
+                         "chemRecipes");
+          for (uint32_t k = 0; k < kChunkVol; k++) {
+            const int x = (int)(k % 16) + cx * 16, y = (int)((k / 16) % 16) + cy * 16,
+                      z = (int)(k / 256) + cz * 16;
+            if (!area.Has(x, y, z)) continue;
+            const int lx = (x - x0) % pitch - 2, lz = (z - z0) % pitch - 2;
+            if (lx < 0 || lx >= w || lz < 0 || lz >= w) continue;
+            const int i = ((z - z0) / pitch) * cols + (x - x0) / pitch;
+            if (i >= n) continue;
+            if ((int)(buf[k] & 0xFFFu) == P[i]) cnt[i]++;
+          }
+        }
+    for (int i = 0; i < n; i++) peak[i] = std::max(peak[i], cnt[i]);
+  };
+  const int kTicks = (int)BaselineNumber("chemRecipes.ticks", 160);
+  for (int i = 1; i <= kTicks; i++) {
+    tick();
+    if (i % 4 == 0) sample();
+  }
+  Regenerate(c);
+  int made = 0;
+  std::string fails, got;
+  for (int i = 0; i < n; i++) {
+    if (peak[i] > 0) made++;
+    else
+      fails += Format("%s%s+%s->%s", fails.empty() ? "" : ", ", kRecipes[i].a, kRecipes[i].b,
+                      kRecipes[i].product);
+    got += Format("%s%s %u", got.empty() ? "" : ", ", kRecipes[i].product, peak[i]);
+  }
+  RecordObserved("chemRecipes.made", (double)made);
+  const bool ok = made == n;
+  detail = Format("%d of %d recipes made their product in %d ticks%s%s [peaks: %s]", made, n, kTicks,
+                  fails.empty() ? "" : "; NOT MADE: ", fails.c_str(), got.c_str());
+  std::printf("chem-recipes: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& ChemGates() {
@@ -485,6 +1063,12 @@ const std::vector<Gate>& ChemGates() {
       {"chem-acid-fumes", "sim", {}, false, GateChemAcidFumes},
       {"chem-electrolysis", "sim", {}, false, GateChemElectrolysis},
       {"chem-toxic", "mob", {}, false, GateChemToxic},
+      // Package E: the creative expansion's headline recipes.
+      {"chem-gunpowder", "sim", {}, false, GateChemGunpowder},
+      {"chem-thermite", "sim", {}, false, GateChemThermite},
+      {"chem-frost", "sim", {}, false, GateChemFrost},
+      {"chem-holy-water", "mob", {}, false, GateChemHolyWater},
+      {"chem-recipes", "sim", {}, false, GateChemRecipes},
   };
   return g;
 }

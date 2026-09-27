@@ -770,10 +770,14 @@ const char* const kOrder[] = {
     "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-spawn", "alchemy-sand-carry",
     // Bench chemistry (package C): CPU-only FlaskSims over the world's tables.
     "alchemy-react", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode",
+    // Package E on the bench: every headline recipe through the world's table.
+    "chem-bench",
     // World chemistry (docs/PLAN_alchemy_chemistry.md A): each builds its own
     // sealed fixture, ticks THE tick, and regenerates the world on the way
     // out; chem-toxic spawns under an IdCounterScope and resets the mobs.
     "chem-sodium", "chem-acid-fumes", "chem-electrolysis", "chem-toxic",
+    // Package E (the creative expansion): same fixture discipline.
+    "chem-gunpowder", "chem-thermite", "chem-frost", "chem-holy-water", "chem-recipes",
     // ...and what landed there is a SUBSTANCE, not a colour: the per-limb coat
     // ledger names the material, it dries at that material's own authored rate
     // (and does not at the default one), and a coat can be tracked back onto

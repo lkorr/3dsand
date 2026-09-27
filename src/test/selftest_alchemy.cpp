@@ -974,6 +974,104 @@ Status GateAlchemyExplode(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// PACKAGE E ON THE BENCH (docs/PLAN_alchemy_chemistry.md, the creative
+// expansion). Every headline recipe in a flask, through the bench's copy of
+// the WORLD'S table (no fixture rules: a recipe the table does not carry
+// fails, by name). Pairs are poured in together; the heat recipes stand on
+// the burner. Each row must MAKE its product (FlaskSim::Produced) and, where
+// the rule carries an effect, raise that bench event (gunpowder and dragon's
+// blood `explode`, thermite and the chemical wedding `flash`); the units
+// audit must stay exact in every flask. Solute converts are rows too (sugar
+// -> syrup, spores -> the potion of light, salt in enchanted water -> holy
+// water), since on the bench they are the dissolving machinery's, not a rule.
+Status GateChemBench(Ctx& c, std::string& detail) {
+  struct Row {
+    const char* a; int aE;
+    const char* b; int bE;     // nullptr = one reagent
+    bool burner;
+    const char* product;
+    const char* event;         // nullptr = none expected
+  };
+  static const Row kRows[] = {
+      {"saltpeter", 40, "charcoal", 40, false, "black_mix", nullptr},
+      {"black_mix", 40, "sulfur", 40, false, "gunpowder", nullptr},
+      {"gunpowder", 30, nullptr, 0, true, "fire", "explode"},
+      {"saltpeter", 40, "sugar", 40, false, "smoke_powder", nullptr},
+      {"smoke_powder", 30, nullptr, 0, true, "thick_smoke", nullptr},
+      {"rust", 40, "aluminium", 40, false, "thermite", nullptr},
+      {"thermite", 40, nullptr, 0, true, "molten_iron", "flash"},
+      {"molten_iron", 30, "water", 120, false, "iron", nullptr},
+      {"chalk", 40, nullptr, 0, true, "quicklime", nullptr},
+      {"quicklime", 30, "water", 150, false, "slaked_lime", nullptr},
+      {"acid", 150, "chalk", 30, false, "choke_damp", nullptr},
+      {"frost_salt", 20, "water", 150, false, "ice", nullptr},
+      {"acid", 150, "copper", 30, false, "blue_vitriol", nullptr},
+      {"acid", 150, "saltpeter", 30, false, "aqua_fortis", nullptr},
+      {"aqua_fortis", 150, "salt", 30, false, "aqua_regia", nullptr},
+      {"quicksilver", 60, "sulfur", 30, false, "cinnabar", nullptr},
+      {"cinnabar", 30, nullptr, 0, true, "quicksilver", nullptr},
+      {"spirits", 100, "acid", 60, false, "ether", nullptr},
+      {"ether", 60, nullptr, 0, false, "ether_vapour", nullptr},
+      {"phosphorus", 30, nullptr, 0, false, "fire", "flash"},
+      {"sugar", 120, "water", 100, false, "syrup", nullptr},
+      {"luminous_spores", 60, "water", 100, false, "glow_potion", nullptr},
+      {"salt", 30, "enchanted_water", 150, false, "holy_water", nullptr},
+      {"fairy_dust", 30, "ichor", 100, false, "slime", nullptr},
+      {"slime", 100, "salt", 30, false, "water", nullptr},
+      {"sunwater", 100, "moonwater", 100, false, "philosophers_stone", "flash"},
+      {"philosophers_stone", 20, "lead", 40, false, "gold_dust", nullptr},
+      {"luminous_spores", 20, "moonwater", 100, false, "glowcap", nullptr},
+      {"dragons_blood", 60, nullptr, 0, true, "fire", "explode"},
+  };
+  ChemBench b = MakeChemBench(c);
+  const int n = (int)(sizeof(kRows) / sizeof(kRows[0]));
+  const int kFrames = (int)BaselineNumber("chemBench.framesMax", 600);
+  int made = 0;
+  std::string fails, got;
+  for (int i = 0; i < n; i++) {
+    const Row& r = kRows[i];
+    const int sa = SlotOfName(b, c, r.a), sb = r.b ? SlotOfName(b, c, r.b) : -2,
+              sp = SlotOfName(b, c, r.product);
+    if (sa < 0 || sb == -1 || sp < 0) {
+      fails += Format("%s%s: not on the bench", fails.empty() ? "" : "; ", r.product);
+      continue;
+    }
+    Composition in;
+    in.Add(b.subs[sa].mat, (uint32_t)r.aE);
+    if (sb >= 0) in.Add(b.subs[sb].mat, (uint32_t)r.bE);
+    alchemy::FlaskSim s(ChemConfig());
+    s.SetSubstances(b.subs);
+    s.SetChemistry(b.chem);
+    const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in);
+    if (r.burner) s.SetBurner(v, true);
+    int at = -1;
+    bool evSeen = r.event == nullptr;
+    for (int f = 0; f < kFrames; f++) {
+      s.Step(4);
+      for (const alchemy::SimEvent& e : s.TakeEvents())
+        if (r.event && e.kind == r.event) evSeen = true;
+      if (s.Produced()[sp] > 0 && at < 0) at = f;
+      if (at >= 0 && evSeen) break;
+    }
+    std::string why;
+    const bool audit = s.AuditUnits(&why);
+    const bool ok = at >= 0 && evSeen && audit;
+    if (ok) made++;
+    else
+      fails += Format("%s%s%s%s -> %s: %s%s%s", fails.empty() ? "" : "; ", r.a, r.b ? "+" : "",
+                      r.b ? r.b : "", r.product, at < 0 ? "NOT MADE" : "made",
+                      evSeen ? "" : Format(", no %s event", r.event).c_str(),
+                      audit ? "" : (", audit: " + why).c_str());
+    got += Format("%s%s@%d", got.empty() ? "" : ", ", r.product, at);
+  }
+  RecordObserved("chemBench.made", (double)made);
+  const bool ok = made == n;
+  detail = Format("%d of %d bench recipes made their product (and event) within %d frames%s%s [frame made: %s]",
+                  made, n, kFrames, fails.empty() ? "" : "; FAILED: ", fails.c_str(), got.c_str());
+  std::printf("chem-bench: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& AlchemyGates() {
@@ -991,6 +1089,8 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-dissolve", "player", {}, false, GateAlchemyDissolve},
       {"alchemy-electrolysis", "player", {}, false, GateAlchemyElectrolysis},
       {"alchemy-explode", "player", {}, false, GateAlchemyExplode},
+      // Package E: the creative expansion's recipes on the bench.
+      {"chem-bench", "player", {}, false, GateChemBench},
   };
   return g;
 }

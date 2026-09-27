@@ -3624,11 +3624,91 @@ heat → molten salt (molten salt itself a 2% melter, so a pile cannot melt
 itself), molten salt cools on an inverted hot ramp, + water quenches, + spark
 (tag:electric) → sodium + chlorine (electrolysis); spark ignites flammables
 weakly and lives ~2 ticks; acid dissolves crystal now and FUMES noxious gas
-from every dissolution (~1 in 10 eaten voxels), is neutralized by lye (→ water/
+from every dissolution (~1 in 10 eaten voxels; ~1 in 3 since package E, below), is neutralized by lye (→ water/
 steam + salt) and sodium (→ hydrogen + salt), and still spares glass, steel,
 gold, bone; lye eats organics at a tenth of acid and spends itself; fairy dust
 + water / blood → enchanted water / blood as a pair rule (package B's solute
 layer replaces it). Salt + water has no rule: it becomes the solute layer's.
+
+### The alchemist's shelf: package E's substances (2026-09-27; `materials.json` after `spark`, `reactions.json` "PACKAGE E", `solutes.json`, gates `chem-gunpowder` / `chem-thermite` / `chem-frost` / `chem-holy-water` / `chem-recipes` / `chem-bench`)
+
+docs/PLAN_alchemy_chemistry.md package E. Forty-four materials, real chemistry
+and lore, every one pure data: a `//` on each row says what it is, whether it
+is real, and why its numbers are what they are; the rules are appended at the
+end of `reactions.json` (one note per family, and a RECIPES table at the top
+of the section). Because the bench runs the world's compiled table, every
+recipe below works in the world AND in a flask on the bench (`chem-bench`
+proves 29 of them there, `chem-recipes` 36 in the world).
+
+| Family | Recipe (all by contact unless said) | Real / lore |
+|---|---|---|
+| gunpowder | saltpeter + charcoal → black_mix; black_mix + sulfur → gunpowder; heat or spark → EXPLODE (r3 p130); water spoils it to charcoal | real |
+| smoke bomb | saltpeter + sugar → smoke_powder; heat → smoke_charge (hot, emits thick_smoke for ~2 s, then ash) | real |
+| lime cycle | chalk + heat → quicklime; quicklime + wet → slaking_lime (HOT ~1 s: boils, ignites) → slaked_lime; slaked_lime + choke_damp → chalk; acid + chalk → choke_damp (CO2: heavy, puts fires out) | real (plague-pit rot → ash is lore) |
+| thermite | rust + aluminium → thermite; heat → molten_iron with a FLASH; molten iron cuts iron/steel one-for-one, quenches to iron, cools on an inverted hot ramp | real |
+| metals & acids | acid + copper → blue_vitriol (the `vitriol` solute: blue water); blue_vitriol + iron → copper + rust; acid + saltpeter → aqua_fortis (silver, copper, lead, iron — never gold); aqua_fortis + salt → aqua_regia (dissolves gold; gold dust is the `aurum` solute); acid + aluminium → hydrogen; acid + sugar → charcoal (carbon snake); quicksilver + sulfur → cinnabar; cinnabar + heat → quicksilver | real |
+| fire starters | phosphorus lights itself in air (a DECAY gated on air faces, so under water it never does), with a flash; spirits burn; spirits + acid → ether; ether evaporates to heavy ether_vapour, which EXPLODES (r2) near flame or spark | real |
+| sugar | sugar dissolves (`sugar` solute) and a saturated cell becomes syrup; syrup + fungus (yeast) → spirits + choke_damp | real |
+| holy water | salt + enchanted_water → holy_water (pair rule; also the `salt` solute's convert); it SEARS ROT — `tag:infectious` → flesh_charred, a burn stage — and purifies ichor | lore, real root |
+| sun and moon | silver + water under the open NIGHT sky → moonwater; gold_dust + water under the NOON sky → sunwater; each fades back under the other's sky; sunwater also sears rot | lore |
+| the stone | sunwater + moonwater (the chemical wedding, 4‰) → philosophers_stone with a FLASH; stone + lead → gold_dust (30‰), the stone crumbling (8‰): ~4 gold a grain | lore |
+| light | luminous_spores + damp ground (slow) or moonwater (at once) → glowcap; heat pops a glowcap back to spores; spores dissolved (`lumen`) → glow_potion | real-ish (foxfire) |
+| slime | fairy_dust + ichor → slime; slime eats rotflesh and ichor one-for-one; salt and heat kill it | lore |
+| dragon | dragons_blood + skin → dragonhide (hardness 120, no tags: fire, acid and rot have no rule for it); heat → it ERUPTS (explode r3); water hisses it away | lore |
+| frost | frost_salt + water → ice (~3 a grain, spent); + lava → stone; + molten iron → iron; + steam → snow; snuffs flame | lore, real root (frigorific salts) |
+
+**Rule 2 for all of it.** Every conversion is one-for-one or SPENDS its
+reagent; each catalyst (silver, gold dust, the stone, frost salt, acid for
+ether) carries its own spend rule at a fixed ratio; every gas and every hot
+transient decays; every blast is an `explode` through the capped path; the
+only emitter (smoke_charge) has its decay FIRST in its bucket so its lifetime
+is fixed whatever it emits. Nothing grows from nothing: slime grows only by
+the carrion it eats, and the moon/sun waters by the dust spent making them.
+
+**Two things the grid taught.** (1) A PAIR rule whose neighbour is `air` never
+fires on the grid — `sim_step.wgsl`'s pair loop skips an air face — though it
+does on the bench. "Reacts with air" is a DECAY gated and scaled on its air
+faces (`scaleByNeighbors: {neighbor: air}`; count 0 forbids it), which every
+evaluator counts the same way (phosphorus, ether). (2) Light-gated rules never
+hold a chunk awake, so moonwater/sunwater steep only while something else keeps
+the chunk awake: the dust's own non-gated SPEND rule is that something, which
+is also why the dust is used up whatever the sky.
+
+**Thicker acid fumes.** Package C measured about one dissolved voxel in ten
+fuming. acid + `tag:organic` → air 125 → 85 and + `tag:dissolvable` → air
+45 → 25, with the fume rules raised (dissolvable → noxious 5 → 20, and a new
+appended organic → noxious 40): the same share eaten a tick, about a third of
+it as green fume. `chem-acid-fumes` noxious peak 5 → 14 cells (40 → 111
+cell-samples), stone and iron eaten exactly as fast.
+
+**The world's second effect kind: `flash`.** `session.cpp` `ReactFxToBlasts`
+handles `"kind": "flash"` (radius, optional `what`): merged by radius and
+capped at 4 a tick (`kReactFlashesPerTick`), it queues an aftermath that the
+next tick lays a ball of `glare` — emission 255, no tags, decays at 400‰ —
+IfAir round the cell (`ReactFxAftermath`, ≤ 30 cells, positions hashed from
+cell and tick). The bench's `flash` handler (package C) is a word in the
+bench's message line. Thermite, phosphorus, the chemical wedding and a
+transmutation carry it. `chem-thermite` runs twice bit-identically with it.
+
+**Bodies.** The same rules reach creatures through the inbound pass: holy and
+sun water sear a bitten limb's rotflesh to flesh_charred (`chem-holy-water`: a
+bitten zombie standing in holy water, rotflesh 29 → 7 and charred 0 → 26 in
+200 ticks, beside an identically bitten one in plain water, 32 → 33 and 0;
+a zombie carries no rotflesh until bitten, see below); dragon's
+blood turns skin to dragonhide; the acids eat flesh like acid. A zombie is NOT
+made of rot — its body is the human's tissue under a palette filter — so holy
+water hurts the undead where they carry rot (a bite, a turned corpse's
+infection), not everywhere.
+
+**Solute species** (`solutes.json`, read by the bench now and by package B's
+world layer): `sugar` (→ syrup at 160), `ink` (charcoal, a black tint),
+`vitriol` (blue), `lumen` (glows; → glow_potion at 96), `aurum` (gold in aqua
+regia), and `salt` gained a convert (enchanted_water → holy_water at 32).
+
+**Not done:** no world handler for `eject`/`shock`/`burst` (bench only); no
+poison or healing salve (package D owns healing); the moon/sun waters and
+spores are not placed by worldgen, and no item or shop hands out reagents —
+they come from the brush and scooping; ink is a tint with no use yet.
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
