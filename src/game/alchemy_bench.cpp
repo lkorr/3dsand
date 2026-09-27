@@ -45,7 +45,14 @@ std::map<std::string, BenchEventHandler>& Registry() {
       BenchOutcome::Blast b;
       b.radius = std::clamp(e.radius > 0 ? e.radius + std::min(3, e.count / 6) : 4, 1, (int)kMaxExplosionRadius);
       b.power = e.power > 0 ? e.power : 60;
-      o.blasts.push_back(b);
+      // ONE blast at the hands however many firings arrived together (the
+      // bench's thread may hand over several steps' worth in one frame): the
+      // biggest of them.
+      if (o.blasts.empty()) o.blasts.push_back(b);
+      else {
+        o.blasts[0].radius = std::max(o.blasts[0].radius, b.radius);
+        o.blasts[0].power = std::max(o.blasts[0].power, b.power);
+      }
       for (uint16_t p : e.products) o.puff.push_back(p);
       o.puffCells = std::max(o.puffCells, b.radius * 10);
       o.message = "it explodes in your hands!";

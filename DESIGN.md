@@ -16530,6 +16530,41 @@ contents after its damage; MOBS v9 and net protocol 2 write the Composition in
 `WriteItemInstance` (`mixed`). An older record's one-material word loads as
 one portion.
 
+**Stoppers, gas and dissolved matter in a vessel** (2026-09-27, package C of
+docs/PLAN_alchemy_chemistry.md). `ItemInstance::stoppered` is a stopper in the
+mouth (put in or taken out with the bench's Stopper tool): a stoppered vessel
+pours nothing, applies nothing, scoops nothing and takes no deposit
+(`ContainerTopMat` is 0 for it; `ContainerAccepts` says "it is stoppered"); a
+break still spills everything. It is not `Plain()`, so it never stacks.
+Formats: PLYR v9 (a stopper word per slot after the v8 contents), ITMS v6 (after
+the contents), MOBS v10 and net protocol 3 (`kItemFmtStopper`: the stopper word
+ends every `WriteItemInstance`). A portion may be DISSOLVED
+(`composition.h kDissolvedBit`, contract 2.4): the powder in solution, no layer
+of its own, counted as its powder by every conservation check, taking no room
+(`ContainerVolume`), skipped by `ContainerTopMat`/`ContainerMainMat`, carried by
+every reader (`ValidPortionMat`, `RemapItemInstance` remaps the powder and
+keeps the bit). A vessel holds GAS only when stoppered: an open one's gas vents
+on the bench (off the table or at "done").
+
+**The one vessel->world door** (contract 2.5): `ContainerSpillStep` takes every
+Composition out (a break, the bench's stream and vents, an unpaid scoop, a bench
+explosion's broken flasks). A GAS portion leaves as gas parcels on the CPU gas
+stream (`World::QueueGasSpawns`), eight eighths a voxel, the last partial voxel
+rounded by a hash (the one rounding). A DISSOLVED portion goes through
+`ContainerDissolvedToWorld`, and so does the share of dissolved matter that
+leaves with a pour's liquid (`ContainerTakeDissolvedShare`; the MPM pour, which
+has no grain stream, puts that share back as undissolved powder, which then
+pours as grains). Until package B's world solute layer replaces its body,
+`ContainerDissolvedToWorld` emits the POWDER, one-eighth grains -- conserved,
+just not in solution.
+
+**Pocket chemistry, the minimal version.** A scoop that brings two substances
+together in a flask whose world rule carries an `explode` effect
+(`ContainerPocketExplosion`, over `MobSystem::Reactions()` and `ruleFx`) goes off:
+the flask is gone, its contents burst out at the hands and a real blast goes
+off there through `PlayerSession::pendingBlasts`. Only `explode` is answered;
+the rest of a carried vessel's chemistry happens on the bench.
+
 **The workstation** (`game/alchemy_bench.*`, `ui/inventory_ui.cpp` AlchemyPanel,
 reworked 2026-09-27 from the owner's "this should be a work station"). Double-
 click a vessel slot: the bench takes the spellbook's column (the character stays
@@ -16689,11 +16724,111 @@ the motion of the vessel's interior centre, and never out of its own vessel:
 per-grain rigid motion stood the sand up in the air while turning, and grains
 in the air are falling, not held.
 
-**Not yet:** reactions, powders dissolving, the cauldron, a held/grounded
-flask drawing its layers, refraction; a stream off the table leaves from the
-nearest hand's lip, not from where on the table it fell. Reactions must run on the vessel's
-`contents` in the game's tick, not on the bench's particles -- the bench is a
-UI device.
+**Chemistry: the bench runs THE WORLD'S RULES on its particles** (2026-09-27,
+package C of docs/PLAN_alchemy_chemistry.md; `game/flaskchem.cpp`,
+`game/benchchem.h`). This section used to say reactions must run on a vessel's
+`contents` in the game tick, not on the bench, because the bench is a UI
+device. The owner wanted reactions VISIBLE -- sand fizzing away in acid, fumes
+curling out of the neck, salt melting over a flame -- and a Composition has no
+neighbours, so the only place a PAIR rule can mean what it means is where
+matter touches matter. The bench is still not world state (floats, no hash);
+what it changes still reaches the game only through the tally, and a LEDGER is
+what keeps ValidateBench a proof.
+
+- **The same rules.** `flasksim_mats.h BuildBenchChemistry` re-indexes the
+  compiled table by bench substance slot: each substance's bucket
+  (`reactOffset/reactCount`, synthesized tail rules included), products as
+  slots, `MaterialDef::ruleFx` effects by kind. Nothing is named in C++. Per
+  entity (a particle, a grain, a gas pixel) the rules run in order, each gated
+  (`ChemGateOpen`: the bench is indoors -- a sky- or rain-gated rule never
+  fires, daylight is 128) and rolled ONCE (a pair against the first matching
+  neighbour of a rotated scan, an emit against the first free one, a decay
+  with the neighbour-count ramp), first to fire wins. Chances are per world
+  tick; a chemistry step is `chemEvery`/8 of one (60 Hz at the bench's 240
+  substeps a second) times `chemRate` (2 on the bench: a pixel is ~1/100 of a
+  voxel, and at the world's per-contact rate a spoonful of sand took a
+  minute). At most `chemMaxFires` firings a step, and a slot with no rule a
+  present substance, the air or a live virtual neighbour could satisfy is
+  skipped without gathering neighbours.
+- **Quanta.** A pair converts `min(units)` of each side (a grain of sand eats
+  one unit of an acid particle, not six); decay and emit the whole entity. Units
+  that change PHASE go where that phase lives: gas to the gas grid, powder to
+  grains, liquid to a POOL (per vessel and substance, in the vessel's frame)
+  that becomes a particle once it holds a particle's worth. Nothing is rounded
+  away: `AuditUnits` proves live + spilled + taken-off + drained == seeded +
+  produced - consumed per slot.
+- **Neighbours.** A particle: particles within 1.2 spacings, grains in its 3x3,
+  gas at its pixel and faces, AIR where a particle-width off is free. A grain
+  or gas pixel: its four faces. The glass is inert (it is what vials are made
+  of). Two VIRTUAL neighbours: the burner's heat, seen by whatever is near the
+  hot glass (the vessel's near-glass raster), with the rule's chance scaled by
+  how hot it is -- it answers to `tag:hot` plus every synthetic bit a
+  `neighborChance` rule made of it (ExpandNeighborChance: "hot but not fire"),
+  i.e. every bit only hot materials carry, since the glass is hot and not fire;
+  and Electrify's discharge, seen by the liquid for 0.6 s, which is the gas
+  tagged `electric` (the contract's `spark`). A rule that rewrites a virtual
+  neighbour MATERIALISES its product where it touched: the world's spark voxel
+  becomes chlorine, so ours leaves chlorine.
+- **The gas phase.** A pixel CA, one gas per pixel, up to `gasPixelCap` units:
+  a puff rises whole (a heavy gas, `kMatFlagHeavyGas`, sinks and pools), a
+  dense cloud leaves half behind, sideways a third bleeds -- so it fills a
+  headspace; glass and a stopper stop it, grains mostly do, liquid does not
+  (it rises through as bubbles). A moving vessel carries its gas. Out of every
+  vessel it lingers `gasVentSteps` and is then IN THE WORLD: it joins the spill
+  the bench streams out at the lip of the flask in hand, as gas parcels.
+  Drawn as smoke: each unit a soft radius-3 puff, the material's palette lifted
+  a third toward a pale grey so a dark gas still reads as a haze of its hue,
+  alpha from how much is there and its opacity, wisped by drifting noise.
+- **Stopper, pressure.** A stoppered mouth is one more glass segment (raster,
+  particle contact, the crossing test). A gas fading to NOTHING is the world's
+  way of saying it dispersed into open air; in a sealed flask it cannot, so that
+  rule does not fire there (a decay into matter -- steam condensing -- still
+  does). Pressure is gas units per free inside pixel times (1 + 3 x heat); past
+  `popAt` (0.6) the stopper POPS (a `pop` event), or over a lit burner, hot
+  glass or past `burstAt` the glass BURSTS (`burst`: shards fly, the contents
+  are loose on the table and fall into the world, the item is gone at "done").
+  A gas unit is the matter of a liquid unit, which is why the thresholds are
+  well under one: boiled wholly to steam, a flask of water is ~1 unit a pixel.
+- **Dissolving** (`solutes.json`, the table the world's solute layer reads): a
+  powder grain of a species touching a particle of one of its solvents
+  dissolves at `dissolveChance` up to `saturation` (`mass x yield <= sat x
+  units`), its unit going into the particle's solute mass; mass diffuses a unit
+  at a time toward a less concentrated neighbour of a solvent; a particle past
+  a `converts` row's `cMin` BECOMES `into` and the solute is spent (fairy dust +
+  water -> enchanted water); a solvent that becomes something else (boils off)
+  leaves the mass as `precipitatesTo` grains. Tinted and lit by concentration.
+  The tally reports it as DISSOLVED portions; seeding a vessel with one spreads
+  it back through its solvent up to saturation (the rest stays powder).
+- **The ledger in the result.** `BenchResult::produced/consumed` (units, per
+  material) and `vented`; ValidateBench proves `before + LedgerEighths(produced
+  - consumed) == after + spilled + streamed + vented` per material, the units
+  rounded to eighths exactly as the tally rounds a material's total (half up),
+  so matter the sim made or lost without recording it fails the proof.
+- **Bench events** (`alchemy_bench.h`): a rule with an effect raises a
+  `SimEvent` (per vessel per step, counted), the bench turns it into a
+  `BenchEvent` and main.cpp runs `DispatchBenchEvent` -- a registry keyed by
+  kind -- into one `BenchOutcome` it applies generically (`BenchOutcomeWorldOps`
+  is the pure world half). `explode`: the bench shuts mid-motion (Finish
+  `abrupt`: nothing settles), the character screen closes, both vessels in the
+  hands break and their contents burst out at the hands, ONE real ExplosionOp
+  at the hands (the biggest of the firings; `PlayerSession::pendingBlasts`,
+  drained into the grenade slot, so it carves the arms that held it) and a puff
+  of the reaction's gases there. `burst`, `pop`, `eject`, `flash`, `shock` are
+  the other built-ins; a new kind is one handler.
+- **Look:** the burner is a brass cup and flame tongues wrapping the bottom of
+  the flask (in front of it), the heated glass warms toward a dull red; the
+  arc is an electrode over the mouth and a jagged bolt into the liquid; the
+  stopper a tapered cork turned with the vessel. `--shot-bench` scripts it:
+  `SANDVOX_BENCH_BURNER=1`, `SANDVOX_BENCH_STOPPER=1`, `SANDVOX_BENCH_SHOCK=<frame>`,
+  `SANDVOX_BENCH_NOPOUR=1` (just watch; `_chem1..3` pictures, `_arc`). Iterate
+  in the standalone g++ lab: flaskchem.cpp, like flasksim.cpp, has no engine
+  dependency.
+
+**Not yet:** the cauldron, a held/grounded flask drawing its layers or its
+stopper, refraction; a stream off the table leaves from the nearest hand's lip,
+not from where on the table it fell; brine electrolysis (waits on the world
+solute layer's concentration condition); only the first effect of a rule is
+raised on the bench.
 
 Gates: `alchemy-shake` (a 60%-full flask carried side to side: nothing spills,
 still sloshing half a second after the hand stops, asleep within 6 s),
@@ -16711,7 +16846,18 @@ turned over and emptied off the table with the spill DRAINED LIVE every step,
 which must carry matter and still conserve exactly), `vessel` (the
 mixture checks: second portion, top layer pours first, 17th refused, a mixed
 break spills every portion, byte round-trip and the legacy word, a salve spends
-in proportion).
+in proportion). Chemistry: `alchemy-react` (acid over sand: sand eaten, fumes
+made and vented, audit exact, the ledger validates), `alchemy-stopper` (the
+same stoppered: nothing vents; a gas-packed flask POPS; a stoppered flask of
+water on the burner BURSTS; the stopper on the item record and its refusals),
+`alchemy-dissolve` (salt dissolves and the tally's dissolved portion matches,
+off and on again it goes back into solution; fairy dust makes enchanted
+water), `alchemy-electrolysis` (salt melts over the burner, electrify splits
+it into sodium and chlorine), `alchemy-explode` (sodium in water raises
+`explode`, the handler ejects/breaks/blasts at the hands, the broken flask
+empties exactly through the spill door, pocket sodium+water explodes). Each
+falls back to a FIXTURE rule, named in its detail line, when the table lacks
+the rule it tests.
 
 
 ## 9d. Biomes and water-body presets — the Environment tab (added 2026-09-01)
