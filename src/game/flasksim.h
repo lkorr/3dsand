@@ -440,12 +440,16 @@ class FlaskSim {
   void ConvertEnt(uint8_t type, int idx, int q, int to, int hv);
   void TakeFromEnt(uint8_t type, int idx, int q, int hv);
   void Deposit(int sub, uint32_t q, V2 at, int hv);
-  bool AddGasAt(int sub, uint32_t& q, int x, int y);
+  // `within`: -2 = anywhere; else the vessel whose inside the gas must stay
+  // in (-1 = outside every vessel). A product never lands across the glass.
+  bool AddGasAt(int sub, uint32_t& q, int x, int y, int within = -2);
   void ReleaseSolute(int i, int hv);
   void AddPool(int vessel, int sub, uint32_t q, V2 at);
   void FlushPools();
   void CompactDead();
   int SpawnParticle(V2 p, int sub, int units, int home);
+  // Every effect of a fired rule (ChemRule::fx .. fx + fxCount).
+  void RaiseEvents(int hv, V2 at, uint16_t selfMat, uint16_t nbrMat, const ChemRule& r);
   void RaiseEvent(const ChemEffect& fx, int hv, V2 at, uint16_t selfMat, uint16_t nbrMat,
                   const ChemRule& r);
   void RaisePressureEvent(const char* kind, int v, float pressure);
@@ -467,7 +471,9 @@ class FlaskSim {
   bool SweepChain(int gi, const Vessel& v, bool wantIn);
   bool PoseClear(const Vessel& v, const Xform& x) const;
   bool GrainFree(int x, int y) const;
-  bool PlaceGrain(Grain g, int nearX, int nearY);
+  // `within` as AddGasAt's: a reaction's product is placed only on its own
+  // side of the glass (the ring search reaches 4 px, the wall is ~3.5).
+  bool PlaceGrain(Grain g, int nearX, int nearY, int within = -2);
   void BuildCells();
   void BucketPixels();
   float LiquidMassAt(int x, int y, int* count, V2* vel) const;

@@ -1124,7 +1124,7 @@ bool FlaskSim::GrainFree(int x, int y) const {
   return !grid_[k] && !wall_[k];
 }
 
-bool FlaskSim::PlaceGrain(Grain g, int nx, int ny) {
+bool FlaskSim::PlaceGrain(Grain g, int nx, int ny, int within) {
   // Nearest free pixel within a small ring search.
   for (int r = 0; r <= 4; r++)
     for (int dy = -r; dy <= r; dy++)
@@ -1132,6 +1132,7 @@ bool FlaskSim::PlaceGrain(Grain g, int nx, int ny) {
         if (std::max(std::abs(dx), std::abs(dy)) != r) continue;
         int x = nx + dx, y = ny + dy;
         if (!GrainFree(x, y)) continue;
+        if (within >= -1 && inside_[(size_t)y * cfg_.gridW + x] != (uint8_t)(within + 1)) continue;
         g.x = (int16_t)x;
         g.y = (int16_t)y;
         if (g.vx == 0 && g.vy == 0) { g.fx = x + 0.5f; g.fy = y + 0.5f; }

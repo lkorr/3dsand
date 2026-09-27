@@ -40,7 +40,11 @@ struct ChemRule {
   uint32_t cond = 0;     // ReactionGpu::cond (light gate + neighbour-count ramp)
   int prodSelf = kChemKeep;
   int prodNbr = kChemKeep;   // pair: the neighbour's product; emit: what is emitted
-  int fx = -1;               // index into Chemistry::effects, -1 = none
+  // The rule's effects: Chemistry::effects[fx .. fx + fxCount), in the
+  // order reactions.json lists them (-1 / 0 = none). EVERY effect of a rule
+  // is raised when it fires, as the world's ReactFxToBlasts loops them all.
+  int fx = -1;
+  uint8_t fxCount = 0;
   uint32_t worldIndex = 0;   // the rule's index in the world table (diagnostics)
   // A CONCENTRATION CONDITION (reactions.json "solute"/"cMin"/"cMax";
   // materials.h RuleFx::solute): the rule fires only for a LIQUID self

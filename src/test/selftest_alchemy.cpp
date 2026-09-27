@@ -941,8 +941,9 @@ Status GateAlchemyExplode(Ctx& c, std::string& detail) {
   if (water < 0 || na < 0 || lye < 0 || h2 < 0) { detail = "missing materials"; return Status::Fail; }
   bool authored = false;
   for (const alchemy::ChemRule& r : b.chem.rules[na])
-    authored |= r.fx >= 0 && b.chem.effects[r.fx].kind == "explode" && r.kind == alchemy::kChemPair &&
-                alchemy::ChemNbrMatches(r, b.subs[water].mat, b.subs[water].tagMask, b.subs[water].klass, false);
+    for (int i = 0; r.fx >= 0 && i < (int)r.fxCount; i++)
+      authored |= b.chem.effects[(size_t)(r.fx + i)].kind == "explode" && r.kind == alchemy::kChemPair &&
+                  alchemy::ChemNbrMatches(r, b.subs[water].mat, b.subs[water].tagMask, b.subs[water].klass, false);
   if (!authored) {
     alchemy::ChemRule r;
     r.nbrMat = b.subs[water].mat;
@@ -950,6 +951,7 @@ Status GateAlchemyExplode(Ctx& c, std::string& detail) {
     r.prodSelf = h2;
     r.prodNbr = lye;
     r.fx = (int)b.chem.effects.size();
+    r.fxCount = 1;
     alchemy::ChemEffect e;
     e.kind = "explode";
     e.radius = 5;

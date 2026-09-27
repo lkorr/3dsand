@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstdio>
 
+#include "game/benchchem.h"  // ChemGateOpen (pocket chemistry)
 #include "game/mob.h"  // SplatterEvent
 #include "game/worlditems.h"
 #include "phys/debris.h"
@@ -428,10 +429,17 @@ int ContainerPour(const ItemDef& def, ItemStack& st, Vec3 mouth, Vec3 fwd,
     land.y -= gTick * (float)n * (float)(n + 1) * 0.5f;
     if (target && ContainerInReach(def, mouth, *target)) land = *target;
     const IVec3 lc{(int)std::floor(land.x), (int)std::floor(land.y), (int)std::floor(land.z)};
+    uint32_t charged = (uint32_t)poured;
     for (int i = 0; i < d.n; i++) {
+      // The grain fallback (no solute layer / no species) is charged
+      // against what is left of the particle room the pour itself respected.
+      const uint32_t roomLeft = partRoom == 0xFFFFFFFFu ? partRoom
+                                : partRoom - std::min<uint32_t>(partRoom, charged);
+      const size_t before = spawns.size();
       const int out = ContainerDissolvedToWorld(d.p[i].mat, (int)d.p[i].eighths, mouth, v0,
-                                                seed ^ 0xD155u, tick, *mats, spawns, 0xFFFFFFFFu,
+                                                seed ^ 0xD155u, tick, *mats, spawns, roomLeft,
                                                 sol, lc, tick + (uint32_t)n);
+      charged += (uint32_t)(spawns.size() - before);
       if (out < (int)d.p[i].eighths) st.contents.Add(d.p[i].mat, d.p[i].eighths - (uint32_t)out);
     }
   }
@@ -1035,7 +1043,8 @@ uint16_t ContainerTopMat(const ItemInstance& st, const std::vector<MaterialDef>*
 }
 
 bool ContainerPocketExplosion(const alchemy::Composition& c, const std::vector<MaterialDef>& mats,
-                              const std::vector<ReactionGpu>& reactions, ReactionEffect& out) {
+                              const std::vector<ReactionGpu>& reactions, ReactionEffect& out,
+                              uint16_t with) {
   std::vector<MaterialGpu> gpu;   // ReactNbrMatches reads the gpu rows
   for (int a = 0; a < c.n; a++) {
     const uint16_t ma = c.p[a].mat;
@@ -1046,6 +1055,7 @@ bool ContainerPocketExplosion(const alchemy::Composition& c, const std::vector<M
       if (k >= A.ruleFx.size() || A.ruleFx[k].effects.empty()) continue;
       const ReactionGpu& r = reactions[A.gpu.reactOffset + k];
       if ((r.packed & 3u) != kReactPair) continue;
+      if (!alchemy::ChemGateOpen(r.cond, 0u) || RuleNeedsSolute(A, k)) continue;
       const ReactionEffect* ex = nullptr;
       for (const ReactionEffect& e : A.ruleFx[k].effects)
         if (e.kind == "explode") { ex = &e; break; }
@@ -1057,6 +1067,7 @@ bool ContainerPocketExplosion(const alchemy::Composition& c, const std::vector<M
       for (int b = 0; b < c.n; b++) {
         const uint16_t mb = c.p[b].mat;
         if (b == a || alchemy::IsDissolved(mb) || mb == 0 || mb >= mats.size()) continue;
+        if (with != 0 && ma != with && mb != with) continue;
         if (ReactNbrMatches(r, mb, gpu)) {
           out = *ex;
           return true;
@@ -1150,11 +1161,17 @@ int ContainerSolutePoursDue(std::vector<ContainerSolutePour>& pending, uint32_t 
     }
     // Merge every later due pour of the same cell and species into this op
     // (a stream lands on one cell tick after tick), up to the op's field.
+    // Merged no further than ONE entry's worth (kSolutePourMaxEighths): the
+    // GPU's powder fallback searches room for exactly that much, so a merged
+    // op over dry ground would lose the rest (SOLM_POUR_LOST).
+    const SoluteDef* msd = CurrentSoluteById(p.species);
+    const uint32_t my8 = std::max<uint32_t>(1u, msd ? msd->yieldPerVoxel / 8u : 32u);
+    const uint32_t mergeCap = std::min<uint32_t>(kCellOpSoluteUnitsMax, kSolutePourMaxEighths * my8);
     uint32_t units = p.units;
     for (size_t j = i + 1; j < pending.size(); j++) {
       ContainerSolutePour& q = pending[j];
       if (q.units == 0 || q.tick > tick || q.species != p.species || q.cell.x != p.cell.x ||
-          q.cell.y != p.cell.y || q.cell.z != p.cell.z || units + q.units > kCellOpSoluteUnitsMax)
+          q.cell.y != p.cell.y || q.cell.z != p.cell.z || units + q.units > mergeCap)
         continue;
       units += q.units;
       q.units = 0;

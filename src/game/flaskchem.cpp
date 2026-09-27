@@ -277,8 +277,11 @@ void FlaskSim::RaiseEvent(const ChemEffect& fx, int hv, V2 at, uint16_t selfMat,
                           const ChemRule& r) {
   for (SimEvent& e : events_)
     if (e.kind == fx.kind && e.vessel == hv) {
+      // Merged: the event is as big as the biggest firing in it.
       e.count++;
       e.amount += fx.amount;
+      e.radius = std::max(e.radius, fx.radius);
+      e.power = std::max(e.power, fx.power);
       return;
     }
   SimEvent e;
@@ -294,6 +297,12 @@ void FlaskSim::RaiseEvent(const ChemEffect& fx, int hv, V2 at, uint16_t selfMat,
   if (r.prodSelf >= 0) e.products.push_back(subs_[r.prodSelf].mat);
   if (r.prodNbr >= 0) e.products.push_back(subs_[r.prodNbr].mat);
   events_.push_back(e);
+}
+
+void FlaskSim::RaiseEvents(int hv, V2 at, uint16_t selfMat, uint16_t nbrMat, const ChemRule& r) {
+  if (r.fx < 0) return;
+  for (int i = 0; i < (int)r.fxCount && r.fx + i < (int)chem_.effects.size(); i++)
+    RaiseEvent(chem_.effects[(size_t)(r.fx + i)], hv, at, selfMat, nbrMat, r);
 }
 
 void FlaskSim::RaisePressureEvent(const char* kind, int vi, float pressure) {
@@ -475,7 +484,7 @@ void FlaskSim::AddPool(int vessel, int sub, uint32_t q, V2 at) {
   pools_.push_back({vessel, sub, q, (double)at.x * q, (double)at.y * q, (double)q});
 }
 
-bool FlaskSim::AddGasAt(int sub, uint32_t& q, int x, int y) {
+bool FlaskSim::AddGasAt(int sub, uint32_t& q, int x, int y, int within) {
   const int W = cfg_.gridW, H = cfg_.gridH;
   const uint32_t cap = (uint32_t)cfg_.gasPixelCap;
   for (int r = 0; r <= 3 && q; r++)
@@ -486,6 +495,7 @@ bool FlaskSim::AddGasAt(int sub, uint32_t& q, int x, int y) {
         if (xx < 0 || yy < 0 || xx >= W || yy >= H) continue;
         const int k = yy * W + xx;
         if (wall_[k]) continue;
+        if (within >= -1 && inside_[k] != (uint8_t)(within + 1)) continue;
         if (gasAmt_[k] && gasSub_[k] != sub) continue;
         const uint32_t room = cap - std::min<uint32_t>(cap, gasAmt_[k]);
         const uint32_t put = std::min(q, room);
@@ -505,7 +515,7 @@ void FlaskSim::Deposit(int sub, uint32_t q, V2 at, int hv) {
   const int x = std::clamp((int)std::floor(at.x), 0, cfg_.gridW - 1);
   const int y = std::clamp((int)std::floor(at.y), 0, cfg_.gridH - 1);
   if (S.gas) {
-    if (!AddGasAt(sub, q, x, y)) AddPool(hv, sub, q, at);
+    if (!AddGasAt(sub, q, x, y, hv)) AddPool(hv, sub, q, at);
     return;
   }
   if (S.powder) {
@@ -516,7 +526,7 @@ void FlaskSim::Deposit(int sub, uint32_t q, V2 at, int hv) {
       g.variant = (uint8_t)(Rand() % 3);
       g.home = (int8_t)hv;
       g.chem = (uint8_t)chemStep_;
-      if (!PlaceGrain(g, x, y)) break;
+      if (!PlaceGrain(g, x, y, hv)) break;
       if (grainDead_.size() < grains_.size()) grainDead_.resize(grains_.size(), 0);
       left--;
     }
@@ -537,7 +547,7 @@ void FlaskSim::FlushPools() {
                        ? p.vessel : -1;
     const V2 at = hv >= 0 ? ToWorld(vessels_[hv].x, local) : local;
     if (S.gas) {
-      AddGasAt(p.sub, p.units, (int)std::floor(at.x), (int)std::floor(at.y));
+      AddGasAt(p.sub, p.units, (int)std::floor(at.x), (int)std::floor(at.y), hv);
     } else if (S.powder) {
       const int x = std::clamp((int)std::floor(at.x), 0, cfg_.gridW - 1);
       const int y = std::clamp((int)std::floor(at.y), 0, cfg_.gridH - 1);
@@ -547,7 +557,7 @@ void FlaskSim::FlushPools() {
         g.variant = (uint8_t)(Rand() % 3);
         g.home = (int8_t)hv;
         g.chem = (uint8_t)chemStep_;
-        if (!PlaceGrain(g, x, y)) break;
+        if (!PlaceGrain(g, x, y, hv)) break;
         if (grainDead_.size() < grains_.size()) grainDead_.resize(grains_.size(), 0);
         p.units--;
       }
@@ -839,7 +849,7 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
         chance = ChemScaledChance(r.chance, r.cond, count, chem_.chanceDen);
       }
       if (!chance || Rand01() * den >= chance * scale) continue;
-      if (r.fx >= 0) RaiseEvent(chem_.effects[r.fx], hv, at, subs_[slot].mat, 0, r);
+      RaiseEvents(hv, at, subs_[slot].mat, 0, r);
       ConvertEnt(selfType, selfIdx, UnitsOf(selfType, selfIdx), r.prodSelf, hv);
       firedThisStep_++;
       firedTotal_++;
@@ -862,7 +872,7 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
         produced_[r.prodNbr] += q;
         Deposit(r.prodNbr, (uint32_t)q, nb[hit].at, hv);
       }
-      if (r.fx >= 0) RaiseEvent(chem_.effects[r.fx], hv, at, subs_[slot].mat, 0, r);
+      RaiseEvents(hv, at, subs_[slot].mat, 0, r);
       if (r.prodSelf != kChemKeep) ConvertEnt(selfType, selfIdx, UnitsOf(selfType, selfIdx), r.prodSelf, hv);
       firedThisStep_++;
       firedTotal_++;
@@ -889,7 +899,7 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
     const int uN = virt ? INT_MAX : UnitsOf(n.type, n.idx);
     const int q = std::max(1, std::min(uS, uN));
     const uint16_t nm = nbMat(n);
-    if (r.fx >= 0) RaiseEvent(chem_.effects[r.fx], hv, at, subs_[slot].mat, nm, r);
+    RaiseEvents(hv, at, subs_[slot].mat, nm, r);
     if (r.prodNbr != kChemKeep) {
       if (!virt) {
         ConvertEnt(n.type, n.idx, q, r.prodNbr, hv);

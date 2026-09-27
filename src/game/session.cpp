@@ -1806,7 +1806,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                               Vec3{0, MetresToCells(0.15f), 0};
             }
             ReactionEffect fx;
-            if (put > 0 && ContainerPocketExplosion(cand.contents, mats, mobs.Reactions(), fx)) {
+            if (put > 0 && ContainerPocketExplosion(cand.contents, mats, mobs.Reactions(), fx, mat)) {
               bool seen = false;
               for (const Pocket& p : pockets) seen |= p.st == &cand;
               if (!seen) pockets.push_back({&cand, fx});
@@ -1883,8 +1883,16 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                                        std::max(1, p.fx.power), 0, 0, 0});
             p.st->ClearFill();
             p.st->stoppered = false;
-            p.st->count -= 1;
-            if (p.st->count <= 0) *p.st = ItemStack{};
+            // A vessel in a HAND leaves through the body's own door (Mob::
+            // KitTake marks the slot stale, so the held model is rebuilt), as
+            // the bench's break does; the hotbar and pack are plain slots.
+            const ptrdiff_t eq = p.st - kit.equip.slots;
+            if (eq >= 0 && eq < (ptrdiff_t)kEquipSlotCount) {
+              avatar.KitTake(KitRef{KitSpace::Equip, (int)eq}, 1);
+            } else {
+              p.st->count -= 1;
+              if (p.st->count <= 0) *p.st = ItemStack{};
+            }
             ui.kitMessage = "it explodes in your hands!";
             ui.kitMessageAge = 0.0f;
           }
@@ -3791,11 +3799,15 @@ static void PhaseJ(TickAuthorityCtx& w, WorldScratch& ws,
 // ---- REACTION EFFECTS -> EXPLOSIONS (docs/PLAN_alchemy_chemistry.md A) ----
 //
 // The world's handler registry for reactions.json "effects", keyed by kind
-// NAME. The world handles `explode` (package A) and `flash` (package E: a
-// burst of `glare` round the cell); every other kind is the
-// bench's (package C) or nobody's yet, and is ignored here by design
-// (materials.h ReactionEffect: "a consumer that does not know a kind ignores
-// it"). A new world kind is one more `if (fx.kind == ...)` below plus JSON.
+// NAME. The world handles `explode` (package A), `flash` (package E: a
+// burst of `glare` round the cell) and `shock` (a flash whose default
+// material is `spark`: a discharge that lives a tick or two and ignites what
+// it touches, through the spark's own rules). `eject`, `burst` and `pop` act
+// on a vessel or a player at the bench, which the world has no counterpart
+// for, so they are the bench's alone (alchemy_bench.cpp's registry) and are
+// ignored here by design (materials.h ReactionEffect: "a consumer that does
+// not know a kind ignores it"). A new world kind is one more branch below
+// plus JSON.
 //
 // WHAT IT READS is fixed-latency and ordered: the grid's firings come from
 // World::TakeReactFx (published snapshots, slot order within a tick, tick
@@ -3906,7 +3918,7 @@ static void ReactFxToBlasts(TickAuthorityCtx& w, uint32_t tick,
     const RuleFx* fx = FindRuleFx(w.mats, e.fxId);
     if (!fx) continue;
     for (const ReactionEffect& eff : fx->effects) {
-      if (eff.kind == "flash") {
+      if (eff.kind == "flash" || eff.kind == "shock") {
         const int r = std::clamp(eff.radius > 0 ? eff.radius : 2, 1, 6);
         bool merged = false;
         for (const Flash& f : flashes)
@@ -3916,7 +3928,9 @@ static void ReactFxToBlasts(TickAuthorityCtx& w, uint32_t tick,
           rf.refused++;
           continue;
         }
-        const uint32_t mat = matByName(eff.what.empty() ? std::string("glare") : eff.what);
+        const uint32_t mat = matByName(!eff.what.empty() ? eff.what
+                                       : eff.kind == "shock" ? std::string("spark")
+                                                             : std::string("glare"));
         if (!mat) continue;
         flashes.push_back({e.cell, r});
         rf.flashes++;
@@ -4215,9 +4229,14 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
       // reaction that blew up in the character's hands goes off here, in the
       // grenade's slot, so it craters, carves the hands and arms that held
       // it and shoves exactly as a grenade at the hands would.
-      for (const ExplosionOp& e : s.pendingBlasts)
-        if (exps.size() < kMaxExplosionsPerTick) exps.push_back(e);
-      s.pendingBlasts.clear();
+      // One that does not fit this tick waits for the next rather than
+      // vanishing: the vessels that made it are already gone.
+      {
+        size_t taken = 0;
+        while (taken < s.pendingBlasts.size() && exps.size() < kMaxExplosionsPerTick)
+          exps.push_back(s.pendingBlasts[taken++]);
+        s.pendingBlasts.erase(s.pendingBlasts.begin(), s.pendingBlasts.begin() + (ptrdiff_t)taken);
+      }
       for (size_t i = 0; i < grenades.size();) {
         if (UpdateGrenade(grenades[i], kTickDt, kindAt)) {
           if (exps.size() < kMaxExplosionsPerTick) {

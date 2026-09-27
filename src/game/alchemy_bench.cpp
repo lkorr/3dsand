@@ -639,7 +639,20 @@ void AlchemyBench::Tick(const BenchInput& in, bool pressed, float tilt, BenchToo
       const V2 neck{x.pos.x + nr.x, x.pos.y + nr.y};
       const V2 d{in.at.x - neck.x, in.at.y - neck.y};
       float len = std::sqrt(d.x * d.x + d.y * d.y);
-      if (len > 4) {
+      if (sim_.Stoppered(vs)) {
+        // A STOPPERED vessel: the stick cannot go in. It rests on the cork,
+        // upright along the vessel's axis -- the closing segment is glass to
+        // the contents, and the stick (which pushes particles, never glass)
+        // must not stir through it.
+        const V2 up = Rot({0.0f, 1.0f}, x.angle);
+        // The cork's cap is drawn to local height + 6 (flaskchem.cpp, the
+        // stopper); the stick's round end (radius 2.5) sits on it.
+        const float rest = sh.height + 9.0f;
+        const V2 cork{x.pos.x + up.x * rest, x.pos.y + up.y * rest};
+        const V2 top{cork.x + up.x * sh.height * 0.45f, cork.y + up.y * sh.height * 0.45f};
+        sim_.SetStick(true, top, cork, 2.5f);
+        stick = true;
+      } else if (len > 4) {
         // In the vessel's own frame, where "down the neck" is -y.
         V2 u = Rot({d.x / len, d.y / len}, -x.angle);
         const float maxLean = 0.6f;

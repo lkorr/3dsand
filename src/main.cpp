@@ -10382,9 +10382,32 @@ int main(int argc, char** argv) {
       weather::Presets().Reload();
       std::vector<MaterialDef> newMats;
       std::vector<ReactionGpu> newReactions;
-      if (LoadAssets(assetDir + "/materials/materials.json",
-                     assetDir + "/materials/reactions.json", newMats, newReactions,
-                     errors)) {
+      // THE ALCHEMY BENCH: its substances, rules and ledger are indexed by the
+      // material ids of the table it opened with (alchemy_bench.h Open), and
+      // it validates its tally against `mats` when it closes. A reload that
+      // MOVES ids (a material inserted, removed or renamed) under an open
+      // bench would validate it against the wrong rows -- so that reload
+      // waits: the bench is closed (written back normally) this frame and the
+      // reload runs on the next. A reload that keeps every id (a tuning F5, a
+      // colour or rule edit) goes ahead under the open bench, which keeps
+      // running on the rules it copied at Open.
+      auto idsMoved = [&](const std::vector<MaterialDef>& nm) {
+        if (nm.size() != mats.size()) return true;
+        for (size_t i = 0; i < nm.size(); i++)
+          if (nm[i].name != mats[i].name) return true;
+        return false;
+      };
+      bool loaded = LoadAssets(assetDir + "/materials/materials.json",
+                               assetDir + "/materials/reactions.json", newMats, newReactions,
+                               errors);
+      if (loaded && bench.IsOpen() && idsMoved(newMats)) {
+        std::fprintf(stderr, "materials reload moves material ids: closing the alchemy "
+                             "bench first, reloading next frame\n");
+        ui.alchemy.wantClose = true;
+        ui.reloadMaterials = true;
+        loaded = false;
+      }
+      if (loaded) {
         mats = std::move(newMats);
         reactions = std::move(newReactions);
         {
@@ -10593,7 +10616,7 @@ int main(int argc, char** argv) {
         }
         std::printf("materials reloaded (%zu, %zu reactions)\n", mats.size(),
                     reactions.size());
-      } else {
+      } else if (!ui.reloadMaterials) {   // (deferred for the bench: not a failure)
         std::fprintf(stderr, "asset reload failed:\n%s\n", errors.c_str());
       }
     }
@@ -12897,37 +12920,46 @@ int main(int argc, char** argv) {
         }
         return n ? sum * (1.0f / (float)n) : at;
       };
-      auto finishBench = [&](bool abrupt = false, bool breakHeld = false) {
+      // Returns false when the session was VOIDED (nothing written back):
+      // the caller must then not apply anything else the session produced
+      // (an explosion at the hands), or the reaction would go off AND the
+      // vessels come back full to do it again.
+      auto finishBench = [&](bool abrupt = false, bool breakHeld = false) -> bool {
         alchemy::BenchResult r = bench.Finish(abrupt);
         ui.alchemy.open = false;
         ui.alchemy.texReady = false;
         ui.alchemy.rows.clear();
+        // What already fell into the world while the bench was up (streamed
+        // off the table, vented out of a mouth) is gone whatever happens
+        // here: a voided session takes it out of the vessels that are still
+        // what they were, so voiding is never a way to pour a flask out and
+        // keep it full. Both void paths below owe it.
+        auto takeStreamed = [&]() {
+          for (size_t m = 0; m < r.streamed.size(); m++) {
+            uint32_t owe = r.streamed[m];
+            for (const alchemy::BenchEntry& o : r.vessels) {
+              if (!owe) break;
+              ItemStack* os = kit.Resolve(o.ref);
+              if (os && os->name == o.item && os->count == 1 && os->contents.SameAs(o.before))
+                owe -= os->contents.Take((uint16_t)m, owe);
+            }
+          }
+        };
         std::string why;
         if (!alchemy::ValidateBench(r, mats, why)) {
           std::fprintf(stderr, "alchemy bench: %s -- nothing changed\n", why.c_str());
+          takeStreamed();
           ui.kitMessage = "the bench lost track of something; nothing changed";
           ui.kitMessageAge = 0.0f;
-          return;
+          return false;
         }
         for (const alchemy::BenchEntry& e : r.vessels) {
           const ItemStack* st = kit.Resolve(e.ref);
           if (!st || st->name != e.item || st->count != 1 || !st->contents.SameAs(e.before)) {
-            // What already fell into the world while the bench was up is
-            // gone whatever happens here: it comes out of the vessels that
-            // are still what they were, so voiding the session is never a
-            // way to pour a flask out and keep it full.
-            for (size_t m = 0; m < r.streamed.size(); m++) {
-              uint32_t owe = r.streamed[m];
-              for (const alchemy::BenchEntry& o : r.vessels) {
-                if (!owe) break;
-                ItemStack* os = kit.Resolve(o.ref);
-                if (os && os->name == o.item && os->count == 1 && os->contents.SameAs(o.before))
-                  owe -= os->contents.Take((uint16_t)m, owe);
-              }
-            }
+            takeStreamed();
             ui.kitMessage = "something moved while you worked; nothing changed";
             ui.kitMessageAge = 0.0f;
-            return;
+            return false;
           }
         }
         // THE GLASS THAT BROKE: a vessel whose pressure burst it on the bench,
@@ -12972,6 +13004,7 @@ int main(int argc, char** argv) {
             ui.kitMessageAge = 0.0f;
           }
         }
+        return true;
       };
       // Put a vessel on the bench (opening the bench if it is not up yet, sized
       // to the room the panel measured last) or take it off.
@@ -13009,16 +13042,14 @@ int main(int argc, char** argv) {
         if (bench.OnTable(ui.alchemy.toggleRef)) bench.Remove(ui.alchemy.toggleRef);
         else benchPlace(ui.alchemy.toggleRef);
       }
-      if (ui.alchemy.wantClose || (bench.IsOpen() && !ui.inventoryOpen)) {
-        ui.alchemy.wantClose = false;
-        if (bench.IsOpen()) finishBench();
-      }
       // ---- THE BENCH'S EVENTS (alchemy_bench.h: the registry by effect kind) --
       // Each goes through its handler into one BenchOutcome, applied here
       // generically: a message, an EJECT (the bench shuts mid-motion, the
       // vessels in hand break), real EXPLOSIONS at the hands through the
       // grenade slot (PlayerSession::pendingBlasts) and a PUFF of the
-      // reaction's gases round them on the CPU gas stream.
+      // reaction's gases round them on the CPU gas stream. BEFORE the close
+      // below, so an event raised in the frame the bench is closed is not
+      // dropped with the session.
       if (bench.IsOpen()) {
         alchemy::BenchOutcome out;
         bool any = false;
@@ -13038,14 +13069,26 @@ int main(int argc, char** argv) {
           std::vector<GasSpawnOp> gas;
           alchemy::BenchOutcomeWorldOps(out, hands, rng::Hash3(0xB1A57u, (uint32_t)frameCounter, 1u), mats,
                                         exps, gas);
-          for (const ExplosionOp& e : exps) session.pendingBlasts.push_back(e);
           for (int be : out.burst) bench.BurstEntry(be);
-          if (!gas.empty()) world.QueueGasSpawns(gas.data(), (uint32_t)gas.size());
+          // An EJECT closes the session first, and its blast and puff go off
+          // only if the session was written back (the held vessels broke). A
+          // VOIDED session put the vessels back as they came -- sodium and
+          // water still in them -- so blasting too would let the same
+          // reaction explode again the next time they went on the bench.
+          bool apply = true;
           if (out.eject) {
-            finishBench(true, out.breakHeld);
+            apply = finishBench(true, out.breakHeld);
             ui.inventoryOpen = false;   // thrown out of the bench AND the screen
           }
+          if (apply) {
+            for (const ExplosionOp& e : exps) session.pendingBlasts.push_back(e);
+            if (!gas.empty()) world.QueueGasSpawns(gas.data(), (uint32_t)gas.size());
+          }
         }
+      }
+      if (ui.alchemy.wantClose || (bench.IsOpen() && !ui.inventoryOpen)) {
+        ui.alchemy.wantClose = false;
+        if (bench.IsOpen()) finishBench();
       }
       // ---- THE BENCH IN THE CHARACTER'S HANDS (session.h BenchHold) --------
       // One vessel on the table: held in one hand. Two or more: the one in
@@ -13612,7 +13655,11 @@ int main(int argc, char** argv) {
               p.name = mid < mats.size() ? mats[mid].name + (dis ? " (dissolved)" : "") : std::string("?");
               p.color = mid < mats.size() ? (0xFF000000u | (mats[mid].gpu.color0 & 0x00FFFFFFu)) : 0u;
               p.eighths = (int)c.p[i].eighths;
-              p.dissolved = dis;
+              // `dissolved` is read as "takes no room" (the fill bar and the
+              // n / cap count): dissolved matter rides the liquid, and a
+              // stoppered flask's gas is headspace (container.h
+              // ContainerVolume) -- counting it read a flask of fumes over-full.
+              p.dissolved = dis || (mid < mats.size() && mats[mid].gpu.klass == CLASS_GAS);
               out.push_back(p);
             }
             // Heaviest first: the list reads bottom layer to top.
@@ -13650,6 +13697,12 @@ int main(int argc, char** argv) {
           ui.alchemy.focusName.clear();
           ui.alchemy.focusParts.clear();
           ui.alchemy.focusCap = 0;
+          // The devices too: a focus with none (off the table) must not show
+          // the last vessel's stopper, flame and pressure.
+          ui.alchemy.focusStoppered = false;
+          ui.alchemy.focusBurner = false;
+          ui.alchemy.focusHeat = 0.0f;
+          ui.alchemy.focusPressure = 0.0f;
           if (fr.Valid()) {
             const ItemStack* st = kit.Resolve(fr);
             const ItemDef* d = st ? items.Of(*st) : nullptr;

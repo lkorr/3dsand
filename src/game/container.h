@@ -514,8 +514,14 @@ alchemy::Composition ContainerTakeDissolvedShare(alchemy::Composition& c, uint32
 // hands. Deterministic and integer (the compiled table, in portion order).
 // Only `explode` is answered here; the rest of a pocket reaction's
 // chemistry is the bench's.
+// `with` (nonzero) is what just ARRIVED: only a pair that includes it is
+// asked, so a flask that left the bench holding sodium over water that had
+// not met yet is not set off by a scoop of plain sand. A pocket is dark and
+// cannot read a concentration: a light/sky/rain-gated rule and a
+// solute-conditioned one never fire here (benchchem.h ChemGateOpen, night).
 bool ContainerPocketExplosion(const alchemy::Composition& c, const std::vector<MaterialDef>& mats,
-                              const std::vector<ReactionGpu>& reactions, ReactionEffect& out);
+                              const std::vector<ReactionGpu>& reactions, ReactionEffect& out,
+                              uint16_t with = 0);
 
 // A VESSEL'S VOLUME in eighths: what takes room in it. Dissolved matter and
 // gas (a stoppered flask's headspace) do not; everything else does.

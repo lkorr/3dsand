@@ -176,17 +176,20 @@ inline Chemistry BuildBenchChemistry(const std::vector<MaterialDef>& mats,
       r.prodNbr = prod(g.prodNbr, ok);
       if (!ok) continue;
       if (k < m.ruleFx.size() && !m.ruleFx[k].effects.empty()) {
-        // One effect a rule on the bench (the first); the registry keys on
-        // its kind.
-        const ReactionEffect& e = m.ruleFx[k].effects.front();
-        ChemEffect fx;
-        fx.kind = e.kind;
-        fx.radius = e.radius;
-        fx.power = e.power;
-        fx.amount = e.amount;
-        fx.what = e.what;
+        // Every effect of the rule, in order; the registry keys on each
+        // one's kind (a rule may explode AND flash).
         r.fx = (int)c.effects.size();
-        c.effects.push_back(fx);
+        for (const ReactionEffect& e : m.ruleFx[k].effects) {
+          if (r.fxCount == 255) break;
+          ChemEffect fx;
+          fx.kind = e.kind;
+          fx.radius = e.radius;
+          fx.power = e.power;
+          fx.amount = e.amount;
+          fx.what = e.what;
+          c.effects.push_back(fx);
+          r.fxCount++;
+        }
       }
       c.rules[s].push_back(r);
     }
