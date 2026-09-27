@@ -2308,6 +2308,13 @@ struct Tuning {
     int powderFineRepose = TPD(sim, powderFineRepose);
     // critter hop chance = 1/(mask+1) per tick
     int wanderHopMask = TPD(sim, wanderHopMask);
+    // THE SOLUTE LAYER (docs/PLAN_solutes.md). 0 = nothing dissolves (the
+    // CA's dissolve step is off; mass already in the world still moves and
+    // diffuses). 1 = on.
+    int soluteMode = TPD(sim, soluteMode);
+    // Percent scale on each species' solutes.json `diffusivity`: 0 freezes the
+    // pair exchange, 100 is the authored rate. The --sweep reach knob.
+    int soluteDiffusion = TPD(sim, soluteDiffusion);
     // Explosion micro grit: sub-voxel spall thrown alongside the real ejecta.
     // Visual, but spawned BY A SIM KERNEL from the hashed RNG — the roll
     // advances sim state and the droplets can stain, so these are integers in

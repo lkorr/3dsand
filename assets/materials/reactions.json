@@ -1765,21 +1765,28 @@
       "selfBecomes": "water"
     },
     {
-      "note": "-------- fairy dust enchants water and blood --------\nA simple PAIR RULE for now: one grain turns the liquid cell it touches. Package B's solute layer is meant to REPLACE these with concentration (solutes.json `fairy`: dissolve, diffuse, convert at cMin) -- delete these two when it does."
+      "note": "-------- fairy dust enchants water and blood: NO PAIR RULE --------\nThe solute layer owns this (package B, docs/PLAN_solutes.md): fairy dust DISSOLVES into water or blood (solutes.json `fairy`), the mass spreads through the liquid, and a cell concentrated past the species' `converts` cMin BECOMES enchanted_water / enchanted_blood (sim_step.wgsl solTryConvert). A pinch in a lake disperses below cMin and enchants nothing; a handful in a basin enchants it. The two placeholder pair rules package A authored here (one grain turned the cell it touched) were removed when the layer landed."
     },
     {
-      "self": "fairy_dust",
-      "neighbor": "water",
-      "chance": 60,
-      "selfBecomes": "air",
-      "neighborBecomes": "enchanted_water"
+      "note": "-------- brine electrolysis: the chlor-alkali cell (package B) --------\nSalt WATER touching a spark (tag:electric) splits: 2 NaCl + 2 H2O -> Cl2 + H2 + 2 NaOH. Both rules are gated on the DISSOLVED salt with the solute layer's concentration condition (\"solute\": \"salt\", \"cMin\": 24 -- brine, not a pinch; sim_step.wgsl solRuleAllows, the rule side array): fresh water under a spark does nothing. The first rule makes lye of the water and chlorine of the spark, the second hydrogen of the water and chlorine of the spark, so a shocked brine pool fumes both gases and turns caustic. Appended at the END of water's bucket (no earlier water rule's RNG stream moves). Simplification: the lye keeps the water's dissolved salt (lye is a salt solvent in solutes.json), so the salt is not consumed. A CPU evaluator with no solute (a body, the bench without its own solute model) must treat these as unmet -- MaterialDef::ruleFx[k].solute / RuleNeedsSolute."
     },
     {
-      "self": "fairy_dust",
-      "neighbor": "blood",
-      "chance": 60,
-      "selfBecomes": "air",
-      "neighborBecomes": "enchanted_blood"
+      "self": "water",
+      "neighbor": "tag:electric",
+      "solute": "salt",
+      "cMin": 24,
+      "chance": 300,
+      "selfBecomes": "lye",
+      "neighborBecomes": "chlorine"
+    },
+    {
+      "self": "water",
+      "neighbor": "tag:electric",
+      "solute": "salt",
+      "cMin": 24,
+      "chance": 250,
+      "selfBecomes": "hydrogen",
+      "neighborBecomes": "chlorine"
     },
     {
       "note": "======== PACKAGE E: THE CREATIVE EXPANSION (2026-09-27, docs/PLAN_alchemy_chemistry.md) ========\nForty-four new materials (materials.json, the rows after `spark`) and their chemistry, real and lore. Every rule below is APPENDED, so it is the last of its material's bucket and re-rolls nothing authored before it (rule index is part of the reaction RNG stream). They run in the WORLD and, through the same compiled table, on the ALCHEMY BENCH (game/flasksim_mats.h BuildBenchChemistry: a burner is a virtual tag:hot neighbour, Electrify a virtual spark, gases vent from the mouth into the world, and a rule's effect is a bench event by kind).\n\nRECIPES, in one place (the notes below say why each number is what it is):\n  gunpowder     saltpeter + charcoal -> black_mix; black_mix + sulfur -> gunpowder; heat or a spark -> EXPLODES (wet it and it is spoiled to charcoal)\n  smoke bomb    saltpeter + sugar -> smoke_powder; heat -> smoke_charge, which pours thick_smoke and burns out to ash\n  lime          chalk + heat -> quicklime; quicklime + water -> slaking_lime (HOT for a second: boils, ignites) -> slaked_lime; slaked_lime + choke_damp -> chalk\n  thermite      rust + aluminium -> thermite; heat -> molten_iron (with a white glare), which cuts iron and steel and quenches to iron\n  vitriol       acid + copper -> blue_vitriol (dissolves blue: the `vitriol` solute); blue_vitriol on iron -> copper + rust ('iron into copper')\n  acids         acid + saltpeter -> aqua_fortis (parting acid: silver, copper, lead, iron -- never gold); aqua_fortis + salt -> aqua_regia (dissolves GOLD)\n  quicksilver   quicksilver + sulfur -> cinnabar; cinnabar + heat -> quicksilver + fume; quicksilver + heat -> poisonous vapour\n  fire          phosphorus lights itself in AIR (keep it under water); acid + aluminium -> hydrogen; acid + sugar -> charcoal (the carbon snake)\n  spirits       sugar dissolves -> syrup; syrup + fungus (the yeast) -> spirits + choke_damp; spirits + acid -> ether; ether EVAPORATES to heavy ether_vapour, which EXPLODES near a flame\n  frost         frost_salt + water -> ice (about three a grain); + lava -> stone; + steam -> snow; snuffs fire\n  holy water    enchanted_water + salt -> holy_water; it SEARS rot (tag:infectious -> flesh_charred) and purifies ichor\n  sun and moon  silver + water under the NIGHT sky -> moonwater; gold_dust + water under the NOON sky -> sunwater; each fades back under the other's sky\n  the stone     sunwater + moonwater (the chemical wedding) -> philosophers_stone, rarely, with a flash; the stone on lead -> gold_dust, crumbling as it works\n  light         luminous_spores sprout into glowcap on damp ground, at once in moonwater; heat pops a glowcap back to spores; spores dissolved -> glow_potion\n  slime         fairy_dust + ichor -> slime; slime eats carrion (rotflesh, ichor) one for one; salt and heat kill it\n  dragon        dragons_blood on skin -> dragonhide (Siegfried); heat -> it ERUPTS; water hisses it away\n\nRULE 2, for all of it: every conversion is one-for-one or SPENDS its reagent (a catalyst -- silver, gold dust, the stone, frost salt -- carries its own spend rule at a fixed ratio), every gas decays, every hot transient decays, and every blast goes through the capped explode path. Nothing here grows from nothing, and nothing emits forever: the smoke charge is the only emitter and it burns out in ~2 s.\n\nEFFECTS: `explode` is the world's and the bench's (gunpowder, ether vapour, dragon's blood). `flash` (thermite, phosphorus, the chemical wedding, a transmutation) is a burst of `glare` round the cell in the world (game/session.cpp ReactFxToBlasts, capped at 4 a tick, merged by radius) and a word at the bench.\n\nIGNITION SCALING: a rule whose product is hot, or a hot neighbour acting on a FLAMMABLE self, is multiplied by combustion.spreadPct (29% as shipped). Every such rule below is authored knowing it (gunpowder's 1000 reads as ~290 per-mille a hot face)."

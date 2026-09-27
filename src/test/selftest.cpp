@@ -78,6 +78,9 @@ const std::vector<Gate>& CombatGates();
 const std::vector<Gate>& PoseGates();
 // The network layer (src/net/*). CPU-only: no world, no GPU, no assets.
 const std::vector<Gate>& NetGates();
+// The solute layer (docs/PLAN_solutes.md): conservation, the dilution floor,
+// the phase change. Each regenerates worldgen and builds its own stone box.
+const std::vector<Gate>& SoluteGates();
 
 // THE EXECUTION ORDER, and it is load-bearing.
 //
@@ -940,6 +943,9 @@ const char* const kOrder[] = {
     // Right after it: spawns every pool body, kills and resets them, and
     // evicts every unheld runtime def -- so nothing after it counts defs.
     "pool-evict",
+    // The solute layer (docs/PLAN_solutes.md). Each regenerates worldgen and
+    // builds a sealed stone box of its own; nothing after them reads solute.
+    "solute", "solute-dilute", "solute-evap", "solute-seam", "solute-electrolysis", "solute-vessel",
     "snapshot-latency",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
@@ -968,7 +974,7 @@ const std::vector<Gate>& Registry() {
                           &SwingGates(),
                           &EquipmentGates(), &DyeGates(), &WoundGates(), &ImpactGates(),
                           &CombatGates(), &PoseGates(),
-                          &NetGates()})
+                          &NetGates(), &SoluteGates()})
       pool.insert(pool.end(), g->begin(), g->end());
 
     std::vector<Gate> v;

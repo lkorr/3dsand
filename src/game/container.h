@@ -99,6 +99,30 @@ struct ContainerScoopLedger {
 void ContainerLedgerObserve(ContainerScoopLedger& L, uint32_t snapTick,
                             uint32_t ledger, int landingClaims);
 
+// THE DISSOLVED HALF OF A SCOOP (docs/PLAN_alchemy_chemistry.md contract
+// 2.5; world.h kSolMScoopBySpecies). A clear that empties a liquid cell also
+// takes the solute mass that cell carried: sim_solute.wgsl solScoop moves it
+// into a per-species monotonic counter the snapshot carries
+// (WorldSnapshot::solScoopedBy). One reader per world, like the eighths
+// ledger: each new snapshot's delta goes into a per-species POT, and the
+// session whose water claims were paid that tick draws it as a DISSOLVED
+// portion (composition.h kDissolvedBit), whole eighths only -- one eighth is
+// SoluteDef::yieldPerVoxel / 8 units. The sub-eighth remainder stays in the
+// pot for the next scoop of the same species, so nothing is rounded away.
+struct ContainerSoluteLedger {
+  bool have = false;
+  uint32_t tick = 0;
+  uint32_t seen[kSolScoopSpecies] = {};
+  uint32_t pot[kSolScoopSpecies] = {};
+};
+// Observe one snapshot (idempotent for a tick already seen). A counter that
+// went BACKWARDS was reset (load, regen): re-seeded, nothing credited.
+void ContainerSoluteObserve(ContainerSoluteLedger& L, uint32_t snapTick,
+                            const uint32_t (&scoopedBy)[kSolScoopSpecies]);
+// Take whole eighths of species `species` (1-based) out of the pot, at
+// `eighthUnits` units an eighth. Returns the eighths taken.
+int ContainerSoluteTake(ContainerSoluteLedger& L, uint32_t species, uint32_t eighthUnits);
+
 struct ContainerScoopMemo {
   struct Taken {
     IVec3 c;

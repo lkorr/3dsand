@@ -116,6 +116,190 @@ const GAS_OUTER_MAX   : u32 = 60000u;
 const GAS_MODE_OFF    : u32 = 0u;
 // PFLAG_GAS is in common.wgsl now, beside the other PFLAG_* bits.
 
+// ---- THE SOLUTE LAYER (docs/PLAN_solutes.md; world.h kSol*; bindings 40..43)
+// The CA is where dissolved mass MOVES: every liquid move carries it
+// (advection, tryMove / transferLiquid), a powder named as a solute's `from`
+// dissolves into a solvent it touches, a solvent the CA turns into something
+// else pushes its mass into a neighbour or leaves it as powder (evaporation
+// concentrates brine and finally precipitates salt), and a solvent
+// concentrated past a `converts` row becomes that material. Diffusion, the
+// dilution floor and the pages themselves are sim_solute.wgsl's.
+//
+// solTable is read_write only because the layout entry is: the CA never
+// writes it (a page is solAlloc's, handed back by solCompact). Every write of
+// a cell's mass goes through solStoreAt, which refuses and COUNTS a write into
+// a chunk that is not a page -- the allocator guarantees one to every chunk
+// this tick can write, so the count is a bug detector, not a code path.
+@group(0) @binding(40) var<storage, read_write> solTable : array<u32>;
+@group(0) @binding(41) var<storage, read_write> solPool : array<atomic<u32>>;
+@group(0) @binding(42) var<storage, read_write> solMeta : array<atomic<u32>>;
+@group(0) @binding(43) var<storage, read> solSpec : array<u32>;
+
+// MIRROR-BEGIN solute
+// ---- THE SOLUTE LAYER'S SHARED ACCESSORS (docs/PLAN_solutes.md) -------------
+// ONE block, pasted verbatim into every shader that touches dissolved mass
+// (sim_step.wgsl, sim_solute.wgsl, sim_mutate.wgsl, sim_fluid_seam.wgsl) and
+// held identical by scripts/check_invariants.py `solute`. Not in common.wgsl on
+// purpose: common.wgsl is prepended to every shader, so an edit there misses the
+// SPIR-V cache for all of them (CLAUDE.md, "What needs a rebuild"); this block
+// only reaches the four modules that bind the layer.
+//
+// The layout is world.h's kSol* block, mirrored constant for constant:
+//   solTable[slot]  0 = SOL_EMPTY | SOL_UNIFORM_BIT | value16 | SOL_PAGE_BIT | page
+//   solPool         16-bit cells (species << 8 | mass), two per word, the EVEN
+//                   chunk-local index in the low half
+//   solMeta         SOLM_* header, free stack, want list/flags, request flags,
+//                   stall counters, per-chunk aggregates
+//   solSpec         species params (SOLS_*) + one word per material
+//
+// POOL WORDS ARE WRITTEN WITH TWO ATOMICS (and, then or) because two cells share
+// a word and the colour lattice lets two acting threads write neighbouring
+// cells: a plain read-modify-write of the word would lose one of them. Atomic
+// ops on DISJOINT bits commute, so the result does not depend on their order.
+const SOL_UNIFORM_BIT : u32 = 0x80000000u;
+const SOL_PAGE_BIT : u32 = 0x40000000u;
+const SOL_PAGE_MASK : u32 = 0x3FFFFFFFu;
+const SOL_WORDS_PER_PAGE : u32 = 2048u;
+const SOL_POOL_PAGES : u32 = 4096u;
+const SOLM_FREE : u32 = 0u;
+const SOLM_WANT_COUNT : u32 = 1u;
+const SOLM_FAULTS : u32 = 2u;
+const SOLM_EXHAUSTED : u32 = 3u;
+const SOLM_HIGH_WATER : u32 = 4u;
+const SOLM_DISSOLVED : u32 = 5u;
+const SOLM_PRECIP : u32 = 6u;
+const SOLM_DISCARDED : u32 = 7u;
+const SOLM_CONVERTED : u32 = 8u;
+const SOLM_FAULT_SLOT : u32 = 9u;
+const SOLM_FAULT_TICK : u32 = 10u;
+const SOLM_POURED : u32 = 11u;
+const SOLM_SCOOPED : u32 = 12u;
+const SOLM_SEAM_REFUSED : u32 = 13u;
+const SOLM_ARGS : u32 = 16u;
+const SOLM_STACK : u32 = 64u;
+const SOLM_WANT_LIST : u32 = SOLM_STACK + SOL_POOL_PAGES;
+const SOLM_WANT_FLAG : u32 = SOLM_WANT_LIST + NUM_SLOTS;
+const SOLM_REQ_FLAG : u32 = SOLM_WANT_FLAG + NUM_SLOTS;
+const SOLM_STALL : u32 = SOLM_REQ_FLAG + NUM_SLOTS;
+const SOLM_AGG : u32 = SOLM_STALL + NUM_SLOTS;
+const SOLS_BASE : u32 = 16u;
+const SOLS_STRIDE : u32 = 16u;
+const SOLS_MAT_BASE : u32 = 4112u;
+const SOLS_RULE_BASE : u32 = 8208u;
+// Bit 26 of the dirty word (world.h kDirtyReasonName "solute"): dissolved mass
+// still moving. Deliberately NOT in sim_step's FILM_LICENCE.
+const DIRTY_R_SOLUTE : u32 = 67108864u;
+// Bit 27 ("solute-back"): a chunk's diffusion found work across its -axis face
+// in a pair its -axis neighbour OWNS. The owner, woken by it, keeps itself
+// awake for a whole phase cycle (it cannot know which of the 24 phases the
+// pair lives in, and waking it for one tick lands on the wrong one).
+const DIRTY_R_SOLBACK : u32 = 134217728u;
+// A chunk whose diffusion found nothing to do for this many CONSECUTIVE
+// dispatches has seen every axis, parity and stride (3 x 2 x 4 = 24 phases,
+// eight ticks) idle: it is STALLED, the dilution floor applies and it stops
+// keeping itself awake.
+const SOL_STALL_TICKS : u32 = 24u;
+
+fn solSpeciesOf(v : u32) -> u32 { return v >> 8u; }
+fn solMassOf(v : u32) -> u32 { return v & 0xFFu; }
+fn solPack(species : u32, mass : u32) -> u32 {
+  if (mass == 0u || species == 0u) { return 0u; }
+  return (species << 8u) | min(mass, 255u);
+}
+fn solLocalOf(c : vec3<i32>) -> u32 {
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  return (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+}
+// The cell value a table entry implies for chunk-local cell `local`.
+fn solCellValue(e : u32, local : u32) -> u32 {
+  if (e == 0u) { return 0u; }
+  if ((e & SOL_UNIFORM_BIT) != 0u) { return e & 0xFFFFu; }
+  let wv = atomicLoad(&solPool[(e & SOL_PAGE_MASK) * SOL_WORDS_PER_PAGE + (local >> 1u)]);
+  return (wv >> ((local & 1u) * 16u)) & 0xFFFFu;
+}
+// The STORED value at world cell c. A caller that wants the value a cell
+// carries must also ask whether the cell is a liquid (solCarried): a value
+// left behind on a cell something turned into air is stale until solCompact
+// clears it, and must read as nothing.
+fn solValueAt(c : vec3<i32>) -> u32 {
+  return solCellValue(solTable[voxSlotOfCell(c)], solLocalOf(c));
+}
+fn solWritable(c : vec3<i32>) -> bool {
+  return (solTable[voxSlotOfCell(c)] & SOL_PAGE_BIT) != 0u;
+}
+// A write into a chunk with no page is REFUSED and counted -- the allocator
+// promises a page to every chunk a tick can write, so a refusal is a bug, and
+// the count is what says so (Simulation::CheckSoluteFaults aborts on it). A
+// write of the value the sentinel already implies is not a write at all.
+fn solFault(slot : u32) {
+  let prev = atomicAdd(&solMeta[SOLM_FAULTS], 1u);
+  if (prev == 0u) {
+    atomicStore(&solMeta[SOLM_FAULT_SLOT], slot + 1u);
+    atomicStore(&solMeta[SOLM_FAULT_TICK], T.tick);
+  }
+}
+fn solStoreAt(c : vec3<i32>, v : u32) -> bool {
+  let slot = voxSlotOfCell(c);
+  let e = solTable[slot];
+  let local = solLocalOf(c);
+  if ((e & SOL_PAGE_BIT) == 0u) {
+    if (solCellValue(e, local) == v) { return true; }
+    solFault(slot);
+    return false;
+  }
+  let wi = (e & SOL_PAGE_MASK) * SOL_WORDS_PER_PAGE + (local >> 1u);
+  let sh = (local & 1u) * 16u;
+  let old = (atomicLoad(&solPool[wi]) >> sh) & 0xFFFFu;
+  if (old == v) { return true; }
+  atomicAnd(&solPool[wi], ~(0xFFFFu << sh));
+  atomicOr(&solPool[wi], (v & 0xFFFFu) << sh);
+  return true;
+}
+// ---- the species table (world.h kSolSpec*, Simulation::UploadSolutes) ----
+fn solYield8(s : u32) -> u32 { return max(solSpec[SOLS_BASE + s * SOLS_STRIDE], 1u); }
+fn solSaturation(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 1u]; }
+fn solDissolveChance(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 2u]; }
+fn solDiffusivity(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 3u]; }
+fn solFloor(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u]; }
+fn solDensityPerUnit(s : u32) -> i32 { return bitcast<i32>(solSpec[SOLS_BASE + s * SOLS_STRIDE + 5u]); }
+fn solPrecipitate(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 9u]; }
+fn solConvertCount(s : u32) -> u32 { return min(solSpec[SOLS_BASE + s * SOLS_STRIDE + 10u], 4u); }
+fn solConvertRow(s : u32, k : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 11u + k]; }
+fn solMatWord(m : u32) -> u32 { return solSpec[SOLS_MAT_BASE + (m & 0xFFFu)]; }
+// The species powder `m` dissolves AS, or 0.
+fn solFromSpecies(m : u32) -> u32 { return solMatWord(m) & 0xFFu; }
+// Is liquid `m` a solvent of species `s`?
+fn solIsSolvent(m : u32, s : u32) -> bool {
+  if (s == 0u || s > 24u) { return false; }
+  return (solMatWord(m) & (1u << (7u + s))) != 0u;
+}
+// The most mass a cell of `f` eighths of a solvent holds of species `s`.
+fn solCap(s : u32, f : u32) -> u32 { return (solSaturation(s) * f) / 8u; }
+fn solIsLiquidMat(m : u32) -> bool {
+  return m != MAT_AIR && materials[m].klass == CLASS_LIQUID;
+}
+// The value cell c CARRIES given its word `w`: the stored value if the cell is
+// a liquid, else nothing (see solValueAt).
+fn solCarried(c : vec3<i32>, w : u32) -> u32 {
+  if (!solIsLiquidMat(voxMat(w))) { return 0u; }
+  return solValueAt(c);
+}
+// A CONCENTRATION CONDITION on a reaction rule (PLAN_solutes §4.1; the side
+// array at SOLS_RULE_BASE, indexed by the rule's GPU index): may rule `ri`
+// fire for the self cell c whose word is w? An unconditioned rule (word 0)
+// always may; a conditioned one needs a liquid self carrying that species at
+// a concentration (mass * 8 / fullness) inside [cMin, cMax].
+fn solRuleAllows(ri : u32, c : vec3<i32>, w : u32) -> bool {
+  let cond = solSpec[SOLS_RULE_BASE + ri];
+  if (cond == 0u) { return true; }
+  if (!solIsLiquidMat(voxMat(w))) { return false; }
+  let v = solValueAt(c);
+  if (solSpeciesOf(v) != (cond & 0xFFu)) { return false; }
+  let conc = (solMassOf(v) * 8u) / (voxState(w) + 1u);
+  return conc >= ((cond >> 8u) & 0xFFu) && conc <= ((cond >> 16u) & 0xFFu);
+}
+// MIRROR-END solute
+
 fn markVoxActive(idx : u32) {
   if (T.vizActive != 0u && idx != PT_NO_WORD) {
     atomicOr(&actVoxViz[idx >> 5u], 1u << (idx & 31u));
@@ -152,8 +336,11 @@ fn inBounds(c : vec3<i32>) -> bool { return cellResident(c, T.origin); }
 // used to hold up to 7 innocent chunks awake beside every idle reactor. None
 // of the four is in FILM_LICENCE, and the repose snapshot is keyed on the
 // dispatch list rather than on who marked it, so neither depends on the fan.
+// DIRTY_R_SOLUTE joins them for the CA's one non-write use of it: a dissolve
+// that found no page this tick asks for one (SOLM_REQ_FLAG) and keeps only its
+// OWN chunk awake to take it next tick.
 const DIRTY_OWN_CHUNK_ONLY : u32 =
-    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_FLOW | DIRTY_R_VISCOUS;
+    DIRTY_R_REACT | DIRTY_R_STAIN | DIRTY_R_FLOW | DIRTY_R_VISCOUS | DIRTY_R_SOLUTE;
 
 fn markDirtyR(c : vec3<i32>, reason : u32) {
   if ((reason & ~DIRTY_OWN_CHUNK_ONLY) == 0u) {
@@ -456,6 +643,308 @@ fn canDisplace(myDensity : i32, rising : bool, tw : u32) -> bool {
   return td < myDensity;
 }
 
+// ---- ADVECTION: dissolved mass rides the liquid that carries it -------------
+// Each of these runs on cells the acting thread is ALREADY writing (tryMove's
+// and transferLiquid's src/dst, a reaction's self/neighbour), so they inherit
+// the colour lattice's disjointness: no other thread of this pass touches
+// either cell's mass. (Two cells share a pool word, hence solStoreAt's atomics.)
+
+// Mass that must go because the thing carrying it is gone, counted so the
+// ledger still balances (sim_solute.wgsl SOLM_DISCARDED).
+fn solDiscard(units : u32) {
+  if (units != 0u) { atomicAdd(&solMeta[SOLM_DISCARDED], units); }
+}
+
+// tryMove's half. The two cells trade places and each one's mass goes WITH its
+// matter: a sinking grain of sand lifts the brine it displaces, brine it falls
+// through keeps its salt, a bubble rising through a pond leaves the pond's
+// salt behind. A cell that is not a liquid carries nothing -- a value found on
+// one is mass a destroyed solvent left behind, and is discarded here.
+fn solSwap(src : vec3<i32>, dst : vec3<i32>, srcWord : u32, dstWord : u32) {
+  let sl = solIsLiquidMat(voxMat(srcWord));
+  let dl = solIsLiquidMat(voxMat(dstWord));
+  if (!sl && !dl) { return; }
+  let rs = solValueAt(src);
+  let rd = solValueAt(dst);
+  if (rs == 0u && rd == 0u) { return; }
+  let vs = select(0u, rs, sl);
+  let vd = select(0u, rd, dl);
+  solDiscard(solMassOf(rs ^ vs) + solMassOf(rd ^ vd));
+  // After the swap `dst` holds the source's matter and `src` the target's.
+  _ = solStoreAt(dst, vs);
+  _ = solStoreAt(src, vd);
+}
+
+// transferLiquid's half: t of the source's sf eighths move onto the target, and
+// the same FRACTION of its mass goes with them -- concentration is unchanged
+// on both sides, which is what a liquid moving as a body does. The last eighth
+// takes all of it. Integer floor, so a source keeps the remainder; nothing is
+// created and nothing is lost. A target of a DIFFERENT species keeps its own
+// (immiscible, PLAN_solutes §2.3) and the arriving mass is discarded, counted.
+fn solTransfer(src : vec3<i32>, dst : vec3<i32>, sf : u32, df : u32, t : u32) {
+  let rs = solValueAt(src);
+  let rd = solValueAt(dst);
+  if (rs == 0u && rd == 0u) { return; }
+  // df == 0: the target is AIR, and a value on it is stale.
+  var vd = rd;
+  if (df == 0u) {
+    solDiscard(solMassOf(rd));
+    vd = 0u;
+  }
+  let ms = solMassOf(rs);
+  let ss = solSpeciesOf(rs);
+  var moved = ms;
+  if (t < sf) { moved = (ms * t) / sf; }
+  var nd = vd;
+  if (moved != 0u) {
+    let sd = solSpeciesOf(vd);
+    if (sd != 0u && sd != ss) {
+      solDiscard(moved);
+    } else {
+      let tot = solMassOf(vd) + moved;
+      nd = solPack(ss, min(tot, 255u));
+      if (tot > 255u) { solDiscard(tot - 255u); }
+    }
+  }
+  _ = solStoreAt(dst, nd);
+  _ = solStoreAt(src, solPack(ss, ms - moved));
+}
+
+// A value on a cell that is about to become something new from nothing (an
+// emission into air). Only a stale value can be there; drop it so the new
+// matter does not inherit a destroyed solvent's mass.
+fn solClearStale(c : vec3<i32>) {
+  let v = solValueAt(c);
+  if (v == 0u) { return; }
+  solDiscard(solMassOf(v));
+  _ = solStoreAt(c, 0u);
+}
+
+// ---- THE PHASE CHANGE: a solvent the CA turns into something else ------------
+// Cell `c` carried value `v` (non-zero) and is being rewritten to `prod`. What
+// happens to the mass is the physics of evaporation and boiling:
+//   * `prod` is itself a solvent of the species (water -> enchanted water):
+//     the mass stays where it is, untouched;
+//   * otherwise, if `push`, it moves into face neighbours that are solvents of
+//     the species with room under saturation -- a pond that evaporates from the
+//     top CONCENTRATES rather than losing its salt;
+//   * what cannot move PRECIPITATES: the cell becomes the species'
+//     `precipitatesTo` powder with one eighth per yieldPerVoxel/8 units (so the
+//     salt that went in comes out as the same amount of salt). A remainder
+//     under one eighth, or a species with no precipitate, is discarded and
+//     counted.
+// Returns (material, eighths): 0 eighths means "write `prod` as the caller
+// would have"; otherwise write the precipitate with that many eighths.
+// `push` only for the ACTING cell: its neighbours are within the lattice's
+// write reach; a rule's NEIGHBOUR is not, so its mass cannot move again.
+fn solOnReplace(c : vec3<i32>, v : u32, prod : u32, push : bool, rot : u32) -> vec2<u32> {
+  let s = solSpeciesOf(v);
+  var m = solMassOf(v);
+  if (solIsLiquidMat(prod) && solIsSolvent(prod, s)) { return vec2<u32>(prod, 0u); }
+  if (push) {
+    for (var i = 0u; i < 6u && m > 0u; i = i + 1u) {
+      let n = c + faceDir((i + rot) % 6u);
+      if (!inBounds(n)) { continue; }
+      let nw = voxWordAt(n);
+      let nmat = voxMat(nw);
+      if (!solIsLiquidMat(nmat) || !solIsSolvent(nmat, s) || !solWritable(n)) { continue; }
+      let nv = solValueAt(n);
+      if (solSpeciesOf(nv) != 0u && solSpeciesOf(nv) != s) { continue; }
+      let cap = solCap(s, voxState(nw) + 1u);
+      let have = solMassOf(nv);
+      if (have >= cap) { continue; }
+      let k = min(m, cap - have);
+      _ = solStoreAt(n, solPack(s, have + k));
+      m -= k;
+      markDirty(n);
+    }
+  }
+  _ = solStoreAt(c, 0u);
+  var out = vec2<u32>(prod, 0u);
+  if (m != 0u) {
+    let y8 = solYield8(s);
+    let p = solPrecipitate(s);
+    var e = min(m / y8, POWDER_FULL);
+    // A precipitate that cannot hold eighths is whole cells or nothing.
+    if (p != MAT_AIR && !matHasPowderMass(materials[p]) && e < POWDER_FULL) { e = 0u; }
+    if (e != 0u && p != MAT_AIR) {
+      out = vec2<u32>(p, e);
+      atomicAdd(&solMeta[SOLM_PRECIP], e * y8);
+      m -= e * y8;
+    }
+    // What is left is less than an eighth of a grain (or has no precipitate):
+    // it cannot leave as powder, so it stays in the liquid -- the brine beside
+    // this cell takes it past saturation (a supersaturated film, which is what
+    // a drying pan really holds). Only mass with no liquid of its kind to go
+    // to is discarded, counted.
+    if (push) {
+      for (var i = 0u; i < 6u && m > 0u; i = i + 1u) {
+        let n = c + faceDir((i + rot) % 6u);
+        if (!inBounds(n)) { continue; }
+        let nw = voxWordAt(n);
+        let nmat = voxMat(nw);
+        if (!solIsLiquidMat(nmat) || !solIsSolvent(nmat, s) || !solWritable(n)) { continue; }
+        let nv = solValueAt(n);
+        if (solSpeciesOf(nv) != 0u && solSpeciesOf(nv) != s) { continue; }
+        let have = solMassOf(nv);
+        let k = min(m, 255u - have);
+        if (k == 0u) { continue; }
+        _ = solStoreAt(n, solPack(s, have + k));
+        m -= k;
+        markDirty(n);
+      }
+    }
+    solDiscard(m);
+  }
+  return out;
+}
+
+// The state nibble for a precipitate of `e` eighths at cell c.
+fn solPrecipState(p : u32, e : u32, c : vec3<i32>) -> u32 {
+  if (matHasPowderMass(materials[p])) { return powderStateFor(e, c, ptSeed()); }
+  return 0u;
+}
+
+// ---- DISSOLVING: a powder named as a solute's `from` meets a solvent ----------
+// The ACTING cell is the powder (salt, fairy dust). Faces are tried from a
+// rotated start; the first that is a solvent of its species, holding no other
+// species and with room for at least one eighth under saturation, takes up to
+// the whole cell at dissolveChance per mille per tick. The powder loses those
+// eighths (an eighth is yieldPerVoxel/8 units: the contract's unit bridge) and
+// the solvent gains them, so the ledger moves the same integer both ways.
+//
+// A solvent in a chunk with no page cannot take mass THIS tick: the powder
+// asks for one (SOLM_REQ_FLAG, read by next tick's solWant) and keeps its own
+// chunk awake. Whether a chunk has a page is itself deterministic, so the
+// one-tick deferral is too.
+//
+// Returns true when the cell dissolved (fully or in part): it has acted.
+fn solTryDissolve(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material,
+                  s : u32, slotIdx : u32, probe : bool) -> bool {
+  let rr = hash3(T.seed ^ 0x501D155Du, T.tick, slotIdx);
+  let rot = (rr >> 12u) % 6u;
+  let pm = select(POWDER_FULL, powderMass(w), matHasPowderMass(m));
+  let y8 = solYield8(s);
+  for (var i = 0u; i < 6u; i = i + 1u) {
+    let n = c + faceDir((i + rot) % 6u);
+    if (!inBounds(n)) { continue; }
+    let nw = voxWordAt(n);
+    let nmat = voxMat(nw);
+    if (!solIsLiquidMat(nmat) || !solIsSolvent(nmat, s)) { continue; }
+    let nv = solValueAt(n);
+    if (solSpeciesOf(nv) != 0u && solSpeciesOf(nv) != s) { continue; }
+    let cap = solCap(s, voxState(nw) + 1u);
+    let have = solMassOf(nv);
+    if (have + y8 > cap) { continue; }   // saturated for a whole eighth
+    let k = min(pm, (cap - have) / y8);
+    // A powder with no eighths dissolves whole or not at all.
+    if (!matHasPowderMass(m) && k < POWDER_FULL) { continue; }
+    // Stamped this substep already: only say there is work here.
+    if (probe) {
+      markDirtyR(c, DIRTY_R_REACT);
+      return false;
+    }
+    // No page there yet: ask for one BEFORE rolling. Rolling first made the
+    // dissolve need two successes in a row (one to ask, one on the tick the
+    // page exists -- an all-zero page is handed back at the end of the tick
+    // it was made), and a lone grain in a clean pond measured 0 dissolved in
+    // 1,500 ticks.
+    if (!solWritable(n)) {
+      atomicStore(&solMeta[SOLM_REQ_FLAG + voxSlotOfCell(c)], 1u);
+      markDirtyR(c, DIRTY_R_SOLUTE);
+      return false;
+    }
+    // A solvent contact exists: this cell has work until it fires.
+    if ((rr % REACT_CHANCE_DEN) >= solDissolveChance(s)) {
+      markDirtyR(c, DIRTY_R_REACT);
+      return false;
+    }
+    let stamp = stampFor(T.tick, P.substep);
+    _ = solStoreAt(n, solPack(s, have + k * y8));
+    atomicAdd(&solMeta[SOLM_DISSOLVED], k * y8);
+    if (k >= pm) {
+      voxStore(idx, 0u);
+      flagSupportLoss(c, m.klass, MAT_AIR);
+    } else {
+      voxStore(idx, packVoxKeepStain(mat, powderStateFor(pm - k, c, ptSeed()), stamp, w));
+    }
+    markVoxActive(idx);
+    markDirty(c);
+    markDirty(n);
+    return true;
+  }
+  return false;
+}
+
+// ---- DENSITY: brine sinks (PLAN_solutes §4.2) -------------------------------
+// The solute's share of a FULL cell's density: densityPerUnit * c >> 8, with
+// c = mass for a full cell. 0 for no solute or a species that weighs nothing.
+fn solDensityOf(v : u32) -> i32 {
+  if (v == 0u) { return 0; }
+  return (solDensityPerUnit(solSpeciesOf(v)) * i32(solMassOf(v))) >> 8u;
+}
+// Mark every chunk the cell c borders with DIRTY_R_SOLUTE. markDirtyR treats
+// that bit as own-chunk-only (the CA's waiting dissolve), but a solute SWAP
+// across a chunk face changes both chunks' state and both must look again.
+fn solMarkFan(c : vec3<i32>) {
+  for (var k = 0u; k < 8u; k++) {
+    let ns = dirtyFanSlot(c, T.origin, k);
+    if (ns != SLOT_NONE) { atomicOr(&dirtyOut[ns], DIRTY_R_SOLUTE); }
+  }
+}
+// The acting FULL cell c (word w, liquid mat) trades its solute with the FULL
+// cell of the same liquid directly below when its solute makes it strictly
+// denser. `apply` false is canFlowAnywhere's read-only mirror (they must
+// agree, or a stratifying pond pins awake or sleeps with work left).
+// Different species never trade (immiscible). Both cells are within the
+// lattice's write reach of c, and the voxels do not change.
+fn solTrySink(c : vec3<i32>, w : u32, mat : u32, apply : bool) -> bool {
+  if (voxState(w) + 1u != 8u) { return false; }
+  let b = c + vec3<i32>(0, -1, 0);
+  if (!inBounds(b)) { return false; }
+  let bw = voxWordAt(b);
+  if (voxMat(bw) != mat || voxState(bw) + 1u != 8u) { return false; }
+  let v = solValueAt(c);
+  if (v == 0u) { return false; }
+  let vb = solValueAt(b);
+  if (vb != 0u && solSpeciesOf(vb) != solSpeciesOf(v)) { return false; }
+  if (solDensityOf(v) <= solDensityOf(vb)) { return false; }
+  if (!apply) { return true; }
+  if (!solWritable(c) || !solWritable(b)) { return false; }
+  _ = solStoreAt(b, v);
+  _ = solStoreAt(c, vb);
+  solMarkFan(c);
+  solMarkFan(b);
+  return true;
+}
+
+// ---- CONVERTING: a solvent concentrated past a `converts` row --------------
+// solutes.json `converts: [{solvent, into, cMin}]`: once the ACTING liquid cell
+// is that solvent at concentration >= cMin (c = mass * 8 / fullness), it
+// BECOMES `into` at the same fullness and the mass is spent in it (counted as
+// SOLM_CONVERTED) -- fairy dust dissolved in water to 48 is enchanted water.
+// This is the concentration-driven replacement of a plain pair rule: a pinch of
+// dust in a lake disperses below cMin and converts nothing.
+fn solTryConvert(c : vec3<i32>, idx : u32, w : u32, mat : u32) -> bool {
+  let v = solValueAt(c);
+  if (v == 0u) { return false; }
+  let s = solSpeciesOf(v);
+  let f = voxState(w) + 1u;
+  let conc = (solMassOf(v) * 8u) / f;
+  for (var k = 0u; k < solConvertCount(s); k = k + 1u) {
+    let row = solConvertRow(s, k);
+    if ((row & 0xFFFu) != mat || conc < (row >> 24u)) { continue; }
+    let into = (row >> 12u) & 0xFFFu;
+    voxStore(idx, packVoxKeepStain(into, voxState(w), stampFor(T.tick, P.substep), w));
+    _ = solStoreAt(c, 0u);
+    atomicAdd(&solMeta[SOLM_CONVERTED], solMassOf(v));
+    markVoxActive(idx);
+    markDirty(c);
+    return true;
+  }
+  return false;
+}
+
 fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, rising : bool) -> bool {
   if (!inBounds(dst)) { return false; }
   // One table resolution for the target's index AND word.
@@ -477,6 +966,7 @@ fn tryMove(src : vec3<i32>, dst : vec3<i32>, myWord : u32, myDensity : i32, risi
   if (any(src != gSelfCell) || si == PT_NO_WORD) { si = voxWordIndex(src); }
   voxStore(si, packVoxKeepStain(voxMat(tw), voxState(tw), stamp, tw));
   markVoxActive(si);
+  solSwap(src, dst, myWord, tw);
   markDirtyR(src, DIRTY_R_MOVE);
   markDirtyR(dst, DIRTY_R_MOVE);
   // a powder sliding out from under a solid may leave it floating
@@ -1123,6 +1613,7 @@ fn transferLiquid(src : vec3<i32>, dst : vec3<i32>, mat : u32,
   markVoxActive(si);
   voxStore(di, packVoxKeepStain(mat, df + t - 1u, stamp, dw));
   markVoxActive(di);
+  solTransfer(src, dst, sf, df, t);
   markDirtyR(src, DIRTY_R_MOVE);
   markDirtyR(dst, DIRTY_R_MOVE);
 }
@@ -1364,10 +1855,24 @@ fn reactWriteSelf(c : vec3<i32>, idx : u32, synthSelf : bool, klass : u32,
   // the store below; nothing on the reaction paths writes self before this.
   var e = 0u;
   var selfPowder = false;
+  // The solute this cell carries, if it is a liquid (solOnReplace below).
+  var sv = 0u;
   if (!synthSelf) {
     let sw = voxWordAt(c);
     e = cellEighths(sw);
     selfPowder = matHasPowderMass(materials[voxMat(sw)]);
+    sv = solCarried(c, sw);
+  }
+  // A solvent turning into something else: its mass moves on or precipitates
+  // (evaporating brine concentrates, then leaves salt).
+  if (sv != 0u) {
+    let rep = solOnReplace(c, sv, prod, true, (rnd >> 7u) % 6u);
+    if (rep.y != 0u) {
+      voxStore(idx, packVox(rep.x, solPrecipState(rep.x, rep.y, c), stamp));
+      markVoxActive(idx);
+      flagSupportLoss(c, klass, rep.x);
+      return;
+    }
   }
   // A partial grain that becomes a GAS (dust flashing to fire) makes one whole
   // gas cell with probability e/8 and otherwise just goes: a dusting burns
@@ -1723,6 +2228,9 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     let rule = reactions[cmat.reactOffset + ri];
     if ((rule.packed & 3u) != RK_PAIR) { continue; }
     if (!lightMatches(rule, c)) { continue; }
+    // A coat carries no solute: a concentration-conditioned rule never fires
+    // through one (word 0 reads as "not a liquid").
+    if (cmat.klass == CLASS_LIQUID && !solRuleAllows(cmat.reactOffset + ri, c, 0u)) { continue; }
     let rr = hash3(rnd ^ COAT_ROLL_SALT, ri, slotIdx);  // SLOT index
     let rot = rr >> 12u;
     let dmask = (rule.packed >> 2u) & 7u;
@@ -1920,6 +2428,12 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     // night instead of spinning on a rule that cannot fire (rule 2). The
     // chunk is re-woken when the phase crosses back, see wakeOnPhaseChange.
     if (!lightMatches(rule, c)) { continue; }
+    // A concentration condition (reactions.json "solute"/"cMin"; the solute
+    // layer's rule side array): brine electrolysis needs the salt, not just
+    // the water. One side-array word per rule tried; 0 for nearly all. Only a
+    // LIQUID self can carry the condition (materials.cpp refuses it on any
+    // other), so fire, smoke and stone never pay the side-array read.
+    if (m.klass == CLASS_LIQUID && !solRuleAllows(m.reactOffset + ri, c, w)) { continue; }
 
     // Drawn AFTER the gate: hash3 is stateless and keyed on (rnd, ri, slot),
     // so a skipped rule consumes nothing and every later draw is unchanged.
@@ -1974,6 +2488,9 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
           reactFxNote(rule, c);
           let ni = voxWordIndex(n);  // resolved only for the cell that is written
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
+          // Only a LIQUID product can carry a value, so only one can inherit a
+          // stale one (solCarried): smoke and fire emits skip the table read.
+          if (solIsLiquidMat(rule.prodNbr)) { solClearStale(n); }
           markVoxActive(ni);
           markDirtyR(n, DIRTY_R_REACTW);
           markDirtyR(c, DIRTY_R_REACTW);
@@ -2031,7 +2548,17 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
             // For a synthesized neighbour ni is the air cell: a product
             // writes into it (condensed stone, grown plant); prodNbr == 0
             // rewrites air over air, harmless.
-            if (rule.prodNbr == 0u) { voxStore(ni, 0u); }
+            //
+            // A solvent neighbour being replaced: its mass precipitates in
+            // place (it cannot move on -- a neighbour's neighbour is past the
+            // lattice's write reach). Boiling brine leaves its salt.
+            var nsv = 0u;
+            if (!synthFluid) { nsv = solCarried(n, niw.y); }
+            var rep = vec2<u32>(rule.prodNbr, 0u);
+            if (nsv != 0u) { rep = solOnReplace(n, nsv, rule.prodNbr, false, 0u); }
+            if (rep.y != 0u) {
+              voxStore(ni, packVox(rep.x, solPrecipState(rep.x, rep.y, n), stamp));
+            } else if (rule.prodNbr == 0u) { voxStore(ni, 0u); }
             else {
               // A partial neighbour keeps its eighths (carriedState).
               let ne = select(cellEighths(niw.y), 0u, synthFluid);
@@ -2651,6 +3178,8 @@ fn canFlowAnywhere(c : vec3<i32>, w : u32, mat : u32, m : Material) -> bool {
 
   // 1) down: a partial same-liquid cell to top up, or anything displaceable.
   if (canDescend(c, c + vec3<i32>(0, -1, 0), mat, m.density)) { return true; }
+  // 1b) brine above lighter liquid of its own kind (solTrySink, read only).
+  if (solTrySink(c, w, mat, false)) { return true; }
 
   // 2a) the four axis down-diagonals.
   for (var i = 0u; i < 4u; i++) {
@@ -2758,6 +3287,14 @@ fn stepLiquid(c : vec3<i32>, idx : u32, w : u32, mat : u32, m : Material, rnd : 
     markDirtyR(c, DIRTY_M_DOWN | sub);
     return true;
   }
+
+  // 1b) BRINE SINKS (docs/PLAN_solutes.md §4.2): a full cell whose dissolved
+  //     mass makes it denser than the full cell of the same liquid below it
+  //     trades its SOLUTE with that cell. The voxels are the same liquid at the
+  //     same fullness, so only the mass moves -- a halocline out of one
+  //     comparison. Strictly decreases SUM(solute density * y) (a bounded
+  //     integer), so it terminates on its own; not a film licence.
+  if (solTrySink(c, w, mat, true)) { return true; }
 
   // 2a) the four AXIS down-diagonals, RNG order.
   let r = rnd >> 10u;
@@ -3398,6 +3935,30 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   if (skip && P.substep != 0u) { return; }
 
   let m = materials[mat];
+  // ---- THE SOLUTE LAYER'S TWO SELF-RULES (substep 0, before the authored
+  // rules): a solute powder touching a solvent dissolves into it, and a solvent
+  // concentrated past a `converts` row becomes that material. Ahead of the
+  // reaction scan so the concentration-driven path owns these pairs; a cell
+  // that dissolved or converted has acted this tick. Ahead of the stain-dry
+  // step too: a grain resting in water is WET (stained), and stainDry returns
+  // early for a wet cell beside water -- measured, a grain at rest on a pond
+  // floor never dissolved at all.
+  //
+  // A STAMPED cell (skip) still PROBES: a resting grain's stamp matches the
+  // tick's substep-0 stamp one tick in seven, and a tick on which nothing in
+  // the chunk marks dirty is a tick the CPU can prove the world settled and
+  // stop running the CA -- measured, a grain on a pond floor went to sleep
+  // after 22 ticks and never dissolved. doReactions probes for the same reason.
+  // Only a POWDER dissolves (solutes.cpp refuses any other `from`) and only a
+  // LIQUID converts: gases and solids -- most of a burning forest's awake
+  // cells -- skip the species-table read entirely (measured: +9% CA in the
+  // --perf forestfire scene before this gate).
+  if (P.substep == 0u && (m.klass == CLASS_POWDER || m.klass == CLASS_LIQUID)) {
+    let sp = solFromSpecies(mat);
+    if (sp != 0u && TUNE_SOLUTE_MODE != 0u &&
+        solTryDissolve(c, idx, w, mat, m, sp, slotIdx, skip)) { return; }
+    if (!skip && m.klass == CLASS_LIQUID && solTryConvert(c, idx, w, mat)) { return; }
+  }
 
   // ---- A SOLID WITH NOTHING TOUCHING IT IS A ONE-VOXEL ISLAND -------------
   //

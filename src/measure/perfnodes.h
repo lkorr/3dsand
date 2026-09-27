@@ -132,6 +132,15 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "rather than to a node of "
      "its own because it exists only to serve the CA row behind it, and a "
      "reader comparing them separately would have to add them up anyway."},
+    {"soluteSys", "Solute Layer", "simTick", PerfSide::Gpu, PerfScope::Count,
+     "solWant;solArgs;solAlloc;solScoop;solDiffuse;solCompact;solHash;lr_solHash;ho_solHash;"
+     "solEvict;solRestore",
+     "Dissolved mass (docs/PLAN_solutes.md): page allocation before the CA, "
+     "pair-exchange diffusion and compaction after it, over the same dirty "
+     "list. A chunk with no solute nearby costs one 27-entry table probe in "
+     "solWant and nothing else; the rest scales with chunks that carry "
+     "solute. solHash is a hash-tick sweep that returns at once for an EMPTY "
+     "slot."},
     {"particleSys", "Particles", "simTick", PerfSide::Gpu, PerfScope::Count,
      "particleSpawn;particleArgs1;particleIntegrate;particleArgs2;particleResolve",
      "Scales with the live particle count, not the world. Integrate is the "

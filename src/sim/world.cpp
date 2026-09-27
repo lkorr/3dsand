@@ -47,6 +47,18 @@ constexpr uint64_t kGasCountOff = kPCountOff + 16;   // 16 B
 constexpr uint64_t kGasStatOff = kPCountOff + 64;    // kGasSpHdrBytes
 static_assert(kGasStatOff + kGasSpHdrBytes <= kPCountOff + 256,
               "gas readback overruns the particle-count block's slack");
+// The solute layer's header (world.h kSolM*: the two fault latches and the
+// mass ledger) rides the same slack, after the gas header: its first 16
+// words, 64 B. (It rode the page-fault block until that record grew to 64
+// words for the reaction effects.)
+constexpr uint64_t kSolMetaSnapOff = kPCountOff + 128;
+// Words 0..31: the ledger, the latches and the per-species scoop ledger.
+constexpr uint64_t kSolMetaSnapBytes = 128;
+static_assert(kSolMScoopBySpecies + kSolScoopSpecies <= kSolMetaSnapBytes / 4,
+              "the scoop ledger must ride the snapshot");
+static_assert(kGasStatOff + kGasSpHdrBytes <= kSolMetaSnapOff &&
+                  kSolMetaSnapOff + kSolMetaSnapBytes <= kPCountOff + 256,
+              "solute header overruns the particle-count block's slack");
 constexpr uint64_t kSupportOff = kPCountOff + 256;
 constexpr uint64_t kSupportBytes = kNumSlots * 4;
 constexpr uint64_t kPageFaultOff = kSupportOff + kSupportBytes;
@@ -100,6 +112,17 @@ void World::Init(const rhi::Device& device) {
                            U::Storage | U::CopySrc | U::CopyDst, "pageTable");
   pageFaults = CreateBuffer(device, kPageFaultBytes,
                             U::Storage | U::CopySrc | U::CopyDst, "pageFaults");
+  // The solute layer (world.h's kSol* block). Created zeroed = every slot
+  // SOL_EMPTY; ResetSolutes installs the free stack before the first tick.
+  solTable = CreateBuffer(device, (uint64_t)kNumSlots * 4,
+                          U::Storage | U::CopySrc | U::CopyDst, "solTable");
+  solPool = CreateBuffer(device, (uint64_t)kSolutePoolPages * kSolWordsPerPage * 4,
+                         U::Storage | U::CopySrc | U::CopyDst, "solPool");
+  solMeta = CreateBuffer(device, (uint64_t)kSolMetaWords * 4,
+                         U::Storage | U::CopySrc | U::CopyDst, "solMeta");
+  solArgs = CreateBuffer(device, 12, U::Indirect | U::CopyDst, "solArgs");
+  solStage = CreateBuffer(device, (uint64_t)kSolStageWords * 4,
+                          U::Storage | U::CopySrc | U::CopyDst, "solStage");
 
   // The allocator + conservative dirty mirror + materialization rule. It
   // installs the initial table: the IDENTITY MAP in both modes, because
@@ -646,6 +669,10 @@ bool World::EncodeReadbacks(const rhi::Device&, const rhi::CommandEncoder& enc,
   // only under test.
   enc.CopyTracked(pass::Buf::PageFaults, pageFaults, 0, s.buf, kPageFaultOff,
                   kPageFaultBytes);
+  // The solute layer's header (world.h kSolM*): the two fault latches and
+  // the mass ledger, 64 B in the page-fault block's slack.
+  enc.CopyTracked(pass::Buf::SolMeta, solMeta, 0, s.buf, kSolMetaSnapOff,
+                  kSolMetaSnapBytes);
   // MLS-MPM fluid seam: the live count + event counters and the active block
   // list. 1.3 KB per snapshot; the block list is what keeps every chunk the
   // seam may write materialized (PageTable::UpdateFluidChunks).
@@ -854,6 +881,22 @@ void World::KickReadback() {
         std::memcpy(&out.scoopApplied, p + kPageFaultOff + kPageFaultScoopApplied * 4, 4);
         std::memcpy(&out.scoopRefused, p + kPageFaultOff + kPageFaultScoopRefused * 4, 4);
         {
+          uint32_t sm[kSolMetaHdrWords] = {};
+          std::memcpy(sm, p + kSolMetaSnapOff, kSolMetaSnapBytes);
+          out.solFree = sm[kSolMFree];
+          out.solFaults = sm[kSolMFaults];
+          out.solExhausted = sm[kSolMExhausted];
+          out.solHighWater = sm[kSolMHighWater];
+          out.solDissolved = sm[kSolMDissolved];
+          out.solPrecip = sm[kSolMPrecip];
+          out.solDiscarded = sm[kSolMDiscarded];
+          out.solConverted = sm[kSolMConverted];
+          out.solPoured = sm[kSolMPoured];
+          out.solScooped = sm[kSolMScooped];
+          out.solFaultSlot = sm[kSolMFaultSlot];
+          out.solFaultTick = sm[kSolMFaultTick];
+          for (uint32_t k = 0; k < kSolScoopSpecies; k++)
+            out.solScoopedBy[k] = sm[kSolMScoopBySpecies + k];
           // THE REACTION-EFFECT RECORD (world.h kPageFaultReactFx*): this
           // tick's firings of rules with effects, one winner per slot. The
           // record's tick word guards against a copy that raced nothing but
@@ -973,6 +1016,21 @@ void World::KickReadback() {
           }
         }
       });
+}
+
+// ---- THE SOLUTE LAYER'S RESET (world.h kSol* block) ------------------------
+// Every slot SOL_EMPTY, every page on the free stack (stack[i] = i, depth =
+// kSolutePoolPages), every flag, stall counter, aggregate and ledger counter 0.
+// The pool itself is not cleared: solAlloc fills a page from the sentinel it
+// replaces before anything reads it. Deferred writes, like every other reset
+// here: they land at the head of the next submit, before any tick reads them.
+void World::ResetSolutes(const rhi::Queue& queue) {
+  static const std::vector<uint32_t> kZeroSlots(kNumSlots, 0u);
+  queue.WriteBuffer(solTable, 0, kZeroSlots.data(), kZeroSlots.size() * 4);
+  std::vector<uint32_t> meta(kSolMetaWords, 0u);
+  meta[kSolMFree] = kSolutePoolPages;
+  for (uint32_t i = 0; i < kSolutePoolPages; i++) meta[kSolMStackBase + i] = i;
+  queue.WriteBuffer(solMeta, 0, meta.data(), meta.size() * 4);
 }
 
 // ---- THE FIXED-LATENCY PIPELINE (docs/PLAN_multiplayer_now.md N1) ---------

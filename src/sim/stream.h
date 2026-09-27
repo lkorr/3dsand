@@ -301,6 +301,35 @@ class Stream {
   // reset residency bookkeeping. Used by LoadWorld and world regen.
   void ReloadWindow(IVec3 origin);
 
+  // ---- THE SOLUTE LAYER'S HALF OF STREAMING (docs/PLAN_solutes.md §7.1) ----
+  //
+  // Dissolved mass is AUTHORITATIVE world state keyed by world chunk, and a
+  // chunk leaving the window must take its salt with it. The GPU owns the
+  // live layer (world.h kSol*); this map owns every chunk's solute that is
+  // NOT resident -- filled by a shift's eviction (solEvict, read back
+  // asynchronously like the voxel eviction), emptied by the refill that
+  // brings the chunk back (solRestore), and written to / read from the save
+  // dir's `solutes.svs` (worldio.cpp). One entry per chunk:
+  //   entry  the table entry it had (a UNIFORM sentinel, or the page flag)
+  //   stall  its diffusion stall counter (the dilution floor's clock)
+  //   words  a page's kSolWordsPerPage words, empty for a sentinel.
+  struct SoluteChunk {
+    uint32_t entry = 0;
+    uint32_t stall = 0;
+    std::vector<uint32_t> words;
+  };
+  using SoluteMap = std::unordered_map<uint64_t, SoluteChunk>;  // PackChunkKey(wc)
+  SoluteMap& Solutes() { return solutes_; }
+  // Pull every RESIDENT slot's solute into Solutes() (blocking readback: the
+  // save path only), after completing any eviction still in flight. The GPU
+  // layer is left as it was.
+  void CaptureResidentSolutes();
+  // ...or into another map, leaving solutes_ alone (the save's snapshot).
+  void CaptureResidentSolutes(SoluteMap& into);
+  // Evictions whose staging was full: records (chunks) whose mass was LOST to
+  // the store rather than kept, since the last OnRegen. Printed when non-zero.
+  uint64_t SoluteRecordsLost() const { return solLost_; }
+
   // World regen: the old world's chunks are gone (in-flight evictions too).
   // Clear() detaches from any bound save dir but leaves its files — the last
   // explicit save must survive a regen; the next save overwrites it.
@@ -317,10 +346,16 @@ class Stream {
     // world they belonged to is gone.
     awaitingRemote_.assign(kNumSlots, 0);
     genAfterMiss_.clear();
+    // The kept solute belongs to the replaced world too (and the GPU layer
+    // is reset by the worldgen that follows).
+    DiscardSoluteState();
     // The caller regenerates the whole window next, and the store is empty:
     // every slot is procgen again, so the delta's coverage proof restarts.
     ResetSaveTracking();
   }
+  // Forget every kept and in-flight solute record (a regen, or a load that
+  // is about to install the saved ones).
+  void DiscardSoluteState();
 
   ChunkStore& Store() { return store_; }
   // The far-field edit index. LoadWorld rebuilds it from the store it just
@@ -679,6 +714,27 @@ class Stream {
   std::deque<PendingDemote> demotes_;
   std::vector<uint32_t> demoteScratch_;  // mapped-memory bounce, reused
   std::vector<uint32_t> evictScratch_;   // same, for the eviction harvest
+
+  // ---- solute streaming (see Solutes() above) ----
+  struct PendingSolEvict {
+    rhi::Buffer staging;
+    rhi::MapTicket map;
+    std::vector<uint32_t> slots;   // the evicted slots
+    std::vector<uint64_t> keys;    // PackChunkKey of the chunk each one held
+  };
+  // Clear `slots`' solute on the GPU and read what they held back into
+  // solutes_ (asynchronously). Called by ShiftAxis BEFORE the origin moves,
+  // while SlotToWorldChunk still names the leaving chunks.
+  void EvictSolutes(const std::vector<uint32_t>& slots);
+  // Install whatever solutes_ holds for the chunks now in `slots` (the end of
+  // FillSlots). Forces a pending eviction of the same chunk to complete first.
+  void RestoreSolutes(const std::vector<uint32_t>& slots);
+  void HarvestSoluteEvicts(bool wait);
+  SoluteMap solutes_;
+  std::deque<PendingSolEvict> solPending_;
+  std::unordered_map<uint64_t, uint32_t> solPendingKeys_;  // key -> in-flight count
+  std::vector<rhi::Buffer> solStagingPool_;
+  uint64_t solLost_ = 0;
   // The last tick Update() saw: FillSlots stamps demote copies with it.
   // ReloadWindow runs before any Update, so its copies carry a stale tick and
   // take the harvest's re-copy path — lazily correct, never wrong.

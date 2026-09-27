@@ -58,6 +58,9 @@ bool LoadSolutes(const std::string& path, const std::vector<MaterialDef>& mats,
       return (uint16_t)(id > 0 ? id : 0);
     };
     d.from = mat("from", true);
+    // Only a powder dissolves: sim_step gates the dissolve read on the class.
+    if (d.from && mats[d.from].gpu.klass != CLASS_POWDER)
+      errors += where + "\"from\" must be a powder\n";
     d.precipitatesTo = mat("precipitatesTo", false);
     d.yieldPerVoxel = r.value("yieldPerVoxel", 256u);
     d.saturation = std::min(255u, r.value("saturation", 255u));
@@ -116,5 +119,25 @@ bool LoadSolutes(const std::string& path, const std::vector<MaterialDef>& mats,
 const SoluteDef* SoluteFromPowder(const std::vector<SoluteDef>& table, uint16_t mat) {
   for (const SoluteDef& d : table)
     if (d.from == mat) return &d;
+  return nullptr;
+}
+
+namespace {
+std::vector<SoluteDef>& CurrentSolutesStore() {
+  static std::vector<SoluteDef> s;
+  return s;
+}
+}  // namespace
+
+const std::vector<SoluteDef>& CurrentSolutes() { return CurrentSolutesStore(); }
+void SetCurrentSolutes(const std::vector<SoluteDef>& table) { CurrentSolutesStore() = table; }
+const SoluteDef* CurrentSoluteNamed(const char* name) {
+  for (const SoluteDef& d : CurrentSolutesStore())
+    if (d.name == name) return &d;
+  return nullptr;
+}
+const SoluteDef* CurrentSoluteById(uint32_t species) {
+  for (const SoluteDef& d : CurrentSolutesStore())
+    if (d.species == species) return &d;
   return nullptr;
 }

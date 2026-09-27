@@ -237,6 +237,14 @@ enum class Buf : uint8_t {
   // the SAME command buffer, which is the hazard the table has to know about.
   GenCols,
   ColCache,
+  // The solute layer (world.h kSol* block, sim_solute.wgsl). SolArgs is
+  // indirect-only and never bound, like DispatchArgs.
+  SolTable,
+  SolPool,
+  SolMeta,
+  SolSpec,
+  SolArgs,
+  SolStage,   // eviction / restore staging (world.h kSolStage*), binding 44
   kCount,
 };
 
@@ -343,6 +351,9 @@ enum class Pipe : uint8_t {
   // `(int)Pipe::ShadowResolve + 1` and a Pipe added past it is silently never
   // copied into the recorder's table.
   GlowSrc, GlowField, GlowRefresh,
+  // The solute layer (sim_solute.wgsl). BEFORE ShadowResolve: RecordTable
+  // hands the recorder pipelines up to that enumerator only.
+  SolWant, SolArgsP, SolAlloc, SolDiffuse, SolCompact, SolScoop, SolHash, SolEvict, SolRestore,
   // The clouds (cloud.wgsl): the one-shot noise bake, then the per-frame
   // weather map, shadow map, env map, march and temporal resolve. BEFORE
   // ShadowPrepare for the pipeline-copy bound's reason stated above.
@@ -525,7 +536,7 @@ enum class Table : uint8_t { Tick, Worldgen, GenList, LoadReset, HashOnly, FarFi
                              // Per-FRAME, not per-tick: recorded by
                              // EncodeShadowResolve immediately before the
                              // render pass that consumes it.
-                             ShadowCache };
+                             ShadowCache, SolEvict, SolRestore };
 
 // Dispatch extents. Values >= kDynBase are selectors resolved at record time
 // from the tick's counts; anything below is a literal extent. Indirect rows put
@@ -590,6 +601,7 @@ enum class DispatchSel : uint32_t {
   // ---- the clouds: one 8x8 workgroup per tile of the low-res target ----
   CloudGx,
   CloudGy,
+  IndSolArgs,        // indirect: world.solArgs @ 0 (one group per want-list entry)
 };
 
 // Max `uses` entries on any row. Asserted against the widest row at compile
@@ -604,7 +616,7 @@ enum class DispatchSel : uint32_t {
 // Raised 16 -> 20 by the gas package: `ca` gains A(GasSpawn), the window-edge
 // outbox, -> 17 uses. Four of headroom rather than one, for the reason the
 // page-table note above gives.
-inline constexpr int kMaxUses = 20;
+inline constexpr int kMaxUses = 24;
 
 struct Row {
   const char* name;

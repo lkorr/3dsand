@@ -38,6 +38,8 @@ namespace {
 #define PT_FLUIDSETTLE Table::FluidSettle
 #define PT_PAGEFILL   Table::PageFill
 #define PT_SHADOWCACHE Table::ShadowCache
+#define PT_SOLEVICT   Table::SolEvict
+#define PT_SOLRESTORE Table::SolRestore
 
 #define PIPE_NONE            Pipe::None
 #define PIPE_WORLDGEN        Pipe::Worldgen
@@ -121,6 +123,15 @@ namespace {
 #define PIPE_GAS_RESOLVE     Pipe::GasResolve
 #define PIPE_GAS_FARPLUME    Pipe::GasFarPlume
 #define PIPE_GAS_FARPLUMEW   Pipe::GasFarPlumeWide
+#define PIPE_SOL_WANT        Pipe::SolWant
+#define PIPE_SOL_ARGS        Pipe::SolArgsP
+#define PIPE_SOL_ALLOC       Pipe::SolAlloc
+#define PIPE_SOL_DIFFUSE     Pipe::SolDiffuse
+#define PIPE_SOL_COMPACT     Pipe::SolCompact
+#define PIPE_SOL_SCOOP       Pipe::SolScoop
+#define PIPE_SOL_HASH        Pipe::SolHash
+#define PIPE_SOL_EVICT       Pipe::SolEvict
+#define PIPE_SOL_RESTORE     Pipe::SolRestore
 
 #define K_COMPUTE  Kind::Compute
 #define K_INDIRECT Kind::ComputeIndirect
@@ -198,6 +209,7 @@ namespace {
 #define D_GASFARWIDE      (uint32_t)DispatchSel::GasFarWideSel
 #define D_CLOUDGX         (uint32_t)DispatchSel::CloudGx
 #define D_CLOUDGY         (uint32_t)DispatchSel::CloudGy
+#define IND_SOLARGS       (uint32_t)DispatchSel::IndSolArgs
 
 // ---- expansion 1: the rows -----------------------------------------------
 #define R(b)  Use{Buf::b, Acc::StorageRead},

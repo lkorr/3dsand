@@ -258,6 +258,55 @@ PASS(compact, "prep(mutate+explode+compact)", PT_TICK, PIPE_COMPACT,      K_COMP
 PASS(copy_argsStage_dispatchArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 0,0,12, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
      USES(TR(ArgsStage) TW(DispatchArgs)))
 
+// ---- phase 2a: THE SOLUTE LAYER'S PAGES (docs/PLAN_solutes.md, world.h kSol*)
+//
+// A kernel cannot allocate, and unlike the voxel page table the CPU cannot
+// foresee which chunks a tick will write solute into (a grain of salt meeting
+// water is a CA decision). So the allocation is ITSELF a GPU pass, at this
+// fixed point in every CA tick, over the same compacted dirty list the CA is
+// about to run:
+//
+//   solWant   one group per dirty chunk D: if D asked for solute last tick
+//             (a dissolve that found no page) or any chunk of N27(D) carries
+//             solute, every chunk of N27(D) goes on the want list (first
+//             marker appends -- atomicOr on the want flag, so each slot is
+//             listed once).
+//   solArgs   one thread: the want count becomes solAlloc's indirect args,
+//             and the append cursor is reset for next tick.
+//   solAlloc  one group per listed chunk: pop a page off the free stack if
+//             the slot has none, and fill it from the sentinel it replaces.
+//
+// Every write the CA or the diffusion can make this tick lands in N27 of a
+// dirty chunk whose neighbourhood carries solute, so every such chunk is a
+// page before the first colour iteration. WHETHER a slot is a page is a pure
+// function of the dirty set and the solute state -- deterministic -- and only
+// WHICH page index it got depends on atomic scheduling, which nothing keys on.
+// C_CAACTIVE with the CA: a settled world compacts nothing and every one of
+// these dispatches zero groups (rule 2).
+// read-only in practice: solTable is read_write for the module because solAlloc and
+// solCompact write it; solWant only asks which chunks carry solute.
+PASS(solWant, "solute(want+alloc)", PT_TICK, PIPE_SOL_WANT, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) R(DirtyList) I(DispatchArgs) R(SolTable) A(SolMeta)))
+PASS(solArgs, "solute(want+alloc)", PT_TICK, PIPE_SOL_ARGS, K_COMPUTE, 1,1,1,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(A(SolMeta)))
+PASS(copy_solArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 64,0,12, GRP_NONE, DYN_NONE, C_CAACTIVE, 1,
+     USES(TR(SolMeta) TW(SolArgs)))
+PASS(solAlloc, "solute(want+alloc)", PT_TICK, PIPE_SOL_ALLOC, K_INDIRECT, IND_SOLARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(I(SolArgs) RW(SolTable) A(SolPool) A(SolMeta)))
+// solScoop (sim_solute.wgsl): the dissolved mass of every cell a vessel's
+// conditional clear emptied this tick moves to the per-species scoop ledger.
+// After solAlloc so the cleared cell's chunk is a page (it was dirtied by the
+// clear and carries solute); before the CA so nothing has flowed into the hole
+// yet. C_CELLS with sim_mutate's `cells`: a tick without cell ops has no row.
+// read-only in practice: solTable is read_write for the module (solAlloc and
+// solCompact write it); solScoop only resolves pages through it.
+PASS(solScoop, "solute(want+alloc)", PT_TICK, PIPE_SOL_SCOOP, K_COMPUTE, D_CELLS,1,1,
+     GRP_SIM, DYN_ZERO, C_CELLS, 1,
+     USES(U(TickUBO) R(Materials) R(CellOps) R(Voxels) R(PageTable) R(SolTable) A(SolPool) A(SolMeta)))
+
 // ---- phase 2b: the ANGLE-OF-REPOSE OCCUPANCY SNAPSHOT --------------------
 //
 // The ONE licence in this engine for a CA read past distance 1, and it has to
@@ -333,7 +382,42 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHA
      USES(R(Materials) U(TickUBO) U(PassUBO) R(Reactions) R(DirtyIn) R(DirtyList) I(DispatchArgs)
           RW(Voxels) A(DirtyOut) A(Support) R(PageTable) A(PageFaults)
           R(FluidBlockMap) R(FluidGrid) A(FluidCellScratch) A(ActVoxViz)
-          A(GasSpawn) A(GasOuter) R(ReposeSnap)))
+          A(GasSpawn) A(GasOuter) R(ReposeSnap)
+          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec)))
+
+// ---- phase 3a: THE SOLUTE LAYER AFTER THE CA (docs/PLAN_solutes.md §3.3) ---
+//
+// solDiffuse  one group per dirty chunk: PAIR-EXCHANGE diffusion. The axis and
+//             parity cycle with the tick, the lower cell of each pair owns it
+//             and writes both halves, so pairs are disjoint and conservation
+//             is exact (the same integer leaves one cell and enters the
+//             other). The d == 0 fixpoint does not mark: that is what lets a
+//             mixed body sleep. A chunk idle for all six phases is STALLED.
+// solCompact  one group per want-list chunk (every chunk that could have been
+//             written this tick): clear mass stranded on a cell that is no
+//             longer a solvent, apply the DILUTION FLOOR to a stalled chunk
+//             (§3.3.1 -- mass below the floor is discarded, which is what lets a
+//             plume in a lake be GONE), republish the chunk's aggregate, and
+//             hand the page back if the chunk turned uniform or empty.
+//
+// Right after the CA and before every post-CA voxel writer (water bodies,
+// particles, the MPM seam), so a cell those writers turn into liquid never
+// finds mass a destroyed solvent left behind. Both read the voxels (the solvent
+// test) and neither writes one.
+// read-only in practice: solTable is read_write for the module because solAlloc and
+// solCompact write it; the diffusion only reads entries.
+// THREE iterations, one per AXIS: DYN_CA hands iteration k the passUBO slice
+// k, whose colorPhase.x is k. The axes cannot share a dispatch (an x pair and a
+// y pair share cells), and the recorder's per-iteration barrier is what makes
+// the three sequential -- the same mechanism the CA row's 54 rely on.
+PASS(solDiffuse, "solute(diffuse+compact)", PT_TICK, PIPE_SOL_DIFFUSE, K_INDIRECT, IND_DISPATCHARGS,0,0,
+     GRP_SIM, DYN_CA, C_CAACTIVE, 3,
+     USES(U(TickUBO) U(PassUBO) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs) R(Voxels)
+          R(PageTable) R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) A(DirtyOut)))
+PASS(solCompact, "solute(diffuse+compact)", PT_TICK, PIPE_SOL_COMPACT, K_INDIRECT, IND_SOLARGS,0,0,
+     GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
+     USES(U(TickUBO) R(Materials) I(SolArgs) R(Voxels) R(PageTable)
+          RW(SolTable) A(SolPool) A(SolMeta) R(SolSpec)))
 
 // ---- phase 3b: water bodies (docs/PLAN_water_master.md M2) ----------------
 //
@@ -637,6 +721,16 @@ PASS(gasFarPlumeWide, "gasFarPlume", PT_TICK, PIPE_GAS_FARPLUMEW, K_COMPUTE, D_G
 PASS(occupancyFull, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_OCCUPANCY, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) W(ChunkHash)
           R(PageTable)))
+// The solute layer's share of the world hash (sim_solute.wgsl solHash): one
+// group per slot, an EMPTY slot returns at once, a page or a UNIFORM sentinel
+// hashes its cells keyed by SLOT and cell -- never by page index -- into the
+// same wrapping sum the voxels add to. Solute mass is authoritative state
+// (PLAN_solutes §7.1), so a world that differs only in where its salt is must
+// hash differently.
+// read-only in practice: solTable is read_write for the module because solAlloc and
+// solCompact write it; solHash only reads the entry.
+PASS(solHash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_SOL_HASH, K_COMPUTE, D_CHUNKS,1,1, GRP_SIM, DYN_ZERO, C_HASH, 1,
+     USES(R(SolTable) A(SolPool) A(Hash)))
 PASS(pick_hash, "occupancyFull+pick(hashTick)", PT_TICK, PIPE_PICK,      K_COMPUTE, 1,1,1,       GRP_SIM, DYN_ZERO, C_HASH, 1,
      USES(R(Voxels) R(Materials) U(RenderUBO) W(Pick) R(PageTable)))
 // ---- THE HASH-TICK farDown BACKSTOP (2026-09-24) --------------------------
@@ -974,6 +1068,11 @@ PASS(lr_occupancyFull, "occupancyFull(loadReset)", PT_LOADRESET, PIPE_OCCUPANCY,
      GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) W(ChunkHash)
           R(PageTable)))
+// read-only in practice: solTable is read_write for the module because solAlloc and
+// solCompact write it; solHash only reads the entry.
+PASS(lr_solHash, "occupancyFull(loadReset)", PT_LOADRESET, PIPE_SOL_HASH, K_COMPUTE, D_CHUNKS,1,1,
+     GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(R(SolTable) A(SolPool) A(Hash)))
 
 // ========================================================= PT_HASHONLY =====
 // Simulation::EncodeHashOnly — standalone whole-world hash pass (save/load
@@ -984,6 +1083,11 @@ PASS(ho_occupancyFull, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_OCCUPANCY, K
      GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
      USES(R(Voxels) R(Materials) U(TickUBO) W(Occupancy) A(Hash) W(ChunkHash)
           R(PageTable)))
+// read-only in practice: solTable is read_write for the module because solAlloc and
+// solCompact write it; solHash only reads the entry.
+PASS(ho_solHash, "occupancyFull(hashOnly)", PT_HASHONLY, PIPE_SOL_HASH, K_COMPUTE, D_CHUNKS,1,1,
+     GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(R(SolTable) A(SolPool) A(Hash)))
 
 // ========================================================== PT_FARFILL =====
 // Simulation::EncodeFarFill. Encoded into the tick's command buffer AFTER
@@ -1372,7 +1476,8 @@ PASS(seam_consume_apply, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_CONSUME_APPLY, K_
 PASS(seam_excite_detect, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_DETECT, K_INDIRECT, IND_DISPATCHARGS,0,0, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_CAACTIVE, 1,
      USES(RW(Voxels) R(Materials) U(TickUBO) R(PageTable) R(DirtyList)
           R(FluidBlockMap) R(FluidGrid) A(FluidExciteScratch)
-          A(FluidArgsStage) A(WaterBodyState) I(DispatchArgs)))
+          A(FluidArgsStage) A(WaterBodyState) I(DispatchArgs)
+          R(SolTable) A(SolPool) A(SolMeta)))
 PASS(seam_excite_scan, "fluidSeam", PT_FLUIDSEAM, PIPE_FLUID_EXCITE_SCAN, K_COMPUTE, 1,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) A(FluidExciteScratch) A(FluidArgsStage)))
 // The emit dispatch is list-shaped (one workgroup per candidate slot):
@@ -1490,5 +1595,20 @@ PASS(seam_settle_kill, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_SETTLE_KILL, K_
 PASS(seam_mirror_fold, "fluidSettle", PT_FLUIDSETTLE, PIPE_FLUID_MIRROR_FOLD, K_COMPUTE, 27,1,1, GRP_SLIM_FLUIDSEAM, DYN_NONE, C_ALWAYS, 1,
      USES(U(TickUBO) R(FluidBlockMap) R(FluidGrid) W(FluidMirror)
           A(FluidArgsStage) A(FluidSettleScratch)))
+
+// ===================================================== PT_SOLEVICT / RESTORE ==
+// Simulation::EncodeSoluteEvict / EncodeSoluteRestore: the solute layer's two
+// between-tick doors (docs/PLAN_solutes.md; world.h kSolStage*). A window
+// shift clears the leaving plane's entries and copies what they held into the
+// staging for the CPU to keep with the chunk; a refill (or a load) installs the
+// kept solute into the slot the chunk now occupies. Each is its own command
+// buffer, recorded while no tick is in flight, so no CA dispatch ever sees a
+// slot half-evicted or half-restored. D_GENCOUNT carries the list length.
+PASS(solEvict, "soluteEvict", PT_SOLEVICT, PIPE_SOL_EVICT, K_COMPUTE, D_GENCOUNT,1,1,
+     GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(RW(SolTable) A(SolPool) A(SolMeta) A(SolStage)))
+PASS(solRestore, "soluteRestore", PT_SOLRESTORE, PIPE_SOL_RESTORE, K_COMPUTE, D_GENCOUNT,1,1,
+     GRP_SIM, DYN_ZERO, C_ALWAYS, 1,
+     USES(W(SolTable) A(SolPool) A(SolMeta) A(SolStage)))
 
 // clang-format on

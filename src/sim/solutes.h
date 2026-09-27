@@ -62,3 +62,15 @@ bool LoadSolutes(const std::string& path, const std::vector<MaterialDef>& mats,
 
 // The species a powder material dissolves as, or nullptr.
 const SoluteDef* SoluteFromPowder(const std::vector<SoluteDef>& table, uint16_t mat);
+
+// THE TABLE THE GPU HOLDS. Set by Simulation::UploadSolutes, the one place the
+// species table is uploaded (every materials load and R reload comes through
+// it), so a CPU reader -- the vessel seam, a gate's fixture, the selftest op
+// stream -- sees exactly the ids the kernels resolve. Empty before the first
+// upload. Process-global like CurrentTuning(): there is one GPU table.
+const std::vector<SoluteDef>& CurrentSolutes();
+void SetCurrentSolutes(const std::vector<SoluteDef>& table);
+// The species named `name` in CurrentSolutes(), or nullptr.
+const SoluteDef* CurrentSoluteNamed(const char* name);
+// The species with 1-based id `species` in CurrentSolutes(), or nullptr.
+const SoluteDef* CurrentSoluteById(uint32_t species);

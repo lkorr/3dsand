@@ -409,7 +409,7 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 // standing argument against two lists (tuning_params.def, pass_table.def).
 //
 // Order is bit order. Adding a bit means adding a row HERE and nowhere else.
-constexpr int kDirtyReasonBits = 26;
+constexpr int kDirtyReasonBits = 28;
 inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     "write",      "react-idle", "stain-idle", "flow",
     "viscous",    "seam",       "part",       "wbody",
@@ -420,7 +420,15 @@ inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     "film-press", "powder",     "gas",        "solo",
     // docs/PLAN_gas_particles.md P0: gas moving FLAT (the top-plane sheet) and
     // gas whose intent pointed out of the residency window (the sink).
-    "gas-lat",    "gas-edge"};
+    "gas-lat",    "gas-edge",
+    // docs/PLAN_solutes.md: dissolved mass still moving -- a pair exchange,
+    // a dissolve waiting for its page, or a boundary gradient a neighbour
+    // owns (sim_solute.wgsl / sim_step.wgsl DIRTY_R_SOLUTE). Not in
+    // FILM_LICENCE: solute moving is not liquid progress.
+    "solute",
+    // ...and its back-check: a pair the -axis neighbour owns has work, so the
+    // owner is woken for a whole phase cycle (sim_solute.wgsl DIRTY_R_SOLBACK).
+    "solute-back"};
 
 // The bit for a reason NAME, resolved from the one table above rather than
 // written down as a number a second time -- 22/24/25 in a header is exactly
@@ -1795,6 +1803,127 @@ static_assert((uint64_t)kPoolPages * kChunkVol * 4ull <= 0xFFFFFFFFull,
               "voxels buffer exceeds the 4 GiB storage-binding ceiling: "
               "kWorldN is too large for a single binding. Split the pool "
               "across buffers, or reduce kWorldN.");
+
+// ============================================================================
+// THE SOLUTE LAYER (docs/PLAN_solutes.md P1-P3, DESIGN.md "Solutes").
+//
+// Dissolved matter is not a material: a powder that dissolves (salt, fairy
+// dust) becomes MASS carried by the liquid cell it dissolved into. The voxel
+// word is full, so the mass lives in a SPARSE AUX LAYER keyed by chunk slot,
+// shaped like the voxel page table:
+//
+//   solTable[slot]  0                          SOL_EMPTY   (no solute anywhere)
+//                   kSolUniformBit | value16   SOL_UNIFORM (every cell holds value16)
+//                   kSolPageBit | page         a real page in solPool
+//   solPool         kSolutePoolPages pages x kSolWordsPerPage u32; a cell is a
+//                   16-bit value (species << 8 | mass), two cells per word,
+//                   the EVEN local index in the low half.
+//
+// Mass is 0..255 at a full cell (8 eighths); concentration = mass * 8 /
+// fullness is DERIVED and never stored (PLAN_solutes §1). Species is the
+// 1-based index into solutes.json, 0 = none.
+//
+// WHY THE TABLE IS GPU-OWNED, unlike the voxel page table. The voxel table is
+// derived data the CPU allocates ahead of every write it can foresee, and it
+// needs a whole conservative-mirror recurrence to foresee them. The solute
+// table cannot be foreseen from the CPU at all: a grain of salt touching water
+// is a CA decision. So allocation is a GPU PASS at a fixed point in the tick
+// (sim_solute.wgsl solWant/solAlloc, before the CA): every chunk within one
+// chunk of a dirty chunk whose neighbourhood carries solute (or asked for it
+// last tick) is given a page. Which page index a slot gets depends on atomic
+// scheduling -- harmless, because the index is a memory address, never an
+// identity: the hash, the save and every reader key on the SLOT and the cell.
+// WHETHER a slot has a page is a pure function of the dirty set and the
+// solute state, so it is deterministic, and it is the only thing any kernel
+// branches on (a write into a non-page is refused and counted as a fault).
+//
+// Pages are handed back at the END of the same tick (solCompact) when a chunk
+// turns out uniform or empty, so a settled lake is table entries, not pages.
+//
+// THE POOL SIZE IS DERIVED, never a literal (the kPoolPages rule): a page is
+// needed only for a chunk MID-DISPERSION -- a uniform body is a sentinel -- and
+// the dilution floor bounds how far a plume can spread (mass / floor cells).
+// One-eighth of the window's slots is 4,096 pages = 32 MiB, ~64x the largest
+// plume a vessel can pour. Exhaustion is a FATAL ABORT with a verdict
+// (Simulation::CheckSoluteFaults), because which slots would be refused is
+// scheduling-dependent and a refused page would be a lost write.
+constexpr uint32_t kSolWordsPerPage = kChunkVol / 2;        // 2048 u32 = 8 KiB
+constexpr uint32_t kSolPoolDivisor = 8;
+constexpr uint32_t kSolutePoolPages = kNumSlots / kSolPoolDivisor;  // 4096
+constexpr uint32_t kSolUniformBit = 0x80000000u;
+constexpr uint32_t kSolPageBit = 0x40000000u;
+constexpr uint32_t kSolPageMask = 0x3FFFFFFFu;
+static_assert(kSolutePoolPages < kSolPageMask, "page index must fit the entry");
+// solMeta (one buffer, u32 words): a 64-word header, then the free stack,
+// the want list + want flags, the request flags, the per-chunk stall
+// counters and the per-chunk aggregates. sim_solute.wgsl's SOLM_* block
+// mirrors every offset below (check_invariants.py `solute`).
+constexpr uint32_t kSolMetaHdrWords = 64;
+constexpr uint32_t kSolMFree = 0;        // free-stack depth (pages available)
+constexpr uint32_t kSolMWantCount = 1;   // want-list append cursor this tick
+constexpr uint32_t kSolMFaults = 2;      // solute store into a non-page (a BUG)
+constexpr uint32_t kSolMExhausted = 3;   // pops that found the stack empty (FATAL)
+constexpr uint32_t kSolMHighWater = 4;   // max pages in use, monotonic
+constexpr uint32_t kSolMDissolved = 5;   // units dissolved, monotonic (wraps)
+constexpr uint32_t kSolMPrecip = 6;      // units precipitated back to powder
+constexpr uint32_t kSolMDiscarded = 7;   // units discarded (floor / destroyed / conflict)
+constexpr uint32_t kSolMConverted = 8;   // units spent converting a solvent
+constexpr uint32_t kSolMFaultSlot = 9;   // first fault: slot + 1
+constexpr uint32_t kSolMFaultTick = 10;  // first fault: tick
+constexpr uint32_t kSolMPoured = 11;     // units added by solute cell ops (pours)
+constexpr uint32_t kSolMScooped = 12;    // units removed by scoop clears, monotonic
+constexpr uint32_t kSolMSeamRefused = 13; // MPM excites refused: the cell carried solute
+// THE SOLUTE SCOOP LEDGER (docs/PLAN_alchemy_chemistry.md contract 2.5): units
+// of each species a vessel's conditional clears took out of the world, one
+// monotonic word per species 1..kSolScoopSpecies at [20 .. 20 + N), written by
+// sim_solute.wgsl solScoop (which walks the tick's cell ops after
+// sim_mutate's `cells` applied them). Read by TickAuthority beside the
+// eighths ledger (pageFaults [36]); a species past N is not credited (its
+// mass stays on the cleared cell and solCompact discards it, counted).
+constexpr uint32_t kSolMScoopBySpecies = 20;
+constexpr uint32_t kSolScoopSpecies = 8;
+constexpr uint32_t kSolMArgs = 16;       // [16..18] solAlloc indirect args staging
+// pass_table.def's copy_solArgs row copies from byte 64 as a literal.
+static_assert(kSolMArgs * 4 == 64, "pass_table.def copy_solArgs offset");
+constexpr uint32_t kSolMStackBase = kSolMetaHdrWords;
+constexpr uint32_t kSolMWantList = kSolMStackBase + kSolutePoolPages;
+constexpr uint32_t kSolMWantFlag = kSolMWantList + kNumSlots;
+constexpr uint32_t kSolMReqFlag = kSolMWantFlag + kNumSlots;
+constexpr uint32_t kSolMStall = kSolMReqFlag + kNumSlots;
+constexpr uint32_t kSolMAgg = kSolMStall + kNumSlots;       // (species << 24) | mass
+// The slots a window SHIFT (or a chunk replace) is about to give to another
+// world chunk: sim_solute.wgsl solEvict clears their entries, hands their pages
+// back and copies what they held into the eviction staging (kSolEvict* below).
+// One plane of the window at most.
+constexpr uint32_t kSolMEvictList = kSolMAgg + kNumSlots;
+constexpr uint32_t kSolMEvictMax = kNChunk * kNChunk;
+constexpr uint32_t kSolMetaWords = kSolMEvictList + kSolMEvictMax;
+// The eviction staging (world.solStage): a 16-word header ([0] = records
+// written, [1] = records REFUSED because the staging was full -- mass lost to
+// the store and counted), then records of kSolRecWords: [slot, entry, 2048
+// page words (a copy of the page; meaningless for a sentinel entry)].
+constexpr uint32_t kSolRecWords = 2 + kSolWordsPerPage;
+constexpr uint32_t kSolEvictRecords = 256;
+constexpr uint32_t kSolStageHdrWords = 16;
+constexpr uint32_t kSolStageWords = kSolStageHdrWords + kSolEvictRecords * kSolRecWords;
+constexpr uint32_t kSolMetaHdrBytes = kSolMetaHdrWords * 4;
+// solSpec: the species table uploaded from solutes.json (Simulation::
+// UploadSolutes). A 16-word header, 16 words per species (1-based, so slot 0
+// is unused), then one word per material: bits 0..7 the species this powder
+// dissolves AS, bits 8..31 a mask of the species (1..24) it is a SOLVENT of.
+constexpr uint32_t kSolSpeciesMax = 255;
+constexpr uint32_t kSolSolventSpeciesMax = 24;   // the mask's width
+constexpr uint32_t kSolSpecStride = 16;
+constexpr uint32_t kSolSpecBase = 16;
+constexpr uint32_t kSolSpecMatBase = kSolSpecBase + (kSolSpeciesMax + 1) * kSolSpecStride;
+// ...then one word per compiled REACTION RULE (the side array PLAN_solutes
+// §4.1 chose over a 36-byte ReactionGpu): bits 0..7 the species the rule's
+// self cell must carry (0 = no condition), 8..15 cMin, 16..23 cMax, in
+// concentration units. Indexed by the rule's GPU index (reactOffset + k).
+constexpr uint32_t kSolSpecRuleBase = kSolSpecMatBase + 4096;
+constexpr uint32_t kSolSpecRuleCount = 4096;   // >= kMaxReactions (asserted in simulation.cpp)
+constexpr uint32_t kSolSpecWords = kSolSpecRuleBase + kSolSpecRuleCount;
+constexpr uint32_t kSolConvertsMax = 4;          // converts rows per species on the GPU
 
 // The word a sentinel chunk's cells read as. THIS IS THE HASH CONTRACT (§4.1):
 // it must be bit-identical to what a materialized page would hold, which is
@@ -3797,6 +3926,25 @@ struct WorldSnapshot {
   uint32_t scoopEighths = 0;
   uint32_t scoopApplied = 0;
   uint32_t scoopRefused = 0;
+  // ---- the solute layer (the kSolM* header of solMeta, as of `tick`) ----
+  // Monotonic counters since the last solute reset; `solFaults` and
+  // `solExhausted` are the two "this build has a bug" latches, the others are
+  // the mass ledger the solute gates balance (dissolved - precipitated -
+  // discarded - converted + poured - scooped == mass now).
+  uint32_t solFree = 0;
+  uint32_t solFaults = 0;
+  uint32_t solExhausted = 0;
+  uint32_t solHighWater = 0;
+  uint32_t solDissolved = 0;
+  uint32_t solPrecip = 0;
+  uint32_t solDiscarded = 0;
+  uint32_t solConverted = 0;
+  uint32_t solPoured = 0;
+  uint32_t solScooped = 0;
+  uint32_t solFaultSlot = 0;
+  uint32_t solFaultTick = 0;
+  // Monotonic units per species (1..kSolScoopSpecies) the vessels' clears took.
+  uint32_t solScoopedBy[kSolScoopSpecies] = {};
   // ---- reaction effects (pageFaults [40..63], kPageFaultReactFx*) ----
   // THIS snapshot's tick only (the record is cleared every tick). `reactFx`
   // is the surviving slot winners in SLOT order -- a fixed order, so the
@@ -4591,6 +4739,20 @@ class World {
                             // is zero, and there is exactly ONE bind-group
                             // layout and one pass_table.def rather than a
                             // flag-dependent pair (PLAN_page_table.md §5.1).
+  // ---- the solute layer (the kSol* block above) ----
+  // AUTHORITATIVE STATE, unlike the page table: the cell values are hashed
+  // (sim_solute.wgsl solHash) and saved (worldio 'SOLU'). The table and the
+  // page indices are GPU-owned; the CPU writes them only at a reset or a
+  // restore, when no tick is in flight.
+  rhi::Buffer solTable;    // kNumSlots u32 entries
+  rhi::Buffer solPool;     // kSolutePoolPages * kSolWordsPerPage u32
+  rhi::Buffer solMeta;     // kSolMetaWords u32
+  rhi::Buffer solArgs;     // 3 u32 — indirect-only copy of solMeta[kSolMArgs..]
+  rhi::Buffer solStage;    // kSolStageWords u32: eviction / restore records
+  // Zero the whole layer: every slot EMPTY, every page free, every counter 0.
+  // Deferred queue writes, so they land at the head of the next submit -- the
+  // same ordering every other reset here relies on.
+  void ResetSolutes(const rhi::Queue& queue);
   rhi::Buffer dirty[2];    // kNumChunks u32
   rhi::Buffer dirtyList;   // kNumChunks u32 — compacted dirty-chunk indices
   rhi::Buffer argsStage;   // 3 u32 — compact shader writes (x = dirty count, y = z = 1)

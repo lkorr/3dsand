@@ -9,6 +9,7 @@
 #include "sim/microbody.h"
 #include "sim/microvox.h"
 #include "sim/pass_table.h"
+#include "sim/solutes.h"
 #include "sim/treeatlas.h"
 #include "sim/worldmap.h"
 #include "sim/world.h"
@@ -32,6 +33,13 @@ class Simulation {
   // Re-upload the material + reaction tables (JSON hot reload).
   void UploadTables(const rhi::Queue& queue, const std::vector<MaterialDef>& mats,
                     const std::vector<ReactionGpu>& reactions);
+  // The solute species table the GPU holds (solutes.json resolved against the
+  // materials of the last UploadTables). Empty = nothing dissolves.
+  const std::vector<SoluteDef>& Solutes() const { return solutes_; }
+  // Pack `defs` into the kSolSpec* layout and upload it. UploadTables calls
+  // this with LoadSolutes(solutes.json); a gate may call it directly.
+  void UploadSolutes(const rhi::Queue& queue, const std::vector<SoluteDef>& defs,
+                     const std::vector<MaterialDef>& mats);
   // Re-upload the static micro-detail brick pool + per-material table (rides
   // the same R hot-reload as materials — sim/microvox.h). Render-only data:
   // these buffers are bound to the raymarch pipeline and to nothing else.
@@ -110,6 +118,12 @@ class Simulation {
   // Standalone whole-world hash pass (save/load verification): caller writes
   // TickParams with hashEnable=1 first, reads world.hash after submit.
   void EncodeHashOnly(const rhi::CommandEncoder& enc);
+  // The solute layer's two between-tick doors (sim_solute.wgsl solEvict /
+  // solRestore): `count` slots listed in solMeta[kSolMEvictList..], or `count`
+  // records in solStage. Each wants its own command buffer, submitted while no
+  // tick is in flight (Stream::ShiftAxis / FillSlots, LoadWorld).
+  void EncodeSoluteEvict(const rhi::CommandEncoder& enc, uint32_t count);
+  void EncodeSoluteRestore(const rhi::CommandEncoder& enc, uint32_t count);
 
   // Wake every chunk for the NEXT tick by setting all dirty-in flags.
   //
@@ -704,6 +718,15 @@ class Simulation {
   // genColCount_ is the chunk-column count of the last WriteGenList, the
   // `cols` dispatch extent. genColScratch_ is WriteGenList's staging.
   rhi::Buffer genColsBuf_, colCacheBuf_;
+  // The solute species table (world.h kSolSpec* layout, binding 43), rebuilt
+  // from assets/materials/solutes.json by every UploadTables -- so an R reload
+  // of materials re-resolves the species' material names against the new
+  // table, and a reload of solutes.json alone rides the same key.
+  rhi::Buffer solSpecBuf_;
+  std::vector<SoluteDef> solutes_;
+  // The solute layer's pipelines (sim_solute.wgsl).
+  rhi::ComputePipeline solWant_, solArgs_, solAlloc_, solDiffuse_, solCompact_, solScoop_, solHash_,
+      solEvict_, solRestore_;
   uint32_t genColCount_ = 0;
   std::vector<uint32_t> genColScratch_;
   // Art palette RGB (0x00RRGGBB), indexed from kArtPaletteBaseGpu. Cached so a

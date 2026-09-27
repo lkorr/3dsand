@@ -232,6 +232,8 @@ void Stream::Update(const InterestSet& interest, uint32_t tick) {
     CompleteOldest(/*discard=*/false);
   // harvest completed shift-demote batches (non-blocking; see HarvestDemotes)
   HarvestDemotes(tick);
+  // ...and completed solute evictions (non-blocking; see EvictSolutes)
+  HarvestSoluteEvicts(/*wait=*/false);
   const double uT1 = PtNowMs();
   timing_.harvestMs += uT1 - uT0;
 
@@ -364,6 +366,9 @@ void Stream::ShiftAxis(int axis, int dir) {
 
   const double sT0 = PtNowMs();
   EvictSlots(slots, /*filter=*/true);
+  // The plane's dissolved mass leaves with it (before the origin moves, while
+  // SlotToWorldChunk still names the chunks that are leaving).
+  EvictSolutes(slots);
   timing_.evictMs += PtNowMs() - sT0;
 
   IVec3 no = o;
@@ -1193,6 +1198,9 @@ void Stream::FillSlots(const std::vector<uint32_t>& slots, bool deferWake) {
       timing_.demoteMs += PtNowMs() - dT0;
     }
   }
+  // Whatever dissolved mass is kept for the chunks now in these slots goes
+  // back onto the GPU (after the voxels, so the solvent it rides is there).
+  RestoreSolutes(slots);
 }
 
 // ---- the deferred wake's second half -------------------------------------
@@ -1830,6 +1838,13 @@ void Stream::ReloadWindow(IVec3 origin) {
   DrainEvictions(/*discard=*/true);
   DiscardDemotes();  // same: old-world bytes must never classify the new one
   DiscardPendingShifts();  // and so do any un-enacted shift verdicts
+  // The solute layer's slots describe the window being replaced: keep what
+  // they hold (a teleport must not delete the salt it leaves behind), then
+  // clear the layer. The refill below restores whatever is kept for the
+  // chunks of the NEW window. (LoadWorld resets the layer BEFORE calling
+  // this, so for a load the capture finds nothing of the old world.)
+  CaptureResidentSolutes();
+  world_->ResetSolutes(ctx_->queue);
   world_->SetWindowOrigin(origin);
   modified_.assign(kNumSlots, 0);
   // Every slot is refilled below from the store or genChunk, so the delta
@@ -1847,4 +1862,192 @@ void Stream::ReloadWindow(IVec3 origin) {
   // one-plane size), it is not on a frame path worth protecting, and a load
   // must be simulable on the tick it lands rather than two ticks later.
   FillSlots(slots, /*deferWake=*/false);
+}
+
+// ============================================================================
+// THE SOLUTE LAYER'S HALF OF STREAMING (docs/PLAN_solutes.md §7.1)
+//
+// The GPU owns the live layer and its page indices (world.h kSol*), so the
+// CPU never addresses a solute page: both doors are GPU passes over a slot
+// list, recorded in their own command buffers between ticks, exactly where
+// the voxel eviction and refill run.
+//
+//   EvictSolutes   before a shift moves the origin: solEvict copies each
+//                  listed slot's entry (and page) into the staging, frees the
+//                  page and empties the slot; the staging is read back
+//                  asynchronously (the voxel eviction's pattern) and harvested
+//                  into solutes_ keyed by the chunk that LEFT.
+//   RestoreSolutes after the refill: every refilled slot whose chunk solutes_
+//                  holds gets its entry/page back through solRestore, and the
+//                  CPU copy is dropped -- the GPU owns it again.
+//
+// A chunk that leaves and comes straight back (the player doubling back
+// inside the map latency) forces its eviction to complete first, so the
+// restore always sees the newest bytes.
+// ============================================================================
+void Stream::DiscardSoluteState() {
+  while (!solPending_.empty()) {
+    PendingSolEvict& p = solPending_.front();
+    p.map.Wait();
+    p.map.Unmap();
+    solStagingPool_.push_back(p.staging);
+    solPending_.pop_front();
+  }
+  solPendingKeys_.clear();
+  solutes_.clear();
+  solLost_ = 0;
+}
+
+void Stream::EvictSolutes(const std::vector<uint32_t>& slots) {
+  if (slots.empty() || !sim_ || !ctx_) return;
+  const uint32_t n = std::min<uint32_t>((uint32_t)slots.size(), kSolMEvictMax);
+  PendingSolEvict p;
+  p.slots.assign(slots.begin(), slots.begin() + n);
+  p.keys.reserve(n);
+  for (uint32_t i = 0; i < n; i++)
+    p.keys.push_back(World::PackChunkKey(world_->SlotToWorldChunk(p.slots[i])));
+  static const uint32_t kZeroHdr[kSolStageHdrWords] = {};
+  ctx_->queue.WriteBuffer(world_->solMeta, (uint64_t)kSolMEvictList * 4, p.slots.data(),
+                          (uint64_t)n * 4);
+  ctx_->queue.WriteBuffer(world_->solStage, 0, kZeroHdr, sizeof kZeroHdr);
+  if (!solStagingPool_.empty()) {
+    p.staging = solStagingPool_.back();
+    solStagingPool_.pop_back();
+  } else {
+    p.staging = CreateBuffer(ctx_->device, (uint64_t)kSolStageWords * 4,
+                             rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                             "solEvictStaging");
+  }
+  rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
+  sim_->EncodeSoluteEvict(enc, n);
+  enc.CopyTracked(pass::Buf::SolStage, world_->solStage, 0, p.staging, 0,
+                  (uint64_t)kSolStageWords * 4);
+  ctx_->queue.Submit(enc.Finish());
+  p.map = rhi::MapReadDeferred(ctx_->device, p.staging, 0, (uint64_t)kSolStageWords * 4);
+  for (uint64_t k : p.keys) solPendingKeys_[k]++;
+  solPending_.push_back(std::move(p));
+}
+
+void Stream::HarvestSoluteEvicts(bool wait) {
+  while (!solPending_.empty()) {
+    PendingSolEvict& p = solPending_.front();
+    if (!wait && !p.map.Ready()) break;
+    p.map.Wait();
+    const uint32_t* w = p.map.Succeeded() ? (const uint32_t*)p.map.Data() : nullptr;
+    if (w) {
+      // One sequential copy out of write-combined memory, of only the records
+      // the pass wrote (CompleteOldest's bounce, for the same reason).
+      const uint32_t count = std::min(w[0], kSolEvictRecords);
+      const uint32_t refused = w[1];
+      std::vector<uint32_t> buf(kSolStageHdrWords + (size_t)count * kSolRecWords);
+      std::memcpy(buf.data(), w, buf.size() * 4);
+      // Every chunk that LEFT forgets any older copy first: one that left
+      // carrying nothing must not come back with salt a previous visit (or a
+      // save's capture) recorded for it.
+      for (uint64_t k : p.keys) solutes_.erase(k);
+      for (uint32_t r = 0; r < count; r++) {
+        const uint32_t* rec = &buf[kSolStageHdrWords + (size_t)r * kSolRecWords];
+        const uint32_t slot = rec[0] & 0xFFFFFFu;
+        uint64_t key = 0;
+        bool found = false;
+        for (size_t i = 0; i < p.slots.size(); i++)
+          if (p.slots[i] == slot) { key = p.keys[i]; found = true; break; }
+        if (!found) continue;
+        SoluteChunk sc;
+        sc.entry = rec[1];
+        sc.stall = rec[0] >> 24;
+        if (sc.entry & kSolPageBit) sc.words.assign(rec + 2, rec + 2 + kSolWordsPerPage);
+        solutes_[key] = std::move(sc);
+      }
+      if (refused) {
+        solLost_ += refused;
+        std::fprintf(stderr,
+                     "solute: %u evicted chunks did not fit the %u-record "
+                     "staging; their dissolved mass is lost (world.h "
+                     "kSolEvictRecords)\n",
+                     refused, kSolEvictRecords);
+      }
+    }
+    p.map.Unmap();
+    for (uint64_t k : p.keys) {
+      auto it = solPendingKeys_.find(k);
+      if (it != solPendingKeys_.end() && --it->second == 0) solPendingKeys_.erase(it);
+    }
+    solStagingPool_.push_back(p.staging);
+    solPending_.pop_front();
+  }
+}
+
+void Stream::RestoreSolutes(const std::vector<uint32_t>& slots) {
+  if (!sim_ || !ctx_) return;
+  HarvestSoluteEvicts(/*wait=*/false);
+  if (solutes_.empty() && solPending_.empty()) return;  // nothing kept: the common case
+  std::vector<uint32_t> recs;
+  uint32_t n = 0;
+  auto flush = [&] {
+    if (n == 0) return;
+    ctx_->queue.WriteBuffer(world_->solStage, (uint64_t)kSolStageHdrWords * 4, recs.data(),
+                            recs.size() * 4);
+    rhi::CommandEncoder enc = ctx_->device.CreateCommandEncoder();
+    sim_->EncodeSoluteRestore(enc, n);
+    ctx_->queue.Submit(enc.Finish());
+    recs.clear();
+    n = 0;
+  };
+  for (uint32_t s : slots) {
+    const uint64_t key = World::PackChunkKey(world_->SlotToWorldChunk(s));
+    if (solPendingKeys_.count(key)) HarvestSoluteEvicts(/*wait=*/true);
+    auto it = solutes_.find(key);
+    if (it == solutes_.end()) continue;
+    const SoluteChunk& sc = it->second;
+    const size_t at = recs.size();
+    recs.resize(at + kSolRecWords, 0u);
+    recs[at] = s | (std::min<uint32_t>(sc.stall, 255u) << 24);
+    recs[at + 1] = sc.entry;
+    if ((sc.entry & kSolPageBit) && sc.words.size() == kSolWordsPerPage)
+      std::memcpy(&recs[at + 2], sc.words.data(), kSolWordsPerPage * 4);
+    else if (sc.entry & kSolPageBit)
+      recs[at + 1] = 0u;   // a malformed page record restores as EMPTY
+    solutes_.erase(it);
+    if (++n == kSolEvictRecords) flush();
+  }
+  flush();
+}
+
+void Stream::CaptureResidentSolutes() { CaptureResidentSolutes(solutes_); }
+
+void Stream::CaptureResidentSolutes(SoluteMap& into) {
+  if (!ctx_ || !world_) return;
+  HarvestSoluteEvicts(/*wait=*/true);
+  std::vector<uint32_t> table(kNumSlots, 0u);
+  rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->solTable, 0, table.data(),
+                        table.size() * 4, "solCaptureTable");
+  bool any = false, pages = false;
+  for (uint32_t s = 0; s < kNumChunks; s++) {
+    any = any || table[s] != 0u;
+    pages = pages || (table[s] & kSolPageBit) != 0u;
+  }
+  if (!any) return;
+  std::vector<uint32_t> stall(kNumSlots, 0u);
+  rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->solMeta,
+                        (uint64_t)kSolMStall * 4, stall.data(), stall.size() * 4,
+                        "solCaptureStall");
+  std::vector<uint32_t> pool;
+  if (pages) {
+    pool.resize((size_t)kSolutePoolPages * kSolWordsPerPage);
+    rhi::ReadbackBlocking(ctx_->device, ctx_->queue, world_->solPool, 0, pool.data(),
+                          pool.size() * 4, "solCapturePool");
+  }
+  for (uint32_t s = 0; s < kNumChunks; s++) {
+    const uint32_t e = table[s];
+    if (e == 0u) continue;
+    SoluteChunk sc;
+    sc.entry = e;
+    sc.stall = stall[s];
+    if (e & kSolPageBit) {
+      const size_t base = (size_t)(e & kSolPageMask) * kSolWordsPerPage;
+      sc.words.assign(pool.begin() + base, pool.begin() + base + kSolWordsPerPage);
+    }
+    into[World::PackChunkKey(world_->SlotToWorldChunk(s))] = std::move(sc);
+  }
 }

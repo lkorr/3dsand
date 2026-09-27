@@ -1,7 +1,31 @@
 # Solutes: concentrations of a dissolved substance in a liquid — plan of record
 
-Status 2026-09-03: **NOTHING BUILT.** This is the design decision record and the
-package order. No code, no assets, no gates yet.
+Status 2026-09-27: **P1-P3 BUILT** (package B of docs/PLAN_alchemy_chemistry.md;
+DESIGN.md §4 "Solutes" is the as-built summary, which wins where it and this
+record disagree). What differs from the plan below:
+- **Allocation is a GPU pass** (`solWant`/`solArgs`/`solAlloc` before the CA,
+  pages freed by `solCompact` after it), not a CPU-foreseen set: a dissolve is a
+  CA decision the CPU cannot predict.
+- **Diffusion is strided pair exchange** (strides 1/2/4/8, three axis dispatches
+  a tick), not stride-1 only: stride 1 alone reaches an integer RAMP fixpoint
+  (spread 13 across a pond). The half-down rounding of the equalising amount is
+  what stops a film residue. The dilution floor (§3.3.1) applies to a chunk
+  STALLED for 24 consecutive dispatches.
+- **Concentration conditions** live in a side array keyed by GPU rule index
+  (`cond` bits 24..28 went to package A's effect ids), self must be a LIQUID.
+- **MPM seam: refused**, not carried: a cell with solute is never excited.
+- **Vessels:** scoop credits dissolved portions (`solScoop` + a per-species
+  ledger); the POUR still emits powder grains.
+- **Not built:** render tint / glow (§4.3; the species table carries the
+  numbers, no shader reads them), multigrid (§3.4.1; the strides were enough at
+  pond scale), mixing of two species in one cell.
+
+Gates: `solute`, `solute-dilute`, `solute-evap`, `solute-seam`,
+`solute-electrolysis`, `solute-vessel` (all in `src/test/selftest_solute.cpp`),
+plus `save-load` for the `solutes.svs` round trip.
+
+Original status 2026-09-03: nothing built; the design decision record and the
+package order.
 
 Revised same day: §3.3.1 (the dilution floor) and §3.4.1 (multigrid vs. a rate
 limit) were added after working the blood-into-water case, which is the one that

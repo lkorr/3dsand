@@ -130,6 +130,183 @@ const PT_KERNEL : u32 = PT_K_FLUIDSEAM;
 // read back with the snapshot.
 @group(1) @binding(13) var<storage, read_write> fluidMirror : array<u32>;
 
+// ---- THE SOLUTE LAYER (docs/PLAN_solutes.md; world.h kSol*) -----------------
+// Bindings 14..17 of the seam group. The seam does not carry dissolved mass
+// yet -- FluidParticle's reserved _r0 is where a {species, mass} payload would
+// ride -- so exciteDetect REFUSES a cell that carries solute: exciting it would
+// turn the liquid into particles and leave the mass on an air cell, i.e. delete
+// it. The refusal is counted (SOLM_SEAM_REFUSED) so the `solute-seam` gate can
+// assert it happened rather than infer it from a mass total.
+@group(1) @binding(14) var<storage, read_write> solTable : array<u32>;
+@group(1) @binding(15) var<storage, read_write> solPool : array<atomic<u32>>;
+@group(1) @binding(16) var<storage, read_write> solMeta : array<atomic<u32>>;
+@group(1) @binding(17) var<storage, read> solSpec : array<u32>;
+
+// MIRROR-BEGIN solute
+// ---- THE SOLUTE LAYER'S SHARED ACCESSORS (docs/PLAN_solutes.md) -------------
+// ONE block, pasted verbatim into every shader that touches dissolved mass
+// (sim_step.wgsl, sim_solute.wgsl, sim_mutate.wgsl, sim_fluid_seam.wgsl) and
+// held identical by scripts/check_invariants.py `solute`. Not in common.wgsl on
+// purpose: common.wgsl is prepended to every shader, so an edit there misses the
+// SPIR-V cache for all of them (CLAUDE.md, "What needs a rebuild"); this block
+// only reaches the four modules that bind the layer.
+//
+// The layout is world.h's kSol* block, mirrored constant for constant:
+//   solTable[slot]  0 = SOL_EMPTY | SOL_UNIFORM_BIT | value16 | SOL_PAGE_BIT | page
+//   solPool         16-bit cells (species << 8 | mass), two per word, the EVEN
+//                   chunk-local index in the low half
+//   solMeta         SOLM_* header, free stack, want list/flags, request flags,
+//                   stall counters, per-chunk aggregates
+//   solSpec         species params (SOLS_*) + one word per material
+//
+// POOL WORDS ARE WRITTEN WITH TWO ATOMICS (and, then or) because two cells share
+// a word and the colour lattice lets two acting threads write neighbouring
+// cells: a plain read-modify-write of the word would lose one of them. Atomic
+// ops on DISJOINT bits commute, so the result does not depend on their order.
+const SOL_UNIFORM_BIT : u32 = 0x80000000u;
+const SOL_PAGE_BIT : u32 = 0x40000000u;
+const SOL_PAGE_MASK : u32 = 0x3FFFFFFFu;
+const SOL_WORDS_PER_PAGE : u32 = 2048u;
+const SOL_POOL_PAGES : u32 = 4096u;
+const SOLM_FREE : u32 = 0u;
+const SOLM_WANT_COUNT : u32 = 1u;
+const SOLM_FAULTS : u32 = 2u;
+const SOLM_EXHAUSTED : u32 = 3u;
+const SOLM_HIGH_WATER : u32 = 4u;
+const SOLM_DISSOLVED : u32 = 5u;
+const SOLM_PRECIP : u32 = 6u;
+const SOLM_DISCARDED : u32 = 7u;
+const SOLM_CONVERTED : u32 = 8u;
+const SOLM_FAULT_SLOT : u32 = 9u;
+const SOLM_FAULT_TICK : u32 = 10u;
+const SOLM_POURED : u32 = 11u;
+const SOLM_SCOOPED : u32 = 12u;
+const SOLM_SEAM_REFUSED : u32 = 13u;
+const SOLM_ARGS : u32 = 16u;
+const SOLM_STACK : u32 = 64u;
+const SOLM_WANT_LIST : u32 = SOLM_STACK + SOL_POOL_PAGES;
+const SOLM_WANT_FLAG : u32 = SOLM_WANT_LIST + NUM_SLOTS;
+const SOLM_REQ_FLAG : u32 = SOLM_WANT_FLAG + NUM_SLOTS;
+const SOLM_STALL : u32 = SOLM_REQ_FLAG + NUM_SLOTS;
+const SOLM_AGG : u32 = SOLM_STALL + NUM_SLOTS;
+const SOLS_BASE : u32 = 16u;
+const SOLS_STRIDE : u32 = 16u;
+const SOLS_MAT_BASE : u32 = 4112u;
+const SOLS_RULE_BASE : u32 = 8208u;
+// Bit 26 of the dirty word (world.h kDirtyReasonName "solute"): dissolved mass
+// still moving. Deliberately NOT in sim_step's FILM_LICENCE.
+const DIRTY_R_SOLUTE : u32 = 67108864u;
+// Bit 27 ("solute-back"): a chunk's diffusion found work across its -axis face
+// in a pair its -axis neighbour OWNS. The owner, woken by it, keeps itself
+// awake for a whole phase cycle (it cannot know which of the 24 phases the
+// pair lives in, and waking it for one tick lands on the wrong one).
+const DIRTY_R_SOLBACK : u32 = 134217728u;
+// A chunk whose diffusion found nothing to do for this many CONSECUTIVE
+// dispatches has seen every axis, parity and stride (3 x 2 x 4 = 24 phases,
+// eight ticks) idle: it is STALLED, the dilution floor applies and it stops
+// keeping itself awake.
+const SOL_STALL_TICKS : u32 = 24u;
+
+fn solSpeciesOf(v : u32) -> u32 { return v >> 8u; }
+fn solMassOf(v : u32) -> u32 { return v & 0xFFu; }
+fn solPack(species : u32, mass : u32) -> u32 {
+  if (mass == 0u || species == 0u) { return 0u; }
+  return (species << 8u) | min(mass, 255u);
+}
+fn solLocalOf(c : vec3<i32>) -> u32 {
+  let lo = vec3<u32>(c & vec3<i32>(CHUNK_MASK));
+  return (lo.z * CHUNK + lo.y) * CHUNK + lo.x;
+}
+// The cell value a table entry implies for chunk-local cell `local`.
+fn solCellValue(e : u32, local : u32) -> u32 {
+  if (e == 0u) { return 0u; }
+  if ((e & SOL_UNIFORM_BIT) != 0u) { return e & 0xFFFFu; }
+  let wv = atomicLoad(&solPool[(e & SOL_PAGE_MASK) * SOL_WORDS_PER_PAGE + (local >> 1u)]);
+  return (wv >> ((local & 1u) * 16u)) & 0xFFFFu;
+}
+// The STORED value at world cell c. A caller that wants the value a cell
+// carries must also ask whether the cell is a liquid (solCarried): a value
+// left behind on a cell something turned into air is stale until solCompact
+// clears it, and must read as nothing.
+fn solValueAt(c : vec3<i32>) -> u32 {
+  return solCellValue(solTable[voxSlotOfCell(c)], solLocalOf(c));
+}
+fn solWritable(c : vec3<i32>) -> bool {
+  return (solTable[voxSlotOfCell(c)] & SOL_PAGE_BIT) != 0u;
+}
+// A write into a chunk with no page is REFUSED and counted -- the allocator
+// promises a page to every chunk a tick can write, so a refusal is a bug, and
+// the count is what says so (Simulation::CheckSoluteFaults aborts on it). A
+// write of the value the sentinel already implies is not a write at all.
+fn solFault(slot : u32) {
+  let prev = atomicAdd(&solMeta[SOLM_FAULTS], 1u);
+  if (prev == 0u) {
+    atomicStore(&solMeta[SOLM_FAULT_SLOT], slot + 1u);
+    atomicStore(&solMeta[SOLM_FAULT_TICK], T.tick);
+  }
+}
+fn solStoreAt(c : vec3<i32>, v : u32) -> bool {
+  let slot = voxSlotOfCell(c);
+  let e = solTable[slot];
+  let local = solLocalOf(c);
+  if ((e & SOL_PAGE_BIT) == 0u) {
+    if (solCellValue(e, local) == v) { return true; }
+    solFault(slot);
+    return false;
+  }
+  let wi = (e & SOL_PAGE_MASK) * SOL_WORDS_PER_PAGE + (local >> 1u);
+  let sh = (local & 1u) * 16u;
+  let old = (atomicLoad(&solPool[wi]) >> sh) & 0xFFFFu;
+  if (old == v) { return true; }
+  atomicAnd(&solPool[wi], ~(0xFFFFu << sh));
+  atomicOr(&solPool[wi], (v & 0xFFFFu) << sh);
+  return true;
+}
+// ---- the species table (world.h kSolSpec*, Simulation::UploadSolutes) ----
+fn solYield8(s : u32) -> u32 { return max(solSpec[SOLS_BASE + s * SOLS_STRIDE], 1u); }
+fn solSaturation(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 1u]; }
+fn solDissolveChance(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 2u]; }
+fn solDiffusivity(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 3u]; }
+fn solFloor(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 4u]; }
+fn solDensityPerUnit(s : u32) -> i32 { return bitcast<i32>(solSpec[SOLS_BASE + s * SOLS_STRIDE + 5u]); }
+fn solPrecipitate(s : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 9u]; }
+fn solConvertCount(s : u32) -> u32 { return min(solSpec[SOLS_BASE + s * SOLS_STRIDE + 10u], 4u); }
+fn solConvertRow(s : u32, k : u32) -> u32 { return solSpec[SOLS_BASE + s * SOLS_STRIDE + 11u + k]; }
+fn solMatWord(m : u32) -> u32 { return solSpec[SOLS_MAT_BASE + (m & 0xFFFu)]; }
+// The species powder `m` dissolves AS, or 0.
+fn solFromSpecies(m : u32) -> u32 { return solMatWord(m) & 0xFFu; }
+// Is liquid `m` a solvent of species `s`?
+fn solIsSolvent(m : u32, s : u32) -> bool {
+  if (s == 0u || s > 24u) { return false; }
+  return (solMatWord(m) & (1u << (7u + s))) != 0u;
+}
+// The most mass a cell of `f` eighths of a solvent holds of species `s`.
+fn solCap(s : u32, f : u32) -> u32 { return (solSaturation(s) * f) / 8u; }
+fn solIsLiquidMat(m : u32) -> bool {
+  return m != MAT_AIR && materials[m].klass == CLASS_LIQUID;
+}
+// The value cell c CARRIES given its word `w`: the stored value if the cell is
+// a liquid, else nothing (see solValueAt).
+fn solCarried(c : vec3<i32>, w : u32) -> u32 {
+  if (!solIsLiquidMat(voxMat(w))) { return 0u; }
+  return solValueAt(c);
+}
+// A CONCENTRATION CONDITION on a reaction rule (PLAN_solutes §4.1; the side
+// array at SOLS_RULE_BASE, indexed by the rule's GPU index): may rule `ri`
+// fire for the self cell c whose word is w? An unconditioned rule (word 0)
+// always may; a conditioned one needs a liquid self carrying that species at
+// a concentration (mass * 8 / fullness) inside [cMin, cMax].
+fn solRuleAllows(ri : u32, c : vec3<i32>, w : u32) -> bool {
+  let cond = solSpec[SOLS_RULE_BASE + ri];
+  if (cond == 0u) { return true; }
+  if (!solIsLiquidMat(voxMat(w))) { return false; }
+  let v = solValueAt(c);
+  if (solSpeciesOf(v) != (cond & 0xFFu)) { return false; }
+  let conc = (solMassOf(v) * 8u) / (voxState(w) + 1u);
+  return conc >= ((cond >> 8u) & 0xFFu) && conc <= ((cond >> 16u) & 0xFFu);
+}
+// MIRROR-END solute
+
 // ---- layout constants -------------------------------------------------------
 const SPANS : u32 = FLUID_CAP / 256u;         // compaction spans
 const EX_LIST_COUNT : u32 = 0u;   // candidate slots (accepted AND refused)
@@ -969,6 +1146,13 @@ fn exciteDetect(@builtin(workgroup_id) wg : vec3<u32>,
       }
     }
     if (!excite) { continue; }
+    // THE SOLUTE REFUSAL (docs/PLAN_solutes.md §7.2): a cell carrying
+    // dissolved mass stays with the CA, which carries mass through every
+    // move; the MPM particle has no payload for it yet. Counted, per cell.
+    if (solValueAt(c) != 0u) {
+      atomicAdd(&solMeta[SOLM_SEAM_REFUSED], 1u);
+      continue;
+    }
     cand += 1u;   // FA_EXCANDID; folded below
 
     // Depth to the free surface: contiguous same-liquid cells above, capped
