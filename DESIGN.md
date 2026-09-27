@@ -16965,8 +16965,8 @@ refuses waits in `pendingBlasts` for the next tick instead of vanishing.
 reworked 2026-09-27 from the owner's "this should be a work station"). Double-
 click a vessel slot: the bench takes the spellbook's column (the character stays
 on the left), its table sized from the room the panel measures every frame, at
-an integer scale (`areaH / 260`, 2..5) that leaves a table at least ~1.7 flasks
-tall so one can be lifted over another. The left column lists EVERY vessel you
+an integer scale (`areaH / 260`, 2..5 -- but see "The lift room" below) that
+leaves a table at least ~1.7 flasks tall. The left column lists EVERY vessel you
 carry (filled or empty -- an empty flask is what you pour into); clicking one
 puts it on the table (at the first spot clear of the others' glass) or takes it
 off (it leaves with what is inside it, `FlaskSim::RemoveVessel`; put back, it
@@ -16981,6 +16981,53 @@ one vessel in each; a third is refused with the reason. They stand at a third
 and two thirds of the table. The kit is written only at "done" (Esc,
 or the screen shutting): every vessel that was ever on the table is re-checked
 against what came on and `ValidateBench` proves conservation, as before.
+
+**The lift room: the sim is taller than the box** (2026-09-27, owner: "it's
+impossible to lift it above the other flask and rotate upside down"). A
+full-size flask (1024 eighths) is ~126 x 172 bench px; holding one upside down
+with its mouth 30 px over another standing flask's needs ~380 px of height,
+and the box was ~300. The SIM GRID is now never shorter than
+`AlchemyBench::kLiftH` (400) and runs up to the top of the screen; the box is only its bottom
+`tableH` rows (`AlchemyUI::tableH` vs `gridH`). The panel draws the whole grid,
+the rows above the box OVERFLOWING over its own header and the screen's top
+margin (the picture is transparent where nothing is, so the chrome shows
+through), out of the window's clip rect. The scale is `min(areaH / 260,
+roomH / kLiftH, areaW / kMinW)` clamped 2..5, `roomH` being the box's bottom
+edge in screen px, so the lift room FITS ON THE SCREEN and a flask held that
+high is seen, not clipped (below ~850 px of window the clamp to 2 wins and
+the top of an inverted flask can leave the screen): at 1080p that is scale 2
+(was 3), at 1440p 3 (was 4) -- a smaller flask on screen, the price of an
+inverted flask over another being visible at all (at 1080p and scale 3 the
+screen holds 334 grid px, and the pose needs ~380). The hand's goal is
+clamped to the GRID, not the box (`alchemy::HandGoal`, pure: base on the table,
+no glass under the floor, no glass or cork above the top), so nothing a held
+vessel holds can leave through the grid's top -- only through a mouth, and
+what falls is still what falls off the table. While the button is held the
+pointer keeps driving the hand anywhere on screen (ImGui's active item), the
+wheel tilts while dragging, and the tilt runs to `kMaxTilt` (3.3 rad, a little
+past upside down; it was 2.9). The character's carry-follow clamps on the ARM
+side only: the flask's 3D lift follows the bench up to 1.4 flask lengths and
+holds there, about the face, rather than straightening the arm overhead. Cost:
+the grid's per-pixel arrays grow with its height (800 x 800 at most, the
+texture's size; ~500 rows at 1080p); the liquid and sand steps do not scan the
+grid (cells, tiles, the written box), the render does, ~1.5x a 300-row table.
+`--shot-bench` with `SANDVOX_BENCH_INVERT=1` lifts B, swings its mouth over
+A's and turns it upside down (`_invlift`, `_invturn`, `_inverted`,
+`_invpoured`); gate `alchemy-lift`.
+
+**Placing never overlaps** (same day, owner: on a small window a new vial
+spawned inside the other one and the tangled glass blew up). Placing used to
+fall back to the table's right end when no clear spot was found, whether or
+not a vessel stood there. `alchemy::FindPlaceSpot` (pure) finds an upright spot
+clear of every glass and wholly on the table, or REFUSES: the sim thread hands
+the entry back (`AlchemyBench::TakeLateRefusal`, "no room on the table") and
+the vessel is off the table, holding what it held. The table is never narrower
+than `kMinW` (300 px, two full-size vessels and a gap; 280 was measured too narrow), so the bench's two
+vessels always fit whatever the window; the scale rule keeps that width, and a
+window too small even at scale 2 draws the table at 1. The HEALTH COLUMN stays shut while the bench is open (its
+toggle hidden; it reopens after if it was open) and the bench's room is
+measured without it -- opening it used to shrink the bench, and a vessel
+double-clicked with it open got the narrower table. Gate `alchemy-place`.
 
 **What falls off the table falls into the world AS IT FALLS** (2026-09-27, the
 owner's "it needs to happen in real time, not all at once when exiting").

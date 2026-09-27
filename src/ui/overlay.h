@@ -791,6 +791,7 @@ struct UIState {
 
   bool inventoryOpen = false;   // I toggles; main.cpp owns the cursor/capture
   bool inspectMode = false;     // left panel: CHARACTER (gear) vs HEALTH
+  bool inspectResume = false;   // the health column was shut for the alchemy bench; reopen after
   int inspectSelected = -1;     // BodySlot of the limb whose detail is open, -1 = none
   // WHICH TRIAGE GROUPS ARE EXPANDED, one bit per body group (head, torso,
   // left arm, right arm, left leg, right leg — the table lives in the panel,
@@ -1252,7 +1253,12 @@ struct UIState {
     bool open = false;
     uint64_t tex = 0;            // ImTextureID of the bench picture
     int texW = 0, texH = 0;      // the texture's full size
-    int tableW = 0, tableH = 0;  // the table's size, sim pixels (top-left of tex)
+    int tableW = 0, tableH = 0;  // the VISIBLE table (the box), sim pixels
+    // The sim grid's height (top-left gridH rows of tex): the table plus the
+    // HEADROOM a lifted flask goes up into, drawn above the box. >= tableH.
+    int gridH = 0;
+    int liftH = 0;               // the least grid height (AlchemyBench::kLiftH), sim pixels
+    int minW = 0;                // the least table width (AlchemyBench::kMinW), sim pixels
     bool texReady = false;       // copied at least once (safe to sample)
     struct Portion {
       std::string name;
@@ -1285,6 +1291,7 @@ struct UIState {
     // What the panel measured last frame, for sizing the next table: the
     // picture's room in screen pixels and the integer scale it draws at.
     float areaW = 0.0f, areaH = 0.0f;
+    float roomH = 0.0f;          // the picture's bottom edge, px from the screen top
     int scale = 3;
     // ---- input, written by the panel every frame ----
     bool over = false;

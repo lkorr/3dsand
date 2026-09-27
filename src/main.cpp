@@ -383,6 +383,9 @@ const char* g_shotJumpPath = nullptr;  // set for exactly one frame, then taken
 // the stir and the pour and just watches (extra pictures _chem1.._chem3).
 // e.g. SANDVOX_BENCH_A=acid:0.3+sand:0.08 (fumes), =salt:0.1 with BURNER=1 and
 // SHOCK=300 (electrolysis), =water:0.3+sodium:0.01 (it blows up in your hands).
+// SANDVOX_BENCH_INVERT=1: B is lifted high, carried over A and turned fully
+// UPSIDE DOWN with its mouth over A's, into the headroom above the table's
+// box (pictures _invlift, _invturn, _inverted, _invpoured).
 bool g_shotBench = false;
 constexpr uint64_t kShotBenchLast = 425;
 float g_shotJumpVy = 0.0f;             // the vy that picture was taken at, m/s
@@ -4825,7 +4828,8 @@ int main(int argc, char** argv) {
     // g_shotInventory.
     else if (a == "--shot-bench") {
       g_shotBench = true;
-      g_harnessFrames = kShotBenchLast;
+      // SANDVOX_BENCH_INVERT runs a longer script (the lift, the turn, the pour).
+      g_harnessFrames = kShotBenchLast + (std::getenv("SANDVOX_BENCH_INVERT") ? 160 : 0);
     }
     else if (a == "--shot-inventory") {
       g_shotInventory = true;
@@ -6226,6 +6230,8 @@ int main(int argc, char** argv) {
   ui.alchemy.tex = overlay.RegisterTexture(benchView);
   ui.alchemy.texW = (int)kBenchW;
   ui.alchemy.texH = (int)kBenchH;
+  ui.alchemy.liftH = alchemy::AlchemyBench::kLiftH;
+  ui.alchemy.minW = alchemy::AlchemyBench::kMinW;
   // ---- internal render scale (render.renderScale) --------------------------
   // The world's offscreen colour target when the scale is below 1, cached on
   // its size like the depth targets; the blit up to the swapchain and the
@@ -9155,7 +9161,68 @@ int main(int argc, char** argv) {
       // then carry and tip it so its left lip corner hangs over A's mouth.
       static float want = 0.0f, reqd = 0.0f;
       static alchemy::V2 grabAt, start;
-      if (f >= 260 && f < 400 && haveA && haveB && !chemNoPour) {
+      static const bool invert = std::getenv("SANDVOX_BENCH_INVERT") != nullptr;
+      // SANDVOX_BENCH_INVERT: lift B straight up, swing its lip over A's
+      // mouth while tipping it to 75 degrees (before its contents reach the
+      // lip), then turn it on to upside down, the pivot sliding from the
+      // pouring lip corner to the mouth's centre, 30 px over A's mouth -- the
+      // path of gate alchemy-lift. The pointer is the grab point of that
+      // pose; the bench's HandGoal does the rest.
+      static alchemy::Xform b0;
+      if (invert && f >= 260 && f < 560 && haveA && haveB && !chemNoPour) {
+        const alchemy::V2 grabL{0.0f, hb * 0.35f};
+        if (f == 260) {
+          b0 = pb;
+          reqd = 0.0f;
+        }
+        auto ease = [](float t) { t = std::clamp(t, 0.0f, 1.0f); return t * t * (3 - 2 * t); };
+        auto rot = [](alchemy::V2 v, float a) {
+          return alchemy::V2{v.x * std::cos(a) - v.y * std::sin(a), v.x * std::sin(a) + v.y * std::cos(a)};
+        };
+        const float side = pa.pos.x < b0.pos.x ? 1.0f : -1.0f;   // + = CCW, mouth swings left
+        const alchemy::V2 L{-side * 0.30f * wb * 0.5f, hb};        // the pouring lip corner
+        const alchemy::V2 M{pa.pos.x, pa.pos.y + ha + 30.0f};    // ...goes here
+        const float liftY = M.y + 20.0f;                           // B's base, lifted upright
+        const float kSwing = 1.309f, kPi = 3.14159f;
+        const float fl = (float)f;
+        alchemy::Xform p{{b0.pos.x, liftY}, 0.0f};
+        if (fl < 300) {
+          p.pos.y = b0.pos.y + (liftY - b0.pos.y) * ease((fl - 260) / 40);
+        } else {
+          float ang;
+          alchemy::V2 corner;
+          if (fl < 370) {
+            const float e = ease((fl - 300) / 70);
+            ang = kSwing * e;
+            const alchemy::V2 c0{b0.pos.x + L.x, liftY + L.y};
+            corner = {c0.x + (M.x - c0.x) * e, c0.y + (M.y - c0.y) * e};
+          } else {
+            ang = kSwing + (kPi - kSwing) * ease((fl - 370) / 90);
+            corner = M;
+          }
+          const float k = std::clamp((kPi - ang) / (kPi - kSwing), 0.0f, 1.0f);
+          const alchemy::V2 r = rot({L.x * k, L.y}, side * ang);
+          p = {{corner.x - r.x, corner.y - r.y}, side * ang};
+        }
+        const alchemy::V2 g = rot(grabL, p.angle);
+        ui.alchemy.tool = 0;
+        ui.alchemy.over = true;
+        ui.alchemy.pressed = f == 260;
+        ui.alchemy.down = true;
+        ui.alchemy.atX = f == 260 ? b0.pos.x + grabL.x : p.pos.x + g.x;
+        ui.alchemy.atY = f == 260 ? b0.pos.y + grabL.y : p.pos.y + g.y;
+        ui.alchemy.tiltReq = p.angle - reqd;
+        reqd = p.angle;
+      }
+      if (invert && !chemNoPour) {
+        if (f == 299) g_shotJumpPath = "screenshot_bench_invlift.bmp";
+        if (f == 385) g_shotJumpPath = "screenshot_bench_invturn.bmp";
+        if (f == 440) g_shotJumpPath = "screenshot_bench_inverted.bmp";
+        if (f == 555) g_shotJumpPath = "screenshot_bench_invpoured.bmp";
+        if (f == 565) ui.alchemy.wantClose = true;
+        if (f == 580) g_shotJumpPath = "screenshot_bench_closed.bmp";
+      }
+      if (!invert && f >= 260 && f < 400 && haveA && haveB && !chemNoPour) {
         const alchemy::V2 grabL{0.0f, hb * 0.35f};
         if (f == 260) {
           grabAt = {pb.pos.x + grabL.x, pb.pos.y + grabL.y};
@@ -9196,11 +9263,13 @@ int main(int argc, char** argv) {
         ui.alchemy.tiltReq = want - reqd;
         reqd = want;
       }
-      if (f == 289 && !chemNoPour) g_shotJumpPath = "screenshot_bench_lift.bmp";
-      if (f == 300 && !chemNoPour) g_shotJumpPath = "screenshot_bench_pour.bmp";
-      if (f == 398 && !chemNoPour) g_shotJumpPath = "screenshot_bench_poured.bmp";
-      if (f == 405) ui.alchemy.wantClose = true;
-      if (f == 420) g_shotJumpPath = "screenshot_bench_closed.bmp";
+      if (!invert) {
+        if (f == 289 && !chemNoPour) g_shotJumpPath = "screenshot_bench_lift.bmp";
+        if (f == 300 && !chemNoPour) g_shotJumpPath = "screenshot_bench_pour.bmp";
+        if (f == 398 && !chemNoPour) g_shotJumpPath = "screenshot_bench_poured.bmp";
+        if (f == 405) ui.alchemy.wantClose = true;
+        if (f == 420) g_shotJumpPath = "screenshot_bench_closed.bmp";
+      }
     }
     // --shot-inventory's scripted schedule. Frame-counted rather than
     // wall-clocked so the same picture comes out on any machine.
@@ -13020,11 +13089,17 @@ int main(int argc, char** argv) {
           const int sc = std::max(1, ui.alchemy.scale);
           const float aw = ui.alchemy.areaW > 0 ? ui.alchemy.areaW : 1000.0f;
           const float ah = ui.alchemy.areaH > 0 ? ui.alchemy.areaH : 780.0f;
-          bench.Open((int)(aw / sc), (int)(ah / sc), mats, reactions, benchSolutes);
+          // THE GRID RUNS ABOVE THE BOX: up to the top of the screen, and
+          // never less than the lift room (Open enforces kLiftH), so a flask
+          // can be held upside down over the other; the panel draws the part
+          // above its box over its header.
+          const float rh = std::max(ah, ui.alchemy.roomH);
+          bench.Open((int)(aw / sc), (int)(rh / sc), mats, reactions, benchSolutes);
           ui.alchemy.open = true;
           ui.alchemy.texReady = false;
           ui.alchemy.tableW = bench.W();
-          ui.alchemy.tableH = bench.H();
+          ui.alchemy.gridH = bench.H();
+          ui.alchemy.tableH = std::min(bench.H(), (int)(ah / sc));
           ui.alchemy.message.clear();
           ui.alchemy.tool = 0;
         }
@@ -13641,6 +13716,9 @@ int main(int argc, char** argv) {
           in.shock = ui.alchemy.shockReq;
           ui.alchemy.shockReq = false;
           bench.Frame(in, (alchemy::BenchTool)ui.alchemy.tool);
+          // The table had no clear spot for a vessel (FindPlaceSpot): it is
+          // back in the list, and this says why.
+          if (std::string lr = bench.TakeLateRefusal(); !lr.empty()) ui.alchemy.message = lr;
           auto densityOf = [&](const std::string& name) {
             for (size_t k = 1; k < mats.size(); k++)
               if (mats[k].name == name) return mats[k].gpu.density;

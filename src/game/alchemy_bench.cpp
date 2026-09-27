@@ -101,6 +101,51 @@ V2 Rot(V2 v, float a) {
 
 }  // namespace
 
+Xform HandGoal(const VesselShape& shape, V2 at, V2 grabLocal, float angle, int gridW, int gridH,
+               float tableY) {
+  const V2 r = Rot(grabLocal, angle);
+  Xform g{{std::clamp(at.x - r.x, 0.0f, (float)gridW), at.y - r.y}, angle};
+  // The outline's vertical extent at this angle, relative to the pose origin
+  // (the base centre): the profile's corners, both sides, rotated. Plus the
+  // glass, and a cork's height above the mouth (flaskchem.cpp draws it to
+  // local height + 6).
+  float lo = 0.0f, hi = 0.0f;
+  const float hw = shape.width * 0.5f;
+  for (const V2& p : shape.profile)
+    for (float side : {-1.0f, 1.0f}) {
+      const V2 w = Rot({side * p.x * hw, p.y * shape.height}, angle);
+      lo = std::min(lo, w.y);
+      hi = std::max(hi, w.y);
+    }
+  hi = std::max(hi, Rot({0.0f, shape.height + 8.0f}, angle).y);
+  lo = std::min(lo, Rot({0.0f, shape.height + 8.0f}, angle).y);
+  const float m = shape.wall + 1.0f;
+  const float yMin = std::max(tableY, -lo + m);     // base on the table, no glass under the floor
+  const float yMax = (float)gridH - hi - m;         // no glass (or cork) over the top
+  g.pos.y = std::max(yMin, std::min(yMax, g.pos.y));
+  if (yMax < yMin) g.pos.y = yMax;                  // a grid too short: the top wins (never happens at kLiftH)
+  return g;
+}
+
+bool FindPlaceSpot(const FlaskSim& sim, const VesselShape& shape, int tableW, float tableY, Xform& out) {
+  const float half = shape.width * 0.5f + shape.wall + 2;
+  const float W = (float)tableW;
+  if (2 * half > W) return false;
+  for (float frac : {0.66f, 0.33f}) {
+    const float want = std::clamp(W * frac, half, W - half);
+    for (int k = 0; k < 2 * tableW; k++) {
+      const float x = want + (float)((k + 1) / 2) * 3.0f * ((k & 1) ? 1.0f : -1.0f);
+      if (x - half < 0 || x + half > W) continue;
+      const Xform p{{x, tableY}, 0.0f};
+      if (sim.ShapeClear(shape, p)) {
+        out = p;
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 void RegisterBenchEvent(const std::string& kind, BenchEventHandler h) { Registry()[kind] = std::move(h); }
 
 bool DispatchBenchEvent(const BenchEvent& e, BenchOutcome& out) {
@@ -151,8 +196,10 @@ bool AlchemyBench::Open(int w, int h, const std::vector<MaterialDef>& mats,
                         const std::vector<ReactionGpu>& reactions,
                         const std::vector<SoluteDef>& solutes) {
   Abandon();
-  w_ = std::clamp(w, 160, kMaxW);
-  h_ = std::clamp(h, 160, kMaxH);
+  w_ = std::clamp(w, kMinW, kMaxW);
+  // Never shorter than the lift room: a flask can always be held upside down
+  // over another, whatever the panel's box is (it draws the rest above it).
+  h_ = std::clamp(std::max(h, kLiftH), 160, kMaxH);
   mats_ = &mats;
   SimConfig cfg;
   cfg.gridW = w_;
@@ -173,6 +220,8 @@ bool AlchemyBench::Open(int w, int h, const std::vector<MaterialDef>& mats,
   slots_.clear();
   live_.clear();
   removed_.clear();
+  refused_.clear();
+  lateRefusal_.clear();
   cmds_.clear();
   held_ = -1;
   simFocus_ = focus_ = -1;
@@ -412,6 +461,18 @@ void AlchemyBench::Frame(const BenchInput& in, BenchTool tool) {
       entries_[r.entry].stoppered = r.stoppered;
     }
   removed_.clear();
+  for (int e : refused_)
+    if (e >= 0 && e < (int)entries_.size()) {
+      entries_[e].onTable = false;
+      lateRefusal_ = "no room on the table for that - take a vessel off first";
+    }
+  refused_.clear();
+}
+
+std::string AlchemyBench::TakeLateRefusal() {
+  std::string r;
+  r.swap(lateRefusal_);
+  return r;
 }
 
 BenchResult AlchemyBench::Finish(bool abrupt) {
@@ -435,6 +496,9 @@ BenchResult AlchemyBench::Finish(bool abrupt) {
       entries_[rm.entry].stoppered = rm.stoppered;
     }
   removed_.clear();
+  for (int e : refused_)
+    if (e >= 0 && e < (int)entries_.size()) entries_[e].onTable = false;
+  refused_.clear();
   sim_.SetStick(false);
   if (!abrupt) {
     // Whatever is carried stops where it is, and what is in flight lands (a
@@ -531,21 +595,15 @@ void AlchemyBench::Apply(Cmd& c) {
     if (s.sim >= 0) return;
     // Stood upright at the free spot nearest one of the table's two places
     // (a third and two thirds of the way across), the one not taken first.
-    const float half = c.shape.width * 0.5f + c.shape.wall + 2;
-    Xform pose{{(float)w_ - half - 4, kTableY}, 0.0f};
-    bool found = false;
-    for (float frac : {0.66f, 0.33f}) {
-      const float want = std::clamp((float)w_ * frac, half + 2, (float)w_ - half - 2);
-      for (int k = 0; k < 2 * w_ && !found; k++) {
-        const float x = want + (float)((k + 1) / 2) * 3.0f * ((k & 1) ? 1.0f : -1.0f);
-        if (x - half < 0 || x + half > (float)w_) continue;
-        const Xform p{{x, kTableY}, 0.0f};
-        if (sim_.ShapeClear(c.shape, p)) {
-          pose = p;
-          found = true;
-        }
-      }
-      if (found) break;
+    // NO SPOT, NO PLACING: it used to fall back to the table's right end
+    // whether or not a vessel stood there, and on a small window the new
+    // vial spawned inside the other one (owner, 2026-09-27). It goes back to
+    // the kit untouched, with the reason (Frame -> TakeLateRefusal).
+    Xform pose;
+    if (!FindPlaceSpot(sim_, c.shape, w_, kTableY, pose)) {
+      std::lock_guard<std::mutex> lk(mu_);
+      refused_.push_back(c.entry);
+      return;
     }
     // Settled before it is shown (FlaskSim::AddVessel): it arrives at rest,
     // stoppered if it was put away stoppered.
@@ -607,12 +665,13 @@ void AlchemyBench::Tick(const BenchInput& in, bool pressed, float tilt, BenchToo
   }
   if (held_ >= 0) {
     Slot& s = slots_[held_];
-    heldAngle_ = std::clamp(heldAngle_ + tilt, -2.9f, 2.9f);
-    if (in.over) {
-      const V2 r = Rot(grabLocal_, heldAngle_);
-      s.goal.pos = {std::clamp(in.at.x - r.x, 0.0f, (float)w_),
-                    std::clamp(in.at.y - r.y, kTableY, (float)h_)};
-    }
+    // A little past upside down either way: a flask held over another's
+    // mouth can be emptied into it.
+    heldAngle_ = std::clamp(heldAngle_ + tilt, -kMaxTilt, kMaxTilt);
+    // Clamped to the GRID, which runs above the visible table (kLiftH): the
+    // pointer may leave the box while the button is held (`over` stays up
+    // for a drag) and the vessel follows until its glass meets the top.
+    if (in.over) s.goal = HandGoal(sim_.Shape(s.sim), in.at, grabLocal_, heldAngle_, w_, h_, kTableY);
     s.goal.angle = heldAngle_;
   }
 

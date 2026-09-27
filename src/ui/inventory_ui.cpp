@@ -2214,21 +2214,36 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     }
     dl->AddRectFilled(ImVec2(p0.x, p1.y - 4 * sc), ImVec2(p1.x, p1.y), IM_COL32(58, 44, 34, 255));
     dl->AddRectFilled(ImVec2(p0.x, p1.y - 4 * sc), ImVec2(p1.x, p1.y - 3 * sc), IM_COL32(92, 70, 50, 255));
-    if (A.texReady && A.tex)
-      dl->AddImage((ImTextureID)A.tex, p0, p1, ImVec2(0, 0),
-                   ImVec2((float)A.tableW / A.texW, (float)A.tableH / A.texH));
     dl->AddRect(ImVec2(p0.x - 1, p0.y - 1), ImVec2(p1.x + 1, p1.y + 1), ui::ColBronze());
+    // THE PICTURE IS TALLER THAN THE BOX: the sim grid has HEADROOM above the
+    // table (AlchemyBench::kLiftH), and a flask lifted into it is drawn there
+    // -- over the panel's header and up to the top of the screen, out of the
+    // window's own clip rect. Nothing but vessels, liquid and gas is opaque
+    // in the picture, so above the box the chrome shows through. Drawn after
+    // the box's rule so a flask held over the edge is in front of it.
+    const int gh = std::max(A.tableH, A.gridH);
+    if (A.texReady && A.tex) {
+      const ImVec2 g0(p0.x, p1.y - (float)(gh * sc));
+      dl->PushClipRect(ImVec2(p0.x, 0.0f), p1, false);
+      dl->AddImage((ImTextureID)A.tex, g0, p1, ImVec2(0, 0),
+                   ImVec2((float)A.tableW / A.texW, (float)gh / A.texH));
+      dl->PopClipRect();
+    }
 
     ImGui::SetCursorScreenPos(p0);
     ImGui::InvisibleButton("##benchimg", ImVec2(iw, ih));
     const bool hov = ImGui::IsItemHovered(), act = ImGui::IsItemActive();
     const ImVec2 m = ImGui::GetIO().MousePos;
+    // While the button is held the pointer keeps driving the hand wherever it
+    // goes -- above the box, over the header, off the panel -- in grid
+    // pixels from the table's bottom edge (the bench clamps the vessel to the
+    // grid, not to the box).
     A.over = hov || act;
     A.atX = (m.x - p0.x) / sc;
-    A.atY = (float)A.tableH - (m.y - p0.y) / sc;
+    A.atY = (p1.y - m.y) / sc;
     A.down = act && ImGui::IsMouseDown(ImGuiMouseButton_Left);
     A.pressed = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
-    if (hov) A.tiltReq += ImGui::GetIO().MouseWheel * 0.10f;
+    if (hov || act) A.tiltReq += ImGui::GetIO().MouseWheel * 0.10f;
     const float dt = ImGui::GetIO().DeltaTime;
     if (ImGui::IsKeyDown(ImGuiKey_Q)) A.tiltReq += 1.4f * dt;
     if (ImGui::IsKeyDown(ImGuiKey_E)) A.tiltReq -= 1.4f * dt;
@@ -3087,6 +3102,18 @@ void DrawInventoryScreen(UIState& s) {
     s.triageOpen = 0xFFFFFFFFu;
   }
 
+  // THE BENCH KEEPS ITS ROOM: the health column stays shut while a vessel is
+  // on the alchemy bench (owner, 2026-09-27: opening it shrank the bench).
+  // Shut here, its toggle hidden below, and opened again when the bench is
+  // done if it was open when the bench came up.
+  if (s.alchemy.open && s.inspectMode) {
+    s.inspectMode = false;
+    s.inspectResume = true;
+  } else if (!s.alchemy.open && s.inspectResume) {
+    s.inspectResume = false;
+    s.inspectMode = true;
+  }
+
   // ---- layout ---------------------------------------------------------------
   const float kPortraitW =
       s.portraitW > 0 ? (float)s.portraitW : kPortraitWFallback;
@@ -3208,13 +3235,31 @@ void DrawInventoryScreen(UIState& s) {
   const bool packShown = !s.spellbookOpen && !bench;
   // The bench's room, measured whether or not it is open: the table is sized
   // from it at the moment a vessel first goes on, which is before the bench
-  // panel has ever been drawn. Must match AlchemyPanel's own layout.
+  // panel has ever been drawn. Must match AlchemyPanel's own layout. Measured
+  // WITHOUT the health column, which the bench shuts (above): a vessel
+  // double-clicked while the column was open used to get a table sized to
+  // the narrower room.
   {
-    const float panelW = std::max(360.0f, disp.x - 28.0f - bookX);
+    const float benchX = leftX + leftBase + kColGap;
+    const float panelW = std::max(360.0f, disp.x - 28.0f - benchX);
     const float panelH = bottom - top;
     s.alchemy.areaW = std::max(0.0f, panelW - 2 * (kFrame + kPad) - kBenchColW - kColGap);
     s.alchemy.areaH = std::max(0.0f, panelH - (kFrame + ui::kHeaderH + 14) - (kFrame + kPad));
-    s.alchemy.scale = std::clamp((int)(s.alchemy.areaH / 260.0f), 2, 5);
+    // The picture's bottom edge, from the top of the screen: all the room a
+    // lifted flask has, since the panel draws the sim's headroom ABOVE its
+    // box (over the header and up to the screen's edge).
+    s.alchemy.roomH = bottom - (kFrame + kPad);
+    // The scale: a flask about half the table (areaH / 260) -- but no larger
+    // than lets the LIFT ROOM (AlchemyBench::kLiftH, a flask upside down
+    // over another) fit on the screen, so a flask held that high is seen,
+    // not clipped by the screen's top.
+    // And no larger than leaves the table its least width (AlchemyBench::
+    // kMinW, two vessels side by side): a table widened past the room it was
+    // measured for is drawn a scale smaller than planned.
+    int sc = (int)(s.alchemy.areaH / 260.0f);
+    if (s.alchemy.liftH > 0) sc = std::min(sc, (int)(s.alchemy.roomH / (float)s.alchemy.liftH));
+    if (s.alchemy.minW > 0) sc = std::min(sc, (int)(s.alchemy.areaW / (float)s.alchemy.minW));
+    s.alchemy.scale = std::clamp(sc, 2, 5);
   }
   const float bookH =
       s.spellbookOpen
@@ -3264,7 +3309,8 @@ void DrawInventoryScreen(UIState& s) {
     // The toggle sits on the header bar, right-aligned. It ADDS the health
     // column and the portrait's callouts; it no longer swaps the panel for a
     // different page, so the gear never leaves the screen (see VitalsColumn).
-    {
+    // Not while the alchemy bench is up: it would take the bench's room.
+    if (!s.alchemy.open) {
       const char* label = "health";
       const ImVec2 ts = ImGui::CalcTextSize(label);
       const float bw = std::max(96.0f, ts.x + 24);

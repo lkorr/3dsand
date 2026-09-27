@@ -534,7 +534,12 @@ static void PoseBenchHands(PlayerSession& s, PlayerAvatar& avatar) {
       }
     }
     const float dx = pv.cx - bc.bx, dy = pv.cy - bc.by;
-    goal = bc.c0 + left * (dx * bc.sx) + Vec3{0, dy * bc.sy, 0};
+    // The bench's headroom (AlchemyBench::kLiftH) lets a flask go ~1.3 of
+    // its lengths above where it stood, and a tall screen's grid further:
+    // the arm follows up to 1.4 flask lengths and holds there (about the
+    // face), rather than straightening overhead. The bench is not clamped.
+    const float up = std::min(dy * bc.sy, 1.4f * std::max(len, 0.0f));
+    goal = bc.c0 + left * (dx * bc.sx) + Vec3{0, up, 0};
     // ...and in depth, toward the other flask as it is approached, so the
     // two meet rather than pass one in front of the other.
     if (bc.other) {

@@ -410,6 +410,243 @@ Status GateAlchemySandCarry(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// A FLASK HELD UPSIDE DOWN OVER ANOTHER POURS INTO IT (owner, 2026-09-27: "it's
+// impossible to lift it above the other flask and rotate upside down"). The
+// bench's grid is never shorter than AlchemyBench::kLiftH, whatever its box;
+// this runs at EXACTLY that height, the tightest a player ever gets. Two
+// full-size flasks (1024 eighths); the right one holds water. The hand
+// (alchemy::HandGoal, the bench's own clamp) grabs it by the belly, lifts it,
+// swings its lip over the other's mouth tipped to 75 degrees (before the
+// water reaches the lip) and turns it on to upside down (pi), the pivot
+// sliding from the pouring corner to the mouth's centre, 30 px over the
+// other's. Asserted: it gets there (angle ~pi, its glass under the grid's top
+// all the way), no particle ever goes above the grid (nothing leaves through
+// the top), most of the water arrives (alchemy.liftMinFrac), the splash off
+// the rim is bounded (alchemy.liftMaxSpillFrac -- a pour splashes
+// chaotically, as alchemy-pour's does: a loose cap, not a tuning target) and
+// the tally plus the drained spill is exact. Then the
+// pointer is dragged far above the grid (off the panel): the flask stops at
+// the top, its glass still inside. SANDVOX_LIFT_SHOTS=1 writes a picture every
+// 10 frames (alchemy_lift_NNN.bmp) to see where a splash comes from.
+Status GateAlchemyLift(Ctx& c, std::string& detail) {
+  using alchemy::AlchemyBench;
+  const int water = MatId(c, "water");
+  if (water < 0) { detail = "no water"; return Status::Fail; }
+  Composition in;
+  in.Add((uint16_t)water, 400);
+  auto subs = alchemy::SubstancesFor(c.mats, {&in});
+  alchemy::SimConfig cfg = BenchConfig();
+  cfg.gridH = AlchemyBench::kLiftH;
+  cfg.tableY = AlchemyBench::kTableY;
+  FlaskSim s(cfg);
+  s.SetSubstances(subs);
+  const alchemy::VesselShape shape = BenchFlask(1024);
+  const float ty = AlchemyBench::kTableY;
+  const int T = s.AddVessel(shape, {{150, ty}, 0}, Composition{});
+  const int S = s.AddVessel(shape, {{330, ty}, 0}, in);
+  const float h = shape.height;
+  const V2 grabL{0.0f, h * 0.35f};
+  auto rot = [](V2 v, float a) { return V2{v.x * std::cos(a) - v.y * std::sin(a), v.x * std::sin(a) + v.y * std::cos(a)}; };
+  auto ease = [](float t) { t = std::clamp(t, 0.0f, 1.0f); return t * t * (3 - 2 * t); };
+  // The pour pivots on the LEFT LIP CORNER (the lowest one while it turns
+  // CCW), 30 px over the middle of the other's mouth. Pivoted on the mouth's
+  // centre, the stream left the lower corner and splashed on the rim.
+  const float lipHalf = shape.profile.back().x * shape.width * 0.5f;
+  const V2 L{-lipHalf, h};                   // the corner, vessel frame
+  const V2 M{150, ty + h + 30.0f};           // ...goes here
+  const float liftY = M.y + 20.0f;           // S's base, lifted upright
+  Composition drained;
+  auto drain = [&]() {
+    const Composition d = s.DrainSpilled();
+    for (int i = 0; i < d.n; i++) drained.Add(d.p[i].mat, d.p[i].eighths);
+  };
+  float topGlass = 0, topLiquid = 0, maxAngle = 0;
+  auto watch = [&]() {
+    for (const V2& p : s.VesselOutline(S)) topGlass = std::max(topGlass, p.y);
+    for (const V2& p : s.Positions()) topLiquid = std::max(topLiquid, p.y);
+    maxAngle = std::max(maxAngle, s.VesselXform(S).angle);
+  };
+  // The hand: the pointer is the grab point of the pose wanted; HandGoal is
+  // what the bench makes of it.
+  auto hand = [&](const Xform& want) {
+    const V2 g = rot(grabL, want.angle);
+    const V2 at{want.pos.x + g.x, want.pos.y + g.y};
+    s.SetVesselXform(S, alchemy::HandGoal(shape, at, grabL, want.angle, cfg.gridW, cfg.gridH, ty));
+  };
+  // Lift (0.67 s); swing the mouth over the other's while tipping it to 75
+  // degrees, before the water reaches the lip (1.2 s); then turn on to
+  // upside down about the mouth (1.5 s). The glass stays clear of the other
+  // flask all the way (at 75 degrees the bulb is beside the other's neck).
+  const float kSwing = 1.309f;
+  // What has LEFT THE TABLE so far (drained); in-flight water is not a spill.
+  auto spillNow = [&]() { return drained.Total(); };
+  uint32_t spillSwing = 0, spillTurn = 0;
+  int f = 0;
+  for (; f < 200; f++) {
+    Xform p{{330, liftY}, 0.0f};
+    if (f < 40) {
+      p.pos.y = ty + (liftY - ty) * ease(f / 40.0f);
+    } else {
+      float ang;
+      V2 corner;
+      if (f < 110) {
+        const float e = ease((f - 40) / 70.0f);
+        ang = kSwing * e;
+        const V2 c0{330 + L.x, liftY + L.y};
+        corner = {c0.x + (M.x - c0.x) * e, c0.y + (M.y - c0.y) * e};
+      } else {
+        ang = kSwing + (3.14159f - kSwing) * ease((f - 110) / 90.0f);
+        corner = M;
+      }
+      // The pivot slides from the corner to the mouth's centre as it comes
+      // upside down (both corners are level then, and a corner over the
+      // middle would leave half the mouth off the other's).
+      const float k = std::clamp((3.14159f - ang) / (3.14159f - kSwing), 0.0f, 1.0f);
+      const V2 r = rot({L.x * k, L.y}, ang);
+      p = {{corner.x - r.x, corner.y - r.y}, ang};
+    }
+    hand(p);
+    s.Step(4);
+    drain();
+    watch();
+    if (f == 109) spillSwing = spillNow();
+    if (f == 150) Shot(s, "alchemy_lift_turn.bmp");
+    if (std::getenv("SANDVOX_LIFT_SHOTS") && (f % 10) == 0) Shot(s, Format("alchemy_lift_%03d.bmp", f).c_str());
+  }
+  spillTurn = spillNow() - spillSwing;
+  // Held upside down until it has run out (or 10 s).
+  const V2 rpi = rot({0.0f, h}, 3.14159f);
+  const Xform inverted{{M.x - rpi.x, M.y - rpi.y}, 3.14159f};
+  for (int hold = 0; hold < 600; hold++, f++) {
+    hand(inverted);
+    if (std::getenv("SANDVOX_LIFT_SHOTS") && (f % 10) == 0 && hold < 120) Shot(s, Format("alchemy_lift_%03d.bmp", f).c_str());
+    s.Step(4);
+    drain();
+    watch();
+    if (hold > 150 && (hold % 30) == 0 && s.MovingCount(0.3f) == 0) break;
+  }
+  Shot(s, "alchemy_lift.bmp");
+  const alchemy::Tally t = s.Count();
+  const uint32_t arrived = t.vessel[T].AmountOf((uint16_t)water);
+  const uint32_t left = t.vessel[S].AmountOf((uint16_t)water);
+  const uint32_t spilled = t.spilled.AmountOf((uint16_t)water) + drained.AmountOf((uint16_t)water);
+  alchemy::Tally all = t;
+  for (int i = 0; i < drained.n; i++) all.spilled.Add(drained.p[i].mat, drained.p[i].eighths);
+  std::string why;
+  const bool cons = Conserved(in, all, why);
+  // The drag off the panel: the pointer far above the grid, still inverted.
+  float dragTop = 0;
+  for (int k = 0; k < 90; k++) {
+    s.SetVesselXform(S, alchemy::HandGoal(shape, {M.x, (float)cfg.gridH + 2000.0f}, grabL, 3.14159f, cfg.gridW,
+                                          cfg.gridH, ty));
+    s.Step(4);
+    drain();
+    watch();
+  }
+  for (const V2& p : s.VesselOutline(S)) dragTop = std::max(dragTop, p.y);
+  const float gridTop = (float)cfg.gridH;
+  const double minFrac = BaselineNumber("alchemy.liftMinFrac", 0.8);
+  const double maxSpill = BaselineNumber("alchemy.liftMaxSpillFrac", 0.15);
+  const bool turned = maxAngle >= 3.1f;
+  const bool inside = topGlass + shape.wall <= gridTop && dragTop + shape.wall <= gridTop && topLiquid <= gridTop;
+  const bool poured = arrived >= minFrac * 400;
+  const bool tidy = spilled <= maxSpill * 400;
+  RecordObserved("alchemy.liftArrived", (double)arrived);
+  detail = Format("grid %d px tall: turned to %.2f rad; glass top %.1f (dragged off the panel: %.1f), liquid top %.1f; "
+                  "water 400 -> %u in the lower flask, %u left in the inverted one, %u spilled; %s",
+                  cfg.gridH, maxAngle, topGlass, dragTop, topLiquid, arrived, left, spilled,
+                  cons ? "conserved" : why.c_str());
+  detail += Format(" (off the table while swinging %u, while turning %u)", spillSwing, spillTurn);
+  const bool ok = turned && inside && poured && tidy && cons;
+  std::printf("alchemy-lift: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// A VESSEL COMING ONTO THE TABLE NEVER LANDS ON ANOTHER (owner, 2026-09-27: on
+// a small window a new vial spawned inside the other one, the glasses tangled
+// and it blew up). alchemy::FindPlaceSpot, the bench's own placing, over a
+// range of table widths from far too narrow to roomy, for three pairs (two
+// full flasks, a flask and a vial, a pouch and a flask), and then the first
+// taken off and a vial put on in its place. Asserted, every time: a vessel is
+// either REFUSED or stands wholly on the table with its glass clear of every
+// other (PoseClear), and every vessel holds exactly what it came with and
+// nothing is outside them; and at the bench's narrowest table
+// (AlchemyBench::kMinW) and up, both of every pair fit.
+Status GateAlchemyPlace(Ctx& c, std::string& detail) {
+  using alchemy::AlchemyBench;
+  const int water = MatId(c, "water"), sand = MatId(c, "sand");
+  if (water < 0 || sand < 0) { detail = "missing water/sand"; return Status::Fail; }
+  Composition in;
+  in.Add((uint16_t)water, 150);
+  in.Add((uint16_t)sand, 30);
+  auto subs = alchemy::SubstancesFor(c.mats, {&in});
+  const alchemy::VesselShape flask = BenchFlask(1024), vial = BenchFlask(256),
+                             pouch = alchemy::ShapeWithArea(alchemy::PouchShape(100, 110), 1024 * 12);
+  struct Pair { const char* name; const alchemy::VesselShape* a; const alchemy::VesselShape* b; };
+  const Pair pairs[] = {{"flask+flask", &flask, &flask}, {"flask+vial", &flask, &vial}, {"pouch+flask", &pouch, &flask}};
+  const float ty = AlchemyBench::kTableY;
+  int placed = 0, refused = 0, bad = 0;
+  std::string notes;
+  for (int w : {160, 200, 240, 264, 280, AlchemyBench::kMinW, 320, 400, 560}) {
+    for (const Pair& pr : pairs) {
+      alchemy::SimConfig cfg = BenchConfig();
+      cfg.gridW = w;
+      cfg.gridH = AlchemyBench::kLiftH;
+      FlaskSim s(cfg);
+      s.SetSubstances(subs);
+      std::vector<int> vs;
+      auto put = [&](const alchemy::VesselShape& sh) {
+        Xform p;
+        if (!alchemy::FindPlaceSpot(s, sh, w, ty, p)) {
+          refused++;
+          return false;
+        }
+        vs.push_back(s.AddVessel(sh, p, in));
+        placed++;
+        return true;
+      };
+      auto check = [&](const char* when) {
+        const alchemy::Tally t = s.Count();
+        for (int v : vs) {
+          if (!s.VesselAlive(v)) continue;
+          const Xform x = s.VesselXform(v);
+          const float half = s.Shape(v).width * 0.5f + s.Shape(v).wall;
+          const bool clear = s.PoseClear(v, x);
+          const bool onTable = x.pos.x - half >= 0 && x.pos.x + half <= (float)w;
+          const bool holds = t.vessel[v].SameAs(in);
+          if (!clear || !onTable || !holds) {
+            bad++;
+            notes += Format(" [w %d %s %s: vessel %d at %.0f%s%s%s]", w, pr.name, when, v, x.pos.x,
+                            clear ? "" : " OVERLAPS", onTable ? "" : " OFF THE TABLE", holds ? "" : " contents changed");
+          }
+        }
+        if (t.spilled.Total()) {
+          bad++;
+          notes += Format(" [w %d %s %s: %u eighths outside]", w, pr.name, when, t.spilled.Total());
+        }
+      };
+      const bool a = put(*pr.a), b = put(*pr.b);
+      check("placed");
+      if (w >= AlchemyBench::kMinW && !(a && b)) {
+        bad++;
+        notes += Format(" [w %d %s: refused on a table the bench uses]", w, pr.name);
+      }
+      // The first taken off, a vial put on where there is room.
+      if (a && !vs.empty()) {
+        s.RemoveVessel(vs.front());
+        vs.erase(vs.begin());
+        put(vial);
+        check("swapped");
+      }
+      for (int k = 0; k < 20; k++) s.Step(4);
+      check("after a moment");
+    }
+  }
+  detail = Format("%d vessels placed, %d refused (no clear spot), %d violations%s", placed, refused, bad, notes.c_str());
+  const bool ok = bad == 0;
+  std::printf("alchemy-place: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
 
 // ---- BENCH CHEMISTRY (docs/PLAN_alchemy_chemistry.md package C) -------------
 //
@@ -1199,6 +1436,8 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-shake", "player", {}, false, GateAlchemyShake},
       {"alchemy-spawn", "player", {}, false, GateAlchemySpawn},
       {"alchemy-sand-carry", "player", {}, false, GateAlchemySandCarry},
+      {"alchemy-lift", "player", {}, false, GateAlchemyLift},
+      {"alchemy-place", "player", {}, false, GateAlchemyPlace},
       // Bench chemistry (package C): the world's rules on the bench.
       {"alchemy-react", "player", {}, false, GateAlchemyReact},
       {"alchemy-keeps", "player", {}, false, GateAlchemyKeeps},

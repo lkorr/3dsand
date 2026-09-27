@@ -154,6 +154,26 @@ inline int64_t LedgerEighths(int64_t units, int upe) {
   return x >= 0 ? x / upe : -((-x + upe - 1) / upe);
 }
 
+// WHERE THE HAND PUTS A VESSEL: the pose that has the grab point `grabLocal`
+// (vessel frame) under the pointer `at` at `angle`, clamped to the SIM GRID
+// (not the visible table): the base no lower than the table top, no glass
+// below the grid floor or above its top (with room for a cork), the base
+// centre inside the table's width. Liquid in a vessel the hand holds can
+// therefore never leave through the top of the grid -- only through a mouth.
+// Pure, so the gate drives exactly what the hand does.
+Xform HandGoal(const VesselShape& shape, V2 at, V2 grabLocal, float angle, int gridW, int gridH,
+               float tableY);
+
+// WHERE A VESSEL COMING ONTO THE TABLE STANDS: upright on the table top, the
+// clear spot nearest one of the table's two places (two thirds, then a third
+// of the way across), wholly inside the table's width and with its glass
+// clear of every vessel already on it (FlaskSim::ShapeClear). FALSE when
+// there is no such spot -- the vessel is then REFUSED, never put on top of
+// another (owner, 2026-09-27: a new vial spawned inside the other one on a
+// small window, and the two glasses tangled and blew up). Pure: the gate
+// `alchemy-place` runs exactly this.
+bool FindPlaceSpot(const FlaskSim& sim, const VesselShape& shape, int tableW, float tableY, Xform& out);
+
 class AlchemyBench {
  public:
   // One eighth of a cell is this many pixels of area on the bench, so a
@@ -162,11 +182,33 @@ class AlchemyBench {
   static constexpr int kUnitsPerEighth = 12;
   static constexpr int kUnitsPerParticle = 6;
   // The largest table (the picture's texture is this size; a table uses the
-  // top-left W x H of it).
+  // top-left W x H of it). H is the SIM GRID's height, headroom included.
   static constexpr int kMaxW = 800;
-  static constexpr int kMaxH = 480;
+  static constexpr int kMaxH = 800;
+  // The narrowest table: two of the largest vessels (a full flask is ~126 px
+  // wide, a full pouch a little wider; FindPlaceSpot keeps each wholly on
+  // the table with its glass 4 px from the other's, and stands the first at
+  // two thirds of the way across, so 280 was measured too narrow for a
+  // second full flask) side by side, so the two
+  // vessels the bench takes always fit whatever the window (gate
+  // `alchemy-place` asserts it at this width). The panel picks its scale so
+  // the table is at least this wide; a window too small for even that draws
+  // it at a smaller scale, it never gets a table they overlap on.
+  static constexpr int kMinW = 300;
   // The table top: vessels stand with their base this high.
   static constexpr float kTableY = 4.0f;
+  // THE LIFT ROOM: the sim grid is never shorter than this, whatever the
+  // visible table is (the panel draws the rest ABOVE its box). Room for the
+  // largest flask (1024 eighths: ~126 x 172 px) held UPSIDE DOWN with its
+  // mouth 30 px over the mouth of another standing on the table:
+  // 4 + 172 + 30 + 172 = 378 to its base, plus glass and a margin for the
+  // hand. Kept as low as that allows, because the panel sizes its scale so
+  // this much fits on the screen (at 1600 x 900: 411 px at scale 2). Gate
+  // `alchemy-lift` pours at exactly this height, so a shape that outgrows it
+  // fails there, not in the hand.
+  static constexpr int kLiftH = 400;
+  // How far the hand turns a vessel either way: a little past upside down.
+  static constexpr float kMaxTilt = 3.3f;
   // Vessels on the table at once: the character's two hands.
   static constexpr int kMaxOnTable = 2;
 
@@ -188,6 +230,10 @@ class AlchemyBench {
   bool Place(KitRef ref, const ItemDef& def, const ItemInstance& inst);
   // Why the last Place said no, for the panel ("" = no reason to show).
   const std::string& Refusal() const { return refusal_; }
+  // A Place the table itself refused after Place said yes (the sim found no
+  // clear spot for it: FindPlaceSpot). Once; "" when none. The vessel is off
+  // the table again, holding what it held.
+  std::string TakeLateRefusal();
   void Remove(KitRef ref);
   bool OnTable(KitRef ref) const;
   bool Uses(KitRef ref) const;
@@ -280,6 +326,8 @@ class AlchemyBench {
   int heldPub_ = -1;                                   // entry in the hand
   struct Removed { int entry; Composition c; bool stoppered; };
   std::vector<Removed> removed_;                       // what left with each vessel taken off
+  std::vector<int> refused_;                           // entries the table had no spot for
+  std::string lateRefusal_;                            // frame thread (Frame fills it)
   std::vector<BenchEvent> events_;                     // not yet taken
   std::vector<uint8_t> brokenPub_;                     // per entry: burst
   int focus_ = -1;                                     // entry
