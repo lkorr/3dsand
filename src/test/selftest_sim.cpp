@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
@@ -33,6 +34,238 @@ using namespace sandvox;
 namespace selftest {
 namespace {
 
+// ---- determinism: DIVERGENCE ATTRIBUTION (SANDVOX_DET_PROBE=<t>[,<t>...]) --
+// CLAUDE.md rule 6: "first divergence at tick 85" is a bare number. At each
+// probe tick both runs capture the per-slot voxel digests, the whole solute
+// meta record, every solute-carrying slot's cells and the voxel words of those
+// slots and their 26-rings (plus any slot named in SANDVOX_DET_SLOTS), and run
+// 2 prints WHICH slot differs and in WHICH field: voxel material / state /
+// stain / stamp+excite, solute cell value, solute meta word. Off by default:
+// it is a set of blocking readbacks at the probe ticks only.
+struct DetProbe {
+  std::vector<uint32_t> chunkHash, solMeta, solTable;
+  std::map<uint32_t, std::vector<uint16_t>> solCells;  // slot -> 4096 values
+  std::map<uint32_t, std::vector<uint32_t>> vox;       // slot -> 4096 words
+  uint32_t gas[kGasSpHdr] = {};
+};
+
+static std::vector<uint32_t> DetProbeTicks(const char* env) {
+  std::vector<uint32_t> v;
+  const char* s = std::getenv(env);
+  while (s && *s) {
+    char* end = nullptr;
+    const unsigned long t = std::strtoul(s, &end, 10);
+    if (end == s) break;
+    v.push_back((uint32_t)t);
+    s = (*end == ',') ? end + 1 : end;
+  }
+  return v;
+}
+
+static void DetProbeCapture(GpuContext& ctx, World& world, DetProbe& p) {
+  auto rb = [&](const rhi::Buffer& b, uint64_t off, void* dst, size_t n,
+                const char* label) {
+    rhi::ReadbackBlocking(ctx.device, ctx.queue, b, off, dst, n, label);
+  };
+  p.chunkHash.assign(kChunkHashWords, 0u);
+  rb(world.chunkHash, 0, p.chunkHash.data(), kChunkHashBytes, "detChunkHash");
+  p.solMeta.assign(kSolMetaWords, 0u);
+  rb(world.solMeta, 0, p.solMeta.data(), (size_t)kSolMetaWords * 4, "detSolMeta");
+  p.solTable.assign(kNumSlots, 0u);
+  rb(world.solTable, 0, p.solTable.data(), (size_t)kNumSlots * 4, "detSolTable");
+  std::vector<uint32_t> page(kSolWordsPerPage);
+  std::vector<uint32_t> want;
+  for (uint32_t s = 0; s < kNumSlots; s++) {
+    const uint32_t e = p.solTable[s];
+    if (e == 0u) continue;
+    std::vector<uint16_t>& cells = p.solCells[s];
+    cells.assign(kChunkVol, 0);
+    if (e & kSolPageBit) {
+      rb(world.solPool, (uint64_t)(e & kSolPageMask) * kSolWordsPerPage * 4,
+         page.data(), (size_t)kSolWordsPerPage * 4, "detSolPage");
+      for (uint32_t i = 0; i < kChunkVol; i++)
+        cells[i] = (uint16_t)((page[i >> 1] >> ((i & 1u) * 16u)) & 0xFFFFu);
+    } else {
+      for (uint32_t i = 0; i < kChunkVol; i++) cells[i] = (uint16_t)(e & 0xFFFFu);
+    }
+    const IVec3 wc = world.SlotToWorldChunk(s);
+    for (int dz = -1; dz <= 1; dz++)
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+          const IVec3 n{wc.x + dx, wc.y + dy, wc.z + dz};
+          if (world.ChunkInWindow(n)) want.push_back(World::SlotChunkIndex(n));
+        }
+  }
+  for (uint32_t s : DetProbeTicks("SANDVOX_DET_SLOTS"))
+    if (s < kNumSlots) want.push_back(s);
+  std::sort(want.begin(), want.end());
+  want.erase(std::unique(want.begin(), want.end()), want.end());
+  if (want.size() > 1024) want.resize(1024);
+  for (uint32_t s : want) {
+    std::vector<uint32_t>& w = p.vox[s];
+    w.assign(kChunkVol, 0u);
+    ReadVoxelsSync(ctx, world, s, 1, w.data(), "detVox");
+  }
+  ReadGasStatsSync(ctx, world, p.gas);
+}
+
+static void DetProbeCompare(World& world, uint32_t tick, const DetProbe& a,
+                            const DetProbe& b) {
+  auto wcs = [&](uint32_t s) {
+    const IVec3 c = world.SlotToWorldChunk(s);
+    return Format("slot %u (%d,%d,%d)", s, c.x, c.y, c.z);
+  };
+  std::printf("det-probe tick %u:\n", tick);
+  // Voxel digests (sim_occupancy's per-slot chunkHash: material+state+stain).
+  uint32_t nVox = 0;
+  for (uint32_t s = 0; s < kNumSlots; s++) {
+    if (a.chunkHash[s] == b.chunkHash[s]) continue;
+    if (nVox++ < 16)
+      std::printf("  voxel digest differs: %s  %08x vs %08x\n", wcs(s).c_str(),
+                  a.chunkHash[s], b.chunkHash[s]);
+  }
+  std::printf("  voxel digests: %u slots differ (table tick %u vs %u)\n", nVox,
+              a.chunkHash[kNumSlots], b.chunkHash[kNumSlots]);
+  // Solute meta header: the counters and the free depth.
+  for (uint32_t w = 0; w < kSolMetaHdrWords; w++)
+    if (a.solMeta[w] != b.solMeta[w])
+      std::printf("  solMeta hdr[%u]: %u vs %u\n", w, a.solMeta[w], b.solMeta[w]);
+  struct Region { const char* name; uint32_t base, n; };
+  const Region regs[] = {{"wantFlag", kSolMWantFlag, kNumSlots},
+                         {"reqFlag", kSolMReqFlag, kNumSlots},
+                         {"stall", kSolMStall, kNumSlots},
+                         {"agg", kSolMAgg, kNumSlots}};
+  for (const Region& r : regs) {
+    uint32_t n = 0;
+    for (uint32_t i = 0; i < r.n; i++) {
+      if (a.solMeta[r.base + i] == b.solMeta[r.base + i]) continue;
+      if (n++ < 8)
+        std::printf("  solMeta %s: %s  %08x vs %08x\n", r.name, wcs(i).c_str(),
+                    a.solMeta[r.base + i], b.solMeta[r.base + i]);
+    }
+    if (n) std::printf("  solMeta %s: %u slots differ\n", r.name, n);
+  }
+  // Solute cells, by CONTENT (the page index is an address, not state).
+  std::vector<uint32_t> slots;
+  for (auto& kv : a.solCells) slots.push_back(kv.first);
+  for (auto& kv : b.solCells) slots.push_back(kv.first);
+  std::sort(slots.begin(), slots.end());
+  slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+  static const std::vector<uint16_t> kNone(kChunkVol, 0);
+  uint32_t solDiffSlots = 0;
+  for (uint32_t s : slots) {
+    auto ia = a.solCells.find(s), ib = b.solCells.find(s);
+    const std::vector<uint16_t>& ca = ia != a.solCells.end() ? ia->second : kNone;
+    const std::vector<uint16_t>& cb = ib != b.solCells.end() ? ib->second : kNone;
+    uint32_t n = 0, first = 0;
+    for (uint32_t i = 0; i < kChunkVol; i++)
+      if (ca[i] != cb[i]) { if (!n) first = i; n++; }
+    const bool kindDiff = ((a.solTable[s] & kSolPageBit) != 0) !=
+                          ((b.solTable[s] & kSolPageBit) != 0);
+    if (!n && !kindDiff) continue;
+    if (solDiffSlots++ < 16)
+      std::printf("  solute differs: %s  %u cells (first local %u: %04x vs %04x)"
+                  " entry %08x vs %08x\n",
+                  wcs(s).c_str(), n, first, ca[first], cb[first], a.solTable[s],
+                  b.solTable[s]);
+  }
+  std::printf("  solute: %u slots differ (%zu vs %zu carrying)\n", solDiffSlots,
+              a.solCells.size(), b.solCells.size());
+  // Voxel words, by field, where both runs captured the slot.
+  uint32_t vShown = 0;
+  for (auto& kv : a.vox) {
+    auto ib = b.vox.find(kv.first);
+    if (ib == b.vox.end()) continue;
+    uint32_t nm = 0, ns = 0, nst = 0, nstamp = 0, first = 0xFFFFFFFFu;
+    for (uint32_t i = 0; i < kChunkVol; i++) {
+      const uint32_t x = kv.second[i], y = ib->second[i];
+      if (x == y) continue;
+      if (first == 0xFFFFFFFFu) first = i;
+      if ((x & 0xFFFu) != (y & 0xFFFu)) nm++;
+      if (((x >> 12) & 0xFu) != ((y >> 12) & 0xFu)) ns++;
+      if ((x & 0x7F000000u) != (y & 0x7F000000u)) nst++;
+      if ((x & 0x00FF0000u) != (y & 0x00FF0000u)) nstamp++;
+    }
+    if (first == 0xFFFFFFFFu) continue;
+    if (vShown++ < 16)
+      std::printf("  voxels differ: %s  material %u, state %u, stain %u, "
+                  "stamp/excite %u (first local %u: %08x vs %08x)\n",
+                  wcs(kv.first).c_str(), nm, ns, nst, nstamp, first,
+                  kv.second[first], ib->second[first]);
+  }
+  std::printf("  voxel words: %u of %zu captured slots differ\n", vShown,
+              a.vox.size());
+  for (uint32_t i = 0; i < kGasSpHdr; i++)
+    if (a.gas[i] != b.gas[i])
+      std::printf("  gas stat[%u]: %u vs %u\n", i, a.gas[i], b.gas[i]);
+}
+
+// Cross-BOOT attribution: SANDVOX_DET_DUMP=<prefix> writes run 1's probes (and
+// its per-tick hashes) to files; SANDVOX_DET_REF=<prefix> reads a previous
+// boot's and compares run 1 against them. Two boots that end on different
+// hashes are then diffed exactly like the two runs of one boot.
+static void DetProbeSave(const std::string& path, const DetProbe& p) {
+  FILE* f = std::fopen(path.c_str(), "wb");
+  if (!f) return;
+  auto vec = [&](const std::vector<uint32_t>& v) {
+    const uint32_t n = (uint32_t)v.size();
+    std::fwrite(&n, 4, 1, f);
+    std::fwrite(v.data(), 4, n, f);
+  };
+  vec(p.chunkHash); vec(p.solMeta); vec(p.solTable);
+  uint32_t n = (uint32_t)p.solCells.size();
+  std::fwrite(&n, 4, 1, f);
+  for (auto& kv : p.solCells) {
+    std::fwrite(&kv.first, 4, 1, f);
+    std::fwrite(kv.second.data(), 2, kChunkVol, f);
+  }
+  n = (uint32_t)p.vox.size();
+  std::fwrite(&n, 4, 1, f);
+  for (auto& kv : p.vox) {
+    std::fwrite(&kv.first, 4, 1, f);
+    std::fwrite(kv.second.data(), 4, kChunkVol, f);
+  }
+  std::fwrite(p.gas, 4, kGasSpHdr, f);
+  std::fclose(f);
+}
+
+static bool DetProbeLoad(const std::string& path, DetProbe& p) {
+  FILE* f = std::fopen(path.c_str(), "rb");
+  if (!f) return false;
+  bool ok = true;
+  auto rd = [&](void* d, size_t sz, size_t n) {
+    if (std::fread(d, sz, n, f) != n) ok = false;
+  };
+  auto vec = [&](std::vector<uint32_t>& v) {
+    uint32_t n = 0;
+    rd(&n, 4, 1);
+    v.assign(n, 0u);
+    if (n) rd(v.data(), 4, n);
+  };
+  vec(p.chunkHash); vec(p.solMeta); vec(p.solTable);
+  uint32_t n = 0;
+  rd(&n, 4, 1);
+  for (uint32_t i = 0; i < n && ok; i++) {
+    uint32_t s = 0;
+    rd(&s, 4, 1);
+    std::vector<uint16_t>& c = p.solCells[s];
+    c.assign(kChunkVol, 0);
+    rd(c.data(), 2, kChunkVol);
+  }
+  n = 0;
+  rd(&n, 4, 1);
+  for (uint32_t i = 0; i < n && ok; i++) {
+    uint32_t s = 0;
+    rd(&s, 4, 1);
+    std::vector<uint32_t>& w = p.vox[s];
+    w.assign(kChunkVol, 0u);
+    rd(w.data(), 4, kChunkVol);
+  }
+  rd(p.gas, 4, kGasSpHdr);
+  std::fclose(f);
+  return ok;
+}
+
 // ---- determinism -------------------------------------------------------
 Status GateDeterminism(Ctx& c, std::string& detail) {
   constexpr int kTicks = 200;
@@ -56,6 +289,8 @@ std::vector<uint32_t> hashes[2];
 // not heal), and 400 extra stalls for a claim two make is exactly the
 // verification budget CLAUDE.md is about.
 uint32_t gasDigest[2] = {}, gasLiveEnd[2] = {};
+const std::vector<uint32_t> probeTicks = DetProbeTicks("SANDVOX_DET_PROBE");
+std::map<uint32_t, DetProbe> probe[2];
 for (int run = 0; run < 2; run++) {
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
@@ -64,6 +299,44 @@ for (int run = 0; run < 2; run++) {
                SelftestExps(t, kDefaultSeed), {}, true, {8, 3, 8}, false,
                SelftestParticlesActive(t));
     hashes[run].push_back(ReadHashSync(ctx, world));
+    if (std::find(probeTicks.begin(), probeTicks.end(), t) != probeTicks.end()) {
+      DetProbeCapture(ctx, world, probe[run][t]);
+      if (run == 1) DetProbeCompare(world, t, probe[0][t], probe[1][t]);
+      if (run == 0) {
+        const char* dump = std::getenv("SANDVOX_DET_DUMP");
+        const char* ref = std::getenv("SANDVOX_DET_REF");
+        if (dump && *dump)
+          DetProbeSave(Format("%s.t%u.bin", dump, t), probe[0][t]);
+        DetProbe rp;
+        if (ref && *ref && DetProbeLoad(Format("%s.t%u.bin", ref, t), rp)) {
+          std::printf("det-probe vs REFERENCE BOOT (%s):\n", ref);
+          DetProbeCompare(world, t, rp, probe[0][t]);
+        }
+      }
+    }
+  }
+  if (run == 0) {
+    if (const char* dump = std::getenv("SANDVOX_DET_DUMP"); dump && *dump) {
+      if (FILE* f = std::fopen(Format("%s.hashes.txt", dump).c_str(), "w")) {
+        for (uint32_t h : hashes[0]) std::fprintf(f, "%08x\n", h);
+        std::fclose(f);
+      }
+    }
+    if (const char* ref = std::getenv("SANDVOX_DET_REF"); ref && *ref) {
+      if (FILE* f = std::fopen(Format("%s.hashes.txt", ref).c_str(), "r")) {
+        unsigned h = 0;
+        int i = 0;
+        while (i < kTicks && std::fscanf(f, "%x", &h) == 1) {
+          if (h != hashes[0][i]) {
+            std::printf("det-probe: first divergence FROM THE REFERENCE BOOT at "
+                        "tick %d: %08x (ref) vs %08x\n", i + 1, h, hashes[0][i]);
+            break;
+          }
+          i++;
+        }
+        std::fclose(f);
+      }
+    }
   }
   uint32_t gs[kGasSpHdr] = {};
   ReadGasStatsSync(ctx, world, gs);

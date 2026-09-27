@@ -1438,7 +1438,12 @@ the integer fixpoint flat (stride 1 alone stalls in a ramp: spread 13 measured,
 parity and stride) is STALLED: the dilution floor (`floor`) discards what is
 below it and the chunk stops keeping itself awake. Dirty reasons 26 `solute`
 and 27 `solute-back` (a pair owned by the -axis neighbour, which must be woken
-for a whole phase cycle).
+for a whole phase cycle). The partner reads those face pairs ONLY when their
+owner is not writing them in the same dispatch (owner off the dirty list, or
+carrying nothing): a read racing the owner's exchange decided the partner's
+stall clock by scheduling, and with it whether the floor discarded mass -- the
+2026-09-27 `determinism` twice-run failure. A running owner instead restarts
+its partner's clock itself, through the same `solute-back` bit.
 
 **Conditions.** A reactions.json rule may carry `"solute": "<species>", "cMin",
 "cMax"`: it fires only when its (LIQUID -- refused on any other class) self
