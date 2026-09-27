@@ -46,6 +46,12 @@ struct StainLattice {
   void SetStain(size_t i, uint16_t s) const {
     if (skin) (*skin)[i].stain = s; else (*coll)[i].stain = s;
   }
+  // The skin's BRUISE byte (voxload.h PrefabVoxel::bruise). Only the fine
+  // skin carries one: the coarse lattice reads 0 and ignores a write.
+  uint8_t Bruise(size_t i) const { return skin ? (*skin)[i].bruise : 0u; }
+  void SetBruise(size_t i, uint8_t b) const {
+    if (skin) (*skin)[i].bruise = b;
+  }
 };
 
 // ---- WHICH OF TWO COATS OWNS A VOXEL (rule-unification W2-J2) ------------
@@ -180,10 +186,18 @@ uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
 // ---- A BLOW THAT DOES NOT BREAK THE SKIN -----------------------------------
 //
 // THE BRUISE LADDER, and it is three rungs: a cell DARKENS toward a ceiling, a
-// cell already at that ceiling can BREAK and go bloody, and a cell that is
-// bloody at depth is PULPED and will crumble. All of it is per-voxel
-// arithmetic over one lattice, which is why it belongs beside the cut's soak
-// rather than inside the creature that used to own it.
+// cell already at that ceiling can SPLIT and bleed, and a split cell is PULPED
+// and will crumble (and bleeds again whenever it is struck). All of it is
+// per-voxel arithmetic over one lattice, which is why it belongs beside the
+// cut's soak rather than inside the creature that used to own it.
+//
+// THE BRUISE IS THE SKIN, NOT A COAT (2026-09-26). The ladder used to live in
+// the COAT word, which made a bruise something water rinsed off, something a
+// splash of mud replaced, and something that could not wear blood over it;
+// and since "pulped" was "wears blood at gore.pulpAmt", washing a beaten limb
+// reset the beating. It now lives in PrefabVoxel::bruise, a level on the
+// tissue itself (kBruiseBroken = split), and only the BLOOD a split cell
+// sheds is a coat. Fine skins only -- see StainLattice::Bruise.
 //
 // WHY IT MOVED (2026-09-20). It was `Mob::BruiseLimb`, so a mace marked a
 // living body and did nothing whatever to a corpse: the loose-matter path had
@@ -198,13 +212,11 @@ uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
 struct BruiseSoak {
   Vec3 centre{};            // lattice units
   float radius = 0.0f;      // lattice units
-  uint32_t bruiseMat = 0;   // the coat this lays (gore.bruiseMat)
   uint32_t bloodMat = 0;    // what a broken bruise becomes (0 = never breaks)
   float step = 0.0f;        // coat added at the contact, before the taper
-  uint32_t cap = 0;         // gore.bruiseMax, the global ceiling
-  uint32_t bleedFrom = 0;   // coat depth at which a cell may break
+  uint32_t cap = 0;         // gore.bruiseMax, the global ceiling (<= 14)
+  uint32_t bleedFrom = 0;   // bruise level at which a cell may split
   float bleedChance = 0.0f; // ...and how often it does
-  uint32_t pulpAt = 0;      // blood depth that counts as PULPED (rung 3)
   float blowScale = 1.0f;   // how hard this blow was, 0..1
   const std::vector<uint8_t>* tissue = nullptr;  // bone does not bruise
   uint32_t seed = 0;
@@ -214,9 +226,9 @@ struct BruiseSoak {
 // scored against the damage it ARRIVED at, or the first blow that breaks the
 // skin would also be the first that carves.
 struct BruiseTally {
-  uint32_t marked = 0;   // voxels whose coat changed
-  uint32_t core = 0;     // voxels in the inner half-radius
-  uint32_t pulped = 0;   // ...of those, already bloody at `pulpAt`
+  uint32_t marked = 0;   // voxels whose bruise (or bleeding) changed
+  uint32_t core = 0;     // exposed voxels in the inner half-radius
+  uint32_t pulped = 0;   // ...of those, already split (kBruiseBroken)
   float Ripeness() const {
     return core == 0 ? 0.0f : (float)pulped / (float)core;
   }

@@ -247,8 +247,12 @@ uint32_t SoakCut(const StainLattice& L, Vec3 centre, const CutSoak& p,
 uint32_t SoakBruise(const StainLattice& L, const BruiseSoak& p,
                     BruiseTally* out, MicroBodySet* micro, int model) {
   if (out) *out = BruiseTally{};
-  if (p.bruiseMat == 0 || p.radius <= 0.0f || p.cap == 0 || p.step <= 0.0f)
-    return 0;
+  // THE BRUISE IS THE SKIN'S, AND ONLY A FINE SKIN HAS ROOM FOR IT (voxload.h
+  // PrefabVoxel::bruise). The coarse collider lattice is a tight 8-byte voxel
+  // with nothing spare, and a body without a fine skin has no stain lattice to
+  // draw one in either -- it takes the blow's hp and dent, not a mark.
+  if (!L.skin) return 0;
+  if (p.radius <= 0.0f || p.cap == 0 || p.step <= 0.0f) return 0;
   const size_t n = L.Size();
   if (n == 0) return 0;
   // The brick only takes pokes when it is this body's own (COW), exactly as
@@ -261,17 +265,21 @@ uint32_t SoakBruise(const StainLattice& L, const BruiseSoak& p,
   const float r2 = p.radius * p.radius;
   // The inner half-radius, in the squared metric the sweep already works in.
   const float core2 = r2 * 0.25f;
+  // The contusion ceiling can never reach the SPLIT level: only rung 2 puts a
+  // cell there, so "broken" always means the skin actually split.
+  const uint32_t cap = std::min<uint32_t>(p.cap, kBruiseMaxIntact);
+  const uint32_t bleedFrom =
+      std::min<uint32_t>(std::max<uint32_t>(1u, p.bleedFrom), cap);
 
   // ---- SKIN BREAKS AT THE SURFACE (2026-09-20) ----------------------------
   //
-  // Rung 2 turns a saturated bruise into blood and rung 3 eats whatever is
-  // bloody AT DEPTH. Applied to every cell in the radius, that makes the
-  // INTERIOR of a beaten limb one solid reservoir of pulp: each voxel the
-  // dissolution takes exposes more of it, the front never runs out, and a
-  // beating eats the entire limb. Measured on both populations the same day -
-  // the living gate `impact-blunt` reporting "1344 voxels -> 0 after 3 ticks
-  // dissolving (100.0% gone, cap 60%)", and a corpse beaten with a mace
-  // vanishing inside four seconds.
+  // Rung 2 splits a saturated bruise and rung 3 eats whatever is split.
+  // Applied to every cell in the radius, that makes the INTERIOR of a beaten
+  // limb one solid reservoir of pulp: each voxel the dissolution takes exposes
+  // more of it, the front never runs out, and a beating eats the entire limb.
+  // Measured on both populations the same day - the living gate `impact-blunt`
+  // reporting "1344 voxels -> 0 after 3 ticks dissolving (100.0% gone, cap
+  // 60%)", and a corpse beaten with a mace vanishing inside four seconds.
   //
   // A contusion breaks where there IS a surface to break. Gating the rung on
   // exposure bounds the reservoir to the skin the blow actually landed on,
@@ -313,6 +321,55 @@ uint32_t SoakBruise(const StainLattice& L, const BruiseSoak& p,
            !occAt(v.x, v.y - 1, v.z) || !occAt(v.x, v.y + 1, v.z) ||
            !occAt(v.x, v.y, v.z - 1) || !occAt(v.x, v.y, v.z + 1);
   };
+  // Blood on a split cell, and on one struck again after it split: at least
+  // the depth the bruise had reached, so the wet patch reads as continuous
+  // with the mark around it rather than as a splash. A DELIBERATE OVERWRITE
+  // of whatever coat is there (mud, water, somebody else's blood) -- the skin
+  // is bleeding through it -- except that the same blood already deeper stays.
+  auto bleed = [&](size_t i, uint32_t amt) -> bool {
+    if (p.bloodMat == 0) return false;
+    const uint16_t cur = L.Stain(i);
+    amt = std::min<uint32_t>(std::max<uint32_t>(1u, amt), kBodyStainAmtMax);
+    if (BodyStainMat(cur) == p.bloodMat && BodyStainAmt(cur) >= amt)
+      return false;
+    const uint16_t next = PackBodyStain(p.bloodMat, amt);
+    L.SetStain(i, next);
+    if (poke) {
+      const IVec3 v = L.At(i);
+      MicroBodyPokeStain(*micro, (uint32_t)model, v.x, v.y, v.z, next);
+    }
+    return true;
+  };
+  // ---- THE BLOW LANDS ON THE SKIN, NOT ON THE AXIS (2026-09-26) -----------
+  //
+  // The contact a caller hands over is where the weapon's probe met the LIMB,
+  // and the sweep reports that within about a voxel of the limb's axis
+  // (impact-blunt: "worst 1.09 vox off the limb axis"). Tapered from there,
+  // the SURFACE -- the only place rung 2 may split -- sits most of the way out
+  // to the rim, where the per-blow ceiling (`voxCap`) is below `bleedFrom`: a
+  // cell that can split could never get dark enough, and a cell dark enough
+  // was buried. So no beating ever broke skin, bled, or pulped (impact-blunt
+  // and corpse-blunt red at clean HEAD 4a61ee4 with identical numbers; the
+  // owner's report was that a bruise hit again never got worse). The taper is
+  // therefore measured from the nearest EXPOSED tissue cell to the contact:
+  // where the blow actually meets the skin, which is where a bruise is darkest.
+  Vec3 centre = p.centre;
+  {
+    float best = 1e30f;
+    for (size_t i = 0; i < n; i++) {
+      const uint32_t mat = L.Mat(i);
+      if (mat == 0) continue;
+      if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) continue;
+      const IVec3 v = L.At(i);
+      const Vec3 d{(float)v.x + 0.5f - p.centre.x,
+                   (float)v.y + 0.5f - p.centre.y,
+                   (float)v.z + 0.5f - p.centre.z};
+      const float d2 = d.dot(d);
+      if (d2 >= best || d2 >= r2 || !exposedAt(v)) continue;
+      best = d2;
+      centre = Vec3{(float)v.x + 0.5f, (float)v.y + 0.5f, (float)v.z + 0.5f};
+    }
+  }
   uint32_t marked = 0, coreCells = 0, pulpedCells = 0;
   for (size_t i = 0; i < n; i++) {
     const uint32_t mat = L.Mat(i);
@@ -321,35 +378,36 @@ uint32_t SoakBruise(const StainLattice& L, const BruiseSoak& p,
     // hole-shows-bone rule (MobDef::tissue) is the same one that governs here.
     if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) continue;
     const IVec3 v = L.At(i);
-    const Vec3 d{(float)v.x + 0.5f - p.centre.x, (float)v.y + 0.5f - p.centre.y,
-                 (float)v.z + 0.5f - p.centre.z};
+    const Vec3 d{(float)v.x + 0.5f - centre.x, (float)v.y + 0.5f - centre.y,
+                 (float)v.z + 0.5f - centre.z};
     const float d2 = d.dot(d);
     if (d2 >= r2) continue;
     const float t = std::sqrt(d2 / r2);
-    const uint16_t curStain = L.Stain(i);
+    const uint32_t cur = BruiseLevel(L.Bruise(i));
+    const bool exposed = exposedAt(v);
     const uint32_t h = rng::Hash3(p.seed, (uint32_t)(v.x * 73856093),
                                   (uint32_t)(v.y * 19349663) ^
                                       (uint32_t)(v.z * 83492791));
     // ---- THE READING FOR RUNG 3, taken BEFORE this blow changes anything ---
     //
-    // OVER THE CORE'S SURFACE, not its volume. Rung 2 only breaks skin that is
-    // exposed (see above), so pulp can only ever exist on the surface — and a
+    // OVER THE CORE'S SURFACE, not its volume. Rung 2 only splits skin that is
+    // exposed (see above), so pulp can only ever exist on the surface -- and a
     // fraction whose denominator counts buried cells that are structurally
-    // incapable of being pulped can never reach a threshold. Measured: with
-    // the volume denominator the ripeness stalled under gore.pulpCarveFrom
-    // forever and a beating stopped taking anything at all, which is the exact
-    // opposite failure to the one the exposure gate fixed.
-    if (d2 < core2 && exposedAt(v)) {
+    // incapable of being pulped can never reach a threshold.
+    //
+    // PULPED IS THE SKIN'S OWN STATE (2026-09-26), a split bruise, not "wears
+    // blood at gore.pulpAmt". Read off the coat, a rinse or a splash of mud
+    // reset how far a beating had got, and a spray of blood from a cut
+    // elsewhere counted as tissue beaten open.
+    if (d2 < core2 && exposed) {
       coreCells++;
-      if (p.bloodMat != 0 && BodyStainMat(curStain) == p.bloodMat &&
-          BodyStainAmt(curStain) >= p.pulpAt)
-        pulpedCells++;
+      if (cur == kBruiseBroken) pulpedCells++;
     }
     // ---- THE FULL STEP AT THE CONTACT, AND A SPECTRUM OUT TO THE RIM -------
     //
     // ONE multiplier below 1, not three: the taper, plus a narrow jitter to
     // break the patch up, plus `blowScale` (the difference between a fist and
-    // a mace, floored so it cannot vanish). Power is deliberately NOT here —
+    // a mace, floored so it cannot vanish). Power is deliberately NOT here --
     // it already scales the radius at the call site, and charging it twice
     // made a glancing blow both smaller AND fainter.
     const float jitter = 0.85f + 0.15f * (float)((h >> 16) & 0xFFu) / 255.0f;
@@ -357,43 +415,49 @@ uint32_t SoakBruise(const StainLattice& L, const BruiseSoak& p,
     const uint32_t add = (uint32_t)std::lround(p.step * taper * jitter *
                                                p.blowScale);
     if (add == 0) continue;
+    // ---- ALREADY SPLIT: IT BLEEDS AGAIN -----------------------------------
+    // A blow on open, beaten tissue opens it again. The level cannot go
+    // further (rung 3, the crumbling, is the clock's), but the blood comes
+    // back, washed off or not.
+    if (cur == kBruiseBroken) {
+      if (bleed(i, add)) marked++;
+      continue;
+    }
     // ---- AND THE RIM HAS ITS OWN CEILING ----------------------------------
     //
     // The taper is a CEILING as well as a rate: a cell at the rim cannot be
     // driven past a light mark by this blow however many land, and only the
     // middle can reach the depth that breaks. Without it, enough blows on one
     // spot crawl every cell in the radius to the global ceiling and the whole
-    // mark goes wet — a patch of blood with a hard edge and no bruise around
+    // mark goes wet -- a patch of blood with a hard edge and no bruise around
     // it, which is not what a beating looks like. PER BLOW, not per voxel
     // forever: a second blow landing closer legitimately raises this cell's
     // ceiling, which is how a beating walks across a limb.
-    const uint32_t voxCap = (uint32_t)std::lround((float)p.cap * taper);
+    const uint32_t voxCap = (uint32_t)std::lround((float)cap * taper);
     if (voxCap == 0) continue;
-    const uint32_t curAmt = BodyStainAmt(curStain);
-    const uint32_t curMat = BodyStainMat(curStain);
-    uint16_t next = curStain;
+    uint32_t next = cur;
     // ---- RUNG 2: where it has already gone as dark as a bruise gets -------
+    // "Each hit adds more, up to the ceiling, and then after that is blood":
+    // a cell that can still darken darkens, and only one already at the
+    // breaking depth rolls to split.
     bool broke = false;
-    if (p.bloodMat != 0 && p.bleedChance > 0.0f && curMat == p.bruiseMat &&
-        curAmt >= p.bleedFrom && exposedAt(v)) {
+    if (p.bloodMat != 0 && p.bleedChance > 0.0f && cur >= bleedFrom &&
+        exposed) {
       const float roll = (float)(h & 0xFFFFu) / 65535.0f;
       if (roll < p.bleedChance) {
-        // Blood goes on at the bruise's own depth, not at a cut's: a deep
-        // contusion has broken the skin, and it should read as continuous with
-        // the mark around it rather than as a splash. A DELIBERATE OVERWRITE
-        // rather than a raise — Raise's cross-material rule ("only a strictly
-        // larger amount repaints") can never fire here by construction, which
-        // is how this rung once shipped disabled.
-        next = PackBodyStain(
-            p.bloodMat, std::min(std::max(curAmt, add), (uint32_t)kBodyStainAmtMax));
+        next = kBruiseBroken;
         broke = true;
       }
     }
-    if (!broke) next = AddBodyStain(curStain, p.bruiseMat, add, voxCap);
-    if (next == curStain) continue;
-    L.SetStain(i, next);
+    if (!broke) {
+      if (cur >= voxCap) continue;   // at this blow's ceiling: nothing to add
+      next = std::min(cur + add, voxCap);
+    }
+    L.SetBruise(i, (uint8_t)next);
     if (poke)
-      MicroBodyPokeStain(*micro, (uint32_t)model, v.x, v.y, v.z, next);
+      MicroBodyPokeBruise(*micro, (uint32_t)model, v.x, v.y, v.z,
+                          (uint8_t)next);
+    if (broke) bleed(i, std::max(cur, add));
     marked++;
   }
   if (out) {

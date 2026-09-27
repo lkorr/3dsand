@@ -3301,14 +3301,14 @@
       "hardness": 8,
       "rubble": "blood",
       "far": "skin",
-      "_stain_note": "A BRUISE IS A COAT, NOT A REPAINT (2026-09-16). This material used to be written straight onto skin voxels, which quantized a bruise to three hard colours and a hash-picked SUBSET of the tissue in the radius -- so one punch produced a scatter of flat purple cells over the arm and a second punch produced a different scatter, and neither read as a mark deepening on a body. It is now the BODY STAIN (phys/bodystain.h) instead: the same voxel keeps its skin material and art colour and carries a 0..15 coat amount that microbody.wgsl multiplies and lerps over the albedo, so a bruise is an ALPHA over whatever complexion the voxel was painted and repeat blows DEEPEN THE SAME PATCH instead of speckling a new one. bodyOnly says this slot is a coat and never a spill: a solid cannot soak the ground, and the world's liquid path must not think it can (materials.cpp ParseStain).",
+      "_stain_note": "A BRUISE IS THE SKIN, NOT A REPAINT AND NOT A COAT. This material used to be written straight onto skin voxels, which quantized a bruise to three hard colours and a hash-picked SUBSET of the tissue in the radius. It was then a BODY COAT (2026-09-16), which fixed the falloff but made it something water rinsed off, mud replaced, and blood could not sit on. Since 2026-09-26 it is the skin voxel's own BRUISE LEVEL (sim/voxload.h PrefabVoxel::bruise): the voxel keeps its material, art colour AND whatever coat is on it, and this block supplies only the COLOUR the level is drawn in (microbody.wgsl draws it under the coat) -- repeat blows deepen the same patch, a saturated patch splits and bleeds, and split skin crumbles. bodyOnly: never a spill (materials.cpp ParseStain).",
       "stain": {
         "type": "bruise",
         "color": "#5e2d44",
         "amount": 15,
         "bodyOnly": true
       },
-      "_coat_note": "A BRUISE FADES, it is not washed off. The material rewrite this replaced healed through MobLimb::woundWas, which reverted a voxel in one step the moment the wound closed; a coat decays a level at a time instead, which is both what a bruise does and the mechanism blood and water already use. 45 s per level against a ceiling of 11 is about eight minutes to clear, so a beaten creature stays visibly beaten for the rest of a fight and a while after it. shed 0: a bruise is UNDER the skin and nothing rubs it off on the furniture.",
+      "_coat_note": "A BRUISE FADES, it is not washed off. Read by Mob::HealBruises as the bruise level's clock, not as a coat: 45 s per level down to decayFloor, on a LIVING creature only (the dead keep their bruises; a split cell is eaten, never healed). About eight minutes to clear, so a beaten creature stays visibly beaten for the rest of a fight and a while after it. shed 0: a bruise is UNDER the skin.",
       "coat": {
         "decay": 45.0,
         "decayFloor": 2,

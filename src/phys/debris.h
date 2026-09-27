@@ -1296,7 +1296,11 @@ class DebrisSystem {
   // dye is that the art it colours is a neutral greyscale weave. A dropped red
   // shirt that reloaded grey would be the one visible way this system could
   // silently lose data, so the word travels.
-  static constexpr uint32_t kSaveVersion = 4;
+  //
+  // 5 (2026-09-26): THE BRUISE BYTE (voxload.h PrefabVoxel::bruise), in what
+  // was the skin voxel's padding byte. Same stride, so a v4 section still
+  // LOADS -- with that byte zeroed, because in v4 it was never written.
+  static constexpr uint32_t kSaveVersion = 5;
   void SaveState(std::vector<uint8_t>& out) const;
   // Contract (worldio LoadEntities): Reset() has already run.
   bool LoadState(const uint8_t* data, size_t len, uint32_t version);

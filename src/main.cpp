@@ -3515,10 +3515,9 @@ static void SampleSlots(MobSystem& mobs, uint64_t id, int slots,
     s.art = mobs.LimbArtVoxelCount(id, i);
     s.hp = mobs.LimbHp(id, i);
     s.bleed = mobs.LimbBleedBudget(id, i);
-    // A bruise is a COAT, not a material rewrite (DESIGN.md, "A bruise is an
-    // alpha that deepens"), so counting voxels whose MATERIAL is `bruiseMat`
-    // reports zero on a thoroughly beaten limb. Count the ones wearing it.
-    if (bruiseMat) s.bruise = mobs.LimbCoatMatCount(id, i, bruiseMat, 1);
+    // A bruise is neither a material rewrite nor (since 2026-09-26) a coat:
+    // it is the skin's own bruise byte (voxload.h PrefabVoxel::bruise).
+    if (bruiseMat) s.bruise = mobs.LimbBruiseCount(id, i, 1);
     if (rotMat) s.rot = mobs.LimbMaterialCount(id, i, rotMat);
     s.stain = mobs.LimbStainCount(id, i, 1);
   }

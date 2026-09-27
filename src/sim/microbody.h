@@ -62,10 +62,13 @@ struct MicroBodyModelGpu {
   // 10 bits each is 1023 per axis, far past the +-127 DebrisVoxel bound that
   // limits a limb anyway; packing them keeps the record at 16 bytes.
   //
-  // bit 30 (kMicroBodyDimsStainBit): THIS BLOCK CARRIES A STAIN LATTICE. One
-  // byte per micro voxel, 4 per word, laid out after the payload at
-  // `base + WordsFor(cells)` in the same idx order, holding `slot << 4 | amt`
-  // -- the world's 3-bit stain PALETTE SLOT and the 0..15 amount. This is the
+  // bit 30 (kMicroBodyDimsStainBit): THIS BLOCK CARRIES A STAIN LATTICE. 16
+  // bits per micro voxel, 2 per word, laid out after the payload at
+  // `base + WordsFor(cells)` in the same idx order. The LOW byte is the coat,
+  // `slot << 4 | amt` -- the world's 3-bit stain PALETTE SLOT and the 0..15
+  // amount; the HIGH byte is the BRUISE in the same shape (MicroBodySet::
+  // bruiseSlot, PrefabVoxel::bruise), drawn under the coat. It was one byte
+  // per voxel until 2026-09-26, when the bruise stopped being a coat. This is the
   // one place the 16-bit body coat word (voxload.h BodyStain*, which names a
   // MATERIAL) is narrowed to what the shader needs, through
   // MicroBodySet::stainSlotOfMat; the shader is unchanged by that. Only OWNED
@@ -280,13 +283,19 @@ struct MicroBodySet {
   // material past its end) means "no slot", i.e. amount 0, i.e. nothing drawn
   // -- which is the right failure for a set that was never told.
   std::vector<uint8_t> stainSlotOfMat;
+  // The stain palette slot a BRUISE draws in (voxload.h PrefabVoxel::bruise):
+  // gore.bruiseMat's slot, published beside the table above. 0 = bruises
+  // draw nothing. A bruise is not a coat and names no material per voxel, so
+  // one slot is the whole of what the renderer needs.
+  uint8_t bruiseSlot = 0;
 };
 
 // Publish material id -> stain palette slot into `set`. Called wherever the
 // material table is (re)built: LoadMobDefs, which already clears the set, and
 // MobSystem::OnMaterialsReloaded, because an R reload can renumber the slots
 // under bricks that are already packed.
-void MicroBodySetStainSlots(MicroBodySet& set, std::vector<uint8_t> slotOfMat);
+void MicroBodySetStainSlots(MicroBodySet& set, std::vector<uint8_t> slotOfMat,
+                            uint8_t bruiseSlot = 0);
 
 // Merge one prefab's art palette into `set`, remapping its slots if needed.
 // Returns a 256-entry table mapping the prefab's .vox palette SLOT (128..255)
@@ -428,6 +437,13 @@ bool MicroBodyPoke(MicroBodySet& set, uint32_t model, int x, int y, int z,
 // block.
 bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
                         uint16_t stain);
+
+// The same for the BRUISE byte of that cell (voxload.h PrefabVoxel::bruise),
+// narrowed through MicroBodySet::bruiseSlot. Leaves the coat byte alone, which
+// is the point: blood, water and mud go on and come off over a bruise without
+// touching it.
+bool MicroBodyPokeBruise(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                         uint8_t bruise);
 
 // A model's brick dimensions in micro voxels; {0,0,0} for an invalid index.
 IVec3 MicroBodyDims(const MicroBodySet& set, uint32_t model);

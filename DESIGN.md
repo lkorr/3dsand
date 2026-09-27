@@ -5651,8 +5651,8 @@ replay of the same tick cuts, bruises and tears identically.
 charges hp through the ordinary `Damage` (flinch, hurt cry, and death on a vital
 limb at zero, all unchanged), tops the drip budget up at only
 `gore.bluntBleedScale` of a cut's rate — a punch does not open you — lays a
-BRUISE in `gore.bruiseMat` over `gore.bruiseRadius · (0.5 + 0.5·power)` (a
-COAT, not a rewrite — see "A bruise is an alpha that deepens" below), and
+BRUISE over `gore.bruiseRadius · (0.5 + 0.5·power)` (a level on the SKIN, not
+a rewrite and not a coat — see "A bruise is the skin's own" below), and
 removes a voxel only if the weapon authored `bluntCarve` AND the spot it landed
 on has already been beaten open (see "A blunt blow climbs a ladder" below): a
 shallow radial DENT of `gore.bluntCarveRadius · bluntCarve · power · earned`,
@@ -5674,22 +5674,25 @@ however long you swing it. The owner's report was "beating someone with a mace
 just keeps adding more and more bruises". Neither setting is the thing, because
 what a beating does is not a per-blow constant — it is a HISTORY:
 
-1. **Clean skin bruises.** The coat deepens by `gore.bruiseStep`, scaled by how
+1. **Clean skin bruises.** The bruise level deepens by `gore.bruiseStep`, scaled by how
    hard the blow was (`gore.bruiseHpRef`: a 4 hp fist against a 16 hp reference
    lands a square-rooted half-step, which is the whole of "the same thing with
    fists, only slower"), toward a ceiling that TAPERS with distance from the
    contact — a cell at the rim cannot be driven past a light mark by that blow
    however many land, so only the middle can ever reach the depth that breaks.
-2. **A saturated patch breaks.** At `gore.bruiseBleedFrom` of that ceiling a
-   further blow rolls `gore.bruiseBleedChance` per voxel and lays the
-   creature's own BLOOD there instead, at the bruise's own depth.
-3. **Broken, bloodied tissue comes away.** `Mob::BruiseLimb` reports what share
-   of the contact CORE (the inner half-radius — the rim never saturates, so a
-   share measured over the whole sphere would stay permanently small) already
-   wears blood at `gore.pulpAmt` or deeper; the dent radius is scaled by how far
-   that share has climbed past `gore.pulpCarveFrom`. It compounds, on purpose:
-   the crater is soaked in blood and `woundMat`, so what it exposes reads as
-   pulp to the NEXT blow.
+2. **A saturated patch splits.** At `gore.bruiseBleedFrom` of that ceiling a
+   further blow rolls `gore.bruiseBleedChance` per exposed voxel to SPLIT the
+   skin there (`kBruiseBroken`) and lays the creature's own BLOOD over it as a
+   coat, at the bruise's own depth. A split cell struck again bleeds again,
+   however often it has been washed.
+3. **Split tissue comes away.** `Mob::BruiseLimb` reports what share of the
+   exposed contact CORE (the inner half-radius — the rim never saturates, so a
+   share measured over the whole sphere would stay permanently small) is
+   already split; that raises `MobLimb::bluntPulp`, and `Mob::BluntPulpTick`
+   crumbles split cells at `gore.pulpRotRate`, surface first, which exposes
+   fresh skin for the NEXT blow to bruise and split. (Until 2026-09-26 "pulp"
+   was "wears blood at `gore.pulpAmt`", read off the coat, so a rinse un-beat a
+   limb; `gore.pulpAmt` is now read by nothing.)
 
 The reading is the BRUISE's, so a blow that laid no bruise earns no dent — the
 right coupling rather than an accident, since the mark IS the record of the
@@ -5754,8 +5757,8 @@ is the single rule separating a bite from a punch. On a SHELL a bite is
 `Mob::StainWound` had the victim's `woundMat` baked into it, which is right for
 a cut and wrong for everything else; it is now a one-line wrapper over
 `Mob::StainWoundAs(limb, centre, radius, seed, rewriteMat, smearMat, ...)`. A
-cut leaves the creature's own blood, a punch leaves `gore.bruiseMat` as a coat
-(below) rather than as a rewrite, and a zombie's bite leaves the BITER's `rotflesh` smeared with the
+cut leaves the creature's own blood, a punch leaves a bruise LEVEL on the skin
+(below) rather than a rewrite, and a zombie's bite leaves the BITER's `rotflesh` smeared with the
 biter's `ichor` — the victim's blood does not come into it. Because
 `StainWoundAs` only ever rewrites flesh-class cells (`MobDef::tissue`), a
 nonzero return IS "the tear exposed flesh", which is how an infection knows it
@@ -5766,7 +5769,26 @@ clocks — blood at `gore.woundHealSlow`, rot at
 `gore.infectHealSlow` (6.0 against 2.0), because rot living in you is not a
 wound settling. In an undead it never goes away, which is the point.
 
-**A bruise is an alpha that deepens, not a repaint** (2026-09-16;
+**A bruise is the skin's own, not a repaint and not a coat** (2026-09-26;
+`PrefabVoxel::bruise`, `SoakBruise`, `Mob::HealBruises`). For ten days it was a
+body COAT (below), which fixed its shape and broke what a coat is for: water
+rinsed a bruise off, mud or oil displaced it, blood could not sit over it, and
+because rung 3 read "pulped" off the blood coat, a wash reset how far a beating
+had got. It is now a 4-bit LEVEL on the fine-skin voxel itself — the padding
+byte after `PrefabVoxel::color`, so nothing grew — 1..14 a deepening
+contusion and 15 (`kBruiseBroken`) skin that has split. The micro brick's stain
+lattice went from a byte to 16 bits per cell (coat low, bruise high, same
+`slot << 4 | amt` shape through `MicroBodySet::bruiseSlot` = `gore.bruiseMat`'s
+stain slot), and `microbody.wgsl` tints the bruise into the albedo BEFORE the
+coat, so every coat lands on it and comes off it without touching it. It heals
+on a LIVING creature only, a level per `skin_bruised` `coat.decay` down to its
+`decayFloor` (`Mob::HealBruises`); the dead keep their bruises, and a split
+cell is never healed — it is eaten. Only the fine skin has the byte: a
+collider-only body (the `critter`/`dummy` fixtures) takes a blunt blow's hp but
+no mark. Everything below about the shape of a bruise still holds with "coat
+amount" read as "bruise level".
+
+**A bruise was an alpha that deepens, not a repaint** (2026-09-16;
 `Mob::BruiseLimb`, `AddBodyStain`). It was a rewrite like the other two, and it
 was the wrong shape for what a bruise IS. A rewrite is all-or-nothing per voxel,
 so the only place the falloff could live was in the FRACTION of cells rewritten:

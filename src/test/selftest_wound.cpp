@@ -68,6 +68,7 @@
 #include "game/melee.h"  // hit-drive swings the real sweep
 #include "game/anim.h"   // QuatRotate: a joint anchor is body-local
 #include "sim/microbody.h"
+#include "phys/bodystain.h"   // bruise-is-skin: SoakBruise and the coat rules
 #include "sim/tuning.h"
 #include "sim/weather.h"  // corpse-sleep: the rain word, for attribution
 #include "test/selftest.h"
@@ -1589,8 +1590,18 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
 
   // A MACE, resolved exactly as melee resolves it on a creature (the corpse is
   // one): the bruise first, the dissolution only as far as the pulp earns it.
-  const uint32_t vox0 = mobs.LimbArtVoxelCount(id, t.limb);
-  const uint32_t coat0 = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
+  //
+  // LIVE voxels, tombstones excluded: the pulp tick eats by TOMBSTONING
+  // (Mob::BluntPulpTick -> FlushBurn), and below FlushBurn's batch threshold a
+  // tombstone stays in the lattice, so the lattice's SIZE did not move when a
+  // crater opened (impact-blunt's LiveVoxels, the same count).
+  auto live = [&](uint64_t mid, int li) -> uint32_t {
+    const uint32_t art = mobs.LimbArtVoxelCount(mid, li);
+    const uint32_t dead = mobs.LimbMaterialCount(mid, li, 0u);
+    return art > dead ? art - dead : 0u;
+  };
+  const uint32_t vox0 = live(id, t.limb);
+  const uint32_t coat0 = mobs.LimbBruiseCount(id, t.limb, 1);
   std::vector<ParticleSpawn> spawns;
   const float kHp = 16.0f;
   uint32_t voxAfterFirst = vox0;
@@ -1611,12 +1622,12 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
     mobs.BluntHit(h, hit, c.world, spawns);
     spawns.clear();
     if (i == 0) {
-      voxAfterFirst = mobs.LimbArtVoxelCount(id, t.limb);
-      coatAfterFirst = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
+      voxAfterFirst = live(id, t.limb);
+      coatAfterFirst = mobs.LimbBruiseCount(id, t.limb, 1);
     }
   }
-  const uint32_t vox1 = mobs.LimbArtVoxelCount(id, t.limb);
-  const uint32_t coat1 = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
+  const uint32_t vox1 = live(id, t.limb);
+  const uint32_t coat1 = mobs.LimbBruiseCount(id, t.limb, 1);
   const bool pulping = mobs.LimbPulping(id, t.limb);
 
   // ...AND IT KEEPS GOING WITH NOBODY TOUCHING IT. The blows have stopped;
@@ -1642,7 +1653,7 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
   support::TickCursor ticker{c, tick, pchunk};
   for (int i = 0; i < 45; i++) ticker();
   SetCurrentTuning(savedTune);
-  const uint32_t vox2 = mobs.LimbArtVoxelCount(id, t.limb);
+  const uint32_t vox2 = live(id, t.limb);
 
   RecordObserved("corpseBluntCoat", (double)(coat1 - coat0));
   RecordObserved("corpseBluntDissolved", (double)(vox1 > vox2 ? vox1 - vox2 : 0));
@@ -1655,8 +1666,8 @@ Status GateCorpseBlunt(Ctx& c, std::string& detail) {
   mobs.Reset();
   c.debris.Reset();
   detail = Format(
-      "%s limb '%s' as a corpse, %d mace blows (%.0f hp) on one spot: bruise "
-      "coat %u -> %u (first blow %u, took %u voxels), lattice %u -> %u, then "
+      "%s limb '%s' as a corpse, %d mace blows (%.0f hp) on one spot: bruised "
+      "%u -> %u (first blow %u, took %u voxels), lattice %u -> %u, then "
       "45 ticks untouched -> %u (pulping=%d)",
       t.defName.c_str(), t.limbName.c_str(), kBlows, (double)kHp, coat0, coat1,
       coatAfterFirst, vox0 - voxAfterFirst, vox0, vox1, vox2, pulping ? 1 : 0);
@@ -7866,6 +7877,187 @@ Status GateHeadCleave(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ============================================================================
+// bruise-is-skin: a bruise is the SKIN's, not a coat (owner report 2026-09-26)
+//
+// "Bruises shouldn't be stains but changes to the skin; they shouldn't wash
+// off with water and should be able to be stained with other things; and a
+// bruise hit again gets worse until the micro voxels bleed and break up."
+//
+// Pure lattice arithmetic -- SoakBruise, the washer's rule, the coat raise and
+// the micro brick's stain lattice -- over a synthetic block of skin, because
+// every claim here is about which FIELD a rule writes, and a world, a rig and
+// a tick would add nothing but ways for the answer to be about something else.
+// The living ladder over a real limb is impact-blunt's; the corpse's is
+// corpse-blunt's. Claims:
+//   A  one blow bruises and splits nothing;
+//   B  repeat blows DEEPEN the same cells, then split the saturated ones, and
+//      a split cell wears this body's blood;
+//   C  washing every coat off (the rule rain and rivers use) leaves every
+//      bruise level exactly as it was -- in the lattice AND in the brick;
+//   D  another substance's coat goes on OVER a bruise without touching it;
+//   E  the next blow still finds the split cells (washing did not un-beat the
+//      skin) and they BLEED AGAIN.
+// ============================================================================
+Status GateBruiseIsSkin(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  const uint32_t skin = mobs.MaterialIdNamed("skin");
+  const uint32_t blood = mobs.MaterialIdNamed("blood");
+  const uint32_t water = mobs.MaterialIdNamed("water");
+  const uint32_t oil = mobs.MaterialIdNamed("oil");
+  if (!skin || !blood || !water || !oil || skin > 255) {
+    detail = Format("materials missing: skin %u blood %u water %u oil %u", skin,
+                    blood, water, oil);
+    return Status::Fail;
+  }
+  const auto& gt = CurrentTuning().gore;
+  constexpr int N = 16;
+  std::vector<PrefabVoxel> lat;
+  for (int z = 0; z < N; z++)
+    for (int y = 0; y < N; y++)
+      for (int x = 0; x < N; x++) {
+        PrefabVoxel v{};
+        v.x = (int16_t)x; v.y = (int16_t)y; v.z = (int16_t)z;
+        v.material = (uint16_t)skin;
+        lat.push_back(v);
+      }
+  // A private brick with a known slot table, so the check reads real bytes.
+  MicroBodySet set;
+  std::vector<uint8_t> slots(std::max({skin, blood, water, oil}) + 1u, 0);
+  slots[blood] = 1; slots[water] = 2; slots[oil] = 4;
+  MicroBodySetStainSlots(set, slots, /*bruiseSlot=*/3);
+  std::string log;
+  const int model = MicroBodyPack(set, lat, IVec3{N, N, N}, 8, "bruise-is-skin", log);
+  if (model < 0) {
+    detail = "brick pack refused: " + log;
+    return Status::Fail;
+  }
+  const int own = MicroBodyOwn(set, (uint32_t)model);
+  if (own < 0) {
+    detail = "brick own refused";
+    return Status::Fail;
+  }
+  // The brick's 16-bit stain cell for lattice voxel i (coat low, bruise high).
+  auto brickCell = [&](size_t i) -> uint16_t {
+    const MicroBodyModelGpu& m = set.models[(size_t)own];
+    if (!(m.dims & kMicroBodyDimsStainBit)) return 0;
+    const size_t cells = (size_t)N * N * N;
+    const size_t idx = ((size_t)lat[i].z * N + lat[i].y) * N + lat[i].x;
+    const size_t w = m.base + (cells + 1) / 2 + idx / 2;
+    return (uint16_t)(set.pool[w] >> ((idx % 2) * 16));
+  };
+
+  StainLattice L;
+  L.skin = &lat;
+  BruiseSoak bs;
+  bs.centre = Vec3{N * 0.5f, (float)N, N * 0.5f};   // on the top face
+  bs.radius = 7.0f;
+  bs.bloodMat = blood;
+  bs.step = std::max(1.0f, gt.bruiseStep);
+  bs.cap = (uint32_t)std::lround(std::clamp(gt.bruiseMax, 2.0f, 14.0f));
+  bs.bleedFrom = (uint32_t)std::lround(
+      (float)bs.cap * std::clamp(gt.bruiseBleedFrom, 0.0f, 1.0f));
+  bs.bleedChance = 0.5f;   // an arm, not the shipped odds: the rung must fire
+  bs.blowScale = 1.0f;
+  auto blow = [&](uint32_t k) {
+    bs.seed = 0xB2015Eu + k * 2654435761u;
+    BruiseTally t;
+    SoakBruise(L, bs, &t, &set, own);
+    return t;
+  };
+  auto count = [&](uint32_t minLvl) {
+    uint32_t n = 0;
+    for (const PrefabVoxel& v : lat) n += BruiseLevel(v.bruise) >= minLvl;
+    return n;
+  };
+
+  // A
+  blow(0);
+  const uint32_t bruised1 = count(1), deep1 = count(bs.cap), split1 = count(kBruiseBroken);
+  bool ok = true;
+  std::string why;
+  if (bruised1 == 0) { ok = false; why += " A:first blow marked nothing"; }
+  if (split1 != 0) { ok = false; why += " A:first blow split skin"; }
+
+  // B
+  uint32_t k = 1;
+  for (; k < 12 && count(kBruiseBroken) == 0; k++) blow(k);
+  const uint32_t deepB = count(bs.cap), splitB = count(kBruiseBroken);
+  uint32_t splitBleeding = 0;
+  for (const PrefabVoxel& v : lat)
+    if (BruiseBroken(v.bruise) && BodyStainMat(v.stain) == blood) splitBleeding++;
+  if (deepB <= deep1) { ok = false; why += " B:blows did not deepen"; }
+  if (splitB == 0) { ok = false; why += " B:never split"; }
+  if (splitBleeding != splitB) { ok = false; why += " B:a split cell is dry"; }
+
+  // brick mirrors the lattice
+  uint32_t brickMismatch = 0;
+  for (size_t i = 0; i < lat.size(); i++) {
+    const uint32_t lvl = BruiseLevel(lat[i].bruise);
+    const uint16_t want = lvl ? (uint16_t)((3u << 4 | lvl) << 8) : 0u;
+    if ((brickCell(i) & 0xFF00u) != want) brickMismatch++;
+  }
+  if (brickMismatch) { ok = false; why += " brick bruise byte disagrees"; }
+
+  // C: wash everything, the way water does, until nothing foreign is left.
+  std::vector<uint8_t> before(lat.size());
+  for (size_t i = 0; i < lat.size(); i++) before[i] = lat[i].bruise;
+  const uint16_t brickBefore = brickCell(0);   // untouched corner: nothing
+  (void)brickBefore;
+  std::vector<uint16_t> brickHiBefore(lat.size());
+  for (size_t i = 0; i < lat.size(); i++) brickHiBefore[i] = brickCell(i) & 0xFF00u;
+  for (int pass = 0; pass < 16; pass++)
+    for (size_t i = 0; i < lat.size(); i++) {
+      const uint16_t next = WashBodyStain(lat[i].stain, water, 4, 15);
+      lat[i].stain = next;
+      MicroBodyPokeStain(set, (uint32_t)own, lat[i].x, lat[i].y, lat[i].z, next);
+    }
+  uint32_t washedBlood = 0, bruiseMoved = 0, brickMoved = 0;
+  for (size_t i = 0; i < lat.size(); i++) {
+    washedBlood += BodyStainMat(lat[i].stain) == blood;
+    bruiseMoved += lat[i].bruise != before[i];
+    brickMoved += (brickCell(i) & 0xFF00u) != brickHiBefore[i];
+  }
+  if (washedBlood) { ok = false; why += " C:blood survived the wash"; }
+  if (bruiseMoved) { ok = false; why += " C:the wash moved a bruise"; }
+  if (brickMoved) { ok = false; why += " C:the wash moved a brick bruise byte"; }
+
+  // D: oil over everything.
+  for (size_t i = 0; i < lat.size(); i++) {
+    const uint16_t next = PackBodyStain(oil, 10);
+    lat[i].stain = next;
+    MicroBodyPokeStain(set, (uint32_t)own, lat[i].x, lat[i].y, lat[i].z, next);
+  }
+  uint32_t oilMoved = 0, oilOnBruise = 0;
+  for (size_t i = 0; i < lat.size(); i++) {
+    oilMoved += lat[i].bruise != before[i] ||
+                (brickCell(i) & 0xFF00u) != brickHiBefore[i];
+    oilOnBruise += BruiseLevel(lat[i].bruise) > 0 &&
+                   (brickCell(i) & 0x00FFu) == (4u << 4 | 10u);
+  }
+  if (oilMoved) { ok = false; why += " D:a coat moved a bruise"; }
+  if (oilOnBruise == 0) { ok = false; why += " D:no coat sits on a bruise"; }
+
+  // E
+  const BruiseTally tE = blow(k + 1);
+  uint32_t rebled = 0;
+  for (const PrefabVoxel& v : lat)
+    if (BruiseBroken(v.bruise) && BodyStainMat(v.stain) == blood) rebled++;
+  if (tE.pulped == 0) { ok = false; why += " E:the wash un-beat the skin"; }
+  if (rebled == 0) { ok = false; why += " E:split skin did not bleed again"; }
+
+  detail = Format(
+      "A bruised %u after 1 blow (split %u) | B after %u blows: %u at cap %u "
+      "(was %u), %u split, %u of them bleeding | brick mismatches %u | C wash: "
+      "%u blood left, %u bruises moved, %u brick bytes moved | D oil: %u moved, "
+      "%u bruised cells wearing it | E next blow: pulped %u/%u core, %u split "
+      "cells bleeding again%s",
+      bruised1, split1, k, deepB, bs.cap, deep1, splitB, splitBleeding,
+      brickMismatch, washedBlood, bruiseMoved, brickMoved, oilMoved, oilOnBruise,
+      tE.pulped, tE.core, rebled, why.empty() ? "" : (" |" + why).c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 const std::vector<Gate>& WoundGates() {
   static const std::vector<Gate> g = {
       {"wound-chip", "mob", {}, false, GateWoundChip, /*needsRender=*/false},
@@ -7882,6 +8074,7 @@ const std::vector<Gate>& WoundGates() {
       {"corpse-dismember", "mob", {}, false, GateCorpseDismember, false},
       {"head-cleave", "mob", {}, false, GateHeadCleave, false},
       {"corpse-blunt", "mob", {}, false, GateCorpseBlunt, false},
+      {"bruise-is-skin", "mob", {}, false, GateBruiseIsSkin, false},
       {"corpse-armor", "mob", {}, false, GateCorpseArmor, false},
       {"corpse-bleed", "mob", {}, false, GateCorpseBleed, false},
       {"body-stain", "mob", {}, false, GateBodyStain, false},

@@ -2015,9 +2015,13 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
   // and because a hot reload replaces the set wholesale with an empty one.
   {
     std::vector<uint8_t> slotOfMat(mats.size(), 0);
-    for (size_t i = 0; i < mats.size(); i++)
+    uint8_t bruiseSlot = 0;
+    const std::string& bruiseName = CurrentTuning().gore.bruiseMat;
+    for (size_t i = 0; i < mats.size(); i++) {
       slotOfMat[i] = (uint8_t)mats[i].stainSlot;
-    MicroBodySetStainSlots(micro, std::move(slotOfMat));
+      if (mats[i].name == bruiseName) bruiseSlot = (uint8_t)mats[i].stainSlot;
+    }
+    MicroBodySetStainSlots(micro, std::move(slotOfMat), bruiseSlot);
   }
   std::error_code ec;
   const std::vector<MobSource> sources = CollectMobSources(dir, log, ec);
@@ -2219,7 +2223,15 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
   // (sim/microbody.h keeps no dependency on sim/materials.h). Republished on
   // every reload because an R reload can renumber the slots under bricks that
   // are already packed.
-  if (microSet_) MicroBodySetStainSlots(*microSet_, stainSlotOfMat_);
+  // The BRUISE draws in gore.bruiseMat's slot (voxload.h PrefabVoxel::bruise):
+  // the skin's own damage, not a coat, so it rides beside the table.
+  if (microSet_) {
+    uint8_t bruiseSlot = 0;
+    const std::string& bruiseName = CurrentTuning().gore.bruiseMat;
+    for (size_t mi = 0; mi < mats.size(); mi++)
+      if (mats[mi].name == bruiseName) bruiseSlot = (uint8_t)mats[mi].stainSlot;
+    MicroBodySetStainSlots(*microSet_, stainSlotOfMat_, bruiseSlot);
+  }
   // What each material becomes when it CATCHES: the product of the first rule
   // in its bucket whose product is itself hot. Resolved from the table so the
   // ignition entry point never names a material — bone and steel refuse
@@ -11159,7 +11171,7 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
 }
 
 // ============================================================================
-// A BRUISE DEEPENS (2026-09-16)
+// A BRUISE DEEPENS (2026-09-16), AND IT IS THE SKIN'S (2026-09-26)
 //
 // The blunt mark used to go through `StainWoundAs`, which REWRITES a voxel's
 // material -- and a rewrite is all-or-nothing per cell, so the only place the
@@ -11168,32 +11180,40 @@ uint32_t Mob::StainWound(int limbIndex, Vec3 centreLocal, float radiusWorld,
 // punch produced a different scatter beside the first. Nothing about that reads
 // as a mark on a body; it reads as pixel damage.
 //
-// This is the same geometry writing the BODY COAT instead (phys/bodystain.h):
-// the voxel keeps its material and its art colour, and gains an amount that
-// microbody.wgsl multiplies and lerps over the albedo. So:
+// It then became a BODY COAT, which fixed the falloff and broke everything a
+// coat is: water rinsed a bruise off, a splash of mud replaced it, blood could
+// not sit on top of it, and since "pulped" was read off the blood coat, a
+// wash reset how far a beating had got. So since 2026-09-26 it is a LEVEL ON
+// THE TISSUE (voxload.h PrefabVoxel::bruise), drawn under whatever coat is on
+// top (microbody.wgsl). The voxel keeps its material and its art colour, and:
 //
-//   * the falloff lives in the AMOUNT -- a bruise is dark at the contact and
+//   * the falloff lives in the LEVEL -- a bruise is dark at the contact and
 //     fades out at the rim, on the same voxels, instead of being dense at the
 //     centre and sparse at the edge;
-//   * repeat blows ADD (bodystain.h AddBodyStain), so the same patch darkens
-//     in `gore.bruiseStep` increments to a `gore.bruiseMax` ceiling, which is
-//     the "each hit adds 15% up to 75%" the owner asked for;
-//   * and past 60% of that ceiling a blow may break the skin instead of
-//     deepening it, laying the creature's own blood over the worst of it.
+//   * repeat blows ADD, so the same patch darkens in `gore.bruiseStep`
+//     increments to a `gore.bruiseMax` ceiling;
+//   * past `gore.bruiseBleedFrom` of that ceiling a blow may SPLIT the skin
+//     (kBruiseBroken) instead of deepening it, and a split cell bleeds -- the
+//     creature's own blood as a coat over it -- and bleeds again every time it
+//     is struck, however often it has been washed;
+//   * split cells are PULP, and Mob::BluntPulpTick crumbles them.
+//
+// It heals on a living creature only (Mob::HealBruises); a split cell does not
+// heal, it is eaten. Water, rain and every other coat pass straight over it.
 //
 // EVERY VOXEL IN RANGE IS TOUCHED, not a subset -- that is the whole point of
-// moving to an alpha, and it is why there is no coherence draw here the way
+// the level, and it is why there is no coherence draw here the way
 // `StainWoundAs` has one: the mottle a bruise needs is in the per-voxel jitter
 // on the amount, which varies the SHADE rather than punching holes in it.
 //
 // ---- AND THE THIRD RUNG: WHAT IT FOUND ALREADY BROKEN (2026-09-19) ---------
 //
-// The sweep below reads every voxel's coat anyway, so it also COUNTS: how many
-// tissue voxels sit in the contact core, and how many of those already wear
-// blood at `gore.pulpAmt` or deeper. `Mob::BluntHit` scales its dent radius by
-// that share (Tuning::Gore::pulpCarveFrom), which is what makes a blunt weapon
-// remove nothing from an intact limb and open a crater in one that has been
-// beaten in the same place a dozen times.
+// The sweep below reads every voxel's bruise anyway, so it also COUNTS: how
+// many exposed tissue voxels sit in the contact core, and how many of those are
+// already split. `Mob::BluntHit` scales its dent by that share
+// (Tuning::Gore::pulpCarveFrom), which is what makes a blunt weapon remove
+// nothing from an intact limb and open a crater in one that has been beaten in
+// the same place a dozen times.
 uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
                          uint32_t seed, uint32_t bruiseMat, float power,
                          float hp, BruiseReport* report, bool unarmed) {
@@ -11216,12 +11236,13 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   if (cap == 0 || effStep <= 0.0f) return 0;
 
   MobLimb& limb = limbs_[limbIndex];
+  // The bruise is a byte of the FINE skin (voxload.h PrefabVoxel::bruise); a
+  // limb with only a collider lattice has nowhere to keep one.
   const bool fine = limb.HasFineSkin();
-  const float scale =
-      (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+  if (!fine) return 0;
+  const float scale = (float)std::max(1u, SkinScaleOf(limb));
   const Vec3 c = centreLocal * scale;
   const float r = radiusWorld * scale;
-  const float r2 = r * r;
   const std::vector<uint8_t>& tissue = def_->tissue;
   const float pw = std::clamp(power, 0.0f, 1.0f);
 
@@ -11250,15 +11271,6 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   const float bleedChance =
       std::clamp(effBleedChance, 0.0f, 1.0f) * pw * blowScale;
 
-  // Rung 3's reading. `pulpAmt` is a DEPTH of blood, not merely "wet": a single
-  // spray from a cut elsewhere should not make a limb crumble under a punch,
-  // and the bleed rung above lays its blood at the bruise's own (deep) amount
-  // precisely so that tissue somebody actually beat open reads differently
-  // from tissue that was rained on.
-  const uint32_t pulpAt =
-      (uint32_t)std::lround(std::clamp(gt.pulpAmt, 1.0f, 15.0f));
-  // The inner half-radius, in the squared metric the sweep already works in.
-  const float core2 = r2 * 0.25f;
   uint32_t coreCells = 0, pulpedCells = 0;
 
   // The brick must be OWNED before it can be poked, or the poke repaints every
@@ -11288,18 +11300,16 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   BruiseSoak bs;
   bs.centre = c;
   bs.radius = r;
-  bs.bruiseMat = bruiseMat;
   bs.bloodMat = bloodMat;
   bs.step = effStep;
   bs.cap = cap;
   bs.bleedFrom = bleedFrom;
   bs.bleedChance = bleedChance;
-  bs.pulpAt = pulpAt;
   bs.blowScale = blowScale;
   bs.tissue = &tissue;
   bs.seed = seed;
   StainLattice L;
-  if (fine) L.skin = &limb.skinVoxels; else L.coll = &limb.voxels;
+  L.skin = &limb.skinVoxels;
   BruiseTally tally;
   const uint32_t marked =
       SoakBruise(L, bs, &tally, poke ? micro : nullptr,
@@ -11307,12 +11317,14 @@ uint32_t Mob::BruiseLimb(int limbIndex, Vec3 centreLocal, float radiusWorld,
   coreCells = tally.core;
   pulpedCells = tally.pulped;
 
-  // THE LEDGER OWES A RECOUNT (mob.h LimbCoat). Without this the bruise is
-  // invisible to everything that reads "what is on this creature" — including
-  // the coat DECAY sweep, which walks the ledger's materials and would
-  // therefore never dry a bruise off. A stain written behind the ledger's back
-  // is a stain that is permanent by accident.
-  if (marked) coatDirty_ = twinDirty_ = true;
+  // THE LEDGER OWES A RECOUNT (mob.h LimbCoat) for the BLOOD a split cell
+  // sheds -- that is a coat, and a coat written behind the ledger's back is
+  // one the decay sweep never dries. The bruise itself is not a coat; it heals
+  // on its own clock (Mob::HealBruises), armed here.
+  if (marked) {
+    coatDirty_ = twinDirty_ = true;
+    limb.bruised = true;
+  }
   if (report) {
     report->marked = marked;
     report->core = coreCells;
@@ -12403,7 +12415,7 @@ bool Mob::ReskinLimbMicro(MobLimb& limb, uint32_t skinScale,
     mv.reserve(limb.voxels.size());
     for (const DebrisVoxel& v : limb.voxels)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                    (uint16_t)(v.payload & 0xFFF), 0, v.stain});
+                    (uint16_t)(v.payload & 0xFFF), 0, 0, v.stain});
   }
   IVec3 shift{};
   if (!MicroBodyEdit(*MicroSet(), (uint32_t)limb.microModel, mv, shift))
@@ -12836,7 +12848,7 @@ uint64_t Mob::EmitCarvedFragment(const MobLimb& src, int srcLimb,
     mv.reserve(part.size());
     for (const DebrisVoxel& v : part)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                    (uint16_t)(v.payload & 0xFFF), 0, v.stain});
+                    (uint16_t)(v.payload & 0xFFF), 0, 0, v.stain});
     IVec3 dims{1, 1, 1};
     for (const PrefabVoxel& v : mv) {
       dims.x = std::max<int>(dims.x, v.x + 1);
@@ -15694,6 +15706,8 @@ void Mob::BurnTick(uint32_t tick, World& world, std::vector<CellOp>& cellOps,
   // PULPED TISSUE DISSOLVES (the blunt counterpart of InfectTick). Same
   // position, same FlushBurn tail, same return contract.
   if (!BluntPulpTick(tick, world, spawns)) return;
+  // ...and a living creature's bruises fade (never reshapes limbs_).
+  HealBruises(tick);
   if (!SyncJointTwins(world, spawns)) return;
   // The burn cap (Gore §G). Recounted at a bounded cadence while the lattice
   // is changing and not at all while it is not; may kill the creature, and is
@@ -16868,13 +16882,84 @@ bool MobSystem::SetLimbCellAt(uint64_t mobId, int limb, IVec3 rest,
 }
 
 // ============================================================================
+// BRUISES FADE (2026-09-26) -- see mob.h HealBruises
+//
+// A bruise stopped being a coat that day, and with it went the coat DECAY that
+// used to fade it. This is that clock back, on the bruise byte: the period is
+// gore.bruiseMat's own coat.decay (materials.json skin_bruised, seconds per
+// level) through the same CoatDryTicks every coat uses, down to its
+// coat.decayFloor, so the tuned rate did not move. Half the contused voxels per
+// period, hash-picked, so a bruise fades unevenly the way the coat did rather
+// than like a slider.
+//
+// COST (rule 2). A creature with no bruised limb pays one bool per limb. A
+// bruised one sweeps that limb's skin once a period (1350 ticks at the shipped
+// 45 s), and stops being swept the first time a sweep finds it whole.
+// ============================================================================
+void Mob::HealBruises(uint32_t tick) {
+  if (!alive_ || !def_ || !sys_) return;
+  bool any = false;
+  for (const MobLimb& l : limbs_) any |= l.bruised;
+  if (!any) return;
+  const uint32_t bruiseMat =
+      sys_->MaterialIdNamed(CurrentTuning().gore.bruiseMat);
+  const uint32_t period = bruiseMat ? sys_->CoatDryTicks(bruiseMat) : 0u;
+  if (period == 0) return;   // authored never to fade
+  // ...and to what: coat.decayFloor, the faint trace a bad beating leaves.
+  const uint32_t floor = bruiseMat < sys_->coatDecayFloor_.size()
+                             ? sys_->coatDecayFloor_[bruiseMat]
+                             : 0u;
+  MicroBodySet* micro = MicroSet();
+  for (int li = 0; li < (int)limbs_.size(); li++) {
+    MobLimb& limb = limbs_[li];
+    if (!limb.bruised) continue;
+    if (!limb.HasFineSkin()) {
+      limb.bruised = false;
+      continue;
+    }
+    // Staggered per creature and limb, so a crowd beaten in one brawl does not
+    // sweep on one tick.
+    const uint32_t key =
+        (uint32_t)id_ * 0x9E3779B9u + (uint32_t)li * 2654435761u;
+    if ((tick + key) % period != 0) continue;
+    const bool poke = micro && limb.microModel >= 0 &&
+                      (size_t)limb.microModel < micro->owned.size() &&
+                      micro->owned[(size_t)limb.microModel];
+    bool left = false;
+    for (size_t i = 0; i < limb.skinVoxels.size(); i++) {
+      PrefabVoxel& v = limb.skinVoxels[i];
+      const uint32_t lvl = BruiseLevel(v.bruise);
+      if (lvl == 0) continue;
+      // A split cell is the pulp tick's to eat, not this clock's to heal; it
+      // keeps the limb on the list so that whatever of it survives is seen.
+      if (lvl == kBruiseBroken || (v.material & 0xFFFu) == 0) {
+        left |= lvl == kBruiseBroken && (v.material & 0xFFFu) != 0;
+        continue;
+      }
+      if (lvl <= floor) continue;
+      if (Hash3(key ^ (uint32_t)i, tick, 0xB2015Eu) % 1000u >= 500u) {
+        left = true;
+        continue;
+      }
+      v.bruise = (uint8_t)(lvl - 1u);
+      if (lvl - 1u > floor) left = true;
+      if (poke)
+        MicroBodyPokeBruise(*micro, (uint32_t)limb.microModel, v.x, v.y, v.z,
+                            v.bruise);
+    }
+    limb.bruised = left;
+  }
+}
+
+// ============================================================================
 // PULPED TISSUE DISSOLVES (2026-09-19, gore.pulpRotRate)
 //
 // The blunt counterpart of InfectTick, and deliberately simpler: there is no
 // SPREAD phase (blunt trauma does not rot healthy tissue -- that progression is
 // driven by further BLOWS, not by time) and no cross-joint migration. The one
 // phase that runs is ROT: pulped voxels -- those wearing the victim's own blood
-// at gore.pulpAmt depth or deeper -- are eaten one at a time at pulpRotRate,
+// has SPLIT (kBruiseBroken, 2026-09-26; it read "wears blood at gore.pulpAmt"
+// until the bruise stopped being a coat) -- are eaten one at a time at pulpRotRate,
 // through the same Bernoulli draw and the same FlushBurn tail the infection
 // uses, so the disappearance is noisy, gradual, and reads as beaten flesh
 // coming apart rather than as a clean sphere of nothing.
@@ -16892,10 +16977,7 @@ bool Mob::BluntPulpTick(uint32_t tick, World& world,
   const auto& gt = CurrentTuning().gore;
   if (gt.pulpRotRate <= 0.0f) return true;
   const float perTick = 1.0f / (60.0f * 30.0f);
-  const uint32_t bloodMat = def_->bleedMat;
-  if (bloodMat == 0) return true;
-  const uint32_t pulpAt =
-      (uint32_t)std::lround(std::clamp(gt.pulpAmt, 1.0f, 15.0f));
+  if (def_->bleedMat == 0) return true;
   // WHAT CRUMBLES TO THIS CREATURE'S BLOOD, i.e. soft tissue. Empty means the
   // creature authored no census and everything counts, which is the same
   // convention SoakBruise takes.
@@ -16949,24 +17031,21 @@ bool Mob::BluntPulpTick(uint32_t tick, World& world,
       return c == kNoBurnCell ? 0u : (bs.idx[c] & ~kBurnQueued);
     };
 
-    // BONE DOES NOT DISSOLVE (2026-09-22). Rung 2 lays its blood only on
-    // tissue (SoakBruise makes the same exclusion: a contusion is a burst
-    // capillary bed), but blood on a voxel is not the only way one gets there
-    // -- StainWoundAs floors every NON-tissue cell in a cut at `boneMin`
-    // precisely so a wound shows bone through the blood, and pulpAmt is below
-    // that floor. So a limb cut once and then beaten had its SKELETON eaten,
-    // which is the structure every sever rule in CarveLimb measures: take the
-    // bone out from under a forearm and what is left is a fraction and a split.
-    // A mace shatters bone, it does not delete it.
+    // BONE DOES NOT DISSOLVE (2026-09-22). SoakBruise never splits bone (a
+    // contusion is a burst capillary bed), so this is belt and braces now that
+    // pulp is the bruise byte rather than blood; it was load-bearing while
+    // pulp was "wears blood", because StainWoundAs floors every NON-tissue
+    // cell in a cut at `boneMin` so a wound shows bone through the blood --
+    // a limb cut once and then beaten had its SKELETON eaten, which is the
+    // structure every sever rule in CarveLimb measures. A mace shatters bone,
+    // it does not delete it.
     std::vector<uint32_t> candidates;
     const size_t n = v.Size();
     for (size_t i = 0; i < n; i++) {
       const uint32_t mat = v.Mat(i) & 0xFFFu;
       if (mat == 0) continue;
       if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) continue;
-      const uint16_t st = v.Stain(i);
-      if (BodyStainMat(st) == bloodMat && BodyStainAmt(st) >= pulpAt)
-        candidates.push_back((uint32_t)i);
+      if (BruiseBroken(v.Bruise(i))) candidates.push_back((uint32_t)i);
     }
     if (candidates.empty()) {
       limb.bluntPulp = false;
@@ -19352,8 +19431,9 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
                                                         : gt.pulpCarveFrom;
 
   // 1. THE BRUISE, first and widest, on skin that is still there. An
-  //    ACCUMULATING COAT in gore.bruiseMat rather than a rewrite of the skin
-  //    to it: a punch marks you, it does not repaint you, and the mark gets
+  //    ACCUMULATING LEVEL on the skin itself (PrefabVoxel::bruise), not a
+  //    rewrite and not a coat: a punch marks you, water does not wash it
+  //    off, and the mark gets
   //    darker the more of them land (Mob::BruiseLimb). The radius still scales
   //    with power so a glancing blow marks a smaller patch; how DARK the patch
   //    goes is now the step's business, not the radius's.
@@ -19370,8 +19450,8 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
   // The weapon's `bluntCarve` is still the ceiling (a bare fist authors almost
   // nothing and a mace ~0.6 of the tuning radius), but it is no longer the
   // whole story: the radius is scaled by how much of the contact core this
-  // blow found ALREADY pulped -- bloodied at `gore.pulpAmt` after the bruise
-  // there saturated and broke.
+  // blow found ALREADY pulped -- skin split (kBruiseBroken) after the bruise
+  // there saturated.
   //
   // DISSOLUTION REPLACES THE INSTANT CARVE. Before this, earned > 0 fired
   // CarveLimbRadial: a clean sphere of nothing, in one tick. Now it flags
@@ -21993,6 +22073,18 @@ uint32_t MobSystem::LimbCoatMatCount(uint64_t mobId, int limbIndex,
   return n;
 }
 
+uint32_t MobSystem::LimbBruiseCount(uint64_t mobId, int limbIndex,
+                                    uint32_t minLevel) const {
+  const Mob* mob = FindCreature(mobId);
+  if (!mob || limbIndex < 0 || limbIndex >= (int)mob->limbs_.size()) return 0;
+  const MobLimb& l = mob->limbs_[limbIndex];
+  const uint32_t lo = std::max(1u, minLevel);
+  uint32_t n = 0;
+  for (const PrefabVoxel& v : l.skinVoxels)
+    if ((v.material & 0xFFFu) != 0 && BruiseLevel(v.bruise) >= lo) n++;
+  return n;
+}
+
 uint64_t MobSystem::CoatDigest(uint64_t mobId, uint64_t* sumAmt) const {
   const Mob* mob = FindCreature(mobId);
   uint64_t h = 1469598103934665603ull, sum = 0;
@@ -22553,7 +22645,7 @@ static bool SameSkin(const std::vector<PrefabVoxel>& a,
   for (size_t k = 0; k < a.size(); k++)
     if (a[k].x != b[k].x || a[k].y != b[k].y || a[k].z != b[k].z ||
         a[k].material != b[k].material || a[k].color != b[k].color ||
-        a[k].stain != b[k].stain)
+        a[k].stain != b[k].stain || a[k].bruise != b[k].bruise)
       return false;
   return true;
 }
@@ -22581,7 +22673,7 @@ static bool SameShape(const std::vector<V>& a, const std::vector<V>& b) {
   return true;
 }
 // Bring a limb's brick up to its (same-shaped) lattice by POKES: own it copy-
-// on-write, then rewrite every cell's material, art slot and coat — the door
+// on-write, then rewrite every cell's material, art slot, coat and bruise — the door
 // SoakLimb and the burn front use, which never rebases the brick. Lattice
 // coordinates are brick-local for a limb (those paths poke v.At(i) directly).
 // A collider-only limb draws unpainted (ReskinLimbMicro's rule for that case).
@@ -22598,6 +22690,7 @@ static void RepaintLimbMicro(MobLimb& L, MicroBodySet* micro) {
       MicroBodyPoke(*micro, model, v.x, v.y, v.z,
                     (uint8_t)(v.material & 0xFFFu), v.color);
       MicroBodyPokeStain(*micro, model, v.x, v.y, v.z, v.stain);
+      MicroBodyPokeBruise(*micro, model, v.x, v.y, v.z, v.bruise);
     }
   } else {
     for (const DebrisVoxel& v : L.voxels) {
@@ -23032,6 +23125,8 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
       r.Pod(s.size);
       r.PodVec(s.voxels);
       r.PodVec(s.skinVoxels);
+      if (version < 8)   // the bruise byte was padding (kSaveVersion 8)
+        for (PrefabVoxel& v : s.skinVoxels) v.bruise = 0;
       continue;
     }
     r.U32(s.alive);
@@ -23044,6 +23139,8 @@ bool MobSystem::ReadMobRecord(ByteReader& r, MobRecord& out, uint32_t version) {
     r.Pod(s.size);
     r.PodVec(s.voxels);
     r.PodVec(s.skinVoxels);
+    // v3 is always older than the bruise byte (kSaveVersion 8).
+    for (PrefabVoxel& v : s.skinVoxels) v.bruise = 0;
   }
   // The pack, mirroring SaveOne's tail.
   //
@@ -23289,6 +23386,8 @@ void MobSystem::OverlayMobRecord(Mob& m, MobRecord& rec, bool placeLimbs) {
                              SameVec3(s.anchorLimb, L.anchorLimb);
       L.voxels = std::move(s.voxels);
       L.skinVoxels = std::move(s.skinVoxels);
+      // A saved bruise heals after the load as it would have before it.
+      for (const PrefabVoxel& v : L.skinVoxels) L.bruised |= v.bruise != 0;
       L.size = s.size;
       L.restOffset = s.restOffset;
       L.anchorRoot = s.anchorRoot;

@@ -733,6 +733,9 @@ const char* const kOrder[] = {
     // an instant sphere out of it: the same three-rung ladder the living
     // climb (owner report 2026-09-20). Ticks the debris system only.
     "corpse-blunt",
+    // Pure lattice arithmetic, touches no world state: the bruise is the
+    // skin's byte, survives a wash and a coat, and split skin bleeds again.
+    "bruise-is-skin",
     // Right after it, and for the same reason it exists: `corpse-armor` is
     // `corpse-intact` with a wardrobe on and the head off first. It needs the
     // same pristine ground and leaves the same nothing behind.

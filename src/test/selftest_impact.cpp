@@ -574,8 +574,10 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
   // could see because `bluntCarveRadius` was 0 as well and the dent claim was
   // therefore red for an unrelated-looking reason.
   const uint32_t bloodMat = mobs.Defs()[t.defIndex].bleedMat;
-  const uint32_t pulpAt =
-      (uint32_t)std::lround(std::clamp(gtune.pulpAmt, 1.0f, 15.0f));
+  // PULPED = the skin SPLIT (voxload.h kBruiseBroken), read off the bruise
+  // byte since 2026-09-26 -- it was "blood at gore.pulpAmt" while the bruise
+  // was a coat, which a rinse could undo.
+  const uint32_t pulpAt = kBruiseBroken;
   uint32_t pulped = 0, pulpedOne = 0;
   {
     const uint64_t id = SpawnTarget(c, t, 415);
@@ -600,11 +602,11 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
       // darker" — and that needs a reading from before the rest of the blows
       // landed to compare against.
       if (k == 0 && mobs.LimbBody(id, t.limb)) {
-        if (bruiseMat) bruiseOne = mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1);
+        if (bruiseMat) bruiseOne = mobs.LimbBruiseCount(id, t.limb, 1);
         // ZERO IS THE CLAIM HERE, and it is half of what makes the ladder a
         // ladder: one blow on intact skin bruises and breaks nothing.
         if (bloodMat)
-          pulpedOne = mobs.LimbCoatMatCount(id, t.limb, bloodMat, pulpAt);
+          pulpedOne = mobs.LimbBruiseCount(id, t.limb, pulpAt);
       }
     }
     attached = mobs.LimbBody(id, t.limb) != 0;
@@ -613,17 +615,17 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
     if (attached) {
       afterBlows = LiveVoxels(mobs, id, t.limb);
       hp1 = mobs.LimbHp(id, t.limb);
-      // THE COAT, NOT THE MATERIAL. Counting `skin_bruised` VOXELS was right
-      // while a bruise was a material rewrite and is now always zero: the
-      // voxel keeps its own material and carries the bruise as a 0..15 body
-      // stain instead. `minAmt` 1 is "marked at all".
-      bruise = bruiseMat ? mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1) : 0u;
+      // THE BRUISE BYTE, NOT THE MATERIAL OR THE COAT (2026-09-26): the voxel
+      // keeps its own material and carries the bruise as a 0..15 level on the
+      // skin itself (voxload.h PrefabVoxel::bruise). Level 1 is "marked at
+      // all".
+      bruise = bruiseMat ? mobs.LimbBruiseCount(id, t.limb, 1) : 0u;
       // ...and how many have been driven past a single blow's worth. This is
       // the half that proves the accumulation rather than merely the marking.
       bruiseDeep = (bruiseMat && bruiseCap)
-                       ? mobs.LimbCoatMatCount(id, t.limb, bruiseMat, bruiseCap)
+                       ? mobs.LimbBruiseCount(id, t.limb, bruiseCap)
                        : 0u;
-      pulped = bloodMat ? mobs.LimbCoatMatCount(id, t.limb, bloodMat, pulpAt) : 0u;
+      pulped = bloodMat ? mobs.LimbBruiseCount(id, t.limb, pulpAt) : 0u;
       bluntBleed = mobs.LimbBleedBudget(id, t.limb);
       // ---- ...AND THEN IT COMES APART (2026-09-19, gore.pulpRotRate) -------
       //
@@ -774,8 +776,8 @@ Status GateImpactBlunt(Ctx& c, std::string& detail) {
       "the instant the blows end (%u gone in the swing, must be 0) -> %u after "
       "%d ticks dissolving at %.0f vox/min (%.1f%% gone, cap %.0f%%), bruised "
       "%u after one blow -> %u after %d (%u past %u/15, i.e. more than one "
-      "blow), attached=%d severs=%zu alive=%d | ladder: %u pulped (blood >= "
-      "%u/15) after one blow -> %u after %d | bleed budget %.2f vs %.2f for "
+      "blow), attached=%d severs=%zu alive=%d | ladder: %u pulped (bruise "
+      ">= %u/15, split) after one blow -> %u after %d | bleed budget %.2f vs %.2f for "
       "the same hp as cuts | through the real sweep: hp -%.1f, %u voxels, "
       "attached=%d, contact reported=%d/%d, worst %.2f vox off the limb axis",
       t.defName.c_str(), t.limbName.c_str(), kHits, mace.blunt,
@@ -1170,8 +1172,7 @@ Status GateImpactFist(Ctx& c, std::string& detail) {
   const float kPulpRot = (float)BaselineNumber("impactPulpRot", 30.0);
   const int kPulpTicks = (int)BaselineNumber("impactPulpTicks", 60);
   const uint32_t bloodMat = mobs.Defs()[t.defIndex].bleedMat;
-  const uint32_t pulpAt = (uint32_t)std::lround(
-      std::clamp(CurrentTuning().gore.pulpAmt, 1.0f, 15.0f));
+  const uint32_t pulpAt = kBruiseBroken;   // split skin (voxload.h)
 
   struct Arm {
     uint32_t before = 0, afterBlows = 0, after = 0, bruise = 0, pulped = 0;
@@ -1201,16 +1202,16 @@ Status GateImpactFist(Ctx& c, std::string& detail) {
     a.alive = mobs.IsAlive(id);
     if (a.attached) {
       a.afterBlows = LiveVoxels(mobs, id, t.limb);
-      // The COAT, not the material -- a bruise no longer rewrites the voxel it
-      // marks (DESIGN.md, "A bruise is an alpha that deepens"), so the old
-      // material count is always zero now. `minAmt` 1 is "marked at all", which
-      // is the claim this arm makes: a bare fist bruises and takes nothing.
-      a.bruise = bruiseMat ? mobs.LimbCoatMatCount(id, t.limb, bruiseMat, 1) : 0u;
-      // ...and how much of the patch the blows BROKE (blood at pulp depth),
+      // The skin's BRUISE byte (voxload.h PrefabVoxel::bruise) -- neither the
+      // material nor, since 2026-09-26, a coat. Level 1 is "marked at all",
+      // which is the claim this arm makes: a bare fist bruises and takes
+      // nothing.
+      a.bruise = bruiseMat ? mobs.LimbBruiseCount(id, t.limb, 1) : 0u;
+      // ...and how much of the patch the blows SPLIT (kBruiseBroken),
       // which is what the dissolution below has to work with. Reported, not
       // asserted: the gauntlet's ladder is impact-blunt's claim, made there.
       a.pulped =
-          bloodMat ? mobs.LimbCoatMatCount(id, t.limb, bloodMat, pulpAt) : 0u;
+          bloodMat ? mobs.LimbBruiseCount(id, t.limb, pulpAt) : 0u;
       float hp0[(int)DamageCause::Count] = {};
       uint32_t falls0 = 0;
       Vec3 o0{};

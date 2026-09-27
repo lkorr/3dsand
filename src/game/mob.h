@@ -1052,6 +1052,9 @@ struct BurnLimbView {
   void SetStain(size_t i, uint16_t st) const {
     if (skin) (*skin)[i].stain = st; else (*coll)[i].stain = st;
   }
+  // The skin's BRUISE (voxload.h PrefabVoxel::bruise). The coarse lattice has
+  // none and reads 0 -- see phys/bodystain.h StainLattice::Bruise.
+  uint8_t Bruise(size_t i) const { return skin ? (*skin)[i].bruise : 0u; }
 
   // ---- A WOUND IS WET FLESH, NOT A POOL OF BLOOD (gore.woundHeals) --------
   //
@@ -1610,6 +1613,11 @@ struct MobLimb {
   // same per-tick Bernoulli draw the infection uses. No clock state for the
   // same reason InfectTick carries none (see the note above that function).
   bool bluntPulp = false;
+  // SOMETHING ON THIS LIMB'S SKIN IS BRUISED (voxload.h PrefabVoxel::bruise):
+  // set by Mob::BruiseLimb, cleared by Mob::HealBruises once a sweep finds the
+  // skin whole again. The whole cost of healing for a limb nobody has hit is
+  // this bool.
+  bool bruised = false;
   // What is ON this limb, recounted at a bounded cadence (see LimbCoat).
   // Index-parallel by construction because it rides the limb itself, which is
   // what RemoveAppendedSlots moves wholesale.
@@ -3769,7 +3777,7 @@ class Mob {
   //
   // `report` is how the caller reaches the third rung of the blunt ladder
   // (Tuning::Gore::pulpCarveFrom). The sweep over the contact sphere already
-  // reads every voxel's coat, so it is free to say how much of the CORE has
+  // reads every voxel's bruise, so it is free to say how much of the CORE has
   // already been beaten open — and that share, not the weapon alone, is what
   // decides whether this blow removes anything. A separate probe pass would
   // walk the same lattice twice to learn the same fact.
@@ -3779,9 +3787,9 @@ class Mob {
   // over the whole sphere would be permanently small and no weapon would ever
   // earn a dent.
   struct BruiseReport {
-    uint32_t marked = 0;  // coat words changed by THIS blow
-    uint32_t core = 0;    // tissue voxels inside the contact core
-    uint32_t pulped = 0;  // of those, already wearing blood at gore.pulpAmt or deeper
+    uint32_t marked = 0;  // bruises (or bleeding) changed by THIS blow
+    uint32_t core = 0;    // exposed tissue voxels inside the contact core
+    uint32_t pulped = 0;  // of those, already split (voxload.h kBruiseBroken)
     // 0 on clean skin, 1 on a core that is wholly pulp. The number the dent
     // radius is scaled by.
     float Ripeness() const {
@@ -3944,11 +3952,18 @@ class Mob {
   bool InfectTick(uint32_t tick, World& world,
                   std::vector<ParticleSpawn>& spawns);
   // PULPED TISSUE DISSOLVES (the blunt counterpart of InfectTick). One tick
-  // older, same Bernoulli draw, same FlushBurn tail. Eats voxels wearing the
-  // victim's own blood at gore.pulpAmt depth or deeper. Same return contract
-  // as InfectTick: false means limbs_ was reshaped and the caller must stop.
+  // older, same Bernoulli draw, same FlushBurn tail. Eats tissue whose bruise
+  // has SPLIT (kBruiseBroken). Same return contract as InfectTick: false
+  // means limbs_ was reshaped and the caller must stop.
   bool BluntPulpTick(uint32_t tick, World& world,
                      std::vector<ParticleSpawn>& spawns);
+  // A LIVING creature's bruises fade: once per gore.bruiseMat's coat.decay
+  // period (seconds per level, scaled by coat.decayScale -- the clock the
+  // bruise had when it was a coat), about half of each bruised limb's
+  // contused voxels drop a level. A SPLIT cell does not heal (BluntPulpTick
+  // eats it), and the dead do not heal at all. Never touches the coat, so
+  // blood over a bruise dries on its own clock and the bruise on its own.
+  void HealBruises(uint32_t tick);
   // One limb, on a tick whose dice came up non-zero. Same return contract.
   bool InfectStep(int limbIndex, uint32_t tick, uint32_t nSpread,
                   uint32_t nRot, World& world,
@@ -5456,7 +5471,12 @@ class MobSystem {
   // count, dye, FILL, damage) where they were name/count/dye and
   // name/dye/damage, so a looted or risen flask keeps what it held. v6 and
   // older still LOAD: their pack and gear come back with no fill.
-  static constexpr uint32_t kSaveVersion = 7;
+  //
+  // 8 (2026-09-26): THE BRUISE BYTE (voxload.h PrefabVoxel::bruise). Same
+  // bytes, same layout -- it took what was the padding byte after `color` --
+  // but that byte was uninitialised padding in every older file, so a v7 or
+  // older skin lattice has it ZEROED on read rather than trusted.
+  static constexpr uint32_t kSaveVersion = 8;
   static constexpr uint32_t kSaveVersionMin = 3;
   // Record limb kinds (v4).
   static constexpr uint32_t kLimbSevered = 0;
@@ -6080,11 +6100,17 @@ class MobSystem {
                                uint32_t coatMat, uint32_t* coated) const;
   // ...and the OTHER field on the same voxel: how many cells are WEARING a coat
   // of `coatMat` (0xFFFFFFFF = any) at `minAmt` or deeper. The one above filters
-  // on what the voxel IS MADE OF; this filters on what is ON it, which is what
-  // "how much of this limb is bruised" means. Mixing the two reports 0 for a
-  // thoroughly bruised limb — see the note at the definition.
+  // on what the voxel IS MADE OF; this filters on what is ON it. NOT how much
+  // of a limb is bruised since 2026-09-26 -- a bruise is not a coat any more;
+  // that is LimbBruiseCount below.
   uint32_t LimbCoatMatCount(uint64_t mobId, int limbIndex, uint32_t coatMat,
                             uint32_t minAmt) const;
+  // ...and the THIRD field: how many of the limb's skin voxels are BRUISED at
+  // level `minLevel` or deeper (voxload.h PrefabVoxel::bruise; kBruiseBroken
+  // counts only the split, i.e. pulped, cells). What "how much of this limb
+  // is bruised" means. 0 for a limb with no fine skin, which cannot bruise.
+  uint32_t LimbBruiseCount(uint64_t mobId, int limbIndex,
+                           uint32_t minLevel) const;
   // EVERY coat word on the creature, every limb, in one number (FNV over
   // limb, voxel, stain), and in `*sumAmt` the summed coat amount. Two runs
   // whose bodies carry the same coat voxel for voxel agree (the corpse-sleep

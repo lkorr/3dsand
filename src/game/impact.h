@@ -17,7 +17,7 @@
 //          rules (cut-through, hanging by a thread). Plate stops it almost
 //          entirely (iron k = 0.05, floored at one lattice cell).
 //   BLUNT  trauma. hp charged to the struck limb WITHOUT removing voxels: a
-//          bruise (skin rewritten to `gore.bruiseMat`), at most a shallow
+//          bruise (a level on the skin, voxload.h PrefabVoxel::bruise), at most a shallow
 //          radial DENT (`bluntCarve`), and NEVER a sever — a blunt hit does
 //          not take a limb off, however many land. Against a worn shell it
 //          breaks shell voxels (`armorBreak`) and a share TRANSMITS through

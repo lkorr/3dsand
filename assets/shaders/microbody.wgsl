@@ -133,8 +133,9 @@ struct VSOut {
   // the same reason `base`/`dims` are: refetching insts -> models per fragment
   // is two dependent storage loads for a value constant across the instance.
   @location(8) @interpolate(flat) cut : u32,
-  // Pool word where this model's STAIN LATTICE starts (one byte per micro
-  // voxel, 4 per word, same idx order as the payload), or 0 when the block
+  // Pool word where this model's STAIN LATTICE starts (16 bits per micro
+  // voxel -- coat byte, bruise byte -- 2 per word, same idx order as the
+  // payload), or 0 when the block
   // carries none -- bit 30 of the dims word (sim/microbody.h). A shared def
   // model never has one; a body grows one the first time it is bloodied.
   @location(9) @interpolate(flat) stainBase : u32,
@@ -260,16 +261,17 @@ const MB_DIMS_STAIN_BIT : u32 = 0x40000000u;
 
 // ---- BLOOD ON A BODY (DESIGN.md section 7) ----------------------------------
 //
-// The stain byte of a hit voxel: amount in the low nibble, stain TYPE (the
-// same palette slot the voxel word's bits 28..30 carry) above it. Read once,
-// at the hit only, from the lattice after the payload. 0 when the model has
-// no lattice or the voxel is clean.
+// The 16-bit stain cell of a hit voxel, two per word: the COAT byte low and
+// the BRUISE byte high (sim/microbody.h, dims bit 30). Each byte is amount in
+// the low nibble and stain TYPE (the same palette slot the voxel word's bits
+// 28..30 carry) above it. Read once, at the hit only, from the lattice after
+// the payload. 0 when the model has no lattice or the voxel is clean.
 fn poolStainAt(stainBase : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
   if (stainBase == 0u) { return 0u; }
   let idx = u32((p.z * dims.y + p.y) * dims.x + p.x);
-  let w = stainBase + (idx >> 2u);
+  let w = stainBase + (idx >> 1u);
   if (w >= MICRO_BODY_POOL_WORDS) { return 0u; }
-  return (pool[w] >> ((idx & 3u) * 8u)) & 0xFFu;
+  return (pool[w] >> ((idx & 1u) * 16u)) & 0xFFFFu;
 }
 
 // The same look as the ground's stain (raymarch.wgsl applyStain), on purpose:
@@ -674,7 +676,16 @@ fn fs(in : VSOut) -> FSOut {
   // where the ground applies its own stain: a stain is a change to what the
   // surface is, and it has to take the scene's light like the skin under it.
   // One pool load, and only for models that carry a lattice at all.
-  let coatWord = poolStainAt(in.stainBase, dims, c);
+  //
+  // THE BRUISE FIRST, THEN THE COAT (2026-09-26). A bruise is the skin itself
+  // discoloured, not something on it, so it is tinted into the albedo before
+  // anything that sits on top: blood, water or mud over a bruise covers it the
+  // way it would cover unhurt skin, and washing the coat off shows the bruise
+  // still there. Same palette entry, mottle and knobs as a coat -- the look is
+  // unchanged, only the layering is.
+  let stainCell = poolStainAt(in.stainBase, dims, c);
+  let coatWord = stainCell & 0xFFu;
+  albedo = bodyStainTint(albedo, stainCell >> 8u, c, scale, R.time);
   albedo = bodyStainTint(albedo, coatWord, c, scale, R.time);
 
   // `tCur` is already the parameter along the UNNORMALIZED camera-to-fragment

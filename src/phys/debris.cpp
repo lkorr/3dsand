@@ -4408,7 +4408,7 @@ bool DebrisSystem::ReskinMicro(Body& b) {
     mv.reserve(b.voxels.size());
     for (const DebrisVoxel& v : b.voxels)
       mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                    (uint16_t)(v.payload & 0xFFF), 0, v.stain});
+                    (uint16_t)(v.payload & 0xFFF), 0, 0, v.stain});
   }
   IVec3 shift{};
   if (!MicroBodyEdit(*microSet_, b.micro.model, mv, shift)) return false;
@@ -5334,12 +5334,14 @@ float DebrisSystem::BruiseBody(uint64_t handle, Vec3 atVoxel,
       (uint32_t)std::lround(std::clamp(gt.bruiseMax, 0.0f, 15.0f));
   if (cap == 0 || effStep <= 0.0f) return 0.0f;
 
+  // The bruise is a byte of the FINE skin (voxload.h PrefabVoxel::bruise);
+  // a body with only a collider lattice has nowhere to keep one.
+  const bool fine = b.HasFineSkin();
+  if (!fine) return 0.0f;
   phys_->GetTransform(b.handle, b.xf);
   const float qi[4] = {-b.xf.quat[0], -b.xf.quat[1], -b.xf.quat[2],
                        b.xf.quat[3]};
-  const bool fine = b.HasFineSkin();
-  const float scale =
-      (float)std::max(1u, fine ? b.micro.skinScale : b.physScale);
+  const float scale = (float)std::max(1u, b.micro.skinScale);
   const Vec3 cLocal = QuatRot(qi, atVoxel - b.xf.pos) * scale;
   const float pw = std::clamp(power, 0.0f, 1.0f);
   float blowScale = 1.0f;
@@ -5361,28 +5363,23 @@ float DebrisSystem::BruiseBody(uint64_t handle, Vec3 atVoxel,
   BruiseSoak bs;
   bs.centre = cLocal;
   bs.radius = radiusVoxels * scale;
-  bs.bruiseMat = bruiseMat;
   bs.bloodMat = b.bleedMat;
   bs.step = effStep;
   bs.cap = cap;
   bs.bleedFrom = (uint32_t)std::lround(
       (float)cap * std::clamp(gt.bruiseBleedFrom, 0.0f, 1.0f));
   bs.bleedChance = std::clamp(effBleedChance, 0.0f, 1.0f) * pw * blowScale;
-  bs.pulpAt = (uint32_t)std::lround(std::clamp(gt.pulpAmt, 1.0f, 15.0f));
   bs.blowScale = blowScale;
   bs.tissue = tissue.empty() ? nullptr : &tissue;
   bs.seed = b.serial * 2654435761u + seed;
   StainLattice L;
-  if (fine)
-    L.skin = &b.skinVoxels;
-  else
-    L.coll = &b.voxels;
+  L.skin = &b.skinVoxels;
   BruiseTally tally;
   SoakBruise(L, bs, &tally, nullptr, -1);
   if (tally.marked) {
-    // The coarse lattice carries the mark too, and the brick is what the
+    // The coarse lattice carries the blood too, and the brick is what the
     // player sees: re-skin so the bruise actually appears.
-    if (fine) DeriveColliderFromSkin(b);
+    DeriveColliderFromSkin(b);
     if (b.micro.Valid()) ReskinMicro(b);
     instancesDirty_ = true;
   }
@@ -5409,8 +5406,6 @@ void DebrisSystem::PulpTick(uint32_t tick, World& world,
   const auto& gt = CurrentTuning().gore;
   if (gt.pulpRotRate <= 0.0f) return;
   const float perTick = 1.0f / (60.0f * 30.0f);   // per minute -> per tick
-  const uint32_t pulpAt =
-      (uint32_t)std::lround(std::clamp(gt.pulpAmt, 1.0f, 15.0f));
   auto key = [](int x, int y, int z) -> uint64_t {
     return ((uint64_t)(uint32_t)(x + 32768) << 42) |
            ((uint64_t)(uint32_t)(y + 32768) << 21) |
@@ -5468,8 +5463,9 @@ void DebrisSystem::PulpTick(uint32_t tick, World& world,
       const uint32_t mat = L.Mat(i) & 0xFFFu;
       if (mat == 0) continue;
       if (!tissue.empty() && (mat >= tissue.size() || !tissue[mat])) continue;
-      const uint16_t st = L.Stain(i);
-      if (BodyStainMat(st) != b.bleedMat || BodyStainAmt(st) < pulpAt) continue;
+      // PULPED = the skin split (voxload.h kBruiseBroken), not "wears blood":
+      // a rinse must not un-beat a corpse. Only a fine skin carries a bruise.
+      if (!BruiseBroken(L.Bruise(i))) continue;
       const IVec3 v = L.At(i);
       static constexpr int kN[6][3] = {{1, 0, 0},  {-1, 0, 0}, {0, 1, 0},
                                        {0, -1, 0}, {0, 0, 1},  {0, 0, -1}};
@@ -6888,7 +6884,7 @@ void DebrisSystem::SaveState(std::vector<uint8_t>& out) const {
 }
 
 bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) {
-  if (version != kSaveVersion) {
+  if (version != kSaveVersion && version != 4u) {
     std::fprintf(stderr, "debris: unknown DBRS section version %u\n", version);
     return false;
   }
@@ -6926,6 +6922,8 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
     for (float& q : relQuat) r.F32(q);
     r.PodVec(voxels);
     r.PodVec(skinVoxels);
+    if (version < 5u)   // the bruise byte was padding (kSaveVersion 5)
+      for (PrefabVoxel& v : skinVoxels) v.bruise = 0;
     if (!r.ok || voxels.empty()) continue;
     // MATERIAL NAMES (sim/mattable.h, W1-D): ids in the table this payload's
     // file named, remapped by name before anything is built from them.
@@ -6960,12 +6958,12 @@ bool DebrisSystem::LoadState(const uint8_t* data, size_t len, uint32_t version) 
       if (src) {
         mv.reserve(src->size());
         for (const PrefabVoxel& v : *src)
-          mv.push_back({v.x, v.y, v.z, (uint16_t)(v.material & 0xFFu), 0, v.stain});
+          mv.push_back({v.x, v.y, v.z, (uint16_t)(v.material & 0xFFu), 0, v.bruise, v.stain});
       } else {
         mv.reserve(voxels.size());
         for (const DebrisVoxel& v : voxels)
           mv.push_back({(int16_t)v.x, (int16_t)v.y, (int16_t)v.z,
-                        (uint16_t)(v.payload & 0xFFu), 0, v.stain});
+                        (uint16_t)(v.payload & 0xFFu), 0, 0, v.stain});
       }
       IVec3 mx{0, 0, 0};
       for (const PrefabVoxel& v : mv) {

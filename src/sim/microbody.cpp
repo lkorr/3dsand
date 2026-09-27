@@ -52,8 +52,9 @@ void NoteRefusal(MicroBodySet& set, const char* what) {
 // sizes: every .vox in assets/ together occupies ~49k of the 1 MiW pool at
 // 4 bpw, so ~98k at 2 bpw — under 10% either way.
 inline size_t WordsFor(size_t cellCount) { return (cellCount + 1) / 2; }
-// Word count for a brick's STAIN lattice: one byte per micro voxel, 4 per word.
-inline size_t StainWordsFor(size_t cellCount) { return (cellCount + 3) / 4; }
+// Word count for a brick's STAIN lattice: 16 bits per micro voxel, 2 per word
+// -- the coat byte low, the bruise byte high (MicroBodyModelGpu::dims bit 30).
+inline size_t StainWordsFor(size_t cellCount) { return (cellCount + 1) / 2; }
 inline size_t CellsOf(uint32_t dimsWord) {
   return (size_t)(dimsWord & 1023) * ((dimsWord >> 10) & 1023) *
          ((dimsWord >> 20) & 1023);
@@ -80,6 +81,20 @@ inline uint8_t StainByteOf(const MicroBodySet& set, uint16_t coat) {
   const uint32_t slot = set.stainSlotOfMat[mat] & 7u;
   if (slot == 0) return 0;
   return (uint8_t)((slot << 4) | (amt & 0xFu));
+}
+
+// ...and the bruise byte (voxload.h PrefabVoxel::bruise) into the same
+// `slot << 4 | amt` shape, through the ONE slot the set was told bruises draw
+// in (MicroBodySet::bruiseSlot). No slot, no bruise drawn.
+inline uint8_t BruiseByteOf(const MicroBodySet& set, uint8_t bruise) {
+  const uint32_t lvl = BruiseLevel(bruise);
+  const uint32_t slot = set.bruiseSlot & 7u;
+  if (lvl == 0 || slot == 0) return 0;
+  return (uint8_t)((slot << 4) | lvl);
+}
+inline uint16_t StainCellOf(const MicroBodySet& set, const PrefabVoxel& v) {
+  return (uint16_t)(StainByteOf(set, v.stain) |
+                    ((uint16_t)BruiseByteOf(set, v.bruise) << 8));
 }
 
 // Take `words` from the best-fitting free range (the smallest one that holds
@@ -163,8 +178,8 @@ void WriteBrick(MicroBodySet& set, uint32_t base, IVec3 dims,
     set.pool[base + idx / 2] |=
         (uint32_t)MicroVox((uint8_t)mat, v.color) << ((idx % 2) * 16);
     if (withStain) {
-      const uint8_t sb = StainByteOf(set, v.stain);
-      if (sb) set.pool[sbase + idx / 4] |= (uint32_t)sb << ((idx % 4) * 8);
+      const uint16_t sc = StainCellOf(set, v);
+      if (sc) set.pool[sbase + idx / 2] |= (uint32_t)sc << ((idx % 2) * 16);
     }
   }
   set.MarkPool(base, base + (uint32_t)total);
@@ -201,8 +216,10 @@ void MicroBodySet::MarkPool(uint32_t lo, uint32_t hi) {
   dirtyRanges.push_back({lo, hi});
 }
 
-void MicroBodySetStainSlots(MicroBodySet& set, std::vector<uint8_t> slotOfMat) {
+void MicroBodySetStainSlots(MicroBodySet& set, std::vector<uint8_t> slotOfMat,
+                            uint8_t bruiseSlot) {
   set.stainSlotOfMat = std::move(slotOfMat);
+  set.bruiseSlot = bruiseSlot;
 }
 
 void MicroBodySet::ClearDirty() {
@@ -382,12 +399,12 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   // of zeroes.
   bool withStain = false;
   for (const PrefabVoxel& v : voxels)
-    if (StainByteOf(set, v.stain)) { withStain = true; break; }
+    if (StainCellOf(set, v)) { withStain = true; break; }
   const size_t words =
       WordsFor(cellCount) + (withStain ? StainWordsFor(cellCount) : 0);
 
   std::vector<uint16_t> cells(cellCount, 0);
-  std::vector<uint8_t> stains(withStain ? cellCount : 0, 0);
+  std::vector<uint16_t> stains(withStain ? cellCount : 0, 0);
   for (const PrefabVoxel& v : voxels) {
     if (v.x < 0 || v.y < 0 || v.z < 0 || v.x >= dims.x || v.y >= dims.y ||
         v.z >= dims.z)
@@ -405,7 +422,7 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
         MicroVox((uint8_t)mat, v.color);
     if (withStain)
       stains[((size_t)v.z * dims.y + v.y) * dims.x + v.x] =
-          StainByteOf(set, v.stain);
+          StainCellOf(set, v);
   }
 
   // Allocated only now that the payload is known good: the material-range check
@@ -429,9 +446,9 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   }
   for (size_t w = payloadWords; w < words; w++) {
     uint32_t word = 0;
-    for (size_t b = 0; b < 4; b++) {
-      size_t idx = (w - payloadWords) * 4 + b;
-      if (idx < cellCount) word |= (uint32_t)stains[idx] << (b * 8);
+    for (size_t b = 0; b < 2; b++) {
+      size_t idx = (w - payloadWords) * 2 + b;
+      if (idx < cellCount) word |= (uint32_t)stains[idx] << (b * 16);
     }
     set.pool[base + w] = word;
   }
@@ -627,8 +644,13 @@ uint16_t MicroBodyCell(const MicroBodySet& set, uint32_t model, int x, int y,
   return (uint16_t)(set.pool[w] >> ((idx % 2) * 16u));
 }
 
-bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
-                        uint16_t coat) {
+namespace {
+// Write one BYTE of a micro voxel's 16-bit stain cell (`hi` false = the coat
+// byte, true = the bruise byte), growing the lattice on a Pack-made owned
+// model that has none. The one body both pokes share, so the coat and the
+// bruise can never disagree about where a cell lives.
+bool PokeStainByte(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                   uint8_t byte, bool hi) {
   if (model >= set.models.size()) return false;
   if (model >= set.owned.size() || !set.owned[model]) return false;  // shared
   MicroBodyModelGpu& m = set.models[model];
@@ -638,6 +660,8 @@ bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
   const size_t cells = (size_t)dx * dy * dz;
   const size_t payloadWords = WordsFor(cells);
   if (!HasStain(m.dims)) {
+    // Nothing to erase on a lattice that does not exist yet.
+    if (byte == 0) return true;
     // A Pack-made owned model (a fragment, a reloaded corpse) without a stain
     // lattice: move it to a block that has room for one. Same free-at-
     // reserved-size discipline MicroBodyEdit follows.
@@ -658,16 +682,27 @@ bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
     set.MarkPool(base, base + (uint32_t)words);
   }
   const size_t idx = ((size_t)z * dy + y) * dx + x;
-  const uint32_t w = m.base + (uint32_t)payloadWords + (uint32_t)(idx / 4);
+  const uint32_t w = m.base + (uint32_t)payloadWords + (uint32_t)(idx / 2);
   if (w >= set.pool.size()) return false;
-  const uint32_t shift = (uint32_t)(idx % 4) * 8u;
+  const uint32_t shift = (uint32_t)(idx % 2) * 16u + (hi ? 8u : 0u);
   uint32_t word = set.pool[w];
   word &= ~(0xFFu << shift);
-  word |= (uint32_t)StainByteOf(set, coat) << shift;
+  word |= (uint32_t)byte << shift;
   if (word == set.pool[w]) return true;
   set.pool[w] = word;
   set.MarkPool(w, w + 1);
   return true;
+}
+}  // namespace
+
+bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                        uint16_t coat) {
+  return PokeStainByte(set, model, x, y, z, StainByteOf(set, coat), false);
+}
+
+bool MicroBodyPokeBruise(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                         uint8_t bruise) {
+  return PokeStainByte(set, model, x, y, z, BruiseByteOf(set, bruise), true);
 }
 
 IVec3 MicroBodyDims(const MicroBodySet& set, uint32_t model) {

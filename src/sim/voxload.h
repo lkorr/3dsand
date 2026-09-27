@@ -39,6 +39,20 @@ struct PrefabVoxel {
   int16_t x, y, z;
   uint16_t material;  // 12-bit material ID (== .vox palette index)
   uint8_t color = 0;  // art palette slot, 0 = use the material's own colour
+  // BRUISE (2026-09-26): how badly the tissue AT this voxel is contused, a
+  // property of the skin itself and NOT a coat. 0 = unhurt, 1..14 a deepening
+  // contusion (the blow ladder caps at gore.bruiseMax), kBruiseBroken = the
+  // skin has split here: it bleeds, and Mob::BluntPulpTick /
+  // DebrisSystem::PulpTick crumble it. Separate from `stain` on purpose: a coat
+  // is something ON the skin that water rinses and another substance can
+  // displace; a bruise is the skin, so it survives a wash and wears blood, mud
+  // or water OVER it. Rendered as its own layer under the coat
+  // (MicroBodyPokeBruise, microbody.wgsl). Lives in what was the padding byte
+  // after `color`, so the struct did not grow; savers written before it carry
+  // garbage there and zero it on load (MobSystem v8, DebrisSystem v5).
+  // The COARSE lattice (DebrisVoxel) has no room and carries none -- a body
+  // without a fine skin does not bruise.
+  uint8_t bruise = 0;
   // BODY COAT (DESIGN.md section 7, "blood on a body"): bits 0..11 the MATERIAL
   // that is on this voxel, bits 12..15 how much of it, 0..15. 0 = clean.
   //
@@ -57,6 +71,9 @@ struct PrefabVoxel {
   // into the micro brick's stain lattice by WriteBrick.
   uint16_t stain = 0;
 };
+// The bruise byte took the padding; a 13th byte would silently grow every
+// prefab, every saved limb and every networked body by two.
+static_assert(sizeof(PrefabVoxel) == 12, "PrefabVoxel grew");
 
 // ---- the body stain word ----------------------------------------------------
 constexpr uint32_t kBodyStainMatMask = 0xFFFu;
@@ -74,6 +91,13 @@ inline uint16_t PackBodyStain(uint32_t mat, uint32_t amt) {
   return (uint16_t)((mat & kBodyStainMatMask) |
                     ((amt & kBodyStainAmtMask) << kBodyStainAmtShift));
 }
+
+// ---- the bruise byte ---------------------------------------------------------
+constexpr uint32_t kBruiseLevelMask = 0xFu;
+constexpr uint32_t kBruiseBroken = 15u;   // the skin has split (see PrefabVoxel)
+constexpr uint32_t kBruiseMaxIntact = kBruiseBroken - 1u;
+inline uint32_t BruiseLevel(uint8_t b) { return b & kBruiseLevelMask; }
+inline bool BruiseBroken(uint8_t b) { return BruiseLevel(b) == kBruiseBroken; }
 
 struct PrefabModel {
   std::string name;   // scene-graph node name, or "modelN"

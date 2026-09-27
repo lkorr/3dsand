@@ -175,6 +175,9 @@ inline bool ReadWornDamage(ByteReader& r, WornDamage& d,
     r.U32(s.live);
     r.PodVec(s.lattice);
     if (!r.ok) break;
+    // PrefabVoxel::bruise was padding in files written before 2026-09-26, and
+    // a garment never bruises anyway (only a creature's own skin does).
+    for (PrefabVoxel& v : s.lattice) v.bruise = 0;
     d.shells.push_back(std::move(s));
   }
   return r.ok;
