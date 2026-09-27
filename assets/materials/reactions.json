@@ -574,16 +574,16 @@
       "neighborBecomes": "sand"
     },
     {
-      "note": "ACID EATS MEAT FAR FASTER THAN IT EATS ROCK, and this is the rule that says so. Ordered BEFORE the generic tag:dissolvable rule below, per the file's specific-before-generic convention, so mineral erosion keeps its old slow chain and only organics get the fast one.\n\nWHY IT MATTERS OUT OF PROPORTION TO ITS SIZE: this rule reaches a BODY. mob.cpp's inbound pass evaluates acid's own rules FROM the grid cell ONTO each body voxel it touches (the same direction the GPU evaluates them), so skin, flesh, bone, cloth and leather -- all tag:organic -- are eaten by this line and by nothing that had to be written for them. At the old shared 45 per-mille a limb at skinScale 8 lost about 4.5% of ONE sub-voxel layer per tick, roughly two seconds per layer and the better part of a minute for an arm, which is what 'acid does not do nearly enough damage' actually was. At 250 a layer went in about ten ticks; halved to 125 (owner, 2026-09-23: disintegrates flesh twice too fast), about twenty -- still five times rock's 25.\n\nSteel is unaffected because `steel` carries no tag:organic and no tag:dissolvable -- armour still protects, and still for the reason equipment.h states: not a resist number, an absence of the tag.",
+      "note": "ACID EATS MEAT FAR FASTER THAN IT EATS ROCK, and this is the rule that says so. Ordered BEFORE the generic tag:dissolvable rule below, per the file's specific-before-generic convention, so mineral erosion keeps its old slow chain and only organics get the fast one.\n\nWHY IT MATTERS OUT OF PROPORTION TO ITS SIZE: this rule reaches a BODY. mob.cpp's inbound pass evaluates acid's own rules FROM the grid cell ONTO each body voxel it touches (the same direction the GPU evaluates them), so skin, flesh, bone, cloth and leather -- all tag:organic -- are eaten by this line and by nothing that had to be written for them. At the old shared 45 per-mille a limb at skinScale 8 lost about 4.5% of ONE sub-voxel layer per tick, roughly two seconds per layer and the better part of a minute for an arm, which is what 'acid does not do nearly enough damage' actually was. At 250 a layer went in about ten ticks; halved to 125 (owner, 2026-09-23: disintegrates flesh twice too fast), about twenty -- still five times rock's 25.\n\nSteel is unaffected because `steel` carries no tag:organic and no tag:dissolvable -- armour still protects, and still for the reason equipment.h states: not a resist number, an absence of the tag.\n\nPACKAGE E (2026-09-27) CUT THIS 125 -> 85, AND THE TOTAL DID NOT MOVE: the 40 went to an appended `acid + tag:organic -> noxious_gas` (the end of the file), so an organic voxel is still eaten at about the same per-tick rate (~16%) but about a THIRD of what acid eats now comes off as green fume instead of vanishing. Package C measured the old share at about one in ten, which read as a pool that barely smoked.",
       "self": "acid",
       "neighbor": "tag:organic",
-      "chance": 125,
+      "chance": 85,
       "neighborBecomes": "air"
     },
     {
       "self": "acid",
       "neighbor": "tag:dissolvable",
-      "chance": 45,
+      "chance": 25,
       "neighborBecomes": "air"
     },
     {
@@ -1706,8 +1706,9 @@
     {
       "self": "acid",
       "neighbor": "tag:dissolvable",
-      "chance": 5,
-      "neighborBecomes": "noxious_gas"
+      "chance": 20,
+      "neighborBecomes": "noxious_gas",
+      "note": "PACKAGE E: 5 -> 20, with the generic `-> air` rule above it cut 45 -> 25 to pay for it (same total eaten, about a third of it fuming). Bounded: every fume is a voxel acid ATE -- the gas is paid for in matter, it decays at 12 per-mille, and the acid spends itself on the dissolvable rule between."
     },
     {
       "self": "acid",
@@ -1779,6 +1780,937 @@
       "chance": 60,
       "selfBecomes": "air",
       "neighborBecomes": "enchanted_blood"
+    },
+    {
+      "note": "======== PACKAGE E: THE CREATIVE EXPANSION (2026-09-27, docs/PLAN_alchemy_chemistry.md) ========\nForty-four new materials (materials.json, the rows after `spark`) and their chemistry, real and lore. Every rule below is APPENDED, so it is the last of its material's bucket and re-rolls nothing authored before it (rule index is part of the reaction RNG stream). They run in the WORLD and, through the same compiled table, on the ALCHEMY BENCH (game/flasksim_mats.h BuildBenchChemistry: a burner is a virtual tag:hot neighbour, Electrify a virtual spark, gases vent from the mouth into the world, and a rule's effect is a bench event by kind).\n\nRECIPES, in one place (the notes below say why each number is what it is):\n  gunpowder     saltpeter + charcoal -> black_mix; black_mix + sulfur -> gunpowder; heat or a spark -> EXPLODES (wet it and it is spoiled to charcoal)\n  smoke bomb    saltpeter + sugar -> smoke_powder; heat -> smoke_charge, which pours thick_smoke and burns out to ash\n  lime          chalk + heat -> quicklime; quicklime + water -> slaking_lime (HOT for a second: boils, ignites) -> slaked_lime; slaked_lime + choke_damp -> chalk\n  thermite      rust + aluminium -> thermite; heat -> molten_iron (with a white glare), which cuts iron and steel and quenches to iron\n  vitriol       acid + copper -> blue_vitriol (dissolves blue: the `vitriol` solute); blue_vitriol on iron -> copper + rust ('iron into copper')\n  acids         acid + saltpeter -> aqua_fortis (parting acid: silver, copper, lead, iron -- never gold); aqua_fortis + salt -> aqua_regia (dissolves GOLD)\n  quicksilver   quicksilver + sulfur -> cinnabar; cinnabar + heat -> quicksilver + fume; quicksilver + heat -> poisonous vapour\n  fire          phosphorus lights itself in AIR (keep it under water); acid + aluminium -> hydrogen; acid + sugar -> charcoal (the carbon snake)\n  spirits       sugar dissolves -> syrup; syrup + fungus (the yeast) -> spirits + choke_damp; spirits + acid -> ether; ether EVAPORATES to heavy ether_vapour, which EXPLODES near a flame\n  frost         frost_salt + water -> ice (about three a grain); + lava -> stone; + steam -> snow; snuffs fire\n  holy water    enchanted_water + salt -> holy_water; it SEARS rot (tag:infectious -> flesh_charred) and purifies ichor\n  sun and moon  silver + water under the NIGHT sky -> moonwater; gold_dust + water under the NOON sky -> sunwater; each fades back under the other's sky\n  the stone     sunwater + moonwater (the chemical wedding) -> philosophers_stone, rarely, with a flash; the stone on lead -> gold_dust, crumbling as it works\n  light         luminous_spores sprout into glowcap on damp ground, at once in moonwater; heat pops a glowcap back to spores; spores dissolved -> glow_potion\n  slime         fairy_dust + ichor -> slime; slime eats carrion (rotflesh, ichor) one for one; salt and heat kill it\n  dragon        dragons_blood on skin -> dragonhide (Siegfried); heat -> it ERUPTS; water hisses it away\n\nRULE 2, for all of it: every conversion is one-for-one or SPENDS its reagent (a catalyst -- silver, gold dust, the stone, frost salt -- carries its own spend rule at a fixed ratio), every gas decays, every hot transient decays, and every blast goes through the capped explode path. Nothing here grows from nothing, and nothing emits forever: the smoke charge is the only emitter and it burns out in ~2 s.\n\nEFFECTS: `explode` is the world's and the bench's (gunpowder, ether vapour, dragon's blood). `flash` (thermite, phosphorus, the chemical wedding, a transmutation) is a burst of `glare` round the cell in the world (game/session.cpp ReactFxToBlasts, capped at 4 a tick, merged by radius) and a word at the bench.\n\nIGNITION SCALING: a rule whose product is hot, or a hot neighbour acting on a FLAMMABLE self, is multiplied by combustion.spreadPct (29% as shipped). Every such rule below is authored knowing it (gunpowder's 1000 reads as ~290 per-mille a hot face)."
+    },
+    {
+      "note": "-------- acid: its share of fume, and what it does to the new things --------\nThe organic fume rule is the other half of the rebalance at acid's first rules (organic 125 -> 85 + this 40). Then: saltpeter distils into aqua fortis (real: nitric acid was made from saltpeter and oil of vitriol), copper becomes blue vitriol, aluminium gives off hydrogen, sugar chars to carbon and steam (the carbon snake), chalk FIZZES off choke damp (CO2) and is neutralised to water, the caustic limes neutralise to salt and steam (lye keeps its own, earlier, rules), and lead pits very slowly. None of saltpeter, copper, aluminium, sugar, chalk or lead is tagged dissolvable, which is what lets these rules -- appended AFTER acid's generic dissolve -- be the ones that fire."
+    },
+    {
+      "self": "acid",
+      "neighbor": "tag:organic",
+      "chance": 40,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "acid",
+      "neighbor": "saltpeter",
+      "chance": 150,
+      "selfBecomes": "aqua_fortis",
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "acid",
+      "neighbor": "copper",
+      "chance": 60,
+      "neighborBecomes": "blue_vitriol"
+    },
+    {
+      "self": "acid",
+      "neighbor": "aluminium",
+      "chance": 60,
+      "neighborBecomes": "hydrogen"
+    },
+    {
+      "self": "acid",
+      "neighbor": "sugar",
+      "chance": 150,
+      "selfBecomes": "steam",
+      "neighborBecomes": "charcoal"
+    },
+    {
+      "self": "acid",
+      "neighbor": "chalk",
+      "chance": 200,
+      "selfBecomes": "water",
+      "neighborBecomes": "choke_damp"
+    },
+    {
+      "self": "acid",
+      "neighbor": "tag:caustic",
+      "chance": 150,
+      "selfBecomes": "steam",
+      "neighborBecomes": "salt"
+    },
+    {
+      "self": "acid",
+      "neighbor": "lead",
+      "chance": 4,
+      "neighborBecomes": "air"
+    },
+    {
+      "note": "-------- holy water and slime, from package A's materials --------\nSalt in enchanted water makes HOLY WATER (real root: holy water is blessed water with salt in it). A pair rule so it works in the world today; on the bench the `salt` solute's convert row (solutes.json) does it by concentration as well. Fairy dust in ICHOR quickens it into SLIME -- the ooze of a rotten thing given life."
+    },
+    {
+      "self": "salt",
+      "neighbor": "enchanted_water",
+      "chance": 60,
+      "selfBecomes": "air",
+      "neighborBecomes": "holy_water"
+    },
+    {
+      "self": "fairy_dust",
+      "neighbor": "ichor",
+      "chance": 60,
+      "selfBecomes": "air",
+      "neighborBecomes": "slime"
+    },
+    {
+      "note": "-------- GUNPOWDER: saltpeter + charcoal + sulfur --------\nMixing is contact: two powders poured together meet at every grain boundary, and each rule turns BOTH grains into the mix (one-for-one, conserving). Saltpeter + charcoal is black_mix (sulfurless powder: it burns fast and fizzes, no bang); black_mix + sulfur is gunpowder. The mix rules are 120 per-mille, so a stirred flask turns in a second or two and a pile poured on a pile turns only where they touch.\n\nGunpowder + heat: selfBecomes fire and an EXPLODE effect, radius 3 power 90 (a grenade is 13/380). Authored 1000 and scaled by combustion.spreadPct (gunpowder is flammable and the neighbour is hot) to ~290 per-mille a hot face; a drifting flame at half of that (neighborChance -- a flame is how a fuse works). The blast's own aftermath lays fire in the crater, which lights the next grains: a pile goes off as a short string of bangs, bounded by the 4-a-tick cap, the merge radius and the powder itself. A spark lights it through spark's own `tag:flammable` rule. WET POWDER will not fire: water washes the saltpeter out and leaves charcoal."
+    },
+    {
+      "self": "saltpeter",
+      "neighbor": "charcoal",
+      "chance": 120,
+      "selfBecomes": "black_mix",
+      "neighborBecomes": "black_mix"
+    },
+    {
+      "self": "saltpeter",
+      "neighbor": "sugar",
+      "chance": 120,
+      "selfBecomes": "smoke_powder",
+      "neighborBecomes": "smoke_powder"
+    },
+    {
+      "self": "black_mix",
+      "neighbor": "sulfur",
+      "chance": 120,
+      "selfBecomes": "gunpowder",
+      "neighborBecomes": "gunpowder"
+    },
+    {
+      "self": "black_mix",
+      "neighbor": "tag:hot",
+      "chance": 300,
+      "selfBecomes": "fire",
+      "rainDamped": true,
+      "neighborChance": {
+        "fire": 0.25
+      }
+    },
+    {
+      "self": "black_mix",
+      "neighbor": "water",
+      "chance": 40,
+      "selfBecomes": "charcoal"
+    },
+    {
+      "self": "gunpowder",
+      "neighbor": "tag:hot",
+      "chance": 1000,
+      "selfBecomes": "fire",
+      "rainDamped": true,
+      "neighborChance": {
+        "fire": 0.5
+      },
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 3,
+          "power": 90
+        }
+      ]
+    },
+    {
+      "self": "gunpowder",
+      "neighbor": "water",
+      "chance": 40,
+      "selfBecomes": "charcoal"
+    },
+    {
+      "note": "Sulfur burns with a choking fume (real: sulfur dioxide) -- a share of its burn is noxious gas. Charcoal catches a little easier than wood (15 against 12) and smoulders as ember."
+    },
+    {
+      "self": "sulfur",
+      "neighbor": "tag:hot",
+      "chance": 60,
+      "selfBecomes": "fire",
+      "rainDamped": true,
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "sulfur",
+      "neighbor": "tag:hot",
+      "chance": 20,
+      "selfBecomes": "noxious_gas"
+    },
+    {
+      "self": "charcoal",
+      "neighbor": "tag:hot",
+      "chance": 15,
+      "selfBecomes": "ember",
+      "rainDamped": true,
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "note": "-------- SMOKE BOMB: saltpeter + sugar -> smoke_powder --------\nHeat lights it into smoke_charge (authored 300, ~87 per-mille scaled), which is hot -- it lights the next grain and anything flammable, as a real smoke grenade does -- and EMITS thick_smoke into its open faces. Its decay is the FIRST rule in its bucket, so its lifetime (~66 ticks at 15 per-mille) is fixed whatever it emits, and a grain pours out ~25-30 cells of smoke and is ash: bounded, and never a standing emitter (the dew rule that pinned 250 chunks awake is the cautionary tale). thick_smoke hangs ~8 s."
+    },
+    {
+      "self": "smoke_powder",
+      "neighbor": "tag:hot",
+      "chance": 300,
+      "selfBecomes": "smoke_charge",
+      "rainDamped": true,
+      "neighborChance": {
+        "fire": 0.25
+      }
+    },
+    {
+      "self": "smoke_charge",
+      "decay": true,
+      "chance": 15,
+      "becomes": "ash"
+    },
+    {
+      "self": "smoke_charge",
+      "emit": "thick_smoke",
+      "dir": "up",
+      "chance": 350
+    },
+    {
+      "self": "smoke_charge",
+      "emit": "thick_smoke",
+      "dir": "side",
+      "chance": 200
+    },
+    {
+      "self": "smoke_charge",
+      "emit": "thick_smoke",
+      "dir": "down",
+      "chance": 100
+    },
+    {
+      "self": "thick_smoke",
+      "decay": true,
+      "chance": 4,
+      "becomes": "air"
+    },
+    {
+      "note": "-------- THE LIME CYCLE: chalk -> quicklime -> slaked lime -> chalk --------\nChalk over heat calcines to quicklime slowly (8 per-mille: a kiln, not a flash; not an ignition, so unscaled). Quicklime meeting anything wet SLAKES: it becomes slaking_lime -- tag:hot for about a second -- and the water it drank is steam. Being hot, slaking lime boils the water beside it and lights straw and wood through their own heat rules, which is the real hazard of wet quicklime; then it decays to slaked lime. Slaked lime drinking choke damp (carbon dioxide) sets back into chalk: lime mortar curing. Quicklime also hastens ROT to ash (the plague-pit trope -- in truth it slows decay, and this line is lore). Choke damp is heavy, puts fires out (tag:extinguisher, every douse rule already answers it) and fades (3 per-mille)."
+    },
+    {
+      "self": "chalk",
+      "neighbor": "tag:hot",
+      "chance": 8,
+      "selfBecomes": "quicklime"
+    },
+    {
+      "self": "quicklime",
+      "neighbor": "tag:wet",
+      "chance": 150,
+      "selfBecomes": "slaking_lime",
+      "neighborBecomes": "steam"
+    },
+    {
+      "self": "quicklime",
+      "neighbor": "rotflesh",
+      "chance": 20,
+      "neighborBecomes": "ash"
+    },
+    {
+      "self": "slaking_lime",
+      "decay": true,
+      "chance": 40,
+      "becomes": "slaked_lime"
+    },
+    {
+      "self": "slaked_lime",
+      "neighbor": "choke_damp",
+      "chance": 60,
+      "selfBecomes": "chalk",
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "choke_damp",
+      "decay": true,
+      "chance": 3,
+      "becomes": "air"
+    },
+    {
+      "note": "-------- THERMITE: rust + aluminium --------\nMixed by contact (one-for-one). Lit it becomes MOLTEN IRON. Hard to light: 60 authored, ~17 per-mille against lava or an ember after spreadPct, a drifting flame a sixteenth of that -- but molten iron lights the next grain at FIVE times the base (neighborChance), ~87 per-mille a face, so once it goes a pile burns through in seconds. Each grain that catches FLASHES (the `flash` effect: a burst of glare round it in the world, capped 4 a tick and merged by radius; a word at the bench). A spark lights it (its own rule).\n\nMolten iron: burns organics like lava (60), sets sand to glass, QUENCHES to iron in water with a burst of steam, and CUTS iron and steel -- it hands its heat to the plate cell and freezes to iron itself, one for one, so the melt tunnels into a plate for as long as it stays molten and no longer (rule 2: there is never more molten iron than there was). It cools to iron on the inverted hot ramp molten salt uses, from the skin in, faster the less heat is round it."
+    },
+    {
+      "self": "rust",
+      "neighbor": "aluminium",
+      "chance": 100,
+      "selfBecomes": "thermite",
+      "neighborBecomes": "thermite"
+    },
+    {
+      "self": "thermite",
+      "neighbor": "tag:hot",
+      "chance": 60,
+      "selfBecomes": "molten_iron",
+      "neighborChance": {
+        "fire": 0.0625,
+        "molten_iron": 5.0
+      },
+      "effects": [
+        {
+          "kind": "flash",
+          "radius": 3
+        }
+      ]
+    },
+    {
+      "self": "thermite",
+      "neighbor": "tag:electric",
+      "chance": 200,
+      "selfBecomes": "molten_iron"
+    },
+    {
+      "self": "molten_iron",
+      "neighbor": "water",
+      "chance": 400,
+      "selfBecomes": "iron",
+      "neighborBecomes": "steam"
+    },
+    {
+      "self": "molten_iron",
+      "neighbor": "tag:organic",
+      "chance": 60,
+      "neighborBecomes": "fire"
+    },
+    {
+      "self": "molten_iron",
+      "neighbor": "sand",
+      "chance": 30,
+      "neighborBecomes": "molten_glass"
+    },
+    {
+      "self": "molten_iron",
+      "neighbor": "steel",
+      "chance": 30,
+      "selfBecomes": "iron",
+      "neighborBecomes": "molten_iron"
+    },
+    {
+      "self": "molten_iron",
+      "neighbor": "iron",
+      "chance": 30,
+      "selfBecomes": "iron",
+      "neighborBecomes": "molten_iron"
+    },
+    {
+      "self": "molten_iron",
+      "decay": true,
+      "chance": 4,
+      "becomes": "iron",
+      "scaleByNeighbors": {
+        "neighbor": "tag:hot",
+        "invert": true,
+        "scaleMax": 3
+      }
+    },
+    {
+      "note": "-------- BLUE VITRIOL, QUICKSILVER, CINNABAR --------\nBlue vitriol laid on iron gives COPPER and leaves the iron rust (Fe + CuSO4 -> FeSO4 + Cu: the iron goes into solution and the copper plates out) -- the real reaction that convinced alchemists metals could be transmuted. Slow (10 per-mille).\n\nQuicksilver takes up sulfur into cinnabar (60), and over heat gives off a poisonous vapour (noxious_gas, 15 -- unscaled: not fuel, not a hot product). Cinnabar roasted gives the quicksilver back (20) with a sulfurous fume (5)."
+    },
+    {
+      "self": "blue_vitriol",
+      "neighbor": "iron",
+      "chance": 10,
+      "selfBecomes": "copper",
+      "neighborBecomes": "rust"
+    },
+    {
+      "self": "quicksilver",
+      "neighbor": "sulfur",
+      "chance": 60,
+      "selfBecomes": "cinnabar",
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "quicksilver",
+      "neighbor": "tag:hot",
+      "chance": 15,
+      "selfBecomes": "noxious_gas"
+    },
+    {
+      "self": "cinnabar",
+      "neighbor": "tag:hot",
+      "chance": 20,
+      "selfBecomes": "quicksilver"
+    },
+    {
+      "self": "cinnabar",
+      "neighbor": "tag:hot",
+      "chance": 5,
+      "selfBecomes": "noxious_gas"
+    },
+    {
+      "note": "-------- AQUA FORTIS and AQUA REGIA --------\nAqua fortis (nitric acid) is PARTING ACID: it eats silver, copper, lead and iron (each with a share of fume -- real nitric acid on copper boils off brown fumes) and flesh, and NEVER gold; that is how gold was assayed out of silver. Salt turns it to aqua regia (150). Aqua regia dissolves GOLD -- the solid gold (30 + a fume) and gold dust (50) -- and everything aqua fortis does short of silver (real: silver chloride skins over and stops it). Both are spent by what they dissolve (the dissolvable self-spend, 10) and neutralised by the caustics (lye, the limes) to salt and steam. On a body both eat like acid through the inbound pass; neither has a coat (the stain palette is full)."
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "salt",
+      "chance": 150,
+      "selfBecomes": "aqua_regia",
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "silver",
+      "chance": 60,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "silver",
+      "chance": 20,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "copper",
+      "chance": 40,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "copper",
+      "chance": 30,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "lead",
+      "chance": 40,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "iron",
+      "chance": 20,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "iron",
+      "chance": 10,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "tag:caustic",
+      "chance": 150,
+      "selfBecomes": "steam",
+      "neighborBecomes": "salt"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "tag:organic",
+      "chance": 60,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "tag:organic",
+      "chance": 30,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "tag:dissolvable",
+      "chance": 20,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "tag:dissolvable",
+      "chance": 10,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "aqua_fortis",
+      "neighbor": "tag:dissolvable",
+      "chance": 10,
+      "selfBecomes": "air"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "gold",
+      "chance": 30,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "gold",
+      "chance": 15,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "gold_dust",
+      "chance": 50,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "copper",
+      "chance": 40,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "lead",
+      "chance": 30,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "iron",
+      "chance": 30,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "tag:caustic",
+      "chance": 150,
+      "selfBecomes": "steam",
+      "neighborBecomes": "salt"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "tag:organic",
+      "chance": 80,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "tag:organic",
+      "chance": 30,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "tag:dissolvable",
+      "chance": 25,
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "tag:dissolvable",
+      "chance": 10,
+      "neighborBecomes": "noxious_gas"
+    },
+    {
+      "self": "aqua_regia",
+      "neighbor": "tag:dissolvable",
+      "chance": 10,
+      "selfBecomes": "air"
+    },
+    {
+      "note": "-------- PHOSPHORUS: lights itself in air --------\n`phosphorus + air -> fire`: a pair rule whose partner is AIR (an exact nbrMat 0), so a grain with an open face catches on its own (40 authored, ~12 per-mille scaled: a pile in the open smokes for a few seconds and flares) and a grain under water, with no air beside it, NEVER does -- which is exactly why it is stored under water. Each flare flashes (the glare burst). A burning neighbour lights it at the usual rate."
+    },
+    {
+      "self": "phosphorus",
+      "neighbor": "air",
+      "chance": 40,
+      "selfBecomes": "fire",
+      "effects": [
+        {
+          "kind": "flash",
+          "radius": 2
+        }
+      ]
+    },
+    {
+      "self": "phosphorus",
+      "neighbor": "air",
+      "chance": 10,
+      "selfBecomes": "smoke"
+    },
+    {
+      "self": "phosphorus",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "fire",
+      "rainDamped": true,
+      "neighborChance": {
+        "fire": 0.25
+      }
+    },
+    {
+      "note": "-------- SPIRITS and ETHER --------\nSpirits burn readily (400 authored, ~116 scaled; a drifting flame a quarter). Spirits touching acid become ETHER (20; the acid is the catalyst and is not spent -- the spirits are). Ether is the most volatile thing here: every cell with an air face EVAPORATES (25 per-mille) into ether_vapour, which is HEAVY (gas_heavy: it sinks and creeps, sim_step.wgsl stepHeavyGas) and EXPLODES near a flame or a spark (radius 2 power 40 -- a whoomph, not a grenade). A vapour cloud goes off as a chain bounded by the blast cap and the vapour itself; left alone it disperses (5 per-mille)."
+    },
+    {
+      "self": "spirits",
+      "neighbor": "tag:hot",
+      "chance": 400,
+      "selfBecomes": "fire",
+      "rainDamped": true,
+      "neighborChance": {
+        "fire": 0.25
+      }
+    },
+    {
+      "self": "spirits",
+      "neighbor": "acid",
+      "chance": 20,
+      "selfBecomes": "ether"
+    },
+    {
+      "self": "ether",
+      "neighbor": "tag:hot",
+      "chance": 600,
+      "selfBecomes": "fire",
+      "rainDamped": true,
+      "neighborChance": {
+        "fire": 0.25
+      }
+    },
+    {
+      "self": "ether",
+      "neighbor": "air",
+      "chance": 25,
+      "selfBecomes": "ether_vapour"
+    },
+    {
+      "self": "ether_vapour",
+      "neighbor": "tag:hot",
+      "chance": 500,
+      "selfBecomes": "fire",
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 2,
+          "power": 40
+        }
+      ]
+    },
+    {
+      "self": "ether_vapour",
+      "neighbor": "tag:electric",
+      "chance": 600,
+      "selfBecomes": "fire",
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 2,
+          "power": 40
+        }
+      ]
+    },
+    {
+      "self": "ether_vapour",
+      "decay": true,
+      "chance": 5,
+      "becomes": "air"
+    },
+    {
+      "note": "-------- SUGAR and SYRUP --------\nSugar burns (30, scaled). It DISSOLVES into water as the `sugar` solute (solutes.json) and a saturated cell becomes syrup there -- a solute convert, on the bench and in package B's world layer; there is no pair rule for it. Syrup beside a FUNGUS (the yeast) ferments: most of it into spirits (6 per-mille), a little into choke damp (1). Slow on purpose: brewing takes a while."
+    },
+    {
+      "self": "sugar",
+      "neighbor": "tag:hot",
+      "chance": 30,
+      "selfBecomes": "fire",
+      "rainDamped": true,
+      "neighborChance": {
+        "fire": 0.0625
+      }
+    },
+    {
+      "self": "syrup",
+      "neighbor": "fungus",
+      "chance": 6,
+      "selfBecomes": "spirits"
+    },
+    {
+      "self": "syrup",
+      "neighbor": "fungus",
+      "chance": 1,
+      "selfBecomes": "choke_damp"
+    },
+    {
+      "note": "-------- SLIME --------\nSalt kills it (300: slime becomes water and the salt is used up -- the slug trope), heat boils it (150). It EATS CARRION: rotflesh and ichor it touches become slime (20 each), one for one, so a slime grows only by what it finds and never by itself (rule 2). On a zombie that is the rot being eaten off it."
+    },
+    {
+      "self": "slime",
+      "neighbor": "salt",
+      "chance": 300,
+      "selfBecomes": "water",
+      "neighborBecomes": "air"
+    },
+    {
+      "self": "slime",
+      "neighbor": "tag:hot",
+      "chance": 150,
+      "selfBecomes": "steam"
+    },
+    {
+      "self": "slime",
+      "neighbor": "rotflesh",
+      "chance": 20,
+      "neighborBecomes": "slime"
+    },
+    {
+      "self": "slime",
+      "neighbor": "ichor",
+      "chance": 20,
+      "neighborBecomes": "slime"
+    },
+    {
+      "note": "-------- HOLY WATER --------\nIt SEARS THE ROT: anything tag:infectious (rotflesh -- a zombie's rot, a bitten wound going bad) becomes flesh_charred and the water hisses to steam (200). On a creature that is a BURN (flesh_charred is a burn stage, so it counts into the burnt fraction that caps health, DESIGN.md 'Blood is health, and burns cap it'): the undead are hurt where they are rotten, and a bitten living creature has the infection seared out at the price of a burn. Ichor it purifies back to water and is not spent by it (150). Boils like water."
+    },
+    {
+      "self": "holy_water",
+      "neighbor": "tag:infectious",
+      "chance": 200,
+      "selfBecomes": "steam",
+      "neighborBecomes": "flesh_charred"
+    },
+    {
+      "self": "holy_water",
+      "neighbor": "ichor",
+      "chance": 150,
+      "neighborBecomes": "water"
+    },
+    {
+      "self": "holy_water",
+      "neighbor": "tag:hot",
+      "chance": 180,
+      "selfBecomes": "steam"
+    },
+    {
+      "note": "-------- MOONWATER, SUNWATER, THE PHILOSOPHER'S STONE --------\nSILVER (Luna) steeped in water under the open NIGHT sky makes moonwater (60); GOLD DUST (Sol) under the open NOON sky (minLight 160) makes sunwater (60). Both dusts are SPENT at 3 per-mille whatever the sky -- a pinch makes a handful and is gone, and by day (or indoors, or on the bench, which has no sky) it is simply wasted. The spend rule is also what keeps the chunk awake while the dust works: a light-gated rule never holds a chunk awake by itself (gotcha: light-gated rules never sleep), so without it a still pond would never be steeped at all. Each water fades back to plain water under the OTHER sky (2 per-mille, light-gated, so a still pond or a stoppered flask keeps it).\n\nTHE CHEMICAL WEDDING: sunwater meeting moonwater, at 4 per-mille, becomes one grain of the philosopher's stone (and the moonwater plain water), with a FLASH. The stone on LEAD makes gold dust (30, with a flash) and crumbles as it works (8), so a grain of stone is about four grains of gold -- a miracle, not a mine. Sunwater also sears rot, more gently than holy water (100, and it is spent), and thaws ice."
+    },
+    {
+      "self": "silver",
+      "neighbor": "water",
+      "chance": 60,
+      "neighborBecomes": "moonwater",
+      "needsSky": true,
+      "when": "night"
+    },
+    {
+      "self": "silver",
+      "neighbor": "water",
+      "chance": 3,
+      "selfBecomes": "air"
+    },
+    {
+      "self": "gold_dust",
+      "neighbor": "water",
+      "chance": 60,
+      "neighborBecomes": "sunwater",
+      "needsSky": true,
+      "when": "day",
+      "minLight": 160
+    },
+    {
+      "self": "gold_dust",
+      "neighbor": "water",
+      "chance": 3,
+      "selfBecomes": "air"
+    },
+    {
+      "self": "moonwater",
+      "decay": true,
+      "chance": 2,
+      "becomes": "water",
+      "needsSky": true,
+      "when": "day"
+    },
+    {
+      "self": "sunwater",
+      "neighbor": "moonwater",
+      "chance": 4,
+      "selfBecomes": "philosophers_stone",
+      "neighborBecomes": "water",
+      "effects": [
+        {
+          "kind": "flash",
+          "radius": 4
+        }
+      ]
+    },
+    {
+      "self": "sunwater",
+      "neighbor": "tag:infectious",
+      "chance": 100,
+      "selfBecomes": "water",
+      "neighborBecomes": "flesh_charred"
+    },
+    {
+      "self": "sunwater",
+      "neighbor": "ice",
+      "chance": 150,
+      "neighborBecomes": "water"
+    },
+    {
+      "self": "sunwater",
+      "decay": true,
+      "chance": 2,
+      "becomes": "water",
+      "needsSky": true,
+      "when": "night"
+    },
+    {
+      "self": "philosophers_stone",
+      "neighbor": "lead",
+      "chance": 30,
+      "neighborBecomes": "gold_dust",
+      "effects": [
+        {
+          "kind": "flash",
+          "radius": 2
+        }
+      ]
+    },
+    {
+      "self": "philosophers_stone",
+      "neighbor": "lead",
+      "chance": 8,
+      "selfBecomes": "air"
+    },
+    {
+      "note": "-------- LUMINOUS SPORES, GLOWCAP, THE POTION OF LIGHT --------\nSpores in MOONWATER sprout at once (200, the moonwater spent to plain water); on damp ground slowly (dirt 3, mud and wet moss 5 per-mille: minutes, and the matched rule keeps only that chunk awake until they have). One spore, one glowcap. Heat POPS a glowcap back into spores (100, scaled as fuel) rather than burning it, one for one. Dissolved in water the spores are the `lumen` solute and a concentrated cell becomes glow_potion (solutes.json); the potion boils like water and otherwise only glows."
+    },
+    {
+      "self": "luminous_spores",
+      "neighbor": "moonwater",
+      "chance": 200,
+      "selfBecomes": "glowcap",
+      "neighborBecomes": "water"
+    },
+    {
+      "self": "luminous_spores",
+      "neighbor": "dirt",
+      "chance": 3,
+      "selfBecomes": "glowcap"
+    },
+    {
+      "self": "luminous_spores",
+      "neighbor": "shore_mud",
+      "chance": 5,
+      "selfBecomes": "glowcap"
+    },
+    {
+      "self": "luminous_spores",
+      "neighbor": "wet_moss",
+      "chance": 5,
+      "selfBecomes": "glowcap"
+    },
+    {
+      "self": "glowcap",
+      "neighbor": "tag:hot",
+      "chance": 100,
+      "selfBecomes": "luminous_spores"
+    },
+    {
+      "self": "glow_potion",
+      "neighbor": "tag:hot",
+      "chance": 180,
+      "selfBecomes": "steam"
+    },
+    {
+      "note": "-------- DRAGON'S BLOOD --------\nOn SKIN it hardens the skin to dragonhide and is spent in a hiss of smoke (25) -- bathe in it and you come out scaled (the Nibelungenlied). Dragonhide has no tags at all, so fire, acid and rot have no rule for it; only blades and blasts, against hardness 120. Heat makes the blood ERUPT: it becomes fire with an explode effect (radius 3, power 60), authored 300 and scaled to ~87, a drifting flame a quarter of that. Water hisses it away (both to steam, 60); it melts ice and snow."
+    },
+    {
+      "self": "dragons_blood",
+      "neighbor": "skin",
+      "chance": 25,
+      "selfBecomes": "smoke",
+      "neighborBecomes": "dragonhide"
+    },
+    {
+      "self": "dragons_blood",
+      "neighbor": "skin_bruised",
+      "chance": 25,
+      "selfBecomes": "smoke",
+      "neighborBecomes": "dragonhide"
+    },
+    {
+      "self": "dragons_blood",
+      "neighbor": "tag:hot",
+      "chance": 300,
+      "selfBecomes": "fire",
+      "neighborChance": {
+        "fire": 0.25
+      },
+      "effects": [
+        {
+          "kind": "explode",
+          "radius": 3,
+          "power": 60
+        }
+      ]
+    },
+    {
+      "self": "dragons_blood",
+      "neighbor": "water",
+      "chance": 60,
+      "selfBecomes": "steam",
+      "neighborBecomes": "steam"
+    },
+    {
+      "self": "dragons_blood",
+      "neighbor": "ice",
+      "chance": 150,
+      "neighborBecomes": "water"
+    },
+    {
+      "self": "dragons_blood",
+      "neighbor": "snow",
+      "chance": 150,
+      "neighborBecomes": "water"
+    },
+    {
+      "note": "-------- FROST SALT --------\nEndothermic: water it touches FREEZES (80), and the salt is spent (25), so a grain makes about three voxels of ice. It quenches lava to stone and molten iron to iron (300, spent), snuffs a flame to smoke (300, not spent -- a flame is not heat enough to use it up), and turns steam to snow (100). Every conversion is bounded by the salt or by what it touches; the ice it makes is ordinary ice and melts by ice's own rules."
+    },
+    {
+      "self": "frost_salt",
+      "neighbor": "water",
+      "chance": 80,
+      "neighborBecomes": "ice"
+    },
+    {
+      "self": "frost_salt",
+      "neighbor": "water",
+      "chance": 25,
+      "selfBecomes": "air"
+    },
+    {
+      "self": "frost_salt",
+      "neighbor": "lava",
+      "chance": 300,
+      "selfBecomes": "air",
+      "neighborBecomes": "stone"
+    },
+    {
+      "self": "frost_salt",
+      "neighbor": "molten_iron",
+      "chance": 300,
+      "selfBecomes": "air",
+      "neighborBecomes": "iron"
+    },
+    {
+      "self": "frost_salt",
+      "neighbor": "fire",
+      "chance": 300,
+      "neighborBecomes": "smoke"
+    },
+    {
+      "self": "frost_salt",
+      "neighbor": "steam",
+      "chance": 100,
+      "neighborBecomes": "snow"
+    },
+    {
+      "note": "-------- glare: the flash effect's light, gone in two or three ticks --------"
+    },
+    {
+      "self": "glare",
+      "decay": true,
+      "chance": 400,
+      "becomes": "air"
     }
   ]
 }

@@ -3670,6 +3670,825 @@
       "tags": [
         "electric"
       ]
+    },
+    {
+      "//": "PACKAGE E (docs/PLAN_alchemy_chemistry.md, 2026-09-27): the creative expansion. REAL. Sulfur, brimstone: the third of gunpowder's three parts. A yellow powder that burns with a choking fume (reactions.json: sulfur + heat -> fire, and a share of noxious_gas -- real burning sulfur gives off sulfur dioxide). Density is crystalline sulfur's 2070; flammable so every fire rule already knows it; NOT dissolvable, so acid leaves it alone (real: sulfur shrugs off most acids).",
+      "id": "sulfur",
+      "arcane": 6,
+      "far": "sand",
+      "class": "powder",
+      "repose": 36,
+      "density": 2070,
+      "hardness": 8,
+      "colors": [
+        "#e2cc30",
+        "#cdb422",
+        "#f0de52"
+      ],
+      "tags": [
+        "flammable",
+        "mineral"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "REAL. Saltpeter (potassium nitrate): the oxidiser in gunpowder and the 'saltpetre' of every smoke and rocket composition. White crystals. Not flammable itself -- it FEEDS a fire -- so its only rules are what it is mixed into (black_mix, smoke_powder) and aqua fortis (acid + saltpeter, the real way nitric acid was first made). Not tagged dissolvable on purpose: acid's generic dissolve rules would eat it before the aqua fortis rule, which is appended after them, ever rolled.",
+      "id": "saltpeter",
+      "arcane": 5,
+      "far": "snow",
+      "class": "powder",
+      "repose": 34,
+      "density": 2110,
+      "hardness": 8,
+      "colors": [
+        "#e6e4da",
+        "#d6d4c8",
+        "#f2f0e8"
+      ],
+      "tags": [
+        "mineral"
+      ]
+    },
+    {
+      "//": "REAL. Charcoal: the fuel in gunpowder. Black, and LIGHT (real lump charcoal is ~0.4 g/cm3, so it floats on water, which this does). Catches like wood does and smoulders as ember. Also what acid leaves of sugar (the carbon snake). Tagged dissolvable so acid eats it slowly like any char.",
+      "id": "charcoal",
+      "arcane": 2,
+      "far": "ash",
+      "class": "powder",
+      "repose": 38,
+      "density": 420,
+      "hardness": 6,
+      "colors": [
+        "#1e1c1a",
+        "#161412",
+        "#28251f"
+      ],
+      "tags": [
+        "flammable",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "REAL. Saltpeter ground with charcoal and no sulfur -- historically 'sulfurless' powder. It burns fiercely and fizzes but does not detonate; add sulfur and it becomes gunpowder (reactions.json black_mix + sulfur). Dark grey, the average of its two parts.",
+      "id": "black_mix",
+      "arcane": 6,
+      "far": "gravel",
+      "class": "powder",
+      "repose": 36,
+      "density": 1200,
+      "hardness": 6,
+      "colors": [
+        "#4a4844",
+        "#3e3c38",
+        "#57554f"
+      ],
+      "tags": [
+        "flammable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "REAL. Gunpowder (black powder): saltpeter + charcoal + sulfur. A spark or a flame and it goes off -- a real ExplosionOp through the explode effect (radius 3, power 90: a third of a grenade, per grain that catches first; a pile is several bangs, the per-tick cap of 4 and the merge radius bound it). Flammable, so a spark's own rule lights it too.",
+      "id": "gunpowder",
+      "arcane": 10,
+      "far": "gravel",
+      "class": "powder",
+      "repose": 34,
+      "density": 1700,
+      "hardness": 6,
+      "colors": [
+        "#2c2c2e",
+        "#222224",
+        "#37373a"
+      ],
+      "tags": [
+        "flammable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "REAL. Chalk (calcium carbonate, limestone ground fine). Roasted it gives off carbon dioxide and becomes quicklime (the lime kiln); acid on it FIZZES -- choke_damp and water. And slaked lime drinking choke_damp turns back into it, which is how lime mortar sets: the whole lime cycle is here. Not dissolvable, for the same reason as saltpeter.",
+      "id": "chalk",
+      "arcane": 2,
+      "far": "snow",
+      "class": "powder",
+      "repose": 38,
+      "density": 1500,
+      "hardness": 10,
+      "colors": [
+        "#e4e2d8",
+        "#d4d2c6",
+        "#f0eee6"
+      ],
+      "tags": [
+        "mineral"
+      ]
+    },
+    {
+      "//": "REAL. Quicklime (calcium oxide), chalk after the kiln. Meets water VIOLENTLY: it slakes, and that is hot enough to boil water and set straw alight (reactions.json: quicklime + tag:wet -> slaking_lime + steam). Caustic. Also the lime of the plague pit: it hastens rot to ash (lore more than chemistry, and said so).",
+      "id": "quicklime",
+      "arcane": 4,
+      "far": "snow",
+      "class": "powder",
+      "repose": 36,
+      "density": 1300,
+      "hardness": 8,
+      "colors": [
+        "#ecebe4",
+        "#dddcd4",
+        "#f6f5f0"
+      ],
+      "tags": [
+        "mineral",
+        "caustic"
+      ]
+    },
+    {
+      "//": "REAL, TRANSIENT. Quicklime in the act of slaking: tag:hot for about a second (decay 40 per-mille), which is what does the boiling and the igniting -- every water and fuel rule already answers tag:hot -- then it is slaked_lime. A separate material because the voxel word has no bits for 'hot for a moment' and the material id is the memory (as the burning leaves are).",
+      "id": "slaking_lime",
+      "far": "snow",
+      "class": "powder",
+      "repose": 36,
+      "density": 1400,
+      "hardness": 8,
+      "emission": 30,
+      "colors": [
+        "#f4efe0",
+        "#e8e0cc",
+        "#fff8ea"
+      ],
+      "tags": [
+        "hot",
+        "caustic"
+      ]
+    },
+    {
+      "//": "REAL. Slaked lime (calcium hydroxide): what quicklime becomes in water. Inert until it drinks carbon dioxide (choke_damp), when it sets back to chalk -- lime mortar curing.",
+      "id": "slaked_lime",
+      "arcane": 2,
+      "far": "snow",
+      "class": "powder",
+      "repose": 40,
+      "density": 1200,
+      "hardness": 8,
+      "colors": [
+        "#f2f0ea",
+        "#e4e2da",
+        "#faf9f5"
+      ],
+      "tags": [
+        "mineral",
+        "caustic"
+      ]
+    },
+    {
+      "//": "REAL. Choke damp: the miners' name for carbon dioxide. Nearly invisible, heavier than air (gas_heavy: it pools in hollows and cellars and creeps downhill), and it PUTS OUT FIRES -- it carries tag:extinguisher, so every douse rule in reactions.json already answers it (fire -> smoke, an ember back to wood, burning flesh to charred). Made by acid on chalk, by the kiln, and by fermentation. Fades like chlorine does.",
+      "id": "choke_damp",
+      "far": "steam",
+      "class": "gas",
+      "density": 5,
+      "opacity": 14,
+      "colors": [
+        "#c2c8d0",
+        "#b6bcc6",
+        "#ced4dc"
+      ],
+      "tags": [
+        "gas_heavy",
+        "extinguisher"
+      ]
+    },
+    {
+      "//": "REAL. Rust (iron oxide, Fe2O3): red-brown powder, the oxide half of thermite. Tagged dissolvable: acid eats it like any mineral.",
+      "id": "rust",
+      "arcane": 2,
+      "far": "dirt",
+      "class": "powder",
+      "repose": 38,
+      "density": 2400,
+      "hardness": 8,
+      "colors": [
+        "#7e3416",
+        "#6c2c12",
+        "#90401c"
+      ],
+      "tags": [
+        "mineral",
+        "dissolvable"
+      ]
+    },
+    {
+      "//": "REAL. Aluminium powder: silver-white and light. The fuel half of thermite; and acid on it gives off HYDROGEN (real: 2Al + 6HCl -> 2AlCl3 + 3H2), which then goes off beside a flame. Bulk density of a fine powder (~1.1), not the metal's 2.7.",
+      "id": "aluminium",
+      "arcane": 6,
+      "far": "steel",
+      "class": "powder",
+      "repose": 34,
+      "density": 1100,
+      "hardness": 8,
+      "colors": [
+        "#c6cace",
+        "#b4b8bd",
+        "#d8dbdf"
+      ],
+      "tags": [
+        "metal"
+      ]
+    },
+    {
+      "//": "REAL. Thermite: rust + aluminium. Hard to light -- an ordinary flame barely does it (authored 60, x combustion.spreadPct) -- but once it goes it burns at 2,500 C into MOLTEN IRON, which lights the next grain at six times the rate, so a pile burns through in a few seconds with a white glare (the flash effect). NOT flammable: fire alone is the wrong match, as it really is.",
+      "id": "thermite",
+      "arcane": 12,
+      "far": "dirt",
+      "class": "powder",
+      "repose": 36,
+      "density": 1800,
+      "hardness": 8,
+      "colors": [
+        "#6e4030",
+        "#5e3628",
+        "#7e4c3a"
+      ],
+      "tags": [
+        "mineral"
+      ]
+    },
+    {
+      "//": "REAL. Molten iron, what thermite leaves: white-orange, dense (7,000), hot. It burns what it touches like lava, sets glass from sand, QUENCHES to iron in water, and cuts through iron and steel plate by handing its heat on -- it freezes to iron as it melts the next cell, one-for-one, so the cut is bounded by the melt that made it (rule 2). Cools to iron from its skin inward when the heat is gone (the same inverted hot ramp molten salt uses).",
+      "id": "molten_iron",
+      "far": "molten_glass",
+      "class": "liquid",
+      "density": 7000,
+      "hardness": 6,
+      "moveEvery": 2,
+      "emission": 230,
+      "opaque": true,
+      "colors": [
+        "#ffd07a",
+        "#ffb44a",
+        "#fff0b4"
+      ],
+      "tags": [
+        "hot",
+        "metal"
+      ]
+    },
+    {
+      "//": "REAL. Copper filings. Acid turns it into blue vitriol (copper sulfate); aqua fortis dissolves it in a brown-green fume. The warm metal colour is linear light (it looks darker in a picker).",
+      "id": "copper",
+      "arcane": 8,
+      "far": "gold",
+      "class": "powder",
+      "repose": 34,
+      "density": 3500,
+      "hardness": 10,
+      "colors": [
+        "#b05a30",
+        "#9a4c28",
+        "#c26c3c"
+      ],
+      "tags": [
+        "metal"
+      ]
+    },
+    {
+      "//": "REAL. Blue vitriol: copper sulfate crystals, the brilliant blue of every chemistry set. Dissolves into water as the `vitriol` solute (solutes.json), tinting it blue. Laid on iron it plates it with copper -- the alchemists' famous 'transmutation' of iron into copper, which is real chemistry (Fe + CuSO4 -> FeSO4 + Cu) and is why they believed in the other kind.",
+      "id": "blue_vitriol",
+      "arcane": 8,
+      "far": "crystal",
+      "class": "powder",
+      "repose": 32,
+      "density": 2280,
+      "hardness": 8,
+      "colors": [
+        "#1e5ad0",
+        "#184cb8",
+        "#2c6ee8"
+      ],
+      "tags": [
+        "mineral",
+        "salt"
+      ]
+    },
+    {
+      "//": "REAL. Quicksilver (mercury). A liquid metal at 13,540 kg/m3 -- EVERYTHING but gold sinks in water and floats on this, lead included, exactly as it does in life. Flows freely (moveEvery 1). With sulfur it makes cinnabar; heated it gives off a poisonous vapour (noxious_gas).",
+      "id": "quicksilver",
+      "arcane": 20,
+      "far": "steel",
+      "class": "liquid",
+      "density": 13540,
+      "hardness": 4,
+      "opaque": true,
+      "colors": [
+        "#c2c6cb",
+        "#aeb2b7",
+        "#dadde1"
+      ],
+      "tags": [
+        "metal"
+      ]
+    },
+    {
+      "//": "REAL. Cinnabar (mercury sulfide), vermilion: quicksilver + sulfur. Roasted it gives the quicksilver back and a fume -- how mercury has been won from its ore for three thousand years.",
+      "id": "cinnabar",
+      "arcane": 15,
+      "far": "flesh",
+      "class": "powder",
+      "repose": 34,
+      "density": 3000,
+      "hardness": 10,
+      "colors": [
+        "#a8121a",
+        "#900e14",
+        "#be2a24"
+      ],
+      "tags": [
+        "mineral"
+      ]
+    },
+    {
+      "//": "REAL. Aqua fortis ('strong water', nitric acid): acid distilled with saltpeter. Parting acid -- it dissolves silver, copper, iron and lead, eats flesh, and does NOT touch gold, which is how assayers separated the two. Add salt and it becomes aqua regia. Pale yellow, fuming.",
+      "id": "aqua_fortis",
+      "arcane": 10,
+      "far": "acid",
+      "class": "liquid",
+      "density": 1400,
+      "hardness": 4,
+      "emission": 20,
+      "opacity": 120,
+      "colors": [
+        "#dccc82",
+        "#ccbc70",
+        "#eadc96"
+      ],
+      "tags": []
+    },
+    {
+      "//": "REAL. Aqua regia ('royal water'): aqua fortis + salt (the salt's chloride is what does it). The only thing that dissolves GOLD, which acid, steel and fire cannot touch. Orange and fuming. Gold dust in it becomes the `aurum` solute (solutes.json): the golden tint.",
+      "id": "aqua_regia",
+      "arcane": 25,
+      "far": "acid",
+      "class": "liquid",
+      "density": 1300,
+      "hardness": 4,
+      "emission": 30,
+      "opacity": 150,
+      "colors": [
+        "#e0962a",
+        "#cc8220",
+        "#f0ae42"
+      ],
+      "tags": []
+    },
+    {
+      "//": "REAL. White phosphorus: waxy, pale, and it GLOWS faintly green in the air (real chemiluminescence -- the 'light-bearer' of its name). It catches fire BY ITSELF in air (reactions.json phosphorus + air -> fire), and that is why it is kept under water: a grain with no air beside it never lights. A pile in the open smokes and then flares.",
+      "id": "phosphorus",
+      "arcane": 12,
+      "far": "sand",
+      "class": "powder",
+      "repose": 34,
+      "density": 1820,
+      "hardness": 6,
+      "emission": 45,
+      "colors": [
+        "#e0e6b0",
+        "#d0d89c",
+        "#eef2c8"
+      ],
+      "tags": [
+        "flammable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "REAL. Spirits (aqua vitae, alcohol): what syrup ferments into beside a fungus (the yeast). Clear, light (790: it floats on water), burns readily. With acid it becomes ether (the real 'sweet oil of vitriol', Valerius Cordus 1540).",
+      "id": "spirits",
+      "arcane": 4,
+      "far": "water",
+      "class": "liquid",
+      "density": 790,
+      "hardness": 4,
+      "opacity": 18,
+      "colors": [
+        "#d6e2ea",
+        "#c8d6e0",
+        "#e4eef4"
+      ],
+      "tags": [
+        "flammable"
+      ]
+    },
+    {
+      "//": "REAL. Ether: the most volatile thing in the file. It EVAPORATES wherever it meets air (a spilled puddle is gone in seconds) into ether_vapour, which is heavier than air and creeps along the floor to the nearest flame. The liquid burns; the vapour explodes.",
+      "id": "ether",
+      "arcane": 8,
+      "far": "water",
+      "class": "liquid",
+      "density": 710,
+      "hardness": 4,
+      "opacity": 10,
+      "colors": [
+        "#e8eef2",
+        "#dce4ea",
+        "#f2f6f8"
+      ],
+      "tags": [
+        "flammable"
+      ]
+    },
+    {
+      "//": "REAL. Ether vapour: 2.5x heavier than air (gas_heavy -- it pools and creeps like chlorine, and in real life that is how ether fires start across a room). Near a flame or a spark it EXPLODES (a small blast, radius 2); left alone it disperses (decay 5 per-mille).",
+      "id": "ether_vapour",
+      "far": "steam",
+      "class": "gas",
+      "density": 4,
+      "opacity": 10,
+      "colors": [
+        "#dbe3e8",
+        "#cfd8de",
+        "#e7edf1"
+      ],
+      "tags": [
+        "gas_heavy",
+        "flammable"
+      ]
+    },
+    {
+      "//": "REAL. Sugar. Dissolves into water as the `sugar` solute (solutes.json); concentrated enough the water becomes SYRUP. Burns. With acid it chars to black carbon and steam -- the carbon-snake demonstration -- and with saltpeter it is smoke powder (the real smoke-bomb recipe).",
+      "id": "sugar",
+      "arcane": 2,
+      "far": "snow",
+      "class": "powder",
+      "repose": 34,
+      "density": 850,
+      "hardness": 6,
+      "colors": [
+        "#eeebe4",
+        "#e0ddd4",
+        "#f8f6f2"
+      ],
+      "tags": [
+        "flammable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "REAL. Syrup: water saturated with sugar. Thick (moveEvery 4) and heavier than water (1,330: it sinks under it). Beside a fungus -- the yeast -- it ferments into spirits and gives off choke damp.",
+      "id": "syrup",
+      "arcane": 3,
+      "far": "blood",
+      "class": "liquid",
+      "density": 1330,
+      "hardness": 4,
+      "moveEvery": 4,
+      "opacity": 200,
+      "colors": [
+        "#a8621a",
+        "#945414",
+        "#ba7428"
+      ],
+      "//tags": "NONE, on purpose: tag:organic would let fungus (fungus + tag:organic -> fungus) eat the syrup it is meant to ferment, and acid dissolve it. Syrup's only rules are its own.",
+      "tags": []
+    },
+    {
+      "//": "REAL. Smoke powder: saltpeter + sugar, the smoke-bomb composition. It does not explode: a flame lights it into smoke_charge, which pours out thick smoke for a couple of seconds and leaves ash.",
+      "id": "smoke_powder",
+      "arcane": 4,
+      "far": "snow",
+      "class": "powder",
+      "repose": 36,
+      "density": 1100,
+      "hardness": 6,
+      "colors": [
+        "#d2c6bc",
+        "#c2b6ac",
+        "#e0d6cc"
+      ],
+      "tags": [
+        "flammable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "REAL, TRANSIENT. A lit smoke charge: smouldering orange-grey, tag:hot, EMITS thick_smoke into every open face (up strongest) and burns out to ash in about two seconds (decay 15 per-mille, ~30 smoke voxels a grain). Bounded: it is spent, never a permanent emitter (rule 2).",
+      "id": "smoke_charge",
+      "far": "ember",
+      "class": "powder",
+      "repose": 36,
+      "density": 1000,
+      "hardness": 6,
+      "emission": 110,
+      "colors": [
+        "#b0684a",
+        "#9a5840",
+        "#c47a56"
+      ],
+      "tags": [
+        "hot"
+      ]
+    },
+    {
+      "//": "What a smoke charge pours out: dense white smoke (opacity 220 against smoke's 70) that hangs for about eight seconds (decay 4). Rises like any gas; wind carries it.",
+      "id": "thick_smoke",
+      "far": "smoke",
+      "class": "gas",
+      "density": 2,
+      "opacity": 220,
+      "colors": [
+        "#d4d4d8",
+        "#c6c6cc",
+        "#e0e0e4"
+      ],
+      "tags": []
+    },
+    {
+      "//": "LORE. Slime: the ooze a rotten thing becomes when it is quickened by magic (fairy dust in ichor). Thick (moveEvery 6), faintly luminous green. It EATS carrion -- rotflesh and ichor become more slime, one for one, so it grows only by what it finds (rule 2) -- and it is killed by SALT (the slug trope), which dries it back to water, and by heat.",
+      "id": "slime",
+      "arcane": 15,
+      "far": "acid",
+      "class": "liquid",
+      "density": 1100,
+      "hardness": 4,
+      "moveEvery": 6,
+      "emission": 30,
+      "opacity": 160,
+      "colors": [
+        "#4ec23e",
+        "#40aa32",
+        "#62d852"
+      ],
+      "tags": [
+        "organic"
+      ]
+    },
+    {
+      "//": "LORE (with a real root: holy water is blessed water with SALT added). Enchanted water + salt. Softly luminous. It SEARS THE ROT: rotflesh (tag:infectious -- a zombie's rot, a bitten wound) turns to charred flesh where it touches, and the water hisses off as steam; ichor it turns back to water. On a living body that is a burn that cuts the infection out; on the undead it is simply a burn. Douses fire (extinguisher).",
+      "id": "holy_water",
+      "arcane": 40,
+      "far": "water",
+      "class": "liquid",
+      "density": 1000,
+      "hardness": 4,
+      "emission": 60,
+      "opacity": 50,
+      "colors": [
+        "#d2e4f6",
+        "#c0d6f0",
+        "#e4f0fc"
+      ],
+      "tags": [
+        "wet",
+        "extinguisher",
+        "magic"
+      ]
+    },
+    {
+      "//": "REAL metal, LORE use. Silver dust: Luna, the moon's metal. Steeped in water under the NIGHT SKY it gives up its virtue into it -- moonwater (reactions.json: needsSky + when night). By day, or under a roof, the dust simply dissolves away for nothing (it is spent at 3 per-mille either way, so a pinch makes a handful of moonwater and is gone). Aqua fortis dissolves it.",
+      "id": "silver",
+      "arcane": 20,
+      "far": "steel",
+      "class": "powder",
+      "repose": 34,
+      "density": 5000,
+      "hardness": 10,
+      "colors": [
+        "#d0d4d8",
+        "#bcc0c5",
+        "#e2e5e8"
+      ],
+      "tags": [
+        "metal"
+      ]
+    },
+    {
+      "//": "LORE. Moonwater: water that has held silver under the moon. Pale, cold-lit. In the open sky by DAY it fades back to water (light-gated, so a still pond keeps it and a stoppered flask always does). What it is for: luminous spores sprout in it at once, and married to sunwater it makes the philosopher's stone.",
+      "id": "moonwater",
+      "arcane": 30,
+      "far": "water",
+      "class": "liquid",
+      "density": 1000,
+      "hardness": 4,
+      "emission": 110,
+      "opacity": 60,
+      "colors": [
+        "#96b2ec",
+        "#849ee2",
+        "#aec6fa"
+      ],
+      "tags": [
+        "wet",
+        "magic"
+      ]
+    },
+    {
+      "//": "REAL metal, LORE use. Gold dust: Sol, the sun's metal. Steeped in water under a HIGH SUN (needsSky, day, minLight 160) it makes sunwater; spent at 3 per-mille like silver. What the philosopher's stone makes of lead. Dissolves in aqua regia (and only there) as the `aurum` solute.",
+      "id": "gold_dust",
+      "arcane": 40,
+      "far": "gold",
+      "class": "powder",
+      "repose": 32,
+      "density": 9000,
+      "hardness": 10,
+      "colors": [
+        "#dcae2c",
+        "#c89a22",
+        "#ecc444"
+      ],
+      "tags": [
+        "metal"
+      ]
+    },
+    {
+      "//": "LORE. Sunwater: water that has held gold under the noon sun. Warm and bright (emission 150). It BURNS THE ROT like holy water, more gently, and thaws ice; out under the night sky it fades back to water. Married to moonwater -- the alchemists' 'chemical wedding' of Sol and Luna -- it very rarely yields the philosopher's stone.",
+      "id": "sunwater",
+      "arcane": 30,
+      "far": "water",
+      "class": "liquid",
+      "density": 1000,
+      "hardness": 4,
+      "emission": 150,
+      "opacity": 70,
+      "colors": [
+        "#f2c866",
+        "#e8b852",
+        "#fcda86"
+      ],
+      "tags": [
+        "wet",
+        "magic"
+      ]
+    },
+    {
+      "//": "LORE. The philosopher's stone, the red powder of projection: born of the chemical wedding (sunwater + moonwater at 4 per-mille, with a flash). Laid on LEAD it transmutes it to gold dust -- and crumbles as it works (the lead -> gold rule at 30 per-mille, the stone's own loss at 8, so a grain makes about four grains of gold: rule 2, and the reason it is not a gold mine). Inert to acid, fire and water.",
+      "id": "philosophers_stone",
+      "arcane": 250,
+      "far": "flesh",
+      "class": "powder",
+      "repose": 30,
+      "density": 5000,
+      "hardness": 40,
+      "emission": 90,
+      "colors": [
+        "#9a1226",
+        "#7c0e1e",
+        "#b82636"
+      ],
+      "tags": [
+        "magic"
+      ]
+    },
+    {
+      "//": "REAL. Lead filings: Saturn's metal, the base one. Dense (11,340 -- it sinks in water and FLOATS ON QUICKSILVER, as real lead does). Aqua fortis dissolves it; the philosopher's stone turns it to gold.",
+      "id": "lead",
+      "arcane": 10,
+      "far": "gravel",
+      "class": "powder",
+      "repose": 32,
+      "density": 11340,
+      "hardness": 12,
+      "colors": [
+        "#586070",
+        "#4a5262",
+        "#666e7e"
+      ],
+      "tags": [
+        "metal"
+      ]
+    },
+    {
+      "//": "REAL (foxfire -- the bioluminescent fungi of rotting wood -- with a little lore). Luminous spores: a glowing teal dust, very light, carried by the wind. On damp ground (dirt, mud, moss) they sprout into glowcaps slowly; in moonwater, at once. Dissolved in water they make it glow (the `lumen` solute) and, concentrated, a potion of light.",
+      "id": "luminous_spores",
+      "arcane": 12,
+      "far": "crystal",
+      "class": "powder",
+      "repose": 28,
+      "density": 150,
+      "hardness": 2,
+      "emission": 140,
+      "colors": [
+        "#74e8c2",
+        "#58d0aa",
+        "#96fadc"
+      ],
+      "wind": {
+        "response": 6,
+        "friction": 6
+      },
+      "tags": [
+        "dissolvable"
+      ]
+    },
+    {
+      "//": "REAL-ish (foxfire). Glowcap: a mushroom that glows teal -- a light you can grow in a cave. Organic and flammable; heat makes it POP back into the spores it grew from (one for one), rather than burning, so a fire through a glowcap patch scatters glowing dust.",
+      "id": "glowcap",
+      "arcane": 10,
+      "far": "crystal",
+      "class": "solid",
+      "density": 400,
+      "hardness": 6,
+      "emission": 150,
+      "colors": [
+        "#5ed8b4",
+        "#46c09c",
+        "#7cf0cc"
+      ],
+      "tags": [
+        "flammable",
+        "organic",
+        "dissolvable"
+      ],
+      "molten": "fire"
+    },
+    {
+      "//": "LORE. A potion of light: water carrying enough dissolved luminous spores (the `lumen` solute's convert at 96) that it glows by itself (emission 200). Pour it on a cave floor and it lights the cave. It does nothing else, on purpose.",
+      "id": "glow_potion",
+      "arcane": 20,
+      "far": "water",
+      "class": "liquid",
+      "density": 1000,
+      "hardness": 4,
+      "emission": 200,
+      "opacity": 80,
+      "colors": [
+        "#86fad6",
+        "#6ceac2",
+        "#a4ffe6"
+      ],
+      "tags": [
+        "wet",
+        "magic"
+      ]
+    },
+    {
+      "//": "LORE (and a real resin of the same name, the red sap of Dracaena). Dragon's blood: dark crimson, glowing from within, thick. Heat it and it ERUPTS in flame (explode radius 3). Water hisses it away to steam. And the old story -- Siegfried bathed in it and his skin turned to horn -- is a rule: dragon's blood on SKIN turns it to dragonhide.",
+      "id": "dragons_blood",
+      "arcane": 80,
+      "far": "blood",
+      "class": "liquid",
+      "density": 1100,
+      "hardness": 4,
+      "moveEvery": 3,
+      "emission": 140,
+      "opacity": 220,
+      "colors": [
+        "#b81808",
+        "#9a1206",
+        "#d42a10"
+      ],
+      "tags": [
+        "magic"
+      ]
+    },
+    {
+      "//": "LORE. Dragonhide: skin that dragon's blood has hardened into scale. Hardness 120 (a blade or a blast has a hard time with it), wound weight 4, and none of skin's tags -- not flammable, not organic, not dissolvable -- so fire, acid and rot cannot touch it: the tags are the armour, as they are for steel. Bleeds when it is finally cut (rubble blood).",
+      "id": "dragonhide",
+      "far": "flesh_charred",
+      "class": "solid",
+      "density": 1200,
+      "hardness": 120,
+      "rubble": "blood",
+      "woundHp": 4,
+      "colors": [
+        "#6c2c1a",
+        "#5a2416",
+        "#7e3824"
+      ],
+      "tags": []
+    },
+    {
+      "//": "REAL ROOT, LORE NAME. Frost salt, 'sal frigoris': a frigorific salt. Real salts (saltpeter, ammonium nitrate) dissolving in water pull heat out of it -- the 16th-century way to chill wine. This one is stronger than any real one: it FREEZES the water it touches (about three voxels of ice a grain before it is spent), snuffs flame, turns steam to snow and quenches lava to stone. Faintly glowing, pale blue.",
+      "id": "frost_salt",
+      "arcane": 15,
+      "far": "snow",
+      "class": "powder",
+      "repose": 34,
+      "density": 1700,
+      "hardness": 8,
+      "emission": 20,
+      "colors": [
+        "#c2e8fc",
+        "#aedcf6",
+        "#d8f4ff"
+      ],
+      "tags": [
+        "mineral"
+      ]
+    },
+    {
+      "//": "A FLASH: what the world's `flash` reaction effect lays in a small ball round the cell that fired (thermite catching, phosphorus flaring, the chemical wedding, a transmutation). Pure light: emission 255, no tags, no rules but its own fast decay (400 per-mille, gone in two or three ticks), so it touches nothing and nothing touches it.",
+      "id": "glare",
+      "far": "fire",
+      "class": "gas",
+      "density": 1,
+      "emission": 255,
+      "opacity": 30,
+      "colors": [
+        "#fff6e2",
+        "#fff0d0",
+        "#ffffff"
+      ],
+      "tags": []
     }
   ]
 }
