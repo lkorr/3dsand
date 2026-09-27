@@ -1,16 +1,26 @@
 #pragma once
-// THE ALCHEMY BENCH, as the game drives it: one FlaskSim (game/flasksim.h)
-// over the vessel the player opened, plus at most one vessel brought in to
-// pour from, the tools that act on them, and the tally that turns what
-// happened into a TRANSFER the game checks and applies.
+// THE ALCHEMY BENCH, as the game drives it: a WORKSTATION. A table (one
+// FlaskSim, game/flasksim.h) that any of the player's vessels can be put on
+// and taken off; a hand that picks them up, carries and tilts them; a
+// stirring stick; and the tally that turns what happened into a TRANSFER the
+// game checks and applies.
 //
 // Game-side, owned by main.cpp; the inventory panel only draws Pixels() and
 // hands in a BenchInput each frame (ui/overlay.h, "mirror in, intent out").
-// Nothing here writes a stack: Finish() returns a BenchResult and
-// ApplyBenchResult is the one place its numbers reach the kit, after
-// ValidateBench has proven they conserve every material.
+// Nothing here writes a stack: Finish() returns a BenchResult and main.cpp
+// applies it after ValidateBench has proven it conserves every material.
+//
+// THE SIM RUNS ON ITS OWN THREAD, at 60 steps a second. A table with several
+// full vessels costs several milliseconds a step while it is moving; on the
+// frame thread that was the game's frame rate, on its own thread it is at
+// worst a bench running a little slow. Settled vessels sleep and cost nothing
+// (FlaskSim's sleep), and a quiet table is not redrawn. Everything the frame
+// thread sees is a snapshot published under one mutex.
+#include <atomic>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "game/composition.h"
@@ -23,11 +33,11 @@ struct MaterialDef;
 
 namespace alchemy {
 
-enum class BenchTool : uint8_t { Stir = 0, Pour = 1 };
+enum class BenchTool : uint8_t { Hand = 0, Stick = 1 };
 
 // One frame of the pointer over the bench, in SIM pixels (y up, 0..W/H).
 struct BenchInput {
-  bool over = false;     // pointer is on the bench image
+  bool over = false;     // pointer is on the bench picture
   V2 at;                 // where, sim pixels
   bool down = false;     // primary button held
   bool pressed = false;  // primary button went down this frame
@@ -38,82 +48,127 @@ struct BenchEntry {
   KitRef ref;
   std::string item;       // the stack's item name when it came on the bench
   int capacity = 0;       // eighths
-  Composition before;     // what it held then
-  Composition after;      // what it holds now (Finish / removal)
+  Composition before;     // what it held when it first came on
+  Composition after;      // what it holds now (taken off, or at Finish)
+  bool onTable = false;
 };
 
 struct BenchResult {
-  std::vector<BenchEntry> vessels;   // the opened one first
+  std::vector<BenchEntry> vessels;
   Composition spilled;               // left the bench: goes to the world
 };
 
 // Does `r` conserve every material (sum of before == sum of after + spilled)?
-// Also enforces each vessel's capacity and the 16-substance limit by moving
-// the excess -- top layer first -- into the spill, so the result that comes
-// back is always applicable. False (with `why`) only for a result that
-// created or destroyed matter, which is a bug, never a player action.
+// Also enforces each vessel's capacity by moving the excess -- top layer
+// first -- into the spill, so the result that comes back is always
+// applicable. False (with `why`) only for a result that created or destroyed
+// matter, which is a bug, never a player action.
 bool ValidateBench(BenchResult& r, const std::vector<MaterialDef>& mats, std::string& why);
 
 class AlchemyBench {
  public:
-  // The sim's grid (the panel draws it at an integer scale).
-  static constexpr int kGridW = 336;
-  static constexpr int kGridH = 288;
   // One eighth of a cell is this many pixels of area on the bench, so a
-  // vessel's drawn inside is capacity x this.
-  static constexpr int kUnitsPerEighth = 8;
+  // vessel's drawn inside is capacity x this. A liquid particle is half an
+  // eighth.
+  static constexpr int kUnitsPerEighth = 12;
+  static constexpr int kUnitsPerParticle = 6;
+  // The largest table (the picture's texture is this size; a table uses the
+  // top-left W x H of it).
+  static constexpr int kMaxW = 800;
+  static constexpr int kMaxH = 480;
+  // The table top: vessels stand with their base this high.
+  static constexpr float kTableY = 4.0f;
 
-  bool Open(KitRef ref, const ItemDef& def, const ItemInstance& inst,
-            const std::vector<MaterialDef>& mats);
+  AlchemyBench() = default;
+  ~AlchemyBench() { Abandon(); }
+  AlchemyBench(const AlchemyBench&) = delete;
+  AlchemyBench& operator=(const AlchemyBench&) = delete;
+
+  // An empty table of `w` x `h` sim pixels.
+  bool Open(int w, int h, const std::vector<MaterialDef>& mats);
   bool IsOpen() const { return open_; }
-  KitRef Target() const { return entries_.empty() ? KitRef{} : entries_[0].ref; }
 
-  // Brings a vessel on to pour FROM, beside the target, upright. A source
-  // already on the bench is taken off first (it keeps what is inside it).
-  bool SetSource(KitRef ref, const ItemDef& def, const ItemInstance& inst);
-  void ClearSource();
-  KitRef Source() const { return source_ >= 0 ? entries_[source_].ref : KitRef{}; }
+  // Put a vessel on the table (a free spot, upright) / take it off (it
+  // leaves with what is inside it). A vessel taken off and put back holds
+  // what it left with; the kit is only written at Finish.
+  bool Place(KitRef ref, const ItemDef& def, const ItemInstance& inst);
+  void Remove(KitRef ref);
+  bool OnTable(KitRef ref) const;
   bool Uses(KitRef ref) const;
+  // What a vessel the bench has had holds now (live, approximate while
+  // things move; exact at Finish). False if the bench has never had it.
+  bool Contents(KitRef ref, Composition& out) const;
+  // The vessel under the hand or last picked up, for the readout.
+  KitRef Focus() const;
+  // Where a vessel on the table stands and how big it is (sim pixels), as of
+  // the last published step. For scripted captures.
+  bool PoseOf(KitRef ref, Xform& pose, float& width, float& height) const;
 
-  void Frame(float dt, const BenchInput& in, BenchTool tool);
+  // One frame: the pointer and tool go to the sim thread, the newest picture
+  // comes back into Pixels().
+  void Frame(const BenchInput& in, BenchTool tool);
 
-  // Lets whatever is in flight land, tallies, and closes.
+  // Stops the sim, lets whatever is in flight land, tallies, closes.
   BenchResult Finish();
   void Abandon();
 
-  const std::vector<uint32_t>& Pixels() const { return pixels_; }
-  int W() const { return kGridW; }
-  int H() const { return kGridH; }
-  // The source's ACTUAL tilt (it lags the hand, and glass stops it).
-  float SourceTilt() const;
-  float RequestedTilt() const { return tilt_; }
-  // Where the pointer would have to be to hold the source by its pivot, and
-  // the middle of the target's mouth (sim pixels) -- for scripted captures.
-  V2 SourcePivot() const { return pivot_; }
-  V2 TargetMouth() const;
-  // Eighths currently in the target / source vessel (live, for the panel's
-  // numbers; exact only at Finish).
-  Composition LiveTarget() const;
-  Composition LiveSource() const;
+  const std::vector<uint32_t>& Pixels() const { return front_; }
+  int W() const { return w_; }
+  int H() const { return h_; }
+  // True once per new picture (the frame thread uploads only then).
+  bool TakeFresh() { const bool f = fresh_; fresh_ = false; return f; }
 
  private:
-  Xform SourcePose() const;
-  void PlaceSourceAt(V2 pivotWorld);
+  struct Cmd {
+    enum Kind { kPlace, kRemove } kind;
+    int entry;
+    VesselShape shape;
+    Composition contents;
+  };
+  struct Slot {                // per entry, sim-thread side
+    int sim = -1;              // FlaskSim vessel index, -1 when off the table
+    Xform cmd;                 // the smoothed pose sent to the sim
+    Xform goal;                // where the hand (or the table) wants it
+  };
+  void Run();
+  void Apply(Cmd& c);
+  void Tick(const BenchInput& in, bool pressed, float tilt, BenchTool tool, float dt);
+  bool FreeSpot(int entry, float nearX, Xform& out) const;
 
+  // ---- frame-thread state ----
   bool open_ = false;
+  int w_ = 0, h_ = 0;
+  const std::vector<MaterialDef>* mats_ = nullptr;
+  std::vector<BenchEntry> entries_;
+  std::vector<uint32_t> front_;
+  bool fresh_ = false;
+
+  // ---- shared, under mu_ ----
+  mutable std::mutex mu_;
+  BenchInput input_;
+  bool pressedLatch_ = false;
+  float tiltAcc_ = 0;
+  BenchTool tool_ = BenchTool::Hand;
+  std::vector<Cmd> cmds_;
+  std::vector<uint32_t> back_;
+  bool backReady_ = false;
+  std::vector<Composition> live_;                      // per entry
+  std::vector<std::pair<int, Composition>> removed_;   // entry, what left with it
+  int focus_ = -1;                                     // entry
+  struct PoseView { Xform x; float w = 0, h = 0; bool on = false; };
+  std::vector<PoseView> poses_;                        // per entry
+  bool quit_ = false;
+
+  // ---- sim-thread state (the frame thread touches it only when the thread
+  // is not running: Open before it starts, Finish after it is joined) ----
+  std::thread thread_;
   FlaskSim sim_;
-  std::vector<BenchEntry> entries_;   // [0] = target
-  std::vector<int> simIndex_;         // per entry, FlaskSim vessel index
-  int source_ = -1;                   // entry index of the current source
-  // The source's pose: a PIVOT (the lip corner on the pouring side, which the
-  // pointer holds) and a tilt about it.
-  V2 pivot_;
-  float tilt_ = 0;
-  bool pivotLeft_ = true;
-  bool dragging_ = false;
-  V2 grabOffset_;
-  float accum_ = 0;
-  std::vector<uint32_t> pixels_;
+  std::vector<Slot> slots_;                // per entry
+  int held_ = -1;                          // entry
+  V2 grabLocal_;
+  float heldAngle_ = 0;
+  int simFocus_ = -1;
+  uint32_t ticks_ = 0;
 };
 
 }  // namespace alchemy

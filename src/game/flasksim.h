@@ -66,8 +66,11 @@ VesselShape PouchShape(float width, float height);
 // The inside area of a shape, pixels (its profile at its box, closed across
 // the mouth).
 float ShapeArea(const VesselShape& s);
-// Rescale a shape (keeping its proportions) so its inside is `area` pixels --
-// a vessel's CAPACITY in units -- so a full flask is drawn full.
+// Rescale a shape (keeping its proportions) so its USABLE inside is `area`
+// pixels -- a vessel's CAPACITY in units -- so a full flask is drawn full.
+// Usable: the polygon is the glass's centre line, and the inner half of the
+// glass (plus half a pixel) holds nothing; sized to the polygon alone, a
+// "full" pouch had no free pixel left and jammed on every tilt.
 VesselShape ShapeWithArea(VesselShape s, float area);
 
 struct Xform {
@@ -79,7 +82,10 @@ struct SimConfig {
   int gridW = 224, gridH = 288;
   int unitsPerEighth = 6;
   int unitsPerParticle = 12;
-  float gravity = 0.045f;      // px / step^2
+  // px / step^2. Scaled with the particle spacing: the deeper a column is
+  // in particles, the more a single relaxation pass must hold up, and past
+  // this the bottom of a full flask oscillates for ever instead of resting.
+  float gravity = 0.025f;
   float stiffness = 0.1f;      // Clavet k, per h
   float stiffnessNear = 0.4f;  // Clavet k_near, per h
   float kernelScale = 2.1f;    // h / lattice spacing
@@ -94,7 +100,25 @@ struct SimConfig {
   float buoyancy = 2.0f;
   float maxSpeedFrac = 0.4f;
   float listSlack = 1.15f;
-  float maxVesselStep = 2.0f;  // px a vessel's outline may move per substep (< the glass)     // neighbour-list radius / h   // velocity cap as a fraction of h per step
+  float maxVesselStep = 2.0f;  // px a vessel's outline may move per substep (< the glass)
+  // ---- where the energy goes (without these a stirred mix churns forever) --
+  // Velocity kept per step, 1 - drag: a plain linear drag on every particle.
+  float damping = 0.02f;
+  // XSPH smoothing: each particle's velocity pulled this far toward its
+  // neighbours' weighted mean. Eddies die; bulk flow is untouched.
+  float xsph = 0.12f;
+  // Glass contact: the part of a particle's motion ALONG the glass (relative
+  // to the glass) lost per step; the part INTO or OFF it is set to the
+  // glass's own -- no bounce, and a moving wall never gives a particle more
+  // speed than it has itself.
+  float wallFriction = 0.3f;
+  // Steps a freshly seeded particle is heavily damped for, so a vessel opens
+  // calm instead of relaxing its lattice with a bang.
+  int calmSteps = 90;
+  // A vessel sleeps once none of its liquid has moved faster than this (px
+  // per step) for this many steps in a row.
+  float sleepSpeed = 0.12f;
+  int sleepSteps = 45;     // neighbour-list radius / h   // velocity cap as a fraction of h per step
   uint32_t seed = 0x5eed;
 };
 
@@ -124,6 +148,8 @@ class FlaskSim {
   // Would vessel `v` at `x` keep its glass clear of every other vessel's?
   // Step() refuses moves that fail this; the panel asks it to steer.
   bool PoseClear(int v, const Xform& x) const;
+  // Would a vessel of this shape, not yet on the bench, fit at `x`?
+  bool ShapeClear(const VesselShape& shape, const Xform& x) const;
 
   // The stirring stick: a capsule a..b of radius r, or off.
   void SetStick(bool on, V2 a = {}, V2 b = {}, float r = 3);
@@ -157,6 +183,8 @@ class FlaskSim {
   int GridW() const { return cfg_.gridW; }
   int GridH() const { return cfg_.gridH; }
   int ParticleCount() const { return (int)px_.size(); }
+  int AwakeParticleCount() const { return nAct_; }
+  bool VesselAsleep(int v) const { return v >= 0 && v < (int)vessels_.size() && vessels_[v].asleep; }
   int GrainCount() const { return (int)grains_.size(); }
   float KernelRadius() const { return h_; }
 
@@ -164,11 +192,28 @@ class FlaskSim {
   std::vector<float> MeanHeights() const;
   // For gates: how many particles/grains are moving faster than `speed`.
   int MovingCount(float speed) const;
+  // The vessel under a point: inside its outline or within `slack` px of its
+  // glass; the most recently added wins (it is drawn on top). -1 for none.
+  int HitVessel(V2 p, float slack = 6.0f) const;
+  // Draw this vessel's glass lit (the one under the hand), -1 for none.
+  void SetHighlight(int v) { highlight_ = v; }
+  // Did the last Step change anything visible? (Awake liquid, a grain that
+  // moved, a vessel that moved, the stick.) A quiet table need not be redrawn.
+  bool Active() const { return active_; }
+  // Read-only views for gates and the lab.
+  const std::vector<V2>& Positions() const { return px_; }
+  const std::vector<V2>& Velocities() const { return pv_; }
 
  private:
   struct Vessel {
     VesselShape shape;
     Xform x, prevX, target;
+    // SLEEP: a vessel whose liquid has come to rest stops being simulated
+    // (its particles are kept after the awake ones and skipped) until
+    // something disturbs it: it moves, the stick comes near, or anything not
+    // its own enters its box.
+    bool asleep = false;
+    int quiet = 0;
     std::vector<V2> outline;  // local, left lip -> bottom -> right lip
   };
   struct Grain {
@@ -196,6 +241,8 @@ class FlaskSim {
   void StepGrains();
   void CarryGrains();
   void UpdateGrainHomes();
+  void UpdateSleep();
+  void Partition();
   bool SweepChain(int gi, const Vessel& v, bool wantIn);
   bool PoseClear(const Vessel& v, const Xform& x) const;
   bool GrainFree(int x, int y) const;
@@ -221,21 +268,54 @@ class FlaskSim {
   std::vector<uint8_t> psub_;
   std::vector<uint16_t> pw_;  // units this particle carries
   std::vector<float> mbar_;   // neighbourhood mean mass, last step
+  std::vector<uint8_t> calm_; // steps of calm-in left
+  std::vector<int8_t> phome_; // vessel a particle was last inside, -1 none
+  // Particles [0, nAct_) are awake; [nAct_, size) belong to sleeping vessels.
+  int nAct_ = 0;
   std::vector<int> nbrStart_, nbr_;
+  std::vector<V2> xs_;        // XSPH scratch
 
   // hash grid over h-sized cells
   int cellsW_ = 0, cellsH_ = 0;
   std::vector<int> cellStart_, cellIdx_, cellOf_;
 
   // per-pixel particle buckets (coupling)
-  std::vector<int> pixStart_, pixIdx_;
+  // Particles by pixel: a head per pixel and a next per particle.
+  std::vector<int> pixHead_, pixNext_, pixOf_;
   std::vector<float> fieldW_, fieldM_, fieldVisc_;
   std::vector<V2> fieldV_;
 
   // powder grid: grain index + 1, or 0
   std::vector<int> grid_;
   std::vector<Grain> grains_;
-  std::vector<uint8_t> wall_;  // 1 = glass
+  std::vector<uint8_t> wall_;  // glass: the vessel's index + 1, 0 = none
+  // INSIDE which vessel each pixel's centre is (index + 1, first vessel wins),
+  // rasterized with the glass. The one answer to "whose is this grain": the
+  // point-in-polygon test it replaced ran per grain per substep.
+  std::vector<uint8_t> inside_;
+  // SWEEP MEMO: pixels a failed sweep search already explored this pass
+  // (stamped epoch*2 + side). Within one pass the free pixels only get
+  // fewer, so a second search through them would fail the same way; without
+  // this a tipped full pouch re-explored its whole pile per wedged grain.
+  std::vector<uint32_t> bfsDead_;
+  uint32_t deadEpoch_ = 0;
+  // SAND SLEEPS in 16x16 tiles. A resting grain in a tile nothing touched
+  // last step is skipped: it failed every move then and nothing within a
+  // pixel of it has changed. Every writer of grid_ wakes the tiles round
+  // what it wrote (Wake), a moving vessel wakes everything.
+  std::vector<uint8_t> awake_, awakeNext_;
+  int tilesW_ = 0, tilesH_ = 0;
+  bool wakeAll_ = true;
+  void Wake(int x, int y) {
+    for (int dy = -1; dy <= 1; dy += 2)
+      for (int dx = -1; dx <= 1; dx += 2) {
+        const int tx = (x + dx) >> 4, ty = (y + dy) >> 4;
+        if (tx < 0 || ty < 0 || tx >= tilesW_ || ty >= tilesH_) continue;
+        awake_[ty * tilesW_ + tx] = awakeNext_[ty * tilesW_ + tx] = 1;
+      }
+  }
+  // The liquid field's written box (cleared next step instead of the grid).
+  int fbx0_ = 0, fby0_ = 0, fbx1_ = -1, fby1_ = -1;
   std::vector<int> wedged_;    // grains the last sweep could not place
   std::vector<int> bfsParent_, bfsQueue_;
   std::vector<uint32_t> bfsSeen_;
@@ -246,6 +326,9 @@ class FlaskSim {
   float stickR_ = 3;
 
   std::vector<uint32_t> spilledUnits_;  // per substance slot
+  int highlight_ = -1;
+  bool active_ = true;
+  int grainMoves_ = 0;   // grains moved in the current step
   uint32_t rng_;
   uint32_t step_ = 0;
 };

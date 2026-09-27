@@ -1251,29 +1251,35 @@ struct UIState {
     // ---- mirror ----
     bool open = false;
     uint64_t tex = 0;            // ImTextureID of the bench picture
-    int texW = 0, texH = 0;      // its size, sim pixels
+    int texW = 0, texH = 0;      // the texture's full size
+    int tableW = 0, tableH = 0;  // the table's size, sim pixels (top-left of tex)
     bool texReady = false;       // copied at least once (safe to sample)
-    std::string title;           // the opened vessel's name
-    KitRef target{};
-    KitRef source{};             // the vessel being poured from, if any
-    float tilt = 0.0f;           // the source's tilt, radians
     struct Portion {
       std::string name;
       uint32_t color = 0;        // 0xAABBGGRR
       int eighths = 0;
     };
-    std::vector<Portion> targetParts, sourceParts;
-    int targetCap = 0, sourceCap = 0;   // eighths
-    // Vessels you carry that could be poured from (not the opened one).
-    struct Candidate {
+    // Every vessel you carry, and whether it is on the table. Click one to
+    // put it on / take it off.
+    struct Row {
       KitRef ref;
       std::string label;         // "flask: water 12, oil 3"
-      KitSlotUI slot;            // for the icon
+      KitSlotUI slot;            // for the icon (live contents while benched)
+      bool onTable = false;
     };
-    std::vector<Candidate> candidates;
+    std::vector<Row> rows;
+    // The vessel under the hand (or last picked up): its contents, heaviest
+    // first, and its capacity.
+    std::string focusName;
+    std::vector<Portion> focusParts;
+    int focusCap = 0;
     std::string message;         // the last thing the bench said
     // ---- panel-owned ----
-    int tool = 0;                // 0 = stir, 1 = pour
+    int tool = 0;                // 0 = hand, 1 = stirring stick
+    // What the panel measured last frame, for sizing the next table: the
+    // picture's room in screen pixels and the integer scale it draws at.
+    float areaW = 0.0f, areaH = 0.0f;
+    int scale = 3;
     // ---- input, written by the panel every frame ----
     bool over = false;
     float atX = 0.0f, atY = 0.0f;   // sim pixels, y up
@@ -1283,8 +1289,8 @@ struct UIState {
     bool wantOpen = false;       // double-click on a vessel slot
     KitRef openRef{};
     bool wantClose = false;      // "done", Esc, or the screen closing
-    bool wantSource = false;     // pick (or, with an invalid ref, put back)
-    KitRef sourceRef{};
+    bool wantToggle = false;     // a row clicked: on / off the table
+    KitRef toggleRef{};
   } alchemy;
   // THE THROW'S WIND-UP, 0..1 while Q is held with a throwable vessel in
   // hand, -1 otherwise (game/container.h ContainerThrowCharge). Written by the

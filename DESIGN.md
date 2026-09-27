@@ -16419,28 +16419,67 @@ contents after its damage; MOBS v9 and net protocol 2 write the Composition in
 `WriteItemInstance` (`mixed`). An older record's one-material word loads as
 one portion.
 
-**The panel** (`game/alchemy_bench.*`, `ui/inventory_ui.cpp` AlchemyPanel).
-Double-click a vessel slot on the character screen: the bench takes the
-spellbook's column (the character stays on the left), its picture drawn at the
-largest INTEGER scale that fits (pixel art). `stir` puts the stick in through
-the neck while the button is held; `pour` lists every other filled vessel you
-carry -- click one and it stands beside the target; drag it (held by its
-pouring lip corner) and tilt it with the wheel or Q / E. Glass stops glass, and
-the requested tilt may not lead the vessel by more than 0.35 rad. `done`, Esc,
-or the screen shutting ends the session: what is in flight lands (capped at
-360 substeps, in that frame), `ValidateBench` proves every material conserved
-and caps each vessel at its capacity (overflow goes to the spill, top layer
-first), every vessel on the bench must still be exactly what came on (a stack
-moved, emptied or swapped meanwhile voids the session: "nothing changed"), and
-only then are the contents written. What spilled goes into the world at your
-feet through the vessel-spill queue (`TickAuthorityCtx::vesselSpills`), so it
-is ordinary matter through the MutationQueue. The picture is drawn on the CPU
-and copied to a texture each frame (`rhi::CommandEncoder::CopyBufferToTexture`,
-Recorder::CopyBufferToImage: staging buffer written by the queue BEFORE the
-copy's encoder exists, submitted ahead of the UI so Finish() leaves it in the
-sampled layout; sync validation clean). Look-iterate with `--shot-bench`
-(`SANDVOX_BENCH_A` / `SANDVOX_BENCH_B` fill specs, `SANDVOX_BENCH_B_ITEM`,
-five `screenshot_bench*.bmp`).
+**The workstation** (`game/alchemy_bench.*`, `ui/inventory_ui.cpp` AlchemyPanel,
+reworked 2026-09-27 from the owner's "this should be a work station"). Double-
+click a vessel slot: the bench takes the spellbook's column (the character stays
+on the left), its table sized from the room the panel measures every frame, at
+an integer scale (`areaH / 260`, 2..5) that leaves a table at least ~1.7 flasks
+tall so one can be lifted over another. The left column lists EVERY vessel you
+carry (filled or empty -- an empty flask is what you pour into); clicking one
+puts it on the table (at the first spot clear of the others' glass) or takes it
+off (it leaves with what is inside it, `FlaskSim::RemoveVessel`; put back, it
+holds what it left with). Two tools: the HAND picks any vessel up where you
+click it, carries it and tilts it (wheel, Q / E) about that grab point, and sets
+it down upright in the nearest free spot when you let go; the STICK's tip
+follows the pointer inside whichever vessel it is in, through that vessel's
+neck. Vessels follow the hand by an exponential approach and never more than
+10 px / 0.3 rad ahead of the glass, so a vessel held against another does not
+wind up a lead it releases in one jerk. The kit is written only at "done" (Esc,
+or the screen shutting): every vessel that was ever on the table is re-checked
+against what came on and `ValidateBench` proves conservation, as before.
+
+The sim runs on its OWN THREAD at 60 steps a second (four substeps each): the
+frame thread hands in the pointer and gets back the newest picture, live
+contents and poses under one mutex, and uploads the picture only when a new one
+arrived. A heavy table therefore runs a little slow rather than dropping the
+game's frame rate. Particles are half an eighth (`kUnitsPerParticle` 6 at
+`kUnitsPerEighth` 12) -- four times as many as the first version, which the
+owner could see as blobs.
+
+**Where the energy goes.** Without these a stirred water+acid flask churned for
+ever and a fresh flask burst open: a linear drag (`damping`), XSPH velocity
+smoothing (`xsph`), a glass contact that zeroes the relative velocity into or
+off the wall and bleeds `wallFriction` along it (a moving wall never gives a
+particle more than its own speed -- the old position push launched liquid), a
+calm-in (`calmSteps`) that damps a fresh particle's motion RELATIVE TO ITS
+VESSEL (damped in the world, a flask lifted in its first second left its
+liquid behind and the glass pushed it through), and gravity lowered to 0.025
+px/step^2 -- with finer particles a column is more particles deep, and past
+that the bottom of a full flask shimmered for ever.
+
+**Sleep.** A vessel whose liquid has an RMS speed under `sleepSpeed` with under
+2% visibly moving, for `sleepSteps` steps, SLEEPS: its particles are kept after
+the awake ones (`nAct_`) and skipped by the whole liquid step. Moving, the
+stick near it, or anything moving that is not its own entering its box wakes
+it. A settled full flask: 7.6 -> 0.1 ms. Sand sleeps separately in 16x16 tiles
+(below).
+
+**Sand performance** (measured by an Opus review of the CA, 2026-09-27): a
+per-pixel INSIDE mask rasterized with the glass (grain homes, the sweep and the
+tally read it instead of a point-in-polygon test per grain per substep); a
+per-pass memo of failed sweep searches (a tipped full pouch re-explored its
+whole pile once per wedged grain: 106 ms -> 6 ms); a counting sort in the carry;
+16x16 SLEEPING TILES (a resting grain in a tile nothing touched is skipped;
+every writer of the grain grid wakes the tiles round what it wrote, a moving
+vessel wakes everything); the liquid field cleared only over what was written.
+Two conservation bugs it found: seeding silently dropped the grains that did
+not fit (800 of a full pouch), and a vessel's POLYGON area was its capacity
+while the inner half of the glass holds nothing, so "full" had no free pixel
+and jammed every tilt -- `ShapeWithArea` now sizes the USABLE inside. The
+carry moves every SUPPORTED grain (on a grain, glass or liquid) by one move,
+the motion of the vessel's interior centre, and never out of its own vessel:
+per-grain rigid motion stood the sand up in the air while turning, and grains
+in the air are falling, not held.
 
 **Not yet:** reactions, powders dissolving, the cauldron, a held/grounded
 flask drawing its layers, refraction. Reactions must run on the vessel's

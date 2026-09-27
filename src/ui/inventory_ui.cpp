@@ -1997,6 +1997,7 @@ void GrimoireBody(UIState& s, ImVec2 at, ImVec2 size) {
 // right-click TAKE, and a drag INTO one is refused by main.cpp with the
 // reason (a thing put on a corpse would have no body in the world).
 // ---- THE ALCHEMY BENCH -------------------------------------------------------
+constexpr float kBenchColW = 340.0f;   // the bench panel's left column
 //
 // The spellbook's column while a vessel is open on the bench: tools and
 // readouts down the left, the bench's picture (game/alchemy_bench.h, drawn by
@@ -2057,8 +2058,7 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
   ImDrawList* dl = ImGui::GetWindowDrawList();
   const ImVec2 wp = ImGui::GetWindowPos();
   const ImVec2 ws = ImGui::GetWindowSize();
-  const std::string title = "ALCHEMY: " + A.title;
-  float y = PanelChrome(dl, wp, ws, title.c_str(), nullptr, st);
+  float y = PanelChrome(dl, wp, ws, "ALCHEMY BENCH", nullptr, st);
   const float contentTop = y;
   const float lineH = ImGui::GetTextLineHeight();
   {
@@ -2068,73 +2068,78 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     if (ui::Button("##benchdone", ImVec2(wp.x + ws.x - kFrame - 10 - bw, by), "done", false, bw))
       A.wantClose = true;
     if (ImGui::IsItemHovered())
-      Tip("Put it all back: whatever is in each vessel stays in it, and whatever "
+      Tip("Put everything away: whatever is in each vessel stays in it, and whatever "
           "was spilled lands at your feet.");
   }
 
-  // ---- the left column: tools, what is in what, what to pour from --------
+  // ---- the left column: tools, the vessel in hand, every vessel you carry --
   const float colX = wp.x + kFrame + kPad;
-  const float colW = 280.0f;
+  const float colW = kBenchColW;
+  const float colBottom = wp.y + ws.y - kFrame - kPad;
   {
     const float bw = (colW - 8) * 0.5f;
-    if (ui::Button("##benchstir", ImVec2(colX, y), "stir", A.tool == 0, bw)) A.tool = 0;
-    if (ImGui::IsItemHovered()) Tip("Hold the button over the flask: the stick goes in through the neck and follows you.");
-    if (ui::Button("##benchpour", ImVec2(colX + bw + 8, y), "pour", A.tool == 1, bw)) A.tool = 1;
-    if (ImGui::IsItemHovered()) Tip("Drag the vessel you are pouring from; the wheel (or Q / E) tilts it.");
+    if (ui::Button("##benchhand", ImVec2(colX, y), "hand", A.tool == 0, bw)) A.tool = 0;
+    if (ImGui::IsItemHovered())
+      Tip("Pick up any vessel on the bench and carry it; the wheel (or Q / E) tilts it. "
+          "Let go and it is set down upright. Click a vessel in the list to put it on "
+          "the bench or take it off.");
+    if (ui::Button("##benchstick", ImVec2(colX + bw + 8, y), "stick", A.tool == 1, bw)) A.tool = 1;
+    if (ImGui::IsItemHovered())
+      Tip("Hold the button inside a vessel: the stick goes in through its neck and follows you.");
     y += 44;
   }
-  dl->AddText(ImVec2(colX, y), ui::ColGold(), "IN IT");
-  y += lineH + 6;
-  BenchParts(dl, ImVec2(colX, y), colW, A.targetParts, A.targetCap, y);
-
-  dl->AddText(ImVec2(colX, y), ui::ColGold(), "POUR FROM");
-  y += lineH + 6;
-  if (A.source.Valid()) {
-    BenchParts(dl, ImVec2(colX, y), colW, A.sourceParts, A.sourceCap, y);
-    char b[64];
-    std::snprintf(b, sizeof b, "tilt %d deg", (int)std::lround(A.tilt * 57.2958f));
-    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.7f), b);
-    y += lineH + 8;
-    if (ui::Button("##benchputback", ImVec2(colX, y), "put it back", false, colW)) {
-      A.wantSource = true;
-      A.sourceRef = KitRef{};
-    }
-    y += 44;
+  // The vessel in hand (or last touched).
+  if (!A.focusName.empty()) {
+    dl->AddText(ImVec2(colX, y), ui::ColGold(), A.focusName.c_str());
+    y += lineH + 6;
+    BenchParts(dl, ImVec2(colX, y), colW, A.focusParts, A.focusCap, y);
+  } else {
+    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.6f), "point at a vessel to see inside it");
+    y += lineH + 12;
   }
-  // Every other vessel you carry, as a row: its icon (layers and all) and
-  // what is in it. Click one to bring it on to the bench.
-  for (size_t i = 0; i < A.candidates.size(); i++) {
-    const auto& c = A.candidates[i];
-    if (c.ref == A.source) continue;
-    if (y + kSlot > wp.y + ws.y - kFrame - 60) break;
+  dl->AddText(ImVec2(colX, y), ui::ColGold(), "YOUR VESSELS");
+  y += lineH + 6;
+  // Every vessel you carry: click to put it on the bench or take it off.
+  const float rowH = kSlot + 12;
+  for (size_t i = 0; i < A.rows.size(); i++) {
+    const auto& r = A.rows[i];
+    if (y + rowH > colBottom - lineH * 2) break;
     ImGui::SetCursorScreenPos(ImVec2(colX, y));
     ImGui::PushID((int)i);
-    const bool hit = ImGui::InvisibleButton("##cand", ImVec2(colW, kSlot));
+    const bool hit = ImGui::InvisibleButton("##row", ImVec2(colW, kSlot));
     const bool hov = ImGui::IsItemHovered();
     ImGui::PopID();
+    if (r.onTable || hov)
+      dl->AddRectFilled(ImVec2(colX - 4, y - 2), ImVec2(colX + colW + 4, y + kSlot + 2),
+                        Fade(ui::ColGold(), r.onTable ? 0.14f : 0.07f));
     ui::SlotSurface(dl, ImVec2(colX, y), kSlot,
-                    hov ? ui::SlotLook::Hover : ui::SlotLook::Filled, false);
+                    hov ? ui::SlotLook::Hover : ui::SlotLook::Filled, r.onTable);
     const ImVec2 mid(colX + kSlot * 0.5f, y + kSlot * 0.5f);
-    ui::DrawSpriteCentered(dl, ItemIcon(c.slot.kind), mid, IM_COL32_WHITE);
-    DrawVesselContents(dl, mid, c.slot.fill, c.slot.fillSwatch, c.slot.fillGlow,
-                       &c.slot.fillBandColor, &c.slot.fillBandFrac);
-    dl->PushClipRect(ImVec2(colX, y), ImVec2(colX + colW, y + kSlot), true);
-    dl->AddText(ImVec2(colX + kSlot + 10, y + (kSlot - lineH) * 0.5f),
-                hov ? ui::ColGoldPale() : ui::ColParch(), c.label.c_str());
+    ui::DrawSpriteCentered(dl, ItemIcon(r.slot.kind), mid, IM_COL32_WHITE);
+    DrawVesselContents(dl, mid, r.slot.fill, r.slot.fillSwatch, r.slot.fillGlow,
+                       &r.slot.fillBandColor, &r.slot.fillBandFrac);
+    // Two lines: what it is (and whether it is on the bench), what is in it.
+    const size_t colon = r.label.find(": ");
+    const std::string name = colon == std::string::npos ? r.label : r.label.substr(0, colon);
+    const std::string what = colon == std::string::npos ? std::string() : r.label.substr(colon + 2);
+    dl->PushClipRect(ImVec2(colX, y - 2), ImVec2(colX + colW, y + kSlot + 8), true);
+    dl->AddText(ImVec2(colX + kSlot + 10, y - 1), hov ? ui::ColGoldPale() : ui::ColParch(),
+                (name + (r.onTable ? "  (on the bench)" : "")).c_str());
+    dl->AddText(ImVec2(colX + kSlot + 10, y + lineH + 1), Fade(ui::ColParch(), 0.65f), what.c_str());
     dl->PopClipRect();
-    if (hov) Tip(c.label.c_str());
+    if (hov) Tip(r.label.c_str());
     if (hit) {
-      A.wantSource = true;
-      A.sourceRef = c.ref;
+      A.wantToggle = true;
+      A.toggleRef = r.ref;
     }
-    y += kSlot + 6;
+    y += rowH;
   }
-  if (A.candidates.empty() && !A.source.Valid()) {
-    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.6f), "no other vessel to pour from");
+  if (A.rows.empty()) {
+    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.6f), "you carry no vessels");
     y += lineH + 6;
   }
   if (!A.message.empty()) {
-    ImGui::SetCursorScreenPos(ImVec2(colX, wp.y + ws.y - kFrame - 3 * lineH));
+    ImGui::SetCursorScreenPos(ImVec2(colX, colBottom - 2 * lineH));
     ImGui::PushTextWrapPos(colX + colW);
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColEmber()));
     ImGui::TextUnformatted(A.message.c_str());
@@ -2142,27 +2147,31 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     ImGui::PopTextWrapPos();
   }
 
-  // ---- the bench's picture -----------------------------------------------
+  // ---- the table ------------------------------------------------------------
+  // Everything right of the column. The panel reports its room so the next
+  // table is sized to fill it, at an integer scale that makes a flask about
+  // half the picture's height.
   const float ax0 = colX + colW + kColGap, ax1 = wp.x + ws.x - kFrame - kPad;
-  const float ay0 = contentTop;
-  const float ay1 = wp.y + ws.y - kFrame - kPad;
+  const float ay0 = contentTop, ay1 = colBottom;
   A.over = A.down = A.pressed = false;
   A.tiltReq = 0.0f;
-  if (A.texW > 0 && A.texH > 0 && ax1 > ax0 && ay1 > ay0) {
-    const int sc = std::max(1, (int)std::floor(std::min((ax1 - ax0) / A.texW, (ay1 - ay0) / A.texH)));
-    const float iw = (float)(A.texW * sc), ih = (float)(A.texH * sc);
+  if (A.tableW > 0 && A.tableH > 0 && A.texW > 0 && A.texH > 0 && ax1 > ax0 && ay1 > ay0) {
+    const int sc = std::max(1, (int)std::floor(std::min((ax1 - ax0) / A.tableW, (ay1 - ay0) / A.tableH)));
+    const float iw = (float)(A.tableW * sc), ih = (float)(A.tableH * sc);
     const ImVec2 p0((float)(int)(ax0 + (ax1 - ax0 - iw) * 0.5f), (float)(int)(ay1 - ih));
     const ImVec2 p1(p0.x + iw, p0.y + ih);
     // The desk behind the glass: a dark field in stepped bands, a lit rule
     // for the table top the vessels stand on.
-    for (int b = 0; b < 8; b++) {
-      const float t0 = p0.y + ih * b / 8.0f, t1 = p0.y + ih * (b + 1) / 8.0f;
+    for (int band = 0; band < 8; band++) {
+      const float t0 = p0.y + ih * band / 8.0f, t1 = p0.y + ih * (band + 1) / 8.0f;
       dl->AddRectFilled(ImVec2(p0.x, t0), ImVec2(p1.x, t1),
-                        ui::Mix(IM_COL32(18, 15, 26, 255), IM_COL32(34, 28, 44, 255), b / 7.0f));
+                        ui::Mix(IM_COL32(18, 15, 26, 255), IM_COL32(34, 28, 44, 255), band / 7.0f));
     }
     dl->AddRectFilled(ImVec2(p0.x, p1.y - 4 * sc), ImVec2(p1.x, p1.y), IM_COL32(58, 44, 34, 255));
     dl->AddRectFilled(ImVec2(p0.x, p1.y - 4 * sc), ImVec2(p1.x, p1.y - 3 * sc), IM_COL32(92, 70, 50, 255));
-    if (A.texReady && A.tex) dl->AddImage((ImTextureID)A.tex, p0, p1);
+    if (A.texReady && A.tex)
+      dl->AddImage((ImTextureID)A.tex, p0, p1, ImVec2(0, 0),
+                   ImVec2((float)A.tableW / A.texW, (float)A.tableH / A.texH));
     dl->AddRect(ImVec2(p0.x - 1, p0.y - 1), ImVec2(p1.x + 1, p1.y + 1), ui::ColBronze());
 
     ImGui::SetCursorScreenPos(p0);
@@ -2171,17 +2180,19 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     const ImVec2 m = ImGui::GetIO().MousePos;
     A.over = hov || act;
     A.atX = (m.x - p0.x) / sc;
-    A.atY = (float)A.texH - (m.y - p0.y) / sc;
+    A.atY = (float)A.tableH - (m.y - p0.y) / sc;
     A.down = act && ImGui::IsMouseDown(ImGuiMouseButton_Left);
     A.pressed = hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
     if (hov) A.tiltReq += ImGui::GetIO().MouseWheel * 0.10f;
     const float dt = ImGui::GetIO().DeltaTime;
     if (ImGui::IsKeyDown(ImGuiKey_Q)) A.tiltReq += 1.4f * dt;
     if (ImGui::IsKeyDown(ImGuiKey_E)) A.tiltReq -= 1.4f * dt;
-    if (A.tool == 1 && !A.source.Valid()) {
-      const char* t = "pick a vessel on the left to pour from";
+    bool any = false;
+    for (const auto& r : A.rows) any |= r.onTable;
+    if (!any) {
+      const char* t = "the bench is empty - click a vessel on the left to put it here";
       const ImVec2 ts = ImGui::CalcTextSize(t);
-      dl->AddText(ImVec2(p0.x + (iw - ts.x) * 0.5f, p0.y + 16), Fade(ui::ColParch(), 0.8f), t);
+      dl->AddText(ImVec2(p0.x + (iw - ts.x) * 0.5f, p0.y + ih * 0.4f), Fade(ui::ColParch(), 0.8f), t);
     }
   }
   ImGui::End();
@@ -3150,6 +3161,16 @@ void DrawInventoryScreen(UIState& s) {
   // from are listed on the bench itself.
   const bool bench = s.alchemy.open;
   const bool packShown = !s.spellbookOpen && !bench;
+  // The bench's room, measured whether or not it is open: the table is sized
+  // from it at the moment a vessel first goes on, which is before the bench
+  // panel has ever been drawn. Must match AlchemyPanel's own layout.
+  {
+    const float panelW = std::max(360.0f, disp.x - 28.0f - bookX);
+    const float panelH = bottom - top;
+    s.alchemy.areaW = std::max(0.0f, panelW - 2 * (kFrame + kPad) - kBenchColW - kColGap);
+    s.alchemy.areaH = std::max(0.0f, panelH - (kFrame + ui::kHeaderH + 14) - (kFrame + kPad));
+    s.alchemy.scale = std::clamp((int)(s.alchemy.areaH / 260.0f), 2, 5);
+  }
   const float bookH =
       s.spellbookOpen
           ? (bottom - top)
