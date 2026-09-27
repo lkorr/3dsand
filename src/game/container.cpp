@@ -10,6 +10,7 @@
 #include "game/worlditems.h"
 #include "phys/debris.h"
 #include "phys/physics.h"
+#include "sim/reactcpu.h"
 #include "sim/rng.h"
 #include "sim/tuning.h"
 
@@ -983,6 +984,39 @@ uint16_t ContainerTopMat(const ItemInstance& st, const std::vector<MaterialDef>*
     if (best < 0 || d < bestD) { best = i; bestD = d; }
   }
   return best < 0 ? 0 : c.p[best].mat;
+}
+
+bool ContainerPocketExplosion(const alchemy::Composition& c, const std::vector<MaterialDef>& mats,
+                              const std::vector<ReactionGpu>& reactions, ReactionEffect& out) {
+  std::vector<MaterialGpu> gpu;   // ReactNbrMatches reads the gpu rows
+  for (int a = 0; a < c.n; a++) {
+    const uint16_t ma = c.p[a].mat;
+    if (alchemy::IsDissolved(ma) || ma == 0 || ma >= mats.size()) continue;
+    const MaterialDef& A = mats[ma];
+    if (A.ruleFx.empty()) continue;
+    for (uint32_t k = 0; k < A.gpu.reactCount && A.gpu.reactOffset + k < reactions.size(); k++) {
+      if (k >= A.ruleFx.size() || A.ruleFx[k].effects.empty()) continue;
+      const ReactionGpu& r = reactions[A.gpu.reactOffset + k];
+      if ((r.packed & 3u) != kReactPair) continue;
+      const ReactionEffect* ex = nullptr;
+      for (const ReactionEffect& e : A.ruleFx[k].effects)
+        if (e.kind == "explode") { ex = &e; break; }
+      if (!ex) continue;
+      if (gpu.empty()) {
+        gpu.reserve(mats.size());
+        for (const MaterialDef& m : mats) gpu.push_back(m.gpu);
+      }
+      for (int b = 0; b < c.n; b++) {
+        const uint16_t mb = c.p[b].mat;
+        if (b == a || alchemy::IsDissolved(mb) || mb == 0 || mb >= mats.size()) continue;
+        if (ReactNbrMatches(r, mb, gpu)) {
+          out = *ex;
+          return true;
+        }
+      }
+    }
+  }
+  return false;
 }
 
 uint32_t ContainerVolume(const alchemy::Composition& c, const std::vector<MaterialDef>& mats) {

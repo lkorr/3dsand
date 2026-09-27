@@ -1767,10 +1767,15 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
       if (!s.scoopMemo.claims.empty()) {
         const WorldSnapshot& lsnap = world.Snap();
         if (lsnap.valid) {
+          // POCKET CHEMISTRY (container.h ContainerPocketExplosion): a
+          // deposit that brings two substances together that the world's
+          // rules make explode goes off in the hands, after the payout.
+          struct Pocket { ItemStack* st; ReactionEffect fx; };
+          std::vector<Pocket> pockets;
           auto depositInto = [&](ItemStack* v, int n, int i, ItemStack* spill,
                                  int nSpill, uint16_t mat, int units) {
             ItemStack& cand = v[i];
-            if (cand.Empty()) return 0;
+            if (cand.Empty() || cand.stoppered) return 0;
             const ItemDef* d = items.Of(cand);
             // Another substance is fine (contents mix) until the vessel holds
             // kMaxSubstances of them.
@@ -1799,6 +1804,12 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
               s.flaskFillAt = player.EyePos() + cam.Forward() * MetresToCells(0.35f) -
                               Vec3{0, MetresToCells(0.15f), 0};
             }
+            ReactionEffect fx;
+            if (put > 0 && ContainerPocketExplosion(cand.contents, mats, mobs.Reactions(), fx)) {
+              bool seen = false;
+              for (const Pocket& p : pockets) seen |= p.st == &cand;
+              if (!seen) pockets.push_back({&cand, fx});
+            }
             return put;
           };
           auto deposit = [&](uint16_t mat, int units) {
@@ -1819,6 +1830,28 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
           };
           std::vector<ContainerUnpaid> unpaid;
           ContainerSettle(w.scoopLedger, s.scoopMemo, lsnap.tick, deposit, &unpaid);
+          // It went off: the vessel is gone, what was in it bursts out at the
+          // hands, and a real blast (the grenade slot) carves whoever held it.
+          for (const Pocket& p : pockets) {
+            const Vec3 hands = player.EyePos() + cam.Forward() * MetresToCells(0.35f) -
+                               Vec3{0, MetresToCells(0.15f), 0};
+            ContainerSpill sp;
+            sp.at = hands;
+            sp.vel = player.vel;
+            sp.away = Vec3{0, 1, 0};
+            sp.rest = p.st->contents;
+            sp.seed = rng::Hash3(0xB0C4E7u, tick, p.st->contents.Total());
+            w.vesselSpills.push_back(sp);
+            s.pendingBlasts.push_back({ifloor(hands.x), ifloor(hands.y), ifloor(hands.z),
+                                       std::clamp(p.fx.radius, 1, kMaxExplosionRadius),
+                                       std::max(1, p.fx.power), 0, 0, 0});
+            p.st->ClearFill();
+            p.st->stoppered = false;
+            p.st->count -= 1;
+            if (p.st->count <= 0) *p.st = ItemStack{};
+            ui.kitMessage = "it explodes in your hands!";
+            ui.kitMessageAge = 0.0f;
+          }
           for (const ContainerUnpaid& u : unpaid) {
             ContainerSpill sp;
             const Vec3 fwd = cam.Forward();

@@ -1346,7 +1346,7 @@ void FlaskSim::RenderChem(std::vector<uint32_t>& out) const {
     for (int dx = -(int)hw; dx <= (int)hw; dx++) {
       const float u = 1.0f - std::fabs((float)dx) / hw;
       const float fl = 0.55f + 0.45f * Noise2(dx * 0.35f, t * 0.12f);
-      const int h = (int)(std::sqrt(u) * 20.0f * fl + 2);
+      const int h = (int)(std::sqrt(u) * 16.0f * fl + 3);
       for (int dy = 0; dy < h; dy++) {
         const float f = (float)dy / std::max(1, h);
         int r, g, b, a;
@@ -1356,7 +1356,10 @@ void FlaskSim::RenderChem(std::vector<uint32_t>& out) const {
         const int px = (int)bx + dx, py = (int)by + dy;
         if (px < 0 || py < 0 || px >= W || py >= H) continue;
         const size_t k = (size_t)py * W + px;
-        if (inside_.size() == (size_t)W * H && inside_[k] == vi + 1 && !wall_[k]) continue;   // not inside the glass
+        // Over the glass the flame is in FRONT of the flask (a cross-section
+        // of a flame wrapping its bottom): drawn there, thinner.
+        const bool front = inside_.size() == (size_t)W * H && inside_[k] == vi + 1;
+        if (front) a = a * 11 / 20;
         put(px, py, r, g, b, a);
       }
     }
@@ -1419,7 +1422,7 @@ void FlaskSim::RenderChem(std::vector<uint32_t>& out) const {
           const Substance& S = subs_[rGasSub_[j]];
           const float op = std::max(0.02f, S.opacity / 255.0f);
           const float wisp = 0.55f + 0.45f * Noise2(x * 0.18f, y * 0.18f - t * 0.02f);
-          float a = (1.0f - std::exp(-rGas_[j] * 7.0f * (0.3f + op))) * wisp;
+          float a = (1.0f - std::exp(-rGas_[j] * 12.0f * (0.3f + op))) * wisp;
           const float n2 = Noise2(x * 0.3f + 11.0f, y * 0.3f - t * 0.03f);
           const uint32_t c = S.color[n2 < 0.4f ? 1 : n2 < 0.75f ? 0 : 2];
           // Smoke is lit: a dark gas still reads against the dark desk as a

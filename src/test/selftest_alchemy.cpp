@@ -23,7 +23,10 @@
 #include "game/container.h"
 #include "game/flasksim.h"
 #include "game/flasksim_mats.h"
+#include "game/item.h"
+#include "game/iteminstance.h"
 #include "game/mob.h"
+#include "sim/bytestream.h"
 #include "sim/solutes.h"
 #include "sim/world.h"
 #include "test/selftest.h"
@@ -666,7 +669,44 @@ Status GateAlchemyStopper(Ctx& c, std::string& detail) {
   std::string why3;
   const bool audit3 = s3.AuditUnits(&why3);
 
-  const bool ok = held && audit1 && ledger1 && pop && audit2 && burst && audit3;
+  // THE STOPPER ON THE ITEM: a stoppered flask pours nothing, scoops
+  // nothing, and keeps its stopper -- and a dissolved portion -- through the
+  // item record (iteminstance.h kItemFmtStopper); an older format drops the
+  // stopper, never the record.
+  bool itemOk = false;
+  std::string itemNote = "no flask item";
+  if (const int fi = c.items.Find("flask"); fi >= 0) {
+    const ItemDef* fd = c.items.At(fi);
+    ItemInstance st;
+    st.name = fd->name;
+    st.count = 1;
+    st.contents.Add(b.subs[water].mat, 64);
+    st.contents.Add((uint16_t)(MatId(c, "salt") | alchemy::kDissolvedBit), 5);
+    st.stoppered = true;
+    const char* w = nullptr;
+    const bool refuses = !ContainerAccepts(*fd, st, b.subs[water].mat, c.mats, &w);
+    std::vector<ParticleSpawn> ps;
+    ItemInstance pour = st;
+    const int poured = ContainerPour(*fd, pour, Vec3{0, 50, 0}, Vec3{1, 0, 0}, nullptr, 8, 1, 1u, ps, nullptr,
+                                     0xFFFFFFFFu, &c.mats);
+    std::vector<uint8_t> buf, buf1;
+    ByteWriter bw{buf};
+    WriteItemInstance(bw, st, kItemFmtStopper);
+    ByteReader br{buf.data(), buf.size()};
+    ItemInstance back;
+    const bool read = ReadItemInstance(br, back, kItemFmtStopper);
+    ByteWriter bw1{buf1};
+    WriteItemInstance(bw1, st, kItemFmtMixed);
+    ByteReader br1{buf1.data(), buf1.size()};
+    ItemInstance old;
+    ReadItemInstance(br1, old, kItemFmtMixed);
+    const bool trip = read && back.stoppered && back.contents.SameAs(st.contents);
+    itemOk = refuses && poured == 0 && ps.empty() && trip && !old.stoppered && old.contents.SameAs(st.contents);
+    itemNote = Format("item: scoop %s (%s), pour %d, record %s, older format %s", refuses ? "refused" : "ALLOWED",
+                      w ? w : "", poured, trip ? "keeps stopper + dissolved salt" : "LOSES IT",
+                      old.stoppered ? "KEPT A STOPPER" : "unstoppered");
+  }
+  const bool ok = held && audit1 && ledger1 && pop && audit2 && burst && audit3 && itemOk;
   detail = Format("held: peak %d gas units inside, %u eighths vented%s, audit %s, ledger %s; "
                   "pop: %s (frame %d; events %s) audit %s; burst: %s (frame %d, heat %.2f) audit %s%s%s",
                   maxGas, vented, popped ? " (after it popped)" : "", audit1 ? "exact" : why.c_str(),
@@ -674,6 +714,7 @@ Status GateAlchemyStopper(Ctx& c, std::string& detail) {
                   audit2 ? "exact" : why2.c_str(), burst ? "yes" : "NO", burstAt, s3.Heat(v3),
                   audit3 ? "exact" : why3.c_str(), b.fixtures.empty() ? "" : "; FIXTURE rules: ",
                   b.fixtures.c_str());
+  detail += "; " + itemNote;
   std::printf("alchemy-stopper: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -902,7 +943,24 @@ Status GateAlchemyExplode(Ctx& c, std::string& detail) {
     emitted += ContainerSpillStep(sp, c.mats, 1000 + k, 4096, fl, pa, &splat, 0xFFFFFFFFu, &gs, 1024);
   }
   const bool spillOk = sp.Done() && emitted == (int)t.vessel[v].Total();
-  const bool ok = at >= 0 && handled && out.eject && out.breakHeld && blastOk && puffOk && ledger && spillOk;
+  // POCKET CHEMISTRY (ContainerPocketExplosion): off the bench, a flask that
+  // has sodium and water meet in it goes off too -- by the authored rule.
+  std::string pocketNote = "pocket: not authored (fixture rule has no ruleFx)";
+  bool pocketOk = true;
+  if (authored) {
+    ReactionEffect pfx, nfx;
+    Composition both, alone;
+    both.Add(b.subs[na].mat, 8);
+    both.Add(b.subs[water].mat, 40);
+    alone.Add(b.subs[na].mat, 8);
+    const bool boom = ContainerPocketExplosion(both, c.mats, c.reactions, pfx) && pfx.kind == "explode";
+    const bool calm = !ContainerPocketExplosion(alone, c.mats, c.reactions, nfx);
+    pocketOk = boom && calm;
+    pocketNote = Format("pocket: sodium+water %s (r%d p%d), sodium alone %s", boom ? "explodes" : "DOES NOT",
+                        pfx.radius, pfx.power, calm ? "calm" : "EXPLODES");
+  }
+  const bool ok = at >= 0 && handled && out.eject && out.breakHeld && blastOk && puffOk && ledger && spillOk &&
+                  pocketOk;
   detail = Format("explode event at frame %d (x%d, radius %d power %d); handler: eject %s, break %s, blast %s "
                   "(r%d p%d at the hands), puff %zu gas parcels %s; ledger %s; the broken flask's %u eighths "
                   "-> %d emitted through the spill door (%zu gas parcels) %s%s%s",
@@ -911,6 +969,7 @@ Status GateAlchemyExplode(Ctx& c, std::string& detail) {
                   gas.size(), puffOk ? "ok" : "WRONG", ledger ? "validates" : lwhy.c_str(), t.vessel[v].Total(),
                   emitted, gs.size(), spillOk ? "ok" : "SHORT", b.fixtures.empty() ? "" : "; FIXTURE rules: ",
                   b.fixtures.c_str());
+  detail += "; " + pocketNote;
   std::printf("alchemy-explode: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

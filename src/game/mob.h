@@ -6739,6 +6739,9 @@ class MobSystem {
   // True once the reaction mirror has been built. A caller with no tables must
   // not burn: it would silently do nothing rather than fail.
   bool BurnTablesReady() const { return !reactions_.empty() && !matGpu_.empty(); }
+  // The compiled reaction table this system was given (the vessels' pocket
+  // chemistry reads it: container.h ContainerPocketExplosion).
+  const std::vector<ReactionGpu>& Reactions() const { return reactions_; }
   // World position of one of a limb's SURVIVING voxels — the `n`th, wrapped.
   // Deliberately not the centroid: once a carve has hollowed a limb, its
   // centroid is in the cavity, and a tool aimed there eats nothing. Anything

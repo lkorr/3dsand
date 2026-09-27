@@ -399,6 +399,19 @@ int ContainerDissolvedToWorld(uint16_t mat, int eighths, Vec3 at, Vec3 vel, uint
 alchemy::Composition ContainerTakeDissolvedShare(alchemy::Composition& c, uint32_t eighths,
                                                  uint32_t liquidBefore);
 
+// POCKET CHEMISTRY, the minimal version (docs/PLAN_alchemy_chemistry.md
+// package C): a vessel that is not on the bench still holds substances that
+// react. When two portions first meet in it (a scoop lands in a flask that
+// already holds something), the world's rules are asked -- portion level:
+// does a PAIR rule of one portion's material match the other's, and does
+// that rule carry an `explode` effect (reactions.json "effects")? True with
+// the effect in `out`: sodium scooped into a flask of water goes off in the
+// hands. Deterministic and integer (the compiled table, in portion order).
+// Only `explode` is answered here; the rest of a pocket reaction's
+// chemistry is the bench's.
+bool ContainerPocketExplosion(const alchemy::Composition& c, const std::vector<MaterialDef>& mats,
+                              const std::vector<ReactionGpu>& reactions, ReactionEffect& out);
+
 // A VESSEL'S VOLUME in eighths: what takes room in it. Dissolved matter and
 // gas (a stoppered flask's headspace) do not; everything else does.
 uint32_t ContainerVolume(const alchemy::Composition& c, const std::vector<MaterialDef>& mats);
