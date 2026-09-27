@@ -1,24 +1,24 @@
 {
-  "comment": "A two-handed cleaver: the heavy end of the melee range, and the second arm of the wound model's heft differential. Regenerate with scripts/gen_cleaver_item.py \u2014 the edge and hilt blocks are emitted from the same constants that build the mesh, so the hitbox cannot drift from the art. NOTE there is no \"heft\" key here on purpose: heft is DERIVED from this file's own voxel volume (item.h ItemDef::heftVolume), so re-authoring the blade re-weighs it in the same edit.",
+  "comment": "A two-handed cleaver: the heavy end of the melee range, and the second arm of the wound model's heft differential. Regenerate with scripts/gen_cleaver_item.py — the edge and hilt blocks are emitted from the same constants that build the mesh, so the hitbox cannot drift from the art. NOTE there is no \"heft\" key here on purpose: heft is DERIVED from this file's own voxel volume (item.h ItemDef::heftVolume), so re-authoring the blade re-weighs it in the same edit.",
   "name": "cleaver",
   "model": "cleaver",
   "artVoxelsPerMetre": 40,
   "hp": 45,
   "severable": true,
-  "severImpactSpeed": 9.0,
+  "severImpactSpeed": 9,
   "grip": {
     "held_right": {
       "translation": [
         0,
-        0,
-        0
+        4,
+        -3
       ],
       "rotation": [
-        0,
+        90,
         -90,
         0
       ],
-      "scale": 1.0
+      "scale": 1
     }
   },
   "hilt": {

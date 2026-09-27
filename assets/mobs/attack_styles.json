@@ -543,7 +543,7 @@
           "frames": [
             {
               "name": "windup",
-              "ticks": 4,
+              "ticks": 6,
               "ease": "quadInOut",
               "pose": {
                 "shoulder": [
@@ -570,7 +570,7 @@
             },
             {
               "name": "cut a",
-              "ticks": 2,
+              "ticks": 3,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -624,7 +624,7 @@
             },
             {
               "name": "cut c",
-              "ticks": 1,
+              "ticks": 3,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -650,9 +650,34 @@
               }
             },
             {
+              "name": "cut c",
+              "ticks": 3,
+              "pose": {
+                "shoulder": [
+                  -0.582739,
+                  0.314619,
+                  -0.159765,
+                  0.732056
+                ],
+                "elbow": [
+                  -0.252812,
+                  -0.42244,
+                  0.42869,
+                  0.757533
+                ],
+                "wrist": [
+                  0.524825,
+                  -0.44213,
+                  0.477017,
+                  0.549122
+                ],
+                "twist": -0.065987,
+                "pitch": -0.044948
+              }
+            },
+            {
               "name": "recover pre",
-              "ticks": 2,
-              "cuts": true,
+              "ticks": 3,
               "pose": {
                 "shoulder": [
                   -0.178694,
@@ -1152,7 +1177,7 @@
           "frames": [
             {
               "name": "windup1 ",
-              "ticks": 2,
+              "ticks": 3,
               "ease": "quadInOut",
               "pose": {
                 "shoulder": [
@@ -1179,7 +1204,7 @@
             },
             {
               "name": "windup 2",
-              "ticks": 2,
+              "ticks": 3,
               "ease": "quadInOut",
               "pose": {
                 "shoulder": [
@@ -1206,26 +1231,26 @@
             },
             {
               "name": "cut a",
-              "ticks": 3,
+              "ticks": 4,
               "cuts": true,
               "pose": {
                 "shoulder": [
-                  0.496362,
-                  0.105067,
-                  0.42143,
-                  -0.751653
+                  0.541121,
+                  0.03889,
+                  0.357412,
+                  -0.760219
                 ],
                 "elbow": [
-                  0.054643,
-                  0.33031,
-                  -0.377837,
-                  -0.86322
+                  0.028961,
+                  0.350056,
+                  -0.19977,
+                  -0.914721
                 ],
                 "wrist": [
-                  -0.107358,
-                  -0.687483,
-                  0.19632,
-                  -0.690869
+                  -0.139832,
+                  -0.6798,
+                  0.227845,
+                  -0.682939
                 ],
                 "twist": -0.081616,
                 "pitch": 0.05845
@@ -1237,22 +1262,22 @@
               "cuts": true,
               "pose": {
                 "shoulder": [
-                  0.294979,
-                  0.472531,
-                  0.701162,
-                  -0.445055
+                  0.352814,
+                  0.419837,
+                  0.669557,
+                  -0.500952
                 ],
                 "elbow": [
-                  -0.07667,
-                  -0.149587,
-                  0.637435,
-                  0.751945
+                  -0.058348,
+                  -0.170094,
+                  0.485703,
+                  0.855427
                 ],
                 "wrist": [
-                  -0.183617,
-                  -0.752062,
-                  0.248892,
-                  -0.582014
+                  -0.146893,
+                  -0.762695,
+                  0.213691,
+                  -0.592499
                 ],
                 "twist": 0.155392,
                 "pitch": 0.056987
@@ -2014,7 +2039,7 @@
           "frames": [
             {
               "name": "windup1 ",
-              "ticks": 2,
+              "ticks": 3,
               "ease": "quadIn",
               "pose": {
                 "shoulder": [
@@ -2049,7 +2074,7 @@
             },
             {
               "name": "windup2",
-              "ticks": 1,
+              "ticks": 2,
               "pose": {
                 "shoulder": [
                   -0.521054,
@@ -2083,7 +2108,7 @@
             },
             {
               "name": "windup 3",
-              "ticks": 2,
+              "ticks": 4,
               "ease": "quadOut",
               "pose": {
                 "shoulder": [
@@ -2171,27 +2196,54 @@
               }
             },
             {
+              "name": "cut b",
+              "ticks": 4,
+              "cuts": true,
+              "pose": {
+                "shoulder": [
+                  -0.045328,
+                  0.588646,
+                  -0.143223,
+                  0.79431
+                ],
+                "elbow": [
+                  -0.264758,
+                  -0.681936,
+                  0.018483,
+                  0.68156
+                ],
+                "wrist": [
+                  -0.354455,
+                  0.073503,
+                  0.108528,
+                  -0.925841
+                ],
+                "twist": -0.083225,
+                "pitch": 0.029461
+              }
+            },
+            {
               "name": "recover",
               "ticks": 5,
               "from": "body",
               "pose": {
                 "shoulder": [
-                  -0.080076,
-                  -0.68318,
-                  0.259019,
-                  -0.678058
+                  0.002724,
+                  -0.427726,
+                  0.187456,
+                  -0.884253
                 ],
                 "elbow": [
-                  0.219403,
-                  0.009058,
-                  0.141443,
-                  -0.965284
+                  0.201626,
+                  0.009085,
+                  0.129928,
+                  -0.970764
                 ],
                 "wrist": [
-                  -0.043435,
-                  -0.327375,
-                  0.175245,
-                  0.927485
+                  0.061388,
+                  -0.41443,
+                  0.125873,
+                  0.899241
                 ],
                 "twist": 0.006202,
                 "pitch": -0.030434
@@ -2567,7 +2619,7 @@
           "frames": [
             {
               "name": "windup",
-              "ticks": 6,
+              "ticks": 8,
               "ease": "quadInOut",
               "pose": {
                 "shoulder": [
@@ -2594,7 +2646,7 @@
             },
             {
               "name": "cut a",
-              "ticks": 2,
+              "ticks": 3,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -2622,7 +2674,7 @@
             },
             {
               "name": "cut b",
-              "ticks": 3,
+              "ticks": 4,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -2650,7 +2702,7 @@
             },
             {
               "name": "recover",
-              "ticks": 4,
+              "ticks": 5,
               "from": "body",
               "ease": "quadOut",
               "pose": {
@@ -3097,7 +3149,7 @@
           "frames": [
             {
               "name": "windup",
-              "ticks": 6,
+              "ticks": 7,
               "ease": "quadInOut",
               "pose": {
                 "shoulder": [
@@ -3124,7 +3176,7 @@
             },
             {
               "name": "cut a",
-              "ticks": 1,
+              "ticks": 2,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -3178,7 +3230,7 @@
             },
             {
               "name": "cut c",
-              "ticks": 2,
+              "ticks": 3,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -3206,7 +3258,7 @@
             },
             {
               "name": "recover",
-              "ticks": 3,
+              "ticks": 5,
               "from": "body",
               "ease": "quadInOut",
               "pose": {
@@ -3733,7 +3785,7 @@
           "frames": [
             {
               "name": "windup",
-              "ticks": 6,
+              "ticks": 8,
               "ease": "quadInOut",
               "pose": {
                 "shoulder": [
@@ -3760,7 +3812,7 @@
             },
             {
               "name": "cut a",
-              "ticks": 2,
+              "ticks": 3,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -3814,7 +3866,7 @@
             },
             {
               "name": "cut c",
-              "ticks": 2,
+              "ticks": 3,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -3840,10 +3892,36 @@
               }
             },
             {
-              "name": "recover",
+              "name": "cut c",
               "ticks": 3,
+              "pose": {
+                "shoulder": [
+                  0.615285,
+                  -0.166022,
+                  0.142421,
+                  -0.757349
+                ],
+                "elbow": [
+                  -0.203927,
+                  -0.393367,
+                  0.29265,
+                  0.847368
+                ],
+                "wrist": [
+                  -0.36982,
+                  0.379416,
+                  -0.354116,
+                  -0.770635
+                ],
+                "twist": -0.253843,
+                "pitch": 0.090385
+              }
+            },
+            {
+              "name": "recover",
+              "ticks": 4,
               "from": "body",
-              "ease": "quadOut",
+              "ease": "quadIn",
               "pose": {
                 "shoulder": [
                   0.286208,
@@ -3869,9 +3947,9 @@
             },
             {
               "name": "recover",
-              "ticks": 3,
+              "ticks": 5,
               "from": "body",
-              "ease": "quadInOut",
+              "ease": "quadOut",
               "pose": {
                 "shoulder": [
                   0.092152,
@@ -4377,7 +4455,7 @@
           "frames": [
             {
               "name": "windup",
-              "ticks": 6,
+              "ticks": 8,
               "ease": "quadInOut",
               "pose": {
                 "shoulder": [
@@ -4404,7 +4482,7 @@
             },
             {
               "name": "cut a",
-              "ticks": 1,
+              "ticks": 2,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -4458,7 +4536,7 @@
             },
             {
               "name": "cut c ",
-              "ticks": 1,
+              "ticks": 2,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -4485,7 +4563,7 @@
             },
             {
               "name": "recover",
-              "ticks": 6,
+              "ticks": 8,
               "from": "body",
               "pose": {
                 "shoulder": [
@@ -4847,7 +4925,7 @@
             },
             {
               "name": "cut b",
-              "ticks": 6,
+              "ticks": 4,
               "cuts": true,
               "pose": {
                 "shoulder": [
@@ -4874,7 +4952,7 @@
             },
             {
               "name": "cut c",
-              "ticks": 1,
+              "ticks": 6,
               "cuts": true,
               "pose": {
                 "shoulder": [
