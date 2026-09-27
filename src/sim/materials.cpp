@@ -1178,8 +1178,11 @@ static bool ExpandNeighborChance(const json& r, std::vector<MaterialDef>& mats,
 // event handlers). This list is only the loader's spell-checker: a kind
 // outside it still loads (a consumer that does not know a kind ignores it)
 // but is warned about once, so "exlpode" is visible instead of silent.
+// explode / flash / shock: world AND bench. eject / burst / pop: the bench's
+// (a vessel and a player at a bench are what they act on); the world ignores
+// them by design (session.cpp ReactFxToBlasts).
 const char* const kKnownEffectKinds[] = {"explode", "flash", "eject", "shock",
-                                         "burst"};
+                                         "burst", "pop"};
 const size_t kKnownEffectKindCount =
     sizeof(kKnownEffectKinds) / sizeof(kKnownEffectKinds[0]);
 

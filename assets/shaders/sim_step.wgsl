@@ -229,7 +229,7 @@ fn solWritable(c : vec3<i32>) -> bool {
 }
 // A write into a chunk with no page is REFUSED and counted -- the allocator
 // promises a page to every chunk a tick can write, so a refusal is a bug, and
-// the count is what says so (Simulation::CheckSoluteFaults aborts on it). A
+// the count is what says so (SubmitTick aborts on it: support.cpp). A
 // write of the value the sentinel already implies is not a write at all.
 fn solFault(slot : u32) {
   let prev = atomicAdd(&solMeta[SOLM_FAULTS], 1u);
@@ -680,7 +680,8 @@ fn solSwap(src : vec3<i32>, dst : vec3<i32>, srcWord : u32, dstWord : u32) {
 // on both sides, which is what a liquid moving as a body does. The last eighth
 // takes all of it. Integer floor, so a source keeps the remainder; nothing is
 // created and nothing is lost. A target of a DIFFERENT species keeps its own
-// (immiscible, PLAN_solutes §2.3) and the arriving mass is discarded, counted.
+// (immiscible, PLAN_solutes §2.3) and REFUSES the arriving mass, which stays
+// in the source; only a source that left entirely has it discarded, counted.
 fn solTransfer(src : vec3<i32>, dst : vec3<i32>, sf : u32, df : u32, t : u32) {
   let rs = solValueAt(src);
   let rd = solValueAt(dst);
@@ -699,7 +700,13 @@ fn solTransfer(src : vec3<i32>, dst : vec3<i32>, sf : u32, df : u32, t : u32) {
   if (moved != 0u) {
     let sd = solSpeciesOf(vd);
     if (sd != 0u && sd != ss) {
-      solDiscard(moved);
+      // Immiscible: the arriving mass is REFUSED, not destroyed -- it stays
+      // in what is left of the source (whose concentration rises; capped at
+      // 255 already, since it is the source's own mass). Only when the whole
+      // source left (t == sf: it becomes air) is there nowhere for it to
+      // stay, and it is discarded, counted. Destroying it every transfer
+      // would let brine levelling into sugar water delete the salt.
+      if (t < sf) { moved = 0u; } else { solDiscard(moved); }
     } else {
       let tot = solMassOf(vd) + moved;
       nd = solPack(ss, min(tot, 255u));
@@ -2373,7 +2380,7 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
 // origin/tick words are an atomicAdd and identical stores: order-free too.
 //
 // Out-of-window cells (a ticket chunk; TICKET_SLOTS) are not reported: the
-// key holds a window-relative cell. Their products still apply; only the
+// key's slot coordinates decode to a WINDOW cell. Their products still apply; only the
 // effect is skipped, and a ticket chunk is a peer's, whose own window
 // reports it.
 //
@@ -2394,8 +2401,14 @@ fn reactFxNote(rule : Reaction, c : vec3<i32>) {
   let fx = (rule.cond >> RFX_COND_SHIFT) & RFX_COND_MASK;
   if (fx == 0u) { return; }
   if (!inWindow(c, T.origin)) { return; }
-  let rel = vec3<u32>(c - T.origin * i32(CHUNK));
-  let lin = (rel.z * WORLD_N + rel.y) * WORLD_N + rel.x;
+  // The cell's SLOT coordinates (world coords wrapped into the toroidal
+  // window), never window-relative ones: the slot hash and the key must not
+  // depend on where the window sits (CLAUDE.md: an identity is the slot
+  // index), or the same firings would pick different winners -- different
+  // ExplosionOps -- for a player standing elsewhere. Unique within the
+  // window, so the CPU decodes it back with the origin (ReactFxDecodeCell).
+  let wr = vec3<u32>(c & vec3<i32>(WORLD_MASK));
+  let lin = (wr.z * WORLD_N + wr.y) * WORLD_N + wr.x;
   atomicAdd(&pageFaults[RFX_FIRES], 1u);
   atomicStore(&pageFaults[RFX_ORIGIN + 0u], bitcast<u32>(T.origin.x));
   atomicStore(&pageFaults[RFX_ORIGIN + 1u], bitcast<u32>(T.origin.y));

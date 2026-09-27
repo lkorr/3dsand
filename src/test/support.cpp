@@ -1029,13 +1029,36 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
       if (!pour && seenPour) { needMove = true; break; }
       seenPour |= pour;
     }
-    if (needMove) {
+    // THE POUR CAPS, counted (world.h kMaxSolutePourOpsPerTick): at most
+    // that many pours, keep-first; and the stream's own cap
+    // (kMaxCellOpsPerTick) cuts VOXEL ops before pours, because the plain
+    // clamp below cuts the tail -- which is where the pours are -- and a
+    // pour's mass was already taken out of a vessel.
+    uint32_t pours = 0;
+    for (const CellOp& op : src) pours += IsSoluteCellOp(op.word) ? 1u : 0u;
+    const uint32_t keepPours = std::min(pours, kMaxSolutePourOpsPerTick);
+    const uint32_t voxelOps = (uint32_t)src.size() - pours;
+    const uint32_t keepVoxel = std::min(voxelOps, kMaxCellOpsPerTick - keepPours);
+    if (needMove || keepPours < pours || keepVoxel < voxelOps) {
       std::vector<CellOp> part;
-      part.reserve(src.size());
+      part.reserve(keepVoxel + keepPours);
+      uint32_t nv = 0, np = 0, lostUnits = 0;
       for (const CellOp& op : src)
-        if (!IsSoluteCellOp(op.word)) part.push_back(op);
-      for (const CellOp& op : src)
-        if (IsSoluteCellOp(op.word)) part.push_back(op);
+        if (!IsSoluteCellOp(op.word) && nv < keepVoxel) { part.push_back(op); nv++; }
+      for (const CellOp& op : src) {
+        if (!IsSoluteCellOp(op.word)) continue;
+        if (np < keepPours) { part.push_back(op); np++; }
+        else lostUnits += (op.word >> 12) & 0xFFFu;
+      }
+      if (pours > keepPours) {
+        opstream::NoteSolutePourTrunc(pours - keepPours, lostUnits);
+        std::fprintf(stderr, "solute pours: %u op(s) past the %u-a-tick cap refused at tick %u "
+                     "(%u units lost)\n", pours - keepPours, kMaxSolutePourOpsPerTick, tick,
+                     lostUnits);
+      }
+      // Voxel ops cut here are counted as cellTrunc exactly as the clamp
+      // below would have counted them.
+      if (voxelOps > keepVoxel) opstream::NoteTruncation(0, 0, voxelOps - keepVoxel, 0, 0, 0);
       cellsCanon.swap(part);
     }
   }
@@ -2030,6 +2053,23 @@ void SubmitTick(GpuContext& ctx, World& world, Simulation& sim, uint32_t tick,
                      "kSolPoolDivisor); this is genuine demand past it.\n",
                      sn.tick, sn.solExhausted, kSolutePoolPages, sn.solHighWater,
                      sn.solFree, sn.solDissolved, sn.solDiscarded, sn.solPrecip);
+        std::fflush(stderr);
+        std::abort();
+      }
+      // ...AND SO IS A SOLUTE STORE FAULT (world.h kSolMFaults; the check
+      // every solute shader's solFault comment names). The allocator promises
+      // a page to every chunk a tick can write, so a store into a sentinel
+      // is a lost (or, half a swap, duplicated) write of authoritative,
+      // hashed mass: a bug, named at the first tick it happened.
+      if (sn.solFaults != 0) {
+        const uint32_t slot = sn.solFaultSlot ? sn.solFaultSlot - 1u : 0u;
+        const IVec3 wc = sn.solFaultSlot ? world.SlotToWorldChunk(slot) : IVec3{0, 0, 0};
+        std::fprintf(stderr,
+                     "FATAL: %u solute store(s) refused by a chunk with no page; "
+                     "the first at tick %u in slot %u (world chunk %d,%d,%d). The "
+                     "writer reached past the chunks solWant paged for it "
+                     "(sim_solute.wgsl solWant / solFault).\n",
+                     sn.solFaults, sn.solFaultTick, slot, wc.x, wc.y, wc.z);
         std::fflush(stderr);
         std::abort();
       }

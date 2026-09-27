@@ -947,6 +947,13 @@ inline uint32_t CellOpClearIfMat(uint32_t mat) {
 // single invocation reads only them.
 constexpr uint32_t kCellOpSoluteSpeciesMax = 127;
 constexpr uint32_t kCellOpSoluteUnitsMax = 0xFFF;
+// The most pour ops one tick applies: solPour is ONE invocation walking the
+// stream's tail, so it is bounded here (sim_mutate.wgsl SOL_POUR_MAX_OPS,
+// declared there and checked equal by check_invariants.py). SubmitTick clamps
+// the stream to it, keep-first, and counts the refused ops and their units
+// into last_run.json's opstream block (solPourTrunc / solPourUnitsTrunc). The
+// producer (container.h kMaxSolutePoursPerTick) sends far fewer.
+constexpr uint32_t kMaxSolutePourOpsPerTick = 256;
 inline uint32_t CellOpSolute(uint32_t species, uint32_t units) {
   return kCellOpIfAir | ((units & 0xFFFu) << 12) | ((species & 0x7Fu) << 24);
 }
@@ -1619,7 +1626,7 @@ constexpr uint32_t kPtNoWord = 0xFFFFFFFFu;
 //   [44]   T.tick + 1 (0 = nothing fired; the parse checks it)
 //   [45..47] reserved
 //   [48..63] kPageFaultReactFxSlots SLOTS, each an atomicMax of
-//          (fxId << 27) | scramble(window-relative cell). A firing picks its
+//          (fxId << 27) | scramble(slot cell = world cell mod kWorldN). A firing picks its
 //          slot by hash3(seed, tick, cell), so WHICH firings survive a busy
 //          tick is a pure function of the set of firings -- never of the
 //          order threads ran in (rule 1: an order-free reduction, not an
@@ -1872,7 +1879,7 @@ static_assert((uint64_t)kPoolPages * kChunkVol * 4ull <= 0xFFFFFFFFull,
 // the dilution floor bounds how far a plume can spread (mass / floor cells).
 // One-eighth of the window's slots is 4,096 pages = 32 MiB, ~64x the largest
 // plume a vessel can pour. Exhaustion is a FATAL ABORT with a verdict
-// (Simulation::CheckSoluteFaults), because which slots would be refused is
+// (SubmitTick, support.cpp), because which slots would be refused is
 // scheduling-dependent and a refused page would be a lost write.
 constexpr uint32_t kSolWordsPerPage = kChunkVol / 2;        // 2048 u32 = 8 KiB
 constexpr uint32_t kSolPoolDivisor = 8;
@@ -3846,8 +3853,8 @@ struct ReactFxEvent {
   IVec3 cell{};
   uint32_t tick = 0;
 };
-// The slot key's cell half: the window-relative linear cell (z-major, x
-// fastest; 27 bits at kWorldN 512) times an odd constant mod 2^27. The
+// The slot key's cell half: the SLOT linear cell (world cell mod kWorldN,
+// z-major, x fastest; 27 bits at kWorldN 512) times an odd constant mod 2^27. The
 // multiply is a bijection, so the key is still unique per cell and decodes
 // exactly, but a slot's atomicMax then picks a spatially SCATTERED winner
 // instead of always the cell in the window's high corner. MIRRORED in
@@ -3865,12 +3872,19 @@ constexpr uint32_t ReactFxScrambleInverse() {
 }
 static_assert((kReactFxScramble * ReactFxScrambleInverse()) == 1u,
               "kReactFxScramble must be odd");
+// The key holds the cell's SLOT coordinates (world coords mod kWorldN, so
+// the slot choice and the winner do not depend on the window origin); the
+// origin names the one window cell with those slot coordinates.
 inline IVec3 ReactFxDecodeCell(uint32_t key, IVec3 originChunks) {
   const uint32_t lin = (key * ReactFxScrambleInverse()) & kReactFxCellMask;
-  const int x = (int)(lin % kWorldN), y = (int)((lin / kWorldN) % kWorldN),
-            z = (int)(lin / (kWorldN * kWorldN));
-  return {originChunks.x * (int)kChunk + x, originChunks.y * (int)kChunk + y,
-          originChunks.z * (int)kChunk + z};
+  const int n = (int)kWorldN;
+  const int w[3] = {(int)(lin % kWorldN), (int)((lin / kWorldN) % kWorldN),
+                    (int)(lin / (kWorldN * kWorldN))};
+  const int o[3] = {originChunks.x * (int)kChunk, originChunks.y * (int)kChunk,
+                    originChunks.z * (int)kChunk};
+  int c[3];
+  for (int a = 0; a < 3; a++) c[a] = o[a] + ((((w[a] - o[a]) % n) + n) % n);
+  return {c[0], c[1], c[2]};
 }
 
 // CPU-visible snapshot of GPU state, exactly World::kSnapshotLatency ticks

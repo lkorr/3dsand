@@ -169,7 +169,7 @@ fn solWritable(c : vec3<i32>) -> bool {
 }
 // A write into a chunk with no page is REFUSED and counted -- the allocator
 // promises a page to every chunk a tick can write, so a refusal is a bug, and
-// the count is what says so (Simulation::CheckSoluteFaults aborts on it). A
+// the count is what says so (SubmitTick aborts on it: support.cpp). A
 // write of the value the sentinel already implies is not a write at all.
 fn solFault(slot : u32) {
   let prev = atomicAdd(&solMeta[SOLM_FAULTS], 1u);
@@ -390,8 +390,22 @@ fn cells(@builtin(global_invocation_id) gid : vec3<u32>) {
   // conditional clear of the material in bits 12..23.
   if (cellOpIsSolutePour(word)) {
     let lp = vec3<i32>(vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK)));
-    markBoth(slotWorldChunk(ci, T.origin) * i32(CHUNK) + lp);
+    let wcell = slotWorldChunk(ci, T.origin) * i32(CHUNK) + lp;
+    markBoth(wcell);
     atomicStore(&solMeta[SOLM_REQ_FLAG + ci], 1u);
+    // ...and for the chunks ABOVE and BELOW it. solPour's surface search
+    // climbs out of the ground and falls up to SOL_POUR_DOWN cells, so it can
+    // deposit into the chunk above or below this one; that chunk, if the CA
+    // is already moving its liquid THIS tick, carries the mass on into ITS
+    // neighbours -- which must be paged too, or the store is refused (a
+    // fault: mass lost, or duplicated by half a swap). Waking them and
+    // raising their request flags pages their 3x3x3 in this tick's solWant.
+    for (var dy = -1; dy <= 1; dy += 2) {
+      let c2 = wcell + vec3<i32>(0, dy * i32(CHUNK), 0);
+      if (!inBounds(c2)) { continue; }
+      markBoth(c2);
+      atomicStore(&solMeta[SOLM_REQ_FLAG + voxSlotOfCell(c2)], 1u);
+    }
     return;
   }
   if ((word & CELLOP_IF_AIR) != 0u) {
@@ -485,7 +499,9 @@ const SOL_POUR_CLIMB : i32 = 3;
 const SOL_POUR_DOWN : i32 = 16;
 const SOL_POUR_RADIUS : i32 = 2;
 const SOL_POUR_LAYERS : i32 = 3;
-const SOL_POUR_MAX_OPS : u32 = 256u;   // container.h kMaxSolutePoursPerTick
+// world.h kMaxSolutePourOpsPerTick (check_invariants.py); SubmitTick has
+// already clamped the stream to it and counted what it refused.
+const SOL_POUR_MAX_OPS : u32 = 256u;
 
 fn cellOpIsSolutePour(w : u32) -> bool {
   return (w & CELLOP_IF_AIR) != 0u && (w & 0xFFFu) == MAT_AIR && ((w >> 24u) & 0x7Fu) != 0u;
@@ -545,18 +561,29 @@ fn solPourOne(op : CellOp) {
   }
   var left = units;
   let y8 = solYield8(s);
+  // The pour's reach, in chunks: its own and the ones above and below,
+  // which `cells` woke and asked pages round (so whatever the CA does with
+  // the mass this tick lands in a paged chunk). A deeper fall -- 16 cells
+  // of air from the bottom of the op's chunk -- lands past it and
+  // precipitates instead of dissolving into a chunk nobody paged round.
+  let opCy = worldChunkOf(slotWorldChunk(ci, T.origin) * i32(CHUNK) + lp).y;
   // 2. Into solution.
   let side = 2 * SOL_POUR_RADIUS + 1;
   let n = side * side * SOL_POUR_LAYERS;
   let pm = voxMat(voxWordAt(p));
   if (solIsLiquidMat(pm) && solIsSolvent(pm, s)) {
     var room = 0u;
-    for (var k = 0; k < n; k++) { room += solPourRoom(solPourPatch(p, k), s); }
+    for (var k = 0; k < n; k++) {
+      let c = solPourPatch(p, k);
+      if (abs(worldChunkOf(c).y - opCy) > 1) { continue; }
+      room += solPourRoom(c, s);
+    }
     var put = min(left, room);
     if (put < left) { put = (put / y8) * y8; }
     var given = 0u;
     for (var k = 0; k < n && given < put; k++) {
       let c = solPourPatch(p, k);
+      if (abs(worldChunkOf(c).y - opCy) > 1) { continue; }
       let r = solPourRoom(c, s);
       if (r == 0u) { continue; }
       let g = min(r, put - given);

@@ -214,6 +214,11 @@ void NoteTruncation(uint32_t brush, uint32_t exp, uint32_t cell, uint32_t spawn,
   g_counts.gasTrunc += gas;
 }
 
+void NoteSolutePourTrunc(uint32_t ops, uint32_t units) {
+  g_counts.solPourTrunc += ops;
+  g_counts.solPourUnitsTrunc += units;
+}
+
 void NoteCellDupes(uint32_t tick, uint32_t dropped, uint32_t firstCellIdx) {
   if (dropped == 0) return;
   if (g_counts.cellDupes == 0) {

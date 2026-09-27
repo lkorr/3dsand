@@ -726,6 +726,7 @@ class Stream {
   // solutes_ (asynchronously). Called by ShiftAxis BEFORE the origin moves,
   // while SlotToWorldChunk still names the leaving chunks.
   void EvictSolutes(const std::vector<uint32_t>& slots);
+  void EvictSoluteBatch(const uint32_t* slots, uint32_t n);   // <= kSolEvictRecords
   // Install whatever solutes_ holds for the chunks now in `slots` (the end of
   // FillSlots). Forces a pending eviction of the same chunk to complete first.
   void RestoreSolutes(const std::vector<uint32_t>& slots);

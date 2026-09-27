@@ -186,6 +186,12 @@ struct StreamCounts {
   uint32_t spawnTrunc = 0;
   uint32_t fluidTrunc = 0;
   uint32_t gasTrunc = 0;
+  // Solute pour ops (world.h CellOpSolute) refused at the choke point: past
+  // kMaxSolutePourOpsPerTick, or squeezed out of kMaxCellOpsPerTick. The
+  // ops, and the solute UNITS they carried -- dissolved mass a vessel was
+  // already debited for, so the units are the loss.
+  uint32_t solPourTrunc = 0;
+  uint32_t solPourUnitsTrunc = 0;
   uint32_t cellDupes = 0;  // dropped by CanonicalizeCells
   uint32_t ticksWithDupes = 0;
   uint32_t firstDupeCell = 0xFFFFFFFFu;  // a cell that lost a duplicate
@@ -218,7 +224,7 @@ struct StreamCounts {
   int32_t firstViolChunk[3] = {0, 0, 0};
   uint32_t Total() const {
     return brushTrunc + expTrunc + cellTrunc + spawnTrunc + fluidTrunc +
-           gasTrunc;
+           gasTrunc + solPourTrunc;
   }
 };
 const StreamCounts& Counts();
@@ -226,6 +232,7 @@ void ResetCounts();
 void NoteTruncation(uint32_t brush, uint32_t exp, uint32_t cell, uint32_t spawn,
                     uint32_t fluid, uint32_t gas);
 void NoteCellDupes(uint32_t tick, uint32_t dropped, uint32_t firstCellIdx);
+void NoteSolutePourTrunc(uint32_t ops, uint32_t units);
 // One op emitted into a chunk this machine does not own. `producer` is a
 // Producer, or Producer::Count for a CellOp (which has no OpMeta). Only the
 // FIRST call fills the attribution fields; the rest only bump the count.

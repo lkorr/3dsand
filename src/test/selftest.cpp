@@ -1159,6 +1159,9 @@ void WriteJson(const std::string& path, const std::vector<Result>& results) {
       << ", \"cellTrunc\": " << oc.cellTrunc
       << ", \"spawnTrunc\": " << oc.spawnTrunc
       << ", \"fluidTrunc\": " << oc.fluidTrunc
+      << ", \"gasTrunc\": " << oc.gasTrunc
+      << ", \"solPourTrunc\": " << oc.solPourTrunc
+      << ", \"solPourUnitsTrunc\": " << oc.solPourUnitsTrunc
       << ", \"cellDupes\": " << oc.cellDupes
       << ", \"ticksWithDupes\": " << oc.ticksWithDupes
       << ", \"firstDupeTick\": " << oc.firstDupeTick

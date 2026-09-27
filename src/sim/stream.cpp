@@ -1900,9 +1900,20 @@ void Stream::DiscardSoluteState() {
 
 void Stream::EvictSolutes(const std::vector<uint32_t>& slots) {
   if (slots.empty() || !sim_ || !ctx_) return;
-  const uint32_t n = std::min<uint32_t>((uint32_t)slots.size(), kSolMEvictMax);
+  // IN BATCHES OF kSolEvictRecords SLOTS, one pass + staging each. A shift
+  // evicts a whole plane (up to kSolMEvictMax = 1,024 slots) and the staging
+  // holds kSolEvictRecords records: past that, WHICH slots won a record was
+  // decided by solEvict's atomicAdd order -- a scheduling-dependent loss of
+  // solute (rule 1), not merely a counted one. A batch can never hold more
+  // solute-carrying slots than it has records, so nothing is refused.
+  const uint32_t total = std::min<uint32_t>((uint32_t)slots.size(), kSolMEvictMax);
+  for (uint32_t at = 0; at < total; at += kSolEvictRecords)
+    EvictSoluteBatch(slots.data() + at, std::min(kSolEvictRecords, total - at));
+}
+
+void Stream::EvictSoluteBatch(const uint32_t* slots, uint32_t n) {
   PendingSolEvict p;
-  p.slots.assign(slots.begin(), slots.begin() + n);
+  p.slots.assign(slots, slots + n);
   p.keys.reserve(n);
   for (uint32_t i = 0; i < n; i++)
     p.keys.push_back(World::PackChunkKey(world_->SlotToWorldChunk(p.slots[i])));

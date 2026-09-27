@@ -2749,6 +2749,17 @@ def check_solute_mirror():
         if cv is None or int(mw.group(1), 0) != cv:
             problems.append(f"solute: raymarch.wgsl {w} = {mw.group(1)} but "
                             f"{c} = {cv} in world.h")
+    # solPour's op cap: SubmitTick clamps the stream to world.h's number and
+    # counts the refusals; the shader walks back at most its own copy. A
+    # shader copy smaller than world.h's is ops the CPU counted as sent and
+    # the GPU silently skipped.
+    mu = read("assets/shaders/sim_mutate.wgsl") or ""
+    mw = re.search(r"const\s+SOL_POUR_MAX_OPS\s*:\s*u32\s*=\s*(\d+)u\s*;", mu)
+    cv = cpp_value("kMaxSolutePourOpsPerTick")
+    if not mw or cv is None or int(mw.group(1)) != cv:
+        problems.append(f"solute: sim_mutate.wgsl SOL_POUR_MAX_OPS = "
+                        f"{mw.group(1) if mw else '?'} but world.h "
+                        f"kMaxSolutePourOpsPerTick = {cv}")
 
 
 def check_react_fx():

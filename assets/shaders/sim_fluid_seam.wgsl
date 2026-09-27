@@ -236,7 +236,7 @@ fn solWritable(c : vec3<i32>) -> bool {
 }
 // A write into a chunk with no page is REFUSED and counted -- the allocator
 // promises a page to every chunk a tick can write, so a refusal is a bug, and
-// the count is what says so (Simulation::CheckSoluteFaults aborts on it). A
+// the count is what says so (SubmitTick aborts on it: support.cpp). A
 // write of the value the sentinel already implies is not a write at all.
 fn solFault(slot : u32) {
   let prev = atomicAdd(&solMeta[SOLM_FAULTS], 1u);
