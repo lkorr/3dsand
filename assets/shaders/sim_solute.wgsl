@@ -566,6 +566,8 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
       var agg = 0u;
       if (e != 0u) { agg = (solSpeciesOf(e & 0xFFFFu) << 24u) | (solMassOf(e & 0xFFFFu) * CHUNK_VOL); }
       atomicStore(&solMeta[SOLM_AGG + slot], agg);
+      // An EMPTY slot has no diffusion history: see the demotion below.
+      if (e == 0u) { atomicStore(&solMeta[SOLM_STALL + slot], 0u); }
     }
     return;
   }
@@ -623,6 +625,13 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
   var ne = 0u;
   if (v0 != 0u) { ne = SOL_UNIFORM_BIT | v0; }
   solTable[slot] = ne;
+  // A chunk that is EMPTY again forgets its stall clock. solDiffuse only
+  // touches the counter of a slot that carries solute, so without this the
+  // count a finished plume left (e.g. 78) was still there when the next mass
+  // arrived, and the dilution floor discarded it on its first compaction --
+  // before it had diffused at all. Safe here: solDiffuse (the only other
+  // writer during a tick) ran earlier in this tick, and this group owns slot.
+  if (ne == 0u) { atomicStore(&solMeta[SOLM_STALL + slot], 0u); }
   let at = atomicAdd(&solMeta[SOLM_FREE], 1u);
   atomicStore(&solMeta[SOLM_STACK + at], page);
 }
