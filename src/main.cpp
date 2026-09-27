@@ -10721,6 +10721,11 @@ int main(int argc, char** argv) {
     if (ui.devControls && mouseLClick && ui.tool == UIState::kToolMob)
       feeder.Press(TB_SPAWN);
     if (mouseLClick) feeder.Press(TB_ATTACK);
+    // RMB IS THE LEFT HAND (dual wielding): its click edge starts a left-hand
+    // strike or reports a vessel's refusal (session.cpp reads Pressed(TB_ALT)).
+    // The feeder never derives an edge from a held bit, so without this the
+    // left hand could hold but never begin anything.
+    if (mouseRClick) feeder.Press(TB_ALT);
     if (captured && ui.magicMode && mouseRClick) feeder.Press(TB_CAST);
     if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE)))
       feeder.Press(TB_DROP);
@@ -10818,7 +10823,7 @@ int main(int argc, char** argv) {
     // would sit there and discharge the instant you unpause, at whatever you
     // happen to be aiming at then.
     if (ui.paused && !ui.stepOnce) {
-      feeder.Cancel(TB_CAST | TB_ATTACK);
+      feeder.Cancel(TB_CAST | TB_ATTACK | TB_ALT);
       // ...and the strike style a tick already picked, for the same reason.
       // Cancel() only reaches edges that have not been consumed yet; a press
       // taken on the last tick before the pause has already become a style
