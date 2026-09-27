@@ -3605,14 +3605,14 @@
         "chance": 200,
         "consume": 0
       },
-      "//coat": "A GENTLE RESTORATIVE (Mob::HealTick). Each coat level rebuilds `restore` 0.0015 world voxels of tissue (0.77 skin cells of a human at skinScale 8: a world voxel is 512 of them) from the limb's authored recipe -- missing cells grown back, cooked or soaked cells put back -- at most `restoreRate` 0.3 world voxels a second per limb, and whatever is left once the shape is whole buys hp up to the burn cap. Paid for level by level, so a splash heals a splash's worth and is then spent (rule 2). Surface only (SoakLimb). decay 3 s/level: it dries off like water if there is nothing to heal. contact 120: bathing in a pool of it coats you steadily -- a healing spring heals whoever stands in it. No `stanch`: water does not close a cut, it only knits it slowly.",
+      "//coat": "A GENTLE RESTORATIVE (Mob::HealTick). Each coat level rebuilds `restore` 0.0015 world voxels of tissue (0.77 skin cells of a human at skinScale 8: a world voxel is 512 of them) from the limb's authored recipe -- missing cells grown back, cooked or soaked cells put back, a few at a time picked at random across the wound -- at `restoreRate` 0.03 world voxels a second per limb (~15 skin cells a second on a human: a third of enchanted blood's pace, so a heavy wound takes minutes of bathing), and whatever is left once the shape is whole buys hp up to the burn cap. Paid for level by level, so a splash heals a splash's worth and is then spent (rule 2). Surface only (SoakLimb). decay 8 s/level (was 3 when the heal took seconds): a soaked limb keeps its coat for about two minutes, long enough for the slow heal to use it, and an idle one still dries. contact 120: bathing in a pool of it coats you steadily -- a healing spring heals whoever stands in it. No `stanch`: water does not close a cut, it only knits it slowly.",
       "coat": {
         "contact": 120,
-        "decay": 3,
+        "decay": 8,
         "shed": 0,
         "opacity": 0.35,
         "restore": 0.0015,
-        "restoreRate": 0.3,
+        "restoreRate": 0.03,
         "effects": ["restore"]
       }
     },
@@ -3644,13 +3644,13 @@
         "chance": 200,
         "consume": 0
       },
-      "//coat": "THE STRONG RESTORATIVE (Mob::HealTick). Laid on a wound it closes it (`stanch`), stops a bite's rot (`disinfect`) and REGROWS what was lost: each coat level rebuilds `restore` 0.005 world voxels of tissue (2.56 skin cells of a human at skinScale 8, where a world voxel is 512 of them: the Apply brush held on one spot, ~50 cells at 15, regrows a crater about a world voxel across) from the limb's authored recipe -- carved holes fill from their walls, a stump grows outward, cooked / charred / soaked / rotted cells return to what the recipe says -- at up to `restoreRate` 1 world voxel a second per limb, and once the shape is whole the rest buys hp up to the burn cap. Paid for level by level out of the coat, so a small pour heals a small wound and is spent (rule 2). Surface only (SoakLimb). decay 6 s/level: an unused coat dries off in about a minute. contact 90 (blood's): wading in it coats you.",
+      "//coat": "THE STRONG RESTORATIVE (Mob::HealTick). Laid on a wound it closes it (`stanch`), stops a bite's rot (`disinfect`) and REGROWS what was lost: each coat level rebuilds `restore` 0.005 world voxels of tissue (2.56 skin cells of a human at skinScale 8, where a world voxel is 512 of them: the Apply brush held on one spot, ~50 cells at 15, regrows a crater about a world voxel across) from the limb's authored recipe -- carved holes fill from their walls, a stump grows outward, cooked / charred / soaked / rotted cells return to what the recipe says -- at `restoreRate` 0.1 world voxels a second per limb (~51 skin cells a second on a human; the pace is in world voxels, so every creature heals the same volume a second), a few cells ten times a second picked at random across the wound so it visibly knits back over ~30 s for a heavy wound (the owner, 2026-09-27: it was 1 wv/s and done in 4 s), and once the shape is whole the rest buys hp up to the burn cap. Paid for level by level out of the coat, so a small pour heals a small wound and is spent (rule 2). Surface only (SoakLimb). decay 6 s/level: a level off half the coated voxels every 6 s, so a soak (+8) lasts ~1.5 min -- well past a 30 s heal -- and an unused coat dries off in about a minute. contact 90 (blood's): wading in it coats you.",
       "coat": {
         "contact": 90,
         "decay": 6,
         "shed": 200,
         "restore": 0.005,
-        "restoreRate": 1.0,
+        "restoreRate": 0.1,
         "effects": ["restore", "stanch", "disinfect"]
       }
     },
