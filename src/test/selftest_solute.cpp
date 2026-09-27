@@ -26,6 +26,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <string>
 #include <vector>
@@ -53,6 +54,7 @@ struct SoluteLayer {
   std::vector<uint32_t> table;
   std::vector<uint32_t> pool;
   std::vector<uint32_t> hdr;
+  std::vector<uint32_t> stall;   // per slot: the diffusion stall counter
   uint32_t Value(uint32_t slot, uint32_t local) const {
     const uint32_t e = table[slot];
     if (e == 0u) return 0u;
@@ -73,6 +75,10 @@ void ReadSoluteLayer(Ctx& c, SoluteLayer& L) {
                         L.pool.size() * 4, "solPool");
   rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.solMeta, 0, L.hdr.data(),
                         L.hdr.size() * 4, "solMeta");
+  L.stall.assign(kNumSlots, 0u);
+  rhi::ReadbackBlocking(c.ctx.device, c.ctx.queue, c.world.solMeta,
+                        (uint64_t)kSolMStall * 4, L.stall.data(), L.stall.size() * 4,
+                        "solStall");
 }
 
 // A sealed (or open-topped) stone box: interior [x0,x1] x (floorY, roofY) x
@@ -147,7 +153,11 @@ uint32_t PowderEighths(uint32_t word, bool hasMass) {
   return 8u;
 }
 
-BoxCensus Census(Ctx& c, const Box& box, const SoluteLayer& L, uint32_t powderMat) {
+// `altMat` (0 = none) is a LIQUID form of the same matter (molten salt is
+// salt): its cells count into powderEighths at their fullness, so a balance
+// across melting and freezing holds.
+BoxCensus Census(Ctx& c, const Box& box, const SoluteLayer& L, uint32_t powderMat,
+                 uint32_t altMat = 0) {
   BoxCensus r;
   const bool powderHasMass =
       powderMat < c.mats.size() && c.mats[powderMat].gpu.klass == CLASS_POWDER &&
@@ -177,6 +187,10 @@ BoxCensus Census(Ctx& c, const Box& box, const SoluteLayer& L, uint32_t powderMa
       if (m == powderMat && powderMat != 0) {
         r.powderCells++;
         r.powderEighths += PowderEighths(w, powderHasMass);
+      }
+      if (m == altMat && altMat != 0) {
+        r.powderCells++;
+        r.powderEighths += ((w >> 12) & 0x7u) + 1u;
       }
       if (liquid) {
         r.solventCells++;
@@ -337,7 +351,10 @@ Status GateSoluteDilute(Ctx& c, std::string& detail) {
   uint64_t peakMass = 0;
   for (int i = 0; i < kTicks; i++) {
     ticker({}, i == 0 ? build : i == 2 ? pond : i == 4 ? grain : std::vector<CellOp>{});
-    if (i >= 30 && i % 60 == 0) {
+    // SANDVOX_SOLUTE_TRACE=1: every 10 ticks, the mass, entry and stall
+    // counter of every box chunk carrying solute (the plume's decay, chunk by
+    // chunk -- what found the face-ownership stall).
+    if (i >= 30 && (i % 60 == 0 || (getenv("SANDVOX_SOLUTE_TRACE") && i % 10 == 0))) {
       SoluteLayer L;
       ReadSoluteLayer(c, L);
       uint64_t m = 0;
@@ -346,6 +363,17 @@ Status GateSoluteDilute(Ctx& c, std::string& detail) {
       peakMass = std::max(peakMass, m);
       if (m == 0 && L.hdr[kSolMDissolved] != 0 && goneAt < 0) goneAt = i;
       if (m != 0) goneAt = -1;
+      if (getenv("SANDVOX_SOLUTE_TRACE")) {
+        std::printf("dilute t%d: mass %llu disc %u |", i, (unsigned long long)m,
+                    L.hdr[kSolMDiscarded]);
+        for (uint32_t slot : box.Chunks()) {
+          uint32_t cm = 0;
+          for (uint32_t q = 0; q < kChunkVol; q++) cm += L.Value(slot, q) & 0xFFu;
+          if (L.table[slot] || cm)
+            std::printf(" %u:%08x m%u st%u", slot, L.table[slot], cm, L.stall[slot]);
+        }
+        std::printf("\n");
+      }
     }
   }
   const uint32_t awake = AwakeIn(c, box);
@@ -369,6 +397,29 @@ Status GateSoluteDilute(Ctx& c, std::string& detail) {
       ledgerOk ? "balanced" : "UNBALANCED", (uint32_t)k.powderEighths, awake,
       box.Chunks().size(), latchOk ? "" : ", ", latch.c_str());
   const bool ok = goneOk && ledgerOk && idleOk && latchOk && k.powderEighths == 0;
+  if (k.mass != 0) {
+    // What is left, cell by cell: a residue that will not decay is a question
+    // about the cells holding it (a stuck pair, a non-solvent, a partial
+    // cell under the floor), and a count alone cannot say which.
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    int listed = 0;
+    for (uint32_t slot : box.Chunks()) {
+      ReadVoxelsSync(c.ctx, c.world, slot, 1, cbuf.data(), "diluteResidue");
+      const IVec3 wc = c.world.SlotToWorldChunk(slot);
+      if (L.table[slot] == 0u) continue;
+      detail += Format("; slot (%d,%d,%d) entry %08x stall %u", wc.x, wc.y, wc.z,
+                       L.table[slot], L.stall[slot]);
+      for (uint32_t q = 0; q < kChunkVol && listed < 24; q++) {
+        const uint32_t v = L.Value(slot, q);
+        if (v == 0) continue;
+        listed++;
+        detail += Format(" [%d,%d,%d m%u s%u w%08x]", wc.x * 16 + (int)(q % 16),
+                         wc.y * 16 + (int)((q / 16) % 16), wc.z * 16 + (int)(q / 256),
+                         v & 0xFFu, v >> 8, cbuf[q]);
+      }
+      if (listed >= 24) break;
+    }
+  }
   if (k.powderEighths != 0) {
     // Where the grain came to rest and what it touches: a grain that never
     // dissolved is a contact question before it is a solute one.
@@ -412,7 +463,7 @@ Status GateSoluteDilute(Ctx& c, std::string& detail) {
 // leave whole eighths of salt): bounded, and pinned in tests/baseline.json.
 Status GateSoluteEvap(Ctx& c, std::string& detail) {
   const uint32_t water = MatNamed(c, "water"), salt = MatNamed(c, "salt"),
-                 lava = MatNamed(c, "lava");
+                 lava = MatNamed(c, "lava"), molten = MatNamed(c, "molten_salt");
   const SoluteDef* sd = CurrentSoluteNamed("salt");
   if (!water || !salt || !lava || !sd) {
     detail = "needs materials water + salt + lava and a `salt` species";
@@ -452,14 +503,21 @@ Status GateSoluteEvap(Ctx& c, std::string& detail) {
   }
   SoluteLayer L;
   ReadSoluteLayer(c, L);
-  const BoxCensus k = Census(c, box, L, salt);
+  // Salt that fell back on the lava melts (salt + tag:hot -> molten_salt) and
+  // refreezes, and molten salt quenched by brine turns the brine to steam
+  // (reactions.json): the same matter, counted in both forms.
+  const BoxCensus k = Census(c, box, L, salt, molten);
   std::string latch;
   const bool latchOk = LatchesClean(L, latch);
   const uint64_t discarded = L.hdr[kSolMDiscarded];
   const uint64_t accounted = k.powderEighths * y8 + k.mass + discarded;
   const bool balanceOk = accounted == placedUnits;
   const bool precipOk = L.hdr[kSolMPrecip] > 0 && k.powderCells > 0;
-  const double maxDiscard = BaselineNumber("solute-evap.maxDiscard", 512);
+  // Discarded is the sub-eighth remainder of a precipitation a NEIGHBOUR rule
+  // forced (molten salt quenching brine to steam: the brine cell's mass can
+  // only leave as whole eighths of salt in place -- a neighbour's neighbour is
+  // past the lattice's reach). Bounded by 31 units an event; pinned loosely.
+  const double maxDiscard = BaselineNumber("solute-evap.maxDiscard", 2048);
   const bool roundOk = (double)discarded <= maxDiscard;
   RecordObserved("solute-evap.precip", (double)L.hdr[kSolMPrecip]);
   RecordObserved("solute-evap.discarded", (double)discarded);

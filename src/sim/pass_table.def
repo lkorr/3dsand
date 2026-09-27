@@ -402,8 +402,8 @@ PASS(ca, "ca(54 color x substep)", PT_TICK, PIPE_STEP, K_INDIRECT, IND_DISPATCHA
 // the three sequential -- the same mechanism the CA row's 54 rely on.
 PASS(solDiffuse, "solute(diffuse+compact)", PT_TICK, PIPE_SOL_DIFFUSE, K_INDIRECT, IND_DISPATCHARGS,0,0,
      GRP_SIM, DYN_CA, C_CAACTIVE, 3,
-     USES(U(TickUBO) U(PassUBO) R(Materials) R(DirtyList) I(DispatchArgs) R(Voxels) R(PageTable)
-          R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) A(DirtyOut)))
+     USES(U(TickUBO) U(PassUBO) R(Materials) R(DirtyIn) R(DirtyList) I(DispatchArgs) R(Voxels)
+          R(PageTable) R(SolTable) A(SolPool) A(SolMeta) R(SolSpec) A(DirtyOut)))
 PASS(solCompact, "solute(diffuse+compact)", PT_TICK, PIPE_SOL_COMPACT, K_INDIRECT, IND_SOLARGS,0,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(U(TickUBO) R(Materials) I(SolArgs) R(Voxels) R(PageTable)

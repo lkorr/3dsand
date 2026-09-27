@@ -14,6 +14,8 @@
 // hashed, saved or read by a rule.
 
 @group(0) @binding(0) var<storage, read> voxels : array<u32>;
+// solDiffuse reads its own chunk's reasons (DIRTY_R_SOLBACK) off this tick's set.
+@group(0) @binding(1) var<storage, read> dirtyIn : array<u32>;
 @group(0) @binding(2) var<storage, read_write> dirtyOut : array<atomic<u32>>;
 @group(0) @binding(3) var<storage, read> materials : array<Material>;
 @group(0) @binding(4) var<uniform> T : TickParams;
@@ -80,6 +82,11 @@ const SOLS_MAT_BASE : u32 = 4112u;
 // Bit 26 of the dirty word (world.h kDirtyReasonName "solute"): dissolved mass
 // still moving. Deliberately NOT in sim_step's FILM_LICENCE.
 const DIRTY_R_SOLUTE : u32 = 67108864u;
+// Bit 27 ("solute-back"): a chunk's diffusion found work across its -axis face
+// in a pair its -axis neighbour OWNS. The owner, woken by it, keeps itself
+// awake for a whole phase cycle (it cannot know which of the 24 phases the
+// pair lives in, and waking it for one tick lands on the wrong one).
+const DIRTY_R_SOLBACK : u32 = 134217728u;
 // A chunk whose diffusion found nothing to do for this many CONSECUTIVE
 // dispatches has seen every axis, parity and stride (3 x 2 x 4 = 24 phases,
 // eight ticks) idle: it is STALLED, the dilution floor applies and it stops
@@ -350,7 +357,18 @@ fn solPairExchange(cA : vec3<i32>, cB : vec3<i32>, step : vec3<i32>, k : u32,
   let fB = voxState(wB) + 1u;
   let xA = solMassOf(vA);
   let xB = solMassOf(vB);
-  let d = (i32(xA * fB) - i32(xB * fA)) / i32(fA + fB);
+  // The equalising amount, ROUNDED HALF DOWN rather than truncated: with
+  // truncation a one-unit film over a clean full cell (8 : 0 in concentration)
+  // is a fixpoint -- measured, the last unit of a pinch in a pond sat on the
+  // surface for the rest of the run. Half-down still leaves |remaining| <= 1/2
+  // after a move, which is exactly the termination argument (the potential
+  // SUM(m*m/f) strictly decreases), and ties -- two full cells one unit apart
+  // -- stay put, so it cannot oscillate. For equal fullness it is identical
+  // to (dm)/2 truncated.
+  let num = i32(xA * fB) - i32(xB * fA);
+  let den = i32(fA + fB);
+  var d = (2 * abs(num) + den - 1) / (2 * den);
+  if (num < 0) { d = -d; }
   if (d == 0) { return 0u; }
   // A stride pair is connected only through its solvent.
   for (var i = 1u; i < k; i = i + 1u) {
@@ -388,6 +406,15 @@ fn solDiffuse(@builtin(workgroup_id) wg : vec3<u32>,
     atomicStore(&difWork, 0u);
     atomicStore(&difCross, 0u);
     atomicStore(&difBack, 0u);
+  }
+  // WOKEN BY A NEIGHBOUR'S BACK-CHECK (DIRTY_R_SOLBACK): this chunk owns a
+  // pending pair across its +axis face in a phase nobody can name from here,
+  // so it restarts its stall clock and stays awake a whole cycle (24 phases).
+  // Waking it for ONE tick was measured to land it two ticks later -- on the
+  // NEXT stride, every time -- and the gradient never moved. Its own counter,
+  // written only by its own group, once a tick (the first axis dispatch).
+  if (li == 0u && P.colorPhase.x == 0u && (dirtyIn[ci] & DIRTY_R_SOLBACK) != 0u) {
+    atomicStore(&solMeta[SOLM_STALL + ci], 0u);
   }
   workgroupBarrier();
   let e = solTable[ci];
@@ -442,7 +469,7 @@ fn solDiffuse(@builtin(workgroup_id) wg : vec3<u32>,
   }
   if (atomicLoad(&difBack) != 0u) {
     let os = chunkSlotOf(wc - step, T.origin);
-    if (os != SLOT_NONE) { atomicOr(&dirtyOut[os], DIRTY_R_SOLUTE); }
+    if (os != SLOT_NONE) { atomicOr(&dirtyOut[os], DIRTY_R_SOLBACK); }
   }
 }
 

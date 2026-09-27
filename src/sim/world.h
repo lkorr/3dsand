@@ -409,7 +409,7 @@ constexpr uint32_t kExplosionWg = 11;        // EXP_WG in common.wgsl
 // standing argument against two lists (tuning_params.def, pass_table.def).
 //
 // Order is bit order. Adding a bit means adding a row HERE and nowhere else.
-constexpr int kDirtyReasonBits = 27;
+constexpr int kDirtyReasonBits = 28;
 inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     "write",      "react-idle", "stain-idle", "flow",
     "viscous",    "seam",       "part",       "wbody",
@@ -425,7 +425,10 @@ inline constexpr const char* kDirtyReasonName[kDirtyReasonBits] = {
     // a dissolve waiting for its page, or a boundary gradient a neighbour
     // owns (sim_solute.wgsl / sim_step.wgsl DIRTY_R_SOLUTE). Not in
     // FILM_LICENCE: solute moving is not liquid progress.
-    "solute"};
+    "solute",
+    // ...and its back-check: a pair the -axis neighbour owns has work, so the
+    // owner is woken for a whole phase cycle (sim_solute.wgsl DIRTY_R_SOLBACK).
+    "solute-back"};
 
 // The bit for a reason NAME, resolved from the one table above rather than
 // written down as a number a second time -- 22/24/25 in a header is exactly

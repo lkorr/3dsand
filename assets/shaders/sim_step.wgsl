@@ -188,6 +188,11 @@ const SOLS_MAT_BASE : u32 = 4112u;
 // Bit 26 of the dirty word (world.h kDirtyReasonName "solute"): dissolved mass
 // still moving. Deliberately NOT in sim_step's FILM_LICENCE.
 const DIRTY_R_SOLUTE : u32 = 67108864u;
+// Bit 27 ("solute-back"): a chunk's diffusion found work across its -axis face
+// in a pair its -axis neighbour OWNS. The owner, woken by it, keeps itself
+// awake for a whole phase cycle (it cannot know which of the 24 phases the
+// pair lives in, and waking it for one tick lands on the wrong one).
+const DIRTY_R_SOLBACK : u32 = 134217728u;
 // A chunk whose diffusion found nothing to do for this many CONSECUTIVE
 // dispatches has seen every axis, parity and stride (3 x 2 x 4 = 24 phases,
 // eight ticks) idle: it is STALLED, the dilution floor applies and it stops
