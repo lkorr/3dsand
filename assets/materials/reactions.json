@@ -1735,6 +1735,27 @@
     },
     {
       "note": "-------- fairy dust enchants water and blood: NO PAIR RULE --------\nThe solute layer owns this (package B, docs/PLAN_solutes.md): fairy dust DISSOLVES into water or blood (solutes.json `fairy`), the mass spreads through the liquid, and a cell concentrated past the species' `converts` cMin BECOMES enchanted_water / enchanted_blood (sim_step.wgsl solTryConvert). A pinch in a lake disperses below cMin and enchants nothing; a handful in a basin enchants it. The two placeholder pair rules package A authored here (one grain turned the cell it touched) were removed when the layer landed."
+    },
+    {
+      "note": "-------- brine electrolysis: the chlor-alkali cell (package B) --------\nSalt WATER touching a spark (tag:electric) splits: 2 NaCl + 2 H2O -> Cl2 + H2 + 2 NaOH. Both rules are gated on the DISSOLVED salt with the solute layer's concentration condition (\"solute\": \"salt\", \"cMin\": 24 -- brine, not a pinch; sim_step.wgsl solRuleAllows, the rule side array): fresh water under a spark does nothing. The first rule makes lye of the water and chlorine of the spark, the second hydrogen of the water and chlorine of the spark, so a shocked brine pool fumes both gases and turns caustic. Appended at the END of water's bucket (no earlier water rule's RNG stream moves). Simplification: the lye keeps the water's dissolved salt (lye is a salt solvent in solutes.json), so the salt is not consumed. A CPU evaluator with no solute (a body, the bench without its own solute model) must treat these as unmet -- MaterialDef::ruleFx[k].solute / RuleNeedsSolute."
+    },
+    {
+      "self": "water",
+      "neighbor": "tag:electric",
+      "solute": "salt",
+      "cMin": 24,
+      "chance": 300,
+      "selfBecomes": "lye",
+      "neighborBecomes": "chlorine"
+    },
+    {
+      "self": "water",
+      "neighbor": "tag:electric",
+      "solute": "salt",
+      "cMin": 24,
+      "chance": 250,
+      "selfBecomes": "hydrogen",
+      "neighborBecomes": "chlorine"
     }
   ]
 }

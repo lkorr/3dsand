@@ -185,6 +185,7 @@ const SOLM_AGG : u32 = SOLM_STALL + NUM_SLOTS;
 const SOLS_BASE : u32 = 16u;
 const SOLS_STRIDE : u32 = 16u;
 const SOLS_MAT_BASE : u32 = 4112u;
+const SOLS_RULE_BASE : u32 = 8208u;
 // Bit 26 of the dirty word (world.h kDirtyReasonName "solute"): dissolved mass
 // still moving. Deliberately NOT in sim_step's FILM_LICENCE.
 const DIRTY_R_SOLUTE : u32 = 67108864u;
@@ -282,6 +283,20 @@ fn solIsLiquidMat(m : u32) -> bool {
 fn solCarried(c : vec3<i32>, w : u32) -> u32 {
   if (!solIsLiquidMat(voxMat(w))) { return 0u; }
   return solValueAt(c);
+}
+// A CONCENTRATION CONDITION on a reaction rule (PLAN_solutes §4.1; the side
+// array at SOLS_RULE_BASE, indexed by the rule's GPU index): may rule `ri`
+// fire for the self cell c whose word is w? An unconditioned rule (word 0)
+// always may; a conditioned one needs a liquid self carrying that species at
+// a concentration (mass * 8 / fullness) inside [cMin, cMax].
+fn solRuleAllows(ri : u32, c : vec3<i32>, w : u32) -> bool {
+  let cond = solSpec[SOLS_RULE_BASE + ri];
+  if (cond == 0u) { return true; }
+  if (!solIsLiquidMat(voxMat(w))) { return false; }
+  let v = solValueAt(c);
+  if (solSpeciesOf(v) != (cond & 0xFFu)) { return false; }
+  let conc = (solMassOf(v) * 8u) / (voxState(w) + 1u);
+  return conc >= ((cond >> 8u) & 0xFFu) && conc <= ((cond >> 16u) & 0xFFu);
 }
 // MIRROR-END solute
 
@@ -2213,6 +2228,9 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     let rule = reactions[cmat.reactOffset + ri];
     if ((rule.packed & 3u) != RK_PAIR) { continue; }
     if (!lightMatches(rule, c)) { continue; }
+    // A coat carries no solute: a concentration-conditioned rule never fires
+    // through one (word 0 reads as "not a liquid").
+    if (!solRuleAllows(cmat.reactOffset + ri, c, 0u)) { continue; }
     let rr = hash3(rnd ^ COAT_ROLL_SALT, ri, slotIdx);  // SLOT index
     let rot = rr >> 12u;
     let dmask = (rule.packed >> 2u) & 7u;
@@ -2410,6 +2428,10 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     // night instead of spinning on a rule that cannot fire (rule 2). The
     // chunk is re-woken when the phase crosses back, see wakeOnPhaseChange.
     if (!lightMatches(rule, c)) { continue; }
+    // A concentration condition (reactions.json "solute"/"cMin"; the solute
+    // layer's rule side array): brine electrolysis needs the salt, not just
+    // the water. One side-array word per rule tried; 0 for nearly all.
+    if (!solRuleAllows(m.reactOffset + ri, c, w)) { continue; }
 
     // Drawn AFTER the gate: hash3 is stateless and keyed on (rnd, ri, slot),
     // so a skipped rule consumes nothing and every later draw is unchanged.

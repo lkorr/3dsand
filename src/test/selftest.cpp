@@ -937,7 +937,7 @@ const char* const kOrder[] = {
     "pool-evict",
     // The solute layer (docs/PLAN_solutes.md). Each regenerates worldgen and
     // builds a sealed stone box of its own; nothing after them reads solute.
-    "solute", "solute-dilute", "solute-evap", "solute-seam",
+    "solute", "solute-dilute", "solute-evap", "solute-seam", "solute-electrolysis",
     "snapshot-latency",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every

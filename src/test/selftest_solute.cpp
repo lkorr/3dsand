@@ -627,6 +627,117 @@ Status GateSoluteSeam(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- solute-electrolysis -----------------------------------------------------
+// A CONCENTRATION CONDITION on a reaction (PLAN_solutes §4.1, the rule side
+// array): reactions.json's brine-electrolysis rules fire on WATER beside a
+// spark only while the water carries salt at cMin or more. Two identical boxes
+// side by side, one brine and one fresh, the same sparks laid over both:
+// asserted, the brine box makes lye and chlorine and the fresh box makes
+// neither -- the condition both enables and refuses, which is the whole claim
+// (a rule that ignored the side array would fire in both).
+Status GateSoluteElectrolysis(Ctx& c, std::string& detail) {
+  const uint32_t water = MatNamed(c, "water"), salt = MatNamed(c, "salt"),
+                 spark = MatNamed(c, "spark"), lye = MatNamed(c, "lye"),
+                 chlorine = MatNamed(c, "chlorine"), hydrogen = MatNamed(c, "hydrogen");
+  if (!water || !salt || !spark || !lye || !chlorine || !CurrentSoluteNamed("salt")) {
+    detail = "needs water, salt, spark, lye, chlorine and the `salt` species";
+    return Status::Fail;
+  }
+  FixtureTuning tune;
+  const int py = 120, pz = 96;
+  const Box brine{80, 85, pz - 3, pz + 2, py, py + 10, true};
+  const Box fresh{100, 105, pz - 3, pz + 2, py, py + 10, true};
+  const int kTicks = (int)BaselineNumber("solute-electrolysis.ticks", 420);
+  const int sparkFrom = 300, sparkTo = 312;
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  std::vector<CellOp> build = brine.Build((uint32_t)kMatStone);
+  for (const CellOp& o : fresh.Build((uint32_t)kMatStone)) build.push_back(o);
+  std::vector<CellOp> pond = brine.Layers(water, py + 1, 2, 7u);
+  for (const CellOp& o : fresh.Layers(water, py + 1, 2, 7u)) pond.push_back(o);
+  // 16 grains into 72 cells of water: ~56 units a cell, over cMin 24.
+  std::vector<CellOp> grains;
+  for (int z = brine.z0; z <= brine.z1; z++)
+    for (int x = brine.x0; x <= brine.x1; x++)
+      if (grains.size() < 16 && ((x + z) % 2 == 0 || grains.size() < 4))
+        grains.push_back({World::SlotCellIndex({x, py + 3, z}), salt & 0xFFFu});
+  auto sparks = [&](const Box& b) {
+    std::vector<CellOp> v;
+    for (int z = b.z0; z <= b.z1; z++)
+      for (int x = b.x0; x <= b.x1; x++)
+        v.push_back({World::SlotCellIndex({x, py + 3, z}), (spark & 0xFFFu) | kCellOpIfAir});
+    return v;
+  };
+  std::vector<CellOp> zap = sparks(brine);
+  for (const CellOp& o : sparks(fresh)) zap.push_back(o);
+
+  auto count = [&](const Box& b, uint32_t mat) {
+    uint32_t n = 0;
+    std::vector<uint32_t> cbuf((size_t)kChunkVol);
+    for (uint32_t slot : b.Chunks()) {
+      ReadVoxelsSync(c.ctx, c.world, slot, 1, cbuf.data(), "electroVox");
+      const IVec3 wc = c.world.SlotToWorldChunk(slot);
+      for (uint32_t q = 0; q < kChunkVol; q++) {
+        const int x = wc.x * 16 + (int)(q % 16), y = wc.y * 16 + (int)((q / 16) % 16),
+                  z = wc.z * 16 + (int)(q / 256);
+        if (b.Inside(x, y, z) && (cbuf[q] & 0xFFFu) == mat) n++;
+      }
+    }
+    return n;
+  };
+  uint32_t t = 56000;
+  support::TickCursor ticker{c, t, {90 >> 4, py >> 4, pz >> 4}};
+  // Products are counted at their PEAK over the spark window (chlorine and
+  // hydrogen are gases that rise and fade; lye is a liquid and stays), the
+  // way chem-electrolysis counts sodium.
+  uint32_t lyeB = 0, lyeF = 0, clB = 0, clF = 0, h2B = 0;
+  for (int i = 0; i < kTicks; i++) {
+    // Consecutive ticks, IF AIR (a spark only where nothing is), exactly as
+    // chem-electrolysis electrifies its molten pool.
+    const bool zapNow = i >= sparkFrom && i < sparkTo;
+    std::vector<CellOp> ops = i == 0 ? build : i == 2 ? pond : i == 4 ? grains
+                                                 : zapNow ? zap : std::vector<CellOp>{};
+    ticker({}, ops);
+    if (i >= sparkFrom && i < sparkTo + 20 && (i % 2) == 0) {
+      lyeB = std::max(lyeB, count(brine, lye));
+      lyeF = std::max(lyeF, count(fresh, lye));
+      clB = std::max(clB, count(brine, chlorine));
+      clF = std::max(clF, count(fresh, chlorine));
+      if (hydrogen) h2B = std::max(h2B, count(brine, hydrogen));
+    }
+  }
+  SoluteLayer L;
+  ReadSoluteLayer(c, L);
+  std::string latch;
+  const bool latchOk = LatchesClean(L, latch);
+  const bool ok = lyeB > 0 && lyeF == 0 && clF == 0 && latchOk;
+  detail = Format(
+      "sparks laid over brine (16 salt grains in 72 cells) and fresh water from "
+      "tick %d to %d: brine box %u lye, %u chlorine, %u hydrogen cells; fresh box "
+      "%u lye, %u chlorine (both must be 0)%s%s",
+      sparkFrom, sparkTo, lyeB, clB, h2B, lyeF, clF, latchOk ? "" : ", ", latch.c_str());
+  // Which of water's compiled rules carry the condition (the side array's
+  // source), and the brine's concentration where the sparks land.
+  {
+    const MaterialDef& wm = c.mats[water];
+    std::string conds;
+    for (uint32_t k = 0; k < wm.ruleFx.size(); k++)
+      if (!wm.ruleFx[k].solute.empty())
+        conds += Format(" rule %u (gpu %u) %s>=%u", k, wm.gpu.reactOffset + k,
+                        wm.ruleFx[k].solute.c_str(), wm.ruleFx[k].soluteMin);
+    uint32_t maxC = 0, nMass = 0;
+    for (uint32_t slot : brine.Chunks())
+      for (uint32_t q = 0; q < kChunkVol; q++) {
+        const uint32_t v = L.Value(slot, q);
+        if (v) { nMass++; maxC = std::max(maxC, v & 0xFFu); }
+      }
+    detail += Format("; water has %u rules, conditioned:%s; brine %u cells, max mass %u",
+                     wm.gpu.reactCount, conds.c_str(), nMass, maxC);
+  }
+  std::printf("solute-electrolysis: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SoluteGates() {
@@ -635,6 +746,7 @@ const std::vector<Gate>& SoluteGates() {
       {"solute-dilute", "sim", {}, false, GateSoluteDilute, false},
       {"solute-evap", "sim", {}, false, GateSoluteEvap, false},
       {"solute-seam", "sim", {}, false, GateSoluteSeam, false},
+      {"solute-electrolysis", "sim", {}, false, GateSoluteElectrolysis, false},
   };
   return g;
 }

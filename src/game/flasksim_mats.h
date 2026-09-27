@@ -145,6 +145,13 @@ inline Chemistry BuildBenchChemistry(const std::vector<MaterialDef>& mats,
     const MaterialDef& m = mats[subs[s].mat];
     for (uint32_t k = 0; k < m.gpu.reactCount && m.gpu.reactOffset + k < reactions.size(); k++) {
       const ReactionGpu& g = reactions[m.gpu.reactOffset + k];
+      // A CONCENTRATION-CONDITIONED rule (reactions.json "solute"/"cMin",
+      // package B: brine electrolysis) needs the self particle's dissolved
+      // concentration, which this compiler does not carry into ChemRule yet.
+      // Unmet until it does -- the safe direction: firing it unconditionally
+      // would electrolyse FRESH water. (Package B, minimal edit; the bench's
+      // own solute model is where the condition belongs.)
+      if (RuleNeedsSolute(m, k)) continue;
       ChemRule r;
       r.kind = (uint8_t)(g.packed & 3u);
       r.dirs = (uint8_t)((g.packed >> 2) & 7u);

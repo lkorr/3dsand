@@ -1356,7 +1356,29 @@ void Simulation::UploadSolutes(const rhi::Queue& queue, const std::vector<Solute
     }
   }
   w[0] = count;
-  (void)mats;
+  // ---- the concentration conditions (the rule side array) ----------------
+  // MaterialDef::ruleFx[k].solute names the species rule reactOffset + k needs
+  // its self cell to carry; resolved BY NAME here, where the species table
+  // is. An unknown name compiles to species 255 -- a condition nothing can
+  // meet -- and is reported, so a typo disables its rule loudly rather than
+  // letting it fire unconditionally.
+  static_assert(kSolSpecRuleCount >= kMaxReactions, "the rule side array must cover every rule");
+  for (const MaterialDef& m : mats) {
+    for (uint32_t k = 0; k < m.ruleFx.size() && k < m.gpu.reactCount; k++) {
+      const RuleFx& f = m.ruleFx[k];
+      if (f.solute.empty()) continue;
+      const uint32_t idx = m.gpu.reactOffset + k;
+      if (idx >= kSolSpecRuleCount) continue;
+      uint32_t sp = 255u;
+      for (const SoluteDef& d : defs)
+        if (d.name == f.solute) sp = d.species & 0xFFu;
+      if (sp == 255u)
+        std::fprintf(stderr, "reactions.json: rule %u of \"%s\" names solute \"%s\", "
+                     "which solutes.json does not have; the rule can never fire\n",
+                     k, m.name.c_str(), f.solute.c_str());
+      w[kSolSpecRuleBase + idx] = sp | ((f.soluteMin & 0xFFu) << 8) | ((f.soluteMax & 0xFFu) << 16);
+    }
+  }
   queue.WriteBuffer(solSpecBuf_, 0, w.data(), w.size() * 4);
   solutes_ = defs;
   SetCurrentSolutes(defs);

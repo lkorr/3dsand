@@ -1531,6 +1531,24 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
         g.cond |= (fx.fxId & kCondFxMask) << kCondFxShift;
       }
     }
+    // ---- a concentration condition (package B, docs/PLAN_solutes.md §4.1) --
+    // Rides the RuleFx beside the effects so the neighborChance tails below
+    // inherit it exactly as they inherit an fx id: the tail is the same
+    // reaction at another rate. The species is a NAME, resolved against
+    // solutes.json by Simulation::UploadSolutes (which loads after this).
+    if (r.contains("solute")) {
+      if (!r["solute"].is_string()) {
+        errors += path + ": reaction self=\"" + self + "\": \"solute\" must be a species name\n";
+      } else {
+        fx.solute = r["solute"].get<std::string>();
+        const int lo = r.value("cMin", 1), hi = r.value("cMax", 255);
+        if (lo < 0 || lo > 255 || hi < lo || hi > 255)
+          errors += path + ": reaction self=\"" + self +
+                    "\": cMin/cMax must satisfy 0 <= cMin <= cMax <= 255\n";
+        fx.soluteMin = (uint32_t)std::clamp(lo, 0, 255);
+        fx.soluteMax = (uint32_t)std::clamp(hi, 0, 255);
+      }
+    }
     // A per-member exception splits this rule in two (see ExpandNeighborChance).
     // The base rule keeps its place; the exact-neighbour rules go to the tail
     // of the bucket, so a voxel touching both an ember and a flame rolls the
@@ -1557,7 +1575,7 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
     // Empty (the common case) unless some rule of this material has effects;
     // otherwise exactly reactCount long, ruleFx[k] <-> rule reactOffset + k.
     bool any = false;
-    for (const RuleFx& f : bucketFx[i]) any |= f.fxId != 0;
+    for (const RuleFx& f : bucketFx[i]) any |= f.fxId != 0 || !f.solute.empty();
     mats[i].ruleFx.clear();
     if (any) mats[i].ruleFx = std::move(bucketFx[i]);
   }
@@ -1671,4 +1689,8 @@ std::vector<uint32_t> BuildCollisionClasses(const std::vector<MaterialDef>& mats
                                                        : m.gpu.klass);
   }
   return classOf;
+}
+
+bool RuleNeedsSolute(const MaterialDef& m, uint32_t k) {
+  return k < m.ruleFx.size() && !m.ruleFx[k].solute.empty();
 }

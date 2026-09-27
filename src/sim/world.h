@@ -1907,7 +1907,13 @@ constexpr uint32_t kSolSolventSpeciesMax = 24;   // the mask's width
 constexpr uint32_t kSolSpecStride = 16;
 constexpr uint32_t kSolSpecBase = 16;
 constexpr uint32_t kSolSpecMatBase = kSolSpecBase + (kSolSpeciesMax + 1) * kSolSpecStride;
-constexpr uint32_t kSolSpecWords = kSolSpecMatBase + 4096;
+// ...then one word per compiled REACTION RULE (the side array PLAN_solutes
+// §4.1 chose over a 36-byte ReactionGpu): bits 0..7 the species the rule's
+// self cell must carry (0 = no condition), 8..15 cMin, 16..23 cMax, in
+// concentration units. Indexed by the rule's GPU index (reactOffset + k).
+constexpr uint32_t kSolSpecRuleBase = kSolSpecMatBase + 4096;
+constexpr uint32_t kSolSpecRuleCount = 4096;   // >= kMaxReactions (asserted in simulation.cpp)
+constexpr uint32_t kSolSpecWords = kSolSpecRuleBase + kSolSpecRuleCount;
 constexpr uint32_t kSolConvertsMax = 4;          // converts rows per species on the GPU
 
 // The word a sentinel chunk's cells read as. THIS IS THE HASH CONTRACT (§4.1):

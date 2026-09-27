@@ -729,7 +729,25 @@ struct RuleFx {
   // (game/session.cpp, ReactFxWorld) maps the id back through FindRuleFx.
   // Added by package A (docs/PLAN_alchemy_chemistry.md 2.2), additive.
   uint32_t fxId = 0;
+  // ---- A CONCENTRATION CONDITION (docs/PLAN_solutes.md §4.1, package B) ----
+  // reactions.json `"solute": "salt", "cMin": 20` (optional "cMax"): the rule
+  // may fire only while the SELF cell carries that species at a concentration
+  // (mass * 8 / fullness, 0..255 per full cell) in [soluteMin, soluteMax].
+  // Empty = unconditioned. Kept here, in the CPU-side parallel array, and
+  // packed by Simulation::UploadSolutes into a SIDE ARRAY the GPU reads by
+  // rule index (solSpec, world.h kSolSpecRuleBase) -- not into ReactionGpu,
+  // whose 32 bytes are full (cond bits 24..28 carry fxId). A CPU evaluator
+  // that runs these rules on something with no solute (a body, a bench
+  // particle without its own solute model) must treat a non-empty `solute`
+  // as UNMET. Additive, package B.
+  std::string solute;
+  uint32_t soluteMin = 0;
+  uint32_t soluteMax = 255;
 };
+// Does rule k of `m` (its bucket, reactOffset + k) carry a solute condition?
+// Declared here so a CPU rule evaluator can skip such a rule in one line.
+struct MaterialDef;
+bool RuleNeedsSolute(const MaterialDef& m, uint32_t k);
 
 // ---- the reaction-effect id in ReactionGpu.cond (bits 24..28) --------------
 // cond bits 0..7 are the light/weather gates, 8..15 minLight, 16..23 the
