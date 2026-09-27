@@ -1393,6 +1393,90 @@ A rule may also carry **effects** (2026-09-27) — sodium + water explodes. The 
 only REPORTS the firing; the blast is an ExplosionOp authored on the CPU a fixed
 number of ticks later. See §6 "Reaction effects".
 
+### Solutes: dissolved matter is MASS in a side layer (2026-09-27; `sim_solute.wgsl`, `sim/solutes.*`, world.h `kSol*`, docs/PLAN_solutes.md, gates `solute*`)
+
+Salt in water is not a material. The voxel word is full, and "brine" as a
+material id would need one id per (solvent, solute, concentration). A liquid
+cell instead carries an optional 16-bit value in a **sparse auxiliary layer**
+beside the page pool: `species << 8 | mass`, mass 0..255 units per cell
+(concentration = `mass * 8 / fullness`, derived, never stored). One species a
+cell; two species meeting do not mix (the second stays undissolved / is refused).
+
+**Storage.** `solTable[slot]` is `0` (EMPTY), `UNIFORM | value16` or
+`PAGE | page`; `solPool` is `kSolutePoolPages` (= `kNumSlots / 8`, 4,096 at a
+512 window, 32 MiB) pages of 2,048 words, two cells a word. Pool words are
+written with `atomicAnd` + `atomicOr` on disjoint halves, because the colour
+lattice lets two neighbouring cells sharing a word act at once. **A kernel
+cannot allocate and the CPU cannot foresee a dissolve**, so allocation is a GPU
+pass at a fixed point of every CA tick (`solWant` -> `solArgs` -> `solAlloc`,
+over the compacted dirty list, N27 of every dirty chunk whose neighbourhood
+carries solute or asked for a page last tick); `solCompact` after the CA cleans
+mass off non-solvents, applies the dilution floor, collapses a uniform page back
+to a sentinel and returns empty pages the same tick. WHETHER a slot is a page is
+a function of the dirty set and the solute state (deterministic); WHICH page it
+got depends on atomic order and nothing keys on it. A store into a non-page is a
+counted fault; pool exhaustion is a fatal abort in `SubmitTick` (like the voxel
+pool).
+
+**The CA moves it** (sim_step.wgsl, hooks commented at each site): `tryMove`
+swaps mass with the matter (`solSwap`), `transferLiquid` moves it in proportion
+to the eighths moved (`solTransfer`), a powder named by a solutes.json `from`
+touching one of its `solvents` dissolves an eighth at a time
+(`solTryDissolve`, up to `saturation`), a solvent that turns into something
+else pushes its mass into neighbouring solvent and precipitates the rest
+(`solOnReplace`: evaporating brine leaves salt), brine sinks under fresher
+water of its own kind (`solTrySink`, `densityPerUnit`), and a solvent past a
+`converts` row's `cMin` becomes `into` (`solTryConvert`: fairy dust in water is
+enchanted water -- this replaced package A's placeholder pair rule).
+
+**Diffusion** (`solDiffuse`) is pair exchange: three axis dispatches a tick,
+pairs at stride 1/2/4/8 (cycled by tick), parity alternating, the equalising
+amount rounded half-down and the rate (`diffusivity` / 256 x `sim.soluteDiffusion`
+/ 100) rounded stochastically off the stateless hash. The strides are what make
+the integer fixpoint flat (stride 1 alone stalls in a ramp: spread 13 measured,
+3-4 with strides). A chunk idle for 24 consecutive dispatches (every axis,
+parity and stride) is STALLED: the dilution floor (`floor`) discards what is
+below it and the chunk stops keeping itself awake. Dirty reasons 26 `solute`
+and 27 `solute-back` (a pair owned by the -axis neighbour, which must be woken
+for a whole phase cycle).
+
+**Conditions.** A reactions.json rule may carry `"solute": "<species>", "cMin",
+"cMax"`: it fires only when its (LIQUID -- refused on any other class) self
+cell carries that species inside the range. The condition lives in a side array
+indexed by the rule's GPU index (the rule's own `cond` bits 24..28 are package
+A's effect id). Brine electrolysis (salt water + spark -> lye / hydrogen +
+chlorine) is the first user.
+
+**MPM seam.** `sim_fluid_seam.wgsl` refuses to excite a cell carrying solute
+(counted, `SOLM_SEAM_REFUSED`): the MPM particles have no solute channel, so a
+brine surface stays on the CA.
+
+**Streaming and saves.** `solEvict` / `solRestore` run between ticks around a
+window shift; `Stream` keeps evicted chunks' values keyed by world chunk.
+Saves write `solutes.svs` (species by NAME, remapped on load). The layer is
+hashed (`solHash`, slot-keyed like the voxels).
+
+**Vessels** (contract 2.5 of docs/PLAN_alchemy_chemistry.md). SCOOP: a
+conditional clear that empties a liquid cell leaves its mass on the air cell;
+`solScoop` (after `solAlloc`, over the tick's cell ops) moves it to a
+per-species monotonic ledger (`kSolMScoopBySpecies`) the snapshot carries, and
+the session whose water claims were paid that tick draws it as whole dissolved
+eighths (`ContainerSoluteLedger`; one eighth = `yieldPerVoxel / 8` units; the
+sub-eighth remainder waits in the pot). What does not fit in a vessel spills.
+POUR: not yet -- a dissolved portion leaving a vessel still enters the world as
+powder grains (`ContainerDissolvedToWorld`), which then dissolve again where
+they land in liquid. Conserved, one step removed.
+
+**Cost.** Measured `--perf` forestfire (~5,000 awake chunks, no solute
+anywhere, identical world hash before and after): the layer's own passes 0.17
+ms/frame, but the CA row went 20.27 -> 21.76 ms/frame (+7%). Not registers
+(`step` stays at 56) -- the `step` binary grew 1.73 -> 2.23 MB (+29%) from the
+inlined hooks, so the likely cost is instruction-cache pressure. The hooks'
+table reads are already gated on material class (that gate took it from +9%);
+shrinking the inlined code (one call site for `solOnReplace`'s push loops, the
+dissolve out of line) is the next lever. Other scenes: idle, flythrough,
+explosion within noise; sim cost is zero where nothing is awake.
+
 ### Day/night, and sunlight as a sim input (2026-08-20)
 
 The world runs a day/night cycle, and sunlight is a real input to the CA:
@@ -3626,9 +3710,11 @@ itself), molten salt cools on an inverted hot ramp, + water quenches, + spark
 weakly and lives ~2 ticks; acid dissolves crystal now and FUMES noxious gas
 from every dissolution (~1 in 10 eaten voxels), is neutralized by lye (→ water/
 steam + salt) and sodium (→ hydrogen + salt), and still spares glass, steel,
-gold, bone; lye eats organics at a tenth of acid and spends itself; fairy dust
-+ water / blood → enchanted water / blood as a pair rule (package B's solute
-layer replaces it). Salt + water has no rule: it becomes the solute layer's.
+gold, bone; lye eats organics at a tenth of acid and spends itself. Fairy dust
+and salt in water are the solute layer's (§4 "Solutes"): fairy dust dissolves
+and, concentrated, CONVERTS the water to enchanted water (solutes.json
+`converts`, which replaced package A's pair rule); salt water + spark
+electrolyses (a rule with a `solute` concentration condition).
 
 ### Compilation to GPU
 - Material properties → one SSBO array indexed by 12-bit ID.
@@ -16554,9 +16640,10 @@ rounded by a hash (the one rounding). A DISSOLVED portion goes through
 `ContainerDissolvedToWorld`, and so does the share of dissolved matter that
 leaves with a pour's liquid (`ContainerTakeDissolvedShare`; the MPM pour, which
 has no grain stream, puts that share back as undissolved powder, which then
-pours as grains). Until package B's world solute layer replaces its body,
-`ContainerDissolvedToWorld` emits the POWDER, one-eighth grains -- conserved,
-just not in solution.
+pours as grains). `ContainerDissolvedToWorld` still emits the POWDER,
+one-eighth grains -- conserved, just not in solution; the grains re-dissolve
+where they land in liquid. The SCOOP direction is done: scooping brine pays the
+salt as a dissolved portion (§4 "Solutes", `solScoop`).
 
 **Pocket chemistry, the minimal version.** A scoop that brings two substances
 together in a flask whose world rule carries an `explode` effect
@@ -16826,9 +16913,10 @@ what keeps ValidateBench a proof.
 
 **Not yet:** the cauldron, a held/grounded flask drawing its layers or its
 stopper, refraction; a stream off the table leaves from the nearest hand's lip,
-not from where on the table it fell; brine electrolysis (waits on the world
-solute layer's concentration condition); only the first effect of a rule is
-raised on the bench.
+not from where on the table it fell; brine electrolysis ON THE BENCH (the
+world rule exists; `BuildBenchChemistry` skips concentration-conditioned rules,
+`RuleNeedsSolute`, until the bench evaluates the condition); only the first
+effect of a rule is raised on the bench.
 
 Gates: `alchemy-shake` (a 60%-full flask carried side to side: nothing spills,
 still sloshing half a second after the hand stops, asleep within 6 s),

@@ -52,7 +52,10 @@ static_assert(kGasStatOff + kGasSpHdrBytes <= kPCountOff + 256,
 // words, 64 B. (It rode the page-fault block until that record grew to 64
 // words for the reaction effects.)
 constexpr uint64_t kSolMetaSnapOff = kPCountOff + 128;
-constexpr uint64_t kSolMetaSnapBytes = 64;
+// Words 0..31: the ledger, the latches and the per-species scoop ledger.
+constexpr uint64_t kSolMetaSnapBytes = 128;
+static_assert(kSolMScoopBySpecies + kSolScoopSpecies <= kSolMetaSnapBytes / 4,
+              "the scoop ledger must ride the snapshot");
 static_assert(kGasStatOff + kGasSpHdrBytes <= kSolMetaSnapOff &&
                   kSolMetaSnapOff + kSolMetaSnapBytes <= kPCountOff + 256,
               "solute header overruns the particle-count block's slack");
@@ -892,6 +895,8 @@ void World::KickReadback() {
           out.solScooped = sm[kSolMScooped];
           out.solFaultSlot = sm[kSolMFaultSlot];
           out.solFaultTick = sm[kSolMFaultTick];
+          for (uint32_t k = 0; k < kSolScoopSpecies; k++)
+            out.solScoopedBy[k] = sm[kSolMScoopBySpecies + k];
           // THE REACTION-EFFECT RECORD (world.h kPageFaultReactFx*): this
           // tick's firings of rules with effects, one winner per slot. The
           // record's tick word guards against a copy that raced nothing but

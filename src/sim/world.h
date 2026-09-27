@@ -1873,6 +1873,15 @@ constexpr uint32_t kSolMFaultTick = 10;  // first fault: tick
 constexpr uint32_t kSolMPoured = 11;     // units added by solute cell ops (pours)
 constexpr uint32_t kSolMScooped = 12;    // units removed by scoop clears, monotonic
 constexpr uint32_t kSolMSeamRefused = 13; // MPM excites refused: the cell carried solute
+// THE SOLUTE SCOOP LEDGER (docs/PLAN_alchemy_chemistry.md contract 2.5): units
+// of each species a vessel's conditional clears took out of the world, one
+// monotonic word per species 1..kSolScoopSpecies at [20 .. 20 + N), written by
+// sim_solute.wgsl solScoop (which walks the tick's cell ops after
+// sim_mutate's `cells` applied them). Read by TickAuthority beside the
+// eighths ledger (pageFaults [36]); a species past N is not credited (its
+// mass stays on the cleared cell and solCompact discards it, counted).
+constexpr uint32_t kSolMScoopBySpecies = 20;
+constexpr uint32_t kSolScoopSpecies = 8;
 constexpr uint32_t kSolMArgs = 16;       // [16..18] solAlloc indirect args staging
 // pass_table.def's copy_solArgs row copies from byte 64 as a literal.
 static_assert(kSolMArgs * 4 == 64, "pass_table.def copy_solArgs offset");
@@ -3934,6 +3943,8 @@ struct WorldSnapshot {
   uint32_t solScooped = 0;
   uint32_t solFaultSlot = 0;
   uint32_t solFaultTick = 0;
+  // Monotonic units per species (1..kSolScoopSpecies) the vessels' clears took.
+  uint32_t solScoopedBy[kSolScoopSpecies] = {};
   // ---- reaction effects (pageFaults [40..63], kPageFaultReactFx*) ----
   // THIS snapshot's tick only (the record is cleared every tick). `reactFx`
   // is the surviving slot winners in SLOT order -- a fixed order, so the

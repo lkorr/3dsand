@@ -30,6 +30,7 @@
 #include "sim/plants.h"
 #include "sim/rng.h"
 #include "sim/trample.h"
+#include "sim/solutes.h"
 #include "sim/tuning.h"
 #include "sim/voxload.h"
 #include "sim/waterbody.h"
@@ -1829,7 +1830,42 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
             return put;
           };
           std::vector<ContainerUnpaid> unpaid;
-          ContainerSettle(w.scoopLedger, s.scoopMemo, lsnap.tick, deposit, &unpaid);
+          const int paidWater =
+              ContainerSettle(w.scoopLedger, s.scoopMemo, lsnap.tick, deposit, &unpaid);
+          // THE DISSOLVED HALF (container.h ContainerSoluteLedger): the salt the
+          // scooped brine carried, paid to the session whose water claims were
+          // just paid, into the first vessel in hand / hotbar / pack that now
+          // holds a liquid. What does not fit (a dissolved eighth takes room,
+          // composition.h) spills with the unpaid water -- as grains, through
+          // ContainerDissolvedToWorld -- never into nothing.
+          if (paidWater > 0) {
+            for (uint32_t sp = 1; sp <= kSolScoopSpecies; sp++) {
+              const SoluteDef* sd = CurrentSoluteById(sp);
+              if (!sd || !sd->from) continue;
+              const int n = ContainerSoluteTake(w.soluteLedger, sp,
+                                                std::max<uint32_t>(1, sd->yieldPerVoxel / 8));
+              if (n <= 0) continue;
+              const uint16_t dmat = (uint16_t)(alchemy::kDissolvedBit | sd->from);
+              int put = 0;
+              auto tryInto = [&](ItemStack& cand) {
+                if (put >= n || cand.Empty() || cand.stoppered || cand.count != 1) return;
+                const ItemDef* d = items.Of(cand);
+                if (!d || !d->IsContainer()) return;
+                bool liquid = false;
+                for (int i = 0; i < cand.contents.n; i++) {
+                  const uint16_t m = cand.contents.p[i].mat;
+                  liquid |= !alchemy::IsDissolved(m) && m < mats.size() &&
+                            mats[m].gpu.klass == CLASS_LIQUID;
+                }
+                if (liquid) put += ContainerDeposit(*d, cand, dmat, n - put);
+              };
+              for (int hk = 0; hk < kHands; hk++)
+                tryInto(kit.equip.slots[EquipSlotOfHand(HandAt(hk))]);
+              for (int i = 0; i < kItemSlots; i++) tryInto(hotbar.slots[i]);
+              for (int i = 0; i < Bag::kSlots; i++) tryInto(kit.bag.slots[i]);
+              if (put < n) unpaid.push_back({dmat, n - put});
+            }
+          }
           // It went off: the vessel is gone, what was in it bursts out at the
           // hands, and a real blast (the grenade slot) carves whoever held it.
           for (const Pocket& p : pockets) {
@@ -4793,6 +4829,7 @@ void TickAuthority(TickAuthorityCtx& w, std::span<SessionTick> players,
           if (c.tick == lsnap.tick) landing++;
       ContainerLedgerObserve(w.scoopLedger, lsnap.tick, lsnap.scoopEighths,
                              landing);
+      ContainerSoluteObserve(w.soluteLedger, lsnap.tick, lsnap.solScoopedBy);
     }
   }
   for (size_t i = 0; i < players.size(); i++)

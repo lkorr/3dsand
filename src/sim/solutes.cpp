@@ -58,6 +58,9 @@ bool LoadSolutes(const std::string& path, const std::vector<MaterialDef>& mats,
       return (uint16_t)(id > 0 ? id : 0);
     };
     d.from = mat("from", true);
+    // Only a powder dissolves: sim_step gates the dissolve read on the class.
+    if (d.from && mats[d.from].gpu.klass != CLASS_POWDER)
+      errors += where + "\"from\" must be a powder\n";
     d.precipitatesTo = mat("precipitatesTo", false);
     d.yieldPerVoxel = r.value("yieldPerVoxel", 256u);
     d.saturation = std::min(255u, r.value("saturation", 255u));

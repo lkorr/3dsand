@@ -128,6 +128,7 @@ namespace {
 #define PIPE_SOL_ALLOC       Pipe::SolAlloc
 #define PIPE_SOL_DIFFUSE     Pipe::SolDiffuse
 #define PIPE_SOL_COMPACT     Pipe::SolCompact
+#define PIPE_SOL_SCOOP       Pipe::SolScoop
 #define PIPE_SOL_HASH        Pipe::SolHash
 #define PIPE_SOL_EVICT       Pipe::SolEvict
 #define PIPE_SOL_RESTORE     Pipe::SolRestore

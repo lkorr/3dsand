@@ -2230,7 +2230,7 @@ fn coatReact(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     if (!lightMatches(rule, c)) { continue; }
     // A coat carries no solute: a concentration-conditioned rule never fires
     // through one (word 0 reads as "not a liquid").
-    if (!solRuleAllows(cmat.reactOffset + ri, c, 0u)) { continue; }
+    if (cmat.klass == CLASS_LIQUID && !solRuleAllows(cmat.reactOffset + ri, c, 0u)) { continue; }
     let rr = hash3(rnd ^ COAT_ROLL_SALT, ri, slotIdx);  // SLOT index
     let rot = rr >> 12u;
     let dmask = (rule.packed >> 2u) & 7u;
@@ -2430,8 +2430,10 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
     if (!lightMatches(rule, c)) { continue; }
     // A concentration condition (reactions.json "solute"/"cMin"; the solute
     // layer's rule side array): brine electrolysis needs the salt, not just
-    // the water. One side-array word per rule tried; 0 for nearly all.
-    if (!solRuleAllows(m.reactOffset + ri, c, w)) { continue; }
+    // the water. One side-array word per rule tried; 0 for nearly all. Only a
+    // LIQUID self can carry the condition (materials.cpp refuses it on any
+    // other), so fire, smoke and stone never pay the side-array read.
+    if (m.klass == CLASS_LIQUID && !solRuleAllows(m.reactOffset + ri, c, w)) { continue; }
 
     // Drawn AFTER the gate: hash3 is stateless and keyed on (rnd, ri, slot),
     // so a skipped rule consumes nothing and every later draw is unchanged.
@@ -2486,7 +2488,9 @@ fn doReactions(c : vec3<i32>, idx : u32, slotIdx : u32, w : u32, mat : u32,
           reactFxNote(rule, c);
           let ni = voxWordIndex(n);  // resolved only for the cell that is written
           voxStore(ni, packVox(rule.prodNbr, productState(rule.prodNbr, rr >> 4u), stamp));
-          solClearStale(n);
+          // Only a LIQUID product can carry a value, so only one can inherit a
+          // stale one (solCarried): smoke and fire emits skip the table read.
+          if (solIsLiquidMat(rule.prodNbr)) { solClearStale(n); }
           markVoxActive(ni);
           markDirtyR(n, DIRTY_R_REACTW);
           markDirtyR(c, DIRTY_R_REACTW);
@@ -3945,7 +3949,11 @@ fn main(@builtin(workgroup_id) wg : vec3<u32>,
   // the chunk marks dirty is a tick the CPU can prove the world settled and
   // stop running the CA -- measured, a grain on a pond floor went to sleep
   // after 22 ticks and never dissolved. doReactions probes for the same reason.
-  if (P.substep == 0u) {
+  // Only a POWDER dissolves (solutes.cpp refuses any other `from`) and only a
+  // LIQUID converts: gases and solids -- most of a burning forest's awake
+  // cells -- skip the species-table read entirely (measured: +9% CA in the
+  // --perf forestfire scene before this gate).
+  if (P.substep == 0u && (m.klass == CLASS_POWDER || m.klass == CLASS_LIQUID)) {
     let sp = solFromSpecies(mat);
     if (sp != 0u && TUNE_SOLUTE_MODE != 0u &&
         solTryDissolve(c, idx, w, mat, m, sp, slotIdx, skip)) { return; }

@@ -296,6 +296,16 @@ PASS(copy_solArgs, nullptr, PT_TICK, PIPE_NONE, K_COPY, 64,0,12, GRP_NONE, DYN_N
 PASS(solAlloc, "solute(want+alloc)", PT_TICK, PIPE_SOL_ALLOC, K_INDIRECT, IND_SOLARGS,0,0,
      GRP_SIM, DYN_ZERO, C_CAACTIVE, 1,
      USES(I(SolArgs) RW(SolTable) A(SolPool) A(SolMeta)))
+// solScoop (sim_solute.wgsl): the dissolved mass of every cell a vessel's
+// conditional clear emptied this tick moves to the per-species scoop ledger.
+// After solAlloc so the cleared cell's chunk is a page (it was dirtied by the
+// clear and carries solute); before the CA so nothing has flowed into the hole
+// yet. C_CELLS with sim_mutate's `cells`: a tick without cell ops has no row.
+// read-only in practice: solTable is read_write for the module (solAlloc and
+// solCompact write it); solScoop only resolves pages through it.
+PASS(solScoop, "solute(want+alloc)", PT_TICK, PIPE_SOL_SCOOP, K_COMPUTE, D_CELLS,1,1,
+     GRP_SIM, DYN_ZERO, C_CELLS, 1,
+     USES(U(TickUBO) R(Materials) R(CellOps) R(Voxels) R(PageTable) R(SolTable) A(SolPool) A(SolMeta)))
 
 // ---- phase 2b: the ANGLE-OF-REPOSE OCCUPANCY SNAPSHOT --------------------
 //

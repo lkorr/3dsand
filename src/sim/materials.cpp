@@ -1541,6 +1541,12 @@ static bool LoadReactionsJson(const std::string& path, std::vector<MaterialDef>&
         errors += path + ": reaction self=\"" + self + "\": \"solute\" must be a species name\n";
       } else {
         fx.solute = r["solute"].get<std::string>();
+        // The condition reads the SELF cell's dissolved mass, and only a
+        // liquid carries any -- sim_step skips the side-array read for every
+        // other class, so a condition on one would fire unconditionally.
+        if (mats[selfId].gpu.klass != CLASS_LIQUID)
+          errors += path + ": reaction self=\"" + self +
+                    "\": a \"solute\" condition needs a liquid self\n";
         const int lo = r.value("cMin", 1), hi = r.value("cMax", 255);
         if (lo < 0 || lo > 255 || hi < lo || hi > 255)
           errors += path + ": reaction self=\"" + self +

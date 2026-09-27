@@ -188,6 +188,25 @@ int ContainerDeposit(const ItemDef& def, ItemStack& st, uint16_t mat, int units)
   return put;
 }
 
+void ContainerSoluteObserve(ContainerSoluteLedger& L, uint32_t snapTick,
+                            const uint32_t (&scoopedBy)[kSolScoopSpecies]) {
+  if (L.have && L.tick == snapTick) return;
+  for (uint32_t k = 0; k < kSolScoopSpecies; k++) {
+    if (L.have && scoopedBy[k] >= L.seen[k]) L.pot[k] += scoopedBy[k] - L.seen[k];
+    L.seen[k] = scoopedBy[k];
+  }
+  L.have = true;
+  L.tick = snapTick;
+}
+
+int ContainerSoluteTake(ContainerSoluteLedger& L, uint32_t species, uint32_t eighthUnits) {
+  if (species == 0 || species > kSolScoopSpecies || eighthUnits == 0) return 0;
+  uint32_t& pot = L.pot[species - 1];
+  const uint32_t n = pot / eighthUnits;
+  pot -= n * eighthUnits;
+  return (int)n;
+}
+
 int ContainerSettle(ContainerScoopLedger& L, ContainerScoopMemo& memo,
                     uint32_t snapTick,
                     const std::function<int(uint16_t mat, int units)>& deposit,

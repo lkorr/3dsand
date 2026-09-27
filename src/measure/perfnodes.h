@@ -133,7 +133,7 @@ inline constexpr PerfNodeDef kPerfNodes[] = {
      "its own because it exists only to serve the CA row behind it, and a "
      "reader comparing them separately would have to add them up anyway."},
     {"soluteSys", "Solute Layer", "simTick", PerfSide::Gpu, PerfScope::Count,
-     "solWant;solArgs;solAlloc;solDiffuse;solCompact;solHash;lr_solHash;ho_solHash;"
+     "solWant;solArgs;solAlloc;solScoop;solDiffuse;solCompact;solHash;lr_solHash;ho_solHash;"
      "solEvict;solRestore",
      "Dissolved mass (docs/PLAN_solutes.md): page allocation before the CA, "
      "pair-exchange diffusion and compaction after it, over the same dirty "

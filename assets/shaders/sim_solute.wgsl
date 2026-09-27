@@ -603,7 +603,62 @@ fn solCompact(@builtin(workgroup_id) wg : vec3<u32>,
 }
 
 // ============================================================================
-// solHash: the layer's share of the world hash. One group per slot; an EMPTY
+// solScoop: THE WORLD HALF OF A VESSEL'S SCOOP (docs/PLAN_alchemy_chemistry.md
+// contract 2.5). A vessel scoops through CONDITIONAL CLEARS (world.h
+// CellOpClearIfMat), which sim_mutate.wgsl `cells` applies to the VOXEL and
+// credits to the eighths ledger. The mass the cleared liquid carried is still
+// on the (now air) cell. This pass, recorded after solAlloc -- the clear
+// dirtied the chunk and the chunk carries solute, so solWant listed it and it
+// is a page -- walks the same op list, takes the mass off every cell a clear
+// emptied and adds it to that species' scoop ledger word. TickAuthority pays
+// it to the vessel as a DISSOLVED portion, exactly as the eighths ledger pays
+// the water. Without it the mass would be stale on an air cell and solCompact
+// would discard it: the salt of a flask of brine would vanish.
+//
+// "A clear emptied it": the op is a conditional clear (CELLOP_IF_AIR on an air
+// word) and the cell is air now. A REFUSED clear left its occupant (something
+// else flowed in), which is not air unless it was air already -- and an air
+// cell carries no mass after compaction, so reading one costs nothing wrong.
+// Cell ops are deduplicated keep-first on the CPU (sim/oprecord.h), so no
+// cell is credited twice. atomicAdd sums: order-independent (rule 1).
+// ============================================================================
+struct SolCellOp {
+  cellIdx : u32,
+  word    : u32,
+};
+@group(0) @binding(14) var<storage, read> cellOps : array<SolCellOp>;
+// world.h kSolMScoopBySpecies / kSolScoopSpecies. Declared here, beside their
+// only writer (CLAUDE.md: a constant one shader reads lives in that shader).
+const SOLM_SCOOP_BY_SPECIES : u32 = 20u;
+const SOL_SCOOP_SPECIES : u32 = 8u;
+
+@compute @workgroup_size(64)
+fn solScoop(@builtin(global_invocation_id) gid : vec3<u32>) {
+  if (gid.x >= T.cellCount) { return; }
+  let op = cellOps[gid.x];
+  if (op.cellIdx >= WORLD_N * WORLD_N * WORLD_N) { return; }
+  if ((op.word & CELLOP_IF_AIR) == 0u || (op.word & 0xFFFu) != MAT_AIR) { return; }
+  let tmat = (op.word >> 12u) & 0xFFFu;
+  if (!solIsLiquidMat(tmat)) { return; }
+  let ci = op.cellIdx / CHUNK_VOL;
+  let lo = op.cellIdx % CHUNK_VOL;
+  let l = vec3<i32>(vec3<u32>(lo % CHUNK, (lo / CHUNK) % CHUNK, lo / (CHUNK * CHUNK)));
+  let c = slotWorldChunk(ci, T.origin) * i32(CHUNK) + l;
+  if (voxMat(voxWordAt(c)) != MAT_AIR) { return; }
+  let v = solValueAt(c);
+  if (v == 0u) { return; }
+  let s = solSpeciesOf(v);
+  // A species past the ledger's width is not credited: the mass stays and
+  // solCompact discards it (counted), the same fate as before this pass.
+  if (s == 0u || s > SOL_SCOOP_SPECIES) { return; }
+  if (!solWritable(c)) { return; }
+  _ = solStoreAt(c, 0u);
+  atomicAdd(&solMeta[SOLM_SCOOP_BY_SPECIES + s - 1u], solMassOf(v));
+  atomicAdd(&solMeta[SOLM_SCOOPED], solMassOf(v));
+}
+
+// ============================================================================
+// solHash:the layer's share of the world hash. One group per slot; an EMPTY
 // slot returns at once (almost all of them). Keyed by the SLOT cell index and
 // the value, never by page index, and added into the same wrapping sum as the
 // voxels -- commutative, so the atomic order cannot matter. A UNIFORM sentinel

@@ -31,6 +31,9 @@
 #include <string>
 #include <vector>
 
+#include "game/composition.h"
+#include "game/container.h"
+#include "game/item.h"
 #include "sim/solutes.h"
 #include "sim/tuning.h"
 #include "test/selftest.h"
@@ -738,6 +741,133 @@ Status GateSoluteElectrolysis(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- solute-vessel ------------------------------------------------------------
+// THE WORLD HALF OF THE VESSEL SEAM, scoop direction (PLAN_alchemy_chemistry
+// contract 2.5): a flask scooping BRINE is paid the water AND the salt. The
+// clears go through the real MutationQueue and the real tick; sim_solute.wgsl
+// solScoop moves each cleared cell's mass to the per-species scoop ledger; the
+// snapshot carries it; ContainerSoluteObserve / Take turn it into whole
+// dissolved eighths. Asserted EXACT: every unit the pond lost is in the flask
+// as dissolved salt, in the overflow (what did not fit, which the live tick
+// spills), or in the ledger's sub-eighth remainder -- and no mass is left on a
+// cleared (air) cell. The water half is the vessel gates' claim, not this one's.
+//
+// The ContainerSettle / ContainerSoluteTake calls below are the single-memo
+// gate form of what session.cpp's PhaseG does (the pure functions; the live
+// deposit loop over hands / hotbar / pack is glue around them).
+Status GateSoluteVessel(Ctx& c, std::string& detail) {
+  const uint32_t water = MatNamed(c, "water"), salt = MatNamed(c, "salt");
+  const SoluteDef* sd = CurrentSoluteNamed("salt");
+  const int flaskI = c.items.Find("flask");
+  const ItemDef* flask = c.items.At(flaskI);
+  if (!water || !salt || !sd || !flask) {
+    detail = "needs water, salt, a `salt` species and the flask item";
+    return Status::Fail;
+  }
+  FixtureTuning tune;
+  const int px = 96, py = 120, pz = 96;
+  const Box box{px - 4, px + 3, pz - 4, pz + 3, py, py + 6, false};
+  SubmitWorldgen(c.ctx, c.world, c.sim, kDefaultSeed);
+  c.ctx.WaitIdle();
+  const std::vector<CellOp> build = box.Build((uint32_t)kMatStone);
+  const std::vector<CellOp> pond = box.Layers(water, py + 1, 2, 7u);
+  std::vector<CellOp> grains;
+  for (int z = pz - 3; z < pz + 3; z++)
+    for (int x = px - 2; x < px + 2; x++)
+      grains.push_back({World::SlotCellIndex({x, py + 3, z}), salt & 0xFFFu});
+  const uint32_t y8 = std::max<uint32_t>(1, sd->yieldPerVoxel / 8);
+
+  uint32_t t = 58000;
+  support::TickCursor ticker{c, t, {px >> 4, py >> 4, pz >> 4}};
+  // Dissolve it all first: a grain still dissolving during the scoop would
+  // move the pond's mass for a reason that is not the scoop.
+  SoluteLayer L;
+  BoxCensus k0;
+  int dissolvedAt = -1;
+  for (int i = 0; i < 900 && dissolvedAt < 0; i++) {
+    ticker({}, i == 0 ? build : i == 2 ? pond : i == 4 ? grains : std::vector<CellOp>{});
+    if (i >= 100 && i % 50 == 0) {
+      ReadSoluteLayer(c, L);
+      k0 = Census(c, box, L, salt);
+      if (k0.powderCells == 0 && k0.mass > 0) dissolvedAt = i;
+    }
+  }
+  if (dissolvedAt < 0) {
+    detail = Format("the salt never finished dissolving (%u powder cells, mass %llu)",
+                    k0.powderCells, (unsigned long long)k0.mass);
+    return Status::Fail;
+  }
+
+  // THE SCOOP: aimed each tick at the highest water the snapshot shows.
+  ItemStack st = StackOf(c.items, flaskI, 1);
+  ContainerScoopMemo memo;
+  ContainerSoluteLedger led;
+  int dissolvedIn = 0, overflow = 0, scoopTicks = 0;
+  auto settle = [&]() {
+    const WorldSnapshot& sn = c.world.Snap();
+    if (!sn.valid) return;
+    ContainerSettle(memo, sn.tick, sn.scoopEighths, flask, &st);
+    ContainerSoluteObserve(led, sn.tick, sn.solScoopedBy);
+    const int n = ContainerSoluteTake(led, sd->species, y8);
+    if (n <= 0) return;
+    const int put = ContainerDeposit(*flask, st, (uint16_t)(alchemy::kDissolvedBit | salt), n);
+    dissolvedIn += put;
+    overflow += n - put;
+  };
+  for (int i = 0; i < 60 && st.FillTotal() < (uint32_t)flask->container.capacity; i++) {
+    IVec3 aim{0, 0, 0};
+    bool found = false;
+    for (int y = py + 3; y > py && !found; y--)
+      for (int z = box.z0; z <= box.z1 && !found; z++)
+        for (int x = box.x0; x <= box.x1 && !found; x++) {
+          uint32_t w = 0;
+          if (ContainerSnapWord(c.world, {x, y, z}, w) && (w & 0xFFFu) == water) {
+            aim = {x, y, z};
+            found = true;
+          }
+        }
+    std::vector<CellOp> cells;
+    if (found) {
+      ContainerScoop(*flask, st, aim,
+                     [&](IVec3 p, uint32_t& w) { return ContainerSnapWord(c.world, p, w); },
+                     c.world, c.mats, cells, nullptr, &memo, t + 1);
+      scoopTicks++;
+    }
+    ticker({}, cells);
+    settle();
+  }
+  for (int i = 0; i < 12; i++) {   // let the last claims' snapshots arrive
+    ticker({}, {});
+    settle();
+  }
+  ReadSoluteLayer(c, L);
+  const BoxCensus k1 = Census(c, box, L, salt);
+  const uint32_t remainder = led.pot[sd->species - 1];
+  const uint64_t lost = k0.mass - std::min(k0.mass, k1.mass);
+  const uint64_t paid = (uint64_t)(dissolvedIn + overflow) * y8 + remainder;
+  const uint32_t ledgerUnits = sd->species <= kSolScoopSpecies
+                                   ? L.hdr[kSolMScoopBySpecies + sd->species - 1] : 0u;
+  std::string latch;
+  const bool latchOk = LatchesClean(L, latch);
+  const bool exact = k1.mass <= k0.mass && lost == paid && ledgerUnits == lost;
+  const bool credited = dissolvedIn > 0 && st.contents.AmountOf(water) > 0;
+  const bool ok = exact && credited && k1.strayMass == 0 && memo.claims.empty() && latchOk;
+  RecordObserved("solute-vessel.dissolvedEighths", (double)dissolvedIn);
+  detail = Format(
+      "pond mass %llu (dissolved by tick %d) -> %llu after %d scoop ticks: lost %llu, "
+      "ledger %u, paid %d dissolved eighths into the flask + %d overflow at %u units "
+      "+ %u remainder = %llu (%s); flask holds %u water + %u dissolved salt of %d; "
+      "stray %u, open claims %zu%s%s",
+      (unsigned long long)k0.mass, dissolvedAt, (unsigned long long)k1.mass, scoopTicks,
+      (unsigned long long)lost, ledgerUnits, dissolvedIn, overflow, y8, remainder,
+      (unsigned long long)paid, exact ? "EXACT" : "LEAK", st.contents.AmountOf(water),
+      st.contents.AmountOf((uint16_t)(alchemy::kDissolvedBit | salt)),
+      flask->container.capacity, k1.strayMass, memo.claims.size(), latchOk ? "" : ", ",
+      latch.c_str());
+  std::printf("solute-vessel: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SoluteGates() {
@@ -747,6 +877,7 @@ const std::vector<Gate>& SoluteGates() {
       {"solute-evap", "sim", {}, false, GateSoluteEvap, false},
       {"solute-seam", "sim", {}, false, GateSoluteSeam, false},
       {"solute-electrolysis", "sim", {}, false, GateSoluteElectrolysis, false},
+      {"solute-vessel", "sim", {}, false, GateSoluteVessel, false},
   };
   return g;
 }

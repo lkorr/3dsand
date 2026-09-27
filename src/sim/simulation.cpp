@@ -1815,6 +1815,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   pool.Add([&] { solAlloc_ = MakeComputePipeline(device, simPL_, mSolute, "solAlloc", "solAlloc"); });
   pool.Add([&] { solDiffuse_ = MakeComputePipeline(device, simPL_, mSolute, "solDiffuse", "solDiffuse"); });
   pool.Add([&] { solCompact_ = MakeComputePipeline(device, simPL_, mSolute, "solCompact", "solCompact"); });
+  pool.Add([&] { solScoop_ = MakeComputePipeline(device, simPL_, mSolute, "solScoop", "solScoop"); });
   pool.Add([&] { solHash_ = MakeComputePipeline(device, simPL_, mSolute, "solHash", "solHash"); });
   pool.Add([&] { solEvict_ = MakeComputePipeline(device, simPL_, mSolute, "solEvict", "solEvict"); });
   pool.Add([&] { solRestore_ = MakeComputePipeline(device, simPL_, mSolute, "solRestore", "solRestore"); });
@@ -1938,7 +1939,7 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   if (!worldgen_ || !worldgenList_ || !worldgenCols_ || !pageFill_ || !mutate_ ||
       !mutateCells_ || !windWake_ || !rainFall_ || !compact_ || !compactNext_ || !step_ || !occupancy_ ||
       !occupancyDirty_ || !pick_ || !explodeMark_ || !explodeApply_ || !pArgs1_ ||
-      !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solHash_ || !solEvict_ || !solRestore_ ||
+      !solWant_ || !solArgs_ || !solAlloc_ || !solDiffuse_ || !solCompact_ || !solScoop_ || !solHash_ || !solEvict_ || !solRestore_ ||
       !pSpawn_ || !pIntegrate_ || !pArgs2_ || !pResolve_ ||
       !gArgs1_ || !gSpawn_ || !gIntegrate_ || !gArgs2_ || !gResolve_ ||
       !fluidSpawn_ ||
@@ -2337,6 +2338,7 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::SolAlloc:       return solAlloc_;
     case P::SolDiffuse:     return solDiffuse_;
     case P::SolCompact:     return solCompact_;
+    case P::SolScoop:       return solScoop_;
     case P::SolHash:        return solHash_;
     case P::SolEvict:       return solEvict_;
     case P::SolRestore:     return solRestore_;

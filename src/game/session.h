@@ -807,6 +807,8 @@ struct TickAuthorityCtx {
   // GPU's scoop counter is world-wide, so every session's claims draw on one
   // per-tick pot here instead of each reading the whole delta for itself.
   ContainerScoopLedger scoopLedger;
+  // ...and its dissolved half (container.h ContainerSoluteLedger).
+  ContainerSoluteLedger soluteLedger;
   // ---- REACTION EFFECTS IN THE WORLD (docs/PLAN_alchemy_chemistry.md A) ----
   // The world consumer of reactions.json "effects" (materials.h RuleFx). The
   // GPU reports which rules-with-effects fired where (sim_step.wgsl
