@@ -840,6 +840,26 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
     if (r.kind == kChemDecay && selfType == NbGas && r.prodSelf == kChemAir && hv >= 0 &&
         hv < (int)vessels_.size() && vessels_[hv].stoppered)
       continue;
+    // NOTHING VANISHES INSIDE GLASS (owner report 2026-09-27: "blood is just
+    // disappearing in its flask while I'm in the alchemy menu. Same with
+    // ether"). A decay to AIR in the world is an abstraction of matter
+    // leaving into the open: a pool of blood drying into the ground
+    // (`blood -> air`, 8 per-mille), a vapour dispersing into the sky
+    // (`ether_vapour -> air`). Inside a vessel there is no ground to soak
+    // into and no sky to disperse in -- matter leaves only through the mouth
+    // (venting, pouring, spilling), and once it is out in the world the
+    // world's own rule takes over. So inside a vessel, open or stoppered, a
+    // decay to air does not fire for a liquid or a powder at all, nor for a
+    // gas that decays SLOWLY (a dispersal rule: smoke, chlorine, ether
+    // vapour). A FAST decay (at least a tenth of the chance scale a tick,
+    // a life of a few ticks) is a transient, not matter -- a spark, a glare
+    // -- and still burns out where it is. A decay into matter (ether ->
+    // ether_vapour, steam -> water) is chemistry and still fires, so an open
+    // flask of ether still evaporates -- into vapour that stays in the
+    // bottle until it spills over the lip.
+    if (r.kind == kChemDecay && r.prodSelf == kChemAir && hv >= 0 &&
+        (selfType != NbGas || r.chance * 10u < chem_.chanceDen))
+      continue;
     if (r.kind == kChemDecay) {
       uint32_t chance = r.chance;
       if (ChemScaleArmed(r.cond)) {

@@ -17220,6 +17220,8 @@ what keeps ValidateBench a proof.
   in the standalone g++ lab: flaskchem.cpp, like flasksim.cpp, has no engine
   dependency.
 
+**Nothing vanishes inside glass** (2026-09-27, owner: blood and ether disappeared from open flasks). A world decay to AIR is matter leaving into the open (a blood pool drying, a vapour dispersing); inside a vessel it does not fire for liquids and powders, nor for slow gas decays -- matter leaves a flask only through its mouth, and the world rule takes over once it is out. Fast decays (>= a tenth of the chance scale: spark, glare) are transients and still burn out; decays into matter (ether -> ether vapour) still fire. Gate `alchemy-keeps`.
+
 **Not yet:** the cauldron, a held/grounded flask drawing its layers, refraction; a stream off the table leaves from the nearest hand's lip,
 not from where on the table it fell; dissolved matter that streams off the
 table enters the world as its POWDER (conserved; the vessel door's in-solution

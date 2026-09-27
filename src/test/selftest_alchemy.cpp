@@ -567,6 +567,51 @@ Status GateAlchemyReact(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// NOTHING VANISHES INSIDE GLASS (owner report 2026-09-27: blood and ether
+// disappeared from open flasks at the bench). The world's `blood -> air`
+// (a pool drying) and `ether_vapour -> air` (a vapour dispersing) must not
+// fire inside a vessel: matter leaves a flask only through its mouth. An open
+// flask of blood and an open flask of ether left on the bench for 20 s: the
+// blood is all still there, and the ether is all still there as ether or
+// ether vapour (in the flask, spilled, or vented through the mouth), with the
+// units audit exact and the ledger validating.
+Status GateAlchemyKeeps(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int blood = SlotOfName(b, c, "blood"), ether = SlotOfName(b, c, "ether"),
+            vap = SlotOfName(b, c, "ether_vapour");
+  if (blood < 0 || ether < 0 || vap < 0) { detail = "missing blood/ether/ether_vapour"; return Status::Fail; }
+  auto run = [&](int slot, uint32_t amount, uint32_t& kept, std::string& why) {
+    Composition in;
+    in.Add(b.subs[slot].mat, amount);
+    alchemy::FlaskSim s(ChemConfig());
+    s.SetSubstances(b.subs);
+    s.SetChemistry(b.chem);
+    const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in);
+    Composition drained;
+    for (int f = 0; f < 60 * 20; f++) {
+      s.Step(4);
+      Drain(s, drained);
+    }
+    const alchemy::Tally t = s.Count();
+    kept = 0;
+    for (int m : {b.subs[slot].mat, b.subs[vap].mat})
+      kept += t.vessel[v].AmountOf((uint16_t)m) + t.spilled.AmountOf((uint16_t)m) + drained.AmountOf((uint16_t)m);
+    std::string a, l;
+    const bool audit = s.AuditUnits(&a), ledger = BenchLedgerHolds(c, s, in, v, drained, l);
+    why = std::string(audit ? "" : " audit: " + a) + (ledger ? "" : " ledger: " + l);
+    return audit && ledger;
+  };
+  uint32_t keptBlood = 0, keptEther = 0;
+  std::string wb, we;
+  const bool okB = run(blood, 200, keptBlood, wb), okE = run(ether, 200, keptEther, we);
+  // One eighth of slack each for the tally's largest-remainder rounding.
+  const bool ok = okB && okE && keptBlood + 1 >= 200 && keptEther + 1 >= 200;
+  detail = Format("open flask 20 s: blood 200 -> %u eighths%s; ether 200 -> %u eighths as ether + vapour%s",
+                  keptBlood, wb.c_str(), keptEther, we.c_str());
+  std::printf("alchemy-keeps: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // A STOPPERED FLASK KEEPS ITS GAS -- AND PRESSURE POPS OR BURSTS IT. (1) The
 // acid and sand of alchemy-react, stoppered: nothing vents, the gas is in the
 // flask. (2) A stoppered flask packed with gas past its headspace: the
@@ -1156,6 +1201,7 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-sand-carry", "player", {}, false, GateAlchemySandCarry},
       // Bench chemistry (package C): the world's rules on the bench.
       {"alchemy-react", "player", {}, false, GateAlchemyReact},
+      {"alchemy-keeps", "player", {}, false, GateAlchemyKeeps},
       {"alchemy-stopper", "player", {}, false, GateAlchemyStopper},
       {"alchemy-dissolve", "player", {}, false, GateAlchemyDissolve},
       {"alchemy-electrolysis", "player", {}, false, GateAlchemyElectrolysis},
