@@ -4396,6 +4396,20 @@ fn farInValid(c : vec3<i32>, b : FarBox) -> bool {
 // candidate when the cell UNDER it holds material — one byte read, usually in
 // the same cache line — and a map load happens for at most a couple of cells
 // per ray, never for the air the ray crossed to get there.
+//
+// WHAT IT COSTS, and what was measured about the shape of that cost
+// (--render-budget, arms norefine / refine1 / refine2 in one process): the
+// candidate test and the map load are free (an arm that ran both and skipped
+// only the intersection priced at the norefine frame to within noise). The
+// intersection is not, and the reason is divergence, not arithmetic: lanes of
+// a warp reach their candidate at different DDA iterations, so a warp runs the
+// body up to once per lane. Two things keep that down: the body is small and
+// exits early (the QUICK MISS below: a ray whose lowest point in the cell is
+// over the tallest top leaves without the piece walk), and every vector
+// component is taken by select, never v[i] (a runtime index parks the vector
+// in local memory). Tried and taken out: returning the candidate and refining
+// in fs after the loop with a resumed march on a miss — the re-seeded passes
+// cost MORE than the divergence (seam +1.41 ms vs +0.61 in-loop).
 const FAR_HIT_REFINED : u32 = 0x100u;   // FarHit.level flag: hit came from the map
 struct FarRefine { hit : bool, t : f32, axis : i32, pal : u32 };
 
@@ -4409,9 +4423,17 @@ struct FarRefine { hit : bool, t : f32, axis : i32, pal : u32 };
 // clamped) test the same point their neighbour does, so the order the pieces
 // are tried in keeps the entry face's axis on a hit at tIn.
 fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f,
-                 inv : vec3f, tIn : f32, tOut : f32, entryAxis : i32) -> FarRefine {
+                 inv : vec3f, tIn : f32, tOut : f32, entryAxis : i32,
+                 maxTop : i32) -> FarRefine {
   var r : FarRefine;
   r.hit = false;
+  // THE QUICK MISS: heights compare in FINE units (a multiply, never a divide
+  // by s), and a ray whose lowest point over the cell is above the tallest
+  // top — the common case for the flagged air a grazing ray skims — leaves
+  // without walking the pieces.
+  let yIn = (roL.y + rd.y * tIn) * s;
+  let yOut = (roL.y + rd.y * tOut) * s;
+  if (min(yIn, yOut) > f32(maxTop + 1)) { return r; }
   let midX = f32(vc.x) + 0.5;
   let midZ = f32(vc.z) + 0.5;
   let tx = clamp((midX - roL.x) * inv.x, tIn, tOut);
@@ -4423,15 +4445,18 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
   var axSeg = entryAxis;
   for (var k = 0u; k < 3u; k++) {
     let tb = select(select(tOut, b2, k == 1u), b1, k == 0u);
-    let pm = roL + rd * (0.5 * (ta + tb));
-    let i = select(0u, 1u, pm.x >= midX) + select(0u, 2u, pm.z >= midZ);
-    let hq = farMapTop(e[i]);
-    let topL = f32(hq + 1) / s;
+    let tm = 0.5 * (ta + tb);
+    // Component by SELECT, never e[i] (see the note above).
+    let hiX = roL.x + rd.x * tm >= midX;
+    let ez = select(select(e.x, e.y, hiX), select(e.z, e.w, hiX),
+                    roL.z + rd.z * tm >= midZ);
+    let hq = farMapTop(ez);
+    let top = f32(hq + 1);                 // fine y of the sub-column's top face
     var th = ta;
     var hax = axSeg;
-    var got = roL.y + rd.y * ta <= topL;
+    var got = (roL.y + rd.y * ta) * s <= top;
     if (!got && rd.y < 0.0) {
-      th = (topL - roL.y) * inv.y;
+      th = (top / s - roL.y) * inv.y;
       hax = 1;
       got = th <= tb;
     }
@@ -4443,7 +4468,7 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
       // the sub-skin below it (grass over dirt, sand over stone).
       let yv = i32(floor((roL.y + rd.y * th) * s));
       let skin = hax == 1 || yv >= hq;
-      r.pal = select((e[i] >> 23u) & 0x7Fu, (e[i] >> 16u) & 0x7Fu, skin);
+      r.pal = select((ez >> 23u) & 0x7Fu, (ez >> 16u) & 0x7Fu, skin);
       return r;
     }
     ta = tb;
@@ -4459,7 +4484,9 @@ fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f
 fn farHfTopAt(level : u32, m : vec2<i32>, b : FarBox) -> i32 {
   let c = m >> vec2<u32>(1u);
   if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return -1073741824; }
-  let e = farMap[farMapCell(level, c)][u32(m.y & 1) * 2u + u32(m.x & 1)];
+  let q = farMap[farMapCell(level, c)];
+  let hx = (m.x & 1) != 0;
+  let e = select(select(q.x, q.y, hx), select(q.z, q.w, hx), (m.y & 1) != 0);
   if ((e & FAR_MAP_VALID) == 0u) { return -1073741824; }
   return farMapTop(e);
 }
@@ -4731,12 +4758,14 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
                   let hc = select(maxH, hq.w, level == 1u);
                   if (mat == 0u || y0 + (si >> 1) <= hc) {
                     let rf = farRefineCell(e, vc, s, roL, rd, inv, vCur,
-                                           min(vMax.x, min(vMax.y, vMax.z)), axis);
+                                           min(vMax.x, min(vMax.y, vMax.z)), axis,
+                                           maxH);
                     if (rf.hit) {
                       out.hit = true;
                       out.t = rf.t * s;   // back to fine-voxel units
                       out.axis = rf.axis;
-                      out.sgn = sign(rd[rf.axis]);
+                      out.sgn = sign(select(select(rd.x, rd.z, rf.axis == 2), rd.y,
+                                            rf.axis == 1));
                       out.mat = farPalMat(&materials, rf.pal);
                       out.cell = vc;
                       out.level = level | FAR_HIT_REFINED;

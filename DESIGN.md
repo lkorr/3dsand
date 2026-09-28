@@ -12278,6 +12278,31 @@ where you hear from either (§12b, "The ears are on the character").
     over the hit's cell, because a refined hit sits inside a cell the far
     shadow march would otherwise count as its own blocker. The level word of
     `FarHit` carries the refined flag, so fs keeps its state size.
+  - **Measured** (2026-09-28, `--verify ... --budget-cams seam,seamveg,cascade`,
+    one process, exclusive lock, RTX 3060 Ti 1080p; arms `norefine`,
+    `refine1`/`refine2` = cap at level 1/2, `lod20`): the refine costs
+    **+0.58 ms on `seam`** (0.38 of it level 1), **+0.29 ms on `seamveg`**,
+    +0.82 ms on `cascade` (almost all levels >= 2, which is where that camera's
+    pixels are). With the handoff moved in to 20 m (`lod20`, package E) the
+    seam frame is +0.29 ms over the unrefined, 26 m-handoff frame. raymarch
+    `fs` stays at 128 registers / 144 B local (`--shader-stats`, unchanged).
+    What the cost is NOT: the candidate test and the map load are free (an
+    arm that ran both and skipped only the intersection priced at the
+    unrefined frame). It is divergence — lanes reach their candidate at
+    different DDA iterations, so a warp runs the body up to once per lane —
+    which is why the body exits early (a ray whose lowest point in the cell is
+    over the tallest top leaves before the piece walk) and takes vector
+    components by `select`, never `v[i]` (a runtime index put the map vector
+    in local memory: that alone was 0.8 ms of the cascade camera's 2.15).
+    Tried and removed: returning the candidate and refining in fs after the
+    loop, resuming the march on a miss — the re-seeded passes cost MORE
+    (seam +1.41 ms). Looks: at the window edge the level-1 side now shows the
+    near field's own 10 cm columns instead of 20 cm terraces, and the coarse
+    levels read as slopes rather than slab stacks; the cost of the finer
+    geometry is 1-2 px stair aliasing on distant slopes (salt-and-pepper
+    step edges, strongest on snow), which a level cap (`farRefineLevel` 1-2)
+    trades back. The concentric-ring moire on distant slopes predates this
+    and is unchanged by it.
   - **Gate** `far-surface`: after a full refill every sampled valid level-1
     entry equals `TerrainHeight` (or a fluid surface over it) and the sieve's
     cell holding that top wears the same far slot as the entry's skin; levels
