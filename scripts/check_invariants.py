@@ -1750,21 +1750,28 @@ def check_far_face_word():
             "FAR_FACE_MASK": (1 << bits) - 1,
             "FAR_FACE_ALL": int(flag.group(1))}
 
-    got = {}
-    for name in want:
-        m = re.search(name + r"\s*:\s*u32\s*=\s*(?:1u\s*<<\s*)?(\d+)u?", rm)
-        if m:
-            got[name] = int(m.group(1))
-    for name, v in want.items():
-        if name not in got:
-            problems.append(
-                f"raymarch.wgsl does not declare {name} -- farBox unpacks the "
-                f"pending-face word and world.h owns its layout")
-        elif got[name] != v:
-            problems.append(
-                f"raymarch.wgsl {name} = {got[name]} but world.h derives {v} "
-                f"from kFarN/kChunk = {nchunk} chunks per level axis -- the "
-                f"valid box would exclude the wrong slab")
+    # shadow_resolve.wgsl carries a verbatim copy of farBox since LOD-seam
+    # package C (its patch rays continue into the cascade past the window).
+    for fname, src in (("raymarch.wgsl", rm),
+                       ("shadow_resolve.wgsl",
+                        read("assets/shaders/shadow_resolve.wgsl"))):
+        if not src:
+            continue
+        got = {}
+        for name in want:
+            m = re.search(name + r"\s*:\s*u32\s*=\s*(?:1u\s*<<\s*)?(\d+)u?", src)
+            if m:
+                got[name] = int(m.group(1))
+        for name, v in want.items():
+            if name not in got:
+                problems.append(
+                    f"{fname} does not declare {name} -- farBox unpacks the "
+                    f"pending-face word and world.h owns its layout")
+            elif got[name] != v:
+                problems.append(
+                    f"{fname} {name} = {got[name]} but world.h derives {v} "
+                    f"from kFarN/kChunk = {nchunk} chunks per level axis -- the "
+                    f"valid box would exclude the wrong slab")
 
     if bits * 6 > int(flag.group(1)):
         problems.append(

@@ -4555,7 +4555,7 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
             var mat = farPalMat(&materials, cellByte & FAR_PAL_MASK);
             // THE BLOCKER FLAG AS A PRIMARY HIT, behind render.farBlockerHitLevel.
             //
-            // Shadows take the flag at every level (farShadowDist) because a
+            // Shadows take the flag at every level (farShadowMarch) because a
             // shadow that is half a cell too tall on the horizon costs nothing.
             // The VISIBLE surface cannot: the flag is set for every cell whose
             // floor is at or below the ground, so honouring it raises the
@@ -4653,13 +4653,11 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 }
 
 // ---- far-field sun shadows (phase 4: distance look) ----
-// One coarse DDA toward the sun through the SAME cascade level the hit lives
-// in, occupancy-skipped and hard-capped. Lighting mismatch is what makes LOD
-// terrain read as "LOD terrain": the near field casts real shadow rays, so an
-// unshadowed far field renders every hillside and every spot under a canopy at
-// identical brightness and the horizon flattens into wallpaper. One level only
-// — a sun ray leaves the hit level's box within a few dozen cells, and
-// cross-level shadow reach buys nothing visible through fog at that range.
+// A coarse DDA toward the sun through the cascade, occupancy-skipped and
+// capped. Lighting mismatch is what makes LOD terrain read as "LOD terrain":
+// the near field casts real shadow rays, so an unshadowed far field renders
+// every hillside and every spot under a canopy at identical brightness and the
+// horizon flattens into wallpaper.
 // Render-only float math on render-only data (CLAUDE.md rule 1 scopes to sim).
 // ---- THE REACH MUST BE A DISTANCE, NOT A STEP COUNT ----
 // This loop used to run a bare `for (i = 0; i < 128; i++)`, which silently ties
@@ -4672,26 +4670,43 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
 // into a 606 ms one: a 58x cliff out of a constant that reads like a safety
 // cap.
 //
-// The budget below is therefore expressed in METERS and converted into this
-// level's cells, so the shadow reaches the same distance into the world at
-// every level and the step count falls out of the geometry. The clamp bounds
-// both ends: never so few steps that a coarse level cannot leave its own cell,
-// never more than the cap, which is what protects the frame.
+// ---- AND IT WAS STILL A STEP COUNT UNTIL 2026-09-28 (LOD-seam package C) ----
+// The fix above converted TUNE_FAR_SHADOW_REACH into cells and then clamped
+// the count to 64 — and the budget was also charged for every CHUNK the ray
+// crossed and for every cell of a diagonal DDA, which visits up to
+// |rd.x|+|rd.y|+|rd.z| cells per cell of length. What that shipped, at 24 m:
+// a level-1 receiver's ray reached ~9 m, a level-2 or level-3 one ~17 m. The
+// shadow of one tree changed length at the window face (the near field's ray
+// is unbounded inside the window) and again at the level-1 -> level-2 seam
+// ~51 m out, which is a walking seam: it moves with the camera.
 //
-// THE CAP IS 64, AND THE REACH SHIPS AT 24 m (2026-09-04). Since the LOD-seam
-// pass stopped treating the blocker flag as a caster, an unshadowed far ray
-// walks its whole reach instead of stopping in the flagged row: measured on
-// the owner's live flight, 38 far-shadow steps per PIXEL over a frame that was
-// 81% cascade, 74 M steps a frame against 264 M for the far march itself. A
-// caster that matters at cascade range is a canopy or a ridge within a few
-// tens of metres of its receiver (a 10 m tree at 30 deg sun casts ~17 m);
-// levels >= 3 floor at TUNE_SHADOW_FAR_LIFT anyway, so the long tail of the
-// reach bought nothing visible. At 24 m: level 1 runs 64 steps (12.8 m at
-// 20 cm cells), level 2 60, level 3 30, level 4 15.
-fn farShadowSteps(level : u32) -> i32 {
-  let cellM = f32(1u << farCellShift(level)) * VOXEL_METERS;
-  return clamp(i32(TUNE_FAR_SHADOW_REACH / max(cellM, 1e-4)), 8, 64);
-}
+// NOW THE RAY IS A CONE TRACE THROUGH THE LEVELS. It starts in the receiver's
+// own level and hands itself to the next coarser level every
+// FAR_SHADOW_SEG_CELLS cells of distance: level k covers the ray out to
+// 32 * cell_k from the receiver (level 1: 0-6.4 m, level 2: 6.4-12.8 m,
+// level 3: 12.8-25.6 m ...), and the reach test is on DISTANCE (tF >= reach),
+// never on a count. Two things fall out of that:
+//
+//   * The reach is the same number of METRES at every level, including the
+//     window's own continuation (shadow_resolve.wgsl), so a shadow is as long
+//     on one side of any seam as on the other.
+//   * The cost is bounded by geometry, not by a clamp: a level-1 receiver walks
+//     32 + 16 + 14 cells of length for 24 m where the old ray walked 64 steps
+//     for ~9 m, and every coarser receiver walks less. The step cap below is
+//     a safety net that a full-reach ray does not normally meet.
+//
+// WHY THE CELL MAY GROW WITH DISTANCE. The sun is a disc (render.shadowSunAngle
+// = 1 deg half-angle), so a blocker `d` away already smears its shadow edge
+// over 2*d*tan(angle) — 0.2 m at 5.7 m, 0.4 m at 11.5 m, 0.8 m at 23 m. A
+// caster's detail finer than that is not in the shadow at all, so marching it
+// in cells no finer than that loses nothing the near field shows. Those
+// distances are, to a cell, where the schedule hands over.
+const FAR_SHADOW_SEG_CELLS : f32 = 32.0;
+const FAR_SHADOW_STEP_CAP : i32 = 160;
+// tan of the sun's half-angle, the one number the far penumbra estimate needs.
+// Same const-eval as shadow_resolve.wgsl's SHADOW_CONE_TAN, so 0 turns the far
+// penumbra off exactly as it turns the near one off.
+const FAR_SHADOW_CONE_TAN : f32 = tan(TUNE_SHADOW_SUN_ANGLE * 0.017453292);
 
 // Which cascade level covers a point, given as a distance from the camera in
 // FINE voxels. The levels are nested boxes centred on the camera whose
@@ -4740,126 +4755,217 @@ fn farShadowBlocked(level : u32, vc : vec3<i32>) -> bool {
   return farPalAt(level, vc) != 0u;
 }
 
-// Returns the distance to the blocker in FINE voxels, or -1.0 when the ray
-// left the level box / its reach unblocked. The distance is what lets a far
-// receiver take the SAME softening law the near field uses
-// (shadowFromOpaqueHit): a contact blocker stays dark, a canopy 8 m up lifts
-// toward TUNE_SHADOW_LIFT, exactly as it does one voxel inside the window.
-fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
-  var rd = keyLightDir();
+// Where a ray from `ro` (fine voxels) leaves the residency window, in fine
+// voxels along `rd`. The near shadow ray (traceOpaque) stops there; the
+// cascade continuation starts there. shadow_resolve.wgsl carries the same
+// lines for the cached half — --gate shadow-cache's comparison of the cached
+// value against sunShadowAt is what holds the two call sites to one answer.
+fn shadowWindowExitT(ro : vec3f, rd : vec3f) -> f32 {
+  let inv = 1.0 / rd;
+  let lo = vec3f(R.origin * i32(CHUNK));
+  let t0 = (lo - ro) * inv;
+  let t1 = (lo + vec3f(f32(WORLD_N)) - ro) * inv;
+  let tmax = max(t0, t1);
+  return max(min(tmax.x, min(tmax.y, tmax.z)), 0.0);
+}
+
+// The far march's answer: the blocker distance in FINE voxels (< 0 = nothing
+// within reach) and how much of the SUN DISC that blocker covers (see
+// farShadowCover). `cov` is only meaningful when t >= 0.
+struct FarShadowHit { t : f32, cov : f32 };
+
+// ---- THE FAR PENUMBRA, WITHOUT A SECOND RAY ---------------------------------
+// The near field's shadow is soft because shadow_resolve.wgsl jitters its ray
+// across the solar disc and averages 16 frames of verdicts. A far pixel gets
+// one ray and no history, so its edge was a hard step — and past the window
+// face a shadow edge went from a ~2 d tan(angle) ramp to a cell-sized stair.
+//
+// The ray already knows most of what the ramp needs. It hit a blocker cell;
+// if the ray LEAVES that cell through a face whose neighbour is empty, the
+// shared edge of the entry and exit faces is a piece of the blocker's
+// silhouette, and the ray's perpendicular distance from it is how far inside
+// the shadow this receiver sits. The shadow reaches full depth where that
+// margin covers the disc's projected width 2*d*tan(angle); at a margin of zero
+// it is fully lit. That is the INNER half of the penumbra only — the outer
+// half would need a near miss the DDA never visits — so the edge has the near
+// field's slope, sits half a penumbra further into the shadow, and is
+// continuous at the silhouette (cov = 0 there, the lit side's value).
+//
+// Distance from the ray to that edge, with a = the entry axis and x = the exit
+// axis: the edge runs along the third axis, the entry point sits
+// `chord * |rd_x|` from the exit face, and the common perpendicular of the two
+// lines gives `chord * |rd_a| * |rd_x| / sqrt(rd_a^2 + rd_x^2)`.
+//
+// DEEP (cov = 1) when the ray passes straight through (exit axis == entry
+// axis), when the neighbour past the exit face is itself a blocker (the ray is
+// inside a mass, not at its edge), and when the entry face is unknown (the
+// first cell a level visits). A thin caster — one cell of trunk — is exactly
+// the case where the margin never reaches the disc width, and a partial
+// shadow is the right answer for it.
+//
+// fs cost: this runs once, on the hit, after the march's loop state is dead.
+fn farShadowCover(level : u32, vc : vec3<i32>, eAx : i32, tIn : f32,
+                  vMax : vec3f, rd : vec3f, stepv : vec3<i32>, s : f32) -> f32 {
+  if (FAR_SHADOW_CONE_TAN <= 0.0 || eAx < 0) { return 1.0; }
+  var xAx = 2;
+  var tOut = vMax.z;
+  if (vMax.x < vMax.y && vMax.x < vMax.z) { xAx = 0; tOut = vMax.x; }
+  else if (vMax.y < vMax.z) { xAx = 1; tOut = vMax.y; }
+  if (xAx == eAx) { return 1.0; }
+  // No dynamic vector index (the by-value register gotcha): selects.
+  let nb = vc + vec3<i32>(select(0, stepv.x, xAx == 0),
+                          select(0, stepv.y, xAx == 1),
+                          select(0, stepv.z, xAx == 2));
+  if (farInValid(nb, farBox(level)) && farShadowBlocked(level, nb)) { return 1.0; }
+  let a = abs(rd);
+  let ra = select(select(a.x, a.y, eAx == 1), a.z, eAx == 2);
+  let rx = select(select(a.x, a.y, xAx == 1), a.z, xAx == 2);
+  let margin = (tOut - tIn) * ra * rx * inverseSqrt(max(ra * ra + rx * rx, 1e-8)) * s;
+  let w = 2.0 * tIn * s * FAR_SHADOW_CONE_TAN;
+  return smoothstep(0.0, max(w, 1e-3), margin);
+}
+
+// The cone trace (see THE REACH MUST BE A DISTANCE above). `level0` is the
+// finest level the ray may use — the receiver's own level for a far hit, 1 for
+// the window's continuation — and `tStartFine` is where along the ray from
+// `roFine` it starts: 0 for a far receiver, the window exit for a near one
+// (shadow_resolve.wgsl, sunShadowAt). The level schedule and the reach are
+// both measured from `roFine`, which is what makes a receiver one voxel
+// inside the window face and one cell outside it get the same shadow.
+fn farShadowMarch(level0 : u32, roFine : vec3f, rdIn : vec3f,
+                  tStartFine : f32) -> FarShadowHit {
+  var out : FarShadowHit;
+  out.t = -1.0;
+  out.cov = 0.0;
+  var rd = rdIn;
   if (abs(rd.x) < 1e-6) { rd.x = select(-1e-6, 1e-6, rd.x >= 0.0); }
   if (abs(rd.y) < 1e-6) { rd.y = select(-1e-6, 1e-6, rd.y >= 0.0); }
   if (abs(rd.z) < 1e-6) { rd.z = select(-1e-6, 1e-6, rd.z >= 0.0); }
   let inv = 1.0 / rd;
-  let s = f32(1u << farCellShift(level));
-  let roL = roFine / s;
-  let box = farBox(level);   // the valid box, as traceFar
-  let tt0 = (vec3f(box.lo) - roL) * inv;
-  let tt1 = (vec3f(box.hi) - roL) * inv;
-  let tExit = min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z)));
-
-  // ---- THE SAME NESTED CURSOR traceFar RUNS (2026-09-07) -------------------
-  // An occlusion ray is already ANY-HIT with an immediate exit here (the
-  // `return tCur * s` on the first material cell below): it keeps no nearest
-  // bookkeeping and never walks past a caster. What it did NOT have was cheap
-  // empty space — it re-seeded a whole DDA per empty level chunk and re-read
-  // farOcc on every cell of an occupied one. Reach is TUNE_FAR_SHADOW_REACH
-  // (24 m), which at level 1 is 7.5 level chunks and at level 2 is 3.7, so
-  // most of a sun ray's budget was spent crossing chunks, not testing cells.
-  //
-  // The two other occlusion disciplines a cascade ray could want are already
-  // here or do not apply, and it is worth saying which is which:
-  //   - FACING AWAY FROM THE SUN: the call sites gate on `lambert > 0.0`
-  //     (wrapDiffuse), which is this engine's back-face test — a face past the
-  //     wrap terminator never reaches this function at all. Cutting at
-  //     dot(n,sun) <= 0 instead would not save a ray that is cast today, it
-  //     would RESHADE the wrapped band, so it belongs to lighting, not to
-  //     traversal.
-  //   - A WORLD CEILING: the row skip below IS that test, at chunk
-  //     granularity and from data that already exists (farOccTop). A ray above
-  //     a chunk's highest non-empty row and climbing is done with the chunk
-  //     without touching a cell. A far shadow ray STARTS on a far surface, so
-  //     a global above-the-terrain test could never fire for it.
   let stepv = vec3<i32>(sign(rd));
   let tDelta = abs(inv);
+  let reachF = TUNE_FAR_SHADOW_REACH / VOXEL_METERS;
+  var tF = tStartFine;
+  var budget = FAR_SHADOW_STEP_CAP;
 
-  var tCur = 0.0;
-  var cc = worldChunkOf(vec3<i32>(floor(roL)));
-  var cNext : vec3f;
-  for (var a = 0; a < 3; a++) {
-    let b = f32((cc[a] + select(0, 1, rd[a] > 0.0)) * i32(CHUNK));
-    cNext[a] = (b - roL[a]) * inv[a];
-  }
-  var budget = farShadowSteps(level);
-  while (budget > 0) {
-    rsAdd(RS_FAR_SHADOW, 1u);
-    budget -= 1;
-    if (!farInValid(cc * i32(CHUNK), box)) { return -1.0; }
-    if (tCur >= tExit) { return -1.0; }
-    let tOut = min(cNext.x, min(cNext.y, cNext.z));
-    let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
-    if (occ != 0u) {
-      // The row skip (traceFar has the full note): a sun ray that has climbed
-      // above the chunk's highest non-empty row cannot be blocked in it.
-      var tIn = tCur;
-      var walk = true;
-      let top = farOccTop(occ);
-      if (top != 0u) {
-        let yTop = cc.y * i32(CHUNK) + i32(top);
-        let yEnter = roL.y + rd.y * (tIn + 1e-4);
-        if (yEnter >= f32(yTop)) {
-          if (rd.y >= 0.0) {
-            walk = false;
-          } else {
-            let tPlane = max((f32(yTop) - roL.y) * inv.y, tIn);
-            if (tPlane + 1e-4 >= tOut) { walk = false; }
-            else { tIn = tPlane + 1e-4; }
+  for (var level = level0; level <= FAR_LEVELS; level++) {
+    if (tF >= reachF || budget <= 0) { break; }
+    let s = f32(1u << farCellShift(level));
+    let tEndF = select(min(reachF, FAR_SHADOW_SEG_CELLS * s), reachF,
+                       level == FAR_LEVELS);
+    if (tEndF <= tF) { continue; }   // this level's stretch is already behind
+    let roL = roFine / s;
+    let box = farBox(level);   // the valid box, as traceFar
+    let tt0 = (vec3f(box.lo) - roL) * inv;
+    let tt1 = (vec3f(box.hi) - roL) * inv;
+    let tExit = min(min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z))),
+                    tEndF / s);
+
+    // ---- THE SAME NESTED CURSOR traceFar RUNS (2026-09-07) -----------------
+    // An occlusion ray is ANY-HIT with an immediate exit (the return on the
+    // first material cell below): it keeps no nearest bookkeeping and never
+    // walks past a caster. Empty space is cheap: one farOcc read per level
+    // CHUNK, and the row skip drops a ray that has climbed above a chunk's
+    // highest non-empty row straight out of it.
+    //
+    // The two other occlusion disciplines a cascade ray could want are already
+    // here or do not apply, and it is worth saying which is which:
+    //   - FACING AWAY FROM THE SUN: the call sites gate on `lambert > 0.0`
+    //     (wrapDiffuse), which is this engine's back-face test — a face past the
+    //     wrap terminator never reaches this function at all.
+    //   - A WORLD CEILING: the row skip below IS that test, at chunk
+    //     granularity and from data that already exists (farOccTop).
+    var tCur = tF / s;
+    var cc = worldChunkOf(vec3<i32>(floor(roL + rd * tCur)));
+    var cNext : vec3f;
+    for (var a = 0; a < 3; a++) {
+      let b = f32((cc[a] + select(0, 1, rd[a] > 0.0)) * i32(CHUNK));
+      cNext[a] = (b - roL[a]) * inv[a];
+    }
+    // The axis the ray crossed into the current CHUNK through; -1 until the
+    // first crossing (a level's first chunk is entered mid-air, not through a
+    // face). Only the penumbra estimate reads it.
+    var cAx = -1;
+    while (budget > 0) {
+      rsAdd(RS_FAR_SHADOW, 1u);
+      budget -= 1;
+      if (!farInValid(cc * i32(CHUNK), box)) { break; }   // a coarser level takes it
+      if (tCur >= tExit) { break; }
+      let tOut = min(cNext.x, min(cNext.y, cNext.z));
+      let occ = farOcc[farOccIndex(level, cc * i32(CHUNK))];
+      if (occ != 0u) {
+        // The row skip (traceFar has the full note): a sun ray that has climbed
+        // above the chunk's highest non-empty row cannot be blocked in it.
+        var tIn = tCur;
+        var eAx = cAx;
+        var walk = true;
+        let top = farOccTop(occ);
+        if (top != 0u) {
+          let yTop = cc.y * i32(CHUNK) + i32(top);
+          let yEnter = roL.y + rd.y * (tIn + 1e-4);
+          if (yEnter >= f32(yTop)) {
+            if (rd.y >= 0.0) {
+              walk = false;
+            } else {
+              let tPlane = max((f32(yTop) - roL.y) * inv.y, tIn);
+              if (tPlane + 1e-4 >= tOut) { walk = false; }
+              else { tIn = tPlane + 1e-4; eAx = 1; }
+            }
+          }
+        }
+        if (walk) {
+          let cLo = cc * i32(CHUNK);
+          var vCur = tIn;
+          var vc = clamp(vec3<i32>(floor(roL + rd * (tIn + 1e-4))),
+                         cLo, cLo + vec3<i32>(i32(CHUNK) - 1));
+          var vMax : vec3f;
+          for (var a = 0; a < 3; a++) {
+            let boundary = f32(vc[a]) + select(0.0, 1.0, rd[a] > 0.0);
+            vMax[a] = (boundary - roL[a]) * inv[a];
+          }
+          for (var j = 0; j < 3 * i32(CHUNK); j++) {
+            if (budget <= 0) { break; }
+            rsAdd(RS_FAR_SHADOW, 1u);
+            budget -= 1;
+            if (farShadowBlocked(level, vc)) {
+              out.t = vCur * s;
+              out.cov = farShadowCover(level, vc, eAx, vCur, vMax, rd, stepv, s);
+              return out;
+            }
+            if (vMax.x < vMax.y && vMax.x < vMax.z) {
+              vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x; eAx = 0;
+            } else if (vMax.y < vMax.z) {
+              vc.y += stepv.y; vCur = vMax.y; vMax.y += tDelta.y; eAx = 1;
+            } else {
+              vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z; eAx = 2;
+            }
+            if (vCur >= tOut || vCur >= tExit) { break; }
           }
         }
       }
-      if (walk) {
-        let cLo = cc * i32(CHUNK);
-        var vCur = tIn;
-        var vc = clamp(vec3<i32>(floor(roL + rd * (tIn + 1e-4))),
-                       cLo, cLo + vec3<i32>(i32(CHUNK) - 1));
-        var vMax : vec3f;
-        for (var a = 0; a < 3; a++) {
-          let boundary = f32(vc[a]) + select(0.0, 1.0, rd[a] > 0.0);
-          vMax[a] = (boundary - roL[a]) * inv[a];
-        }
-        for (var j = 0; j < 3 * i32(CHUNK); j++) {
-          if (budget <= 0) { break; }
-          rsAdd(RS_FAR_SHADOW, 1u);
-          budget -= 1;
-          if (farShadowBlocked(level, vc)) { return vCur * s; }
-          if (vMax.x < vMax.y && vMax.x < vMax.z) {
-            vc.x += stepv.x; vCur = vMax.x; vMax.x += tDelta.x;
-          } else if (vMax.y < vMax.z) {
-            vc.y += stepv.y; vCur = vMax.y; vMax.y += tDelta.y;
-          } else {
-            vc.z += stepv.z; vCur = vMax.z; vMax.z += tDelta.z;
-          }
-          if (vCur >= tOut || vCur >= tExit) { break; }
-        }
+      // Re-derived, not accumulated — see the note on traceFar's chunk cursor.
+      if (cNext.x <= cNext.y && cNext.x <= cNext.z) {
+        tCur = cNext.x; cc.x += stepv.x; cAx = 0;
+        cNext.x = (f32((cc.x + max(stepv.x, 0)) * i32(CHUNK)) - roL.x) * inv.x;
+      } else if (cNext.y <= cNext.z) {
+        tCur = cNext.y; cc.y += stepv.y; cAx = 1;
+        cNext.y = (f32((cc.y + max(stepv.y, 0)) * i32(CHUNK)) - roL.y) * inv.y;
+      } else {
+        tCur = cNext.z; cc.z += stepv.z; cAx = 2;
+        cNext.z = (f32((cc.z + max(stepv.z, 0)) * i32(CHUNK)) - roL.z) * inv.z;
       }
     }
-    // Re-derived, not accumulated — see the note on traceFar's chunk cursor.
-    if (cNext.x <= cNext.y && cNext.x <= cNext.z) {
-      tCur = cNext.x; cc.x += stepv.x;
-      cNext.x = (f32((cc.x + max(stepv.x, 0)) * i32(CHUNK)) - roL.x) * inv.x;
-    } else if (cNext.y <= cNext.z) {
-      tCur = cNext.y; cc.y += stepv.y;
-      cNext.y = (f32((cc.y + max(stepv.y, 0)) * i32(CHUNK)) - roL.y) * inv.y;
-    } else {
-      tCur = cNext.z; cc.z += stepv.z;
-      cNext.z = (f32((cc.z + max(stepv.z, 0)) * i32(CHUNK)) - roL.z) * inv.z;
-    }
+    // Hand over where this level stopped: its stretch's end, its valid box's
+    // face, or the chunk the budget ran out in. min() because a chunk step can
+    // overshoot the stretch's end by most of a chunk, and the coarser level
+    // must not skip that piece.
+    tF = max(tF, min(tCur, tExit) * s);
   }
-  return -1.0;
+  return out;
 }
 
 fn farShadowed(level : u32, roFine : vec3f) -> bool {
-  return farShadowDist(level, roFine) >= 0.0;
+  return farShadowMarch(level, roFine, keyLightDir(), 0.0).t >= 0.0;
 }
 
 // ---- far-field ambient occlusion: voxelAO's rule over cascade cells ----------
@@ -4868,7 +4974,7 @@ fn farShadowed(level : u32, roFine : vec3f) -> bool {
 // front of the face, the corner the hit leans into, ramped by the hit's
 // position in the face. Occluders are MATERIAL cells only, never the
 // conservative blocker flag: the flag sits on the whole row above a surface
-// whenever the ground is in the surface cell's upper half (see farShadowDist),
+// whenever the ground is in the surface cell's upper half (see farShadowMarch),
 // and taken as an occluder it darkened every far terrace tread to the full AO
 // depth. Micro plants are no longer in the cascade at all, so grass cannot
 // stamp AO onto a meadow here any more than it can inside (isRayBlocker).
@@ -5808,7 +5914,15 @@ fn sunShadowFar(hp : vec3f, n : vec3f, camDistFine : f32) -> f32 {
   return 1.0;
 }
 
-fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
+// `beyondWindow` continues an unblocked ray into the cascade from where it
+// leaves the residency window — the continuation shadow_resolve.wgsl runs for
+// the cached half (its CASTERS OUTSIDE THE WINDOW note). A constant at every
+// call site, so the arm folds away where it is false: the cache-off terrain
+// path passes true (it is the reference --gate shadow-cache compares the cache
+// against), shadeTranslucent's glint passes false and keeps the shipping
+// fragment shader free of a second march.
+fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32,
+               beyondWindow : bool) -> f32 {
   if (camDistFine * VOXEL_METERS > TUNE_SHADOW_MAX_DIST) {
     return sunShadowFar(hp, n, camDistFine);
   }
@@ -5816,10 +5930,15 @@ fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
   // shadow-cache gate asserts it against the compute-stage cast) and none of
   // trace()'s 26-field register footprint, which for a fragment shader is paid
   // by every pixel whether or not this branch runs. See common.wgsl.
-  let s = traceOpaque(hp + n * TUNE_SHADOW_BIAS, keyLightDir(),
-                      TUNE_SHADOW_STEPS, shadowCoarseFromT(),
+  let ro = hp + n * TUNE_SHADOW_BIAS;
+  let s = traceOpaque(ro, keyLightDir(), TUNE_SHADOW_STEPS, shadowCoarseFromT(),
                       &occupancy, &materials);
   rsAdd(RS_SHADOW, s.steps);
+  if (beyondWindow && !s.hit && s.steps <= u32(TUNE_SHADOW_STEPS)) {
+    let f = farShadowMarch(1u, ro, keyLightDir(),
+                           shadowWindowExitT(ro, keyLightDir()));
+    if (f.t >= 0.0) { return shadowFromOpaqueHit(true, f.t, 0u); }
+  }
   // The softening law itself lives in common.wgsl (shadowFromOpaqueHit) since
   // 2026-09-04, because the raster body path casts the same ray and must land
   // on the same penumbra curve — a body and the ground under it disagreeing
@@ -5835,7 +5954,7 @@ fn sunShadowAt(hp : vec3f, n : vec3f, px : vec2f, camDistFine : f32) -> f32 {
 // translucent-solid path, which is already gated to near ice by its own
 // reflection budget) keep the full-quality near shadow.
 fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
-  return sunShadowAt(hp, n, px, 0.0);
+  return sunShadowAt(hp, n, px, 0.0, false);
 }
 
 // ---- THE CACHED SHADOW (world.h kShadowCacheBuckets) -----------------------
@@ -10575,15 +10694,20 @@ fn fs(in : VSOut) -> FSOut {
         // raster bodies already share; feeding it the far march's distance
         // puts the cascade on the same penumbra curve.
         //
-        // LEVELS 3+ KEEP A FLOOR AT TUNE_SHADOW_FAR_LIFT. At 80 cm cells and
-        // beyond, a caster is mostly a single terrace step and a hard contact
-        // shadow on it renders as the "ant trail" speckle the phase-4 pass
-        // measured; the two near levels (20/40 cm cells, out to ~100 m) are
-        // where the seam is judged and where the near law is right.
-        let sd = farShadowDist(far.level, hp);
-        if (sd >= 0.0) {
-          var sh = shadowFromOpaqueHit(true, sd, 0u);
-          if (far.level >= 3u) { sh = max(sh, TUNE_SHADOW_FAR_LIFT); }
+        // THE EDGE IS SOFT TOO (2026-09-28): `cov` is the fraction of the sun
+        // disc the blocker covers, estimated from where the ray crossed it
+        // (farShadowCover), so a far shadow edge ramps over the near field's
+        // 2 d tan(angle) instead of stepping one cell wide.
+        //
+        // NO PER-LEVEL FLOOR. Levels 3+ used to take max(sh, 0.3) against the
+        // "ant trail" speckle of contact shadows on 80 cm terraces. The
+        // shading-LOD lift below already does that job by PROJECTED size, and
+        // at any ordinary FOV it had lifted every contact shadow to 0.7 long
+        // before level 3 begins (~102 m), so the floor was a no-op there and
+        // a 0.3 step at 102 m under a zoomed FOV. One law, keyed on distance.
+        let fsh = farShadowMarch(far.level, hp, keyLightDir(), 0.0);
+        if (fsh.t >= 0.0) {
+          var sh = mix(1.0, shadowFromOpaqueHit(true, fsh.t, 0u), fsh.cov);
           // Shading LOD (see lodShadeFade): the staircase's contact shadow
           // is an artefact of the sampling at this projected size.
           sh = mix(sh, max(sh, LOD_SHADE_SHADOW_LIFT), lodShadeFade(far.t));
@@ -10826,7 +10950,7 @@ fn fs(in : VSOut) -> FSOut {
           sh = sunShadowFar(hitP, n, h.t);
         }
       } else {
-        sh = sunShadowAt(hitP, n, in.pos.xy, h.t);
+        sh = sunShadowAt(hitP, n, in.pos.xy, h.t, true);
       }
       // Shading LOD: contact shadows lift with projected size (see
       // lodShadeFade); a real cast shadow is already above the lift.
