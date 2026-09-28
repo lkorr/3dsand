@@ -1497,18 +1497,10 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
   }
   SubmitWorldgen(ctx, world, sim, kDefaultSeed);
   ctx.WaitIdle();
-  FarField far;
-  far.Init(&world);
-  far.FullRefill(IVec3{8, 3, 8});
-  uint32_t n;
-  while ((n = far.PrepareTick(ctx.queue)) > 0) {
-    TickParams tp{0, kDefaultSeed, 0, 0};
-    tp.farCount = n;
-    ctx.queue.WriteBuffer(world.tickUBO, 0, &tp, sizeof(tp));
-    rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
-    sim.EncodeFarFill(enc, n);
-    ctx.queue.Submit(enc.Finish());
-  }
+  // Centred on the WINDOW's centre chunk, as play centres it on the player.
+  // This was a literal {8, 3, 8} from the kNChunk = 16 era — a quarter of the
+  // way into today's window and 13 chunks below its centre.
+  sandvox::RefillFarAround(ctx, world, sim, sandvox::WindowCentreChunk(world));
   // THE SUN BEFORE THE SETTLE TICKS. The openness walk (sim_openness.wgsl)
   // reads RenderParams for the key light when it deposits its off-screen
   // irradiance sample (docs/PLAN_gi.md §3), and 120 ticks of refresh cover
@@ -2359,6 +2351,78 @@ int RunShots(GpuContext& ctx, World& world, Simulation& sim) {
     // sits 2 under the lowest rim sample, the centre TUNE_POND_DEPTH below it.
     render({(float)(kPx - 30), (float)(rim - 10), (float)(kPz - 30)}, 0.785f,
            0.04f, "screenshot_pond_sub.bmp");
+  }
+
+  // ---- THE LOD SEAM AT EYE HEIGHT (2026-09-28, LOD-seam overhaul P0) ----
+  //
+  // Where the residency window's box face hands the fine march off to the far
+  // cascade, seen from where a player stands: 1.7 m over the ground, window
+  // AND far field centred on the eye exactly as Stream / FarField centre them
+  // in play (sandvox::CentreWindowOnEye), so the face is 25.6 m ahead along an
+  // axis and ~36 m toward a box corner — not wherever the harness origin put
+  // it. Every other frame here either looks down from well above the ground
+  // or stands in a window centred somewhere else, so none of them shows the
+  // seam at its in-game distance. The poses are shared with the `seam` /
+  // `seamveg` --render-budget cameras, so the frame judged is the frame timed.
+  //   _x     level down +x, the flattest pad column (bare sand): face 25.6 m ahead
+  //   _diag  level toward the (-x,+z) box corner: face vs corner asymmetry
+  //   _low   +x pitched down 0.08: the ground band 10-60 m fills the frame
+  //   _veg   level down +x at the nearest meadow to the spawn: plants across
+  //          the seam (the harness pad refuses all cover)
+  //   _x_mask, _diag_mask  _x / _diag with the far march off: beyond the
+  //          face is fog, so the pair locates the handoff line exactly
+  // LAST in RunShots and skipped whole unless one of them is wanted: each site
+  // is a worldgen + a full far refill, and nothing after this needs restoring.
+  if (ShotWanted("screenshot_seam_x") || ShotWanted("screenshot_seam_diag") ||
+      ShotWanted("screenshot_seam_low") || ShotWanted("screenshot_seam_veg") ||
+      ShotWanted("screenshot_seam_x_mask") ||
+      ShotWanted("screenshot_seam_diag_mask")) {
+    const sandvox::SeamPose plain = sandvox::SeamPlainPose();
+    std::printf("seam site: (%d,%d) ground y=%d eye y=%.1f -- %s\n", plain.x,
+                plain.z, plain.ground, plain.ey, plain.what);
+    sandvox::CentreWindowOnEye(ctx, world, sim, plain.ex, plain.ey, plain.ez,
+                               120);
+    const Vec3 pe{plain.ex, plain.ey, plain.ez};
+    render(pe, 0.0f, 0.0f, "screenshot_seam_x.bmp");
+    render(pe, 2.356f, 0.0f, "screenshot_seam_diag.bmp");
+    render(pe, 0.0f, -0.08f, "screenshot_seam_low.bmp");
+    // Where the face IS, as arithmetic: the window spans chunks
+    // [origin, origin + kNChunk), so the +x face is at (origin.x + kNChunk)*16.
+    {
+      const IVec3 o = world.WindowOrigin();
+      const float fx = (float)((o.x + (int)kNChunk) * (int)kChunk) - plain.ex;
+      const float fzp = (float)((o.z + (int)kNChunk) * (int)kChunk) - plain.ez;
+      const float fxm = plain.ex - (float)(o.x * (int)kChunk);
+      std::printf("seam geometry: window origin chunk (%d,%d,%d); +x face %.1f m "
+                  "ahead; (-x,+z) corner %.1f m away (faces %.1f / %.1f m)\n",
+                  o.x, o.y, o.z, fx * 0.1f,
+                  std::sqrt(fxm * fxm + fzp * fzp) * 0.1f, fxm * 0.1f,
+                  fzp * 0.1f);
+    }
+    // _x_mask / _diag_mask: the SAME two frames with the far march off
+    // (render.farSteps 0, --render-budget's `nofar` arm), so every ray that
+    // leaves the window is fog/sky. Diffed against _x / _diag it is a pixel-
+    // exact map of where the handoff line falls — the seam, located without
+    // having to spot it. Costs a shader reload each way, so only when asked.
+    if (ShotWanted("screenshot_seam_x_mask") ||
+        ShotWanted("screenshot_seam_diag_mask")) {
+      const Tuning saved = CurrentTuning();
+      Tuning tm = saved;
+      tm.render.farSteps = 0;
+      SetCurrentTuning(tm);
+      sim.ReloadShaders(ctx.device);
+      render(pe, 0.0f, 0.0f, "screenshot_seam_x_mask.bmp");
+      render(pe, 2.356f, 0.0f, "screenshot_seam_diag_mask.bmp");
+      SetCurrentTuning(saved);
+      sim.ReloadShaders(ctx.device);
+    }
+    if (ShotWanted("screenshot_seam_veg")) {
+      const sandvox::SeamPose veg = sandvox::SeamVegPose();
+      std::printf("seam veg site: (%d,%d) ground y=%d eye y=%.1f -- %s\n",
+                  veg.x, veg.z, veg.ground, veg.ey, veg.what);
+      sandvox::CentreWindowOnEye(ctx, world, sim, veg.ex, veg.ey, veg.ez, 120);
+      render({veg.ex, veg.ey, veg.ez}, 0.0f, 0.0f, "screenshot_seam_veg.bmp");
+    }
   }
   // A hazard report with no message pop is a hazard report that goes nowhere:
   // the debug messenger collects continuously, but only the F5-reload scope
@@ -4709,7 +4773,7 @@ int main(int argc, char** argv) {
           "  --perf-out <path>     Where --perf writes its JSON\n"
           "  --perf-w/--perf-h <n> Offscreen render size for --perf/--render-budget\n"
           "  --render-budget       Where INSIDE the raymarch the GPU frame went\n"
-          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire; default all)\n"
+          "  --budget-cams <list>  --render-budget cameras (noon,dusk,cascade,submerged,meadow,canopy,fire,seam,seamveg; default all)\n"
           "  --shader-stats        Per-shader registers/spills from the driver\n"
           "                        -> build/shader_stats.json (headless)\n\n"
           "Residency:\n"
