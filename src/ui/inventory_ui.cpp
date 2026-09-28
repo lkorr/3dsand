@@ -2005,6 +2005,15 @@ constexpr float kBenchColW = 340.0f;   // the bench panel's left column
 // column fits -- the picture is pixel art and a fractional scale would smear
 // it. The pointer over the picture goes back as sim pixels (y up).
 namespace {
+// `t` cut to fit `maxW` pixels in the current font, ".." on the end when cut
+// (owner, 2026-09-27: the bench column's text ran under the table).
+std::string FitText(const std::string& t, float maxW) {
+  if (ImGui::CalcTextSize(t.c_str()).x <= maxW) return t;
+  std::string c = t;
+  while (!c.empty() && ImGui::CalcTextSize((c + "..").c_str()).x > maxW) c.pop_back();
+  while (!c.empty() && c.back() == ' ') c.pop_back();
+  return c + "..";
+}
 void BenchParts(ImDrawList* dl, ImVec2 at, float w,
                 const std::vector<UIState::AlchemyUI::Portion>& parts, int cap,
                 float& y) {
@@ -2024,10 +2033,9 @@ void BenchParts(ImDrawList* dl, ImVec2 at, float w,
     dl->AddRectFilled(ImVec2(at.x, y + 2), ImVec2(at.x + 12, y + 14), p.color | 0xFF000000u);
     dl->AddRect(ImVec2(at.x, y + 2), ImVec2(at.x + 12, y + 14), ui::ColInk());
     char b[96];
-    std::snprintf(b, sizeof b, "%s", p.name.c_str());
-    dl->AddText(ImVec2(at.x + 20, y), ui::ColParch(), b);
     std::snprintf(b, sizeof b, "%d", (p.eighths + 7) / 8);
     const ImVec2 ts = ImGui::CalcTextSize(b);
+    dl->AddText(ImVec2(at.x + 20, y), ui::ColParch(), FitText(p.name, w - 20 - ts.x - 10).c_str());
     dl->AddText(ImVec2(at.x + w - ts.x, y), ui::ColGoldPale(), b);
     y += lineH + 4;
   }
@@ -2082,7 +2090,8 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     if (ui::Button("##benchhand", ImVec2(colX, y), "hand", A.tool == 0, bw)) A.tool = 0;
     if (ImGui::IsItemHovered())
       Tip("Pick up any vessel on the bench and carry it; the wheel (or Q / E) tilts it. "
-          "Let go and it is set down upright. Click a vessel in the list to put it on "
+          "Let go and it is set down upright. Click a vessel's MOUTH to put a stopper in "
+          "or take it out. Click a vessel in the list to put it on "
           "the bench or take it off - two at a time, one for each hand.");
     if (ui::Button("##benchstick", ImVec2(colX + bw + 8, y), "stick", A.tool == 1, bw)) A.tool = 1;
     if (ImGui::IsItemHovered())
@@ -2109,7 +2118,7 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
   }
   // The vessel in hand (or last touched).
   if (!A.focusName.empty()) {
-    dl->AddText(ImVec2(colX, y), ui::ColGold(), A.focusName.c_str());
+    dl->AddText(ImVec2(colX, y), ui::ColGold(), FitText(A.focusName, colW).c_str());
     y += lineH + 6;
     BenchParts(dl, ImVec2(colX, y), colW, A.focusParts, A.focusCap, y);
     // Its devices, in words, and the pressure when it is stoppered.
@@ -2123,7 +2132,8 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
       dev += hb;
     }
     if (!dev.empty()) {
-      dl->AddText(ImVec2(colX, y), A.focusHeat > 0.35f ? ui::ColEmber() : Fade(ui::ColParch(), 0.8f), dev.c_str());
+      dl->AddText(ImVec2(colX, y), A.focusHeat > 0.35f ? ui::ColEmber() : Fade(ui::ColParch(), 0.8f),
+                  FitText(dev, colW).c_str());
       y += lineH + 4;
     }
     if (A.focusStoppered) {
@@ -2140,16 +2150,25 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
       y += lineH + 8;
     }
   } else {
-    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.6f), "point at a vessel to see inside it");
+    // Two lines: one does not fit the column.
+    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.6f), "point at a vessel");
+    y += lineH + 2;
+    dl->AddText(ImVec2(colX, y), Fade(ui::ColParch(), 0.6f), "to see inside it");
     y += lineH + 12;
   }
   dl->AddText(ImVec2(colX, y), ui::ColGold(), "YOUR VESSELS");
   y += lineH + 6;
+  // The message at the foot of the column, measured WRAPPED: placed a fixed
+  // two lines up, a third line ran off the panel ("pop - the stopper
+  // flies out" was cut). The rows stop above it.
+  const float msgH = A.message.empty()
+                         ? lineH * 2
+                         : ImGui::CalcTextSize(A.message.c_str(), nullptr, false, colW).y + 4;
   // Every vessel you carry: click to put it on the bench or take it off.
   const float rowH = kSlot + 12;
   for (size_t i = 0; i < A.rows.size(); i++) {
     const auto& r = A.rows[i];
-    if (y + rowH > colBottom - lineH * 2) break;
+    if (y + rowH > colBottom - msgH) break;
     ImGui::SetCursorScreenPos(ImVec2(colX, y));
     ImGui::PushID((int)i);
     const bool hit = ImGui::InvisibleButton("##row", ImVec2(colW, kSlot));
@@ -2168,11 +2187,22 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     const size_t colon = r.label.find(": ");
     const std::string name = colon == std::string::npos ? r.label : r.label.substr(0, colon);
     const std::string what = colon == std::string::npos ? std::string() : r.label.substr(colon + 2);
-    dl->PushClipRect(ImVec2(colX, y - 2), ImVec2(colX + colW, y + kSlot + 8), true);
-    dl->AddText(ImVec2(colX + kSlot + 10, y - 1), hov ? ui::ColGoldPale() : ui::ColParch(),
-                (name + (r.onTable ? "  (on the bench)" : "")).c_str());
-    dl->AddText(ImVec2(colX + kSlot + 10, y + lineH + 1), Fade(ui::ColParch(), 0.65f), what.c_str());
-    dl->PopClipRect();
+    // Fitted to the column, not clipped by it: "(on the bench)" on a row
+    // was cut off under the table. On the bench is now the row's gold wash
+    // and a small tag over the icon; the whole label is the tooltip.
+    const float textX = colX + kSlot + 10, textW = colX + colW - textX;
+    dl->AddText(ImVec2(textX, y - 1), hov ? ui::ColGoldPale() : ui::ColParch(),
+                FitText(name, textW).c_str());
+    dl->AddText(ImVec2(textX, y + lineH + 1), Fade(ui::ColParch(), 0.65f), FitText(what, textW).c_str());
+    if (r.onTable) {
+      ImGui::PushFont(ui::FontSmall());
+      const char* tag = "on bench";
+      const ImVec2 ts = ImGui::CalcTextSize(tag);
+      const ImVec2 t0(colX + (kSlot - ts.x) * 0.5f, y + kSlot - ts.y + 2);
+      dl->AddRectFilled(ImVec2(t0.x - 3, t0.y - 1), ImVec2(t0.x + ts.x + 3, t0.y + ts.y), Fade(ui::ColInk(), 0.85f));
+      dl->AddText(t0, ui::ColGold(), tag);
+      ImGui::PopFont();
+    }
     if (hov) Tip(r.label.c_str());
     if (hit) {
       A.wantToggle = true;
@@ -2185,7 +2215,7 @@ void AlchemyPanel(UIState& s, ImVec2 pos, ImVec2 size, const ui::PanelStyle& st,
     y += lineH + 6;
   }
   if (!A.message.empty()) {
-    ImGui::SetCursorScreenPos(ImVec2(colX, colBottom - 2 * lineH));
+    ImGui::SetCursorScreenPos(ImVec2(colX, colBottom - msgH));
     ImGui::PushTextWrapPos(colX + colW);
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::ColorConvertU32ToFloat4(ui::ColEmber()));
     ImGui::TextUnformatted(A.message.c_str());

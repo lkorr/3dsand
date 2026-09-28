@@ -213,6 +213,7 @@ struct SpellFlash {
 struct ScoopMote {
   Vec3 from;       // cell centre, world voxels
   uint32_t color;  // 0xAABBGGRR
+  uint32_t mat = 0;  // what it is made of: the sprite glows as this does
   uint32_t seed;   // swirl phase, size and flight-time jitter
   int delay;       // ticks until it takes off
   int age;         // ticks in flight

@@ -3362,7 +3362,9 @@ Author in JSON, hot-reload at runtime, compile at load into flat GPU tables.
                "amount": 5, "chance": 90, "consume": 6 } }
   ```
   - `type` names a stain palette slot (shared: two liquids naming the same
-    stain get the same slot and the same look). `amount` is added per contact
+    stain get the same slot and the same look ON THE GROUND; a body draws a
+    coat by its material, see "Every look is the material's"). A `bodyOnly`
+    stain gets a slot 8+ and spends none of the ground's seven. `amount` is added per contact
     and saturates at 15, so repeated contact deepens a stain.
   - `chance` is per-mille per tick to stain one touching face neighbour;
     `consume` is per-mille that the stain then deletes that voxel to air,
@@ -5783,6 +5785,33 @@ touch a creature with a sword, lose a limb, anywhere, every time.
   measured by the gate and removed: no effect at ±2 cm of aim wander, noise at
   ±4 cm. Gate `head-cleave`; `MobSystem::LastCutBite` says why a blow did or did
   not go through.
+- **A thrust is a STAB, not a kerf (2026-09-26).** `BuildStrikeParts`
+  (melee.cpp) calls a blow a stab when the blade travels along itself, hilt →
+  point (cosine ≥ `gore.stabAlign`; above 1 = never). The slot is then a bore:
+  depth along the thrust (`stabDepth + stabDepthPower × power`, NO heft, capped
+  at the blade's length), length ACROSS the blade (`stabWidth` × its authored
+  half-width), thickness the edge's (floor `stabThick`) — the kerf's wedge
+  narrows it to the point. `KerfCut::stab` skips `KerfBite` on both populations
+  (a stab never parts a limb) and the stab lands once per slot per stroke
+  (`EdgeSweep::struck`), because every later tick inside would snap to the
+  bottom of the bore and drive another full depth. Before this a thrust fell
+  into `KerfFrame`'s degenerate branch and bored a sideways sliver. Gate
+  `blade-wounds` sweeps the shipped sword and dagger (slash, stab, stabs-off
+  control) through the real `MeleeSweepDamage`; at 0.8 speed the first blow
+  takes sword 77 / 139 / 36 and dagger 7 / 55 / 1 art voxels. The dagger's
+  SLASH is heft-linear (0.22) and chips under a skin cell — a tuning question,
+  not a bug. The kerf half-thickness floor is `gore.cutWidthMin` (was a literal).
+- **A bleeding wound stays bloody (2026-09-26).** The cut's smear is laid once;
+  while a LIVING limb still owes blood (budget ≥ 1 voxel, or an open stump)
+  `BleedTick` re-lays it every `gore.woundRebloodTicks` round `woundLocal`
+  (`Mob::ReBloodWound`: `SoakCut`'s surface half only, no material rewrite, so
+  it can repeat without eating tissue; 0.5–1 strength by how much is still
+  owed against `woundRebloodFull`). A wound rinsed with water refills with
+  blood while it bleeds and stays clean once it stops. `Mob::CutLimb` now sets
+  `woundLocal` to the entry-snapped slot mouth rather than the collider hit.
+  Gate `wound-rebleed` (on vs off, fresh world per arm). The same day the
+  global bleed dials went to 0.5 (`gore.bleedVoxelGain`, `gore.bleedGain`) and
+  now also reach the open-stump top-up and the loose-debris wound path.
   **A blade takes the skull, not the neck** (`Mob::TrimNeckForSever`, called by
   `Sever()` for a blade on a vital limb). The human neck is part of the head
   limb and the torso ends flat at the shoulders, so a decapitation anywhere on
@@ -5817,7 +5846,19 @@ touch a creature with a sword, lose a limb, anywhere, every time.
   it: `dagger` 0.22x, `shortsword` 0.62x, `sword` 1.0x, `cleaver` 1.85x, against
   a `HeftFactor` floor of 0.2 and a `gore.woundHeftMax` ceiling of 4.0. The
   small pair is what makes the floor reachable — "a knife needs sustained work"
-  was an unexercised branch until a knife existed.
+  was an unexercised branch until a knife existed. **The three blades now PIN
+  those factors** (`heft` in items.json, 2026-09-27): re-authored at 80 art
+  voxels/metre with a real section (one-cell edge, three-cell flats, fullers,
+  `scripts/bladesmith.py`), a blade's voxel volume stopped meaning its weight —
+  the sword would have measured 3.6, not 5.3, and lost a third of its cut to a
+  look change. Volume stays the derivation for everything authored as a solid
+  (cleaver, mace). Their sidecars also carry `edge.line`, the point across the
+  section the cutting segment runs through; without it the segment rides the
+  model's min corner, which a crossguard wider than the blade walks further off
+  the steel. It is set to where the 40/m corner line WAS — (+0.75, -0.5) world
+  voxels off the sword's axis — so the re-art moved no hit (14 weapon gates
+  line-for-line identical to a data-only control arm). Moving it onto the axis
+  is the correct geometry and a separate, gameplay-visible change.
 - **What survives of the three instant severs.** The joint-proximity rule is
   deleted outright. `severImpactSpeed` remains as an extreme-speed exception
   scaled by `gore.woundImpactSeverScale`, because the authored 9–20 voxels/sec
@@ -6156,9 +6197,9 @@ because rung 3 read "pulped" off the blood coat, a wash reset how far a beating
 had got. It is now a 4-bit LEVEL on the fine-skin voxel itself — the padding
 byte after `PrefabVoxel::color`, so nothing grew — 1..14 a deepening
 contusion and 15 (`kBruiseBroken`) skin that has split. The micro brick's stain
-lattice went from a byte to 16 bits per cell (coat low, bruise high, same
-`slot << 4 | amt` shape through `MicroBodySet::bruiseSlot` = `gore.bruiseMat`'s
-stain slot), and `microbody.wgsl` tints the bruise into the albedo BEFORE the
+lattice went from a byte to 16 bits per cell (coat low, bruise high), and on
+2026-09-27 to a word per cell, each half a `PackBodyStain(material, amount)`
+(the bruise's material is `MicroBodySet::bruiseMat` = `gore.bruiseMat`), and `microbody.wgsl` tints the bruise into the albedo BEFORE the
 coat, so every coat lands on it and comes off it without touching it. It heals
 on a LIVING creature only, a level per `skin_bruised` `coat.decay` down to its
 `decayFloor` (`Mob::HealBruises`); the dead keep their bruises, and a split
@@ -6733,10 +6774,10 @@ on a body, where there is no cell and the stain IS the substance. Seven looks
 are not seven substances: a future nullifier and blood may share a ground
 colour and must still be told apart on a hand. So the body stain is now a
 `uint16_t` -- 12-bit MATERIAL id, 4-bit amount (`voxload.h` `BodyStain*`) --
-and the ground's slot is DERIVED from it where a look is needed: the micro
-brick's render lattice stays one byte and `microbody.cpp` converts through
-`MicroBodySet::stainSlotOfMat`, refilled at every materials load, so
-`microbody.wgsl` did not change. A dry floor stain rubbing onto a foot goes the
+and the ground's slot is DERIVED from it where a ground look is needed. (The
+micro brick's render lattice narrowed it to the slot too, until 2026-09-27;
+it now carries the coat word itself and draws by material -- "Every look is
+the material's".) A dry floor stain rubbing onto a foot goes the
 other way through `matOfStainType_` (the first material registered with that
 slot). The width change bumped the MOBS and DBRS save versions once.
 
@@ -6851,8 +6892,8 @@ on a character neither showed nor dissolved anything. Two gaps: acid had no
 `stain` block, so every coat write (pour, splash, contact) refused it; and a
 coat could not act on the voxel under it -- only a GRID cell of acid could,
 through `BurnOneLimb`'s inbound pass. Now:
-- **`"bodyOnly": true` on a LIQUID's stain** gives it a palette slot for
-  bodies and NO type bits in the GPU `stainPack`, so no kernel ever marks the
+- **`"bodyOnly": true` on a LIQUID's stain** gives it a slot for bodies
+  (8+ since 2026-09-27, outside the ground's seven) and NO type bits in the GPU `stainPack`, so no kernel ever marks the
   ground with it (`sim_step` doStaining, the particle landing and the fluid
   seam all gate on those bits). `MaterialDef::stainSlot` is the slot; read it,
   not the pack, wherever the question is "how is this drawn". The world hash is
@@ -6898,8 +6939,8 @@ through `BurnOneLimb`'s inbound pass. Now:
   ticks. A corrosive contact asks the worn-shell probe first (`StainTick` now
   sets it up as `BurnTick` does), so acid does not coat skin under a plate.
 - **The look**: `coat.opacity` 0.5, and `coat.glow` / `coat.pulse` (Hz) are
-  mirrored into the stain palette entry's spare `_r2` word (materials.h
-  `kCoatGlow*`); `microbody.wgsl` `bodyCoatGlow` adds emission and
+  packed into the material's own uploaded `_r3` word (materials.h
+  `kCoatGlow*`; it was the stain palette entry's `_r2` until 2026-09-27); `microbody.wgsl` `bodyCoatGlow` adds emission and
   `bodyStainTint` breathes the cover 70-100% on the same wave.
 Gate `acid-coat` (pose ticks only): acid over blood coats 720 surface voxels,
 the limb goes 1344 -> ~400 (skin + flesh, bone left, limb stays on), the blood
@@ -6996,7 +7037,9 @@ is who pays -- the coat does, level by level.
   enchanted water heals whoever stands in it while they stand in it -- the
   pool's matter, as an acid bath keeps eating. The living only; the dead do
   not heal. Severed limbs are not regrown (no lattice to fill).
-- **The stain palette is FULL, so the enchanted liquids SHARE a slot**:
+- **(SUPERSEDED 2026-09-27 -- see "Every look is the material's" below: the
+  enchanted liquids have their own stains now.) The stain palette is FULL, so
+  the enchanted liquids SHARE a slot**:
   enchanted blood takes `blood`'s, enchanted water `wet`'s. On the ground a
   stain is only a slot, and its look, drying clock and coat material are the
   FIRST claimant's (`Simulation::UploadTables` -- colour and glow were
@@ -7006,10 +7049,34 @@ is who pays -- the coat does, level by level.
   names the MATERIAL (`PrefabVoxel::stain`), so every gameplay reader tells
   them apart; only the renderer sees the shared slot. Enchanted water is NOT a
   washer: a washer wicks into its neighbours at half depth (`WetOneLimb`),
-  which would mint healing levels from nothing. The clean way to give them a
-  look of their own is a second 8-entry body-only palette (the micro brick's
-  coat byte already has four slot bits; world.h has no room reserved) --
-  not done.
+  which would mint healing levels from nothing.
+
+**Every look is the material's (2026-09-27).** The owner's report: enchanted
+blood on a body looked exactly like blood, and scooped fairy dust stopped
+glowing in flight. Both were one bug: somewhere between the material and the
+pixel a path dropped the material and kept a stand-in. The rule now is that
+every path that draws matter draws it from the MATERIAL's own row, so a new
+material needs no per-mode code:
+- **Body coats** are drawn by material. The micro brick's stain lattice is a
+  word per cell whose halves are body coat words (`PackBodyStain`: material +
+  amount; coat low, bruise high); `microbody.wgsl` reads `materials[mat]
+  .stainColor` (coat opacity in its alpha) and the material's own uploaded
+  `_r3` coat glow word. The 3-bit ground slot never reaches a body.
+- **Coat glow defaults to the material's `emission`** (`ParseStain`); an
+  authored `coat.glow` overrides. Enchanted blood glows as a coat because the
+  liquid glows.
+- **Ground stains**: the voxel word has 3 stain-type bits, so the ground has
+  7 looks and that is a hard ceiling. `bodyOnly` stains (lava, acid, bruise)
+  no longer spend them (`StainRegistry` gives them slots 8+), which freed the
+  room for `enchanted_water` / `enchanted_blood` to author their own stain
+  types. 6 of 7 are used. A glowing ground stain shines by its slot's coat
+  glow (`raymarch.wgsl stainGlow`, primary rays only). The 8th ground stain
+  type is a load error; past that, a new ground look needs a sparse side
+  layer, not more bits.
+- **Sprites that are matter** carry `Sprite::mat` (world.h): `vsSprite` adds
+  that material's emission through `burnTint`, as `vsParticle` does. Scoop /
+  apply motes set it. **MPM fluid particles** (`vsFluid`) do the same off
+  their particle's material (they drew at emission 0 before).
 - **The look**: a healing step lifts one micro mote of the coat material
   (emissive) off the first (lowest-hash) cell it rebuilt -- as scattered as
   the cells, ten a second while it works -- flagged `kPFlagDrip` so it falls
@@ -16584,9 +16651,10 @@ to 16 portions since 2026-09-26), are part of the merge key (a flask of blood
 must not fold into a stack of empties), and persist through `PLYR` v6 (v8 for a
 mixture), `ITMS` v3 (v5), a drop and an R reload.
 
-**Hands up, a vessel selected in the hotbar, nothing drawn** (`FrameIntent::
-vesselSlot`): RMB scoops, LMB pours, the flask is held in the rig slot a sword
-would borrow, and the unarmed compass is off. Both directions go through the
+**A vessel in a hand** (a kit hand slot since dual wielding; see *Two
+hands*): that hand's button (LMB right, RMB left) pours, scoops or applies by
+the hand's mode (F cycles it), the flask is held in the rig slot a sword
+would borrow, and that hand does not punch. Both directions go through the
 MutationQueue:
 
 - **A scoop is a list of CONDITIONAL CLEARS** (`CellOpClearIfMat`: kCellOpIfAir
@@ -16737,8 +16805,14 @@ before submit; the `TickAuthorityCtx::ground` registry) breaks any vessel with
 the last step whose closing speed reaches it -- relative speed, so the flask
 hitting a wall and a rock hitting a resting flask are one test -- or a velocity
 jump of that size in one tick, which covers what the contact list cannot see
-(capped per step, blind to the player) and a blast. Free fall adds g/30 a tick
-and never qualifies. The body is destroyed and its contents become a
+(capped per step, blind to the player). Free fall adds g/30 a tick
+and never qualifies. A BLAST is not left to that witness: the crater carve
+(`DamageBodiesRadial`) runs before the impulse and would take the body -- and,
+through OnBodyGone, the registry entry that is the only record of its
+contents -- so `ContainerBlastPass` runs first, beside each of this machine's
+explosions in phase K, and bursts every vessel (glass or leather; `breakSpeed`
+is about knocks) whose centre is within the crater radius + 2 voxels, into the
+same `ContainerSpill` with the blast's shove as its velocity. The body is destroyed and its contents become a
 `ContainerSpill` at its centre of mass, drained by `ContainerSpillStep` through
 the same two roads as the pour (MPM fluid per eighth for seam liquids, grid
 particles per cell otherwise) in a ball of the contents' own volume, nudged off
@@ -16755,7 +16829,9 @@ the ledger, pour conserved counting grid + MPM -- a splash excites landed water
 into MPM particles for a while, which a grid-only count reads as a loss), and
 `vessel-break` (real Jolt on a stone table: a flask set down from two voxels
 survives the whole fixture, one thrown down at full draw breaks and spills all
-1024 eighths, one lying still breaks when a flying stone hits it).
+1024 eighths, one lying still breaks when a flying stone hits it, and a blast
+between a pouch of sand and a flask of water bursts both and spills all 1280
+eighths while the far flask stays whole).
 
 
 **What is in it, visibly** (2026-09-26; owner: "flasks are tinted / contain the
@@ -16860,11 +16936,32 @@ grantkot.com/ll -- not MLS-MPM, which is heavier and buys nothing at this scale.
   floats.
 - Moving into liquid shoves that pixel's particles into the pixel the grain
   left.
-- Grains are walls to the liquid. A particle that ends a step in a grain's
-  pixel is pulled back along its own path, not teleported; teleporting
-  pumped energy into every liquid above a sand bed.
+- RESTING grains are walls to the liquid. A particle that ends a step in a
+  grain's pixel is pulled back along its own path, not teleported;
+  teleporting pumped energy into every liquid above a sand bed. One BURIED
+  there (a grain was moved onto it) SEEPS OUT to the nearest free pixel
+  reached through the grains, within ~10 px; only past that is the grain
+  shoved instead. Shoving first churned a tilted flask's sand bed into a
+  sponge of liquid and air.
 - The stirring stick FLINGS the grains it touches. They move ballistically,
   dragged by the liquid, until they slow.
+- A GRAIN IN LIQUID that nothing holds up (no resting grain or glass under
+  it; or the liquid running past it; or anywhere outside every vessel) is
+  flung too and RIDES ITS LIQUID (2026-09-27): its velocity, in its vessel's
+  frame, is dragged toward the liquid's, with its weight less the liquid's
+  buoyancy inside a vessel -- the drag rate set so the terminal speed is the
+  CA's settling rate -- and full weight outside, where the liquid is in flight
+  and weightless and nothing settles through it (Maxey-Riley with the
+  fluid's own acceleration). The drag is paid back to the particles round it,
+  equal and opposite in units (`PayDrag`). A grain moving faster than half a
+  pixel a step (or any flung one outside every vessel) is NOT a wall, and
+  moving WITH its liquid it does not shove it. Before this a grain in liquid
+  was a still CA pixel sinking at the settling rate (a tenth of a pixel a
+  step in slime): a falling blob of slime and dirt stood on its own dirt and
+  hovered, and a pour of it clogged the neck (lab: the mixed slime fell 0.48
+  of pure slime's distance; half-empty 2.6x later). A submerged grain also
+  slumps along a 1:2 slope through liquid it sinks in, at the liquid's pace,
+  so a pour does not leave a slime-coated heap on an upturned shoulder.
 
 **Units, and why the tally is exact**: one grain is one pixel of area and one
 unit; `unitsPerEighth` units make an eighth; a particle carries
@@ -16882,7 +16979,29 @@ own, changed by at most `vesselAccel` x gravity a step sideways or up and
 braking in time to stop on it; no outline point moves more than
 `maxVesselStep` px a substep. The liquid feels a vessel's acceleration as a
 tilt of gravity, tan = a/g, so this is what bounds how hard a flick of the
-pointer can throw it: a hand carrying a flask, not a cursor. A move that would
+pointer can throw it: a hand carrying a flask, not a cursor.
+
+**The contents ride the vessel's FRAME** (2026-09-27, `SimConfig::vesselFeel`).
+Each step a vessel's frame is the translation of its interior's centre: a
+velocity, its change, and a WHOLE-PIXEL SHIFT with the sub-pixel remainder
+kept for the next step. Its grains (`CarryGrains`) and its liquid
+(`StepLiquid`, by the inside raster at the start of the step) take that same
+shift, so a carried pile and the liquid in it keep their places pixel for
+pixel; every particle also takes the frame's acceleration less the share it
+FEELS as a fictitious force -- `vesselFeel` (0.5) sideways, the slosh, and
+`vesselFeelLift` (0.1) up and down, which only changes weight -- and its
+speed is capped relative to the frame. Particle velocities stay world
+velocities (the frame's plus their own), so liquid leaving a swung vessel
+flies with it. Before, only the glass moved the liquid while the carry lifted
+the sand: a lift drove the liquid into the sand bed and a shake squeezed it
+like a spring. Measured by the occupied area (grain pixels and pixels within
+1.6 px of a particle) against the same flask at rest, over a lift, shake, tip
+and set-down (gate `alchemy-coherence`): water over sand 11.4% mean / 27%
+worst before, 1.4% / 4.3% after; slime over dirt 11.8% / 26% before, 1.7% /
+4.1% after. The trade is `vesselFeel`: below ~0.45 a hard shake no longer
+mixes water into oil (`alchemy-resort`); at 1.0 the liquid swings +/-40% in
+density. Turning is not carried -- the glass turns round a level liquid and
+sweeps the sand, below. A move that would
 bring its glass into another vessel's (`PoseClear`) slides, and loses the
 refused part of its velocity. The glass keeps each particle on its SIDE --
 inside or outside the outline closed across the mouth, by the polygon test at
@@ -16903,12 +17022,15 @@ landed on is IN the glass; at five, a path along the band made turning flasks
 shuffle the grains on their wall 3-5 px a step) but only a free pixel off it, on the grain's side,
 ends it; each grain remembers the vessel it was last clearly inside (`home`),
 because judged from inside the glass it can read as outside. A vessel also
-CARRIES its grains by its own rigid motion at each grain -- whole for a
-translation, only the upward part while it rotates -- so lifting a flask lifts
-its sand (left to the glass, liquid under a sand bed rode up with the bottom
+CARRIES its grains by its frame's whole-pixel shift (above; the motion of its
+interior's centre, so a turn about its own middle carries nothing) -- so
+lifting a flask lifts its sand (left to the glass, liquid under a sand bed rode up with the bottom
 and blew through the bed) while tipped sand still slides out. A liquid particle
-trapped between rising glass and a bed it cannot pass shoves the grain along
-its pile instead: that is how pressure lifts a bed. A grain rises into
+trapped between rising glass and a bed it cannot pass seeps out through the
+bed (above), and past the seep's reach shoves the grain along its pile: that
+is how pressure lifts a bed. (With the frame carry a lift no longer squeezes
+liquid under a bed at all; the seep mostly serves the sweep of a turning
+flask.) A grain rises into
 heavier liquid ABOVE it (not only liquid in its own pixel, which a packed pile
 never has), so a sand bed under lava inverts. A move that would put glass
 through glass slides (rotation alone, translation alone, half of each) rather
@@ -17073,11 +17195,19 @@ double-clicked with it open got the narrower table. Gate `alchemy-place`.
 owner's "it needs to happen in real time, not all at once when exiting").
 Every bench step drains the sim's spill in WHOLE eighths (`FlaskSim::
 DrainSpilled`; the fraction of an eighth stays in the sim until more joins it,
-so `Count()` still adds up) along with the mean x it left the table at; the
-frame takes it (`AlchemyBench::TakeSpill`) and queues a `ContainerSpill` with
-`pour` set -- a small ball, no outward burst, no splatter -- at the lip of the
-flask in the character's hand nearest that x (at your feet for one not in a
-hand). What was taken is reported in `BenchResult::streamed` and is part of
+so `Count()` still adds up), split by the vessel each eighth LEFT
+(`FlaskSim::SpillBy`: a particle's `psrc_` / a grain's `src` is the vessel it
+was last inside, kept after it leaves; the per-vessel ledger `exitBy_` only
+apportions, `spilledUnits_` stays the truth, and the split is an exact
+partition). The frame takes one `BenchSpill` per source vessel
+(`AlchemyBench::TakeSpill`) and queues a `ContainerSpill` for each with `pour`
+set -- a small ball, no outward burst, no splatter -- at the lip of THAT
+vessel's flask in the character's hand (at your feet for one not in a hand).
+Only matter that left no known vessel (loose gas) falls back to the flask
+nearest the mean x it left the table at. It used to be that x for all of it,
+compared with the vessels' BASE x: a pour's misses land beside the flask
+poured INTO, so the spill came out of the wrong hand. Gate `alchemy-pour`
+asserts the dump of the left flask is filed under it. What was taken is reported in `BenchResult::streamed` and is part of
 `ValidateBench`'s sum (before == after + spilled + streamed); "done" spills
 only what is left. A session voided because a stack moved still takes the
 streamed matter out of the vessels that are unchanged, so voiding is never a
@@ -17266,7 +17396,13 @@ what keeps ValidateBench a proof.
   and Electrify's discharge, seen by the liquid for 0.6 s, which is the gas
   tagged `electric` (the contract's `spark`). A rule that rewrites a virtual
   neighbour MATERIALISES its product where it touched: the world's spark voxel
-  becomes chlorine, so ours leaves chlorine.
+  becomes chlorine, so ours leaves chlorine. A heated vessel is a hot
+  SURROUNDING for everything in it: a cooling rule (a decay scaled by the
+  neighbours NOT `tag:hot`, molten salt freezing) runs at (1 - heat), so a
+  flask of salt on the flame melts through and sets again as the glass cools.
+  A powder product lands where its source was; if that is buried
+  (PlaceGrain's 4-px ring full) it surfaces at the nearest free pixel of the
+  same vessel within 64 px (PlaceDeposit), never waiting in an undrawn pool.
 - **Gas is voluminous** (2026-09-27, owner: "the volume of liquid to gas
   conversion should generally always make more gas since gas becomes more
   voluminous"). The gas grid counts in GAS UNITS, `SimConfig::gasExpand` (8)
@@ -17314,6 +17450,61 @@ what keeps ValidateBench a proof.
   haze of its hue, alpha from how much is there and its opacity, wisped by
   drifting noise -- a headspace full of vapour at its natural volume is a
   visible haze.
+- **The gas is a grid fluid** (2026-09-27, `288078b`; supersedes the pixel CA
+  above -- units per pixel, the bank, `CarryGas` and the lingering vent stand).
+  A MAC velocity grid of `kGasCell` = 2 px cells over the air round the gas
+  (`FlaskSim::StepGasFlow`): buoyancy by the gas's weight, vorticity
+  confinement, jitter, semi-Lagrangian self-advection, red-black SOR pressure
+  (warm-started, `gasPressureIters`) with glass, grains and liquid as walls
+  (a cell with ANY glass pixel is glass, so a diagonal wall cannot leak), and
+  gas BORN (evaporation, a reaction) as a volume source. The gas units ride
+  the face velocities pixel by pixel (upwind, stochastically rounded: exact).
+  - **Cost scales with the gas, not the bench.** Only ACTIVE TILES
+    (`kGasTile` = 8 cells, 16 px) are solved: tiles holding gas and their
+    eight neighbours, and the whole of any vessel holding some. Every other
+    cell of the solve's box is open air at zero pressure, and a tile let go
+    of has its faces and pressure zeroed. Measured in a g++ -O2 lab
+    (2026-09-27, 480 x 380 bench, one bench frame = `Step(4)` + `Render`):
+    one open flask of gas 5.8 + 2.8 -> 2.7 + 2.2 ms, two flasks at the ends
+    of the bench 17.9 + 5.1 -> 5.9 + 4.0 ms (the old single bounding box
+    spanned the gap; 1-px cells were four times the solve) -- the bench
+    thread had been running past its 16.7 ms with two vessels. `RenderGas`
+    encodes through a table, not three `pow`s a pixel. The frame thread
+    never waits on a step: it only swaps buffers under `mu_`.
+  - **Born volume rises with its bubbles.** Gas is mostly born INSIDE matter
+    (a reaction at the sand under the acid, an evaporating surface particle),
+    and a solid cell is not in the solve, so its volume was never pushed:
+    the headspace compressed past one atmosphere while the air above it
+    never moved and no gas left the mouth (`alchemy-react` vented 0). A
+    birth in a solid cell now goes to the first air cell above it on its own
+    side of the glass.
+  - **The mouth's exchange.** A gas leaves an open mouth by a counter-flow
+    in the neck (out one side, room air in the other). The 2-px grid does
+    not resolve it in a 12-px neck: the solve's own exchange was a few px
+    wide at under a px a step, a light gas mixed through the bulb reached
+    the lip dilute, and an open flask looked stoppered (a heavy vapour held
+    mouth-down poured 22 % in 6 s). It is parameterised on the GAS (units
+    drift; the air is untouched): in the top `gasWindMouthDepth` (4)
+    neck-widths of an open vessel the gas drifts out along the vessel's up
+    at `gasMouthExchange` (0.15 px a step) + `gasWindMouth` x the breeze at
+    the mouth, fading with depth, capped at half the transport's CFL --
+    only where the mouth faces the way the gas goes (up for a light gas,
+    down for a heavy one: upright, ether vapour lies in its bottle; held
+    mouth-down it pours, 65 %). A stopper is glass. Driving a cavity eddy on
+    the air instead only swapped the neck's air with the plume over it.
+  - **Out of the glass it is the world's.** A slow decay to air (a gas's
+    dispersal) no longer fires on a gas pixel OUTSIDE every vessel: that gas
+    lingers, thins and vents into the world, whose own rule disperses it.
+    Noxious gas fades in ~2 s, so fumes crossing the mouth were deleted
+    before an eighth reached the world.
+  - **The room's draught** (`SimConfig::gasWind`, tuning `tools.alchemyWind`,
+    0.12, read every frame so F5 applies it): a divergence-free breeze
+    (stream function: a wandering uniform wind with a little shear plus
+    drifting 96-px eddies, every phase a pure function of the step count)
+    that air OUTSIDE every vessel is pulled toward, `gasWindGrip` a step,
+    and that adds to the mouth's draw. 40 eighths of noxious gas in an open
+    flask (chemistry paused): 69 % gone in 20 s in a still room, 95 % on the
+    draught; stoppered, none. Gate `alchemy-gas-vent`.
 - **Stopper, pressure.** A stoppered mouth is one more glass segment (raster,
   particle contact, the crossing test). Nothing turns to air in a sealed flask
   (below). Pressure is in ATMOSPHERES: gas units per free inside pixel times

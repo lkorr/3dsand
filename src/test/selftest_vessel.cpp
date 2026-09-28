@@ -1462,6 +1462,52 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
                   flewD));
   }
 
+  // ---- E: blown up where it lies -------------------------------------------
+  // A pouch of sand (leather: breakSpeed 0, no knock ever bursts it) and a
+  // flask of water side by side, a blast between them. Both must burst and
+  // spill ALL they held (the carve used to take the body and, with its
+  // registry entry, the contents); A, far off, must not be touched. The blast
+  // is the tick's order: ContainerBlastPass, then the carve.
+  int spilledE = -1, burstE = 0;
+  {
+    spills.clear();
+    uint32_t mSand = 0;
+    for (size_t i = 0; i < c.mats.size(); i++)
+      if (c.mats[i].name == "sand") mSand = (uint32_t)i;
+    const ItemDef* pouch = c.items.At(c.items.Find("pouch"));
+    if (!pouch || !mSand) {
+      fail("E: pouch or sand missing");
+    } else {
+      ItemInstance sand{pouch->name};
+      sand.contents.Add((uint16_t)mSand, 256);
+      const uint64_t pe = DropItemToWorld(*pouch, sand,
+                                          Vec3{(float)px + 3, top + 1.0f, (float)pz + 1},
+                                          Vec3{}, phys, debris, nullptr, ground);
+      const uint64_t fe = drop(Vec3{(float)px + 7, top + 1.0f, (float)pz + 1}, Vec3{});
+      for (int i = 0; i < 30; i++) tick({});
+      if (!pe || !fe || !ground.Find(pe) || !ground.Find(fe)) {
+        fail("E: the pouch and flask did not settle intact");
+      } else {
+        const Vec3 at{(float)px + 5.5f, top + 1.0f, (float)pz + 1.5f};
+        burstE = ContainerBlastPass(ground, c.items, phys, debris, at, 4.0f, spills);
+        std::vector<ParticleSpawn> gore;
+        debris.DamageBodiesRadial(at, 4.0f, world, gore);
+        int w = 0, s = 0;
+        for (const ContainerSpill& sp : spills) {
+          w += (sp.mat == mWater ? sp.units : 0) + (int)sp.rest.AmountOf((uint16_t)mWater);
+          s += (sp.mat == mSand ? sp.units : 0) + (int)sp.rest.AmountOf((uint16_t)mSand);
+        }
+        spilledE = w + s;
+        if (burstE != 2 || ground.Find(pe) || ground.Find(fe))
+          fail(Format("E: a blast between a pouch and a flask burst %d of 2", burstE));
+        else if (w != 1024 || s != 256)
+          fail(Format("E: the blown-up vessels spilled %d/1024 water, %d/256 sand", w, s));
+        else if (!ground.Find(a))
+          fail("E: the blast burst a flask 13 voxels away");
+      }
+    }
+  }
+
   // A must survive the WHOLE fixture, not only its own settle: B landing and
   // C being struck nearby must not take it with them.
   if (aGone >= 0)
@@ -1470,11 +1516,13 @@ Status GateVesselBreak(Ctx& c, std::string& detail) {
                 aWhere.z));
   detail = Format("A intact throughout: %s; B broke at +%d (spill %d/1024); "
                   "C struck, broke at +%d; D thrown from an arm: %s (flew "
-                  "%.1f vox), old AVATAR release %s",
+                  "%.1f vox), old AVATAR release %s; E blast burst %d "
+                  "(spill %d/1280)",
                   aGone < 0 ? "yes" : "no", brokeB, spilledB, brokeC,
                   brokeD == -1 ? "intact" : "BROKE", flewD,
                   brokeCtl >= 0 ? Format("broke at +%d", brokeCtl).c_str()
-                                : "intact");
+                                : "intact",
+                  burstE, spilledE);
   if (!ok) detail = why + " -- " + detail;
   std::printf("vessel-break: %s\n", detail.c_str());
   // Leave nothing behind but a regenerated world: the bodies and the slab.

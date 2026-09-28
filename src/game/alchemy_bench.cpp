@@ -11,6 +11,7 @@
 #include "sim/rng.h"
 #include "sim/materials.h"
 #include "sim/solutes.h"
+#include "sim/tuning.h"
 #include "sim/world.h"
 
 namespace alchemy {
@@ -212,6 +213,7 @@ bool AlchemyBench::Open(int w, int h, const std::vector<MaterialDef>& mats,
   // a voxel, so at the world's per-contact chance a spoonful of sand takes a
   // minute to go in acid; doubled, the reaction reads while you watch.
   cfg.chemRate = 2.0f;
+  cfg.gasWind = wind_ = CurrentTuning().tools.alchemyWind;
   sim_ = FlaskSim(cfg);
   const std::vector<Substance> subs = BenchSubstances(mats, reactions);
   sim_.SetSubstances(subs);
@@ -219,6 +221,7 @@ bool AlchemyBench::Open(int w, int h, const std::vector<MaterialDef>& mats,
   entries_.clear();
   slots_.clear();
   live_.clear();
+  liveOn_.clear();
   removed_.clear();
   refused_.clear();
   lateRefusal_.clear();
@@ -230,7 +233,7 @@ bool AlchemyBench::Open(int w, int h, const std::vector<MaterialDef>& mats,
   front_.assign((size_t)w_ * h_, 0u);
   back_.clear();
   backReady_ = false;
-  streamOut_.assign(mats.size(), 0u);
+  streamOut_.assign(1, std::vector<uint32_t>(mats.size(), 0u));
   streamed_.assign(mats.size(), 0u);
   vented_.assign(mats.size(), 0u);
   events_.clear();
@@ -380,7 +383,10 @@ bool AlchemyBench::Contents(KitRef ref, Composition& out) const {
   for (size_t i = 0; i < entries_.size(); i++) {
     if (!(entries_[i].ref == ref)) continue;
     std::lock_guard<std::mutex> lk(mu_);
-    out = entries_[i].onTable && i < live_.size() && live_[i].n ? live_[i] : entries_[i].after;
+    // The tally, once one has counted it on the table -- an EMPTY one too:
+    // a flask poured dry reads empty, not what it held when it came on.
+    // Before its first tally it still holds what it came with.
+    out = entries_[i].onTable && i < liveOn_.size() && liveOn_[i] ? live_[i] : entries_[i].after;
     return true;
   }
   return false;
@@ -418,21 +424,27 @@ std::vector<BenchVesselView> AlchemyBench::Vessels() const {
   return out;
 }
 
-bool AlchemyBench::TakeSpill(Composition& out, float& exitX) {
-  out = Composition{};
+bool AlchemyBench::TakeSpill(std::vector<BenchSpill>& out, float& exitX) {
+  out.clear();
   exitX = -1.0f;
   if (!open_) return false;
   std::lock_guard<std::mutex> lk(mu_);
-  for (size_t m = 0; m < streamOut_.size(); m++) {
-    if (!streamOut_[m]) continue;
-    if (!out.Add((uint16_t)m, streamOut_[m])) break;
-    // Gas that left a mouth VENTED; the rest fell off the table.
-    const bool gas = mats_ && m < mats_->size() && (*mats_)[m].gpu.klass == CLASS_GAS;
-    if (gas && m < vented_.size()) vented_[m] += streamOut_[m];
-    else if (m < streamed_.size()) streamed_[m] += streamOut_[m];
-    streamOut_[m] = 0;
+  for (size_t src = 0; src < streamOut_.size(); src++) {
+    std::vector<uint32_t>& row = streamOut_[src];
+    BenchSpill sp;
+    if (src > 0 && src - 1 < entries_.size()) sp.ref = entries_[src - 1].ref;
+    for (size_t m = 0; m < row.size(); m++) {
+      if (!row[m]) continue;
+      if (!sp.what.Add((uint16_t)m, row[m])) break;
+      // Gas that left a mouth VENTED; the rest fell off the table.
+      const bool gas = mats_ && m < mats_->size() && (*mats_)[m].gpu.klass == CLASS_GAS;
+      if (gas && m < vented_.size()) vented_[m] += row[m];
+      else if (m < streamed_.size()) streamed_[m] += row[m];
+      row[m] = 0;
+    }
+    if (!sp.what.Empty()) out.push_back(sp);
   }
-  if (out.Empty()) return false;
+  if (out.empty()) return false;
   exitX = streamXW_ > 0 ? (float)(streamXSum_ / streamXW_) : -1.0f;
   streamXSum_ = streamXW_ = 0;
   return true;
@@ -450,6 +462,9 @@ void AlchemyBench::Frame(const BenchInput& in, BenchTool tool) {
   if (in.pressed) pressedLatch_ = true;
   tiltAcc_ += in.tilt;
   tool_ = tool;
+  // The room's draught (tuning tools.alchemyWind), read here on the frame
+  // thread -- F5 reloads the tuning on this thread -- and handed over.
+  wind_ = CurrentTuning().tools.alchemyWind;
   if (backReady_) {
     front_.swap(back_);
     backReady_ = false;
@@ -554,8 +569,9 @@ BenchResult AlchemyBench::Finish(bool abrupt) {
     }
   // Anything that fell off the table and the frame never took goes out with
   // the rest at the end.
-  for (size_t m = 0; m < streamOut_.size(); m++)
-    if (streamOut_[m]) r.spilled.Add((uint16_t)m, streamOut_[m]);
+  for (const std::vector<uint32_t>& row : streamOut_)
+    for (size_t m = 0; m < row.size(); m++)
+      if (row[m]) r.spilled.Add((uint16_t)m, row[m]);
   streamOut_.clear();
   r.streamed = streamed_;
   r.vented = vented_;
@@ -633,6 +649,20 @@ void AlchemyBench::Tick(const BenchInput& in, bool pressed, float tilt, BenchToo
   };
   const int hover = in.over ? entryOfSim(sim_.HitVessel(in.at)) : -1;
 
+  // ---- the mouth: the hand puts the stopper in and takes it out ------------
+  // Pointing at a vessel's mouth with the hand shows a ghost cork there (a
+  // ring round the real one when it is stoppered); a click toggles it, and
+  // does NOT pick the vessel up (owner, 2026-09-27: no trip to the stopper
+  // tool for every cork). Not while a vessel is in the hand.
+  const int mouth = tool == BenchTool::Hand && in.over && held_ < 0 ? MouthAt(in.at) : -1;
+  if (mouth != mouthHover_) redraw_ = true;
+  mouthHover_ = mouth;
+  const bool corked = pressed && mouth >= 0;
+  if (corked) {
+    sim_.SetStopper(mouth, !sim_.Stoppered(mouth));
+    redraw_ = true;
+  }
+
   // ---- the stopper and the burner: a click on a vessel toggles it ----------
   if (pressed && hover >= 0 && slots_[hover].sim >= 0) {
     const int sv = slots_[hover].sim;
@@ -646,7 +676,7 @@ void AlchemyBench::Tick(const BenchInput& in, bool pressed, float tilt, BenchToo
   }
 
   // ---- the hand ----------------------------------------------------------
-  if (tool == BenchTool::Hand && pressed && in.over && hover >= 0) {
+  if (tool == BenchTool::Hand && pressed && !corked && in.over && hover >= 0) {
     held_ = hover;
     const Xform pose = sim_.VesselXform(slots_[held_].sim);
     grabLocal_ = Rot({in.at.x - pose.pos.x, in.at.y - pose.pos.y}, -pose.angle);
@@ -744,6 +774,70 @@ void AlchemyBench::Tick(const BenchInput& in, bool pressed, float tilt, BenchToo
   sim_.SetHighlight(held_ >= 0 ? slots_[held_].sim : hover >= 0 ? slots_[hover].sim : -1);
 }
 
+// The cork's footprint in a vessel's own frame, as flaskchem.cpp's Render
+// draws it (step 6, "THE STOPPER"): from 4 px down the neck to 6 above the
+// lip, the neck's width tapering in, a cap proud of the lip. `grow` widens it
+// all round (negative shrinks), for the hover's ring and the hit margin.
+static bool InCork(const VesselShape& sh, V2 l, float grow) {
+  const float H0 = sh.height;
+  const float mh = sh.profile.back().x * sh.width * 0.5f;
+  const float top = H0 + 6.0f + grow, bot = H0 - 4.0f - grow;
+  if (l.y < bot || l.y > top) return false;
+  const float half = l.y < H0 + 1.0f ? mh + 0.5f - std::max(0.0f, H0 + 1.0f - l.y) * 0.25f
+                                     : mh + 2.0f;
+  return std::fabs(l.x) <= half + grow;
+}
+
+int AlchemyBench::MouthAt(V2 at) const {
+  for (const Slot& s : slots_) {
+    if (s.sim < 0 || !sim_.VesselAlive(s.sim) || sim_.Broken(s.sim)) continue;
+    const Xform x = sim_.VesselXform(s.sim);
+    const V2 l = Rot({at.x - x.pos.x, at.y - x.pos.y}, -x.angle);
+    // A generous margin: the mouth is a few pixels wide, the pointer is not
+    // that precise, and above the lip there is nothing else to point at.
+    if (InCork(sim_.Shape(s.sim), l, 5.0f)) return s.sim;
+  }
+  return -1;
+}
+
+void AlchemyBench::PaintMouthHover(std::vector<uint32_t>& pic) const {
+  const int v = mouthHover_;
+  if (v < 0 || !sim_.VesselAlive(v) || pic.size() != (size_t)w_ * h_) return;
+  const VesselShape& sh = sim_.Shape(v);
+  const Xform x = sim_.VesselXform(v);
+  const bool stoppered = sim_.Stoppered(v);
+  // The bounding box of the grown cork, in picture pixels.
+  const float mh = sh.profile.back().x * sh.width * 0.5f + 5.0f;
+  const V2 corners[4] = {{-mh, sh.height - 8.0f}, {mh, sh.height - 8.0f},
+                         {-mh, sh.height + 10.0f}, {mh, sh.height + 10.0f}};
+  float x0 = 1e9f, x1 = -1e9f, y0 = 1e9f, y1 = -1e9f;
+  for (const V2& c : corners) {
+    const V2 w = Rot(c, x.angle);
+    x0 = std::min(x0, x.pos.x + w.x); x1 = std::max(x1, x.pos.x + w.x);
+    y0 = std::min(y0, x.pos.y + w.y); y1 = std::max(y1, x.pos.y + w.y);
+  }
+  // 0xAABBGGRR, rows top-down (flaskchem.cpp's put): `a` of (r,g,b) over it.
+  auto over = [&](int px, int py, int r, int g, int b, int a) {
+    uint32_t& o = pic[(size_t)(h_ - 1 - py) * w_ + px];
+    const int dr = o & 255, dg = (o >> 8) & 255, db = (o >> 16) & 255, da = (o >> 24) & 255;
+    const int oa = std::max(da, a);
+    o = (uint32_t)(dr + (r - dr) * a / 255) | (uint32_t)(dg + (g - dg) * a / 255) << 8 |
+        (uint32_t)(db + (b - db) * a / 255) << 16 | (uint32_t)oa << 24;
+  };
+  for (int py = std::max(0, (int)y0); py <= std::min(h_ - 1, (int)y1); py++)
+    for (int px = std::max(0, (int)x0); px <= std::min(w_ - 1, (int)x1); px++) {
+      const V2 l = Rot({px + 0.5f - x.pos.x, py + 0.5f - x.pos.y}, -x.angle);
+      if (stoppered) {
+        // Stoppered: a bright ring just outside the real cork -- "this comes out".
+        if (InCork(sh, l, 1.6f) && !InCork(sh, l, 0.0f)) over(px, py, 255, 236, 190, 190);
+      } else if (InCork(sh, l, 0.0f)) {
+        // Open: a translucent cork where one would go, its edge brighter.
+        const bool rim = !InCork(sh, l, -1.0f);
+        over(px, py, 250, 232, 196, rim ? 170 : 70);
+      }
+    }
+}
+
 void AlchemyBench::Run() {
   using clock = std::chrono::steady_clock;
   const auto period = std::chrono::microseconds(16667);
@@ -756,6 +850,7 @@ void AlchemyBench::Run() {
     bool pressed = false;
     float tilt = 0;
     BenchTool tool = BenchTool::Hand;
+    float wind = 0;
     {
       std::lock_guard<std::mutex> lk(mu_);
       if (quit_) break;
@@ -767,7 +862,9 @@ void AlchemyBench::Run() {
       tilt = tiltAcc_;
       tiltAcc_ = 0;
       tool = tool_;
+      wind = wind_;
     }
+    sim_.SetGasWind(wind);
     const bool hadCmds = !cmds.empty();
     for (Cmd& c : cmds) Apply(c);
     cmds.clear();
@@ -775,7 +872,8 @@ void AlchemyBench::Run() {
     sim_.Step(4);
     ticks_++;
     float exitX = -1.0f;
-    const Composition fell = sim_.DrainSpilled(&exitX);
+    FlaskSim::SpillBy fellBy;
+    const Composition fell = sim_.DrainSpilled(&exitX, &fellBy);
     // The chemistry's events, in entry terms.
     std::vector<BenchEvent> evs;
     for (const SimEvent& se : sim_.TakeEvents()) {
@@ -799,17 +897,26 @@ void AlchemyBench::Run() {
     // Redrawn every step while anything moves, and at 30 a second while the
     // table only LOOKS alive (glow, fizz, the light on water: FlaskSim::
     // Animated); a table with nothing on it every half second.
-    const bool draw = hadCmds || sim_.Active() || simFocus_ != lastFocus ||
+    const bool draw = hadCmds || redraw_ || sim_.Active() || simFocus_ != lastFocus ||
                       (sim_.Animated() ? (ticks_ & 1) == 0 : (ticks_ % 30) == 0);
     lastFocus = simFocus_;
-    if (draw) sim_.Render(pic);
+    redraw_ = false;
+    if (draw) {
+      sim_.Render(pic);
+      PaintMouthHover(pic);
+    }
     std::vector<Composition> live;
+    std::vector<uint8_t> liveOn;
     const bool tally = hadCmds || (ticks_ % 6) == 0;
     if (tally) {
       const Tally t = sim_.Count();
       live.resize(slots_.size());
+      liveOn.assign(slots_.size(), 0);
       for (size_t i = 0; i < slots_.size(); i++)
-        if (slots_[i].sim >= 0) live[i] = t.vessel[slots_[i].sim];
+        if (slots_[i].sim >= 0) {
+          live[i] = t.vessel[slots_[i].sim];
+          liveOn[i] = 1;
+        }
     }
     std::vector<PoseView> poses(slots_.size());
     std::vector<uint8_t> broken(slots_.size(), 0);
@@ -832,7 +939,10 @@ void AlchemyBench::Run() {
         back_.swap(pic);
         backReady_ = true;
       }
-      if (tally) live_.swap(live);
+      if (tally) {
+        live_.swap(live);
+        liveOn_.swap(liveOn);
+      }
       // The pressure is sampled every sixth step: keep the last between.
       for (size_t i = 0; i < poses.size() && i < poses_.size(); i++)
         if (poses[i].stoppered && (ticks_ % 6) != 0) poses[i].pressure = poses_[i].pressure;
@@ -842,12 +952,27 @@ void AlchemyBench::Run() {
       focus_ = simFocus_;
       heldPub_ = held_;
       if (!fell.Empty()) {
-        uint32_t units = 0;
-        for (int i = 0; i < fell.n; i++) {
-          if (fell.p[i].mat >= streamOut_.size()) streamOut_.resize(fell.p[i].mat + 1, 0u);
-          streamOut_[fell.p[i].mat] += fell.p[i].eighths;
-          units += fell.p[i].eighths;
+        // Filed under the ENTRY each part left (FlaskSim's vessel index ->
+        // the slot holding it), [0] for no known vessel. fellBy partitions
+        // `fell`, so the totals -- and ValidateBench's sum -- are unchanged.
+        auto file = [&](size_t src, const Composition& c) {
+          if (streamOut_.size() <= src) streamOut_.resize(src + 1);
+          std::vector<uint32_t>& row = streamOut_[src];
+          for (int i = 0; i < c.n; i++) {
+            if (c.p[i].mat >= row.size()) row.resize(c.p[i].mat + 1, 0u);
+            row[c.p[i].mat] += c.p[i].eighths;
+          }
+        };
+        file(0, fellBy.unknown);
+        for (size_t v = 0; v < fellBy.vessel.size(); v++) {
+          if (fellBy.vessel[v].Empty()) continue;
+          size_t src = 0;
+          for (size_t i = 0; i < slots_.size(); i++)
+            if (slots_[i].sim == (int)v) src = i + 1;
+          file(src, fellBy.vessel[v]);
         }
+        uint32_t units = 0;
+        for (int i = 0; i < fell.n; i++) units += fell.p[i].eighths;
         if (exitX >= 0) {
           streamXSum_ += (double)exitX * units;
           streamXW_ += units;

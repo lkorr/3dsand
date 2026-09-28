@@ -1240,6 +1240,34 @@ struct Tuning {
     // heavy blow has any, and a neck already notched costs less to finish.
     float cleaveArea = TPD(gore, cleaveArea);
     float cleaveFrom = TPD(gore, cleaveFrom);
+    // The kerf's half-thickness never drops below this, world voxels. A skin
+    // cell is 1/skinScale of a voxel (0.125 on the human), and a slot thinner
+    // than about one cell falls between cell centres and takes nothing.
+    float cutWidthMin = TPD(gore, cutWidthMin);
+
+    // ---- E1c. the stab (2026-09-26) -----------------------------------------
+    // A blade driven ALONG ITS OWN LENGTH is a stab, not a cut: the wound is a
+    // bore from the entry point down the direction of travel, a slit as wide
+    // as the blade and as thick as its edge, narrowing toward the point (the
+    // kerf's wedge). melee.cpp BuildStrikeParts decides which a blow is:
+    // stabAlign is the cosine between the blade (hilt -> point) and its
+    // travel above which the blow is a stab; above 1 turns stabs off.
+    //
+    // Depth = stabDepth + stabDepthPower * power, world voxels, capped at the
+    // blade's own edge length. NO HEFT, unlike a cut: a point concentrates the
+    // force, so a dagger stab goes deep where a dagger slash only scratches --
+    // the heft that makes a knife need sustained work to part a limb (0.2 on
+    // the shipped dagger) would make it unable to stab at all. A bigger blade
+    // still makes a bigger hole, through its width (stabWidth).
+    // stabWidth is the slit's half-length across the blade as a multiple of
+    // the blade's authored half-width; stabThick its half-thickness floor.
+    // A stab never cleaves or parts a limb, and lands once per slot per
+    // stroke (the blade does not re-stab every tick it is inside).
+    float stabAlign = TPD(gore, stabAlign);
+    float stabDepth = TPD(gore, stabDepth);
+    float stabDepthPower = TPD(gore, stabDepthPower);
+    float stabWidth = TPD(gore, stabWidth);
+    float stabThick = TPD(gore, stabThick);
 
     // ---- E2. heft: how much weapon is behind the edge -----------------------
     // The item's own voxel volume in WORLD voxels that reads as heft 1.0.
@@ -1340,6 +1368,20 @@ struct Tuning {
     int stainCutBuried = TPD(gore, stainCutBuried);
     float stainCutBuriedChance = TPD(gore, stainCutBuriedChance);
     int stainBoneMin = TPD(gore, stainBoneMin);
+    // ---- THE RE-BLEED (2026-09-26, Mob::ReBloodWound) ----------------------
+    // While a LIVING limb still owes blood (bleed budget >= 1 voxel, or an
+    // open stump), every woundRebloodTicks the smear is laid again round the
+    // wound: exposed cells within woundRebloodRadius world voxels, up to
+    // woundRebloodAmount of the 0..15 coat at the centre (bone floored at
+    // stainBoneMin). Scaled 0.5..1 by how much the wound still owes against
+    // woundRebloodFull voxels (a stump is always full). So a wound rinsed
+    // clean fills back up with blood while it bleeds, and stays clean once
+    // it has stopped. A coat is a maximum, so an already-bloody wound only
+    // costs one lattice walk. woundRebloodTicks 0 = off.
+    int woundRebloodTicks = TPD(gore, woundRebloodTicks);
+    float woundRebloodRadius = TPD(gore, woundRebloodRadius);
+    int woundRebloodAmount = TPD(gore, woundRebloodAmount);
+    float woundRebloodFull = TPD(gore, woundRebloodFull);
     // CONTACT. A limb in a blood pool, on a bloodied floor or under a drip
     // takes the liquid's authored stain (materials.json `stain`: type, amount,
     // per-mille chance per tick) on its exposed voxels, scaled by this. A dry
@@ -2260,6 +2302,12 @@ struct Tuning {
     float laserDamage = TPD(tools, laserDamage);
     // How far ahead (voxels) the brush paints when the crosshair hits nothing.
     float brushAirDistance = TPD(tools, brushAirDistance);
+    // The ALCHEMY BENCH's room draught (game/flasksim.h SimConfig::gasWind):
+    // peak speed of the slow, wandering breeze that pushes gas about outside
+    // the vessels and draws a light gas out of an open mouth, in bench px
+    // per gas step (120 gas steps a second). 0 = a still room. Read by the
+    // bench every frame, so F5 applies it live.
+    float alchemyWind = TPD(tools, alchemyWind);
   } tools;
 
   // ---- integer sim constants: DETERMINISM-CRITICAL (CLAUDE.md rule 1) ----

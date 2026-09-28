@@ -667,6 +667,12 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   // ---- the RenderParams half ----
   rp.weatherFlags = (on ? kRwfClouds : 0u) |
                     (on && w.precip > 0.01f && w.coverage > 0.2f ? kRwfRain : 0u);
+  // An aux view (the character screen's portrait) raymarches the world too,
+  // but the cloud deck it would composite is the MAIN view's screen-space
+  // resolve -- another camera, another size -- and the rain streaks ride the
+  // same flag pair. Its sky is the plain one; overcast and wetness still
+  // colour the ground below.
+  if (auxView) rp.weatherFlags = 0u;
   rp.overcast = on ? st.overcast : 0.0f;
   rp.wetness = on ? st.wetness : 0.0f;
   // The flash reaches the ground only as the part of it not lost in the deck;
@@ -677,8 +683,8 @@ static void WriteCloudParams(const rhi::Queue& queue, const World& world,
   // cascades end — mist only brings it closer.
   if (on) rp.fogDensity *= 1.0f + w.mist;
 
-  // An aux view records no cloud passes of its own (the portrait draws bodies
-  // only), and the main view writing its params next frame must find the
+  // An aux view records no cloud passes of its own (and composites none, see
+  // above), and the main view writing its params next frame must find the
   // recorder's answer still its own.
   if (!auxView) {
     gCloudFrame.on = on;

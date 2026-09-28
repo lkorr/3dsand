@@ -483,7 +483,7 @@ Status GateArmorWear(Ctx& c, std::string& detail) {
         cut.at = centre + Vec3{0.06f, 0.9f, 0.06f};
         cut.edgeAxis = Vec3{1, 0, 0};
         cut.cutDir = Vec3{0, -1, 0};
-        cut.halfWidth = std::max(0.2f * g.cutWidth, 0.08f);
+        cut.halfWidth = std::max(0.2f * g.cutWidth, g.cutWidthMin);
         cut.depth = g.cutDepth + g.cutDepthPower;
         cut.length = g.cutLength;
         cut.power = 1.0f;

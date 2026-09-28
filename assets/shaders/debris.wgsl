@@ -58,7 +58,9 @@ fn fragEyeDist(fragPos : vec4f) -> f32 {
 
 struct Sprite {
   pos : vec3f, halfSize : f32,
-  color : u32, emission : f32, _a : u32, _b : u32,
+  color : u32, emission : f32,
+  mat : u32,   // world.h Sprite::mat: the material it is a piece of, 0 = none
+  _b : u32,
 };
 @group(1) @binding(1) var<storage, read> sprites : array<Sprite>;
 
@@ -466,7 +468,13 @@ fn vsFluid(@builtin(vertex_index) vi : u32,
   albedo = mix(albedo, vec3f(0.92, 0.95, 0.98), foam);
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
-  out.color = litColorO(albedo, n, world, 0.0, R,
+  // ...and it GLOWS as that material does: enchanted water poured, scooped or
+  // splashed is still enchanted water. The same burnTint every other
+  // emission-to-light site uses (common.wgsl), keyed on the slot.
+  let fm = materials[fpMat(p.attr)];
+  let bt = burnTint(fm, albedo, f32(fm.emission) / 255.0,
+                    burnTintWeightH(pcg(inst * 2917u), R.time));
+  out.color = litColorO(bt.albedo, n, world, bt.emis, R,
                         opennessAtBody(world, &occupancy, &openness, &opennessGen));
   return out;
 }
@@ -480,8 +488,24 @@ fn vsSprite(@builtin(vertex_index) vi : u32,
   let world = s.pos + off;
   var out : VSOut;
   out.pos = projectView(world - R.camPos, R);
-  out.color = litColorO(unpackColor(s.color), n, world, s.emission, R,
+  // A sprite that IS matter (Sprite::mat) glows as that matter: the material's
+  // emission through burnTint, keyed on the instance, exactly as vsParticle
+  // does for a loose grain. The CPU's colour stays the albedo (it carries the
+  // mote's brightness jitter); only the light is the material's. Added to the
+  // authored `emission` so a sprite may still glow brighter than its matter.
+  var albedo = unpackColor(s.color);
+  var emis = s.emission;
+  if (s.mat != 0u) {
+    let bt = burnTint(materials[s.mat], albedo, f32(materials[s.mat].emission) / 255.0,
+                      burnTintWeightH(pcg(inst * 2917u), R.time));
+    albedo = bt.albedo;
+    emis += bt.emis;
+  }
+  out.color = litColorO(albedo, n, world, emis, R,
                         opennessAtBody(world, &occupancy, &openness, &opennessGen));
+  if (s.mat != 0u) {
+    out.color += glowLight(albedo, 1.0, glowAtPos(world, &glow), TUNE_GLOW_STRENGTH);
+  }
   return out;
 }
 

@@ -1,319 +1,182 @@
-"""Generate assets/items/sword.{vox,json} — the sword as a STANDALONE ITEM.
+"""Generate assets/items/sword.{vox,json} — the arming sword, as a STANDALONE ITEM.
 
-WHY THIS FILE EXISTS AT ALL. The sword used to be a limb of the wearer's rig
-(a `"tag": "prop"` entry in gen_mina.py's LIMBS, parented to hand.R). That is
-where it broke: prefab-local space has its origin at the BODY's min corner —
-props are deliberately excluded from that measurement, because a creature's
-size must not change with what it happens to be carrying — so when the
-handedness fix moved the right hand to model -X, the blade followed it to
-engine x -30..14. Thirty micro of blade sat at NEGATIVE prefab-local
-coordinates, which that space cannot represent. On screen the body rendered
-offset from where the arm actually solved.
+An item is not a part of the creature that holds it: it has its own .vox and
+its own origin, and the rig BORROWS A SLOT to show it (src/game/item.h has the
+history — the sword used to be a rig prop and hung outside its wearer's box).
+It is authored pommel-at-low-x, tip-at-high-x, and the GRIP ROTATION is what
+points it outboard when held; the art never encodes handedness.
 
-An item is not a part of the creature, so it does not belong in the creature's
-box. It gets its own .vox and its own origin, and the rig BORROWS A SLOT to
-show it. Everything the old arrangement bought — severing with the parent
-limb, dropping to debris, per-voxel carving, micro detail — is preserved by
-the item's runtime entity filling a real rig Part, which is what src/game/
-item.cpp does with the `grip` block below.
+THE ART (2026-09-27, scripts/bladesmith.py for the shared parts). 80 art voxels
+per metre — one cell is 12.5 mm — which is fine enough for a blade to have a
+section instead of being a slab:
 
-THE ART IS UNCHANGED. The geometry here is the same builder that lived in
-gen_mina.py (sword_vox), moved verbatim except for the mirror: a rig prop had
-to be built pointing along the wearer's -X, but an item's own box has no
-handedness, so it is authored pommel-at-low-x, tip-at-high-x — the natural
-reading — and the GRIP ROTATION is what points it outboard when held. That is
-the whole reason the offset lives on the item rather than on the skeleton.
+  * a CHAMFERED WHEEL POMMEL, blued, with a raised boss;
+  * a leather grip with a spiral cord wrap, swelling slightly at the middle,
+    between two iron risers;
+  * a CROSSGUARD whose quillons taper and sweep toward the blade, ending in
+    knobs, with a central block and a langet tongue lying on the ricasso;
+  * a BLADE with a short unground ricasso, then a lenticular section — three
+    cells through the flats, one at the edge, the step between them being the
+    bevel — a fuller down the first 60% of the flat, a maker's mark inlaid in
+    it, and a diamond section with a midrib from the end of the fuller into an
+    acute point.
 
-TWO CONSTRAINTS INHERITED FROM THE RIG VERSION, both still load-bearing:
+What the rig reads is unchanged: overall length 1.10 m, the grip's centre
+15 cm from the butt, the edge from 30 cm to the tip, halfWidth 7.5 cm. Each of
+those is the old 40/m number doubled.
 
- 1. The blade lies along the box's LONG axis (x here), and when held it must
-    end up ORTHOGONAL TO THE FOREARM. The arm extends along -y in the rig,
-    so the blade's +x is already perpendicular — identity grip rotation is
-    correct. The angle must HOLD through a swing: the arm moves, the wrist
-    does not swivel.
- 2. The `edge` block is the ONE source of truth for where the weapon cuts.
-    melee.cpp sweeps that segment; re-measuring it by eye in C++ would rot the
-    moment the art changes. It is emitted from the same constants that build
-    the mesh, so art and hitbox can only move together.
+The `edge` and `hilt` blocks are emitted from the same constants that build the
+mesh, so the hitbox cannot drift from the art.
 
 Run: python scripts/gen_sword_item.py
 """
 
-import json
+import math
 import os
-import struct
 
-# ---- palette (assets/prefabs — palette index == material ID) ----------------
-STEEL = 57      # the blade, guard and pommel
-GRIP = 58       # grip_leather, the wrapped hilt
+import bladesmith as B
 
-SCALE = 4       # micro voxels per world voxel, matching the mina rig
-
-# ---- blade dimensions, micro units ------------------------------------------
-SWORD_LEN = 44          # pommel butt to tip: 11 world voxels
-SWORD_GRIP = 10         # micro of hilt behind the guard
-SWORD_GUARD = 2         # micro of crossguard
-SWORD_HALF_W = 3        # blade half-width at the widest
+LEN = 88            # pommel butt to tip: 1.10 m
+GRIP = (6, 20)      # the wrapped span; risers at both ends
+HILT = (4, 20)      # the hilt box (unchanged from 40/m: 2..10 micro)
+GUARD = (20, 24)    # the crossguard
+BLADE0 = 24         # ricasso starts here; the edge block starts here too
+HALF_W = 6          # edge.halfWidth: 3 micro at 40/m
 
 
-# ---- .vox writing (same helpers as gen_mina.py / gen_wizard.py) -------------
-def chunk(cid, content, children=b""):
-    return cid + struct.pack("<ii", len(content), len(children)) + content + children
+def build():
+    f = B.Forge(LEN, 23, 5)
 
+    # ---- crossguard (stamped first: it owns the cells where it meets the
+    # blade and the grip) ----------------------------------------------------
+    def guard(x, dy, dz):
+        X = x + 0.5
+        ady = abs(dy)
+        # central block: wraps the blade root, 5 cells through
+        if ady <= 3 and GUARD[0] <= x < GUARD[1]:
+            return (B.STEEL, "iron")
+        # langet: a tongue of the guard lying on each flat of the ricasso,
+        # narrowing onto the blade
+        if abs(dz) == 2 and GUARD[1] <= x < GUARD[1] + 3 and ady <= 2 - (x - GUARD[1]) * 0.7:
+            return (B.STEEL, "iron")
+        if ady > 10:
+            return None
+        # quillons: a bar centred on a line that sweeps gently toward the
+        # blade, tapering in x toward the tips
+        def centre(a):
+            k = max(0.0, a - 3.0)
+            return 21.6 + 0.022 * k * k, 2.0 - 0.8 * B.clamp01(k / 6.0)
+        if ady <= 9 and abs(dz) <= 1:
+            xc, hx = centre(ady)
+            if abs(X - xc) <= hx:
+                return (B.STEEL, "iron")
+        # terminal knobs: a little ball at each tip
+        kx, _ = centre(9.3)
+        if (X - kx) ** 2 + (ady - 9.3) ** 2 + (dz * 1.2) ** 2 <= 1.75 ** 2:
+            return (B.STEEL, "iron")
+        return None
+    f.stamp(guard, GUARD[0] - 1, GUARD[1] + 4)
 
-def dict_bytes(d):
-    out = struct.pack("<i", len(d))
-    for k, v in d.items():
-        out += struct.pack("<i", len(k)) + k.encode()
-        out += struct.pack("<i", len(v)) + v.encode()
-    return out
-
-
-def model_chunks(size, voxels):
-    sx, sy, sz = size
-    xyzi = struct.pack("<i", len(voxels)) + b"".join(
-        struct.pack("4B", x, y, z, c) for (x, y, z, c) in voxels
-    )
-    return chunk(b"SIZE", struct.pack("<iii", sx, sy, sz)) + chunk(b"XYZI", xyzi)
-
-
-def ntrn(node_id, name, child, t):
-    attrs = {"_name": name} if name else {}
-    frame = {"_t": f"{t[0]} {t[1]} {t[2]}"}
-    c = struct.pack("<i", node_id) + dict_bytes(attrs)
-    c += struct.pack("<iiii", child, -1, 0, 1) + dict_bytes(frame)
-    return chunk(b"nTRN", c)
-
-
-def ngrp(node_id, children):
-    c = struct.pack("<i", node_id) + dict_bytes({})
-    c += struct.pack("<i", len(children))
-    for ch in children:
-        c += struct.pack("<i", ch)
-    return chunk(b"nGRP", c)
-
-
-def nshp(node_id, model_id):
-    c = struct.pack("<i", node_id) + dict_bytes({})
-    c += struct.pack("<ii", 1, model_id) + dict_bytes({})
-    return chunk(b"nSHP", c)
-
-
-def ellipse_mask(x, y, cx, cy, rx, ry):
-    """True when voxel (x,y)'s CENTRE is inside the axis-aligned ellipse. Voxel
-    i covers [i, i+1) so its centre is i+0.5 — that half is added here, once,
-    so no builder has to invent its own convention."""
-    if rx <= 0 or ry <= 0:
-        return False
-    dx = (x + 0.5 - cx) / rx
-    dy = (y + 0.5 - cy) / ry
-    return dx * dx + dy * dy <= 1.0
-
-
-# ---- the blade --------------------------------------------------------------
-def sword_vox(size):
-    """A straight, tapering, double-edged blade on a wrapped hilt, lying along
-    the box's X axis with the pommel at LOW x and the tip at HIGH x. Thin in Z
-    (the flat of the blade), so it reads as a blade rather than a bar, and the
-    taper is what makes the tip the part that bites.
-
-    NO MIRROR, unlike the rig-prop version this came from. That one was flipped
-    so the blade pointed along the wearer's -X; an item's own box has no
-    handedness and no wearer, so the natural pommel-first ordering stands and
-    the grip rotation is what aims it. Keeping the flip here would mean the
-    art and the grip both encoded "which way is outboard", and they would
-    disagree the next time either changed."""
-    sx, sy, sz = size
-    out = []
-    cy, cz = sy * 0.5, sz * 0.5
-    guard_x = SWORD_GRIP + SWORD_GUARD
-
-    for x in range(sx):
-        if x < 2:
-            # pommel: a squat steel knob, wider than the grip
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, 1.6, 1.6):
-                        out.append((x, y, z, STEEL))
-        elif x < SWORD_GRIP:
-            # wrapped grip
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, 1.1, 1.1):
-                        out.append((x, y, z, GRIP))
-        elif x < guard_x:
-            # crossguard: a bar across Y, thin in Z
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, sy * 0.5, 1.0):
-                        out.append((x, y, z, STEEL))
+    # ---- pommel: a chamfered wheel with a boss -------------------------------
+    def pommel(x, dy, dz):
+        X = x + 0.5
+        r = math.hypot(X - 3.4, dy)
+        R = 3.45
+        if r > R:
+            return None
+        adz = abs(dz)
+        if r <= 1.6:
+            t = 2                        # the boss, standing proud of the face
+        elif r <= R - 1.0:
+            t = 1                        # the face
         else:
-            # blade: full width at the ricasso, tapering to a point. Thin in Z
-            # (half-thickness 1) so the flat reads flat.
-            t = (x - guard_x) / max(sx - 1 - guard_x, 1)
-            hw = SWORD_HALF_W * (1.0 - 0.65 * t * t)
-            for z in range(sz):
-                for y in range(sy):
-                    if ellipse_mask(y, z, cy, cz, hw, 1.0):
-                        out.append((x, y, z, STEEL))
-    return out
+            t = 0                        # the chamfered rim
+        if adz > t:
+            return None
+        return (B.STEEL, "iron_hi" if adz == 2 else "iron")
+    f.stamp(pommel, 0, 8)
+
+    # ---- grip ------------------------------------------------------------------
+    def grip(x, dy, dz):
+        X = x + 0.5
+        g0, g1 = GRIP
+        if not (g0 <= x < g1):
+            return None
+        t = (X - g0) / (g1 - g0)
+        s = 1.0 + 0.10 * math.sin(math.pi * t)
+        # iron risers at both ends of the wrap
+        if x == g0 or x == g1 - 1:
+            if (dy / 2.35) ** 2 + (dz / 2.35) ** 2 <= 1.0:
+                return (B.STEEL, "iron")
+            return None
+        ry, rz = 2.15 * s, 2.05 * s
+        if (dy / ry) ** 2 + (dz / rz) ** 2 > 1.0:
+            return None
+        return (B.GRIP_LEATHER, B.wrap_colour(x, dy, dz))
+    f.stamp(grip, GRIP[0], GRIP[1])
+
+    # ---- blade -----------------------------------------------------------------
+    blen = LEN - BLADE0
+    def blade(x, dy, dz):
+        X = x + 0.5
+        u = (X - BLADE0) / blen
+        # the ricasso: square-shouldered, full thickness, unground
+        if x < BLADE0 + 4:
+            if abs(dy) <= 4 and abs(dz) <= 1:
+                return (B.STEEL, "forged")
+            return None
+        # profile: a gentle straight taper, then an ogival point
+        base = 5.8 - 1.8 * u
+        if u > 0.68:
+            p = (u - 0.68) / 0.32
+            hw = base * (1.0 - p ** 1.7) ** 0.85
+        else:
+            hw = base
+        # shoulders out of the ricasso
+        hw = min(hw, 5.0 + (x - (BLADE0 + 4)) * 0.6)
+        # fuller: from just past the ricasso, running out at 60%, fading
+        fl = 0.0
+        if u < 0.60:
+            fl = 1.0 - B.smooth(0.52, 0.60, u)
+            fl = 0.9 if fl > 0.5 else 0.0
+        # where the blade is thick: a wide lenticular flat near the hilt, a
+        # narrowing diamond toward the point (the distal taper)
+        thick_to = max(1.0, hw - 1.9) if u < 0.62 else max(1.0, hw * 0.48)
+        c = B.blade_section(dy, dz, hw, thick_to=thick_to, fuller=fl,
+                            ridge=(u >= 0.62))
+        if c is None:
+            return None
+        # the maker's mark: a small brass cross inlaid at the head of the fuller
+        if x in (BLADE0 + 7, BLADE0 + 8, BLADE0 + 9) and dy == 0:
+            c = "brass_hi"
+        if x == BLADE0 + 8 and abs(dy) == 1 and abs(dz) == 1:
+            c = "brass_hi"
+        return (B.STEEL, c)
+    f.stamp(blade, BLADE0, LEN)
+
+    # bright arrises on the fittings: the corners of the guard and pommel wear
+    f.recolour_arrises(0, 8, "iron", "iron_hi")
+    f.recolour_arrises(GUARD[0], GUARD[1] + 3, "iron", "iron_hi")
+    return f
 
 
 def main():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     out_dir = os.path.join(root, "assets", "items")
-    os.makedirs(out_dir, exist_ok=True)
-
-    size = (SWORD_LEN, 2 * SWORD_HALF_W, 4)
-    voxels = sword_vox(size)
-    assert voxels, "sword generated no voxels"
-    # DebrisVoxel is int8 and these are MICRO units, so a part may be at most
-    # 120 micro = 30 world voxels on an axis. Same ceiling the rig asserts.
-    assert max(size) <= 120, "sword exceeds DebrisVoxel int8 range"
-
-    seen = set()
-    uniq = []
-    for v in voxels:
-        x, y, z, _c = v
-        assert 0 <= x < size[0] and 0 <= y < size[1] and 0 <= z < size[2], \
-            f"sword voxel {(x, y, z)} outside declared size {size}"
-        if (x, y, z) in seen:
-            continue          # first write wins, as in the rig generator
-        seen.add((x, y, z))
-        uniq.append(v)
-
-    # ONE model, named for the item. The loader reads a single-model .vox the
-    # same way it reads a rig's per-limb models; the name is what item.cpp
-    # looks up, so it must match the sidecar's "model".
-    body = model_chunks(size, uniq)
-    pivot = (size[0] // 2, size[1] // 2, size[2] // 2)
-    graph = ntrn(0, "", 1, (0, 0, 0)) + ngrp(1, [2])
-    graph += ntrn(2, "sword", 3, pivot) + nshp(3, 0)
-
-    payload = body + graph
-    data = b"VOX " + struct.pack("<i", 150)
-    data += b"MAIN" + struct.pack("<ii", 0, len(payload)) + payload
-    with open(os.path.join(out_dir, "sword.vox"), "wb") as f:
-        f.write(data)
-
-    # ---- the sidecar --------------------------------------------------------
-    #
-    # GRIP IS A MAP OF CONTEXTS, not a single offset, and only held_right is
-    # populated today. Minecraft carries nine display slots because one offset
-    # never covers held/ground/GUI/head; making this a map now means adding
-    # held_left or ground is DATA rather than a schema migration. Two of its
-    # rules are stolen verbatim because both are the kind of thing you only
-    # learn by getting them wrong:
-    #
-    #   * TRANSLATION APPLIES BEFORE ROTATION.
-    #   * A CONTEXT THAT OMITS A SUB-KEY DOES NOT INHERIT IT. Be explicit.
-    #
-    # The composition is handSocket x grip: the rig says where the hand's grip
-    # point is, the item says how it sits in that grip. Explicitly NOT the
-    # inverse form (Inverse(grip) x socket) that VR rigs use — that inverts
-    # because in VR the HAND POSE is the constraint being solved for, which is
-    # not the case here, and it drags in a scale hazard.
-    #
-    # ROTATION, degrees, applied X then Y then Z. The blade is authored along
-    # +x; the arm extends along -y in the rig.
-    #
-    # -90 ABOUT Y POINTS THE BLADE AWAY FROM THE CHARACTER. Heading 0 faces +Z,
-    # and -90 about Y carries the authored +x onto +Z, so the sword points out
-    # front rather than across the body. Verified rather than reasoned:
-    #
-    #   python scripts/geometry.py rotate_point 0 1 0 -90 -- 1 0 0
-    #   -> [0, 0, 1]                     (blade +x lands on +Z, i.e. forward)
-    #
-    # Constraint 1 in this file's docstring still holds: a rotation about Y
-    # keeps the blade horizontal, so it stays perpendicular to a forearm that
-    # runs along -y. The angle is carried by the grip, not by the art, so the
-    # blade is still authored pommel-at-low-x and nothing about the mesh moves.
-    #
-    # TRANSLATION is a RESIDUAL NUDGE in MICRO units, and is zero here. Where
-    # the fist closes is stated by the `hilt` box below, and the runtime puts
-    # that box's centre on the rig's socket — so the placement needs no tuned
-    # constant at all.
-    #
-    # IT USED TO BE [-SWORD_GRIP, 0, 0], AND THAT WAS THE BUG. It was chosen as
-    # if the socket sat at the pommel butt, but the socket is the CENTRE of the
-    # hand's limb box, and mina's hand is one world voxel across. -10 micro is
-    # -2.5 world voxels, so the item's origin was parked two and a half voxels
-    # outboard of a one-voxel fist and the blade — which grows from that origin
-    # along +x — hung down and away from the hand. It also never centred the
-    # blade's cross-section in y or z, so even the intended axis was off by
-    # half the guard. Aligning boxes removes all three errors at once.
-    sidecar = {
-        "comment": (
-            "The sword as a standalone item: its own art, its own origin. "
-            "Held by BORROWING a rig slot (see src/game/item.cpp), so it is a "
-            "real rig Part while worn and severs, drops, burns and carves "
-            "exactly like a limb. Regenerate with scripts/gen_sword_item.py — "
-            "the edge block is emitted from the same constants that build the "
-            "mesh, so the hitbox cannot drift from the art."),
-        "name": "sword",
-        "model": "sword",
-        # The modern key for the legacy `"scale": SCALE` the committed file was
-        # migrated off: mob.cpp reads a legacy scale as scale * 10 vox/m.
-        "artVoxelsPerMetre": SCALE * 10,
-        "hp": 30,
-        "severable": True,
-        "severImpactSpeed": 7.0,
-        "grip": {
-            "held_right": {
-                "translation": [0, 0, 0],
-                "rotation": [0, -90, 0],
-                "scale": 1.0,
-            }
-        },
-        # WHERE THE FIST CLOSES, in the item's own frame and micro units — the
-        # wrapped grip between the pommel knob and the crossguard, which is
-        # exactly the span sword_vox() fills with GRIP leather. Emitted from
-        # the same constants that build the mesh, for the same reason the edge
-        # block is: re-measuring it by eye would rot the moment the art moved.
-        #
-        # This is the item's answer to the question the LIMB SYSTEM answers for
-        # a hand. The rig states what a hand is by declaring a box; the item
-        # states where its hilt is by declaring a box; the runtime puts the two
-        # centres together (src/game/avatar.cpp EquipItem). Neither side is a
-        # tuned number, so neither can drift.
-        #
-        # x: the leather runs from the pommel (x < 2 is the knob) to the guard.
-        # y/z: the full cross-section, so the centre lands on the blade's axis
-        #      rather than on its corner — the omission that left the old
-        #      placement off by half the guard even along the axis it did set.
-        "hilt": {
-            "min": [2, 0, 0],
-            "size": [SWORD_GRIP - 2, 2 * SWORD_HALF_W, 4],
-        },
-        # The cutting edge, in the ITEM's own local frame and micro units,
-        # from the ricasso (where the sharpened part starts, just past the
-        # guard) to the tip. Authored along +x because that is how the art is
-        # built — the grip rotation carries it wherever the hand goes.
-        "edge": {
-            "from": SWORD_GRIP + SWORD_GUARD,
-            "to": SWORD_LEN,
-            "axis": [1, 0, 0],
-            # WHICH WAY THE FLAT FACES. sword_vox builds the blade wide in y
-            # and THIN IN Z, so +z is the face — the same constant the mesh is
-            # cut from, for the same reason `from`/`to` are emitted here rather
-            # than measured by eye in C++. The stroke driver rolls the blade so
-            # the edge leads the cut and the damage sweep scales a hit by how
-            # edge-on it was; both read this, and neither can derive it.
-            "flat": [0, 0, 1],
-            "halfWidth": SWORD_HALF_W,
-        },
-        # Jiggle, carried over from the rig prop: a held weapon that is welded
-        # rigid to the fist reads as part of the arm.
-        "spring": {"halflife": 0.09, "gain": 0.35, "maxAngle": 0.15},
-    }
-    with open(os.path.join(out_dir, "sword.json"), "w") as f:
-        json.dump(sidecar, f, indent=2)
-        f.write("\n")
-
-    print(f"wrote {out_dir}/sword.vox  ({len(uniq)} voxels, size {size})")
-    print(f"wrote {out_dir}/sword.json")
-    print(f"  blade {SWORD_LEN} micro = {SWORD_LEN / SCALE} world voxels, "
-          f"edge {SWORD_GRIP + SWORD_GUARD}..{SWORD_LEN}")
+    f = build()
+    sc = B.sidecar(
+        "sword", f,
+        comment=(
+            "The sword as a standalone item: its own art, its own origin. Held "
+            "by BORROWING a rig slot (see src/game/item.cpp), so it is a real "
+            "rig Part while worn and severs, drops, burns and carves exactly "
+            "like a limb. Regenerate with scripts/gen_sword_item.py — the edge "
+            "block is emitted from the same constants that build the mesh, so "
+            "the hitbox cannot drift from the art."),
+        hp=30, sever=7.0, grip_t=(0, 0, 0), hilt_x=HILT, edge_x=(BLADE0, LEN),
+        half_w=HALF_W, old_line=(0.75, -0.5),
+        spring={"halflife": 0.09, "gain": 0.35, "maxAngle": 0.15})
+    B.emit(out_dir, "sword", f, sc)
 
 
 if __name__ == "__main__":

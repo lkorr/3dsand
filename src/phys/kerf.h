@@ -67,6 +67,12 @@ struct KerfCut {
   // covers (the last strip of a neck grooved almost through).
   float edgeHalf = 0.0f;
   float cleave = 0.0f;
+  // A STAB (2026-09-26): the point was driven in along the blade's own length
+  // (melee.cpp BuildStrikeParts). The slot is then a BORE -- `cutDir` is the
+  // thrust, `edgeAxis` runs ACROSS the blade, so the slot's length is the
+  // blade's width and its depth is how far the point went in -- and it is
+  // never priced by KerfBite: a stab makes a hole, it does not part a limb.
+  bool stab = false;
 };
 
 // ---- THE SAME BLOW, IN THE STRUCK THING'S FRAME -----------------------------
@@ -99,10 +105,10 @@ inline KerfSlot KerfFrame(Vec3 cLocal, Vec3 uLocal, Vec3 wLocal, float depth,
   s.w = wl > 1e-4f ? wLocal * (1.0f / wl) : Vec3{0, -1, 0};
   s.v = s.u.cross(s.w);
   if (s.v.len() < 0.15f) {
-    // A THRUST, NOT A CUT: the edge is travelling along its own length, so
-    // "the flat of the blade" is undefined and the cross product is noise.
-    // Any perpendicular will do — the slot is then a round-ish bore, which is
-    // what a thrust actually makes.
+    // DEGENERATE INPUT: the edge axis and the travel coincide. A real thrust
+    // no longer arrives here -- BuildStrikeParts turns it into a stab and
+    // hands over the blade's WIDTH as `uLocal` -- so this is only a
+    // hand-built cut that did not say. Any perpendicular will do.
     s.v = s.u.cross(Vec3{0, 1, 0});
     if (s.v.len() < 0.15f) s.v = s.u.cross(Vec3{1, 0, 0});
   }

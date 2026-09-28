@@ -874,7 +874,13 @@ struct Sprite {
   float halfSize;
   uint32_t color;   // 0xAABBGGRR
   float emission;
-  uint32_t pad0 = 0, pad1 = 0;
+  // The MATERIAL this sprite is a piece of (0 = none: a marker, a spell
+  // flash). When set, debris.wgsl vsSprite takes the glow from that
+  // material's own emission (through burnTint, as a flying particle does) on
+  // top of `emission`, so matter drawn as a sprite -- a scooped mote, an
+  // applied dab -- glows exactly as the same matter does in the grid.
+  uint32_t mat = 0;
+  uint32_t pad1 = 0;
 };
 // 512: a spell flight is up to ~20 sprites (core, lobes, tail, orbit) and
 // up to maxLiveProjectiles fly at once, plus impact flashes and markers.

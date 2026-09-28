@@ -1643,6 +1643,14 @@ TP_F(gore, cutSpallStrength, NO_WGSL, 0.30f, 0.0f, 1.0f)
 TP_F(gore, cleaveArea, NO_WGSL, 1.6f, 0.0f, 16.0f)
 // 1 would divide by zero in the power shaping (Tuning::Gore::cleaveFrom).
 TP_F(gore, cleaveFrom, NO_WGSL, 0.5f, 0.0f, 0.95f)
+// The kerf's half-thickness floor, world voxels (was a literal 0.08 in melee.cpp).
+TP_F(gore, cutWidthMin, NO_WGSL, 0.08f, 0.0f, 2.0f)
+// THE STAB (Tuning::Gore::stabAlign). Above 1 no blow is ever a stab.
+TP_F(gore, stabAlign, NO_WGSL, 0.7f, 0.0f, 1.01f)
+TP_F(gore, stabDepth, NO_WGSL, 0.35f, 0.0f, 8.0f)
+TP_F(gore, stabDepthPower, NO_WGSL, 0.6f, 0.0f, 8.0f)
+TP_F(gore, stabWidth, NO_WGSL, 0.4f, 0.05f, 4.0f)
+TP_F(gore, stabThick, NO_WGSL, 0.1f, 0.0f, 2.0f)
 TP_F(gore, woundHeftRef, NO_WGSL, 5.3f, 0.01f, 60.0f)
 TP_F(gore, woundHeftMax, NO_WGSL, 4.0f, 1.0f, 32.0f)
 TP_F(gore, woundStainRadius, NO_WGSL, 0.90f, 0.0f, 16.0f)
@@ -1661,6 +1669,11 @@ TP_I(gore, stainCutAmount, NO_WGSL, 15, 0, 15)
 TP_I(gore, stainCutBuried, NO_WGSL, 6, 0, 15)
 TP_F(gore, stainCutBuriedChance, NO_WGSL, 0.35f, 0.0f, 1.0f)
 TP_I(gore, stainBoneMin, NO_WGSL, 5, 0, 15)
+// The re-bleed (Tuning::Gore::woundRebloodTicks). 0 ticks turns it off.
+TP_I(gore, woundRebloodTicks, NO_WGSL, 15, 0, 600)
+TP_F(gore, woundRebloodRadius, NO_WGSL, 0.45f, 0.0f, 4.0f)
+TP_I(gore, woundRebloodAmount, NO_WGSL, 12, 0, 15)
+TP_F(gore, woundRebloodFull, NO_WGSL, 20.0f, 1.0f, 1000.0f)
 TP_F(gore, stainContactScale, NO_WGSL, 1.0f, 0.0f, 8.0f)
 TP_F(gore, stainFloorTransfer, NO_WGSL, 0.35f, 0.0f, 1.0f)
 TP_I(gore, stainWashPerContact, NO_WGSL, 3, 0, 15)
@@ -2001,6 +2014,8 @@ TP_I(tools, laserMeltRadius, NO_WGSL, 2, 1, 8)
 TP_F(tools, laserCarveRadius, NO_WGSL, 0.3f, 0.1f, 3.0f)
 TP_F(tools, laserDamage, NO_WGSL, 1.5f, 0.1f, 20.0f)
 TP_F(tools, brushAirDistance, NO_WGSL, 48.0f, 4.0f, 200.0f)
+// The alchemy bench's room draught, px per gas step (FlaskSim SimConfig::gasWind).
+TP_F(tools, alchemyWind, NO_WGSL, 0.12f, 0.0f, 0.6f)
 
 
 // ==== sim: rows no shader reads ====

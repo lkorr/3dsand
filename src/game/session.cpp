@@ -2220,6 +2220,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                 ScoopMote m;
                 m.from = Vec3{t.c.x + 0.5f, t.c.y + 0.5f, t.c.z + 0.5f};
                 m.color = mmat < mats.size() ? mats[mmat].gpu.color0 : 0xFFFFFFFFu;
+                m.mat = mmat < mats.size() ? mmat : 0u;
                 m.seed = h;
                 // Staggered by a tick per cell so a held button reads as a
                 // stream rather than volleys of four.
@@ -2325,6 +2326,7 @@ static void PhaseG(TickAuthorityCtx& w, WorldScratch& ws,
                   m.from = amouth;
                   m.to = hit.pos;
                   m.color = mat < mats.size() ? mats[mat].gpu.color0 : 0xFFFFFFFFu;
+                  m.mat = mat < mats.size() ? mat : 0u;
                   m.seed = h;
                   m.delay = k;
                   m.age = 0;
@@ -4340,6 +4342,14 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
           // merged batch to that machine's own avatars (DESIGN.md §10). The
           // ghost's gore is discarded here (MobSystem::CarveMobsRadial) and
           // authored there, so it enters the shared batch once.
+          // VESSELS BURST FIRST (container.h ContainerBlastPass): the carve
+          // below would take a flask's body and, through OnBodyGone, the
+          // registry entry that is its contents. They drain through
+          // w.vesselSpills from next tick's phase H, like a broken flask.
+          if (w.ground)
+            ContainerBlastPass(*w.ground, items, phys, debris,
+                               BlastForceOf(e).center, BlastForceOf(e).craterRadius,
+                               w.vesselSpills);
           ExplosionHitsBodies(e, world, phys, debris, mobs, spawns);
           stream.MarkModifiedBox({e.x - e.radius, e.y - e.radius, e.z - e.radius},
                                  {e.x + e.radius, e.y + e.radius, e.z + e.radius});

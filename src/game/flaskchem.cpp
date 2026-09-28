@@ -74,7 +74,17 @@ inline uint32_t Over(uint32_t dst, int r, int g, int b, int a) {
 }
 // The palette is linear light; the bench draws to the screen (flasksim.cpp
 // ToDisplay, the same 1/1.5 encode).
-inline int Enc(int v) { return (int)std::lround(255.0 * std::pow(std::clamp(v, 0, 255) / 255.0, 1.0 / 1.5)); }
+// A table: three pow() a gas pixel a picture were a third of RenderGas.
+struct EncTable {
+  uint8_t v[256];
+  EncTable() {
+    for (int i = 0; i < 256; i++) v[i] = (uint8_t)std::lround(255.0 * std::pow(i / 255.0, 1.0 / 1.5));
+  }
+};
+inline int Enc(int v) {
+  static const EncTable t;
+  return t.v[std::clamp(v, 0, 255)];
+}
 
 inline uint8_t DirOf(float dx, float dy) {
   if (std::fabs(dy) >= std::fabs(dx)) return dy > 0 ? kChemUp : kChemDown;
@@ -517,6 +527,7 @@ int FlaskSim::SpawnParticle(V2 p, int sub, int units, int home) {
   mbar_.push_back(mass_[sub]);
   calm_.push_back(0);
   phome_.push_back((int8_t)home);
+  psrc_.push_back((int8_t)home);
   pvar_.push_back((uint8_t)(Rand() >> 7));
   panc_.push_back(p);
   pheat_.push_back(SeedHeat(p));
@@ -1002,6 +1013,15 @@ bool FlaskSim::TryRules(uint8_t selfType, int selfIdx, int slot, const std::vect
       continue;
     if (sealed && r.kind == kChemDecay && r.prodSelf == kChemAir && r.chance * 10u < chem_.chanceDen)
       continue;
+    //  - A GAS OUT OF EVERY VESSEL is in the room: it lingers, thins and
+    //    VENTS into the world (StepGas), where the world's own rule disperses
+    //    it. Its slow dispersal here too deleted what the world should get --
+    //    fumes born under acid (noxious gas fades in ~2 s) crossed the mouth
+    //    and were gone before a single eighth reached the world
+    //    (alchemy-react vented 0).
+    if (!inVessel && selfType == NbGas && r.kind == kChemDecay && r.prodSelf == kChemAir &&
+        r.chance * 10u < chem_.chanceDen)
+      continue;
     if (r.kind == kChemDecay) {
       uint32_t chance = r.chance;
       if (ChemScaleArmed(r.cond)) {
@@ -1330,14 +1350,14 @@ void FlaskSim::CompactDead() {
       if (w != i) {
         px_[w] = px_[i]; pv_[w] = pv_[i]; pprev_[w] = pprev_[i];
         psub_[w] = psub_[i]; pw_[w] = pw_[i]; mbar_[w] = mbar_[i]; calm_[w] = calm_[i];
-        phome_[w] = phome_[i]; pvar_[w] = pvar_[i]; panc_[w] = panc_[i]; pheat_[w] = pheat_[i];
+        phome_[w] = phome_[i]; psrc_[w] = psrc_[i]; pvar_[w] = pvar_[i]; panc_[w] = panc_[i]; pheat_[w] = pheat_[i];
         psol_[w] = psol_[i]; pmass_[w] = pmass_[i];
       }
       w++;
     }
     nAct_ = act;
     px_.resize(w); pv_.resize(w); pprev_.resize(w); psub_.resize(w); pw_.resize(w); mbar_.resize(w);
-    calm_.resize(w); phome_.resize(w); pvar_.resize(w); panc_.resize(w); pheat_.resize(w);
+    calm_.resize(w); phome_.resize(w); psrc_.resize(w); pvar_.resize(w); panc_.resize(w); pheat_.resize(w);
     psol_.resize(w); pmass_.resize(w);
     needPartition_ = true;
   }
@@ -1426,6 +1446,11 @@ void FlaskSim::EnsureGasFlow() {
   liqPx_.assign((size_t)W * H, 0);
   liqCellV_.assign(n, V2{});
   liqCellN_.assign(n, 0.0f);
+  gtlW_ = (cw + kGasTile - 1) / kGasTile;
+  gtlH_ = (ch + kGasTile - 1) / kGasTile;
+  gTileOn_.assign((size_t)gtlW_ * gtlH_, 0);
+  gTileWas_.assign((size_t)gtlW_ * gtlH_, 0);
+  gTileSeed_.assign((size_t)gtlW_ * gtlH_, 0);
   gbx0_ = gby0_ = 0;
   gbx1_ = gby1_ = -1;
 }
@@ -1450,6 +1475,36 @@ float FlaskSim::SampleGv(float x, float y, const float* from) const {
   const int s = gcW_;
   const float a = v[j0 * s + i0], b = v[j0 * s + i0 + 1], c = v[(j0 + 1) * s + i0], d = v[(j0 + 1) * s + i0 + 1];
   return (a + (b - a) * tx) * (1 - ty) + (c + (d - c) * tx) * ty;
+}
+
+// THE ROOM'S DRAUGHT (SimConfig::gasWind): a stream function, so the breeze
+// is divergence-free before the solve sees it -- a drifting wind along the
+// bench (stronger higher up, a little shear) plus a lattice of slow eddies
+// that wander with it. Every phase is a function of the step count: the
+// same bench does the same thing.
+//   psi = U0(t) (0.7 y + 0.15 y^2 / H) + 0.6 A / k sin(k x + a(t)) sin(k y + b(t))
+//   u = dpsi/dy = U0 (0.7 + 0.3 y / H) + 0.6 A sin(k x + a) cos(k y + b)
+//   v = -dpsi/dx = -0.6 A cos(k x + a) sin(k y + b)
+// U0 wanders between -A and A over ~20 s (a draught that comes and goes and
+// sometimes turns round); the eddies drift over ~10 s.
+namespace {
+constexpr float kWindEddy = 96.0f;   // px, eddy wavelength
+constexpr float kTwoPi = 6.2831853f;
+constexpr float kBenchStepsPerSec = 240.0f;   // AlchemyBench: Step(4) at 60 Hz
+constexpr float kMouthAbove = 4.0f;           // px over the lip the mouth's draw still reaches
+constexpr float kMouthMaxDrift = 0.45f;       // px per gas step, the mouth drift at most (half the transport CFL)
+}  // namespace
+void FlaskSim::SetWindPhase() {
+  const float A = cfg_.gasWind, t = (float)step_ / kBenchStepsPerSec;
+  windU0_ = A * (0.65f * std::sin(kTwoPi * t / 19.0f + 0.4f) + 0.35f * std::sin(kTwoPi * t / 6.7f + 1.3f));
+  windPhX_ = std::fmod(kTwoPi * t / 11.0f, kTwoPi);
+  windPhY_ = std::fmod(kTwoPi * t / 13.0f + 0.9f, kTwoPi);
+}
+V2 FlaskSim::WindAt(V2 p) const {
+  const float A = cfg_.gasWind, k = kTwoPi / kWindEddy;
+  const float sx = std::sin(k * p.x + windPhX_), cx = std::cos(k * p.x + windPhX_);
+  const float sy = std::sin(k * p.y + windPhY_), cy = std::cos(k * p.y + windPhY_);
+  return {windU0_ * (0.7f + 0.3f * p.y / (float)std::max(1, cfg_.gridH)) + 0.6f * A * sx * cy, -0.6f * A * cx * sy};
 }
 
 void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
@@ -1566,9 +1621,14 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
 
   // 2. THE CELLS: solid (glass, grain or liquid holds 3 of its 4 pixels) or
   // air; the air's frame (the vessel it is inside); the gas in it.
+  // A cell with any GLASS in it is glass: at 2 px a cell, a majority rule
+  // let a diagonal wall through as a chequer of air cells, and the solve
+  // breathed across the glass.
   const float buoyK = cfg_.gasBuoyancy / (float)(C * C * R);
+  const int T = kGasTile;
   for (int j = by0; j <= by1; j++)
     for (int i = bx0; i <= bx1; i++) {
+      if (!gTileOn_[(size_t)(j / T) * gtlW_ + i / T]) continue;   // open air (lf 2)
       int solid = 0, freePx = 0, wallV = -1;
       bool liq = false;
       uint32_t gas = 0;
@@ -1595,7 +1655,7 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       gcFrame_[c] = frame ? frame : anyFrame;
       gcDen_[c] = freePx ? (float)gas / (float)(freePx * R) : 0.0f;
       float b = lift * buoyK;
-      if (solid * 4 >= 3 * C * C) {
+      if (wallV >= 0 || solid * 4 >= 3 * C * C) {
         lf[L(i, j)] = 1;
         V2 sv{};
         if (wallV >= 0 && wallV < (int)vessels_.size() && !vessels_[wallV].outline.empty()) sv = vesselVel(wallV, ctr);
@@ -1666,6 +1726,29 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
     const float w = std::min(1.0f, 2.0f * (gcDen_[ca] + gcDen_[cb]));
     return w > 0 ? jitA * w * (float)(Rand01() - 0.5) : 0.0f;
   };
+  // THE DRAUGHT (SimConfig::gasWind): air outside every vessel is pulled
+  // toward the room's breeze, gasWindGrip of the difference a step. Its
+  // sines per column and row of faces: [sin, cos] at the face line, then
+  // [sin, cos] half a cell on.
+  const float windA = cfg_.gasWind, grip = std::clamp(cfg_.gasWindGrip, 0.0f, 1.0f);
+  const bool windOn = windA > 0 && grip > 0;
+  if (windOn) {
+    // (the phases: StepGas set them)
+    const float k = kTwoPi / kWindEddy;
+    windCol_.resize((size_t)(bw + 1) * 4);
+    windRow_.resize((size_t)(bh + 1) * 5);
+    for (int i = bx0; i <= bx1 + 1; i++) {
+      float* w = &windCol_[(size_t)(i - bx0) * 4];
+      w[0] = std::sin(k * i * C + windPhX_); w[1] = std::cos(k * i * C + windPhX_);
+      w[2] = std::sin(k * (i + 0.5f) * C + windPhX_); w[3] = std::cos(k * (i + 0.5f) * C + windPhX_);
+    }
+    for (int j = by0; j <= by1 + 1; j++) {
+      float* w = &windRow_[(size_t)(j - by0) * 5];
+      w[0] = std::sin(k * j * C + windPhY_); w[1] = std::cos(k * j * C + windPhY_);
+      w[2] = std::sin(k * (j + 0.5f) * C + windPhY_); w[3] = std::cos(k * (j + 0.5f) * C + windPhY_);
+      w[4] = windU0_ * (0.7f + 0.3f * (j + 0.5f) * C / (float)H);
+    }
+  }
   for (int j = by0; j <= by1; j++)
     for (int i = bx0 + 1; i <= bx1; i++) {
       const int c0 = j * cw;
@@ -1674,6 +1757,11 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       float& u = gu[j * U1 + i];
       const int fa = gcFrame_[cell(i - 1, j)], fb = gcFrame_[cell(i, j)];
       if (fa && fa == fb) u += 0.5f * (gcBuoy_[cell(i - 1, j)] + gcBuoy_[cell(i, j)]) * felt[fa].x;
+      if (windOn && !fa && !fb) {
+        const float* wc = &windCol_[(size_t)(i - bx0) * 4];
+        const float* wr = &windRow_[(size_t)(j - by0) * 5];
+        u += grip * (wr[4] + 0.6f * windA * wc[0] * wr[3] - u);
+      }
       const size_t q = (size_t)(j - by0) * bw + (i - bx0);
       u = (u + 0.5f * (conf[q - 1].x + conf[q].x) + jit(c0 + i - 1, c0 + i)) * keep;
     }
@@ -1685,6 +1773,11 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
       const int fa = gcFrame_[cell(i, j - 1)], fb = gcFrame_[cell(i, j)];
       const float b = 0.5f * (gcBuoy_[cell(i, j - 1)] + gcBuoy_[cell(i, j)]);
       if (fa && fa == fb) v += b * felt[fa].y;
+      if (windOn && !fa && !fb) {
+        const float* wc = &windCol_[(size_t)(i - bx0) * 4];
+        const float* wr = &windRow_[(size_t)(j - by0) * 5];
+        v += grip * (-0.6f * windA * wc[3] * wr[0] - v);
+      }
       const size_t q = (size_t)(j - by0) * bw + (i - bx0);
       v += b;
       v = (v + 0.5f * (conf[q - bw].y + conf[q].y) + jit(cell(i, j - 1), cell(i, j))) * keep;
@@ -1760,6 +1853,26 @@ void FlaskSim::StepGasFlow(int bx0, int by0, int bx1, int by1) {
   // source, every one of those pumped air out of an open mouth, and a
   // half-full flask blew its vapour out of its neck.
   const float birthK = cfg_.gasExpandRate / (float)(R * C);
+  // Gas is mostly BORN IN MATTER -- a reaction at the acid's bed of sand,
+  // an evaporating particle at the surface -- and a solid cell is no part of
+  // the solve, so its volume was never pushed anywhere and never paid: the
+  // gas bubbled up into a headspace that only compressed (past one
+  // atmosphere, an open flask packed like a stoppered one) while the air
+  // above it never moved and nothing went out of the mouth. The volume
+  // rises with its bubbles: to the first air cell above it on its own side
+  // of the glass (none -- under a shoulder of glass -- and it is dropped).
+  for (int j = by0; j <= by1; j++)
+    for (int i = bx0; i <= bx1; i++) {
+      const int c = cell(i, j);
+      if (gcBirth_[c] <= 0 || lf[L(i, j)] != 1) continue;
+      for (int jj = j + 1; jj <= by1; jj++) {
+        const uint8_t f = lf[L(i, jj)];
+        if (f == 1) continue;
+        if (f == 0 && gcFrame_[cell(i, jj)] == gcFrame_[c]) gcBirth_[cell(i, jj)] += gcBirth_[c];
+        break;
+      }
+      gcBirth_[c] = 0;
+    }
   for (int j = by0; j <= by1; j++)
     for (int i = bx0; i <= bx1; i++) {
       const int l = L(i, j);
@@ -1930,46 +2043,71 @@ void FlaskSim::StepGas() {
     gasList_.resize(w);
   }
   EnsureGasFlow();
-  auto clearBox = [&](int x0, int y0, int x1, int y1, bool keepInner, int ix0, int iy0, int ix1, int iy1) {
-    for (int j = y0; j <= y1; j++)
-      for (int i = x0; i <= x1; i++) {
-        if (keepInner && i >= ix0 && i <= ix1 && j >= iy0 && j <= iy1) continue;
+  const int T = kGasTile, TP = kGasTile * C;
+  // A tile let go of is still air again (its faces and its pressure).
+  auto clearTile = [&](int ti, int tj) {
+    const int i1 = std::min(gcW_, (ti + 1) * T) - 1, j1 = std::min(gcH_, (tj + 1) * T) - 1;
+    for (int j = tj * T; j <= j1; j++)
+      for (int i = ti * T; i <= i1; i++) {
         gu_[(size_t)j * (gcW_ + 1) + i] = gu_[(size_t)j * (gcW_ + 1) + i + 1] = 0;
         gv_[(size_t)j * gcW_ + i] = gv_[(size_t)(j + 1) * gcW_ + i] = 0;
         gp_[(size_t)j * gcW_ + i] = 0;
       }
   };
+  gTileWas_.swap(gTileOn_);
+  std::fill(gTileOn_.begin(), gTileOn_.end(), 0);
   if (gasList_.empty()) {
     // No gas: the air comes to rest.
-    if (gbx1_ >= gbx0_) clearBox(gbx0_, gby0_, gbx1_, gby1_, false, 0, 0, 0, 0);
+    for (int tj = 0; tj < gtlH_; tj++)
+      for (int ti = 0; ti < gtlW_; ti++)
+        if (gTileWas_[(size_t)tj * gtlW_ + ti]) clearTile(ti, tj);
     gbx1_ = gby1_ = -1;
     return;
   }
   BucketChem();
+  SetWindPhase();
 
-  // THE ACTIVE BOX: round the gas, and the whole of every vessel holding
-  // some (a closed flask must be solved whole, or its air leaks out of the
-  // box's open edge).
-  int x0 = W, x1 = -1, y0 = H, y1 = -1;
-  std::vector<uint8_t> holds(vessels_.size() + 1, 0);
+  // THE ACTIVE TILES: every tile with gas in it and its eight neighbours (at
+  // least a tile of air round any wisp), and the whole of every vessel
+  // holding some (a closed flask must be solved whole, or its air leaks out
+  // of the solve's open edge). The solve's box is their bounds; a cell of
+  // the box on no active tile is open air at zero pressure, as the box's
+  // outside always was -- so two flasks at the ends of the bench are two
+  // small solves, not one bench-wide one.
+  gasHolds_.assign(vessels_.size() + 1, 0);
+  std::fill(gTileSeed_.begin(), gTileSeed_.end(), 0);
   for (int k : gasList_) {
     const int x = k % W, y = k / W;
-    x0 = std::min(x0, x); x1 = std::max(x1, x); y0 = std::min(y0, y); y1 = std::max(y1, y);
-    if (inside_[k] && inside_[k] <= vessels_.size()) holds[inside_[k]] = 1;
+    gTileSeed_[(size_t)(y / TP) * gtlW_ + x / TP] = 1;
+    if (inside_[k] && inside_[k] <= vessels_.size()) gasHolds_[inside_[k]] = 1;
   }
+  for (int tj = 0; tj < gtlH_; tj++)
+    for (int ti = 0; ti < gtlW_; ti++) {
+      if (!gTileSeed_[(size_t)tj * gtlW_ + ti]) continue;
+      for (int b = std::max(0, tj - 1); b <= std::min(gtlH_ - 1, tj + 1); b++)
+        for (int a = std::max(0, ti - 1); a <= std::min(gtlW_ - 1, ti + 1); a++) gTileOn_[(size_t)b * gtlW_ + a] = 1;
+    }
   for (size_t vi = 0; vi < vessels_.size(); vi++) {
-    if (!holds[vi + 1] || vessels_[vi].outline.empty()) continue;
+    if (!gasHolds_[vi + 1] || vessels_[vi].outline.empty()) continue;
+    int x0 = W, x1 = -1, y0 = H, y1 = -1;
     for (V2 o : vessels_[vi].outline) {
       const V2 w = ToWorld(vessels_[vi].x, o);
       x0 = std::min(x0, (int)std::floor(w.x) - 4); x1 = std::max(x1, (int)std::ceil(w.x) + 4);
       y0 = std::min(y0, (int)std::floor(w.y) - 4); y1 = std::max(y1, (int)std::ceil(w.y) + 8);
     }
+    for (int tj = std::max(0, y0) / TP; tj <= std::min(gtlH_ - 1, std::max(0, y1) / TP); tj++)
+      for (int ti = std::max(0, x0) / TP; ti <= std::min(gtlW_ - 1, std::max(0, x1) / TP); ti++)
+        gTileOn_[(size_t)tj * gtlW_ + ti] = 1;
   }
-  const int M = 12;
-  const int bx0 = std::max(0, (x0 - M) / C), bx1 = std::min(gcW_ - 1, (x1 + M) / C);
-  const int by0 = std::max(0, (y0 - M) / C), by1 = std::min(gcH_ - 1, (y1 + M) / C);
-  // What the box let go of is still air again.
-  if (gbx1_ >= gbx0_) clearBox(gbx0_, gby0_, gbx1_, gby1_, true, bx0, by0, bx1, by1);
+  int bx0 = gcW_, bx1 = -1, by0 = gcH_, by1 = -1;
+  for (int tj = 0; tj < gtlH_; tj++)
+    for (int ti = 0; ti < gtlW_; ti++) {
+      const size_t t = (size_t)tj * gtlW_ + ti;
+      if (gTileWas_[t] && !gTileOn_[t]) clearTile(ti, tj);
+      if (!gTileOn_[t]) continue;
+      bx0 = std::min(bx0, ti * T); bx1 = std::max(bx1, std::min(gcW_, (ti + 1) * T) - 1);
+      by0 = std::min(by0, tj * T); by1 = std::max(by1, std::min(gcH_, (tj + 1) * T) - 1);
+    }
   gbx0_ = bx0; gby0_ = by0; gbx1_ = bx1; gby1_ = by1;
 
   StepGasFlow(bx0, by0, bx1, by1);
@@ -1992,6 +2130,48 @@ void FlaskSim::StepGas() {
     NoteExit((k % W) + 0.5f, n);
     gasAmt_[k] = (uint16_t)(gasAmt_[k] - n);
   };
+  // THE MOUTH'S EXCHANGE (SimConfig::gasMouthExchange, gasWindMouth). A gas
+  // leaves an open mouth by a counter-flow in the neck -- out along one
+  // side, room air in along the other -- and a breeze over the mouth adds
+  // the eddy it spins there and the turbulence at the lip. The 2-px grid
+  // resolves neither in a 12-px neck: measured, the solve's own exchange
+  // was a few px wide at under a px a step, so a light gas mixed through the
+  // bulb reached the lip dilute and an open flask looked stoppered (and a
+  // heavy vapour held mouth-down poured a fifth in 6 s); driving a cavity
+  // eddy on the air only swapped the neck's air with the plume over it. So
+  // it acts on the GAS (the units drift; the air is untouched): in the top
+  // gasWindMouthDepth neck-widths of every open vessel holding gas (and
+  // kMouthAbove px over the lip) the gas drifts out along the vessel's up at
+  // gasMouthExchange + gasWindMouth x the breeze's speed at the mouth,
+  // fading with depth, where the mouth faces the way that gas goes (the
+  // transport below). Units only move: exact. A stopper is glass.
+  draws_.clear();
+  const float mouthX = std::max(0.0f, cfg_.gasMouthExchange);
+  for (size_t vi = 0; vi < vessels_.size(); vi++) {
+    const Vessel& vs = vessels_[vi];
+    if (vs.outline.size() < 2 || vs.stoppered || vi + 1 >= gasHolds_.size() || !gasHolds_[vi + 1]) continue;
+    MouthDraw md;
+    md.x = vs.x;
+    const V2 la = vs.outline.front(), lb = vs.outline.back();
+    md.lm = (la + lb) * 0.5f;
+    md.hw = 0.5f * std::hypot(lb.x - la.x, lb.y - la.y);
+    if (md.hw < 1.0f) continue;
+    const V2 o = ToWorld(vs.x, {0, 0});
+    md.up = ToWorld(vs.x, {0, 1}) - o;
+    const V2 w = cfg_.gasWind > 0 ? WindAt(ToWorld(vs.x, md.lm)) : V2{};
+    md.speed = std::max(0.0f, cfg_.gasWindMouth) * std::hypot(w.x, w.y);
+    if (md.speed + mouthX <= 0) continue;
+    md.depth = std::max(2.0f, cfg_.gasWindMouthDepth * 2.0f * md.hw);
+    md.x0 = md.y0 = 1e9f;
+    md.x1 = md.y1 = -1e9f;
+    for (V2 lp : {V2{md.lm.x - md.hw, md.lm.y + kMouthAbove}, V2{md.lm.x + md.hw, md.lm.y + kMouthAbove},
+                  V2{md.lm.x - md.hw, md.lm.y - md.depth}, V2{md.lm.x + md.hw, md.lm.y - md.depth}}) {
+      const V2 p = ToWorld(vs.x, lp);
+      md.x0 = std::min(md.x0, p.x); md.x1 = std::max(md.x1, p.x);
+      md.y0 = std::min(md.y0, p.y); md.y1 = std::max(md.y1, p.y);
+    }
+    draws_.push_back(md);
+  }
   // Can gas of slot s go into pixel nk (before this step's moves)?
   auto openPx = [&](int nk, int s) {
     if (wall_[nk] || grid_[nk] || liqPx_[nk]) return false;
@@ -2064,8 +2244,25 @@ void FlaskSim::StepGas() {
     // THE FLOW: upwind through each face by its velocity, plus diffusion
     // down the difference.
     const float cx = x + 0.5f, cy = y + 0.5f;
-    const float vel[4] = {SampleGu(x + 1.0f, cy), -SampleGu((float)x, cy), SampleGv(cx, y + 1.0f),
-                          -SampleGv(cx, (float)y)};
+    float vel[4] = {SampleGu(x + 1.0f, cy), -SampleGu((float)x, cy), SampleGv(cx, y + 1.0f),
+                    -SampleGv(cx, (float)y)};
+    // The breeze's draw at an open mouth: the gas (not the air) drifts up
+    // and out through it.
+    for (const MouthDraw& md : draws_) {
+      if (cx < md.x0 || cx > md.x1 || cy < md.y0 || cy > md.y1) continue;
+      // Only where the mouth faces the way this gas goes: up for a light
+      // gas, down for a heavy one (a flask held mouth-down pours its
+      // vapour; upright, the vapour lies in it; a light gas in an upturned
+      // flask is a trapped bubble). Sideways, a little.
+      const float face = std::clamp((S.heavy ? -md.up.y : md.up.y) + 0.3f, 0.0f, 1.0f);
+      if (face <= 0) continue;
+      const V2 l = ToLocal(md.x, {cx, cy});
+      const float xi = (l.x - md.lm.x) / md.hw, d = md.lm.y - l.y;
+      if (xi <= -1.0f || xi >= 1.0f || d > md.depth || d < -kMouthAbove) continue;
+      const float sp = std::min(kMouthMaxDrift, (md.speed + mouthX) * face) * (d <= 0 ? 1.0f : 1.0f - d / md.depth);
+      vel[0] += sp * md.up.x; vel[1] -= sp * md.up.x;
+      vel[2] += sp * md.up.y; vel[3] -= sp * md.up.y;
+    }
     static const int kD[4][2] = {{1, 0}, {-1, 0}, {0, 1}, {0, -1}};
     float f[4];
     int to[4];
@@ -2255,14 +2452,15 @@ void FlaskSim::RenderGas(std::vector<uint32_t>& out) const {
         }
     }
   // Light from above through the cloud: optical depth accumulated down each
-  // column (a deep pool of vapour is shadowed at its bottom).
+  // column (a deep pool of vapour is shadowed at its bottom). Kept as the
+  // depth; its exp is taken only where a pixel is drawn.
   std::vector<float>& shade = tmp;
   for (int xx = 0; xx < bw; xx++) {
     float acc = 0;
     for (int yy = bh - 1; yy >= 0; yy--) {
       const size_t j = (size_t)yy * bw + xx;
       acc = acc * 0.93f + rGas_[j];
-      shade[j] = std::exp(-0.06f * acc);
+      shade[j] = acc;
     }
   }
   // The advected texture, bilinear over cell centres.
@@ -2326,7 +2524,7 @@ void FlaskSim::RenderGas(std::vector<uint32_t>& out) const {
       // Smoke is lit: a dark gas still reads against the dark desk as a haze
       // of its own hue (a third of the way to a pale grey), shadowed below.
       r += (170 - r) / 3; g += (175 - g) / 3; b += (170 - b) / 3;
-      const float lit = 0.62f + 0.38f * shade[j];
+      const float lit = 0.62f + 0.38f * std::exp(-0.06f * shade[j]);
       r = (int)(r * lit); g = (int)(g * lit); b = (int)(b * lit);
       const float glow = S.emission / 255.0f;
       if (wall_[k]) a *= 0.5f;

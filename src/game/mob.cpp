@@ -839,7 +839,8 @@ bool BuildMobDef(const MobDefFactory& fac, const MobSource& src, const json& j,
   // brick. Doing it here means exactly one place understands the remap.
   if (!def.prefab.artColors.empty()) {
     const std::vector<uint8_t> remap =
-        MicroBodyMergeArt(micro, def.prefab.artColors, def.name, log);
+        MicroBodyMergeArt(micro, def.prefab.artColors, def.name, log,
+                          &def.prefab);
     for (PrefabModel& pm : def.prefab.models)
       for (PrefabVoxel& v : pm.voxels)
         if (v.color) v.color = remap[v.color];
@@ -2107,20 +2108,20 @@ bool LoadMobDefs(const std::string& dir, const std::vector<MaterialDef>& mats,
   // list, so carrying one across a reload would repaint every def with the
   // previous load's colours.
   micro.artColors.clear();
-  // ...and the material -> stain-slot table the brick's stain lattice narrows
-  // coat words through. Published HERE as well as from
+  // ...and which materials the brick's stain lattice can draw a coat in (a
+  // coat is drawn by its material, microbody.h). Published HERE as well as from
   // MobSystem::OnMaterialsReloaded because a set is handed to the system after
   // the system's tables are built (main.cpp orders SetMicroSet after Init),
   // and because a hot reload replaces the set wholesale with an empty one.
   {
-    std::vector<uint8_t> slotOfMat(mats.size(), 0);
-    uint8_t bruiseSlot = 0;
+    std::vector<uint8_t> drawsCoat(mats.size(), 0);
+    uint16_t bruiseMat = 0;
     const std::string& bruiseName = CurrentTuning().gore.bruiseMat;
     for (size_t i = 0; i < mats.size(); i++) {
-      slotOfMat[i] = (uint8_t)mats[i].stainSlot;
-      if (mats[i].name == bruiseName) bruiseSlot = (uint8_t)mats[i].stainSlot;
+      drawsCoat[i] = mats[i].stainSlot != 0 ? 1 : 0;
+      if (mats[i].name == bruiseName && mats[i].stainSlot != 0) bruiseMat = (uint16_t)i;
     }
-    MicroBodySetStainSlots(micro, std::move(slotOfMat), bruiseSlot);
+    MicroBodySetCoatLooks(micro, std::move(drawsCoat), bruiseMat);
   }
   std::error_code ec;
   const std::vector<MobSource> sources = CollectMobSources(dir, log, ec);
@@ -2292,10 +2293,10 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     matInfectious_.push_back((infectiousMask && (m.gpu.tagMask & infectiousMask)) ? 1 : 0);
     // Could any rewrite of this material land on a creature? matAttacksBody_.
     const uint8_t attacks = matAttacksBody_[mi];
-    // ---- the stain palette, both ways round, and the coat block ------------
-    // The slot is what the RENDERER can afford (three bits in the voxel word
-    // and three in the micro brick's stain lattice); the material is what
-    // everything else needs. Both directions are mirrored here so no caller
+    // ---- the stain slot, both ways round, and the coat block --------------
+    // A GROUND slot (1..7) is what the voxel word can afford (three bits); a
+    // bodyOnly stain's is 8+ and never reaches a cell; the material is what
+    // everything else needs, the renderer's body coat included. Both directions are mirrored here so no caller
     // has to hold a MaterialDef to convert, and the reverse table takes the
     // FIRST material that claimed a slot — materials sharing a stain name look
     // identical by construction, so there is nothing better to pick.
@@ -2338,19 +2339,21 @@ void MobSystem::OnMaterialsReloaded(const std::vector<MaterialDef>& mats,
     }
     SetBodyCoatClasses(std::move(cls));
   }
-  // The micro brick's stain lattice is the one consumer that still speaks in
-  // palette slots, so it is handed the table rather than the material list
+  // The micro brick's stain lattice draws a coat by its MATERIAL; it is
+  // handed only "which materials have a look" rather than the material list
   // (sim/microbody.h keeps no dependency on sim/materials.h). Republished on
-  // every reload because an R reload can renumber the slots under bricks that
-  // are already packed.
-  // The BRUISE draws in gore.bruiseMat's slot (voxload.h PrefabVoxel::bruise):
-  // the skin's own damage, not a coat, so it rides beside the table.
+  // every reload because an R reload can add or drop stain blocks.
+  // The BRUISE draws in gore.bruiseMat (voxload.h PrefabVoxel::bruise): the
+  // skin's own damage, not a coat, so it rides beside the table.
   if (microSet_) {
-    uint8_t bruiseSlot = 0;
+    std::vector<uint8_t> drawsCoat(stainSlotOfMat_.size(), 0);
+    uint16_t bruiseMat = 0;
     const std::string& bruiseName = CurrentTuning().gore.bruiseMat;
-    for (size_t mi = 0; mi < mats.size(); mi++)
-      if (mats[mi].name == bruiseName) bruiseSlot = (uint8_t)mats[mi].stainSlot;
-    MicroBodySetStainSlots(*microSet_, stainSlotOfMat_, bruiseSlot);
+    for (size_t mi = 0; mi < mats.size(); mi++) {
+      if (mi < drawsCoat.size()) drawsCoat[mi] = stainSlotOfMat_[mi] != 0 ? 1 : 0;
+      if (mats[mi].name == bruiseName && mats[mi].stainSlot != 0) bruiseMat = (uint16_t)mi;
+    }
+    MicroBodySetCoatLooks(*microSet_, std::move(drawsCoat), bruiseMat);
   }
   // What each material becomes when it CATCHES: the product of the first rule
   // in its bucket whose product is itself hot. Resolved from the table so the
@@ -9300,10 +9303,43 @@ void Mob::BleedTick(uint32_t tick, World& world, std::vector<BrushOp>& ops,
     // turns it into hp, and death is what ends it. Capped at one clump rather
     // than at the wound cap so a stump that cannot drip this tick (out of
     // ops) does not bank blood for later.
-    if (limb.stumpOpen && alive_ && gore.stumpBleedsOpen) {
+    //
+    // THE VOLUME DIAL APPLIES HERE TOO (2026-09-26): the top-up is paid in
+    // gore.bleedVoxelGain of a clump per drip period rather than refilled to
+    // a whole one every tick, so halving the gain halves what an amputation
+    // puts on the floor. At gain 1 it is exactly the old refill (a drip
+    // spends one clump per period and this puts one back).
+    if (limb.stumpOpen && alive_ && gore.stumpBleedsOpen &&
+        tick % (uint32_t)std::max(1, gore.bleedDripTicks) == 0) {
       const float clumpVox =
           (float)BleedClumpVoxels(std::max(0, gore.bleedClumpRadius));
-      if (limb.bleedBudget < clumpVox) limb.bleedBudget = clumpVox;
+      if (limb.bleedBudget < clumpVox)
+        limb.bleedBudget =
+            std::min(clumpVox, limb.bleedBudget +
+                                   clumpVox * std::max(0.0f, gore.bleedVoxelGain));
+    }
+
+    // ---- A BLEEDING WOUND STAYS BLOODY (2026-09-26) -------------------------
+    //
+    // The cut's smear is laid once, on the hit tick; wash it off and the wound
+    // went on dripping out of clean skin and bone. While a LIVING limb still
+    // owes blood, the smear is re-laid round the wound (Mob::ReBloodWound),
+    // heavier the more it owes; an open stump counts as fully bleeding.
+    // Staggered by creature and limb so a crowd of wounds does not all walk
+    // their lattices on the same tick.
+    if (alive_ && limb.body && gore.woundRebloodTicks > 0 &&
+        (limb.bleedBudget >= 1.0f || limb.stumpOpen) &&
+        (tick + (uint32_t)id_ * 7u + (uint32_t)li * 3u) %
+                (uint32_t)gore.woundRebloodTicks == 0) {
+      const float owe =
+          limb.stumpOpen
+              ? 1.0f
+              : std::clamp(limb.bleedBudget /
+                               std::max(1.0f, gore.woundRebloodFull),
+                           0.0f, 1.0f);
+      ReBloodWound((int)li, limb.woundLocal, 0.5f + 0.5f * owe,
+                   Hash3((uint32_t)id_ * 2654435761u + (uint32_t)li, tick,
+                         0x2EB1Du));
     }
 
     // Report the wound for audio BEFORE the budget/op-rate early-outs
@@ -12063,6 +12099,67 @@ uint32_t Mob::StainWoundAs(int limbIndex, Vec3 centreLocal, float radiusWorld,
   return stained;
 }
 
+uint32_t Mob::ReBloodWound(int limbIndex, Vec3 centreLocal, float wet,
+                           uint32_t seed) {
+  if (!def_ || limbIndex < 0 || limbIndex >= (int)limbs_.size()) return 0;
+  // The same refusals StainWoundAs makes: no blood in hair, a garment or a
+  // held item.
+  if (IsBloodless(limbIndex) || limbIndex >= baseLimbs_) return 0;
+  const auto& gt = CurrentTuning().gore;
+  wet = std::clamp(wet, 0.0f, 1.0f);
+  if (wet <= 0.0f || gt.woundRebloodRadius <= 0.0f ||
+      gt.woundRebloodAmount <= 0)
+    return 0;
+  const uint32_t smear = DefaultSmearMat();
+  if (!sys_ || !smear || !sys_->StainTypeOf(smear)) return 0;
+  MobLimb& limb = limbs_[limbIndex];
+  if (!limb.body) return 0;
+  const bool fine = limb.HasFineSkin();
+  const float scale =
+      (float)std::max(1u, fine ? SkinScaleOf(limb) : PhysScaleOf(limb));
+  // Owned before poking, as StainWoundAs does: a shared brick is everybody's
+  // art, and a poke into it would bloody every creature drawn from it.
+  MicroBodySet* micro = MicroSet();
+  bool poke = false;
+  if (micro && limb.microModel >= 0) {
+    const int own = MicroBodyOwn(*micro, (uint32_t)limb.microModel);
+    if (own >= 0) {
+      limb.microModel = own;
+      limb.carved = true;
+      limb.flipbookModel = -1;
+      poke = true;
+    }
+  }
+  CutSoak soak;
+  soak.mat = smear;
+  // The reach comes in as sqrt(wet), the amount linearly -- StainWoundAs's
+  // rule: a faint trace stays narrow rather than going faint everywhere.
+  soak.radius = gt.woundRebloodRadius * scale * std::sqrt(wet);
+  soak.amountExposed =
+      (int)std::lround((float)std::min(gt.woundRebloodAmount, 15) * wet);
+  // The SURFACE only: what a fresh cut soaked into the meat is still there;
+  // this is the blood welling back over what can be seen.
+  soak.amountBuried = 0;
+  soak.buriedChance = 0.0f;
+  soak.boneMin = (int)std::lround((float)gt.stainBoneMin * wet);
+  soak.tissue = &def_->tissue;
+  StainLattice L;
+  if (fine) L.skin = &limb.skinVoxels; else L.coll = &limb.voxels;
+  const uint32_t changed = SoakCut(L, centreLocal * scale, soak, seed, micro,
+                                   poke ? limb.microModel : -1);
+  if (!changed) return 0;
+  coatDirty_ = twinDirty_ = true;  // the ledger owes a recount (LimbCoat)
+  if (fine) {
+    bool overflow = false;
+    limb.voxels = DownsampleSkin(
+        limb.skinVoxels,
+        std::max(1u, SkinScaleOf(limb) / std::max(1u, PhysScaleOf(limb))),
+        &overflow);
+  }
+  MarkInstancesDirty();
+  return changed;
+}
+
 bool MobSystem::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
                         std::vector<ParticleSpawn>& spawns, float severity) {
   // AND THE PLAYER BLEEDS TOO (every creature, ForEachCreature's order).
@@ -12190,7 +12287,8 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
     const float cleave = std::max(cut.cleave, 0.0f);
     const float budget = depth * 2.0f * halfL + cleave;
     KerfBiteResult bite;
-    if (mayPart || cleave > 0.0f) {
+    // A STAB IS A HOLE (phys/kerf.h KerfCut::stab): never priced, never through.
+    if (!cut.stab && (mayPart || cleave > 0.0f)) {
       // Resistance per material, relative to skin; unknown or art-palette
       // matter (ids 128.., which are colours) is charged as skin.
       const float ref = CurrentTuning().gear.cutHardnessRef;
@@ -12338,6 +12436,12 @@ bool Mob::CutLimb(uint64_t bodyHandle, const BladeCut& cut, World& world,
       return true;
     }
 
+    // THE WOUND IS WHERE THE EDGE WENT IN (2026-09-26). Damage() left
+    // woundLocal at the probe's hit on the Jolt collider, which is near the
+    // surface but not on it; the entry-snapped slot mouth is. The drip comes
+    // out of it and BleedTick's re-bleed (Mob::ReBloodWound) re-stains round
+    // it, and a stab's bore is deep enough that its middle would be buried.
+    limbs_[i].woundLocal = slotAt;
     // The soak goes on LAST, over what survived, and centred a little way into
     // the cut so it follows the gash rather than ringing the entry point.
     StainWound((int)i, slotAt + w * (depth * 0.5f),

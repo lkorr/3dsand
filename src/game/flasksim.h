@@ -13,9 +13,19 @@
 // Powders: a falling-sand pixel CA on the same grid, one grain per pixel. A
 // grain reads the liquid under it (the mean particle mass in that pixel) to
 // decide whether it sinks, and how fast; moving into a pixel shoves that
-// pixel's particles into the one it left. Grains are walls to the liquid.
-// A grain the stirring stick hits is FLUNG: it carries a velocity and moves
-// ballistically (dragged by the liquid) until it slows, then rejoins the CA.
+// pixel's particles into the one it left. A RESTING grain is a wall to the
+// liquid. A grain the stirring stick hits is FLUNG: it carries a velocity and
+// moves ballistically until it slows, then rejoins the CA. A grain IN LIQUID
+// with nothing holding it (StepGrains, "WET") is flung too, and carried by
+// its liquid: dragged toward the liquid's velocity, settling through it at
+// the CA's pace only inside a vessel (in flight the liquid is weightless and
+// nothing settles), the drag paid back to the liquid equal and opposite; one
+// moving faster than half a pixel a step is no wall -- so a falling blob of
+// slime and dirt falls as one instead of standing on its own dirt.
+//
+// A MOVING VESSEL CARRIES ITS CONTENTS in its frame (SimConfig::vesselFeel):
+// grains and liquid take the same whole-pixel shift a step, the liquid takes
+// the vessel's acceleration less the part it feels as slosh.
 //
 // Units. The grid is `gridW x gridH` pixels, y UP (row 0 = bottom). One grain
 // is one pixel of area and one UNIT; one eighth of a cell is
@@ -195,6 +205,25 @@ struct SimConfig {
   // how far a shake can throw it up the glass.
   float vesselAccel = 1.1f;
   float vesselDropAccel = 0.6f;
+  // THE CONTENTS RIDE THEIR VESSEL'S FRAME (StepLiquid, CarryGrains). A held
+  // vessel's liquid moves by the same whole-pixel shift as its grains (the
+  // translation of its interior's centre), takes the vessel's acceleration
+  // on every particle, and FEELS only `vesselFeel` of that acceleration
+  // sideways as a fictitious force -- the slosh. Pushed by the glass alone
+  // (1.0), the glass shoved the whole body through two relaxation passes:
+  // a lift squeezed the liquid and drove it into the sand bed the carry had
+  // lifted into it (lab, 2026-09-27: occupied area -26%, 170 particles in
+  // grain pixels), and a shake threw it about as a spring (density +/-40%).
+  // 0.5 keeps a shaken flask sloshing and mixing (alchemy-shake,
+  // alchemy-resort: a hard shake still mixes water into oil) at +/-11%;
+  // below ~0.45 a hard shake no longer mixes two liquids.
+  // Turning is not carried: the glass turns round a level liquid, as round a
+  // level sand bed.
+  float vesselFeel = 0.5f;
+  // ...and of its UP-AND-DOWN acceleration, which makes no slosh -- only
+  // weight: felt in full, a lift loaded the liquid to 2g and squeezed it
+  // 8% denser, and a drop let it swell.
+  float vesselFeelLift = 0.1f;
   // ---- where the energy goes (without these a stirred mix churns forever) --
   // Velocity kept per step, 1 - drag, RELATIVE TO THE VESSEL the particle is
   // in (its rigid motion at that point). A world-frame drag acted on a moving
@@ -283,6 +312,28 @@ struct SimConfig {
   int gasPressureIters = 30;
   float gasSor = 1.7f;
   float gasJitter = 0.02f;       // random push a step where gas is, px/step (turbulence)
+  // THE ROOM'S DRAUGHT (owner, 2026-09-27: "a small ambient wind ... pushes
+  // gas around outside vessels, and near the top/mouth of an open flask
+  // lightly draws gas out, like a breeze across a bottle mouth"). A slowly
+  // varying, divergence-free breeze (a drifting uniform wind plus a lattice
+  // of slow eddies, a pure function of the step count) that the AIR OUTSIDE
+  // EVERY VESSEL is pulled toward, gasWindGrip of the difference a gas step.
+  // Air inside glass never feels it; at an open mouth it adds to the mouth's
+  // draw (below). gasWind: peak speed, px per gas step (0 = still room).
+  // AlchemyBench sets it every frame from tuning.json `tools.alchemyWind`.
+  float gasWind = 0.12f;
+  float gasWindGrip = 0.06f;
+  // THE MOUTH'S EXCHANGE, which a 2-px grid cannot resolve in a 12-px neck
+  // (StepGas): in the top gasWindMouthDepth neck-widths of an open vessel,
+  // gas drifts out through the mouth at gasMouthExchange (px per gas step,
+  // the counter-flow of gas out and room air in) + gasWindMouth x the
+  // breeze's speed there (a breeze across a bottle ventilates it), fading
+  // with depth -- where the mouth faces the way the gas goes: up for a light
+  // gas, down for a heavy vapour (upright, it lies in the bottle; held
+  // mouth-down, it pours).
+  float gasMouthExchange = 0.15f;
+  float gasWindMouth = 3.0f;
+  float gasWindMouthDepth = 4.0f;
   // THE BURNER. Heat 0..1 rises while it is on and the vessel stands on the
   // table (its base within burnerReach px of tableY), and falls off after.
   float heatRiseSec = 2.5f;
@@ -397,8 +448,9 @@ class FlaskSim {
   int GasPixelCount() const { return (int)gasList_.size(); }
 
   // Kinematic: the UI owns a vessel's TARGET pose; the vessel moves toward
-  // it at most maxVesselStep px per substep. The glass pushes liquid and
-  // sweeps grains; contents are never carried rigidly.
+  // it at most maxVesselStep px per substep. Its contents ride its frame's
+  // translation (SimConfig::vesselFeel); its TURNING is the glass's alone --
+  // the glass pushes liquid round and sweeps grains.
   void SetVesselXform(int v, const Xform& x);
   const Xform& VesselXform(int v) const { return vessels_[v].x; }
   // Moves a vessel's glass (and pose target) straight to `x` with no motion
@@ -414,6 +466,9 @@ class FlaskSim {
   bool PoseClear(int v, const Xform& x) const;
   // Would a vessel of this shape, not yet on the bench, fit at `x`?
   bool ShapeClear(const VesselShape& shape, const Xform& x) const;
+
+  // The room's draught (SimConfig::gasWind), px per gas step; 0 = still.
+  void SetGasWind(float w) { cfg_.gasWind = std::max(0.0f, w); }
 
   // The stirring stick: a capsule a..b of radius r, or off.
   void SetStick(bool on, V2 a = {}, V2 b = {}, float r = 3);
@@ -447,7 +502,16 @@ class FlaskSim {
   // of the spill (the fraction of an eighth stays until more joins it, so
   // Count() keeps adding up). The bench streams it into the world as it
   // falls. `exitX` = the mean x (sim pixels) it left at, -1 if unknown.
-  Composition DrainSpilled(float* exitX = nullptr);
+  // `by` (optional) splits the SAME eighths by the vessel each left: the
+  // vessel the matter was last inside (a particle's psrc_, a grain's src),
+  // so two flasks spilling in one step each pour from their own lip. The
+  // split is a partition of the return value: sum(by->vessel) + by->unknown
+  // == it, eighth for eighth.
+  struct SpillBy {
+    std::vector<Composition> vessel;  // per FlaskSim vessel index
+    Composition unknown;              // left no vessel we know of (loose gas, ...)
+  };
+  Composition DrainSpilled(float* exitX = nullptr, SpillBy* by = nullptr);
 
   // RGBA8 (0xAABBGGRR), gridW x gridH, row 0 = TOP (image order). Alpha 0
   // where there is nothing, so the panel's own backdrop shows through.
@@ -525,7 +589,15 @@ class FlaskSim {
     int shock = 0;            // chemistry steps of discharge left
     bool broken = false;      // burst: gone, its contents loose
     V2 vel;                   // px / step (the motion profile, Step)
-    V2 carryRem;              // the grain carry's sub-pixel remainder (CarryGrains)
+    // THE CONTENTS' FRAME (Step, FrameMotion): the velocity of the interior's
+    // centre this step (px / step) -- what carries grains AND liquid -- and
+    // its change since the last step.
+    V2 frameVel, frameAcc;
+    // ...and the WHOLE-PIXEL SHIFT it carries its contents by this step, the
+    // sub-pixel remainder kept for the next: grains and liquid take the same
+    // shift, so a carried pile and the liquid over it keep their places.
+    V2 carryRem;
+    int shiftX = 0, shiftY = 0;
     float angVel = 0;         // rad / step
     float reach = 1;          // farthest outline point from the pose origin
     std::vector<V2> outline;  // local, left lip -> bottom -> right lip
@@ -555,6 +627,9 @@ class FlaskSim {
     // is sliding, the size (1..3) how many steps it has kept sliding. A step
     // it does not move clears it.
     int8_t slide = 0;
+    // The vessel it was last inside, kept after it leaves (home goes to -1):
+    // what a spill is attributed to (DrainSpilled's SpillBy).
+    int8_t src = -1;
   };
 
   void BuildOutline(Vessel& v, bool raster = true) const;
@@ -645,7 +720,19 @@ class FlaskSim {
   void BucketPixels();
   float LiquidMassAt(int x, int y, int* count, V2* vel) const;
   void ShoveLiquid(int fromX, int fromY, int toX, int toY);
-  void MoveGrain(int gi, int x, int y);
+  // `shove`: the liquid in (x, y) takes the pixel it left (ShoveLiquid).
+  void MoveGrain(int gi, int x, int y, bool shove = true);
+  // A grain's home vessel's frame velocity (Vessel::frameVel; none = 0).
+  V2 frameVelOf(const Grain& g) const {
+    return g.home >= 0 && g.home < (int)vessels_.size() && !vessels_[g.home].outline.empty()
+               ? vessels_[g.home].frameVel : V2{};
+  }
+  // How fast a grain settles through the liquid at pixel k (px / step, the
+  // CA's sinking rate): heavier and thinner, faster.
+  float WetSettle(const Grain& g, float ml, size_t k) const;
+  // The liquid round a grain takes back the change `dv` of the grain's
+  // velocity its drag made (equal and opposite momentum, in units).
+  void PayDrag(const Grain& g, V2 dv, float mg);
   uint32_t Rand();
   float Mass(int sub) const { return mass_[sub]; }
 
@@ -662,6 +749,7 @@ class FlaskSim {
   std::vector<float> mbar_;   // neighbourhood mean mass, last step
   std::vector<uint8_t> calm_; // steps of calm-in left
   std::vector<int8_t> phome_; // vessel a particle was last inside, -1 none
+  std::vector<int8_t> psrc_;  // ...and the last one it WAS inside, kept once it leaves (spill attribution)
   std::vector<uint8_t> pvar_; // look: which palette entry + a phase, fixed per particle
   std::vector<V2> panc_;      // where it was when its vessel's quiet window began
   std::vector<uint8_t> pheat_; // look: molten matter's heat phase (SeedHeat)
@@ -674,6 +762,9 @@ class FlaskSim {
   std::vector<int> rcJ_;      // relaxation scratch: i's pairs inside h
   std::vector<float> rcQ_;
   std::vector<V2> rcN_;
+  // StepLiquid scratch: the vessel whose FRAME each awake particle rode this
+  // step (-1 none): its speed cap, its whole-pixel carry and its contacts.
+  std::vector<int8_t> pframe_;
   std::vector<V2> xs_;        // XSPH scratch
   std::vector<float> xw_;
   std::vector<int> orderScratch_;
@@ -735,6 +826,17 @@ class FlaskSim {
   // unit-weighted sum of x.
   double exitSum_ = 0, exitW_ = 0;
   void NoteExit(float x, uint32_t units) { exitSum_ += (double)x * units; exitW_ += units; }
+  // WHICH VESSEL it left, per substance slot, in units: [vessel][slot]. Only
+  // proportions -- the spill's truth is spilledUnits_; DrainSpilled splits
+  // the eighths it drains by this and clamps it to what is still pending.
+  std::vector<std::vector<uint32_t>> exitBy_;
+  void NoteFrom(int vessel, int sub, uint32_t units) {
+    if (vessel < 0 || sub < 0 || !units) return;
+    if ((size_t)vessel >= exitBy_.size()) exitBy_.resize((size_t)vessel + 1);
+    std::vector<uint32_t>& row = exitBy_[(size_t)vessel];
+    if ((size_t)sub >= row.size()) row.resize(spilledUnits_.size() > (size_t)sub ? spilledUnits_.size() : (size_t)sub + 1, 0u);
+    row[(size_t)sub] += units;
+  }
   int highlight_ = -1;
   // ---- the look (Render): derived per substance at SetSubstances ----------
   struct Look {
@@ -779,10 +881,19 @@ class FlaskSim {
   std::vector<int> vesselAir_;
   std::vector<uint8_t> grainDead_;      // grains a chemistry step removed (compacted at its end)
   // THE GAS FLOW (StepGas): a MAC grid of kGasCell-pixel cells, velocities
-  // in px per gas step. Only the cells in the ACTIVE BOX (round the gas, and
-  // every vessel holding some) are stepped; everything outside it is still
-  // air at zero pressure.
-  static constexpr int kGasCell = 1;
+  // in px per gas step. Only the cells on ACTIVE TILES (below) are stepped;
+  // everything else is still air at zero pressure.
+  // 2 px: the pressure solve is a quarter of the cells a 1-px grid had (the
+  // units still move pixel by pixel; the velocity is sampled bilinearly).
+  static constexpr int kGasCell = 2;
+  // THE ACTIVE TILES (kGasTile cells square): a tile is stepped when it
+  // holds gas, touches a tile that does, or lies on a vessel holding some.
+  // Everything else is still air at zero pressure -- two flasks at the ends
+  // of the bench are two small solves, not one bench-wide box.
+  static constexpr int kGasTile = 8;
+  int gtlW_ = 0, gtlH_ = 0;
+  std::vector<uint8_t> gTileOn_, gTileWas_, gTileSeed_;
+  std::vector<uint8_t> gasHolds_;
   int gcW_ = 0, gcH_ = 0;
   std::vector<float> gu_, gv_;          // (gcW+1) x gcH, gcW x (gcH+1)
   std::vector<float> gu2_, gv2_;        // advection scratch
@@ -818,6 +929,15 @@ class FlaskSim {
   std::vector<GasMove> gasMoves_;
   void EnsureGasFlow();
   void StepGasFlow(int bx0, int by0, int bx1, int by1);
+  // The room's draught: this gas step's phases, from the step count (StepGas
+  // sets them), and its sines per column / row of faces (StepGasFlow).
+  void SetWindPhase();
+  V2 WindAt(V2 p) const;   // the breeze at a point, px per gas step
+  float windU0_ = 0, windPhX_ = 0, windPhY_ = 0;
+  // Per open vessel holding gas, this gas step: its mouth's draw (StepGas).
+  struct MouthDraw { Xform x; V2 lm; float hw, depth, speed; V2 up; float x0, x1, y0, y1; };
+  std::vector<MouthDraw> draws_;
+  std::vector<float> windCol_, windRow_;
   // A face velocity at a point (px), bilinear; `from` another field of the same shape.
   float SampleGu(float x, float y, const float* from = nullptr) const;
   float SampleGv(float x, float y, const float* from = nullptr) const;

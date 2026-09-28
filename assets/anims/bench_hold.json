@@ -1,5 +1,5 @@
 {
-  "//": "HOLDING A VESSEL AT THE ALCHEMY BENCH (session.cpp BenchHold): the right forearm comes up level in front of the belly, close in: low enough that the other hand can hold a flask upside down over it without going over your head, the flask held before you. The flask's own tilt is not this clip's: Mob::SetHeldAim turns the hand after the pose so the flask in the fist matches the bench. The arm that pours is IK'd over the other flask instead. A slow small sway so the balance reads as held, not frozen. Rotations are pure X, negative = forward/up (pour.json's convention). The left hand plays the library's derived bench_hold.mirror.",
+  "//": "HOLDING A VESSEL AT THE ALCHEMY BENCH (session.cpp BenchHold): the right forearm comes up level and STRAIGHT OUT in front, the upper arm hanging at the side with no inward roll (owner, 2026-09-27: the hands used to meet at the middle of the chest, squished in): low enough that the other hand can hold a flask upside down over it without going over your head, the flask held before you. The flask's own tilt is not this clip's: Mob::SetHeldAim turns the hand after the pose so the flask in the fist matches the bench. The arm that pours is IK'd over the other flask instead. A slow small sway so the balance reads as held, not frozen. Rotations are pure X, negative = forward/up (pour.json's convention). The left hand plays the library's derived bench_hold.mirror.",
   "name": "bench_hold",
   "sidecarVoxelsPerMetre": 10,
   "durationMs": 2400,
@@ -19,27 +19,27 @@
           "t": 0,
           "q": [
             -0.0432,
-            0.0057,
-            0.1304,
-            0.9905
+            0.0,
+            0.0,
+            0.9991
           ]
         },
         {
           "t": 1200,
           "q": [
             -0.0692,
-            0.0091,
-            0.1302,
-            0.989
+            0.0,
+            0.0,
+            0.9976
           ]
         },
         {
           "t": 2400,
           "q": [
             -0.0432,
-            0.0057,
-            0.1304,
-            0.9905
+            0.0,
+            0.0,
+            0.9991
           ]
         }
       ]

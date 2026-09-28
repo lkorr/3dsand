@@ -8,6 +8,8 @@
       "weaponClass": "long",
       "damage": 14.0,
       "carveBonus": 0.15,
+      "heft": 1.0,
+      "//heft": "Pinned, not derived: the old 40/m slab measured 5.31 world voxels (= gore.woundHeftRef), the 80/m blade with a real section measures far less while weighing the same.",
       "reach": 9.0,
       "blunt": 2.0,
       "armorBreak": 0.05,
@@ -30,6 +32,8 @@
       "weaponClass": "short",
       "damage": 10.0,
       "carveBonus": 0.1,
+      "heft": 0.625,
+      "//heft": "Pinned to what the 40/m art derived (212 micro / 4^3 / 5.3).",
       "reach": 7.5,
       "blunt": 1.0,
       "desc": "Two feet of straight double-edged blade on a one-hand grip. It gives up the arming sword's last third of reach and about a third of its weight with it, and hands back a weapon you can still swing inside somebody's guard."
@@ -40,6 +44,8 @@
       "weaponClass": "short",
       "damage": 6.5,
       "carveBonus": 0.04,
+      "heft": 0.224,
+      "//heft": "Pinned to what the 40/m art derived (76 micro / 4^3 / 5.3).",
       "reach": 6.5,
       "blunt": 1.0,
       "desc": "A hand's length of point, and barely a fifth of the sword behind it. It will not take an arm off in one pass and it was never going to; what it does is open the same wound over and over while standing closer than a sword can answer."

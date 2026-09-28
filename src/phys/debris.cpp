@@ -4718,8 +4718,12 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
   if (b.bleedMat != 0 && carvedWorldVox > 0.0f) {
     const auto& gore = CurrentTuning().gore;
     const bool amputation = fragments.size() > fragmentsBefore;
-    const float drip = carvedWorldVox * gore.corpseBleedPerVoxel +
-                       (amputation ? gore.severStumpBudget : 0.0f);
+    // The two global dials apply to the dead as they do to the living
+    // (AddBleedBudget, MobGore::bleedGain): gore.bleedVoxelGain is the volume
+    // that reaches the floor, gore.bleedGain the droplet and gobbet counts.
+    const float drip = (carvedWorldVox * gore.corpseBleedPerVoxel +
+                        (amputation ? gore.severStumpBudget : 0.0f)) *
+                       std::max(0.0f, gore.bleedVoxelGain);
     // ---- A CUT GOUTS, NOT ONLY AN AMPUTATION (2026-09-19) -----------------
     //
     // The gout — gore.severSpray droplets front-loaded over severDecayTicks,
@@ -4755,7 +4759,8 @@ bool DebrisSystem::DamageBody(size_t bi, World& world,
       // The conserved voxels a dismemberment throws (gore.severVoxels): few,
       // and they are the lasting mess. Thrown from the cut, up and outward.
       const int nVox =
-          (int)std::lround(goutFrac * (float)std::max(0, gore.severVoxels));
+          (int)std::lround(goutFrac * (float)std::max(0, gore.severVoxels) *
+                           std::max(0.0f, gore.bleedGain));
       const float sprd = gore.severGobbetSpread;
       for (int k = 0; k < nVox; k++) {
         if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
@@ -5035,7 +5040,8 @@ void DebrisSystem::BleedBodies(uint32_t tick, World& world,
     if (w.gushTicks > 0) {
       const int decay = std::max(1, gore.severDecayTicks);
       const float frac = (float)w.gushTicks / (float)decay;
-      const int want = (int)std::lround(2.0f * (float)gore.severSpray * frac /
+      const int want = (int)std::lround(2.0f * (float)gore.severSpray *
+                                        std::max(0.0f, gore.bleedGain) * frac /
                                         (float)decay);
       for (int k = 0; k < want; k++) {
         if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
@@ -5068,7 +5074,9 @@ void DebrisSystem::BleedBodies(uint32_t tick, World& world,
       w.budget -= 1.0f;
       drips++;
     }
-    const int sprayN = std::max(0, (int)std::lround(gore.bleedSprayPerDrip));
+    const int sprayN = std::max(
+        0, (int)std::lround(gore.bleedSprayPerDrip *
+                            std::max(0.0f, gore.bleedGain)));
     for (int k = 0; k < sprayN; k++) {
       if (spawns.size() >= kMaxParticleSpawnsPerTick) break;
       const uint32_t h = rng::Hash3(b.serial * 40503u, tick ^ 0xB1005u,
@@ -5235,7 +5243,8 @@ bool DebrisSystem::CutBody(uint64_t handle, const KerfCut& cut, World& world,
   // shell is on the living.
   const bool garment = WornHostOf(handle) != 0ull;
   slot.c = slot.c + slot.w * KerfEntry(slot, latScale, walk);
-  if (!garment) {
+  // A stab is a hole, never a parting (phys/kerf.h KerfCut::stab).
+  if (!garment && !cut.stab) {
     const float edgeHalf = cut.edgeHalf > 0.0f ? cut.edgeHalf : slot.halfL;
     const float cleave = std::max(cut.cleave, 0.0f);
     const float budget = slot.depth * 2.0f * slot.halfL + cleave;

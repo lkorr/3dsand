@@ -3885,6 +3885,17 @@ class Mob {
                         uint32_t seed, uint32_t rewriteMat, uint32_t smearMat,
                         const std::vector<IVec3>* crater = nullptr,
                         float rimCells = 0.0f, float wetness = 1.0f);
+  // ---- A WOUND THAT IS STILL BLEEDING KEEPS ITSELF BLOODY (2026-09-26) ------
+  //
+  // StainWound's SMEAR half alone -- no material rewrite, so it can run again
+  // and again without eating tissue -- laid round `centreLocal` at `wet`
+  // (0..1) of gore.woundRebloodAmount. Called by BleedTick every
+  // gore.woundRebloodTicks while a LIVING limb bleeds, so a wound rinsed
+  // clean with water fills back up with the creature's own blood. A coat is a
+  // maximum (RaiseBodyStain), so a wound already that bloody costs one lattice
+  // walk and changes nothing. Returns voxels whose coat changed.
+  uint32_t ReBloodWound(int limbIndex, Vec3 centreLocal, float wet,
+                        uint32_t seed);
   // ---- THE BLUNT MARK, WHICH IS NOT A REWRITE (2026-09-16) ----------------
   //
   // Lays an ACCUMULATING body coat over every tissue voxel in range instead of

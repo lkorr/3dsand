@@ -1226,8 +1226,17 @@ void Simulation::UploadTables(const rhi::Queue& queue,
   bool claimed[8] = {};
   for (size_t mi = 0; mi < mats.size() && mi < kStainPaletteBase; mi++) {
     const MaterialDef& d = mats[mi];
-    // stainSlot, not the pack's type bits: a `bodyOnly` stain has a palette
-    // slot (bodies draw it) but no GPU type (the ground never gets it).
+    // EVERY staining material's own coat glow + pulse, in its own row's spare
+    // `_r3` (materials.h kCoatGlow*). A BODY draws a coat by its material
+    // (microbody.wgsl reads materials[mat].stainColor and this), so every
+    // material that stains is drawn as itself on skin whatever slot it has.
+    if (d.stainSlot != 0)
+      table[mi]._r3 = (d.coatGlow & kCoatGlowMask) |
+                      (((uint32_t)std::lround(d.coatPulseHz * 100.0f) & kCoatPulseMask)
+                       << kCoatPulseShift);
+    // The GROUND palette from here down: slots 1..7 only. A `bodyOnly` stain
+    // has a slot of 8+ (materials.cpp StainRegistry) and no palette entry --
+    // it never reaches a grid cell, and a body draws it by material above.
     uint32_t type = d.stainSlot;
     if (type == 0 || type >= 8u) continue;
     // WHAT THE STAIN IS MADE OF, in the entry's spare `_r3`: the material id

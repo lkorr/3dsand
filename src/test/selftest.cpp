@@ -740,6 +740,8 @@ const char* const kOrder[] = {
     // (phys/kerf.h KerfBite / KerfGroove, owner 2026-09-25). Fresh spawns on
     // pristine ground, CPU only.
     "head-cleave",
+    "blade-wounds",
+    "wound-rebleed",
     // ...and a mace MARKS a corpse and leaves it crumbling, instead of boring
     // an instant sphere out of it: the same three-rung ladder the living
     // climb (owner report 2026-09-20). Ticks the debris system only.
@@ -770,10 +772,10 @@ const char* const kOrder[] = {
     // blood landing on it (owner report 2026-09-22). Each ticks the world and
     // regenerates it on the way out.
     "corpse-crossheat", "garment-burn", "corpse-worn", "corpse-splatter", "vessel-grid", "vessel-sand", "vessel-mpm", "vessel-break",
-    "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-spawn", "alchemy-sand-carry",
-    "alchemy-lift", "alchemy-place",
+    "alchemy-layers", "alchemy-pour", "alchemy-cost", "alchemy-shake", "alchemy-resort", "alchemy-spawn", "alchemy-sand-carry",
+    "alchemy-lift", "alchemy-place", "alchemy-coherence",
     // Bench chemistry (package C): CPU-only FlaskSims over the world's tables.
-    "alchemy-react", "alchemy-keeps", "alchemy-evaporate", "alchemy-gas-carry", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode",
+    "alchemy-react", "alchemy-keeps", "alchemy-evaporate", "alchemy-gas-carry", "alchemy-gas-vent", "alchemy-stopper", "alchemy-dissolve", "alchemy-electrolysis", "alchemy-explode",
     "alchemy-brine-electrolysis",
     // Package E on the bench: every headline recipe through the world's table.
     "chem-bench",

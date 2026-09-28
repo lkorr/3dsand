@@ -5621,6 +5621,16 @@ fn applyStain(albedo : vec3f, w : u32, cell : vec3<i32>, wetOut : ptr<function, 
   return mix(soaked, stainCol, shown * TUNE_STAIN_OPACITY);
 }
 
+// The light a stained voxel's stain gives off, per unit of coverage: its
+// colour times the slot's coat glow (the palette entry's `_r2`, materials.h
+// kCoatGlow*; defaults to the stain material's emission). Zero for a stain
+// that does not glow. The caller scales it by the coverage applyStain wrote.
+fn stainGlow(w : u32) -> vec3f {
+  let pal = materials[STAIN_PALETTE_BASE + voxStainType(w)];
+  let g = f32(pal._r2 & 0xFFu) / 255.0;
+  return unpackColor(pal.stainColor) * g;
+}
+
 // ---- voxel ambient occlusion ----
 // The classic Minecraft-style per-vertex AO, evaluated per PIXEL because a
 // raymarcher has no vertices: for the face we hit, sample the two tangent
@@ -10992,6 +11002,12 @@ fn fs(in : VSOut) -> FSOut {
       let hv = normalize(keyLightDir() - rd);
       let spec = pow(max(dot(n, hv), 0.0), TUNE_STAIN_SHEEN_POWER);
       color += keyLightColor() * spec * lambert * wet * TUNE_STAIN_SHEEN;
+      // A GLOWING stain (enchanted water / blood soaked into the ground) shines
+      // as its liquid does: stainGlow is the slot owner's coat glow, which
+      // defaults to the material's emission. Inside this branch so an
+      // unstained surface pays nothing, and zero for every stain that does not
+      // glow.
+      color += stainGlow(h.word) * wet * TUNE_EMISSIVE_STRENGTH;
     }
 
     // ---- emissive surfaces ----

@@ -291,33 +291,42 @@ const MB_DIMS_STAIN_BIT : u32 = 0x40000000u;
 
 // ---- BLOOD ON A BODY (DESIGN.md section 7) ----------------------------------
 //
-// The 16-bit stain cell of a hit voxel, two per word: the COAT byte low and
-// the BRUISE byte high (sim/microbody.h, dims bit 30). Each byte is amount in
-// the low nibble and stain TYPE (the same palette slot the voxel word's bits
-// 28..30 carry) above it. Read once, at the hit only, from the lattice after
-// the payload. 0 when the model has no lattice or the voxel is clean.
+// The stain word of a hit voxel, ONE per cell: the COAT half low and the
+// BRUISE half high (sim/microbody.h, dims bit 30). Each half is a body coat
+// word (sim/voxload.h PackBodyStain): the MATERIAL in bits 0..11 and the
+// amount in 12..15. A coat is drawn by its material -- materials[mat]'s own
+// stainColor and coat glow word -- so every substance looks like itself on
+// skin, whatever ground stain slot it has or shares. Read once, at the hit
+// only, from the lattice after the payload. 0 when the model has no lattice
+// or the voxel is clean.
 fn poolStainAt(stainBase : u32, dims : vec3<i32>, p : vec3<i32>) -> u32 {
   if (stainBase == 0u) { return 0u; }
   let idx = u32((p.z * dims.y + p.y) * dims.x + p.x);
-  let w = stainBase + (idx >> 1u);
+  let w = stainBase + idx;
   if (w >= MICRO_BODY_POOL_WORDS) { return 0u; }
-  return (pool[w] >> ((idx & 1u) * 16u)) & 0xFFFFu;
+  return pool[w];
 }
+// One half of it (a coat word) -> its amount 0..15 and its material.
+fn coatAmt(coat : u32) -> u32 { return (coat >> 12u) & 0xFu; }
+fn coatMat(coat : u32) -> u32 { return coat & 0xFFFu; }
 
 // The same look as the ground's stain (raymarch.wgsl applyStain), on purpose:
 // blood that ran off an arm onto the floor must not change colour on the way
-// down. Same palette entry, same mottle threshold, same multiply-then-lerp,
+// down. Same colour (the ground's palette entry is its slot owner's
+// stainColor; a body reads the coat material's own), same mottle threshold,
+// same multiply-then-lerp,
 // same render.stain* knobs. Only the noise domain differs: the mottle is
 // sampled in MICRO cells scaled back to world pitch, so a stain on a scale-8
 // limb breaks up at the same physical size as one on the ground beside it.
 // The value noise itself is common.wgsl's valueNoise — the one the ground's
 // stain mottle reads, so the two cannot drift.
 // ---- A COAT THAT GLOWS AND BREATHES (2026-09-23) ---------------------------
-// The stain palette entry's spare `_r2` word is the coat's glow + pulse
-// (materials.json coat.glow / coat.pulse; packed by Simulation::UploadTables,
-// layout materials.h kCoatGlow* -- bits 0..7 glow 0..255, bits 8..19 pulse in
-// centi-Hz). Zero for every coat but a glowing one, so blood, water, rot and
-// bruises take the `pulse == 0` branch and draw exactly as before.
+// The coat material's own uploaded `_r3` word is its glow + pulse (materials.
+// json coat.glow / coat.pulse, glow defaulting to the material's emission;
+// packed by Simulation::UploadTables, layout materials.h kCoatGlow* -- bits
+// 0..7 glow 0..255, bits 8..19 pulse in centi-Hz). Zero for every coat of a
+// substance that does not glow, so blood, water, rot and bruises draw exactly
+// as before.
 //
 // The wave is 0..1. A small per-cell phase from the same mottle the coverage
 // uses, so a drenched arm shimmers as one film rather than blinking as a slab.
@@ -330,10 +339,10 @@ fn bodyCoatWave(glowWord : u32, mottle : f32, time : f32) -> f32 {
 // How much of this voxel the coat covers, 0..1, before any pulse. Shared by the
 // tint and the glow so the two can never disagree about where the coat is.
 fn bodyStainCover(stain : u32, cell : vec3<i32>, scale : f32) -> vec2f {
-  let amtI = stain & 0xFu;
+  let amtI = coatAmt(stain);
   if (amtI == 0u) { return vec2f(0.0); }
   let amt = f32(amtI) / f32(STAIN_AMT_MAX);
-  let packed = materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)].stainColor;
+  let packed = materials[coatMat(stain)].stainColor;
   // The one place a body differs from the ground: the coat's authored
   // `opacity` (materials.json coat block, packed in the colour's alpha byte by
   // ParseCoat) scales the coverage, so water can soak a limb to full amount
@@ -349,8 +358,8 @@ fn bodyStainCover(stain : u32, cell : vec3<i32>, scale : f32) -> vec2f {
 // Emission a glowing coat adds to this voxel (scalar, like material emission):
 // glow x coverage, breathing between 35% and 100% on the coat's pulse.
 fn bodyCoatGlow(stain : u32, cell : vec3<i32>, scale : f32, time : f32) -> f32 {
-  if ((stain & 0xFu) == 0u) { return 0.0; }
-  let glowWord = materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)]._r2;
+  if (coatAmt(stain) == 0u) { return 0.0; }
+  let glowWord = materials[coatMat(stain)]._r3;
   let glow = f32(glowWord & 0xFFu) / 255.0;
   if (glow <= 0.0) { return 0.0; }
   let cm = bodyStainCover(stain, cell, scale);
@@ -361,11 +370,11 @@ fn bodyStainTint(albedo : vec3f, stain : u32, cell : vec3<i32>, scale : f32,
                  time : f32) -> vec3f {
   let cm = bodyStainCover(stain, cell, scale);
   if (cm.x <= 0.0) { return albedo; }
-  let pal = materials[STAIN_PALETTE_BASE + ((stain >> 4u) & 0x7u)];
-  let stainCol = unpackColor(pal.stainColor);
+  let cmat = materials[coatMat(stain)];
+  let stainCol = unpackColor(cmat.stainColor);
   // A pulsing coat's COLOUR breathes too (70%..100% of its cover), so the film
   // itself swells and thins rather than only its light.
-  let cover = cm.x * mix(0.7, 1.0, bodyCoatWave(pal._r2, cm.y, time));
+  let cover = cm.x * mix(0.7, 1.0, bodyCoatWave(cmat._r3, cm.y, time));
   let soaked = albedo * mix(vec3f(1.0), stainCol * TUNE_STAIN_DARKEN, cover);
   return mix(soaked, stainCol, cover * TUNE_STAIN_OPACITY);
 }
@@ -730,11 +739,11 @@ fn fs(in : VSOut) -> FSOut {
   // discoloured, not something on it, so it is tinted into the albedo before
   // anything that sits on top: blood, water or mud over a bruise covers it the
   // way it would cover unhurt skin, and washing the coat off shows the bruise
-  // still there. Same palette entry, mottle and knobs as a coat -- the look is
-  // unchanged, only the layering is.
+  // still there. Same material lookup, mottle and knobs as a coat -- the look
+  // is unchanged, only the layering is.
   let stainCell = poolStainAt(in.stainBase, dims, c);
-  let coatWord = stainCell & 0xFFu;
-  albedo = bodyStainTint(albedo, stainCell >> 8u, c, scale, R.time);
+  let coatWord = stainCell & 0xFFFFu;
+  albedo = bodyStainTint(albedo, stainCell >> 16u, c, scale, R.time);
   albedo = bodyStainTint(albedo, coatWord, c, scale, R.time);
 
   // `tCur` is already the parameter along the UNNORMALIZED camera-to-fragment

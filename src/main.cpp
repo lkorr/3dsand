@@ -3535,6 +3535,18 @@ int RunMobShot(GpuContext& ctx, World& world, Simulation& sim, Physics& phys,
   shoot((fwd + right) * 0.7071f + Vec3{0, 0.3f, 0}, shotDist,
         "screenshot_mob_quarter.bmp");
   shoot(fwd + Vec3{0, 0.15f, 0}, shotDist, "screenshot_mob_front.bmp");
+  // ...a close-up of what is in the fist: at the body's framing a sword is a
+  // few dozen pixels, which cannot show whether its art reads (a bevel, a
+  // wrap, a guard). Aimed at the held part's own body, so it follows the arm.
+  if (Mob* hm = mobs.FindCreature(id); hm && hm->HeldSlot() >= 0) {
+    target = mobs.LimbPosition(id, hm->HeldSlot());
+    // `right` is the creature's LEFT in this frame (see the side shot), and
+    // a weapon is held in the right hand, so both views come from -right:
+    // level with the blade, and from above and a little ahead.
+    shoot(Vec3{0, 0.3f, 0} - right, 7.0f, "screenshot_mob_held.bmp");
+    shoot(fwd * 0.35f - right + Vec3{0, 1.1f, 0}, 7.0f,
+          "screenshot_mob_held2.bmp");
+  }
   // ...and a close-up of what was dropped: the creature keeps walking while
   // the drop settles, so the three above cannot be trusted to frame it.
   if (!droppedBodies.empty()) {
@@ -13289,41 +13301,53 @@ int main(int argc, char** argv) {
 
         // ---- WHAT FALLS OFF THE TABLE FALLS INTO THE WORLD, NOW -----------
         // Whole eighths as the bench drains them (AlchemyBench::TakeSpill),
-        // poured -- not burst -- from the lip of the flask in the hand
-        // nearest where it fell off the table, or at your feet for one not
-        // in a hand.
-        alchemy::Composition fell;
+        // poured -- not burst -- from the lip of the flask in the hand that
+        // holds the vessel it LEFT (one spill per source vessel, so two
+        // flasks spilling at once each pour from their own), or at your feet
+        // for one not in a hand. Only matter that left no known vessel falls
+        // back to the vessel nearest where it fell off the table.
+        std::vector<alchemy::BenchSpill> fellBy;
         float exitX = -1.0f;
-        if (bench.IsOpen() && bench.TakeSpill(fell, exitX)) {
-          ContainerSpill sp;
-          const Vec3 fwd = cam.Forward();
-          sp.at = player.EyePos() + fwd * MetresToCells(0.35f) -
-                  Vec3{0, MetresToCells(0.6f), 0};
-          int nearest = -1;
-          for (size_t i = 0; i < views.size(); i++)
-            if (nearest < 0 || std::fabs(views[i].pose.pos.x - exitX) <
-                                std::fabs(views[nearest].pose.pos.x - exitX))
-              nearest = (int)i;
-          if (nearest >= 0 && avatar.Spawned()) {
-            for (int hk = 0; hk < kHands; hk++) {
-              if (!(views[nearest].ref == benchInHand[hk])) continue;
-              const Hand h = HandAt(hk);
-              const float ang = views[nearest].pose.angle;
-              const Quat yaw = QuatAxisAngle({0, 1, 0}, avatar.Heading());
-              const Vec3 axisW = QuatRotate(yaw, Vec3{-std::sin(ang), std::cos(ang), 0.0f});
-              Vec3 lip;
-              if (avatar.HeldMouthWorld(axisW, lip, h)) sp.at = lip;
+        if (bench.IsOpen() && bench.TakeSpill(fellBy, exitX)) {
+          for (const alchemy::BenchSpill& bs : fellBy) {
+            const alchemy::Composition& fell = bs.what;
+            ContainerSpill sp;
+            const Vec3 fwd = cam.Forward();
+            sp.at = player.EyePos() + fwd * MetresToCells(0.35f) -
+                    Vec3{0, MetresToCells(0.6f), 0};
+            int nearest = -1;
+            if (bs.ref.Valid()) {
+              for (size_t i = 0; i < views.size(); i++)
+                if (views[i].ref == bs.ref) nearest = (int)i;
+            } else if (exitX >= 0) {
+              for (size_t i = 0; i < views.size(); i++)
+                if (nearest < 0 || std::fabs(views[i].pose.pos.x - exitX) <
+                                    std::fabs(views[nearest].pose.pos.x - exitX))
+                  nearest = (int)i;
             }
+            if (nearest >= 0 && avatar.Spawned()) {
+              for (int hk = 0; hk < kHands; hk++) {
+                if (!(views[nearest].ref == benchInHand[hk])) continue;
+                const Hand h = HandAt(hk);
+                const float ang = views[nearest].pose.angle;
+                const Quat yaw = QuatAxisAngle({0, 1, 0}, avatar.Heading());
+                const Vec3 axisW = QuatRotate(yaw, Vec3{-std::sin(ang), std::cos(ang), 0.0f});
+                Vec3 lip;
+                if (avatar.HeldMouthWorld(axisW, lip, h)) sp.at = lip;
+              }
+            }
+            sp.vel = player.vel;
+            sp.pour = true;
+            sp.splatted = true;
+            sp.rest = fell;
+            sp.seed = rng::Hash3(0xA1C4E5u, (uint32_t)frameCounter,
+                                 fell.Total() + 131u * (uint32_t)(&bs - fellBy.data()));
+            tickCtx.vesselSpills.push_back(sp);
+            if (std::getenv("SANDVOX_BENCH_DEBUG"))
+              std::printf("bench spill: frame %llu, %u eighths off the table at x %.0f, from %s (view %d)\n",
+                          (unsigned long long)frameCounter, fell.Total(), exitX,
+                          bs.ref.Valid() ? "its vessel" : "no known vessel", nearest);
           }
-          sp.vel = player.vel;
-          sp.pour = true;
-          sp.splatted = true;
-          sp.rest = fell;
-          sp.seed = rng::Hash3(0xA1C4E5u, (uint32_t)frameCounter, fell.Total());
-          tickCtx.vesselSpills.push_back(sp);
-          if (std::getenv("SANDVOX_BENCH_DEBUG"))
-            std::printf("bench spill: frame %llu, %u eighths off the table at x %.0f\n",
-                        (unsigned long long)frameCounter, fell.Total(), exitX);
         }
       }
 
@@ -13739,9 +13763,18 @@ int main(int argc, char** argv) {
         };
         // The HUD's hotbar strip (DrawHudHotbar) reads this one, so it is the
         // one mirror built with the screen shut.
+        // WHILE THE BENCH IS UP a vessel it has had shows what it holds NOW
+        // (AlchemyBench::Contents), not the kit's copy: the kit is only
+        // written at Finish, and the character screen's FLASKS row, the
+        // hands and the hotbar read as the flasks are poured.
+        auto live = [&](KitSpace space, int idx, const ItemStack& st) {
+          ItemStack shown = st;
+          if (bench.IsOpen() && !st.Empty()) bench.Contents(KitRef{space, idx}, shown.contents);
+          return shown;
+        };
         ui.hotbarSlots.clear();
         for (int i = 0; i < kItemSlots; i++)
-          ui.hotbarSlots.push_back(mirror(hotbar.slots[i]));
+          ui.hotbarSlots.push_back(mirror(live(KitSpace::Hotbar, i, hotbar.slots[i])));
         // ...and THE TWO HANDS, which the HUD draws beside the strip (dual
         // wielding): the equipment mirror below is only rebuilt with the
         // screen open, so the hand entries are refreshed here every frame.
@@ -13749,7 +13782,7 @@ int main(int argc, char** argv) {
           ui.equipSlots.assign(kEquipSlotCount, UIState::KitSlotUI{});
         for (int hk = 0; hk < kHands; hk++) {
           const int hs = EquipSlotOfHand(HandAt(hk));
-          ui.equipSlots[hs] = mirror(kit.equip.slots[hs], hs);
+          ui.equipSlots[hs] = mirror(live(KitSpace::Equip, hs, kit.equip.slots[hs]), hs);
         }
         // EVERYTHING BELOW IS THE CHARACTER SCREEN'S, and only it reads these
         // (inventory_ui.cpp, spellgraph_ui.cpp). Shut, they are left as they
@@ -13856,10 +13889,10 @@ int main(int argc, char** argv) {
         }
         ui.bagSlots.clear();
         for (int i = 0; i < Bag::kSlots; i++)
-          ui.bagSlots.push_back(mirror(kit.bag.slots[i]));
+          ui.bagSlots.push_back(mirror(live(KitSpace::Bag, i, kit.bag.slots[i])));
         ui.equipSlots.clear();
         for (int i = 0; i < kEquipSlotCount; i++)
-          ui.equipSlots.push_back(mirror(kit.equip.slots[i], i));
+          ui.equipSlots.push_back(mirror(live(KitSpace::Equip, i, kit.equip.slots[i]), i));
         // The corpse's gear, through the same mirror so a robe on a corpse is
         // drawn and tipped exactly as one in the pack — with its condition
         // read off the death-time capture, the only record there is for a
@@ -14579,6 +14612,7 @@ int main(int argc, char** argv) {
                              : size * (1.0f - 0.8f * t * t);
           s.color = shade(m.color, bright);
           s.emission = 0.0f;
+          s.mat = m.mat;   // glows as its matter does (debris.wgsl vsSprite)
           sprv.push_back(s);
           // A crumb trailing behind, so the stream reads as matter pouring
           // up rather than cubes teleporting.
@@ -14901,9 +14935,13 @@ int main(int argc, char** argv) {
       // draws, and hands the real mask back for the main pass. Both uploads
       // are followed by their own submit, for the same reason as the camera.
       //
-      // No DrawWorld: the clear colour IS the backdrop, and a raymarch of the
-      // whole residency window to fill 320x448 pixels behind a character is
-      // the most expensive possible way to draw a background.
+      // THE WORLD IS DRAWN BEHIND THE FIGURE (owner, 2026-09-27: to watch a
+      // pour on yourself land in the real sand and water around you). It was
+      // a flat clear colour; a 320x448 raymarch is a fraction of the main
+      // view's pixels, and it runs only while the screen is open. The sky
+      // behind it is cloudless (support.cpp: an aux view composites no deck).
+      // The pour's droplets and the MPM water come with it: DrawParticles,
+      // and the real fluidCount so the raymarcher draws the surface.
       //
       // THE DEATH POSE IS A THIRD RE-UPLOAD OF THE SAME SHAPE. A dead player's
       // limbs are a dead Mob's (MobSystem::AdoptDeadAvatar) and go on
@@ -14981,7 +15019,7 @@ int main(int argc, char** argv) {
         WriteRenderParams(ctx.queue, world, portraitCam.eye, portraitCam.cam,
                           portraitCam.aspect, /*shadows=*/true, (float)now,
                           /*fogDensity=*/0.0f, (float)kPortraitH,
-                          kPortraitLightTick, /*fluidCount=*/0,
+                          kPortraitLightTick, fluidCount,
                           /*frameFrac=*/0.0f, /*extraFlags=*/0u, kPortraitW,
                           kPortraitH, /*auxView=*/true);
         rhi::CommandEncoder pEnc = ctx.device.CreateCommandEncoder();
@@ -14991,8 +15029,12 @@ int main(int argc, char** argv) {
         rhi::RenderPass pRp =
             sim.BeginAuxRenderPass(pEnc, portraitView, ctx.surfaceFormat,
                                    kPortraitW, kPortraitH, kPortraitClear);
+        sim.DrawWorld(pRp);
+        sim.DrawParticles(pRp);
+        if (CurrentTuning().render.fluidSurface < 0.5f) sim.DrawFluid(pRp, fluidCount);
         sim.DrawBodies(pRp, (uint32_t)pInst.size());
         sim.DrawMicroBodies(pRp, pMicro);
+        sim.DrawSprites(pRp, (uint32_t)sprv.size());
         pRp.End();
         // One line, on the captured frames only: "the portrait drew N bodies
         // from HERE". It is what turns "the frame is empty" from a guess into

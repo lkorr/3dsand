@@ -927,9 +927,11 @@ function appendExtraInstances(cubes, n, cap, m4, col) {
  * material table first and fall back to the file's own palette.
  */
 function itemVoxColor(pal, v) {
-  // Item .vox files carry no RGBA chunk (gen_sword_item.py writes indices, not
-  // colours), so the material table is the normal path and the palette branch
-  // below only fires for a hand-made file that does embed one.
+  // The material table is the normal path. NOTE this preview draws MATERIAL
+  // colour only: the blades (scripts/bladesmith.py) and the armour paint their
+  // look in a "<name>.col" art layer, which is filtered out above, so a sword
+  // shows here as plain steel and leather rather than as it renders in game.
+  // The palette branch below only fires for a hand-made file.
   const mats = ed.getMaterials?.();
   if (mats && mats.length && v < mats.length) return ed.matColorOf(v);
   const c = pal && pal[v];

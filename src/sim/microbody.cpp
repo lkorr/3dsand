@@ -52,9 +52,9 @@ void NoteRefusal(MicroBodySet& set, const char* what) {
 // sizes: every .vox in assets/ together occupies ~49k of the 1 MiW pool at
 // 4 bpw, so ~98k at 2 bpw — under 10% either way.
 inline size_t WordsFor(size_t cellCount) { return (cellCount + 1) / 2; }
-// Word count for a brick's STAIN lattice: 16 bits per micro voxel, 2 per word
-// -- the coat byte low, the bruise byte high (MicroBodyModelGpu::dims bit 30).
-inline size_t StainWordsFor(size_t cellCount) { return (cellCount + 1) / 2; }
+// Word count for a brick's STAIN lattice: ONE WORD per micro voxel -- the coat
+// half low, the bruise half high (MicroBodyModelGpu::dims bit 30).
+inline size_t StainWordsFor(size_t cellCount) { return cellCount; }
 inline size_t CellsOf(uint32_t dimsWord) {
   return (size_t)(dimsWord & 1023) * ((dimsWord >> 10) & 1023) *
          ((dimsWord >> 20) & 1023);
@@ -68,33 +68,33 @@ inline uint16_t MicroVox(uint8_t mat, uint8_t color) {
   return (uint16_t)mat | ((uint16_t)color << 8);
 }
 
-// THE ONE NARROWING. A body coat word names a material (voxload.h); the stain
-// lattice the shader reads holds `slot << 4 | amt`. A material the set has no
-// slot for yields 0 -- clean -- rather than an arbitrary slot, because the
-// slots are a shared visual vocabulary and picking the wrong one paints a
-// creature the colour of somebody else's substance.
-inline uint8_t StainByteOf(const MicroBodySet& set, uint16_t coat) {
+// A body coat is DRAWN BY ITS MATERIAL. The stain cell the shader reads is the
+// coat word itself (voxload.h PackBodyStain: material in bits 0..11, amount in
+// 12..15) in the low half, and the bruise in the SAME shape in the high half
+// (gore.bruiseMat, the level as the amount). microbody.wgsl looks the colour
+// and glow up on materials[mat] -- the substance's own row -- so two liquids
+// can never be drawn alike because they happened to share a stain slot, and a
+// new staining material needs nothing here or in the shader.
+//
+// The one filter: a material the set has no look for (does not stain, or a
+// set that was never told) draws as clean rather than as whatever colour its
+// id happens to index.
+inline bool DrawsCoat(const MicroBodySet& set, uint32_t mat) {
+  return mat < set.drawsCoat.size() && set.drawsCoat[mat] != 0;
+}
+inline uint16_t CoatHalfOf(const MicroBodySet& set, uint16_t coat) {
   const uint32_t amt = BodyStainAmt(coat);
   if (amt == 0) return 0;
-  const uint32_t mat = BodyStainMat(coat);
-  if (mat >= set.stainSlotOfMat.size()) return 0;
-  const uint32_t slot = set.stainSlotOfMat[mat] & 7u;
-  if (slot == 0) return 0;
-  return (uint8_t)((slot << 4) | (amt & 0xFu));
+  return DrawsCoat(set, BodyStainMat(coat)) ? coat : (uint16_t)0;
 }
-
-// ...and the bruise byte (voxload.h PrefabVoxel::bruise) into the same
-// `slot << 4 | amt` shape, through the ONE slot the set was told bruises draw
-// in (MicroBodySet::bruiseSlot). No slot, no bruise drawn.
-inline uint8_t BruiseByteOf(const MicroBodySet& set, uint8_t bruise) {
+inline uint16_t BruiseHalfOf(const MicroBodySet& set, uint8_t bruise) {
   const uint32_t lvl = BruiseLevel(bruise);
-  const uint32_t slot = set.bruiseSlot & 7u;
-  if (lvl == 0 || slot == 0) return 0;
-  return (uint8_t)((slot << 4) | lvl);
+  if (lvl == 0 || !DrawsCoat(set, set.bruiseMat)) return 0;
+  return PackBodyStain(set.bruiseMat, lvl);
 }
-inline uint16_t StainCellOf(const MicroBodySet& set, const PrefabVoxel& v) {
-  return (uint16_t)(StainByteOf(set, v.stain) |
-                    ((uint16_t)BruiseByteOf(set, v.bruise) << 8));
+inline uint32_t StainCellOf(const MicroBodySet& set, const PrefabVoxel& v) {
+  return (uint32_t)CoatHalfOf(set, v.stain) |
+         ((uint32_t)BruiseHalfOf(set, v.bruise) << 16);
 }
 
 // Take `words` from the best-fitting free range (the smallest one that holds
@@ -177,10 +177,7 @@ void WriteBrick(MicroBodySet& set, uint32_t base, IVec3 dims,
     size_t idx = ((size_t)z * dims.y + y) * dims.x + x;
     set.pool[base + idx / 2] |=
         (uint32_t)MicroVox((uint8_t)mat, v.color) << ((idx % 2) * 16);
-    if (withStain) {
-      const uint16_t sc = StainCellOf(set, v);
-      if (sc) set.pool[sbase + idx / 2] |= (uint32_t)sc << ((idx % 2) * 16);
-    }
+    if (withStain) set.pool[sbase + idx] = StainCellOf(set, v);
   }
   set.MarkPool(base, base + (uint32_t)total);
 }
@@ -216,10 +213,10 @@ void MicroBodySet::MarkPool(uint32_t lo, uint32_t hi) {
   dirtyRanges.push_back({lo, hi});
 }
 
-void MicroBodySetStainSlots(MicroBodySet& set, std::vector<uint8_t> slotOfMat,
-                            uint8_t bruiseSlot) {
-  set.stainSlotOfMat = std::move(slotOfMat);
-  set.bruiseSlot = bruiseSlot;
+void MicroBodySetCoatLooks(MicroBodySet& set, std::vector<uint8_t> drawsCoat,
+                           uint16_t bruiseMat) {
+  set.drawsCoat = std::move(drawsCoat);
+  set.bruiseMat = bruiseMat;
 }
 
 void MicroBodySet::ClearDirty() {
@@ -231,7 +228,8 @@ void MicroBodySet::ClearDirty() {
 std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
                                        const std::vector<uint32_t>& artColors,
                                        const std::string& label,
-                                       std::string& log) {
+                                       std::string& log,
+                                       const Prefab* paintedBy) {
   // Identity by default, so a prefab that painted nothing costs nothing and
   // every unpainted voxel keeps color 0.
   //
@@ -243,6 +241,14 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
   std::vector<uint8_t> remap(256, 0);
   if (artColors.empty()) return remap;
 
+  // Which .vox slots a voxel actually paints (see the header). Without a
+  // prefab every slot counts, which is the old behaviour.
+  bool used[256];
+  for (int i = 0; i < 256; i++) used[i] = paintedBy == nullptr;
+  if (paintedBy)
+    for (const PrefabModel& pm : paintedBy->models)
+      for (const PrefabVoxel& v : pm.voxels) used[v.color] = true;
+
   uint32_t dropped = 0;
   // The SOURCE bound is the per-file limit (a .vox addresses art at 128..255);
   // the MERGED bound below is kArtPaletteSlotsGpu. Conflating the two is what
@@ -251,6 +257,7 @@ std::vector<uint8_t> MicroBodyMergeArt(MicroBodySet& set,
     const uint32_t rgb = artColors[i];
     const int srcSlot = kArtPaletteBase + (int)i;
     if (srcSlot > kArtPaletteTop) break;
+    if (!used[srcSlot]) continue;
     // Colours are deduplicated across prefabs: two mobs painted the same red
     // share one slot, which is what keeps the merged palette small enough for a
     // whole cast plus its wardrobe.
@@ -394,9 +401,9 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
   // a corpse reloaded -- keeps its stain: the block grows the lattice and the
   // dims word says so. A def's shared model never has one (nothing authored
   // is stained), which is what keeps the load-time pool cost unchanged.
-  // Asked of the NARROWED byte, not of the coat word: a coat of something the
-  // renderer has no palette slot for would otherwise buy the block a lattice
-  // of zeroes.
+  // Asked of the FILTERED cell, not of the coat word: a coat of something the
+  // renderer has no look for would otherwise buy the block a lattice of
+  // zeroes.
   bool withStain = false;
   for (const PrefabVoxel& v : voxels)
     if (StainCellOf(set, v)) { withStain = true; break; }
@@ -404,7 +411,7 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
       WordsFor(cellCount) + (withStain ? StainWordsFor(cellCount) : 0);
 
   std::vector<uint16_t> cells(cellCount, 0);
-  std::vector<uint16_t> stains(withStain ? cellCount : 0, 0);
+  std::vector<uint32_t> stains(withStain ? cellCount : 0, 0);
   for (const PrefabVoxel& v : voxels) {
     if (v.x < 0 || v.y < 0 || v.z < 0 || v.x >= dims.x || v.y >= dims.y ||
         v.z >= dims.z)
@@ -444,14 +451,9 @@ int MicroBodyPack(MicroBodySet& set, const std::vector<PrefabVoxel>& voxels,
     }
     set.pool[base + w] = word;
   }
-  for (size_t w = payloadWords; w < words; w++) {
-    uint32_t word = 0;
-    for (size_t b = 0; b < 2; b++) {
-      size_t idx = (w - payloadWords) * 2 + b;
-      if (idx < cellCount) word |= (uint32_t)stains[idx] << (b * 16);
-    }
-    set.pool[base + w] = word;
-  }
+  // One stain word per cell, in idx order after the payload.
+  for (size_t w = payloadWords; w < words; w++)
+    set.pool[base + w] = stains[w - payloadWords];
 
   MicroBodyModelGpu m{};
   m.base = base;
@@ -645,12 +647,12 @@ uint16_t MicroBodyCell(const MicroBodySet& set, uint32_t model, int x, int y,
 }
 
 namespace {
-// Write one BYTE of a micro voxel's 16-bit stain cell (`hi` false = the coat
-// byte, true = the bruise byte), growing the lattice on a Pack-made owned
-// model that has none. The one body both pokes share, so the coat and the
-// bruise can never disagree about where a cell lives.
-bool PokeStainByte(MicroBodySet& set, uint32_t model, int x, int y, int z,
-                   uint8_t byte, bool hi) {
+// Write one HALF of a micro voxel's stain word (`hi` false = the coat half,
+// true = the bruise half), growing the lattice on a Pack-made owned model
+// that has none. The one body both pokes share, so the coat and the bruise can
+// never disagree about where a cell lives.
+bool PokeStainHalf(MicroBodySet& set, uint32_t model, int x, int y, int z,
+                   uint16_t half, bool hi) {
   if (model >= set.models.size()) return false;
   if (model >= set.owned.size() || !set.owned[model]) return false;  // shared
   MicroBodyModelGpu& m = set.models[model];
@@ -661,7 +663,7 @@ bool PokeStainByte(MicroBodySet& set, uint32_t model, int x, int y, int z,
   const size_t payloadWords = WordsFor(cells);
   if (!HasStain(m.dims)) {
     // Nothing to erase on a lattice that does not exist yet.
-    if (byte == 0) return true;
+    if (half == 0) return true;
     // A Pack-made owned model (a fragment, a reloaded corpse) without a stain
     // lattice: move it to a block that has room for one. Same free-at-
     // reserved-size discipline MicroBodyEdit follows.
@@ -682,12 +684,12 @@ bool PokeStainByte(MicroBodySet& set, uint32_t model, int x, int y, int z,
     set.MarkPool(base, base + (uint32_t)words);
   }
   const size_t idx = ((size_t)z * dy + y) * dx + x;
-  const uint32_t w = m.base + (uint32_t)payloadWords + (uint32_t)(idx / 2);
+  const uint32_t w = m.base + (uint32_t)payloadWords + (uint32_t)idx;
   if (w >= set.pool.size()) return false;
-  const uint32_t shift = (uint32_t)(idx % 2) * 16u + (hi ? 8u : 0u);
+  const uint32_t shift = hi ? 16u : 0u;
   uint32_t word = set.pool[w];
-  word &= ~(0xFFu << shift);
-  word |= (uint32_t)byte << shift;
+  word &= ~(0xFFFFu << shift);
+  word |= (uint32_t)half << shift;
   if (word == set.pool[w]) return true;
   set.pool[w] = word;
   set.MarkPool(w, w + 1);
@@ -697,12 +699,12 @@ bool PokeStainByte(MicroBodySet& set, uint32_t model, int x, int y, int z,
 
 bool MicroBodyPokeStain(MicroBodySet& set, uint32_t model, int x, int y, int z,
                         uint16_t coat) {
-  return PokeStainByte(set, model, x, y, z, StainByteOf(set, coat), false);
+  return PokeStainHalf(set, model, x, y, z, CoatHalfOf(set, coat), false);
 }
 
 bool MicroBodyPokeBruise(MicroBodySet& set, uint32_t model, int x, int y, int z,
                          uint8_t bruise) {
-  return PokeStainByte(set, model, x, y, z, BruiseByteOf(set, bruise), true);
+  return PokeStainHalf(set, model, x, y, z, BruiseHalfOf(set, bruise), true);
 }
 
 IVec3 MicroBodyDims(const MicroBodySet& set, uint32_t model) {

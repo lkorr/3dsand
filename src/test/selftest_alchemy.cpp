@@ -142,7 +142,20 @@ Status GateAlchemyPour(Ctx& c, std::string& detail) {
   for (int i = 0; i < b.n; i++) all.Add(b.p[i].mat, b.p[i].eighths);
 
   auto subs = alchemy::SubstancesFor(c.mats, {&a, &b});
-  FlaskSim s;
+  // ONE POUR IS ONE CHAOTIC SAMPLE: a glob leaving the lip a frame early or
+  // late lands on the rim of A or in it, so a single run's spill moved 0 ->
+  // 60 eighths between RNG seeds of the same code (lab, 2026-09-27: the
+  // pre-coherence sim spilled 7.4 on average over 16 seeds with two over the
+  // limit, the current one 2.0 with none). The same pour runs under
+  // alchemy.pourSeeds seeds; what it claims -- most of the oil arrives, little
+  // splashes -- is asserted on the MEAN; conservation and the spill's
+  // bookkeeping on EVERY run.
+  struct Run { bool cons, cons2, streamed, partitioned, fromA; uint32_t oilIn, sandIn, oilSpilled, spilled, drainedPour, dumped; std::string why, why2, order, source; };
+  auto run = [&](uint32_t seed, bool shot) {
+  Run R{};
+  alchemy::SimConfig cfg;
+  cfg.seed = seed;
+  FlaskSim s(cfg);
   s.SetSubstances(subs);
   int A = s.AddVessel(alchemy::FlaskShape(110, 150), {{96, 8}, 0}, a);
   // The source flask starts upright above and to the right, and swings in
@@ -164,10 +177,23 @@ Status GateAlchemyPour(Ctx& c, std::string& detail) {
   // WHAT FALLS OFF THE TABLE IS DRAINED AS IT FALLS, the way the bench
   // streams it into the world (AlchemyBench::Run -> TakeSpill), and the sum
   // must still come out exact: drained + what is left == what went in.
+  // WHO SPILLED IT (DrainSpilled's SpillBy): each drained eighth is also
+  // filed under the vessel it LEFT, which is what the bench pours from in
+  // the world. It must partition the drain exactly.
   Composition drained;
+  uint32_t byVessel[2] = {0, 0}, byUnknown = 0;
+  bool partitioned = true;
   auto drain = [&]() {
-    const Composition d = s.DrainSpilled();
+    FlaskSim::SpillBy by;
+    const Composition d = s.DrainSpilled(nullptr, &by);
     for (int i = 0; i < d.n; i++) drained.Add(d.p[i].mat, d.p[i].eighths);
+    uint32_t sum = by.unknown.Total();
+    byUnknown += by.unknown.Total();
+    for (size_t v = 0; v < by.vessel.size(); v++) {
+      sum += by.vessel[v].Total();
+      if (v < 2) byVessel[v] += by.vessel[v].Total();
+    }
+    if (sum != d.Total()) partitioned = false;
   };
   int f = 0;
   for (; f < 320; f++) {
@@ -186,7 +212,7 @@ Status GateAlchemyPour(Ctx& c, std::string& detail) {
     drain();
   }
   s.Settle(1200);
-  Shot(s, "alchemy_pour.bmp");
+  if (shot) Shot(s, "alchemy_pour.bmp");
   auto t = s.Count();
   for (int i = 0; i < drained.n; i++) t.spilled.Add(drained.p[i].mat, drained.p[i].eighths);
   std::string why;
@@ -200,22 +226,16 @@ Status GateAlchemyPour(Ctx& c, std::string& detail) {
   // is still at the lip when the flask swings back falls where it falls,
   // which is the sim being right about sand.
   const uint32_t oilSpilled = t.spilled.AmountOf((uint16_t)oil);
-  const double minPoured = BaselineNumber("alchemy.pourMinFrac", 0.8);
-  const double maxSpill = BaselineNumber("alchemy.pourMaxSpillFrac", 0.05);
-  bool moved = oilIn >= minPoured * b.AmountOf((uint16_t)oil);
-  bool tidy = oilSpilled <= maxSpill * b.AmountOf((uint16_t)oil);
-  // After settling, the target has sand under water under oil.
-  auto mh = s.MeanHeights();
+  // After settling, the target has sand under water under oil (reported).
   std::string order;
-  bool ord = Ordered(s, subs, order);
-  (void)mh;
-  RecordObserved("alchemy.pourPoured", (double)poured);
-  RecordObserved("alchemy.pourSpilled", (double)spilled);
-  detail = Format("%s; into A: oil %u/%u sand %u/%u; spilled oil %u, all %u (%u drained live); order %s",
-                  cons ? "conserved" : why.c_str(), oilIn, b.AmountOf((uint16_t)oil), sandIn,
-                  b.AmountOf((uint16_t)sand), oilSpilled, spilled, drained.Total(), order.c_str());
+  Ordered(s, subs, order);
+  (void)poured;
+  R.cons = cons; R.why = why; R.oilIn = oilIn; R.sandIn = sandIn; R.oilSpilled = oilSpilled;
+  R.spilled = spilled; R.drainedPour = drained.Total(); R.order = order;
   // ...then A is turned over and emptied off the table, drained as it
   // falls: the live stream must carry real matter and still add up.
+  const uint32_t pourBy[2] = {byVessel[0], byVessel[1]}, pourUnknown = byUnknown;
+  byVessel[0] = byVessel[1] = byUnknown = 0;
   for (int k = 0; k < 360; k++) {
     s.SetVesselXform(A, Xform{{96, 60}, std::min(3.0f, 3.0f * k / 60.0f)});
     s.Step(3);
@@ -226,10 +246,53 @@ Status GateAlchemyPour(Ctx& c, std::string& detail) {
   std::string why2;
   const bool cons2 = Conserved(all, t2, why2);
   const bool streamed = drained.Total() > 0;
-  detail += Format("; dumped: %u eighths drained live, %s", drained.Total(),
-                   cons2 ? "conserved" : why2.c_str());
-  bool ok = cons && moved && tidy && cons2 && streamed;
-  (void)ord;  // mixed across two vessels: reported, not asserted
+  R.cons2 = cons2; R.why2 = why2; R.streamed = streamed; R.dumped = drained.Total();
+  // The dump is A's (the LEFT vessel, x 96; B stands upright to its right):
+  // what falls must be filed under A, not under B nor "nobody" -- the bench
+  // pours it from A's lip in the world. (Loose sand B dropped on the table
+  // earlier may fall with it, hence a share, not all.)
+  const uint32_t dumped = byVessel[0] + byVessel[1] + byUnknown;
+  const bool fromA = A == 0 && dumped > 0 && byVessel[0] >= 0.9 * dumped;
+  R.source = Format("pour A %u B %u ? %u, dump A %u B %u ? %u%s", pourBy[0], pourBy[1], pourUnknown, byVessel[0],
+                    byVessel[1], byUnknown, partitioned ? "" : " (NOT A PARTITION)");
+  R.partitioned = partitioned;
+  R.fromA = fromA;
+  return R;
+  };
+  const int seeds = std::max(1, (int)BaselineNumber("alchemy.pourSeeds", 5));
+  const uint32_t oilB = b.AmountOf((uint16_t)oil);
+  double oilInSum = 0, oilSpillSum = 0;
+  bool every = true;
+  std::string per, fails;
+  for (int k = 0; k < seeds; k++) {
+    const uint32_t seed = k == 0 ? alchemy::SimConfig{}.seed : 0x5eed + 7919u * (uint32_t)k;
+    const Run R = run(seed, k == 0);
+    oilInSum += R.oilIn;
+    oilSpillSum += R.oilSpilled;
+    per += Format("%s%u/%u", k ? ", " : "", R.oilIn, R.oilSpilled);
+    const bool okRun = R.cons && R.cons2 && R.streamed && R.partitioned && R.fromA;
+    if (!okRun)
+      fails += Format(" [seed %d: %s; dump %s; %s]", k, R.cons ? "conserved" : R.why.c_str(),
+                      R.cons2 ? "conserved" : R.why2.c_str(), R.source.c_str());
+    every = every && okRun;
+    if (k == 0)
+      detail = Format("seed 0: into A oil %u/%u sand %u/%u; spilled oil %u, all %u (%u drained live); order %s; "
+                      "dumped %u drained live; spill source %s",
+                      R.oilIn, oilB, R.sandIn, b.AmountOf((uint16_t)sand), R.oilSpilled, R.spilled,
+                      R.drainedPour, R.order.c_str(), R.dumped, R.source.c_str());
+  }
+  const double oilInMean = oilInSum / seeds, oilSpillMean = oilSpillSum / seeds;
+  const double minPoured = BaselineNumber("alchemy.pourMinFrac", 0.8);
+  const double maxSpill = BaselineNumber("alchemy.pourMaxSpillFrac", 0.05);
+  const bool moved = oilInMean >= minPoured * oilB;
+  const bool tidy = oilSpillMean <= maxSpill * oilB;
+  RecordObserved("alchemy.pourOilInMean", oilInMean);
+  RecordObserved("alchemy.pourOilSpilledMean", oilSpillMean);
+  detail += Format(" | %d seeds (oil in / oil spilled): %s; mean in %.1f (min %.0f), mean spilled %.1f (max %.1f); "
+                   "every run conserved with its spill filed: %s%s",
+                   seeds, per.c_str(), oilInMean, minPoured * oilB, oilSpillMean, maxSpill * oilB,
+                   every ? "yes" : "NO", fails.c_str());
+  const bool ok = every && moved && tidy;
   std::printf("alchemy-pour: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
@@ -1068,6 +1131,75 @@ Status GateAlchemyGasCarry(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// A LIGHT GAS LEAVES AN OPEN FLASK; A STOPPERED ONE KEEPS IT (owner,
+// 2026-09-27: "smoke isn't leaving the flask ... as if it's been stoppered
+// when it hasn't. This has been recurring for a few attempts now"). A flask
+// seeded with 40 eighths of noxious gas (light), chemistry paused so only
+// transport moves it (no fading by rule), on the bench's own draught
+// (SimConfig::gasWind default, the tuning's tools.alchemyWind):
+//   (1) OPEN, 20 s: at least `alchemy.gasVentMinFraction` of its gas leaves
+//       through the mouth, the units audit exact and the ledger validating;
+//   (2) OPEN IN A STILL ROOM (gasWind 0), 20 s: some still leaves on its own
+//       buoyancy (`alchemy.gasVentStillMinFraction`) -- the mouth is open to
+//       the solve, not a lid;
+//   (3) STOPPERED, 10 s: every gas unit is still inside, nothing drained.
+// Records the cost of a bench frame (Step(4)) with the gas moving.
+Status GateAlchemyGasVent(Ctx& c, std::string& detail) {
+  ChemBench b = MakeChemBench(c);
+  const int nox = SlotOfName(b, c, "noxious_gas");
+  if (nox < 0) { detail = "missing noxious_gas"; return Status::Fail; }
+  if (b.subs[nox].heavy) { detail = "noxious_gas is a heavy gas (this gate wants a light one)"; return Status::Fail; }
+  const uint16_t mN = b.subs[nox].mat;
+  struct Run { int gas0 = 0, gas1 = 0; uint32_t out = 0; double ms = 0; bool ok = false; std::string why; };
+  auto run = [&](bool stoppered, float wind, int secs) {
+    Run o;
+    Composition in;
+    in.Add(mN, 40);
+    alchemy::SimConfig cfg = ChemConfig();
+    if (wind >= 0) cfg.gasWind = wind;
+    alchemy::FlaskSim s(cfg);
+    s.SetSubstances(b.subs);
+    s.SetChemistry(b.chem);
+    s.PauseChemistry(true);
+    const int v = s.AddVessel(BenchFlask(512), {{240, 4}, 0}, in, stoppered);
+    o.gas0 = s.GasUnits(v);
+    Composition drained;
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int f = 0; f < 60 * secs; f++) {
+      s.Step(4);
+      Drain(s, drained);
+      if (!stoppered && wind < 0 && f == 60 * 5) Shot(s, "alchemy_gas_vent.bmp");
+    }
+    o.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / (60.0 * secs);
+    o.gas1 = s.GasUnits(v);
+    o.out = drained.AmountOf(mN) + s.Count().spilled.AmountOf(mN);
+    std::string a, l;
+    const bool audit = s.AuditUnits(&a), ledger = BenchLedgerHolds(c, s, in, v, drained, l);
+    o.why = std::string(audit ? "" : " audit: " + a) + (ledger ? "" : " ledger: " + l);
+    o.ok = audit && ledger;
+    return o;
+  };
+  const Run open = run(false, -1.0f, 20), still = run(false, 0.0f, 20), shut = run(true, -1.0f, 10);
+  auto gone = [](const Run& r) { return r.gas0 > 0 ? (double)(r.gas0 - r.gas1) / r.gas0 : 0.0; };
+  const double minOpen = BaselineNumber("alchemy.gasVentMinFraction", 0.5);
+  const double minStill = BaselineNumber("alchemy.gasVentStillMinFraction", 0.1);
+  const bool vents = open.gas0 > 0 && gone(open) >= minOpen && open.out > 0;
+  const bool stillVents = gone(still) >= minStill && still.out > 0;
+  const bool kept = shut.gas0 > 0 && shut.gas1 == shut.gas0 && shut.out == 0;
+  RecordObserved("alchemy.gasVentFraction", gone(open));
+  RecordObserved("alchemy.gasVentStillFraction", gone(still));
+  RecordObserved("alchemy.gasVentMsPerFrame", open.ms);
+  const bool ok = open.ok && still.ok && shut.ok && vents && stillVents && kept;
+  detail = Format("open, draught %.2f: %d -> %d gas units in 20 s (%.0f%% gone, need %.0f%%), %u eighths out%s; "
+                  "still room: %d -> %d (%.0f%% gone, need %.0f%%), %u out%s; stoppered 10 s: %d -> %d, %u out%s; "
+                  "%.2f ms a bench frame",
+                  ChemConfig().gasWind, open.gas0, open.gas1, 100 * gone(open), 100 * minOpen, open.out,
+                  open.why.c_str(), still.gas0, still.gas1, 100 * gone(still), 100 * minStill, still.out,
+                  still.why.c_str(), shut.gas0, shut.gas1, shut.out, shut.why.c_str(), open.ms);
+  std::printf("alchemy-gas-vent: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // A STOPPERED FLASK KEEPS ITS GAS -- AND PRESSURE POPS OR BURSTS IT. (1) The
 // acid and sand of alchemy-react, stoppered: nothing vents, the gas is in the
 // flask. (2) A stoppered flask packed with gas past its headspace: the
@@ -1694,7 +1826,15 @@ Status GateAlchemyResort(Ctx& c, std::string& detail) {
   const Shake on = shake(true), off = shake(false);
   const int minMixed = (int)BaselineNumber("alchemy.resortMinMixed", 150);
   const bool mixed = on.invAtStop >= minMixed;
-  const bool sorted = on.invEnd * 20 <= on.invAtStop && on.ordered;
+  // Re-sorted: what is left out of order is the few pairs pinned at the
+  // glass that UpdateSleep lets sleep (sortStall), at most
+  // alchemy.resortMaxLeft -- or a twentieth of the mix, if the shake mixed
+  // more. It was only the twentieth: the pinned residue is the same ~15 pairs
+  // however hard the shake mixed (lab, 2026-09-27: 15 left of 539 before the
+  // contents rode the vessel's frame, 15-18 of ~207 after), and a shake that
+  // mixed less (vesselFeel) failed on the same residue.
+  const int maxLeft = std::max((int)BaselineNumber("alchemy.resortMaxLeft", 20), on.invAtStop / 20);
+  const bool sorted = on.invEnd <= maxLeft && on.ordered;
   const bool slept = on.asleepEnd;
 
   struct Spread { int width = 0, grains = 0; bool asleep = false; };
@@ -1726,15 +1866,193 @@ Status GateAlchemyResort(Ctx& c, std::string& detail) {
   const bool skin = fOn.grains > 100 && fOn.width >= 2 * fOff.width && fOn.asleep;
   RecordObserved("alchemy.resortInvertedEnd", (double)on.invEnd);
   RecordObserved("alchemy.floatSkinWidth", (double)fOn.width);
-  detail = Format("shaken: %d inverted when the hand stopped (min %d), %d at the end, order %s, asleep %s | "
+  detail = Format("shaken: %d inverted when the hand stopped (min %d), %d at the end (max %d), order %s, asleep %s | "
                   "control (no sort drive, lone drops held apart): %d, %d at the end, order %s || charcoal on "
                   "water: %d grains %d px wide, %s | control floatSpread off: %d px wide",
-                  on.invAtStop, minMixed, on.invEnd, on.order.c_str(),
+                  on.invAtStop, minMixed, on.invEnd, maxLeft, on.order.c_str(),
                   on.sleptF < 0 ? "never" : Format("%.1f s after", (on.sleptF - stopAt) / 60.0).c_str(),
                   off.invAtStop, off.invEnd, off.order.c_str(), fOn.grains, fOn.width,
                   fOn.asleep ? "asleep" : "AWAKE", fOff.width);
   const bool ok = mixed && sorted && slept && skin;
   std::printf("alchemy-resort: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// CONTENTS STAY COHERENT WHILE THEIR VESSEL MOVES, AND A MIXED BLOB FALLS AS
+// ONE (owner, 2026-09-27: "the liquid gets stuck in the powder when moving
+// upwards ... everything should take up 99% the same volume when it's moved";
+// "dirt in slime poured out fell really slowly and the slime hovered on it").
+//
+// (1) CARRY. A flask of water over a sand bed, and one of slime over dirt,
+// lifted, shaken, tipped and set down. Every 6 frames the OCCUPIED AREA is
+// measured -- grain pixels together with the pixels within 1.6 px of a
+// particle (a settled lattice covers its whole area at that radius, and
+// liquid squeezed, torn or soaked into the bed covers less) -- against the
+// same flask at rest. Asserted (tests/baseline.json alchemy.coherence*): its
+// mean and worst deviation while moving, and the deviation once set down
+// again. Before the contents rode the vessel's frame the lift alone
+// drove the liquid into the sand (mean 11.5%, worst 27%, 175 particles in
+// grain pixels); after, 1.4-1.7% and ~4%.
+// (2) FREE FALL. The flask is taken out from under its contents in mid-air
+// (TeleportVessel), once with slime alone and once with slime over dirt. The
+// mixed blob's liquid and its grains must have fallen at least
+// alchemy.fallRatioMin of what the pure slime fell in 30 frames (before: the
+// slime 0.48 of it, standing on its dirt).
+// (3) POURED OUT. Each flask turned over high up: the mixed one must be half
+// empty within alchemy.pourOutRatioMax of the time the pure slime takes
+// (before: 2.6 x, the dirt clogged the neck and held the slime on it).
+Status GateAlchemyCoherence(Ctx& c, std::string& detail) {
+  const int water = MatId(c, "water"), sand = MatId(c, "sand"), slime = MatId(c, "slime"), dirt = MatId(c, "dirt");
+  if (water < 0 || sand < 0 || slime < 0 || dirt < 0) { detail = "missing water/sand/slime/dirt"; return Status::Fail; }
+  struct Occ { int area = 0, trapped = 0; };
+  auto occupied = [](const FlaskSim& s) {
+    Occ o;
+    const int W = s.GridW(), H = s.GridH();
+    std::vector<uint8_t> m((size_t)W * H, 0);
+    std::vector<V2> gp;
+    s.GrainPositions(gp);
+    for (V2 g : gp) {
+      const int x = (int)g.x, y = (int)g.y;
+      if (x >= 0 && y >= 0 && x < W && y < H) m[(size_t)y * W + x] = 2;
+    }
+    const float R = 1.6f;
+    for (V2 p : s.Positions()) {
+      const int cx = (int)std::floor(p.x), cy = (int)std::floor(p.y);
+      if (cx >= 0 && cy >= 0 && cx < W && cy < H && m[(size_t)cy * W + cx] == 2) o.trapped++;
+      for (int y = (int)std::floor(p.y - R); y <= (int)std::floor(p.y + R); y++)
+        for (int x = (int)std::floor(p.x - R); x <= (int)std::floor(p.x + R); x++) {
+          if (x < 0 || y < 0 || x >= W || y >= H) continue;
+          const float dx = x + 0.5f - p.x, dy = y + 0.5f - p.y;
+          if (dx * dx + dy * dy <= R * R && !m[(size_t)y * W + x]) m[(size_t)y * W + x] = 1;
+        }
+    }
+    for (uint8_t v : m) o.area += v != 0;
+    return o;
+  };
+
+  // ---- (1) carry ----
+  struct Carry { double mean = 0, worst = 0, after = 0; int trapped = 0; uint32_t spilled = 0; };
+  auto carry = [&](int liq, int pow, uint32_t liqE, uint32_t powE, const char* shot) {
+    Carry r;
+    Composition in;
+    in.Add((uint16_t)liq, liqE);
+    in.Add((uint16_t)pow, powE);
+    auto subs = alchemy::SubstancesFor(c.mats, {&in});
+    FlaskSim s(BenchConfig());
+    s.SetSubstances(subs);
+    const int v = s.AddVessel(BenchFlask(1024), {{240, 4}, 0}, in);
+    for (int f = 0; f < 30; f++) s.Step(4);
+    const Occ rest = occupied(s);
+    int n = 0;
+    auto smooth = [](float u) { u = std::clamp(u, 0.f, 1.f); return u * u * (3 - 2 * u); };
+    for (int f = 0; f < 270; f++) {
+      const float t = f / 60.0f;
+      Xform x{{240, 4}, 0};
+      if (t < 1.0f) x.pos.y = 4 + 150 * smooth(t);                                          // lift
+      else if (t < 2.5f) x.pos = {240 + 60 * std::sin(6.2832f * 1.5f * (t - 1)), 154};     // shake
+      else if (t < 3.5f) { x.pos = {240, 154}; x.angle = 0.6f * std::sin(6.2832f * (t - 2.5f)); }  // tip
+      else x.pos.y = 154 - 150 * smooth(t - 3.5f);                                          // set down
+      s.SetVesselXform(v, x);
+      s.Step(4);
+      if (f % 6) continue;
+      const Occ o = occupied(s);
+      const double d = std::fabs((double)o.area / rest.area - 1.0);
+      r.mean += d;
+      r.worst = std::max(r.worst, d);
+      r.trapped = std::max(r.trapped, o.trapped);
+      n++;
+    }
+    r.mean /= std::max(1, n);
+    for (int f = 0; f < 300; f++) s.Step(4);
+    r.after = std::fabs((double)occupied(s).area / rest.area - 1.0);
+    r.spilled = s.Count().spilled.Total();
+    Shot(s, shot);
+    return r;
+  };
+  const Carry ws = carry(water, sand, 400, 150, "alchemy_coherence_sand.bmp");
+  const Carry sd = carry(slime, dirt, 400, 100, "alchemy_coherence_dirt.bmp");
+  const double meanMax = BaselineNumber("alchemy.coherenceMeanMax", 0.03);
+  const double worstMax = BaselineNumber("alchemy.coherenceWorstMax", 0.08);
+  const double afterMax = BaselineNumber("alchemy.coherenceAfterMax", 0.03);
+  auto carryOk = [&](const Carry& r) {
+    // (What a hard shake throws out of the mouth is alchemy-shake's business;
+    // a real loss shows here as area missing once set down.)
+    return r.mean <= meanMax && r.worst <= worstMax && r.after <= afterMax;
+  };
+  RecordObserved("alchemy.coherenceMeanSand", ws.mean);
+  RecordObserved("alchemy.coherenceMeanDirt", sd.mean);
+
+  // ---- (2) free fall ----
+  auto fall = [&](bool withDirt, double* liqDrop, double* grainDrop) {
+    Composition in;
+    in.Add((uint16_t)slime, 300);
+    if (withDirt) in.Add((uint16_t)dirt, 60);
+    auto subs = alchemy::SubstancesFor(c.mats, {&in});
+    FlaskSim s(BenchConfig());
+    s.SetSubstances(subs);
+    const int v = s.AddVessel(BenchFlask(512), {{120, 220}, 0}, in);
+    auto means = [&](double* ly, double* gy) {
+      *ly = 0;
+      for (V2 p : s.Positions()) *ly += p.y;
+      *ly /= std::max<size_t>(1, s.Positions().size());
+      std::vector<V2> gp;
+      s.GrainPositions(gp);
+      *gy = 0;
+      for (V2 g : gp) *gy += g.y;
+      *gy /= std::max<size_t>(1, gp.size());
+    };
+    double l0, g0, l1, g1;
+    means(&l0, &g0);
+    s.TeleportVessel(v, {{400, 4}, 0});
+    for (int f = 0; f < 30; f++) s.Step(4);
+    means(&l1, &g1);
+    *liqDrop = l0 - l1;
+    *grainDrop = g0 - g1;
+    if (withDirt) Shot(s, "alchemy_coherence_fall.bmp");
+  };
+  double pureDrop, unused, mixDrop, mixGrainDrop;
+  fall(false, &pureDrop, &unused);
+  fall(true, &mixDrop, &mixGrainDrop);
+  const double fallMin = BaselineNumber("alchemy.fallRatioMin", 0.85);
+  const double liqRatio = mixDrop / std::max(1e-6, pureDrop), grainRatio = mixGrainDrop / std::max(1e-6, pureDrop);
+  const bool fell = liqRatio >= fallMin && grainRatio >= fallMin;
+  RecordObserved("alchemy.fallLiquidRatio", liqRatio);
+
+  // ---- (3) poured out ----
+  auto pourOut = [&](bool withDirt) {
+    Composition in;
+    in.Add((uint16_t)slime, 300);
+    if (withDirt) in.Add((uint16_t)dirt, 60);
+    auto subs = alchemy::SubstancesFor(c.mats, {&in});
+    FlaskSim s(BenchConfig());
+    s.SetSubstances(subs);
+    const int v = s.AddVessel(BenchFlask(512), {{200, 200}, 0}, in);
+    const uint32_t total = s.Count().vessel[v].Total();
+    for (int f = 0; f < 900; f++) {
+      s.SetVesselXform(v, {{200, 200}, std::min(3.0f, 3.0f * f / 60.0f)});
+      s.Step(4);
+      if (s.Count().vessel[v].Total() * 2 <= total) return f / 60.0;
+    }
+    return 99.0;
+  };
+  const double pureHalf = pourOut(false), mixHalf = pourOut(true);
+  const double pourRatio = mixHalf / std::max(1e-6, pureHalf);
+  const bool poured = pourRatio <= BaselineNumber("alchemy.pourOutRatioMax", 1.5);
+  RecordObserved("alchemy.pourOutRatio", pourRatio);
+
+  auto carryText = [&](const char* what, const Carry& r) {
+    return Format("%s: occupied area off by %.2f%% mean, %.2f%% worst (max %.1f%%, %.1f%%), %d particles in grain "
+                  "pixels at worst, %.2f%% once set down, spilled %u",
+                  what, 100 * r.mean, 100 * r.worst, 100 * meanMax, 100 * worstMax, r.trapped, 100 * r.after,
+                  r.spilled);
+  };
+  detail = carryText("water+sand", ws) + " | " + carryText("slime+dirt", sd) +
+           Format(" | free fall in 30 frames: slime alone %.1f px, with dirt its slime %.1f (%.2f) and dirt %.1f "
+                  "(%.2f), min %.2f | poured out: half out in %.2f s alone, %.2f s with dirt (%.2f x, max %.2f)",
+                  pureDrop, mixDrop, liqRatio, mixGrainDrop, grainRatio, fallMin, pureHalf, mixHalf, pourRatio,
+                  BaselineNumber("alchemy.pourOutRatioMax", 1.5));
+  const bool ok = carryOk(ws) && carryOk(sd) && fell && poured;
+  std::printf("alchemy-coherence: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -1752,11 +2070,13 @@ const std::vector<Gate>& AlchemyGates() {
       {"alchemy-sand-carry", "player", {}, false, GateAlchemySandCarry},
       {"alchemy-lift", "player", {}, false, GateAlchemyLift},
       {"alchemy-place", "player", {}, false, GateAlchemyPlace},
+      {"alchemy-coherence", "player", {}, false, GateAlchemyCoherence},
       // Bench chemistry (package C): the world's rules on the bench.
       {"alchemy-react", "player", {}, false, GateAlchemyReact},
       {"alchemy-keeps", "player", {}, false, GateAlchemyKeeps},
       {"alchemy-evaporate", "player", {}, false, GateAlchemyEvaporate},
       {"alchemy-gas-carry", "player", {}, false, GateAlchemyGasCarry},
+      {"alchemy-gas-vent", "player", {}, false, GateAlchemyGasVent},
       {"alchemy-stopper", "player", {}, false, GateAlchemyStopper},
       {"alchemy-dissolve", "player", {}, false, GateAlchemyDissolve},
       {"alchemy-electrolysis", "player", {}, false, GateAlchemyElectrolysis},

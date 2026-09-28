@@ -168,7 +168,7 @@ bool CutOnce(MobSystem& mobs, World& world, uint64_t id, int limb,
   cut.cutDir = ax.travel;
   // The same three lines main.cpp computes, so a tuning change moves the gate
   // and the game together instead of leaving one of them behind.
-  cut.halfWidth = std::max(0.9f * g.cutWidth, 0.08f);
+  cut.halfWidth = std::max(0.9f * g.cutWidth, g.cutWidthMin);
   cut.depth = (g.cutDepth + g.cutDepthPower * power) * heft;
   cut.length = g.cutLength * (0.4f + 0.6f * power) * heft;
   cut.power = power;
@@ -1476,7 +1476,7 @@ Status GateCorpseCut(Ctx& c, std::string& detail) {
     cut.at = at;
     cut.edgeAxis = ax.edge;
     cut.cutDir = ax.travel;
-    cut.halfWidth = std::max(kRadius * g.cutWidth, 0.08f);
+    cut.halfWidth = std::max(kRadius * g.cutWidth, g.cutWidthMin);
     cut.depth = (g.cutDepth + g.cutDepthPower * kPower) * kHeft;
     cut.length = g.cutLength * (0.4f + 0.6f * kPower) * kHeft;
     cut.power = kPower;
@@ -1824,7 +1824,7 @@ Status GateCorpseDismember(Ctx& c, std::string& detail) {
     if (edge.len() < 0.15f) edge = into.cross(Vec3{1, 0, 0});
     cut.edgeAxis = edge.normalized();
     cut.cutDir = into;
-    cut.halfWidth = std::max(kRadius * g.cutWidth, 0.08f);
+    cut.halfWidth = std::max(kRadius * g.cutWidth, g.cutWidthMin);
     cut.depth = (g.cutDepth + g.cutDepthPower * kPower) * kHeft;
     cut.length = g.cutLength * (0.4f + 0.6f * kPower) * kHeft;
     cut.power = kPower;
@@ -6892,7 +6892,7 @@ Status GateCorpseSleep(Ctx& c, std::string& detail) {
     cut.at = at;
     cut.edgeAxis = Vec3{1, 0, 0};
     cut.cutDir = Vec3{0, -1, 0};
-    cut.halfWidth = std::max(0.9f * g.cutWidth, 0.08f);
+    cut.halfWidth = std::max(0.9f * g.cutWidth, g.cutWidthMin);
     cut.depth = g.cutDepth + g.cutDepthPower;
     cut.length = g.cutLength;
     cut.power = 1.0f;
@@ -7346,7 +7346,7 @@ Status GatePlayerCorpse(Ctx& c, std::string& detail) {
     cut.at = at;
     cut.edgeAxis = Vec3{1, 0, 0};
     cut.cutDir = Vec3{0, -1, 0};
-    cut.halfWidth = std::max(0.9f * g.cutWidth, 0.08f);
+    cut.halfWidth = std::max(0.9f * g.cutWidth, g.cutWidthMin);
     cut.depth = g.cutDepth + g.cutDepthPower;
     cut.length = g.cutLength;
     cut.power = 1.0f;
@@ -7667,7 +7667,7 @@ Status GateHeadCleave(Ctx& c, std::string& detail) {
       sword && sword->hasEdge ? (sword->edgeTo - sword->edgeFrom).len() * 0.5f
                               : 2.0f;
   const float halfWidth =
-      std::max((sword ? sword->edgeHalfWidth : 0.5f) * g.cutWidth, 0.08f);
+      std::max((sword ? sword->edgeHalfWidth : 0.5f) * g.cutWidth, g.cutWidthMin);
   std::vector<ParticleSpawn> spawns;
   IVec3 chunk{};
   auto fresh = [&]() -> uint64_t {
@@ -7923,11 +7923,13 @@ Status GateBruiseIsSkin(Ctx& c, std::string& detail) {
         v.material = (uint16_t)skin;
         lat.push_back(v);
       }
-  // A private brick with a known slot table, so the check reads real bytes.
+  // A private brick with a known look table, so the check reads real words.
+  // The bruise draws in `skin` here only because it is a material the table
+  // says has a look; any drawn id would do.
   MicroBodySet set;
-  std::vector<uint8_t> slots(std::max({skin, blood, water, oil}) + 1u, 0);
-  slots[blood] = 1; slots[water] = 2; slots[oil] = 4;
-  MicroBodySetStainSlots(set, slots, /*bruiseSlot=*/3);
+  std::vector<uint8_t> draws(std::max({skin, blood, water, oil}) + 1u, 0);
+  draws[blood] = 1; draws[water] = 1; draws[oil] = 1; draws[skin] = 1;
+  MicroBodySetCoatLooks(set, draws, /*bruiseMat=*/(uint16_t)skin);
   std::string log;
   const int model = MicroBodyPack(set, lat, IVec3{N, N, N}, 8, "bruise-is-skin", log);
   if (model < 0) {
@@ -7939,14 +7941,13 @@ Status GateBruiseIsSkin(Ctx& c, std::string& detail) {
     detail = "brick own refused";
     return Status::Fail;
   }
-  // The brick's 16-bit stain cell for lattice voxel i (coat low, bruise high).
-  auto brickCell = [&](size_t i) -> uint16_t {
+  // The brick's stain word for lattice voxel i (coat half low, bruise high).
+  auto brickCell = [&](size_t i) -> uint32_t {
     const MicroBodyModelGpu& m = set.models[(size_t)own];
     if (!(m.dims & kMicroBodyDimsStainBit)) return 0;
     const size_t cells = (size_t)N * N * N;
     const size_t idx = ((size_t)lat[i].z * N + lat[i].y) * N + lat[i].x;
-    const size_t w = m.base + (cells + 1) / 2 + idx / 2;
-    return (uint16_t)(set.pool[w] >> ((idx % 2) * 16));
+    return set.pool[m.base + (cells + 1) / 2 + idx];
   };
 
   StainLattice L;
@@ -7996,18 +7997,16 @@ Status GateBruiseIsSkin(Ctx& c, std::string& detail) {
   uint32_t brickMismatch = 0;
   for (size_t i = 0; i < lat.size(); i++) {
     const uint32_t lvl = BruiseLevel(lat[i].bruise);
-    const uint16_t want = lvl ? (uint16_t)((3u << 4 | lvl) << 8) : 0u;
-    if ((brickCell(i) & 0xFF00u) != want) brickMismatch++;
+    const uint32_t want = (uint32_t)PackBodyStain(skin, lvl) << 16;
+    if ((brickCell(i) & 0xFFFF0000u) != want) brickMismatch++;
   }
   if (brickMismatch) { ok = false; why += " brick bruise byte disagrees"; }
 
   // C: wash everything, the way water does, until nothing foreign is left.
   std::vector<uint8_t> before(lat.size());
   for (size_t i = 0; i < lat.size(); i++) before[i] = lat[i].bruise;
-  const uint16_t brickBefore = brickCell(0);   // untouched corner: nothing
-  (void)brickBefore;
-  std::vector<uint16_t> brickHiBefore(lat.size());
-  for (size_t i = 0; i < lat.size(); i++) brickHiBefore[i] = brickCell(i) & 0xFF00u;
+  std::vector<uint32_t> brickHiBefore(lat.size());
+  for (size_t i = 0; i < lat.size(); i++) brickHiBefore[i] = brickCell(i) & 0xFFFF0000u;
   for (int pass = 0; pass < 16; pass++)
     for (size_t i = 0; i < lat.size(); i++) {
       const uint16_t next = WashBodyStain(lat[i].stain, water, 4, 15);
@@ -8018,7 +8017,7 @@ Status GateBruiseIsSkin(Ctx& c, std::string& detail) {
   for (size_t i = 0; i < lat.size(); i++) {
     washedBlood += BodyStainMat(lat[i].stain) == blood;
     bruiseMoved += lat[i].bruise != before[i];
-    brickMoved += (brickCell(i) & 0xFF00u) != brickHiBefore[i];
+    brickMoved += (brickCell(i) & 0xFFFF0000u) != brickHiBefore[i];
   }
   if (washedBlood) { ok = false; why += " C:blood survived the wash"; }
   if (bruiseMoved) { ok = false; why += " C:the wash moved a bruise"; }
@@ -8033,9 +8032,9 @@ Status GateBruiseIsSkin(Ctx& c, std::string& detail) {
   uint32_t oilMoved = 0, oilOnBruise = 0;
   for (size_t i = 0; i < lat.size(); i++) {
     oilMoved += lat[i].bruise != before[i] ||
-                (brickCell(i) & 0xFF00u) != brickHiBefore[i];
+                (brickCell(i) & 0xFFFF0000u) != brickHiBefore[i];
     oilOnBruise += BruiseLevel(lat[i].bruise) > 0 &&
-                   (brickCell(i) & 0x00FFu) == (4u << 4 | 10u);
+                   (brickCell(i) & 0xFFFFu) == PackBodyStain(oil, 10);
   }
   if (oilMoved) { ok = false; why += " D:a coat moved a bruise"; }
   if (oilOnBruise == 0) { ok = false; why += " D:no coat sits on a bruise"; }
@@ -8057,6 +8056,300 @@ Status GateBruiseIsSkin(Ctx& c, std::string& detail) {
       bruised1, split1, k, deepB, bs.cap, deep1, splitB, splitBleeding,
       brickMismatch, washedBlood, bruiseMoved, brickMoved, oilMoved, oilOnBruise,
       tE.pulped, tE.core, rebled, why.empty() ? "" : (" |" + why).c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// blade-wounds: a sword and a dagger, slashed and stabbed, through the sweep
+// ---------------------------------------------------------------------------
+// The owner, 2026-09-26: "swords, daggers and cuts don't seem to be chipping /
+// removing voxels. I want a stab to remove some voxels as if it's a stab
+// wound." Every other wound gate builds its KerfCut by hand (CutOnce), so none
+// of them could see what a REAL blow's kerf is made of -- the dagger's derived
+// heft (0.2) scales a slash's depth under half a skin cell.
+//
+// FIXTURE. Two creatures (MeleeSweepDamage refuses to cut its wielder); the
+// SHIPPED sword and dagger (profile, edge half-width, carve bonus, heft); one
+// EdgeSweep per blow at `bladeWoundSpeed` of melee.fullSpeed, into the middle
+// of the target limb along its measured cross-section axis. A SLASH moves the
+// blade across itself; a STAB moves it hilt -> point along itself. Each arm is
+// a fresh spawn. The stab arms run twice, the second with gore.stabAlign
+// above 1 (stabs off: the old thrust-as-kerf path) as the control.
+//
+// Asserted: every arm lands; each stab takes at least bladeStabMinVox art
+// voxels in one blow and more than its control; a stab held in the limb for a
+// second tick of the same stroke carves nothing more (once per stroke).
+// Slash counts are REPORTED and recorded, and asserted only against
+// bladeSlashMinVox (0 = report only).
+Status GateBladeWounds(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 170));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const ItemDef* blades[2] = {c.items.At(c.items.Find("sword")),
+                              c.items.At(c.items.Find("dagger"))};
+  if (!blades[0] || !blades[1]) {
+    detail = "the item library has no sword or no dagger";
+    return Status::Skip;
+  }
+  const Tuning base = CurrentTuning();
+  const auto& g = base.gore;
+  MeleeTuning mt;
+  ApplyMeleeTuning(mt);
+  const float speed = (float)BaselineNumber("bladeWoundSpeed", 0.8);
+  const float step = mt.fullSpeed * kTickDt * speed;
+  const int kBlows = (int)BaselineNumber("bladeWoundBlows", 3);
+
+  struct Arm {
+    uint32_t firstLost = 0, lost = 0, heldExtra = 0;
+    int landed = 0;
+    float power = 0.0f;
+    bool severed = false, ran = false;
+  };
+  // mode 0 = slash, 1 = stab, 2 = stab with stabs OFF (control).
+  auto runArm = [&](const ItemDef& it, int mode) -> Arm {
+    Arm a;
+    Tuning tu = base;
+    if (mode == 2) tu.gore.stabAlign = 2.0f;
+    SetCurrentTuning(tu);
+    mobs.Reset();
+    c.debris.Reset();
+    const uint64_t wid = mobs.Spawn(t.defIndex, FixtureSite(c.world, 225));
+    const uint64_t id = mobs.Spawn(t.defIndex, FixtureSite(c.world, 170));
+    if (!wid || !id) { SetCurrentTuning(base); return a; }
+    // DIRECT PHASE CALLS ON PURPOSE (W2-O): fixture posing (SpawnTarget's).
+    for (int i = 0; i < 8; i++) {
+      std::vector<BrushOp> ops;
+      std::vector<ParticleSpawn> st;
+      std::vector<CellOp> cellOps;
+      mobs.PreTick(1000u + (uint32_t)i, c.world, ops, cellOps, st);
+      c.phys.Step(kTickDt);
+      mobs.PostStep();
+    }
+    mobs.ClearSeverEvents();
+    mobs.ClearSeverStats();
+    Mob* wielder = mobs.FindMobById(wid);
+    if (!wielder) { SetCurrentTuning(base); return a; }
+    a.ran = true;
+    const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+    const Vec3 mid = ax.anchor + ax.along * (ax.reach * 0.5f);
+    const uint32_t before = mobs.LimbArtVoxelCount(id, t.limb);
+    std::vector<ParticleSpawn> spawns;
+    const float L = 3.0f;   // world voxels of edge; enough to span the limb
+    auto sweep = [&](const Vec3& a0, const Vec3& b0, const Vec3& a1,
+                     const Vec3& b1, const Vec3& flat, uint32_t tick,
+                     std::vector<uint64_t>* struck) {
+      EdgeSweep sw;
+      sw.aPrev = a0; sw.bPrev = b0; sw.aNow = a1; sw.bNow = b1;
+      sw.flatNow = flat;
+      sw.dt = kTickDt;
+      sw.halfWidth = it.edgeHalfWidth;
+      sw.carveBonus = it.carveBonus;
+      sw.strike = it.strike;
+      sw.heft = it.HeftFactor(g.woundHeftRef, g.woundHeftMax);
+      sw.tick = tick;
+      sw.struck = struck;
+      sw.valid = true;
+      return MeleeSweepDamage(sw, mt, *wielder, c.phys, mobs, c.debris,
+                              c.world, spawns);
+    };
+    for (int k = 0; k < kBlows && mobs.LimbBody(id, t.limb); k++) {
+      std::vector<uint64_t> struck;
+      EdgeSweepResult r;
+      if (mode == 0) {
+        // Across the limb: the edge along `ax.edge`, travelling `ax.travel`,
+        // the flat's normal therefore along the limb (edge-on, full power).
+        r = sweep(mid - ax.edge * L - ax.travel * step,
+                  mid + ax.edge * L - ax.travel * step, mid - ax.edge * L,
+                  mid + ax.edge * L, ax.along, 7000u + (uint32_t)k, &struck);
+      } else {
+        // Point first along `ax.travel`, the tip ending at the limb's middle;
+        // the flat faces along the limb, so the slit runs ACROSS it.
+        const Vec3 tip0 = mid - ax.travel * step, tip1 = mid;
+        r = sweep(tip0 - ax.travel * L, tip0, tip1 - ax.travel * L, tip1,
+                  ax.along, 7000u + (uint32_t)k, &struck);
+        // ...and the blade stays in for one more tick of the SAME stroke,
+        // pushing on a little: it must not stab again.
+        if (k == 0 && mobs.LimbBody(id, t.limb)) {
+          const uint32_t n1 = mobs.LimbArtVoxelCount(id, t.limb);
+          const Vec3 tip2 = mid + ax.travel * (step * 0.25f);
+          sweep(tip1 - ax.travel * L, tip1, tip2 - ax.travel * L, tip2,
+                ax.along, 7100u, &struck);
+          const uint32_t n2 = mobs.LimbBody(id, t.limb)
+                                  ? mobs.LimbArtVoxelCount(id, t.limb)
+                                  : 0u;
+          a.heldExtra = n1 > n2 ? n1 - n2 : 0u;
+        }
+      }
+      if (r.bodiesHit > 0) a.landed++;
+      a.power = std::max(a.power, r.power * r.edgeAlign);
+      if (k == 0) {
+        const uint32_t n = mobs.LimbBody(id, t.limb)
+                               ? mobs.LimbArtVoxelCount(id, t.limb)
+                               : 0u;
+        a.firstLost = before > n ? before - n : 0u;
+        // The held tick above counted separately, not as the first blow's.
+        a.firstLost -= std::min(a.firstLost, a.heldExtra);
+      }
+    }
+    a.severed = mobs.LimbBody(id, t.limb) == 0;
+    const uint32_t after =
+        a.severed ? 0u : mobs.LimbArtVoxelCount(id, t.limb);
+    a.lost = before > after ? before - after : 0u;
+    mobs.Reset();
+    c.debris.Reset();
+    SetCurrentTuning(base);
+    return a;
+  };
+
+  const char* names[2] = {"sword", "dagger"};
+  const double stabMin = BaselineNumber("bladeStabMinVox", 12);
+  const double slashMin = BaselineNumber("bladeSlashMinVox", 0);
+  bool ok = true;
+  std::string why, line;
+  for (int b = 0; b < 2; b++) {
+    const Arm slash = runArm(*blades[b], 0);
+    const Arm stab = runArm(*blades[b], 1);
+    const Arm ctl = runArm(*blades[b], 2);
+    const std::string nm = names[b];
+    RecordObserved(("bladeSlashFirstVox_" + nm).c_str(), (double)slash.firstLost);
+    RecordObserved(("bladeStabFirstVox_" + nm).c_str(), (double)stab.firstLost);
+    RecordObserved(("bladeStabOffFirstVox_" + nm).c_str(), (double)ctl.firstLost);
+    auto fail = [&](const std::string& s) { ok = false; why += " | " + nm + ": " + s; };
+    if (!slash.ran || !stab.ran || !ctl.ran) fail("spawn refused");
+    if (slash.landed == 0) fail("slash never landed");
+    if (stab.landed == 0) fail("stab never landed");
+    if ((double)stab.firstLost < stabMin) fail("stab took too little");
+    if (stab.firstLost <= ctl.firstLost) fail("stab no bigger than stabs-off");
+    if (stab.heldExtra > 0) fail("held blade stabbed again");
+    if (slashMin > 0 && (double)slash.firstLost < slashMin)
+      fail("slash took too little");
+    line += Format(
+        "%s (heft %.2f): slash %u first / %u in %d (%d landed, power %.2f%s); "
+        "stab %u first / %u (%d landed, power %.2f, held +%u%s); stabs-off "
+        "%u first / %u. ",
+        nm.c_str(), blades[b]->HeftFactor(g.woundHeftRef, g.woundHeftMax),
+        slash.firstLost, slash.lost, kBlows, slash.landed, slash.power,
+        slash.severed ? ", SEVERED" : "", stab.firstLost, stab.lost,
+        stab.landed, stab.power, stab.heldExtra,
+        stab.severed ? ", SEVERED" : "", ctl.firstLost, ctl.lost);
+  }
+  detail = Format("%s/%s at %.2f speed: %s(need stab >= %.0f%s)%s",
+                  t.defName.c_str(), t.limbName.c_str(), speed, line.c_str(),
+                  stabMin,
+                  slashMin > 0 ? Format(", slash >= %.0f", slashMin).c_str()
+                               : "",
+                  why.c_str());
+  std::printf("blade-wounds: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
+  return ok ? Status::Pass : Status::Fail;
+}
+
+// ---------------------------------------------------------------------------
+// wound-rebleed: a bleeding wound washed clean fills back up with blood
+// ---------------------------------------------------------------------------
+// The owner, 2026-09-26: "I can stab someone, reveal their ribcage, then clean
+// up the wound with water, and the wound will still be bleeding voxels into
+// the world, but the area directly around the wound should still get stained
+// with blood." The cut's smear used to be laid once, on the hit tick.
+//
+// FIXTURE. A living target limb is cut (CutOnce) and hit (Damage, which opens
+// the bleed budget and puts the wound where the cut is); the whole limb is
+// then washed with water (SoakLimb, which scrubs every coat), and THE REAL
+// TICK runs for woundRebloodTicks * 2 + 2 ticks. Two arms on fresh spawns:
+// re-bleed on, and gore.woundRebloodTicks 0 (off) as the control -- the drip's
+// own spray can splatter the creature, and this separates that from the rule.
+//
+// Asserted: the wound is still bleeding after the wash, the wash really took
+// the blood off, and the ON arm has more
+// blood-coated voxels than the control
+// (baseline woundRebleedMin).
+Status GateWoundRebleed(Ctx& c, std::string& detail) {
+  MobSystem& mobs = c.mobs;
+  IdCounterScope idScope(mobs);
+  PrepareWorld(c);
+  const Target t = ChooseTarget(mobs, FixtureSite(c.world, 170));
+  if (!t.valid()) {
+    detail = "no loaded mob def has a severable non-vital limb that bleeds";
+    return Status::Fail;
+  }
+  const uint32_t blood = mobs.Defs()[t.defIndex].bleedMat;
+  const uint32_t water = mobs.MaterialIdNamed("water");
+  if (!blood || !water) {
+    detail = "no blood or no water material";
+    return Status::Fail;
+  }
+  const Tuning base = CurrentTuning();
+  struct Arm {
+    uint32_t cut = 0, washed = 0, after = 0;
+    float budgetWashed = 0.0f;
+    bool ran = false, alive = false;
+  };
+  auto runArm = [&](bool on) -> Arm {
+    Arm a;
+    Tuning tu = base;
+    if (!on) tu.gore.woundRebloodTicks = 0;
+    SetCurrentTuning(tu);
+    // Pristine ground PER ARM: the first arm's blood is still in the world
+    // otherwise, and the second target would be splattered by it.
+    PrepareWorld(c);
+    IVec3 pchunk{};
+    const uint64_t id = SpawnTarget(c, t, 170, pchunk);
+    if (!id) { SetCurrentTuning(base); return a; }
+    const LimbAxis ax = MeasureLimb(mobs, id, t.limb);
+    std::vector<ParticleSpawn> spawns;
+    // Damage FIRST, as the sweep does: it opens the bleed budget, and the cut
+    // after it moves the wound to the mouth of the slot (Mob::CutLimb).
+    if (const uint64_t b0 = mobs.LimbBody(id, t.limb))
+      mobs.Damage(b0, 8.0f, ax.anchor + ax.along * (ax.reach * 0.5f), 0.0f,
+                  DamageCtx(DamageCause::Blade, 1.0f));
+    CutOnce(mobs, c.world, id, t.limb, ax, ax.reach * 0.5f, 1.0f, 1.0f,
+            0x2EB1Du, spawns);
+    if (!mobs.LimbBody(id, t.limb)) {
+      SetCurrentTuning(base);
+      mobs.Reset();
+      return a;
+    }
+    a.cut = mobs.LimbCoatMatCount(id, t.limb, blood, 1);
+    mobs.SoakLimb(id, t.limb, water, 15, 40999u);
+    a.washed = mobs.LimbCoatMatCount(id, t.limb, blood, 1);
+    a.budgetWashed = mobs.LimbBleedBudget(id, t.limb);
+    uint32_t simTick = 41000;
+    support::TickCursor ticker{c, simTick, pchunk};
+    const int n = std::max(1, base.gore.woundRebloodTicks) * 2 + 2;
+    for (int i = 0; i < n; i++) ticker();
+    a.alive = mobs.IsAlive(id) && mobs.LimbBody(id, t.limb) != 0;
+    a.after = a.alive ? mobs.LimbCoatMatCount(id, t.limb, blood, 1) : 0u;
+    a.ran = true;
+    mobs.Reset();
+    c.debris.Reset();
+    SetCurrentTuning(base);
+    return a;
+  };
+  const Arm on = runArm(true);
+  const Arm off = runArm(false);
+  const double need = BaselineNumber("woundRebleedMin", 8);
+  RecordObserved("woundRebleedOn", (double)on.after);
+  RecordObserved("woundRebleedOff", (double)off.after);
+  std::string why;
+  if (!on.ran || !off.ran) why += " | spawn refused";
+  if (!on.alive || !off.alive) why += " | the limb or the creature did not last";
+  if (on.budgetWashed < 1.0f) why += " | the wound was not bleeding after the wash";
+  if (on.washed >= on.cut && on.cut > 0) why += " | the wash took no blood off";
+  if ((double)on.after < (double)off.after + need)
+    why += " | the washed wound did not bleed back";
+  const bool ok = why.empty();
+  detail = Format(
+      "%s/%s: blood-coated voxels cut %u -> washed %u (budget %.1f vox) -> "
+      "%u after %d ticks with re-bleed every %d, %u with it off (need +%.0f)%s",
+      t.defName.c_str(), t.limbName.c_str(), on.cut, on.washed,
+      on.budgetWashed, on.after,
+      std::max(1, base.gore.woundRebloodTicks) * 2 + 2,
+      base.gore.woundRebloodTicks, off.after, need, why.c_str());
+  std::printf("wound-rebleed: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }
 
@@ -8209,12 +8502,16 @@ HealScatter HealOrderScatter(const std::vector<float>& d2) {
 //     pay for the whole hole (the fixture asserts it cannot), the hole is NOT whole.
 //   * RESTORED, SLOWLY AND NOISILY: a HEAVY wound (a crater on every side of
 //     the limb that a ray reaches, at two heights) on a fresh creature, the
-//     limb soaked (+8, surface). At 5 s (150 ticks) at least
-//     heal.minLeftAt5s of the wound is still there (it is not an instant
-//     heal); at 35 s at most heal.maxLeftAt35s is; it ends back at its recipe
-//     -- 0 missing, 0 changed -- with hp at least what it was before the
-//     carve, and the coat is still on it when it does (it did not dry off
-//     first); every cell rebuilt is paid for by a level spent; and the FIRST
+//     limb soaked (+8, surface) and SOAKED AGAIN every heal.repourTicks
+//     until it is whole: a soak dries off in ~20 s (coat.decay 1.2, the
+//     owner 2026-09-27), well short of a heavy wound's ~30 s heal, so a heavy
+//     wound takes repeated pours -- which is what this measures. At 5 s (150
+//     ticks) at least heal.minLeftAt5s of the wound is still there (it is not
+//     an instant heal); at 35 s at most heal.maxLeftAt35s is; it ends back at
+//     its recipe -- 0 missing, 0 changed -- with hp at least what it was
+//     before the carve, and the coat is still on it when it does; every cell
+//     rebuilt is paid for by a level spent (levels summed over every pour);
+//     and the FIRST
 //     20% of the cells to grow back are scattered along the wound, not the
 //     ones nearest the joint (HealOrderScatter's mean rank >=
 //     heal.minScatterRank). Thresholds: tests/baseline.json heal.*.
@@ -8234,8 +8531,10 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
   const bool wired = eb.coatRestore > 0.0f && ew.coatRestore > 0.0f &&
                      c.mats[hm.blood].coatRestore == 0.0f &&
                      c.mats[hm.water].coatRestore == 0.0f &&
-                     eb.stainSlot != 0 && eb.stainSlot == c.mats[hm.blood].stainSlot &&
-                     ew.stainSlot != 0 && ew.stainSlot == c.mats[hm.water].stainSlot &&
+                     // Their OWN stains (2026-09-27): drawn as themselves on
+                     // skin and on the ground, not as blood's and wet's.
+                     eb.stainSlot != 0 && eb.stainSlot != c.mats[hm.blood].stainSlot &&
+                     ew.stainSlot != 0 && ew.stainSlot != c.mats[hm.water].stainSlot &&
                      mobs.StainTypeOf(hm.eBlood) != 0;
   const MobDef& def = mobs.Defs()[t.defIndex];
   const double cpl = HealCellsPerLevel(def, eb);
@@ -8323,9 +8622,11 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
   const double maxLeft35 = BaselineNumber("heal.maxLeftAt35s", 0.15);
   const double minScatter = BaselineNumber("heal.minScatterRank", 0.3);
   const double minWound = BaselineNumber("heal.minHeavyWoundCells", 600);
+  const uint32_t repour =
+      (uint32_t)std::max(1.0, BaselineNumber("heal.repourTicks", 150));
   bool restoredOk = false;
   uint32_t missB0 = 0, diffB0 = 0, missB1 = 0, diffB1 = 0, levelsB = 0,
-           doneAt = 0, craters = 0, coatAtDone = 0;
+           doneAt = 0, craters = 0, coatAtDone = 0, poursB = 0;
   uint32_t left5 = 0, left35 = 0;
   float hpB0 = 0.0f, hpB1 = 0.0f;
   Mob::HealStats sB;
@@ -8357,8 +8658,16 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
     mobs.LimbRecipeDiff(idB, t.limb, missB0, diffB0);
     hpB0 = mobs.LimbHp(idB, t.limb);
     mobs.LogHealOrder(idB, true);
-    mobs.SoakLimb(idB, t.limb, hm.eBlood, 8, simTick);
-    levelsB = HealCoatLevels(mobs, idB, t.limb, hm.eBlood, simTick);
+    // One pour: the levels it ADDED join the purse (what is already on the
+    // limb was paid for by an earlier pour).
+    auto soakB = [&]() {
+      const uint32_t before = HealCoatLevels(mobs, idB, t.limb, hm.eBlood, simTick);
+      mobs.SoakLimb(idB, t.limb, hm.eBlood, 8, simTick);
+      const uint32_t after = HealCoatLevels(mobs, idB, t.limb, hm.eBlood, simTick);
+      levelsB += after > before ? after - before : 0u;
+      poursB++;
+    };
+    soakB();
     left5 = left35 = missB0 + diffB0;
     // SANDVOX_HEAL_SHOTS=1: a picture of the limb at 0, 5, 10, 15, 20, 30 s
     // and when it is whole, from the first side a crater was carved from.
@@ -8378,6 +8687,7 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
     for (int i = 0; i < 3600 && mobs.LimbBody(idB, t.limb); i++) {
       poseTick();
       const uint32_t tk = (uint32_t)i + 1;
+      if (tk % repour == 0) soakB();
       if (tk == 150) shotAt("05s");
       if (tk == 300) shotAt("10s");
       if (tk == 450) shotAt("15s");
@@ -8417,7 +8727,8 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
       "%s.%s: wired %d, %.2f cells/level | A pour: %u marked, %u levels (purse "
       "%.0f cells) on a hole of %u missing + %u changed -> rebuilt %u (%u grown, "
       "%u mended, %u levels spent), coat spent after %u ticks, +60 ticks: %u "
-      "more; left %u missing | B heavy (%u craters), soak: %u levels on %u "
+      "more; left %u missing | B heavy (%u craters), %u soaks every %u ticks: "
+      "%u levels on %u "
       "missing + %u changed; left %u at 5 s (>= %.2f), %u at 35 s (<= %.2f) -> "
       "%u missing + %u changed, whole+hp at tick %u (%.1f s) with %u voxels "
       "still coated, %u grown, %u mended, %u levels spent (%.0f cells), hp "
@@ -8428,7 +8739,7 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
       t.defName.c_str(), t.limbName.c_str(), wired ? 1 : 0, cpl, markedA,
       levelsA, purseA, missA0, diffA0, rebuiltA, sA.grown, sA.mended,
       sA.levelsSpent, spentAt, (sA2.grown + sA2.mended) - rebuiltA, missA1,
-      craters, levelsB, missB0, diffB0, left5, minLeft5, left35, maxLeft35,
+      craters, poursB, repour, levelsB, missB0, diffB0, left5, minLeft5, left35, maxLeft35,
       missB1, diffB1, doneAt, doneAt / 30.0, coatAtDone, sB.grown, sB.mended,
       sB.levelsSpent, sB.levelsSpent * cpl, hpB0, hpB1, hpPre, scat.first,
       scat.n, scat.meanRank, minScatter, 100.0 * scat.nearFrac, sB.timedSteps,
@@ -8446,7 +8757,9 @@ Status GateHealRestore(Ctx& c, std::string& detail) {
 //     the limb's hp rises -- and on NO tick is it above hp x the burn cap.
 //     PACED: the ~1600 cooked cells are not back at 5 s (heal.minLeftAt5s of
 //     them remain), are mostly back at 35 s (heal.maxLeftAt35s), and the
-//     coat is still on the limb when it is whole.
+//     coat is still on the limb when it is whole. Doused AGAIN every
+//     heal.repourTicks until then: one douse dries off in ~20 s (coat.decay
+//     1.2), so a wound this size takes repeated applications.
 //   * ENCHANTED WATER, the gentle one, on a fresh cooked limb: it mends
 //     (> 0 cells), does not claim to stanch, and never rebuilds more than its
 //     levels buy.
@@ -8494,6 +8807,9 @@ Status GateHealWound(Ctx& c, std::string& detail) {
   uint32_t miss0 = 0, diff0 = 0;
   mobs.LimbRecipeDiff(id, t.limb, miss0, diff0);
   const uint32_t did = mobs.DouseLimb(id, t.limb, hm.eBlood, 6, simTick);
+  const uint32_t repour =
+      (uint32_t)std::max(1.0, BaselineNumber("heal.repourTicks", 150));
+  uint32_t douses = 1;
   const double minLeft5 = BaselineNumber("heal.minLeftAt5s", 0.5);
   const double maxLeft35 = BaselineNumber("heal.maxLeftAt35s", 0.15);
   uint32_t overCap = 0, wholeAt = 0, left5 = miss0 + diff0, left35 = miss0 + diff0,
@@ -8502,6 +8818,10 @@ Status GateHealWound(Ctx& c, std::string& detail) {
   std::string trace;
   for (int i = 0; i < 3600 && mobs.LimbBody(id, t.limb); i++) {
     poseTick();
+    if ((uint32_t)(i + 1) % repour == 0) {
+      mobs.DouseLimb(id, t.limb, hm.eBlood, 6, simTick);
+      douses++;
+    }
     if (i + 1 == 150 || i + 1 == 1050) {
       uint32_t m = 0, d = 0;
       mobs.LimbRecipeDiff(id, t.limb, m, d);
@@ -8571,7 +8891,8 @@ Status GateHealWound(Ctx& c, std::string& detail) {
 
   detail = Format(
       "%s.%s: cut (open %d), %u skin cooked -> cap %.3f frac %.3f, hp %.2f, %u "
-      "missing + %u changed | enchanted blood: did 0x%x, left %u at 5 s (>= "
+      "missing + %u changed | enchanted blood: did 0x%x, %u douses every %u "
+      "ticks, left %u at 5 s (>= "
       "%.2f), %u at 35 s (<= %.2f), whole at tick %u (%.1f s, %u voxels still "
       "coated): open %d, %u missing + %u changed, cap %.3f frac %.3f, hp %.2f "
       "(max %.1f), %u ticks over the cap (worst +%.3f), %u grown %u mended %u "
@@ -8579,7 +8900,7 @@ Status GateHealWound(Ctx& c, std::string& detail) {
       "cooked, did 0x%x, %u levels (%.2f cells each) -> %u mended %u grown in "
       "10 s",
       t.defName.c_str(), t.limbName.c_str(), open0 ? 1 : 0, cooked, cap0, frac0,
-      hp0, miss0, diff0, did, left5, minLeft5, left35, maxLeft35, wholeAt,
+      hp0, miss0, diff0, did, douses, repour, left5, minLeft5, left35, maxLeft35, wholeAt,
       wholeAt / 30.0, coatAtWhole, open1 ? 1 : 0, miss1, diff1, cap1, frac1, hp1,
       hpMax, overCap, worst, sb.grown, sb.mended, sb.levelsSpent, sb.timedSteps,
       sb.timedSteps ? sb.stepUs / sb.timedSteps : 0.0, sb.stepUsMax, cookedW,
@@ -8604,6 +8925,8 @@ const std::vector<Gate>& WoundGates() {
       {"hit-drive", "mob", {}, false, GateHitDrive, false},
       {"corpse-dismember", "mob", {}, false, GateCorpseDismember, false},
       {"head-cleave", "mob", {}, false, GateHeadCleave, false},
+      {"blade-wounds", "mob", {}, false, GateBladeWounds, false},
+      {"wound-rebleed", "mob", {}, false, GateWoundRebleed, false},
       {"corpse-blunt", "mob", {}, false, GateCorpseBlunt, false},
       {"bruise-is-skin", "mob", {}, false, GateBruiseIsSkin, false},
       {"corpse-armor", "mob", {}, false, GateCorpseArmor, false},

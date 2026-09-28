@@ -541,6 +541,19 @@ int ContainerBreakPass(WorldItems& ground, const ItemLibrary& items,
                        std::vector<std::pair<uint64_t, Vec3>>& lastVel,
                        std::vector<ContainerSpill>& spills);
 
+// A BLAST BURSTS EVERY VESSEL IT REACHES (session.cpp, beside each of this
+// machine's explosions, BEFORE DebrisSystem::DamageBodiesRadial). The crater
+// carve would otherwise take the vessel's body -- and with it, through
+// OnBodyGone, the registry entry that is the only record of what it held --
+// so a flask of oil blown up used to vanish, contents and all. Every vessel
+// whose centre of mass is within `radius` (+ a small body margin) of `center`
+// is destroyed here and its contents appended to `spills`, bursting outward
+// from the blast. Glass or leather alike: `breakSpeed` is about knocks, and a
+// blast is not a knock. Ghost bodies are the peer's. Returns the number burst.
+int ContainerBlastPass(WorldItems& ground, const ItemLibrary& items,
+                       Physics& phys, DebrisSystem& debris, Vec3 center,
+                       float radius, std::vector<ContainerSpill>& spills);
+
 // Spend up to `cells` whole cells of contents (the triage "apply to this
 // limb"). Returns the eighths actually spent; empties the fill at zero.
 int ContainerSpend(ItemStack& st, int cells);

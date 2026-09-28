@@ -910,6 +910,62 @@ int ContainerBreakPass(WorldItems& ground, const ItemLibrary& items,
   return n;
 }
 
+int ContainerBlastPass(WorldItems& ground, const ItemLibrary& items,
+                       Physics& phys, DebrisSystem& debris, Vec3 center,
+                       float radius, std::vector<ContainerSpill>& spills) {
+  if (radius <= 0.0f) return 0;
+  // The carve tests the body's VOXELS against the sphere; this tests its
+  // centre, so a vessel the rim would still nick sits a little further out.
+  // A flask is a couple of voxels across -- the margin is its half-size.
+  constexpr float kVesselMargin = 2.0f;
+  const float reach = radius + kVesselMargin;
+  struct Burst {
+    uint64_t body;
+    Vec3 at, vel, away;
+  };
+  std::vector<Burst> burst;
+  for (const WorldItem& wi : ground.All()) {
+    const ItemDef* def = items.Of(wi);
+    if (!def || !def->IsContainer()) continue;
+    if (debris.IsGhost(wi.body)) continue;
+    Vec3 at{};
+    if (!phys.BodyCenterOfMass(wi.body, at)) {
+      BodyTransform bx{};
+      if (!phys.GetTransform(wi.body, bx)) continue;
+      at = bx.pos;
+    }
+    const Vec3 d = at - center;
+    const float l = d.len();
+    if (l > reach) continue;
+    Vec3 lin{}, ang{};
+    phys.GetBodyVelocities(wi.body, lin, ang);
+    // Off the blast; straight up for one sitting on the charge.
+    const Vec3 away = l > 1e-3f ? d * (1.0f / l) : Vec3{0, 1, 0};
+    // The blast's shove, which the impulse pass will never get to apply (the
+    // body is gone first): nearer is harder. ContainerSpillStep carries a
+    // third of it, on top of its own outward burst.
+    const float shove = MetresToCells(12.0f) * (1.0f - 0.6f * std::min(1.0f, l / reach));
+    burst.push_back({wi.body, at, lin + away * shove, away});
+  }
+  int n = 0;
+  for (const Burst& b : burst) {
+    const WorldItem* wi = ground.Find(b.body);
+    if (!wi) continue;
+    ContainerSpill sp;
+    sp.rest = wi->contents;
+    sp.at = b.at;
+    sp.vel = b.vel;
+    sp.away = b.away;
+    // Salted apart from the break pass's seed: same body, different event.
+    sp.seed = (uint32_t)(b.body ^ (b.body >> 32)) ^ 0xB1A57u;
+    // AFTER every read of the entry: OnBodyGone erases it.
+    debris.DestroyBody(b.body);
+    n++;
+    if (!sp.Done()) spills.push_back(sp);
+  }
+  return n;
+}
+
 int ContainerSpend(ItemStack& st, int cells) {
   if (!st.Filled() || cells <= 0 || st.count != 1 || st.stoppered) return 0;
   // What is spent is the MIX: every portion in proportion, so a salve of two

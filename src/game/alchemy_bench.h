@@ -140,6 +140,15 @@ struct BenchVesselView {
   float heat = 0;
 };
 
+// Whole eighths that fell off the table, and the vessel they left (the one
+// the matter was last inside: FlaskSim::DrainSpilled's SpillBy). `ref` is
+// invalid for matter that left no vessel we know of (loose gas on the
+// table, the remainder of a vessel taken off it).
+struct BenchSpill {
+  KitRef ref;
+  Composition what;
+};
+
 // Does `r` conserve every material (sum of before == sum of after + spilled)?
 // Also enforces each vessel's capacity by moving the excess -- top layer
 // first -- into the spill, so the result that comes back is always
@@ -253,10 +262,12 @@ class AlchemyBench {
   void Frame(const BenchInput& in, BenchTool tool);
 
   // WHAT FELL OFF THE TABLE SINCE THE LAST CALL, whole eighths, for the
-  // caller to put into the world NOW (up to 16 substances a call; more waits
-  // for the next). `exitX` = where on the table it fell, sim pixels. Once
+  // caller to put into the world NOW, one BenchSpill per vessel it LEFT (up
+  // to 16 substances each a call; more waits for the next) -- so two flasks
+  // spilling at once each pour from their own lip. `exitX` = where on the
+  // table it fell, sim pixels (a fallback for the part with no vessel). Once
   // taken it is the world's: Finish reports it in BenchResult::streamed.
-  bool TakeSpill(Composition& out, float& exitX);
+  bool TakeSpill(std::vector<BenchSpill>& out, float& exitX);
 
   // THE CHEMISTRY'S EVENTS since the last call (DispatchBenchEvent each).
   std::vector<BenchEvent> TakeEvents();
@@ -298,6 +309,14 @@ class AlchemyBench {
   void Apply(Cmd& c);
   void Tick(const BenchInput& in, bool pressed, float tilt, BenchTool tool, float dt);
   bool FreeSpot(int entry, float nearX, Xform& out) const;
+  // THE MOUTH UNDER THE POINTER (sim thread): the vessel on the table whose
+  // mouth -- the cork's box, with a margin for the hand -- is at `at`, as a
+  // FlaskSim index; -1 for none. A hand click there puts the stopper in or
+  // takes it out instead of picking the vessel up.
+  int MouthAt(V2 at) const;
+  // The hovered mouth's ghost cork (or, stoppered, a ring round the real
+  // one), painted over a rendered picture.
+  void PaintMouthHover(std::vector<uint32_t>& pic) const;
 
   // ---- frame-thread state ----
   bool open_ = false;
@@ -316,11 +335,15 @@ class AlchemyBench {
   bool pressedLatch_ = false;
   float tiltAcc_ = 0;
   BenchTool tool_ = BenchTool::Hand;
+  float wind_ = 0.12f;                                 // tuning tools.alchemyWind, as of the last Frame
   std::vector<Cmd> cmds_;
   std::vector<uint32_t> back_;
   bool backReady_ = false;
   std::vector<Composition> live_;                      // per entry
-  std::vector<uint32_t> streamOut_;                    // per mat id, not yet taken
+  std::vector<uint8_t> liveOn_;                        // per entry: live_ counted it on the table
+  // Not yet taken, per SOURCE then per mat id: [0] left no known vessel,
+  // [1 + entry] left that entry.
+  std::vector<std::vector<uint32_t>> streamOut_;
   double streamXSum_ = 0, streamXW_ = 0;
   int heldPub_ = -1;                                   // entry in the hand
   struct Removed { int entry; Composition c; bool stoppered; };
@@ -346,6 +369,8 @@ class AlchemyBench {
   V2 grabLocal_;
   float heldAngle_ = 0;
   int simFocus_ = -1;
+  int mouthHover_ = -1;                    // FlaskSim vessel whose mouth is pointed at
+  bool redraw_ = false;                    // Tick changed the look (hover, a stopper)
   uint32_t ticks_ = 0;
 };
 

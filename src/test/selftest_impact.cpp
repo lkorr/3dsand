@@ -304,7 +304,7 @@ void CutOnce(MobSystem& mobs, World& world, uint64_t id, int limb,
   cut.at = ax.anchor + ax.along * alongLimb;
   cut.edgeAxis = travel.cross(ax.along).normalized();
   cut.cutDir = travel;
-  cut.halfWidth = std::max(0.9f * g.cutWidth, 0.08f);
+  cut.halfWidth = std::max(0.9f * g.cutWidth, g.cutWidthMin);
   cut.depth = (g.cutDepth + g.cutDepthPower * power);
   cut.length = g.cutLength * (0.4f + 0.6f * power);
   cut.power = power;

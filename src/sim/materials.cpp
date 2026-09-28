@@ -98,25 +98,48 @@ static int FindMaterial(const std::vector<MaterialDef>& mats, const std::string&
   return -1;
 }
 
-// Stain-type registry: stain name -> slot 1..7, assigned first-seen. Keyed by
-// NAME rather than by material so several materials can share one stain look
-// (any of the future gore materials can all stain "blood"), and so the slot
-// numbers stay stable as long as the file order of first use does.
+// Stain-type registry: stain name -> slot, assigned first-seen. Keyed by NAME
+// rather than by material so several materials can share one stain (any of
+// the future gore materials can all stain "blood"), and so the slot numbers
+// stay stable as long as the file order of first use does.
 //
-// Only 7 slots exist — the voxel word can spare 3 bits and no more (world.h).
-// That is a deliberate ceiling: stains are a visual vocabulary of a handful of
-// kinds, not a per-material property. Running out is a loud load error.
+// TWO SLOT SPACES, because only one of them is scarce:
+//   * GROUND slots 1..7 -- a stain that can reach the world lives in the voxel
+//     word's 3 stain-type bits (world.h), and that is all the bits there are.
+//     Running out is a loud load error.
+//   * BODY-ONLY slots 8..255 -- a `"bodyOnly": true` stain (a bruise, acid's
+//     coat) never touches a grid cell, and a body coat is DRAWN BY ITS
+//     MATERIAL (sim/microbody.h, the stain lattice), not through the palette.
+//     It still needs a nonzero slot -- gameplay asks "does this substance
+//     stain at all?" as `stainSlot != 0` -- but it must not spend one of the
+//     seven, which it used to: acid and bruise held two of them while
+//     enchanted water and blood had to borrow wet's and blood's look.
+// One name is one kind: naming a stain bodyOnly in one material and a ground
+// stain in another is an error rather than a silent promotion.
 struct StainRegistry {
+  static constexpr uint32_t kFirstBodySlot = kStainTypeMax + 1;
   std::map<std::string, uint32_t> slots;
-  bool full = false;
-  uint32_t SlotOf(const std::string& name) {
+  uint32_t groundUsed = 0, bodyUsed = 0;
+  // Why the last SlotOf returned 0.
+  bool full = false, mixed = false;
+  uint32_t SlotOf(const std::string& name, bool bodyOnly) {
+    full = mixed = false;
     auto it = slots.find(name);
-    if (it != slots.end()) return it->second;
-    if (slots.size() >= kStainTypeMax) {
-      full = true;
-      return 0;
+    if (it != slots.end()) {
+      if ((it->second >= kFirstBodySlot) != bodyOnly) {
+        mixed = true;
+        return 0;
+      }
+      return it->second;
     }
-    uint32_t slot = (uint32_t)slots.size() + 1;  // 0 means "unstained"
+    uint32_t slot;
+    if (bodyOnly) {
+      if (kFirstBodySlot + bodyUsed > 255u) { full = true; return 0; }
+      slot = kFirstBodySlot + bodyUsed++;
+    } else {
+      if (groundUsed >= kStainTypeMax) { full = true; return 0; }
+      slot = 1u + groundUsed++;  // 0 means "unstained"
+    }
     slots[name] = slot;
     return slot;
   }
@@ -142,8 +165,8 @@ static void ParseStain(const json& m, const std::string& path,
   //
   // `"bodyOnly": true` is a solid saying "I am a COAT, not a spill". The body
   // stain (phys/bodystain.h) is a 16-bit word on a creature's own lattice,
-  // written by C++ at the point of injury and narrowed to this palette slot
-  // only for rendering — it never goes near the liquid movement path, so the
+  // written by C++ at the point of injury and drawn by its material — it
+  // never goes near the liquid movement path, so the
   // objection above does not apply to it and the rejection was costing the one
   // thing a solid legitimately wants a stain slot FOR: a bruise, which is a
   // colour that deepens under the skin rather than a fluid lying on it.
@@ -160,12 +183,26 @@ static void ParseStain(const json& m, const std::string& path,
     return;
   }
   d.stain = s.value("type", d.name);
-  uint32_t slot = stainReg.SlotOf(d.stain);
+  uint32_t slot = stainReg.SlotOf(d.stain, bodyOnly);
   if (slot == 0) {
-    errors += path + ": material \"" + d.name + "\": more than " +
-              std::to_string(kStainTypeMax) + " distinct stain types\n";
+    if (stainReg.mixed)
+      errors += path + ": material \"" + d.name + "\": stain type \"" + d.stain +
+                "\" is bodyOnly on one material and a ground stain on another "
+                "(one stain name is one kind; give one of them its own name)\n";
+    else if (bodyOnly)
+      errors += path + ": material \"" + d.name +
+                "\": more than 248 distinct bodyOnly stain types\n";
+    else
+      errors += path + ": material \"" + d.name + "\": more than " +
+                std::to_string(kStainTypeMax) +
+                " distinct GROUND stain types (the voxel word has 3 stain-type "
+                "bits; bodyOnly stains do not count against them)\n";
     return;
   }
+  // A stain GLOWS on a body as its material glows, unless the coat block says
+  // otherwise (ParseCoat reads "glow" with this as its default): enchanted
+  // blood's coat shines because the liquid does, with nothing authored twice.
+  d.coatGlow = std::min<uint32_t>(d.gpu.emission, 255u);
 
   uint32_t color = 0;
   if (s.contains("color")) {
@@ -310,7 +347,7 @@ static void ParseCoat(const json& m, const std::string& path, MaterialDef& d,
   d.coatEffects = co.value("effects", std::vector<std::string>{});
   // Glow + pulse (render-only; MaterialDef::coatGlow), contact rate and depth
   // (MaterialDef::coatContact / coatDepth).
-  const int glow = co.value("glow", 0);
+  const int glow = co.value("glow", (int)d.coatGlow);  // default: the emission
   if (glow < 0 || glow > 255) {
     errors += path + ": material \"" + d.name + "\": coat glow must be 0..255\n";
   } else {

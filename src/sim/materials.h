@@ -429,8 +429,9 @@ struct MaterialGpu {
   uint32_t fluidPack = 0;           // packed liquid coupling (see above)
   // Reserved in the AUTHORED record (always 0 here). Filled only in the
   // UPLOADED table (Simulation::UploadTables): a real material's `_r2` is its
-  // catch form (DESIGN.md §6 clause 2c, sim/bodyreact.h CatchFormTable); a
-  // stain palette entry's `_r2` / `_r3` are the coat glow and coat material.
+  // catch form (DESIGN.md §6 clause 2c, sim/bodyreact.h CatchFormTable) and its
+  // `_r3` its COAT GLOW word (kCoatGlow*, read by microbody.wgsl); a stain
+  // palette entry's `_r2` / `_r3` are the coat glow and coat material.
   uint32_t _r2 = 0, _r3 = 0;
 };
 // 80 bytes, not the 68 the fluid block above says on its own: `repose` grew it
@@ -474,10 +475,12 @@ constexpr uint32_t kStainPackConsumeShift = 17, kStainPackConsumeMask = 0x3FF;
 constexpr uint32_t kStainPackAbsorbShift = 27, kStainPackAbsorbMask = 0xF;
 constexpr uint32_t kStainPackWashesBit = 1u << 31;
 constexpr uint32_t kStainChanceMax = 1000;
-// The COAT GLOW word: the `_r2` of a STAIN PALETTE entry only
-// (table[kStainPaletteBase + type], never a real material's), written by
-// Simulation::UploadTables from MaterialDef::coatGlow / coatPulseHz and read by
-// microbody.wgsl `bodyCoatGlow`, which unpacks the same shifts literally.
+// The COAT GLOW word, written by Simulation::UploadTables from
+// MaterialDef::coatGlow / coatPulseHz into TWO places: a real material's `_r3`
+// (what microbody.wgsl `bodyCoatGlow` reads -- a body coat is drawn by its
+// material) and its ground STAIN PALETTE entry's `_r2` (what raymarch.wgsl
+// applyStain reads -- the ground has only the slot). Both unpack the same
+// shifts literally.
 //   bits 0..7  : glow 0..255
 //   bits 8..19 : pulse rate in centi-Hz (0 = steady)
 constexpr uint32_t kCoatGlowMask = 0xFF;
@@ -801,12 +804,13 @@ struct MaterialDef {
   // {"type": ...}). Shared across materials: two liquids naming the same stain
   // get the same palette slot. Empty = this material does not stain.
   std::string stain;
-  // Its stain PALETTE slot (1..7, 0 = none). Equal to the type bits of
-  // gpu.stainPack EXCEPT for a `"bodyOnly": true` stain, which gets a slot
-  // (a body coat is drawn through it) and NO type bits: the sim and particle
-  // kernels read the type to decide whether to mark the ground, and a
-  // body-only stain must never reach the ground. Read this, not the pack,
-  // wherever the question is "how is this drawn".
+  // Its stain slot, 0 = does not stain. A GROUND stain's slot is 1..7 and
+  // equals the type bits of gpu.stainPack (the voxel word's 3 stain bits, and
+  // the ground's palette entry kStainPaletteBase + slot). A `"bodyOnly": true`
+  // stain gets a slot 8..255 and NO type bits: it never reaches the ground,
+  // so it spends none of the seven (materials.cpp StainRegistry). Nonzero is
+  // what "this substance stains" means to gameplay. A BODY draws a coat by its
+  // material, never by this number (sim/microbody.h stain lattice).
   uint32_t stainSlot = 0;
   // How much staining liquid this material soaks up before the liquid pools on
   // top (materials.json "absorb": {"capacity": ...}), in the same 0..15 units
@@ -856,10 +860,12 @@ struct MaterialDef {
   // ---- A COAT THAT GLOWS, AND ONE THAT EATS (2026-09-23) --------------------
   //
   // `glow` 0..255 and `pulse` Hz: the coat is EMISSIVE on a body and breathes
-  // at that rate (0 = steady). Unlike the fields above these DO reach a shader,
-  // and only one: Simulation::UploadTables mirrors them into the stain palette
-  // entry's spare `_r2` word (kCoatGlow* below), which microbody.wgsl reads
-  // beside the stainColor it already reads there. Render-only, never hashed.
+  // at that rate (0 = steady). DEFAULTS TO THE MATERIAL'S OWN EMISSION
+  // (ParseStain), so a glowing liquid glows as a coat with nothing authored;
+  // `coat.glow` overrides. Unlike the fields above these DO reach a shader:
+  // Simulation::UploadTables packs them (kCoatGlow* below) into the material's
+  // own uploaded `_r3`, which microbody.wgsl reads beside the material's
+  // stainColor, and into its ground palette entry's `_r2`. Render-only.
   uint32_t coatGlow = 0;
   float coatPulseHz = 0.0f;
   // Per-mille chance per tick an exposed body voxel IN CONTACT with this

@@ -65,7 +65,8 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
   // stay on that side of the ordering.
   if (!d.prefab.artColors.empty()) {
     const std::vector<uint8_t> remap =
-        MicroBodyMergeArt(micro, d.prefab.artColors, "item/" + d.name, errors);
+        MicroBodyMergeArt(micro, d.prefab.artColors, "item/" + d.name, errors,
+                          &d.prefab);
     for (PrefabModel& pm : d.prefab.models)
       for (PrefabVoxel& v : pm.voxels)
         if (v.color) v.color = remap[v.color];
@@ -421,15 +422,29 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
     // position for a rebase to correct, and subtracting the model origin only
     // slides the segment off that line onto an arbitrary corner of the art.
     //
-    // The real gap is that the sidecar cannot say WHERE ACROSS the blade the
-    // edge runs, so it rides the origin line rather than the blade's mid-plane
-    // (for the sword, y 0 / z 0 against a blade centred at y 0.5 / z 0.75).
-    // `halfWidth` is wide enough to cover the difference here, so this is a
-    // sharpness question rather than a placement bug — but it wants an
-    // authored offset, not a borrowed one, and that is a schema change.
+    // WHERE ACROSS THE BLADE the edge runs is the optional `line`: a point,
+    // in the art's own scene units like the hilt box, that the segment passes
+    // through. Without it the segment rides the model's origin line — the min
+    // corner of the box — which is only near the steel while the box is no
+    // wider than the blade (the 40/m sword: y 0 / z 0 against a blade centred
+    // at y 0.5 / z 0.75, inside `halfWidth`). A crossguard wider than the
+    // blade widens the box and walks that line off the steel entirely, so the
+    // 80/m blades (scripts/bladesmith.py) state their mid-plane instead.
+    // Converted exactly like the hilt centre — the (x, z, -y) map, then the
+    // model-origin rebase — and projected off the edge axis, because `from`
+    // and `to` already say where ALONG the blade it runs.
     d.edgeFrom = axEngine * (e.value("from", 0.0f) * inv);
     d.edgeTo = axEngine * (e.value("to", 0.0f) * inv);
     d.edgeHalfWidth = e.value("halfWidth", 1.0f) * inv;
+    if (e.contains("line") && e["line"].size() == 3) {
+      const Vec3 l{e["line"][0].get<float>(), e["line"][1].get<float>(),
+                   e["line"][2].get<float>()};
+      Vec3 off = Vec3{l.x, l.z, -l.y} * inv - modelOrigin;
+      const Vec3 along = axEngine.normalized();
+      off = off - along * along.dot(off);
+      d.edgeFrom = d.edgeFrom + off;
+      d.edgeTo = d.edgeTo + off;
+    }
     // THE FLAT, through the same scene(Z-up) -> engine(Y-up) map as `axis`.
     // A DIRECTION, so no `inv` scaling: this says which way the blade's face
     // points, not how big it is. Orthogonalized against the edge, because two
@@ -721,19 +736,55 @@ StrikeParts BuildStrikeParts(const EdgeSweep& s, const Vec3& at,
   // The blade's OWN thickness decides the kerf's width; the tuning knob only
   // scales it, because the geometry is supposed to be what decides the wound
   // (items.json says so about carveBonus for the same reason).
-  p.cut.halfWidth = std::max(radius * goreT.cutWidth, 0.08f);
-  // `power` is speed x edge-alignment and `s.heft` is the weapon's own volume,
-  // so how deep the wound goes is: how fast, how well-angled, how much sword.
-  p.cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
-  p.cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
-  // ...AND HOW FAR IT COULD GO (phys/kerf.h KerfBite). The edge's reach is the
-  // blade that was swung -- `seg` is the whole edge at this sub-step -- and the
-  // cleave is what a committed swing of this much sword has past the chip.
-  // Squared in the excess power, so it is the top of the range or nothing:
-  // a square, fast blow of a heavy blade across a neck goes through; a lazy
-  // one, a glancing one, or a light one chips it like any other.
-  p.cut.edgeHalf = seg.len() * 0.5f;
-  {
+  p.cut.halfWidth = std::max(radius * goreT.cutWidth, goreT.cutWidthMin);
+  // ---- A STAB, OR A CUT? (2026-09-26) ---------------------------------------
+  //
+  // A point driven along the blade's own length (hilt -> point, the way `seg`
+  // runs) makes a HOLE, not a slot along the edge. Before this a thrust went
+  // down the cut path with its edge axis parallel to its travel, which
+  // KerfFrame can only answer with an arbitrary perpendicular: the "wound" was
+  // a sliver bored sideways from the contact, half of it outside the body.
+  //
+  // Not a natural weapon: a fist's edge runs up the arm and a thrown jab is
+  // trauma, not a puncture (and has no cut part to spend anyway).
+  const float segL = seg.len();
+  const bool stab = !s.selfMounted && segL > 1e-4f && sweepDir.len() > 1e-4f &&
+                    goreT.stabAlign <= 1.0f &&
+                    (seg * (1.0f / segL)).dot(sweepDir.normalized()) >=
+                        goreT.stabAlign;
+  if (stab) {
+    // THE BORE. Depth along the thrust, the slot's length ACROSS the blade
+    // (the flat's in-plane width direction), its thickness the edge's. The
+    // kerf's own wedge then narrows it toward the bottom, which is the point.
+    const Vec3 in = sweepDir.normalized();
+    Vec3 across = in.cross(s.flatNow);
+    if (across.len() < 0.15f) across = in.cross(Vec3{0, 1, 0});
+    if (across.len() < 0.15f) across = in.cross(Vec3{1, 0, 0});
+    p.cut.stab = true;
+    p.cut.cutDir = in;
+    p.cut.edgeAxis = across.normalized();
+    p.cut.halfWidth = std::max(p.cut.halfWidth, goreT.stabThick);
+    p.cut.length = std::max(radius * goreT.stabWidth, p.cut.halfWidth);
+    // NO HEFT (Tuning::Gore::stabDepth says why), and never past the blade
+    // itself: a dagger cannot put its point in deeper than it is long.
+    p.cut.depth =
+        std::min(goreT.stabDepth + goreT.stabDepthPower * power, segL);
+    p.cut.edgeHalf = p.cut.length;
+    p.cut.cleave = 0.0f;
+  } else {
+    // `power` is speed x edge-alignment and `s.heft` is the weapon's own
+    // volume, so how deep the wound goes is: how fast, how well-angled, how
+    // much sword.
+    p.cut.depth = (goreT.cutDepth + goreT.cutDepthPower * power) * s.heft;
+    p.cut.length = goreT.cutLength * (0.4f + 0.6f * power) * s.heft;
+    // ...AND HOW FAR IT COULD GO (phys/kerf.h KerfBite). The edge's reach is
+    // the blade that was swung -- `seg` is the whole edge at this sub-step --
+    // and the cleave is what a committed swing of this much sword has past
+    // the chip. Squared in the excess power, so it is the top of the range or
+    // nothing: a square, fast blow of a heavy blade across a neck goes
+    // through; a lazy one, a glancing one, or a light one chips it like any
+    // other.
+    p.cut.edgeHalf = segL * 0.5f;
     const float from = std::clamp(goreT.cleaveFrom, 0.0f, 0.95f);
     const float x = std::clamp((power - from) / (1.0f - from), 0.0f, 1.0f);
     p.cut.cleave = std::max(goreT.cleaveArea, 0.0f) * s.heft * x * x;
@@ -783,7 +834,9 @@ void ResolveOnLooseMatter(uint64_t body, const StrikeParts& p,
                           DebrisSystem& debris, World& world,
                           std::vector<ParticleSpawn>& spawns, bool* bitten) {
   const Tuning::Gore& goreT = CurrentTuning().gore;
-  if (profile.cut > 0.0f) debris.CutBody(body, p.cut, world, spawns);
+  // A stab lands once per stroke (see firstContact in MeleeSweepDamage).
+  if (profile.cut > 0.0f && (!p.cut.stab || firstContact))
+    debris.CutBody(body, p.cut, world, spawns);
   // ---- TRAUMA, AND IT CLIMBS THE SAME LADDER (2026-09-20) ----------------
   //
   // This read "trauma on a thing that cannot feel it is a DENT and nothing
@@ -1318,8 +1371,16 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       // contacts on one meeting. See EdgeSweep::struck for why an impulse is
       // not a kerf. ONE COPY, BOTH POPULATIONS — a corpse's dent is once per
       // stroke for the same reason a bruise is.
+      //
+      // A STAB is an impulse too (2026-09-26): the point goes in once, and the
+      // ticks the blade then spends inside the limb must not re-stab it --
+      // each would snap its entry to the bottom of the last bore and drive it
+      // another full depth. `parts` is therefore built first.
+      const StrikeParts parts = BuildStrikeParts(s, at, seg, sweepDir, radius,
+                                                 power, out.tipSpeed, hitSeed);
       bool firstContact = true;
-      if (s.struck != nullptr && (s.strike.blunt > 0.0f || s.strike.bite > 0.0f)) {
+      if (s.struck != nullptr && (s.strike.blunt > 0.0f || s.strike.bite > 0.0f ||
+                                  (s.strike.cut > 0.0f && parts.cut.stab))) {
         for (uint64_t h : *s.struck)
           if (h == hb) firstContact = false;
         if (firstContact) s.struck->push_back(hb);
@@ -1335,8 +1396,6 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
       const bool wrongTarget = s.bitePrefer != 0 && hb != s.bitePrefer &&
                                s.biteHoldout;
 
-      const StrikeParts parts = BuildStrikeParts(s, at, seg, sweepDir, radius,
-                                                 power, out.tipSpeed, hitSeed);
 
       // ---- LOOSE MATTER RESOLVES IT AND THE PROBE MOVES ON ----------------
       //
@@ -1411,7 +1470,8 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
         // direction the swing is going, and a limb comes off when the lattice
         // has been cut through (game/mob.h BladeCut). The slot itself is
         // `parts.cut`, which a corpse is cut by too.
-        if (mobs.Damage(hb, dmg, at, out.tipSpeed, blade))
+        if (mobs.Damage(hb, dmg, at, out.tipSpeed, blade) &&
+            (!parts.cut.stab || firstContact))
           mobs.CutLimb(hb, parts.cut, world, spawns, power);
       }
 

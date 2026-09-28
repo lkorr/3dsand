@@ -1,0 +1,338 @@
+{
+  "//": "A CHARACTER, not a creature: fleepo inherits human's rig — limb names and tags, chains, loco states, natural weapons, sockets, the anatomy recipe and the shared clip library — and states only what its own body makes different. Written by the Characters page or by `node scripts/gen_mobs.mjs fleepo --rebake`, from the `genome` block at the bottom. Do not hand-edit: re-roll it.",
+  "extends": "human",
+  "model": "fleepo",
+  "sidecarVoxelsPerMetre": 10,
+  "anatomy": {
+    "limbs": {
+      "hair": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      },
+      "hair.2": {
+        "layers": [
+          {
+            "material": "hair_white",
+            "keep": true
+          }
+        ]
+      }
+    },
+    "garmentsBecome": null
+  },
+  "limbs": [
+    {
+      "name": "hips",
+      "hp": 198
+    },
+    {
+      "name": "torso",
+      "hp": 225,
+      "anchor": [
+        18,
+        74,
+        10
+      ]
+    },
+    {
+      "name": "head",
+      "anchor": [
+        18,
+        106,
+        10
+      ]
+    },
+    {
+      "name": "armU.L",
+      "hp": 79,
+      "anchor": [
+        32,
+        108,
+        10
+      ]
+    },
+    {
+      "name": "armL.L",
+      "hp": 35
+    },
+    {
+      "name": "hand.L",
+      "anchor": [
+        32,
+        68,
+        10
+      ]
+    },
+    {
+      "name": "armU.R",
+      "hp": 79,
+      "anchor": [
+        4,
+        108,
+        10
+      ]
+    },
+    {
+      "name": "armL.R",
+      "hp": 35
+    },
+    {
+      "name": "hand.R",
+      "anchor": [
+        4,
+        68,
+        10
+      ]
+    },
+    {
+      "name": "legU.L",
+      "anchor": [
+        22,
+        60,
+        10
+      ]
+    },
+    {
+      "name": "legL.L",
+      "anchor": [
+        22,
+        34,
+        10
+      ]
+    },
+    {
+      "name": "foot.L",
+      "anchor": [
+        22,
+        6,
+        14
+      ]
+    },
+    {
+      "name": "legU.R",
+      "anchor": [
+        14,
+        60,
+        10
+      ]
+    },
+    {
+      "name": "legL.R",
+      "anchor": [
+        14,
+        34,
+        10
+      ]
+    },
+    {
+      "name": "foot.R",
+      "anchor": [
+        14,
+        6,
+        14
+      ]
+    },
+    {
+      "name": "hair",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 40,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        24.5,
+        123,
+        3.5
+      ]
+    },
+    {
+      "name": "hair.2",
+      "parent": "head",
+      "joint": "fixed",
+      "hp": 4,
+      "severable": true,
+      "vital": false,
+      "bloodless": true,
+      "tag": "hair",
+      "anchor": [
+        18.5,
+        119,
+        16.5
+      ]
+    }
+  ],
+  "sockets": [
+    {
+      "name": "held_right",
+      "offset": [
+        4,
+        63,
+        10
+      ]
+    }
+  ],
+  "states": [
+    {
+      "name": "squirm",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl",
+      "bodyYOffset": null
+    },
+    {
+      "name": "crawl.shins",
+      "bodyYOffset": null
+    }
+  ],
+  "clips": {
+    "bite": null,
+    "lunge": null
+  },
+  "genome": {
+    "archetype": "humanoid",
+    "name": "Fleepo",
+    "displayName": "Untitled",
+    "body": {
+      "sex": "male",
+      "bust": 0,
+      "heightM": 1.7203162219058907,
+      "hipWidth": 8,
+      "shoulderWidth": 12,
+      "bodyDepth": 10,
+      "headWidth": 10,
+      "headDepth": 10,
+      "limbWidth": 4,
+      "footDepth": 7,
+      "stack": {
+        "foot": 4.042283314549364,
+        "shin": 13.20791768116653,
+        "thigh": 14.390929341586308,
+        "hips": 10.530653969933613,
+        "torso": 17.602775057417976,
+        "head": 16.099353460955022
+      },
+      "armStack": {
+        "upper": 11.655383256264775,
+        "fore": 9.5,
+        "hand": 4.5
+      },
+      "armLengths": 1
+    },
+    "shape": {
+      "waist": 0.9759956134038474,
+      "chest": 0.973145453692846,
+      "shoulder": 0.9856716524599027,
+      "chestDepth": 1.0329040609914883,
+      "seat": 1.0131367657124344,
+      "armGirth": 0.9689876511061843,
+      "legGirth": 1.0071535994182061,
+      "upperArm": 1.1,
+      "bicep": 0.45,
+      "deltoid": 0,
+      "foreArm": 0.9228003458620496,
+      "forearmMuscle": 0
+    },
+    "head": {
+      "jaw": 1.0402961044054442,
+      "cheek": 1.0400495311011486,
+      "crown": 1.0345759759240076,
+      "skullBack": 0.6343768334722146
+    },
+    "face": {
+      "eyeDx": 2.1850016236163863,
+      "eyeRow": 0,
+      "eyeCols": 1,
+      "mouthWidth": 2,
+      "mouthDrop": 3,
+      "brow": false,
+      "beard": 0.09407800985167734,
+      "browHeight": 1,
+      "browInner": 1,
+      "browOuter": 0,
+      "browThick": 1,
+      "browTilt": 0.2560864404267166,
+      "browArch": 0,
+      "browSparse": 0,
+      "browTone": "shade",
+      "browProud": false,
+      "mouthCurve": -0.21410598197327926,
+      "mouthSkew": 0.15634407301666214,
+      "mouthShift": 0,
+      "mouthOpen": 0,
+      "mouthTone": "shade",
+      "lips": 0,
+      "nose": 0,
+      "noseWidth": 1,
+      "earSize": 1,
+      "earPoint": false,
+      "eyeWhites": false,
+      "eyeBags": 0.08617307395208626,
+      "cheeks": -0.13676481535881757,
+      "freckles": 0,
+      "wrinkles": 0.014364332672785966,
+      "scar": -0.01871348788373172,
+      "beardStyle": "clean",
+      "beardLip": 0.1215154491668567,
+      "beardChin": -0.10793613722439854,
+      "beardJaw": -1,
+      "beardCheek": -0.0006945360141992568,
+      "beardSide": 0,
+      "beardWidth": -0.21037697530629113,
+      "beardDensity": 0.9158287340312824,
+      "beardRagged": 0.336348153199777,
+      "beardTone": "shade",
+      "beardLen": 0,
+      "beardPoint": 0.1170909233272355,
+      "beardFork": false
+    },
+    "hair": {
+      "style": "sidepart",
+      "back": 5.5,
+      "front": 10.5,
+      "length": 0,
+      "knot": false,
+      "side": 1,
+      "band": 1,
+      "volume": 1,
+      "crest": 0,
+      "spikes": 0,
+      "buns": false,
+      "drop": 0,
+      "tail": 0,
+      "braid": false,
+      "twin": false,
+      "wisp": 0.35,
+      "ragged": 0.3,
+      "bangs": 0,
+      "faceThin": 0,
+      "hairlineSoft": 0,
+      "sideThin": 0,
+      "topThin": 0,
+      "fluff": 0,
+      "fuzz": 0,
+      "fuzzTop": 0.8690590443788468,
+      "fuzzSide": 0.798559661154598,
+      "fuzzBack": 1.063687766309753,
+      "fuzzLow": 0.5848914044486265,
+      "fuzzFray": 0.5229806763750501
+    },
+    "colors": {
+      "skin": "#c18661",
+      "skinShade": "#9a6849",
+      "skinLight": "#d9a886",
+      "hair": "#433627",
+      "hairShade": "#2e2419",
+      "eye": "#251b18",
+      "cloth": "#7d6c50",
+      "clothShade": "#5e513a",
+      "nail": "#d0a58d"
+    }
+  }
+}
