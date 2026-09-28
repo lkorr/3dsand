@@ -170,6 +170,12 @@ const WATER_VEIL : bool = SHADOW_CACHE_AVAILABLE;
 @group(0) @binding(28) var<storage, read> solTable : array<u32>;
 @group(0) @binding(29) var<storage, read> solPool : array<u32>;
 @group(0) @binding(30) var<storage, read> solSpec : array<u32>;
+// ---- THE FAR SURFACE MAP (world.h kFarMap*, LOD-seam package A) -------------
+// Per-level sub-column tops + skin, one vec4 per level CELL (its 2x2
+// sub-columns; common.wgsl farMapCell). traceFar's refine reads it; written
+// only by the far fill / downsample rows, covered by the command buffer's
+// opening barrier like farVox.
+@group(0) @binding(31) var<storage, read> farMap : array<vec4<u32>>;
 // world.h's kSol* values (scripts/check_invariants.py `solute` checks these
 // against world.h too -- they are NOT the sim's MIRROR block, which needs
 // atomics and solMeta that a fragment stage must not bind).
@@ -4361,6 +4367,129 @@ fn farInValid(c : vec3<i32>, b : FarBox) -> bool {
   return all(c >= b.lo) && all(c < b.hi);
 }
 
+// ======================= THE SURFACE REFINE (LOD-seam package A) =============
+// A cascade cell is ONE centre-sampled cube: at the window edge a level-1 cell
+// is a 20 cm block standing where the near field draws four 10 cm columns of
+// different heights, its top off by up to a voxel, and every coarser level
+// terraces the same way at its own scale. The far SURFACE MAP (world.h
+// kFarMap*, worldgen.wgsl `farmap`) holds, per level, the true top and skin of
+// every SUB-COLUMN at twice the level's XZ resolution — level 1's are the fine
+// columns themselves — and traceFar intersects a surface cell's ray against its
+// 2x2 sub-columns instead of the cube. At level 1 that IS the near field's
+// terrain, voxel for voxel; every coarser level gains 2x its detail.
+//
+// WHICH CELLS: only the SURFACE BAND of a level cell whose four entries are
+// VALID (the map vouches for a pure heightfield there, not edited), i.e. a cell
+// its sub-columns leave partly full: floor <= max top and top > min top. Above
+// the band and below it the 3D cell is drawn exactly as before, so trees,
+// canopies, rocks, overhangs and a deep tunnel's mouth are untouched; inside
+// it, one more rule — THE UNION — keeps things standing ON the ground: a
+// material cell whose centre sample lies ABOVE the map's top at that sample
+// column is not terrain (a trunk, a boulder, a wall the player built) and is
+// drawn as the plain cell.
+//
+// CANDIDATES ARE CHEAP TO REJECT, which is the whole perf argument. The band
+// cells are the ones the march already stops at (material) plus the flagged
+// air cell directly over one (farBlockerBand's surface band: the centre sample
+// missed a top in the cell's lower half). The blocker flag also sits on the
+// cover-height rows above the ground, so a flagged cell only becomes a
+// candidate when the cell UNDER it holds material — one byte read, usually in
+// the same cache line — and a map load happens for at most a couple of cells
+// per ray, never for the air the ray crossed to get there.
+const FAR_HIT_REFINED : u32 = 0x100u;   // FarHit.level flag: hit came from the map
+struct FarRefine { hit : bool, t : f32, axis : i32, pal : u32 };
+
+// The ray against the 2x2 sub-columns of level cell `vc` over [tIn, tOut], in
+// LEVEL-CELL t units (traceFar's). `e` = the cell's four entries, all VALID;
+// `s` = fine voxels per cell. The mid planes x = vc.x + 0.5 / z = vc.z + 0.5
+// cut the segment into at most three pieces, each inside one sub-column — an
+// infinitely deep box up to (top + 1) / s. A piece that STARTS under the top is
+// a side (or entry) face hit; one that crosses the top plane on the way down
+// is a top face hit. Zero-length pieces (a crossing outside the segment,
+// clamped) test the same point their neighbour does, so the order the pieces
+// are tried in keeps the entry face's axis on a hit at tIn.
+fn farRefineCell(e : vec4<u32>, vc : vec3<i32>, s : f32, roL : vec3f, rd : vec3f,
+                 inv : vec3f, tIn : f32, tOut : f32, entryAxis : i32) -> FarRefine {
+  var r : FarRefine;
+  r.hit = false;
+  let midX = f32(vc.x) + 0.5;
+  let midZ = f32(vc.z) + 0.5;
+  let tx = clamp((midX - roL.x) * inv.x, tIn, tOut);
+  let tz = clamp((midZ - roL.z) * inv.z, tIn, tOut);
+  let xFirst = tx <= tz;
+  let b1 = min(tx, tz);
+  let b2 = max(tx, tz);
+  var ta = tIn;
+  var axSeg = entryAxis;
+  for (var k = 0u; k < 3u; k++) {
+    let tb = select(select(tOut, b2, k == 1u), b1, k == 0u);
+    let pm = roL + rd * (0.5 * (ta + tb));
+    let i = select(0u, 1u, pm.x >= midX) + select(0u, 2u, pm.z >= midZ);
+    let hq = farMapTop(e[i]);
+    let topL = f32(hq + 1) / s;
+    var th = ta;
+    var hax = axSeg;
+    var got = roL.y + rd.y * ta <= topL;
+    if (!got && rd.y < 0.0) {
+      th = (topL - roL.y) * inv.y;
+      hax = 1;
+      got = th <= tb;
+    }
+    if (got) {
+      r.hit = true;
+      r.t = th;
+      r.axis = hax;
+      // Top face: the skin. Side face: the skin on the top voxel's own side,
+      // the sub-skin below it (grass over dirt, sand over stone).
+      let yv = i32(floor((roL.y + rd.y * th) * s));
+      let skin = hax == 1 || yv >= hq;
+      r.pal = select((e[i] >> 23u) & 0x7Fu, (e[i] >> 16u) & 0x7Fu, skin);
+      return r;
+    }
+    ta = tb;
+    // Which mid plane the ray crossed to enter the next piece.
+    axSeg = select(select(0, 2, xFirst), select(2, 0, xFirst), k == 0u);
+  }
+  return r;
+}
+
+// The top (fine y) of sub-column `m` of `level`, or a floor no tap reaches when
+// the entry is outside the valid box or not vouched for: the heightfield AO
+// below treats both as open, as farAoSolidAt treats cells outside the box.
+fn farHfTopAt(level : u32, m : vec2<i32>, b : FarBox) -> i32 {
+  let c = m >> vec2<u32>(1u);
+  if (any(c < b.lo.xz) || any(c >= b.hi.xz)) { return -1073741824; }
+  let e = farMap[farMapCell(level, c)][u32(m.y & 1) * 2u + u32(m.x & 1)];
+  if ((e & FAR_MAP_VALID) == 0u) { return -1073741824; }
+  return farMapTop(e);
+}
+
+// voxelAO's four-tap rule (farVoxelAO's twin) on the HEIGHTFIELD, for a refined
+// hit: the lattice is sub-columns in x/z and fine voxels in y, and a lattice
+// point is solid when it is at or under its sub-column's top. At level 1 that
+// is the near field's own voxels, so the crease at the foot of a one-voxel step
+// darkens exactly as it does one voxel inside the window.
+fn farHfAO(level : u32, fineV : vec3<i32>, n : vec3<i32>, a1 : i32, a2 : i32,
+           uv : vec2f) -> f32 {
+  let wsh = farCellShift(level) - 1u;
+  let b = farBox(level);
+  let base = vec3<i32>(fineV.x >> wsh, fineV.y, fineV.z >> wsh) + n;
+  let d1 = axisVecI(a1, select(-1, 1, uv.x > 0.5));
+  let d2 = axisVecI(a2, select(-1, 1, uv.y > 0.5));
+  let p1 = base + d1;
+  let p2 = base + d2;
+  let p3 = p1 + d2;
+  let side1 = select(0.0, 1.0, p1.y <= farHfTopAt(level, p1.xz, b));
+  let side2 = select(0.0, 1.0, p2.y <= farHfTopAt(level, p2.xz, b));
+  let corner = select(0.0, 1.0, p3.y <= farHfTopAt(level, p3.xz, b));
+  var occ = side1 + side2;
+  if (side1 > 0.0 && side2 > 0.0) { occ = 3.0; } else { occ += corner; }
+  let w1 = abs(uv.x - 0.5) * 2.0;
+  let w2 = abs(uv.y - 0.5) * 2.0;
+  let reach = clamp(max(w1, w2), 0.0, 1.0);
+  return clamp(1.0 - (occ / 3.0) * TUNE_AO_STRENGTH * reach, 0.0, 1.0);
+}
+
 fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
   var out : FarHit;
   out.hit = false;
@@ -4577,6 +4706,45 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
                 if (!farInValid(probe, box)) { break; }
                 let below = farMatAt(level, probe);
                 if (below != 0u) { mat = below; break; }
+              }
+            }
+            // ---- THE SURFACE REFINE (see farRefineCell) ----
+            // A candidate: this cell holds something, and it is a material
+            // cell or the flagged air directly over one. Only then the map.
+            if (i32(level) <= TUNE_FAR_REFINE_LEVEL && cellByte != 0u &&
+                (mat != 0u || farPalAt(level, vc - vec3<i32>(0, 1, 0)) != 0u)) {
+              let e = farMap[farMapCell(level, vc.xz)];
+              if (all((e & vec4<u32>(FAR_MAP_VALID)) != vec4<u32>(0u))) {
+                let hq = vec4<i32>(e & vec4<u32>(0xFFFFu)) - vec4<i32>(FAR_MAP_H_BIAS);
+                let minH = min(min(hq.x, hq.y), min(hq.z, hq.w));
+                let maxH = max(max(hq.x, hq.y), max(hq.z, hq.w));
+                let si = 1 << farCellShift(level);
+                let y0 = vc.y * si;
+                // The band: partly full under the heightfield. Fully under it
+                // or fully over it, the cell is drawn as it always was.
+                if (y0 + si - 1 > minH && y0 <= maxH) {
+                  // THE UNION: a material cell whose centre sample is ABOVE
+                  // the top of its sample column stands on the ground (a
+                  // trunk, a rock, a built wall) and keeps its plain cell. The
+                  // sample column is sub-column (1,1) at level 1 exactly; past
+                  // it the tallest sub-column bounds it.
+                  let hc = select(maxH, hq.w, level == 1u);
+                  if (mat == 0u || y0 + (si >> 1) <= hc) {
+                    let rf = farRefineCell(e, vc, s, roL, rd, inv, vCur,
+                                           min(vMax.x, min(vMax.y, vMax.z)), axis);
+                    if (rf.hit) {
+                      out.hit = true;
+                      out.t = rf.t * s;   // back to fine-voxel units
+                      out.axis = rf.axis;
+                      out.sgn = sign(rd[rf.axis]);
+                      out.mat = farPalMat(&materials, rf.pal);
+                      out.cell = vc;
+                      out.level = level | FAR_HIT_REFINED;
+                      return out;
+                    }
+                    mat = 0u;   // the ray passes between the sub-columns
+                  }
+                }
               }
             }
             if (mat != 0u) {
@@ -10515,6 +10683,12 @@ fn fs(in : VSOut) -> FSOut {
       // LOD terrain read as a different world.
       let m = materials[far.mat];
       var n = axisVec(far.axis, -far.sgn);
+      // The level, and whether the hit came from the surface map's refine
+      // (FAR_HIT_REFINED rides the level word so FarHit stays the same size
+      // across everything fs runs after traceFar).
+      let flv = far.level & 0xFFu;
+      let fRefined = (far.level & FAR_HIT_REFINED) != 0u;
+      let sL = f32(1u << farCellShift(flv));
       // ---- TEXTURE AT THE FINE VOXEL, NOT AT THE CELL (the LOD-seam pass) ----
       // The near field's per-voxel "texture" is two positional hashes: the
       // worldgen palette variant (synthJitterState, the state nibble every
@@ -10556,7 +10730,7 @@ fn fs(in : VSOut) -> FSOut {
       // Burning foliage breathes toward the flame colour out here too, keyed
       // on the FINE cell so a leaf keeps its phase across the cascade seam.
       let bt = burnTint(m, albedo, f32(m.emission) / 255.0,
-                        burnTintWeight(far.cell << vec3<u32>(farCellShift(far.level)),
+                        burnTintWeight(far.cell << vec3<u32>(farCellShift(flv)),
                                        R.time));
       albedo = bt.albedo;
       // Same wrapped diffuse as the near field — a different falloff here is a
@@ -10564,8 +10738,14 @@ fn fs(in : VSOut) -> FSOut {
       var lambert = wrapDiffuse(dot(n, keyLightDir()), TUNE_DIFFUSE_WRAP);
       if (lambert > 0.0 && (R.flags & 1u) != 0u) {
         // start the shadow march just off the hit face, in fine-voxel coords
-        let hp = R.camPos + rd * (far.t - 1e-3) +
-                 n * (0.55 * f32(1u << farCellShift(far.level)));
+        var hp = R.camPos + rd * (far.t - 1e-3) + n * (0.55 * sL);
+        // A REFINED hit sits inside its level cell (a sub-column top at mid
+        // height, a side face between two sub-columns), and that cell — or the
+        // one the side offset lands in — may be a MATERIAL cell the shadow
+        // march would stop on at distance zero. Start it over the cell's top
+        // instead: the shadow is the cells' anyway, so this only gives up the
+        // contact shadow of the cell the hit is in.
+        if (fRefined) { hp.y = max(hp.y, f32(far.cell.y + 1) * sL + 0.05 * sL); }
         // THE NEAR FIELD'S SOFTENING LAW, on the cascade's own blocker
         // distance. The old term was a flat x0.3 for any blocker, which put a
         // contact shadow under a tree and the shadow of a ridge 40 m away at the
@@ -10580,10 +10760,10 @@ fn fs(in : VSOut) -> FSOut {
         // shadow on it renders as the "ant trail" speckle the phase-4 pass
         // measured; the two near levels (20/40 cm cells, out to ~100 m) are
         // where the seam is judged and where the near law is right.
-        let sd = farShadowDist(far.level, hp);
+        let sd = farShadowDist(flv, hp);
         if (sd >= 0.0) {
           var sh = shadowFromOpaqueHit(true, sd, 0u);
-          if (far.level >= 3u) { sh = max(sh, TUNE_SHADOW_FAR_LIFT); }
+          if (flv >= 3u) { sh = max(sh, TUNE_SHADOW_FAR_LIFT); }
           // Shading LOD (see lodShadeFade): the staircase's contact shadow
           // is an artefact of the sampling at this projected size.
           sh = mix(sh, max(sh, LOD_SHADE_SHADOW_LIFT), lodShadeFade(far.t));
@@ -10607,15 +10787,25 @@ fn fs(in : VSOut) -> FSOut {
       let ni = vec3<i32>(round(n));
       let a1 = select(0, 1, far.axis == 0);
       let a2 = select(2, 1, far.axis == 2);
-      let sL = f32(1u << farCellShift(far.level));
-      let uvL = vec2f(fract(axisPick(hitP, a1) / sL), fract(axisPick(hitP, a2) / sL));
-      var ao = farVoxelAO(far.level, far.cell, ni, a1, a2, uvL);
+      var ao = 1.0;
+      if (fRefined) {
+        // The heightfield's own four taps (farHfAO), on the sub-column lattice:
+        // x/z in sub-columns (half a cell), y in fine voxels.
+        let wS = 0.5 * sL;
+        let u1 = select(wS, 1.0, a1 == 1);
+        let u2 = select(wS, 1.0, a2 == 1);
+        let uvR = vec2f(fract(axisPick(hitP, a1) / u1), fract(axisPick(hitP, a2) / u2));
+        ao = farHfAO(flv, fineV, ni, a1, a2, uvR);
+      } else {
+        let uvL = vec2f(fract(axisPick(hitP, a1) / sL), fract(axisPick(hitP, a2) / sL));
+        ao = farVoxelAO(flv, far.cell, ni, a1, a2, uvL);
+      }
       // The occupied-cell-above term stays on top: it is what darkens the
       // ground under a flattened canopy at levels >= 5, where the crown is
       // painted onto the surface cell and nothing sits above it to occlude.
       let up = far.cell + vec3<i32>(0, 1, 0);
-      if (farInValid(up, farBox(far.level)) &&
-          farPalAt(far.level, up) != 0u) { ao *= TUNE_AO_FAR; }
+      if (farInValid(up, farBox(flv)) &&
+          farPalAt(flv, up) != 0u) { ao *= TUNE_AO_FAR; }
       // Shading LOD: the crease AO of a staircase fades with its treads.
       ao = mix(ao, 1.0, lodShadeFade(far.t));
       // Same lighting model as the near field (hemisphere ambient x AO, plus

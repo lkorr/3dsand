@@ -4328,6 +4328,18 @@ struct Tuning {
     // rebuild.
     int farBlockerHitLevel = TPD(render, farBlockerHitLevel);
 
+    // ---- the far SURFACE MAP refine (LOD-seam package A, DESIGN.md §9) ----
+    // Highest cascade level whose SURFACE cells are refined against the far
+    // surface map (world.h kFarMap*): a per-level 2D heightfield at twice the
+    // level's XZ resolution — level 1's is the fine 10 cm column grid — holding
+    // each column's true top and skin. A cell the map vouches for (pristine
+    // heightfield, not edited) is intersected against its 2x2 sub-columns
+    // instead of being drawn as one centre-sampled cube, so level 1 draws the
+    // near field's own columns and every coarser level gains 2x surface
+    // detail. Trees, rocks, ruins and edits keep the 3D cells. 0 turns it off
+    // everywhere (the A/B), which is what `--budget-arms norefine` does.
+    int farRefineLevel = TPD(render, farRefineLevel);
+
     // ---- in-window LOD handoff (PLAN_surface_flight_perf.md A1) ----
     // Distance in METERS past which the PRIMARY march stops resolving fine
     // 10 cm voxels and hands the rest of the ray to the far-field cascade,

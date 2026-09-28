@@ -1927,6 +1927,17 @@ const RenderArm kRenderArms[] = {
     {"nofar", "farSteps 384 -> 0",
      [](Tuning& t) { t.render.farSteps = 0; }, true, 1,
      "the far-field cascade march for rays that leave the fine window"},
+    // The far SURFACE MAP refine (LOD-seam package A). Off = every surface
+    // cell is the plain centre-sampled cube again; baseline - norefine is what
+    // the refine costs (map loads + the 2x2 sub-column test) on this camera.
+    {"norefine", "farRefineLevel 8 -> 0",
+     [](Tuning& t) { t.render.farRefineLevel = 0; }, true, 1,
+     "the far surface-map refine: map loads + sub-column intersections"},
+    // The handoff the refine exists to allow (package E): the cascade takes
+    // over at 20 m, inside the window, instead of at the window box.
+    {"lod20", "lodHandoffDist 26 -> 20 m",
+     [](Tuning& t) { t.render.lodHandoffDist = 20.0f; }, true, 1,
+     "fine marching between 20 m and the window edge that the cascade covers"},
 
     {"nomicro", "microMaxPerRay 8 -> 0",
      [](Tuning& t) { t.render.microMaxPerRay = 0; }, true, 1,

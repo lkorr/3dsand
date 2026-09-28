@@ -691,7 +691,9 @@ if [ -f "$WORLDGEN_COMBINED" ]; then
   # `farpatch` is the edit-patch half `far` was split into (package C item 1);
   # it carries its own genColumn + farBlockerBitAt copies, so it gets the same
   # ceiling as the sweep it came out of rather than riding on it.
-  for spec in "far:25000" "farpatch:25000" "fardown:25000"; do
+  # `farmap` is the surface-map fill (LOD-seam package A): one genColumn, one
+  # rolled genCellIn and the canopy scan — smaller than the sweep it rides.
+  for spec in "far:25000" "farpatch:25000" "fardown:25000" "farmap:25000"; do
     ep="${spec%%:*}"; ceil="${spec##*:}"
     spv="$TMP/worldgen_${ep}.spv"
     if ! "$TINT_BIN" -f spirv -ep "$ep" -o "$spv" "$WORLDGEN_COMBINED" >/dev/null 2>&1; then

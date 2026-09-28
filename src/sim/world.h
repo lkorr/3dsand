@@ -3772,6 +3772,48 @@ constexpr uint32_t kFarPatchBase = kFarListCap * 2;
 constexpr uint32_t kFarPatchCap = 1u << 17;
 constexpr uint32_t kFarPatchWords = kFarPatchBase + kFarPatchCap;
 
+// ---- THE FAR SURFACE MAP (LOD-seam package A, 2026-09-28; DESIGN.md §9) -----
+// A per-level 2D heightfield at TWICE the level's XZ resolution: level k holds
+// kFarMapN^2 entries, one per SUB-COLUMN of 2^(k-1+kFarShiftBase) fine voxels,
+// so level 1's map is at FINE resolution (one entry per 10 cm column) and every
+// coarser level carries 2x its cells' XZ detail. Toroidal exactly like the
+// level (entry (mx, mz) lives at slot (mx, mz) mod kFarMapN) and blocked 2x2
+// per level CELL, so the four sub-columns under one cell are one 16-byte load
+// for the raymarcher: word = ((level-1) * kFarN^2 + (cz mod kFarN) * kFarN +
+// (cx mod kFarN)) * 4 + (mz & 1) * 2 + (mx & 1), with (cx, cz) = (mx, mz) >> 1.
+//
+// One u32 per entry:
+//   bits  0..15  top: the fine y of the column's topmost far-solid voxel
+//                (max(ground, standing fluid)), biased by kFarMapHBias
+//   bits 16..22  the SKIN's far palette slot (what the top voxel wears)
+//   bits 23..29  the SUB-SKIN's slot (the voxel under it: a side face below
+//                the top voxel wears this — grass over dirt, sand over stone)
+//   bit  31      VALID: the column is a pure heightfield in the band the
+//                renderer refines. Zero-initialised = invalid = "use the 3D
+//                cells", so an unfilled or edited entry can only ever fall
+//                back to the old rendering, never invent terrain.
+//
+// Produced by worldgen.wgsl `farmap` (one entry per fill entry that carries
+// kFarListMapBit: see FarField::EnqueuePlane), invalidated — never raised —
+// by `farpatch` (a refilled EDITED level chunk) and `fardown` (a live edit
+// that removed matter the entry vouches for). Render-only derived data: never
+// hashed, never saved, never read by the sim.
+constexpr uint32_t kFarMapN = kFarN * 2;
+constexpr uint64_t kFarMapWords = (uint64_t)kFarLevels * kFarMapN * kFarMapN;
+constexpr int32_t kFarMapHBias = 32768;
+constexpr uint32_t kFarMapValid = 0x80000000u;
+// A farList entry that also (re)fills the surface map under its level chunk's
+// XZ footprint. Bit 31, clear of the (level-1) << kFarSlotShift field below it.
+constexpr uint32_t kFarListMapBit = 0x80000000u;
+static_assert(((uint64_t)kFarLevels << kFarSlotShift) <= kFarListMapBit,
+              "the far list's map-fill flag must sit above the level field");
+constexpr uint32_t kFarMapWord(uint32_t level, int mx, int mz) {
+  const uint32_t cx = (uint32_t)(mx >> 1) & (kFarN - 1);
+  const uint32_t cz = (uint32_t)(mz >> 1) & (kFarN - 1);
+  return ((level - 1) * kFarN * kFarN + cz * kFarN + cx) * 4 +
+         (uint32_t)(mz & 1) * 2 + (uint32_t)(mx & 1);
+}
+
 // ---- cascade geometry, derived in ONE place ----
 // Level k (1-based) holds kFarN cells per axis of 2^(k + kFarShiftBase) fine
 // voxels, so its box edge is kFarN << (k + kFarShiftBase) fine voxels. Every
@@ -5042,6 +5084,10 @@ class World {
   // 15.4 ms/frame of fardown). Derived, zero-initialised; FarField zeroes it
   // on every reset / full refill so a re-filled level is downsampled afresh.
   rhi::Buffer farSig;
+  // The far SURFACE MAP (kFarMap* above): per-level fine-resolution column
+  // heights + skin, the raymarcher's refine data. CopySrc for the far-surface
+  // gate only.
+  rhi::Buffer farMap;
 
   // The CPU's far-field edit index (src/sim/faredits.h), owned by Stream —
   // it is fed by the same eviction path that fills the ChunkStore, and that

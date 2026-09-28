@@ -4058,6 +4058,32 @@ fn farOccPack(count : u32, topRowPlusOne : u32) -> u32 {
 }
 fn farOccTop(occ : u32) -> u32 { return occ >> FAR_OCC_TOP_SHIFT; }
 
+// ---- THE FAR SURFACE MAP (LOD-seam package A, 2026-09-28) -------------------
+// world.h's kFarMap* block owns the layout; these must agree with it (the
+// far-surface gate reads entries back through kFarMapWord). Per level, a 2D
+// toroidal grid of SUB-COLUMNS at twice the level's XZ resolution — level 1's
+// are single fine columns — blocked 2x2 per level CELL so one cell's four
+// sub-columns are one 16-byte load (raymarch.wgsl) or four consecutive words
+// (the worldgen writers). Entry: top voxel y + FAR_MAP_H_BIAS in bits 0..15,
+// skin far-palette slot in 16..22, sub-skin slot in 23..29, VALID in 31.
+// Here and not beside one consumer because worldgen writes it and raymarch
+// reads it: two shaders that must AGREE, which is what common.wgsl is for.
+const FAR_MAP_VALID : u32 = 0x80000000u;
+const FAR_MAP_H_BIAS : i32 = 32768;
+// A farList entry that also refills the surface map (world.h kFarListMapBit).
+const FAR_LIST_MAP_BIT : u32 = 0x80000000u;
+// The vec4 (cell) index of level cell (cx, cz), toroidal like farCellIndexG.
+fn farMapCell(level : u32, c : vec2<i32>) -> u32 {
+  let s = vec2<u32>(c & vec2<i32>(FAR_MASK));
+  return (level - 1u) * FAR_N * FAR_N + s.y * FAR_N + s.x;
+}
+// The word index of sub-column (mx, mz) (units of half a level cell).
+fn farMapWord(level : u32, m : vec2<i32>) -> u32 {
+  return farMapCell(level, m >> vec2<u32>(1u)) * 4u +
+         u32(m.y & 1) * 2u + u32(m.x & 1);
+}
+fn farMapTop(e : u32) -> i32 { return i32(e & 0xFFFFu) - FAR_MAP_H_BIAS; }
+
 // ---- THE FAR CELL BYTE: 7 bits of PALETTE SLOT + 1 CONSERVATIVE BLOCKER BIT -
 // (13.2.2, docs/PLAN_lin_followups.md W2-D)
 //

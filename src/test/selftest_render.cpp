@@ -513,6 +513,179 @@ Status GateFarPersist(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- far-surface -------------------------------------------------------
+// The far SURFACE MAP (world.h kFarMap*, LOD-seam package A): the per-level
+// column heightfield traceFar refines surface cells against. The refine
+// TRUSTS a VALID entry instead of the 3D cells in the surface band, so the
+// three things that can make it lie are the three claims here:
+//
+//   (a) PRISTINE AGREEMENT. After a full refill, a valid level-1 entry holds
+//       the ground contract (World::TerrainHeight) or a standing fluid's
+//       surface above it, and the sieve's own 3D cell containing that top is
+//       a material cell wearing the SAME far palette slot as the entry's skin
+//       — the map and the cells describe one surface. Levels 2 and 3 are
+//       checked against TerrainHeight at their sample column.
+//   (b) LIVE EDITS INVALIDATE. A crater dug and a block built inside the
+//       window, then ticked: the entries over them must have lost VALID (the
+//       renderer falls back to the cells, which `fardown` has already
+//       rewritten), and an untouched control column must not.
+//   (c) A REFILL DOES NOT RESURRECT. Two arms like far-persist's: refilled with
+//       an EMPTY edit index the crater's entry comes back valid (pristine
+//       procgen, and the cells are pristine too — consistent); refilled with
+//       the edited chunks indexed, `farpatch` must clear it again.
+namespace {
+uint32_t FarMapEntry(GpuContext& ctx, World& world, uint32_t level, int mx, int mz) {
+  rhi::Buffer staging =
+      CreateBuffer(ctx.device, 4, rhi::BufferUsage::MapRead | rhi::BufferUsage::CopyDst,
+                   "farMapRead");
+  rhi::CommandEncoder enc = ctx.device.CreateCommandEncoder();
+  enc.CopyBufferToBuffer(world.farMap, (uint64_t)kFarMapWord(level, mx, mz) * 4,
+                         staging, 0, 4);
+  ctx.queue.Submit(enc.Finish());
+  uint32_t word = 0;
+  rhi::ReadBufferBlocking(ctx.device, staging, 0, &word, 4);
+  return word;
+}
+int FarMapTopOf(uint32_t e) { return (int)(e & 0xFFFFu) - kFarMapHBias; }
+}  // namespace
+
+Status GateFarSurface(Ctx& c, std::string& detail) {
+  GpuContext& ctx = c.ctx;
+  World& world = c.world;
+  Simulation& sim = c.sim;
+  const uint32_t seed = kDefaultSeed;
+  const int shift1 = (int)(1 + kFarShiftBase);
+
+  // Ground sites inside the {0,0,0} window, clear of far-downsample's (140)
+  // and far-persist's (300) sky paint and of the harness lake.
+  const IVec3 crater{232, World::TerrainHeight(232, 172, seed), 172};
+  const IVec3 build{176, World::TerrainHeight(176, 236, seed), 236};
+  const IVec3 control{260, World::TerrainHeight(260, 250, seed), 250};
+  const IVec3 playerChunk{crater.x >> 4, crater.y >> 4, crater.z >> 4};
+  for (const IVec3& s : {crater, build, control}) {
+    if (s.y < 8 || s.y >= (int)kWorldN - 8) {
+      detail = Format("site (%d,%d,%d) outside the window", s.x, s.y, s.z);
+      std::printf("far surface: FAIL (%s)\n", detail.c_str());
+      return Status::Fail;
+    }
+  }
+
+  FarEdits& edits = c.stream.Edits();
+  edits.Clear();
+  DrainFullRefill(ctx, world, sim, playerChunk);
+
+  // ---- (a) pristine agreement --------------------------------------------
+  int sampled = 0, valid = 0, exact = 0, fluid = 0, wrong = 0, cellAgree = 0;
+  std::string firstWrong;
+  for (int i = 0; i < 48; i++) {
+    // Odd coordinates: the sieve's level-1 SAMPLE columns, so the cell check
+    // below compares the map with the very voxel the cell was cut from.
+    const int wx = crater.x - 300 + ((i * 37) % 600) | 1;
+    const int wz = crater.z - 300 + ((i * 53 + 11) % 600) | 1;
+    sampled++;
+    const uint32_t e = FarMapEntry(ctx, world, 1, wx, wz);
+    if (!(e & kFarMapValid)) continue;
+    valid++;
+    const int top = FarMapTopOf(e);
+    const int h = World::TerrainHeight(wx, wz, seed);
+    const uint32_t skin = (e >> 16) & 0x7Fu;
+    // The sieve's cell holding `top`: centre sample 2cy+1 <= top < 2cy+3.
+    const int cy = (top - 1) >> shift1;
+    const uint32_t b = FarVoxByte(ctx, world, 1, {wx >> shift1, cy, wz >> shift1});
+    const bool agree = (b & 0x7Fu) == skin && skin != 0;
+    if (agree) cellAgree++;
+    if (top == h) exact++;
+    else if (top > h && agree) fluid++;   // standing fluid over the ground
+    if (!agree || top < h) {
+      wrong++;
+      if (firstWrong.empty())
+        firstWrong = Format(" first (%d,%d): top %d h %d skin %u cell %u", wx, wz,
+                            top, h, skin, b & 0x7Fu);
+    }
+  }
+  int coarse = 0, coarseExact = 0;
+  for (uint32_t level = 2; level <= 3; level++) {
+    const int wsh = (int)(level + kFarShiftBase) - 1;   // fine voxels per sub-column
+    for (int i = 0; i < 16; i++) {
+      const int mx = ((crater.x - 400 + i * 53) >> wsh);
+      const int mz = ((crater.z - 400 + i * 41) >> wsh);
+      const uint32_t e = FarMapEntry(ctx, world, level, mx, mz);
+      if (!(e & kFarMapValid)) continue;
+      coarse++;
+      const int fx = (mx << wsh) + ((1 << wsh) >> 1);
+      const int fz = (mz << wsh) + ((1 << wsh) >> 1);
+      if (FarMapTopOf(e) >= World::TerrainHeight(fx, fz, seed)) coarseExact++;
+    }
+  }
+  const bool aOk = valid >= sampled * 3 / 4 && wrong == 0 &&
+                   exact + fluid == valid && coarse >= 16 && coarseExact == coarse;
+
+  // ---- (b) live edits invalidate -------------------------------------------
+  auto validAt = [&](int x, int z) {
+    return (FarMapEntry(ctx, world, 1, x, z) & kFarMapValid) != 0;
+  };
+  const bool preCrater = validAt(crater.x, crater.z);
+  const bool preBuild = validAt(build.x, build.z);
+  const bool preControl = validAt(control.x, control.z);
+  for (uint32_t t = 1; t <= 4; t++) {
+    std::vector<BrushOp> ops;
+    if (t == 1) {
+      ops.push_back({crater.x, crater.y, crater.z, 3, kMatAir, 1u, 0, 0});
+      ops.push_back({build.x, build.y + 2, build.z, 2, kMatGlass, 1u, 0, 0});
+    }
+    SubmitTick(ctx, world, sim, t, seed, ops, {}, {}, false, playerChunk, false,
+               false);
+  }
+  ctx.WaitIdle();
+  const bool postCrater = validAt(crater.x, crater.z);
+  const bool postBuild = validAt(build.x, build.z);
+  const bool postControl = validAt(control.x, control.z);
+  // Level 2's sub-column over the crater centre, whose sample column is the
+  // crater's own when the centre is odd-aligned; any sample inside the dug
+  // sphere proves the coarse half, and radius 3 covers level 2's.
+  const int wsh2 = (int)(2 + kFarShiftBase) - 1;
+  const bool postCrater2 =
+      (FarMapEntry(ctx, world, 2, crater.x >> wsh2, crater.z >> wsh2) & kFarMapValid) != 0;
+  const bool bOk = preCrater && preBuild && preControl && !postCrater &&
+                   !postBuild && postControl && !postCrater2;
+
+  // ---- (c) a refill does not resurrect ----------------------------------
+  edits.Clear();
+  DrainFullRefill(ctx, world, sim, playerChunk);
+  const bool healed = validAt(crater.x, crater.z);   // pristine arm: valid again
+  std::vector<uint32_t> words(kChunkVol);
+  uint32_t noted = 0;
+  for (const IVec3& s : {crater, build}) {
+    for (int dz = -1; dz <= 1; dz++)
+      for (int dy = -1; dy <= 1; dy++)
+        for (int dx = -1; dx <= 1; dx++) {
+          const IVec3 wc{(s.x >> 4) + dx, (s.y >> 4) + dy, (s.z >> 4) + dz};
+          if (!world.ChunkInWindow(wc)) continue;
+          ReadVoxelsSync(ctx, world, World::SlotChunkIndex(wc), 1, words.data(),
+                         "farSurface");
+          edits.NoteChunk(wc, words.data());
+          noted++;
+        }
+  }
+  DrainFullRefill(ctx, world, sim, playerChunk);
+  const bool keptCrater = !validAt(crater.x, crater.z);
+  const bool keptBuild = !validAt(build.x, build.z);
+  const bool cOk = healed && keptCrater && keptBuild;
+
+  const bool ok = aOk && bOk && cOk;
+  detail = Format("L1 %d/%d valid, %d exact + %d fluid, %d cell/skin agree, %d wrong; "
+                  "L2-3 %d/%d; edit %d%d%d->%d%d%d L2 %d; refill healed %d kept %d%d",
+                  valid, sampled, exact, fluid, cellAgree, wrong, coarseExact, coarse,
+                  preCrater, preBuild, preControl, postCrater, postBuild,
+                  postControl, postCrater2, healed, keptCrater, keptBuild);
+  std::printf("far surface: %s (%s%s; %u chunks indexed)\n", ok ? "PASS" : "FAIL",
+              detail.c_str(), firstWrong.c_str(), noted);
+  // Leave the cascades as the next gate expects to find them: pristine + the
+  // index the harness had (none), not our two edits' patches.
+  edits.Clear();
+  return ok ? Status::Pass : Status::Fail;
+}
+
 // ---- screenshots -------------------------------------------------------
 Status GateScreenshots(Ctx& c, std::string& detail) {
   GpuContext& ctx = c.ctx;
@@ -4648,6 +4821,9 @@ const std::vector<Gate>& RenderGates() {
       {"far-fog", "render", {}, false, GateFarFog},
       {"far-downsample", "render", {}, false, GateFarDownsample},
       {"far-persist", "render", {}, false, GateFarPersist},
+      // The far SURFACE MAP (LOD-seam package A): pristine agreement, live
+      // edits invalidate, a refill does not resurrect. Compute + readback only.
+      {"far-surface", "render", {}, false, GateFarSurface},
       // The only gate in this file that actually DRAWS: far-fog and
       // far-downsample exercise the far-field cascades through compute and a
       // one-word readback, and never touch the offscreen target.

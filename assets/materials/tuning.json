@@ -857,6 +857,7 @@
     "farPlaneFillRate": 256,
     "farShadowReach": 24,
     "farBlockerHitLevel": 0,
+    "farRefineLevel": 8,
     "gasBlendStart": 0.5,
     "farPlumeStrength": 1,
     "farPlumeHeight": 28,

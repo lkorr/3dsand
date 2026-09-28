@@ -5247,6 +5247,11 @@ fn pagefill(@builtin(workgroup_id) wg : vec3<u32>,
 // fardown's skip (world.h farSig): the far-visible matter signature each slot
 // had the last time it was downsampled.
 @group(1) @binding(6) var<storage, read_write> farSig : array<u32>;
+// THE FAR SURFACE MAP (world.h kFarMap*, common.wgsl farMapWord). `farmap`
+// below fills it; `farpatch` and `fardown` only ever CLEAR its valid bit.
+// Atomic for fardown's sake: neighbouring dirty chunks clear bits in entries
+// they share (a coarse level's sub-column is wider than a chunk).
+@group(1) @binding(7) var<storage, read_write> farMap : array<atomic<u32>>;
 
 var<workgroup> wgFarCount : atomic<u32>;
 // Non-air cells contributed by the patch pass (`farpatch`). Kept apart from
@@ -5271,7 +5276,8 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   workgroupBarrier();
 
   let packed = farList[wg.x];
-  let level = (packed >> FAR_SLOT_SHIFT) + 1u;   // 1-based
+  // Bit 31 is the surface-map fill flag (`farmap`), not part of the level.
+  let level = ((packed & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT) + 1u;   // 1-based
   let slot = packed & FAR_SLOT_MASK;
   let sc = vec3<i32>(vec3<u32>(slot % FAR_NCHUNK, (slot / FAR_NCHUNK) % FAR_NCHUNK,
                                slot / (FAR_NCHUNK * FAR_NCHUNK)));
@@ -5440,6 +5446,97 @@ fn far(@builtin(workgroup_id) wg : vec3<u32>,
   }
 }
 
+// ---- THE SURFACE MAP FILL (LOD-seam package A, 2026-09-28) -----------------
+//
+// The sweep above point-samples one fine voxel per cell, which is the far
+// field's resolution limit: at the window edge a level-1 cell is a 20 cm cube
+// standing where the near field draws four 10 cm columns of different heights,
+// and the top is off by up to a voxel. This entry fills the 2D map the
+// raymarcher refines those cells against (world.h kFarMap*): for every
+// SUB-COLUMN under this level chunk's XZ footprint — 2^(k-1) fine voxels wide,
+// so ONE fine column at level 1 — the column's true top (the ground contract's
+// `h`, or the standing fluid's surface over it), the skin the top voxel wears,
+// and the sub-skin under it. One genColumn per entry and two genCellIn, no
+// per-cell work: 1,024 columns per map-fill entry, and only one entry in 32
+// carries the flag (the y == 0 slot layer of each level-chunk column of an X/Z
+// plane or reset, farfield.cpp EnqueuePlane), so it is ~1/8 of the sieve's
+// column work on the same planes.
+//
+// THE SAMPLE COLUMN IS THE SUB-COLUMN'S CENTRE, the sieve's own convention one
+// level down (exact at level 1, where a sub-column IS a fine column). A max over
+// the footprint would cost 4^(k-1) genColumns at level k and would disagree
+// with the 3D cells, which centre-sample too.
+//
+// WHAT MAKES AN ENTRY VALID, i.e. what the map may vouch for: a column whose
+// far-visible top is the heightfield itself. An authored stamp (a ruin, a
+// building: wmSiteTopAt above the ground) is not, and neither is a top whose
+// voxel is not far-solid (a lily pad on a pond surface falls back to the
+// fluid). Trees, cover rocks and every other thing standing ON the ground do
+// not invalidate anything: the raymarcher draws a 3D cell whose centre sample
+// sits ABOVE the map's top as a plain cell (the union rule, traceFar).
+//
+// Separate entry point for the compile-time reason `farpatch` is (its own
+// genColumn + genCellIn copies); same dispatch extent, and an entry without the
+// flag returns at once.
+@compute @workgroup_size(64)
+fn farmap(@builtin(workgroup_id) wg : vec3<u32>,
+          @builtin(local_invocation_index) li : u32) {
+  if (wg.x >= T.farCount) { return; }
+  let packed = farList[wg.x];
+  if ((packed & FAR_LIST_MAP_BIT) == 0u) { return; }
+  let level = ((packed & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT) + 1u;   // 1-based
+  let slot = packed & FAR_SLOT_MASK;
+  let sc = vec3<i32>(vec3<u32>(slot % FAR_NCHUNK, (slot / FAR_NCHUNK) % FAR_NCHUNK,
+                               slot / (FAR_NCHUNK * FAR_NCHUNK)));
+  // base LEVEL-cell coord of this level chunk; only x and z matter here
+  let base = farSlotToChunk(sc, F.origins[level - 1u].xyz) * i32(CHUNK);
+  let shift = farCellShift(level);
+  let wsh = shift - 1u;               // fine voxels per sub-column, as a shift
+  let hw = (1 << wsh) >> 1;           // its centre column (0 at level 1)
+  let n = 2u * CHUNK;                 // sub-columns per axis under the chunk
+  for (var i = li + unrollFenceU(); i < n * n; i += 64u) {
+    let m = vec2<i32>(base.x * 2 + i32(i % n), base.z * 2 + i32(i / n));
+    let fx = (m.x << wsh) + hw;
+    let fz = (m.y << wsh) + hw;
+    var ponds : PondSet;
+    var col = genColumn(fx, fz, T.seed, &ponds);
+    let top = max(col.h, col.fluidTop);
+    // An authored stamp's bounding box stands above the ground: a building,
+    // not a heightfield. And a top the 16-bit field cannot hold is no claim.
+    var ok = wmSiteTopAt(fx, fz) <= col.h &&
+             top + FAR_MAP_H_BIAS >= 0 && top + FAR_MAP_H_BIAS <= 0xFFFF;
+    // The skin (y == top) and the sub-skin (y == top - 1) in ONE rolled loop:
+    // every genCellCol call site is a whole inlined genCellIn, and this entry
+    // should cost the driver one of them (see unrollFence()).
+    var skin = MAT_AIR;
+    var under = MAT_AIR;
+    for (var q = unrollFenceU(); q < 2u; q++) {
+      let mq = genCellCol(&col, &ponds, vec3<i32>(fx, top - i32(q), fz), T.seed) & 0xFFFu;
+      if (q == 0u) { skin = mq; } else { under = mq; }
+    }
+    if (!farCellIsSolid(skin)) {
+      // Something non-far-solid ON the surface voxel (a lily pad over a pond):
+      // the far field paints the fluid it floats on, as the sieve's cells do.
+      if (top == col.fluidTop && farCellIsSolid(col.fluid)) { skin = col.fluid; }
+      else { ok = false; skin = MAT_AIR; }
+    }
+    // farSurfaceMat's canopy flattening, mirrored: at cells 2 m+ (shift >= 5)
+    // a crown too thin to survive sampling is painted onto the ground skin, and
+    // a refined sub-column there must wear the same paint as the cell it
+    // replaces, or the far forest turns into bare grass the moment it refines.
+    if (shift >= 5u && top == col.h && ok) {
+      let can = treeCanopyAt(fx, fz, T.seed, &ponds);
+      if (can != MAT_AIR) { skin = can; }
+    }
+    if (!farCellIsSolid(under)) { under = skin; }
+    var e = u32(clamp(top + FAR_MAP_H_BIAS, 0, 0xFFFF)) |
+            (matFarPal(&materials, skin) << 16u) |
+            (matFarPal(&materials, under) << 23u);
+    if (ok) { e |= FAR_MAP_VALID; }
+    atomicStore(&farMap[farMapWord(level, m)], e);
+  }
+}
+
 // ---- THE EDIT PATCH (far-field edit persistence) ---------------------------
 //
 // The sweep above is PRISTINE PROCGEN, and that is the whole problem this
@@ -5491,7 +5588,8 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
   workgroupBarrier();
 
   let packed = farList[wg.x];
-  let level = (packed >> FAR_SLOT_SHIFT) + 1u;   // 1-based
+  // Bit 31 is the surface-map fill flag (`farmap`), not part of the level.
+  let level = ((packed & ~FAR_LIST_MAP_BIT) >> FAR_SLOT_SHIFT) + 1u;   // 1-based
   let slot = packed & FAR_SLOT_MASK;
   let sc = vec3<i32>(vec3<u32>(slot % FAR_NCHUNK, (slot / FAR_NCHUNK) % FAR_NCHUNK,
                                slot / (FAR_NCHUNK * FAR_NCHUNK)));
@@ -5543,6 +5641,17 @@ fn farpatch(@builtin(workgroup_id) wg : vec3<u32>,
       byteV |= matFarPal(&materials, farSurfaceMat(&pcol, &pponds, pmat, pfine, shift, T.seed));
     }
     if (byteV != 0u) { pnz += 1u; atomicMax(&wgFarTop, u32(pl.y) + 1u); }
+    // THE SURFACE MAP STOPS VOUCHING FOR AN EDITED CELL'S COLUMN (package A).
+    // `farmap` just refilled it from PRISTINE procgen, and a patch is the
+    // proof that this level chunk was edited: a crater dug here would be
+    // resurrected by the refine if the map kept claiming the old ground.
+    // FarEdits carries only the cell's centre sample, not the fine columns the
+    // map describes, so the only honest answer is "use the 3D cells here" —
+    // all four sub-columns under the cell, unconditionally. Over-conservative
+    // for a patch that re-states pristine matter (a flushed-save rebuild), and
+    // the cost of that is the plain cascade cell, never a wrong one.
+    let mw = farMapCell(level, pcc.xz) * 4u;
+    for (var q = 0u; q < 4u; q++) { atomicAnd(&farMap[mw + q], ~FAR_MAP_VALID); }
     let bi = (level - 1u) * FAR_VOX + slot * CHUNK_VOL + ci;
     let bsh = (bi & 3u) * 8u;
     atomicAnd(&farVox[bi >> 2u], ~(0xFFu << bsh));
@@ -5756,6 +5865,69 @@ fn fardown(@builtin(workgroup_id) wg : vec3<u32>,
           // ever lowers it (common.wgsl, the farOcc word).
           atomicMax(&farOcc[farOccIndex(level, cc)],
                     farOccPack(1u, u32(cc.y & (i32(CHUNK) - 1)) + 1u));
+        }
+      }
+    }
+  }
+
+  // ---- THE SURFACE MAP'S CLAIM, CHECKED AGAINST THE LIVE GRID (package A) ----
+  //
+  // The map (world.h kFarMap*) says "this sub-column is solid up to `top` and
+  // air right above it", and traceFar trusts that claim INSTEAD of the 3D
+  // cells in exactly one band: the cells between the floor of the lowest cell
+  // its level cell's four sub-columns leave partly empty and the voxel over
+  // its top. Everything above and below that band is drawn from the cells this
+  // entry just rewrote. So an edit can only ever be misdrawn by the refine if
+  // it changed a voxel INSIDE that band at the sub-column's sample column, and
+  // that is precisely what is tested here: any voxel of this chunk in the band
+  // that is not what the claim says (a dug voxel at or under the top, a placed
+  // one on it) clears the entry's VALID bit, and the renderer falls back to the
+  // plain cells for that level cell. Clearing is the only write: nothing here
+  // re-derives a height (a crater's new floor may lie in a chunk that is not
+  // in this dispatch, and two chunks of one column race), so the entry stays
+  // invalid until a refill of its column re-derives it from procgen — which,
+  // for an edited chunk, `farpatch` invalidates again.
+  //
+  // One sample column per sub-column, the fill's own (the centre; exact at
+  // level 1, where a sub-column is one fine column). Cost: one word per
+  // sub-column whose sample column lies in this chunk (~340 across the levels)
+  // plus at most a chunk-height of voxel reads where the band crosses it, only
+  // for a chunk whose far signature moved (the early return above).
+  for (var level = 1u; level <= FAR_LEVELS; level++) {
+    let shift = farCellShift(level);
+    let step = 1 << shift;
+    let wsh = shift - 1u;
+    let w = 1 << wsh;
+    let hw = w >> 1;
+    let fx0 = farFirstCenter(base.x, w, hw);
+    let fz0 = farFirstCenter(base.z, w, hw);
+    let nx = farCenterCount(base.x, fx0, w);
+    let nz = farCenterCount(base.z, fz0, w);
+    let origin = F.origins[level - 1u].xyz;
+    let cols = u32(max(nx * nz, 0));
+    for (var ci = li; ci < cols; ci += 64u) {
+      let fx = fx0 + (i32(ci) % nx) * w;
+      let fz = fz0 + (i32(ci) / nx) * w;
+      let m = vec2<i32>(fx >> wsh, fz >> wsh);
+      let c = m >> vec2<u32>(1u);
+      let d = c - origin.xz * i32(CHUNK);
+      if (any(d < vec2<i32>(0)) || any(d >= vec2<i32>(i32(FAR_N)))) { continue; }
+      let mw = farMapCell(level, c) * 4u;
+      let me = mw + u32(m.y & 1) * 2u + u32(m.x & 1);
+      let e = atomicLoad(&farMap[me]);
+      if ((e & FAR_MAP_VALID) == 0u) { continue; }
+      let hTop = farMapTop(e);
+      var minH = hTop;
+      for (var q = 0u; q < 4u; q++) { minH = min(minH, farMapTop(atomicLoad(&farMap[mw + q]))); }
+      // The band, clipped to this chunk: from the floor of the level cell that
+      // holds minH + 1 (the lowest partly-empty one) up to the voxel over top.
+      let lo = max(fdiv(minH + 1, step) * step, base.y);
+      let hi = min(hTop + 1, base.y + i32(CHUNK) - 1);
+      for (var y = lo; y <= hi; y++) {
+        let solid = farCellIsSolid(voxWordAt(vec3<i32>(fx, y, fz)) & 0xFFFu);
+        if (solid != (y <= hTop)) {
+          atomicAnd(&farMap[me], ~FAR_MAP_VALID);
+          break;
         }
       }
     }
