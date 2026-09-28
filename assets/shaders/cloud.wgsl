@@ -1012,8 +1012,26 @@ fn writeRainWindProbe() {
     acc += windAt(c + d * (rv * 0.5), R.time, &R);
     acc += windAt(c + d * rv, R.time, &R);
   }
-  let w = acc * (VOXEL_METERS / 17.0);
+  var w = acc * (VOXEL_METERS / 17.0);
+  // SMOOTHED IN TIME too (word 7 = the R.time of the last write). The overlay
+  // shears its whole lattice along this wind, so a flake h metres from the
+  // eye moves by dWind * h / fallSpeed when it changes — with snow's 1.1 m/s
+  // fall a wind shift swung the entire field round the eye like one rigid
+  // sheet. Easing the lean over a few seconds (longer for snow) keeps that
+  // swing slower than the flakes' own motion. A first frame or a clock that
+  // went backwards snaps to the new value.
+  let tPrev = bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 7u]);
+  let dt = R.time - tPrev;
+  if (dt >= 0.0 && dt < 1.0) {
+    let prev = vec3f(bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 4u]),
+                     bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 5u]),
+                     bitcast<f32>(cloudMaps[CLOUD_PROBE_BASE + 6u]));
+    let tau = mix(1.5, 4.0, clamp(C.precipType, 0.0, 1.0));
+    let blend = 1.0 - exp(-dt / tau);
+    if (all(prev == prev)) { w = mix(prev, w, blend); }   // NaN guard
+  }
   cloudMaps[CLOUD_PROBE_BASE + 4u] = bitcast<u32>(w.x);
   cloudMaps[CLOUD_PROBE_BASE + 5u] = bitcast<u32>(w.y);
   cloudMaps[CLOUD_PROBE_BASE + 6u] = bitcast<u32>(w.z);
+  cloudMaps[CLOUD_PROBE_BASE + 7u] = bitcast<u32>(R.time);
 }
