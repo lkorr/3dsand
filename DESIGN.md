@@ -11972,16 +11972,19 @@ where you hear from either (§12b, "The ears are on the character").
   planes seamless against live chunks. At `kFarShiftBase = 0` (the 512³
   window over the 512³ far grid; this table said 1 until 2026-09-28, which was
   stale since kFarN went 512) and `kVoxelMeters = 0.10` that gives (level:
-  cell size, band it serves, smallest edit it can show):
+  cell size, where it hands the ray to the next level — a SPHERE about the
+  eye, 13 level chunks (the box half less the recentre hysteresis and one
+  plane; the box itself is 16 chunks half — see "each level hands off on a
+  sphere" below) — and the smallest edit it can show):
 
-  | level | cell | serves out to | smallest visible edit |
+  | level | cell | hands off at (box half) | smallest visible edit |
   |---|---|---|---|
-  | 1 | 2 vox (0.2 m) | 51 m | ~0.2 m — a brush stroke |
-  | 2 | 4 vox (0.4 m) | 102 m | ~0.4 m — a doorway |
-  | 3 | 8 vox (0.8 m) | 205 m | ~0.8 m — a small crater |
-  | 4 | 16 vox (1.6 m) | 410 m | ~1.6 m — a room, a big blast |
-  | 5 | 32 vox (3.2 m) | 819 m | ~3 m — a tower, a quarry |
-  | 6–8 | 64–256 vox | 1.6–6.6 km | 6–26 m — terrain-scale work only |
+  | 1 | 2 vox (0.2 m) | 41.6 m (51 m) | ~0.2 m — a brush stroke |
+  | 2 | 4 vox (0.4 m) | 83 m (102 m) | ~0.4 m — a doorway |
+  | 3 | 8 vox (0.8 m) | 166 m (205 m) | ~0.8 m — a small crater |
+  | 4 | 16 vox (1.6 m) | 333 m (410 m) | ~1.6 m — a room, a big blast |
+  | 5 | 32 vox (3.2 m) | 666 m (819 m) | ~3 m — a tower, a quarry |
+  | 6–8 | 64–256 vox | 1.3–2.7 km, level 8 its box (6.6 km) | 6–26 m — terrain-scale work only |
 
   The SURFACE of pristine terrain is no longer bound by this table: the far
   surface map below draws each surface cell as its 2x2 true-height
@@ -12003,7 +12006,9 @@ where you hear from either (§12b, "The ears are on the character").
   the previous box's exit) keeps coarse data from ever occluding fine data.
   **A ray leaves the fine march at whichever comes first: the window exit, or
   the in-window LOD handoff** (`TUNE_LOD_HANDOFF_DIST`, render group — **ships
-  DISABLED at 26 m since the LOD-seam pass, 2026-09-04**; it was 24). The
+  ON at 20.5 m since the LOD-seam overhaul, 2026-09-28**; it was disabled at
+  26 m from 2026-09-04, and 24 before that — why it is back is the LOD-seam
+  overhaul's closing paragraph, below). The
   handoff is a `min()` clamp on `trace()`'s `tExit`, so it moves where the
   cascade takes over without touching the handoff machinery — the cascade
   start distance, the one-sided seam dither and the `tPrev` ordering all read
@@ -12016,9 +12021,12 @@ where you hear from either (§12b, "The ears are on the character").
   ring: a `t` clamp on a normalised ray is a sphere around the camera, so every
   representation change the seam carries (cell size 10 → 20 cm, and every
   shading term listed under the seam pass below) landed on one circle on the
-  ground at a constant 24 m, where a 20 cm cell is still 6 px. The box edge is
-  25.6-44 m away, is not a circle, and is where the fine data genuinely ends.
-  Turn the knob back down to buy the 8-11% at the cost of the ring.
+  ground at a constant 24 m, where a 20 cm cell is still 6 px. The box edge
+  was the handoff from then until 2026-09-28: 22.4-38 m away, not a circle,
+  and STEPPING — fixed in the world while you walk, then jumping a 1.6 m chunk
+  with the window (in Y too), which is the line the user saw. With the far
+  surface map, the plant fade, the far shadows and the far shading terms in
+  place the circle carries little, and the circle moves with you.
   **Distance look (phase 4, 2026-08-19):** kFarLevels is 8 (128 MiB farVox —
   exactly the WebGPU default storage-binding limit; the horizon sits 2 km out
   at 6.25 cm voxels). Cell COLOR is decoupled from cell SHAPE: shape still
@@ -12136,12 +12144,13 @@ where you hear from either (§12b, "The ears are on the character").
   `color0` + 35% airglow LIT LIKE ROCK — a blue slab against the near field's
   sky-grey sheet. Only clear, non-viscous liquid seen through open air takes
   it (a far hit behind a near water surface keeps the old paint), and a far
-  water pixel no longer runs the far shadow march. For a view from above, a
-  top face probes up to 8 cells down its own level for the bed (depth +
-  material), lit as an open up face through the column's Beer-Lambert both
-  ways; none found = deep. Measured on screenshot_cascade's far oasis ponds
-  against the near fixture lake (68/122/154): old far 143/182/224, new
-  114/145/164 (the remainder is 60 m more aerial haze). Not reproduced:
+  water pixel no longer runs the far shadow march. Measured on
+  screenshot_cascade's far oasis ponds against the near fixture lake
+  (68/122/154): old far 143/182/224, new 114/145/164 (the remainder is 60 m
+  more aerial haze). A bed probe (a top face looking up to 8 cells down its
+  level for the bed, lit through the column) was tried and REMOVED in package
+  E: it moved those ponds by +3 blue and was the only per-pixel loop in the
+  far-water path, on the camera where the far field is the whole frame. Not reproduced:
   shore foam, the traced reflection of the far shore, caustics; and the far
   waterline is a cascade cell top, up to one fine voxel off the near
   fullness plane (a geometry matter). (b) **GI bounce** —
@@ -12160,7 +12169,9 @@ where you hear from either (§12b, "The ears are on the character").
   (far band vs near band, 20 rows either side of the handoff line, p20 ≈
   risers): far risers sat +16/255 above the near ones before, +28 with the
   bounce alone, +19 with bounce + openness (up 1, riser 0.72 = the fan less
-  its three down rays, underside 0.25). The far-vs-near differences that
+  its three down rays, underside 0.25; package E moved the riser to 0.6, the
+  MEASURED median of the near grid on the seam frames' risers, and reads the
+  near grid itself in the handoff band — below). The far-vs-near differences that
   remain on the seam frames (far treads ~28/255 darker on seam_x, the whole
   far band ~36 darker on seam_diag) move by 1-3 under these terms and are
   shadow / geometry (packages C / A). (c) **wet ground** — `farWetness` is
@@ -12174,6 +12185,77 @@ where you hear from either (§12b, "The ears are on the character").
   reached yet and ramps in over frames. Once the handoff is a camera radius
   inside the box (package E) new planes stream in beyond it and neither is
   on screen.
+  **Making the seam invisible (LOD-seam overhaul package E, 2026-09-28) — the
+  closing account.** The seam the user saw at eye height was the residency
+  window's BOX face: 22.4-38 m ahead, fixed in the world while walking, then
+  jumping a chunk. Packages A-D made the two sides agree (A the geometry,
+  B the plants, C the shadows, D the missing far terms); E moved the line and
+  finished the agreement:
+  - **The handoff is a camera sphere again, at 20.5 m** (the paragraph on
+    `TUNE_LOD_HANDOFF_DIST` above), inside the nearest the box face can be
+    (22.4 m), so it moves continuously and never steps; B's fade ends 0.5 m
+    before it automatically. A sphere, not a view-depth plane: a plane's
+    distance grows toward the screen corners (by 1/cos of the off-axis
+    angle) and there runs past the window.
+  - **The handoff band** (`farBandNearWeight`, raymarch.wgsl): a cascade hit
+    between the sphere and 22.3 m still sits over window cells the near field
+    has measured, so its OPENNESS is read from the near grid there and eased
+    to the far constant across the band — never on the stepping face. This was
+    ATTRIBUTED, not guessed: a temporary debug output wrote each shading term
+    (albedo, face, wrapped Lambert, shadow, AO, ambient, GI, openness,
+    pre-aerial colour, aerial fraction, final) for near and far pixels, and the
+    20-row bands either side of the handoff were compared. At 20.5 m on
+    seam_x the treads already matched (final median 0.753 vs 0.753 of full
+    scale); the risers differed by OPENNESS (near median 0.50, spread
+    0.33-1.0; far constant 0.72) — the near's soft dark blotches are the
+    openness grid, not shadow. With the band and the measured riser constant
+    (0.6) the riser medians are 0.525 near vs 0.510 far. The far arm also
+    takes the near's `shadowLiftCap` on that openness, so a shadowed riser has
+    the same depth either side.
+  - **The footprint fade** (`farFootprintFade`): below ~2 px per fine voxel
+    the palette variant eases to the mean of its three entries, each
+    `surfaceGrain` octave to its mean once its feature is under 2 px, and a
+    heightfield hit to the AVERAGE of the voxel staircase under it
+    (`farStairShade`: tread and uphill-riser areas projected on the ray weight
+    the three faces' Lambert, face weight and n.y, and the skin / sub-skin
+    albedo). Keyed on the fine voxel's projected size only, so it is
+    continuous across every level seam, and it starts no nearer than the
+    handoff at any resolution. It removes A's salt-and-pepper. A smooth
+    heightfield normal was tried first and rejected: seen from low down a
+    hillside is mostly risers, and shading it as a smooth slope turned
+    stone-and-snow mountains white.
+  - **Each level hands off on a sphere, not on its box** (`tLvlOut` in
+    `traceFar`). The concentric-ring MOIRE (seam_veg's far ridge, the cascade
+    camera's pond bowls and dune bands) was not shading: a per-pixel debug of
+    the far march showed every ring pixel was a level-(k+1) hit whose
+    level-k march had just left its VALID BOX. A side face is seen edge-on, so
+    which level a pixel draws flips with the cell lattice on the face plane
+    wherever the levels disagree (a cactus or crown the coarse centre sample
+    dropped, a crest drawn lower). The pattern was identical with the dither
+    hash replaced, with the dither off (split-screen A/B in one frame) and
+    with the refine at 0, 2 and 8. A sphere is crossed head-on by every ray,
+    so the flip is a circle the dither dissolves. Radius = box half less the
+    2-chunk recentre hysteresis less the one plane a shift re-queues (13 level
+    chunks), so a plane refill lands beyond the handoff: the ~50 m valid-box
+    refill pop no longer shows. The outermost level keeps its box.
+  - A traversal bug found on the way (not the moire): a level whose step
+    budget died inside a chunk's cell walk handed the next level the NEXT
+    chunk's entry, leaving up to 16 cells marched by nobody. Fixed (`tDied`).
+  - **Measured** (`--render-budget`, RTX 3060 Ti 1080p, exclusive lock, main
+    a6234e9's exe and this tree back to back): seam 10.16 -> 9.00 ms,
+    seamveg 9.99 -> 9.63, cascade 3.69 -> 2.89 — the handoff move and the
+    level spheres pay for everything A-E added (main's own seam number moved
+    9.66-10.16 between two exclusive runs, so read the seam delta as
+    -0.7 to -1.2 ms). raymarch `fs` 128 registers, 112 B local (was 144).
+  - **Still visible**, honestly: plants end in a fade 16-20 m out (B's design:
+    the far field has no plant representation); the near side keeps more
+    contrast (its openness blotches and contact shadows) than the far side
+    past the 2 m band; trees, rocks and cacti stay centre-sampled cells; at a
+    low sun (SANDVOX_BUDGET_SUN_DEG=12) cast shadows continue across the
+    handoff, but a heightfield contact-shadow walk tried for the refined
+    ground was removed (it made the noon distributions disagree more, near
+    tread shadow p20 1.0 vs far 0.66, and did not move the low-sun ones);
+    and a meadow reads as grass, then bare ground.
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
@@ -12332,7 +12414,7 @@ where you hear from either (§12b, "The ears are on the character").
     `fardown` / `farpatch` keep correct as before. What it gives up: an edited
     column shows the plain cascade cell until a pristine refill of it.
   - **Render** (raymarch.wgsl `farRefineCell`, in traceFar's cell loop, up to
-    `render.farRefineLevel`, default 8). A cell is a CANDIDATE when it is a
+    `render.farRefineLevel`, ships at 2 — see the measurement below). A cell is a CANDIDATE when it is a
     material cell or the flagged air directly over one (one byte read) — so the
     map is loaded for at most a couple of cells per ray, never for the cover-
     height rows of blocker flags the ray crossed on the way down. If its four
@@ -12375,9 +12457,13 @@ where you hear from either (§12b, "The ears are on the character").
     near field's own 10 cm columns instead of 20 cm terraces, and the coarse
     levels read as slopes rather than slab stacks; the cost of the finer
     geometry is 1-2 px stair aliasing on distant slopes (salt-and-pepper
-    step edges, strongest on snow), which a level cap (`farRefineLevel` 1-2)
-    trades back. The concentric-ring moire on distant slopes predates this
-    and is unchanged by it.
+    step edges, strongest on snow) — now removed by the footprint fade
+    (package E, below). The concentric-ring moire on distant slopes predated
+    this and was unchanged by it; it was the level box faces, fixed by the
+    sphere handoffs (package E). Package E ships the refine CAPPED AT LEVEL 2:
+    levels 3+ were 0.61 ms of the 4.44 ms cascade camera and nothing on the
+    eye-height cameras, and past ~77 m the footprint fade draws the average of
+    the staircase anyway, so their extra columns bought only silhouette.
   - **Gate** `far-surface`: after a full refill every sampled valid level-1
     entry equals `TerrainHeight` (or a fluid surface over it) and the sieve's
     cell holding that top wears the same far slot as the entry's skin; levels
@@ -12865,8 +12951,8 @@ the box face 22-27 m out, stepping with the window. Now:
 - **One place for the distances.** `DETAIL_FADE_END_M = min(render.lodHandoffDist,
   WINDOW_HALF_EXTENT_METERS - 2 chunks) - 0.5 m`: the handoff, capped at the
   nearest the window face gets (25.6 m less the 2-chunk stream hysteresis =
-  22.4 m), less half a metre — 21.9 m while the handoff ships disabled at 26 m,
-  20.5 m at a 21 m handoff. `DETAIL_FADE_START_M = min(render.plantLodDist,
+  22.4 m), less half a metre — 20.0 m at the shipped 20.5 m handoff (21.9 m
+  with it disabled). `DETAIL_FADE_START_M = min(render.plantLodDist,
   END - 1 m)` — `plantLodDist` (16 m) no longer switches anything to a cube;
   it is where the fade begins, for EVERY kind of micro detail. Moving the
   handoff moves the fade with it; no knob was added.

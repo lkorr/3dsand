@@ -4480,7 +4480,8 @@ struct Tuning {
     float cloudCirrusScaleM = TPD(render, cloudCirrusScaleM);
     // How much the clouds in a direction colour the distance fog and reflections in it (the env map).
     float cloudFogMix = TPD(render, cloudFogMix);
-    // shipped: 26 = past the 25.6 m window face, i.e. OFF (tuning.json)
+    // shipped: 20.5 m (tuning.json) = ON, a camera sphere inside the nearest
+    // window face (22.4 m); >= 25.6 disables it (the window box is the handoff).
     float lodHandoffDist = TPD(render, lodHandoffDist);
     // ---- frame pacing and internal resolution (CPU-only: NO_WGSL rows, no
     // TUNE_* constant — nothing here reaches a shader) ----------------------
