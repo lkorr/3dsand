@@ -12106,10 +12106,15 @@ where you hear from either (§12b, "The ears are on the character").
   `color0` + 35% airglow LIT LIKE ROCK — a blue slab against the near field's
   sky-grey sheet. Only clear, non-viscous liquid seen through open air takes
   it (a far hit behind a near water surface keeps the old paint), and a far
-  water pixel no longer runs the far shadow march. Not reproduced: the bed of
-  shallow water, shore foam, the traced reflection of the far shore,
-  caustics; and the far waterline is a cascade cell top, up to one fine
-  voxel off the near fullness plane (a geometry matter). (b) **GI bounce** —
+  water pixel no longer runs the far shadow march. For a view from above, a
+  top face probes up to 8 cells down its own level for the bed (depth +
+  material), lit as an open up face through the column's Beer-Lambert both
+  ways; none found = deep. Measured on screenshot_cascade's far oasis ponds
+  against the near fixture lake (68/122/154): old far 143/182/224, new
+  114/145/164 (the remainder is 60 m more aerial haze). Not reproduced:
+  shore foam, the traced reflection of the far shore, caustics; and the far
+  waterline is a cascade cell top, up to one fine voxel off the near
+  fullness plane (a geometry matter). (b) **GI bounce** —
   `farGiBounce` is the irradiance gather's closed form on open terrain:
   0 on a tread (every ray sees sky), one ring ray's weight (0.09375) on a
   riser, 0.33 on an underside, of the ground's direct radiance
@@ -12117,11 +12122,22 @@ where you hear from either (§12b, "The ears are on the character").
   × the far AO. CALIBRATED, not derived: measured near, a riser's bounce is
   0.11-0.13 of the adjacent tread's radiance (screenshot_ground, giStrength
   2 vs 0, tonemap inverted), a third of what the ideal three-ray weight
-  predicts. Openness needs no far term: open ground reads 1.0, the far AO's
-  cell-above test covers canopy. (c) **wet ground** — `farWetness` is the
-  near rain law with openness replaced by its open-terrain values (up face
-  1, riser 0.45, a cell with something on top 0), plus the near sheen. Rain
-  used to leave a dry ring at the window edge.
+  predicts. **The bounce is not allowed without the openness that pays for
+  it** (`farOpenness`): the near field scales a riser's ambient by its
+  openness BEFORE the gather adds the ground's light back, and the
+  hemisphere's ambGround half was the pre-GI stand-in for that same light —
+  so bounce alone counted the ground twice. Measured on screenshot_seam_x
+  (far band vs near band, 20 rows either side of the handoff line, p20 ≈
+  risers): far risers sat +16/255 above the near ones before, +28 with the
+  bounce alone, +19 with bounce + openness (up 1, riser 0.72 = the fan less
+  its three down rays, underside 0.25). The far-vs-near differences that
+  remain on the seam frames (far treads ~28/255 darker on seam_x, the whole
+  far band ~36 darker on seam_diag) move by 1-3 under these terms and are
+  shadow / geometry (packages C / A). (c) **wet ground** — `farWetness` is
+  the near rain law on `farOpenness` (a cell with something on top 0), plus
+  the near sheen. Rain used to leave a dry ring at the window edge; measured
+  with SANDVOX_WEATHER=rain, the median darkening either side of the line is
+  now x0.925 near / x0.935 far (seam_x) and x0.77 / x0.81 (seam_diag).
   Newly streamed chunks at the window edge: the openness fallback (stamp
   missing) is 1.0, i.e. exactly the far look, so the ambient does not pop;
   the GI gather of a new chunk reads an irradiance grid its deposits have not
