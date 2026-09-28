@@ -954,6 +954,10 @@ const char* const kOrder[] = {
     // The render half: tinted and glowing pools drawn to build/solute_look.bmp.
     "solute-look",
     "snapshot-latency",
+    // Spells in hand: real casts through the tick, so it fires bolts into the
+    // harness window and leaves their marks. Late, where nothing after it
+    // places a fixture on the ground it burned (voxregion/worldedit regenerate).
+    "spell-hands",
     // LAST of the world-touching gates, and it must be: BuildVoxRegion moves
     // the residency window and resets the page table, which is the state every
     // other gate's fixture placement assumes. It restores both before it

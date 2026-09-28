@@ -558,6 +558,7 @@ bool LoadPlayerKit(const PlayerKitRefs& r, const uint8_t* data, size_t len,
     return false;
   }
   r.caster->Clear(*r.glyphs);   // a half-spoken spell does not survive a load
+  r.caster->ClearHands();       // ...nor does one held in a hand (not saved)
   // The equipment was replaced wholesale: whatever the rig is wearing is not
   // these stacks, even where a name matches (Mob::DressFromKit re-dresses).
   if (r.wearer) r.wearer->KitWornStale();

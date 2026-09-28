@@ -95,6 +95,18 @@ Vec3 LaserMuzzle(const Player& player, const Camera& cam) {
          cam.Up() * 0.5f;
 }
 
+Vec3 SpellHandPoint(const PlayerAvatar& avatar, const Player& player,
+                    const Camera& cam, Hand h) {
+  if (avatar.Spawned()) {
+    const int part = h == Hand::Left ? avatar.Parts().handL : avatar.Parts().handR;
+    Vec3 at;
+    Quat rot;
+    if (avatar.PartAlive(part) && avatar.PartWorldTransform(part, at, rot)) return at;
+  }
+  return player.EyePos() + cam.Forward() * 1.2f +
+         cam.Right() * (0.7f * HandSideSign(h)) - cam.Up() * 0.5f;
+}
+
 // ---- body-condition HUD mirror (ui/overlay.h UIState::body) -----------------
 //
 // Maps the avatar's limbs onto the fixed stick-figure slots. The mapping is by
@@ -3422,12 +3434,6 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
           }
           return found;
         };
-        // Consume the latch on the FIRST tick of the frame that sees it, and
-        // clear it even when there is nothing spoken — otherwise a click on an
-        // empty stack stays queued and fires the next spell the moment one is
-        // spoken. Clearing outside the inner test is what makes this a one-shot
-        // rather than a pending intent.
-        const bool castNow = ti.Pressed(TB_CAST);
         // The inspector's "cast it on this part": `self` resolves at the
         // clicked limb's centre, with the effect radii clamped to the part.
         // Same Cast(), one extra argument (plan §7); the VM never learns what
@@ -3536,48 +3542,59 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
             }
           }
         }
-        if (castNow && !caster.stack.Empty()) {
-          // Origin at the muzzle — in front of the eye so the bolt does not
-          // spawn inside the caster's own head. Direction is the aim ray.
-          const Vec3 eye = player.EyePos();
+        // ---- SPELLS IN HAND (caster.h PlayerCaster::hand) ------------------
+        //
+        // A hand holding a spell casts it on its own button's press edge — LMB
+        // the right hand, RMB the left, the dual-wield rule — and the spell
+        // STAYS in the hand, so it fires as often as the button is clicked;
+        // mana is the rate limit. ResolveHands decided which hands qualify
+        // (empty of items, a usable arm). Both on one tick: right first, then
+        // left, each its own Cast() with its own origin.
+        //
+        // Origin: one step forward of the hand (SpellHandPoint) along the aim,
+        // so the flight leaves the fist; the caster's own parts are rejected
+        // by ownership in bodyHit above, so an arm in the line is not a hit.
+        // Direction is the aim ray. A FATAL cast runs its effect at the
+        // CASTER instead, through the same Cast (thesis 2).
+        for (int hk = 0; hk < kHands; hk++) {
+          const Hand h = HandAt(hk);
+          if (!hands[h].spell) continue;
+          if (!ti.Pressed(h == Hand::Right ? TB_ATTACK : TB_ALT)) continue;
+          const PlayerCaster::HandSpell& hs = caster.hand[hk];
           const Vec3 fwd = cam.Forward();
-          const Vec3 muzzle = eye + fwd * 1.5f;
-          SpellFxVec originFx{SpellFxFromFloat(muzzle.x),
-                              SpellFxFromFloat(muzzle.y),
+          const Vec3 muzzle = SpellHandPoint(avatar, player, cam, h) + fwd * 1.5f;
+          SpellFxVec originFx{SpellFxFromFloat(muzzle.x), SpellFxFromFloat(muzzle.y),
                               SpellFxFromFloat(muzzle.z)};
           SpellFxVec dirFx{SpellFxFromFloat(fwd.x), SpellFxFromFloat(fwd.y),
                            SpellFxFromFloat(fwd.z)};
-          // A FATAL cast runs its effect at the CASTER instead — and does so
-          // through the same ApplySpellEffect call, with the caster's position
-          // as the argument (thesis 2). Nothing here branches on the spell.
           const bool fatal =
-              ResolveCast(caster.mana, playerHealth.Get(),
-                          caster.compiled.manaCost).outcome == CastOutcome::Fatal;
+              ResolveCast(caster.mana, playerHealth.Get(), hs.compiled.manaCost).outcome ==
+              CastOutcome::Fatal;
           if (fatal) {
             const Vec3 body = player.pos;
             originFx = {SpellFxFromFloat(body.x), SpellFxFromFloat(body.y),
                         SpellFxFromFloat(body.z)};
           }
           const SpellProbe probe = WorldSpellProbe(world);
-          CastResult res =
-              spells.Cast(caster.compiled, caster.mana, playerHealth,
-                          kPlayerCasterId /*casterId*/, originFx, dirFx, tick, emit,
-                          &probe, nullptr, &bodyProbe);
+          CastResult res = spells.Cast(hs.compiled, caster.mana, playerHealth,
+                                       kPlayerCasterId, originFx, dirFx, tick, emit, &probe,
+                                       nullptr, &bodyProbe);
           caster.lastOutcome = res.outcome;
-          if (res.outcome != CastOutcome::Nothing) caster.Clear(glyphs);
+          caster.beamHand = hk;
         }
 
-        // A held beam follows the aim while RMB stays down.
+        // A held beam follows the aim while the button of the hand that cast
+        // it stays down.
         {
-          const Vec3 eye = player.EyePos();
+          const Hand bh = HandAt(caster.beamHand);
           const Vec3 fwd = cam.Forward();
-          const Vec3 muzzle = eye + fwd * 1.5f;
+          const Vec3 muzzle = SpellHandPoint(avatar, player, cam, bh) + fwd * 1.5f;
           spells.HoldBeam(kPlayerCasterId,
                           {SpellFxFromFloat(muzzle.x), SpellFxFromFloat(muzzle.y),
                            SpellFxFromFloat(muzzle.z)},
                           {SpellFxFromFloat(fwd.x), SpellFxFromFloat(fwd.y),
                            SpellFxFromFloat(fwd.z)},
-                          ti.Held(TB_ALT));
+                          ti.Held(bh == Hand::Right ? TB_ATTACK : TB_ALT));
         }
         if (ti.Pressed(TB_DROP)) {
           spells.DropNewestStatus(kPlayerCasterId);
@@ -4914,6 +4931,13 @@ static void ResolveHands(TickAuthorityCtx& w, SessionTick& st) {
     }
     // No body (fly mode, dead) swings nothing; an arm that is gone or
     // useless (Mob::HandCondition 0) swings nothing either.
+    // A spell in an empty hand: cast in fly mode too (no body: from the eye),
+    // never from an arm that could not grip.
+    if (hn.item == nullptr && s.caster.hand[k].Equipped() &&
+        (!body || s.avatar.HandUsable(h))) {
+      hn.spell = true;
+      continue;
+    }
     if (!st.intent.handsUp || !body || !s.avatar.HandUsable(h)) continue;
     if (hn.weapon) hn.ready = true;
     else if (hn.item == nullptr)

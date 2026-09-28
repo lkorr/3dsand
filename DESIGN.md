@@ -8870,7 +8870,8 @@ target PEEKS at the payload, so a gold ring, a ghost and a reason are drawn
 before the release. **And the number row now CASTS**: in magic mode a number key
 SELECTS the spell bound to it (a page, or one glyph as a one-word spell), the
 stack becomes its expansion, right-click casts it, and the selection persists
-across casts. Speaking one word per key and `=` capturing the stack are gone —
+across casts. (Superseded 2026-09-27 by *Spells in hand* under *Two hands*: the
+number row selects on the spell bar and Q / E put the spell into a hand.) Speaking one word per key and `=` capturing the stack are gone —
 authoring happens on the page, which is a surface with room for it.
 `--shot-inventory` writes a fourth frame, `screenshot_inventory_graph.bmp`: a
 copy of the `duststorm` starter with `shotgun` on it and a lane holding `fire`
@@ -16091,6 +16092,43 @@ person, and nothing draws from them. Showing a stowed blade on the avatar's
 back is a `sheath_back` socket in the rig plus a matching grip context on the
 item -- `ItemGrip`'s context map (`game/item.h`) already anticipates exactly
 that, so it is content, not code.
+
+#### Spells in hand (2026-09-27)
+
+A spell is held the way an item is. **Z** opens the SPELL BAR: the HUD strip
+shows the twenty bound keys (bank A, or bank B while Shift is held / the
+selection is in it) in the items' place, and the number row and the wheel
+move along it. **Q / E** put the selected key's spell into the left / right
+hand; from then on that hand's button (**RMB / LMB**, the item rule) casts it
+on EVERY press edge — nothing consumes it, mana is the only rate limit. Close
+the bar and the hands keep their spells, so a fist of fire and a sword can be
+carried together.
+
+- **One thing per hand.** A spell needs an empty hand: Q / E stow whatever the
+  hand holds into the first free hotbar slot, else the pack, or refuse. The
+  other way round, an item arriving in a hand by any door (Q / E, a drag, a
+  pickup) lets that hand's spell go (main.cpp, after the Q / E block). The key
+  pressed again on its own spell, or on an empty key, lets the spell go.
+- **The hand holds a SNAPSHOT** (`PlayerCaster::HandSpell`, `game/caster.h`):
+  the stack and its compile, made once at equip, plus the slot and name.
+  Rebinding the key does not change the spell in hand; a glyph reload (R)
+  re-speaks each hand from its slot (`RefreshHands`), since indices move. Hand
+  spells are not saved (a load clears them, like the half-spoken stack).
+- **The tick casts.** `ResolveHands` marks `HandNow::spell` for an EMPTY hand
+  holding a spell on a usable arm (fly mode, no body: allowed); such a hand is
+  never `ready` to strike. The SPELLS IN HAND block (`session.cpp`, magic
+  phase) casts per hand on `TB_ATTACK` / `TB_ALT` press, right then left, from
+  `SpellHandPoint` + 1.5 voxels along the aim; the caster's own parts are
+  rejected by ownership as before. A held beam follows the button of the hand
+  that cast last (`beamHand`). `TB_CAST` is no longer pressed by anything.
+- **The light in the fist** (main.cpp sprite pass): a breathing core with three
+  orbiting motes and a rising wisp at `SpellHandPoint`, in the spell's colour —
+  the SAME rule the flight is drawn with (first carried matter's colour, else
+  the delivery's `look.color`), with a short flare on each press. The HUD's
+  hand slot and the spell bar draw the same colour as a pool under the glyph.
+
+Gate `spell-hands` (runs the real tick through `TickRig`, which now carries a
+`TickOps::input` command and exposes its glyph library).
 
 ### Ground items are debris that remember their name
 

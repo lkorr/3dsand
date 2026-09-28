@@ -106,8 +106,8 @@ void RunTicks(TickRig& rig, int n,
     // Explosions go off in the primary's blast slot (phase K), not with the
     // other ops: see TickAuthorityCtx::Harness::blasts.
     rig.w_->harness.blasts = rig.pending_.exps;
-    // An empty command: the harness body is not being played.
-    const TickInput ti{};
+    // The gate's command for the body, empty unless it set one.
+    const TickInput ti = rig.pending_.input;
     const FrameIntent intent{};
     TickAuthority(*rig.w_, *rig.session_, intent, ti, t, rig.batch_);
     rig.tick = t;

@@ -31,6 +31,7 @@
 #include <nlohmann/json.hpp>
 
 #include "game/brush.h"
+#include "game/caster.h"
 #include "game/mob.h"
 #include "game/spell.h"
 #include "game/spellgraph.h"
@@ -2171,6 +2172,89 @@ Status GateSpellTiming(Ctx& c, std::string& detail) {
   return ok ? Status::Pass : Status::Fail;
 }
 
+// ---- spell-hands (spells in hand, dual wielding 2026-09-27) --------------------
+//
+// A spell put into a hand STAYS there: that hand's button casts it on every
+// press edge (LMB right, RMB left), through THE tick (TickAuthority, the rig's
+// harness body in fly mode). Asserts: equip compiles, three presses are three
+// casts and the hand still holds the spell after them, no press is no cast, an
+// empty hand's button casts nothing, the left hand casts on RMB and becomes
+// the beam hand, a glyph reload re-speaks the hands, and an empty key refuses.
+Status GateSpellHands(Ctx& c, std::string& detail) {
+  World& world = c.world;
+  const IVec3 wo = world.WindowOrigin();
+  const int sx = wo.x * (int)kChunk + 72, sz = wo.z * (int)kChunk + 72;
+  const int h = World::TerrainHeight(sx, sz, kDefaultSeed);
+  support::TickRig rig(c, 9700, IVec3{sx >> 4, (h + 40) >> 4, sz >> 4});
+  GlyphLibrary& lib = rig.Glyphs();
+  std::string gerr;
+  if (!LoadGlyphs(AssetDir() + "/spells/glyphs.json", c.mats, lib, gerr)) {
+    std::printf("spell-hands: FAIL (glyph load: %s)\n", gerr.c_str());
+    detail = "glyph load failed";
+    return Status::Fail;
+  }
+  bool ok = true;
+  int checks = 0;
+  auto check = [&](bool cond, const std::string& what) {
+    checks++;
+    if (!cond) {
+      ok = false;
+      std::printf("spell-hands: FAILED %s\n", what.c_str());
+    }
+  };
+  // The VM casts nothing without its library (main.cpp sets the game's).
+  rig.Session().spells.SetLibrary(&lib);
+  PlayerCaster& pc = rig.Session().caster;
+  pc.inventory.GrantAllAndBind(lib);
+  pc.grimoire.pages.push_back(GrimoirePage{"hands-firebolt", {"fire", "bolt"}, false});
+  pc.grimoire.pages.push_back(GrimoirePage{"hands-sandshot", {"sand", "projectile"}, false});
+  pc.inventory.BindPage(0, "hands-firebolt");
+  pc.inventory.BindPage(1, "hands-sandshot");
+  pc.inventory.Bind(2, -1);
+  pc.mana.manaMax = 1000000;
+  pc.mana.mana = 1000000;
+
+  check(pc.EquipHand(lib, 0, 0) && pc.hand[0].Equipped() && pc.hand[0].name == "hands-firebolt",
+        "the right hand takes the page on key 1");
+  check(!pc.EquipHand(lib, 1, 2) && !pc.hand[1].Equipped(), "an empty key puts nothing in a hand");
+
+  auto tickWith = [&](uint32_t pressed) {
+    pc.lastOutcome = CastOutcome::Nothing;
+    const int32_t before = pc.mana.mana;
+    support::RunTicks(rig, 1, [&](uint32_t, support::TickOps& o) {
+      o.input.SetPressed(pressed, pressed != 0);
+      o.input.SetHeld(pressed, pressed != 0);
+    });
+    return std::pair<bool, int32_t>{pc.lastOutcome != CastOutcome::Nothing,
+                                    before - pc.mana.mana};
+  };
+  tickWith(0);   // settle: nothing pressed
+  int casts = 0;
+  for (int i = 0; i < 3; i++) {
+    const auto [cast, spent] = tickWith(TB_ATTACK);
+    if (cast && spent > 0) casts++;
+    tickWith(0);
+  }
+  check(casts == 3, Format("three LMB presses are three right-hand casts (%d)", casts));
+  check(pc.hand[0].Equipped(), "the spell is still in the right hand after casting");
+  check(!tickWith(0).first, "no press, no cast");
+  check(!tickWith(TB_ALT).first, "RMB with nothing in the left hand casts nothing");
+  check(pc.EquipHand(lib, 1, 1), "the left hand takes the page on key 2");
+  {
+    const auto [cast, spent] = tickWith(TB_ALT);
+    check(cast && spent > 0 && pc.beamHand == 1, "RMB casts the left hand's spell");
+  }
+  pc.RefreshHands(lib);
+  check(pc.hand[0].Equipped() && pc.hand[1].Equipped() && pc.hand[1].name == "hands-sandshot",
+        "a glyph reload re-speaks both hands");
+  pc.ClearHand(0);
+  check(!tickWith(TB_ATTACK).first, "a hand whose spell was let go casts nothing");
+
+  detail = Format("%d checks", checks);
+  std::printf("spell-hands: %s (%d casts; %d checks)\n", ok ? "PASS" : "FAIL", casts, checks);
+  return ok ? Status::Pass : Status::Fail;
+}
+
 }  // namespace
 
 const std::vector<Gate>& SpellGates() {
@@ -2185,6 +2269,9 @@ const std::vector<Gate>& SpellGates() {
       // M3 triggers: CPU checks plus real flights through the same open-air
       // window fixture `spells` check 8 uses; it leaves nothing behind.
       {"spell-timing", "spell", {}, false, GateSpellTiming},
+      // Spells in hand: the hand's button casts its spell on every press,
+      // through the real tick. Its own rig on the harness window; no deps.
+      {"spell-hands", "spell", {}, false, GateSpellHands},
       // No deps: CPU-only over the glyph library and the oracle file.
       {"spells-oracle", "spell", {}, false, GateSpellsOracle},
   };

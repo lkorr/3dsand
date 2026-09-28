@@ -280,4 +280,66 @@ struct PlayerCaster {
     selected = -1;
     Recompile(lib);
   }
+
+  // ---- SPELLS IN HAND (dual wielding, 2026-09-27) ---------------------------
+  //
+  // A spell is EQUIPPED into a hand the way an item is: Z opens the spell bar,
+  // the number row / wheel moves along it (`selected`), and Q / E put the
+  // selected slot's spell into the left / right hand. From then on that hand's
+  // button (LMB right, RMB left — the item rule) casts it, as often as it is
+  // pressed: the compile below is made once at equip and a cast does not
+  // consume it. Mana is the only rate limit.
+  //
+  // The hand holds a SNAPSHOT of the slot, not a pointer to it: rebinding the
+  // key afterwards does not change what is already in your hand, exactly as
+  // moving an item on the hotbar does not change what you are holding.
+  // `slot` is kept so a glyph reload (R), which re-indexes every glyph, can
+  // re-speak it by name (RefreshHands).
+  struct HandSpell {
+    int slot = -1;          // the glyph slot it came from; -1 = no spell
+    std::string name;       // the glyph's id or the page's name, at equip
+    SpellStack stack;
+    CastList compiled;
+    bool Equipped() const { return slot >= 0 && !compiled.Empty(); }
+  };
+  HandSpell hand[2];        // indexed by HandIndex: 0 right, 1 left
+  // The hand that cast last: a held beam follows ITS button and leaves from
+  // it (the VM keeps one beam per caster).
+  int beamHand = 0;
+
+  // Speak `slot` into hand `h` (0 right, 1 left). False when the slot says
+  // nothing castable; the hand is then left as it was.
+  bool EquipHand(const GlyphLibrary& lib, int h, int slot) {
+    if (h < 0 || h > 1) return false;
+    PlayerCaster scratch;
+    scratch.inventory = inventory;
+    scratch.grimoire = grimoire;
+    if (!scratch.SpeakSlot(lib, slot) || scratch.compiled.Empty()) return false;
+    hand[h].slot = slot;
+    if (inventory.KindAt(slot) == SlotKind::Page) {
+      hand[h].name = inventory.PageAt(slot);
+    } else {
+      const GlyphDef* g = lib.At(inventory.At(slot));
+      hand[h].name = g ? g->id : std::string("?");
+    }
+    hand[h].stack = scratch.stack;
+    hand[h].compiled = scratch.compiled;
+    return true;
+  }
+  void ClearHand(int h) {
+    if (h >= 0 && h <= 1) hand[h] = HandSpell{};
+  }
+  void ClearHands() {
+    ClearHand(0);
+    ClearHand(1);
+  }
+  // After a glyph reload: re-speak each hand from its slot (indices moved),
+  // dropping a hand whose slot no longer says anything.
+  void RefreshHands(const GlyphLibrary& lib) {
+    for (int h = 0; h < 2; h++) {
+      const int slot = hand[h].slot;
+      if (slot < 0) continue;
+      if (!EquipHand(lib, h, slot)) ClearHand(h);
+    }
+  }
 };

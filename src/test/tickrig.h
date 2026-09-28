@@ -57,6 +57,10 @@ struct TickOps {
   std::vector<ExplosionOp> exps;
   std::vector<CellOp> cells;
   std::vector<ParticleSpawn> spawns;
+  // The command the harness body plays this tick. Empty by default: the body
+  // is a camera nobody is playing. A gate that asserts an INPUT path (a
+  // button's press edge reaching the tick) sets the bits it means.
+  TickInput input{};
 };
 
 // The engine a rig ticks: what TickAuthorityCtx takes by reference and a
@@ -90,6 +94,8 @@ class TickRig {
 
   const TickEngine& Engine() const { return e_; }
   PlayerSession& Session() { return *session_; }
+  // The glyph library the tick casts with. Empty until a gate loads it.
+  GlyphLibrary& Glyphs() { return glyphs_; }
   TickAuthorityCtx& Authority() { return *w_; }
   // What the last tick submitted, after every system authored into it.
   const OpBatch& LastBatch() const { return batch_; }

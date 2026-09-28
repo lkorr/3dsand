@@ -780,6 +780,17 @@ struct UIState {
   // Which bound key's spell is SELECTED (PLAN_spell_graph §0b: a number key
   // selects, right-click casts, the selection persists). -1 = nothing held.
   int glyphSelected = -1;
+  // THE SPELL BAR (Z; spells in hand): per bound key, the colour its spell's
+  // flight is drawn in (0xAABBGGRR, 0 = none) and the glyph's sort for its
+  // engraving (-1 for a page), parallel to glyphSlots.
+  std::vector<uint32_t> glyphSlotColors;
+  std::vector<int> glyphSlotTypes;
+  // The spell in each hand (0 right, 1 left): its name ("" = none), whether it
+  // is a page, its colour, and the glyph sort for a one-glyph spell.
+  std::string handSpell[2];
+  bool handSpellPage[2] = {false, false};
+  uint32_t handSpellColor[2] = {0, 0};
+  int handSpellType[2] = {0, 0};
   std::string spellNote;                       // "saved as ...", "the stack is full"
   float spellNoteAge = 99.0f;
 

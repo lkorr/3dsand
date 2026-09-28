@@ -332,6 +332,14 @@ constexpr uint64_t kPlayerCasterId = 0x9134A5EEu;
 // middle of the player's face.
 Vec3 LaserMuzzle(const Player& player, const Camera& cam);
 
+// Where a SPELL IN HAND sits (PlayerCaster::hand): the hand part's centre on
+// a spawned rig, else (fly mode, no body, a hand that is gone) LaserMuzzle's
+// point mirrored to that hand's side. ONE definition for the cast origin (the
+// tick, which adds a step forward so the flight leaves the fist) and the
+// hand's glow (the render block), so the light is where the spell comes out.
+Vec3 SpellHandPoint(const PlayerAvatar& avatar, const Player& player,
+                    const Camera& cam, Hand h);
+
 // Which figure slot a rig part belongs to, for the character screen and for a
 // spell aimed at a body part. A pure function of the authored part name and
 // tag; lives here rather than in main.cpp because both the tick body and the
@@ -1067,6 +1075,9 @@ struct HandNow {
   const ItemDef* item = nullptr;   // what the kit's hand slot holds, or null
   bool weapon = false;             // ItemKind::Melee
   bool vessel = false;             // a container (flask, pouch)
+  // An EMPTY hand holding an equipped spell (PlayerCaster::hand): its button
+  // casts, so it never punches. Never on a ruined arm.
+  bool spell = false;
   // THIS hand may begin a strike: the hands are up, the arm is whole, and it
   // holds a weapon — or is EMPTY and one of the unarmed compass's styles can
   // be thrown with it (a fist round a flask does not punch).

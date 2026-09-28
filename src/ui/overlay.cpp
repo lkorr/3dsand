@@ -1678,8 +1678,8 @@ void Overlay::DrawDevMagic(UIState& s) {
       ImGui::TextDisabled("%s", s.spellVerdict.c_str());
     } else {
       ImGui::TextDisabled("held: (nothing)");
-      ImGui::TextDisabled("a number selects a bound spell, RMB casts it,");
-      ImGui::TextDisabled("Backspace clears");
+      ImGui::TextDisabled("Z opens the spell bar, a number selects,");
+      ImGui::TextDisabled("Q / E put it in a hand; RMB / LMB cast it");
     }
     if (!s.glyphSlots.empty()) {
       for (int bank = 0; bank < 2; bank++) {

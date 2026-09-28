@@ -9784,10 +9784,20 @@ int main(int argc, char** argv) {
       const double dy = g_scrollY;
       g_scrollY = 0.0;
       if (dy != 0.0 && !ui.inventoryOpen && !overlay.WantsMouse() && captured) {
-        if (camMode != CameraMode::First)
+        if (camMode != CameraMode::First) {
           tpRig.Zoom((float)dy);
-        else
+        } else if (ui.magicMode) {
+          // The spell bar: along the bank on screen, wrapping, as the item
+          // hotbar scrolls.
+          const int step = dy > 0 ? -1 : 1;
+          const int cur = caster.selected >= 0 ? caster.selected : 0;
+          const int bank = cur / kGlyphBank;
+          const int col = ((cur % kGlyphBank) + step + kGlyphBank) % kGlyphBank;
+          caster.SelectSlot(glyphs, bank * kGlyphBank + col);
+          caster.selected = bank * kGlyphBank + col;   // an empty key is still a place on the bar
+        } else {
           hotbar.Scroll(dy > 0 ? -1 : 1);
+        }
       }
     }
     double mx, my;
@@ -9876,12 +9886,12 @@ int main(int argc, char** argv) {
         }
     } else {
       // THE PAGE IS THE INTERFACE (PLAN_spell_graph §0b). Pressing a number
-      // SELECTS the spell bound to that key — a grimoire page, or a single
-      // glyph as a one-word spell — and right-click CASTS it. The selection
-      // persists across casts, so a bound spell fires as often as you click;
-      // another key switches, Backspace clears. Building the sentence happens
-      // on the page's tree, which is a surface with room for it; the number row
-      // used to be the only authoring tool there was, and it was a bad one.
+      // SELECTS the spell bound to that key on the spell bar — a grimoire
+      // page, or a single glyph as a one-word spell — and Q / E put it into a
+      // hand, whose button then casts it as often as it is clicked (spells in
+      // hand, below). Building the sentence happens on the page's tree, which
+      // is a surface with room for it; the number row used to be the only
+      // authoring tool there was, and it was a bad one.
       //
       // Edge-triggered still: a held key must not re-select every frame and
       // wipe a half-drained mana readout. TWO BANKS (plan §12a): `1`-`0` is
@@ -9892,14 +9902,18 @@ int main(int argc, char** argv) {
         // GLFW's number row is contiguous 1..9 then 0, and slot 10 is the 0
         // key, matching the strip the HUD prints.
         int k = (i == 9) ? GLFW_KEY_0 : (GLFW_KEY_1 + i);
-        if (captured && eGlyph[i].Pressed(key(k)))
+        if (captured && eGlyph[i].Pressed(key(k))) {
           caster.SelectSlot(glyphs, i + (bankB ? kGlyphBank : 0));
+          caster.selected = i + (bankB ? kGlyphBank : 0);   // empty keys are places on the bar too
+        }
       }
     }
-    if (captured && eZ.Pressed(key(GLFW_KEY_Z))) {
-      ui.magicMode = !ui.magicMode;
-      if (!ui.magicMode) caster.Clear(glyphs);   // leaving mode abandons the spell
-    }
+    // Z OPENS THE SPELL BAR (spells in hand, 2026-09-27): the HUD's strip
+    // shows the bound spells in place of the items, the number row and the
+    // wheel move along it, and Q / E put the selected spell into a hand. The
+    // selection survives closing the bar; what is in your hands is unaffected
+    // by either (caster.h PlayerCaster::hand).
+    if (captured && eZ.Pressed(key(GLFW_KEY_Z))) ui.magicMode = !ui.magicMode;
     // Abandon a half-spoken spell. Backspace rather than a letter: it is the
     // universal "undo what I just typed" key and the left hand is on WASD.
     if (captured && eBack.Pressed(key(GLFW_KEY_BACKSPACE))) caster.Clear(glyphs);
@@ -10149,7 +10163,7 @@ int main(int argc, char** argv) {
       const Tuning::Player& tp = CurrentTuning().player;
       const bool eDown = captured && key(GLFW_KEY_G);
       const bool throwable = [&] {
-        if (ui.tool != UIState::kToolMelee || ui.magicMode) return false;
+        if (ui.tool != UIState::kToolMelee) return false;
         for (int hk = 0; hk < kHands; hk++) {
           const ItemDef* d = items.Of(kit.equip.InHand(HandAt(hk)));
           if (d && d->IsContainer() && ContainerThrowable(*d)) return true;
@@ -10613,6 +10627,7 @@ int main(int argc, char** argv) {
               caster.inventory.Bind(i, glyphs.Find(boundNames[i]));
             }
             caster.Clear(glyphs);
+            caster.RefreshHands(glyphs);   // re-speak the hands' spells by the new indices
             std::printf("glyphs reloaded (%zu)\n", glyphs.glyphs.size());
           } else {
             std::fprintf(stderr, "glyph reload failed:\n%s", gerr.c_str());
@@ -11032,11 +11047,9 @@ int main(int argc, char** argv) {
     // does that for all of them at once, and guarantees the half nobody wrote
     // by hand: an edge reaches EXACTLY ONE tick, never zero and never two.
     //
-    // THE CAST KEY is RMB, and only while magic mode is on. Chosen over Enter
-    // for the right reason: the left hand lives on WASD and the right hand is
-    // already on the mouse for aiming. A spell is AIMED, so the cast belongs
-    // on the aiming hand; magic mode is what keeps this from stealing
-    // brush-erase.
+    // THERE IS NO CAST KEY any more (spells in hand, 2026-09-27): a spell is
+    // put into a hand from the spell bar and that hand's own button casts it
+    // (session.cpp SPELLS IN HAND reads TB_ATTACK / TB_ALT). TB_CAST is unused.
     // PLAY (UIState::devControls off) has no prefab or mob tool: the panel's
     // radio buttons can still set one for the frame before the PLAY block
     // below forces the hands back, so the click is gated here too.
@@ -11050,7 +11063,6 @@ int main(int argc, char** argv) {
     // The feeder never derives an edge from a held bit, so without this the
     // left hand could hold but never begin anything.
     if (mouseRClick) feeder.Press(TB_ALT);
-    if (captured && ui.magicMode && mouseRClick) feeder.Press(TB_CAST);
     if (captured && ui.magicMode && eDel.Pressed(key(GLFW_KEY_DELETE)))
       feeder.Press(TB_DROP);
     // The DEV PANEL asks for the same two things through UIState, so its
@@ -11083,7 +11095,9 @@ int main(int argc, char** argv) {
     // reads the same slots itself (session.h HandsNow); these copies are for
     // the frame's own questions: which button a vessel is on, where its pour
     // marker goes, what the HUD says.
-    const bool handsUp = ui.tool == UIState::kToolMelee && !ui.magicMode;
+    // The spell bar (magic mode) does not take the buttons: a spell is cast
+    // from the hand it was put in, by that hand's button (spells in hand).
+    const bool handsUp = ui.tool == UIState::kToolMelee;
     auto handDef = [&](Hand h) -> const ItemDef* {
       const ItemDef* d = items.Of(kit.equip.InHand(h));
       return d && EquipSlotAccepts(EquipSlotOfHand(h), d->kind) ? d : nullptr;
@@ -11324,12 +11338,71 @@ int main(int argc, char** argv) {
         const bool press = pass == 0 ? ePress : qPress;
         if (!press) continue;
         const Hand h = pass == 0 ? Hand::Right : Hand::Left;
+        const int hk = HandIndex(h);
+        // ---- THE SPELL BAR IS OPEN: the selected spell into the hand -------
+        //
+        // A spell needs an EMPTY hand: whatever the hand holds is put away
+        // into the first free hotbar slot, else the pack (a kit move, so
+        // nothing is lost), and the key refuses if there is nowhere to put
+        // it. On an empty key, or pressed again for the spell already there,
+        // the key lets the hand's spell go.
+        if (ui.magicMode) {
+          const int slot = caster.selected;
+          const bool slotHas =
+              slot >= 0 && caster.inventory.KindAt(slot) != SlotKind::None;
+          std::string msg;
+          if (!slotHas || caster.hand[hk].slot == slot) {
+            if (caster.hand[hk].Equipped()) {
+              msg = "you let the " + caster.hand[hk].name + " go from your " +
+                    HandName(h) + " hand";
+              caster.ClearHand(hk);
+            } else {
+              msg = "no spell on that key";
+            }
+          } else {
+            bool free = kit.equip.InHand(h).Empty();
+            if (!free) {
+              const std::string what = kit.equip.InHand(h).name;
+              const KitRef hand{KitSpace::Equip, EquipSlotOfHand(h)};
+              KitRef to{};
+              for (int i = 0; i < kItemSlots && to.space == KitSpace::None; i++)
+                if (hotbar.slots[i].Empty()) to = KitRef{KitSpace::Hotbar, i};
+              for (int i = 0; i < Bag::kSlots && to.space == KitSpace::None; i++)
+                if (kit.bag.slots[i].Empty()) to = KitRef{KitSpace::Bag, i};
+              if (to.space != KitSpace::None &&
+                  avatar.KitMove(hand, to, items) == MoveResult::Ok) {
+                free = true;
+                msg = "you put away the " + what + "; ";
+              } else {
+                msg = std::string("no room to put away the ") + what;
+              }
+            }
+            if (free) {
+              if (caster.EquipHand(glyphs, hk, slot)) {
+                msg += caster.hand[hk].name + " in your " + HandName(h) + " hand (" +
+                       (h == Hand::Right ? "LMB" : "RMB") + " casts)";
+                session.lastHand = h;
+              } else {
+                msg += "that spell says nothing castable";
+              }
+            }
+          }
+          ui.kitMessage = msg;
+          ui.kitMessageAge = 0.0f;
+          continue;
+        }
         const KitRef hot{KitSpace::Hotbar, hotbar.selected};
         const KitRef hand{KitSpace::Equip, EquipSlotOfHand(h)};
         const bool hotEmpty = hotbar.Selected().Empty();
         const bool handEmpty = kit.equip.InHand(h).Empty();
         std::string msg;
-        if (hotEmpty && handEmpty) {
+        if (hotEmpty && handEmpty && caster.hand[hk].Equipped()) {
+          // An empty hotbar slot on a spell hand: lower the spell, as it
+          // would put an item away.
+          msg = "you let the " + caster.hand[hk].name + " go from your " +
+                HandName(h) + " hand";
+          caster.ClearHand(hk);
+        } else if (hotEmpty && handEmpty) {
           msg = std::string("nothing to put in your ") + HandName(h) + " hand";
         } else {
           const std::string what =
@@ -11346,6 +11419,12 @@ int main(int argc, char** argv) {
         ui.kitMessage = msg;
         ui.kitMessageAge = 0.0f;
       }
+      // AN ITEM IN A HAND DISPLACES ITS SPELL, however it got there (Q / E
+      // above, a drag on the character screen, a pickup): the hand holds one
+      // thing, and the thing you just put in it is the one you meant.
+      for (int hk = 0; hk < kHands; hk++)
+        if (caster.hand[hk].slot >= 0 && !kit.equip.InHand(HandAt(hk)).Empty())
+          caster.ClearHand(hk);
     }
     feeder.SetSelection(ui.tool, hotbar.selected);
     spanInput.Close();
@@ -12517,6 +12596,77 @@ int main(int argc, char** argv) {
         ui.glyphSlotReadouts.push_back("");
       }
       ui.glyphSelected = caster.selected;
+      // ---- THE SPELL BAR AND THE HANDS' SPELLS (spells in hand) -----------
+      //
+      // A spell's COLOUR is its flight's (the projectile block below): the
+      // first matter it carries, else its delivery's look. One rule, so the
+      // key on the bar, the light in the fist and the bolt that leaves it are
+      // the same colour. A key's colour needs a compile, so it is cached per
+      // key on what the key says and the glyph epoch.
+      {
+        auto spellColor = [&](const CastList& l) -> uint32_t {
+          if (l.casts.empty()) return 0;
+          const SpellCast& c = l.casts[0];
+          const uint32_t tint = CastTintMaterial(c);
+          const uint32_t base = tint != 0 && tint < mats.size()
+                                    ? mats[tint].gpu.color0
+                                    : glyphs.Delivery(c.delivery.glyph).look.color;
+          return 0xFF000000u | (base & 0x00FFFFFFu);
+        };
+        auto glyphType = [&](const std::vector<int>& spoken) {
+          const GlyphDef* g = spoken.size() == 1 ? glyphs.At(spoken[0]) : nullptr;
+          return g ? (int)g->sort : -1;
+        };
+        static std::string keySaid[kGlyphSlots];
+        static uint32_t keyColor[kGlyphSlots];
+        static int keyType[kGlyphSlots];
+        static uint32_t keyEpoch = ~0u;
+        if (keyEpoch != glyphEpoch) {
+          keyEpoch = glyphEpoch;
+          for (std::string& k : keySaid) k = "\x01";   // never a real binding
+        }
+        ui.glyphSlotColors.assign(kGlyphSlots, 0);
+        ui.glyphSlotTypes.assign(kGlyphSlots, -1);
+        for (int i = 0; i < kGlyphSlots; i++) {
+          const SlotKind k = caster.inventory.KindAt(i);
+          std::string said = std::to_string((int)k) + ":" +
+                             (k == SlotKind::Page ? caster.inventory.PageAt(i)
+                                                  : std::to_string(caster.inventory.At(i)));
+          // A page's words are what it says: editing the page recolours
+          // its key (nested pages still wait for the next epoch).
+          if (k == SlotKind::Page) {
+            const int pi = caster.grimoire.Find(caster.inventory.PageAt(i));
+            if (pi >= 0)
+              for (const std::string& w : caster.grimoire.pages[pi].words) said += "\x1f" + w;
+          }
+          if (said != keySaid[i]) {
+            keySaid[i] = said;
+            keyColor[i] = 0;
+            keyType[i] = -1;
+            if (k != SlotKind::None) {
+              PlayerCaster tmp;
+              tmp.inventory = caster.inventory;
+              tmp.grimoire = caster.grimoire;
+              tmp.SpeakSlot(glyphs, i);
+              keyColor[i] = spellColor(tmp.compiled);
+              keyType[i] = k == SlotKind::Page ? -1 : glyphType(tmp.stack.spoken);
+            }
+          }
+          ui.glyphSlotColors[i] = keyColor[i];
+          ui.glyphSlotTypes[i] = keyType[i];
+        }
+        for (int hk = 0; hk < kHands; hk++) {
+          const PlayerCaster::HandSpell& hs = caster.hand[hk];
+          const bool on = hs.Equipped();
+          ui.handSpell[hk] = on ? hs.name : std::string();
+          ui.handSpellPage[hk] =
+              on && caster.inventory.KindAt(hs.slot) == SlotKind::Page &&
+              caster.inventory.PageAt(hs.slot) == hs.name;
+          ui.handSpellColor[hk] = on ? spellColor(hs.compiled) : 0;
+          ui.handSpellType[hk] = on ? glyphType(hs.stack.spoken) : -1;
+          if (ui.handSpellType[hk] < 0 && on) ui.handSpellPage[hk] = true;
+        }
+      }
       ui.glyphBankB = captured && ui.magicMode &&
                       (key(GLFW_KEY_LEFT_SHIFT) || key(GLFW_KEY_RIGHT_SHIFT));
       caster.noteAge += dt;
@@ -14514,6 +14664,44 @@ int main(int argc, char** argv) {
               break;
             }
           }
+        }
+        // ---- THE SPELL IN THE FIST (spells in hand) -------------------------
+        //
+        // A hand holding a spell holds its light: a breathing core in the
+        // spell's colour (the colour its flight is drawn in, above) with motes
+        // circling the hand, and a flare for a moment after each cast. Drawn
+        // at SpellHandPoint, the point the tick casts from, so the light is
+        // where the bolt comes out. Presentation only: frame time, no tick
+        // state. First person too: the arms are kept in view.
+        for (int hk = 0; hk < kHands; hk++) {
+          const uint32_t col = ui.handSpellColor[hk];
+          if (col == 0 || ui.handSpell[hk].empty()) continue;
+          if (!kit.equip.InHand(HandAt(hk)).Empty()) continue;
+          const Hand h = HandAt(hk);
+          const Vec3 at = SpellHandPoint(avatar, player, cam, h);
+          // The flare: the core swells for ~0.2 s after this hand's press.
+          static double flareAt[2] = {-9.0, -9.0};
+          static bool btnPrev[2] = {false, false};
+          const bool btn = captured && (hk == 0 ? mouseL : mouseR);
+          if (btn && !btnPrev[hk]) flareAt[hk] = tNow;
+          btnPrev[hk] = btn;
+          const float flare = std::clamp(1.0f - (float)(tNow - flareAt[hk]) / 0.2f, 0.0f, 1.0f);
+          const float phase = (float)hk * 2.1f;
+          const float breathe = 1.0f + 0.15f * std::sin(tNow * 4.0f + phase);
+          push(at, (0.32f * breathe) * (1.0f + 1.2f * flare), col, 1.6f + 2.5f * flare);
+          // Three motes on tilted orbits round the hand, a slower wisp rising.
+          static const Vec3 kOrbitU[3] = {{1, 0, 0}, {0, 0.7071f, 0.7071f}, {0.7071f, 0.7071f, 0}};
+          static const Vec3 kOrbitW[3] = {{0, 1, 0}, {1, 0, 0}, {0, -0.7071f, 0.7071f}};
+          for (int k = 0; k < 3; k++) {
+            const float ang = tNow * (3.0f + 0.9f * (float)k) + phase + (float)k * 2.094f;
+            const float rr = 0.75f + 0.1f * std::sin(tNow * 5.0f + (float)k);
+            if (!push(at + (kOrbitU[k] * std::cos(ang) + kOrbitW[k] * std::sin(ang)) * rr,
+                      0.1f, scaleColor(col, 1.25f), 2.2f))
+              break;
+          }
+          const float rise = std::fmod(tNow * 0.9f + phase, 1.0f);
+          push(at + Vec3{0.15f * std::sin(tNow * 7.0f + phase), 0.3f + rise * 1.1f, 0.0f},
+               0.12f * (1.0f - rise), scaleColor(col, 0.9f), 1.4f * (1.0f - rise));
         }
         // Bombs are debris bodies and the debris path draws them; the fuse
         // sparks on top, faster as it runs down.

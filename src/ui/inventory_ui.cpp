@@ -4057,6 +4057,33 @@ void DrawInventoryScreen(UIState& s) {
 // The number each slot answers to sits in its top-left corner, and the
 // selected slot's name floats above the strip for a moment after it changes
 // -- the way you learn what you just switched to without looking down.
+// A SPELL'S LIGHT in a slot: a pool of its colour that breathes, under the
+// engraving. The HUD's echo of the light in the fist (main.cpp, the hand
+// glow) — same colour, same slow pulse.
+static void SpellLight(ImDrawList* dl, ImVec2 mid, uint32_t color, float strength) {
+  if (color == 0) return;
+  const float t = (float)ImGui::GetTime();
+  const float breathe = 0.75f + 0.25f * std::sin(t * 3.0f);
+  const ImU32 c = (color & 0x00FFFFFFu);
+  dl->AddCircleFilled(mid, kSlot * 0.42f, c | ((ImU32)(60 * strength * breathe) << 24), 20);
+  dl->AddCircleFilled(mid, kSlot * 0.26f, c | ((ImU32)(110 * strength * breathe) << 24), 16);
+}
+
+// A bound spell drawn in a slot: its light, then a glyph's engraving or the
+// page mark.
+static void SpellContents(const UIState& s, ImDrawList* dl, ImVec2 at, const std::string& id,
+                          bool page, int type, uint32_t color, float strength) {
+  const ImVec2 mid(at.x + kSlot * 0.5f, at.y + kSlot * 0.5f);
+  SpellLight(dl, mid, color, strength);
+  if (page) {
+    PageContents(dl, at);
+  } else if (const UIState::GlyphUI* g = FindGlyph(s, id)) {
+    GlyphContents(dl, at, *g);
+  } else {
+    ui::GlyphArt(dl, at, kSlot, color, type < 0 ? 0 : type);
+  }
+}
+
 void DrawHudHotbar(const UIState& s, ImDrawList* dl) {
   const int n = (int)s.hotbarSlots.size();
   if (n == 0) return;
@@ -4070,11 +4097,61 @@ void DrawHudHotbar(const UIState& s, ImDrawList* dl) {
   // says so by dimming its selection rather than lying about what is held.
   const bool live = s.tool == UIState::kToolMelee && !s.magicMode;
   const int sel = s.itemSelected;
+  // THE SPELL BAR (Z): the bound keys in the items' place, same geometry, so
+  // the number row and the wheel move along it the way they move along the
+  // items. It shows the bank the selection is in, or bank B while Shift is
+  // held (Shift+number reaches it).
+  const bool spellBar = s.magicMode && !s.glyphSlots.empty();
 
   dl->AddRectFilled(ImVec2(x0 - 6, y0 - 6), ImVec2(x0 + w + 6, y0 + kSlot + 6),
-                    IM_COL32(0, 0, 0, 90));
+                    spellBar ? IM_COL32(20, 8, 40, 120) : IM_COL32(0, 0, 0, 90));
   ImGui::PushFont(ui::FontSmall());
-  for (int i = 0; i < n; i++) {
+  if (spellBar) {
+    const int bank = s.glyphBankB ? 1 : (s.glyphSelected >= 10 ? 1 : 0);
+    for (int c = 0; c < n && c < 10; c++) {
+      const int i = bank * 10 + c;
+      if (i >= (int)s.glyphSlots.size()) break;
+      const ImVec2 at(x0 + c * (kSlot + kGap), y0);
+      const bool filled = !s.glyphSlots[i].empty();
+      const bool isSel = i == s.glyphSelected;
+      const ui::SlotLook look = isSel    ? ui::SlotLook::Hover
+                                : filled ? ui::SlotLook::Filled
+                                         : ui::SlotLook::Empty;
+      ui::SlotSurface(dl, at, kSlot, look, isSel);
+      SlotRim(dl, at, look);
+      if (filled) {
+        const bool page = i < (int)s.glyphSlotKinds.size() && s.glyphSlotKinds[i] == 2;
+        const uint32_t col = i < (int)s.glyphSlotColors.size() ? s.glyphSlotColors[i] : 0;
+        const int type = i < (int)s.glyphSlotTypes.size() ? s.glyphSlotTypes[i] : -1;
+        SpellContents(s, dl, at, s.glyphSlots[i], page, type, col, isSel ? 1.0f : 0.6f);
+      }
+      // A key already in a hand says which: R / L in the bottom corner.
+      for (int hk = 0; hk < 2; hk++)
+        if (!s.handSpell[hk].empty() && s.handSpell[hk] == s.glyphSlots[i])
+          ui::ShadowText(dl, ImVec2(at.x + (hk == 1 ? 4 : kSlot - 10), at.y + kSlot - 16),
+                         ui::ColGoldHi(), hk == 1 ? "L" : "R");
+      char key[6];
+      std::snprintf(key, sizeof key, bank ? "S%d" : "%d", (c + 1) % 10);
+      ui::ShadowText(dl, ImVec2(at.x + 4, at.y + 2),
+                     isSel ? ui::ColGoldHi() : Fade(ui::ColParch(), 0.7f), key);
+    }
+    const int sc = s.glyphSelected - bank * 10;
+    if (sc >= 0 && sc < 10 && sc < n) {
+      const ImVec2 at(x0 + sc * (kSlot + kGap), y0);
+      dl->AddRect(ImVec2(at.x - 3, at.y - 3), ImVec2(at.x + kSlot + 3, at.y + kSlot + 3),
+                  ui::ColGoldHi(), 0.0f, 0, 2.0f);
+    }
+    // Above the bar: the selected spell's name and what the keys do.
+    const std::string& nm = s.glyphSelected >= 0 && s.glyphSelected < (int)s.glyphSlots.size()
+                                ? s.glyphSlots[s.glyphSelected]
+                                : std::string();
+    const std::string line = (nm.empty() ? std::string("spells") : nm) +
+                             "   -   Q left hand  .  E right hand  .  Z close";
+    const ImVec2 ts = ImGui::CalcTextSize(line.c_str());
+    ui::ShadowText(dl, ImVec2(std::floor((disp.x - ts.x) * 0.5f), y0 - 10 - ts.y),
+                   Fade(ui::ColParch(), 0.9f), line.c_str());
+  }
+  for (int i = 0; i < n && !spellBar; i++) {
     const UIState::KitSlotUI& item = s.hotbarSlots[i];
     const ImVec2 at(x0 + i * (kSlot + kGap), y0);
     const bool filled = !item.name.empty();
@@ -4133,14 +4210,18 @@ void DrawHudHotbar(const UIState& s, ImDrawList* dl) {
     const UIState::KitSlotUI& item = s.equipSlots[idx];
     const float hx = side == 0 ? x0 - 18 - kSlot : x0 + w + 18;
     const ImVec2 at(hx, y0);
-    const bool filled = !item.name.empty();
+    const bool spell = item.name.empty() && !s.handSpell[hk].empty();
+    const bool filled = !item.name.empty() || spell;
     const ui::SlotLook look = filled ? ui::SlotLook::Filled : ui::SlotLook::Empty;
     dl->AddRectFilled(ImVec2(at.x - 6, at.y - 6), ImVec2(at.x + kSlot + 6, at.y + kSlot + 6),
                       IM_COL32(0, 0, 0, 90));
     ui::SlotSurface(dl, at, kSlot, look, false);
     SlotRim(dl, at, look);
     const ImVec2 mid(at.x + kSlot * 0.5f, at.y + kSlot * 0.5f);
-    if (filled) {
+    if (spell) {
+      SpellContents(s, dl, at, s.handSpell[hk], s.handSpellPage[hk], s.handSpellType[hk],
+                    s.handSpellColor[hk], 1.0f);
+    } else if (filled) {
       ui::DrawSpriteCentered(dl, ItemIcon(item.kind), ImVec2(mid.x + 1, mid.y + 1),
                              Fade(ui::ColInk(), 0.7f));
       ui::DrawSpriteCentered(dl, ItemIcon(item.kind), mid,
@@ -4167,11 +4248,13 @@ void DrawHudHotbar(const UIState& s, ImDrawList* dl) {
     const int mode = s.vesselModeShown[hk];
     if (mode >= 0 && mode < 3)
       std::snprintf(cap, sizeof cap, "%s %s", hk == 1 ? "RMB" : "LMB", kModeName[mode]);
+    else if (spell)
+      std::snprintf(cap, sizeof cap, "%s cast", hk == 1 ? "RMB" : "LMB");
     else
       std::snprintf(cap, sizeof cap, "%s", hk == 1 ? "RMB" : "LMB");
     const ImVec2 cs = ImGui::CalcTextSize(cap);
     ui::ShadowText(dl, ImVec2(std::floor(at.x + (kSlot - cs.x) * 0.5f), at.y - cs.y - 4),
-                   Fade(ui::ColParch(), live ? 0.85f : 0.4f), cap);
+                   Fade(ui::ColParch(), live || spell ? 0.85f : 0.4f), cap);
   }
   if (live && sel >= 0 && sel < n) {
     // A gold frame round the selection, 2 px, outside the rim so it never
