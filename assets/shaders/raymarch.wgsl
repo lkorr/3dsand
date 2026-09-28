@@ -2659,7 +2659,14 @@ fn microNormalToWorld(n : vec3f, flags : u32, h : u32) -> vec3f {
   return n;
 }
 
-const SUBOCC_SKIP : bool = false;
+// ON since 2026-09-28. The refutation kept at the skip site below was measured
+// at 168 registers with the plant evaluation still inside the DDA loop; after
+// the two-phase detail resolve (128 registers) the same flip, one binary, one
+// boot per arm, camera order matched, --render-budget 1080p RTX 3060 Ti:
+//   noon 5.72 -> 5.34   cascade 3.11 -> 3.04   meadow 7.87 -> 6.57
+//   canopy 6.93 -> 6.19   fire 14.82 -> 12.48 ms
+// Picture: <= 0.015% of pixels move by >= 16/255 (the run-to-run floor).
+const SUBOCC_SKIP : bool = true;
 
 // ---- THERE IS EXACTLY ONE CALL TO THIS FUNCTION (W2-A) ---------------------
 // fs()'s primary camera ray, and it passes `wantMedia = true`. Every secondary
@@ -3003,7 +3010,10 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
     }
 
     // ---- SUB-CHUNK BLOCK SKIP (PLAN_surface_flight_perf.md A2) ----
-    // IMPLEMENTED, MEASURED, DEFAULT OFF — the premise does not survive its
+    // NOW ON — see the SUBOCC_SKIP const for the 2026-09-28 re-measurement,
+    // which reverses the verdict below. The note is kept as the record of why
+    // it was off: every number in it predates the two-phase detail resolve.
+    // (Original:) IMPLEMENTED, MEASURED, DEFAULT OFF — the premise does not survive its
     // own arithmetic. Kept in the same shape A3's refutation is kept: flip
     // SUBOCC_SKIP and the experiment re-runs, and `--measure` (MEASUREMENT 1d)
     // still reports the content number that decides it.
@@ -4361,6 +4371,27 @@ fn farInValid(c : vec3<i32>, b : FarBox) -> bool {
   return all(c >= b.lo) && all(c < b.hi);
 }
 
+// ---- THE SKY BOUND (shadow_resolve.wgsl skyTopReduce, 2026-09-28) ---------
+// farOcc's tail holds, per level, one plus the highest occupied level-cell row
+// (biased; 0 = the level holds nothing). A level's cells above it are all air,
+// so every far reader may clip its ray to the slab below it. Returns the
+// ceiling PLANE in level-cell y, or a very low value for an empty level.
+const SKY_TOP_BASE : u32 = FAR_LEVELS * FAR_NUM_CHUNKS;   // shadow_resolve agrees
+const SKY_TOP_BIAS : i32 = 1 << 24;                       // shadow_resolve agrees
+fn farSkyCeil(level : u32) -> f32 {
+  let w = farOcc[SKY_TOP_BASE + level - 1u];
+  return select(f32(i32(w) - SKY_TOP_BIAS), -1e30, w == 0u);
+}
+// [tEnter, tExit] of a ray (level-cell units) clipped to y < ceil. An ascending
+// ray leaves the slab at the plane; a descending one from above enters there.
+fn farSkyClip(roY : f32, rdY : f32, invY : f32, ceil : f32, t : vec2f) -> vec2f {
+  let tPlane = (ceil - roY) * invY;
+  var r = t;
+  if (rdY > 0.0) { r.y = min(r.y, tPlane + 1e-3); }
+  else if (roY >= ceil) { r.x = max(r.x, tPlane - 1e-3); }
+  return r;
+}
+
 fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
   var out : FarHit;
   out.hit = false;
@@ -4413,12 +4444,22 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     let tt1 = (vec3f(box.hi) - roL) * inv;
     let tmin = min(tt0, tt1);
     let tmax = max(tt0, tt1);
-    let tEnter = max(max(tmin.x, tmin.y), max(tmin.z, tPrev / s));
+    let tEnter0 = max(max(tmin.x, tmin.y), max(tmin.z, tPrev / s));
     // tCeil is in FINE voxels; this level's t is in level cells, hence /s.
     // Once tPrev has passed the ceiling every remaining (coarser) level takes
     // the `continue` below, so the mode also skips the levels it cannot reach
     // rather than entering and immediately breaking out of each one.
-    let tExit = min(min(tmax.x, min(tmax.y, tmax.z)), tCeil / s);
+    let tExit0 = min(min(tmax.x, min(tmax.y, tmax.z)), tCeil / s);
+    // THE SKY BOUND: nothing in this level sits above farSkyCeil, so the
+    // march is clipped to the slab below it. A sky ray above every level's
+    // terrain now skips each level on this one compare instead of walking
+    // 8..16 empty chunks per shell. Exact: the cells cut off are all air. The
+    // seam below still hands the next level this level's (clipped) stop, and
+    // that level applies its own bound.
+    let clip = farSkyClip(roL.y, rd.y, inv.y, farSkyCeil(level),
+                          vec2f(tEnter0, tExit0));
+    let tEnter = clip.x;
+    let tExit = clip.y;
     if (tExit <= tEnter) { continue; }   // box missed (or fully behind tPrev)
 
     // ---- NESTED TRAVERSAL: a CHUNK cursor over a CELL cursor ---------------
@@ -4472,6 +4513,8 @@ fn traceFar(ro : vec3f, rdIn : vec3f, tStart : f32, px : vec2f) -> FarHit {
     var axis = 0;
     if (tmin.y > tmin.x && tmin.y > tmin.z) { axis = 1; }
     else if (tmin.z > tmin.x && tmin.z > tmin.y) { axis = 2; }
+    // Entered through the sky bound's plane: the entry face is a y face.
+    if (tEnter > tEnter0) { axis = 1; }
 
     var tCur = tEnter + 1e-4;
     var cc = worldChunkOf(clamp(vec3<i32>(floor(roL + rd * tCur)),
@@ -4756,7 +4799,12 @@ fn farShadowDist(level : u32, roFine : vec3f) -> f32 {
   let box = farBox(level);   // the valid box, as traceFar
   let tt0 = (vec3f(box.lo) - roL) * inv;
   let tt1 = (vec3f(box.hi) - roL) * inv;
-  let tExit = min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z)));
+  var tExit = min(max(tt0.x, tt1.x), min(max(tt0.y, tt1.y), max(tt0.z, tt1.z)));
+  // THE SKY BOUND (traceFar's note): a sun ray that has climbed above the
+  // level's highest occupied cell cannot be blocked in this level any more.
+  if (rd.y > 0.0) {
+    tExit = min(tExit, (farSkyCeil(level) - roL.y) * inv.y + 1e-3);
+  }
 
   // ---- THE SAME NESTED CURSOR traceFar RUNS (2026-09-07) -------------------
   // An occlusion ray is already ANY-HIT with an immediate exit here (the
@@ -5855,6 +5903,28 @@ fn sunShadow(hp : vec3f, n : vec3f, px : vec2f) -> f32 {
 // (value, weight) — weight 0 means "no opinion", which the bilinear blend below
 // renormalises away rather than painting lit OR black. See shadowSetOf in
 // common.wgsl for why this probes a set instead of hitting one bucket.
+// ---- STAGGERED REFRESH (2026-09-28, raymarch perf) --------------------------
+// A patch whose slot is already VALID is re-cast once every
+// SHADOW_REFRESH_PERIOD frames, on a phase hashed from its key, instead of
+// every frame. The slot is still stamped LIVE every frame it is on screen (the
+// CAS below), so nothing about ownership changes — only the append. A patch
+// with no valid value yet requests every frame, exactly as before, so a newly
+// visible surface still has its answer one frame later.
+//
+// Cost it removes: the resolve pass recast EVERY visible patch EVERY frame
+// (712k rays a frame on the `fire` camera). What it costs: the 16-sample
+// penumbra window now fills over 16 x PERIOD frames and a changed blocker
+// shows after up to PERIOD frames. shadow_resolve.wgsl walks its window by the
+// same phase (shadowRefreshSample) so every patch still visits all 16 cone
+// samples and the centre ray. MUST AGREE with shadow_resolve.wgsl.
+const SHADOW_REFRESH_PERIOD : u32 = 4u;
+fn shadowRefreshPhase(key : u32) -> u32 {
+  return ((key * 0x9E3779B1u) >> 16u) % SHADOW_REFRESH_PERIOD;
+}
+fn shadowRefreshDue(key : u32) -> bool {
+  return ((R.frameIdx + shadowRefreshPhase(key)) % SHADOW_REFRESH_PERIOD) == 0u;
+}
+
 fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
   let key = shadowPatchKey(packedCell, packedSub);
   let ver = shadowPatchVerifier(packedCell, packedSub);
@@ -5970,7 +6040,9 @@ fn shadowSlotRead(packedCell : u32, packedSub : u32, curFrame : u32) -> vec2f {
         shadowPackState(state & 0xFFu, shadowStateResolved(state), curFrame,
                         shadowStateValid(state), ver));
     if (r.exchanged) {
-      shadowAppendRequest(key, slot, packedCell, packedSub);
+      if (!shadowStateValid(state) || shadowRefreshDue(key)) {
+        shadowAppendRequest(key, slot, packedCell, packedSub);
+      }
     } else if (shadowStateVerifier(r.old_value) != ver) {
       return vec2f(0.0);
     }

@@ -20,6 +20,10 @@ namespace {
 constexpr uint32_t kRainTile = 8;
 constexpr uint32_t kRainFallGroups = (kWorldN / kRainTile) * (kWorldN / kRainTile) / 64;
 static_assert(kRainFallGroups > 0 && kRainFallGroups < 0x10000000u, "literal extent");
+// The sky bound's reduce (shadow_resolve.wgsl skyTopReduce): one thread per far
+// occupancy word, 64 per group, and a group never straddles two levels.
+static_assert((kFarNumChunks % 64u) == 0u, "skyTopReduce groups straddle levels");
+constexpr uint32_t kSkyTopGroups = kFarLevels * kFarNumChunks / 64;
 }  // namespace
 
 namespace pass {
@@ -79,6 +83,8 @@ namespace {
 #define PIPE_CLOUD_MARCH     Pipe::CloudMarch
 #define PIPE_CLOUD_RESOLVE   Pipe::CloudResolve
 #define PIPE_SHADOW_PREPARE  Pipe::ShadowPrepare
+#define PIPE_SKY_TOP_CLEAR   Pipe::SkyTopClear
+#define PIPE_SKY_TOP_REDUCE  Pipe::SkyTopReduce
 #define PIPE_SHADOW_RESOLVE  Pipe::ShadowResolve
 #define PIPE_FLUID_SPAWN     Pipe::FluidSpawn
 #define PIPE_FLUID_MARK      Pipe::FluidMark

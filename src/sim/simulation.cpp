@@ -863,6 +863,12 @@ bool Simulation::Init(const rhi::Device& device, World& world,
         entry(15, T::Storage),         // cloudMaps
         entry(16, T::Storage),         // cloudRaw
         entry(17, T::Storage),         // cloudHist
+        // THE SKY BOUND (shadow_resolve.wgsl skyTopClear/skyTopReduce): the
+        // far cascade's occupancy words, reduced once per frame into one
+        // "highest occupied cell" word per level at the buffer's tail, plus
+        // the level origins that turn a slot row into an absolute height.
+        entry(18, T::Storage),         // farOcc
+        entry(19, T::Uniform),         // FarParams
     };
     shadowBGL_ = device.CreateBindGroupLayout(entries, std::size(entries));
 
@@ -1808,6 +1814,8 @@ bool Simulation::BuildPipelines(const rhi::Device& device, std::string* err) {
   // enable path is ONE test in one place rather than a load-time fork.
   pool.Add([&] { shadowPrepare_ = MakeComputePipeline(device, shadowPL_, mShadow, "prepare", "shadowPrepare"); });
   pool.Add([&] { shadowResolve_ = MakeComputePipeline(device, shadowPL_, mShadow, "resolve", "shadowResolve"); });
+  pool.Add([&] { skyTopClear_ = MakeComputePipeline(device, shadowPL_, mShadow, "skyTopClear", "skyTopClear"); });
+  pool.Add([&] { skyTopReduce_ = MakeComputePipeline(device, shadowPL_, mShadow, "skyTopReduce", "skyTopReduce"); });
   if (mCloud) {
     pool.Add([&] { cloudNoise_ = MakeComputePipeline(device, shadowPL_, mCloud, "noise", "cloudNoise"); });
     pool.Add([&] { cloudWeather_ = MakeComputePipeline(device, shadowPL_, mCloud, "weather", "cloudWeather"); });
@@ -2330,6 +2338,8 @@ const rhi::ComputePipeline& Simulation::PassPipeline(pass::Pipe p) const {
     case P::CloudEnv:       return cloudEnv_;
     case P::CloudMarch:     return cloudMarch_;
     case P::CloudResolve:   return cloudResolve_;
+    case P::SkyTopClear:    return skyTopClear_;
+    case P::SkyTopReduce:   return skyTopReduce_;
     case P::ShadowPrepare:  return shadowPrepare_;
     case P::ShadowResolve:  return shadowResolve_;
     case P::FluidSpawn:     return fluidSpawn_;
@@ -2545,7 +2555,8 @@ void Simulation::EncodeShadowResolve(const rhi::CommandEncoder& enc) {
   const sandvox::CloudFrame& cf = sandvox::LastCloudFrame();
   const bool clouds = cf.on && cloudMarch_ && cloudResolve_ && cloudWeather_ &&
                       cloudShadow_ && cloudEnv_ && cloudNoise_;
-  if (!shadowCacheOn_ && !clouds) return;
+  // No early return any more: the sky bound's two rows (C_ALWAYS) must run
+  // every frame the far cascade is drawn, cache or clouds or neither.
   RecordCtx cx{};
   cx.cloudFlags = (shadowCacheOn_ ? 4u : 0u);
   if (clouds) {
@@ -3166,6 +3177,8 @@ void Simulation::BuildShadowBindGroup() {
       b(15, cloudMapsBuf_),
       b(16, cloudRawBuf_),
       b(17, cloudHistBuf_),
+      b(18, world_->farOcc),
+      b(19, world_->farUBO),
   };
   shadowBG_ = device_.CreateBindGroup(shadowBGL_, bges, std::size(bges), "shadowBG");
 }

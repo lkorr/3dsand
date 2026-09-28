@@ -125,6 +125,11 @@
 // frame), it is finer than a voxel at subdiv 4, and the reader averages four
 // patches bilinearly on top of it.
 const SHADOW_SAMPLES : u32 = 16u;   // world.h kShadowSamples
+// raymarch.wgsl STAGGERED REFRESH — MUST AGREE with the copy there.
+const SHADOW_REFRESH_PERIOD : u32 = 4u;
+fn shadowRefreshPhase(key : u32) -> u32 {
+  return ((key * 0x9E3779B1u) >> 16u) % SHADOW_REFRESH_PERIOD;
+}
 const SHADOW_HIST_MASK : u32 = 0xFFFFu;
 const SHADOW_FILL_SHIFT : u32 = 16u;
 const SHADOW_FILL_MASK : u32 = 31u;
@@ -286,7 +291,14 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   // smoothing it would only delay the first honest answer — and would leave
   // the value still creeping after the warm-up --gate shadow-cache pays for.
   let wasFull = fill >= SHADOW_SAMPLES;
-  let slotIdx = R.frameIdx % SHADOW_SAMPLES;
+  // Which window sample: the patch is resolved once every
+  // SHADOW_REFRESH_PERIOD frames on its own phase (raymarch.wgsl, STAGGERED
+  // REFRESH), so its sample index advances by one per RESOLVE, not per frame —
+  // otherwise it would only ever land on 16 / PERIOD of the cone's samples and
+  // most patches would never take the centre ray. A fresh patch resolving off
+  // its phase lands on some index; `centre` covers it below.
+  let slotIdx = ((R.frameIdx + shadowRefreshPhase(key)) / SHADOW_REFRESH_PERIOD)
+                % SHADOW_SAMPLES;
 
   // THE CENTRE RAY IS NOT JITTERED, and which frames take it is load-bearing.
   // The LIFT — how far a shadowed patch is lifted toward TUNE_SHADOW_LIFT by
@@ -436,7 +448,11 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
     let sample = irrSample(bt.albedo, n3, keyLightDirP(R), keyLightColorP(R),
                            lit, bt.emis);
     let stampOk = opennessGen[chunkIndexW(cell)] == opennessStamp(worldChunkOf(cell));
-    irrDeposit(irrIndexOfCell(cell, face), sample, GI_RESOLVE_ALPHA, stampOk,
+    // x PERIOD: a patch deposits once per SHADOW_REFRESH_PERIOD frames now, so
+    // the per-deposit rate is scaled to keep the grid's convergence per FRAME
+    // what it was when every patch deposited every frame.
+    irrDeposit(irrIndexOfCell(cell, face), sample,
+               min(GI_RESOLVE_ALPHA * f32(SHADOW_REFRESH_PERIOD), 1.0), stampOk,
                &irradiance);
   }
 
@@ -458,4 +474,64 @@ fn resolve(@builtin(global_invocation_id) gid : vec3<u32>) {
   atomicStore(&shadowCache[bucket * 2u + 1u],
               shadowPackState(u32(valU), R.frameIdx & 15u,
                               shadowStateRequested(old), !buried, ver));
+}
+
+// ============================ THE SKY BOUND =================================
+// (2026-09-28, raymarch perf.) One word per far level at farOcc's tail: the
+// highest occupied LEVEL CELL in that level's whole box, biased so that 0 means
+// "the level holds nothing". raymarch.wgsl's traceFar and farShadowDist clip
+// every ray to the slab below it: a sky ray used to enter all FAR_LEVELS
+// shells and chunk-walk each one (8..16 chunk probes a shell) to learn there
+// was nothing up there — measured as the largest single piece of the far
+// march on every camera with sky in it.
+//
+// CONSERVATIVE BY CONSTRUCTION. It is a max over EVERY slot, including slots a
+// pending face still holds stale bytes in (farBox excludes those from the
+// march, but they are counted here under their new absolute row), and the
+// per-chunk top row it reads is itself conservative-high (farOccTop's note).
+// Extra slots can only raise a max, so the bound is never below a cell the
+// march could hit. Recomputed from scratch every frame, so it also comes back
+// DOWN when the terrain that raised it streams out.
+//
+// Render-only derived data; the sim never reads farOcc.
+@group(0) @binding(18) var<storage, read_write> farOcc : array<atomic<u32>>;
+@group(0) @binding(19) var<uniform> F : FarParams;
+
+const SKY_TOP_BASE : u32 = FAR_LEVELS * FAR_NUM_CHUNKS;   // raymarch.wgsl agrees
+const SKY_TOP_BIAS : i32 = 1 << 24;                       // raymarch.wgsl agrees
+
+@compute @workgroup_size(16)
+fn skyTopClear(@builtin(local_invocation_index) li : u32) {
+  atomicStore(&farOcc[SKY_TOP_BASE + li], 0u);
+}
+
+var<workgroup> skyWgMax : atomic<u32>;
+
+@compute @workgroup_size(64)
+fn skyTopReduce(@builtin(local_invocation_index) li : u32,
+                @builtin(workgroup_id) wg : vec3<u32>) {
+  if (li == 0u) { atomicStore(&skyWgMax, 0u); }
+  workgroupBarrier();
+  // FAR_NUM_CHUNKS is a multiple of 64 (pass_table.cpp asserts it), so a
+  // workgroup's 64 words all belong to one level.
+  let idx = wg.x * 64u + li;
+  let level0 = idx / FAR_NUM_CHUNKS;
+  let slot = idx % FAR_NUM_CHUNKS;
+  let occ = atomicLoad(&farOcc[idx]);
+  if ((occ & 0xFFFFu) != 0u) {
+    // farChunkIndexG's order is (z * N + y) * N + x.
+    let sy = i32((slot / FAR_NCHUNK) % FAR_NCHUNK);
+    let o = F.origins[level0].xyz;
+    let cy = o.y + ((sy - o.y) & i32(FAR_NCHUNK_MASK));   // farSlotToChunk
+    let top = farOccTop(occ);
+    // top 0 = "unknown, assume full": the chunk's top row.
+    let row = select(i32(top) - 1, i32(CHUNK) - 1, top == 0u);
+    let yTop = cy * i32(CHUNK) + row;
+    atomicMax(&skyWgMax, u32(yTop + SKY_TOP_BIAS + 1));
+  }
+  workgroupBarrier();
+  if (li == 0u) {
+    let m = atomicLoad(&skyWgMax);
+    if (m != 0u) { atomicMax(&farOcc[SKY_TOP_BASE + level0], m); }
+  }
 }

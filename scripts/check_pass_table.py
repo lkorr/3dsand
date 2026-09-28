@@ -131,6 +131,8 @@ PIPE_TO_MEMBER = {
     "PIPE_CLOUD_RESOLVE": "cloudResolve_",
     "PIPE_SHADOW_PREPARE": "shadowPrepare_",
     "PIPE_SHADOW_RESOLVE": "shadowResolve_",
+    "PIPE_SKY_TOP_CLEAR": "skyTopClear_",
+    "PIPE_SKY_TOP_REDUCE": "skyTopReduce_",
     "PIPE_FLUID_SPAWN": "fluidSpawn_",
     "PIPE_FLUID_MARK": "fluidMark_",
     "PIPE_FLUID_ALLOC": "fluidAlloc_",

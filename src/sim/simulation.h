@@ -804,6 +804,8 @@ class Simulation {
   // requested patch. Render-path passes, encoded by EncodeShadowResolve rather
   // than on the tick table — they run per FRAME, not per tick.
   rhi::ComputePipeline shadowPrepare_, shadowResolve_;
+  // The far cascade's per-level sky bound (shadow_resolve.wgsl skyTop*).
+  rhi::ComputePipeline skyTopClear_, skyTopReduce_;
   rhi::ShaderModule shadowModule_;
   // Whether the cache is live this run. Recomputed in Init and ReloadShaders
   // from (device capability AND render.shadowCache), so F5 flips it with the

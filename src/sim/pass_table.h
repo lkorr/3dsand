@@ -363,6 +363,10 @@ enum class Pipe : uint8_t {
   // Simulation::RecordTable moves to ShadowResolve with these. Both are render
   // -path passes: they run once per FRAME from EncodeShadowResolve, not on the
   // tick table.
+  // The far cascade's per-level sky bound (shadow_resolve.wgsl skyTop*),
+  // per-FRAME rows on the ShadowCache table. Before ShadowResolve for the copy
+  // loop's bound.
+  SkyTopClear, SkyTopReduce,
   ShadowPrepare, ShadowResolve,
   // Not a pipeline: the array bound the two recorder-side mirrors size
   // themselves by. It was a LITERAL 64 in vk_record.h and rhi_record.h, and

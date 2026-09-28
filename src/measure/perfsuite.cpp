@@ -3215,7 +3215,13 @@ int RunRenderBudget(GpuContext& ctx, World& world, Simulation& sim,
                 opt.width, opt.height, (int)arms.size());
 
     for (const RenderArm* arm : arms) {
-      ArmResult r = runner.Measure(*arm, base, scene, /*warm=*/12,
+      // SANDVOX_BUDGET_WARM: more warm frames, for comparing the STEADY-STATE
+      // picture of render paths that converge over frames (shadow window, GI).
+      static const uint32_t kWarm = [] {
+        const char* e = std::getenv("SANDVOX_BUDGET_WARM");
+        return e ? (uint32_t)std::max(1, std::atoi(e)) : 12u;
+      }();
+      ArmResult r = runner.Measure(*arm, base, scene, /*warm=*/kWarm,
                                    /*frames=*/48);
       std::printf("  %-11s %-42s ", arm->id, arm->label);
       if (!r.ok) std::printf("SKIPPED — %s\n", r.why.c_str());

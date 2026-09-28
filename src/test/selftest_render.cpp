@@ -2389,7 +2389,12 @@ Status GateShadowCache(Ctx& c, std::string& detail) {
   // bit-stable in a static scene — the same slot is rewritten with the same bit
   // — which is what keeps the flicker claim below meaningful rather than
   // merely satisfied. Anything under 17 measures the fill, not the cache.
-  uint32_t cacheFrames = 20;
+  //
+  // x4 SINCE THE STAGGERED REFRESH (raymarch.wgsl SHADOW_REFRESH_PERIOD = 4,
+  // 2026-09-28): a valid patch is re-cast once every 4 frames, so its window
+  // fills over 64 frames, not 16. 20 frames measured the fill again (agreement
+  // 6.95 against a 6.46 bar); 68 is 16 x 4 plus the same margin and passes.
+  uint32_t cacheFrames = 68;
   if (const char* e = std::getenv("SANDVOX_SHADOW_GATE_FRAMES")) {
     const int v = std::atoi(e);
     if (v >= 2) cacheFrames = (uint32_t)v;

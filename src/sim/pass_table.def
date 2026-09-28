@@ -1171,6 +1171,20 @@ PASS(farPatchFill, "farPatchFill", PT_FARFILL, PIPE_FAR_PATCH_FILL, K_COMPUTE,
 // list at zero, then `resolve` reads that saved count. Both rows declare it
 // A(ShadowReq) — atomics on one buffer still need a real barrier between the
 // dispatch that writes and the dispatch that reads (§3.8).
+// ---- THE SKY BOUND (shadow_resolve.wgsl skyTopClear / skyTopReduce) --------
+// One word per far level at farOcc's tail: the highest occupied level cell,
+// reduced from the occupancy words every frame. traceFar and farShadowDist
+// clip every ray to the slab below it, so a sky ray stops entering (and
+// chunk-walking) levels that have nothing above its height. Render-only and
+// derived: nothing in the sim reads farOcc. ~262k threads, one word each.
+// Two rows because the clear must land before any workgroup's atomicMax; the
+// generated A->A barrier between them is the whole synchronisation.
+PASS(sky_top_clear, "skyTop", PT_SHADOWCACHE, PIPE_SKY_TOP_CLEAR, K_COMPUTE, 1,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(A(FarOcc)))
+PASS(sky_top_reduce, "skyTop", PT_SHADOWCACHE, PIPE_SKY_TOP_REDUCE, K_COMPUTE, kSkyTopGroups,1,1,
+     GRP_SHADOW, DYN_NONE, C_ALWAYS, 1,
+     USES(A(FarOcc) U(FarUBO)))
 PASS(shadow_prepare, "shadowPrepare", PT_SHADOWCACHE, PIPE_SHADOW_PREPARE, K_COMPUTE, 1,1,1,
      GRP_SHADOW, DYN_NONE, C_SHADOWON, 1,
      USES(A(ShadowReq) W(ShadowArgsStage)))

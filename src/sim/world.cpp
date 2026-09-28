@@ -386,7 +386,15 @@ void World::Init(const rhi::Device& device) {
   // the frame path stays readback-free per CLAUDE.md.
   farVox = CreateBuffer(device, (uint64_t)kFarLevels * kFarVox,
                         U::Storage | U::CopySrc, "farVox");
-  farOcc = CreateBuffer(device, (uint64_t)kFarLevels * kFarNumChunks * 4,
+  // shadow_resolve.wgsl SKY_TOP_BASE indexes past the counts; FAR_LEVELS (8)
+  // of these words are used, the rest are headroom.
+  constexpr uint32_t kFarSkyTopWords = 16;
+  static_assert(kFarLevels <= kFarSkyTopWords, "sky-bound tail too small");
+  // + kFarSkyTopWords: the per-level SKY BOUND tail (shadow_resolve.wgsl
+  // skyTopReduce, read by raymarch.wgsl traceFar/farShadowDist). Zero = "this
+  // level holds nothing", which is also what an unfilled level is.
+  farOcc = CreateBuffer(device,
+                        ((uint64_t)kFarLevels * kFarNumChunks + kFarSkyTopWords) * 4,
                         U::Storage, "farOcc");
   farList = CreateBuffer(device, kFarListCap * 4, U::Storage | U::CopyDst, "farList");
   farUBO = CreateBuffer(device, sizeof(FarParams), U::Uniform | U::CopyDst, "farUBO");
