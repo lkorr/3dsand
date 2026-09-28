@@ -1,5 +1,5 @@
 {
-  "comment": "A dagger: the small end of the melee range, where the wound model's heft factor falls BELOW the arming sword instead of above it. Regenerate with scripts/gen_shortblade_items.py \u2014 the edge and hilt blocks are emitted from the same constants that build the mesh, so the hitbox cannot drift from the art. Heft is PINNED in items.json (the art has a real blade section now, so its voxel volume no longer says what the steel weighs).",
+  "comment": "A dagger: the small end of the melee range, where the wound model's heft factor falls BELOW the arming sword instead of above it. Regenerate with scripts/gen_shortblade_items.py — the edge and hilt blocks are emitted from the same constants that build the mesh, so the hitbox cannot drift from the art. Heft is PINNED in items.json (the art has a real blade section now, so its voxel volume no longer says what the steel weighs).",
   "name": "dagger",
   "model": "dagger",
   "artVoxelsPerMetre": 80,
@@ -11,7 +11,7 @@
       "translation": [
         2,
         2,
-        0
+        1
       ],
       "rotation": [
         90,
