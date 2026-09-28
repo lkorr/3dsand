@@ -763,7 +763,23 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
           int si = -1;
           const bool flicked =
               strikePicker.Pick(CurrentTuning().melee.pickMinSpeed, fx, fy);
-          if (flicked) si = QuantizeStrike(map, fx, fy);
+          if (flicked) {
+            si = QuantizeStrike(map, fx, fy);
+            // A MIRRORED STROKE TRAVELS THE MIRROR OF ITS SECTOR (strokes.h
+            // "THE LEFT HAND IS THE RIGHT, MIRRORED"): the left hand swinging
+            // a right-authored style reflects it through the body, so the
+            // sector the flick named would cut the OTHER way across the
+            // screen. Pick with the flick reflected instead, so the blade
+            // goes where the mouse went — kept only if that pick is mirrored
+            // too (the unarmed compass has native left-side punches).
+            const StyleLibrary& lib = mobs.AttackStyles();
+            const AttackStyle* raw = lib.At(si);
+            if (raw && StrokeMirrored(*raw, ph)) {
+              const int ri = QuantizeStrike(map, -fx, fy);
+              const AttackStyle* refl = lib.At(ri);
+              if (refl && StrokeMirrored(*refl, ph)) si = ri;
+            }
+          }
           if (si < 0) {
             // No flick: alternate the two horizontals so plain clicking is a
             // usable L/R rhythm rather than the same cut stamped.
