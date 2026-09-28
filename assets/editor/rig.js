@@ -250,7 +250,11 @@ async function loadHeldItem(id) {
   try {
     const rs = await fetch('/api/model?path=' + encodeURIComponent('items/' + id + '.json'));
     if (!rs.ok) throw new Error(id + '.json ' + rs.status);
-    itemSc = JSON.parse(await rs.text());
+    const scText = await rs.text();
+    // SUPERSEDED while in flight (another equip, or an unequip): drop it, or
+    // a sword nobody is holding comes back as a trail with no sword.
+    if (heldItemId !== id) return;
+    itemSc = JSON.parse(scText);
 
     const modelName = itemSc.model || id;
     const rv = await fetch('/api/model?path=' + encodeURIComponent('items/' + modelName + '.vox'));
@@ -258,6 +262,7 @@ async function loadHeldItem(id) {
     // `.prefab` is the EDITOR-shaped parse (dim/grid/offset per model), the
     // same one openPath() builds the document from — not the raw .vox models.
     const parsed = VOX.readVox(await rv.arrayBuffer());
+    if (heldItemId !== id) { itemSc = null; return; }
     itemDoc = parsed.prefab;
     if (!itemDoc?.models?.length) throw new Error('no models in ' + modelName + '.vox');
     // Default the context to one the item actually declares, so the panel opens
@@ -3829,17 +3834,20 @@ function armForStyle(sty) {
   if (!sty || !sty.weapon || sty.weapon === 'held') {
     clearStrikeEffector();
     if (wpHandPart < 0) return false;
-    if (heldItemId) return true;
+    // UNARMED MODE IS UNARMED even if an item is still loaded (a late fetch,
+    // a dropdown): the fist swings, never a sword the panel is not showing.
+    if (heldItemId && ATK.currentWeaponMode?.() !== 'unarmed') return true;
     // mob.cpp Mob::ArmForStyle: AN EMPTY HAND THROWS THE STROKE WITH ITS
     // FIST -- the natural weapon on the hand part -- so the preview swings
-    // (and trails) the knuckles, as the game does.
+    // (and trails) the knuckles, as the game does. A rig whose sidecar does
+    // not restate `natural` (a character inheriting the human's) still arms
+    // the hand; effectorEdgeModel then trails the hand's own box.
     const NW = naturalList();
     const ni = NW.findIndex(w => w && w.part && skel.findPart(w.part) === wpHandPart);
-    if (ni < 0 || !naturalUsable(NW[ni])) return true;
     const out = {};
     strikeEff = wpHandPart;
     strikeMode = chainForEffector(wpHandPart, out) >= 0 ? 'chain' : 'aim';
-    strikeNatural = ni;
+    strikeNatural = ni >= 0 && naturalUsable(NW[ni]) ? ni : -1;
     return true;
   }
   const ni = naturalIndexNamed(sty.weapon);
@@ -3888,8 +3896,20 @@ function naturalEdgeModel(nw) {
   const from = pt(e.from), to = pt(e.to);
   if (!from || !to) return null;
   const m = anim.model[i];
-  const a = skel.parts[i].anchorLocal;
-  const place = (q) => AN.vadd(m.pos, AN.qrot(m.rot, AN.vsub(q, a)));
+  // THE EDGE IS AUTHORED FROM THE PART MODEL'S OWN MIN CORNER (mob.cpp's
+  // loader; the engine composes it on the limb's min-corner transform), and
+  // `anchorLocal` is in PREFAB space. So the authored point goes to prefab
+  // space first (+ the model's offset), then rides the part exactly as
+  // modelTransform() carries the drawn voxels: posed joint + the delta from
+  // rest. Subtracting the prefab anchor from a model-local point threw the
+  // fist ~8 voxels past the knuckles (the hand's whole prefab offset).
+  const model = skel.parts[i]._model;
+  const off = model && model.offset ? AN.v3(model.offset.x, model.offset.y, model.offset.z)
+                                    : AN.v3();
+  const rest = restModel?.[i];
+  const restPos = rest ? rest.pos : skel.parts[i].anchorLocal;
+  const dq = rest ? AN.qnorm(AN.qmul(m.rot, AN.qconj(rest.rot))) : m.rot;
+  const place = (q) => AN.vadd(m.pos, AN.qrot(dq, AN.vsub(AN.vadd(q, off), restPos)));
   return { base: place(from), tip: place(to), part: i,
            halfWidth: +e.halfWidth || 0, flat: AN.v3() };
 }
@@ -3905,9 +3925,29 @@ function effectorEdgeModel() {
   const eff = resolveEffector();
   if (eff.mode === 'chain' || eff.mode === 'aim') {
     const nw = naturalList()[eff.natural];
-    return nw ? naturalEdgeModel(nw) : null;
+    if (nw) return naturalEdgeModel(nw);
+    return partBoxSegment(eff.part);
   }
   return bladeSegmentModel();
+}
+
+/**
+ * A part's own reach as a segment, for an armed hand with no authored fist:
+ * from its JOINT to the far end of its box along the joint-to-centre line,
+ * posed exactly as modelTransform() carries the drawn voxels. MODEL space.
+ */
+function partBoxSegment(i) {
+  if (i < 0 || !anim?.model?.[i]) return null;
+  const posed = anim.model[i];
+  const model = skel.parts[i]._model;
+  const rest = restModel?.[i];
+  if (!model || !model.offset || !model.dim || !rest) return null;
+  const c = AN.v3(model.offset.x + model.dim.x * 0.5, model.offset.y + model.dim.y * 0.5,
+                  model.offset.z + model.dim.z * 0.5);
+  const dq = AN.qnorm(AN.qmul(posed.rot, AN.qconj(rest.rot)));
+  const centre = AN.vadd(posed.pos, AN.qrot(dq, AN.vsub(c, rest.pos)));
+  const tip = AN.vadd(posed.pos, AN.vmul(AN.vsub(centre, posed.pos), 2));
+  return { base: posed.pos, tip, part: i, halfWidth: 0, flat: AN.v3() };
 }
 
 // tuning.json's melee block, live off the HOST'S OWN tuning document — the
