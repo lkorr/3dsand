@@ -393,6 +393,18 @@ struct ItemDef {
   // makes its roll meaningless: it will always read as half-aligned.
   bool hasEdgeFlat = false;
   Vec3 edgeFlat{0, 1, 0};
+  // ---- THE HAFT: a second, WEAK striking segment (sidecar `haft`) ---------
+  // The part of a weapon that is not its business end but is still a solid
+  // thing moving fast: a mace's stick. Without it the stick passed through
+  // bodies as if it were not there. Same frame and units as `edge`; swept
+  // beside it by the same MeleeSweepDamage with its power scaled by
+  // `haftPower` (a glancing blow off the handle) and its impact cues played
+  // `haftGainDb` down so a handle hit SOUNDS softer. No flat: a stick is round.
+  bool hasHaft = false;
+  Vec3 haftFrom{}, haftTo{};
+  float haftHalfWidth = 0;
+  float haftPower = 0.2f;
+  float haftGainDb = -12.0f;
 
   // ---- melee: WHAT A HIT IS MADE OF (game/impact.h) -----------------------
   //

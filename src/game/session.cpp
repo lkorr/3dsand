@@ -102,6 +102,9 @@ Vec3 SpellHandPoint(const PlayerAvatar& avatar, const Player& player,
     Vec3 at;
     Quat rot;
     if (avatar.PartAlive(part) && avatar.PartWorldTransform(part, at, rot)) return at;
+    // A hand that is gone: the spell stays where the hand would be — the pose
+    // still carries it (PoseSpellReady keeps the ready clip up for it).
+    if (part >= 0 && avatar.PartPosedWorld(part, at, rot)) return at;
   }
   return player.EyePos() + cam.Forward() * 1.2f +
          cam.Right() * (0.7f * HandSideSign(h)) - cam.Up() * 0.5f;
@@ -800,7 +803,7 @@ static void PhaseA(TickAuthorityCtx& w, WorldScratch& ws,
             const ItemDef* pItem = hands[ph].weapon ? hands[ph].item : nullptr;
             if (s.strikeBaseHand == ph &&
                 StrikeRepeats(map, strikeBase,
-                              pItem ? WeaponFormOf(pItem->weaponClass) : -1))
+                              FormForItem(pItem)))
               si = strikeBase;
           }
           if (si < 0) {
@@ -2896,7 +2899,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                   hands[nextHand].weapon ? hands[nextHand].item : nullptr;
               if (next == strikeBase &&
                   StrikeRepeats(cmap, strikeBase,
-                                nItem ? WeaponFormOf(nItem->weaponClass) : -1))
+                                FormForItem(nItem)))
                 return true;
               return StrikeChains(cmap, strikeBase, next,
                                   chainT.chainSectorLeeway);
@@ -2930,7 +2933,7 @@ static void PhaseI(TickAuthorityCtx& w, WorldScratch& ws,
                 const ItemDef* qItem = hands[qHand].weapon ? hands[qHand].item : nullptr;
                 const int formed = mobs.AttackStyles().ResolveForm(
                     strikeQueued,
-                    qItem ? WeaponFormOf(qItem->weaponClass) : -1);
+                    FormForItem(qItem));
                 if (const AttackStyle* sty = mobs.AttackStyles().At(formed)) {
                   // ---- POINT THE DRIVER AT THE PART THIS STYLE SWINGS -----
                   // Exactly what MobSystem::BeginStroke does, and through the
@@ -4143,6 +4146,7 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
           if (!playerStrike.Cutting()) {
             playerStruck.clear();
             playerBitten = false;
+            s.playerHaftStruck.clear();
           }
           if (lastEdgeValid && playerStrike.Cutting()) {
             EdgeSweep sw;
@@ -4218,13 +4222,74 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
             // blow come off the BlockEvent queue instead (the drain below the
             // AI readout), which is the only place that knows a block from a
             // chip. One blow, one cue, whichever way it ended.
-            const size_t sev0 = mobs.SeverEvents().size();
-            const size_t voi0 = mobs.VoiceEvents().size();
-            // The third queue, for the population the other two cannot see:
-            // dead flesh (DebrisSystem::GoreEvent).
-            const size_t gore0 = debris.GoreEvents().size();
-            const EdgeSweepResult res = MeleeSweepDamage(
-                sw, melee.tuning, avatar, phys, mobs, debris, world, spawns);
+            // ONE BLOW'S AFTERMATH -- hit-stop tier and impact cues -- for the
+            // blade's sweep and for the haft's (weak: a chip dip at most,
+            // unless something came off; cues `gainDb` down).
+            auto resolveSweep = [&](const EdgeSweep& sw, float gainDb,
+                                    bool weak) -> EdgeSweepResult {
+              const size_t sev0 = mobs.SeverEvents().size();
+              const size_t voi0 = mobs.VoiceEvents().size();
+              // The third queue, for the population the other two cannot see:
+              // dead flesh (DebrisSystem::GoreEvent).
+              const size_t gore0 = debris.GoreEvents().size();
+              const EdgeSweepResult res = MeleeSweepDamage(
+                  sw, melee.tuning, avatar, phys, mobs, debris, world, spawns);
+              if (res.bodiesHit > 0) {
+                const bool severedLive = mobs.SeverEvents().size() > sev0;
+                // ---- ...AND DEAD FLESH IS STILL FLESH (2026-09-20) ---------
+                //
+                // This differencing trick has a blind spot and it is a whole
+                // population: a CORPSE fills neither queue — it has no voice to
+                // cry and its pieces are DebrisSystem's, not MobSystem's — so
+                // every blow on one fell through to the `chip` tier and a body
+                // being hacked apart on the ground sounded like a crate. The
+                // sweep now answers the question directly for that case
+                // (EdgeSweepResult::hitDeadFlesh), and the corpse's own sever
+                // rides the debris gore queue drained beside the mob one below.
+                const bool flesh =
+                    mobs.VoiceEvents().size() > voi0 || res.hitDeadFlesh;
+                const bool severed =
+                    severedLive || debris.GoreEvents().size() > gore0;
+                const Tuning::CombatFx& fx = CurrentTuning().combatfx;
+                // LATCHED, not acted on. This is inside the tick loop, which
+                // runs 0..4 times a frame; the frame loop drains it at the top
+                // of the next frame (see HitStop's note).
+                if (severed)
+                  hitStop.Request(fx.hitStopSeverScale, fx.hitStopSeverMs);
+                else if (flesh && !weak)
+                  hitStop.Request(fx.hitStopFleshScale, fx.hitStopFleshMs);
+                else
+                  hitStop.Request(fx.hitStopChipScale, fx.hitStopChipMs);
+                // The impact cue, latched for the same reason and peak-held on
+                // power so one frame carrying four tick-hits plays the hardest
+                // of them once rather than four overlapping copies of nearly the
+                // same sound.
+                CombatCueRequest& q = flesh ? combatFleshCue : combatClangCue;
+                const float pw = res.power * res.edgeAlign;
+                // AT THE CONTACT POINT, not at the middle of the blade. The
+                // segment midpoint is where the WEAPON is; on a sword that is up
+                // to half a metre from the wound, and a listener standing right in
+                // front of what they just hit could hear the blow off to one side
+                // (reported 2026-09-19). `hitAt` is the probe ray's own hit
+                // position — the same place the kerf is bored.
+                const Vec3 hitAt = res.hasHitAt ? res.hitAt
+                                                : (sw.aNow + sw.bNow) * 0.5f;
+                q.Offer(pw, hitAt, gainDb);
+                // Weapon impact layer: the sword's ring or the mace's thud,
+                // on ANY body contact regardless of flesh/armor.
+                const bool edged = sw.strike.cut > sw.strike.blunt;
+                const bool louder = !combatStrikeCue.pending ||
+                    pw * std::pow(10.0f, gainDb / 20.0f) >
+                        combatStrikeCue.power *
+                            std::pow(10.0f, combatStrikeCue.gainDb / 20.0f);
+                combatStrikeCue.Offer(pw, hitAt, gainDb);
+                if (louder) combatStrikeEdged = edged;
+                // Wet cutting layer: edged weapons contacting flesh.
+                if (flesh && edged) combatCutCue.Offer(pw, hitAt, gainDb);
+              }
+              return res;
+            };
+            const EdgeSweepResult res = resolveSweep(sw, 0.0f, false);
             // PARRIED BY AN NPC'S BLADE. The sweep reports; ending the stroke
             // is the caller's job, because MeleeSweepDamage has no business
             // reaching into whichever driver happens to own this swing
@@ -4240,78 +4305,52 @@ static void PhaseK(TickAuthorityCtx& w, WorldScratch& ws,
                 playerStrike.phaseTick = 0;
               }
             }
-            if (res.bodiesHit > 0) {
-              const bool severedLive = mobs.SeverEvents().size() > sev0;
-              // ---- ...AND DEAD FLESH IS STILL FLESH (2026-09-20) ---------
-              //
-              // This differencing trick has a blind spot and it is a whole
-              // population: a CORPSE fills neither queue — it has no voice to
-              // cry and its pieces are DebrisSystem's, not MobSystem's — so
-              // every blow on one fell through to the `chip` tier and a body
-              // being hacked apart on the ground sounded like a crate. The
-              // sweep now answers the question directly for that case
-              // (EdgeSweepResult::hitDeadFlesh), and the corpse's own sever
-              // rides the debris gore queue drained beside the mob one below.
-              const bool flesh =
-                  mobs.VoiceEvents().size() > voi0 || res.hitDeadFlesh;
-              const bool severed =
-                  severedLive || debris.GoreEvents().size() > gore0;
-              const Tuning::CombatFx& fx = CurrentTuning().combatfx;
-              // LATCHED, not acted on. This is inside the tick loop, which
-              // runs 0..4 times a frame; the frame loop drains it at the top
-              // of the next frame (see HitStop's note).
-              if (severed)
-                hitStop.Request(fx.hitStopSeverScale, fx.hitStopSeverMs);
-              else if (flesh)
-                hitStop.Request(fx.hitStopFleshScale, fx.hitStopFleshMs);
-              else
-                hitStop.Request(fx.hitStopChipScale, fx.hitStopChipMs);
-              // The impact cue, latched for the same reason and peak-held on
-              // power so one frame carrying four tick-hits plays the hardest
-              // of them once rather than four overlapping copies of nearly the
-              // same sound.
-              CombatCueRequest& q = flesh ? combatFleshCue : combatClangCue;
-              const float pw = res.power * res.edgeAlign;
-              // AT THE CONTACT POINT, not at the middle of the blade. The
-              // segment midpoint is where the WEAPON is; on a sword that is up
-              // to half a metre from the wound, and a listener standing right in
-              // front of what they just hit could hear the blow off to one side
-              // (reported 2026-09-19). `hitAt` is the probe ray's own hit
-              // position — the same place the kerf is bored.
-              const Vec3 hitAt = res.hasHitAt ? res.hitAt
-                                              : (sw.aNow + sw.bNow) * 0.5f;
-              if (!q.pending || pw > q.power) {
-                q.power = pw;
-                q.at = hitAt;
-              }
-              q.pending = true;
-              // Weapon impact layer: the sword's ring or the mace's thud,
-              // on ANY body contact regardless of flesh/armor.
-              const bool edged = sw.strike.cut > sw.strike.blunt;
-              if (!combatStrikeCue.pending || pw > combatStrikeCue.power) {
-                combatStrikeCue.power = pw;
-                combatStrikeCue.at = hitAt;
-                combatStrikeEdged = edged;
-              }
-              combatStrikeCue.pending = true;
-              // Wet cutting layer: edged weapons contacting flesh.
-              if (flesh && edged) {
-                if (!combatCutCue.pending || pw > combatCutCue.power) {
-                  combatCutCue.power = pw;
-                  combatCutCue.at = hitAt;
+            // ---- THE HAFT: the stick behind the head (item.h hasHaft) ---
+            // Swept after the head, from its own last position, with its own
+            // impulse set; skipped once the head was parried (the blow is
+            // over). `powerScale` makes the whole blow that much weaker.
+            Vec3 hb, ht;
+            float hhw = 0, hPow = 1, hDb = 0;
+            if (!res.arrested && s.lastHaftValid &&
+                avatar.HaftEdge(hb, ht, hhw, hPow, hDb)) {
+              EdgeSweep hs = sw;
+              hs.aPrev = s.lastHaftBase;
+              hs.bPrev = s.lastHaftTip;
+              hs.aNow = hb;
+              hs.bNow = ht;
+              hs.flatNow = Vec3{};
+              hs.halfWidth = hhw;
+              hs.carveBonus = 0.0f;
+              hs.powerScale = hPow;
+              hs.struck = &s.playerHaftStruck;
+              hs.bitten = nullptr;
+              const EdgeSweepResult hr = resolveSweep(hs, hDb, true);
+              if (hr.arrested) {
+                melee.Arrest();
+                if (playerStrike.Cutting()) {
+                  playerStrike.phase = StrokeCursor::Phase::Recover;
+                  playerStrike.phaseTick = 0;
                 }
-                combatCutCue.pending = true;
               }
             }
           }
           lastEdgeBase = eb;
           lastEdgeTip = et;
           lastEdgeValid = true;
+          {
+            Vec3 hb, ht;
+            float hhw = 0, hPow = 1, hDb = 0;
+            s.lastHaftValid = avatar.HaftEdge(hb, ht, hhw, hPow, hDb);
+            s.lastHaftBase = hb;
+            s.lastHaftTip = ht;
+          }
         } else {
           lastEdgeValid = false;   // sheathed or severed: no segment to sweep
+          s.lastHaftValid = false;
         }
       } else {
         lastEdgeValid = false;
+        s.lastHaftValid = false;
       }
 
       // prefab stamps drain after island ops (they win same-cell conflicts)
@@ -4950,7 +4989,9 @@ static bool UnarmedUsable(const Mob& body, const StyleLibrary& lib, Hand h) {
   auto usable = [&](int si) {
     const AttackStyle* sty = lib.At(si);
     if (sty == nullptr) return false;
-    if (sty->weapon.empty() || sty->weapon == "held") return false;
+    // A `held` style is thrown with THIS hand's fist (Mob::ArmForStyle).
+    if (sty->weapon.empty() || sty->weapon == "held")
+      return body.HandFist(h) != nullptr;
     const std::string name = StrokeMirrored(*sty, h) ? MirrorSideName(sty->weapon)
                                                      : sty->weapon;
     const MobNaturalWeaponDef* nw = body.NaturalWeaponNamed(name);

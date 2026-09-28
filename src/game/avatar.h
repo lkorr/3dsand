@@ -293,6 +293,11 @@ class PlayerAvatar : public Mob {
   // Model-space pose of a part, or identity when the part is gone. The camera
   // uses this to ride the head.
   bool PartWorldTransform(int part, Vec3& outPos, Quat& outRot) const;
+  // Where the ANIMATION puts a part this tick, in the same frame and form as
+  // PartWorldTransform (lattice corner + rotation) — answered for a severed or
+  // dead part too, because the pose is flattened over the whole skeleton. The
+  // spell in an amputated hand sits where the hand would be (SpellHandPoint).
+  bool PartPosedWorld(int part, Vec3& outPos, Quat& outRot) const;
   // World position of a part's joint anchor — where the camera boom pivots and
   // where a first-person eye sits.
   bool PartAnchorWorld(int part, Vec3& out) const;

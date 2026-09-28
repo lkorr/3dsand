@@ -5649,10 +5649,28 @@ bool Mob::ArmForStyle(const AttackStyle& sty) {
 bool Mob::ArmForStyle(const AttackStyle& sty, Hand hand) {
   if (sty.weapon.empty() || sty.weapon == "held") {
     ClearStrikeEffector();     // falls through to the held item
-    // THIS hand's item, and only if this hand can hold it: a stroke asked of
-    // an empty fist, or of an arm whose chain is broken, does not begin.
-    if (HeldSlot(hand) < 0 || !HandUsable(hand)) return false;
+    // THIS hand's item, and only if this hand can hold it: an arm whose
+    // chain is broken does not begin a stroke.
+    if (HeldSlot(hand) >= 0) {
+      if (!HandUsable(hand)) return false;
+      strikeHand_ = hand;
+      return true;
+    }
+    // AN EMPTY HAND THROWS THE SAME STROKE WITH ITS FIST (2026-09-27). The
+    // directional strikes are the unarmed strikes too: the arm follows the
+    // same keyed poses and the knuckles are the edge, exactly as a style
+    // authored on `fist.R` arms it below. No fist on this hand (a rig with
+    // none, or its arm broken) and the stroke does not begin.
+    const MobNaturalWeaponDef* fist = HandFist(hand);
+    if (fist == nullptr) return false;
     strikeHand_ = hand;
+    int handPart = -1;
+    const bool chained =
+        ChainForEffector(skel_, fist->partIndex, handPart) != nullptr;
+    SetStrikeEffector(fist->partIndex,
+                      chained ? StrikeEffectorMode::Chain
+                              : StrikeEffectorMode::Aim,
+                      def_ != nullptr ? def_->FindNatural(fist->name) : -1);
     return true;
   }
   // A SIDED natural weapon is taken on the asked hand: the style authored on
@@ -5732,6 +5750,16 @@ Hand Mob::StrokeHandFor(const AttackStyle& sty, uint32_t tick) const {
 }
 
 // ---- THE ARM BEHIND A HAND (dual wielding) ----------------------------------
+const MobNaturalWeaponDef* Mob::HandFist(Hand h) const {
+  if (def_ == nullptr) return nullptr;
+  const int hp = HandPart(h);
+  if (hp < 0) return nullptr;
+  for (const MobNaturalWeaponDef& nw : def_->natural)
+    if (nw.partIndex == hp)
+      return NaturalWeaponUsable(nw) ? &nw : nullptr;
+  return nullptr;
+}
+
 int Mob::HandPart(Hand h) const {
   if (def_ == nullptr) return -1;
   const int si = def_->FindSocket(HandContext(h));
@@ -5914,9 +5942,12 @@ void MobSystem::StartStroke(Mob& mob, int styleIndex, uint64_t targetId,
   // THE HELD WEAPON'S OWN VERSION of the stroke (strokes.h WEAPON FORMS):
   // the same resolve the player's press does, so a dagger in an NPC's fist
   // swings the dagger form the player's does.
+  // ...and an EMPTY-HANDED creature swings the `unarmed` form (its fist).
   if (items_ != nullptr)
-    if (const ItemDef* held = items_->Named(mob.HeldItem()))
-      styleIndex = styles_.ResolveForm(styleIndex, WeaponFormOf(held->weaponClass));
+    styleIndex = styles_.ResolveForm(
+        styleIndex,
+        FormForItem(mob.HeldItem().empty() ? nullptr
+                                           : items_->Named(mob.HeldItem())));
   const AttackStyle& sty = *styles_.At(styleIndex);
   NpcStroke& st = mob.stroke_;
   st = NpcStroke{};
@@ -6085,7 +6116,16 @@ float MobSystem::StyleReachOn(const Mob& mob, const AttackStyle& sty) const {
   // with nothing at all for an empty-handed creature. The chain is found the
   // same way `ArmForStyle` finds it, and measured off the same live bones.
   float effector = 0.0f;
-  if (const MobNaturalWeaponDef* nw = mob.NaturalWeaponNamed(sty.weapon)) {
+  // A `held` style on an EMPTY-HANDED body is thrown with a fist
+  // (Mob::ArmForStyle), so it reaches what that fist reaches.
+  const bool heldStyle = sty.weapon.empty() || sty.weapon == "held";
+  const MobNaturalWeaponDef* styleNw =
+      !heldStyle ? mob.NaturalWeaponNamed(sty.weapon)
+      : mob.HeldItem().empty()
+          ? (mob.HandFist(Hand::Right) ? mob.HandFist(Hand::Right)
+                                       : mob.HandFist(Hand::Left))
+          : nullptr;
+  if (const MobNaturalWeaponDef* nw = styleNw) {
     // THE EDGE COUNTS ONLY WHERE IT POINTS FORWARD. For an AIM effector it is
     // the reach -- the jaws ARE the segment, and the segment is the head's
     // forward. For a CHAIN effector it is a fist's wrist-to-knuckle line,
@@ -6573,6 +6613,35 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
       st.phase = NpcStroke::Phase::Recover;
       st.phaseTick = 0;
     }
+    // ---- THE HAFT (item.h hasHaft): the stick behind a mace's head -------
+    // The same blow at `powerScale` of its strength, from the haft's own last
+    // position, its own impulse set; not once the head was parried.
+    Vec3 hb, ht;
+    float hhw = 0, hPow = 1, hDb = 0;
+    if (!res.arrested && st.haftValid &&
+        mob.HaftEdge(hb, ht, hhw, hPow, hDb)) {
+      EdgeSweep hs = sw;
+      hs.aPrev = st.haftBase;
+      hs.bPrev = st.haftTip;
+      hs.aNow = hb;
+      hs.bNow = ht;
+      hs.flatNow = Vec3{};
+      hs.halfWidth = hhw;
+      hs.carveBonus = 0.0f;
+      hs.powerScale = hPow;
+      hs.struck = &st.haftStruck;
+      hs.bitten = nullptr;
+      const EdgeSweepResult hr =
+          MeleeSweepDamage(hs, st.melee.tuning, mob, *phys_, *this, *debris_,
+                           world, spawns);
+      st.bodiesHit += hr.bodiesHit;
+      if (hr.arrested) {
+        st.arrested = true;
+        st.melee.Arrest();
+        st.phase = NpcStroke::Phase::Recover;
+        st.phaseTick = 0;
+      }
+    }
   }
   if (haveEdge) {
     st.edgeBase = base;
@@ -6580,6 +6649,13 @@ void MobSystem::StepStroke(Mob& mob, uint32_t tick, World& world,
     st.edgeValid = true;
   } else {
     st.edgeValid = false;
+  }
+  {
+    Vec3 hb, ht;
+    float hhw = 0, hPow = 1, hDb = 0;
+    st.haftValid = haveEdge && mob.HaftEdge(hb, ht, hhw, hPow, hDb);
+    st.haftBase = hb;
+    st.haftTip = ht;
   }
 
   // ---- 2. WHERE THE BLADE IS NOW, so the driver steers from the truth ------
@@ -20688,6 +20764,23 @@ bool Mob::BluntHit(uint64_t bodyHandle, const ::BluntHit& hit, World& world,
     }
   if (li < 0) return true;
 
+  // ---- A HARD BLOW TO THE HEAD CAN DROP YOU (2026-09-27) -------------------
+  //
+  // Trauma to the head at or above gore.headKnockPower (the sweep's speed x
+  // alignment x segment scale, so a mace's haft at 0.2 never qualifies) has a
+  // gore.headKnockChance of putting the creature on the ground: limp for
+  // gore.headKnockSeconds, then the ordinary get-up. Player and NPC alike --
+  // this is the one door every blunt blow to a body comes through, including
+  // one transmitted through a helmet. The roll is the blow's own seed, so the
+  // same fight falls the same way every time.
+  if ((size_t)li < limbDefs_.size() && limbDefs_[(size_t)li].tag == "head" &&
+      alive_ && power >= gt.headKnockPower && gt.headKnockChance > 0.0f) {
+    uint32_t h = hit.seed ^ 0x6EADB10Bu;
+    h ^= h >> 16; h *= 0x7FEB352Du; h ^= h >> 15; h *= 0x846CA68Bu; h ^= h >> 16;
+    if ((float)(h & 0xFFFFu) / 65536.0f < gt.headKnockChance)
+      StartRagdoll(gt.headKnockSeconds, "head blow");
+  }
+
   // The contact point in the limb's own frame, which is what both the bruise
   // and the dent are placed in. Read from the limb's live transform, once.
   phys_->GetTransform(limbs_[li].body, limbs_[li].xf);
@@ -25742,6 +25835,12 @@ bool Mob::EquipItem(const ItemDef* item, const char* context) {
   ld.edgeHalfWidth = item->edgeHalfWidth;
   ld.hasEdgeFlat = item->hasEdgeFlat;
   ld.edgeFlat = item->edgeFlat;
+  ld.hasHaft = item->hasHaft;
+  ld.haftFrom = item->haftFrom;
+  ld.haftTo = item->haftTo;
+  ld.haftHalfWidth = item->haftHalfWidth;
+  ld.haftPower = item->haftPower;
+  ld.haftGainDb = item->haftGainDb;
   ld.microModel = item->microModel;
 
   AnimPart& ap = skel_.parts[slot];
@@ -27763,8 +27862,12 @@ bool StyleUsable(const Mob& who, const AttackStyle& sty) {
   // "held": SOMETHING in either fist (dual wielding). Which hand then swings
   // it is the stroke's to choose (MobSystem::StartStroke / the player's
   // button); the style vocabulary only asks whether it can be swung at all.
+  // ...or an EMPTY fist to throw it with (Mob::ArmForStyle: the directional
+  // strikes are the unarmed strikes too).
   if (sty.weapon.empty() || sty.weapon == "held")
-    return who.HeldSlot(Hand::Right) >= 0 || who.HeldSlot(Hand::Left) >= 0;
+    return who.HeldSlot(Hand::Right) >= 0 || who.HeldSlot(Hand::Left) >= 0 ||
+           (who.HeldSlot(Hand::Right) < 0 && who.HandFist(Hand::Right)) ||
+           (who.HeldSlot(Hand::Left) < 0 && who.HandFist(Hand::Left));
   const MobNaturalWeaponDef* nw = who.NaturalWeaponNamed(sty.weapon);
   return nw != nullptr && who.NaturalWeaponUsable(*nw);
 }
@@ -29182,6 +29285,29 @@ bool Mob::WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
   // MeleeEdgeAlign reads that as "no evidence" rather than as a bad angle.
   if (outFlat)
     *outFlat = ld.hasEdgeFlat ? QuatRotate(q, ld.edgeFlat) : Vec3{};
+  return true;
+}
+
+bool Mob::HaftEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
+                   float& outPower, float& outGainDb) const {
+  if (!def_) return false;
+  int effPart = -1, effNatural = -1;
+  StrikeEffectorMode effMode = StrikeEffectorMode::None;
+  if (!ResolveEffector(effPart, effMode, effNatural)) return false;
+  if (effMode != StrikeEffectorMode::Held) return false;
+  const int heldPart = HeldSlot();
+  if (heldPart < 0 || heldPart >= (int)limbDefs_.size()) return false;
+  const MobLimbDef& ld = limbDefs_[heldPart];
+  if (!ld.hasHaft || !LimbAlive(heldPart)) return false;
+  const MobLimb& p = limbs_[heldPart];
+  if (!p.body) return false;
+  // WeaponEdge's composition exactly: min-corner transform, no rebasing.
+  Quat q{p.xf.quat[0], p.xf.quat[1], p.xf.quat[2], p.xf.quat[3]};
+  outBase = p.xf.pos + QuatRotate(q, ld.haftFrom);
+  outTip = p.xf.pos + QuatRotate(q, ld.haftTo);
+  outHalfWidth = ld.haftHalfWidth;
+  outPower = ld.haftPower;
+  outGainDb = ld.haftGainDb;
   return true;
 }
 

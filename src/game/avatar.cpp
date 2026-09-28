@@ -1139,6 +1139,20 @@ bool PlayerAvatar::PartWorldTransform(int part, Vec3& outPos,
   return true;
 }
 
+bool PlayerAvatar::PartPosedWorld(int part, Vec3& outPos, Quat& outRot) const {
+  if (def_ == nullptr || part < 0 || part >= (int)limbs_.size() ||
+      part >= (int)anim_.model.size())
+    return false;
+  // SubmitPose's body frame, without the get-up blend: yaw, then the slope
+  // tilt, about the footprint centre.
+  const Quat bodyRot =
+      Mul(QuatFromTo({0, 1, 0}, bodyUp_), AxisAngle({0, 1, 0}, heading_));
+  const Vec3 yawPivot{def_->worldSize.x * 0.5f, 0, def_->worldSize.z * 0.5f};
+  LimbTargetFor((size_t)part, Vec3{origin_.x, bodyY_, origin_.z}, bodyRot,
+                yawPivot, outPos, outRot);
+  return true;
+}
+
 bool PlayerAvatar::PartAnchorWorld(int part, Vec3& out) const {
   if (part < 0 || part >= (int)limbs_.size()) return false;
   const MobLimb& p = limbs_[part];

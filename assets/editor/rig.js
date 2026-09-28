@@ -3482,6 +3482,31 @@ function pushStrokeTrail() {
       segs.push({ a: [a.x, a.y, a.z], b: [b.x, b.y, b.z], color: 0xff7a3a, alpha });
     }
   }
+  // THE HAFT'S RIBBON (a mace's stick): its own shade -- sea-green, and
+  // dimmer than the head's -- because it is the same kind of hitbox at a
+  // fraction of the strength (sidecar `haft.power`). Its in-between rows are
+  // drawn too, fainter, so a gap in the stick's coverage is visible like one
+  // in the head's.
+  for (let i = 0; i < n; i++) {
+    const s = strokeTrail[i];
+    if (!s.haftBase || !s.haftTip) continue;
+    const age = (i + 1) / n;
+    const cut = s.phase === MELEE.STROKE_PHASE.Cut;
+    segs.push({ a: [s.haftBase.x, s.haftBase.y, s.haftBase.z],
+                b: [s.haftTip.x, s.haftTip.y, s.haftTip.z],
+                color: cut ? 0x5fd6a4 : 0x3f7f86,
+                alpha: (cut ? 0.25 : 0.1) + age * (cut ? 0.45 : 0.2) });
+    const p = i > 0 ? strokeTrail[i - 1] : null;
+    if (!cut || !p || !p.haftBase || !p.haftTip) continue;
+    const steps = clamp(Math.ceil(AN.vlen(AN.vsub(s.haftTip, p.haftTip)) / spacing), 1, cap);
+    const alpha = 0.08 + 0.2 * age;
+    for (let k = 1; k < steps; k++) {
+      const u = k / steps;
+      const a = AN.vadd(p.haftBase, AN.vmul(AN.vsub(s.haftBase, p.haftBase), u));
+      const b = AN.vadd(p.haftTip, AN.vmul(AN.vsub(s.haftTip, p.haftTip), u));
+      segs.push({ a: [a.x, a.y, a.z], b: [b.x, b.y, b.z], color: 0x2f9f78, alpha });
+    }
+  }
   ed.setStrokeTrail?.(goalMarkerSegs ? segs.concat(goalMarkerSegs) : segs);
 }
 
@@ -3803,7 +3828,19 @@ function resolveEffector() {
 function armForStyle(sty) {
   if (!sty || !sty.weapon || sty.weapon === 'held') {
     clearStrikeEffector();
-    return wpHandPart >= 0;
+    if (wpHandPart < 0) return false;
+    if (heldItemId) return true;
+    // mob.cpp Mob::ArmForStyle: AN EMPTY HAND THROWS THE STROKE WITH ITS
+    // FIST -- the natural weapon on the hand part -- so the preview swings
+    // (and trails) the knuckles, as the game does.
+    const NW = naturalList();
+    const ni = NW.findIndex(w => w && w.part && skel.findPart(w.part) === wpHandPart);
+    if (ni < 0 || !naturalUsable(NW[ni])) return true;
+    const out = {};
+    strikeEff = wpHandPart;
+    strikeMode = chainForEffector(wpHandPart, out) >= 0 ? 'chain' : 'aim';
+    strikeNatural = ni;
+    return true;
   }
   const ni = naturalIndexNamed(sty.weapon);
   const nw = ni >= 0 ? naturalList()[ni] : null;
@@ -3999,9 +4036,22 @@ function weaponArmSeed() {
  * Y-up with (x, z, -y) and does NOT rebase on the model origin (they already
  * lie on it). Both are reproduced here.
  */
-function bladeSegmentModel() {
+function bladeSegmentModel() { return itemSegmentModel(itemSc?.edge); }
+
+/**
+ * The held item's HAFT (sidecar `haft`, item.h ItemDef::hasHaft): the weak
+ * second striking segment -- a mace's stick -- through exactly the same map
+ * as the edge. Only while the held item is what is swinging; a fist style
+ * with a mace in the other hand has no haft in the blow.
+ */
+function haftSegmentModel() {
+  if (resolveEffector().mode !== 'held') return null;
+  return itemSegmentModel(itemSc?.haft);
+}
+
+/** One authored item segment (`edge` or `haft`) in MODEL space, file voxels. */
+function itemSegmentModel(e) {
   const xf = heldItemTransform();
-  const e = itemSc?.edge;
   if (!xf || !e) return null;
   const ax = Array.isArray(e.axis) && e.axis.length === 3
     ? { x: +e.axis[0] || 0, y: +e.axis[1] || 0, z: +e.axis[2] || 0 }
@@ -5367,7 +5417,12 @@ function recordStrokeTrail() {
   // applied by the renderer (modelTransform), so a trail sampled in model space
   // would stay behind on the launch pad while the creature flew away from it.
   const lo = lungeOffsetModel();
+  // The haft rides the same record (null when the item authors none), so its
+  // ribbon is sampled on exactly the ticks the head's is.
+  const haft = haftSegmentModel();
   strokeTrail.push({ base: AN.vadd(blade.base, lo), tip: AN.vadd(blade.tip, lo),
+                     haftBase: haft ? AN.vadd(haft.base, lo) : null,
+                     haftTip: haft ? AN.vadd(haft.tip, lo) : null,
                      phase: strokeCur.phase });
   while (strokeTrail.length > kStrokeTrailMax) strokeTrail.shift();
 }
@@ -6804,12 +6859,40 @@ function keyedCtx() {
   const hm = anim.model[handIdx];
   const tipRel = blade && hm ? AN.qrotinv(hm.rot, AN.vsub(blade.tip, hm.pos)) : AN.v3();
   const flatRel = blade && hm && blade.flat ? AN.qrotinv(hm.rot, blade.flat) : AN.v3(0, 0, 1);
+  // THE WRIST'S HANDLE LEVER, in the hand's frame. With a blade it IS the
+  // blade (tip + flat). An EMPTY hand -- a fist style, or a sword style
+  // previewed unarmed -- has no blade, and the tip/roll handles were the only
+  // way to turn the wrist, so it gets a stand-in: a pointer out of the fist
+  // (toward the natural weapon's knuckles when there is one, else along the
+  // forearm) and a flat square to it. HANDLES ONLY: tipRel stays zero, so
+  // what a bake or a mirror measures (fk.T) is unchanged for a fist.
+  let wristRel = tipRel, wristFlat = flatRel;
+  // FIXED IN THE HAND'S FRAME, never re-read off the drawn forearm: a lever
+  // that re-aimed itself along the arm every redraw would never show the bend.
+  if (!blade && hp >= 0 && hm) {
+    let local = null;
+    const edge = effectorEdgeModel();
+    if (edge && edge.part === hp) {
+      const d = AN.qrotinv(hm.rot, AN.vsub(edge.tip, hm.pos));
+      if (AN.vlen(d) > 1e-3) local = AN.vnorm(d);
+    }
+    if (!local) {
+      // The forearm's line at REST, in the hand's own frame: the elbow-to-
+      // wrist offset (rest.pos, forearm frame) un-turned by the hand's rest
+      // rotation.
+      const r = skel.parts[hp].rest;
+      local = r && AN.vlen(r.pos) > 1e-3
+        ? AN.qrotinv(r.rot || AN.qid(), AN.vnorm(r.pos)) : AN.v3(0, -1, 0);
+    }
+    wristRel = AN.vmul(local, 3 * rigScale());
+    wristFlat = perps(local)[0];
+  }
   return {
     parts, P, S: anim.model[parts[0]].pos,
     eOff: relPosOf(parts[1]),
     hOff: hp >= 0 ? relPosOf(hp) : skel.parts[parts[1]].rest.pos,
     wAnim: hp >= 0 ? weaponArmLocals(parts)[2] : null,
-    tipRel, flatRel,
+    tipRel, flatRel, wristRel, wristFlat, bladed: !!blade,
   };
 }
 function keyedFK(ctx, pose, aim) {
@@ -6822,7 +6905,9 @@ function keyedFK(ctx, pose, aim) {
   const E = AN.vadd(ctx.S, AN.qrot(U, ctx.eOff));
   const H = AN.vadd(E, AN.qrot(F, ctx.hOff));
   const T = AN.vadd(H, AN.qrot(W, ctx.tipRel));
-  return { U, F, W, S: ctx.S, E, H, T };
+  // The wrist handles' lever end: the blade tip, or an empty hand's stand-in.
+  const Tw = AN.vadd(H, AN.qrot(W, ctx.wristRel || ctx.tipRel));
+  return { U, F, W, S: ctx.S, E, H, T, Tw };
 }
 // Model rotations back to a STORED pose: parent-relative, the aim turn taken
 // back off the shoulder.
@@ -6968,14 +7053,19 @@ function drawKeyedHandles() {
     { id: 'karm', pos: P(AN.vmul(AN.vadd(fk.S, fk.E), 0.5)), text: 'arm', color: '#8fd3ff',
       title: 'drag: turn the WHOLE ARM about the shoulder, blade and all' },
   ];
-  if (AN.vlen(AN.vsub(fk.T, fk.H)) > 0.5 * S) {
-    list.push({ id: 'ktip', pos: P(fk.T), text: '✥ tip', color: '#ffc857',
-      title: 'drag: point the BLADE (the wrist turns; the hand stays put)' });
-    const mid = AN.vmul(AN.vadd(fk.H, fk.T), 0.5);
-    const flat = AN.qrot(fk.W, ctx.flatRel);
+  // The WRIST: on the blade, or on an empty hand's stand-in pointer (keyedCtx
+  // wristRel) so a fist can be bent and rolled too.
+  if (AN.vlen(AN.vsub(fk.Tw, fk.H)) > 0.5 * S) {
+    const bl = ctx.bladed;
+    list.push({ id: 'ktip', pos: P(fk.Tw), text: bl ? '✥ tip' : '✥ wrist', color: '#ffc857',
+      title: bl ? 'drag: point the BLADE (the wrist turns; the hand stays put)'
+                : 'drag: BEND THE WRIST — point the fist (the hand stays put)' });
+    const mid = AN.vmul(AN.vadd(fk.H, fk.Tw), 0.5);
+    const flat = AN.qrot(fk.W, ctx.wristFlat);
     list.push({ id: 'kroll', pos: P(AN.vadd(mid, AN.vmul(AN.vnorm(flat), 1.5 * S))),
       text: '⟳ roll', color: '#e8a0ff',
-      title: 'drag: ROLL the blade about its own length (which way the edge faces)' });
+      title: bl ? 'drag: ROLL the blade about its own length (which way the edge faces)'
+                : 'drag: ROLL the fist about the forearm line (which way the knuckles face)' });
   }
   ed.setPoseHandles?.(list, keyedDragCb);
 }
@@ -7020,7 +7110,7 @@ const keyedDragCb = {
       if (id === 'ktip' || id === 'karm') {
         // Two rotations about axes square to the pivot-to-point line.
         const pivot = id === 'ktip' ? fk.H : fk.S;
-        const pt = id === 'ktip' ? fk.T : AN.vmul(AN.vadd(fk.S, fk.E), 0.5);
+        const pt = id === 'ktip' ? fk.Tw : AN.vmul(AN.vadd(fk.S, fk.E), 0.5);
         const dir = AN.vsub(pt, pivot);
         if (AN.vlen(dir) < 1e-4) return;
         const [a1, a2] = perps(AN.vnorm(dir));
@@ -7036,11 +7126,11 @@ const keyedDragCb = {
           fk.W = AN.qnorm(AN.qmul(Q, fk.W));
         }
       } else if (id === 'kroll') {
-        const ax = AN.vsub(fk.T, fk.H);
+        const ax = AN.vsub(fk.Tw, fk.H);
         if (AN.vlen(ax) < 1e-4) return;
         const axis = AN.vnorm(ax);
-        const mid = AN.vmul(AN.vadd(fk.H, fk.T), 0.5);
-        const pt = AN.vadd(mid, AN.vmul(AN.vnorm(AN.qrot(fk.W, ctx.flatRel)), 1.5 * rigScale()));
+        const mid = AN.vmul(AN.vadd(fk.H, fk.Tw), 0.5);
+        const pt = AN.vadd(mid, AN.vmul(AN.vnorm(AN.qrot(fk.W, ctx.wristFlat)), 1.5 * rigScale()));
         const J = jac(a => { const v = rotAboutPt(AN.qaxisangle(axis, a), mid, pt); return [v.x, v.y, v.z]; }, 0, 1e-3);
         const d = capStep(solve1(J, dx, dy));
         fk.W = AN.qnorm(AN.qmul(AN.qaxisangle(axis, d), fk.W));

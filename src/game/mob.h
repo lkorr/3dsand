@@ -129,6 +129,13 @@ struct MobLimbDef {
   // way a held sword does.
   bool hasEdgeFlat = false;
   Vec3 edgeFlat{0, 1, 0};
+  // A HELD ITEM'S HAFT (item.h ItemDef::hasHaft), copied in with the edge by
+  // AppendHeldItem: the weak second striking segment, same frame and units.
+  bool hasHaft = false;
+  Vec3 haftFrom{}, haftTo{};
+  float haftHalfWidth = 0;
+  float haftPower = 0.2f;
+  float haftGainDb = -12.0f;
   // Index into the shared micro-body model pool (sim/microbody.h), or -1 for
   // the cube path. Only ever set for defs with skinScale > 1; a limb whose
   // model failed to pack keeps -1 and simply does not render (cube instances
@@ -2441,6 +2448,11 @@ class Mob {
   // publishes no socket for it. By the SOCKET, not by name, so a left-handed
   // def that puts `held_right` on hand.L answers for that hand.
   int HandPart(Hand h) const;
+  // THE FIST ON THIS HAND: the natural weapon whose part is HandPart(h)
+  // (human: fist.R / fist.L), if it is usable now -- else nullptr. What an
+  // EMPTY hand throws a `held` style with (ArmForStyle, StyleUsable): the
+  // directional strikes are the fist's strikes too, not a separate punch set.
+  const MobNaturalWeaponDef* HandFist(Hand h) const;
   // HOW WELL THIS ARM WORKS, 0..1: the weakest of the parts that serve the
   // hand (the arm chain ending at it, and the hand itself), each as hp over
   // the hp it was authored with. 0 when any of them is severed or dead — a
@@ -3062,6 +3074,12 @@ class Mob {
   // read off the same live transform the segment is.
   bool WeaponEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
                   Vec3* outFlat = nullptr) const;
+  // THE HELD ITEM'S HAFT, the same way: the weak second segment (a mace's
+  // stick) on the item's live transform, plus the power scale and the cue
+  // gain a hit off it takes. False with no held item, no haft authored, a
+  // natural weapon as the effector, or the item severed.
+  bool HaftEdge(Vec3& outBase, Vec3& outTip, float& outHalfWidth,
+                float& outPower, float& outGainDb) const;
   // Is this Jolt body one of this creature's own parts?
   bool OwnsBody(uint64_t bodyHandle) const;
   // WHERE A LIMB'S JOINT IS, in world voxels, off its LIVE transform.

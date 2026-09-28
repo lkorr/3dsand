@@ -691,7 +691,7 @@ function renderWeaponModeBar() {
       if (want) await host?.equipWeapon?.(want);
       else await host?.equipWeapon?.(null, true);
       render();
-    }, m.id === 'unarmed' ? 'empty hands — punches'
+    }, m.id === 'unarmed' ? 'empty hands — the directional strikes thrown with a fist (forms.unarmed)'
      : m.id === 'short'   ? 'short blades — dagger, shortsword (weaponClass "short")'
      : m.id === 'long'    ? 'long blades — sword, cleaver (weaponClass "long")'
      :                       'blunt — mace (weaponClass "blunt")'));

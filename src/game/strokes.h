@@ -667,11 +667,21 @@ struct AttackStyle {
 // Resolved ONCE, at the stroke's start (the player's press and
 // MobSystem::StartStroke), into a separate library entry, so every runner
 // below sees an ordinary AttackStyle.
-constexpr int kWeaponForms = 3;
-extern const char* const kWeaponFormNames[kWeaponForms];   // short, long, blunt
+//
+// `unarmed` IS A FORM TOO (2026-09-27): an EMPTY hand throws the held styles
+// with its fist (Mob::ArmForStyle), and `forms.unarmed` is how those strikes
+// get their own poses. It is never an item's weaponClass; the stroke's start
+// resolves it when the striking hand holds nothing (FormForItem).
+constexpr int kWeaponForms = 4;
+extern const char* const kWeaponFormNames[kWeaponForms];   // short, long, blunt, unarmed
+constexpr int kFormUnarmed = 3;
 // An item's weaponClass -> its form index; -1 for none/unknown (the style's
 // own frames).
 int WeaponFormOf(const std::string& weaponClass);
+// THE FORM A STROKE SWUNG WITH THIS ITEM TAKES: its class's, or `unarmed`
+// for an empty hand (nullptr).
+struct ItemDef;
+int FormForItem(const ItemDef* item);
 
 // THE PLAYER'S FLICK COMPASS (the `player` block of attack_styles.json): a
 // screen-space direction per style, quantized by max dot at the attack press.
@@ -940,6 +950,11 @@ struct NpcStroke : StrokeCursor {
   // inventing one is a free hit at the start of every swing.
   Vec3 edgeBase{}, edgeTip{};
   bool edgeValid = false;
+  // ...and the held item's HAFT (Mob::HaftEdge), swept beside it, with its
+  // own once-per-stroke impulse set so a stick graze never spends the head's.
+  Vec3 haftBase{}, haftTip{};
+  bool haftValid = false;
+  std::vector<uint64_t> haftStruck;
   // Set when a parry arrested this stroke (game/melee.h EdgeSweepResult), so
   // the dev readout and the gates can tell "it finished" from "it was stopped".
   bool arrested = false;

@@ -2187,8 +2187,9 @@ export function migrateRawToFrames(json) {
   return true;
 }
 
-// strokes.h kWeaponFormNames: the weapon classes a style may have a version for.
-export const WEAPON_FORMS = ['short', 'long', 'blunt'];
+// strokes.h kWeaponFormNames: the weapon classes a style may have a version
+// for -- plus `unarmed`, the version an EMPTY hand throws with its fist.
+export const WEAPON_FORMS = ['short', 'long', 'blunt', 'unarmed'];
 
 /**
  * strokes.cpp:32 LoadAttackStyles. Returns { styles, player, playerUnarmed, log }.

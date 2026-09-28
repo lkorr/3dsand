@@ -2563,20 +2563,32 @@ Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
   check(lib.playerUnarmed.sectors.size() >= 3,
         "...with at least three directions");
   check(lib.playerUnarmed.neutral[0] >= 0 && lib.playerUnarmed.neutral[1] >= 0,
-        "...and both neutral-alternate punches resolve");
+        "...and both neutral-alternate strikes resolve");
   check(!ad.natural.empty(),
         "the avatar's def declares natural weapons at all");
   std::vector<int> unarmedStyles;
   for (const PlayerStrikeMap::Sector& s : lib.playerUnarmed.sectors) {
     const AttackStyle* sty = lib.At(s.style);
     if (sty == nullptr) continue;
-    check(sty->weapon != "held",
-          "playerUnarmed sector -> \"" + sty->name + "\" is a fist style");
-    check(ad.FindNatural(sty->weapon) >= 0,
-          "...whose weapon \"" + sty->weapon + "\" the avatar rig declares");
-    if (std::find(unarmedStyles.begin(), unarmedStyles.end(), s.style) ==
+    // FISTS THROW THE DIRECTIONAL STRIKES (2026-09-27): a sector may name a
+    // `held` style, which an empty hand throws with its own fist
+    // (Mob::ArmForStyle); anything else must be a natural weapon the rig has.
+    const bool held = sty->weapon.empty() || sty->weapon == "held";
+    check(held || ad.FindNatural(sty->weapon) >= 0,
+          "playerUnarmed sector -> \"" + sty->name +
+              "\" is held (thrown with a fist) or names a natural weapon the "
+              "avatar rig declares");
+    // THE STYLE THE PRESS ACTUALLY SWINGS: the empty hand's `unarmed` form
+    // (strokes.h FormForItem), resolved exactly as the player's press does.
+    // A held sector must have one authored -- otherwise the fist swings the
+    // sword's poses and nothing an author tunes for fists would reach it.
+    const int formed = lib.ResolveForm(s.style, FormForItem(nullptr));
+    if (held)
+      check(formed != s.style,
+            "...and \"" + sty->name + "\" has an authored forms.unarmed");
+    if (std::find(unarmedStyles.begin(), unarmedStyles.end(), formed) ==
         unarmedStyles.end())
-      unarmedStyles.push_back(s.style);
+      unarmedStyles.push_back(formed);
   }
   // EVERY NATURAL WEAPON'S EDGE IS REAL. A degenerate one (from == to) has no
   // direction for the driver to steer and no segment for the sweep to sweep,
@@ -2682,9 +2694,15 @@ Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
     // ---- 2. THE EFFECTOR ---------------------------------------------------
     check(avatar.ArmForStyle(sty),
           "style \"" + sty.name + "\" arms an effector on the avatar");
+    // A `held` style on an empty hand arms THAT HAND'S fist; a fist style
+    // arms the weapon it names.
     const MobNaturalWeaponDef* nw = avatar.EffectorWeapon();
-    check(nw != nullptr && nw->name == sty.weapon,
-          "...which is the natural weapon the style named");
+    const bool heldStyle = sty.weapon.empty() || sty.weapon == "held";
+    const MobNaturalWeaponDef* want =
+        heldStyle ? avatar.HandFist(avatar.StrikeHand()) : nullptr;
+    check(nw != nullptr &&
+              (heldStyle ? nw == want : nw->name == sty.weapon),
+          "...which is the fist the style resolves to");
     check(avatar.StrikeEffectorKind() == StrikeEffectorMode::Chain,
           "...on a CHAIN effector (a fist is on an arm, not aimed like jaws)");
     Vec3 eb0, et0, ef0;
@@ -2794,8 +2812,12 @@ Status GatePlayerUnarmed(Ctx& c, std::string& detail) {
     const float dr = rMax > rMin ? rMax - rMin : 0.0f;
     const std::string n = "\"" + sty.name + "\"";
     check(cutTicks >= 2, "style " + n + " spent time cutting");
-    check(cmdAzArc + cmdElArc + dr > minSweep,
-          "style " + n + ": the stroke actually drove a channel");
+    // A KEYED style (frames are poses) moves the arm by its joints, not by
+    // the driver's az/el channels, so its evidence is the knuckles' own
+    // travel -- the same allowance player-styles makes for the sword.
+    check(cmdAzArc + cmdElArc + dr > minSweep ||
+              (sty.Keyed() && edgeTravel > minEdgeTravel),
+          "style " + n + ": the stroke actually drove the arm");
     // ---- 3. THE ARM ------------------------------------------------------
     check(edgeTravel > minEdgeTravel,
           "style " + n + ": the FIST moved through the world, not just the "

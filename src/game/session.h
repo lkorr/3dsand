@@ -60,6 +60,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -236,6 +237,18 @@ struct CombatCueRequest {
   bool pending = false;
   float power = 0.0f;  // 0..1
   Vec3 at{};
+  float gainDb = 0.0f; // extra level (a haft hit is -12); peak-held with power
+  // Latch a hit, keeping the LOUDER of this frame's candidates: power and
+  // gain together, so a soft haft thud never displaces a full ball hit.
+  void Offer(float pw, const Vec3& where, float db = 0.0f) {
+    const auto loud = [](float p, float g) { return p * std::pow(10.0f, g / 20.0f); };
+    if (!pending || loud(pw, db) > loud(power, gainDb)) {
+      power = pw;
+      at = where;
+      gainDb = db;
+    }
+    pending = true;
+  }
 };
 
 // THE HIT-STOP DIP. `pendScale`/`pendMs` are written INSIDE the tick loop,
@@ -639,6 +652,11 @@ struct PlayerSession {
   StrikePickNote lastStrikePick;
   Vec3 lastEdgeBase{}, lastEdgeTip{};
   bool lastEdgeValid = false;
+  // The held item's HAFT, swept the same way (Mob::HaftEdge), and its own
+  // once-per-stroke impulse set so a stick graze cannot spend the ball's.
+  Vec3 lastHaftBase{}, lastHaftTip{};
+  bool lastHaftValid = false;
+  std::vector<uint64_t> playerHaftStruck;
   // The STRIKE aim ray's ignore list. Its own vector rather than a share of
   // `lookIgnore`: that one is filled in the frame block and read by the E
   // prompt, and the melee ray runs inside the tick loop, where overwriting it

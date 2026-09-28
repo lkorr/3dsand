@@ -1623,6 +1623,14 @@ struct Tuning {
     float unarmedBleedScale = TPD(gore, unarmedBleedScale);
     float unarmedCarveRadius = TPD(gore, unarmedCarveRadius);
     float unarmedPulpCarveFrom = TPD(gore, unarmedPulpCarveFrom);
+    // KNOCKED DOWN BY A BLOW TO THE HEAD (Mob::BluntHit). Blunt trauma (mace,
+    // fist, a bite's blow through armour) landing on the HEAD at or above
+    // `headKnockPower` -- the sweep's 0..1 power, speed x alignment x segment
+    // scale -- has `headKnockChance` of ragdolling the creature for
+    // `headKnockSeconds` before it may get up. Rolled on the blow's own seed.
+    float headKnockPower = TPD(gore, headKnockPower);
+    float headKnockChance = TPD(gore, headKnockChance);
+    float headKnockSeconds = TPD(gore, headKnockSeconds);
     // A BITE. Radius of the tear in world voxels at full power, scaled by
     // (0.4 + 0.6 * power); `biteBlob` is the correlated noise's feature size
     // in SKIN voxels, i.e. the size of one piece that comes away. Same pair,

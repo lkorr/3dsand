@@ -545,7 +545,7 @@ bool Cues::CombatActive(int handle) const {
   return enabled_ && handle >= 0 && world_.OneShotActive(handle);
 }
 
-int Cues::Combat(CombatCue cue, const Vec3& posVox, float power) {
+int Cues::Combat(CombatCue cue, const Vec3& posVox, float power, float gainDb) {
   // COUNTED BEFORE THE DEVICE CHECK. See Stats::combat — this is the only
   // signal a headless gate has that the game asked for the right sound at the
   // right moment, and putting it after `enabled_` would freeze it at 0 in
@@ -597,7 +597,7 @@ int Cues::Combat(CombatCue cue, const Vec3& posVox, float power) {
   const std::vector<float>* buf = PickStep(setId, lastVariant_[(size_t)setId]);
 
   VoiceConfig cfg;
-  cfg.gain = gain;
+  cfg.gain = gain * std::pow(10.0f, std::min(gainDb, 0.0f) / 20.0f);
   cfg.audibleRadius = t.cueRadius;
   cfg.verbWet = CurrentTuning().audio.reverbWet;
   // Doppler off: the blade is moving fast, but the SOUND is made at a place and

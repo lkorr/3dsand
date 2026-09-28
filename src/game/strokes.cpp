@@ -7,6 +7,7 @@
 #include <unordered_map>
 
 #include "sim/rng.h"
+#include "game/item.h"
 #include "sim/tuning.h"
 
 namespace {
@@ -590,7 +591,9 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
   // `player` compose instead of one silently winning.
   {
     const size_t pre = lib.styles.size();
-    std::vector<std::array<int, kWeaponForms>> rows(pre, {-1, -1, -1});
+    std::array<int, kWeaponForms> none;
+    none.fill(-1);
+    std::vector<std::array<int, kWeaponForms>> rows(pre, none);
     for (size_t i = 0; i < pre; i++) {
       std::string base = lib.styles[i].name;
       const size_t colon = base.find(":player");
@@ -604,7 +607,7 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
       for (auto kv = fo.begin(); kv != fo.end(); ++kv)
         if (WeaponFormOf(kv.key()) < 0 && !isPlayer)
           log += path + ": style \"" + base + "\" has unknown form \"" +
-                 kv.key() + "\" (short / long / blunt) - ignored\n";
+                 kv.key() + "\" (short / long / blunt / unarmed) - ignored\n";
       for (int f = 0; f < kWeaponForms; f++) {
         const char* key = kWeaponFormNames[f];
         if (!fo.contains(key) || !fo[key].is_object()) continue;
@@ -620,7 +623,7 @@ bool LoadAttackStyles(const std::string& path, StyleLibrary& out,
         lib.styles.push_back(std::move(fs));
       }
     }
-    rows.resize(lib.styles.size(), {-1, -1, -1});
+    rows.resize(lib.styles.size(), none);
     lib.forms = std::move(rows);
   }
   // AFTER the merge, and over base and player copies alike: a player block in
@@ -759,7 +762,12 @@ const PlayerStrikeMap& PlayerCompass(const StyleLibrary& lib, bool armed) {
   return armed ? lib.player : lib.playerUnarmed;
 }
 
-const char* const kWeaponFormNames[kWeaponForms] = {"short", "long", "blunt"};
+const char* const kWeaponFormNames[kWeaponForms] = {"short", "long", "blunt",
+                                                    "unarmed"};
+
+int FormForItem(const ItemDef* item) {
+  return item != nullptr ? WeaponFormOf(item->weaponClass) : kFormUnarmed;
+}
 
 int WeaponFormOf(const std::string& weaponClass) {
   for (int f = 0; f < kWeaponForms; f++)

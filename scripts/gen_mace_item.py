@@ -290,7 +290,7 @@ def main():
             # the same verified rotation the sword uses — see gen_sword_item.py
             # for the geometry.py check that proves it.
             "held_right": {
-                "translation": [0, 0, 0],
+                "translation": [2, 1, 2],
                 "rotation": [0, -90, 0],
                 "scale": 1.0,
             }
@@ -316,6 +316,21 @@ def main():
             "to": MACE_LEN,
             "axis": [1, 0, 0],
             "halfWidth": MACE_HALF_W,
+        },
+        # THE STICK, as a WEAK second segment (item.h ItemDef::hasHaft): from
+        # the top of the grip to the ball's socket. Without it the stick went
+        # through bodies as if it were not there. A blow off it is `power` of
+        # a head blow and its impact cues play `gainDb` down, so it reads as
+        # the glancing, softer hit it is. halfWidth 4 rather than the stick's
+        # 2: the probes measure to voxel CENTRES, so a hitbox the width of
+        # the wood alone misses the surface it is touching.
+        "haft": {
+            "from": MACE_GRIP,
+            "to": int(BALL_CX - BALL_R),
+            "axis": [1, 0, 0],
+            "halfWidth": 4,
+            "power": 0.2,
+            "gainDb": -12,
         },
         # Less jiggle than the sword: a mace is a bar of metal, and a floppy
         # one reads as rubber.

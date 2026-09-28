@@ -12021,19 +12021,20 @@ int main(int argc, char** argv) {
           audioCues.Combat(combatStrikeEdged
                                ? audio::Cues::CombatCue::StrikeEdge
                                : audio::Cues::CombatCue::StrikeBlunt,
-                           combatStrikeCue.at, combatStrikeCue.power);
+                           combatStrikeCue.at, combatStrikeCue.power,
+                           combatStrikeCue.gainDb);
         }
         if (combatFleshCue.pending) {
           audioCues.Combat(audio::Cues::CombatCue::Flesh, combatFleshCue.at,
-                           combatFleshCue.power);
+                           combatFleshCue.power, combatFleshCue.gainDb);
         }
         if (combatCutCue.pending) {
           audioCues.Combat(audio::Cues::CombatCue::Cut, combatCutCue.at,
-                           combatCutCue.power);
+                           combatCutCue.power, combatCutCue.gainDb);
         }
         if (combatClangCue.pending) {
           audioCues.Combat(audio::Cues::CombatCue::Clang, combatClangCue.at,
-                           combatClangCue.power);
+                           combatClangCue.power, combatClangCue.gainDb);
         }
         // Liquid that landed in a flask since the last frame: one call, at
         // the fill the LAST cell reached (Cues::FlaskFill rate-limits).
@@ -12158,6 +12159,10 @@ int main(int argc, char** argv) {
       combatClangCue.pending = false;
       combatStrikeCue.pending = false;
       combatCutCue.pending = false;
+      // The haft's softer level is per hit, never carried into the next frame's
+      // latch (the block cue writes power/at without touching it).
+      combatFleshCue.gainDb = combatClangCue.gainDb = 0.0f;
+      combatStrikeCue.gainDb = combatCutCue.gainDb = 0.0f;
       session.flaskFills.clear();
       // (The hit flash is NOT decayed here. It ages on the tick, inside
       // MobSystem::PreTick, because a frame-driven decay is never called by
@@ -12797,7 +12802,7 @@ int main(int argc, char** argv) {
               note.flicked ? sectorOf(note.style, note.fx, note.fy) : -1;
           // Named as the weapon's FORM of it, which is what the press began.
           const int formed = lib.ResolveForm(
-              note.style, heldItem ? WeaponFormOf(heldItem->weaponClass) : -1);
+              note.style, FormForItem(heldItem));
           std::string t = note.style >= 0 ? baseName(formed) : "nothing";
           for (char& ch : t) if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
           if (note.flicked) {
@@ -14678,7 +14683,11 @@ int main(int argc, char** argv) {
           if (col == 0 || ui.handSpell[hk].empty()) continue;
           if (!kit.equip.InHand(HandAt(hk)).Empty()) continue;
           const Hand h = HandAt(hk);
-          const Vec3 at = SpellHandPoint(avatar, player, cam, h);
+          // Plus the body's render offset (tick interpolation + step smoothing,
+          // Mob::SetRenderOffset): the arm is DRAWN at xf + offset, and without
+          // it the light snaps at the tick rate while the hand glides.
+          const Vec3 at = SpellHandPoint(avatar, player, cam, h) +
+                          (avatar.Spawned() ? avatar.RenderOffset() : Vec3{0, 0, 0});
           // The flare: the core swells for ~0.2 s after this hand's press.
           static double flareAt[2] = {-9.0, -9.0};
           static bool btnPrev[2] = {false, false};

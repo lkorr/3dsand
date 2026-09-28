@@ -636,6 +636,12 @@ struct EdgeSweep {
   // tuning and this header is included by item.h's consumers; the callers each
   // do the one-line `item->HeftFactor(g.woundHeftRef, g.woundHeftMax)`.
   float heft = 1.0f;
+  // A WEAK SEGMENT'S SCALE on the blow (ItemDef::haftPower): multiplies the
+  // sweep's one `power`, so everything it drives -- the hp, the dent, the
+  // flinch, the knock -- comes out that much softer. 1 for the real edge.
+  // EdgeSweepResult::power is reported UNSCALED (the speed ramp), so a caller
+  // choosing a cue's loudness applies its own gain for the softer hit.
+  float powerScale = 1.0f;
   // Sim tick, for the wound's counter-based seed. The ragged rim and the blood
   // soak must replay identically from the same tick+probe, and nothing in the
   // kerf may key on a Jolt float (game/mob.h BladeCut::seed).

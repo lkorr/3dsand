@@ -3034,7 +3034,9 @@ function allocArt(hex) {
 
 function updateHover(ev) {
   hover = pickCell(ev.clientX, ev.clientY);
-  if (!hover) { ghost.visible = false; return; }
+  // Editing off: no ghost promising an edit a click will not make (a select
+  // or move drag still previews — those brushes are not voxel writes).
+  if (!hover || (!mode && !drag)) { ghost.visible = false; return; }
 
   if (drag) {
     // Box preview: scale the ghost to span the drag rectangle.
@@ -3117,10 +3119,15 @@ function onPointerDown(ev) {
     return;
   }
 
+  // Editing off (setMode: the active mode clicked again): nothing below may
+  // change the model — no move, no voxel write. Alt-click still picks
+  // colour, since that changes only the brush.
+  if (!mode && !ev.altKey) return;
+
   // Move brush: grab the model under the cursor and slide it. Picking by the
   // clicked voxel rather than using activeModel means you grab the limb you
   // are pointing at, which is the whole point of a direct-manipulation move.
-  if (brush === 'move') {
+  if (brush === 'move' && mode) {
     // pickCell works in EDIT space, which is the active model's box unless
     // whole mode is on; ownerOf is the one place that maps a cell back to the
     // model that actually owns it. Outside whole mode that is activeModel by
@@ -3475,9 +3482,15 @@ function onKeyDown(ev) {
   }
 }
 
+// Choosing the mode that is already on turns it OFF (mode = null): a click
+// on the model then writes nothing, so orbiting and looking cannot misclick
+// a voxel away. Choosing any mode turns editing back on.
 function setMode(m) {
   if (!MODES.includes(m)) return;
-  mode = m; renderToolbar();
+  mode = mode === m ? null : m;
+  drag = null;
+  renderToolbar();
+  if (!mode) hooks.toast('editing off — pick Attach, Erase or Paint to edit again');
   if (pointer.inside) updateHover({ clientX: pointer.x, clientY: pointer.y });
 }
 function setBrush(b) {
@@ -3536,13 +3549,13 @@ function renderToolbar() {
   for (const b of ui.brushes.children) b.classList.toggle('on', b.dataset.brush === brush);
   ui.mirrorBtn.classList.toggle('on', mirror.x);
   ui.wholeBtn.classList.toggle('on', wholeMode);
-  ui.modeInd.textContent = (wholeMode ? 'WHOLE·' : '') + mode.toUpperCase();
+  ui.modeInd.textContent = (wholeMode ? 'WHOLE·' : '') + (mode ? mode.toUpperCase() : 'OFF');
   if (ui.peelVal) {
     ui.peelVal.textContent = peel > 0 && depthField
       ? `${peel}/${ANA.maxDepth(depthField)}` : '0';
     ui.peelVal.classList.toggle('on', peel > 0);
   }
-  ui.modeInd.className = 'medind ' + mode;
+  ui.modeInd.className = 'medind ' + (mode || 'off');
 }
 
 /**

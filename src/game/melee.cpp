@@ -462,6 +462,33 @@ bool LoadItemAsset(const std::string& dir, size_t materialCount,
       }
     }
   }
+  // THE HAFT (item.h ItemDef::hasHaft): the same segment grammar as `edge`
+  // (distances along `axis`, optional `line`), plus how weak a blow off it is
+  // and how much quieter it sounds.
+  if (s.contains("haft") && s["haft"].is_object()) {
+    const json& e = s["haft"];
+    Vec3 ax{0, 0, 1};
+    if (e.contains("axis") && e["axis"].size() == 3)
+      ax = {e["axis"][0].get<float>(), e["axis"][1].get<float>(),
+            e["axis"][2].get<float>()};
+    const Vec3 axEngine{ax.x, ax.z, -ax.y};
+    d.hasHaft = true;
+    d.haftFrom = axEngine * (e.value("from", 0.0f) * inv);
+    d.haftTo = axEngine * (e.value("to", 0.0f) * inv);
+    d.haftHalfWidth = e.value("halfWidth", 1.0f) * inv;
+    d.haftPower = std::clamp(e.value("power", 0.2f), 0.0f, 1.0f);
+    d.haftGainDb = std::clamp(e.value("gainDb", -12.0f), -60.0f, 0.0f);
+    if (e.contains("line") && e["line"].size() == 3) {
+      const Vec3 l{e["line"][0].get<float>(), e["line"][1].get<float>(),
+                   e["line"][2].get<float>()};
+      Vec3 off = Vec3{l.x, l.z, -l.y} * inv - modelOrigin;
+      const Vec3 along = axEngine.normalized();
+      off = off - along * along.dot(off);
+      d.haftFrom = d.haftFrom + off;
+      d.haftTo = d.haftTo + off;
+    }
+    if ((d.haftTo - d.haftFrom).len() < 1e-4f) d.hasHaft = false;
+  }
 
   // Micro brick, packed into the SAME pool the rigs use — a held item is drawn
   // by the borrowed slot's own render path. A worn piece packed one brick PER
@@ -976,7 +1003,7 @@ EdgeSweepResult MeleeSweepDamage(const EdgeSweep& s, const MeleeTuning& t,
   // one without the wound model needing to know that edge alignment exists.
   // Deliberate: it is the one place the two halves of the melee overhaul meet,
   // and multiplying `edgeAlign` in a second time further down would square it.
-  const float power = out.power * out.edgeAlign;
+  const float power = out.power * out.edgeAlign * std::clamp(s.powerScale, 0.0f, 1.0f);
   const float radius = s.halfWidth + s.carveBonus;
   // ---- WHAT THE WOUND MODEL NEEDS, MEASURED ONCE ---------------------------
   // WHICH WAY THE EDGE IS GOING: how far the blade's MIDPOINT travelled over
