@@ -192,11 +192,13 @@ void BumpEditGen(MicroBodySet& set, uint32_t model) {
 void MicroBodySet::MarkPool(uint32_t lo, uint32_t hi) {
   dirty = true;
   if (poolDirtyAll || hi <= lo) return;
-  for (auto& r : dirtyRanges) {
-    // Merge when the new span overlaps, abuts, or sits within the slack gap of
-    // an existing one. Scanning all of them (<= 24) rather than only the last
-    // matters: a tick that burns two limbs alternates between two blocks, and
-    // a last-only merge would open a fresh range on every alternation.
+  // Merge into the LAST range only (the common case: consecutive pokes into
+  // one limb's block). Everything else is appended and the uploader sorts and
+  // coalesces the lot (TakeDirtyRanges) — the old scan-all-and-cap-at-24 flipped
+  // to a whole-pool (4 MiB) write the moment 25 separate limbs burned in one
+  // frame, which is exactly the frame that could least afford it.
+  if (!dirtyRanges.empty()) {
+    auto& r = dirtyRanges.back();
     if (lo <= r.second + kDirtyMergeGap && r.first <= hi + kDirtyMergeGap) {
       r.first = std::min(r.first, lo);
       r.second = std::max(r.second, hi);
@@ -217,6 +219,21 @@ void MicroBodySetCoatLooks(MicroBodySet& set, std::vector<uint8_t> drawsCoat,
                            uint16_t bruiseMat) {
   set.drawsCoat = std::move(drawsCoat);
   set.bruiseMat = bruiseMat;
+}
+
+void MicroBodySet::TakeDirtyRanges(
+    std::vector<std::pair<uint32_t, uint32_t>>& out) const {
+  out = dirtyRanges;
+  if (out.size() < 2) return;
+  std::sort(out.begin(), out.end());
+  size_t w = 0;
+  for (size_t k = 1; k < out.size(); k++) {
+    if (out[k].first <= out[w].second + kDirtyMergeGap)
+      out[w].second = std::max(out[w].second, out[k].second);
+    else
+      out[++w] = out[k];
+  }
+  out.resize(w + 1);
 }
 
 void MicroBodySet::ClearDirty() {

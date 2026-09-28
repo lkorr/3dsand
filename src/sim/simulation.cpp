@@ -1479,13 +1479,16 @@ void Simulation::UploadMicroBodies(const rhi::Queue& queue, MicroBodySet& set) {
     if (set.poolDirtyAll) {
       // Whole-pool: first publish, hot reload, or the ranges overflowed.
       queue.WriteBuffer(mbPoolBuf_, 0, set.pool.data(), poolWords * 4);
+      mbPoolBytesSent_ += poolWords * 4;
     } else {
-      for (const auto& r : set.dirtyRanges) {
+      set.TakeDirtyRanges(mbRangeScratch_);
+      for (const auto& r : mbRangeScratch_) {
         const size_t lo = std::min<size_t>(r.first, poolWords);
         const size_t hi = std::min<size_t>(r.second, poolWords);
         if (hi <= lo) continue;
         queue.WriteBuffer(mbPoolBuf_, lo * 4, set.pool.data() + lo,
                           (hi - lo) * 4);
+        mbPoolBytesSent_ += (hi - lo) * 4;
       }
     }
   }
@@ -4128,10 +4131,31 @@ void Simulation::DrawBodies(const rhi::RenderPass& pass, uint32_t voxInstances) 
   // Depth first, then colour: the second draw's fragments pass GreaterEqual
   // only where they are the nearest body surface, so fsBody's per-fragment
   // shadow ray is cast once per pixel (debris.wgsl, THE DEPTH PRE-PASS).
+  //
+  // 18 VERTICES, NOT 36 (2026-09-28): a cube seen from outside shows at most
+  // three faces, one per axis, and debris.wgsl's bodyVertex picks each axis's
+  // camera-facing sign itself — so the back three faces are never generated
+  // rather than generated and collapsed.
   pass.SetPipeline(bodyDepth_);
-  pass.Draw(36, voxInstances);
+  pass.Draw(kBodyCubeVerts, voxInstances);
   pass.SetPipeline(bodyDraw_);
-  pass.Draw(36, voxInstances);
+  pass.Draw(kBodyCubeVerts, voxInstances);
+}
+
+void Simulation::DrawBodyRanges(
+    const rhi::RenderPass& pass,
+    const std::vector<std::pair<uint32_t, uint32_t>>& draws) {
+  // Per-body (culled) draws of the same buffer: [firstInstance, count] pairs
+  // from CullBodyRanges. `instance_index` in WGSL INCLUDES firstInstance, so
+  // bodyInst[inst] and the ember-flicker key read exactly what the whole-list
+  // draw would have for the same instance.
+  if (draws.empty()) return;
+  pass.SetBindGroup(0, VeilReaderBG(pass));
+  pass.SetBindGroup(1, renderPartBG_[page_]);
+  pass.SetPipeline(bodyDepth_);
+  for (const auto& d : draws) pass.Draw(kBodyCubeVerts, d.second, 0, d.first);
+  pass.SetPipeline(bodyDraw_);
+  for (const auto& d : draws) pass.Draw(kBodyCubeVerts, d.second, 0, d.first);
 }
 
 uint32_t Simulation::UploadMicroBodyInsts(const rhi::Queue& queue,

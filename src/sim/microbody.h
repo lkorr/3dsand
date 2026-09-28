@@ -238,7 +238,13 @@ struct MicroBodySet {
   // fallback is what makes correctness independent of how well the merge went
   // — a missed range would be a stale brick on screen, and the failure mode of
   // a coalescing heuristic must never be "wrong", only "slower".
-  static constexpr size_t kMaxDirtyRanges = 24;
+  //
+  // (2026-09-28) The cap was 24 and MarkPool scanned all of them; a frame with
+  // 25 separately-burning limbs then sent the whole 4 MiB pool. Now MarkPool
+  // only merges into the last range and appends otherwise, the uploader sorts
+  // and coalesces (TakeDirtyRanges), and the cap is a sanity ceiling — past it
+  // the pool is so fragmented that one write is genuinely cheaper.
+  static constexpr size_t kMaxDirtyRanges = 4096;
   // Words this far apart are merged into one range rather than kept separate:
   // one 2 KiB write beats two writes plus a range slot, and the slack is only
   // ever re-sending words that did not change.
@@ -252,6 +258,8 @@ struct MicroBodySet {
 
   // Record that pool words [lo, hi) were written. Also sets `dirty`.
   void MarkPool(uint32_t lo, uint32_t hi);
+  // The dirty ranges sorted and coalesced (kDirtyMergeGap), for the uploader.
+  void TakeDirtyRanges(std::vector<std::pair<uint32_t, uint32_t>>& out) const;
   // Called by the uploader once the GPU copy has been issued.
   void ClearDirty();
 

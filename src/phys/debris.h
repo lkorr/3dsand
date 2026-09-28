@@ -880,6 +880,9 @@ class DebrisSystem {
     return i < bodies_.size() ? bodies_[i].wound.budget : 0.0f;
   }
   Vec3 BodyWoundWorld(uint32_t i) const;  // the wound, in world voxels
+  // World-space centre of collider voxel `k` of body `i` (the --fell-tree
+  // harness's ignition seeds). False past either end.
+  bool BodyVoxelWorld(uint32_t i, uint32_t k, Vec3& out) const;
   uint32_t BodyVoxelCount(uint32_t i) const {
     if (i >= bodies_.size()) return 0;
     const Body& b = bodies_[i];
@@ -1562,6 +1565,18 @@ class DebrisSystem {
     // march index (MarchShell). Before this those three read neighbours and
     // boxes at the pre-shift coordinates until something changed the count.
     uint32_t geomGen = 0;
+    // ---- THE CUBE PATH'S EXPOSED-VOXEL LIST (BuildInstances) --------------
+    // Indices into `voxels` of the ones EmitExposedBodyVoxels would emit. Same
+    // key as the bounds above — (count, geomGen) — plus the array's address,
+    // so a Body copied or re-assigned wholesale never inherits a stale list.
+    // Burning rewrites payloads in place and keeps all three, so a burning
+    // body re-emits by a gather over this list instead of re-running the
+    // occupancy cull (a bounding-box lattice clear and two passes over every
+    // voxel) on every tick its payload changes.
+    std::vector<uint32_t> drawIdx;
+    uint32_t drawCount = 0xFFFFFFFFu;
+    uint32_t drawGen = 0xFFFFFFFFu;
+    const void* drawData = nullptr;
     // ...AND WHICH PARTS OF THAT BOX HOLD ANYTHING. The AABB of a rotated
     // 81-voxel trunk with a crown at one end is mostly empty, and the sweep
     // sat at kTerrainNeedCeiling (505 of 512 chunks a tick) for as long as

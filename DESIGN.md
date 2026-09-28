@@ -13076,7 +13076,7 @@ rebuilds the world ray, rotates it into object space by the body's conjugate
 quaternion, slab-tests, and runs an Amanatides–Woo DDA over the brick, or
 `discard`s. Cost therefore scales with the SCREEN AREA a limb covers rather than
 with its voxel count, which is the whole point: the instanced-cube path
-(`debris.wgsl vsBody`) is one 36-vertex instance per voxel, so a scale-4 limb
+(`debris.wgsl vsBody`) is one 18-vertex instance per voxel (three camera-facing faces), so a scale-4 limb
 would cost 64× the instances for the same on-screen result. That inverts rule
 §11's "cost tracks activity, not content".
 
