@@ -346,10 +346,94 @@ Status GateHairRooted(Ctx& c, std::string& detail) {
   const bool attached = mobs.LimbBody(id, t.limb) != 0;
   const uint32_t after = attached ? mobs.LimbArtVoxelCount(id, t.limb) : 0;
   const bool cut = landed > 0 && after < before;
-  const bool ok = attached && cut;
-  detail = Format("%s/%s: %d/%d cuts landed, %u -> %u voxels, %s",
+
+  // ...AND THE CUT HAIR STAYS ON THE CORPSE'S HEAD. Owner report 2026-09-27:
+  // "hit an npc with hair with a sword and his corpse had another set of hair
+  // offset from the head". A carve that moves the brick's min corner rebases
+  // the limb (ReskinLimbMicro), and RebuildLimbBody re-created the hair's
+  // Fixed joint with the live limb one rebase shift off its art. In life the
+  // rig re-poses the hair every tick, so nothing showed; on death the joint
+  // takes over and holds the hair that shift away from the scalp, next to the
+  // head's own painted cap.
+  //
+  // So the hair is carved again from its FIRST voxel (the low side of its
+  // brick, which is what forces a rebase), and two things are measured once
+  // the rig has re-posed it: how far that rebase moved the hair's origin in
+  // the head's frame (`rebase`, recorded: nonzero says the fixture exercised
+  // the path), and how far apart the hair-head joint's two anchors are
+  // through the LIVE poses (`mismatch`, asserted: that gap is exactly what
+  // the joint will pull the hair through the moment the creature dies). Not
+  // the corpse's own drift: that is mostly the solver's sag under a heavy
+  // afro and measured 0.01..0.59 vox on the same tree.
+  float rebase = -1.0f, mismatch = -1.0f;
+  const int headLi = [&]() {
+    const MobDef& def = mobs.Defs()[t.defIndex];
+    for (size_t k = 0; k < def.limbs.size(); k++)
+      if (def.limbs[k].name == def.limbs[t.limb].parent) return (int)k;
+    return -1;
+  }();
+  auto hairInHead = [&](Vec3& out) {
+    const uint64_t hb = mobs.LimbBody(id, t.limb);
+    const uint64_t pb = headLi >= 0 ? mobs.LimbBody(id, headLi) : 0;
+    if (!hb || !pb) return false;
+    BodyTransform hx{}, px{};
+    c.phys.GetTransform(hb, hx);
+    c.phys.GetTransform(pb, px);
+    const Quat pq{px.quat[0], px.quat[1], px.quat[2], px.quat[3]};
+    out = QuatRotateInv(pq, hx.pos - px.pos);
+    return true;
+  };
+  auto jointGap = [&]() {
+    const uint64_t hb = mobs.LimbBody(id, t.limb);
+    const uint64_t pb = headLi >= 0 ? mobs.LimbBody(id, headLi) : 0;
+    if (!hb || !pb) return -1.0f;
+    std::vector<Physics::BodyJoint> hj, pj;
+    c.phys.JointsOn(hb, hj);
+    c.phys.JointsOn(pb, pj);
+    const Physics::BodyJoint* a = nullptr;
+    const Physics::BodyJoint* b = nullptr;
+    for (const auto& j : hj) if (j.other == pb) a = &j;
+    for (const auto& j : pj) if (j.other == hb) b = &j;
+    if (!a || !b) return -1.0f;
+    BodyTransform hx{}, px{};
+    c.phys.GetTransform(hb, hx);
+    c.phys.GetTransform(pb, px);
+    const Quat hq{hx.quat[0], hx.quat[1], hx.quat[2], hx.quat[3]};
+    const Quat pq{px.quat[0], px.quat[1], px.quat[2], px.quat[3]};
+    return ((hx.pos + QuatRotate(hq, a->anchorLocalVox)) -
+            (px.pos + QuatRotate(pq, b->anchorLocalVox))).len();
+  };
+  if (attached && headLi >= 0) {
+    uint32_t tick = 61999;
+    support::TickCursor ticker{c, tick, pchunk};
+    for (int i = 0; i < 3; i++) ticker();
+    Vec3 pre{}, live{};
+    hairInHead(pre);
+    // Measured after EVERY carve, not once at the end: a later carve that
+    // does not rebase rebuilds the joint from the (by then re-posed) live
+    // pose and heals it, so only the gap right after the rebasing carve shows
+    // what a creature killed by that blow would have kept.
+    for (int k = 0; k < 4 && mobs.LimbBody(id, t.limb); k++) {
+      mobs.CarveLimbRadial(mobs.LimbBody(id, t.limb),
+                           mobs.LimbVoxelPos(id, t.limb, 0), 1.5f,
+                           /*ragged=*/false, /*eject=*/false, c.world, spawns);
+      spawns.clear();
+      for (int i = 0; i < 2; i++) ticker();
+      mismatch = std::max(mismatch, jointGap());
+    }
+    if (hairInHead(live)) rebase = (live - pre).len();
+  }
+  const float gapMax = (float)BaselineNumber("hairJointGapMax", 0.05);
+  const bool stays = mismatch >= 0.0f && mismatch <= gapMax;
+  mobs.Reset();
+  c.debris.Reset();
+
+  const bool ok = attached && cut && stays;
+  detail = Format("%s/%s: %d/%d cuts landed, %u -> %u voxels, %s; hair rebased "
+                  "%.2f vox, hair-head joint gap %.3f vox (max %.3f)",
                   t.defName.c_str(), t.limbName.c_str(), landed, cutsMade,
-                  before, after, attached ? "still on" : "CAME OFF WHOLE");
+                  before, after, attached ? "still on" : "CAME OFF WHOLE",
+                  rebase, mismatch, gapMax);
   std::printf("hair-rooted: %s (%s)\n", ok ? "PASS" : "FAIL", detail.c_str());
   return ok ? Status::Pass : Status::Fail;
 }

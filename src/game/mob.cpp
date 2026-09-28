@@ -3163,6 +3163,7 @@ bool MobSystem::ServiceRising(size_t ri) {
           }
         if (changed && L.microModel >= 0)
           now.ReskinLimbMicro(L, now.SkinScaleOf(L), now.PhysScaleOf(L));
+        L.rebaseUnbuilt = Vec3{};  // recolour only; nothing is rebuilt
       }
     }
   }
@@ -12976,6 +12977,7 @@ bool Mob::ReskinLimbMicro(MobLimb& limb, uint32_t skinScale,
     Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2], limb.xf.quat[3]};
     limb.xf.pos += Rotate(q, d);
     limb.restOffset += d;
+    limb.rebaseUnbuilt += d;   // RebuildLimbBody's kinematic branch needs it
     // The joint anchors are expressed from the limb origin, so they move the
     // opposite way to stay on the same physical point of the creature.
     limb.anchorLimb = limb.anchorLimb - d;
@@ -13934,6 +13936,7 @@ uint32_t MobSystem::RewriteLimbSurface(uint64_t mobId, int limb, uint32_t fromMa
     l.voxels = DownsampleSkin(l.skinVoxels, std::max(1u, skin / phys), &overflow);
   }
   if (l.microModel >= 0) mob->ReskinLimbMicro(l, skin, phys);
+  l.rebaseUnbuilt = Vec3{};  // no rebuild follows: the rig re-poses it
   Mob::DropBurnIndex(l.burn);
   mob->MarkInstancesDirty();
   mob->burnFracDirty_ = true;
@@ -13965,8 +13968,24 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   // re-reading Jolt would throw the shift away. DriveWornShells re-derives it
   // from the new anchorLimb in this same tick's PostStep either way.
   // (A corpse is Limp for good, so it takes the limp branch too.)
-  if (!(ragdoll_ == RagdollPhase::Limp || limb.wornHost >= 0))
+  //
+  // ...BUT THE KINEMATIC READ-BACK MUST CARRY THE REBASE SHIFT (2026-09-27).
+  // "Re-posed a tick later" is true of the BODY and false of the JOINTS made
+  // below: they are created from this pose, and Jolt's Fixed constraint
+  // (AutoDetectPoint) locks whatever relative transform the two bodies have at
+  // that instant, and every other joint's anchor lands a shift off on the
+  // parent's side. Without the shift the new body sits one rebase off its art,
+  // the joint records that, and nothing shows while the rig drives the limb —
+  // until death hands the rig to the joints and a carved hair piece hangs a
+  // shift away from the scalp ("a second set of hair offset from the head").
+  // `hair-rooted` measured it: 0.64 vox of joint gap from one carve.
+  if (!(ragdoll_ == RagdollPhase::Limp || limb.wornHost >= 0)) {
     phys_->GetTransform(limb.body, limb.xf);
+    const Quat q{limb.xf.quat[0], limb.xf.quat[1], limb.xf.quat[2],
+                 limb.xf.quat[3]};
+    limb.xf.pos += Rotate(q, limb.rebaseUnbuilt);
+  }
+  limb.rebaseUnbuilt = Vec3{};
   // What the old body was doing, for a LIMP limb: a rebuilt body starts at
   // rest, and a limb flying at 10 m/s that a burn or acid bite rebuilt at
   // zero was yanked back up to speed by its own joints.
@@ -13974,7 +13993,12 @@ bool Mob::RebuildLimbBody(int limbIndex) {
   const bool hadVel = phys_->GetBodyVelocities(limb.body, oldLin, oldAng);
   uint64_t nh = phys_->CreateDebrisBodyXf(limb.voxels, limb.xf, DensityOf(),
                                           true /*allowKinematic*/, pitch);
-  if (nh == 0) return false;  // Jolt refused: keep the old collider, stay carved
+  // Jolt refused: keep the old collider, stay carved. The rig re-poses the
+  // old body from the shifted restOffset, so the pending shift is spent.
+  if (nh == 0) {
+    limb.rebaseUnbuilt = Vec3{};
+    return false;
+  }
   // ...and what the old body WAS: its role, owner and layer, and whether it
   // was still clearing the player (an NPC knocked limp beside the player is
   // off the player's contact layer until it has fallen clear, and the rebuilt

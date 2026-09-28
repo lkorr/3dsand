@@ -1386,6 +1386,12 @@ struct MobLimb {
   Vec3 restOffset{};         // limb min corner from creature min corner (rest)
   Vec3 anchorRoot{};         // joint anchor from creature min corner (rest)
   Vec3 anchorLimb{};         // joint anchor in limb-local coords
+  // The rebase shift ReskinLimbMicro applied (limb-local world voxels) that
+  // the Jolt body has not been rebuilt with yet. RebuildLimbBody consumes it:
+  // a KINEMATIC limb is rebuilt at Jolt's pose, which predates the shift, and
+  // joints re-created against that pose lock the shift in (the corpse hair
+  // that hung off the head, 2026-09-27). Transient; never saved.
+  Vec3 rebaseUnbuilt{};
   BodyTransform xf{};
   float bleedBudget = 0;
   // A child of this limb was cut off and the stump was never closed: the
