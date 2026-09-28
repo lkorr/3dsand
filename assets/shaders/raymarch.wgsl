@@ -1788,8 +1788,9 @@ const PLANT_FERN_ON : bool = true;
 //     may resolve, and once it is spent the next detail cell is treated as a
 //     SOLID cube, not as air — a ray that flew on through would punch a hole
 //     through a whole meadow. Phase 1 charges the budget at RECORD time and
-//     falls through to the plain-solid branch once it is spent, so the bound
-//     and its failure mode are exactly what they were.
+//     takes a plain solid hit once it is spent, so the bound and its failure
+//     mode are exactly what they were — NEARER than the near-detail fade band.
+//     Inside the band a spent budget passes the cell as air (NEAR-DETAIL FADE).
 //   * ONE EVALUATION PER TILE PLANT. A fern or a big toadstool is one organism
 //     across a 3x3xH footprint and tracePlant intersects all of it in one
 //     call, so a ray crossing four of its cells must evaluate it once. The old
@@ -1823,8 +1824,8 @@ const PLANT_FERN_ON : bool = true;
 // prefab that is one object across several cells. Nothing here is plant-shaped;
 // the branch keys on MATF_MICRO and the only per-kind decisions are three, all
 // in one place each:
-//   1. phase 1's LOD arm: how far out does the model become a solid proxy, and
-//      which of its cells is the proxy (a tile plant's centre column).
+//   1. phase 1's fade: which IDENTITY the model thins on (detailVanishDist;
+//      a column hash, or the tile key), so all of its cells vanish together.
 //   2. phase 1's `key`: the model's IDENTITY, so a ray crossing four of its
 //      cells records it once and spends one budget slot. Return 0 for a model
 //      that really is per-cell. Any hash family works as long as it ors in a 1
@@ -1837,6 +1838,62 @@ const PLANT_FERN_ON : bool = true;
 // phase 2's `isTile` arm, which is what decides whether an unpainted cell
 // under the hit clips the model or is a rounding artifact.
 const DETAIL_SLOTS : i32 = 4;
+
+// ---- NEAR-DETAIL FADE: vegetation and micro-detail end BEFORE the seam ------
+// (LOD seam overhaul, package B, 2026-09-28.) The far cascade has no micro
+// detail at all — farCellIsSolid drops MATF_MICRO, so past the handoff a
+// meadow is its bare ground skin. Everything drawn only by this file's detail
+// path therefore has to have faded to "bare skin" BEFORE the handoff, or the
+// handoff is a line where the grass stops.
+//
+// It used to be two cuts instead of a fade: column plants became solid proxy
+// cubes past render.plantLodDist (a field of 10 cm pillars from 16 m — itself
+// the most visible LOD pop at eye height), everything else past
+// render.microLodDist (40 m), and then all of it vanished at the window face.
+// The proxies are GONE: with the fade in place they were only ever drawn in
+// the band where the fade is removing the plant anyway.
+//
+// THE FADE IS SPATIALLY STABLE, because TAA is off and anything temporal would
+// be raw noise. Each detail MODEL (a column's plant or brick, keyed on its
+// column; a tile plant, keyed on its tile) draws a fixed uniform hash, and that
+// hash places its VANISH DISTANCE somewhere in [START, END]. Past it the model
+// is not there at all — phase 1 passes its cells as air, so it costs nothing
+// and spends no record. As the camera moves only that threshold moves: a tuft
+// either exists or does not, never flickers. Density falls linearly across the
+// band and is exactly zero at END.
+//
+// A COLUMN PLANT (grass, flower) also SHRINKS into the ground over the last
+// DETAIL_SHRINK_M before its own vanish distance (tracePlant's `lodH`), so it is
+// already at zero height when it is removed: no tuft pops. Tile plants (ferns,
+// big toadstools), small mushrooms and bricks (bushes, moss, litter) only thin
+// — they are sparse, and their models have no single height to scale.
+//
+// ONE PLACE FOR THE DISTANCES. END derives from render.lodHandoffDist, capped
+// at the nearest the window face can be (half extent less the 2-chunk stream
+// hysteresis, 22.4 m at 512^3 / 10 cm), less 0.5 m: 21.9 m on today's 26 m
+// (handoff disabled), 20.5 m at a 21 m handoff. START is render.plantLodDist
+// (16 m), clamped to at least 1 m short of END. Moving the handoff moves END;
+// nothing else needs retuning.
+const DETAIL_FADE_END_M : f32 =
+    min(TUNE_LOD_HANDOFF_DIST,
+        WINDOW_HALF_EXTENT_METERS - 2.0 * f32(CHUNK) * VOXEL_METERS) - 0.5;
+const DETAIL_FADE_START_M : f32 = min(TUNE_PLANT_LOD_DIST, DETAIL_FADE_END_M - 1.0);
+const DETAIL_SHRINK_M : f32 = 1.5;
+
+// A column's detail identity: every cell of one tuft/brick stack shares it.
+fn detailColumnId(cell : vec3<i32>) -> u32 {
+  return hash3(bitcast<u32>(cell.x), bitcast<u32>(cell.z), 0xD37A1u);
+}
+// The camera distance (m) at which the model with identity `id` is gone.
+fn detailVanishDist(id : u32) -> f32 {
+  let u = f32(id >> 8u) * (1.0 / 16777216.0);
+  return DETAIL_FADE_END_M - u * (DETAIL_FADE_END_M - DETAIL_FADE_START_M);
+}
+// Camera distance (m) to a detail cell's centre. Per CELL, not per pixel, so
+// every pixel of a cell agrees about whether its model exists.
+fn detailDist(ro : vec3f, cell : vec3<i32>) -> f32 {
+  return length(vec3f(cell) + 0.5 - ro) * VOXEL_METERS;
+}
 
 struct PlantDef {
   kind : u32,
@@ -1914,11 +1971,9 @@ fn plantTileKey(kind : u32, cell : vec3<i32>, mat : u32) -> u32 {
 //
 // A column memo therefore needs tracePlant to intersect the WHOLE column in
 // one call first. That is a different change, and a bigger one.
-// Is this cell the centre column of its tile plant (the LOD stand-in)?
-fn plantTileCentre(kind : u32, cell : vec3<i32>) -> bool {
-  let pt = plantTileOf(kind, cell);
-  return pt.cx == cell.x && pt.cz == cell.z;
-}
+//
+// (plantTileCentre, the tile plant's solid LOD stand-in column, went with the
+// proxy cubes on 2026-09-28: see NEAR-DETAIL FADE.)
 
 // ---- primitives -----------------------------------------------------------
 struct PrimHit {
@@ -2182,7 +2237,9 @@ fn plantSquashAt(baseXZ : vec2f, baseY : f32) -> PlantSquash {
 }
 
 fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
-              entry : vec3f, rd : vec3f, tHiIn : f32) -> MicroHit {
+              entry : vec3f, rd : vec3f, tHiIn : f32, lodH : f32) -> MicroHit {
+  // lodH: the NEAR-DETAIL FADE's height scale for COLUMN plants (1 = full
+  // height, 0 = flat, about to be removed by phase 1). Tile plants ignore it.
   var out : MicroHit;
   out.hit = false;
   out.mat = 0u;
@@ -2244,7 +2301,7 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
         // This blade's own height: a fraction of the plant, compressed by the
         // trample, so a stand's top is ragged per blade and a foot presses the
         // blades under it into a short mat.
-        let sH = totalH * (1.0 - heightVary * hf(hs, 0u)) * sq.hs;
+        let sH = totalH * (1.0 - heightVary * hf(hs, 0u)) * sq.hs * lodH;
         if (rise0 >= sH) { continue; }
         let yTop = min(1.0, sH - rise0);
         let rt = vec2f(0.5) + (vec2f(hf(hs, 8u), hf(hs2, 0u)) - 0.5) * (2.0 * rootSpread);
@@ -2312,22 +2369,24 @@ fn tracePlant(b : MicroBrick, d : PlantDef, mat : u32, cell : vec3<i32>,
     }
 
     // ---- flower: one stem, a few leaves, a head ----------------------------
+    // The fade's lodH scales the whole flower (stem height, head, leaves), so
+    // a fading flower is a smaller flower rather than a head on the ground.
     let stemHalfW = plantP(d, 0u);
-    let headR = plantP(d, 1u);
-    let headH = plantP(d, 2u);
+    let headR = plantP(d, 1u) * lodH;
+    let headH = plantP(d, 2u) * lodH;
     let leafCount = u32(plantP(d, 3u));
-    let leafLen = min(plantP(d, 4u), 0.36);
-    let leafW = plantP(d, 5u);
+    let leafLen = min(plantP(d, 4u), 0.36) * lodH;
+    let leafW = plantP(d, 5u) * lodH;
     let swayScale = plantP(d, 6u);
     let heightVary = plantP(d, 7u);
     let headDrop = plantP(d, 8u);
     let headCount = max(u32(plantP(d, 9u)), 1u);
-    let centreR = plantP(d, 10u);
+    let centreR = plantP(d, 10u) * lodH;
     let petalGap = plantP(d, 11u);
     let petalCount = max(plantP(d, 12u), 1.0);
     let hs = hash3(colH, 0u, 0xF10Eu);
     let hs2 = hash3(colH, 1u, 0xF10Eu);
-    let sH = max(totalH * (1.0 - heightVary * hf(hs, 0u)) * sq.hs, 0.3);
+    let sH = max(totalH * (1.0 - heightVary * hf(hs, 0u)) * sq.hs, 0.3) * lodH;
     let rt = vec2f(0.5) + (vec2f(hf(hs, 8u), hf(hs, 16u)) - 0.5) * 0.2;
     let W = plantWindBlend(wind, hs) * swayScale + sq.lean;
     let margin = max(headR, stemHalfW) + 0.02;
@@ -3227,7 +3286,7 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           break;
         }
         // else: pass through as air
-      } else if (detN < detMax && (materials[mat].flags & MATF_MICRO) != 0u &&
+      } else if (detMax > 0 && (materials[mat].flags & MATF_MICRO) != 0u &&
                  microBricks[mat].base != MICRO_NONE) {
         // ---- static micro-detail: substitute a finer model for this cell ----
         // See traceMicro and tracePlant. The cell is an ordinary solid voxel as
@@ -3235,27 +3294,31 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
         //
         // PHASE 1 ONLY (see DEFERRED DETAIL, next to the PK_* constants). The
         // model is NOT evaluated here — the register pressure of doing so
-        // inside this loop is what spilled the march. Two decisions are taken,
-        // and both are cheap enough to keep in the march:
+        // inside this loop is what spilled the march. Three decisions are
+        // taken, all cheap enough to keep in the march:
         //
-        // LOD: past TUNE_MICRO_LOD_DIST a world cell is roughly one pixel, so
-        // the nested march is spending 3*subdiv steps to decide the colour of a
-        // sub-pixel — the model's silhouette cannot survive the sample anyway.
-        // Beyond it the cell shades as a plain voxel, which is not merely
-        // cheaper but the SAME answer averaged, and it keeps distant meadows
-        // reading as continuous ground instead of dissolving into stipple. That
-        // is an OPAQUE hit, so it has to be taken in the march: deferring it
-        // would let the ray keep accumulating media behind a solid surface.
+        // FADE (see NEAR-DETAIL FADE next to DETAIL_SLOTS): past this model's
+        // own vanish distance the cell is AIR — no record, no hit — and the
+        // ray goes on to the ground skin under it, which is exactly what the
+        // far cascade draws past the handoff. One hash, one length per micro
+        // cell entered; no memory read.
         //
-        // RECORD: everything nearer than the LOD is written to a record slot
-        // and the ray keeps going, treating the cell as air.
+        // RECORD: a surviving cell is written to a record slot and the ray
+        // keeps going, treating the cell as air.
+        //
+        // BUDGET: once the records are spent, a surviving cell NEARER than the
+        // fade band is a SOLID hit (the shipped bound: terminating is bounded
+        // and reads as ground, where flying on would punch a hole through a
+        // meadow). INSIDE the band it is air instead — the band is where the
+        // plants are going away anyway, and a solid cube there would bring
+        // back the very pillars the fade replaced.
         rsAdd(RS_MICRO_ENTER, 1u);
         let mb = microBricks[mat];
         let isPlant = (mb.flags & MICROF_PLANT) != 0u;
         // Two pool words, not a whole PlantDef. plantDefOf unpacks thirteen
         // fields and every one of them would be live across the rest of the
-        // step; the LOD decision needs the kind and the tile size only, and
-        // phase 2 materializes the rest where there is room for it.
+        // step; phase 1 needs the kind and the tile size only, and phase 2
+        // materializes the rest where there is room for it.
         var pKind = 0u;
         var pTile = 0;
         if (isPlant) {
@@ -3263,18 +3326,24 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
           pTile = i32((microPool[mb.base + 1u] >> 16u) & 0xFFu);
         }
         let tileMode = isPlant && pTile != 0;
-        // A COLUMN plant (grass, flower, small mushroom) takes the shorter of
-        // the two cuts: its blades are sub-pixel long before its cell is, and
-        // an evaluation is a wind sample plus six to eight blade tests. A tile
-        // plant is 30-50 cm of geometry and keeps TUNE_MICRO_LOD_DIST.
-        let lodDist = select(TUNE_MICRO_LOD_DIST,
-                             min(TUNE_MICRO_LOD_DIST, TUNE_PLANT_LOD_DIST),
-                             isPlant && !tileMode);
-        if (tCur * VOXEL_METERS > lodDist) {
-          // A tile plant's footprint is mostly air: past the LOD only its
-          // CENTRE column stands in as the solid proxy, the eight outer
-          // columns pass through as air (or a distant fern is a 30 cm cube).
-          if (!(tileMode && !plantTileCentre(pKind, cell))) {
+        // ONE RECORD PER TILE PLANT, and one per CELL for everything else —
+        // exactly the split the in-march memo ran (see plantColumnKey's
+        // absence, next to plantTileKey, for why a column plant may not be
+        // collapsed this way). A tile plant is one organism across a 3x3xH
+        // footprint and tracePlant intersects all of it in one call, so a
+        // ray crossing four of its cells must not spend four budget slots on
+        // it and then treat the next tuft as a solid cube. The key is
+        // compared against the LAST record only — which is all a single-slot
+        // memo ever did, and an alternating A,B,A crossing records A twice
+        // exactly as it used to evaluate it twice. The same key is the tile
+        // plant's fade identity, so all nine of its columns go together.
+        var key = 0u;
+        if (tileMode) { key = plantTileKey(pKind, cell, mat); }
+        let dM = detailDist(ro, cell);
+        if (dM >= detailVanishDist(select(detailColumnId(cell), key, tileMode))) {
+          // faded out: fall through as air
+        } else if (detN >= detMax) {
+          if (dM < DETAIL_FADE_START_M) {
             out.hit = true;
             out.t = tCur;
             out.cell = cell;
@@ -3283,57 +3352,36 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
             out.word = w;
             break;
           }
-        } else {
+          // in the fade band: air (see BUDGET above)
+        } else if (key == 0u || key != detKey) {
           // ---- record it and keep marching ----
-          // ONE RECORD PER TILE PLANT, and one per CELL for everything else —
-          // exactly the split the in-march memo ran (see plantColumnKey's
-          // absence, next to plantTileKey, for why a column plant may not be
-          // collapsed this way). A tile plant is one organism across a 3x3xH
-          // footprint and tracePlant intersects all of it in one call, so a
-          // ray crossing four of its cells must not spend four budget slots on
-          // it and then treat the next tuft as a solid cube. The key is
-          // compared against the LAST record only — which is all a single-slot
-          // memo ever did, and an alternating A,B,A crossing records A twice
-          // exactly as it used to evaluate it twice.
-          //
           // A column plant and a brick get key 0 and are always recorded, so
-          // the budget is spent per CELL for them and the ray goes solid after
-          // TUNE_MICRO_MAX_PER_RAY of them — the shipped bound, unchanged.
-          var key = 0u;
-          if (tileMode) { key = plantTileKey(pKind, cell, mat); }
-          if (key == 0u || key != detKey) {
-            // Only a TILE overwrites the slot. A grass cell crossed between two
-            // cells of one fern must not make the renderer forget the fern —
-            // the in-march memo only ever wrote pKey inside its tileMode arm,
-            // and this is that, restated.
-            if (key != 0u) { detKey = key; }
-            // Window-local, 10 bits per axis. The residency window is
-            // WORLD_N = 512 cells on a side and world.h refuses 1024 (the
-            // voxel buffer would pass Vulkan's 4 GiB binding ceiling), so 30
-            // bits covers every cell this loop can reach — and the loop has
-            // already bounds-checked `cell` against the window this step.
-            let lc = vec3<u32>(cell - wloI);
-            let packed = lc.x | (lc.y << 10u) | (lc.z << 20u);
-            if (detN == 0) {
-              det0 = packed; detT0 = tCur;
-              detTau = out.mediaTau; detFire = out.fireGlow;
-            } else if (detN == 1) { det1 = packed; detT1 = tCur; }
-            else if (detN == 2) { det2 = packed; detT2 = tCur; }
-            else { det3 = packed; detT3 = tCur; }
-            detN += 1;
-          }
+          // the budget is spent per CELL for them.
+          //
+          // Only a TILE overwrites the slot. A grass cell crossed between two
+          // cells of one fern must not make the renderer forget the fern —
+          // the in-march memo only ever wrote pKey inside its tileMode arm,
+          // and this is that, restated.
+          if (key != 0u) { detKey = key; }
+          // Window-local, 10 bits per axis. The residency window is
+          // WORLD_N = 512 cells on a side and world.h refuses 1024 (the
+          // voxel buffer would pass Vulkan's 4 GiB binding ceiling), so 30
+          // bits covers every cell this loop can reach — and the loop has
+          // already bounds-checked `cell` against the window this step.
+          let lc = vec3<u32>(cell - wloI);
+          let packed = lc.x | (lc.y << 10u) | (lc.z << 20u);
+          if (detN == 0) {
+            det0 = packed; detT0 = tCur;
+            detTau = out.mediaTau; detFire = out.fireGlow;
+          } else if (detN == 1) { det1 = packed; detT1 = tCur; }
+          else if (detN == 2) { det2 = packed; detT2 = tCur; }
+          else { det3 = packed; detT3 = tCur; }
+          detN += 1;
         }
-        // DEFER — and this is the crucial half. The ray passes through: fall
-        // out of the `if` and let the world DDA step past the cell exactly as
-        // if it were air. A micro cell that blocked here would render every
-        // tuft of grass as a solid 6 cm cube.
-        //
-        // Note what happens once the records are spent: this branch stops
-        // matching and control drops to the plain-solid `else` at the bottom,
-        // so a ray that has already recorded TUNE_MICRO_MAX_PER_RAY models
-        // treats the next micro cell as SOLID. That is the intended bound —
-        // terminating is bounded and reads as distant ground, where letting
-        // the ray fly on unbounded would punch a hole through a whole meadow.
+        // DEFER — and this is the crucial half. Unless the budget arm above
+        // hit, the ray passes through: fall out of the `if` and let the world
+        // DDA step past the cell exactly as if it were air. A micro cell that
+        // blocked here would render every tuft of grass as a solid 6 cm cube.
       } else if (!wantMedia && (materials[mat].flags & MATF_MICRO) != 0u) {
         // ---- shadow / reflection ray meets a micro cell ----
         // Pass straight through. These rays never march bricks (see the
@@ -3567,7 +3615,13 @@ fn trace(ro : vec3f, rdIn : vec3f, maxSteps : i32, wantMedia : bool) -> Hit {
                    - ro) * inv;
         let tCellExit = min(bnd.x, min(bnd.y, bnd.z));
         let tClip = select(max(tCellExit - pt, 1e-3) + 1e-3, 1e9, isTile);
-        mh = tracePlant(mb, pd, dm, dc, entry, rd, tClip);
+        // NEAR-DETAIL FADE, the shrink half: a column plant lowers into the
+        // ground over the last DETAIL_SHRINK_M before phase 1 removes it, so
+        // it is already flat when it goes. Same identity and distance as
+        // phase 1's test, recomputed here where registers are free.
+        let lodH = clamp((detailVanishDist(detailColumnId(dc)) -
+                          detailDist(ro, dc)) / DETAIL_SHRINK_M, 0.02, 1.0);
+        mh = tracePlant(mb, pd, dm, dc, entry, rd, tClip, lodH);
       } else {
         mh = traceMicro(mb, dc, entry, rd, R.tick);
       }
