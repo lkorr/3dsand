@@ -12026,7 +12026,7 @@ where you hear from either (§12b, "The ears are on the character").
   material instead (`treeCanopyAt`) — trees too thin to survive center
   sampling are flattened into the terrain, so the far forest keeps its canopy
   color. Far hits shade with the same palette/face/ambient constants as the
-  near field plus sky reflection on distant water top faces; the texture, AO
+  near field (far water: `shadeFarWater`, below); the texture, AO
   and shadow terms are the near field's own since the seam pass below (phase 4
   had a 0.5 m palette hash, a one-sample AO and a flat ×0.3 shadow lift). Fog
   is aerial perspective: `applyAerial` converges surfaces exactly to
@@ -12108,13 +12108,65 @@ where you hear from either (§12b, "The ears are on the character").
   material, not a cell rule. What is still not matched, in order of visibility:
   the blades themselves end at the window edge (analytic plants have no far
   representation); the 2× cell step is a 3 px → 6 px block change at the seam
-  and at every level box; the near field's one-bounce GI and openness terms
-  have no far equivalent; far water is an opaque disc. The structural answer
+  and at every level box; far water is an opaque disc (it now SHADES as
+  water — see the next paragraph — but has no depth and no bed). The structural answer
   for the first two is the mesh game's: surface memory scales with area, so it
   keeps full-detail chunks out to ~500 m (1.5 px per block at the swap), where
   a dense cascade level costs volume — see `docs/PLAN_far_field_cascades.md`
   §5.6 for why `kFarN` is the only knob and what a sparse near level would
   take.
+  **The near-only shading terms (LOD-seam overhaul package D, 2026-09-28).**
+  Three terms the near shade had and the cascade lacked, each reduced to what
+  the near field SHOWS at the seam (20-26 m, eye height) and reproduced with
+  ALU only, in helpers beside `fs` (`raymarch.wgsl`):
+  (a) **water** — `shadeFarWater` is `shadeWater`'s up-facing, bed-less limit:
+  the same deep-water `waveSlope` normal with the same screen-footprint
+  damping (so both sides carry the same surviving swell bands), the same
+  Schlick Fresnel (F0 0.0204, `waterFresnelPower`, × `liquidOptics.fresnel`)
+  against `reflectionSky`, the body's in-scatter as the refracted term (at a
+  grazing seam the column runs ~15× the depth, so Beer-Lambert has already
+  removed the bed), and the glint at its far lobe. The old far shade was
+  `color0` + 35% airglow LIT LIKE ROCK — a blue slab against the near field's
+  sky-grey sheet. Only clear, non-viscous liquid seen through open air takes
+  it (a far hit behind a near water surface keeps the old paint), and a far
+  water pixel no longer runs the far shadow march. For a view from above, a
+  top face probes up to 8 cells down its own level for the bed (depth +
+  material), lit as an open up face through the column's Beer-Lambert both
+  ways; none found = deep. Measured on screenshot_cascade's far oasis ponds
+  against the near fixture lake (68/122/154): old far 143/182/224, new
+  114/145/164 (the remainder is 60 m more aerial haze). Not reproduced:
+  shore foam, the traced reflection of the far shore, caustics; and the far
+  waterline is a cascade cell top, up to one fine voxel off the near
+  fullness plane (a geometry matter). (b) **GI bounce** —
+  `farGiBounce` is the irradiance gather's closed form on open terrain:
+  0 on a tread (every ray sees sky), one ring ray's weight (0.09375) on a
+  riser, 0.33 on an underside, of the ground's direct radiance
+  (albedo × key light × the wrapped Lambert of an up face), × `giStrength`,
+  × the far AO. CALIBRATED, not derived: measured near, a riser's bounce is
+  0.11-0.13 of the adjacent tread's radiance (screenshot_ground, giStrength
+  2 vs 0, tonemap inverted), a third of what the ideal three-ray weight
+  predicts. **The bounce is not allowed without the openness that pays for
+  it** (`farOpenness`): the near field scales a riser's ambient by its
+  openness BEFORE the gather adds the ground's light back, and the
+  hemisphere's ambGround half was the pre-GI stand-in for that same light —
+  so bounce alone counted the ground twice. Measured on screenshot_seam_x
+  (far band vs near band, 20 rows either side of the handoff line, p20 ≈
+  risers): far risers sat +16/255 above the near ones before, +28 with the
+  bounce alone, +19 with bounce + openness (up 1, riser 0.72 = the fan less
+  its three down rays, underside 0.25). The far-vs-near differences that
+  remain on the seam frames (far treads ~28/255 darker on seam_x, the whole
+  far band ~36 darker on seam_diag) move by 1-3 under these terms and are
+  shadow / geometry (packages C / A). (c) **wet ground** — `farWetness` is
+  the near rain law on `farOpenness` (a cell with something on top 0), plus
+  the near sheen. Rain used to leave a dry ring at the window edge; measured
+  with SANDVOX_WEATHER=rain, the median darkening either side of the line is
+  now x0.925 near / x0.935 far (seam_x) and x0.77 / x0.81 (seam_diag).
+  Newly streamed chunks at the window edge: the openness fallback (stamp
+  missing) is 1.0, i.e. exactly the far look, so the ambient does not pop;
+  the GI gather of a new chunk reads an irradiance grid its deposits have not
+  reached yet and ramps in over frames. Once the handoff is a camera radius
+  inside the box (package E) new planes stream in beyond it and neither is
+  on screen.
   **Those seven bits are a PALETTE SLOT, not a material id (2026-09-09):**
   a far cell byte names one of 128 entries in the FAR PALETTE — the fourth
   reserved run of the GPU material table (`kFarPaletteBaseGpu`, world.h,
@@ -13085,7 +13137,8 @@ changed the cost, not the answer.
 ambient by `opennessScale(opennessAt(...))`, alongside `ao` and never the sun
 (the sun has its own shadow ray). Far-cascade hits keep the plain lerp — the
 grid is keyed on residency slots and a cascade hit is outside the window by
-definition. Micro hits sample the cell BELOW with the +Y face, because a grass
+definition; open ground reads 1.0 so the two agree there, and the far GI
+stand-in is `farGiBounce` (§9 far field, "near-only shading terms"). Micro hits sample the cell BELOW with the +Y face, because a grass
 tuft is not a ray blocker and its own block has no entry. `microbody.wgsl` uses
 `opennessScaleAtBody`, which walks down at most six blocks to the ground the
 body stands on and takes that surface's value: a body is not in the voxel grid,
